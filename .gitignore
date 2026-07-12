@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.env
+.venv
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# pytest
+.pytest_cache/
+mytemp/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project secrets & local state (NEVER commit real API keys)
+config.json
+ycode.db
+active_skills.json
+mcp.json
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,0 +1,20 @@
+{
+  "active_model_id": "model_1",
+  "providers": [
+    {
+      "id": "provider_1",
+      "name": "Agnes AI",
+      "base_url": "https://apihub.agnes-ai.com/v1",
+      "api_key": "sk-your-agnes-api-key-here",
+      "protocol": "openai",
+      "models": [
+        {
+          "id": "model_1",
+          "name": "agnes-2.0-flash",
+          "litellm_model": "openai/agnes-2.0-flash",
+          "context_window": 128000
+        }
+      ]
+    }
+  ]
+}
