@@ -1,8 +1,5 @@
 import os
 import subprocess
-import urllib.request
-import urllib.parse
-import re
 from ddgs import DDGS
 
 def read_file(file_path):
@@ -20,29 +17,38 @@ def write_file(file_path, content):
 def list_directory(dir_path="."):
     """雷达工具：扫描文件夹，返回里面的所有文件和文件夹列表"""
     try:
-        # os.listdir 会列出该目录下所有的文件名字
         items = os.listdir(dir_path)
-        # 把列表拼成一段带有换行的文字返回给大模型
         return "\n".join(items)
     except Exception as e:
         return f"🚨 目录扫描失败: {str(e)}"
 
-def execute_command(command):
+def execute_command(command, run_in_background=False):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
+    if run_in_background:
+        from core.task_manager import start_background_task
+        try:
+            task_id = start_background_task(command)
+            return (
+                f"✔ 异步后台任务已成功启动！\n"
+                f"任务 ID: {task_id}\n"
+                f"命令内容: {command}\n"
+                f"系统已经把输出重定向到了日志中。你可以随时调用 `manage_task(action='status', task_id='{task_id}')` 来查看运行日志尾部，"
+                f"或者调用 `manage_task(action='kill', task_id='{task_id}')` 终结此后台服务。"
+            )
+        except Exception as e:
+            return f"🚨 启动后台异步任务失败: {e}"
+
     try:
-        # subprocess.run 是 Python 里极其强大的命令执行器
         result = subprocess.run(
             command,
-            shell=True,          # 允许执行复杂的 shell 命令
-            capture_output=True, # 把本该打印在屏幕上的结果偷偷抓到变量里
-            text=True,           # 把抓到的字节直接变成普通文字
-            encoding='utf-8',    # 🌟 强行指定 UTF-8 编码
-            errors='replace',    # 🌟 遇到奇葩字符直接替换，绝不报错崩溃！
-            timeout=30           # 加上 30 秒超时限制，防止星瑶写个死循环卡死电脑
+            shell=True,
+            capture_output=True,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            timeout=30
         )
         
-        # 很多命令即使成功了，也会把信息输出到 stderr (比如安装库的进度条)
-        # 所以我们把标准输出 (stdout) 和标准错误 (stderr) 结合起来返回
         output = result.stdout
         if result.stderr:
             output += f"\n[附加信息/警告]:\n{result.stderr}"
@@ -60,7 +66,6 @@ def search_news(query, num_results=5):
     """🌐 现代化新闻搜索工具：稳定可靠的联网引擎"""
     try:
         with DDGS() as ddgs:
-            # 直接调用底层接口，绕过反爬虫，告别脆弱的正则表达式
             results = list(ddgs.news(query, max_results=num_results))
             
             if not results:
@@ -80,11 +85,7 @@ def search_news(query, num_results=5):
     
 def search_code(query, dir_path="."):
     """精准搜索：跨文件全局查找代码片段或关键字"""
-    import os
-    
-    # 需要过滤的无关目录
     IGNORE_DIRS = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', '.ycode', 'dist', 'build'}
-    # 允许扫描的文件扩展名（防乱码和二进制文件）
     ALLOWED_EXTS = {
         '.py', '.js', '.ts', '.html', '.css', '.json', '.md', '.txt', 
         '.java', '.c', '.cpp', '.h', '.go', '.rs', '.php', '.rb', '.sh',
@@ -93,11 +94,10 @@ def search_code(query, dir_path="."):
     
     results = []
     match_count = 0
-    max_matches = 50 # 限制最多返回 50 条结果，防止撑爆上下文
+    max_matches = 50
     
     try:
         for root, dirs, files in os.walk(dir_path):
-            # 过滤无关目录
             dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.')]
             
             for file in files:
@@ -113,7 +113,6 @@ def search_code(query, dir_path="."):
                         
                     for line_num, line in enumerate(lines, 1):
                         if query.lower() in line.lower():
-                            # 获取前后文 (各 1 行)
                             start = max(0, line_num - 2)
                             end = min(len(lines), line_num + 1)
                             snippet = "".join(lines[start:end])
@@ -125,7 +124,6 @@ def search_code(query, dir_path="."):
                                 results.append(f"\n⚠️ 搜索结果太多，已截断前 {max_matches} 条，请尝试更精确的关键字。")
                                 return "\n---\n".join(results)
                 except Exception:
-                    # 忽略读取失败的文件（比如非 utf-8）
                     continue
                     
         if not results:
@@ -133,3 +131,78 @@ def search_code(query, dir_path="."):
         return "\n---\n".join(results)
     except Exception as e:
         return f"🚨 搜索失败: {str(e)}"
+
+# --- 星瑶的新神装：后台任务管理与局部代码修改 ---
+
+def manage_task(action, task_id=None):
+    """
+    后台进程管理器：对丢在后台运行的长周期任务（如服务器）进行查杀和状态管理。
+    参数:
+      action: 可选值：'list'（查看所有运行中的后台任务）, 'status'（查看指定任务的实时日志尾部）, 'kill'（强制杀掉指定任务）。
+      task_id: 目标任务的 ID，如果是 'status' 或 'kill' 行动，则为必填项。
+    """
+    from core.task_manager import list_active_tasks, get_task_output, kill_background_task
+    
+    if action == "list":
+        tasks = list_active_tasks()
+        if not tasks:
+            return "ℹ 当前没有任何运行中的后台异步任务。"
+        res = ["当前活跃后台任务列表："]
+        for t in tasks:
+            res.append(f"- [任务 ID: {t['task_id']}] 运行 PID: {t['pid']} | 运行时间: {t['duration']} | 命令: {t['command']}")
+        return "\n".join(res)
+        
+    elif action == "status":
+        if not task_id:
+            return "🚨 错误：查看状态必须提供 task_id 参数。"
+        output = get_task_output(task_id, tail_lines=40)
+        return f"--- 任务 {task_id} 最新 40 行日志输出 ---\n{output}"
+        
+    elif action == "kill":
+        if not task_id:
+            return "🚨 错误：终结任务必须提供 task_id 参数。"
+        success = kill_background_task(task_id)
+        if success:
+            return f"✔ 后台任务 {task_id} 已被强行终结清除。"
+        else:
+            return f"🚨 未能成功杀掉任务 {task_id}（可能进程已经提前结束，或找不到 ID）。"
+            
+    else:
+        return "🚨 错误：未知行动参数。可选值有 'list', 'status', 'kill'。"
+
+def edit_file(file_path, target_content, replacement_content):
+    """
+    手术刀局部替换工具：用于对已有代码文件进行点对点局部精准替换，不用每次都重写整张文件，避免开销和误删。
+    参数:
+      file_path: 要修改的文件的相对或绝对路径。
+      target_content: 文件中要被替换的旧代码段（必须完全一致，注意保留原始缩进和换行）。
+      replacement_content: 准备换上的新代码段。
+    """
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+            
+        # 写入撤销栈，以防出错
+        from core.memory import set_undo_state
+        set_undo_state(file_path, content)
+        
+        if target_content not in content:
+            # 容错：如果换行符因为跨平台不匹配 (\r\n vs \n)
+            norm_content = content.replace("\r\n", "\n")
+            norm_target = target_content.replace("\r\n", "\n")
+            if norm_target in norm_content:
+                new_content = norm_content.replace(norm_target, replacement_content.replace("\r\n", "\n"))
+            else:
+                return (
+                    f"🚨 精准修改失败！在文件 {file_path} 中没有找到指定的旧代码段。\n"
+                    f"请确保你传入的 target_content 的缩进、空格、换行完全匹配，或者你可以尝试使用 write_file 覆写工具。"
+                )
+        else:
+            new_content = content.replace(target_content, replacement_content)
+            
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+            
+        return f"✔ 文件 {file_path} 精准替换修改成功！"
+    except Exception as e:
+        return f"🚨 精准修改发生异常: {str(e)}"

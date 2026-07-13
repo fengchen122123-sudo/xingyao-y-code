@@ -51,14 +51,47 @@ def recalc_token_usage():
     history = manager.get_history(current_session)
     session_token_usage["latest_total"] = estimate_tokens(current_model, history)
 
-def print_logo():
+def print_logo(clear_screen=True):
     """打印顶部的 Logo 和系统信息"""
-    os.system('cls' if os.name == 'nt' else 'clear')
+    if clear_screen:
+        os.system('cls' if os.name == 'nt' else 'clear')
     custom_fig = pyfiglet.Figlet(font='slant')
     console.print(f"[bold cyan]{custom_fig.renderText('Y - CODE')}[/bold cyan]")
     cwd = os.getcwd()
     console.print(f"🚀 [bold green]Y-code CLI v1.0[/bold green] | 📂 [cyan]{cwd}[/cyan] | 💬 会话: [yellow]{current_session}[/yellow]")
     console.print("[dim]   Enter 发送 | Alt+Enter 换行 | Ctrl+C 清空 | Ctrl+D 退出[/dim]\n")
+
+
+def show_session_history(session_name):
+    """在终端里漂亮地重现该会话的所有历史对话消息"""
+    history = manager.get_history(session_name)
+    # 过滤掉 system 提示词与 tool 节点，只展示人类和智能体的核心对话内容
+    chat_history = [m for m in history if m.get("role") in ("user", "assistant")]
+    
+    if not chat_history:
+        console.print(f"[yellow]ℹ 会话 {session_name} 当前没有任何对话记录。[/yellow]")
+        return
+        
+    console.print(f"\n[bold cyan]--- 会话 {session_name} 历史对话记录 ---[/bold cyan]")
+    import re
+    for msg in chat_history:
+        role = msg.get("role")
+        content = msg.get("content") or ""
+        
+        # 过滤掉回答中冗长的心路历程思考标签
+        content_clean = re.sub(r"<(?:think|thinking)>.*?</(?:think|thinking)>", "", content, flags=re.DOTALL).strip()
+        
+        if not content_clean:
+            continue
+            
+        if role == "user":
+            safe_input = content_clean.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            print_formatted_text(HTML(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}"))
+        elif role == "assistant":
+            print_formatted_text(HTML(f"<b><magenta>🤖 星瑶 &gt;</magenta></b> "))
+            print_formatted_text(content_clean)
+            print_formatted_text("") # 留出段落空行
+    console.print("[bold cyan]--------------------------------------[/bold cyan]\n")
 
 
 def handle_slash_command(command_text):
@@ -72,6 +105,7 @@ def handle_slash_command(command_text):
         console.print("[bold yellow]系统指令说明：[/bold yellow]")
         console.print("  [cyan]/session <名称>[/cyan] : 切换或创建新的记忆会话")
         console.print(f"  [cyan]/models[/cyan]          : 打开模型管理器")
+        console.print("  [cyan]/tasks[/cyan]           : 查看或托管后台长周期进程")
         console.print("  [cyan]/skills[/cyan]         : (开发中) 查看或安装技能插件")
         console.print("  [cyan]/clear[/cyan]          : 清理当前屏幕")
         console.print("  [cyan]/exit[/cyan]           : 退出 Y-code")
@@ -93,11 +127,51 @@ def handle_slash_command(command_text):
         if len(parts) > 1:
             current_session = parts[1]
             recalc_token_usage()  # 切换后立即重新计算 token
-            console.print(f"[green]✅ 已切换至会话: {current_session}[/green]")
+            console.print(f"\n[green]Switching to session {current_session}...[/green]")
+            print_logo(clear_screen=False)
+            show_session_history(current_session)
         else:
             pending_action = "open_sessions"
             if app_instance:
                 app_instance.exit()
+
+    elif cmd in ("/tasks", "/task"):
+        from core.task_manager import list_active_tasks, get_task_output, kill_background_task
+        from prompt_toolkit import print_formatted_text
+        from prompt_toolkit.formatted_text import HTML
+
+        if len(parts) > 1:
+            subcmd = parts[1]
+            if subcmd == "kill" and len(parts) > 2:
+                tid = parts[2]
+                cleaned_tid = tid.strip("<>")
+                safe_tid = cleaned_tid.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                if kill_background_task(cleaned_tid):
+                    print_formatted_text(HTML(f"<ansigreen>✔ 后台任务 {safe_tid} 已成功终结。</ansigreen>"))
+                else:
+                    print_formatted_text(HTML(f"<ansired>❌ 找不到任务 ID: {safe_tid}，或任务已经提前结束。</ansired>"))
+            elif subcmd in ("tail", "log", "status") and len(parts) > 2:
+                tid = parts[2]
+                cleaned_tid = tid.strip("<>")
+                safe_tid = cleaned_tid.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                output = get_task_output(cleaned_tid, tail_lines=30)
+                print_formatted_text(HTML(f"<ansicyan><b>--- 任务 {safe_tid} 最新 30 行日志 ---</b></ansicyan>"))
+                print(output)
+            else:
+                print_formatted_text(HTML("<ansired>❌ 用法错误。可选指令：</ansired>"))
+                print_formatted_text(HTML("  <ansicyan>/tasks</ansicyan>           : 列出所有后台任务"))
+                print_formatted_text(HTML("  <ansicyan>/tasks kill &lt;ID&gt;</ansicyan> : 终结指定后台任务"))
+                print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;ID&gt;</ansicyan> : 查看任务日志输出"))
+        else:
+            tasks = list_active_tasks()
+            if not tasks:
+                print_formatted_text(HTML("<ansiyellow>ℹ 当前没有运行中的后台异步任务。</ansiyellow>"))
+            else:
+                print_formatted_text(HTML("<ansicyan><b>当前运行的后台任务：</b></ansicyan>"))
+                for t in tasks:
+                    safe_cmd = t['command'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    print_formatted_text(HTML(f"  <ansigreen>• ID: {t['task_id']}</ansigreen> | PID: <ansicyan>{t['pid']}</ansicyan> | 运行: {t['duration']} | 命令: {safe_cmd}"))
+                print_formatted_text(HTML("<ansigray>提示：你可以输入 `/tasks tail &lt;ID&gt;` 查看日志，或 `/tasks kill &lt;ID&gt;` 终结任务。</ansigray>"))
 
     elif cmd == "/undo":
         from core.memory import get_undo_state
@@ -165,6 +239,7 @@ def _make_input_app():
         ("/help", "查看系统指令说明"),
         ("/session", "切换或创建新的记忆会话"),
         ("/models", "打开模型管理器"),
+        ("/tasks", "查看或托管后台长周期进程"),
         ("/undo", "撤销星瑶上一次修改的代码"),
         ("/skills", "(开发中) 查看或安装技能插件"),
         ("/clear", "清理当前屏幕"),
@@ -227,11 +302,18 @@ def _make_input_app():
 
     @kb.add("enter")
     def submit(event):
-        """Enter 提交（放入队列排队执行，清空输入框继续等待输入）"""
+        """Enter 提交（如果是指令则立即在主线程同步执行，不阻塞队列；如果是普通对话则放入后台队列）"""
         text = input_area.text.strip()
         if text:
-            msg_queue.put(text)
-            input_area.text = ""
+            if text.startswith('/'):
+                # 立即清空输入框，并在当前主线程/事件循环中直接执行命令，无需排队等待大模型执行完毕
+                input_area.text = ""
+                safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                print_formatted_text(HTML(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}"))
+                handle_slash_command(text)
+            else:
+                msg_queue.put(text)
+                input_area.text = ""
 
     @kb.add("escape", "enter")
     def newline(event):
@@ -249,7 +331,7 @@ def _make_input_app():
         event.app.exit()
 
     def get_status():
-        """底部状态栏内容：极简无底色，带 Token 统计"""
+        """底部状态栏内容：极简无底色，带 Token 统计与后台任务监控"""
         # 1. 提取短模型名（去掉前缀 openai/ 等）
         model_display = current_model.split('/')[-1]
 
@@ -264,13 +346,37 @@ def _make_input_app():
         hit_rate = (cum_cached / cum_total * 100) if cum_total > 0 else 0
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
         
-        token_info = f"累计消耗: {cum_total} | 物理窗口: {latest_total}/{max_win} ({pct:.1f}%) | 缓存: 命中 {cum_cached} / 未命中 {cum_miss} ({hit_rate:.1f}%)"
+        def format_num(n):
+            if n >= 1_000_000:
+                return f"{n/1_000_000:.1f}M"
+            if n >= 1_000:
+                return f"{n/1_000:.1f}K"
+            return str(n)
+            
+        cum_total_str = format_num(cum_total)
+        latest_total_str = format_num(latest_total)
+        max_win_str = format_num(max_win)
+        
+        token_info = f"tokens: {cum_total_str} | 上下文: {latest_total_str}/{max_win_str} ({pct:.1f}%) | 缓存命中: {hit_rate:.1f}%"
 
-        # 3. 取消底部状态栏的思考动画
+        # 3. 统计星瑶的执行状态与播放动画，证明星瑶仍在操作/思考
+        if is_thinking:
+            # 播放流式旋转动画
+            elapsed = time.time()
+            frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+            frame = frames[int(elapsed * 5) % len(frames)]
+            task_info = f" {frame} 正在执行... "
+            task_style = "class:status.task_active"
+        else:
+            task_info = " 闲置 "
+            task_style = "class:status.task_idle"
+
         return [
             ("class:status.model",   f" {model_display} "),
             ("class:status.sep",     "  |  "),
             ("class:status.token",   token_info),
+            ("class:status.sep",     "  |  "),
+            (task_style,             task_info),
         ]
 
     def get_thinking_text():
@@ -331,6 +437,8 @@ def _make_input_app():
         "status.sep":      "#445566",
         "status.token":    "#718096",
         "status.think":    "bold #e2e8f0",
+        "status.task_active": "bold #39ff14",  # 矩阵亮绿
+        "status.task_idle":   "#556677",
         
         # 下拉补全菜单的颜色
         "completion-menu": "bg:#1a2a3a #e2e8f0",
@@ -367,6 +475,13 @@ def _background_worker():
         if user_input.startswith('/'):
             handle_slash_command(user_input)
         else:
+            # 捕捉当前的全局会话与模型配置，防止执行过程中用户切换会话/模型导致竞态冲突
+            task_session = current_session
+            task_model = current_model
+            task_key = current_key
+            task_url = current_url
+            task_ctx_win = current_ctx_win
+
             from core.input_parser import parse_user_input
             parsed_content, attached_msgs = parse_user_input(user_input)
             
@@ -376,23 +491,23 @@ def _background_worker():
                 print_formatted_text(HTML(f"  <ansigreen>{safe_msg}</ansigreen>"))
             
             # 将用户最新输入存入数据库
-            manager.add_message(current_session, "user", parsed_content)
+            manager.add_message(task_session, "user", parsed_content)
             
             # 【阶段4】后台静默清理超长历史文件记录
-            manager.prune_history_files(current_session, max_turns=16, retain_recent=4)
+            manager.prune_history_files(task_session, max_turns=16, retain_recent=4)
             
             # 获取上下文历史 (此时可能刚刚被精简过)
-            history = manager.get_history(current_session)
+            history = manager.get_history(task_session)
             
             # 【全新机制】在向大模型请求前，实时估算当前历史的 Token 数
             from core.llm import session_token_usage, estimate_tokens
-            estimated_tokens = estimate_tokens(current_model, history)
+            estimated_tokens = estimate_tokens(task_model, history)
             
-            if estimated_tokens > current_ctx_win * 0.8:
+            if estimated_tokens > task_ctx_win * 0.8:
                 # 超过 80% 安全线，触发压缩
-                manager.prune_history_files(current_session, max_turns=1, retain_recent=4)
-                history = manager.get_history(current_session)
-                estimated_tokens = estimate_tokens(current_model, history)
+                manager.prune_history_files(task_session, max_turns=1, retain_recent=4)
+                history = manager.get_history(task_session)
+                estimated_tokens = estimate_tokens(task_model, history)
                 
             # 更新最新 Token 数供界面显示
             session_token_usage["latest_total"] = estimated_tokens
@@ -404,9 +519,10 @@ def _background_worker():
                 "在给出回答前，请先将思考过程用 <think> 和 </think> 标签包裹起来输出。\n\n"
                 "【⚠️ 警告：如何正确修改文件】\n"
                 "你是一个 AI，无法通过“纯文本回复”来改变用户的本地文件。\n"
-                "只要用户要求修改、编写或重写代码，你**必须立即调用 `write_file` 工具**，把完整的代码通过参数传过去。\n"
-                "严禁只在聊天框里输出诸如“我已经修改完成”的废话而不调用工具，那属于严重的幻觉！\n"
-                "只要你成功调用了 `write_file`，系统就会自动渲染出漂亮的 Diff，所以你也绝对不需要在聊天文本里输出完整的 Markdown 代码块。\n\n"
+                "1. 如果是修改已有文件，你**必须优先调用 `edit_file` 工具**进行精准局部替换（提供 target_content 和 replacement_content），这样耗时极短且极度安全。\n"
+                "2. 如果是创建新文件，或者需要对文件进行彻底重写，调用 `write_file` 工具。\n"
+                "严禁只在聊天框里输出诸如“我已经修改完成”的废话而不调用任何修改工具，那属于严重的幻觉！\n"
+                "只要你成功调用了 `write_file` 或 `edit_file`，系统就会自动渲染出漂亮的 Diff，所以你也绝对不需要在聊天文本里输出完整的 Markdown 代码块。\n\n"
                 "【🌟 你的进阶能力：全自动规划与修复 (Agentic Core)】\n"
                 "1. 当用户交代复杂任务时，请主动拆解为 `[ ] 步骤1`, `[ ] 步骤2` 格式。\n"
                 "2. 修改代码后，务必使用 `execute_command` 运行测试或对应的命令验证。\n"
@@ -427,16 +543,10 @@ def _background_worker():
             is_thinking = True
             think_start_time = time.time()
                 
-            # 启动一个子线程，每 0.1s 刷新一次 UI，让底部的计时器动起来
-            def _ui_refresher():
-                while is_thinking:
-                    if app_instance:
-                        app_instance.invalidate()
-                    time.sleep(0.1)
-            threading.Thread(target=_ui_refresher, daemon=True).start()
+            # 思考期间界面重绘已交由全局 UI 刷新线程托管，此处无需重复启动本地子线程
 
-            # 调用大模型 (现在是真流式，会源源不断 yield 字符出来！)
-            response_gen = chat_with_model(current_model, current_key, history, current_url, stream=True)
+            # 调用大模型 (使用捕捉的快照配置进行调用，保障竞态安全)
+            response_gen = chat_with_model(task_model, task_key, history, task_url, stream=True)
                 
             # 打印回复头部
             print_formatted_text(HTML("\n<b><magenta>🤖 星瑶 &gt;</magenta></b> "))
@@ -515,7 +625,7 @@ def _background_worker():
             if think_match:
                 final_content = full_raw_reply.replace(think_match.group(0), "").strip()
 
-            manager.add_message(current_session, "assistant", final_content)
+            manager.add_message(task_session, "assistant", final_content)
                 
             # 请求完成，通知 UI 刷新底部的 Token 状态栏
             if app_instance:
@@ -533,6 +643,17 @@ def run_cli():
     # 启动后台处理线程
     worker_thread = threading.Thread(target=_background_worker, daemon=True)
     worker_thread.start()
+
+    # 启动全局常驻 UI 刷新线程（用以维持思考计时器和星瑶运转状态微动画）
+    def _ui_refresher_loop():
+        while True:
+            # 只要星瑶在操作或思考，就主动刷新 UI 以更新旋转动画
+            if is_thinking:
+                if app_instance:
+                    app_instance.invalidate()
+            time.sleep(0.2)
+            
+    threading.Thread(target=_ui_refresher_loop, daemon=True).start()
 
     # 首次启动，计算当前 session 的 Token
     recalc_token_usage()
@@ -574,11 +695,22 @@ def run_cli():
             
         elif pending_action == "open_sessions":
             from core.session_selector import open_session_selector
+            switched_session = [None]
+            
             def _on_switch(new_session):
                 global current_session
                 current_session = new_session
-                recalc_token_usage()
+                switched_session[0] = new_session
+                
             open_session_selector(on_switch=_on_switch)
+            
+            # 选择器全屏 App 已彻底退出，现在安全地在主终端追加打印历史记录
+            if switched_session[0]:
+                recalc_token_usage()
+                console.print(f"\n[green]Switching to session {switched_session[0]}...[/green]")
+                print_logo(clear_screen=False)
+                show_session_history(switched_session[0])
+                
             pending_action = None
             continue
             

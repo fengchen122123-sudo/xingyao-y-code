@@ -138,3 +138,21 @@ def delete_model(model_id: str):
     if data.get("active_model_id") == model_id:
         data["active_model_id"] = None
     _write_config(data)
+
+
+def update_provider_and_model(provider_id: str, model_id: str, base_url: str, api_key: str, model_name: str, context_window: int):
+    """更新厂商的 Base URL、API Key 以及旗下特定模型的名字和上下文窗口。"""
+    data = load_config()
+    for provider in data.get("providers", []):
+        if provider["id"] == provider_id:
+            provider["base_url"] = base_url
+            provider["api_key"] = api_key
+            for model in provider.get("models", []):
+                if model["id"] == model_id:
+                    model["name"] = model_name
+                    proto = provider.get("protocol", "openai")
+                    model["litellm_model"] = f"{proto}/{model_name}"
+                    model["context_window"] = context_window
+                    break
+            break
+    _write_config(data)

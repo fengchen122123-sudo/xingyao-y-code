@@ -1,10 +1,15 @@
 import json
+import logging
 import litellm
 from litellm import completion
+
+# 彻底屏蔽 LiteLLM 启动时的网络请求超时警告
+logging.getLogger("LiteLLM").setLevel(logging.ERROR)
+logging.getLogger("litellm").setLevel(logging.ERROR)
+
 # 🌟 注意这里：我们把四个工具全都引进来了！
-from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code
+from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task
 from core.mcp_client import mcp_manager
-import litellm
 from litellm import token_counter
 
 litellm.suppress_debug_info = True
@@ -87,11 +92,12 @@ TOOLS_SCHEMA = [
         "type": "function",
         "function": {
             "name": "execute_command",
-            "description": "引擎：在本地终端执行 shell 或命令行指令，并获取输出结果。可用于运行代码、测试、安装依赖等。",
+            "description": "引擎：在本地终端执行 shell 或命令行指令，并获取输出结果。对于 npm run dev、python server.py 等常驻进程服务，请务必设置 run_in_background=true，否则会卡死阻塞对话。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "command": {"type": "string", "description": "要在终端执行的命令，比如 'python hello.py'"}
+                    "command": {"type": "string", "description": "要在终端执行的命令，比如 'python hello.py'"},
+                    "run_in_background": {"type": "boolean", "description": "是否在后台异步运行该命令。若是常驻服务器或进程，设为 true。"}
                 },
                 "required": ["command"]
             }
@@ -109,6 +115,37 @@ TOOLS_SCHEMA = [
                     "num_results": {"type": "integer", "description": "返回结果数量，默认 5 条"}
                 },
                 "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_file",
+            "description": "手术刀：对本地已有的代码文件进行精准的局部搜索与替换修改。相较于 write_file 覆写整张大文件，编辑已有代码时应优先调用此工具以节省 Token 并防止丢代码。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string", "description": "要修改的文件的相对或绝对路径"},
+                    "target_content": {"type": "string", "description": "文件里准备被替换的旧代码块（必须完全匹配，注意空格缩进和换行）"},
+                    "replacement_content": {"type": "string", "description": "替换进去的新代码块"}
+                },
+                "required": ["file_path", "target_content", "replacement_content"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "manage_task",
+            "description": "后台进程管理器：对丢在后台运行的长周期任务（如 npm run dev 启动的服务器）进行列表查看（list）、状态及实时日志尾部查询（status）、强制杀掉（kill）。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "description": "对任务的动作。可选值: 'list', 'status', 'kill'"},
+                    "task_id": {"type": "string", "description": "目标任务 ID。如果 action 是 'status' 或 'kill' 则为必填参数。"}
+                },
+                "required": ["action"]
             }
         }
     }
@@ -155,7 +192,11 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                 tool_calls_dict = {}
                 in_native_think = False
                 
+                import time as native_time
+                request_start = native_time.time()
                 for chunk in response_stream:
+                    if native_time.time() - request_start > 45:
+                        raise TimeoutError("Siliconflow API 响应超时（流式读取累计耗时已超 45s），已强行切断，请稍后重试或更换模型。")
                     # 1. 解析 Token 消耗 (如果在流中提供)
                     if hasattr(chunk, 'usage') and chunk.usage:
                         usage = chunk.usage
@@ -268,7 +309,8 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                     # 打印一条提示给控制台
                     from prompt_toolkit import print_formatted_text
                     from prompt_toolkit.formatted_text import HTML
-                    print_formatted_text(HTML(f"<ansigreen>[ {friendly_msg} ]</ansigreen>"))
+                    safe_friendly_msg = friendly_msg.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    print_formatted_text(HTML(f"<ansigreen>[ {safe_friendly_msg} ]</ansigreen>"))
                 
                     result = ""
                     try:
@@ -344,10 +386,67 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                             dir_path = arguments.get("dir_path", ".")
                             result = search_code(query, dir_path)
                         elif function_name == "execute_command":
-                            result = execute_command(arguments.get("command", ""))
+                            cmd = arguments.get("command", "")
+                            bg = arguments.get("run_in_background", False)
+                            result = execute_command(cmd, run_in_background=bg)
                         elif function_name == "search_news":
                             num = arguments.get("num_results", 5)
                             result = search_news(arguments.get("query", ""), num)
+                        elif function_name == "manage_task":
+                            act = arguments.get("action")
+                            tid = arguments.get("task_id")
+                            result = manage_task(act, tid)
+                        elif function_name == "edit_file":
+                            file_path = arguments.get("file_path")
+                            target = arguments.get("target_content")
+                            repl = arguments.get("replacement_content")
+                            
+                            try:
+                                with open(file_path, 'r', encoding='utf-8') as f:
+                                    old_content = f.read()
+                            except FileNotFoundError:
+                                old_content = ""
+                                
+                            result = edit_file(file_path, target, repl)
+                            
+                            if not result.startswith("🚨"):
+                                try:
+                                    with open(file_path, 'r', encoding='utf-8') as f:
+                                        new_content = f.read()
+                                        
+                                    from core.diff_viewer import generate_diff
+                                    from rich.panel import Panel
+                                    from rich.console import Console
+                                    
+                                    diff_text = generate_diff(old_content, new_content, file_path)
+                                    if diff_text:
+                                        lines = diff_text.split('\n')
+                                        max_lines = 25
+                                        if len(lines) > max_lines:
+                                            display_text = '\n'.join(lines[:max_lines]) + f"\n... (省略 {len(lines) - max_lines} 行，已局部替换并修改成功)"
+                                        else:
+                                            display_text = diff_text
+                                            
+                                        from core.diff_viewer import render_diff_table
+                                        diff_table = render_diff_table(display_text)
+                                        
+                                        panel = Panel(
+                                            diff_table,
+                                            title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
+                                            border_style="green",
+                                            expand=False
+                                        )
+                                        
+                                        from prompt_toolkit import print_formatted_text
+                                        from prompt_toolkit.formatted_text import ANSI
+                                        
+                                        rich_console = Console(force_terminal=True, color_system="truecolor")
+                                        with rich_console.capture() as capture:
+                                            rich_console.print(panel)
+                                            
+                                        print_formatted_text(ANSI(capture.get()))
+                                except Exception as e:
+                                    print(f"\n[⚠️ Diff 生成失败: {str(e)}]")
                         else:
                             # 尝试去 MCP manager 里面找
                             if any(s["function"]["name"] == function_name for s in mcp_manager.get_schemas()):
@@ -368,8 +467,16 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
             # 循环继续，带着所有工具的执行结果发起下一轮对话
             
         msg = f"🚨 任务轮次超过上限（{max_turns} 轮），请把任务拆小一点再试！"
-        return _yield_content(msg) if stream else msg
+        if stream:
+            yield from _yield_content(msg)
+            return
+        else:
+            return msg
         
     except Exception as e:
         msg = f"🚨 糟糕！错误信息：{str(e)}"
-        return _yield_content(msg) if stream else msg
+        if stream:
+            yield from _yield_content(msg)
+            return
+        else:
+            return msg

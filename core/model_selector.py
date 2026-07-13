@@ -6,7 +6,7 @@ core/model_selector.py
 import uuid
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.layout import Layout, HSplit, Window
+from prompt_toolkit.layout import Layout, HSplit, VSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
 from prompt_toolkit.styles import Style
 from prompt_toolkit.buffer import Buffer
@@ -16,7 +16,8 @@ from prompt_toolkit.layout.containers import ConditionalContainer
 
 from core.model_manager import (
     load_config, set_active_model, add_provider,
-    add_model_to_provider, delete_model, get_active_model
+    add_model_to_provider, delete_model, get_active_model,
+    update_provider_and_model
 )
 
 STYLE = Style.from_dict({
@@ -28,8 +29,8 @@ STYLE = Style.from_dict({
     "model.cursor":  "bold #ffffff bg:#1a2a3a",
     "add.cursor":    "bold #f6c90e bg:#1a2a3a",
     "add.normal":    "#f6c90e",
-    "dialog.title":  "bold #00b4d8",
-    "dialog.hint":   "#445566",
+    "wiz.title":     "bold #00b4d8",
+    "wiz.hint":      "#445566",
     "proto.cursor":  "bold #ffffff bg:#1a2a3a",
     "proto.normal":  "#718096",
     "proto.ok":      "bold #00ffa3",
@@ -63,7 +64,151 @@ def open_model_selector(on_model_selected=None):
         "add_data":       {},
         "new_provider_id": None,
         "message":        "",
+        "testing":        False,
+        "edit_step":      0,
+        "edit_data":      {},
+        "edit_model_id":   None,
+        "edit_provider_id":None,
     }
+
+    def _test_and_save_edited_model(event, ctx):
+        import threading
+        state["message"] = "⏳ 正在验证连接模型..."
+        state["testing"] = True
+        event.app.invalidate()
+
+        def test_conn():
+            try:
+                import litellm
+                url = state["edit_data"].get("base_url", "").strip()
+                key = state["edit_data"].get("api_key", "").strip()
+                model = state["edit_data"].get("model_name", "").strip()
+                
+                # 获取原厂商的协议类型
+                proto = "openai"
+                cfg = load_config()
+                for provider in cfg.get("providers", []):
+                    if provider["id"] == state["edit_provider_id"]:
+                        proto = provider.get("protocol", "openai")
+                        break
+                
+                test_model = model
+                if not model.startswith(f"{proto}/"):
+                    test_model = f"{proto}/{model}"
+                
+                kwargs = {
+                    "model": test_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 5,
+                    "timeout": 8,
+                }
+                if key:
+                    kwargs["api_key"] = key
+                if url:
+                    kwargs["api_base"] = url
+                
+                litellm.completion(**kwargs)
+                
+                # 验证成功，保存修改的厂商与模型
+                update_provider_and_model(
+                    provider_id=state["edit_provider_id"],
+                    model_id=state["edit_model_id"],
+                    base_url=url,
+                    api_key=key,
+                    model_name=model,
+                    context_window=ctx,
+                )
+                
+                state["message"] = "✔ 修改已成功测试并保存！"
+                state["mode"] = "list"
+                state["items"] = build_items()
+                layout.focus(main_win)
+            except Exception as e:
+                err_msg = str(e)
+                if "APIConnectionError" in err_msg:
+                    err_msg = "网络连接失败，请检查 Base URL 是否正确或网络是否通畅。"
+                elif "AuthenticationError" in err_msg or "401" in err_msg:
+                    err_msg = "认证失败，请检查 API Key 是否正确。"
+                elif "NotFoundError" in err_msg or "404" in err_msg:
+                    err_msg = f"模型或 API 路径不存在，请检查模型名称 '{model}' 或 Base URL 是否正确。"
+                else:
+                    err_msg = f"连接失败: {err_msg}"
+                
+                state["message"] = f"❌ {err_msg[:75]}"
+            finally:
+                state["testing"] = False
+                event.app.invalidate()
+                
+        threading.Thread(target=test_conn, daemon=True).start()
+
+    def _test_and_save_model(event, ctx):
+        import threading
+        state["message"] = "⏳ 正在验证连接模型..."
+        state["testing"] = True
+        event.app.invalidate()
+
+        def test_conn():
+            try:
+                import litellm
+                url = state["add_data"].get("base_url", "").strip()
+                key = state["add_data"].get("api_key", "").strip()
+                model = state["add_data"].get("model_name", "").strip()
+                proto_idx = state["add_data"].get("proto_idx", 0)
+                proto = PROTOCOLS[proto_idx][0]
+                
+                test_model = model
+                if not model.startswith(f"{proto}/"):
+                    test_model = f"{proto}/{model}"
+                
+                kwargs = {
+                    "model": test_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 5,
+                    "timeout": 8,
+                }
+                if key:
+                    kwargs["api_key"] = key
+                if url:
+                    kwargs["api_base"] = url
+                
+                litellm.completion(**kwargs)
+                
+                # 验证成功，保存厂商与模型
+                if not state.get("new_provider_id"):
+                    pid = add_provider(
+                        name=state["add_data"]["name"],
+                        base_url=state["add_data"]["base_url"],
+                        api_key=state["add_data"]["api_key"],
+                        protocol=proto,
+                    )
+                    state["new_provider_id"] = pid
+                
+                add_model_to_provider(
+                    provider_id=state["new_provider_id"],
+                    name=model,
+                    context_window=ctx,
+                )
+                
+                state["message"] = "✔ 模型连接测试成功，已保存！"
+                state["add_step"] = 6
+                layout.focus(main_win)
+            except Exception as e:
+                err_msg = str(e)
+                if "APIConnectionError" in err_msg:
+                    err_msg = "网络连接失败，请检查 Base URL 是否正确或网络是否通畅。"
+                elif "AuthenticationError" in err_msg or "401" in err_msg:
+                    err_msg = "认证失败，请检查 API Key 是否正确。"
+                elif "NotFoundError" in err_msg or "404" in err_msg:
+                    err_msg = f"模型或 API 路径不存在，请检查模型名称 '{model}' 或 Base URL 是否正确。"
+                else:
+                    err_msg = f"连接失败: {err_msg}"
+                
+                state["message"] = f"❌ {err_msg[:75]}"
+            finally:
+                state["testing"] = False
+                event.app.invalidate()
+                
+        threading.Thread(target=test_conn, daemon=True).start()
 
     # ── 输入缓冲区（向导用）──
     input_buf = Buffer()
@@ -129,9 +274,44 @@ def open_model_selector(on_model_selected=None):
                     out += [_t("class:add.normal", "      ＋ 添加新厂商\n")]
 
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
-        out += [_t("class:footer", "  ↑↓ 移动  Enter 激活  D 删除  Q 退出\n")]
+        out += [_t("class:footer", "  ↑↓ 移动  Enter 激活  E 编辑  D 删除  Esc 退出\n")]
         if state["message"]:
             out += [_t("class:ok", f"  {state['message']}\n")]
+        return out
+
+    # ════════════════ 渲染编辑向导 ════════════════
+    def render_edit_wizard():
+        step = state["edit_step"]
+        data = state["edit_data"]
+        out = []
+        out += [_t("class:header", "  ✎ 修改已添加的模型 — 向导\n")]
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+
+        steps_map = {
+            0: ("步骤 1/4  API Base URL", "编辑 Base URL，如 https://api.deepseek.com/v1："),
+            1: ("步骤 2/4  API Key",       "编辑 API Key："),
+            2: ("步骤 3/4  模型名称",        "编辑模型名称，如 deepseek-chat："),
+            3: ("步骤 4/4  最大上下文",      "编辑上下文 Token 数，如 128000："),
+        }
+
+        # 回显修改的值
+        if step > 0 and "base_url" in data:
+            out += [_t("class:wiz.hint", f"  Base URL: {data['base_url']}\n")]
+        if step > 1 and "api_key" in data:
+            out += [_t("class:wiz.hint", f"  API Key:  {'*' * 8}\n")]
+        if step > 2 and "model_name" in data:
+            out += [_t("class:wiz.hint", f"  模型名称: {data['model_name']}\n")]
+
+        if step in steps_map:
+            title, hint = steps_map[step]
+            out += [_t("class:wiz.title", f"  {title}\n")]
+            out += [_t("class:wiz.hint",  f"  {hint}\n")]
+
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        if state["message"]:
+            style = "class:ok" if not state["message"].startswith("❌") else "class:empty"
+            out += [_t(style, f"  {state['message']}\n")]
+        out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
         return out
 
     # ════════════════ 渲染向导 ════════════════
@@ -152,20 +332,20 @@ def open_model_selector(on_model_selected=None):
 
         # 前几步已填写的值回显
         if step > 0 and "name" in data:
-            out += [_t("class:dialog.hint", f"  厂商名称: {data['name']}\n")]
+            out += [_t("class:wiz.hint", f"  厂商名称: {data['name']}\n")]
         if step > 1 and "base_url" in data:
-            out += [_t("class:dialog.hint", f"  Base URL: {data['base_url']}\n")]
+            out += [_t("class:wiz.hint", f"  Base URL: {data['base_url']}\n")]
         if step > 2 and "api_key" in data:
-            out += [_t("class:dialog.hint", f"  API Key:  {'*' * 8}\n")]
+            out += [_t("class:wiz.hint", f"  API Key:  {'*' * 8}\n")]
 
         if step in steps_map:
             title, hint = steps_map[step]
-            out += [_t("class:dialog.title", f"  {title}\n")]
-            out += [_t("class:dialog.hint",  f"  {hint}\n")]
+            out += [_t("class:wiz.title", f"  {title}\n")]
+            out += [_t("class:wiz.hint",  f"  {hint}\n")]
 
         elif step == 3:
-            out += [_t("class:dialog.title", "  步骤 4/5  协议类型\n")]
-            out += [_t("class:dialog.hint",  "  ↑↓ 选择，Enter 确认：\n")]
+            out += [_t("class:wiz.title", "  步骤 4/5  协议类型\n")]
+            out += [_t("class:wiz.hint",  "  ↑↓ 选择，Enter 确认：\n")]
             for pi, (_, plabel) in enumerate(PROTOCOLS):
                 if pi == state["proto_cursor"]:
                     out += [_t("class:proto.cursor", f"  ▶ {plabel}\n")]
@@ -174,7 +354,7 @@ def open_model_selector(on_model_selected=None):
 
         elif step == 6:
             out += [_t("class:ok", "  ✔ 模型已添加！\n")]
-            out += [_t("class:dialog.hint", "  是否继续为该厂商添加更多模型？\n")]
+            out += [_t("class:wiz.hint", "  是否继续为该厂商添加更多模型？\n")]
             opts = ["  ＋ 继续添加该厂商的模型", "  ✔ 完成并保存"]
             for oi, o in enumerate(opts):
                 if oi == state["proto_cursor"]:
@@ -183,6 +363,9 @@ def open_model_selector(on_model_selected=None):
                     out += [_t("class:proto.normal", f"   {o}\n")]
 
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        if state["message"]:
+            style = "class:ok" if not state["message"].startswith("❌") else "class:empty"
+            out += [_t(style, f"  {state['message']}\n")]
         if step not in (3, 6):
             out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
         return out
@@ -191,6 +374,8 @@ def open_model_selector(on_model_selected=None):
     def get_main_content():
         if state["mode"] == "list":
             return render_list()
+        elif state["mode"] == "edit":
+            return render_edit_wizard()
         return render_wizard()
 
     main_ctrl = FormattedTextControl(get_main_content, focusable=True)
@@ -198,9 +383,23 @@ def open_model_selector(on_model_selected=None):
 
     @Condition
     def need_input():
-        return state["mode"] == "wizard" and state["add_step"] not in (3, 6)
+        return state["mode"] in ("wizard", "edit") and not (state["mode"] == "wizard" and state["add_step"] in (3, 6))
 
-    def get_input_label():
+    def get_input_header():
+        if state["mode"] == "edit":
+            step = state["edit_step"]
+            hints = {
+                0: "编辑 Base URL，按 Enter 确认",
+                1: "编辑 API Key，按 Enter 确认",
+                2: "编辑模型名称，按 Enter 确认",
+                3: "编辑 Token 数量，按 Enter 确认",
+            }
+            hint = hints.get(step, "")
+            return [
+                ("class:footer", "  " + "─" * 44 + "\n"),
+                ("class:wiz.title", f"  ▶ {hint}\n"),
+            ]
+
         step = state["add_step"]
         hints = {
             0: "输入厂商名称，按 Enter 确认",
@@ -212,21 +411,23 @@ def open_model_selector(on_model_selected=None):
         hint = hints.get(step, "")
         return [
             ("class:footer", "  " + "─" * 44 + "\n"),
-            ("class:dialog.title", f"  ▶ {hint}\n"),
-            ("class:dialog.title", "  > "),
+            ("class:wiz.title", f"  ▶ {hint}\n"),
         ]
 
-    input_label_ctrl = FormattedTextControl(get_input_label)
+    input_header_ctrl = FormattedTextControl(get_input_header)
+    input_prefix_ctrl = FormattedTextControl([("class:wiz.title", "  > ")])
 
     layout = Layout(
         HSplit([
             main_win,
             ConditionalContainer(
-                content=Window(content=input_label_ctrl, height=3),
-                filter=need_input,
-            ),
-            ConditionalContainer(
-                content=Window(content=BufferControl(buffer=input_buf), height=1),
+                content=HSplit([
+                    Window(content=input_header_ctrl, height=2),
+                    VSplit([
+                        Window(content=input_prefix_ctrl, width=4),
+                        Window(content=BufferControl(buffer=input_buf), height=1),
+                    ])
+                ]),
                 filter=need_input,
             ),
         ]),
@@ -273,7 +474,29 @@ def open_model_selector(on_model_selected=None):
             state["add_step"] = 0
             state["add_data"] = {}
             state["proto_cursor"] = 0
+            state["message"] = ""
             input_buf.set_document(Document(""))
+            layout.focus(input_buf)
+
+    # ── 列表：E 编辑 ──
+    @kb.add("e", filter=Condition(lambda: state["mode"] == "list"))
+    def _edit_list(event):
+        item = state["items"][state["cursor"]]
+        if item["type"] == "model":
+            m = item["data"]
+            p = item["provider"]
+            state["mode"] = "edit"
+            state["edit_step"] = 0
+            state["edit_model_id"] = m["id"]
+            state["edit_provider_id"] = p["id"]
+            state["edit_data"] = {
+                "base_url": p.get("base_url", ""),
+                "api_key": p.get("api_key", ""),
+                "model_name": m.get("name", ""),
+                "context_window": m.get("context_window", 128000)
+            }
+            state["message"] = ""
+            input_buf.set_document(Document(state["edit_data"]["base_url"]))
             layout.focus(input_buf)
 
     # ── 列表：D 删除 ──
@@ -287,7 +510,8 @@ def open_model_selector(on_model_selected=None):
             _skip_providers(1)
             state["message"] = f"已删除: {item['data']['name']}"
 
-    # ── 列表：Q 退出 ──
+    # ── 列表：Esc/Q 退出 ──
+    @kb.add("escape", filter=Condition(lambda: state["mode"] == "list"))
     @kb.add("q", filter=Condition(lambda: state["mode"] == "list"))
     @kb.add("c-c")
     def _quit(event):
@@ -296,16 +520,24 @@ def open_model_selector(on_model_selected=None):
     # ── 向导：协议 & 确认选项 ↑↓ ──
     @kb.add("up", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (3, 6)))
     def _w_up(event):
+        if state.get("testing"):
+            return
         state["proto_cursor"] = max(0, state["proto_cursor"] - 1)
 
     @kb.add("down", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (3, 6)))
     def _w_down(event):
+        if state.get("testing"):
+            return
         mx = len(PROTOCOLS) - 1 if state["add_step"] == 3 else 1
         state["proto_cursor"] = min(mx, state["proto_cursor"] + 1)
 
     # ── 向导：Enter 推进步骤 ──
     @kb.add("enter", filter=Condition(lambda: state["mode"] == "wizard"))
     def _w_enter(event):
+        if state.get("testing"):
+            return
+            
+        state["message"] = ""
         step = state["add_step"]
         text = input_buf.text.strip()
 
@@ -334,13 +566,6 @@ def open_model_selector(on_model_selected=None):
 
         elif step == 3:
             state["add_data"]["proto_idx"] = state["proto_cursor"]
-            pid = add_provider(
-                name=state["add_data"]["name"],
-                base_url=state["add_data"]["base_url"],
-                api_key=state["add_data"]["api_key"],
-                protocol=PROTOCOLS[state["add_data"]["proto_idx"]][0],
-            )
-            state["new_provider_id"] = pid
             state["proto_cursor"] = 0
             input_buf.set_document(Document(""))
             layout.focus(input_buf)
@@ -358,15 +583,10 @@ def open_model_selector(on_model_selected=None):
                 ctx = int(text)
             except ValueError:
                 ctx = 128000
-            add_model_to_provider(
-                provider_id=state["new_provider_id"],
-                name=state["add_data"]["model_name"],
-                context_window=ctx,
-            )
-            input_buf.set_document(Document(""))
-            state["proto_cursor"] = 0
-            layout.focus(main_win)
-            state["add_step"] = 6
+            state["add_data"]["context_window"] = ctx
+            
+            # 触发连接测试与保存逻辑
+            _test_and_save_model(event, ctx)
 
         elif step == 6:
             if state["proto_cursor"] == 0:
@@ -383,12 +603,95 @@ def open_model_selector(on_model_selected=None):
                 state["message"] = "✔ 厂商已保存！"
                 layout.focus(main_win)
 
-    # ── 向导：Esc 返回 ──
+    # ── 向导：Esc 返回上一步 ──
     @kb.add("escape", filter=Condition(lambda: state["mode"] == "wizard"))
     def _w_esc(event):
-        state["mode"] = "list"
-        state["items"] = build_items()
-        layout.focus(main_win)
+        if state.get("testing"):
+            return
+            
+        state["message"] = ""
+        step = state["add_step"]
+        if step == 0:
+            # 第一步按 Esc，退出向导
+            state["mode"] = "list"
+            state["items"] = build_items()
+            layout.focus(main_win)
+        elif step in (1, 2):
+            state["add_step"] -= 1
+            prev_field = {1: "name", 2: "base_url"}[step]
+            input_buf.set_document(Document(state["add_data"].get(prev_field, "")))
+        elif step == 3:
+            state["add_step"] = 2
+            input_buf.set_document(Document(state["add_data"].get("api_key", "")))
+            layout.focus(input_buf)
+        elif step == 4:
+            state["add_step"] = 3
+            state["proto_cursor"] = state["add_data"].get("proto_idx", 0)
+            layout.focus(main_win)
+        elif step == 5:
+            state["add_step"] = 4
+            input_buf.set_document(Document(state["add_data"].get("model_name", "")))
+
+    # ── 编辑向导：Enter 推进步骤 ──
+    @kb.add("enter", filter=Condition(lambda: state["mode"] == "edit"))
+    def _w_edit_enter(event):
+        if state.get("testing"):
+            return
+            
+        state["message"] = ""
+        step = state["edit_step"]
+        text = input_buf.text.strip()
+
+        if step == 0:
+            if not text:
+                return
+            state["edit_data"]["base_url"] = text
+            input_buf.set_document(Document(state["edit_data"]["api_key"]))
+            state["edit_step"] = 1
+
+        elif step == 1:
+            if not text:
+                return
+            state["edit_data"]["api_key"] = text
+            input_buf.set_document(Document(state["edit_data"]["model_name"]))
+            state["edit_step"] = 2
+
+        elif step == 2:
+            if not text:
+                return
+            state["edit_data"]["model_name"] = text
+            input_buf.set_document(Document(str(state["edit_data"]["context_window"])))
+            state["edit_step"] = 3
+
+        elif step == 3:
+            try:
+                ctx = int(text)
+            except ValueError:
+                ctx = 128000
+            state["edit_data"]["context_window"] = ctx
+            _test_and_save_edited_model(event, ctx)
+
+    # ── 编辑向导：Esc 返回上一步 ──
+    @kb.add("escape", filter=Condition(lambda: state["mode"] == "edit"))
+    def _w_edit_esc(event):
+        if state.get("testing"):
+            return
+            
+        state["message"] = ""
+        step = state["edit_step"]
+        if step == 0:
+            state["mode"] = "list"
+            state["items"] = build_items()
+            layout.focus(main_win)
+        elif step == 1:
+            state["edit_step"] = 0
+            input_buf.set_document(Document(state["edit_data"].get("base_url", "")))
+        elif step == 2:
+            state["edit_step"] = 1
+            input_buf.set_document(Document(state["edit_data"].get("api_key", "")))
+        elif step == 3:
+            state["edit_step"] = 2
+            input_buf.set_document(Document(state["edit_data"].get("model_name", "")))
 
     app = Application(
         layout=layout,
