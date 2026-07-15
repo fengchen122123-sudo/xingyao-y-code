@@ -1,0 +1,76 @@
+# 内置的 TUI 终端主题配色
+THEMES = {
+    "cyan": {  # 默认极光青
+        "border": "#00b4d8",
+        "label": "bold #00b4d8",
+        "status_main": "bold #00b4d8",
+        "text_input": "#dde1e7",
+        "menu_current": "bg:#00b4d8 #ffffff bold",
+        "menu_current_meta": "bg:#00b4d8 #ffffff",
+    },
+    "matrix": {  # 骇客暗绿
+        "border": "#39ff14",
+        "label": "bold #39ff14",
+        "status_main": "bold #39ff14",
+        "text_input": "#00ff00",
+        "menu_current": "bg:#39ff14 #000000 bold",
+        "menu_current_meta": "bg:#39ff14 #000000",
+    },
+    "nord": {  # 极光幽蓝
+        "border": "#88c0d0",
+        "label": "bold #8fbcbb",
+        "status_main": "bold #81a1c1",
+        "text_input": "#d8dee9",
+        "menu_current": "bg:#88c0d0 #2e3440 bold",
+        "menu_current_meta": "bg:#88c0d0 #2e3440",
+    },
+    "cyberpunk": {  # 赛博霓虹 (粉)
+        "border": "#ff007f",
+        "label": "bold #00f0ff",
+        "status_main": "bold #ff007f",
+        "text_input": "#ffffff",
+        "menu_current": "bg:#ff007f #ffffff bold",
+        "menu_current_meta": "bg:#00f0ff #000000",
+    },
+    "dracula": {  # 德古拉暗黑 (紫)
+        "border": "#bd93f9",
+        "label": "bold #ff79c6",
+        "status_main": "bold #50fa7b",
+        "text_input": "#f8f8f2",
+        "menu_current": "bg:#bd93f9 #282a36 bold",
+        "menu_current_meta": "bg:#ff79c6 #282a36",
+    },
+
+    "lava": {  # 熔岩烈红
+        "border": "#ff5555",
+        "label": "bold #ff5555",
+        "status_main": "bold #ff5555",
+        "text_input": "#f8f8f2",
+        "menu_current": "bg:#ff5555 #000000 bold",
+        "menu_current_meta": "bg:#ff5555 #000000",
+    },
+    "sunset": {  # 落日余晖 (橙)
+        "border": "#ff9f43",
+        "label": "bold #ff9f43",
+        "status_main": "bold #ff9f43",
+        "text_input": "#f8f8f2",
+        "menu_current": "bg:#ff9f43 #000000 bold",
+        "menu_current_meta": "bg:#ff9f43 #000000",
+    },
+    "amber": {  # 荧光琥珀 (黄)
+        "border": "#f1fa8c",
+        "label": "bold #f1fa8c",
+        "status_main": "bold #f1fa8c",
+        "text_input": "#f8f8f2",
+        "menu_current": "bg:#f1fa8c #000000 bold",
+        "menu_current_meta": "bg:#f1fa8c #000000",
+    },
+    "white": {  # 象牙白
+        "border": "#ffffff",
+        "label": "bold #ffffff",
+        "status_main": "bold #ffffff",
+        "text_input": "#ffffff",
+        "menu_current": "bg:#ffffff #000000 bold",
+        "menu_current_meta": "bg:#ffffff #000000",
+    }
+}

@@ -27,7 +27,7 @@ STYLE = Style.from_dict({
 def _t(style: str, text: str):
     return (style, text)
 
-def open_session_selector(on_closed=None, on_switch=None):
+def open_session_selector(on_closed=None, on_switch=None, on_rename=None):
     """
     提供全屏终端 UI 用于浏览、切换、删除会话记录。
     """
@@ -74,7 +74,7 @@ def open_session_selector(on_closed=None, on_switch=None):
                 out.append(_t(st, line))
 
         out += [_t("", "\n")]
-        out += [_t("class:footer", "  [↑/↓] 移动   [Enter] 切换到选中的会话   [Delete/Backspace] 删除选中的会话   [Esc] 退出\n")]
+        out += [_t("class:footer", "  [↑/↓] 移动   [Enter] 切换到选中的会话   [R/F2] 重命名会话   [Delete/Backspace] 删除   [Esc] 退出\n")]
         return out
 
     kb = KeyBindings()
@@ -97,6 +97,17 @@ def open_session_selector(on_closed=None, on_switch=None):
         cur = state["sessions"][state["cursor"]]
         if on_switch:
             on_switch(cur["name"])
+        event.app.exit()
+
+    @kb.add("r")
+    @kb.add("f2")
+    def _rename(event):
+        if not state["sessions"]:
+            return
+            
+        cur = state["sessions"][state["cursor"]]
+        if on_rename:
+            on_rename(cur["name"])
         event.app.exit()
 
     @kb.add("delete")

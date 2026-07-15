@@ -134,3 +134,18 @@ def get_active_skills_markdown():
         combined += f"--- 技能结束: {s['name']} ---\n"
         
     return combined
+
+def get_active_skills_list():
+    """返回当前所有已启用技能的字典映射 {short_id: skill_info}"""
+    import os
+    active_ids = set(get_active_skill_ids())
+    if not active_ids:
+        return {}
+        
+    all_skills = scan_all_skills()
+    mapping = {}
+    for s in all_skills:
+        if s["id"] in active_ids:
+            short_id = os.path.basename(os.path.dirname(s["id"])).lower()
+            mapping[short_id] = s
+    return mapping

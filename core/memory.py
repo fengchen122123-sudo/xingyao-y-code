@@ -24,15 +24,25 @@ class MemoryManager:
         # 3. 准备执行 SQL 命令
         cursor = self.conn.cursor()
         
-        # 4. 创建一个叫 sessions 的表（相当于 Excel 里的一个工作表）
+        # 4. 创建一个叫 sessions 的表，加入摘要字段
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS sessions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_name TEXT UNIQUE
+                session_name TEXT UNIQUE,
+                memory_summary TEXT,
+                summarized_until_msg_id INTEGER
             )
         ''')
         
-        # 5. 创建一个叫 messages 的表（用来存具体的聊天记录）
+        # 兼容性升级逻辑：如果旧表已经存在但缺少字段，动态添加
+        cursor.execute("PRAGMA table_info(sessions)")
+        columns = [col[1] for col in cursor.fetchall()]
+        if "memory_summary" not in columns:
+            cursor.execute("ALTER TABLE sessions ADD COLUMN memory_summary TEXT")
+        if "summarized_until_msg_id" not in columns:
+            cursor.execute("ALTER TABLE sessions ADD COLUMN summarized_until_msg_id INTEGER")
+        
+        # 5. 创建一个叫 messages 的表
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS messages (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,6 +118,46 @@ class MemoryManager:
             
         return history
 
+    def get_history_for_llm(self, session_name):
+        """获取专门供给大模型的历史，剔除已被总结的段落，并在最前面附带记忆摘要"""
+        cursor = self.conn.cursor()
+        
+        cursor.execute('SELECT id, memory_summary, summarized_until_msg_id FROM sessions WHERE session_name = ?', (session_name,))
+        row = cursor.fetchone()
+        if row is None:
+            return []
+            
+        session_id = row[0]
+        memory_summary = row[1]
+        summarized_until_msg_id = row[2] or 0
+        
+        # 仅获取 id > summarized_until_msg_id 的消息
+        cursor.execute('''
+            SELECT role, content FROM messages
+            WHERE session_id = ? AND id > ?
+            ORDER BY id ASC
+        ''', (session_id, summarized_until_msg_id))
+        
+        import json
+        history = []
+        for record in cursor.fetchall():
+            role = record[0]
+            raw_content = record[1]
+            try:
+                parsed = json.loads(raw_content)
+                history.append({"role": role, "content": parsed})
+            except (ValueError, TypeError):
+                history.append({"role": role, "content": raw_content})
+                
+        # 如果存在背景记忆摘要，将其包装为 system 提示参考并插在首部
+        if memory_summary:
+            history.insert(0, {
+                "role": "system", 
+                "content": f"[历史对话记忆摘要 (以下是前段长对话的归纳记忆，请作为背景上下文参考，无需直接回复这段摘要)]\n{memory_summary}"
+            })
+            
+        return history
+
     def undo_last_interaction(self, session_name):
         """抹除大模型最近一次回答的记忆（防止大模型误以为文件没被回退）"""
         cursor = self.conn.cursor()
@@ -159,6 +209,36 @@ class MemoryManager:
             cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
             cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
             self.conn.commit()
+
+    def rename_session(self, old_name, new_name):
+        """重命名指定会话，确保新名称在数据库中唯一。如果名字冲突则自动加数字后缀。"""
+        cursor = self.conn.cursor()
+        
+        # 1. 查找旧会话是否存在
+        cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (old_name,))
+        row = cursor.fetchone()
+        if not row:
+            return False, old_name
+            
+        session_id = row[0]
+        
+        # 2. 检查新名字是否冲突并生成唯一名字
+        final_name = new_name.strip()
+        suffix = 1
+        while True:
+            cursor.execute('SELECT id FROM sessions WHERE session_name = ? AND id != ?', (final_name, session_id))
+            if not cursor.fetchone():
+                break
+            final_name = f"{new_name}_{suffix}"
+            suffix += 1
+            
+        # 3. 更新会话名称
+        try:
+            cursor.execute('UPDATE sessions SET session_name = ? WHERE id = ?', (final_name, session_id))
+            self.conn.commit()
+            return True, final_name
+        except Exception:
+            return False, old_name
 
     def prune_history_files(self, session_name, max_turns=16, retain_recent=4):
         """物理级折叠历史挂载的大文件，以节省 token。"""

@@ -14,6 +14,82 @@ from litellm import token_counter
 
 litellm.suppress_debug_info = True
 
+def ask_in_raw_terminal(function_name, arguments):
+    print("\n" + "━"*60)
+    if function_name == "write_file":
+        file_path = arguments.get("file_path", "未知文件")
+        content = arguments.get("content", "")
+        print(f"🚨 Y-CODE 敏感操作拦截：写入文件 🚨")
+        print(f"文件路径: {file_path}")
+        # 打印前 10 行内容预览
+        lines = content.splitlines()
+        preview = "\n".join(lines[:10])
+        if len(lines) > 10:
+            preview += f"\n... (省略 {len(lines) - 10} 行)"
+        print(f"内容预览:\n{preview}")
+    elif function_name == "edit_file":
+        file_path = arguments.get("file_path", "未知文件")
+        target = arguments.get("target_content", "")
+        repl = arguments.get("replacement_content", "")
+        print(f"🚨 Y-CODE 敏感操作拦截：修改文件 🚨")
+        print(f"文件路径: {file_path}")
+        print(f"目标删除内容:\n{target}")
+        print(f"替换新增内容:\n{repl}")
+    elif function_name == "execute_command":
+        cmd = arguments.get("command", "")
+        bg = arguments.get("run_in_background", False)
+        bg_str = " (后台运行)" if bg else ""
+        print(f"🚨 Y-CODE 敏感操作拦截：执行命令{bg_str} 🚨")
+        print(f"命令内容: {cmd}")
+        
+    print("━"*60)
+    import main
+    mode_display = {"confirm": "【每次确认】", "plan": "【计划确认，后续本轮将不再提示】"}
+    mode_tip = mode_display.get(main.current_permission_mode, "")
+    
+    try:
+        res = input(f"是否批准此项操作？{mode_tip} (y/n, 默认为 y): ").strip().lower()
+        return res in ("", "y", "yes")
+    except (KeyboardInterrupt, EOFError):
+        print("\n[⚠️ 操作已取消]")
+        return False
+
+def check_permission_and_ask(function_name, arguments):
+    import main
+    import asyncio
+    from prompt_toolkit.application import in_terminal
+    
+    # 1. 如果权限是完全放行，直接通过
+    if main.current_permission_mode == "full":
+        return True
+        
+    # 2. 如果是计划模式且本轮对话的计划已经获得批准，直接通过
+    if main.current_permission_mode == "plan" and main.plan_approved_this_turn:
+        return True
+        
+    # 3. 否则，需要挂起 TUI 并向用户征求意见
+    app = main.app_instance
+    if not app or not app.loop:
+        # 兜底：如果前台没有活动 App 实例，采用普通 input() 获取
+        return ask_in_raw_terminal(function_name, arguments)
+        
+    loop = app.loop
+    
+    async def ask_coro():
+        async with in_terminal():
+            return ask_in_raw_terminal(function_name, arguments)
+            
+    future = asyncio.run_coroutine_threadsafe(ask_coro(), loop)
+    try:
+        approved = future.result()  # 阻塞消费者线程，直至用户返回 y/n
+        if approved and main.current_permission_mode == "plan":
+            # 用户批准了，计划模式下本轮剩余的工具调用将自动放行
+            main.plan_approved_this_turn = True
+        return approved
+    except Exception as e:
+        print(f"\n[⚠️ 权限询问交互发生异常: {str(e)}]")
+        return False
+
 # 全局变量：分离“本次窗口占比”和“整体累积消耗”
 session_token_usage = {
     # 累积消耗（用来算钱）
@@ -164,6 +240,8 @@ def _yield_content(text):
     for char in text:
         yield char
 
+cancel_requested = False
+
 def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
     """返回 str（stream=False）或 Generator[str]（stream=True）"""
     """大模型通信网关：带有连续与并发工具调用（Agent Loop）能力"""
@@ -175,7 +253,8 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
         "tools": TOOLS_SCHEMA,
         "tool_choice": "auto",
         "stream": stream,
-        "stream_options": {"include_usage": True}
+        "stream_options": {"include_usage": True},
+        "num_retries": 2
     }
     
     if api_base:
@@ -184,6 +263,10 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
     try:
         max_turns = 20
         for turn in range(max_turns):
+            global cancel_requested
+            if cancel_requested:
+                raise KeyboardInterrupt("用户终止了对话。")
+                
             if stream:
                 kwargs["stream"] = True
                 response_stream = completion(**kwargs, timeout=30)
@@ -195,6 +278,8 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                 import time as native_time
                 request_start = native_time.time()
                 for chunk in response_stream:
+                    if cancel_requested:
+                        raise KeyboardInterrupt("用户终止了对话。")
                     if native_time.time() - request_start > 45:
                         raise TimeoutError("Siliconflow API 响应超时（流式读取累计耗时已超 45s），已强行切断，请稍后重试或更换模型。")
                     # 1. 解析 Token 消耗 (如果在流中提供)
@@ -313,8 +398,15 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                     print_formatted_text(HTML(f"<ansigreen>[ {safe_friendly_msg} ]</ansigreen>"))
                 
                     result = ""
+                    if function_name in ("write_file", "edit_file", "execute_command"):
+                        approved = check_permission_and_ask(function_name, arguments)
+                        if not approved:
+                            result = "🚨 用户拒绝了执行该操作。"
+
                     try:
-                        if function_name == "read_file":
+                        if result == "🚨 用户拒绝了执行该操作。":
+                            pass
+                        elif function_name == "read_file":
                             result = read_file(arguments.get("file_path", ""))
                         elif function_name == "write_file":
                             file_path = arguments.get("file_path", "")

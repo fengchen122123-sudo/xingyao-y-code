@@ -17,6 +17,19 @@ _cfg = _load()
 MY_MODEL    = _cfg.get("model",    "openai/agnes-2.0-flash")
 MY_KEY      = _cfg.get("api_key",  "")
 MY_BASE_URL = _cfg.get("base_url", "https://apihub.agnes-ai.com/v1")
+MY_THEME    = _cfg.get("theme",    "cyan")
+MY_PERMISSION_MODE = _cfg.get("permission_mode", "confirm")
+
+def save_config_value(key, value):
+    """保存配置项并持久化写入 config.json"""
+    try:
+        data = _load()
+        data[key] = value
+        with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+        return True
+    except Exception:
+        return False
 
 # 安全提示：不要把真实 API 密钥硬编码到代码里！
 # 请把 config.example.json 复制为 config.json 并填入你的真实密钥。

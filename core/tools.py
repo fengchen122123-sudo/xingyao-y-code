@@ -22,8 +22,85 @@ def list_directory(dir_path="."):
     except Exception as e:
         return f"🚨 目录扫描失败: {str(e)}"
 
+def check_and_install_dependencies(command):
+    """检测命令是否执行了 skills 中的 python 脚本，若是则自动检查并热安装缺少的库依赖"""
+    import re
+    # 匹配形如 ...skills/<skill_name>/scripts/<script>.py 的路径
+    match = re.search(r'[\'"]?([^\'"\s]*skills/[^\'"\s]+/scripts/[^\'"\s]+\.py)[\'"]?', command)
+    if not match:
+        return
+        
+    script_path = match.group(1)
+    if not os.path.exists(script_path):
+        return
+        
+    skill_dir = os.path.dirname(os.path.dirname(script_path))
+    req_file = os.path.join(skill_dir, "requirements.txt")
+    deps = []
+    
+    # 1. 尝试从 requirements.txt 中读取依赖包名
+    if os.path.exists(req_file):
+        try:
+            with open(req_file, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        dep_name = re.split(r'[=<>~!]', line)[0].strip()
+                        if dep_name:
+                            deps.append(dep_name)
+        except Exception:
+            pass
+            
+    # 2. 如果无 requirements.txt，通过正则粗暴静态扫描 import/from 关键字提取模块名作为备用
+    if not deps:
+        try:
+            with open(script_path, "r", encoding="utf-8") as f:
+                code = f.read()
+            found_imports = re.findall(r'^\s*(?:import|from)\s+(\w+)', code, re.MULTILINE)
+            import sys
+            std_libs = set(sys.builtin_module_names)
+            for m in found_imports:
+                if m not in std_libs and m not in ("core", "utils", "config", "main") and not m.startswith("_"):
+                    deps.append(m)
+        except Exception:
+            pass
+            
+    # 3. 对提取出的依赖进行环境 specs 检查，找出缺失的依赖包
+    missing_deps = []
+    import importlib.util
+    for dep in set(deps):
+        dep_base = dep.split(".")[0].strip()
+        if not dep_base:
+            continue
+        try:
+            if importlib.util.find_spec(dep_base) is None:
+                local_dir = os.path.dirname(script_path)
+                if not os.path.exists(os.path.join(local_dir, f"{dep_base}.py")) and \
+                   not os.path.exists(os.path.join(local_dir, dep_base)):
+                    missing_deps.append(dep_base)
+        except Exception:
+            pass
+            
+    # 4. 如果发现依赖缺失，自动跑 pip install 进行热装补全！
+    if missing_deps:
+        missing_str = ", ".join(missing_deps)
+        from prompt_toolkit import print_formatted_text
+        from prompt_toolkit.formatted_text import HTML
+        print_formatted_text(HTML(f"\n<ansiyellow>📦 检测到技能脚本缺少运行依赖: <b>{missing_str}</b>，正在自动热安装...</ansiyellow>"))
+        try:
+            pip_cmd = f"pip install {' '.join(missing_deps)}"
+            subprocess.run(pip_cmd, shell=True, capture_output=True, timeout=60)
+            print_formatted_text(HTML("<ansigreen>✔ 依赖包自动热装补齐成功！开始执行命令...</ansigreen>\n"))
+        except Exception as install_err:
+            print_formatted_text(HTML(f"<ansired>⚠️ 自动安装依赖失败: {install_err}</ansired>\n"))
+
 def execute_command(command, run_in_background=False):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
+    # 自动做前置依赖检测与安装
+    try:
+        check_and_install_dependencies(command)
+    except Exception:
+        pass
     if run_in_background:
         from core.task_manager import start_background_task
         try:
