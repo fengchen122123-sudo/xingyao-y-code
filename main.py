@@ -1074,8 +1074,16 @@ def _make_input_app():
         args = confirm_prompt['arguments']
         text = ""
         if func == "execute_command":
-            cmd = args.get('command', '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-            text = f"💻  星瑶申请执行命令: {cmd}\n"
+            cmd = args.get('command', '')
+            cmd_lines = cmd.splitlines()
+            if len(cmd_lines) > 2:
+                cmd_display = "\n".join(cmd_lines[:2]) + f"\n    ... (共 {len(cmd_lines)} 行)"
+            else:
+                cmd_display = cmd
+            if len(cmd_display) > 250:
+                cmd_display = cmd_display[:247] + "..."
+            cmd_escaped = cmd_display.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            text = f"💻  星瑶申请执行命令: {cmd_escaped}\n"
         elif func == "write_file":
             file_path = args.get('file_path', '').replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             text = f"✍️  星瑶申请写入文件: {file_path}\n"
@@ -1096,7 +1104,7 @@ def _make_input_app():
         content=Frame(
             Window(
                 content=FormattedTextControl(get_confirm_prompt_content),
-                height=5,
+                height=D(min=5, max=10),
                 wrap_lines=True
             ),
             title="🚨 敏感操作授权确认 (用方向键选择，回车确认)",
