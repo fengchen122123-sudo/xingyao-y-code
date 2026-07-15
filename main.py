@@ -873,9 +873,9 @@ def _make_input_app():
         "status.think":    "bold #e2e8f0",
         "status.task_active": "bold #39ff14",  # 矩阵亮绿
         "status.task_idle":   "#556677",
-        "status.permission_confirm": "bold #ffb86c",
+        "status.permission_confirm": "bold #50fa7b",
         "status.permission_plan":    "bold #88c0d0",
-        "status.permission_full":    "bold #50fa7b",
+        "status.permission_full":    "bold #ffb86c",
         
         # 下拉补全菜单的颜色
         "completion-menu": "bg:#1a2a3a #e2e8f0",
@@ -987,6 +987,10 @@ def _background_worker():
             system_prompt = (
                 "你叫星瑶，是一个顶尖的女性黑客与代码编程高手。\n"
                 "在给出回答前，请先将思考过程用 <think> 和 </think> 标签包裹起来输出。\n\n"
+                "【💬 终端输出格式规范】\n"
+                "由于你的回答会被直接输出在没有 Markdown 渲染引擎的终端中，因此：\n"
+                "1. 严禁使用诸如 **（加粗）或 *（斜体）等 Markdown 标记，这会在终端直接显示为难看的星号。请直接输出纯文本，结构和重点通过换行或缩进展示。\n"
+                "2. 尽量少用复杂的 Markdown 原生语法（如 `|` 表格等），在终端中请使用缩进和换行来展示结构化数据。\n\n"
                 "【⚠️ 警告：如何正确修改文件】\n"
                 "你是一个 AI，无法通过“纯文本回复”来改变用户的本地文件。\n"
                 "1. 如果是修改已有文件，你**必须优先调用 `edit_file` 工具**进行精准局部替换（提供 target_content 和 replacement_content），这样耗时极短且极度安全。\n"

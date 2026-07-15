@@ -280,8 +280,6 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                 for chunk in response_stream:
                     if cancel_requested:
                         raise KeyboardInterrupt("用户终止了对话。")
-                    if native_time.time() - request_start > 45:
-                        raise TimeoutError("Siliconflow API 响应超时（流式读取累计耗时已超 45s），已强行切断，请稍后重试或更换模型。")
                     # 1. 解析 Token 消耗 (如果在流中提供)
                     if hasattr(chunk, 'usage') and chunk.usage:
                         usage = chunk.usage
