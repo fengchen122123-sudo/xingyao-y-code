@@ -855,6 +855,8 @@ def _make_input_app():
     border_color = theme_cfg.get("border", "#00b4d8")
     label_color = theme_cfg.get("label", "bold #00b4d8")
     status_main = theme_cfg.get("status_main", "bold #00b4d8")
+    status_text = theme_cfg.get("status_text", "#718096")
+    status_sep = theme_cfg.get("status_sep", "#445566")
     text_input = theme_cfg.get("text_input", "#dde1e7")
     menu_current = theme_cfg.get("menu_current", "bg:#00b4d8 #ffffff bold")
     menu_current_meta = theme_cfg.get("menu_current_meta", "bg:#00b4d8 #ffffff")
@@ -868,11 +870,11 @@ def _make_input_app():
         "input-field":     f"bg:#0a0a0f {text_input}",
         # 状态栏：去掉所有底色，直接使用前景色
         "status.model":    status_main,
-        "status.sep":      "#445566",
-        "status.token":    "#718096",
+        "status.sep":      status_sep,
+        "status.token":    status_text,
         "status.think":    "bold #e2e8f0",
         "status.task_active": "bold #39ff14",  # 矩阵亮绿
-        "status.task_idle":   "#556677",
+        "status.task_idle":   status_sep,
         "status.permission_confirm": "bold #50fa7b",
         "status.permission_plan":    "bold #88c0d0",
         "status.permission_full":    "bold #ffb86c",
