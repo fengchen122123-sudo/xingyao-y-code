@@ -8,47 +8,223 @@ logging.getLogger("LiteLLM").setLevel(logging.ERROR)
 logging.getLogger("litellm").setLevel(logging.ERROR)
 
 # 🌟 注意这里：我们把四个工具全都引进来了！
-from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task
+from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent
 from core.mcp_client import mcp_manager
 from litellm import token_counter
 
+# 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
+session_allowed_commands = set()      # 放行的命令前缀 (如 'git', 'date')
+session_allowed_write_files = set()   # 放行的写入文件绝对路径
+session_allowed_edit_files = set()    # 放行的修改文件绝对路径
+_last_tracked_session = None
+
+def check_session_reset():
+    global _last_tracked_session, session_allowed_commands, session_allowed_write_files, session_allowed_edit_files
+    import main
+    if _last_tracked_session != main.current_session:
+        _last_tracked_session = main.current_session
+        session_allowed_commands.clear()
+        session_allowed_write_files.clear()
+        session_allowed_edit_files.clear()
+
 litellm.suppress_debug_info = True
 
+def select_from_options(options, default_index=0):
+    """
+    提供类似 Claude Code 的交互式上下键菜单选择器。
+    在非 Windows 系统或 stdin 重定向的环境下自动平滑降级为普通命令行交互。
+    """
+    try:
+        import msvcrt
+        import sys
+        import ctypes
+        from ctypes import wintypes
+        
+        # 使用 ctypes 显式将 Windows 控制台设为 Raw 模式，防止 getch() 阻塞
+        kernel32 = ctypes.windll.kernel32
+        hStdIn = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        
+        orig_mode = wintypes.DWORD()
+        kernel32.GetConsoleMode(hStdIn, ctypes.byref(orig_mode))
+        
+        # 禁用行输入 (0x0002) 和回显 (0x0004)
+        raw_mode = orig_mode.value & ~(0x0002 | 0x0004)
+        kernel32.SetConsoleMode(hStdIn, raw_mode)
+        
+        current_idx = default_index
+        num_options = len(options)
+        
+        # 隐藏光标
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
+        
+        def render():
+            for idx, option in enumerate(options):
+                prefix = "  > " if idx == current_idx else "    "
+                if idx == current_idx:
+                    sys.stdout.write(f"\033[K\033[92m\033[1m{prefix}{option}\033[0m\n")
+                else:
+                    sys.stdout.write(f"\033[K{prefix}{option}\n")
+            sys.stdout.flush()
+            
+        render()
+        
+        try:
+            # 清空之前的按键缓存
+            while msvcrt.kbhit():
+                msvcrt.getch()
+                
+            while True:
+                ch = msvcrt.getch()
+                if ch in (b'\xe0', b'\x00'):
+                    ch2 = msvcrt.getch()
+                    if ch2 == b'H':  # Up Arrow
+                        current_idx = (current_idx - 1) % num_options
+                    elif ch2 == b'P':  # Down Arrow
+                        current_idx = (current_idx + 1) % num_options
+                    sys.stdout.write(f"\033[{num_options}A")
+                    render()
+                elif ch in (b'y', b'Y') and num_options > 0:
+                    current_idx = 0
+                    sys.stdout.write(f"\033[{num_options}A")
+                    render()
+                elif ch in (b'n', b'N') and num_options > 1:
+                    current_idx = 1
+                    sys.stdout.write(f"\033[{num_options}A")
+                    render()
+                elif ch in (b'a', b'A') and num_options > 2:
+                    current_idx = 2
+                    sys.stdout.write(f"\033[{num_options}A")
+                    render()
+                elif ch in (b'\r', b'\n'):
+                    break
+                elif ch == b'\x03':  # Ctrl+C
+                    raise KeyboardInterrupt()
+        finally:
+            # 恢复原始控制台模式
+            kernel32.SetConsoleMode(hStdIn, orig_mode.value)
+            
+            # 恢复光标并清空选择列表显示（使终端只保留最终选择的一行，保持极其整洁）
+            sys.stdout.write(f"\033[{num_options}A")
+            for _ in range(num_options):
+                sys.stdout.write("\033[K\n")
+            sys.stdout.write(f"\033[{num_options}A")
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
+            
+        return current_idx
+    except Exception:
+        # 降级兜底
+        return None
+
 def ask_in_raw_terminal(function_name, arguments):
-    print("\n" + "━"*60)
+    import main
+    mode_display = {"confirm": "每次确认", "plan": "计划确认"}
+    mode_tip = mode_display.get(main.current_permission_mode, "确认")
+    
+    print("")  # 空行分隔
     if function_name == "write_file":
         file_path = arguments.get("file_path", "未知文件")
         content = arguments.get("content", "")
-        print(f"🚨 Y-CODE 敏感操作拦截：写入文件 🚨")
-        print(f"文件路径: {file_path}")
-        # 打印前 10 行内容预览
+        print(f"✍️  星瑶申请写入文件: {file_path}")
         lines = content.splitlines()
-        preview = "\n".join(lines[:10])
-        if len(lines) > 10:
-            preview += f"\n... (省略 {len(lines) - 10} 行)"
-        print(f"内容预览:\n{preview}")
+        if lines:
+            preview = "\n".join(lines[:5])
+            if len(lines) > 5:
+                preview += f"\n   ... (共 {len(lines)} 行)"
+            print(f"   [预览]:\n   {preview}")
     elif function_name == "edit_file":
         file_path = arguments.get("file_path", "未知文件")
         target = arguments.get("target_content", "")
         repl = arguments.get("replacement_content", "")
-        print(f"🚨 Y-CODE 敏感操作拦截：修改文件 🚨")
-        print(f"文件路径: {file_path}")
-        print(f"目标删除内容:\n{target}")
-        print(f"替换新增内容:\n{repl}")
+        print(f"📝  星瑶申请修改文件: {file_path}")
+        print(f"   [-] 计划删除: {target.strip()[:100]}...")
+        print(f"   [+] 计划替换: {repl.strip()[:100]}...")
     elif function_name == "execute_command":
         cmd = arguments.get("command", "")
         bg = arguments.get("run_in_background", False)
         bg_str = " (后台运行)" if bg else ""
-        print(f"🚨 Y-CODE 敏感操作拦截：执行命令{bg_str} 🚨")
-        print(f"命令内容: {cmd}")
+        print(f"💻  星瑶申请执行命令{bg_str}: {cmd}")
         
-    print("━"*60)
-    import main
-    mode_display = {"confirm": "【每次确认】", "plan": "【计划确认，后续本轮将不再提示】"}
-    mode_tip = mode_display.get(main.current_permission_mode, "")
+    options = [
+        "Yes, 同意本次操作 (y)",
+        "No, 拒绝本次操作 (n)",
+        "Always, 允许此类操作 (a)"
+    ]
     
+    # 尝试使用高品质交互式上下键菜单选择器
+    choice_idx = select_from_options(options)
+    
+    if choice_idx is not None:
+        choices_map = {
+            0: "\033[92m✓ 已同意本次操作\033[0m",
+            1: "\033[91m✗ 已拒绝本次操作\033[0m",
+            2: "\033[96m✨ 已选择始终放行此类操作 (当前会话)\033[0m"
+        }
+        print(f"   👉 确认结果: {choices_map[choice_idx]}")
+        
+        if choice_idx == 1:
+            return False
+            
+        if choice_idx == 2:
+            if function_name == "execute_command":
+                cmd = arguments.get("command", "")
+                words = cmd.split()
+                if words:
+                    first_word = words[0]
+                    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
+                        prefix = f"{first_word} {words[1]}"
+                    else:
+                        prefix = first_word
+                    session_allowed_commands.add(prefix)
+                    print(f"   ✨ [当前会话已放行前缀]：{prefix}*")
+            elif function_name == "write_file":
+                file_path = arguments.get("file_path", "")
+                if file_path:
+                    session_allowed_write_files.add(file_path)
+                    print(f"   ✨ [当前会话已放行写入]：{file_path}")
+            elif function_name == "edit_file":
+                file_path = arguments.get("file_path", "")
+                if file_path:
+                    session_allowed_edit_files.add(file_path)
+                    print(f"   ✨ [当前会话已放行修改]：{file_path}")
+            return True
+            
+        return True
+        
+    # 兜底：如果选择器不支持（重定向等），降级为常规 input 模式
     try:
-        res = input(f"是否批准此项操作？{mode_tip} (y/n, 默认为 y): ").strip().lower()
+        print("👉 输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前会话放行)")
+        res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
+        
+        if res in ("n", "no"):
+            return False
+            
+        if res in ("a", "always", "y*"):
+            if function_name == "execute_command":
+                cmd = arguments.get("command", "")
+                words = cmd.split()
+                if words:
+                    first_word = words[0]
+                    # 特殊处理：如果是 python / pip 脚本，允许保留首个参数（脚本路径）以防过度放行整个 python
+                    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
+                        prefix = f"{first_word} {words[1]}"
+                    else:
+                        prefix = first_word
+                    session_allowed_commands.add(prefix)
+                    print(f"✨ [当前会话已放行前缀]：{prefix}*")
+            elif function_name == "write_file":
+                file_path = arguments.get("file_path", "")
+                if file_path:
+                    session_allowed_write_files.add(file_path)
+                    print(f"✨ [当前会话已放行写入]：{file_path}")
+            elif function_name == "edit_file":
+                file_path = arguments.get("file_path", "")
+                if file_path:
+                    session_allowed_edit_files.add(file_path)
+                    print(f"✨ [当前会话已放行修改]：{file_path}")
+            return True
+            
         return res in ("", "y", "yes")
     except (KeyboardInterrupt, EOFError):
         print("\n[⚠️ 操作已取消]")
@@ -59,34 +235,135 @@ def check_permission_and_ask(function_name, arguments):
     import asyncio
     from prompt_toolkit.application import in_terminal
     
-    # 1. 如果权限是完全放行，直接通过
+    # 0. 自动同步和重置会话级别的白名单缓存
+    check_session_reset()
+    
+    # 1. 检查当前会话中是否已被用户“永久允许”
+    if function_name == "execute_command":
+        cmd = arguments.get("command", "")
+        for prefix in session_allowed_commands:
+            if cmd.startswith(prefix):
+                print(f"💚 [当前会话自动放行命令]：{cmd}")
+                return True
+    elif function_name == "write_file":
+        file_path = arguments.get("file_path", "")
+        if file_path in session_allowed_write_files:
+            print(f"💚 [当前会话自动放行写入]：{file_path}")
+            return True
+    elif function_name == "edit_file":
+        file_path = arguments.get("file_path", "")
+        if file_path in session_allowed_edit_files:
+            print(f"💚 [当前会话自动放行修改]：{file_path}")
+            return True
+    
+    # 2. 如果权限是完全放行，直接通过
     if main.current_permission_mode == "full":
         return True
         
-    # 2. 如果是计划模式且本轮对话的计划已经获得批准，直接通过
+    # 3. 如果是计划模式且本轮对话的计划已经获得批准，直接通过
     if main.current_permission_mode == "plan" and main.plan_approved_this_turn:
         return True
         
-    # 3. 否则，需要挂起 TUI 并向用户征求意见
+    # 4. 否则，需要使用 TUI 确认面板向用户征求意见
+    # 临时切入等待授权状态，并刷新状态栏
+    old_status = main.task_status
+    main.task_status = 'waiting'
+    if main.app_instance:
+        main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
+
     app = main.app_instance
     if not app or not app.loop:
         # 兜底：如果前台没有活动 App 实例，采用普通 input() 获取
-        return ask_in_raw_terminal(function_name, arguments)
+        approved = ask_in_raw_terminal(function_name, arguments)
+        main.task_status = old_status
+        return approved
         
     loop = app.loop
     
-    async def ask_coro():
-        async with in_terminal():
-            return ask_in_raw_terminal(function_name, arguments)
-            
-    future = asyncio.run_coroutine_threadsafe(ask_coro(), loop)
+    # 异步在 TUI 线程初始化 confirm_prompt 并创建一个 Future 用来跨线程同步等待用户按键
+    async def setup_prompt():
+        fut = loop.create_future()
+        main.confirm_prompt = {
+            'function_name': function_name,
+            'arguments': arguments,
+            'options': [
+                "Yes, 同意本次操作 (y)",
+                "No, 拒绝本次操作 (n)",
+                "Always, 始终允许此类操作 (a)"
+            ],
+            'current_idx': 0,
+            'future': fut
+        }
+        main.app_instance.invalidate()
+        return fut
+        
+    fut = asyncio.run_coroutine_threadsafe(setup_prompt(), loop).result()
+    
     try:
-        approved = future.result()  # 阻塞消费者线程，直至用户返回 y/n
+        choice_idx = fut.result()  # 阻塞当前后台 Worker 线程，直至 TUI 线程设置用户按键的选择结果
+        
+        # 恢复状态并触发刷新
+        main.task_status = old_status
+        if main.app_instance:
+            main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
+            
+        choices_map = {
+            0: "\033[92m✓ 已同意本次操作\033[0m",
+            1: "\033[91m✗ 已拒绝本次操作\033[0m",
+            2: "\033[96m✨ 已选择始终放行此类操作 (当前会话)\033[0m"
+        }
+        
+        # 向主对话历史区打印整洁的单行授权记录
+        from prompt_toolkit import print_formatted_text
+        from prompt_toolkit.formatted_text import ANSI
+        
+        if function_name == "execute_command":
+            cmd = arguments.get("command", "")
+            print_formatted_text(ANSI(f"💻 星瑶申请执行命令: {cmd}"))
+        elif function_name == "write_file":
+            file_path = arguments.get("file_path", "")
+            print_formatted_text(ANSI(f"✍️ 星瑶申请写入文件: {file_path}"))
+        elif function_name == "edit_file":
+            file_path = arguments.get("file_path", "")
+            print_formatted_text(ANSI(f"📝 星瑶申请修改文件: {file_path}"))
+            
+        print_formatted_text(ANSI(f"   👉 确认结果: {choices_map[choice_idx]}"))
+        
+        if choice_idx == 1:
+            return False
+            
+        if choice_idx == 2:
+            if function_name == "execute_command":
+                cmd = arguments.get("command", "")
+                words = cmd.split()
+                if words:
+                    first_word = words[0]
+                    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
+                        prefix = f"{first_word} {words[1]}"
+                    else:
+                        prefix = first_word
+                    session_allowed_commands.add(prefix)
+                    print_formatted_text(ANSI(f"   ✨ [当前会话已放行前缀]：{prefix}*"))
+            elif function_name == "write_file":
+                file_path = arguments.get("file_path", "")
+                if file_path:
+                    session_allowed_write_files.add(file_path)
+                    print_formatted_text(ANSI(f"   ✨ [当前会话已放行写入]：{file_path}"))
+            elif function_name == "edit_file":
+                file_path = arguments.get("file_path", "")
+                if file_path:
+                    session_allowed_edit_files.add(file_path)
+                    print_formatted_text(ANSI(f"   ✨ [当前会话已放行修改]：{file_path}"))
+            return True
+            
+        approved = (choice_idx in (0, 2))
         if approved and main.current_permission_mode == "plan":
-            # 用户批准了，计划模式下本轮剩余的工具调用将自动放行
             main.plan_approved_this_turn = True
         return approved
     except Exception as e:
+        main.task_status = old_status
+        if main.app_instance:
+            main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
         print(f"\n[⚠️ 权限询问交互发生异常: {str(e)}]")
         return False
 
@@ -224,11 +501,27 @@ TOOLS_SCHEMA = [
                 "required": ["action"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "run_subagent",
+            "description": "启动一个相对独立的辅助子 Agent 来协助完成特定的子任务，并在结束后返回详尽的汇总报告。",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task_description": {"type": "string", "description": "需要子 Agent 独立去完成的具体子任务描述。"}
+                },
+                "required": ["task_description"]
+            }
+        }
     }
 ] + mcp_manager.get_schemas()
 
 def estimate_tokens(model_name, messages):
     """本地离线快速估算 Token 数，防止超载崩溃"""
+    if not messages:
+        return 0
     try:
         return token_counter(model=model_name, messages=messages)
     except Exception:
@@ -261,7 +554,7 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
         kwargs["api_base"] = api_base
         
     try:
-        max_turns = 20
+        max_turns = 100
         for turn in range(max_turns):
             global cancel_requested
             if cancel_requested:
@@ -356,6 +649,11 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                     return
                     
                 # 如果有工具，则开始执行工具 (不 yield 任何东西，让 UI 保持等待)
+                import main
+                main.task_status = 'executing'
+                if main.app_instance:
+                    main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
+                
                 for tc in tool_calls_list:
                     function_name = tc["function"]["name"]
                     arguments_str = tc["function"]["arguments"]
@@ -486,6 +784,9 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                             act = arguments.get("action")
                             tid = arguments.get("task_id")
                             result = manage_task(act, tid)
+                        elif function_name == "run_subagent":
+                            desc = arguments.get("task_description")
+                            result = run_subagent(desc)
                         elif function_name == "edit_file":
                             file_path = arguments.get("file_path")
                             target = arguments.get("target_content")
@@ -553,6 +854,11 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                         "name": function_name,
                         "content": str(result)
                     })
+                
+                # 工具执行完毕，恢复至思考状态进行后续回复生成
+                main.task_status = 'thinking'
+                if main.app_instance:
+                    main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
             
             # 循环继续，带着所有工具的执行结果发起下一轮对话
             

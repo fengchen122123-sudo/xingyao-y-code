@@ -283,3 +283,64 @@ def edit_file(file_path, target_content, replacement_content):
         return f"✔ 文件 {file_path} 精准替换修改成功！"
     except Exception as e:
         return f"🚨 精准修改发生异常: {str(e)}"
+
+import threading
+subagents_lock = threading.Lock()
+active_subagent_numbers = set()
+
+def run_subagent(task_description):
+    """
+    启动一个相对独立的辅助子 Agent 协助主任务的拆解与执行，并在执行结束后返回工作汇总结果。
+    参数:
+      task_description: 子任务的详细描述，应指明所需的输入、目标以及希望获得的结果。
+    """
+    import main
+    from core.llm import chat_with_model
+    from prompt_toolkit import print_formatted_text
+    from prompt_toolkit.formatted_text import HTML
+    
+    # 动态分配星瑶X号子代理编号与上限防线
+    with subagents_lock:
+        if len(active_subagent_numbers) >= 5:
+            msg = "🚨 子 Agent 启动失败：当前处于活动状态的子 Agent 已达最大上限（最多 5 个）。"
+            print_formatted_text(HTML(f"<b><ansired>{msg}</ansired></b>\n"))
+            return msg
+            
+        subagent_num = 2
+        while subagent_num in active_subagent_numbers:
+            subagent_num += 1
+        active_subagent_numbers.add(subagent_num)
+        
+    subagent_name = f"星瑶{subagent_num}号"
+    
+    # 打印给前台，让用户知晓子任务启动
+    print_formatted_text(HTML(f"\n<b><ansiyellow>🤖 [{subagent_name}] 启动中... 任务内容：{task_description[:60]}...</ansiyellow></b>"))
+    
+    sub_system_prompt = (
+        f"你的名字叫 {subagent_name}，你是一个子 Agent（辅助智能体）。你的任务是独立协助主 Agent 完成特定的子任务。\n"
+        "你可以自由且多次地使用现有的工具（读取、写入、修改文件，执行命令等）来解决问题。\n"
+        "任务达成后，请直接输出一份非常详尽的最终工作汇总报告，以便主 Agent 进行接下来的整合。不要包含任何无意义的闲聊。"
+    )
+    
+    messages = [
+        {"role": "system", "content": sub_system_prompt},
+        {"role": "user", "content": f"请执行并完成以下任务，并输出完整报告：\n{task_description}"}
+    ]
+    
+    try:
+        # 使用当前运行的主环境配置
+        task_model = main.current_model
+        task_key = main.current_key
+        task_url = main.current_url
+        
+        # 启动辅助代理。注意，流式输出置为 False，让其在后台完整走完多轮对话循环后直接返回汇总文本
+        result = chat_with_model(task_model, task_key, messages, task_url, stream=False)
+        print_formatted_text(HTML(f"<b><ansigreen>✔ [{subagent_name}] 任务执行完毕，结果已汇报给主 Agent。</ansigreen></b>\n"))
+        return f"✅ {subagent_name} 工作圆满结束！工作汇总如下：\n{result}"
+    except Exception as e:
+        print_formatted_text(HTML(f"<b><ansired>🚨 [{subagent_name}] 运行发生异常：{str(e)}</ansired></b>\n"))
+        return f"🚨 {subagent_name} 执行失败，报错：{str(e)}"
+    finally:
+        with subagents_lock:
+            if subagent_num in active_subagent_numbers:
+                active_subagent_numbers.remove(subagent_num)

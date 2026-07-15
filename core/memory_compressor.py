@@ -4,11 +4,11 @@ from litellm import completion
 from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import HTML
 
-def compress_session_memory(manager, session_name, api_model, api_key, api_url):
+def compress_session_memory(manager, session_name, api_model, api_key, api_url, force=False):
     """
     智能归纳压缩会话记忆：
     1. 读取全部历史对话记录；
-    2. 保留最近的 8 条（也就是 4 轮对话，user-assistant）作为当前活跃上下文；
+    2. 保留最近的 8 条（force=True时保留 4 条，也就是 2-4 轮对话，user-assistant）作为当前活跃上下文；
     3. 把在此之前的所有更老对话打包，调用 LLM 提炼/合并生成简短中文记忆摘要并写入 sessions。
     """
     try:
@@ -56,8 +56,10 @@ def compress_session_memory(manager, session_name, api_model, api_key, api_url):
             
         # 3. 统计需要保留的最近活跃消息（保留最后 8 条活跃消息，即 4 轮完整 user-assistant 交互）
         # 确保只有在活跃消息数显著多于保留数时才压缩，否则没意义
-        RETAIN_COUNT = 8
+        RETAIN_COUNT = 4 if force else 8
         if len(all_active_messages) <= RETAIN_COUNT + 2:
+            if force:
+                print_formatted_text(HTML("<ansiyellow>ℹ 当前会话活跃对话过少（少于 6 条），无需进行记忆压缩。</ansiyellow>"))
             return False
             
         messages_to_summarize = all_active_messages[:-RETAIN_COUNT]

@@ -198,6 +198,13 @@ class MemoryManager:
             ORDER BY s.id DESC
         ''')
         return [{"name": row[0], "count": row[1]} for row in cursor.fetchall()]
+
+    def get_memory_summary(self, session_name):
+        """获取当前会话的背景记忆摘要"""
+        cursor = self.conn.cursor()
+        cursor.execute('SELECT memory_summary FROM sessions WHERE session_name = ?', (session_name,))
+        row = cursor.fetchone()
+        return row[0] if row else None
         
     def delete_session(self, session_name):
         """删除指定会话及其所有消息"""
