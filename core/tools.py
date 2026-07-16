@@ -287,6 +287,7 @@ def edit_file(file_path, target_content, replacement_content):
 import threading
 subagents_lock = threading.Lock()
 active_subagent_numbers = set()
+used_subagent_numbers_this_turn = set()
 
 def run_subagent(task_description):
     """
@@ -307,9 +308,10 @@ def run_subagent(task_description):
             return msg
             
         subagent_num = 2
-        while subagent_num in active_subagent_numbers:
+        while subagent_num in active_subagent_numbers or subagent_num in used_subagent_numbers_this_turn:
             subagent_num += 1
         active_subagent_numbers.add(subagent_num)
+        used_subagent_numbers_this_turn.add(subagent_num)
         
     subagent_name = f"星瑶{subagent_num}号"
     

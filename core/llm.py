@@ -29,6 +29,15 @@ def check_session_reset():
 
 litellm.suppress_debug_info = True
 
+def safe_print(formatted_text):
+    """线程安全地在 TUI 终端输出格式化文本，避免破坏屏幕布局"""
+    import main
+    from prompt_toolkit import print_formatted_text
+    if main.app_instance and main.app_instance.loop:
+        main.app_instance.loop.call_soon_threadsafe(lambda: print_formatted_text(formatted_text))
+    else:
+        print_formatted_text(formatted_text)
+
 def select_from_options(options, default_index=0):
     """
     提供类似 Claude Code 的交互式上下键菜单选择器。
@@ -280,9 +289,11 @@ def check_permission_and_ask(function_name, arguments):
         
     loop = app.loop
     
-    # 异步在 TUI 线程初始化 confirm_prompt 并创建一个 Future 用来跨线程同步等待用户按键
+    from concurrent.futures import Future
+    fut = Future()
+    
+    # 异步在 TUI 线程初始化 confirm_prompt 并绑定 Future
     async def setup_prompt():
-        fut = loop.create_future()
         main.confirm_prompt = {
             'function_name': function_name,
             'arguments': arguments,
@@ -295,9 +306,8 @@ def check_permission_and_ask(function_name, arguments):
             'future': fut
         }
         main.app_instance.invalidate()
-        return fut
         
-    fut = asyncio.run_coroutine_threadsafe(setup_prompt(), loop).result()
+    asyncio.run_coroutine_threadsafe(setup_prompt(), loop).result()
     
     try:
         choice_idx = fut.result()  # 阻塞当前后台 Worker 线程，直至 TUI 线程设置用户按键的选择结果
@@ -314,20 +324,19 @@ def check_permission_and_ask(function_name, arguments):
         }
         
         # 向主对话历史区打印整洁的单行授权记录
-        from prompt_toolkit import print_formatted_text
         from prompt_toolkit.formatted_text import ANSI
         
         if function_name == "execute_command":
             cmd = arguments.get("command", "")
-            print_formatted_text(ANSI(f"💻 星瑶申请执行命令: {cmd}"))
+            safe_print(ANSI(f"💻 星瑶申请执行命令: {cmd}"))
         elif function_name == "write_file":
             file_path = arguments.get("file_path", "")
-            print_formatted_text(ANSI(f"✍️ 星瑶申请写入文件: {file_path}"))
+            safe_print(ANSI(f"✍️ 星瑶申请写入文件: {file_path}"))
         elif function_name == "edit_file":
             file_path = arguments.get("file_path", "")
-            print_formatted_text(ANSI(f"📝 星瑶申请修改文件: {file_path}"))
+            safe_print(ANSI(f"📝 星瑶申请修改文件: {file_path}"))
             
-        print_formatted_text(ANSI(f"   👉 确认结果: {choices_map[choice_idx]}"))
+        safe_print(ANSI(f"   👉 确认结果: {choices_map[choice_idx]}"))
         
         if choice_idx == 1:
             return False
@@ -343,17 +352,17 @@ def check_permission_and_ask(function_name, arguments):
                     else:
                         prefix = first_word
                     session_allowed_commands.add(prefix)
-                    print_formatted_text(ANSI(f"   ✨ [当前会话已放行前缀]：{prefix}*"))
+                    safe_print(ANSI(f"   ✨ [当前会话已放行前缀]：{prefix}*"))
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     session_allowed_write_files.add(file_path)
-                    print_formatted_text(ANSI(f"   ✨ [当前会话已放行写入]：{file_path}"))
+                    safe_print(ANSI(f"   ✨ [当前会话已放行写入]：{file_path}"))
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     session_allowed_edit_files.add(file_path)
-                    print_formatted_text(ANSI(f"   ✨ [当前会话已放行修改]：{file_path}"))
+                    safe_print(ANSI(f"   ✨ [当前会话已放行修改]：{file_path}"))
             return True
             
         approved = (choice_idx in (0, 2))
@@ -536,16 +545,31 @@ def _yield_content(text):
 cancel_requested = False
 
 def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
-    """返回 str（stream=False）或 Generator[str]（stream=True）"""
-    """大模型通信网关：带有连续与并发工具调用（Agent Loop）能力"""
-    
+    """
+    大模型通信网关：支持流式（stream=True）与非流式（stream=False，后台 Agent 自动消化）
+    """
+    gen = _chat_with_model_generator(model_name, api_key, messages, api_base=api_base, stream=stream)
+    if stream:
+        return gen
+    else:
+        # 非流式模式下，由包装函数在后台默默消耗生成器，完成所有工具调用与轮次迭代
+        for _ in gen:
+            pass
+        if messages and messages[-1]["role"] == "assistant":
+            return messages[-1].get("content", "") or ""
+        return ""
+
+def _chat_with_model_generator(model_name, api_key, messages, api_base=None, stream=False):
+    """
+    内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
+    """
     kwargs = {
         "model": model_name,
         "api_key": api_key,
         "messages": messages,
         "tools": TOOLS_SCHEMA,
         "tool_choice": "auto",
-        "stream": stream,
+        "stream": True,
         "stream_options": {"include_usage": True},
         "num_retries": 2
     }
@@ -560,7 +584,7 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
             if cancel_requested:
                 raise KeyboardInterrupt("用户终止了对话。")
                 
-            if stream:
+            if True:  # 强制统一走流式解析逻辑以获取流式 chunk 及其中的工具链
                 kwargs["stream"] = True
                 response_stream = completion(**kwargs, timeout=30)
                 
@@ -688,10 +712,9 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                         friendly_msg = f"🌐 星瑶正在联网搜索：{arguments.get('query', '')}"
 
                     # 打印一条提示给控制台
-                    from prompt_toolkit import print_formatted_text
                     from prompt_toolkit.formatted_text import HTML
                     safe_friendly_msg = friendly_msg.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    print_formatted_text(HTML(f"<ansigreen>[ {safe_friendly_msg} ]</ansigreen>"))
+                    safe_print(HTML(f"<ansigreen>[ {safe_friendly_msg} ]</ansigreen>"))
                 
                     result = ""
                     if function_name in ("write_file", "edit_file", "execute_command"):
@@ -753,14 +776,13 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                                     )
                                     
                                     # 解决 patch_stdout 下 rich 直接 print 产生 ANSI 乱码的问题
-                                    from prompt_toolkit import print_formatted_text
                                     from prompt_toolkit.formatted_text import ANSI
                                     
                                     rich_console = Console(force_terminal=True, color_system="truecolor")
                                     with rich_console.capture() as capture:
                                         rich_console.print(panel)
                                     
-                                    print_formatted_text(ANSI(capture.get()))
+                                    safe_print(ANSI(capture.get()))
                                     
                             except Exception as e:
                                 print(f"\n[⚠️ Diff 生成失败: {str(e)}]")
@@ -828,14 +850,13 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
                                             expand=False
                                         )
                                         
-                                        from prompt_toolkit import print_formatted_text
                                         from prompt_toolkit.formatted_text import ANSI
                                         
                                         rich_console = Console(force_terminal=True, color_system="truecolor")
                                         with rich_console.capture() as capture:
                                             rich_console.print(panel)
                                             
-                                        print_formatted_text(ANSI(capture.get()))
+                                        safe_print(ANSI(capture.get()))
                                 except Exception as e:
                                     print(f"\n[⚠️ Diff 生成失败: {str(e)}]")
                         else:
@@ -863,16 +884,10 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
             # 循环继续，带着所有工具的执行结果发起下一轮对话
             
         msg = f"🚨 任务轮次超过上限（{max_turns} 轮），请把任务拆小一点再试！"
-        if stream:
-            yield from _yield_content(msg)
-            return
-        else:
-            return msg
+        yield from _yield_content(msg)
+        return
         
     except Exception as e:
         msg = f"🚨 糟糕！错误信息：{str(e)}"
-        if stream:
-            yield from _yield_content(msg)
-            return
-        else:
-            return msg
+        yield from _yield_content(msg)
+        return

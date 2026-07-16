@@ -8,7 +8,8 @@ from mcp.client.stdio import stdio_client
 
 class MCPManager:
     def __init__(self):
-        self.config_file = "mcp.json"
+        import config
+        self.config_file = config.MCP_FILE
         self.servers = {} # name -> {"session": session, "stack": stack}
         self.tool_schemas = []
         self.server_of_tool = {} # tool_name -> server_name

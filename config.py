@@ -1,7 +1,46 @@
 import json
 import os
+import shutil
 
-_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "config.json")
+# 获取用户目录下的 .ycode 文件夹
+YCODE_DIR = os.path.join(os.path.expanduser("~"), ".ycode")
+os.makedirs(YCODE_DIR, exist_ok=True)
+
+# 集中定义所有持久化文件路径
+_CONFIG_FILE = os.path.join(YCODE_DIR, "config.json")
+DB_FILE = os.path.join(YCODE_DIR, "ycode.db")
+ACTIVE_SKILLS_FILE = os.path.join(YCODE_DIR, "active_skills.json")
+MCP_FILE = os.path.join(YCODE_DIR, "mcp.json")
+SYSTEM_PROMPT_FILE = os.path.join(YCODE_DIR, "system_prompt.md")
+
+# 自动从当前源码目录初始化默认配置文件
+if not os.path.exists(_CONFIG_FILE):
+    default_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
+    if os.path.exists(default_config_path):
+        try:
+            shutil.copy(default_config_path, _CONFIG_FILE)
+        except Exception:
+            pass
+    if not os.path.exists(_CONFIG_FILE):
+        try:
+            with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
+                json.dump({"active_model_id": None, "providers": []}, f, indent=2)
+        except Exception:
+            pass
+
+if not os.path.exists(SYSTEM_PROMPT_FILE):
+    default_prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
+    if os.path.exists(default_prompt_path):
+        try:
+            shutil.copy(default_prompt_path, SYSTEM_PROMPT_FILE)
+        except Exception:
+            pass
+    if not os.path.exists(SYSTEM_PROMPT_FILE):
+        try:
+            with open(SYSTEM_PROMPT_FILE, "w", encoding="utf-8") as f:
+                f.write("你叫星瑶，是一个顶尖的女性黑客与代码编程高手。")
+        except Exception:
+            pass
 
 def _load():
     try:

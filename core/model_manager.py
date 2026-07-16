@@ -6,7 +6,8 @@ import json
 import os
 import uuid
 
-_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "..", "config.json")
+import config
+_CONFIG_FILE = config._CONFIG_FILE
 
 
 def load_config() -> dict:

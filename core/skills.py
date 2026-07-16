@@ -3,8 +3,9 @@ import re
 import json
 import glob
 
+import config
 # 使用一个独立的文件来记录当前启用的技能列表
-ACTIVE_SKILLS_FILE = "active_skills.json"
+ACTIVE_SKILLS_FILE = config.ACTIVE_SKILLS_FILE
 
 def get_skill_dirs():
     """返回所有可能包含 SKILL.md 的基础目录"""

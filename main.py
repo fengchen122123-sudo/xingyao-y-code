@@ -25,10 +25,10 @@ from prompt_toolkit.formatted_text import HTML
 from core.memory import MemoryManager
 from core.llm import chat_with_model, session_token_usage
 from core.model_manager import get_active_model
-from config import MY_MODEL, MY_KEY, MY_BASE_URL, MY_THEME, MY_PERMISSION_MODE
+from config import MY_MODEL, MY_KEY, MY_BASE_URL, MY_THEME, MY_PERMISSION_MODE, DB_FILE
 
 console = Console()
-manager = MemoryManager()
+manager = MemoryManager(db_path=DB_FILE)
 
 current_theme = MY_THEME
 current_permission_mode = MY_PERMISSION_MODE
@@ -1254,8 +1254,14 @@ def _background_worker():
         task_data = msg_queue.get()
         if task_data is None:
             break
-        # 新一轮对话，重置计划模式授权状态
+        # 新一轮对话，重置计划模式授权状态与已用子 Agent 编号缓存
         plan_approved_this_turn = False
+        try:
+            from core.tools import used_subagent_numbers_this_turn, subagents_lock
+            with subagents_lock:
+                used_subagent_numbers_this_turn.clear()
+        except Exception:
+            pass
             
         user_input = task_data["text"]
         was_queued = task_data["was_queued"]
@@ -1351,7 +1357,8 @@ def _background_worker():
             history = [m for m in history if m.get("role") != "system"]
             import os
             import datetime
-            prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
+            from config import SYSTEM_PROMPT_FILE
+            prompt_path = SYSTEM_PROMPT_FILE
             system_prompt = ""
             if os.path.exists(prompt_path):
                 try:
