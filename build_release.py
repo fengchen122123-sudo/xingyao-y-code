@@ -36,30 +36,44 @@ def build():
     print("运行命令:", " ".join(cmd_core))
     subprocess.run(cmd_core, check=True)
     
-    print("\n2. 正在验证核心程序是否编译成功...")
+    print("\n2. 正在编译卸载程序 ycode_uninstall.exe...")
+    cmd_uninst = [
+        pyinstaller_bin,
+        "--clean",
+        "--onefile",
+        "--console",
+        "--name", "ycode_uninstall",
+        "ycode_uninstall.py"
+    ]
+    print("运行命令:", " ".join(cmd_uninst))
+    subprocess.run(cmd_uninst, check=True)
+    
+    print("\n3. 正在验证程序是否编译成功...")
     ycode_exe = os.path.join(project_dir, "dist", "ycode.exe")
-    if os.path.exists(ycode_exe):
+    ycode_uninst = os.path.join(project_dir, "dist", "ycode_uninstall.exe")
+    if os.path.exists(ycode_exe) and os.path.exists(ycode_uninst):
         print(f"✔ 核心程序成功生成: {ycode_exe}")
+        print(f"✔ 卸载程序成功生成: {ycode_uninst}")
     else:
-        print("🚨 核心程序编译失败！")
+        print("🚨 核心程序或卸载程序编译失败！")
         sys.exit(1)
         
-    print("\n3. 正在编译安装向导程序 ycode_setup.exe...")
-    # 将 dist/ycode.exe 打包进 ycode_setup.exe
-    # 在 Windows 下，数据文件打包语法为 "源路径;目标包内相对目录"，用半角分号分割
+    print("\n4. 正在编译安装向导程序 ycode_setup.exe...")
+    # 将 dist/ycode.exe 和 dist/ycode_uninstall.exe 打包进 ycode_setup.exe
     cmd_setup = [
         pyinstaller_bin,
         "--clean",
         "--onefile",
         "--console",
         "--add-data", f"dist/ycode.exe;.",
+        "--add-data", f"dist/ycode_uninstall.exe;.",
         "--name", "ycode_setup",
         "ycode_setup.py"
     ]
     print("运行命令:", " ".join(cmd_setup))
     subprocess.run(cmd_setup, check=True)
     
-    print("\n4. 正在验证安装程序是否编译成功...")
+    print("\n5. 正在验证安装程序是否编译成功...")
     setup_exe = os.path.join(project_dir, "dist", "ycode_setup.exe")
     if os.path.exists(setup_exe):
         print(f"✔ 安装程序成功生成: {setup_exe}")

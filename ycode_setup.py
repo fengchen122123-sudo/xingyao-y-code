@@ -57,11 +57,19 @@ def install():
     src_exe = os.path.join(bundle_dir, "ycode.exe")
     dest_exe = os.path.join(install_dir, "ycode.exe")
     
+    src_uninst = os.path.join(bundle_dir, "ycode_uninstall.exe")
+    dest_uninst = os.path.join(install_dir, "ycode_uninstall.exe")
+    
     if not os.path.exists(src_exe):
         # 兼容性开发模式测试：如果 dist/ycode.exe 存在
         dev_exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "ycode.exe")
         if os.path.exists(dev_exe):
             src_exe = dev_exe
+            
+    if not os.path.exists(src_uninst):
+        dev_uninst = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "ycode_uninstall.exe")
+        if os.path.exists(dev_uninst):
+            src_uninst = dev_uninst
             
     if not os.path.exists(src_exe):
         print(f"🚨 错误：未能在安装包中找到核心文件 ycode.exe！(检测路径: {src_exe})")
@@ -74,6 +82,9 @@ def install():
     try:
         shutil.copy2(src_exe, dest_exe)
         print(f"✔ 核心文件成功复制到: {dest_exe}")
+        if os.path.exists(src_uninst):
+            shutil.copy2(src_uninst, dest_uninst)
+            print(f"✔ 卸载程序成功复制到: {dest_uninst}")
     except Exception as e:
         print(f"🚨 复制文件失败: {str(e)}")
         print("请确保目标目录可写，且没有其他 ycode 进程在运行。")
