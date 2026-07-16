@@ -146,11 +146,21 @@ def install():
                 ['reg', 'add', 'HKCU\\Environment', '/v', 'PATH', '/t', 'REG_EXPAND_SZ', '/d', new_path, '/f'],
                 startupinfo=startupinfo
             )
-            # 广播 WM_SETTINGCHANGE 消息，使环境变量无需重启直接生效
+            # 广播 WM_SETTINGCHANGE 消息，使环境变量无需重启直接生效 (使用 SendMessageTimeoutW 避免卡死在挂起窗口)
             import ctypes.wintypes
             HWND_BROADCAST = 0xFFFF
             WM_SETTINGCHANGE = 0x001A
-            ctypes.windll.user32.SendMessageW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment")
+            SMTO_ABORTIFHUNG = 0x0002
+            result_val = ctypes.c_long()
+            ctypes.windll.user32.SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                "Environment",
+                SMTO_ABORTIFHUNG,
+                1000,
+                ctypes.byref(result_val)
+            )
             print("✔ 成功将 Y-code 路径加入环境变量 PATH！")
         else:
             print("ℹ Y-code 路径已存在于环境变量中，跳过配置。")
