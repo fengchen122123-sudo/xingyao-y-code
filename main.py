@@ -1486,6 +1486,32 @@ def run_cli():
 
     print_logo()
 
+    # 首次启动且 API Key 为空时，提示输入 DeepSeek 密钥并保存
+    if not current_key:
+        print("\n🔑 检测到您尚未配置大模型 API 密钥。")
+        print("已为您预设默认模型：deepseek-v4-pro")
+        print("接口协议：OpenAI | 厂商：深度求索 (DeepSeek) | 上下文支持：1M (1,000,000)")
+        print("请在下方输入您的 DeepSeek API 密钥 (API Key)：")
+        try:
+            key_input = input("👉 API Key: ").strip()
+            if key_input:
+                current_key = key_input
+                # 持久化保存到配置文件中
+                from core.model_manager import load_config, _write_config
+                cfg = load_config()
+                for provider in cfg.get("providers", []):
+                    if provider.get("id") == "deepseek-provider":
+                        provider["api_key"] = key_input
+                        break
+                _write_config(cfg)
+                print("✔ 密钥已成功保存到配置文件中！")
+            else:
+                print("⚠️ 未输入密钥，系统将使用空密钥启动。")
+        except (KeyboardInterrupt, EOFError):
+            print("\n👋 启动已取消。")
+            import sys
+            sys.exit(0)
+
     # 启动后台处理线程
     worker_thread = threading.Thread(target=_background_worker, daemon=True)
     worker_thread.start()

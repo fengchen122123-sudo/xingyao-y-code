@@ -46,9 +46,35 @@ def load_config() -> dict:
         }
         _write_config(data)
 
-    # 如果完全空，初始化为空结构
-    if "providers" not in data:
-        data = {"active_model_id": None, "providers": []}
+    # 如果完全空，初始化为 DeepSeek 默认结构
+    if "providers" not in data or not data.get("providers"):
+        data = {
+            "active_model_id": "ds-v4-pro",
+            "providers": [
+                {
+                    "id": "deepseek-provider",
+                    "name": "深度求索",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "",
+                    "protocol": "openai",
+                    "models": [
+                        {
+                            "id": "ds-v4-pro",
+                            "name": "deepseek-v4-pro",
+                            "litellm_model": "deepseek/deepseek-chat",
+                            "context_window": 1000000
+                        },
+                        {
+                            "id": "ds-v4-flash",
+                            "name": "deepseek-v4-flash",
+                            "litellm_model": "deepseek/deepseek-coder",
+                            "context_window": 1000000
+                        }
+                    ]
+                }
+            ]
+        }
+        _write_config(data)
 
     return data
 
