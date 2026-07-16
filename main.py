@@ -41,6 +41,7 @@ import uuid
 current_session = f"session_{uuid.uuid4().hex[:6]}"
 _active = get_active_model()
 current_model   = _active["litellm_model"]   if _active else MY_MODEL
+current_model_name = _active["name"]         if _active else MY_MODEL.split('/')[-1]
 current_key     = _active["api_key"]          if _active else MY_KEY
 current_url     = _active["base_url"]          if _active else MY_BASE_URL
 current_ctx_win = _active["context_window"]   if _active else 128000
@@ -305,7 +306,7 @@ def print_logo(clear_screen=True):
     if len(cwd) > 35:
         cwd_display = "..." + cwd[-32:]
         
-    model_display = current_model.split('/')[-1]
+    model_display = current_model_name
     safe_session = current_session.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     
     def display_width(s):
@@ -974,7 +975,7 @@ def _make_input_app():
     def get_status():
         """底部状态栏内容：极简无底色，带 Token 统计与后台任务监控"""
         # 1. 提取短模型名（去掉前缀 openai/ 等）
-        model_display = current_model.split('/')[-1]
+        model_display = current_model_name
 
         # 2. 计算 Token 消耗与缓存命中（分离概念）
         cum_total = session_token_usage["cumulative_total"]
@@ -1546,8 +1547,9 @@ def run_cli():
             from core.model_selector import open_model_selector
 
             def _on_selected(info: dict):
-                global current_model, current_key, current_url, current_ctx_win
+                global current_model, current_key, current_url, current_ctx_win, current_model_name
                 current_model   = info["litellm_model"]
+                current_model_name = info["name"]
                 current_key     = info["api_key"]
                 current_url     = info["base_url"]
                 current_ctx_win = info["context_window"]
