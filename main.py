@@ -1,5 +1,8 @@
 import os
 import sys
+# 防止 PyInstaller 双重导入主入口模块导致全局变量（如 app_instance 等）在子线程内读取为 None 的双重导入陷阱
+if '__main__' in sys.modules and 'main' not in sys.modules:
+    sys.modules['main'] = sys.modules['__main__']
 import time
 import threading
 import queue
