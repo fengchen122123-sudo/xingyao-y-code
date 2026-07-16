@@ -20,11 +20,16 @@ def build():
     # --clean: 清除缓存
     # --onefile: 生成单个独立 .exe
     # --console: 保持控制台窗口（TUI 所需）
+    # --collect-all: 强制收集指定库中的所有模块、二进制文件及数据文件，彻底解决动态导入与数据缺失
     cmd_core = [
         pyinstaller_bin,
         "--clean",
         "--onefile",
         "--console",
+        "--collect-all", "litellm",
+        "--collect-all", "tiktoken",
+        "--collect-all", "tiktoken_ext",
+        "--collect-all", "pyfiglet",
         "--name", "ycode",
         "main.py"
     ]
