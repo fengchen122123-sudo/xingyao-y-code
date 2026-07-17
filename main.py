@@ -899,13 +899,21 @@ def _make_input_app():
     @kb.add("c-c")
     def clear_input(event):
         """Ctrl+C: 如果星瑶正在执行，则中断执行；如果闲置，则清空输入框"""
-        global is_thinking
+        global is_thinking, confirm_prompt
         if is_thinking:
             import core.llm
             core.llm.cancel_requested = True
             print_formatted_text(HTML("\n<ansired>🛑 收到中断信号，正在终止星瑶的执行...</ansired>"))
+            # 如果 TUI 确认面板的 Future 还在等待，立即以"拒绝"(index=1)解除阻塞，防止死锁
+            if confirm_prompt is not None and 'future' in confirm_prompt:
+                fut = confirm_prompt['future']
+                if not fut.done():
+                    event.app.loop.call_soon_threadsafe(lambda: fut.set_result(1))
+                confirm_prompt = None
+                event.app.invalidate()
         else:
             input_area.text = ""
+
 
     @kb.add("c-d")
     def exit_app(event):

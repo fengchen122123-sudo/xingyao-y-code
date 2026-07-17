@@ -1,4 +1,5 @@
 import sqlite3
+import threading
 
 # 全局撤销状态
 LAST_UNDO_STATE = {
@@ -15,9 +16,14 @@ def get_undo_state():
 
 class MemoryManager:
     def __init__(self, db_path="ycode.db"):
-        # 1. 连接数据库
+        # 1. 连接数据库（check_same_thread=False 允许多线程访问）
         self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        # 2. 立刻建表
+        # 2. 启用 WAL 模式，提升多线程并发读写性能，防止数据库锁死
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA synchronous=NORMAL")
+        # 3. 写操作序列化锁，防止多线程同时提交导致竞态错误
+        self._lock = threading.Lock()
+        # 4. 立刻建表
         self.create_tables()
 
     def create_tables(self):
@@ -56,32 +62,34 @@ class MemoryManager:
 
     def add_message(self, session_name, role, content):
         """记笔记技能：把聊天内容存进数据库"""
-        cursor = self.conn.cursor()
-        
-        # 1. 档案袋处理：如果这个会话名字不存在，就新建一个；如果有了，就忽略 (IGNORE)
-        cursor.execute('''
-            INSERT OR IGNORE INTO sessions (session_name)
-            VALUES (?)
-        ''', (session_name,))
-        
-        # 2. 查出这个档案袋的专属 ID 号码
-        cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
-        session_id = cursor.fetchone()[0]
-        
         import json
         if isinstance(content, (list, dict)):
             content = json.dumps(content, ensure_ascii=False)
         else:
             content = str(content)
+
+        with self._lock:
+            cursor = self.conn.cursor()
             
-        # 3. 把角色和说的内容存进 messages 表，并贴上档案袋的 ID 标签
-        cursor.execute('''
-            INSERT INTO messages (session_id, role, content)
-            VALUES (?, ?, ?)
-        ''', (session_id, role, content))
-        
-        # 4. 提交保存到硬盘/内存
-        self.conn.commit()
+            # 1. 档案袋处理：如果这个会话名字不存在，就新建一个；如果有了，就忽略 (IGNORE)
+            cursor.execute('''
+                INSERT OR IGNORE INTO sessions (session_name)
+                VALUES (?)
+            ''', (session_name,))
+            
+            # 2. 查出这个档案袋的专属 ID 号码
+            cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
+            session_id = cursor.fetchone()[0]
+                
+            # 3. 把角色和说的内容存进 messages 表，并贴上档案袋的 ID 标签
+            cursor.execute('''
+                INSERT INTO messages (session_id, role, content)
+                VALUES (?, ?, ?)
+            ''', (session_id, role, content))
+            
+            # 4. 提交保存到硬盘/内存
+            self.conn.commit()
+
 
     def get_history(self, session_name):
         """翻旧账技能：根据会话名字，把历史记录全拿出来"""

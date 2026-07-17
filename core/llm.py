@@ -127,6 +127,10 @@ def select_from_options(options, default_index=0):
         return None
 
 def ask_in_raw_terminal(function_name, arguments):
+    """
+    纯文本原始终端兜底：只在确实没有活动 TUI App 时才被调用（例如管道重定向或早期初始化时）。
+    不使用任何 ANSI 转义序列或 msvcrt 菜单，直接用 print/input 避免污染 TUI 屏幕。
+    """
     import main
     mode_display = {"confirm": "每次确认", "plan": "计划确认"}
     mode_tip = mode_display.get(main.current_permission_mode, "确认")
@@ -135,7 +139,7 @@ def ask_in_raw_terminal(function_name, arguments):
     if function_name == "write_file":
         file_path = arguments.get("file_path", "未知文件")
         content = arguments.get("content", "")
-        print(f"✍️  星瑶申请写入文件: {file_path}")
+        print(f"[写入文件] 星瑶申请写入文件: {file_path}")
         lines = content.splitlines()
         if lines:
             preview = "\n".join(lines[:5])
@@ -146,64 +150,18 @@ def ask_in_raw_terminal(function_name, arguments):
         file_path = arguments.get("file_path", "未知文件")
         target = arguments.get("target_content", "")
         repl = arguments.get("replacement_content", "")
-        print(f"📝  星瑶申请修改文件: {file_path}")
-        print(f"   [-] 计划删除: {target.strip()[:100]}...")
-        print(f"   [+] 计划替换: {repl.strip()[:100]}...")
+        print(f"[修改文件] 星瑶申请修改文件: {file_path}")
+        print(f"   [-] 计划删除: {target.strip()[:100]}")
+        print(f"   [+] 计划替换: {repl.strip()[:100]}")
     elif function_name == "execute_command":
         cmd = arguments.get("command", "")
         bg = arguments.get("run_in_background", False)
         bg_str = " (后台运行)" if bg else ""
-        print(f"💻  星瑶申请执行命令{bg_str}: {cmd}")
-        
-    options = [
-        "Yes, 同意本次操作 (y)",
-        "No, 拒绝本次操作 (n)",
-        "Always, 允许此类操作 (a)"
-    ]
+        print(f"[执行命令] 星瑶申请执行命令{bg_str}: {cmd}")
     
-    # 尝试使用高品质交互式上下键菜单选择器
-    choice_idx = select_from_options(options)
-    
-    if choice_idx is not None:
-        choices_map = {
-            0: "\033[92m✓ 已同意本次操作\033[0m",
-            1: "\033[91m✗ 已拒绝本次操作\033[0m",
-            2: "\033[96m✨ 已选择始终放行此类操作 (当前会话)\033[0m"
-        }
-        print(f"   👉 确认结果: {choices_map[choice_idx]}")
-        
-        if choice_idx == 1:
-            return False
-            
-        if choice_idx == 2:
-            if function_name == "execute_command":
-                cmd = arguments.get("command", "")
-                words = cmd.split()
-                if words:
-                    first_word = words[0]
-                    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
-                        prefix = f"{first_word} {words[1]}"
-                    else:
-                        prefix = first_word
-                    session_allowed_commands.add(prefix)
-                    print(f"   ✨ [当前会话已放行前缀]：{prefix}*")
-            elif function_name == "write_file":
-                file_path = arguments.get("file_path", "")
-                if file_path:
-                    session_allowed_write_files.add(file_path)
-                    print(f"   ✨ [当前会话已放行写入]：{file_path}")
-            elif function_name == "edit_file":
-                file_path = arguments.get("file_path", "")
-                if file_path:
-                    session_allowed_edit_files.add(file_path)
-                    print(f"   ✨ [当前会话已放行修改]：{file_path}")
-            return True
-            
-        return True
-        
-    # 兜底：如果选择器不支持（重定向等），降级为常规 input 模式
+    # 纯文本 input 模式，不含任何 ANSI 序列
     try:
-        print("👉 输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前会话放行)")
+        print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前会话放行)")
         res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
         
         if res in ("n", "no"):
@@ -221,22 +179,22 @@ def ask_in_raw_terminal(function_name, arguments):
                     else:
                         prefix = first_word
                     session_allowed_commands.add(prefix)
-                    print(f"✨ [当前会话已放行前缀]：{prefix}*")
+                    print(f"[当前会话已放行前缀]：{prefix}*")
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     session_allowed_write_files.add(file_path)
-                    print(f"✨ [当前会话已放行写入]：{file_path}")
+                    print(f"[当前会话已放行写入]：{file_path}")
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     session_allowed_edit_files.add(file_path)
-                    print(f"✨ [当前会话已放行修改]：{file_path}")
+                    print(f"[当前会话已放行修改]：{file_path}")
             return True
             
         return res in ("", "y", "yes")
     except (KeyboardInterrupt, EOFError):
-        print("\n[⚠️ 操作已取消]")
+        print("\n[操作已取消]")
         return False
 
 def check_permission_and_ask(function_name, arguments):
@@ -596,6 +554,17 @@ def _chat_with_model_generator(model_name, api_key, messages, api_base=None, str
                 request_start = native_time.time()
                 for chunk in response_stream:
                     if cancel_requested:
+                        # 如果 TUI 确认面板的 Future 还在等待，立即以"拒绝"(index=1)解除阻塞，防止死锁
+                        try:
+                            import main as _main
+                            cp = _main.confirm_prompt
+                            if cp is not None and 'future' in cp:
+                                fut = cp['future']
+                                if not fut.done():
+                                    fut.set_result(1)  # 1 = 拒绝
+                                _main.confirm_prompt = None
+                        except Exception:
+                            pass
                         raise KeyboardInterrupt("用户终止了对话。")
                     # 1. 解析 Token 消耗 (如果在流中提供)
                     if hasattr(chunk, 'usage') and chunk.usage:

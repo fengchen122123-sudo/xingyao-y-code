@@ -16,9 +16,18 @@ dist/
 *.egg-info/
 .eggs/
 
+# PyInstaller (auto-generated, never commit)
+*.spec
+
 # pytest
 .pytest_cache/
 mytemp/
+
+# SQLite databases (contain user data / dev state)
+*.db
+
+# Scraped / downloaded HTML files
+*.html
 
 # IDE
 .idea/
@@ -28,7 +37,6 @@ mytemp/
 
 # Project secrets & local state (NEVER commit real API keys)
 config.json
-ycode.db
 active_skills.json
 mcp.json
 
