@@ -20,31 +20,39 @@ def load_config() -> dict:
 
     # 检测旧格式（只有 model/api_key/base_url 的扁平结构），自动迁移
     if "model" in data and "providers" not in data:
-        old_model = data.get("model", "openai/agnes-2.0-flash")
-        model_name = old_model.split("/")[-1]
-        mid = str(uuid.uuid4())[:8]
-        pid = str(uuid.uuid4())[:8]
-        data = {
-            "active_model_id": mid,
-            "providers": [
-                {
-                    "id": pid,
-                    "name": "默认厂商",
-                    "base_url": data.get("base_url", ""),
-                    "api_key": data.get("api_key", ""),
-                    "protocol": "openai",
-                    "models": [
-                        {
-                            "id": mid,
-                            "name": model_name,
-                            "litellm_model": old_model,
-                            "context_window": 128000,
-                        }
-                    ],
-                }
-            ],
-        }
-        _write_config(data)
+        try:
+            old_model = data.get("model", "openai/agnes-2.0-flash")
+            if isinstance(old_model, dict):
+                old_model = old_model.get("litellm_model") or old_model.get("name") or "openai/agnes-2.0-flash"
+            elif not isinstance(old_model, str):
+                old_model = str(old_model) if old_model else "openai/agnes-2.0-flash"
+            
+            model_name = old_model.split("/")[-1]
+            mid = str(uuid.uuid4())[:8]
+            pid = str(uuid.uuid4())[:8]
+            data = {
+                "active_model_id": mid,
+                "providers": [
+                    {
+                        "id": pid,
+                        "name": "默认厂商",
+                        "base_url": data.get("base_url", ""),
+                        "api_key": data.get("api_key", ""),
+                        "protocol": "openai",
+                        "models": [
+                            {
+                                "id": mid,
+                                "name": model_name,
+                                "litellm_model": old_model,
+                                "context_window": 128000,
+                            }
+                        ],
+                    }
+                ],
+            }
+            _write_config(data)
+        except Exception:
+            data = {}
 
     # 如果完全空，初始化为 DeepSeek 默认结构
     if "providers" not in data or not data.get("providers"):
