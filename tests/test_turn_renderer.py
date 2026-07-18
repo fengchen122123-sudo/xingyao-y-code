@@ -32,3 +32,17 @@ def test_renderer_reports_errors_once():
     renderer.consume("error", {"message": "命令失败"})
 
     assert renderer.finish().count("命令失败") == 1
+
+
+def test_renderer_shows_structured_plan_status():
+    renderer = TurnRenderer()
+    renderer.consume("plan_updated", {
+        "items": [
+            {"id": "1", "subject": "检查代码", "status": "completed"},
+            {"id": "2", "subject": "运行测试", "status": "in_progress"},
+        ]
+    })
+
+    output = renderer.finish()
+    assert "✓ 检查代码" in output
+    assert "■ 运行测试" in output

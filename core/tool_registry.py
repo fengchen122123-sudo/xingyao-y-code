@@ -60,6 +60,8 @@ def _adapt(function):
 
 def build_default_registry() -> ToolRegistry:
     from core import tools
+    from core.ask_user import ask_user
+    from core.plan import plan_update, plan_write
 
     read_specs = [
         ToolSpec(
@@ -119,6 +121,45 @@ def build_default_registry() -> ToolRegistry:
     ]
 
     mutating_specs = [
+        ToolSpec(
+            name="ask_user",
+            description="向用户提出一个需要选择的澄清问题。最多提供三个选项。",
+            input_schema=_schema({
+                "question": {"type": "string"},
+                "options": {"type": "array", "items": {"type": "string"}},
+            }, ["question"]),
+            execute=_adapt(ask_user),
+            requires_permission=False,
+            activity_description="等待用户回答",
+        ),
+        ToolSpec(
+            name="plan_write",
+            description="创建或替换当前任务计划。",
+            input_schema=_schema({
+                "items": {"type": "array", "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "string"},
+                        "subject": {"type": "string"},
+                        "status": {"type": "string"},
+                    },
+                    "required": ["id", "subject", "status"],
+                }},
+            }, ["items"]),
+            execute=_adapt(plan_write),
+            activity_description="更新任务计划",
+        ),
+        ToolSpec(
+            name="plan_update",
+            description="更新当前计划项的状态或标题。",
+            input_schema=_schema({
+                "item_id": {"type": "string"},
+                "status": {"type": "string"},
+                "subject": {"type": "string"},
+            }, ["item_id"]),
+            execute=_adapt(plan_update),
+            activity_description="更新计划项",
+        ),
         ToolSpec(
             name="write_file",
             description="创建或完整写入文件。",

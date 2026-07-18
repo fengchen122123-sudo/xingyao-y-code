@@ -63,6 +63,19 @@ class TurnRenderer:
             diff = str(data.get("text") or data.get("diff") or "")
             if diff:
                 self._append_line(diff)
+        elif kind == "plan_updated":
+            status_markers = {
+                "completed": "✓",
+                "in_progress": "■",
+                "failed": "✗",
+                "cancelled": "-",
+                "pending": "□",
+            }
+            for item in data.get("items", []):
+                status = str(item.get("status", "pending"))
+                subject = str(item.get("subject", "")).strip()
+                if subject:
+                    self._append_line(f"  {status_markers.get(status, '□')} {subject}")
 
         return list(self._emitted)
 
