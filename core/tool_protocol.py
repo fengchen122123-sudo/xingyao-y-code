@@ -1,0 +1,33 @@
+"""Contracts shared by tool registration, execution and rendering."""
+
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping
+
+
+ToolExecutor = Callable[..., "ToolResult"]
+
+
+@dataclass(frozen=True)
+class ToolSpec:
+    name: str
+    description: str
+    input_schema: Mapping[str, Any]
+    execute: ToolExecutor
+    read_only: bool = False
+    mutates_files: bool = False
+    requires_permission: bool = True
+    cancellable: bool = True
+    activity_description: str = ""
+
+
+@dataclass
+class ToolResult:
+    content: str
+    is_error: bool = False
+    changed_files: list[str] = field(default_factory=list)
+    diff: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    def to_message_content(self) -> str:
+        """Return the compact content that belongs in model conversation history."""
+        return str(self.content)
