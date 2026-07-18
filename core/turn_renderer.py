@@ -137,8 +137,19 @@ class TurnRenderer:
 
     def finish(self) -> str:
         if not self._finished:
-            if not self._in_thinking and self._pending_text:
-                self._append_text(self._pending_text)
-            self._pending_text = ""
-            self._finished = True
+            self._flush_pending()
         return "".join(self._records).rstrip("\n")
+
+    def finish_incremental(self) -> list[str]:
+        """Flush only output that was waiting for a complete stream boundary."""
+        if self._finished:
+            return []
+        self._emitted = []
+        self._flush_pending()
+        return list(self._emitted)
+
+    def _flush_pending(self) -> None:
+        if not self._in_thinking and self._pending_text:
+            self._append_text(self._pending_text)
+        self._pending_text = ""
+        self._finished = True
