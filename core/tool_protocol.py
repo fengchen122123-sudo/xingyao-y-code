@@ -19,6 +19,16 @@ class ToolSpec:
     cancellable: bool = True
     activity_description: str = ""
 
+    def api_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": dict(self.input_schema),
+            },
+        }
+
 
 @dataclass
 class ToolResult:
