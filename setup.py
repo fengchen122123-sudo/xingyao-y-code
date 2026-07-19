@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='ycode',
-    version='1.0.20',
+    version='1.0.25',
     packages=find_packages(),
     py_modules=['main'],  # 根目录的 main.py 作为入口模块
     install_requires=[

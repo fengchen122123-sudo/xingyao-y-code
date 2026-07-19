@@ -1,5 +1,6 @@
 import datetime
 import json
+import logging
 import os
 import re
 import sqlite3
@@ -26,18 +27,131 @@ def _try_parse_json(text):
     except (ValueError, TypeError):
         return None, False
 
-# 全局撤销状态
+# 全局撤销状态（单文件 undo 栈，向后兼容保留）
 LAST_UNDO_STATE = {
     "file_path": None,
     "old_content": None
 }
 
+# 会话级检查点缓存（按 session_name → list of checkpoint dict）
+# 每轮对话开始前自动打一个 checkpoint，记录本轮所有被修改文件的旧内容
+# /checkpoint list 查看，/checkpoint restore <id> 回滚到该检查点
+# 设计参考 Grok Build 的 workspace 级 checkpoint
+_session_checkpoints_lock = threading.Lock()
+_session_checkpoints: dict[str, list[dict]] = {}
+
+
 def set_undo_state(file_path, old_content):
     LAST_UNDO_STATE["file_path"] = file_path
     LAST_UNDO_STATE["old_content"] = old_content
+    # 同步追加到当前会话的检查点文件快照
+    # （由 worker 线程在 begin_turn 时已建好当前 turn 的 checkpoint 上下文）
+    if file_path and old_content is not None:
+        record_file_snapshot_for_current_turn(file_path, old_content)
+
 
 def get_undo_state():
     return LAST_UNDO_STATE
+
+
+# ---------------------------------------------------------------------------
+# 会话级检查点 API
+# ---------------------------------------------------------------------------
+# 设计：每轮对话开始前由 main._background_worker 调用 begin_turn_checkpoint，
+# 把 turn_id + last_msg_id 记下来；之后 write_file/edit_file 调用 set_undo_state
+# 时同步把旧内容追加到该 turn 的快照列表里。
+# 用户 /checkpoint restore <turn_id> 时，把所有快照按反序回写文件。
+
+# 当前 worker 线程的活动 turn 上下文（thread-local，避免多线程串扰）
+_checkpoint_tls = threading.local()
+
+
+def begin_turn_checkpoint(session_name, turn_id, last_msg_id, description=""):
+    """每轮对话开始前调用：建立当前 turn 的检查点上下文。
+
+    此后该线程内的 write_file/edit_file 调用会通过 set_undo_state 自动把旧内容
+    追加到本 turn 的快照列表。turn 结束后调用 end_turn_checkpoint 提交到全局缓存。
+    """
+    ctx = {
+        "session_name": session_name,
+        "turn_id": turn_id,
+        "last_msg_id": last_msg_id,
+        "description": description,
+        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "file_snapshots": [],  # list of {file_path, old_content}
+        "completed": False,
+    }
+    _checkpoint_tls.current = ctx
+    return ctx
+
+
+def record_file_snapshot_for_current_turn(file_path, old_content):
+    """把当前线程内被修改文件的旧内容追加到当前 turn 的快照列表。"""
+    ctx = getattr(_checkpoint_tls, "current", None)
+    if ctx is None or ctx.get("completed"):
+        return
+    # 同一文件在一轮内可能被多次修改，只保留最早的旧内容（最原始状态）
+    existing = next(
+        (s for s in ctx["file_snapshots"] if s["file_path"] == file_path),
+        None,
+    )
+    if existing is None:
+        ctx["file_snapshots"].append({
+            "file_path": file_path,
+            "old_content": old_content,
+        })
+
+
+def end_turn_checkpoint():
+    """turn 结束时把当前上下文提交到全局缓存，便于后续 /checkpoint 查询和回滚。"""
+    ctx = getattr(_checkpoint_tls, "current", None)
+    if ctx is None:
+        return None
+    ctx["completed"] = True
+    session_name = ctx["session_name"]
+    with _session_checkpoints_lock:
+        bucket = _session_checkpoints.setdefault(session_name, [])
+        bucket.append(ctx)
+        # 限制每个会话最多保留 50 个检查点，防止内存无限增长
+        if len(bucket) > 50:
+            del bucket[: len(bucket) - 50]
+    _checkpoint_tls.current = None
+    return ctx
+
+
+def list_checkpoints(session_name):
+    """返回指定会话的所有检查点（按时间正序）。"""
+    with _session_checkpoints_lock:
+        return list(_session_checkpoints.get(session_name, []))
+
+
+def get_checkpoint(session_name, turn_id):
+    """按 turn_id 查找单个检查点。"""
+    with _session_checkpoints_lock:
+        for cp in _session_checkpoints.get(session_name, []):
+            if cp["turn_id"] == turn_id:
+                return cp
+    return None
+
+
+def restore_checkpoint(session_name, turn_id):
+    """回滚到指定检查点：返回该检查点记录的所有文件快照（按反序，便于逐个回写）。
+
+    调用方负责把 old_content 写回文件。本函数只返回快照列表，不直接写文件，
+    避免在 memory 模块引入文件写入副作用。
+    """
+    cp = get_checkpoint(session_name, turn_id)
+    if cp is None:
+        return None
+    # 反序返回：最后修改的文件先回写，最早修改的文件最后回写
+    # 这样即使有依赖关系也能正确恢复
+    return list(reversed(cp["file_snapshots"]))
+
+
+def clear_checkpoints(session_name):
+    """清空指定会话的所有检查点（切换会话或主动清理时调用）。"""
+    with _session_checkpoints_lock:
+        _session_checkpoints.pop(session_name, None)
 
 class MemoryManager:
     def __init__(self, db_path="ycode.db"):
@@ -63,10 +177,33 @@ class MemoryManager:
 
     def create_tables(self):
         with self._lock:
-            # 3. 准备执行 SQL 命令
             cursor = self.conn.cursor()
 
-            # 4. 创建一个叫 sessions 的表，加入摘要字段
+            # 兼容性恢复：检测并丢弃与当前版本不兼容的遗留 sessions 表。
+            # 当 ~/.ycode/ycode.db 由更旧的星瑶版本创建、缺少核心 session_name
+            # 列时，CREATE TABLE IF NOT EXISTS 不会重建它，SQLite 也无法通过
+            # ALTER ADD COLUMN 添加带 UNIQUE 约束的列，从而导致首次运行就崩在
+            # get_history 的 "no such column: session_name"。该遗留库无
+            # session_name 标识符、其消息均为孤儿，本身已无法使用，因此直接清表
+            # 重建是最稳的恢复（同时记一条 runtime-warnings 日志便于事后追溯）。
+            cursor.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+            )
+            if cursor.fetchone() is not None:
+                cursor.execute("PRAGMA table_info(sessions)")
+                existing_columns = {col[1] for col in cursor.fetchall()}
+                if "session_name" not in existing_columns:
+                    try:
+                        logging.getLogger("py.warnings").warning(
+                            "Detected legacy ycode.db with incompatible sessions schema "
+                            "(missing session_name). Recreating tables; legacy data is unrecoverable."
+                        )
+                    except Exception:
+                        pass
+                    cursor.execute("DROP TABLE IF EXISTS sessions")
+                    cursor.execute("DROP TABLE IF EXISTS messages")
+
+            # 创建一个叫 sessions 的表，加入摘要字段
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -91,7 +228,7 @@ class MemoryManager:
             if "updated_at" not in columns:
                 cursor.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
 
-            # 5. 创建一个叫 messages 的表
+            # 创建一个叫 messages 的表
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,7 +237,7 @@ class MemoryManager:
                     content TEXT
                 )
             ''')
-            # 6. 保存修改
+            # 保存修改
             self.conn.commit()
 
     def add_message(self, session_name, role, content):

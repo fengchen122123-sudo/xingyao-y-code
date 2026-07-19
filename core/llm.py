@@ -10,15 +10,67 @@ from copy import deepcopy
 
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
 # （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
+# 必须在 import litellm 之前设置该环境变量才生效
 os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-import litellm
-from litellm import completion
 
 # 屏蔽 LiteLLM 启动时的调试噪音，但保留 WARNING 及以上的有用告警
 logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 logging.getLogger("litellm").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# litellm 懒加载：启动性能优化
+# ---------------------------------------------------------------------------
+# 旧实现：顶部直接 import litellm，导致每次启动都要等 litellm 加载（本地实测 ~1.4s，
+#   打包后首次启动 litellm 会让 UI 等待 3-5s 才出现）。
+# 新实现：UI 启动路径（main.py import core.llm）不再触发 litellm 加载，
+#   只有后台 worker 首次真正调用 LLM 或 estimate_tokens 时才加载。
+# 通过 _get_litellm() 单次懒加载 + 缓存，保证 litellm 只在第一次使用时被导入。
+_litellm_module = None
+_litellm_lock = threading.Lock()
+
+
+def _get_litellm():
+    """懒加载 litellm 模块，首次调用时 import 并执行一次性配置，后续调用直接返回缓存。
+
+    线程安全：多线程并发首次调用时通过 _litellm_lock 保证只 import 一次。
+    """
+    global _litellm_module
+    if _litellm_module is not None:
+        return _litellm_module
+    with _litellm_lock:
+        if _litellm_module is not None:
+            return _litellm_module
+        import litellm as _litellm
+        # 屏蔽启动调试噪音
+        _litellm.suppress_debug_info = True
+        _litellm_module = _litellm
+        return _litellm
+
+
+def _litellm_completion(**kwargs):
+    """litellm.completion 的懒加载包装。"""
+    return _get_litellm().completion(**kwargs)
+
+
+def _litellm_token_counter(model, messages):
+    """litellm.token_counter 的懒加载包装。"""
+    return _get_litellm().token_counter(model=model, messages=messages)
+
+
+def _litellm_supports_vision(model):
+    """litellm.supports_vision 的懒加载包装。"""
+    try:
+        return _get_litellm().supports_vision(model=model)
+    except Exception:
+        return False
+
+
+def _litellm_context_overflow_error():
+    """litellm.ContextWindowExceededError 异常类的懒加载包装。"""
+    return _get_litellm().ContextWindowExceededError
+
 
 # 单次 API 请求超时（秒）：长思考模型的首个 token 可能较慢，不宜过紧
 API_REQUEST_TIMEOUT_SECONDS = 90
@@ -37,7 +89,6 @@ from core.permission_broker import CANCELLED_RESULT, permission_broker
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
 from core.tool_presenter import summarize_tool_finished, summarize_tool_started
 from core.turn_events import TurnEventFactory
-from litellm import token_counter
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
 session_allowed_commands = set()      # 放行的命令前缀 (如 'git', 'date')
@@ -128,8 +179,6 @@ def _session_prefix_for_command(cmd):
 def _command_matches_prefix(cmd, prefix):
     """前缀匹配：前缀之后必须是空格或结尾，避免放行 'git' 后命中 'gitfoo'。"""
     return cmd == prefix or cmd.startswith(prefix + " ")
-
-litellm.suppress_debug_info = True
 
 def safe_print(formatted_text):
     """线程安全地在 TUI 终端输出格式化文本，避免破坏屏幕布局"""
@@ -447,7 +496,7 @@ def estimate_tokens(model_name, messages):
     if not messages:
         return 0
     try:
-        return token_counter(model=model_name, messages=messages)
+        return _litellm_token_counter(model_name, messages)
     except Exception:
         # 如果模型不支持或报错，采用约 2 字符 / Token 的经验值进行兜底估算
         return len(str(messages)) // 2
@@ -618,6 +667,67 @@ def _supports_reasoning_fields(model_name):
     return prefix in _REASONING_FIELD_PROVIDERS
 
 
+# 支持 prompt caching 的 provider 白名单（按 litellm model 前缀匹配）
+# 仅 Anthropic 需要显式 cache_control 标记：
+#   - anthropic: 需显式标记，命中后缓存 token 按 1/10 计费
+#   - deepseek/openai: 自动缓存命中，无需标记；显式标记反而可能被某些严格校验的
+#     OpenAI 兼容网关（如部分国产中转）拒绝为 400。保守起见不启用。
+_CACHE_CONTROL_PROVIDERS = ("anthropic",)
+
+
+def _supports_cache_control(model_name):
+    """判断 provider 是否支持 cache_control 字段。
+
+    保守策略：仅对 Anthropic 启用。其他 provider（含 OpenAI 兼容端点）自动缓存命中，
+    无需显式标记；显式标记反而可能被严格校验的网关拒绝为 400。
+    """
+    prefix = str(model_name or "").split("/")[0].lower()
+    return prefix in _CACHE_CONTROL_PROVIDERS
+
+
+def _apply_cache_control(messages, model_name):
+    """给消息列表加 cache_control 标记，启用 provider 侧 prompt caching。
+
+    标记策略：
+    - system 消息：必缓存（固定前缀，单次会话内不变）
+    - 最后一条 assistant 消息：设置缓存边界。
+      选择 assistant 而非倒数第 2 条，是因为工具轮次中 messages[-2] 可能是 tool 结果
+      而非稳定前缀（多 tool 结果会让断点每轮移动，二级缓存几乎永远 miss）。
+      最后一条 assistant 消息是上一轮的回复，在当前轮 tool 调用期间保持稳定，
+      provider 可以缓存到该位置，下一轮 tool 结果追加时前缀稳定命中。
+
+    Anthropic 限制：单次请求最多 4 个 cache_control 标记。
+    本策略仅用 2 个，远低于上限，安全。
+
+    本函数原地修改并返回 messages；调用方已通过 _strip_media_and_merge 处理过副本，
+    不会污染 messages 列表本身。
+    """
+    if not _supports_cache_control(model_name):
+        return messages
+    if not messages:
+        return messages
+
+    # 清除已有标记，避免累积（_strip_media_and_merge 不传 cache_control，但兜底防御）
+    for msg in messages:
+        if isinstance(msg, dict):
+            msg.pop("cache_control", None)
+
+    # 1. 标记 system 消息（如果有）
+    if messages[0].get("role") == "system":
+        messages[0]["cache_control"] = {"type": "ephemeral"}
+
+    # 2. 标记最后一条 assistant 消息（缓存边界）
+    #    遍历从后往前找第一条 role=="assistant" 的消息。
+    #    如果最后一条已经是 assistant（无 tool 调用），就标它；
+    #    如果末尾是 tool 结果，就标它们之前的 assistant（更稳定）。
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            messages[i]["cache_control"] = {"type": "ephemeral"}
+            break
+
+    return messages
+
+
 def _supports_vision(model_name):
     """判断模型是否支持图像输入。
 
@@ -637,7 +747,7 @@ def _supports_vision(model_name):
     except Exception:
         pass
     try:
-        if litellm.supports_vision(model=model_name):
+        if _litellm_supports_vision(model_name):
             return True
     except Exception:
         pass
@@ -1440,15 +1550,18 @@ def _chat_with_model_generator(
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
                 try:
-                    kwargs["messages"] = _strip_media_and_merge(messages, model_name)
-                    response_stream = completion(**kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
+                    kwargs["messages"] = _apply_cache_control(
+                        _strip_media_and_merge(messages, model_name),
+                        model_name,
+                    )
+                    response_stream = _litellm_completion(**kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
                     break
                 except Exception as api_err:
                     err_str = str(api_err).lower()
                     # 上下文窗口超限自动压缩历史记录并重试：
                     # 优先按异常类型判断，字符串匹配作为兜底且要求上下文相关关键词组合，
                     # 避免把 rate limit 等错误误判为超限
-                    is_context_overflow = isinstance(api_err, litellm.ContextWindowExceededError)
+                    is_context_overflow = isinstance(api_err, _litellm_context_overflow_error())
                     if not is_context_overflow:
                         is_context_overflow = (
                             "prompt is too long" in err_str

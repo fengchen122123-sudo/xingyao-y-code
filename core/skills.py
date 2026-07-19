@@ -20,29 +20,81 @@ def _log_warning(message, *args):
     except Exception:
         pass
 
+def _expand_path(p):
+    """展开 ~ 与环境变量，相对路径相对 cwd 解析。返回展开后的路径（不强制存在）。"""
+    if not isinstance(p, str) or not p.strip():
+        return None
+    p = os.path.expandvars(os.path.expanduser(p.strip()))
+    if not os.path.isabs(p):
+        p = os.path.join(os.getcwd(), p)
+    return os.path.normpath(p)
+
+
+def get_user_skill_search_paths():
+    """读取 config.json 中用户自定义的 skill 搜索路径列表。
+
+    配置键：skill_search_paths，类型为字符串数组。
+    - 未配置或非列表：返回 []（回退到默认目录）
+    - 每项支持 ~ 展开、环境变量、相对路径（相对 cwd）
+    - 仅返回已存在目录，不主动创建（避免误把笔误路径建出来）
+    """
+    try:
+        data = config._read_json_with_backup(config._CONFIG_FILE, default=None)
+    except Exception:
+        return []
+    if not isinstance(data, dict):
+        return []
+    raw = data.get("skill_search_paths")
+    if not isinstance(raw, list):
+        return []
+    result = []
+    for item in raw:
+        path = _expand_path(item)
+        if path and os.path.isdir(path) and path not in result:
+            result.append(path)
+    return result
+
+
 def get_skill_dirs():
-    """返回所有可能包含 SKILL.md 的基础目录（只扫描已存在目录，不主动创建项目级目录以免污染任意工作目录）"""
+    """返回所有可能包含 SKILL.md 的基础目录（只扫描已存在目录，不主动创建项目级目录以免污染任意工作目录）
+
+    目录来源（按顺序，已按物理路径去重）：
+      1. 默认用户级：~/.ycode/skills（不存在则自动创建）
+      2. 默认兼容全局：~/.agents/skills（仅已存在时扫描）
+      3. 用户自定义：config.json 的 skill_search_paths 列表（仅已存在时扫描）
+
+    说明：项目级 <cwd>/.agents/skills 不再隐式扫描——避免在任意 cwd 启动时行为不一致，
+    也消除 cwd 在用户主目录下时与全局 .agents/skills 重合导致重复扫描的隐患。
+    如需扫描项目级目录，请在 config.json 的 skill_search_paths 中显式配置（如 "./.agents/skills"）。
+    """
     dirs = []
-    # 用户级全局目录（属于 Y-code 自己的数据目录，允许自动创建）
+    seen = set()  # 按规范化绝对路径去重，防止多个路径指向同一物理位置时重复扫描
     user_home = os.path.expanduser("~")
+
+    def _add(p):
+        if not p or not os.path.exists(p):
+            return
+        norm = os.path.normcase(os.path.abspath(p))
+        if norm in seen:
+            return
+        seen.add(norm)
+        dirs.append(p)
+
+    # 1. 用户级全局目录（属于 Y-code 自己的数据目录，允许自动创建）
     global_skills = os.path.join(user_home, ".ycode", "skills")
     if not os.path.exists(global_skills):
         try:
             os.makedirs(global_skills, exist_ok=True)
         except Exception as e:
             _log_warning("创建全局技能目录失败 %s: %s", global_skills, e)
-    if os.path.exists(global_skills):
-        dirs.append(global_skills)
+    _add(global_skills)
 
-    # 兼容用户级全局 .agents 目录
-    global_agents = os.path.join(user_home, ".agents", "skills")
-    if os.path.exists(global_agents):
-        dirs.append(global_agents)
+    # 2. 兼容用户级全局 .agents 目录
+    _add(os.path.join(user_home, ".agents", "skills"))
 
-    # 项目级局部目录：仅在已存在时扫描，绝不在任意 cwd 下自动创建
-    local_skills = os.path.join(os.getcwd(), ".agents", "skills")
-    if os.path.exists(local_skills):
-        dirs.append(local_skills)
+    # 3. 用户自定义目录（来自 config.json 的 skill_search_paths）
+    for p in get_user_skill_search_paths():
+        _add(p)
 
     return dirs
 
@@ -93,15 +145,20 @@ def parse_skill_md(file_path):
 def scan_all_skills():
     """扫描目录下的所有 SKILL.md 或 skill.md"""
     skills = []
+    seen_ids = set()  # 按绝对路径去重，防止多个扫描目录指向同一物理位置时 SKILL.md 被加载多次
     for base_dir in get_skill_dirs():
         if not os.path.exists(base_dir):
             continue
-            
+
         # 递归扫描
         for root, dirs, files in os.walk(base_dir):
             for file in files:
                 if file.lower() == "skill.md":
                     file_path = os.path.abspath(os.path.join(root, file))
+                    norm_id = os.path.normcase(file_path)
+                    if norm_id in seen_ids:
+                        continue
+                    seen_ids.add(norm_id)
                     skill_info = parse_skill_md(file_path)
                     if skill_info:
                         skills.append(skill_info)

@@ -3,13 +3,39 @@ import json
 import logging
 import re
 import threading
-from litellm import completion
+# litellm 改为懒导入：避免在 import core.memory_compressor 时强制加载 litellm（~1.4s）
+# 实际首次压缩时才加载，与 core.llm 的懒加载策略一致
 from prompt_toolkit import print_formatted_text  # noqa: F401 保留导入以兼容测试桩
 from prompt_toolkit.formatted_text import HTML  # noqa: F401
 
 # 压缩进行中守卫：防止同一会话被并发/重入压缩导致 summarized_until_msg_id 跳过新消息
 _compress_guard = threading.Lock()
 _compressing_sessions = set()
+
+# 单条消息预压缩阈值：超过此长度的工具结果先截断再交给 LLM 总结
+# 工具结果（如 read_file 大文件）往往是 LLM 总结的 token 大户，预截断可显著降低压缩成本
+TOOL_RESULT_PREVIEW_LIMIT = 800
+TOOL_RESULT_TRUNCATE_THRESHOLD = 2000
+
+
+def _truncate_long_tool_result(content):
+    """对超长工具结果做预截断，保留开头 + 末尾 + 占位符。
+
+    工具结果（特别是 read_file 返回的完整文件内容）在压缩时全部塞进 prompt 让 LLM 总结，
+    等于把整个文件又发一遍。预截断把单条工具结果限制在 TOOL_RESULT_PREVIEW_LIMIT 字符内，
+    能显著降低压缩调用的 token 成本（典型大文件 read_file 可省 80%+）。
+
+    策略：保留开头（通常是文件头/结构信息）和末尾（通常是关键结论），
+    中间用占位符标注截断长度，让 LLM 知道有内容被省略。
+    """
+    if not isinstance(content, str):
+        content = str(content)
+    if len(content) <= TOOL_RESULT_TRUNCATE_THRESHOLD:
+        return content
+    head = content[:TOOL_RESULT_PREVIEW_LIMIT // 2]
+    tail = content[-(TOOL_RESULT_PREVIEW_LIMIT // 2):]
+    omitted = len(content) - TOOL_RESULT_PREVIEW_LIMIT
+    return f"{head}\n... [已省略 {omitted} 字符的工具结果内容] ...\n{tail}"
 
 
 def compress_session_memory(
@@ -117,11 +143,24 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             max_summarized_id = messages_to_summarize[-1]["id"]
 
             # 4. 组装待总结对话文本日志
+            # 对超长工具结果做预截断：read_file 等工具返回的大文件原文在压缩时
+            # 全部塞给 LLM 等于又发一遍，预截断保留头尾即可让 LLM 理解上下文，
+            # 同时显著降低压缩调用的 token 成本。
             chat_log = ""
             for msg in messages_to_summarize:
-                role_display = "用户" if msg["role"] == "user" else "星瑶"
+                # 角色显示：user→用户，assistant→星瑶，tool→工具结果（避免误标为助手发言）
+                role = msg["role"]
+                if role == "user":
+                    role_display = "用户"
+                elif role == "tool":
+                    role_display = "工具结果"
+                else:
+                    role_display = "星瑶"
                 # 过滤内容里的思考标签以缩减 Token 负担
                 clean_content = re.sub(r"<(?:think|thinking)>.*?</(?:think|thinking)>", "", msg["content"], flags=re.DOTALL).strip()
+                # 工具结果（role=tool）超长时预截断
+                if role == "tool" and clean_content:
+                    clean_content = _truncate_long_tool_result(clean_content)
                 if clean_content:
                     chat_log += f"{role_display}: {clean_content}\n"
 
@@ -162,7 +201,9 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         # LLM 调用耗时较长，在锁外执行，避免阻塞其它线程的正常读写
         emit("\n<ansigray>🧠 正在后台智能压缩并整合长对话记忆...</ansigray>")
 
-        response = completion(
+        # 懒加载 litellm.completion（首次调用触发 import，约 1.4s）
+        from core.llm import _litellm_completion
+        response = _litellm_completion(
             model=api_model,
             api_key=api_key,
             api_base=api_url,
