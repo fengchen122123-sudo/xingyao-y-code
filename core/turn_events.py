@@ -1,5 +1,6 @@
 """Structured events emitted while an agent turn is running."""
 
+import threading
 from copy import deepcopy
 from dataclasses import dataclass
 from types import MappingProxyType
@@ -24,15 +25,21 @@ class TurnEventFactory:
             raise ValueError("turn_id must not be empty")
         self.turn_id = turn_id
         self._sequence = 0
+        # 并行工具批次会跨线程 emit，序号自增必须串行化。
+        # 注意：序号只保证唯一且单调递增，不保证跨线程的实际交付顺序
+        # （先拿到序号的线程可能后把事件交给消费者）。
+        self._sequence_lock = threading.Lock()
 
     def emit(self, kind: str, payload: Mapping[str, Any] | None = None) -> TurnEvent:
         if not kind:
             raise ValueError("event kind must not be empty")
-        self._sequence += 1
+        with self._sequence_lock:
+            self._sequence += 1
+            sequence = self._sequence
         snapshot = deepcopy(dict(payload or {}))
         return TurnEvent(
             turn_id=self.turn_id,
-            sequence=self._sequence,
+            sequence=sequence,
             kind=kind,
             payload=MappingProxyType(snapshot),
         )

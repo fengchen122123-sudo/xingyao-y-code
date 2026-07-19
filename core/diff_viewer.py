@@ -1,9 +1,5 @@
 import difflib
-from prompt_toolkit.layout.containers import Float, HSplit
-from prompt_toolkit.widgets import TextArea, Frame
-from prompt_toolkit.layout.dimension import D
-from prompt_toolkit.lexers import PygmentsLexer
-from prompt_toolkit.key_binding import KeyBindings
+import re
 
 def generate_diff(old_content, new_content, file_path):
     """生成标准 unified diff"""
@@ -38,7 +34,9 @@ def render_diff_table(diff_text):
     for line in lines:
         if not line:
             continue
-        if line.startswith('---') or line.startswith('+++'):
+        # 只跳过真正的文件头（--- a/... 与 +++ b/...），
+        # 避免把以 ---/+++ 开头的增删内容行误判为文件头而丢行
+        if re.match(r"^--- a/", line) or re.match(r"^\+\+\+ b/", line):
             continue
         elif line.startswith('@@'):
             # 解析 @@ -9,4 +9,4 @@
@@ -49,8 +47,13 @@ def render_diff_table(diff_text):
                 old_ln = old_start
                 new_ln = new_start
             except Exception:
-                pass
+                # 解析失败时重置行号，避免沿用上一个 hunk 的行号
+                old_ln = 0
+                new_ln = 0
             table.add_row('...', '...', Text(line, style="cyan"))
+        elif line.startswith('\\'):
+            # "\ No newline at end of file" 只是注释行，不占文件行号
+            continue
         elif line.startswith('-'):
             table.add_row(str(old_ln), '', Text(line, style="red"))
             old_ln += 1

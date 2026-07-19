@@ -2,38 +2,48 @@ import os
 import re
 import json
 import glob
+import logging
+import threading
 
 import config
 # 使用一个独立的文件来记录当前启用的技能列表
 ACTIVE_SKILLS_FILE = config.ACTIVE_SKILLS_FILE
 
+# 激活技能文件写锁，防止并发写互相截断
+_file_lock = threading.Lock()
+
+
+def _log_warning(message, *args):
+    """异常诊断写入 runtime warnings 日志，而不是裸吞。"""
+    try:
+        logging.getLogger("py.warnings").warning(message, *args)
+    except Exception:
+        pass
+
 def get_skill_dirs():
-    """返回所有可能包含 SKILL.md 的基础目录"""
+    """返回所有可能包含 SKILL.md 的基础目录（只扫描已存在目录，不主动创建项目级目录以免污染任意工作目录）"""
     dirs = []
-    # 用户级全局目录
+    # 用户级全局目录（属于 Y-code 自己的数据目录，允许自动创建）
     user_home = os.path.expanduser("~")
     global_skills = os.path.join(user_home, ".ycode", "skills")
     if not os.path.exists(global_skills):
         try:
             os.makedirs(global_skills, exist_ok=True)
-        except:
-            pass
-    dirs.append(global_skills)
-    
+        except Exception as e:
+            _log_warning("创建全局技能目录失败 %s: %s", global_skills, e)
+    if os.path.exists(global_skills):
+        dirs.append(global_skills)
+
     # 兼容用户级全局 .agents 目录
     global_agents = os.path.join(user_home, ".agents", "skills")
     if os.path.exists(global_agents):
         dirs.append(global_agents)
-    
-    # 项目级局部目录
+
+    # 项目级局部目录：仅在已存在时扫描，绝不在任意 cwd 下自动创建
     local_skills = os.path.join(os.getcwd(), ".agents", "skills")
-    if not os.path.exists(local_skills):
-        try:
-            os.makedirs(local_skills, exist_ok=True)
-        except:
-            pass
-    dirs.append(local_skills)
-    
+    if os.path.exists(local_skills):
+        dirs.append(local_skills)
+
     return dirs
 
 def parse_skill_md(file_path):
@@ -76,7 +86,8 @@ def parse_skill_md(file_path):
                 "body": content.strip()
             }
     except Exception as e:
-        print(f"⚠️ 解析技能文件失败 {file_path}: {e}")
+        # 诊断走 runtime warnings 日志：后台扫描路径不允许裸 print 污染 TUI
+        _log_warning("解析技能文件失败 %s: %s", file_path, e)
         return None
 
 def scan_all_skills():
@@ -97,48 +108,54 @@ def scan_all_skills():
     return skills
 
 def get_active_skill_ids():
-    if os.path.exists(ACTIVE_SKILLS_FILE):
-        try:
-            with open(ACTIVE_SKILLS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return []
+    # 读失败时优先从 .bak 备份恢复，避免激活技能无声丢失
+    data = config._read_json_with_backup(ACTIVE_SKILLS_FILE, default=None)
+    if isinstance(data, list):
+        return data
+    if data is not None:
+        _log_warning("active_skills.json 内容不是列表，已忽略: %r", type(data))
     return []
 
 def save_active_skill_ids(active_ids):
+    # 临时文件 + os.replace 原子写，防止写一半崩溃导致激活技能丢失
     try:
-        with open(ACTIVE_SKILLS_FILE, "w", encoding="utf-8") as f:
-            json.dump(active_ids, f)
-    except:
-        pass
+        with _file_lock:
+            config._atomic_write_json(ACTIVE_SKILLS_FILE, active_ids, indent=None)
+    except Exception as e:
+        _log_warning("保存 active_skills.json 失败: %s", e)
 
-def get_active_skills_markdown():
-    """返回所有已启用技能合并后的 Markdown 字符串，供 main.py 注入到系统提示词"""
+def get_active_skills_catalog():
+    """Return enabled skill metadata without eagerly injecting skill bodies."""
     active_ids = set(get_active_skill_ids())
     if not active_ids:
         return ""
-        
+
     all_skills = scan_all_skills()
     active_skills = [s for s in all_skills if s["id"] in active_ids]
-    
+
     if not active_skills:
         return ""
-        
-    combined = "\n\n【启用附加技能 (Skills)】\n"
-    combined += "以下是你被授予的附加技能指令，请在用户要求或适当的时机遵循这些指令：\n"
-    
-    for s in active_skills:
-        skill_dir = os.path.dirname(s['id'])
-        combined += f"\n--- 技能开始: {s['name']} ---\n"
-        combined += f"【系统提示：该技能的物理绝对路径为 {skill_dir}，如果技能指令要求你运行其中的脚本，请去该路径下寻找】\n\n"
-        combined += s['content'] + "\n"
-        combined += f"--- 技能结束: {s['name']} ---\n"
-        
-    return combined
+
+    lines = [
+        "【可用技能目录】",
+        "仅在任务直接匹配时读取对应 SKILL.md；不要加载无关技能。",
+    ]
+    for skill in sorted(
+        active_skills,
+        key=lambda item: (item["name"].lower(), item["id"]),
+    ):
+        lines.append(
+            f'- {skill["name"]}: {skill["description"]} | {skill["id"]}'
+        )
+    return "\n".join(lines)
+
+
+def get_active_skills_markdown():
+    """Compatibility alias for callers migrated from eager skill injection."""
+    return get_active_skills_catalog()
 
 def get_active_skills_list():
     """返回当前所有已启用技能的字典映射 {short_id: skill_info}"""
-    import os
     active_ids = set(get_active_skill_ids())
     if not active_ids:
         return {}
@@ -148,5 +165,12 @@ def get_active_skills_list():
     for s in all_skills:
         if s["id"] in active_ids:
             short_id = os.path.basename(os.path.dirname(s["id"])).lower()
+            # 同名短 ID 冲突：扫描顺序为用户级在前、项目级在后，后者覆盖前者（项目 > 用户），
+            # 覆盖前写一条告警日志，绝不静默覆盖。
+            if short_id in mapping:
+                _log_warning(
+                    "技能短 ID 冲突 '%s'：%s 被 %s 覆盖（项目级优先）",
+                    short_id, mapping[short_id]["id"], s["id"],
+                )
             mapping[short_id] = s
     return mapping
