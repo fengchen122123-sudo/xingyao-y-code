@@ -1,6 +1,10 @@
 import pytest
 import sqlite3
-from core.memory import SessionManager
+from core.memory import MemoryManager, SessionManager
+
+
+def test_memory_manager_compatibility_name():
+    assert SessionManager is MemoryManager
 
 def test_init_db_creates_tables():
     """测试 SessionManager 初始化时是否正确创建了数据库表"""
@@ -42,3 +46,132 @@ def test_add_and_get_messages():
     assert history[0]["content"] == "你好，我是人类"
     assert history[1]["role"] == "assistant"
     assert history[1]["content"] == "你好，我是 Y-code！"
+
+
+def test_structured_assistant_history_returns_public_content_to_llm(tmp_path):
+    manager = MemoryManager(str(tmp_path / "memory.db"))
+    manager.add_message("session", "assistant", {
+        "role": "assistant",
+        "content": "最终回答",
+        "reasoning_content": "分析过程",
+    })
+
+    history = manager.get_history_for_llm("session")
+
+    assert history == [{"role": "assistant", "content": "最终回答"}]
+
+
+def test_add_messages_persists_one_ordered_batch(tmp_path):
+    manager = MemoryManager(str(tmp_path / "batch.db"))
+
+    manager.add_messages("session", [
+        ("assistant", {"content": None, "tool_calls": [{"id": "one"}]}),
+        ("tool", {"tool_call_id": "one", "content": "result"}),
+        ("assistant", {"content": "summary"}),
+    ])
+
+    history = manager.get_history("session")
+    assert [message["role"] for message in history] == [
+        "assistant",
+        "tool",
+        "assistant",
+    ]
+    assert history[-1]["content"] == "summary"
+
+
+def test_plain_scalar_text_is_not_misparsed_as_json(tmp_path):
+    """用户消息恰为 123 / true 等合法 JSON 标量时，content 必须保持原始字符串类型"""
+    manager = MemoryManager(str(tmp_path / "scalar.db"))
+    manager.add_message("session", "user", "123")
+    manager.add_message("session", "user", "true")
+
+    history = manager.get_history("session")
+
+    assert history[0]["content"] == "123"
+    assert isinstance(history[0]["content"], str)
+    assert history[1]["content"] == "true"
+    assert isinstance(history[1]["content"], str)
+
+    llm_history = manager.get_history_for_llm("session")
+    assert llm_history[0]["content"] == "123"
+    assert isinstance(llm_history[0]["content"], str)
+
+
+def test_rename_session_suffix_uses_stripped_base_name(tmp_path):
+    """重命名冲突时后缀基于 strip 后的基准名，不产生 'name _1' 带空格名"""
+    manager = MemoryManager(str(tmp_path / "rename.db"))
+    manager.add_message("chat", "user", "hello")
+    manager.add_message("taken", "user", "hello")
+
+    success, final_name = manager.rename_session("chat", "  taken  ")
+
+    assert success is True
+    assert final_name == "taken_1"
+    assert " " not in final_name
+
+
+def test_rename_session_rejects_empty_new_name(tmp_path):
+    """空串/纯空白/None 新名字必须被拒绝，不得产生空 session_name"""
+    manager = MemoryManager(str(tmp_path / "rename_empty.db"))
+    manager.add_message("chat", "user", "hello")
+
+    assert manager.rename_session("chat", "") == (False, "chat")
+    assert manager.rename_session("chat", "   ") == (False, "chat")
+    assert manager.rename_session("chat", None) == (False, "chat")
+    # 原会话不受影响
+    assert any(s["name"] == "chat" for s in manager.get_all_sessions())
+
+
+def test_sessions_are_scoped_by_workdir(tmp_path):
+    """会话按工作目录隔离：只返回指定目录的会话 + 历史遗留（无目录）会话"""
+    manager = MemoryManager(str(tmp_path / "scoped.db"))
+    dir_a = tmp_path / "dir_a"
+    dir_b = tmp_path / "dir_b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    manager.set_workdir(dir_a)
+    manager.add_message("session_a", "user", "hello")
+    manager.set_workdir(dir_b)
+    manager.add_message("session_b", "user", "hello")
+
+    names_a = {s["name"] for s in manager.get_all_sessions(workdir=str(dir_a))}
+    names_b = {s["name"] for s in manager.get_all_sessions(workdir=str(dir_b))}
+    names_all = {s["name"] for s in manager.get_all_sessions()}
+
+    assert names_a == {"session_a"}
+    assert names_b == {"session_b"}
+    assert names_all == {"session_a", "session_b"}
+
+
+def test_legacy_sessions_without_workdir_visible_everywhere(tmp_path):
+    """历史遗留的 NULL workdir 会话在任何目录下都可见（升级不丢历史）"""
+    manager = MemoryManager(str(tmp_path / "legacy.db"))
+    manager.set_workdir(tmp_path)
+    manager.add_message("new_session", "user", "hello")
+    # 手工插入一条无 workdir 的旧会话记录
+    with manager.acquire_lock():
+        manager.conn.execute(
+            "INSERT INTO sessions (session_name) VALUES (?)", ("legacy_session",)
+        )
+        manager.conn.commit()
+
+    names = {s["name"] for s in manager.get_all_sessions(workdir=str(tmp_path))}
+    assert names == {"new_session", "legacy_session"}
+
+
+def test_session_timestamps_recorded_and_updated(tmp_path):
+    """新建会话记录 workdir/created_at/updated_at，再次写消息时 updated_at 刷新"""
+    manager = MemoryManager(str(tmp_path / "timestamps.db"))
+    manager.set_workdir(tmp_path)
+    manager.add_message("chat", "user", "hello")
+
+    session = next(s for s in manager.get_all_sessions() if s["name"] == "chat")
+    assert session["workdir"] is not None
+    assert session["created_at"] and len(session["created_at"]) == 19
+    assert session["updated_at"] == session["created_at"]
+
+    # 再次写入消息后 updated_at 字段仍存在且格式正确（秒级精度下同秒相等也合法）
+    manager.add_message("chat", "assistant", "reply")
+    session = next(s for s in manager.get_all_sessions() if s["name"] == "chat")
+    assert session["updated_at"] >= session["created_at"]
