@@ -54,9 +54,16 @@ def _t(style: str, text: str):
     return (style, text)
 
 
+def _latest_total_tokens() -> int:
+    """读取当前会话最新一轮的 token 总量（持锁，与 core.llm 的后台写线程互斥）。"""
+    from core.llm import session_token_usage, token_usage_lock
+    with token_usage_lock:
+        return session_token_usage["latest_total"]
+
+
 def open_model_selector(on_model_selected=None):
     state = {
-        "mode":           "list",   # list | wizard
+        "mode":           "list",   # list | wizard | edit | addmodel
         "cursor":         0,
         "items":          [],
         "proto_cursor":   0,
@@ -69,6 +76,9 @@ def open_model_selector(on_model_selected=None):
         "edit_data":      {},
         "edit_model_id":   None,
         "edit_provider_id":None,
+        "am_step":        0,        # 为已有厂商添加模型：0=model_name 1=ctx
+        "am_data":        {},
+        "am_provider_id":  None,
     }
 
     def _test_and_save_edited_model(event, ctx):
@@ -77,7 +87,13 @@ def open_model_selector(on_model_selected=None):
         state["testing"] = True
         event.app.invalidate()
 
+        # 后台线程不直接触碰 UI，所有界面更新回投到 prompt_toolkit 主循环
+        def _ui(callback):
+            event.app.loop.call_soon_threadsafe(callback)
+
         def test_conn():
+            # 注：worker 线程直接写 state 的 str/bool 字段（CPython 单赋值是原子的），
+            # 渲染线程最坏读到短暂旧值，风险可接受；UI 刷新统一走 _ui() 回投主循环。
             try:
                 import litellm
                 url = state["edit_data"].get("base_url", "").strip()
@@ -122,7 +138,7 @@ def open_model_selector(on_model_selected=None):
                 state["message"] = "✔ 修改已成功测试并保存！"
                 state["mode"] = "list"
                 state["items"] = build_items()
-                layout.focus(main_win)
+                _ui(lambda: layout.focus(main_win))
             except Exception as e:
                 err_msg = str(e)
                 if "APIConnectionError" in err_msg:
@@ -137,7 +153,7 @@ def open_model_selector(on_model_selected=None):
                 state["message"] = f"❌ {err_msg[:75]}"
             finally:
                 state["testing"] = False
-                event.app.invalidate()
+                _ui(event.app.invalidate)
                 
         threading.Thread(target=test_conn, daemon=True).start()
 
@@ -147,7 +163,13 @@ def open_model_selector(on_model_selected=None):
         state["testing"] = True
         event.app.invalidate()
 
+        # 后台线程不直接触碰 UI，所有界面更新回投到 prompt_toolkit 主循环
+        def _ui(callback):
+            event.app.loop.call_soon_threadsafe(callback)
+
         def test_conn():
+            # 注：worker 线程直接写 state 的 str/bool 字段（CPython 单赋值是原子的），
+            # 渲染线程最坏读到短暂旧值，风险可接受；UI 刷新统一走 _ui() 回投主循环。
             try:
                 import litellm
                 url = state["add_data"].get("base_url", "").strip()
@@ -191,7 +213,7 @@ def open_model_selector(on_model_selected=None):
                 
                 state["message"] = "✔ 模型连接测试成功，已保存！"
                 state["add_step"] = 6
-                layout.focus(main_win)
+                _ui(lambda: layout.focus(main_win))
             except Exception as e:
                 err_msg = str(e)
                 if "APIConnectionError" in err_msg:
@@ -206,8 +228,83 @@ def open_model_selector(on_model_selected=None):
                 state["message"] = f"❌ {err_msg[:75]}"
             finally:
                 state["testing"] = False
-                event.app.invalidate()
+                _ui(event.app.invalidate)
                 
+        threading.Thread(target=test_conn, daemon=True).start()
+
+    def _test_and_save_added_model(event, ctx):
+        """为已有厂商添加模型：复用该厂商的 URL/Key/协议做连接测试，通过后保存"""
+        import threading
+        state["message"] = "⏳ 正在验证连接模型..."
+        state["testing"] = True
+        event.app.invalidate()
+
+        # 后台线程不直接触碰 UI，所有界面更新回投到 prompt_toolkit 主循环
+        def _ui(callback):
+            event.app.loop.call_soon_threadsafe(callback)
+
+        def test_conn():
+            # 注：worker 线程直接写 state 的 str/bool 字段（CPython 单赋值是原子的），
+            # 渲染线程最坏读到短暂旧值，风险可接受；UI 刷新统一走 _ui() 回投主循环。
+            model = state["am_data"].get("model_name", "").strip()
+            try:
+                import litellm
+                # 读取目标厂商的连接信息
+                url, key, proto = "", "", "openai"
+                provider_name = ""
+                cfg = load_config()
+                for provider in cfg.get("providers", []):
+                    if provider["id"] == state["am_provider_id"]:
+                        url = provider.get("base_url", "")
+                        key = provider.get("api_key", "")
+                        proto = provider.get("protocol", "openai")
+                        provider_name = provider.get("name", "")
+                        break
+
+                test_model = model
+                if not model.startswith(f"{proto}/"):
+                    test_model = f"{proto}/{model}"
+
+                kwargs = {
+                    "model": test_model,
+                    "messages": [{"role": "user", "content": "ping"}],
+                    "max_tokens": 5,
+                    "timeout": 8,
+                }
+                if key:
+                    kwargs["api_key"] = key
+                if url:
+                    kwargs["api_base"] = url
+
+                litellm.completion(**kwargs)
+
+                # 验证成功，保存模型到已有厂商
+                add_model_to_provider(
+                    provider_id=state["am_provider_id"],
+                    name=model,
+                    context_window=ctx,
+                )
+
+                state["message"] = f"✔ 模型已添加到「{provider_name}」！"
+                state["mode"] = "list"
+                state["items"] = build_items()
+                _ui(lambda: layout.focus(main_win))
+            except Exception as e:
+                err_msg = str(e)
+                if "APIConnectionError" in err_msg:
+                    err_msg = "网络连接失败，请检查 Base URL 是否正确或网络是否通畅。"
+                elif "AuthenticationError" in err_msg or "401" in err_msg:
+                    err_msg = "认证失败，请检查 API Key 是否正确。"
+                elif "NotFoundError" in err_msg or "404" in err_msg:
+                    err_msg = f"模型或 API 路径不存在，请检查模型名称 '{model}' 或 Base URL 是否正确。"
+                else:
+                    err_msg = f"连接失败: {err_msg}"
+
+                state["message"] = f"❌ {err_msg[:75]}"
+            finally:
+                state["testing"] = False
+                _ui(event.app.invalidate)
+
         threading.Thread(target=test_conn, daemon=True).start()
 
     # ── 输入缓冲区（向导用）──
@@ -226,6 +323,7 @@ def open_model_selector(on_model_selected=None):
                     "provider": provider,
                     "active":   model["id"] == active_id,
                 })
+            items.append({"type": "add_model", "provider": provider})
         items.append({"type": "add"})
         return items
 
@@ -266,6 +364,12 @@ def open_model_selector(on_model_selected=None):
                     out += [_t("class:model.active", f"   {label}\n")]
                 else:
                     out += [_t("class:model.normal", f"   {label}\n")]
+
+            elif t == "add_model":
+                if is_cur:
+                    out += [_t("class:add.cursor", "  ▶   ＋ 添加模型\n")]
+                else:
+                    out += [_t("class:add.normal", "      ＋ 添加模型\n")]
 
             elif t == "add":
                 if is_cur:
@@ -370,12 +474,49 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
         return out
 
+    # ════════════════ 渲染添加模型向导 ════════════════
+    def render_addmodel_wizard():
+        step = state["am_step"]
+        data = state["am_data"]
+        provider_name = ""
+        cfg = load_config()
+        for provider in cfg.get("providers", []):
+            if provider["id"] == state["am_provider_id"]:
+                provider_name = provider.get("name", "")
+                break
+
+        out = []
+        out += [_t("class:header", f"  ＋ 为「{provider_name}」添加模型 — 向导\n")]
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+
+        steps_map = {
+            0: ("步骤 1/2  模型名称",   "输入模型名称，如 deepseek-chat："),
+            1: ("步骤 2/2  最大上下文", "输入上下文 Token 数，如 128000："),
+        }
+
+        if step > 0 and "model_name" in data:
+            out += [_t("class:wiz.hint", f"  模型名称: {data['model_name']}\n")]
+
+        if step in steps_map:
+            title, hint = steps_map[step]
+            out += [_t("class:wiz.title", f"  {title}\n")]
+            out += [_t("class:wiz.hint",  f"  {hint}\n")]
+
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        if state["message"]:
+            style = "class:ok" if not state["message"].startswith("❌") else "class:empty"
+            out += [_t(style, f"  {state['message']}\n")]
+        out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
+        return out
+
     # ════════════════ 布局 ════════════════
     def get_main_content():
         if state["mode"] == "list":
             return render_list()
         elif state["mode"] == "edit":
             return render_edit_wizard()
+        elif state["mode"] == "addmodel":
+            return render_addmodel_wizard()
         return render_wizard()
 
     main_ctrl = FormattedTextControl(get_main_content, focusable=True)
@@ -383,9 +524,22 @@ def open_model_selector(on_model_selected=None):
 
     @Condition
     def need_input():
+        if state["mode"] == "addmodel":
+            return True
         return state["mode"] in ("wizard", "edit") and not (state["mode"] == "wizard" and state["add_step"] in (3, 6))
 
     def get_input_header():
+        if state["mode"] == "addmodel":
+            hints = {
+                0: "输入模型名称，按 Enter 确认",
+                1: "输入 Token 数量，按 Enter 确认",
+            }
+            hint = hints.get(state["am_step"], "")
+            return [
+                ("class:footer", "  " + "─" * 44 + "\n"),
+                ("class:wiz.title", f"  ▶ {hint}\n"),
+            ]
+
         if state["mode"] == "edit":
             step = state["edit_step"]
             hints = {
@@ -454,10 +608,10 @@ def open_model_selector(on_model_selected=None):
         item = state["items"][state["cursor"]]
         if item["type"] == "model":
             # 增加安全拦截：如果当前 Token 消耗超过目标模型上限，禁止切换！
-            from core.llm import session_token_usage
             target_ctx = item["data"].get("context_window", 128000)
-            if session_token_usage["latest_total"] > target_ctx:
-                state["message"] = f"❌ 无法切换：当前 Token 消耗 ({session_token_usage['latest_total']}) 已超过目标模型上限 ({target_ctx})，强行切换将导致崩溃！"
+            latest_total = _latest_total_tokens()
+            if latest_total > target_ctx:
+                state["message"] = f"❌ 无法切换：当前 Token 消耗 ({latest_total}) 已超过目标模型上限 ({target_ctx})，强行切换将导致崩溃！"
                 return
                 
             set_active_model(item["data"]["id"])
@@ -468,6 +622,16 @@ def open_model_selector(on_model_selected=None):
                 if info:
                     on_model_selected(info)
             event.app.exit()
+
+        elif item["type"] == "add_model":
+            p = item["provider"]
+            state["mode"] = "addmodel"
+            state["am_step"] = 0
+            state["am_data"] = {}
+            state["am_provider_id"] = p["id"]
+            state["message"] = ""
+            input_buf.set_document(Document(""))
+            layout.focus(input_buf)
 
         elif item["type"] == "add":
             state["mode"] = "wizard"
@@ -631,6 +795,47 @@ def open_model_selector(on_model_selected=None):
         elif step == 5:
             state["add_step"] = 4
             input_buf.set_document(Document(state["add_data"].get("model_name", "")))
+
+    # ── 添加模型向导：Enter 推进步骤 ──
+    @kb.add("enter", filter=Condition(lambda: state["mode"] == "addmodel"))
+    def _am_enter(event):
+        if state.get("testing"):
+            return
+
+        state["message"] = ""
+        step = state["am_step"]
+        text = input_buf.text.strip()
+
+        if step == 0:
+            if not text:
+                return
+            state["am_data"]["model_name"] = text
+            input_buf.set_document(Document(""))
+            state["am_step"] = 1
+
+        elif step == 1:
+            try:
+                ctx = int(text)
+            except ValueError:
+                ctx = 128000
+            state["am_data"]["context_window"] = ctx
+            _test_and_save_added_model(event, ctx)
+
+    # ── 添加模型向导：Esc 返回上一步 ──
+    @kb.add("escape", filter=Condition(lambda: state["mode"] == "addmodel"))
+    def _am_esc(event):
+        if state.get("testing"):
+            return
+
+        state["message"] = ""
+        step = state["am_step"]
+        if step == 0:
+            state["mode"] = "list"
+            state["items"] = build_items()
+            layout.focus(main_win)
+        elif step == 1:
+            state["am_step"] = 0
+            input_buf.set_document(Document(state["am_data"].get("model_name", "")))
 
     # ── 编辑向导：Enter 推进步骤 ──
     @kb.add("enter", filter=Condition(lambda: state["mode"] == "edit"))

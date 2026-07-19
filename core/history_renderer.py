@@ -37,20 +37,55 @@ def _styled_summary(summary: str, target: str) -> str:
     return f"{before}{_CYAN}{target}{_RESET}{after}"
 
 
+def _strip_escapes(value):
+    """递归剥离字符串中的 ANSI 转义字符。
+
+    历史记录里的 assistant/reasoning/tool 字符串均来自模型生成内容，
+    可能携带 \\x1b[2J 之类的终端控制序列，回放时必须统一在输入侧剥离，
+    防止注入劫持终端（rich 自身生成的颜色序列不受影响）。
+    """
+    if isinstance(value, str):
+        return value.replace("\x1b", "")
+    if isinstance(value, list):
+        return [_strip_escapes(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _strip_escapes(item) for key, item in value.items()}
+    return value
+
+
+def _sanitize_user_content(raw) -> str:
+    """提取用户消息文本并剥离 ANSI 转义序列，防止 \x1b[ 注入劫持终端。"""
+    if isinstance(raw, list):
+        # 多模态 list 内容：只提取 text 块，图片块以占位说明表示
+        parts = []
+        for block in raw:
+            if isinstance(block, dict):
+                if block.get("type") == "text":
+                    parts.append(str(block.get("text", "")))
+                elif block.get("type") == "image_url":
+                    parts.append("[图片]")
+        content = " ".join(part for part in parts if part)
+    else:
+        content = str(raw or "")
+    return content.replace("\x1b", "")
+
+
 def render_session_history(history: list[dict], width: int) -> str:
+    # 窄终端钳制：render_markdown_to_ansi 要求 width >= 20
+    width = max(20, width)
     output: list[str] = []
     pending_tools: dict[str, tuple[str, dict]] = {}
 
     for message in history:
         role = message.get("role")
         if role == "user":
-            content = str(message.get("content") or "")
+            content = _sanitize_user_content(message.get("content"))
             output.append(f"{_CYAN}✨ You >{_RESET} {content}\n")
             continue
 
         if role == "assistant":
-            content = str(message.get("content") or "")
-            reasoning = str(message.get("reasoning_content") or "")
+            content = _strip_escapes(str(message.get("content") or ""))
+            reasoning = _strip_escapes(str(message.get("reasoning_content") or ""))
             tagged_reasoning, public_content = split_reasoning_text(content)
             if tagged_reasoning:
                 reasoning = reasoning or tagged_reasoning
@@ -60,8 +95,8 @@ def render_session_history(history: list[dict], width: int) -> str:
                 output.append(f"{_DIM}{reasoning}{_RESET}\n")
 
             for call in message.get("tool_calls") or []:
-                name = str(call.get("function", {}).get("name") or "tool")
-                arguments = _arguments(call)
+                name = _strip_escapes(str(call.get("function", {}).get("name") or "tool"))
+                arguments = _strip_escapes(_arguments(call))
                 pending_tools[str(call.get("id", ""))] = (name, arguments)
                 summary = summarize_tool_started(name, arguments)
                 summary = _styled_summary(summary, tool_target(name, arguments))
@@ -76,7 +111,7 @@ def render_session_history(history: list[dict], width: int) -> str:
             tool_id = str(message.get("tool_call_id", ""))
             name, arguments = pending_tools.pop(
                 tool_id,
-                (str(message.get("name") or "tool"), {}),
+                (_strip_escapes(str(message.get("name") or "tool")), {}),
             )
             result = {"content": message.get("content", "")}
             ok = not str(result["content"]).startswith("🚨")

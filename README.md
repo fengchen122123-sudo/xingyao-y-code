@@ -45,9 +45,9 @@ source venv/bin/activate
 pip install -e .
 ```
 
-> `setup.py` 已声明依赖：`rich`、`litellm`、`pytest`、`prompt_toolkit`、`pyfiglet`。运行时如需联网搜索，请额外安装 `duckduckgo-search`：
+> `setup.py` 已声明依赖：`rich`、`litellm`、`pytest`、`prompt_toolkit`、`pyfiglet`。运行时如需联网搜索，请额外安装 `ddgs`：
 > ```bash
-> pip install duckduckgo-search
+> pip install ddgs
 > ```
 
 ### 3. 配置 API 密钥
