@@ -1,33 +1,184 @@
 import json
 import logging
-import litellm
-from litellm import completion
+import os
+import random
+import re
+import threading
+import time
+import uuid
+from copy import deepcopy
 
-# 彻底屏蔽 LiteLLM 启动时的网络请求超时警告
-logging.getLogger("LiteLLM").setLevel(logging.ERROR)
-logging.getLogger("litellm").setLevel(logging.ERROR)
+# 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
+# （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
+# 必须在 import litellm 之前设置该环境变量才生效
+os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+
+# 屏蔽 LiteLLM 启动时的调试噪音，但保留 WARNING 及以上的有用告警
+logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+logging.getLogger("litellm").setLevel(logging.WARNING)
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# litellm 懒加载：启动性能优化
+# ---------------------------------------------------------------------------
+# 旧实现：顶部直接 import litellm，导致每次启动都要等 litellm 加载（本地实测 ~1.4s，
+#   打包后首次启动 litellm 会让 UI 等待 3-5s 才出现）。
+# 新实现：UI 启动路径（main.py import core.llm）不再触发 litellm 加载，
+#   只有后台 worker 首次真正调用 LLM 或 estimate_tokens 时才加载。
+# 通过 _get_litellm() 单次懒加载 + 缓存，保证 litellm 只在第一次使用时被导入。
+_litellm_module = None
+_litellm_lock = threading.Lock()
+
+
+def _get_litellm():
+    """懒加载 litellm 模块，首次调用时 import 并执行一次性配置，后续调用直接返回缓存。
+
+    线程安全：多线程并发首次调用时通过 _litellm_lock 保证只 import 一次。
+    """
+    global _litellm_module
+    if _litellm_module is not None:
+        return _litellm_module
+    with _litellm_lock:
+        if _litellm_module is not None:
+            return _litellm_module
+        import litellm as _litellm
+        # 屏蔽启动调试噪音
+        _litellm.suppress_debug_info = True
+        _litellm_module = _litellm
+        return _litellm
+
+
+def _litellm_completion(**kwargs):
+    """litellm.completion 的懒加载包装。"""
+    return _get_litellm().completion(**kwargs)
+
+
+def _litellm_token_counter(model, messages):
+    """litellm.token_counter 的懒加载包装。"""
+    return _get_litellm().token_counter(model=model, messages=messages)
+
+
+def _litellm_supports_vision(model):
+    """litellm.supports_vision 的懒加载包装。"""
+    try:
+        return _get_litellm().supports_vision(model=model)
+    except Exception:
+        return False
+
+
+def _litellm_context_overflow_error():
+    """litellm.ContextWindowExceededError 异常类的懒加载包装。"""
+    return _get_litellm().ContextWindowExceededError
+
+
+# 单次 API 请求超时（秒）：长思考模型的首个 token 可能较慢，不宜过紧
+API_REQUEST_TIMEOUT_SECONDS = 90
+
+# 工具结果中的错误哨兵前缀（统一在此定义，供结果判断与构造处引用）
+TOOL_ERROR_PREFIX = "🚨"
+ASK_USER_ERROR_PREFIX = "无法提问："
+TOOL_INTERNAL_ERROR_PREFIX = "Tool execution error:"
+PERMISSION_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 用户拒绝了执行该操作。"
+PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 
 # 🌟 注意这里：我们把四个工具全都引进来了！
-from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent
+from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace, set_session_sandbox_bypass
 from core.mcp_client import mcp_manager
-from litellm import token_counter
+from core.permission_broker import CANCELLED_RESULT, permission_broker
+from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
+from core.tool_presenter import summarize_tool_finished, summarize_tool_started
+from core.turn_events import TurnEventFactory
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
 session_allowed_commands = set()      # 放行的命令前缀 (如 'git', 'date')
 session_allowed_write_files = set()   # 放行的写入文件绝对路径
 session_allowed_edit_files = set()    # 放行的修改文件绝对路径
 _last_tracked_session = None
+_raw_permission_lock = threading.Lock()
+# 保护会话放行白名单与 _last_tracked_session 的跨线程读写
+_session_whitelist_lock = threading.Lock()
+_plan_turn_lock = threading.Lock()
+_plan_turn_started_at = {}
+_PLAN_BYPASS_ERROR_PREFIX = "计划已创建：工具"
+_PLAN_ROOT_CONTROL_TOOLS = frozenset({
+    "plan_write",
+    "plan_update",
+    "run_subagent",
+    "ask_user",
+})
+_PLAN_BOUND_ORCHESTRATORS = frozenset({"run_subagent", "ask_user"})
+
+
+def _mark_plan_turn(turn_id):
+    if not turn_id:
+        return
+    now = time.monotonic()
+    with _plan_turn_lock:
+        _plan_turn_started_at[str(turn_id)] = now
+        cutoff = now - 3600
+        for stale_id, started_at in list(_plan_turn_started_at.items()):
+            if started_at < cutoff:
+                _plan_turn_started_at.pop(stale_id, None)
+
+
+def _is_plan_turn(turn_id):
+    if not turn_id:
+        return False
+    with _plan_turn_lock:
+        return str(turn_id) in _plan_turn_started_at
+
+
+def _has_pending_plan(session_id):
+    if not session_id:
+        return False
+    from core.plan import get_default_plan_manager
+
+    plan = get_default_plan_manager()
+    if plan.session_id != str(session_id):
+        return False
+    return any(
+        item.get("status") in {"pending", "in_progress"}
+        for item in plan.snapshot()
+    )
 
 def check_session_reset():
-    global _last_tracked_session, session_allowed_commands, session_allowed_write_files, session_allowed_edit_files
+    global _last_tracked_session
     import main
-    if _last_tracked_session != main.current_session:
-        _last_tracked_session = main.current_session
-        session_allowed_commands.clear()
-        session_allowed_write_files.clear()
-        session_allowed_edit_files.clear()
+    with _session_whitelist_lock:
+        if _last_tracked_session != main.current_session:
+            _last_tracked_session = main.current_session
+            session_allowed_commands.clear()
+            session_allowed_write_files.clear()
+            session_allowed_edit_files.clear()
 
-litellm.suppress_debug_info = True
+
+# 内联执行参数：含这些参数的命令不做会话前缀放行（等价于放行任意代码）
+# -m (python -m pip)、-p (node/perl -e 同类) 同样能执行任意模块/代码，必须拦截
+_INLINE_EXEC_FLAGS = {"-c", "-e", "--eval", "-command", "-encodedcommand", "/c", "-m", "-p"}
+
+
+def _session_prefix_for_command(cmd):
+    """计算可会话放行的命令前缀；内联执行命令返回 None 表示不予放行。"""
+    words = cmd.split()
+    if not words:
+        return None
+    lowered = [word.lower() for word in words]
+    if any(flag in lowered for flag in _INLINE_EXEC_FLAGS):
+        return None
+    first_word = words[0]
+    # 特殊处理：python / pip 脚本保留首个参数（脚本路径）以防过度放行整个解释器；
+    # 首个参数以 - 开头（如 python -m pip install）等价于任意模块执行，不予放行
+    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
+        if words[1].startswith("-"):
+            return None
+        return f"{first_word} {words[1]}"
+    return first_word
+
+
+def _command_matches_prefix(cmd, prefix):
+    """前缀匹配：前缀之后必须是空格或结尾，避免放行 'git' 后命中 'gitfoo'。"""
+    return cmd == prefix or cmd.startswith(prefix + " ")
 
 def safe_print(formatted_text):
     """线程安全地在 TUI 终端输出格式化文本，避免破坏屏幕布局"""
@@ -37,94 +188,6 @@ def safe_print(formatted_text):
         main.app_instance.loop.call_soon_threadsafe(lambda: print_formatted_text(formatted_text))
     else:
         print_formatted_text(formatted_text)
-
-def select_from_options(options, default_index=0):
-    """
-    提供类似 Claude Code 的交互式上下键菜单选择器。
-    在非 Windows 系统或 stdin 重定向的环境下自动平滑降级为普通命令行交互。
-    """
-    try:
-        import msvcrt
-        import sys
-        import ctypes
-        from ctypes import wintypes
-        
-        # 使用 ctypes 显式将 Windows 控制台设为 Raw 模式，防止 getch() 阻塞
-        kernel32 = ctypes.windll.kernel32
-        hStdIn = kernel32.GetStdHandle(-10)  # STD_INPUT_HANDLE
-        
-        orig_mode = wintypes.DWORD()
-        kernel32.GetConsoleMode(hStdIn, ctypes.byref(orig_mode))
-        
-        # 禁用行输入 (0x0002) 和回显 (0x0004)
-        raw_mode = orig_mode.value & ~(0x0002 | 0x0004)
-        kernel32.SetConsoleMode(hStdIn, raw_mode)
-        
-        current_idx = default_index
-        num_options = len(options)
-        
-        # 隐藏光标
-        sys.stdout.write("\033[?25l")
-        sys.stdout.flush()
-        
-        def render():
-            for idx, option in enumerate(options):
-                prefix = "  > " if idx == current_idx else "    "
-                if idx == current_idx:
-                    sys.stdout.write(f"\033[K\033[92m\033[1m{prefix}{option}\033[0m\n")
-                else:
-                    sys.stdout.write(f"\033[K{prefix}{option}\n")
-            sys.stdout.flush()
-            
-        render()
-        
-        try:
-            # 清空之前的按键缓存
-            while msvcrt.kbhit():
-                msvcrt.getch()
-                
-            while True:
-                ch = msvcrt.getch()
-                if ch in (b'\xe0', b'\x00'):
-                    ch2 = msvcrt.getch()
-                    if ch2 == b'H':  # Up Arrow
-                        current_idx = (current_idx - 1) % num_options
-                    elif ch2 == b'P':  # Down Arrow
-                        current_idx = (current_idx + 1) % num_options
-                    sys.stdout.write(f"\033[{num_options}A")
-                    render()
-                elif ch in (b'y', b'Y') and num_options > 0:
-                    current_idx = 0
-                    sys.stdout.write(f"\033[{num_options}A")
-                    render()
-                elif ch in (b'n', b'N') and num_options > 1:
-                    current_idx = 1
-                    sys.stdout.write(f"\033[{num_options}A")
-                    render()
-                elif ch in (b'a', b'A') and num_options > 2:
-                    current_idx = 2
-                    sys.stdout.write(f"\033[{num_options}A")
-                    render()
-                elif ch in (b'\r', b'\n'):
-                    break
-                elif ch == b'\x03':  # Ctrl+C
-                    raise KeyboardInterrupt()
-        finally:
-            # 恢复原始控制台模式
-            kernel32.SetConsoleMode(hStdIn, orig_mode.value)
-            
-            # 恢复光标并清空选择列表显示（使终端只保留最终选择的一行，保持极其整洁）
-            sys.stdout.write(f"\033[{num_options}A")
-            for _ in range(num_options):
-                sys.stdout.write("\033[K\n")
-            sys.stdout.write(f"\033[{num_options}A")
-            sys.stdout.write("\033[?25h")
-            sys.stdout.flush()
-            
-        return current_idx
-    except Exception:
-        # 降级兜底
-        return None
 
 def ask_in_raw_terminal(function_name, arguments):
     """
@@ -170,25 +233,24 @@ def ask_in_raw_terminal(function_name, arguments):
         if res in ("a", "always", "y*"):
             if function_name == "execute_command":
                 cmd = arguments.get("command", "")
-                words = cmd.split()
-                if words:
-                    first_word = words[0]
-                    # 特殊处理：如果是 python / pip 脚本，允许保留首个参数（脚本路径）以防过度放行整个 python
-                    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
-                        prefix = f"{first_word} {words[1]}"
-                    else:
-                        prefix = first_word
-                    session_allowed_commands.add(prefix)
+                prefix = _session_prefix_for_command(cmd)
+                if prefix is None:
+                    print("[内联执行命令不做会话前缀放行，仅本次通过]")
+                else:
+                    with _session_whitelist_lock:
+                        session_allowed_commands.add(prefix)
                     print(f"[当前会话已放行前缀]：{prefix}*")
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
-                    session_allowed_write_files.add(file_path)
+                    with _session_whitelist_lock:
+                        session_allowed_write_files.add(file_path)
                     print(f"[当前会话已放行写入]：{file_path}")
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
-                    session_allowed_edit_files.add(file_path)
+                    with _session_whitelist_lock:
+                        session_allowed_edit_files.add(file_path)
                     print(f"[当前会话已放行修改]：{file_path}")
             return True
             
@@ -197,142 +259,200 @@ def ask_in_raw_terminal(function_name, arguments):
         print("\n[操作已取消]")
         return False
 
-def check_permission_and_ask(function_name, arguments):
+def check_permission_and_ask(
+    function_name,
+    arguments,
+    event_callback=None,
+    permission_owner=None,
+    parent_turn_id=None,
+    permission_source="主代理",
+    cancel_event=None,
+):
     import main
-    import asyncio
-    from prompt_toolkit.application import in_terminal
-    
+
     # 0. 自动同步和重置会话级别的白名单缓存
     check_session_reset()
-    
+
     # 1. 检查当前会话中是否已被用户“永久允许”
     if function_name == "execute_command":
         cmd = arguments.get("command", "")
-        for prefix in session_allowed_commands:
-            if cmd.startswith(prefix):
-                print(f"💚 [当前会话自动放行命令]：{cmd}")
-                return True
+        with _session_whitelist_lock:
+            allowed = any(
+                _command_matches_prefix(cmd, prefix)
+                for prefix in session_allowed_commands
+            )
+        if allowed:
+            if event_callback is None:
+                from prompt_toolkit.formatted_text import HTML
+                safe_print(HTML(f"<ansigreen>当前会话自动放行命令：{cmd}</ansigreen>"))
+            else:
+                _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
+            return True
     elif function_name == "write_file":
         file_path = arguments.get("file_path", "")
-        if file_path in session_allowed_write_files:
-            print(f"💚 [当前会话自动放行写入]：{file_path}")
+        with _session_whitelist_lock:
+            file_allowed = file_path in session_allowed_write_files
+        if file_allowed:
+            if event_callback is None:
+                from prompt_toolkit.formatted_text import HTML
+                safe_print(HTML(f"<ansigreen>当前会话自动放行写入：{file_path}</ansigreen>"))
+            else:
+                _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
             return True
     elif function_name == "edit_file":
         file_path = arguments.get("file_path", "")
-        if file_path in session_allowed_edit_files:
-            print(f"💚 [当前会话自动放行修改]：{file_path}")
+        with _session_whitelist_lock:
+            edit_allowed = file_path in session_allowed_edit_files
+        if edit_allowed:
+            if event_callback is None:
+                from prompt_toolkit.formatted_text import HTML
+                safe_print(HTML(f"<ansigreen>当前会话自动放行修改：{file_path}</ansigreen>"))
+            else:
+                _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
             return True
-    
+
     # 2. 如果权限是完全放行，直接通过
     if main.current_permission_mode == "full":
+        if event_callback is not None:
+            _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
-        
+
     # 3. 如果是计划模式且本轮对话的计划已经获得批准，直接通过
     if main.current_permission_mode == "plan" and main.plan_approved_this_turn:
+        if event_callback is not None:
+            _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
-        
-    # 4. 否则，需要使用 TUI 确认面板向用户征求意见
-    # 临时切入等待授权状态，并刷新状态栏
-    old_status = main.task_status
-    main.task_status = 'waiting'
-    if main.app_instance:
-        main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
+
+    _notify_event(event_callback, "permission_requested", {
+        "function_name": function_name,
+        "arguments": dict(arguments),
+        "source": permission_source,
+    })
 
     app = main.app_instance
     if not app or not app.loop:
-        # 兜底：如果前台没有活动 App 实例，采用普通 input() 获取
-        approved = ask_in_raw_terminal(function_name, arguments)
-        main.task_status = old_status
-        return approved
-        
-    loop = app.loop
-    
-    from concurrent.futures import Future
-    fut = Future()
-    
-    # 异步在 TUI 线程初始化 confirm_prompt 并绑定 Future
-    async def setup_prompt():
-        main.confirm_prompt = {
-            'function_name': function_name,
-            'arguments': arguments,
-            'options': [
-                "Yes, 同意本次操作 (y)",
-                "No, 拒绝本次操作 (n)",
-                "Always, 始终允许此类操作 (a)"
-            ],
-            'current_idx': 0,
-            'future': fut
-        }
-        main.app_instance.invalidate()
-        
-    asyncio.run_coroutine_threadsafe(setup_prompt(), loop).result()
-    
+        with _raw_permission_lock:
+            return ask_in_raw_terminal(function_name, arguments)
+
+    # owner/turn_id 统一来源：优先显式传入，turn 兜底 owner，线程名最后兜底
+    owner_id = str(permission_owner or parent_turn_id or threading.current_thread().name)
+    turn_id = str(parent_turn_id or owner_id)
+    request = permission_broker.enqueue(
+        function_name,
+        arguments,
+        owner_id,
+        turn_id,
+        permission_source,
+    )
+
     try:
-        choice_idx = fut.result()  # 阻塞当前后台 Worker 线程，直至 TUI 线程设置用户按键的选择结果
-        
-        # 恢复状态并触发刷新
-        main.task_status = old_status
-        if main.app_instance:
-            main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
-            
+        # 带短超时的轮询等待：取消信号到达时立即跳出，避免线程永久挂起；
+        # 先查 future 再判 cancel，避免用户刚点“同意”被竞态误判为取消
+        while True:
+            if request.future.done():
+                choice_idx = request.future.result()
+                break
+            if cancel_event is not None and cancel_event.is_set():
+                permission_broker.cancel_owner(owner_id)
+                choice_idx = CANCELLED_RESULT
+                break
+            try:
+                choice_idx = request.future.result(timeout=0.1)
+                break
+            except TimeoutError:
+                continue
+
+        from prompt_toolkit.formatted_text import ANSI
+
+        if choice_idx == CANCELLED_RESULT:
+            if event_callback is None:
+                safe_print(ANSI("   🛑 操作已取消"))
+            else:
+                _notify_event(event_callback, "permission_resolved", {
+                    "approved": False,
+                    "cancelled": True,
+                })
+            return False
+
         choices_map = {
             0: "\033[92m✓ 已同意本次操作\033[0m",
             1: "\033[91m✗ 已拒绝本次操作\033[0m",
             2: "\033[96m✨ 已选择始终放行此类操作 (当前会话)\033[0m"
         }
-        
-        # 向主对话历史区打印整洁的单行授权记录
-        from prompt_toolkit.formatted_text import ANSI
-        
-        if function_name == "execute_command":
-            cmd = arguments.get("command", "")
-            safe_print(ANSI(f"💻 星瑶申请执行命令: {cmd}"))
-        elif function_name == "write_file":
-            file_path = arguments.get("file_path", "")
-            safe_print(ANSI(f"✍️ 星瑶申请写入文件: {file_path}"))
-        elif function_name == "edit_file":
-            file_path = arguments.get("file_path", "")
-            safe_print(ANSI(f"📝 星瑶申请修改文件: {file_path}"))
-            
-        safe_print(ANSI(f"   👉 确认结果: {choices_map[choice_idx]}"))
-        
+
+        if event_callback is None:
+            if function_name == "execute_command":
+                cmd = arguments.get("command", "")
+                safe_print(ANSI(f"💻 星瑶申请执行命令: {cmd}"))
+            elif function_name == "write_file":
+                file_path = arguments.get("file_path", "")
+                safe_print(ANSI(f"✍️ 星瑶申请写入文件: {file_path}"))
+            elif function_name == "edit_file":
+                file_path = arguments.get("file_path", "")
+                safe_print(ANSI(f"📝 星瑶申请修改文件: {file_path}"))
+            safe_print(ANSI(f"   👉 确认结果: {choices_map[choice_idx]}"))
+        else:
+            _notify_event(event_callback, "permission_resolved", {
+                "approved": choice_idx != 1,
+                "always": choice_idx == 2,
+            })
+
         if choice_idx == 1:
             return False
-            
+
         if choice_idx == 2:
             if function_name == "execute_command":
                 cmd = arguments.get("command", "")
-                words = cmd.split()
-                if words:
-                    first_word = words[0]
-                    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
-                        prefix = f"{first_word} {words[1]}"
+                prefix = _session_prefix_for_command(cmd)
+                if prefix is None:
+                    # 与 raw 终端路径行为对齐：内联执行命令不放行也不静默，明确提示
+                    if event_callback is None:
+                        safe_print(ANSI("   ⚠️ [内联执行命令不做会话前缀放行，仅本次通过]"))
                     else:
-                        prefix = first_word
-                    session_allowed_commands.add(prefix)
-                    safe_print(ANSI(f"   ✨ [当前会话已放行前缀]：{prefix}*"))
+                        _notify_event(event_callback, "status", {
+                            "message": "内联执行命令不做会话前缀放行，仅本次通过。",
+                        })
+                else:
+                    with _session_whitelist_lock:
+                        session_allowed_commands.add(prefix)
+                    if event_callback is None:
+                        safe_print(ANSI(f"   ✨ [当前会话已放行前缀]：{prefix}*"))
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
-                    session_allowed_write_files.add(file_path)
-                    safe_print(ANSI(f"   ✨ [当前会话已放行写入]：{file_path}"))
+                    with _session_whitelist_lock:
+                        session_allowed_write_files.add(file_path)
+                    if event_callback is None:
+                        safe_print(ANSI(f"   ✨ [当前会话已放行写入]：{file_path}"))
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
-                    session_allowed_edit_files.add(file_path)
-                    safe_print(ANSI(f"   ✨ [当前会话已放行修改]：{file_path}"))
+                    with _session_whitelist_lock:
+                        session_allowed_edit_files.add(file_path)
+                    if event_callback is None:
+                        safe_print(ANSI(f"   ✨ [当前会话已放行修改]：{file_path}"))
+            elif function_name == "sandbox_outside_access":
+                set_session_sandbox_bypass(True)
+                if event_callback is None:
+                    safe_print(ANSI("   ✨ [当前会话已放行沙盒外访问]"))
             return True
-            
+
         approved = (choice_idx in (0, 2))
-        if approved and main.current_permission_mode == "plan":
+        # plan 模式仅在用户明确选择“始终放行”时才批准整轮计划，
+        # “同意本次”(0) 只放行当前这一次操作
+        if choice_idx == 2 and main.current_permission_mode == "plan":
             main.plan_approved_this_turn = True
         return approved
     except Exception as e:
-        main.task_status = old_status
-        if main.app_instance:
-            main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
-        print(f"\n[⚠️ 权限询问交互发生异常: {str(e)}]")
+        _notify_event(event_callback, "error", {
+            "message": f"权限询问交互发生异常: {str(e)}",
+        })
         return False
+    finally:
+        # 异常退出（含 KeyboardInterrupt 等 BaseException）时回收已入队请求，
+        # 否则 broker 串行化会让后续所有权限提示永久排队
+        if not request.future.done():
+            permission_broker.cancel_owner(owner_id)
 
 # 全局变量：分离“本次窗口占比”和“整体累积消耗”
 session_token_usage = {
@@ -348,151 +468,37 @@ session_token_usage = {
     
     "max_window": 128000  # 默认最大上下文窗口配置
 }
+# session_token_usage 会被后台 worker 线程与 UI 线程同时读写，所有读写必须走锁
+token_usage_lock = threading.Lock()
 
-# 星瑶的终极武器库说明书
-TOOLS_SCHEMA = [
-    {
-        "type": "function",
-        "function": {
-            "name": "read_file",
-            "description": "读取本地文件的内容，用于查看代码",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "要读取的文件相对路径"}
-                },
-                "required": ["file_path"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "write_file",
-            "description": "将内容写入本地文件，用于创建新文件或修改代码",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "要写入的文件路径"},
-                    "content": {"type": "string", "description": "要写入的具体代码内容"}
-                },
-                "required": ["file_path", "content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "list_directory",
-            "description": "雷达：扫描指定文件夹，查看里面有哪些文件和目录。如果不确定项目结构，优先使用此工具。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "dir_path": {"type": "string", "description": "要扫描的文件夹路径，默认为 '.'"}
-                }
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_code",
-            "description": "全局代码搜索雷达：跨文件搜索特定的变量、类名、函数或任意关键字。当你不知道某段逻辑在哪个文件时，使用此工具查找。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "要搜索的关键字或代码片段"},
-                    "dir_path": {"type": "string", "description": "搜索范围目录，默认是 '.'", "default": "."}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_command",
-            "description": "引擎：在本地终端执行 shell 或命令行指令，并获取输出结果。对于 npm run dev、python server.py 等常驻进程服务，请务必设置 run_in_background=true，否则会卡死阻塞对话。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string", "description": "要在终端执行的命令，比如 'python hello.py'"},
-                    "run_in_background": {"type": "boolean", "description": "是否在后台异步运行该命令。若是常驻服务器或进程，设为 true。"}
-                },
-                "required": ["command"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "search_news",
-            "description": "联网工具：在网上搜索最新的新闻标题和链接。当用户询问现实世界的新闻或最新资讯时使用。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string", "description": "搜索关键词"},
-                    "num_results": {"type": "integer", "description": "返回结果数量，默认 5 条"}
-                },
-                "required": ["query"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "edit_file",
-            "description": "手术刀：对本地已有的代码文件进行精准的局部搜索与替换修改。相较于 write_file 覆写整张大文件，编辑已有代码时应优先调用此工具以节省 Token 并防止丢代码。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "file_path": {"type": "string", "description": "要修改的文件的相对或绝对路径"},
-                    "target_content": {"type": "string", "description": "文件里准备被替换的旧代码块（必须完全匹配，注意空格缩进和换行）"},
-                    "replacement_content": {"type": "string", "description": "替换进去的新代码块"}
-                },
-                "required": ["file_path", "target_content", "replacement_content"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "manage_task",
-            "description": "后台进程管理器：对丢在后台运行的长周期任务（如 npm run dev 启动的服务器）进行列表查看（list）、状态及实时日志尾部查询（status）、强制杀掉（kill）。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "description": "对任务的动作。可选值: 'list', 'status', 'kill'"},
-                    "task_id": {"type": "string", "description": "目标任务 ID。如果 action 是 'status' 或 'kill' 则为必填参数。"}
-                },
-                "required": ["action"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "run_subagent",
-            "description": "启动一个相对独立的辅助子 Agent 来协助完成特定的子任务，并在结束后返回详尽的汇总报告。",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "task_description": {"type": "string", "description": "需要子 Agent 独立去完成的具体子任务描述。"}
-                },
-                "required": ["task_description"]
-            }
-        }
-    }
-] + mcp_manager.get_schemas()
+# The registry is the canonical capability metadata source.
+from core.tool_registry import build_default_registry
+tool_registry = build_default_registry()
+
+
+def get_tools_schema():
+    """每次构建请求时新鲜获取工具 schema（registry 静态 + MCP 动态）。
+
+    不做模块级一次性快照：启动时 MCP 连接失败不会导致本进程永久缺失
+    MCP 工具 schema，且 mcp_client 为惰性连接，import 时不触发网络。
+    """
+    return tool_registry.api_schemas() + mcp_manager.get_schemas()
+
+
+def __getattr__(name):
+    # 兼容别名：惰性计算，避免 import 时触发 MCP 连接
+    if name == "TOOLS_SCHEMA":
+        return get_tools_schema()
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 def estimate_tokens(model_name, messages):
     """本地离线快速估算 Token 数，防止超载崩溃"""
     if not messages:
         return 0
     try:
-        return token_counter(model=model_name, messages=messages)
+        return _litellm_token_counter(model_name, messages)
     except Exception:
-        # 如果模型不支持或报错，采用 2.5 字符 / Token 的经验值进行兜底估算
+        # 如果模型不支持或报错，采用约 2 字符 / Token 的经验值进行兜底估算
         return len(str(messages)) // 2
 
 def _yield_content(text):
@@ -500,13 +506,32 @@ def _yield_content(text):
     for char in text:
         yield char
 
-cancel_requested = False
+
+def _is_meaningful_assistant_content(text):
+    return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
+
+
+def _read_text_with_encoding_fallback(file_path):
+    """读取文本文件：优先 UTF-8，失败回退 GBK（与 core.tools.edit_file 解码策略一致）。"""
+    with open(file_path, "rb") as f:
+        raw = f.read()
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode("gbk", errors="replace")
+
 
 def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
     """
     大模型通信网关：支持流式（stream=True）与非流式（stream=False，后台 Agent 自动消化）
     """
-    gen = _chat_with_model_generator(model_name, api_key, messages, api_base=api_base, stream=stream)
+    gen = _chat_with_model_generator(
+        model_name,
+        api_key,
+        messages,
+        api_base=api_base,
+        stream=False,
+    )
     if stream:
         return gen
     else:
@@ -514,349 +539,1348 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
         for _ in gen:
             pass
         if messages and messages[-1]["role"] == "assistant":
+            # 尾部 assistant 消息 content 可能为 None（例如仅工具调用轮）：
+            # 为保持兼容，统一归一化为空字符串返回，不向调用方暴露 None
             return messages[-1].get("content", "") or ""
         return ""
 
-def _chat_with_model_generator(model_name, api_key, messages, api_base=None, stream=False):
+
+def chat_with_model_events(
+    model_name,
+    api_key,
+    messages,
+    api_base=None,
+    persist=True,
+    turn_id=None,
+    cancel_event=None,
+    allow_subagents=True,
+    allowed_tools=None,
+    consume_background_notifications=True,
+    parent_session=None,
+    parent_turn_id=None,
+    permission_owner=None,
+    permission_source="主代理",
+):
+    """Yield ordered :class:`TurnEvent` snapshots for one model turn.
+
+    The legacy ``chat_with_model`` API remains text-oriented. This adapter is
+    the event-oriented entry point used by the TUI and is deliberately kept
+    separate while the existing tool loop is migrated incrementally.
+    """
+    if persist and not parent_session:
+        raise ValueError("parent_session is required when persist=True")
+    resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
+    resolved_parent_turn_id = parent_turn_id or resolved_turn_id
+    factory = TurnEventFactory(resolved_turn_id)
+    pending_events = []
+    pending_lock = threading.Lock()
+    parser = ReasoningStreamParser()
+    thinking_open = False
+    turn_failed = False
+
+    def emit(kind, payload):
+        nonlocal thinking_open
+        with pending_lock:
+            # 生成器侧的任何回调事件都发生在已 yield 文本之后：
+            # 若 parser 已悄悄越过 </think>（闭合标签本身不产生文本 part），
+            # 这里统一补发 thinking_finished，保证每个思考块只收到一组事件
+            if thinking_open:
+                pending_events.append(factory.emit("thinking_finished", {}))
+                thinking_open = False
+            pending_events.append(factory.emit(kind, payload))
+
+    def drain_public_events():
+        nonlocal turn_failed
+        with pending_lock:
+            ready = pending_events[:]
+            del pending_events[:]
+        if any(event.kind == "turn_error" for event in ready):
+            turn_failed = True
+        return ready
+
+    def events_for_parts(parts):
+        nonlocal thinking_open
+        ready = []
+        for part in parts:
+            if part.kind == "thinking":
+                if not thinking_open:
+                    ready.append(factory.emit("thinking_started", {}))
+                    thinking_open = True
+                if part.text:
+                    ready.append(factory.emit("thinking_delta", {"text": part.text}))
+                continue
+
+            if thinking_open:
+                ready.append(factory.emit("thinking_finished", {}))
+                thinking_open = False
+            if part.text:
+                ready.append(factory.emit("assistant_delta", {"text": part.text}))
+        return ready
+
+    generator = _chat_with_model_generator(
+        model_name,
+        api_key,
+        messages,
+        api_base=api_base,
+        stream=persist,
+        event_callback=emit,
+        cancel_event=cancel_event,
+        allow_subagents=allow_subagents,
+        allowed_tools=allowed_tools,
+        consume_background_notifications=consume_background_notifications,
+        parent_session=parent_session,
+        parent_turn_id=resolved_parent_turn_id,
+        permission_owner=permission_owner or resolved_parent_turn_id,
+        permission_source=permission_source,
+    )
+    try:
+        for chunk in generator:
+            yield from drain_public_events()
+            if chunk:
+                yield from events_for_parts(parser.feed(chunk))
+
+        yield from drain_public_events()
+        yield from events_for_parts(parser.finish())
+        if thinking_open:
+            yield factory.emit("thinking_finished", {})
+            thinking_open = False
+        # 异常结束的回合只发 turn_error，不再发 turn_finished，避免 UI 把失败当成功
+        if not turn_failed:
+            yield factory.emit("turn_finished", {})
+    except KeyboardInterrupt:
+        yield from drain_public_events()
+        yield factory.emit("turn_cancelled", {})
+        raise
+    except Exception as exc:
+        # 生成器前置区（记忆注入/通知 drain/请求构造）抛出的异常会穿透内部
+        # try 直接传播到这里：补发 turn_error，保证调用方能感知回合失败
+        yield from drain_public_events()
+        yield factory.emit("turn_error", {"message": str(exc)})
+        raise
+
+# 支持原生推理字段回传的 provider 白名单（按 litellm model 前缀匹配）
+_REASONING_FIELD_PROVIDERS = ("anthropic", "deepseek")
+
+
+def _supports_reasoning_fields(model_name):
+    prefix = str(model_name or "").split("/")[0].lower()
+    return prefix in _REASONING_FIELD_PROVIDERS
+
+
+# 支持 prompt caching 的 provider 白名单（按 litellm model 前缀匹配）
+# 仅 Anthropic 需要显式 cache_control 标记：
+#   - anthropic: 需显式标记，命中后缓存 token 按 1/10 计费
+#   - deepseek/openai: 自动缓存命中，无需标记；显式标记反而可能被某些严格校验的
+#     OpenAI 兼容网关（如部分国产中转）拒绝为 400。保守起见不启用。
+_CACHE_CONTROL_PROVIDERS = ("anthropic",)
+
+
+def _supports_cache_control(model_name):
+    """判断 provider 是否支持 cache_control 字段。
+
+    保守策略：仅对 Anthropic 启用。其他 provider（含 OpenAI 兼容端点）自动缓存命中，
+    无需显式标记；显式标记反而可能被严格校验的网关拒绝为 400。
+    """
+    prefix = str(model_name or "").split("/")[0].lower()
+    return prefix in _CACHE_CONTROL_PROVIDERS
+
+
+def _apply_cache_control(messages, model_name):
+    """给消息列表加 cache_control 标记，启用 provider 侧 prompt caching。
+
+    标记策略：
+    - system 消息：必缓存（固定前缀，单次会话内不变）
+    - 最后一条 assistant 消息：设置缓存边界。
+      选择 assistant 而非倒数第 2 条，是因为工具轮次中 messages[-2] 可能是 tool 结果
+      而非稳定前缀（多 tool 结果会让断点每轮移动，二级缓存几乎永远 miss）。
+      最后一条 assistant 消息是上一轮的回复，在当前轮 tool 调用期间保持稳定，
+      provider 可以缓存到该位置，下一轮 tool 结果追加时前缀稳定命中。
+
+    Anthropic 限制：单次请求最多 4 个 cache_control 标记。
+    本策略仅用 2 个，远低于上限，安全。
+
+    本函数原地修改并返回 messages；调用方已通过 _strip_media_and_merge 处理过副本，
+    不会污染 messages 列表本身。
+    """
+    if not _supports_cache_control(model_name):
+        return messages
+    if not messages:
+        return messages
+
+    # 清除已有标记，避免累积（_strip_media_and_merge 不传 cache_control，但兜底防御）
+    for msg in messages:
+        if isinstance(msg, dict):
+            msg.pop("cache_control", None)
+
+    # 1. 标记 system 消息（如果有）
+    if messages[0].get("role") == "system":
+        messages[0]["cache_control"] = {"type": "ephemeral"}
+
+    # 2. 标记最后一条 assistant 消息（缓存边界）
+    #    遍历从后往前找第一条 role=="assistant" 的消息。
+    #    如果最后一条已经是 assistant（无 tool 调用），就标它；
+    #    如果末尾是 tool 结果，就标它们之前的 assistant（更稳定）。
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            messages[i]["cache_control"] = {"type": "ephemeral"}
+            break
+
+    return messages
+
+
+def _supports_vision(model_name):
+    """判断模型是否支持图像输入。
+
+    判定顺序：
+    1. 模型配置中的 supports_vision 显式标注（config.json 的 models 条目，可选）
+    2. LiteLLM 内置模型信息（知名模型）
+    3. 未知模型按协议兜底：openai/anthropic 兼容端点通常接受 image_url 负载
+    """
+    if not model_name:
+        return False
+    try:
+        from core.model_manager import load_config
+        for provider in load_config().get("providers", []):
+            for model in provider.get("models", []):
+                if model.get("litellm_model") == model_name and "supports_vision" in model:
+                    return bool(model["supports_vision"])
+    except Exception:
+        pass
+    try:
+        if _litellm_supports_vision(model_name):
+            return True
+    except Exception:
+        pass
+    return str(model_name).startswith(("openai/", "anthropic/"))
+
+
+def _flatten_media_content(content_list):
+    """把多模态 list 内容折叠为纯文本：图片/文档用短占位符，绝不内联原始 base64 数据。"""
+    text_parts = []
+    for item in content_list:
+        if isinstance(item, dict):
+            item_type = item.get("type")
+            if item_type == "text":
+                text_parts.append(item.get("text", ""))
+            elif item_type in ("image", "image_url"):
+                text_parts.append("[图片]")
+            elif item_type == "document":
+                text_parts.append("[文档]")
+            else:
+                text_parts.append(str(item)[:200])
+        else:
+            text_parts.append(str(item))
+    return " ".join(text_parts)
+
+
+def _strip_media_and_merge(messages, model_name=None):
+    """
+    1. 多媒体处理：支持视觉的模型保留最近一条消息中的图片（多模态负载原样透传），
+       更早的历史图片一律折叠为占位符，避免每轮重复发送烧 Token；
+       不支持视觉的模型全部折叠为占位符（绝不把 base64 当文本发给模型）
+    2. 合并连续相同 role 的消息，满足 LiteLLM / Anthropic 对 user/assistant 严格轮流的要求
+    3. reasoning_content / thinking_blocks 仅对支持的 provider 回传，避免其他 provider 报 400
+    """
+    keep_reasoning_fields = _supports_reasoning_fields(model_name)
+    keep_media = _supports_vision(model_name)
+
+    # 仅保留最近一条含多媒体的消息（其余历史中的图片折叠为占位符）
+    last_media_idx = -1
+    if keep_media:
+        for idx, msg in enumerate(messages):
+            content = msg.get("content")
+            if isinstance(content, list) and any(
+                isinstance(item, dict) and item.get("type") in ("image", "image_url", "document")
+                for item in content
+            ):
+                last_media_idx = idx
+
+    cleaned = []
+    for idx, msg in enumerate(messages):
+        role = msg.get("role")
+        content = msg.get("content")
+
+        if isinstance(content, list):
+            if idx == last_media_idx:
+                # 多模态负载原样保留，模型按 image_url 接收图片
+                cleaned_msg = {"role": role, "content": content}
+            else:
+                cleaned_msg = {"role": role, "content": _flatten_media_content(content)}
+        else:
+            cleaned_msg = {"role": role, "content": str(content) if content else ""}
+
+        # 保留工具链和 provider 原生推理字段，避免工具轮次破坏签名思考块。
+        if "tool_calls" in msg:
+            cleaned_msg["tool_calls"] = msg["tool_calls"]
+        if "tool_call_id" in msg:
+            cleaned_msg["tool_call_id"] = msg["tool_call_id"]
+        if "name" in msg:
+            cleaned_msg["name"] = msg["name"]
+        if keep_reasoning_fields and msg.get("reasoning_content") is not None:
+            cleaned_msg["reasoning_content"] = msg["reasoning_content"]
+        if keep_reasoning_fields and msg.get("thinking_blocks") is not None:
+            cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
+            
+        cleaned.append(cleaned_msg)
+        
+    # 合并同角色消息 (注意：不要合并有 tool_calls 或 role 是 tool/system 的消息)
+    fixed = []
+    if cleaned:
+        fixed.append(cleaned[0])
+        for msg in cleaned[1:]:
+            can_merge = (
+                msg["role"] == fixed[-1]["role"] and
+                msg["role"] not in ("tool", "system") and
+                "tool_calls" not in msg and
+                "tool_calls" not in fixed[-1] and
+                "reasoning_content" not in msg and
+                "reasoning_content" not in fixed[-1] and
+                "thinking_blocks" not in msg and
+                "thinking_blocks" not in fixed[-1] and
+                # 多模态 list 内容不参与文本合并
+                not isinstance(msg["content"], list) and
+                not isinstance(fixed[-1]["content"], list)
+            )
+            if can_merge:
+                fixed[-1]["content"] = (fixed[-1]["content"] or "") + "\n" + (msg["content"] or "")
+            else:
+                fixed.append(msg)
+    return fixed
+
+
+def _provider_request_options(model_name, api_base):
+    """Return options required by a known provider/model pair."""
+    normalized_base = str(api_base or "").rstrip("/").lower()
+    normalized_model = str(model_name or "").split("/")[-1].lower()
+    if "api.kimi.com/coding" in normalized_base and normalized_model == "k3":
+        return {
+            "thinking": {"type": "enabled", "budget_tokens": 4096},
+            "max_tokens": 32000,
+            "allowed_openai_params": ["thinking"],
+        }
+    return {}
+
+
+def _complete_thinking_blocks(delta):
+    """Extract only complete provider blocks that are safe to round-trip."""
+    fields = getattr(delta, "provider_specific_fields", None) or {}
+    blocks = fields.get("thinking_blocks") if isinstance(fields, dict) else None
+    if not isinstance(blocks, list):
+        return None
+    complete = [
+        deepcopy(block)
+        for block in blocks
+        if isinstance(block, dict)
+        and (
+            bool(block.get("signature"))
+            or (
+                block.get("type") == "redacted_thinking"
+                and bool(block.get("data"))
+            )
+        )
+    ]
+    return complete or None
+
+def _notify_event(event_callback, kind, payload):
+    if event_callback is not None:
+        event_callback(kind, payload)
+
+
+def _tool_call_arguments(tc):
+    try:
+        return json.loads(tc["function"].get("arguments", "{}"))
+    except (TypeError, ValueError):
+        return {}
+
+
+def _tool_event_payload(tc):
+    function_name = tc["function"]["name"]
+    arguments = _tool_call_arguments(tc)
+    preview = ""
+    if function_name in ("read_file", "write_file", "edit_file"):
+        preview = arguments.get("file_path", "")
+    elif function_name in ("search_code", "search_news"):
+        preview = arguments.get("query", "")
+    elif function_name == "fetch_url":
+        preview = arguments.get("url", "")
+    elif function_name == "get_weather":
+        preview = arguments.get("city", "") or "自动定位"
+    elif function_name == "execute_command":
+        preview = arguments.get("command", "")
+    elif function_name == "glob_files":
+        preview = arguments.get("pattern", "")
+    elif function_name == "list_directory":
+        preview = arguments.get("dir_path", ".")
+    elif function_name == "run_subagent":
+        preview = arguments.get("task_description", "")
+    return {
+        "id": tc.get("id", ""),
+        "name": function_name,
+        "preview": str(preview)[:120],
+        "arguments": arguments,
+        "summary": summarize_tool_started(function_name, arguments),
+    }
+
+
+def _tool_output_preview(function_name, arguments, result):
+    """Return a stable terminal summary without exposing raw tool output."""
+    ok = _tool_result_ok(function_name, result)
+    return summarize_tool_finished(function_name, arguments, result, ok)
+
+
+def _tool_result_ok(function_name, result):
+    content = str(result.get("content", "") or "")
+    if function_name in {"run_subagent", "ask_user"}:
+        try:
+            payload = json.loads(content)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and payload.get("status"):
+            return payload["status"] in {"running", "completed", "selected"}
+    return not content.startswith((
+        TOOL_ERROR_PREFIX,
+        ASK_USER_ERROR_PREFIX,
+        TOOL_INTERNAL_ERROR_PREFIX,
+        _PLAN_BYPASS_ERROR_PREFIX,
+        "计划执行约束：",
+        "计划配置错误：",
+        "计划运行状态由真实调度器管理",
+        "新建计划项必须是 pending",
+    ))
+
+
+def _raise_if_tool_cancelled(cancel_event):
+    # 取消判断只认每 turn 传入的 cancel_event，不再读全局粘性布尔
+    if cancel_event is not None and cancel_event.is_set():
+        raise KeyboardInterrupt("用户终止了工具执行。")
+
+
+def _escape_control_chars_in_json_strings(text):
+    """只转义字符串值内部的裸控制字符（\\n/\\r/\\t），结构空白与合法转义保持不动。"""
+    escapes = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+    out = []
+    in_string = False
+    escaped = False
+    for ch in text:
+        if in_string:
+            if escaped:
+                out.append(ch)
+                escaped = False
+            elif ch == "\\":
+                out.append(ch)
+                escaped = True
+            elif ch == '"':
+                out.append(ch)
+                in_string = False
+            elif ch in escapes:
+                out.append(escapes[ch])
+            else:
+                out.append(ch)
+        else:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+    return "".join(out)
+
+
+def _show_file_diff(file_path, old_content, new_content, event_callback, panel_title, truncated_note):
+    """渲染文件修改 diff 面板（write_file / edit_file 共用）。"""
+    try:
+        from core.diff_viewer import generate_diff, render_diff_table
+        from rich.panel import Panel
+        from rich.console import Console
+        diff_text = generate_diff(old_content, new_content, file_path)
+        if not diff_text:
+            return
+        lines = diff_text.split('\n')
+        max_lines = 25
+        display_text = (
+            '\n'.join(lines[:max_lines]) + f"\n... (省略 {len(lines) - max_lines} 行，{truncated_note})"
+            if len(lines) > max_lines else diff_text
+        )
+        diff_table = render_diff_table(display_text)
+        panel = Panel(diff_table, title=panel_title, border_style="green", expand=False)
+        from prompt_toolkit.formatted_text import ANSI
+        rich_console = Console(force_terminal=True, color_system="truecolor")
+        with rich_console.capture() as capture:
+            rich_console.print(panel)
+        diff_output = capture.get()
+        if event_callback is None:
+            safe_print(ANSI(diff_output))
+        else:
+            _notify_event(event_callback, "diff_ready", {
+                "file_path": file_path,
+                "text": diff_output,
+            })
+    except Exception as diff_err:
+        logger.warning("渲染文件 diff 失败 (%s): %s", file_path, diff_err)
+
+
+def _sandbox_outside_guard(
+    function_name,
+    path_value,
+    event_callback,
+    permission_owner,
+    parent_turn_id,
+    permission_source,
+    cancel_event,
+):
+    """沙盒开启时访问工作目录外路径：先询问用户，同意则放行本次。
+
+    返回 (bypass_cm, error)：
+    - (None, None)：在沙盒内或已全局/会话放行，无需特殊处理
+    - (cm, None)：用户同意本次，调用方需在 cm 上下文中执行工具
+    - (None, err)：用户拒绝/取消，err 为工具结果文案
+    """
+    if not path_value:
+        return None, None
+    try:
+        outside = is_outside_workspace(path_value)
+    except Exception:
+        outside = False
+    if not outside:
+        return None, None
+    from core import tools as _tools
+    if _tools._outside_workspace_allowed():
+        return None, None
+
+    approved = check_permission_and_ask(
+        "sandbox_outside_access",
+        {"path": str(path_value), "operation": function_name},
+        event_callback=event_callback,
+        permission_owner=permission_owner,
+        parent_turn_id=parent_turn_id,
+        permission_source=permission_source,
+        cancel_event=cancel_event,
+    )
+    if approved:
+        return sandbox_bypass(), None
+    if cancel_event is not None and cancel_event.is_set():
+        return None, PERMISSION_CANCELLED_MESSAGE
+    return None, "🚨 用户拒绝了访问沙盒外路径的请求（可提示用户使用 /sandbox on 长期开放）。"
+
+
+def _execute_single_tool_call(
+    tc,
+    event_callback=None,
+    *,
+    parent_session=None,
+    parent_turn_id=None,
+    cancel_event=None,
+    allow_subagents=True,
+    permission_owner=None,
+    permission_source="主代理",
+):
+    """执行单个工具调用，并返回对应的 JSON 结果结构。"""
+    function_name = tc["function"]["name"]
+    arguments_str = tc["function"]["arguments"]
+    try:
+        arguments = json.loads(arguments_str)
+    except Exception:
+        try:
+            # 兜底修复：仅转义字符串值内部的裸控制字符，合法 \\n 不会被二次转义
+            arguments = json.loads(_escape_control_chars_in_json_strings(arguments_str))
+        except Exception:
+            arguments = {}
+
+    _raise_if_tool_cancelled(cancel_event)
+
+    plan_enforced = allow_subagents and (
+        _is_plan_turn(parent_turn_id) or _has_pending_plan(parent_session)
+    )
+    if plan_enforced:
+        plan_item_id = str(arguments.get("plan_item_id", "") or "").strip()
+        if function_name == "plan_write" and _is_plan_turn(parent_turn_id):
+            from core.plan import get_default_plan_manager
+
+            if any(
+                item.get("status") != "pending"
+                for item in get_default_plan_manager().snapshot()
+            ):
+                return {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": function_name,
+                    "content": (
+                        "计划执行约束：不能重建已有执行记录，请使用 "
+                        "/plan retry <id> 重试失败项。"
+                    ),
+                }
+        if function_name in _PLAN_BOUND_ORCHESTRATORS and not plan_item_id:
+            return {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": function_name,
+                "content": (
+                    f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} "
+                    "必须填写 plan_item_id，不能执行未归属计划项的任务。"
+                ),
+            }
+        if function_name not in _PLAN_ROOT_CONTROL_TOOLS:
+            return {
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": function_name,
+                "content": (
+                    f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} 必须通过 "
+                    "run_subagent(plan_item_id=...) 执行，不能由主 Agent 直接绕过计划调用。"
+                ),
+            }
+            
+    # 生成友好的中文提示
+    friendly_msg = f"⚙️ 星瑶正在后台悄悄使用工具: {function_name} 哒～"
+    if function_name == "read_file":
+        friendly_msg = f"🔍 星瑶正在读取文件：{arguments.get('file_path', '未知文件')}"
+    elif function_name == "write_file":
+        friendly_msg = f"✍️ 星瑶正在写入文件：{arguments.get('file_path', '未知文件')}"
+    elif function_name == "list_directory":
+        friendly_msg = f"📂 星瑶正在查看目录：{arguments.get('dir_path', '当前目录')}"
+    elif function_name == "execute_command":
+        cmd = arguments.get('command', '...')
+        if len(cmd) > 20: cmd = cmd[:20] + "..."
+        friendly_msg = f"💻 星瑶正在执行命令：{cmd}"
+    elif function_name == "search_code":
+        friendly_msg = f"🔍 星瑶正在全局查找: {arguments.get('query', '')}"
+    elif function_name == "search_news":
+        friendly_msg = f"🌐 星瑶正在联网搜索：{arguments.get('query', '')}"
+    elif function_name == "fetch_url":
+        friendly_msg = f"🌐 星瑶正在访问网址：{arguments.get('url', '')}"
+    elif function_name == "get_weather":
+        friendly_msg = f"🌤 星瑶正在查询天气：{arguments.get('city', '') or '自动定位'}"
+
+    # The event-oriented path lets the UI render this status in order.
+    from prompt_toolkit.formatted_text import HTML
+    safe_friendly_msg = friendly_msg.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    if event_callback is None:
+        safe_print(HTML(f"<ansigreen>[ {safe_friendly_msg} ]</ansigreen>"))
+
+    result = ""
+    # 权限由工具能力元数据决定，而不是散落的函数名白名单。
+    try:
+        requires_permission = tool_registry.get(function_name).requires_permission
+    except KeyError:
+        requires_permission = function_name in ("write_file", "edit_file", "execute_command")
+    if requires_permission:
+        approved = check_permission_and_ask(
+            function_name,
+            arguments,
+            event_callback=event_callback,
+            permission_owner=permission_owner,
+            parent_turn_id=parent_turn_id,
+            permission_source=permission_source,
+            cancel_event=cancel_event,
+        )
+        if not approved:
+            # 取消与拒绝使用不同的工具结果文案，避免把“取消”误述为“拒绝”喂给模型
+            if cancel_event is not None and cancel_event.is_set():
+                result = PERMISSION_CANCELLED_MESSAGE
+            else:
+                result = PERMISSION_DENIED_MESSAGE
+
+    _raise_if_tool_cancelled(cancel_event)
+
+    try:
+        if result in (PERMISSION_DENIED_MESSAGE, PERMISSION_CANCELLED_MESSAGE):
+            pass
+        elif function_name == "read_file":
+            bypass_cm, sandbox_err = _sandbox_outside_guard(
+                function_name, arguments.get("file_path"), event_callback,
+                permission_owner, parent_turn_id, permission_source, cancel_event,
+            )
+            if sandbox_err:
+                result = sandbox_err
+            elif bypass_cm:
+                with bypass_cm:
+                    result = tool_registry.execute(function_name, **arguments).to_message_content()
+            else:
+                result = tool_registry.execute(function_name, **arguments).to_message_content()
+        elif function_name == "write_file":
+            file_path = arguments.get("file_path", "")
+            new_content = arguments.get("content", "")
+            # 写入权限已在上方统一确认（确认文案含文件路径），用户批准即视为允许该次沙盒外写入
+            with sandbox_bypass():
+                old_content = ""
+                if os.path.exists(file_path):
+                    try:
+                        old_content = _read_text_with_encoding_fallback(file_path)
+                    except OSError as read_err:
+                        logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
+                        old_content = ""
+                # 新建文件也记录空内容快照，保证 undo 可以回退到“文件不存在之前”
+                from core.memory import set_undo_state
+                set_undo_state(file_path, old_content)
+                write_file(file_path, new_content)
+            # 生成 diff 并展示
+            _show_file_diff(
+                file_path,
+                old_content,
+                new_content,
+                event_callback,
+                panel_title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
+                truncated_note="已成功写入文件",
+            )
+            result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
+        elif function_name == "run_subagent":
+            if not allow_subagents:
+                result = f"{TOOL_ERROR_PREFIX} 子代理不能启动其他子代理。"
+            else:
+                result = run_subagent(
+                    task_description=arguments.get("task_description", ""),
+                    subagent_type=arguments.get("subagent_type", "general"),
+                    plan_item_id=arguments.get("plan_item_id", ""),
+                    run_in_background=arguments.get("run_in_background", False),
+                    timeout_seconds=arguments.get("timeout_seconds", 120),
+                    parent_session=parent_session,
+                    parent_turn_id=parent_turn_id,
+                    parent_cancel_event=cancel_event,
+                    event_callback=event_callback,
+                )
+        elif function_name == "ask_user":
+            from core.ask_user import ask_user, normalize_question_request
+            plan_item_id = str(arguments.get("plan_item_id", "") or "").strip()
+            scheduler = None
+            try:
+                question, choices = normalize_question_request(
+                    arguments.get("question", ""),
+                    arguments.get("options"),
+                )
+            except ValueError as error:
+                result = str(error)
+            else:
+                arguments["question"] = question
+                arguments["options"] = choices
+
+            if not result and plan_item_id:
+                from core.task_scheduler import get_default_scheduler
+
+                scheduler = get_default_scheduler()
+                plan_item = next(
+                    (
+                        item
+                        for item in scheduler.plan.snapshot()
+                        if item["id"] == plan_item_id
+                    ),
+                    None,
+                )
+                if plan_item is None:
+                    result = json.dumps({
+                        "status": "blocked",
+                        "plan_item_id": plan_item_id,
+                        "error": "用户输入准备项不存在。",
+                    }, ensure_ascii=False)
+                elif plan_item.get("kind") != "input_preparation":
+                    result = (
+                        "无法提问：plan_item_id 必须指向 "
+                        "kind=input_preparation 的用户输入准备项。"
+                    )
+                elif not scheduler.start_item(
+                    plan_item_id,
+                    owner="ask_user",
+                    event_callback=event_callback,
+                ):
+                    result = json.dumps({
+                        "status": "blocked",
+                        "plan_item_id": plan_item_id,
+                        "error": "计划项尚未满足依赖或当前计划不可执行。",
+                    }, ensure_ascii=False)
+                else:
+                    try:
+                        result = ask_user(
+                            question,
+                            choices,
+                            owner_id=permission_owner,
+                            parent_turn_id=parent_turn_id,
+                            source=permission_source,
+                            cancel_event=cancel_event,
+                        )
+                        try:
+                            result_payload = json.loads(str(result))
+                        except (TypeError, ValueError):
+                            result_payload = None
+                        if (
+                            isinstance(result_payload, dict)
+                            and result_payload.get("status") == "cancelled"
+                        ):
+                            scheduler.cancel(plan_item_id, "用户取消提问")
+                        elif str(result).startswith("无法") or str(result).startswith(TOOL_ERROR_PREFIX):
+                            scheduler.fail(plan_item_id, str(result))
+                        elif cancel_event is not None and cancel_event.is_set():
+                            scheduler.cancel(plan_item_id, "用户取消提问")
+                            result = json.dumps({
+                                "status": "cancelled",
+                                "plan_item_id": plan_item_id,
+                                "error": "用户取消提问",
+                            }, ensure_ascii=False)
+                        else:
+                            scheduler.complete(plan_item_id, str(result))
+                        _notify_event(event_callback, "plan_updated", {
+                            "items": scheduler.plan.snapshot(),
+                            "live_only": True,
+                        })
+                    except Exception as error:
+                        scheduler.fail(plan_item_id, str(error))
+                        raise
+            elif not result:
+                result = ask_user(
+                    question,
+                    choices,
+                    owner_id=permission_owner,
+                    parent_turn_id=parent_turn_id,
+                    source=permission_source,
+                    cancel_event=cancel_event,
+                )
+        elif function_name == "manage_task":
+            # 透传当前回合的回调/权限 owner/取消事件（kwargs 形式）。
+            # 按函数签名过滤，向后兼容尚未接受这些参数的 manage_task 版本。
+            import inspect as _inspect
+
+            _extra = {
+                "event_callback": event_callback,
+                "permission_owner": permission_owner,
+                "cancel_event": cancel_event,
+            }
+            _supported = {
+                key: value
+                for key, value in _extra.items()
+                if key in _inspect.signature(manage_task).parameters
+            }
+            result = manage_task(
+                action=arguments.get("action"),
+                task_id=arguments.get("task_id"),
+                **_supported,
+            )
+        elif function_name in {
+            "list_directory",
+            "search_code",
+            "execute_command",
+            "search_news",
+            "fetch_url",
+            "get_weather",
+            "glob_files",
+            "plan_write",
+            "plan_update",
+        }:
+            # 只读目录类工具在沙盒外访问时需用户确认（同意本次/始终放行会话）
+            bypass_cm, sandbox_err = None, None
+            if function_name in ("list_directory", "search_code", "glob_files"):
+                bypass_cm, sandbox_err = _sandbox_outside_guard(
+                    function_name, arguments.get("dir_path", "."), event_callback,
+                    permission_owner, parent_turn_id, permission_source, cancel_event,
+                )
+            if sandbox_err:
+                result = sandbox_err
+            elif bypass_cm:
+                with bypass_cm:
+                    result = tool_registry.execute(function_name, **arguments).to_message_content()
+            else:
+                result = tool_registry.execute(function_name, **arguments).to_message_content()
+            if function_name in {"plan_write", "plan_update"}:
+                if (
+                    function_name == "plan_write"
+                    and str(result).strip() == "计划已更新。"
+                ):
+                    _mark_plan_turn(parent_turn_id)
+                from core.plan import get_default_plan_manager
+                _notify_event(event_callback, "plan_updated", {
+                    "items": get_default_plan_manager().snapshot(),
+                    "live_only": True,
+                })
+        elif function_name == "edit_file":
+            file_path = arguments.get("file_path")
+            target = arguments.get("target_content")
+            repl = arguments.get("replacement_content")
+            # 修改权限已在上方统一确认（确认文案含文件路径），用户批准即视为允许该次沙盒外修改
+            with sandbox_bypass():
+                try:
+                    old_content = _read_text_with_encoding_fallback(file_path)
+                except OSError as read_err:
+                    logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
+                    old_content = ""
+                # undo 快照由 core.tools.edit_file 内部统一记录
+                result = edit_file(
+                    file_path,
+                    target,
+                    repl,
+                    replace_all=bool(arguments.get("replace_all", False)),
+                )
+                if not result.startswith(TOOL_ERROR_PREFIX):
+                    try:
+                        new_content = _read_text_with_encoding_fallback(file_path)
+                    except OSError as read_err:
+                        logger.warning("读取新文件内容失败 (%s): %s", file_path, read_err)
+                        new_content = ""
+                    _show_file_diff(
+                        file_path,
+                        old_content,
+                        new_content,
+                        event_callback,
+                        panel_title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
+                        truncated_note="已局部替换并修改成功",
+                    )
+        else:
+            if any(s["function"]["name"] == function_name for s in mcp_manager.get_schemas()):
+                result = mcp_manager.call_tool_sync(function_name, arguments)
+            else:
+                result = f"{TOOL_ERROR_PREFIX} 未找到名为 {function_name} 的工具！"
+    except Exception as tool_err:
+        result = f"{TOOL_ERROR_PREFIX} 调用工具 {function_name} 时发生系统内部错误：{str(tool_err)}"
+
+    return {
+        "role": "tool",
+        "tool_call_id": tc["id"],
+        "name": function_name,
+        "content": str(result)
+    }
+
+def _chat_with_model_generator(
+    model_name,
+    api_key,
+    messages,
+    api_base=None,
+    stream=False,
+    event_callback=None,
+    cancel_event=None,
+    allow_subagents=True,
+    allowed_tools=None,
+    consume_background_notifications=True,
+    parent_session=None,
+    parent_turn_id=None,
+    permission_owner=None,
+    permission_source="主代理",
+):
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
     """
+    turn_snapshot = deepcopy(messages)
+    # 1. 自动注入 KAIROS 长期记忆指示与 MEMORY.md 索引
+    import core.memory_kairos as mk
+    memory_section = mk.build_memory_system_section()
+    
+    system_msg = None
+    for msg in messages:
+        if msg.get("role") == "system":
+            system_msg = msg
+            break
+    if system_msg:
+        if "# Auto Memory" not in system_msg["content"]:
+            system_msg["content"] += "\n\n" + memory_section
+    else:
+        messages.insert(0, {"role": "system", "content": memory_section})
+
+    # 2. 注入后台子 Agent 回报数据 (XML task-notification)
+    from core.tools import subagent_manager
+    drained_notifications = []
+    if consume_background_notifications and parent_session:
+        drained_notifications = subagent_manager.drain_notifications(parent_session)
+        for notif in drained_notifications:
+            messages.append({
+                "role": "user",
+                "content": notif
+            })
+
+    def rollback_turn_messages():
+        """回滚本轮新增的消息残影；已 drain 的后台通知重新保留，避免丢失。"""
+        messages[:] = turn_snapshot
+        for notif in drained_notifications:
+            messages.append({"role": "user", "content": notif})
+
+    active_plan = allow_subagents and _has_pending_plan(parent_session)
+    request_tools = [
+        schema
+        for schema in get_tools_schema()
+        if (
+            not active_plan
+            or schema.get("function", {}).get("name") in _PLAN_ROOT_CONTROL_TOOLS
+        )
+        if allow_subagents
+        or schema.get("function", {}).get("name")
+        not in {"run_subagent", "plan_write", "plan_update"}
+        if allowed_tools is None
+        or schema.get("function", {}).get("name") in allowed_tools
+    ]
+
     kwargs = {
         "model": model_name,
         "api_key": api_key,
-        "messages": messages,
-        "tools": TOOLS_SCHEMA,
+        "messages": _strip_media_and_merge(messages, model_name),
+        "tools": request_tools,
         "tool_choice": "auto",
         "stream": True,
         "stream_options": {"include_usage": True},
         "num_retries": 2
     }
+    kwargs.update(_provider_request_options(model_name, api_base))
     
     if api_base:
         kwargs["api_base"] = api_base
         
+    tool_activity_seen = False
+    final_summary_retry_count = 0
+    pending_persistence = []
+
+    def flush_persistence():
+        """把本轮已确认的助手/工具消息按序落库（与正常结束路径一致）。"""
+        if stream and pending_persistence:
+            import main as _main
+            try:
+                _main.manager.add_messages(parent_session, pending_persistence)
+            except Exception as flush_err:
+                # 落库失败不回滚内存：add_messages 可能已部分写入，回滚会造成
+                # 内存/DB 分叉。仅上报错误事件并丢弃待写队列，避免重复写入。
+                _notify_event(event_callback, "error", {
+                    "message": f"消息持久化失败：{str(flush_err)}",
+                })
+            finally:
+                del pending_persistence[:]
+
+    def raise_if_cancelled():
+        if cancel_event is not None and cancel_event.is_set():
+            raise KeyboardInterrupt("用户终止了对话。")
+
     try:
         max_turns = 100
         for turn in range(max_turns):
-            global cancel_requested
-            if cancel_requested:
-                raise KeyboardInterrupt("用户终止了对话。")
-                
-            if True:  # 强制统一走流式解析逻辑以获取流式 chunk 及其中的工具链
-                kwargs["stream"] = True
-                response_stream = completion(**kwargs, timeout=30)
-                
-                accumulated_content = ""
-                tool_calls_dict = {}
-                in_native_think = False
-                
-                import time as native_time
-                request_start = native_time.time()
-                for chunk in response_stream:
-                    if cancel_requested:
-                        # 如果 TUI 确认面板的 Future 还在等待，立即以"拒绝"(index=1)解除阻塞，防止死锁
+            raise_if_cancelled()
+
+            # API 调用指数退避与 Jitter 抖动重试
+            response_stream = None
+            max_api_retries = 3
+            base_delay = 1.0
+
+            for attempt in range(max_api_retries):
+                raise_if_cancelled()
+                try:
+                    kwargs["messages"] = _apply_cache_control(
+                        _strip_media_and_merge(messages, model_name),
+                        model_name,
+                    )
+                    response_stream = _litellm_completion(**kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
+                    break
+                except Exception as api_err:
+                    err_str = str(api_err).lower()
+                    # 上下文窗口超限自动压缩历史记录并重试：
+                    # 优先按异常类型判断，字符串匹配作为兜底且要求上下文相关关键词组合，
+                    # 避免把 rate limit 等错误误判为超限
+                    is_context_overflow = isinstance(api_err, _litellm_context_overflow_error())
+                    if not is_context_overflow:
+                        is_context_overflow = (
+                            "prompt is too long" in err_str
+                            or "context window" in err_str
+                            or "context_length" in err_str
+                            or (
+                                "exceeds" in err_str
+                                and ("context" in err_str or "token" in err_str or "length" in err_str)
+                            )
+                        )
+                    if is_context_overflow:
                         try:
                             import main as _main
-                            cp = _main.confirm_prompt
-                            if cp is not None and 'future' in cp:
-                                fut = cp['future']
-                                if not fut.done():
-                                    fut.set_result(1)  # 1 = 拒绝
-                                _main.confirm_prompt = None
-                        except Exception:
-                            pass
-                        raise KeyboardInterrupt("用户终止了对话。")
-                    # 1. 解析 Token 消耗 (如果在流中提供)
-                    if hasattr(chunk, 'usage') and chunk.usage:
-                        usage = chunk.usage
-                        global session_token_usage
-                        session_token_usage["latest_total"] = getattr(usage, "total_tokens", 0)
-                        session_token_usage["latest_prompt"] = getattr(usage, "prompt_tokens", 0)
-                        cache_details = getattr(usage, "prompt_tokens_details", None)
-                        latest_cached = cache_details.cached_tokens if cache_details and hasattr(cache_details, "cached_tokens") else 0
-                        session_token_usage["latest_cached"] = latest_cached
-                        session_token_usage["cumulative_total"] += session_token_usage["latest_total"]
-                        session_token_usage["cumulative_prompt"] += session_token_usage["latest_prompt"]
-                        session_token_usage["cumulative_cached"] += latest_cached
+                            if event_callback is None:
+                                print("\n[⚠️ 检测到上下文窗口超限，正在尝试压缩历史记录以缩减 Prompt 长度...]")
+                            else:
+                                _notify_event(event_callback, "status", {
+                                    "message": "检测到上下文窗口超限，正在压缩历史记录。",
+                                })
+                            from core.memory import MemoryManager
+                            mm = MemoryManager()
+                            # 子代理回合必须压缩自己的会话（parent_session），
+                            # 不能误压主 UI 会话
+                            session = parent_session or _main.current_session
+                            mm.compress_session(session, force=True)
+                            # 原地替换为压缩后历史：禁止重新绑定局部名，
+                            # 否则调用方持有的旧列表会失联、取消回滚也会作用错对象
+                            messages[:] = mm.get_history(session)
+                            # 压缩已成功落库：同步回合快照，避免后续异常回滚把
+                            # 内存恢复成未压缩状态（与 DB 分叉且下轮必再超限）
+                            turn_snapshot = deepcopy(messages)
+                            continue # 跳回重试当前 API
+                        except Exception as compress_err:
+                            if event_callback is None:
+                                from prompt_toolkit.formatted_text import HTML
 
-                    if not chunk.choices:
-                        continue
-                        
-                    delta = chunk.choices[0].delta
+                                safe_print(HTML("<ansiyellow>历史记录暂未完成压缩</ansiyellow>"))
+                            else:
+                                _notify_event(event_callback, "error", {
+                                    "message": str(compress_err),
+                                })
+
+                    if attempt < max_api_retries - 1:
+                        sleep_time = (base_delay * (2 ** attempt)) + (random.random() * 0.5)
+                        retry_message = (
+                            f"API 暂未成功，正在进行第 {attempt+1}/{max_api_retries} 次重试，"
+                            f"等待 {sleep_time:.1f} 秒"
+                        )
+                        if event_callback is None:
+                            print(f"\n[⚠️ {retry_message}]")
+                        else:
+                            _notify_event(event_callback, "status", {"message": retry_message})
+                        time.sleep(sleep_time)
+                    else:
+                        raise api_err
+
+            accumulated_content = ""
+            tool_calls_dict = {}
+            in_native_think = False
+            provider_thinking_blocks = None
+            
+            stream_usage = None
+            for chunk in response_stream:
+                raise_if_cancelled()
+
+                # 同一流中可能出现多个带 usage 的 chunk，只保留最后一个，
+                # 在流结束后统一记账一次，避免 cumulative_* 被反复累加
+                if getattr(chunk, 'usage', None):
+                    stream_usage = chunk.usage
+
+                if not chunk.choices:
+                    continue
                     
-                    # 2. 处理原生 reasoning_content (DeepSeek R1/V3)
-                    reasoning = getattr(delta, "reasoning_content", "") or ""
-                    if reasoning:
-                        if not in_native_think:
-                            yield "<think>\n"
-                            accumulated_content += "<think>\n"
-                            in_native_think = True
-                        yield reasoning
-                        accumulated_content += reasoning
-                        
-                    # 3. 处理标准文本
-                    content = getattr(delta, "content", "") or ""
-                    if content:
-                        if in_native_think:
-                            yield "\n</think>\n"
-                            accumulated_content += "\n</think>\n"
-                            in_native_think = False
-                        yield content
-                        accumulated_content += content
-                        
-                    # 4. 拦截并组装 Tool Calls 碎片
-                    if getattr(delta, "tool_calls", None):
-                        for tc in delta.tool_calls:
-                            idx = tc.index
-                            if idx not in tool_calls_dict:
-                                tool_calls_dict[idx] = {
-                                    "id": getattr(tc, "id", f"call_{idx}"),
-                                    "type": "function",
-                                    "function": {"name": "", "arguments": ""}
-                                }
-                            if getattr(tc.function, "name", None):
-                                tool_calls_dict[idx]["function"]["name"] += tc.function.name
-                            if getattr(tc.function, "arguments", None):
-                                tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
+                delta = chunk.choices[0].delta
+
+                complete_blocks = _complete_thinking_blocks(delta)
+                if complete_blocks is not None:
+                    provider_thinking_blocks = complete_blocks
                 
-                if in_native_think:
-                    yield "\n</think>\n"
-                    accumulated_content += "\n</think>\n"
+                # reasoning_content (DeepSeek R1/V3)
+                # 注意：thinking 事件只由下游 parser 根据 <think> 文本统一转换，
+                # 此处不再直接发事件，避免双重发射
+                reasoning = getattr(delta, "reasoning_content", "") or ""
+                if reasoning:
+                    if not in_native_think:
+                        yield "<think>"
+                        accumulated_content += "<think>"
+                        in_native_think = True
+                    yield reasoning
+                    accumulated_content += reasoning
                     
-                # 组装完整的工具调用列表
-                tool_calls_list = []
-                for idx in sorted(tool_calls_dict.keys()):
-                    tool_calls_list.append(tool_calls_dict[idx])
+                # Content text
+                content = getattr(delta, "content", "") or ""
+                if content:
+                    if in_native_think:
+                        yield "</think>"
+                        accumulated_content += "</think>"
+                        in_native_think = False
+                    yield content
+                    accumulated_content += content
                     
-                # 记录这轮的回复到历史
-                message_to_append = {
-                    "role": "assistant",
-                    "content": accumulated_content if accumulated_content else None,
-                }
-                if tool_calls_list:
-                    message_to_append["tool_calls"] = tool_calls_list
-                messages.append(message_to_append)
+                # Tool Calls
+                if getattr(delta, "tool_calls", None):
+                    for tc in delta.tool_calls:
+                        idx = tc.index
+                        if idx not in tool_calls_dict:
+                            tool_calls_dict[idx] = {
+                                "id": getattr(tc, "id", f"call_{idx}"),
+                                "type": "function",
+                                "function": {"name": "", "arguments": ""}
+                            }
+                        # name 只在为空时赋值：provider 重复发 name 时 += 会拼出
+                        # "read_fileread_file" 之类的坏名字
+                        if getattr(tc.function, "name", None) and not tool_calls_dict[idx]["function"]["name"]:
+                            tool_calls_dict[idx]["function"]["name"] = tc.function.name
+                        if getattr(tc.function, "arguments", None):
+                            tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
+            
+            if in_native_think:
+                yield "</think>"
+                accumulated_content += "</think>"
+
+            # 流结束：按最终 usage chunk 统一记账一次（读写均走锁）
+            if stream_usage is not None:
+                cache_details = getattr(stream_usage, "prompt_tokens_details", None)
+                latest_cached = (
+                    cache_details.cached_tokens
+                    if cache_details is not None and hasattr(cache_details, "cached_tokens")
+                    else 0
+                ) or 0
+                with token_usage_lock:
+                    session_token_usage["latest_total"] = getattr(stream_usage, "total_tokens", 0) or 0
+                    session_token_usage["latest_prompt"] = getattr(stream_usage, "prompt_tokens", 0) or 0
+                    session_token_usage["latest_cached"] = latest_cached
+                    session_token_usage["cumulative_total"] += session_token_usage["latest_total"]
+                    session_token_usage["cumulative_prompt"] += session_token_usage["latest_prompt"]
+                    session_token_usage["cumulative_cached"] += latest_cached
+
+            reasoning_content, public_content = split_reasoning_text(accumulated_content)
+
+            # 只允许公开正文写入记忆，避免把原生推理误当作长期事实。
+            memory_tags = mk.extract_memory_tags(public_content)
+            for tag in memory_tags:
+                try:
+                    mk.append_to_daily_log(tag)
+                except Exception as log_err:
+                    if event_callback is None:
+                        print(f"\n[⚠️ 写入日记账记忆失败: {str(log_err)}]")
+                    else:
+                        _notify_event(event_callback, "error", {
+                            "message": f"写入日记账记忆失败：{str(log_err)}",
+                        })
+
+            tool_calls_list = []
+            for idx in sorted(tool_calls_dict.keys()):
+                tool_calls_list.append(tool_calls_dict[idx])
                 
-                # 如果没有调用工具，流式输出彻底完成
-                if not tool_calls_list:
-                    return
-                    
-                # 如果有工具，则开始执行工具 (不 yield 任何东西，让 UI 保持等待)
+            message_to_append = {
+                "role": "assistant",
+                "content": public_content or None,
+                "reasoning_content": reasoning_content or None,
+            }
+            if provider_thinking_blocks is not None:
+                message_to_append["thinking_blocks"] = provider_thinking_blocks
+            if tool_calls_list:
+                message_to_append["tool_calls"] = tool_calls_list
+            messages.append(message_to_append)
+
+            persisted_message = {
+                "role": "assistant",
+                "content": public_content or None,
+                "reasoning_content": reasoning_content or None,
+            }
+            if tool_calls_list:
+                persisted_message["tool_calls"] = tool_calls_list
+
+            needs_final_summary = (
+                not tool_calls_list
+                and tool_activity_seen
+                and not _is_meaningful_assistant_content(public_content)
+            )
+            
+            if stream and not needs_final_summary:
+                pending_persistence.append(("assistant", persisted_message))
+            
+            if not tool_calls_list:
+                if needs_final_summary and final_summary_retry_count == 0:
+                    final_summary_retry_count += 1
+                    # 空 assistant 消息（content 为 None）不入库也不留内存：
+                    # 留在历史里会让下一轮 API 报 400（Anthropic 拒绝空 content）
+                    messages.pop()
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "工具已经执行完毕。现在必须只输出最终中文检查结论，"
+                            "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
+                        ),
+                    })
+                    _notify_event(event_callback, "status", {
+                        "state": "executing",
+                        "message": "模型未生成结论，正在请求最终总结。",
+                    })
+                    continue
+                flush_persistence()
+                return
+
+            tool_activity_seen = True
+            if event_callback is None:
                 import main
                 main.task_status = 'executing'
                 if main.app_instance:
                     main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
-                
-                for tc in tool_calls_list:
-                    function_name = tc["function"]["name"]
-                    arguments_str = tc["function"]["arguments"]
-                    try:
-                        arguments = json.loads(arguments_str)
-                    except Exception:
-                        try:
-                            # 尝试修复大模型经常犯的错：在 JSON 字符串值里直接写原生的换行符，而不是 \n
-                            fixed_str = arguments_str.replace('\n', '\\n')
-                            # 处理控制字符
-                            fixed_str = fixed_str.replace('\r', '\\r').replace('\t', '\\t')
-                            arguments = json.loads(fixed_str)
-                        except Exception as e:
-                            print(f"\n[⚠️ 工具参数 JSON 解析严重失败，原始数据片段：{arguments_str[:100]}... 报错：{str(e)}]")
-                            arguments = {}
-                    
-                    # 生成友好的中文提示
-                    friendly_msg = f"⚙️ 星瑶正在后台悄悄使用工具: {function_name} 哒～"
-                    if function_name == "read_file":
-                        friendly_msg = f"🔍 星瑶正在读取文件：{arguments.get('file_path', '未知文件')}"
-                    elif function_name == "write_file":
-                        friendly_msg = f"✍️ 星瑶正在写入文件：{arguments.get('file_path', '未知文件')}"
-                    elif function_name == "list_directory":
-                        friendly_msg = f"📂 星瑶正在查看目录：{arguments.get('dir_path', '当前目录')}"
-                    elif function_name == "execute_command":
-                        cmd = arguments.get('command', '...')
-                        if len(cmd) > 20: cmd = cmd[:20] + "..."
-                        friendly_msg = f"💻 星瑶正在执行命令：{cmd}"
-                    elif function_name == "search_code":
-                        friendly_msg = f"🔍 星瑶正在全局查找: {arguments.get('query', '')}"
-                    elif function_name == "search_news":
-                        friendly_msg = f"🌐 星瑶正在联网搜索：{arguments.get('query', '')}"
+            else:
+                _notify_event(event_callback, "status", {"state": "executing"})
+            
+            def execute_in_context(tool_call):
+                return _execute_single_tool_call(
+                    tool_call,
+                    event_callback=event_callback,
+                    parent_session=parent_session,
+                    parent_turn_id=parent_turn_id,
+                    cancel_event=cancel_event,
+                    allow_subagents=allow_subagents,
+                    permission_owner=permission_owner,
+                    permission_source=permission_source,
+                )
 
-                    # 打印一条提示给控制台
-                    from prompt_toolkit.formatted_text import HTML
-                    safe_friendly_msg = friendly_msg.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    safe_print(HTML(f"<ansigreen>[ {safe_friendly_msg} ]</ansigreen>"))
-                
-                    result = ""
-                    if function_name in ("write_file", "edit_file", "execute_command"):
-                        approved = check_permission_and_ask(function_name, arguments)
-                        if not approved:
-                            result = "🚨 用户拒绝了执行该操作。"
+            # 只把显式声明为 parallel_safe 的相邻工具放入同一并发批次。
+            batches = []
+            for tc in tool_calls_list:
+                func_name = tc["function"]["name"]
+                try:
+                    is_parallel = tool_registry.get(func_name).parallel_safe
+                except KeyError:
+                    is_parallel = False
+                if batches and batches[-1][0] and is_parallel:
+                    batches[-1][1].append(tc)
+                else:
+                    batches.append((is_parallel, [tc]))
 
-                    try:
-                        if result == "🚨 用户拒绝了执行该操作。":
-                            pass
-                        elif function_name == "read_file":
-                            result = read_file(arguments.get("file_path", ""))
-                        elif function_name == "write_file":
-                            file_path = arguments.get("file_path", "")
-                            new_content = arguments.get("content", "")
-                            
-                            # 1. 尝试读取旧内容
-                            old_content = ""
-                            import os
-                            if os.path.exists(file_path):
-                                try:
-                                    with open(file_path, 'r', encoding='utf-8') as f:
-                                        old_content = f.read()
-                                except FileNotFoundError:
-                                    old_content = "" # 如果文件不存在，撤销时应该置为空
-                                    
-                                from core.memory import set_undo_state
-                                set_undo_state(file_path, old_content)
+            for is_parallel, batch in batches:
+                raise_if_cancelled()
 
-                            # 2. 执行写入
-                            write_file(file_path, new_content)
-                            
-                            # 3. 生成 diff 并内联展示 (Kimi Style)
-                            try:
-                                from core.diff_viewer import generate_diff
-                                from rich.panel import Panel
-                                from rich.syntax import Syntax
-                                from rich.console import Console
-                                
-                                diff_text = generate_diff(old_content, new_content, file_path)
-                                
-                                if diff_text:
-                                    # 截断过长的 diff，防止刷屏
-                                    lines = diff_text.split('\n')
-                                    max_lines = 25
-                                    if len(lines) > max_lines:
-                                        display_text = '\n'.join(lines[:max_lines]) + f"\n... (省略 {len(lines) - max_lines} 行，已成功写入文件)"
-                                    else:
-                                        display_text = diff_text
-                                        
-                                    from core.diff_viewer import render_diff_table
-                                    diff_table = render_diff_table(display_text)
-                                    
-                                    panel = Panel(
-                                        diff_table, 
-                                        title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
-                                        border_style="green",
-                                        expand=False
-                                    )
-                                    
-                                    # 解决 patch_stdout 下 rich 直接 print 产生 ANSI 乱码的问题
-                                    from prompt_toolkit.formatted_text import ANSI
-                                    
-                                    rich_console = Console(force_terminal=True, color_system="truecolor")
-                                    with rich_console.capture() as capture:
-                                        rich_console.print(panel)
-                                    
-                                    safe_print(ANSI(capture.get()))
-                                    
-                            except Exception as e:
-                                print(f"\n[⚠️ Diff 生成失败: {str(e)}]")
-                                
-                            result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
-                        elif function_name == "list_directory":
-                            dir_path = arguments.get("dir_path", ".")
-                            result = list_directory(dir_path)
-                        elif function_name == "search_code":
-                            query = arguments.get("query")
-                            dir_path = arguments.get("dir_path", ".")
-                            result = search_code(query, dir_path)
-                        elif function_name == "execute_command":
-                            cmd = arguments.get("command", "")
-                            bg = arguments.get("run_in_background", False)
-                            result = execute_command(cmd, run_in_background=bg)
-                        elif function_name == "search_news":
-                            num = arguments.get("num_results", 5)
-                            result = search_news(arguments.get("query", ""), num)
-                        elif function_name == "manage_task":
-                            act = arguments.get("action")
-                            tid = arguments.get("task_id")
-                            result = manage_task(act, tid)
-                        elif function_name == "run_subagent":
-                            desc = arguments.get("task_description")
-                            result = run_subagent(desc)
-                        elif function_name == "edit_file":
-                            file_path = arguments.get("file_path")
-                            target = arguments.get("target_content")
-                            repl = arguments.get("replacement_content")
-                            
-                            try:
-                                with open(file_path, 'r', encoding='utf-8') as f:
-                                    old_content = f.read()
-                            except FileNotFoundError:
-                                old_content = ""
-                                
-                            result = edit_file(file_path, target, repl)
-                            
-                            if not result.startswith("🚨"):
-                                try:
-                                    with open(file_path, 'r', encoding='utf-8') as f:
-                                        new_content = f.read()
-                                        
-                                    from core.diff_viewer import generate_diff
-                                    from rich.panel import Panel
-                                    from rich.console import Console
-                                    
-                                    diff_text = generate_diff(old_content, new_content, file_path)
-                                    if diff_text:
-                                        lines = diff_text.split('\n')
-                                        max_lines = 25
-                                        if len(lines) > max_lines:
-                                            display_text = '\n'.join(lines[:max_lines]) + f"\n... (省略 {len(lines) - max_lines} 行，已局部替换并修改成功)"
-                                        else:
-                                            display_text = diff_text
-                                            
-                                        from core.diff_viewer import render_diff_table
-                                        diff_table = render_diff_table(display_text)
-                                        
-                                        panel = Panel(
-                                            diff_table,
-                                            title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
-                                            border_style="green",
-                                            expand=False
-                                        )
-                                        
-                                        from prompt_toolkit.formatted_text import ANSI
-                                        
-                                        rich_console = Console(force_terminal=True, color_system="truecolor")
-                                        with rich_console.capture() as capture:
-                                            rich_console.print(panel)
-                                            
-                                        safe_print(ANSI(capture.get()))
-                                except Exception as e:
-                                    print(f"\n[⚠️ Diff 生成失败: {str(e)}]")
-                        else:
-                            # 尝试去 MCP manager 里面找
-                            if any(s["function"]["name"] == function_name for s in mcp_manager.get_schemas()):
-                                result = mcp_manager.call_tool_sync(function_name, arguments)
-                            else:
-                                result = f"🚨 未找到名为 {function_name} 的工具！"
-                    except Exception as tool_err:
-                        result = f"🚨 调用工具 {function_name} 时发生系统内部错误：{str(tool_err)}"
-                        
-                    # 挨个把工具执行的结果塞进历史记录，和前面的并发指令一一对应
-                    messages.append({
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": function_name,
-                        "content": str(result)
-                    })
-                
-                # 工具执行完毕，恢复至思考状态进行后续回复生成
-                main.task_status = 'thinking'
+                for tc in batch:
+                    _notify_event(event_callback, "tool_requested", _tool_event_payload(tc))
+                for tc in batch:
+                    _notify_event(event_callback, "tool_started", _tool_event_payload(tc))
+                yield ""
+
+                if is_parallel and len(batch) > 1:
+                    # 并发上限固定为 4，结果仍按模型工具调用顺序写回。
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=min(len(batch), 4)) as executor:
+                        results = list(executor.map(execute_in_context, batch))
+                    messages.extend(results)
+                    for tc, res in zip(batch, results):
+                        arguments = _tool_call_arguments(tc)
+                        _notify_event(event_callback, "tool_finished", {
+                            **_tool_event_payload(tc),
+                            "ok": _tool_result_ok(tc["function"]["name"], res),
+                            "summary": _tool_output_preview(
+                                tc["function"]["name"], arguments, res
+                            ),
+                        })
+                    if stream:
+                        pending_persistence.extend(("tool", res) for res in results)
+                else:
+                    # 修改类工具：串行处理以保证授权及状态顺序
+                    for tc in batch:
+                        raise_if_cancelled()
+                        res = execute_in_context(tc)
+                        messages.append(res)
+                        arguments = _tool_call_arguments(tc)
+                        _notify_event(event_callback, "tool_finished", {
+                            **_tool_event_payload(tc),
+                            "ok": _tool_result_ok(tc["function"]["name"], res),
+                            "summary": _tool_output_preview(
+                                tc["function"]["name"], arguments, res
+                            ),
+                        })
+                        if stream:
+                            pending_persistence.append(("tool", res))
+                yield ""
+            
+            if event_callback is None:
+                main.task_status = 'executing'
                 if main.app_instance:
                     main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
+            else:
+                _notify_event(event_callback, "status", {"state": "executing"})
             
-            # 循环继续，带着所有工具的执行结果发起下一轮对话
-            
-        msg = f"🚨 任务轮次超过上限（{max_turns} 轮），请把任务拆小一点再试！"
+        # 超过轮次上限：提示消息写入历史并与正常结束一样落库，避免下一轮丢失上下文
+        msg = f"{TOOL_ERROR_PREFIX} 任务轮次超过上限（100 轮），请把任务拆小一点再试！"
+        limit_message = {"role": "assistant", "content": msg}
+        messages.append(limit_message)
+        if stream:
+            pending_persistence.append(("assistant", deepcopy(limit_message)))
+        flush_persistence()
         yield from _yield_content(msg)
         return
-        
+
+    except KeyboardInterrupt:
+        # 用户中断：安全回退删除此轮 Turn 添加的一切消息残影
+        rollback_turn_messages()
+        raise
     except Exception as e:
-        msg = f"🚨 糟糕！错误信息：{str(e)}"
-        yield from _yield_content(msg)
+        # 异常路径同样回滚本轮未持久化的内存消息：既避免留下带 tool_calls 却无
+        # tool 响应的悬空 assistant 消息（下一轮 API 会 400），也保持内存历史与 DB 一致
+        rollback_turn_messages()
+        if event_callback is not None:
+            _notify_event(event_callback, "error", {
+                "message": str(e),
+            })
+            # 专用结束事件：chat_with_model_events 不再为异常回合发 turn_finished
+            _notify_event(event_callback, "turn_error", {
+                "message": str(e),
+            })
+        else:
+            from prompt_toolkit.formatted_text import HTML
+
+            safe_print(HTML("<ansiyellow>星瑶暂未完成当前步骤</ansiyellow>"))
         return

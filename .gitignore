@@ -26,6 +26,10 @@ mytemp/
 # SQLite databases (contain user data / dev state)
 *.db
 
+# Per-session persisted task plans (runtime state)
+.ycode_tasks/plans/*.json
+.ycode_tasks/plans/*.tmp
+
 # Scraped / downloaded HTML files
 *.html
 

@@ -17,21 +17,15 @@ def build():
         pyinstaller_bin = "pyinstaller" # 备用全局命令
         
     print(f"1. 正在编译核心主程序 ycode.exe...")
+    # 使用 ycode.spec 而非命令行参数：spec 里配置了 excludes（排除 litellm.proxy 等
+    # 运行时不需要的子模块）和 upx=False（避免启动时内存解压 + Defender 扫描拖慢）
     # --clean: 清除缓存
-    # --onefile: 生成单个独立 .exe
-    # --console: 保持控制台窗口（TUI 所需）
-    # --collect-all: 强制收集指定库中的所有模块、二进制文件及数据文件，彻底解决动态导入与数据缺失
+    # --noconfirm: 覆盖 dist/ 不询问
     cmd_core = [
         pyinstaller_bin,
         "--clean",
-        "--onefile",
-        "--console",
-        "--collect-all", "litellm",
-        "--collect-all", "tiktoken",
-        "--collect-all", "tiktoken_ext",
-        "--collect-all", "pyfiglet",
-        "--name", "ycode",
-        "main.py"
+        "--noconfirm",
+        "ycode.spec"
     ]
     print("运行命令:", " ".join(cmd_core))
     subprocess.run(cmd_core, check=True)
