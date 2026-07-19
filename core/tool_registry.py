@@ -52,34 +52,36 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None) -> di
     return result
 
 
-def _adapt(function):
-    def execute(**arguments):
-        return function(**arguments)
-    return execute
-
-
 def build_default_registry() -> ToolRegistry:
     from core import tools
+    from core import lsp as _lsp
     from core.ask_user import ask_user
     from core.plan import plan_update, plan_write
 
     read_specs = [
         ToolSpec(
             name="read_file",
-            description="读取指定文件的文本内容。",
-            input_schema=_schema({"file_path": {"type": "string"}}, ["file_path"]),
-            execute=_adapt(tools.read_file),
+            description="读取指定文件的文本内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；默认最多返回 2000 行，大文件（>50KB）自动只读前 500 行并提示分页；compress=False 默认返回完全原始内容，设 compress=True 可压缩（去行尾空白、合并空行）以节省 token 但会与原文不完全一致（编辑前需 compress=False 重读以保证 edit_file 匹配）。",
+            input_schema=_schema({
+                "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
+                "offset": {"type": "integer", "default": 0, "description": "从第几行开始读取（0 起）"},
+                "limit": {"type": "integer", "description": "最多读取的行数（上限 2000）"},
+                "compress": {"type": "boolean", "default": False, "description": "是否压缩文本（去行尾空白、合并空行）。默认 False 保留原始内容；浏览理解时可设 True 省 token，但编辑前需用 compress=False 重读"},
+            }, ["file_path"]),
+            execute=tools.read_file,
             read_only=True,
             requires_permission=False,
+            parallel_safe=True,
             activity_description="读取文件",
         ),
         ToolSpec(
             name="list_directory",
-            description="列出目录内容。",
+            description="列出目录内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）。",
             input_schema=_schema({"dir_path": {"type": "string", "default": "."}}),
-            execute=_adapt(tools.list_directory),
+            execute=tools.list_directory,
             read_only=True,
             requires_permission=False,
+            parallel_safe=True,
             activity_description="查看目录",
         ),
         ToolSpec(
@@ -89,10 +91,33 @@ def build_default_registry() -> ToolRegistry:
                 "query": {"type": "string"},
                 "dir_path": {"type": "string", "default": "."},
             }, ["query"]),
-            execute=_adapt(tools.search_code),
+            execute=tools.search_code,
             read_only=True,
             requires_permission=False,
+            parallel_safe=True,
             activity_description="搜索代码",
+        ),
+        ToolSpec(
+            name="find_definition",
+            description=(
+                "查找符号（函数/类/方法）的定义位置。比 search_code 更精确——"
+                "只匹配定义位置（def/class/function/func 等关键字），不匹配调用或字符串字面量。"
+                "支持 Python/JS/TS/Go/Rust/Java/C/C++/C#。返回 file:line 格式，可直接用 read_file 跳转。"
+            ),
+            input_schema=_schema({
+                "symbol": {"type": "string", "description": "要查找的符号名（函数名/类名/方法名）"},
+                "dir_path": {"type": "string", "default": "."},
+                "file_extensions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "限定文件扩展名（如 ['.py', '.ts']），不传则全语言",
+                },
+            }, ["symbol"]),
+            execute=_lsp.find_definition,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查找符号定义",
         ),
         ToolSpec(
             name="search_news",
@@ -101,10 +126,47 @@ def build_default_registry() -> ToolRegistry:
                 "query": {"type": "string"},
                 "num_results": {"type": "integer", "default": 5},
             }, ["query"]),
-            execute=_adapt(tools.search_news),
+            execute=tools.search_news,
             read_only=True,
             requires_permission=False,
+            parallel_safe=True,
             activity_description="联网搜索",
+        ),
+        ToolSpec(
+            name="fetch_url",
+            description="使用本机 HTTP 客户端获取网页或 JSON。需要实时网页数据时使用，不要用它代替项目代码搜索。",
+            input_schema=_schema({
+                "url": {"type": "string", "description": "完整的 http 或 https 地址"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 60,
+                },
+            }, ["url"]),
+            execute=tools.fetch_url,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="访问网址",
+        ),
+        ToolSpec(
+            name="get_weather",
+            description="查询指定城市的实时天气和短期预报。必须明确传入城市；不要使用 search_news 查询天气。",
+            input_schema=_schema({
+                "city": {"type": "string", "description": "城市名，例如北京、上海或 Shanghai"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 60,
+                },
+            }, ["city"]),
+            execute=tools.get_weather,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查询天气",
         ),
         ToolSpec(
             name="glob_files",
@@ -113,9 +175,10 @@ def build_default_registry() -> ToolRegistry:
                 "pattern": {"type": "string"},
                 "dir_path": {"type": "string", "default": "."},
             }, ["pattern"]),
-            execute=_adapt(tools.glob_files),
+            execute=tools.glob_files,
             read_only=True,
             requires_permission=False,
+            parallel_safe=True,
             activity_description="匹配文件",
         ),
     ]
@@ -123,18 +186,24 @@ def build_default_registry() -> ToolRegistry:
     mutating_specs = [
         ToolSpec(
             name="ask_user",
-            description="向用户提出一个需要选择的澄清问题。最多提供三个选项。",
+            description="向用户提出一个需要选择的澄清问题。必须提供 1 到 3 个选项；有计划时只能绑定独立的用户输入准备项。",
             input_schema=_schema({
                 "question": {"type": "string"},
-                "options": {"type": "array", "items": {"type": "string"}},
-            }, ["question"]),
-            execute=_adapt(ask_user),
+                "options": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 1,
+                    "maxItems": 3,
+                },
+                "plan_item_id": {"type": "string", "default": "", "description": "只能填写独立的用户输入准备项 ID；不得填写真正执行查询或修改的计划项 ID"},
+            }, ["question", "options"]),
+            execute=ask_user,
             requires_permission=False,
             activity_description="等待用户回答",
         ),
         ToolSpec(
             name="plan_write",
-            description="创建或替换当前任务计划。",
+            description="创建或替换当前任务计划；新项目必须是 pending。用户输入准备项使用 kind=input_preparation，其他项使用 kind=execution；运行状态由调度器真实回写。",
             input_schema=_schema({
                 "items": {"type": "array", "items": {
                     "type": "object",
@@ -142,72 +211,115 @@ def build_default_registry() -> ToolRegistry:
                         "id": {"type": "string"},
                         "subject": {"type": "string"},
                         "status": {"type": "string"},
+                        "depends_on": {"type": "array", "items": {"type": "string"}, "default": []},
+                        "owner": {"type": "string", "default": ""},
+                        "files": {"type": "array", "items": {"type": "string"}, "default": []},
+                        "verification": {"type": "string", "default": ""},
+                        "verification_type": {"type": "string", "enum": ["result", "command"], "default": "result"},
+                        "stage": {"type": "string", "enum": ["plan", "build", "review"], "default": "build"},
+                        "kind": {"type": "string", "enum": ["execution", "input_preparation"], "default": "execution"},
                     },
                     "required": ["id", "subject", "status"],
                 }},
             }, ["items"]),
-            execute=_adapt(plan_write),
+            execute=plan_write,
             activity_description="更新任务计划",
         ),
         ToolSpec(
             name="plan_update",
-            description="更新当前计划项的状态或标题。",
+            description="更新当前计划项的元数据；不要伪造运行状态，completed/failed 由真实执行器回写。",
             input_schema=_schema({
                 "item_id": {"type": "string"},
                 "status": {"type": "string"},
                 "subject": {"type": "string"},
+                "depends_on": {"type": "array", "items": {"type": "string"}},
+                "owner": {"type": "string"},
+                "files": {"type": "array", "items": {"type": "string"}},
+                "verification": {"type": "string"},
+                "verification_type": {"type": "string", "enum": ["result", "command"]},
+                "stage": {"type": "string", "enum": ["plan", "build", "review"]},
+                "kind": {"type": "string", "enum": ["execution", "input_preparation"]},
             }, ["item_id"]),
-            execute=_adapt(plan_update),
+            execute=plan_update,
             activity_description="更新计划项",
         ),
         ToolSpec(
             name="write_file",
-            description="创建或完整写入文件。",
+            description="创建或完整写入文件。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）。",
             input_schema=_schema({
-                "file_path": {"type": "string"},
+                "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
                 "content": {"type": "string"},
             }, ["file_path", "content"]),
-            execute=_adapt(tools.write_file),
+            execute=tools.write_file,
             mutates_files=True,
             activity_description="写入文件",
         ),
         ToolSpec(
             name="edit_file",
-            description="以精确字符串替换的方式修改文件。",
+            description="以精确字符串替换的方式修改文件。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；target_content 必须唯一匹配，出现多次时需补充上下文或显式设置 replace_all。",
             input_schema=_schema({
-                "file_path": {"type": "string"},
+                "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
                 "target_content": {"type": "string"},
                 "replacement_content": {"type": "string"},
+                "replace_all": {"type": "boolean", "default": False, "description": "是否替换全部出现位置"},
             }, ["file_path", "target_content", "replacement_content"]),
-            execute=_adapt(tools.edit_file),
+            execute=tools.edit_file,
             mutates_files=True,
             activity_description="修改文件",
         ),
         ToolSpec(
             name="execute_command",
-            description="执行本地命令。",
+            description="执行本地命令。前台执行默认 30 秒超时，可用 timeout_seconds 调整（上限 600 秒）。",
             input_schema=_schema({
                 "command": {"type": "string"},
                 "run_in_background": {"type": "boolean", "default": False},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 30,
+                    "minimum": 1,
+                    "maximum": 600,
+                },
             }, ["command"]),
-            execute=_adapt(tools.execute_command),
+            execute=tools.execute_command,
             activity_description="执行命令",
         ),
         ToolSpec(
             name="manage_task",
-            description="查看或终止后台任务。",
+            description="查看或终止后台任务。list/status 为只读操作不弹确认；仅 kill 操作会请求用户确认。",
             input_schema=_schema({
                 "action": {"type": "string"},
                 "task_id": {"type": "string"},
             }, ["action"]),
-            execute=_adapt(tools.manage_task),
+            execute=tools.manage_task,
+            requires_permission=False,
             activity_description="管理后台任务",
         ),
         ToolSpec(
             name="run_subagent",
-            description="启动后台辅助 Agent。",
-            input_schema=_schema({"task_description": {"type": "string"}}, ["task_description"]),
-            execute=_adapt(tools.run_subagent),
+            description="启动辅助 Agent；默认前台等待结果，仅独立任务使用后台模式。",
+            input_schema=_schema({
+                "task_description": {"type": "string"},
+                "subagent_type": {
+                    "type": "string",
+                    "enum": ["explore", "implement", "test", "review", "general"],
+                    "default": "general",
+                },
+                "plan_item_id": {
+                    "type": "string",
+                    "default": "",
+                    "description": "与当前计划项关联的 ID；有计划时必须填写。",
+                },
+                "run_in_background": {"type": "boolean", "default": False},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 120,
+                    "minimum": 30,
+                    "maximum": 3600,
+                },
+            }, ["task_description"]),
+            execute=tools.run_subagent,
+            requires_permission=False,
+            parallel_safe=True,
             activity_description="启动子 Agent",
         ),
     ]
