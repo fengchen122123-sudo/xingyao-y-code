@@ -54,17 +54,19 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None) -> di
 
 def build_default_registry() -> ToolRegistry:
     from core import tools
+    from core import lsp as _lsp
     from core.ask_user import ask_user
     from core.plan import plan_update, plan_write
 
     read_specs = [
         ToolSpec(
             name="read_file",
-            description="读取指定文件的文本内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；默认最多返回 2000 行，超出时可用 offset/limit 分页读取。",
+            description="读取指定文件的文本内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；默认最多返回 2000 行，大文件（>50KB）自动只读前 500 行并提示分页；compress=False 默认返回完全原始内容，设 compress=True 可压缩（去行尾空白、合并空行）以节省 token 但会与原文不完全一致（编辑前需 compress=False 重读以保证 edit_file 匹配）。",
             input_schema=_schema({
                 "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
                 "offset": {"type": "integer", "default": 0, "description": "从第几行开始读取（0 起）"},
                 "limit": {"type": "integer", "description": "最多读取的行数（上限 2000）"},
+                "compress": {"type": "boolean", "default": False, "description": "是否压缩文本（去行尾空白、合并空行）。默认 False 保留原始内容；浏览理解时可设 True 省 token，但编辑前需用 compress=False 重读"},
             }, ["file_path"]),
             execute=tools.read_file,
             read_only=True,
@@ -94,6 +96,28 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="搜索代码",
+        ),
+        ToolSpec(
+            name="find_definition",
+            description=(
+                "查找符号（函数/类/方法）的定义位置。比 search_code 更精确——"
+                "只匹配定义位置（def/class/function/func 等关键字），不匹配调用或字符串字面量。"
+                "支持 Python/JS/TS/Go/Rust/Java/C/C++/C#。返回 file:line 格式，可直接用 read_file 跳转。"
+            ),
+            input_schema=_schema({
+                "symbol": {"type": "string", "description": "要查找的符号名（函数名/类名/方法名）"},
+                "dir_path": {"type": "string", "default": "."},
+                "file_extensions": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "限定文件扩展名（如 ['.py', '.ts']），不传则全语言",
+                },
+            }, ["symbol"]),
+            execute=_lsp.find_definition,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查找符号定义",
         ),
         ToolSpec(
             name="search_news",

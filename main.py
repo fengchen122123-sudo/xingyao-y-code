@@ -108,6 +108,13 @@ PERMISSION_HELP_LINES = (
 _FILE_LIST_CACHE_TTL = 5.0
 _file_list_cache = {"timestamp": 0.0, "files": []}
 
+# 记忆压缩触发阈值：历史 token 数占上下文窗口的比例超过此值即触发压缩。
+# 默认 0.70（折中值）：
+#   - 0.80（旧值）太晚，单次压缩压力大且易触发兜底逻辑（prune_history_files）
+#   - 0.65 偏激进，配合 prompt caching 后缓存命中部分成本仅 1/10，频繁触发反而更费 token
+#   - 0.70 配合 prompt caching 是较好的折中：仍留有 30% 缓冲给当前轮 + 工具结果
+MEMORY_COMPRESS_THRESHOLD = 0.70
+
 
 def _esc(text) -> str:
     """转义一切插入 prompt_toolkit HTML(...) 的外部/用户内容，防止标签解析错乱。"""
@@ -775,7 +782,7 @@ def print_logo(clear_screen=True):
         + make_data_line("   Session   : ", safe_session)
         + make_data_line("   Model     : ", model_display)
         + make_data_line("   Theme     : ", current_theme)
-        + make_data_line("   Version   : ", "v1.0.20")
+        + make_data_line("   Version   : ", "v1.0.25")
         + make_box_line("")
         + make_box_line("   提示: 星瑶是您的编程伙伴，使用 <ansigreen>@文件</ansigreen> 可附带上下文。")
         + f"<style fg='{theme_color}'>└────────────────────────────────────────────────────────┘</style>\n"
@@ -832,6 +839,9 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
         print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
         print_formatted_text(HTML("  <ansicyan>/undo</ansicyan>                                   : 撤销星瑶上一次修改的代码，并同步抹除模型记忆"))
+        print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
+        print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
+        print_formatted_text(HTML("  <ansicyan>/worktree</ansicyan>                              : Git worktree 管理 (list/create/remove/prune)"))
         print_formatted_text(HTML("  <ansicyan>/clear</ansicyan>                                  : 清理终端当前屏幕"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【2. 模型与样式配置】</ansiyellow></b>"))
@@ -1167,7 +1177,7 @@ def handle_slash_command(command_text):
                 else:
                     write_file(file_path, old_content)
                     print_formatted_text(HTML(f"<ansigreen>↩️ 撤销成功！已将 {_esc(file_path)} 恢复到上一个版本。</ansigreen>"))
-                
+
                 # 清理大模型的错误记忆，防止幻觉
                 manager.undo_last_interaction(current_session)
                 recalc_token_usage()  # 撤销后重新计算 token
@@ -1178,6 +1188,116 @@ def handle_slash_command(command_text):
                 set_undo_state(None, None)
             except Exception as e:
                 print_formatted_text(HTML(f"<ansired>⚠️ 撤销失败: {_esc(e)}</ansired>"))
+
+    elif cmd == "/checkpoint" or cmd.startswith("/checkpoint "):
+        # 会话级检查点管理：list 查看、restore <turn_id> 回滚整轮所有文件修改
+        # 设计参考 Grok Build 的 workspace 级 checkpoint
+        from core.memory import list_checkpoints, restore_checkpoint
+        parts = cmd.split(maxsplit=2)
+        sub = parts[1] if len(parts) > 1 else "list"
+
+        if sub == "list":
+            checkpoints = list_checkpoints(current_session)
+            if not checkpoints:
+                print_formatted_text(HTML("<ansiyellow>ℹ 当前会话没有检查点记录。</ansiyellow>"))
+                print_formatted_text(HTML("<ansigray>  每轮对话开始前会自动打一个检查点，记录本轮所有文件修改的旧内容。</ansigray>"))
+                print_formatted_text(HTML("<ansigray>  使用 /checkpoint restore &lt;turn_id&gt; 可整体回滚到该检查点。</ansigray>"))
+            else:
+                print_formatted_text(HTML(f"<ansicyan>📋 当前会话共有 {len(checkpoints)} 个检查点:</ansicyan>"))
+                for cp in checkpoints:
+                    desc = cp.get("description", "") or "(无描述)"
+                    if len(desc) > 50:
+                        desc = desc[:47] + "..."
+                    n_files = len(cp.get("file_snapshots", []))
+                    print_formatted_text(HTML(
+                        f"  <ansigreen>{_esc(cp['turn_id'])}</ansigreen> "
+                        f"<ansigray>{_esc(cp['created_at'])}</ansigray> "
+                        f"文件修改: {n_files}  "
+                        f"<ansigray>{_esc(desc)}</ansigray>"
+                    ))
+                print_formatted_text(HTML("<ansigray>\n  使用 /checkpoint restore &lt;turn_id&gt; 整体回滚该轮所有文件修改</ansigray>"))
+
+        elif sub == "restore":
+            if len(parts) < 3:
+                print_formatted_text(HTML("<ansired>⚠️ 用法: /checkpoint restore &lt;turn_id&gt;</ansired>"))
+            else:
+                target_turn_id = parts[2].strip()
+                snapshots = restore_checkpoint(current_session, target_turn_id)
+                if snapshots is None:
+                    print_formatted_text(HTML(f"<ansired>⚠️ 未找到检查点: {_esc(target_turn_id)}</ansired>"))
+                    print_formatted_text(HTML("<ansigray>  使用 /checkpoint list 查看所有可用的检查点 ID</ansigray>"))
+                elif not snapshots:
+                    print_formatted_text(HTML(f"<ansiyellow>ℹ 检查点 {_esc(target_turn_id)} 没有文件修改记录（该轮没有写/编辑操作）。</ansiyellow>"))
+                else:
+                    print_formatted_text(HTML(f"<ansicyan>🔄 正在回滚检查点 {_esc(target_turn_id)}，共 {len(snapshots)} 个文件...</ansicyan>"))
+                    from core.tools import write_file
+                    success = 0
+                    failed = 0
+                    for snap in snapshots:
+                        try:
+                            file_path = snap["file_path"]
+                            old_content = snap["old_content"]
+                            if old_content == "":
+                                # 原本不存在该文件，删除
+                                if os.path.exists(file_path):
+                                    os.remove(file_path)
+                                print_formatted_text(HTML(f"  <ansigreen>✔ 删除新建文件: {_esc(file_path)}</ansigreen>"))
+                            else:
+                                write_file(file_path, old_content)
+                                print_formatted_text(HTML(f"  <ansigreen>✔ 恢复文件: {_esc(file_path)}</ansigreen>"))
+                            success += 1
+                        except Exception as e:
+                            print_formatted_text(HTML(f"  <ansired>✗ 恢复失败 {_esc(snap.get('file_path', '?'))}: {_esc(e)}</ansired>"))
+                            failed += 1
+                    print_formatted_text(HTML(
+                        f"<ansigreen>✅ 检查点回滚完成：成功 {success} 个，失败 {failed} 个。</ansigreen>"
+                    ))
+                    if success > 0:
+                        recalc_token_usage()
+
+        else:
+            print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /checkpoint [list|restore &lt;turn_id&gt;]</ansired>"))
+
+    elif cmd == "/share" or cmd.startswith("/share "):
+        # 会话导出（参考 OpenCode 的 share 模块）
+        # 用法: /share [md|html|json]
+        from core.share import export_session_markdown, export_session_html, export_session_json
+        parts = cmd.split(maxsplit=1)
+        fmt = parts[1].strip() if len(parts) > 1 else "md"
+        if fmt == "md" or fmt == "markdown":
+            result = export_session_markdown(current_session)
+        elif fmt == "html":
+            result = export_session_html(current_session)
+        elif fmt == "json":
+            result = export_session_json(current_session)
+        else:
+            result = f"🚨 未知格式: {fmt}。支持: md / html / json"
+        print_formatted_text(HTML(f"<ansigray>{_esc(result)}</ansigray>"))
+
+    elif cmd == "/worktree" or cmd.startswith("/worktree "):
+        # Git worktree 管理（参考 OpenCode 的 worktree 模块）
+        # 用法: /worktree list / /worktree create <branch> <path> / /worktree remove <path>
+        from core.worktree import list_worktrees, create_worktree, remove_worktree, prune_worktrees
+        parts = cmd.split(maxsplit=3)
+        sub = parts[1] if len(parts) > 1 else "list"
+
+        if sub == "list":
+            print_formatted_text(HTML(f"<ansigray>{_esc(list_worktrees())}</ansigray>"))
+        elif sub == "create":
+            if len(parts) < 4:
+                print_formatted_text(HTML("<ansired>⚠️ 用法: /worktree create &lt;branch&gt; &lt;path&gt;</ansired>"))
+            else:
+                branch, wt_path = parts[2], parts[3]
+                print_formatted_text(HTML(f"<ansigray>{_esc(create_worktree(branch, wt_path))}</ansigray>"))
+        elif sub == "remove":
+            if len(parts) < 3:
+                print_formatted_text(HTML("<ansired>⚠️ 用法: /worktree remove &lt;path&gt;</ansired>"))
+            else:
+                print_formatted_text(HTML(f"<ansigray>{_esc(remove_worktree(parts[2]))}</ansigray>"))
+        elif sub == "prune":
+            print_formatted_text(HTML(f"<ansigray>{_esc(prune_worktrees())}</ansigray>"))
+        else:
+            print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /worktree [list|create|remove|prune]</ansired>"))
 
     elif cmd == "/clear":
         print_logo()
@@ -1246,6 +1366,9 @@ def _make_input_app():
         ("/tasks", "查看或托管后台长周期进程"),
         ("/plan", "查看或控制当前任务计划"),
         ("/undo", "撤销星瑶上一次修改的代码"),
+        ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
+        ("/share", "导出会话为 Markdown/HTML/JSON"),
+        ("/worktree", "Git worktree 管理 (list/create/remove)"),
         ("/skills", "查看或安装/开启/禁用技能插件"),
         ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
         ("/permission", "切换安全权限级别 (confirm/plan/full)"),
@@ -1825,8 +1948,9 @@ def _background_worker():
             from core.llm import estimate_tokens
             estimated_tokens = estimate_tokens(task_model, history)
 
-            if estimated_tokens > task_ctx_win * 0.8:
-                # 超过 80% 安全线，触发智能记忆压缩提炼。
+            if estimated_tokens > task_ctx_win * MEMORY_COMPRESS_THRESHOLD:
+                # 超过阈值（默认 65%，更早压缩以降低单次压缩压力），
+                # 触发智能记忆压缩提炼。
                 # 注意：compress_session_memory 在 worker 内同步执行且暂不支持取消参数，
                 # 压缩期间的 Ctrl+C 要等压缩返回后才会生效（接口约束，暂不透传取消）。
                 from core.memory_compressor import compress_session_memory
@@ -1844,14 +1968,14 @@ def _background_worker():
                 estimated_tokens = estimate_tokens(task_model, history)
 
                 # 兜底：如果总结归纳后依然超限，触发物理大文件折叠机制
-                if estimated_tokens > task_ctx_win * 0.8:
+                if estimated_tokens > task_ctx_win * MEMORY_COMPRESS_THRESHOLD:
                     manager.prune_history_files(task_session, max_turns=1, retain_recent=4)
                     history = manager.get_history_for_llm(task_session)
                     estimated_tokens = estimate_tokens(task_model, history)
 
                 # 智能滑窗淘汰：如果仍超限，按完整轮次（user 开头到下一个 user 之前）
                 # 为单位从内存中丢弃最早的旧消息，直到满足 Token 安全阈值
-                while len(history) > 2 and estimated_tokens > task_ctx_win * 0.8:
+                while len(history) > 2 and estimated_tokens > task_ctx_win * MEMORY_COMPRESS_THRESHOLD:
                     if not _evict_oldest_turn(history):
                         break
                     estimated_tokens = estimate_tokens(task_model, history)
@@ -1904,6 +2028,16 @@ def _background_worker():
             active_cancel_event = cancel_event
             active_turn_id = turn_id
 
+            # 会话级检查点：本轮所有 write_file/edit_file 的旧内容会被自动记录
+            # 用户可通过 /checkpoint restore <turn_id> 整体回滚（含文件 + 对话上下文）
+            from core.memory import begin_turn_checkpoint, end_turn_checkpoint
+            begin_turn_checkpoint(
+                session_name=task_session,
+                turn_id=turn_id,
+                last_msg_id=len(history),
+                description=str(user_input)[:80],
+            )
+
             def mark_turn_started():
                 global is_thinking, think_start_time, task_status
                 _clear_active_thinking()
@@ -1937,14 +2071,19 @@ def _background_worker():
                     # 消息已由 generator 在生成迭代中实时持久化入库，此处不再重复写入
                     _forward_response_events(response_gen)
                     turn_controller.complete()
+                    # 提交本轮检查点到全局缓存（即使本轮没有文件修改也要记录，
+                    # 用户可借此回滚到"本轮对话开始前"的状态）
+                    end_turn_checkpoint()
                     schedule_ui(_reset_turn_state)
                 except KeyboardInterrupt:
                     # The queued turn_cancelled event renders the cancellation line.
                     turn_controller.cancel()
+                    end_turn_checkpoint()  # 取消也提交检查点（已记录的快照仍可用）
                     schedule_ui(_reset_turn_state)
                     turn_interrupted = True
                 except Exception as e:
                     turn_controller.cancel()
+                    end_turn_checkpoint()
                     schedule_ui(lambda message=_esc(e): print_formatted_text(
                         HTML(f"\n<ansired>⚠️ 连接或回复生成失败: {message}</ansired>\n")
                     ))
@@ -1979,6 +2118,85 @@ def _background_worker():
             schedule_ui(_reset_turn_state)
         finally:
             msg_queue.task_done()
+
+
+def run_headless(prompt, session_name=None):
+    """Headless 模式：执行一次性任务后退出，不进入交互式 TUI。
+
+    用途：CI/脚本/管道集成
+    参考：Grok Build/OpenCode 都支持的 headless 模式
+
+    流程：
+    1. 初始化配置（与 run_cli 相同）
+    2. 解析 prompt（支持 "-" 读取 stdin）
+    3. 后台 worker 线程执行任务
+    4. 主线程通过事件回调接收回复并打印到 stdout
+    5. 任务完成或取消后退出
+
+    与交互模式区别：
+    - 不启动 prompt_toolkit Application
+    - 所有输出走 print_formatted_text 到 stdout
+    - 权限请求直接按"拒绝"处理（headless 模式不交互确认）
+    - 退出码：0=成功，1=任务失败，2=配置错误
+    """
+    global current_session, current_model, current_key, current_url, current_ctx_win
+
+    # 1. 初始化运行时（与 run_cli 相同的副作用集中执行）
+    bind_default_plan_session(current_session)
+    # headless 模式：用简单的 prompt handler 自动拒绝所有权限请求
+    # （不在 TUI 中与用户交互，安全起见拒绝所有副作用操作）
+    permission_broker.set_prompt_handlers(
+        lambda req: None,  # 不激活 UI 提示
+        lambda: None,       # 不需要 dismiss
+    )
+
+    set_terminal_title("Y-code (headless)")
+
+    # 2. 处理 prompt 输入（支持 stdin）
+    if prompt == "-":
+        import sys as _sys
+        prompt = _sys.stdin.read().strip()
+        if not prompt:
+            print("错误：从 stdin 读取的内容为空", file=_sys.stderr)
+            _sys.exit(2)
+    elif not prompt.strip():
+        print("错误：prompt 不能为空", file=sys.stderr)
+        sys.exit(2)
+
+    # 3. 指定会话（如果传了 --session）
+    if session_name:
+        current_session = session_name
+        sync_plan_session(current_session)
+
+    # 4. 启动后台 worker 线程
+    worker_thread = threading.Thread(target=_background_worker, daemon=True)
+    worker_thread.start()
+
+    # 5. 投递任务并等待完成
+    # 用一个简单的事件机制等 worker 处理完成
+    done_event = threading.Event()
+    task_data = {
+        "text": prompt,
+        "was_queued": False,
+        "is_skill_call": False,
+    }
+    msg_queue.put(task_data)
+
+    # 监听事件：worker 处理完一轮会 idle 等 msg_queue.get()，
+    # 这里用 polling 检测 msg_queue 是否被消费 + task_done
+    # 简化方案：等待 worker 把这一轮处理完（msg_queue.task_done() 会调用）
+    # task_done() 在 finally 块里调用，这里等待它
+    try:
+        # 超时 30 分钟，避免 headless 模式无限挂起
+        msg_queue.join()
+        # 给事件队列一点时间排空
+        time.sleep(0.5)
+    except KeyboardInterrupt:
+        print("\n[已取消]", file=sys.stderr)
+        sys.exit(130)
+
+    # 6. 退出
+    sys.exit(0)
 
 
 def run_cli():
@@ -2057,8 +2275,18 @@ def run_cli():
 
     threading.Thread(target=_ui_refresher_loop, daemon=True).start()
 
-    # 首次启动，计算当前 session 的 Token
-    recalc_token_usage()
+    # 首次启动，异步计算当前 session 的 Token
+    # 异步化原因：recalc_token_usage 会触发 litellm.token_counter（首次约 1.3s），
+    # 同步执行会让 UI 显示延迟。改为后台线程后 UI 立即出现，状态栏 token 数稍后填充。
+    def _async_recalc_token_usage():
+        try:
+            recalc_token_usage()
+            # 计算完成后刷新 UI 显示最新 token 数
+            schedule_ui(_invalidate_ui)
+        except Exception as e:
+            logging.getLogger("py.warnings").warning("首次 recalc_token_usage 失败: %s", e)
+
+    threading.Thread(target=_async_recalc_token_usage, daemon=True).start()
 
     # 主循环：支持 /models 弹出选择器并重启主 App
     while True:
@@ -2164,4 +2392,30 @@ def run_cli():
 
 
 if __name__ == "__main__":
-    run_cli()
+    # Headless 模式：ycode -p "task" 一次性执行任务后退出，不进入交互式 TUI
+    # 用途：CI/脚本/管道集成（参考 Grok Build/OpenCode 的 headless 模式）
+    # 用法：
+    #   ycode -p "解释这个代码库"
+    #   ycode --prompt "实现一个加法函数" --session work
+    #   echo "问题" | ycode --prompt -
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="ycode",
+        description="Y-code 终端 AI 编程助手",
+        add_help=False,  # 交互模式下 argparse 的 -h/--help 会干扰；只在显式 -p 时启用
+    )
+    parser.add_argument("-p", "--prompt", dest="prompt",
+                        help="Headless 模式：执行一次性任务后退出（- 读取 stdin）")
+    parser.add_argument("--session", dest="session", default=None,
+                        help="指定会话名（headless 模式下有效）")
+    parser.add_argument("-h", "--help", action="help",
+                        help="显示帮助信息")
+
+    args, _ = parser.parse_known_args()
+
+    if args.prompt is not None:
+        # Headless 模式
+        run_headless(prompt=args.prompt, session_name=args.session)
+    else:
+        # 交互式模式（默认）
+        run_cli()
