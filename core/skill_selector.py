@@ -4,7 +4,7 @@ from prompt_toolkit.layout import Layout, HSplit, Window
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.styles import Style
 
-from core.skills import scan_all_skills, get_active_skill_ids, save_active_skill_ids
+from core.skills import scan_all_skills, get_active_skill_ids, save_active_skill_ids, get_skill_dirs
 
 STYLE = Style.from_dict({
     "header":        "bold #00b4d8",
@@ -35,8 +35,16 @@ def open_skill_selector(on_closed=None):
         out += [_t("class:header", "  Y-code 技能插件管理器 (通用 SKILL.md)\n")]
         out += [_t("", "  -----------------------------------------\n")]
 
+        # 展示当前生效的扫描目录，方便用户确认 skill_search_paths 配置是否生效
+        active_dirs = get_skill_dirs()
+        if active_dirs:
+            out += [_t("class:footer", "  扫描目录:\n")]
+            for d in active_dirs:
+                out += [_t("class:footer", f"    - {d}\n")]
+            out += [_t("", "\n")]
+
         if not state["skills"]:
-            out += [_t("class:empty", "  (没有扫描到任何技能。请在 .agents/skills 或 ~/.ycode/skills 中放入带有 SKILL.md 的文件夹)\n")]
+            out += [_t("class:empty", "  (没有扫描到任何技能。请在上述扫描目录中放入带有 SKILL.md 的文件夹)\n")]
         else:
             for i, skill in enumerate(state["skills"]):
                 is_cursor = (i == state["cursor"])

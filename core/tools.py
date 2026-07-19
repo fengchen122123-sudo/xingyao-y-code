@@ -1,6 +1,8 @@
+import ipaddress
 import os
 import json
 import re
+import socket
 import subprocess
 import tempfile
 import threading
@@ -23,12 +25,82 @@ HTTP_TIMEOUT_SECONDS = 20
 HTTP_MAX_BYTES = 512 * 1024
 HTTP_USER_AGENT = "Y-Code/1.0.19 (terminal coding assistant)"
 READ_FILE_MAX_LINES = 2000
+# 大文件阈值：超过此字节数的文件，未显式指定 limit 时自动只读前部分并提示分页
+READ_FILE_LARGE_BYTES = 50 * 1024
+READ_FILE_LARGE_DEFAULT_LINES = 500
+
+
+def _compress_source_text(text):
+    """压缩源代码文本以减少 token 消耗，同时保留语义完整性。
+
+    优化项：
+    1. 去除每行行尾空白（trailing whitespace，包括空格和制表符）
+    2. 连续 2+ 空行合并为 1 行（保留代码块之间的视觉分隔，但避免大段空白烧 token）
+    3. 文件末尾多余空行裁剪
+
+    不做的事（避免破坏语义）：
+    - 不剥离行首缩进（Python 等语言依赖缩进）
+    - 不剥离注释（注释对理解代码逻辑很重要）
+    - 不剥离字符串字面量
+
+    注意：压缩后内容与原始文件不完全一致（行尾空白、空行数有差异）。
+    若后续要用 edit_file 修改该文件，须用 compress=False 重读以保证 target_content 匹配。
+    """
+    if not text:
+        return text
+    lines = text.splitlines()
+    # 1. 去除行尾空白（保留行首缩进与内容）
+    stripped = [line.rstrip() for line in lines]
+    # 2. 连续 2+ 空行合并为 1 行
+    result = []
+    blank_run = 0
+    for line in stripped:
+        if line == "":
+            blank_run += 1
+            if blank_run <= 1:
+                result.append(line)
+            # 超过 1 个连续空行直接跳过，最终只保留 1 个
+        else:
+            blank_run = 0
+            result.append(line)
+    # 3. 末尾多余空行裁剪（保留 1 个换行符即可）
+    while result and result[-1] == "":
+        result.pop()
+    return "\n".join(result) + ("\n" if result else "")
 
 
 # 线程内临时放行（用户批准的单次沙盒外操作）与会话级放行（用户选“始终放行”）
 _sandbox_tls = threading.local()
 _session_sandbox_bypass = False
 _session_sandbox_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# 子代理嵌套深度限制（参考 OpenCode 的 limit subagent nesting depth）
+# ---------------------------------------------------------------------------
+# 防止子代理递归调用 run_subagent 形成无限嵌套导致：
+# - 资源耗尽（每个子代理是一个独立线程 + 一轮 LLM 对话）
+# - 计划项状态错乱（深度嵌套的 callback 链难追溯）
+# - 用户难以追踪到底是谁在执行
+# 默认最大深度 3：主代理 → 子代理 → 孙代理 → 终止
+# 超限时返回明确错误，让上层 LLM 改用直接执行
+_subagent_depth_tls = threading.local()
+SUBAGENT_MAX_DEPTH = 3
+
+
+def _get_current_subagent_depth():
+    """获取当前线程的子代理嵌套深度（0 表示主代理线程）。"""
+    return getattr(_subagent_depth_tls, "depth", 0)
+
+
+@contextlib.contextmanager
+def _subagent_depth_scope():
+    """进入子代理执行上下文：深度 +1，退出时 -1。"""
+    prev = getattr(_subagent_depth_tls, "depth", 0)
+    _subagent_depth_tls.depth = prev + 1
+    try:
+        yield prev + 1
+    finally:
+        _subagent_depth_tls.depth = prev
 
 
 def is_outside_workspace(path_value):
@@ -91,14 +163,41 @@ def _resolve_workspace_path(file_path):
     return candidate
 
 
-def read_file(file_path, offset=0, limit=None):
-    """读取文件内容并返回（仅限当前工作目录内，默认最多 2000 行，超出时给出截断提示）"""
+def read_file(file_path, offset=0, limit=None, compress=False):
+    """读取文件内容并返回（仅限当前工作目录内，默认最多 2000 行，超出时给出截断提示）
+
+    参数：
+    - offset: 从第几行开始读取（0 起）
+    - limit: 最多读取的行数（上限 2000），未指定时按文件大小自适应：
+             原始文件 > 50KB 且未指定 limit 时，默认只读前 500 行并提示分页
+    - compress: 是否压缩源代码文本（默认 False）。
+                压缩项：去除行尾空白、连续 2+ 空行合并为 1 行、裁剪末尾空行。
+                不影响语义：保留缩进、注释、字符串字面量。
+                设为 True 可节省 token，但内容与原始文件不完全一致——
+                若后续要用 edit_file 修改该文件，请用 compress=False 重读以保证匹配。
+                建议流程：先 compress=True 快速浏览理解结构 → 若需编辑再 compress=False 重读。
+    """
     resolved = _resolve_workspace_path(file_path)
-    with open(resolved, 'r', encoding='utf-8') as f:
-        lines = f.read().splitlines(keepends=True)
+
+    # 大文件自适应：未显式指定 limit 时，按文件大小决定默认读取行数
+    file_size = resolved.stat().st_size
+    auto_limited = False
+    if limit is None and file_size > READ_FILE_LARGE_BYTES:
+        max_lines = READ_FILE_LARGE_DEFAULT_LINES
+        auto_limited = True
+    else:
+        max_lines = READ_FILE_MAX_LINES if limit is None else max(1, min(int(limit), READ_FILE_MAX_LINES))
+
+    # 非 UTF-8 文件回退 GBK 读取（与原行为一致）
+    try:
+        with open(resolved, 'r', encoding='utf-8') as f:
+            lines = f.read().splitlines(keepends=True)
+    except UnicodeDecodeError:
+        with open(resolved, 'r', encoding='gbk', errors='replace') as f:
+            lines = f.read().splitlines(keepends=True)
+
     total = len(lines)
     start = max(0, int(offset or 0))
-    max_lines = READ_FILE_MAX_LINES if limit is None else max(1, min(int(limit), READ_FILE_MAX_LINES))
     if total == 0:
         return ""
     if start >= total:
@@ -106,9 +205,29 @@ def read_file(file_path, offset=0, limit=None):
     selected = lines[start:start + max_lines]
     result = "".join(selected)
     end = start + len(selected)
+
+    # 压缩处理
+    compressed_note = ""
+    if compress and result:
+        original_len = len(result)
+        result = _compress_source_text(result)
+        compressed_len = len(result)
+        if original_len > compressed_len:
+            compressed_note = f"\n[已压缩：{original_len} → {compressed_len} 字节，省 {original_len - compressed_len} 字节]"
+
+    # 截断提示
+    truncation_note = ""
     if end < total:
-        result += f"\n... (文件共 {total} 行，已显示第 {start + 1}-{end} 行；请使用 offset/limit 参数继续读取)"
-    return result
+        if auto_limited:
+            truncation_note = (
+                f"\n... (文件较大：共 {total} 行 / {file_size} 字节，"
+                f"已显示第 {start + 1}-{end} 行；请使用 offset/limit 参数继续读取，"
+                f"或显式传 limit 参数突破自动限制)"
+            )
+        else:
+            truncation_note = f"\n... (文件共 {total} 行，已显示第 {start + 1}-{end} 行；请使用 offset/limit 参数继续读取)"
+
+    return result + compressed_note + truncation_note
 
 def write_file(file_path, content):
     """将内容写入文件（仅限当前工作目录内，统一按 utf-8 编码写入）"""
@@ -292,6 +411,121 @@ def _validate_http_url(url):
     return parsed.geturl()
 
 
+# ---------------------------------------------------------------------------
+# SSRF 防护
+# ---------------------------------------------------------------------------
+# 防 SSRF：阻止 LLM 通过 fetch_url 探测内网/云元数据接口
+# （参考 Grok Build：阻止非公开 IP，本地需显式 opt-in）
+# 防护范围：
+#   1. 私网（10.0.0.0/8、172.16.0.0/12、192.168.0.0/16）
+#   2. Loopback（127.0.0.0/8、::1）
+#   3. Link-local（169.254.0.0/16，含 AWS/GCP/Azure 元数据接口 169.254.169.254）
+#   4. 未分配/保留地址（0.0.0.0/8、240.0.0.0/4 等）
+#   5. DNS 解析后的 IP 也要校验（防 DNS rebinding 攻击）
+# 白名单：用户可在 config.json 加 fetch_url_allow_hosts 显式放行特定主机名
+
+class SSRFBlockedError(ValueError):
+    """SSRF 防护拦截的请求"""
+
+
+# 默认私网/保留 IP 段（ipaddress 模块的 is_private/is_loopback/is_link_local/is_reserved 已覆盖）
+# 额外明确禁止的元数据接口
+_METADATA_HOSTS = {"169.254.169.254", "metadata.google.internal", "metadata.azure.com"}
+
+
+def _is_safe_public_ip(ip_str):
+    """判断 IP 字符串是否为安全的公网 IP（非私网/loopback/link-local/保留）。"""
+    try:
+        ip = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    # 公网 IP 的判定：四个属性全部为 False
+    return not (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_reserved
+        or ip.is_multicast
+        or ip.is_unspecified
+    )
+
+
+def _get_fetch_url_allow_hosts():
+    """读取 config.json 的 fetch_url_allow_hosts 白名单（用户显式 opt-in）。"""
+    try:
+        import config
+        data = config._read_json_with_backup(config._CONFIG_FILE, default=None)
+        if not isinstance(data, dict):
+            return set()
+        hosts = data.get("fetch_url_allow_hosts")
+        if not isinstance(hosts, list):
+            return set()
+        return {str(h).lower().strip() for h in hosts if h}
+    except Exception:
+        return set()
+
+
+def _check_ssrf_url(url):
+    """SSRF 防护：校验 URL 的主机名与解析后的 IP 是否为安全公网目标。
+
+    策略：
+    1. 主机名在显式白名单中 → 直接放行（不查 IP）
+    2. 主机名在元数据黑名单中 → 拒绝
+    3. DNS 解析所有 A/AAAA 记录，任一 IP 不安全 → 拒绝
+    4. 解析失败 → 拒绝（保守策略）
+    """
+    parsed = urlparse(str(url or "").strip())
+    host = (parsed.hostname or "").lower()
+
+    if not host:
+        raise SSRFBlockedError("URL 缺少主机名")
+
+    # 1. 显式白名单优先
+    allow_hosts = _get_fetch_url_allow_hosts()
+    if host in allow_hosts:
+        return
+
+    # 2. 元数据接口黑名单
+    if host in _METADATA_HOSTS:
+        raise SSRFBlockedError(
+            f"已阻止访问云元数据接口 {host}（防止 SSRF 泄露凭据）"
+        )
+
+    # 3. 如果 host 本身就是 IP 字面量，直接校验
+    try:
+        ipaddress.ip_address(host)
+        if not _is_safe_public_ip(host):
+            raise SSRFBlockedError(
+                f"已阻止访问非公网 IP {host}（防止 SSRF 访问内网）"
+            )
+        return
+    except ValueError:
+        pass  # 不是 IP 字面量，是域名，继续 DNS 解析
+
+    # 4. DNS 解析后校验所有 IP
+    try:
+        # getaddrinfo 返回 (family, type, proto, canonname, sockaddr) 列表
+        # sockaddr 对 IPv4 是 (ip, port)，对 IPv6 是 (ip, port, flowinfo, scope_id)
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise SSRFBlockedError(
+            f"DNS 解析失败 {host}：{exc}（保守拒绝以防止 SSRF）"
+        )
+
+    if not infos:
+        raise SSRFBlockedError(f"DNS 解析返回空结果 {host}（保守拒绝）")
+
+    for info in infos:
+        sockaddr = info[4]
+        if not sockaddr:
+            continue
+        ip_str = sockaddr[0]
+        if not _is_safe_public_ip(ip_str):
+            raise SSRFBlockedError(
+                f"已阻止访问 {host}（解析到非公网 IP {ip_str}，防止 SSRF）"
+            )
+
+
 def _decode_http_response(response, raw):
     headers = getattr(response, "headers", {})
     content_type = ""
@@ -310,6 +544,9 @@ def _decode_http_response(response, raw):
 
 def _request_http_text(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
     normalized_url = _validate_http_url(url)
+    # SSRF 防护：在发起请求前校验主机与解析后的 IP
+    # 即使 LLM 拼接了内网/元数据接口 URL，也会在此被拦截
+    _check_ssrf_url(normalized_url)
     timeout = float(timeout_seconds)
     if not 1 <= timeout <= 60:
         raise ValueError("timeout_seconds 必须在 1 到 60 秒之间")
@@ -345,6 +582,13 @@ def fetch_url(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
         if content_type:
             header += f" ({content_type})"
         return f"{header}\n{text}"
+    except SSRFBlockedError as exc:
+        # SSRF 防护拦截：清晰提示用户被阻止的原因，并说明如何加白名单
+        return (
+            f"🚨 {exc}\n"
+            f"如需访问该内网/私有地址，请在 ~/.ycode/config.json 的 "
+            f"fetch_url_allow_hosts 数组中显式添加该主机名以 opt-in。"
+        )
     except (HTTPError, URLError, TimeoutError, ValueError) as exc:
         return f"🚨 FetchURL 请求失败：{_format_http_error(exc)}"
     except Exception as exc:
@@ -1273,22 +1517,25 @@ class SubagentManager:
             },
         ]
         self._record_stage(task.task_id, "model")
-        events = chat_with_model_events(
-            current_model,
-            current_key,
-            messages,
-            current_url,
-            persist=False,
-            turn_id=task.task_id,
-            cancel_event=task.cancel_event,
-            allow_subagents=False,
-            allowed_tools=allowed_tools,
-            consume_background_notifications=False,
-            parent_session=task.parent_session,
-            parent_turn_id=task.parent_turn_id,
-            permission_owner=task.task_id,
-            permission_source=f"子代理：{task.description[:40]}",
-        )
+        # 进入子代理深度作用域：在此作用域内 _get_current_subagent_depth() 返回新深度
+        # 该深度会被 run_subagent 入口的硬限制检查读取，防止子代理内嵌套创建子代理
+        with _subagent_depth_scope():
+            events = chat_with_model_events(
+                current_model,
+                current_key,
+                messages,
+                current_url,
+                persist=False,
+                turn_id=task.task_id,
+                cancel_event=task.cancel_event,
+                allow_subagents=False,
+                allowed_tools=allowed_tools,
+                consume_background_notifications=False,
+                parent_session=task.parent_session,
+                parent_turn_id=task.parent_turn_id,
+                permission_owner=task.task_id,
+                permission_source=f"子代理：{task.description[:40]}",
+            )
         answer = []
         tool_errors: dict[str, str] = {}
         for event in events:
@@ -1336,6 +1583,19 @@ def run_subagent(
     event_callback=None,
 ):
     """Run one isolated child agent and return its foreground result or background ID."""
+    # 子代理深度硬限制：防止无限递归（参考 OpenCode limit subagent nesting depth）
+    # 主代理线程 depth=0，子代理 depth=1，孙代理 depth=2，重孙 depth=3 → 超限拒绝
+    current_depth = _get_current_subagent_depth()
+    if current_depth >= SUBAGENT_MAX_DEPTH:
+        return json.dumps({
+            "status": "failed",
+            "plan_item_id": str(plan_item_id or ""),
+            "error": (
+                f"子代理嵌套深度已达上限 {SUBAGENT_MAX_DEPTH}（当前 {current_depth}），"
+                f"拒绝继续创建子代理。请改用直接工具执行任务，或重新组织任务结构。"
+            ),
+        }, ensure_ascii=False)
+
     # 先完成参数校验，再认领计划项，避免认领后校验失败导致计划项永久 in_progress
     try:
         timeout_seconds = int(timeout_seconds)
