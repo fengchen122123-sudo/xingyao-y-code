@@ -17,6 +17,7 @@ class ToolSpec:
     mutates_files: bool = False
     requires_permission: bool = True
     cancellable: bool = True
+    parallel_safe: bool = False
     activity_description: str = ""
 
     def api_schema(self) -> dict[str, Any]:

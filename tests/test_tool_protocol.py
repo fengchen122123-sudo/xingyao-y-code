@@ -1,4 +1,15 @@
-from core.tool_protocol import ToolResult
+from core.tool_protocol import ToolResult, ToolSpec
+
+
+def test_tool_spec_defaults_to_serial_execution():
+    spec = ToolSpec(
+        name="demo",
+        description="demo",
+        input_schema={},
+        execute=lambda: None,
+    )
+
+    assert spec.parallel_safe is False
 
 
 def test_tool_result_keeps_error_diff_and_changed_files():
