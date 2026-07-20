@@ -143,25 +143,45 @@ def parse_skill_md(file_path):
         return None
 
 def scan_all_skills():
-    """扫描目录下的所有 SKILL.md 或 skill.md"""
+    """扫描目录下的所有 SKILL.md 或 skill.md。
+
+    只扫描 base_dir 的直接子目录（深度=1），避免嵌套 skill 目录被重复展示：
+        base_dir/
+          skill-a/SKILL.md   ← 扫描
+          skill-a/sub/SKILL.md  ← 不扫描（双层）
+    """
     skills = []
-    seen_ids = set()  # 按绝对路径去重，防止多个扫描目录指向同一物理位置时 SKILL.md 被加载多次
+    seen_ids = set()  # 按绝对路径去重，防止多个扫描目录指向同一物理位置时重复加载
+
     for base_dir in get_skill_dirs():
         if not os.path.exists(base_dir):
             continue
 
-        # 递归扫描
-        for root, dirs, files in os.walk(base_dir):
-            for file in files:
-                if file.lower() == "skill.md":
-                    file_path = os.path.abspath(os.path.join(root, file))
+        # 只遍历 base_dir 的直接子条目（不递归）
+        try:
+            entries = os.listdir(base_dir)
+        except OSError as e:
+            _log_warning("扫描技能目录失败 %s: %s", base_dir, e)
+            continue
+
+        for entry in entries:
+            skill_dir = os.path.join(base_dir, entry)
+            if not os.path.isdir(skill_dir):
+                continue
+            # 优先匹配 SKILL.md，其次 skill.md（大小写兼容）
+            for fname in ("SKILL.md", "skill.md"):
+                candidate = os.path.join(skill_dir, fname)
+                if os.path.isfile(candidate):
+                    file_path = os.path.abspath(candidate)
                     norm_id = os.path.normcase(file_path)
                     if norm_id in seen_ids:
-                        continue
+                        break
                     seen_ids.add(norm_id)
                     skill_info = parse_skill_md(file_path)
                     if skill_info:
                         skills.append(skill_info)
+                    break  # 找到一个就不再找 skill.md
+
     return skills
 
 def get_active_skill_ids():

@@ -116,9 +116,9 @@ def test_default_prompt_defines_http_and_weather_tool_selection():
     assert "search_news 只用于新闻" in prompt
 
 
-def test_source_and_package_versions_are_1_0_18():
+def test_source_and_package_versions_are_1_0_26():
     main_source = Path("main.py").read_text(encoding="utf-8")
     setup_source = Path("setup.py").read_text(encoding="utf-8")
 
-    assert '"v1.0.19"' in main_source
-    assert "version='1.0.19'" in setup_source
+    assert '"v1.0.26"' in main_source
+    assert "version='1.0.26'" in setup_source

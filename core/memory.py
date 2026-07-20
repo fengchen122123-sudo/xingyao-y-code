@@ -240,6 +240,27 @@ class MemoryManager:
             # 保存修改
             self.conn.commit()
 
+    def checkpoint_wal(self):
+        """主动执行 WAL checkpoint，整理被写的预写日志，防止 ycode.db-wal 文件体积无限膨胀。"""
+        with self.lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
+            except Exception as e:
+                try:
+                    logging.getLogger("py.warnings").warning("WAL checkpoint 执行失败: %s", e)
+                except Exception:
+                    pass
+
+    def close(self):
+        """关闭数据库连接前自动刷盘 WAL 日志。"""
+        with self.lock:
+            if hasattr(self, "conn") and self.conn:
+                try:
+                    self.checkpoint_wal()
+                    self.conn.close()
+                except Exception:
+                    pass
+
     def add_message(self, session_name, role, content):
         """记笔记技能：把聊天内容存进数据库"""
         self.add_messages(session_name, [(role, content)])

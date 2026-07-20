@@ -53,35 +53,42 @@ def install():
     else:
         # 本地开发测试环境
         bundle_dir = os.path.dirname(os.path.abspath(__file__))
-        
-    src_exe = os.path.join(bundle_dir, "ycode.exe")
+
+    # 寻找编译好的程序主目录 (onedir 模式下的 ycode_pkg 或 dist/ycode 文件夹)
+    src_pkg_dir = os.path.join(bundle_dir, "ycode_pkg")
+    if not os.path.exists(src_pkg_dir):
+        src_pkg_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "ycode")
+
     dest_exe = os.path.join(install_dir, "ycode.exe")
-    
     src_uninst = os.path.join(bundle_dir, "ycode_uninstall.exe")
-    dest_uninst = os.path.join(install_dir, "ycode_uninstall.exe")
-    
-    if not os.path.exists(src_exe):
-        # 兼容性开发模式测试：如果 dist/ycode.exe 存在
-        dev_exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "ycode.exe")
-        if os.path.exists(dev_exe):
-            src_exe = dev_exe
-            
     if not os.path.exists(src_uninst):
-        dev_uninst = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "ycode_uninstall.exe")
-        if os.path.exists(dev_uninst):
-            src_uninst = dev_uninst
-            
-    if not os.path.exists(src_exe):
-        print(f"🚨 错误：未能在安装包中找到核心文件 ycode.exe！(检测路径: {src_exe})")
-        print("请检查安装包完整性，或联系开发者。")
-        input("按任意键退出安装...")
-        sys.exit(1)
-        
-    # 3. 复制可执行文件
-    print("\n🚀 正在复制核心文件...")
+        src_uninst = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "ycode_uninstall.exe")
+
+    dest_uninst = os.path.join(install_dir, "ycode_uninstall.exe")
+
+    if not os.path.exists(src_pkg_dir) or not os.path.exists(os.path.join(src_pkg_dir, "ycode.exe")):
+        # 兜底单文件模式兼容
+        src_exe = os.path.join(bundle_dir, "ycode.exe")
+        if not os.path.exists(src_exe):
+            src_exe = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist", "ycode.exe")
+        if not os.path.exists(src_exe):
+            print(f"🚨 错误：未能在安装包中找到核心文件！(检测路径: {src_pkg_dir})")
+            print("请检查安装包完整性，或联系开发者。")
+            input("按任意键退出安装...")
+            sys.exit(1)
+        src_pkg_dir = None
+
+    # 3. 复制核心文件与依赖库
+    print("\n🚀 正在安装程序核心依赖与组件 (onedir 秒开架构)...")
     try:
-        shutil.copy2(src_exe, dest_exe)
-        print(f"✔ 核心文件成功复制到: {dest_exe}")
+        if src_pkg_dir and os.path.isdir(src_pkg_dir):
+            # 复制 onedir 目录里的所有文件与子目录（包含 _internal 等关键依赖）
+            shutil.copytree(src_pkg_dir, install_dir, dirs_exist_ok=True)
+            print(f"✔ 核心程序包及依赖成功释放到: {install_dir}")
+        else:
+            shutil.copy2(src_exe, dest_exe)
+            print(f"✔ 核心文件成功复制到: {dest_exe}")
+
         if os.path.exists(src_uninst):
             shutil.copy2(src_uninst, dest_uninst)
             print(f"✔ 卸载程序成功复制到: {dest_uninst}")
