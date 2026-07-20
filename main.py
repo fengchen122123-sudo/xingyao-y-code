@@ -782,7 +782,7 @@ def print_logo(clear_screen=True):
         + make_data_line("   Session   : ", safe_session)
         + make_data_line("   Model     : ", model_display)
         + make_data_line("   Theme     : ", current_theme)
-        + make_data_line("   Version   : ", "v1.0.25")
+        + make_data_line("   Version   : ", "v1.0.26")
         + make_box_line("")
         + make_box_line("   提示: 星瑶是您的编程伙伴，使用 <ansigreen>@文件</ansigreen> 可附带上下文。")
         + f"<style fg='{theme_color}'>└────────────────────────────────────────────────────────┘</style>\n"
@@ -2388,6 +2388,10 @@ def run_cli():
             
         else:
             # 正常退出（Ctrl+D 或其他原因）
+            try:
+                manager.close()
+            except Exception:
+                pass
             break
 
 

@@ -485,10 +485,17 @@ def get_tools_schema():
     return tool_registry.api_schemas() + mcp_manager.get_schemas()
 
 
+def completion(**kwargs):
+    """litellm.completion 的模块级导出的包装函数（可被测试 mocker.patch 拦截）。"""
+    return _litellm_completion(**kwargs)
+
+
 def __getattr__(name):
     # 兼容别名：惰性计算，避免 import 时触发 MCP 连接
     if name == "TOOLS_SCHEMA":
         return get_tools_schema()
+    if name == "litellm":
+        return _get_litellm()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 def estimate_tokens(model_name, messages):
@@ -807,10 +814,10 @@ def _strip_media_and_merge(messages, model_name=None):
             else:
                 cleaned_msg = {"role": role, "content": _flatten_media_content(content)}
         else:
-            cleaned_msg = {"role": role, "content": str(content) if content else ""}
+            cleaned_msg = {"role": role, "content": str(content) if content is not None else ""}
 
         # 保留工具链和 provider 原生推理字段，避免工具轮次破坏签名思考块。
-        if "tool_calls" in msg:
+        if "tool_calls" in msg and msg["tool_calls"]:
             cleaned_msg["tool_calls"] = msg["tool_calls"]
         if "tool_call_id" in msg:
             cleaned_msg["tool_call_id"] = msg["tool_call_id"]
@@ -820,7 +827,20 @@ def _strip_media_and_merge(messages, model_name=None):
             cleaned_msg["reasoning_content"] = msg["reasoning_content"]
         if keep_reasoning_fields and msg.get("thinking_blocks") is not None:
             cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
-            
+
+        # 净化 assistant 消息：若 content 包含 protocol sanitised 占位符且有 tool_calls/reasoning，将 content 重置为空字符串
+        if role == "assistant" and isinstance(cleaned_msg.get("content"), str):
+            if "[System: Empty message content sanitised to satisfy protocol]" in cleaned_msg["content"]:
+                cleaned_msg["content"] = ""
+
+        # 过滤完全没有内容的空白 assistant 消息（无 content, 无 tool_calls, 无 reasoning）
+        if role == "assistant":
+            has_text = bool(cleaned_msg.get("content"))
+            has_tools = bool(cleaned_msg.get("tool_calls"))
+            has_reasoning = bool(cleaned_msg.get("reasoning_content") or cleaned_msg.get("thinking_blocks"))
+            if not (has_text or has_tools or has_reasoning):
+                continue
+
         cleaned.append(cleaned_msg)
         
     # 合并同角色消息 (注意：不要合并有 tool_calls 或 role 是 tool/system 的消息)
@@ -1554,7 +1574,7 @@ def _chat_with_model_generator(
                         _strip_media_and_merge(messages, model_name),
                         model_name,
                     )
-                    response_stream = _litellm_completion(**kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
+                    response_stream = completion(**kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
                     break
                 except Exception as api_err:
                     err_str = str(api_err).lower()

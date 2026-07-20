@@ -253,7 +253,13 @@ def list_directory(dir_path="."):
     """雷达工具：扫描文件夹，返回里面的所有文件和文件夹列表（仅限当前工作目录内）"""
     try:
         resolved = _resolve_workspace_path(dir_path)
+        if not os.path.exists(resolved):
+            return f"🚨 目录扫描失败：路径不存在 '{dir_path}'"
+        if os.path.isfile(resolved):
+            return f"🚨 目录扫描失败：'{dir_path}' 是一个文件而不是目录。若要查看文件内容，请使用 read_file 工具。"
         items = os.listdir(resolved)
+        if not items:
+            return f"📂 目录 '{dir_path}' 为空。"
         return "\n".join(items)
     except Exception as e:
         return f"🚨 目录扫描失败: {str(e)}"
