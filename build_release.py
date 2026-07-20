@@ -43,24 +43,25 @@ def build():
     subprocess.run(cmd_uninst, check=True)
     
     print("\n3. 正在验证程序是否编译成功...")
-    ycode_exe = os.path.join(project_dir, "dist", "ycode.exe")
+    ycode_dir = os.path.join(project_dir, "dist", "ycode")
+    ycode_exe = os.path.join(ycode_dir, "ycode.exe")
     ycode_uninst = os.path.join(project_dir, "dist", "ycode_uninstall.exe")
     if os.path.exists(ycode_exe) and os.path.exists(ycode_uninst):
-        print(f"✔ 核心程序成功生成: {ycode_exe}")
+        print(f"✔ 核心程序包(onedir)成功生成: {ycode_dir}")
         print(f"✔ 卸载程序成功生成: {ycode_uninst}")
     else:
         print("🚨 核心程序或卸载程序编译失败！")
         sys.exit(1)
-        
-    print("\n4. 正在编译安装向导程序 ycode_setup.exe...")
-    # 将 dist/ycode.exe 和 dist/ycode_uninstall.exe 打包进 ycode_setup.exe
+
+    print("\n4. 正在编译安装向导程序 ycode_setup.exe (打包核心程序包)...")
+    # 将 dist/ycode 目录和 dist/ycode_uninstall.exe 打包进 ycode_setup.exe
     cmd_setup = [
         pyinstaller_bin,
         "--clean",
         "--onefile",
         "--console",
-        "--add-data", f"dist/ycode.exe;.",
-        "--add-data", f"dist/ycode_uninstall.exe;.",
+        "--add-data", "dist/ycode;ycode_pkg",
+        "--add-data", "dist/ycode_uninstall.exe;.",
         "--name", "ycode_setup",
         "ycode_setup.py"
     ]
