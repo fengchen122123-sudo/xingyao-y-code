@@ -15,8 +15,17 @@ _memory_io_lock = threading.Lock()
 def _atomic_write_text(path, content):
     """临时文件 + replace 原子写入，避免写一半崩溃产生截断文件。调用方需持有 _memory_io_lock。"""
     tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    tmp_path.write_text(content, encoding="utf-8")
-    os.replace(tmp_path, path)
+    try:
+        tmp_path.write_text(content, encoding="utf-8")
+        os.replace(tmp_path, path)
+    except BaseException:
+        # os.replace 在 Windows 上若目标文件被占用会抛 PermissionError；
+        # 用 try/finally 确保临时文件不会永久残留。
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
 
 
 def _is_safe_memory_filename(fname):

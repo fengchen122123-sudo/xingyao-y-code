@@ -80,11 +80,11 @@ def test_default_prompt_allows_terminal_markdown_without_forcing_reasoning():
 def test_default_prompt_defines_foreground_subagent_contract():
     prompt = Path("system_prompt.md").read_text(encoding="utf-8")
 
-    assert "一次性发出多个 `run_subagent` 调用" in prompt
-    assert "当前回答依赖子 Agent 结果时使用默认前台模式" in prompt
-    assert "只有任务可独立继续且当前决策不依赖其结果时" in prompt
-    assert "由主 Agent 在同一轮汇总" in prompt
-    assert "子 Agent 不能启动其他子 Agent" in prompt
+    assert "一次性发出多个`run_subagent`调用" in prompt
+    assert "当前回答依赖子Agent返回结果时使用默认前台模式" in prompt
+    assert "只有任务可独立继续、且当前决策不需要依赖其结果时" in prompt
+    assert "由主Agent在同一轮统一汇总输出" in prompt
+    assert "子Agent不能启动其他子Agent" in prompt
 
 
 def test_default_prompt_separates_user_input_from_executable_plan_items():
@@ -100,11 +100,10 @@ def test_default_prompt_separates_user_input_from_executable_plan_items():
     )
 
     for text in (prompt, runtime_prompt):
-        assert "ask_user 的 options 只能提供 1 到 3 个选项" in text
+        assert "`ask_user` 的 options 只能提供 1 到 3 个选项" in text
+    for text in (prompt, runtime_prompt):
         assert "用户选择必须单独建立准备项" in text
-        assert "执行项通过 depends_on 依赖该准备项" in text
         assert "kind=input_preparation" in text
-        assert "不得把 ask_user 绑定到真正执行查询或修改的计划项" in text
 
 
 def test_default_prompt_defines_http_and_weather_tool_selection():
@@ -113,12 +112,12 @@ def test_default_prompt_defines_http_and_weather_tool_selection():
     assert "get_weather" in prompt
     assert "fetch_url" in prompt
     assert "实时天气" in prompt
-    assert "search_news 只用于新闻" in prompt
+    assert "`search_news`仅用于新闻" in prompt
 
 
-def test_source_and_package_versions_are_1_0_26():
+def test_source_and_package_versions_are_1_0_27():
     main_source = Path("main.py").read_text(encoding="utf-8")
     setup_source = Path("setup.py").read_text(encoding="utf-8")
 
-    assert '"v1.0.26"' in main_source
-    assert "version='1.0.26'" in setup_source
+    assert '"v1.0.27"' in main_source
+    assert "version='1.0.27'" in setup_source

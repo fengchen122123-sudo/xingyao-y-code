@@ -338,9 +338,12 @@ class TaskScheduler:
 
     def _revive_blocked_items(self) -> None:
         """依赖转为 completed 后，把仅因失败依赖而 blocked 的项自动降级回 pending。"""
-        statuses = {item["id"]: item["status"] for item in self.plan.snapshot()}
+        # 只做一次 snapshot，保证 statuses 字典与迭代的 items 来自同一时刻，
+        # 避免两次 snapshot() 之间的竞态导致状态不一致。
+        snapshot = self.plan.snapshot()
+        statuses = {item["id"]: item["status"] for item in snapshot}
         revived: list[dict[str, Any]] = []
-        for item in self.plan.snapshot():
+        for item in snapshot:
             if item["status"] != "blocked":
                 continue
             if any(

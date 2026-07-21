@@ -9,6 +9,7 @@ from core.tool_presenter import (
     summarize_tool_started,
     tool_target,
 )
+from core.turn_renderer import sanitize_protocol_text
 
 
 _DIM = "\x1b[90m"
@@ -90,6 +91,8 @@ def render_session_history(history: list[dict], width: int) -> str:
             if tagged_reasoning:
                 reasoning = reasoning or tagged_reasoning
                 content = public_content
+
+            content = sanitize_protocol_text(content)
 
             if reasoning:
                 output.append(f"{_DIM}{reasoning}{_RESET}\n")

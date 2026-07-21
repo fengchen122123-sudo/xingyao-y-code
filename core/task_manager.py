@@ -144,7 +144,7 @@ def _load_tasks():
 
 
 def _save_tasks():
-    """将当前的活跃任务持久化写入磁盘 JSON 库"""
+    """将当前的活跃任务持久化写入磁盘 JSON 库（原子写，防止崩溃时文件损坏）"""
     _ensure_paths()
     try:
         with _TASKS_LOCK:
@@ -162,8 +162,12 @@ def _save_tasks():
                             or platform_console_encoding()
                         ),
                     }
-            with open(TASK_DB_PATH, 'w', encoding='utf-8') as f:
+            # 先写临时文件，成功后再原子替换目标文件，
+            # 避免写到一半进程崩溃或磁盘满时 tasks.json 损坏。
+            tmp_path = TASK_DB_PATH + ".tmp"
+            with open(tmp_path, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, TASK_DB_PATH)
     except Exception as error:
         _logger.warning("写入任务记录失败 %s: %s", TASK_DB_PATH, error)
 

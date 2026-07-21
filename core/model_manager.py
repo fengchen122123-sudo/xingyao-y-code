@@ -52,8 +52,8 @@ def load_config() -> dict:
         except Exception:
             data = {}
 
-    # 如果完全空，初始化为 DeepSeek 默认结构
-    if "providers" not in data or not data.get("providers"):
+    # 仅在全新启动/无 providers 键时初始化为 DeepSeek 默认结构
+    if "providers" not in data:
         data = {
             "active_model_id": "ds-v4-pro",
             "providers": [
@@ -142,7 +142,7 @@ def add_provider(name: str, base_url: str, api_key: str, protocol: str) -> str:
 def add_model_to_provider(provider_id: str, name: str, context_window: int) -> str:
     """
     给指定厂商追加一个模型，litellm_model 格式为 {protocol}/{name}。
-    返回新模型的 model_id。
+    返回新模型的 model_id。若当前无激活模型，自动激活该模型。
     """
     mid = str(uuid.uuid4())[:8]
 
@@ -160,12 +160,15 @@ def add_model_to_provider(provider_id: str, name: str, context_window: int) -> s
                     "context_window": context_window,
                 })
                 break
+        # 若当前尚未选择激活任何模型，自动激活新添加的模型
+        if not data.get("active_model_id"):
+            data["active_model_id"] = mid
     config.update_config(_mutate)
     return mid
 
 
 def delete_model(model_id: str):
-    """删除一个模型；如果厂商下没有模型了，厂商也一并删除。"""
+    """删除一个模型；如果厂商下没有模型了，厂商也一并删除。若删除了激活模型，自动切到第一个剩余模型。"""
     def _mutate(data):
         for provider in data.get("providers", [])[:]:
             for model in provider["models"][:]:
@@ -173,9 +176,14 @@ def delete_model(model_id: str):
                     provider["models"].remove(model)
             if not provider["models"]:
                 data["providers"].remove(provider)
-        # 如果删掉的是激活模型，清空激活状态
+        # 如果删掉的是激活模型，自动将激活模型切到第一个剩余模型
         if data.get("active_model_id") == model_id:
-            data["active_model_id"] = None
+            first_remaining = None
+            for p in data.get("providers", []):
+                if p.get("models"):
+                    first_remaining = p["models"][0]["id"]
+                    break
+            data["active_model_id"] = first_remaining
     config.update_config(_mutate)
 
 
@@ -196,3 +204,35 @@ def update_provider_and_model(provider_id: str, model_id: str, base_url: str, ap
                         break
                 break
     config.update_config(_mutate)
+
+
+def add_preset_provider_with_models(name: str, base_url: str, api_key: str, protocol: str, models: list[dict]) -> str:
+    """批量添加预设厂商及其下的所有预置模型，默认激活厂商的第一个大模型，返回 provider_id。"""
+    pid = str(uuid.uuid4())[:8]
+
+    def _mutate(data):
+        provider_models = []
+        for m in models:
+            mid = str(uuid.uuid4())[:8]
+            mname = m["name"]
+            litellm_model = mname if "/" in mname else f"{protocol}/{mname}"
+            provider_models.append({
+                "id": mid,
+                "name": mname,
+                "litellm_model": litellm_model,
+                "context_window": m.get("context_window", 128000),
+            })
+
+        data.setdefault("providers", []).append({
+            "id": pid,
+            "name": name,
+            "base_url": base_url,
+            "api_key": api_key,
+            "protocol": protocol,
+            "models": provider_models,
+        })
+        # 默认自动激活新添加预设厂商的第一个大模型
+        if provider_models:
+            data["active_model_id"] = provider_models[0]["id"]
+    config.update_config(_mutate)
+    return pid

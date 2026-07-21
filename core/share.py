@@ -44,7 +44,7 @@ def _format_message_markdown(msg):
         for item in content:
             if isinstance(item, dict):
                 if item.get('type') == 'text':
-                    parts.append(item.get('text', ''))
+                    parts.append(item.get('text') or '')
                 elif item.get('type') in ('image', 'image_url'):
                     parts.append('[图片]')
                 else:
@@ -136,7 +136,7 @@ def export_session_html(session_name, manager=None, output_path=None):
             parts = []
             for item in content:
                 if isinstance(item, dict) and item.get('type') == 'text':
-                    parts.append(item.get('text', ''))
+                    parts.append(item.get('text') or '')
                 elif isinstance(item, dict) and item.get('type') in ('image', 'image_url'):
                     parts.append('[图片]')
                 else:
