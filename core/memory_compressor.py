@@ -236,6 +236,13 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             return True
 
     except Exception as e:
+        # 异常路径必须回滚，否则未提交的事务会使 SQLite 连接进入锁定状态，
+        # 导致后续所有写操作报 "database is locked"。
+        try:
+            if hasattr(manager, "conn") and manager.conn:
+                manager.conn.rollback()
+        except Exception:
+            pass
         safe_e = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         emit(f"<ansired>⚠️ 后台记忆压缩失败: {safe_e}</ansired>")
 
