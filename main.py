@@ -64,10 +64,10 @@ confirm_prompt = None
 # 全局运行时状态（优先从 config.json 读取激活模型）
 current_session = f"session_{uuid.uuid4().hex[:6]}"
 _active = get_active_model()
-current_model   = _active["litellm_model"]   if _active else MY_MODEL
-current_model_name = _active["name"]         if _active else MY_MODEL.split('/')[-1]
-current_key     = _active["api_key"]          if _active else MY_KEY
-current_url     = _active["base_url"]          if _active else MY_BASE_URL
+current_model   = _active["litellm_model"]   if _active else ""
+current_model_name = _active["name"]         if _active else "未激活模型"
+current_key     = _active["api_key"]          if _active else ""
+current_url     = _active["base_url"]          if _active else ""
 current_ctx_win = _active["context_window"]   if _active else 128000
 msg_queue = queue.Queue()
 ui_event_queue = queue.Queue()
@@ -151,6 +151,9 @@ def _list_workspace_files():
                 continue
             rel_path = os.path.relpath(os.path.join(root, f), '.')
             results.append(rel_path.replace('\\', '/'))
+    # 注：以下两步赋值非原子操作。当前 _list_workspace_files 仅在 UI 主线程
+    # （SlashCommandCompleter.get_completions）调用，不存在并发问题。
+    # 若未来需要在后台线程调用，应改为原子替换整个 dict 对象。
     _file_list_cache["timestamp"] = now
     _file_list_cache["files"] = results
     return results
@@ -215,7 +218,15 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
     elif func == "edit_file":
         text += f"📝  星瑶申请修改文件: {_esc(args.get('file_path', ''))}\n"
     elif func == "ask_user":
-        text += f"❓  星瑶需要你的选择: {_esc(args.get('question', ''))}\n"
+        q = str(args.get("question", ""))
+        q_lines = q.splitlines()
+        if len(q_lines) > 3:
+            q_display = "\n".join(q_lines[:3]) + f"\n    ... (问题包含多行内容，共 {len(q_lines)} 行)"
+        else:
+            q_display = q
+        if len(q_display) > 200:
+            q_display = q_display[:197] + "..."
+        text += f"❓  星瑶需要你的选择: {_esc(q_display)}\n"
     elif func == "sandbox_outside_access":
         text += f"🛡  星瑶申请访问工作目录之外的路径: {_esc(args.get('path', ''))}\n"
         text += "    （沙盒模式下默认仅限工作目录内；同意本次仅放行此操作，可用 /sandbox on 长期开放）\n"
@@ -267,7 +278,9 @@ def _dismiss_permission_prompt() -> None:
             return
         if confirm_prompt is not None and confirm_prompt.get("request_id"):
             confirm_prompt = None
-        if active_cancel_event is not None:
+        # 仅当 active_turn_id 不为 None（确实有 turn 正在运行）时才恢复 executing 状态；
+        # 若 turn 已结束（active_turn_id 已被清空），保持 idle 状态，避免旋转动画永不消失。
+        if active_cancel_event is not None and active_turn_id is not None:
             task_status = "executing"
             is_thinking = True
         if app_instance is not None:
@@ -724,7 +737,8 @@ def print_logo(clear_screen=True):
     if len(cwd) > 35:
         cwd_display = "..." + cwd[-32:]
         
-    model_display = current_model_name
+    active_info = get_active_model()
+    model_display = active_info["name"] if active_info else "未激活模型"
     safe_session = current_session.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     
     def display_width(s):
@@ -782,14 +796,14 @@ def print_logo(clear_screen=True):
         + make_data_line("   Session   : ", safe_session)
         + make_data_line("   Model     : ", model_display)
         + make_data_line("   Theme     : ", current_theme)
-        + make_data_line("   Version   : ", "v1.0.26")
+        + make_data_line("   Version   : ", "v1.0.27")
         + make_box_line("")
         + make_box_line("   提示: 星瑶是您的编程伙伴，使用 <ansigreen>@文件</ansigreen> 可附带上下文。")
         + f"<style fg='{theme_color}'>└────────────────────────────────────────────────────────┘</style>\n"
     )
     
     print_formatted_text(HTML(card))
-    print_formatted_text(HTML("<ansigray>   Enter 发送 | Alt+Enter 换行 | Ctrl+C 清空/中断 | Ctrl+D 退出 | Ctrl+T 记忆</ansigray>\n"))
+    print_formatted_text(HTML("<ansigray>   Enter 发送 | Ctrl+N 换行 | Ctrl+C 清空/中断 | Ctrl+D 退出 | Ctrl+T 记忆</ansigray>\n"))
 
 
 def _resolve_session_after_selector(current_session_name, existed_before):
@@ -871,7 +885,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("<b><ansiyellow>【6. 终端常用快捷操作】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>@文件名</ansicyan>                               : <b>在提问中挂载本地文件</b> (例如: <ansigray>这行代码怎么改 @main.py</ansigray>)"))
         print_formatted_text(HTML("  <ansicyan>Enter</ansicyan>                                 : 提交当前文本给星瑶（闲置立即执行，繁忙则自动排队等待）"))
-        print_formatted_text(HTML("  <ansicyan>Alt+Enter</ansicyan>                             : 在输入框内输入新的一行换行符"))
+        print_formatted_text(HTML("  <ansicyan>Ctrl+N</ansicyan>                                    : 在输入框内输入新的一行换行符"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+C</ansicyan>                                : <b>星瑶思考中时立即发送强行中断信号</b>；闲置时清空输入框"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+T</ansicyan>                                : <b>切换展开/收起底部浮窗显示当前会话的背景记忆摘要</b>"))
         print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 Y-CODE 权限模式</b> (变更前确认 ➡️ 计划模式 ➡️ 完全访问)"))
@@ -1193,7 +1207,7 @@ def handle_slash_command(command_text):
         # 会话级检查点管理：list 查看、restore <turn_id> 回滚整轮所有文件修改
         # 设计参考 Grok Build 的 workspace 级 checkpoint
         from core.memory import list_checkpoints, restore_checkpoint
-        parts = cmd.split(maxsplit=2)
+        parts = command_text.strip().split(maxsplit=2)
         sub = parts[1] if len(parts) > 1 else "list"
 
         if sub == "list":
@@ -1262,7 +1276,7 @@ def handle_slash_command(command_text):
         # 会话导出（参考 OpenCode 的 share 模块）
         # 用法: /share [md|html|json]
         from core.share import export_session_markdown, export_session_html, export_session_json
-        parts = cmd.split(maxsplit=1)
+        parts = command_text.strip().split(maxsplit=1)
         fmt = parts[1].strip() if len(parts) > 1 else "md"
         if fmt == "md" or fmt == "markdown":
             result = export_session_markdown(current_session)
@@ -1278,7 +1292,7 @@ def handle_slash_command(command_text):
         # Git worktree 管理（参考 OpenCode 的 worktree 模块）
         # 用法: /worktree list / /worktree create <branch> <path> / /worktree remove <path>
         from core.worktree import list_worktrees, create_worktree, remove_worktree, prune_worktrees
-        parts = cmd.split(maxsplit=3)
+        parts = command_text.strip().split(maxsplit=3)
         sub = parts[1] if len(parts) > 1 else "list"
 
         if sub == "list":
@@ -1491,9 +1505,9 @@ def _make_input_app():
                 msg_queue.put({"text": text, "was_queued": was_queued})
                 input_area.text = ""
 
-    @kb.add("escape", "enter")
+    @kb.add("c-n")
     def newline(event):
-        """Alt+Enter 换行"""
+        """Ctrl+N 换行"""
         event.current_buffer.insert_text("\n")
 
     @kb.add("c-c")
@@ -1573,7 +1587,8 @@ def _make_input_app():
     def get_status():
         """底部状态栏内容：极简无底色，带 Token 统计与后台任务监控"""
         # 1. 提取短模型名（去掉前缀 openai/ 等）
-        model_display = current_model_name
+        active_info = get_active_model()
+        model_display = active_info["name"] if active_info else "未激活模型"
 
         # 2. 计算 Token 消耗与缓存命中（分离概念）；与 worker 并发读写，必须持锁
         with token_usage_lock:
@@ -1682,7 +1697,7 @@ def _make_input_app():
         content=Frame(
             Window(
                 content=FormattedTextControl(get_confirm_prompt_content),
-                height=D(min=6, max=11),
+                height=D(min=6, max=9),
                 wrap_lines=True
             ),
             title="🚨 敏感操作授权确认 (用方向键选择，回车确认)",
@@ -1899,12 +1914,21 @@ def _background_worker():
                 ))
 
             # 捕捉配置
+            from core.model_manager import get_active_model
+            active_info = get_active_model()
+            if not active_info or not active_info.get("litellm_model"):
+                schedule_ui(lambda: print_formatted_text(
+                    HTML("❌ <b><ansired>您当前未配置或激活任何大模型！请输入 /models 添加并激活模型后再进行对话。</ansired></b>")
+                ))
+                msg_queue.task_done()
+                continue
+
             task_session = current_session
             sync_plan_session(task_session)
-            task_model = current_model
-            task_key = current_key
-            task_url = current_url
-            task_ctx_win = current_ctx_win
+            task_model = active_info["litellm_model"]
+            task_key = active_info.get("api_key", "")
+            task_url = active_info.get("base_url", "")
+            task_ctx_win = active_info.get("context_window", 128000)
 
             from core.input_parser import parse_user_input
             if is_skill_call:
@@ -2084,14 +2108,19 @@ def _background_worker():
                 except Exception as e:
                     turn_controller.cancel()
                     end_turn_checkpoint()
-                    schedule_ui(lambda message=_esc(e): print_formatted_text(
+                    schedule_ui(lambda message=_esc(str(e)): print_formatted_text(
                         HTML(f"\n<ansired>⚠️ 连接或回复生成失败: {message}</ansired>\n")
                     ))
                     schedule_ui(_reset_turn_state)
                     turn_interrupted = True
             finally:
-                active_cancel_event = None
-                active_turn_id = None
+                # 将全局状态清空推回 UI 主线程，与 _cancel_active_turn 的读操作
+                # 在同一线程执行，消除 active_cancel_event / active_turn_id 的竞态。
+                def _clear_active_turn():
+                    global active_cancel_event, active_turn_id
+                    active_cancel_event = None
+                    active_turn_id = None
+                schedule_ui(_clear_active_turn)
 
             if not turn_interrupted:
                 # 检查是否需要自动重命名会话（当且仅当是新建的默认 hex 会话）
@@ -2112,7 +2141,7 @@ def _background_worker():
             # 兜底防线：parse/add_message/prune/压缩/提示词组装等任何未预期异常
             # 都不允许杀死 worker 线程，否则之后所有用户输入会被静默吞掉、UI 卡死
             logging.getLogger("py.warnings").exception("background worker turn failed: %s", e)
-            schedule_ui(lambda message=_esc(e): print_formatted_text(
+            schedule_ui(lambda message=_esc(str(e)): print_formatted_text(
                 HTML(f"\n<ansired>⚠️ 后台任务执行失败: {message}</ansired>\n")
             ))
             schedule_ui(_reset_turn_state)
@@ -2187,8 +2216,14 @@ def run_headless(prompt, session_name=None):
     # 简化方案：等待 worker 把这一轮处理完（msg_queue.task_done() 会调用）
     # task_done() 在 finally 块里调用，这里等待它
     try:
-        # 超时 30 分钟，避免 headless 模式无限挂起
-        msg_queue.join()
+        # Queue.join() 没有 timeout 参数；改用轮询，设 30 分钟硬超时，
+        # 防止 worker 意外崩溃漏调 task_done() 导致 headless 进程永久挂起。
+        deadline = time.monotonic() + 1800  # 30 分钟
+        while msg_queue.unfinished_tasks > 0:
+            if time.monotonic() > deadline:
+                print("\n[headless 任务超时（30 分钟），强制退出]", file=sys.stderr)
+                sys.exit(1)
+            time.sleep(0.1)
         # 给事件队列一点时间排空
         time.sleep(0.5)
     except KeyboardInterrupt:
@@ -2202,7 +2237,7 @@ def run_headless(prompt, session_name=None):
 def run_cli():
     """主入口 — 封装在 while 循环里，支持弹出全屏选择器后自动重启"""
     global app_instance, pending_action, current_session
-    global current_model, current_key, current_url, current_ctx_win
+    global current_model, current_key, current_url, current_ctx_win, current_model_name
 
     # 运行时初始化副作用集中在入口执行（而非模块 import 时），保证 main.py 可被安全 import
     bind_default_plan_session(current_session)
@@ -2215,14 +2250,37 @@ def run_cli():
 
     print_logo()
 
-    # 首次启动且 API Key 为空时，基于当前激活模型提示输入密钥并保存
-    if not current_key:
+    # 首次启动/完全无配置模型时，自动引导开启全屏模型配置选择器
+    active_info = get_active_model()
+    if not active_info:
+        print("\n🔑 欢迎使用 Y-CODE！检测到您尚未配置大模型。")
+        print("💡 正在自动为您开启模型管理界面，请选择厂商并配置 API Key...")
+        time.sleep(1.2)
+        from core.model_selector import open_model_selector
+        def _on_init_selected(info: dict):
+            global current_model, current_key, current_url, current_ctx_win, current_model_name
+            current_model      = info["litellm_model"]
+            current_model_name = info["name"]
+            current_key        = info["api_key"]
+            current_url        = info["base_url"]
+            current_ctx_win    = info["context_window"]
+        open_model_selector(on_model_selected=_on_init_selected)
         active_info = get_active_model()
-        model_label = active_info["name"] if active_info else MY_MODEL
-        provider_label = active_info["provider_name"] if active_info else "未配置厂商"
-        protocol_label = active_info.get("protocol", "openai") if active_info else "openai"
-        ctx_label = active_info.get("context_window", 128000) if active_info else 128000
-        print("\n🔑 检测到您尚未配置大模型 API 密钥。")
+        if active_info:
+            current_model      = active_info["litellm_model"]
+            current_model_name = active_info["name"]
+            current_key        = active_info["api_key"]
+            current_url        = active_info["base_url"]
+            current_ctx_win    = active_info["context_window"]
+            print(f"\n✔ 已成功配置并激活模型：{current_model_name}")
+
+    elif not active_info.get("api_key"):
+        # 已有激活模型但密钥为空时，提示输入 Key
+        model_label = active_info["name"]
+        provider_label = active_info.get("provider_name", "未配置厂商")
+        protocol_label = active_info.get("protocol", "openai")
+        ctx_label = active_info.get("context_window", 128000)
+        print("\n🔑 检测到激活模型尚未配置 API 密钥。")
         print(f"当前激活模型：{model_label}")
         print(f"接口协议：{protocol_label} | 厂商：{provider_label} | 上下文支持：{ctx_label:,}")
         print("请在下方输入您的 API 密钥 (API Key)：")
@@ -2230,7 +2288,6 @@ def run_cli():
             key_input = input("👉 API Key: ").strip()
             if key_input:
                 current_key = key_input
-                # 持久化保存到激活模型所属的厂商配置中
                 from core.model_manager import load_config, _write_config
                 cfg = load_config()
                 active_id = cfg.get("active_model_id")
@@ -2314,9 +2371,23 @@ def run_cli():
                 current_ctx_win = info["context_window"]
 
             open_model_selector(on_model_selected=_on_selected)
-            # 选择器关闭后，因为可能切了模型，重新算一下 Token
+            # 选择器关闭后（即使删光了模型未触发 on_selected），均重新同步当前激活模型
+            active_info = get_active_model()
+            if active_info:
+                current_model      = active_info["litellm_model"]
+                current_model_name = active_info["name"]
+                current_key        = active_info["api_key"]
+                current_url        = active_info["base_url"]
+                current_ctx_win    = active_info["context_window"]
+            else:
+                current_model      = ""
+                current_model_name = "未激活模型"
+                current_key        = ""
+                current_url        = ""
+                current_ctx_win    = 128000
+
             recalc_token_usage()
-            
+            print_logo(clear_screen=True)
             pending_action = None
             continue
             

@@ -161,3 +161,16 @@ def test_renderer_preserves_markdown_split_across_stream_chunks():
     renderer.consume("assistant_delta", {"text": "** 和 __次要__"})
 
     assert renderer.assistant_text() == "**重要** 和 __次要__"
+
+
+def test_renderer_sanitizes_protocol_and_raw_tool_call_tags():
+    renderer = TurnRenderer()
+
+    renderer.consume("assistant_delta", {"text": "[Advisor consultation #1] [Advisor review]\n"})
+    renderer.consume("assistant_delta", {"text": "<tool_call id=\"call_123\" name=\"edit_file\"> {\"file_path\": \"test.py\"} </tool_call>\n"})
+    renderer.consume("assistant_delta", {"text": "修改已完成。"})
+
+    finish_output = renderer.finish()
+    assert "[Advisor" not in finish_output
+    assert "<tool_call" not in finish_output
+    assert "修改已完成。" in finish_output

@@ -40,13 +40,17 @@ def parse_user_input(text):
     abs_matches = re.finditer(r'(?:[\'"]?)([a-zA-Z]:[\\/][^\s\'"]+)(?:[\'"]?)', text)
     for m in abs_matches:
         candidate = m.group(1)
-        # 从右往左缩小范围，解决用户紧贴着路径敲字（无空格）导致识别失败的问题
-        while candidate:
-            if os.path.exists(candidate) and os.path.isfile(candidate):
-                extracted_files.append(candidate)
+        # 只接受原始候选路径精确匹配到真实文件的情况；
+        # 不再逐字符截断缩短，避免误匹配无关文件并将其注入对话上下文。
+        # 若路径末尾紧贴标点（如逗号、句号），先尝试去掉最后一个字符。
+        if os.path.exists(candidate) and os.path.isfile(candidate):
+            extracted_files.append(candidate)
+            text = text.replace(candidate, "", 1).strip()
+        elif len(candidate) > 1:
+            trimmed = candidate[:-1]
+            if os.path.exists(trimmed) and os.path.isfile(trimmed):
+                extracted_files.append(trimmed)
                 text = text.replace(candidate, "", 1).strip()
-                break
-            candidate = candidate[:-1]
 
     # 保序去重
     extracted_files = list(dict.fromkeys(extracted_files))

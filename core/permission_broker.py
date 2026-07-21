@@ -158,6 +158,10 @@ class PermissionBroker:
         return len(cancelled)
 
     def _show_next(self, request: PermissionRequest | None) -> None:
+        # 注意：此方法可能由后台 worker 线程通过 resolve()/cancel_turn() 间接调用。
+        # _activate_prompt 和 _dismiss_prompt 回调在注册时必须已内部使用
+        # schedule_ui / app_instance.loop.call_soon_threadsafe 跳回 UI 主线程，
+        # 绝不能在回调内直接操作 prompt_toolkit 的 UI 状态。
         if request is None:
             self._dismiss_prompt()
         else:

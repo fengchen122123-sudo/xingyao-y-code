@@ -47,3 +47,9 @@ mcp.json
 # OS
 .DS_Store
 Thumbs.db
+
+# Scratch and temporary files
+scratch_*
+generate_interview_pdf*.py
+zip/
+*.pdf

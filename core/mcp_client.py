@@ -78,9 +78,18 @@ class MCPManager:
             future.result(timeout=CONNECT_TIMEOUT)
         except Exception as e:
             # 连接失败/超时后重置标记，允许下次调用重新发起连接，
-            # 避免一次失败导致 MCP 永久失效且每次调用反复阻塞等待超时
+            # 避免一次失败导致 MCP 永久失效且每次调用反复阻塞等待超时。
+            # 注意：future.cancel() 只能阻止尚未启动的协程任务；
+            # 若协程已挂在 session.initialize()，还需向事件循环投递取消信号。
             try:
                 future.cancel()
+            except Exception:
+                pass
+            # 尝试取消事件循环中可能残留的冻结协程，减少僵尸协程积累
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    self._cancel_pending_connections(), self.loop
+                )
             except Exception:
                 pass
             with self._connect_lock:
@@ -141,6 +150,19 @@ class MCPManager:
             except Exception:
                 pass
             _emit_status(f"\n[MCP] 连接服务 {name} 失败: {e}")
+
+    async def _cancel_pending_connections(self) -> None:
+        """尝试取消当前事件循环中所有与 MCP 连接相关的挂起任务。
+        当连接超时时调用，减少僵尸协程在事件循环中积累。"""
+        try:
+            for task in asyncio.all_tasks():
+                if task.done():
+                    continue
+                coro_name = getattr(task.get_coro(), "__name__", "")
+                if coro_name in ("_connect_all", "_connect_server"):
+                    task.cancel()
+        except Exception:
+            pass
 
     async def _connect_all(self):
         servers = self.config.get("mcpServers", {})

@@ -240,7 +240,9 @@ def write_file(file_path, content):
         with os.fdopen(fd, 'w', encoding='utf-8') as f:
             f.write(content)
         os.replace(temp_name, resolved)
-    except OSError:
+    except BaseException:
+        # 使用 BaseException 确保 KeyboardInterrupt、MemoryError 等非 OSError 异常
+        # 同样能触发临时文件清理，避免孤儿 .ycode-tmp 文件在磁盘积累。
         try:
             os.unlink(temp_name)
         except OSError:
@@ -318,7 +320,7 @@ def find_missing_skill_dependencies(command):
                 missing.append(str(requirement))
     return sorted(set(missing))
 
-def execute_command(command, run_in_background=False, timeout_seconds=30):
+def execute_command(command, run_in_background=False, timeout_seconds=30, cancel_event=None):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
     try:
         timeout_seconds = int(timeout_seconds)
@@ -365,12 +367,22 @@ def execute_command(command, run_in_background=False, timeout_seconds=30):
             text=False,
             env=env,
         )
-        try:
-            stdout_raw, stderr_raw = process.communicate(timeout=timeout_seconds)
-        except subprocess.TimeoutExpired:
-            _stop_process_tree(process)
-            process.communicate()
-            return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
+        start_time = time.time()
+        stdout_raw = b""
+        stderr_raw = b""
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                _stop_process_tree(process)
+                process.communicate()
+                return "🛑 命令已被用户强行中断终止。"
+            try:
+                stdout_raw, stderr_raw = process.communicate(timeout=0.1)
+                break
+            except subprocess.TimeoutExpired:
+                if time.time() - start_time >= timeout_seconds:
+                    _stop_process_tree(process)
+                    process.communicate()
+                    return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
 
         output = decode_process_output(stdout_raw, output_encoding)
         if stderr_raw:

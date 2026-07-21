@@ -41,6 +41,18 @@ def _safe_prefix_length(text: str, tags: Iterable[str]) -> int:
     return len(text)
 
 
+def sanitize_protocol_text(text: str) -> str:
+    """清理输出文本中的内部协议标记、Advisor 调试头及裸露的 XML <tool_call> 标签。"""
+    if not text or not isinstance(text, str):
+        return text
+    text = re.sub(r'<tool_call[^>]*>.*?</tool_call>', '', text, flags=re.DOTALL)
+    text = re.sub(r'</?tool_call[^>]*>', '', text)
+    text = re.sub(r'\[Advisor consultation[^\]]*\]', '', text)
+    text = re.sub(r'\[Advisor review\]', '', text)
+    text = re.sub(r'\[End of advisor consultation[^\]]*\]', '', text)
+    return text
+
+
 class TurnRenderer:
     """Accumulate assistant text and tool status lines without doing I/O."""
 
@@ -132,16 +144,19 @@ class TurnRenderer:
             self._in_thinking = True
 
     def _append_text(self, text: str) -> None:
-        self._assistant_text_parts.append(text)
-        if not self._suppress_assistant_emit and text:
-            self._emitted.append(text)
-        if not self._is_meaningful_text(text):
+        clean_text = sanitize_protocol_text(text)
+        if not clean_text:
+            return
+        self._assistant_text_parts.append(clean_text)
+        if not self._suppress_assistant_emit and clean_text:
+            self._emitted.append(clean_text)
+        if not self._is_meaningful_text(clean_text):
             return
         self._has_meaningful_assistant_text = True
         if self._records and not self._records[-1].endswith("\n"):
-            self._records[-1] += text
+            self._records[-1] += clean_text
         else:
-            self._records.append(text)
+            self._records.append(clean_text)
 
     @staticmethod
     def _is_meaningful_text(text: str) -> bool:

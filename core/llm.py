@@ -1387,6 +1387,9 @@ def _execute_single_tool_call(
                     function_name, arguments.get("dir_path", "."), event_callback,
                     permission_owner, parent_turn_id, permission_source, cancel_event,
                 )
+            if function_name in ("execute_command", "search_code") and cancel_event is not None:
+                arguments["cancel_event"] = cancel_event
+
             if sandbox_err:
                 result = sandbox_err
             elif bypass_cm:
@@ -1721,6 +1724,8 @@ def _chat_with_model_generator(
                     session_token_usage["cumulative_cached"] += latest_cached
 
             reasoning_content, public_content = split_reasoning_text(accumulated_content)
+            from core.turn_renderer import sanitize_protocol_text
+            public_content = sanitize_protocol_text(public_content)
 
             # 只允许公开正文写入记忆，避免把原生推理误当作长期事实。
             memory_tags = mk.extract_memory_tags(public_content)

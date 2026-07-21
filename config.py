@@ -36,6 +36,7 @@ def _atomic_write_json(path, data, indent=2):
             os.fsync(f.fileno())
         _backup_if_valid(path)
         os.replace(tmp_path, path)
+        _CONFIG_CACHE["data"] = None
     finally:
         # os.replace 在 Windows 上目标文件被占用时会 PermissionError，
         # 异常路径必须清理临时文件，避免 *.tmp 泄漏堆积
@@ -46,11 +47,20 @@ def _atomic_write_json(path, data, indent=2):
             pass
 
 
+_CONFIG_CACHE = {"mtime": 0, "data": None}
+
+
 def _read_json_with_backup(path, default=None):
-    """读取 JSON；主文件损坏时先尝试从 .bak 备份恢复，而不是直接丢弃用户配置。"""
+    """读取 JSON；使用 mtime 缓存，仅在磁盘文件真正改变时才重新读取磁盘，极大提升多窗口/高频刷新性能。"""
     try:
+        current_mtime = os.path.getmtime(path)
+        if _CONFIG_CACHE["data"] is not None and _CONFIG_CACHE["mtime"] == current_mtime:
+            return _CONFIG_CACHE["data"]
         with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+            _CONFIG_CACHE["mtime"] = current_mtime
+            _CONFIG_CACHE["data"] = data
+            return data
     except FileNotFoundError:
         return default
     except (json.JSONDecodeError, OSError):
@@ -154,13 +164,27 @@ def _resolve_constant(name):
     data = _load()
 
     if name == "MY_MODEL":
-        return (info or {}).get("litellm_model") or data.get("model", "deepseek/deepseek-chat")
+        if info:
+            return info.get("litellm_model", "")
+        if "providers" not in data:
+            return data.get("model", "deepseek/deepseek-chat")
+        return ""
     if name == "MY_KEY":
-        return (info or {}).get("api_key") or data.get("api_key", "")
+        if info:
+            return info.get("api_key", "")
+        if "providers" not in data:
+            return data.get("api_key", "")
+        return ""
     if name == "MY_BASE_URL":
-        return (info or {}).get("base_url") or data.get("base_url", "https://api.deepseek.com")
+        if info:
+            return info.get("base_url", "")
+        if "providers" not in data:
+            return data.get("base_url", "https://api.deepseek.com")
+        return ""
     if name == "MY_CONTEXT_WINDOW":
-        return (info or {}).get("context_window", 1000000)
+        if info:
+            return info.get("context_window", 128000)
+        return 128000
     if name == "MY_THEME":
         return data.get("theme", "cyan")
     if name == "MY_PERMISSION_MODE":

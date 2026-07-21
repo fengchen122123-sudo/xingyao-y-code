@@ -155,11 +155,12 @@ def clear_checkpoints(session_name):
 
 class MemoryManager:
     def __init__(self, db_path="ycode.db"):
-        # 1. 连接数据库（check_same_thread=False 允许多线程访问）
-        self.conn = sqlite3.connect(db_path, check_same_thread=False)
-        # 2. 启用 WAL 模式，提升多线程并发读写性能，防止数据库锁死
+        # 1. 连接数据库（check_same_thread=False 允许多线程访问，timeout=30.0 防止多窗口并发挂起）
+        self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
+        # 2. 启用 WAL 模式与 busy_timeout，提升多进程多窗口并发读写性能，彻底解决锁死卡顿
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")
         # 3. 读写序列化锁（可重入，允许方法间互调），防止多线程共享单连接游标并发竞态
         self._lock = threading.RLock()
         # 4. 新建会话的归属工作目录（默认取启动时的 cwd，可用 set_workdir 修改）
@@ -179,70 +180,78 @@ class MemoryManager:
         with self._lock:
             cursor = self.conn.cursor()
 
-            # 兼容性恢复：检测并丢弃与当前版本不兼容的遗留 sessions 表。
-            # 当 ~/.ycode/ycode.db 由更旧的星瑶版本创建、缺少核心 session_name
-            # 列时，CREATE TABLE IF NOT EXISTS 不会重建它，SQLite 也无法通过
-            # ALTER ADD COLUMN 添加带 UNIQUE 约束的列，从而导致首次运行就崩在
-            # get_history 的 "no such column: session_name"。该遗留库无
-            # session_name 标识符、其消息均为孤儿，本身已无法使用，因此直接清表
-            # 重建是最稳的恢复（同时记一条 runtime-warnings 日志便于事后追溯）。
-            cursor.execute(
-                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
-            )
-            if cursor.fetchone() is not None:
+            try:
+                # 兼容性恢复：检测并丢弃与当前版本不兼容的遗留 sessions 表。
+                # 当 ~/.ycode/ycode.db 由更旧的星瑶版本创建、缺少核心 session_name
+                # 列时，CREATE TABLE IF NOT EXISTS 不会重建它，SQLite 也无法通过
+                # ALTER ADD COLUMN 添加带 UNIQUE 约束的列，从而导致首次运行就崩在
+                # get_history 的 "no such column: session_name"。该遗留库无
+                # session_name 标识符、其消息均为孤儿，本身已无法使用，因此直接清表
+                # 重建是最稳的恢复（同时记一条 runtime-warnings 日志便于事后追溯）。
+                cursor.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sessions'"
+                )
+                if cursor.fetchone() is not None:
+                    cursor.execute("PRAGMA table_info(sessions)")
+                    existing_columns = {col[1] for col in cursor.fetchall()}
+                    if "session_name" not in existing_columns:
+                        try:
+                            logging.getLogger("py.warnings").warning(
+                                "Detected legacy ycode.db with incompatible sessions schema "
+                                "(missing session_name). Recreating tables; legacy data is unrecoverable."
+                            )
+                        except Exception:
+                            pass
+                        cursor.execute("DROP TABLE IF EXISTS sessions")
+                        cursor.execute("DROP TABLE IF EXISTS messages")
+
+                # 创建一个叫 sessions 的表，加入摘要字段
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS sessions (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_name TEXT UNIQUE,
+                        memory_summary TEXT,
+                        summarized_until_msg_id INTEGER
+                    )
+                ''')
+
+                # 兼容性升级逻辑：如果旧表已经存在但缺少字段，动态添加
                 cursor.execute("PRAGMA table_info(sessions)")
-                existing_columns = {col[1] for col in cursor.fetchall()}
-                if "session_name" not in existing_columns:
-                    try:
-                        logging.getLogger("py.warnings").warning(
-                            "Detected legacy ycode.db with incompatible sessions schema "
-                            "(missing session_name). Recreating tables; legacy data is unrecoverable."
-                        )
-                    except Exception:
-                        pass
-                    cursor.execute("DROP TABLE IF EXISTS sessions")
-                    cursor.execute("DROP TABLE IF EXISTS messages")
+                columns = [col[1] for col in cursor.fetchall()]
+                if "memory_summary" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN memory_summary TEXT")
+                if "summarized_until_msg_id" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN summarized_until_msg_id INTEGER")
+                # 会话归属工作目录与时间戳（按目录隔离会话列表，NULL 表示历史遗留的全局会话）
+                if "workdir" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN workdir TEXT")
+                if "created_at" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN created_at TEXT")
+                if "updated_at" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
 
-            # 创建一个叫 sessions 的表，加入摘要字段
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS sessions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_name TEXT UNIQUE,
-                    memory_summary TEXT,
-                    summarized_until_msg_id INTEGER
-                )
-            ''')
-
-            # 兼容性升级逻辑：如果旧表已经存在但缺少字段，动态添加
-            cursor.execute("PRAGMA table_info(sessions)")
-            columns = [col[1] for col in cursor.fetchall()]
-            if "memory_summary" not in columns:
-                cursor.execute("ALTER TABLE sessions ADD COLUMN memory_summary TEXT")
-            if "summarized_until_msg_id" not in columns:
-                cursor.execute("ALTER TABLE sessions ADD COLUMN summarized_until_msg_id INTEGER")
-            # 会话归属工作目录与时间戳（按目录隔离会话列表，NULL 表示历史遗留的全局会话）
-            if "workdir" not in columns:
-                cursor.execute("ALTER TABLE sessions ADD COLUMN workdir TEXT")
-            if "created_at" not in columns:
-                cursor.execute("ALTER TABLE sessions ADD COLUMN created_at TEXT")
-            if "updated_at" not in columns:
-                cursor.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
-
-            # 创建一个叫 messages 的表
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS messages (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    session_id INTEGER,
-                    role TEXT,
-                    content TEXT
-                )
-            ''')
-            # 保存修改
-            self.conn.commit()
+                # 创建一个叫 messages 的表
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_id INTEGER,
+                        role TEXT,
+                        content TEXT
+                    )
+                ''')
+                # 保存修改
+                self.conn.commit()
+            except Exception:
+                # DDL 失败时回滚，避免遗留未提交事务阻塞后续写操作
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                raise
 
     def checkpoint_wal(self):
         """主动执行 WAL checkpoint，整理被写的预写日志，防止 ycode.db-wal 文件体积无限膨胀。"""
-        with self.lock:
+        with self._lock:
             try:
                 self.conn.execute("PRAGMA wal_checkpoint(PASSIVE);")
             except Exception as e:
@@ -253,7 +262,7 @@ class MemoryManager:
 
     def close(self):
         """关闭数据库连接前自动刷盘 WAL 日志。"""
-        with self.lock:
+        with self._lock:
             if hasattr(self, "conn") and self.conn:
                 try:
                     self.checkpoint_wal()
@@ -587,7 +596,7 @@ class MemoryManager:
 
             if updates:
                 cursor.executemany('UPDATE messages SET content = ? WHERE id = ?', updates)
-            self.conn.commit()
+                self.conn.commit()
 
 
 # Backward-compatible public name used by the original test and extension API.

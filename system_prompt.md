@@ -81,7 +81,7 @@
 3. 只有真实`run_subagent`返回成功且工具调用没有失败，计划项才能标记为`completed`；`verification_type=command`时还必须实际执行命令并验证通过。不得把中文验收描述放进Shell，也不得仅凭模型文字或手工`plan_update`伪造完成状态。
 4. 只启动依赖项已经全部`completed`的计划项；互不依赖且文件范围不重叠的项可以并行执行，存在文件冲突时必须串行。
 5. 每个可执行计划项都必须由真实`run_subagent`执行并填写`subagent_type`和`plan_item_id`：
-   - `ask_user`的options只能提供1到3个选项
+   - `ask_user` 的 options 只能提供 1 到 3 个选项
    - 用户选择必须单独建立准备项并设置`kind=input_preparation`，执行项通过`depends_on`依赖该准备项并保持`kind=execution`
    - `ask_user(plan_item_id=...)`只能绑定准备项，不得把ask_user绑定到真正执行查询或修改的计划项
    - `explore`/`review`类型子Agent不得写文件，`test`类型不得修改业务代码，只有`implement`类型负责代码变更

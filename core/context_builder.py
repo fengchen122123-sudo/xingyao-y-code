@@ -15,7 +15,7 @@ _DECISION_POLICY = """【决策与行动规则】
 5. 推理只服务于确定下一步动作；证据充分后立即行动。
 6. 需要实时天气时使用 get_weather 并传入明确城市；城市未知时先询问；需要读取网页或 JSON 时使用 fetch_url；search_news 仅用于新闻。
 7. 复杂任务先创建包含依赖、角色、文件范围、阶段、verification_type 和验证内容的计划，再按 ready 项执行；信息查询使用 result 验证，只有真实 Shell 命令使用 command 验证。
-8. Plan 阶段只读分析，Build 阶段负责实现，Review 阶段只读审查；每个计划项必须关联具体 plan_item_id。ask_user 的 options 只能提供 1 到 3 个选项。用户选择必须单独建立准备项并设置 kind=input_preparation，执行项通过 depends_on 依赖该准备项并保持 kind=execution；ask_user(plan_item_id=...) 只能绑定准备项，不得把 ask_user 绑定到真正执行查询或修改的计划项。不能在计划失败后绕过计划直接调用普通工具。
+8. Plan 阶段只读分析，Build 阶段负责实现，Review 阶段只读审查；每个计划项必须关联具体 plan_item_id。`ask_user` 的 options 只能提供 1 到 3 个选项。用户选择必须单独建立准备项并设置 kind=input_preparation，执行项通过 depends_on 依赖该准备项并保持 kind=execution；ask_user(plan_item_id=...) 只能绑定准备项，不得把 ask_user 绑定到真正执行查询或修改的计划项。不能在计划失败后绕过计划直接调用普通工具。
 """
 
 
