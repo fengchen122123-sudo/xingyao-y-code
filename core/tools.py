@@ -1560,6 +1560,9 @@ class SubagentManager:
         # 进入子代理深度作用域：在此作用域内 _get_current_subagent_depth() 返回新深度
         # 该深度会被 run_subagent 入口的硬限制检查读取，防止子代理内嵌套创建子代理
         with _subagent_depth_scope():
+            # 子代理执行具体计划项时，不应继承父会话的计划锁约束；
+            # 否则子代理会被剥夺 write_file/edit_file/execute_command 等必要工具，
+            # 导致只能只读探索而无法完成实现/测试任务，最终超时失败。
             events = chat_with_model_events(
                 current_model,
                 current_key,
@@ -1571,8 +1574,8 @@ class SubagentManager:
                 allow_subagents=False,
                 allowed_tools=allowed_tools,
                 consume_background_notifications=False,
-                parent_session=task.parent_session,
-                parent_turn_id=task.parent_turn_id,
+                parent_session=None,
+                parent_turn_id=None,
                 permission_owner=task.task_id,
                 permission_source=f"子代理：{task.description[:40]}",
             )
@@ -1684,10 +1687,23 @@ def run_subagent(
             owner=owner,
             event_callback=event_callback,
         ):
+            # 构造详细的失败原因，帮助 LLM 诊断
+            actual_status = plan_item.get("status", "unknown") if plan_item else "不存在"
+            reason_parts = [f"计划项 '{plan_item_id}' 当前状态为 '{actual_status}'"]
+            if plan_item and actual_status in {"failed", "blocked", "cancelled"}:
+                reason_parts.append("（需先用 plan_retry(item_id='{0}') 重置为 pending 后重试）".format(plan_item_id))
+            if plan_item:
+                deps = plan_item.get("depends_on", [])
+                if deps:
+                    dep_statuses = []
+                    for dep_id in deps:
+                        dep_item = next((i for i in scheduler.plan.snapshot() if i["id"] == dep_id), None)
+                        dep_statuses.append(f"'{dep_id}'({dep_item['status'] if dep_item else '不存在'})")
+                    reason_parts.append(f"依赖项状态: {', '.join(dep_statuses)}")
             return json.dumps({
                 "status": "blocked",
                 "plan_item_id": str(plan_item_id),
-                "error": "计划项尚未满足依赖、已暂停或已有冲突任务在执行。",
+                "error": "计划项尚未满足依赖、已暂停或已有冲突任务在执行。" + " ".join(reason_parts),
             }, ensure_ascii=False)
 
     def terminal_callback(task, status, result, error):
@@ -1702,7 +1718,14 @@ def run_subagent(
                         "live_only": True,
                     })
                 return None
-            return "计划项验证失败，未勾选完成"
+            item = next((x for x in scheduler.plan.snapshot() if x["id"] == item_id), None)
+            if item is None:
+                return f"计划项 {item_id} 不存在，无法验证完成。"
+            if item.get("status") != "in_progress":
+                return f"计划项 {item_id} 当前状态为 {item.get('status')}，不是 in_progress，无法验证完成。"
+            if item.get("verification_type") == "command":
+                return f"计划项验证失败（command）：{item.get('error', '未知验证错误')}"
+            return f"计划项验证失败：{item.get('error', '未知错误')}"
         if status == "cancelled":
             scheduler.cancel(item_id, error or "子代理已取消")
         else:
