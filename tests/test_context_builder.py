@@ -115,9 +115,13 @@ def test_default_prompt_defines_http_and_weather_tool_selection():
     assert "`search_news`仅用于新闻" in prompt
 
 
-def test_source_and_package_versions_are_1_0_27():
+def test_source_and_package_versions_match():
+    import re
+
     main_source = Path("main.py").read_text(encoding="utf-8")
     setup_source = Path("setup.py").read_text(encoding="utf-8")
 
-    assert '"v1.0.27"' in main_source
-    assert "version='1.0.27'" in setup_source
+    main_version = re.search(r'"v(\d+\.\d+\.\d+)"', main_source).group(1)
+    setup_version = re.search(r"version='(\d+\.\d+\.\d+)'", setup_source).group(1)
+    # main.py 与 setup.py 的版本号必须保持一致（历史上曾出现 1.0.29/1.0.28 漂移）
+    assert main_version == setup_version

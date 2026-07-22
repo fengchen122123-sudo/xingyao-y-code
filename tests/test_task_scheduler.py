@@ -400,3 +400,44 @@ def test_session_switch_does_not_cancel_new_session_items():
     bind_default_plan_session(previous_session)
     scheduler_module._DEFAULT_SCHEDULER = None
     scheduler_module._DEFAULT_SCHEDULER_SESSION = None
+
+
+def test_verification_runs_in_process_cwd_not_item_file_dir(tmp_path, monkeypatch):
+    """回归：验证命令必须与 execute_command 一样在项目工作目录执行，
+    不得根据计划项 files 把 cwd 偷换成文件所在目录（否则模型按项目根
+    目录写的 `cd subdir && ...` 会永远报"系统找不到指定的路径"）。"""
+    subdir = tmp_path / "subdir"
+    subdir.mkdir()
+    target = subdir / "tool.py"
+    target.write_text("print('x')", encoding="utf-8")
+
+    captured = {}
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return b"ok", b""
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return FakeProcess()
+
+    monkeypatch.setattr("core.task_scheduler.subprocess.Popen", fake_popen)
+    plan = PlanManager()
+    plan.replace([{
+        "id": "impl",
+        "subject": "实现工具",
+        "files": [str(target)],
+        "verification_type": "command",
+        "verification": "cd subdir && python tool.py",
+    }])
+    scheduler = TaskScheduler(plan)
+
+    assert scheduler.start_item("impl") is True
+    assert scheduler.complete("impl", "结果") is True
+    assert captured.get("cwd") is None
+    assert plan.snapshot()[0]["status"] == "completed"

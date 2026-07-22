@@ -409,6 +409,11 @@ def execute_command(command, run_in_background=False, timeout_seconds=30, cancel
             stderr = decode_process_output(stderr_raw, output_encoding)
             output += f"\n[附加信息/警告]:\n{stderr}"
 
+        # 必须如实汇报退出码：此前非零退出但只要无输出就返回"执行成功"，
+        # 调用方（尤其子代理）无法区分成败，会把失败命令当成通过。
+        if process.returncode:
+            detail = output.strip() or "（命令没有任何输出）"
+            return f"🚨 命令执行失败（退出码 {process.returncode}）。\n{detail}"
         return output or "执行成功，但命令没有返回任何输出内容。"
 
     except Exception as e:
@@ -1006,6 +1011,23 @@ def _has_meaningful_subagent_result(text: str) -> bool:
     return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
 
 
+_ADVISOR_TAG_RE = re.compile(
+    r"\[(?:Advisor consultation[^\]]*|Advisor review|End of advisor consultation[^\]]*)\]"
+)
+
+
+def _strip_advisor_tags(text: str) -> str:
+    """剔除模型泄漏到正文里的 Advisor 内部协议标记，避免污染子代理结果与计划回写。"""
+    return _ADVISOR_TAG_RE.sub("", text or "").strip()
+
+
+_SUBAGENT_TIMEOUT_HINT = (
+    "（子代理可能已产出部分结果，例如文件已写入；"
+    "请先用 read_file/list_directory 确认工作成果，再决定 plan_retry 重试或调整任务，"
+    "避免重复执行已完成的工作）"
+)
+
+
 @dataclass(frozen=True)
 class SubagentStage:
     name: str
@@ -1112,7 +1134,7 @@ class SubagentManager:
         parent_turn_id: str,
         *,
         run_in_background: bool = False,
-        timeout_seconds: int = 120,
+        timeout_seconds: int = 600,
         parent_cancel_event: threading.Event | None = None,
         subagent_type: str = "general",
         plan_item_id: str = "",
@@ -1201,7 +1223,11 @@ class SubagentManager:
                         )
                 execution_elapsed = task.execution_elapsed
             if execution_elapsed >= timeout_seconds:
-                self._terminate(task.task_id, "timed_out", "foreground timeout")
+                self._terminate(
+                    task.task_id,
+                    "timed_out",
+                    "foreground timeout" + _SUBAGENT_TIMEOUT_HINT,
+                )
                 break
 
         return self._foreground_result(task.task_id)
@@ -1232,7 +1258,11 @@ class SubagentManager:
                     task.execution_elapsed += elapsed
                 execution_elapsed = task.execution_elapsed
             if execution_elapsed >= timeout_seconds:
-                self._terminate(task.task_id, "timed_out", "background timeout")
+                self._terminate(
+                    task.task_id,
+                    "timed_out",
+                    "background timeout" + _SUBAGENT_TIMEOUT_HINT,
+                )
                 return
 
     def _run_task(self, task: SubagentTask) -> None:
@@ -1244,7 +1274,7 @@ class SubagentManager:
             self._record_stage_locked(task, "running")
 
         try:
-            result = str(self._runner(task) or "").strip()
+            result = _strip_advisor_tags(str(self._runner(task) or "").strip())
         except BaseException as error:
             if task.cancel_event.is_set():
                 self._terminate(task.task_id, "cancelled", "task cancelled")
@@ -1549,6 +1579,8 @@ class SubagentManager:
                     f"{role_instructions[role]}"
                     "你只执行主 Agent 已分配的单一子任务，不得拆解、创建或修改主任务计划；"
                     "如实使用可用工具；结束时只输出供主 Agent 汇总的公开结论。"
+                    "所有输出必须使用中文，包括过程说明与最终结论；"
+                    "不要输出 [Advisor consultation] 等内部协议标记。"
                 ),
             },
             {
@@ -1617,7 +1649,7 @@ subagent_manager = SubagentManager()
 def run_subagent(
     task_description,
     run_in_background=False,
-    timeout_seconds=120,
+    timeout_seconds=600,
     parent_session=None,
     parent_turn_id=None,
     parent_cancel_event=None,
@@ -1721,11 +1753,17 @@ def run_subagent(
             item = next((x for x in scheduler.plan.snapshot() if x["id"] == item_id), None)
             if item is None:
                 return f"计划项 {item_id} 不存在，无法验证完成。"
+            # 优先透传真实失败原因（如验证命令的 stderr）。complete() 验证失败时已把
+            # 计划项标记为 failed 并写入 error，若先判断状态只会得到"不是 in_progress"
+            # 的误导信息，主 Agent 看不到根因就会陷入 retry 死循环。
+            item_error = str(item.get("error") or "").strip()
+            if item_error:
+                if item.get("verification_type") == "command":
+                    return f"计划项验证失败（command）：{item_error}"
+                return f"计划项验证失败：{item_error}"
             if item.get("status") != "in_progress":
                 return f"计划项 {item_id} 当前状态为 {item.get('status')}，不是 in_progress，无法验证完成。"
-            if item.get("verification_type") == "command":
-                return f"计划项验证失败（command）：{item.get('error', '未知验证错误')}"
-            return f"计划项验证失败：{item.get('error', '未知错误')}"
+            return f"计划项 {item_id} 完成回写失败，请通过 plan_read 查看状态后重试。"
         if status == "cancelled":
             scheduler.cancel(item_id, error or "子代理已取消")
         else:

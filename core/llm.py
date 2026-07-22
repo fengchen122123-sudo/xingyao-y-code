@@ -1266,26 +1266,46 @@ def _execute_single_tool_call(
             # 只读工具允许主 Agent 直接使用，便于验证子代理产出和读取上下文
             pass
         elif function_name not in _PLAN_ROOT_CONTROL_TOOLS:
-            # 构造可执行计划项列表，引导 LLM 使用正确的 plan_item_id
             from core.plan import get_default_plan_manager as _get_plan
-            ready_items = _get_plan().ready_items()
-            ready_hints = ""
-            if ready_items:
-                execution_items = [item for item in ready_items if item.get("kind") != "input_preparation"]
-                if execution_items:
+            _plan = _get_plan()
+            ready_items = _plan.ready_items()
+            ready_execution = [
+                item for item in ready_items if item.get("kind") != "input_preparation"
+            ]
+            snapshot = _plan.snapshot()
+            in_progress = any(
+                item.get("status") == "in_progress" for item in snapshot
+            )
+            # 计划停滞且重试耗尽（剩余项全部 failed/blocked/cancelled 且均尝试>=2 次）时，
+            # 放开主 Agent 直接调用作为兜底出口，避免子代理连续失败后主 Agent
+            # 被逼入只能空转或等待用户介入的死局；首次失败仍必须走 run_subagent。
+            stalled_items = [
+                item for item in snapshot
+                if item.get("status") in {"failed", "blocked", "cancelled"}
+            ]
+            retry_exhausted = bool(stalled_items) and all(
+                int(item.get("attempts", 0)) >= 2 for item in stalled_items
+            )
+            if not ready_execution and not in_progress and retry_exhausted:
+                pass
+            else:
+                # 构造可执行计划项列表，引导 LLM 使用正确的 plan_item_id
+                ready_hints = ""
+                if ready_execution:
                     hints = ", ".join(
-                        f"'{item['id']}'({item['subject']})" for item in execution_items[:5]
+                        f"'{item['id']}'({item['subject']})" for item in ready_execution[:5]
                     )
                     ready_hints = f" 当前可执行的计划项: [{hints}]。"
-            return {
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": function_name,
-                "content": (
-                    f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} 必须通过 "
-                    f"run_subagent(plan_item_id=...) 执行，不能由主 Agent 直接绕过计划调用。{ready_hints}"
-                ),
-            }
+                return {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": function_name,
+                    "content": (
+                        f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} 必须通过 "
+                        f"run_subagent(plan_item_id=...) 执行，不能由主 Agent 直接绕过计划调用。{ready_hints}"
+                        "（若计划项多次失败（attempts>=2）全部停滞后，主 Agent 可直接调用工具修复。）"
+                    ),
+                }
             
     # 生成友好的中文提示
     friendly_msg = f"⚙️ 星瑶正在后台悄悄使用工具: {function_name} 哒～"
@@ -1389,7 +1409,7 @@ def _execute_single_tool_call(
                     subagent_type=arguments.get("subagent_type", "general"),
                     plan_item_id=arguments.get("plan_item_id", ""),
                     run_in_background=arguments.get("run_in_background", False),
-                    timeout_seconds=arguments.get("timeout_seconds", 120),
+                    timeout_seconds=arguments.get("timeout_seconds", 600),
                     parent_session=parent_session,
                     parent_turn_id=parent_turn_id,
                     parent_cancel_event=cancel_event,
@@ -1565,6 +1585,19 @@ def _execute_single_tool_call(
             repl = arguments.get("replacement_content")
             # 修改权限已在上方统一确认（确认文案含文件路径），用户批准即视为允许该次沙盒外修改
             with sandbox_bypass():
+                if not os.path.isfile(file_path or ""):
+                    # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
+                    # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
+                    result = (
+                        f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
+                        "edit_file 只能修改已有文件；创建新文件请改用 write_file。"
+                    )
+                    return {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": function_name,
+                        "content": result,
+                    }
                 try:
                     old_content = _read_text_with_encoding_fallback(file_path)
                 except OSError as read_err:
