@@ -82,6 +82,8 @@ is_thinking = False
 task_status = 'idle'  # 全局运行状态：'idle' (闲置), 'thinking' (思考中), 'executing' (执行中), 'waiting' (等待确认)
 think_start_time = 0
 pending_action = None   # 待处理的主线程操作：目前可能的值有 "open_models" / "open_skills" / "open_sessions"
+# 计划项状态提示去重：避免同一个计划项反复失败/重试时刷屏
+_last_printed_plan_state: dict[str, str] = {}
 
 
 # 主题配色展示元数据（/theme list 与无参数帮助共用）
@@ -509,11 +511,24 @@ def _render_ui_event(event):
         if event.kind.startswith("plan_item_"):
             item = dict(event.payload.get("item") or {})
             subject = str(item.get("subject", "")).replace("\x1b", "").strip()
-            if subject:
+            item_id = str(item.get("id", "")).strip()
+            if subject and item_id:
+                # 同一个计划项的同一状态只打印一次，避免失败重试时刷屏
+                state_key = f"{item_id}:{event.kind}"
+                global _last_printed_plan_state
+                if _last_printed_plan_state.get(state_key) == subject:
+                    if app_instance is not None:
+                        app_instance.invalidate()
+                    return
+                _last_printed_plan_state[state_key] = subject
                 if event.kind == "plan_item_started":
                     _print_ui_fragment(f"\x1b[36m星瑶正在执行：{subject}\x1b[0m\n")
                 elif event.kind == "plan_item_completed":
                     _print_ui_fragment(f"\x1b[32m星瑶已完成：{subject} ✓\x1b[0m\n")
+                    # 完成后清理该计划项的历史状态缓存
+                    for key in list(_last_printed_plan_state.keys()):
+                        if key.startswith(f"{item_id}:"):
+                            del _last_printed_plan_state[key]
                 elif event.kind == "plan_item_failed":
                     _print_ui_fragment(f"\x1b[33m星瑶暂未完成：{subject}\x1b[0m\n")
                 elif event.kind == "plan_item_blocked":
@@ -1899,6 +1914,21 @@ def _background_worker():
             # 新一轮对话，重置计划模式授权状态
             plan_approved_this_turn = False
 
+            # 立即给 UI 反馈：消息已收到，正在准备请求。
+            # 后续构建 system prompt、读取历史、压缩记忆等步骤可能耗时数秒，
+            # 提前显示状态可显著降低用户感知的“首次响应延迟”。
+            def mark_turn_initializing():
+                global is_thinking, task_status, think_start_time, active_thinking_text
+                _clear_active_thinking()
+                active_thinking_text = "正在准备请求..."
+                is_thinking = True
+                task_status = "executing"
+                think_start_time = time.time()
+                if app_instance is not None:
+                    app_instance.invalidate()
+
+            schedule_ui(mark_turn_initializing)
+
             user_input = task_data["text"]
             was_queued = task_data["was_queued"]
             is_skill_call = task_data.get("is_skill_call", False)
@@ -2314,6 +2344,26 @@ def run_cli():
     # 启动后台处理线程
     worker_thread = threading.Thread(target=_background_worker, daemon=True)
     worker_thread.start()
+
+    # 后台预加载 litellm，避免首次 LLM 调用时才 import 产生 1-3 秒卡顿
+    def _preload_litellm():
+        try:
+            from core.llm import _get_litellm
+            _get_litellm()
+        except Exception as e:
+            logging.getLogger("py.warnings").warning("预加载 litellm 失败: %s", e)
+
+    threading.Thread(target=_preload_litellm, daemon=True).start()
+
+    # 后台启动 MCP 连接，让首次 LLM 请求不必同步等待 MCP server 就绪
+    def _preload_mcp():
+        try:
+            from core.mcp_client import mcp_manager
+            mcp_manager._ensure_connected()
+        except Exception as e:
+            logging.getLogger("py.warnings").warning("MCP 后台连接失败: %s", e)
+
+    threading.Thread(target=_preload_mcp, daemon=True).start()
 
     # 启动全局常驻 UI 刷新线程（用以维持思考计时器和星瑶运转状态微动画）
     def _ui_refresher_loop():

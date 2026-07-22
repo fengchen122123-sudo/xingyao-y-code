@@ -173,7 +173,11 @@ class MCPManager:
             await asyncio.gather(*tasks)
 
     def get_schemas(self):
-        self._ensure_connected()
+        """返回当前已就绪的 MCP 工具 schema，不阻塞等待连接完成。
+
+        启动时主流程会在后台线程调用 _ensure_connected() 启动 MCP 连接；
+        连接成功后 tool_schemas 会自动更新。首次 LLM 请求不再被 MCP 连接超时阻塞。
+        """
         return list(self.tool_schemas)
 
     async def _call_tool_async(self, tool_name, arguments):

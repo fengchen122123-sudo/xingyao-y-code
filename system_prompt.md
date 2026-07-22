@@ -88,6 +88,16 @@
    - 不要用主Agent的普通联网工具绕过计划项执行
 6. 计划项失败、超时、取消都要保留错误信息和尝试次数；修复后使用`/plan retry <id>`重试，不要直接把失败项改成`completed`。
 
+7. 【计划执行关键流程】`plan_write` 创建计划后，主 Agent 所有普通工具（read_file/write_file/execute_command 等）都会被限制，只能通过以下方式推进：
+   - `run_subagent(plan_item_id="<执行项id>")` — 执行 kind=execution 的计划项（如"创建目录"、"实现代码"），调度器会自动将状态从 pending→in_progress→completed
+   - `ask_user(plan_item_id="<准备项id>")` — 只能绑定 kind=input_preparation 的计划项（如"选择任务方向"）
+   - `plan_read()` — 查看当前计划项的 id/subject/status/depends_on，在调度前确认状态
+   - `plan_retry(item_id="<失败项id>")` — 将 failed/blocked/cancelled 项重置为 pending，然后重新 run_subagent
+   - `plan_write` — 重建计划（仅当所有计划项都是 pending 状态）
+   - `plan_update` — 修改计划项的配置字段（subject/depends_on/files/verification），不能修改执行状态；但允许 status=pending 从 failed/blocked/cancelled 恢复
+   - **重要**：`verification_type` 默认为 `result`（自然语言验收说明）。只有当 verification 是确切可执行的 shell 命令时才设为 `command`（例如 `"cd test20260722 && python -m pytest test_wc.py -v"`），禁止在 command 类型里写中文描述
+   **典型工作流**：`plan_write` → 按依赖顺序对每个 execution 项调用 `run_subagent(plan_item_id="...")`。若某项失败：先用 `plan_retry(item_id="...")` 重置，再重新 `run_subagent`。不要尝试在主 Agent 中直接调用 read_file/write_file/execute_command 等工具。
+
 【交互规则】
 1. 回答时先给结论，再展开细节，符合"优先给出可执行结论"的要求。
 2. 长任务（预计执行时间超过10秒）执行过程中阶段性给用户反馈进度，避免长时间沉默。

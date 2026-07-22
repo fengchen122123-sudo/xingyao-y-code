@@ -56,7 +56,7 @@ def build_default_registry() -> ToolRegistry:
     from core import tools
     from core import lsp as _lsp
     from core.ask_user import ask_user
-    from core.plan import plan_update, plan_write
+    from core.plan import plan_read, plan_retry, plan_update, plan_write
 
     read_specs = [
         ToolSpec(
@@ -242,6 +242,25 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_update,
             activity_description="更新计划项",
+        ),
+        ToolSpec(
+            name="plan_read",
+            description="读取当前计划状态，查看每个计划项的 id/subject/status/depends_on。用于在 plan_write/plan_update/run_subagent 之前检查计划状态。可选传 item_id 查看单条详情。",
+            input_schema=_schema({
+                "item_id": {"type": "string", "description": "可选，查看特定计划项的详情"},
+            }, []),
+            execute=plan_read,
+            read_only=True,
+            activity_description="查看计划状态",
+        ),
+        ToolSpec(
+            name="plan_retry",
+            description="将 failed/blocked/cancelled 状态的计划项重置为 pending，以便重新通过 run_subagent 执行。",
+            input_schema=_schema({
+                "item_id": {"type": "string", "description": "要重置的计划项 id"},
+            }, ["item_id"]),
+            execute=plan_retry,
+            activity_description="重试计划项",
         ),
         ToolSpec(
             name="write_file",

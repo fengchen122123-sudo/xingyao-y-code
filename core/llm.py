@@ -104,8 +104,21 @@ _PLAN_BYPASS_ERROR_PREFIX = "计划已创建：工具"
 _PLAN_ROOT_CONTROL_TOOLS = frozenset({
     "plan_write",
     "plan_update",
+    "plan_read",
+    "plan_retry",
     "run_subagent",
     "ask_user",
+})
+# 只读探索类工具在计划模式下仍允许主 Agent 直接使用，
+# 便于主 Agent 验证子代理产出、读取上下文，避免事事都开子代理导致超时循环。
+_PLAN_READ_ONLY_TOOLS = frozenset({
+    "read_file",
+    "list_directory",
+    "search_code",
+    "glob_files",
+    "fetch_url",
+    "search_news",
+    "get_weather",
 })
 _PLAN_BOUND_ORCHESTRATORS = frozenset({"run_subagent", "ask_user"})
 
@@ -1249,14 +1262,28 @@ def _execute_single_tool_call(
                     "必须填写 plan_item_id，不能执行未归属计划项的任务。"
                 ),
             }
-        if function_name not in _PLAN_ROOT_CONTROL_TOOLS:
+        if function_name in _PLAN_READ_ONLY_TOOLS:
+            # 只读工具允许主 Agent 直接使用，便于验证子代理产出和读取上下文
+            pass
+        elif function_name not in _PLAN_ROOT_CONTROL_TOOLS:
+            # 构造可执行计划项列表，引导 LLM 使用正确的 plan_item_id
+            from core.plan import get_default_plan_manager as _get_plan
+            ready_items = _get_plan().ready_items()
+            ready_hints = ""
+            if ready_items:
+                execution_items = [item for item in ready_items if item.get("kind") != "input_preparation"]
+                if execution_items:
+                    hints = ", ".join(
+                        f"'{item['id']}'({item['subject']})" for item in execution_items[:5]
+                    )
+                    ready_hints = f" 当前可执行的计划项: [{hints}]。"
             return {
                 "role": "tool",
                 "tool_call_id": tc["id"],
                 "name": function_name,
                 "content": (
                     f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} 必须通过 "
-                    "run_subagent(plan_item_id=...) 执行，不能由主 Agent 直接绕过计划调用。"
+                    f"run_subagent(plan_item_id=...) 执行，不能由主 Agent 直接绕过计划调用。{ready_hints}"
                 ),
             }
             
@@ -1395,16 +1422,25 @@ def _execute_single_tool_call(
                     ),
                     None,
                 )
+                # 收集可用的 input_preparation 项，用于错误提示
+                input_prep_items = [
+                    item for item in scheduler.plan.snapshot()
+                    if item.get("kind") == "input_preparation"
+                ]
+                prep_hints = ""
+                if input_prep_items:
+                    ids = ", ".join(f"'{item['id']}'({item['subject']})" for item in input_prep_items[:5])
+                    prep_hints = f" 当前 plan 中的 input_preparation 项: [{ids}]。"
                 if plan_item is None:
                     result = json.dumps({
                         "status": "blocked",
                         "plan_item_id": plan_item_id,
-                        "error": "用户输入准备项不存在。",
+                        "error": f"用户输入准备项 '{plan_item_id}' 不存在。{prep_hints}",
                     }, ensure_ascii=False)
                 elif plan_item.get("kind") != "input_preparation":
                     result = (
-                        "无法提问：plan_item_id 必须指向 "
-                        "kind=input_preparation 的用户输入准备项。"
+                        f"无法提问：plan_item_id='{plan_item_id}' 的 kind 是 "
+                        f"'{plan_item.get('kind', 'unknown')}'，不是 input_preparation。{prep_hints}"
                     )
                 elif not scheduler.start_item(
                     plan_item_id,
@@ -1492,6 +1528,8 @@ def _execute_single_tool_call(
             "glob_files",
             "plan_write",
             "plan_update",
+            "plan_read",
+            "plan_retry",
         }:
             # 只读目录类工具在沙盒外访问时需用户确认（同意本次/始终放行会话）
             bypass_cm, sandbox_err = None, None
@@ -1629,12 +1667,15 @@ def _chat_with_model_generator(
             messages.append({"role": "user", "content": notif})
 
     active_plan = allow_subagents and _has_pending_plan(parent_session)
+    # 计划模式下仍向 LLM 暴露计划控制工具和只读探索工具，
+    # 让主 Agent 既能推进计划，也能直接读取上下文验证子代理产出。
+    _PLAN_AVAILABLE_TOOLS = _PLAN_ROOT_CONTROL_TOOLS | _PLAN_READ_ONLY_TOOLS
     request_tools = [
         schema
         for schema in get_tools_schema()
         if (
             not active_plan
-            or schema.get("function", {}).get("name") in _PLAN_ROOT_CONTROL_TOOLS
+            or schema.get("function", {}).get("name") in _PLAN_AVAILABLE_TOOLS
         )
         if allow_subagents
         or schema.get("function", {}).get("name")
@@ -1698,7 +1739,25 @@ def _chat_with_model_generator(
                         _strip_media_and_merge(messages, model_name),
                         model_name,
                     )
-                    response_stream = completion(**kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
+                    # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
+                    # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
+                    from concurrent.futures import ThreadPoolExecutor
+                    with ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(completion, **kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
+                        while not future.done():
+                            raise_if_cancelled()
+                            try:
+                                future.result(timeout=0.1)
+                            except Exception:
+                                # result(timeout=0.1) 在超时或异常时都会抛；
+                                # 交给下面统一处理 future.exception()
+                                pass
+                        if future.cancelled():
+                            raise KeyboardInterrupt("用户终止了对话。")
+                        exc = future.exception()
+                        if exc is not None:
+                            raise exc
+                        response_stream = future.result()
                     break
                 except Exception as api_err:
                     err_str = str(api_err).lower()
