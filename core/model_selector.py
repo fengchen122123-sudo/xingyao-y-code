@@ -23,6 +23,27 @@ from core.model_manager import (
     update_provider_and_model, add_preset_provider_with_models
 )
 
+# litellm 懒加载，避免打包后导入问题，与 core/llm.py 实现一致
+_litellm_module = None
+_litellm_lock = threading.Lock()
+
+
+def _get_litellm():
+    import os
+    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
+    global _litellm_module
+    if _litellm_module is not None:
+        return _litellm_module
+    with _litellm_lock:
+        if _litellm_module is not None:
+            return _litellm_module
+        import litellm as _litellm
+        _litellm.suppress_debug_info = True
+        _litellm.set_verbose = False
+        _litellm_module = _litellm
+        return _litellm
+
+
 STYLE = Style.from_dict({
     "header":        "bold #00b4d8",
     "footer":        "#445566",
@@ -168,6 +189,17 @@ def _t(style: str, text: str):
     return (style, text)
 
 
+def _format_test_error(exception, model_name):
+    """格式化连接测试错误信息"""
+    msg = str(exception)
+    if not msg:
+        msg = repr(exception)
+    # 截断过长的错误信息
+    if len(msg) > 200:
+        msg = msg[:200] + "..."
+    return f"连接测试失败 (模型: {model_name}): {msg}"
+
+
 def _latest_total_tokens() -> int:
     """读取当前会话最新一轮的 token 总量（持锁，与 core.llm 的后台写线程互斥）。"""
     from core.llm import session_token_usage, token_usage_lock
@@ -228,13 +260,13 @@ def open_model_selector(on_model_selected=None):
             event.app.loop.call_soon_threadsafe(callback)
 
         def test_conn():
+            # model/err 变量在 try 之前赋值，避免 _get_litellm() 抛异常时
+            # except 块引用未绑定变量导致 UnboundLocalError 被线程静默吞掉
+            model = state["edit_data"].get("model_name", "").strip()
             try:
-                import litellm
-                litellm.suppress_debug_info = True
-                litellm.set_verbose = False
+                litellm = _get_litellm()
                 url = state["edit_data"].get("base_url", "").strip()
                 key = state["edit_data"].get("api_key", "").strip()
-                model = state["edit_data"].get("model_name", "").strip()
                 
                 proto = "openai"
                 cfg = load_config()
@@ -287,9 +319,11 @@ def open_model_selector(on_model_selected=None):
                     event.app.invalidate()
                 _ui(_on_err)
             finally:
-                state["testing"] = False
-                _ui(event.app.invalidate)
-                
+                def _finish_testing():
+                    state["testing"] = False
+                    event.app.invalidate()
+                _ui(_finish_testing)
+
         threading.Thread(target=test_conn, daemon=True).start()
 
     def _test_and_save_preset_provider(event, key):
@@ -309,9 +343,7 @@ def open_model_selector(on_model_selected=None):
             proto = preset["protocol"]
             first_model = preset["models"][0]["name"]
             try:
-                import litellm
-                litellm.suppress_debug_info = True
-                litellm.set_verbose = False
+                litellm = _get_litellm()
                 test_model = first_model
                 if not first_model.startswith(f"{proto}/"):
                     test_model = f"{proto}/{first_model}"
@@ -355,8 +387,10 @@ def open_model_selector(on_model_selected=None):
                     event.app.invalidate()
                 _ui(_on_err)
             finally:
-                state["testing"] = False
-                _ui(event.app.invalidate)
+                def _finish_testing():
+                    state["testing"] = False
+                    event.app.invalidate()
+                _ui(_finish_testing)
 
         threading.Thread(target=test_conn, daemon=True).start()
 
@@ -369,13 +403,13 @@ def open_model_selector(on_model_selected=None):
             event.app.loop.call_soon_threadsafe(callback)
 
         def test_conn():
+            # model/err 变量在 try 之前赋值，避免 _get_litellm() 抛异常时
+            # except 块引用未绑定变量导致 UnboundLocalError 被线程静默吞掉
+            model = state["add_data"].get("model_name", "").strip()
             try:
-                import litellm
-                litellm.suppress_debug_info = True
-                litellm.set_verbose = False
+                litellm = _get_litellm()
                 url = state["add_data"].get("base_url", "").strip()
                 key = state["add_data"].get("api_key", "").strip()
-                model = state["add_data"].get("model_name", "").strip()
                 proto_idx = state["add_data"].get("proto_idx", 0)
                 proto = PROTOCOLS[proto_idx][0]
                 
@@ -404,17 +438,20 @@ def open_model_selector(on_model_selected=None):
                         api_key=state["add_data"]["api_key"],
                         protocol=proto,
                     )
-                    state["new_provider_id"] = pid
-                
+                else:
+                    pid = state["new_provider_id"]
+
                 add_model_to_provider(
-                    provider_id=state["new_provider_id"],
+                    provider_id=pid,
                     name=model,
                     context_window=ctx,
                 )
-                
+
                 def _on_success():
                     state["message"] = "✔ 模型连接测试成功，已保存！"
                     state["add_step"] = 6
+                    # new_provider_id 在 UI 线程写入，供后续"继续添加模型"复用
+                    state["new_provider_id"] = pid
                     main_win.vertical_scroll = 0
                     layout.focus(main_win)
                     event.app.invalidate()
@@ -426,9 +463,11 @@ def open_model_selector(on_model_selected=None):
                     event.app.invalidate()
                 _ui(_on_err)
             finally:
-                state["testing"] = False
-                _ui(event.app.invalidate)
-                
+                def _finish_testing():
+                    state["testing"] = False
+                    event.app.invalidate()
+                _ui(_finish_testing)
+
         threading.Thread(target=test_conn, daemon=True).start()
 
     def _test_and_save_added_model(event, ctx):
@@ -442,9 +481,7 @@ def open_model_selector(on_model_selected=None):
         def test_conn():
             model = state["am_data"].get("model_name", "").strip()
             try:
-                import litellm
-                litellm.suppress_debug_info = True
-                litellm.set_verbose = False
+                litellm = _get_litellm()
                 url, key, proto = "", "", "openai"
                 provider_name = ""
                 cfg = load_config()
@@ -496,8 +533,10 @@ def open_model_selector(on_model_selected=None):
                     event.app.invalidate()
                 _ui(_on_err)
             finally:
-                state["testing"] = False
-                _ui(event.app.invalidate)
+                def _finish_testing():
+                    state["testing"] = False
+                    event.app.invalidate()
+                _ui(_finish_testing)
 
         threading.Thread(target=test_conn, daemon=True).start()
 
@@ -653,7 +692,7 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.title", f"  {title}\n")]
             out += [_t("class:wiz.hint",  f"  {hint}\n")]
 
-        elif step == 3.5 or step == 3:
+        elif step == 3.5:
             out += [_t("class:wiz.title", "  步骤 4/5  协议类型\n")]
             out += [_t("class:wiz.hint",  "  ↑↓ 选择，Enter 确认：\n")]
             for pi, (_, plabel) in enumerate(PROTOCOLS):
@@ -733,7 +772,7 @@ def open_model_selector(on_model_selected=None):
         if state["mode"] == "edit":
             return True
         if state["mode"] == "wizard":
-            return state["add_step"] not in (0, 3, 3.5, 6)
+            return state["add_step"] not in (0, 3.5, 6)
         return False
 
     def get_input_header():
@@ -897,22 +936,22 @@ def open_model_selector(on_model_selected=None):
     def _quit(event):
         event.app.exit()
 
-    @kb.add("up", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3, 3.5, 6)))
+    @kb.add("up", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3.5, 6)))
     def _w_up(event):
         if state.get("testing"):
             return
         if state["add_step"] == 0:
             state["preset_cursor"] = max(0, state["preset_cursor"] - 1)
-        elif state["add_step"] in (3, 3.5, 6):
+        elif state["add_step"] in (3.5, 6):
             state["proto_cursor"] = max(0, state["proto_cursor"] - 1)
 
-    @kb.add("down", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3, 3.5, 6)))
+    @kb.add("down", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3.5, 6)))
     def _w_down(event):
         if state.get("testing"):
             return
         if state["add_step"] == 0:
             state["preset_cursor"] = min(len(PRESET_PROVIDERS), state["preset_cursor"] + 1)
-        elif state["add_step"] in (3, 3.5):
+        elif state["add_step"] in (3.5,):
             state["proto_cursor"] = min(len(PROTOCOLS) - 1, state["proto_cursor"] + 1)
         elif state["add_step"] == 6:
             state["proto_cursor"] = min(1, state["proto_cursor"] + 1)
@@ -1045,6 +1084,14 @@ def open_model_selector(on_model_selected=None):
         elif step == 5:
             state["add_step"] = 4
             input_buf.set_document(Document(state["add_data"].get("model_name", "")))
+        elif step == 6:
+            # "继续添加/完成保存"步骤按 Esc：直接完成保存，返回列表
+            state["items"] = build_items()
+            state["mode"] = "list"
+            state["message"] = "✔ 厂商已保存！"
+            input_buf.set_document(Document(""))
+            main_win.vertical_scroll = 0
+            layout.focus(main_win)
 
     @kb.add("enter", filter=Condition(lambda: state["mode"] == "addmodel"))
     def _am_enter(event):

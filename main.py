@@ -796,7 +796,7 @@ def print_logo(clear_screen=True):
         + make_data_line("   Session   : ", safe_session)
         + make_data_line("   Model     : ", model_display)
         + make_data_line("   Theme     : ", current_theme)
-        + make_data_line("   Version   : ", "v1.0.28")
+        + make_data_line("   Version   : ", "v1.0.29")
         + make_box_line("")
         + make_box_line("   提示: 星瑶是您的编程伙伴，使用 <ansigreen>@文件</ansigreen> 可附带上下文。")
         + f"<style fg='{theme_color}'>└────────────────────────────────────────────────────────┘</style>\n"
@@ -2114,13 +2114,14 @@ def _background_worker():
                     schedule_ui(_reset_turn_state)
                     turn_interrupted = True
             finally:
-                # 将全局状态清空推回 UI 主线程，与 _cancel_active_turn 的读操作
-                # 在同一线程执行，消除 active_cancel_event / active_turn_id 的竞态。
-                def _clear_active_turn():
-                    global active_cancel_event, active_turn_id
-                    active_cancel_event = None
-                    active_turn_id = None
-                schedule_ui(_clear_active_turn)
+                # active_cancel_event / active_turn_id 由 worker 线程在本 turn 的
+                # try/finally 作用域内建立，也必须由 worker 线程在 finally 直接清空。
+                # 不能依赖 schedule_ui 投递清理：App 重启间隙（如 /models 选择器期间）
+                # schedule_ui 会静默丢弃回调，导致 active_cancel_event 残留为旧 event，
+                # 下一轮 Ctrl+C 无法中断新轮次、旋转动画永不消失。
+                # 这两个全局的设计意图就是"worker 建立、worker 清理、UI 只读"。
+                active_cancel_event = None
+                active_turn_id = None
 
             if not turn_interrupted:
                 # 检查是否需要自动重命名会话（当且仅当是新建的默认 hex 会话）

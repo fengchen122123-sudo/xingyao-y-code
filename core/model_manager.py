@@ -231,8 +231,9 @@ def add_preset_provider_with_models(name: str, base_url: str, api_key: str, prot
             "protocol": protocol,
             "models": provider_models,
         })
-        # 默认自动激活新添加预设厂商的第一个大模型
-        if provider_models:
+        # 仅在当前无激活模型时才激活新厂商的首个模型，
+        # 避免抢走用户正在使用的模型，也避免绕过 token 超限安全检查
+        if provider_models and not data.get("active_model_id"):
             data["active_model_id"] = provider_models[0]["id"]
     config.update_config(_mutate)
     return pid

@@ -354,6 +354,15 @@ def execute_command(command, run_in_background=False, timeout_seconds=30, cancel
         # 直接子进程（cmd.exe）而泄露孙进程
         from core.task_scheduler import _stop_process_tree
 
+        def _close_process_pipes(proc):
+            """显式关闭子进程的 stdout/stderr 管道，防止 fd 泄漏。"""
+            for stream in (proc.stdout, proc.stderr):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except Exception:
+                        pass
+
         output_encoding = platform_console_encoding()
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = output_encoding
@@ -373,7 +382,14 @@ def execute_command(command, run_in_background=False, timeout_seconds=30, cancel
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 _stop_process_tree(process)
-                process.communicate()
+                # 二次 communicate 加硬超时，防止孙进程 daemon 化脱离进程树后
+                # pipe 永不关闭导致 communicate() 无限阻塞卡死 worker 线程；
+                # 超时后显式关闭管道释放 fd，避免资源泄漏
+                try:
+                    process.communicate(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                _close_process_pipes(process)
                 return "🛑 命令已被用户强行中断终止。"
             try:
                 stdout_raw, stderr_raw = process.communicate(timeout=0.1)
@@ -381,7 +397,11 @@ def execute_command(command, run_in_background=False, timeout_seconds=30, cancel
             except subprocess.TimeoutExpired:
                 if time.time() - start_time >= timeout_seconds:
                     _stop_process_tree(process)
-                    process.communicate()
+                    try:
+                        process.communicate(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    _close_process_pipes(process)
                     return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
 
         output = decode_process_output(stdout_raw, output_encoding)
@@ -963,7 +983,9 @@ def edit_file(file_path, target_content, replacement_content, replace_all=False)
         with os.fdopen(fd, "wb") as temp_file:
             temp_file.write(new_content.encode(encoding))
         os.replace(temp_path, resolved)
-    except OSError as e:
+    except BaseException as e:
+        # 使用 BaseException 确保 UnicodeEncodeError、KeyboardInterrupt 等非 OSError 异常
+        # 同样能触发临时文件清理，避免孤儿 .ycode-tmp 文件在磁盘积累（与 write_file 对齐）
         try:
             temp_path.unlink(missing_ok=True)
         except OSError:
