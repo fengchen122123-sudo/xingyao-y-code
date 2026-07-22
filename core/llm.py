@@ -1003,6 +1003,112 @@ def _escape_control_chars_in_json_strings(text):
     return "".join(out)
 
 
+def _repair_truncated_json(raw):
+    """修复被截断的 JSON 字符串：补全未闭合的字符串、括号、花括号。
+
+    当 LLM 生成的 tool call arguments 超过 API 传输限制时被截断，
+    json.loads 会报 "Unterminated string" 错误。本函数尝试：
+    1. 补全未闭合的字符串（在末尾加引号）
+    2. 移除对象/数组末尾多余的逗号
+    3. 按栈顺序闭合所有未闭合的 [ { 括号
+    4. 特殊处理：如果在某个值中间被截断且不在字符串内，尝试找到最近的键结束位置
+    """
+    if not raw or not raw.strip():
+        return raw
+
+    in_string = False
+    escaped = False
+    stack = []
+    last_colon_pos = -1
+    last_comma_pos = -1
+    last_open_brace = -1
+    
+    for i, ch in enumerate(raw):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_string = False
+        else:
+            if ch == '"':
+                in_string = True
+            elif ch in "[{":
+                stack.append(ch)
+                if ch == "{":
+                    last_open_brace = i
+            elif ch == "]":
+                if stack and stack[-1] == "[":
+                    stack.pop()
+            elif ch == "}":
+                if stack and stack[-1] == "{":
+                    stack.pop()
+            elif ch == ":":
+                last_colon_pos = i
+            elif ch == ",":
+                last_comma_pos = i
+
+    # 如果不在字符串内且在某个值中间，尝试回退到上一个完整的键值对
+    if not in_string and last_colon_pos > last_comma_pos and last_open_brace >= 0:
+        # 在某个值中间被截断且不在字符串内：回退到上一个完整的键值对
+        # 找到上一个逗号或左大括号的位置
+        cutoff_pos = max(last_comma_pos, last_open_brace)
+        if cutoff_pos > 0:
+            repaired = raw[:cutoff_pos + 1].rstrip()
+            # 重新计算栈状态
+            in_string = False
+            escaped = False
+            stack = []
+            for ch in repaired:
+                if in_string:
+                    if escaped:
+                        escaped = False
+                    elif ch == "\\":
+                        escaped = True
+                    elif ch == '"':
+                        in_string = False
+                else:
+                    if ch == '"':
+                        in_string = True
+                    elif ch in "[{":
+                        stack.append(ch)
+                    elif ch == "]":
+                        if stack and stack[-1] == "[":
+                            stack.pop()
+                    elif ch == "}":
+                        if stack and stack[-1] == "{":
+                            stack.pop()
+        else:
+            repaired = raw.rstrip()
+    else:
+        repaired = raw.rstrip()
+
+    # 如果末尾在字符串内（未闭合），先补上引号
+    if in_string:
+        # 移除末尾可能残留的反斜杠（避免转义刚补的引号）
+        if repaired.endswith("\\"):
+            repaired = repaired[:-1]
+        repaired += '"'
+
+    # 移除末尾多余的逗号（在闭合括号前）
+    repaired = repaired.rstrip()
+    while repaired.endswith(","):
+        repaired = repaired[:-1].rstrip()
+
+    # 如果末尾是冒号（缺值），补空字符串
+    if repaired.endswith(":"):
+        repaired += ' ""'
+
+    # 按栈的逆序闭合括号
+    closing_map = {"[": "]", "{": "}"}
+    while stack:
+        opener = stack.pop()
+        repaired += closing_map[opener]
+
+    return repaired
+
+
 def _show_file_diff(file_path, old_content, new_content, event_callback, panel_title, truncated_note):
     """渲染文件修改 diff 面板（write_file / edit_file 共用）。"""
     try:
@@ -1101,7 +1207,11 @@ def _execute_single_tool_call(
             # 兜底修复：仅转义字符串值内部的裸控制字符，合法 \\n 不会被二次转义
             arguments = json.loads(_escape_control_chars_in_json_strings(arguments_str))
         except Exception:
-            arguments = {}
+            try:
+                # 二次修复：处理被截断的 JSON（补全未闭合字符串/括号）
+                arguments = json.loads(_repair_truncated_json(arguments_str))
+            except Exception:
+                arguments = {}
 
     _raise_if_tool_cancelled(cancel_event)
 
@@ -1419,13 +1529,21 @@ def _execute_single_tool_call(
                 except OSError as read_err:
                     logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
                     old_content = ""
-                # undo 快照由 core.tools.edit_file 内部统一记录
-                result = edit_file(
-                    file_path,
-                    target,
-                    repl,
-                    replace_all=bool(arguments.get("replace_all", False)),
-                )
+                # 修复后校验：target_content 必须在文件中能找到，否则说明截断修复不完整
+                if target and target not in old_content:
+                    result = (
+                        f"{TOOL_ERROR_PREFIX} edit_file 的 target_content 经 JSON 修复后"
+                        f"不完整（原始内容被截断），无法在文件中定位。"
+                        f"请将本次编辑拆分为更小的片段后重试。"
+                    )
+                else:
+                    # undo 快照由 core.tools.edit_file 内部统一记录
+                    result = edit_file(
+                        file_path,
+                        target,
+                        repl,
+                        replace_all=bool(arguments.get("replace_all", False)),
+                    )
                 if not result.startswith(TOOL_ERROR_PREFIX):
                     try:
                         new_content = _read_text_with_encoding_fallback(file_path)
