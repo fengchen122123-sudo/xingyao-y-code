@@ -787,3 +787,67 @@ def test_terminal_callback_fires_only_once_under_concurrent_termination():
     release.set()
     assert manager.wait_for_idle(1)
     assert len(callback_count) == 1
+
+
+def test_execute_command_reports_nonzero_exit_code():
+    """回归：非零退出码必须如实上报，不得伪装成"执行成功"。"""
+    result = execute_command('python -c "import sys; sys.exit(3)"')
+
+    assert "退出码 3" in result
+    assert "执行成功" not in result
+
+
+def test_subagent_result_strips_advisor_tags():
+    """回归：子代理结果中的 Advisor 内部协议标记必须剔除，避免污染计划回写。"""
+    manager = SubagentManager(
+        runner=lambda record: (
+            "[Advisor consultation #1]\n[Advisor review]\n"
+            "结论内容\n[End of advisor consultation #1]"
+        )
+    )
+
+    result = manager.run("任务", "s1", "t1", timeout_seconds=30)
+
+    assert "[Advisor" not in result
+    assert "End of advisor" not in result
+    assert "结论内容" in result
+
+
+def test_run_subagent_surfaces_real_verification_error(monkeypatch):
+    """回归：验证失败时必须把真实错误（如验证命令 stderr）返回给主 Agent，
+    不得只报"不是 in_progress，无法验证完成"的误导信息导致 retry 死循环。"""
+    import core.tools as tools_module
+    from core.plan import bind_default_plan_session, get_default_plan_manager
+
+    plan = get_default_plan_manager()
+    previous_session = plan.session_id
+    bind_default_plan_session("subagent-verification-error-test")
+    plan.replace([{
+        "id": "item-1",
+        "subject": "验证失败任务",
+        "stage": "build",
+        "verification_type": "command",
+        # 必定失败的命令（cmd 与 sh 均支持 exit）
+        "verification": "exit 1",
+    }])
+    monkeypatch.setattr(
+        tools_module,
+        "subagent_manager",
+        SubagentManager(runner=lambda record: "子任务做完了"),
+    )
+
+    result = tools_module.run_subagent(
+        "执行子任务",
+        parent_session="subagent-verification-error-test",
+        parent_turn_id="turn-1",
+        subagent_type="implement",
+        plan_item_id="item-1",
+        timeout_seconds=30,
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "failed"
+    assert "不是 in_progress" not in payload["error"]
+    assert "验证" in payload["error"]
+    assert plan.snapshot()[0]["status"] == "failed"
+    bind_default_plan_session(previous_session)
