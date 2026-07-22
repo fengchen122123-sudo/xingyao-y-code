@@ -43,6 +43,8 @@ def test_write_edit_and_command_copy_is_stable():
 
 
 def test_failed_tool_uses_neutral_copy_without_raw_error():
+    # 修复后：显示真实的错误信息，而非通用的"命令暂未完成"，
+    # 让用户/LLM 知道真正的原因以便修正
     text = summarize_tool_finished(
         "execute_command",
         {"command": "pytest -q"},
@@ -50,7 +52,7 @@ def test_failed_tool_uses_neutral_copy_without_raw_error():
         ok=False,
     )
 
-    assert text == "命令暂未完成：pytest -q"
+    assert text == "命令执行失败：exit 1"
 
 
 def test_subagent_copy_distinguishes_foreground_and_background():

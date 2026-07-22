@@ -31,6 +31,11 @@ def _starts_with_cjk(text: str) -> bool:
     return bool(first and "\u3400" <= first <= "\u9fff")
 
 
+def _contains_cjk(text: str) -> bool:
+    """检查文本是否包含任何 CJK 统一表意文字（中日韩汉字）。"""
+    return any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in str(text or ""))
+
+
 class PlanManager:
     def __init__(
         self,
@@ -372,15 +377,27 @@ def bind_default_plan_session(session_id: str | None) -> None:
 
 
 def plan_write(items: list[dict[str, Any]]) -> str:
-    if any(str(item.get("status", "pending")).strip() != "pending" for item in items):
-        return "新建计划项必须是 pending，运行状态由真实调度器管理。"
+    non_pending = [
+        f"'{item.get('id', '?')}'(status={item.get('status', 'pending')})"
+        for item in items
+        if str(item.get("status", "pending")).strip() != "pending"
+    ]
+    if non_pending:
+        return (
+            f"新建计划项必须是 pending，运行状态由真实调度器管理。"
+            f"以下 {len(non_pending)} 项的状态不是 'pending': {', '.join(non_pending)}。"
+            f"请将所有项的 status 改为 'pending'，调度器会在 run_subagent 执行对应项时自动将状态设为 in_progress。"
+        )
     for item in items:
         verification_type = str(item.get("verification_type", "result")).strip().lower()
         verification = str(item.get("verification", "")).strip()
-        if verification_type == "command" and _starts_with_cjk(verification):
+        if verification_type == "command" and _contains_cjk(verification):
             return (
-                "计划配置错误：verification_type=command 必须填写可执行命令；"
-                "中文验收说明请改为 verification_type=result。"
+                "计划配置错误：verification_type=command 时必须填写可执行 shell 命令，"
+                "不能包含中文。当前 verification 包含中文描述，请改为："
+                "verification_type='result' 并在 verification 中写自然语言验收说明，"
+                "或保持 verification_type='command' 但填写纯英文/命令字符的可执行命令（"
+                "例如 'cd test20260722 && python -m pytest test_wc.py -v'）。"
             )
     _DEFAULT_PLAN_MANAGER.replace(items)
     return "计划已更新。"
@@ -401,8 +418,21 @@ def plan_update(
     attempts: int | None = None,
     verification_type: str | None = None,
 ) -> str:
-    if status in {"in_progress", "completed", "failed", "blocked", "cancelled"}:
-        return "计划运行状态由真实调度器管理，不能通过 plan_update 伪造。"
+    if status in {"in_progress", "completed"}:
+        # LLM 经常尝试通过 plan_update 设置受管状态来标记进度。
+        # 返回明确的引导消息，告知正确的方式是通过 run_subagent 执行计划项。
+        return (
+            f"状态变更由调度器自动管理，不能通过 plan_update 手动设置。"
+            f"要执行计划项，请使用 run_subagent(plan_item_id='{item_id}')，"
+            f"调度器会自动将状态从 pending 推进到 in_progress。"
+        )
+    if status in {"failed", "blocked", "cancelled"}:
+        return (
+            f"不能通过 plan_update 将计划项置为 {status}。"
+            f"状态为 failed/blocked/cancelled 的项如需重试，"
+            f"请使用 plan_retry(item_id='{item_id}') 重置为 pending。"
+        )
+    # status == "pending" 是 LLM 重置失败项的自然操作，允许从 terminal 状态恢复
     updated = _DEFAULT_PLAN_MANAGER.update(
         item_id,
         status=status,
@@ -419,3 +449,55 @@ def plan_update(
         attempts=attempts,
     )
     return "计划项已更新。" if updated else f"无法更新计划项: {item_id}"
+
+
+def plan_retry(item_id: str) -> str:
+    """将失败/阻塞/取消的计划项重置为 pending，允许重新调度执行。"""
+    from core.task_scheduler import get_default_scheduler
+
+    scheduler = get_default_scheduler()
+    if scheduler.retry(item_id):
+        return f"计划项 '{item_id}' 已重置为 pending，可重新调用 run_subagent(plan_item_id='{item_id}') 执行。"
+    item = next((i for i in _DEFAULT_PLAN_MANAGER.snapshot() if i["id"] == item_id), None)
+    if item is None:
+        return f"计划项 '{item_id}' 不存在。"
+    return (
+        f"无法重置计划项 '{item_id}'。"
+        f"当前状态为 '{item.get('status', 'unknown')}'，"
+        f"只有 failed/blocked/cancelled 状态可以重试。"
+    )
+
+
+def plan_read(item_id: str | None = None) -> str:
+    """返回当前计划状态，用于 LLM 查看计划详情。
+
+    若提供 item_id，返回该计划项的详细信息；
+    否则返回完整计划快照。
+    """
+    snapshot = _DEFAULT_PLAN_MANAGER.snapshot()
+    if not snapshot:
+        return "当前没有计划项。"
+
+    if item_id:
+        item = next((i for i in snapshot if i["id"] == str(item_id).strip()), None)
+        if item is None:
+            available = ", ".join(i["id"] for i in snapshot)
+            return f"计划项 '{item_id}' 不存在。当前计划中的项: [{available}]"
+        return (
+            f"计划项: id='{item['id']}', subject='{item['subject']}', "
+            f"status='{item['status']}', kind='{item['kind']}', "
+            f"depends_on={item['depends_on']}, stage='{item['stage']}', "
+            f"attempts={item['attempts']}, error='{item['error']}'"
+        )
+
+    lines = [f"计划共 {len(snapshot)} 项:"]
+    for item in snapshot:
+        deps = f" ← {item['depends_on']}" if item["depends_on"] else ""
+        ready_mark = " ✓就绪" if (
+            item["status"] == "pending"
+            and _DEFAULT_PLAN_MANAGER._dependencies_completed_locked(item)
+        ) else ""
+        lines.append(
+            f"  [{item['status']:12s}] {item['id']:20s} | {item['subject'][:40]}{deps}{ready_mark}"
+        )
+    return "\n".join(lines)

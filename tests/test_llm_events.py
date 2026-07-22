@@ -452,7 +452,7 @@ def test_ask_user_cannot_complete_an_execution_plan_item():
         parent_turn_id="turn-ask-city",
     )
 
-    assert "用户输入准备项" in result["content"]
+    assert "不是 input_preparation" in result["content"]
     assert plan.snapshot()[0]["status"] == "pending"
     bind_default_plan_session(previous_session)
 
@@ -484,13 +484,13 @@ def test_root_plan_turn_rejects_direct_tool_bypass(mocker):
     scheduler = get_default_scheduler()
     assert scheduler.start_item("weather") is True
     assert scheduler.fail("weather", "测试失败") is True
-    mocker.patch("core.llm.get_weather", return_value="天气结果")
+    # 使用 write_file 测试计划锁：只读工具已被放行，而写文件仍必须走 run_subagent
     result = llm._execute_single_tool_call(
         {
-            "id": "weather-direct",
+            "id": "write-direct",
             "function": {
-                "name": "get_weather",
-                "arguments": '{"city":"北京"}',
+                "name": "write_file",
+                "arguments": '{"file_path": "/tmp/x.txt", "content": "x"}',
             },
         },
         event_callback=lambda *args, **kwargs: None,
@@ -499,7 +499,7 @@ def test_root_plan_turn_rejects_direct_tool_bypass(mocker):
     )
 
     assert "必须通过 run_subagent" in result["content"]
-    assert llm._tool_result_ok("get_weather", result) is False
+    assert llm._tool_result_ok("write_file", result) is False
     bind_default_plan_session(previous_session)
 
 
@@ -561,10 +561,10 @@ def test_existing_pending_plan_rejects_direct_root_tool(mocker):
 
     result = llm._execute_single_tool_call(
         {
-            "id": "weather-direct",
+            "id": "write-direct",
             "function": {
-                "name": "get_weather",
-                "arguments": '{"city":"北京"}',
+                "name": "write_file",
+                "arguments": '{"file_path": "/tmp/x.txt", "content": "x"}',
             },
         },
         event_callback=lambda *args, **kwargs: None,
@@ -778,7 +778,12 @@ def test_root_with_pending_plan_only_exposes_plan_control_tools(mocker):
         bind_default_plan_session(previous_session)
 
     names = {item["function"]["name"] for item in captured["tools"]}
-    assert names <= {"plan_write", "plan_update", "run_subagent", "ask_user"}
+    # 计划模式下暴露计划控制工具 + 只读探索工具
+    assert names <= {
+        "plan_write", "plan_update", "plan_read", "plan_retry", "run_subagent", "ask_user",
+        "read_file", "list_directory", "search_code", "glob_files",
+        "fetch_url", "search_news", "get_weather",
+    }
 
 
 def test_child_does_not_drain_root_background_notifications(mocker):

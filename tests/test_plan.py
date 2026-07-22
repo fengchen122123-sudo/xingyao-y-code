@@ -100,9 +100,11 @@ def test_public_plan_update_cannot_forge_runtime_completion():
     manager.clear()
     manager.replace([{"id": "runtime", "subject": "真实执行"}])
 
+    # plan_update 对受管状态（completed/in_progress 等）静默忽略，
+    # 不再返回错误，但状态字段不会被伪造
     message = plan_update("runtime", status="completed")
 
-    assert "真实调度器" in message
+    # 状态仍保持 pending，不会被 plan_update 伪造
     assert manager.snapshot()[0]["status"] == "pending"
     manager.clear()
 

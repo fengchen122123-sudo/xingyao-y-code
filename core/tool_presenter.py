@@ -84,8 +84,17 @@ def summarize_tool_finished(
         return f"{copy}：{target}" if target else copy
 
     if not ok:
+        # 显示真实的错误信息，而非通用的"此步骤暂未完成"，
+        # 让用户/LLM 知道真正的原因以便修正
+        content = str(result.get("content", "") or "").strip()
+        # 截取关键错误信息，避免过长
+        error_hint = content[:80] if content else ""
         if name == "execute_command":
-            return f"命令暂未完成：{target}"
+            return f"命令执行失败：{error_hint}" if error_hint else f"命令暂未完成：{target}"
+        if target and error_hint:
+            return f"{target} — {error_hint}"
+        if error_hint:
+            return error_hint
         return f"此步骤暂未完成：{target}" if target else "此步骤暂未完成"
 
     if name == "read_file":

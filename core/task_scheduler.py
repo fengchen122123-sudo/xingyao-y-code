@@ -248,7 +248,16 @@ class TaskScheduler:
                     cancel_event=cancel_event,
                 )
             if not passed:
-                self.fail(item_id, detail or "验证命令未通过", result=result)
+                self.fail(
+                    item_id,
+                    (
+                        f"计划项验证命令执行失败。实际执行的命令：{command!r}。"
+                        f"错误详情：{detail or '验证命令未通过'}。"
+                        "如果这是中文验收说明，请使用 plan_update 将 verification_type 改为 'result'；"
+                        "如果这是可执行命令但命令本身有误，请修正 verification 字段后再试。"
+                    ),
+                    result=result,
+                )
                 return False
         updated = self.plan.mark_completed(item_id, result)
         if updated:
@@ -398,6 +407,17 @@ class TaskScheduler:
         env["PYTHONIOENCODING"] = output_encoding
         # 与 execute_command 的执行环境保持一致
         env["PYTHONUTF8"] = "0"
+        cwd = None
+        if item_id:
+            item = self._item(item_id)
+            if item:
+                for candidate in item.get("files", []):
+                    if os.path.isfile(candidate):
+                        cwd = os.path.dirname(os.path.abspath(candidate))
+                        break
+                    if os.path.isdir(candidate):
+                        cwd = os.path.abspath(candidate)
+                        break
         try:
             process = subprocess.Popen(
                 command,
@@ -406,6 +426,7 @@ class TaskScheduler:
                 stderr=subprocess.PIPE,
                 text=False,
                 env=env,
+                cwd=cwd,
             )
             if item_id:
                 with self._lock:
