@@ -407,17 +407,9 @@ class TaskScheduler:
         env["PYTHONIOENCODING"] = output_encoding
         # 与 execute_command 的执行环境保持一致
         env["PYTHONUTF8"] = "0"
-        cwd = None
-        if item_id:
-            item = self._item(item_id)
-            if item:
-                for candidate in item.get("files", []):
-                    if os.path.isfile(candidate):
-                        cwd = os.path.dirname(os.path.abspath(candidate))
-                        break
-                    if os.path.isdir(candidate):
-                        cwd = os.path.abspath(candidate)
-                        break
+        # 不设置 cwd：验证命令必须和 execute_command 一样在项目工作目录下执行。
+        # 历史上这里会根据计划项 files 把 cwd 偷换成文件所在目录，导致模型按项目根
+        # 目录编写的验证命令（如 `cd subdir && ...`）在错误目录下执行而永远失败。
         try:
             process = subprocess.Popen(
                 command,
@@ -426,7 +418,6 @@ class TaskScheduler:
                 stderr=subprocess.PIPE,
                 text=False,
                 env=env,
-                cwd=cwd,
             )
             if item_id:
                 with self._lock:

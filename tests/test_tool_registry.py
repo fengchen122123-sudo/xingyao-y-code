@@ -35,7 +35,7 @@ def test_subagent_schema_defaults_to_foreground_with_bounded_timeout():
     properties = schema["function"]["parameters"]["properties"]
 
     assert properties["run_in_background"]["default"] is False
-    assert properties["timeout_seconds"]["default"] == 120
+    assert properties["timeout_seconds"]["default"] == 600
     assert properties["timeout_seconds"]["minimum"] == 30
     assert properties["timeout_seconds"]["maximum"] == 3600
 

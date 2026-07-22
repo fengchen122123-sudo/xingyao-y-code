@@ -938,3 +938,75 @@ def test_cancelled_tool_turn_does_not_persist_partial_tool_chain(mocker, monkeyp
         pass
 
     assert persisted == []
+
+
+def test_edit_file_on_missing_file_gives_clear_error(mocker):
+    """回归：edit_file 对不存在的文件必须提示改用 write_file，
+    不得误报"JSON 修复后不完整"（掩盖真实原因，曾导致子代理白白失败）。"""
+    import core.llm as llm
+
+    mocker.patch("core.llm.check_permission_and_ask", return_value=True)
+
+    result = llm._execute_single_tool_call(
+        {
+            "id": "edit-missing",
+            "function": {
+                "name": "edit_file",
+                "arguments": (
+                    '{"file_path": "mytemp/definitely-not-exists-xyz.py",'
+                    ' "target_content": "a", "replacement_content": "b"}'
+                ),
+            },
+        },
+        event_callback=lambda *args, **kwargs: None,
+        parent_session="edit-missing-file-test",
+        parent_turn_id="turn-edit-missing",
+    )
+
+    assert "目标文件不存在" in result["content"]
+    assert "write_file" in result["content"]
+    assert "JSON 修复后不完整" not in result["content"]
+
+
+def test_stalled_plan_after_repeated_failures_allows_direct_fix(mocker):
+    """回归：计划项多次失败（attempts>=2）全部停滞后，主 Agent 可直接调用
+    工具修复，不再被计划锁逼入死局。"""
+    from core.plan import bind_default_plan_session, get_default_plan_manager
+    from core.task_scheduler import get_default_scheduler
+    import core.llm as llm
+
+    plan = get_default_plan_manager()
+    previous_session = plan.session_id
+    bind_default_plan_session("stalled-plan-escape-test")
+    plan.replace([{"id": "impl", "subject": "实现功能", "stage": "build"}])
+    mocker.patch("core.llm.check_permission_and_ask", return_value=True)
+    execute = mocker.patch.object(
+        llm.tool_registry, "execute", return_value=mocker.Mock(
+            to_message_content=lambda: "写入成功"
+        )
+    )
+
+    scheduler = get_default_scheduler()
+    # 模拟两次执行失败：failed -> retry -> failed（attempts=2，计划停滞）
+    assert scheduler.start_item("impl") is True
+    assert scheduler.fail("impl", "第一次失败") is True
+    assert scheduler.retry("impl") is True
+    assert scheduler.start_item("impl") is True
+    assert scheduler.fail("impl", "第二次失败") is True
+
+    result = llm._execute_single_tool_call(
+        {
+            "id": "exec-direct",
+            "function": {
+                "name": "execute_command",
+                "arguments": '{"command": "echo hi"}',
+            },
+        },
+        event_callback=lambda *args, **kwargs: None,
+        parent_session="stalled-plan-escape-test",
+        parent_turn_id="turn-stalled-escape",
+    )
+
+    assert "必须通过 run_subagent" not in result["content"]
+    execute.assert_called_once()
+    bind_default_plan_session(previous_session)
