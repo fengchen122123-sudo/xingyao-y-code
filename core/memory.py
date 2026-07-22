@@ -28,6 +28,9 @@ def _try_parse_json(text):
         return None, False
 
 # 全局撤销状态（单文件 undo 栈，向后兼容保留）
+# _undo_state_lock 保护并发写：多 worker 线程（含并行工具批次）同时写文件时
+# 防止 LAST_UNDO_STATE 被竞态覆盖导致 /undo 回滚到错误文件/错误内容
+_undo_state_lock = threading.Lock()
 LAST_UNDO_STATE = {
     "file_path": None,
     "old_content": None
@@ -42,8 +45,9 @@ _session_checkpoints: dict[str, list[dict]] = {}
 
 
 def set_undo_state(file_path, old_content):
-    LAST_UNDO_STATE["file_path"] = file_path
-    LAST_UNDO_STATE["old_content"] = old_content
+    with _undo_state_lock:
+        LAST_UNDO_STATE["file_path"] = file_path
+        LAST_UNDO_STATE["old_content"] = old_content
     # 同步追加到当前会话的检查点文件快照
     # （由 worker 线程在 begin_turn 时已建好当前 turn 的 checkpoint 上下文）
     if file_path and old_content is not None:
@@ -51,7 +55,9 @@ def set_undo_state(file_path, old_content):
 
 
 def get_undo_state():
-    return LAST_UNDO_STATE
+    with _undo_state_lock:
+        # 返回副本，避免调用方在无锁状态下读写共享 dict 产生竞态
+        return dict(LAST_UNDO_STATE)
 
 
 # ---------------------------------------------------------------------------
