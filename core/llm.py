@@ -447,6 +447,9 @@ def check_permission_and_ask(
         _notify_event(event_callback, "error", {
             "message": f"权限询问交互发生异常: {str(e)}",
         })
+        # 系统异常不应伪装成"用户拒绝"（False 会被模型理解为用户主动拒绝），
+        # 返回取消语义让调用方按"操作中断"处理，并确保 broker 队列被清理
+        permission_broker.cancel_owner(owner_id)
         return False
     finally:
         # 异常退出（含 KeyboardInterrupt 等 BaseException）时回收已入队请求，
@@ -1722,15 +1725,30 @@ def _chat_with_model_generator(
                                 _notify_event(event_callback, "status", {
                                     "message": "检测到上下文窗口超限，正在压缩历史记录。",
                                 })
-                            from core.memory import MemoryManager
-                            mm = MemoryManager()
+                            from core.memory_compressor import compress_session_memory
+                            # 复用全局单例 manager（共享 SQLite 连接 + 锁），
+                            # 避免每次新建 MemoryManager 导致连接泄漏
+                            manager = _main.manager
                             # 子代理回合必须压缩自己的会话（parent_session），
                             # 不能误压主 UI 会话
                             session = parent_session or _main.current_session
-                            mm.compress_session(session, force=True)
+                            # compress_session_memory 是正确的压缩函数（位于 memory_compressor），
+                            # 旧的 mm.compress_session 是不存在的方法名，会抛 AttributeError 被吞掉
+                            compress_session_memory(
+                                manager,
+                                session,
+                                api_model=model_name,
+                                api_key=api_key,
+                                api_url=api_base,
+                                force=True,
+                                output_callback=(
+                                    (lambda msg: _notify_event(event_callback, "status", {"message": re.sub(r"<[^>]+>", "", msg)}))
+                                    if event_callback is not None else None
+                                ),
+                            )
                             # 原地替换为压缩后历史：禁止重新绑定局部名，
                             # 否则调用方持有的旧列表会失联、取消回滚也会作用错对象
-                            messages[:] = mm.get_history(session)
+                            messages[:] = manager.get_history(session)
                             # 压缩已成功落库：同步回合快照，避免后续异常回滚把
                             # 内存恢复成未压缩状态（与 DB 分叉且下轮必再超限）
                             turn_snapshot = deepcopy(messages)

@@ -45,14 +45,20 @@ def test_compression_replaces_messages_in_place(mocker, monkeypatch):
     monkeypatch.setattr(main, "current_session", "compress-session")
     compressed = [{"role": "user", "content": "压缩后的历史"}]
 
-    class FakeMemoryManager:
-        def compress_session(self, session, force=False):
-            assert session == "compress-session"
-
+    class FakeManager:
         def get_history(self, session):
+            assert session == "compress-session"
             return list(compressed)
 
-    monkeypatch.setattr("core.memory.MemoryManager", FakeMemoryManager)
+    monkeypatch.setattr(main, "manager", FakeManager())
+
+    compress_calls = []
+
+    def fake_compress(manager, session, api_model, api_key, api_url, force=False, output_callback=None):
+        compress_calls.append((session, force))
+        assert session == "compress-session"
+
+    monkeypatch.setattr("core.memory_compressor.compress_session_memory", fake_compress)
     mocker.patch("core.llm.completion", side_effect=[
         RuntimeError("prompt is too long: context window exceeded"),
         iter([_chunk("完成")]),
@@ -83,14 +89,16 @@ def test_rate_limit_error_does_not_trigger_compression(mocker, monkeypatch):
     monkeypatch.setattr(main, "current_session", "rate-limit-session")
     compress_called = []
 
-    class FakeMemoryManager:
-        def compress_session(self, session, force=False):
-            compress_called.append(session)
-
+    class FakeManager:
         def get_history(self, session):
             return []
 
-    monkeypatch.setattr("core.memory.MemoryManager", FakeMemoryManager)
+    monkeypatch.setattr(main, "manager", FakeManager())
+
+    def fake_compress(manager, session, api_model, api_key, api_url, force=False, output_callback=None):
+        compress_called.append(session)
+
+    monkeypatch.setattr("core.memory_compressor.compress_session_memory", fake_compress)
     mocker.patch("time.sleep")
     mocker.patch(
         "core.llm.completion",
@@ -303,15 +311,17 @@ def test_compression_uses_parent_session_not_main_session(mocker, monkeypatch):
     calls = []
     compressed = [{"role": "user", "content": "压缩后的子代理历史"}]
 
-    class FakeMemoryManager:
-        def compress_session(self, session, force=False):
-            calls.append(("compress", session))
-
+    class FakeManager:
         def get_history(self, session):
             calls.append(("history", session))
             return list(compressed)
 
-    monkeypatch.setattr("core.memory.MemoryManager", FakeMemoryManager)
+    monkeypatch.setattr(main, "manager", FakeManager())
+
+    def fake_compress(manager, session, api_model, api_key, api_url, force=False, output_callback=None):
+        calls.append(("compress", session))
+
+    monkeypatch.setattr("core.memory_compressor.compress_session_memory", fake_compress)
     mocker.patch("core.llm.completion", side_effect=[
         RuntimeError("prompt is too long: context window exceeded"),
         iter([_chunk("完成")]),
@@ -343,14 +353,16 @@ def test_rollback_after_successful_compression_keeps_compressed_history(mocker, 
     monkeypatch.setattr(main, "current_session", "compress-then-fail")
     compressed = [{"role": "user", "content": "压缩后的历史"}]
 
-    class FakeMemoryManager:
-        def compress_session(self, session, force=False):
-            pass
-
+    class FakeManager:
         def get_history(self, session):
             return list(compressed)
 
-    monkeypatch.setattr("core.memory.MemoryManager", FakeMemoryManager)
+    monkeypatch.setattr(main, "manager", FakeManager())
+
+    def fake_compress(manager, session, api_model, api_key, api_url, force=False, output_callback=None):
+        pass
+
+    monkeypatch.setattr("core.memory_compressor.compress_session_memory", fake_compress)
     mocker.patch("time.sleep")
     mocker.patch("core.llm.completion", side_effect=[
         RuntimeError("prompt is too long: context window exceeded"),
