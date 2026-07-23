@@ -78,6 +78,13 @@ def find_definition(symbol, dir_path='.', file_extensions=None):
     if cached is not None:
         return cached
 
+    session_id = _tool_cache.get_current_session()
+    if session_id:
+        shared_key = ("find_definition", cache_key)
+        shared = _tool_cache.shared_get(session_id, shared_key)
+        if shared is not None:
+            return shared
+
     # 构造 ripgrep 正则：匹配任何语言的定义关键字 + 指定符号名
     # 用 word boundary 确保精确匹配
     patterns = []
@@ -119,11 +126,15 @@ def find_definition(symbol, dir_path='.', file_extensions=None):
         else:
             result_text = output
         _tool_cache.search_put(cache_key, result_text)
+        if session_id:
+            _tool_cache.shared_put(session_id, ("find_definition", cache_key), result_text)
         return result_text
     except FileNotFoundError:
         # ripgrep 未安装，回退到 Python os.walk + 正则
         result_text = _find_definition_fallback(symbol, dir_path, patterns)
         _tool_cache.search_put(cache_key, result_text)
+        if session_id:
+            _tool_cache.shared_put(session_id, ("find_definition", cache_key), result_text)
         return result_text
     except subprocess.TimeoutExpired:
         return f"🚨 查找超时"
