@@ -18,6 +18,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from core import tool_cache as _tool_cache
+
 
 # 多语言符号定义模式（按语言关键字）
 # 每条模式匹配"关键字 + 符号名"，捕获组 1 是符号名
@@ -71,6 +73,11 @@ def find_definition(symbol, dir_path='.', file_extensions=None):
     if not symbol or not symbol.replace('_', '').isalnum():
         return f"🚨 符号名只能包含字母、数字、下划线：{symbol!r}"
 
+    cache_key = _tool_cache.search_key("find_definition", symbol, dir_path, tuple(file_extensions) if file_extensions else None)
+    cached = _tool_cache.search_get(cache_key)
+    if cached is not None:
+        return cached
+
     # 构造 ripgrep 正则：匹配任何语言的定义关键字 + 指定符号名
     # 用 word boundary 确保精确匹配
     patterns = []
@@ -108,11 +115,16 @@ def find_definition(symbol, dir_path='.', file_extensions=None):
         # 限制返回行数避免过长
         lines = output.split('\n')
         if len(lines) > 30:
-            return '\n'.join(lines[:30]) + f"\n... (共 {len(lines)} 处匹配，已显示前 30 处)"
-        return output
+            result_text = '\n'.join(lines[:30]) + f"\n... (共 {len(lines)} 处匹配，已显示前 30 处)"
+        else:
+            result_text = output
+        _tool_cache.search_put(cache_key, result_text)
+        return result_text
     except FileNotFoundError:
         # ripgrep 未安装，回退到 Python os.walk + 正则
-        return _find_definition_fallback(symbol, dir_path, patterns)
+        result_text = _find_definition_fallback(symbol, dir_path, patterns)
+        _tool_cache.search_put(cache_key, result_text)
+        return result_text
     except subprocess.TimeoutExpired:
         return f"🚨 查找超时"
     except Exception as e:
