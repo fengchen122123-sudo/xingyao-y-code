@@ -31,7 +31,12 @@ from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.data_structures import Point
 
 from core.memory import MemoryManager
-from core.context_builder import RuntimeContext, build_system_prompt, without_system_messages
+from core.context_builder import (
+    RuntimeContext,
+    build_dynamic_prompt,
+    build_stable_prompt,
+    without_system_messages,
+)
 from core.history_renderer import render_session_history
 from core.llm import chat_with_model_events, session_token_usage, token_usage_lock
 from core.permission_broker import PermissionRequest, permission_broker
@@ -2090,8 +2095,15 @@ def _background_worker():
                 memory=memory_kairos.build_memory_system_section(),
                 skills=get_active_skills_catalog() or "无",
             )
-            system_prompt = build_system_prompt(system_prompt, runtime)
-            history.insert(0, {"role": "system", "content": system_prompt})
+            stable_prompt = build_stable_prompt(system_prompt)
+            dynamic_prompt = build_dynamic_prompt(runtime)
+            history.insert(0, {"role": "system", "content": stable_prompt})
+            # 动态上下文独立为第二条 system 消息并靠近当前用户输入，
+            # 保持第一条 system 消息内容稳定，提升 provider 侧 prefix caching 命中率。
+            if history and history[-1].get("role") == "user":
+                history.insert(len(history) - 1, {"role": "system", "content": dynamic_prompt})
+            else:
+                history.append({"role": "system", "content": dynamic_prompt})
 
             # 后台线程只切换 UI 状态，不直接触碰 prompt_toolkit 布局。
             # turn 状态的建立（active_* 赋值）与清理在同一个 try/finally 作用域内，

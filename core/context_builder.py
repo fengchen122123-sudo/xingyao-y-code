@@ -31,9 +31,27 @@ class RuntimeContext:
     skills: str = "无"
 
 
-def build_system_prompt(base_prompt: str, runtime: RuntimeContext) -> str:
+def build_stable_prompt(base_prompt: str) -> str:
+    """Build the stable prefix that stays unchanged across turns.
+
+    Contains only the base system prompt and the hardcoded decision policy.
+    This prefix is safe for provider-side prompt caching because it does not
+    include per-turn dynamic data (time, plan snapshot, memory, skills).
+    """
     stable = (base_prompt or "").strip()
-    dynamic = (
+    parts = [section for section in (stable, _DECISION_POLICY) if section]
+    return "\n\n".join(parts)
+
+
+def build_dynamic_prompt(runtime: RuntimeContext) -> str:
+    """Build the dynamic context block that changes every turn.
+
+    This block is intentionally kept separate from the stable prefix so that
+    the prefix can hit provider-side prompt caches.  It is inserted as a
+    second system message near the tail of the conversation (just before the
+    latest user message) rather than being baked into the stable prefix.
+    """
+    return (
         "【当前运行上下文】\n"
         f"当前模型：{runtime.model_name}\n"
         f"当前权限模式：{runtime.permission_mode}\n"
@@ -43,8 +61,17 @@ def build_system_prompt(base_prompt: str, runtime: RuntimeContext) -> str:
         f"长期记忆：{runtime.memory}\n"
         f"已启用技能：{runtime.skills}"
     )
-    sections = [section for section in (stable, _DECISION_POLICY, dynamic) if section]
-    return "\n\n".join(sections)
+
+
+def build_system_prompt(base_prompt: str, runtime: RuntimeContext) -> str:
+    """Legacy combined prompt (stable + dynamic).
+
+    Kept for backward compatibility.  New code should prefer
+    build_stable_prompt + build_dynamic_prompt to enable prompt caching.
+    """
+    stable = build_stable_prompt(base_prompt)
+    dynamic = build_dynamic_prompt(runtime)
+    return "\n\n".join([stable, dynamic])
 
 
 def without_system_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
