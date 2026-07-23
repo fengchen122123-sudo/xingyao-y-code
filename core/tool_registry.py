@@ -275,7 +275,7 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="edit_file",
-            description="以精确字符串替换的方式修改文件。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；target_content 必须唯一匹配，出现多次时需补充上下文或显式设置 replace_all。",
+            description="以精确字符串替换的方式修改文件。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；target_content 必须唯一匹配，出现多次时需补充上下文或显式设置 replace_all。为避免 JSON 截断导致失败，单次 target_content 建议不超过 1500 字符；更大改动请拆分为多次小改或使用 write_file 重写。",
             input_schema=_schema({
                 "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
                 "target_content": {"type": "string"},
