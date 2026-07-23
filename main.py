@@ -2115,6 +2115,9 @@ def _background_worker():
             cancel_event = turn_controller.cancel_event
             active_cancel_event = cancel_event
             active_turn_id = turn_id
+            # 主代理线程标记当前会话，使子代理可以共享工具级缓存
+            from core import tool_cache as _tool_cache
+            _tool_cache.set_current_session(task_session)
 
             # 会话级检查点：本轮所有 write_file/edit_file 的旧内容会被自动记录
             # 用户可通过 /checkpoint restore <turn_id> 整体回滚（含文件 + 对话上下文）
@@ -2186,6 +2189,8 @@ def _background_worker():
                 # 这两个全局的设计意图就是"worker 建立、worker 清理、UI 只读"。
                 active_cancel_event = None
                 active_turn_id = None
+                from core import tool_cache as _tool_cache
+                _tool_cache.set_current_session(None)
 
             if not turn_interrupted:
                 # 检查是否需要自动重命名会话（当且仅当是新建的默认 hex 会话）
