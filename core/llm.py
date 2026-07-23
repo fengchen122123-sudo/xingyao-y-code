@@ -2019,6 +2019,16 @@ def _chat_with_model_generator(
             from core.turn_renderer import sanitize_protocol_text
             public_content = sanitize_protocol_text(public_content)
 
+            # 兜底：模型只输出 thinking 但未生成正文时，把思考过程作为回复展示，
+            # 避免 UI 在 "思考完成" 后出现空白，给用户造成 Agent 没有响应的错觉。
+            # 注意：工具调用轮保持 content 为 None，不污染工具链签名。
+            if (
+                not tool_calls_dict
+                and not _is_meaningful_assistant_content(public_content)
+                and _is_meaningful_assistant_content(reasoning_content)
+            ):
+                public_content = reasoning_content.strip() + "\n\n[以上为模型思考过程，未生成正式回复]"
+
             # 只允许公开正文写入记忆，避免把原生推理误当作长期事实。
             memory_tags = mk.extract_memory_tags(public_content)
             for tag in memory_tags:
@@ -2082,6 +2092,13 @@ def _chat_with_model_generator(
                         "message": "模型未生成结论，正在请求最终总结。",
                     })
                     continue
+                # 模型未调用工具且未生成任何正文：给出明确提示，避免 UI 在
+                # "思考完成" 后陷入沉默（常见于某些模型只输出 reasoning 或空回复）。
+                if not _is_meaningful_assistant_content(public_content):
+                    fallback_msg = "模型本轮未返回有效正文内容（可能只输出了思考过程或空回复）。"
+                    if reasoning_content and reasoning_content.strip():
+                        fallback_msg += " 如需查看思考过程，可尝试换用支持推理展示的模型或重新提问。"
+                    _notify_event(event_callback, "notice", {"message": fallback_msg})
                 flush_persistence()
                 return
 
