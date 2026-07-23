@@ -174,3 +174,43 @@ def test_renderer_sanitizes_protocol_and_raw_tool_call_tags():
     assert "[Advisor" not in finish_output
     assert "<tool_call" not in finish_output
     assert "修改已完成。" in finish_output
+
+
+def test_renderer_preserves_code_block_with_think_tags_inside():
+    """代码块内的 <think> 标签应作为代码内容保留，不应被当作推理内容丢弃。"""
+    renderer = TurnRenderer()
+    text = (
+        "Here's the code:\n\n"
+        "```python\n"
+        "# <think>\n"
+        "print(1)\n"
+        "# </think>\n"
+        "```\n"
+    )
+    for ch in text:
+        renderer.consume("assistant_delta", {"text": ch})
+
+    output = renderer.assistant_text()
+    assert "```python" in output
+    assert "# <think>" in output
+    assert "print(1)" in output
+    assert "# </think>" in output
+    assert "```" in output
+
+
+def test_renderer_streamed_fenced_code_block_is_recognized():
+    """逐字符流式输入时，``` 应被正确识别为代码块边界。"""
+    renderer = TurnRenderer()
+    chunks = [
+        "See ",
+        "```python\n",
+        "print(1)\n",
+        "```\n",
+    ]
+    for chunk in chunks:
+        renderer.consume("assistant_delta", {"text": chunk})
+
+    output = renderer.assistant_text()
+    assert "```python" in output
+    assert "print(1)" in output
+    assert output.count("```") == 2
