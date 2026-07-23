@@ -54,6 +54,11 @@ def summarize_tool_started(name: str, arguments: dict) -> str:
             return f"星瑶正在使用skill：{skill_name}"
     action = _TOOL_COPY.get(name, (f"使用工具 {name}", "工具执行完成", ""))[0]
     target = tool_target(name, arguments)
+    # 执行命令的预览需要截断，避免长命令（尤其 python -c 内嵌脚本）刷屏
+    if name == "execute_command" and target:
+        target = target.strip()
+        if len(target) > 60:
+            target = target[:57] + "..."
     return f"星瑶正在{action}：{target}" if target else f"星瑶正在{action}"
 
 
