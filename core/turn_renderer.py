@@ -10,6 +10,7 @@ from core.thinking_stream import ThinkingStreamBuffer
 
 _OPEN_TAGS = ("<thinking>", "<think>")
 _CLOSE_TAGS = ("</thinking>", "</think>")
+_CODE_BLOCK_FENCES = ("```", "~~~")
 _ANSI_RESET = "\x1b[0m"
 _ANSI_CYAN = "\x1b[36m"
 _ANSI_GREEN = "\x1b[32m"
@@ -70,6 +71,8 @@ class TurnRenderer:
         self._thinking_stream = ThinkingStreamBuffer()
         self._assistant_text_parts: list[str] = []
         self._suppress_assistant_emit = False
+        self._in_code_block = False
+        self._code_fence = ""
 
     def consume(self, kind: str, payload: dict[str, Any] | None = None) -> list[str]:
         if self._finished:
@@ -129,15 +132,57 @@ class TurnRenderer:
                 self._in_thinking = False
                 continue
 
-            opening = _find_tag(self._pending_text, _OPEN_TAGS)
-            if opening is None:
+            if self._in_code_block:
+                fence = self._code_fence
+                closing = self._pending_text.find(fence)
+                if closing == -1:
+                    safe_length = _safe_prefix_length(
+                        self._pending_text, (fence,)
+                    )
+                    if safe_length:
+                        self._append_text(self._pending_text[:safe_length])
+                        self._pending_text = self._pending_text[safe_length:]
+                    return
+                self._append_text(
+                    self._pending_text[:closing + len(fence)]
+                )
+                self._pending_text = self._pending_text[closing + len(fence):]
+                self._in_code_block = False
+                self._code_fence = ""
+                continue
+
+            think_opening = _find_tag(self._pending_text, _OPEN_TAGS)
+            code_opening = _find_tag(self._pending_text, _CODE_BLOCK_FENCES)
+
+            # 代码块开始早于 think 开始：先处理代码块，跳过其中的 think 标签
+            if code_opening is not None and (
+                think_opening is None or code_opening[0] < think_opening[0]
+            ):
+                index, fence = code_opening
+                if index:
+                    # 递归处理代码块之前的普通文本（其中可能含 think 标签）
+                    suffix = self._pending_text[index:]
+                    self._pending_text = self._pending_text[:index]
+                    self._consume_text("")
+                    self._pending_text += suffix
+                self._append_text(self._pending_text[:len(fence)])
+                self._pending_text = self._pending_text[len(fence):]
+                self._in_code_block = True
+                self._code_fence = fence
+                continue
+
+            if think_opening is None:
                 safe_length = _safe_prefix_length(self._pending_text, _OPEN_TAGS)
+                # 末尾的 ` 或 ~ 可能是 fenced code block 的开始，保守保留，
+                # 避免 ```/~~~ 被拆散后无法识别为代码块。
+                while safe_length > 0 and self._pending_text[safe_length - 1] in "`~":
+                    safe_length -= 1
                 if safe_length:
                     self._append_text(self._pending_text[:safe_length])
                     self._pending_text = self._pending_text[safe_length:]
                 return
 
-            index, tag = opening
+            index, tag = think_opening
             if index:
                 self._append_text(self._pending_text[:index])
             self._pending_text = self._pending_text[index + len(tag):]
