@@ -7,10 +7,15 @@ import sqlite3
 import threading
 
 
+import pathlib
+
 def _normalize_workdir(path):
-    """规范化工作目录路径（绝对路径 + 平台大小写归一），用于会话归属目录比较。"""
+    """规范化工作目录路径（真实磁盘物理大小写），用于会话归属目录比较。"""
     try:
-        return os.path.normcase(os.path.abspath(str(path)))
+        p = pathlib.Path(path)
+        if p.exists():
+            return str(p.resolve())
+        return os.path.abspath(str(path))
     except Exception:
         return str(path or "")
 
@@ -245,6 +250,14 @@ class MemoryManager:
                         content TEXT
                     )
                 ''')
+                # 创建一个叫 workspaces 的表持久化记录引入过的项目文件夹
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS workspaces (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        workdir TEXT UNIQUE,
+                        created_at TEXT
+                    )
+                ''')
                 # 保存修改
                 self.conn.commit()
             except Exception:
@@ -296,15 +309,17 @@ class MemoryManager:
             cursor = self.conn.cursor()
             try:
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cursor.execute('''
-                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at)
-                    VALUES (?, ?, ?, ?)
-                ''', (session_name, self.workdir, now, now))
-                cursor.execute(
-                    'SELECT id FROM sessions WHERE session_name = ?',
-                    (session_name,),
-                )
-                session_id = cursor.fetchone()[0]
+                cursor.execute('SELECT id, workdir FROM sessions WHERE session_name = ?', (session_name,))
+                row = cursor.fetchone()
+                if row:
+                    session_id = row[0]
+                else:
+                    target_wdir = "GLOBAL"
+                    cursor.execute('''
+                        INSERT INTO sessions (session_name, workdir, created_at, updated_at)
+                        VALUES (?, ?, ?, ?)
+                    ''', (session_name, target_wdir, now, now))
+                    session_id = cursor.lastrowid
                 cursor.executemany('''
                     INSERT INTO messages (session_id, role, content)
                     VALUES (?, ?, ?)
@@ -318,6 +333,18 @@ class MemoryManager:
             except Exception:
                 self.conn.rollback()
                 raise
+
+    def create_session_explicit(self, session_name, workdir=None):
+        """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。"""
+        wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute('''
+                INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+            ''', (session_name, wdir, now, now))
+            self.conn.commit()
 
 
     def get_history(self, session_name):
@@ -496,6 +523,51 @@ class MemoryManager:
                 except Exception:
                     self.conn.rollback()
                     raise
+
+    def delete_sessions_by_workdir(self, workdir):
+        """删除指定工作目录下的所有历史会话及其消息记录（仅删除 DB 记录）"""
+        workdir_norm = _normalize_workdir(workdir)
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT id FROM sessions WHERE workdir = ?', (workdir_norm,))
+            rows = cursor.fetchall()
+            for r in rows:
+                sid = r[0]
+                try:
+                    cursor.execute('DELETE FROM messages WHERE session_id = ?', (sid,))
+                except Exception:
+                    pass
+            cursor.execute('DELETE FROM sessions WHERE workdir = ?', (workdir_norm,))
+            cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (workdir_norm,))
+            self.conn.commit()
+
+    def add_workspace(self, workdir):
+        if not workdir or workdir == "GLOBAL":
+            return
+        wdir = _normalize_workdir(workdir)
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            cursor.execute('''
+                INSERT OR IGNORE INTO workspaces (workdir, created_at)
+                VALUES (?, ?)
+            ''', (wdir, now))
+            self.conn.commit()
+
+    def get_all_workspaces(self):
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT workdir FROM workspaces')
+            return [_normalize_workdir(row[0]) for row in cursor.fetchall()]
+
+    def delete_workspace(self, workdir):
+        if not workdir or workdir == "GLOBAL":
+            return
+        wdir = _normalize_workdir(workdir)
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (wdir,))
+            self.conn.commit()
 
     def rename_session(self, old_name, new_name):
         """重命名指定会话，确保新名称在数据库中唯一。如果名字冲突则自动加数字后缀。"""
