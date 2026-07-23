@@ -166,6 +166,26 @@ def _resolve_workspace_path(file_path):
     return candidate
 
 
+def _count_lines_fast(path):
+    """快速统计文件行数（二进制模式，避免解码整个文件）。"""
+    count = 0
+    with open(path, 'rb') as f:
+        for _ in f:
+            count += 1
+    return count
+
+
+def _read_lines_streaming(path, start, count):
+    """流式读取指定行范围，UTF-8 优先，失败回退 GBK。"""
+    from itertools import islice
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return list(islice(f, start, start + count))
+    except UnicodeDecodeError:
+        with open(path, 'r', encoding='gbk', errors='replace') as f:
+            return list(islice(f, start, start + count))
+
+
 def read_file(file_path, offset=0, limit=None, compress=False):
     """读取文件内容并返回（仅限当前工作目录内，默认最多 2000 行，超出时给出截断提示）
 
@@ -187,6 +207,13 @@ def read_file(file_path, offset=0, limit=None, compress=False):
     if cached is not None:
         return cached
 
+    session_id = _tool_cache.get_current_session()
+    if session_id:
+        shared_key = ("read_file", cache_key)
+        shared = _tool_cache.shared_get(session_id, shared_key)
+        if shared is not None:
+            return shared
+
     # 大文件自适应：未显式指定 limit 时，按文件大小决定默认读取行数
     file_size = resolved.stat().st_size
     auto_limited = False
@@ -196,23 +223,35 @@ def read_file(file_path, offset=0, limit=None, compress=False):
     else:
         max_lines = READ_FILE_MAX_LINES if limit is None else max(1, min(int(limit), READ_FILE_MAX_LINES))
 
-    # 非 UTF-8 文件回退 GBK 读取（与原行为一致）
-    try:
-        with open(resolved, 'r', encoding='utf-8') as f:
-            lines = f.read().splitlines(keepends=True)
-    except UnicodeDecodeError:
-        with open(resolved, 'r', encoding='gbk', errors='replace') as f:
-            lines = f.read().splitlines(keepends=True)
+    # 大文件使用流式读取 + 快速行数统计，避免全量载入内存
+    if file_size > READ_FILE_LARGE_BYTES:
+        total = _count_lines_fast(resolved)
+        start = max(0, int(offset or 0))
+        if total == 0:
+            return ""
+        if start >= total:
+            return f"⚠️ 文件共 {total} 行，offset={start} 已超出范围。"
+        selected = _read_lines_streaming(resolved, start, max_lines)
+        result = "".join(selected)
+        end = start + len(selected)
+    else:
+        # 非 UTF-8 文件回退 GBK 读取（与原行为一致）
+        try:
+            with open(resolved, 'r', encoding='utf-8') as f:
+                lines = f.read().splitlines(keepends=True)
+        except UnicodeDecodeError:
+            with open(resolved, 'r', encoding='gbk', errors='replace') as f:
+                lines = f.read().splitlines(keepends=True)
 
-    total = len(lines)
-    start = max(0, int(offset or 0))
-    if total == 0:
-        return ""
-    if start >= total:
-        return f"⚠️ 文件共 {total} 行，offset={start} 已超出范围。"
-    selected = lines[start:start + max_lines]
-    result = "".join(selected)
-    end = start + len(selected)
+        total = len(lines)
+        start = max(0, int(offset or 0))
+        if total == 0:
+            return ""
+        if start >= total:
+            return f"⚠️ 文件共 {total} 行，offset={start} 已超出范围。"
+        selected = lines[start:start + max_lines]
+        result = "".join(selected)
+        end = start + len(selected)
 
     # 压缩处理
     compressed_note = ""
@@ -237,6 +276,8 @@ def read_file(file_path, offset=0, limit=None, compress=False):
 
     final = result + compressed_note + truncation_note
     _tool_cache.read_file_put(cache_key, final)
+    if session_id:
+        _tool_cache.shared_put(session_id, ("read_file", cache_key), final)
     return final
 
 def write_file(file_path, content):
@@ -815,6 +856,13 @@ def search_code(query, dir_path="."):
     if cached is not None:
         return cached
 
+    session_id = _tool_cache.get_current_session()
+    if session_id:
+        shared_key = ("search_code", cache_key)
+        shared = _tool_cache.shared_get(session_id, shared_key)
+        if shared is not None:
+            return shared
+
     try:
         cmd = ["rg", "-n", "-i", "--no-heading", "--max-columns", "200", "-C", "1", query, dir_path]
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
@@ -829,6 +877,8 @@ def search_code(query, dir_path="."):
                 else:
                     result_text = output
             _tool_cache.search_put(cache_key, result_text)
+            if session_id:
+                _tool_cache.shared_put(session_id, ("search_code", cache_key), result_text)
             return result_text
     except Exception:
         pass
@@ -881,6 +931,8 @@ def search_code(query, dir_path="."):
         else:
             result_text = "\n---\n".join(results)
         _tool_cache.search_put(cache_key, result_text)
+        if session_id:
+            _tool_cache.shared_put(session_id, ("search_code", cache_key), result_text)
         return result_text
     except Exception as e:
         return f"🚨 搜索失败: {str(e)}"
@@ -1303,6 +1355,8 @@ class SubagentManager:
             task.started_at = time.time()
             self._record_stage_locked(task, "running")
 
+        # 子代理线程标记父会话，使工具级共享缓存可被复用
+        _tool_cache.set_current_session(task.parent_session)
         try:
             result = _strip_advisor_tags(str(self._runner(task) or "").strip())
         except BaseException as error:
@@ -1310,19 +1364,23 @@ class SubagentManager:
                 self._terminate(task.task_id, "cancelled", "task cancelled")
             else:
                 self._terminate(task.task_id, "failed", str(error))
+            _tool_cache.set_current_session(None)
             return
 
-        if task.cancel_event.is_set():
-            self._terminate(task.task_id, "cancelled", "task cancelled")
-        elif task.tool_errors:
-            details = "; ".join(
-                f"{name}: {detail}" for name, detail in task.tool_errors.items()
-            )
-            self._terminate(task.task_id, "failed", details)
-        elif not _has_meaningful_subagent_result(result):
-            self._terminate(task.task_id, "failed", "subagent returned no public answer")
-        else:
-            self._complete(task.task_id, result)
+        try:
+            if task.cancel_event.is_set():
+                self._terminate(task.task_id, "cancelled", "task cancelled")
+            elif task.tool_errors:
+                details = "; ".join(
+                    f"{name}: {detail}" for name, detail in task.tool_errors.items()
+                )
+                self._terminate(task.task_id, "failed", details)
+            elif not _has_meaningful_subagent_result(result):
+                self._terminate(task.task_id, "failed", "subagent returned no public answer")
+            else:
+                self._complete(task.task_id, result)
+        finally:
+            _tool_cache.set_current_session(None)
 
     def _complete(self, task_id: str, result: str) -> bool:
         with self._lock:
@@ -1410,7 +1468,16 @@ class SubagentManager:
         with self._lock:
             task = self._tasks[task_id]
             if task.status == "completed":
-                return task.result
+                result = str(task.result or "")
+                # 子代理结果过长时截断，避免完整大段内容进入主代理上下文浪费 token。
+                max_len = 4000
+                if len(result) > max_len:
+                    omitted = len(result) - max_len
+                    result = (
+                        result[:max_len]
+                        + f"\n\n... [子代理结果已截断，省略 {omitted} 字符]"
+                    )
+                return result
             return json.dumps({
                 "task_id": task.task_id,
                 "status": task.status,
@@ -1866,6 +1933,13 @@ def glob_files(pattern, dir_path="."):
     if cached is not None:
         return cached
 
+    session_id = _tool_cache.get_current_session()
+    if session_id:
+        shared_key = ("glob_files", cache_key)
+        shared = _tool_cache.shared_get(session_id, shared_key)
+        if shared is not None:
+            return shared
+
     try:
         cmd = ["rg", "--files", "--glob", pattern, str(base)]
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
@@ -1885,6 +1959,8 @@ def glob_files(pattern, dir_path="."):
                 if truncated:
                     res += f"\n\n... (匹配结果过多，已截断，共 {len(rel_matches)} 个匹配文件)"
                 _tool_cache.glob_put(cache_key, res)
+                if session_id:
+                    _tool_cache.shared_put(session_id, ("glob_files", cache_key), res)
                 return res
     except Exception:
         pass
@@ -1908,6 +1984,8 @@ def glob_files(pattern, dir_path="."):
             if truncated:
                 result_text += f"\n\n... (匹配结果过多，已截断，共 {len(matches)} 个匹配文件)"
         _tool_cache.glob_put(cache_key, result_text)
+        if session_id:
+            _tool_cache.shared_put(session_id, ("glob_files", cache_key), result_text)
         return result_text
     except Exception as e:
         return f"🚨 快速匹配工具发生异常: {str(e)}"
