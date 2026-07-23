@@ -17,7 +17,9 @@ dist/
 .eggs/
 
 # PyInstaller (auto-generated, never commit)
+# 注意：ycode.spec 是项目自定义配置，已纳入版本控制；其他自动生成的 .spec 仍忽略。
 *.spec
+!ycode.spec
 
 # pytest
 .pytest_cache/
