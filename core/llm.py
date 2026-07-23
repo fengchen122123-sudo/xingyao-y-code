@@ -1586,6 +1586,24 @@ def _execute_single_tool_call(
             file_path = arguments.get("file_path")
             target = arguments.get("target_content")
             repl = arguments.get("replacement_content")
+
+            # 对过长的 target_content 提前拦截，避免 JSON 截断后反复失败浪费 token。
+            # 模型应拆分为多个小片段编辑，或改用 write_file 重写整个文件。
+            _EDIT_TARGET_MAX_LEN = 1500
+            if target and len(target) > _EDIT_TARGET_MAX_LEN:
+                result = (
+                    f"{TOOL_ERROR_PREFIX} edit_file 的 target_content 过长（"
+                    f"{len(target)} 字符），超过 {_EDIT_TARGET_MAX_LEN} 字符限制，"
+                    f"容易在传输过程中被截断。请将本次编辑拆分为多个不超过 {_EDIT_TARGET_MAX_LEN} "
+                    f"字符的小段后重试；如需整体重写，请改用 write_file。"
+                )
+                return {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": function_name,
+                    "content": result,
+                }
+
             # 修改权限已在上方统一确认（确认文案含文件路径），用户批准即视为允许该次沙盒外修改
             with sandbox_bypass():
                 if not os.path.isfile(file_path or ""):
