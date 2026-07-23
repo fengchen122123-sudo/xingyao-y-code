@@ -445,6 +445,21 @@ def _render_public_answer_block(text: str) -> None:
     _print_ui_fragment(rendered)
 
 
+def _find_paragraph_boundary(buffer: str) -> int:
+    """在 buffer 中查找段分隔符 \n\n，但避开 ``` 代码块内部。"""
+    in_code_block = False
+    i = 0
+    while i < len(buffer) - 1:
+        if buffer.startswith("```", i) and (i == 0 or buffer[i - 1] == "\n"):
+            in_code_block = not in_code_block
+            i += 3
+            continue
+        if not in_code_block and buffer.startswith("\n\n", i):
+            return i
+        i += 1
+    return -1
+
+
 def _flush_public_answer(turn_id: str, *, final: bool = False) -> None:
     buffer = _assistant_stream_buffers.get(turn_id, "")
     if not buffer:
@@ -456,9 +471,15 @@ def _flush_public_answer(turn_id: str, *, final: bool = False) -> None:
 
     # Prefer paragraph boundaries so headings, lists, and tables are rendered as
     # complete Markdown blocks. Long prose also flushes at sentence boundaries.
-    while "\n\n" in buffer:
-        block, buffer = buffer.split("\n\n", 1)
+    # 只在代码块外按空行分段，避免 ``` 内的空行把代码块拆碎导致渲染失败。
+    while True:
+        boundary = _find_paragraph_boundary(buffer)
+        if boundary == -1:
+            break
+        block = buffer[:boundary]
+        buffer = buffer[boundary + 2 :]
         _render_public_answer_block(block)
+
     if "```" not in buffer and not buffer.lstrip().startswith("|") and len(buffer) >= 160:
         boundary = max(
             buffer.rfind(mark, 0, 160)
