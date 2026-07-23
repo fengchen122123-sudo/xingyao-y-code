@@ -1321,6 +1321,8 @@ def _execute_single_tool_call(
         friendly_msg = f"💻 星瑶正在执行命令：{cmd}"
     elif function_name == "search_code":
         friendly_msg = f"🔍 星瑶正在全局查找: {arguments.get('query', '')}"
+    elif function_name == "find_definition":
+        friendly_msg = f"🔍 星瑶正在查找符号定义: {arguments.get('symbol', '')}"
     elif function_name == "search_news":
         friendly_msg = f"🌐 星瑶正在联网搜索：{arguments.get('query', '')}"
     elif function_name == "fetch_url":
@@ -1541,6 +1543,7 @@ def _execute_single_tool_call(
         elif function_name in {
             "list_directory",
             "search_code",
+            "find_definition",
             "execute_command",
             "search_news",
             "fetch_url",
@@ -1553,7 +1556,7 @@ def _execute_single_tool_call(
         }:
             # 只读目录类工具在沙盒外访问时需用户确认（同意本次/始终放行会话）
             bypass_cm, sandbox_err = None, None
-            if function_name in ("list_directory", "search_code", "glob_files"):
+            if function_name in ("list_directory", "search_code", "find_definition", "glob_files"):
                 bypass_cm, sandbox_err = _sandbox_outside_guard(
                     function_name, arguments.get("dir_path", "."), event_callback,
                     permission_owner, parent_turn_id, permission_source, cancel_event,
