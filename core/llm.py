@@ -888,12 +888,31 @@ def _provider_request_options(model_name, api_base):
     """Return options required by a known provider/model pair."""
     normalized_base = str(api_base or "").rstrip("/").lower()
     normalized_model = str(model_name or "").split("/")[-1].lower()
+
+    # Kimi K3：启用 thinking，保持较高预算以支持复杂推理。
     if "api.kimi.com/coding" in normalized_base and normalized_model == "k3":
         return {
             "thinking": {"type": "enabled", "budget_tokens": 4096},
             "max_tokens": 32000,
             "allowed_openai_params": ["thinking"],
         }
+
+    # Kimi K2.7：降低 thinking 预算以节省额度；若模型不支持 thinking 则由 litellm 忽略。
+    if ("api.kimi.com/coding" in normalized_base or "api.moonshot.cn" in normalized_base) and "k2.7" in normalized_model:
+        return {
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "max_tokens": 16000,
+            "allowed_openai_params": ["thinking"],
+        }
+
+    # Moonshot openai 协议 K3：同样启用 thinking，但降低预算以平衡额度消耗。
+    if "api.moonshot.cn" in normalized_base and "k3" in normalized_model:
+        return {
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "max_tokens": 16000,
+            "allowed_openai_params": ["thinking"],
+        }
+
     return {}
 
 
