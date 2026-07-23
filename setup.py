@@ -1,8 +1,21 @@
+import re
+from pathlib import Path
+
 from setuptools import setup, find_packages
+
+
+def _get_version():
+    version_file = Path(__file__).parent / "core" / "version.py"
+    text = version_file.read_text(encoding="utf-8")
+    match = re.search(r'^__version__\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not match:
+        raise RuntimeError("Unable to find version string in core/version.py")
+    return match.group(1)
+
 
 setup(
     name='ycode',
-    version='1.0.30',
+    version=_get_version(),
     packages=find_packages(),
     py_modules=['main'],  # 根目录的 main.py 作为入口模块
     install_requires=[

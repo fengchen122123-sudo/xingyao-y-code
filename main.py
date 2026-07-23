@@ -40,6 +40,7 @@ from core.turn_renderer import TurnRenderer
 from core.plan import bind_default_plan_session, get_default_plan_manager
 from core.terminal_markdown import MarkdownRenderError, render_markdown_to_ansi
 from core.model_manager import get_active_model
+from core.version import __version__ as YCODE_VERSION
 # 警告：from-import 会在 import 时冻结常量值。新增调用方禁止 from-import 这些常量，
 # 应 import config 后动态读取（如 config.MY_MODEL），以便配置热更新生效。
 from config import MY_MODEL, MY_KEY, MY_BASE_URL, MY_THEME, MY_PERMISSION_MODE, DB_FILE
@@ -811,7 +812,7 @@ def print_logo(clear_screen=True):
         + make_data_line("   Session   : ", safe_session)
         + make_data_line("   Model     : ", model_display)
         + make_data_line("   Theme     : ", current_theme)
-        + make_data_line("   Version   : ", "v1.0.30")
+        + make_data_line("   Version   : ", f"v{YCODE_VERSION}")
         + make_box_line("")
         + make_box_line("   提示: 星瑶是您的编程伙伴，使用 <ansigreen>@文件</ansigreen> 可附带上下文。")
         + f"<style fg='{theme_color}'>└────────────────────────────────────────────────────────┘</style>\n"

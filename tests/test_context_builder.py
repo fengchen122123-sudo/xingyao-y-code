@@ -117,11 +117,27 @@ def test_default_prompt_defines_http_and_weather_tool_selection():
 
 def test_source_and_package_versions_match():
     import re
+    from core.version import __version__ as core_version
 
-    main_source = Path("main.py").read_text(encoding="utf-8")
+    version_source = Path("core/version.py").read_text(encoding="utf-8")
     setup_source = Path("setup.py").read_text(encoding="utf-8")
+    main_source = Path("main.py").read_text(encoding="utf-8")
 
-    main_version = re.search(r'"v(\d+\.\d+\.\d+)"', main_source).group(1)
-    setup_version = re.search(r"version='(\d+\.\d+\.\d+)'", setup_source).group(1)
-    # main.py 与 setup.py 的版本号必须保持一致（历史上曾出现 1.0.29/1.0.28 漂移）
-    assert main_version == setup_version
+    # core/version.py 中的版本号应与导入值一致
+    file_version = re.search(
+        r'^__version__\s*=\s*"(\d+\.\d+\.\d+)"',
+        version_source,
+        re.MULTILINE,
+    ).group(1)
+    assert file_version == core_version
+
+    # setup.py 通过 _get_version() 从 core/version.py 读取版本
+    assert "version=_get_version()" in setup_source.replace(" ", "")
+    assert "core/version.py" in setup_source
+
+    # main.py 使用 core.version 中的版本
+    assert "from core.version import __version__ as YCODE_VERSION" in main_source
+    assert 'f"v{YCODE_VERSION}"' in main_source
+
+    # 版本号格式合法
+    assert re.fullmatch(r"\d+\.\d+\.\d+", core_version)
