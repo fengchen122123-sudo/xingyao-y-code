@@ -851,3 +851,83 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
     assert "验证" in payload["error"]
     assert plan.snapshot()[0]["status"] == "failed"
     bind_default_plan_session(previous_session)
+
+
+def test_edit_file_fuzzy_match_minor_trailing_whitespace(tmp_path, monkeypatch):
+    """target_content 与原文仅有首尾空白差异时也能定位。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "fuzzy.txt"
+    target.write_text("def foo():\n    pass\n", encoding="utf-8")
+
+    result = edit_file("fuzzy.txt", "def foo():\n    pass", "def bar():\n    return 1")
+    assert result.startswith("\u2714")
+    assert target.read_text(encoding="utf-8") == "def bar():\n    return 1\n"
+
+
+def test_edit_file_fuzzy_match_minor_pollution(tmp_path, monkeypatch):
+    """target_content 存在轻微字符污染时，仍可通过模糊匹配定位并替换。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "polluted.txt"
+    original = (
+        "public void HandleReturnResult(List<IEntryDataObject> result) {\n"
+        "    if (result == null || result.isEmpty()) {\n"
+        "        throw new BaseBusinessException(\"empty\");\n"
+        "    }\n"
+        "}\n"
+    )
+    target.write_text(original, encoding="utf-8")
+
+    # 模拟污染：把 null 写成 nul1，其余与原文完全一致
+    polluted_target = (
+        "public void HandleReturnResult(List<IEntryDataObject> result) {\n"
+        "    if (result == nul1 || result.isEmpty()) {\n"
+        "        throw new BaseBusinessException(\"empty\");\n"
+        "    }\n"
+        "}\n"
+    )
+    replacement = (
+        "public void HandleReturnResult(List<IEntryDataObject> result) {\n"
+        "    if (result == null || result.isEmpty()) {\n"
+        "        log.warn(\"empty result\");\n"
+        "        return;\n"
+        "    }\n"
+        "}\n"
+    )
+    result = edit_file("polluted.txt", polluted_target, replacement)
+    assert result.startswith("\u2714")
+    assert target.read_text(encoding="utf-8") == replacement
+
+
+def test_write_file_refuses_to_overwrite_large_existing_file(tmp_path, monkeypatch):
+    """write_file 应拒绝覆盖超过 500 行 / 50KB 的已有大文件。"""
+    from core.tools import write_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "large.txt"
+    # 构造 600 行的小文件，超过行数阈值
+    target.write_text("\n".join(f"line {i}" for i in range(600)), encoding="utf-8")
+
+    result = write_file("large.txt", "new content")
+    assert isinstance(result, str)
+    assert result.startswith("\U0001f6a8")
+    assert "large.txt" in result
+    # 文件内容不应被覆盖
+    assert "new content" not in target.read_text(encoding="utf-8")
+
+
+def test_write_file_allows_overwrite_small_existing_file(tmp_path, monkeypatch):
+    """write_file 允许覆盖小文件。"""
+    from core.tools import write_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "small.txt"
+    target.write_text("old", encoding="utf-8")
+
+    result = write_file("small.txt", "new")
+    assert isinstance(result, str)
+    assert result.startswith("\u2714")
+    assert target.read_text(encoding="utf-8") == "new"

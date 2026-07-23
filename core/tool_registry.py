@@ -267,7 +267,7 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="write_file",
-            description="创建或完整写入文件。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）。",
+            description="创建新文件或完整重写小文件。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）。重要限制：如果目标文件已存在且超过 500 行 / 50KB，write_file 会拒绝覆盖；修改已有大文件必须使用 edit_file 进行局部片段修改。",
             input_schema=_schema({
                 "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
                 "content": {"type": "string"},
@@ -278,7 +278,7 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="edit_file",
-            description="以精确字符串替换的方式修改文件。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；target_content 必须唯一匹配，出现多次时需补充上下文或显式设置 replace_all。为避免 JSON 截断导致失败，单次 target_content 建议不超过 1500 字符；更大改动请拆分为多次小改或使用 write_file 重写。",
+            description="以字符串替换的方式局部修改已有文件（首选工具）。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；系统会尝试智能定位 target_content，即使轻微截断/空白差异也能匹配。target_content 应尽量短小并包含唯一上下文；出现多次时需补充上下文或显式设置 replace_all。单次 target_content 不得超过 1500 字符，更大改动请拆分为多次小改；严禁用 write_file 覆盖已有大文件来替代 edit_file。",
             input_schema=_schema({
                 "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
                 "target_content": {"type": "string"},

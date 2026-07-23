@@ -757,7 +757,8 @@ def _supports_vision(model_name):
     判定顺序：
     1. 模型配置中的 supports_vision 显式标注（config.json 的 models 条目，可选）
     2. LiteLLM 内置模型信息（知名模型）
-    3. 未知模型按协议兜底：openai/anthropic 兼容端点通常接受 image_url 负载
+    3. 未知模型默认按不支持处理，避免把 image_url 负载发给纯文本模型触发
+       "Model only support text input" 等 400 错误
     """
     if not model_name:
         return False
@@ -774,7 +775,7 @@ def _supports_vision(model_name):
             return True
     except Exception:
         pass
-    return str(model_name).startswith(("openai/", "anthropic/"))
+    return False
 
 
 def _flatten_media_content(content_list):
@@ -803,6 +804,8 @@ def _strip_media_and_merge(messages, model_name=None):
        不支持视觉的模型全部折叠为占位符（绝不把 base64 当文本发给模型）
     2. 合并连续相同 role 的消息，满足 LiteLLM / Anthropic 对 user/assistant 严格轮流的要求
     3. reasoning_content / thinking_blocks 仅对支持的 provider 回传，避免其他 provider 报 400
+
+    返回 (fixed_messages, folded_media_count, keep_media)。
     """
     keep_reasoning_fields = _supports_reasoning_fields(model_name)
     keep_media = _supports_vision(model_name)
@@ -818,6 +821,7 @@ def _strip_media_and_merge(messages, model_name=None):
             ):
                 last_media_idx = idx
 
+    folded_count = 0
     cleaned = []
     for idx, msg in enumerate(messages):
         role = msg.get("role")
@@ -829,6 +833,11 @@ def _strip_media_and_merge(messages, model_name=None):
                 cleaned_msg = {"role": role, "content": content}
             else:
                 cleaned_msg = {"role": role, "content": _flatten_media_content(content)}
+                folded_count += sum(
+                    1
+                    for item in content
+                    if isinstance(item, dict) and item.get("type") in ("image", "image_url", "document")
+                )
         else:
             cleaned_msg = {"role": role, "content": str(content) if content is not None else ""}
 
@@ -881,7 +890,7 @@ def _strip_media_and_merge(messages, model_name=None):
                 fixed[-1]["content"] = (fixed[-1]["content"] or "") + "\n" + (msg["content"] or "")
             else:
                 fixed.append(msg)
-    return fixed
+    return fixed, folded_count, keep_media
 
 
 def _provider_request_options(model_name, api_base):
@@ -1410,17 +1419,21 @@ def _execute_single_tool_call(
                 # 新建文件也记录空内容快照，保证 undo 可以回退到“文件不存在之前”
                 from core.memory import set_undo_state
                 set_undo_state(file_path, old_content)
-                write_file(file_path, new_content)
-            # 生成 diff 并展示
-            _show_file_diff(
-                file_path,
-                old_content,
-                new_content,
-                event_callback,
-                panel_title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
-                truncated_note="已成功写入文件",
-            )
-            result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
+                write_result = write_file(file_path, new_content)
+            if isinstance(write_result, str) and write_result.startswith("🚨"):
+                # 大文件覆盖保护等场景：write_file 拒绝写入，不应展示虚假 diff
+                result = write_result
+            else:
+                # 生成 diff 并展示
+                _show_file_diff(
+                    file_path,
+                    old_content,
+                    new_content,
+                    event_callback,
+                    panel_title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
+                    truncated_note="已成功写入文件",
+                )
+                result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
         elif function_name == "run_subagent":
             if not allow_subagents:
                 result = f"{TOOL_ERROR_PREFIX} 子代理不能启动其他子代理。"
@@ -1760,7 +1773,7 @@ def _chat_with_model_generator(
     kwargs = {
         "model": model_name,
         "api_key": api_key,
-        "messages": _strip_media_and_merge(messages, model_name),
+        "messages": _strip_media_and_merge(messages, model_name)[0],
         "tools": request_tools,
         "tool_choice": "auto",
         "stream": True,
@@ -1808,10 +1821,21 @@ def _chat_with_model_generator(
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
                 try:
-                    kwargs["messages"] = _apply_cache_control(
-                        _strip_media_and_merge(messages, model_name),
-                        model_name,
-                    )
+                    cleaned_messages, folded_count, keep_media = _strip_media_and_merge(messages, model_name)
+                    kwargs["messages"] = _apply_cache_control(cleaned_messages, model_name)
+                    if folded_count and attempt == 0 and turn == 0:
+                        if keep_media:
+                            _notify_event(
+                                event_callback,
+                                "notice",
+                                {"message": f"为节省 Token，仅保留最近一条消息中的图片，更早的 {folded_count} 个媒体已折叠为占位符。"},
+                            )
+                        else:
+                            _notify_event(
+                                event_callback,
+                                "notice",
+                                {"message": f"当前模型不支持图片/文档输入，已将 {folded_count} 个媒体折叠为 [图片]/[文档] 占位符。"},
+                            )
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
                     from concurrent.futures import ThreadPoolExecutor

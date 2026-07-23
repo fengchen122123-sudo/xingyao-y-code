@@ -1,6 +1,26 @@
 import os
 import shutil
 import sys
+import io
+
+# Windows GBK 终端在输出 emoji/非 BMP 字符时会触发 UnicodeEncodeError 崩溃。
+# 强制 stdout/stderr 使用 UTF-8 + replace 错误策略：无法显示的字符会变成 �，
+# 保证程序不崩溃；现代 Windows Terminal 已支持 UTF-8，旧版 conhost 最多显示乱码。
+if sys.stdout and hasattr(sys.stdout, "buffer") and getattr(sys.stdout, "encoding", None) != "utf-8":
+    try:
+        sys.stdout = io.TextIOWrapper(
+            sys.stdout.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+    except Exception:
+        pass
+if sys.stderr and hasattr(sys.stderr, "buffer") and getattr(sys.stderr, "encoding", None) != "utf-8":
+    try:
+        sys.stderr = io.TextIOWrapper(
+            sys.stderr.buffer, encoding="utf-8", errors="replace", line_buffering=True
+        )
+    except Exception:
+        pass
+
 # 防止 PyInstaller 双重导入主入口模块导致全局变量（如 app_instance 等）在子线程内读取为 None 的双重导入陷阱
 if '__main__' in sys.modules and 'main' not in sys.modules:
     sys.modules['main'] = sys.modules['__main__']
@@ -571,6 +591,14 @@ def _render_ui_event(event):
         is_thinking = True
         if app_instance is not None:
             app_instance.invalidate()
+
+    if event.kind == "notice":
+        message = str(event.payload.get("message", ""))
+        if message:
+            print_formatted_text(HTML(f"<ansiyellow>! {_esc(message)}</ansiyellow>"))
+        if app_instance is not None:
+            app_instance.invalidate()
+        return
 
     if event.kind == "thinking_started":
         active_thinking_text = ""
@@ -1956,9 +1984,32 @@ def _background_worker():
 
             schedule_ui(mark_turn_initializing)
 
-            user_input = task_data["text"]
-            was_queued = task_data["was_queued"]
+            # 防御性检查：某些边界路径或旧进程可能投递不一致的任务结构，
+            # 直接取 key 会导致后台 worker 崩溃并阻塞后续任务。
+            if not isinstance(task_data, dict):
+                logging.getLogger("py.warnings").warning(
+                    "background worker received non-dict task_data: %s", type(task_data).__name__
+                )
+                schedule_ui(lambda: print_formatted_text(
+                    HTML("\n<ansired>! 后台任务执行失败：任务格式异常，已跳过。</ansired>\n")
+                ))
+                continue
+
+            user_input = task_data.get("text", "")
+            if not isinstance(user_input, str):
+                user_input = str(user_input) if user_input is not None else ""
+            was_queued = task_data.get("was_queued", False)
             is_skill_call = task_data.get("is_skill_call", False)
+            if not user_input.strip():
+                # 空任务：调度到 UI 提示并跳过，避免后续空转或 400
+                logging.getLogger("py.warnings").warning(
+                    "background worker received empty task_data: %s",
+                    {k: type(v).__name__ for k, v in task_data.items()},
+                )
+                schedule_ui(lambda: print_formatted_text(
+                    HTML("\n<ansired>! 后台任务执行失败：收到空任务，已跳过。</ansired>\n")
+                ))
+                continue
 
             # 注：普通 slash 命令在 Enter 键绑定里已由 UI 线程同步路由执行，
             # 能进入队列的 slash 输入只有“主动技能调用”（is_skill_call=True）。
@@ -1975,9 +2026,8 @@ def _background_worker():
             active_info = get_active_model()
             if not active_info or not active_info.get("litellm_model"):
                 schedule_ui(lambda: print_formatted_text(
-                    HTML("❌ <b><ansired>您当前未配置或激活任何大模型！请输入 /models 添加并激活模型后再进行对话。</ansired></b>")
+                    HTML("<ansired>! 您当前未配置或激活任何大模型！请输入 /models 添加并激活模型后再进行对话。</ansired>")
                 ))
-                msg_queue.task_done()
                 continue
 
             task_session = current_session

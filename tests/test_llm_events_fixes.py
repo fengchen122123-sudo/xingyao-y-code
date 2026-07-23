@@ -607,7 +607,7 @@ def test_vision_model_keeps_latest_image_and_strips_older(monkeypatch):
         {"role": "assistant", "content": "好的"},
         _image_msg("第二张"),
     ]
-    out = llm_mod._strip_media_and_merge(messages, "openai/vision-model")
+    out = llm_mod._strip_media_and_merge(messages, "openai/vision-model")[0]
 
     # 较早的图片被折叠，base64 不外泄
     assert isinstance(out[1]["content"], str)
@@ -624,7 +624,7 @@ def test_non_vision_model_flattens_image_without_base64_leak(monkeypatch):
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod, "_supports_vision", lambda model: False)
-    out = llm_mod._strip_media_and_merge([_image_msg()], "openai/text-model")
+    out = llm_mod._strip_media_and_merge([_image_msg()], "openai/text-model")[0]
     assert isinstance(out[0]["content"], str)
     assert "AAAABBBB" not in out[0]["content"]
     assert "[图片]" in out[0]["content"]
@@ -637,7 +637,7 @@ def test_media_list_content_not_merged_with_text(monkeypatch):
     monkeypatch.setattr(llm_mod, "_supports_vision", lambda model: True)
     out = llm_mod._strip_media_and_merge(
         [_image_msg("问题"), {"role": "user", "content": "补充"}], "openai/vision-model"
-    )
+    )[0]
     assert len(out) == 2
     assert isinstance(out[0]["content"], list)
     assert out[1]["content"] == "补充"
@@ -659,8 +659,8 @@ def test_supports_vision_config_flag_takes_precedence(monkeypatch):
     assert llm_mod._supports_vision("openai/m2") is True
 
 
-def test_supports_vision_protocol_fallback(monkeypatch):
-    """未知模型按协议兜底：openai//anthropic/ 视为支持视觉"""
+def test_supports_vision_unknown_default_false(monkeypatch):
+    """未知模型默认不支持视觉，避免把 image_url 发给纯文本模型触发 400"""
     import core.llm as llm_mod
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {"providers": []})
@@ -669,7 +669,7 @@ def test_supports_vision_protocol_fallback(monkeypatch):
         lambda model: False,
         raising=False,
     )
-    assert llm_mod._supports_vision("openai/step-3.7-flash") is True
-    assert llm_mod._supports_vision("anthropic/K3") is True
+    assert llm_mod._supports_vision("openai/step-3.7-flash") is False
+    assert llm_mod._supports_vision("anthropic/K3") is False
     assert llm_mod._supports_vision("deepseek/deepseek-chat") is False
     assert llm_mod._supports_vision(None) is False
