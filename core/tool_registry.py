@@ -76,8 +76,11 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="list_directory",
-            description="列出目录内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）。",
-            input_schema=_schema({"dir_path": {"type": "string", "default": "."}}),
+            description="列出目录内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）。超过 max_entries 时自动截断。",
+            input_schema=_schema({
+                "dir_path": {"type": "string", "default": "."},
+                "max_entries": {"type": "integer", "default": 200, "minimum": 1, "maximum": 1000},
+            }),
             execute=tools.list_directory,
             read_only=True,
             requires_permission=False,
