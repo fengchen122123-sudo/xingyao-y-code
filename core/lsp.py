@@ -143,14 +143,16 @@ def find_definition(symbol, dir_path='.', file_extensions=None):
         return f"🚨 查找异常: {e}"
 
 
-def _find_definition_fallback(symbol, dir_path, patterns, file_extensions=None, timeout_seconds=10):
+def _find_definition_fallback(symbol, dir_path, patterns, file_extensions=None, timeout_seconds=30):
     """无 ripgrep 时的回退实现：Python os.walk + 正则匹配。
 
-    为防止在大代码库上无限遍历，设置了时间上限、目录/文件大小限制，
+    为防止在大代码库上无限遍历，设置了时间上限、扫描文件数上限、目录/文件大小限制，
     且未指定扩展名时默认只扫描常见源代码文件。
     """
-    ignore_dirs = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', 'build', 'dist', 'target', 'out', '.gradle'}
+    ignore_dirs = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', 'build', 'dist', 'target', 'out', '.gradle', 'bin', 'obj'}
     results = []
+    scanned_files = 0
+    max_files_to_scan = 3000  # 文件数上限，避免大仓库扫描过久
     deadline = time.monotonic() + timeout_seconds
     max_file_size = 2 * 1024 * 1024  # 2MB，超大文件通常是日志/构建产物，跳过
 
@@ -160,13 +162,20 @@ def _find_definition_fallback(symbol, dir_path, patterns, file_extensions=None, 
     else:
         allowed_exts = {'.py', '.js', '.ts', '.jsx', '.tsx', '.java', '.go', '.rs', '.c', '.cpp', '.h', '.hpp', '.cs', '.swift', '.kt', '.scala', '.php', '.rb'}
 
+    install_hint = (
+        "\n提示：安装 ripgrep 可大幅加速符号查找。Windows 安装方式："
+        "1) 下载 https://github.com/BurntSushi/ripgrep/releases 的 x64 zip；"
+        "2) 将 rg.exe 所在目录加入系统 PATH；"
+        "3) 重启 ycode。"
+    )
+
     try:
         for root, dirs, files in os.walk(dir_path):
             # 超时保护：避免在大项目上卡住几十分钟
             if time.monotonic() > deadline:
                 if results:
-                    return '\n'.join(results) + f"\n... (查找超时，仅返回已找到的 {len(results)} 处)"
-                return f"🚨 查找超时（{timeout_seconds}s）：目录过大或 ripgrep 未安装，建议安装 ripgrep 后重试。"
+                    return '\n'.join(results) + f"\n... (查找超时，仅返回已找到的 {len(results)} 处；已扫描 {scanned_files} 个文件){install_hint}"
+                return f"🚨 查找超时（{timeout_seconds}s）：目录过大或 ripgrep 未安装，建议安装 ripgrep 后重试。{install_hint}"
             dirs[:] = [d for d in dirs if d not in ignore_dirs and not d.startswith('.')]
             for fname in files:
                 if fname.startswith('.'):
@@ -175,6 +184,11 @@ def _find_definition_fallback(symbol, dir_path, patterns, file_extensions=None, 
                 if ext not in allowed_exts:
                     continue
                 fpath = os.path.join(root, fname)
+                scanned_files += 1
+                if scanned_files > max_files_to_scan:
+                    if results:
+                        return '\n'.join(results) + f"\n... (已扫描文件数达到上限 {max_files_to_scan}，仅返回已找到的 {len(results)} 处){install_hint}"
+                    return f"🚨 查找范围过大（已扫描 {max_files_to_scan} 个文件仍未找到）：建议安装 ripgrep 加速，或缩小 dir_path 范围。{install_hint}"
                 try:
                     st = os.stat(fpath)
                     if not st.st_size or st.st_size > max_file_size:
