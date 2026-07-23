@@ -20,10 +20,12 @@ from xml.sax.saxutils import escape
 
 from ddgs import DDGS
 
+from core.version import __version__ as YCODE_VERSION
+
 
 HTTP_TIMEOUT_SECONDS = 20
 HTTP_MAX_BYTES = 512 * 1024
-HTTP_USER_AGENT = "Y-Code/1.0.19 (terminal coding assistant)"
+HTTP_USER_AGENT = f"ycode/{YCODE_VERSION} (terminal coding assistant)"
 READ_FILE_MAX_LINES = 2000
 # 大文件阈值：超过此字节数的文件，未显式指定 limit 时自动只读前部分并提示分页
 READ_FILE_LARGE_BYTES = 50 * 1024
