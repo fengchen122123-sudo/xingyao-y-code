@@ -21,6 +21,7 @@ from xml.sax.saxutils import escape
 from ddgs import DDGS
 
 from core.version import __version__ as YCODE_VERSION
+from core import tool_cache as _tool_cache
 
 
 HTTP_TIMEOUT_SECONDS = 20
@@ -181,6 +182,11 @@ def read_file(file_path, offset=0, limit=None, compress=False):
     """
     resolved = _resolve_workspace_path(file_path)
 
+    cache_key = _tool_cache.read_file_key(str(resolved), offset, limit, compress)
+    cached = _tool_cache.read_file_get(cache_key)
+    if cached is not None:
+        return cached
+
     # 大文件自适应：未显式指定 limit 时，按文件大小决定默认读取行数
     file_size = resolved.stat().st_size
     auto_limited = False
@@ -229,7 +235,9 @@ def read_file(file_path, offset=0, limit=None, compress=False):
         else:
             truncation_note = f"\n... (文件共 {total} 行，已显示第 {start + 1}-{end} 行；请使用 offset/limit 参数继续读取)"
 
-    return result + compressed_note + truncation_note
+    final = result + compressed_note + truncation_note
+    _tool_cache.read_file_put(cache_key, final)
+    return final
 
 def write_file(file_path, content):
     """将内容写入文件（仅限当前工作目录内，统一按 utf-8 编码写入）"""
@@ -253,7 +261,7 @@ def write_file(file_path, content):
 
 # --- 下面是给星瑶装配的两个新神装 ---
 
-def list_directory(dir_path="."):
+def list_directory(dir_path=".", max_entries=200):
     """雷达工具：扫描文件夹，返回里面的所有文件和文件夹列表（仅限当前工作目录内）"""
     try:
         resolved = _resolve_workspace_path(dir_path)
@@ -264,6 +272,11 @@ def list_directory(dir_path="."):
         items = os.listdir(resolved)
         if not items:
             return f"📂 目录 '{dir_path}' 为空。"
+        max_entries = max(1, min(int(max_entries or 200), 1000))
+        if len(items) > max_entries:
+            shown = items[:max_entries]
+            shown.append(f"... (目录过大，已截断前 {max_entries} 项，共 {len(items)} 项)")
+            return "\n".join(shown)
         return "\n".join(items)
     except Exception as e:
         return f"🚨 目录扫描失败: {str(e)}"
@@ -796,17 +809,27 @@ def search_code(query, dir_path="."):
         dir_path = str(_resolve_workspace_path(dir_path))
     except ValueError as e:
         return f"🚨 搜索失败: {e}"
+
+    cache_key = _tool_cache.search_key("search_code", query, dir_path)
+    cached = _tool_cache.search_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         cmd = ["rg", "-n", "-i", "--no-heading", "--max-columns", "200", "-C", "1", query, dir_path]
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
         if result.returncode in (0, 1):
             output = result.stdout.strip()
             if not output:
-                return "未找到匹配的代码片段。"
-            lines = output.split("\n")
-            if len(lines) > 60:
-                return "\n".join(lines[:60]) + f"\n\n... (匹配结果过多，已截断，共 {len(lines)} 行)"
-            return output
+                result_text = "未找到匹配的代码片段。"
+            else:
+                lines = output.split("\n")
+                if len(lines) > 60:
+                    result_text = "\n".join(lines[:60]) + f"\n\n... (匹配结果过多，已截断，共 {len(lines)} 行)"
+                else:
+                    result_text = output
+            _tool_cache.search_put(cache_key, result_text)
+            return result_text
     except Exception:
         pass
 
@@ -847,13 +870,18 @@ def search_code(query, dir_path="."):
                             
                             if match_count >= max_matches:
                                 results.append(f"\n⚠️ 搜索结果太多，已截断前 {max_matches} 条，请尝试更精确的关键字。")
-                                return "\n---\n".join(results)
+                                result_text = "\n---\n".join(results)
+                                _tool_cache.search_put(cache_key, result_text)
+                                return result_text
                 except Exception:
                     continue
                     
         if not results:
-            return f"🔍 搜索完毕，未在代码文件中找到包含 `{query}` 的内容。"
-        return "\n---\n".join(results)
+            result_text = f"🔍 搜索完毕，未在代码文件中找到包含 `{query}` 的内容。"
+        else:
+            result_text = "\n---\n".join(results)
+        _tool_cache.search_put(cache_key, result_text)
+        return result_text
     except Exception as e:
         return f"🚨 搜索失败: {str(e)}"
 
@@ -1833,6 +1861,11 @@ def glob_files(pattern, dir_path="."):
     if not base.exists() or not base.is_dir():
         return f"🚨 错误：指定的目录不存在或非有效目录: {dir_path}"
 
+    cache_key = _tool_cache.glob_key(pattern, str(base))
+    cached = _tool_cache.glob_get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
         cmd = ["rg", "--files", "--glob", pattern, str(base)]
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
@@ -1851,6 +1884,7 @@ def glob_files(pattern, dir_path="."):
                 res = "\n".join(rel_matches[:max_results])
                 if truncated:
                     res += f"\n\n... (匹配结果过多，已截断，共 {len(rel_matches)} 个匹配文件)"
+                _tool_cache.glob_put(cache_key, res)
                 return res
     except Exception:
         pass
@@ -1866,12 +1900,14 @@ def glob_files(pattern, dir_path="."):
         except Exception:
             pass
         if not matches:
-            return "没有找到匹配该模式的文件。"
-        max_results = 100
-        truncated = len(matches) > max_results
-        res = "\n".join(matches[:max_results])
-        if truncated:
-            res += f"\n\n... (匹配结果过多，已截断，共 {len(matches)} 个匹配文件)"
-        return res
+            result_text = "没有找到匹配该模式的文件。"
+        else:
+            max_results = 100
+            truncated = len(matches) > max_results
+            result_text = "\n".join(matches[:max_results])
+            if truncated:
+                result_text += f"\n\n... (匹配结果过多，已截断，共 {len(matches)} 个匹配文件)"
+        _tool_cache.glob_put(cache_key, result_text)
+        return result_text
     except Exception as e:
         return f"🚨 快速匹配工具发生异常: {str(e)}"
