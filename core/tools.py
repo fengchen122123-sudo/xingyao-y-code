@@ -281,8 +281,29 @@ def read_file(file_path, offset=0, limit=None, compress=False):
     return final
 
 def write_file(file_path, content):
-    """将内容写入文件（仅限当前工作目录内，统一按 utf-8 编码写入）"""
+    """创建或完整写入文件（仅限当前工作目录内，统一按 utf-8 编码写入）。
+
+    保护规则：如果目标文件已存在且超过 500 行 / 50KB，write_file 会拒绝直接覆盖，
+    要求改用 edit_file 进行局部片段修改。这是为了避免把已有大文件整篇重写，
+    导致 diff 全红、Token 浪费以及误删未改动的代码。
+    """
     resolved = _resolve_workspace_path(file_path)
+
+    # 大文件覆盖保护：强制使用 edit_file 做片段修改
+    if resolved.exists() and resolved.is_file():
+        existing_size = resolved.stat().st_size
+        existing_lines = 0
+        try:
+            existing_lines = len(resolved.read_text(encoding="utf-8", errors="replace").splitlines())
+        except OSError:
+            pass
+        if existing_size > 50 * 1024 or existing_lines > 500:
+            return (
+                f"🚨 write_file 拒绝覆盖已有大文件（{file_path}，约 {existing_lines} 行 / {existing_size / 1024:.1f}KB）。\n"
+                f"为保护未改动代码并避免 diff 全红，请改用 edit_file 对目标片段进行局部修改；"
+                f"只有确定要完整重写整个文件时才告知用户此限制。"
+            )
+
     # 与 edit_file 对齐：先写同目录临时文件再 os.replace，避免写入中断留下半个文件
     fd, temp_name = tempfile.mkstemp(
         prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
@@ -299,6 +320,7 @@ def write_file(file_path, content):
         except OSError:
             pass
         raise
+    return f"✔ 文件 {file_path} 写入成功！"
 
 # --- 下面是给星瑶装配的两个新神装 ---
 
@@ -989,12 +1011,105 @@ def manage_task(action, task_id=None, event_callback=None, permission_owner=None
     else:
         return "🚨 错误：未知行动参数。可选值有 'list', 'status', 'kill'。"
 
+def _fuzzy_replace(content, target, replacement, replace_all=False):
+    """
+    在 content 中智能定位 target 并替换为 replacement。
+
+    匹配策略（按优先级）：
+    1. 精确字符串匹配（含换行风格自适应）。
+    2. 忽略首尾空白差异的匹配（保留 content 中实际的空白边界）。
+    3. 基于 difflib 的模糊匹配（相似度 >= 0.90），仅用于 target_content 存在
+       轻微字符污染但仍能安全定位的场景；明确截断的 target 不会被强行匹配，
+       避免 replacement 与剩余原文产生结构重复。
+
+    返回 (new_content, matched_count)。matched_count == 0 表示未找到。
+    """
+    import difflib
+
+    target_len = len(target)
+    if target_len == 0:
+        return content, 0
+
+    # 1. 精确匹配
+    occurrences = content.count(target)
+    if occurrences == 1:
+        return content.replace(target, replacement, 1), 1
+    if occurrences > 1:
+        if replace_all:
+            return content.replace(target, replacement), occurrences
+        return content, occurrences
+
+    # 2. 忽略首尾空白：找到 content 中 stripped_target 唯一出现的位置，
+    #    用该位置的实际边界（含原始首尾空白）进行替换，避免缩进丢失。
+    stripped_target = target.strip("\r\n\t ")
+    if stripped_target and stripped_target != target:
+        stripped_occ = content.count(stripped_target)
+        if stripped_occ == 1:
+            start = content.find(stripped_target)
+            end = start + len(stripped_target)
+            # 扩展到 content 中连续的空白边界
+            while start > 0 and content[start - 1] in "\r\n\t ":
+                start -= 1
+            while end < len(content) and content[end] in "\r\n\t ":
+                end += 1
+            return content[:start] + replacement + content[end:], 1
+        if stripped_occ > 1:
+            return content, stripped_occ
+
+    # 3. 模糊匹配：按 target 的物理行数在 content 中滑动，取相似度最高的窗口。
+    #    适用于 target_content 存在个别字符污染但仍与原文高度相似的场景。
+    target_lines = target.splitlines(keepends=True)
+    if len(target_lines) >= 2:
+        first_line_text = target_lines[0].strip()
+        last_line_text = target_lines[-1].strip()
+        if first_line_text and last_line_text:
+            content_lines = content.splitlines(keepends=True)
+            candidates = []
+            for i, line in enumerate(content_lines):
+                if first_line_text not in line:
+                    continue
+                # 取与 target 行数相同的窗口作为候选
+                j = i + len(target_lines)
+                if j > len(content_lines):
+                    continue
+                # 同时要求窗口最后一行包含 target 最后一行的文本
+                if last_line_text not in content_lines[j - 1]:
+                    continue
+                candidate = "".join(content_lines[i:j])
+                ratio = difflib.SequenceMatcher(None, target, candidate).ratio()
+                candidates.append((ratio, i, j, candidate))
+            if candidates:
+                candidates.sort(reverse=True)
+                best_ratio, i, j, candidate = candidates[0]
+                # 要求整段高度相似，且长度接近，拒绝明显截断或不匹配的候选
+                if best_ratio >= 0.90 and abs(len(candidate) - target_len) <= max(target_len // 10, 10):
+                    start = sum(len(ln) for ln in content_lines[:i])
+                    end = sum(len(ln) for ln in content_lines[:j])
+                    return content[:start] + replacement + content[end:], 1
+
+    # 4. 字符级滑动窗口兜底（仅对中小文件/目标，避免 O(n^2) 灾难）
+    if target_len <= 2000 and len(content) <= 200_000:
+        best_ratio = 0.0
+        best_start = 0
+        for i in range(len(content) - target_len + 1):
+            window = content[i : i + target_len]
+            ratio = difflib.SequenceMatcher(None, target, window).ratio()
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_start = i
+        if best_ratio >= 0.90:
+            best_end = best_start + target_len
+            return content[:best_start] + replacement + content[best_end:], 1
+
+    return content, 0
+
+
 def edit_file(file_path, target_content, replacement_content, replace_all=False):
     """
     手术刀局部替换工具：用于对已有代码文件进行点对点局部精准替换，不用每次都重写整张文件，避免开销和误删。
     参数:
       file_path: 要修改的文件的相对或绝对路径（仅限当前工作目录内）。
-      target_content: 文件中要被替换的旧代码段（必须完全一致且唯一，注意保留原始缩进和换行）。
+      target_content: 文件中要被替换的旧代码段（尽量保持原始缩进和换行；允许轻微差异，系统会尝试智能定位）。
       replacement_content: 准备换上的新代码段。
       replace_all: 是否替换全部出现位置（默认 False，旧代码段出现多次时必须显式开启）。
     """
@@ -1022,28 +1137,27 @@ def edit_file(file_path, target_content, replacement_content, replace_all=False)
     if not target:
         return "🚨 精准修改失败！target_content 不能为空。"
 
-    # 换行策略：优先按原文精确匹配；匹配不到时把目标串转换成文件实际使用的换行风格再匹配，
-    # 写回时保持文件原有换行，不做全量换行归一化。
+    # 换行风格自适应：把 target/replacement 统一成文件实际使用的换行风格，
+    # 写回时仍保持文件原编码/换行。先归一化再转换，避免已有 \r\n 被腐蚀成 \r\r\n。
     match_target, match_replacement = target, replacement
-    if content.count(match_target) == 0:
-        if "\r\n" in content:
-            # 先归一（\r\n -> \n）再统一转成文件实际的 CRLF 风格，
-            # 避免把 target/replacement 中已有的 \r\n 腐蚀成 \r\r\n
-            alt_target = target.replace("\r\n", "\n").replace("\n", "\r\n")
-            alt_replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
-        elif "\r\n" in target:
-            alt_target = target.replace("\r\n", "\n")
-            alt_replacement = replacement.replace("\r\n", "\n")
-        else:
-            alt_target, alt_replacement = match_target, match_replacement
-        if alt_target != match_target and content.count(alt_target) > 0:
-            match_target, match_replacement = alt_target, alt_replacement
+    if "\r\n" in content:
+        if "\r\n" not in target:
+            match_target = target.replace("\r\n", "\n").replace("\n", "\r\n")
+            match_replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
+    elif "\r\n" in target:
+        match_target = target.replace("\r\n", "\n")
+        match_replacement = replacement.replace("\r\n", "\n")
 
-    occurrences = content.count(match_target)
+    new_content, occurrences = _fuzzy_replace(
+        content, match_target, match_replacement, replace_all=replace_all
+    )
+
     if occurrences == 0:
         return (
-            f"🚨 精准修改失败！在文件 {file_path} 中没有找到指定的旧代码段。\n"
-            f"请确保你传入的 target_content 的缩进、空格、换行完全匹配，或者你可以尝试使用 write_file 覆写工具。"
+            f"🚨 精准修改失败！在文件 {file_path} 中没有找到与 target_content 足够相似的代码段。\n"
+            f"建议：1) 使用 read_file(compress=False) 重新读取原始文本；"
+            f"2) 把 target_content 缩短到 1500 字符以内并包含唯一上下文；"
+            f"3) 若确实需要整体重写，再使用 write_file（write_file 会覆盖整个文件，diff 会显示全红）。"
         )
     if occurrences > 1 and not replace_all:
         return (
@@ -1051,15 +1165,13 @@ def edit_file(file_path, target_content, replacement_content, replace_all=False)
             f"请提供更长的、包含更多上下文的 target_content 以保证唯一匹配；如果确实需要全部替换，请显式设置 replace_all=True。"
         )
 
+    if new_content == content:
+        return f"🚨 精准修改失败！定位成功但替换后的内容与原文相同，未发生实际修改（{file_path}）。"
+
     # 校验全部通过后才写入撤销栈，避免失败的编辑污染撤销历史
     from core.memory import set_undo_state
     set_undo_state(file_path, content)
 
-    new_content = (
-        content.replace(match_target, match_replacement)
-        if replace_all
-        else content.replace(match_target, match_replacement, 1)
-    )
     # 原子写入：先写同目录临时文件再 os.replace，避免写入中断留下半个文件；
     # 用 tempfile.mkstemp 生成唯一临时文件名，避免并发编辑同一文件时互相覆盖
     fd, temp_name = tempfile.mkstemp(
