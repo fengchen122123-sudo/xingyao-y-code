@@ -16,10 +16,34 @@
 import os
 import re
 import subprocess
+import sys
 import time
 from pathlib import Path
 
 from core import tool_cache as _tool_cache
+
+
+def _get_rg_executable():
+    """返回可用的 ripgrep 可执行文件路径。
+
+    优先使用 ycode 内置的 rg.exe（打包后位于 _MEIPASS/vendor/ripgrep，
+    源码运行时位于项目根目录 vendor/ripgrep），其次尝试系统 PATH 中的 rg。
+    """
+    candidates = []
+    # 1. PyInstaller 打包后的临时目录
+    meipass = getattr(sys, '_MEIPASS', None)
+    if meipass:
+        candidates.append(os.path.join(meipass, 'vendor', 'ripgrep', 'rg.exe'))
+    # 2. 源码运行时的项目根目录
+    candidates.append(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'vendor', 'ripgrep', 'rg.exe'))
+    # 3. 当前工作目录（便于测试/独立拷贝）
+    candidates.append(os.path.join(os.getcwd(), 'vendor', 'ripgrep', 'rg.exe'))
+
+    for path in candidates:
+        if path and os.path.isfile(path):
+            return path
+    # 4. 系统 PATH
+    return 'rg'
 
 
 # 多语言符号定义模式（按语言关键字）
@@ -106,8 +130,9 @@ def find_definition(symbol, dir_path='.', file_extensions=None):
             glob_args.extend(['-g', f'*{ext}'])
 
     try:
+        rg_bin = _get_rg_executable()
         cmd = [
-            'rg', '-n', '--no-heading', '--max-columns', '200',
+            rg_bin, '-n', '--no-heading', '--max-columns', '200',
             '-e', combined,
             dir_path,
         ] + glob_args
