@@ -49,31 +49,8 @@ def _get_litellm():
         return _litellm
 
 
-_litellm_version = None
-
-
-def _get_litellm_version():
-    """缓存 litellm 版本号，避免重复查询。"""
-    global _litellm_version
-    if _litellm_version is None:
-        try:
-            from importlib.metadata import PackageNotFoundError, version
-
-            _litellm_version = version("litellm")
-        except Exception:
-            try:
-                _litellm_version = _get_litellm().__version__
-            except Exception:
-                _litellm_version = "unknown"
-    return _litellm_version
-
-
 def _litellm_completion(**kwargs):
-    """litellm.completion 的懒加载包装，统一注入 ycode 客户端标识。"""
-    kwargs.setdefault("extra_headers", {})
-    kwargs["extra_headers"]["User-Agent"] = (
-        f"ycode/{YCODE_VERSION} litellm/{_get_litellm_version()}"
-    )
+    """litellm.completion 的懒加载包装。"""
     return _get_litellm().completion(**kwargs)
 
 
@@ -112,7 +89,6 @@ from core.permission_broker import CANCELLED_RESULT, permission_broker
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
 from core.tool_presenter import summarize_tool_finished, summarize_tool_started
 from core.turn_events import TurnEventFactory
-from core.version import __version__ as YCODE_VERSION
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
 session_allowed_commands = set()      # 放行的命令前缀 (如 'git', 'date')
