@@ -1582,7 +1582,7 @@ def _execute_single_tool_call(
                     function_name, arguments.get("dir_path", "."), event_callback,
                     permission_owner, parent_turn_id, permission_source, cancel_event,
                 )
-            if function_name in ("execute_command", "search_code") and cancel_event is not None:
+            if function_name == "execute_command" and cancel_event is not None:
                 arguments["cancel_event"] = cancel_event
 
             if sandbox_err:
