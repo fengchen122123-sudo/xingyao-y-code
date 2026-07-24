@@ -81,6 +81,18 @@ ASK_USER_ERROR_PREFIX = "无法提问："
 TOOL_INTERNAL_ERROR_PREFIX = "Tool execution error:"
 PERMISSION_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 用户拒绝了执行该操作。"
 PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
+PERMISSION_SYSTEM_ERROR_MESSAGE = (
+    f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
+    f"这不是用户拒绝，请稍后重试或检查权限组件状态。"
+)
+
+
+class PermissionSystemError(Exception):
+    """权限询问流程自身发生异常（如 UI 事件丢失、broker 状态不一致）。
+
+    与"用户拒绝"(False)区分，避免模型把系统故障误解为用户主动拒绝。
+    """
+    pass
 
 # 🌟 注意这里：我们把四个工具全都引进来了！
 from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace, set_session_sandbox_bypass
@@ -460,10 +472,10 @@ def check_permission_and_ask(
         _notify_event(event_callback, "error", {
             "message": f"权限询问交互发生异常: {str(e)}",
         })
-        # 系统异常不应伪装成"用户拒绝"（False 会被模型理解为用户主动拒绝），
-        # 返回取消语义让调用方按"操作中断"处理，并确保 broker 队列被清理
+        # 系统异常不应伪装成"用户拒绝"（False 会被模型理解为用户主动拒绝）。
+        # 抛出 PermissionSystemError，由调用方返回专门的系统异常提示。
         permission_broker.cancel_owner(owner_id)
-        return False
+        raise PermissionSystemError(str(e)) from e
     finally:
         # 异常退出（含 KeyboardInterrupt 等 BaseException）时回收已入队请求，
         # 否则 broker 串行化会让后续所有权限提示永久排队
@@ -1180,15 +1192,18 @@ def _sandbox_outside_guard(
     if _tools._outside_workspace_allowed():
         return None, None
 
-    approved = check_permission_and_ask(
-        "sandbox_outside_access",
-        {"path": str(path_value), "operation": function_name},
-        event_callback=event_callback,
-        permission_owner=permission_owner,
-        parent_turn_id=parent_turn_id,
-        permission_source=permission_source,
-        cancel_event=cancel_event,
-    )
+    try:
+        approved = check_permission_and_ask(
+            "sandbox_outside_access",
+            {"path": str(path_value), "operation": function_name},
+            event_callback=event_callback,
+            permission_owner=permission_owner,
+            parent_turn_id=parent_turn_id,
+            permission_source=permission_source,
+            cancel_event=cancel_event,
+        )
+    except PermissionSystemError:
+        return None, PERMISSION_SYSTEM_ERROR_MESSAGE
     if approved:
         return sandbox_bypass(), None
     if cancel_event is not None and cancel_event.is_set():
@@ -1352,21 +1367,26 @@ def _execute_single_tool_call(
     except KeyError:
         requires_permission = function_name in ("write_file", "edit_file", "execute_command")
     if requires_permission:
-        approved = check_permission_and_ask(
-            function_name,
-            arguments,
-            event_callback=event_callback,
-            permission_owner=permission_owner,
-            parent_turn_id=parent_turn_id,
-            permission_source=permission_source,
-            cancel_event=cancel_event,
-        )
-        if not approved:
-            # 取消与拒绝使用不同的工具结果文案，避免把“取消”误述为“拒绝”喂给模型
-            if cancel_event is not None and cancel_event.is_set():
-                result = PERMISSION_CANCELLED_MESSAGE
-            else:
-                result = PERMISSION_DENIED_MESSAGE
+        try:
+            approved = check_permission_and_ask(
+                function_name,
+                arguments,
+                event_callback=event_callback,
+                permission_owner=permission_owner,
+                parent_turn_id=parent_turn_id,
+                permission_source=permission_source,
+                cancel_event=cancel_event,
+            )
+        except PermissionSystemError:
+            # 权限系统自身异常：明确告诉模型这是系统故障，不是用户拒绝
+            result = PERMISSION_SYSTEM_ERROR_MESSAGE
+        else:
+            if not approved:
+                # 取消与拒绝使用不同的工具结果文案，避免把“取消”误述为“拒绝”喂给模型
+                if cancel_event is not None and cancel_event.is_set():
+                    result = PERMISSION_CANCELLED_MESSAGE
+                else:
+                    result = PERMISSION_DENIED_MESSAGE
 
     _raise_if_tool_cancelled(cancel_event)
 
@@ -1637,21 +1657,15 @@ def _execute_single_tool_call(
                 except OSError as read_err:
                     logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
                     old_content = ""
-                # 修复后校验：target_content 必须在文件中能找到，否则说明截断修复不完整
-                if target and target not in old_content:
-                    result = (
-                        f"{TOOL_ERROR_PREFIX} edit_file 的 target_content 经 JSON 修复后"
-                        f"不完整（原始内容被截断），无法在文件中定位。"
-                        f"请将本次编辑拆分为更小的片段后重试。"
-                    )
-                else:
-                    # undo 快照由 core.tools.edit_file 内部统一记录
-                    result = edit_file(
-                        file_path,
-                        target,
-                        repl,
-                        replace_all=bool(arguments.get("replace_all", False)),
-                    )
+                # 不再做精确子串预检查：edit_file 内部 _fuzzy_replace 已实现
+                # 精确匹配、空白容错和 difflib 模糊匹配（相似度 >= 0.90），
+                # 预检查过严会导致仅有轻微空白差异的合法编辑被误拦截。
+                result = edit_file(
+                    file_path,
+                    target,
+                    repl,
+                    replace_all=bool(arguments.get("replace_all", False)),
+                )
                 if not result.startswith(TOOL_ERROR_PREFIX):
                     try:
                         new_content = _read_text_with_encoding_fallback(file_path)
@@ -1825,8 +1839,9 @@ def _chat_with_model_generator(
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
                     from concurrent.futures import ThreadPoolExecutor
-                    with ThreadPoolExecutor(max_workers=1) as executor:
-                        future = executor.submit(completion, **kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
+                    executor = ThreadPoolExecutor(max_workers=1)
+                    future = executor.submit(completion, **kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
+                    try:
                         while not future.done():
                             raise_if_cancelled()
                             try:
@@ -1841,6 +1856,10 @@ def _chat_with_model_generator(
                         if exc is not None:
                             raise exc
                         response_stream = future.result()
+                    finally:
+                        # 用户取消时避免 shutdown(wait=True) 阻塞到网络请求完成（最长 90s）
+                        future.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
                     break
                 except Exception as api_err:
                     err_str = str(api_err).lower()
