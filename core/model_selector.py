@@ -251,7 +251,7 @@ def open_model_selector(on_model_selected=None):
 
     state["items"] = build_items()
 
-    def _test_and_save_edited_model(event, ctx):
+    def _test_and_save_edited_model(event, ctx, supports_vision):
         state["message"] = "⏳ 正在验证连接模型..."
         state["testing"] = True
         event.app.invalidate()
@@ -300,6 +300,7 @@ def open_model_selector(on_model_selected=None):
                     api_key=key,
                     model_name=model,
                     context_window=ctx,
+                    supports_vision=supports_vision,
                 )
                 
                 def _on_success():
@@ -394,7 +395,7 @@ def open_model_selector(on_model_selected=None):
 
         threading.Thread(target=test_conn, daemon=True).start()
 
-    def _test_and_save_model(event, ctx):
+    def _test_and_save_model(event, ctx, supports_vision):
         state["message"] = "⏳ 正在验证连接模型..."
         state["testing"] = True
         event.app.invalidate()
@@ -445,6 +446,7 @@ def open_model_selector(on_model_selected=None):
                     provider_id=pid,
                     name=model,
                     context_window=ctx,
+                    supports_vision=supports_vision,
                 )
 
                 def _on_success():
@@ -470,7 +472,7 @@ def open_model_selector(on_model_selected=None):
 
         threading.Thread(target=test_conn, daemon=True).start()
 
-    def _test_and_save_added_model(event, ctx):
+    def _test_and_save_added_model(event, ctx, supports_vision):
         state["message"] = "⏳ 正在验证连接模型..."
         state["testing"] = True
         event.app.invalidate()
@@ -515,6 +517,7 @@ def open_model_selector(on_model_selected=None):
                     provider_id=state["am_provider_id"],
                     name=model,
                     context_window=ctx,
+                    supports_vision=supports_vision,
                 )
 
                 def _on_success():
@@ -566,7 +569,8 @@ def open_model_selector(on_model_selected=None):
                 bullet = "●" if item["active"] else "○"
                 ctx = m.get("context_window", 0)
                 ctx_str = f"{ctx // 1000}k" if ctx >= 1000 else str(ctx)
-                label = f"  {bullet} {m['name']}  [{ctx_str}]"
+                vision = "👁" if m.get("supports_vision") else ""
+                label = f"  {bullet} {m['name']}  [{ctx_str}]{vision}"
                 if is_cur:
                     out += [_t("class:model.cursor", f"  ▶{label}\n")]
                 elif item["active"]:
@@ -600,10 +604,11 @@ def open_model_selector(on_model_selected=None):
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
 
         steps_map = {
-            0: ("步骤 1/4  API Base URL", "编辑 Base URL，如 https://api.deepseek.com/v1："),
-            1: ("步骤 2/4  API Key",       "编辑 API Key："),
-            2: ("步骤 3/4  模型名称",        "编辑模型名称，如 deepseek-chat："),
-            3: ("步骤 4/4  最大上下文",      "编辑上下文 Token 数，如 128000："),
+            0: ("步骤 1/5  API Base URL", "编辑 Base URL，如 https://api.deepseek.com/v1："),
+            1: ("步骤 2/5  API Key",       "编辑 API Key："),
+            2: ("步骤 3/5  模型名称",        "编辑模型名称，如 deepseek-chat："),
+            3: ("步骤 4/5  最大上下文",      "编辑上下文 Token 数，如 128000："),
+            4: ("步骤 5/5  图片/视频输入",      "该模型是否支持图片/视频输入？"),
         }
 
         if step > 0 and "base_url" in data:
@@ -612,8 +617,18 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.hint", f"  API Key:  {'*' * 8}\n")]
         if step > 2 and "model_name" in data:
             out += [_t("class:wiz.hint", f"  模型名称: {data['model_name']}\n")]
+        if step > 3 and "context_window" in data:
+            out += [_t("class:wiz.hint", f"  上下文:   {data['context_window']}\n")]
 
-        if step in steps_map:
+        if step == 4:
+            vision = data.get("supports_vision", False)
+            opts = ["  否（仅文本）", "  是（支持图片/视频）"]
+            for oi, o in enumerate(opts):
+                if oi == (1 if vision else 0):
+                    out += [_t("class:proto.cursor", f"  ▶{o}\n")]
+                else:
+                    out += [_t("class:proto.normal", f"   {o}\n")]
+        elif step in steps_map:
             title, hint = steps_map[step]
             out += [_t("class:wiz.title", f"  {title}\n")]
             out += [_t("class:wiz.hint",  f"  {hint}\n")]
@@ -622,7 +637,10 @@ def open_model_selector(on_model_selected=None):
         if state["message"]:
             style = "class:ok" if not state["message"].startswith("❌") else "class:empty"
             out += [_t(style, f"  {state['message']}\n")]
-        out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
+        if step == 4:
+            out += [_t("class:footer", "  ↑↓ 选择，Enter 确认，Esc 返回\n")]
+        else:
+            out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
         return out
 
     def render_wizard():
@@ -673,11 +691,12 @@ def open_model_selector(on_model_selected=None):
             return out
 
         steps_map = {
-            1: ("步骤 1/5  厂商名称",     "输入厂商名称，如 DeepSeek："),
-            2: ("步骤 2/5  API Base URL", "输入 Base URL，如 https://api.deepseek.com/v1："),
-            3: ("步骤 3/5  API Key",       "输入 API Key："),
+            1: ("步骤 1/6  厂商名称",     "输入厂商名称，如 DeepSeek："),
+            2: ("步骤 2/6  API Base URL", "输入 Base URL，如 https://api.deepseek.com/v1："),
+            3: ("步骤 3/6  API Key",       "输入 API Key："),
             4: ("步骤 5a  模型名称",        "输入模型名称，如 deepseek-chat："),
             5: ("步骤 5b  最大上下文",      "输入上下文 Token 数，如 128000："),
+            5.5: ("步骤 5c  图片/视频输入",    "该模型是否支持图片/视频输入？"),
         }
 
         if step > 1 and "name" in data:
@@ -686,11 +705,22 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.hint", f"  Base URL: {data['base_url']}\n")]
         if step > 3 and "api_key" in data:
             out += [_t("class:wiz.hint", f"  API Key:  {'*' * 8}\n")]
+        if step > 5 and "context_window" in data:
+            out += [_t("class:wiz.hint", f"  上下文:   {data['context_window']}\n")]
 
         if step in steps_map:
             title, hint = steps_map[step]
             out += [_t("class:wiz.title", f"  {title}\n")]
             out += [_t("class:wiz.hint",  f"  {hint}\n")]
+
+        elif step == 5.5:
+            vision = data.get("supports_vision", False)
+            opts = ["  否（仅文本）", "  是（支持图片/视频）"]
+            for oi, o in enumerate(opts):
+                if oi == (1 if vision else 0):
+                    out += [_t("class:proto.cursor", f"  ▶{o}\n")]
+                else:
+                    out += [_t("class:proto.normal", f"   {o}\n")]
 
         elif step == 3.5:
             out += [_t("class:wiz.title", "  步骤 4/5  协议类型\n")]
@@ -734,14 +764,25 @@ def open_model_selector(on_model_selected=None):
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
 
         steps_map = {
-            0: ("步骤 1/2  模型名称",   "输入模型名称，如 deepseek-chat："),
-            1: ("步骤 2/2  最大上下文", "输入上下文 Token 数，如 128000："),
+            0: ("步骤 1/3  模型名称",   "输入模型名称，如 deepseek-chat："),
+            1: ("步骤 2/3  最大上下文", "输入上下文 Token 数，如 128000："),
+            2: ("步骤 3/3  图片/视频输入", "该模型是否支持图片/视频输入？"),
         }
 
         if step > 0 and "model_name" in data:
             out += [_t("class:wiz.hint", f"  模型名称: {data['model_name']}\n")]
+        if step > 1 and "context_window" in data:
+            out += [_t("class:wiz.hint", f"  上下文:   {data['context_window']}\n")]
 
-        if step in steps_map:
+        if step == 2:
+            vision = data.get("supports_vision", False)
+            opts = ["  否（仅文本）", "  是（支持图片/视频）"]
+            for oi, o in enumerate(opts):
+                if oi == (1 if vision else 0):
+                    out += [_t("class:proto.cursor", f"  ▶{o}\n")]
+                else:
+                    out += [_t("class:proto.normal", f"   {o}\n")]
+        elif step in steps_map:
             title, hint = steps_map[step]
             out += [_t("class:wiz.title", f"  {title}\n")]
             out += [_t("class:wiz.hint",  f"  {hint}\n")]
@@ -750,7 +791,10 @@ def open_model_selector(on_model_selected=None):
         if state["message"]:
             style = "class:ok" if not state["message"].startswith("❌") else "class:empty"
             out += [_t(style, f"  {state['message']}\n")]
-        out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
+        if step == 2:
+            out += [_t("class:footer", "  ↑↓ 选择，Enter 确认，Esc 返回\n")]
+        else:
+            out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
         return out
 
     def get_main_content():
@@ -768,11 +812,11 @@ def open_model_selector(on_model_selected=None):
     @Condition
     def need_input():
         if state["mode"] == "addmodel":
-            return True
+            return state["am_step"] != 2
         if state["mode"] == "edit":
-            return True
+            return state["edit_step"] != 4
         if state["mode"] == "wizard":
-            return state["add_step"] not in (0, 3.5, 6)
+            return state["add_step"] not in (0, 3.5, 5.5, 6)
         return False
 
     def get_input_header():
@@ -780,6 +824,7 @@ def open_model_selector(on_model_selected=None):
             hints = {
                 0: "输入模型名称，按 Enter 确认",
                 1: "输入 Token 数量，按 Enter 确认",
+                2: "↑↓ 选择是否支持图片/视频输入，按 Enter 确认",
             }
             hint = hints.get(state["am_step"], "")
             return [
@@ -794,6 +839,7 @@ def open_model_selector(on_model_selected=None):
                 1: "编辑 API Key，按 Enter 确认",
                 2: "编辑模型名称，按 Enter 确认",
                 3: "编辑 Token 数量，按 Enter 确认",
+                4: "↑↓ 选择是否支持图片/视频输入，按 Enter 确认",
             }
             hint = hints.get(step, "")
             return [
@@ -815,6 +861,7 @@ def open_model_selector(on_model_selected=None):
             3: "输入 API Key，按 Enter 确认",
             4: "输入模型名称，按 Enter 确认",
             5: "输入 Token 数量，按 Enter 确认",
+            5.5: "↑↓ 选择是否支持图片/视频输入，按 Enter 确认",
         }
         hint = hints.get(step, "")
         return [
@@ -913,7 +960,8 @@ def open_model_selector(on_model_selected=None):
                 "base_url": p.get("base_url", ""),
                 "api_key": p.get("api_key", ""),
                 "model_name": m.get("name", ""),
-                "context_window": m.get("context_window", 128000)
+                "context_window": m.get("context_window", 128000),
+                "supports_vision": m.get("supports_vision", False),
             }
             state["message"] = ""
             input_buf.set_document(Document(state["edit_data"]["base_url"]))
@@ -936,16 +984,16 @@ def open_model_selector(on_model_selected=None):
     def _quit(event):
         event.app.exit()
 
-    @kb.add("up", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3.5, 6)))
+    @kb.add("up", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3.5, 5.5, 6)))
     def _w_up(event):
         if state.get("testing"):
             return
         if state["add_step"] == 0:
             state["preset_cursor"] = max(0, state["preset_cursor"] - 1)
-        elif state["add_step"] in (3.5, 6):
+        elif state["add_step"] in (3.5, 5.5, 6):
             state["proto_cursor"] = max(0, state["proto_cursor"] - 1)
 
-    @kb.add("down", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3.5, 6)))
+    @kb.add("down", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3.5, 5.5, 6)))
     def _w_down(event):
         if state.get("testing"):
             return
@@ -953,7 +1001,7 @@ def open_model_selector(on_model_selected=None):
             state["preset_cursor"] = min(len(PRESET_PROVIDERS), state["preset_cursor"] + 1)
         elif state["add_step"] in (3.5,):
             state["proto_cursor"] = min(len(PROTOCOLS) - 1, state["proto_cursor"] + 1)
-        elif state["add_step"] == 6:
+        elif state["add_step"] in (5.5, 6):
             state["proto_cursor"] = min(1, state["proto_cursor"] + 1)
 
     @kb.add("enter", filter=Condition(lambda: state["mode"] == "wizard"))
@@ -1025,8 +1073,17 @@ def open_model_selector(on_model_selected=None):
             except ValueError:
                 ctx = 128000
             state["add_data"]["context_window"] = ctx
+            state["add_data"]["supports_vision"] = False
+            state["proto_cursor"] = 0
             input_buf.set_document(Document(""))
-            _test_and_save_model(event, ctx)
+            layout.focus(main_win)
+            state["add_step"] = 5.5
+
+        elif step == 5.5:
+            state["add_data"]["supports_vision"] = (state["proto_cursor"] == 1)
+            state["proto_cursor"] = 0
+            input_buf.set_document(Document(""))
+            _test_and_save_model(event, state["add_data"]["context_window"], state["add_data"]["supports_vision"])
 
         elif step == 6:
             if state["proto_cursor"] == 0:
@@ -1084,6 +1141,10 @@ def open_model_selector(on_model_selected=None):
         elif step == 5:
             state["add_step"] = 4
             input_buf.set_document(Document(state["add_data"].get("model_name", "")))
+        elif step == 5.5:
+            state["add_step"] = 5
+            input_buf.set_document(Document(str(state["add_data"].get("context_window", 128000))))
+            layout.focus(input_buf)
         elif step == 6:
             # "继续添加/完成保存"步骤按 Esc：直接完成保存，返回列表
             state["items"] = build_items()
@@ -1115,8 +1176,29 @@ def open_model_selector(on_model_selected=None):
             except ValueError:
                 ctx = 128000
             state["am_data"]["context_window"] = ctx
+            state["am_data"]["supports_vision"] = False
+            state["proto_cursor"] = 0
             input_buf.set_document(Document(""))
-            _test_and_save_added_model(event, ctx)
+            layout.focus(main_win)
+            state["am_step"] = 2
+
+        elif step == 2:
+            state["am_data"]["supports_vision"] = (state["proto_cursor"] == 1)
+            state["proto_cursor"] = 0
+            input_buf.set_document(Document(""))
+            _test_and_save_added_model(event, state["am_data"]["context_window"], state["am_data"]["supports_vision"])
+
+    @kb.add("up", filter=Condition(lambda: state["mode"] == "addmodel" and state["am_step"] == 2))
+    def _am_up(event):
+        if state.get("testing"):
+            return
+        state["proto_cursor"] = max(0, state["proto_cursor"] - 1)
+
+    @kb.add("down", filter=Condition(lambda: state["mode"] == "addmodel" and state["am_step"] == 2))
+    def _am_down(event):
+        if state.get("testing"):
+            return
+        state["proto_cursor"] = min(1, state["proto_cursor"] + 1)
 
     @kb.add("escape", filter=Condition(lambda: state["mode"] == "addmodel"))
     def _am_esc(event):
@@ -1134,6 +1216,22 @@ def open_model_selector(on_model_selected=None):
         elif step == 1:
             state["am_step"] = 0
             input_buf.set_document(Document(state["am_data"].get("model_name", "")))
+        elif step == 2:
+            state["am_step"] = 1
+            input_buf.set_document(Document(str(state["am_data"].get("context_window", 128000))))
+            layout.focus(input_buf)
+
+    @kb.add("up", filter=Condition(lambda: state["mode"] == "edit" and state["edit_step"] == 4))
+    def _w_edit_up(event):
+        if state.get("testing"):
+            return
+        state["proto_cursor"] = max(0, state["proto_cursor"] - 1)
+
+    @kb.add("down", filter=Condition(lambda: state["mode"] == "edit" and state["edit_step"] == 4))
+    def _w_edit_down(event):
+        if state.get("testing"):
+            return
+        state["proto_cursor"] = min(1, state["proto_cursor"] + 1)
 
     @kb.add("enter", filter=Condition(lambda: state["mode"] == "edit"))
     def _w_edit_enter(event):
@@ -1171,8 +1269,17 @@ def open_model_selector(on_model_selected=None):
             except ValueError:
                 ctx = 128000
             state["edit_data"]["context_window"] = ctx
+            state["edit_data"]["supports_vision"] = bool(state["edit_data"].get("supports_vision", False))
+            state["proto_cursor"] = 1 if state["edit_data"]["supports_vision"] else 0
             input_buf.set_document(Document(""))
-            _test_and_save_edited_model(event, ctx)
+            layout.focus(main_win)
+            state["edit_step"] = 4
+
+        elif step == 4:
+            state["edit_data"]["supports_vision"] = (state["proto_cursor"] == 1)
+            state["proto_cursor"] = 0
+            input_buf.set_document(Document(""))
+            _test_and_save_edited_model(event, state["edit_data"]["context_window"], state["edit_data"]["supports_vision"])
 
     @kb.add("escape", filter=Condition(lambda: state["mode"] == "edit"))
     def _w_edit_esc(event):
@@ -1196,6 +1303,10 @@ def open_model_selector(on_model_selected=None):
         elif step == 3:
             state["edit_step"] = 2
             input_buf.set_document(Document(state["edit_data"].get("model_name", "")))
+        elif step == 4:
+            state["edit_step"] = 3
+            input_buf.set_document(Document(str(state["edit_data"].get("context_window", 128000))))
+            layout.focus(input_buf)
 
     app = Application(
         layout=layout,
