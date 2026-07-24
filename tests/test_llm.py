@@ -52,12 +52,15 @@ def test_inline_exec_command_is_not_session_allowlisted():
 
 
 def test_inline_module_exec_flags_are_not_session_allowlisted():
-    """-m / -p 等价于任意模块/代码执行，不予会话放行；python/pip 首参为选项同样拦截。"""
+    """-m / -p 等价于任意模块/代码执行，不予会话放行；但只读查询例外。"""
     assert _session_prefix_for_command("python -m pip install requests") is None
     assert _session_prefix_for_command("python -m http.server 8080") is None
     assert _session_prefix_for_command('node -p "1+1"') is None
     assert _session_prefix_for_command("perl -p -i -e 's/a/b/' file") is None
-    assert _session_prefix_for_command("python -V") is None
+    # 只读查询（-V/--version/-h/--help）可以放行至前缀白名单
+    assert _session_prefix_for_command("python -V") == "python"
+    assert _session_prefix_for_command("python --version") == "python"
+    assert _session_prefix_for_command("python -m pip --version") == "python -m pip"
     # 普通脚本/子命令路径仍按原规则放行
     assert _session_prefix_for_command("python script.py") == "python script.py"
     assert _session_prefix_for_command("pip install requests") == "pip install"

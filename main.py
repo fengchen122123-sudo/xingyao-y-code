@@ -1155,6 +1155,9 @@ def handle_slash_command(command_text):
             else:
                 # 向后兼容：默认会话切换 /session <会话名>
                 target = parts[1].strip("<>")
+                # 确保目标会话在数据库中已存在，避免后续 get_history/计划绑定/压缩
+                # 基于一个不存在的 session_name 工作，导致状态失配。
+                manager.create_session_explicit(target)
                 current_session = target
                 sync_plan_session(current_session)
                 recalc_token_usage()
@@ -2269,7 +2272,7 @@ def _background_worker():
             msg_queue.task_done()
 
 
-def run_headless(prompt, session_name=None):
+def run_headless(prompt, session_name=None) -> int:
     """Headless 模式：执行一次性任务后退出，不进入交互式 TUI。
 
     用途：CI/脚本/管道集成
@@ -2286,7 +2289,7 @@ def run_headless(prompt, session_name=None):
     - 不启动 prompt_toolkit Application
     - 所有输出走 print_formatted_text 到 stdout
     - 权限请求直接按"拒绝"处理（headless 模式不交互确认）
-    - 退出码：0=成功，1=任务失败，2=配置错误
+    - 返回退出码：0=成功，1=任务失败，2=配置错误
     """
     global current_session, current_model, current_key, current_url, current_ctx_win
 
@@ -2307,10 +2310,10 @@ def run_headless(prompt, session_name=None):
         prompt = _sys.stdin.read().strip()
         if not prompt:
             print("错误：从 stdin 读取的内容为空", file=_sys.stderr)
-            _sys.exit(2)
+            return 2
     elif not prompt.strip():
         print("错误：prompt 不能为空", file=sys.stderr)
-        sys.exit(2)
+        return 2
 
     # 3. 指定会话（如果传了 --session）
     if session_name:
@@ -2342,16 +2345,16 @@ def run_headless(prompt, session_name=None):
         while msg_queue.unfinished_tasks > 0:
             if time.monotonic() > deadline:
                 print("\n[headless 任务超时（30 分钟），强制退出]", file=sys.stderr)
-                sys.exit(1)
+                return 1
             time.sleep(0.1)
         # 给事件队列一点时间排空
         time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n[已取消]", file=sys.stderr)
-        sys.exit(130)
+        return 130
 
-    # 6. 退出
-    sys.exit(0)
+    # 6. 返回成功退出码，由入口统一 sys.exit
+    return 0
 
 
 def run_cli():
@@ -2629,8 +2632,8 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
 
     if args.prompt is not None:
-        # Headless 模式
-        run_headless(prompt=args.prompt, session_name=args.session)
+        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码
+        sys.exit(run_headless(prompt=args.prompt, session_name=args.session))
     else:
         # 交互式模式（默认）
         run_cli()

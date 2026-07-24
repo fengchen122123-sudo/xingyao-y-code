@@ -52,35 +52,41 @@ def load_config() -> dict:
         except Exception:
             data = {}
 
-    # 仅在全新启动/无 providers 键时初始化为 DeepSeek 默认结构
+    # 无 providers 键时的处理：
+    # - 完全空配置：写入 DeepSeek 默认结构作为新手引导；
+    # - 已有自定义配置（如只含 active_model_id）：补充空 providers 列表并保留
+    #   用户原有字段，避免静默覆盖用户手动维护的配置。
     if "providers" not in data:
-        data = {
-            "active_model_id": "ds-v4-pro",
-            "providers": [
-                {
-                    "id": "deepseek-provider",
-                    "name": "深度求索",
-                    "base_url": "https://api.deepseek.com",
-                    "api_key": "",
-                    "protocol": "openai",
-                    "models": [
-                        {
-                            "id": "ds-v4-pro",
-                            "name": "deepseek-v4-pro",
-                            "litellm_model": "deepseek/deepseek-chat",
-                            "context_window": 1000000
-                        },
-                        {
-                            "id": "ds-v4-flash",
-                            "name": "deepseek-v4-flash",
-                            "litellm_model": "deepseek/deepseek-coder",
-                            "context_window": 1000000
-                        }
-                    ]
-                }
-            ]
-        }
-        _write_config(data)
+        if not data:
+            data = {
+                "active_model_id": "ds-v4-pro",
+                "providers": [
+                    {
+                        "id": "deepseek-provider",
+                        "name": "深度求索",
+                        "base_url": "https://api.deepseek.com",
+                        "api_key": "",
+                        "protocol": "openai",
+                        "models": [
+                            {
+                                "id": "ds-v4-pro",
+                                "name": "deepseek-v4-pro",
+                                "litellm_model": "deepseek/deepseek-chat",
+                                "context_window": 1000000
+                            },
+                            {
+                                "id": "ds-v4-flash",
+                                "name": "deepseek-v4-flash",
+                                "litellm_model": "deepseek/deepseek-coder",
+                                "context_window": 1000000
+                            }
+                        ]
+                    }
+                ]
+            }
+            _write_config(data)
+        else:
+            data["providers"] = []
 
     return data
 

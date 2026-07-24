@@ -41,12 +41,12 @@ def parse_user_input(text):
     for m in abs_matches:
         candidate = m.group(1)
         # 只接受原始候选路径精确匹配到真实文件的情况；
-        # 不再逐字符截断缩短，避免误匹配无关文件并将其注入对话上下文。
-        # 若路径末尾紧贴标点（如逗号、句号），先尝试去掉最后一个字符。
+        # 若路径末尾紧贴常见标点（如逗号、句号），先尝试去掉最后一个字符。
+        # 注意：仅对标点字符做裁剪，避免把有效路径（如 D:data.txt）末尾字母切掉。
         if os.path.exists(candidate) and os.path.isfile(candidate):
             extracted_files.append(candidate)
             text = text.replace(candidate, "", 1).strip()
-        elif len(candidate) > 1:
+        elif len(candidate) > 1 and candidate[-1] in {',', '.', ';', '!', '?', ':', ')', ']', '}', '"', "'"}:
             trimmed = candidate[:-1]
             if os.path.exists(trimmed) and os.path.isfile(trimmed):
                 extracted_files.append(trimmed)
