@@ -52,6 +52,13 @@ Thumbs.db
 
 # Scratch and temporary files
 scratch_*
+scratch/
 generate_interview_pdf*.py
 zip/
 *.pdf
+
+# DB debug exports (temporary debug dumps)
+db_*.txt
+
+# Temporary test directories
+test20*/
