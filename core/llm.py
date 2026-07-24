@@ -1391,7 +1391,7 @@ def _execute_single_tool_call(
     _raise_if_tool_cancelled(cancel_event)
 
     try:
-        if result in (PERMISSION_DENIED_MESSAGE, PERMISSION_CANCELLED_MESSAGE):
+        if result in (PERMISSION_DENIED_MESSAGE, PERMISSION_CANCELLED_MESSAGE, PERMISSION_SYSTEM_ERROR_MESSAGE):
             pass
         elif function_name == "read_file":
             bypass_cm, sandbox_err = _sandbox_outside_guard(
