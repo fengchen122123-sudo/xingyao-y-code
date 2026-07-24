@@ -1762,7 +1762,12 @@ def _chat_with_model_generator(
         "num_retries": 2,
     }
     kwargs.update(_provider_request_options(model_name, api_base))
-    
+
+    # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小
+    # 导致长回复被静默截断。若 provider 已显式配置则尊重其值。
+    if "max_tokens" not in kwargs and "max_completion_tokens" not in kwargs:
+        kwargs["max_tokens"] = 8192
+
     if api_base:
         kwargs["api_base"] = api_base
         
@@ -1918,7 +1923,8 @@ def _chat_with_model_generator(
             tool_calls_dict = {}
             in_native_think = False
             provider_thinking_blocks = None
-            
+            finish_reason = None
+
             stream_usage = None
             for chunk in response_stream:
                 raise_if_cancelled()
@@ -1930,7 +1936,11 @@ def _chat_with_model_generator(
 
                 if not chunk.choices:
                     continue
-                    
+
+                chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
+                if chunk_finish_reason:
+                    finish_reason = chunk_finish_reason
+
                 delta = chunk.choices[0].delta
 
                 complete_blocks = _complete_thinking_blocks(delta)
@@ -1979,6 +1989,15 @@ def _chat_with_model_generator(
             if in_native_think:
                 yield "</think>"
                 accumulated_content += "</think>"
+
+            # 输出被模型长度限制截断：给出明确提示，避免用户以为任务已完成。
+            if finish_reason == "length":
+                truncated_notice = (
+                    "\n[回复已被模型长度限制截断。如需完整结果，请尝试："
+                    "1) 让模型分步骤输出；2) 换用输出上限更高的模型；"
+                    "3) 在 config.json 中为当前模型增大 max_tokens。]"
+                )
+                _notify_event(event_callback, "notice", {"message": truncated_notice.strip()})
 
             # 流结束：按最终 usage chunk 统一记账一次（读写均走锁）
             if stream_usage is not None:
