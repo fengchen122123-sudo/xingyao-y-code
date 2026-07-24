@@ -362,8 +362,8 @@ def test_api_retry_status_does_not_leak_raw_error(mocker):
         if event.kind == "status"
     )
     assert "secret provider traceback" not in status_text
-    assert "1/3" in status_text
-    assert "2/3" in status_text
+    assert "1/5" in status_text
+    assert "2/5" in status_text
 
 
 def test_ask_user_plan_item_completes_after_real_selection(monkeypatch):
