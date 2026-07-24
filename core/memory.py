@@ -674,6 +674,13 @@ class MemoryManager:
 
             if updates:
                 cursor.executemany('UPDATE messages SET content = ? WHERE id = ?', updates)
+                # 同步更新会话时间戳，避免外部基于 updated_at 的缓存/排序与
+                # 实际内容变化脱节。
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute(
+                    'UPDATE sessions SET updated_at = ? WHERE session_name = ?',
+                    (now, session_name)
+                )
                 self.conn.commit()
 
 

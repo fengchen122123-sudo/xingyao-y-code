@@ -152,10 +152,11 @@ def test_list_directory(tmp_path):
 
 def test_execute_command():
     """测试引擎功能：能否在终端里执行命令"""
-    # 1. 执行：让 Python 自己在终端里跑一句打印命令
-    # 注意：为了跨平台兼容，我们用 python -c 来执行一句简单的代码
-    result = execute_command('python -c "print(\'hello engine\')"')
-    
+    import sys
+    # 1. 执行：用当前 Python 解释器跑一句打印命令
+    # 使用 sys.executable 避免在纯净 Windows runner 上找不到 python 命令
+    result = execute_command(f'{sys.executable} -c "print(\'hello engine\')"')
+
     # 2. 断言验证：终端里是不是真的输出了这句话
     assert "hello engine" in result
 
@@ -791,7 +792,8 @@ def test_terminal_callback_fires_only_once_under_concurrent_termination():
 
 def test_execute_command_reports_nonzero_exit_code():
     """回归：非零退出码必须如实上报，不得伪装成"执行成功"。"""
-    result = execute_command('python -c "import sys; sys.exit(3)"')
+    import sys
+    result = execute_command(f'{sys.executable} -c "import sys; sys.exit(3)"')
 
     assert "退出码 3" in result
     assert "执行成功" not in result
