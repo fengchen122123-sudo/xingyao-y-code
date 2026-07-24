@@ -242,11 +242,15 @@ class PlanManager:
         return self._storage_dir / f"{self._session_id}.json"
 
     def _normalize_item(self, raw: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(raw, dict):
+            raise ValueError(f"plan item must be an object, got {type(raw).__name__}: {raw!r}")
         item_id = str(raw.get("id", "")).strip()
         subject = str(raw.get("subject", "")).strip()
         status = str(raw.get("status", "pending")).strip()
-        if not item_id or not subject:
-            raise ValueError("plan items require id and subject")
+        if not item_id:
+            raise ValueError(f"plan item missing required field 'id': {raw!r}")
+        if not subject:
+            raise ValueError(f"plan item '{item_id}' missing required field 'subject'")
         if status not in VALID_STATUSES:
             raise ValueError(f"invalid plan status: {status}")
         stage = str(raw.get("stage", "build")).strip().lower() or "build"
@@ -376,7 +380,17 @@ def bind_default_plan_session(session_id: str | None) -> None:
     _DEFAULT_PLAN_MANAGER.bind_session(session_id)
 
 
-def plan_write(items: list[dict[str, Any]]) -> str:
+def plan_write(items: list[dict[str, Any]] | None = None) -> str:
+    if items is None:
+        return (
+            "计划参数错误：调用 plan_write 时必须传入 items 数组（计划项列表）。"
+            "如果计划为空，请传入空数组 []，不要省略 items 参数。"
+        )
+    if not isinstance(items, list):
+        return (
+            f"计划参数错误：items 必须是数组，当前收到的是 {type(items).__name__}。"
+            "请重新调用 plan_write(items=[...]) 并传入正确的计划项列表。"
+        )
     non_pending = [
         f"'{item.get('id', '?')}'(status={item.get('status', 'pending')})"
         for item in items
@@ -399,7 +413,10 @@ def plan_write(items: list[dict[str, Any]]) -> str:
                 "或保持 verification_type='command' 但填写纯英文/命令字符的可执行命令（"
                 "例如 'cd test20260722 && python -m pytest test_wc.py -v'）。"
             )
-    _DEFAULT_PLAN_MANAGER.replace(items)
+    try:
+        _DEFAULT_PLAN_MANAGER.replace(items)
+    except ValueError as exc:
+        return f"计划写入失败：{exc}。请修正每一项的 id、subject 和依赖关系后重试。"
     return "计划已更新。"
 
 
