@@ -993,16 +993,20 @@ def manage_task(action, task_id=None, event_callback=None, permission_owner=None
         if not task_id:
             return "🚨 错误：终结任务必须提供 task_id 参数。"
         # 只在 kill 类操作时要求用户确认，list/status 只读操作不弹确认
-        from core.llm import check_permission_and_ask
+        from core.llm import check_permission_and_ask, PermissionSystemError
         # 注意：缺省（无 event_callback）路径会在调用线程内直接 safe_print 触碰终端，
         # 仅在主线程上下文中可用；子代理/调度层调用时必须透传权限上下文参数。
-        if not check_permission_and_ask(
-            "manage_task",
-            {"action": "kill", "task_id": task_id},
-            event_callback=event_callback,
-            permission_owner=permission_owner,
-            cancel_event=cancel_event,
-        ):
+        try:
+            approved = check_permission_and_ask(
+                "manage_task",
+                {"action": "kill", "task_id": task_id},
+                event_callback=event_callback,
+                permission_owner=permission_owner,
+                cancel_event=cancel_event,
+            )
+        except PermissionSystemError:
+            return "🚨 权限询问系统异常，未能终结后台任务。请稍后重试。"
+        if not approved:
             return "🚨 用户拒绝了终结后台任务的操作。"
         success = kill_background_task(task_id)
         if success:
@@ -1090,15 +1094,42 @@ def _fuzzy_replace(content, target, replacement, replace_all=False):
                     return content[:start] + replacement + content[end:], 1
 
     # 4. 字符级滑动窗口兜底（仅对中小文件/目标，避免 O(n^2) 灾难）
-    if target_len <= 2000 and len(content) <= 200_000:
+    # 先用 target 前 50 字符作为锚点快速定位候选区域，再仅在锚点邻域内做
+    # difflib 相似度比较，把最坏情况从 4 亿次 ratio() 降到可接受范围。
+    content_len = len(content)
+    if target_len <= 2000 and content_len <= 200_000:
         best_ratio = 0.0
         best_start = 0
-        for i in range(len(content) - target_len + 1):
-            window = content[i : i + target_len]
-            ratio = difflib.SequenceMatcher(None, target, window).ratio()
-            if ratio > best_ratio:
-                best_ratio = ratio
-                best_start = i
+        anchor_len = min(50, max(1, target_len // 4))
+        anchor = target[:anchor_len]
+        search_start = 0
+        # 锚点邻域半径：保证能覆盖轻微位移（如插入/删除少量字符）
+        window_radius = 200
+        while True:
+            anchor_idx = content.find(anchor, search_start)
+            if anchor_idx == -1:
+                break
+            # 在锚点附近做小范围滑动窗口
+            region_start = max(0, anchor_idx - window_radius)
+            region_end = min(content_len - target_len + 1, anchor_idx + window_radius)
+            for i in range(region_start, region_end + 1):
+                window = content[i : i + target_len]
+                ratio = difflib.SequenceMatcher(None, target, window).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = i
+            search_start = anchor_idx + 1
+
+        # 锚点完全找不到时（target 被严重污染或全为空白），退化到原全量滑动，
+        # 但把文件大小限制到 50k 字符以内，避免极端卡顿。
+        if best_ratio < 0.90 and content_len <= 50_000:
+            for i in range(content_len - target_len + 1):
+                window = content[i : i + target_len]
+                ratio = difflib.SequenceMatcher(None, target, window).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_start = i
+
         if best_ratio >= 0.90:
             best_end = best_start + target_len
             return content[:best_start] + replacement + content[best_end:], 1
