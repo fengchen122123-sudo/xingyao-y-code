@@ -1010,3 +1010,57 @@ def test_stalled_plan_after_repeated_failures_allows_direct_fix(mocker):
     assert "必须通过 run_subagent" not in result["content"]
     execute.assert_called_once()
     bind_default_plan_session(previous_session)
+
+
+def test_unparseable_tool_arguments_return_error_without_executing():
+    """当 tool_call arguments 是完全无法解析的畸形 JSON 时，应直接返回解析错误，
+    而不是用空参数继续执行工具。"""
+    from core.llm import _execute_single_tool_call
+
+    malformed_arguments = '{"items": [{"id": "a", "stage": "" Received Messages=[]'
+    result = _execute_single_tool_call(
+        {
+            "id": "call-bad-json",
+            "function": {
+                "name": "plan_write",
+                "arguments": malformed_arguments,
+            },
+        },
+        event_callback=lambda *args, **kwargs: None,
+    )
+
+    assert result["role"] == "tool"
+    assert result["tool_call_id"] == "call-bad-json"
+    assert result["name"] == "plan_write"
+    assert "JSON 解析失败" in result["content"]
+
+
+def test_execute_command_preview_is_truncated_in_tool_event_payload():
+    """execute_command 的长命令 preview 应该被截断，避免 UI 刷屏。"""
+    from core.llm import _tool_event_payload
+
+    long_command = "powershell -Command " + "x" * 200
+    payload = _tool_event_payload({
+        "id": "call-long-cmd",
+        "function": {
+            "name": "execute_command",
+            "arguments": f'{{"command": "{long_command}"}}',
+        },
+    })
+
+    preview = payload["preview"]
+    assert len(preview) <= 40
+    assert preview.endswith("...")
+    assert long_command.startswith(preview.replace("...", ""))
+
+
+def test_summarize_execute_command_started_truncates_long_command():
+    """summarize_tool_started 对 execute_command 的显示应截断到 30 字符。"""
+    from core.tool_presenter import summarize_tool_started
+
+    long_command = "powershell -Command " + "x" * 200
+    summary = summarize_tool_started("execute_command", {"command": long_command})
+
+    assert "星瑶正在执行命令" in summary
+    assert "..." in summary
+    assert len(summary) <= len("星瑶正在执行命令：") + 30

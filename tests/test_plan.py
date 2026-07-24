@@ -205,3 +205,44 @@ def test_plan_update_rejects_negative_attempts_without_partial_mutation():
     item = plan.snapshot()[0]
     assert item["subject"] == "原始"
     assert item["attempts"] == 1
+
+
+def test_plan_write_rejects_missing_id_and_subject_with_clear_errors():
+    from core.plan import bind_default_plan_session, get_default_plan_manager, plan_write
+
+    manager = get_default_plan_manager()
+    previous_session = manager.session_id
+    bind_default_plan_session("missing-fields-test")
+    manager.clear()
+    try:
+        # 缺少 id
+        message = plan_write([{"subject": "没有id", "status": "pending"}])
+        assert "missing required field 'id'" in message
+        assert manager.snapshot() == []
+
+        # 缺少 subject
+        message = plan_write([{"id": "no-subject", "status": "pending"}])
+        assert "missing required field 'subject'" in message
+        assert "no-subject" in message
+        assert manager.snapshot() == []
+    finally:
+        bind_default_plan_session(previous_session)
+
+
+def test_plan_write_rejects_non_list_items():
+    from core.plan import bind_default_plan_session, get_default_plan_manager, plan_write
+
+    manager = get_default_plan_manager()
+    previous_session = manager.session_id
+    bind_default_plan_session("non-list-items-test")
+    manager.clear()
+    try:
+        message = plan_write(None)
+        assert "必须传入 items 数组" in message
+        assert manager.snapshot() == []
+
+        message = plan_write({"id": "a", "subject": "b"})
+        assert "items 必须是数组" in message
+        assert manager.snapshot() == []
+    finally:
+        bind_default_plan_session(previous_session)

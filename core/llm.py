@@ -971,6 +971,9 @@ def _tool_event_payload(tc):
         preview = arguments.get("city", "") or "自动定位"
     elif function_name == "execute_command":
         preview = arguments.get("command", "")
+        # 长命令（尤其 PowerShell / curl / python -c）预览截短，避免刷屏
+        if preview and len(preview) > 40:
+            preview = preview[:37] + "..."
     elif function_name == "glob_files":
         preview = arguments.get("pattern", "")
     elif function_name == "list_directory":
@@ -1051,11 +1054,15 @@ def _repair_truncated_json(raw):
     """修复被截断的 JSON 字符串：补全未闭合的字符串、括号、花括号。
 
     当 LLM 生成的 tool call arguments 超过 API 传输限制时被截断，
-    json.loads 会报 "Unterminated string" 错误。本函数尝试：
+    json.loads 会报 "Unterminated string" 错误。本函数只处理末尾截断：
     1. 补全未闭合的字符串（在末尾加引号）
     2. 移除对象/数组末尾多余的逗号
     3. 按栈顺序闭合所有未闭合的 [ { 括号
-    4. 特殊处理：如果在某个值中间被截断且不在字符串内，尝试找到最近的键结束位置
+    4. 如果末尾是冒号（缺值），补空字符串
+
+    注意：如果截断处之后还混入了非 JSON 文本（如模型把对话历史写进参数），
+    本函数不再 aggressive 地回退截断，而是让 json.loads 继续失败，由调用方
+    返回明确的参数解析错误，避免用被篡改的参数继续执行工具。
     """
     if not raw or not raw.strip():
         return raw
@@ -1063,11 +1070,8 @@ def _repair_truncated_json(raw):
     in_string = False
     escaped = False
     stack = []
-    last_colon_pos = -1
-    last_comma_pos = -1
-    last_open_brace = -1
-    
-    for i, ch in enumerate(raw):
+
+    for ch in raw:
         if in_string:
             if escaped:
                 escaped = False
@@ -1080,53 +1084,14 @@ def _repair_truncated_json(raw):
                 in_string = True
             elif ch in "[{":
                 stack.append(ch)
-                if ch == "{":
-                    last_open_brace = i
             elif ch == "]":
                 if stack and stack[-1] == "[":
                     stack.pop()
             elif ch == "}":
                 if stack and stack[-1] == "{":
                     stack.pop()
-            elif ch == ":":
-                last_colon_pos = i
-            elif ch == ",":
-                last_comma_pos = i
 
-    # 如果不在字符串内且在某个值中间，尝试回退到上一个完整的键值对
-    if not in_string and last_colon_pos > last_comma_pos and last_open_brace >= 0:
-        # 在某个值中间被截断且不在字符串内：回退到上一个完整的键值对
-        # 找到上一个逗号或左大括号的位置
-        cutoff_pos = max(last_comma_pos, last_open_brace)
-        if cutoff_pos > 0:
-            repaired = raw[:cutoff_pos + 1].rstrip()
-            # 重新计算栈状态
-            in_string = False
-            escaped = False
-            stack = []
-            for ch in repaired:
-                if in_string:
-                    if escaped:
-                        escaped = False
-                    elif ch == "\\":
-                        escaped = True
-                    elif ch == '"':
-                        in_string = False
-                else:
-                    if ch == '"':
-                        in_string = True
-                    elif ch in "[{":
-                        stack.append(ch)
-                    elif ch == "]":
-                        if stack and stack[-1] == "[":
-                            stack.pop()
-                    elif ch == "}":
-                        if stack and stack[-1] == "{":
-                            stack.pop()
-        else:
-            repaired = raw.rstrip()
-    else:
-        repaired = raw.rstrip()
+    repaired = raw.rstrip()
 
     # 如果末尾在字符串内（未闭合），先补上引号
     if in_string:
@@ -1244,6 +1209,7 @@ def _execute_single_tool_call(
     """执行单个工具调用，并返回对应的 JSON 结果结构。"""
     function_name = tc["function"]["name"]
     arguments_str = tc["function"]["arguments"]
+    parse_error = None
     try:
         arguments = json.loads(arguments_str)
     except Exception:
@@ -1254,8 +1220,22 @@ def _execute_single_tool_call(
             try:
                 # 二次修复：处理被截断的 JSON（补全未闭合字符串/括号）
                 arguments = json.loads(_repair_truncated_json(arguments_str))
-            except Exception:
+            except Exception as repair_err:
+                parse_error = repair_err
                 arguments = {}
+
+    if parse_error is not None:
+        # 参数 JSON 彻底无法解析：直接返回错误，避免用空参数继续执行产生更迷惑的行为。
+        # 这对 plan_write 等写操作尤为重要，可防止模型把对话历史混进参数后误清空计划。
+        return {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": function_name,
+            "content": (
+                f"工具参数 JSON 解析失败：{parse_error}。"
+                "请重新调用该工具，并确保 arguments 是合法、完整、未混入其他文本的 JSON。"
+            ),
+        }
 
     _raise_if_tool_cancelled(cancel_event)
 

@@ -49,6 +49,7 @@
 6. 查询实时天气必须使用`get_weather`并明确传入城市名；用户未提供城市时先询问，不得猜测城市；获取指定网页/JSON内容使用`fetch_url`；`search_news`仅用于新闻搜索，不得用于查询天气或网页内容。
 7. 在`confirm`权限模式下，所有文件修改、命令执行必须等待用户确认后再操作，不得擅自执行。
 8. 定位代码内容时优先使用`search_code`/`find_definition`精准查找，不要盲目遍历目录浪费时间。
+9. 执行 PowerShell 命令时注意引号规则：`$env:TEMP`、`$HOME` 等变量在单引号字符串内不会被扩展，会导致"找不到驱动器"错误。涉及环境变量的路径应使用双引号（例如 `-OutFile "$env:TEMP\\pkg.zip"`）或使用 `%TEMP%` 走 cmd。
 
 【失败与重试】
 1. 命令或API调用失败后先判断根因，再决定是否重试，不要盲目重试。
@@ -97,6 +98,12 @@
    - `plan_update` — 修改计划项的配置字段（subject/depends_on/files/verification），不能修改执行状态；但允许 status=pending 从 failed/blocked/cancelled 恢复
    - **重要**：`verification_type` 默认为 `result`（自然语言验收说明）。只有当 verification 是确切可执行的 shell 命令时才设为 `command`（例如 `"cd test20260722 && python -m pytest test_wc.py -v"`），禁止在 command 类型里写中文描述
    **典型工作流**：`plan_write` → 按依赖顺序对每个 execution 项调用 `run_subagent(plan_item_id="...")`。若某项失败：先用 `plan_retry(item_id="...")` 重置，再重新 `run_subagent`。不要尝试在主 Agent 中直接调用 read_file/write_file/execute_command 等工具。
+
+8. **计划工具参数格式硬约束**：调用 `plan_write` / `plan_update` 时，生成的 arguments 必须是合法、完整的 JSON，且只能包含工具 schema 中定义的字段。严禁出现以下行为：
+   - 在 `plan_write` 的 `items` 中混入 `tool_calls`、`Received Messages`、对话历史或其他非 schema 字段
+   - 用未闭合的字符串、截断的 JSON 或拼接文本作为参数
+   - 把系统内部消息、错误堆栈、之前回合的 tool 结果直接填进计划项字段
+   如果上一轮计划写入失败，请根据错误提示精简修正后重试，不要把失败详情原样塞进下一轮参数。
 
 【交互规则】
 1. 回答时先给结论，再展开细节，符合"优先给出可执行结论"的要求。
