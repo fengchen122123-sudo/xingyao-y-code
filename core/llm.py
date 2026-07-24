@@ -1815,7 +1815,7 @@ def _chat_with_model_generator(
 
             # API 调用指数退避与 Jitter 抖动重试
             response_stream = None
-            max_api_retries = 3
+            max_api_retries = 5
             base_delay = 1.0
 
             for attempt in range(max_api_retries):
@@ -1925,11 +1925,27 @@ def _chat_with_model_generator(
                                 })
 
                     if attempt < max_api_retries - 1:
-                        sleep_time = (base_delay * (2 ** attempt)) + (random.random() * 0.5)
-                        retry_message = (
-                            f"API 暂未成功，正在进行第 {attempt+1}/{max_api_retries} 次重试，"
-                            f"等待 {sleep_time:.1f} 秒"
+                        # 速率限制（429 / TooManyRequests / RateLimitError）需要更长退避，
+                        # 普通网络抖动用短退避即可。
+                        is_rate_limit = (
+                            "rate limit" in err_str
+                            or "too many requests" in err_str
+                            or "too frequent" in err_str
+                            or "AccountRateLimitExceeded" in str(api_err)
                         )
+                        if is_rate_limit:
+                            rate_limit_base_delay = 5.0
+                            sleep_time = (rate_limit_base_delay * (2 ** attempt)) + (random.random() * 1.0)
+                            retry_message = (
+                                f"触发 API 速率限制，正在进行第 {attempt+1}/{max_api_retries} 次重试，"
+                                f"等待 {sleep_time:.1f} 秒"
+                            )
+                        else:
+                            sleep_time = (base_delay * (2 ** attempt)) + (random.random() * 0.5)
+                            retry_message = (
+                                f"API 暂未成功，正在进行第 {attempt+1}/{max_api_retries} 次重试，"
+                                f"等待 {sleep_time:.1f} 秒"
+                            )
                         if event_callback is None:
                             print(f"\n[⚠️ {retry_message}]")
                         else:
