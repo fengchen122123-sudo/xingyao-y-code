@@ -188,12 +188,28 @@ def _session_prefix_for_command(cmd):
     words = cmd.split()
     if not words:
         return None
+    first_word = words[0]
+
+    # 特殊处理：python / pip 脚本保留首个参数（脚本路径）以防过度放行整个解释器；
+    # 首个参数以 - 开头（如 python -m pip install）等价于任意模块执行，不予放行。
+    # 但只读查询（--version/-V/--help/-h）可以放行到前缀白名单，避免重复询问。
+    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
+        second = words[1].lower()
+        if second in {"-v", "--version", "-h", "--help", "-version", "--help"}:
+            return first_word
+        # python -m pip --version / -V / --help / -h 等只读查询放行到 "python -m pip"
+        if (
+            len(words) >= 4
+            and second == "-m"
+            and words[2].lower() == "pip"
+            and words[-1].lower() in {"--version", "-v", "--help", "-h"}
+        ):
+            return f"{first_word} -m pip"
+
     lowered = [word.lower() for word in words]
     if any(flag in lowered for flag in _INLINE_EXEC_FLAGS):
         return None
-    first_word = words[0]
-    # 特殊处理：python / pip 脚本保留首个参数（脚本路径）以防过度放行整个解释器；
-    # 首个参数以 - 开头（如 python -m pip install）等价于任意模块执行，不予放行
+
     if len(words) > 1 and ("python" in first_word or "pip" in first_word):
         if words[1].startswith("-"):
             return None

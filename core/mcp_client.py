@@ -77,8 +77,22 @@ class MCPManager:
                 self._connect_future = done
 
     def _ensure_connected(self):
-        """首次访问时惰性连接所有 MCP 服务；配置为空时完全不启动连接。"""
+        """首次访问时惰性连接所有 MCP 服务；配置为空时完全不启动连接。
+
+        支持运行期配置变化：若之前是空配置占位 future，而当前 mcp.json 已
+        包含 server，则重置连接标记并重新发起连接。
+        """
         with self._connect_lock:
+            self._load_config()
+            servers_now = bool(self.config.get("mcpServers"))
+            placeholder = (
+                self._connect_future is not None
+                and self._connect_future.done()
+                and self._connect_future.exception() is None
+                and self._connect_future.result() is None
+            )
+            if servers_now and placeholder:
+                self._connect_future = None
             self._maybe_start_connection()
             future = self._connect_future
         try:

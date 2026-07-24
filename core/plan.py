@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
-import warnings
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable
+
+
+logger = logging.getLogger(__name__)
 
 
 VALID_STATUSES = frozenset({
@@ -358,8 +361,9 @@ class PlanManager:
             except OSError:
                 pass
             self._items = []
-            warnings.warn(
-                f"计划文件 {path} 已损坏（{error}），已备份为 {corrupt_path.name} 并以空计划启动"
+            logger.warning(
+                "计划文件 %s 已损坏（%s），已备份为 %s 并以空计划启动",
+                path, error, corrupt_path.name
             )
             return
         for item in normalized:

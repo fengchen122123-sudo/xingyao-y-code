@@ -150,15 +150,16 @@ def test_plan_write_rejects_human_description_as_command_verification():
         bind_default_plan_session(previous_session)
 
 
-def test_corrupt_plan_file_is_backed_up_and_starts_empty(tmp_path):
+def test_corrupt_plan_file_is_backed_up_and_starts_empty(tmp_path, caplog):
     storage = tmp_path / "plans"
     storage.mkdir()
     plan_file = storage / "broken.json"
     plan_file.write_text("{ not valid json !!!", encoding="utf-8")
 
-    with pytest.warns(UserWarning, match="已损坏"):
+    with caplog.at_level("WARNING", logger="core.plan"):
         plan = PlanManager(storage_dir=storage, session_id="broken")
 
+    assert "已损坏" in caplog.text
     assert plan.snapshot() == []
     assert not plan_file.exists()
     assert (storage / "broken.json.corrupt").exists()
@@ -168,30 +169,32 @@ def test_corrupt_plan_file_is_backed_up_and_starts_empty(tmp_path):
     assert plan.snapshot()[0]["id"] == "a"
 
 
-def test_non_list_plan_json_is_backed_up_and_starts_empty(tmp_path):
+def test_non_list_plan_json_is_backed_up_and_starts_empty(tmp_path, caplog):
     storage = tmp_path / "plans"
     storage.mkdir()
     plan_file = storage / "dict.json"
     # 合法 JSON 但不是计划项列表
     plan_file.write_text('{"id": "a", "subject": "任务"}', encoding="utf-8")
 
-    with pytest.warns(UserWarning, match="已损坏"):
+    with caplog.at_level("WARNING", logger="core.plan"):
         plan = PlanManager(storage_dir=storage, session_id="dict")
 
+    assert "已损坏" in caplog.text
     assert plan.snapshot() == []
     assert not plan_file.exists()
     assert (storage / "dict.json.corrupt").exists()
 
 
-def test_invalid_utf8_plan_file_is_backed_up_and_starts_empty(tmp_path):
+def test_invalid_utf8_plan_file_is_backed_up_and_starts_empty(tmp_path, caplog):
     storage = tmp_path / "plans"
     storage.mkdir()
     plan_file = storage / "garbled.json"
     plan_file.write_bytes(b"\xff\xfe\x00\x01 not json")
 
-    with pytest.warns(UserWarning, match="已损坏"):
+    with caplog.at_level("WARNING", logger="core.plan"):
         plan = PlanManager(storage_dir=storage, session_id="garbled")
 
+    assert "已损坏" in caplog.text
     assert plan.snapshot() == []
     assert not plan_file.exists()
     assert (storage / "garbled.json.corrupt").exists()
