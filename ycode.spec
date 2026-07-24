@@ -122,6 +122,11 @@ litellm_datas = [
     d for d in _litellm_datas if _should_keep_litellm_data(d)
 ]
 
+# 收集 pyfiglet 字体数据和子模块，避免打包后在其他电脑上启动报
+# "No module named 'pyfiglet.fonts'"。pyfiglet 通过 importlib.resources
+# 在 pyfiglet.fonts 包中加载 .flf 字体文件，PyInstaller 默认不会收集。
+pyfiglet_datas, pyfiglet_binaries, pyfiglet_hiddenimports = collect_all('pyfiglet')
+
 a = Analysis(
     ['main.py'],
     pathex=[],
@@ -130,8 +135,8 @@ a = Analysis(
         ('config.example.json', '.'),
         ('system_prompt.md', '.'),
         ('vendor/ripgrep/rg.exe', 'vendor/ripgrep'),
-    ] + litellm_datas,
-    hiddenimports=litellm_hiddenimports,
+    ] + litellm_datas + pyfiglet_datas,
+    hiddenimports=litellm_hiddenimports + pyfiglet_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
