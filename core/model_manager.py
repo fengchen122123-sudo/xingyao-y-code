@@ -103,10 +103,11 @@ def get_active_model() -> dict | None:
         for model in provider.get("models", []):
             if model["id"] == active_id:
                 return {
-                    "litellm_model":  model["litellm_model"],
-                    "api_key":        provider["api_key"],
-                    "base_url":        provider["base_url"],
-                    "context_window": model.get("context_window", 128000),
+                    "litellm_model":   model["litellm_model"],
+                    "api_key":         provider["api_key"],
+                    "base_url":         provider["base_url"],
+                    "context_window":  model.get("context_window", 128000),
+                    "supports_vision": model.get("supports_vision"),
                     "name":            model["name"],
                     "protocol":        provider.get("protocol", "openai"),
                     "provider_name":   provider["name"],
@@ -139,7 +140,7 @@ def add_provider(name: str, base_url: str, api_key: str, protocol: str) -> str:
     return pid
 
 
-def add_model_to_provider(provider_id: str, name: str, context_window: int) -> str:
+def add_model_to_provider(provider_id: str, name: str, context_window: int, supports_vision: bool | None = None) -> str:
     """
     给指定厂商追加一个模型，litellm_model 格式为 {protocol}/{name}。
     返回新模型的 model_id。若当前无激活模型，自动激活该模型。
@@ -153,12 +154,15 @@ def add_model_to_provider(provider_id: str, name: str, context_window: int) -> s
                 # 用户可能直接输入带前缀的模型名（如 openai/gpt-4o）：
                 # 已含 / 前缀时不再重复添加，避免出现 openai/openai/gpt-4o
                 litellm_model = name if "/" in name else f"{protocol}/{name}"
-                provider["models"].append({
+                model_entry = {
                     "id": mid,
                     "name": name,
                     "litellm_model": litellm_model,
                     "context_window": context_window,
-                })
+                }
+                if supports_vision is not None:
+                    model_entry["supports_vision"] = bool(supports_vision)
+                provider["models"].append(model_entry)
                 break
         # 若当前尚未选择激活任何模型，自动激活新添加的模型
         if not data.get("active_model_id"):
@@ -187,8 +191,8 @@ def delete_model(model_id: str):
     config.update_config(_mutate)
 
 
-def update_provider_and_model(provider_id: str, model_id: str, base_url: str, api_key: str, model_name: str, context_window: int):
-    """更新厂商的 Base URL、API Key 以及旗下特定模型的名字和上下文窗口。"""
+def update_provider_and_model(provider_id: str, model_id: str, base_url: str, api_key: str, model_name: str, context_window: int, supports_vision: bool | None = None):
+    """更新厂商的 Base URL、API Key 以及旗下特定模型的名字、上下文窗口和视觉支持标志。"""
     def _mutate(data):
         for provider in data.get("providers", []):
             if provider["id"] == provider_id:
@@ -201,6 +205,8 @@ def update_provider_and_model(provider_id: str, model_id: str, base_url: str, ap
                         # 与 add_model_to_provider 一致：已含 / 前缀不重复添加
                         model["litellm_model"] = model_name if "/" in model_name else f"{proto}/{model_name}"
                         model["context_window"] = context_window
+                        if supports_vision is not None:
+                            model["supports_vision"] = bool(supports_vision)
                         break
                 break
     config.update_config(_mutate)
@@ -216,12 +222,15 @@ def add_preset_provider_with_models(name: str, base_url: str, api_key: str, prot
             mid = str(uuid.uuid4())[:8]
             mname = m["name"]
             litellm_model = mname if "/" in mname else f"{protocol}/{mname}"
-            provider_models.append({
+            model_entry = {
                 "id": mid,
                 "name": mname,
                 "litellm_model": litellm_model,
                 "context_window": m.get("context_window", 128000),
-            })
+            }
+            if "supports_vision" in m:
+                model_entry["supports_vision"] = bool(m["supports_vision"])
+            provider_models.append(model_entry)
 
         data.setdefault("providers", []).append({
             "id": pid,

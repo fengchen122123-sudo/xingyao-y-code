@@ -87,7 +87,7 @@ def test_add_model_enter_opens_wizard(monkeypatch):
     # 应已进入 addmodel 向导模式，渲染包含厂商名与步骤提示
     text = "".join(t for _, t in main_win.content.text())
     assert "为「厂商一」添加模型" in text
-    assert "步骤 1/2" in text
+    assert "步骤 1/3" in text
 
 
 def test_latest_total_tokens_reads_current_value(monkeypatch):
@@ -111,3 +111,41 @@ def test_latest_total_tokens_reads_under_lock():
         assert not done.wait(0.3), "持锁期间读取应阻塞（未持锁读取则测试失败）"
 
     assert done.wait(2), "锁释放后读取应完成"
+
+
+def test_add_model_to_provider_persists_supports_vision(monkeypatch, tmp_path):
+    """add_model_to_provider 应将 supports_vision 写入 config.json"""
+    from core.model_manager import add_model_to_provider, add_provider, load_config
+    import config as config_mod
+
+    config_file = tmp_path / "vision.json"
+    monkeypatch.setattr(config_mod, "_CONFIG_FILE", str(config_file))
+    monkeypatch.setattr("core.model_manager._CONFIG_FILE", str(config_file))
+
+    pid = add_provider("Test", "https://test.com", "key", "openai")
+    mid = add_model_to_provider(pid, "vision-model", 128000, supports_vision=True)
+
+    cfg = load_config()
+    model = next(m for p in cfg["providers"] for m in p["models"] if m["id"] == mid)
+    assert model["supports_vision"] is True
+
+
+def test_update_provider_and_model_persists_supports_vision(monkeypatch, tmp_path):
+    """update_provider_and_model 应能更新模型的 supports_vision 字段"""
+    from core.model_manager import (
+        add_model_to_provider, add_provider, load_config, update_provider_and_model,
+    )
+    import config as config_mod
+
+    config_file = tmp_path / "vision2.json"
+    monkeypatch.setattr(config_mod, "_CONFIG_FILE", str(config_file))
+    monkeypatch.setattr("core.model_manager._CONFIG_FILE", str(config_file))
+
+    pid = add_provider("Test", "https://test.com", "key", "openai")
+    mid = add_model_to_provider(pid, "vision-model", 128000, supports_vision=False)
+
+    update_provider_and_model(pid, mid, "https://test.com", "key", "vision-model", 128000, supports_vision=True)
+
+    cfg = load_config()
+    model = next(m for p in cfg["providers"] for m in p["models"] if m["id"] == mid)
+    assert model["supports_vision"] is True

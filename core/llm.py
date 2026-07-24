@@ -779,7 +779,7 @@ def _supports_vision(model_name):
 
 
 def _flatten_media_content(content_list):
-    """把多模态 list 内容折叠为纯文本：图片/文档用短占位符，绝不内联原始 base64 数据。"""
+    """把多模态 list 内容折叠为纯文本：图片用短占位符，文档也折叠为占位说明，绝不内联原始 base64 数据。"""
     text_parts = []
     for item in content_list:
         if isinstance(item, dict):
@@ -799,9 +799,10 @@ def _flatten_media_content(content_list):
 
 def _strip_media_and_merge(messages, model_name=None):
     """
-    1. 多媒体处理：支持视觉的模型保留最近一条消息中的图片（多模态负载原样透传），
+    1. 视觉输入处理：支持视觉的模型保留最近一条消息中的图片/视频（多模态负载原样透传），
        更早的历史图片一律折叠为占位符，避免每轮重复发送烧 Token；
-       不支持视觉的模型全部折叠为占位符（绝不把 base64 当文本发给模型）
+       不支持视觉的模型把图片折叠为占位符（绝不把 base64 当文本发给模型）。
+       文档/文本文件已在 input_parser 中转为普通文本，此处不视为视觉输入。
     2. 合并连续相同 role 的消息，满足 LiteLLM / Anthropic 对 user/assistant 严格轮流的要求
     3. reasoning_content / thinking_blocks 仅对支持的 provider 回传，避免其他 provider 报 400
 
@@ -810,13 +811,13 @@ def _strip_media_and_merge(messages, model_name=None):
     keep_reasoning_fields = _supports_reasoning_fields(model_name)
     keep_media = _supports_vision(model_name)
 
-    # 仅保留最近一条含多媒体的消息（其余历史中的图片折叠为占位符）
+    # 仅保留最近一条含视觉输入（图片/视频）的消息，其余历史图片折叠为占位符
     last_media_idx = -1
     if keep_media:
         for idx, msg in enumerate(messages):
             content = msg.get("content")
             if isinstance(content, list) and any(
-                isinstance(item, dict) and item.get("type") in ("image", "image_url", "document")
+                isinstance(item, dict) and item.get("type") in ("image", "image_url")
                 for item in content
             ):
                 last_media_idx = idx
@@ -836,7 +837,7 @@ def _strip_media_and_merge(messages, model_name=None):
                 folded_count += sum(
                     1
                     for item in content
-                    if isinstance(item, dict) and item.get("type") in ("image", "image_url", "document")
+                    if isinstance(item, dict) and item.get("type") in ("image", "image_url")
                 )
         else:
             cleaned_msg = {"role": role, "content": str(content) if content is not None else ""}
@@ -1814,7 +1815,7 @@ def _chat_with_model_generator(
                             _notify_event(
                                 event_callback,
                                 "notice",
-                                {"message": f"当前模型不支持图片/文档输入，已将 {folded_count} 个媒体折叠为 [图片]/[文档] 占位符。"},
+                                {"message": f"当前模型不支持图片输入，已将 {folded_count} 个图片折叠为 [图片] 占位符。"},
                             )
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
