@@ -314,7 +314,7 @@ class MemoryManager:
                 if row:
                     session_id = row[0]
                 else:
-                    target_wdir = "GLOBAL"
+                    target_wdir = self.workdir
                     cursor.execute('''
                         INSERT INTO sessions (session_name, workdir, created_at, updated_at)
                         VALUES (?, ?, ?, ?)

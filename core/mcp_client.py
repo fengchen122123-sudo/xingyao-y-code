@@ -57,22 +57,29 @@ class MCPManager:
         except Exception:
             self.config = {"mcpServers": {}}
 
+    def _maybe_start_connection(self):
+        """启动 MCP 连接或创建占位 future，不等待完成。
+
+        必须在已持有 self._connect_lock 时调用。
+        """
+        if self._connect_future is None:
+            self._load_config()
+            if self.config.get("mcpServers"):
+                self._connect_future = asyncio.run_coroutine_threadsafe(
+                    self._connect_all(), self.loop
+                )
+            else:
+                # 无配置：用一个已完成的 future 占位，后续访问零开销。
+                # 注意：空配置是进程级一次性决策——运行期再编辑 mcp.json
+                # 不会触发重连，需重启进程后生效。
+                done = concurrent.futures.Future()
+                done.set_result(None)
+                self._connect_future = done
+
     def _ensure_connected(self):
         """首次访问时惰性连接所有 MCP 服务；配置为空时完全不启动连接。"""
         with self._connect_lock:
-            if self._connect_future is None:
-                self._load_config()
-                if self.config.get("mcpServers"):
-                    self._connect_future = asyncio.run_coroutine_threadsafe(
-                        self._connect_all(), self.loop
-                    )
-                else:
-                    # 无配置：用一个已完成的 future 占位，后续访问零开销。
-                    # 注意：空配置是进程级一次性决策——运行期再编辑 mcp.json
-                    # 不会触发重连，需重启进程后生效。
-                    done = concurrent.futures.Future()
-                    done.set_result(None)
-                    self._connect_future = done
+            self._maybe_start_connection()
             future = self._connect_future
         try:
             future.result(timeout=CONNECT_TIMEOUT)
@@ -175,9 +182,11 @@ class MCPManager:
     def get_schemas(self):
         """返回当前已就绪的 MCP 工具 schema，不阻塞等待连接完成。
 
-        启动时主流程会在后台线程调用 _ensure_connected() 启动 MCP 连接；
-        连接成功后 tool_schemas 会自动更新。首次 LLM 请求不再被 MCP 连接超时阻塞。
+        首次访问时惰性触发连接（或空配置占位 future），但不等待连接结果，
+        避免阻塞主流程；连接成功后 tool_schemas 会自动更新。
         """
+        with self._connect_lock:
+            self._maybe_start_connection()
         return list(self.tool_schemas)
 
     async def _call_tool_async(self, tool_name, arguments):

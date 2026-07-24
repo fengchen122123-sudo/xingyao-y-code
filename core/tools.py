@@ -22,6 +22,7 @@ from ddgs import DDGS
 
 from core.version import __version__ as YCODE_VERSION
 from core import tool_cache as _tool_cache
+from core.lsp import _get_rg_executable
 
 
 HTTP_TIMEOUT_SECONDS = 20
@@ -886,7 +887,8 @@ def search_code(query, dir_path="."):
             return shared
 
     try:
-        cmd = ["rg", "-n", "-i", "--no-heading", "--max-columns", "200", "-C", "1", query, dir_path]
+        rg_executable = _get_rg_executable()
+        cmd = [rg_executable, "-n", "-i", "--no-heading", "--max-columns", "200", "-C", "1", query, dir_path]
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
         if result.returncode in (0, 1):
             output = result.stdout.strip()

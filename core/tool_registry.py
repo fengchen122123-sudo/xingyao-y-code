@@ -291,7 +291,11 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="execute_command",
-            description="执行本地命令。前台执行默认 30 秒超时，可用 timeout_seconds 调整（上限 600 秒）。",
+            description=(
+                "执行本地命令。前台执行默认 30 秒超时，可用 timeout_seconds 调整（上限 600 秒）。"
+                "注意：PowerShell 中 $env:XXX 这类变量在单引号字符串内不会扩展，应使用双引号包裹"
+                "（例如 -OutFile \"$env:TEMP\\pkg.zip\"）。"
+            ),
             input_schema=_schema({
                 "command": {"type": "string"},
                 "run_in_background": {"type": "boolean", "default": False},

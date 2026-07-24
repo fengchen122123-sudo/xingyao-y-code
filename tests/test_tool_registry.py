@@ -114,6 +114,15 @@ def test_registry_exposes_ask_user_without_permission_gate():
     assert properties["options"]["maxItems"] == 3
 
 
+def test_execute_command_description_warns_about_powershell_quotes():
+    registry = build_default_registry()
+    spec = registry.get("execute_command")
+
+    assert "PowerShell" in spec.description
+    assert "$env:" in spec.description
+    assert '双引号' in spec.description
+
+
 def test_manage_task_only_prompts_for_kill():
     registry = build_default_registry()
 
