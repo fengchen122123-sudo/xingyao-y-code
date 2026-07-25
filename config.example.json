@@ -1,5 +1,20 @@
 {
   "active_model_id": "model_1",
+  "secondary_model_id": null,
+  "image_compression": {
+    "max_edge": 1024,
+    "quality": 85,
+    "max_output_bytes": 512000
+  },
+  "memory_compression": {
+    "retain_count": 8,
+    "retain_count_force": 4,
+    "tool_result_truncate_threshold_chars": 2000,
+    "tool_result_preview_limit_chars": 800,
+    "tool_result_token_limit": 600,
+    "summary_length_first": 250,
+    "summary_length_merge": 350
+  },
   "providers": [
     {
       "id": "provider_1",
@@ -12,7 +27,11 @@
           "id": "model_1",
           "name": "agnes-2.0-flash",
           "litellm_model": "openai/agnes-2.0-flash",
-          "context_window": 128000
+          "context_window": 128000,
+          "supports_vision": false,
+          "max_tokens": 8192,
+          "thinking_budget": null,
+          "enable_thinking": null
         }
       ]
     }

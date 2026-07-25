@@ -10,6 +10,7 @@ tenacity>=8.0.0
 
 # GUI dependencies
 pywebview>=6.0.0
+pillow>=10.0.0
 
 # Development / test dependencies
 pytest>=7.0.0

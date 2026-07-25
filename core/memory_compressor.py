@@ -12,30 +12,97 @@ from prompt_toolkit.formatted_text import HTML  # noqa: F401
 _compress_guard = threading.Lock()
 _compressing_sessions = set()
 
-# 单条消息预压缩阈值：超过此长度的工具结果先截断再交给 LLM 总结
-# 工具结果（如 read_file 大文件）往往是 LLM 总结的 token 大户，预截断可显著降低压缩成本
-TOOL_RESULT_PREVIEW_LIMIT = 800
-TOOL_RESULT_TRUNCATE_THRESHOLD = 2000
+# 默认配置：在压缩收益与额度消耗之间取平衡
+DEFAULT_RETAIN_COUNT = 8
+DEFAULT_RETAIN_COUNT_FORCE = 4
+DEFAULT_TOOL_RESULT_TRUNCATE_THRESHOLD_CHARS = 2000
+DEFAULT_TOOL_RESULT_PREVIEW_LIMIT_CHARS = 800
+DEFAULT_TOOL_RESULT_TOKEN_LIMIT = 600      # 近似 token 上限（优先于字符阈值）
+DEFAULT_SUMMARY_LENGTH_FIRST = 250
+DEFAULT_SUMMARY_LENGTH_MERGE = 350
 
 
-def _truncate_long_tool_result(content):
+def _load_compression_config():
+    """读取 config.json 中的记忆压缩配置，失败时返回默认值。"""
+    try:
+        from core.model_manager import load_config
+        cfg = load_config()
+        comp_cfg = cfg.get("memory_compression", {})
+        return {
+            "retain_count": int(comp_cfg.get("retain_count", DEFAULT_RETAIN_COUNT)),
+            "retain_count_force": int(comp_cfg.get("retain_count_force", DEFAULT_RETAIN_COUNT_FORCE)),
+            "tool_result_truncate_threshold_chars": int(
+                comp_cfg.get("tool_result_truncate_threshold_chars", DEFAULT_TOOL_RESULT_TRUNCATE_THRESHOLD_CHARS)
+            ),
+            "tool_result_preview_limit_chars": int(
+                comp_cfg.get("tool_result_preview_limit_chars", DEFAULT_TOOL_RESULT_PREVIEW_LIMIT_CHARS)
+            ),
+            "tool_result_token_limit": int(
+                comp_cfg.get("tool_result_token_limit", DEFAULT_TOOL_RESULT_TOKEN_LIMIT)
+            ),
+            "summary_length_first": int(comp_cfg.get("summary_length_first", DEFAULT_SUMMARY_LENGTH_FIRST)),
+            "summary_length_merge": int(comp_cfg.get("summary_length_merge", DEFAULT_SUMMARY_LENGTH_MERGE)),
+        }
+    except Exception:
+        return {
+            "retain_count": DEFAULT_RETAIN_COUNT,
+            "retain_count_force": DEFAULT_RETAIN_COUNT_FORCE,
+            "tool_result_truncate_threshold_chars": DEFAULT_TOOL_RESULT_TRUNCATE_THRESHOLD_CHARS,
+            "tool_result_preview_limit_chars": DEFAULT_TOOL_RESULT_PREVIEW_LIMIT_CHARS,
+            "tool_result_token_limit": DEFAULT_TOOL_RESULT_TOKEN_LIMIT,
+            "summary_length_first": DEFAULT_SUMMARY_LENGTH_FIRST,
+            "summary_length_merge": DEFAULT_SUMMARY_LENGTH_MERGE,
+        }
+
+
+def _estimate_tokens(text):
+    """估算文本 token 数。优先用 tiktoken，失败时按字符数近似（中文/英文混合约 1 token / 2 字符）。"""
+    if not isinstance(text, str):
+        text = str(text)
+    try:
+        import tiktoken
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(text))
+    except Exception:
+        # 保守近似：英文 1 token / 4 字符，中文 1 token / 1 字符；混合取 1 token / 2 字符
+        return max(1, len(text) // 2)
+
+
+def _truncate_long_tool_result(content, config=None):
     """对超长工具结果做预截断，保留开头 + 末尾 + 占位符。
 
     工具结果（特别是 read_file 返回的完整文件内容）在压缩时全部塞进 prompt 让 LLM 总结，
-    等于把整个文件又发一遍。预截断把单条工具结果限制在 TOOL_RESULT_PREVIEW_LIMIT 字符内，
+    等于把整个文件又发一遍。预截断把单条工具结果限制在可控长度内，
     能显著降低压缩调用的 token 成本（典型大文件 read_file 可省 80%+）。
 
-    策略：保留开头（通常是文件头/结构信息）和末尾（通常是关键结论），
-    中间用占位符标注截断长度，让 LLM 知道有内容被省略。
+    策略：
+    - 字符长度超过阈值 或 token 数超过阈值时触发截断；
+    - 保留开头（通常是文件头/结构信息）和末尾（通常是关键结论），
+      中间用占位符标注截断长度，让 LLM 知道有内容被省略。
     """
     if not isinstance(content, str):
         content = str(content)
-    if len(content) <= TOOL_RESULT_TRUNCATE_THRESHOLD:
+    if config is None:
+        config = _load_compression_config()
+
+    threshold_chars = config["tool_result_truncate_threshold_chars"]
+    preview_limit = config["tool_result_preview_limit_chars"]
+    token_limit = config["tool_result_token_limit"]
+
+    if len(content) <= threshold_chars and _estimate_tokens(content) <= token_limit:
         return content
-    head = content[:TOOL_RESULT_PREVIEW_LIMIT // 2]
-    tail = content[-(TOOL_RESULT_PREVIEW_LIMIT // 2):]
-    omitted = len(content) - TOOL_RESULT_PREVIEW_LIMIT
-    return f"{head}\n... [已省略 {omitted} 字符的工具结果内容] ...\n{tail}"
+
+    head_len = preview_limit // 2
+    tail_len = preview_limit // 2
+    head = content[:head_len]
+    tail = content[-tail_len:] if tail_len else ""
+    omitted = len(content) - preview_limit
+    omitted_tokens = _estimate_tokens(content) - _estimate_tokens(head + tail)
+    return (
+        f"{head}\n"
+        f"... [已省略 {omitted} 字符 / 约 {omitted_tokens} token 的工具结果内容] ...\n"
+        f"{tail}"
+    )
 
 
 def compress_session_memory(
@@ -50,7 +117,7 @@ def compress_session_memory(
     """
     智能归纳压缩会话记忆：
     1. 读取全部历史对话记录；
-    2. 保留最近的 8 条（force=True时保留 4 条，也就是 2-4 轮对话，user-assistant）作为当前活跃上下文；
+    2. 保留最近的 N 条（force=True 时保留更少条）作为当前活跃上下文；
     3. 把在此之前的所有更老对话打包，调用 LLM 提炼/合并生成简短中文记忆摘要并写入 sessions。
     """
     def emit(message):
@@ -83,9 +150,10 @@ def compress_session_memory(
 
 
 def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit):
+    config = _load_compression_config()
     try:
         # 多步读写期间持有 manager 的可重入锁，与 add_messages 等写路径互斥
-        lock = manager.acquire_lock() if hasattr(manager, "acquire_lock") else contextlib.nullcontext()
+        lock = manager.acquire_lock() if hasattr(manager, 'acquire_lock') else contextlib.nullcontext()
         with lock:
             cursor = manager.conn.cursor()
 
@@ -129,26 +197,20 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                     "content": content_str
                 })
 
-            # 3. 统计需要保留的最近活跃消息（保留最后 8 条活跃消息，即 4 轮完整 user-assistant 交互）
-            # 确保只有在活跃消息数显著多于保留数时才压缩，否则没意义
-            RETAIN_COUNT = 4 if force else 8
-            if len(all_active_messages) <= RETAIN_COUNT + 2:
+            # 3. 统计需要保留的最近活跃消息
+            retain_count = config["retain_count_force"] if force else config["retain_count"]
+            if len(all_active_messages) <= retain_count + 2:
                 if force:
-                    # 阈值随 RETAIN_COUNT 动态生成（force=True 时 RETAIN_COUNT=4）
-                    emit(f"<ansiyellow>ℹ 当前会话活跃对话过少（少于 {RETAIN_COUNT + 2} 条），无需进行记忆压缩。</ansiyellow>")
+                    emit(f"<ansiyellow>ℹ 当前会话活跃对话过少（少于 {retain_count + 2} 条），无需进行记忆压缩。</ansiyellow>")
                 return False
 
-            messages_to_summarize = all_active_messages[:-RETAIN_COUNT]
+            messages_to_summarize = all_active_messages[:-retain_count]
             # 获取被压缩的最大消息 id，以此作为下次截断的起点
             max_summarized_id = messages_to_summarize[-1]["id"]
 
             # 4. 组装待总结对话文本日志
-            # 对超长工具结果做预截断：read_file 等工具返回的大文件原文在压缩时
-            # 全部塞给 LLM 等于又发一遍，预截断保留头尾即可让 LLM 理解上下文，
-            # 同时显著降低压缩调用的 token 成本。
             chat_log = ""
             for msg in messages_to_summarize:
-                # 角色显示：user→用户，assistant→星瑶，tool→工具结果（避免误标为助手发言）
                 role = msg["role"]
                 if role == "user":
                     role_display = "用户"
@@ -160,12 +222,14 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 clean_content = re.sub(r"<(?:think|thinking)>.*?</(?:think|thinking)>", "", msg["content"], flags=re.DOTALL).strip()
                 # 工具结果（role=tool）超长时预截断
                 if role == "tool" and clean_content:
-                    clean_content = _truncate_long_tool_result(clean_content)
+                    clean_content = _truncate_long_tool_result(clean_content, config)
                 if clean_content:
                     chat_log += f"{role_display}: {clean_content}\n"
 
             if not chat_log.strip():
                 return False
+
+            summary_limit = config["summary_length_merge"] if old_summary else config["summary_length_first"]
 
             # 5. 构造总结 / 合并 prompt 提交大模型
             if old_summary:
@@ -177,7 +241,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                     "3. 当前遗留、尚在排查的 Bug 或者是未完工的待办开发任务；\n"
                     "4. 用户当前正在进行的最终目标。\n"
                     "要求：\n"
-                    "- 保持极度精炼，整体字数严格控制在 350 字以内，千万不要长篇大论。\n"
+                    f"- 保持极度精炼，整体字数严格控制在 {summary_limit} 字以内，千万不要长篇大论。\n"
                     "- 直接输出合并后的摘要内容，不要带废话，也不要带任何 Markdown 标题、说明性前言或结尾词。\n\n"
                     f"【前期历史记忆摘要】\n{old_summary}\n\n"
                     f"【追加对话记录】\n{chat_log}\n\n"
@@ -192,7 +256,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                     "3. 目前未解决的 Bug、排查中的问题或未完工的待办事项；\n"
                     "4. 用户当前正在进行的目标。\n"
                     "要求：\n"
-                    "- 保持极其简练，字数严格控制在 250 字以内。\n"
+                    f"- 保持极其简练，字数严格控制在 {summary_limit} 字以内。\n"
                     "- 不要带任何废话、Markdown标题或介绍，直接输出摘要内容。\n\n"
                     f"[对话历史记录]\n{chat_log}\n\n"
                     "记忆摘要："
@@ -201,12 +265,24 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         # LLM 调用耗时较长，在锁外执行，避免阻塞其它线程的正常读写
         emit("\n<ansigray>🧠 正在后台智能压缩并整合长对话记忆...</ansigray>")
 
+        # 优先使用 secondary（便宜）模型做摘要，降低后台记忆压缩的额度消耗
+        compress_model, compress_key, compress_url = api_model, api_key, api_url
+        try:
+            from core.model_manager import get_secondary_model
+            secondary = get_secondary_model()
+            if secondary:
+                compress_model = secondary["litellm_model"]
+                compress_key = secondary["api_key"]
+                compress_url = secondary["base_url"]
+        except Exception:
+            pass
+
         # 懒加载 litellm.completion（首次调用触发 import，约 1.4s）
         from core.llm import _litellm_completion
         response = _litellm_completion(
-            model=api_model,
-            api_key=api_key,
-            api_base=api_url,
+            model=compress_model,
+            api_key=compress_key,
+            api_base=compress_url,
             messages=[{"role": "user", "content": prompt}],
             timeout=15
         )
@@ -219,7 +295,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             # 6. 将合并后的记忆摘要和截止 id 存回数据库。
             # 乐观校验：仅当 summarized_until_msg_id 仍为读取时的旧值才更新，
             # 防止压缩期间并发写入/压缩导致边界错乱、新消息被静默跳过。
-            with manager.acquire_lock() if hasattr(manager, "acquire_lock") else contextlib.nullcontext():
+            with manager.acquire_lock() if hasattr(manager, 'acquire_lock') else contextlib.nullcontext():
                 cursor = manager.conn.cursor()
                 cursor.execute('''
                     UPDATE sessions
@@ -239,7 +315,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         # 异常路径必须回滚，否则未提交的事务会使 SQLite 连接进入锁定状态，
         # 导致后续所有写操作报 "database is locked"。
         try:
-            if hasattr(manager, "conn") and manager.conn:
+            if hasattr(manager, 'conn') and manager.conn:
                 manager.conn.rollback()
         except Exception:
             pass
