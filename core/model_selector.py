@@ -621,7 +621,7 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.hint", f"  上下文:   {data['context_window']}\n")]
 
         if step == 4:
-            vision = data.get("supports_vision", False)
+            vision = state["proto_cursor"] == 1
             opts = ["  否（仅文本）", "  是（支持图片/视频）"]
             for oi, o in enumerate(opts):
                 if oi == (1 if vision else 0):
@@ -714,7 +714,7 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.hint",  f"  {hint}\n")]
 
         elif step == 5.5:
-            vision = data.get("supports_vision", False)
+            vision = state["proto_cursor"] == 1
             opts = ["  否（仅文本）", "  是（支持图片/视频）"]
             for oi, o in enumerate(opts):
                 if oi == (1 if vision else 0):
@@ -775,7 +775,7 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.hint", f"  上下文:   {data['context_window']}\n")]
 
         if step == 2:
-            vision = data.get("supports_vision", False)
+            vision = state["proto_cursor"] == 1
             opts = ["  否（仅文本）", "  是（支持图片/视频）"]
             for oi, o in enumerate(opts):
                 if oi == (1 if vision else 0):
