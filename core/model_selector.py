@@ -78,8 +78,8 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.kimi.com/coding",
         "protocol": "anthropic",
         "models": [
-            {"name": "kimi-for-coding", "context_window": 256000},
-            {"name": "K3", "context_window": 1000000},
+            {"name": "kimi-for-coding", "context_window": 256000, "supports_vision": True},
+            {"name": "K3", "context_window": 1000000, "supports_vision": True},
         ],
     },
     {
@@ -87,9 +87,9 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.moonshot.cn/v1",
         "protocol": "openai",
         "models": [
-            {"name": "kimi-k3", "context_window": 1000000},
-            {"name": "kimi-k2.7-code", "context_window": 256000},
-            {"name": "kimi-k2.6", "context_window": 256000},
+            {"name": "kimi-k3", "context_window": 1000000, "supports_vision": True},
+            {"name": "kimi-k2.7-code", "context_window": 256000, "supports_vision": True},
+            {"name": "kimi-k2.6", "context_window": 256000, "supports_vision": True},
         ],
     },
     {
@@ -97,8 +97,8 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.deepseek.com",
         "protocol": "openai",
         "models": [
-            {"name": "deepseek-v4-pro", "context_window": 1000000},
-            {"name": "deepseek-v4-flash", "context_window": 1000000},
+            {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
+            {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
         ],
     },
     {
@@ -106,7 +106,7 @@ PRESET_PROVIDERS = [
         "base_url": "https://apihub.agnes-ai.com/v1",
         "protocol": "openai",
         "models": [
-            {"name": "agnes-2.0-flash", "context_window": 1000000},
+            {"name": "agnes-2.0-flash", "context_window": 1000000, "supports_vision": True},
         ],
     },
     {
@@ -114,7 +114,7 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.longcat.chat/openai/v1",
         "protocol": "openai",
         "models": [
-            {"name": "LongCat-2.0", "context_window": 1000000},
+            {"name": "LongCat-2.0", "context_window": 1000000, "supports_vision": False},
         ],
     },
     {
@@ -122,7 +122,7 @@ PRESET_PROVIDERS = [
         "base_url": "https://token.sensenova.cn/v1",
         "protocol": "openai",
         "models": [
-            {"name": "sensenova-6.7-flash-lite", "context_window": 256000},
+            {"name": "sensenova-6.7-flash-lite", "context_window": 256000, "supports_vision": True},
         ],
     },
     {
@@ -130,10 +130,10 @@ PRESET_PROVIDERS = [
         "base_url": "https://ark.cn-beijing.volces.com/api/plan",
         "protocol": "anthropic",
         "models": [
-            {"name": "doubao-seed-2.0-code", "context_window": 256000},
-            {"name": "glm-5.2", "context_window": 1000000},
-            {"name": "doubao-seed-evolving", "context_window": 1000000},
-            {"name": "ark-code-latest", "context_window": 256000},
+            {"name": "doubao-seed-2.0-code", "context_window": 256000, "supports_vision": True},
+            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
+            {"name": "doubao-seed-evolving", "context_window": 1000000, "supports_vision": True},
+            {"name": "ark-code-latest", "context_window": 256000, "supports_vision": True},
         ],
     },
     {
@@ -141,9 +141,9 @@ PRESET_PROVIDERS = [
         "base_url": "https://ark.cn-beijing.volces.com/api/coding",
         "protocol": "anthropic",
         "models": [
-            {"name": "doubao-seed-2.0-code", "context_window": 256000},
-            {"name": "glm-5.2", "context_window": 1000000},
-            {"name": "ark-code-latest", "context_window": 256000},
+            {"name": "doubao-seed-2.0-code", "context_window": 256000, "supports_vision": True},
+            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
+            {"name": "ark-code-latest", "context_window": 256000, "supports_vision": True},
         ],
     },
     {
@@ -151,8 +151,8 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.stepfun.com/step_plan/v1",
         "protocol": "openai",
         "models": [
-            {"name": "step-3.7-flash", "context_window": 256000},
-            {"name": "step-router-v1", "context_window": 256000},
+            {"name": "step-3.7-flash", "context_window": 256000, "supports_vision": True},
+            {"name": "step-router-v1", "context_window": 256000, "supports_vision": False},
         ],
     },
     {
@@ -160,7 +160,7 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.siliconflow.cn/v1",
         "protocol": "openai",
         "models": [
-            {"name": "zai-org/GLM-5.2", "context_window": 1000000},
+            {"name": "zai-org/GLM-5.2", "context_window": 1000000, "supports_vision": False},
         ],
     },
     {
@@ -168,8 +168,8 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.minimaxi.com/v1",
         "protocol": "openai",
         "models": [
-            {"name": "MiniMax-M3", "context_window": 1000000},
-            {"name": "MiniMax-M2.7", "context_window": 204800},
+            {"name": "MiniMax-M3", "context_window": 1000000, "supports_vision": True},
+            {"name": "MiniMax-M2.7", "context_window": 204800, "supports_vision": True},
         ],
     },
     {
@@ -177,8 +177,8 @@ PRESET_PROVIDERS = [
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "protocol": "openai",
         "models": [
-            {"name": "glm-5.2", "context_window": 1000000},
-            {"name": "glm-5.1", "context_window": 1000000},
+            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
+            {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
         ],
     },
 ]
