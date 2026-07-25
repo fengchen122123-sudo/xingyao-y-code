@@ -1,0 +1,393 @@
+:root {
+  --bg0: #0d1117;
+  --bg1: #161b22;
+  --bg2: #1c2330;
+  --bg3: #232b3a;
+  --border: #2d3646;
+  --text: #d7dde8;
+  --text-dim: #8b98ab;
+  --text-faint: #5b6678;
+  --accent: #4f8cff;
+  --accent2: #7c5cff;
+  --green: #3fb950;
+  --yellow: #d29922;
+  --red: #f85149;
+  --orange: #f0883e;
+  --cyan: #39c5cf;
+  --purple: #bc8cff;
+  --mono: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+  --sans: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: var(--bg0);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 14px;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #3a4356;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+}
+
+.mono {
+  font-family: var(--mono);
+}
+
+/* 顶栏按钮与 Pill */
+.pill {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 7px;
+  padding: 5px 10px;
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  transition: 0.15s;
+}
+
+.pill:hover {
+  border-color: var(--accent);
+  background: var(--bg3);
+}
+
+.pill .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  box-shadow: 0 0 6px var(--green);
+}
+
+.pill .caret {
+  color: var(--text-faint);
+  font-size: 10px;
+}
+
+.icon-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  color: var(--text-dim);
+  border-radius: 7px;
+  width: 32px;
+  height: 32px;
+  font-size: 15px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: 0.15s;
+}
+
+.icon-btn:hover {
+  background: var(--bg3);
+  color: var(--text);
+  border-color: var(--border);
+}
+
+/* Kimi 风格卡片 */
+.kimi-empty-container {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 160px);
+  padding: 20px;
+  animation: fadein 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+  user-select: none;
+}
+
+.kimi-hero {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 28px;
+}
+
+.kimi-icon {
+  width: 56px;
+  height: 56px;
+  border-radius: 18px;
+  background: linear-gradient(135deg, #4facfe, #00f2fe);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 26px;
+  box-shadow: 0 8px 24px rgba(79, 172, 254, 0.35);
+  color: #fff;
+}
+
+.kimi-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.kimi-title {
+  font-size: 26px;
+  font-weight: 600;
+  color: var(--text);
+  letter-spacing: -0.3px;
+}
+
+.kimi-beta {
+  font-size: 11px;
+  background: rgba(57, 197, 207, 0.15);
+  color: var(--cyan);
+  padding: 2px 8px;
+  border-radius: 6px;
+  font-weight: 600;
+  text-transform: uppercase;
+  border: 1px solid rgba(57, 197, 207, 0.3);
+}
+
+.kimi-card {
+  width: 100%;
+  max-width: 680px;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 22px;
+  padding: 18px 20px 14px;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.3);
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.kimi-card:focus-within {
+  border-color: var(--accent);
+  box-shadow: 0 20px 48px rgba(79, 140, 255, 0.2);
+}
+
+.kimi-card textarea {
+  width: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font-family: inherit;
+  font-size: 15px;
+  resize: none;
+  min-height: 75px;
+  line-height: 1.6;
+}
+
+.kimi-card textarea::placeholder {
+  color: var(--text-faint);
+}
+
+.kimi-card-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+}
+
+.kimi-pill-btn {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  color: var(--text-dim);
+  border-radius: 10px;
+  padding: 6px 12px;
+  font-size: 12.5px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  cursor: pointer;
+  transition: 0.15s;
+}
+
+.kimi-pill-btn:hover {
+  background: var(--bg3);
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.kimi-send-btn {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: none;
+  background: var(--bg3);
+  color: var(--text-faint);
+  font-size: 17px;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: 0.2s;
+}
+
+.kimi-card:focus-within .kimi-send-btn,
+.kimi-send-btn.active {
+  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  color: #fff;
+  box-shadow: 0 4px 14px rgba(79, 140, 255, 0.4);
+}
+
+.kimi-footer-workdir {
+  margin-top: 18px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 9px 18px;
+  font-size: 13px;
+  color: var(--text-dim);
+  cursor: pointer;
+  transition: 0.15s;
+  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
+}
+
+.kimi-footer-workdir:hover {
+  border-color: var(--accent);
+  color: var(--text);
+  background: var(--bg2);
+}
+
+/* 动效 */
+@keyframes fadein {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* 高清精细 Markdown 样式 */
+.md-body {
+  line-height: 1.7;
+  color: var(--text);
+}
+.md-body p {
+  margin: 6px 0;
+}
+.md-body strong {
+  color: #ffffff;
+  font-weight: 600;
+}
+.md-body em {
+  color: var(--cyan);
+  font-style: italic;
+}
+.md-body h2,
+.md-body h3,
+.md-body h4 {
+  margin: 14px 0 6px;
+  color: #ffffff;
+  font-weight: 600;
+}
+.md-body h2 {
+  font-size: 16px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 4px;
+}
+.md-body h3 {
+  font-size: 14.5px;
+}
+.md-body h4 {
+  font-size: 13.5px;
+}
+.md-body code {
+  background: var(--bg3);
+  padding: 2px 6px;
+  border-radius: 4px;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  color: var(--cyan);
+}
+.md-body pre {
+  background: #0a0e14;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 12px;
+  margin: 10px 0;
+  overflow-x: auto;
+  font-family: var(--mono);
+  font-size: 12.5px;
+  line-height: 1.55;
+}
+.md-body pre code {
+  background: none;
+  padding: 0;
+  color: var(--text);
+}
+.md-body ul,
+.md-body ol {
+  padding-left: 22px;
+  margin: 8px 0;
+}
+.md-body li {
+  margin: 4px 0;
+}
+
+.cursor-blink {
+  display: inline-block;
+  width: 8px;
+  height: 15px;
+  background: var(--accent);
+  vertical-align: -2px;
+  margin-left: 2px;
+  animation: blink 1s steps(1) infinite;
+}
+@keyframes blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* 浅色主题支持 */
+body.light {
+  --bg0: #f5f7fa;
+  --bg1: #ffffff;
+  --bg2: #eef1f5;
+  --bg3: #e2e7ee;
+  --border: #d3dae4;
+  --text: #1f2733;
+  --text-dim: #5b6a80;
+  --text-faint: #93a0b4;
+}
+body.light .md-body pre,
+body.light .tool-body,
+body.light .modal-body,
+body.light .bg-task .btlog,
+body.light #pane-terminal .term-body {
+  background: #f0f3f7;
+}
+body.light .tool-head .tname,
+body.light .md-body h2,
+body.light .md-body h3,
+body.light .md-body h4,
+body.light .md-body strong {
+  color: #1f2733;
+}

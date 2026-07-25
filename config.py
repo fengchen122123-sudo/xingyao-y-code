@@ -36,7 +36,7 @@ def _atomic_write_json(path, data, indent=2):
             os.fsync(f.fileno())
         _backup_if_valid(path)
         os.replace(tmp_path, path)
-        _CONFIG_CACHE["data"] = None
+        _CONFIG_CACHE.pop(path, None)
     finally:
         # os.replace 在 Windows 上目标文件被占用时会 PermissionError，
         # 异常路径必须清理临时文件，避免 *.tmp 泄漏堆积
@@ -47,19 +47,20 @@ def _atomic_write_json(path, data, indent=2):
             pass
 
 
-_CONFIG_CACHE = {"mtime": 0, "data": None}
+_CONFIG_CACHE: dict[str, dict] = {}
 
 
 def _read_json_with_backup(path, default=None):
     """读取 JSON；使用 mtime 缓存，仅在磁盘文件真正改变时才重新读取磁盘，极大提升多窗口/高频刷新性能。"""
     try:
         current_mtime = os.path.getmtime(path)
-        if _CONFIG_CACHE["data"] is not None and _CONFIG_CACHE["mtime"] == current_mtime:
-            return _CONFIG_CACHE["data"]
+        cache_entry = _CONFIG_CACHE.setdefault(path, {"mtime": 0, "data": None})
+        if cache_entry["data"] is not None and cache_entry["mtime"] == current_mtime:
+            return cache_entry["data"]
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-            _CONFIG_CACHE["mtime"] = current_mtime
-            _CONFIG_CACHE["data"] = data
+            cache_entry["mtime"] = current_mtime
+            cache_entry["data"] = data
             return data
     except FileNotFoundError:
         return default
@@ -68,8 +69,12 @@ def _read_json_with_backup(path, default=None):
         try:
             with open(backup, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            # 用备份回写主文件完成自愈
-            _atomic_write_json(path, data)
+            # 用备份回写主文件完成自愈；对 config.json 加锁，避免与正常写路径竞态覆盖新配置
+            if path == _CONFIG_FILE:
+                with _CONFIG_LOCK:
+                    _atomic_write_json(path, data)
+            else:
+                _atomic_write_json(path, data)
             return data
         except Exception:
             return default

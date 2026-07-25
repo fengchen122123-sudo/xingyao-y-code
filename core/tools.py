@@ -1,4 +1,5 @@
 import ipaddress
+import logging
 import os
 import json
 import re
@@ -32,6 +33,8 @@ READ_FILE_MAX_LINES = 2000
 # 大文件阈值：超过此字节数的文件，未显式指定 limit 时自动只读前部分并提示分页
 READ_FILE_LARGE_BYTES = 50 * 1024
 READ_FILE_LARGE_DEFAULT_LINES = 500
+
+_logger = logging.getLogger(__name__)
 
 
 def _compress_source_text(text):
@@ -310,7 +313,7 @@ def write_file(file_path, content):
         prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
     )
     try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
             f.write(content)
         os.replace(temp_name, resolved)
     except BaseException:
@@ -1120,16 +1123,9 @@ def _fuzzy_replace(content, target, replacement, replace_all=False):
                     best_start = i
             search_start = anchor_idx + 1
 
-        # 锚点完全找不到时（target 被严重污染或全为空白），退化到原全量滑动，
-        # 但把文件大小限制到 50k 字符以内，避免极端卡顿。
-        if best_ratio < 0.90 and content_len <= 50_000:
-            for i in range(content_len - target_len + 1):
-                window = content[i : i + target_len]
-                ratio = difflib.SequenceMatcher(None, target, window).ratio()
-                if ratio > best_ratio:
-                    best_ratio = ratio
-                    best_start = i
-
+        # 锚点完全找不到时（target 被严重污染或全为空白），不再做全量字符滑动窗口。
+        # 全量滑窗在最坏情况下是 O(n*m) 的 difflib 比较，常见幻觉 target 会让
+        # 工具假死数分钟，因此直接放弃匹配，把失败信息返回给模型。
         if best_ratio >= 0.90:
             best_end = best_start + target_len
             return content[:best_start] + replacement + content[best_end:], 1
@@ -1831,56 +1827,57 @@ class SubagentManager:
             },
         ]
         self._record_stage(task.task_id, "model")
-        # 进入子代理深度作用域：在此作用域内 _get_current_subagent_depth() 返回新深度
-        # 该深度会被 run_subagent 入口的硬限制检查读取，防止子代理内嵌套创建子代理
-        with _subagent_depth_scope():
-            # 子代理执行具体计划项时，不应继承父会话的计划锁约束；
-            # 否则子代理会被剥夺 write_file/edit_file/execute_command 等必要工具，
-            # 导致只能只读探索而无法完成实现/测试任务，最终超时失败。
-            events = chat_with_model_events(
-                current_model,
-                current_key,
-                messages,
-                current_url,
-                persist=False,
-                turn_id=task.task_id,
-                cancel_event=task.cancel_event,
-                allow_subagents=False,
-                allowed_tools=allowed_tools,
-                consume_background_notifications=False,
-                parent_session=None,
-                parent_turn_id=None,
-                permission_owner=task.task_id,
-                permission_source=f"子代理：{task.description[:40]}",
-            )
+        # 子代理执行具体计划项时，不应继承父会话的计划锁约束；
+        # 否则子代理会被剥夺 write_file/edit_file/execute_command 等必要工具，
+        # 导致只能只读探索而无法完成实现/测试任务，最终超时失败。
+        events = chat_with_model_events(
+            current_model,
+            current_key,
+            messages,
+            current_url,
+            persist=False,
+            turn_id=task.task_id,
+            cancel_event=task.cancel_event,
+            allow_subagents=False,
+            allowed_tools=allowed_tools,
+            consume_background_notifications=False,
+            parent_session=None,
+            parent_turn_id=None,
+            permission_owner=task.task_id,
+            permission_source=f"子代理：{task.description[:40]}",
+        )
         answer = []
         tool_errors: dict[str, str] = {}
-        for event in events:
-            if event.kind == "thinking_started":
-                self._record_stage(task.task_id, "thinking")
-            elif event.kind == "tool_started":
-                self._record_stage(
-                    task.task_id,
-                    "tool",
-                    str(event.payload.get("name", "")),
-                )
-            elif event.kind == "permission_requested":
-                self._record_stage(task.task_id, "waiting_approval")
-            elif event.kind == "permission_resolved":
-                self._record_stage(task.task_id, "running", "approval resolved")
-            elif event.kind == "assistant_delta":
-                self._record_stage(task.task_id, "composing")
-                answer.append(str(event.payload.get("text", "")))
-            elif event.kind == "tool_finished":
-                name = str(event.payload.get("name", "tool"))
-                if event.payload.get("ok") is False:
-                    tool_errors[name] = str(
-                        event.payload.get("summary")
-                        or event.payload.get("error")
-                        or "工具执行失败"
+        # 进入子代理深度作用域：在此作用域内 _get_current_subagent_depth() 返回新深度。
+        # 必须把事件消费循环包在作用域内，因为生成器创建时并不执行子代理逻辑；
+        # 若只包生成器创建语句，深度会在真正执行前复位，嵌套深度限制将永久失效。
+        with _subagent_depth_scope():
+            for event in events:
+                if event.kind == "thinking_started":
+                    self._record_stage(task.task_id, "thinking")
+                elif event.kind == "tool_started":
+                    self._record_stage(
+                        task.task_id,
+                        "tool",
+                        str(event.payload.get("name", "")),
                     )
-                else:
-                    tool_errors.pop(name, None)
+                elif event.kind == "permission_requested":
+                    self._record_stage(task.task_id, "waiting_approval")
+                elif event.kind == "permission_resolved":
+                    self._record_stage(task.task_id, "running", "approval resolved")
+                elif event.kind == "assistant_delta":
+                    self._record_stage(task.task_id, "composing")
+                    answer.append(str(event.payload.get("text", "")))
+                elif event.kind == "tool_finished":
+                    name = str(event.payload.get("name", "tool"))
+                    if event.payload.get("ok") is False:
+                        tool_errors[name] = str(
+                            event.payload.get("summary")
+                            or event.payload.get("error")
+                            or "工具执行失败"
+                        )
+                    else:
+                        tool_errors.pop(name, None)
         task.tool_errors.update(tool_errors)
         return "".join(answer)
 
@@ -2086,7 +2083,8 @@ def glob_files(pattern, dir_path="."):
             return shared
 
     try:
-        cmd = ["rg", "--files", "--glob", pattern, str(base)]
+        rg = _get_rg_executable()
+        cmd = [rg, "--files", "--glob", pattern, str(base)]
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
         if result.returncode in (0, 1):
             output = result.stdout.strip()
@@ -2107,8 +2105,13 @@ def glob_files(pattern, dir_path="."):
                 if session_id:
                     _tool_cache.shared_put(session_id, ("glob_files", cache_key), res)
                 return res
-    except Exception:
-        pass
+        elif result.returncode != 0:
+            # rg 返回真实错误（如 glob 语法错误），记录诊断日志而不是静默吞掉
+            _logger.warning("glob_files rg 错误 (rc=%s): %s", result.returncode, result.stderr.strip())
+    except FileNotFoundError:
+        _logger.debug("glob_files 未找到 ripgrep，回退到 Python glob")
+    except Exception as e:
+        _logger.warning("glob_files rg 调用异常: %s", e)
 
     try:
         matches = glob.glob(pattern, root_dir=str(base), recursive=True)

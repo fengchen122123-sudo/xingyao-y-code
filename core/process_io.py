@@ -38,8 +38,16 @@ def decode_process_output(
         return raw.decode("utf-32")
     if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
         return raw.decode("utf-16")
+    # 当调用方显式指定了预期编码时，先严格按该编码解码；失败则回退 UTF-8。
+    # 这同时满足两个场景：
+    # 1) 旧版/控制台程序按 gbk/cp936 输出时得到正确中文；
+    # 2) 现代工具输出 UTF-8 但 expected_encoding 是 cp936 且 strict 解码失败时，
+    #    能自动回退到 UTF-8，避免乱码。
     if expected_encoding:
-        return raw.decode(expected_encoding, errors="replace")
+        try:
+            return raw.decode(expected_encoding)
+        except UnicodeDecodeError:
+            pass
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
