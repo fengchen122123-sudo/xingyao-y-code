@@ -1312,8 +1312,23 @@ SubagentRunner = Callable[[SubagentTask], str]
 _BACKGROUND_NOTIFICATION_TTL_SECONDS = 600
 
 
-def _snapshot_model_config() -> tuple | None:
-    """启动时快照当前模型配置，避免子代理运行途中用户切换模型/密钥导致配置混用。"""
+def _snapshot_model_config(prefer_secondary: bool = True) -> tuple | None:
+    """启动时快照当前模型配置，避免子代理运行途中用户切换模型/密钥导致配置混用。
+
+    若 config.json 中配置了 secondary_model_id 且 prefer_secondary=True（默认），
+    子代理优先使用 cheaper secondary 模型，降低后台任务额度消耗。
+    """
+    try:
+        from core.model_manager import get_secondary_model
+        secondary = get_secondary_model() if prefer_secondary else None
+        if secondary:
+            return (
+                secondary["litellm_model"],
+                secondary["api_key"],
+                secondary["base_url"],
+            )
+    except Exception:
+        pass
     try:
         import main
         return (main.current_model, main.current_key, main.current_url)

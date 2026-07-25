@@ -934,28 +934,66 @@ def _strip_media_and_merge(messages, model_name=None):
 
 
 def _provider_request_options(model_name, api_base):
-    """Return options required by a known provider/model pair."""
+    """Return options required by a known provider/model pair.
+
+    优先级：
+    1. config.json 中模型条目的显式 thinking_budget / max_tokens / enable_thinking
+    2. 内置的 Kimi/Moonshot 模型默认表
+    3. 空字典（由调用方兜底 max_tokens=8192）
+    """
     normalized_base = str(api_base or "").rstrip("/").lower()
     normalized_model = str(model_name or "").split("/")[-1].lower()
 
-    # Kimi K3：启用 thinking，保持较高预算以支持复杂推理。
-    if "api.kimi.com/coding" in normalized_base and normalized_model == "k3":
-        return {
-            "thinking": {"type": "enabled", "budget_tokens": 4096},
-            "max_tokens": 32000,
-            "allowed_openai_params": ["thinking"],
-        }
+    # 1. 读取用户在 config.json 中的显式配置
+    try:
+        from core.model_manager import get_model_config_by_litellm_model
+        model_cfg = get_model_config_by_litellm_model(model_name, api_base) or {}
+    except Exception:
+        model_cfg = {}
 
-    # Kimi K2.7：降低 thinking 预算以节省额度；若模型不支持 thinking 则由 litellm 忽略。
-    if ("api.kimi.com/coding" in normalized_base or "api.moonshot.cn" in normalized_base) and "k2.7" in normalized_model:
+    cfg_max_tokens = model_cfg.get("max_tokens")
+    cfg_thinking_budget = model_cfg.get("thinking_budget")
+    cfg_enable_thinking = model_cfg.get("enable_thinking")
+
+    # 如果用户显式配置了就地返回
+    if cfg_max_tokens is not None or cfg_thinking_budget is not None or cfg_enable_thinking is not None:
+        result = {}
+        if cfg_max_tokens is not None:
+            result["max_tokens"] = int(cfg_max_tokens)
+        # thinking 仅在显式启用或配置了 budget 时注入
+        if cfg_enable_thinking is True or cfg_thinking_budget is not None:
+            budget = int(cfg_thinking_budget) if cfg_thinking_budget is not None else 2048
+            result["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            result["allowed_openai_params"] = ["thinking"]
+        return result
+
+    # 2. 内置默认表：按 api_base + 模型名变体匹配
+    is_kimi_coding = "api.kimi.com/coding" in normalized_base
+    is_moonshot = "api.moonshot.cn" in normalized_base or "moonshot" in normalized_base
+    is_kimi = is_kimi_coding or is_moonshot or "kimi" in normalized_base
+
+    # 统一模型名前缀：k3 / k2.7 / k2.5 / kimi-k3 / moonshot-v1-xxx 等
+    model_lower = normalized_model
+
+    def _match_any(prefixes):
+        return any(p in model_lower for p in prefixes)
+
+    # Kimi K3：启用 thinking，保持较高预算以支持复杂推理。
+    if is_kimi and _match_any(("k3", "kimi-k3")):
+        if is_kimi_coding:
+            return {
+                "thinking": {"type": "enabled", "budget_tokens": 4096},
+                "max_tokens": 32000,
+                "allowed_openai_params": ["thinking"],
+            }
         return {
             "thinking": {"type": "enabled", "budget_tokens": 2048},
             "max_tokens": 16000,
             "allowed_openai_params": ["thinking"],
         }
 
-    # Moonshot openai 协议 K3：同样启用 thinking，但降低预算以平衡额度消耗。
-    if "api.moonshot.cn" in normalized_base and "k3" in normalized_model:
+    # Kimi K2.7 / K2.5：降低 thinking 预算以节省额度；若模型不支持 thinking 则由 litellm 忽略。
+    if is_kimi and _match_any(("k2.7", "k2.5", "kimi-k2.7", "kimi-k2.5")):
         return {
             "thinking": {"type": "enabled", "budget_tokens": 2048},
             "max_tokens": 16000,
