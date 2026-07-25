@@ -28,6 +28,24 @@ _MAX_TASK_LOGS = 50
 # get_task_output 的 task_id 白名单，防止路径穿越读取任意日志文件
 _TASK_ID_PATTERN = re.compile(r"^[\w-]{1,64}$")
 
+# 后台任务命令的危险模式黑名单（最后一道防线，避免模型/用户输入直接触发破坏性操作）。
+# 该检查不替代上游权限确认，仅作为 shell=True 场景下的纵深防御。
+_DANGEROUS_COMMAND_PATTERNS = [
+    re.compile(r"rm\s+-rf\s+/\s*(?:#.*)?$", re.IGNORECASE),          # rm -rf /
+    re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|:\s*&\s*\}\s*;\s*:", re.IGNORECASE),  # fork bomb
+    re.compile(r">\s*/dev/[sh]d[a-z]", re.IGNORECASE),              # 覆写磁盘
+    re.compile(r"\bdd\s+.*\bof\s*=\s*/dev/", re.IGNORECASE),        # dd 到块设备
+    re.compile(r"\bmkfs\.\s*", re.IGNORECASE),                      # 格式化
+    re.compile(r"\bformat\s+", re.IGNORECASE),                      # Windows format
+    re.compile(r"\brd\s+/s\s+/q\s+", re.IGNORECASE),                # Windows 递归删目录
+    re.compile(r"\bdel\s+/[fq]\s+/s\s+", re.IGNORECASE),            # Windows 递归删文件
+]
+
+
+def _is_dangerous_command(command: str) -> bool:
+    stripped = (command or "").strip()
+    return any(p.search(stripped) for p in _DANGEROUS_COMMAND_PATTERNS)
+
 
 def _ensure_paths():
     """按需解析日志目录与任务库路径（首次使用时按当前 cwd 确定）。"""
@@ -126,21 +144,32 @@ def _load_tasks():
         return
     with _TASKS_LOCK:
         for tid, info in data.items():
-            if tid not in ACTIVE_TASKS:
-                ACTIVE_TASKS[tid] = {
-                    "id": tid,
-                    "command": info["command"],
-                    "pid": info["pid"],
-                    "start_time": info["start_time"],
-                    "create_time": info.get("create_time"),
-                    "log_file_path": os.path.join(LOG_DIR, f"task_{tid}.log"),
-                    "process": None,     # 重建的任务 Popen 对象为 None，依赖 PID 检测
-                    "log_handle": None,  # 文件句柄在需要时懒加载/写入时关闭
-                    "output_encoding": (
-                        info.get("output_encoding")
-                        or platform_console_encoding()
-                    ),
-                }
+            if tid in ACTIVE_TASKS:
+                continue
+            # 防御手工编辑或旧版本格式导致字段缺失，避免 KeyError 击穿整个任务系统
+            if not isinstance(info, dict):
+                _logger.warning("忽略无效任务记录 %s: %s", tid, info)
+                continue
+            command = info.get("command")
+            pid = info.get("pid")
+            start_time = info.get("start_time")
+            if command is None or pid is None or start_time is None:
+                _logger.warning("忽略不完整任务记录 %s: %s", tid, info)
+                continue
+            ACTIVE_TASKS[tid] = {
+                "id": tid,
+                "command": command,
+                "pid": pid,
+                "start_time": start_time,
+                "create_time": info.get("create_time"),
+                "log_file_path": os.path.join(LOG_DIR, f"task_{tid}.log"),
+                "process": None,     # 重建的任务 Popen 对象为 None，依赖 PID 检测
+                "log_handle": None,  # 文件句柄在需要时懒加载/写入时关闭
+                "output_encoding": (
+                    info.get("output_encoding")
+                    or platform_console_encoding()
+                ),
+            }
 
 
 def _save_tasks():
@@ -176,8 +205,16 @@ def start_background_task(command: str) -> str:
     """在后台开启一个异步长周期任务（如 npm run dev），重定向日志输出"""
     _ensure_paths()
     _ensure_loaded()
-    task_id = str(uuid.uuid4())[:8]
-    log_file_path = os.path.join(LOG_DIR, f"task_{task_id}.log")
+    if _is_dangerous_command(command):
+        raise RuntimeError(f"拒绝执行包含危险模式的后台命令：{command}")
+    # 8 位 uuid 有碰撞可能，若目标日志已存在则重新生成
+    for _ in range(10):
+        task_id = str(uuid.uuid4())[:8]
+        log_file_path = os.path.join(LOG_DIR, f"task_{task_id}.log")
+        if not os.path.exists(log_file_path) and task_id not in ACTIVE_TASKS:
+            break
+    else:
+        raise RuntimeError("无法生成唯一任务 ID")
 
     log_file = None
     try:
@@ -365,6 +402,54 @@ def get_task_output(task_id: str, tail_lines: int = 30) -> str:
         return f"🚨 读取日志发生异常: {e}"
 
 
+def _kill_posix_tree(pid: int, proc=None) -> bool:
+    """POSIX 下尝试终止进程树；优先使用 psutil，否则回退到单进程信号。"""
+    try:
+        import psutil
+        parent = psutil.Process(pid)
+        children = parent.children(recursive=True)
+        for child in children:
+            try:
+                child.terminate()
+            except Exception:
+                pass
+        parent.terminate()
+        gone, alive = psutil.wait_procs(children + [parent], timeout=5)
+        for p in alive:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        return not is_pid_running(pid)
+    except ImportError:
+        pass
+    except Exception as error:
+        _logger.warning("psutil 终止进程树失败 %s: %s", pid, error)
+
+    # 无 psutil 回退：先 SIGTERM，再给几秒自行结束，仍存活则 SIGKILL
+    try:
+        os.kill(pid, 15)
+    except OSError:
+        if proc:
+            proc.terminate()
+    if proc is not None:
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
+    else:
+        for _ in range(50):
+            if not is_pid_running(pid):
+                break
+            time.sleep(0.1)
+        if is_pid_running(pid):
+            try:
+                os.kill(pid, 9)
+            except OSError:
+                pass
+    return not is_pid_running(pid)
+
+
 def kill_background_task(task_id: str) -> bool:
     """终止后台运行的指定任务；按实际结果返回成功与否"""
     # 刷新状态，确保最新的 tasks.json 已被同步
@@ -415,20 +500,8 @@ def kill_background_task(task_id: str) -> bool:
                 )
                 killed = result.returncode == 0 or not is_pid_running(pid)
             else:
-                # POSIX：只对单进程发 SIGTERM（不杀整棵进程树，Windows 为主战场，
-                # 这里只做基本处理）；发送后 wait/poll 回收，避免残留僵尸进程
-                try:
-                    os.kill(pid, 15)  # SIGTERM
-                    killed = True
-                except OSError:
-                    if proc:
-                        proc.terminate()
-                        killed = True
-                if proc is not None:
-                    try:
-                        proc.wait(timeout=5)
-                    except Exception:
-                        pass
+                # POSIX：尝试终止整个进程树并等待实际结束，避免壳进程死了孙子进程仍存活
+                killed = _kill_posix_tree(pid, proc)
         elif proc:
             proc.terminate()
             killed = True

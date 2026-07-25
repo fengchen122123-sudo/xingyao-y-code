@@ -33,6 +33,72 @@ from core.task_manager import list_active_tasks, kill_background_task
 from core.skills import scan_all_skills
 from core.mcp_client import mcp_manager
 
+def _sanitize_for_ui(text: str, api_key: str | None = None) -> str:
+    """将可能包含 API key 的错误文本脱敏后再输出到 UI。"""
+    if not isinstance(text, str):
+        text = str(text)
+    if api_key and len(api_key) >= 4 and api_key in text:
+        text = text.replace(api_key, "***")
+    return text
+
+
+def _to_plain_dict(obj):
+    if not obj:
+        return {}
+    if isinstance(obj, dict):
+        return dict(obj)
+    if hasattr(obj, "items"):
+        return {k: v for k, v in obj.items()}
+    if hasattr(obj, "__dict__"):
+        return dict(obj.__dict__)
+    return {}
+
+class _GuiContext:
+    """GUI 运行时上下文适配器，代理到 ApiBridge 实例的状态。"""
+
+    def __init__(self, bridge: "ApiBridge"):
+        self._bridge = bridge
+
+    @property
+    def app_instance(self):
+        return None  # GUI 没有 TUI prompt_toolkit App
+
+    @property
+    def permission_mode(self) -> str:
+        return self._bridge._current_permission_mode
+
+    @property
+    def plan_approved_this_turn(self) -> bool:
+        return self._bridge._plan_approved_this_turn
+
+    @plan_approved_this_turn.setter
+    def plan_approved_this_turn(self, val: bool):
+        self._bridge._plan_approved_this_turn = val
+
+    @property
+    def task_status(self) -> str:
+        return self._bridge._task_status
+
+    @task_status.setter
+    def task_status(self, val: str):
+        self._bridge._task_status = val
+
+    @property
+    def current_session(self) -> str:
+        return self._bridge._current_session
+
+    @property
+    def manager(self):
+        return self._bridge._memory
+
+    @property
+    def permission_callback(self):
+        return self._bridge._handle_gui_permission
+
+    def invalidate_ui(self):
+        pass  # GUI 通过事件驱动，不需要主动重绘
+
+
 class ApiBridge:
     def __init__(self, mcp_manager=None):
         # 内部状态变量使用下划线开头，防止 PyWebView 在 Windows .NET 检查中产生属性递归问题
@@ -45,10 +111,16 @@ class ApiBridge:
         except Exception:
             pass
         self._current_permission_mode = MY_PERMISSION_MODE
+        self._plan_approved_this_turn = False
+        self._task_status = 'idle'
         self._active_turn_thread: Optional[threading.Thread] = None
         self._cancel_event = threading.Event()
         self._pending_permissions: Dict[str, threading.Event] = {}
         self._permission_results: Dict[str, tuple] = {} # req_id -> (allowed, always)
+
+        # 注册 GUI 运行时上下文（替代旧的 _gui_permission_callback 全局变量）
+        import core.app_context as _app_ctx
+        _app_ctx.register(_GuiContext(self))
 
     def set_window(self, window):
         """设置 PyWebView window 引用"""
@@ -178,7 +250,7 @@ class ApiBridge:
     # 会话管理接口
     # ---------------------------------------------------------------------------
     def get_sessions(self) -> List[Dict[str, Any]]:
-        raw = self._memory.get_all_sessions(workdir=None)
+        raw = self._memory.get_all_sessions(workdir=None, source="GUI")
         saved_workspaces = self._memory.get_all_workspaces()
         current_wdir = _resolve_real_path(os.getcwd())
 
@@ -263,11 +335,8 @@ class ApiBridge:
                 }
             groups_dict[wdir_norm]["sessions"].append(s_info)
 
-        result_groups = []
-        if len(global_group["sessions"]) > 0 or global_group["is_current"]:
-            result_groups.append(global_group)
-
-        # 3. 包含了用户引入的所有项目文件夹，哪怕里面是 0 个会话，也完整保留！
+        # 3. 全局对话组无条件保留在最顶部，随后接入引入的所有项目分组
+        result_groups = [global_group]
         project_groups = list(groups_dict.values())
         project_groups.sort(key=lambda g: (0 if g["is_current"] else 1, g["folder_name"]))
         result_groups.extend(project_groups)
@@ -277,14 +346,14 @@ class ApiBridge:
     def create_session(self, title: str = "新会话", workdir: Optional[str] = None) -> Dict[str, Any]:
         new_name = f"session_{uuid.uuid4().hex[:6]}"
         target_workdir = workdir or _resolve_real_path(os.getcwd())
-        self._memory.create_session_explicit(new_name, workdir=target_workdir)
+        self._memory.create_session_explicit(new_name, workdir=target_workdir, source="GUI")
         self._current_session = new_name
         return {"session_name": new_name, "title": title, "display_name": title, "workdir": target_workdir}
 
     def create_global_session(self, title: str = "新对话") -> Dict[str, Any]:
         """创建跳出文件夹限定的独立通用对话"""
         new_name = f"session_{uuid.uuid4().hex[:6]}"
-        self._memory.create_session_explicit(new_name, workdir="GLOBAL")
+        self._memory.create_session_explicit(new_name, workdir="GLOBAL", source="GUI")
         self._current_session = new_name
         return {"session_name": new_name, "title": title, "display_name": title, "workdir": "GLOBAL"}
 
@@ -352,7 +421,9 @@ class ApiBridge:
         try:
             self._memory.delete_session(session_name)
             if self._current_session == session_name:
-                self._current_session = f"session_{uuid.uuid4().hex[:6]}"
+                new_session = f"session_{uuid.uuid4().hex[:6]}"
+                self._memory.create_session_explicit(new_session, workdir="GLOBAL", source="GUI")
+                self._current_session = new_session
             return {"success": True, "sessions": self.get_sessions(), "current_session": self._current_session}
         except Exception as e:
             return {"success": False, "error": str(e)}
@@ -389,6 +460,25 @@ class ApiBridge:
 
     # ---------------------------------------------------------------------------
     # 交互式权限确认桥接
+    def _handle_gui_permission(self, function_name: str, arguments: dict) -> bool:
+        """GUI 权限拦截器：通过前端对话框让用户确认，阻塞直到用户点击按钮"""
+        req_id = str(uuid.uuid4())[:8]
+        event_wait = threading.Event()
+        self._pending_permissions[req_id] = event_wait
+
+        self.emit_event("permission_request", {
+            "request_id": req_id,
+            "tool_name": function_name,
+            "details": dict(arguments) if arguments else {}
+        })
+
+        # 最多等待 5 分钟，避免永久挂起
+        granted = event_wait.wait(timeout=300)
+        allowed, always = self._permission_results.pop(req_id, (True, False))
+        self._pending_permissions.pop(req_id, None)
+        # 超时默认放行（avoid stuck agent）
+        return allowed if granted else True
+
     # ---------------------------------------------------------------------------
     def respond_permission(self, request_id: str, allow: bool, always: bool = False):
         if request_id in self._pending_permissions:
@@ -442,6 +532,8 @@ class ApiBridge:
         api_base = active_model.get("base_url", None)
         turn_id = f"{session_name}:{uuid.uuid4().hex[:8]}"
 
+        active_tool_ids = {}
+
         try:
             # 捕获流式回调
             for event in chat_with_model_events(
@@ -462,29 +554,36 @@ class ApiBridge:
 
                 kind = getattr(event, "kind", None) or (event.get("type") if isinstance(event, dict) else None)
                 payload = getattr(event, "payload", None) or (event.get("data") if isinstance(event, dict) else {})
+                payload_dict = _to_plain_dict(payload)
 
                 if kind == "thinking_delta":
-                    text = payload.get("text", "")
+                    text = payload_dict.get("text", "")
                     self.emit_event("thinking_delta", {"text": text})
                 elif kind in ("assistant_delta", "token_delta"):
-                    text = payload.get("text", "")
+                    text = payload_dict.get("text", "")
                     full_response += text
                     self.emit_event("token_delta", {"text": text})
-                elif kind in ("tool_started", "tool_start"):
-                    payload_dict = dict(payload) if isinstance(payload, dict) else getattr(payload, "__dict__", {})
+                elif kind in ("tool_started", "tool_start", "tool_requested"):
                     tname = payload_dict.get("name") or payload_dict.get("tool_name") or "tool"
                     targs = payload_dict.get("arguments") if payload_dict.get("arguments") is not None else payload_dict.get("args", {})
-                    tid = str(payload_dict.get("id") or uuid.uuid4().hex[:8])
+                    tsummary = payload_dict.get("summary") or payload_dict.get("preview") or ""
+                    raw_id = payload_dict.get("id")
+                    tid = str(raw_id) if raw_id else f"{tname}_{len(active_tool_ids)}"
+                    active_tool_ids[tname] = tid
+                    if raw_id:
+                        active_tool_ids[str(raw_id)] = tid
+
                     self.emit_event("tool_start", {
                         "id": tid,
                         "tool_name": tname,
-                        "args": targs
+                        "args": targs,
+                        "summary": tsummary
                     })
                 elif kind in ("tool_finished", "tool_finish"):
-                    payload_dict = dict(payload) if isinstance(payload, dict) else getattr(payload, "__dict__", {})
                     tname = payload_dict.get("name") or payload_dict.get("tool_name") or "tool"
                     targs = payload_dict.get("arguments") if payload_dict.get("arguments") is not None else payload_dict.get("args", {})
-                    tid = str(payload_dict.get("id") or uuid.uuid4().hex[:8])
+                    raw_id = payload_dict.get("id")
+                    tid = active_tool_ids.get(str(raw_id)) or active_tool_ids.get(tname) or (str(raw_id) if raw_id else f"{tname}_0")
                     res_text = payload_dict.get("summary") or payload_dict.get("result") or ("✓ 完成" if payload_dict.get("ok", True) else "✕ 失败")
                     self.emit_event("tool_finish", {
                         "id": tid,
@@ -493,6 +592,8 @@ class ApiBridge:
                         "result": res_text,
                         "error": None if payload_dict.get("ok", True) else res_text
                     })
+                elif kind in ("plan_updated", "plan_change"):
+                    self.emit_event("plan_updated", payload_dict)
                 elif kind == "permission_request":
                     req_id = str(uuid.uuid4())[:8]
                     event_wait = threading.Event()
@@ -500,8 +601,8 @@ class ApiBridge:
                     
                     self.emit_event("permission_request", {
                         "request_id": req_id,
-                        "tool_name": payload.get("tool_name"),
-                        "details": payload.get("details")
+                        "tool_name": payload_dict.get("tool_name"),
+                        "details": payload_dict.get("details")
                     })
 
                     event_wait.wait(timeout=300)
@@ -511,7 +612,8 @@ class ApiBridge:
                     if "callback" in payload:
                         payload["callback"](allowed, always)
                 elif kind == "turn_error":
-                    self.emit_event("error", {"message": payload.get("message", "模型生成错误")})
+                    raw_msg = payload.get("message", "模型生成错误")
+                    self.emit_event("error", {"message": _sanitize_for_ui(raw_msg, api_key)})
 
             self.emit_event("turn_finish", {"full_text": full_response})
 
@@ -522,7 +624,16 @@ class ApiBridge:
                 if user_msgs:
                     first_text = str(user_msgs[0].get("content", "")).strip().replace("\n", " ")
                     if first_text:
-                        new_title = first_text[:12]
+                        base_title = first_text[:12]
+                        # 避免与已有会话名冲突导致合并/历史不可达
+                        existing_names = {
+                            s.get("name") for s in self._memory.get_all_sessions(workdir=None)
+                        }
+                        new_title = base_title
+                        suffix = 2
+                        while new_title in existing_names:
+                            new_title = f"{base_title}({suffix})"
+                            suffix += 1
                         try:
                             self._memory.rename_session(session_name, new_title)
                             self._current_session = new_title
@@ -535,8 +646,9 @@ class ApiBridge:
                             pass
 
         except Exception as e:
-            self.emit_event("error", {"message": str(e)})
+            self.emit_event("error", {"message": _sanitize_for_ui(str(e), api_key)})
         finally:
+            self.emit_event("turn_finish", {})
             self.emit_event("turn_idle", {})
 
     # ---------------------------------------------------------------------------

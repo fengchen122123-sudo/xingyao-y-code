@@ -101,6 +101,7 @@ from core.permission_broker import CANCELLED_RESULT, permission_broker
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
 from core.tool_presenter import summarize_tool_finished, summarize_tool_started
 from core.turn_events import TurnEventFactory
+import core.app_context as app_context
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
 session_allowed_commands = set()      # 放行的命令前缀 (如 'git', 'date')
@@ -112,6 +113,10 @@ _raw_permission_lock = threading.Lock()
 _session_whitelist_lock = threading.Lock()
 _plan_turn_lock = threading.Lock()
 _plan_turn_started_at = {}
+
+# GUI 模式权限回调：由 gui_bridge.py 在启动时注册
+# 签名: (function_name: str, arguments: dict) -> bool
+_gui_permission_callback = None
 _PLAN_BYPASS_ERROR_PREFIX = "计划已创建：工具"
 _PLAN_ROOT_CONTROL_TOOLS = frozenset({
     "plan_write",
@@ -169,10 +174,10 @@ def _has_pending_plan(session_id):
 
 def check_session_reset():
     global _last_tracked_session
-    import main
     with _session_whitelist_lock:
-        if _last_tracked_session != main.current_session:
-            _last_tracked_session = main.current_session
+        current = app_context.get_current_session()
+        if current and _last_tracked_session != current:
+            _last_tracked_session = current
             session_allowed_commands.clear()
             session_allowed_write_files.clear()
             session_allowed_edit_files.clear()
@@ -223,21 +228,23 @@ def _command_matches_prefix(cmd, prefix):
 
 def safe_print(formatted_text):
     """线程安全地在 TUI 终端输出格式化文本，避免破坏屏幕布局"""
-    import main
     from prompt_toolkit import print_formatted_text
-    if main.app_instance and main.app_instance.loop:
-        main.app_instance.loop.call_soon_threadsafe(lambda: print_formatted_text(formatted_text))
+    _app = app_context.get_app_instance()
+    if _app and _app.loop:
+        _app.loop.call_soon_threadsafe(lambda: print_formatted_text(formatted_text))
     else:
-        print_formatted_text(formatted_text)
+        try:
+            print_formatted_text(formatted_text)
+        except Exception:
+            pass
 
 def ask_in_raw_terminal(function_name, arguments):
     """
     纯文本原始终端兜底：只在确实没有活动 TUI App 时才被调用（例如管道重定向或早期初始化时）。
     不使用任何 ANSI 转义序列或 msvcrt 菜单，直接用 print/input 避免污染 TUI 屏幕。
     """
-    import main
     mode_display = {"confirm": "每次确认", "plan": "计划确认"}
-    mode_tip = mode_display.get(main.current_permission_mode, "确认")
+    mode_tip = mode_display.get(app_context.get_permission_mode(), "确认")
     
     print("")  # 空行分隔
     if function_name == "write_file":
@@ -309,8 +316,6 @@ def check_permission_and_ask(
     permission_source="主代理",
     cancel_event=None,
 ):
-    import main
-
     # 0. 自动同步和重置会话级别的白名单缓存
     check_session_reset()
 
@@ -353,13 +358,13 @@ def check_permission_and_ask(
             return True
 
     # 2. 如果权限是完全放行，直接通过
-    if main.current_permission_mode == "full":
+    if app_context.get_permission_mode() == "full":
         if event_callback is not None:
             _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
 
     # 3. 如果是计划模式且本轮对话的计划已经获得批准，直接通过
-    if main.current_permission_mode == "plan" and main.plan_approved_this_turn:
+    if app_context.get_permission_mode() == "plan" and app_context.get_plan_approved():
         if event_callback is not None:
             _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
@@ -370,8 +375,14 @@ def check_permission_and_ask(
         "source": permission_source,
     })
 
-    app = main.app_instance
-    if not app or not app.loop:
+    # GUI 模式：使用已注册的 GUI 权限回调，避免阻塞在 input()
+    _gui_cb = app_context.get_permission_callback()
+    if _gui_cb is not None:
+        return _gui_cb(function_name, arguments)
+
+    # TUI 模式：通过 prompt_toolkit app 或终端 input()
+    _app = app_context.get_app_instance()
+    if not _app or not _app.loop:
         with _raw_permission_lock:
             return ask_in_raw_terminal(function_name, arguments)
 
@@ -481,8 +492,8 @@ def check_permission_and_ask(
         approved = (choice_idx in (0, 2))
         # plan 模式仅在用户明确选择“始终放行”时才批准整轮计划，
         # “同意本次”(0) 只放行当前这一次操作
-        if choice_idx == 2 and main.current_permission_mode == "plan":
-            main.plan_approved_this_turn = True
+        if choice_idx == 2 and app_context.get_permission_mode() == "plan":
+            app_context.set_plan_approved(True)
         return approved
     except Exception as e:
         _notify_event(event_callback, "error", {
@@ -1433,14 +1444,14 @@ def _execute_single_tool_call(
                     except OSError as read_err:
                         logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
                         old_content = ""
-                # 新建文件也记录空内容快照，保证 undo 可以回退到“文件不存在之前”
-                from core.memory import set_undo_state
-                set_undo_state(file_path, old_content)
                 write_result = write_file(file_path, new_content)
             if isinstance(write_result, str) and write_result.startswith("🚨"):
-                # 大文件覆盖保护等场景：write_file 拒绝写入，不应展示虚假 diff
+                # 大文件覆盖保护等场景：write_file 拒绝写入，不应展示虚假 diff，也不记录 undo
                 result = write_result
             else:
+                # 写入成功后再记录 undo 快照，避免未发生的修改污染撤销历史
+                from core.memory import set_undo_state
+                set_undo_state(file_path, old_content)
                 # 生成 diff 并展示
                 _show_file_diff(
                     file_path,
@@ -1746,16 +1757,39 @@ def _chat_with_model_generator(
     else:
         messages.insert(0, {"role": "system", "content": memory_section})
 
+    tool_activity_seen = False
+    final_summary_retry_count = 0
+    pending_persistence = []
+
+    def flush_persistence():
+        """把本轮已确认的助手/工具消息按序落库（与正常结束路径一致）。"""
+        nonlocal pending_persistence
+        if stream and pending_persistence:
+            _mgr = app_context.get_manager()
+            try:
+                if _mgr:
+                    _mgr.add_messages(parent_session, pending_persistence)
+            except Exception as flush_err:
+                # 落库失败不回滚内存：add_messages 可能已部分写入，回滚会造成
+                # 内存/DB 分叉。仅上报错误事件并丢弃待写队列，避免重复写入。
+                _notify_event(event_callback, "error", {
+                    "message": f"消息持久化失败：{str(flush_err)}",
+                })
+            finally:
+                del pending_persistence[:]
+
     # 2. 注入后台子 Agent 回报数据 (XML task-notification)
     from core.tools import subagent_manager
     drained_notifications = []
     if consume_background_notifications and parent_session:
         drained_notifications = subagent_manager.drain_notifications(parent_session)
         for notif in drained_notifications:
-            messages.append({
-                "role": "user",
-                "content": notif
-            })
+            notif_msg = {"role": "user", "content": notif}
+            messages.append(notif_msg)
+            # 立即加入待持久化队列并落库：即使本轮后续被取消，通知也不会丢失，
+            # 否则模型上下文会出现"收到通知并回复了，但下一轮找不到通知"的矛盾。
+            pending_persistence.append(notif_msg)
+        flush_persistence()
 
     def rollback_turn_messages():
         """回滚本轮新增的消息残影；已 drain 的后台通知重新保留，避免丢失。"""
@@ -1781,16 +1815,28 @@ def _chat_with_model_generator(
         or schema.get("function", {}).get("name") in allowed_tools
     ]
 
+    # 针对打招呼等简单闲聊优化：禁用工具防乱掉
+    last_user_text = ""
+    for msg in reversed(messages):
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            c = msg.get("content")
+            if isinstance(c, str):
+                last_user_text = c.strip()
+            break
+
+    is_simple_greeting = bool(re.match(r"^(你好|您好|hi|hello|在吗|哈喽|早上好|晚上好|下午好|你是谁|1|测试)[！!？?~。]*$", last_user_text, re.IGNORECASE))
+
     kwargs = {
         "model": model_name,
         "api_key": api_key,
         "messages": _strip_media_and_merge(messages, model_name)[0],
-        "tools": request_tools,
-        "tool_choice": "auto",
+        "tools": None if (is_simple_greeting and not active_plan) else request_tools,
         "stream": True,
         "stream_options": {"include_usage": True},
         "num_retries": 2,
     }
+    if not (is_simple_greeting and not active_plan):
+        kwargs["tool_choice"] = "auto"
     kwargs.update(_provider_request_options(model_name, api_base))
 
     # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小
@@ -1801,24 +1847,7 @@ def _chat_with_model_generator(
     if api_base:
         kwargs["api_base"] = api_base
         
-    tool_activity_seen = False
-    final_summary_retry_count = 0
-    pending_persistence = []
-
-    def flush_persistence():
-        """把本轮已确认的助手/工具消息按序落库（与正常结束路径一致）。"""
-        if stream and pending_persistence:
-            import main as _main
-            try:
-                _main.manager.add_messages(parent_session, pending_persistence)
-            except Exception as flush_err:
-                # 落库失败不回滚内存：add_messages 可能已部分写入，回滚会造成
-                # 内存/DB 分叉。仅上报错误事件并丢弃待写队列，避免重复写入。
-                _notify_event(event_callback, "error", {
-                    "message": f"消息持久化失败：{str(flush_err)}",
-                })
-            finally:
-                del pending_persistence[:]
+    # (pending_persistence and flush_persistence are now defined earlier)
 
     def raise_if_cancelled():
         if cancel_event is not None and cancel_event.is_set():
@@ -1895,7 +1924,6 @@ def _chat_with_model_generator(
                         )
                     if is_context_overflow:
                         try:
-                            import main as _main
                             if event_callback is None:
                                 print("\n[⚠️ 检测到上下文窗口超限，正在尝试压缩历史记录以缩减 Prompt 长度...]")
                             else:
@@ -1905,10 +1933,10 @@ def _chat_with_model_generator(
                             from core.memory_compressor import compress_session_memory
                             # 复用全局单例 manager（共享 SQLite 连接 + 锁），
                             # 避免每次新建 MemoryManager 导致连接泄漏
-                            manager = _main.manager
+                            manager = app_context.get_manager()
                             # 子代理回合必须压缩自己的会话（parent_session），
                             # 不能误压主 UI 会话
-                            session = parent_session or _main.current_session
+                            session = parent_session or app_context.get_current_session()
                             # compress_session_memory 是正确的压缩函数（位于 memory_compressor），
                             # 旧的 mm.compress_session 是不存在的方法名，会抛 AttributeError 被吞掉
                             compress_session_memory(
@@ -1929,7 +1957,11 @@ def _chat_with_model_generator(
                             # 压缩已成功落库：同步回合快照，避免后续异常回滚把
                             # 内存恢复成未压缩状态（与 DB 分叉且下轮必再超限）
                             turn_snapshot = deepcopy(messages)
-                            continue # 跳回重试当前 API
+                            if attempt < max_api_retries - 1:
+                                continue  # 跳回重试当前 API
+                            # 已是最后一次重试，压缩后仍无法发出请求，抛出原始错误
+                            # 而不是带着 response_stream=None 继续迭代导致 TypeError
+                            raise api_err
                         except Exception as compress_err:
                             if event_callback is None:
                                 from prompt_toolkit.formatted_text import HTML
@@ -1966,7 +1998,12 @@ def _chat_with_model_generator(
                             print(f"\n[⚠️ {retry_message}]")
                         else:
                             _notify_event(event_callback, "status", {"message": retry_message})
-                        time.sleep(sleep_time)
+                        # 将 sleep 切成小段并检查取消事件，避免用户按 Ctrl+C 后长时间无响应
+                        sleep_deadline = time.monotonic() + sleep_time
+                        while time.monotonic() < sleep_deadline:
+                            raise_if_cancelled()
+                            remaining = sleep_deadline - time.monotonic()
+                            time.sleep(min(0.1, remaining) if remaining > 0 else 0.1)
                     else:
                         raise api_err
 
@@ -2026,10 +2063,19 @@ def _chat_with_model_generator(
                         idx = tc.index
                         if idx not in tool_calls_dict:
                             tool_calls_dict[idx] = {
-                                "id": getattr(tc, "id", f"call_{idx}"),
+                                "id": None,
                                 "type": "function",
                                 "function": {"name": "", "arguments": ""}
                             }
+                        # 某些 provider 首 chunk 的 tool_call id 为 None，在后续 chunk 才给出。
+                        # 这里用 None 占位，遇到真实 id 再回填；始终没有则用 call_{idx} 兜底。
+                        tc_id = getattr(tc, "id", None)
+                        existing_id = tool_calls_dict[idx].get("id")
+                        if tc_id is not None:
+                            if existing_id is None or str(existing_id).startswith("call_"):
+                                tool_calls_dict[idx]["id"] = tc_id
+                        elif existing_id is None:
+                            tool_calls_dict[idx]["id"] = f"call_{idx}"
                         # name 只在为空时赋值：provider 重复发 name 时 += 会拼出
                         # "read_fileread_file" 之类的坏名字
                         if getattr(tc.function, "name", None) and not tool_calls_dict[idx]["function"]["name"]:
@@ -2131,13 +2177,16 @@ def _chat_with_model_generator(
                     # 空 assistant 消息（content 为 None）不入库也不留内存：
                     # 留在历史里会让下一轮 API 报 400（Anthropic 拒绝空 content）
                     messages.pop()
-                    messages.append({
+                    summary_request = {
                         "role": "user",
                         "content": (
                             "工具已经执行完毕。现在必须只输出最终中文检查结论，"
                             "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
                         ),
-                    })
+                    }
+                    messages.append(summary_request)
+                    # 该 user 催促消息也需要持久化，否则下一轮重建历史时上下文会缺失
+                    pending_persistence.append(("user", summary_request))
                     _notify_event(event_callback, "status", {
                         "state": "executing",
                         "message": "模型未生成结论，正在请求最终总结。",
@@ -2155,10 +2204,8 @@ def _chat_with_model_generator(
 
             tool_activity_seen = True
             if event_callback is None:
-                import main
-                main.task_status = 'executing'
-                if main.app_instance:
-                    main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
+                app_context.set_task_status('executing')
+                app_context.invalidate_ui()
             else:
                 _notify_event(event_callback, "status", {"state": "executing"})
             
@@ -2232,9 +2279,8 @@ def _chat_with_model_generator(
                 yield ""
             
             if event_callback is None:
-                main.task_status = 'executing'
-                if main.app_instance:
-                    main.app_instance.loop.call_soon_threadsafe(main.app_instance.invalidate)
+                app_context.set_task_status('executing')
+                app_context.invalidate_ui()
             else:
                 _notify_event(event_callback, "status", {"state": "executing"})
             

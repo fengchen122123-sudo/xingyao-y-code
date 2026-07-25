@@ -11,6 +11,7 @@ from mcp.client.stdio import stdio_client
 # 连接与初始化超时（秒），防止任一 server 挂起导致程序永久卡死
 CONNECT_TIMEOUT = 10
 INITIALIZE_TIMEOUT = 10
+CALL_TOOL_TIMEOUT = 60
 
 
 def _emit_status(message):
@@ -41,6 +42,7 @@ class MCPManager:
         self._connect_lock = threading.Lock()
         # 惰性连接标记：import 时绝不连接，首次使用时才启动
         self._connect_future = None
+        self._connect_future_is_placeholder = False
         self._closed = False
 
     def _run_loop(self):
@@ -68,6 +70,7 @@ class MCPManager:
                 self._connect_future = asyncio.run_coroutine_threadsafe(
                     self._connect_all(), self.loop
                 )
+                self._connect_future_is_placeholder = False
             else:
                 # 无配置：用一个已完成的 future 占位，后续访问零开销。
                 # 注意：空配置是进程级一次性决策——运行期再编辑 mcp.json
@@ -75,6 +78,7 @@ class MCPManager:
                 done = concurrent.futures.Future()
                 done.set_result(None)
                 self._connect_future = done
+                self._connect_future_is_placeholder = True
 
     def _ensure_connected(self):
         """首次访问时惰性连接所有 MCP 服务；配置为空时完全不启动连接。
@@ -85,14 +89,9 @@ class MCPManager:
         with self._connect_lock:
             self._load_config()
             servers_now = bool(self.config.get("mcpServers"))
-            placeholder = (
-                self._connect_future is not None
-                and self._connect_future.done()
-                and self._connect_future.exception() is None
-                and self._connect_future.result() is None
-            )
-            if servers_now and placeholder:
+            if servers_now and self._connect_future_is_placeholder:
                 self._connect_future = None
+                self._connect_future_is_placeholder = False
             self._maybe_start_connection()
             future = self._connect_future
         try:
@@ -116,6 +115,7 @@ class MCPManager:
             with self._connect_lock:
                 if self._connect_future is future:
                     self._connect_future = None
+                    self._connect_future_is_placeholder = False
             _emit_status(f"\n[MCP] 连接过程超时或失败: {e}")
 
     async def _connect_server(self, name, server_config):
@@ -164,6 +164,13 @@ class MCPManager:
             self.server_of_tool = {**self.server_of_tool, **new_tool_map}
 
             _emit_status(f"\n[MCP] 成功连接服务: {name}")
+        except asyncio.CancelledError:
+            # 取消时同样要释放已 spawn 的子进程/AsyncExitStack，避免泄漏
+            try:
+                await stack.aclose()
+            except Exception:
+                pass
+            raise
         except Exception as e:
             # 异常时释放已建立的子进程/资源，避免泄漏
             try:
@@ -212,7 +219,10 @@ class MCPManager:
         original_tool_name = tool_name[len(server_name)+2:] # 去除 name__ 前缀
 
         try:
-            result = await session.call_tool(original_tool_name, arguments)
+            result = await asyncio.wait_for(
+                session.call_tool(original_tool_name, arguments),
+                timeout=CALL_TOOL_TIMEOUT,
+            )
             if result.isError:
                 return f"🚨 MCP 工具执行错误: {result.content}"
             # 将执行结果内容转为字符串
@@ -230,7 +240,7 @@ class MCPManager:
         """提供给同步框架调用的阻塞方法"""
         self._ensure_connected()
         future = asyncio.run_coroutine_threadsafe(self._call_tool_async(tool_name, arguments), self.loop)
-        return future.result()
+        return future.result(timeout=CALL_TOOL_TIMEOUT + 5)
 
     async def _close_all(self):
         for name, entry in list(self.servers.items()):

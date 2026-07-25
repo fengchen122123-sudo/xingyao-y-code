@@ -27,7 +27,7 @@ _lsp_cache: OrderedDict[tuple, str] = OrderedDict()
 
 # Shared cache scoped to a parent session.  Subagents and the main agent can
 # share read/search results to avoid re-scanning the same codebase in parallel.
-_shared_cache: dict[str, dict[tuple, Any]] = {}
+_shared_cache: dict[str, OrderedDict[tuple, Any]] = {}
 
 # Thread-local session id used to route shared-cache lookups from subagents.
 _session_tls = threading.local()
@@ -176,7 +176,7 @@ def shared_get(session_id: str, key: tuple) -> Any | None:
 
 def shared_put(session_id: str, key: tuple, value: Any) -> None:
     with _LOCK:
-        session = _shared_cache.setdefault(session_id, {})
+        session = _shared_cache.setdefault(session_id, OrderedDict())
         session[key] = value
         # Keep shared cache bounded to avoid unbounded growth.
         if len(session) > _MAX_ENTRIES:
