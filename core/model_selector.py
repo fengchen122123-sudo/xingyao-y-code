@@ -20,7 +20,8 @@ from prompt_toolkit.layout.containers import ConditionalContainer
 from core.model_manager import (
     load_config, set_active_model, add_provider,
     add_model_to_provider, delete_model, get_active_model,
-    update_provider_and_model, add_preset_provider_with_models
+    update_provider_and_model, add_preset_provider_with_models,
+    set_secondary_model, get_secondary_roles, set_secondary_roles
 )
 
 # litellm 懒加载，避免打包后导入问题，与 core/llm.py 实现一致
@@ -227,6 +228,12 @@ def open_model_selector(on_model_selected=None):
         "am_step":        0,        # 为已有厂商添加模型：0=model_name 1=ctx
         "am_data":        {},
         "am_provider_id":  None,
+        "sec_cursor":     0,
+        "sec_items":      [],
+        "role_cursor":    0,
+        "roles_data":     {"vision": True, "compression": True, "subagent": True},
+        "return_to_secondary": False,
+        "secondary_candidate_id": None,
     }
 
     # 显式使用 multiline=False 限制单行输入框，绝不允许插入换行符造成残留与扩展
@@ -247,6 +254,7 @@ def open_model_selector(on_model_selected=None):
                 })
             items.append({"type": "add_model", "provider": provider})
         items.append({"type": "add"})
+        items.append({"type": "set_secondary"})
         return items
 
     state["items"] = build_items()
@@ -370,9 +378,22 @@ def open_model_selector(on_model_selected=None):
                     protocol=proto,
                     models=preset["models"],
                 )
+                if state.get("return_to_secondary"):
+                    cfg = load_config()
+                    for p in cfg.get("providers", []):
+                        if p["id"] == pid and p.get("models"):
+                            state["secondary_candidate_id"] = p["models"][0]["id"]
+                            break
 
                 def _on_success():
-                    state["message"] = f"✔ 预设厂商「{preset['name']}」已成功验证保存（包含 {len(preset['models'])} 个模型）！"
+                    msg = f"✔ 预设厂商「{preset['name']}」已成功验证保存（包含 {len(preset['models'])} 个模型）！"
+                    if state.get("return_to_secondary"):
+                        candidate = state.pop("secondary_candidate_id", None)
+                        if candidate:
+                            set_secondary_model(candidate)
+                            msg = f"✔ 已添加预设厂商并设为副模型：{preset['name']}"
+                        state["return_to_secondary"] = False
+                    state["message"] = msg
                     state["mode"] = "list"
                     state["items"] = build_items()
                     input_buf.set_document(Document(""))
@@ -442,12 +463,14 @@ def open_model_selector(on_model_selected=None):
                 else:
                     pid = state["new_provider_id"]
 
-                add_model_to_provider(
+                mid = add_model_to_provider(
                     provider_id=pid,
                     name=model,
                     context_window=ctx,
                     supports_vision=supports_vision,
                 )
+                if state.get("return_to_secondary"):
+                    state["secondary_candidate_id"] = mid
 
                 def _on_success():
                     state["message"] = "✔ 模型连接测试成功，已保存！"
@@ -555,6 +578,21 @@ def open_model_selector(on_model_selected=None):
         out += [_t("class:header", "  Y-code 模型管理器\n")]
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
 
+        cfg = load_config()
+        secondary_id = cfg.get("secondary_model_id")
+        secondary_name = None
+        for provider in cfg.get("providers", []):
+            for model in provider.get("models", []):
+                if model["id"] == secondary_id:
+                    secondary_name = f"{provider['name']} / {model['name']}"
+                    break
+            if secondary_name:
+                break
+        if secondary_name:
+            out += [_t("class:footer", f"  副模型: {secondary_name}\n")]
+        else:
+            out += [_t("class:footer", "  副模型: 未设置（复用主模型）\n")]
+
         for i, item in enumerate(state["items"]):
             is_cur = (i == state["cursor"])
             t = item["type"]
@@ -570,7 +608,8 @@ def open_model_selector(on_model_selected=None):
                 ctx = m.get("context_window", 0)
                 ctx_str = f"{ctx // 1000}k" if ctx >= 1000 else str(ctx)
                 vision = "👁" if m.get("supports_vision") else ""
-                label = f"  {bullet} {m['name']}  [{ctx_str}]{vision}"
+                sec_mark = " 💡" if m["id"] == secondary_id else ""
+                label = f"  {bullet} {m['name']}  [{ctx_str}]{vision}{sec_mark}"
                 if is_cur:
                     out += [_t("class:model.cursor", f"  ▶{label}\n")]
                 elif item["active"]:
@@ -590,8 +629,15 @@ def open_model_selector(on_model_selected=None):
                 else:
                     out += [_t("class:add.normal", "      ＋ 添加新厂商\n")]
 
+            elif t == "set_secondary":
+                label = "  ⚙ 设置副模型（识图 / 压缩 / 子 Agent）"
+                if is_cur:
+                    out += [_t("class:add.cursor", f"  ▶{label}\n")]
+                else:
+                    out += [_t("class:add.normal", f"   {label}\n")]
+
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
-        out += [_t("class:footer", "  ↑↓ 移动  Enter 激活  E 编辑  D 删除  Esc 退出\n")]
+        out += [_t("class:footer", "  ↑↓ 移动  Enter 激活  E 编辑  D 删除  S 副模型  Esc 退出\n")]
         if state["message"]:
             out += [_t("class:ok", f"  {state['message']}\n")]
         return out
@@ -797,6 +843,81 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:footer", "  Enter 确认，Esc 返回\n")]
         return out
 
+    def render_secondary_selector():
+        out = []
+        out += [_t("class:header", "  选择副模型（用于识图、记忆压缩和子 Agent）\n")]
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+
+        roles = get_secondary_roles()
+        role_names = []
+        if roles.get("vision"):
+            role_names.append("识图")
+        if roles.get("compression"):
+            role_names.append("压缩")
+        if roles.get("subagent"):
+            role_names.append("子Agent")
+        out += [_t("class:footer", f"  当前用途: {('、'.join(role_names)) if role_names else '未启用'}\n")]
+
+        secondary_id = load_config().get("secondary_model_id")
+        for i, item in enumerate(state["sec_items"]):
+            is_cur = (i == state["sec_cursor"])
+            t = item["type"]
+
+            if t == "none":
+                bullet = "●" if secondary_id is None else "○"
+                label = f"  {bullet} 不使用副模型（复用当前主模型）"
+            elif t == "sec_add_custom":
+                label = "  ＋ 添加并设为副模型"
+            elif t == "sec_roles":
+                label = "  ⚙ 设置副模型用途（识图 / 压缩 / 子 Agent 开关）"
+            else:
+                m = item["data"]
+                p = item["provider"]
+                bullet = "●" if m["id"] == secondary_id else "○"
+                ctx = m.get("context_window", 0)
+                ctx_str = f"{ctx // 1000}k" if ctx >= 1000 else str(ctx)
+                label = f"  {bullet} {p['name']} / {m['name']}  [{ctx_str}]"
+
+            if is_cur:
+                if t in ("sec_add_custom", "sec_roles"):
+                    out += [_t("class:add.cursor", f"  ▶{label}\n")]
+                else:
+                    out += [_t("class:model.cursor", f"  ▶{label}\n")]
+            else:
+                if t in ("sec_add_custom", "sec_roles"):
+                    out += [_t("class:add.normal", f"   {label}\n")]
+                else:
+                    out += [_t("class:model.normal", f"   {label}\n")]
+
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        out += [_t("class:footer", "  ↑↓ 移动  Enter 选择  Esc 取消\n")]
+        if state["message"]:
+            out += [_t("class:ok", f"  {state['message']}\n")]
+        return out
+
+    def render_secondary_roles():
+        out = []
+        out += [_t("class:header", "  设置副模型用途\n")]
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+
+        items = [
+            ("vision", "识图（主模型不支持图片时代为识别）"),
+            ("compression", "记忆压缩（后台摘要会话历史）"),
+            ("subagent", "子 Agent（后台任务、代码分析等）"),
+        ]
+        for i, (key, label) in enumerate(items):
+            checked = "☑" if state["roles_data"].get(key, True) else "☐"
+            if i == state["role_cursor"]:
+                out += [_t("class:model.cursor", f"  ▶ {checked} {label}\n")]
+            else:
+                out += [_t("class:model.normal", f"    {checked} {label}\n")]
+
+        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        out += [_t("class:footer", "  ↑↓ 移动  空格 切换  Enter 保存  Esc 取消\n")]
+        if state["message"]:
+            out += [_t("class:ok", f"  {state['message']}\n")]
+        return out
+
     def get_main_content():
         if state["mode"] == "list":
             return render_list()
@@ -804,6 +925,10 @@ def open_model_selector(on_model_selected=None):
             return render_edit_wizard()
         elif state["mode"] == "addmodel":
             return render_addmodel_wizard()
+        elif state["mode"] == "secondary":
+            return render_secondary_selector()
+        elif state["mode"] == "secondary_roles":
+            return render_secondary_roles()
         return render_wizard()
 
     main_ctrl = FormattedTextControl(get_main_content, focusable=True)
@@ -817,6 +942,8 @@ def open_model_selector(on_model_selected=None):
             return state["edit_step"] != 4
         if state["mode"] == "wizard":
             return state["add_step"] not in (0, 3.5, 5.5, 6)
+        if state["mode"] in ("secondary", "secondary_roles"):
+            return False
         return False
 
     def get_input_header():
@@ -907,6 +1034,10 @@ def open_model_selector(on_model_selected=None):
     @kb.add("enter", filter=Condition(lambda: state["mode"] == "list"))
     def _enter_list(event):
         item = state["items"][state["cursor"]]
+        if item["type"] == "set_secondary":
+            _open_secondary_selector(event)
+            event.app.invalidate()
+            return
         if item["type"] == "model":
             target_ctx = item["data"].get("context_window", 128000)
             latest_total = _latest_total_tokens()
@@ -977,6 +1108,31 @@ def open_model_selector(on_model_selected=None):
             state["cursor"] = min(state["cursor"], len(state["items"]) - 1)
             _skip_providers(1)
             state["message"] = f"已删除: {item['data']['name']}"
+
+    @kb.add("s", filter=Condition(lambda: state["mode"] == "list"))
+    def _open_secondary_selector(event):
+        cfg = load_config()
+        sec_id = cfg.get("secondary_model_id")
+        sec_items = [{"type": "none"}]
+        cursor = 0
+        idx = 1
+        for provider in cfg.get("providers", []):
+            for model in provider.get("models", []):
+                sec_items.append({"type": "model_sec", "data": model, "provider": provider})
+                if model["id"] == sec_id:
+                    cursor = idx
+                idx += 1
+        sec_items.append({"type": "sec_add_custom"})
+        sec_items.append({"type": "sec_roles"})
+        state["mode"] = "secondary"
+        state["sec_items"] = sec_items
+        state["sec_cursor"] = cursor
+        state["return_to_secondary"] = False
+        state["secondary_candidate_id"] = None
+        state["message"] = ""
+        input_buf.set_document(Document(""))
+        main_win.vertical_scroll = 0
+        layout.focus(main_win)
 
     @kb.add("escape", filter=Condition(lambda: state["mode"] == "list"))
     @kb.add("q", filter=Condition(lambda: state["mode"] == "list"))
@@ -1093,9 +1249,16 @@ def open_model_selector(on_model_selected=None):
                 layout.focus(input_buf)
                 state["add_step"] = 4
             else:
+                msg = "✔ 厂商已保存！"
+                if state.get("return_to_secondary"):
+                    candidate = state.pop("secondary_candidate_id", None)
+                    if candidate:
+                        set_secondary_model(candidate)
+                        msg = "✔ 已添加并设为副模型！"
+                    state["return_to_secondary"] = False
                 state["items"] = build_items()
                 state["mode"] = "list"
-                state["message"] = "✔ 厂商已保存！"
+                state["message"] = msg
                 input_buf.set_document(Document(""))
                 main_win.vertical_scroll = 0
                 layout.focus(main_win)
@@ -1104,7 +1267,17 @@ def open_model_selector(on_model_selected=None):
     def _w_esc(event):
         if state.get("testing"):
             return
-            
+
+        if state.pop("return_to_secondary", None):
+            state["secondary_candidate_id"] = None
+            state["items"] = build_items()
+            state["mode"] = "list"
+            state["message"] = ""
+            input_buf.set_document(Document(""))
+            main_win.vertical_scroll = 0
+            layout.focus(main_win)
+            return
+
         state["message"] = ""
         step = state["add_step"]
         if step in (0, 100):
@@ -1307,6 +1480,91 @@ def open_model_selector(on_model_selected=None):
             state["edit_step"] = 3
             input_buf.set_document(Document(str(state["edit_data"].get("context_window", 128000))))
             layout.focus(input_buf)
+
+    @kb.add("up", filter=Condition(lambda: state["mode"] == "secondary"))
+    def _sec_up(event):
+        state["sec_cursor"] = max(0, state["sec_cursor"] - 1)
+
+    @kb.add("down", filter=Condition(lambda: state["mode"] == "secondary"))
+    def _sec_down(event):
+        state["sec_cursor"] = min(len(state["sec_items"]) - 1, state["sec_cursor"] + 1)
+
+    @kb.add("enter", filter=Condition(lambda: state["mode"] == "secondary"))
+    def _sec_enter(event):
+        item = state["sec_items"][state["sec_cursor"]]
+        if item["type"] == "none":
+            set_secondary_model(None)
+            state["message"] = "已取消副模型设置"
+            state["mode"] = "list"
+            state["items"] = build_items()
+            state["sec_items"] = []
+            main_win.vertical_scroll = 0
+            layout.focus(main_win)
+        elif item["type"] == "sec_add_custom":
+            state["return_to_secondary"] = True
+            state["secondary_candidate_id"] = None
+            state["mode"] = "wizard"
+            state["add_step"] = 0
+            state["preset_cursor"] = 0
+            state["selected_preset"] = None
+            state["add_data"] = {}
+            state["proto_cursor"] = 0
+            state["message"] = ""
+            input_buf.set_document(Document(""))
+            main_win.vertical_scroll = 0
+            layout.focus(main_win)
+        elif item["type"] == "sec_roles":
+            state["roles_data"] = get_secondary_roles()
+            state["role_cursor"] = 0
+            state["mode"] = "secondary_roles"
+            state["message"] = ""
+            main_win.vertical_scroll = 0
+            layout.focus(main_win)
+        else:
+            set_secondary_model(item["data"]["id"])
+            state["message"] = f"已设置副模型: {item['data']['name']}"
+            state["mode"] = "list"
+            state["items"] = build_items()
+            state["sec_items"] = []
+            main_win.vertical_scroll = 0
+            layout.focus(main_win)
+
+    @kb.add("escape", filter=Condition(lambda: state["mode"] == "secondary"))
+    @kb.add("q", filter=Condition(lambda: state["mode"] == "secondary"))
+    def _sec_esc(event):
+        state["mode"] = "list"
+        state["sec_items"] = []
+        state["message"] = ""
+        main_win.vertical_scroll = 0
+        layout.focus(main_win)
+
+    @kb.add("up", filter=Condition(lambda: state["mode"] == "secondary_roles"))
+    def _roles_up(event):
+        state["role_cursor"] = max(0, state["role_cursor"] - 1)
+
+    @kb.add("down", filter=Condition(lambda: state["mode"] == "secondary_roles"))
+    def _roles_down(event):
+        state["role_cursor"] = min(2, state["role_cursor"] + 1)
+
+    @kb.add("space", filter=Condition(lambda: state["mode"] == "secondary_roles"))
+    def _roles_toggle(event):
+        keys = ["vision", "compression", "subagent"]
+        key = keys[state["role_cursor"]]
+        state["roles_data"][key] = not state["roles_data"].get(key, True)
+
+    @kb.add("enter", filter=Condition(lambda: state["mode"] == "secondary_roles"))
+    def _roles_save(event):
+        set_secondary_roles(state["roles_data"])
+        state["message"] = "副模型用途已保存"
+        state["mode"] = "list"
+        state["items"] = build_items()
+        main_win.vertical_scroll = 0
+        layout.focus(main_win)
+
+    @kb.add("escape", filter=Condition(lambda: state["mode"] == "secondary_roles"))
+    @kb.add("q", filter=Condition(lambda: state["mode"] == "secondary_roles"))
+    def _roles_esc(event):
+        _open_secondary_selector(event)
 
     app = Application(
         layout=layout,

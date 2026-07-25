@@ -473,15 +473,43 @@ def plan_update(
 
 
 def plan_retry(item_id: str) -> str:
-    """将失败/阻塞/取消的计划项重置为 pending，允许重新调度执行。"""
+    """将失败/阻塞/取消的计划项重置为 pending，允许重新调度执行。
+
+    防盲目重试：当 attempts >= 2 且上次失败原因仍然存在时，提示主 Agent
+    先分析根因并修改任务描述/工具选择，不要原样重试导致重复失败。
+    """
     from core.task_scheduler import get_default_scheduler
 
     scheduler = get_default_scheduler()
-    if scheduler.retry(item_id):
-        return f"计划项 '{item_id}' 已重置为 pending，可重新调用 run_subagent(plan_item_id='{item_id}') 执行。"
-    item = next((i for i in _DEFAULT_PLAN_MANAGER.snapshot() if i["id"] == item_id), None)
+    snapshot = _DEFAULT_PLAN_MANAGER.snapshot()
+    item = next((i for i in snapshot if i["id"] == item_id), None)
     if item is None:
         return f"计划项 '{item_id}' 不存在。"
+
+    attempts = int(item.get("attempts", 0))
+    last_error = str(item.get("error", "")).strip()
+
+    # 盲目重试防护：已失败 2 次以上时，要求主 Agent 先分析根因
+    if attempts >= 2 and last_error:
+        return (
+            f"⚠️ 计划项 '{item_id}' 已失败 {attempts} 次，上次失败原因：\n"
+            f"  {last_error}\n"
+            f"盲目重试大概率会再次失败。请主 Agent 先分析根因：\n"
+            f"  1. 用 plan_read(item_id='{item_id}') 查看详情\n"
+            f"  2. 根据失败原因修改任务描述（如换工具、换方法、拆分子任务）\n"
+            f"  3. 用 plan_update(item_id='{item_id}', subject='修改后的任务描述') 更新\n"
+            f"  4. 确认修改后再调用 plan_retry(item_id='{item_id}')\n"
+            f"如确信根因已排除（如网络恢复、模型可用），可再次调用 plan_retry 强制重试。"
+        )
+
+    if scheduler.retry(item_id):
+        if attempts >= 1:
+            return (
+                f"计划项 '{item_id}' 已重置为 pending（第 {attempts + 1} 次尝试），"
+                f"可重新调用 run_subagent(plan_item_id='{item_id}') 执行。"
+                f"提示：上次失败原因是「{last_error or '未知'}」，请确保本次执行方式已调整。"
+            )
+        return f"计划项 '{item_id}' 已重置为 pending，可重新调用 run_subagent(plan_item_id='{item_id}') 执行。"
     return (
         f"无法重置计划项 '{item_id}'。"
         f"当前状态为 '{item.get('status', 'unknown')}'，"

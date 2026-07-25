@@ -156,7 +156,9 @@ def test_legacy_sessions_without_workdir_visible_everywhere(tmp_path):
         )
         manager.conn.commit()
 
-    names = {s["name"] for s in manager.get_all_sessions(workdir=str(tmp_path))}
+    # legacy_session 是无消息的空会话，测试目的是验证旧会话可见性，
+    # 传 include_empty=True 跳过空会话过滤（参考 kimicode 的列表过滤策略）
+    names = {s["name"] for s in manager.get_all_sessions(workdir=str(tmp_path), include_empty=True)}
     assert names == {"new_session", "legacy_session"}
 
 

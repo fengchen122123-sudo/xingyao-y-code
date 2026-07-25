@@ -327,8 +327,13 @@ def build_default_registry() -> ToolRegistry:
                 "task_description": {"type": "string"},
                 "subagent_type": {
                     "type": "string",
-                    "enum": ["explore", "implement", "test", "review", "general"],
                     "default": "general",
+                    "description": (
+                        "子 Agent 类型。内置：explore（只读探索）/ implement（修改代码）/ "
+                        "test（运行测试）/ review（只读审查）/ general（综合）。"
+                        "也可传 ~/.ycode/agents/*.md 中定义的自定义子 agent name；"
+                        "自定义子 agent 加载失败时自动回退为 general。"
+                    ),
                 },
                 "plan_item_id": {
                     "type": "string",

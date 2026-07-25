@@ -44,7 +44,10 @@ def test_subagent_schema_exposes_role_and_plan_item():
     properties = build_default_registry().get("run_subagent").api_schema()["function"]["parameters"]["properties"]
 
     assert properties["subagent_type"]["default"] == "general"
-    assert properties["subagent_type"]["enum"] == ["explore", "implement", "test", "review", "general"]
+    # subagent_type 不再限制 enum，允许传入 ~/.ycode/agents/*.md 中定义的自定义子 agent name
+    assert "enum" not in properties["subagent_type"]
+    assert "description" in properties["subagent_type"]
+    assert "plan_item_id" in properties
     assert properties["plan_item_id"]["default"] == ""
 
 

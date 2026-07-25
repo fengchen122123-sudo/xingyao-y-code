@@ -261,6 +261,66 @@ def schedule_ui(callback):
         pass
 
 
+def _on_background_subagent_terminal(task_id: str, status: str, description: str, summary: str) -> None:
+    """后台子代理终态实时通知（在 worker 线程中触发，切回 UI 线程打印）。
+
+    遵守 AGENTS.md 线程安全规则：不在 worker 线程直接调 print_formatted_text，
+    通过 schedule_ui 回到主 prompt_toolkit 线程。
+    """
+    def _print_notification():
+        # 状态对应的图标和颜色
+        icon_color = {
+            "completed": "ansigreen",
+            "failed": "ansired",
+            "timed_out": "ansired",
+            "cancelled": "ansigray",
+        }.get(status, "ansiyellow")
+        icon = {
+            "completed": "✓",
+            "failed": "✗",
+            "timed_out": "⏰",
+            "cancelled": "⊘",
+        }.get(status, "•")
+        status_label = {
+            "completed": "已完成",
+            "failed": "已失败",
+            "timed_out": "已超时",
+            "cancelled": "已取消",
+        }.get(status, status)
+
+        # 描述截断到 40 字符，避免通知过长
+        desc_short = (description or "")[:40]
+        # 摘要截断到 150 字符
+        summary_short = (summary or "")[:150]
+        # HTML 转义
+        import html as _html
+        desc_safe = _html.escape(desc_short)
+        summary_safe = _html.escape(summary_short)
+        tid_safe = _html.escape(task_id)
+
+        try:
+            print_formatted_text(HTML(""))
+            print_formatted_text(HTML(
+                f"<ansicyan>🔔 后台子代理{status_label}：</ansicyan>"
+                f"<ansigray>{desc_safe}</ansigray> "
+                f"(<{icon_color}>{icon}</{icon_color}> "
+                f"id=<ansicyan>{tid_safe}</ansicyan>)"
+            ))
+            if summary_short:
+                print_formatted_text(HTML(
+                    f"   <ansigray>详情：{summary_safe}</ansigray>"
+                ))
+            print_formatted_text(HTML(
+                f"   <ansigray>输入 /tasks tail {tid_safe} 查看完整结果</ansigray>"
+            ))
+            print_formatted_text(HTML(""))
+        except Exception:
+            # 通知打印失败不能影响主流程
+            pass
+
+    schedule_ui(_print_notification)
+
+
 def _permission_prompt(request: PermissionRequest) -> dict:
     return {
         "request_id": request.request_id,
@@ -1224,6 +1284,7 @@ def handle_slash_command(command_text):
 
     elif cmd in ("/tasks", "/task"):
         from core.task_manager import list_active_tasks, get_task_output, kill_background_task
+        from core.tools import subagent_manager
 
         if len(parts) > 1:
             subcmd = parts[1]
@@ -1231,32 +1292,83 @@ def handle_slash_command(command_text):
                 tid = parts[2]
                 cleaned_tid = tid.strip("<>")
                 safe_tid = cleaned_tid.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                # 先尝试 shell 后台进程
                 if kill_background_task(cleaned_tid):
-                    print_formatted_text(HTML(f"<ansigreen>✔ 后台任务 {safe_tid} 已成功终结。</ansigreen>"))
+                    print_formatted_text(HTML(f"<ansigreen>✔ 后台进程 {safe_tid} 已成功终结。</ansigreen>"))
                 else:
-                    print_formatted_text(HTML(f"<ansired>❌ 找不到任务 ID: {safe_tid}，或任务已经提前结束。</ansired>"))
+                    # 再尝试子代理后台任务（cancel 而非 kill，协作式取消）
+                    sub_tasks = subagent_manager.snapshot()
+                    matched = [t for t in sub_tasks if t.task_id == cleaned_tid]
+                    if matched and matched[0].status not in {"completed", "failed", "cancelled", "timed_out"}:
+                        subagent_manager.cancel(cleaned_tid, "用户通过 /tasks kill 终止")
+                        print_formatted_text(HTML(f"<ansigreen>✔ 子代理任务 {safe_tid} 已请求取消。</ansigreen>"))
+                    else:
+                        print_formatted_text(HTML(f"<ansired>❌ 找不到任务 ID: {safe_tid}，或任务已经提前结束。</ansired>"))
             elif subcmd in ("tail", "log", "status") and len(parts) > 2:
                 tid = parts[2]
                 cleaned_tid = tid.strip("<>")
                 safe_tid = cleaned_tid.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                # 先查 shell 后台进程日志
                 output = get_task_output(cleaned_tid, tail_lines=30)
-                print_formatted_text(HTML(f"<ansicyan><b>--- 任务 {safe_tid} 最新 30 行日志 ---</b></ansicyan>"))
-                print(output)
+                if output and output.strip():
+                    print_formatted_text(HTML(f"<ansicyan><b>--- 任务 {safe_tid} 最新 30 行日志 ---</b></ansicyan>"))
+                    print(output)
+                else:
+                    # 再查子代理任务状态
+                    sub_tasks = subagent_manager.snapshot()
+                    matched = [t for t in sub_tasks if t.task_id == cleaned_tid]
+                    if matched:
+                        t = matched[0]
+                        print_formatted_text(HTML(f"<ansicyan><b>--- 子代理任务 {safe_tid} 状态 ---</b></ansicyan>"))
+                        status_color = {"completed": "ansigreen", "failed": "ansired",
+                                       "cancelled": "ansigray", "timed_out": "ansired"}.get(t.status, "ansiyellow")
+                        print_formatted_text(HTML(f"  状态: <{status_color}>{t.status}</{status_color}> | 类型: {t.subagent_type} | 阶段: {t.stage}"))
+                        print_formatted_text(HTML(f"  执行: {round(t.execution_elapsed, 1)}s | 等待审批: {round(t.approval_wait_elapsed, 1)}s"))
+                        desc_safe = (t.description or "")[:80].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        print_formatted_text(HTML(f"  描述: {desc_safe}"))
+                        if t.result:
+                            result_safe = (t.result or "")[:500].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                            print_formatted_text(HTML(f"  <ansigray>结果摘要: {result_safe}</ansigray>"))
+                        if t.error:
+                            error_safe = (t.error or "")[:500].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                            print_formatted_text(HTML(f"  <ansired>错误: {error_safe}</ansired>"))
+                    else:
+                        print_formatted_text(HTML(f"<ansiyellow>ℹ 任务 {safe_tid} 没有可用日志或状态信息。</ansiyellow>"))
             else:
                 print_formatted_text(HTML("<ansired>❌ 用法错误。可选指令：</ansired>"))
                 print_formatted_text(HTML("  <ansicyan>/tasks</ansicyan>           : 列出所有后台任务"))
                 print_formatted_text(HTML("  <ansicyan>/tasks kill &lt;ID&gt;</ansicyan> : 终结指定后台任务"))
                 print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;ID&gt;</ansicyan> : 查看任务日志输出"))
         else:
-            tasks = list_active_tasks()
-            if not tasks:
+            # 同时查询 shell 后台进程和子代理后台任务
+            shell_tasks = list_active_tasks()
+            sub_snapshots = subagent_manager.snapshot()
+            # 只显示后台子代理任务（前台子代理在状态栏已有实时显示）
+            bg_sub_snapshots = [t for t in sub_snapshots if t.run_in_background]
+
+            if not shell_tasks and not bg_sub_snapshots:
                 print_formatted_text(HTML("<ansiyellow>ℹ 当前没有运行中的后台异步任务。</ansiyellow>"))
             else:
-                print_formatted_text(HTML("<ansicyan><b>当前运行的后台任务：</b></ansicyan>"))
-                for t in tasks:
-                    safe_cmd = t['command'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    print_formatted_text(HTML(f"  <ansigreen>• ID: {t['task_id']}</ansigreen> | PID: <ansicyan>{t['pid']}</ansicyan> | 运行: {t['duration']} | 命令: {safe_cmd}"))
-                print_formatted_text(HTML("<ansigray>提示：你可以输入 `/tasks tail &lt;ID&gt;` 查看日志，或 `/tasks kill &lt;ID&gt;` 终结任务。</ansigray>"))
+                if shell_tasks:
+                    print_formatted_text(HTML("<ansicyan><b>当前运行的后台进程（shell）：</b></ansicyan>"))
+                    for t in shell_tasks:
+                        safe_cmd = t['command'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        print_formatted_text(HTML(f"  <ansigreen>• ID: {t['task_id']}</ansigreen> | PID: <ansicyan>{t['pid']}</ansicyan> | 运行: {t['duration']} | 命令: {safe_cmd}"))
+                if bg_sub_snapshots:
+                    if shell_tasks:
+                        print_formatted_text(HTML(""))
+                    print_formatted_text(HTML("<ansicyan><b>当前运行的后台子代理：</b></ansicyan>"))
+                    for t in bg_sub_snapshots:
+                        status_color = {"completed": "ansigreen", "failed": "ansired",
+                                       "cancelled": "ansigray", "timed_out": "ansired",
+                                       "in_progress": "ansiyellow", "running": "ansiyellow"}.get(t.status, "ansigray")
+                        desc_safe = (t.description or "")[:50].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        print_formatted_text(HTML(
+                            f"  <ansigreen>• ID: {t.task_id}</ansigreen> | 状态: <{status_color}>{t.status}</{status_color}> "
+                            f"| 类型: <ansicyan>{t.subagent_type}</ansicyan> | 阶段: {t.stage} "
+                            f"| 执行: {round(t.execution_elapsed, 1)}s | 描述: {desc_safe}"
+                        ))
+                print_formatted_text(HTML("<ansigray>提示：你可以输入 `/tasks tail &lt;ID&gt;` 查看日志/状态，或 `/tasks kill &lt;ID&gt;` 终结任务。</ansigray>"))
 
     elif cmd in ("/plan", "/plans"):
         from core.task_scheduler import get_default_scheduler
@@ -1866,6 +1978,19 @@ def _make_input_app():
 
         return ANSI(_format_live_plan_items(get_default_plan_manager().snapshot()))
 
+    def _has_active_plan_items() -> bool:
+        """判断是否有未完成的计划项（pending/in_progress）。
+
+        所有项都进入终态（completed/failed/blocked/cancelled）时返回 False，
+        避免已完成的计划长期占用状态栏。注意 blocked 在 plan.py 的
+        TERMINAL_STATUSES 中属于终态，不应算作 active。
+        """
+        from core.plan import TERMINAL_STATUSES
+        items = get_default_plan_manager().snapshot()
+        if not items:
+            return False
+        return any(item.get("status") not in TERMINAL_STATUSES for item in items)
+
     live_plan_window = ConditionalContainer(
         content=Frame(
             Window(
@@ -1877,7 +2002,7 @@ def _make_input_app():
             style="class:status.live-plan-frame",
         ),
         filter=Condition(
-            lambda: bool(get_default_plan_manager().snapshot())
+            lambda: _has_active_plan_items()
             and (
                 task_status != "idle"
                 or any(
@@ -2035,6 +2160,7 @@ def _background_worker():
     while True:
         task_data = msg_queue.get()
         # worker 是 daemon 线程随主进程退出；队列从未投递 None 哨兵，无需判空分支
+        task_session = None  # 预初始化，确保 except 块中可安全引用
         try:
             # 新一轮对话，重置计划模式授权状态
             plan_approved_this_turn = False
@@ -2207,6 +2333,7 @@ def _background_worker():
                 system_prompt = "你叫星瑶，是一位顶尖的代码编程助手。"
 
             from core.skills import get_active_skills_catalog
+            from core.subagent_registry import get_custom_subagents_catalog
             import core.memory_kairos as memory_kairos
             from core.plan import get_default_plan_manager
             now = datetime.datetime.now()
@@ -2222,6 +2349,7 @@ def _background_worker():
                 active_plan=active_plan,
                 memory=memory_kairos.build_memory_system_section(),
                 skills=get_active_skills_catalog() or "无",
+                custom_subagents=get_custom_subagents_catalog() or "无",
             )
             stable_prompt = build_stable_prompt(system_prompt)
             dynamic_prompt = build_dynamic_prompt(runtime)
@@ -2306,6 +2434,19 @@ def _background_worker():
                 except Exception as e:
                     turn_controller.cancel()
                     end_turn_checkpoint()
+                    # 必须记录到 runtime-warnings.log，否则异常被静默吞掉，
+                    # 用户消息已入库但 assistant 回复缺失，无法排查（session 97 类问题）
+                    import logging as _logging_mod
+                    _logging_mod.getLogger("py.warnings").exception(
+                        "LLM 调用失败 session=%s turn=%s: %s",
+                        task_session, turn_id, e,
+                    )
+                    # 同时持久化一条失败标记消息到数据库，确保会话历史完整
+                    try:
+                        failure_msg = f"[回复生成失败] {type(e).__name__}: {e}"
+                        manager.add_message(task_session, "assistant", failure_msg)
+                    except Exception:
+                        pass
                     schedule_ui(lambda message=_esc(str(e)): print_formatted_text(
                         HTML(f"\n<ansired>⚠️ 连接或回复生成失败: {message}</ansired>\n")
                     ))
@@ -2330,6 +2471,32 @@ def _background_worker():
                 from core.memory import clear_undo_session
                 _tool_cache.set_current_session(None)
                 clear_undo_session()
+                # 清理卡在 in_progress 的计划项：子 agent 异常退出（超时/崩溃/未调用 terminal_callback）
+                # 会导致计划项永久卡在 in_progress，turn 结束后仍显示在状态栏。
+                # 这里将所有 in_progress 项标记为 failed，并记录原因，避免脏状态残留到下一轮。
+                try:
+                    from core.plan import get_default_plan_manager, TERMINAL_STATUSES
+                    plan_mgr = get_default_plan_manager()
+                    stuck_items = [
+                        item for item in plan_mgr.snapshot()
+                        if item.get("status") == "in_progress"
+                    ]
+                    if stuck_items:
+                        from core.task_scheduler import get_default_scheduler
+                        for item in stuck_items:
+                            get_default_scheduler().fail(
+                                item["id"],
+                                f"turn 结束时仍处于 in_progress（子 agent 可能异常退出或未回调终止状态）",
+                            )
+                    # 自动归档：所有计划项都已进入终态时清空 plan_manager，
+                    # 避免上一轮已完成的计划跨越多轮对话仍残留在状态栏（用户问"你能做什么"等无关问题时尤其明显）。
+                    # 必须放在 in_progress 项被标记为 failed 之后，否则会漏判。
+                    # 归档只清空内存与磁盘计划文件，不影响会话历史中的对话记录。
+                    items = plan_mgr.snapshot()
+                    if items and all(item.get("status") in TERMINAL_STATUSES for item in items):
+                        plan_mgr.clear()
+                except Exception:
+                    pass
 
             if not turn_interrupted:
                 # 检查是否需要自动重命名会话（当且仅当是新建的默认 hex 会话）
@@ -2350,6 +2517,13 @@ def _background_worker():
             # 兜底防线：parse/add_message/prune/压缩/提示词组装等任何未预期异常
             # 都不允许杀死 worker 线程，否则之后所有用户输入会被静默吞掉、UI 卡死
             logging.getLogger("py.warnings").exception("background worker turn failed: %s", e)
+            # 持久化兜底异常的失败标记，确保会话历史完整可排查
+            try:
+                if task_session:
+                    failure_msg = f"[后台任务异常] {type(e).__name__}: {e}"
+                    manager.add_message(task_session, "assistant", failure_msg)
+            except Exception:
+                pass
             schedule_ui(lambda message=_esc(str(e)): print_formatted_text(
                 HTML(f"\n<ansired>⚠️ 后台任务执行失败: {message}</ansired>\n")
             ))
@@ -2603,6 +2777,12 @@ def run_cli():
     while True:
         pending_action = None
         app_instance = _make_input_app()
+
+        # 注册后台子代理终态实时通知回调
+        # 后台任务完成/失败/超时/取消时，立即在终端打印一条通知，不等下一轮对话。
+        # 回调在 worker 线程中触发，必须通过 schedule_ui 切回 UI 线程打印（遵守 AGENTS.md 线程安全规则）。
+        from core.tools import subagent_manager as _sm_for_notification
+        _sm_for_notification.set_on_terminal(_on_background_subagent_terminal)
 
         with patch_stdout():
             try:
