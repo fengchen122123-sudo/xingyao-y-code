@@ -134,6 +134,46 @@ def set_active_model(model_id: str):
     config.update_config(_mutate)
 
 
+def get_model_config_by_litellm_model(litellm_model: str, base_url: str | None = None) -> dict | None:
+    """根据 litellm_model 字符串（以及可选的 base_url）查找对应的模型配置条目。
+
+    返回的 dict 是 provider 下 model 条目的引用（浅拷贝），调用方不应修改。
+    """
+    data = load_config()
+    litellm_model = str(litellm_model or "").strip()
+    base_url = str(base_url or "").rstrip("/").lower()
+    for provider in data.get("providers", []):
+        p_base = str(provider.get("base_url") or "").rstrip("/").lower()
+        for model in provider.get("models", []):
+            if model.get("litellm_model") == litellm_model:
+                if not base_url or not p_base or p_base == base_url:
+                    return model
+    return None
+
+
+def get_secondary_model() -> dict | None:
+    """返回当前配置的 secondary（便宜）模型信息，用于子 Agent / 摘要 / 压缩等后台任务。"""
+    data = load_config()
+    secondary_id = data.get("secondary_model_id")
+    if not secondary_id:
+        return None
+    for provider in data.get("providers", []):
+        for model in provider.get("models", []):
+            if model.get("id") == secondary_id:
+                return {
+                    "litellm_model":   model["litellm_model"],
+                    "api_key":         provider["api_key"],
+                    "base_url":         provider["base_url"],
+                    "context_window":  model.get("context_window", 128000),
+                    "supports_vision": model.get("supports_vision"),
+                    "name":            model["name"],
+                    "protocol":        provider.get("protocol", "openai"),
+                    "provider_name":   provider["name"],
+                    "id":              model["id"],
+                }
+    return None
+
+
 def add_provider(name: str, base_url: str, api_key: str, protocol: str) -> str:
     """添加一个新厂商，返回新生成的 provider_id。"""
     pid = str(uuid.uuid4())[:8]

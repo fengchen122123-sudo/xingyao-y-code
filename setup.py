@@ -26,6 +26,7 @@ setup(
         'ddgs>=9.0.0',
         'mcp>=1.0.0',
         'psutil>=5.9.0',
+        'pillow>=10.0.0',
     ],
     entry_points={
         'console_scripts': [
