@@ -631,16 +631,16 @@ def test_non_vision_model_flattens_image_without_base64_leak(monkeypatch):
 
 
 def test_media_list_content_not_merged_with_text(monkeypatch):
-    """多模态 list 内容不参与同 role 文本合并"""
+    """多模态 list 内容不参与同 role 文本合并；只有最新用户消息中的图片被保留"""
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod, "_supports_vision", lambda model: True)
     out = llm_mod._strip_media_and_merge(
-        [_image_msg("问题"), {"role": "user", "content": "补充"}], "openai/vision-model"
+        [{"role": "user", "content": "补充"}, _image_msg("问题")], "openai/vision-model"
     )[0]
     assert len(out) == 2
-    assert isinstance(out[0]["content"], list)
-    assert out[1]["content"] == "补充"
+    assert out[0]["content"] == "补充"
+    assert isinstance(out[1]["content"], list)
 
 
 def test_supports_vision_config_flag_takes_precedence(monkeypatch):

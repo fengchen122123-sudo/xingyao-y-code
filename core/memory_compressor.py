@@ -268,12 +268,13 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         # 优先使用 secondary（便宜）模型做摘要，降低后台记忆压缩的额度消耗
         compress_model, compress_key, compress_url = api_model, api_key, api_url
         try:
-            from core.model_manager import get_secondary_model
-            secondary = get_secondary_model()
-            if secondary:
-                compress_model = secondary["litellm_model"]
-                compress_key = secondary["api_key"]
-                compress_url = secondary["base_url"]
+            from core.model_manager import get_secondary_model, get_secondary_roles
+            if get_secondary_roles().get("compression"):
+                secondary = get_secondary_model()
+                if secondary:
+                    compress_model = secondary["litellm_model"]
+                    compress_key = secondary["api_key"]
+                    compress_url = secondary["base_url"]
         except Exception:
             pass
 

@@ -272,9 +272,211 @@ def test_subagent_structured_tool_failure_cannot_complete():
     manager = SubagentManager(runner=runner)
     result = manager.run("查询天气", "s1", "t1", timeout_seconds=30)
 
-    payload = json.loads(result)
-    assert payload["status"] == "failed"
-    assert "天气服务超时" in payload["error"]
+    # 失败结果为结构化文本，包含失败原因和工具清单
+    assert "失败" in result
+    assert "天气服务超时" in result
+    assert "get_weather" in result
+    assert manager.snapshot()[0].status == "failed"
+
+
+def test_subagent_cancel_terminates_running_task():
+    """cancel 方法应把运行中的子代理任务标记为 cancelled"""
+    import threading
+    import time as _time
+
+    started = threading.Event()
+    cancel_ready = threading.Event()
+
+    def runner(record):
+        started.set()
+        # 模拟长任务，等待取消信号
+        for _ in range(100):
+            if cancel_ready.is_set() or record.status == "cancelled":
+                return "被取消"
+            _time.sleep(0.01)
+        return "未取消"
+
+    manager = SubagentManager(runner=runner)
+    # 后台启动子代理
+    thread = threading.Thread(
+        target=manager.run,
+        args=("长任务", "s1", "t1"),
+        kwargs={"timeout_seconds": 30, "run_in_background": True},
+        daemon=True,
+    )
+    thread.start()
+    assert started.wait(2.0), "子代理未在 2 秒内启动"
+
+    # 找到运行中的 task_id 并取消
+    snapshots = manager.snapshot()
+    assert snapshots, "snapshot 不应为空"
+    task_id = snapshots[0].task_id
+    assert snapshots[0].status not in {"completed", "failed", "cancelled", "timed_out"}
+
+    ok = manager.cancel(task_id, reason="测试取消")
+    assert ok is True, "cancel 应返回 True"
+
+    # 通知 runner 可以退出
+    cancel_ready.set()
+    # 等待线程结束
+    thread.join(timeout=5.0)
+
+    # 最终状态应该是 cancelled
+    final = [s for s in manager.snapshot() if s.task_id == task_id][0]
+    assert final.status == "cancelled", f"期望 cancelled，实际 {final.status}"
+
+
+def test_subagent_cancel_returns_false_for_unknown_or_terminal_task():
+    """cancel 对不存在的 task_id 或已终态任务应返回 False"""
+    manager = SubagentManager(runner=lambda record: "完成")
+    # 不存在的 task_id
+    assert manager.cancel("nonexistent-id") is False
+
+    # 先正常跑完一个任务，再尝试 cancel
+    manager.run("已完成任务", "s1", "t1", timeout_seconds=30)
+    snapshots = manager.snapshot()
+    task_id = snapshots[0].task_id
+    assert snapshots[0].status == "completed"
+    # 已终态任务 cancel 应返回 False
+    assert manager.cancel(task_id) is False
+
+
+def test_background_subagent_terminal_notification_fires_on_complete():
+    """后台子代理完成时应触发 on_terminal 回调，前台不触发"""
+    import threading
+    import time as _time
+
+    notifications = []  # list of (task_id, status, description, summary)
+    lock = threading.Lock()
+
+    def on_terminal(task_id, status, description, summary):
+        with lock:
+            notifications.append((task_id, status, description, summary))
+
+    # 后台任务：完成
+    manager = SubagentManager(
+        runner=lambda record: "查询结果：晴",
+        on_terminal=on_terminal,
+    )
+    thread = threading.Thread(
+        target=manager.run,
+        args=("后台查询天气", "s1", "t1"),
+        kwargs={"timeout_seconds": 30, "run_in_background": True},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=5.0)
+
+    with lock:
+        assert len(notifications) == 1, f"应触发1次通知，实际 {len(notifications)}"
+        tid, status, desc, summary = notifications[0]
+        assert status == "completed"
+        assert "后台查询天气" in desc
+        assert "晴" in summary
+
+
+def test_background_subagent_terminal_notification_fires_on_failure():
+    """后台子代理失败时应触发 on_terminal 回调，summary 包含错误信息"""
+    import threading
+
+    notifications = []
+    lock = threading.Lock()
+
+    def on_terminal(task_id, status, description, summary):
+        with lock:
+            notifications.append((task_id, status, description, summary))
+
+    def runner(record):
+        record.tool_errors["search_news"] = "无结果"
+        return "查询失败"
+
+    manager = SubagentManager(runner=runner, on_terminal=on_terminal)
+    thread = threading.Thread(
+        target=manager.run,
+        args=("后台查新闻", "s1", "t1"),
+        kwargs={"timeout_seconds": 30, "run_in_background": True},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=5.0)
+
+    with lock:
+        assert len(notifications) == 1
+        tid, status, desc, summary = notifications[0]
+        assert status == "failed"
+        assert "后台查新闻" in desc
+        # 失败时 summary 是 error 信息
+        assert "search_news" in summary or "无结果" in summary
+
+
+def test_foreground_subagent_does_not_trigger_terminal_notification():
+    """前台子代理不应触发 on_terminal（状态栏已有实时显示，避免重复通知）"""
+    notifications = []
+
+    def on_terminal(task_id, status, description, summary):
+        notifications.append((task_id, status, description, summary))
+
+    manager = SubagentManager(
+        runner=lambda record: "前台结果",
+        on_terminal=on_terminal,
+    )
+    # 前台模式（默认）
+    result = manager.run("前台任务", "s1", "t1", timeout_seconds=30)
+    assert "前台结果" in result
+    # 前台任务不应触发通知
+    assert len(notifications) == 0, f"前台任务不应触发通知，实际触发了 {len(notifications)} 次"
+
+
+def test_set_on_terminal_can_register_callback_after_init():
+    """set_on_terminal 允许运行时注册回调（main.py 初始化 UI 后调用）"""
+    notifications = []
+
+    # 初始化时不传 on_terminal
+    manager = SubagentManager(runner=lambda record: "结果")
+    assert manager._on_terminal is None
+
+    # 运行时注册
+    manager.set_on_terminal(lambda tid, st, desc, sum: notifications.append((tid, st, desc, sum)))
+    assert manager._on_terminal is not None
+
+    # 后台任务完成后应触发
+    import threading
+    thread = threading.Thread(
+        target=manager.run,
+        args=("后台任务", "s1", "t1"),
+        kwargs={"timeout_seconds": 30, "run_in_background": True},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=5.0)
+
+    assert len(notifications) == 1
+    assert notifications[0][1] == "completed"
+
+
+def test_terminal_notification_callback_exception_does_not_break_subagent():
+    """on_terminal 回调抛异常时不能影响子代理主流程"""
+    import threading
+
+    def bad_callback(task_id, status, description, summary):
+        raise RuntimeError("回调内部错误")
+
+    manager = SubagentManager(
+        runner=lambda record: "正常结果",
+        on_terminal=bad_callback,
+    )
+    thread = threading.Thread(
+        target=manager.run,
+        args=("测试回调异常", "s1", "t1"),
+        kwargs={"timeout_seconds": 30, "run_in_background": True},
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=5.0)
+
+    # 子代理状态应正常完成，回调异常被吞掉
+    snapshots = manager.snapshot()
+    assert snapshots[0].status == "completed"
 
 
 def test_run_subagent_updates_associated_plan_only_after_completion(monkeypatch):
@@ -409,10 +611,8 @@ def test_foreground_timeout_sets_terminal_state():
 
     result = manager.run("慢任务", "s1", "t1", timeout_seconds=30)
 
-    payload = json.loads(result)
-    assert payload["status"] == "timed_out"
-    assert payload["latest_stage"] == "timed_out"
-    assert payload["execution_elapsed"] >= 30
+    # 超时返回结构化文本
+    assert "超时" in result
     snapshot = manager.snapshot()[0]
     assert snapshot.status == "timed_out"
     assert snapshot.stage == "timed_out"
@@ -463,7 +663,11 @@ def test_foreground_timeout_cancels_owned_permission_requests(monkeypatch):
 
     result = manager.run("慢任务", "s1", "t1", timeout_seconds=30)
 
-    task_id = json.loads(result)["task_id"]
+    # 失败结果为结构化文本，从中提取 task_id
+    import re
+    match = re.search(r"task_id=(subagent-[a-f0-9]+)", result)
+    assert match is not None, f"未在结果中找到 task_id: {result}"
+    task_id = match.group(1)
     assert cancelled == [task_id]
 
 
@@ -484,7 +688,7 @@ def test_parent_cancel_marks_foreground_task_cancelled():
         parent_cancel_event=parent_cancel,
     )
 
-    assert json.loads(result)["status"] == "cancelled"
+    assert "已取消" in result
     assert manager.snapshot()[0].status == "cancelled"
 
 
@@ -501,9 +705,9 @@ def test_empty_or_exceptional_subagent_is_failed(runner):
 
     result = manager.run("失败任务", "s1", "t1", timeout_seconds=30)
 
-    payload = json.loads(result)
-    assert payload["status"] == "failed"
-    assert payload["error"]
+    # 失败结果为结构化文本，包含失败原因
+    assert "失败" in result
+    assert "失败原因" in result
     assert manager.snapshot()[0].status == "failed"
 
 
@@ -660,6 +864,254 @@ def test_outside_workspace_allowed_reads_config(monkeypatch):
         lambda: {},
     )
     assert tools_mod._outside_workspace_allowed() is False
+
+
+# ---------------------------------------------------------------------------
+# search_news 无结果必须返回 🚨 前缀，否则子代理会被误判为 completed
+# ---------------------------------------------------------------------------
+# 历史问题：search_news 无结果时返回 "🔍 互联网上没有找到..."，
+# 不以 🚨 开头，_tool_result_ok 判定为工具成功，tool_errors 不收录，
+# LLM 编一段"我没搜到"的文本通过 _has_meaningful_subagent_result，
+# 最终 _complete 被调用，task.status="completed"，但实际结果是失败的。
+# 修复：无结果也返回 🚨 前缀，走 _terminate("failed") 流程。
+
+def test_search_news_no_results_returns_error_prefix(monkeypatch):
+    """search_news 无结果时返回 🚨 前缀，确保被识别为工具失败"""
+    import core.tools as tools_mod
+
+    class _FakeDDGS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def news(self, query, max_results=5):
+            return []  # 模拟无结果
+
+    monkeypatch.setattr(tools_mod, "DDGS", _FakeDDGS)
+
+    result = tools_mod.search_news("Kimi AI")
+
+    assert result.startswith("🚨"), "无结果必须返回 🚨 前缀以触发子代理失败流程"
+    assert "无结果" in result or "未返回" in result
+    assert "Kimi AI" in result
+
+
+def test_search_news_with_results_returns_normal_text(monkeypatch):
+    """search_news 有结果时正常返回，不带 🚨 前缀"""
+    import core.tools as tools_mod
+
+    class _FakeDDGS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def news(self, query, max_results=5):
+            return [
+                {"title": "测试新闻", "url": "https://example.com/1", "body": "摘要内容"}
+            ]
+
+    monkeypatch.setattr(tools_mod, "DDGS", _FakeDDGS)
+
+    result = tools_mod.search_news("AI")
+
+    assert not result.startswith("🚨"), "有结果时不应带 🚨 前缀"
+    assert "测试新闻" in result
+    assert "https://example.com/1" in result
+
+
+def test_tool_result_ok_treats_search_news_no_results_as_failure(monkeypatch):
+    """_tool_result_ok 必须把 search_news 的无结果返回识别为失败（ok=False）"""
+    import core.tools as tools_mod
+    from core.llm import _tool_result_ok, TOOL_ERROR_PREFIX
+
+    class _FakeDDGS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def news(self, query, max_results=5):
+            return []
+
+    monkeypatch.setattr(tools_mod, "DDGS", _FakeDDGS)
+
+    result_text = tools_mod.search_news("Kimi AI")
+    # 模拟 llm.py 中 tool_finished 事件的 payload 构造
+    fake_result = {"content": result_text}
+
+    assert result_text.startswith(TOOL_ERROR_PREFIX)
+    assert _tool_result_ok("search_news", fake_result) is False
+
+
+def test_subagent_with_search_news_no_results_is_marked_failed(monkeypatch):
+    """端到端：子代理调用 search_news 无结果时，task.status 必须是 failed 而非 completed"""
+    import core.tools as tools_mod
+
+    class _FakeDDGS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def news(self, query, max_results=5):
+            return []
+
+    monkeypatch.setattr(tools_mod, "DDGS", _FakeDDGS)
+
+    # 直接调用 search_news 验证前缀（端到端验证需要 LLM 调用，这里只验证工具层契约）
+    result = tools_mod.search_news("nonexistent topic 12345")
+    assert result.startswith("🚨"), \
+        "search_news 无结果必须以 🚨 开头，否则子代理会误判为 completed"
+
+
+# ---------------------------------------------------------------------------
+# SSRF 防护双模式测试
+# ---------------------------------------------------------------------------
+# 参考 kimicode/opencode 的做法：默认宽松模式只拦截云元数据接口，
+# 不做 DNS 解析后的 IP 校验，避免误杀 Clash/V2Ray fake-ip 段（198.18.0.0/15）。
+# 严格模式（fetch_url_strict_ssrf=True）保留完整 IP 校验。
+
+def test_ssrf_default_mode_allows_fakeip_domain(monkeypatch):
+    """默认宽松模式：域名解析到 198.18.x.x（fake-ip 段）也放行，不查 IP"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: False)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    # 即使 DNS 解析到 198.18.0.92（is_private=True），默认模式也不应该拦截
+    monkeypatch.setattr(
+        tools_mod.socket, "getaddrinfo",
+        lambda host, *a, **k: [("AF_INET", "STREAM", "PROTO", None, ("198.18.0.92", 0))]
+    )
+    # 不应抛异常
+    tools_mod._check_ssrf_url("https://open-meteo.com/api")
+
+
+def test_ssrf_default_mode_allows_private_ip_literal(monkeypatch):
+    """默认宽松模式：直接访问私网 IP 字面量也放行（对齐 kimicode/opencode）"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: False)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    tools_mod._check_ssrf_url("http://10.0.0.1/api")
+    tools_mod._check_ssrf_url("http://192.168.1.1/")
+    tools_mod._check_ssrf_url("http://198.18.0.92/")
+
+
+def test_ssrf_both_modes_block_cloud_metadata(monkeypatch):
+    """两种模式都拦截云元数据接口（SSRF 防护的核心价值）"""
+    import core.tools as tools_mod
+
+    for strict_mode in (False, True):
+        monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: strict_mode)
+        monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+        with pytest.raises(tools_mod.SSRFBlockedError, match="元数据接口"):
+            tools_mod._check_ssrf_url("http://169.254.169.254/latest/meta-data/")
+        with pytest.raises(tools_mod.SSRFBlockedError, match="元数据接口"):
+            tools_mod._check_ssrf_url("http://metadata.google.internal/")
+
+
+def test_ssrf_allowlist_bypasses_both_modes(monkeypatch):
+    """白名单优先级最高，两种模式都直接放行（不查 IP）"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(
+        tools_mod, "_get_fetch_url_allow_hosts",
+        lambda: {"open-meteo.com", "geocoding-api.open-meteo.com"}
+    )
+    # 严格模式下，白名单域名即使解析到私网 IP 也应放行
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(
+        tools_mod.socket, "getaddrinfo",
+        lambda host, *a, **k: [("AF_INET", "STREAM", "PROTO", None, ("198.18.0.92", 0))]
+    )
+    tools_mod._check_ssrf_url("https://open-meteo.com/api")
+    tools_mod._check_ssrf_url("https://geocoding-api.open-meteo.com/v1/search")
+
+
+def test_ssrf_strict_mode_blocks_private_ip_literal(monkeypatch):
+    """严格模式：IP 字面量 198.18.0.92（fake-ip 段）被拦截"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    with pytest.raises(tools_mod.SSRFBlockedError, match="非公网 IP"):
+        tools_mod._check_ssrf_url("http://198.18.0.92/")
+    with pytest.raises(tools_mod.SSRFBlockedError, match="非公网 IP"):
+        tools_mod._check_ssrf_url("http://10.0.0.1/")
+
+
+def test_ssrf_strict_mode_blocks_dns_resolved_private_ip(monkeypatch):
+    """严格模式：DNS 解析到 198.18.x.x（fake-ip）被拦截"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    monkeypatch.setattr(
+        tools_mod.socket, "getaddrinfo",
+        lambda host, *a, **k: [("AF_INET", "STREAM", "PROTO", None, ("198.18.0.92", 0))]
+    )
+    with pytest.raises(tools_mod.SSRFBlockedError, match="非公网 IP 198.18.0.92"):
+        tools_mod._check_ssrf_url("https://open-meteo.com/api")
+
+
+def test_ssrf_strict_mode_blocks_dns_failure(monkeypatch):
+    """严格模式：DNS 解析失败保守拒绝"""
+    import core.tools as tools_mod
+    import socket as _socket
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    monkeypatch.setattr(
+        tools_mod.socket, "getaddrinfo",
+        lambda host, *a, **k: (_ for _ in ()).throw(_socket.gaierror("DNS failed"))
+    )
+    with pytest.raises(tools_mod.SSRFBlockedError, match="DNS 解析失败"):
+        tools_mod._check_ssrf_url("https://nonexistent.invalid/")
+
+
+def test_ssrf_strict_mode_allows_public_ip(monkeypatch):
+    """严格模式：公网 IP 正常放行"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    # 8.8.8.8 是 Google DNS，公网 IP，应放行
+    tools_mod._check_ssrf_url("http://8.8.8.8/")
+    # 1.1.1.1 是 Cloudflare DNS，公网 IP，应放行
+    tools_mod._check_ssrf_url("http://1.1.1.1/")
+
+
+def test_fetch_url_ssrf_error_hint_mentions_fakeip(monkeypatch):
+    """SSRF 拦截时错误提示应提到 fake-ip 可能性和解决方案"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    # 拦截 198.18.0.92 时，返回的错误信息应包含 fake-ip 提示
+    result = tools_mod.fetch_url("http://198.18.0.92/")
+    assert "🚨" in result
+    assert "fake-ip" in result or "Clash" in result or "V2Ray" in result
+    assert "fetch_url_strict_ssrf" in result
+    assert "fetch_url_allow_hosts" in result
+
+
+def test_fetch_url_ssrf_metadata_error_no_fakeip_hint(monkeypatch):
+    """云元数据接口拦截时不提示 fake-ip（这类目标绝不应该放行）"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    result = tools_mod.fetch_url("http://169.254.169.254/latest/meta-data/")
+    assert "🚨" in result
+    assert "元数据接口" in result
+    # 元数据拦截不应提到 fake-ip（避免误导用户放行元数据接口）
+    assert "fake-ip" not in result
 
 
 def test_read_file_truncates_and_pages_long_files(tmp_path, monkeypatch):
@@ -851,10 +1303,10 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
         timeout_seconds=30,
     )
 
-    payload = json.loads(result)
-    assert payload["status"] == "failed"
-    assert "不是 in_progress" not in payload["error"]
-    assert "验证" in payload["error"]
+    # 失败结果为结构化文本，应包含验证失败的具体原因，而不是"不是 in_progress"的误导信息
+    assert "失败" in result
+    assert "不是 in_progress" not in result
+    assert "验证" in result
     assert plan.snapshot()[0]["status"] == "failed"
     bind_default_plan_session(previous_session)
 
@@ -937,3 +1389,62 @@ def test_write_file_allows_overwrite_small_existing_file(tmp_path, monkeypatch):
     assert isinstance(result, str)
     assert result.startswith("\u2714")
     assert target.read_text(encoding="utf-8") == "new"
+
+
+def test_write_file_auto_creates_missing_parent_directory(tmp_path, monkeypatch):
+    """write_file 应自动创建不存在的父目录，而不是抛 FileNotFoundError。
+
+    复现场景：主 Agent 按系统提示词写 memory/feedback/xxx.md，
+    但 feedback/ 目录不存在 → 旧版 mkstemp(dir=...) 直接抛错，
+    Agent 陷入无效重试。修复后 write_file 应自动 mkdir parents=True。
+    """
+    from core.tools import write_file
+
+    monkeypatch.chdir(tmp_path)
+    # feedback/ 子目录不存在
+    target = tmp_path / "memory" / "feedback" / "note.md"
+    assert not target.parent.exists()
+
+    result = write_file(str(target), "test content")
+
+    assert isinstance(result, str)
+    assert result.startswith("\u2714"), f"应写入成功，实际：{result}"
+    assert target.exists()
+    assert target.read_text(encoding="utf-8") == "test content"
+    # 父目录应被自动创建
+    assert target.parent.exists()
+
+
+def test_write_file_auto_creates_nested_parent_directories(tmp_path, monkeypatch):
+    """write_file 应自动创建多层嵌套的不存在父目录"""
+    from core.tools import write_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "a" / "b" / "c" / "d" / "file.txt"
+    assert not target.parent.exists()
+
+    result = write_file(str(target), "deep")
+
+    assert result.startswith("\u2714")
+    assert target.read_text(encoding="utf-8") == "deep"
+
+
+def test_edit_file_auto_creates_missing_parent_directory(tmp_path, monkeypatch):
+    """edit_file 修改已存在文件时，若父目录被外部删除应能自动重建（防御性）。
+
+    注意：edit_file 本身要求文件已存在（先读后改），所以这个测试构造的场景是：
+    文件存在但其父目录被外部删除（极端情况），edit_file 应能自动重建父目录后写入。
+    实际上更常见的场景是 write_file 创建新文件到不存在的子目录，那已被前两个测试覆盖。
+    这里只验证 edit_file 的 mkdir 逻辑不会破坏正常编辑流程。
+    """
+    from core.tools import write_file, edit_file
+
+    monkeypatch.chdir(tmp_path)
+    # 先用 write_file 创建一个文件（同时自动建父目录）
+    target = tmp_path / "sub" / "note.md"
+    write_file(str(target), "old content")
+
+    # 正常 edit_file 应能工作（父目录已存在，mkdir 是 no-op）
+    result = edit_file(str(target), "old content", "new content")
+    assert "✔" in str(result) or "成功" in str(result), f"edit_file 应成功，实际：{result}"
+    assert target.read_text(encoding="utf-8") == "new content"

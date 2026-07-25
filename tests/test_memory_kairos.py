@@ -68,3 +68,36 @@ def test_memory_md_index_cannot_be_overwritten(tmp_path, monkeypatch):
     assert "拒绝" in result
     idx = memory_dir / "MEMORY.md"
     assert not idx.exists(), "索引文件不应被 create_or_update 覆写创建"
+
+
+def test_ensure_memory_dir_creates_all_subdirectories(tmp_path, monkeypatch):
+    """ensure_memory_dir 应创建系统提示词里承诺的所有子目录。
+
+    复现场景：系统提示词说"directory already exists, write to it directly"，
+    但旧版只创建 MEMORY_DIR 和 logs/，主 Agent 写 feedback/xxx.md 时
+    触发 FileNotFoundError。修复后应一次创建全部子目录。
+    """
+    memory_dir = tmp_path / "memory"
+    monkeypatch.setattr(mk, "MEMORY_DIR", memory_dir)
+
+    mk.ensure_memory_dir()
+
+    # 系统提示词承诺的目录必须全部存在
+    assert memory_dir.exists()
+    assert (memory_dir / "logs").exists()
+    assert (memory_dir / "user").exists()
+    assert (memory_dir / "feedback").exists()
+    assert (memory_dir / "project").exists()
+    assert (memory_dir / "reference").exists()
+
+
+def test_ensure_memory_dir_is_idempotent(tmp_path, monkeypatch):
+    """ensure_memory_dir 重复调用不应报错（exist_ok=True）"""
+    memory_dir = tmp_path / "memory"
+    monkeypatch.setattr(mk, "MEMORY_DIR", memory_dir)
+
+    mk.ensure_memory_dir()
+    mk.ensure_memory_dir()  # 不应抛异常
+
+    assert (memory_dir / "feedback").exists()
+

@@ -40,6 +40,11 @@ def _is_safe_memory_filename(fname):
 def ensure_memory_dir():
     MEMORY_DIR.mkdir(parents=True, exist_ok=True)
     (MEMORY_DIR / "logs").mkdir(parents=True, exist_ok=True)
+    # 系统提示词里承诺的四类记忆子目录也一并创建，
+    # 避免主 Agent 按 build_memory_system_section 的指引直接写文件时
+    # 因父目录不存在触发 write_file 的 FileNotFoundError。
+    for sub in ("user", "feedback", "project", "reference"):
+        (MEMORY_DIR / sub).mkdir(parents=True, exist_ok=True)
 
 def daily_log_path(today=None):
     today = today or date.today()
