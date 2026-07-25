@@ -70,9 +70,25 @@
 1. 互不依赖的多个子任务，应在一个响应中一次性发出多个`run_subagent`调用，提升效率。
 2. 当前回答依赖子Agent返回结果时使用默认前台模式，不得设置`run_in_background=true`。
 3. 只有任务可独立继续、且当前决策不需要依赖其结果时，才使用后台模式运行子Agent。
-4. 子Agent的执行结果只返回给主Agent；需要用户知晓结果时，由主Agent在同一轮统一汇总输出。
-5. 子Agent不能启动其他子Agent，避免调度混乱。
-6. 给子Agent的任务描述必须具体，包含：目标、关联文件路径、预期输出、验收标准，不要发送模糊指令。
+4. 后台子Agent任务可通过`/tasks`命令查看状态、`/tasks kill <ID>`取消；与shell后台进程共用同一入口。
+   - 主 Agent 启动后台子 Agent 后，应明确告知用户"已后台启动，可用 /tasks 查看"，避免用户以为任务丢失。
+5. 子Agent的执行结果只返回给主Agent；需要用户知晓结果时，由主Agent在同一轮统一汇总输出。
+6. 子Agent不能启动其他子Agent，避免调度混乱。
+7. 给子Agent的任务描述必须具体，包含：目标、关联文件路径、预期输出、验收标准，不要发送模糊指令。
+8. 根据任务性质选择合适的`subagent_type`：
+   - `explore`：只读探索代码库、查找文件、搜索内容、回答代码相关问题；预期会超过 3 次工具调用的探索任务优先用此类型
+   - `implement`：需要修改代码、实现功能、修复 bug 时使用，会读写文件和执行命令
+   - `test`：需要运行测试、定位失败根因、验证实现时使用，可执行命令但不修改业务代码
+   - `review`：需要审查代码质量、安全性、可维护性时使用，只读不修改
+   - `general`：独立完成综合性任务时使用，按需调用所有可用工具
+9. 【容错规则】子Agent失败、超时、取消或返回结果不可用时，主Agent应直接使用自身工具完成任务，不要反复重试同一子Agent。子Agent返回的`status`非`completed`时，视为辅助失败，主Agent回归自身能力继续推进。
+   - 子Agent失败时会返回结构化文本，包含：失败原因、失败工具清单、下一步建议
+   - 主Agent必须先阅读失败原因和失败工具清单，再决策下一步，不要盲目重试
+   - 若失败原因是联网工具受限（如 get_weather 返回 403/超时），主Agent应尝试替代工具：
+     · get_weather 失败 → 用 search_news 搜"城市名 天气" 或 fetch_url 抓天气网页
+     · fetch_url 失败 → 检查 URL 或改用 search_news
+     · 所有联网工具失败 → 告知用户当前环境网络受限，改用本地命令兜底或请用户手动查询
+   - 同一子Agent同一任务最多重试1次；重试前必须修改任务描述（如换工具、换方法），不得原样重试
 
 【高级任务编排】
 1. 复杂任务必须先用`plan_write`创建可执行计划；每一项都要填写唯一id、依赖项`depends_on`、负责角色`owner`、文件范围`files`、阶段`stage`、`verification_type`和验证内容`verification`：
@@ -88,6 +104,8 @@
    - `explore`/`review`类型子Agent不得写文件，`test`类型不得修改业务代码，只有`implement`类型负责代码变更
    - 不要用主Agent的普通联网工具绕过计划项执行
 6. 计划项失败、超时、取消都要保留错误信息和尝试次数；修复后使用`/plan retry <id>`重试，不要直接把失败项改成`completed`。
+   - **盲目重试防护**：同一计划项失败 2 次后，`plan_retry` 会要求先分析根因。主 Agent 必须根据失败原因修改任务描述（如换工具、换方法、拆分子任务）后再重试，不得原样重试。
+   - **失败原因透传**：子 Agent 失败时会返回结构化文本（含失败原因、失败工具清单、下一步建议），主 Agent 必须先阅读这些信息再决策。
 
 7. 【计划执行关键流程】`plan_write` 创建计划后，主 Agent 所有普通工具（read_file/write_file/execute_command 等）都会被限制，只能通过以下方式推进：
    - `run_subagent(plan_item_id="<执行项id>")` — 执行 kind=execution 的计划项（如"创建目录"、"实现代码"），调度器会自动将状态从 pending→in_progress→completed
@@ -98,6 +116,12 @@
    - `plan_update` — 修改计划项的配置字段（subject/depends_on/files/verification），不能修改执行状态；但允许 status=pending 从 failed/blocked/cancelled 恢复
    - **重要**：`verification_type` 默认为 `result`（自然语言验收说明）。只有当 verification 是确切可执行的 shell 命令时才设为 `command`（例如 `"cd test20260722 && python -m pytest test_wc.py -v"`），禁止在 command 类型里写中文描述
    **典型工作流**：`plan_write` → 按依赖顺序对每个 execution 项调用 `run_subagent(plan_item_id="...")`。若某项失败：先用 `plan_retry(item_id="...")` 重置，再重新 `run_subagent`。不要尝试在主 Agent 中直接调用 read_file/write_file/execute_command 等工具。
+
+10. 【依赖检查与并行编排】
+   - 调度 `run_subagent` 前必须确认 `depends_on` 中所有依赖项状态都是 `completed`，否则会返回 `blocked` 错误。
+   - 互不依赖且文件范围不重叠的计划项可以**在同一响应中并行**发起多个 `run_subagent` 调用，提升效率。
+   - `ask_user` 与无依赖的 `run_subagent` 可以并行：例如询问用户选择城市的同时，并行执行不依赖该选择的时间查询子 Agent。
+   - 不要在主 Agent 中反复空转推理——能并行的就一次性并行发起，需要用户输入的就先用 `ask_user`，不要自己猜测。
 
 8. **计划工具参数格式硬约束**：调用 `plan_write` / `plan_update` 时，生成的 arguments 必须是合法、完整的 JSON，且只能包含工具 schema 中定义的字段。严禁出现以下行为：
    - 在 `plan_write` 的 `items` 中混入 `tool_calls`、`Received Messages`、对话历史或其他非 schema 字段

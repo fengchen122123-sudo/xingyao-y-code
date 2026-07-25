@@ -850,16 +850,21 @@ def _strip_media_and_merge(messages, model_name=None):
     keep_reasoning_fields = _supports_reasoning_fields(model_name)
     keep_media = _supports_vision(model_name)
 
-    # 仅保留最近一条含视觉输入（图片/视频）的消息，其余历史图片折叠为占位符
+    # 仅保留最近一条用户消息中的视觉输入（图片/视频），
+    # 更早的历史图片全部折叠为占位符，避免重复发送、浪费 Token。
     last_media_idx = -1
     if keep_media:
-        for idx, msg in enumerate(messages):
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if msg.get("role") != "user":
+                continue
             content = msg.get("content")
             if isinstance(content, list) and any(
                 isinstance(item, dict) and item.get("type") in ("image", "image_url")
                 for item in content
             ):
                 last_media_idx = idx
+            break
 
     folded_count = 0
     cleaned = []
@@ -1760,6 +1765,139 @@ def _execute_single_tool_call(
         "content": str(result)
     }
 
+def _call_vision_model_for_content(secondary, content, cancel_event=None, max_retries=3):
+    """调用支持视觉的副模型，传入完整 content（含图片），返回回复文本；失败返回空字符串。"""
+    kwargs = {
+        "model": secondary["litellm_model"],
+        "messages": [{"role": "user", "content": content}],
+        "api_key": secondary["api_key"],
+        "api_base": secondary["base_url"],
+        "max_tokens": 2048,
+        "timeout": API_REQUEST_TIMEOUT_SECONDS,
+    }
+
+    from concurrent.futures import ThreadPoolExecutor
+    warning_logger = logging.getLogger("py.warnings")
+
+    for attempt in range(max_retries):
+        try:
+            executor = ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(_litellm_completion, **kwargs)
+            try:
+                while not future.done():
+                    if cancel_event is not None and cancel_event.is_set():
+                        future.cancel()
+                        executor.shutdown(wait=False, cancel_futures=True)
+                        return ""
+                    try:
+                        future.result(timeout=0.1)
+                    except Exception:
+                        pass
+                exc = future.exception()
+                if exc is not None:
+                    raise exc
+                resp = future.result()
+            finally:
+                future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+
+            if resp and getattr(resp, "choices", None):
+                c = resp.choices[0].message.content
+                if c is not None:
+                    text = str(c).strip()
+                    if text:
+                        return text
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+        except Exception as e:
+            warning_logger.warning(
+                "副模型图片分析失败 (attempt %d/%d): %s %s",
+                attempt + 1, max_retries, type(e).__name__, e,
+            )
+            if attempt < max_retries - 1:
+                time.sleep(0.5 * (attempt + 1))
+                continue
+    return ""
+
+
+def _vision_fallback_text(user_text=""):
+    """图片分析失败时替换用的提示文本，明确让主模型直接回复用户。"""
+    hint = (
+        "[当前主模型和副模型均不支持图片输入或图片分析失败，无法处理图片。"
+        "请直接回复用户：无法分析图片，不要调用任何工具。]"
+    )
+    if user_text:
+        return f"{user_text}\\n\\n{hint}"
+    return hint
+
+
+def _describe_images_with_secondary(messages, main_model_name, event_callback=None, cancel_event=None):
+    """主模型不识图时，直接用副模型分析本轮最新图片并替换为文字描述/回答。"""
+    if _supports_vision(main_model_name):
+        return
+
+    # 只处理最近一条用户消息中的图片；历史图片即使还在上下文里也不再重复分析
+    target_msg = None
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            target_msg = msg
+            break
+    if target_msg is None:
+        return
+
+    content = target_msg.get("content")
+    if not isinstance(content, list):
+        return
+    image_items = [
+        item for item in content
+        if isinstance(item, dict) and item.get("type") in ("image", "image_url")
+    ]
+    if not image_items:
+        return
+    text_items = [
+        item for item in content
+        if isinstance(item, dict) and item.get("type") == "text"
+    ]
+
+    user_text = " ".join(t.get("text", "") for t in text_items).strip()
+
+    from core.model_manager import get_secondary_model, get_secondary_roles
+    roles = get_secondary_roles()
+    secondary = get_secondary_model() if roles.get("vision") else None
+
+    if not secondary or not _supports_vision(secondary["litellm_model"]):
+        _notify_event(event_callback, "notice", {
+            "message": "当前主模型不支持图片输入，且副模型无法分析图片，已将图片替换为占位说明。",
+        })
+        target_msg["content"] = _vision_fallback_text(user_text)
+        return
+
+    _notify_event(event_callback, "notice", {
+        "message": f"主模型不支持图片输入，正在使用副模型 {secondary['name']} 分析图片...",
+    })
+
+    # 把用户的问题也一起给副模型，让副模型直接作答
+    if user_text:
+        vision_prompt = f"请基于图片的视觉内容回答以下问题：{user_text}"
+    else:
+        vision_prompt = (
+            "请以视觉助手身份理解这张图片：先判断图片类型（如截图/海报/照片/图表/界面截图等），"
+            "再说明图片的主题、关键视觉元素和传达的信息；"
+            "如果图片包含文字，提炼文字核心要点而非逐字复制。"
+        )
+    sec_content = [{"type": "text", "text": vision_prompt}] + image_items
+
+    answer = _call_vision_model_for_content(secondary, sec_content, cancel_event=cancel_event)
+    if answer:
+        if user_text:
+            target_msg["content"] = f"{user_text}\\n\\n[图片分析结果]\\n{answer}"
+        else:
+            target_msg["content"] = f"[图片分析结果]\\n{answer}"
+    else:
+        target_msg["content"] = _vision_fallback_text(user_text)
+
+
 def _chat_with_model_generator(
     model_name,
     api_key,
@@ -1884,7 +2022,10 @@ def _chat_with_model_generator(
 
     if api_base:
         kwargs["api_base"] = api_base
-        
+
+    # 主模型不识图时，尝试用副模型先分析图片并替换为文字描述。
+    _describe_images_with_secondary(messages, model_name, event_callback=event_callback, cancel_event=cancel_event)
+
     # (pending_persistence and flush_persistence are now defined earlier)
 
     def raise_if_cancelled():
@@ -1906,19 +2047,7 @@ def _chat_with_model_generator(
                 try:
                     cleaned_messages, folded_count, keep_media = _strip_media_and_merge(messages, model_name)
                     kwargs["messages"] = _apply_cache_control(cleaned_messages, model_name)
-                    if folded_count and attempt == 0 and turn == 0:
-                        if keep_media:
-                            _notify_event(
-                                event_callback,
-                                "notice",
-                                {"message": f"为节省 Token，仅保留最近一条消息中的图片，更早的 {folded_count} 个媒体已折叠为占位符。"},
-                            )
-                        else:
-                            _notify_event(
-                                event_callback,
-                                "notice",
-                                {"message": f"当前模型不支持图片输入，已将 {folded_count} 个图片折叠为 [图片] 占位符。"},
-                            )
+                    # 历史图片折叠属于正常节省行为，不再向用户弹提示打扰
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
                     from concurrent.futures import ThreadPoolExecutor

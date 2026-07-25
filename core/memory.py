@@ -483,11 +483,13 @@ class MemoryManager:
                     self.conn.rollback()
                     raise
 
-    def get_all_sessions(self, workdir=None, source=None):
+    def get_all_sessions(self, workdir=None, source=None, include_empty=False):
         """返回会话列表（名称/消息数/归属目录/时间/来源）。
 
         workdir 为 None 时返回全部会话；指定路径时只返回该目录下创建的会话。
         source 参数用于过滤 GUI 或 TUI 专属会话。
+        include_empty=False 时过滤掉无任何消息的空会话（参考 kimicode 的 is_empty 策略），
+        避免会话列表被空会话污染；磁盘记录仍保留，不删除。
         """
         with self._lock:
             cursor = self.conn.cursor()
@@ -519,6 +521,9 @@ class MemoryManager:
                 row for row in rows
                 if not row[2] or _normalize_workdir(row[2]) == target
             ]
+        # 参考 kimicode：列表过滤空会话（msg_count=0），磁盘保留不删除
+        if not include_empty:
+            filtered = [row for row in filtered if row[1] > 0]
         return [
             {
                 "name": row[0],

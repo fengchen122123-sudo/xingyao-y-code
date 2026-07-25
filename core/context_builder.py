@@ -29,6 +29,7 @@ class RuntimeContext:
     active_plan: str = "无"
     memory: str = "无"
     skills: str = "无"
+    custom_subagents: str = "无"
 
 
 def build_stable_prompt(base_prompt: str) -> str:
@@ -59,7 +60,8 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
         f"当前时间：{runtime.current_time}\n"
         f"当前计划：{runtime.active_plan}\n"
         f"长期记忆：{runtime.memory}\n"
-        f"已启用技能：{runtime.skills}"
+        f"已启用技能：{runtime.skills}\n"
+        f"可用自定义子 Agent：{runtime.custom_subagents}"
     )
 
 

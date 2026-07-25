@@ -1,6 +1,11 @@
 {
   "active_model_id": "model_1",
   "secondary_model_id": null,
+  "secondary_model_roles": {
+    "vision": true,
+    "compression": true,
+    "subagent": true
+  },
   "image_compression": {
     "max_edge": 1024,
     "quality": 85,

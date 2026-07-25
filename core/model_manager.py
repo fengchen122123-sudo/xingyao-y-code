@@ -174,6 +174,38 @@ def get_secondary_model() -> dict | None:
     return None
 
 
+def set_secondary_model(model_id: str | None):
+    """设置/清除 secondary（便宜）模型 ID，用于子 Agent / 摘要 / 压缩等后台任务。"""
+    def _mutate(data):
+        if model_id:
+            data["secondary_model_id"] = model_id
+        else:
+            data.pop("secondary_model_id", None)
+    config.update_config(_mutate)
+
+
+def get_secondary_roles() -> dict:
+    """返回副模型用途开关：vision / compression / subagent，默认全部开启。"""
+    data = load_config()
+    roles = data.get("secondary_model_roles") or {}
+    return {
+        "vision": bool(roles.get("vision", True)),
+        "compression": bool(roles.get("compression", True)),
+        "subagent": bool(roles.get("subagent", True)),
+    }
+
+
+def set_secondary_roles(roles: dict):
+    """更新副模型用途开关，仅覆盖传入的 key。"""
+    def _mutate(data):
+        current = data.get("secondary_model_roles") or {}
+        for key in ("vision", "compression", "subagent"):
+            if key in roles:
+                current[key] = bool(roles[key])
+        data["secondary_model_roles"] = current
+    config.update_config(_mutate)
+
+
 def add_provider(name: str, base_url: str, api_key: str, protocol: str) -> str:
     """添加一个新厂商，返回新生成的 provider_id。"""
     pid = str(uuid.uuid4())[:8]
@@ -231,6 +263,9 @@ def delete_model(model_id: str):
                     provider["models"].remove(model)
             if not provider["models"]:
                 data["providers"].remove(provider)
+        # 如果删掉的是 secondary 模型，一并清除
+        if data.get("secondary_model_id") == model_id:
+            data.pop("secondary_model_id", None)
         # 如果删掉的是激活模型，自动将激活模型切到第一个剩余模型
         if data.get("active_model_id") == model_id:
             first_remaining = None

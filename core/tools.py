@@ -309,6 +309,17 @@ def write_file(file_path, content):
             )
 
     # 与 edit_file 对齐：先写同目录临时文件再 os.replace，避免写入中断留下半个文件
+    # 自动创建父目录：用户/Agent 可能直接写到不存在的子目录（如 memory/feedback/），
+    # 不自动创建会导致 mkstemp 抛 FileNotFoundError，让 Agent 陷入无效重试。
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return (
+            f"🚨 创建父目录失败：{resolved.parent}\n"
+            f"错误：{e}\n"
+            f"请检查路径是否正确，或权限是否充足。"
+        )
+
     fd, temp_name = tempfile.mkstemp(
         prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
     )
@@ -508,19 +519,27 @@ def search_news(query, num_results=5):
     try:
         with DDGS() as ddgs:
             results = list(ddgs.news(query, max_results=num_results))
-            
+
             if not results:
-                return "🔍 互联网上没有找到相关新闻，换个关键词试试？"
-                
+                # 用 🚨 前缀让 _tool_result_ok 识别为工具失败，进而触发子代理 _terminate("failed")
+                # 这样主代理会收到结构化失败文本（含 search_news 失败的兜底建议），
+                # 而不是误判为 completed 后返回一段"我没搜到"的文本。
+                # 语义上"无结果"对 LLM 而言就是任务失败，应走失败流程让主代理决策兜底。
+                return (
+                    f"🚨 新闻搜索无结果：查询「{query}」未返回任何新闻。"
+                    f"可能原因：关键词过窄、网络受限或 DuckDuckGo 服务波动。"
+                    f"建议主 Agent 改用 fetch_url 抓取已知新闻站点，或告知用户当前无法联网。"
+                )
+
             formatted_results = []
             for i, r in enumerate(results):
                 title = r.get('title', '无标题')
                 url = r.get('url', '')
                 body = r.get('body', '无摘要')
                 formatted_results.append(f"{i+1}. {title}\n   摘要: {body}\n   链接: {url}")
-                
+
             return "\n\n".join(formatted_results)
-            
+
     except Exception as e:
         return f"🚨 新闻搜索工具发生异常: {str(e)}"
 
@@ -590,14 +609,44 @@ def _get_fetch_url_allow_hosts():
         return set()
 
 
-def _check_ssrf_url(url):
-    """SSRF 防护：校验 URL 的主机名与解析后的 IP 是否为安全公网目标。
+def _get_fetch_url_strict_ssrf():
+    """读取 config.json 的 fetch_url_strict_ssrf 开关（默认 False）。
 
-    策略：
-    1. 主机名在显式白名单中 → 直接放行（不查 IP）
-    2. 主机名在元数据黑名单中 → 拒绝
-    3. DNS 解析所有 A/AAAA 记录，任一 IP 不安全 → 拒绝
-    4. 解析失败 → 拒绝（保守策略）
+    默认宽松模式（对齐 kimicode/opencode）：只拦截云元数据接口，
+    不做 DNS 解析后的 IP 校验。这样不会误杀 Clash/V2Ray 等代理工具的
+    fake-ip 段（如 198.18.0.0/15，被 Python ipaddress 判为 is_private）。
+
+    严格模式（True）：保留完整 IP 校验，适用于企业部署、多租户、
+    不信任用户输入的场景。
+    """
+    try:
+        import config
+        data = config._read_json_with_backup(config._CONFIG_FILE, default=None)
+        if not isinstance(data, dict):
+            return False
+        return bool(data.get("fetch_url_strict_ssrf", False))
+    except Exception:
+        return False
+
+
+def _check_ssrf_url(url):
+    """SSRF 防护：校验 URL 的主机名是否为安全目标。
+
+    双模式设计（参考 kimicode/opencode 的做法，它们默认不做 IP 校验）：
+
+    默认宽松模式（fetch_url_strict_ssrf=False，对齐 kimicode/opencode）：
+      1. 主机名在显式白名单中 → 放行
+      2. 主机名在云元数据黑名单中 → 拒绝（核心防护，始终保留）
+      3. 其他一律放行，不做 DNS 解析后的 IP 校验
+      这样不会误杀 Clash/V2Ray 等代理工具的 fake-ip 段（198.18.0.0/15 等），
+      也不会因为 CDN 双栈中一个 IPv6 解析到保留段就全拒。
+
+    严格模式（fetch_url_strict_ssrf=True）：
+      在默认模式基础上增加：
+      4. 如果 host 是 IP 字面量，校验是否公网
+      5. 否则 DNS 解析所有 A/AAAA 记录，任一非公网即拒绝
+      6. DNS 解析失败 → 拒绝（保守策略）
+      适用于企业部署、多租户、不信任用户输入的场景。
     """
     parsed = urlparse(str(url or "").strip())
     host = (parsed.hostname or "").lower()
@@ -605,17 +654,22 @@ def _check_ssrf_url(url):
     if not host:
         raise SSRFBlockedError("URL 缺少主机名")
 
-    # 1. 显式白名单优先
+    # 1. 显式白名单优先（两种模式都支持）
     allow_hosts = _get_fetch_url_allow_hosts()
     if host in allow_hosts:
         return
 
-    # 2. 元数据接口黑名单
+    # 2. 云元数据接口黑名单（始终拦截，这是 SSRF 防护的核心价值）
     if host in _METADATA_HOSTS:
         raise SSRFBlockedError(
             f"已阻止访问云元数据接口 {host}（防止 SSRF 泄露凭据）"
         )
 
+    # 宽松模式：到此为止，不再做 IP 校验
+    if not _get_fetch_url_strict_ssrf():
+        return
+
+    # ---- 以下为严格模式专属的 IP 校验 ----
     # 3. 如果 host 本身就是 IP 字面量，直接校验
     try:
         ipaddress.ip_address(host)
@@ -708,12 +762,30 @@ def fetch_url(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
             header += f" ({content_type})"
         return f"{header}\n{text}"
     except SSRFBlockedError as exc:
-        # SSRF 防护拦截：清晰提示用户被阻止的原因，并说明如何加白名单
-        return (
-            f"🚨 {exc}\n"
-            f"如需访问该内网/私有地址，请在 ~/.ycode/config.json 的 "
-            f"fetch_url_allow_hosts 数组中显式添加该主机名以 opt-in。"
-        )
+        # SSRF 防护拦截：清晰提示用户被阻止的原因，并说明如何加白名单或关闭严格模式
+        msg = str(exc)
+        hint_lines = []
+        # 云元数据接口拦截：只提示白名单（这类目标绝不应该放行，但保留 opt-in 通道）
+        if "元数据接口" in msg:
+            hint_lines.append(
+                "如确需访问，请在 ~/.ycode/config.json 的 fetch_url_allow_hosts "
+                "数组中显式添加该主机名以 opt-in。"
+            )
+        else:
+            # IP 类拦截：提示可能是代理软件 fake-ip，或关闭严格模式
+            hint_lines.append(
+                "可能原因：本机使用了 Clash/V2Ray 等代理软件的 fake-ip 模式，"
+                "DNS 解析到 198.18.x.x 等保留段被误判为内网。"
+            )
+            hint_lines.append(
+                "解决方案（任选其一）：\n"
+                "  1. 在 ~/.ycode/config.json 的 fetch_url_allow_hosts 数组中"
+                "添加该主机名以 opt-in（推荐，精确放行）\n"
+                "  2. 在 ~/.ycode/config.json 中设置 "
+                "\"fetch_url_strict_ssrf\": false 关闭严格 IP 校验"
+                "（默认已是 false，若曾开启请关闭）"
+            )
+        return f"🚨 {msg}\n" + "\n".join(hint_lines)
     except (HTTPError, URLError, TimeoutError, ValueError) as exc:
         return f"🚨 FetchURL 请求失败：{_format_http_error(exc)}"
     except Exception as exc:
@@ -1203,6 +1275,16 @@ def edit_file(file_path, target_content, replacement_content, replace_all=False)
 
     # 原子写入：先写同目录临时文件再 os.replace，避免写入中断留下半个文件；
     # 用 tempfile.mkstemp 生成唯一临时文件名，避免并发编辑同一文件时互相覆盖
+    # 自动创建父目录（防御性：与 write_file 对齐，虽然 edit_file 通常改的是已存在文件）
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return (
+            f"🚨 创建父目录失败：{resolved.parent}\n"
+            f"错误：{e}\n"
+            f"请检查路径是否正确，或权限是否充足。"
+        )
+
     fd, temp_name = tempfile.mkstemp(
         prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
     )
@@ -1304,6 +1386,7 @@ class SubagentTask:
     callback_invoked: bool = field(default=False, repr=False)
     model_config: tuple | None = field(default=None, repr=False)
     thread: threading.Thread | None = field(default=None, repr=False)
+    custom_config: dict | None = field(default=None, repr=False)
 
 
 SubagentRunner = Callable[[SubagentTask], str]
@@ -1319,8 +1402,13 @@ def _snapshot_model_config(prefer_secondary: bool = True) -> tuple | None:
     子代理优先使用 cheaper secondary 模型，降低后台任务额度消耗。
     """
     try:
-        from core.model_manager import get_secondary_model
-        secondary = get_secondary_model() if prefer_secondary else None
+        from core.model_manager import get_secondary_model, get_secondary_roles
+        roles = get_secondary_roles()
+        secondary = (
+            get_secondary_model()
+            if prefer_secondary and roles.get("subagent")
+            else None
+        )
         if secondary:
             return (
                 secondary["litellm_model"],
@@ -1351,6 +1439,7 @@ class SubagentManager:
         monotonic: Callable[[], float] = time.monotonic,
         wait_interval: float = 0.05,
         permission_waiting: Callable[[str], bool] | None = None,
+        on_terminal: Callable[[str, str, str, str], None] | None = None,
     ) -> None:
         if max_records < 1:
             raise ValueError("max_records must be positive")
@@ -1364,6 +1453,38 @@ class SubagentManager:
         self._permission_waiting = permission_waiting or _permission_owner_waiting
         self._tasks: dict[str, SubagentTask] = {}
         self._lock = threading.Lock()
+        # 后台子代理进入终态时的实时通知回调。
+        # 签名：on_terminal(task_id, status, description, error_or_result_summary)
+        # 仅对 run_in_background=True 的任务触发（前台任务在状态栏已有实时显示）。
+        # 回调内禁止直接操作 UI，必须通过 app.loop.call_soon_threadsafe 回到 UI 线程。
+        self._on_terminal = on_terminal
+
+    def set_on_terminal(self, callback: Callable[[str, str, str, str], None] | None) -> None:
+        """运行时注册/替换 on_terminal 回调（main.py 初始化 UI 后调用）。"""
+        self._on_terminal = callback
+
+    def _fire_terminal_notification(self, task: "SubagentTask") -> None:
+        """后台任务终态时触发实时通知回调（在 worker 线程中调用）。
+
+        回调内必须自己做线程切换（call_soon_threadsafe），不能直接操作 UI。
+        只通知后台任务；前台任务的状态栏已有实时显示，重复通知会刷屏。
+        """
+        if not task.run_in_background:
+            return
+        cb = self._on_terminal
+        if cb is None:
+            return
+        try:
+            # 失败时给 error，成功时给 result 摘要，方便用户快速判断
+            if task.status == "completed":
+                summary = (task.result or "")[:200]
+            else:
+                summary = task.error or ""
+            cb(task.task_id, task.status, task.description, summary)
+        except BaseException:
+            # 通知失败不能影响子代理主流程
+            pass
+
 
     def run(
         self,
@@ -1392,16 +1513,30 @@ class SubagentManager:
         if model_config is None and self._uses_default_runner:
             model_config = _snapshot_model_config()
 
+        # 加载自定义子 agent 配置：subagent_type 非内置 5 种时尝试从注册中心获取
+        # 容错：加载失败回退到 None（_run_default_subagent 会按内置 general 处理）
+        custom_config = None
+        normalized_type = str(subagent_type or "general")
+        if normalized_type and normalized_type not in {
+            "explore", "implement", "test", "review", "general"
+        }:
+            try:
+                from core.subagent_registry import get_custom_subagent
+                custom_config = get_custom_subagent(normalized_type)
+            except Exception:
+                custom_config = None
+
         task = SubagentTask(
             task_id=f"subagent-{uuid.uuid4().hex[:8]}",
             parent_session=str(parent_session or ""),
             parent_turn_id=str(parent_turn_id or ""),
             description=description,
-            subagent_type=str(subagent_type or "general"),
+            subagent_type=normalized_type,
             plan_item_id=str(plan_item_id or ""),
             run_in_background=bool(run_in_background),
             terminal_callback=terminal_callback,
             model_config=model_config,
+            custom_config=custom_config,
         )
         with self._lock:
             self._make_capacity_locked()
@@ -1570,7 +1705,9 @@ class SubagentManager:
             task.finished_at = time.time()
             self._record_stage_locked(task, "completed")
             task.done_event.set()
-            return True
+        # 后台任务终态实时通知（worker 线程内，回调自行切回 UI 线程）
+        self._fire_terminal_notification(task)
+        return True
 
     def _terminate(
         self,
@@ -1618,7 +1755,10 @@ class SubagentManager:
         if status in {"timed_out", "cancelled"}:
             from core.permission_broker import permission_broker
             permission_broker.cancel_owner(task_id)
+        # 后台任务终态实时通知（worker 线程内，回调自行切回 UI 线程）
+        self._fire_terminal_notification(task)
         return True
+
 
     def _foreground_result(self, task_id: str) -> str:
         with self._lock:
@@ -1634,14 +1774,70 @@ class SubagentManager:
                         + f"\n\n... [子代理结果已截断，省略 {omitted} 字符]"
                     )
                 return result
-            return json.dumps({
-                "task_id": task.task_id,
-                "status": task.status,
-                "error": task.error,
-                "latest_stage": task.stage,
-                "execution_elapsed": round(task.execution_elapsed, 3),
-                "approval_wait_elapsed": round(task.approval_wait_elapsed, 3),
-            }, ensure_ascii=False)
+            # 失败/超时/取消：返回结构化文本，让主 agent 能快速理解决策下一步
+            # 不用 JSON 是因为终端环境可读性差，主 agent 直接读文本即可
+            return self._format_failure_text(task)
+
+    def _format_failure_text(self, task: SubagentTask) -> str:
+        """格式化子代理失败结果为结构化文本，供主 agent 快速决策。
+
+        包含：状态、失败原因、失败的工具清单、耗时、下一步建议。
+        主 agent 看到后应直接用自身工具兜底，不要盲目重试同一子 agent。
+        """
+        status_label = {
+            "failed": "失败",
+            "timed_out": "超时",
+            "cancelled": "已取消",
+        }.get(task.status, task.status)
+
+        # 失败工具清单（从 tool_errors 收集）
+        tool_errors = dict(task.tool_errors) if task.tool_errors else {}
+        tool_lines = []
+        if tool_errors:
+            for name, detail in tool_errors.items():
+                # 截断过长的单工具错误详情，避免一个工具的堆栈淹没其他信息
+                detail_text = str(detail)
+                if len(detail_text) > 200:
+                    detail_text = detail_text[:200] + "..."
+                tool_lines.append(f"  - {name}: {detail_text}")
+
+        # 错误主因
+        error_main = str(task.error or "").strip()
+        if not error_main and not tool_lines:
+            error_main = "无具体错误信息"
+
+        # 下一步建议（根据失败类型给不同指引）
+        hints = []
+        if task.status == "timed_out":
+            hints.append("子代理超时，主 Agent 应直接用自身工具完成该任务，或拆分为更小的子任务")
+        elif task.status == "cancelled":
+            hints.append("子代理被取消（可能是父轮次结束），如仍需执行请重新发起")
+        elif tool_lines:
+            hints.append("子代理工具调用失败，主 Agent 应分析失败工具的原因并用自身工具兜底")
+            # 针对常见联网工具失败给具体建议
+            failed_tool_names = set(tool_errors.keys())
+            if "get_weather" in failed_tool_names:
+                hints.append("  · get_weather 失败时可尝试 search_news（搜'城市 天气'）或 fetch_url 抓取天气网页")
+            if "fetch_url" in failed_tool_names:
+                hints.append("  · fetch_url 失败时检查 URL 是否可达，或改用 search_news 搜索相关信息")
+            if "search_news" in failed_tool_names:
+                hints.append("  · search_news 失败时可能网络受限，告知用户当前环境无法联网")
+        else:
+            hints.append("子代理执行失败，主 Agent 应直接用自身工具完成任务，不要反复重试同一子代理")
+
+        parts = [
+            f"子代理执行{status_label}（task_id={task.task_id}）",
+            f"角色: {task.subagent_type}",
+            f"失败原因: {error_main}",
+        ]
+        if tool_lines:
+            parts.append("失败工具清单:")
+            parts.extend(tool_lines)
+        parts.append(f"耗时: 执行 {round(task.execution_elapsed, 1)}s / 等待审批 {round(task.approval_wait_elapsed, 1)}s")
+        parts.append("下一步建议:")
+        for h in hints:
+            parts.append(f"  {h}")
+        return "\n".join(parts)
 
     def snapshot(self) -> list[SubagentTaskSnapshot]:
         with self._lock:
@@ -1684,6 +1880,20 @@ class SubagentManager:
                 task.status not in _SUBAGENT_TERMINAL_STATUSES
                 for task in self._tasks.values()
             )
+
+    def cancel(self, task_id: str, reason: str = "user requested") -> bool:
+        """取消指定子代理任务（协作式取消，非强制 kill）。
+
+        用于 /tasks kill <ID> 命令，让用户可以终止卡住的后台子代理。
+        与 cancel_foreground 不同，这里按精确 task_id 取消单个任务，
+        不区分前台/后台，只对非终态任务生效。
+        """
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None or task.status in _SUBAGENT_TERMINAL_STATUSES:
+                return False
+        return self._terminate(task_id, "cancelled", reason)
+
 
     def wait_for_idle(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -1784,27 +1994,100 @@ class SubagentManager:
     def _run_default_subagent(self, task: SubagentTask) -> str:
         from core.llm import chat_with_model_events
 
-        if task.model_config is not None:
-            # 使用启动时快照的模型配置，避免运行途中切换模型/密钥
-            current_model, current_key, current_url = task.model_config
+        custom = task.custom_config
+        # 决定使用的模型：
+        # - 自定义子 agent model=secondary → 副模型（失败回退 fallback）
+        # - 自定义子 agent model=inherit → 主模型（失败回退 fallback）
+        # - 其他 → task.model_config（启动时快照）或 main 全局
+        def _fallback_model():
+            if task.model_config is not None:
+                return task.model_config
+            try:
+                import main
+                return (main.current_model, main.current_key, main.current_url)
+            except Exception:
+                return (None, None, None)
+
+        model_pref = custom.get("model") if custom else None
+        if model_pref == "secondary":
+            try:
+                from core.model_manager import get_secondary_model
+                secondary = get_secondary_model()
+                if secondary:
+                    current_model = secondary["litellm_model"]
+                    current_key = secondary["api_key"]
+                    current_url = secondary["base_url"]
+                else:
+                    current_model, current_key, current_url = _fallback_model()
+            except Exception:
+                current_model, current_key, current_url = _fallback_model()
+        elif model_pref == "inherit":
+            try:
+                import main
+                current_model = main.current_model
+                current_key = main.current_key
+                current_url = main.current_url
+            except Exception:
+                current_model, current_key, current_url = _fallback_model()
         else:
-            # 兼容直接构造 SubagentTask 的旧用法：回退到读取 main 全局
-            import main
-            current_model, current_key, current_url = (
-                main.current_model,
-                main.current_key,
-                main.current_url,
-            )
+            current_model, current_key, current_url = _fallback_model()
 
         role_instructions = {
-            "explore": "只读探索代码和资料，不修改文件，不执行有副作用命令。",
-            "implement": "负责按任务修改代码，修改前先读取相关文件，完成后说明改动和验证。",
-            "test": "负责运行针对性测试和检查，优先定位失败根因，不修改业务代码。",
-            "review": "只读审查实现和测试结果，列出风险和未覆盖项，不修改文件。",
-            "general": "独立完成任务，按需使用可用工具。",
+            "explore": (
+                "只读探索代码和资料，不修改文件，不执行有副作用命令。"
+                "尽可能并行发起多个 search_code/glob_files/read_file 调用以最大化速度："
+                "用 glob_files 按模式定位文件，用 search_code 搜索内容，用 read_file 读取已知路径。"
+                "【工具失败降级】任一工具失败时优先尝试同类替代工具，不要直接返回失败："
+                "  · get_weather 失败（403/超时/SSRF）→ search_news 搜'城市名 天气'或 fetch_url 抓天气网页"
+                "  · fetch_url 失败 → 检查 URL 拼写，或改用 search_news 搜索相同关键词"
+                "  · search_news 失败 → 可能网络受限，明确告知主 Agent 当前环境无法联网"
+                "  · search_code 无结果 → 改用 glob_files 按文件名模式查找，或扩大搜索范围"
+                "  · read_file 路径不存在 → 先用 list_directory 或 glob_files 定位正确路径"
+                "【本地优先】获取系统时间/日期/主机信息等本地可完成的任务，优先用 execute_command "
+                "执行本地命令（如 PowerShell 的 Get-Date），不要依赖联网工具。"
+                "所有替代尝试都失败后，明确说明失败原因和已尝试的替代方案，由主 Agent 决策下一步。"
+            ),
+            "implement": (
+                "负责按任务修改代码，修改前先读取相关文件，完成后说明改动和验证。"
+                "【工具失败降级】命令执行失败时先分析错误输出，调整命令或参数后重试；"
+                "edit_file 匹配失败时先用 read_file 重新读取目标文件确认当前内容，再重试。"
+            ),
+            "test": (
+                "负责运行针对性测试和检查，优先定位失败根因，不修改业务代码。"
+                "【工具失败降级】测试命令失败时先分析 stderr 定位失败用例，"
+                "改用更细粒度的命令（如单测）重试，避免一次跑全量测试。"
+            ),
+            "review": (
+                "只读审查实现和测试结果，列出风险和未覆盖项，不修改文件。"
+                "【工具失败降级】read_file/search_code 失败时参考 explore 角色的降级策略。"
+            ),
+            "general": (
+                "独立完成任务，按需使用可用工具。"
+                "【工具失败降级】任一工具失败时优先尝试同类替代工具，"
+                "所有替代都失败后明确说明原因，由主 Agent 决策下一步。"
+            ),
         }
-        role = task.subagent_type if task.subagent_type in role_instructions else "general"
-        allowed_tools = {
+        # 各角色何时使用的简要说明，注入主 Agent 系统提示词用于自动委派
+        role_when_to_use = {
+            "explore": "只读探索代码库、查找文件、搜索内容、回答代码相关问题时使用，预期会超过 3 次工具调用的探索任务优先用此类型。",
+            "implement": "需要修改代码、实现功能、修复 bug 时使用，会读写文件和执行命令。",
+            "test": "需要运行测试、定位失败根因、验证实现时使用，可执行命令但不修改业务代码。",
+            "review": "需要审查代码质量、安全性、可维护性时使用，只读不修改。",
+            "general": "独立完成综合性任务时使用，按需调用所有可用工具。",
+        }
+        if custom:
+            # 自定义子 agent：用 base_type 决定 role，用 system_prompt 覆盖提示词
+            role = custom.get("base_type", "general")
+            if role not in role_instructions:
+                role = "general"
+            custom_system_prompt = custom.get("system_prompt") or ""
+            custom_allowed_tools = custom.get("allowed_tools")  # None 或 set
+        else:
+            role = task.subagent_type if task.subagent_type in role_instructions else "general"
+            custom_system_prompt = ""
+            custom_allowed_tools = None
+
+        default_allowed_tools = {
             "explore": {
                 "read_file", "list_directory", "search_code", "glob_files",
                 "search_news", "fetch_url", "get_weather",
@@ -1823,13 +2106,19 @@ class SubagentManager:
                 "search_news", "fetch_url", "get_weather",
             },
             "general": None,
-        }[role]
+        }
+        allowed_tools = (
+            custom_allowed_tools if custom_allowed_tools is not None
+            else default_allowed_tools[role]
+        )
+        # 自定义子 agent 的系统提示词优先；未配置时用内置 role_instructions
+        instruction_text = custom_system_prompt if custom_system_prompt else role_instructions[role]
         messages = [
             {
                 "role": "system",
                 "content": (
                     f"你是星瑶子代理({task.task_id})，角色是 {role}。"
-                    f"{role_instructions[role]}"
+                    f"{instruction_text}"
                     "你只执行主 Agent 已分配的单一子任务，不得拆解、创建或修改主任务计划；"
                     "如实使用可用工具；结束时只输出供主 Agent 汇总的公开结论。"
                     "所有输出必须使用中文，包括过程说明与最终结论；"
@@ -1894,7 +2183,65 @@ class SubagentManager:
                     else:
                         tool_errors.pop(name, None)
         task.tool_errors.update(tool_errors)
-        return "".join(answer)
+        result_text = "".join(answer)
+
+        # summary_continuation：结果过短时追加要求展开，避免子代理敷衍
+        # 参考 Kimi Code 的 SUMMARY_MIN_LENGTH 机制
+        if 0 < len(result_text.strip()) < 200 and not task.cancel_event.is_set():
+            continuation_prompt = (
+                "你之前的回答过于简短。请提供更完整的总结，包含：\n"
+                "1. 具体的技术细节和实现要点\n"
+                "2. 关键发现与分析结论\n"
+                "3. 主 Agent 需要知晓的所有重要信息\n"
+                "请直接输出完整内容，不要重复之前的简短回答。"
+            )
+            cont_messages = [
+                {
+                    "role": "system",
+                    "content": (
+                        f"你是星瑶子代理({task.task_id})，角色是 {role}。"
+                        f"{instruction_text}"
+                        "你只执行主 Agent 已分配的单一子任务；"
+                        "结束时只输出供主 Agent 汇总的公开结论。"
+                        "所有输出必须使用中文。"
+                    ),
+                },
+                {"role": "user", "content": f"请完成以下子任务：\n{task.description}"},
+                {"role": "assistant", "content": result_text},
+                {"role": "user", "content": continuation_prompt},
+            ]
+            self._record_stage(task.task_id, "summarizing")
+            try:
+                cont_events = chat_with_model_events(
+                    current_model,
+                    current_key,
+                    cont_messages,
+                    current_url,
+                    persist=False,
+                    turn_id=task.task_id,
+                    cancel_event=task.cancel_event,
+                    allow_subagents=False,
+                    allowed_tools=None,  # 总结阶段不需要工具
+                    consume_background_notifications=False,
+                    parent_session=None,
+                    parent_turn_id=None,
+                    permission_owner=task.task_id,
+                    permission_source=f"子代理总结：{task.description[:40]}",
+                )
+                cont_answer = []
+                with _subagent_depth_scope():
+                    for event in cont_events:
+                        if event.kind == "assistant_delta":
+                            cont_answer.append(str(event.payload.get("text", "")))
+                continued = "".join(cont_answer).strip()
+                # 只有重试结果更长时才采用，避免重试反而更差
+                if len(continued) > len(result_text.strip()):
+                    result_text = continued
+            except Exception:
+                # 总结续写失败不影响主流程，返回原始结果
+                pass
+
+        return result_text
 
 
 subagent_manager = SubagentManager()
@@ -1911,7 +2258,13 @@ def run_subagent(
     plan_item_id="",
     event_callback=None,
 ):
-    """Run one isolated child agent and return its foreground result or background ID."""
+    """运行一个隔离的子代理，返回前台结果或后台任务 ID。
+
+    subagent_type 可选：
+    - 内置类型：explore（只读探索）/ implement（修改代码）/ test（运行测试）/ review（只读审查）/ general（综合）
+    - 自定义类型：在 ~/.ycode/agents/*.md 或 <cwd>/.ycode/agents/*.md 中定义的子 agent name
+      自定义子 agent 加载失败时自动回退为 general 类型执行，不影响主流程。
+    """
     # 子代理深度硬限制：防止无限递归（参考 OpenCode limit subagent nesting depth）
     # 主代理线程 depth=0，子代理 depth=1，孙代理 depth=2，重孙 depth=3 → 超限拒绝
     current_depth = _get_current_subagent_depth()
