@@ -61,8 +61,8 @@ def create_worktree(branch, path, base_branch=None, cwd=None):
     if not branch or not branch.replace('-', '').replace('_', '').replace('/', '').replace('.', '').isalnum():
         return f"🚨 分支名只能包含字母、数字、下划线、连字符、斜杠、点号：{branch!r}"
 
-    # 解析 worktree 路径（相对路径相对 cwd）
-    abs_path = Path(path).resolve()
+    # 解析 worktree 路径（相对路径应相对 cwd，而非进程当前目录）
+    abs_path = Path(cwd or os.getcwd(), path).resolve()
     if abs_path.exists():
         return f"🚨 目标路径已存在: {abs_path}"
 
@@ -139,7 +139,7 @@ def remove_worktree(path, force=False, cwd=None):
     if not _is_git_repo(cwd):
         return "🚨 当前目录不是 git 仓库"
 
-    abs_path = Path(path).resolve()
+    abs_path = Path(cwd or os.getcwd(), path).resolve()
     args = ['worktree', 'remove']
     if force:
         args.append('--force')

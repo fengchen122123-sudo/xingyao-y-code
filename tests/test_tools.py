@@ -54,6 +54,8 @@ def test_fetch_url_uses_local_http_client_and_returns_response(monkeypatch):
         return _FakeHTTPResponse('{"ok": true}')
 
     monkeypatch.setattr("core.tools.urlopen", fake_urlopen)
+    # 测试关注点为本机 HTTP 客户端调用与响应解析，SSRF 防护独立测试
+    monkeypatch.setattr("core.tools._check_ssrf_url", lambda url: None)
 
     result = fetch_url("https://example.com/data")
 
@@ -108,6 +110,8 @@ def test_get_weather_uses_geocoded_open_meteo_payload(monkeypatch):
         return _FakeHTTPResponse(json.dumps(payload))
 
     monkeypatch.setattr("core.tools.urlopen", fake_urlopen)
+    # 测试关注点为天气 API 调用与数据解析，SSRF 防护独立测试
+    monkeypatch.setattr("core.tools._check_ssrf_url", lambda url: None)
 
     result = get_weather("北京")
 

@@ -111,6 +111,58 @@ pending_action = None   # 待处理的主线程操作：目前可能的值有 "o
 # 计划项状态提示去重：避免同一个计划项反复失败/重试时刷屏
 _last_printed_plan_state: dict[str, str] = {}
 
+# ---------------------------------------------------------------------------
+# 注册 TUI 运行时上下文（让 core/llm.py 通过 app_context 访问，而非直接 import main）
+# ---------------------------------------------------------------------------
+import core.app_context as _app_ctx
+
+class _TuiContext:
+    """TUI 运行时上下文适配器，代理到 main 模块的全局变量。"""
+
+    @property
+    def app_instance(self):
+        return app_instance
+
+    @property
+    def permission_mode(self) -> str:
+        return current_permission_mode
+
+    @property
+    def plan_approved_this_turn(self) -> bool:
+        return plan_approved_this_turn
+
+    @plan_approved_this_turn.setter
+    def plan_approved_this_turn(self, val: bool):
+        global plan_approved_this_turn
+        plan_approved_this_turn = val
+
+    @property
+    def task_status(self) -> str:
+        return task_status
+
+    @task_status.setter
+    def task_status(self, val: str):
+        global task_status
+        task_status = val
+
+    @property
+    def current_session(self) -> str:
+        return current_session
+
+    @property
+    def manager(self):
+        return manager
+
+    @property
+    def permission_callback(self):
+        return None  # TUI 使用 prompt_toolkit broker，不需要 GUI 回调
+
+    def invalidate_ui(self):
+        if app_instance and app_instance.loop:
+            app_instance.loop.call_soon_threadsafe(app_instance.invalidate)
+
+_app_ctx.register(_TuiContext())
+
 
 # 主题配色展示元数据（/theme list 与无参数帮助共用）
 THEME_DESCS = {
@@ -1246,18 +1298,29 @@ def handle_slash_command(command_text):
         from core.memory import get_undo_state
         from core.tools import write_file
 
-        state = get_undo_state()
+        state = get_undo_state(current_session)
         file_path = state.get("file_path")
         old_content = state.get("old_content")
 
         if not file_path:
-            print_formatted_text(HTML("<ansired>⚠️ 没有可以撤销的操作记录。</ansired>"))
+            print_formatted_text(HTML("<ansired>⚠️ 当前会话没有可以撤销的操作记录。</ansired>"))
         elif old_content is None:
             # old_content 为 None 表示缺少原始内容快照，直接写 None 会损坏文件
             print_formatted_text(HTML("<ansired>⚠️ 撤销失败：缺少文件原始内容记录，无法安全恢复。</ansired>"))
         else:
             try:
-                if old_content == "": # 代表原来没有这个文件，大模型是新建的
+                # 删除新建文件是高危操作：要求显式确认，避免跨会话/误操作导致用户数据丢失
+                will_delete = old_content == ""
+                if will_delete:
+                    confirm = command_text.strip().split()
+                    if len(confirm) < 2 or confirm[1].lower() not in ("y", "yes", "--force"):
+                        print_formatted_text(
+                            HTML(f"<ansiyellow>⚠️ 该操作将删除星瑶新建的文件 {_esc(file_path)}，"
+                                 f"请在命令后追加 y/yes/--force 确认，例如：/undo y</ansiyellow>")
+                        )
+                        return
+
+                if will_delete:
                     if os.path.exists(file_path):
                         os.remove(file_path)
                     print_formatted_text(HTML(f"<ansigreen>↩️ 撤销成功！已删除星瑶新建的文件: {_esc(file_path)}</ansigreen>"))
@@ -1272,7 +1335,7 @@ def handle_slash_command(command_text):
 
                 # 清空状态防止重复撤销
                 from core.memory import set_undo_state
-                set_undo_state(None, None)
+                set_undo_state(None, None, session_name=current_session)
             except Exception as e:
                 print_formatted_text(HTML(f"<ansired>⚠️ 撤销失败: {_esc(e)}</ansired>"))
 
@@ -1564,7 +1627,12 @@ def _make_input_app():
                     input_area.text = ""
                     safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                     print_formatted_text(HTML(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}"))
-                    handle_slash_command(text)
+                    try:
+                        handle_slash_command(text)
+                    except Exception as e:
+                        print_formatted_text(
+                            HTML(f"\n<ansired>⚠️ 命令执行出错：{_esc(str(e))}</ansired>\n")
+                        )
             else:
                 was_queued = is_thinking
                 safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
@@ -1659,9 +1727,8 @@ def _make_input_app():
 
     def get_status():
         """底部状态栏内容：极简无底色，带 Token 统计与后台任务监控"""
-        # 1. 提取短模型名（去掉前缀 openai/ 等）
-        active_info = get_active_model()
-        model_display = active_info["name"] if active_info else "未激活模型"
+        # 1. 提取短模型名（使用内存缓存，避免每次渲染都读盘解析 config.json）
+        model_display = current_model_name or "未激活模型"
 
         # 2. 计算 Token 消耗与缓存命中（分离概念）；与 worker 并发读写，必须持锁
         with token_usage_lock:
@@ -2123,13 +2190,21 @@ def _background_worker():
             from config import SYSTEM_PROMPT_FILE
             prompt_path = SYSTEM_PROMPT_FILE
             system_prompt = ""
-            if os.path.exists(prompt_path):
-                with open(prompt_path, "r", encoding="utf-8") as f:
-                    system_prompt = f.read().strip()
+            try:
+                if os.path.exists(prompt_path):
+                    with open(prompt_path, "r", encoding="utf-8") as f:
+                        system_prompt = f.read().strip()
+                if not system_prompt:
+                    fallback_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
+                    if os.path.exists(fallback_path):
+                        with open(fallback_path, "r", encoding="utf-8") as f:
+                            system_prompt = f.read().strip()
+            except Exception as e:
+                _logger.warning("读取 system prompt 失败: %s", e)
+                system_prompt = ""
             if not system_prompt:
-                fallback_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
-                with open(fallback_path, "r", encoding="utf-8") as f:
-                    system_prompt = f.read().strip()
+                # 最后一道兜底，确保任何情况下都不会因为提示词文件缺失而整轮失败
+                system_prompt = "你叫星瑶，是一位顶尖的代码编程助手。"
 
             from core.skills import get_active_skills_catalog
             import core.memory_kairos as memory_kairos
@@ -2171,6 +2246,9 @@ def _background_worker():
             # 主代理线程标记当前会话，使子代理可以共享工具级缓存
             from core import tool_cache as _tool_cache
             _tool_cache.set_current_session(task_session)
+            # 将 undo 状态绑定到当前会话，防止切会话后 /undo 误操作其他会话的文件
+            from core.memory import set_undo_session
+            set_undo_session(task_session)
 
             # 会话级检查点：本轮所有 write_file/edit_file 的旧内容会被自动记录
             # 用户可通过 /checkpoint restore <turn_id> 整体回滚（含文件 + 对话上下文）
@@ -2242,8 +2320,16 @@ def _background_worker():
                 # 这两个全局的设计意图就是"worker 建立、worker 清理、UI 只读"。
                 active_cancel_event = None
                 active_turn_id = None
+                # 同样由 worker 线程直接清理 UI 状态变量，避免 App 重启间隙 schedule_ui 丢弃
+                # 导致旋转动画/executing 状态永久残留。
+                global is_thinking, task_status
+                is_thinking = False
+                task_status = "idle"
+                _clear_active_thinking()
                 from core import tool_cache as _tool_cache
+                from core.memory import clear_undo_session
                 _tool_cache.set_current_session(None)
+                clear_undo_session()
 
             if not turn_interrupted:
                 # 检查是否需要自动重命名会话（当且仅当是新建的默认 hex 会话）
@@ -2295,11 +2381,16 @@ def run_headless(prompt, session_name=None) -> int:
 
     # 1. 初始化运行时（与 run_cli 相同的副作用集中执行）
     bind_default_plan_session(current_session)
-    # headless 模式：用简单的 prompt handler 自动拒绝所有权限请求
-    # （不在 TUI 中与用户交互，安全起见拒绝所有副作用操作）
+    # headless 模式：不在 TUI 中与用户交互，自动拒绝所有权限请求，避免 worker 永久挂起
+    def _deny_permission_request(request):
+        try:
+            permission_broker.resolve(request.request_id, 1)  # 1 = No, 拒绝
+        except Exception:
+            pass
+
     permission_broker.set_prompt_handlers(
-        lambda req: None,  # 不激活 UI 提示
-        lambda: None,       # 不需要 dismiss
+        _deny_permission_request,  # 自动拒绝
+        lambda: None,              # 不需要 dismiss
     )
 
     set_terminal_title("Y-code (headless)")
@@ -2349,6 +2440,26 @@ def run_headless(prompt, session_name=None) -> int:
             time.sleep(0.1)
         # 给事件队列一点时间排空
         time.sleep(0.5)
+
+        # headless 下不经过 TUI 渲染，需要从数据库取出最终回复并打印到 stdout
+        try:
+            history = manager.get_history(current_session)
+            assistant_messages = [
+                msg for msg in history
+                if isinstance(msg, dict) and msg.get("role") == "assistant"
+            ]
+            if assistant_messages:
+                last = assistant_messages[-1]
+                content = last.get("content", "")
+                if isinstance(content, list):
+                    content = "\n".join(
+                        str(item.get("text", item)) for item in content
+                    )
+                if isinstance(content, str) and content.strip():
+                    print("\n" + content.strip())
+        except Exception as e:
+            print(f"\n[headless 获取回复失败: {e}]", file=sys.stderr)
+            return 1
     except KeyboardInterrupt:
         print("\n[已取消]", file=sys.stderr)
         return 130

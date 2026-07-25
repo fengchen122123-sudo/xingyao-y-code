@@ -32,14 +32,26 @@ def _try_parse_json(text):
     except (ValueError, TypeError):
         return None, False
 
-# 全局撤销状态（单文件 undo 栈，向后兼容保留）
+# 按会话隔离的撤销状态。
 # _undo_state_lock 保护并发写：多 worker 线程（含并行工具批次）同时写文件时
-# 防止 LAST_UNDO_STATE 被竞态覆盖导致 /undo 回滚到错误文件/错误内容
+# 防止 LAST_UNDO_STATE 被竞态覆盖导致 /undo 回滚到错误文件/错误内容。
+# 每个会话独立维护自己的最后一次 undo 记录，避免切会话后误删/误改其他会话的文件。
 _undo_state_lock = threading.Lock()
-LAST_UNDO_STATE = {
-    "file_path": None,
-    "old_content": None
-}
+_undo_tls = threading.local()
+LAST_UNDO_STATE: dict[str, dict] = {}
+
+
+def set_undo_session(session_name: str | None) -> None:
+    """标记当前线程的 undo 会话，供 set_undo_state / get_undo_state 隐式使用。"""
+    _undo_tls.session_name = session_name
+
+
+def clear_undo_session() -> None:
+    _undo_tls.session_name = None
+
+
+def _current_undo_session(session_name: str | None = None) -> str:
+    return session_name or getattr(_undo_tls, "session_name", None) or "_global_"
 
 # 会话级检查点缓存（按 session_name → list of checkpoint dict）
 # 每轮对话开始前自动打一个 checkpoint，记录本轮所有被修改文件的旧内容
@@ -49,20 +61,21 @@ _session_checkpoints_lock = threading.Lock()
 _session_checkpoints: dict[str, list[dict]] = {}
 
 
-def set_undo_state(file_path, old_content):
+def set_undo_state(file_path, old_content, session_name=None):
+    session = _current_undo_session(session_name)
     with _undo_state_lock:
-        LAST_UNDO_STATE["file_path"] = file_path
-        LAST_UNDO_STATE["old_content"] = old_content
+        LAST_UNDO_STATE[session] = {"file_path": file_path, "old_content": old_content}
     # 同步追加到当前会话的检查点文件快照
     # （由 worker 线程在 begin_turn 时已建好当前 turn 的 checkpoint 上下文）
     if file_path and old_content is not None:
         record_file_snapshot_for_current_turn(file_path, old_content)
 
 
-def get_undo_state():
+def get_undo_state(session_name=None):
+    session = _current_undo_session(session_name)
     with _undo_state_lock:
         # 返回副本，避免调用方在无锁状态下读写共享 dict 产生竞态
-        return dict(LAST_UNDO_STATE)
+        return dict(LAST_UNDO_STATE.get(session, {"file_path": None, "old_content": None}))
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +253,8 @@ class MemoryManager:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN created_at TEXT")
                 if "updated_at" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
+                if "source" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'GUI'")
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -316,8 +331,8 @@ class MemoryManager:
                 else:
                     target_wdir = self.workdir
                     cursor.execute('''
-                        INSERT INTO sessions (session_name, workdir, created_at, updated_at)
-                        VALUES (?, ?, ?, ?)
+                        INSERT INTO sessions (session_name, workdir, created_at, updated_at, source)
+                        VALUES (?, ?, ?, ?, 'GUI')
                     ''', (session_name, target_wdir, now, now))
                     session_id = cursor.lastrowid
                 cursor.executemany('''
@@ -334,17 +349,21 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
-    def create_session_explicit(self, session_name, workdir=None):
+    def create_session_explicit(self, session_name, workdir=None, source="GUI"):
         """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。"""
         wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
         with self._lock:
             cursor = self.conn.cursor()
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute('''
-                INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at)
-                VALUES (?, ?, ?, ?)
-            ''', (session_name, wdir, now, now))
-            self.conn.commit()
+            try:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (session_name, wdir, now, now, source))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
 
     def get_history(self, session_name):
@@ -464,22 +483,33 @@ class MemoryManager:
                     self.conn.rollback()
                     raise
 
-    def get_all_sessions(self, workdir=None):
-        """返回会话列表（名称/消息数/归属目录/时间）。
+    def get_all_sessions(self, workdir=None, source=None):
+        """返回会话列表（名称/消息数/归属目录/时间/来源）。
 
-        workdir 为 None 时返回全部会话；指定路径时只返回该目录下创建的会话，
-        以及历史遗留的无目录记录（workdir 为 NULL 的旧会话，避免升级后历史“消失”）。
+        workdir 为 None 时返回全部会话；指定路径时只返回该目录下创建的会话。
+        source 参数用于过滤 GUI 或 TUI 专属会话。
         """
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute('''
-                SELECT s.session_name, COUNT(m.id) as msg_count,
-                       s.workdir, s.updated_at, s.created_at
-                FROM sessions s
-                LEFT JOIN messages m ON s.id = m.session_id
-                GROUP BY s.id
-                ORDER BY s.id DESC
-            ''')
+            if source:
+                cursor.execute('''
+                    SELECT s.session_name, COUNT(m.id) as msg_count,
+                           s.workdir, s.updated_at, s.created_at, s.source
+                    FROM sessions s
+                    LEFT JOIN messages m ON s.id = m.session_id
+                    WHERE s.source = ? OR s.source IS NULL
+                    GROUP BY s.id
+                    ORDER BY s.id DESC
+                ''', (source,))
+            else:
+                cursor.execute('''
+                    SELECT s.session_name, COUNT(m.id) as msg_count,
+                           s.workdir, s.updated_at, s.created_at, s.source
+                    FROM sessions s
+                    LEFT JOIN messages m ON s.id = m.session_id
+                    GROUP BY s.id
+                    ORDER BY s.id DESC
+                ''')
             rows = cursor.fetchall()
         if workdir is None:
             filtered = rows
@@ -496,6 +526,7 @@ class MemoryManager:
                 "workdir": row[2],
                 "updated_at": row[3],
                 "created_at": row[4],
+                "source": row[5] or "GUI"
             }
             for row in filtered
         ]
@@ -529,17 +560,18 @@ class MemoryManager:
         workdir_norm = _normalize_workdir(workdir)
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute('SELECT id FROM sessions WHERE workdir = ?', (workdir_norm,))
-            rows = cursor.fetchall()
-            for r in rows:
-                sid = r[0]
-                try:
+            try:
+                cursor.execute('SELECT id FROM sessions WHERE workdir = ?', (workdir_norm,))
+                rows = cursor.fetchall()
+                for r in rows:
+                    sid = r[0]
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (sid,))
-                except Exception:
-                    pass
-            cursor.execute('DELETE FROM sessions WHERE workdir = ?', (workdir_norm,))
-            cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (workdir_norm,))
-            self.conn.commit()
+                cursor.execute('DELETE FROM sessions WHERE workdir = ?', (workdir_norm,))
+                cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (workdir_norm,))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def add_workspace(self, workdir):
         if not workdir or workdir == "GLOBAL":
@@ -548,11 +580,15 @@ class MemoryManager:
         with self._lock:
             cursor = self.conn.cursor()
             now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            cursor.execute('''
-                INSERT OR IGNORE INTO workspaces (workdir, created_at)
-                VALUES (?, ?)
-            ''', (wdir, now))
-            self.conn.commit()
+            try:
+                cursor.execute('''
+                    INSERT OR IGNORE INTO workspaces (workdir, created_at)
+                    VALUES (?, ?)
+                ''', (wdir, now))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def get_all_workspaces(self):
         with self._lock:
@@ -566,8 +602,12 @@ class MemoryManager:
         wdir = _normalize_workdir(workdir)
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (wdir,))
-            self.conn.commit()
+            try:
+                cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (wdir,))
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def rename_session(self, old_name, new_name):
         """重命名指定会话，确保新名称在数据库中唯一。如果名字冲突则自动加数字后缀。"""
@@ -673,15 +713,19 @@ class MemoryManager:
                 )
 
             if updates:
-                cursor.executemany('UPDATE messages SET content = ? WHERE id = ?', updates)
-                # 同步更新会话时间戳，避免外部基于 updated_at 的缓存/排序与
-                # 实际内容变化脱节。
-                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                cursor.execute(
-                    'UPDATE sessions SET updated_at = ? WHERE session_name = ?',
-                    (now, session_name)
-                )
-                self.conn.commit()
+                try:
+                    cursor.executemany('UPDATE messages SET content = ? WHERE id = ?', updates)
+                    # 同步更新会话时间戳，避免外部基于 updated_at 的缓存/排序与
+                    # 实际内容变化脱节。
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    cursor.execute(
+                        'UPDATE sessions SET updated_at = ? WHERE session_name = ?',
+                        (now, session_name)
+                    )
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
 
 
 # Backward-compatible public name used by the original test and extension API.

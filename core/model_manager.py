@@ -28,14 +28,18 @@ def load_config() -> dict:
             model_name = old_model.split("/")[-1]
             mid = str(uuid.uuid4())[:8]
             pid = str(uuid.uuid4())[:8]
-            data = {
+            # 保留旧格式中的其他字段（theme / permission_mode 等），只替换模型相关字段
+            base_url = data.pop("base_url", "")
+            api_key = data.pop("api_key", "")
+            data.pop("model", None)
+            migrated = {
                 "active_model_id": mid,
                 "providers": [
                     {
                         "id": pid,
                         "name": "默认厂商",
-                        "base_url": data.get("base_url", ""),
-                        "api_key": data.get("api_key", ""),
+                        "base_url": base_url,
+                        "api_key": api_key,
                         "protocol": "openai",
                         "models": [
                             {
@@ -48,6 +52,7 @@ def load_config() -> dict:
                     }
                 ],
             }
+            data.update(migrated)
             _write_config(data)
         except Exception:
             data = {}
