@@ -234,8 +234,11 @@ def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_dat
             "--add-data", f"{version_path};.",
         ]
         for src, dest in add_data_pairs:
-            cmd += ["--add-data", f"{src};{dest}"]
-        cmd.append("ycode_setup.py")
+            # --specpath 指向临时目录后，PyInstaller 会以 spec 所在目录解析
+            # 相对的 add-data 源路径，因此这里统一换算成项目根目录下的绝对路径
+            src_abs = src if os.path.isabs(src) else os.path.join(project_dir, src)
+            cmd += ["--add-data", f"{src_abs};{dest}"]
+        cmd.append(os.path.join(project_dir, "ycode_setup.py"))
         run_checked(cmd, f"安装向导编译 ({output_name}.exe, mode={mode})")
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
