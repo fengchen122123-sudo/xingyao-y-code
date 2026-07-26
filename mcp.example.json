@@ -1,0 +1,73 @@
+{
+    "mcpServers": {
+        "amap": {
+            "enabled": true,
+            "command": "npx",
+            "args": ["-y", "@amap/amap-maps-mcp-server"],
+            "env": {
+                "AMAP_MAPS_API_KEY": "your-amap-web-service-key"
+            }
+        },
+        "lark": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "@larksuiteoapi/lark-mcp", "mcp", "-a", "cli_your_app_id", "-s", "your_app_secret"],
+            "comment": "飞书 MCP。appId/appSecret 在 https://open.feishu.cn/app 创建自建应用后获取。"
+        },
+        "wechat-publisher": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "wechat-official-publisher"],
+            "env": {
+                "WECHAT_APP_ID": "wx_your_app_id",
+                "WECHAT_APP_SECRET": "your_app_secret"
+            },
+            "comment": "微信公众号文章发布。AppID/AppSecret 在公众号后台 → 设置 → 公众号设置获取。"
+        },
+        "bilibili": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "@wangshunnn/bilibili-mcp-server"],
+            "comment": "B站视频搜索，免登录即可使用。"
+        },
+        "sqlite": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "mcp-server-sqlite-npx", "--db-path", "C:/path/to/your.db"],
+            "comment": "SQLite 数据库 MCP。把 db-path 改成你的数据库文件路径。"
+        },
+        "postgres": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-postgres", "postgresql://user:pass@host:5432/db"],
+            "comment": "PostgreSQL 只读查询。把连接串换成你的数据库地址。"
+        },
+        "firecrawl": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "firecrawl-mcp"],
+            "env": {
+                "FIRECRAWL_API_KEY": "fc-your-api-key-here"
+            },
+            "comment": "Firecrawl 网页抓取，1000 免费 credits/月。"
+        },
+        "wigolo": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "wigolo"],
+            "comment": "wigolo 本地优先免费搜索，需 1.5GB 磁盘空间。"
+        },
+        "sequential-thinking": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-sequential-thinking"],
+            "comment": "顺序思考 MCP server，结构化推理。"
+        },
+        "filesystem": {
+            "enabled": false,
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem", "$HOME"],
+            "comment": "文件系统访问 MCP server。$HOME 可改为指定路径。"
+        }
+    }
+}
