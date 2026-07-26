@@ -5,7 +5,7 @@
         <div class="mh-ico">⚠️</div>
         <div>
           <h3>权限请求 · <span>{{ store.permModal.toolName }}</span></h3>
-          <p>星瑶请求执行以下操作，当前为默认权限模式</p>
+          <p>星瑶请求执行以下操作{{ store.permModal.source ? '（来源: ' + store.permModal.source + '）' : '' }}</p>
         </div>
       </div>
       <div class="modal-body">

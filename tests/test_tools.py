@@ -33,6 +33,7 @@ def test_declared_search_dependency_uses_renamed_ddgs_package():
 class _FakeHTTPResponse:
     def __init__(self, body, content_type="application/json; charset=utf-8"):
         self._body = body.encode("utf-8")
+        self._pos = 0  # 流式读取位置，模拟真实 HTTP 响应的连续读取
         self.status = 200
         self.headers = {"content-type": content_type}
 
@@ -43,7 +44,16 @@ class _FakeHTTPResponse:
         return False
 
     def read(self, limit=-1):
-        return self._body if limit < 0 else self._body[:limit]
+        """模拟真实 HTTP 响应的流式读取：每次 read 从当前位置继续，而非从头开始。"""
+        if limit < 0:
+            # 读全部剩余内容
+            chunk = self._body[self._pos:]
+            self._pos = len(self._body)
+            return chunk
+        # 读指定长度
+        chunk = self._body[self._pos:self._pos + limit]
+        self._pos += len(chunk)
+        return chunk
 
 
 def test_fetch_url_uses_local_http_client_and_returns_response(monkeypatch):
@@ -64,6 +74,70 @@ def test_fetch_url_uses_local_http_client_and_returns_response(monkeypatch):
     assert calls[0][0].full_url == "https://example.com/data"
     assert calls[0][0].get_header("User-agent")
     assert calls[0][1] == 20
+
+
+def test_fetch_url_uses_browser_like_headers(monkeypatch):
+    """fetch_url 应使用伪装的浏览器请求头（绕过反爬 403）"""
+    captured_request = []
+
+    def fake_urlopen(request, timeout):
+        captured_request.append(request)
+        return _FakeHTTPResponse("<html>内容</html>", "text/html; charset=utf-8")
+
+    monkeypatch.setattr("core.tools.urlopen", fake_urlopen)
+    monkeypatch.setattr("core.tools._check_ssrf_url", lambda url: None)
+
+    fetch_url("https://example.com/article")
+
+    assert len(captured_request) == 1
+    req = captured_request[0]
+    # User-Agent 应为 Chrome 浏览器伪装，而非 ycode/...
+    ua = req.get_header("User-agent")
+    assert "Mozilla/5.0" in ua, f"应伪装为浏览器 UA，实际: {ua}"
+    assert "Chrome" in ua, f"UA 应包含 Chrome 标识，实际: {ua}"
+    assert "ycode" not in ua, f"UA 不应包含 ycode（会被反爬拦截），实际: {ua}"
+    # 应携带浏览器常见请求头
+    assert req.get_header("Accept-language"), "应携带 Accept-Language 头"
+    assert req.get_header("Referer"), "应携带 Referer 头"
+
+
+def test_fetch_url_truncates_large_response_instead_of_failing(monkeypatch):
+    """响应超过 512KB 时应截断并附加提示，而非直接报错"""
+    # 构造超过 HTTP_MAX_BYTES 的响应体
+    from core.tools import HTTP_MAX_BYTES
+    large_body = "x" * (HTTP_MAX_BYTES + 1024)  # 超过 512KB
+
+    def fake_urlopen(request, timeout):
+        return _FakeHTTPResponse(large_body, "text/html; charset=utf-8")
+
+    monkeypatch.setattr("core.tools.urlopen", fake_urlopen)
+    monkeypatch.setattr("core.tools._check_ssrf_url", lambda url: None)
+
+    result = fetch_url("https://example.com/large-article")
+
+    # 不应报错（不以 🚨 开头）
+    assert not result.startswith("🚨"), f"大响应应截断而非报错，实际: {result[:100]}"
+    # 应包含 HTTP 200 状态
+    assert "HTTP 200" in result
+    # 应包含截断提示
+    assert "已截断" in result, "应附加截断提示"
+    # 应包含部分内容（截断后的前 512KB）
+    assert "x" in result
+
+
+def test_fetch_url_does_not_truncate_small_response(monkeypatch):
+    """小响应不应被截断，也不应附加截断提示"""
+    def fake_urlopen(request, timeout):
+        return _FakeHTTPResponse('{"small": "content"}', "application/json; charset=utf-8")
+
+    monkeypatch.setattr("core.tools.urlopen", fake_urlopen)
+    monkeypatch.setattr("core.tools._check_ssrf_url", lambda url: None)
+
+    result = fetch_url("https://example.com/small")
+
+    assert "HTTP 200" in result
+    assert '{"small": "content"}' in result
+    assert "已截断" not in result, "小响应不应附加截断提示"
 
 
 def test_fetch_url_rejects_non_http_urls():
@@ -477,6 +551,249 @@ def test_terminal_notification_callback_exception_does_not_break_subagent():
     # 子代理状态应正常完成，回调异常被吞掉
     snapshots = manager.snapshot()
     assert snapshots[0].status == "completed"
+
+
+def test_is_plan_item_running_returns_true_for_running_task():
+    """is_plan_item_running 应识别仍在运行的后台子代理任务（避免误杀）"""
+    import threading
+    import time as _time
+
+    started = threading.Event()
+
+    def slow_runner(record):
+        started.set()
+        # 让任务持续运行，直到 cancel_event 被设置
+        while not record.cancel_event.is_set():
+            _time.sleep(0.01)
+        return "已取消"
+
+    manager = SubagentManager(runner=slow_runner)
+    thread = threading.Thread(
+        target=manager.run,
+        args=("后台长任务", "s1", "t1"),
+        kwargs={
+            "timeout_seconds": 30,
+            "run_in_background": True,
+            "plan_item_id": "plan-running-1",
+        },
+        daemon=True,
+    )
+    thread.start()
+    assert started.wait(2.0), "子代理应在 2s 内启动"
+
+    try:
+        # 任务运行中：应返回 True
+        assert manager.is_plan_item_running("plan-running-1") is True
+        # 无关联任务的 plan_item_id：应返回 False
+        assert manager.is_plan_item_running("plan-nonexistent") is False
+        # 空 plan_item_id：应返回 False
+        assert manager.is_plan_item_running("") is False
+    finally:
+        # 清理：取消运行中的任务
+        manager.cancel(manager.snapshot()[0].task_id, "测试结束")
+        thread.join(timeout=2.0)
+
+
+def test_is_plan_item_running_returns_false_for_completed_task():
+    """is_plan_item_running 对已完成的任务应返回 False"""
+    import threading
+
+    manager = SubagentManager(runner=lambda record: "完成")
+    thread = threading.Thread(
+        target=manager.run,
+        args=("后台任务", "s1", "t1"),
+        kwargs={
+            "timeout_seconds": 30,
+            "run_in_background": True,
+            "plan_item_id": "plan-done-1",
+        },
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=5.0)
+
+    # 任务已完成：应返回 False
+    assert manager.is_plan_item_running("plan-done-1") is False
+
+
+def test_drain_terminal_background_tasks_returns_all_terminal_unconsumed():
+    """drain_terminal_background_tasks 应返回所有终态（成功+失败）且未被消费的后台任务"""
+    import threading
+
+    # 用一个 manager 管理两个后台任务：一个成功，一个失败
+    # runner 根据 description 区分返回不同结果
+    def runner(record):
+        if "失败" in record.description:
+            record.tool_errors["search_news"] = "无结果"
+            return "查询失败"
+        return "查询结果：晴"
+
+    manager = SubagentManager(runner=runner)
+
+    # 后台任务1：成功完成
+    thread1 = threading.Thread(
+        target=manager.run,
+        args=("后台查天气", "s-fallback", "t1"),
+        kwargs={
+            "timeout_seconds": 30,
+            "run_in_background": True,
+            "plan_item_id": "plan-ok-1",
+        },
+        daemon=True,
+    )
+    thread1.start()
+    thread1.join(timeout=5.0)
+
+    # 后台任务2：失败
+    thread2 = threading.Thread(
+        target=manager.run,
+        args=("后台查失败新闻", "s-fallback", "t2"),
+        kwargs={
+            "timeout_seconds": 30,
+            "run_in_background": True,
+            "plan_item_id": "plan-failed-1",
+        },
+        daemon=True,
+    )
+    thread2.start()
+    thread2.join(timeout=5.0)
+
+    # drain：应返回 2 个任务（1 成功 + 1 失败）
+    drained = manager.drain_terminal_background_tasks("s-fallback")
+    assert len(drained) == 2, f"应提取 2 个任务，实际 {len(drained)}"
+
+    statuses = {t.status for t in drained}
+    assert "completed" in statuses, "应包含已完成的任务"
+    assert "failed" in statuses, "应包含失败的任务"
+
+    # 验证成功任务的结果
+    completed_task = next(t for t in drained if t.status == "completed")
+    assert "晴" in completed_task.result
+
+    # 第二次 drain：应返回空（已通过 summary_injected 标记消费）
+    drained_again = manager.drain_terminal_background_tasks("s-fallback")
+    assert drained_again == [], "已消费的任务不应重复提取"
+
+    # 不同会话：应返回空
+    drained_other = manager.drain_terminal_background_tasks("s-other")
+    assert drained_other == [], "其他会话的任务不应被提取"
+
+
+def test_drain_terminal_independent_from_notification_consumed():
+    """drain_terminal_background_tasks 应独立于 drain_notifications 的消费标志。
+
+    场景：drain_notifications 在普通 turn 中消费了任务通知（notification_consumed=True），
+    但汇总 turn 仍应能看到任务结果（summary_injected=False → 可提取）。
+    这修复了"第一次过早汇总消费了 AI 任务后，第二次汇总看不到 AI 任务结果"的 bug。
+    """
+    import threading
+
+    manager = SubagentManager(runner=lambda record: "查询结果：晴")
+    thread = threading.Thread(
+        target=manager.run,
+        args=("后台查天气", "s-indep", "t1"),
+        kwargs={
+            "timeout_seconds": 30,
+            "run_in_background": True,
+            "plan_item_id": "plan-ok-1",
+        },
+        daemon=True,
+    )
+    thread.start()
+    thread.join(timeout=5.0)
+
+    # 先用 drain_notifications 消费通知（模拟普通 turn 的 LLM 上下文注入）
+    notifications = manager.drain_notifications("s-indep")
+    assert len(notifications) == 1, "drain_notifications 应返回 1 条通知"
+
+    # 再用 drain_terminal_background_tasks 提取：应仍能返回任务（独立标志）
+    drained = manager.drain_terminal_background_tasks("s-indep")
+    assert len(drained) == 1, (
+        "drain_terminal_background_tasks 应独立于 notification_consumed，"
+        "即使 drain_notifications 已消费通知，汇总 turn 仍应能看到任务结果"
+    )
+    assert drained[0].status == "completed"
+    assert "晴" in drained[0].result
+
+    # 第二次 drain_terminal：应返回空（summary_injected 已标记）
+    drained_again = manager.drain_terminal_background_tasks("s-indep")
+    assert drained_again == [], "summary_injected 已标记的任务不应重复提取"
+
+
+def test_drain_terminal_background_tasks_skips_running_and_foreground():
+    """drain_terminal_background_tasks 应跳过运行中任务和前台任务"""
+    import threading
+    import time as _time
+
+    # 后台任务：运行中（不结束）
+    started = threading.Event()
+    manager = SubagentManager(runner=lambda record: (
+        started.set(),
+        _time.sleep(10),
+        "结果"
+    )[2])
+    thread1 = threading.Thread(
+        target=manager.run,
+        args=("后台运行中任务", "s-mix", "t1"),
+        kwargs={"timeout_seconds": 30, "run_in_background": True, "plan_item_id": "p-bg-running"},
+        daemon=True,
+    )
+    thread1.start()
+    assert started.wait(2.0), "子代理应在 2s 内启动"
+
+    try:
+        # drain：不应返回运行中的任务
+        drained = manager.drain_terminal_background_tasks("s-mix")
+        assert drained == [], "运行中的后台任务不应被 drain"
+    finally:
+        manager.cancel(manager.snapshot()[0].task_id, "测试结束")
+        thread1.join(timeout=2.0)
+
+    # 前台任务：完成
+    manager_fg = SubagentManager(runner=lambda record: "前台结果")
+    manager_fg.run("前台任务", "s-mix", "t1", timeout_seconds=30, plan_item_id="p-fg-ok")
+
+    # drain：不应返回前台任务
+    drained_fg = manager_fg.drain_terminal_background_tasks("s-mix")
+    assert drained_fg == [], "前台任务不应被 drain"
+
+
+def test_has_running_background_tasks_detects_running():
+    """has_running_background_tasks 应正确识别运行中的后台任务"""
+    import threading
+    import time as _time
+
+    started = threading.Event()
+
+    def slow_runner(record):
+        started.set()
+        while not record.cancel_event.is_set():
+            _time.sleep(0.01)
+        return "已取消"
+
+    manager = SubagentManager(runner=slow_runner)
+    thread = threading.Thread(
+        target=manager.run,
+        args=("后台长任务", "s-running", "t1"),
+        kwargs={"timeout_seconds": 30, "run_in_background": True},
+        daemon=True,
+    )
+    thread.start()
+    assert started.wait(2.0), "子代理应在 2s 内启动"
+
+    try:
+        # 有运行中的任务：应返回 True
+        assert manager.has_running_background_tasks("s-running") is True
+        # 无任务的会话：应返回 False
+        assert manager.has_running_background_tasks("s-other") is False
+        # 空会话：应返回 False
+        assert manager.has_running_background_tasks("") is False
+    finally:
+        manager.cancel(manager.snapshot()[0].task_id, "测试结束")
+        thread.join(timeout=2.0)
+
+    # 任务取消后：应返回 False
+    assert manager.has_running_background_tasks("s-running") is False
 
 
 def test_run_subagent_updates_associated_plan_only_after_completion(monkeypatch):
@@ -1271,6 +1588,86 @@ def test_subagent_result_strips_advisor_tags():
     assert "结论内容" in result
 
 
+def test_subagent_result_strips_xml_junk_blocks():
+    """回归（软件识别会话事故）：模型把 <advisor-request> 求助文本和
+    <function_calls> XML 伪工具调用整块泄漏到正文时，必须从子代理结果中剔除。
+    未闭合的块（流被截断）也要剔到末尾。"""
+    manager = SubagentManager(
+        runner=lambda record: (
+            "<advisor-request>\n我需要读取所有指定的核心文件。\n</advisor-request>\n"
+            "真正的审查结论。\n"
+            '<function_calls>\n<invoke name="advisor">\n<parameter name="message">未闭合的伪调用'
+        )
+    )
+
+    result = manager.run("任务", "s-xml", "t-xml", timeout_seconds=30)
+
+    assert "advisor-request" not in result
+    assert "function_calls" not in result
+    assert "伪调用" not in result
+    assert "真正的审查结论。" in result
+
+
+def test_subagent_result_keeps_only_text_after_last_tool_call(monkeypatch):
+    """回归（软件识别会话事故）：子代理结果只保留最后一次工具调用之后的文本。
+
+    工具调用之前的过程叙述（"我先给你一版初步结论，继续补读…"）不是最终结论，
+    混入结果会让主 Agent 把中间思路当成事实汇总。"""
+    from types import SimpleNamespace
+    import core.llm as llm_module
+
+    final_text = "最终结论：" + "核心模块无阻塞性问题。" * 30  # >200 字，避免触发总结续写
+
+    def fake_events(*args, **kwargs):
+        yield SimpleNamespace(kind="assistant_delta", payload={"text": "我先给你一版初步结论，继续补读文件。"})
+        yield SimpleNamespace(kind="tool_started", payload={"name": "read_file"})
+        yield SimpleNamespace(kind="tool_finished", payload={"name": "read_file", "ok": True})
+        yield SimpleNamespace(kind="assistant_delta", payload={"text": final_text})
+
+    monkeypatch.setattr(llm_module, "chat_with_model_events", fake_events)
+
+    manager = SubagentManager()
+    result = manager.run("审查任务", "s-last-text", "t-last-text", timeout_seconds=30)
+
+    assert "初步结论" not in result
+    assert "最终结论" in result
+
+
+def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
+    """回归：未显式传 timeout_seconds 时按角色解析默认超时
+    （explore 240 / review 300 / test 480 / implement、general 600）。
+    只读子代理的设计目标是快，不能默认给 10 分钟。"""
+    import core.tools as tools_module
+
+    captured = {}
+
+    class _FakeManager:
+        def run(self, task_description, parent_session, parent_turn_id, **kwargs):
+            captured.update(kwargs)
+            return "完成"
+
+    monkeypatch.setattr(tools_module, "subagent_manager", _FakeManager())
+
+    for role, expected in [
+        ("explore", 240), ("review", 300), ("test", 480),
+        ("implement", 600), ("general", 600), ("custom-agent", 600),
+    ]:
+        captured.clear()
+        tools_module.run_subagent(
+            "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
+            subagent_type=role,
+        )
+        assert captured["timeout_seconds"] == expected, role
+
+    # 显式传入时以显式值为准
+    captured.clear()
+    tools_module.run_subagent(
+        "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
+        subagent_type="explore", timeout_seconds=3600,
+    )
+    assert captured["timeout_seconds"] == 3600
+
+
 def test_run_subagent_surfaces_real_verification_error(monkeypatch):
     """回归：验证失败时必须把真实错误（如验证命令 stderr）返回给主 Agent，
     不得只报"不是 in_progress，无法验证完成"的误导信息导致 retry 死循环。"""
@@ -1448,3 +1845,569 @@ def test_edit_file_auto_creates_missing_parent_directory(tmp_path, monkeypatch):
     result = edit_file(str(target), "old content", "new content")
     assert "✔" in str(result) or "成功" in str(result), f"edit_file 应成功，实际：{result}"
     assert target.read_text(encoding="utf-8") == "new content"
+
+
+# ============================================================================
+# 行号路径测试（with_line_numbers + start_line/end_line）
+# 借鉴 Hashline 思想的轻量实现：read_file 返回行号 → edit_file 按行号切片替换
+# ============================================================================
+
+
+def test_read_file_with_line_numbers_returns_prefixed_format(tmp_path, monkeypatch):
+    """read_file(with_line_numbers=True) 应返回 'N: line' 格式（1-based）。"""
+    from core.tools import read_file
+    from core import tool_cache
+    tool_cache.clear_all()
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "sample.py"
+    target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+
+    result = read_file("sample.py", with_line_numbers=True)
+
+    assert result == "1: alpha\n2: beta\n3: gamma"
+
+
+def test_read_file_with_line_numbers_respects_offset_and_limit(tmp_path, monkeypatch):
+    """with_line_numbers 与 offset/limit 配合时行号应反映原始位置。"""
+    from core.tools import read_file
+    from core import tool_cache
+    tool_cache.clear_all()
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "paged.txt"
+    target.write_text("L1\nL2\nL3\n", encoding="utf-8")  # 3 行
+
+    # 从第 2 行（0-based offset=1）开始读 2 行，行号应为 2, 3（读取剩余全部，不触发截断）
+    result = read_file("paged.txt", offset=1, limit=2, with_line_numbers=True)
+
+    assert result == "2: L2\n3: L3"
+
+
+def test_read_file_with_line_numbers_ignores_compress(tmp_path, monkeypatch):
+    """with_line_numbers=True 时 compress 参数应被忽略，保留原始行结构。"""
+    from core.tools import read_file
+    from core import tool_cache
+    tool_cache.clear_all()
+
+    monkeypatch.chdir(tmp_path)
+    # 含连续空行的文件，compress=True 时本应合并空行
+    target = tmp_path / "spaced.txt"
+    target.write_text("a\n\n\nb\n", encoding="utf-8")
+
+    # 同时开启 compress 和 with_line_numbers，行号路径应优先
+    result = read_file("spaced.txt", compress=True, with_line_numbers=True)
+
+    # 应保留 4 行（含 2 个空行），不应被压缩
+    assert result == "1: a\n2: \n3: \n4: b"
+
+
+def test_read_file_with_line_numbers_caches_separately_from_plain(tmp_path, monkeypatch):
+    """with_line_numbers=True 和 False 应分别缓存，不互相污染。"""
+    from core.tools import read_file
+    from core import tool_cache
+    tool_cache.clear_all()
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "cache.txt"
+    target.write_text("hello\nworld\n", encoding="utf-8")
+
+    plain = read_file("cache.txt")
+    numbered = read_file("cache.txt", with_line_numbers=True)
+
+    assert plain == "hello\nworld\n"
+    assert numbered == "1: hello\n2: world"
+
+    # 再次读取应命中各自缓存
+    plain2 = read_file("cache.txt")
+    numbered2 = read_file("cache.txt", with_line_numbers=True)
+    assert plain2 == plain
+    assert numbered2 == numbered
+
+
+def test_edit_file_by_lines_basic_replacement(tmp_path, monkeypatch):
+    """行号路径：基本替换功能，应跳过字符串匹配直接按行号切片。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "code.py"
+    target.write_text("def foo():\n    return 1\n\ndef bar():\n    return 2\n", encoding="utf-8")
+
+    # 替换第 2 行（return 1 → return 42）
+    result = edit_file("code.py", replacement_content="    return 42", start_line=2, end_line=2)
+
+    assert result.startswith("✔")
+    assert "第 2-2 行替换成功" in result
+    assert target.read_text(encoding="utf-8") == "def foo():\n    return 42\n\ndef bar():\n    return 2\n"
+
+
+def test_edit_file_by_lines_multi_line_range(tmp_path, monkeypatch):
+    """行号路径：多行范围替换。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "multi.py"
+    original = "a\nb\nc\nd\ne\n"
+    target.write_text(original, encoding="utf-8")
+
+    # 替换第 2-4 行（b,c,d → X,Y）
+    result = edit_file("multi.py", replacement_content="X\nY", start_line=2, end_line=4)
+
+    assert result.startswith("✔")
+    assert "第 2-4 行替换成功" in result
+    assert target.read_text(encoding="utf-8") == "a\nX\nY\ne\n"
+
+
+def test_edit_file_by_lines_end_line_exceeds_total_clamps_silently(tmp_path, monkeypatch):
+    """end_line 超过总行数时应自动收敛，不报错。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "short.txt"
+    target.write_text("only\none\nline\n", encoding="utf-8")  # 3 行
+
+    # end_line=100 远超总行数，应自动收敛到 3
+    result = edit_file("short.txt", replacement_content="replaced", start_line=2, end_line=100)
+
+    assert result.startswith("✔")
+    # 实际替换了第 2-3 行
+    assert "第 2-3 行替换成功" in result
+    assert target.read_text(encoding="utf-8") == "only\nreplaced\n"
+
+
+def test_edit_file_by_lines_includes_replaced_preview_in_response(tmp_path, monkeypatch):
+    """成功响应中应包含被替换的原文预览（便于发现行号错误）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "preview.py"
+    target.write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+    result = edit_file("preview.py", replacement_content="NEW", start_line=2, end_line=2)
+
+    assert "被替换原文预览" in result
+    assert "line2" in result  # 预览应包含被替换的原文
+
+
+def test_edit_file_by_lines_preview_truncates_long_blocks(tmp_path, monkeypatch):
+    """被替换块超过 5 行时预览应省略中间，只显示前 3 后 2。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "long_block.txt"
+    content = "\n".join(f"line{i}" for i in range(1, 11)) + "\n"  # 10 行
+    target.write_text(content, encoding="utf-8")
+
+    # 替换第 1-10 行
+    result = edit_file("long_block.txt", replacement_content="REPLACED", start_line=1, end_line=10)
+
+    assert result.startswith("✔")
+    assert "省略中间部分" in result
+    assert "line1" in result  # 前 3 行之一
+    assert "line3" in result  # 前 3 行之一
+    assert "line10" in result  # 后 2 行之一
+    assert "line5" not in result  # 中间被省略
+
+
+def test_edit_file_by_lines_rejects_start_line_below_one(tmp_path, monkeypatch):
+    """start_line < 1 应报错（1-based 行号）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "x.txt"
+    target.write_text("content\n", encoding="utf-8")
+
+    result = edit_file("x.txt", replacement_content="new", start_line=0, end_line=1)
+
+    assert result.startswith("🚨")
+    assert "start_line 必须 >= 1" in result
+    assert target.read_text(encoding="utf-8") == "content\n"  # 文件未被修改
+
+
+def test_edit_file_by_lines_rejects_end_below_start(tmp_path, monkeypatch):
+    """end_line < start_line 应报错。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "x.txt"
+    target.write_text("a\nb\nc\n", encoding="utf-8")
+
+    result = edit_file("x.txt", replacement_content="new", start_line=3, end_line=1)
+
+    assert result.startswith("🚨")
+    assert "不能小于" in result
+
+
+def test_edit_file_by_lines_rejects_start_exceeds_total(tmp_path, monkeypatch):
+    """start_line 超出文件总行数应报错（end_line 自动收敛，但 start_line 不会）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "x.txt"
+    target.write_text("only\none\n", encoding="utf-8")  # 2 行
+
+    result = edit_file("x.txt", replacement_content="new", start_line=100, end_line=200)
+
+    assert result.startswith("🚨")
+    assert "超出文件总行数" in result
+    assert "read_file(with_line_numbers=True)" in result  # 应给出修复建议
+
+
+def test_edit_file_by_lines_rejects_partial_line_args(tmp_path, monkeypatch):
+    """只提供 start_line 不提供 end_line（或反之）应报错。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "x.txt"
+    target.write_text("a\nb\n", encoding="utf-8")
+
+    # 只提供 start_line
+    result1 = edit_file("x.txt", replacement_content="new", start_line=1)
+    assert result1.startswith("🚨")
+    assert "同时提供" in result1
+
+    # 只提供 end_line
+    result2 = edit_file("x.txt", replacement_content="new", end_line=1)
+    assert result2.startswith("🚨")
+    assert "同时提供" in result2
+
+
+def test_edit_file_by_lines_rejects_bool_arguments(tmp_path, monkeypatch):
+    """start_line/end_line 不能是布尔值（bool 是 int 子类，True==1 会被误用）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "x.txt"
+    target.write_text("a\nb\n", encoding="utf-8")
+
+    result = edit_file("x.txt", replacement_content="new", start_line=True, end_line=True)
+
+    assert result.startswith("🚨")
+    assert "布尔值" in result
+
+
+def test_edit_file_by_lines_rejects_non_int_arguments(tmp_path, monkeypatch):
+    """start_line/end_line 必须是整数。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "x.txt"
+    target.write_text("a\nb\n", encoding="utf-8")
+
+    result = edit_file("x.txt", replacement_content="new", start_line=1.5, end_line=2)
+
+    assert result.startswith("🚨")
+    assert "整数" in result
+
+
+def test_edit_file_by_lines_rejects_empty_file(tmp_path, monkeypatch):
+    """空文件无法按行号编辑。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "empty.txt"
+    target.write_text("", encoding="utf-8")
+
+    result = edit_file("empty.txt", replacement_content="new", start_line=1, end_line=1)
+
+    assert result.startswith("🚨")
+    assert "为空" in result
+
+
+def test_edit_file_by_lines_no_change_returns_error(tmp_path, monkeypatch):
+    """替换后内容与原文相同时应报错（避免无意义写入）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "same.txt"
+    target.write_text("identical\n", encoding="utf-8")
+
+    # replacement_content 与原行完全相同
+    result = edit_file("same.txt", replacement_content="identical", start_line=1, end_line=1)
+
+    assert result.startswith("🚨")
+    assert "相同" in result
+
+
+def test_edit_file_by_lines_writes_undo_stack(tmp_path, monkeypatch):
+    """行号路径成功时应写入撤销栈（与字符串路径行为一致）。"""
+    import core.memory as memory_module
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "undo.py"
+    # 用 write_bytes 确保 LF 换行，避免 Windows write_text 默认转 CRLF
+    target.write_bytes(b"original\n")
+    captured = []
+    monkeypatch.setattr(
+        memory_module,
+        "set_undo_state",
+        lambda file_path, content: captured.append((file_path, content)),
+    )
+
+    result = edit_file("undo.py", replacement_content="modified", start_line=1, end_line=1)
+
+    assert result.startswith("✔")
+    assert len(captured) == 1
+    undo_file, undo_content = captured[0]
+    assert undo_file == "undo.py"
+    assert undo_content == "original\n"  # 撤销栈保存的是修改前的内容
+
+
+def test_edit_file_by_lines_failed_validation_does_not_pollute_undo_stack(tmp_path, monkeypatch):
+    """行号路径校验失败时不应写入撤销栈。"""
+    import core.memory as memory_module
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "safe.txt"
+    target.write_text("a\nb\n", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(
+        memory_module,
+        "set_undo_state",
+        lambda file_path, content: captured.append((file_path, content)),
+    )
+
+    # start_line 越界，应失败且不写撤销栈
+    result = edit_file("safe.txt", replacement_content="new", start_line=100, end_line=200)
+
+    assert result.startswith("🚨")
+    assert captured == []
+    assert target.read_text(encoding="utf-8") == "a\nb\n"  # 文件未被修改
+
+
+def test_edit_file_by_lines_preserves_gbk_encoding(tmp_path, monkeypatch):
+    """行号路径应保持 GBK 编码写回（与字符串路径一致）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "gbk_lines.txt"
+    original = "第一行\r\n第二行\r\n第三行\r\n"
+    target.write_bytes(original.encode("gbk"))
+
+    # 替换第 2 行
+    result = edit_file("gbk_lines.txt", replacement_content="替换行", start_line=2, end_line=2)
+
+    assert result.startswith("✔")
+    assert target.read_bytes() == "第一行\r\n替换行\r\n第三行\r\n".encode("gbk")
+
+
+def test_edit_file_by_lines_adapts_crlf_replacement(tmp_path, monkeypatch):
+    """行号路径：replacement 含 LF 但文件是 CRLF 时应自动转换。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "crlf_lines.txt"
+    target.write_bytes(b"alpha\r\nbeta\r\nomega\r\n")
+
+    # replacement 用 LF，应被转为 CRLF
+    result = edit_file("crlf_lines.txt", replacement_content="line1\nline2", start_line=2, end_line=2)
+
+    assert result.startswith("✔")
+    raw = target.read_bytes()
+    assert raw == b"alpha\r\nline1\r\nline2\r\nomega\r\n"
+    assert b"\r\r\n" not in raw  # 不应腐蚀
+
+
+def test_edit_file_by_lines_ignores_target_content(tmp_path, monkeypatch):
+    """行号路径下 target_content 即使提供也应被忽略（不参与匹配）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "ignore_target.py"
+    target.write_text("actual_line\n", encoding="utf-8")
+
+    # target_content 与原文完全不同，但行号路径应忽略它
+    result = edit_file(
+        "ignore_target.py",
+        target_content="this is wrong and should be ignored",
+        replacement_content="new_line",
+        start_line=1,
+        end_line=1,
+    )
+
+    assert result.startswith("✔")
+    assert target.read_text(encoding="utf-8") == "new_line\n"
+
+
+def test_edit_file_string_path_still_works_when_no_line_args(tmp_path, monkeypatch):
+    """未提供 start_line/end_line 时应回退到字符串匹配路径（兼容性）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "compat.py"
+    target.write_text("def foo():\n    return 1\n", encoding="utf-8")
+
+    # 不提供 start_line/end_line，应走字符串匹配
+    result = edit_file("compat.py", target_content="return 1", replacement_content="return 42")
+
+    assert result.startswith("✔")
+    assert target.read_text(encoding="utf-8") == "def foo():\n    return 42\n"
+
+
+def test_edit_file_only_replacement_triggers_smart_replace(tmp_path, monkeypatch):
+    """只传 replacement_content（无 target_content 和行号）时触发智能降级替换。
+    新语义：用 difflib 找最相似代码段进行替换，而非直接报错。
+    """
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "hint.py"
+    # 多行内容，让智能替换有足够上下文定位
+    target.write_text("def old_func():\n    return 'old'\n", encoding="utf-8")
+
+    replacement = "def new_func():\n    return 'new'\n"
+
+    result = edit_file("hint.py", replacement_content=replacement)
+
+    # 智能替换应成功
+    assert result.startswith("✔")
+    assert "智能修改" in result
+    new_content = target.read_text(encoding="utf-8")
+    assert "new_func" in new_content
+    assert "old_func" not in new_content
+
+
+def test_edit_file_only_replacement_rejects_when_no_similarity(tmp_path, monkeypatch):
+    """只传 replacement_content 但找不到相似代码段时，给出明确错误并提示行号路径。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "hint.py"
+    target.write_text("line1\nline2\nline3\n", encoding="utf-8")
+
+    replacement = "completely unrelated content with no similarity at all here"
+
+    result = edit_file("hint.py", replacement_content=replacement)
+
+    assert result.startswith("🚨")
+    assert "start_line" in result or "target_content" in result
+
+
+def test_edit_file_by_lines_handles_duplicate_code_blocks_without_ambiguity(tmp_path, monkeypatch):
+    """行号路径核心优势：重复代码段无歧义定位（字符串路径会失败的场景）。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "dup_blocks.py"
+    # 多个完全相同的 case 块，字符串路径会因 target_content 多次出现而失败
+    content = (
+        "def handle(x):\n"
+        "    case_a()\n"
+        "    case_a()\n"
+        "    case_a()\n"
+        "    return\n"
+    )
+    target.write_text(content, encoding="utf-8")
+
+    # 字符串路径：target_content="    case_a()" 出现 3 次，应失败
+    string_result = edit_file(
+        "dup_blocks.py",
+        target_content="    case_a()",
+        replacement_content="    case_b()",
+    )
+    assert string_result.startswith("🚨")
+    assert "3 次" in string_result
+
+    # 行号路径：直接定位第 3 行（第二个 case_a），无歧义
+    line_result = edit_file(
+        "dup_blocks.py",
+        replacement_content="    case_b()",
+        start_line=3,
+        end_line=3,
+    )
+    assert line_result.startswith("✔")
+    new_content = target.read_text(encoding="utf-8")
+    # 第 2 行和第 4 行的 case_a 未变，只有第 3 行被替换
+    assert new_content == "def handle(x):\n    case_a()\n    case_b()\n    case_a()\n    return\n"
+
+
+def test_read_file_with_line_numbers_then_edit_file_by_lines_end_to_end(tmp_path, monkeypatch):
+    """端到端：read_file(with_line_numbers) → edit_file(start_line, end_line) 完整流程。"""
+    from core.tools import read_file, edit_file
+    from core import tool_cache
+    tool_cache.clear_all()
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "e2e.py"
+    target.write_text(
+        "import os\n"
+        "import sys\n"
+        "\n"
+        "def main():\n"
+        "    print('hello')\n"
+        "    return 0\n"
+        "\n"
+        "if __name__ == '__main__':\n"
+        "    main()\n",
+        encoding="utf-8",
+    )
+
+    # 步骤 1：读取带行号视图
+    view = read_file("e2e.py", with_line_numbers=True)
+    assert "5:     print('hello')" in view
+
+    # 步骤 2：用行号替换第 5 行
+    result = edit_file(
+        "e2e.py",
+        replacement_content="    print('world')",
+        start_line=5,
+        end_line=5,
+    )
+    assert result.startswith("✔")
+    assert target.read_text(encoding="utf-8").count("print('world')") == 1
+    assert "print('hello')" not in target.read_text(encoding="utf-8")
+
+
+def test_edit_file_by_lines_replacement_appends_newline_when_needed(tmp_path, monkeypatch):
+    """行号路径：replacement 不带换行符时系统应自动补换行符，保持行结构。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "tail.txt"
+    # 用 write_bytes 确保 LF 换行，避免 Windows write_text 默认转 CRLF
+    target.write_bytes(b"a\nb\nc\n")
+
+    # 替换第 3 行（"c\n"），replacement "C" 不带换行符
+    # 新语义：replacement 按行切分后每行自动补换行符，"C" → "C\n"
+    # 所以原 "c\n" 被替换为 "C\n"，文件保持 "a\nb\nC\n"
+    result = edit_file("tail.txt", replacement_content="C", start_line=3, end_line=3)
+
+    assert result.startswith("✔")
+    assert target.read_bytes() == b"a\nb\nC\n"
+
+
+def test_edit_file_by_lines_empty_replacement_deletes_lines(tmp_path, monkeypatch):
+    """行号路径：replacement 为空字符串时应删除指定行范围。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "delete.txt"
+    target.write_bytes(b"a\nb\nc\nd\n")
+
+    # 替换第 2-3 行为空字符串 → 删除这两行
+    result = edit_file("delete.txt", replacement_content="", start_line=2, end_line=3)
+
+    assert result.startswith("✔")
+    assert target.read_bytes() == b"a\nd\n"
+
+
+def test_edit_file_by_lines_insert_at_start(tmp_path, monkeypatch):
+    """行号路径：替换第 1 行可实现"插入+替换"效果。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "head.py"
+    target.write_text("old_first\nsecond\n", encoding="utf-8")
+
+    # 替换第 1 行为多行内容
+    result = edit_file(
+        "head.py",
+        replacement_content="new_first\nnew_second",
+        start_line=1,
+        end_line=1,
+    )
+
+    assert result.startswith("✔")
+    assert target.read_text(encoding="utf-8") == "new_first\nnew_second\nsecond\n"

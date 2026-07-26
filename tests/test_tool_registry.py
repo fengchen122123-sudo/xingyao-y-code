@@ -35,9 +35,12 @@ def test_subagent_schema_defaults_to_foreground_with_bounded_timeout():
     properties = schema["function"]["parameters"]["properties"]
 
     assert properties["run_in_background"]["default"] is False
-    assert properties["timeout_seconds"]["default"] == 600
+    # 超时不再有统一 default：未传时由 run_subagent 按角色解析
+    # （explore 240 / review 300 / test 480 / 其他 600），schema 只约束范围
+    assert "default" not in properties["timeout_seconds"]
     assert properties["timeout_seconds"]["minimum"] == 30
     assert properties["timeout_seconds"]["maximum"] == 3600
+    assert "explore 240" in properties["timeout_seconds"]["description"]
 
 
 def test_subagent_schema_exposes_role_and_plan_item():

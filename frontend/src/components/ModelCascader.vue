@@ -2,33 +2,36 @@
   <div id="model-cascader" :class="{ show: visible }" :style="styleObj" @click.stop>
     <!-- 二级子面板：具体模型列表 -->
     <div class="cascader-sub-panel" :class="{ show: activeProviderName }">
-      <div 
-        v-for="m in currentSubModels" 
+      <div
+        v-for="m in currentSubModels"
         :key="m.id || m.name"
         class="cascader-item"
-        :class="{ active: m.name === store.currentModel || m.id === store.currentModel }"
-        @click="selectModel(m.id || m.name)"
+        :class="{ active: m.id === store.activeModelId }"
+        @click="selectModel(m.id)"
       >
         <span class="c-label">{{ m.name }}</span>
-        <span v-if="m.name === store.currentModel || m.id === store.currentModel" class="c-check checked">✓</span>
+        <span v-if="m.id === store.activeModelId" class="c-check checked">✓</span>
       </div>
     </div>
 
     <!-- 一级主面板：供应商列表 -->
     <div class="cascader-main-panel">
-      <div 
-        v-for="(modelsInGroup, provider) in groupedModels" 
-        :key="provider"
-        class="cascader-item"
-        :class="{ active: activeProviderName === provider }"
-        @mouseenter="activeProviderName = provider as string"
-      >
-        <span class="c-label">{{ provider }}</span>
-        <span v-if="hasCurrentModel(modelsInGroup)" class="c-check">✓</span>
-        <span class="c-arrow">›</span>
-      </div>
-      <div class="cascader-sep"></div>
-      <div class="cascader-item cascader-manage" @click="manageModels">
+      <template v-if="hasAnyModel">
+        <div
+          v-for="(modelsInGroup, provider) in groupedModels"
+          :key="provider"
+          class="cascader-item"
+          :class="{ active: activeProviderName === provider }"
+          @mouseenter="activeProviderName = provider as string"
+        >
+          <span class="c-label">{{ provider }}</span>
+          <span v-if="hasCurrentModel(modelsInGroup)" class="c-check">✓</span>
+          <span class="c-arrow">›</span>
+        </div>
+        <div class="cascader-sep"></div>
+      </template>
+      <div v-else class="cascader-empty">暂无模型，点击 ⚙ 添加</div>
+      <div class="cascader-item cascader-manage" title="添加/管理供应商与模型" @click="manageModels">
         <span class="c-label">⚙ 管理模型</span>
       </div>
     </div>
@@ -51,50 +54,8 @@ const store = useAppStore();
 const activeProviderName = ref<string | null>(null);
 const styleObj = ref<Record<string, string>>({});
 
-// 示范组默认数据
-const fallbackGroups: Record<string, ModelInfo[]> = {
-  "Agens AI": [
-    { id: "agnes-2.0-flash", name: "agnes-2.0-flash" },
-    { id: "agnes-2.5-flash", name: "agnes-2.5-flash" }
-  ],
-  "深度求索": [
-    { id: "deepseek-chat", name: "deepseek-chat" },
-    { id: "deepseek-reasoner", name: "deepseek-reasoner" }
-  ],
-  "月之暗面": [
-    { id: "moonshot-v1-8k", name: "moonshot-v1-8k" },
-    { id: "moonshot-v1-32k", name: "moonshot-v1-32k" }
-  ],
-  "商汤": [
-    { id: "sensechat-5", name: "sensechat-5" }
-  ],
-  "火山AgentPlan": [
-    { id: "doubao-pro-32k", name: "doubao-pro-32k" }
-  ],
-  "小米": [
-    { id: "mi-lm-pro", name: "mi-lm-pro" }
-  ],
-  "Mistral": [
-    { id: "mistral-large", name: "mistral-large" }
-  ],
-  "硅基流动": [
-    { id: "step-3.7-flash", name: "step-3.7-flash" }
-  ]
-};
-
-const groupedModels = computed(() => {
-  const groups: Record<string, ModelInfo[]> = {};
-  if (store.models && store.models.length > 0) {
-    store.models.forEach(m => {
-      const p = m.provider || '通用模型';
-      if (!groups[p]) groups[p] = [];
-      groups[p].push(m);
-    });
-  } else {
-    Object.assign(groups, fallbackGroups);
-  }
-  return groups;
-});
+const groupedModels = computed(() => store.modelsByProvider);
+const hasAnyModel = computed(() => store.models.length > 0);
 
 const currentSubModels = computed(() => {
   if (!activeProviderName.value) return [];
@@ -102,7 +63,7 @@ const currentSubModels = computed(() => {
 });
 
 function hasCurrentModel(modelsList: ModelInfo[]) {
-  return modelsList.some(m => m.name === store.currentModel || m.id === store.currentModel);
+  return modelsList.some(m => m.id === store.activeModelId);
 }
 
 function selectModel(modelId: string) {
@@ -111,7 +72,7 @@ function selectModel(modelId: string) {
 }
 
 function manageModels() {
-  store.showToast('可以在设置中增删模型');
+  store.openSubpage('models');
   emit('close');
 }
 
@@ -139,6 +100,7 @@ watch(() => props.visible, (newVal) => {
     }
 
     // 默认高亮并展开当前模型的供应商
+    activeProviderName.value = null;
     for (const [provider, list] of Object.entries(groupedModels.value)) {
       if (hasCurrentModel(list)) {
         activeProviderName.value = provider;
@@ -239,5 +201,11 @@ onUnmounted(() => {
 }
 .cascader-manage:hover {
   color: var(--accent);
+}
+.cascader-empty {
+  padding: 14px 12px;
+  font-size: 12px;
+  color: var(--text-faint);
+  text-align: center;
 }
 </style>

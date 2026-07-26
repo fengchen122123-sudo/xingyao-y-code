@@ -6,17 +6,49 @@ import re
 from typing import Any, Iterable
 
 from core.thinking_stream import ThinkingStreamBuffer
+from core.ui_markers import (
+    ANSI_CYAN,
+    ANSI_GRAY,
+    ANSI_GREEN,
+    ANSI_RED,
+    ANSI_RESET,
+    ANSI_YELLOW,
+    MARK_DONE,
+    MARK_FAILED,
+    plan_color,
+    plan_mark,
+)
 
 
 _OPEN_TAGS = ("<thinking>", "<think>")
 _CLOSE_TAGS = ("</thinking>", "</think>")
 _CODE_BLOCK_FENCES = ("```", "~~~")
-_ANSI_RESET = "\x1b[0m"
-_ANSI_CYAN = "\x1b[36m"
-_ANSI_GREEN = "\x1b[32m"
-_ANSI_RED = "\x1b[31m"
-_ANSI_YELLOW = "\x1b[33m"
-_ANSI_DIM = "\x1b[90m"
+_DIFF_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_DIFF_MARKER_RE = re.compile(r"^[\d\s]*([+\-])")
+
+
+def _count_diff_changes(diff_text: str) -> tuple[int, int]:
+    """粗略统计 diff 展示文本中的新增/删除行数，用于简短模式的单行摘要。
+
+    diff_text 既可能是原始 unified diff，也可能是渲染成 Rich 表格/面板后的
+    文本（core.llm._show_file_diff 生成，行首会带行号列与面板边框）。两种
+    形式在剥离 ANSI 转义码、去掉行号列/边框后，内容列仍然以原始的 +/-/空格
+    diff 前缀开头，因此可以用同一套启发式识别。
+    """
+    added = 0
+    removed = 0
+    for raw_line in diff_text.split("\n"):
+        line = _DIFF_ANSI_RE.sub("", raw_line).strip().strip("│").strip()
+        if line.startswith("+++") or line.startswith("---"):
+            continue
+        match = _DIFF_MARKER_RE.match(line)
+        if not match:
+            continue
+        if match.group(1) == "+":
+            added += 1
+        else:
+            removed += 1
+    return added, removed
 
 
 def _find_tag(text: str, tags: Iterable[str]) -> tuple[int, str] | None:
@@ -57,7 +89,7 @@ def sanitize_protocol_text(text: str) -> str:
 class TurnRenderer:
     """Accumulate assistant text and tool status lines without doing I/O."""
 
-    def __init__(self) -> None:
+    def __init__(self, tool_verbose: bool = True) -> None:
         self._records: list[str] = []
         self._pending_text = ""
         self._in_thinking = False
@@ -66,7 +98,15 @@ class TurnRenderer:
         self._emitted: list[str] = []
         self._finished = False
         self._completed_tool_count = 0
+        # 工具调用细节是否在屏幕打印（False=简短模式：只显示"星瑶正在干活"汇总行）
+        # 数据库记录不受此开关影响，event 仍带完整 summary 入库
+        self._tool_verbose = bool(tool_verbose)
         self._completed_tools: list[tuple[str, str]] = []
+        self._failed_tool_count = 0
+        # 简短模式下"星瑶正在干活…"汇总行是否已打印过（每回合只打印一次）
+        self._concise_header_emitted = False
+        # 简短模式的收尾统计行是否已经生成过（避免重复调用 concise_recap 时重复输出）
+        self._recap_emitted = False
         self._has_meaningful_assistant_text = False
         self._thinking_stream = ThinkingStreamBuffer()
         self._assistant_text_parts: list[str] = []
@@ -98,22 +138,26 @@ class TurnRenderer:
         elif kind == "diff_ready":
             diff = str(data.get("text") or data.get("diff") or "")
             if diff:
-                self._append_line(diff)
+                if self._tool_verbose:
+                    self._append_line(diff)
+                else:
+                    file_path = str(data.get("file_path") or "").strip()
+                    added, removed = _count_diff_changes(diff)
+                    self._append_line(
+                        f"✎ {ANSI_CYAN}{file_path}{ANSI_RESET}"
+                        f"（{ANSI_GREEN}+{added}{ANSI_RESET} 行 / "
+                        f"{ANSI_RED}-{removed}{ANSI_RESET} 行）"
+                    )
         elif kind == "plan_updated":
             if data.get("live_only"):
                 return []
-            status_markers = {
-                "completed": "✓",
-                "in_progress": "■",
-                "failed": "✗",
-                "cancelled": "-",
-                "pending": "□",
-            }
             for item in data.get("items", []):
                 status = str(item.get("status", "pending"))
                 subject = str(item.get("subject", "")).strip()
                 if subject:
-                    self._append_line(f"  {status_markers.get(status, '□')} {subject}")
+                    mark = plan_mark(status)
+                    color = plan_color(status)
+                    self._append_line(f"  {color}{mark}{ANSI_RESET} {subject}")
 
         return list(self._emitted)
 
@@ -164,7 +208,15 @@ class TurnRenderer:
                     suffix = self._pending_text[index:]
                     self._pending_text = self._pending_text[:index]
                     self._consume_text("")
-                    self._pending_text += suffix
+                    if self._pending_text:
+                        # 递归调用后仍保留了被保守持留的尾部（例如一个尚未完整的
+                        # <think> 标签前缀）。此时 fence 已经不再位于位置 0，不能
+                        # 再假设 self._pending_text[:len(fence)] 就是围栏本身——
+                        # 原样拼回并直接返回，等待下一块数据到达后重新判断；
+                        # 回合结束时 finish_incremental 会把剩余内容当纯文本冲刷。
+                        self._pending_text += suffix
+                        return
+                    self._pending_text = suffix
                 self._append_text(self._pending_text[:len(fence)])
                 self._pending_text = self._pending_text[len(fence):]
                 self._in_code_block = True
@@ -237,13 +289,19 @@ class TurnRenderer:
         if not target or target not in summary:
             return summary
         before, _, after = summary.partition(target)
-        return f"{before}{_ANSI_CYAN}{target}{_ANSI_RESET}{after}"
+        return f"{before}{ANSI_CYAN}{target}{ANSI_RESET}{after}"
 
     def _tool_requested(self, data: dict[str, Any]) -> None:
         tool_id = str(data.get("id") or self._tool_label(data))
         label = self._tool_label(data)
         self._tool_lines[tool_id] = (label, "")
-        self._append_line(f"{_ANSI_GREEN}●{_ANSI_RESET} {self._styled_tool_summary(data)}")
+        # 详细模式：不再打印"星瑶正在 X"请求行，只做内部记录——工具的唯一一行
+        # 反馈改到 _tool_finished 里打印（✓/✗ 汇总行），进行中的状态已经由
+        # main.py 底部的活动指示行实时展示，这里重复打印只会让屏幕更吵。
+        # 简短模式：仅首次工具调用时打印一行"星瑶正在干活"汇总（每回合一次）。
+        if not self._tool_verbose and not self._concise_header_emitted:
+            self._concise_header_emitted = True
+            self._append_line(f"{ANSI_GREEN}●{ANSI_RESET} 星瑶正在干活…")
 
     def _tool_finished(self, data: dict[str, Any]) -> None:
         tool_id = str(data.get("id") or self._tool_label(data))
@@ -252,18 +310,43 @@ class TurnRenderer:
         if not label:
             label = self._tool_label(data)
         ok = bool(data.get("ok", True))
-        marker = "✓" if ok else "!"
-        color = _ANSI_GREEN if ok else _ANSI_YELLOW
-        styled_summary = self._styled_tool_summary(data) if data.get("summary") else label
-        self._append_line(f"{color}{marker}{_ANSI_RESET} {styled_summary}")
         self._completed_tool_count += 1
         self._completed_tools.append((str(data.get("name", "tool")), label))
+        if not ok:
+            self._failed_tool_count += 1
+        styled_summary = self._styled_tool_summary(data) if data.get("summary") else label
+        if not self._tool_verbose:
+            # 简短模式：成功的工具调用保持静默（过程中的试错不刷屏）；
+            # 失败必须可见——绝不能无声消失，否则用户根本不知道出了问题。
+            # 失败信息始终完整入库，用户也可通过 /verbose on 切到详细模式查看全过程。
+            if not ok:
+                self._append_line(f"{ANSI_RED}{MARK_FAILED}{ANSI_RESET} {styled_summary}")
+            return
+        marker = MARK_DONE if ok else MARK_FAILED
+        color = ANSI_GREEN if ok else ANSI_RED
+        self._append_line(f"{color}{marker}{ANSI_RESET} {styled_summary}")
 
     def _error(self, message: str) -> None:
         if not message or message in self._errors:
             return
         self._errors.add(message)
-        self._append_line(f"{_ANSI_YELLOW}  ! 星瑶暂未完成当前步骤{_ANSI_RESET}")
+        self._append_line(f"{ANSI_YELLOW}  ! 星瑶暂未完成当前步骤{ANSI_RESET}")
+
+    def concise_recap(self) -> str:
+        """简短模式下的回合收尾统计行：共执行 N 项操作（M 项失败）。
+
+        详细模式、本回合未执行任何工具、或本实例已经生成过收尾行时返回空串。
+        由 main.py 在 turn_finished/turn_cancelled/turn_error 时调用一次，直接
+        经 _print_ui_fragment 打印——不走 Markdown 渲染缓冲区，避免其中的
+        ANSI 颜色码被当成 Markdown 源文本处理导致显示异常。
+        """
+        if self._tool_verbose or not self._completed_tools or self._recap_emitted:
+            return ""
+        self._recap_emitted = True
+        total = len(self._completed_tools)
+        failed = self._failed_tool_count
+        suffix = f"（{failed} 项失败）" if failed else ""
+        return f"{ANSI_GRAY}● 共执行 {total} 项操作{suffix}{ANSI_RESET}\n"
 
     def finish(self) -> str:
         if not self._finished:
@@ -294,11 +377,17 @@ class TurnRenderer:
         if not self._in_thinking and self._pending_text:
             self._append_text(self._pending_text)
         self._pending_text = ""
-        if self._completed_tool_count and not self._has_meaningful_assistant_text:
+        if self._has_meaningful_assistant_text:
+            return
+        if self._completed_tool_count:
             read_count = sum(name == "read_file" for name, _ in self._completed_tools)
             if read_count:
                 summary = f"检查完成：已读取 {read_count} 个文件。模型未返回最终结论。"
             else:
                 summary = f"检查完成：已执行 {self._completed_tool_count} 项工具操作。模型未返回最终结论。"
             self._append_line(f"  {summary}")
+        else:
+            # 回合结束但既无文字输出也未执行任何工具（如只思考未产出），
+            # 给用户一个明确的兜底提示，避免看起来"什么都没发生"
+            self._append_line("  星瑶本轮暂未返回内容。")
 

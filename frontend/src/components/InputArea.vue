@@ -11,14 +11,32 @@
         ></textarea>
 
         <div id="input-bar">
-          <button class="chip-btn" title="附加文件" @click="store.showToast('附件加载功能')">📎 文件</button>
-          <button class="chip-btn" title="深度思考" @click="store.showToast('深度思考已开启')">🧠 思考</button>
-          <button class="chip-btn" title="计划模式" @click="store.setPermissionMode('计划模式', 'plan')">📋 计划</button>
-          <button class="chip-btn" title="斜杠命令" @click="store.showToast('常用斜杠命令')">/ 命令</button>
-          
-          <button 
-            id="send-btn" 
+          <button class="chip-btn" title="附加文件" @click="handlePickFiles">📎 文件</button>
+          <button
+            class="chip-btn"
+            :class="{ active: store.showThinking }"
+            title="显示/收起思考过程"
+            @click="store.toggleShowThinking()"
+          >🧠 思考</button>
+          <button
+            ref="permBtnRef"
+            class="chip-btn"
+            :class="{ active: store.permissionMode === 'plan' || store.permissionMode === 'full' }"
+            title="切换权限模式"
+            @click.stop="togglePermDropdown"
+          >☑ {{ formatPermMode(store.permissionMode) }} <span style="font-size:9px;color:var(--text-faint)">▼</span></button>
+          <button class="chip-btn" title="撤销星瑶上一次的文件修改" @click="store.undoLastEdit()">↩ 撤销</button>
+
+          <button
+            ref="modelBtnRef"
+            class="chip-btn model-chip"
+            title="切换模型"
+            @click.stop="toggleModelCascader"
+          >{{ store.activeModelName || '选择模型' }} <span style="font-size:9px;color:var(--text-faint)">▼</span></button>
+          <button
+            id="send-btn"
             :class="{ stop: store.running }"
+            :title="store.running ? '停止生成 (Esc)' : '发送消息 (Enter)'"
             @click="handleSend"
           >
             <template v-if="store.running">■ 停止 (Esc)</template>
@@ -28,9 +46,21 @@
       </div>
     </div>
 
+    <!-- 模型 / 权限下拉（与空状态页共用组件） -->
+    <ModelCascader
+      :visible="showModelCascader"
+      :anchor-el="modelBtnRef"
+      @close="showModelCascader = false"
+    />
+    <PermDropdown
+      :visible="showPermDropdown"
+      :anchor-el="permBtnRef"
+      @close="showPermDropdown = false"
+    />
+
     <div id="input-meta">
       <div class="l">
-        <span>Token: 0 / 128,000</span>
+        <span :class="tokenClass">Token: {{ tokenUsedDisplay }} / {{ tokenWindowDisplay }}</span>
       </div>
       <div class="r">
         <span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行 · <span class="kbd">Esc</span> 中断
@@ -40,14 +70,52 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import { formatPermMode } from '../utils/markdown';
+import ModelCascader from './ModelCascader.vue';
+import PermDropdown from './PermDropdown.vue';
 
 const store = useAppStore();
 const inputVal = ref('');
 
+const showModelCascader = ref(false);
+const showPermDropdown = ref(false);
+const modelBtnRef = ref<HTMLElement | null>(null);
+const permBtnRef = ref<HTMLElement | null>(null);
+
+function toggleModelCascader() {
+  showPermDropdown.value = false;
+  showModelCascader.value = !showModelCascader.value;
+}
+
+function togglePermDropdown() {
+  showModelCascader.value = false;
+  showPermDropdown.value = !showPermDropdown.value;
+}
+
+const tokenUsedDisplay = computed(() => (store.tokenUsage.used || 0).toLocaleString('zh-CN'));
+const tokenWindowDisplay = computed(() => (store.tokenUsage.window || 0).toLocaleString('zh-CN'));
+const tokenPct = computed(() => {
+  const w = store.tokenUsage.window || 0;
+  if (!w) return 0;
+  return (store.tokenUsage.used / w) * 100;
+});
+const tokenClass = computed(() => {
+  if (tokenPct.value > 90) return 'tok-red';
+  if (tokenPct.value > 70) return 'tok-orange';
+  return '';
+});
+
+async function handlePickFiles() {
+  const paths = await store.pickFiles();
+  if (paths.length) {
+    inputVal.value += paths.map(p => ` @${p}`).join('');
+  }
+}
+
 function handleSend() {
-  if (store.running && !inputVal.value.trim()) {
+  if (store.running) {
     store.stopCurrentTurn();
     return;
   }
@@ -117,9 +185,22 @@ textarea {
   border-color: var(--accent);
   color: var(--text);
 }
+.chip-btn.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: rgba(79, 140, 255, 0.12);
+}
+
+.model-chip {
+  margin-left: auto;
+  max-width: 180px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: inline-block;
+}
 
 #send-btn {
-  margin-left: auto;
   border-radius: 8px;
   padding: 5px 14px;
   font-size: 12.5px;
@@ -152,5 +233,11 @@ textarea {
   border-radius: 4px;
   padding: 1px 5px;
   font-size: 10px;
+}
+.tok-orange {
+  color: var(--orange);
+}
+.tok-red {
+  color: var(--red);
 }
 </style>

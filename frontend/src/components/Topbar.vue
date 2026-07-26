@@ -1,16 +1,16 @@
 <template>
   <div id="topbar">
-    <button class="icon-btn" id="btn-toggle-side" title="切换侧栏" @click="store.sidebarCollapsed = !store.sidebarCollapsed">☰</button>
-    <div class="logo">
+    <button class="icon-btn" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">☰</button>
+    <div class="logo" :title="store.version ? ('Y-CODE 星瑶 v' + store.version) : 'Y-CODE 星瑶'">
       <div class="mark">Y</div>
       <div><span class="name">Y-CODE</span> <span class="sub">星瑶 · Vue 3</span></div>
     </div>
     <div class="top-spacer"></div>
-    
-    <button class="icon-btn" id="btn-theme" title="切换主题" @click="toggleTheme">
+
+    <button class="icon-btn" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
       {{ store.themeLight ? '☀️' : '🌙' }}
     </button>
-    <button class="icon-btn" id="btn-toggle-right" title="切换面板" @click="store.rightPanelCollapsed = !store.rightPanelCollapsed">▐</button>
+    <button class="icon-btn" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">▐</button>
   </div>
 </template>
 
@@ -18,15 +18,6 @@
 import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
-
-function toggleTheme() {
-  store.themeLight = !store.themeLight;
-  if (store.themeLight) {
-    document.body.classList.add('light');
-  } else {
-    document.body.classList.remove('light');
-  }
-}
 </script>
 
 <style scoped>

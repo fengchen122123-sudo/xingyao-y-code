@@ -1,6 +1,7 @@
 import asyncio
 import atexit
 import concurrent.futures
+import logging
 import threading
 import json
 import os
@@ -14,18 +15,30 @@ INITIALIZE_TIMEOUT = 10
 CALL_TOOL_TIMEOUT = 60
 
 
+# MCP 状态输出回调：默认写日志，由入口层（main.py / gui_bridge.py）
+# 按各自 UI 形态注册真正的展示方式，本模块不依赖任何界面库。
+_status_logger = None
+
+
+def set_status_logger(callback):
+    """注册 MCP 状态展示回调；传 None 恢复为默认的日志输出。
+
+    回调会在 MCP 后台线程中被调用，注册方必须自行切回各自的 UI 线程。
+    """
+    global _status_logger
+    _status_logger = callback
+
+
 def _emit_status(message):
-    """Render MCP connection status on the TUI loop when it exists."""
-    try:
-        import main
-        app = getattr(main, "app_instance", None)
-        if app is not None and app.loop is not None:
-            from prompt_toolkit import print_formatted_text
-            app.loop.call_soon_threadsafe(lambda: print_formatted_text(message))
+    """输出 MCP 连接状态：优先交给已注册的展示回调，否则记入日志。"""
+    callback = _status_logger
+    if callback is not None:
+        try:
+            callback(message)
             return
-    except Exception:
-        pass
-    print(message)
+        except Exception:
+            pass
+    logging.getLogger(__name__).info("%s", message)
 
 class MCPManager:
     def __init__(self):
@@ -196,6 +209,11 @@ class MCPManager:
         servers = self.config.get("mcpServers", {})
         tasks = []
         for name, conf in servers.items():
+            # 支持 enabled 字段：显式 false 时跳过连接，配置保留方便随时启用
+            # 未设置 enabled 或 enabled=true 都按启用处理（向后兼容旧配置）
+            if isinstance(conf, dict) and conf.get("enabled", True) is False:
+                _emit_status(f"\n[MCP] 跳过已禁用的服务: {name}")
+                continue
             tasks.append(self._connect_server(name, conf))
         if tasks:
             await asyncio.gather(*tasks)
@@ -249,6 +267,172 @@ class MCPManager:
             except Exception:
                 pass
         self.servers.clear()
+
+    def reconnect(self):
+        """运行期重连：先关闭所有现有连接与子进程，再清空状态，下次 get_schemas()/call_tool_sync() 时惰性重建。
+
+        供 /mcp reconnect 调用，避免用户编辑 mcp.json 后必须重启进程。
+        返回 (ok: bool, message: str)。
+        """
+        if self._closed:
+            return False, "MCP 管理器已关闭（进程退出中）"
+        try:
+            # 1) 在事件循环中关闭所有现有 server stack
+            try:
+                if not self.loop.is_closed():
+                    future = asyncio.run_coroutine_threadsafe(self._close_all(), self.loop)
+                    future.result(timeout=10)
+            except Exception as e:
+                _emit_status(f"\n[MCP] 重连-关闭旧连接失败（继续重置）: {e}")
+            # 2) 清空状态，重置占位标记，下次访问会重新读 mcp.json 并发起连接
+            with self._connect_lock:
+                self.tool_schemas = []
+                self.server_of_tool = {}
+                self.servers = {}
+                self._connect_future = None
+                self._connect_future_is_placeholder = False
+            # 3) 重新读盘 + 立即触发一次连接（不阻塞等待结果）
+            self._ensure_connected()
+            return True, "已清空旧连接并重新发起连接，下次调用 MCP 工具时生效"
+        except Exception as e:
+            return False, f"重连失败: {e}"
+
+    def set_server_enabled(self, name, enabled):
+        """启用/禁用某个 MCP server，并立即重连生效。
+
+        会写回 mcp.json：把 server.enabled 字段设为 True/False。
+        若 server 不存在返回失败；若原本就没 enabled 字段，会新增。
+        禁用后下次 reconnect 不会拉起该 server，但配置保留以便随时启用。
+        返回 (ok: bool, message: str)。
+        """
+        if self._closed:
+            return False, "MCP 管理器已关闭（进程退出中）"
+        try:
+            # 1) 重新读盘拿最新配置
+            self._load_config()
+            servers = self.config.get("mcpServers", {})
+            if name not in servers:
+                return False, f"未找到 MCP 服务: {name}（可用 /mcp status 查看已配置项）"
+            if not isinstance(servers[name], dict):
+                return False, f"服务 {name} 的配置格式异常（应为对象）"
+            # 2) 更新 enabled 字段
+            servers[name]["enabled"] = bool(enabled)
+            # 3) 写回 mcp.json（保持缩进与编码）
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+            # 4) 触发重连让改动立即生效
+            ok, msg = self.reconnect()
+            if not ok:
+                return True, f"已更新 {name}.enabled={enabled}，但重连失败: {msg}"
+            action = "启用" if enabled else "禁用"
+            return True, f"已{action}服务 {name}，并重新发起连接"
+        except Exception as e:
+            return False, f"更新失败: {e}"
+
+    def add_server(self, name, command, args, env=None, enabled=True):
+        """新增一个 MCP server 配置，并立即重连生效。
+
+        供 AI 工具和 /mcp TUI 配置器调用，避免用户手动编辑 JSON。
+        参数：
+          name: server 名称（用作 mcpServers 下的 key，也是工具名前缀）
+          command: 启动命令（如 "npx"）
+          args: 命令参数数组（如 ["-y", "firecrawl-mcp"]）
+          env: 环境变量字典（如 {"FIRECRAWL_API_KEY": "fc-xxx"}），可为 None
+          enabled: 是否立即启用，默认 True
+        返回 (ok: bool, message: str)。
+        """
+        if self._closed:
+            return False, "MCP 管理器已关闭（进程退出中）"
+        if not name or not isinstance(name, str):
+            return False, "server 名称不能为空"
+        if not command or not isinstance(command, str):
+            return False, "command 不能为空"
+        if not isinstance(args, list):
+            return False, "args 必须是数组（如 [\"-y\", \"firecrawl-mcp\"]）"
+        if env is not None and not isinstance(env, dict):
+            return False, "env 必须是字典或 null"
+        try:
+            self._load_config()
+            servers = self.config.setdefault("mcpServers", {})
+            if name in servers:
+                return False, f"已存在同名服务: {name}（如需更新请先 /mcp remove {name}）"
+            servers[name] = {
+                "enabled": bool(enabled),
+                "command": command,
+                "args": args,
+            }
+            if env:
+                servers[name]["env"] = env
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+            ok, msg = self.reconnect()
+            if not ok:
+                return True, f"已写入 {name} 配置，但重连失败: {msg}"
+            return True, f"已新增服务 {name}（command={command}），并重新发起连接"
+        except Exception as e:
+            return False, f"新增失败: {e}"
+
+    def remove_server(self, name):
+        """删除一个 MCP server 配置，并立即重连生效。
+
+        供 AI 工具和 /mcp TUI 配置器调用。
+        返回 (ok: bool, message: str)。
+        """
+        if self._closed:
+            return False, "MCP 管理器已关闭（进程退出中）"
+        if not name:
+            return False, "server 名称不能为空"
+        try:
+            self._load_config()
+            servers = self.config.get("mcpServers", {})
+            if name not in servers:
+                return False, f"未找到 MCP 服务: {name}"
+            del servers[name]
+            with open(self.config_file, "w", encoding="utf-8") as f:
+                json.dump(self.config, f, indent=4, ensure_ascii=False)
+            ok, msg = self.reconnect()
+            if not ok:
+                return True, f"已删除 {name}，但重连失败: {msg}"
+            return True, f"已删除服务 {name}，并重新发起连接"
+        except Exception as e:
+            return False, f"删除失败: {e}"
+
+    def list_servers(self):
+        """返回所有 MCP server 配置的 JSON 字符串（供 AI 工具读取）。
+
+        包含 enabled/command/args/env 字段，env 中的 API Key 会做掩码处理
+        （前 4 位 + **** + 后 4 位），避免敏感信息泄露给 LLM。
+        """
+        try:
+            self._load_config()
+            servers = self.config.get("mcpServers", {})
+            result = []
+            for name, conf in servers.items():
+                if not isinstance(conf, dict):
+                    continue
+                item = {
+                    "name": name,
+                    "enabled": conf.get("enabled", True) is not False,
+                    "command": conf.get("command", ""),
+                    "args": conf.get("args", []),
+                    "connected": name in self.servers,
+                }
+                # env 中的 API Key 做掩码处理
+                env = conf.get("env")
+                if env:
+                    masked = {}
+                    for k, v in env.items():
+                        if isinstance(v, str) and len(v) > 12 and ("key" in k.lower() or "token" in k.lower() or "secret" in k.lower()):
+                            masked[k] = v[:4] + "****" + v[-4:]
+                        else:
+                            masked[k] = v
+                    item["env"] = masked
+                else:
+                    item["env"] = None
+                result.append(item)
+            return json.dumps(result, ensure_ascii=False, indent=2)
+        except Exception as e:
+            return json.dumps({"error": str(e)}, ensure_ascii=False)
 
     def close(self):
         """统一清理：关闭所有 server 子进程与 AsyncExitStack（进程退出时由 atexit 调用）。

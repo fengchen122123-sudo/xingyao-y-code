@@ -19,6 +19,8 @@ import json
 import os
 from pathlib import Path
 
+import core.app_context as app_context
+
 
 def _escape_html(text):
     """HTML 转义。"""
@@ -73,11 +75,10 @@ def export_session_markdown(session_name, manager=None, output_path=None):
     返回：导出的文件路径，或错误信息
     """
     if manager is None:
-        try:
-            import main
-            manager = main.manager
-        except Exception as e:
-            return f"🚨 无法获取会话管理器: {e}"
+        # 未显式传入时回落到运行时上下文（TUI / GUI 启动时都会注册）
+        manager = app_context.get_manager()
+    if manager is None:
+        return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"
 
     history = manager.get_history(session_name)
     if not history:
@@ -116,11 +117,10 @@ def export_session_markdown(session_name, manager=None, output_path=None):
 def export_session_html(session_name, manager=None, output_path=None):
     """导出会话为 HTML 文件（含样式，便于阅读）。"""
     if manager is None:
-        try:
-            import main
-            manager = main.manager
-        except Exception as e:
-            return f"🚨 无法获取会话管理器: {e}"
+        # 未显式传入时回落到运行时上下文（TUI / GUI 启动时都会注册）
+        manager = app_context.get_manager()
+    if manager is None:
+        return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"
 
     history = manager.get_history(session_name)
     if not history:
@@ -214,11 +214,10 @@ def export_session_html(session_name, manager=None, output_path=None):
 def export_session_json(session_name, manager=None, output_path=None):
     """导出会话为原始 JSON 文件。"""
     if manager is None:
-        try:
-            import main
-            manager = main.manager
-        except Exception as e:
-            return f"🚨 无法获取会话管理器: {e}"
+        # 未显式传入时回落到运行时上下文（TUI / GUI 启动时都会注册）
+        manager = app_context.get_manager()
+    if manager is None:
+        return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"
 
     history = manager.get_history(session_name)
     if not history:

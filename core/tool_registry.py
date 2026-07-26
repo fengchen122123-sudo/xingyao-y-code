@@ -6,6 +6,16 @@ from typing import Any, Iterable
 
 from core.tool_protocol import ToolResult, ToolSpec
 
+# 调度层（core/llm.py）会向 arguments 注入 schema 之外的内部上下文参数，
+# 过滤未知参数时必须放行这些键，否则会破坏取消/权限链路
+_INTERNAL_ARG_KEYS = {
+    "cancel_event",
+    "event_callback",
+    "permission_owner",
+    "permission_source",
+    "parent_turn_id",
+}
+
 
 class ToolRegistry:
     def __init__(self, specs: Iterable[ToolSpec] = ()):
@@ -36,6 +46,15 @@ class ToolRegistry:
         spec = self._specs.get(name)
         if spec is None:
             return ToolResult(content=f"Unknown tool: {name}", is_error=True)
+        # 模型偶尔会编造 schema 之外的参数（如 regex=true、max_results=50），
+        # 直接 **arguments 调用会 TypeError 变成 "Tool execution error"，
+        # 导致本可成功的调用整体失败；这里按 schema 丢弃未知参数保住调用
+        props = (spec.input_schema or {}).get("properties")
+        if isinstance(props, dict) and props:
+            arguments = {
+                key: value for key, value in arguments.items()
+                if key in props or key in _INTERNAL_ARG_KEYS
+            }
         try:
             result = spec.execute(**arguments)
             if isinstance(result, ToolResult):
@@ -45,10 +64,14 @@ class ToolRegistry:
             return ToolResult(content=f"Tool execution error: {exc}", is_error=True)
 
 
-def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
+def _schema(properties: dict[str, Any], required: list[str] | None = None, **extra: Any) -> dict[str, Any]:
     result: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         result["required"] = required
+    # 支持 anyOf / oneOf / allOf 等 JSON Schema 顶层约束
+    for key, value in extra.items():
+        if value is not None:
+            result[key] = value
     return result
 
 
@@ -61,12 +84,13 @@ def build_default_registry() -> ToolRegistry:
     read_specs = [
         ToolSpec(
             name="read_file",
-            description="读取指定文件的文本内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；默认最多返回 2000 行，大文件（>50KB）自动只读前 500 行并提示分页；compress=False 默认返回完全原始内容，设 compress=True 可压缩（去行尾空白、合并空行）以节省 token 但会与原文不完全一致（编辑前需 compress=False 重读以保证 edit_file 匹配）。",
+            description="读取指定文件的文本内容。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；默认最多返回 2000 行，大文件（>50KB）自动只读前 500 行并提示分页；compress=False 默认返回完全原始内容，设 compress=True 可压缩（去行尾空白、合并空行）以节省 token 但会与原文不完全一致（编辑前需 compress=False 重读以保证 edit_file 匹配）；with_line_numbers=True 时返回 \"N: line\" 格式（1-based），便于配合 edit_file 的 start_line/end_line 精准定位大文件或重复代码段。",
             input_schema=_schema({
                 "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
                 "offset": {"type": "integer", "default": 0, "description": "从第几行开始读取（0 起）"},
                 "limit": {"type": "integer", "description": "最多读取的行数（上限 2000）"},
                 "compress": {"type": "boolean", "default": False, "description": "是否压缩文本（去行尾空白、合并空行）。默认 False 保留原始内容；浏览理解时可设 True 省 token，但编辑前需用 compress=False 重读"},
+                "with_line_numbers": {"type": "boolean", "default": False, "description": "是否在每行前添加 1-based 行号前缀（如 \"1: code\\n2: code\\n\"）。默认 False。设 True 时 compress 被忽略；建议与 edit_file 的 start_line/end_line 参数配合使用，适用于大文件、重复代码段、字符串匹配易失败的场景"},
             }, ["file_path"]),
             execute=tools.read_file,
             read_only=True,
@@ -278,13 +302,28 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="edit_file",
-            description="以字符串替换的方式局部修改已有文件（首选工具）。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）；系统会尝试智能定位 target_content，即使轻微截断/空白差异也能匹配。target_content 应尽量短小并包含唯一上下文；出现多次时需补充上下文或显式设置 replace_all。单次 target_content 不得超过 1500 字符，更大改动请拆分为多次小改；严禁用 write_file 覆盖已有大文件来替代 edit_file。",
+            description=(
+                "局部修改已有文件（首选工具）。默认仅限当前工作目录内（用户可通过 /sandbox on 开放）。\n"
+                "⚠ 参数硬约束（二选一，必须完整提供，缺一即报错）：\n"
+                "  路径A 字符串匹配：必传 target_content + replacement_content（target_content 为空或缺失会直接失败）\n"
+                "  路径B 行号路径：必传 start_line + end_line + replacement_content（只传一个行号会失败）\n"
+                "两条路径互斥：传了 start_line/end_line 就跳过 target_content 匹配。\n"
+                "路径A 适合小文件/唯一代码段，target_content 应包含唯一上下文（≤1500 字符），多次出现需补上下文或 replace_all=True。\n"
+                "路径B 适合大文件/重复代码段，建议先 read_file(with_line_numbers=True) 获取行号。\n"
+                "严禁用 write_file 覆盖已有大文件来替代 edit_file。"
+            ),
             input_schema=_schema({
                 "file_path": {"type": "string", "description": "当前工作目录内的文件路径"},
-                "target_content": {"type": "string"},
-                "replacement_content": {"type": "string"},
-                "replace_all": {"type": "boolean", "default": False, "description": "是否替换全部出现位置"},
-            }, ["file_path", "target_content", "replacement_content"]),
+                "target_content": {"type": "string", "description": "路径A 必传：要被替换的旧代码段（须与文件实际内容完全一致，含缩进/空白）。路径B 下可省略"},
+                "replacement_content": {"type": "string", "description": "两条路径都必传：要换上的新代码段"},
+                "replace_all": {"type": "boolean", "default": False, "description": "路径A 下是否替换全部出现位置；路径B 下忽略"},
+                "start_line": {"type": "integer", "description": "路径B 必传：1-based 起始行号（inclusive）。必须与 end_line 同时提供"},
+                "end_line": {"type": "integer", "description": "路径B 必传：1-based 结束行号（inclusive）。必须与 start_line 同时提供。超出文件总行数时自动收敛不报错"},
+            }, ["file_path", "replacement_content"],
+            anyOf=[
+                {"required": ["target_content"]},
+                {"required": ["start_line", "end_line"]},
+            ]),
             execute=tools.edit_file,
             mutates_files=True,
             activity_description="修改文件",
@@ -293,8 +332,14 @@ def build_default_registry() -> ToolRegistry:
             name="execute_command",
             description=(
                 "执行本地命令。前台执行默认 30 秒超时，可用 timeout_seconds 调整（上限 600 秒）。"
-                "注意：PowerShell 中 $env:XXX 这类变量在单引号字符串内不会扩展，应使用双引号包裹"
-                "（例如 -OutFile \"$env:TEMP\\pkg.zip\"）。"
+                "PowerShell 注意事项：\n"
+                "1) $env:XXX 这类变量在单引号字符串内不会扩展，应使用双引号包裹"
+                "（例如 -OutFile \"$env:TEMP\\pkg.zip\"）\n"
+                "2) 命令串联必须用 ;（分号）或换行，禁止用 & 作为分隔符。"
+                "PowerShell 中 & 是调用运算符（用于执行字符串命令），非 Bash 风格的命令串联符。"
+                "错误示例：cd path & javac Foo.java（会抛 ParserError，退出码 2）"
+                "正确示例：cd path; javac Foo.java; java Foo\n"
+                "3) 条件串联用 if ($LASTEXITCODE -eq 0) { next }，PowerShell 7+ 才支持 && 运算符"
             ),
             input_schema=_schema({
                 "command": {"type": "string"},
@@ -343,10 +388,12 @@ def build_default_registry() -> ToolRegistry:
                 "run_in_background": {"type": "boolean", "default": False},
                 "timeout_seconds": {
                     "type": "integer",
-                    "default": 600,
                     "minimum": 30,
                     "maximum": 3600,
-                    "description": "默认 600 秒；简单只读任务可调小，复杂多步任务可调大。",
+                    "description": (
+                        "不传时按类型自动选择：explore 240 / review 300 / "
+                        "test 480 / 其他 600 秒。复杂多步任务可显式调大。"
+                    ),
                 },
             }, ["task_description"]),
             execute=tools.run_subagent,
@@ -354,5 +401,98 @@ def build_default_registry() -> ToolRegistry:
             parallel_safe=True,
             activity_description="启动子 Agent",
         ),
+        # ── MCP 服务配置工具（让 AI 能自己配置/启用/禁用 MCP server）─────
+        ToolSpec(
+            name="mcp_add_server",
+            description=(
+                "新增一个 MCP server 配置并立即重连生效。用于让 AI 帮用户配置 MCP（如 Firecrawl、wigolo 等）。"
+                "会写入 ~/.ycode/mcp.json 并触发重连。若已存在同名 server 会失败，需先调用 mcp_remove_server。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "server 名称（用作工具名前缀，如 'firecrawl'）"},
+                "command": {"type": "string", "description": "启动命令，通常为 'npx'"},
+                "args": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "命令参数数组，如 ['-y', 'firecrawl-mcp']",
+                },
+                "env": {
+                    "type": "object",
+                    "description": "环境变量字典（可选），如 {\"FIRECRAWL_API_KEY\": \"fc-xxx\"}",
+                },
+                "enabled": {"type": "boolean", "default": True},
+            }, ["name", "command", "args"]),
+            execute=lambda name, command, args, env=None, enabled=True: _mcp_add_server_wrapper(name, command, args, env, enabled),
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="新增 MCP server",
+        ),
+        ToolSpec(
+            name="mcp_remove_server",
+            description=(
+                "删除一个 MCP server 配置并立即重连生效。"
+                "会从 ~/.ycode/mcp.json 移除该 server 并关闭其子进程。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "要删除的 server 名称"},
+            }, ["name"]),
+            execute=lambda name: _mcp_remove_server_wrapper(name),
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="删除 MCP server",
+        ),
+        ToolSpec(
+            name="mcp_set_enabled",
+            description=(
+                "启用或禁用某个 MCP server（写回 mcp.json + 重连）。"
+                "禁用时配置保留，随时可重新启用。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "server 名称"},
+                "enabled": {"type": "boolean", "description": "true=启用, false=禁用"},
+            }, ["name", "enabled"]),
+            execute=lambda name, enabled: _mcp_set_enabled_wrapper(name, enabled),
+            requires_permission=False,
+            parallel_safe=False,
+            activity_description="切换 MCP server 开关",
+        ),
+        ToolSpec(
+            name="mcp_list_servers",
+            description=(
+                "列出所有已配置的 MCP server（含 enabled/command/args/env/connected 字段）。"
+                "env 中的 API Key 会做掩码处理（前4位+****+后4位），避免敏感信息泄露。"
+                "用于 AI 在配置前查看现状。"
+            ),
+            input_schema=_schema({}),
+            execute=lambda **kwargs: _mcp_list_servers_wrapper(),
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查看 MCP 服务列表",
+        ),
     ]
     return ToolRegistry([*read_specs, *mutating_specs])
+
+
+# ── MCP 配置工具的执行包装函数 ──────────────────────────────────────
+def _mcp_add_server_wrapper(name, command, args, env, enabled):
+    from core.mcp_client import mcp_manager
+    ok, msg = mcp_manager.add_server(name, command, args, env, enabled)
+    return ToolResult(content=msg, is_error=not ok)
+
+
+def _mcp_remove_server_wrapper(name):
+    from core.mcp_client import mcp_manager
+    ok, msg = mcp_manager.remove_server(name)
+    return ToolResult(content=msg, is_error=not ok)
+
+
+def _mcp_set_enabled_wrapper(name, enabled):
+    from core.mcp_client import mcp_manager
+    ok, msg = mcp_manager.set_server_enabled(name, enabled)
+    return ToolResult(content=msg, is_error=not ok)
+
+
+def _mcp_list_servers_wrapper():
+    from core.mcp_client import mcp_manager
+    return ToolResult(content=mcp_manager.list_servers(), is_error=False)

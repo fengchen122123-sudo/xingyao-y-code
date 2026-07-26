@@ -6,15 +6,23 @@
     <!-- 主体区域 -->
     <div id="main">
       <!-- 左侧边栏 -->
-      <Sidebar @open-sub="openSubpage" />
+      <Sidebar />
 
       <!-- 中间主对话与聊天区域 -->
       <div id="center">
         <div id="chat-header">
           <span class="crumb">会话 / <b>{{ store.currentSessionDisplayName }}</b></span>
           <span class="top-spacer"></span>
-          <button class="chip-btn" title="导出会话" @click="store.showToast('导出会话 (Markdown)', 'ok')">⤓ 导出</button>
-          <button class="chip-btn" title="清空会话" @click="clearCurrentSession">🗑 清空</button>
+
+          <div class="export-wrap">
+            <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu">⤓ 导出</button>
+            <div v-if="showExportMenu" class="export-menu" @click.stop>
+              <div class="export-item" @click="doExport('md')">Markdown (.md)</div>
+              <div class="export-item" @click="doExport('html')">HTML (.html)</div>
+              <div class="export-item" @click="doExport('json')">JSON (.json)</div>
+            </div>
+          </div>
+          <button class="chip-btn" title="清空当前会话历史" @click="store.clearSessionHistory()">🗑 清空</button>
         </div>
 
         <!-- 对话主体滚动区 -->
@@ -25,20 +33,20 @@
 
             <!-- 消息流列表 -->
             <template v-else>
-              <MessageBubble 
-                v-for="(msg, i) in store.messages" 
-                :key="i" 
-                :msg="msg" 
+              <MessageBubble
+                v-for="(msg, i) in store.messages"
+                :key="i"
+                :msg="msg"
               />
             </template>
           </div>
         </div>
 
         <!-- 二级抽屉页面 -->
-        <Subpage 
-          :visible="showSubpage" 
-          :sub-type="currentSubpageType" 
-          @close="showSubpage = false" 
+        <Subpage
+          :visible="store.subpage.show"
+          :sub-type="store.subpage.type"
+          @close="store.closeSubpage()"
         />
 
         <!-- 底部固定输入框 (当存在消息时固定呈现) -->
@@ -51,8 +59,14 @@
 
     <!-- 状态栏 -->
     <div id="statusbar">
-      <span class="si"><span class="s-dot"></span><span>后端已连接</span></span>
-      <span class="si">⚙ 权限: <span>{{ store.permissionMode }}</span></span>
+      <span class="si">
+        <span class="s-dot" :class="{ off: !store.connected }"></span>
+        <span>{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
+      </span>
+      <span class="si" :title="'当前模型: ' + (store.activeModelName || '未选择')">🤖 {{ store.activeModelName || '未选择模型' }}</span>
+      <span class="si" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">📁 {{ store.currentWorkdirLabel }}</span>
+      <span class="si" :class="statusTokenClass" title="上下文 Token 占用百分比">🔢 {{ statusTokenPct }}%</span>
+      <span class="si">⚙ 权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
       <div class="right">
         <span class="si">{{ store.running ? '生成中…' : '空闲' }}</span>
         <span class="si">UTF-8</span>
@@ -65,14 +79,16 @@
 
     <!-- 全局 Toast -->
     <div id="toast" :class="[store.toast.show ? 'show' : '', store.toast.type]">
-      {{ store.toast.msg }}
+      <span>{{ store.toast.msg }}</span>
+      <button v-if="store.toast.action" class="toast-action" @click="store.toast.action.fn()">{{ store.toast.action.label }}</button>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, onMounted, nextTick, watch } from 'vue';
+import { ref, onMounted, onUnmounted, nextTick, computed, watch } from 'vue';
 import { useAppStore } from './stores/appStore';
+import { formatPermMode } from './utils/markdown';
 
 import Topbar from './components/Topbar.vue';
 import Sidebar from './components/Sidebar.vue';
@@ -87,18 +103,27 @@ import Subpage from './components/Subpage.vue';
 const store = useAppStore();
 const chatScrollRef = ref<HTMLElement | null>(null);
 
-const showSubpage = ref(false);
-const currentSubpageType = ref<'skills' | 'mcp'>('skills');
+const showExportMenu = ref(false);
 
-function openSubpage(type: 'skills' | 'mcp') {
-  currentSubpageType.value = type;
-  showSubpage.value = true;
+async function doExport(fmt: 'md' | 'html' | 'json') {
+  showExportMenu.value = false;
+  await store.exportSession(fmt);
 }
 
-function clearCurrentSession() {
-  store.messages = [];
-  store.showToast('已重置为空白新会话');
+function closeExportMenu() {
+  showExportMenu.value = false;
 }
+
+const statusTokenPct = computed(() => {
+  const w = store.tokenUsage.window || 0;
+  if (!w) return 0;
+  return Math.round((store.tokenUsage.used / w) * 100);
+});
+const statusTokenClass = computed(() => {
+  if (statusTokenPct.value > 90) return 'tok-red';
+  if (statusTokenPct.value > 70) return 'tok-orange';
+  return '';
+});
 
 function scrollToBottom() {
   nextTick(() => {
@@ -116,6 +141,8 @@ watch(() => store.currentStreamingText, () => {
 });
 
 onMounted(() => {
+  document.addEventListener('click', closeExportMenu);
+
   if (window.pywebview && window.pywebview.api) {
     store.initFromBackend();
   } else {
@@ -134,6 +161,10 @@ onMounted(() => {
       }
     }, 100);
   }
+});
+
+onUnmounted(() => {
+  document.removeEventListener('click', closeExportMenu);
 });
 </script>
 
@@ -206,6 +237,35 @@ onMounted(() => {
   border-color: var(--accent);
 }
 
+.export-wrap {
+  position: relative;
+}
+.export-menu {
+  position: absolute;
+  top: 100%;
+  right: 0;
+  margin-top: 6px;
+  background: rgba(22, 27, 34, 0.97);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(14px);
+  z-index: 200;
+  min-width: 150px;
+  padding: 5px;
+}
+.export-item {
+  padding: 8px 12px;
+  border-radius: 7px;
+  cursor: pointer;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.export-item:hover {
+  background: var(--bg3);
+  color: var(--text);
+}
+
 #statusbar {
   height: 24px;
   background: var(--bg1);
@@ -234,6 +294,15 @@ onMounted(() => {
   border-radius: 50%;
   background: var(--green);
 }
+.s-dot.off {
+  background: var(--red);
+}
+.si.tok-orange {
+  color: var(--orange);
+}
+.si.tok-red {
+  color: var(--red);
+}
 
 #toast {
   position: fixed;
@@ -248,6 +317,9 @@ onMounted(() => {
   z-index: 10000;
   transition: transform 0.3s;
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  gap: 12px;
 }
 #toast.show {
   transform: translateX(-50%);
@@ -257,5 +329,20 @@ onMounted(() => {
 }
 #toast.warn {
   border-color: var(--orange);
+}
+.toast-action {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 6px;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: 0.15s;
+}
+.toast-action:hover {
+  opacity: 0.85;
 }
 </style>

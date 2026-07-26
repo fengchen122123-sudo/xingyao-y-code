@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import threading
+# Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
+# 只 except TimeoutError 会漏接，导致轮询循环直接崩溃
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 
 from core.permission_broker import CANCELLED_RESULT, permission_broker
 
@@ -54,10 +57,11 @@ def ask_user(
     except ValueError as error:
         return str(error)
 
-    import main
-
-    app = main.app_instance
-    if app is None or app.loop is None:
+    # 统一走 permission_broker：TUI 由 prompt_toolkit 提示回答，
+    # GUI 由前端弹窗经 respond_permission 回答，headless 由入口层自动拒绝。
+    # 不再检查具体 UI 实例，避免 core 层反向依赖 main。
+    if not permission_broker.has_prompt_handlers():
+        # 没有任何入口层注册应答通道，入队只会永久等待
         return "无法提问：当前终端没有活动的交互界面。"
 
     # owner/turn_id 统一来源：优先显式传入，turn 兜底 owner，线程名最后兜底
@@ -81,7 +85,7 @@ def ask_user(
             try:
                 selected_index = int(request.future.result(timeout=_POLL_INTERVAL_SECONDS))
                 break
-            except TimeoutError:
+            except (TimeoutError, _FutureTimeoutError):
                 continue
     finally:
         # 异常退出（含 KeyboardInterrupt 等 BaseException）时回收已入队请求，

@@ -29,6 +29,13 @@ from core.lsp import _get_rg_executable
 HTTP_TIMEOUT_SECONDS = 20
 HTTP_MAX_BYTES = 512 * 1024
 HTTP_USER_AGENT = f"ycode/{YCODE_VERSION} (terminal coding assistant)"
+# 伪装成 Chrome 浏览器的 User-Agent：很多新闻网站（NYT、AP News 等）有反爬虫机制，
+# 看到非浏览器 UA（如 ycode/...）会直接返回 403 Forbidden。
+# 伪装成主流浏览器 UA 可绕过这类基础反爬，让 fetch_url 能正常抓取网页内容。
+_BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
 READ_FILE_MAX_LINES = 2000
 # 大文件阈值：超过此字节数的文件，未显式指定 limit 时自动只读前部分并提示分页
 READ_FILE_LARGE_BYTES = 50 * 1024
@@ -190,7 +197,7 @@ def _read_lines_streaming(path, start, count):
             return list(islice(f, start, start + count))
 
 
-def read_file(file_path, offset=0, limit=None, compress=False):
+def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers=False):
     """读取文件内容并返回（仅限当前工作目录内，默认最多 2000 行，超出时给出截断提示）
 
     参数：
@@ -203,10 +210,17 @@ def read_file(file_path, offset=0, limit=None, compress=False):
                 设为 True 可节省 token，但内容与原始文件不完全一致——
                 若后续要用 edit_file 修改该文件，请用 compress=False 重读以保证匹配。
                 建议流程：先 compress=True 快速浏览理解结构 → 若需编辑再 compress=False 重读。
+                注意：with_line_numbers=True 时 compress 会被忽略。
+    - with_line_numbers: 是否在每行前添加 1-based 行号前缀（默认 False）。
+                设为 True 时返回格式如 "1: line1\n2: line2\n..."，便于配合
+                edit_file 的 start_line/end_line 参数精准定位。
+                适用于大文件、重复代码段、字符串匹配易失败的场景。
     """
     resolved = _resolve_workspace_path(file_path)
 
-    cache_key = _tool_cache.read_file_key(str(resolved), offset, limit, compress)
+    cache_key = _tool_cache.read_file_key(
+        str(resolved), offset, limit, compress, with_line_numbers
+    )
     cached = _tool_cache.read_file_get(cache_key)
     if cached is not None:
         return cached
@@ -257,9 +271,21 @@ def read_file(file_path, offset=0, limit=None, compress=False):
         result = "".join(selected)
         end = start + len(selected)
 
-    # 压缩处理
+    # 行号格式化：with_line_numbers=True 时把 selected 转为 "N: line" 格式
+    # 1-based 行号，与 offset 配合（selected[i] 对应原始第 start+1+i 行）
+    if with_line_numbers and selected:
+        numbered_lines = []
+        for i, line in enumerate(selected):
+            # 兼容 \r\n 和 \n：去掉行尾换行符，统一输出不带行尾换行
+            line_text = line.rstrip("\r\n")
+            line_no = start + 1 + i
+            numbered_lines.append(f"{line_no}: {line_text}")
+        result = "\n".join(numbered_lines)
+        # 行号路径跳过压缩（compress 即使为 True 也不处理，行号视图必须保留原始行结构）
+
+    # 压缩处理（with_line_numbers 时跳过）
     compressed_note = ""
-    if compress and result:
+    if compress and result and not with_line_numbers:
         original_len = len(result)
         result = _compress_source_text(result)
         compressed_len = len(result)
@@ -548,6 +574,30 @@ class _ResponseTooLargeError(ValueError):
     pass
 
 
+def _build_browser_like_headers():
+    """构造伪装成 Chrome 浏览器的 HTTP 请求头。
+
+    很多新闻网站（NYT、AP News、BBC 等）有反爬虫机制，会检查：
+    1. User-Agent 是否为浏览器（ycode/... 会被直接 403）
+    2. Accept-Language 是否存在（缺少会被识别为爬虫）
+    3. Accept-Encoding 等常见浏览器头
+
+    伪装成主流 Chrome 浏览器可绕过这类基础反爬，让 fetch_url 能正常抓取。
+    仅用于 fetch_url 工具读取公开网页，不影响 API 调用（API 仍用 HTTP_USER_AGENT）。
+    """
+    return {
+        "User-Agent": _BROWSER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                  "image/avif,image/webp,application/json;q=0.8,*/*;q=0.7",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept-Encoding": "identity",  # 不压缩，避免需要解压 gzip/br
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        # 参考 Referrer-Policy：同源 Referer 可降低部分反爬拦截概率
+        "Referer": "https://www.google.com/",
+    }
+
+
 def _validate_http_url(url):
     parsed = urlparse(str(url or "").strip())
     if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -731,18 +781,26 @@ def _request_http_text(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
         raise ValueError("timeout_seconds 必须在 1 到 60 秒之间")
     request = Request(
         normalized_url,
-        headers={
-            "User-Agent": HTTP_USER_AGENT,
-            "Accept": "application/json, text/plain, text/html;q=0.9, */*;q=0.8",
-        },
+        headers=_build_browser_like_headers(),
     )
     with urlopen(request, timeout=timeout) as response:
-        raw = response.read(HTTP_MAX_BYTES + 1)
-        if len(raw) > HTTP_MAX_BYTES:
-            raise _ResponseTooLargeError(
-                f"响应超过 {HTTP_MAX_BYTES // 1024} KB 限制，已停止读取"
+        # 截断模式：读到 HTTP_MAX_BYTES 上限后停止读取，附加截断提示
+        # 而非直接报错——文章正文通常在前几十 KB，剩余多为模板/脚本/广告，
+        # 截断后 LLM 仍能拿到正文，比直接报错让 LLM 啥也拿不到更实用。
+        raw = response.read(HTTP_MAX_BYTES)
+        truncated = False
+        # 探测是否还有更多数据：再读 1 字节，如果能读到说明被截断了
+        peek = response.read(1)
+        if peek:
+            truncated = True
+        status, content_type, text = _decode_http_response(response, raw)
+        if truncated:
+            text = (
+                text
+                + f"\n\n[⚠️ 响应超过 {HTTP_MAX_BYTES // 1024} KB 限制，已截断。"
+                f"文章正文通常已包含在上方内容中；如需完整内容请缩小请求范围或使用 search_news。]"
             )
-        return _decode_http_response(response, raw)
+        return status, content_type, text
 
 
 def _format_http_error(error):
@@ -961,26 +1019,58 @@ def search_code(query, dir_path="."):
         if shared is not None:
             return shared
 
+    def _run_rg(args_query, literal=False):
+        cmd = [
+            rg_executable, "-n", "-i", "--no-heading",
+            "--max-columns", "200", "-C", "1",
+            "-m", "20",  # 每个文件最多 20 处匹配，避免单文件刷屏
+        ]
+        if literal:
+            cmd.append("-F")
+        cmd += [args_query, dir_path]
+        return subprocess.run(
+            cmd, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=15,
+        )
+
+    def _format_rg_output(output):
+        if not output:
+            return "未找到匹配的代码片段。"
+        lines = output.split("\n")
+        if len(lines) > 60:
+            return "\n".join(lines[:60]) + f"\n\n... (匹配结果过多，已截断，共 {len(lines)} 行)"
+        return output
+
+    rg_executable = None
     try:
         rg_executable = _get_rg_executable()
-        cmd = [rg_executable, "-n", "-i", "--no-heading", "--max-columns", "200", "-C", "1", query, dir_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
-        if result.returncode in (0, 1):
-            output = result.stdout.strip()
-            if not output:
-                result_text = "未找到匹配的代码片段。"
-            else:
-                lines = output.split("\n")
-                if len(lines) > 60:
-                    result_text = "\n".join(lines[:60]) + f"\n\n... (匹配结果过多，已截断，共 {len(lines)} 行)"
-                else:
-                    result_text = output
-            _tool_cache.search_put(cache_key, result_text)
-            if session_id:
-                _tool_cache.shared_put(session_id, ("search_code", cache_key), result_text)
-            return result_text
     except Exception:
-        pass
+        rg_executable = None
+
+    if rg_executable:
+        # ripgrep 路径：坏正则时自动降级为字面量搜索重试；
+        # 超时/其他失败直接报错返回，绝不再落到全仓 Python 遍历
+        # （慢查询叠加一个更慢的遍历只会让卡顿翻倍）。
+        try:
+            result = _run_rg(query)
+            if result.returncode == 2:
+                # 正则语法错误 → 按字面量重试（模型经常传入含特殊字符的代码片段）
+                result = _run_rg(query, literal=True)
+            if result.returncode in (0, 1):
+                result_text = _format_rg_output(result.stdout.strip())
+                _tool_cache.search_put(cache_key, result_text)
+                if session_id:
+                    _tool_cache.shared_put(session_id, ("search_code", cache_key), result_text)
+                return result_text
+            return f"🚨 搜索失败（ripgrep 退出码 {result.returncode}）：{(result.stderr or '').strip()[:300]}"
+        except subprocess.TimeoutExpired:
+            return (
+                "🚨 搜索超时（15 秒）。目录可能过大，请缩小 dir_path 范围"
+                "或使用更精确的关键字重试。"
+            )
+        except Exception:
+            # rg 意外不可用（进程启动失败等）：走下面的 Python 兜底
+            pass
 
     IGNORE_DIRS = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', '.ycode', 'dist', 'build'}
     ALLOWED_EXTS = {
@@ -1205,14 +1295,307 @@ def _fuzzy_replace(content, target, replacement, replace_all=False):
     return content, 0
 
 
-def edit_file(file_path, target_content, replacement_content, replace_all=False):
+def _edit_file_by_lines(
+    file_path, resolved, content, encoding, start_line, end_line, replacement_content
+):
+    """行号路径：按 1-based 行号范围（inclusive）切片替换，跳过字符串匹配。
+
+    用于大文件、重复代码段、字符串匹配易失败的场景。
+    建议先用 read_file(with_line_numbers=True) 获取行号；文件被外部修改后行号可能失效。
+    边界处理：end_line 超出总行数时自动收敛到总行数（不报错，更宽容）；
+              start_line 超出总行数或 < 1 时报错。
+    """
+    # 参数校验
+    if start_line is None or end_line is None:
+        return (
+            f"🚨 行号编辑失败！start_line 和 end_line 必须同时提供"
+            f"（当前 start_line={start_line}, end_line={end_line}）。"
+        )
+    # 防御性：拒绝 bool（bool 是 int 的子类，True==1 会被误用）
+    if isinstance(start_line, bool) or isinstance(end_line, bool):
+        return "🚨 行号编辑失败！start_line 和 end_line 不能是布尔值。"
+    if not isinstance(start_line, int) or not isinstance(end_line, int):
+        return (
+            "🚨 行号编辑失败！start_line 和 end_line 必须是整数"
+            f"（当前 start_line={type(start_line).__name__}, "
+            f"end_line={type(end_line).__name__}）。"
+        )
+    if start_line < 1:
+        return f"🚨 行号编辑失败！start_line 必须 >= 1（当前 {start_line}）。"
+    if end_line < start_line:
+        return (
+            f"🚨 行号编辑失败！end_line({end_line}) 不能小于 start_line({start_line})。"
+        )
+
+    # 切行（保留换行符）
+    lines = content.splitlines(keepends=True)
+    total = len(lines)
+    if total == 0:
+        return f"🚨 行号编辑失败！文件 {file_path} 为空，无法按行号编辑。"
+    if start_line > total:
+        return (
+            f"🚨 行号编辑失败！start_line={start_line} 超出文件总行数 {total}。\n"
+            f"建议：重新 read_file(with_line_numbers=True) 获取最新行号。"
+        )
+    # end_line 超过总行数时自动收敛（不报错，更宽容）
+    actual_end = min(end_line, total)
+
+    # 提取被替换的原文（用于预览展示）
+    replaced_block = "".join(lines[start_line - 1:actual_end])
+
+    replacement = str(replacement_content or "")
+
+    # 行号路径换行语义：replacement 按行切分，每行末尾补文件原换行符。
+    # 这样 LLM 给 "return 42" 时会变成 "return 42\n"，与原行结构对齐，
+    # 避免 replacement 不带换行符时把后续行合并成一行。
+    # splitlines() 会去掉所有换行符，得到纯行内容列表；
+    # 空字符串 → []（删除所有行）；"X\nY" → ["X","Y"]；"X\nY\n" → ["X","Y"]（末尾换行不影响）。
+    if "\r\n" in content:
+        line_sep = "\r\n"
+    else:
+        line_sep = "\n"
+    replacement_lines = replacement.splitlines()
+    replacement = "".join(line + line_sep for line in replacement_lines)
+
+    # 拼接新内容：[行号前的所有行] + replacement + [行号后的所有行]
+    new_content = (
+        "".join(lines[:start_line - 1]) + replacement + "".join(lines[actual_end:])
+    )
+
+    if new_content == content:
+        return (
+            f"🚨 行号编辑失败！第 {start_line}-{actual_end} 行替换后内容与原文相同，"
+            f"未发生实际修改（{file_path}）。"
+        )
+
+    # 校验通过后写入撤销栈
+    from core.memory import set_undo_state
+    set_undo_state(file_path, content)
+
+    # 原子写入（与 target_content 路径对齐）
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return (
+            f"🚨 创建父目录失败：{resolved.parent}\n"
+            f"错误：{e}\n"
+            f"请检查路径是否正确，或权限是否充足。"
+        )
+
+    fd, temp_name = tempfile.mkstemp(
+        prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as temp_file:
+            temp_file.write(new_content.encode(encoding))
+        os.replace(temp_path, resolved)
+    except BaseException as e:
+        # 使用 BaseException 确保 UnicodeEncodeError、KeyboardInterrupt 等非 OSError 异常
+        # 同样能触发临时文件清理，避免孤儿 .ycode-tmp 文件在磁盘积累
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return f"🚨 行号编辑发生异常: {str(e)}"
+
+    # 构建预览：被替换的原文前 3 行 + 后 2 行（超过 5 行时省略中间）
+    replaced_preview_lines = replaced_block.splitlines()
+    if len(replaced_preview_lines) <= 5:
+        preview = replaced_block.rstrip("\r\n")
+    else:
+        preview = "\n".join(
+            replaced_preview_lines[:3]
+            + ["... (省略中间部分) ..."]
+            + replaced_preview_lines[-2:]
+        )
+
+    return (
+        f"✔ 文件 {file_path} 第 {start_line}-{actual_end} 行替换成功！\n"
+        f"被替换原文预览：\n{preview}"
+    )
+
+
+def _atomic_write_edit_file(resolved, encoding, new_content):
+    """原子写入 edit_file 结果：先写同目录临时文件再 os.replace。
+    返回 None 表示成功，返回字符串表示错误。
+    """
+    try:
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return (
+            f"🚨 创建父目录失败：{resolved.parent}\n"
+            f"错误：{e}\n"
+            f"请检查路径是否正确，或权限是否充足。"
+        )
+    fd, temp_name = tempfile.mkstemp(
+        prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "wb") as temp_file:
+            temp_file.write(new_content.encode(encoding))
+        os.replace(temp_path, resolved)
+    except BaseException as e:
+        # 使用 BaseException 确保 UnicodeEncodeError、KeyboardInterrupt 等非 OSError 异常
+        # 同样能触发临时文件清理，避免孤儿 .ycode-tmp 文件在磁盘积累
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return f"🚨 精准修改发生异常: {str(e)}"
+    return None
+
+
+def _smart_replace_without_target(file_path, content, replacement, replace_all):
+    """智能降级：LLM 只传了 replacement_content，未提供 target_content 和行号。
+
+    设计思路：
+    用 difflib.SequenceMatcher 在文件中找出与 replacement 最相似的连续行块，
+    按"相似度 × 行数匹配权重"综合排序，取最佳候选替换。
+
+    适用场景：LLM 想"重写某段代码"但没说清替换哪段。
+    不适用场景：极小改动（如 while→for），因为新旧行数相近时难以精确定位——
+    这种场景应让 LLM 显式传 target_content。
+
+    返回：
+    - 成功：(new_content, occurrences, replaced_preview)
+    - 失败：错误字符串
+    """
+    import difflib
+
+    replacement_lines = [line.rstrip("\r\n") for line in replacement.splitlines()]
+    content_lines = content.splitlines(keepends=True)
+    content_lines_stripped = [line.rstrip("\r\n") for line in content_lines]
+
+    if not replacement_lines or not content_lines_stripped:
+        return (
+            f"🚨 智能替换失败：replacement_content 或文件内容为空（{file_path}）。"
+        )
+
+    # 文件行数 < replacement 行数时，整个文件就是候选
+    if len(content_lines_stripped) < len(replacement_lines):
+        return (
+            f"🚨 智能替换失败：文件 {file_path} 共 {len(content_lines_stripped)} 行，"
+            f"少于 replacement_content 的 {len(replacement_lines)} 行。"
+            f"若要整体重写，请显式使用 write_file。"
+        )
+
+    # 综合评分：相似度 × 行数匹配权重
+    # 行数匹配权重：行数完全相同 = 1.0，行数差异越大权重越低（线性衰减到 0）
+    # 这样优先选行数匹配的块，避免"3行replacement匹配到2行原文"的错位
+    repl_len = len(replacement_lines)
+    candidates = []  # [(start_idx, combined_score, ratio, block_lines)]
+    # 搜索窗口范围：repl_len 的 50%~200%
+    min_len = max(1, repl_len // 2)
+    max_len = min(len(content_lines_stripped), repl_len * 2)
+
+    for window_len in range(min_len, max_len + 1):
+        # 行数匹配权重：差异越小权重越高
+        len_diff = abs(window_len - repl_len)
+        len_weight = 1.0 - (len_diff / max(repl_len, window_len))
+        for i in range(len(content_lines_stripped) - window_len + 1):
+            block = content_lines_stripped[i:i + window_len]
+            # 行级相似度：对每对行计算相似度后取平均（比字符级 ratio 更宽容）
+            # 这样结构相似但内容不同的代码段也能被识别
+            line_ratios = []
+            for r_line, b_line in zip(replacement_lines, block):
+                # 每行也用 SequenceMatcher，但只比较单行
+                lr = difflib.SequenceMatcher(
+                    None, r_line, b_line, autojunk=False
+                ).ratio()
+                line_ratios.append(lr)
+            # 不足的行（block 比 replacement 长）按 0 计入
+            while len(line_ratios) < max(repl_len, window_len):
+                line_ratios.append(0.0)
+            ratio = sum(line_ratios) / len(line_ratios)
+            if ratio >= 0.3:  # 行级相似度阈值放宽到 0.3
+                combined = ratio * len_weight
+                candidates.append((i, combined, ratio, block))
+
+    if not candidates:
+        return (
+            f"🚨 智能替换失败：在 {file_path} 中未找到与 replacement_content "
+            f"足够相似的代码段（相似度阈值 0.5）。"
+            f"请显式提供 target_content（字符串匹配）或 start_line/end_line（行号路径）。"
+        )
+
+    # 按综合评分降序
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    best_idx, best_combined, best_ratio, best_block = candidates[0]
+
+    # 多候选检测：综合评分 >= 0.7 的候选如果超过 1 个且未启用 replace_all，拒绝替换
+    high_score_candidates = [c for c in candidates if c[1] >= 0.7]
+    if len(high_score_candidates) > 1 and not replace_all:
+        locations = []
+        for c in high_score_candidates[:3]:
+            start_idx, combined_score, ratio, block = c
+            end_line = start_idx + len(block)
+            locations.append(
+                f"第 {start_idx + 1}-{end_line} 行（综合评分 {combined_score:.2f}，相似度 {ratio:.2f}）"
+            )
+        return (
+            f"🚨 智能替换失败：在 {file_path} 中找到 {len(high_score_candidates)} 个 "
+            f"高相似度代码段，无法确定唯一替换位置：\n"
+            + "\n".join(locations)
+            + f"\n请显式提供 target_content 或 start_line/end_line 精确定位。"
+        )
+
+    # 执行替换
+    if "\r\n" in content:
+        line_sep = "\r\n"
+    else:
+        line_sep = "\n"
+
+    new_lines = content_lines_stripped[:best_idx]
+    for line in replacement_lines:
+        new_lines.append(line)
+    new_lines.extend(content_lines_stripped[best_idx + len(best_block):])
+
+    new_content = line_sep.join(new_lines)
+    if content.endswith("\n") or content.endswith("\r\n"):
+        new_content += line_sep
+
+    # 构建被替换原文预览（前 5 行）
+    replaced_preview_lines = best_block[:5]
+    if len(best_block) > 5:
+        replaced_preview_lines.append(f"...（共 {len(best_block)} 行）")
+    replaced_preview = "\n".join(replaced_preview_lines)
+
+    return (new_content, 1, replaced_preview)
+
+
+def edit_file(
+    file_path,
+    target_content="",
+    replacement_content="",
+    replace_all=False,
+    start_line=None,
+    end_line=None,
+):
     """
     手术刀局部替换工具：用于对已有代码文件进行点对点局部精准替换，不用每次都重写整张文件，避免开销和误删。
+
+    支持两种编辑路径（二选一）：
+    1. 字符串匹配路径（默认）：提供 target_content + replacement_content，
+       系统用四层智能匹配定位（精确 → 忽略空白 → difflib 模糊 → 字符滑窗）。
+       适用于 target_content 易于复述原文、文件较小的场景。
+    2. 行号路径：提供 start_line + end_line + replacement_content，
+       直接按 1-based 行号范围（inclusive）切片替换，跳过字符串匹配。
+       适用于大文件、重复代码段、字符串匹配易失败的场景。
+       建议先用 read_file(with_line_numbers=True) 获取行号。
+
     参数:
       file_path: 要修改的文件的相对或绝对路径（仅限当前工作目录内）。
-      target_content: 文件中要被替换的旧代码段（尽量保持原始缩进和换行；允许轻微差异，系统会尝试智能定位）。
+      target_content: 字符串匹配路径下，文件中要被替换的旧代码段
+                      （尽量保持原始缩进和换行；允许轻微差异，系统会尝试智能定位）。
+                      行号路径下可省略（即使提供也忽略）。
       replacement_content: 准备换上的新代码段。
-      replace_all: 是否替换全部出现位置（默认 False，旧代码段出现多次时必须显式开启）。
+      replace_all: 字符串匹配路径下，是否替换全部出现位置（默认 False，旧代码段
+                   出现多次时必须显式开启）。行号路径下忽略此参数。
+      start_line, end_line: 行号路径参数，1-based 行号范围（inclusive）。
+                            同时提供时启用行号路径；同时为 None 时启用字符串匹配路径。
+                            end_line 超过文件总行数时自动收敛不报错；start_line 超出或 <1 报错。
     """
     try:
         resolved = _resolve_workspace_path(file_path)
@@ -1233,10 +1616,46 @@ def edit_file(file_path, target_content, replacement_content, replace_all=False)
         except UnicodeDecodeError:
             return f"🚨 精准修改失败！无法解码文件 {file_path}（既不是 UTF-8 也不是 GBK 编码）。"
 
+    # 行号路径：直接按行号切片替换，跳过字符串匹配
+    if start_line is not None or end_line is not None:
+        return _edit_file_by_lines(
+            file_path, resolved, content, encoding,
+            start_line, end_line, replacement_content
+        )
+
     target = str(target_content or "")
     replacement = str(replacement_content or "")
     if not target:
-        return "🚨 精准修改失败！target_content 不能为空。"
+        # 智能降级：LLM 只传了 replacement_content（未提供 target_content 也未提供行号）。
+        # 与其报错让 LLM 重试 3 次最后 fallback 到 write_file，不如直接用 difflib
+        # 在文件中找出与 replacement 最相似的代码块进行替换。
+        # 这种"宽容调用"显著降低 LLM 工具使用门槛，提升用户体验。
+        if not replacement:
+            return (
+                f"🚨 edit_file 调用参数缺失：target_content 和 replacement_content 均为空，"
+                f"且未提供 start_line/end_line（{file_path}）。"
+            )
+        result = _smart_replace_without_target(
+            file_path, content, replacement, replace_all
+        )
+        if isinstance(result, str) and result.startswith("🚨"):
+            return result
+        new_content, occurrences, replaced_preview = result
+        if new_content == content:
+            return (
+                f"🚨 edit_file 智能替换失败：在 {file_path} 中未找到与 replacement_content "
+                f"足够相似的代码段（建议显式提供 target_content 或 start_line/end_line）。"
+            )
+        # 写入撤销栈 + 原子写入（与字符串匹配路径共用逻辑）
+        from core.memory import set_undo_state
+        set_undo_state(file_path, content)
+        write_err = _atomic_write_edit_file(resolved, encoding, new_content)
+        if write_err:
+            return write_err
+        return (
+            f"✔ 智能修改 {file_path}（自动定位最相似代码段，共 {occurrences} 处替换）\n"
+            f"被替换的原文（前 5 行）：\n{replaced_preview}"
+        )
 
     # 换行风格自适应：把 target/replacement 统一成文件实际使用的换行风格，
     # 写回时仍保持文件原编码/换行。先归一化再转换，避免已有 \r\n 被腐蚀成 \r\r\n。
@@ -1272,37 +1691,10 @@ def edit_file(file_path, target_content, replacement_content, replace_all=False)
     # 校验全部通过后才写入撤销栈，避免失败的编辑污染撤销历史
     from core.memory import set_undo_state
     set_undo_state(file_path, content)
-
-    # 原子写入：先写同目录临时文件再 os.replace，避免写入中断留下半个文件；
-    # 用 tempfile.mkstemp 生成唯一临时文件名，避免并发编辑同一文件时互相覆盖
-    # 自动创建父目录（防御性：与 write_file 对齐，虽然 edit_file 通常改的是已存在文件）
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return (
-            f"🚨 创建父目录失败：{resolved.parent}\n"
-            f"错误：{e}\n"
-            f"请检查路径是否正确，或权限是否充足。"
-        )
-
-    fd, temp_name = tempfile.mkstemp(
-        prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
-    )
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(fd, "wb") as temp_file:
-            temp_file.write(new_content.encode(encoding))
-        os.replace(temp_path, resolved)
-    except BaseException as e:
-        # 使用 BaseException 确保 UnicodeEncodeError、KeyboardInterrupt 等非 OSError 异常
-        # 同样能触发临时文件清理，避免孤儿 .ycode-tmp 文件在磁盘积累（与 write_file 对齐）
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return f"🚨 精准修改发生异常: {str(e)}"
-
-    return f"✔ 文件 {file_path} 精准替换修改成功！"
+    write_err = _atomic_write_edit_file(resolved, encoding, new_content)
+    if write_err:
+        return write_err
+    return f"✔ 已修改文件：{file_path}"
 
 _SUBAGENT_TERMINAL_STATUSES = {
     "completed",
@@ -1310,6 +1702,10 @@ _SUBAGENT_TERMINAL_STATUSES = {
     "timed_out",
     "cancelled",
 }
+
+# 同一时刻真正执行的子代理上限：超出的任务保持排队状态等待空位。
+# 无上限时模型一次派发 6+ 个子代理会挤爆 API 并发与本机资源。
+_MAX_CONCURRENT_SUBAGENTS = 5
 
 
 def _has_meaningful_subagent_result(text: str) -> bool:
@@ -1319,11 +1715,20 @@ def _has_meaningful_subagent_result(text: str) -> bool:
 _ADVISOR_TAG_RE = re.compile(
     r"\[(?:Advisor consultation[^\]]*|Advisor review|End of advisor consultation[^\]]*)\]"
 )
+# 模型（尤其 Kimi 系）偶尔把内部协议整块泄漏到正文：<advisor-request> 求助文本、
+# XML 形式的 <function_calls>/<tool_call> 伪工具调用。这些不是结论，整块剔除。
+# 未闭合的块（流被截断）一律剔到文本末尾。
+_XML_JUNK_BLOCK_RE = re.compile(
+    r"<(advisor-request|function_calls|tool_call)>[\s\S]*?(?:</\1>|\Z)",
+    re.IGNORECASE,
+)
 
 
 def _strip_advisor_tags(text: str) -> str:
-    """剔除模型泄漏到正文里的 Advisor 内部协议标记，避免污染子代理结果与计划回写。"""
-    return _ADVISOR_TAG_RE.sub("", text or "").strip()
+    """剔除模型泄漏到正文里的 Advisor 内部协议标记与 XML 伪工具调用块，避免污染子代理结果与计划回写。"""
+    cleaned = _ADVISOR_TAG_RE.sub("", text or "")
+    cleaned = _XML_JUNK_BLOCK_RE.sub("", cleaned)
+    return cleaned.strip()
 
 
 _SUBAGENT_TIMEOUT_HINT = (
@@ -1382,6 +1787,10 @@ class SubagentTask:
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
     done_event: threading.Event = field(default_factory=threading.Event, repr=False)
     notification_consumed: bool = False
+    # 独立于 notification_consumed：标记任务结果是否已注入到汇总 turn 的上下文中。
+    # 避免与 drain_notifications 的消费标志冲突——drain_notifications 用于普通 turn
+    # 的 LLM 上下文注入，summary_injected 用于自动汇总 turn 的上下文注入。
+    summary_injected: bool = False
     terminal_callback: Callable | None = field(default=None, repr=False)
     callback_invoked: bool = field(default=False, repr=False)
     model_config: tuple | None = field(default=None, repr=False)
@@ -1417,11 +1826,30 @@ def _snapshot_model_config(prefer_secondary: bool = True) -> tuple | None:
             )
     except Exception:
         pass
+    return _active_model_tuple_or_none()
+
+
+def _active_model_tuple_or_none():
+    """从运行时上下文取当前激活模型 (model, key, url)；取不到时读 config.json 兜底。"""
     try:
-        import main
-        return (main.current_model, main.current_key, main.current_url)
+        import core.app_context as app_context
+        current = app_context.get_active_model_tuple()
+        if current and current[0]:
+            return tuple(current)
     except Exception:
-        return None
+        pass
+    try:
+        from core.model_manager import get_active_model
+        active = get_active_model()
+        if active:
+            return (
+                active.get("litellm_model"),
+                active.get("api_key"),
+                active.get("base_url"),
+            )
+    except Exception:
+        pass
+    return None
 
 
 def _permission_owner_waiting(owner_id: str) -> bool:
@@ -1453,6 +1881,8 @@ class SubagentManager:
         self._permission_waiting = permission_waiting or _permission_owner_waiting
         self._tasks: dict[str, SubagentTask] = {}
         self._lock = threading.Lock()
+        # 并发闸门：限制同时真正执行的子代理数量（排队不占名额）
+        self._concurrency = threading.BoundedSemaphore(_MAX_CONCURRENT_SUBAGENTS)
         # 后台子代理进入终态时的实时通知回调。
         # 签名：on_terminal(task_id, status, description, error_or_result_summary)
         # 仅对 run_in_background=True 的任务触发（前台任务在状态栏已有实时显示）。
@@ -1583,8 +2013,8 @@ class SubagentManager:
                 if waiting_for_approval:
                     task.approval_wait_elapsed += elapsed
                     self._record_stage_locked(task, "waiting_approval")
-                elif task.callback_invoked:
-                    # 终态回调正在执行（可能同步跑验证命令），暂停计时避免误判超时
+                elif task.callback_invoked or task.stage == "queued":
+                    # 终态回调执行中 / 并发闸门排队中：暂停计时避免误判超时
                     task.approval_wait_elapsed += elapsed
                 else:
                     task.execution_elapsed += elapsed
@@ -1624,8 +2054,8 @@ class SubagentManager:
             with self._lock:
                 if task.status in _SUBAGENT_TERMINAL_STATUSES:
                     return
-                if waiting_for_approval or task.callback_invoked:
-                    # 等待审批或终态回调执行期间暂停计时，避免误判超时
+                if waiting_for_approval or task.callback_invoked or task.stage == "queued":
+                    # 等待审批 / 终态回调执行 / 并发闸门排队期间暂停计时，避免误判超时
                     task.approval_wait_elapsed += elapsed
                 else:
                     task.execution_elapsed += elapsed
@@ -1639,39 +2069,47 @@ class SubagentManager:
                 return
 
     def _run_task(self, task: SubagentTask) -> None:
-        with self._lock:
-            if task.status != "pending":
+        # 并发闸门：拿到执行名额前保持 queued 状态（排队时间不计入超时），
+        # 期间响应取消与外部终态（如父回合取消、超时监管）
+        while not self._concurrency.acquire(timeout=0.2):
+            if task.cancel_event.is_set() or task.status in _SUBAGENT_TERMINAL_STATUSES:
                 return
-            task.status = "running"
-            task.started_at = time.time()
-            self._record_stage_locked(task, "running")
-
-        # 子代理线程标记父会话，使工具级共享缓存可被复用
-        _tool_cache.set_current_session(task.parent_session)
         try:
-            result = _strip_advisor_tags(str(self._runner(task) or "").strip())
-        except BaseException as error:
-            if task.cancel_event.is_set():
-                self._terminate(task.task_id, "cancelled", "task cancelled")
-            else:
-                self._terminate(task.task_id, "failed", str(error))
-            _tool_cache.set_current_session(None)
-            return
+            with self._lock:
+                if task.status != "pending":
+                    return
+                task.status = "running"
+                task.started_at = time.time()
+                self._record_stage_locked(task, "running")
 
-        try:
-            if task.cancel_event.is_set():
-                self._terminate(task.task_id, "cancelled", "task cancelled")
-            elif task.tool_errors:
-                details = "; ".join(
-                    f"{name}: {detail}" for name, detail in task.tool_errors.items()
-                )
-                self._terminate(task.task_id, "failed", details)
-            elif not _has_meaningful_subagent_result(result):
-                self._terminate(task.task_id, "failed", "subagent returned no public answer")
-            else:
-                self._complete(task.task_id, result)
+            # 子代理线程标记父会话，使工具级共享缓存可被复用
+            _tool_cache.set_current_session(task.parent_session)
+            try:
+                result = _strip_advisor_tags(str(self._runner(task) or "").strip())
+            except BaseException as error:
+                if task.cancel_event.is_set():
+                    self._terminate(task.task_id, "cancelled", "task cancelled")
+                else:
+                    self._terminate(task.task_id, "failed", str(error))
+                _tool_cache.set_current_session(None)
+                return
+
+            try:
+                if task.cancel_event.is_set():
+                    self._terminate(task.task_id, "cancelled", "task cancelled")
+                elif task.tool_errors:
+                    details = "; ".join(
+                        f"{name}: {detail}" for name, detail in task.tool_errors.items()
+                    )
+                    self._terminate(task.task_id, "failed", details)
+                elif not _has_meaningful_subagent_result(result):
+                    self._terminate(task.task_id, "failed", "subagent returned no public answer")
+                else:
+                    self._complete(task.task_id, result)
+            finally:
+                _tool_cache.set_current_session(None)
         finally:
-            _tool_cache.set_current_session(None)
+            self._concurrency.release()
 
     def _complete(self, task_id: str, result: str) -> bool:
         with self._lock:
@@ -1881,6 +2319,81 @@ class SubagentManager:
                 for task in self._tasks.values()
             )
 
+    def is_plan_item_running(self, plan_item_id: str) -> bool:
+        """判断指定计划项是否有仍在运行（非终态）的子代理任务。
+
+        用于 turn 结束清理逻辑：避免把后台子代理正在执行的 in_progress 计划项
+        误判为"子 agent 异常退出"而标记为 failed。
+        只关心 plan_item_id 关联的任务是否还在运行，不区分前台/后台。
+        """
+        if not plan_item_id:
+            return False
+        with self._lock:
+            for task in self._tasks.values():
+                if (
+                    task.plan_item_id == plan_item_id
+                    and task.status not in _SUBAGENT_TERMINAL_STATUSES
+                ):
+                    return True
+            return False
+
+    def has_running_background_tasks(self, parent_session: str) -> bool:
+        """检查指定会话是否仍有运行中（非终态）的后台子代理任务。
+
+        用于自动汇总触发：当所有后台任务都进入终态时，主代理应自动汇总结果。
+        """
+        if not parent_session:
+            return False
+        with self._lock:
+            for task in self._tasks.values():
+                if (
+                    task.run_in_background
+                    and task.parent_session == parent_session
+                    and task.status not in _SUBAGENT_TERMINAL_STATUSES
+                ):
+                    return True
+            return False
+
+    def has_unconsumed_terminal_background_tasks(self, parent_session: str) -> bool:
+        """检查指定会话是否有未消费的终态后台子代理任务（成功+失败都算）。
+
+        用于决定是否在 turn 开始时注入汇总上下文。
+        """
+        if not parent_session:
+            return False
+        with self._lock:
+            for task in self._tasks.values():
+                if (
+                    task.run_in_background
+                    and task.parent_session == parent_session
+                    and task.status in _SUBAGENT_TERMINAL_STATUSES
+                    and not task.notification_consumed
+                ):
+                    return True
+            return False
+
+    def drain_terminal_background_tasks(self, parent_session: str) -> list[SubagentTaskSnapshot]:
+        """提取本会话中所有终态（completed/failed/timed_out/cancelled）且尚未注入汇总上下文的后台子代理任务。
+
+        用于主代理汇总/兜底机制：在汇总 turn 开始时调用，把所有终态后台任务（成功+失败）
+        的结果摘要注入到主代理上下文，让主代理能汇总成功结果并用自身工具接手失败任务。
+        调用后会标记这些任务为 summary_injected=True，避免重复注入。
+        注意：使用独立的 summary_injected 标志，与 drain_notifications 的 notification_consumed
+        互不干扰——即使 drain_notifications 已经消费过通知，汇总 turn 仍能看到任务结果。
+        """
+        drained: list[SubagentTaskSnapshot] = []
+        with self._lock:
+            for task in self._tasks.values():
+                if (
+                    task.run_in_background
+                    and task.parent_session == parent_session
+                    and task.status in _SUBAGENT_TERMINAL_STATUSES
+                    and not task.summary_injected
+                ):
+                    task.summary_injected = True
+                    drained.append(self._snapshot(task))
+        return drained
+
     def cancel(self, task_id: str, reason: str = "user requested") -> bool:
         """取消指定子代理任务（协作式取消，非强制 kill）。
 
@@ -2002,11 +2515,7 @@ class SubagentManager:
         def _fallback_model():
             if task.model_config is not None:
                 return task.model_config
-            try:
-                import main
-                return (main.current_model, main.current_key, main.current_url)
-            except Exception:
-                return (None, None, None)
+            return _active_model_tuple_or_none() or (None, None, None)
 
         model_pref = custom.get("model") if custom else None
         if model_pref == "secondary":
@@ -2022,12 +2531,10 @@ class SubagentManager:
             except Exception:
                 current_model, current_key, current_url = _fallback_model()
         elif model_pref == "inherit":
-            try:
-                import main
-                current_model = main.current_model
-                current_key = main.current_key
-                current_url = main.current_url
-            except Exception:
+            inherited = _active_model_tuple_or_none()
+            if inherited:
+                current_model, current_key, current_url = inherited
+            else:
                 current_model, current_key, current_url = _fallback_model()
         else:
             current_model, current_key, current_url = _fallback_model()
@@ -2121,8 +2628,12 @@ class SubagentManager:
                     f"{instruction_text}"
                     "你只执行主 Agent 已分配的单一子任务，不得拆解、创建或修改主任务计划；"
                     "如实使用可用工具；结束时只输出供主 Agent 汇总的公开结论。"
+                    "【速度要求】子任务必须快速收敛：优先用 search_code / glob_files / "
+                    "list_directory 定位关键位置后精读相关片段，不要逐文件全文通读；"
+                    "信息足以支撑结论时立即停止探索并输出最终结论，不要追求穷尽。"
                     "所有输出必须使用中文，包括过程说明与最终结论；"
-                    "不要输出 [Advisor consultation] 等内部协议标记。"
+                    "不要输出 [Advisor consultation] 等内部协议标记，"
+                    "也不要在正文中书写 <function_calls>/<advisor-request> 之类的 XML 伪工具调用。"
                 ),
             },
             {
@@ -2165,6 +2676,10 @@ class SubagentManager:
                         "tool",
                         str(event.payload.get("name", "")),
                     )
+                    # 结果只保留最后一次工具调用之后的文本。工具调用前的过程叙述
+                    # （"我先给你一版初步结论，继续补读…"）不是最终结论，拼进结果
+                    # 会让主 Agent 把中间思路当成事实汇总（软件识别会话的真实事故）。
+                    answer.clear()
                 elif event.kind == "permission_requested":
                     self._record_stage(task.task_id, "waiting_approval")
                 elif event.kind == "permission_resolved":
@@ -2185,9 +2700,11 @@ class SubagentManager:
         task.tool_errors.update(tool_errors)
         result_text = "".join(answer)
 
-        # summary_continuation：结果过短时追加要求展开，避免子代理敷衍
-        # 参考 Kimi Code 的 SUMMARY_MIN_LENGTH 机制
-        if 0 < len(result_text.strip()) < 200 and not task.cancel_event.is_set():
+        # summary_continuation：结果过短或为空时追加要求展开，避免子代理敷衍
+        # 参考 Kimi Code 的 SUMMARY_MIN_LENGTH 机制。
+        # 为空也要触发：最后一次工具调用之后模型可能没再输出文本（结果提取
+        # 只保留末次工具调用后的内容），此时必须补一轮总结才有可交付结论。
+        if len(result_text.strip()) < 200 and not task.cancel_event.is_set():
             continuation_prompt = (
                 "你之前的回答过于简短。请提供更完整的总结，包含：\n"
                 "1. 具体的技术细节和实现要点\n"
@@ -2207,7 +2724,8 @@ class SubagentManager:
                     ),
                 },
                 {"role": "user", "content": f"请完成以下子任务：\n{task.description}"},
-                {"role": "assistant", "content": result_text},
+                # 结果为空时用占位文本，空 assistant content 会被部分 API 拒绝（400）
+                {"role": "assistant", "content": result_text or "（未输出最终结论）"},
                 {"role": "user", "content": continuation_prompt},
             ]
             self._record_stage(task.task_id, "summarizing")
@@ -2247,10 +2765,21 @@ class SubagentManager:
 subagent_manager = SubagentManager()
 
 
+# 按角色的默认超时（秒）：只读角色必须快速收敛，写代码/跑测试允许更久。
+# 调用方显式传 timeout_seconds 时以显式值为准。
+_SUBAGENT_DEFAULT_TIMEOUTS = {
+    "explore": 240,
+    "review": 300,
+    "test": 480,
+    "implement": 600,
+    "general": 600,
+}
+
+
 def run_subagent(
     task_description,
     run_in_background=False,
-    timeout_seconds=600,
+    timeout_seconds=None,
     parent_session=None,
     parent_turn_id=None,
     parent_cancel_event=None,
@@ -2279,16 +2808,18 @@ def run_subagent(
         }, ensure_ascii=False)
 
     # 先完成参数校验，再认领计划项，避免认领后校验失败导致计划项永久 in_progress
-    try:
-        timeout_seconds = int(timeout_seconds)
-    except (TypeError, ValueError):
-        timeout_seconds = -1
-    if not 30 <= timeout_seconds <= 3600:
-        return json.dumps({
-            "status": "failed",
-            "plan_item_id": str(plan_item_id or ""),
-            "error": "timeout_seconds 必须在 30 到 3600 秒之间。",
-        }, ensure_ascii=False)
+    # timeout_seconds 未传时保持 None，待 subagent_type 最终确定后按角色解析默认值
+    if timeout_seconds is not None:
+        try:
+            timeout_seconds = int(timeout_seconds)
+        except (TypeError, ValueError):
+            timeout_seconds = -1
+        if not 30 <= timeout_seconds <= 3600:
+            return json.dumps({
+                "status": "failed",
+                "plan_item_id": str(plan_item_id or ""),
+                "error": "timeout_seconds 必须在 30 到 3600 秒之间。",
+            }, ensure_ascii=False)
     if not str(task_description or "").strip():
         return json.dumps({
             "status": "failed",
@@ -2296,8 +2827,8 @@ def run_subagent(
             "error": "task_description 不能为空。",
         }, ensure_ascii=False)
     if parent_session is None or parent_turn_id is None:
-        import main
-        parent_session = parent_session or main.current_session
+        import core.app_context as app_context
+        parent_session = parent_session or app_context.get_current_session()
         parent_turn_id = parent_turn_id or f"standalone-{uuid.uuid4().hex[:8]}"
     scheduler = None
     if plan_item_id:
@@ -2339,6 +2870,21 @@ def run_subagent(
                         dep_item = next((i for i in scheduler.plan.snapshot() if i["id"] == dep_id), None)
                         dep_statuses.append(f"'{dep_id}'({dep_item['status'] if dep_item else '不存在'})")
                     reason_parts.append(f"依赖项状态: {', '.join(dep_statuses)}")
+            # 并发已满是最常见且可自愈的原因：必须明确说出来，否则模型会把
+            # "认领失败"误判为永久性冲突而直接放弃整个计划项
+            in_progress_count = sum(
+                1 for i in scheduler.plan.snapshot() if i.get("status") == "in_progress"
+            )
+            if (
+                plan_item is not None
+                and actual_status == "pending"
+                and in_progress_count >= scheduler.max_workers
+            ):
+                reason_parts.append(
+                    f"当前并行执行的计划项已达调度上限 {scheduler.max_workers}"
+                    f"（{in_progress_count} 项运行中）。这不是冲突或死锁，"
+                    "请等待任一运行中的计划项完成后重新调用本项即可成功。"
+                )
             return json.dumps({
                 "status": "blocked",
                 "plan_item_id": str(plan_item_id),
@@ -2382,6 +2928,12 @@ def run_subagent(
             })
         return None
 
+    # 此时 subagent_type 已最终确定（含计划 stage 自动映射），解析角色默认超时。
+    # 只读角色（explore/review）默认更短：子代理设计目标是"快"，
+    # 10 分钟级别的探索/审查违背设计初衷（自定义类型回落到 600 秒）。
+    if timeout_seconds is None:
+        timeout_seconds = _SUBAGENT_DEFAULT_TIMEOUTS.get(str(subagent_type or "general"), 600)
+
     try:
         return subagent_manager.run(
             task_description,
@@ -2413,12 +2965,9 @@ def dream_consolidation():
     """
     在后台发起一次梦境归类整理，将日记账中的记忆提炼合并，并更新 MEMORY.md 索引。
     """
-    import main
     from core.memory_kairos import run_dream_consolidation_sync
-    task_model = main.current_model
-    task_key = main.current_key
-    task_url = main.current_url
-    
+    task_model, task_key, task_url = _active_model_tuple_or_none() or (None, None, None)
+
     if not task_key:
         return "🚨 整理失败：大模型密钥尚未配置，无法提炼记忆。"
         
@@ -2473,6 +3022,13 @@ def glob_files(pattern, dir_path="."):
                 if session_id:
                     _tool_cache.shared_put(session_id, ("glob_files", cache_key), res)
                 return res
+            # rg 正常跑完但没有匹配：直接返回结论，
+            # 不再落到 Python glob 把同一棵目录树重扫一遍
+            res = f"未找到匹配 `{pattern}` 的文件。"
+            _tool_cache.glob_put(cache_key, res)
+            if session_id:
+                _tool_cache.shared_put(session_id, ("glob_files", cache_key), res)
+            return res
         elif result.returncode != 0:
             # rg 返回真实错误（如 glob 语法错误），记录诊断日志而不是静默吞掉
             _logger.warning("glob_files rg 错误 (rc=%s): %s", result.returncode, result.stderr.strip())

@@ -80,8 +80,7 @@ def test_add_model_enter_opens_wizard(monkeypatch):
     captured = _run_selector_headless(monkeypatch)
     main_win = captured["layout"].container.children[0]
 
-    # 初始为列表模式，光标 0 在 provider 行；按下键移到 add_model 行
-    assert _press(captured, Keys.Down, monkeypatch), "down 键绑定应存在"
+    # 初始光标已自动跳过不可选中的 provider 标题行，直接落在 add_model 行
     assert _press(captured, Keys.Enter, monkeypatch), "enter 键绑定应存在"
 
     # 应已进入 addmodel 向导模式，渲染包含厂商名与步骤提示

@@ -10,9 +10,13 @@ import sys
 from prompt_toolkit import Application
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.layout import Layout, HSplit, Window
-from prompt_toolkit.layout.controls import FormattedTextControl
+from prompt_toolkit.layout.controls import FormattedTextControl, BufferControl
 from prompt_toolkit.layout.containers import ConditionalContainer
-from prompt_toolkit.mouse_events import MouseButton, MouseEventType
+from prompt_toolkit.layout.processors import (
+    BeforeInput,
+    ConditionalProcessor,
+    PasswordProcessor,
+)
 from prompt_toolkit.styles import Style
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.buffer import Buffer
@@ -237,7 +241,7 @@ def _get_clipboard_text():
                 ["powershell", "-NoProfile", "-Command", "Get-Clipboard"],
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=2,
                 encoding="utf-8",
                 errors="ignore",
             )
@@ -420,14 +424,12 @@ def open_mcp_selector(on_closed=None):
                 display = _mask_value(v) if f.get("secret") else v
                 out += [_t("class:footer", f"    {f['name']} = {display}\n")]
         out += [_t("", "\n")]
-        # 当前输入字段：secret 字段做掩码显示
-        cur_display = _mask_value(state["input_value"]) if cur_field.get("secret") else state["input_value"]
-        out += [_t("class:input.field", f"  > {cur_display}_\n")]
-        out += [_t("", "\n")]
+        # 真实输入框渲染在主体下方的独立输入行（支持粘贴与光标编辑），
+        # 此处只渲染提示文字
         if state["input_idx"] < len(fields) - 1:
-            out += [_t("class:footer", "  [Enter] 下一个字段  [Esc] 返回  [Ctrl+V / 右键] 粘贴\n")]
+            out += [_t("class:footer", "  [Enter] 下一个字段  [Esc] 返回  （可直接粘贴，长 key 无需手打）\n")]
         else:
-            out += [_t("class:footer", "  [Enter] 确认添加  [Esc] 返回  [Ctrl+V / 右键] 粘贴\n")]
+            out += [_t("class:footer", "  [Enter] 确认添加  [Esc] 返回  （可直接粘贴，长 key 无需手打）\n")]
         return out
 
     def render_confirm_delete():
@@ -436,7 +438,7 @@ def open_mcp_selector(on_closed=None):
             srv = state["servers"][state["cursor"]]
             out += [_t("class:err", f"  确认删除服务 {srv['name']}？\n")]
             out += [_t("", "\n")]
-            out += [_t("class:footer", "  [y] 确认删除  [n/Esc] 取消\n")]
+            out += [_t("class:footer", "  [Enter/y] 确认删除  [n/Esc] 取消\n")]
         return out
 
     def render_custom_notice():
@@ -539,6 +541,28 @@ def open_mcp_selector(on_closed=None):
         if app_ref[0] is not None:
             app_ref[0].invalidate()
 
+    # ─── input_env 真实输入框 ────────────────────────────────────
+    # 用真正的 Buffer + BufferControl 替代逐字符手搓输入。
+    # 这样修复了三个问题：
+    #   1. Linux/macOS 上粘贴（BracketedPaste）落入 dummy buffer 完全无效
+    #   2. Windows 上带换行的粘贴被整体丢弃
+    #   3. 没有光标移动/Home/End/Ctrl+W 等基本编辑能力
+    input_buf = Buffer(multiline=False)
+
+    def _is_secret_field_active():
+        if state["mode"] != "input_env":
+            return False
+        try:
+            preset = PRESET_MCPS[state["add_idx"]]
+            fields = _get_preset_fields(preset)
+            return bool(fields[state["input_idx"]].get("secret"))
+        except Exception:
+            return False
+
+    def _input_buf_text():
+        # API key/URL 一律单行：清洗粘贴带来的换行符
+        return input_buf.text.replace("\r", "").replace("\n", "").strip()
+
     # ─── list 模式按键 ───────────────────────────────────────────
     @kb.add("up")
     def _up(event):
@@ -584,6 +608,8 @@ def open_mcp_selector(on_closed=None):
                 state["input_idx"] = 0
                 state["input_values"] = {}
                 state["input_value"] = ""
+                input_buf.reset()
+                event.app.layout.focus(input_win)
                 invalidate()
             else:
                 # 无需输入字段，直接添加
@@ -603,13 +629,13 @@ def open_mcp_selector(on_closed=None):
             if not fields:
                 return
             cur_field = fields[state["input_idx"]]
-            val = state["input_value"].strip()
+            val = _input_buf_text()
             if not val:
                 set_message(f"{cur_field['name']} 不能为空")
                 return
             # 保存当前字段值
             state["input_values"][cur_field["name"]] = val
-            state["input_value"] = ""
+            input_buf.reset()
             # 切换到下一个字段，或全部输完后提交
             if state["input_idx"] < len(fields) - 1:
                 state["input_idx"] += 1
@@ -627,9 +653,15 @@ def open_mcp_selector(on_closed=None):
                 state["mode"] = "list"
                 state["input_idx"] = 0
                 state["input_values"] = {}
+                event.app.layout.focus(body_window)
                 reload_servers()
                 set_message(msg)
         elif mode == "confirm_delete":
+            # 边界防御：列表可能已空
+            if not state["servers"] or state["cursor"] >= len(state["servers"]):
+                state["mode"] = "list"
+                invalidate()
+                return
             srv = state["servers"][state["cursor"]]
             ok, msg = mcp_manager.remove_server(srv["name"])
             state["mode"] = "list"
@@ -647,41 +679,29 @@ def open_mcp_selector(on_closed=None):
             state["input_values"] = {}
             state["input_value"] = ""
             state["message"] = ""
+            input_buf.reset()
+            event.app.layout.focus(body_window)
             invalidate()
         else:
             event.app.exit()
             if on_closed:
                 on_closed()
 
-    # 退格（input_env 模式）
-    @kb.add("backspace")
-    def _backspace(event):
-        if state["mode"] == "input_env":
-            if state["input_value"]:
-                state["input_value"] = state["input_value"][:-1]
-                invalidate()
+    # 兜底粘贴（仅老式控制台需要）：现代终端（Windows Terminal/iTerm 等）的
+    # Ctrl+V 由终端自己处理，会直接把内容作为 bracketed paste 送进焦点输入框，
+    # 根本不会走到这里。只有旧 conhost 才会把 ^V 传给应用。
+    @kb.add("c-v", filter=Condition(lambda: state["mode"] == "input_env"))
+    @kb.add("s-insert", filter=Condition(lambda: state["mode"] == "input_env"))
+    def _paste_fallback(event):
+        text = _get_clipboard_text()
+        if text:
+            input_buf.insert_text(text.replace("\r", "").replace("\n", ""))
+            invalidate()
 
-    # 粘贴（input_env 模式）：Ctrl+V / Shift+Insert 从系统剪贴板粘贴文本
-    @kb.add("c-v")
-    @kb.add("s-insert")
-    def _paste(event):
-        if state["mode"] == "input_env":
-            text = _get_clipboard_text()
-            if text:
-                # 剪贴板内容可能带换行，输入字段通常只需要单行，取第一行
-                text = text.splitlines()[0] if text else ""
-                state["input_value"] += text
-                invalidate()
-            else:
-                set_message("剪贴板为空或无法读取")
-
-    # 字符输入与单字符命令：统一在 <any> 处理器中处理
-    # 重要：不能用 @kb.add("n") 等单字符绑定，否则在 input_env 模式下
-    # 这些字符会被特定绑定拦截，无法输入到 API key 中（按键不冒泡到 <any>）。
-    # <any> 是最低优先级绑定，只有当没有更具体的绑定匹配时才触发，
-    # 因此 up/down/enter/backspace/escape 等控制键仍由各自绑定处理，
-    # 而所有其他可打印字符在这里统一分发。
-    @kb.add("<any>")
+    # 单字符命令：只在非输入模式下生效。
+    # 重要：input_env 模式下绝不能拦截字符——必须放行给焦点上的 Buffer
+    # 做默认 self-insert，否则打字和粘贴都会失效。
+    @kb.add("<any>", filter=Condition(lambda: state["mode"] != "input_env"))
     def _any_key(event):
         try:
             ch = event.key_sequence[0].key
@@ -691,11 +711,7 @@ def open_mcp_selector(on_closed=None):
         if len(ch) != 1 or not ch.isprintable():
             return
         mode = state["mode"]
-        if mode == "input_env":
-            # input_env 模式：接收所有字符作为输入
-            state["input_value"] += ch
-            invalidate()
-        elif mode == "list":
+        if mode == "list":
             # list 模式：单字符命令 n/d/r
             low = ch.lower()
             if low == "n":
@@ -711,32 +727,23 @@ def open_mcp_selector(on_closed=None):
                 reload_servers()
                 set_message(msg)
         elif mode == "confirm_delete":
-            # 确认删除：y 确认
-            if ch.lower() == "y":
+            low = ch.lower()
+            if low == "y":
+                if not state["servers"] or state["cursor"] >= len(state["servers"]):
+                    state["mode"] = "list"
+                    invalidate()
+                    return
                 srv = state["servers"][state["cursor"]]
                 ok, msg = mcp_manager.remove_server(srv["name"])
                 state["mode"] = "list"
                 reload_servers()
                 set_message(msg)
+            elif low == "n":
+                state["mode"] = "list"
+                state["message"] = ""
+                invalidate()
 
     h = _header_line_count()
-
-    def _mouse_handler(mouse_event):
-        """处理 body_window 的鼠标事件：右键释放时粘贴剪贴板。"""
-        if state["mode"] != "input_env":
-            return None
-        if (
-            mouse_event.button == MouseButton.RIGHT
-            and mouse_event.event_type == MouseEventType.MOUSE_UP
-        ):
-            text = _get_clipboard_text()
-            if text:
-                # 剪贴板内容可能带换行，输入字段通常只需要单行，取第一行
-                text = text.splitlines()[0] if text else ""
-                state["input_value"] += text
-                invalidate()
-            return None
-        return None
 
     # 主体 Window：可滚动，需保存引用以便 Layout 显式 focus
     # 关键点：prompt_toolkit 的 auto-scroll 只对"拥有焦点的 Window"生效，
@@ -747,13 +754,28 @@ def open_mcp_selector(on_closed=None):
             render_body,
             get_cursor_position=get_cursor_position,
             focusable=True,
-            mouse_handler=_mouse_handler,
         ),
         wrap_lines=False,
         allow_scroll_beyond_bottom=False,
-        # 界面用自定义文本渲染输入光标（`> _`），隐藏终端物理光标，
-        # 避免光标停留在标题左上角等无关位置。
+        # 非输入模式下隐藏终端物理光标，避免光标停在标题左上角等无关位置
         always_hide_cursor=True,
+    )
+
+    # 真实输入行：input_env 模式下显示在主体和页脚之间。
+    # secret 字段用 PasswordProcessor 全程掩码。
+    input_win = Window(
+        content=BufferControl(
+            buffer=input_buf,
+            input_processors=[
+                BeforeInput("  > ", style="class:input.label"),
+                ConditionalProcessor(
+                    PasswordProcessor(),
+                    Condition(_is_secret_field_active),
+                ),
+            ],
+        ),
+        height=1,
+        dont_extend_height=True,
     )
 
     root_container = HSplit([
@@ -766,6 +788,11 @@ def open_mcp_selector(on_closed=None):
         ),
         # 中间：可滚动主体
         body_window,
+        # 输入行：仅 input_env 模式显示
+        ConditionalContainer(
+            input_win,
+            filter=Condition(lambda: state["mode"] == "input_env"),
+        ),
         # 底部：固定 Footer
         Window(
             content=FormattedTextControl(render_footer),
@@ -780,12 +807,14 @@ def open_mcp_selector(on_closed=None):
     # 显式 focus 主体窗口，启用 prompt_toolkit 的 auto-scroll
     layout.focus(body_window)
 
+    # 注意 mouse_support 必须关闭：开启后会接管终端鼠标协议，
+    # 导致用户无法用终端原生的选中复制/右键粘贴（这比滚轮更重要）。
     app = Application(
         layout=layout,
         key_bindings=kb,
         style=STYLE,
         full_screen=True,
-        mouse_support=True,
+        mouse_support=False,
     )
     app_ref[0] = app
 
