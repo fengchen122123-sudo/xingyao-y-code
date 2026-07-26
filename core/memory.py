@@ -373,6 +373,28 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
+    def update_session_workdir(self, session_name, workdir):
+        """把已有会话重新绑定到指定工作目录（或 'GLOBAL' 自由对话分组）。
+
+        供 GUI 在会话进行中切换项目工作区时迁移当前会话的归属分组，
+        否则启动时挂在 GLOBAL 下的会话即使已进入项目文件夹，
+        侧栏仍会一直显示在"对话"分组里。
+        """
+        wdir = workdir if workdir == "GLOBAL" else _normalize_workdir(workdir)
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute('''
+                    UPDATE sessions SET workdir = ?, updated_at = ?
+                    WHERE session_name = ?
+                ''', (wdir, now, session_name))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def clear_session_messages(self, session_name):
         """清空指定会话的全部消息，但保留会话本身（供 GUI "清空历史" 使用）。
 
