@@ -432,6 +432,10 @@ class ApiBridge:
                 return {"ok": False, "msg": "选择的路径不是文件夹"}
             os.chdir(selected_path)
             self._memory.add_workspace(selected_path)
+            # 当前会话跟随进入所选工作区：否则启动时挂在 GLOBAL 的会话
+            # 即使已在项目文件夹里干活，侧栏仍会一直显示在"对话"分组下
+            if self._current_session:
+                self._memory.update_session_workdir(self._current_session, selected_path)
             return {
                 "ok": True,
                 "workdir": selected_path,

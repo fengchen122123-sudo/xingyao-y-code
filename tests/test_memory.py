@@ -177,3 +177,27 @@ def test_session_timestamps_recorded_and_updated(tmp_path):
     manager.add_message("chat", "assistant", "reply")
     session = next(s for s in manager.get_all_sessions() if s["name"] == "chat")
     assert session["updated_at"] >= session["created_at"]
+
+
+def test_update_session_workdir_migrates_group(tmp_path):
+    """会话进行中切换项目工作区后，会话应迁移到新目录分组（GUI 侧栏归组依据）"""
+    manager = MemoryManager(str(tmp_path / "rebind.db"))
+    project = tmp_path / "project"
+    project.mkdir()
+
+    manager.create_session_explicit("chat", workdir="GLOBAL", source="GUI")
+    manager.add_message("chat", "user", "hello")
+
+    assert manager.update_session_workdir("chat", str(project)) is True
+    session = next(s for s in manager.get_all_sessions() if s["name"] == "chat")
+    assert session["workdir"] != "GLOBAL"
+    assert {s["name"] for s in manager.get_all_sessions(workdir=str(project))} == {"chat"}
+
+    # 也支持迁回 GLOBAL 自由对话分组
+    assert manager.update_session_workdir("chat", "GLOBAL") is True
+    session = next(s for s in manager.get_all_sessions() if s["name"] == "chat")
+    assert session["workdir"] == "GLOBAL"
+
+    # 不存在的会话返回 False，且不会误建新记录
+    assert manager.update_session_workdir("ghost", str(project)) is False
+    assert not any(s["name"] == "ghost" for s in manager.get_all_sessions(include_empty=True))
