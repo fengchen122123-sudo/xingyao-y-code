@@ -13,6 +13,72 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 
 _context: Optional[Any] = None  # 当前注册的上下文实例
 
+# 模块级兜底状态：没有注册 ctx（如纯 headless / 单元测试）时依然可用，
+# 注册了 ctx 时优先信任 ctx 的实时值。
+_active_model_tuple: Optional[tuple] = None
+_ui_flavor: str = "headless"
+_current_session_fallback: str = ""
+_manager_fallback: Optional[Any] = None
+_permission_mode_fallback: str = "confirm"
+
+# 规范权限模式集合：全系统只允许出现这四个值
+CANONICAL_PERMISSION_MODES = ("confirm", "auto", "plan", "full")
+
+# 历史遗留 / 中文标签 -> 规范值的映射表
+_PERMISSION_MODE_ALIASES = {
+    "confirm": "confirm",
+    "default": "confirm",
+    "ask": "confirm",
+    "变更前确认": "confirm",
+    "默认模式": "confirm",
+    "auto": "auto",
+    "autoedit": "auto",
+    "auto_edit": "auto",
+    "acceptedits": "auto",
+    "自动接受编辑": "auto",
+    "自动模式": "auto",
+    "plan": "plan",
+    "planning": "plan",
+    "计划模式": "plan",
+    "full": "full",
+    "yolo": "full",
+    "all": "full",
+    "完全访问": "full",
+    "yolo (全部允许)": "full",
+    "全部允许": "full",
+}
+
+
+def is_known_permission_mode(value: Any) -> bool:
+    """判断给定值是否是可识别的权限模式（规范值或已登记的别名）。
+
+    用于区分"用户选了合法模式"与"传了个拼错/未知的值"——后者不应被
+    normalize 静默兜底成 confirm 后当作切换成功。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    return (
+        lowered in CANONICAL_PERMISSION_MODES
+        or lowered in _PERMISSION_MODE_ALIASES
+        or text in _PERMISSION_MODE_ALIASES
+    )
+
+
+def normalize_permission_mode(value: Any) -> str:
+    """把任意来源的权限模式值规范化为 confirm / auto / plan / full 之一。
+
+    未知值一律回落到最保守的 'confirm'，绝不放宽权限。
+    """
+    text = str(value or "").strip()
+    if not text:
+        return "confirm"
+    lowered = text.lower()
+    if lowered in CANONICAL_PERMISSION_MODES:
+        return lowered
+    return _PERMISSION_MODE_ALIASES.get(lowered, _PERMISSION_MODE_ALIASES.get(text, "confirm"))
+
 
 # ---------------------------------------------------------------------------
 # 注册 / 获取
@@ -29,15 +95,71 @@ def get() -> Optional[Any]:
 
 
 # ---------------------------------------------------------------------------
+# UI 形态（tui / gui / headless）
+# ---------------------------------------------------------------------------
+
+def set_ui_flavor(flavor: str) -> None:
+    """由入口层声明当前 UI 形态，核心模块据此决定是否走终端交互路径。"""
+    global _ui_flavor
+    value = str(flavor or "headless").strip().lower()
+    _ui_flavor = value if value in ("tui", "gui", "headless") else "headless"
+    ctx = _context
+    if ctx is not None:
+        try:
+            ctx.ui_flavor = _ui_flavor
+        except Exception:
+            pass
+
+
+def get_ui_flavor() -> str:
+    ctx = _context
+    if ctx is not None:
+        value = getattr(ctx, "ui_flavor", None)
+        if value:
+            return str(value)
+    return _ui_flavor
+
+
+# ---------------------------------------------------------------------------
+# 当前激活模型（model, key, url）
+# ---------------------------------------------------------------------------
+
+def set_active_model_tuple(model: str, key: str, url: str) -> None:
+    """入口层每次更新激活模型时调用，供 core 层（子代理等）读取。"""
+    global _active_model_tuple
+    _active_model_tuple = (model, key, url)
+
+
+def get_active_model_tuple() -> Optional[tuple]:
+    """返回 (model, key, url)；从未设置过时返回 None，由调用方自行兜底。"""
+    return _active_model_tuple
+
+
+# ---------------------------------------------------------------------------
 # 权限相关
 # ---------------------------------------------------------------------------
 
 def get_permission_mode() -> str:
-    """返回当前权限模式字符串，如 'full'、'plan'、'default'。"""
+    """返回当前权限模式的规范值（confirm / auto / plan / full）。"""
     ctx = _context
     if ctx is None:
-        return "default"
-    return getattr(ctx, "permission_mode", "default")
+        return normalize_permission_mode(_permission_mode_fallback)
+    return normalize_permission_mode(getattr(ctx, "permission_mode", _permission_mode_fallback))
+
+
+def set_permission_mode(value: Any) -> str:
+    """写入权限模式（自动规范化），返回最终生效的规范值。"""
+    global _permission_mode_fallback
+    canonical = normalize_permission_mode(value)
+    _permission_mode_fallback = canonical
+    ctx = _context
+    if ctx is not None:
+        try:
+            ctx.permission_mode = canonical
+        except Exception:
+            # ctx 的 permission_mode 可能是只读属性（由入口层自行维护），忽略即可
+            pass
+    return canonical
 
 
 def get_plan_approved() -> bool:
@@ -87,16 +209,45 @@ def invalidate_ui() -> None:
 def get_manager() -> Optional[Any]:
     """返回 MemoryManager 实例，用于消息持久化。"""
     ctx = _context
-    if ctx is None:
-        return None
-    return getattr(ctx, "manager", None)
+    if ctx is not None:
+        mgr = getattr(ctx, "manager", None)
+        if mgr is not None:
+            return mgr
+    return _manager_fallback
+
+
+def set_manager(manager: Any) -> None:
+    """显式注册 MemoryManager（没有 ctx 或 ctx 不暴露 manager 时的兜底通道）。"""
+    global _manager_fallback
+    _manager_fallback = manager
+    ctx = _context
+    if ctx is not None:
+        try:
+            ctx.manager = manager
+        except Exception:
+            pass
 
 
 def get_current_session() -> str:
     ctx = _context
-    if ctx is None:
-        return ""
-    return str(getattr(ctx, "current_session", ""))
+    if ctx is not None:
+        name = getattr(ctx, "current_session", "")
+        if name:
+            return str(name)
+    return _current_session_fallback
+
+
+def set_current_session(name: str) -> None:
+    """入口层切换会话时调用，保证 core 层拿到的会话名始终最新。"""
+    global _current_session_fallback
+    _current_session_fallback = str(name or "")
+    ctx = _context
+    if ctx is not None:
+        try:
+            ctx.current_session = _current_session_fallback
+        except Exception:
+            # ctx 的 current_session 常为只读属性（代理入口层全局变量），忽略即可
+            pass
 
 
 # ---------------------------------------------------------------------------

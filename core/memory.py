@@ -349,6 +349,59 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
+    def ensure_session(self, session_name, workdir=None, source="GUI"):
+        """确保会话记录存在（不存在则创建），返回是否为本次新建。
+
+        与 create_session_explicit 的区别：本方法会明确告知调用方会话是否已存在，
+        供 GUI 启动时"准备当前会话"这类幂等场景使用。
+        """
+        wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
+                if cursor.fetchone() is not None:
+                    return False
+                cursor.execute('''
+                    INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (session_name, wdir, now, now, source))
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def clear_session_messages(self, session_name):
+        """清空指定会话的全部消息，但保留会话本身（供 GUI "清空历史" 使用）。
+
+        同时重置记忆摘要与压缩游标，避免清空后仍向大模型注入旧摘要。
+        返回被删除的消息条数；会话不存在时返回 0。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
+                row = cursor.fetchone()
+                if row is None:
+                    return 0
+                session_id = row[0]
+                cursor.execute('SELECT COUNT(*) FROM messages WHERE session_id = ?', (session_id,))
+                deleted = cursor.fetchone()[0] or 0
+                cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute('''
+                    UPDATE sessions
+                    SET memory_summary = NULL, summarized_until_msg_id = 0, updated_at = ?
+                    WHERE id = ?
+                ''', (now, session_id))
+                self.conn.commit()
+                return deleted
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def create_session_explicit(self, session_name, workdir=None, source="GUI"):
         """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。"""
         wdir = workdir if workdir == "GLOBAL" else (_normalize_workdir(workdir) if workdir else self.workdir)
@@ -399,6 +452,9 @@ class MemoryManager:
                 elif isinstance(parsed, dict):
                     msg = {"role": role}
                     msg.update(parsed)
+                    # 数据库列中的 role 是权威值：防止消息正文恰好是含 "role" 键的
+                    # JSON 时覆盖真实角色（历史损坏 + 注入向量）
+                    msg["role"] = role
                     history.append(msg)
                 else:
                     history.append({"role": role, "content": parsed})

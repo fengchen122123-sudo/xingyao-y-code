@@ -7,7 +7,9 @@ def plain(text: str) -> str:
     return Text.from_ansi(text).plain
 
 
-def test_structured_history_replays_reasoning_and_markdown():
+def test_structured_history_replays_markdown_and_never_shows_reasoning():
+    """回放历史时正文按 Markdown 渲染；reasoning_content 与实时路径一致，
+    永不显示（实时路径里思考过程只消费不展示，回放必须保持一致）。"""
     history = [
         {"role": "user", "content": "检查项目"},
         {
@@ -20,12 +22,14 @@ def test_structured_history_replays_reasoning_and_markdown():
     rendered = plain(render_session_history(history, width=60))
 
     assert "检查项目" in rendered
-    assert "先查看项目结构" in rendered
+    assert "先查看项目结构" not in rendered
     assert "检查结果" in rendered
     assert "# 检查结果" not in rendered
 
 
 def test_legacy_tagged_history_remains_compatible():
+    """旧版用内联 <think> 标签存储推理内容：标签本身和标签内的推理都不应
+    出现在回放输出里，只保留标签之外的公开正文。"""
     history = [{
         "role": "assistant",
         "content": "<think>旧思考</think>旧回答",
@@ -33,12 +37,14 @@ def test_legacy_tagged_history_remains_compatible():
 
     rendered = plain(render_session_history(history, width=60))
 
-    assert "旧思考" in rendered
+    assert "旧思考" not in rendered
     assert "旧回答" in rendered
     assert "<think>" not in rendered
 
 
 def test_history_replays_tool_call_without_raw_file_content():
+    """详细模式回放：每个工具只有一条结果行（不再有单独的"请求"行），
+    且绝不泄漏工具返回内容的原文。"""
     history = [
         {
             "role": "assistant",
@@ -60,11 +66,69 @@ def test_history_replays_tool_call_without_raw_file_content():
         },
     ]
 
-    rendered = plain(render_session_history(history, width=60))
+    rendered = plain(render_session_history(history, width=60, tool_verbose=True))
 
-    assert "星瑶正在查看文件：core/llm.py" in rendered
     assert "星瑶已查看文件：core/llm.py（2 行）" in rendered
     assert "secret source" not in rendered
+
+
+def test_history_concise_mode_hides_successful_tool_lines_but_shows_failures():
+    """简短模式回放：成功的工具调用不刷屏，失败的必须仍然可见；
+    与实时路径 concise_recap 的理念一致。"""
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "ok-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"file_path":"a.py"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "ok-1", "name": "read_file", "content": "print(1)"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "fail-1",
+                "type": "function",
+                "function": {"name": "execute_command", "arguments": '{"command":"boom"}'},
+            }],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "fail-1",
+            "name": "execute_command",
+            "content": "🚨 command not found",
+        },
+        {"role": "assistant", "content": "已完成排查。"},
+    ]
+
+    rendered = plain(render_session_history(history, width=60, tool_verbose=False))
+
+    assert "a.py" not in rendered
+    assert "星瑶已查看文件" not in rendered
+    assert "命令执行失败" in rendered
+    assert "已完成排查" in rendered
+
+
+def test_history_verbose_mode_shows_both_successful_and_failed_tool_lines():
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "ok-1",
+                "type": "function",
+                "function": {"name": "read_file", "arguments": '{"file_path":"a.py"}'},
+            }],
+        },
+        {"role": "tool", "tool_call_id": "ok-1", "name": "read_file", "content": "print(1)"},
+    ]
+
+    rendered = plain(render_session_history(history, width=60, tool_verbose=True))
+
+    assert "星瑶已查看文件：a.py" in rendered
 
 
 def test_user_content_ansi_escape_is_stripped():
@@ -105,8 +169,9 @@ def test_narrow_terminal_width_is_clamped():
     assert "标题" in plain(rendered)
 
 
-def test_assistant_and_reasoning_ansi_escape_is_stripped():
-    """assistant/reasoning 内容中的 ANSI 注入必须被剥离，防止回放劫持终端"""
+def test_assistant_ansi_escape_is_stripped_and_reasoning_never_leaks():
+    """assistant 内容中的 ANSI 注入必须被剥离，防止回放劫持终端；
+    reasoning_content 永不回放，即使其中包含注入尝试也不会以任何形式泄漏。"""
     history = [{
         "role": "assistant",
         "content": "回答\x1b[2J\x1b[1;1H被清屏",
@@ -118,7 +183,7 @@ def test_assistant_and_reasoning_ansi_escape_is_stripped():
     assert "\x1b[2J" not in rendered
     assert "\x1b[1;1H" not in rendered
     assert "被清屏" in plain(rendered)
-    assert "思考" in plain(rendered)
+    assert "思考" not in plain(rendered)
 
 
 def test_tool_target_ansi_escape_is_stripped():
@@ -144,7 +209,7 @@ def test_tool_target_ansi_escape_is_stripped():
         },
     ]
 
-    rendered = render_session_history(history, width=60)
+    rendered = render_session_history(history, width=60, tool_verbose=True)
 
     assert "\x1b[2J" not in rendered
     assert "evil" in plain(rendered)

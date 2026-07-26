@@ -254,6 +254,8 @@ def test_tool_started_switches_ui_to_executing_state(monkeypatch):
 
 
 def test_plan_item_events_print_one_line_and_refresh_panel(monkeypatch):
+    """计划项事件统一走 ui_markers：<mark> <subject>，不再有各异的动词前缀
+    和末尾多余的 " ✓"（见 core/ui_markers.py 与 main.py 的 plan_item_* 分支）。"""
     factory = TurnEventFactory("turn-plan-events")
     printed = []
     invalidated = []
@@ -272,8 +274,10 @@ def test_plan_item_events_print_one_line_and_refresh_panel(monkeypatch):
         "item": {"id": "a", "subject": "修改调度器", "status": "completed"},
     }))
 
-    assert "星瑶正在执行：修改调度器" in printed[0]
-    assert "星瑶已完成：修改调度器 ✓" in printed[1]
+    started_plain = Text.from_ansi(printed[0]).plain
+    completed_plain = Text.from_ansi(printed[1]).plain
+    assert started_plain == "■ 修改调度器\n"
+    assert completed_plain == "✓ 修改调度器\n"
     assert len(invalidated) == 2
 
 
@@ -375,8 +379,13 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
     assert "用户说了" not in plain
     assert "你好" not in plain
     assert "思考完成" in plain
-    assert main.active_thinking_text == ""
+    # 思考结束后面板延迟隐藏：保留最后一帧思考内容，直到下一个事件到来
+    assert main.active_thinking_text == '用户说了"你好"'
     assert main.active_thinking_turn_id is None
+
+    # 模型开始输出正文时，延迟显示的思考内容被清除
+    main._render_ui_event(factory.emit("assistant_delta", {"text": "答"}))
+    assert main.active_thinking_text == ""
     main.ui_renderers.pop("turn-inline-thinking", None)
 
 

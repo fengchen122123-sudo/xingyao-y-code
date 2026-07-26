@@ -1,13 +1,15 @@
 <template>
   <div id="dropdown" :class="{ show: visible }" :style="styleObj" @click.stop>
-    <div 
-      v-for="m in permModes" 
-      :key="m.n"
+    <div
+      v-for="m in permModes"
+      :key="m.v"
       class="dd-item"
-      @click="selectMode(m.n, m.v)"
+      :title="m.desc"
+      @click="selectMode(m.v)"
     >
-      🛡 {{ m.n }}
-      <span v-if="store.permissionMode === m.n" class="ck">✓</span>
+      <span class="dd-dot" :style="{ background: m.c }"></span>
+      {{ formatPermMode(m.v) }}
+      <span v-if="store.permissionMode === m.v" class="ck">✓</span>
     </div>
   </div>
 </template>
@@ -15,6 +17,8 @@
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import { formatPermMode } from '../utils/markdown';
+import type { PermissionMode } from '../types/pywebview';
 
 const props = defineProps<{
   visible: boolean;
@@ -26,15 +30,15 @@ const store = useAppStore();
 
 const styleObj = ref<Record<string, string>>({});
 
-const permModes = [
-  { n: '默认模式', v: 'confirm', c: 'var(--yellow)' },
-  { n: '自动接受编辑', v: 'auto', c: 'var(--cyan)' },
-  { n: '计划模式', v: 'plan', c: 'var(--purple)' },
-  { n: 'YOLO (全部允许)', v: 'yolo', c: 'var(--red)' }
+const permModes: Array<{ v: PermissionMode; c: string; desc: string }> = [
+  { v: 'confirm', c: 'var(--yellow)', desc: '每次变更前都会向你确认' },
+  { v: 'auto', c: 'var(--cyan)', desc: '自动接受文件编辑，其余操作仍需确认' },
+  { v: 'plan', c: 'var(--purple)', desc: '仅规划任务，不直接执行改动' },
+  { v: 'full', c: 'var(--red)', desc: '完全放行所有操作，风险自负' },
 ];
 
-function selectMode(name: string, val: string) {
-  store.setPermissionMode(name, val);
+function selectMode(val: PermissionMode) {
+  store.setPermissionMode(val);
   emit('close');
 }
 
@@ -108,5 +112,11 @@ onUnmounted(() => {
 .dd-item .ck {
   margin-left: auto;
   color: var(--accent);
+}
+.dd-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
 </style>

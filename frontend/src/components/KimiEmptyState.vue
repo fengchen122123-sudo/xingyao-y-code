@@ -17,30 +17,33 @@
 
       <div class="kimi-card-bar">
         <div style="display:flex;align-items:center;gap:8px">
-          <button class="kimi-pill-btn" title="添加附件" @click="store.showToast('附件加载功能')">＋</button>
-          <button 
-            ref="permBtnRef" 
-            class="kimi-pill-btn" 
+          <button class="kimi-pill-btn" title="添加附件" @click="handlePickFiles">＋ 附件</button>
+          <button
+            ref="permBtnRef"
+            class="kimi-pill-btn"
+            title="切换权限模式"
             @click.stop="togglePermDropdown"
           >
-            ☑ <span>{{ store.permissionMode }}</span>
+            ☑ <span>{{ formatPermMode(store.permissionMode) }}</span>
             <span style="font-size:10px;color:var(--text-faint)">▼</span>
           </button>
         </div>
 
         <div style="display:flex;align-items:center;gap:10px">
-          <button 
-            ref="modelBtnRef" 
-            class="kimi-pill-btn" 
+          <button
+            ref="modelBtnRef"
+            class="kimi-pill-btn"
+            title="切换模型"
             @click.stop="toggleModelCascader"
           >
-            <span>{{ store.currentModel }}</span>
+            <span>{{ store.activeModelName || '选择模型' }}</span>
             <span style="font-size:10px;color:var(--text-faint)">▼</span>
           </button>
 
-          <button 
-            class="kimi-send-btn" 
-            :class="{ active: inputVal.trim() }" 
+          <button
+            class="kimi-send-btn"
+            :class="{ active: inputVal.trim() && !store.running }"
+            :disabled="store.running"
             title="发送消息 (Enter)"
             @click="handleSend"
           >↑</button>
@@ -70,6 +73,7 @@
 <script setup lang="ts">
 import { ref } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import { formatPermMode } from '../utils/markdown';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
 
@@ -92,7 +96,15 @@ function togglePermDropdown() {
   showPermDropdown.value = !showPermDropdown.value;
 }
 
+async function handlePickFiles() {
+  const paths = await store.pickFiles();
+  if (paths.length) {
+    inputVal.value += paths.map(p => ` @${p}`).join('');
+  }
+}
+
 function handleSend() {
+  if (store.running) return;
   if (!inputVal.value.trim()) return;
   const text = inputVal.value;
   inputVal.value = '';

@@ -13,7 +13,7 @@
       </div>
       <div class="modal-foot">
         <button class="btn" @click="store.resolveConfirm(false)">取消 (Esc)</button>
-        <button class="btn primary danger" @click="store.resolveConfirm(true)">确定删除 ⏎</button>
+        <button class="btn primary danger" @click="store.resolveConfirm(true)">{{ store.confirmModal.confirmLabel || '确定删除 ⏎' }}</button>
       </div>
     </div>
   </div>

@@ -62,7 +62,9 @@ class TaskScheduler:
         self,
         plan: PlanManager,
         *,
-        max_workers: int = 4,
+        # 与 core/tools.py 的 _MAX_CONCURRENT_SUBAGENTS 对齐：调度上限低于
+        # 子代理并发上限时，模型按并发上限启动的最后一批认领会永远失败
+        max_workers: int = 5,
         event_callback: SchedulerCallback | None = None,
         verification_runner: VerificationRunner | None = None,
     ) -> None:

@@ -6,6 +6,9 @@ import re
 import threading
 import time
 import uuid
+# Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
+# 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
+from concurrent.futures import TimeoutError as _FutureTimeoutError
 from copy import deepcopy
 
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
@@ -132,10 +135,15 @@ _PLAN_READ_ONLY_TOOLS = frozenset({
     "read_file",
     "list_directory",
     "search_code",
+    "find_definition",
     "glob_files",
     "fetch_url",
     "search_news",
     "get_weather",
+    # 后台任务监控必须放行：模型用 run_subagent(run_in_background=True) 启动
+    # 子代理后需要 manage_task(list/status) 轮询进度，拦截会让主 Agent 对自己
+    # 启动的后台任务完全失明（kill 操作有独立的用户确认，不受此白名单影响）
+    "manage_task",
 })
 _PLAN_BOUND_ORCHESTRATORS = frozenset({"run_subagent", "ask_user"})
 
@@ -363,6 +371,13 @@ def check_permission_and_ask(
             _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
 
+    # 2.5 auto（自动接受编辑）模式：只自动放行文件写入/修改，
+    #     execute_command 等有副作用的操作仍然必须逐次确认。
+    if app_context.get_permission_mode() == "auto" and function_name in ("write_file", "edit_file"):
+        if event_callback is not None:
+            _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
+        return True
+
     # 3. 如果是计划模式且本轮对话的计划已经获得批准，直接通过
     if app_context.get_permission_mode() == "plan" and app_context.get_plan_approved():
         if event_callback is not None:
@@ -381,8 +396,10 @@ def check_permission_and_ask(
         return _gui_cb(function_name, arguments)
 
     # TUI 模式：通过 prompt_toolkit app 或终端 input()
+    # GUI 模式没有 prompt_toolkit App，但已在 permission_broker 上注册了处理器，
+    # 必须直接走下面的 broker 路径，绝不能退回阻塞式 input()。
     _app = app_context.get_app_instance()
-    if not _app or not _app.loop:
+    if (not _app or not _app.loop) and app_context.get_ui_flavor() != "gui":
         with _raw_permission_lock:
             return ask_in_raw_terminal(function_name, arguments)
 
@@ -411,7 +428,10 @@ def check_permission_and_ask(
             try:
                 choice_idx = request.future.result(timeout=0.1)
                 break
-            except TimeoutError:
+            except (TimeoutError, _FutureTimeoutError):
+                # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建
+                # TimeoutError 的别名，只 except TimeoutError 会漏接，
+                # 导致轮询循环直接抛 PermissionSystemError（等待期必崩）
                 continue
 
         from prompt_toolkit.formatted_text import ANSI
@@ -553,15 +573,32 @@ def __getattr__(name):
         return _get_litellm()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
+# estimate_tokens 结果缓存：tiktoken 全量编码整个历史相当慢（长会话可达秒级），
+# 而 UI 状态栏、压缩判断等会在内容未变时反复调用。用 (模型, 消息数, 总字符数)
+# 作为签名，未变化时直接复用上次结果。
+_token_estimate_cache = {"sig": None, "value": 0}
+
+
 def estimate_tokens(model_name, messages):
-    """本地离线快速估算 Token 数，防止超载崩溃"""
+    """本地离线快速估算 Token 数，防止超载崩溃（带签名缓存）"""
     if not messages:
         return 0
     try:
-        return _litellm_token_counter(model_name, messages)
+        total_len = sum(len(str(m.get("content") or "")) for m in messages)
+        sig = (str(model_name), len(messages), total_len)
+    except Exception:
+        sig = None
+    if sig is not None and _token_estimate_cache.get("sig") == sig:
+        return _token_estimate_cache["value"]
+    try:
+        value = _litellm_token_counter(model_name, messages)
     except Exception:
         # 如果模型不支持或报错，采用约 2 字符 / Token 的经验值进行兜底估算
-        return len(str(messages)) // 2
+        value = len(str(messages)) // 2
+    if sig is not None:
+        _token_estimate_cache["sig"] = sig
+        _token_estimate_cache["value"] = value
+    return value
 
 def _yield_content(text):
     """假流式生成器：把完整文本逐字符 yield，模拟打字机效果"""
@@ -721,12 +758,33 @@ def chat_with_model_events(
         raise
 
 # 支持原生推理字段回传的 provider 白名单（按 litellm model 前缀匹配）
-_REASONING_FIELD_PROVIDERS = ("anthropic", "deepseek")
+_REASONING_FIELD_PROVIDERS = ("anthropic", "deepseek", "moonshot")
+
+_KIMI_NAME_RE = re.compile(r"(?:^|[-_/])k(?:2|3)(?:[._-]\d+)?(?:$|[-_])")
+
+
+def _is_kimi_family(model_name, api_base=""):
+    """判断是否 Kimi/Moonshot 系模型（模型名优先，api_base 兜底）。
+
+    经销商/聚合网关（api.scnet.cn、OpenRouter 等）的 base_url 不含
+    moonshot 字样，必须靠模型名识别，否则所有 Kimi 深度适配全部失效。
+    """
+    m = str(model_name or "").split("/")[-1].lower()
+    if "kimi" in m or "moonshot" in m:
+        return True
+    if _KIMI_NAME_RE.search(m):
+        return True
+    b = str(api_base or "").lower()
+    return "moonshot" in b or "kimi" in b
 
 
 def _supports_reasoning_fields(model_name):
     prefix = str(model_name or "").split("/")[0].lower()
-    return prefix in _REASONING_FIELD_PROVIDERS
+    if prefix in _REASONING_FIELD_PROVIDERS:
+        return True
+    # Kimi 推理模型（含经销商 openai/ 路由）：多轮工具调用要求 assistant
+    # 消息保留 reasoning_content，剥掉会导致 400 或推理链断裂
+    return _is_kimi_family(model_name)
 
 
 # 支持 prompt caching 的 provider 白名单（按 litellm model 前缀匹配）
@@ -790,6 +848,11 @@ def _apply_cache_control(messages, model_name):
     return messages
 
 
+# _supports_vision 结果缓存（30s TTL）：该函数在工具循环里每轮都会被调用
+# （最多 100 次/用户轮），底层的 litellm.supports_vision 查表并不便宜。
+_vision_support_cache = {}
+
+
 def _supports_vision(model_name):
     """判断模型是否支持图像输入。
 
@@ -801,20 +864,27 @@ def _supports_vision(model_name):
     """
     if not model_name:
         return False
+    cached = _vision_support_cache.get(model_name)
+    if cached is not None and cached[1] > time.monotonic():
+        return cached[0]
+    result = False
     try:
         from core.model_manager import load_config
         for provider in load_config().get("providers", []):
             for model in provider.get("models", []):
                 if model.get("litellm_model") == model_name and "supports_vision" in model:
-                    return bool(model["supports_vision"])
+                    result = bool(model["supports_vision"])
+                    _vision_support_cache[model_name] = (result, time.monotonic() + 30)
+                    return result
     except Exception:
         pass
     try:
         if _litellm_supports_vision(model_name):
-            return True
+            result = True
     except Exception:
         pass
-    return False
+    _vision_support_cache[model_name] = (result, time.monotonic() + 30)
+    return result
 
 
 def _flatten_media_content(content_list):
@@ -972,40 +1042,43 @@ def _provider_request_options(model_name, api_base):
             result["allowed_openai_params"] = ["thinking"]
         return result
 
-    # 2. 内置默认表：按 api_base + 模型名变体匹配
-    is_kimi_coding = "api.kimi.com/coding" in normalized_base
-    is_moonshot = "api.moonshot.cn" in normalized_base or "moonshot" in normalized_base
-    is_kimi = is_kimi_coding or is_moonshot or "kimi" in normalized_base
+    # 2. 内置默认表：Kimi/Moonshot 深度适配。
+    # 判定同时看模型名与 api_base（经销商/聚合网关的 base_url 千奇百怪，
+    # 只认 base 会漏判，比如 api.scnet.cn 上的 Kimi-K2.6）。
+    if not _is_kimi_family(model_name, api_base):
+        return {}
 
-    # 统一模型名前缀：k3 / k2.7 / k2.5 / kimi-k3 / moonshot-v1-xxx 等
+    is_kimi_coding = "api.kimi.com/coding" in normalized_base
+    route_prefix = str(model_name or "").split("/")[0].lower()
+    anthropic_route = route_prefix == "anthropic"
     model_lower = normalized_model
 
-    def _match_any(prefixes):
-        return any(p in model_lower for p in prefixes)
+    def _match_any(keys):
+        return any(k in model_lower for k in keys)
 
-    # Kimi K3：启用 thinking，保持较高预算以支持复杂推理。
-    if is_kimi and _match_any(("k3", "kimi-k3")):
-        if is_kimi_coding:
+    is_k3 = _match_any(("k3",)) or "for-coding" in model_lower
+
+    if anthropic_route:
+        # Anthropic 协议路由（api.kimi.com/coding 等 anthropic 兼容端点）：
+        # 接受 Anthropic 形状的 thinking 参数。
+        if is_k3:
             return {
-                "thinking": {"type": "enabled", "budget_tokens": 4096},
-                "max_tokens": 32000,
-                "allowed_openai_params": ["thinking"],
+                "thinking": {"type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048},
+                "max_tokens": 32000 if is_kimi_coding else 16000,
             }
         return {
             "thinking": {"type": "enabled", "budget_tokens": 2048},
             "max_tokens": 16000,
-            "allowed_openai_params": ["thinking"],
         }
 
-    # Kimi K2.7 / K2.5：降低 thinking 预算以节省额度；若模型不支持 thinking 则由 litellm 忽略。
-    if is_kimi and _match_any(("k2.7", "k2.5", "kimi-k2.7", "kimi-k2.5")):
-        return {
-            "thinking": {"type": "enabled", "budget_tokens": 2048},
-            "max_tokens": 16000,
-            "allowed_openai_params": ["thinking"],
-        }
-
-    return {}
+    # OpenAI 兼容路由（api.moonshot.cn/v1 及各类经销商）：
+    # 绝不发送 Anthropic 形状的 thinking 参数——Moonshot 的
+    # /v1/chat/completions 不认这个键，发了会直接 400。
+    # Kimi 推理模型（k2.5/k2.6/k2.7/k3 等）在该路由上会原生输出
+    # reasoning_content，无需显式开启，只需给足输出上限。
+    if is_k3:
+        return {"max_tokens": 32000}
+    return {"max_tokens": 16384}
 
 
 def _complete_thinking_blocks(delta):
@@ -1076,6 +1149,26 @@ def _tool_output_preview(function_name, arguments, result):
     """Return a stable terminal summary without exposing raw tool output."""
     ok = _tool_result_ok(function_name, result)
     return summarize_tool_finished(function_name, arguments, result, ok)
+
+
+# tool_finished 事件里携带的完整工具结果上限（字符数）：
+# GUI 需要展开查看原始输出，但不能让单条事件把 IPC 通道撑爆。
+TOOL_RESULT_EVENT_MAX_CHARS = 4000
+
+
+def _tool_result_text(result):
+    """把工具消息正文取出并截断，作为 tool_finished 事件的 result 字段。
+
+    这是附加字段：TUI 只读 summary，多出的 result 对它无副作用。
+    """
+    try:
+        content = result.get("content", "") if isinstance(result, dict) else result
+    except Exception:
+        content = ""
+    text = str(content or "")
+    if len(text) > TOOL_RESULT_EVENT_MAX_CHARS:
+        return text[:TOOL_RESULT_EVENT_MAX_CHARS] + "...（已截断）"
+    return text
 
 
 def _tool_result_ok(function_name, result):
@@ -1228,7 +1321,11 @@ def _show_file_diff(file_path, old_content, new_content, event_callback, panel_t
         else:
             _notify_event(event_callback, "diff_ready", {
                 "file_path": file_path,
+                # text: 终端用的 rich 面板（含 ANSI 颜色），TUI 直接打印
                 "text": diff_output,
+                # diff_text: 纯文本 unified diff，供 GUI 等非终端界面自行着色渲染
+                # （ANSI 转义码在 HTML 里会原样显示成乱码）
+                "diff_text": display_text,
             })
     except Exception as diff_err:
         logger.warning("渲染文件 diff 失败 (%s): %s", file_path, diff_err)
@@ -1514,7 +1611,8 @@ def _execute_single_tool_call(
                     subagent_type=arguments.get("subagent_type", "general"),
                     plan_item_id=arguments.get("plan_item_id", ""),
                     run_in_background=arguments.get("run_in_background", False),
-                    timeout_seconds=arguments.get("timeout_seconds", 600),
+                    # 不传时交给 run_subagent 按角色解析默认超时（只读角色更短）
+                    timeout_seconds=arguments.get("timeout_seconds"),
                     parent_session=parent_session,
                     parent_turn_id=parent_turn_id,
                     parent_cancel_event=cancel_event,
@@ -1735,6 +1833,8 @@ def _execute_single_tool_call(
                     target,
                     repl,
                     replace_all=bool(arguments.get("replace_all", False)),
+                    start_line=arguments.get("start_line"),
+                    end_line=arguments.get("end_line"),
                 )
                 if not result.startswith(TOOL_ERROR_PREFIX):
                     try:
@@ -1762,8 +1862,41 @@ def _execute_single_tool_call(
         "role": "tool",
         "tool_call_id": tc["id"],
         "name": function_name,
-        "content": str(result)
+        "content": _truncate_tool_result_for_context(function_name, str(result)),
     }
+
+
+# ─── 工具结果入上下文前的截断 ────────────────────────────────────
+# 这是最大的 token 泄漏点：一次 fetch_url 可以塞进 512KB（≈13 万 token）原文，
+# 一次 pip install 的 stdout 可以是几 MB。截断只影响送进模型上下文/落库的内容，
+# 不影响工具本身的执行结果与终端展示。
+_TOOL_RESULT_MAX_CHARS = 24000            # 默认上限（约 8K token）
+_TOOL_RESULT_LIMITS = {
+    "execute_command": 16000,             # 保留头尾：报错信息几乎都在结尾
+    "fetch_url": 16000,                   # 保留头部：正文开头信息密度最高
+    "search_news": 8000,
+}
+_TOOL_RESULT_TAIL_TOOLS = {"execute_command"}
+# read_file 自带行数/字节上限，且编辑流程依赖完整内容，不做二次截断
+_TOOL_RESULT_EXEMPT = {"read_file"}
+
+
+def _truncate_tool_result_for_context(function_name, text):
+    if function_name in _TOOL_RESULT_EXEMPT:
+        return text
+    limit = _TOOL_RESULT_LIMITS.get(function_name, _TOOL_RESULT_MAX_CHARS)
+    if len(text) <= limit:
+        return text
+    dropped = len(text) - limit
+    if function_name in _TOOL_RESULT_TAIL_TOOLS:
+        head_len = limit // 4
+        head = text[:head_len]
+        tail = text[-(limit - head_len):]
+        return f"{head}\n…[输出过长，中间省略 {dropped} 字符]…\n{tail}"
+    return (
+        f"{text[:limit]}\n"
+        f"…[结果过长，已截断 {dropped} 字符。如需后续内容请用更精确的参数重新调用]"
+    )
 
 def _call_vision_model_for_content(secondary, content, cancel_event=None, max_retries=3):
     """调用支持视觉的副模型，传入完整 content（含图片），返回回复文本；失败返回空字符串。"""
@@ -1828,7 +1961,7 @@ def _vision_fallback_text(user_text=""):
         "请直接回复用户：无法分析图片，不要调用任何工具。]"
     )
     if user_text:
-        return f"{user_text}\\n\\n{hint}"
+        return f"{user_text}\n\n{hint}"
     return hint
 
 
@@ -1891,9 +2024,9 @@ def _describe_images_with_secondary(messages, main_model_name, event_callback=No
     answer = _call_vision_model_for_content(secondary, sec_content, cancel_event=cancel_event)
     if answer:
         if user_text:
-            target_msg["content"] = f"{user_text}\\n\\n[图片分析结果]\\n{answer}"
+            target_msg["content"] = f"{user_text}\n\n[图片分析结果]\n{answer}"
         else:
-            target_msg["content"] = f"[图片分析结果]\\n{answer}"
+            target_msg["content"] = f"[图片分析结果]\n{answer}"
     else:
         target_msg["content"] = _vision_fallback_text(user_text)
 
@@ -1918,23 +2051,32 @@ def _chat_with_model_generator(
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
     """
     turn_snapshot = deepcopy(messages)
-    # 1. 自动注入 KAIROS 长期记忆指示与 MEMORY.md 索引
+    # 1. 自动注入 KAIROS 长期记忆指示与 MEMORY.md 索引。
+    # 注意：main.py 的动态上下文（尾部第二条 system 消息）里已经带了完整记忆段，
+    # 所以必须检查所有 system 消息，避免重复注入（重复会翻倍 token 消耗）。
+    # 同时绝不能把动态内容拼进 messages[0]——那是提示词缓存的稳定前缀，
+    # 一旦每轮变化，provider 侧的 prompt cache 将永远无法命中。
     import core.memory_kairos as mk
-    memory_section = mk.build_memory_system_section()
-    
-    system_msg = None
-    for msg in messages:
-        if msg.get("role") == "system":
-            system_msg = msg
-            break
-    if system_msg:
-        if "# Auto Memory" not in system_msg["content"]:
-            system_msg["content"] += "\n\n" + memory_section
-    else:
-        messages.insert(0, {"role": "system", "content": memory_section})
+
+    _memory_already_injected = any(
+        msg.get("role") == "system" and "# Auto Memory" in str(msg.get("content") or "")
+        for msg in messages
+    )
+    if not _memory_already_injected:
+        memory_section = mk.build_memory_system_section()
+        if memory_section and memory_section.strip():
+            # 作为独立 system 消息插入到最后一条 user 消息之前（而非改写稳定前缀）
+            insert_at = len(messages)
+            for i in range(len(messages) - 1, -1, -1):
+                if messages[i].get("role") == "user":
+                    insert_at = i
+                    break
+            messages.insert(insert_at, {"role": "system", "content": memory_section})
 
     tool_activity_seen = False
     final_summary_retry_count = 0
+    # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
+    plan_continue_nudges = 0
     pending_persistence = []
 
     def flush_persistence():
@@ -1942,9 +2084,12 @@ def _chat_with_model_generator(
         nonlocal pending_persistence
         if stream and pending_persistence:
             _mgr = app_context.get_manager()
+            if not _mgr:
+                # 当前没有可用的存储管理器：保留队列，待下次 flush 时再尝试落库，
+                # 直接清空会导致整批消息静默丢失。
+                return
             try:
-                if _mgr:
-                    _mgr.add_messages(parent_session, pending_persistence)
+                _mgr.add_messages(parent_session, pending_persistence)
             except Exception as flush_err:
                 # 落库失败不回滚内存：add_messages 可能已部分写入，回滚会造成
                 # 内存/DB 分叉。仅上报错误事件并丢弃待写队列，避免重复写入。
@@ -1964,7 +2109,8 @@ def _chat_with_model_generator(
             messages.append(notif_msg)
             # 立即加入待持久化队列并落库：即使本轮后续被取消，通知也不会丢失，
             # 否则模型上下文会出现"收到通知并回复了，但下一轮找不到通知"的矛盾。
-            pending_persistence.append(notif_msg)
+            # 注意：队列元素必须是 (role, content) 二元组，与 add_messages 的解包约定一致。
+            pending_persistence.append(("user", notif))
         flush_persistence()
 
     def rollback_turn_messages():
@@ -1977,6 +2123,15 @@ def _chat_with_model_generator(
     # 计划模式下仍向 LLM 暴露计划控制工具和只读探索工具，
     # 让主 Agent 既能推进计划，也能直接读取上下文验证子代理产出。
     _PLAN_AVAILABLE_TOOLS = _PLAN_ROOT_CONTROL_TOOLS | _PLAN_READ_ONLY_TOOLS
+    # MCP 管理工具默认不进请求：用户几乎都通过 /mcp 界面管理 MCP，
+    # 这 4 个 schema 每轮白吃约 500 token。需要让 AI 代管 MCP 时在
+    # config.json 里设 "expose_mcp_admin_tools": true 即可恢复。
+    _MCP_ADMIN_TOOLS = {"mcp_add_server", "mcp_remove_server", "mcp_set_enabled", "mcp_list_servers"}
+    try:
+        from core.model_manager import load_config as _load_cfg_for_tools
+        _expose_mcp_admin = bool(_load_cfg_for_tools().get("expose_mcp_admin_tools", False))
+    except Exception:
+        _expose_mcp_admin = False
     request_tools = [
         schema
         for schema in get_tools_schema()
@@ -1989,6 +2144,9 @@ def _chat_with_model_generator(
         not in {"run_subagent", "plan_write", "plan_update"}
         if allowed_tools is None
         or schema.get("function", {}).get("name") in allowed_tools
+        if _expose_mcp_admin
+        or (allowed_tools is not None and schema.get("function", {}).get("name") in allowed_tools)
+        or schema.get("function", {}).get("name") not in _MCP_ADMIN_TOOLS
     ]
 
     # 针对打招呼等简单闲聊优化：禁用工具防乱掉
@@ -2005,7 +2163,9 @@ def _chat_with_model_generator(
     kwargs = {
         "model": model_name,
         "api_key": api_key,
-        "messages": _strip_media_and_merge(messages, model_name)[0],
+        # 占位：每次请求前都会在重试循环里用 _strip_media_and_merge 的结果覆盖，
+        # 这里不再提前做一遍完整清洗（此前同一份数据每轮被处理两次，纯浪费 CPU）
+        "messages": messages,
         "tools": None if (is_simple_greeting and not active_plan) else request_tools,
         "stream": True,
         "stream_options": {"include_usage": True},
@@ -2046,6 +2206,18 @@ def _chat_with_model_generator(
                 raise_if_cancelled()
                 try:
                     cleaned_messages, folded_count, keep_media = _strip_media_and_merge(messages, model_name)
+                    if _is_kimi_family(model_name, api_base):
+                        # Moonshot 推理模型要求所有带 tool_calls 的 assistant 消息
+                        # 携带 reasoning_content；从数据库重建的历史消息可能已被剥掉，
+                        # 这里补空格占位符（litellm 的 moonshot/ 路由会自动做，
+                        # 但经销商常用的 openai/ 路由不会）。
+                        for _m in cleaned_messages:
+                            if (
+                                _m.get("role") == "assistant"
+                                and _m.get("tool_calls")
+                                and not _m.get("reasoning_content")
+                            ):
+                                _m["reasoning_content"] = " "
                     kwargs["messages"] = _apply_cache_control(cleaned_messages, model_name)
                     # 历史图片折叠属于正常节省行为，不再向用户弹提示打扰
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
@@ -2286,12 +2458,15 @@ def _chat_with_model_generator(
             # 兜底：模型只输出 thinking 但未生成正文时，把思考过程作为回复展示，
             # 避免 UI 在 "思考完成" 后出现空白，给用户造成 Agent 没有响应的错觉。
             # 注意：工具调用轮保持 content 为 None，不污染工具链签名。
+            raw_content_meaningful = _is_meaningful_assistant_content(public_content)
+            promoted_reasoning = False
             if (
                 not tool_calls_dict
-                and not _is_meaningful_assistant_content(public_content)
+                and not raw_content_meaningful
                 and _is_meaningful_assistant_content(reasoning_content)
             ):
                 public_content = reasoning_content.strip() + "\n\n[以上为模型思考过程，未生成正式回复]"
+                promoted_reasoning = True
 
             # 只允许公开正文写入记忆，避免把原生推理误当作长期事实。
             memory_tags = mk.extract_memory_tags(public_content)
@@ -2329,17 +2504,22 @@ def _chat_with_model_generator(
             if tool_calls_list:
                 persisted_message["tool_calls"] = tool_calls_list
 
+            # 用"促升前"的原始正文判断：思考内容被促升为正文后不能算作有效结论，
+            # 否则模型纯思考收尾时会跳过最终总结重试，用户什么都看不到
             needs_final_summary = (
                 not tool_calls_list
                 and tool_activity_seen
-                and not _is_meaningful_assistant_content(public_content)
+                and not raw_content_meaningful
             )
-            
-            if stream and not needs_final_summary:
+            # 只有真正要走重试分支时才跳过持久化（重试会 pop 掉这条消息）；
+            # 重试机会用尽后的最终消息必须照常入库，否则内存与 DB 分叉
+            will_retry_summary = needs_final_summary and final_summary_retry_count == 0
+
+            if stream and not will_retry_summary:
                 pending_persistence.append(("assistant", persisted_message))
-            
+
             if not tool_calls_list:
-                if needs_final_summary and final_summary_retry_count == 0:
+                if will_retry_summary:
                     final_summary_retry_count += 1
                     # 空 assistant 消息（content 为 None）不入库也不留内存：
                     # 留在历史里会让下一轮 API 报 400（Anthropic 拒绝空 content）
@@ -2359,6 +2539,43 @@ def _chat_with_model_generator(
                         "message": "模型未生成结论，正在请求最终总结。",
                     })
                     continue
+                # 计划仍有可执行项时不允许提前收尾：向模型注入续推消息，
+                # 要求继续通过 run_subagent 完成剩余计划项（最多续推 2 次，
+                # 避免模型坚持收尾时与续推消息无限打转）。
+                if allow_subagents and parent_session and plan_continue_nudges < 2:
+                    try:
+                        from core.plan import get_default_plan_manager as _get_plan_for_nudge
+                        _nudge_plan = _get_plan_for_nudge()
+                        _nudge_ready = [
+                            item for item in _nudge_plan.ready_items()
+                            if item.get("kind") != "input_preparation"
+                        ] if _nudge_plan.session_id == str(parent_session) else []
+                        _nudge_running = any(
+                            item.get("status") == "in_progress"
+                            for item in _nudge_plan.snapshot()
+                        ) if _nudge_plan.session_id == str(parent_session) else False
+                    except Exception:
+                        _nudge_ready, _nudge_running = [], False
+                    if _nudge_ready and not _nudge_running:
+                        plan_continue_nudges += 1
+                        hints = ", ".join(
+                            f"'{item['id']}'({item['subject']})" for item in _nudge_ready[:5]
+                        )
+                        nudge_request = {
+                            "role": "user",
+                            "content": (
+                                f"计划尚未执行完毕，仍有可执行的计划项: [{hints}]。"
+                                "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项；"
+                                "若某项确实无法完成，请先用 plan_read 查看状态并明确说明原因，"
+                                "不要在计划未完成时直接结束回答。"
+                            ),
+                        }
+                        messages.append(nudge_request)
+                        pending_persistence.append(("user", nudge_request))
+                        _notify_event(event_callback, "notice", {
+                            "message": "计划仍有未执行项，已提醒模型继续执行。",
+                        })
+                        continue
                 # 模型未调用工具且未生成任何正文：给出明确提示，避免 UI 在
                 # "思考完成" 后陷入沉默（常见于某些模型只输出 reasoning 或空回复）。
                 if not _is_meaningful_assistant_content(public_content):
@@ -2366,8 +2583,37 @@ def _chat_with_model_generator(
                     if reasoning_content and reasoning_content.strip():
                         fallback_msg += " 如需查看思考过程，可尝试换用支持推理展示的模型或重新提问。"
                     _notify_event(event_callback, "notice", {"message": fallback_msg})
+                # 促升的思考正文此前只写入了历史、从未推送到 UI——用户会看到
+                # 回合默默结束什么都没输出。此处补推给界面流式显示。
+                if promoted_reasoning and public_content:
+                    yield from _yield_content(public_content)
                 flush_persistence()
                 return
+
+            # 输出被 max_tokens 截断时，工具参数几乎必然不完整（JSON 修复只能补全
+            # 语法，无法找回被截断的内容）。此时绝不能执行任何工具——尤其是
+            # write_file/edit_file 会把半截内容写进文件。改为向模型返回错误结果，
+            # 让它拆小参数后重新调用。
+            if finish_reason == "length":
+                truncated_err = (
+                    f"{TOOL_ERROR_PREFIX} 本次工具调用参数因输出长度限制被截断，未执行。"
+                    "请把参数拆小（例如分多次 edit_file、缩短 content）后重新调用。"
+                )
+                for tc in tool_calls_list:
+                    synth = {
+                        "role": "tool",
+                        "tool_call_id": tc["id"],
+                        "name": tc["function"]["name"],
+                        "content": truncated_err,
+                    }
+                    messages.append(synth)
+                    if stream:
+                        pending_persistence.append(("tool", synth))
+                flush_persistence()
+                _notify_event(event_callback, "notice", {
+                    "message": "模型输出被长度限制截断，已拦截本批工具调用并要求模型拆小参数重试。",
+                })
+                continue
 
             tool_activity_seen = True
             if event_callback is None:
@@ -2375,7 +2621,7 @@ def _chat_with_model_generator(
                 app_context.invalidate_ui()
             else:
                 _notify_event(event_callback, "status", {"state": "executing"})
-            
+
             def execute_in_context(tool_call):
                 return _execute_single_tool_call(
                     tool_call,
@@ -2412,9 +2658,14 @@ def _chat_with_model_generator(
 
                 if is_parallel and len(batch) > 1:
                     # 并发上限固定为 4，结果仍按模型工具调用顺序写回。
+                    # 不用 with 语句：with 的 __exit__ 会 shutdown(wait=True)，
+                    # 取消时会卡住 UI 直到所有并行工具（可能是长时子代理）跑完。
                     from concurrent.futures import ThreadPoolExecutor
-                    with ThreadPoolExecutor(max_workers=min(len(batch), 4)) as executor:
+                    executor = ThreadPoolExecutor(max_workers=min(len(batch), 4))
+                    try:
                         results = list(executor.map(execute_in_context, batch))
+                    finally:
+                        executor.shutdown(wait=False, cancel_futures=True)
                     messages.extend(results)
                     for tc, res in zip(batch, results):
                         arguments = _tool_call_arguments(tc)
@@ -2424,6 +2675,8 @@ def _chat_with_model_generator(
                             "summary": _tool_output_preview(
                                 tc["function"]["name"], arguments, res
                             ),
+                            # 完整工具结果（截断）：GUI 需要展开查看，TUI 忽略此字段
+                            "result": _tool_result_text(res),
                         })
                     if stream:
                         pending_persistence.extend(("tool", res) for res in results)
@@ -2440,6 +2693,8 @@ def _chat_with_model_generator(
                             "summary": _tool_output_preview(
                                 tc["function"]["name"], arguments, res
                             ),
+                            # 完整工具结果（截断）：GUI 需要展开查看，TUI 忽略此字段
+                            "result": _tool_result_text(res),
                         })
                         if stream:
                             pending_persistence.append(("tool", res))
@@ -2462,10 +2717,19 @@ def _chat_with_model_generator(
         return
 
     except KeyboardInterrupt:
+        # 关闭底层 HTTP 流：否则每次取消都会泄漏一个连接/套接字
+        try:
+            response_stream.close()
+        except Exception:
+            pass
         # 用户中断：安全回退删除此轮 Turn 添加的一切消息残影
         rollback_turn_messages()
         raise
     except Exception as e:
+        try:
+            response_stream.close()
+        except Exception:
+            pass
         # 异常路径同样回滚本轮未持久化的内存消息：既避免留下带 tool_calls 却无
         # tool 响应的悬空 assistant 消息（下一轮 API 会 400），也保持内存历史与 DB 一致
         rollback_turn_messages()

@@ -53,17 +53,22 @@ def get_frontend_url() -> str:
         print(f"Loading compiled Vue 3 production dist from: {dist_path}")
         return dist_path
 
-    # 3. 兜底回退
-    demo_path = os.path.abspath(os.path.join(base_dir, "demo", "ycode_gui_demo.html"))
-    if os.path.exists(demo_path):
-        print(f"Fallback to demo template at: {demo_path}")
-        return demo_path
-
     print(f"Error: No valid frontend entry point found!", file=sys.stderr)
     sys.exit(1)
 
+
+def _debug_enabled() -> bool:
+    """开发者工具开关：设置环境变量 YCODE_GUI_DEBUG=1 即可打开调试控制台。"""
+    return os.environ.get("YCODE_GUI_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
+
+
 def main():
-    api = ApiBridge()
+    # 显式传入真正的 MCP 单例，避免桥接层拿到空的 MCP 管理器
+    try:
+        from core.mcp_client import mcp_manager
+    except Exception:
+        mcp_manager = None
+    api = ApiBridge(mcp_manager=mcp_manager)
     url = get_frontend_url()
 
     # 启动 PyWebView 原生桌面窗口
@@ -80,9 +85,9 @@ def main():
     )
 
     api.set_window(window)
-    
-    # 启动 WebView 消息主循环 (debug=False 关闭开发者工具调试控制台弹窗)
-    webview.start(debug=False)
+
+    # 启动 WebView 消息主循环（默认关闭开发者工具，YCODE_GUI_DEBUG=1 时打开）
+    webview.start(debug=_debug_enabled())
 
 if __name__ == "__main__":
     main()

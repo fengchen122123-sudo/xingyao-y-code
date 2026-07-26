@@ -170,7 +170,10 @@ def test_kimi_k3_request_uses_anthropic_high_thinking_budget(mocker):
 
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 4096}
     assert captured["max_tokens"] == 32000
-    assert captured["allowed_openai_params"] == ["thinking"]
+    # anthropic 协议路由原生支持 thinking 参数，不再需要
+    # allowed_openai_params 透传 hack（那是 openai 路由才用的，
+    # 且 openai 路由现在根本不发 thinking——Moonshot 的 OpenAI 端点不认它）
+    assert "allowed_openai_params" not in captured
     assert "reasoning_effort" not in captured
 
 
@@ -582,7 +585,6 @@ def test_existing_pending_plan_rejects_direct_root_tool(mocker):
     [
         ("run_subagent", '{"task_description":"查询天气"}'),
         ("ask_user", '{"question":"城市？","options":["北京"]}'),
-        ("manage_task", '{"action":"list"}'),
         ("mcp_demo", '{}'),
     ],
 )
@@ -613,6 +615,36 @@ def test_plan_turn_requires_bound_orchestrators_and_blocks_other_tools(
     else:
         assert "必须通过 run_subagent" in result["content"]
     bind_default_plan_session(previous_session)
+
+
+def test_plan_turn_allows_manage_task_passthrough():
+    """回归：计划激活时 manage_task（后台任务监控）必须放行，不被计划门禁拦截。
+
+    模型需要用 manage_task 查看/管理后台子代理任务；kill 操作有独立的用户确认，
+    拦截它只会让模型在计划期间对后台任务失明。
+    """
+    from core.plan import bind_default_plan_session, get_default_plan_manager
+    import core.llm as llm
+
+    plan = get_default_plan_manager()
+    previous_session = plan.session_id
+    bind_default_plan_session("plan-bound-manage-task-pass-test")
+    plan.replace([{"id": "weather", "subject": "查询天气"}])
+
+    try:
+        result = llm._execute_single_tool_call(
+            {
+                "id": "call-manage-task-pass",
+                "function": {"name": "manage_task", "arguments": '{"action":"list"}'},
+            },
+            event_callback=lambda *args, **kwargs: None,
+            parent_session="plan-bound-manage-task-pass-test",
+            parent_turn_id="turn-manage-task-pass",
+        )
+    finally:
+        bind_default_plan_session(previous_session)
+
+    assert "必须通过 run_subagent" not in result["content"]
 
 
 def test_parallel_subagents_overlap_and_results_keep_call_order(mocker):
@@ -779,10 +811,11 @@ def test_root_with_pending_plan_only_exposes_plan_control_tools(mocker):
 
     names = {item["function"]["name"] for item in captured["tools"]}
     # 计划模式下暴露计划控制工具 + 只读探索工具
+    # find_definition 属只读探索；manage_task 用于后台任务监控（kill 有独立确认）
     assert names <= {
         "plan_write", "plan_update", "plan_read", "plan_retry", "run_subagent", "ask_user",
-        "read_file", "list_directory", "search_code", "glob_files",
-        "fetch_url", "search_news", "get_weather",
+        "read_file", "list_directory", "search_code", "glob_files", "find_definition",
+        "fetch_url", "search_news", "get_weather", "manage_task",
     }
 
 

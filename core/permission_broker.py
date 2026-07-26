@@ -36,9 +36,18 @@ class PermissionBroker:
     ) -> None:
         self._activate_prompt = activate_prompt or (lambda request: None)
         self._dismiss_prompt = dismiss_prompt or (lambda: None)
+        self._has_prompt_handlers = activate_prompt is not None
         self._active: PermissionRequest | None = None
         self._queued: deque[PermissionRequest] = deque()
         self._lock = threading.Lock()
+
+    def has_prompt_handlers(self) -> bool:
+        """是否已有入口层注册的提示处理器。
+
+        没有处理器时入队请求永远无人应答，调用方应直接放弃询问而不是空等。
+        """
+        with self._lock:
+            return self._has_prompt_handlers
 
     def set_prompt_handlers(
         self,
@@ -48,6 +57,7 @@ class PermissionBroker:
         with self._lock:
             self._activate_prompt = activate_prompt
             self._dismiss_prompt = dismiss_prompt
+            self._has_prompt_handlers = True
             active = self._active
         # 锁外激活前复核：请求可能在此期间已被 resolve/cancel
         if active is not None and self.is_active(active.request_id):

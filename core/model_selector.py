@@ -74,13 +74,17 @@ PROTOCOLS = [
 
 # 内置 12 大快捷预设厂商配置
 PRESET_PROVIDERS = [
+    # 注意：context_window 按官方口径 262144（256K）标注，宁可保守——
+    # 虚标会让记忆压缩在真实上限之后才触发，直接 400。
+    # supports_vision 保守标 False：把图片发给纯文本 Kimi 变体会直接报错，
+    # 确认某模型支持视觉后可在 config.json 中手动改回 True。
     {
         "name": "月之暗面kimi-for-coding",
         "base_url": "https://api.kimi.com/coding",
         "protocol": "anthropic",
         "models": [
-            {"name": "kimi-for-coding", "context_window": 256000, "supports_vision": True},
-            {"name": "K3", "context_window": 1000000, "supports_vision": True},
+            {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": False},
+            {"name": "K3", "context_window": 262144, "supports_vision": False},
         ],
     },
     {
@@ -88,9 +92,9 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.moonshot.cn/v1",
         "protocol": "openai",
         "models": [
-            {"name": "kimi-k3", "context_window": 1000000, "supports_vision": True},
-            {"name": "kimi-k2.7-code", "context_window": 256000, "supports_vision": True},
-            {"name": "kimi-k2.6", "context_window": 256000, "supports_vision": True},
+            {"name": "kimi-k3", "context_window": 262144, "supports_vision": False},
+            {"name": "kimi-k2.7-code", "context_window": 262144, "supports_vision": False},
+            {"name": "kimi-k2.6", "context_window": 262144, "supports_vision": False},
         ],
     },
     {
@@ -258,6 +262,12 @@ def open_model_selector(on_model_selected=None):
         return items
 
     state["items"] = build_items()
+    # 初始光标落到第一个可选中项：items[0] 是 provider 分组标题（不可选中），
+    # 不跳过的话首次打开按 Enter 没有任何反应
+    for _i, _it in enumerate(state["items"]):
+        if _it["type"] != "provider":
+            state["cursor"] = _i
+            break
 
     def _test_and_save_edited_model(event, ctx, supports_vision):
         state["message"] = "⏳ 正在验证连接模型..."
@@ -265,7 +275,16 @@ def open_model_selector(on_model_selected=None):
         event.app.invalidate()
 
         def _ui(callback):
-            event.app.loop.call_soon_threadsafe(callback)
+            # 后台测试线程回投 UI 前必须检查 loop 是否已关闭：
+            # 用户在测试期间退出选择器时，loop 已关闭，直接调用会抛
+            # RuntimeError 并在无守护的线程里打印堆栈污染终端。
+            loop = getattr(event.app, "loop", None)
+            if loop is None or loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(callback)
+            except RuntimeError:
+                pass
 
         def test_conn():
             # model/err 变量在 try 之前赋值，避免 _get_litellm() 抛异常时
@@ -345,7 +364,16 @@ def open_model_selector(on_model_selected=None):
         event.app.invalidate()
 
         def _ui(callback):
-            event.app.loop.call_soon_threadsafe(callback)
+            # 后台测试线程回投 UI 前必须检查 loop 是否已关闭：
+            # 用户在测试期间退出选择器时，loop 已关闭，直接调用会抛
+            # RuntimeError 并在无守护的线程里打印堆栈污染终端。
+            loop = getattr(event.app, "loop", None)
+            if loop is None or loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(callback)
+            except RuntimeError:
+                pass
 
         def test_conn():
             url = preset["base_url"]
@@ -422,7 +450,16 @@ def open_model_selector(on_model_selected=None):
         event.app.invalidate()
 
         def _ui(callback):
-            event.app.loop.call_soon_threadsafe(callback)
+            # 后台测试线程回投 UI 前必须检查 loop 是否已关闭：
+            # 用户在测试期间退出选择器时，loop 已关闭，直接调用会抛
+            # RuntimeError 并在无守护的线程里打印堆栈污染终端。
+            loop = getattr(event.app, "loop", None)
+            if loop is None or loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(callback)
+            except RuntimeError:
+                pass
 
         def test_conn():
             # model/err 变量在 try 之前赋值，避免 _get_litellm() 抛异常时
@@ -501,7 +538,16 @@ def open_model_selector(on_model_selected=None):
         event.app.invalidate()
 
         def _ui(callback):
-            event.app.loop.call_soon_threadsafe(callback)
+            # 后台测试线程回投 UI 前必须检查 loop 是否已关闭：
+            # 用户在测试期间退出选择器时，loop 已关闭，直接调用会抛
+            # RuntimeError 并在无守护的线程里打印堆栈污染终端。
+            loop = getattr(event.app, "loop", None)
+            if loop is None or loop.is_closed():
+                return
+            try:
+                loop.call_soon_threadsafe(callback)
+            except RuntimeError:
+                pass
 
         def test_conn():
             model = state["am_data"].get("model_name", "").strip()
@@ -1101,13 +1147,23 @@ def open_model_selector(on_model_selected=None):
 
     @kb.add("d", filter=Condition(lambda: state["mode"] == "list"))
     def _delete(event):
-        item = state["items"][state["cursor"]]
-        if item["type"] == "model":
-            delete_model(item["data"]["id"])
+        # 两步确认：删除模型是破坏性操作，与会话/MCP 选择器保持一致的确认习惯
+        if not state["items"]:
+            return
+        item = state["items"][min(state["cursor"], len(state["items"]) - 1)]
+        if item["type"] != "model":
+            return
+        model_id = item["data"]["id"]
+        if state.get("pending_delete") == model_id:
+            state["pending_delete"] = None
+            delete_model(model_id)
             state["items"] = build_items()
             state["cursor"] = min(state["cursor"], len(state["items"]) - 1)
             _skip_providers(1)
             state["message"] = f"已删除: {item['data']['name']}"
+        else:
+            state["pending_delete"] = model_id
+            state["message"] = f"⚠ 再按一次 d 确认删除模型: {item['data']['name']}"
 
     @kb.add("s", filter=Condition(lambda: state["mode"] == "list"))
     def _open_secondary_selector(event):
@@ -1138,6 +1194,11 @@ def open_model_selector(on_model_selected=None):
     @kb.add("q", filter=Condition(lambda: state["mode"] == "list"))
     @kb.add("c-c")
     def _quit(event):
+        if state.get("testing"):
+            # 连接测试进行中不允许退出：后台线程还会回投 UI 更新，
+            # 此时关闭 loop 会让测试线程崩溃
+            state["message"] = "⏳ 正在测试连接，请稍候再退出..."
+            return
         event.app.exit()
 
     @kb.add("up", filter=Condition(lambda: state["mode"] == "wizard" and state["add_step"] in (0, 3.5, 5.5, 6)))
@@ -1167,7 +1228,9 @@ def open_model_selector(on_model_selected=None):
             
         state["message"] = ""
         step = state["add_step"]
-        text = input_buf.text.strip()
+        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
+        # 混入配置后请求会直接 400，且肉眼极难排查
+        text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
             if state["preset_cursor"] < len(PRESET_PROVIDERS):
@@ -1334,7 +1397,9 @@ def open_model_selector(on_model_selected=None):
 
         state["message"] = ""
         step = state["am_step"]
-        text = input_buf.text.strip()
+        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
+        # 混入配置后请求会直接 400，且肉眼极难排查
+        text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
             if not text:
@@ -1413,7 +1478,9 @@ def open_model_selector(on_model_selected=None):
             
         state["message"] = ""
         step = state["edit_step"]
-        text = input_buf.text.strip()
+        # 清洗粘贴内容：浏览器复制的 API key/URL 常带换行符，
+        # 混入配置后请求会直接 400，且肉眼极难排查
+        text = input_buf.text.replace("\r", "").replace("\n", "").strip()
 
         if step == 0:
             if not text:

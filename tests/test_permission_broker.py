@@ -424,6 +424,9 @@ def test_ask_user_poll_exception_releases_enqueued_request(monkeypatch):
         def __init__(self):
             self.cancelled = []
 
+        def has_prompt_handlers(self):
+            return True
+
         def enqueue(self, *args, **kwargs):
             from types import SimpleNamespace
 

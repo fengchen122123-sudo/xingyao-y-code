@@ -65,12 +65,19 @@ def _get_file_mtime(path: str) -> float:
 # ---------------------------------------------------------------------------
 
 
-def read_file_key(path: str, offset: int, limit: int | None, compress: bool) -> tuple:
+def read_file_key(
+    path: str,
+    offset: int,
+    limit: int | None,
+    compress: bool,
+    with_line_numbers: bool = False,
+) -> tuple:
     return (
         str(Path(path).resolve()),
         int(offset),
         limit,
         bool(compress),
+        bool(with_line_numbers),
         _get_file_mtime(path),
     )
 
