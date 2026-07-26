@@ -14,6 +14,42 @@
    （项目运行时依赖见 `requirements.txt`，同样需要提前 `pip install -r requirements.txt`。）
 3. Node.js 20 及以上版本（用于构建 `frontend/` 下的 Vue 3 前端，GUI 版加载的就是它的
    编译产物）。安装后确认 `npm -v` 在命令行可用。
+4. 前端依赖已安装：首次构建（或 `frontend/node_modules` 不存在时）需先执行
+   ```bash
+   cd frontend
+   npm install
+   cd ..
+   ```
+
+### 零基础完整流程（从全新 clone 到拿到安装包）
+
+给第一次接手本项目的人（或 AI 助手）的完整命令序列，在项目根目录依次执行：
+
+```bash
+# 1. 创建虚拟环境并安装 Python 依赖（已有 venv 可跳过）
+python -m venv venv
+venv\Scripts\pip install -r requirements.txt
+venv\Scripts\pip install pyinstaller
+
+# 2. 安装前端依赖（已有 frontend\node_modules 可跳过）
+cd frontend && npm install && cd ..
+
+# 3. 一条命令构建全部产物
+venv\Scripts\python build_release.py
+
+# 4. 确认产物：最终交付用户的是 dist\ycode_setup.exe
+dir dist
+```
+
+打包所需的一切文件都在版本库内，不依赖任何库外文件：
+`build_release.py`（构建入口）、`ycode.spec`（GUI+TUI 双主程序）、
+`ycode_uninstall.spec` / `ycode_uninstall.py`（卸载程序）、
+`ycode_setup.spec` / `ycode_setup.py`（安装向导，同一份源码按内嵌
+marker 区分 full/tui 两种模式）、`packaging/runtime_hook_nullstdout.py`
+（windowed 模式下 stdout 兜底的运行时钩子）、`config.example.json` 与
+`system_prompt.md`（安装时播种到 `~/.ycode` 的默认配置）、`frontend/`
+（Vue 3 前端源码）。版本号唯一来源是 `core/version.py`，安装包版本号
+自动从它读取，不要在别处硬编码。
 
 ## 二、一条命令完成构建
 
