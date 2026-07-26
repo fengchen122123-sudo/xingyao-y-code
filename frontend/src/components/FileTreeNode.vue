@@ -5,32 +5,39 @@
       {{ node.d ? '📂 ' + node.n : '📄 ' + node.n }}
     </div>
     <div v-if="node.d && isOpen" class="file-children">
-      <FileTreeNode 
-        v-for="child in node.children" 
-        :key="child.n" 
-        :node="child" 
+      <FileTreeNode
+        v-for="child in node.children"
+        :key="child.n"
+        :node="child"
+        :parent-path="fullPath"
       />
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import type { FileNode } from '../types/pywebview';
 import { useAppStore } from '../stores/appStore';
 
 const props = defineProps<{
   node: FileNode;
+  parentPath?: string;
 }>();
 
 const store = useAppStore();
 const isOpen = ref(false);
 
+// FileNode 本身只带文件名(n)，需要沿递归路径拼接出完整路径供预览接口使用
+const fullPath = computed(() => {
+  return props.parentPath ? props.parentPath + '\\' + props.node.n : props.node.n;
+});
+
 function toggle() {
   if (props.node.d) {
     isOpen.value = !isOpen.value;
   } else {
-    store.showToast('选中文件: ' + props.node.n);
+    store.openFilePreview(fullPath.value);
   }
 }
 </script>

@@ -249,6 +249,10 @@ button {
   color: #fff;
   box-shadow: 0 4px 14px rgba(79, 140, 255, 0.4);
 }
+.kimi-send-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
 
 .kimi-footer-workdir {
   margin-top: 18px;
@@ -379,9 +383,9 @@ body.light {
 }
 body.light .md-body pre,
 body.light .tool-body,
+body.light .diff-body,
 body.light .modal-body,
-body.light .bg-task .btlog,
-body.light #pane-terminal .term-body {
+body.light .fp-body {
   background: #f0f3f7;
 }
 body.light .tool-head .tname,

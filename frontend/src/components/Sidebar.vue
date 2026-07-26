@@ -1,16 +1,16 @@
 <template>
   <div id="sidebar" :class="{ collapsed: store.sidebarCollapsed }">
     <div class="side-menu">
-      <div class="menu-item" @click="emit('openSub', 'skills')">
+      <div class="menu-item" @click="store.openSubpage('skills')">
         <span class="mi-ico">⚡</span>
         <span class="mi-label">技能 Skills</span>
         <span class="mi-count">{{ store.skills.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
-      <div class="menu-item" @click="emit('openSub', 'mcp')">
+      <div class="menu-item" @click="store.openSubpage('mcp')">
         <span class="mi-ico">🔌</span>
         <span class="mi-label">MCP 服务</span>
-        <span class="mi-count">{{ store.mcps.length }} 在线</span>
+        <span class="mi-count">{{ connectedMcpCount }} / {{ store.mcps.length }} 在线</span>
         <span class="mi-arrow">›</span>
       </div>
     </div>
@@ -78,14 +78,14 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, computed } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import type { SessionGroup } from '../types/pywebview';
 
 const store = useAppStore();
-const emit = defineEmits(['openSub']);
 
 const collapsedGroups = ref<Record<string, boolean>>({});
+const connectedMcpCount = computed(() => store.mcps.filter(m => m.connected).length);
 
 function toggleGroupCollapsed(path: string) {
   collapsedGroups.value[path] = !collapsedGroups.value[path];

@@ -392,7 +392,14 @@ def test_edit_file_dispatch_passes_replace_all(mocker, tmp_path):
     target.write_text("aaa bbb aaa", encoding="utf-8")
     captured = {}
 
-    def fake_edit_file(file_path, target_content, replacement_content, replace_all=False):
+    def fake_edit_file(
+        file_path,
+        target_content,
+        replacement_content,
+        replace_all=False,
+        start_line=None,
+        end_line=None,
+    ):
         captured["replace_all"] = replace_all
         return f"{llm.TOOL_ERROR_PREFIX} 模拟失败，跳过后续 diff 读取"
 

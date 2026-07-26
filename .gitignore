@@ -17,9 +17,14 @@ dist/
 .eggs/
 
 # PyInstaller (auto-generated, never commit)
-# 注意：ycode.spec 是项目自定义配置，已纳入版本控制；其他自动生成的 .spec 仍忽略。
+# 注意：ycode.spec / ycode_setup.spec / ycode_uninstall.spec 是项目自定义配置，
+# 已纳入版本控制；其他自动生成的 .spec（例如 build_release.py 用 --onefile
+# 动态构建 ycode_setup.exe / ycode_tui_setup.exe 时，PyInstaller 在临时目录
+# 里自动生成的那些）仍然忽略。
 *.spec
 !ycode.spec
+!ycode_setup.spec
+!ycode_uninstall.spec
 
 # pytest
 .pytest_cache/
@@ -32,8 +37,10 @@ mytemp/
 .ycode_tasks/plans/*.json
 .ycode_tasks/plans/*.tmp
 
-# Scraped / downloaded HTML files
-*.html
+# Scraped / downloaded HTML files（仅忽略仓库根目录下的抓取/临时网页；
+# /* 限定层级，避免误伤 frontend/index.html 这类项目源码里的 HTML 模板）
+/*.html
+!frontend/index.html
 
 # IDE
 .idea/

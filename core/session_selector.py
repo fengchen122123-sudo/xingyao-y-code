@@ -6,14 +6,16 @@ from prompt_toolkit.styles import Style
 
 import os
 
-# 延迟导入，避免循环引用
+import core.app_context as app_context
+
+
+# 会话数据来源：优先使用调用方显式传入的参数，其次回落到 app_context
+# （彻底移除对 main 的 import，GUI/测试同样可直接调用本模块）
 def get_manager():
-    from main import manager
-    return manager
+    return app_context.get_manager()
 
 def get_current_session():
-    from main import current_session
-    return current_session
+    return app_context.get_current_session() or "default"
 
 STYLE = Style.from_dict({
     "header":          "bold #00b4d8",
@@ -29,13 +31,17 @@ STYLE = Style.from_dict({
 def _t(style: str, text: str):
     return (style, text)
 
-def open_session_selector(on_closed=None, on_switch=None, on_rename=None):
+def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
+                          manager=None, current_session=None):
     """
     提供全屏终端 UI 用于浏览、切换、删除会话记录。
+
+    参数 manager / current_session 由调用方（main.py）显式传入；
+    未传入时回落到 app_context 中注册的运行时上下文。
     """
     try:
-        mgr = get_manager()
-        cur_session = get_current_session()
+        mgr = manager if manager is not None else get_manager()
+        cur_session = current_session if current_session else get_current_session()
     except Exception:
         # 如果无法获取到，可能是某些上下文问题，给个空数据做防御
         mgr = None
@@ -126,8 +132,9 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None):
             on_rename(cur["name"])
         event.app.exit()
 
+    # 注意：不绑定 backspace——退格是几乎所有界面里的"返回"习惯键，
+    # 绑定成删除会话会造成误触（即使有二次确认也很吓人）
     @kb.add("delete")
-    @kb.add("backspace")
     def _delete(event):
         if not state["sessions"]:
             return
