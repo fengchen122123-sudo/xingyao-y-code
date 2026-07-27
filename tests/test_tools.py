@@ -1588,6 +1588,19 @@ def test_subagent_result_strips_advisor_tags():
     assert "结论内容" in result
 
 
+def test_subagent_result_strips_parenthesized_advisor_leak():
+    """回归：圆括号形式的 advisor 内部说明（如 "(advisor returned no content)"）
+    也必须从子代理结果中剔除。"""
+    manager = SubagentManager(
+        runner=lambda record: "(advisor returned no content)\n\n真正的结论。"
+    )
+
+    result = manager.run("任务", "s-paren", "t-paren", timeout_seconds=30)
+
+    assert "advisor" not in result.lower()
+    assert "真正的结论。" in result
+
+
 def test_subagent_result_strips_xml_junk_blocks():
     """回归（软件识别会话事故）：模型把 <advisor-request> 求助文本和
     <function_calls> XML 伪工具调用整块泄漏到正文时，必须从子代理结果中剔除。

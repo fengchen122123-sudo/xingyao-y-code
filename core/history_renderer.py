@@ -126,8 +126,8 @@ def render_session_history(
             result = {"content": message.get("content", "")}
             ok = not str(result["content"]).startswith("🚨")
             # 与实时详细模式一致：每个工具只回放一行结果（不再有单独的"请求"行）。
-            # 简短模式下只回放失败的工具调用，成功的调用保持静默，避免刷屏。
-            if ok and not tool_verbose:
+            # 简短模式下所有工具调用都保持静默，避免刷屏。
+            if not tool_verbose:
                 continue
             summary = summarize_tool_finished(name, arguments, result, ok=ok)
             summary = _styled_summary(summary, tool_target(name, arguments))

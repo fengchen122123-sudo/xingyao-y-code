@@ -72,9 +72,9 @@ def test_history_replays_tool_call_without_raw_file_content():
     assert "secret source" not in rendered
 
 
-def test_history_concise_mode_hides_successful_tool_lines_but_shows_failures():
-    """简短模式回放：成功的工具调用不刷屏，失败的必须仍然可见；
-    与实时路径 concise_recap 的理念一致。"""
+def test_history_concise_mode_hides_all_tool_lines():
+    """简短模式回放：成功和失败的工具调用都不刷屏；
+    与实时路径一致，失败数量由收尾统计行汇总。"""
     history = [
         {
             "role": "assistant",
@@ -108,10 +108,9 @@ def test_history_concise_mode_hides_successful_tool_lines_but_shows_failures():
 
     assert "a.py" not in rendered
     assert "星瑶已查看文件" not in rendered
-    # 失败行必须可见：命令本身 + 错误原因（🚨 哨兵前缀已被剥离）
-    assert "boom" in rendered
-    assert "command not found" in rendered
-    assert "🚨" not in rendered
+    assert "boom" not in rendered
+    assert "command not found" not in rendered
+    assert "✗" not in rendered
     assert "已完成排查" in rendered
 
 

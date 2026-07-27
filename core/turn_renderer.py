@@ -83,6 +83,9 @@ def sanitize_protocol_text(text: str) -> str:
     text = re.sub(r'\[Advisor consultation[^\]]*\]', '', text)
     text = re.sub(r'\[Advisor review\]', '', text)
     text = re.sub(r'\[End of advisor consultation[^\]]*\]', '', text)
+    # 圆括号形式的 advisor 内部说明（如 "(advisor returned no content)"）也会泄漏到正文，
+    # 同样需要清理
+    text = re.sub(r'\(\s*advisor[^\)]*\)', '', text, flags=re.IGNORECASE)
     return text
 
 
@@ -316,11 +319,9 @@ class TurnRenderer:
             self._failed_tool_count += 1
         styled_summary = self._styled_tool_summary(data) if data.get("summary") else label
         if not self._tool_verbose:
-            # 简短模式：成功的工具调用保持静默（过程中的试错不刷屏）；
-            # 失败必须可见——绝不能无声消失，否则用户根本不知道出了问题。
-            # 失败信息始终完整入库，用户也可通过 /verbose on 切到详细模式查看全过程。
-            if not ok:
-                self._append_line(f"{ANSI_RED}{MARK_FAILED}{ANSI_RESET} {styled_summary}")
+            # 简短模式：所有工具调用（无论成功失败）都保持静默，不逐条刷屏；
+            # 失败数量由回合收尾的 concise_recap 统计行汇总展示，
+            # 用户可通过 /verbose on 切到详细模式查看每个工具的完整过程。
             return
         marker = MARK_DONE if ok else MARK_FAILED
         color = ANSI_GREEN if ok else ANSI_RED
@@ -333,8 +334,9 @@ class TurnRenderer:
         self._append_line(f"{ANSI_YELLOW}  ! 星瑶暂未完成当前步骤{ANSI_RESET}")
 
     def concise_recap(self) -> str:
-        """简短模式下的回合收尾统计行：共执行 N 项操作（M 项失败）。
+        """简短模式下的回合收尾统计行：共执行 N 项操作。
 
+        失败信息完全静默（不显示失败计数），用户可切到 /verbose on 查看详情。
         详细模式、本回合未执行任何工具、或本实例已经生成过收尾行时返回空串。
         由 main.py 在 turn_finished/turn_cancelled/turn_error 时调用一次，直接
         经 _print_ui_fragment 打印——不走 Markdown 渲染缓冲区，避免其中的
@@ -344,9 +346,7 @@ class TurnRenderer:
             return ""
         self._recap_emitted = True
         total = len(self._completed_tools)
-        failed = self._failed_tool_count
-        suffix = f"（{failed} 项失败）" if failed else ""
-        return f"{ANSI_GRAY}● 共执行 {total} 项操作{suffix}{ANSI_RESET}\n"
+        return f"{ANSI_GRAY}● 共执行 {total} 项操作{ANSI_RESET}\n"
 
     def finish(self) -> str:
         if not self._finished:
