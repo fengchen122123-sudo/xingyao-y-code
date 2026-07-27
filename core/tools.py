@@ -1806,6 +1806,8 @@ def _has_meaningful_subagent_result(text: str) -> bool:
 
 _ADVISOR_TAG_RE = re.compile(
     r"\[(?:Advisor consultation[^\]]*|Advisor review|End of advisor consultation[^\]]*)\]"
+    r"|\(\s*advisor[^\)]*\)",
+    re.IGNORECASE,
 )
 # 模型（尤其 Kimi 系）偶尔把内部协议整块泄漏到正文：<advisor-request> 求助文本、
 # XML 形式的 <function_calls>/<tool_call> 伪工具调用。这些不是结论，整块剔除。

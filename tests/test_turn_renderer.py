@@ -187,6 +187,20 @@ def test_renderer_sanitizes_protocol_and_raw_tool_call_tags():
     assert "修改已完成。" in finish_output
 
 
+def test_renderer_strips_parenthesized_advisor_leak():
+    """回归：圆括号形式的 advisor 内部说明（如 "(advisor returned no content)"）
+    也会泄漏到正文，必须被清理。"""
+    renderer = TurnRenderer()
+
+    renderer.consume("assistant_delta", {"text": "(advisor returned no content)\n\n实际结论在这里。"})
+    renderer.consume("assistant_delta", {"text": "完成。"})
+
+    finish_output = renderer.finish()
+    assert "advisor" not in finish_output.lower()
+    assert "实际结论在这里。" in finish_output
+    assert "完成。" in finish_output
+
+
 def test_renderer_preserves_code_block_with_think_tags_inside():
     """代码块内的 <think> 标签应作为代码内容保留，不应被当作推理内容丢弃。"""
     renderer = TurnRenderer()
@@ -262,8 +276,8 @@ def test_concise_mode_prints_working_header_once_for_parallel_tool_batch():
     assert third == ""
 
 
-def test_concise_mode_hides_success_but_always_shows_failure():
-    """简短模式下：成功的工具调用静默，失败必须可见——不能无声消失。"""
+def test_concise_mode_hides_both_success_and_failure():
+    """简短模式下：成功和失败的工具调用都静默，失败数量由收尾统计行汇总。"""
     renderer = TurnRenderer(tool_verbose=False)
     renderer.consume("tool_requested", {"id": "1", "name": "read_file", "preview": "a.py"})
 
@@ -278,12 +292,11 @@ def test_concise_mode_hides_success_but_always_shows_failure():
     }))
 
     assert ok_output == ""
-    assert "✗" in fail_output
-    assert "\x1b[31m" in fail_output
-    assert "命令执行失败" in Text.from_ansi(fail_output).plain
+    assert fail_output == ""
+    assert "✗" not in fail_output
 
 
-def test_concise_mode_end_of_turn_recap_counts_operations_and_failures():
+def test_concise_mode_end_of_turn_recap_counts_operations_silently():
     renderer = TurnRenderer(tool_verbose=False)
     renderer.consume("tool_requested", {"id": "1", "name": "read_file"})
     renderer.consume("tool_finished", {"id": "1", "name": "read_file", "ok": True})
@@ -293,12 +306,14 @@ def test_concise_mode_end_of_turn_recap_counts_operations_and_failures():
     })
 
     plain = Text.from_ansi(renderer.concise_recap()).plain
-    assert plain.strip() == "● 共执行 2 项操作（1 项失败）"
+    # 简洁模式完全静默失败：只显示操作总数，不显示失败计数
+    assert plain.strip() == "● 共执行 2 项操作"
+    assert "失败" not in plain
     # 同一实例只应生成一次收尾行，避免 main.py 在多个终止分支里重复打印
     assert renderer.concise_recap() == ""
 
 
-def test_concise_recap_omits_parenthetical_when_nothing_failed():
+def test_concise_recap_omits_failures_completely():
     renderer = TurnRenderer(tool_verbose=False)
     renderer.consume("tool_requested", {"id": "1", "name": "read_file"})
     renderer.consume("tool_finished", {"id": "1", "name": "read_file", "ok": True})
