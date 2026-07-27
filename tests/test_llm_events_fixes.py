@@ -680,3 +680,163 @@ def test_supports_vision_unknown_default_false(monkeypatch):
     assert llm_mod._supports_vision("anthropic/K3") is False
     assert llm_mod._supports_vision("deepseek/deepseek-chat") is False
     assert llm_mod._supports_vision(None) is False
+
+
+# ── 只思考不行动的促升兜底（P0 回归）──
+
+
+def test_reasoning_only_turn_is_nudged_to_act(mocker):
+    """模型只输出 reasoning、不调工具也不给正文：先注入催促消息让它真正行动，
+    而不是把整段内心独白当成本轮回合的交付结果。"""
+    responses = [
+        iter([_chunk(reasoning="让我先精确定位需要修改的 SQL，然后做修改。")]),
+        iter([_chunk("检查结论：已定位问题并完成修改。")]),
+    ]
+    mocker.patch("core.llm.completion", side_effect=responses)
+    messages = [{"role": "user", "content": "使用方案A修改一下"}]
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        messages,
+        persist=False,
+        turn_id="turn-reasoning-only-nudge",
+        consume_background_notifications=False,
+    ))
+
+    # 催促消息已注入对话，要求模型调用工具或给出结论
+    assert any(
+        m["role"] == "user" and "只输出了思考过程" in str(m.get("content", ""))
+        for m in messages
+    )
+    # 最终留下的 assistant 正文是结论，而不是思考原文
+    final = [m for m in messages if m["role"] == "assistant" and m.get("content")]
+    assert final and "检查结论" in final[-1]["content"]
+    assert "让我先精确定位" not in final[-1]["content"]
+
+
+def test_reasoning_only_promotion_is_truncated(mocker):
+    """催促重试后模型仍只输出思考：促升为正文时必须截断，
+    不能把数万字内心独白全量倾倒给用户。"""
+    long_reasoning = "分析过程。" * 2000  # 远超预览上限
+    responses = [
+        iter([_chunk(reasoning=long_reasoning)]),
+        iter([_chunk(reasoning=long_reasoning)]),  # 重试后仍只思考
+    ]
+    mocker.patch("core.llm.completion", side_effect=responses)
+    messages = [{"role": "user", "content": "使用方案A修改一下"}]
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        messages,
+        persist=False,
+        turn_id="turn-reasoning-only-truncated",
+        consume_background_notifications=False,
+    ))
+
+    final = [m for m in messages if m["role"] == "assistant" and m.get("content")]
+    assert final, "促升兜底仍应留下一条可见回复"
+    content = final[-1]["content"]
+    assert content.rstrip().endswith("[以上为模型思考过程，未生成正式回复]")
+    assert "已截断" in content
+    assert len(content) < 1000
+
+
+def _chunk_with_finish(content="", reasoning="", finish_reason=None):
+    delta = SimpleNamespace(
+        content=content,
+        reasoning_content=reasoning,
+        tool_calls=None,
+        provider_specific_fields=None,
+    )
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=delta, finish_reason=finish_reason)],
+        usage=None,
+    )
+
+
+def test_reasoning_fields_dropped_for_messages_without_tool_calls(mocker):
+    """白名单 provider 下：无 tool_calls 的 assistant 消息不回传 reasoning_content /
+    thinking_blocks（死思考重复上传纯属浪费）；带 tool_calls 的消息仍保留。"""
+    captured = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+
+    list(chat_with_model_events(
+        "deepseek/deepseek-reasoner",
+        "fake-key",
+        [
+            {"role": "user", "content": "提问"},
+            {
+                "role": "assistant",
+                "content": "促升的思考预览……[以上为模型思考过程，未生成正式回复]",
+                "reasoning_content": "废推理" * 5000,
+                "thinking_blocks": [
+                    {"type": "thinking", "thinking": "废推理", "signature": "sig"}
+                ],
+            },
+            {
+                "role": "assistant",
+                "content": "工具轮",
+                "reasoning_content": "签名链推理",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "read_file", "arguments": "{}"},
+                }],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "结果"},
+            {"role": "user", "content": "继续"},
+        ],
+        persist=False,
+        turn_id="turn-dead-reasoning-strip",
+        consume_background_notifications=False,
+    ))
+
+    assistants = [m for m in captured["messages"] if m["role"] == "assistant"]
+    no_tool = next(m for m in assistants if not m.get("tool_calls"))
+    with_tool = next(m for m in assistants if m.get("tool_calls"))
+    assert "reasoning_content" not in no_tool
+    assert "thinking_blocks" not in no_tool
+    assert with_tool["reasoning_content"] == "签名链推理"
+
+
+def test_length_truncated_retry_bumps_max_tokens(mocker):
+    """思考被 max_tokens 截断（finish_reason=length）导致无正文时，
+    催促重试必须翻倍输出上限并要求压缩思考，否则同参数重试必然同样失败。"""
+    captured = []
+    responses = [
+        iter([_chunk_with_finish(reasoning="长思考" * 100, finish_reason="length")]),
+        iter([_chunk_with_finish(content="最终结论", finish_reason="stop")]),
+    ]
+
+    def fake_completion(**kwargs):
+        captured.append(dict(kwargs))
+        return responses.pop(0)
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+    messages = [{"role": "user", "content": "排查问题"}]
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        messages,
+        persist=False,
+        turn_id="turn-length-retry-bump",
+        consume_background_notifications=False,
+    ))
+
+    assert len(captured) == 2
+    first_max = captured[0].get("max_tokens") or captured[0].get("max_completion_tokens")
+    second_max = captured[1].get("max_tokens") or captured[1].get("max_completion_tokens")
+    assert second_max == min(first_max * 2, 32768)
+    # 催促消息应包含压缩思考的提示
+    assert any(
+        m["role"] == "user" and "输出长度限制被截断" in str(m.get("content", ""))
+        for m in messages
+    )

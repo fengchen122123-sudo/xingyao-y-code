@@ -471,7 +471,15 @@ def build_default_registry() -> ToolRegistry:
             activity_description="查看 MCP 服务列表",
         ),
     ]
-    return ToolRegistry([*read_specs, *mutating_specs])
+    registry = ToolRegistry([*read_specs, *mutating_specs])
+    # 加载进程内插件（plugins/ 与 ~/.ycode/plugins/）。插件加载全程隔离，
+    # 任何失败只记录日志，绝不影响内置工具的可用性。
+    try:
+        from core import plugin_loader
+        plugin_loader.load_and_register(registry)
+    except Exception:
+        pass
+    return registry
 
 
 # ── MCP 配置工具的执行包装函数 ──────────────────────────────────────

@@ -52,7 +52,43 @@ def test_failed_tool_uses_neutral_copy_without_raw_error():
         ok=False,
     )
 
-    assert text == "命令执行失败：exit 1"
+    assert text == "pytest -q — exit 1"
+
+
+def test_failed_summary_strips_error_prefix_and_shows_command():
+    # 🚨 哨兵前缀只做程序化失败判定，不应出现在展示文案里；
+    # 命令本身必须可见，否则用户不知道哪条命令失败了
+    text = summarize_tool_finished(
+        "execute_command",
+        {"command": "pytest -q"},
+        {"content": "🚨 命令执行失败（退出码 1）。\n（命令没有任何输出）"},
+        ok=False,
+    )
+
+    assert not text.startswith("🚨")
+    assert "pytest -q" in text
+    assert "退出码 1" in text
+    # 不能出现“命令执行失败：命令执行失败”式的重复
+    assert text.count("命令执行失败") == 1
+
+
+def test_failed_summary_dedupes_target_and_keeps_guidance():
+    # 错误文本里已包含目标路径时不重复拼接；
+    # 截断上限必须保留最关键的指导意见（"请使用 read_file 工具"）
+    content = (
+        "🚨 目录扫描失败：路径不存在 'D:\\proj\\missing_dir'，"
+        "请检查路径是否正确，或先用 glob_files 查找目标。"
+    )
+    text = summarize_tool_finished(
+        "list_directory",
+        {"dir_path": "D:\\proj\\missing_dir"},
+        {"content": content},
+        ok=False,
+    )
+
+    assert not text.startswith("🚨")
+    assert text.count("D:\\proj\\missing_dir") == 1
+    assert "glob_files" in text
 
 
 def test_subagent_copy_distinguishes_foreground_and_background():

@@ -92,13 +92,19 @@ def summarize_tool_finished(
         # 显示真实的错误信息，而非通用的"此步骤暂未完成"，
         # 让用户/LLM 知道真正的原因以便修正
         content = str(result.get("content", "") or "").strip()
-        # 截取关键错误信息，避免过长
-        error_hint = content[:80] if content else ""
-        if name == "execute_command":
-            return f"命令执行失败：{error_hint}" if error_hint else f"命令暂未完成：{target}"
-        if target and error_hint:
-            return f"{target} — {error_hint}"
+        # 剥离错误哨兵前缀（🚨）：它只用于程序化失败判定，
+        # 拼进展示文案只会在不支持 emoji 的终端变成乱码噪音
+        error_hint = content.lstrip("🚨").strip() if content else ""
+        # 多行错误压成一行展示；上限 160 字符，避免像原来 80 字符那样
+        # 把最关键的指导语（如"请使用 read_file 工具"）截掉
+        error_hint = " ".join(error_hint.split())[:160] if error_hint else ""
         if error_hint:
+            # 错误文本里已包含目标（路径/命令）时不重复拼接，
+            # 避免 "✗ 路径 — 失败：'路径'" 这种路径出现两次的噪音
+            if target and target in error_hint:
+                return error_hint
+            if target:
+                return f"{target} — {error_hint}"
             return error_hint
         return f"此步骤暂未完成：{target}" if target else "此步骤暂未完成"
 

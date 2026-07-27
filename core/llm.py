@@ -913,7 +913,8 @@ def _strip_media_and_merge(messages, model_name=None):
        不支持视觉的模型把图片折叠为占位符（绝不把 base64 当文本发给模型）。
        文档/文本文件已在 input_parser 中转为普通文本，此处不视为视觉输入。
     2. 合并连续相同 role 的消息，满足 LiteLLM / Anthropic 对 user/assistant 严格轮流的要求
-    3. reasoning_content / thinking_blocks 仅对支持的 provider 回传，避免其他 provider 报 400
+    3. reasoning_content / thinking_blocks 仅对支持的 provider 回传，避免其他 provider 报 400；
+       且仅随带 tool_calls 的消息回传（签名思考链要求），无工具调用的纯思考消息一律剥掉
 
     返回 (fixed_messages, folded_media_count, keep_media)。
     """
@@ -963,9 +964,14 @@ def _strip_media_and_merge(messages, model_name=None):
             cleaned_msg["tool_call_id"] = msg["tool_call_id"]
         if "name" in msg:
             cleaned_msg["name"] = msg["name"]
-        if keep_reasoning_fields and msg.get("reasoning_content") is not None:
+        # 死思考不回传：reasoning/thinking 字段仅对带 tool_calls 的 assistant
+        # 消息有协议价值（Kimi/Anthropic 的签名思考链要求）。无工具调用的纯
+        # 思考消息（常见于模型只输出 reasoning 未生成正文的兜底轮）保留它，
+        # 会让后续每一轮请求都重复上传这段废推理（可能长达数万字符），纯烧 Token。
+        has_tool_calls = bool(msg.get("tool_calls"))
+        if keep_reasoning_fields and has_tool_calls and msg.get("reasoning_content") is not None:
             cleaned_msg["reasoning_content"] = msg["reasoning_content"]
-        if keep_reasoning_fields and msg.get("thinking_blocks") is not None:
+        if keep_reasoning_fields and has_tool_calls and msg.get("thinking_blocks") is not None:
             cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
 
         # 净化 assistant 消息：若 content 包含 protocol sanitised 占位符且有 tool_calls/reasoning，将 content 重置为空字符串
@@ -1154,6 +1160,10 @@ def _tool_output_preview(function_name, arguments, result):
 # tool_finished 事件里携带的完整工具结果上限（字符数）：
 # GUI 需要展开查看原始输出，但不能让单条事件把 IPC 通道撑爆。
 TOOL_RESULT_EVENT_MAX_CHARS = 4000
+
+# 模型只输出思考未生成正文时，促升为公开回复的思考预览长度上限（字符数）。
+# 思考原文可能长达数万字，全量展示会把大段内心独白倾倒给用户。
+PROMOTED_REASONING_PREVIEW_CHARS = 600
 
 
 def _tool_result_text(result):
@@ -2458,6 +2468,8 @@ def _chat_with_model_generator(
             # 兜底：模型只输出 thinking 但未生成正文时，把思考过程作为回复展示，
             # 避免 UI 在 "思考完成" 后出现空白，给用户造成 Agent 没有响应的错觉。
             # 注意：工具调用轮保持 content 为 None，不污染工具链签名。
+            # 思考原文可能极长（数万字），直接全量促升会把大段内心独白倾倒给用户，
+            # 因此只保留开头一段预览，其余截断。
             raw_content_meaningful = _is_meaningful_assistant_content(public_content)
             promoted_reasoning = False
             if (
@@ -2465,7 +2477,13 @@ def _chat_with_model_generator(
                 and not raw_content_meaningful
                 and _is_meaningful_assistant_content(reasoning_content)
             ):
-                public_content = reasoning_content.strip() + "\n\n[以上为模型思考过程，未生成正式回复]"
+                reasoning_preview = reasoning_content.strip()
+                if len(reasoning_preview) > PROMOTED_REASONING_PREVIEW_CHARS:
+                    reasoning_preview = (
+                        reasoning_preview[:PROMOTED_REASONING_PREVIEW_CHARS].rstrip()
+                        + " …（思考内容过长，已截断）"
+                    )
+                public_content = reasoning_preview + "\n\n[以上为模型思考过程，未生成正式回复]"
                 promoted_reasoning = True
 
             # 只允许公开正文写入记忆，避免把原生推理误当作长期事实。
@@ -2505,11 +2523,14 @@ def _chat_with_model_generator(
                 persisted_message["tool_calls"] = tool_calls_list
 
             # 用"促升前"的原始正文判断：思考内容被促升为正文后不能算作有效结论，
-            # 否则模型纯思考收尾时会跳过最终总结重试，用户什么都看不到
+            # 否则模型纯思考收尾时会跳过最终总结重试，用户什么都看不到。
+            # 除"工具跑完却没给结论"外，"只输出思考、既没调工具也没给正文"同样是
+            # 模型未完成本轮任务的表现（常见于模型本打算调工具却只输出了 reasoning），
+            # 也纳入催促重试，避免把整段思考当作回合结果草草收尾。
             needs_final_summary = (
                 not tool_calls_list
-                and tool_activity_seen
                 and not raw_content_meaningful
+                and (tool_activity_seen or promoted_reasoning)
             )
             # 只有真正要走重试分支时才跳过持久化（重试会 pop 掉这条消息）；
             # 重试机会用尽后的最终消息必须照常入库，否则内存与 DB 分叉
@@ -2521,15 +2542,44 @@ def _chat_with_model_generator(
             if not tool_calls_list:
                 if will_retry_summary:
                     final_summary_retry_count += 1
+                    # 上一轮因 max_tokens 截断（finish_reason == "length"）导致正文
+                    # 未输出时，用相同上限重试几乎必然再次把预算全烧在思考上。
+                    # 临时翻倍输出上限（封顶 32768）并在催促文案中要求压缩思考，
+                    # 提高重试成功率。
+                    length_truncated = finish_reason == "length"
+                    if length_truncated:
+                        if "max_completion_tokens" in kwargs:
+                            _cur_max = int(kwargs.get("max_completion_tokens") or 8192)
+                            kwargs["max_completion_tokens"] = min(_cur_max * 2, 32768)
+                        else:
+                            _cur_max = int(kwargs.get("max_tokens") or 8192)
+                            kwargs["max_tokens"] = min(_cur_max * 2, 32768)
+                    length_hint = (
+                        "上一轮回复因输出长度限制被截断：请大幅压缩思考过程，"
+                        "尽快开始输出正式内容。"
+                        if length_truncated else ""
+                    )
                     # 空 assistant 消息（content 为 None）不入库也不留内存：
                     # 留在历史里会让下一轮 API 报 400（Anthropic 拒绝空 content）
                     messages.pop()
-                    summary_request = {
-                        "role": "user",
-                        "content": (
+                    if tool_activity_seen:
+                        nudge_text = (
                             "工具已经执行完毕。现在必须只输出最终中文检查结论，"
                             "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
-                        ),
+                            + length_hint
+                        )
+                    else:
+                        # 模型只输出思考、未调用任何工具也未给出正文：催促它真正行动，
+                        # 而不是把内心独白当成交付结果。
+                        nudge_text = (
+                            "你刚才只输出了思考过程，既没有调用工具执行任何操作，"
+                            "也没有给出正式回复。请立即继续：需要执行操作就调用相应工具，"
+                            "任务已完成就直接输出中文结论；不要只输出思考内容。"
+                            + length_hint
+                        )
+                    summary_request = {
+                        "role": "user",
+                        "content": nudge_text,
                     }
                     messages.append(summary_request)
                     # 该 user 催促消息也需要持久化，否则下一轮重建历史时上下文会缺失
