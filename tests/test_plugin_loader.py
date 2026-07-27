@@ -1,0 +1,149 @@
+"""core/plugin_loader.py 的单元测试。"""
+
+import json
+
+import pytest
+
+from core import plugin_loader
+from core.tool_registry import ToolRegistry
+
+
+def _make_plugin(plugin_dir, name, body, enabled=True, entry="plugin.py"):
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    (plugin_dir / "plugin.json").write_text(
+        json.dumps({
+            "name": name,
+            "version": "1.0.0",
+            "entry": entry,
+            "enabled": enabled,
+        }),
+        encoding="utf-8",
+    )
+    (plugin_dir / entry).write_text(body, encoding="utf-8")
+
+
+_GOOD_PLUGIN = """
+from core.tool_protocol import ToolSpec
+
+def register(registry):
+    registry.register(ToolSpec(
+        name="demo_tool",
+        description="demo",
+        input_schema={"type": "object", "properties": {"x": {"type": "string"}}},
+        execute=lambda x="": f"hello {x}",
+        read_only=True,
+        requires_permission=False,
+    ))
+"""
+
+_BROKEN_PLUGIN = """
+raise RuntimeError("插件加载即崩溃")
+"""
+
+_NO_REGISTER_PLUGIN = """
+X = 1
+"""
+
+
+@pytest.fixture
+def plugin_env(tmp_path, monkeypatch):
+    """把插件扫描目录重定向到临时目录。"""
+    user_dir = tmp_path / "user_plugins"
+    builtin_dir = tmp_path / "builtin_plugins"
+    user_dir.mkdir()
+    builtin_dir.mkdir()
+    monkeypatch.setattr(plugin_loader, "plugin_dirs", lambda: [user_dir, builtin_dir])
+    return user_dir, builtin_dir
+
+
+def test_load_plugin_registers_tool(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == ["demo"]
+    result = registry.execute("demo_tool", x="world")
+    assert not result.is_error
+    assert result.content == "hello world"
+
+
+def test_broken_plugin_is_skipped_without_crashing(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "broken", "broken", _BROKEN_PLUGIN)
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == ["demo"]
+    assert registry.execute("demo_tool", x="ok").content == "hello ok"
+
+
+def test_plugin_without_register_function_is_skipped(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "noreg", "noreg", _NO_REGISTER_PLUGIN)
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == []
+
+
+def test_disabled_plugin_is_skipped(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == []
+    assert registry.execute("demo_tool").is_error  # unknown tool
+
+
+def test_user_plugin_overrides_builtin_with_same_name(plugin_env):
+    user_dir, builtin_dir = plugin_env
+    _make_plugin(user_dir / "same", "same", _GOOD_PLUGIN)
+    _make_plugin(builtin_dir / "same", "same", _BROKEN_PLUGIN)
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    # 用户目录先扫描，内置同名插件被跳过，不会触发崩溃也不会重复注册
+    assert loaded == ["same"]
+    assert registry.execute("demo_tool", x="u").content == "hello u"
+
+
+def test_missing_plugin_json_is_ignored(plugin_env, tmp_path):
+    user_dir, _ = plugin_env
+    stray = user_dir / "stray"
+    stray.mkdir()
+    (stray / "plugin.py").write_text(_GOOD_PLUGIN, encoding="utf-8")
+
+    registry = ToolRegistry()
+    loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == []
+
+
+def test_import_sibling_loads_module_with_unique_name(plugin_env):
+    user_dir, _ = plugin_env
+    plugin_dir = user_dir / "sib"
+    plugin_dir.mkdir()
+    (plugin_dir / "helper.py").write_text("VALUE = 42\n", encoding="utf-8")
+
+    module = plugin_loader.import_sibling(str(plugin_dir / "plugin.py"), "helper")
+    assert module.VALUE == 42
+    # 第二次调用命中 sys.modules 缓存，返回同一对象
+    again = plugin_loader.import_sibling(str(plugin_dir / "plugin.py"), "helper")
+    assert again is module
+
+
+def test_import_sibling_missing_module_raises(plugin_env):
+    user_dir, _ = plugin_env
+    plugin_dir = user_dir / "sib2"
+    plugin_dir.mkdir()
+
+    with pytest.raises(ImportError):
+        plugin_loader.import_sibling(str(plugin_dir / "plugin.py"), "nope")

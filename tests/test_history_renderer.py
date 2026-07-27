@@ -108,7 +108,10 @@ def test_history_concise_mode_hides_successful_tool_lines_but_shows_failures():
 
     assert "a.py" not in rendered
     assert "星瑶已查看文件" not in rendered
-    assert "命令执行失败" in rendered
+    # 失败行必须可见：命令本身 + 错误原因（🚨 哨兵前缀已被剥离）
+    assert "boom" in rendered
+    assert "command not found" in rendered
+    assert "🚨" not in rendered
     assert "已完成排查" in rendered
 
 

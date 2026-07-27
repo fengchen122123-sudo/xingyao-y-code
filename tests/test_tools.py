@@ -2411,3 +2411,54 @@ def test_edit_file_by_lines_insert_at_start(tmp_path, monkeypatch):
 
     assert result.startswith("✔")
     assert target.read_text(encoding="utf-8") == "new_first\nnew_second\nsecond\n"
+
+
+def test_execute_command_no_output_nonzero_exit_is_informational(monkeypatch):
+    """非零退出 + 完全无输出（如 findstr 无匹配）不按 🚨 失败返回，
+    避免 UI 红色失败刷屏；但必须如实说明退出码并给出区分提示。"""
+    class FakeProcess:
+        returncode = 1
+
+        def communicate(self, timeout=None):
+            return b"", b""
+
+    monkeypatch.setattr(
+        "core.tools.subprocess.Popen", lambda *args, **kwargs: FakeProcess()
+    )
+
+    result = execute_command('findstr /i "nope" somefile.txt')
+
+    assert not result.startswith("🚨")
+    assert "退出码 1" in result
+    assert "findstr" in result
+
+
+def test_execute_command_nonzero_exit_with_output_still_error(monkeypatch):
+    """非零退出但有输出：仍是 🚨 错误，输出内容原样带回。"""
+    class FakeProcess:
+        returncode = 2
+
+        def communicate(self, timeout=None):
+            return "爆炸了".encode("utf-8"), b""
+
+    monkeypatch.setattr(
+        "core.tools.subprocess.Popen", lambda *args, **kwargs: FakeProcess()
+    )
+
+    result = execute_command("boom-command")
+
+    assert result.startswith("🚨")
+    assert "退出码 2" in result
+    assert "爆炸了" in result
+
+
+def test_list_directory_on_file_returns_soft_hint(tmp_path):
+    """把文件路径误传给 list_directory：返回普通提示（非 🚨 错误级），
+    引导模型改用 read_file，UI 不再渲染成红色失败。"""
+    target = tmp_path / "SflF400_mk.v"
+    target.write_text("x", encoding="utf-8")
+
+    result = list_directory(str(target))
+
+    assert not result.startswith("🚨")
+    assert "read_file" in result
