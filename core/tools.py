@@ -160,6 +160,46 @@ def _outside_workspace_allowed():
         return False
 
 
+# ── 信任目录（trusted roots）─────────────────────────────────────
+# 插件（如 ***_locator）注册的工作目录外可信根目录。命中信任目录的
+# 读取/搜索操作不再被沙盒拦截；写操作权限流程不受影响。
+_trusted_roots: set = set()
+_trusted_roots_lock = threading.Lock()
+
+
+def register_trusted_root(path_value):
+    """把一个目录登记为本会话的信任根目录（工作目录外访问不再被沙盒拦截）。"""
+    try:
+        resolved = Path(str(path_value or "")).expanduser().resolve()
+    except Exception:
+        return
+    with _trusted_roots_lock:
+        _trusted_roots.add(str(resolved))
+
+
+def unregister_trusted_root(path_value):
+    try:
+        resolved = Path(str(path_value or "")).expanduser().resolve()
+    except Exception:
+        return
+    with _trusted_roots_lock:
+        _trusted_roots.discard(str(resolved))
+
+
+def _is_trusted_path(candidate):
+    """判断已 resolve 的路径是否位于任一信任根目录之下。"""
+    with _trusted_roots_lock:
+        roots = list(_trusted_roots)
+    for root in roots:
+        try:
+            root_path = Path(root)
+            if candidate == root_path or root_path in candidate.parents:
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def _resolve_workspace_path(file_path):
     """将路径解析为绝对路径；默认强制限定在当前工作目录内，越界直接拒绝。
 
@@ -167,6 +207,8 @@ def _resolve_workspace_path(file_path):
     """
     candidate = Path(str(file_path or "")).expanduser().resolve()
     if _outside_workspace_allowed():
+        return candidate
+    if _is_trusted_path(candidate):
         return candidate
     workspace = Path.cwd().resolve()
     if candidate != workspace and workspace not in candidate.parents:
@@ -372,7 +414,10 @@ def list_directory(dir_path=".", max_entries=200):
         if not os.path.exists(resolved):
             return f"🚨 目录扫描失败：路径不存在 '{dir_path}'"
         if os.path.isfile(resolved):
-            return f"🚨 目录扫描失败：'{dir_path}' 是一个文件而不是目录。若要查看文件内容，请使用 read_file 工具。"
+            # 模型把文件路径误传给目录扫描是常见的可恢复误用（尤其 .v 这类
+            # 名字像目录的单文件），不用 🚨 错误级返回——否则 UI 会渲染成红色失败。
+            # 用普通提示文案引导模型改用 read_file 即可。
+            return f"'{dir_path}' 是一个文件而不是目录，无法列出。请改用 read_file 工具读取该文件内容。"
         items = os.listdir(resolved)
         if not items:
             return f"📂 目录 '{dir_path}' 为空。"
@@ -531,7 +576,18 @@ def execute_command(command, run_in_background=False, timeout_seconds=30, cancel
         # 必须如实汇报退出码：此前非零退出但只要无输出就返回"执行成功"，
         # 调用方（尤其子代理）无法区分成败，会把失败命令当成通过。
         if process.returncode:
-            detail = output.strip() or "（命令没有任何输出）"
+            detail = output.strip()
+            if not detail:
+                # 非零退出 + 完全无输出：对 findstr/grep 类搜索命令而言，
+                # "没有找到任何匹配"就是退出码 1 且无输出，属正常结果。
+                # 不用 🚨 错误级返回（避免 UI 红色失败刷屏），但如实说明退出码，
+                # 并提示模型如何区分"无匹配"与"真出错"。
+                return (
+                    f"命令执行完毕（退出码 {process.returncode}），但没有任何输出。\n"
+                    "提示：findstr / grep 类搜索命令在没有找到任何匹配时就会以退出码 1 "
+                    "结束且无输出，通常属于正常结果而非命令出错；若预期应有输出，"
+                    "请检查命令本身或换用其他方式验证。"
+                )
             return f"🚨 命令执行失败（退出码 {process.returncode}）。\n{detail}"
         return output or "执行成功，但命令没有返回任何输出内容。"
 
@@ -998,6 +1054,33 @@ def get_weather(city="", timeout_seconds=HTTP_TIMEOUT_SECONDS):
     except Exception as exc:
         return f"🚨 天气查询发生异常：{exc}"
     
+# search_code 的 ripgrep 超时（秒）：大型仓库（含 target/node_modules 等）下 15 秒
+# 经常不够，默认 30 秒；可用环境变量 YCODE_SEARCH_TIMEOUT 覆盖。
+try:
+    SEARCH_CODE_TIMEOUT_SECONDS = max(1, int(os.environ.get("YCODE_SEARCH_TIMEOUT", "30") or 30))
+except (TypeError, ValueError):
+    SEARCH_CODE_TIMEOUT_SECONDS = 30
+
+
+# search_code 的默认排除目录（Python 兜底路径使用）。
+# 可通过 config.json 的 "search_exclude_dirs": ["target", "out", ...] 追加自定义排除，
+# ripgrep 路径与 Python 兜底路径均生效（rg 以 --glob '!**/<dir>/' 形式下发）。
+_SEARCH_DEFAULT_IGNORE_DIRS = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', '.ycode', 'dist', 'build'}
+
+
+def _get_search_exclude_dirs():
+    """合并默认排除目录与 config.json 的 search_exclude_dirs 自定义配置。"""
+    dirs = set(_SEARCH_DEFAULT_IGNORE_DIRS)
+    try:
+        from core.model_manager import load_config
+        extra = load_config().get("search_exclude_dirs")
+        if isinstance(extra, (list, tuple, set)):
+            dirs.update(str(d).strip() for d in extra if str(d).strip())
+    except Exception:
+        pass
+    return dirs
+
+
 def search_code(query, dir_path="."):
     """精准搜索：跨文件全局查找代码片段或关键字。优先尝试 ripgrep。"""
     import subprocess
@@ -1025,12 +1108,16 @@ def search_code(query, dir_path="."):
             "--max-columns", "200", "-C", "1",
             "-m", "20",  # 每个文件最多 20 处匹配，避免单文件刷屏
         ]
+        # 统一排除构建产物目录：git 仓库 rg 靠 .gitignore 排除，
+        # 非 git 目录（如 *** publish）必须显式下发，否则会命中 target/dist 产物
+        for _d in sorted(_get_search_exclude_dirs()):
+            cmd += ["--glob", f"!**/{_d}/"]
         if literal:
             cmd.append("-F")
         cmd += [args_query, dir_path]
         return subprocess.run(
             cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=15,
+            encoding="utf-8", errors="replace", timeout=SEARCH_CODE_TIMEOUT_SECONDS,
         )
 
     def _format_rg_output(output):
@@ -1065,14 +1152,14 @@ def search_code(query, dir_path="."):
             return f"🚨 搜索失败（ripgrep 退出码 {result.returncode}）：{(result.stderr or '').strip()[:300]}"
         except subprocess.TimeoutExpired:
             return (
-                "🚨 搜索超时（15 秒）。目录可能过大，请缩小 dir_path 范围"
+                f"🚨 搜索超时（{SEARCH_CODE_TIMEOUT_SECONDS} 秒）。目录可能过大，请缩小 dir_path 范围"
                 "或使用更精确的关键字重试。"
             )
         except Exception:
             # rg 意外不可用（进程启动失败等）：走下面的 Python 兜底
             pass
 
-    IGNORE_DIRS = {'.git', '.venv', 'venv', 'node_modules', '__pycache__', '.idea', '.vscode', '.ycode', 'dist', 'build'}
+    IGNORE_DIRS = _get_search_exclude_dirs()
     ALLOWED_EXTS = {
         '.py', '.js', '.ts', '.html', '.css', '.json', '.md', '.txt', 
         '.java', '.c', '.cpp', '.h', '.go', '.rs', '.php', '.rb', '.sh',
@@ -1707,6 +1794,11 @@ _SUBAGENT_TERMINAL_STATUSES = {
 # 无上限时模型一次派发 6+ 个子代理会挤爆 API 并发与本机资源。
 _MAX_CONCURRENT_SUBAGENTS = 5
 
+# 子代理前台结果进入主代理上下文的长度上限（字符）。此前为 4000，多段式汇报
+# （如 explore 代理按任务分段的结论）会被拦腰截断，主代理只能基于残缺信息决策；
+# 与 core/llm.py 工具结果入上下文的截断上限（16000）对齐。
+SUBAGENT_RESULT_MAX_CHARS = 16000
+
 
 def _has_meaningful_subagent_result(text: str) -> bool:
     return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
@@ -2204,7 +2296,7 @@ class SubagentManager:
             if task.status == "completed":
                 result = str(task.result or "")
                 # 子代理结果过长时截断，避免完整大段内容进入主代理上下文浪费 token。
-                max_len = 4000
+                max_len = SUBAGENT_RESULT_MAX_CHARS
                 if len(result) > max_len:
                     omitted = len(result) - max_len
                     result = (
@@ -3001,7 +3093,11 @@ def glob_files(pattern, dir_path="."):
 
     try:
         rg = _get_rg_executable()
-        cmd = [rg, "--files", "--glob", pattern, str(base)]
+        cmd = [rg, "--files", "--glob", pattern]
+        # 与 search_code 一致：统一排除构建产物目录（非 git 目录下 rg 无 .gitignore 可依）
+        for _d in sorted(_get_search_exclude_dirs()):
+            cmd += ["--glob", f"!**/{_d}/"]
+        cmd.append(str(base))
         result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
         if result.returncode in (0, 1):
             output = result.stdout.strip()

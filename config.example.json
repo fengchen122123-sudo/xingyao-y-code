@@ -11,6 +11,7 @@
     "quality": 85,
     "max_output_bytes": 512000
   },
+  "search_exclude_dirs": ["target", "out", "bin", "obj"],
   "memory_compression": {
     "retain_count": 8,
     "retain_count_force": 4,

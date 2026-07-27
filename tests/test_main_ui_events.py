@@ -364,6 +364,8 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
     main.ui_renderers.pop("turn-inline-thinking", None)
     main.active_thinking_text = ""
     main.active_thinking_turn_id = None
+    main._turn_thinking_segments = 0
+    main._turn_thinking_elapsed = 0.0
 
     main._render_ui_event(factory.emit("thinking_started"))
     main._render_ui_event(factory.emit("thinking_delta", {"text": "用户说了"}))
@@ -375,10 +377,9 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
 
     main._render_ui_event(factory.emit("thinking_finished"))
 
-    plain = Text.from_ansi("".join(writes)).plain
-    assert "用户说了" not in plain
-    assert "你好" not in plain
-    assert "思考完成" in plain
+    # 思考内容本身永不打印；"思考完成"摘要改为延迟合并打印，
+    # thinking_finished 当下不再立即输出
+    assert writes == []
     # 思考结束后面板延迟隐藏：保留最后一帧思考内容，直到下一个事件到来
     assert main.active_thinking_text == '用户说了"你好"'
     assert main.active_thinking_turn_id is None
@@ -386,7 +387,44 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
     # 模型开始输出正文时，延迟显示的思考内容被清除
     main._render_ui_event(factory.emit("assistant_delta", {"text": "答"}))
     assert main.active_thinking_text == ""
+    main._render_ui_event(factory.emit("turn_finished"))
+
+    plain = Text.from_ansi("".join(writes)).plain
+    assert "用户说了" not in plain
+    assert "你好" not in plain
+    assert "思考完成" in plain
     main.ui_renderers.pop("turn-inline-thinking", None)
+
+
+def test_multiple_thinking_segments_collapse_into_one_summary_line(monkeypatch):
+    """工具循环中多段思考只打印一行合并摘要，不再逐段刷屏。"""
+    factory = TurnEventFactory("turn-thinking-coalesce")
+    fragments = []
+
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_print_ui_fragment", fragments.append)
+    monkeypatch.setattr(main, "app_instance", None)
+    main.ui_renderers.pop("turn-thinking-coalesce", None)
+    main.active_thinking_text = ""
+    main.active_thinking_turn_id = None
+    main._turn_thinking_segments = 0
+    main._turn_thinking_elapsed = 0.0
+
+    for index in range(3):
+        main._render_ui_event(factory.emit("thinking_started"))
+        main._render_ui_event(factory.emit("thinking_delta", {"text": f"分析{index}"}))
+        main._render_ui_event(factory.emit("thinking_finished"))
+
+    # 三段思考结束都不会立即打印
+    assert fragments == []
+
+    main._render_ui_event(factory.emit("assistant_delta", {"text": "结论"}))
+    main._render_ui_event(factory.emit("turn_finished"))
+
+    plain = Text.from_ansi("".join(fragments)).plain
+    assert plain.count("思考完成") == 1
+    assert "共 3 段" in plain
+    main.ui_renderers.pop("turn-thinking-coalesce", None)
 
 
 def test_ui_keeps_reasoning_deltas_out_of_terminal_history(monkeypatch):
