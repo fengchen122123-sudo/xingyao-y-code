@@ -2574,9 +2574,16 @@ def _make_input_app():
             ),
             filter=is_working_cond
         ),
+        # 弹性占位：吸收 HSplit 的所有剩余高度（非全屏模式下布局高度只增不减，
+        # 思考面板消失后多出的行会灌进唯一无 max 上限的容器）。把它放在输入框上方，
+        # 输入框+状态栏就能始终钉在布局区域底部，不随思考面板显隐而跳动。
+        # weight 设大，防止思考面板 Frame（同样无 max 上限）分走空间被撑高。
+        Window(height=D(min=0, weight=100)),
         Frame(
             input_area,
             style="class:input-frame",
+            # 封顶 4 行（2 行内容 + 上下边框），杜绝边框被剩余空间拉伸成高空框
+            height=D.exact(4),
         ),
         Window(
             content=FormattedTextControl(get_status),
