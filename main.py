@@ -60,15 +60,17 @@ from prompt_toolkit import print_formatted_text
 from prompt_toolkit.formatted_text import ANSI, HTML
 from prompt_toolkit.data_structures import Point
 from prompt_toolkit.history import FileHistory
+from prompt_toolkit.keys import Keys
 
 from core.memory import MemoryManager
 from core.history_renderer import render_session_history
+from core.paste_placeholders import PastedTextStore, normalize_pasted_text
 import core.agent_service as _agent_service
 from core.llm import chat_with_model_events, session_token_usage, token_usage_lock
 from core.permission_broker import PermissionRequest, permission_broker
 from core.turn_controller import TurnController
 from core.turn_renderer import TurnRenderer
-from core.ui_markers import ANSI_RESET, plan_color, plan_html_color, plan_mark
+from core.ui_markers import ANSI_GRAY, ANSI_RESET, plan_color, plan_html_color, plan_mark
 from core.plan import bind_default_plan_session, get_default_plan_manager
 from core.terminal_markdown import MarkdownRenderError, render_markdown_to_ansi
 from core.model_manager import get_active_model
@@ -138,6 +140,13 @@ _thinking_panel_linger = False
 # 改为累计后在第一个可见正文块（或回合收尾）前打印一行合并摘要。
 _turn_thinking_segments = 0
 _turn_thinking_elapsed = 0.0
+# 粘贴大段文本的占位符存储：输入框里只显示 [粘贴文本 #N · 共 M 行]，
+# 提交时 expand 还原成完整原文再发送（见 kb 的 BracketedPaste 绑定与 submit）
+_paste_store = PastedTextStore()
+# 轮次分隔线标志：首次回显 "✨ You >" 前置 False（屏幕上还没有内容，不打印分隔线），
+# 之后每轮提问前打印一条灰色细分隔线，把相邻轮次在视觉上分开。
+# 切换/回放会话（show_session_history）与 /clear 清屏时重置为 False。
+_turn_separator_needed = False
 pending_action = None   # 待处理的主线程操作：目前可能的值有 "open_models" / "open_skills" / "open_sessions"
 # 计划项状态提示去重：避免同一个计划项反复失败/重试时刷屏
 _last_printed_plan_state: dict[str, str] = {}
@@ -686,6 +695,21 @@ def _terminal_width():
     return max(20, shutil.get_terminal_size((100, 24)).columns)
 
 
+def _print_turn_separator() -> None:
+    """在两轮对话之间打印一条灰色细分隔线（前后各留一个空行）。"""
+    line = "─" * min(_terminal_width(), 60)
+    _print_ui_fragment(f"\n{ANSI_GRAY}{line}{ANSI_RESET}\n")
+
+
+def _echo_user_input(html_text: str) -> None:
+    """回显用户输入；非首轮时在前面补一条轮次分隔线。"""
+    global _turn_separator_needed
+    if _turn_separator_needed:
+        _print_turn_separator()
+    _turn_separator_needed = True
+    print_formatted_text(HTML(html_text))
+
+
 def _format_thinking_elapsed(elapsed: float) -> str:
     # 短思考（< 1s）用毫秒显示，避免全部显示成 "0.0s" 让用户误以为没思考
     if elapsed < 1.0:
@@ -711,7 +735,7 @@ def _flush_thinking_summary() -> None:
         )
     _turn_thinking_segments = 0
     _turn_thinking_elapsed = 0.0
-    _print_ui_fragment(f"\x1b[90m{line}\x1b[0m\n")
+    _print_ui_fragment(f"\n\x1b[90m{line}\x1b[0m\n")
 
 
 def _render_public_answer_block(turn_id: str, text: str) -> None:
@@ -965,7 +989,8 @@ def _render_ui_event(event):
         recap = renderer.concise_recap()
         if recap:
             _print_ui_fragment(recap)
-        print_formatted_text("", flush=True)
+        # 回合结束后留一个空行，与下一轮的轮次分隔线形成呼吸间距
+        print_formatted_text("\n", end="", flush=True)
         ui_renderers.pop(event.turn_id, None)
         _answer_header_printed.pop(event.turn_id, None)
         _clear_active_thinking()
@@ -1234,6 +1259,9 @@ def _resolve_session_after_selector(current_session_name, existed_before):
 
 def show_session_history(session_name):
     """在终端里漂亮地重现该会话的所有历史对话消息"""
+    global _turn_separator_needed
+    # 切换/回放会话后屏幕被 logo + 历史块重新铺过，下一轮提问前不再补分隔线
+    _turn_separator_needed = False
     history = manager.get_history(session_name)
     safe_session = session_name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     rendered = render_session_history(history, _terminal_width())
@@ -1248,7 +1276,7 @@ def show_session_history(session_name):
 
 def handle_slash_command(command_text):
     """斜杠指令路由器"""
-    global current_session, current_model
+    global current_session, current_model, _turn_separator_needed
 
     parts = command_text.strip().split()
     cmd = parts[0].lower()
@@ -1967,6 +1995,8 @@ def handle_slash_command(command_text):
             ))
 
     elif cmd == "/clear":
+        # 清屏后屏幕上没有内容，下一轮提问前不打印轮次分隔线
+        _turn_separator_needed = False
         print_logo()
 
     elif cmd == "/dream":
@@ -2137,6 +2167,12 @@ def _make_input_app():
         input_area.buffer.history_forward()
         event.app.invalidate()
 
+    @kb.add(Keys.BracketedPaste, eager=True)
+    def paste(event):
+        """粘贴大段文本：超阈值折叠为 [粘贴文本 #N · 共 M 行] 占位符，提交时展开"""
+        pasted = normalize_pasted_text(event.data)
+        event.current_buffer.insert_text(_paste_store.maybe_placeholderize(pasted))
+
     @kb.add("enter")
     def submit(event):
         """Enter 提交（如果是指令则立即在主线程同步执行，不阻塞队列；如果是普通对话则放入后台队列）"""
@@ -2147,10 +2183,14 @@ def _make_input_app():
                 event.app.invalidate()
             return
             
-        text = input_area.text.strip()
+        display_text = input_area.text.strip()
+        text = _paste_store.expand(display_text)
         if text:
-            # 写入输入历史（供 ↑/↓ 翻阅）；失败不影响提交
+            # 写入输入历史（供 ↑/↓ 翻阅）；失败不影响提交。
+            # 历史里存展开后的完整原文（而非占位符），↑ 翻出来可直接复用。
             try:
+                if display_text != text:
+                    input_area.text = text
                 input_area.buffer.append_to_history()
             except Exception:
                 pass
@@ -2174,9 +2214,9 @@ def _make_input_app():
                     was_queued = is_thinking
                     safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                     if was_queued:
-                        print_formatted_text(HTML(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) {safe_input}</ansigray>"))
+                        _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) {safe_input}</ansigray>")
                     else:
-                        print_formatted_text(HTML(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}"))
+                        _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}")
                         
                     msg_queue.put({"text": text, "was_queued": was_queued, "is_skill_call": True})
                     input_area.text = ""
@@ -2186,7 +2226,7 @@ def _make_input_app():
                     # 因此后台 worker 里不再有 slash 路由分支。
                     input_area.text = ""
                     safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                    print_formatted_text(HTML(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}"))
+                    _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}")
                     try:
                         handle_slash_command(text)
                     except Exception as e:
@@ -2198,10 +2238,10 @@ def _make_input_app():
                 safe_input = text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                 if was_queued:
                     # 立即打印置灰的排队等待提示
-                    print_formatted_text(HTML(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) {safe_input}</ansigray>"))
+                    _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) {safe_input}</ansigray>")
                 else:
                     # 正常的青色高亮提示
-                    print_formatted_text(HTML(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}"))
+                    _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}")
                 
                 msg_queue.put({"text": text, "was_queued": was_queued})
                 input_area.text = ""
@@ -2734,7 +2774,7 @@ def _background_worker():
                 actual_query = parts[1] if len(parts) > 1 else "请启动并运行该技能。"
 
                 schedule_ui(lambda name=_esc(skill_name): print_formatted_text(
-                    HTML(f"⚡ <b><ansigreen>[主动调用技能: {name}]</ansigreen></b>")
+                    HTML(f"\n⚡ <b><ansigreen>[主动调用技能: {name}]</ansigreen></b>")
                 ))
 
                 parsed_content, attached_msgs = parse_user_input(actual_query)

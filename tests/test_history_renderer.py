@@ -215,3 +215,39 @@ def test_tool_target_ansi_escape_is_stripped():
 
     assert "\x1b[2J" not in rendered
     assert "evil" in plain(rendered)
+
+
+def test_separator_between_turns_but_not_before_first_message():
+    """多轮对话回放：相邻轮次（user 消息）之间出现一条灰色细分隔线，
+    首条消息前不打印分隔线。"""
+    history = [
+        {"role": "user", "content": "第一个问题"},
+        {"role": "assistant", "content": "第一个回答"},
+        {"role": "user", "content": "第二个问题"},
+        {"role": "assistant", "content": "第二个回答"},
+    ]
+
+    rendered = render_session_history(history, width=60)
+    text = plain(rendered)
+
+    # 分隔线只出现一次（第二轮提问前），首条消息前没有
+    assert text.count("─" * 60) == 1
+    first_q = text.index("第一个问题")
+    second_q = text.index("第二个问题")
+    sep_pos = text.index("─" * 60)
+    assert first_q < sep_pos < second_q
+
+
+def test_blank_line_between_assistant_blocks_in_replay():
+    """回放时 assistant 正文块与上一块之间有一个空行，不再全部汇集在一起。"""
+    history = [
+        {"role": "user", "content": "问题"},
+        {"role": "assistant", "content": "回答一"},
+        {"role": "assistant", "content": "回答二"},
+    ]
+
+    rendered = render_session_history(history, width=60)
+
+    assert "\n🤖" in plain(rendered) or "\n\x1b" in rendered
+    # 第二个 assistant 块头部前必须有空行
+    assert "\n\x1b[35m🤖" in rendered
