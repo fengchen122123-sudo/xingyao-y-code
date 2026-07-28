@@ -22,7 +22,7 @@
 - Modify `core/turn_renderer.py`: emit complete gray reasoning blocks before `thinking_finished`.
 - Modify `main.py`: connect prompt resolution and Ctrl+C to the broker/manager, pass the root session/turn, and change only the startup version text.
 - Modify `system_prompt.md`: document foreground/background and multi-subagent scheduling rules.
-- Modify `C:/Users/***/.ycode/system_prompt.md`: apply the same scheduling contract to the active user prompt.
+- Modify `~/.ycode/system_prompt.md`: apply the same scheduling contract to the active user prompt.
 - Modify `setup.py`: bump the package version to `1.0.11`.
 - Create `tests/test_permission_broker.py`: permission ordering, resolution, and cancellation tests.
 - Create `tests/test_thinking_stream.py`: sentence, newline, long text, and finish-flush tests.
@@ -588,7 +588,7 @@ git commit -m "feat: orchestrate foreground subagents in parallel"
 
 **Files:**
 - Modify: `system_prompt.md`
-- Modify: `C:/Users/***/.ycode/system_prompt.md`
+- Modify: `~/.ycode/system_prompt.md`
 - Modify: `tests/test_context_builder.py`
 - Modify: `main.py`
 - Modify: `setup.py`
@@ -648,7 +648,7 @@ git add system_prompt.md main.py setup.py tests/test_context_builder.py tests/te
 git commit -m "feat: complete Kimi-style subagent workflow"
 ```
 
-The active file `C:/Users/***/.ycode/system_prompt.md` is intentionally not part of the Git commit; verify its contents separately.
+The active file `~/.ycode/system_prompt.md` is intentionally not part of the Git commit; verify its contents separately.
 
 ### Task 7: Full Verification and Windows PTY Acceptance
 

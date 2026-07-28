@@ -37,16 +37,6 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 - 插件内兄弟模块用 `from core.plugin_loader import import_sibling; m = import_sibling(__file__, "module")` 加载。
 - 插件工具通过 `ToolSpec` 元数据自动获得权限拦截、schema 参数过滤与结果截断。
 
-### Built-in Plugin: ***_locator
-
-`plugins/***_locator/` — *** 多项目代码定位插件，提供 5 个工具：
-`***_register_project` / `***_list_projects` / `***_use_project` / `***_build_index` / `***_locate`。
-
-- 项目注册表：`~/.ycode/***_projects.json`；定位索引：`~/.ycode/***_index/<name>.json`。
-- 索引自动排除 target/dist/node_modules 等构建产物（规则见插件 `excluder.py`）。
-- `***_use_project` 会把 publish 目录注册为会话信任目录（`core/tools.py:register_trusted_root`），放开沙盒读取拦截。
-- `search_code`/`glob_files` 的排除目录可通过 config.json 的 `search_exclude_dirs` 追加配置。
-
 ---
 
 ## 🎨 Code Style & Quality Guidelines
