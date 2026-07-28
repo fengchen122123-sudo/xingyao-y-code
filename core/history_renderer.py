@@ -11,6 +11,7 @@ from core.tool_presenter import (
 from core.turn_renderer import sanitize_protocol_text
 from core.ui_markers import (
     ANSI_CYAN,
+    ANSI_GRAY,
     ANSI_GREEN,
     ANSI_MAGENTA,
     ANSI_RED,
@@ -88,12 +89,19 @@ def render_session_history(
             tool_verbose = False
     output: list[str] = []
     pending_tools: dict[str, tuple[str, dict]] = {}
+    # 轮次分隔线：user 消息之间用一条灰色细线隔开；首条消息前不打印
+    separator = f"{ANSI_GRAY}{'─' * min(width, 60)}{ANSI_RESET}\n"
+    # 上一个输出块类型：None(尚未输出) / "user" / "assistant" / "tool"
+    prev_block: str | None = None
 
     for message in history:
         role = message.get("role")
         if role == "user":
             content = _sanitize_user_content(message.get("content"))
+            if prev_block is not None:
+                output.append("\n" + separator + "\n")
             output.append(f"{ANSI_CYAN}✨ You >{ANSI_RESET} {content}\n")
+            prev_block = "user"
             continue
 
         if role == "assistant":
@@ -113,8 +121,12 @@ def render_session_history(
                 pending_tools[str(call.get("id", ""))] = (name, arguments)
 
             if content.strip():
+                # 与上一块之间补一个空行（紧跟在 user 提问后时不需要）
+                if prev_block not in (None, "user"):
+                    output.append("\n")
                 output.append(f"{ANSI_MAGENTA}🤖 星瑶 >{ANSI_RESET}\n")
                 output.append(render_markdown_to_ansi(content, width))
+                prev_block = "assistant"
             continue
 
         if role == "tool":
@@ -133,6 +145,10 @@ def render_session_history(
             summary = _styled_summary(summary, tool_target(name, arguments))
             color = ANSI_GREEN if ok else ANSI_RED
             marker = MARK_DONE if ok else MARK_FAILED
+            # 工具行紧跟所属的 assistant 块；若上文是其他块则先补一个空行
+            if prev_block not in (None, "assistant", "tool"):
+                output.append("\n")
             output.append(f"{color}{marker}{ANSI_RESET} {summary}\n")
+            prev_block = "tool"
 
     return "".join(output)

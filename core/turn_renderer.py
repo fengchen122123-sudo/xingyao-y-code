@@ -108,6 +108,8 @@ class TurnRenderer:
         self._failed_tool_count = 0
         # 简短模式下"星瑶正在干活…"汇总行是否已打印过（每回合只打印一次）
         self._concise_header_emitted = False
+        # 工具区与上文之间的分段空行是否已输出（每回合首个工具行前补一次）
+        self._section_gap_emitted = False
         # 简短模式的收尾统计行是否已经生成过（避免重复调用 concise_recap 时重复输出）
         self._recap_emitted = False
         self._has_meaningful_assistant_text = False
@@ -268,6 +270,15 @@ class TurnRenderer:
         self._records.append(line)
         self._emitted.append(line)
 
+    def _append_section_gap(self) -> None:
+        """首个工具行输出前补一个空行，把工具区与上文（思考摘要/正文）分开。"""
+        if self._section_gap_emitted:
+            return
+        self._section_gap_emitted = True
+        self._finish_current_line()
+        self._records.append("\n")
+        self._emitted.append("\n")
+
     def _finish_current_line(self) -> None:
         if self._records and not self._records[-1].endswith("\n"):
             self._records.append("\n")
@@ -304,6 +315,7 @@ class TurnRenderer:
         # 简短模式：仅首次工具调用时打印一行"星瑶正在干活"汇总（每回合一次）。
         if not self._tool_verbose and not self._concise_header_emitted:
             self._concise_header_emitted = True
+            self._append_section_gap()
             self._append_line(f"{ANSI_GREEN}●{ANSI_RESET} 星瑶正在干活…")
 
     def _tool_finished(self, data: dict[str, Any]) -> None:
@@ -325,6 +337,7 @@ class TurnRenderer:
             return
         marker = MARK_DONE if ok else MARK_FAILED
         color = ANSI_GREEN if ok else ANSI_RED
+        self._append_section_gap()
         self._append_line(f"{color}{marker}{ANSI_RESET} {styled_summary}")
 
     def _error(self, message: str) -> None:
