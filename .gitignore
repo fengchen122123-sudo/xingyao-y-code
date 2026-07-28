@@ -36,6 +36,9 @@ mytemp/
 # Per-session persisted task plans (runtime state)
 .ycode_tasks/plans/*.json
 .ycode_tasks/plans/*.tmp
+# 任务日志与本地运行状态（含个人路径，不入库）
+.ycode_tasks/*.log
+.ycode_tasks/tasks.json
 
 # Scraped / downloaded HTML files（仅忽略仓库根目录下的抓取/临时网页；
 # /* 限定层级，避免误伤 frontend/index.html 这类项目源码里的 HTML 模板）

@@ -161,7 +161,7 @@ def _outside_workspace_allowed():
 
 
 # ── 信任目录（trusted roots）─────────────────────────────────────
-# 插件（如 ***_locator）注册的工作目录外可信根目录。命中信任目录的
+# 插件注册的工作目录外可信根目录。命中信任目录的
 # 读取/搜索操作不再被沙盒拦截；写操作权限流程不受影响。
 _trusted_roots: set = set()
 _trusted_roots_lock = threading.Lock()
@@ -1109,7 +1109,7 @@ def search_code(query, dir_path="."):
             "-m", "20",  # 每个文件最多 20 处匹配，避免单文件刷屏
         ]
         # 统一排除构建产物目录：git 仓库 rg 靠 .gitignore 排除，
-        # 非 git 目录（如 *** publish）必须显式下发，否则会命中 target/dist 产物
+        # 非 git 目录必须显式下发，否则会命中 target/dist 产物
         for _d in sorted(_get_search_exclude_dirs()):
             cmd += ["--glob", f"!**/{_d}/"]
         if literal:
