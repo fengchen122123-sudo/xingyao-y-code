@@ -1,5 +1,7 @@
 # Y-code（星瑶）
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 > 一个运行在终端里的 AI 编程助手，代号「星瑶」。支持多模型切换、文件操作、命令执行、联网搜索、会话记忆与可扩展技能。
 
 ---
@@ -187,10 +189,14 @@ description: 一个示例技能
 
 ## 🤝 贡献
 
-欢迎提交 Issue 或 PR。如果你发现代码里有敏感信息泄露，请第一时间提醒维护者。
+欢迎提交 Issue 或 Pull Request：
+
+- 提交 Issue：<https://gitee.com/feng-chenhao/xingyao-y-code/issues>
+- 提交 PR 前请先本地跑通 `pytest`，并遵循 `AGENTS.md` 中的开发规范
+- 如果你发现代码里有敏感信息泄露，请第一时间通过 Issue 提醒维护者
 
 ---
 
 ## 📄 License
 
-MIT License
+本项目基于 [MIT License](LICENSE) 开源，可自由使用、修改与分发。
