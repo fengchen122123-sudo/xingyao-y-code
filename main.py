@@ -135,11 +135,9 @@ _current_tool_name = ""
 # 思考面板延迟隐藏标志：思考结束后保留面板显示最后一帧内容，直到下一个事件（工具/文字/新思考）到来
 # 避免短思考（如 14ms）面板闪现即消失，让用户能读到思考内容
 _thinking_panel_linger = False
-# 本回合思考段的合并统计：工具循环中每次模型调用都会产生一段思考，
-# 若每段都立刻打印一行"思考完成 · 用时 Xs"，回合中会连续刷屏。
-# 改为累计后在第一个可见正文块（或回合收尾）前打印一行合并摘要。
-_turn_thinking_segments = 0
-_turn_thinking_elapsed = 0.0
+# 思考段逐段即时打印：每段有实质内容的思考在 thinking_finished 时立刻
+# 打印一行"思考完成 · 用时 X"，作为该段输出正文的天然分隔线，
+# 避免多段短输出揉成一团难以阅读。
 # 粘贴大段文本的占位符存储：输入框里只显示 [粘贴文本 #N · 共 M 行]，
 # 提交时 expand 还原成完整原文再发送（见 kb 的 BracketedPaste 绑定与 submit）
 _paste_store = PastedTextStore()
@@ -717,33 +715,10 @@ def _format_thinking_elapsed(elapsed: float) -> str:
     return f"{elapsed:.1f}s"
 
 
-def _flush_thinking_summary() -> None:
-    """把本回合累计的思考段合并成一行摘要打印（无累计时不打印）。
-
-    工具循环中每轮模型调用都会产生一段思考，逐段打印"思考完成 · 用时 Xs"
-    会连续刷屏；合并后一个回合最多出现一行。
-    """
-    global _turn_thinking_segments, _turn_thinking_elapsed
-    if _turn_thinking_segments <= 0:
-        return
-    if _turn_thinking_segments == 1:
-        line = f"思考完成 · 用时 {_format_thinking_elapsed(_turn_thinking_elapsed)}"
-    else:
-        line = (
-            f"思考完成 · 共 {_turn_thinking_segments} 段 · "
-            f"累计用时 {_format_thinking_elapsed(_turn_thinking_elapsed)}"
-        )
-    _turn_thinking_segments = 0
-    _turn_thinking_elapsed = 0.0
-    _print_ui_fragment(f"\n\x1b[90m{line}\x1b[0m\n")
-
-
 def _render_public_answer_block(turn_id: str, text: str) -> None:
     block = str(text or "").strip()
     if not block:
         return
-    # 本回合第一段可见正文出现前，先补打思考合并摘要（保持"先思考后回答"的阅读顺序）
-    _flush_thinking_summary()
     # 头部延迟到这里——第一个真正要渲染的正文块——才打印，而不是回合的
     # 第一个事件（可能只是一次工具调用）到来时就打印。同一回合只打印一次。
     if not _answer_header_printed.get(turn_id):
@@ -807,7 +782,7 @@ def _flush_public_answer(turn_id: str, *, final: bool = False) -> None:
 def _render_ui_event(event):
     global is_thinking, task_status, think_start_time, activity_start_time
     global active_thinking_text, active_thinking_turn_id, _current_tool_name
-    global _thinking_panel_linger, _turn_thinking_segments, _turn_thinking_elapsed
+    global _thinking_panel_linger
     renderer = ui_renderers.get(event.turn_id)
     if renderer is None:
         # 读取 verbose 配置（默认 False 简短模式：只显示"星瑶正在干活"，不显示具体工具调用细节）
@@ -937,14 +912,13 @@ def _render_ui_event(event):
         # 不立即清空 active_thinking_text：保留最后一帧思考内容供面板延迟显示
         # 仅重置 turn_id 标记，让下一个 thinking_started 能识别新一段思考
         active_thinking_turn_id = None
-        # 只有真实产生过思考内容才计入：Kimi 等模型会为工具调用消息回填
-        # " " 占位 reasoning_content，每次模型调用都会触发一次 thinking_finished，
-        # 无内容也计数会导致合并摘要虚高。
-        # 不逐段打印：累计后由 _flush_thinking_summary 在第一个可见正文块/
-        # 回合收尾时统一打印一行，避免工具循环中"思考完成"连续刷屏。
+        # 只有真实产生过思考内容才打印：Kimi 等模型会为工具调用消息回填
+        # " " 占位 reasoning_content，无内容的段直接跳过，避免空刷屏。
+        # 逐段即时打印：每段思考一行"思考完成 · 用时 X"，作为该段输出正文的
+        # 天然分隔线——多段短输出不再揉成一团。
         if active_thinking_text.strip():
-            _turn_thinking_segments += 1
-            _turn_thinking_elapsed += elapsed
+            line = f"思考完成 · 用时 {_format_thinking_elapsed(elapsed)}"
+            _print_ui_fragment(f"\n\x1b[90m{line}\x1b[0m\n")
         task_status = "executing"
         is_thinking = True
         # 思考结束进入执行阶段，此时还没有具体工具，清空以免显示上一个工具的活动
@@ -983,8 +957,6 @@ def _render_ui_event(event):
                 _assistant_stream_buffers.get(event.turn_id, "") + tail
             )
         _flush_public_answer(event.turn_id, final=True)
-        # 回合没有任何可见正文时，思考合并摘要在这里兜底补打
-        _flush_thinking_summary()
         # 简短模式收尾统计行：直接打印 ANSI 片段，不进 Markdown 缓冲区
         recap = renderer.concise_recap()
         if recap:
@@ -1003,7 +975,6 @@ def _render_ui_event(event):
                 _assistant_stream_buffers.get(event.turn_id, "") + tail
             )
         _flush_public_answer(event.turn_id, final=True)
-        _flush_thinking_summary()
         recap = renderer.concise_recap()
         if recap:
             _print_ui_fragment(recap)
@@ -1022,7 +993,6 @@ def _render_ui_event(event):
                 _assistant_stream_buffers.get(event.turn_id, "") + tail
             )
         _flush_public_answer(event.turn_id, final=True)
-        _flush_thinking_summary()
         recap = renderer.concise_recap()
         if recap:
             _print_ui_fragment(recap)
