@@ -1260,6 +1260,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/session all</ansicyan>                         : 列出所有目录下的历史会话 (含归属路径与时间)"))
         print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
         print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
+        print_formatted_text(HTML("  <ansicyan>/new</ansicyan>                                    : 创建并切换到全新会话（历史会话保留，/session 可切回）"))
         print_formatted_text(HTML("  <ansicyan>/undo</ansicyan>                                   : 撤销星瑶上一次修改的代码，并同步抹除模型记忆"))
         print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
         print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
@@ -1281,6 +1282,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan>            : 禁用指定短 ID 对应的技能"))
         print_formatted_text(HTML("  <ansicyan>/&lt;短ID&gt; [提问内容]</ansicyan>                   : <b>主动且强制调用指定技能</b>让星瑶为您执行任务"))
         print_formatted_text(HTML("  <ansicyan>/plugins</ansicyan>                             : 查看已安装的进程内插件 (名称/版本/来源/加载状态/提供的工具)"))
+        print_formatted_text(HTML("  <ansicyan>/mcp</ansicyan>                                 : MCP 服务管理 (open/status/tools/enable/disable/reconnect/edit)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【4. 任务托管与后台进程】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/tasks</ansicyan>                               : 查看或接管目前正在运行的后台长周期服务/命令"))
@@ -1463,6 +1465,18 @@ def handle_slash_command(command_text):
             status = "详细模式（显示工具调用细节）" if enabled else '简短模式（只显示"星瑶正在干活"）'
             print_formatted_text(HTML(f"<b><ansicyan>工具显示模式：{status}</ansicyan></b>"))
             print_formatted_text(HTML("用法: <ansiyellow>/verbose &lt;on|off&gt;</ansiyellow>（on=显示每个工具调用，off=只显示汇总行）"))
+
+    elif cmd == "/new":
+        # 创建全新会话并切换：历史会话全部保留，随时可用 /session 切回
+        new_session = f"session_{uuid.uuid4().hex[:6]}"
+        manager.create_session_explicit(new_session)
+        current_session = new_session
+        sync_plan_session(current_session)
+        recalc_token_usage()
+        safe_session = new_session.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+        print_formatted_text(HTML(f"\n<ansigreen>✔ 已创建并切换到全新会话: {safe_session}</ansigreen>"))
+        print_formatted_text(HTML("<ansigray>  历史会话仍保留，输入 /session 可随时切回。</ansigray>"))
+        print_logo(clear_screen=False)
 
     elif cmd in ("/sessions", "/session"):
         if len(parts) > 1:
@@ -2073,6 +2087,7 @@ def _make_input_app():
     COMMAND_COMPLETIONS = [
         ("/help", "查看系统指令说明"),
         ("/session", "切换或创建新的记忆会话"),
+        ("/new", "创建并切换到全新会话"),
         ("/models", "打开模型管理器"),
         ("/tasks", "查看或托管后台长周期进程"),
         ("/plan", "查看或控制当前任务计划"),
@@ -3336,6 +3351,9 @@ def run_cli():
 
             recalc_token_usage()
             print_logo(clear_screen=True)
+            # 重铺当前会话历史：全屏选择器退出后屏幕被清空，不回放历史
+            # 用户会误以为“上下文丢了/被开了新会话”，实际上会话从未变化
+            show_session_history(current_session)
             pending_action = None
             continue
             

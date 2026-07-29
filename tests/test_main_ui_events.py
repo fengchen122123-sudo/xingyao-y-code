@@ -712,3 +712,32 @@ def test_existing_session_still_present_is_untouched(monkeypatch):
     )
     assert was_deleted is False
     assert resolved == "会话A"
+
+
+def test_new_command_creates_and_switches_session(monkeypatch):
+    """/new 创建全新会话并切换；历史会话不受影响。"""
+    created = []
+    synced = []
+    printed = []
+
+    class FakeManager:
+        def create_session_explicit(self, name):
+            created.append(name)
+
+    monkeypatch.setattr(main, "manager", FakeManager())
+    monkeypatch.setattr(main, "sync_plan_session", lambda s: synced.append(s))
+    monkeypatch.setattr(main, "recalc_token_usage", lambda: None)
+    monkeypatch.setattr(main, "print_logo", lambda clear_screen=False: None)
+    monkeypatch.setattr(main, "print_formatted_text", lambda *a, **k: printed.append(str(a)))
+
+    old_session = main.current_session
+    try:
+        main.handle_slash_command("/new")
+        assert len(created) == 1
+        assert created[0].startswith("session_")
+        assert main.current_session == created[0]
+        assert main.current_session != old_session
+        assert synced == [created[0]]
+        assert any("全新会话" in p for p in printed)
+    finally:
+        main.current_session = old_session
