@@ -33,6 +33,19 @@ _logger = logging.getLogger("ycode.plugins")
 # 内置插件目录（随 ycode 仓库发布）与用户插件目录（可覆盖内置同名插件）
 _BUILTIN_PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
 
+# 最近一次 load_and_register 的扫描结果（含禁用/失败/被覆盖的插件），
+# 供 /plugins 命令与诊断查询；每次扫描开头会整体重建。
+_PLUGIN_INFOS: list[dict] = []
+
+
+def get_plugin_infos() -> list[dict]:
+    """返回最近一次插件扫描的信息列表（dict 副本，调用方修改不影响内部状态）。
+
+    每条记录字段：name / version / description / path / source(user|builtin) /
+    status(loaded|disabled|failed|overridden) / tools(list[str]) / error(可选)。
+    """
+    return [dict(info) for info in _PLUGIN_INFOS]
+
 
 def _user_plugin_dir() -> Path:
     try:
@@ -105,7 +118,10 @@ def load_and_register(registry) -> list[str]:
     """
     loaded: list[str] = []
     seen: set[str] = set()
-    for base in plugin_dirs():
+    _PLUGIN_INFOS.clear()
+    # plugin_dirs() 约定用户目录在前：索引 0 即用户级，其余为内置
+    for idx, base in enumerate(plugin_dirs()):
+        source = "user" if idx == 0 else "builtin"
         try:
             if not base.is_dir():
                 continue
@@ -119,18 +135,40 @@ def load_and_register(registry) -> list[str]:
             # 同名覆盖：用户目录先扫，内置目录遇到同名直接跳过
             try:
                 with open(child / "plugin.json", "r", encoding="utf-8") as f:
-                    plugin_name = str(json.load(f).get("name") or child.name)
+                    meta = json.load(f)
+                plugin_name = str(meta.get("name") or child.name)
             except Exception:
+                meta = {}
                 plugin_name = child.name
+            info: dict = {
+                "name": plugin_name,
+                "version": str(meta.get("version") or "?"),
+                "description": str(meta.get("description") or ""),
+                "path": str(child),
+                "source": source,
+                "status": "loaded",
+                "tools": [],
+            }
             if plugin_name in seen:
+                info["status"] = "overridden"
+                _PLUGIN_INFOS.append(info)
                 continue
+            before_tools = {s.name for s in registry.all()}
             try:
                 name = _load_one(child, registry)
                 seen.add(plugin_name)
                 if name:
+                    info["tools"] = sorted(
+                        s.name for s in registry.all() if s.name not in before_tools
+                    )
                     loaded.append(name)
                     _logger.info("插件已加载: %s (%s)", name, child)
+                else:
+                    info["status"] = "disabled"
             except Exception as exc:
                 seen.add(plugin_name)
+                info["status"] = "failed"
+                info["error"] = str(exc)
                 _logger.warning("插件 %s 加载失败，已跳过: %s", child.name, exc)
+            _PLUGIN_INFOS.append(info)
     return loaded
