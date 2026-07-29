@@ -170,11 +170,35 @@ def test_kimi_k3_request_uses_anthropic_high_thinking_budget(mocker):
 
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 4096}
     assert captured["max_tokens"] == 32000
-    # anthropic 协议路由原生支持 thinking 参数，不再需要
-    # allowed_openai_params 透传 hack（那是 openai 路由才用的，
-    # 且 openai 路由现在根本不发 thinking——Moonshot 的 OpenAI 端点不认它）
-    assert "allowed_openai_params" not in captured
+    # litellm 客户端参数校验只把 Claude 系列识别为支持 thinking 的 anthropic 模型，
+    # 对 "K3" 这类陌生模型名会直接抛 UnsupportedParamsError（请求根本发不出去），
+    # 必须显式声明 allowed_openai_params 豁免校验。
+    assert captured["allowed_openai_params"] == ["thinking"]
     assert "reasoning_effort" not in captured
+
+
+def test_kimi_k3_generic_anthropic_route_also_bypasses_litellm_param_check(mocker):
+    """非 kimi coding 的 anthropic 兼容端点（经销商网关等）同样必须带豁免参数。"""
+    captured = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+
+    list(chat_with_model_events(
+        "anthropic/K3",
+        "fake-key",
+        [{"role": "user", "content": "回答"}],
+        "https://anthropic-proxy.example.com",
+        persist=False,
+        turn_id="turn-k3-generic-anthropic",
+    ))
+
+    assert captured["thinking"] == {"type": "enabled", "budget_tokens": 2048}
+    assert captured["max_tokens"] == 16000
+    assert captured["allowed_openai_params"] == ["thinking"]
 
 
 def test_non_kimi_provider_does_not_receive_kimi_reasoning_options(mocker):
