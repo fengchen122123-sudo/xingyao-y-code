@@ -89,9 +89,9 @@ venv\Scripts\python build_release.py
 
 - `full` 模式（`ycode_setup.exe`，默认）：
   1. 询问安装目录，释放完整的核心程序包（GUI + TUI + 依赖）。
-  2. 询问“是否同时安装命令行版 TUI (ycode 命令)？[Y/n]”：
+  2. 询问“是否同时安装命令行版 CLI (ycode 命令)？[Y/n]”：
      - 选 是：保留 `ycode.exe`，把安装目录加入 PATH，创建桌面快捷方式
-       “Y-code TUI”。
+       “Y-code CLI”。
      - 选 否：从安装目录里删掉 `ycode.exe`，不写 PATH，转而把内嵌的
        `ycode_tui_setup.exe` 释放到 `<安装目录>\tui\ycode_tui_setup.exe`，
        并提示“以后可双击 tui\ycode_tui_setup.exe 补装命令行版”。
@@ -100,7 +100,7 @@ venv\Scripts\python build_release.py
      “控制面板 → 程序和功能”（即注册表 `HKCU\...\Uninstall\Y-code`）里注册一条
      卸载入口。
 - `tui` 模式（`ycode_tui_setup.exe`）：只安装 `ycode.exe` 及其依赖，加入 PATH，
-  创建 “Y-code TUI” 快捷方式。如果目标目录已经是一次完整版安装（检测到
+  创建 “Y-code CLI” 快捷方式。如果目标目录已经是一次完整版安装（检测到
   `Y-code.exe` 已存在），会直接合并进去，并复用完整版已经注册好的卸载入口，
   不会重复注册。
 
@@ -108,12 +108,12 @@ venv\Scripts\python build_release.py
 
 用户可以通过以下任意一种方式卸载：
 
-1. Windows 设置 → 应用 → 已安装的应用 → 找到 “Y-code”（或独立安装 TUI 时的
-   “Y-code TUI”）→ 卸载。
+1. Windows 设置 → 应用 → 已安装的应用 → 找到 "Y-code"（或独立安装 CLI 时的
+   "Y-code CLI"）→ 卸载。
 2. 直接运行安装目录下的 `ycode_uninstall.exe`。
 
-卸载向导会清理：桌面快捷方式（GUI 版 + TUI 版）、PATH 环境变量里的安装路径、
-注册表里的卸载入口（`Y-code` 与 `Y-code-TUI` 都会尝试清理）、可选的 `~/.ycode`
+卸载向导会清理：桌面快捷方式（GUI 版 + CLI 版，兼容旧版 TUI 命名）、PATH 环境变量里的安装路径、
+注册表里的卸载入口（`Y-code` 与 `Y-code-CLI`（含旧版 `Y-code-TUI`）都会尝试清理）、可选的 `~/.ycode`
 用户配置与会话记录，最后自我删除并清空整个安装目录。
 
 ## 六、常见问题排查

@@ -50,7 +50,7 @@ def print_finish_banner_full(install_dir, installed_tui):
     print("🚀 启动方法：")
     print("1. 双击桌面上的 [Y-code] 快捷方式，打开图形界面版。")
     if installed_tui:
-        print("2. 双击桌面上的 [Y-code TUI] 快捷方式，或打开一个新的命令行窗口输入 ycode，使用命令行版。")
+        print("2. 双击桌面上的 [Y-code CLI] 快捷方式，或打开一个新的命令行窗口输入 ycode，使用命令行版。")
     else:
         print("2. 本次未安装命令行版；如需要，可随时双击安装目录下的 tui\\ycode_tui_setup.exe 补装。")
     print("============================================================")
@@ -59,11 +59,11 @@ def print_finish_banner_full(install_dir, installed_tui):
 
 def print_finish_banner_tui(install_dir):
     print("\n============================================================")
-    print("🎉 Y-code 命令行版 (TUI) 安装成功！")
+    print("🎉 Y-code 命令行版 (CLI) 安装成功！")
     print(f"安装路径: {install_dir}")
     print("------------------------------------------------------------")
     print("🚀 启动方法：")
-    print("1. 双击桌面上的 [Y-code TUI] 快捷方式即可开启对话。")
+    print("1. 双击桌面上的 [Y-code CLI] 快捷方式即可开启对话。")
     print("2. 打开任意全新的命令行窗口 (CMD/PowerShell)，输入 ycode 敲回车。")
     print("============================================================")
     input("\n按任意键退出安装向导...")
@@ -267,7 +267,7 @@ def copy_tui_payload(src_pkg_dir, install_dir):
 def install_full(bundle_dir, startupinfo):
     print("👋 欢迎使用 Y-code 官方 Windows 安装向导！")
     print("本向导将为您安装 Y-code (星瑶 AI 编程助手)，默认安装图形界面版 (GUI)，")
-    print("并可选附带安装命令行版 (TUI)。\n")
+    print("并可选附带安装命令行版 (CLI)。\n")
 
     install_dir = prompt_install_dir()
 
@@ -292,7 +292,7 @@ def install_full(bundle_dir, startupinfo):
 
     # 2. 询问是否附带安装命令行版
     print()
-    choice = input("是否同时安装命令行版 TUI (ycode 命令)？[Y/n]: ").strip().lower()
+    choice = input("是否同时安装命令行版 CLI (ycode 命令)？[Y/n]: ").strip().lower()
     installed_tui = choice != "n"
 
     if installed_tui:
@@ -302,7 +302,7 @@ def install_full(bundle_dir, startupinfo):
             print(f"⚠️ 配置环境变量失败: {e}")
             print("请稍后手动将安装目录添加到您的系统环境变量中。")
         try:
-            shortcut_path = os.path.join(get_desktop_dir(), "Y-code TUI.lnk")
+            shortcut_path = os.path.join(get_desktop_dir(), "Y-code CLI.lnk")
             create_shortcut(shortcut_path, tui_exe_path, install_dir, startupinfo)
             print(f"✔ 桌面快捷方式创建成功: {shortcut_path}")
         except Exception as e:
@@ -377,7 +377,7 @@ def install_full(bundle_dir, startupinfo):
 # ============================================================================
 
 def install_tui(bundle_dir, startupinfo):
-    print("👋 欢迎使用 Y-code 命令行版 (TUI) 安装向导！")
+    print("👋 欢迎使用 Y-code 命令行版 (CLI) 安装向导！")
     print("本向导将为您安装 Y-code 命令行版 (ycode 命令) 到您的电脑上。\n")
 
     install_dir = prompt_install_dir()
@@ -414,7 +414,7 @@ def install_tui(bundle_dir, startupinfo):
 
     # 桌面快捷方式
     try:
-        shortcut_path = os.path.join(get_desktop_dir(), "Y-code TUI.lnk")
+        shortcut_path = os.path.join(get_desktop_dir(), "Y-code CLI.lnk")
         create_shortcut(shortcut_path, tui_exe_path, install_dir, startupinfo)
         print(f"✔ 桌面快捷方式创建成功: {shortcut_path}")
     except Exception as e:
@@ -438,14 +438,14 @@ def install_tui(bundle_dir, startupinfo):
                 print(f"✔ 卸载程序成功复制到: {dest_uninst}")
                 version = read_bundled_version(bundle_dir)
                 write_uninstall_registry_key(
-                    app_key_name="Y-code-TUI",
-                    display_name="Y-code TUI",
+                    app_key_name="Y-code-CLI",
+                    display_name="Y-code CLI",
                     version=version,
                     install_dir=install_dir,
                     uninstall_string=f'"{dest_uninst}"',
                     display_icon=f'"{tui_exe_path}"',
                 )
-                print("✔ 已在“应用和功能”中注册 Y-code TUI。")
+                print("✔ 已在“应用和功能”中注册 Y-code CLI。")
             else:
                 print("⚠️ 安装包中未找到卸载程序，跳过卸载注册。")
         except Exception as e:
