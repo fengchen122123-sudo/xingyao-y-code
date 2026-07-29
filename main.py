@@ -1310,6 +1310,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/skills enable &lt;短ID&gt;</ansicyan>             : 启用指定短 ID 对应的技能"))
         print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan>            : 禁用指定短 ID 对应的技能"))
         print_formatted_text(HTML("  <ansicyan>/&lt;短ID&gt; [提问内容]</ansicyan>                   : <b>主动且强制调用指定技能</b>让星瑶为您执行任务"))
+        print_formatted_text(HTML("  <ansicyan>/plugins</ansicyan>                             : 查看已安装的进程内插件 (名称/版本/来源/加载状态/提供的工具)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【4. 任务托管与后台进程】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/tasks</ansicyan>                               : 查看或接管目前正在运行的后台长周期服务/命令"))
@@ -1994,6 +1995,49 @@ def handle_slash_command(command_text):
                 "<ansired>⚠️ 未知子命令。用法: /mcp [open|status|tools|reconnect|enable &lt;name&gt;|disable &lt;name&gt;|edit]</ansired>"
             ))
 
+    elif cmd == "/plugins":
+        # 进程内插件清单：数据来自启动时 plugin_loader 的扫描记录
+        from core import plugin_loader
+        infos = plugin_loader.get_plugin_infos()
+        if not infos:
+            print_formatted_text(HTML("<ansiyellow>ℹ 未发现任何插件。</ansiyellow>"))
+            print_formatted_text(HTML(
+                "<ansigray>  插件目录: 用户级 ~/.ycode/plugins/ 、内置 plugins/ ；每个插件一个目录，内含 plugin.json。</ansigray>"
+            ))
+        else:
+            print_formatted_text(HTML(f"<ansicyan>🧩 已发现 {len(infos)} 个插件:</ansicyan>"))
+            for info in infos:
+                status = info.get("status")
+                if status == "loaded":
+                    check = "<ansigreen>[✓]</ansigreen>"
+                    state = "<ansigreen>已加载</ansigreen>"
+                elif status == "disabled":
+                    check = "<ansigray>[ ]</ansigray>"
+                    state = "<ansigray>已禁用</ansigray>"
+                elif status == "overridden":
+                    check = "<ansigray>[ ]</ansigray>"
+                    state = "<ansigray>被同名用户级插件覆盖</ansigray>"
+                else:
+                    check = "<ansired>[x]</ansired>"
+                    state = "<ansired>加载失败</ansired>"
+                source = "用户级" if info.get("source") == "user" else "内置"
+                tools = info.get("tools") or []
+                tool_part = f"  <ansigray>工具数: {len(tools)}</ansigray>" if status == "loaded" else ""
+                print_formatted_text(HTML(
+                    f"  {check} <b><ansicyan>{_esc(info['name'])}</ansicyan></b> <ansigray>v{_esc(str(info.get('version') or '?'))}</ansigray>  {source} · {state}{tool_part}"
+                ))
+                desc = info.get("description")
+                if desc:
+                    print_formatted_text(HTML(f"      <ansigray>{_esc(desc)}</ansigray>"))
+                if status == "failed" and info.get("error"):
+                    print_formatted_text(HTML(f"      <ansired>错误: {_esc(info['error'])}</ansired>"))
+                if tools:
+                    print_formatted_text(HTML(f"      <ansigray>工具: {_esc(', '.join(tools))}</ansigray>"))
+                print_formatted_text(HTML(f"      <ansigray>路径: {_esc(info.get('path', ''))}</ansigray>"))
+            print_formatted_text(HTML(
+                "<ansigray>  将插件目录内 plugin.json 的 enabled 改为 false 可禁用（重启后生效）；用户级同名插件覆盖内置。</ansigray>"
+            ))
+
     elif cmd == "/clear":
         # 清屏后屏幕上没有内容，下一轮提问前不打印轮次分隔线
         _turn_separator_needed = False
@@ -2067,6 +2111,7 @@ def _make_input_app():
         ("/share", "导出会话为 Markdown/HTML/JSON"),
         ("/worktree", "Git worktree 管理 (list/create/remove)"),
         ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
+        ("/plugins", "查看已安装的进程内插件 (名称/来源/状态/工具)"),
         ("/skills", "查看或安装/开启/禁用技能插件"),
         ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
         ("/permission", "切换安全权限级别 (confirm/plan/full)"),
