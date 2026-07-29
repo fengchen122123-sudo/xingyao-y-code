@@ -32,6 +32,40 @@ FALLBACK_SYSTEM_PROMPT = "你叫星瑶，是一位顶尖的代码编程助手。
 # 后台子代理结果注入时，单条结果的最大长度
 _BG_RESULT_MAX_CHARS = 1500
 
+# MCP schema 预热标记：进程内只尝试一次
+_MCP_WARMUP_STARTED = False
+
+
+def _warmup_mcp_schemas_once() -> None:
+    """后台线程预热 MCP 连接，让 tools 数组从第二轮起保持稳定。
+
+    MCP 是惰性连接：若等到会话中某轮才连上，get_tools_schema() 返回的
+    tools 数组会从空变满，导致 provider 侧 tools/前缀缓存整体失效。
+    首轮准备时在后台提前触发连接（CONNECT_TIMEOUT=10s，绝不阻塞当前轮），
+    连接失败也不影响对话主流程。
+    """
+    global _MCP_WARMUP_STARTED
+    if _MCP_WARMUP_STARTED:
+        return
+    _MCP_WARMUP_STARTED = True
+    try:
+        from core.mcp_client import mcp_manager
+        mcp_manager._load_config()
+        servers = mcp_manager.config.get("mcpServers", {}) if isinstance(mcp_manager.config, dict) else {}
+        enabled = [
+            name for name, conf in servers.items()
+            if not (isinstance(conf, dict) and conf.get("enabled", True) is False)
+        ]
+        if not enabled or mcp_manager.servers:
+            return
+        threading.Thread(
+            target=mcp_manager._ensure_connected,
+            name="mcp-schema-warmup",
+            daemon=True,
+        ).start()
+    except Exception:
+        logger.debug("MCP schema 预热失败，已忽略", exc_info=True)
+
 
 def _repo_root() -> str:
     """返回项目根目录（core/ 的上一级）。"""
@@ -210,6 +244,9 @@ def prepare_turn_messages(
 
     def _cancelled() -> bool:
         return cancel_event is not None and cancel_event.is_set()
+
+    # MCP schema 预热（进程内一次，后台线程，不阻塞本轮）：稳定后续轮次的 tools 数组
+    _warmup_mcp_schemas_once()
 
     try:
         window = int(context_window or 0)
