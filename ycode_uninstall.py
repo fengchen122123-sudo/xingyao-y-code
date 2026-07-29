@@ -3,9 +3,9 @@ ycode_uninstall.py
 Y-code 官方 Windows 卸载向导。
 
 会清理完整版 (GUI + 可选 TUI) 或独立 TUI 安装留下的全部痕迹：
-  - 桌面快捷方式 (Y-code.lnk / Y-code TUI.lnk，两个都尝试删除，不存在的自动跳过)
+  - 桌面快捷方式 (Y-code.lnk / Y-code CLI.lnk / Y-code TUI.lnk 旧版，都尝试删除)
   - HKCU\\Environment\\PATH 里的安装目录
-  - HKCU\\...\\Uninstall 下的注册表项 (Y-code / Y-code-TUI，两个都尝试移除)
+  - HKCU\\...\\Uninstall 下的注册表项 (Y-code / Y-code-CLI / Y-code-TUI 旧版，都尝试移除)
   - 可选：~/.ycode 用户配置与会话记录
   - 安装目录本身 (Y-code.exe / ycode.exe / _internal/ / tui/ 子目录)
 """
@@ -121,9 +121,10 @@ def uninstall():
 
     print("\n🚀 正在执行卸载步骤...")
 
-    # 1. 删除桌面快捷方式（GUI 版 + TUI 版都尝试删除，不存在的自动跳过）
+    # 1. 删除桌面快捷方式（GUI 版 + CLI 版都尝试删除，同时兼容旧版 TUI 命名，不存在的自动跳过）
     try:
         remove_shortcut("Y-code.lnk")
+        remove_shortcut("Y-code CLI.lnk")
         remove_shortcut("Y-code TUI.lnk")
     except Exception as e:
         print(f"⚠️ 删除快捷方式时发生警告: {e}")
@@ -135,10 +136,12 @@ def uninstall():
     except Exception as e:
         print(f"⚠️ 移除环境变量时发生警告: {e}")
 
-    # 3. 移除“应用和功能”里的卸载注册项（完整版入口 + 可能存在的独立 TUI 入口）
+    # 3. 移除“应用和功能”里的卸载注册项（完整版入口 + 可能存在的独立 CLI 入口，
+    #    兼容旧版 TUI 命名）
     print("🗂️ 正在清理注册表卸载信息...")
     try:
         remove_uninstall_registry_key("Y-code")
+        remove_uninstall_registry_key("Y-code-CLI")
         remove_uninstall_registry_key("Y-code-TUI")
     except Exception as e:
         print(f"⚠️ 清理注册表时发生警告: {e}")

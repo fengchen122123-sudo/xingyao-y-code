@@ -253,9 +253,9 @@ def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_dat
 
 def step3_build_tui_setup(pyinstaller_bin, project_dir, ycode_dir, uninstall_exe):
     print("\n[步骤 3/5] 正在编译 TUI 独立安装向导 ycode_tui_setup.exe...")
-    # 同时内嵌卸载程序：这样即便用户脱离主安装包、单独运行这个 TUI 安装向导
-    # （即“安装目录下还没有 Y-code.exe”的独立安装场景），也能正常复制出
-    # 卸载程序并注册 Y-code-TUI 卸载入口，而不是只能在合并进完整版安装后
+    # 同时内嵌卸载程序：这样即便用户脱离主安装包、单独运行这个 CLI 安装向导
+    # （即"安装目录下还没有 Y-code.exe"的独立安装场景），也能正常复制出
+    # 卸载程序并注册 Y-code-CLI 卸载入口，而不是只能在合并进完整版安装后
     # 才具备可卸载性。
     return build_setup_variant(
         pyinstaller_bin, project_dir, mode="tui", output_name="ycode_tui_setup",
