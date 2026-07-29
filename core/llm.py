@@ -1067,14 +1067,19 @@ def _provider_request_options(model_name, api_base):
     if anthropic_route:
         # Anthropic 协议路由（api.kimi.com/coding 等 anthropic 兼容端点）：
         # 接受 Anthropic 形状的 thinking 参数。
+        # 必须同时声明 allowed_openai_params：litellm 的客户端参数校验只把
+        # Claude 系列识别为支持 thinking 的 anthropic 模型，对 "K3" 这类陌生
+        # 模型名会直接抛 UnsupportedParamsError（请求根本发不出去），需要显式豁免。
         if is_k3:
             return {
                 "thinking": {"type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048},
                 "max_tokens": 32000 if is_kimi_coding else 16000,
+                "allowed_openai_params": ["thinking"],
             }
         return {
             "thinking": {"type": "enabled", "budget_tokens": 2048},
             "max_tokens": 16000,
+            "allowed_openai_params": ["thinking"],
         }
 
     # OpenAI 兼容路由（api.moonshot.cn/v1 及各类经销商）：
