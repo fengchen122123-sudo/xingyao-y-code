@@ -47,10 +47,7 @@ source venv/bin/activate
 pip install -e .
 ```
 
-> `setup.py` 已声明依赖：`rich`、`litellm`、`pytest`、`prompt_toolkit`、`pyfiglet`。运行时如需联网搜索，请额外安装 `ddgs`：
-> ```bash
-> pip install ddgs
-> ```
+> `pip install -e .` 会自动安装全部运行依赖（`rich`、`litellm`、`prompt_toolkit`、`pyfiglet`、`ddgs`、`mcp`、`psutil`、`pillow`），联网搜索所需的 `ddgs` 已包含在内，无需额外安装。
 
 ### 3. 配置 API 密钥
 
@@ -96,6 +93,23 @@ ycode
 ```bash
 python main.py
 ```
+
+### 5. （可选）启动 GUI 界面
+
+GUI 模式基于 `pywebview` + Vue 3 前端。前端构建产物 `frontend/dist/` 不随仓库提交，首次使用需先安装 `pywebview` 并构建前端：
+
+```bash
+pip install pywebview
+
+cd frontend
+npm install
+npm run build
+cd ..
+
+python gui_main.py
+```
+
+> 前端开发调试时也可以改为在 `frontend/` 下运行 `npm run dev`（Vite 开发服务器，端口 5173），`gui_main.py` 会优先加载它。两者都不可用时 GUI 无法启动，TUI 模式（`python main.py`）不受影响。
 
 ---
 
