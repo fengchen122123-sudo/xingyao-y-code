@@ -713,6 +713,8 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.hint", f"  上下文:   {data['context_window']}\n")]
 
         if step == 4:
+            out += [_t("class:wiz.title", "  步骤 5/5  图片/视频输入\n")]
+            out += [_t("class:wiz.hint",  "  该模型是否支持图片/视频输入？↑↓ 选择，Enter 确认：\n")]
             vision = state["proto_cursor"] == 1
             opts = ["  否（仅文本）", "  是（支持图片/视频）"]
             for oi, o in enumerate(opts):
@@ -788,7 +790,6 @@ def open_model_selector(on_model_selected=None):
             3: ("步骤 3/6  API Key",       "输入 API Key："),
             4: ("步骤 5a  模型名称",        "输入模型名称，如 deepseek-chat："),
             5: ("步骤 5b  最大上下文",      "输入上下文 Token 数，如 128000："),
-            5.5: ("步骤 5c  图片/视频输入",    "该模型是否支持图片/视频输入？"),
         }
 
         if step > 1 and "name" in data:
@@ -806,6 +807,8 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.hint",  f"  {hint}\n")]
 
         elif step == 5.5:
+            out += [_t("class:wiz.title", "  步骤 5c  图片/视频输入\n")]
+            out += [_t("class:wiz.hint",  "  该模型是否支持图片/视频输入？↑↓ 选择，Enter 确认：\n")]
             vision = state["proto_cursor"] == 1
             opts = ["  否（仅文本）", "  是（支持图片/视频）"]
             for oi, o in enumerate(opts):
@@ -867,6 +870,8 @@ def open_model_selector(on_model_selected=None):
             out += [_t("class:wiz.hint", f"  上下文:   {data['context_window']}\n")]
 
         if step == 2:
+            out += [_t("class:wiz.title", "  步骤 3/3  图片/视频输入\n")]
+            out += [_t("class:wiz.hint",  "  该模型是否支持图片/视频输入？↑↓ 选择，Enter 确认：\n")]
             vision = state["proto_cursor"] == 1
             opts = ["  否（仅文本）", "  是（支持图片/视频）"]
             for oi, o in enumerate(opts):

@@ -1293,6 +1293,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/remember &lt;内容&gt;</ansicyan>                     : 手动追加一条规则、偏好或事实到今日的记忆日志"))
         print_formatted_text(HTML("  <ansicyan>/dream</ansicyan>                                 : 在后台触发梦境总结，将所有记忆日志提炼归纳并更新索引"))
         print_formatted_text(HTML("  <ansicyan>/memory</ansicyan>                                : 快速查阅当前的长期记忆索引 (MEMORY.md) 内容"))
+        print_formatted_text(HTML("  <ansicyan>/compress [force]</ansicyan>                      : 手动触发当前会话的记忆压缩 (保留最近若干条，更早的历史由大模型提炼为摘要；加 force 强制保留更少条数)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【6. 终端常用快捷操作】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>@文件名</ansicyan>                               : <b>在提问中挂载本地文件</b> (例如: <ansigray>这行代码怎么改 @main.py</ansigray>)"))
@@ -2065,6 +2066,43 @@ def handle_slash_command(command_text):
             except Exception as e:
                 print_formatted_text(HTML(f"<ansired>❌ 写入记忆日志失败：{_esc(e)}</ansired>"))
 
+    elif cmd == "/compress" or cmd.startswith("/compress "):
+        # 手动触发会话记忆压缩：保留最近若干条对话，更早的历史由大模型提炼为摘要
+        # 后台执行避免阻塞 UI，状态/结果通过 schedule_ui 回调输出
+        sub = parts[1].lower() if len(parts) > 1 else ""
+        force = sub == "force"
+
+        def run_compress_bg():
+            try:
+                from core.memory_compressor import compress_session_memory
+                session = current_session
+                def emit(msg):
+                    safe = msg.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                    schedule_ui(lambda m=safe: print_formatted_text(HTML(m)))
+                ok = compress_session_memory(
+                    manager,
+                    session,
+                    api_model=current_model,
+                    api_key=current_key,
+                    api_url=current_url,
+                    force=force,
+                    output_callback=emit,
+                )
+                if ok is False:
+                    # compress_session_memory 在"已在压缩中"或"对话过少"时返回 False
+                    # emit 已经输出过对应提示，这里不重复打印
+                    pass
+            except Exception as e:
+                safe_error = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                schedule_ui(lambda msg=safe_error: print_formatted_text(
+                    HTML(f"\n<ansired>❌ 记忆压缩失败：{msg}</ansired>")
+                ))
+
+        print_formatted_text(HTML(
+            f"<ansiyellow>🧠 正在后台压缩会话记忆{'（强制模式）' if force else ''}...</ansiyellow>"
+        ))
+        threading.Thread(target=run_compress_bg, daemon=True).start()
+
     elif cmd == "/exit":
         # 使用 print_formatted_text 避免 rich 在 prompt_toolkit patch_stdout 下出现 ANSI 乱码
         print_formatted_text(HTML("<ansigreen>👋 星瑶去休息啦，下次见！</ansigreen>"))
@@ -2094,6 +2132,7 @@ def _make_input_app():
         ("/undo", "撤销星瑶上一次修改的代码"),
         ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
         ("/share", "导出会话为 Markdown/HTML/JSON"),
+        ("/compress", "手动触发会话记忆压缩 (force 强制保留更少条)"),
         ("/worktree", "Git worktree 管理 (list/create/remove)"),
         ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
         ("/plugins", "查看已安装的进程内插件 (名称/来源/状态/工具)"),

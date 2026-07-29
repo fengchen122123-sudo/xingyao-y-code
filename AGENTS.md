@@ -1,6 +1,6 @@
-# Y-CODE TUI Development Guidelines
+# Y-CODE CLI Development Guidelines
 
-This file outlines the standard commands, code styles, and guidelines for developing and maintaining the Y-CODE TUI project.
+This file outlines the standard commands, code styles, and guidelines for developing and maintaining the Y-CODE CLI project.
 
 ## 🛠️ Build & Run Commands
 
