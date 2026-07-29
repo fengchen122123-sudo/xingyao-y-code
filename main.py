@@ -2370,12 +2370,15 @@ def _make_input_app():
         # 2. 计算 Token 消耗与缓存命中（分离概念）；与 worker 并发读写，必须持锁
         with token_usage_lock:
             cum_total = session_token_usage["cumulative_total"]
+            cum_prompt = session_token_usage.get("cumulative_prompt", 0)
             cum_cached = session_token_usage["cumulative_cached"]
             cum_miss = max(0, cum_total - cum_cached)
             latest_total = session_token_usage["latest_total"]
         max_win = current_ctx_win
-        
-        hit_rate = (cum_cached / cum_total * 100) if cum_total > 0 else 0
+
+        # 命中率分母用 prompt tokens（缓存只可能命中输入部分），
+        # 用 total（含输出）会把比率稀释失真
+        hit_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else 0
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
         
         def format_num(n):
