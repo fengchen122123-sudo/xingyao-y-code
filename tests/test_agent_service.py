@@ -261,3 +261,85 @@ def test_undo_last_edit_requires_force_to_delete_new_file(tmp_path):
     ok, msg = undo_last_edit(manager, session, force=True)
     assert ok is True, msg
     assert not target.exists()
+
+
+def test_compression_summary_survives_as_user_message(stub_llm, quiet_extras):
+    """压缩摘要必须以 user 角色到达模型（不被 without_system_messages 误删）。"""
+    from core.agent_service import prepare_turn_messages
+
+    manager = _make_manager()
+    session = "test_summary_reaches_model"
+    manager.add_message(session, "user", "早期问题")
+    manager.add_message(session, "assistant", "早期回答")
+    manager.add_message(session, "user", "本轮问题")
+    # 模拟压缩器写回的摘要与边界游标
+    with manager._lock:
+        manager.conn.execute(
+            "UPDATE sessions SET memory_summary = ?, summarized_until_msg_id = 0 WHERE session_name = ?",
+            ("用户之前在调试数据库连接问题。", session),
+        )
+        manager.conn.commit()
+
+    messages = prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+
+    summaries = [m for m in messages if "历史对话记忆摘要" in str(m.get("content", ""))]
+    assert len(summaries) == 1
+    assert summaries[0]["role"] == "user"
+    assert "调试数据库连接问题" in summaries[0]["content"]
+    # system 消息仍然只有稳定前缀 + 动态上下文两条
+    assert sum(1 for m in messages if m["role"] == "system") == 2
+
+
+def test_mcp_warmup_starts_background_connect_once(monkeypatch):
+    """MCP 预热：有启用的 server 时后台触发一次连接，且进程内不重复。"""
+    import time
+
+    import core.agent_service as agent_service
+
+    calls = []
+
+    class FakeManager:
+        config = {"mcpServers": {"srv": {"command": "x"}}}
+        servers = {}
+
+        def _load_config(self):
+            pass
+
+        def _ensure_connected(self):
+            calls.append(1)
+
+    monkeypatch.setattr("core.mcp_client.mcp_manager", FakeManager())
+    monkeypatch.setattr(agent_service, "_MCP_WARMUP_STARTED", False)
+
+    agent_service._warmup_mcp_schemas_once()
+    time.sleep(0.3)
+    assert calls == [1]
+
+    agent_service._warmup_mcp_schemas_once()
+    time.sleep(0.1)
+    assert calls == [1]
+
+
+def test_mcp_warmup_skips_when_no_enabled_servers(monkeypatch):
+    """MCP 预热：没有启用的 server（空配置或全部 disabled）时不触发连接。"""
+    import core.agent_service as agent_service
+
+    calls = []
+
+    class FakeManager:
+        config = {"mcpServers": {"srv": {"command": "x", "enabled": False}}}
+        servers = {}
+
+        def _load_config(self):
+            pass
+
+        def _ensure_connected(self):
+            calls.append(1)
+
+    monkeypatch.setattr("core.mcp_client.mcp_manager", FakeManager())
+    monkeypatch.setattr(agent_service, "_MCP_WARMUP_STARTED", False)
+
+    agent_service._warmup_mcp_schemas_once()
+    assert calls == []
