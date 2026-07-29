@@ -147,3 +147,87 @@ def test_import_sibling_missing_module_raises(plugin_env):
 
     with pytest.raises(ImportError):
         plugin_loader.import_sibling(str(plugin_dir / "plugin.py"), "nope")
+
+
+# ── get_plugin_infos：/plugins 命令的数据来源 ──────────────────────
+
+def test_plugin_infos_record_loaded_plugin_with_tools(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    assert len(infos) == 1
+    info = infos[0]
+    assert info["name"] == "demo"
+    assert info["version"] == "1.0.0"
+    assert info["source"] == "user"
+    assert info["status"] == "loaded"
+    assert info["tools"] == ["demo_tool"]
+    assert info["path"].endswith("demo")
+
+
+def test_plugin_infos_record_builtin_source(plugin_env):
+    _, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    assert [i["source"] for i in infos] == ["builtin"]
+
+
+def test_plugin_infos_record_disabled(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
+
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    assert len(infos) == 1
+    assert infos[0]["status"] == "disabled"
+    assert infos[0]["tools"] == []
+
+
+def test_plugin_infos_record_failed_with_error(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "broken", "broken", _BROKEN_PLUGIN)
+
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    assert len(infos) == 1
+    assert infos[0]["status"] == "failed"
+    assert "插件加载即崩溃" in infos[0]["error"]
+
+
+def test_plugin_infos_record_overridden_builtin(plugin_env):
+    user_dir, builtin_dir = plugin_env
+    _make_plugin(user_dir / "same", "same", _GOOD_PLUGIN)
+    _make_plugin(builtin_dir / "same", "same", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    assert len(infos) == 2
+    by_source = {i["source"]: i for i in infos}
+    assert by_source["user"]["status"] == "loaded"
+    assert by_source["builtin"]["status"] == "overridden"
+
+
+def test_get_plugin_infos_returns_copies(plugin_env):
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    infos[0]["name"] = "tampered"
+    assert plugin_loader.get_plugin_infos()[0]["name"] == "demo"

@@ -33,6 +33,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 ```
 
 - 加载器：`core/plugin_loader.py`，由 `core/tool_registry.py:build_default_registry()` 末尾自动调用。
+- 插件扫描结果（含禁用/失败/被覆盖）由 `plugin_loader.get_plugin_infos()` 提供，TUI 内用 `/plugins` 命令查看。
 - 单插件异常只记录日志并跳过，绝不影响 ycode 启动。
 - 插件内兄弟模块用 `from core.plugin_loader import import_sibling; m = import_sibling(__file__, "module")` 加载。
 - 插件工具通过 `ToolSpec` 元数据自动获得权限拦截、schema 参数过滤与结果截断。
