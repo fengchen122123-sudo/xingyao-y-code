@@ -1756,7 +1756,7 @@ def handle_slash_command(command_text):
                     print_formatted_text(HTML(f"<ansiyellow>ℹ 检查点 {_esc(target_turn_id)} 没有文件修改记录（该轮没有写/编辑操作）。</ansiyellow>"))
                 else:
                     print_formatted_text(HTML(f"<ansicyan>🔄 正在回滚检查点 {_esc(target_turn_id)}，共 {len(snapshots)} 个文件...</ansicyan>"))
-                    from core.tools import write_file
+                    from core.tools import write_file, sandbox_bypass
                     success = 0
                     failed = 0
                     for snap in snapshots:
@@ -1769,7 +1769,10 @@ def handle_slash_command(command_text):
                                     os.remove(file_path)
                                 print_formatted_text(HTML(f"  <ansigreen>✔ 删除新建文件: {_esc(file_path)}</ansigreen>"))
                             else:
-                                write_file(file_path, old_content)
+                                # 回滚是用户显式发起的恢复操作：沙盒外路径也直接放行，
+                                # 避免之前单次批准写出的沙盒外文件无法回滚
+                                with sandbox_bypass():
+                                    write_file(file_path, old_content)
                                 print_formatted_text(HTML(f"  <ansigreen>✔ 恢复文件: {_esc(file_path)}</ansigreen>"))
                             success += 1
                         except Exception as e:
@@ -2042,6 +2045,12 @@ def handle_slash_command(command_text):
                     elif status == "overridden":
                         check = "<ansigray>[ ]</ansigray>"
                         state = "<ansigray>被同名用户级插件覆盖</ansigray>"
+                    elif status == "pending_enable":
+                        check = "<ansiyellow>[~]</ansiyellow>"
+                        state = "<ansiyellow>已启用（重启后加载）</ansiyellow>"
+                    elif status == "pending_disable":
+                        check = "<ansiyellow>[~]</ansiyellow>"
+                        state = "<ansiyellow>已禁用（重启后卸载）</ansiyellow>"
                     else:
                         check = "<ansired>[x]</ansired>"
                         state = "<ansired>加载失败</ansired>"

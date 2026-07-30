@@ -98,7 +98,7 @@ class PermissionSystemError(Exception):
     pass
 
 # 🌟 注意这里：我们把四个工具全都引进来了！
-from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace, set_session_sandbox_bypass
+from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace
 from core.mcp_client import mcp_manager
 from core.permission_broker import CANCELLED_RESULT, permission_broker
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
@@ -280,8 +280,13 @@ def ask_in_raw_terminal(function_name, arguments):
     
     # 纯文本 input 模式，不含任何 ANSI 序列
     try:
-        print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前会话放行)")
-        res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
+        if function_name == "sandbox_outside_access":
+            # 沙盒外路径访问必须每次确认，不提供 always 会话放行
+            print("请输入 [y]es 同意本次, [n]o 拒绝 (沙盒外访问每次都需要确认)")
+            res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
+        else:
+            print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前会话放行)")
+            res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
         
         if res in ("n", "no"):
             return False
@@ -308,6 +313,9 @@ def ask_in_raw_terminal(function_name, arguments):
                     with _session_whitelist_lock:
                         session_allowed_edit_files.add(file_path)
                     print(f"[当前会话已放行修改]：{file_path}")
+            elif function_name == "sandbox_outside_access":
+                # 沙盒外访问不支持会话放行，always 仅本次通过
+                print("[沙盒外访问每次都需要确认，仅本次通过]")
             return True
             
         return res in ("", "y", "yes")
@@ -381,7 +389,12 @@ def check_permission_and_ask(
         return True
 
     # 3. 如果是计划模式且本轮对话的计划已经获得批准，直接通过
-    if app_context.get_permission_mode() == "plan" and app_context.get_plan_approved():
+    #    但 sandbox_outside_access 不受计划批准自动放行，必须每次询问用户。
+    if (
+        app_context.get_permission_mode() == "plan"
+        and app_context.get_plan_approved()
+        and function_name != "sandbox_outside_access"
+    ):
         if event_callback is not None:
             _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
@@ -408,12 +421,20 @@ def check_permission_and_ask(
     # owner/turn_id 统一来源：优先显式传入，turn 兜底 owner，线程名最后兜底
     owner_id = str(permission_owner or parent_turn_id or threading.current_thread().name)
     turn_id = str(parent_turn_id or owner_id)
+    # 沙盒外路径访问必须每次确认，不提供“始终放行”选项
+    _options = None
+    if function_name == "sandbox_outside_access":
+        _options = (
+            "Yes, 同意本次操作 (y)",
+            "No, 拒绝本次操作 (n)",
+        )
     request = permission_broker.enqueue(
         function_name,
         arguments,
         owner_id,
         turn_id,
         permission_source,
+        options=_options,
     )
 
     try:
@@ -505,10 +526,8 @@ def check_permission_and_ask(
                         session_allowed_edit_files.add(file_path)
                     if event_callback is None:
                         safe_print(ANSI(f"   ✨ [当前会话已放行修改]：{file_path}"))
-            elif function_name == "sandbox_outside_access":
-                set_session_sandbox_bypass(True)
-                if event_callback is None:
-                    safe_print(ANSI("   ✨ [当前会话已放行沙盒外访问]"))
+            # sandbox_outside_access 不提供“始终放行”选项（见 enqueue 处），
+            # 沙盒外路径每次访问都必须逐次确认。
             return True
 
         approved = (choice_idx in (0, 2))
@@ -1355,7 +1374,6 @@ def _get_imom_active_publish_root():
         store_file = os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json")
         with open(store_file, "r", encoding="utf-8") as f:
             data = json.load(f)
-            data = json.load(f)
         active = data.get("active")
         projects = data.get("projects", {})
         if active and active in projects:
@@ -1413,7 +1431,7 @@ def _sandbox_outside_guard(
         return sandbox_bypass(), None
     if cancel_event is not None and cancel_event.is_set():
         return None, PERMISSION_CANCELLED_MESSAGE
-    return None, "🚨 用户拒绝了访问沙盒外路径的请求（可提示用户使用 /sandbox on 长期开放）。"
+    return None, "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径每次访问都需要用户确认。"
 
 
 def _execute_single_tool_call(
@@ -1571,7 +1589,15 @@ def _execute_single_tool_call(
         requires_permission = tool_registry.get(function_name).requires_permission
     except KeyError:
         requires_permission = function_name in ("write_file", "edit_file", "execute_command")
-    if requires_permission:
+    # 沙盒外的 write_file/edit_file 由 _sandbox_outside_guard 单独询问（文案含路径），
+    # 跳过此处的通用确认，避免同一操作被连续询问两次
+    _defer_to_sandbox_guard = False
+    if requires_permission and function_name in ("write_file", "edit_file"):
+        try:
+            _defer_to_sandbox_guard = is_outside_workspace(arguments.get("file_path", ""))
+        except Exception:
+            _defer_to_sandbox_guard = False
+    if requires_permission and not _defer_to_sandbox_guard:
         try:
             approved = check_permission_and_ask(
                 function_name,
@@ -1801,7 +1827,7 @@ def _execute_single_tool_call(
             "plan_read",
             "plan_retry",
         }:
-            # 只读目录类工具在沙盒外访问时需用户确认（同意本次/始终放行会话）
+            # 只读目录类工具在沙盒外访问时需用户逐次确认（沙盒外访问不提供会话放行）
             bypass_cm, sandbox_err = None, None
             if function_name in ("list_directory", "search_code", "find_definition", "glob_files"):
                 bypass_cm, sandbox_err = _sandbox_outside_guard(
@@ -1851,6 +1877,22 @@ def _execute_single_tool_call(
                     "content": result,
                 }
 
+            # 文件不存在时直接报错（edit_file 只能修改已有文件），
+            # 避免对不存在的沙盒外路径做无意义的权限询问
+            if not os.path.isfile(file_path or ""):
+                # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
+                # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
+                result = (
+                    f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
+                    "edit_file 只能修改已有文件；创建新文件请改用 write_file。"
+                )
+                return {
+                    "role": "tool",
+                    "tool_call_id": tc["id"],
+                    "name": function_name,
+                    "content": result,
+                }
+
             # 沙盒外修改必须每次询问用户（即使 full 模式）
             _bypass_cm, _sandbox_err = _sandbox_outside_guard(
                 function_name, file_path, event_callback,
@@ -1861,19 +1903,6 @@ def _execute_single_tool_call(
             else:
                 _edit_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
                 with _edit_cm:
-                    if not os.path.isfile(file_path or ""):
-                        # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
-                        # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
-                        result = (
-                            f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
-                            "edit_file 只能修改已有文件；创建新文件请改用 write_file。"
-                        )
-                        return {
-                            "role": "tool",
-                            "tool_call_id": tc["id"],
-                            "name": function_name,
-                            "content": result,
-                        }
                     try:
                         old_content = _read_text_with_encoding_fallback(file_path)
                     except OSError as read_err:
@@ -1915,7 +1944,12 @@ def _execute_single_tool_call(
                 # 插件工具（如 imom_locator）访问工作目录外文件，必须每次询问用户
                 _plugin_guard_path = None
                 if function_name == "imom_register_project":
-                    _plugin_guard_path = arguments.get("hint_path", "")
+                    # hint_path 缺省时兜底 publish_root，避免守卫被静默跳过
+                    _plugin_guard_path = (
+                        arguments.get("hint_path")
+                        or arguments.get("publish_root")
+                        or ""
+                    )
                 elif function_name.startswith("imom_"):
                     # 其他 imom 工具：取当前活跃项目的 publish_root 作为守卫路径
                     try:
