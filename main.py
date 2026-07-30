@@ -1282,6 +1282,8 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan>            : 禁用指定短 ID 对应的技能"))
         print_formatted_text(HTML("  <ansicyan>/&lt;短ID&gt; [提问内容]</ansicyan>                   : <b>主动且强制调用指定技能</b>让星瑶为您执行任务"))
         print_formatted_text(HTML("  <ansicyan>/plugins</ansicyan>                             : 查看已安装的进程内插件 (名称/版本/来源/加载状态/提供的工具)"))
+        print_formatted_text(HTML("  <ansicyan>/plugins enable|disable &lt;name&gt;</ansicyan>        : 启用/禁用指定插件 (写回 plugin.json，重启后生效)"))
+        print_formatted_text(HTML("  <ansicyan>/plugins reload</ansicyan>                       : 重新扫描插件目录刷新清单 (不重启)"))
         print_formatted_text(HTML("  <ansicyan>/mcp</ansicyan>                                 : MCP 服务管理 (open/status/tools/enable/disable/reconnect/edit)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【4. 任务托管与后台进程】</ansiyellow></b>"))
@@ -1979,48 +1981,91 @@ def handle_slash_command(command_text):
                 "<ansired>⚠️ 未知子命令。用法: /mcp [open|status|tools|reconnect|enable &lt;name&gt;|disable &lt;name&gt;|edit]</ansired>"
             ))
 
-    elif cmd == "/plugins":
-        # 进程内插件清单：数据来自启动时 plugin_loader 的扫描记录
+    elif cmd == "/plugins" or cmd.startswith("/plugins "):
+        # 进程内插件清单与开关管理
+        # 用法: /plugins                -> 查看清单
+        #       /plugins enable <name>  -> 启用某插件
+        #       /plugins disable <name> -> 禁用某插件
+        #       /plugins reload         -> 重新扫描插件目录刷新清单
         from core import plugin_loader
-        infos = plugin_loader.get_plugin_infos()
-        if not infos:
-            print_formatted_text(HTML("<ansiyellow>ℹ 未发现任何插件。</ansiyellow>"))
-            print_formatted_text(HTML(
-                "<ansigray>  插件目录: 用户级 ~/.ycode/plugins/ 、内置 plugins/ ；每个插件一个目录，内含 plugin.json。</ansigray>"
-            ))
-        else:
-            print_formatted_text(HTML(f"<ansicyan>🧩 已发现 {len(infos)} 个插件:</ansicyan>"))
-            for info in infos:
-                status = info.get("status")
-                if status == "loaded":
-                    check = "<ansigreen>[✓]</ansigreen>"
-                    state = "<ansigreen>已加载</ansigreen>"
-                elif status == "disabled":
-                    check = "<ansigray>[ ]</ansigray>"
-                    state = "<ansigray>已禁用</ansigray>"
-                elif status == "overridden":
-                    check = "<ansigray>[ ]</ansigray>"
-                    state = "<ansigray>被同名用户级插件覆盖</ansigray>"
+        sub_parts = command_text.strip().split(maxsplit=2)
+        sub = sub_parts[1].strip() if len(sub_parts) > 1 else ""
+
+        if sub == "enable":
+            target = sub_parts[2].strip() if len(sub_parts) > 2 else ""
+            if not target:
+                print_formatted_text(HTML("<ansired>⚠️ 用法: /plugins enable &lt;插件名&gt;</ansired>"))
+            else:
+                ok, msg = plugin_loader.toggle_plugin(target, True)
+                if ok:
+                    print_formatted_text(HTML(f"<ansigreen>✔ {_esc(msg)}</ansigreen>"))
                 else:
-                    check = "<ansired>[x]</ansired>"
-                    state = "<ansired>加载失败</ansired>"
-                source = "用户级" if info.get("source") == "user" else "内置"
-                tools = info.get("tools") or []
-                tool_part = f"  <ansigray>工具数: {len(tools)}</ansigray>" if status == "loaded" else ""
+                    print_formatted_text(HTML(f"<ansired>⚠️ {_esc(msg)}</ansired>"))
+
+        elif sub == "disable":
+            target = sub_parts[2].strip() if len(sub_parts) > 2 else ""
+            if not target:
+                print_formatted_text(HTML("<ansired>⚠️ 用法: /plugins disable &lt;插件名&gt;</ansired>"))
+            else:
+                ok, msg = plugin_loader.toggle_plugin(target, False)
+                if ok:
+                    print_formatted_text(HTML(f"<ansigreen>✔ {_esc(msg)}</ansigreen>"))
+                else:
+                    print_formatted_text(HTML(f"<ansired>⚠️ {_esc(msg)}</ansired>"))
+
+        elif sub == "reload":
+            print_formatted_text(HTML("<ansiyellow>🔄 正在重新扫描插件目录...</ansiyellow>"))
+            from core.tool_registry import ToolRegistry
+            registry = ToolRegistry()
+            plugin_loader.load_and_register(registry)
+            print_formatted_text(HTML("<ansigreen>✔ 插件清单已刷新。</ansigreen>"))
+            print_formatted_text(HTML("<ansigray>  注意：工具注册需重启后才会生效，reload 仅刷新列表显示。</ansigray>"))
+
+        elif sub == "":
+            infos = plugin_loader.get_plugin_infos()
+            if not infos:
+                print_formatted_text(HTML("<ansiyellow>ℹ 未发现任何插件。</ansiyellow>"))
                 print_formatted_text(HTML(
-                    f"  {check} <b><ansicyan>{_esc(info['name'])}</ansicyan></b> <ansigray>v{_esc(str(info.get('version') or '?'))}</ansigray>  {source} · {state}{tool_part}"
+                    "<ansigray>  插件目录: 用户级 ~/.ycode/plugins/ 、内置 plugins/ ；每个插件一个目录，内含 plugin.json。</ansigray>"
                 ))
-                desc = info.get("description")
-                if desc:
-                    print_formatted_text(HTML(f"      <ansigray>{_esc(desc)}</ansigray>"))
-                if status == "failed" and info.get("error"):
-                    print_formatted_text(HTML(f"      <ansired>错误: {_esc(info['error'])}</ansired>"))
-                if tools:
-                    print_formatted_text(HTML(f"      <ansigray>工具: {_esc(', '.join(tools))}</ansigray>"))
-                print_formatted_text(HTML(f"      <ansigray>路径: {_esc(info.get('path', ''))}</ansigray>"))
+            else:
+                print_formatted_text(HTML(f"<ansicyan>🧩 已发现 {len(infos)} 个插件:</ansicyan>"))
+                for info in infos:
+                    status = info.get("status")
+                    if status == "loaded":
+                        check = "<ansigreen>[✓]</ansigreen>"
+                        state = "<ansigreen>已加载</ansigreen>"
+                    elif status == "disabled":
+                        check = "<ansigray>[ ]</ansigray>"
+                        state = "<ansigray>已禁用</ansigray>"
+                    elif status == "overridden":
+                        check = "<ansigray>[ ]</ansigray>"
+                        state = "<ansigray>被同名用户级插件覆盖</ansigray>"
+                    else:
+                        check = "<ansired>[x]</ansired>"
+                        state = "<ansired>加载失败</ansired>"
+                    source = "用户级" if info.get("source") == "user" else "内置"
+                    tools = info.get("tools") or []
+                    tool_part = f"  <ansigray>工具数: {len(tools)}</ansigray>" if status == "loaded" else ""
+                    print_formatted_text(HTML(
+                        f"  {check} <b><ansicyan>{_esc(info['name'])}</ansicyan></b> <ansigray>v{_esc(str(info.get('version') or '?'))}</ansigray>  {source} · {state}{tool_part}"
+                    ))
+                    desc = info.get("description")
+                    if desc:
+                        print_formatted_text(HTML(f"      <ansigray>{_esc(desc)}</ansigray>"))
+                    if status == "failed" and info.get("error"):
+                        print_formatted_text(HTML(f"      <ansired>错误: {_esc(info['error'])}</ansired>"))
+                    if tools:
+                        print_formatted_text(HTML(f"      <ansigray>工具: {_esc(', '.join(tools))}</ansigray>"))
+                    print_formatted_text(HTML(f"      <ansigray>路径: {_esc(info.get('path', ''))}</ansigray>"))
+                print_formatted_text(HTML(
+                    "<ansigray>  使用 /plugins enable|disable &lt;插件名&gt; 切换开关（重启后生效），/plugins reload 刷新清单。</ansigray>"
+                ))
+        else:
             print_formatted_text(HTML(
-                "<ansigray>  将插件目录内 plugin.json 的 enabled 改为 false 可禁用（重启后生效）；用户级同名插件覆盖内置。</ansigray>"
+                "<ansired>⚠️ 未知子命令。用法: /plugins [enable &lt;name&gt;|disable &lt;name&gt;|reload]</ansired>"
             ))
+
 
     elif cmd == "/clear":
         # 清屏后屏幕上没有内容，下一轮提问前不打印轮次分隔线
@@ -2096,7 +2141,7 @@ def _make_input_app():
         ("/share", "导出会话为 Markdown/HTML/JSON"),
         ("/worktree", "Git worktree 管理 (list/create/remove)"),
         ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
-        ("/plugins", "查看已安装的进程内插件 (名称/来源/状态/工具)"),
+        ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
         ("/skills", "查看或安装/开启/禁用技能插件"),
         ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
         ("/permission", "切换安全权限级别 (confirm/plan/full)"),
@@ -3316,8 +3361,29 @@ def run_cli():
                 # pre_run：App 重启间隙（如 /models 触发的退出与重建之间）
                 # schedule_ui 静默丢弃的积压事件，在新 App 启动时立即补渲染
                 app_instance.run(pre_run=drain_ui_events)
-            except (KeyboardInterrupt, EOFError):
+            except EOFError:
+                # Ctrl+D：退出系统
                 pass
+            except KeyboardInterrupt:
+                # Ctrl+C：业务执行中→终止任务并回到输入循环；闲置→也回到输入循环
+                # （不退出系统；退出请用 Ctrl+D）
+                if is_thinking or active_cancel_event is not None:
+                    _cancel_active_turn()
+                    # 清空排队消息，避免取消后旧任务继续执行
+                    try:
+                        while True:
+                            msg_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                    print_formatted_text(HTML(
+                        "\n<ansired>🛑 收到中断信号，已终止星瑶的执行。</ansired>\n"
+                    ))
+                else:
+                    print_formatted_text(HTML(
+                        "\n<ansigray>（Ctrl+C 清空输入；退出请按 Ctrl+D）</ansigray>\n"
+                    ))
+                _reset_turn_state()
+                pending_action = "resume_input"  # 标记：重启输入循环，不退出
 
         if pending_action == "open_models":
             # 在主线程安全地开启全屏选择器
@@ -3434,7 +3500,12 @@ def run_cli():
                 
             pending_action = None
             continue
-            
+
+        elif pending_action == "resume_input":
+            # Ctrl+C 中断后回到输入循环：不退出系统，重建输入 App
+            pending_action = None
+            continue
+
         else:
             # 正常退出（Ctrl+D 或其他原因）
             try:
