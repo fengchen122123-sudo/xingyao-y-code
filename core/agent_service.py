@@ -341,7 +341,7 @@ def undo_last_edit(manager, session_name: str, force: bool = False) -> tuple[boo
       - 删除"星瑶新建文件"属于高危操作，未传 force=True 时会拒绝并给出提示
     """
     from core.memory import get_undo_state, set_undo_state
-    from core.tools import write_file, _resolve_workspace_path, _atomic_write_edit_file
+    from core.tools import write_file, _resolve_workspace_path, _atomic_write_edit_file, sandbox_bypass
 
     state = get_undo_state(session_name)
     file_path = state.get("file_path")
@@ -364,15 +364,18 @@ def undo_last_edit(manager, session_name: str, force: bool = False) -> tuple[boo
                 os.remove(file_path)
             message = f"撤销成功！已删除星瑶新建的文件: {file_path}"
         else:
-            result = write_file(file_path, old_content)
-            if isinstance(result, str) and result.startswith("🚨"):
-                # write_file 的大文件覆盖保护会拒绝恢复超过 500 行/50KB 的已有文件，
-                # 但撤销本来就是刻意的整文件回滚：绕过该保护改走原子直写，
-                # 仍通过 _resolve_workspace_path 保留工作区沙箱校验。
-                resolved = _resolve_workspace_path(file_path)
-                write_err = _atomic_write_edit_file(resolved, "utf-8", old_content)
-                if write_err:
-                    return False, f"撤销失败：{write_err}"
+            # 撤销是用户显式发起的恢复操作：沙盒外路径也直接放行，
+            # 避免之前单次批准写出的沙盒外文件无法撤销
+            with sandbox_bypass():
+                result = write_file(file_path, old_content)
+                if isinstance(result, str) and result.startswith("🚨"):
+                    # write_file 的大文件覆盖保护会拒绝恢复超过 500 行/50KB 的已有文件，
+                    # 但撤销本来就是刻意的整文件回滚：绕过该保护改走原子直写，
+                    # 仍通过 _resolve_workspace_path 保留工作区沙箱校验。
+                    resolved = _resolve_workspace_path(file_path)
+                    write_err = _atomic_write_edit_file(resolved, "utf-8", old_content)
+                    if write_err:
+                        return False, f"撤销失败：{write_err}"
             message = f"撤销成功！已将 {file_path} 恢复到上一个版本。"
 
         # 清理大模型的错误记忆，防止幻觉

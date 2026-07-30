@@ -160,46 +160,6 @@ def _outside_workspace_allowed():
         return False
 
 
-# ── 信任目录（trusted roots）─────────────────────────────────────
-# 插件注册的工作目录外可信根目录。命中信任目录的
-# 读取/搜索操作不再被沙盒拦截；写操作权限流程不受影响。
-_trusted_roots: set = set()
-_trusted_roots_lock = threading.Lock()
-
-
-def register_trusted_root(path_value):
-    """把一个目录登记为本会话的信任根目录（工作目录外访问不再被沙盒拦截）。"""
-    try:
-        resolved = Path(str(path_value or "")).expanduser().resolve()
-    except Exception:
-        return
-    with _trusted_roots_lock:
-        _trusted_roots.add(str(resolved))
-
-
-def unregister_trusted_root(path_value):
-    try:
-        resolved = Path(str(path_value or "")).expanduser().resolve()
-    except Exception:
-        return
-    with _trusted_roots_lock:
-        _trusted_roots.discard(str(resolved))
-
-
-def _is_trusted_path(candidate):
-    """判断已 resolve 的路径是否位于任一信任根目录之下。"""
-    with _trusted_roots_lock:
-        roots = list(_trusted_roots)
-    for root in roots:
-        try:
-            root_path = Path(root)
-            if candidate == root_path or root_path in candidate.parents:
-                return True
-        except Exception:
-            continue
-    return False
-
-
 def _resolve_workspace_path(file_path):
     """将路径解析为绝对路径；默认强制限定在当前工作目录内，越界直接拒绝。
 
@@ -208,7 +168,7 @@ def _resolve_workspace_path(file_path):
     candidate = Path(str(file_path or "")).expanduser().resolve()
     if _outside_workspace_allowed():
         return candidate
-    # 信任目录不再绕过路径限制：沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
+    # 沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
     # 用户批准后通过 sandbox_bypass() 设置线程级放行，_outside_workspace_allowed() 即返回 True。
     workspace = Path.cwd().resolve()
     if candidate != workspace and workspace not in candidate.parents:
