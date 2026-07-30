@@ -366,7 +366,9 @@ def check_permission_and_ask(
             return True
 
     # 2. 如果权限是完全放行，直接通过
-    if app_context.get_permission_mode() == "full":
+    #    但 sandbox_outside_access（沙盒外路径访问）不受 full 模式自动放行，
+    #    必须每次询问用户，确保沙盒外操作始终受控。
+    if app_context.get_permission_mode() == "full" and function_name != "sandbox_outside_access":
         if event_callback is not None:
             _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
@@ -1346,6 +1348,25 @@ def _show_file_diff(file_path, old_content, new_content, event_callback, panel_t
         logger.warning("渲染文件 diff 失败 (%s): %s", file_path, diff_err)
 
 
+
+def _get_imom_active_publish_root():
+    """读取 imom_locator 插件的当前活跃项目 publish_root，用于沙盒守卫。"""
+    try:
+        store_file = os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json")
+        with open(store_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            data = json.load(f)
+        active = data.get("active")
+        projects = data.get("projects", {})
+        if active and active in projects:
+            return projects[active].get("publish_root", "")
+        if len(projects) == 1:
+            return next(iter(projects.values())).get("publish_root", "")
+    except Exception:
+        pass
+    return ""
+
+
 def _sandbox_outside_guard(
     function_name,
     path_value,
@@ -1355,10 +1376,10 @@ def _sandbox_outside_guard(
     permission_source,
     cancel_event,
 ):
-    """沙盒开启时访问工作目录外路径：先询问用户，同意则放行本次。
+    """沙盒外路径访问守卫：无论何种权限模式，每次访问工作目录外路径都必须询问用户。
 
     返回 (bypass_cm, error)：
-    - (None, None)：在沙盒内或已全局/会话放行，无需特殊处理
+    - (None, None)：在沙盒内，无需特殊处理
     - (cm, None)：用户同意本次，调用方需在 cm 上下文中执行工具
     - (None, err)：用户拒绝/取消，err 为工具结果文案
     """
@@ -1371,7 +1392,9 @@ def _sandbox_outside_guard(
     if not outside:
         return None, None
     from core import tools as _tools
-    if _tools._outside_workspace_allowed():
+    # 仅线程内单次放行（已批准的嵌套操作不重复询问）；
+    # 会话级放行（/sandbox on、"始终放行"）不再跳过询问。
+    if getattr(_tools._sandbox_tls, "depth", 0) > 0:
         return None, None
 
     try:
@@ -1590,33 +1613,41 @@ def _execute_single_tool_call(
         elif function_name == "write_file":
             file_path = arguments.get("file_path", "")
             new_content = arguments.get("content", "")
-            # 写入权限已在上方统一确认（确认文案含文件路径），用户批准即视为允许该次沙盒外写入
-            with sandbox_bypass():
-                old_content = ""
-                if os.path.exists(file_path):
-                    try:
-                        old_content = _read_text_with_encoding_fallback(file_path)
-                    except OSError as read_err:
-                        logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
-                        old_content = ""
-                write_result = write_file(file_path, new_content)
-            if isinstance(write_result, str) and write_result.startswith("🚨"):
-                # 大文件覆盖保护等场景：write_file 拒绝写入，不应展示虚假 diff，也不记录 undo
-                result = write_result
+            # 沙盒外写入必须每次询问用户（即使 full 模式）
+            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
+                function_name, file_path, event_callback,
+                permission_owner, parent_turn_id, permission_source, cancel_event,
+            )
+            if _sandbox_err:
+                result = _sandbox_err
             else:
-                # 写入成功后再记录 undo 快照，避免未发生的修改污染撤销历史
-                from core.memory import set_undo_state
-                set_undo_state(file_path, old_content)
-                # 生成 diff 并展示
-                _show_file_diff(
-                    file_path,
-                    old_content,
-                    new_content,
-                    event_callback,
-                    panel_title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
-                    truncated_note="已成功写入文件",
-                )
-                result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
+                _write_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
+                with _write_cm:
+                    old_content = ""
+                    if os.path.exists(file_path):
+                        try:
+                            old_content = _read_text_with_encoding_fallback(file_path)
+                        except OSError as read_err:
+                            logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
+                            old_content = ""
+                    write_result = write_file(file_path, new_content)
+                if isinstance(write_result, str) and write_result.startswith("🚨"):
+                    # 大文件覆盖保护等场景：write_file 拒绝写入，不应展示虚假 diff，也不记录 undo
+                    result = write_result
+                else:
+                    # 写入成功后再记录 undo 快照，避免未发生的修改污染撤销历史
+                    from core.memory import set_undo_state
+                    set_undo_state(file_path, old_content)
+                    # 生成 diff 并展示
+                    _show_file_diff(
+                        file_path,
+                        old_content,
+                        new_content,
+                        event_callback,
+                        panel_title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
+                        truncated_note="已成功写入文件",
+                    )
+                    result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
         elif function_name == "run_subagent":
             if not allow_subagents:
                 result = f"{TOOL_ERROR_PREFIX} 子代理不能启动其他子代理。"
@@ -1820,53 +1851,91 @@ def _execute_single_tool_call(
                     "content": result,
                 }
 
-            # 修改权限已在上方统一确认（确认文案含文件路径），用户批准即视为允许该次沙盒外修改
-            with sandbox_bypass():
-                if not os.path.isfile(file_path or ""):
-                    # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
-                    # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
-                    result = (
-                        f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
-                        "edit_file 只能修改已有文件；创建新文件请改用 write_file。"
-                    )
-                    return {
-                        "role": "tool",
-                        "tool_call_id": tc["id"],
-                        "name": function_name,
-                        "content": result,
-                    }
-                try:
-                    old_content = _read_text_with_encoding_fallback(file_path)
-                except OSError as read_err:
-                    logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
-                    old_content = ""
-                # 不再做精确子串预检查：edit_file 内部 _fuzzy_replace 已实现
-                # 精确匹配、空白容错和 difflib 模糊匹配（相似度 >= 0.90），
-                # 预检查过严会导致仅有轻微空白差异的合法编辑被误拦截。
-                result = edit_file(
-                    file_path,
-                    target,
-                    repl,
-                    replace_all=bool(arguments.get("replace_all", False)),
-                    start_line=arguments.get("start_line"),
-                    end_line=arguments.get("end_line"),
-                )
-                if not result.startswith(TOOL_ERROR_PREFIX):
+            # 沙盒外修改必须每次询问用户（即使 full 模式）
+            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
+                function_name, file_path, event_callback,
+                permission_owner, parent_turn_id, permission_source, cancel_event,
+            )
+            if _sandbox_err:
+                result = _sandbox_err
+            else:
+                _edit_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
+                with _edit_cm:
+                    if not os.path.isfile(file_path or ""):
+                        # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
+                        # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
+                        result = (
+                            f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
+                            "edit_file 只能修改已有文件；创建新文件请改用 write_file。"
+                        )
+                        return {
+                            "role": "tool",
+                            "tool_call_id": tc["id"],
+                            "name": function_name,
+                            "content": result,
+                        }
                     try:
-                        new_content = _read_text_with_encoding_fallback(file_path)
+                        old_content = _read_text_with_encoding_fallback(file_path)
                     except OSError as read_err:
-                        logger.warning("读取新文件内容失败 (%s): %s", file_path, read_err)
-                        new_content = ""
-                    _show_file_diff(
+                        logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
+                        old_content = ""
+                    # 不再做精确子串预检查：edit_file 内部 _fuzzy_replace 已实现
+                    # 精确匹配、空白容错和 difflib 模糊匹配（相似度 >= 0.90），
+                    # 预检查过严会导致仅有轻微空白差异的合法编辑被误拦截。
+                    result = edit_file(
                         file_path,
-                        old_content,
-                        new_content,
-                        event_callback,
-                        panel_title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
-                        truncated_note="已局部替换并修改成功",
+                        target,
+                        repl,
+                        replace_all=bool(arguments.get("replace_all", False)),
+                        start_line=arguments.get("start_line"),
+                        end_line=arguments.get("end_line"),
                     )
+                    if not result.startswith(TOOL_ERROR_PREFIX):
+                        try:
+                            new_content = _read_text_with_encoding_fallback(file_path)
+                        except OSError as read_err:
+                            logger.warning("读取新文件内容失败 (%s): %s", file_path, read_err)
+                            new_content = ""
+                        _show_file_diff(
+                            file_path,
+                            old_content,
+                            new_content,
+                            event_callback,
+                            panel_title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
+                            truncated_note="已局部替换并修改成功",
+                        )
         else:
-            if any(s["function"]["name"] == function_name for s in mcp_manager.get_schemas()):
+            # 通用兜底：优先查进程内工具注册表（含 imom_locator 等插件工具），
+            # 再降级到 MCP 工具，最后才报"未找到"。
+            try:
+                _spec = tool_registry.get(function_name)
+            except KeyError:
+                _spec = None
+            if _spec is not None:
+                # 插件工具（如 imom_locator）访问工作目录外文件，必须每次询问用户
+                _plugin_guard_path = None
+                if function_name == "imom_register_project":
+                    _plugin_guard_path = arguments.get("hint_path", "")
+                elif function_name.startswith("imom_"):
+                    # 其他 imom 工具：取当前活跃项目的 publish_root 作为守卫路径
+                    try:
+                        _plugin_guard_path = _get_imom_active_publish_root()
+                    except Exception:
+                        _plugin_guard_path = None
+                if _plugin_guard_path:
+                    _p_bypass, _p_err = _sandbox_outside_guard(
+                        function_name, _plugin_guard_path, event_callback,
+                        permission_owner, parent_turn_id, permission_source, cancel_event,
+                    )
+                    if _p_err:
+                        result = _p_err
+                    else:
+                        _p_cm = _p_bypass if _p_bypass else sandbox_bypass()
+                        with _p_cm:
+                            result = tool_registry.execute(function_name, **arguments).to_message_content()
+                else:
+                    result = tool_registry.execute(function_name, **arguments).to_message_content()
+            elif any(s["function"]["name"] == function_name for s in mcp_manager.get_schemas()):
                 result = mcp_manager.call_tool_sync(function_name, arguments)
             else:
                 result = f"{TOOL_ERROR_PREFIX} 未找到名为 {function_name} 的工具！"
