@@ -208,8 +208,8 @@ def _resolve_workspace_path(file_path):
     candidate = Path(str(file_path or "")).expanduser().resolve()
     if _outside_workspace_allowed():
         return candidate
-    if _is_trusted_path(candidate):
-        return candidate
+    # 信任目录不再绕过路径限制：沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
+    # 用户批准后通过 sandbox_bypass() 设置线程级放行，_outside_workspace_allowed() 即返回 True。
     workspace = Path.cwd().resolve()
     if candidate != workspace and workspace not in candidate.parents:
         raise ValueError(

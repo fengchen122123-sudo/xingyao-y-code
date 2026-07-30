@@ -55,6 +55,58 @@ def _user_plugin_dir() -> Path:
         return Path.home() / ".ycode" / "plugins"
 
 
+def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
+    """切换插件开关：写回其 plugin.json 的 enabled 字段，并同步刷新内存状态。
+
+    返回 (ok, msg)。注意：实际加载/卸载需重启后生效（插件工具在启动时一次性注册），
+    本函数只负责持久化开关与刷新 /plugins 列表的即时显示状态。
+    """
+    target: Path | None = None
+    target_source = ""
+    for info in _PLUGIN_INFOS:
+        if info.get("name") == name:
+            target = Path(info["path"])
+            target_source = info.get("source", "")
+            break
+    # 兜底：内存记录里没找到就扫一遍目录
+    if target is None:
+        for base in plugin_dirs():
+            child = base / name
+            if (child / "plugin.json").is_file():
+                target = child
+                target_source = "user" if base == _user_plugin_dir() else "builtin"
+                break
+    if target is None or not (target / "plugin.json").is_file():
+        return False, f"未找到插件 {name}"
+    meta_path = target / "plugin.json"
+    try:
+        with open(meta_path, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+    except Exception as exc:
+        return False, f"读取 {meta_path} 失败: {exc}"
+    meta["enabled"] = bool(enabled)
+    try:
+        with open(meta_path, "w", encoding="utf-8") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except Exception as exc:
+        return False, f"写入 {meta_path} 失败: {exc}"
+    # 同步刷新内存中该插件的 status，让 /plugins 列表即时反映
+    for info in _PLUGIN_INFOS:
+        if info.get("name") == name:
+            if enabled:
+                # 原本记录为 disabled 的，开启后标记为"待重启生效"
+                if info.get("status") == "disabled":
+                    info["status"] = "loaded"
+                    info.pop("error", None)
+            else:
+                info["status"] = "disabled"
+                info["tools"] = []
+            break
+    action = "启用" if enabled else "禁用"
+    return True, f"已{action}插件 {name}（重启后完全生效）"
+
+
 def plugin_dirs() -> list[Path]:
     """返回插件扫描目录列表。用户目录在前，使其同名插件优先于内置。"""
     return [_user_plugin_dir(), _BUILTIN_PLUGIN_DIR]
