@@ -591,6 +591,52 @@ def test_session_sandbox_bypass_flag(monkeypatch):
         tools_mod.set_session_sandbox_bypass(False)
 
 
+def test_imom_active_publish_root_reads_store(tmp_path, monkeypatch):
+    """回归：_get_imom_active_publish_root 必须能读出活跃项目的 publish_root
+
+    历史上函数内重复 json.load(f) 导致第二次读取 EOF 必抛异常被静默吞掉，
+    函数永远返回空串，使 imom_* 工具的沙盒守卫完全失效。
+    """
+    import json as _json
+    import os as _os
+
+    import core.llm as llm_mod
+
+    store_dir = tmp_path / ".ycode"
+    store_dir.mkdir()
+    (store_dir / "imom_projects.json").write_text(
+        _json.dumps({
+            "active": "proj_a",
+            "projects": {"proj_a": {"publish_root": "/data/publish"}},
+        }),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(_os.path, "expanduser", lambda p: str(tmp_path) if p == "~" else p)
+
+    assert llm_mod._get_imom_active_publish_root() == "/data/publish"
+
+
+def test_plan_mode_approved_still_asks_sandbox_outside_access(monkeypatch):
+    """回归：plan 模式计划已批准时，sandbox_outside_access 不得自动放行"""
+    import core.llm as llm_mod
+
+    monkeypatch.setattr(llm_mod.app_context, "get_permission_mode", lambda: "plan")
+    monkeypatch.setattr(llm_mod.app_context, "get_plan_approved", lambda: True)
+    # 用权限回调充当“询问了用户”的探针：走到询问路径会调用它
+    monkeypatch.setattr(
+        llm_mod.app_context, "get_permission_callback", lambda: (lambda *a, **kw: "ASKED")
+    )
+
+    # sandbox_outside_access 必须继续询问，不能被计划批准自动放行
+    assert llm_mod.check_permission_and_ask(
+        "sandbox_outside_access", {"path": "/outside", "operation": "write_file"}
+    ) == "ASKED"
+    # 对照：普通写操作在计划批准后仍自动放行
+    assert llm_mod.check_permission_and_ask(
+        "write_file", {"file_path": "a.txt"}
+    ) is True
+
+
 # ── 多模态图片透传（_strip_media_and_merge / _supports_vision）──
 
 def _image_msg(text="看图"):

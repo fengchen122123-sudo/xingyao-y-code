@@ -95,13 +95,13 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
     for info in _PLUGIN_INFOS:
         if info.get("name") == name:
             if enabled:
-                # 原本记录为 disabled 的，开启后标记为"待重启生效"
-                if info.get("status") == "disabled":
-                    info["status"] = "loaded"
+                # 标记为“待重启加载”，避免误显示为已加载（工具实际重启后才注册）
+                if info.get("status") in ("disabled", "pending_disable"):
+                    info["status"] = "pending_enable"
                     info.pop("error", None)
             else:
-                info["status"] = "disabled"
-                info["tools"] = []
+                # 标记为“待重启卸载”：当前进程内工具仍可用，重启后才真正不加载
+                info["status"] = "pending_disable"
             break
     action = "启用" if enabled else "禁用"
     return True, f"已{action}插件 {name}（重启后完全生效）"
