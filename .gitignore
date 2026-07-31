@@ -67,6 +67,9 @@ generate_interview_pdf*.py
 zip/
 *.pdf
 
+# Build logs
+build_log.txt
+
 # DB debug exports (temporary debug dumps)
 db_*.txt
 
