@@ -1410,6 +1410,13 @@ def _sandbox_outside_guard(
     if not outside:
         return None, None
     from core import tools as _tools
+    # skill 目录是用户自行配置的受信任路径，读取 SKILL.md 不应触发沙盒询问
+    try:
+        from core.skills import is_skill_path
+        if is_skill_path(str(path_value)):
+            return None, None
+    except Exception:
+        pass
     # 仅线程内单次放行（已批准的嵌套操作不重复询问）；
     # 会话级放行（/sandbox on、"始终放行"）不再跳过询问。
     if getattr(_tools._sandbox_tls, "depth", 0) > 0:
