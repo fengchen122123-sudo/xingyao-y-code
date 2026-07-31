@@ -168,6 +168,13 @@ def _resolve_workspace_path(file_path):
     candidate = Path(str(file_path or "")).expanduser().resolve()
     if _outside_workspace_allowed():
         return candidate
+    # skill 目录是用户自行配置的受信任路径，读取 SKILL.md 不应被沙盒拦截
+    try:
+        from core.skills import is_skill_path
+        if is_skill_path(str(candidate)):
+            return candidate
+    except Exception:
+        pass
     # 沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
     # 用户批准后通过 sandbox_bypass() 设置线程级放行，_outside_workspace_allowed() 即返回 True。
     workspace = Path.cwd().resolve()
