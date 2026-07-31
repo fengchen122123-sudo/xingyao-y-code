@@ -46,7 +46,7 @@ import uuid
 import pyfiglet
 from prompt_toolkit.widgets import TextArea, Frame
 from prompt_toolkit.layout import Layout, HSplit, Window
-from prompt_toolkit.layout.containers import ConditionalContainer, FloatContainer, Float
+from prompt_toolkit.layout.containers import ConditionalContainer, FloatContainer, Float, VSplit
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.application import Application, run_in_terminal
@@ -2252,9 +2252,8 @@ def _make_input_app():
     input_area = TextArea(
         multiline=True,
         wrap_lines=True,
-        # 固定 2 行：随内容伸缩会导致整个界面布局忽大忽小，
-        # 超过 2 行的内容在框内滚动查看即可
-        height=D.exact(2),
+        # 固定 1 行：超过的内容在框内滚动查看
+        height=D.exact(1),
         style="class:input-field",
         focus_on_click=True,
         read_only=Condition(lambda: confirm_prompt is not None),
@@ -2705,11 +2704,27 @@ def _make_input_app():
         # 输入框+状态栏就能始终钉在布局区域底部，不随思考面板显隐而跳动。
         # weight 设大，防止思考面板 Frame（同样无 max 上限）分走空间被撑高。
         Window(height=D(min=0, weight=100)),
-        Frame(
+        Window(
+            content=FormattedTextControl(
+                lambda: [("class:input-line", "─" * _terminal_width() + "\n")]
+            ),
+            height=1,
+            style="class:input-line",
+        ),
+        VSplit([
+            Window(
+                content=FormattedTextControl([("class:input-prefix", "> ")]),
+                width=D.exact(2),
+                style="class:input-field",
+            ),
             input_area,
-            style="class:input-frame",
-            # 封顶 4 行（2 行内容 + 上下边框），杜绝边框被剩余空间拉伸成高空框
-            height=D.exact(4),
+        ]),
+        Window(
+            content=FormattedTextControl(
+                lambda: [("class:input-line", "─" * _terminal_width() + "\n")]
+            ),
+            height=1,
+            style="class:input-line",
         ),
         Window(
             content=FormattedTextControl(get_status),
@@ -2745,6 +2760,8 @@ def _make_input_app():
     style = Style.from_dict({
         # 输入框边框
         "input-frame":     "bg:#0a0a0f",
+        "input-line":      f"{border_color}",
+        "input-prefix":    f"bg:#0a0a0f {label_color}",
         "status.memory-frame": f"bg:#0a0a0f {status_text}",
         "status.live-plan-frame": f"bg:#0a0a0f {status_text}",
         "status.thinking-frame": f"bg:#0a0a0f {status_text}",
