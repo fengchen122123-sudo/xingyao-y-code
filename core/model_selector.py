@@ -16,6 +16,7 @@ from prompt_toolkit.buffer import Buffer
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.layout.containers import ConditionalContainer
+from prompt_toolkit.data_structures import Point
 
 from core.model_manager import (
     load_config, set_active_model, add_provider,
@@ -83,8 +84,9 @@ PRESET_PROVIDERS = [
         "base_url": "https://api.kimi.com/coding",
         "protocol": "anthropic",
         "models": [
-            {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": False},
-            {"name": "K3", "context_window": 262144, "supports_vision": False},
+            {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": True},
+            {"name": "k3", "context_window": 1000000, "supports_vision": True},
+            {"name": "k3-256k", "context_window": 256000, "supports_vision": True},
         ],
     },
     {
@@ -982,8 +984,25 @@ def open_model_selector(on_model_selected=None):
             return render_secondary_roles()
         return render_wizard()
 
-    main_ctrl = FormattedTextControl(get_main_content, focusable=True)
-    main_win  = Window(content=main_ctrl, wrap_lines=False)
+    def get_cursor_position():
+        # prompt_toolkit 的 auto-scroll 依赖此回调获知高亮行（▶ 标记）的位置，
+        # 否则模型数量超过一屏时无法向下翻页，底部"设置副模型"等选项被裁掉。
+        # 各 render 函数开头均有固定头部行，items 从偏移行后开始，每项占 1 行。
+        mode = state["mode"]
+        if mode == "list":
+            # render_list：标题 + 分隔线 + 副模型行 = 3 行头部
+            return Point(x=0, y=3 + state["cursor"])
+        if mode == "secondary":
+            # render_secondary_selector：标题 + 分隔线 + 当前用途 = 3 行头部
+            return Point(x=0, y=3 + state["sec_cursor"])
+        if mode == "wizard" and state["add_step"] == 0:
+            # render_wizard step0：标题 + 分隔线 + 步骤标题 + 提示 = 4 行头部
+            return Point(x=0, y=4 + state["preset_cursor"])
+        # 其他模式（向导输入步 / 编辑 / 副模型用途）内容较短，光标置于顶部
+        return Point(x=0, y=0)
+
+    main_ctrl = FormattedTextControl(get_main_content, focusable=True, get_cursor_position=get_cursor_position)
+    main_win  = Window(content=main_ctrl, wrap_lines=False, allow_scroll_beyond_bottom=False)
 
     @Condition
     def need_input():
