@@ -684,7 +684,11 @@ def open_model_selector(on_model_selected=None):
                 else:
                     out += [_t("class:add.normal", f"   {label}\n")]
 
-        out += [_t("class:footer", "  " + "─" * 44 + "\n")]
+        return out
+
+    def get_footer():
+        """list 模式的固定底部提示，不随列表滚动。"""
+        out = [_t("class:footer", "  " + "─" * 44 + "\n")]
         out += [_t("class:footer", "  ↑↓ 移动  Enter 激活  E 编辑  D 删除  S 副模型  Esc 退出\n")]
         if state["message"]:
             out += [_t("class:ok", f"  {state['message']}\n")]
@@ -1069,9 +1073,17 @@ def open_model_selector(on_model_selected=None):
     input_header_ctrl = FormattedTextControl(get_input_header)
     input_prefix_ctrl = FormattedTextControl([("class:wiz.title", "  > ")])
 
+    @Condition
+    def is_list_mode():
+        return state["mode"] == "list"
+
+    footer_ctrl = FormattedTextControl(get_footer)
+    footer_win = Window(content=footer_ctrl, height=3)
+
     layout = Layout(
         HSplit([
             main_win,
+            ConditionalContainer(content=footer_win, filter=is_list_mode),
             ConditionalContainer(
                 content=HSplit([
                     Window(content=input_header_ctrl, height=2),
