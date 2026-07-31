@@ -98,6 +98,29 @@ def get_skill_dirs():
 
     return dirs
 
+def is_skill_path(file_path):
+    """判断给定路径是否落在已注册的 skill 扫描目录内。
+
+    用于沙盒白名单：skill 目录是用户自行配置的受信任路径，
+    读取其中的 SKILL.md 不应被工作目录沙盒拦截或反复询问。
+    返回 True 时表示该路径可免沙盒校验。
+    """
+    if not file_path:
+        return False
+    try:
+        p = str(file_path).strip()
+        p = os.path.expandvars(os.path.expanduser(p))
+        if not os.path.isabs(p):
+            p = os.path.join(os.getcwd(), p)
+        candidate = os.path.normcase(os.path.abspath(p))
+    except Exception:
+        return False
+    for base_dir in get_skill_dirs():
+        base_norm = os.path.normcase(os.path.abspath(base_dir))
+        if candidate == base_norm or candidate.startswith(base_norm + os.sep):
+            return True
+    return False
+
 def parse_skill_md(file_path):
     """解析 SKILL.md，提取 YAML frontmatter 和 Markdown 正文"""
     try:
