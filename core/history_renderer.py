@@ -79,14 +79,10 @@ def render_session_history(
 ) -> str:
     # 窄终端钳制：render_markdown_to_ansi 要求 width >= 20
     width = max(20, width)
+    # 历史回放默认显示工具行：查看历史时需要完整工具执行轨迹。
+    # 调用方可显式传 tool_verbose=False 静默工具行（仅用于测试）。
     if tool_verbose is None:
-        # 读取与实时路径相同的配置项：回放应体现"当前"的详细/简短偏好，
-        # 而不是消息记录产生时的偏好。调用方也可以显式传参覆盖（便于测试）。
-        try:
-            from core.model_manager import load_config
-            tool_verbose = bool(load_config().get("tool_verbose", False))
-        except Exception:
-            tool_verbose = False
+        tool_verbose = True
     output: list[str] = []
     pending_tools: dict[str, tuple[str, dict]] = {}
     # 轮次分隔线：user 消息之间用一条灰色细线隔开；首条消息前不打印
@@ -137,8 +133,8 @@ def render_session_history(
             )
             result = {"content": message.get("content", "")}
             ok = not str(result["content"]).startswith("🚨")
-            # 与实时详细模式一致：每个工具只回放一行结果（不再有单独的"请求"行）。
-            # 简短模式下所有工具调用都保持静默，避免刷屏。
+            # 历史回放：每个工具只回放一行结果（不再有单独的"请求"行）。
+            # tool_verbose=False 时静默工具行（仅用于测试）。
             if not tool_verbose:
                 continue
             summary = summarize_tool_finished(name, arguments, result, ok=ok)

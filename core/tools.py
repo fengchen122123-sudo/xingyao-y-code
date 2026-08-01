@@ -168,10 +168,10 @@ def _resolve_workspace_path(file_path):
     candidate = Path(str(file_path or "")).expanduser().resolve()
     if _outside_workspace_allowed():
         return candidate
-    # skill 目录是用户自行配置的受信任路径，读取 SKILL.md 不应被沙盒拦截
+    # skill 目录及 Y-CODE 数据目录是受信任路径，查看其中非敏感文件不应被沙盒拦截
     try:
-        from core.skills import is_skill_path
-        if is_skill_path(str(candidate)):
+        from core.skills import is_trusted_path
+        if is_trusted_path(str(candidate)):
             return candidate
     except Exception:
         pass
