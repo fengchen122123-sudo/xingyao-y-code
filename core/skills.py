@@ -122,36 +122,16 @@ def is_skill_path(file_path):
     return False
 
 
-# ~/.ycode/ 目录下的敏感文件，即使路径受信任也不免沙盒（含 API 密钥/数据库等）
-_SENSITIVE_YCODE_FILES = {
-    "config.json",
-    "config.json.bak",
-    "mcp.json",
-}
-
-
-def _is_sensitive_ycode_file(rel_path):
-    """判断 ~/.ycode/ 下的相对路径是否是敏感文件（API 密钥/数据库等）。"""
-    rel_lower = rel_path.lower()
-    if rel_lower in _SENSITIVE_YCODE_FILES:
-        return True
-    if rel_lower.endswith((".db", ".db-shm", ".db-wal")):
-        return True
-    if ".db.bak" in rel_lower:
-        return True
-    return False
-
-
 def is_trusted_path(file_path):
     """判断路径是否在 Y-CODE 受信任的数据目录内（沙盒白名单增强版）。
 
     覆盖范围：
     1. skill 目录内的所有路径（is_skill_path）
     2. ~/.agents/ 目录（agent 配置目录，通常仅含 skills/）
-    3. ~/.ycode/ 目录下的非敏感文件（排除 config.json/mcp.json/数据库等）
+    3. ~/.ycode/ 目录下的所有文件（含 config.json/mcp.json/数据库等）
 
     用于沙盒白名单：Y-CODE 自己的配置/数据目录是受信任路径，
-    LLM 查看其中的非敏感文件（如 active_skills.json）不应被沙盒拦截。
+    主代理读取自家数据目录不应被沙盒拦截。输出仅展示给本机用户，不外泄。
     """
     if not file_path:
         return False
@@ -171,14 +151,9 @@ def is_trusted_path(file_path):
     agents_dir = os.path.normcase(os.path.abspath(os.path.join(home, ".agents")))
     if candidate == agents_dir or candidate.startswith(agents_dir + os.sep):
         return True
-    # 3. ~/.ycode/ 目录下的非敏感文件
+    # 3. ~/.ycode/ 目录下的所有文件（主代理受信任，输出仅给本机用户）
     ycode_dir = os.path.normcase(os.path.abspath(os.path.join(home, ".ycode")))
-    if candidate == ycode_dir:
-        return True  # 允许列出 ~/.ycode/ 目录
-    if candidate.startswith(ycode_dir + os.sep):
-        rel = candidate[len(ycode_dir) + 1:]
-        if _is_sensitive_ycode_file(rel):
-            return False
+    if candidate == ycode_dir or candidate.startswith(ycode_dir + os.sep):
         return True
     return False
 
