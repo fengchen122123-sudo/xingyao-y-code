@@ -555,6 +555,7 @@ session_token_usage = {
     # 累积消耗（用来算钱）
     "cumulative_total": 0,
     "cumulative_prompt": 0,
+    "cumulative_completion": 0,
     "cumulative_cached": 0,
     
     # 窗口占用（用来防止爆 128k 上下文）
@@ -1410,10 +1411,10 @@ def _sandbox_outside_guard(
     if not outside:
         return None, None
     from core import tools as _tools
-    # skill 目录是用户自行配置的受信任路径，读取 SKILL.md 不应触发沙盒询问
+    # skill 目录及 Y-CODE 数据目录是受信任路径，查看其中非敏感文件不应触发沙盒询问
     try:
-        from core.skills import is_skill_path
-        if is_skill_path(str(path_value)):
+        from core.skills import is_trusted_path
+        if is_trusted_path(str(path_value)):
             return None, None
     except Exception:
         pass
@@ -2571,9 +2572,13 @@ def _chat_with_model_generator(
                 with token_usage_lock:
                     session_token_usage["latest_total"] = getattr(stream_usage, "total_tokens", 0) or 0
                     session_token_usage["latest_prompt"] = getattr(stream_usage, "prompt_tokens", 0) or 0
+                    # completion = total - prompt（多数 provider 不直接给 completion_tokens）
                     session_token_usage["latest_cached"] = latest_cached
                     session_token_usage["cumulative_total"] += session_token_usage["latest_total"]
                     session_token_usage["cumulative_prompt"] += session_token_usage["latest_prompt"]
+                    session_token_usage["cumulative_completion"] += max(
+                        0, session_token_usage["latest_total"] - session_token_usage["latest_prompt"]
+                    )
                     session_token_usage["cumulative_cached"] += latest_cached
 
             reasoning_content, public_content = split_reasoning_text(accumulated_content)
@@ -2699,10 +2704,8 @@ def _chat_with_model_generator(
                     messages.append(summary_request)
                     # 该 user 催促消息也需要持久化，否则下一轮重建历史时上下文会缺失
                     pending_persistence.append(("user", summary_request))
-                    _notify_event(event_callback, "status", {
-                        "state": "executing",
-                        "message": "模型未生成结论，正在请求最终总结。",
-                    })
+                    # 内部兜底重试静默进行：底部状态栏已显示"正在干活..."，
+                    # 这里不再发 status 通知暴露"模型未生成结论"的内部细节。
                     continue
                 # 计划仍有可执行项时不允许提前收尾：向模型注入续推消息，
                 # 要求继续通过 run_subagent 完成剩余计划项（最多续推 2 次，

@@ -149,15 +149,6 @@ pending_action = None   # 待处理的主线程操作：目前可能的值有 "o
 # 计划项状态提示去重：避免同一个计划项反复失败/重试时刷屏
 _last_printed_plan_state: dict[str, str] = {}
 
-# 状态栏"详细/简洁"模式指示缓存：与 /verbose 命令读写的同一个配置项
-# （tool_verbose）保持同步，由 /verbose 命令在切换时更新，状态栏每帧渲染
-# 时直接读这个内存缓存，不必每帧都重新打开 config.json。
-try:
-    from core.model_manager import load_config as _load_config_for_status_init
-    _status_verbose_mode = bool(_load_config_for_status_init().get("tool_verbose", False))
-except Exception:
-    _status_verbose_mode = False
-
 # ---------------------------------------------------------------------------
 # 注册 TUI 运行时上下文（让 core/llm.py 通过 app_context 访问，而非直接 import main）
 # _app_ctx 已在文件顶部导入（权限模式规范化需要）
@@ -785,14 +776,9 @@ def _render_ui_event(event):
     global _thinking_panel_linger
     renderer = ui_renderers.get(event.turn_id)
     if renderer is None:
-        # 读取 verbose 配置（默认 False 简短模式：只显示"星瑶正在干活"，不显示具体工具调用细节）
-        # 数据库记录不受此开关影响，event 仍带完整 summary 入库
-        try:
-            from core.model_manager import load_config
-            tool_verbose = bool(load_config().get("tool_verbose", False))
-        except Exception:
-            tool_verbose = False
-        renderer = TurnRenderer(tool_verbose=tool_verbose)
+        # 简短模式：只显示"星瑶正在干活"汇总行 + 收尾统计行，不显示具体工具调用细节。
+        # 数据库记录不受此影响，event 仍带完整 summary 入库。
+        renderer = TurnRenderer()
         ui_renderers[event.turn_id] = renderer
         # "🤖 星瑶 >" 头部不在这里打印：改到 _render_public_answer_block 里，
         # 在本回合第一个 Markdown 正文块真正要渲染之前才打印（见该函数注释）。
@@ -914,9 +900,10 @@ def _render_ui_event(event):
         active_thinking_turn_id = None
         # 只有真实产生过思考内容才打印：Kimi 等模型会为工具调用消息回填
         # " " 占位 reasoning_content，无内容的段直接跳过，避免空刷屏。
-        # 逐段即时打印：每段思考一行"思考完成 · 用时 X"，作为该段输出正文的
-        # 天然分隔线——多段短输出不再揉成一团。
-        if active_thinking_text.strip():
+        # 极短思考（< 800ms，常见于模型回填的占位 reasoning）不打印分隔行，
+        # 避免大量"思考完成 · 用时 1ms"刷屏；思考内容仍由面板延迟显示。
+        # 只有较长思考才打印"思考完成 · 用时 X"，作为该段输出正文的分隔线。
+        if active_thinking_text.strip() and elapsed >= 0.8:
             line = f"思考完成 · 用时 {_format_thinking_elapsed(elapsed)}"
             _print_ui_fragment(f"\n\x1b[90m{line}\x1b[0m\n")
         task_status = "executing"
@@ -1273,7 +1260,6 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|plan|full&gt;</ansicyan>        : 切换安全权限级别 (confirm:变更前确认 | plan:计划模式 | full:完全访问)"))
         print_formatted_text(HTML("  <ansicyan>/sandbox &lt;on|off&gt;</ansicyan>                     : 沙盒开关 (on:允许访问工作目录外文件 | off:仅限工作目录内)"))
-        print_formatted_text(HTML("  <ansicyan>/verbose &lt;on|off&gt;</ansicyan>                   : 工具显示模式 (on:显示每个工具调用细节 | off:只显示\"星瑶正在干活\")"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【3. 技能插件管理】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/skills</ansicyan>                              : 打开全屏技能选择器 UI (空格勾选开启/关闭)"))
@@ -1442,32 +1428,6 @@ def handle_slash_command(command_text):
             status = "已开放（可访问工作目录外）" if enabled else "已开启（仅限工作目录内）"
             print_formatted_text(HTML(f"<b><ansicyan>沙盒状态：{status}</ansicyan></b>"))
             print_formatted_text(HTML("用法: <ansiyellow>/sandbox &lt;on|off&gt;</ansiyellow>（on=允许访问工作目录外，off=仅限工作目录内）"))
-
-    elif cmd == "/verbose":
-        # 工具调用细节显示开关：on=详细模式（显示每个工具调用），off=简短模式（只显示"星瑶正在干活"）
-        # 数据库记录不受此开关影响，event 仍带完整 summary 入库
-        from core.model_manager import load_config
-        global _status_verbose_mode
-        if len(parts) > 1:
-            mode_name = parts[1].lower().strip("<>\"'")
-            if mode_name in ("on", "off"):
-                from config import save_config_value
-                enabled = (mode_name == "on")
-                save_config_value("tool_verbose", enabled)
-                # 同步状态栏缓存的模式指示，避免它继续显示切换前的模式
-                _status_verbose_mode = enabled
-                if enabled:
-                    print_formatted_text(HTML("<ansigreen>✔ 详细模式已开启：将显示每个工具调用细节（查看文件/执行命令等）</ansigreen>"))
-                else:
-                    print_formatted_text(HTML('<ansigreen>✔ 简短模式已开启：只显示"星瑶正在干活"，工具调用细节不再刷屏（数据库仍完整记录）</ansigreen>'))
-            else:
-                print_formatted_text(HTML(f"<ansired>❌ 未知参数「{_esc(mode_name)}」，可选：on, off</ansired>"))
-        else:
-            enabled = bool(load_config().get("tool_verbose", False))
-            _status_verbose_mode = enabled
-            status = "详细模式（显示工具调用细节）" if enabled else '简短模式（只显示"星瑶正在干活"）'
-            print_formatted_text(HTML(f"<b><ansicyan>工具显示模式：{status}</ansicyan></b>"))
-            print_formatted_text(HTML("用法: <ansiyellow>/verbose &lt;on|off&gt;</ansiyellow>（on=显示每个工具调用，off=只显示汇总行）"))
 
     elif cmd == "/new":
         # 创建全新会话并切换：历史会话全部保留，随时可用 /session 切回
@@ -2194,7 +2154,6 @@ def _make_input_app():
         ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
         ("/permission", "切换安全权限级别 (confirm/plan/full)"),
         ("/sandbox", "沙盒开关 (on:允许访问工作目录外/off:仅限目录内)"),
-        ("/verbose", "工具显示模式 (on:显示工具调用细节/off:只显示\"星瑶正在干活\")"),
         ("/clear", "清理当前屏幕"),
         ("/exit", "退出 Y-code"),
     ]
@@ -2476,10 +2435,9 @@ def _make_input_app():
 
         # 2. 计算 Token 消耗与缓存命中（分离概念）；与 worker 并发读写，必须持锁
         with token_usage_lock:
-            cum_total = session_token_usage["cumulative_total"]
             cum_prompt = session_token_usage.get("cumulative_prompt", 0)
+            cum_completion = session_token_usage.get("cumulative_completion", 0)
             cum_cached = session_token_usage["cumulative_cached"]
-            cum_miss = max(0, cum_total - cum_cached)
             latest_total = session_token_usage["latest_total"]
         max_win = current_ctx_win
 
@@ -2497,19 +2455,18 @@ def _make_input_app():
                 return f"{int(val)}K" if val.is_integer() else f"{val:.1f}K"
             return str(n)
             
-        cum_total_str = format_num(cum_total)
+        prompt_str = format_num(cum_prompt)
+        completion_str = format_num(cum_completion)
+        cached_str = format_num(cum_cached)
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        # 用清晰的文字取代 8 格进度条：小终端下窄格子经常看不出填充比例，
-        # 直接写百分比/用量反而一眼可读。
+        # 状态栏 Token 概览：输入/输出/命中/命中率/上下文
         token_info = (
-            f"上下文 {pct:.0f}% ({latest_total_str}/{max_win_str}) · "
-            f"累计 {cum_total_str} · 缓存命中 {hit_rate:.0f}%"
+            f"输入 {prompt_str} · 输出 {completion_str} · "
+            f"命中 {cached_str} ({hit_rate:.0f}%) · "
+            f"上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
         )
-
-        # 显示模式指示（详细/简洁）：直接读内存缓存，由 /verbose 命令更新
-        mode_label = " 详细 " if _status_verbose_mode else " 简洁 "
 
         # 3. 统计星瑶的执行状态与播放动画，证明星瑶仍在操作/思考
         # 直接读模块全局变量，不再 import main 自引用
@@ -2552,8 +2509,6 @@ def _make_input_app():
             ("class:status.model",   f" {model_display} "),
             ("class:status.sep",     "  |  "),
             (perm_style,             perm_label),
-            ("class:status.sep",     "  |  "),
-            ("class:status.token",   mode_label),
             ("class:status.sep",     "  |  "),
             ("class:status.token",   token_info),
             ("class:status.sep",     "  |  "),
