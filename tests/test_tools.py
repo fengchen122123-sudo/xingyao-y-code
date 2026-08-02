@@ -1,6 +1,7 @@
 import pytest
 import json
 import threading
+from unittest.mock import ANY
 from types import SimpleNamespace
 from pathlib import Path
 from core.tools import (
@@ -827,6 +828,182 @@ def test_run_subagent_updates_associated_plan_only_after_completion(monkeypatch)
     bind_default_plan_session(previous_session)
 
 
+def test_run_subagent_denied_command_verification_never_executes_command(monkeypatch):
+    """子代理计划验证被拒绝后不得再触发任何命令执行路径。"""
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{
+        "id": "build",
+        "subject": "构建项目",
+        "stage": "build",
+        "verification_type": "command",
+        "verification": "pytest -q",
+    }])
+    permission_calls = []
+    command_calls = []
+    shell_launches = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return b"verification passed", b""
+
+    def deny_permission(*args, **kwargs):
+        permission_calls.append((args, kwargs))
+        return False
+
+    monkeypatch.setattr("core.llm.check_permission_and_ask", deny_permission)
+    monkeypatch.setattr(
+        tools_module,
+        "execute_command",
+        lambda *args, **kwargs: command_calls.append((args, kwargs)) or "should not run",
+    )
+    monkeypatch.setattr(
+        "core.task_scheduler.subprocess.Popen",
+        lambda *args, **kwargs: shell_launches.append((args, kwargs)) or FakeProcess(),
+    )
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: TaskScheduler(plan),
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "subagent_manager",
+        SubagentManager(runner=lambda record: "实现完成"),
+    )
+
+    tools_module.run_subagent(
+        "完成构建",
+        parent_session="subagent-denied-verification-test",
+        parent_turn_id="turn-denied-verification",
+        subagent_type="implement",
+        plan_item_id="build",
+        timeout_seconds=30,
+    )
+
+    assert permission_calls == [(
+        ("execute_command", {"command": "pytest -q"}),
+        {
+            "event_callback": None,
+            "permission_owner": "subagent:implement",
+            "parent_turn_id": "turn-denied-verification",
+            "permission_source": "计划项验证：构建项目",
+            "cancel_event": ANY,
+        },
+    )]
+    assert command_calls == []
+    assert shell_launches == []
+    item = plan.snapshot()[0]
+    assert item["status"] == "failed"
+    assert "未获用户授权" in item["error"]
+
+
+def test_run_subagent_command_verification_fails_for_nonzero_exit_without_output(monkeypatch):
+    """验证命令的真实非零退出码必须使计划项失败，即使没有任何输出。"""
+    import sys
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{
+        "id": "build",
+        "subject": "构建项目",
+        "stage": "build",
+        "verification_type": "command",
+        "verification": f'"{sys.executable}" -c "import sys; sys.exit(7)"',
+    }])
+    monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: TaskScheduler(plan),
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "subagent_manager",
+        SubagentManager(runner=lambda record: "实现完成"),
+    )
+
+    tools_module.run_subagent(
+        "完成构建",
+        parent_session="subagent-nonzero-verification-test",
+        parent_turn_id="turn-nonzero-verification",
+        subagent_type="implement",
+        plan_item_id="build",
+        timeout_seconds=30,
+    )
+
+    item = plan.snapshot()[0]
+    assert item["status"] == "failed"
+    assert "退出码 7" in item["error"]
+
+
+def test_run_subagent_command_verification_completes_for_zero_exit(monkeypatch):
+    """验证命令的真实零退出码必须完成计划项。"""
+    import sys
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{
+        "id": "build",
+        "subject": "构建项目",
+        "stage": "build",
+        "verification_type": "command",
+        "verification": f'"{sys.executable}" -c "import sys; sys.exit(0)"',
+    }])
+    monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: TaskScheduler(plan),
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "subagent_manager",
+        SubagentManager(runner=lambda record: "实现完成"),
+    )
+
+    tools_module.run_subagent(
+        "完成构建",
+        parent_session="subagent-zero-verification-test",
+        parent_turn_id="turn-zero-verification",
+        subagent_type="implement",
+        plan_item_id="build",
+        timeout_seconds=30,
+    )
+
+    assert plan.snapshot()[0]["status"] == "completed"
+
+
+def test_execute_command_internal_results_are_call_scoped():
+    """内部执行结果仅属于传入的调用对象，不能在后续命令间共享。"""
+    import sys
+    import core.tools as tools_module
+
+    successful = tools_module._CommandExecutionResult()
+    failed = tools_module._CommandExecutionResult()
+
+    tools_module.execute_command(
+        f'"{sys.executable}" -c "import sys; sys.exit(0)"',
+        _execution_result=successful,
+    )
+    tools_module.execute_command(
+        f'"{sys.executable}" -c "import sys; sys.exit(4)"',
+        _execution_result=failed,
+    )
+
+    assert successful.returncode == 0
+    assert failed.returncode == 4
+
+
 def test_run_subagent_rejects_user_input_preparation_item(monkeypatch):
     import core.tools as tools_module
     from core.plan import bind_default_plan_session, get_default_plan_manager
@@ -1564,11 +1741,9 @@ def test_read_file_truncates_and_pages_long_files(tmp_path, monkeypatch):
 
 def test_run_subagent_rejects_invalid_timeout_before_claiming_plan_item(monkeypatch):
     import core.tools as tools_module
-    from core.plan import bind_default_plan_session, get_default_plan_manager
+    from core.plan import PlanManager
 
-    plan = get_default_plan_manager()
-    previous_session = plan.session_id
-    bind_default_plan_session("subagent-invalid-timeout-test")
+    plan = PlanManager()
     plan.replace([{"id": "item-1", "subject": "任务"}])
     monkeypatch.setattr(
         tools_module,
@@ -1587,16 +1762,15 @@ def test_run_subagent_rejects_invalid_timeout_before_claiming_plan_item(monkeypa
     payload = json.loads(result)
     assert payload["status"] == "failed"
     assert plan.snapshot()[0]["status"] == "pending"
-    bind_default_plan_session(previous_session)
 
 
 def test_run_subagent_rolls_back_plan_item_when_startup_fails(monkeypatch):
     import core.tools as tools_module
-    from core.plan import bind_default_plan_session, get_default_plan_manager
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
 
-    plan = get_default_plan_manager()
-    previous_session = plan.session_id
-    bind_default_plan_session("subagent-rollback-test")
+    plan = PlanManager()
+    scheduler = TaskScheduler(plan)
     plan.replace([{"id": "item-1", "subject": "任务", "files": ["shared.py"]}])
 
     class FailingManager:
@@ -1604,6 +1778,10 @@ def test_run_subagent_rolls_back_plan_item_when_startup_fails(monkeypatch):
             raise RuntimeError("subagent task capacity reached")
 
     monkeypatch.setattr(tools_module, "subagent_manager", FailingManager())
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: scheduler,
+    )
 
     result = tools_module.run_subagent(
         "任务",
@@ -1619,12 +1797,8 @@ def test_run_subagent_rolls_back_plan_item_when_startup_fails(monkeypatch):
     assert item["status"] == "failed"
     assert "capacity" in item["error"]
 
-    from core.task_scheduler import get_default_scheduler
-
-    scheduler = get_default_scheduler()
     assert scheduler.start_item("item-1") is False  # failed 状态不可直接重启
     assert "shared.py" not in scheduler._in_flight_files
-    bind_default_plan_session(previous_session)
 
 
 def test_background_subagent_has_timeout_watchdog():
@@ -1798,11 +1972,11 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
     """回归：验证失败时必须把真实错误（如验证命令 stderr）返回给主 Agent，
     不得只报"不是 in_progress，无法验证完成"的误导信息导致 retry 死循环。"""
     import core.tools as tools_module
-    from core.plan import bind_default_plan_session, get_default_plan_manager
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
 
-    plan = get_default_plan_manager()
-    previous_session = plan.session_id
-    bind_default_plan_session("subagent-verification-error-test")
+    plan = PlanManager()
+    scheduler = TaskScheduler(plan)
     plan.replace([{
         "id": "item-1",
         "subject": "验证失败任务",
@@ -1815,6 +1989,11 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
         tools_module,
         "subagent_manager",
         SubagentManager(runner=lambda record: "子任务做完了"),
+    )
+    monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: scheduler,
     )
 
     result = tools_module.run_subagent(
@@ -1831,7 +2010,6 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
     assert "不是 in_progress" not in result
     assert "验证" in result
     assert plan.snapshot()[0]["status"] == "failed"
-    bind_default_plan_session(previous_session)
 
 
 def test_edit_file_fuzzy_match_minor_trailing_whitespace(tmp_path, monkeypatch):
