@@ -80,7 +80,6 @@ class TaskScheduler:
         self._verification_processes: dict[str, subprocess.Popen] = {}
         self._paused = False
         self._custom_verification_runner = verification_runner
-        self._verification_runner = verification_runner or self._run_verification
 
     @property
     def paused(self) -> bool:
@@ -244,11 +243,7 @@ class TaskScheduler:
             elif self._custom_verification_runner is not None:
                 passed, detail = self._custom_verification_runner(command)
             else:
-                passed, detail = self._run_verification(
-                    command,
-                    item_id=item_id,
-                    cancel_event=cancel_event,
-                )
+                passed, detail = False, "验证命令未获授权执行器"
             if not passed:
                 self.fail(
                     item_id,
