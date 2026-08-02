@@ -547,6 +547,166 @@ def test_sandbox_guard_asks_and_denies_outside_path(tmp_path, monkeypatch):
     assert err is not None and "拒绝" in err
 
 
+def test_sandbox_guard_rejects_unverifiable_path_without_asking(monkeypatch):
+    """Path classification errors must fail closed before any permission prompt."""
+    import core.llm as llm_mod
+
+    asked = []
+    monkeypatch.setattr(
+        llm_mod,
+        "is_outside_workspace",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("classification failed")),
+    )
+    monkeypatch.setattr(
+        llm_mod,
+        "check_permission_and_ask",
+        lambda *args, **kwargs: asked.append((args, kwargs)) or True,
+    )
+
+    cm, err = llm_mod._sandbox_outside_guard(
+        "read_file", "unverifiable.txt", None, "owner", "turn", "主代理", None,
+    )
+
+    assert cm is None
+    assert err is not None and "无法验证路径" in err
+    assert asked == []
+
+
+@pytest.mark.parametrize(
+    ("function_name", "arguments"),
+    [
+        ("read_file", '{"file_path": "unverifiable.txt"}'),
+        ("write_file", '{"file_path": "unverifiable.txt", "content": "new"}'),
+        ("edit_file", '{"file_path": "unverifiable.txt", "target_content": "old", "replacement_content": "new"}'),
+    ],
+)
+def test_unverifiable_path_never_prompts_or_executes_a_file_tool(
+    monkeypatch, function_name, arguments
+):
+    """Read, write, and edit stop on an unclassifiable path before side effects."""
+    import core.llm as llm_mod
+
+    prompted = []
+    executed = []
+    monkeypatch.setattr(
+        llm_mod,
+        "is_outside_workspace",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("classification failed")),
+    )
+    monkeypatch.setattr(
+        llm_mod,
+        "check_permission_and_ask",
+        lambda *args, **kwargs: prompted.append((args, kwargs)) or True,
+    )
+    monkeypatch.setattr(
+        llm_mod.tool_registry,
+        "execute",
+        lambda *args, **kwargs: (
+            executed.append((args, kwargs))
+            or SimpleNamespace(to_message_content=lambda: "executed")
+        ),
+    )
+    monkeypatch.setattr(
+        llm_mod,
+        "write_file",
+        lambda *args, **kwargs: (
+            executed.append((args, kwargs))
+            or f"{llm_mod.TOOL_ERROR_PREFIX} unexpected write"
+        ),
+    )
+    monkeypatch.setattr(
+        llm_mod,
+        "edit_file",
+        lambda *args, **kwargs: (
+            executed.append((args, kwargs))
+            or f"{llm_mod.TOOL_ERROR_PREFIX} unexpected edit"
+        ),
+    )
+
+    result = llm_mod._execute_single_tool_call({
+        "id": f"call-{function_name}",
+        "function": {"name": function_name, "arguments": arguments},
+    })
+
+    assert "无法验证路径" in result["content"]
+    assert prompted == []
+    assert executed == []
+
+
+def test_external_missing_edit_requests_sandbox_access_before_existence_probe(tmp_path, monkeypatch):
+    """A denied external edit cannot disclose whether its target exists."""
+    import core.llm as llm_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    missing = tmp_path / "outside" / "missing.txt"
+    monkeypatch.chdir(workspace)
+    prompts = []
+    probes = []
+    monkeypatch.setattr(
+        llm_mod,
+        "check_permission_and_ask",
+        lambda permission, arguments, **kwargs: prompts.append((permission, arguments)) or False,
+    )
+    monkeypatch.setattr(
+        llm_mod.os.path,
+        "isfile",
+        lambda path: probes.append(path) or False,
+    )
+
+    result = llm_mod._execute_single_tool_call({
+        "id": "call-missing-edit",
+        "function": {
+            "name": "edit_file",
+            "arguments": (
+                '{"file_path": "%s", "target_content": "old", "replacement_content": "new"}'
+                % str(missing).replace("\\", "\\\\")
+            ),
+        },
+    })
+
+    assert "拒绝" in result["content"]
+    assert prompts == [
+        ("sandbox_outside_access", {"path": str(missing), "operation": "edit_file"})
+    ]
+    assert probes == []
+
+
+@pytest.mark.parametrize("function_name", ["write_file", "edit_file"])
+def test_sandbox_guard_requires_confirmation_for_writing_skill_file(
+    tmp_path, monkeypatch, function_name
+):
+    """Skill trust only exempts reads; writes must still request outside access."""
+    import core.llm as llm_mod
+    import core.skills as skills_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    skill_dir = tmp_path / "skills" / "example"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text("# Example", encoding="utf-8")
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(skill_dir)])
+    asked = []
+
+    def deny_outside_access(permission, arguments, **_kwargs):
+        asked.append((permission, arguments))
+        return False
+
+    monkeypatch.setattr(llm_mod, "check_permission_and_ask", deny_outside_access)
+
+    cm, err = llm_mod._sandbox_outside_guard(
+        function_name, str(skill_file), None, "owner", "turn", "主代理", None,
+    )
+
+    assert cm is None
+    assert err is not None and "拒绝" in err
+    assert asked == [
+        ("sandbox_outside_access", {"path": str(skill_file), "operation": function_name})
+    ]
+
+
 def test_sandbox_guard_approved_bypass_allows_read(tmp_path, monkeypatch):
     """沙盒外路径 + 用户同意本次：返回 bypass 上下文，其中可读取沙盒外文件"""
     import core.llm as llm_mod

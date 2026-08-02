@@ -160,7 +160,7 @@ def _outside_workspace_allowed():
         return False
 
 
-def _resolve_workspace_path(file_path):
+def _resolve_workspace_path(file_path, *, allow_trusted_read=False):
     """将路径解析为绝对路径；默认强制限定在当前工作目录内，越界直接拒绝。
 
     当配置 allow_outside_workspace 为 True（/sandbox on）时解除目录限制。
@@ -168,13 +168,13 @@ def _resolve_workspace_path(file_path):
     candidate = Path(str(file_path or "")).expanduser().resolve()
     if _outside_workspace_allowed():
         return candidate
-    # skill 目录及 Y-CODE 数据目录是受信任路径，查看其中非敏感文件不应被沙盒拦截
-    try:
-        from core.skills import is_trusted_path
-        if is_trusted_path(str(candidate)):
-            return candidate
-    except Exception:
-        pass
+    if allow_trusted_read:
+        try:
+            from core.skills import is_trusted_read_path
+            if is_trusted_read_path(str(candidate)):
+                return candidate
+        except Exception:
+            pass
     # 沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
     # 用户批准后通过 sandbox_bypass() 设置线程级放行，_outside_workspace_allowed() 即返回 True。
     workspace = Path.cwd().resolve()
@@ -225,7 +225,7 @@ def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers
                 edit_file 的 start_line/end_line 参数精准定位。
                 适用于大文件、重复代码段、字符串匹配易失败的场景。
     """
-    resolved = _resolve_workspace_path(file_path)
+    resolved = _resolve_workspace_path(file_path, allow_trusted_read=True)
 
     cache_key = _tool_cache.read_file_key(
         str(resolved), offset, limit, compress, with_line_numbers
