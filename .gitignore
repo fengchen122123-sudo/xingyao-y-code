@@ -76,3 +76,4 @@ db_*.txt
 # Temporary test directories
 test20*/
 .workbuddy/
+.worktrees/
