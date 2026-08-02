@@ -205,8 +205,9 @@ def test_get_weather_requires_explicit_city():
     assert result.startswith("🚨")
     assert "城市" in result
 
-def test_read_and_write_file(tmp_path):
+def test_read_and_write_file(tmp_path, monkeypatch):
     """测试 Agent 是否能正确读取和写入文件"""
+    monkeypatch.chdir(tmp_path)
     test_file = tmp_path / "hello.py"
     content_to_write = "print('Hello, Y-code!')"
     
@@ -215,8 +216,9 @@ def test_read_and_write_file(tmp_path):
     
     assert read_content == content_to_write
 
-def test_list_directory(tmp_path):
+def test_list_directory(tmp_path, monkeypatch):
     """测试雷达功能：能否看清文件夹里有什么"""
+    monkeypatch.chdir(tmp_path)
     # 1. 准备：在隔离区造一个假项目，里面有两个文件
     (tmp_path / "main.py").touch()
     (tmp_path / "readme.md").touch()
@@ -1164,6 +1166,117 @@ def test_file_tools_allow_outside_workspace_when_sandbox_off(tmp_path, monkeypat
     write_file(str(outside / "new.txt"), "写入外部")
     assert (outside / "new.txt").read_text(encoding="utf-8") == "写入外部"
     assert "note.txt" in list_directory(str(outside))
+
+
+def test_ycode_and_agents_files_are_not_trusted_read_paths(tmp_path, monkeypatch):
+    """Only configured Skill packages may bypass the workspace sandbox for reads."""
+    import core.skills as skills_mod
+
+    fake_home = tmp_path / "home"
+    skill_dir = fake_home / ".ycode" / "skills" / "example"
+    skill_dir.mkdir(parents=True)
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(skill_dir)])
+    monkeypatch.setattr(
+        skills_mod.os.path,
+        "expanduser",
+        lambda value: str(fake_home) if value == "~" else value,
+    )
+
+    sensitive_paths = [
+        fake_home / ".ycode" / "config.json",
+        fake_home / ".ycode" / "ycode.db",
+        fake_home / ".ycode" / "mcp.json",
+        fake_home / ".ycode" / "system_prompt.md",
+        fake_home / ".agents" / "settings.json",
+    ]
+
+    for sensitive_path in sensitive_paths:
+        assert not skills_mod.is_trusted_read_path(str(sensitive_path))
+
+
+def test_trusted_read_path_requires_a_skill_package_not_just_its_search_root(tmp_path, monkeypatch):
+    """A scan root and unrelated siblings must not inherit a Skill package's trust."""
+    import core.skills as skills_mod
+
+    search_root = tmp_path / "skills"
+    package = search_root / "approved"
+    package.mkdir(parents=True)
+    (package / "SKILL.md").write_text("# Approved", encoding="utf-8")
+    resource = package / "references" / "guide.md"
+    resource.parent.mkdir()
+    resource.write_text("guide", encoding="utf-8")
+    unrelated = search_root / "settings.json"
+    unrelated.write_text("settings", encoding="utf-8")
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(search_root)])
+
+    assert skills_mod.is_trusted_read_path(str(package / "SKILL.md"))
+    assert skills_mod.is_trusted_read_path(str(resource))
+    assert not skills_mod.is_trusted_read_path(str(search_root))
+    assert not skills_mod.is_trusted_read_path(str(unrelated))
+
+
+def test_skill_path_expansion_supports_home_environment_and_relative_inputs(tmp_path, monkeypatch):
+    """Trusted Skill resources retain the public path-expansion input contract."""
+    import core.skills as skills_mod
+
+    fake_home = tmp_path / "home"
+    search_root = fake_home / "skills"
+    package = search_root / "demo"
+    package.mkdir(parents=True)
+    skill_file = package / "SKILL.md"
+    skill_file.write_text("# Demo", encoding="utf-8")
+    original_expanduser = skills_mod.os.path.expanduser
+
+    def expand_fake_home(value):
+        value = str(value)
+        if value == "~":
+            return str(fake_home)
+        if value.startswith("~/") or value.startswith("~\\"):
+            return str(fake_home) + value[1:]
+        return original_expanduser(value)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(search_root)])
+    monkeypatch.setattr(skills_mod.os.path, "expanduser", expand_fake_home)
+    monkeypatch.setenv("YCODE_TEST_SKILL_ROOT", str(search_root))
+    monkeypatch.setenv("YCODE_TEST_SKILL_HOME", "~/skills")
+
+    assert skills_mod.is_trusted_read_path("~/skills/demo/SKILL.md")
+    assert skills_mod.is_trusted_read_path("%YCODE_TEST_SKILL_ROOT%/demo/SKILL.md")
+    assert skills_mod.is_trusted_read_path("%YCODE_TEST_SKILL_HOME%/demo/SKILL.md")
+    assert skills_mod.is_trusted_read_path("home/skills/demo/SKILL.md")
+
+
+def test_write_file_rejects_trusted_skill_path_without_outside_approval(tmp_path, monkeypatch):
+    """write_file must not use the read-only Skill exemption."""
+    import pytest as _pytest
+    import core.skills as skills_mod
+    import core.tools as tools_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    skill_dir = tmp_path / "skills" / "example"
+    skill_dir.mkdir(parents=True)
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(skill_dir)])
+    monkeypatch.setattr(tools_mod, "_outside_workspace_allowed", lambda: False)
+
+    with _pytest.raises(ValueError, match="路径越界"):
+        tools_mod.write_file(str(skill_dir / "SKILL.md"), "# Changed")
+
+
+def test_skill_markdown_is_trusted_for_read_only(tmp_path, monkeypatch):
+    """A configured Skill package remains readable outside the workspace."""
+    import core.skills as skills_mod
+
+    skill_dir = tmp_path / "skills" / "example"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text("# Example", encoding="utf-8")
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(skill_dir.parent)])
+
+    assert skills_mod.is_trusted_read_path(str(skill_file))
+    assert skills_mod.is_trusted_path(str(skill_file))
 
 
 def test_outside_workspace_allowed_reads_config(monkeypatch):
@@ -2465,9 +2578,10 @@ def test_execute_command_nonzero_exit_with_output_still_error(monkeypatch):
     assert "爆炸了" in result
 
 
-def test_list_directory_on_file_returns_soft_hint(tmp_path):
+def test_list_directory_on_file_returns_soft_hint(tmp_path, monkeypatch):
     """把文件路径误传给 list_directory：返回普通提示（非 🚨 错误级），
     引导模型改用 read_file，UI 不再渲染成红色失败。"""
+    monkeypatch.chdir(tmp_path)
     target = tmp_path / "SflF400_mk.v"
     target.write_text("x", encoding="utf-8")
 

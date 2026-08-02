@@ -89,6 +89,9 @@ PERMISSION_SYSTEM_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
     f"这不是用户拒绝，请稍后重试或检查权限组件状态。"
 )
+PATH_VALIDATION_ERROR_MESSAGE = (
+    f"{TOOL_ERROR_PREFIX} 无法验证路径是否位于当前工作区，已拒绝执行。"
+)
 
 
 class PermissionSystemError(Exception):
@@ -1386,17 +1389,17 @@ def _sandbox_outside_guard(
     try:
         outside = is_outside_workspace(path_value)
     except Exception:
-        outside = False
+        return None, PATH_VALIDATION_ERROR_MESSAGE
     if not outside:
         return None, None
     from core import tools as _tools
-    # skill 目录及 Y-CODE 数据目录是受信任路径，查看其中非敏感文件不应触发沙盒询问
-    try:
-        from core.skills import is_trusted_path
-        if is_trusted_path(str(path_value)):
-            return None, None
-    except Exception:
-        pass
+    if function_name == "read_file":
+        try:
+            from core.skills import is_trusted_read_path
+            if is_trusted_read_path(str(path_value)):
+                return None, None
+        except Exception:
+            pass
     # 仅线程内单次放行（已批准的嵌套操作不重复询问）；
     # 会话级放行（/sandbox on、"始终放行"）不再跳过询问。
     if getattr(_tools._sandbox_tls, "depth", 0) > 0:
@@ -1583,8 +1586,8 @@ def _execute_single_tool_call(
         try:
             _defer_to_sandbox_guard = is_outside_workspace(arguments.get("file_path", ""))
         except Exception:
-            _defer_to_sandbox_guard = False
-    if requires_permission and not _defer_to_sandbox_guard:
+            result = PATH_VALIDATION_ERROR_MESSAGE
+    if requires_permission and not result and not _defer_to_sandbox_guard:
         try:
             approved = check_permission_and_ask(
                 function_name,
@@ -1609,7 +1612,12 @@ def _execute_single_tool_call(
     _raise_if_tool_cancelled(cancel_event)
 
     try:
-        if result in (PERMISSION_DENIED_MESSAGE, PERMISSION_CANCELLED_MESSAGE, PERMISSION_SYSTEM_ERROR_MESSAGE):
+        if result in (
+            PERMISSION_DENIED_MESSAGE,
+            PERMISSION_CANCELLED_MESSAGE,
+            PERMISSION_SYSTEM_ERROR_MESSAGE,
+            PATH_VALIDATION_ERROR_MESSAGE,
+        ):
             pass
         elif function_name == "read_file":
             bypass_cm, sandbox_err = _sandbox_outside_guard(
@@ -1847,10 +1855,18 @@ def _execute_single_tool_call(
             target = arguments.get("target_content")
             repl = arguments.get("replacement_content")
 
+            # 沙盒外编辑必须先获批，再检查目标是否存在，避免把外部路径存在性泄露给调用方。
+            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
+                function_name, file_path, event_callback,
+                permission_owner, parent_turn_id, permission_source, cancel_event,
+            )
+            if _sandbox_err:
+                result = _sandbox_err
+
             # 对过长的 target_content 提前拦截，避免 JSON 截断后反复失败浪费 token。
             # 模型应拆分为多个小片段编辑，或改用 write_file 重写整个文件。
             _EDIT_TARGET_MAX_LEN = 1500
-            if target and len(target) > _EDIT_TARGET_MAX_LEN:
+            if not result and target and len(target) > _EDIT_TARGET_MAX_LEN:
                 result = (
                     f"{TOOL_ERROR_PREFIX} edit_file 的 target_content 过长（"
                     f"{len(target)} 字符），超过 {_EDIT_TARGET_MAX_LEN} 字符限制，"
@@ -1866,7 +1882,7 @@ def _execute_single_tool_call(
 
             # 文件不存在时直接报错（edit_file 只能修改已有文件），
             # 避免对不存在的沙盒外路径做无意义的权限询问
-            if not os.path.isfile(file_path or ""):
+            if not result and not os.path.isfile(file_path or ""):
                 # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
                 # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
                 result = (
@@ -1880,14 +1896,7 @@ def _execute_single_tool_call(
                     "content": result,
                 }
 
-            # 沙盒外修改必须每次询问用户（即使 full 模式）
-            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
-                function_name, file_path, event_callback,
-                permission_owner, parent_turn_id, permission_source, cancel_event,
-            )
-            if _sandbox_err:
-                result = _sandbox_err
-            else:
+            if not result:
                 _edit_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
                 with _edit_cm:
                     try:

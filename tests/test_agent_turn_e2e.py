@@ -24,7 +24,8 @@ def _tool_call(index, call_id, name, arguments):
     )
 
 
-def test_fake_provider_turn_covers_rendering_permissions_and_diff(tmp_path, mocker):
+def test_fake_provider_turn_covers_rendering_permissions_and_diff(tmp_path, mocker, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     target = tmp_path / "target.txt"
     target.write_text("before", encoding="utf-8")
     responses = [
@@ -147,9 +148,10 @@ def test_empty_tool_followup_requests_one_final_summary(tmp_path, mocker):
     assert "检查结论" in assistant_text
 
 
-def test_cancel_after_permission_does_not_write_file(tmp_path, mocker):
+def test_cancel_after_permission_does_not_write_file(tmp_path, mocker, monkeypatch):
     import core.llm as llm
 
+    monkeypatch.chdir(tmp_path)
     target = tmp_path / "must-not-exist.txt"
     cancel_event = threading.Event()
     tool_call = {

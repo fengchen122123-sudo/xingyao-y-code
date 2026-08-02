@@ -122,40 +122,52 @@ def is_skill_path(file_path):
     return False
 
 
-def is_trusted_path(file_path):
-    """判断路径是否在 Y-CODE 受信任的数据目录内（沙盒白名单增强版）。
+def is_trusted_read_path(file_path):
+    """Return whether a path is readable without workspace sandbox confirmation.
 
-    覆盖范围：
-    1. skill 目录内的所有路径（is_skill_path）
-    2. ~/.agents/ 目录（agent 配置目录，通常仅含 skills/）
-    3. ~/.ycode/ 目录下的所有文件（含 config.json/mcp.json/数据库等）
-
-    用于沙盒白名单：Y-CODE 自己的配置/数据目录是受信任路径，
-    主代理读取自家数据目录不应被沙盒拦截。输出仅展示给本机用户，不外泄。
+    Trust is limited to configured Skill package directories. Y-CODE and agent
+    configuration directories can contain credentials and mutable state, so they
+    never receive a blanket trust exemption.
     """
     if not file_path:
         return False
-    # 1. skill 目录内的所有路径
-    if is_skill_path(file_path):
-        return True
     try:
-        p = str(file_path).strip()
-        p = os.path.expandvars(os.path.expanduser(p))
-        if not os.path.isabs(p):
-            p = os.path.join(os.getcwd(), p)
-        candidate = os.path.normcase(os.path.abspath(p))
+        candidate = str(file_path).strip()
+        if not candidate:
+            return False
+        candidate = os.path.expandvars(candidate)
+        candidate = os.path.expanduser(candidate)
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(os.getcwd(), candidate)
+        candidate = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+        if not os.path.exists(candidate):
+            return False
+        for search_root in get_skill_dirs():
+            root = os.path.normcase(os.path.realpath(os.path.abspath(search_root)))
+            if candidate == root or not candidate.startswith(root + os.sep):
+                continue
+            relative = os.path.relpath(candidate, root)
+            package_name = relative.split(os.sep, 1)[0]
+            package = os.path.normcase(os.path.realpath(os.path.join(root, package_name)))
+            if not package.startswith(root + os.sep) or not os.path.isdir(package):
+                continue
+            has_skill_file = any(
+                os.path.isfile(skill_file)
+                and os.path.normcase(os.path.realpath(skill_file)).startswith(package + os.sep)
+                for skill_file in (
+                    os.path.join(package, "SKILL.md"),
+                    os.path.join(package, "skill.md"),
+                )
+            )
+            if has_skill_file and (candidate == package or candidate.startswith(package + os.sep)):
+                return True
     except Exception:
         return False
-    home = os.path.expanduser("~")
-    # 2. ~/.agents/ 目录（通常仅含 skills/，安全）
-    agents_dir = os.path.normcase(os.path.abspath(os.path.join(home, ".agents")))
-    if candidate == agents_dir or candidate.startswith(agents_dir + os.sep):
-        return True
-    # 3. ~/.ycode/ 目录下的所有文件（主代理受信任，输出仅给本机用户）
-    ycode_dir = os.path.normcase(os.path.abspath(os.path.join(home, ".ycode")))
-    if candidate == ycode_dir or candidate.startswith(ycode_dir + os.sep):
-        return True
     return False
+
+
+# Compatibility name for callers that only need the trusted-read policy.
+is_trusted_path = is_trusted_read_path
 
 def parse_skill_md(file_path):
     """解析 SKILL.md，提取 YAML frontmatter 和 Markdown 正文"""
