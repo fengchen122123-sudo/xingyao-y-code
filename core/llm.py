@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -101,13 +102,18 @@ class PermissionSystemError(Exception):
 from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace
 from core.mcp_client import mcp_manager
 from core.permission_broker import CANCELLED_RESULT, permission_broker
+from core.command_policy import (
+    _session_rule_is_exact,
+    command_matches_session_rule,
+    session_rule_for_command,
+)
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
 from core.tool_presenter import summarize_tool_finished, summarize_tool_started
 from core.turn_events import TurnEventFactory
 import core.app_context as app_context
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
-session_allowed_commands = set()      # 放行的命令前缀 (如 'git', 'date')
+session_allowed_commands: set[tuple[str, ...]] = set()  # 结构化命令规则
 session_allowed_write_files = set()   # 放行的写入文件绝对路径
 session_allowed_edit_files = set()    # 放行的修改文件绝对路径
 _last_tracked_session = None
@@ -191,48 +197,21 @@ def check_session_reset():
             session_allowed_edit_files.clear()
 
 
-# 内联执行参数：含这些参数的命令不做会话前缀放行（等价于放行任意代码）
-# -m (python -m pip)、-p (node/perl -e 同类) 同样能执行任意模块/代码，必须拦截
-_INLINE_EXEC_FLAGS = {"-c", "-e", "--eval", "-command", "-encodedcommand", "/c", "-m", "-p"}
-
-
 def _session_prefix_for_command(cmd):
-    """计算可会话放行的命令前缀；内联执行命令返回 None 表示不予放行。"""
-    words = cmd.split()
-    if not words:
-        return None
-    first_word = words[0]
-
-    # 特殊处理：python / pip 脚本保留首个参数（脚本路径）以防过度放行整个解释器；
-    # 首个参数以 - 开头（如 python -m pip install）等价于任意模块执行，不予放行。
-    # 但只读查询（--version/-V/--help/-h）可以放行到前缀白名单，避免重复询问。
-    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
-        second = words[1].lower()
-        if second in {"-v", "--version", "-h", "--help", "-version", "--help"}:
-            return first_word
-        # python -m pip --version / -V / --help / -h 等只读查询放行到 "python -m pip"
-        if (
-            len(words) >= 4
-            and second == "-m"
-            and words[2].lower() == "pip"
-            and words[-1].lower() in {"--version", "-v", "--help", "-h"}
-        ):
-            return f"{first_word} -m pip"
-
-    lowered = [word.lower() for word in words]
-    if any(flag in lowered for flag in _INLINE_EXEC_FLAGS):
-        return None
-
-    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
-        if words[1].startswith("-"):
-            return None
-        return f"{first_word} {words[1]}"
-    return first_word
+    """兼容历史扩展名称，委托给结构化命令授权策略。"""
+    return session_rule_for_command(cmd)
 
 
 def _command_matches_prefix(cmd, prefix):
-    """前缀匹配：前缀之后必须是空格或结尾，避免放行 'git' 后命中 'gitfoo'。"""
-    return cmd == prefix or cmd.startswith(prefix + " ")
+    """兼容历史扩展名称，使用完整 token 元素匹配。"""
+    return command_matches_session_rule(cmd, prefix)
+
+
+def _format_session_command_rule(rule):
+    command = subprocess.list2cmdline(rule)
+    if _session_rule_is_exact(rule):
+        return f"精确规则：{command}"
+    return f"子命令规则：{command}（允许后续参数）"
 
 def safe_print(formatted_text):
     """线程安全地在 TUI 终端输出格式化文本，避免破坏屏幕布局"""
@@ -300,7 +279,7 @@ def ask_in_raw_terminal(function_name, arguments):
                 else:
                     with _session_whitelist_lock:
                         session_allowed_commands.add(prefix)
-                    print(f"[当前会话已放行前缀]：{prefix}*")
+                    print(f"[当前会话已放行] {_format_session_command_rule(prefix)}")
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
@@ -511,7 +490,7 @@ def check_permission_and_ask(
                     with _session_whitelist_lock:
                         session_allowed_commands.add(prefix)
                     if event_callback is None:
-                        safe_print(ANSI(f"   ✨ [当前会话已放行前缀]：{prefix}*"))
+                        safe_print(ANSI(f"   ✨ [当前会话已放行] {_format_session_command_rule(prefix)}"))
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
