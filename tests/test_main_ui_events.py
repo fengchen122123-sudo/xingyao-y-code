@@ -368,6 +368,8 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
     main._render_ui_event(factory.emit("thinking_started"))
     main._render_ui_event(factory.emit("thinking_delta", {"text": "用户说了"}))
     main._render_ui_event(factory.emit("thinking_delta", {"text": "\"你好\""}))
+    # 800ms 阈值：极短思考不打印分隔行，这里模拟思考耗时 1s 越过阈值
+    main.think_start_time -= 1.0
 
     assert main.active_thinking_text == '用户说了"你好"'
     assert '用户说了"你好"' in main._thinking_panel_text()
@@ -411,6 +413,8 @@ def test_each_thinking_segment_prints_its_own_divider_line(monkeypatch):
     for index in range(3):
         main._render_ui_event(factory.emit("thinking_started"))
         main._render_ui_event(factory.emit("thinking_delta", {"text": f"分析{index}"}))
+        # 800ms 阈值：模拟每段思考耗时 1s，越过阈值才会打印分隔线
+        main.think_start_time -= 1.0
         main._render_ui_event(factory.emit("thinking_finished"))
         # 每段思考结束都立即打印一行分隔线
         assert Text.from_ansi("".join(fragments)).plain.count("思考完成") == index + 1
@@ -424,6 +428,27 @@ def test_each_thinking_segment_prints_its_own_divider_line(monkeypatch):
     assert "共 3 段" not in plain
     assert "分析0" not in plain
     main.ui_renderers.pop("turn-thinking-segments", None)
+
+
+def test_brief_thinking_under_800ms_prints_no_divider_line(monkeypatch):
+    """极短思考（< 800ms，常见于模型回填的占位 reasoning）不打印分隔行，避免刷屏。"""
+    factory = TurnEventFactory("turn-thinking-brief")
+    fragments = []
+
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_print_ui_fragment", fragments.append)
+    monkeypatch.setattr(main, "app_instance", None)
+    main.ui_renderers.pop("turn-thinking-brief", None)
+    main.active_thinking_text = ""
+    main.active_thinking_turn_id = None
+
+    main._render_ui_event(factory.emit("thinking_started"))
+    main._render_ui_event(factory.emit("thinking_delta", {"text": " "}))
+    # 不调整 think_start_time：事件瞬时完成，耗时 < 800ms
+    main._render_ui_event(factory.emit("thinking_finished"))
+
+    assert "思考完成" not in Text.from_ansi("".join(fragments)).plain
+    main.ui_renderers.pop("turn-thinking-brief", None)
 
 
 def test_ui_keeps_reasoning_deltas_out_of_terminal_history(monkeypatch):
