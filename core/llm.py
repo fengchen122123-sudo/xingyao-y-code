@@ -85,7 +85,7 @@ API_REQUEST_MAX_TIMEOUT_SECONDS = 600
 
 # 单次请求等待反馈：超过阈值后按间隔向 UI 报一次“模型响应中”，
 # 避免大载荷请求长时间无反馈被误判为卡死
-WAIT_NOTICE_THRESHOLD_SECONDS = 15.0
+WAIT_NOTICE_THRESHOLD_SECONDS = 60.0
 WAIT_NOTICE_INTERVAL_SECONDS = 15.0
 
 # 工具结果中的错误哨兵前缀（统一在此定义，供结果判断与构造处引用）
