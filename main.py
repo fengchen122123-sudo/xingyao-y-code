@@ -264,6 +264,29 @@ def _esc(text) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _format_token_usage_summary(
+    cumulative_prompt, cumulative_completion, cumulative_cached
+):
+    """格式化状态栏累计 Token，并用同口径数据计算缓存命中率。"""
+    def format_num(num):
+        if num >= 1_000_000:
+            return f"{num / 1_000_000:.1f}M"
+        if num >= 1_000:
+            return f"{num / 1_000:.1f}K"
+        return str(num)
+
+    hit_rate = (
+        cumulative_cached / cumulative_prompt * 100
+        if cumulative_prompt > 0
+        else 0.0
+    )
+    return (
+        f"输入 {format_num(cumulative_prompt)} · "
+        f"输出 {format_num(cumulative_completion)} · "
+        f"命中 {format_num(cumulative_cached)} · 命中率 {hit_rate:.0f}%"
+    )
+
+
 def set_terminal_title(title: str) -> None:
     """设置终端窗口标题，兼容 Windows 控制台与 Windows Terminal 等现代终端。"""
     try:
@@ -2437,13 +2460,8 @@ def _make_input_app():
         with token_usage_lock:
             cum_prompt = session_token_usage.get("cumulative_prompt", 0)
             cum_completion = session_token_usage.get("cumulative_completion", 0)
+            cum_cached = session_token_usage.get("cumulative_cached", 0)
             latest_total = session_token_usage["latest_total"]
-            cache_latest_rate = session_token_usage.get("cache_latest_rate", 0.0)
-            cache_hot_rate = session_token_usage.get("cache_hot_rate", 0.0)
-            cache_cumulative_rate = session_token_usage.get("cache_cumulative_rate", 0.0)
-            cache_hot_turns = session_token_usage.get("cache_hot_turns", 0)
-            cache_cumulative_cached = session_token_usage.get("cache_cumulative_cached", 0)
-            cache_invalidation_reason = session_token_usage.get("cache_invalidation_reason", "")
         max_win = current_ctx_win
 
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
@@ -2457,21 +2475,12 @@ def _make_input_app():
                 return f"{int(val)}K" if val.is_integer() else f"{val:.1f}K"
             return str(n)
             
-        prompt_str = format_num(cum_prompt)
-        completion_str = format_num(cum_completion)
-        cached_str = format_num(cache_cumulative_cached)
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        # 状态栏 Token 概览：缓存率拆分为当前请求、严格追加的热启动平均、会话累计。
-        token_info = (
-            f"输入 {prompt_str} · 输出 {completion_str} · "
-            f"命中 {cached_str} (当前 {cache_latest_rate:.0f}% / "
-            f"热均 {cache_hot_rate:.0f}%[{cache_hot_turns}] / 累计 {cache_cumulative_rate:.0f}%) · "
-            f"上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
-        )
-        if cache_invalidation_reason:
-            token_info += f" · 缓存失效: {cache_invalidation_reason}"
+        token_info = _format_token_usage_summary(
+            cum_prompt, cum_completion, cum_cached
+        ) + f" · 上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
         from core.cache_keepalive import cache_keepalive_service
         keepalive_status = cache_keepalive_service.status()
         if keepalive_status["enabled"]:

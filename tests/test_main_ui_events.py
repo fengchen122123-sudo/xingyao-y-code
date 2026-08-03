@@ -6,6 +6,18 @@ from core.turn_events import TurnEventFactory
 from rich.text import Text
 
 
+def test_format_token_usage_summary_uses_cumulative_hit_rate():
+    assert main._format_token_usage_summary(315_100, 3_400, 312_000) == (
+        "输入 315.1K · 输出 3.4K · 命中 312.0K · 命中率 99%"
+    )
+
+
+def test_format_token_usage_summary_handles_zero_input():
+    assert main._format_token_usage_summary(0, 0, 0) == (
+        "输入 0 · 输出 0 · 命中 0 · 命中率 0%"
+    )
+
+
 def test_forward_response_events_preserves_order_without_duplicate_text():
     factory = TurnEventFactory("turn-ui")
     events = [
