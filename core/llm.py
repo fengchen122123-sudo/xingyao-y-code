@@ -3,6 +3,7 @@ import logging
 import os
 import random
 import re
+import subprocess
 import threading
 import time
 import uuid
@@ -88,6 +89,9 @@ PERMISSION_SYSTEM_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
     f"这不是用户拒绝，请稍后重试或检查权限组件状态。"
 )
+PATH_VALIDATION_ERROR_MESSAGE = (
+    f"{TOOL_ERROR_PREFIX} 无法验证路径是否位于当前工作区，已拒绝执行。"
+)
 
 
 class PermissionSystemError(Exception):
@@ -101,13 +105,18 @@ class PermissionSystemError(Exception):
 from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace
 from core.mcp_client import mcp_manager
 from core.permission_broker import CANCELLED_RESULT, permission_broker
+from core.command_policy import (
+    _session_rule_is_exact,
+    command_matches_session_rule,
+    session_rule_for_command,
+)
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
 from core.tool_presenter import summarize_tool_finished, summarize_tool_started
 from core.turn_events import TurnEventFactory
 import core.app_context as app_context
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
-session_allowed_commands = set()      # 放行的命令前缀 (如 'git', 'date')
+session_allowed_commands: set[tuple[str, ...]] = set()  # 结构化命令规则
 session_allowed_write_files = set()   # 放行的写入文件绝对路径
 session_allowed_edit_files = set()    # 放行的修改文件绝对路径
 _last_tracked_session = None
@@ -191,48 +200,21 @@ def check_session_reset():
             session_allowed_edit_files.clear()
 
 
-# 内联执行参数：含这些参数的命令不做会话前缀放行（等价于放行任意代码）
-# -m (python -m pip)、-p (node/perl -e 同类) 同样能执行任意模块/代码，必须拦截
-_INLINE_EXEC_FLAGS = {"-c", "-e", "--eval", "-command", "-encodedcommand", "/c", "-m", "-p"}
-
-
 def _session_prefix_for_command(cmd):
-    """计算可会话放行的命令前缀；内联执行命令返回 None 表示不予放行。"""
-    words = cmd.split()
-    if not words:
-        return None
-    first_word = words[0]
-
-    # 特殊处理：python / pip 脚本保留首个参数（脚本路径）以防过度放行整个解释器；
-    # 首个参数以 - 开头（如 python -m pip install）等价于任意模块执行，不予放行。
-    # 但只读查询（--version/-V/--help/-h）可以放行到前缀白名单，避免重复询问。
-    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
-        second = words[1].lower()
-        if second in {"-v", "--version", "-h", "--help", "-version", "--help"}:
-            return first_word
-        # python -m pip --version / -V / --help / -h 等只读查询放行到 "python -m pip"
-        if (
-            len(words) >= 4
-            and second == "-m"
-            and words[2].lower() == "pip"
-            and words[-1].lower() in {"--version", "-v", "--help", "-h"}
-        ):
-            return f"{first_word} -m pip"
-
-    lowered = [word.lower() for word in words]
-    if any(flag in lowered for flag in _INLINE_EXEC_FLAGS):
-        return None
-
-    if len(words) > 1 and ("python" in first_word or "pip" in first_word):
-        if words[1].startswith("-"):
-            return None
-        return f"{first_word} {words[1]}"
-    return first_word
+    """兼容历史扩展名称，委托给结构化命令授权策略。"""
+    return session_rule_for_command(cmd)
 
 
 def _command_matches_prefix(cmd, prefix):
-    """前缀匹配：前缀之后必须是空格或结尾，避免放行 'git' 后命中 'gitfoo'。"""
-    return cmd == prefix or cmd.startswith(prefix + " ")
+    """兼容历史扩展名称，使用完整 token 元素匹配。"""
+    return command_matches_session_rule(cmd, prefix)
+
+
+def _format_session_command_rule(rule):
+    command = subprocess.list2cmdline(rule)
+    if _session_rule_is_exact(rule):
+        return f"精确规则：{command}"
+    return f"子命令规则：{command}（允许后续参数）"
 
 def safe_print(formatted_text):
     """线程安全地在 TUI 终端输出格式化文本，避免破坏屏幕布局"""
@@ -300,7 +282,7 @@ def ask_in_raw_terminal(function_name, arguments):
                 else:
                     with _session_whitelist_lock:
                         session_allowed_commands.add(prefix)
-                    print(f"[当前会话已放行前缀]：{prefix}*")
+                    print(f"[当前会话已放行] {_format_session_command_rule(prefix)}")
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
@@ -511,7 +493,7 @@ def check_permission_and_ask(
                     with _session_whitelist_lock:
                         session_allowed_commands.add(prefix)
                     if event_callback is None:
-                        safe_print(ANSI(f"   ✨ [当前会话已放行前缀]：{prefix}*"))
+                        safe_print(ANSI(f"   ✨ [当前会话已放行] {_format_session_command_rule(prefix)}"))
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
@@ -555,6 +537,7 @@ session_token_usage = {
     # 累积消耗（用来算钱）
     "cumulative_total": 0,
     "cumulative_prompt": 0,
+    "cumulative_completion": 0,
     "cumulative_cached": 0,
     
     # 窗口占用（用来防止爆 128k 上下文）
@@ -1406,17 +1389,17 @@ def _sandbox_outside_guard(
     try:
         outside = is_outside_workspace(path_value)
     except Exception:
-        outside = False
+        return None, PATH_VALIDATION_ERROR_MESSAGE
     if not outside:
         return None, None
     from core import tools as _tools
-    # skill 目录是用户自行配置的受信任路径，读取 SKILL.md 不应触发沙盒询问
-    try:
-        from core.skills import is_skill_path
-        if is_skill_path(str(path_value)):
-            return None, None
-    except Exception:
-        pass
+    if function_name == "read_file":
+        try:
+            from core.skills import is_trusted_read_path
+            if is_trusted_read_path(str(path_value)):
+                return None, None
+        except Exception:
+            pass
     # 仅线程内单次放行（已批准的嵌套操作不重复询问）；
     # 会话级放行（/sandbox on、"始终放行"）不再跳过询问。
     if getattr(_tools._sandbox_tls, "depth", 0) > 0:
@@ -1603,8 +1586,8 @@ def _execute_single_tool_call(
         try:
             _defer_to_sandbox_guard = is_outside_workspace(arguments.get("file_path", ""))
         except Exception:
-            _defer_to_sandbox_guard = False
-    if requires_permission and not _defer_to_sandbox_guard:
+            result = PATH_VALIDATION_ERROR_MESSAGE
+    if requires_permission and not result and not _defer_to_sandbox_guard:
         try:
             approved = check_permission_and_ask(
                 function_name,
@@ -1629,7 +1612,12 @@ def _execute_single_tool_call(
     _raise_if_tool_cancelled(cancel_event)
 
     try:
-        if result in (PERMISSION_DENIED_MESSAGE, PERMISSION_CANCELLED_MESSAGE, PERMISSION_SYSTEM_ERROR_MESSAGE):
+        if result in (
+            PERMISSION_DENIED_MESSAGE,
+            PERMISSION_CANCELLED_MESSAGE,
+            PERMISSION_SYSTEM_ERROR_MESSAGE,
+            PATH_VALIDATION_ERROR_MESSAGE,
+        ):
             pass
         elif function_name == "read_file":
             bypass_cm, sandbox_err = _sandbox_outside_guard(
@@ -1867,10 +1855,18 @@ def _execute_single_tool_call(
             target = arguments.get("target_content")
             repl = arguments.get("replacement_content")
 
+            # 沙盒外编辑必须先获批，再检查目标是否存在，避免把外部路径存在性泄露给调用方。
+            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
+                function_name, file_path, event_callback,
+                permission_owner, parent_turn_id, permission_source, cancel_event,
+            )
+            if _sandbox_err:
+                result = _sandbox_err
+
             # 对过长的 target_content 提前拦截，避免 JSON 截断后反复失败浪费 token。
             # 模型应拆分为多个小片段编辑，或改用 write_file 重写整个文件。
             _EDIT_TARGET_MAX_LEN = 1500
-            if target and len(target) > _EDIT_TARGET_MAX_LEN:
+            if not result and target and len(target) > _EDIT_TARGET_MAX_LEN:
                 result = (
                     f"{TOOL_ERROR_PREFIX} edit_file 的 target_content 过长（"
                     f"{len(target)} 字符），超过 {_EDIT_TARGET_MAX_LEN} 字符限制，"
@@ -1886,7 +1882,7 @@ def _execute_single_tool_call(
 
             # 文件不存在时直接报错（edit_file 只能修改已有文件），
             # 避免对不存在的沙盒外路径做无意义的权限询问
-            if not os.path.isfile(file_path or ""):
+            if not result and not os.path.isfile(file_path or ""):
                 # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
                 # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
                 result = (
@@ -1900,14 +1896,7 @@ def _execute_single_tool_call(
                     "content": result,
                 }
 
-            # 沙盒外修改必须每次询问用户（即使 full 模式）
-            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
-                function_name, file_path, event_callback,
-                permission_owner, parent_turn_id, permission_source, cancel_event,
-            )
-            if _sandbox_err:
-                result = _sandbox_err
-            else:
+            if not result:
                 _edit_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
                 with _edit_cm:
                     try:
@@ -2571,9 +2560,13 @@ def _chat_with_model_generator(
                 with token_usage_lock:
                     session_token_usage["latest_total"] = getattr(stream_usage, "total_tokens", 0) or 0
                     session_token_usage["latest_prompt"] = getattr(stream_usage, "prompt_tokens", 0) or 0
+                    # completion = total - prompt（多数 provider 不直接给 completion_tokens）
                     session_token_usage["latest_cached"] = latest_cached
                     session_token_usage["cumulative_total"] += session_token_usage["latest_total"]
                     session_token_usage["cumulative_prompt"] += session_token_usage["latest_prompt"]
+                    session_token_usage["cumulative_completion"] += max(
+                        0, session_token_usage["latest_total"] - session_token_usage["latest_prompt"]
+                    )
                     session_token_usage["cumulative_cached"] += latest_cached
 
             reasoning_content, public_content = split_reasoning_text(accumulated_content)
@@ -2699,10 +2692,8 @@ def _chat_with_model_generator(
                     messages.append(summary_request)
                     # 该 user 催促消息也需要持久化，否则下一轮重建历史时上下文会缺失
                     pending_persistence.append(("user", summary_request))
-                    _notify_event(event_callback, "status", {
-                        "state": "executing",
-                        "message": "模型未生成结论，正在请求最终总结。",
-                    })
+                    # 内部兜底重试静默进行：底部状态栏已显示"正在干活..."，
+                    # 这里不再发 status 通知暴露"模型未生成结论"的内部细节。
                     continue
                 # 计划仍有可执行项时不允许提前收尾：向模型注入续推消息，
                 # 要求继续通过 run_subagent 完成剩余计划项（最多续推 2 次，

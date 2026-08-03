@@ -32,6 +32,24 @@ _shared_cache: dict[str, OrderedDict[tuple, Any]] = {}
 # Thread-local session id used to route shared-cache lookups from subagents.
 _session_tls = threading.local()
 
+# Per-tool hit/miss statistics.  Keys are tool names exposed to callers
+# (read_file / search_code / find_definition / glob / shared); values are
+# {"hits": int, "misses": int}.  Guarded by _LOCK like the caches above.
+_stats: dict[str, dict[str, int]] = {}
+
+
+def _record(tool: str, hit: bool) -> None:
+    """Record one cache hit or miss for a tool.
+
+    Caller must hold _LOCK.  Entries are created lazily on first use so
+    get_stats() stays empty until the corresponding tool is actually used.
+    """
+    entry = _stats.setdefault(tool, {"hits": 0, "misses": 0})
+    if hit:
+        entry["hits"] += 1
+    else:
+        entry["misses"] += 1
+
 
 def _prune(cache: OrderedDict) -> None:
     while len(cache) > _MAX_ENTRIES:
@@ -86,7 +104,9 @@ def read_file_get(key: tuple) -> str | None:
     with _LOCK:
         if key in _read_file_cache:
             _read_file_cache.move_to_end(key)
+            _record("read_file", hit=True)
             return _read_file_cache[key]
+        _record("read_file", hit=False)
     return None
 
 
@@ -118,10 +138,13 @@ def search_key(
 
 def search_get(key: tuple) -> str | None:
     with _LOCK:
-        cache = _search_cache if key[0] == "search_code" else _lsp_cache
+        tool = key[0]
+        cache = _search_cache if tool == "search_code" else _lsp_cache
         if key in cache:
             cache.move_to_end(key)
+            _record(tool, hit=True)
             return cache[key]
+        _record(tool, hit=False)
     return None
 
 
@@ -149,7 +172,9 @@ def glob_get(key: tuple) -> str | None:
     with _LOCK:
         if key in _glob_cache:
             _glob_cache.move_to_end(key)
+            _record("glob", hit=True)
             return _glob_cache[key]
+        _record("glob", hit=False)
     return None
 
 
@@ -177,8 +202,13 @@ def shared_get(session_id: str, key: tuple) -> Any | None:
     with _LOCK:
         session = _shared_cache.get(session_id)
         if session is None:
+            _record("shared", hit=False)
             return None
-        return session.get(key)
+        if key in session:
+            _record("shared", hit=True)
+            return session[key]
+        _record("shared", hit=False)
+        return None
 
 
 def shared_put(session_id: str, key: tuple, value: Any) -> None:
@@ -193,6 +223,45 @@ def shared_put(session_id: str, key: tuple, value: Any) -> None:
 def shared_clear(session_id: str) -> None:
     with _LOCK:
         _shared_cache.pop(session_id, None)
+
+
+# ---------------------------------------------------------------------------
+# Hit/miss statistics
+# ---------------------------------------------------------------------------
+
+
+def get_stats() -> dict:
+    """Return per-tool hit/miss counters and the overall hit rate.
+
+    Result format::
+
+        {
+            "tools": {tool: {"hits": int, "misses": int}, ...},
+            "total_hits": int,
+            "total_misses": int,
+            "hit_rate": float,  # hits/(hits+misses), 0.0 when no data yet
+        }
+
+    Useful for observing how effective the tool caches are at saving tokens.
+    """
+    with _LOCK:
+        tools = {name: dict(entry) for name, entry in sorted(_stats.items())}
+        total_hits = sum(entry["hits"] for entry in _stats.values())
+        total_misses = sum(entry["misses"] for entry in _stats.values())
+        total = total_hits + total_misses
+        hit_rate = total_hits / total if total else 0.0
+        return {
+            "tools": tools,
+            "total_hits": total_hits,
+            "total_misses": total_misses,
+            "hit_rate": hit_rate,
+        }
+
+
+def reset_stats() -> None:
+    """Testing helper: clear all accumulated hit/miss statistics."""
+    with _LOCK:
+        _stats.clear()
 
 
 # ---------------------------------------------------------------------------
