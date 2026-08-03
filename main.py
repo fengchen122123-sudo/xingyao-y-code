@@ -2437,13 +2437,15 @@ def _make_input_app():
         with token_usage_lock:
             cum_prompt = session_token_usage.get("cumulative_prompt", 0)
             cum_completion = session_token_usage.get("cumulative_completion", 0)
-            cum_cached = session_token_usage["cumulative_cached"]
             latest_total = session_token_usage["latest_total"]
+            cache_latest_rate = session_token_usage.get("cache_latest_rate", 0.0)
+            cache_hot_rate = session_token_usage.get("cache_hot_rate", 0.0)
+            cache_cumulative_rate = session_token_usage.get("cache_cumulative_rate", 0.0)
+            cache_hot_turns = session_token_usage.get("cache_hot_turns", 0)
+            cache_cumulative_cached = session_token_usage.get("cache_cumulative_cached", 0)
+            cache_invalidation_reason = session_token_usage.get("cache_invalidation_reason", "")
         max_win = current_ctx_win
 
-        # 命中率分母用 prompt tokens（缓存只可能命中输入部分），
-        # 用 total（含输出）会把比率稀释失真
-        hit_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else 0
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
         
         def format_num(n):
@@ -2457,16 +2459,25 @@ def _make_input_app():
             
         prompt_str = format_num(cum_prompt)
         completion_str = format_num(cum_completion)
-        cached_str = format_num(cum_cached)
+        cached_str = format_num(cache_cumulative_cached)
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        # 状态栏 Token 概览：输入/输出/命中/命中率/上下文
+        # 状态栏 Token 概览：缓存率拆分为当前请求、严格追加的热启动平均、会话累计。
         token_info = (
             f"输入 {prompt_str} · 输出 {completion_str} · "
-            f"命中 {cached_str} ({hit_rate:.0f}%) · "
+            f"命中 {cached_str} (当前 {cache_latest_rate:.0f}% / "
+            f"热均 {cache_hot_rate:.0f}%[{cache_hot_turns}] / 累计 {cache_cumulative_rate:.0f}%) · "
             f"上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
         )
+        if cache_invalidation_reason:
+            token_info += f" · 缓存失效: {cache_invalidation_reason}"
+        from core.cache_keepalive import cache_keepalive_service
+        keepalive_status = cache_keepalive_service.status()
+        if keepalive_status["enabled"]:
+            token_info += f" · 保活 {keepalive_status['interval']}s"
+        elif keepalive_status["error"]:
+            token_info += f" · 保活已停止: {keepalive_status['error']}"
 
         # 3. 统计星瑶的执行状态与播放动画，证明星瑶仍在操作/思考
         # 直接读模块全局变量，不再 import main 自引用

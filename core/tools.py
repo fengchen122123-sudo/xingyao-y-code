@@ -2735,6 +2735,8 @@ class SubagentManager:
             parent_turn_id=None,
             permission_owner=task.task_id,
             permission_source=f"子代理：{task.description[:40]}",
+            cache_scope=f"subagent:{role}",
+            cache_session_id=task.parent_session,
         )
         answer = []
         tool_errors: dict[str, str] = {}

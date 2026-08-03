@@ -517,7 +517,6 @@ class MemoryManager:
                     normalized = {"role": role}
                     normalized.update(parsed)
                     normalized["role"] = role
-                    normalized.pop("reasoning_content", None)
                     history.append(normalized)
                 else:
                     history.append({"role": role, "content": parsed})

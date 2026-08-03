@@ -283,13 +283,23 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             pass
 
         # 懒加载 litellm.completion（首次调用触发 import，约 1.4s）
-        from core.llm import _litellm_completion
+        from core.llm import _litellm_completion, _provider_cache_affinity_options
+        request_kwargs = {
+            "model": compress_model,
+            "api_key": compress_key,
+            "api_base": compress_url,
+            "messages": [{"role": "user", "content": prompt}],
+            "timeout": 15,
+        }
+        request_kwargs.update(_provider_cache_affinity_options(
+            compress_model,
+            compress_url,
+            cache_scope="secondary:compression",
+            cache_session_id=session_name,
+            tool_contract="no-tools",
+        ))
         response = _litellm_completion(
-            model=compress_model,
-            api_key=compress_key,
-            api_base=compress_url,
-            messages=[{"role": "user", "content": prompt}],
-            timeout=15
+            **request_kwargs
         )
         new_summary = response.choices[0].message.content.strip()
         # 清除多余的 markdown 格式或引导词

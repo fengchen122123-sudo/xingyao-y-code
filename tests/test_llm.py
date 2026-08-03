@@ -116,7 +116,7 @@ def _patch_model_cfg(monkeypatch, cfg):
 
 
 def test_kimi_openai_route_sends_prompt_cache_key(monkeypatch):
-    """OpenAI 兼容路由：Kimi 系模型请求带 extra_body.prompt_cache_key = 会话 ID。"""
+    """OpenAI 兼容路由携带会话级稳定且不暴露原会话名的缓存键。"""
     from core.llm import _provider_request_options
 
     _patch_session(monkeypatch, "session_abc123")
@@ -124,7 +124,12 @@ def test_kimi_openai_route_sends_prompt_cache_key(monkeypatch):
 
     opts = _provider_request_options("openai/kimi-k3", "https://api.moonshot.cn/v1")
 
-    assert opts["extra_body"]["prompt_cache_key"] == "session_abc123"
+    cache_key = opts["extra_body"]["prompt_cache_key"]
+    assert cache_key.startswith("ycode-")
+    assert "session_abc123" not in cache_key
+    assert _provider_request_options(
+        "openai/kimi-k3", "https://api.moonshot.cn/v1"
+    )["extra_body"]["prompt_cache_key"] == cache_key
     assert "metadata" not in opts
     # 内置默认表行为保持不变
     assert opts["max_tokens"] == 32000
@@ -139,7 +144,8 @@ def test_kimi_anthropic_route_sends_metadata_user_id(monkeypatch):
 
     opts = _provider_request_options("anthropic/kimi-for-coding", "https://api.kimi.com/coding")
 
-    assert opts["metadata"] == {"user_id": "session_abc123"}
+    assert opts["metadata"]["user_id"].startswith("ycode-")
+    assert "session_abc123" not in opts["metadata"]["user_id"]
     assert "extra_body" not in opts
     # 原有 thinking 配置不受影响
     assert opts["thinking"] == {"type": "enabled", "budget_tokens": 4096}
@@ -168,7 +174,7 @@ def test_reasoning_effort_injected_for_kimi_openai_route(monkeypatch):
 
     assert opts["extra_body"]["reasoning_effort"] == "low"
     # 与 prompt_cache_key 共存于同一 extra_body
-    assert opts["extra_body"]["prompt_cache_key"] == "session_abc123"
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
 
 
 def test_reasoning_effort_skipped_on_anthropic_route_and_invalid_value(monkeypatch):
@@ -186,7 +192,7 @@ def test_reasoning_effort_skipped_on_anthropic_route_and_invalid_value(monkeypat
     _patch_model_cfg(monkeypatch, {"reasoning_effort": "turbo"})
     opts = _provider_request_options("openai/kimi-k3", "https://api.moonshot.cn/v1")
     assert "reasoning_effort" not in opts["extra_body"]
-    assert opts["extra_body"]["prompt_cache_key"] == "session_abc123"
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
 
 
 def test_explicit_model_config_still_gets_cache_affinity(monkeypatch):
@@ -199,4 +205,109 @@ def test_explicit_model_config_still_gets_cache_affinity(monkeypatch):
     opts = _provider_request_options("openai/kimi-k3", "https://api.moonshot.cn/v1")
 
     assert opts["max_tokens"] == 8192
-    assert opts["extra_body"]["prompt_cache_key"] == "session_abc123"
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
+
+
+def test_kimi_cache_affinity_isolated_by_scope_and_tool_contract(monkeypatch):
+    """主代理、子代理及不同工具契约不得共享缓存通道。"""
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(monkeypatch, None)
+
+    def key(scope, contract):
+        return _provider_request_options(
+            "openai/kimi-for-coding",
+            "https://api.kimi.com/coding/v1",
+            cache_scope=scope,
+            tool_contract=contract,
+        )["extra_body"]["prompt_cache_key"]
+
+    main = key("main", "tools-v1")
+    assert key("main", "tools-v1") == main
+    assert key("subagent:explore", "tools-v1") != main
+    assert key("main", "tools-v2") != main
+
+
+def test_explicit_cache_session_is_independent_of_current_ui_session(monkeypatch):
+    """后台子代理必须锁定启动时父会话，不能被之后的 UI 会话切换影响。"""
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "ui-session-changed")
+    _patch_model_cfg(monkeypatch, None)
+
+    first = _provider_request_options(
+        "openai/kimi-for-coding",
+        "https://api.kimi.com/coding/v1",
+        cache_scope="subagent:test",
+        cache_session_id="captured-parent-session",
+    )["extra_body"]["prompt_cache_key"]
+    _patch_session(monkeypatch, "another-ui-session")
+    second = _provider_request_options(
+        "openai/kimi-for-coding",
+        "https://api.kimi.com/coding/v1",
+        cache_scope="subagent:test",
+        cache_session_id="captured-parent-session",
+    )["extra_body"]["prompt_cache_key"]
+
+    assert first == second
+
+
+def test_cache_request_classification_reports_exact_invalidation_reason():
+    from core.llm import _classify_cache_request
+
+    session = "telemetry-classification-session"
+    base_messages = [{"role": "system", "content": "stable"}]
+
+    assert _classify_cache_request(
+        session, "main", "openai/kimi", "https://api.kimi.test/v1", "tools-a", base_messages
+    ) == "冷启动"
+    assert _classify_cache_request(
+        session,
+        "main",
+        "openai/kimi",
+        "https://api.kimi.test/v1",
+        "tools-a",
+        base_messages + [{"role": "user", "content": "append"}],
+    ) == ""
+    assert _classify_cache_request(
+        session,
+        "main",
+        "openai/kimi",
+        "https://api.kimi.test/v1",
+        "tools-b",
+        base_messages + [{"role": "user", "content": "append"}],
+    ) == "工具契约变化"
+    assert _classify_cache_request(
+        session,
+        "main",
+        "openai/other-kimi",
+        "https://api.kimi.test/v1",
+        "tools-b",
+        base_messages + [{"role": "user", "content": "append"}],
+    ) == "模型或接口变化"
+    assert _classify_cache_request(
+        session,
+        "main",
+        "openai/other-kimi",
+        "https://api.kimi.test/v1",
+        "tools-b",
+        [{"role": "system", "content": "rewritten"}],
+    ) == "上下文压缩或历史重写"
+
+
+def test_cache_usage_separates_latest_hot_and_session_cumulative():
+    from core.llm import _record_cache_usage
+
+    session = "telemetry-usage-session"
+    cold = _record_cache_usage(session, "main", 1000, 0, "冷启动")
+    assert cold["latest_rate"] == 0
+    assert cold["hot_prompt"] == 0
+    assert cold["cumulative_rate"] == 0
+
+    hot = _record_cache_usage(session, "main", 1000, 990, "")
+    assert hot["latest_rate"] == 99
+    assert hot["hot_rate"] == 99
+    assert hot["hot_turns"] == 1
+    assert hot["cumulative_rate"] == 49.5
+    assert hot["invalidation_reason"] == ""

@@ -320,10 +320,12 @@ def build_default_registry() -> ToolRegistry:
                 "start_line": {"type": "integer", "description": "路径B 必传：1-based 起始行号（inclusive）。必须与 end_line 同时提供"},
                 "end_line": {"type": "integer", "description": "路径B 必传：1-based 结束行号（inclusive）。必须与 start_line 同时提供。超出文件总行数时自动收敛不报错"},
             }, ["file_path", "replacement_content"],
-            anyOf=[
-                {"required": ["target_content"]},
-                {"required": ["start_line", "end_line"]},
-            ]),
+            allOf=[{
+                "anyOf": [
+                    {"type": "object", "required": ["target_content"]},
+                    {"type": "object", "required": ["start_line", "end_line"]},
+                ],
+            }]),
             execute=tools.edit_file,
             mutates_files=True,
             activity_description="修改文件",
