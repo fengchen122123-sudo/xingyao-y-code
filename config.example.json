@@ -37,7 +37,8 @@
           "supports_vision": false,
           "max_tokens": 8192,
           "thinking_budget": null,
-          "enable_thinking": null
+          "enable_thinking": null,
+          "reasoning_effort": null
         }
       ]
     }

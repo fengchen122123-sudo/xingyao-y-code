@@ -147,6 +147,56 @@ def _insert_before_last_user(history: list, message: dict) -> None:
         history.append(message)
 
 
+def _drop_legacy_leading_systems(history: list) -> list:
+    """丢弃首个 user 消息之前的 system 消息（历史遗留的稳定提示词）。
+
+    稳定提示词每轮重新组装插入到 position 0，不持久化；append-only 持久化的
+    上下文块（动态块/时间注记/后台汇总）按设计都位于某条 user 消息之后，
+    不受本清理影响。
+    """
+    cleaned = []
+    seen_user = False
+    for msg in history:
+        if msg.get("role") == "system" and not seen_user:
+            continue
+        cleaned.append(msg)
+        if msg.get("role") == "user":
+            seen_user = True
+    return cleaned
+
+
+def _reposition_context_blocks(history: list) -> list:
+    """把持久化的上下文块在内存中前移回对应 user 消息之前。
+
+    持久化时上下文块按自然追加顺序落在当轮 user 消息之后（DB: [user][块]）；
+    发给模型时在内存中还原为 [块][user]，与当轮新注入的块位置约定一致。
+    该重排每轮确定性执行，保证跨轮请求的 prefix 字节级连续（缓存命中关键）。
+    """
+    out: list = []
+    for msg in history:
+        if msg.get("role") != "system" or not out:
+            out.append(msg)
+            continue
+        for i in range(len(out) - 1, -1, -1):
+            if out[i].get("role") == "user":
+                out.insert(i, msg)
+                break
+        else:
+            out.append(msg)
+    return out
+
+
+def _persist_context_block(manager, session_name: str, content: str) -> None:
+    """把上下文块以 system 角色持久化到会话历史（append-only，永不删除）。
+
+    落库失败只记录日志：下一轮会基于 DB 内容重新注入，不影响本轮请求。
+    """
+    try:
+        manager.add_message(session_name, "system", content)
+    except Exception:
+        logger.warning("上下文块持久化失败，下一轮将重新注入", exc_info=True)
+
+
 def build_background_task_summary(session_name: str) -> str:
     """提取本会话中所有终态且尚未消费的后台子代理任务，拼成注入用的 system 文本。
 
@@ -300,28 +350,52 @@ def prepare_turn_messages(
 
     # 只在这一层组装一个稳定提示词和一份当前运行上下文。
     from core.context_builder import (
+        DYNAMIC_CONTEXT_PREFIX,
         build_dynamic_prompt,
         build_stable_prompt,
-        without_system_messages,
+        build_time_note,
     )
-    history = without_system_messages(history)
+
+    # 1) 清理 legacy 首部 system（稳定提示词每轮现组）；持久化的上下文块保留
+    history = _drop_legacy_leading_systems(history)
+    # 2) 持久化的上下文块（DB 中位于当轮 user 之后）前移回 user 之前，
+    #    每轮确定性重排，保证跨轮请求 prefix 字节级连续
+    history = _reposition_context_blocks(history)
 
     system_prompt = load_system_prompt()
     runtime = build_runtime_context(model_name, permission_mode)
     stable_prompt = build_stable_prompt(system_prompt)
     dynamic_prompt = build_dynamic_prompt(runtime)
     history.insert(0, {"role": "system", "content": stable_prompt})
-    # 动态上下文独立为第二条 system 消息并靠近当前用户输入，
-    # 保持第一条 system 消息内容稳定，提升 provider 侧 prefix caching 命中率。
-    _insert_before_last_user(history, {"role": "system", "content": dynamic_prompt})
+
+    # 3) 动态运行上下文块：内容不变则沿用历史中已持久化的那份（不重注、不删除），
+    #    变化时才追加新块并持久化——append-only 是跨轮缓存命中的关键
+    latest_dynamic = next(
+        (
+            str(m.get("content") or "")
+            for m in reversed(history)
+            if m.get("role") == "system"
+            and str(m.get("content") or "").startswith(DYNAMIC_CONTEXT_PREFIX)
+        ),
+        None,
+    )
+    if dynamic_prompt != latest_dynamic:
+        _insert_before_last_user(history, {"role": "system", "content": dynamic_prompt})
+        _persist_context_block(manager, session_name, dynamic_prompt)
+
+    # 4) 时间注记：每轮新追加一条（纯增量），旧注记保留不删
+    time_note = build_time_note(runtime)
+    _insert_before_last_user(history, {"role": "system", "content": time_note})
+    _persist_context_block(manager, session_name, time_note)
 
     # 主代理汇总/兜底机制：提取本会话中所有终态（成功+失败）且尚未消费的后台子代理任务，
     # 注入到 history 中作为 system 消息，让主代理能汇总成功结果并用自身工具接手失败任务。
     try:
         summary_msg = build_background_task_summary(session_name)
         if summary_msg:
-            # 插入到用户消息之前，让主代理把汇总上下文当作本轮的额外信息处理
+            # 与其他上下文块同样 append-only：注入一次后持久化保留
             _insert_before_last_user(history, {"role": "system", "content": summary_msg})
+            _persist_context_block(manager, session_name, summary_msg)
     except Exception:
         # 汇总机制失败不能影响主流程
         pass

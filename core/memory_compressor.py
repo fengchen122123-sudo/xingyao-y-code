@@ -212,6 +212,10 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             chat_log = ""
             for msg in messages_to_summarize:
                 role = msg["role"]
+                # 上下文块（动态运行上下文/时间注记/后台汇总）是脚手架而非对话内容，
+                # 不参与归纳，避免把多份计划快照/时间注记写进记忆摘要
+                if role == "system":
+                    continue
                 if role == "user":
                     role_display = "用户"
                 elif role == "tool":

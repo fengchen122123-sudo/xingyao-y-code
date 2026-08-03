@@ -1046,3 +1046,191 @@ def test_length_truncated_retry_bumps_max_tokens(mocker):
         m["role"] == "user" and "输出长度限制被截断" in str(m.get("content", ""))
         for m in messages
     )
+
+
+def test_context_overflow_circuit_breaker_after_compression(mocker, monkeypatch):
+    """压缩过一次后仍超窗必须直接熔断失败，不得继续重发超大载荷空烧额度。"""
+    import main
+
+    monkeypatch.setattr(main, "current_session", "overflow-breaker-session")
+
+    class FakeManager:
+        def get_history(self, session):
+            return [{"role": "user", "content": "压缩后的历史"}]
+
+    monkeypatch.setattr(main, "manager", FakeManager())
+
+    compress_calls = []
+
+    def fake_compress(manager, session, api_model, api_key, api_url, force=False, output_callback=None):
+        compress_calls.append(session)
+
+    monkeypatch.setattr("core.memory_compressor.compress_session_memory", fake_compress)
+
+    completion_calls = []
+
+    def always_overflow(**kwargs):
+        completion_calls.append(kwargs)
+        raise RuntimeError("prompt is too long: context window exceeded")
+
+    mocker.patch("core.llm.completion", side_effect=always_overflow)
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "原始问题"}],
+        persist=False,
+        turn_id="turn-overflow-breaker",
+        consume_background_notifications=False,
+    ))
+
+    # 第一次超窗 → 压缩一次并重试；第二次超窗 → 熔断，不再压缩也不再重发
+    assert compress_calls == ["overflow-breaker-session"]
+    assert len(completion_calls) == 2
+    error_events = [e for e in events if e.kind == "turn_error"]
+    assert error_events, "熔断后必须向 UI 抛出 turn_error"
+    assert any(
+        "上下文窗口" in str(e.payload.get("message", "")) or "额度" in str(e.payload.get("message", ""))
+        for e in error_events
+    )
+
+
+def test_request_timeout_scales_with_payload(mocker, monkeypatch):
+    """大载荷请求的超时必须随估算 token 数放大（并封顶），小载荷保持默认 90s。"""
+    captured = []
+
+    def fake_completion(**kwargs):
+        captured.append(dict(kwargs))
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+
+    # 小载荷：默认超时
+    monkeypatch.setattr("core.llm.estimate_tokens", lambda model, msgs: 1000)
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "小请求"}],
+        persist=False,
+        turn_id="turn-timeout-small",
+        consume_background_notifications=False,
+    ))
+    assert captured[-1]["timeout"] == 90
+
+    # 大载荷：超时放大 = 90 + tokens // 1500
+    monkeypatch.setattr("core.llm.estimate_tokens", lambda model, msgs: 300_000)
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "大请求"}],
+        persist=False,
+        turn_id="turn-timeout-large",
+        consume_background_notifications=False,
+    ))
+    assert captured[-1]["timeout"] == 90 + 300_000 // 1500
+
+    # 超大载荷：封顶在 API_REQUEST_MAX_TIMEOUT_SECONDS
+    monkeypatch.setattr("core.llm.estimate_tokens", lambda model, msgs: 100_000_000)
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "超大请求"}],
+        persist=False,
+        turn_id="turn-timeout-huge",
+        consume_background_notifications=False,
+    ))
+    from core.llm import API_REQUEST_MAX_TIMEOUT_SECONDS
+    assert captured[-1]["timeout"] == API_REQUEST_MAX_TIMEOUT_SECONDS
+
+
+def test_wait_notice_emitted_during_slow_request(mocker, monkeypatch):
+    """请求长时间无响应时必须向 UI 周期性上报等待状态，避免被误判为卡死。"""
+    import time as _time
+
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_THRESHOLD_SECONDS", 0.05)
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_INTERVAL_SECONDS", 0.05)
+
+    def slow_completion(**kwargs):
+        _time.sleep(0.3)
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=slow_completion)
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "慢请求"}],
+        persist=False,
+        turn_id="turn-wait-notice",
+        consume_background_notifications=False,
+    ))
+
+    notices = [
+        e for e in events
+        if e.kind == "status" and "模型响应中" in str(e.payload.get("message", ""))
+    ]
+    assert notices, "慢请求期间必须上报“模型响应中”状态事件"
+    assert "超时上限" in str(notices[0].payload["message"])
+
+
+def test_fold_old_media_for_estimate_keeps_only_latest_image():
+    """token 估算时历史图片必须折叠为占位符（与请求时的折叠规则一致），
+    仅最近一条带图用户消息保留原样，避免 base64 字符量虚高误触发压缩。"""
+    from core.llm import _fold_old_media_for_estimate
+
+    base64_blob = "a" * 200_000
+
+    def img_msg(text):
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": text},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_blob}"}},
+            ],
+        }
+
+    messages = [
+        img_msg("第一张图"),
+        {"role": "assistant", "content": "看到了"},
+        img_msg("第二张图"),
+    ]
+    folded = _fold_old_media_for_estimate(messages)
+
+    # 历史图片折叠为 "[图片]" 占位符，不再携带 base64
+    assert folded[0]["content"] == "第一张图 [图片]"
+    assert base64_blob not in str(folded[0])
+    # 最近一条带图消息保留原样
+    assert folded[2] is messages[2]
+    assert base64_blob in str(folded[2])
+
+
+def test_estimate_tokens_ignores_old_image_base64(mocker):
+    """estimate_tokens 走 litellm 计数时，历史图片必须先折叠，base64 不得参与计数。"""
+    import core.llm as llm_module
+    from core.llm import estimate_tokens
+
+    base64_blob = "b" * 200_000
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "旧图"},
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_blob}"}},
+            ],
+        },
+        {"role": "assistant", "content": "已识别"},
+        {"role": "user", "content": "继续"},
+    ]
+    counted = []
+
+    def fake_counter(model_name, msgs):
+        counted.append(msgs)
+        return 123
+
+    llm_module._token_estimate_cache["sig"] = None  # 避免命中签名缓存
+    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+
+    assert estimate_tokens("fake-model", messages) == 123
+    assert counted, "必须调用 litellm 计数"
+    assert base64_blob not in str(counted[0])
+    assert "[图片]" in str(counted[0])
