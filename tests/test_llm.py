@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from core.llm import (
     _command_matches_prefix,
     _escape_control_chars_in_json_strings,
+    _format_session_command_rule,
     _session_prefix_for_command,
     chat_with_model,
 )
@@ -36,18 +37,18 @@ def test_chat_with_model_success(mocker):
 
 def test_command_prefix_requires_boundary():
     """放行 'git' 后 'gitfoo' 不得命中，'git status' 才命中。"""
-    assert _command_matches_prefix("git", "git") is True
-    assert _command_matches_prefix("git status", "git") is True
-    assert _command_matches_prefix("gitfoo", "git") is False
-    assert _command_matches_prefix("gitfoo --bar", "git") is False
+    assert _command_matches_prefix("git", ("git",)) is True
+    assert _command_matches_prefix("git status", ("git",)) is False
+    assert _command_matches_prefix("gitfoo", ("git",)) is False
+    assert _command_matches_prefix("gitfoo --bar", ("git",)) is False
 
 
 def test_inline_exec_command_is_not_session_allowlisted():
     """含 -c/-e 等内联执行参数的命令不生成会话放行前缀。"""
     assert _session_prefix_for_command('python -c "print(1)"') is None
     assert _session_prefix_for_command("node -e 'console.log(1)'") is None
-    assert _session_prefix_for_command("python script.py") == "python script.py"
-    assert _session_prefix_for_command("git status") == "git"
+    assert _session_prefix_for_command("python script.py") == ("python", "script.py")
+    assert _session_prefix_for_command("git status") == ("git", "status")
     assert _session_prefix_for_command("") is None
 
 
@@ -58,12 +59,25 @@ def test_inline_module_exec_flags_are_not_session_allowlisted():
     assert _session_prefix_for_command('node -p "1+1"') is None
     assert _session_prefix_for_command("perl -p -i -e 's/a/b/' file") is None
     # 只读查询（-V/--version/-h/--help）可以放行至前缀白名单
-    assert _session_prefix_for_command("python -V") == "python"
-    assert _session_prefix_for_command("python --version") == "python"
-    assert _session_prefix_for_command("python -m pip --version") == "python -m pip"
+    assert _session_prefix_for_command("python -V") == ("python", "-V")
+    assert _session_prefix_for_command("python --version") == ("python", "--version")
+    assert _session_prefix_for_command("python -m pip --version") is None
     # 普通脚本/子命令路径仍按原规则放行
-    assert _session_prefix_for_command("python script.py") == "python script.py"
-    assert _session_prefix_for_command("pip install requests") == "pip install"
+    assert _session_prefix_for_command("python script.py") == ("python", "script.py")
+    assert _session_prefix_for_command("pip install requests") == ("pip", "install")
+
+
+def test_stored_status_rule_cannot_approve_reset_or_shell_composition():
+    stored_rules = {_session_prefix_for_command("git status")}
+
+    assert any(_command_matches_prefix("git status --short", rule) for rule in stored_rules)
+    assert not any(_command_matches_prefix("git reset --hard", rule) for rule in stored_rules)
+    assert not any(_command_matches_prefix("git status; whoami", rule) for rule in stored_rules)
+
+
+def test_session_command_rule_feedback_describes_actual_match_mode():
+    assert _format_session_command_rule(("python", "--version")) == "精确规则：python --version"
+    assert _format_session_command_rule(("git", "status")) == "子命令规则：git status（允许后续参数）"
 
 
 def test_json_repair_only_escapes_raw_control_chars_inside_strings():

@@ -13,8 +13,6 @@ from core.ui_markers import (
     ANSI_RED,
     ANSI_RESET,
     ANSI_YELLOW,
-    MARK_DONE,
-    MARK_FAILED,
     plan_color,
     plan_mark,
 )
@@ -92,7 +90,7 @@ def sanitize_protocol_text(text: str) -> str:
 class TurnRenderer:
     """Accumulate assistant text and tool status lines without doing I/O."""
 
-    def __init__(self, tool_verbose: bool = True) -> None:
+    def __init__(self) -> None:
         self._records: list[str] = []
         self._pending_text = ""
         self._in_thinking = False
@@ -101,12 +99,11 @@ class TurnRenderer:
         self._emitted: list[str] = []
         self._finished = False
         self._completed_tool_count = 0
-        # 工具调用细节是否在屏幕打印（False=简短模式：只显示"星瑶正在干活"汇总行）
-        # 数据库记录不受此开关影响，event 仍带完整 summary 入库
-        self._tool_verbose = bool(tool_verbose)
+        # 简短模式：只显示"星瑶正在干活"汇总行 + 收尾统计行，
+        # 不逐条打印每个工具调用细节。数据库记录不受此影响，event 仍带完整 summary 入库。
         self._completed_tools: list[tuple[str, str]] = []
         self._failed_tool_count = 0
-        # 简短模式下"星瑶正在干活…"汇总行是否已打印过（每回合只打印一次）
+        # "星瑶正在干活…"汇总行是否已打印过（每回合只打印一次）
         self._concise_header_emitted = False
         # 工具区与上文之间的分段空行是否已输出（每回合首个工具行前补一次）
         self._section_gap_emitted = False
@@ -143,16 +140,13 @@ class TurnRenderer:
         elif kind == "diff_ready":
             diff = str(data.get("text") or data.get("diff") or "")
             if diff:
-                if self._tool_verbose:
-                    self._append_line(diff)
-                else:
-                    file_path = str(data.get("file_path") or "").strip()
-                    added, removed = _count_diff_changes(diff)
-                    self._append_line(
-                        f"✎ {ANSI_CYAN}{file_path}{ANSI_RESET}"
-                        f"（{ANSI_GREEN}+{added}{ANSI_RESET} 行 / "
-                        f"{ANSI_RED}-{removed}{ANSI_RESET} 行）"
-                    )
+                file_path = str(data.get("file_path") or "").strip()
+                added, removed = _count_diff_changes(diff)
+                self._append_line(
+                    f"✎ {ANSI_CYAN}{file_path}{ANSI_RESET}"
+                    f"（{ANSI_GREEN}+{added}{ANSI_RESET} 行 / "
+                    f"{ANSI_RED}-{removed}{ANSI_RESET} 行）"
+                )
         elif kind == "plan_updated":
             if data.get("live_only"):
                 return []
@@ -297,23 +291,14 @@ class TurnRenderer:
         preview = str(data.get("preview") or "").strip()
         return f"{name}({preview})" if preview else name
 
-    def _styled_tool_summary(self, data: dict[str, Any]) -> str:
-        summary = self._tool_label(data)
-        target = str(data.get("preview") or "").strip()
-        if not target or target not in summary:
-            return summary
-        before, _, after = summary.partition(target)
-        return f"{before}{ANSI_CYAN}{target}{ANSI_RESET}{after}"
 
     def _tool_requested(self, data: dict[str, Any]) -> None:
         tool_id = str(data.get("id") or self._tool_label(data))
         label = self._tool_label(data)
         self._tool_lines[tool_id] = (label, "")
-        # 详细模式：不再打印"星瑶正在 X"请求行，只做内部记录——工具的唯一一行
-        # 反馈改到 _tool_finished 里打印（✓/✗ 汇总行），进行中的状态已经由
-        # main.py 底部的活动指示行实时展示，这里重复打印只会让屏幕更吵。
-        # 简短模式：仅首次工具调用时打印一行"星瑶正在干活"汇总（每回合一次）。
-        if not self._tool_verbose and not self._concise_header_emitted:
+        # 仅首次工具调用时打印一行"星瑶正在干活"汇总（每回合一次）。
+        # 进行中的状态由 main.py 底部的活动指示行实时展示，这里不重复打印。
+        if not self._concise_header_emitted:
             self._concise_header_emitted = True
             self._append_section_gap()
             self._append_line(f"{ANSI_GREEN}●{ANSI_RESET} 星瑶正在干活…")
@@ -329,16 +314,10 @@ class TurnRenderer:
         self._completed_tools.append((str(data.get("name", "tool")), label))
         if not ok:
             self._failed_tool_count += 1
-        styled_summary = self._styled_tool_summary(data) if data.get("summary") else label
-        if not self._tool_verbose:
-            # 简短模式：所有工具调用（无论成功失败）都保持静默，不逐条刷屏；
-            # 失败数量由回合收尾的 concise_recap 统计行汇总展示，
-            # 用户可通过 /verbose on 切到详细模式查看每个工具的完整过程。
-            return
-        marker = MARK_DONE if ok else MARK_FAILED
-        color = ANSI_GREEN if ok else ANSI_RED
-        self._append_section_gap()
-        self._append_line(f"{color}{marker}{ANSI_RESET} {styled_summary}")
+        # 所有工具调用（无论成功失败）都保持静默，不逐条刷屏；
+        # 失败数量由回合收尾的 concise_recap 统计行汇总展示。
+        # 例外：读取 SKILL.md 表示模型正在加载技能，明确提示用户技能被使用
+        self._maybe_emit_skill_usage(data)
 
     def _error(self, message: str) -> None:
         if not message or message in self._errors:
@@ -346,16 +325,42 @@ class TurnRenderer:
         self._errors.add(message)
         self._append_line(f"{ANSI_YELLOW}  ! 星瑶暂未完成当前步骤{ANSI_RESET}")
 
-    def concise_recap(self) -> str:
-        """简短模式下的回合收尾统计行：共执行 N 项操作。
+    def _maybe_emit_skill_usage(self, data: dict[str, Any]) -> None:
+        """简短模式下，若本次工具调用是读取 SKILL.md，提示用户模型使用了哪个技能。
 
-        失败信息完全静默（不显示失败计数），用户可切到 /verbose on 查看详情。
-        详细模式、本回合未执行任何工具、或本实例已经生成过收尾行时返回空串。
+        技能的使用方式是模型 read_file 读取对应的 SKILL.md，简短模式下该读取
+        默认静默，导致用户无法感知模型启用了哪些技能。这里识别 SKILL.md 读取
+        并打印一行明确提示，其余工具调用仍保持静默。
+        """
+        name = str(data.get("name", ""))
+        if name != "read_file":
+            return
+        arguments = data.get("arguments") or {}
+        file_path = str(arguments.get("file_path") or data.get("preview") or "")
+        if not file_path:
+            return
+        import os
+        base = os.path.basename(file_path.rstrip("/\\"))
+        if base.lower() != "skill.md":
+            return
+        # skill 名称取 SKILL.md 所在目录的 basename（即技能短 ID）
+        skill_dir = os.path.dirname(file_path.rstrip("/\\"))
+        skill_name = os.path.basename(skill_dir) or file_path
+        self._append_section_gap()
+        self._append_line(
+            f"{ANSI_CYAN}✦ 使用技能：{skill_name}{ANSI_RESET}"
+        )
+
+    def concise_recap(self) -> str:
+        """回合收尾统计行：共执行 N 项操作。
+
+        失败信息完全静默（不显示失败计数），用户可切到详细模式查看详情。
+        本回合未执行任何工具、或本实例已经生成过收尾行时返回空串。
         由 main.py 在 turn_finished/turn_cancelled/turn_error 时调用一次，直接
         经 _print_ui_fragment 打印——不走 Markdown 渲染缓冲区，避免其中的
         ANSI 颜色码被当成 Markdown 源文本处理导致显示异常。
         """
-        if self._tool_verbose or not self._completed_tools or self._recap_emitted:
+        if not self._completed_tools or self._recap_emitted:
             return ""
         self._recap_emitted = True
         total = len(self._completed_tools)

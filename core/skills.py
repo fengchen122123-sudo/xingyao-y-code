@@ -121,6 +121,54 @@ def is_skill_path(file_path):
             return True
     return False
 
+
+def is_trusted_read_path(file_path):
+    """Return whether a path is readable without workspace sandbox confirmation.
+
+    Trust is limited to configured Skill package directories. Y-CODE and agent
+    configuration directories can contain credentials and mutable state, so they
+    never receive a blanket trust exemption.
+    """
+    if not file_path:
+        return False
+    try:
+        candidate = str(file_path).strip()
+        if not candidate:
+            return False
+        candidate = os.path.expandvars(candidate)
+        candidate = os.path.expanduser(candidate)
+        if not os.path.isabs(candidate):
+            candidate = os.path.join(os.getcwd(), candidate)
+        candidate = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+        if not os.path.exists(candidate):
+            return False
+        for search_root in get_skill_dirs():
+            root = os.path.normcase(os.path.realpath(os.path.abspath(search_root)))
+            if candidate == root or not candidate.startswith(root + os.sep):
+                continue
+            relative = os.path.relpath(candidate, root)
+            package_name = relative.split(os.sep, 1)[0]
+            package = os.path.normcase(os.path.realpath(os.path.join(root, package_name)))
+            if not package.startswith(root + os.sep) or not os.path.isdir(package):
+                continue
+            has_skill_file = any(
+                os.path.isfile(skill_file)
+                and os.path.normcase(os.path.realpath(skill_file)).startswith(package + os.sep)
+                for skill_file in (
+                    os.path.join(package, "SKILL.md"),
+                    os.path.join(package, "skill.md"),
+                )
+            )
+            if has_skill_file and (candidate == package or candidate.startswith(package + os.sep)):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+# Compatibility name for callers that only need the trusted-read policy.
+is_trusted_path = is_trusted_read_path
+
 def parse_skill_md(file_path):
     """解析 SKILL.md，提取 YAML frontmatter 和 Markdown 正文"""
     try:
