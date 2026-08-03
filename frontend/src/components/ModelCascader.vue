@@ -139,7 +139,7 @@ onUnmounted(() => {
 }
 .cascader-main-panel,
 .cascader-sub-panel {
-  background: rgba(22, 27, 34, 0.95);
+  background: var(--float-bg);
   border: 1px solid var(--border);
   border-radius: 14px;
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);

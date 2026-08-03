@@ -17,7 +17,7 @@
         <!-- 思考过程 Block -->
         <div v-if="msg.reasoning_content && msg.reasoning_content.trim()" class="think-block">
           <div class="tk-head" @click="thinkingOpen = !thinkingOpen">
-            <span>💭 思考过程</span>
+            <span>思考过程</span>
             <span style="margin-left:auto">{{ thinkingOpen ? '▾' : '▸' }}</span>
           </div>
           <div v-show="thinkingOpen" class="tk-cnt">
@@ -73,7 +73,7 @@
             :class="{ open: openDiffs[di] }"
           >
             <div class="diff-head" @click="toggleDiff(di)">
-              <span class="tico">📝</span>
+              <span class="tico">±</span>
               <span class="tname">{{ d.file_path }}</span>
               <span class="tool-toggle">{{ openDiffs[di] ? '收起 ▾' : '展开 ▸' }}</span>
             </div>
@@ -161,21 +161,21 @@ function toggleDiff(idx: number) {
 }
 
 const TOOL_ICONS: Record<string, string> = {
-  read_file: '📄',
-  write_file: '✏️',
-  edit_file: '📝',
-  search_code: '🔍',
-  execute_command: '⚡',
-  run_subagent: '🤖',
-  plan_write: '📋',
-  plan_update: '📋',
-  list_directory: '📂',
-  glob_files: '📂',
-  fetch_url: '🌐',
+  read_file: '▤',
+  write_file: '✎',
+  edit_file: '✐',
+  search_code: '⌕',
+  execute_command: '❯',
+  run_subagent: '◈',
+  plan_write: '≡',
+  plan_update: '≡',
+  list_directory: '▣',
+  glob_files: '▣',
+  fetch_url: '↗',
 };
 
 function getToolIcon(name: string) {
-  return TOOL_ICONS[name] || '🔧';
+  return TOOL_ICONS[name] || '⚙';
 }
 
 // 兼容两种 tool_call 形状：
@@ -239,8 +239,8 @@ function diffLineClass(line: string) {
   justify-content: flex-end;
 }
 .msg-user .bubble {
-  background: linear-gradient(135deg, #274060, #233a63);
-  border: 1px solid #33507e;
+  background: var(--bg2);
+  border: 1px solid var(--border);
   border-radius: 12px 12px 4px 12px;
   padding: 10px 14px;
   max-width: 70%;
@@ -254,7 +254,7 @@ function diffLineClass(line: string) {
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -381,7 +381,7 @@ function diffLineClass(line: string) {
   display: block;
   margin: 0;
   padding: 8px 12px;
-  background: #0a0e14;
+  background: var(--code-bg);
   border-top: 1px solid var(--border);
   font-family: var(--mono);
   font-size: 11.5px;
@@ -470,7 +470,7 @@ function diffLineClass(line: string) {
 .diff-body {
   font-family: var(--mono);
   font-size: 11.5px;
-  background: #0a0e14;
+  background: var(--code-bg);
   border-top: 1px solid var(--border);
   max-height: 280px;
   overflow-y: auto;

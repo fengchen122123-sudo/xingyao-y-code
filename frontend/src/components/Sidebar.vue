@@ -2,13 +2,13 @@
   <div id="sidebar" :class="{ collapsed: store.sidebarCollapsed }">
     <div class="side-menu">
       <div class="menu-item" @click="store.openSubpage('skills')">
-        <span class="mi-ico">⚡</span>
+        <span class="mi-ico">❖</span>
         <span class="mi-label">技能 Skills</span>
         <span class="mi-count">{{ store.skills.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="store.openSubpage('mcp')">
-        <span class="mi-ico">🔌</span>
+        <span class="mi-ico">⧉</span>
         <span class="mi-label">MCP 服务</span>
         <span class="mi-count">{{ connectedMcpCount }} / {{ store.mcps.length }} 在线</span>
         <span class="mi-arrow">›</span>
@@ -18,7 +18,7 @@
     <div class="side-section">
       项目会话
       <span>
-        <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()">📁</button>
+        <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()">▣</button>
         <button class="add-btn" title="新建自由通用对话(跳出文件夹)" @click="store.createGlobalSession()">＋</button>
       </span>
     </div>
@@ -32,7 +32,6 @@
         <div v-for="group in store.sessionGroups" :key="group.folder_path || group.folder_name" class="session-group">
           <div class="group-header" @click="toggleGroupCollapsed(group.folder_path)">
             <span class="g-arrow">{{ collapsedGroups[group.folder_path] ? '▸' : '▾' }}</span>
-            <span class="g-icon">{{ (group.is_global || group.folder_path === 'GLOBAL') ? '💬' : '📁' }}</span>
             <span class="g-title" :style="{ color: group.is_current ? 'var(--accent)' : 'inherit' }">
               {{ getFolderTitle(group) }}
               <span v-if="group.is_current" style="font-size:10px;color:var(--green)"> [当前]</span>
@@ -50,7 +49,7 @@
               class="g-del" 
               title="移出项目分组 (不删磁盘文件)" 
               @click.stop="store.deleteFolderGroup(group.folder_path, getFolderTitle(group))"
-            >🗑</button>
+            >✕</button>
           </div>
 
           <div v-show="!collapsedGroups[group.folder_path]" class="group-sessions">
@@ -63,7 +62,7 @@
             >
               <div class="t" style="padding-right:18px">{{ s.display_name || s.name }}</div>
               <div class="m">{{ s.count || 0 }} 条消息</div>
-              <button class="s-del" title="删除此对话" @click.stop="store.deleteSingleSession(s.name)">🗑</button>
+              <button class="s-del" title="删除此对话" @click.stop="store.deleteSingleSession(s.name)">✕</button>
             </div>
           </div>
         </div>
@@ -71,7 +70,7 @@
     </div>
 
     <div class="side-footer" title="点击切换项目工作区文件夹" @click="store.openWorkspaceFolder()">
-      {{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '💬 对话' : '📁 ' + store.currentWorkdirLabel }}<br>
+      {{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}<br>
       SQLite 已连接
     </div>
   </div>

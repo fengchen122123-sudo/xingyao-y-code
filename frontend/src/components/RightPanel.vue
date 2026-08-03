@@ -23,7 +23,7 @@
         <div class="progress-bar"><i :style="{ width: store.planData.progress + '%' }"></i></div>
 
         <div v-if="!store.planData.items || store.planData.items.length === 0" style="color:var(--text-faint);font-size:12px;padding:12px 0">
-          📋 暂无活动计划。<br>当星瑶编排复杂大任务时，计划全景会自动在此呈现。
+          暂无活动计划。当星瑶编排复杂大任务时，计划全景会自动在此呈现。
         </div>
 
         <div v-else class="plan-list">
@@ -49,7 +49,7 @@
         </div>
 
         <div v-if="!store.backgroundTasks || store.backgroundTasks.length === 0" style="color:var(--text-faint);font-size:12px;padding:12px 0">
-          ⏵ 暂无后台活跃任务
+          暂无后台活跃任务
         </div>
 
         <div v-else class="task-list">
@@ -71,20 +71,23 @@
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border)">
           <span style="font-size:12px;color:var(--text-dim);font-weight:600">终端 · {{ store.currentWorkdirLabel }}</span>
           <div style="display:flex;gap:6px">
-            <button v-if="store.terminalRunning" class="chip-btn danger" style="font-size:11.5px;padding:3px 9px" title="终止正在运行的命令" @click="store.killTerminalCommand()">⏹ 终止</button>
+            <button v-if="store.terminalRunning" class="chip-btn danger" style="font-size:11.5px;padding:3px 9px" title="终止正在运行的命令" @click="store.killTerminalCommand()">■ 终止</button>
             <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="清空终端输出" @click="store.clearTerminal()">✕ 清空</button>
           </div>
         </div>
-        <pre ref="termOutputEl" class="term-output">{{ store.terminalOutput || '在下方输入命令，在当前工作区目录中执行。\n' }}</pre>
-        <div class="term-input-row">
-          <span class="term-prompt">$</span>
-          <input
-            v-model="termInput"
-            class="term-input"
-            :disabled="store.terminalRunning"
-            :placeholder="store.terminalRunning ? '命令运行中…' : '输入命令，Enter 执行'"
-            @keydown.enter="runTermCommand"
-          />
+        <div class="term-body" @click="focusTermInput">
+          <div ref="termOutputEl" class="t-out"><template v-if="termLines.length === 0"><span class="t-cmd">$ # 终端已准备就绪，支持执行 Shell 命令</span></template><template v-for="(line, i) in termLines" :key="i">{{ i > 0 ? '\n' : '' }}<span :class="line.cls || undefined">{{ line.text }}</span></template></div>
+          <div class="term-input-row">
+            <span class="term-prompt">$</span>
+            <input
+              ref="termInputEl"
+              v-model="termInput"
+              class="term-input"
+              :disabled="store.terminalRunning"
+              :placeholder="store.terminalRunning ? '命令运行中…' : '输入命令，回车执行'"
+              @keydown.enter="runTermCommand"
+            />
+          </div>
         </div>
       </div>
 
@@ -92,11 +95,11 @@
       <div v-show="activeTab === 'files'" class="rpane active">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)">
           <span style="font-size:12px;color:var(--text-dim);font-weight:600">项目文件</span>
-          <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="引入新的项目文件夹" @click="store.openWorkspaceFolder()">📂 引入新文件夹</button>
+          <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="引入新的项目文件夹" @click="store.openWorkspaceFolder()">引入新文件夹</button>
         </div>
 
         <div v-if="!store.fileTree || store.fileTree.length === 0" style="padding:20px 10px;text-align:center;color:var(--text-faint);font-size:12px">
-          💬 当前为通用自由对话<br>暂未引入项目文件夹
+          当前为通用自由对话，暂未引入项目文件夹
         </div>
 
         <div v-else id="file-tree">
@@ -109,7 +112,7 @@
     <div class="modal-mask" :class="{ show: store.filePreview.show }" @click.self="store.closeFilePreview()">
       <div class="modal file-preview-modal">
         <div class="modal-head">
-          <div class="mh-ico">📄</div>
+          <div class="mh-ico">▤</div>
           <div class="fp-title">
             <h3 class="fp-name">{{ fileBaseName(store.filePreview.path) }}</h3>
             <p class="fp-path">{{ store.filePreview.path }}</p>
@@ -128,7 +131,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, watch, nextTick, onMounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import FileTreeNode from './FileTreeNode.vue';
 
@@ -138,15 +141,37 @@ const store = useAppStore();
 const activeTab = ref<TabType>('plan');
 
 const tabs: Array<{ id: TabType; label: string }> = [
-  { id: 'plan', label: '📋 计划' },
-  { id: 'tasks', label: '⏵ 任务' },
-  { id: 'term', label: '⌨ 终端' },
-  { id: 'files', label: '📁 文件' }
+  { id: 'plan', label: '计划' },
+  { id: 'tasks', label: '任务' },
+  { id: 'term', label: '终端' },
+  { id: 'files', label: '文件' }
 ];
 
 // ---------------- 内嵌终端 ----------------
 const termInput = ref('');
 const termOutputEl = ref<HTMLElement | null>(null);
+const termInputEl = ref<HTMLInputElement | null>(null);
+
+// 点击终端区域任意处即聚焦输入框（正在选中文字时不抢焦点）
+function focusTermInput() {
+  const sel = window.getSelection();
+  if (sel && !sel.isCollapsed) return;
+  termInputEl.value?.focus();
+}
+
+// 按行着色（对齐 demo 的 t-cmd / t-ok / t-warn 样式）：
+// $ 开头的回显命令 => 白色；退出码 0 => 绿色；非零退出/启动失败 => 黄色
+const termLines = computed(() => {
+  const out = store.terminalOutput;
+  if (!out) return [] as Array<{ text: string; cls: string }>;
+  return out.split('\n').map((text) => {
+    let cls = '';
+    if (text.startsWith('$ ')) cls = 't-cmd';
+    else if (text.startsWith('[进程已退出，代码 0]')) cls = 't-ok';
+    else if (text.startsWith('[进程已退出') || text.startsWith('[启动失败') || text.startsWith('…[输出过长')) cls = 't-warn';
+    return { text, cls };
+  });
+});
 
 function runTermCommand() {
   const cmd = termInput.value.trim();
@@ -267,39 +292,49 @@ onMounted(() => {
   flex-direction: column;
   height: 100%;
 }
-.term-output {
+/* 终端主体：输出区与输入行同处一个深色框内（对齐 demo 样式） */
+.term-body {
   flex: 1;
   min-height: 0;
-  margin: 0 0 8px;
-  padding: 10px 12px;
-  background: #0a0e14;
+  display: flex;
+  flex-direction: column;
+  background: var(--code-bg);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: 9px;
+  padding: 12px;
   font-family: var(--mono);
   font-size: 12px;
-  line-height: 1.55;
-  color: var(--text-dim);
+  line-height: 1.65;
+  cursor: text;
+}
+.t-out {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
-  overflow-y: auto;
+  color: var(--text-dim);
+}
+.t-out .t-cmd {
+  color: var(--text-bright);
+}
+.t-out .t-ok {
+  color: var(--green);
+}
+.t-out .t-warn {
+  color: var(--yellow);
 }
 .term-input-row {
   display: flex;
   align-items: center;
-  gap: 8px;
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 6px 10px;
+  gap: 6px;
+  margin-top: 4px;
+  color: var(--green);
   flex-shrink: 0;
-}
-.term-input-row:focus-within {
-  border-color: var(--accent);
 }
 .term-prompt {
   font-family: var(--mono);
-  font-size: 12.5px;
-  color: var(--accent);
+  font-size: 12px;
   font-weight: 700;
   flex-shrink: 0;
 }
@@ -309,9 +344,9 @@ onMounted(() => {
   background: none;
   border: none;
   outline: none;
-  color: var(--text);
+  color: var(--text-bright);
   font-family: var(--mono);
-  font-size: 12.5px;
+  font-size: 12px;
 }
 .term-input::placeholder {
   color: var(--text-faint);
@@ -334,7 +369,7 @@ onMounted(() => {
 .progress-bar i {
   display: block;
   height: 100%;
-  background: linear-gradient(90deg, var(--accent), var(--accent2));
+  background: var(--accent);
   transition: width 0.3s ease;
 }
 
@@ -424,7 +459,7 @@ onMounted(() => {
   transition: 0.15s;
 }
 .chip-btn:hover {
-  border-color: var(--accent);
+  border-color: var(--text-faint);
   color: var(--text);
 }
 .chip-btn.danger {
@@ -469,7 +504,7 @@ onMounted(() => {
   width: 32px;
   height: 32px;
   border-radius: 8px;
-  background: rgba(79, 140, 255, 0.15);
+  background: var(--accent-soft);
   color: var(--accent);
   display: flex;
   align-items: center;
@@ -496,7 +531,7 @@ onMounted(() => {
 }
 .fp-body {
   padding: 0;
-  background: #0a0e14;
+  background: var(--code-bg);
 }
 .fp-loading {
   padding: 24px;

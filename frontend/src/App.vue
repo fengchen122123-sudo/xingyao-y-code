@@ -22,7 +22,7 @@
               <div class="export-item" @click="doExport('json')">JSON (.json)</div>
             </div>
           </div>
-          <button class="chip-btn" title="清空当前会话历史" @click="store.clearSessionHistory()">🗑 清空</button>
+          <button class="chip-btn" title="清空当前会话历史" @click="store.clearSessionHistory()">清空</button>
         </div>
 
         <!-- 对话主体滚动区 -->
@@ -63,10 +63,10 @@
         <span class="s-dot" :class="{ off: !store.connected }"></span>
         <span>{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
       </span>
-      <span class="si" :title="'当前模型: ' + (store.activeModelName || '未选择')">🤖 {{ store.activeModelName || '未选择模型' }}</span>
-      <span class="si" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">📁 {{ store.currentWorkdirLabel }}</span>
-      <span class="si" :class="statusTokenClass" title="上下文 Token 占用百分比">🔢 {{ statusTokenPct }}%</span>
-      <span class="si">⚙ 权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
+      <span class="si" :title="'当前模型: ' + (store.activeModelName || '未选择')">{{ store.activeModelName || '未选择模型' }}</span>
+      <span class="si" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">{{ store.currentWorkdirLabel }}</span>
+      <span class="si" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
+      <span class="si">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
       <div class="right">
         <span class="si">{{ store.running ? '生成中…' : '空闲' }}</span>
         <span class="si">UTF-8</span>
@@ -234,7 +234,7 @@ onUnmounted(() => {
 }
 .chip-btn:hover {
   color: var(--text);
-  border-color: var(--accent);
+  border-color: var(--text-faint);
 }
 
 .export-wrap {
@@ -245,7 +245,7 @@ onUnmounted(() => {
   top: 100%;
   right: 0;
   margin-top: 6px;
-  background: rgba(22, 27, 34, 0.97);
+  background: var(--float-bg);
   border: 1px solid var(--border);
   border-radius: 10px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);

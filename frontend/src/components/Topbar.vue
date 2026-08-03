@@ -8,7 +8,7 @@
     <div class="top-spacer"></div>
 
     <button class="icon-btn" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
-      {{ store.themeLight ? '☀️' : '🌙' }}
+      {{ store.themeLight ? '☀' : '☾' }}
     </button>
     <button class="icon-btn" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">▐</button>
   </div>
@@ -41,14 +41,13 @@ const store = useAppStore();
   width: 26px;
   height: 26px;
   border-radius: 7px;
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
   font-weight: 700;
   color: #fff;
   font-size: 13px;
-  box-shadow: 0 0 12px rgba(79, 140, 255, 0.4);
 }
 #topbar .logo .name {
   font-weight: 600;

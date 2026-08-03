@@ -81,7 +81,7 @@ def main():
         min_size=(960, 640),
         text_select=True,
         confirm_close=False,
-        background_color="#0d1117"
+        background_color="#0f1114"
     )
 
     api.set_window(window)

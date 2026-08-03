@@ -82,7 +82,7 @@ onUnmounted(() => {
 <style scoped>
 #dropdown {
   position: fixed;
-  background: rgba(22, 27, 34, 0.95);
+  background: var(--float-bg);
   border: 1px solid var(--border);
   border-radius: 10px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
