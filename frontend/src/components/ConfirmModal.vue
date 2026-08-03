@@ -2,7 +2,7 @@
   <div class="modal-mask" :class="{ show: store.confirmModal.show }">
     <div class="modal">
       <div class="modal-head">
-        <div class="mh-ico">🗑</div>
+        <div class="mh-ico">✕</div>
         <div>
           <h3>{{ store.confirmModal.title || '确认操作' }}</h3>
           <p>{{ store.confirmModal.sub || '请确认您的操作' }}</p>
@@ -106,10 +106,10 @@ const store = useAppStore();
   transition: 0.15s;
 }
 .btn:hover {
-  border-color: var(--accent);
+  border-color: var(--text-faint);
 }
 .btn.danger {
-  background: linear-gradient(135deg, var(--red), #c0392b);
+  background: var(--red);
   border: none;
   color: #fff;
   font-weight: 600;

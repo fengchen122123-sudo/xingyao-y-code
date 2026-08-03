@@ -17,7 +17,7 @@
 
       <div class="kimi-card-bar">
         <div style="display:flex;align-items:center;gap:8px">
-          <button class="kimi-pill-btn" title="添加附件" @click="handlePickFiles">＋ 附件</button>
+          <button class="kimi-pill-btn" title="添加附件" @click="handlePickFiles">附件</button>
           <button
             ref="permBtnRef"
             class="kimi-pill-btn"
@@ -52,7 +52,7 @@
     </div>
 
     <div class="kimi-footer-workdir" @click="store.openWorkspaceFolder()">
-      📂 <span>{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '进入项目工作区' : '当前工作区: ' + store.currentWorkdirLabel }}</span>
+      <span>{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '进入项目工作区' : '当前工作区: ' + store.currentWorkdirLabel }}</span>
       <span style="font-size:10px;color:var(--text-faint)">▼</span>
     </div>
 

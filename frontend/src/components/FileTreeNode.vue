@@ -2,7 +2,7 @@
   <div>
     <div class="file-row" :class="{ open: isOpen }" @click="toggle">
       <span class="fi">{{ node.d ? (isOpen ? '▾' : '▸') : '' }}</span>
-      {{ node.d ? '📂 ' + node.n : '📄 ' + node.n }}
+      {{ node.d ? '▣ ' + node.n : node.n }}
     </div>
     <div v-if="node.d && isOpen" class="file-children">
       <FileTreeNode

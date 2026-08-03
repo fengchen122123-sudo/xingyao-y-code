@@ -11,13 +11,13 @@
         ></textarea>
 
         <div id="input-bar">
-          <button class="chip-btn" title="附加文件" @click="handlePickFiles">📎 文件</button>
+          <button class="chip-btn" title="附加文件" @click="handlePickFiles">附件</button>
           <button
             class="chip-btn"
             :class="{ active: store.showThinking }"
             title="显示/收起思考过程"
             @click="store.toggleShowThinking()"
-          >🧠 思考</button>
+          >思考</button>
           <button
             ref="permBtnRef"
             class="chip-btn"
@@ -141,13 +141,13 @@ function handleSend() {
 #input-box {
   background: var(--bg2);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 10px;
   padding: 10px;
-  transition: 0.15s;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.2);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
 #input-box:focus-within {
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 textarea {
   width: 100%;
@@ -182,13 +182,13 @@ textarea {
   transition: 0.15s;
 }
 .chip-btn:hover {
-  border-color: var(--accent);
+  border-color: var(--text-faint);
   color: var(--text);
 }
 .chip-btn.active {
   border-color: var(--accent);
   color: var(--accent);
-  background: rgba(79, 140, 255, 0.12);
+  background: var(--accent-soft);
 }
 
 .model-chip {
@@ -206,17 +206,16 @@ textarea {
   font-size: 12.5px;
   font-weight: 600;
   border: none;
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: var(--accent);
   color: #fff;
   cursor: pointer;
   transition: 0.15s;
 }
 #send-btn:hover {
-  opacity: 0.9;
-  transform: translateY(-1px);
+  filter: brightness(1.1);
 }
 #send-btn.stop {
-  background: linear-gradient(135deg, var(--red), #c0392b);
+  background: var(--red);
 }
 
 #input-meta {
