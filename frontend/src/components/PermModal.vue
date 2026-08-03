@@ -2,7 +2,7 @@
   <div class="modal-mask" :class="{ show: store.permModal.show }">
     <div class="modal">
       <div class="modal-head">
-        <div class="mh-ico">⚠️</div>
+        <div class="mh-ico">⚠</div>
         <div>
           <h3>权限请求 · <span>{{ store.permModal.toolName }}</span></h3>
           <p>星瑶请求执行以下操作{{ store.permModal.source ? '（来源: ' + store.permModal.source + '）' : '' }}</p>
@@ -76,7 +76,7 @@ const store = useAppStore();
   padding: 16px 18px;
   font-family: var(--mono);
   font-size: 12.5px;
-  background: #0a0e14;
+  background: var(--code-bg);
   white-space: pre-wrap;
   line-height: 1.65;
   color: var(--text-dim);
@@ -99,10 +99,10 @@ const store = useAppStore();
   transition: 0.15s;
 }
 .btn:hover {
-  border-color: var(--accent);
+  border-color: var(--text-faint);
 }
 .btn.primary {
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: var(--accent);
   border: none;
   color: #fff;
   font-weight: 600;

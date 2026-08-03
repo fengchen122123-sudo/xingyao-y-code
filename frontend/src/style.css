@@ -1,20 +1,25 @@
 :root {
-  --bg0: #0d1117;
-  --bg1: #161b22;
-  --bg2: #1c2330;
-  --bg3: #232b3a;
-  --border: #2d3646;
-  --text: #d7dde8;
-  --text-dim: #8b98ab;
-  --text-faint: #5b6678;
-  --accent: #4f8cff;
-  --accent2: #7c5cff;
-  --green: #3fb950;
-  --yellow: #d29922;
-  --red: #f85149;
-  --orange: #f0883e;
-  --cyan: #39c5cf;
-  --purple: #bc8cff;
+  /* 中性深色：偏暖灰，避免高饱和蓝紫 */
+  --bg0: #0f1114;
+  --bg1: #15181c;
+  --bg2: #1c2025;
+  --bg3: #262b31;
+  --border: #282d34;
+  --text: #e2e5ea;
+  --text-bright: #ffffff;
+  --text-dim: #99a1ab;
+  --text-faint: #69717c;
+  --accent: #5b87da;
+  --accent2: #5b87da;
+  --accent-soft: rgba(91, 135, 218, 0.14);
+  --green: #3fa15f;
+  --yellow: #c2a03d;
+  --red: #d95f57;
+  --orange: #cf8a4a;
+  --cyan: #43a3b0;
+  --purple: #9c82d4;
+  --code-bg: #0b0d10;
+  --float-bg: rgba(26, 29, 34, 0.97);
   --mono: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
   --sans: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
 }
@@ -34,6 +39,7 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  -webkit-font-smoothing: antialiased;
 }
 
 ::-webkit-scrollbar {
@@ -42,8 +48,12 @@ body {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: #3a4356;
+  background: var(--bg3);
   border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-faint);
 }
 
 ::-webkit-scrollbar-track {
@@ -74,8 +84,8 @@ button {
 }
 
 .pill:hover {
-  border-color: var(--accent);
   background: var(--bg3);
+  border-color: var(--border);
 }
 
 .pill .dot {
@@ -83,7 +93,6 @@ button {
   height: 7px;
   border-radius: 50%;
   background: var(--green);
-  box-shadow: 0 0 6px var(--green);
 }
 
 .pill .caret {
@@ -106,9 +115,8 @@ button {
 }
 
 .icon-btn:hover {
-  background: var(--bg3);
+  background: var(--bg2);
   color: var(--text);
-  border-color: var(--border);
 }
 
 /* Kimi 风格卡片 */
@@ -131,15 +139,14 @@ button {
 }
 
 .kimi-icon {
-  width: 56px;
-  height: 56px;
-  border-radius: 18px;
-  background: linear-gradient(135deg, #4facfe, #00f2fe);
+  width: 52px;
+  height: 52px;
+  border-radius: 15px;
+  background: var(--accent);
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 26px;
-  box-shadow: 0 8px 24px rgba(79, 172, 254, 0.35);
+  font-size: 24px;
   color: #fff;
 }
 
@@ -158,13 +165,13 @@ button {
 
 .kimi-beta {
   font-size: 11px;
-  background: rgba(57, 197, 207, 0.15);
-  color: var(--cyan);
+  color: var(--text-faint);
   padding: 2px 8px;
   border-radius: 6px;
   font-weight: 600;
   text-transform: uppercase;
-  border: 1px solid rgba(57, 197, 207, 0.3);
+  border: 1px solid var(--border);
+  letter-spacing: 0.5px;
 }
 
 .kimi-card {
@@ -172,15 +179,14 @@ button {
   max-width: 680px;
   background: var(--bg1);
   border: 1px solid var(--border);
-  border-radius: 22px;
-  padding: 18px 20px 14px;
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.3);
+  border-radius: 14px;
+  padding: 16px 18px 12px;
   transition: border-color 0.2s, box-shadow 0.2s;
 }
 
 .kimi-card:focus-within {
   border-color: var(--accent);
-  box-shadow: 0 20px 48px rgba(79, 140, 255, 0.2);
+  box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
 .kimi-card textarea {
@@ -224,7 +230,6 @@ button {
 .kimi-pill-btn:hover {
   background: var(--bg3);
   color: var(--text);
-  border-color: var(--accent);
 }
 
 .kimi-send-btn {
@@ -245,9 +250,8 @@ button {
 
 .kimi-card:focus-within .kimi-send-btn,
 .kimi-send-btn.active {
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: var(--accent);
   color: #fff;
-  box-shadow: 0 4px 14px rgba(79, 140, 255, 0.4);
 }
 .kimi-send-btn:disabled {
   opacity: 0.5;
@@ -261,17 +265,15 @@ button {
   gap: 8px;
   background: var(--bg1);
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 9px 18px;
+  border-radius: 10px;
+  padding: 8px 16px;
   font-size: 13px;
   color: var(--text-dim);
   cursor: pointer;
   transition: 0.15s;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, 0.15);
 }
 
 .kimi-footer-workdir:hover {
-  border-color: var(--accent);
   color: var(--text);
   background: var(--bg2);
 }
@@ -297,18 +299,18 @@ button {
   margin: 6px 0;
 }
 .md-body strong {
-  color: #ffffff;
+  color: var(--text-bright);
   font-weight: 600;
 }
 .md-body em {
-  color: var(--cyan);
+  color: var(--text);
   font-style: italic;
 }
 .md-body h2,
 .md-body h3,
 .md-body h4 {
   margin: 14px 0 6px;
-  color: #ffffff;
+  color: var(--text-bright);
   font-weight: 600;
 }
 .md-body h2 {
@@ -328,10 +330,10 @@ button {
   border-radius: 4px;
   font-family: var(--mono);
   font-size: 12.5px;
-  color: var(--cyan);
+  color: var(--text);
 }
 .md-body pre {
-  background: #0a0e14;
+  background: var(--code-bg);
   border: 1px solid var(--border);
   border-radius: 8px;
   padding: 12px;
@@ -370,28 +372,29 @@ button {
   }
 }
 
-/* 浅色主题支持 */
+/* 浅色主题：低亮度暖灰，避免纯白刺眼 */
 body.light {
-  --bg0: #f5f7fa;
-  --bg1: #ffffff;
-  --bg2: #eef1f5;
-  --bg3: #e2e7ee;
-  --border: #d3dae4;
-  --text: #1f2733;
-  --text-dim: #5b6a80;
-  --text-faint: #93a0b4;
+  --bg0: #dde2e7;
+  --bg1: #e5e9ed;
+  --bg2: #eff2f4;
+  --bg3: #d3d9df;
+  --border: #c6ccd3;
+  --text: #24292f;
+  --text-bright: #14181d;
+  --text-dim: #5c6672;
+  --text-faint: #8d99a5;
+  --accent: #3d6ec4;
+  --accent2: #3d6ec4;
+  --accent-soft: rgba(61, 110, 196, 0.10);
+  --green: #2f8a50;
+  --yellow: #8a6d1f;
+  --red: #c54940;
+  --orange: #b06f2c;
+  --cyan: #2f8f9c;
+  --purple: #7b66b8;
+  --code-bg: #dbe0e5;
+  --float-bg: rgba(239, 242, 244, 0.97);
 }
-body.light .md-body pre,
-body.light .tool-body,
-body.light .diff-body,
-body.light .modal-body,
-body.light .fp-body {
-  background: #f0f3f7;
-}
-body.light .tool-head .tname,
-body.light .md-body h2,
-body.light .md-body h3,
-body.light .md-body h4,
-body.light .md-body strong {
-  color: #1f2733;
+body.light .tool-head .tname {
+  color: var(--text);
 }

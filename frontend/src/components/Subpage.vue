@@ -12,7 +12,7 @@
         <div v-if="store.skills.length === 0" class="sub-empty">暂无可用技能</div>
         <div v-for="s in store.skills" :key="s.id" class="sub-card">
           <div class="sc-top">
-            <div class="sc-ico">⚡</div>
+            <div class="sc-ico">❖</div>
             <div class="sc-name">{{ s.name || s.id }}</div>
             <label class="switch" title="启用/禁用该技能" @click.stop>
               <input type="checkbox" :checked="s.enabled" @change="onToggleSkill(s, ($event.target as HTMLInputElement).checked)" />
@@ -33,7 +33,7 @@
           <div v-if="store.mcps.length === 0" class="sub-empty">暂无已配置的 MCP 服务</div>
           <div v-for="m in store.mcps" :key="m.name" class="sub-card mcp-card">
             <div class="sc-top">
-              <div class="sc-ico">🔌</div>
+              <div class="sc-ico">⧉</div>
               <div class="sc-name">{{ m.name }}</div>
               <span class="status-dot" :class="mcpStatusClass(m)" :title="mcpStatusText(m)"></span>
               <label class="switch" title="启用/禁用该 MCP 服务" @click.stop>
@@ -280,9 +280,7 @@ async function testModelRow(m: ModelInfo) {
   transition: 0.15s;
 }
 .sub-card:hover {
-  border-color: var(--accent);
-  transform: translateY(-2px);
-  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+  border-color: var(--text-faint);
 }
 .sub-card .sc-top {
   display: flex;
@@ -293,14 +291,15 @@ async function testModelRow(m: ModelInfo) {
 .sub-card .sc-ico {
   width: 34px;
   height: 34px;
-  border-radius: 99px;
-  background: linear-gradient(135deg, var(--bg3), var(--bg2));
+  border-radius: 10px;
+  background: var(--bg2);
   border: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: center;
   font-size: 16px;
   flex-shrink: 0;
+  color: var(--text-dim);
 }
 .sub-card .sc-name {
   font-size: 13.5px;
@@ -332,14 +331,12 @@ async function testModelRow(m: ModelInfo) {
 }
 .status-dot.green {
   background: var(--green);
-  box-shadow: 0 0 6px var(--green);
 }
 .status-dot.gray {
   background: var(--text-faint);
 }
 .status-dot.yellow {
   background: var(--yellow);
-  box-shadow: 0 0 6px var(--yellow);
 }
 
 /* 开关 Pill */
@@ -378,7 +375,7 @@ async function testModelRow(m: ModelInfo) {
   transition: 0.15s;
 }
 .switch input:checked + .switch-track {
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: var(--accent);
   border-color: transparent;
 }
 .switch input:checked + .switch-track::before {
@@ -399,7 +396,7 @@ async function testModelRow(m: ModelInfo) {
   align-items: center;
 }
 .chip-btn:hover {
-  border-color: var(--accent);
+  border-color: var(--text-faint);
   color: var(--text);
 }
 .chip-btn:disabled {
@@ -425,14 +422,14 @@ async function testModelRow(m: ModelInfo) {
   cursor: pointer;
 }
 .btn:hover {
-  border-color: var(--accent);
+  border-color: var(--text-faint);
 }
 .btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
 .btn.primary {
-  background: linear-gradient(135deg, var(--accent), var(--accent2));
+  background: var(--accent);
   border: none;
   color: #fff;
   font-weight: 600;
@@ -493,7 +490,7 @@ async function testModelRow(m: ModelInfo) {
 .model-form input:focus,
 .model-form select:focus {
   border-color: var(--accent);
-  box-shadow: 0 0 0 2px rgba(79, 140, 255, 0.25);
+  box-shadow: 0 0 0 2px var(--accent-soft);
 }
 .model-groups {
   display: flex;
