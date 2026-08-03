@@ -1303,3 +1303,132 @@ def test_get_tools_schema_waits_for_mcp_only_once(mocker, monkeypatch):
     llm_mod.get_tools_schema()
 
     assert calls == [1], "MCP 同步等待只允许发生在进程内首次调用"
+
+
+def test_estimate_tokens_incremental_counts_only_tail(mocker):
+    """append-only 历史新增消息后，estimate_tokens 只对尾部增量计数，
+    不再全量 tokenize（大会话全量一次要数秒，每轮都发生就是明显卡顿）。"""
+    import core.llm as llm_mod
+    from core.llm import estimate_tokens
+
+    llm_mod._token_estimate_cache["sig"] = None
+    llm_mod._token_prefix_cache.update({"model": None, "msg_count": 0, "char_len": 0, "value": 0})
+
+    counted_batches = []
+
+    def fake_counter(model_name, msgs):
+        counted_batches.append(len(msgs))
+        return sum(len(str(m.get("content", ""))) for m in msgs) // 10
+
+    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+
+    history = [{"role": "user", "content": "x" * 1000} for _ in range(50)]
+    v1 = estimate_tokens("fake-model", history)
+    assert counted_batches == [50], "首次必须全量计数"
+
+    history2 = history + [{"role": "assistant", "content": "y" * 500}]
+    v2 = estimate_tokens("fake-model", history2)
+    assert counted_batches == [50, 1], "第二轮必须只计数新增的 1 条尾部消息"
+    assert v2 > v1, "增量结果必须大于前值"
+
+    # 第三轮签名未变，直接命中签名缓存不再计数
+    v3 = estimate_tokens("fake-model", history2)
+    assert v3 == v2
+    assert counted_batches == [50, 1]
+
+
+def test_estimate_tokens_prefix_changed_falls_back_to_full_count(mocker):
+    """历史被改写（如压缩）导致前缀字符数变化时，必须回退全量计数，
+    不得复用过期的前缀结果。"""
+    import core.llm as llm_mod
+    from core.llm import estimate_tokens
+
+    llm_mod._token_estimate_cache["sig"] = None
+    llm_mod._token_prefix_cache.update({"model": None, "msg_count": 0, "char_len": 0, "value": 0})
+
+    counted_batches = []
+
+    def fake_counter(model_name, msgs):
+        counted_batches.append(len(msgs))
+        return sum(len(str(m.get("content", ""))) for m in msgs) // 10
+
+    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+
+    history = [{"role": "user", "content": "x" * 1000} for _ in range(50)]
+    estimate_tokens("fake-model", history)
+
+    # 模拟压缩：历史被整体替换为更短内容（等长前缀校验必须失败）
+    compressed = [{"role": "user", "content": "压缩后" * 10} for _ in range(5)]
+    estimate_tokens("fake-model", compressed + [{"role": "user", "content": "新问题"}])
+    assert counted_batches[-1] == 6, "前缀变化必须回退全量计数（6 条全部）"
+
+
+def test_litellm_patch_preserves_stream_usage_details():
+    """litellm 1.83.7 流式 usage 为 dict 时只取三个字段重建 Usage，
+    prompt_tokens_details.cached_tokens 被丢弃导致命中记账恒为 0。
+    补丁必须将 dict usage 转成 litellm.Usage 并保留缓存明细。"""
+    from types import SimpleNamespace
+
+    import core.llm as llm_mod
+
+    litellm = llm_mod._get_litellm()
+    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+
+    fake_chunk = SimpleNamespace(
+        choices=[],
+        usage={
+            "prompt_tokens": 673,
+            "completion_tokens": 16,
+            "total_tokens": 689,
+            "prompt_tokens_details": {"cached_tokens": 512},
+            "prompt_cache_hit_tokens": 512,
+            "prompt_cache_miss_tokens": 161,
+        },
+    )
+    result = CustomStreamWrapper.handle_openai_chat_completion_chunk(object(), fake_chunk)
+    usage = result["usage"]
+    assert isinstance(usage, litellm.Usage), "补丁后 usage 必须是 litellm.Usage 实例"
+    assert usage.prompt_tokens_details is not None
+    assert usage.prompt_tokens_details.cached_tokens == 512
+
+
+def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
+    """litellm 流式包装器会把 finish 后的最终 usage chunk 吞进 wrapper.chunks
+    而不再 yield，迭代中拿到的 usage 不含缓存明细（命中记账恒为 0）。
+    记账必须从 chunks 尾部补取最终 usage。"""
+    import core.llm as llm_mod
+
+    final_usage = SimpleNamespace(
+        total_tokens=692,
+        prompt_tokens=676,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=512),
+    )
+
+    class FakeStream:
+        """模拟 litellm CustomStreamWrapper：迭代只给内容 chunk，
+        真实 usage 留在 chunks 属性里。"""
+
+        chunks = [SimpleNamespace(usage=final_usage)]
+
+        def __iter__(self):
+            return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=lambda **kwargs: FakeStream())
+
+    with llm_mod.token_usage_lock:
+        before = llm_mod.session_token_usage["cumulative_cached"]
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "测试"}],
+        persist=False,
+        turn_id="turn-usage-from-wrapper-chunks",
+        consume_background_notifications=False,
+    ))
+
+    assert events[-1].kind == "turn_finished"
+    with llm_mod.token_usage_lock:
+        assert llm_mod.session_token_usage["latest_cached"] == 512
+        assert llm_mod.session_token_usage["latest_prompt"] == 676
+        assert llm_mod.session_token_usage["cumulative_cached"] == before + 512
