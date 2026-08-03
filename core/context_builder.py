@@ -44,25 +44,33 @@ def build_stable_prompt(base_prompt: str) -> str:
     return "\n\n".join(parts)
 
 
-def build_dynamic_prompt(runtime: RuntimeContext) -> str:
-    """Build the dynamic context block that changes every turn.
+DYNAMIC_CONTEXT_PREFIX = "【当前运行上下文】"
+TIME_NOTE_PREFIX = "【当前时间】"
 
-    This block is intentionally kept separate from the stable prefix so that
-    the prefix can hit provider-side prompt caches.  It is inserted as a
-    second system message near the tail of the conversation (just before the
-    latest user message) rather than being baked into the stable prefix.
+
+def build_dynamic_prompt(runtime: RuntimeContext) -> str:
+    """Build the semi-static runtime context block.
+
+    该块以 system 角色持久化到会话历史中（append-only），内容不变时不再
+    重复注入，保证跨轮请求的 prefix 连续、最大化 provider 侧缓存命中。
+    因此块内绝不放每轮必变的字段（当前时间单独用 build_time_note 注入）。
     """
     return (
-        "【当前运行上下文】\n"
+        f"{DYNAMIC_CONTEXT_PREFIX}\n"
         f"当前模型：{runtime.model_name}\n"
         f"当前权限模式：{runtime.permission_mode}\n"
         f"当前工作目录：{runtime.working_dir}\n"
-        f"当前时间：{runtime.current_time}\n"
         f"当前计划：{runtime.active_plan}\n"
         f"长期记忆：{runtime.memory}\n"
         f"已启用技能：{runtime.skills}\n"
-        f"可用自定义子 Agent：{runtime.custom_subagents}"
+        f"可用自定义子 Agent：{runtime.custom_subagents}\n"
+        "（若上下文中存在多份本块，以最新一份为准）"
     )
+
+
+def build_time_note(runtime: RuntimeContext) -> str:
+    """每轮新追加的时间注记（纯增量，不破坏 prefix 缓存，旧的保留不删）。"""
+    return f"{TIME_NOTE_PREFIX}{runtime.current_time}"
 
 
 def build_system_prompt(base_prompt: str, runtime: RuntimeContext) -> str:

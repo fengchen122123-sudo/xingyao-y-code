@@ -523,11 +523,10 @@ class MemoryManager:
                     history.append({"role": role, "content": parsed})
 
             # 如果存在背景记忆摘要，将其包装为参考上下文并插在首部。
-            # 注意 role 必须是 user 而非 system：agent_service 组装消息时会用
-            # without_system_messages 剔除历史中的全部 system 消息（防提示词漂移），
-            # 若摘要挂 system 会被一并误删、永远到不了模型（压缩就白做了）。
-            # user 角色位于 history[0]，紧随其后才是稳定 system 前缀，
-            # 位置在两次压缩之间保持稳定，不破坏 provider 侧 prefix caching。
+            # 注意 role 必须是 user 而非 system：持久化的上下文块（动态运行上下文/
+            # 时间注记等）使用 system 角色，摘要用 user 角色可以与之明确区分，
+            # 且位置固定在 history[0]，在两次压缩之间保持稳定，
+            # 不破坏 provider 侧 prefix caching。
             if memory_summary:
                 history.insert(0, {
                     "role": "user",
