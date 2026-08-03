@@ -962,9 +962,8 @@ def _chunk_with_finish(content="", reasoning="", finish_reason=None):
     )
 
 
-def test_reasoning_fields_dropped_for_messages_without_tool_calls(mocker):
-    """白名单 provider 下：无 tool_calls 的 assistant 消息不回传 reasoning_content /
-    thinking_blocks（死思考重复上传纯属浪费）；带 tool_calls 的消息仍保留。"""
+def test_reasoning_fields_preserved_for_all_assistant_messages(mocker):
+    """支持原生推理字段的 provider 必须收到完整 assistant 消息信封。"""
     captured = {}
 
     def fake_completion(**kwargs):
@@ -974,7 +973,7 @@ def test_reasoning_fields_dropped_for_messages_without_tool_calls(mocker):
     mocker.patch("core.llm.completion", side_effect=fake_completion)
 
     list(chat_with_model_events(
-        "deepseek/deepseek-reasoner",
+        "anthropic/K3",
         "fake-key",
         [
             {"role": "user", "content": "提问"},
@@ -999,6 +998,7 @@ def test_reasoning_fields_dropped_for_messages_without_tool_calls(mocker):
             {"role": "tool", "tool_call_id": "call_1", "content": "结果"},
             {"role": "user", "content": "继续"},
         ],
+        "https://api.kimi.com/coding",
         persist=False,
         turn_id="turn-dead-reasoning-strip",
         consume_background_notifications=False,
@@ -1007,9 +1007,30 @@ def test_reasoning_fields_dropped_for_messages_without_tool_calls(mocker):
     assistants = [m for m in captured["messages"] if m["role"] == "assistant"]
     no_tool = next(m for m in assistants if not m.get("tool_calls"))
     with_tool = next(m for m in assistants if m.get("tool_calls"))
-    assert "reasoning_content" not in no_tool
-    assert "thinking_blocks" not in no_tool
+    assert no_tool["reasoning_content"] == "废推理" * 5000
+    assert no_tool["thinking_blocks"] == [
+        {"type": "thinking", "thinking": "废推理", "signature": "sig"}
+    ]
     assert with_tool["reasoning_content"] == "签名链推理"
+
+
+def test_openai_reasoning_route_strips_anthropic_thinking_blocks():
+    """切换到 OpenAI 路由时保留 reasoning_content，但不得发送 Anthropic 签名块。"""
+    from core.llm import _strip_media_and_merge
+
+    cleaned, _, _ = _strip_media_and_merge([
+        {
+            "role": "assistant",
+            "content": "完成",
+            "reasoning_content": "分析过程",
+            "thinking_blocks": [
+                {"type": "thinking", "thinking": "分析过程", "signature": "sig"},
+            ],
+        },
+    ], "openai/kimi-for-coding")
+
+    assert cleaned[0]["reasoning_content"] == "分析过程"
+    assert "thinking_blocks" not in cleaned[0]
 
 
 def test_length_truncated_retry_bumps_max_tokens(mocker):

@@ -153,3 +153,18 @@ def test_read_file_schema_exposes_paging_and_edit_file_exposes_replace_all():
 
     edit_properties = registry.get("edit_file").api_schema()["function"]["parameters"]["properties"]
     assert edit_properties["replace_all"]["default"] is False
+
+
+def test_edit_file_choice_constraint_is_moonshot_compatible():
+    """函数参数根节点保持 object，选择约束不得直接把 anyOf 放在根节点。"""
+    registry = build_default_registry()
+    parameters = registry.get("edit_file").api_schema()["function"]["parameters"]
+
+    assert parameters["type"] == "object"
+    assert "anyOf" not in parameters
+    choices = parameters["allOf"][0]["anyOf"]
+    assert [choice["type"] for choice in choices] == ["object", "object"]
+    assert [choice["required"] for choice in choices] == [
+        ["target_content"],
+        ["start_line", "end_line"],
+    ]

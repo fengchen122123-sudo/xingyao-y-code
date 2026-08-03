@@ -1,4 +1,5 @@
 import json
+import hashlib
 import logging
 import os
 import random
@@ -594,11 +595,138 @@ session_token_usage = {
     "latest_total": 0,
     "latest_prompt": 0,
     "latest_cached": 0,
+
+    # 缓存遥测（仅主代理镜像到状态栏；按会话独立累计）
+    "cache_latest_rate": 0.0,
+    "cache_hot_rate": 0.0,
+    "cache_cumulative_rate": 0.0,
+    "cache_hot_turns": 0,
+    "cache_cumulative_cached": 0,
+    "cache_invalidation_reason": "",
     
     "max_window": 128000  # 默认最大上下文窗口配置
 }
 # session_token_usage 会被后台 worker 线程与 UI 线程同时读写，所有读写必须走锁
 token_usage_lock = threading.Lock()
+
+_cache_request_states = {}
+_cache_usage_states = {}
+
+
+def _cache_message_fingerprints(messages):
+    fingerprints = []
+    for message in messages or []:
+        normalized = {
+            key: value
+            for key, value in message.items()
+            if key != "cache_control"
+        }
+        payload = json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        fingerprints.append(hashlib.sha256(payload.encode("utf-8")).hexdigest())
+    return tuple(fingerprints)
+
+
+def _classify_cache_request(
+    session_id,
+    cache_scope,
+    model_name,
+    api_base,
+    tool_contract,
+    messages,
+):
+    """记录请求形状并返回确定性的缓存失效原因；空字符串表示严格追加。"""
+    state_key = (str(session_id), str(cache_scope or "main"))
+    current = {
+        "model": str(model_name or "").lower(),
+        "api_base": str(api_base or "").rstrip("/").lower(),
+        "tool_contract": str(tool_contract or ""),
+        "messages": _cache_message_fingerprints(messages),
+    }
+    with token_usage_lock:
+        previous = _cache_request_states.get(state_key)
+        if previous is None:
+            reason = "冷启动"
+        elif (
+            previous["model"] != current["model"]
+            or previous["api_base"] != current["api_base"]
+        ):
+            reason = "模型或接口变化"
+        elif previous["tool_contract"] != current["tool_contract"]:
+            reason = "工具契约变化"
+        elif current["messages"][:len(previous["messages"])] != previous["messages"]:
+            reason = "上下文压缩或历史重写"
+        else:
+            reason = ""
+        _cache_request_states[state_key] = current
+        if len(_cache_request_states) > 128:
+            _cache_request_states.pop(next(iter(_cache_request_states)))
+    return reason
+
+
+def _record_cache_usage(session_id, cache_scope, prompt_tokens, cached_tokens, invalidation_reason):
+    """分别累计当前轮、热启动与会话总命中率，并返回该通道的最新快照。"""
+    prompt = max(0, int(prompt_tokens or 0))
+    cached = max(0, int(cached_tokens or 0))
+    state_key = (str(session_id), str(cache_scope or "main"))
+    with token_usage_lock:
+        state = _cache_usage_states.setdefault(state_key, {
+            "cumulative_prompt": 0,
+            "cumulative_cached": 0,
+            "hot_prompt": 0,
+            "hot_cached": 0,
+            "hot_turns": 0,
+        })
+        state["cumulative_prompt"] += prompt
+        state["cumulative_cached"] += cached
+        if not invalidation_reason:
+            state["hot_prompt"] += prompt
+            state["hot_cached"] += cached
+            state["hot_turns"] += 1
+
+        snapshot = dict(state)
+        snapshot["latest_rate"] = (cached / prompt * 100) if prompt else 0.0
+        snapshot["hot_rate"] = (
+            state["hot_cached"] / state["hot_prompt"] * 100
+            if state["hot_prompt"] else 0.0
+        )
+        snapshot["cumulative_rate"] = (
+            state["cumulative_cached"] / state["cumulative_prompt"] * 100
+            if state["cumulative_prompt"] else 0.0
+        )
+        snapshot["invalidation_reason"] = str(invalidation_reason or "")
+
+        if str(cache_scope or "main") == "main":
+            session_token_usage["cache_latest_rate"] = snapshot["latest_rate"]
+            session_token_usage["cache_hot_rate"] = snapshot["hot_rate"]
+            session_token_usage["cache_cumulative_rate"] = snapshot["cumulative_rate"]
+            session_token_usage["cache_hot_turns"] = snapshot["hot_turns"]
+            session_token_usage["cache_cumulative_cached"] = snapshot["cumulative_cached"]
+            session_token_usage["cache_invalidation_reason"] = snapshot["invalidation_reason"]
+        return snapshot
+
+
+def _extract_cached_tokens(usage):
+    """读取 OpenAI 标准明细或 DeepSeek 原生 usage 中的精确缓存命中 token。"""
+    if usage is None:
+        return 0
+    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else getattr(
+        usage, "prompt_tokens_details", None
+    )
+    if isinstance(details, dict):
+        cached = details.get("cached_tokens", 0)
+    else:
+        cached = getattr(details, "cached_tokens", 0) if details is not None else 0
+    if cached:
+        return int(cached)
+    direct = usage.get("prompt_cache_hit_tokens", 0) if isinstance(usage, dict) else getattr(
+        usage, "prompt_cache_hit_tokens", 0
+    )
+    return int(direct or 0)
 
 # The registry is the canonical capability metadata source.
 from core.tool_registry import build_default_registry
@@ -796,6 +924,8 @@ def chat_with_model_events(
     parent_turn_id=None,
     permission_owner=None,
     permission_source="主代理",
+    cache_scope="main",
+    cache_session_id=None,
 ):
     """Yield ordered :class:`TurnEvent` snapshots for one model turn.
 
@@ -868,6 +998,8 @@ def chat_with_model_events(
         parent_turn_id=resolved_parent_turn_id,
         permission_owner=permission_owner or resolved_parent_turn_id,
         permission_source=permission_source,
+        cache_scope=cache_scope,
+        cache_session_id=cache_session_id or parent_session,
     )
     try:
         for chunk in generator:
@@ -915,6 +1047,12 @@ def _is_kimi_family(model_name, api_base=""):
     return "moonshot" in b or "kimi" in b
 
 
+def _supports_cache_keepalive(model_name, api_base=""):
+    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi 路由。"""
+    identity = f"{model_name or ''} {api_base or ''}".lower()
+    return _is_kimi_family(model_name, api_base) or "deepseek" in identity
+
+
 def _supports_reasoning_fields(model_name):
     prefix = str(model_name or "").split("/")[0].lower()
     if prefix in _REASONING_FIELD_PROVIDERS:
@@ -940,6 +1078,17 @@ def _supports_cache_control(model_name):
     """
     prefix = str(model_name or "").split("/")[0].lower()
     return prefix in _CACHE_CONTROL_PROVIDERS
+
+
+def _tool_contract_fingerprint(tools):
+    """返回最终工具 schema 的确定性指纹，用于隔离不同请求契约的缓存通道。"""
+    payload = json.dumps(
+        tools or [],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
 def _apply_cache_control(messages, model_name):
@@ -1050,12 +1199,13 @@ def _strip_media_and_merge(messages, model_name=None):
        不支持视觉的模型把图片折叠为占位符（绝不把 base64 当文本发给模型）。
        文档/文本文件已在 input_parser 中转为普通文本，此处不视为视觉输入。
     2. 合并连续相同 role 的消息，满足 LiteLLM / Anthropic 对 user/assistant 严格轮流的要求
-    3. reasoning_content / thinking_blocks 仅对支持的 provider 回传，避免其他 provider 报 400；
-       且仅随带 tool_calls 的消息回传（签名思考链要求），无工具调用的纯思考消息一律剥掉
+    3. reasoning_content / thinking_blocks 仅对支持的 provider 完整回传，避免其他
+       provider 报 400，同时保持 Kimi 等模型要求的连续 provider 消息信封
 
     返回 (fixed_messages, folded_media_count, keep_media)。
     """
     keep_reasoning_fields = _supports_reasoning_fields(model_name)
+    keep_thinking_blocks = str(model_name or "").split("/")[0].lower() == "anthropic"
     keep_media = _supports_vision(model_name)
 
     # 仅保留最近一条用户消息中的视觉输入（图片/视频），
@@ -1101,14 +1251,12 @@ def _strip_media_and_merge(messages, model_name=None):
             cleaned_msg["tool_call_id"] = msg["tool_call_id"]
         if "name" in msg:
             cleaned_msg["name"] = msg["name"]
-        # 死思考不回传：reasoning/thinking 字段仅对带 tool_calls 的 assistant
-        # 消息有协议价值（Kimi/Anthropic 的签名思考链要求）。无工具调用的纯
-        # 思考消息（常见于模型只输出 reasoning 未生成正文的兜底轮）保留它，
-        # 会让后续每一轮请求都重复上传这段废推理（可能长达数万字符），纯烧 Token。
-        has_tool_calls = bool(msg.get("tool_calls"))
-        if keep_reasoning_fields and has_tool_calls and msg.get("reasoning_content") is not None:
+        # 支持原生推理字段的 provider 需要收到自己上轮返回的完整消息信封。
+        # 是否存在 tool_calls 不能作为删除条件：Kimi OpenAI 路由会在普通 assistant
+        # 消息中返回 reasoning_content，Anthropic 路由还可能返回签名 thinking_blocks。
+        if keep_reasoning_fields and msg.get("reasoning_content") is not None:
             cleaned_msg["reasoning_content"] = msg["reasoning_content"]
-        if keep_reasoning_fields and has_tool_calls and msg.get("thinking_blocks") is not None:
+        if keep_reasoning_fields and keep_thinking_blocks and msg.get("thinking_blocks") is not None:
             cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
 
         # 净化 assistant 消息：若 content 包含 protocol sanitised 占位符且有 tool_calls/reasoning，将 content 重置为空字符串
@@ -1151,25 +1299,58 @@ def _strip_media_and_merge(messages, model_name=None):
     return fixed, folded_count, keep_media
 
 
-def _cache_affinity_session_id():
-    """返回 Kimi prompt 缓存亲和使用的会话级稳定 ID。
+def _resolve_cache_session_identity(cache_session_id=None):
+    """解析请求所属会话；后台任务可用捕获值覆盖当前 UI 会话。"""
+    global _process_cache_key_fallback
+    sid = str(cache_session_id or "").strip()
+    if not sid:
+        try:
+            sid = str(app_context.get_current_session() or "").strip()
+        except Exception:
+            sid = ""
+    if not sid:
+        if not _process_cache_key_fallback:
+            _process_cache_key_fallback = uuid.uuid4().hex
+        sid = _process_cache_key_fallback
+    return sid
+
+
+def _cache_affinity_session_id(
+    *,
+    cache_scope="main",
+    model_name="",
+    api_base="",
+    tool_contract="",
+    cache_session_id=None,
+):
+    """返回 Kimi prompt 缓存亲和使用的会话级隔离 ID。
 
     Moonshot 后端是多集群架构，请求带 prompt_cache_key（OpenAI 路由）或
     metadata.user_id（Anthropic 路由）时，网关会把同 ID 的请求优先路由到
     持有其前缀 KV cache 的集群，显著提高缓存命中率（命中部分自动折扣计费）。
     官方建议该值在会话生命周期内保持稳定，会话恢复后沿用原值——正好对应
-    app_context 的 current_session；取不到时退化为进程级随机 ID（保底进程内一致）。
+    app_context 的 current_session；后台任务可显式传入启动时捕获的父会话，避免 UI
+    切换会话后串线。原始会话名只参与 SHA-256，不发送给 provider。
+
+    通道维度包含角色、模型、API 路由与工具契约。这样主代理、不同子代理角色、
+    不同工具 schema 不会共用同一个 prompt_cache_key。
     """
-    global _process_cache_key_fallback
-    try:
-        sid = str(app_context.get_current_session() or "").strip()
-        if sid:
-            return sid
-    except Exception:
-        pass
-    if not _process_cache_key_fallback:
-        _process_cache_key_fallback = f"ycode-{uuid.uuid4().hex[:12]}"
-    return _process_cache_key_fallback
+    sid = _resolve_cache_session_identity(cache_session_id)
+
+    session_hash = hashlib.sha256(sid.encode("utf-8")).hexdigest()[:12]
+    lane_material = json.dumps(
+        {
+            "scope": str(cache_scope or "main"),
+            "model": str(model_name or "").lower(),
+            "api_base": str(api_base or "").rstrip("/").lower(),
+            "tool_contract": str(tool_contract or ""),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    lane_hash = hashlib.sha256(lane_material.encode("utf-8")).hexdigest()[:16]
+    return f"ycode-{session_hash}-{lane_hash}"
 
 
 _process_cache_key_fallback = None
@@ -1177,7 +1358,16 @@ _process_cache_key_fallback = None
 _REASONING_EFFORT_LEVELS = ("low", "high", "max")
 
 
-def _attach_kimi_request_extras(result, model_name, model_cfg):
+def _attach_kimi_request_extras(
+    result,
+    model_name,
+    model_cfg,
+    *,
+    api_base="",
+    cache_scope="main",
+    cache_session_id=None,
+    tool_contract="",
+):
     """给 Kimi 系模型的请求参数附加缓存亲和与推理强度配置（原地修改 result）。
 
     - 缓存亲和：OpenAI 兼容路由传 prompt_cache_key，Anthropic 路由传 metadata.user_id。
@@ -1186,7 +1376,13 @@ def _attach_kimi_request_extras(result, model_name, model_cfg):
     """
     anthropic_route = str(model_name or "").split("/")[0].lower() == "anthropic"
 
-    session_id = _cache_affinity_session_id()
+    session_id = _cache_affinity_session_id(
+        cache_scope=cache_scope,
+        model_name=model_name,
+        api_base=api_base,
+        tool_contract=tool_contract,
+        cache_session_id=cache_session_id,
+    )
     if session_id:
         if anthropic_route:
             result.setdefault("metadata", {"user_id": session_id})
@@ -1207,7 +1403,38 @@ def _attach_kimi_request_extras(result, model_name, model_cfg):
             result.setdefault("extra_body", {})["reasoning_effort"] = effort
 
 
-def _provider_request_options(model_name, api_base):
+def _provider_cache_affinity_options(
+    model_name,
+    api_base,
+    *,
+    cache_scope,
+    cache_session_id=None,
+    tool_contract="",
+):
+    """仅返回 provider 缓存亲和参数，不改变输出长度或推理配置。"""
+    if not _is_kimi_family(model_name, api_base):
+        return {}
+    result = {}
+    _attach_kimi_request_extras(
+        result,
+        model_name,
+        {},
+        api_base=api_base,
+        cache_scope=cache_scope,
+        cache_session_id=cache_session_id,
+        tool_contract=tool_contract,
+    )
+    return result
+
+
+def _provider_request_options(
+    model_name,
+    api_base,
+    *,
+    cache_scope="main",
+    cache_session_id=None,
+    tool_contract="",
+):
     """Return options required by a known provider/model pair.
 
     优先级：
@@ -1287,7 +1514,15 @@ def _provider_request_options(model_name, api_base):
                 result = {"max_tokens": 16384}
 
     if kimi_family:
-        _attach_kimi_request_extras(result, model_name, model_cfg)
+        _attach_kimi_request_extras(
+            result,
+            model_name,
+            model_cfg,
+            api_base=api_base,
+            cache_scope=cache_scope,
+            cache_session_id=cache_session_id,
+            tool_contract=tool_contract,
+        )
     return result
 
 
@@ -2217,6 +2452,12 @@ def _call_vision_model_for_content(secondary, content, cancel_event=None, max_re
         "max_tokens": 2048,
         "timeout": API_REQUEST_TIMEOUT_SECONDS,
     }
+    kwargs.update(_provider_cache_affinity_options(
+        secondary["litellm_model"],
+        secondary["base_url"],
+        cache_scope="secondary:vision",
+        tool_contract="no-tools",
+    ))
 
     from concurrent.futures import ThreadPoolExecutor
     warning_logger = logging.getLogger("py.warnings")
@@ -2355,11 +2596,21 @@ def _chat_with_model_generator(
     parent_turn_id=None,
     permission_owner=None,
     permission_source="主代理",
+    cache_scope="main",
+    cache_session_id=None,
 ):
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
     """
     turn_snapshot = deepcopy(messages)
+    keepalive_interval = 0
+    if cache_scope == "main":
+        from core.cache_keepalive import cache_keepalive_service, load_keepalive_interval
+        configured_keepalive = load_keepalive_interval()
+        # 每次主模型请求先停掉旧快照，防止切换 provider 后仍保活旧模型。
+        cache_keepalive_service.register_request({}, interval=0)
+        if _supports_cache_keepalive(model_name, api_base):
+            keepalive_interval = configured_keepalive
     # 1. 自动注入 KAIROS 长期记忆指示与 MEMORY.md 索引。
     # 注意：main.py 的动态上下文（尾部第二条 system 消息）里已经带了完整记忆段，
     # 所以必须检查所有 system 消息，避免重复注入（重复会翻倍 token 消耗）。
@@ -2454,6 +2705,9 @@ def _chat_with_model_generator(
         or schema.get("function", {}).get("name") not in _MCP_ADMIN_TOOLS
     ]
 
+    request_tool_contract = _tool_contract_fingerprint(request_tools)
+    telemetry_session_id = _resolve_cache_session_identity(cache_session_id)
+
     kwargs = {
         "model": model_name,
         "api_key": api_key,
@@ -2469,7 +2723,13 @@ def _chat_with_model_generator(
         "num_retries": 2,
     }
     kwargs["tool_choice"] = "auto"
-    kwargs.update(_provider_request_options(model_name, api_base))
+    kwargs.update(_provider_request_options(
+        model_name,
+        api_base,
+        cache_scope=cache_scope,
+        cache_session_id=telemetry_session_id,
+        tool_contract=request_tool_contract,
+    ))
 
     # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小
     # 导致长回复被静默截断。若 provider 已显式配置则尊重其值。
@@ -2500,6 +2760,8 @@ def _chat_with_model_generator(
             # 超窗自动压缩只允许一次：压缩后仍超限说明单条消息/附件本身过大，
             # 继续重试只会反复重发超大载荷空烧额度
             overflow_compress_attempts = 0
+            classified_message_shape = None
+            request_cache_reason = "冷启动"
 
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
@@ -2517,6 +2779,17 @@ def _chat_with_model_generator(
                                 and not _m.get("reasoning_content")
                             ):
                                 _m["reasoning_content"] = " "
+                    current_message_shape = _cache_message_fingerprints(cleaned_messages)
+                    if current_message_shape != classified_message_shape:
+                        request_cache_reason = _classify_cache_request(
+                            telemetry_session_id,
+                            cache_scope,
+                            model_name,
+                            api_base,
+                            request_tool_contract,
+                            cleaned_messages,
+                        )
+                        classified_message_shape = current_message_shape
                     kwargs["messages"] = _apply_cache_control(cleaned_messages, model_name)
                     # 历史图片折叠属于正常节省行为，不再向用户弹提示打扰
                     # 超时随载荷放大：超大上下文 + 深度思考的首个 token 可能要几分钟，
@@ -2784,17 +3057,23 @@ def _chat_with_model_generator(
                         stream_usage = _tail_usage
                         break
 
+            if cache_scope == "main" and keepalive_interval:
+                cache_keepalive_service.register_request(kwargs, interval=keepalive_interval)
+
             # 流结束：按最终 usage chunk 统一记账一次（读写均走锁）
             if stream_usage is not None:
-                cache_details = getattr(stream_usage, "prompt_tokens_details", None)
-                latest_cached = (
-                    cache_details.cached_tokens
-                    if cache_details is not None and hasattr(cache_details, "cached_tokens")
-                    else 0
-                ) or 0
+                latest_cached = _extract_cached_tokens(stream_usage)
+                prompt_tokens = getattr(stream_usage, "prompt_tokens", 0) or 0
+                _record_cache_usage(
+                    telemetry_session_id,
+                    cache_scope,
+                    prompt_tokens,
+                    latest_cached,
+                    request_cache_reason,
+                )
                 with token_usage_lock:
                     session_token_usage["latest_total"] = getattr(stream_usage, "total_tokens", 0) or 0
-                    session_token_usage["latest_prompt"] = getattr(stream_usage, "prompt_tokens", 0) or 0
+                    session_token_usage["latest_prompt"] = prompt_tokens
                     # completion = total - prompt（多数 provider 不直接给 completion_tokens）
                     session_token_usage["latest_cached"] = latest_cached
                     session_token_usage["cumulative_total"] += session_token_usage["latest_total"]
@@ -2862,6 +3141,8 @@ def _chat_with_model_generator(
                 "content": public_content or None,
                 "reasoning_content": reasoning_content or None,
             }
+            if provider_thinking_blocks is not None:
+                persisted_message["thinking_blocks"] = provider_thinking_blocks
             if tool_calls_list:
                 persisted_message["tool_calls"] = tool_calls_list
 
