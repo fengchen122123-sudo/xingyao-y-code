@@ -564,12 +564,26 @@ from core.tool_registry import build_default_registry
 tool_registry = build_default_registry()
 
 
+_mcp_first_wait_done = False
+
+
 def get_tools_schema():
     """每次构建请求时新鲜获取工具 schema（registry 静态 + MCP 动态）。
 
     不做模块级一次性快照：启动时 MCP 连接失败不会导致本进程永久缺失
     MCP 工具 schema，且 mcp_client 为惰性连接，import 时不触发网络。
+
+    进程内首次调用时同步等待 MCP 连接就绪（有界超时，空配置立即返回）：
+    否则 MCP schema 会在第 N 轮突然出现在 tools 列表里，DeepSeek/Kimi
+    前缀缓存从头部整体失效。后续调用恢复非阻塞，避免每轮都承担连接延迟。
     """
+    global _mcp_first_wait_done
+    if not _mcp_first_wait_done:
+        _mcp_first_wait_done = True
+        try:
+            mcp_manager._ensure_connected()
+        except Exception:
+            pass
     return tool_registry.api_schemas() + mcp_manager.get_schemas()
 
 
@@ -2341,10 +2355,10 @@ def _chat_with_model_generator(
         for notif in drained_notifications:
             messages.append({"role": "user", "content": notif})
 
-    active_plan = allow_subagents and _has_pending_plan(parent_session)
-    # 计划模式下仍向 LLM 暴露计划控制工具和只读探索工具，
-    # 让主 Agent 既能推进计划，也能直接读取上下文验证子代理产出。
-    _PLAN_AVAILABLE_TOOLS = _PLAN_ROOT_CONTROL_TOOLS | _PLAN_READ_ONLY_TOOLS
+    # 注意：不因“计划进行中”裁剪 tools——计划约束由执行层
+    # （_execute_single_tool_call 的 plan_enforced 拦截）统一保证，裁剪是双重保险。
+    # tools 列表逐字节稳定是 DeepSeek/Kimi 前缀缓存命中的前提，
+    # 计划创建↔完成之间切换工具集会让缓存从头部整体失效，代价远大于省下的 schema token。
     # MCP 管理工具默认不进请求：用户几乎都通过 /mcp 界面管理 MCP，
     # 这 4 个 schema 每轮白吃约 500 token。需要让 AI 代管 MCP 时在
     # config.json 里设 "expose_mcp_admin_tools": true 即可恢复。
@@ -2357,10 +2371,6 @@ def _chat_with_model_generator(
     request_tools = [
         schema
         for schema in get_tools_schema()
-        if (
-            not active_plan
-            or schema.get("function", {}).get("name") in _PLAN_AVAILABLE_TOOLS
-        )
         if allow_subagents
         or schema.get("function", {}).get("name")
         not in {"run_subagent", "plan_write", "plan_update"}
@@ -2371,30 +2381,21 @@ def _chat_with_model_generator(
         or schema.get("function", {}).get("name") not in _MCP_ADMIN_TOOLS
     ]
 
-    # 针对打招呼等简单闲聊优化：禁用工具防乱掉
-    last_user_text = ""
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "user":
-            c = msg.get("content")
-            if isinstance(c, str):
-                last_user_text = c.strip()
-            break
-
-    is_simple_greeting = bool(re.match(r"^(你好|您好|hi|hello|在吗|哈喽|早上好|晚上好|下午好|你是谁|1|测试)[！!？?~。]*$", last_user_text, re.IGNORECASE))
-
     kwargs = {
         "model": model_name,
         "api_key": api_key,
         # 占位：每次请求前都会在重试循环里用 _strip_media_and_merge 的结果覆盖，
         # 这里不再提前做一遍完整清洗（此前同一份数据每轮被处理两次，纯浪费 CPU）
         "messages": messages,
-        "tools": None if (is_simple_greeting and not active_plan) else request_tools,
+        # tools 每轮都带（含简单问候轮）：请求形状逐字节稳定是前缀缓存命中的前提，
+        # 问候轮省下的 schema token 远小于缓存整体失效的代价；
+        # 模型在 tool_choice=auto 下对闲聊本来就不会调用工具
+        "tools": request_tools,
         "stream": True,
         "stream_options": {"include_usage": True},
         "num_retries": 2,
     }
-    if not (is_simple_greeting and not active_plan):
-        kwargs["tool_choice"] = "auto"
+    kwargs["tool_choice"] = "auto"
     kwargs.update(_provider_request_options(model_name, api_base))
 
     # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小

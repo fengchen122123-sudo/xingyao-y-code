@@ -704,7 +704,7 @@ def open_model_selector(on_model_selected=None):
         steps_map = {
             0: ("步骤 1/5  API Base URL", "编辑 Base URL，如 https://api.deepseek.com/v1："),
             1: ("步骤 2/5  API Key",       "编辑 API Key："),
-            2: ("步骤 3/5  模型名称",        "编辑模型名称，如 deepseek-chat："),
+            2: ("步骤 3/5  模型名称",        "编辑模型名称，如 deepseek-v4-flash："),
             3: ("步骤 4/5  最大上下文",      "编辑上下文 Token 数，如 128000："),
             4: ("步骤 5/5  图片/视频输入",      "该模型是否支持图片/视频输入？"),
         }
@@ -794,7 +794,7 @@ def open_model_selector(on_model_selected=None):
             1: ("步骤 1/6  厂商名称",     "输入厂商名称，如 DeepSeek："),
             2: ("步骤 2/6  API Base URL", "输入 Base URL，如 https://api.deepseek.com/v1："),
             3: ("步骤 3/6  API Key",       "输入 API Key："),
-            4: ("步骤 5a  模型名称",        "输入模型名称，如 deepseek-chat："),
+            4: ("步骤 5a  模型名称",        "输入模型名称，如 deepseek-v4-flash："),
             5: ("步骤 5b  最大上下文",      "输入上下文 Token 数，如 128000："),
         }
 
@@ -865,7 +865,7 @@ def open_model_selector(on_model_selected=None):
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
 
         steps_map = {
-            0: ("步骤 1/3  模型名称",   "输入模型名称，如 deepseek-chat："),
+            0: ("步骤 1/3  模型名称",   "输入模型名称，如 deepseek-v4-flash："),
             1: ("步骤 2/3  最大上下文", "输入上下文 Token 数，如 128000："),
             2: ("步骤 3/3  图片/视频输入", "该模型是否支持图片/视频输入？"),
         }

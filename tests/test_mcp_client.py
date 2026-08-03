@@ -101,3 +101,17 @@ def test_close_is_idempotent(manager):
     manager.close()
     manager.close()
     assert manager._closed
+
+
+def test_get_schemas_returns_sorted_by_tool_name(manager, tmp_path):
+    """tools 列表必须跨轮次逐字节稳定：get_schemas 按工具名排序返回，
+    与各 server 连接完成的先后顺序无关（DeepSeek/Kimi 前缀缓存命中的前提）。"""
+    _write_config(manager, tmp_path, {})
+    manager.tool_schemas = [
+        {"type": "function", "function": {"name": "srvb__zeta", "description": "", "parameters": {}}},
+        {"type": "function", "function": {"name": "srva__beta", "description": "", "parameters": {}}},
+        {"type": "function", "function": {"name": "srva__alpha", "description": "", "parameters": {}}},
+    ]
+
+    names = [s["function"]["name"] for s in manager.get_schemas()]
+    assert names == ["srva__alpha", "srva__beta", "srvb__zeta"]

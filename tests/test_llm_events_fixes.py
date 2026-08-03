@@ -1234,3 +1234,72 @@ def test_estimate_tokens_ignores_old_image_base64(mocker):
     assert counted, "必须调用 litellm 计数"
     assert base64_blob not in str(counted[0])
     assert "[图片]" in str(counted[0])
+
+
+def test_plan_active_does_not_prune_request_tools(mocker, monkeypatch):
+    """计划进行中不再裁剪 tools：计划约束由执行层 plan_enforced 拦截统一保证，
+    tools 列表逐字节稳定是 DeepSeek/Kimi 前缀缓存命中的前提，
+    计划创建/完成之间切换工具集会让缓存从头部整体失效。"""
+    monkeypatch.setattr("core.llm._has_pending_plan", lambda session: True)
+
+    captured = []
+
+    def fake_completion(**kwargs):
+        captured.append(dict(kwargs))
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "继续执行计划"}],
+        persist=False,
+        turn_id="turn-plan-tools-stable",
+        consume_background_notifications=False,
+    ))
+
+    assert captured, "必须发出请求"
+    tool_names = {s.get("function", {}).get("name") for s in (captured[0].get("tools") or [])}
+    assert "write_file" in tool_names, "计划进行中不得裁剪写工具（执行层拦截兜底）"
+    assert "run_subagent" in tool_names
+    assert "plan_write" in tool_names
+
+
+def test_greeting_turn_keeps_tools_for_cache_stability(mocker):
+    """简单问候轮也必须携带 tools + tool_choice=auto：请求形状逐字节稳定是
+    前缀缓存命中的前提，问候轮省 schema token 的代价是后续轮次缓存整体失效。"""
+    captured = []
+
+    def fake_completion(**kwargs):
+        captured.append(dict(kwargs))
+        return iter([_chunk("你好！")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "你好"}],
+        persist=False,
+        turn_id="turn-greeting-tools",
+        consume_background_notifications=False,
+    ))
+
+    assert captured[0].get("tools"), "问候轮 tools 不得为 None"
+    assert captured[0].get("tool_choice") == "auto"
+
+
+def test_get_tools_schema_waits_for_mcp_only_once(mocker, monkeypatch):
+    """进程内首次构建 tools 前同步等待 MCP 就绪（避免 MCP schema 第 N 轮
+    突然出现破坏前缀缓存），后续调用恢复非阻塞。"""
+    import core.llm as llm_mod
+
+    calls = []
+    monkeypatch.setattr(llm_mod.mcp_manager, "_ensure_connected", lambda: calls.append(1))
+    monkeypatch.setattr(llm_mod, "_mcp_first_wait_done", False)
+
+    llm_mod.get_tools_schema()
+    llm_mod.get_tools_schema()
+
+    assert calls == [1], "MCP 同步等待只允许发生在进程内首次调用"
