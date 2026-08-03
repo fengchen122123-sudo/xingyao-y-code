@@ -219,14 +219,19 @@ class MCPManager:
             await asyncio.gather(*tasks)
 
     def get_schemas(self):
-        """返回当前已就绪的 MCP 工具 schema，不阻塞等待连接完成。
+        """返回当前已就绪的 MCP 工具 schema（按工具名排序），不阻塞等待连接完成。
 
         首次访问时惰性触发连接（或空配置占位 future），但不等待连接结果，
         避免阻塞主流程；连接成功后 tool_schemas 会自动更新。
+        排序返回：各 server 连接完成的先后顺序随网络波动，排序保证 tools 列表
+        跨轮次逐字节稳定，这是 DeepSeek/Kimi 前缀缓存命中的前提。
         """
         with self._connect_lock:
             self._maybe_start_connection()
-        return list(self.tool_schemas)
+        return sorted(
+            self.tool_schemas,
+            key=lambda s: s.get("function", {}).get("name", ""),
+        )
 
     async def _call_tool_async(self, tool_name, arguments):
         server_name = self.server_of_tool.get(tool_name)

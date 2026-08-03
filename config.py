@@ -116,13 +116,13 @@ if not os.path.exists(_CONFIG_FILE):
                                 {
                                     "id": "ds-v4-pro",
                                     "name": "deepseek-v4-pro",
-                                    "litellm_model": "deepseek/deepseek-chat",
+                                    "litellm_model": "openai/deepseek-v4-pro",
                                     "context_window": 1000000
                                 },
                                 {
                                     "id": "ds-v4-flash",
                                     "name": "deepseek-v4-flash",
-                                    "litellm_model": "deepseek/deepseek-coder",
+                                    "litellm_model": "openai/deepseek-v4-flash",
                                     "context_window": 1000000
                                 }
                             ]
@@ -174,7 +174,7 @@ def _resolve_constant(name):
         if info:
             return info.get("litellm_model", "")
         if "providers" not in data:
-            return data.get("model", "deepseek/deepseek-chat")
+            return data.get("model", "openai/deepseek-v4-flash")
         return ""
     if name == "MY_KEY":
         if info:

@@ -76,13 +76,13 @@ def load_config() -> dict:
                             {
                                 "id": "ds-v4-pro",
                                 "name": "deepseek-v4-pro",
-                                "litellm_model": "deepseek/deepseek-chat",
+                                "litellm_model": "openai/deepseek-v4-pro",
                                 "context_window": 1000000
                             },
                             {
                                 "id": "ds-v4-flash",
                                 "name": "deepseek-v4-flash",
-                                "litellm_model": "deepseek/deepseek-coder",
+                                "litellm_model": "openai/deepseek-v4-flash",
                                 "context_window": 1000000
                             }
                         ]

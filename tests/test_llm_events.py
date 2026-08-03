@@ -804,7 +804,10 @@ def test_child_schema_excludes_run_subagent(mocker):
     assert "plan_update" not in names
 
 
-def test_root_with_pending_plan_only_exposes_plan_control_tools(mocker):
+def test_root_with_pending_plan_keeps_full_tools_for_cache_stability(mocker):
+    """计划进行中不再裁剪 tools：计划约束由执行层 plan_enforced 拦截统一保证。
+    tools 列表逐字节稳定是 DeepSeek/Kimi 前缀缓存命中的前提，
+    计划创建↔完成之间切换工具集会让缓存从头部整体失效。"""
     from core.plan import bind_default_plan_session, get_default_plan_manager
 
     captured = {}
@@ -834,13 +837,14 @@ def test_root_with_pending_plan_only_exposes_plan_control_tools(mocker):
         bind_default_plan_session(previous_session)
 
     names = {item["function"]["name"] for item in captured["tools"]}
-    # 计划模式下暴露计划控制工具 + 只读探索工具
-    # find_definition 属只读探索；manage_task 用于后台任务监控（kill 有独立确认）
-    assert names <= {
+    # 计划控制工具与只读探索工具必须仍在（供主 Agent 推进计划）
+    assert {
         "plan_write", "plan_update", "plan_read", "plan_retry", "run_subagent", "ask_user",
         "read_file", "list_directory", "search_code", "glob_files", "find_definition",
         "fetch_url", "search_news", "get_weather", "manage_task",
-    }
+    } <= names
+    # 写工具也必须保留：请求形状跨轮稳定优先，越权调用由执行层拦截
+    assert "write_file" in names
 
 
 def test_child_does_not_drain_root_background_notifications(mocker):
