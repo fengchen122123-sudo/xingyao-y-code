@@ -79,6 +79,15 @@ def _litellm_context_overflow_error():
 # 单次 API 请求超时（秒）：长思考模型的首个 token 可能较慢，不宜过紧
 API_REQUEST_TIMEOUT_SECONDS = 90
 
+# 单次 API 请求超时上限（秒）：超时随载荷 token 数放大（大上下文 + 深度思考
+# 本来就需要几分钟），但必须有上限，避免挂起的连接无限等待
+API_REQUEST_MAX_TIMEOUT_SECONDS = 600
+
+# 单次请求等待反馈：超过阈值后按间隔向 UI 报一次“模型响应中”，
+# 避免大载荷请求长时间无反馈被误判为卡死
+WAIT_NOTICE_THRESHOLD_SECONDS = 15.0
+WAIT_NOTICE_INTERVAL_SECONDS = 15.0
+
 # 工具结果中的错误哨兵前缀（统一在此定义，供结果判断与构造处引用）
 TOOL_ERROR_PREFIX = "🚨"
 ASK_USER_ERROR_PREFIX = "无法提问："
@@ -583,6 +592,42 @@ def __getattr__(name):
 _token_estimate_cache = {"sig": None, "value": 0}
 
 
+def _fold_old_media_for_estimate(messages):
+    """估算前把历史图片折叠为占位符（与请求时 _strip_media_and_merge 的规则一致）。
+
+    base64 原图动辄几十万字符，按字符数估算会虚高几个数量级，导致携带大图片的
+    会话反复误触发记忆压缩。仅最近一条带图用户消息保留原样（交给 litellm 按
+    图片实际规格估算），更早的一律折叠为短占位符。
+    """
+    last_media_idx = -1
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, list) and any(
+            isinstance(item, dict) and item.get("type") in ("image", "image_url")
+            for item in content
+        ):
+            last_media_idx = idx
+        break
+    folded = []
+    for idx, msg in enumerate(messages):
+        content = msg.get("content")
+        if (
+            idx != last_media_idx
+            and isinstance(content, list)
+            and any(
+                isinstance(item, dict) and item.get("type") in ("image", "image_url")
+                for item in content
+            )
+        ):
+            folded.append({"role": msg.get("role"), "content": _flatten_media_content(content)})
+        else:
+            folded.append(msg)
+    return folded
+
+
 def estimate_tokens(model_name, messages):
     """本地离线快速估算 Token 数，防止超载崩溃（带签名缓存）"""
     if not messages:
@@ -595,10 +640,11 @@ def estimate_tokens(model_name, messages):
     if sig is not None and _token_estimate_cache.get("sig") == sig:
         return _token_estimate_cache["value"]
     try:
-        value = _litellm_token_counter(model_name, messages)
+        # 历史图片先折叠再计数：base64 字符量与图片真实 token 消耗无关
+        value = _litellm_token_counter(model_name, _fold_old_media_for_estimate(messages))
     except Exception:
         # 如果模型不支持或报错，采用约 2 字符 / Token 的经验值进行兜底估算
-        value = len(str(messages)) // 2
+        value = len(str(_fold_old_media_for_estimate(messages))) // 2
     if sig is not None:
         _token_estimate_cache["sig"] = sig
         _token_estimate_cache["value"] = value
@@ -1018,6 +1064,62 @@ def _strip_media_and_merge(messages, model_name=None):
     return fixed, folded_count, keep_media
 
 
+def _cache_affinity_session_id():
+    """返回 Kimi prompt 缓存亲和使用的会话级稳定 ID。
+
+    Moonshot 后端是多集群架构，请求带 prompt_cache_key（OpenAI 路由）或
+    metadata.user_id（Anthropic 路由）时，网关会把同 ID 的请求优先路由到
+    持有其前缀 KV cache 的集群，显著提高缓存命中率（命中部分自动折扣计费）。
+    官方建议该值在会话生命周期内保持稳定，会话恢复后沿用原值——正好对应
+    app_context 的 current_session；取不到时退化为进程级随机 ID（保底进程内一致）。
+    """
+    global _process_cache_key_fallback
+    try:
+        sid = str(app_context.get_current_session() or "").strip()
+        if sid:
+            return sid
+    except Exception:
+        pass
+    if not _process_cache_key_fallback:
+        _process_cache_key_fallback = f"ycode-{uuid.uuid4().hex[:12]}"
+    return _process_cache_key_fallback
+
+
+_process_cache_key_fallback = None
+
+_REASONING_EFFORT_LEVELS = ("low", "high", "max")
+
+
+def _attach_kimi_request_extras(result, model_name, model_cfg):
+    """给 Kimi 系模型的请求参数附加缓存亲和与推理强度配置（原地修改 result）。
+
+    - 缓存亲和：OpenAI 兼容路由传 prompt_cache_key，Anthropic 路由传 metadata.user_id。
+    - reasoning_effort：K3 官方推理强度档位（low/high/max，默认 max），仅 OpenAI
+      兼容路由支持；Anthropic 路由的推理强度由 thinking_budget 控制，不注入。
+    """
+    anthropic_route = str(model_name or "").split("/")[0].lower() == "anthropic"
+
+    session_id = _cache_affinity_session_id()
+    if session_id:
+        if anthropic_route:
+            result.setdefault("metadata", {"user_id": session_id})
+        else:
+            result.setdefault("extra_body", {})["prompt_cache_key"] = session_id
+
+    effort = str(model_cfg.get("reasoning_effort") or "").strip().lower()
+    if effort:
+        if effort not in _REASONING_EFFORT_LEVELS:
+            logger.warning(
+                "模型配置 reasoning_effort=%r 无效（仅支持 %s），已忽略",
+                effort, "/".join(_REASONING_EFFORT_LEVELS),
+            )
+        elif anthropic_route:
+            # Anthropic 路由（api.kimi.com/coding 等）的推理强度用 thinking_budget 控制
+            logger.info("reasoning_effort 仅对 OpenAI 兼容路由生效，Anthropic 路由请配置 thinking_budget")
+        else:
+            result.setdefault("extra_body", {})["reasoning_effort"] = effort
+
+
 def _provider_request_options(model_name, api_base):
     """Return options required by a known provider/model pair.
 
@@ -1025,6 +1127,8 @@ def _provider_request_options(model_name, api_base):
     1. config.json 中模型条目的显式 thinking_budget / max_tokens / enable_thinking
     2. 内置的 Kimi/Moonshot 模型默认表
     3. 空字典（由调用方兜底 max_tokens=8192）
+
+    无论走哪个分支，Kimi 系模型都会附加缓存亲和与 reasoning_effort 配置。
     """
     normalized_base = str(api_base or "").rstrip("/").lower()
     normalized_model = str(model_name or "").split("/")[-1].lower()
@@ -1040,9 +1144,16 @@ def _provider_request_options(model_name, api_base):
     cfg_thinking_budget = model_cfg.get("thinking_budget")
     cfg_enable_thinking = model_cfg.get("enable_thinking")
 
-    # 如果用户显式配置了就地返回
+    # 判定同时看模型名与 api_base（经销商/聚合网关的 base_url 千奇百怪，
+    # 只认 base 会漏判，比如 api.scnet.cn 上的 Kimi-K2.6）。
+    kimi_family = _is_kimi_family(model_name, api_base)
+    route_prefix = str(model_name or "").split("/")[0].lower()
+    anthropic_route = route_prefix == "anthropic"
+
+    result = {}
+
     if cfg_max_tokens is not None or cfg_thinking_budget is not None or cfg_enable_thinking is not None:
-        result = {}
+        # 用户显式配置优先
         if cfg_max_tokens is not None:
             result["max_tokens"] = int(cfg_max_tokens)
         # thinking 仅在显式启用或配置了 budget 时注入
@@ -1050,50 +1161,47 @@ def _provider_request_options(model_name, api_base):
             budget = int(cfg_thinking_budget) if cfg_thinking_budget is not None else 2048
             result["thinking"] = {"type": "enabled", "budget_tokens": budget}
             result["allowed_openai_params"] = ["thinking"]
-        return result
+    elif kimi_family:
+        # 2. 内置默认表：Kimi/Moonshot 深度适配。
+        is_kimi_coding = "api.kimi.com/coding" in normalized_base
 
-    # 2. 内置默认表：Kimi/Moonshot 深度适配。
-    # 判定同时看模型名与 api_base（经销商/聚合网关的 base_url 千奇百怪，
-    # 只认 base 会漏判，比如 api.scnet.cn 上的 Kimi-K2.6）。
-    if not _is_kimi_family(model_name, api_base):
-        return {}
+        def _match_any(keys):
+            return any(k in normalized_model for k in keys)
 
-    is_kimi_coding = "api.kimi.com/coding" in normalized_base
-    route_prefix = str(model_name or "").split("/")[0].lower()
-    anthropic_route = route_prefix == "anthropic"
-    model_lower = normalized_model
+        is_k3 = _match_any(("k3",)) or "for-coding" in normalized_model
 
-    def _match_any(keys):
-        return any(k in model_lower for k in keys)
+        if anthropic_route:
+            # Anthropic 协议路由（api.kimi.com/coding 等 anthropic 兼容端点）：
+            # 接受 Anthropic 形状的 thinking 参数。
+            # 必须同时声明 allowed_openai_params：litellm 的客户端参数校验只把
+            # Claude 系列识别为支持 thinking 的 anthropic 模型，对 "K3" 这类陌生
+            # 模型名会直接抛 UnsupportedParamsError（请求根本发不出去），需要显式豁免。
+            if is_k3:
+                result = {
+                    "thinking": {"type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048},
+                    "max_tokens": 32000 if is_kimi_coding else 16000,
+                    "allowed_openai_params": ["thinking"],
+                }
+            else:
+                result = {
+                    "thinking": {"type": "enabled", "budget_tokens": 2048},
+                    "max_tokens": 16000,
+                    "allowed_openai_params": ["thinking"],
+                }
+        else:
+            # OpenAI 兼容路由（api.moonshot.cn/v1 及各类经销商）：
+            # 绝不发送 Anthropic 形状的 thinking 参数——Moonshot 的
+            # /v1/chat/completions 不认这个键，发了会直接 400。
+            # Kimi 推理模型（k2.5/k2.6/k2.7/k3 等）在该路由上会原生输出
+            # reasoning_content，无需显式开启，只需给足输出上限。
+            if is_k3:
+                result = {"max_tokens": 32000}
+            else:
+                result = {"max_tokens": 16384}
 
-    is_k3 = _match_any(("k3",)) or "for-coding" in model_lower
-
-    if anthropic_route:
-        # Anthropic 协议路由（api.kimi.com/coding 等 anthropic 兼容端点）：
-        # 接受 Anthropic 形状的 thinking 参数。
-        # 必须同时声明 allowed_openai_params：litellm 的客户端参数校验只把
-        # Claude 系列识别为支持 thinking 的 anthropic 模型，对 "K3" 这类陌生
-        # 模型名会直接抛 UnsupportedParamsError（请求根本发不出去），需要显式豁免。
-        if is_k3:
-            return {
-                "thinking": {"type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048},
-                "max_tokens": 32000 if is_kimi_coding else 16000,
-                "allowed_openai_params": ["thinking"],
-            }
-        return {
-            "thinking": {"type": "enabled", "budget_tokens": 2048},
-            "max_tokens": 16000,
-            "allowed_openai_params": ["thinking"],
-        }
-
-    # OpenAI 兼容路由（api.moonshot.cn/v1 及各类经销商）：
-    # 绝不发送 Anthropic 形状的 thinking 参数——Moonshot 的
-    # /v1/chat/completions 不认这个键，发了会直接 400。
-    # Kimi 推理模型（k2.5/k2.6/k2.7/k3 等）在该路由上会原生输出
-    # reasoning_content，无需显式开启，只需给足输出上限。
-    if is_k3:
-        return {"max_tokens": 32000}
-    return {"max_tokens": 16384}
+    if kimi_family:
+        _attach_kimi_request_extras(result, model_name, model_cfg)
+    return result
 
 
 def _complete_thinking_blocks(delta):
@@ -2315,6 +2423,9 @@ def _chat_with_model_generator(
             response_stream = None
             max_api_retries = 5
             base_delay = 1.0
+            # 超窗自动压缩只允许一次：压缩后仍超限说明单条消息/附件本身过大，
+            # 继续重试只会反复重发超大载荷空烧额度
+            overflow_compress_attempts = 0
 
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
@@ -2334,11 +2445,23 @@ def _chat_with_model_generator(
                                 _m["reasoning_content"] = " "
                     kwargs["messages"] = _apply_cache_control(cleaned_messages, model_name)
                     # 历史图片折叠属于正常节省行为，不再向用户弹提示打扰
+                    # 超时随载荷放大：超大上下文 + 深度思考的首个 token 可能要几分钟，
+                    # 90s 一刀切会让大载荷反复超时重发（每次重发输入都全额计费）
+                    try:
+                        _est_prompt_tokens = int(estimate_tokens(model_name, cleaned_messages) or 0)
+                    except Exception:
+                        _est_prompt_tokens = 0
+                    attempt_timeout = min(
+                        API_REQUEST_MAX_TIMEOUT_SECONDS,
+                        API_REQUEST_TIMEOUT_SECONDS + max(0, _est_prompt_tokens) // 1500,
+                    )
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
                     from concurrent.futures import ThreadPoolExecutor
                     executor = ThreadPoolExecutor(max_workers=1)
-                    future = executor.submit(completion, **kwargs, timeout=API_REQUEST_TIMEOUT_SECONDS)
+                    future = executor.submit(completion, **kwargs, timeout=attempt_timeout)
+                    wait_started_at = time.monotonic()
+                    last_wait_notice_at = wait_started_at
                     try:
                         while not future.done():
                             raise_if_cancelled()
@@ -2348,6 +2471,23 @@ def _chat_with_model_generator(
                                 # result(timeout=0.1) 在超时或异常时都会抛；
                                 # 交给下面统一处理 future.exception()
                                 pass
+                            # 等待超过阈值后按间隔报一次等待状态，避免大载荷请求
+                            # 长时间无反馈被误判为“卡死”（重试提示只在异常后才有）
+                            waited = time.monotonic() - wait_started_at
+                            if (
+                                waited >= WAIT_NOTICE_THRESHOLD_SECONDS
+                                and time.monotonic() - last_wait_notice_at >= WAIT_NOTICE_INTERVAL_SECONDS
+                            ):
+                                last_wait_notice_at = time.monotonic()
+                                wait_message = (
+                                    f"模型响应中，已等待 {int(waited)} 秒"
+                                    f"（本轮载荷约 {_est_prompt_tokens // 1000}k tokens，超时上限 {attempt_timeout} 秒）；"
+                                    "超大上下文与深度思考可能较慢，可按 Ctrl+C 中断"
+                                )
+                                if event_callback is None:
+                                    print(f"\n[⏳ {wait_message}]")
+                                else:
+                                    _notify_event(event_callback, "status", {"message": wait_message})
                         if future.cancelled():
                             raise KeyboardInterrupt("用户终止了对话。")
                         exc = future.exception()
@@ -2376,6 +2516,15 @@ def _chat_with_model_generator(
                             )
                         )
                     if is_context_overflow:
+                        if overflow_compress_attempts >= 1:
+                            # 已压缩过一次仍然超限：单条消息/附件本身过大，继续重试只会
+                            # 反复重发超大载荷空烧额度。直接失败并给出可操作的指引。
+                            raise RuntimeError(
+                                "历史压缩后仍超出模型上下文窗口，本轮请求已中止，"
+                                "以避免反复重发超大载荷空耗额度。"
+                                "建议 /new 开新会话，或移除超大附件/图片后重试。"
+                            ) from api_err
+                        overflow_compress_attempts += 1
                         try:
                             if event_callback is None:
                                 print("\n[⚠️ 检测到上下文窗口超限，正在尝试压缩历史记录以缩减 Prompt 长度...]")

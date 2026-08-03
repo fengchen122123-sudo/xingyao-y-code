@@ -95,6 +95,9 @@ def export_session_markdown(session_name, manager=None, output_path=None):
         "",
     ]
     for msg in history:
+        # 上下文块（system 角色）是运行时脚手架，不进入导出文件
+        if msg.get("role") == "system":
+            continue
         lines.append(_format_message_markdown(msg))
 
     markdown_content = '\n'.join(lines)
@@ -130,6 +133,9 @@ def export_session_html(session_name, manager=None, output_path=None):
     messages_html = []
     for msg in history:
         role = msg.get('role', 'unknown')
+        # 上下文块（system 角色）是运行时脚手架，不进入导出文件
+        if role == 'system':
+            continue
         content = msg.get('content', '')
 
         if isinstance(content, list):
@@ -227,7 +233,7 @@ def export_session_json(session_name, manager=None, output_path=None):
         'session_name': session_name,
         'exported_at': datetime.datetime.now().isoformat(),
         'message_count': len(history),
-        'messages': history,
+        'messages': [m for m in history if m.get('role') != 'system'],
     }, ensure_ascii=False, indent=2)
 
     if output_path is None:

@@ -66,7 +66,7 @@ def _make_manager():
 
 
 def test_prepare_turn_messages_orders_system_and_dynamic_context(stub_llm, quiet_extras):
-    """system 提示词在最前，动态运行上下文紧贴最后一条 user 消息之前。"""
+    """system 提示词在最前，动态运行上下文与时间注记紧贴最后一条 user 消息之前。"""
     from core.agent_service import prepare_turn_messages
 
     manager = _make_manager()
@@ -91,14 +91,19 @@ def test_prepare_turn_messages_orders_system_and_dynamic_context(stub_llm, quiet
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"] == "第二个问题"
 
-    # 3) 动态上下文是倒数第二条，且确实是运行上下文块
-    dynamic = messages[-2]
+    # 3) 动态上下文与时间注记依次位于用户消息之前
+    dynamic = messages[-3]
+    time_note = messages[-2]
     assert dynamic["role"] == "system"
     assert "【当前运行上下文】" in dynamic["content"]
     assert "当前权限模式：confirm" in dynamic["content"]
+    # 时间已从动态块剥离，单独成块
+    assert "当前时间" not in dynamic["content"]
+    assert time_note["role"] == "system"
+    assert time_note["content"].startswith("【当前时间】")
 
-    # 4) 历史中不残留上一轮的 system 消息（只有新插入的两条）
-    assert sum(1 for m in messages if m["role"] == "system") == 2
+    # 4) 首轮恰好三条 system：稳定前缀 + 动态块 + 时间注记
+    assert sum(1 for m in messages if m["role"] == "system") == 3
 
 
 def test_prepare_turn_messages_updates_token_usage(stub_llm, quiet_extras):
@@ -288,8 +293,8 @@ def test_compression_summary_survives_as_user_message(stub_llm, quiet_extras):
     assert len(summaries) == 1
     assert summaries[0]["role"] == "user"
     assert "调试数据库连接问题" in summaries[0]["content"]
-    # system 消息仍然只有稳定前缀 + 动态上下文两条
-    assert sum(1 for m in messages if m["role"] == "system") == 2
+    # system 消息为稳定前缀 + 动态块 + 时间注记三条
+    assert sum(1 for m in messages if m["role"] == "system") == 3
 
 
 def test_mcp_warmup_starts_background_connect_once(monkeypatch):
@@ -343,3 +348,114 @@ def test_mcp_warmup_skips_when_no_enabled_servers(monkeypatch):
 
     agent_service._warmup_mcp_schemas_once()
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# append-only 上下文块：跨轮 prefix 连续性（缓存命中率改造）
+# ---------------------------------------------------------------------------
+
+
+def test_dynamic_context_not_duplicated_when_unchanged(stub_llm, quiet_extras):
+    """运行上下文不变时第二轮不再重注动态块；时间注记每轮新增、旧的保留。"""
+    from core.agent_service import prepare_turn_messages
+
+    manager = _make_manager()
+    session = "test_append_only"
+
+    manager.add_message(session, "user", "问题一")
+    prepare_turn_messages(manager, session, "openai/gpt-test", 128000, permission_mode="confirm")
+    manager.add_message(session, "assistant", "回答一")
+    manager.add_message(session, "user", "问题二")
+    messages = prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+
+    dynamics = [m for m in messages if "【当前运行上下文】" in str(m.get("content", ""))]
+    time_notes = [
+        m for m in messages if str(m.get("content", "")).startswith("【当前时间】")
+    ]
+    assert len(dynamics) == 1
+    assert len(time_notes) == 2
+
+
+def test_dynamic_context_appended_when_changed(stub_llm, quiet_extras):
+    """运行上下文变化时追加新块，旧块保留（append-only），最新块更靠近当前输入。"""
+    from core.agent_service import prepare_turn_messages
+
+    manager = _make_manager()
+    session = "test_dynamic_changed"
+
+    manager.add_message(session, "user", "问题一")
+    prepare_turn_messages(manager, session, "openai/gpt-test", 128000, permission_mode="confirm")
+    manager.add_message(session, "assistant", "回答一")
+    manager.add_message(session, "user", "问题二")
+    messages = prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="full"
+    )
+
+    dynamics = [m for m in messages if "【当前运行上下文】" in str(m.get("content", ""))]
+    assert len(dynamics) == 2
+    # 旧块在前、新块在后，新块包含最新权限模式
+    assert "当前权限模式：confirm" in dynamics[0]["content"]
+    assert "当前权限模式：full" in dynamics[1]["content"]
+    # 最新动态块位于最后一条 user 消息附近（其后只有时间注记与 user）
+    last_dynamic_idx = max(
+        i for i, m in enumerate(messages) if "【当前运行上下文】" in str(m.get("content", ""))
+    )
+    assert last_dynamic_idx >= len(messages) - 3
+
+
+def test_prefix_continuity_across_turns(stub_llm, quiet_extras):
+    """核心目标：下一轮请求的消息列表必须以前一轮的完整消息列表为前缀。"""
+    from core.agent_service import prepare_turn_messages
+
+    manager = _make_manager()
+    session = "test_prefix_continuity"
+
+    manager.add_message(session, "user", "问题一")
+    turn1 = prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+    manager.add_message(session, "assistant", "回答一")
+    manager.add_message(session, "user", "问题二")
+    turn2 = prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+
+    # turn2 的前 len(turn1) 条与 turn1 完全一致 → provider 侧前缀缓存可全部命中
+    assert turn2[: len(turn1)] == turn1
+    # 后续依次为：上一轮的 assistant 回复、新一轮的时间注记、新一轮的用户输入
+    assert turn2[len(turn1)]["role"] == "assistant"
+    assert turn2[len(turn1)]["content"] == "回答一"
+
+
+def test_reposition_context_blocks_moves_system_before_user():
+    """DB 自然顺序 [user][块] 在内存中还原为 [块][user]，多块保持相对顺序。"""
+    from core.agent_service import _reposition_context_blocks
+
+    history = [
+        {"role": "user", "content": "问题"},
+        {"role": "system", "content": "【当前运行上下文】..."},
+        {"role": "system", "content": "【当前时间】..."},
+        {"role": "assistant", "content": "回答"},
+    ]
+    out = _reposition_context_blocks(history)
+    assert [m["role"] for m in out] == ["system", "system", "user", "assistant"]
+    assert out[0]["content"].startswith("【当前运行上下文】")
+    assert out[1]["content"].startswith("【当前时间】")
+
+
+def test_dynamic_prompt_excludes_time_and_marks_latest_wins():
+    """动态块不含每轮必变的时间字段，且声明多份并存时以最新为准。"""
+    from core.context_builder import RuntimeContext, build_dynamic_prompt, build_time_note
+
+    runtime = RuntimeContext(
+        model_name="m",
+        permission_mode="confirm",
+        working_dir="/tmp",
+        current_time="2026-08-03 10:00:00",
+    )
+    dynamic = build_dynamic_prompt(runtime)
+    assert "当前时间" not in dynamic
+    assert "以最新一份为准" in dynamic
+    assert build_time_note(runtime) == "【当前时间】2026-08-03 10:00:00"
