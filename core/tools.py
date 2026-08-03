@@ -3009,6 +3009,9 @@ def run_subagent(
                 detail = str(
                     execute_command(
                         command,
+                        # 与旧 _run_verification 一致：验证命令（如跑测试套件）
+                        # 耗时常超过 execute_command 默认的 30 秒，保持 120 秒上限
+                        timeout_seconds=120,
                         cancel_event=cancel_event,
                         _execution_result=execution_result,
                     )
