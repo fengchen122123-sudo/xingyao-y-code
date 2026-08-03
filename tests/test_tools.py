@@ -1,6 +1,7 @@
 import pytest
 import json
 import threading
+from unittest.mock import ANY
 from types import SimpleNamespace
 from pathlib import Path
 from core.tools import (
@@ -205,8 +206,9 @@ def test_get_weather_requires_explicit_city():
     assert result.startswith("🚨")
     assert "城市" in result
 
-def test_read_and_write_file(tmp_path):
+def test_read_and_write_file(tmp_path, monkeypatch):
     """测试 Agent 是否能正确读取和写入文件"""
+    monkeypatch.chdir(tmp_path)
     test_file = tmp_path / "hello.py"
     content_to_write = "print('Hello, Y-code!')"
     
@@ -215,8 +217,9 @@ def test_read_and_write_file(tmp_path):
     
     assert read_content == content_to_write
 
-def test_list_directory(tmp_path):
+def test_list_directory(tmp_path, monkeypatch):
     """测试雷达功能：能否看清文件夹里有什么"""
+    monkeypatch.chdir(tmp_path)
     # 1. 准备：在隔离区造一个假项目，里面有两个文件
     (tmp_path / "main.py").touch()
     (tmp_path / "readme.md").touch()
@@ -825,6 +828,182 @@ def test_run_subagent_updates_associated_plan_only_after_completion(monkeypatch)
     bind_default_plan_session(previous_session)
 
 
+def test_run_subagent_denied_command_verification_never_executes_command(monkeypatch):
+    """子代理计划验证被拒绝后不得再触发任何命令执行路径。"""
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{
+        "id": "build",
+        "subject": "构建项目",
+        "stage": "build",
+        "verification_type": "command",
+        "verification": "pytest -q",
+    }])
+    permission_calls = []
+    command_calls = []
+    shell_launches = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return b"verification passed", b""
+
+    def deny_permission(*args, **kwargs):
+        permission_calls.append((args, kwargs))
+        return False
+
+    monkeypatch.setattr("core.llm.check_permission_and_ask", deny_permission)
+    monkeypatch.setattr(
+        tools_module,
+        "execute_command",
+        lambda *args, **kwargs: command_calls.append((args, kwargs)) or "should not run",
+    )
+    monkeypatch.setattr(
+        "core.task_scheduler.subprocess.Popen",
+        lambda *args, **kwargs: shell_launches.append((args, kwargs)) or FakeProcess(),
+    )
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: TaskScheduler(plan),
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "subagent_manager",
+        SubagentManager(runner=lambda record: "实现完成"),
+    )
+
+    tools_module.run_subagent(
+        "完成构建",
+        parent_session="subagent-denied-verification-test",
+        parent_turn_id="turn-denied-verification",
+        subagent_type="implement",
+        plan_item_id="build",
+        timeout_seconds=30,
+    )
+
+    assert permission_calls == [(
+        ("execute_command", {"command": "pytest -q"}),
+        {
+            "event_callback": None,
+            "permission_owner": "subagent:implement",
+            "parent_turn_id": "turn-denied-verification",
+            "permission_source": "计划项验证：构建项目",
+            "cancel_event": ANY,
+        },
+    )]
+    assert command_calls == []
+    assert shell_launches == []
+    item = plan.snapshot()[0]
+    assert item["status"] == "failed"
+    assert "未获用户授权" in item["error"]
+
+
+def test_run_subagent_command_verification_fails_for_nonzero_exit_without_output(monkeypatch):
+    """验证命令的真实非零退出码必须使计划项失败，即使没有任何输出。"""
+    import sys
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{
+        "id": "build",
+        "subject": "构建项目",
+        "stage": "build",
+        "verification_type": "command",
+        "verification": f'"{sys.executable}" -c "import sys; sys.exit(7)"',
+    }])
+    monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: TaskScheduler(plan),
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "subagent_manager",
+        SubagentManager(runner=lambda record: "实现完成"),
+    )
+
+    tools_module.run_subagent(
+        "完成构建",
+        parent_session="subagent-nonzero-verification-test",
+        parent_turn_id="turn-nonzero-verification",
+        subagent_type="implement",
+        plan_item_id="build",
+        timeout_seconds=30,
+    )
+
+    item = plan.snapshot()[0]
+    assert item["status"] == "failed"
+    assert "退出码 7" in item["error"]
+
+
+def test_run_subagent_command_verification_completes_for_zero_exit(monkeypatch):
+    """验证命令的真实零退出码必须完成计划项。"""
+    import sys
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{
+        "id": "build",
+        "subject": "构建项目",
+        "stage": "build",
+        "verification_type": "command",
+        "verification": f'"{sys.executable}" -c "import sys; sys.exit(0)"',
+    }])
+    monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: TaskScheduler(plan),
+    )
+    monkeypatch.setattr(
+        tools_module,
+        "subagent_manager",
+        SubagentManager(runner=lambda record: "实现完成"),
+    )
+
+    tools_module.run_subagent(
+        "完成构建",
+        parent_session="subagent-zero-verification-test",
+        parent_turn_id="turn-zero-verification",
+        subagent_type="implement",
+        plan_item_id="build",
+        timeout_seconds=30,
+    )
+
+    assert plan.snapshot()[0]["status"] == "completed"
+
+
+def test_execute_command_internal_results_are_call_scoped():
+    """内部执行结果仅属于传入的调用对象，不能在后续命令间共享。"""
+    import sys
+    import core.tools as tools_module
+
+    successful = tools_module._CommandExecutionResult()
+    failed = tools_module._CommandExecutionResult()
+
+    tools_module.execute_command(
+        f'"{sys.executable}" -c "import sys; sys.exit(0)"',
+        _execution_result=successful,
+    )
+    tools_module.execute_command(
+        f'"{sys.executable}" -c "import sys; sys.exit(4)"',
+        _execution_result=failed,
+    )
+
+    assert successful.returncode == 0
+    assert failed.returncode == 4
+
+
 def test_run_subagent_rejects_user_input_preparation_item(monkeypatch):
     import core.tools as tools_module
     from core.plan import bind_default_plan_session, get_default_plan_manager
@@ -1166,6 +1345,117 @@ def test_file_tools_allow_outside_workspace_when_sandbox_off(tmp_path, monkeypat
     assert "note.txt" in list_directory(str(outside))
 
 
+def test_ycode_and_agents_files_are_not_trusted_read_paths(tmp_path, monkeypatch):
+    """Only configured Skill packages may bypass the workspace sandbox for reads."""
+    import core.skills as skills_mod
+
+    fake_home = tmp_path / "home"
+    skill_dir = fake_home / ".ycode" / "skills" / "example"
+    skill_dir.mkdir(parents=True)
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(skill_dir)])
+    monkeypatch.setattr(
+        skills_mod.os.path,
+        "expanduser",
+        lambda value: str(fake_home) if value == "~" else value,
+    )
+
+    sensitive_paths = [
+        fake_home / ".ycode" / "config.json",
+        fake_home / ".ycode" / "ycode.db",
+        fake_home / ".ycode" / "mcp.json",
+        fake_home / ".ycode" / "system_prompt.md",
+        fake_home / ".agents" / "settings.json",
+    ]
+
+    for sensitive_path in sensitive_paths:
+        assert not skills_mod.is_trusted_read_path(str(sensitive_path))
+
+
+def test_trusted_read_path_requires_a_skill_package_not_just_its_search_root(tmp_path, monkeypatch):
+    """A scan root and unrelated siblings must not inherit a Skill package's trust."""
+    import core.skills as skills_mod
+
+    search_root = tmp_path / "skills"
+    package = search_root / "approved"
+    package.mkdir(parents=True)
+    (package / "SKILL.md").write_text("# Approved", encoding="utf-8")
+    resource = package / "references" / "guide.md"
+    resource.parent.mkdir()
+    resource.write_text("guide", encoding="utf-8")
+    unrelated = search_root / "settings.json"
+    unrelated.write_text("settings", encoding="utf-8")
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(search_root)])
+
+    assert skills_mod.is_trusted_read_path(str(package / "SKILL.md"))
+    assert skills_mod.is_trusted_read_path(str(resource))
+    assert not skills_mod.is_trusted_read_path(str(search_root))
+    assert not skills_mod.is_trusted_read_path(str(unrelated))
+
+
+def test_skill_path_expansion_supports_home_environment_and_relative_inputs(tmp_path, monkeypatch):
+    """Trusted Skill resources retain the public path-expansion input contract."""
+    import core.skills as skills_mod
+
+    fake_home = tmp_path / "home"
+    search_root = fake_home / "skills"
+    package = search_root / "demo"
+    package.mkdir(parents=True)
+    skill_file = package / "SKILL.md"
+    skill_file.write_text("# Demo", encoding="utf-8")
+    original_expanduser = skills_mod.os.path.expanduser
+
+    def expand_fake_home(value):
+        value = str(value)
+        if value == "~":
+            return str(fake_home)
+        if value.startswith("~/") or value.startswith("~\\"):
+            return str(fake_home) + value[1:]
+        return original_expanduser(value)
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(search_root)])
+    monkeypatch.setattr(skills_mod.os.path, "expanduser", expand_fake_home)
+    monkeypatch.setenv("YCODE_TEST_SKILL_ROOT", str(search_root))
+    monkeypatch.setenv("YCODE_TEST_SKILL_HOME", "~/skills")
+
+    assert skills_mod.is_trusted_read_path("~/skills/demo/SKILL.md")
+    assert skills_mod.is_trusted_read_path("%YCODE_TEST_SKILL_ROOT%/demo/SKILL.md")
+    assert skills_mod.is_trusted_read_path("%YCODE_TEST_SKILL_HOME%/demo/SKILL.md")
+    assert skills_mod.is_trusted_read_path("home/skills/demo/SKILL.md")
+
+
+def test_write_file_rejects_trusted_skill_path_without_outside_approval(tmp_path, monkeypatch):
+    """write_file must not use the read-only Skill exemption."""
+    import pytest as _pytest
+    import core.skills as skills_mod
+    import core.tools as tools_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    skill_dir = tmp_path / "skills" / "example"
+    skill_dir.mkdir(parents=True)
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(skill_dir)])
+    monkeypatch.setattr(tools_mod, "_outside_workspace_allowed", lambda: False)
+
+    with _pytest.raises(ValueError, match="路径越界"):
+        tools_mod.write_file(str(skill_dir / "SKILL.md"), "# Changed")
+
+
+def test_skill_markdown_is_trusted_for_read_only(tmp_path, monkeypatch):
+    """A configured Skill package remains readable outside the workspace."""
+    import core.skills as skills_mod
+
+    skill_dir = tmp_path / "skills" / "example"
+    skill_dir.mkdir(parents=True)
+    skill_file = skill_dir / "SKILL.md"
+    skill_file.write_text("# Example", encoding="utf-8")
+    monkeypatch.setattr(skills_mod, "get_skill_dirs", lambda: [str(skill_dir.parent)])
+
+    assert skills_mod.is_trusted_read_path(str(skill_file))
+    assert skills_mod.is_trusted_path(str(skill_file))
+
+
 def test_outside_workspace_allowed_reads_config(monkeypatch):
     """开关默认 False，配置 allow_outside_workspace=True 时为 True"""
     import core.tools as tools_mod
@@ -1451,11 +1741,9 @@ def test_read_file_truncates_and_pages_long_files(tmp_path, monkeypatch):
 
 def test_run_subagent_rejects_invalid_timeout_before_claiming_plan_item(monkeypatch):
     import core.tools as tools_module
-    from core.plan import bind_default_plan_session, get_default_plan_manager
+    from core.plan import PlanManager
 
-    plan = get_default_plan_manager()
-    previous_session = plan.session_id
-    bind_default_plan_session("subagent-invalid-timeout-test")
+    plan = PlanManager()
     plan.replace([{"id": "item-1", "subject": "任务"}])
     monkeypatch.setattr(
         tools_module,
@@ -1474,16 +1762,15 @@ def test_run_subagent_rejects_invalid_timeout_before_claiming_plan_item(monkeypa
     payload = json.loads(result)
     assert payload["status"] == "failed"
     assert plan.snapshot()[0]["status"] == "pending"
-    bind_default_plan_session(previous_session)
 
 
 def test_run_subagent_rolls_back_plan_item_when_startup_fails(monkeypatch):
     import core.tools as tools_module
-    from core.plan import bind_default_plan_session, get_default_plan_manager
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
 
-    plan = get_default_plan_manager()
-    previous_session = plan.session_id
-    bind_default_plan_session("subagent-rollback-test")
+    plan = PlanManager()
+    scheduler = TaskScheduler(plan)
     plan.replace([{"id": "item-1", "subject": "任务", "files": ["shared.py"]}])
 
     class FailingManager:
@@ -1491,6 +1778,10 @@ def test_run_subagent_rolls_back_plan_item_when_startup_fails(monkeypatch):
             raise RuntimeError("subagent task capacity reached")
 
     monkeypatch.setattr(tools_module, "subagent_manager", FailingManager())
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: scheduler,
+    )
 
     result = tools_module.run_subagent(
         "任务",
@@ -1506,12 +1797,8 @@ def test_run_subagent_rolls_back_plan_item_when_startup_fails(monkeypatch):
     assert item["status"] == "failed"
     assert "capacity" in item["error"]
 
-    from core.task_scheduler import get_default_scheduler
-
-    scheduler = get_default_scheduler()
     assert scheduler.start_item("item-1") is False  # failed 状态不可直接重启
     assert "shared.py" not in scheduler._in_flight_files
-    bind_default_plan_session(previous_session)
 
 
 def test_background_subagent_has_timeout_watchdog():
@@ -1685,11 +1972,11 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
     """回归：验证失败时必须把真实错误（如验证命令 stderr）返回给主 Agent，
     不得只报"不是 in_progress，无法验证完成"的误导信息导致 retry 死循环。"""
     import core.tools as tools_module
-    from core.plan import bind_default_plan_session, get_default_plan_manager
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
 
-    plan = get_default_plan_manager()
-    previous_session = plan.session_id
-    bind_default_plan_session("subagent-verification-error-test")
+    plan = PlanManager()
+    scheduler = TaskScheduler(plan)
     plan.replace([{
         "id": "item-1",
         "subject": "验证失败任务",
@@ -1702,6 +1989,11 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
         tools_module,
         "subagent_manager",
         SubagentManager(runner=lambda record: "子任务做完了"),
+    )
+    monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler",
+        lambda: scheduler,
     )
 
     result = tools_module.run_subagent(
@@ -1718,7 +2010,6 @@ def test_run_subagent_surfaces_real_verification_error(monkeypatch):
     assert "不是 in_progress" not in result
     assert "验证" in result
     assert plan.snapshot()[0]["status"] == "failed"
-    bind_default_plan_session(previous_session)
 
 
 def test_edit_file_fuzzy_match_minor_trailing_whitespace(tmp_path, monkeypatch):
@@ -2465,9 +2756,10 @@ def test_execute_command_nonzero_exit_with_output_still_error(monkeypatch):
     assert "爆炸了" in result
 
 
-def test_list_directory_on_file_returns_soft_hint(tmp_path):
+def test_list_directory_on_file_returns_soft_hint(tmp_path, monkeypatch):
     """把文件路径误传给 list_directory：返回普通提示（非 🚨 错误级），
     引导模型改用 read_file，UI 不再渲染成红色失败。"""
+    monkeypatch.chdir(tmp_path)
     target = tmp_path / "SflF400_mk.v"
     target.write_text("x", encoding="utf-8")
 

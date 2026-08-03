@@ -162,13 +162,71 @@ def test_command_verification_decodes_windows_console_output(monkeypatch):
         "verification_type": "command",
         "verification": "verify",
     }])
-    scheduler = TaskScheduler(plan)
+    scheduler = TaskScheduler(
+        plan,
+        verification_runner=lambda command: scheduler._run_verification(command),
+    )
 
     assert scheduler.start_item("command") is True
     assert scheduler.complete("command", "结果") is False
     error = plan.snapshot()[0]["error"]
     assert "验证命令失败" in error
     assert "�" not in error
+
+
+def test_command_verification_without_authorized_runner_fails_closed(monkeypatch):
+    """缺少授权 runner 时，计划验证不得自行启动 shell。"""
+    launches = []
+
+    class FakeProcess:
+        returncode = 0
+
+        def poll(self):
+            return self.returncode
+
+        def communicate(self, timeout=None):
+            return b"verification passed", b""
+
+    monkeypatch.setattr(
+        "core.task_scheduler.subprocess.Popen",
+        lambda *args, **kwargs: launches.append((args, kwargs)) or FakeProcess(),
+    )
+    plan = PlanManager()
+    plan.replace([{
+        "id": "build",
+        "subject": "构建项目",
+        "verification_type": "command",
+        "verification": "pytest -q",
+    }])
+    scheduler = TaskScheduler(plan)
+
+    assert scheduler.start_item("build") is True
+    assert scheduler.complete("build", "实现完成") is False
+    assert launches == []
+    item = plan.snapshot()[0]
+    assert item["status"] == "failed"
+    assert "授权" in item["error"]
+
+
+def test_command_verification_uses_injected_runner_only():
+    plan = PlanManager()
+    plan.replace([{
+        "id": "build",
+        "subject": "构建项目",
+        "verification_type": "command",
+        "verification": "pytest -q",
+    }])
+    seen = []
+    scheduler = TaskScheduler(plan)
+
+    assert scheduler.start_item("build") is True
+    assert scheduler.complete(
+        "build",
+        "实现完成",
+        verification_runner=lambda command: (seen.append(command) or True, "ok"),
+    ) is True
+    assert seen == ["pytest -q"]
+    assert plan.snapshot()[0]["status"] == "completed"
 
 
 def test_scheduler_cancel_all_cancels_pending_and_in_progress_items():
@@ -228,15 +286,42 @@ def test_verification_with_large_output_does_not_deadlock():
         # 输出远超 64KB 管道缓冲区，旧的 poll 轮询实现会在此死锁
         "verification": f'"{sys.executable}" -c "print(\'x\' * 300000)"',
     }])
-    scheduler = TaskScheduler(plan)
+    scheduler = TaskScheduler(
+        plan,
+        verification_runner=lambda command: scheduler._run_verification(command),
+    )
 
     assert scheduler.start_item("big") is True
     assert scheduler.complete("big", "结果") is True
     assert plan.snapshot()[0]["status"] == "completed"
 
 
-def test_verification_honors_cancel_event_and_stops_process():
+def test_verification_honors_cancel_event_and_stops_process(monkeypatch):
     import sys
+    import subprocess as subprocess_module
+
+    stopped_processes = []
+
+    class FakeProcess:
+        pid = 12345
+        returncode = None
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None
+
+        def communicate(self, timeout=None):
+            raise subprocess_module.TimeoutExpired(cmd="verify", timeout=timeout)
+
+    monkeypatch.setattr(
+        "core.task_scheduler.subprocess.Popen",
+        lambda *args, **kwargs: FakeProcess(),
+    )
+    monkeypatch.setattr(
+        "core.task_scheduler._stop_process_tree",
+        lambda process: stopped_processes.append(process.pid),
+    )
 
     cancel_event = threading.Event()
     cancel_event.set()
@@ -247,7 +332,13 @@ def test_verification_honors_cancel_event_and_stops_process():
         "verification_type": "command",
         "verification": f'"{sys.executable}" -c "import time; time.sleep(60)"',
     }])
-    scheduler = TaskScheduler(plan)
+    scheduler = TaskScheduler(
+        plan,
+        verification_runner=lambda command: scheduler._run_verification(
+            command,
+            cancel_event=cancel_event,
+        ),
+    )
 
     assert scheduler.start_item("slow") is True
     started = threading.Event()
@@ -267,6 +358,7 @@ def test_verification_honors_cancel_event_and_stops_process():
     item = plan.snapshot()[0]
     assert item["status"] == "failed"
     assert "已取消" in item["error"]
+    assert stopped_processes == [12345]
 
 
 def test_verification_cancel_reaps_output_without_blocking(monkeypatch):
@@ -402,15 +494,10 @@ def test_session_switch_does_not_cancel_new_session_items():
     scheduler_module._DEFAULT_SCHEDULER_SESSION = None
 
 
-def test_verification_runs_in_process_cwd_not_item_file_dir(tmp_path, monkeypatch):
+def test_verification_runs_in_process_cwd_not_item_file_dir(monkeypatch):
     """回归：验证命令必须与 execute_command 一样在项目工作目录执行，
     不得根据计划项 files 把 cwd 偷换成文件所在目录（否则模型按项目根
     目录写的 `cd subdir && ...` 会永远报"系统找不到指定的路径"）。"""
-    subdir = tmp_path / "subdir"
-    subdir.mkdir()
-    target = subdir / "tool.py"
-    target.write_text("print('x')", encoding="utf-8")
-
     captured = {}
 
     class FakeProcess:
@@ -431,11 +518,14 @@ def test_verification_runs_in_process_cwd_not_item_file_dir(tmp_path, monkeypatc
     plan.replace([{
         "id": "impl",
         "subject": "实现工具",
-        "files": [str(target)],
+        "files": ["subdir/tool.py"],
         "verification_type": "command",
         "verification": "cd subdir && python tool.py",
     }])
-    scheduler = TaskScheduler(plan)
+    scheduler = TaskScheduler(
+        plan,
+        verification_runner=lambda command: scheduler._run_verification(command),
+    )
 
     assert scheduler.start_item("impl") is True
     assert scheduler.complete("impl", "结果") is True

@@ -22,8 +22,8 @@ def test_renderer_keeps_tool_results_in_requested_order():
     renderer.consume("tool_finished", {"id": "2", "name": "read_file", "ok": True})
 
     output = renderer.finish()
-    assert output.index("a.py") < output.index("b.py")
-    assert output.count("✓") == 2
+    # 简洁模式不逐条显示工具行，但收尾摘要会统计读取的文件数
+    assert "已读取 2 个文件" in output
 
 
 def test_renderer_reports_neutral_status_once_without_raw_error():
@@ -67,9 +67,11 @@ def test_renderer_ignores_raw_tool_output_preview():
     })
 
     output = renderer.finish()
-    assert "星瑶已查看目录" in output
+    # 简洁模式：工具摘要与原始输出都不逐条显示，只在无正文时打印收尾统计
+    assert "星瑶已查看目录" not in output
     assert "main.py" not in output
     assert "core" not in output
+    assert "已执行 1 项工具操作" in output
 
 
 def test_renderer_explains_markdown_only_final_answer_after_tools():
@@ -83,9 +85,8 @@ def test_renderer_explains_markdown_only_final_answer_after_tools():
 
 
 def test_renderer_uses_distinct_ansi_colors_for_tool_feedback():
-    """详细模式下工具的唯一一行反馈按成功/失败区分颜色和标记：
-    成功绿色 ✓，失败红色 ✗；与二者无关的通用 error 事件仍是黄色 !。"""
-    renderer = TurnRenderer(tool_verbose=True)
+    """简洁模式下工具调用静默（不打印 ✓/✗ 行），通用 error 事件仍打印黄色 !。"""
+    renderer = TurnRenderer()
 
     finished_ok = "".join(renderer.consume("tool_finished", {
         "id": "1",
@@ -100,10 +101,12 @@ def test_renderer_uses_distinct_ansi_colors_for_tool_feedback():
     }))
     failed = "".join(renderer.consume("error", {"message": "失败"}))
 
-    assert "\x1b[32m" in finished_ok
-    assert "✓" in finished_ok
-    assert "\x1b[31m" in finished_fail
-    assert "✗" in finished_fail
+    # 工具行静默：成功/失败都不打印 ✓/✗
+    assert finished_ok == ""
+    assert finished_fail == ""
+    assert "✓" not in finished_ok
+    assert "✗" not in finished_fail
+    # error 事件仍是黄色 !，且不泄漏原始错误文案
     assert "\x1b[33m" in failed
     assert "失败" not in Text.from_ansi(failed).plain
 
@@ -241,31 +244,14 @@ def test_renderer_streamed_fenced_code_block_is_recognized():
     assert output.count("```") == 2
 
 
-def test_verbose_mode_prints_exactly_one_line_per_tool_call():
-    """详细模式下不再打印"星瑶正在 X"请求行——每个工具只在完成时打印一行。"""
-    renderer = TurnRenderer(tool_verbose=True)
-
-    requested = renderer.consume("tool_requested", {
-        "id": "1", "name": "read_file", "preview": "a.py",
-    })
-    finished = "".join(renderer.consume("tool_finished", {
-        "id": "1", "name": "read_file", "ok": True, "preview": "a.py",
-    }))
-
-    assert requested == []
-    plain = Text.from_ansi(finished).plain
-    assert "a.py" in plain
-    assert plain.count("a.py") == 1
-
-
 def test_concise_mode_prints_working_header_once_for_parallel_tool_batch():
-    """简短模式下并行的一批工具调用只应打印一次"星瑶正在干活…"。
+    """并行的一批工具调用只应打印一次"星瑶正在干活…"。
 
     回归：旧实现用 `self._completed_tool_count == 0 and not self._emitted`
     判断是否已打印过，但 `_emitted` 在每次 consume() 开头都会被清空，导致
     并行批次里每个 tool_requested 都会重新打印一遍。
     """
-    renderer = TurnRenderer(tool_verbose=False)
+    renderer = TurnRenderer()
 
     first = "".join(renderer.consume("tool_requested", {"id": "1", "name": "read_file"}))
     second = "".join(renderer.consume("tool_requested", {"id": "2", "name": "read_file"}))
@@ -277,8 +263,8 @@ def test_concise_mode_prints_working_header_once_for_parallel_tool_batch():
 
 
 def test_concise_mode_hides_both_success_and_failure():
-    """简短模式下：成功和失败的工具调用都静默，失败数量由收尾统计行汇总。"""
-    renderer = TurnRenderer(tool_verbose=False)
+    """简洁模式下：成功和失败的工具调用都静默，失败数量由收尾统计行汇总。"""
+    renderer = TurnRenderer()
     renderer.consume("tool_requested", {"id": "1", "name": "read_file", "preview": "a.py"})
 
     ok_output = "".join(renderer.consume("tool_finished", {
@@ -297,7 +283,7 @@ def test_concise_mode_hides_both_success_and_failure():
 
 
 def test_concise_mode_end_of_turn_recap_counts_operations_silently():
-    renderer = TurnRenderer(tool_verbose=False)
+    renderer = TurnRenderer()
     renderer.consume("tool_requested", {"id": "1", "name": "read_file"})
     renderer.consume("tool_finished", {"id": "1", "name": "read_file", "ok": True})
     renderer.consume("tool_requested", {"id": "2", "name": "execute_command"})
@@ -314,7 +300,7 @@ def test_concise_mode_end_of_turn_recap_counts_operations_silently():
 
 
 def test_concise_recap_omits_failures_completely():
-    renderer = TurnRenderer(tool_verbose=False)
+    renderer = TurnRenderer()
     renderer.consume("tool_requested", {"id": "1", "name": "read_file"})
     renderer.consume("tool_finished", {"id": "1", "name": "read_file", "ok": True})
 
@@ -322,18 +308,13 @@ def test_concise_recap_omits_failures_completely():
     assert plain.strip() == "● 共执行 1 项操作"
 
 
-def test_concise_recap_is_empty_when_verbose_or_no_tools_ran():
-    verbose_renderer = TurnRenderer(tool_verbose=True)
-    verbose_renderer.consume("tool_requested", {"id": "1", "name": "read_file"})
-    verbose_renderer.consume("tool_finished", {"id": "1", "name": "read_file", "ok": True})
-    assert verbose_renderer.concise_recap() == ""
-
-    idle_renderer = TurnRenderer(tool_verbose=False)
+def test_concise_recap_is_empty_when_no_tools_ran():
+    idle_renderer = TurnRenderer()
     assert idle_renderer.concise_recap() == ""
 
 
-def test_diff_ready_concise_mode_shows_one_line_summary():
-    renderer = TurnRenderer(tool_verbose=False)
+def test_diff_ready_shows_one_line_summary():
+    renderer = TurnRenderer()
     diff_text = (
         "--- a/x.py\n"
         "+++ b/x.py\n"
@@ -355,18 +336,6 @@ def test_diff_ready_concise_mode_shows_one_line_summary():
     assert "-1 行" in plain
     assert "context" not in plain
     assert "old line" not in plain
-
-
-def test_diff_ready_verbose_mode_shows_full_diff():
-    renderer = TurnRenderer(tool_verbose=True)
-    diff_text = "--- a/x.py\n+++ b/x.py\n@@ -1,1 +1,1 @@\n-old\n+new\n"
-
-    output = "".join(renderer.consume("diff_ready", {
-        "file_path": "x.py",
-        "text": diff_text,
-    }))
-
-    assert diff_text.strip() in Text.from_ansi(output).plain
 
 
 def test_code_fence_after_holdback_prefix_does_not_corrupt_output():

@@ -160,7 +160,7 @@ def _outside_workspace_allowed():
         return False
 
 
-def _resolve_workspace_path(file_path):
+def _resolve_workspace_path(file_path, *, allow_trusted_read=False):
     """将路径解析为绝对路径；默认强制限定在当前工作目录内，越界直接拒绝。
 
     当配置 allow_outside_workspace 为 True（/sandbox on）时解除目录限制。
@@ -168,13 +168,13 @@ def _resolve_workspace_path(file_path):
     candidate = Path(str(file_path or "")).expanduser().resolve()
     if _outside_workspace_allowed():
         return candidate
-    # skill 目录是用户自行配置的受信任路径，读取 SKILL.md 不应被沙盒拦截
-    try:
-        from core.skills import is_skill_path
-        if is_skill_path(str(candidate)):
-            return candidate
-    except Exception:
-        pass
+    if allow_trusted_read:
+        try:
+            from core.skills import is_trusted_read_path
+            if is_trusted_read_path(str(candidate)):
+                return candidate
+        except Exception:
+            pass
     # 沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
     # 用户批准后通过 sandbox_bypass() 设置线程级放行，_outside_workspace_allowed() 即返回 True。
     workspace = Path.cwd().resolve()
@@ -225,7 +225,7 @@ def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers
                 edit_file 的 start_line/end_line 参数精准定位。
                 适用于大文件、重复代码段、字符串匹配易失败的场景。
     """
-    resolved = _resolve_workspace_path(file_path)
+    resolved = _resolve_workspace_path(file_path, allow_trusted_read=True)
 
     cache_key = _tool_cache.read_file_key(
         str(resolved), offset, limit, compress, with_line_numbers
@@ -451,7 +451,19 @@ def find_missing_skill_dependencies(command):
                 missing.append(str(requirement))
     return sorted(set(missing))
 
-def execute_command(command, run_in_background=False, timeout_seconds=30, cancel_event=None):
+@dataclass
+class _CommandExecutionResult:
+    returncode: int | None = None
+
+
+def execute_command(
+    command,
+    run_in_background=False,
+    timeout_seconds=30,
+    cancel_event=None,
+    *,
+    _execution_result: _CommandExecutionResult | None = None,
+):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
     try:
         timeout_seconds = int(timeout_seconds)
@@ -535,6 +547,8 @@ def execute_command(command, run_in_background=False, timeout_seconds=30, cancel
                     _close_process_pipes(process)
                     return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
 
+        if _execution_result is not None:
+            _execution_result.returncode = process.returncode
         output = decode_process_output(stdout_raw, output_encoding)
         if stderr_raw:
             stderr = decode_process_output(stderr_raw, output_encoding)
@@ -2957,7 +2971,57 @@ def run_subagent(
             return None
         item_id = task.plan_item_id
         if status == "completed":
-            if scheduler.complete(item_id, result, cancel_event=task.cancel_event):
+            plan_item = next(
+                (item for item in scheduler.plan.snapshot() if item["id"] == item_id),
+                None,
+            )
+            subject = str(plan_item.get("subject") or item_id) if plan_item else item_id
+
+            def authorized_verification_runner(
+                command,
+                *,
+                permission_owner=owner,
+                verification_parent_turn_id=parent_turn_id,
+                permission_source=f"计划项验证：{subject}",
+                cancel_event=task.cancel_event,
+            ):
+                """Run a plan verification command only after the owning turn authorizes it."""
+                from core.llm import PermissionSystemError, check_permission_and_ask
+
+                if cancel_event is not None and cancel_event.is_set():
+                    return False, "验证命令已取消"
+                try:
+                    approved = check_permission_and_ask(
+                        "execute_command",
+                        {"command": command},
+                        event_callback=event_callback,
+                        permission_owner=permission_owner,
+                        parent_turn_id=verification_parent_turn_id,
+                        permission_source=permission_source,
+                        cancel_event=cancel_event,
+                    )
+                except PermissionSystemError:
+                    return False, "验证命令授权系统异常"
+                if not approved:
+                    return False, "验证命令未获用户授权"
+
+                execution_result = _CommandExecutionResult()
+                detail = str(
+                    execute_command(
+                        command,
+                        cancel_event=cancel_event,
+                        _execution_result=execution_result,
+                    )
+                    or ""
+                ).strip()
+                return execution_result.returncode == 0, detail or "验证通过"
+
+            if scheduler.complete(
+                item_id,
+                result,
+                verification_runner=authorized_verification_runner,
+                cancel_event=task.cancel_event,
+            ):
                 if event_callback is not None:
                     event_callback("plan_updated", {
                         "items": scheduler.plan.snapshot(),
