@@ -3,6 +3,22 @@ import threading
 import core.llm as llm
 import core.model_selector as model_selector
 from core.model_manager import add_provider, load_config
+
+
+def test_kimi_for_coding_has_parallel_openai_and_anthropic_presets():
+    from core.model_selector import PRESET_PROVIDERS
+
+    kimi_coding = [
+        preset for preset in PRESET_PROVIDERS
+        if "kimi-for-coding" in preset["name"]
+    ]
+
+    assert {(preset["protocol"], preset["base_url"]) for preset in kimi_coding} == {
+        ("anthropic", "https://api.kimi.com/coding"),
+        ("openai", "https://api.kimi.com/coding/v1"),
+    }
+    openai_preset = next(preset for preset in kimi_coding if preset["protocol"] == "openai")
+    assert openai_preset["models"][0]["name"] == "kimi-for-coding"
 from core.model_selector import _latest_total_tokens
 
 

@@ -177,6 +177,39 @@ def test_kimi_k3_request_uses_anthropic_high_thinking_budget(mocker):
     assert "reasoning_effort" not in captured
 
 
+def test_chat_request_uses_explicit_cache_scope_and_actual_tool_contract(mocker):
+    """实际聊天入口必须把角色、父会话和最终 tools schema 纳入缓存通道。"""
+    from core.llm import _provider_request_options, _tool_contract_fingerprint
+
+    captured = {}
+
+    def fake_completion(**kwargs):
+        captured.update(kwargs)
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+
+    list(chat_with_model_events(
+        "openai/kimi-for-coding",
+        "fake-key",
+        [{"role": "user", "content": "回答"}],
+        "https://api.kimi.com/coding/v1",
+        persist=False,
+        turn_id="turn-cache-lane",
+        cache_scope="subagent:test",
+        cache_session_id="captured-parent-session",
+    ))
+
+    expected = _provider_request_options(
+        "openai/kimi-for-coding",
+        "https://api.kimi.com/coding/v1",
+        cache_scope="subagent:test",
+        cache_session_id="captured-parent-session",
+        tool_contract=_tool_contract_fingerprint(captured["tools"]),
+    )["extra_body"]["prompt_cache_key"]
+    assert captured["extra_body"]["prompt_cache_key"] == expected
+
+
 def test_kimi_k3_generic_anthropic_route_also_bypasses_litellm_param_check(mocker):
     """非 kimi coding 的 anthropic 兼容端点（经销商网关等）同样必须带豁免参数。"""
     captured = {}

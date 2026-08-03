@@ -73,7 +73,7 @@ PROTOCOLS = [
     ("anthropic", "Anthropic Messages (/v1/messages)"),
 ]
 
-# 内置 12 大快捷预设厂商配置
+# 内置快捷预设厂商配置
 PRESET_PROVIDERS = [
     # 注意：context_window 按官方口径 262144（256K）标注，宁可保守——
     # 虚标会让记忆压缩在真实上限之后才触发，直接 400。
@@ -83,6 +83,16 @@ PRESET_PROVIDERS = [
         "name": "月之暗面kimi-for-coding",
         "base_url": "https://api.kimi.com/coding",
         "protocol": "anthropic",
+        "models": [
+            {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": True},
+            {"name": "k3", "context_window": 1000000, "supports_vision": True},
+            {"name": "k3-256k", "context_window": 256000, "supports_vision": True},
+        ],
+    },
+    {
+        "name": "月之暗面kimi-for-coding（OpenAI格式）",
+        "base_url": "https://api.kimi.com/coding/v1",
+        "protocol": "openai",
         "models": [
             {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": True},
             {"name": "k3", "context_window": 1000000, "supports_vision": True},

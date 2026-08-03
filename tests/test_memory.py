@@ -48,17 +48,27 @@ def test_add_and_get_messages():
     assert history[1]["content"] == "你好，我是 Y-code！"
 
 
-def test_structured_assistant_history_returns_public_content_to_llm(tmp_path):
+def test_structured_assistant_history_preserves_provider_envelope_for_llm(tmp_path):
     manager = MemoryManager(str(tmp_path / "memory.db"))
     manager.add_message("session", "assistant", {
         "role": "assistant",
         "content": "最终回答",
         "reasoning_content": "分析过程",
+        "thinking_blocks": [
+            {"type": "thinking", "thinking": "分析过程", "signature": "sig"},
+        ],
     })
 
     history = manager.get_history_for_llm("session")
 
-    assert history == [{"role": "assistant", "content": "最终回答"}]
+    assert history == [{
+        "role": "assistant",
+        "content": "最终回答",
+        "reasoning_content": "分析过程",
+        "thinking_blocks": [
+            {"type": "thinking", "thinking": "分析过程", "signature": "sig"},
+        ],
+    }]
 
 
 def test_add_messages_persists_one_ordered_batch(tmp_path):
