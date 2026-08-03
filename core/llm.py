@@ -35,6 +35,46 @@ _litellm_module = None
 _litellm_lock = threading.Lock()
 
 
+def _patch_litellm_stream_usage_details(_litellm):
+    """修复 litellm 1.83.7 流式 usage 丢失 prompt_tokens_details 的问题。
+
+    部分 OpenAI 兼容通道（如 DeepSeek 中转）流式最终 chunk 的 usage 以 dict 形式
+    穿过 CustomStreamWrapper，litellm 在组装响应时只取 prompt/completion/total
+    三个字段重建 Usage，prompt_tokens_details.cached_tokens 被丢弃，
+    导致 ycode 的缓存命中记账恒为 0（状态栏“命中 0 (0%)”）。
+    这里把 dict usage 提前转成 litellm.Usage（其构造器保留全部明细字段），
+    下游 isinstance(usage, Usage) 分支即原样透传。
+    升级 litellm 后若官方已修复，此补丁无害（转换是幂等的）。
+    """
+    try:
+        from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
+    except Exception:
+        return
+    if getattr(CustomStreamWrapper, _STREAM_USAGE_PATCH_FLAG, False):
+        return
+    _original = CustomStreamWrapper.handle_openai_chat_completion_chunk
+
+    def _patched(self, chunk):
+        response_obj = _original(self, chunk)
+        if response_obj is None:
+            return response_obj
+        usage = response_obj.get("usage")
+        if isinstance(usage, dict) and (
+            "prompt_tokens_details" in usage or "prompt_cache_hit_tokens" in usage
+        ):
+            try:
+                response_obj["usage"] = _litellm.Usage(**usage)
+            except Exception:
+                pass
+        return response_obj
+
+    CustomStreamWrapper.handle_openai_chat_completion_chunk = _patched
+    setattr(CustomStreamWrapper, _STREAM_USAGE_PATCH_FLAG, True)
+
+
+_STREAM_USAGE_PATCH_FLAG = "_ycode_stream_usage_patched"
+
+
 def _get_litellm():
     """懒加载 litellm 模块，首次调用时 import 并执行一次性配置，后续调用直接返回缓存。
 
@@ -49,6 +89,7 @@ def _get_litellm():
         import litellm as _litellm
         # 屏蔽启动调试噪音
         _litellm.suppress_debug_info = True
+        _patch_litellm_stream_usage_details(_litellm)
         _litellm_module = _litellm
         return _litellm
 
@@ -604,6 +645,9 @@ def __getattr__(name):
 # 而 UI 状态栏、压缩判断等会在内容未变时反复调用。用 (模型, 消息数, 总字符数)
 # 作为签名，未变化时直接复用上次结果。
 _token_estimate_cache = {"sig": None, "value": 0}
+# 前缀增量缓存：append-only 历史每轮只新增尾部消息，
+# 记录前缀（消息数/字符总长/token 数），下一轮免全量 tokenize
+_token_prefix_cache = {"model": None, "msg_count": 0, "char_len": 0, "value": 0}
 
 
 def _fold_old_media_for_estimate(messages):
@@ -643,7 +687,13 @@ def _fold_old_media_for_estimate(messages):
 
 
 def estimate_tokens(model_name, messages):
-    """本地离线快速估算 Token 数，防止超载崩溃（带签名缓存）"""
+    """本地离线快速估算 Token 数，防止超载崩溃（带签名缓存 + 前缀增量缓存）
+
+    大会话（10 万+ token）全量 tokenize 一次要数秒，而历史是 append-only 的，
+    每轮只有尾部几条消息是新的。前缀增量缓存记录“前 K 条消息”的计数结果，
+    下一轮只对新增尾部计数，把每轮估算开销从秒级降到毫秒级。
+    前缀一致性用字符总长校验（估算场景容忍极小概率的等长突变误判）。
+    """
     if not messages:
         return 0
     try:
@@ -653,15 +703,38 @@ def estimate_tokens(model_name, messages):
         sig = None
     if sig is not None and _token_estimate_cache.get("sig") == sig:
         return _token_estimate_cache["value"]
-    try:
-        # 历史图片先折叠再计数：base64 字符量与图片真实 token 消耗无关
-        value = _litellm_token_counter(model_name, _fold_old_media_for_estimate(messages))
-    except Exception:
-        # 如果模型不支持或报错，采用约 2 字符 / Token 的经验值进行兜底估算
-        value = len(str(_fold_old_media_for_estimate(messages))) // 2
+
+    def _count(msgs):
+        try:
+            # 历史图片先折叠再计数：base64 字符量与图片真实 token 消耗无关
+            return _litellm_token_counter(model_name, _fold_old_media_for_estimate(msgs))
+        except Exception:
+            # 如果模型不支持或报错，采用约 2 字符 / Token 的经验值进行兜底估算
+            return len(str(_fold_old_media_for_estimate(msgs))) // 2
+
+    value = None
+    pc = _token_prefix_cache
+    if (
+        pc.get("model") == str(model_name)
+        and 0 < pc.get("msg_count", 0) < len(messages)
+    ):
+        prefix = messages[: pc["msg_count"]]
+        try:
+            prefix_len = sum(len(str(m.get("content") or "")) for m in prefix)
+        except Exception:
+            prefix_len = -1
+        if prefix_len == pc.get("char_len"):
+            # 前缀未变：只对新追加的尾部消息计数，加上已缓存的前缀计数
+            value = pc["value"] + _count(messages[pc["msg_count"]:])
+    if value is None:
+        value = _count(messages)
     if sig is not None:
         _token_estimate_cache["sig"] = sig
         _token_estimate_cache["value"] = value
+        _token_prefix_cache["model"] = str(model_name)
+        _token_prefix_cache["msg_count"] = len(messages)
+        _token_prefix_cache["char_len"] = total_len
+        _token_prefix_cache["value"] = value
     return value
 
 def _yield_content(text):
@@ -2698,6 +2771,18 @@ def _chat_with_model_generator(
                     "3) 在 config.json 中为当前模型增大 max_tokens。]"
                 )
                 _notify_event(event_callback, "notice", {"message": truncated_notice.strip()})
+
+            # litellm 流式包装器在 finish 之后收到的最终 usage chunk 会被吞进
+            # wrapper.chunks 而不再 yield（StopIteration 分支）。迭代中拿到的
+            # 最后一个 usage 可能是不含缓存明细的中间态（prompt_tokens_details=None），
+            # 导致 DeepSeek 等通道命中记账恒为 0。流结束后从 chunks 尾部补取最终 usage。
+            _tail_chunks = getattr(response_stream, "chunks", None)
+            if _tail_chunks:
+                for _tail_chunk in reversed(_tail_chunks):
+                    _tail_usage = getattr(_tail_chunk, "usage", None)
+                    if _tail_usage is not None:
+                        stream_usage = _tail_usage
+                        break
 
             # 流结束：按最终 usage chunk 统一记账一次（读写均走锁）
             if stream_usage is not None:
