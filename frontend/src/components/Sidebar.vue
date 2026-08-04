@@ -57,12 +57,18 @@
               title="在项目新建会话" 
               @click.stop="store.createSessionInGroup(group.folder_path)"
             >＋</button>
-            <button 
-              v-if="!group.is_global && group.folder_path !== 'GLOBAL'" 
-              class="g-del" 
-              title="移出项目分组 (不删磁盘文件)" 
-              @click.stop="store.deleteFolderGroup(group.folder_path, getFolderTitle(group))"
+            <button
+              v-if="!group.is_global && group.folder_path !== 'GLOBAL' && confirmDeleteGroupPath !== group.folder_path"
+              class="g-del"
+              title="删除此项目分组及组内对话"
+              @click.stop="askDeleteGroup(group.folder_path)"
             >✕</button>
+            <button
+              v-if="!group.is_global && group.folder_path !== 'GLOBAL' && confirmDeleteGroupPath === group.folder_path"
+              class="g-confirm"
+              title="点击确认删除分组及组内对话"
+              @click.stop="confirmDeleteGroup(group.folder_path, getFolderTitle(group))"
+            >确认</button>
           </div>
 
           <div v-show="!collapsedGroups[group.folder_path]" class="group-sessions">
@@ -70,12 +76,23 @@
               v-for="s in visibleSessions(group)" 
               :key="s.name" 
               class="session-item"
-              :class="{ active: s.name === store.currentSessionName }"
-              @click="store.switchSession(s.name, s.display_name || s.name, s.workdir)"
+              :class="{ active: s.name === store.currentSessionName, confirming: confirmDeleteName === s.name }"
+              @click="onSessionClick(s)"
             >
-              <div class="t" style="padding-right:18px">{{ s.display_name || s.name }}</div>
+              <div class="t">{{ s.display_name || s.name }}</div>
               <div class="m">{{ relativeTime(s.updated_at) }}</div>
-              <button class="s-del" title="删除此对话" @click.stop="store.deleteSingleSession(s.name)">✕</button>
+              <button
+                v-if="confirmDeleteName !== s.name"
+                class="s-del"
+                title="删除此对话"
+                @click.stop="askDelete(s.name)"
+              >✕</button>
+              <button
+                v-else
+                class="s-confirm"
+                title="点击确认删除"
+                @click.stop="confirmDelete(s.name)"
+              >确认</button>
             </div>
             <div
               v-if="group.sessions && group.sessions.length > 5"
@@ -103,6 +120,38 @@ const store = useAppStore();
 
 const collapsedGroups = ref<Record<string, boolean>>({});
 const expandedGroups = ref<Record<string, boolean>>({});
+// 正在等待二次确认删除的会话名（在时间位置显示红色小确认按钮）
+const confirmDeleteName = ref('');
+// 正在等待二次确认删除的项目分组路径
+const confirmDeleteGroupPath = ref('');
+
+function askDeleteGroup(path: string) {
+  confirmDeleteGroupPath.value = path;
+}
+
+function confirmDeleteGroup(path: string, title: string) {
+  confirmDeleteGroupPath.value = '';
+  store.deleteFolderGroup(path, title);
+}
+
+function askDelete(name: string) {
+  confirmDeleteName.value = name;
+}
+
+function confirmDelete(name: string) {
+  confirmDeleteName.value = '';
+  store.deleteSingleSession(name);
+}
+
+function onSessionClick(s: { name: string; display_name?: string; workdir?: string }) {
+  // 处于确认删除状态时，点击条目其它区域视为取消，不切换会话
+  if (confirmDeleteName.value === s.name) {
+    confirmDeleteName.value = '';
+    return;
+  }
+  confirmDeleteName.value = '';
+  store.switchSession(s.name, s.display_name || s.name, s.workdir);
+}
 
 // 一个目录下超过 5 条会话时默认折叠，点“显示更多”再展开全部
 function visibleSessions(group: SessionGroup) {
@@ -136,6 +185,12 @@ const connectedMcpCount = computed(() => store.mcps.filter(m => m.connected).len
 const enabledPluginCount = computed(() => store.plugins.filter(p => p.enabled).length);
 
 function toggleGroupCollapsed(path: string) {
+  // 处于确认删除状态时，点击分组头其它区域视为取消，不折叠
+  if (confirmDeleteGroupPath.value === path) {
+    confirmDeleteGroupPath.value = '';
+    return;
+  }
+  confirmDeleteGroupPath.value = '';
   collapsedGroups.value[path] = !collapsedGroups.value[path];
 }
 
@@ -302,6 +357,21 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--red);
   background: rgba(248, 81, 73, 0.15);
 }
+/* 分组删除的二次确认：红色小确认按钮 */
+.group-header .g-confirm {
+  background: var(--red);
+  border: none;
+  color: #fff;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: 0.15s;
+  animation: s-confirm-pop 0.15s;
+}
+.group-header .g-confirm:hover {
+  filter: brightness(1.15);
+}
 
 .group-sessions {
   padding-left: 6px;
@@ -311,12 +381,13 @@ function getFolderTitle(g: SessionGroup) {
 }
 .session-item {
   position: relative;
-  padding: 7px 9px;
+  padding: 5px 9px;
   border-radius: 7px;
   cursor: pointer;
   display: flex;
-  flex-direction: column;
-  gap: 2px;
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
   margin-bottom: 2px;
   border: 1px solid transparent;
 }
@@ -328,14 +399,21 @@ function getFolderTitle(g: SessionGroup) {
   border-color: var(--border);
 }
 .session-item .t {
+  flex: 1;
+  min-width: 0;
   font-size: 13px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 .session-item .m {
+  flex-shrink: 0;
   font-size: 11.5px;
   color: var(--text-faint);
+}
+/* 悬停时删除按钮出现在最右侧，隐藏时间避免重叠 */
+.session-item:hover .m {
+  visibility: hidden;
 }
 .session-item .s-del {
   position: absolute;
@@ -357,6 +435,32 @@ function getFolderTitle(g: SessionGroup) {
 .session-item .s-del:hover {
   color: var(--red);
   background: rgba(248, 81, 73, 0.15);
+}
+/* 二次确认状态：时间位置显示红色小确认按钮 */
+.session-item.confirming .m {
+  visibility: hidden;
+}
+.session-item .s-confirm {
+  position: absolute;
+  right: 6px;
+  top: 50%;
+  transform: translateY(-50%);
+  background: var(--red);
+  border: none;
+  color: #fff;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 5px;
+  cursor: pointer;
+  transition: 0.15s;
+  animation: s-confirm-pop 0.15s;
+}
+.session-item .s-confirm:hover {
+  filter: brightness(1.15);
+}
+@keyframes s-confirm-pop {
+  from { transform: translateY(-50%) scale(0.85); opacity: 0; }
+  to { transform: translateY(-50%) scale(1); opacity: 1; }
 }
 
 .side-footer {

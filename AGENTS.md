@@ -2,6 +2,11 @@
 
 This file outlines the standard commands, code styles, and guidelines for developing and maintaining the Y-CODE CLI project.
 
+## 🌿 Git Workflow
+
+- 日常代码拉取与提交只在 `dev` 分支进行。
+- 合并到其他分支（如 `master`）必须由用户明确要求后才执行，不要主动合并。
+
 ## 🛠️ Build & Run Commands
 
 ### Run Application
