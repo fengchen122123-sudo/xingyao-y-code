@@ -50,7 +50,7 @@ def print_finish_banner_full(install_dir, installed_tui):
     print("🚀 启动方法：")
     print("1. 双击桌面上的 [Y-code] 快捷方式，打开图形界面版。")
     if installed_tui:
-        print("2. 双击桌面上的 [Y-code CLI] 快捷方式，或打开一个新的命令行窗口输入 ycode，使用命令行版。")
+        print("2. 打开一个新的命令行窗口 (CMD/PowerShell)，输入 ycode 敲回车，使用命令行版。")
     else:
         print("2. 本次未安装命令行版；如需要，可随时双击安装目录下的 tui\\ycode_tui_setup.exe 补装。")
     print("============================================================")
@@ -63,8 +63,7 @@ def print_finish_banner_tui(install_dir):
     print(f"安装路径: {install_dir}")
     print("------------------------------------------------------------")
     print("🚀 启动方法：")
-    print("1. 双击桌面上的 [Y-code CLI] 快捷方式即可开启对话。")
-    print("2. 打开任意全新的命令行窗口 (CMD/PowerShell)，输入 ycode 敲回车。")
+    print("1. 打开任意全新的命令行窗口 (CMD/PowerShell)，输入 ycode 敲回车。")
     print("============================================================")
     input("\n按任意键退出安装向导...")
 
@@ -301,12 +300,15 @@ def install_full(bundle_dir, startupinfo):
         except Exception as e:
             print(f"⚠️ 配置环境变量失败: {e}")
             print("请稍后手动将安装目录添加到您的系统环境变量中。")
+        # 不再创建 CLI 桌面快捷方式（用户直接在终端输入 ycode 即可）；
+        # 顺手清理旧版安装留下的 "Y-code CLI" 快捷方式。
         try:
-            shortcut_path = os.path.join(get_desktop_dir(), "Y-code CLI.lnk")
-            create_shortcut(shortcut_path, tui_exe_path, install_dir, startupinfo)
-            print(f"✔ 桌面快捷方式创建成功: {shortcut_path}")
+            legacy_lnk = os.path.join(get_desktop_dir(), "Y-code CLI.lnk")
+            if os.path.exists(legacy_lnk):
+                os.remove(legacy_lnk)
+                print("ℹ 已移除旧版遗留的 [Y-code CLI] 桌面快捷方式。")
         except Exception as e:
-            print(f"⚠️ 创建命令行版桌面快捷方式失败: {e}")
+            print(f"⚠️ 清理旧版 CLI 快捷方式失败: {e}")
     else:
         try:
             if os.path.exists(tui_exe_path):
@@ -412,13 +414,14 @@ def install_tui(bundle_dir, startupinfo):
         print(f"⚠️ 配置环境变量失败: {e}")
         print("请稍后手动将安装目录添加到您的系统环境变量中。")
 
-    # 桌面快捷方式
+    # 不再创建 CLI 桌面快捷方式（用户直接在终端输入 ycode 即可）；清理旧版遗留
     try:
-        shortcut_path = os.path.join(get_desktop_dir(), "Y-code CLI.lnk")
-        create_shortcut(shortcut_path, tui_exe_path, install_dir, startupinfo)
-        print(f"✔ 桌面快捷方式创建成功: {shortcut_path}")
+        legacy_lnk = os.path.join(get_desktop_dir(), "Y-code CLI.lnk")
+        if os.path.exists(legacy_lnk):
+            os.remove(legacy_lnk)
+            print("ℹ 已移除旧版遗留的 [Y-code CLI] 桌面快捷方式。")
     except Exception as e:
-        print(f"⚠️ 创建桌面快捷方式失败: {e}")
+        print(f"⚠️ 清理旧版 CLI 快捷方式失败: {e}")
 
     # 用户配置播种
     try:
