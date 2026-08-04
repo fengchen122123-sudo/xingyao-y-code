@@ -1,7 +1,6 @@
 <template>
   <div class="kimi-empty-container">
     <div class="kimi-hero">
-      <div class="kimi-icon">✦</div>
       <div class="kimi-title-row">
         <span class="kimi-title">让 星瑶 来帮你完成任务</span>
         <span class="kimi-beta">Beta</span>

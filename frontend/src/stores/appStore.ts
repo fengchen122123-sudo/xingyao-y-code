@@ -422,13 +422,8 @@ export const useAppStore = defineStore('app', {
     },
 
     async deleteFolderGroup(workdir: string, folderTitle: string) {
-      const ok = await this.askConfirm(
-        '移出项目分组',
-        '此操作仅清理软件中的历史会话，绝对不会删除磁盘文件',
-        `确定要在程序中移出项目分组「${folderTitle}」的所有会话记录吗？`
-      );
-      if (!ok) return;
-
+      // 确认动作已内联在分组头的红色小按钮上，不再弹大确认窗；
+      // 后端 delete_folder_group 会连同组内对话记录一起删除（不动磁盘文件）
       const api = this._api();
       if (!api) return;
       try {
@@ -446,13 +441,7 @@ export const useAppStore = defineStore('app', {
     },
 
     async deleteSingleSession(sessionName: string) {
-      const ok = await this.askConfirm(
-        '删除此对话记录',
-        '删除后该对话的历史记录将无法恢复',
-        '确定要删除该会话记录吗？'
-      );
-      if (!ok) return;
-
+      // 确认动作已内联在侧栏的红色小按钮上，不再弹大确认窗
       const api = this._api();
       if (!api) return;
       try {
