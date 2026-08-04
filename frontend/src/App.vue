@@ -88,7 +88,7 @@
       <div v-if="!store.initialized" id="splash">
         <img class="sp-logo" src="/icon.png" alt="Y-CODE">
         <div class="sp-title">Y-CODE</div>
-        <div class="sp-sub">星瑶 GUI 编码助手</div>
+        <div class="sp-sub">星瑶·编码助手</div>
         <div class="sp-bar"><i></i></div>
       </div>
     </Transition>
