@@ -36,7 +36,7 @@ def test_context_builder_adds_decisive_action_and_lazy_skill_policy():
 
     assert "明确且简单的任务只做一次判断，然后立即执行" in prompt
     assert "没有新证据时，不得反复重新讨论已经排除的方案" in prompt
-    assert "只读取与当前任务直接匹配的一个或少量 SKILL.md" in prompt
+    assert "接到任务先对照【可用技能目录】检查匹配的技能" in prompt
 
 
 def test_context_builder_always_selects_dedicated_network_tools():

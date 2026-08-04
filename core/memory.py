@@ -32,6 +32,56 @@ def _try_parse_json(text):
     except (ValueError, TypeError):
         return None, False
 
+
+def _sanitize_tool_call_pairing(history):
+    """修复 tool_call 配对，避免坏历史导致 API 报错后整个会话无法继续使用。
+
+    两种损坏形态（典型成因：记忆压缩边界切在 assistant(tool_calls) 与其 tool 结果之间）：
+    1. 孤儿 tool 消息：tool_call_id 未在前面任何 assistant.tool_calls 中声明，
+       API 会报 "tool_call_id is not found" → 直接丢弃该 tool 消息。
+    2. assistant 声明了 tool_calls 但历史中缺少对应 tool 结果，
+       API 会报 "assistant message with tool_calls must be followed by tool messages"
+       → 移除该 assistant 的 tool_calls 字段（保留文本内容）。
+    """
+    announced = set()
+    for msg in history:
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            if isinstance(tc, dict) and tc.get("id"):
+                announced.add(tc["id"])
+
+    sanitized = []
+    answered = set()
+    for msg in history:
+        if msg.get("role") == "tool":
+            tcid = msg.get("tool_call_id")
+            if tcid not in announced or tcid in answered:
+                continue
+            answered.add(tcid)
+        sanitized.append(msg)
+
+    for msg in sanitized:
+        if msg.get("role") != "assistant":
+            continue
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            continue
+        unresolved = [
+            tc for tc in tool_calls
+            if isinstance(tc, dict) and tc.get("id") and tc["id"] not in answered
+        ]
+        if unresolved:
+            resolved = [tc for tc in tool_calls if tc not in unresolved]
+            if resolved:
+                msg["tool_calls"] = resolved
+            else:
+                msg.pop("tool_calls", None)
+                if not msg.get("content"):
+                    msg["content"] = "[工具调用记录缺失]"
+
+    return sanitized
+
 # 按会话隔离的撤销状态。
 # _undo_state_lock 保护并发写：多 worker 线程（含并行工具批次）同时写文件时
 # 防止 LAST_UNDO_STATE 被竞态覆盖导致 /undo 回滚到错误文件/错误内容。
@@ -520,6 +570,10 @@ class MemoryManager:
                     history.append(normalized)
                 else:
                     history.append({"role": role, "content": parsed})
+
+            # 修复 tool_call 配对（如压缩边界切断了工具调用组），
+            # 防止坏历史让 API 报 "tool_call_id is not found" 后会话彻底不可用
+            history = _sanitize_tool_call_pairing(history)
 
             # 如果存在背景记忆摘要，将其包装为参考上下文并插在首部。
             # 注意 role 必须是 user 而非 system：持久化的上下文块（动态运行上下文/
