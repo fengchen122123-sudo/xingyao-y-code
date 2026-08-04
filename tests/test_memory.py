@@ -211,3 +211,61 @@ def test_update_session_workdir_migrates_group(tmp_path):
     # 不存在的会话返回 False，且不会误建新记录
     assert manager.update_session_workdir("ghost", str(project)) is False
     assert not any(s["name"] == "ghost" for s in manager.get_all_sessions(include_empty=True))
+
+
+def test_get_history_for_llm_drops_orphan_tool_messages(tmp_path):
+    """压缩边界切在 assistant(tool_calls) 与其 tool 结果之间时，
+    保留区开头的孤儿 tool 消息必须被丢弃，否则 API 报 'tool_call_id is not found'
+    且整个会话无法继续使用（回归：会话 '条码打印_1' 坏历史）"""
+    manager = MemoryManager(str(tmp_path / "orphan.db"))
+    manager.add_messages("session", [
+        ("assistant", {"content": None, "tool_calls": [{"id": "tool_A", "function": {"name": "f"}}]}),
+        ("tool", {"tool_call_id": "tool_A", "name": "f", "content": "result"}),
+        ("assistant", {"content": "后续回答"}),
+        ("user", {"content": "下一个问题"}),
+    ])
+    # 模拟压缩边界切在 assistant(tool_calls) 上：其 tool 结果成为孤儿
+    with manager.acquire_lock():
+        cursor = manager.conn.cursor()
+        cursor.execute("SELECT id FROM messages ORDER BY id ASC LIMIT 1")
+        boundary = cursor.fetchone()[0]
+        cursor.execute(
+            "UPDATE sessions SET memory_summary = ?, summarized_until_msg_id = ? WHERE session_name = ?",
+            ("历史摘要", boundary, "session"),
+        )
+        manager.conn.commit()
+
+    history = manager.get_history_for_llm("session")
+
+    # history[0] 是摘要注入；活跃区不得含孤儿 tool 消息
+    assert [m["role"] for m in history] == ["user", "assistant", "user"]
+
+
+def test_get_history_for_llm_strips_unanswered_tool_calls(tmp_path):
+    """assistant 声明了 tool_calls 但缺少对应 tool 结果时，移除 tool_calls，
+    避免 'tool_calls must be followed by tool messages' 报错锁死会话"""
+    manager = MemoryManager(str(tmp_path / "unanswered.db"))
+    manager.add_messages("session", [
+        ("assistant", {"content": None, "tool_calls": [{"id": "tool_B", "function": {"name": "f"}}]}),
+        ("user", {"content": "中断了"}),
+    ])
+
+    history = manager.get_history_for_llm("session")
+
+    assert "tool_calls" not in history[0]
+    assert history[0]["content"]  # 空内容补占位文本，保证消息仍有效
+
+
+def test_get_history_for_llm_keeps_valid_tool_pairing(tmp_path):
+    """正常 assistant(tool_calls) + tool 结果配对不受 sanitizer 影响"""
+    manager = MemoryManager(str(tmp_path / "paired.db"))
+    manager.add_messages("session", [
+        ("assistant", {"content": None, "tool_calls": [{"id": "tool_C", "function": {"name": "f"}}]}),
+        ("tool", {"tool_call_id": "tool_C", "name": "f", "content": "ok"}),
+        ("assistant", {"content": "完成"}),
+    ])
+
+    history = manager.get_history_for_llm("session")
+
+    assert [m["role"] for m in history] == ["assistant", "tool", "assistant"]
+    assert history[0]["tool_calls"][0]["id"] == "tool_C"

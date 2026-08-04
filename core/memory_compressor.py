@@ -205,6 +205,16 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 return False
 
             messages_to_summarize = all_active_messages[:-retain_count]
+            # 截断点绝不能落在工具调用组中间：若保留区的第一条消息是 tool 结果，
+            # 说明其对应的 assistant(tool_calls) 被归入了待压缩区，压缩后该 tool
+            # 消息会变成孤儿，导致后续所有请求报 "tool_call_id is not found"，
+            # 整个会话无法继续使用。此时把保留区开头的连续 tool 消息一并归入待压缩区。
+            retained = all_active_messages[-retain_count:]
+            extra = 0
+            while extra < len(retained) - 1 and retained[extra]["role"] == "tool":
+                extra += 1
+            if extra:
+                messages_to_summarize = all_active_messages[:len(all_active_messages) - retain_count + extra]
             # 获取被压缩的最大消息 id，以此作为下次截断的起点
             max_summarized_id = messages_to_summarize[-1]["id"]
 
