@@ -27,6 +27,7 @@ exe = EXE(
     a.datas,
     [],
     name='ycode_uninstall',
+    icon='assets/ycode.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

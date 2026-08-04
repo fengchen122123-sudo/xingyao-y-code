@@ -122,7 +122,8 @@
         </div>
         <div class="fp-body">
           <div v-if="store.filePreview.loading" class="fp-loading">加载中…</div>
-          <pre v-else class="fp-pre">{{ store.filePreview.content }}</pre>
+          <div v-else-if="isMarkdownPreview" class="fp-md md-body" v-html="renderedMarkdown"></div>
+          <pre v-else class="fp-pre"><code class="hljs" v-html="highlightedPreview"></code></pre>
           <div v-if="store.filePreview.truncated" class="fp-truncated">⚠ 文件内容过长，已截断显示</div>
         </div>
       </div>
@@ -134,6 +135,8 @@
 import { ref, computed, watch, nextTick, onMounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import FileTreeNode from './FileTreeNode.vue';
+import hljs from 'highlight.js/lib/common';
+import { renderMarkdown } from '../utils/markdown';
 
 type TabType = 'plan' | 'tasks' | 'term' | 'files';
 
@@ -193,6 +196,48 @@ function fileBaseName(path: string) {
   const idx = Math.max(path.lastIndexOf('\\'), path.lastIndexOf('/'));
   return idx >= 0 ? path.slice(idx + 1) : path;
 }
+
+// ---------------- 文件预览语法高亮 ----------------
+// highlight.js 语言名与扩展名不一致的补充映射（py/sh 等常见别名 hljs 已内置）
+const HLJS_EXT_ALIAS: Record<string, string> = {
+  vue: 'xml', cs: 'csharp', yml: 'yaml',
+  md: 'markdown', conf: 'ini', toml: 'ini', env: 'ini',
+  jsx: 'javascript', tsx: 'typescript', mk: 'makefile',
+};
+
+function escapeHtml(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+const previewExt = computed(() => {
+  const name = fileBaseName(store.filePreview.path || '');
+  const dot = name.lastIndexOf('.');
+  return dot >= 0 ? name.slice(dot + 1).toLowerCase() : '';
+});
+
+// Markdown 文件以“阅读样式”渲染（标题/列表/加粗等），而不是显示源码
+const isMarkdownPreview = computed(() => ['md', 'markdown'].includes(previewExt.value));
+// md 预览前统一换行符：Windows 文件多为 CRLF，\r 会导致代码块/标题等行级语法失配
+const renderedMarkdown = computed(() =>
+  renderMarkdown((store.filePreview.content || '').replace(/\r\n/g, '\n'))
+);
+
+const highlightedPreview = computed(() => {
+  const content = store.filePreview.content || '';
+  if (!content) return '';
+  let lang = previewExt.value;
+  if (lang && !hljs.getLanguage(lang)) {
+    lang = HLJS_EXT_ALIAS[lang] || '';
+  }
+  if (lang && hljs.getLanguage(lang)) {
+    try {
+      return hljs.highlight(content, { language: lang, ignoreIllegals: true }).value;
+    } catch {
+      // 高亮失败则退化为纯文本
+    }
+  }
+  return escapeHtml(content);
+});
 
 async function refreshTasks() {
   if (window.pywebview && window.pywebview.api) {
@@ -493,6 +538,11 @@ onMounted(() => {
   box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
   overflow: hidden;
 }
+/* 文件预览弹窗加宽，保证代码行能完整显示 */
+.file-preview-modal {
+  width: 980px;
+  max-width: 92vw;
+}
 .modal-head {
   padding: 14px 18px;
   border-bottom: 1px solid var(--border);
@@ -557,5 +607,12 @@ onMounted(() => {
   color: var(--orange);
   border-top: 1px solid var(--border);
   background: var(--bg1);
+}
+.fp-md {
+  padding: 16px 20px;
+  max-height: 60vh;
+  overflow-y: auto;
+  font-size: 13px;
+  line-height: 1.7;
 }
 </style>

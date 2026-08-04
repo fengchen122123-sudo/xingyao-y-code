@@ -82,6 +82,16 @@
       <span>{{ store.toast.msg }}</span>
       <button v-if="store.toast.action" class="toast-action" @click="store.toast.action.fn()">{{ store.toast.action.label }}</button>
     </div>
+
+    <!-- 启动画面：初始化期间全屏展示，加载完成后淡出进入对话 -->
+    <Transition name="splash">
+      <div v-if="!store.initialized" id="splash">
+        <img class="sp-logo" src="/icon.png" alt="Y-CODE">
+        <div class="sp-title">Y-CODE</div>
+        <div class="sp-sub">星瑶 GUI 编码助手</div>
+        <div class="sp-bar"><i></i></div>
+      </div>
+    </Transition>
   </div>
 </template>
 
@@ -169,6 +179,77 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* ---------- 启动画面 ---------- */
+#splash {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  background: var(--bg0);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+.sp-logo {
+  width: 84px;
+  height: 84px;
+  border-radius: 20px;
+  object-fit: cover;
+  display: block;
+  box-shadow: 0 0 42px var(--accent-soft), 0 0 18px var(--accent-soft);
+  animation: sp-pulse 1.6s ease-in-out infinite;
+}
+@keyframes sp-pulse {
+  0%, 100% { transform: scale(1); box-shadow: 0 0 24px var(--accent-soft); }
+  50% { transform: scale(1.06); box-shadow: 0 0 52px var(--accent); }
+}
+.sp-title {
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 6px;
+  color: var(--text);
+  animation: sp-rise 0.6s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.sp-sub {
+  font-size: 12.5px;
+  color: var(--text-faint);
+  letter-spacing: 2px;
+  animation: sp-rise 0.6s 0.12s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes sp-rise {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: none; }
+}
+.sp-bar {
+  margin-top: 10px;
+  width: 168px;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--bg2);
+  overflow: hidden;
+}
+.sp-bar i {
+  display: block;
+  width: 40%;
+  height: 100%;
+  border-radius: 2px;
+  background: var(--accent);
+  animation: sp-slide 1.1s ease-in-out infinite;
+}
+@keyframes sp-slide {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(380%); }
+}
+/* 加载完成后淡出 */
+.splash-leave-active {
+  transition: opacity 0.35s ease, transform 0.35s ease;
+}
+.splash-leave-to {
+  opacity: 0;
+  transform: scale(1.015);
+}
+
 #app-root {
   height: 100vh;
   display: flex;

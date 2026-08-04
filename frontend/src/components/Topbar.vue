@@ -2,8 +2,8 @@
   <div id="topbar">
     <button class="icon-btn" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">☰</button>
     <div class="logo" :title="store.version ? ('Y-CODE 星瑶 v' + store.version) : 'Y-CODE 星瑶'">
-      <div class="mark">Y</div>
-      <div><span class="name">Y-CODE</span> <span class="sub">星瑶 · Vue 3</span></div>
+      <img class="mark" src="/icon.png" alt="Y-CODE">
+      <div><span class="name">Y-CODE</span></div>
     </div>
     <div class="top-spacer"></div>
 
@@ -38,16 +38,11 @@ const store = useAppStore();
   user-select: none;
 }
 #topbar .logo .mark {
-  width: 26px;
-  height: 26px;
+  width: 28px;
+  height: 28px;
   border-radius: 7px;
-  background: var(--accent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-weight: 700;
-  color: #fff;
-  font-size: 13px;
+  object-fit: cover;
+  display: block;
 }
 #topbar .logo .name {
   font-weight: 600;

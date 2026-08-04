@@ -226,6 +226,7 @@ def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_dat
         cmd = [
             pyinstaller_bin, "--clean", "--noconfirm", "--onefile", "--console", "--noupx",
             "--name", output_name,
+            "--icon", os.path.join(project_dir, "assets", "ycode.ico"),
             # --specpath 指向临时目录：避免 PyInstaller 自动生成/覆盖同名的
             # ycode_setup.spec —— 项目根目录下那份是给开发者单独手动构建用的
             # 参考 spec，绝不能被这里的动态 CLI 构建悄悄覆盖掉。
