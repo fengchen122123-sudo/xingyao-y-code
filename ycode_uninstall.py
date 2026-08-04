@@ -85,14 +85,30 @@ def remove_uninstall_registry_key(app_key_name):
 # 快捷方式
 # ============================================================================
 
+def get_desktop_dir():
+    """获取用户真实桌面路径（可能被重定向，优先读注册表 User Shell Folders）。"""
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "Desktop")
+            return os.path.normpath(os.path.expandvars(value))
+    except OSError:
+        return os.path.join(os.path.expanduser("~"), "Desktop")
+
+
 def remove_shortcut(name):
-    shortcut_path = os.path.join(os.path.expanduser("~"), "Desktop", name)
-    if os.path.exists(shortcut_path):
-        try:
-            os.remove(shortcut_path)
-            print(f"✔ 已成功删除桌面快捷方式: {name}")
-        except Exception as e:
-            print(f"⚠️ 删除快捷方式 {name} 失败: {e}")
+    # 真实桌面与旧版 ~/Desktop 两个位置都尝试清理，兼容修复前安装的版本
+    candidate_dirs = {get_desktop_dir(), os.path.join(os.path.expanduser("~"), "Desktop")}
+    for desktop_dir in candidate_dirs:
+        shortcut_path = os.path.join(desktop_dir, name)
+        if os.path.exists(shortcut_path):
+            try:
+                os.remove(shortcut_path)
+                print(f"✔ 已成功删除桌面快捷方式: {shortcut_path}")
+            except Exception as e:
+                print(f"⚠️ 删除快捷方式 {shortcut_path} 失败: {e}")
 
 
 # ============================================================================

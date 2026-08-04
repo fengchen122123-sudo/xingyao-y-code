@@ -765,7 +765,10 @@ class ApiBridge:
             self._set_current_session(session_name)
 
             stored_wdir = None
-            for s in self._memory.get_all_sessions(workdir=None):
+            # include_empty=True：刚新建的空会话（如删除当前会话后自动创建的
+            # GLOBAL 会话）还没有消息，不过滤掉才能拿到它的 GLOBAL 归属，
+            # 否则 is_global 误判为 False，工作区标签会错指到项目文件夹
+            for s in self._memory.get_all_sessions(workdir=None, include_empty=True):
                 if s.get("name") == session_name:
                     stored_wdir = s.get("workdir")
                     break
@@ -1334,7 +1337,7 @@ class ApiBridge:
     def _session_workdir(self, session_name: str) -> str:
         """查询会话已登记的 workdir；查不到时按当前工作目录处理。"""
         try:
-            for s in self._memory.get_all_sessions(workdir=None):
+            for s in self._memory.get_all_sessions(workdir=None, include_empty=True):
                 if s.get("name") == session_name:
                     return s.get("workdir") or _resolve_real_path(os.getcwd())
         except Exception:

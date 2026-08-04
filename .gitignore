@@ -77,3 +77,6 @@ db_*.txt
 test20*/
 .workbuddy/
 .worktrees/
+
+# Local superpowers brainstorm state
+.superpowers/

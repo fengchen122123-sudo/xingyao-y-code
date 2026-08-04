@@ -128,7 +128,21 @@ def prompt_install_dir():
 
 
 def get_desktop_dir():
-    return os.path.join(os.path.expanduser("~"), "Desktop")
+    """获取用户真实桌面路径。
+
+    桌面文件夹可能被用户或 OneDrive 重定向（例如 D:\\Users\\xxx\\Desktop），
+    此时 ~/Desktop 并不是用户实际看到的桌面。优先读注册表
+    User Shell Folders 的 Desktop 值，读取失败再回退 ~/Desktop。
+    """
+    try:
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER,
+            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+        ) as key:
+            value, _ = winreg.QueryValueEx(key, "Desktop")
+            return os.path.normpath(os.path.expandvars(value))
+    except OSError:
+        return os.path.join(os.path.expanduser("~"), "Desktop")
 
 
 def create_shortcut(shortcut_path, target_path, working_dir, startupinfo):
