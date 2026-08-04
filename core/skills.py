@@ -184,18 +184,22 @@ def parse_skill_md(file_path):
             yaml_content = match.group(1)
             markdown_body = match.group(2).strip()
             
-            # 简单解析 yaml 里的 name 和 description
+            # 简单解析 yaml 里的 name、description 和可选的 triggers（中文触发词）
+            triggers = ""
             for line in yaml_content.split('\n'):
                 line = line.strip()
                 if line.startswith("name:"):
                     name = line[5:].strip().strip('"\'')
                 elif line.startswith("description:"):
                     description = line[12:].strip().strip('"\'')
+                elif line.startswith("triggers:"):
+                    triggers = line[9:].strip().strip('"\'')
                     
             return {
                 "id": file_path, # 用绝对路径作为唯一标识
                 "name": name,
                 "description": description,
+                "triggers": triggers,
                 "content": content, # 把带有 header 的完整文件也发给模型，有时有帮助
                 "body": markdown_body
             }
@@ -205,6 +209,7 @@ def parse_skill_md(file_path):
                 "id": file_path,
                 "name": name,
                 "description": "未解析到 YAML 描述",
+                "triggers": "",
                 "content": content,
                 "body": content.strip()
             }
@@ -272,6 +277,31 @@ def save_active_skill_ids(active_ids):
     except Exception as e:
         _log_warning("保存 active_skills.json 失败: %s", e)
 
+# 英文描述技能的中文触发词提示：英文描述在中文业务对话里难以被模型命中，
+# 仅对描述中不含中文的技能追加极简触发词（frontmatter 的 triggers: 可覆盖）。
+# 提示只出现在跨轮稳定的技能目录块中（属缓存前缀），不增加每轮请求的边际成本。
+_TRIGGER_HINTS = {
+    "brainstorming": "新功能/设计/改造前",
+    "writing-plans": "多步任务/写实施计划",
+    "executing-plans": "按计划执行",
+    "subagent-driven-development": "多独立任务并行开发",
+    "dispatching-parallel-agents": "多个独立任务并行",
+    "test-driven-development": "新功能/修bug/写测试",
+    "systematic-debugging": "排查/报错/异常/bug",
+    "verification-before-completion": "声称完成前验证",
+    "requesting-code-review": "任务完成后审查代码",
+    "receiving-code-review": "收到评审意见",
+    "using-git-worktrees": "隔离工作区/新分支开发",
+    "finishing-a-development-branch": "合并分支/收尾",
+    "writing-skills": "创建/修改技能",
+    "using-superpowers": "会话开始/查找技能",
+}
+
+
+def _contains_cjk(text):
+    return any('\u4e00' <= ch <= '\u9fff' for ch in (text or ""))
+
+
 def get_active_skills_catalog():
     """Return enabled skill metadata without eagerly injecting skill bodies."""
     active_ids = set(get_active_skill_ids())
@@ -285,15 +315,21 @@ def get_active_skills_catalog():
         return ""
 
     lines = [
-        "【可用技能目录】",
-        "仅在任务直接匹配时读取对应 SKILL.md；不要加载无关技能。",
+        "【可用技能目录】开始任何工作前先扫一遍本目录：任务与某技能哪怕轻微相关，"
+        "必须先 read_file 读取其 SKILL.md 再动手；确定无关才跳过。",
     ]
     for skill in sorted(
         active_skills,
         key=lambda item: (item["name"].lower(), item["id"]),
     ):
+        # 中文描述本身含触发语义，无需追加；英文描述追加极简中文触发词
+        hint = skill.get("triggers") or ""
+        if not hint and not _contains_cjk(skill["description"]):
+            dir_name = os.path.basename(os.path.dirname(skill["id"]))
+            hint = _TRIGGER_HINTS.get(dir_name, "")
+        suffix = f"（触发:{hint}）" if hint else ""
         lines.append(
-            f'- {skill["name"]}: {skill["description"]} | {skill["id"]}'
+            f'- {skill["name"]}: {skill["description"]}{suffix} | {skill["id"]}'
         )
     return "\n".join(lines)
 
