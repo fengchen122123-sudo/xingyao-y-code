@@ -5,6 +5,7 @@ import type {
   SessionGroup,
   SkillInfo,
   McpInfo,
+  PluginInfo,
   FileNode,
   BridgeEvent,
   PlanData,
@@ -44,7 +45,7 @@ export interface PermReqState {
   source: string;
 }
 
-export type SubpageType = 'skills' | 'mcp' | 'models';
+export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models';
 
 // 从完整路径中取出所在目录（不依赖 Node path 模块，纯字符串处理，兼容 \ 与 /）
 function dirName(p: string): string {
@@ -72,9 +73,10 @@ export const useAppStore = defineStore('app', {
     workdir: '',
     fileTree: [] as FileNode[],
 
-    // 技能 / MCP
+    // 技能 / MCP / 插件
     skills: [] as SkillInfo[],
     mcps: [] as McpInfo[],
+    plugins: [] as PluginInfo[],
 
     // 对话消息流
     messages: [] as ChatMessage[],
@@ -84,6 +86,8 @@ export const useAppStore = defineStore('app', {
     // 后端连接状态 / 版本号
     connected: false,
     version: '',
+    // 启动初始化是否完成（控制 Y-CODE 启动画面，完成后淡出进入对话）
+    initialized: false,
 
     // 侧栏与面板开合状态
     sidebarCollapsed: false,
@@ -194,6 +198,8 @@ export const useAppStore = defineStore('app', {
       this.themeLight = !this.themeLight;
       // body.light 是唯一的浅色主题开关机制（对应 style.css 中的 body.light 选择器）
       document.body.classList.toggle('light', this.themeLight);
+      // 同步 Windows 窗口标题栏明暗，避免深色内容配白色标题栏刺眼
+      this._api()?.set_titlebar_theme(!this.themeLight)?.catch(() => {});
     },
 
     toggleShowThinking() {
@@ -246,8 +252,22 @@ export const useAppStore = defineStore('app', {
         this.handleBridgeEvent(event);
       };
 
+      // 启动画面最少展示时长：后端太快时避免一闪而过
+      const SPLASH_MIN_MS = 900;
+      const splashStart = Date.now();
+      const finishSplash = async () => {
+        const remain = SPLASH_MIN_MS - (Date.now() - splashStart);
+        if (remain > 0) await new Promise(r => setTimeout(r, remain));
+        this.initialized = true;
+      };
+
       const api = this._api();
-      if (!api) return;
+      if (!api) {
+        await finishSplash();
+        return;
+      }
+      // 启动时按当前主题同步一次标题栏（默认深色）
+      api.set_titlebar_theme(!this.themeLight)?.catch(() => {});
       try {
         const init = await api.get_initial_state();
         this.models = init.models || [];
@@ -257,16 +277,33 @@ export const useAppStore = defineStore('app', {
         this.sessionGroups = init.sessions || [];
         this.skills = init.skills || [];
         this.mcps = init.mcps || [];
+        this.plugins = (init as any).plugins || [];
         this.workdir = init.workdir || '';
-        this.currentWorkdirLabel = this.workdir ? (this.workdir.split('\\').pop() || this.workdir) : '对话';
+        this.currentSessionName = (init as any).current_session || '';
+        // 工作区标签以“当前会话归属”为准：GLOBAL 会话显示“对话”，
+        // 不能直接用启动目录，否则会显示在工作区里、消息却发进自由对话
+        const isGlobal = !!(init as any).is_global;
+        this.currentWorkdirLabel = (!isGlobal && this.workdir)
+          ? (this.workdir.split('\\').pop() || this.workdir)
+          : '对话';
+        // 启动时后端自动恢复最近一次对话：同步消息列表与标题
+        this.messages = (init as any).messages || [];
+        for (const g of this.sessionGroups) {
+          const hit = (g.sessions || []).find((s: any) => s.name === this.currentSessionName);
+          if (hit) {
+            this.currentSessionDisplayName = hit.display_name || hit.name;
+            break;
+          }
+        }
         this.fileTree = (init as any).file_tree || [];
         this.tokenUsage = init.token_usage || { used: 0, window: 0, cached_pct: 0, cumulative: 0 };
         this.version = init.version || '';
         this.connected = true;
-        this.showToast('已连接到后端', 'ok');
       } catch (err) {
         this.connected = false;
         this.showToast('后端连接失败：' + err, 'warn');
+      } finally {
+        await finishSplash();
       }
     },
 
@@ -353,6 +390,16 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.showToast('创建通用对话失败: ' + err, 'warn');
+      }
+    },
+
+    // 顶栏“新会话”按钮：跟随当前上下文——在项目中就在该项目新建，
+    // 在自由对话中就新建自由对话
+    async createSessionSmart() {
+      if (this.workdir && this.currentWorkdirLabel !== '对话') {
+        await this.createSessionInGroup(this.workdir);
+      } else {
+        await this.createGlobalSession();
       }
     },
 
@@ -462,9 +509,10 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async sendMessage(text: string) {
+    async sendMessage(text: string, attachments?: string[]) {
       // 生成中禁止再次发送（无论调用方是否已自行判断，均在此兜底拦截）
-      if (!text.trim() || this.running) return;
+      const attachList = (attachments || []).filter(p => p && p.trim());
+      if ((!text.trim() && !attachList.length) || this.running) return;
       this.running = true;
 
       const api = window.pywebview && window.pywebview.api;
@@ -476,7 +524,7 @@ export const useAppStore = defineStore('app', {
         return;
       }
       try {
-        const res = await api.send_user_message(text.trim(), this.currentSessionName);
+        const res = await api.send_user_message(text.trim(), this.currentSessionName, attachList);
         if (!res || !res.ok) {
           this.running = false;
           this.showToast('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
@@ -709,6 +757,51 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 启用 MCP 服务：预置服务需带上用户填写的密钥；已配置服务等价于 toggle
+    async enableMcpServer(name: string, envValues?: Record<string, string>) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.enable_mcp_server(name, envValues || {});
+        if (res && res.ok) {
+          this.mcps = res.mcps || this.mcps;
+          this.showToast(res.msg || 'MCP 状态已更新', 'ok');
+        } else {
+          this.showToast('启用失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+        }
+      } catch (err) {
+        this.connected = false;
+        this.showToast('启用 MCP 服务失败: ' + err, 'warn');
+      }
+    },
+
+    async refreshPlugins() {
+      const api = this._api();
+      if (!api) return;
+      try {
+        this.plugins = (await api.get_plugins()) || [];
+      } catch {
+        // 静默失败，保留现有列表
+      }
+    },
+
+    async togglePlugin(name: string, enabled: boolean) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.toggle_plugin(name, enabled);
+        if (res && res.ok) {
+          this.plugins = res.plugins || this.plugins;
+          this.showToast(res.msg || '插件状态已更新', 'ok');
+        } else {
+          this.showToast('插件状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+        }
+      } catch (err) {
+        this.connected = false;
+        this.showToast('插件状态更新失败: ' + err, 'warn');
+      }
+    },
+
     async reconnectMcp() {
       const api = this._api();
       if (!api) return;
@@ -856,6 +949,28 @@ export const useAppStore = defineStore('app', {
         this.connected = false;
         this.showToast('选择文件失败: ' + err, 'warn');
         return [];
+      }
+    },
+
+    async getFilesInfo(paths: string[]) {
+      const api = this._api();
+      if (!api || !paths.length) return [];
+      const list = await api.get_files_info(paths);
+      return (list || []) as Array<{ path: string; name: string; ext: string; size: number | null; ok: boolean }>;
+    },
+
+    // 保存剪贴板粘贴的图片，返回落盘后的文件路径（失败返回空串并 toast）
+    async saveClipboardImage(dataUrl: string): Promise<string> {
+      const api = this._api();
+      if (!api) return '';
+      try {
+        const res = await api.save_clipboard_image(dataUrl);
+        if (res && res.ok && res.path) return res.path;
+        this.showToast('粘贴图片失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+        return '';
+      } catch (err) {
+        this.showToast('粘贴图片失败: ' + err, 'warn');
+        return '';
       }
     },
 

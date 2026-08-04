@@ -40,6 +40,8 @@ common_datas = [
     ('system_prompt.md', '.'),
     ('vendor/ripgrep/rg.exe', 'vendor/ripgrep'),
     ('frontend/dist', 'frontend/dist'),
+    # GUI 运行时用 WM_SETICON 设置窗口/任务栏图标，需随包携带 ico 文件
+    ('assets/ycode.ico', 'assets'),
 ] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas
 
 common_binaries = litellm_binaries + tiktoken_ext_binaries
@@ -78,6 +80,7 @@ exe_tui = EXE(
     [],
     exclude_binaries=True,
     name='ycode',
+    icon='assets/ycode.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -131,6 +134,7 @@ exe_gui = EXE(
     [],
     exclude_binaries=True,
     name='Y-code',
+    icon='assets/ycode.ico',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

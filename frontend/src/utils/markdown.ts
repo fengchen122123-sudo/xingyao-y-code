@@ -62,6 +62,9 @@ export function renderMarkdown(md: string): string {
   text = text.replace(/^## (.*)$/gim, '<h3>$1</h3>');
   text = text.replace(/^# (.*)$/gim, '<h2>$1</h2>');
 
+  // 4.5 分割线 --- 或 ***
+  text = text.replace(/^(?:---|\*\*\*)$/gim, '<hr>');
+
   // 5. 链接 [text](url) —— href 经 sanitizeHref 白名单过滤
   text = text.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, label, url) => {
     const safeHref = sanitizeHref(url);

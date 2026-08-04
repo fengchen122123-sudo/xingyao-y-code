@@ -2,7 +2,8 @@
   <div>
     <div class="file-row" :class="{ open: isOpen }" @click="toggle">
       <span class="fi">{{ node.d ? (isOpen ? '▾' : '▸') : '' }}</span>
-      {{ node.d ? '▣ ' + node.n : node.n }}
+      <span class="ficon">{{ icon }}</span>
+      <span class="fname">{{ node.n }}</span>
     </div>
     <div v-if="node.d && isOpen" class="file-children">
       <FileTreeNode
@@ -19,6 +20,7 @@
 import { ref, computed } from 'vue';
 import type { FileNode } from '../types/pywebview';
 import { useAppStore } from '../stores/appStore';
+import { extIcon } from '../utils/fileIcon';
 
 const props = defineProps<{
   node: FileNode;
@@ -31,6 +33,11 @@ const isOpen = ref(false);
 // FileNode 本身只带文件名(n)，需要沿递归路径拼接出完整路径供预览接口使用
 const fullPath = computed(() => {
   return props.parentPath ? props.parentPath + '\\' + props.node.n : props.node.n;
+});
+
+const icon = computed(() => {
+  if (props.node.d) return isOpen.value ? '📂' : '📁';
+  return extIcon(props.node.n);
 });
 
 function toggle() {
@@ -61,6 +68,18 @@ function toggle() {
   width: 15px;
   text-align: center;
   font-size: 12px;
+  flex-shrink: 0;
+}
+.file-row .ficon {
+  width: 18px;
+  text-align: center;
+  font-size: 13px;
+  flex-shrink: 0;
+}
+.file-row .fname {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .file-children {
   margin-left: 16px;

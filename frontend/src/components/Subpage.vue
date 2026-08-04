@@ -34,14 +34,40 @@
           <div v-for="m in store.mcps" :key="m.name" class="sub-card mcp-card">
             <div class="sc-top">
               <div class="sc-ico">⧉</div>
-              <div class="sc-name">{{ m.name }}</div>
+              <div class="sc-name">
+                {{ m.name }}
+                <span v-if="!m.configured" class="mcp-preset-badge">预置</span>
+              </div>
               <span class="status-dot" :class="mcpStatusClass(m)" :title="mcpStatusText(m)"></span>
-              <label class="switch" title="启用/禁用该 MCP 服务" @click.stop>
+              <label class="switch" :title="m.configured ? '启用/禁用该 MCP 服务' : '启用该预置服务（缺密钥会弹窗填写）'" @click.stop>
                 <input type="checkbox" :checked="m.enabled" @change="onToggleMcp(m, ($event.target as HTMLInputElement).checked)" />
                 <span class="switch-track"></span>
               </label>
             </div>
-            <div class="sc-desc">工具数: {{ m.tools_count ?? 0 }} · {{ mcpStatusText(m) }}</div>
+            <div class="sc-desc">{{ m.configured ? ('工具数: ' + (m.tools_count ?? 0) + ' · ' + mcpStatusText(m)) : (m.comment || '预置服务模板') }}</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 插件页 -->
+      <div v-else-if="subType === 'plugins'" class="sub-grid">
+        <div v-if="store.plugins.length === 0" class="sub-empty">暂无已安装的插件</div>
+        <div v-for="p in store.plugins" :key="p.name" class="sub-card">
+          <div class="sc-top">
+            <div class="sc-ico">⬡</div>
+            <div class="sc-name">
+              {{ p.name }}
+              <span class="pl-ver">v{{ p.version }}</span>
+              <span class="pl-src" :class="p.source">{{ p.source === 'user' ? '用户' : '内置' }}</span>
+            </div>
+            <label class="switch" title="启用/禁用该插件（重启后完全生效）" @click.stop>
+              <input type="checkbox" :checked="p.enabled" @change="store.togglePlugin(p.name, ($event.target as HTMLInputElement).checked)" />
+              <span class="switch-track"></span>
+            </label>
+          </div>
+          <div class="sc-desc">{{ p.description || '无描述' }}</div>
+          <div class="sc-id">
+            {{ pluginStatusText(p) }}<template v-if="p.tools.length"> · 工具: {{ p.tools.join(', ') }}</template>
           </div>
         </div>
       </div>
@@ -96,13 +122,29 @@
         </div>
       </div>
     </div>
+
+    <!-- 预置 MCP 启用时的密钥输入弹窗 -->
+    <div v-if="envModal.show" class="env-modal-mask" @click.self="envModal.show = false">
+      <div class="env-modal">
+        <div class="em-title">启用 {{ envModal.name }}</div>
+        <div class="em-desc">该服务需要以下密钥，填写后会保存到 mcp.json，之后开关无需再输入</div>
+        <div v-for="key in envModal.keys" :key="key" class="em-row">
+          <label class="em-label">{{ key }}</label>
+          <input v-model="envModal.values[key]" type="password" :placeholder="'请输入 ' + key" class="em-input" />
+        </div>
+        <div class="em-actions">
+          <button class="chip-btn" @click="envModal.show = false">取消</button>
+          <button class="chip-btn em-confirm" @click="submitEnvModal">确认启用</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
 import { useAppStore, type SubpageType } from '../stores/appStore';
-import type { SkillInfo, McpInfo, ModelInfo } from '../types/pywebview';
+import type { SkillInfo, McpInfo, ModelInfo, PluginInfo } from '../types/pywebview';
 
 const props = defineProps<{
   visible: boolean;
@@ -115,11 +157,13 @@ const store = useAppStore();
 const title = computed(() => {
   if (props.subType === 'skills') return '技能 Skills';
   if (props.subType === 'mcp') return 'MCP 服务';
+  if (props.subType === 'plugins') return '插件 Plugins';
   return '模型管理';
 });
 const desc = computed(() => {
   if (props.subType === 'skills') return '已扫描的项目技能与用户扩展技能';
   if (props.subType === 'mcp') return '来自 mcp.json 的服务接口';
+  if (props.subType === 'plugins') return '与 CLI 共用同一份 plugin.json 配置，开关状态两端同步';
   return '管理模型供应商与可用模型列表';
 });
 
@@ -128,7 +172,40 @@ function onToggleSkill(s: SkillInfo, checked: boolean) {
 }
 
 function onToggleMcp(m: McpInfo, checked: boolean) {
+  if (checked && m.configured === false) {
+    // 预置服务首次启用：需要密钥的弹窗填写，不需要的直接启用
+    const keys = m.required_inputs || [];
+    if (keys.length) {
+      envModal.show = true;
+      envModal.name = m.name;
+      envModal.keys = keys;
+      envModal.values = Object.fromEntries(keys.map(k => [k, '']));
+      return;
+    }
+    store.enableMcpServer(m.name, {});
+    return;
+  }
   store.toggleMcpServer(m.name, checked);
+}
+
+// 预置 MCP 密钥输入弹窗状态
+const envModal = reactive({
+  show: false,
+  name: '',
+  keys: [] as string[],
+  values: {} as Record<string, string>,
+});
+
+function submitEnvModal() {
+  const missing = envModal.keys.filter(k => !(envModal.values[k] || '').trim());
+  if (missing.length) {
+    store.showToast('请填写: ' + missing.join(', '), 'warn');
+    return;
+  }
+  const name = envModal.name;
+  const values = { ...envModal.values };
+  envModal.show = false;
+  store.enableMcpServer(name, values);
 }
 
 function mcpStatusClass(m: McpInfo) {
@@ -137,16 +214,31 @@ function mcpStatusClass(m: McpInfo) {
 }
 
 function mcpStatusText(m: McpInfo) {
+  if (m.configured === false) return '预置 · 未配置';
   if (!m.enabled) return '已禁用';
   return m.connected ? '已连接' : '已启用但未连接';
 }
 
-// 打开 MCP 页时用 get_mcp_servers() 刷新一次最新状态
+function pluginStatusText(p: PluginInfo) {
+  switch (p.status) {
+    case 'loaded': return '已加载';
+    case 'disabled': return '已禁用';
+    case 'failed': return p.error ? `加载失败: ${p.error}` : '加载失败';
+    case 'overridden': return '已被同名用户插件覆盖';
+    case 'pending_enable': return '已启用（重启后生效）';
+    case 'pending_disable': return '已禁用（重启后生效）';
+    default: return p.status || '';
+  }
+}
+
+// 打开 MCP / 插件页时刷新一次最新状态
 watch(
   () => [props.visible, props.subType] as const,
   ([visible, type]) => {
     if (visible && type === 'mcp') {
       store.refreshMcpServers();
+    } else if (visible && type === 'plugins') {
+      store.refreshPlugins();
     }
   }
 );
@@ -319,6 +411,101 @@ async function testModelRow(m: ModelInfo) {
   color: var(--text-faint);
   font-family: var(--mono);
   margin-top: 4px;
+}
+
+/* 预置角标 */
+.mcp-preset-badge {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 6px;
+  margin-left: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 400;
+}
+
+/* MCP 密钥输入弹窗 */
+.env-modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1300;
+}
+.env-modal {
+  width: 420px;
+  max-width: 90vw;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+}
+.em-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.em-desc {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin: 6px 0 14px;
+  line-height: 1.6;
+}
+.em-row {
+  margin-bottom: 10px;
+}
+.em-label {
+  display: block;
+  font-size: 11.5px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+  font-family: var(--mono);
+}
+.em-input {
+  width: 100%;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+  color: var(--text);
+  font-size: 12.5px;
+  outline: none;
+}
+.em-input:focus {
+  border-color: var(--accent);
+}
+.em-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+.em-confirm {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.pl-ver {
+  font-size: 10.5px;
+  color: var(--text-faint);
+  font-weight: 400;
+  margin-left: 4px;
+}
+.pl-src {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 6px;
+  margin-left: 4px;
+  background: var(--bg3);
+  color: var(--text-dim);
+  font-weight: 400;
+}
+.pl-src.user {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 /* 状态圆点 */

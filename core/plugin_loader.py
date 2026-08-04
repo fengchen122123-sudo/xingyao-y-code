@@ -55,18 +55,25 @@ def _user_plugin_dir() -> Path:
         return Path.home() / ".ycode" / "plugins"
 
 
-def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
-    """切换插件开关：写回其 plugin.json 的 enabled 字段，并同步刷新内存状态。
+def _live_registry():
+    """取调度层（core/llm.py）的运行时工具注册表单例；取不到（如独立测试进程）返回 None。"""
+    try:
+        from core import llm
+        return getattr(llm, "tool_registry", None)
+    except Exception:
+        return None
 
-    返回 (ok, msg)。注意：实际加载/卸载需重启后生效（插件工具在启动时一次性注册），
-    本函数只负责持久化开关与刷新 /plugins 列表的即时显示状态。
+
+def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
+    """切换插件开关：写回 plugin.json 持久化，并热挂载/卸载运行时工具（无需重启）。
+
+    返回 (ok, msg)。持久化保证 CLI / GUI 下次启动状态一致；热切换通过直接操作
+    core.llm.tool_registry 单例让开关立即生效，两端行为同步。
     """
     target: Path | None = None
-    target_source = ""
     for info in _PLUGIN_INFOS:
         if info.get("name") == name:
             target = Path(info["path"])
-            target_source = info.get("source", "")
             break
     # 兜底：内存记录里没找到就扫一遍目录
     if target is None:
@@ -74,7 +81,6 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
             child = base / name
             if (child / "plugin.json").is_file():
                 target = child
-                target_source = "user" if base == _user_plugin_dir() else "builtin"
                 break
     if target is None or not (target / "plugin.json").is_file():
         return False, f"未找到插件 {name}"
@@ -91,20 +97,49 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
             f.write("\n")
     except Exception as exc:
         return False, f"写入 {meta_path} 失败: {exc}"
-    # 同步刷新内存中该插件的 status，让 /plugins 列表即时反映
-    for info in _PLUGIN_INFOS:
-        if info.get("name") == name:
+
+    # 热切换：直接在当前进程的运行时注册表上挂载/卸载插件工具
+    hot_note = ""
+    registry = _live_registry()
+    if registry is not None:
+        try:
             if enabled:
-                # 标记为“待重启加载”，避免误显示为已加载（工具实际重启后才注册）
-                if info.get("status") in ("disabled", "pending_disable"):
-                    info["status"] = "pending_enable"
-                    info.pop("error", None)
+                # 先卸下同名旧工具，避免重复开关时 duplicate 报错
+                for info in _PLUGIN_INFOS:
+                    if info.get("name") == name:
+                        for t in info.get("tools") or []:
+                            try:
+                                registry.unregister(t)
+                            except KeyError:
+                                pass
+                        break
+                before = {s.name for s in registry.all()}
+                _load_one(target, registry)
+                new_tools = sorted(s.name for s in registry.all() if s.name not in before)
+                for info in _PLUGIN_INFOS:
+                    if info.get("name") == name:
+                        info["status"] = "loaded"
+                        info["tools"] = new_tools
+                        info.pop("error", None)
+                        break
             else:
-                # 标记为“待重启卸载”：当前进程内工具仍可用，重启后才真正不加载
-                info["status"] = "pending_disable"
-            break
+                for info in _PLUGIN_INFOS:
+                    if info.get("name") == name:
+                        for t in info.get("tools") or []:
+                            try:
+                                registry.unregister(t)
+                            except KeyError:
+                                pass
+                        info["status"] = "disabled"
+                        break
+        except Exception as exc:
+            _logger.warning("插件 %s 热切换失败: %s", name, exc)
+            hot_note = f"（热切换失败: {exc}，重启后生效）"
+    else:
+        hot_note = "（运行时注册表不可用，重启后生效）"
+
     action = "启用" if enabled else "禁用"
-    return True, f"已{action}插件 {name}（重启后完全生效）"
+    return True, f"已{action}插件 {name}{hot_note}"
 
 
 def plugin_dirs() -> list[Path]:

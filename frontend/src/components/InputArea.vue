@@ -2,22 +2,18 @@
   <div id="input-area">
     <div id="input-wrap">
       <div id="input-box">
+        <AttachmentChips :items="attachments" @remove="removeAttachment" />
         <textarea 
           v-model="inputVal" 
           rows="2" 
           placeholder="向星瑶提问… 输入 / 查看命令，@ 引用文件"
           @keydown.enter.exact.prevent="handleSend"
           @keydown.esc="store.stopCurrentTurn()"
+          @paste="handlePaste"
         ></textarea>
 
         <div id="input-bar">
-          <button class="chip-btn" title="附加文件" @click="handlePickFiles">附件</button>
-          <button
-            class="chip-btn"
-            :class="{ active: store.showThinking }"
-            title="显示/收起思考过程"
-            @click="store.toggleShowThinking()"
-          >思考</button>
+          <button class="chip-btn plus-btn" title="附加文件" @click="handlePickFiles">＋</button>
           <button
             ref="permBtnRef"
             class="chip-btn"
@@ -75,6 +71,8 @@ import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
+import AttachmentChips from './AttachmentChips.vue';
+import { useAttachments } from '../composables/useAttachments';
 
 const store = useAppStore();
 const inputVal = ref('');
@@ -107,11 +105,10 @@ const tokenClass = computed(() => {
   return '';
 });
 
+const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste } = useAttachments();
+
 async function handlePickFiles() {
-  const paths = await store.pickFiles();
-  if (paths.length) {
-    inputVal.value += paths.map(p => ` @${p}`).join('');
-  }
+  await pickAttachments();
 }
 
 function handleSend() {
@@ -120,10 +117,12 @@ function handleSend() {
     return;
   }
 
-  if (!inputVal.value.trim()) return;
   const text = inputVal.value;
+  const paths = attachments.value.map(a => a.path);
+  if (!text.trim() && !paths.length) return;
   inputVal.value = '';
-  store.sendMessage(text);
+  clearAttachments();
+  store.sendMessage(text, paths);
 }
 </script>
 
@@ -156,9 +155,9 @@ textarea {
   outline: none;
   color: var(--text);
   font-family: var(--sans);
-  font-size: 13.5px;
+  font-size: 14px;
   resize: none;
-  line-height: 1.6;
+  line-height: 1.65;
 }
 #input-bar {
   display: flex;
@@ -174,12 +173,18 @@ textarea {
   color: var(--text-dim);
   border-radius: 7px;
   padding: 4px 10px;
-  font-size: 12px;
+  font-size: 12.5px;
   display: flex;
   align-items: center;
   gap: 5px;
   cursor: pointer;
   transition: 0.15s;
+}
+.plus-btn {
+  font-size: 14px;
+  font-weight: 600;
+  padding: 3px 10px;
+  line-height: 1.2;
 }
 .chip-btn:hover {
   border-color: var(--text-faint);
@@ -223,7 +228,7 @@ textarea {
   margin: 6px auto 0;
   display: flex;
   justify-content: space-between;
-  font-size: 11px;
+  font-size: 11.5px;
   color: var(--text-faint);
 }
 .kbd {
