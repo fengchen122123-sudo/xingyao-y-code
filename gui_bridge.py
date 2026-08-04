@@ -168,12 +168,15 @@ class ApiBridge:
         # 修复：形参曾经遮蔽模块级单例，导致 self._mcp 永远是 None
         self._mcp = mcp_manager if mcp_manager is not None else _mcp_manager_singleton
 
-        self._current_session = f"session_{uuid.uuid4().hex[:6]}"
-        try:
-            # GUI 启动会话统一挂在 GLOBAL（自由对话）分组下
-            self._memory.ensure_session(self._current_session, workdir="GLOBAL", source="GUI")
-        except Exception:
-            logger.warning("初始化 GUI 启动会话失败", exc_info=True)
+        # 启动时恢复最近一次对话（按最后活跃时间）；没有历史会话才新建空对话
+        latest = self._find_latest_session()
+        self._current_session = latest or f"session_{uuid.uuid4().hex[:6]}"
+        if not latest:
+            try:
+                # GUI 启动会话统一挂在 GLOBAL（自由对话）分组下
+                self._memory.ensure_session(self._current_session, workdir="GLOBAL", source="GUI")
+            except Exception:
+                logger.warning("初始化 GUI 启动会话失败", exc_info=True)
 
         self._current_permission_mode = app_context.normalize_permission_mode(MY_PERMISSION_MODE)
         self._plan_approved_this_turn = False
@@ -236,6 +239,112 @@ class ApiBridge:
     def set_window(self, window):
         """设置 PyWebView window 引用"""
         self._window = window
+        self._hwnd = 0
+        self._titlebar_dark = True  # 前端默认深色主题
+        # 后台线程轮询获取原生窗口句柄，拿到后应用深色标题栏
+        threading.Thread(target=self._find_hwnd_worker, daemon=True, name="gui-hwnd-find").start()
+
+    # ------------------------------------------------------------------
+    # 窗口标题栏主题（Windows DWM 沉浸式深色标题栏，保留原生最小化/关闭按钮）
+    # ------------------------------------------------------------------
+    def _find_hwnd_worker(self):
+        """按窗口标题轮询查找 HWND（原生窗口在 webview.start 后才创建）。
+        冻结版启动慢（WebView2 初始化/首次解压），轮询预算放宽到 60 秒。"""
+        if sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            title = getattr(self._window, "title", "") or ""
+            for _ in range(300):  # 最多等 60 秒
+                hwnd = ctypes.windll.user32.FindWindowW(None, title)
+                if hwnd:
+                    self._hwnd = hwnd
+                    # 先设图标再设标题栏主题：WM_SETICON 会触发 DWM 重建非客户区，
+                    # 把已应用的标题栏颜色重置回系统默认（白），顺序不能反。
+                    self._apply_window_icon()
+                    time.sleep(0.05)
+                    self._apply_titlebar_theme()
+                    # WebView2 子窗口就绪、DPI 变化等时机也可能重建边框，延迟补两次
+                    threading.Thread(target=self._reapply_worker, daemon=True,
+                                     name="gui-titlebar-reapply").start()
+                    return
+                time.sleep(0.2)
+        except Exception:
+            logger.debug("查找窗口句柄失败", exc_info=True)
+
+    def _reapply_worker(self):
+        """找到窗口后延迟重设标题栏主题，覆盖启动后期边框被重建的场景。"""
+        for delay in (3, 7):
+            time.sleep(delay)
+            self._apply_titlebar_theme()
+
+    def _apply_window_icon(self):
+        """用 assets/ycode.ico 替换窗口标题栏与任务栏图标（WM_SETICON）。"""
+        if not self._hwnd or sys.platform != "win32":
+            return
+        try:
+            if getattr(sys, "frozen", False):
+                base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+            else:
+                base = os.path.dirname(os.path.abspath(__file__))
+            ico_path = os.path.join(base, "assets", "ycode.ico")
+            if not os.path.exists(ico_path):
+                return
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32
+            u32.LoadImageW.restype = wintypes.HANDLE
+            u32.LoadImageW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR, wintypes.UINT,
+                                       ctypes.c_int, ctypes.c_int, wintypes.UINT]
+            LR_LOADFROMFILE = 0x00000010
+            IMAGE_ICON = 1
+            WM_SETICON = 0x0080
+            # ICON_BIG=1 任务栏/Alt-Tab，ICON_SMALL=0 标题栏左上角
+            big = u32.LoadImageW(None, ico_path, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+            small = u32.LoadImageW(None, ico_path, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+            if big:
+                u32.SendMessageW(self._hwnd, WM_SETICON, 1, big)
+            if small:
+                u32.SendMessageW(self._hwnd, WM_SETICON, 0, small)
+        except Exception:
+            logger.debug("设置窗口图标失败", exc_info=True)
+
+    # 与前端 style.css 主题变量保持一致（标题栏取 --bg1 与应用顶栏无缝衔接，文字取 --text）
+    _TITLEBAR_COLORS = {
+        # dark:  (caption, text)   COLORREF = 0x00BBGGRR
+        True:  (0x001E2020, 0x00D4D9D9),  # #20201e / #d9d9d4
+        False: (0x00FFFFFF, 0x002A2C2C),  # #ffffff / #2c2c2a
+    }
+
+    def _apply_titlebar_theme(self):
+        """把当前标题栏主题写入 DWM；19 兼容旧版 Win10，20 为 Win11/新版 Win10。
+        Win11 22000+ 额外用 CAPTION/TEXT/BORDER_COLOR 让标题栏颜色与界面背景完全一致。"""
+        if not self._hwnd or sys.platform != "win32":
+            return
+        try:
+            import ctypes
+            dwm = ctypes.windll.dwmapi
+            val = ctypes.c_int(1 if self._titlebar_dark else 0)
+            for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE
+                if dwm.DwmSetWindowAttribute(
+                    self._hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)
+                ) == 0:
+                    break
+            caption, text = self._TITLEBAR_COLORS[self._titlebar_dark]
+            # DWMWA_CAPTION_COLOR=35 / TEXT_COLOR=36 / BORDER_COLOR=34（Win11 起支持，失败忽略）
+            for attr, color in ((35, caption), (36, text), (34, caption)):
+                cval = ctypes.c_int(color)
+                dwm.DwmSetWindowAttribute(
+                    self._hwnd, attr, ctypes.byref(cval), ctypes.sizeof(cval)
+                )
+        except Exception:
+            logger.debug("设置标题栏主题失败", exc_info=True)
+
+    def set_titlebar_theme(self, dark: bool) -> Dict[str, Any]:
+        """前端主题切换时同步窗口标题栏明暗，避免深色内容配白色标题栏刺眼。"""
+        self._titlebar_dark = bool(dark)
+        self._apply_titlebar_theme()
+        return {"ok": True}
 
     def _sync_active_model_context(self):
         """把当前激活模型同步给 app_context，供 core 层（子代理等）读取。"""
@@ -318,6 +427,37 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 初始状态
     # ------------------------------------------------------------------
+    def _find_latest_session(self) -> str:
+        """查找最近一次活跃的非空会话（按 updated_at 排序），没有则返回空串。"""
+        try:
+            sessions = self._memory.get_all_sessions(workdir=None)
+            if not sessions:
+                return ""
+            latest = max(sessions, key=lambda s: s.get("updated_at") or s.get("created_at") or "")
+            return str(latest.get("name") or "")
+        except Exception:
+            logger.debug("查找最近会话失败", exc_info=True)
+            return ""
+
+    def _load_session_messages(self, session_name: str) -> List[Dict[str, Any]]:
+        """读取会话历史并转成前端气泡结构（与 switch_session 同一套映射）。"""
+        msgs: List[Dict[str, Any]] = []
+        try:
+            for msg in self._memory.get_history(session_name):
+                role = msg.get("role")
+                if role in ("user", "assistant", "tool"):
+                    msgs.append({
+                        "role": role,
+                        "content": msg.get("content") or "",
+                        "reasoning_content": msg.get("reasoning_content") or "",
+                        "tool_calls": msg.get("tool_calls") or [],
+                        "name": msg.get("name") or "",
+                        "tool_call_id": msg.get("tool_call_id") or "",
+                    })
+        except Exception:
+            logger.debug("加载会话消息失败", exc_info=True)
+        return msgs
+
     def get_initial_state(self) -> Dict[str, Any]:
         try:
             active_model = get_active_model() or {}
@@ -339,7 +479,20 @@ class ApiBridge:
                         "provider_name": str(provider.get("name", "")),
                     })
 
-            workdir = _resolve_real_path(os.getcwd())
+            # 以“当前会话归属”恢复工作区上下文（启动时已自动选中最近一次对话）：
+            # GLOBAL 会话显示自由对话；项目会话切到其工作目录并加载对应文件树。
+            # 不能用启动目录判断——否则会出现“显示在工作区、实际发进对话”的错位。
+            cur_wdir = self._session_workdir(self._current_session)
+            is_global = (cur_wdir == "GLOBAL")
+            if is_global:
+                workdir = "GLOBAL"
+                file_tree: List[Dict[str, Any]] = []
+            else:
+                if os.path.isdir(cur_wdir) and os.path.abspath(cur_wdir) != os.path.abspath(os.getcwd()):
+                    os.chdir(cur_wdir)
+                workdir = _resolve_real_path(os.getcwd())
+                file_tree = self._get_file_tree(workdir)
+            self._recalc_token_usage(self._current_session)
             return {
                 "models": models,
                 "providers": providers,
@@ -349,11 +502,12 @@ class ApiBridge:
                 "sessions": self.get_sessions(),
                 "skills": self._build_skill_list(),
                 "mcps": self._build_mcp_list(),
+                "plugins": self.get_plugins(),
                 "workdir": workdir,
-                # 启动即带上当前目录的文件树：否则顶栏显示了工作区名，
-                # 右侧文件面板却一直是"暂未引入项目文件夹"
-                "file_tree": self._get_file_tree(workdir),
+                "is_global": is_global,
+                "file_tree": file_tree,
                 "current_session": self._current_session,
+                "messages": self._load_session_messages(self._current_session),
                 "token_usage": self.get_token_usage(),
                 "version": str(YCODE_VERSION),
             }
@@ -457,6 +611,10 @@ class ApiBridge:
             raw = self._memory.get_all_sessions(workdir=None, source="GUI", include_empty=True)
             saved_workspaces = self._memory.get_all_workspaces()
             current_wdir = _resolve_real_path(os.getcwd())
+            # “当前”标记必须以【当前会话归属】为准，不能用进程 cwd：
+            # 恢复最近会话会 chdir 到项目目录，此时新建自由对话，
+            # 若按 cwd 标记就会出现“对话”和项目分组同时显示“当前”
+            current_session_wdir = self._session_workdir(self._current_session)
 
             if current_wdir != "GLOBAL":
                 self._memory.add_workspace(current_wdir)
@@ -468,7 +626,7 @@ class ApiBridge:
                 "folder_path": "GLOBAL",
                 "folder_name": "对话",
                 "is_global": True,
-                "is_current": (current_wdir == "GLOBAL"),
+                "is_current": (current_session_wdir == "GLOBAL"),
                 "sessions": [],
             }
 
@@ -490,7 +648,7 @@ class ApiBridge:
                 groups_dict[norm_p] = {
                     "folder_path": norm_p,
                     "folder_name": folder_name,
-                    "is_current": (norm_p == current_wdir),
+                    "is_current": (norm_p == current_session_wdir),
                     "sessions": [],
                 }
 
@@ -514,9 +672,8 @@ class ApiBridge:
                         "count": msg_count,
                         "workdir": "GLOBAL",
                         "is_global": True,
+                        "updated_at": s.get("updated_at") or "",
                     })
-                    if name == self._current_session:
-                        global_group["is_current"] = True
                     continue
 
                 wdir_norm = _resolve_real_path(wdir) if wdir else current_wdir
@@ -526,6 +683,7 @@ class ApiBridge:
                     "count": msg_count,
                     "workdir": wdir_norm,
                     "is_global": False,
+                    "updated_at": s.get("updated_at") or "",
                 }
 
                 if wdir_norm not in groups_dict:
@@ -533,7 +691,7 @@ class ApiBridge:
                     groups_dict[wdir_norm] = {
                         "folder_path": wdir_norm,
                         "folder_name": folder_name,
-                        "is_current": (wdir_norm == current_wdir),
+                        "is_current": (wdir_norm == current_session_wdir),
                         "sessions": [],
                     }
                 groups_dict[wdir_norm]["sessions"].append(s_info)
@@ -618,18 +776,7 @@ class ApiBridge:
                 if os.path.abspath(target_workdir) != os.path.abspath(os.getcwd()):
                     os.chdir(target_workdir)
 
-            msgs = []
-            for msg in self._memory.get_history(session_name):
-                role = msg.get("role")
-                if role in ("user", "assistant", "tool"):
-                    msgs.append({
-                        "role": role,
-                        "content": msg.get("content") or "",
-                        "reasoning_content": msg.get("reasoning_content") or "",
-                        "tool_calls": msg.get("tool_calls") or [],
-                        "name": msg.get("name") or "",
-                        "tool_call_id": msg.get("tool_call_id") or "",
-                    })
+            msgs = self._load_session_messages(session_name)
 
             self._recalc_token_usage(session_name)
             result = {
@@ -824,10 +971,18 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
-    def send_user_message(self, text: str, session_name: Optional[str] = None) -> Dict[str, Any]:
+    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None) -> Dict[str, Any]:
         try:
-            if not str(text or "").strip():
+            clean_text = str(text or "").strip()
+            attach_list = [str(p) for p in (attachments or []) if str(p).strip()]
+            if not clean_text and not attach_list:
                 return {"ok": False, "msg": "消息内容不能为空"}
+            # 附件以 @路径 形式拼回文本，复用 input_parser 的既有解析/挂载逻辑；
+            # 展示给用户的气泡保持干净文本（display_text），不含 @路径
+            full_text = clean_text
+            if attach_list:
+                joined = " ".join("@" + p for p in attach_list)
+                full_text = f"{clean_text} {joined}" if clean_text else joined
             target_session = session_name or self._current_session
             with self._turn_start_lock:
                 if self._active_turn_thread and self._active_turn_thread.is_alive():
@@ -841,7 +996,8 @@ class ApiBridge:
                 self._cancel_event = threading.Event()
                 self._active_turn_thread = threading.Thread(
                     target=self._run_turn_worker,
-                    args=(text, target_session),
+                    args=(full_text, target_session),
+                    kwargs={"display_text": clean_text} if attach_list else {},
                     daemon=True,
                     name="gui-turn-worker",
                 )
@@ -858,7 +1014,7 @@ class ApiBridge:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = ""):
+    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = ""):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
 
         internal_kind 非空表示这是系统自动发起的内部回合（如后台任务汇总），
@@ -880,6 +1036,8 @@ class ApiBridge:
 
         self._task_status = "executing"
         turn_start_data = {"user_text": user_text, "session_name": session_name}
+        if display_text and display_text != user_text:
+            turn_start_data["display_text"] = display_text
         if internal_kind:
             turn_start_data["internal"] = internal_kind
             turn_start_data["display_text"] = _BG_SUMMARY_DISPLAY_TEXT
@@ -1302,8 +1460,83 @@ class ApiBridge:
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 插件（与 CLI 共用 core.plugin_loader 的扫描与开关持久化，天然同步）
+    # ------------------------------------------------------------------
+    def get_plugins(self) -> List[Dict[str, Any]]:
+        try:
+            from core.plugin_loader import get_plugin_infos
+            result = []
+            for info in get_plugin_infos():
+                status = str(info.get("status") or "")
+                # 当前进程内实际生效状态：loaded/pending_disable 视为启用中
+                enabled = status in ("loaded", "pending_disable")
+                result.append({
+                    "name": str(info.get("name") or ""),
+                    "version": str(info.get("version") or ""),
+                    "description": str(info.get("description") or ""),
+                    "source": str(info.get("source") or "builtin"),
+                    "status": status,
+                    "enabled": enabled,
+                    "tools": list(info.get("tools") or []),
+                    "error": str(info.get("error") or ""),
+                })
+            return result
+        except Exception:
+            logger.exception("get_plugins 失败")
+            return []
+
+    def toggle_plugin(self, name: str, enabled: bool) -> Dict[str, Any]:
+        try:
+            from core.plugin_loader import toggle_plugin as _toggle
+            ok, msg = _toggle(name, enabled)
+            return {"ok": ok, "msg": msg, "plugins": self.get_plugins()}
+        except Exception as e:
+            logger.exception("toggle_plugin 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
     # MCP
     # ------------------------------------------------------------------
+    _MCP_EXAMPLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp.example.json")
+
+    @staticmethod
+    def _is_placeholder(val: Any) -> bool:
+        """判断配置值是否为示例占位符（如 your-xxx-key / cli_your_app_id）。"""
+        return isinstance(val, str) and bool(re.search(r"your", val, re.I))
+
+    def _load_mcp_presets(self) -> Dict[str, Dict[str, Any]]:
+        """读取 mcp.example.json 中的预置服务模板，并解析出需要用户填写的密钥项。
+
+        必填项来源：env 中值为占位符的键（key=环境变量名），
+        以及 args 中整段为占位符的参数（key=占位符原文，如 cli_your_app_id）。
+        """
+        presets: Dict[str, Dict[str, Any]] = {}
+        try:
+            with open(self._MCP_EXAMPLE_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            return presets
+        for name, cfg in (data.get("mcpServers") or {}).items():
+            if not isinstance(cfg, dict):
+                continue
+            required: List[str] = []
+            env = cfg.get("env") or {}
+            if isinstance(env, dict):
+                for k, v in env.items():
+                    if self._is_placeholder(v):
+                        required.append(str(k))
+            for a in cfg.get("args") or []:
+                if self._is_placeholder(a) and str(a) not in required:
+                    required.append(str(a))
+            presets[str(name)] = {
+                "command": str(cfg.get("command") or ""),
+                "args": list(cfg.get("args") or []),
+                "env": dict(env) if isinstance(env, dict) else {},
+                "comment": str(cfg.get("comment") or ""),
+                "required_inputs": required,
+            }
+        return presets
+
     def _mcp_tool_counts(self) -> Dict[str, int]:
         """按 "{server}__{tool}" 前缀统计每个 server 已就绪的工具数。"""
         counts: Dict[str, int] = {}
@@ -1332,8 +1565,10 @@ class ApiBridge:
             return []
         counts = self._mcp_tool_counts()
         result = []
+        configured_names = set()
         for item in raw:
             name = str(item.get("name", ""))
+            configured_names.add(name)
             enabled = bool(item.get("enabled", True))
             if enabled_override and name in enabled_override:
                 enabled = enabled_override[name]
@@ -1342,6 +1577,22 @@ class ApiBridge:
                 "enabled": enabled,
                 "connected": bool(item.get("connected", False)),
                 "tools_count": int(counts.get(name, 0)),
+                "configured": True,
+                "required_inputs": [],
+                "comment": "",
+            })
+        # 追加 mcp.example.json 中尚未配置的预置服务，显示为“预置 · 未配置”
+        for pname, preset in self._load_mcp_presets().items():
+            if pname in configured_names:
+                continue
+            result.append({
+                "name": pname,
+                "enabled": False,
+                "connected": False,
+                "tools_count": 0,
+                "configured": False,
+                "required_inputs": list(preset.get("required_inputs") or []),
+                "comment": str(preset.get("comment") or ""),
             })
         return result
 
@@ -1374,6 +1625,60 @@ class ApiBridge:
             }
         except Exception as e:
             logger.exception("toggle_mcp_server 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def enable_mcp_server(self, name: str, env_values: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+        """启用 MCP 服务：已配置的只拨开关；预置服务先把模板（注入用户填写的密钥）
+        写入 ~/.ycode/mcp.json 再启用，重连在后台线程完成。
+        已输入过的密钥持久化在 mcp.json 中，之后开关不再要求输入。"""
+        if self._mcp is None:
+            return {"ok": False, "msg": "MCP 管理器不可用（依赖未安装）"}
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "msg": "服务名不能为空"}
+        try:
+            self._mcp._load_config()
+            configured = self._mcp.config.get("mcpServers", {}) or {}
+        except Exception:
+            configured = {}
+
+        if name in configured:
+            # 已配置过（密钥已持久化），直接拨开关即可
+            return self.toggle_mcp_server(name, True)
+
+        preset = self._load_mcp_presets().get(name)
+        if not preset:
+            return {"ok": False, "msg": f"未找到预置服务: {name}"}
+
+        values = {str(k): str(v) for k, v in (env_values or {}).items()}
+        # 校验必填项：env 键名 或 args 占位符原文，二者任一命中即可
+        missing = [k for k in preset["required_inputs"] if not values.get(k, "").strip()]
+        if missing:
+            return {"ok": False, "msg": "缺少必填密钥: " + ", ".join(missing), "required_inputs": preset["required_inputs"]}
+
+        # 组装真实配置：env 占位符按键名替换，args 整段占位符按原文替换
+        env = {}
+        for k, v in preset["env"].items():
+            env[k] = values[k] if self._is_placeholder(v) else v
+        args = [values[a] if self._is_placeholder(a) else a for a in preset["args"]]
+
+        def _job():
+            try:
+                ok, msg = self._mcp.add_server(name, preset["command"], args, env=env, enabled=True)
+            except Exception as e:
+                ok, msg = False, str(e)
+            time.sleep(1.5)
+            self.emit_event("mcp_status", {"mcps": self._build_mcp_list(), "ok": ok, "msg": msg})
+
+        try:
+            threading.Thread(target=_job, daemon=True, name="gui-mcp-enable").start()
+            return {
+                "ok": True,
+                "msg": f"正在启用 {name}，连接完成后会自动刷新状态",
+                "mcps": self._build_mcp_list(enabled_override={name: True}),
+            }
+        except Exception as e:
+            logger.exception("enable_mcp_server 失败")
             return {"ok": False, "msg": str(e)}
 
     def reconnect_mcp(self) -> Dict[str, Any]:
@@ -1506,6 +1811,67 @@ class ApiBridge:
         except Exception as e:
             logger.exception("pick_files 失败")
             return {"ok": False, "msg": str(e)}
+
+    def save_clipboard_image(self, data_url: str) -> Dict[str, Any]:
+        """把前端粘贴的剪贴板图片（dataURL）落盘为临时文件，返回路径供作为附件发送。"""
+        try:
+            import base64
+            import tempfile
+            import time
+
+            MIME_EXT = {
+                "image/png": ".png",
+                "image/jpeg": ".jpg",
+                "image/gif": ".gif",
+                "image/webp": ".webp",
+            }
+            header, sep, b64 = str(data_url or "").partition(",")
+            if not sep or not header.startswith("data:"):
+                return {"ok": False, "msg": "无效的图片数据"}
+            mime = header[5:].split(";")[0].strip().lower()
+            if mime not in ("image/png", "image/jpeg", "image/gif", "image/webp"):
+                return {"ok": False, "msg": f"不支持的图片类型: {mime or '未知'}"}
+            # base64 体积 ≈ 原始 4/3 倍；限制 8MB 原始大小，超出让发送端压缩逻辑处理
+            if len(b64) > 8 * 1024 * 1024 * 4 // 3 + 1024:
+                return {"ok": False, "msg": "图片超过 8MB，无法粘贴"}
+            raw = base64.b64decode(b64)
+            paste_dir = os.path.join(tempfile.gettempdir(), "ycode_paste")
+            os.makedirs(paste_dir, exist_ok=True)
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            ms = int(time.time() * 1000) % 1000
+            path = os.path.join(paste_dir, f"paste_{ts}_{ms:03d}{MIME_EXT[mime]}")
+            with open(path, "wb") as f:
+                f.write(raw)
+            return {"ok": True, "path": path}
+        except Exception as e:
+            logger.exception("save_clipboard_image 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_files_info(self, paths: List[str]) -> List[Dict[str, Any]]:
+        """批量返回附件的名称 / 扩展名 / 大小，供前端附件卡片展示。"""
+        infos: List[Dict[str, Any]] = []
+        for p in paths or []:
+            raw = str(p)
+            try:
+                real_path = _resolve_real_path(raw)
+                is_file = os.path.isfile(real_path)
+                ext = os.path.splitext(real_path)[1]
+                infos.append({
+                    "path": raw,
+                    "name": os.path.basename(real_path),
+                    "ext": ext[1:].lower() if ext else "",
+                    "size": os.path.getsize(real_path) if is_file else None,
+                    "ok": is_file,
+                })
+            except Exception:
+                infos.append({
+                    "path": raw,
+                    "name": os.path.basename(raw),
+                    "ext": "",
+                    "size": None,
+                    "ok": False,
+                })
+        return infos
 
     # ------------------------------------------------------------------
     # 后台任务

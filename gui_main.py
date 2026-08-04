@@ -73,7 +73,7 @@ def main():
 
     # 启动 PyWebView 原生桌面窗口
     window = webview.create_window(
-        title="Y-CODE · 星瑶 GUI 编码助手 (Vue 3)",
+        title="Y-CODE · 星瑶",
         url=url,
         js_api=api,
         width=1320,
@@ -81,7 +81,7 @@ def main():
         min_size=(960, 640),
         text_select=True,
         confirm_close=False,
-        background_color="#0f1114"
+        background_color="#1a1a18"
     )
 
     api.set_window(window)

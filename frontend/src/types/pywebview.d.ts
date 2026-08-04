@@ -30,6 +30,20 @@ export interface McpInfo {
   enabled: boolean;
   connected: boolean;
   tools_count: number;
+  configured?: boolean;        // false = 预置模板，尚未写入 mcp.json
+  required_inputs?: string[];  // 启用前需要用户填写的密钥项
+  comment?: string;
+}
+
+export interface PluginInfo {
+  name: string;
+  version: string;
+  description: string;
+  source: string;      // user | builtin
+  status: string;      // loaded | disabled | failed | overridden | pending_enable | pending_disable
+  enabled: boolean;
+  tools: string[];
+  error?: string;
 }
 
 export interface SessionInfo {
@@ -38,6 +52,7 @@ export interface SessionInfo {
   count: number;
   workdir: string;
   is_global?: boolean;
+  updated_at?: string;
 }
 
 export interface SessionGroup {
@@ -120,14 +135,17 @@ export interface PyWebViewAPI {
   set_permission_mode(mode: PermissionMode): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
 
-  send_user_message(text: string, sessionName?: string): Promise<any>;
+  send_user_message(text: string, sessionName?: string, attachments?: string[]): Promise<any>;
   stop_current_turn(): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;
 
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
+  get_plugins(): Promise<any>;
+  toggle_plugin(name: string, enabled: boolean): Promise<any>;
   get_mcp_servers(): Promise<McpInfo[]>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
+  enable_mcp_server(name: string, envValues?: Record<string, string>): Promise<any>;
   reconnect_mcp(): Promise<any>;
 
   export_session(fmt: 'md' | 'html' | 'json'): Promise<any>;
@@ -137,6 +155,9 @@ export interface PyWebViewAPI {
   read_file_preview(path: string): Promise<any>;
   open_path(path: string): Promise<any>;
   pick_files(): Promise<any>;
+  get_files_info(paths: string[]): Promise<any>;
+  save_clipboard_image(dataUrl: string): Promise<any>;
+  set_titlebar_theme(dark: boolean): Promise<any>;
 
   get_background_tasks(): Promise<BackgroundTask[]>;
   kill_task(taskId: string): Promise<any>;

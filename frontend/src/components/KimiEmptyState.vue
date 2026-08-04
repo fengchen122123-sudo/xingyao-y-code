@@ -9,10 +9,12 @@
     </div>
 
     <div class="kimi-card">
+      <AttachmentChips :items="attachments" @remove="removeAttachment" />
       <textarea 
         v-model="inputVal" 
         placeholder="尽管问，或做个任务..." 
         @keydown.enter.exact.prevent="handleSend"
+        @paste="handlePaste"
       ></textarea>
 
       <div class="kimi-card-bar">
@@ -42,7 +44,7 @@
 
           <button
             class="kimi-send-btn"
-            :class="{ active: inputVal.trim() && !store.running }"
+            :class="{ active: (inputVal.trim() || attachments.length) && !store.running }"
             :disabled="store.running"
             title="发送消息 (Enter)"
             @click="handleSend"
@@ -76,6 +78,8 @@ import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
+import AttachmentChips from './AttachmentChips.vue';
+import { useAttachments } from '../composables/useAttachments';
 
 const store = useAppStore();
 const inputVal = ref('');
@@ -96,18 +100,19 @@ function togglePermDropdown() {
   showPermDropdown.value = !showPermDropdown.value;
 }
 
+const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste } = useAttachments();
+
 async function handlePickFiles() {
-  const paths = await store.pickFiles();
-  if (paths.length) {
-    inputVal.value += paths.map(p => ` @${p}`).join('');
-  }
+  await pickAttachments();
 }
 
 function handleSend() {
   if (store.running) return;
-  if (!inputVal.value.trim()) return;
   const text = inputVal.value;
+  const paths = attachments.value.map(a => a.path);
+  if (!text.trim() && !paths.length) return;
   inputVal.value = '';
-  store.sendMessage(text);
+  clearAttachments();
+  store.sendMessage(text, paths);
 }
 </script>

@@ -90,13 +90,20 @@
 
         <!-- Markdown 文本内容 -->
         <div v-if="msg.content && msg.content.trim()" class="md-body" v-html="renderMarkdown(msg.content)"></div>
+
+        <!-- 等待模型响应期间的动态反馈（对齐 CLI 的“星瑶正在干活”） -->
+        <div v-if="showWorking" class="working-line">
+          <span class="spin"></span>
+          <span class="wl-text">星瑶正在干活<span class="wl-dots"><i>.</i><i>.</i><i>.</i></span></span>
+          <span v-if="elapsed >= 3" class="wl-elapsed">已等待 {{ elapsed }}s</span>
+        </div>
       </div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, watch, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdown } from '../utils/markdown';
 
@@ -104,7 +111,38 @@ const props = defineProps<{
   msg: ChatMessage;
 }>();
 
+// 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
+// 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。
 const store = useAppStore();
+const showWorking = computed(() => {
+  if (props.msg.role !== 'assistant' || !store.running) return false;
+  const msgs = store.messages;
+  if (!msgs.length || msgs[msgs.length - 1] !== props.msg) return false;
+  const m = props.msg;
+  if (m.content && m.content.trim()) return false;
+  if (m.reasoning_content && m.reasoning_content.trim()) return false;
+  if (m.tool_calls && m.tool_calls.length) return false;
+  return true;
+});
+
+// 等待时长计时：等待超过 3 秒后显示秒数，让用户明确知道仍在处理而不是卡死
+const elapsed = ref(0);
+let elapsedTimer: number | undefined;
+watch(showWorking, (v) => {
+  if (v) {
+    const start = Date.now();
+    elapsed.value = 0;
+    elapsedTimer = window.setInterval(() => {
+      elapsed.value = Math.floor((Date.now() - start) / 1000);
+    }, 1000);
+  } else if (elapsedTimer) {
+    window.clearInterval(elapsedTimer);
+    elapsedTimer = undefined;
+  }
+}, { immediate: true });
+onUnmounted(() => {
+  if (elapsedTimer) window.clearInterval(elapsedTimer);
+});
 
 // 思考块默认跟随全局 store.showThinking；用户在本条消息上手动切换过一次后，
 // 该条消息就"钉住"为用户选择的状态，不再随全局按钮变化。
@@ -290,7 +328,7 @@ function diffLineClass(line: string) {
   padding: 8px 12px;
   margin: 8px 0;
   font-size: 12.5px;
-  color: #b8a5d6;
+  color: var(--purple);
 }
 .tk-head {
   display: flex;
@@ -375,6 +413,35 @@ function diffLineClass(line: string) {
 }
 @keyframes spin {
   to { transform: rotate(360deg); }
+}
+
+/* 等待响应期间的动态反馈行 */
+.working-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.working-line .spin {
+  border-color: var(--accent);
+  border-top-color: transparent;
+}
+.wl-dots i {
+  display: inline-block;
+  font-style: normal;
+  animation: wl-bounce 1.2s ease-in-out infinite;
+}
+.wl-dots i:nth-child(2) { animation-delay: 0.2s; }
+.wl-dots i:nth-child(3) { animation-delay: 0.4s; }
+@keyframes wl-bounce {
+  0%, 60%, 100% { transform: translateY(0); opacity: 0.5; }
+  30% { transform: translateY(-3px); opacity: 1; }
+}
+.wl-elapsed {
+  color: var(--text-faint);
+  font-size: 11.5px;
 }
 
 .tool-body {

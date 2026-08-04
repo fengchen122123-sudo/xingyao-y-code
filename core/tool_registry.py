@@ -30,6 +30,10 @@ class ToolRegistry:
             raise ValueError(f"duplicate tool: {spec.name}")
         self._specs[spec.name] = spec
 
+    def unregister(self, name: str) -> None:
+        """卸载指定工具（插件热切换用）；工具不存在时抛 KeyError。"""
+        del self._specs[name]
+
     def get(self, name: str) -> ToolSpec:
         try:
             return self._specs[name]
