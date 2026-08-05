@@ -89,6 +89,7 @@ def is_pid_running(pid):
                 out = subprocess.run(
                     ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
                     capture_output=True, text=True, timeout=5,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 for line in out.stdout.splitlines():
                     if not line.strip():
@@ -238,7 +239,7 @@ def start_background_task(command: str) -> str:
                 stdout=log_file,
                 stderr=log_file,
                 env=env,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else 0
             )
         except Exception:
             # Popen 失败时关闭日志句柄，避免文件句柄泄露
@@ -497,6 +498,7 @@ def kill_background_task(task_id: str) -> bool:
                 result = subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(pid)],
                     capture_output=True, timeout=15,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
                 killed = result.returncode == 0 or not is_pid_running(pid)
             else:

@@ -28,6 +28,7 @@ def _run_git(args, cwd=None):
             capture_output=True, text=True,
             encoding='utf-8', errors='replace',
             timeout=30,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
         )
         return result.returncode, result.stdout.strip(), result.stderr.strip()
     except FileNotFoundError:
