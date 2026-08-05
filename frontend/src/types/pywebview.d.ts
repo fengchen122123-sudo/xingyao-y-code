@@ -158,6 +158,7 @@ export interface PyWebViewAPI {
   get_files_info(paths: string[]): Promise<any>;
   save_clipboard_image(dataUrl: string): Promise<any>;
   set_titlebar_theme(dark: boolean): Promise<any>;
+  set_gui_theme(theme_light: boolean): Promise<any>;
 
   get_background_tasks(): Promise<BackgroundTask[]>;
   kill_task(taskId: string): Promise<any>;
