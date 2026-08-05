@@ -70,6 +70,54 @@ def test_tool_finish_payload_has_duration_result_and_display():
     assert payload["result"] == "one\ntwo"
 
 
+def test_repaired_arguments_are_shared_by_event_payload_and_executor(mocker):
+    import core.llm as llm
+
+    tc = {
+        "id": "command-repaired",
+        "function": {
+            "name": "execute_command",
+            "arguments": '{"command":"echo first\necho second"}',
+        },
+    }
+    captured = {}
+
+    class FakeToolResult:
+        def to_message_content(self):
+            return "done"
+
+    def fake_execute(name, **arguments):
+        captured["name"] = name
+        captured["arguments"] = arguments
+        return FakeToolResult()
+
+    mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
+    mocker.patch.object(llm.tool_registry, "execute", side_effect=fake_execute)
+
+    payload = llm._tool_event_payload(tc)
+    llm._execute_single_tool_call(tc, event_callback=lambda *_args: None)
+
+    assert payload["arguments"]["command"] == "echo first\necho second"
+    assert payload["display"]["command"] == "echo first echo second"
+    assert captured == {
+        "name": "execute_command",
+        "arguments": {"command": "echo first\necho second"},
+    }
+
+
+def test_tool_event_payload_rejects_unparseable_arguments():
+    malformed_arguments = '{"items": [{"id": "a", "stage": "" Received Messages=[]'
+
+    with pytest.raises(ValueError, match="工具参数 JSON 解析失败"):
+        _tool_event_payload({
+            "id": "bad-event-arguments",
+            "function": {
+                "name": "plan_write",
+                "arguments": malformed_arguments,
+            },
+        })
+
+
 def test_parallel_tool_finished_events_keep_each_call_duration(mocker):
     first_response = iter([_chunk(tool_calls=[
         _tool_call(0, "call-slow", "glob_files", '{"pattern":"*.py"}'),
