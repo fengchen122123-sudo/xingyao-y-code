@@ -198,8 +198,8 @@ export const useAppStore = defineStore('app', {
       this.themeLight = !this.themeLight;
       // body.light 是唯一的浅色主题开关机制（对应 style.css 中的 body.light 选择器）
       document.body.classList.toggle('light', this.themeLight);
-      // 同步 Windows 窗口标题栏明暗，避免深色内容配白色标题栏刺眼
-      this._api()?.set_titlebar_theme(!this.themeLight)?.catch(() => {});
+      // 持久化主题到后端 config.json（关闭重开不变），并同步 Windows 窗口标题栏明暗
+      this._api()?.set_gui_theme(this.themeLight)?.catch(() => {});
     },
 
     toggleShowThinking() {
@@ -295,6 +295,10 @@ export const useAppStore = defineStore('app', {
             break;
           }
         }
+        // 恢复持久化的界面主题（默认深色）：body 类与标题栏一并同步
+        this.themeLight = !!(init as any).theme_light;
+        document.body.classList.toggle('light', this.themeLight);
+        api.set_titlebar_theme(!this.themeLight)?.catch(() => {});
         this.fileTree = (init as any).file_tree || [];
         this.tokenUsage = init.token_usage || { used: 0, window: 0, cached_pct: 0, cumulative: 0 };
         this.version = init.version || '';
