@@ -6,11 +6,8 @@ import re
 from typing import Any, Iterable
 
 from core.thinking_stream import ThinkingStreamBuffer
+from core.tool_progress import ActiveToolStatus, ToolProgressAggregator
 from core.ui_markers import (
-    ANSI_CYAN,
-    ANSI_GRAY,
-    ANSI_GREEN,
-    ANSI_RED,
     ANSI_RESET,
     ANSI_YELLOW,
     plan_color,
@@ -94,21 +91,11 @@ class TurnRenderer:
         self._records: list[str] = []
         self._pending_text = ""
         self._in_thinking = False
-        self._tool_lines: dict[str, tuple[str, str]] = {}
         self._errors: set[str] = set()
         self._emitted: list[str] = []
         self._finished = False
-        self._completed_tool_count = 0
-        # 简短模式：只显示"星瑶正在干活"汇总行 + 收尾统计行，
-        # 不逐条打印每个工具调用细节。数据库记录不受此影响，event 仍带完整 summary 入库。
-        self._completed_tools: list[tuple[str, str]] = []
-        self._failed_tool_count = 0
-        # "星瑶正在干活…"汇总行是否已打印过（每回合只打印一次）
-        self._concise_header_emitted = False
-        # 工具区与上文之间的分段空行是否已输出（每回合首个工具行前补一次）
-        self._section_gap_emitted = False
-        # 简短模式的收尾统计行是否已经生成过（避免重复调用 concise_recap 时重复输出）
-        self._recap_emitted = False
+        self._tool_progress = ToolProgressAggregator()
+        self._saw_tool_event = False
         self._has_meaningful_assistant_text = False
         self._thinking_stream = ThinkingStreamBuffer()
         self._assistant_text_parts: list[str] = []
@@ -129,23 +116,31 @@ class TurnRenderer:
                 pass
         elif kind == "thinking_finished":
             self._flush_thinking()
+        elif kind == "thinking_started":
+            self._append_tool_lines(self._tool_progress.flush())
         elif kind == "assistant_delta":
+            self._append_tool_lines(self._tool_progress.flush())
             self._consume_text(str(data.get("text", "")))
-        elif kind == "tool_requested":
-            self._tool_requested(data)
+        elif kind in {"tool_started", "tool_requested"}:
+            self._saw_tool_event = True
+            self._tool_progress.start(data)
         elif kind == "tool_finished":
-            self._tool_finished(data)
+            self._saw_tool_event = True
+            self._append_tool_lines(self._tool_progress.finish(data))
         elif kind == "error":
             self._error(str(data.get("message", "Unknown error")))
         elif kind == "diff_ready":
+            self._saw_tool_event = True
             diff = str(data.get("text") or data.get("diff") or "")
             if diff:
-                file_path = str(data.get("file_path") or "").strip()
                 added, removed = _count_diff_changes(diff)
-                self._append_line(
-                    f"✎ {ANSI_CYAN}{file_path}{ANSI_RESET}"
-                    f"（{ANSI_GREEN}+{added}{ANSI_RESET} 行 / "
-                    f"{ANSI_RED}-{removed}{ANSI_RESET} 行）"
+                self._append_tool_lines(
+                    self._tool_progress.record_diff(
+                        str(data.get("tool_call_id") or data.get("id") or ""),
+                        str(data.get("file_path") or "").strip(),
+                        added,
+                        removed,
+                    )
                 )
         elif kind == "plan_updated":
             if data.get("live_only"):
@@ -159,6 +154,18 @@ class TurnRenderer:
                     self._append_line(f"  {color}{mark}{ANSI_RESET} {subject}")
 
         return list(self._emitted)
+
+    def active_tool_status(self) -> ActiveToolStatus | None:
+        return self._tool_progress.active_status()
+
+    def flush_tool_progress(self) -> list[str]:
+        self._emitted = []
+        self._append_tool_lines(self._tool_progress.flush())
+        return list(self._emitted)
+
+    def _append_tool_lines(self, lines: list[str]) -> None:
+        for line in lines:
+            self._append_line(line)
 
     def _consume_text(self, chunk: str) -> None:
         self._pending_text += chunk
@@ -264,15 +271,6 @@ class TurnRenderer:
         self._records.append(line)
         self._emitted.append(line)
 
-    def _append_section_gap(self) -> None:
-        """首个工具行输出前补一个空行，把工具区与上文（思考摘要/正文）分开。"""
-        if self._section_gap_emitted:
-            return
-        self._section_gap_emitted = True
-        self._finish_current_line()
-        self._records.append("\n")
-        self._emitted.append("\n")
-
     def _finish_current_line(self) -> None:
         if self._records and not self._records[-1].endswith("\n"):
             self._records.append("\n")
@@ -283,88 +281,11 @@ class TurnRenderer:
         for _ in self._thinking_stream.finish():
             pass
 
-    def _tool_label(self, data: dict[str, Any]) -> str:
-        summary = str(data.get("summary") or "").strip()
-        if summary:
-            return summary
-        name = str(data.get("name") or "工具")
-        preview = str(data.get("preview") or "").strip()
-        return f"{name}({preview})" if preview else name
-
-
-    def _tool_requested(self, data: dict[str, Any]) -> None:
-        tool_id = str(data.get("id") or self._tool_label(data))
-        label = self._tool_label(data)
-        self._tool_lines[tool_id] = (label, "")
-        # 仅首次工具调用时打印一行"星瑶正在干活"汇总（每回合一次）。
-        # 进行中的状态由 main.py 底部的活动指示行实时展示，这里不重复打印。
-        if not self._concise_header_emitted:
-            self._concise_header_emitted = True
-            self._append_section_gap()
-            self._append_line(f"{ANSI_GREEN}●{ANSI_RESET} 星瑶正在干活…")
-
-    def _tool_finished(self, data: dict[str, Any]) -> None:
-        tool_id = str(data.get("id") or self._tool_label(data))
-        requested_label = self._tool_lines.get(tool_id, ("", ""))[0]
-        label = self._tool_label(data) if data.get("summary") else requested_label
-        if not label:
-            label = self._tool_label(data)
-        ok = bool(data.get("ok", True))
-        self._completed_tool_count += 1
-        self._completed_tools.append((str(data.get("name", "tool")), label))
-        if not ok:
-            self._failed_tool_count += 1
-        # 所有工具调用（无论成功失败）都保持静默，不逐条刷屏；
-        # 失败数量由回合收尾的 concise_recap 统计行汇总展示。
-        # 例外：读取 SKILL.md 表示模型正在加载技能，明确提示用户技能被使用
-        self._maybe_emit_skill_usage(data)
-
     def _error(self, message: str) -> None:
         if not message or message in self._errors:
             return
         self._errors.add(message)
         self._append_line(f"{ANSI_YELLOW}  ! 星瑶暂未完成当前步骤{ANSI_RESET}")
-
-    def _maybe_emit_skill_usage(self, data: dict[str, Any]) -> None:
-        """简短模式下，若本次工具调用是读取 SKILL.md，提示用户模型使用了哪个技能。
-
-        技能的使用方式是模型 read_file 读取对应的 SKILL.md，简短模式下该读取
-        默认静默，导致用户无法感知模型启用了哪些技能。这里识别 SKILL.md 读取
-        并打印一行明确提示，其余工具调用仍保持静默。
-        """
-        name = str(data.get("name", ""))
-        if name != "read_file":
-            return
-        arguments = data.get("arguments") or {}
-        file_path = str(arguments.get("file_path") or data.get("preview") or "")
-        if not file_path:
-            return
-        import os
-        base = os.path.basename(file_path.rstrip("/\\"))
-        if base.lower() != "skill.md":
-            return
-        # skill 名称取 SKILL.md 所在目录的 basename（即技能短 ID）
-        skill_dir = os.path.dirname(file_path.rstrip("/\\"))
-        skill_name = os.path.basename(skill_dir) or file_path
-        self._append_section_gap()
-        self._append_line(
-            f"{ANSI_CYAN}✦ 使用技能：{skill_name}{ANSI_RESET}"
-        )
-
-    def concise_recap(self) -> str:
-        """回合收尾统计行：共执行 N 项操作。
-
-        失败信息完全静默（不显示失败计数），用户可切到详细模式查看详情。
-        本回合未执行任何工具、或本实例已经生成过收尾行时返回空串。
-        由 main.py 在 turn_finished/turn_cancelled/turn_error 时调用一次，直接
-        经 _print_ui_fragment 打印——不走 Markdown 渲染缓冲区，避免其中的
-        ANSI 颜色码被当成 Markdown 源文本处理导致显示异常。
-        """
-        if not self._completed_tools or self._recap_emitted:
-            return ""
-        self._recap_emitted = True
-        total = len(self._completed_tools)
-        return f"{ANSI_GRAY}● 共执行 {total} 项操作{ANSI_RESET}\n"
 
     def finish(self) -> str:
         if not self._finished:
@@ -391,21 +312,14 @@ class TurnRenderer:
         return "".join(self._assistant_text_parts)
 
     def _flush_pending(self) -> None:
+        self._append_tool_lines(self._tool_progress.flush())
         self._flush_thinking()
         if not self._in_thinking and self._pending_text:
             self._append_text(self._pending_text)
         self._pending_text = ""
         if self._has_meaningful_assistant_text:
             return
-        if self._completed_tool_count:
-            read_count = sum(name == "read_file" for name, _ in self._completed_tools)
-            if read_count:
-                summary = f"检查完成：已读取 {read_count} 个文件。模型未返回最终结论。"
-            else:
-                summary = f"检查完成：已执行 {self._completed_tool_count} 项工具操作。模型未返回最终结论。"
-            self._append_line(f"  {summary}")
-        else:
-            # 回合结束但既无文字输出也未执行任何工具（如只思考未产出），
-            # 给用户一个明确的兜底提示，避免看起来"什么都没发生"
-            self._append_line("  星瑶本轮暂未返回内容。")
-
+        if self._saw_tool_event:
+            return
+        self._append_line("  \u661f\u7476\u672c\u8f6e\u6682\u672a\u8fd4\u56de\u5185\u5bb9\u3002")
+        return
