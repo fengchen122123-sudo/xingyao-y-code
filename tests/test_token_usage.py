@@ -158,3 +158,23 @@ def test_pad_left_and_right_by_display_width():
     assert main._pad_right("k3-256k", 12) == "k3-256k     "
     # 超出目标宽度时不截断、不加空格
     assert main._pad_left("123456789012345", 14) == "123456789012345"
+
+
+def test_query_cache_invalidation_events():
+    manager = MemoryManager(":memory:")
+    today = _ts_of("2026-08-05")
+    # 大输入低命中 -> 失效事件
+    manager.add_token_usage("openai", "m1", 50000, 100, 3000, 50100, ts=today)
+    manager.add_token_usage("openai", "m1", 80000, 100, 0, 80000, ts=today)
+    # 大输入高命中 -> 不算
+    manager.add_token_usage("openai", "m1", 60000, 100, 59000, 60100, ts=today)
+    # 小输入低命中 -> 不算（低于 min_prompt_tokens 阈值）
+    manager.add_token_usage("openai", "m1", 5000, 100, 0, 5100, ts=today)
+
+    inv = manager.query_cache_invalidation_events("2026-08-05", "2026-08-05")
+    assert inv["count"] == 2
+    assert inv["lost_tokens"] == (50000 - 3000) + (80000 - 0)
+
+    # 区间外无事件
+    inv2 = manager.query_cache_invalidation_events("2026-09-01", "2026-09-30")
+    assert inv2 == {"count": 0, "lost_tokens": 0}

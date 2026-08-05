@@ -2454,13 +2454,35 @@ _TOOL_RESULT_LIMITS = {
     "search_news": 8000,
 }
 _TOOL_RESULT_TAIL_TOOLS = {"execute_command"}
-# read_file 自带行数/字节上限，且编辑流程依赖完整内容，不做二次截断
+# read_file 自带行数/字节上限，且编辑流程依赖完整内容，默认不做二次截断。
+# 但大文件全文读入是前缀缓存条目膨胀的最大来源（单个结果可达数万 token），
+# 在按容量驱逐的网关上更容易被挤掉、失效后的重建成本也更高。可在 config.json
+# 顶层设 "read_file_result_max_chars": 24000 启用截断（保头尾），中间锚点丢失
+# 可能影响 edit 流程，故默认保持不限。
 _TOOL_RESULT_EXEMPT = {"read_file"}
+
+
+def _read_file_result_limit():
+    """read_file 结果入上下文的字符上限；0/缺省 = 不限。配置读取失败时静默不限。"""
+    try:
+        from core.model_manager import load_config
+        return int(load_config().get("read_file_result_max_chars", 0) or 0)
+    except Exception:
+        return 0
 
 
 def _truncate_tool_result_for_context(function_name, text):
     if function_name in _TOOL_RESULT_EXEMPT:
-        return text
+        limit = _read_file_result_limit() if function_name == "read_file" else 0
+        if not limit or len(text) <= limit:
+            return text
+        head_len = limit // 2
+        tail = text[-(limit - head_len):]
+        return (
+            f"{text[:head_len]}\n"
+            f"…[文件过长，中间省略 {len(text) - limit} 字符。"
+            f"如需中间内容请按行号范围重新 read_file]…\n{tail}"
+        )
     limit = _TOOL_RESULT_LIMITS.get(function_name, _TOOL_RESULT_MAX_CHARS)
     if len(text) <= limit:
         return text
