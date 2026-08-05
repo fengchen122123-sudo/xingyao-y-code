@@ -1,4 +1,69 @@
-from core.tool_presenter import summarize_tool_finished, summarize_tool_started
+from core.tool_presenter import (
+    build_tool_display,
+    sanitize_tool_display_text,
+    summarize_tool_finished,
+    summarize_tool_started,
+)
+
+
+def test_build_tool_display_returns_read_metadata():
+    display = build_tool_display(
+        "read_file",
+        {"file_path": "core/llm.py"},
+        {"content": "one\ntwo\nthree"},
+        ok=True,
+    )
+
+    assert display == {
+        "category": "read",
+        "action": "读取文件",
+        "target": "core/llm.py",
+        "command": "",
+        "metrics": {"line_count": 3},
+        "error_summary": "",
+        "is_skill": False,
+    }
+
+
+def test_build_tool_display_marks_skill_read_separately():
+    display = build_tool_display(
+        "read_file",
+        {"file_path": r"C:\Users\user\.agents\skills\writing-plans\SKILL.md"},
+        {"content": "skill"},
+        ok=True,
+    )
+
+    assert display["category"] == "skill"
+    assert display["target"] == "writing-plans"
+    assert display["is_skill"] is True
+
+
+def test_display_text_removes_controls_truncates_and_redacts():
+    value = (
+        "\x1b[31mAuthorization: Bearer abc.def.secret\x1b[0m\n"
+        'api_key="sk-1234567890abcdef"'
+    )
+
+    cleaned = sanitize_tool_display_text(value, limit=80)
+
+    assert "abc.def.secret" not in cleaned
+    assert "sk-1234567890abcdef" not in cleaned
+    assert "Authorization: ***" in cleaned
+    assert "api_key=***" in cleaned
+    assert "\x1b" not in cleaned
+
+
+def test_failed_command_keeps_safe_command_and_error_summary():
+    display = build_tool_display(
+        "execute_command",
+        {"command": "pytest -q"},
+        {"content": "🚨 命令执行失败（退出码 1）。\nModuleNotFoundError: pytest"},
+        ok=False,
+    )
+
+    assert display["category"] == "command"
+    assert display["command"] == "pytest -q"
+    assert display["error_summary"] == "命令执行失败（退出码 1）。 ModuleNotFoundError: pytest"
 
 
 def test_read_file_uses_star_yao_copy_without_source_content():
