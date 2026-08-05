@@ -52,6 +52,7 @@ _TOOL_ACTIONS = {
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_COOKIE_HEADER_RE = re.compile(r"(?im)^(\s*(?:set-)?cookie\s*:\s*)[^\r\n]*")
 _NAMED_SECRET_RE = re.compile(
     r'(?i)(["\']?(?:api[_-]?key|authorization|token|password|client[_-]?secret|secret|cookie)["\']?\s*[:=]\s*)'
     r'(Bearer\s+[A-Za-z0-9._~+/=-]+|"[^"]*"|\'[^\']*\'|[^\s,;]+)'
@@ -62,6 +63,7 @@ _OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
 
 def sanitize_tool_display_text(value: object, limit: int = 160) -> str:
     text = _ANSI_RE.sub("", str(value or ""))
+    text = _COOKIE_HEADER_RE.sub(lambda match: f"{match.group(1)}***", text)
     text = _CONTROL_RE.sub("", text.replace("\r", " ").replace("\n", " "))
     text = _NAMED_SECRET_RE.sub(lambda match: f"{match.group(1)}***", text)
     text = _BEARER_RE.sub(lambda match: f"{match.group(1)}***", text)
