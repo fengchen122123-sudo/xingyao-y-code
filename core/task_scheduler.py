@@ -42,6 +42,7 @@ def _stop_process_tree(process: subprocess.Popen) -> None:
                 ["taskkill", "/F", "/T", "/PID", str(process.pid)],
                 capture_output=True,
                 timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
         else:
             process.terminate()
@@ -415,6 +416,8 @@ class TaskScheduler:
                 stderr=subprocess.PIPE,
                 text=False,
                 env=env,
+                # GUI（无控制台）下避免系统为子进程分配新控制台窗口
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
             if item_id:
                 with self._lock:

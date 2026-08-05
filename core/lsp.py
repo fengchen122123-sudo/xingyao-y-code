@@ -139,6 +139,7 @@ def find_definition(symbol, dir_path='.', file_extensions=None):
         result = subprocess.run(
             cmd, capture_output=True, text=True,
             encoding='utf-8', errors='replace', timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
         )
         if result.returncode not in (0, 1):
             return f"🚨 ripgrep 执行失败（退出码 {result.returncode}）"

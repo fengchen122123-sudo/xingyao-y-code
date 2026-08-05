@@ -518,6 +518,8 @@ def execute_command(
             stderr=subprocess.PIPE,
             text=False,
             env=env,
+            # GUI（无控制台）下避免系统为子进程分配新控制台窗口
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
         start_time = time.time()
         stdout_raw = b""
@@ -1099,6 +1101,7 @@ def search_code(query, dir_path="."):
         return subprocess.run(
             cmd, capture_output=True, text=True,
             encoding="utf-8", errors="replace", timeout=SEARCH_CODE_TIMEOUT_SECONDS,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
 
     def _format_rg_output(output):
@@ -3136,7 +3139,8 @@ def glob_files(pattern, dir_path="."):
         for _d in sorted(_get_search_exclude_dirs()):
             cmd += ["--glob", f"!**/{_d}/"]
         cmd.append(str(base))
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15)
+        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
+                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
         if result.returncode in (0, 1):
             output = result.stdout.strip()
             if output:
