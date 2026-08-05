@@ -68,6 +68,7 @@ from core.paste_placeholders import PastedTextStore, normalize_pasted_text
 import core.agent_service as _agent_service
 from core.llm import chat_with_model_events, session_token_usage, token_usage_lock
 from core.permission_broker import PermissionRequest, permission_broker
+from core.tool_progress import ActiveToolStatus
 from core.turn_controller import TurnController
 from core.turn_renderer import TurnRenderer
 from core.ui_markers import ANSI_GRAY, ANSI_RESET, plan_color, plan_html_color, plan_mark
@@ -126,12 +127,11 @@ app_instance = None
 is_thinking = False
 task_status = 'idle'  # 全局运行状态：'idle' (闲置), 'thinking' (思考中), 'executing' (执行中), 'waiting' (等待确认)
 think_start_time = 0
-# 底部活动指示行使用的独立计时起点：思考开始/工具开始都会刷新它，
-# 与 think_start_time（只用于"思考完成 · 用时 X"这一条提示）区分开，
-# 避免工具执行阶段仍然复用上一次思考的起始时间，导致耗时显示越走越离谱。
+# 底部活动指示区使用的独立墙钟计时起点：思考开始/首个工具开始时刷新，
+# 避免工具执行阶段复用上一次思考的起始时间。
 activity_start_time = 0
-# 当前正在执行的工具名（用于状态行动态标签：查看文件/执行命令等），工具结束或回到思考阶段时清空
-_current_tool_name = ""
+# 当前工具活动只保存 renderer 产出的安全展示字段，不读取原始参数或工具结果。
+_active_tool_status: ActiveToolStatus | None = None
 # 思考面板延迟隐藏标志：思考结束后保留面板显示最后一帧内容，直到下一个事件（工具/文字/新思考）到来
 # 避免短思考（如 14ms）面板闪现即消失，让用户能读到思考内容
 _thinking_panel_linger = False
@@ -654,11 +654,11 @@ def _thinking_panel_text() -> str:
 
 
 def _reset_turn_state():
-    global is_thinking, task_status, _current_tool_name, _thinking_panel_linger
+    global is_thinking, task_status, _active_tool_status, _thinking_panel_linger
     _clear_active_thinking()
     is_thinking = False
     task_status = "idle"
-    _current_tool_name = ""
+    _active_tool_status = None
     _thinking_panel_linger = False
     if app_instance is not None:
         app_instance.invalidate()
@@ -770,6 +770,20 @@ def _turn_activity_label(status, current_tool=""):
     return labels.get(status, "")
 
 
+def _format_activity_text(
+    status: str,
+    active_status: ActiveToolStatus | None,
+    elapsed: float,
+    frame: str,
+) -> str:
+    """Format the live activity region from safe renderer-owned display data."""
+    label = active_status.label if active_status is not None else _turn_activity_label(status)
+    line = f"  {frame} {label} · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"
+    if active_status is not None and active_status.detail:
+        line += f"\n    └─ {active_status.detail}"
+    return line
+
+
 def _print_ui_fragment(fragment):
     if fragment:
         def write_fragment():
@@ -879,7 +893,7 @@ def _flush_public_answer(turn_id: str, *, final: bool = False) -> None:
 
 def _render_ui_event(event):
     global is_thinking, task_status, think_start_time, activity_start_time
-    global active_thinking_text, active_thinking_turn_id, _current_tool_name
+    global active_thinking_text, active_thinking_turn_id, _active_tool_status
     global _thinking_panel_linger
     renderer = ui_renderers.get(event.turn_id)
     if renderer is None:
@@ -896,6 +910,8 @@ def _render_ui_event(event):
             task_status = state
             if state != "idle":
                 is_thinking = state in {"thinking", "executing"}
+            else:
+                _active_tool_status = None
         message = str(event.payload.get("message", ""))
         if message:
             print_formatted_text(HTML(f"\n<ansigray>{_esc(message)}</ansigray>"))
@@ -948,18 +964,12 @@ def _render_ui_event(event):
             app_instance.invalidate()
         return
 
-    if event.kind == "tool_started":
+    if event.kind in {"tool_started", "tool_requested"}:
         task_status = "executing"
         is_thinking = True
-        # 记录当前工具名，供状态行动态显示具体活动（查看文件/执行命令等）
-        _current_tool_name = str(event.payload.get("name") or "")
         # 工具开始，清除思考面板延迟显示
         _thinking_panel_linger = False
         active_thinking_text = ""
-        # 刷新底部活动指示行的计时起点，避免沿用上一次思考/工具的耗时
-        activity_start_time = time.time()
-        if app_instance is not None:
-            app_instance.invalidate()
 
     if event.kind == "notice":
         message = str(event.payload.get("message", ""))
@@ -974,8 +984,8 @@ def _render_ui_event(event):
         active_thinking_turn_id = event.turn_id
         task_status = "thinking"
         is_thinking = True
-        # 回到思考阶段，清空工具标签，状态行显示"星瑶正在思考..."
-        _current_tool_name = ""
+        # 回到思考阶段，清空工具活动，状态行显示"星瑶正在思考..."
+        _active_tool_status = None
         # 新思考开始，清除上一段思考的延迟显示
         _thinking_panel_linger = False
         think_start_time = time.time()
@@ -1001,22 +1011,13 @@ def _render_ui_event(event):
         return
 
     if event.kind == "thinking_finished":
-        elapsed = max(0.0, time.time() - think_start_time)
         # 不立即清空 active_thinking_text：保留最后一帧思考内容供面板延迟显示
         # 仅重置 turn_id 标记，让下一个 thinking_started 能识别新一段思考
         active_thinking_turn_id = None
-        # 只有真实产生过思考内容才打印：Kimi 等模型会为工具调用消息回填
-        # " " 占位 reasoning_content，无内容的段直接跳过，避免空刷屏。
-        # 极短思考（< 800ms，常见于模型回填的占位 reasoning）不打印分隔行，
-        # 避免大量"思考完成 · 用时 1ms"刷屏；思考内容仍由面板延迟显示。
-        # 只有较长思考才打印"思考完成 · 用时 X"，作为该段输出正文的分隔线。
-        if active_thinking_text.strip() and elapsed >= 0.8:
-            line = f"思考完成 · 用时 {_format_thinking_elapsed(elapsed)}"
-            _print_ui_fragment(f"\n\x1b[90m{line}\x1b[0m\n")
         task_status = "executing"
         is_thinking = True
-        # 思考结束进入执行阶段，此时还没有具体工具，清空以免显示上一个工具的活动
-        _current_tool_name = ""
+        # 思考结束进入执行阶段，此时还没有具体工具。
+        _active_tool_status = None
         # 启用思考面板延迟隐藏：保留最后一帧思考内容，直到下一个事件到来
         # 这样即使思考只有十几毫秒，用户也能读到思考内容
         _thinking_panel_linger = bool(active_thinking_text)
@@ -1024,7 +1025,20 @@ def _render_ui_event(event):
             app_instance.invalidate()
         return
 
+    # 工具聚合行是已格式化的 ANSI 终端输出，必须在 Markdown 正文之外直出。
+    if event.kind == "assistant_delta":
+        for fragment in renderer.flush_tool_progress():
+            _print_ui_fragment(fragment)
+
+    previous_active_status = _active_tool_status
     fragments = renderer.consume(event.kind, dict(event.payload))
+    if event.kind in {"tool_started", "tool_requested", "tool_finished"}:
+        _active_tool_status = renderer.active_tool_status()
+        # 并行工具增加时不重置 UI 墙钟计时；只在第一项工具开始时刷新。
+        if previous_active_status is None and _active_tool_status is not None:
+            activity_start_time = time.time()
+        if app_instance is not None:
+            app_instance.invalidate()
     if event.kind == "assistant_delta":
         _assistant_stream_buffers[event.turn_id] = (
             _assistant_stream_buffers.get(event.turn_id, "")
@@ -1042,6 +1056,8 @@ def _render_ui_event(event):
             _print_ui_fragment(fragment)
 
     if event.kind == "turn_finished":
+        for fragment in renderer.flush_tool_progress():
+            _print_ui_fragment(fragment)
         # 把渲染器里滞留的尾部正文（保守持留的末尾字符、收尾代码围栏等）
         # 送进公开回答缓冲区一起做 Markdown 渲染。此前传 False 会导致
         # 回答最后几个字符/结尾 ``` 静默丢失。
@@ -1051,50 +1067,47 @@ def _render_ui_event(event):
                 _assistant_stream_buffers.get(event.turn_id, "") + tail
             )
         _flush_public_answer(event.turn_id, final=True)
-        # 简短模式收尾统计行：直接打印 ANSI 片段，不进 Markdown 缓冲区
-        recap = renderer.concise_recap()
-        if recap:
-            _print_ui_fragment(recap)
         # 回合结束后留一个空行，与下一轮的轮次分隔线形成呼吸间距
         print_formatted_text("\n", end="", flush=True)
         ui_renderers.pop(event.turn_id, None)
         _answer_header_printed.pop(event.turn_id, None)
         _clear_active_thinking()
+        _active_tool_status = None
         is_thinking = False
         task_status = "idle"
     elif event.kind == "turn_cancelled":
+        for fragment in renderer.flush_tool_progress():
+            _print_ui_fragment(fragment)
         tail = "".join(renderer.finish_incremental(include_assistant_text=True))
         if tail:
             _assistant_stream_buffers[event.turn_id] = (
                 _assistant_stream_buffers.get(event.turn_id, "") + tail
             )
         _flush_public_answer(event.turn_id, final=True)
-        recap = renderer.concise_recap()
-        if recap:
-            _print_ui_fragment(recap)
         print_formatted_text(HTML("\n<ansiyellow>⏹ 本轮任务已取消。</ansiyellow>\n"))
         ui_renderers.pop(event.turn_id, None)
         _answer_header_printed.pop(event.turn_id, None)
         _clear_active_thinking()
+        _active_tool_status = None
         is_thinking = False
         task_status = "idle"
     elif event.kind == "turn_error":
         # 异常结束的回合：core.llm 只发 turn_error（不再发 turn_finished），
         # 这里负责 UI 收尾：冲刷剩余文本、打印错误行并重置状态栏。
+        for fragment in renderer.flush_tool_progress():
+            _print_ui_fragment(fragment)
         tail = "".join(renderer.finish_incremental(include_assistant_text=True))
         if tail:
             _assistant_stream_buffers[event.turn_id] = (
                 _assistant_stream_buffers.get(event.turn_id, "") + tail
             )
         _flush_public_answer(event.turn_id, final=True)
-        recap = renderer.concise_recap()
-        if recap:
-            _print_ui_fragment(recap)
         message = str(event.payload.get("message") or "未知错误")
         print_formatted_text(HTML(f"\n<ansired>⚠️ 回合异常结束：{_esc(message)}</ansired>\n"))
         ui_renderers.pop(event.turn_id, None)
         _answer_header_printed.pop(event.turn_id, None)
         _clear_active_thinking()
+        _active_tool_status = None
         is_thinking = False
         task_status = "idle"
 
@@ -2672,7 +2685,7 @@ def _make_input_app():
             # elapsed），避免两个动画刷新率不一致导致的观感卡顿。
             frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             frame = frames[int(time.time() * 5) % len(frames)]
-            return f"  {frame} {_turn_activity_label(task_status, _current_tool_name)} {elapsed:.1f}s"
+            return _format_activity_text(task_status, _active_tool_status, elapsed, frame)
         return ""
 
     @Condition
@@ -2798,7 +2811,8 @@ def _make_input_app():
         ConditionalContainer(
             content=Window(
                 content=FormattedTextControl(get_activity_text),
-                height=1,
+                # 活动标题与安全命令摘要各占一行。
+                height=2,
                 style="class:status.think"
             ),
             filter=is_working_cond
