@@ -53,7 +53,7 @@ _TOOL_ACTIONS = {
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _NAMED_SECRET_RE = re.compile(
-    r'(?i)(["\']?(?:api[_-]?key|authorization|token|password)["\']?\s*[:=]\s*)'
+    r'(?i)(["\']?(?:api[_-]?key|authorization|token|password|client[_-]?secret|secret|cookie)["\']?\s*[:=]\s*)'
     r'(Bearer\s+[A-Za-z0-9._~+/=-]+|"[^"]*"|\'[^\']*\'|[^\s,;]+)'
 )
 _BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
@@ -106,12 +106,15 @@ def build_tool_display(
     ok: bool | None = None,
 ) -> dict[str, object]:
     """Build presentation-safe metadata for tool activity consumers."""
+    if result is not None and not isinstance(result, dict):
+        raise TypeError("result must be a dict or None")
+
     file_path = str(arguments.get("file_path", ""))
     skill_name = _skill_name_from_path(file_path) if name == "read_file" else ""
     category = "skill" if skill_name else _TOOL_CATEGORIES.get(name, "other")
     target = skill_name or tool_target(name, arguments)
     command = str(arguments.get("command", "")) if name == "execute_command" else ""
-    result_data: dict[str, Any] = result if isinstance(result, dict) else {}
+    result_data: dict[str, Any] = result or {}
     metrics: dict[str, int] = {}
     if name == "read_file" and ok is True:
         content = result_data.get("content")
@@ -125,7 +128,9 @@ def build_tool_display(
 
     return {
         "category": category,
-        "action": _TOOL_ACTIONS.get(name, f"使用工具 {name}"),
+        "action": sanitize_tool_display_text(
+            _TOOL_ACTIONS.get(name, f"使用工具 {name}"), 160
+        ),
         "target": sanitize_tool_display_text(target, 160),
         "command": sanitize_tool_display_text(command, 240),
         "metrics": metrics,

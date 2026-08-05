@@ -1,9 +1,46 @@
+import pytest
+
 from core.tool_presenter import (
     build_tool_display,
     sanitize_tool_display_text,
     summarize_tool_finished,
     summarize_tool_started,
 )
+
+
+def test_display_text_redacts_cookie_and_secret_header_and_assignment_forms():
+    cleaned = sanitize_tool_display_text(
+        "Cookie: sid=session-secret; theme=dark cookie=browser-secret "
+        "client_secret='client-secret' secret=plain-secret"
+    )
+
+    assert "session-secret" not in cleaned
+    assert "browser-secret" not in cleaned
+    assert "client-secret" not in cleaned
+    assert "plain-secret" not in cleaned
+    assert "Cookie: ***" in cleaned
+    assert "cookie=***" in cleaned
+    assert "client_secret=***" in cleaned
+    assert "secret=***" in cleaned
+
+
+def test_unknown_tool_action_redacts_embedded_secret():
+    display = build_tool_display("custom token=tool-secret", {}, ok=True)
+
+    assert "tool-secret" not in display["action"]
+    assert display["action"] == "使用工具 custom token=***"
+
+
+@pytest.mark.parametrize("result", ["invalid", [], 1])
+def test_build_tool_display_rejects_non_dict_result(result):
+    with pytest.raises(TypeError, match="result must be a dict or None"):
+        build_tool_display("read_file", {"file_path": "core/llm.py"}, result, ok=True)
+
+
+def test_build_tool_display_accepts_none_result():
+    display = build_tool_display("read_file", {"file_path": "core/llm.py"}, None, ok=True)
+
+    assert display["metrics"] == {}
 
 
 def test_build_tool_display_returns_read_metadata():
