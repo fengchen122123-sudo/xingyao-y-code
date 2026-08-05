@@ -16,6 +16,7 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
   venv\\Scripts\\python build_release.py --tui-only         只构建 TUI 相关产物，跳过主安装包
   venv\\Scripts\\python build_release.py --skip-frontend    跳过前端构建，直接用现有 frontend/dist
   venv\\Scripts\\python build_release.py --rebuild-frontend 强制重新执行 npm run build
+  venv\\Scripts\\python build_release.py --setup-only       只重建两个安装向导（复用现有载荷）
 """
 import argparse
 import os
@@ -23,6 +24,7 @@ import re
 import shutil
 import subprocess
 import sys
+import zipfile
 
 sys.stdout.reconfigure(encoding='utf-8')
 
@@ -48,6 +50,11 @@ def parse_args():
         "--tui-only", action="store_true",
         help="只构建 TUI 相关产物 (dist/ycode、ycode_uninstall.exe、ycode_tui_setup.exe)，"
              "跳过体积较大的主安装包 ycode_setup.exe。",
+    )
+    parser.add_argument(
+        "--setup-only", action="store_true",
+        help="只重建两个安装向导 (ycode_setup.exe / ycode_tui_setup.exe)：复用现有 dist/ycode "
+             "载荷与 dist/ycode_uninstall.exe，适用于仅改动 ycode_setup.py 后的快速重建。",
     )
     return parser.parse_args()
 
@@ -224,7 +231,8 @@ def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_dat
             f.write(read_project_version(project_dir))
 
         cmd = [
-            pyinstaller_bin, "--clean", "--noconfirm", "--onefile", "--console", "--noupx",
+            # --windowed：安装向导是 tkinter GUI，不能弹出黑色控制台窗口
+            pyinstaller_bin, "--clean", "--noconfirm", "--onefile", "--windowed", "--noupx",
             "--name", output_name,
             "--icon", os.path.join(project_dir, "assets", "ycode.ico"),
             # --specpath 指向临时目录：避免 PyInstaller 自动生成/覆盖同名的
@@ -252,7 +260,32 @@ def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_dat
     return exe_path
 
 
-def step3_build_tui_setup(pyinstaller_bin, project_dir, ycode_dir, uninstall_exe):
+def make_payload_archive(project_dir, ycode_dir):
+    """把 dist/ycode 整个目录压缩成单个 ycode_pkg.zip 作为安装向导的载荷。
+
+    安装向导是 PyInstaller onefile exe：启动时要先把内嵌数据全部解压到临时
+    目录才能显示界面。内嵌 4000+ 散文件时，解压 + 杀毒软件逐个扫描会让双击后
+    超过一分钟毫无反应（用户以为安装包坏了）。压缩成单文件后，启动解压量从
+    4000+ 个文件降到十几个，界面几秒内出现；真正的文件释放挪到安装步骤里做
+    （有进度条，符合正常安装体验）。
+    """
+    zip_path = os.path.join(project_dir, "build", "ycode_pkg.zip")
+    if os.path.exists(zip_path):
+        os.remove(zip_path)
+    print("📦 正在压缩核心程序包为单文件载荷 (ycode_pkg.zip)...")
+    count = 0
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+        for root, _dirs, files in os.walk(ycode_dir):
+            for name in files:
+                src = os.path.join(root, name)
+                zf.write(src, os.path.relpath(src, ycode_dir))
+                count += 1
+    size_mb = os.path.getsize(zip_path) / 1024 / 1024
+    print(f"✔ 载荷压缩完成: {count} 个文件 -> {size_mb:.1f} MB")
+    return zip_path
+
+
+def step3_build_tui_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe):
     print("\n[步骤 3/5] 正在编译 TUI 独立安装向导 ycode_tui_setup.exe...")
     # 同时内嵌卸载程序：这样即便用户脱离主安装包、单独运行这个 CLI 安装向导
     # （即"安装目录下还没有 Y-code.exe"的独立安装场景），也能正常复制出
@@ -261,24 +294,30 @@ def step3_build_tui_setup(pyinstaller_bin, project_dir, ycode_dir, uninstall_exe
     return build_setup_variant(
         pyinstaller_bin, project_dir, mode="tui", output_name="ycode_tui_setup",
         add_data_pairs=[
-            (ycode_dir, "ycode_pkg"),
+            (payload_zip, "."),
             (uninstall_exe, "."),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
+            # GUI 向导资源：虚化背景图 + 窗口图标
+            (os.path.join("assets", "setup_bg.png"), "assets"),
+            (os.path.join("assets", "ycode.ico"), "assets"),
         ],
     )
 
 
-def step4_build_full_setup(pyinstaller_bin, project_dir, ycode_dir, uninstall_exe, tui_setup_exe):
+def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, tui_setup_exe):
     print("\n[步骤 4/5] 正在编译主安装向导 ycode_setup.exe...")
     return build_setup_variant(
         pyinstaller_bin, project_dir, mode="full", output_name="ycode_setup",
         add_data_pairs=[
-            (ycode_dir, "ycode_pkg"),
+            (payload_zip, "."),
             (uninstall_exe, "."),
             (tui_setup_exe, "tui"),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
+            # GUI 向导资源：虚化背景图 + 窗口图标
+            (os.path.join("assets", "setup_bg.png"), "assets"),
+            (os.path.join("assets", "ycode.ico"), "assets"),
         ],
     )
 
@@ -337,13 +376,28 @@ def build():
 
     pyinstaller_bin = resolve_pyinstaller(project_dir)
 
-    step0_build_frontend(project_dir, args)
-    ycode_dir = step1_build_core(pyinstaller_bin, project_dir)
-    uninstall_exe = step2_build_uninstaller(pyinstaller_bin, project_dir)
-    tui_setup_exe = step3_build_tui_setup(pyinstaller_bin, project_dir, ycode_dir, uninstall_exe)
+    if args.setup_only:
+        # 快速通道：核心载荷与卸载程序未变，直接复用现有产物，只重新编译安装向导。
+        ycode_dir = os.path.join(project_dir, "dist", "ycode")
+        uninstall_exe = os.path.join(project_dir, "dist", "ycode_uninstall.exe")
+        if not os.path.isdir(ycode_dir):
+            print(f"❌ --setup-only 需要现有核心载荷目录: {ycode_dir}（请先完整构建一次）。")
+            sys.exit(1)
+        if not os.path.exists(uninstall_exe):
+            print(f"❌ --setup-only 需要现有卸载程序: {uninstall_exe}（请先完整构建一次）。")
+            sys.exit(1)
+        print("ℹ 已指定 --setup-only，跳过前端 / 核心载荷 / 卸载程序构建，直接复用现有产物。")
+        payload_zip = make_payload_archive(project_dir, ycode_dir)
+    else:
+        step0_build_frontend(project_dir, args)
+        ycode_dir = step1_build_core(pyinstaller_bin, project_dir)
+        payload_zip = make_payload_archive(project_dir, ycode_dir)
+        uninstall_exe = step2_build_uninstaller(pyinstaller_bin, project_dir)
+
+    tui_setup_exe = step3_build_tui_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
 
     if not args.tui_only:
-        step4_build_full_setup(pyinstaller_bin, project_dir, ycode_dir, uninstall_exe, tui_setup_exe)
+        step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, tui_setup_exe)
 
     step5_summary(project_dir, args.tui_only)
 

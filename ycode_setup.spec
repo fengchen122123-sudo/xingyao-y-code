@@ -22,11 +22,19 @@
 import os
 
 datas = [
-    ('dist/ycode', 'ycode_pkg'),
     ('dist/ycode_uninstall.exe', '.'),
     ('config.example.json', '.'),
     ('system_prompt.md', '.'),
+    # GUI 向导资源：虚化背景图 + 窗口图标
+    ('assets/setup_bg.png', 'assets'),
+    ('assets/ycode.ico', 'assets'),
 ]
+# 核心程序载荷：优先单文件压缩包（onefile 启动解压快），
+# 没有构建过压缩包时回退到目录形式（启动会慢很多）。
+if os.path.exists('build/ycode_pkg.zip'):
+    datas.append(('build/ycode_pkg.zip', '.'))
+else:
+    datas.append(('dist/ycode', 'ycode_pkg'))
 # TUI 独立安装包是可选内嵌资源：单独手动跑本 spec 时如果还没构建
 # dist/ycode_tui_setup.exe，就跳过它——ycode_setup.py 在找不到内嵌 TUI 安装包
 # 时会自动跳过“未安装 TUI 时复制补装程序”这一步，不会因此崩溃。
@@ -64,7 +72,8 @@ exe = EXE(
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    # console=False：安装向导是 tkinter GUI，不能弹出黑色控制台窗口
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

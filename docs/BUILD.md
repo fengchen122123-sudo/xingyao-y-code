@@ -44,9 +44,10 @@ dir dist
 打包所需的一切文件都在版本库内，不依赖任何库外文件：
 `build_release.py`（构建入口）、`ycode.spec`（GUI+TUI 双主程序）、
 `ycode_uninstall.spec` / `ycode_uninstall.py`（卸载程序）、
-`ycode_setup.spec` / `ycode_setup.py`（安装向导，同一份源码按内嵌
+`ycode_setup.spec` / `ycode_setup.py`（tkinter 图形化安装向导，同一份源码按内嵌
 marker 区分 full/tui 两种模式）、`packaging/runtime_hook_nullstdout.py`
-（windowed 模式下 stdout 兜底的运行时钩子）、`config.example.json` 与
+（windowed 模式下 stdout 兜底的运行时钩子）、`assets/`（程序与向导图标、
+向导背景图 setup_bg.png）、`config.example.json` 与
 `system_prompt.md`（安装时播种到 `~/.ycode` 的默认配置）、`frontend/`
 （Vue 3 前端源码）。版本号唯一来源是 `core/version.py`，安装包版本号
 自动从它读取，不要在别处硬编码。
@@ -59,8 +60,16 @@ marker 区分 full/tui 两种模式）、`packaging/runtime_hook_nullstdout.py`
 venv\Scripts\python build_release.py
 ```
 
-该脚本会依次完成：前端构建 → 核心双主程序编译 → 卸载程序编译 → TUI 独立安装向导
+该脚本会依次完成：前端构建 → 核心双主程序编译 → 载荷压缩 → 卸载程序编译 → TUI 独立安装向导
 编译 → 主安装向导编译 → 产物校验，并打印每一步的中文进度（✅ 成功 / ❌ 失败）。
+
+### 单文件 zip 载荷（安装向导秒开的关键）
+
+核心程序包 `dist/ycode` 含 4000+ 个文件。安装向导不直接内嵌这些散文件，而是先把整个
+目录压缩成单个 `build/ycode_pkg.zip`（中间产物，约百余 MB），向导 exe 只需内嵌这个 zip
+加卸载程序等十几个文件——双击后 PyInstaller 自解压的文件数量从 4000+ 降到十几个，
+界面几秒内出现（旧方案曾需 20~95 秒）；真正的文件释放挪到用户点“安装”后的步骤里做，
+带进度条展示。两个安装向导（full/tui）共用同一份 zip 载荷。
 
 ### 可选参数
 
@@ -69,6 +78,7 @@ venv\Scripts\python build_release.py
 | `--skip-frontend` | 跳过前端构建，直接复用现有的 `frontend/dist`（适合只改了 Python 代码时快速重新打包；若 `frontend/dist` 从未构建过，生成的 GUI 版会无法加载界面）。 |
 | `--rebuild-frontend` | 强制重新执行 `npm run build`，即使 `frontend/dist/index.html` 已经存在。 |
 | `--tui-only` | 只构建 TUI 相关产物（核心程序包、卸载程序、`ycode_tui_setup.exe`），跳过体积较大的主安装包 `ycode_setup.exe`，适合只想验证/分发命令行版时使用。 |
+| `--setup-only` | 只重建两个安装向导（`ycode_setup.exe` / `ycode_tui_setup.exe`）：跳过前端、核心程序包与卸载程序的编译，从现有 `dist/ycode` 重新压缩载荷后直接走步骤 3/4，全程约 2 分钟。仅改动 `ycode_setup.py` 后快速重建时使用；要求此前已经完整构建过一次（`dist/ycode` 与 `dist/ycode_uninstall.exe` 存在），全新机器上不可用。 |
 
 ## 三、构建产物
 
@@ -85,22 +95,21 @@ venv\Scripts\python build_release.py
 
 ## 四、可选 TUI 安装机制
 
-`ycode_setup.py` 是同一份源码，靠内嵌的 `setup_mode.txt` marker 文件区分两种运行模式：
+`ycode_setup.py` 是同一份源码的 tkinter 图形化向导（欢迎 → 安装选项 → 安装进度 → 完成
+四个页面），靠内嵌的 `setup_mode.txt` marker 文件区分两种运行模式：
 
 - `full` 模式（`ycode_setup.exe`，默认）：
-  1. 询问安装目录，释放完整的核心程序包（GUI + TUI + 依赖）。
-  2. 询问“是否同时安装命令行版 CLI (ycode 命令)？[Y/n]”：
-     - 选 是：保留 `ycode.exe`，把安装目录加入 PATH，创建桌面快捷方式
-       “Y-code CLI”。
-     - 选 否：从安装目录里删掉 `ycode.exe`，不写 PATH，转而把内嵌的
-       `ycode_tui_setup.exe` 释放到 `<安装目录>\tui\ycode_tui_setup.exe`，
-       并提示“以后可双击 tui\ycode_tui_setup.exe 补装命令行版”。
-  3. 无论上一步选什么，都会创建桌面快捷方式 “Y-code”（指向 `Y-code.exe`）、
-     复制卸载程序、播种 `~/.ycode` 下的默认配置，并在
-     “控制面板 → 程序和功能”（即注册表 `HKCU\...\Uninstall\Y-code`）里注册一条
-     卸载入口。
-- `tui` 模式（`ycode_tui_setup.exe`）：只安装 `ycode.exe` 及其依赖，加入 PATH，
-  创建 “Y-code CLI” 快捷方式。如果目标目录已经是一次完整版安装（检测到
+  1. 选项页可修改安装目录，并有两个复选框（默认都勾选）：
+     “同时安装命令行版 CLI” 与 “创建桌面快捷方式”。
+  2. “同时安装命令行版 CLI” 勾选时：保留 `ycode.exe`，把安装目录加入 PATH，
+     创建桌面快捷方式 “Y-code CLI”。不勾选时：从安装目录里删掉 `ycode.exe`，
+     不写 PATH，转而把内嵌的 `ycode_tui_setup.exe` 释放到
+     `<安装目录>\tui\ycode_tui_setup.exe`，完成页提示以后可双击它补装命令行版。
+  3. 无论怎么选，都会释放完整核心程序包（GUI + 依赖）、播种 `~/.ycode` 下的默认
+     配置，并在“控制面板 → 程序和功能”（注册表 `HKCU\...\Uninstall\Y-code`）里
+     注册一条卸载入口。
+- `tui` 模式（`ycode_tui_setup.exe`）：选项页无复选框，只安装 `ycode.exe` 及其依赖，
+  加入 PATH，创建 “Y-code CLI” 快捷方式。如果目标目录已经是一次完整版安装（检测到
   `Y-code.exe` 已存在），会直接合并进去，并复用完整版已经注册好的卸载入口，
   不会重复注册。
 
