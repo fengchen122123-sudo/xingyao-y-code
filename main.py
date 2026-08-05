@@ -264,6 +264,84 @@ def _esc(text) -> str:
     return str(text).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _term_display_width(text):
+    """按终端显示宽度计算字符串宽度（中文等 East Asian 宽字符算 2 格）。"""
+    import unicodedata
+    return sum(
+        2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        for ch in str(text)
+    )
+
+
+def _pad_right(text, width):
+    """按终端显示宽度左对齐补齐到 width 格。"""
+    text = str(text)
+    return text + " " * max(0, width - _term_display_width(text))
+
+
+def _pad_left(text, width):
+    """按终端显示宽度右对齐补齐到 width 格。"""
+    text = str(text)
+    return " " * max(0, width - _term_display_width(text)) + text
+
+
+def _parse_usage_date_args(args):
+    """解析 /usage 的日期参数。
+
+    支持:
+      /usage                                -> None（默认 今日/近7天/近30天 三段统计）
+      /usage 2026-08-01                     -> (date, date) 指定单日
+      /usage 2026-08-01 2026-08-05          -> (start, end) 指定区间
+      /usage 2026-08-01 ~ 2026-08-05        -> 同上（~ 与 to 作为分隔符被忽略）
+    区间先后写反时自动纠正；日期非法或参数过多时抛出 ValueError。
+    """
+    from datetime import date as _date_cls
+    tokens = [a for a in args if a not in ("~", "to")]
+    if not tokens:
+        return None
+    if len(tokens) > 2:
+        raise ValueError("参数过多")
+    try:
+        dates = [_date_cls.fromisoformat(t) for t in tokens]
+    except ValueError:
+        raise ValueError("日期格式须为 YYYY-MM-DD")
+    if len(dates) == 1:
+        return dates[0], dates[0]
+    return min(dates), max(dates)
+
+
+def _render_usage_section(manager, label, start_s, end_s):
+    """打印一个日期区间的按模型 token 用量统计段，返回该段是否有数据。"""
+    title = f"{label} ({start_s})" if start_s == end_s else f"{label} ({start_s} ~ {end_s})"
+    print_formatted_text(HTML(f"<b><ansiyellow>{_esc(title)}</ansiyellow></b>"))
+    rows = manager.query_token_usage_by_model(start_s, end_s)
+    if not rows:
+        print_formatted_text(HTML("  <ansigray>暂无记录</ansigray>"))
+        return False
+    name_w = max(12, min(40, max(_term_display_width(r["model"]) for r in rows) + 2))
+    _header = (
+        "  " + _pad_right("模型", name_w)
+        + " " + _pad_left("输入", 14)
+        + " " + _pad_left("输出", 14)
+        + " " + _pad_left("缓存命中", 14)
+        + " " + _pad_left("命中率", 10)
+        + " " + _pad_left("合计", 14)
+    )
+    print_formatted_text(HTML(f"<ansigray>{_header}</ansigray>"))
+    for r in rows:
+        _rate = f"{(r['cached'] / r['prompt'] * 100) if r['prompt'] else 0.0:.1f}%"
+        print_formatted_text(HTML(
+            f"  {_pad_right(_esc(r['model']), name_w)} {r['prompt']:>14} {r['completion']:>14} {r['cached']:>14} {_rate:>10} {r['total']:>14}"
+        ))
+    if len(rows) > 1:
+        sub = {k: sum(r[k] for r in rows) for k in ("prompt", "completion", "cached", "total")}
+        _sub_rate = f"{(sub['cached'] / sub['prompt'] * 100) if sub['prompt'] else 0.0:.1f}%"
+        print_formatted_text(HTML(
+            f"  <ansicyan>{_pad_right('小计', name_w)} {sub['prompt']:>14} {sub['completion']:>14} {sub['cached']:>14} {_sub_rate:>10} {sub['total']:>14}</ansicyan>"
+        ))
+    return True
+
+
 def _format_token_usage_summary(
     cumulative_prompt, cumulative_completion, cumulative_cached
 ):
@@ -1283,6 +1361,8 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|plan|full&gt;</ansicyan>        : 切换安全权限级别 (confirm:变更前确认 | plan:计划模式 | full:完全访问)"))
         print_formatted_text(HTML("  <ansicyan>/sandbox &lt;on|off&gt;</ansicyan>                     : 沙盒开关 (on:允许访问工作目录外文件 | off:仅限工作目录内)"))
+        print_formatted_text(HTML("  <ansicyan>/usage</ansicyan>                                : 查看 Token 用量统计 (按模型区分: 今日/近7天/近30天，精确数值)"))
+        print_formatted_text(HTML("  <ansicyan>/usage &lt;日期&gt; [截止日期]</ansicyan>          : 查询指定单日或区间的 Token 用量 (例: /usage 2026-08-01 2026-08-05)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【3. 技能插件管理】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/skills</ansicyan>                              : 打开全屏技能选择器 UI (空格勾选开启/关闭)"))
@@ -2059,6 +2139,48 @@ def handle_slash_command(command_text):
                 "<ansired>⚠️ 未知子命令。用法: /plugins [enable &lt;name&gt;|disable &lt;name&gt;|reload]</ansired>"
             ))
 
+    elif cmd == "/usage" or cmd.startswith("/usage "):
+        # Token 用量统计：按模型分桶，精确数值（不做缩写）
+        # 用法: /usage                            -> 今日/近7天/近30天
+        #       /usage 2026-08-01                 -> 指定单日
+        #       /usage 2026-08-01 2026-08-05      -> 指定区间（也支持 ~ 分隔）
+        from datetime import date as _usage_date_cls, timedelta as _usage_td
+        from core import app_context as _usage_app_ctx
+        _usage_mgr = _usage_app_ctx.get_manager()
+        if _usage_mgr is None:
+            print_formatted_text(HTML("<ansired>⚠️ 记忆数据库未初始化，暂无法统计 token 用量。</ansired>"))
+        else:
+            try:
+                _usage_range = _parse_usage_date_args(parts[1:])
+            except ValueError as _usage_err:
+                print_formatted_text(HTML(
+                    f"<ansired>⚠️ {_esc(str(_usage_err))}。用法: /usage [YYYY-MM-DD] [YYYY-MM-DD]</ansired>"
+                ))
+            else:
+                print_formatted_text(HTML("<b><ansigreen>📊 Token 用量统计</ansigreen></b>"))
+                if _usage_range is not None:
+                    _start_d, _end_d = _usage_range
+                    _render_usage_section(
+                        _usage_mgr, "查询结果", _start_d.isoformat(), _end_d.isoformat()
+                    )
+                else:
+                    _usage_today = _usage_date_cls.today()
+                    _usage_ranges = [
+                        ("今日", _usage_today, _usage_today),
+                        ("近 7 天", _usage_today - _usage_td(days=6), _usage_today),
+                        ("近 30 天", _usage_today - _usage_td(days=29), _usage_today),
+                    ]
+                    _usage_any_data = False
+                    for _usage_label, _usage_start, _usage_end in _usage_ranges:
+                        if _render_usage_section(
+                            _usage_mgr, _usage_label,
+                            _usage_start.isoformat(), _usage_end.isoformat(),
+                        ):
+                            _usage_any_data = True
+                    if not _usage_any_data:
+                        print_formatted_text(HTML(
+                            "<ansigray>暂无 token 用量记录。统计从本次升级后开始累计，历史用量无数据。</ansigray>"
+                        ))
 
     elif cmd == "/clear":
         # 清屏后屏幕上没有内容，下一轮提问前不打印轮次分隔线
@@ -2164,6 +2286,7 @@ def _make_input_app():
         ("/session", "切换或创建新的记忆会话"),
         ("/new", "创建并切换到全新会话"),
         ("/models", "打开模型管理器"),
+        ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
         ("/tasks", "查看或托管后台长周期进程"),
         ("/plan", "查看或控制当前任务计划"),
         ("/undo", "撤销星瑶上一次修改的代码"),

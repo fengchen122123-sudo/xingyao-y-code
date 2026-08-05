@@ -323,6 +323,25 @@ class MemoryManager:
                         created_at TEXT
                     )
                 ''')
+                # token 用量统计表：每次流式响应结束后追加一条真实用量记录，
+                # 供 /usage 按模型与日期区间聚合（今日/近7天/近30天）
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS token_usage (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts INTEGER,
+                        date TEXT,
+                        provider TEXT,
+                        model TEXT,
+                        prompt_tokens INTEGER,
+                        completion_tokens INTEGER,
+                        cached_tokens INTEGER,
+                        total_tokens INTEGER,
+                        session_id TEXT
+                    )
+                ''')
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(date)"
+                )
                 # 保存修改
                 self.conn.commit()
             except Exception:
@@ -343,6 +362,58 @@ class MemoryManager:
                     logging.getLogger("py.warnings").warning("WAL checkpoint 执行失败: %s", e)
                 except Exception:
                     pass
+
+    def add_token_usage(self, provider, model, prompt_tokens, completion_tokens,
+                        cached_tokens, total_tokens, session_id=None, ts=None):
+        """追加一条真实 token 用量记录（由 core/llm.py 流结束记账点调用）。"""
+        import time
+        if ts is None:
+            ts = int(time.time())
+        day = time.strftime("%Y-%m-%d", time.localtime(ts))
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO token_usage "
+                "(ts, date, provider, model, prompt_tokens, completion_tokens, "
+                "cached_tokens, total_tokens, session_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                (
+                    int(ts), day, str(provider or ""), str(model or ""),
+                    int(prompt_tokens or 0), int(completion_tokens or 0),
+                    int(cached_tokens or 0), int(total_tokens or 0),
+                    str(session_id) if session_id is not None else None,
+                ),
+            )
+            self.conn.commit()
+
+    def query_token_usage_by_model(self, start_date, end_date):
+        """按模型聚合指定日期区间（含端点，格式 YYYY-MM-DD）的 token 用量。
+
+        返回按合计 token 降序排列的字典列表:
+        [{"provider", "model", "prompt", "completion", "cached", "total"}, ...]
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT provider, model,
+                       SUM(prompt_tokens), SUM(completion_tokens),
+                       SUM(cached_tokens), SUM(total_tokens)
+                FROM token_usage
+                WHERE date >= ? AND date <= ?
+                GROUP BY provider, model
+                ORDER BY SUM(total_tokens) DESC
+                """,
+                (str(start_date), str(end_date)),
+            )
+            return [
+                {
+                    "provider": row[0] or "",
+                    "model": row[1] or "",
+                    "prompt": row[2] or 0,
+                    "completion": row[3] or 0,
+                    "cached": row[4] or 0,
+                    "total": row[5] or 0,
+                }
+                for row in cursor.fetchall()
+            ]
 
     def close(self):
         """关闭数据库连接前自动刷盘 WAL 日志。"""

@@ -710,6 +710,39 @@ def _record_cache_usage(session_id, cache_scope, prompt_tokens, cached_tokens, i
         return snapshot
 
 
+def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
+                         cached_tokens, total_tokens, session_id=None):
+    """把本轮真实 token 用量追加到本地 token_usage 表，供 /usage 按模型/日期统计。
+
+    失败仅记日志，绝不影响对话主流程。model_name 为 litellm 模型串
+    （如 "openai/deepseek-v4-pro"），按第一个 "/" 拆出 provider 与 model。
+    """
+    try:
+        from core import app_context
+        manager = app_context.get_manager()
+        if manager is None:
+            return
+        full_name = str(model_name or "")
+        if "/" in full_name:
+            provider, model = full_name.split("/", 1)
+        else:
+            provider, model = "", full_name
+        manager.add_token_usage(
+            provider=provider,
+            model=model,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            total_tokens=total_tokens,
+            session_id=session_id,
+        )
+    except Exception as _persist_err:
+        try:
+            logger.debug("token 用量持久化失败（已忽略）: %s", _persist_err)
+        except Exception:
+            pass
+
+
 def _extract_cached_tokens(usage):
     """读取 OpenAI 标准明细或 DeepSeek 原生 usage 中的精确缓存命中 token。"""
     if usage is None:
@@ -3082,6 +3115,17 @@ def _chat_with_model_generator(
                         0, session_token_usage["latest_total"] - session_token_usage["latest_prompt"]
                     )
                     session_token_usage["cumulative_cached"] += latest_cached
+
+                # 持久化本轮真实用量（按模型分桶），供 /usage 统计今日/7天/30天
+                _total_tokens = getattr(stream_usage, "total_tokens", 0) or 0
+                _persist_token_usage(
+                    model_name,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=max(0, _total_tokens - prompt_tokens),
+                    cached_tokens=latest_cached,
+                    total_tokens=_total_tokens,
+                    session_id=telemetry_session_id,
+                )
 
             reasoning_content, public_content = split_reasoning_text(accumulated_content)
             from core.turn_renderer import sanitize_protocol_text
