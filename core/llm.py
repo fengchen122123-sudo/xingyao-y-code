@@ -1589,10 +1589,28 @@ def _notify_event(event_callback, kind, payload):
 
 
 def _tool_call_arguments(tc):
+    raw_arguments = tc["function"].get("arguments", "{}")
+    if not isinstance(raw_arguments, str):
+        raise ValueError("工具参数 JSON 必须是字符串")
+
     try:
-        return json.loads(tc["function"].get("arguments", "{}"))
-    except (TypeError, ValueError):
-        return {}
+        arguments = json.loads(raw_arguments)
+    except ValueError as direct_error:
+        try:
+            arguments = json.loads(
+                _escape_control_chars_in_json_strings(raw_arguments)
+            )
+        except ValueError:
+            try:
+                arguments = json.loads(_repair_truncated_json(raw_arguments))
+            except ValueError as repair_error:
+                raise ValueError(
+                    f"工具参数 JSON 解析失败：{repair_error}"
+                ) from direct_error
+
+    if not isinstance(arguments, dict):
+        raise ValueError("工具参数 JSON 必须是对象")
+    return arguments
 
 
 def _tool_event_payload(tc):
@@ -1928,23 +1946,9 @@ def _execute_single_tool_call(
 ):
     """执行单个工具调用，并返回对应的 JSON 结果结构。"""
     function_name = tc["function"]["name"]
-    arguments_str = tc["function"]["arguments"]
-    parse_error = None
     try:
-        arguments = json.loads(arguments_str)
-    except Exception:
-        try:
-            # 兜底修复：仅转义字符串值内部的裸控制字符，合法 \\n 不会被二次转义
-            arguments = json.loads(_escape_control_chars_in_json_strings(arguments_str))
-        except Exception:
-            try:
-                # 二次修复：处理被截断的 JSON（补全未闭合字符串/括号）
-                arguments = json.loads(_repair_truncated_json(arguments_str))
-            except Exception as repair_err:
-                parse_error = repair_err
-                arguments = {}
-
-    if parse_error is not None:
+        arguments = _tool_call_arguments(tc)
+    except ValueError as parse_error:
         # 参数 JSON 彻底无法解析：直接返回错误，避免用空参数继续执行产生更迷惑的行为。
         # 这对 plan_write 等写操作尤为重要，可防止模型把对话历史混进参数后误清空计划。
         return {
