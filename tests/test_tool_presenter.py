@@ -33,6 +33,17 @@ def test_display_text_redacts_every_value_in_a_cookie_header():
     assert cleaned == "Cookie: ***"
 
 
+def test_display_text_redacts_every_value_in_a_set_cookie_header():
+    cleaned = sanitize_tool_display_text(
+        "Set-Cookie: first=first-secret; second=second-secret; theme=dark"
+    )
+
+    assert "first-secret" not in cleaned
+    assert "second-secret" not in cleaned
+    assert "theme=dark" not in cleaned
+    assert cleaned == "Set-Cookie: ***"
+
+
 def test_unknown_tool_action_redacts_embedded_secret():
     display = build_tool_display("custom token=tool-secret", {}, ok=True)
 
