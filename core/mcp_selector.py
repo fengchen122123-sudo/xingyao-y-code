@@ -244,6 +244,7 @@ def _get_clipboard_text():
                 timeout=2,
                 encoding="utf-8",
                 errors="ignore",
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             if result.returncode == 0:
                 return result.stdout.rstrip("\r\n")
