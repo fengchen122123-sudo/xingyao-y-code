@@ -1,5 +1,6 @@
 """回归测试：代码审查修复的关键 bug（压缩重绑定、thinking 双发、turn_error 等）。"""
 
+import json
 import threading
 from types import SimpleNamespace
 
@@ -54,6 +55,61 @@ def test_diff_ready_contains_exact_tool_call_id():
     assert events[0][0] == "diff_ready"
     assert events[0][1]["tool_call_id"] == "edit-7"
     assert events[0][1]["file_path"] == "sample.py"
+
+
+def test_write_file_execution_emits_diff_ready_for_exact_tool_call_id(mocker, tmp_path):
+    import core.llm as llm
+
+    target = tmp_path / "write-target.txt"
+    events = []
+    mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
+    mocker.patch.object(llm, "is_outside_workspace", return_value=False)
+    tc = {
+        "id": "write-diff-7",
+        "function": {
+            "name": "write_file",
+            "arguments": json.dumps({"file_path": str(target), "content": "new\n"}),
+        },
+    }
+
+    llm._execute_single_tool_call(
+        tc,
+        event_callback=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    diff_event = next(event for event in events if event[0] == "diff_ready")
+    assert diff_event[1]["tool_call_id"] == "write-diff-7"
+    assert diff_event[1]["file_path"] == str(target)
+
+
+def test_edit_file_execution_emits_diff_ready_for_exact_tool_call_id(mocker, tmp_path):
+    import core.llm as llm
+
+    target = tmp_path / "edit-target.txt"
+    target.write_text("old\n", encoding="utf-8")
+    events = []
+    mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
+    mocker.patch.object(llm, "is_outside_workspace", return_value=False)
+    tc = {
+        "id": "edit-diff-7",
+        "function": {
+            "name": "edit_file",
+            "arguments": json.dumps({
+                "file_path": str(target),
+                "target_content": "old",
+                "replacement_content": "new",
+            }),
+        },
+    }
+
+    llm._execute_single_tool_call(
+        tc,
+        event_callback=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    diff_event = next(event for event in events if event[0] == "diff_ready")
+    assert diff_event[1]["tool_call_id"] == "edit-diff-7"
+    assert diff_event[1]["file_path"] == str(target)
 
 
 def test_compression_replaces_messages_in_place(mocker, monkeypatch):
