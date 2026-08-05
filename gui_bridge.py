@@ -84,6 +84,17 @@ def _resolve_real_path(path: str) -> str:
         return os.path.abspath(path)
 
 
+def _app_install_dir() -> str:
+    """应用自身所在目录（冻结版为 exe 所在目录，开发模式为 gui_bridge.py 所在目录）。
+
+    桌面快捷方式的起始位置是安装目录，GUI 进程 cwd 就是它；它不该被当作
+    “项目文件夹”自动注册成分组，否则用户会看到一个永远删不掉的幻影分组。
+    """
+    if getattr(sys, "frozen", False):
+        return _resolve_real_path(os.path.dirname(sys.executable))
+    return _resolve_real_path(os.path.dirname(os.path.abspath(__file__)))
+
+
 def _sanitize_for_ui(text: str, api_key: Optional[str] = None) -> str:
     """将可能包含 API key 的错误文本脱敏后再输出到 UI。"""
     if not isinstance(text, str):
@@ -243,6 +254,20 @@ class ApiBridge:
         self._titlebar_dark = True  # 前端默认深色主题
         # 后台线程轮询获取原生窗口句柄，拿到后应用深色标题栏
         threading.Thread(target=self._find_hwnd_worker, daemon=True, name="gui-hwnd-find").start()
+        # WebView2 就绪、最小化还原等时机 DWM 可能重建非客户区，把标题栏重置回白色。
+        # 冻结版冷启动慢（杀毒扫描），仅靠句柄找到后 7 秒内的延迟重设覆盖不到，
+        # 订阅窗口事件兜底：页面加载完 / 窗口显示 / 还原时都重设一次。
+        try:
+            window.events.loaded += self._on_window_frame_event
+            window.events.shown += self._on_window_frame_event
+            window.events.restored += self._on_window_frame_event
+        except Exception:
+            logger.debug("订阅窗口事件失败", exc_info=True)
+
+    def _on_window_frame_event(self):
+        """窗口框架事件回调：DWM 重建非客户区后重设标题栏主题（线程内延迟执行）。"""
+        threading.Thread(target=self._reapply_worker, daemon=True,
+                         name="gui-titlebar-event-reapply").start()
 
     # ------------------------------------------------------------------
     # 窗口标题栏主题（Windows DWM 沉浸式深色标题栏，保留原生最小化/关闭按钮）
@@ -274,7 +299,7 @@ class ApiBridge:
 
     def _reapply_worker(self):
         """找到窗口后延迟重设标题栏主题，覆盖启动后期边框被重建的场景。"""
-        for delay in (3, 7):
+        for delay in (0.5, 3, 7, 15, 30):
             time.sleep(delay)
             self._apply_titlebar_theme()
 
@@ -345,6 +370,18 @@ class ApiBridge:
         self._titlebar_dark = bool(dark)
         self._apply_titlebar_theme()
         return {"ok": True}
+
+    def set_gui_theme(self, theme_light: bool) -> Dict[str, Any]:
+        """持久化界面主题明暗（原子写入 config.json），并同步窗口标题栏。
+
+        用户关闭再打开后主题保持不变：启动时由 get_initial_state 的
+        theme_light 字段恢复。默认 False（深色）。
+        """
+        light = bool(theme_light)
+        from config import save_config_value
+        ok = save_config_value("gui_theme_light", light)
+        self.set_titlebar_theme(not light)
+        return {"ok": bool(ok)}
 
     def _sync_active_model_context(self):
         """把当前激活模型同步给 app_context，供 core 层（子代理等）读取。"""
@@ -509,6 +546,8 @@ class ApiBridge:
                 "current_session": self._current_session,
                 "messages": self._load_session_messages(self._current_session),
                 "token_usage": self.get_token_usage(),
+                # 持久化的界面主题（True=浅色），前端启动时据此恢复，关闭重开不变
+                "theme_light": bool(config_data.get("gui_theme_light", False)),
                 "version": str(YCODE_VERSION),
             }
         except Exception as e:
@@ -611,12 +650,13 @@ class ApiBridge:
             raw = self._memory.get_all_sessions(workdir=None, source="GUI", include_empty=True)
             saved_workspaces = self._memory.get_all_workspaces()
             current_wdir = _resolve_real_path(os.getcwd())
+            app_dir = _app_install_dir()
             # “当前”标记必须以【当前会话归属】为准，不能用进程 cwd：
             # 恢复最近会话会 chdir 到项目目录，此时新建自由对话，
             # 若按 cwd 标记就会出现“对话”和项目分组同时显示“当前”
             current_session_wdir = self._session_workdir(self._current_session)
 
-            if current_wdir != "GLOBAL":
+            if current_wdir != "GLOBAL" and current_wdir != app_dir:
                 self._memory.add_workspace(current_wdir)
 
             groups_dict: Dict[str, Dict[str, Any]] = {}
@@ -632,7 +672,7 @@ class ApiBridge:
 
             # 1. 初始化所有已记录引入过的项目文件夹，哪怕会话数为 0 也保留
             all_known_wdirs = set(saved_workspaces)
-            if current_wdir != "GLOBAL":
+            if current_wdir != "GLOBAL" and current_wdir != app_dir:
                 all_known_wdirs.add(current_wdir)
 
             for s in raw:
