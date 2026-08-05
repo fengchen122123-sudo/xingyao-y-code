@@ -162,7 +162,11 @@ from core.command_policy import (
     session_rule_for_command,
 )
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
-from core.tool_presenter import summarize_tool_finished, summarize_tool_started
+from core.tool_presenter import (
+    build_tool_display,
+    summarize_tool_finished,
+    summarize_tool_started,
+)
 from core.turn_events import TurnEventFactory
 import core.app_context as app_context
 
@@ -1620,6 +1624,21 @@ def _tool_event_payload(tc):
         "preview": str(preview)[:120],
         "arguments": arguments,
         "summary": summarize_tool_started(function_name, arguments),
+        "display": build_tool_display(function_name, arguments),
+    }
+
+
+def _tool_finished_event_payload(tc, result, duration_ms):
+    function_name = tc["function"]["name"]
+    arguments = _tool_call_arguments(tc)
+    ok = _tool_result_ok(function_name, result)
+    return {
+        **_tool_event_payload(tc),
+        "ok": ok,
+        "summary": _tool_output_preview(function_name, arguments, result),
+        "result": _tool_result_text(result),
+        "duration_ms": max(0, int(duration_ms)),
+        "display": build_tool_display(function_name, arguments, result, ok=ok),
     }
 
 
@@ -1776,7 +1795,15 @@ def _repair_truncated_json(raw):
     return repaired
 
 
-def _show_file_diff(file_path, old_content, new_content, event_callback, panel_title, truncated_note):
+def _show_file_diff(
+    file_path,
+    old_content,
+    new_content,
+    event_callback,
+    panel_title,
+    truncated_note,
+    tool_call_id="",
+):
     """渲染文件修改 diff 面板（write_file / edit_file 共用）。"""
     try:
         from core.diff_viewer import generate_diff, render_diff_table
@@ -1802,6 +1829,7 @@ def _show_file_diff(file_path, old_content, new_content, event_callback, panel_t
             safe_print(ANSI(diff_output))
         else:
             _notify_event(event_callback, "diff_ready", {
+                "tool_call_id": str(tool_call_id or ""),
                 "file_path": file_path,
                 # text: 终端用的 rich 面板（含 ANSI 颜色），TUI 直接打印
                 "text": diff_output,
@@ -2130,6 +2158,7 @@ def _execute_single_tool_call(
                         event_callback,
                         panel_title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
                         truncated_note="已成功写入文件",
+                        tool_call_id=tc["id"],
                     )
                     result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
         elif function_name == "run_subagent":
@@ -2391,6 +2420,7 @@ def _execute_single_tool_call(
                             event_callback,
                             panel_title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
                             truncated_note="已局部替换并修改成功",
+                            tool_call_id=tc["id"],
                         )
         else:
             # 通用兜底：优先查进程内工具注册表（含 imom_locator 等插件工具），
@@ -3372,6 +3402,12 @@ def _chat_with_model_generator(
                     permission_source=permission_source,
                 )
 
+            def execute_timed(tool_call):
+                started_at = time.monotonic()
+                result = execute_in_context(tool_call)
+                duration_ms = round((time.monotonic() - started_at) * 1000)
+                return result, max(0, duration_ms)
+
             # 只把显式声明为 parallel_safe 的相邻工具放入同一并发批次。
             batches = []
             for tc in tool_calls_list:
@@ -3401,39 +3437,31 @@ def _chat_with_model_generator(
                     from concurrent.futures import ThreadPoolExecutor
                     executor = ThreadPoolExecutor(max_workers=min(len(batch), 4))
                     try:
-                        results = list(executor.map(execute_in_context, batch))
+                        timed_results = list(executor.map(execute_timed, batch))
                     finally:
                         executor.shutdown(wait=False, cancel_futures=True)
+                    results = [result for result, _duration_ms in timed_results]
+                    durations = [duration_ms for _result, duration_ms in timed_results]
                     messages.extend(results)
-                    for tc, res in zip(batch, results):
-                        arguments = _tool_call_arguments(tc)
-                        _notify_event(event_callback, "tool_finished", {
-                            **_tool_event_payload(tc),
-                            "ok": _tool_result_ok(tc["function"]["name"], res),
-                            "summary": _tool_output_preview(
-                                tc["function"]["name"], arguments, res
-                            ),
-                            # 完整工具结果（截断）：GUI 需要展开查看，TUI 忽略此字段
-                            "result": _tool_result_text(res),
-                        })
+                    for tc, res, duration_ms in zip(batch, results, durations):
+                        _notify_event(
+                            event_callback,
+                            "tool_finished",
+                            _tool_finished_event_payload(tc, res, duration_ms),
+                        )
                     if stream:
                         pending_persistence.extend(("tool", res) for res in results)
                 else:
                     # 修改类工具：串行处理以保证授权及状态顺序
                     for tc in batch:
                         raise_if_cancelled()
-                        res = execute_in_context(tc)
+                        res, duration_ms = execute_timed(tc)
                         messages.append(res)
-                        arguments = _tool_call_arguments(tc)
-                        _notify_event(event_callback, "tool_finished", {
-                            **_tool_event_payload(tc),
-                            "ok": _tool_result_ok(tc["function"]["name"], res),
-                            "summary": _tool_output_preview(
-                                tc["function"]["name"], arguments, res
-                            ),
-                            # 完整工具结果（截断）：GUI 需要展开查看，TUI 忽略此字段
-                            "result": _tool_result_text(res),
-                        })
+                        _notify_event(
+                            event_callback,
+                            "tool_finished",
+                            _tool_finished_event_payload(tc, res, duration_ms),
+                        )
                         if stream:
                             pending_persistence.append(("tool", res))
                 yield ""

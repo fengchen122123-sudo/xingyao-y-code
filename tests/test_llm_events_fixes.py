@@ -5,7 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from core.llm import chat_with_model_events
+from core.llm import _show_file_diff, chat_with_model_events
 
 
 def _chunk(content="", tool_calls=None, reasoning="", provider_fields=None, usage=None):
@@ -36,6 +36,24 @@ def _tool_call(index, call_id, name, arguments):
         id=call_id,
         function=SimpleNamespace(name=name, arguments=arguments),
     )
+
+
+def test_diff_ready_contains_exact_tool_call_id():
+    events = []
+
+    _show_file_diff(
+        "sample.py",
+        "old\n",
+        "new\n",
+        lambda kind, payload: events.append((kind, payload)),
+        panel_title="test diff",
+        truncated_note="test",
+        tool_call_id="edit-7",
+    )
+
+    assert events[0][0] == "diff_ready"
+    assert events[0][1]["tool_call_id"] == "edit-7"
+    assert events[0][1]["file_path"] == "sample.py"
 
 
 def test_compression_replaces_messages_in_place(mocker, monkeypatch):

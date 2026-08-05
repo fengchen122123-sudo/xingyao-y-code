@@ -1,10 +1,13 @@
 from copy import deepcopy
 from types import SimpleNamespace
 import threading
+import time
 import pytest
 
 from core.llm import (
     _complete_thinking_blocks,
+    _tool_event_payload,
+    _tool_finished_event_payload,
     _tool_output_preview,
     chat_with_model_events,
 )
@@ -29,6 +32,80 @@ def _tool_call(index, call_id, name, arguments):
         id=call_id,
         function=SimpleNamespace(name=name, arguments=arguments),
     )
+
+
+def test_tool_start_payload_has_structured_display():
+    payload = _tool_event_payload({
+        "id": "cmd-start",
+        "function": {
+            "name": "execute_command",
+            "arguments": '{"command":"pytest -q"}',
+        },
+    })
+
+    assert payload["display"]["category"] == "command"
+    assert payload["display"]["command"] == "pytest -q"
+
+
+def test_tool_finish_payload_has_duration_result_and_display():
+    tc = {
+        "id": "read-1",
+        "function": {
+            "name": "read_file",
+            "arguments": '{"file_path":"core/llm.py"}',
+        },
+    }
+    result = {
+        "role": "tool",
+        "tool_call_id": "read-1",
+        "name": "read_file",
+        "content": "one\ntwo",
+    }
+
+    payload = _tool_finished_event_payload(tc, result, duration_ms=125)
+
+    assert payload["duration_ms"] == 125
+    assert payload["display"]["metrics"] == {"line_count": 2}
+    assert payload["ok"] is True
+    assert payload["result"] == "one\ntwo"
+
+
+def test_parallel_tool_finished_events_keep_each_call_duration(mocker):
+    first_response = iter([_chunk(tool_calls=[
+        _tool_call(0, "call-slow", "glob_files", '{"pattern":"*.py"}'),
+        _tool_call(1, "call-fast", "glob_files", '{"pattern":"*.md"}'),
+    ])])
+    final_response = iter([_chunk("done")])
+    mocker.patch("core.llm.completion", side_effect=[first_response, final_response])
+
+    def fake_execute(tc, **_kwargs):
+        if tc["id"] == "call-slow":
+            time.sleep(0.08)
+        return {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": tc["function"]["name"],
+            "content": tc["id"],
+        }
+
+    mocker.patch("core.llm._execute_single_tool_call", side_effect=fake_execute)
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "run tools"}],
+        persist=False,
+        turn_id="turn-duration-per-call",
+    ))
+    finished = {
+        event.payload["id"]: event.payload
+        for event in events
+        if event.kind == "tool_finished"
+    }
+
+    assert finished["call-slow"]["duration_ms"] >= 60
+    assert finished["call-fast"]["duration_ms"] < 50
+    assert finished["call-slow"]["duration_ms"] > finished["call-fast"]["duration_ms"]
 
 
 def test_event_stream_orders_parallel_read_tools(mocker):
