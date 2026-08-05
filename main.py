@@ -339,6 +339,12 @@ def _render_usage_section(manager, label, start_s, end_s):
         print_formatted_text(HTML(
             f"  <ansicyan>{_pad_right('小计', name_w)} {sub['prompt']:>14} {sub['completion']:>14} {sub['cached']:>14} {_sub_rate:>10} {sub['total']:>14}</ansicyan>"
         ))
+    inv = manager.query_cache_invalidation_events(start_s, end_s)
+    if inv["count"]:
+        print_formatted_text(HTML(
+            f"  <ansigray>缓存失效事件 {inv['count']} 次（输入≥2万且命中率&lt;50%），"
+            f"多消耗输入 {inv['lost_tokens']} tokens——属 provider/网关侧缓存驱逐，客户端无法避免</ansigray>"
+        ))
     return True
 
 

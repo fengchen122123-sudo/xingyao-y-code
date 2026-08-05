@@ -415,6 +415,30 @@ class MemoryManager:
                 for row in cursor.fetchall()
             ]
 
+    def query_cache_invalidation_events(
+        self, start_date, end_date, min_prompt_tokens=20000, max_hit_ratio=0.5
+    ):
+        """统计指定日期区间内的“缓存全失效”事件：大输入但命中率极低。
+
+        典型特征：上一轮还 95%+ 命中，本轮 cached 骤降到接近 0，随后一轮又恢复——
+        这是 provider/网关侧前缀缓存条目被驱逐的标志，客户端无法避免。
+        返回 {"count": 事件数, "lost_tokens": 这些事件多消耗的输入 token}。
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT COUNT(*), COALESCE(SUM(prompt_tokens - cached_tokens), 0)
+                FROM token_usage
+                WHERE date >= ? AND date <= ?
+                  AND prompt_tokens >= ?
+                  AND cached_tokens < prompt_tokens * ?
+                """,
+                (str(start_date), str(end_date),
+                 int(min_prompt_tokens), float(max_hit_ratio)),
+            )
+            row = cursor.fetchone()
+        return {"count": int(row[0] or 0), "lost_tokens": int(row[1] or 0)}
+
     def close(self):
         """关闭数据库连接前自动刷盘 WAL 日志。"""
         with self._lock:
