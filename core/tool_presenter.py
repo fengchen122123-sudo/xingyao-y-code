@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import re
+from typing import Any
 
 
 _TOOL_COPY = {
@@ -20,6 +22,56 @@ _TOOL_COPY = {
     "plan_write": ("更新任务计划", "任务计划已更新", ""),
     "plan_update": ("更新计划项", "计划项已更新", "item_id"),
 }
+
+_TOOL_CATEGORIES = {
+    "read_file": "read",
+    "search_code": "search",
+    "glob_files": "search",
+    "execute_command": "command",
+    "write_file": "mutation",
+    "edit_file": "mutation",
+}
+
+_TOOL_ACTIONS = {
+    "read_file": "读取文件",
+    "search_code": "搜索代码",
+    "glob_files": "查找文件",
+    "execute_command": "运行命令",
+    "write_file": "写入文件",
+    "edit_file": "修改文件",
+    "list_directory": "查看目录",
+    "search_news": "搜索资料",
+    "fetch_url": "访问网址",
+    "get_weather": "查询天气",
+    "run_subagent": "调度子代理",
+    "manage_task": "管理后台任务",
+    "ask_user": "等待用户回答",
+    "plan_write": "更新任务计划",
+    "plan_update": "更新计划项",
+}
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+_CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+_NAMED_SECRET_RE = re.compile(
+    r'(?i)(["\']?(?:api[_-]?key|authorization|token|password)["\']?\s*[:=]\s*)'
+    r'(Bearer\s+[A-Za-z0-9._~+/=-]+|"[^"]*"|\'[^\']*\'|[^\s,;]+)'
+)
+_BEARER_RE = re.compile(r"(?i)(\bBearer\s+)[A-Za-z0-9._~+/=-]+")
+_OPENAI_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b")
+
+
+def sanitize_tool_display_text(value: object, limit: int = 160) -> str:
+    text = _ANSI_RE.sub("", str(value or ""))
+    text = _CONTROL_RE.sub("", text.replace("\r", " ").replace("\n", " "))
+    text = _NAMED_SECRET_RE.sub(lambda match: f"{match.group(1)}***", text)
+    text = _BEARER_RE.sub(lambda match: f"{match.group(1)}***", text)
+    text = _OPENAI_KEY_RE.sub("***", text)
+    text = " ".join(text.split())
+    if len(text) <= limit:
+        return text
+    if limit <= 3:
+        return text[:limit]
+    return text[: limit - 3].rstrip() + "..."
 
 
 def _skill_name_from_path(file_path: str) -> str:
@@ -45,6 +97,41 @@ def tool_target(name: str, arguments: dict) -> str:
         if len(target) > 48:
             target = target[:45] + "..."
     return target
+
+
+def build_tool_display(
+    name: str,
+    arguments: dict,
+    result: dict | None = None,
+    ok: bool | None = None,
+) -> dict[str, object]:
+    """Build presentation-safe metadata for tool activity consumers."""
+    file_path = str(arguments.get("file_path", ""))
+    skill_name = _skill_name_from_path(file_path) if name == "read_file" else ""
+    category = "skill" if skill_name else _TOOL_CATEGORIES.get(name, "other")
+    target = skill_name or tool_target(name, arguments)
+    command = str(arguments.get("command", "")) if name == "execute_command" else ""
+    result_data: dict[str, Any] = result if isinstance(result, dict) else {}
+    metrics: dict[str, int] = {}
+    if name == "read_file" and ok is True:
+        content = result_data.get("content")
+        if isinstance(content, str):
+            metrics["line_count"] = len(content.splitlines()) if content else 0
+
+    error_summary = ""
+    if ok is False:
+        error_content = str(result_data.get("content", "") or "").lstrip("🚨").strip()
+        error_summary = sanitize_tool_display_text(error_content, 160)
+
+    return {
+        "category": category,
+        "action": _TOOL_ACTIONS.get(name, f"使用工具 {name}"),
+        "target": sanitize_tool_display_text(target, 160),
+        "command": sanitize_tool_display_text(command, 240),
+        "metrics": metrics,
+        "error_summary": error_summary,
+        "is_skill": bool(skill_name),
+    }
 
 
 def summarize_tool_started(name: str, arguments: dict) -> str:
