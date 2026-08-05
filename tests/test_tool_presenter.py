@@ -10,18 +10,27 @@ from core.tool_presenter import (
 
 def test_display_text_redacts_cookie_and_secret_header_and_assignment_forms():
     cleaned = sanitize_tool_display_text(
-        "Cookie: sid=session-secret; theme=dark cookie=browser-secret "
+        "cookie=browser-secret "
         "client_secret='client-secret' secret=plain-secret"
     )
 
-    assert "session-secret" not in cleaned
     assert "browser-secret" not in cleaned
     assert "client-secret" not in cleaned
     assert "plain-secret" not in cleaned
-    assert "Cookie: ***" in cleaned
     assert "cookie=***" in cleaned
     assert "client_secret=***" in cleaned
     assert "secret=***" in cleaned
+
+
+def test_display_text_redacts_every_value_in_a_cookie_header():
+    cleaned = sanitize_tool_display_text(
+        "Cookie: first=first-secret; second=second-secret; theme=dark"
+    )
+
+    assert "first-secret" not in cleaned
+    assert "second-secret" not in cleaned
+    assert "theme=dark" not in cleaned
+    assert cleaned == "Cookie: ***"
 
 
 def test_unknown_tool_action_redacts_embedded_secret():
