@@ -1067,6 +1067,10 @@ class ApiBridge:
         api_key = ""
         turn_finished = False
         cancelled = False
+        error_state = {
+            "toast_messages": set(),
+            "terminal_message": None,
+        }
 
         def finish_once():
             """turn_finish 只允许发出一次（历史实现在 end + finally 各发一次）。"""
@@ -1151,7 +1155,13 @@ class ApiBridge:
             poller.start()
             try:
                 cancelled = self._consume_turn_events(
-                    history, model_name, api_key, api_base, session_name, turn_id
+                    history,
+                    model_name,
+                    api_key,
+                    api_base,
+                    session_name,
+                    turn_id,
+                    error_state=error_state,
                 )
             finally:
                 poller_stop.set()
@@ -1166,7 +1176,7 @@ class ApiBridge:
                 self._maybe_auto_rename(session_name)
         except Exception as e:
             logger.exception("GUI 对话回合失败")
-            self.emit_event("error", {"message": _sanitize_for_ui(str(e), api_key)})
+            self._emit_owned_error(str(e), api_key, error_state, terminal=True)
         finally:
             self._task_status = "idle"
             try:
@@ -1293,12 +1303,41 @@ class ApiBridge:
             if stopped:
                 break
 
-    def _consume_turn_events(self, history, model_name, api_key, api_base, session_name, turn_id) -> bool:
+    def _emit_owned_error(self, message, api_key, error_state, *, terminal):
+        """Emit one terminal state and one toast per sanitized error message."""
+        sanitized = _sanitize_for_ui(str(message), api_key)
+        if terminal and error_state["terminal_message"] is None:
+            error_state["terminal_message"] = sanitized
+            self.emit_event("turn_error", {"message": sanitized})
+
+        toast_messages = error_state["toast_messages"]
+        if sanitized in toast_messages:
+            return
+        toast_messages.add(sanitized)
+        self.emit_event("error", {"message": sanitized})
+
+    def _consume_turn_events(
+        self,
+        history,
+        model_name,
+        api_key,
+        api_base,
+        session_name,
+        turn_id,
+        *,
+        error_state=None,
+    ) -> bool:
         """迭代模型事件并翻译为前端事件；返回本轮是否被取消。"""
         from core.llm import chat_with_model_events
 
         cancelled = False
         tool_labels: Dict[str, str] = {}
+        started_tool_ids: set[str] = set()
+        if error_state is None:
+            error_state = {
+                "toast_messages": set(),
+                "terminal_message": None,
+            }
 
         for event in chat_with_model_events(
             model_name,
@@ -1334,8 +1373,15 @@ class ApiBridge:
                 name = str(data.get("name") or "tool")
                 label = str(data.get("summary") or data.get("preview") or name)
                 tool_labels[tool_id] = label
-                # tool_requested 与 tool_started 都会到达，前端按 id 去重合并
-                self.emit_event("tool_start", {"id": tool_id, "name": name, "label": label})
+                if tool_id not in started_tool_ids:
+                    started_tool_ids.add(tool_id)
+                    self.emit_event("tool_start", {
+                        "id": tool_id,
+                        "name": name,
+                        "label": label,
+                        "display": dict(data.get("display") or {}),
+                        "started_at_ms": int(time.time() * 1000),
+                    })
             elif kind == "tool_finished":
                 tool_id = str(data.get("id") or "")
                 name = str(data.get("name") or "tool")
@@ -1347,10 +1393,14 @@ class ApiBridge:
                     "ok": bool(data.get("ok", True)),
                     "summary": str(data.get("summary") or ""),
                     "result": str(data.get("result") or ""),
+                    "error": str(data.get("error") or ""),
+                    "duration_ms": data.get("duration_ms"),
+                    "display": dict(data.get("display") or {}),
                 })
             elif kind == "diff_ready":
                 # 优先取纯文本 unified diff；缺失时才退回终端版本（含 ANSI 颜色）
                 self.emit_event("diff_ready", {
+                    "tool_call_id": str(data.get("tool_call_id") or ""),
                     "file_path": str(data.get("file_path") or ""),
                     "diff_text": str(data.get("diff_text") or data.get("text") or ""),
                 })
@@ -1361,10 +1411,20 @@ class ApiBridge:
                 })
             elif kind == "turn_cancelled":
                 cancelled = True
-            elif kind in ("turn_error", "error"):
-                self.emit_event("error", {
-                    "message": _sanitize_for_ui(str(data.get("message") or "模型生成错误"), api_key),
-                })
+            elif kind == "turn_error":
+                self._emit_owned_error(
+                    data.get("message") or "模型生成错误",
+                    api_key,
+                    error_state,
+                    terminal=True,
+                )
+            elif kind == "error":
+                self._emit_owned_error(
+                    data.get("message") or "模型生成错误",
+                    api_key,
+                    error_state,
+                    terminal=False,
+                )
             elif kind in ("notice", "status"):
                 message = data.get("message")
                 if message:
@@ -2012,6 +2072,7 @@ class ApiBridge:
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                     capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             else:
                 proc.kill()

@@ -2,6 +2,7 @@ from concurrent.futures import Future
 
 import main
 from core.permission_broker import PermissionBroker
+from core.tool_progress import ActiveToolStatus
 from core.turn_events import TurnEventFactory
 from rich.text import Text
 
@@ -253,6 +254,39 @@ def test_turn_activity_labels_distinguish_thinking_from_working():
     assert main._turn_activity_label("waiting") == "星瑶等待你的确认..."
 
 
+def test_activity_text_shows_command_and_interrupt_hint():
+    status = ActiveToolStatus(
+        label="正在运行测试",
+        detail=r"venv\Scripts\python -m pytest -q",
+        count=1,
+        started_at=10.0,
+    )
+
+    assert main._format_activity_text("executing", status, 8.4, "⠋") == (
+        "  ⠋ 正在运行测试 · 8.4s · Ctrl+C 中断\n"
+        "    └─ venv\\Scripts\\python -m pytest -q"
+    )
+
+
+def test_activity_window_has_room_for_command_detail(monkeypatch):
+    captured = {}
+
+    class FakeApplication:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(main, "Application", FakeApplication)
+
+    main._make_input_app()
+
+    activity_window = captured["layout"].container.content.children[4].content
+    height = activity_window.height
+    if callable(height):
+        height = height()
+    minimum = height if isinstance(height, int) else height.min
+    assert minimum >= 2
+
+
 def test_tool_started_switches_ui_to_executing_state(monkeypatch):
     factory = TurnEventFactory("turn-tool-state")
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
@@ -389,10 +423,9 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
 
     main._render_ui_event(factory.emit("thinking_finished"))
 
-    # 思考内容本身永不打印；thinking_finished 当下立即打印一行
-    # "思考完成 · 用时 X"作为该段输出正文的分隔线
+    # 思考内容和完成分隔线都不进入终端历史。
     plain_so_far = Text.from_ansi("".join(writes)).plain
-    assert "思考完成" in plain_so_far
+    assert "思考完成" not in plain_so_far
     assert "用户说了" not in plain_so_far
     # 思考结束后面板延迟隐藏：保留最后一帧思考内容，直到下一个事件到来
     assert main.active_thinking_text == '用户说了"你好"'
@@ -406,12 +439,12 @@ def test_ui_streams_thinking_text_in_temporary_panel_then_collapses(monkeypatch)
     plain = Text.from_ansi("".join(writes)).plain
     assert "用户说了" not in plain
     assert "你好" not in plain
-    assert "思考完成" in plain
+    assert "思考完成" not in plain
     main.ui_renderers.pop("turn-inline-thinking", None)
 
 
-def test_each_thinking_segment_prints_its_own_divider_line(monkeypatch):
-    """工具循环中每段思考在结束时立即打印一行分隔线，把各段输出隔开。"""
+def test_thinking_segments_do_not_print_completion_dividers(monkeypatch):
+    """多段思考不刷空完成行，且结束后仍正常输出最终回答。"""
     factory = TurnEventFactory("turn-thinking-segments")
     fragments = []
 
@@ -425,21 +458,110 @@ def test_each_thinking_segment_prints_its_own_divider_line(monkeypatch):
     for index in range(3):
         main._render_ui_event(factory.emit("thinking_started"))
         main._render_ui_event(factory.emit("thinking_delta", {"text": f"分析{index}"}))
-        # 800ms 阈值：模拟每段思考耗时 1s，越过阈值才会打印分隔线
         main.think_start_time -= 1.0
         main._render_ui_event(factory.emit("thinking_finished"))
-        # 每段思考结束都立即打印一行分隔线
-        assert Text.from_ansi("".join(fragments)).plain.count("思考完成") == index + 1
+        assert all("思考完成" not in Text.from_ansi(fragment).plain for fragment in fragments)
 
     main._render_ui_event(factory.emit("assistant_delta", {"text": "结论"}))
     main._render_ui_event(factory.emit("turn_finished"))
 
     plain = Text.from_ansi("".join(fragments)).plain
-    # 三段思考三行分隔线，不再合并为一行；思考内容本身永不打印
-    assert plain.count("思考完成") == 3
-    assert "共 3 段" not in plain
+    assert "思考完成" not in plain
     assert "分析0" not in plain
+    assert "结论" in plain
     main.ui_renderers.pop("turn-thinking-segments", None)
+
+
+def test_tool_failure_continues_to_corrected_command_and_final_answer(monkeypatch):
+    factory = TurnEventFactory("turn-tool-failure-continues")
+    fragments = []
+    states = []
+
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_print_ui_fragment", fragments.append)
+    monkeypatch.setattr(main, "app_instance", None)
+    main.ui_renderers.pop("turn-tool-failure-continues", None)
+    main.task_status = "thinking"
+
+    failed = {
+        "id": "bad",
+        "name": "execute_command",
+        "ok": False,
+        "duration_ms": 100,
+        "display": {
+            "category": "command",
+            "action": "运行命令",
+            "target": "pytest -q",
+            "command": "pytest -q",
+            "error_summary": "ModuleNotFoundError: pytest",
+        },
+    }
+    corrected = {
+        "id": "good",
+        "name": "execute_command",
+        "ok": True,
+        "duration_ms": 200,
+        "display": {
+            "category": "command",
+            "action": "运行命令",
+            "target": "python -m pytest -q",
+            "command": "python -m pytest -q",
+        },
+    }
+
+    for kind, payload in (
+        ("tool_started", failed),
+        ("tool_finished", failed),
+        ("tool_started", corrected),
+    ):
+        main._render_ui_event(factory.emit(kind, payload))
+        states.append(main.task_status)
+
+    assert "运行命令失败" in Text.from_ansi("".join(fragments)).plain
+    assert states == ["executing", "executing", "executing"]
+    assert main._active_tool_status.detail == "python -m pytest -q"
+
+    main._render_ui_event(factory.emit("tool_finished", corrected))
+    main._render_ui_event(factory.emit("assistant_delta", {"text": "测试已通过。"}))
+    main._render_ui_event(factory.emit("turn_finished"))
+
+    assert "测试已通过。" in Text.from_ansi("".join(fragments)).plain
+
+
+def test_grouped_tool_output_stays_outside_markdown_buffer(monkeypatch):
+    turn_id = "turn-tool-output-outside-markdown"
+    factory = TurnEventFactory(turn_id)
+    fragments = []
+
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_print_ui_fragment", fragments.append)
+    monkeypatch.setattr(main, "app_instance", None)
+    main.ui_renderers.pop(turn_id, None)
+    main._assistant_stream_buffers.pop(turn_id, None)
+
+    for index in range(2):
+        payload = {
+            "id": f"read-{index}",
+            "name": "read_file",
+            "ok": True,
+            "duration_ms": 100,
+            "display": {
+                "category": "read",
+                "action": "读取文件",
+                "target": f"file-{index}.py",
+                "metrics": {"line_count": 10},
+            },
+        }
+        main._render_ui_event(factory.emit("tool_started", payload))
+        main._render_ui_event(factory.emit("tool_finished", payload))
+
+    main._render_ui_event(factory.emit("assistant_delta", {"text": "最终答案"}))
+
+    assert "已读取 2 个文件" in Text.from_ansi("".join(fragments)).plain
+    assert main._assistant_stream_buffers[turn_id] == "最终答案"
+    assert all("已读取" not in value for value in main._assistant_stream_buffers.values())
+
+    main._render_ui_event(factory.emit("turn_finished"))
 
 
 def test_brief_thinking_under_800ms_prints_no_divider_line(monkeypatch):
