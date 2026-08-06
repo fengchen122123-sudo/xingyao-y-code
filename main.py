@@ -34,6 +34,38 @@ if sys.stderr and hasattr(sys.stderr, "buffer") and getattr(sys.stderr, "encodin
 # 防止 PyInstaller 双重导入主入口模块导致全局变量（如 app_instance 等）在子线程内读取为 None 的双重导入陷阱
 if '__main__' in sys.modules and 'main' not in sys.modules:
     sys.modules['main'] = sys.modules['__main__']
+
+# 启动即时反馈：后续 import 链（prompt_toolkit/mcp/core 等）需要数秒，
+# 在此之前先打印一行启动提示，避免用户输入 ycode 后终端毫无反应。
+# headless 模式（-p/--prompt）与重定向输出（管道/测试捕获）下保持安静，
+# 避免污染 stdout 的程序化消费。
+def _is_headless_invocation():
+    argv = sys.argv[1:]
+    return any(
+        arg in ("-p", "--prompt") or arg.startswith("--prompt=")
+        for arg in argv
+    )
+
+
+if (
+    sys.stdout is not None
+    and sys.stdout.isatty()
+    and not _is_headless_invocation()
+):
+    print("  星瑶正在启动，请稍候...", flush=True)
+
+# TEMP STARTUP TRACE (revert after diagnosis)：从启动提示处开始全程计时
+import time as _time
+_STARTUP_T0 = _time.monotonic()
+def _startup_trace(label):
+    try:
+        import os as _os
+        with open(_os.path.join(_os.path.expanduser("~"), ".ycode", "startup-trace.log"), "a", encoding="utf-8") as _tf:
+            _tf.write(f"{_time.monotonic()-_STARTUP_T0:8.2f}s  {_time.strftime('%H:%M:%S')}  {label}\n")
+    except Exception:
+        pass
+_startup_trace("startup line printed (import chain begins)")
+
 from core.runtime_warnings import configure_runtime_warnings
 configure_runtime_warnings()
 import datetime
@@ -63,7 +95,8 @@ from prompt_toolkit.history import FileHistory
 from prompt_toolkit.keys import Keys
 
 from core.memory import MemoryManager
-from core.history_renderer import render_session_history
+# 启动优化：history_renderer / terminal_markdown（连带 rich+markdown_it ~0.5s）
+# 不在顶部 import，延迟到首次渲染历史/回答时在函数内加载。
 from core.paste_placeholders import PastedTextStore, normalize_pasted_text
 import core.agent_service as _agent_service
 from core.llm import chat_with_model_events, session_token_usage, token_usage_lock
@@ -73,14 +106,15 @@ from core.turn_controller import TurnController
 from core.turn_renderer import TurnRenderer
 from core.ui_markers import ANSI_GRAY, ANSI_RESET, plan_color, plan_html_color, plan_mark
 from core.plan import bind_default_plan_session, get_default_plan_manager
-from core.terminal_markdown import MarkdownRenderError, render_markdown_to_ansi
 from core.model_manager import get_active_model
 from core.version import __version__ as YCODE_VERSION
 # 警告：from-import 会在 import 时冻结常量值。新增调用方禁止 from-import 这些常量，
 # 应 import config 后动态读取（如 config.MY_MODEL），以便配置热更新生效。
 from config import MY_MODEL, MY_KEY, MY_BASE_URL, MY_THEME, MY_PERMISSION_MODE, DB_FILE
 
+_startup_trace("import chain done")
 manager = MemoryManager(db_path=DB_FILE)
+_startup_trace("MemoryManager ready")
 
 # ---------------------------------------------------------------------------
 # 全局状态所有权约定（为后续 AppState 结构化重构铺路）：
@@ -125,6 +159,10 @@ active_cancel_event = None
 active_turn_id = None
 app_instance = None
 is_thinking = False
+# LLM 引擎（litellm/tiktoken/模型能力探测）是否已在后台预热完成。
+# 首轮对话若赶在预热完成前发出，状态行会显示“正在启动模型引擎”而不是
+# 让用户误以为卡死。
+_llm_engine_ready = False
 task_status = 'idle'  # 全局运行状态：'idle' (闲置), 'thinking' (思考中), 'executing' (执行中), 'waiting' (等待确认)
 think_start_time = 0
 # 底部活动指示区使用的独立墙钟计时起点：思考开始/首个工具开始时刷新，
@@ -837,6 +875,7 @@ def _render_public_answer_block(turn_id: str, text: str) -> None:
         _answer_header_printed[turn_id] = True
         print_formatted_text(HTML("\n<b><magenta>🤖 星瑶 &gt;</magenta></b> "))
     try:
+        from core.terminal_markdown import MarkdownRenderError, render_markdown_to_ansi
         rendered = render_markdown_to_ansi(block, _terminal_width())
     except MarkdownRenderError:
         rendered = block
@@ -1343,6 +1382,7 @@ def show_session_history(session_name):
     _turn_separator_needed = False
     history = manager.get_history(session_name)
     safe_session = session_name.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+    from core.history_renderer import render_session_history
     rendered = render_session_history(history, _terminal_width())
     if not rendered:
         print_formatted_text(HTML(f"<ansiyellow>ℹ 会话 {safe_session} 当前没有任何对话记录。</ansiyellow>"))
@@ -2687,6 +2727,10 @@ def _make_input_app():
             # elapsed），避免两个动画刷新率不一致导致的观感卡顿。
             frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             frame = frames[int(time.time() * 5) % len(frames)]
+            # 首轮对话赶在后台预热完成前发出时，litellm/tiktoken 的首次
+            # import 需要数秒——如实显示“启动模型引擎”，避免看似卡死。
+            if not _llm_engine_ready and _active_tool_status is None:
+                return f"  {frame} 星瑶正在启动模型引擎 · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"
             return _format_activity_text(task_status, _active_tool_status, elapsed, frame)
         return ""
 
@@ -3392,6 +3436,10 @@ def run_cli():
     global app_instance, pending_action, current_session
     global current_model, current_key, current_url, current_ctx_win, current_model_name
 
+    # TEMP STARTUP TRACE (revert after diagnosis)
+    _trace_mark = _startup_trace
+    _trace_mark("run_cli enter")
+
     # 运行时初始化副作用集中在入口执行（而非模块 import 时），保证 main.py 可被安全 import
     _app_ctx.set_ui_flavor("tui")
     bind_default_plan_session(current_session)
@@ -3399,18 +3447,14 @@ def run_cli():
         _activate_permission_request,
         _dismiss_permission_prompt,
     )
-    # MCP 连接状态改由 TUI 主线程打印（core/mcp_client 自身不再 import main）
-    try:
-        from core.mcp_client import set_status_logger as _set_mcp_status_logger
-        _set_mcp_status_logger(
-            lambda message: schedule_ui(lambda text=message: print_formatted_text(text))
-        )
-    except Exception:
-        pass
+    # MCP 状态打印器的注册移入 _preload_mcp 后台线程（见下文），避免在首绘前
+    # 同步 import core.mcp_client（连带 mcp/pydantic/httpx，约 1.1~1.5s）。
 
     set_terminal_title("Y-code")
 
+    _trace_mark("before print_logo")
     print_logo()
+    _trace_mark("after print_logo")
 
     # 首次启动/完全无配置模型时，自动引导开启全屏模型配置选择器
     active_info = get_active_model()
@@ -3476,28 +3520,114 @@ def run_cli():
             sys.exit(0)
 
     # 启动后台处理线程
+    _trace_mark("before worker_thread")
     worker_thread = threading.Thread(target=_background_worker, daemon=True)
     worker_thread.start()
 
-    # 后台预加载 litellm，避免首次 LLM 调用时才 import 产生 1-3 秒卡顿
+    # ── 启动预热（同步阶段，TUI 出现前完成）──────────────────────────────
+    # 设计取向：启动慢一点没关系，但进入界面后必须立即可用、输入不卡。
+    # 若改为后台预热，litellm/mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
+    # 抢 GIL，实测会把首帧绘制卡 8 秒、键盘输入无回显。因此三个预热任务在
+    # 此处并发执行、主线程显示进度动画并等全部完成后再进入 TUI。
+    _trace_mark("preload phase begin")
+
     def _preload_litellm():
+        """预热 LLM 引擎：litellm import、tiktoken 编码加载（token_counter
+        首次调用）、模型视觉能力探测（首个 generator 会调用）。"""
+        global _llm_engine_ready
         try:
-            from core.llm import _get_litellm
+            from core.llm import _get_litellm, _litellm_token_counter, _supports_vision
             _get_litellm()
+            try:
+                _litellm_token_counter(
+                    current_model or "openai/gpt-4o-mini",
+                    [{"role": "user", "content": "预热"}],
+                )
+            except Exception:
+                pass
+            try:
+                if current_model:
+                    _supports_vision(current_model)
+            except Exception:
+                pass
         except Exception as e:
             logging.getLogger("py.warnings").warning("预加载 litellm 失败: %s", e)
+        finally:
+            _llm_engine_ready = True
+            _trace_mark("preload litellm done")
 
-    threading.Thread(target=_preload_litellm, daemon=True).start()
+    def _mcp_status_to_ui(message):
+        # 预热期 TUI 尚未启动：直接打印；TUI 运行后：经 schedule_ui 回 UI 线程
+        if app_instance is None:
+            print_formatted_text(message)
+        else:
+            schedule_ui(lambda text=message: print_formatted_text(text))
 
-    # 后台启动 MCP 连接，让首次 LLM 请求不必同步等待 MCP server 就绪
     def _preload_mcp():
+        """后台启动 MCP 连接，让首次 LLM 请求不必同步等待 MCP server 就绪。"""
+        # 廉价预检：没有任何“启用中”的 MCP 服务时直接跳过——避免 import mcp 全家桶
+        # （~1.1s），也不再打印“跳过已禁用的服务”噪音。
+        # 若用户之后通过 /mcp 启用服务，连接路径会按需惰性 import，不受影响。
         try:
-            from core.mcp_client import mcp_manager
+            import json as _json
+            from config import MCP_FILE as _mcp_file
+            try:
+                with open(_mcp_file, "r", encoding="utf-8") as _f:
+                    _servers = _json.load(_f).get("mcpServers", {})
+            except Exception:
+                _servers = {}
+            if not any(
+                not (isinstance(c, dict) and c.get("enabled", True) is False)
+                for c in _servers.values()
+            ):
+                _trace_mark("preload mcp skipped (no enabled servers)")
+                return
+        except Exception:
+            pass  # 预检失败不阻碍正常预热流程
+        try:
+            from core.mcp_client import mcp_manager, set_status_logger as _set_mcp_status_logger
+            # MCP 连接状态改由 TUI 主线程打印（core/mcp_client 自身不再 import main）
+            _set_mcp_status_logger(_mcp_status_to_ui)
             mcp_manager._ensure_connected()
+            _trace_mark("preload mcp done")
         except Exception as e:
             logging.getLogger("py.warnings").warning("MCP 后台连接失败: %s", e)
 
-    threading.Thread(target=_preload_mcp, daemon=True).start()
+    def _warm_token_usage():
+        """预热当前 session 的 Token 统计（会连带 tiktoken 首次加载），
+        同步完成后状态栏 token 数在首绘时就是准确值。"""
+        try:
+            recalc_token_usage()
+            _trace_mark("warm token usage done")
+        except Exception as e:
+            logging.getLogger("py.warnings").warning("启动预热 recalc_token_usage 失败: %s", e)
+
+    _preload_threads = [
+        threading.Thread(target=_preload_litellm, daemon=True),
+        threading.Thread(target=_preload_mcp, daemon=True),
+        threading.Thread(target=_warm_token_usage, daemon=True),
+    ]
+    for _t in _preload_threads:
+        _t.start()
+
+    # 进度动画：纯文本终端阶段（TUI 未启动），非 tty 时安静等待
+    _preload_t0 = time.monotonic()
+    _spin_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    _tty = sys.stdout is not None and sys.stdout.isatty()
+    try:
+        while any(_t.is_alive() for _t in _preload_threads):
+            if _tty:
+                _frame = _spin_frames[int((time.monotonic() - _preload_t0) * 10) % len(_spin_frames)]
+                print(f"\r  {_frame} 星瑶正在预热模型引擎 · {time.monotonic() - _preload_t0:.1f}s   ", end="", flush=True)
+            for _t in _preload_threads:
+                _t.join(timeout=0.1)
+    except KeyboardInterrupt:
+        # Ctrl+C：跳过等待直接进入界面（后台 daemon 线程仍会继续预热）
+        if _tty:
+            print("\r  ⚠️ 已跳过预热等待，首轮对话可能稍慢。           ")
+    if _tty and all(not _t.is_alive() for _t in _preload_threads):
+        print(f"\r  ✔ 预热完成（{time.monotonic() - _preload_t0:.1f}s），星瑶已就绪！           ")
+    _trace_mark("preload phase done")
 
     # 启动全局常驻 UI 刷新线程（用以维持思考计时器和星瑶运转状态微动画）
     def _ui_refresher_loop():
@@ -3517,23 +3647,12 @@ def run_cli():
 
     threading.Thread(target=_ui_refresher_loop, daemon=True).start()
 
-    # 首次启动，异步计算当前 session 的 Token
-    # 异步化原因：recalc_token_usage 会触发 litellm.token_counter（首次约 1.3s），
-    # 同步执行会让 UI 显示延迟。改为后台线程后 UI 立即出现，状态栏 token 数稍后填充。
-    def _async_recalc_token_usage():
-        try:
-            recalc_token_usage()
-            # 计算完成后刷新 UI 显示最新 token 数
-            schedule_ui(_invalidate_ui)
-        except Exception as e:
-            logging.getLogger("py.warnings").warning("首次 recalc_token_usage 失败: %s", e)
-
-    threading.Thread(target=_async_recalc_token_usage, daemon=True).start()
-
     # 主循环：支持 /models 弹出选择器并重启主 App
     while True:
         pending_action = None
+        _trace_mark("before _make_input_app")
         app_instance = _make_input_app()
+        _trace_mark("after _make_input_app")
 
         # 注册后台子代理终态实时通知回调
         # 后台任务完成/失败/超时/取消时，立即在终端打印一条通知，不等下一轮对话。
@@ -3545,6 +3664,17 @@ def run_cli():
             try:
                 # pre_run：App 重启间隙（如 /models 触发的退出与重建之间）
                 # schedule_ui 静默丢弃的积压事件，在新 App 启动时立即补渲染
+                _trace_mark("before app.run")
+                # TEMP STARTUP TRACE：记录首帧绘制的开始/结束时间点
+                _orig_renderer_render = app_instance.renderer.render
+                def _first_render_gate(*_a, **_kw):
+                    _trace_mark("first renderer.render begin (first paint)")
+                    app_instance.renderer.render = _orig_renderer_render
+                    try:
+                        return _orig_renderer_render(*_a, **_kw)
+                    finally:
+                        _trace_mark("first renderer.render end")
+                app_instance.renderer.render = _first_render_gate
                 app_instance.run(pre_run=drain_ui_events)
             except EOFError:
                 # Ctrl+D：退出系统

@@ -154,7 +154,9 @@ class PermissionSystemError(Exception):
 
 # 🌟 注意这里：我们把四个工具全都引进来了！
 from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace
-from core.mcp_client import mcp_manager
+# 注意：core.mcp_client 不在此处顶部 import（mcp 包会连带 pydantic/httpx/anyio，
+# 冷启动约 1.1s）。mcp_manager 通过下方模块级 __getattr__ 惰性加载，首次访问时
+# 才 import core.mcp_client；启动时的预热由 main.py 的 _preload_mcp 后台线程负责。
 from core.permission_broker import CANCELLED_RESULT, permission_broker
 from core.command_policy import (
     _session_rule_is_exact,
@@ -773,6 +775,14 @@ tool_registry = build_default_registry()
 _mcp_first_wait_done = False
 
 
+def _get_mcp_manager():
+    """惰性获取 mcp_manager 单例：import core.mcp_client 会拉起 mcp 包全家桶
+    （pydantic/httpx/anyio，冷启动约 1.1s），故延迟到首次实际使用时才加载。
+    每次调用时读取属性，不做缓存，保证测试 monkeypatch core.mcp_client.mcp_manager 生效。"""
+    from core.mcp_client import mcp_manager
+    return mcp_manager
+
+
 def get_tools_schema():
     """每次构建请求时新鲜获取工具 schema（registry 静态 + MCP 动态）。
 
@@ -787,10 +797,10 @@ def get_tools_schema():
     if not _mcp_first_wait_done:
         _mcp_first_wait_done = True
         try:
-            mcp_manager._ensure_connected()
+            _get_mcp_manager()._ensure_connected()
         except Exception:
             pass
-    return tool_registry.api_schemas() + mcp_manager.get_schemas()
+    return tool_registry.api_schemas() + _get_mcp_manager().get_schemas()
 
 
 def completion(**kwargs):
@@ -804,6 +814,11 @@ def __getattr__(name):
         return get_tools_schema()
     if name == "litellm":
         return _get_litellm()
+    if name == "mcp_manager":
+        # 惰性加载 mcp_manager 单例：避免 import core.llm 时就拉起 mcp 包全家桶
+        # （~1.1s 启动开销）。不缓存到 globals，保证外部属性访问始终反映
+        # core.mcp_client.mcp_manager 的当前值（测试 monkeypatch 友好）。
+        return _get_mcp_manager()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # estimate_tokens 结果缓存：tiktoken 全量编码整个历史相当慢（长会话可达秒级），
@@ -2462,8 +2477,8 @@ def _execute_single_tool_call(
                             result = tool_registry.execute(function_name, **arguments).to_message_content()
                 else:
                     result = tool_registry.execute(function_name, **arguments).to_message_content()
-            elif any(s["function"]["name"] == function_name for s in mcp_manager.get_schemas()):
-                result = mcp_manager.call_tool_sync(function_name, arguments)
+            elif any(s["function"]["name"] == function_name for s in _get_mcp_manager().get_schemas()):
+                result = _get_mcp_manager().call_tool_sync(function_name, arguments)
             else:
                 result = f"{TOOL_ERROR_PREFIX} 未找到名为 {function_name} 的工具！"
     except Exception as tool_err:
