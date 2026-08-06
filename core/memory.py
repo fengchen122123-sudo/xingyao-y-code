@@ -384,6 +384,28 @@ class MemoryManager:
             )
             self.conn.commit()
 
+    def get_last_token_usage(self, session_id):
+        """查询指定会话最近一次真实 token 用量，无记录返回 None。
+
+        供窗口占用显示与压缩触发判断使用真实基线（下一轮请求的 prompt
+        必然包含上一轮的 prompt + completion），避免本地估算。
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens "
+                "FROM token_usage WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                (str(session_id),),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return {
+            "prompt_tokens": int(row[0] or 0),
+            "completion_tokens": int(row[1] or 0),
+            "total_tokens": int(row[2] or 0),
+            "cached_tokens": int(row[3] or 0),
+        }
+
     def query_token_usage_by_model(self, start_date, end_date):
         """按模型聚合指定日期区间（含端点，格式 YYYY-MM-DD）的 token 用量。
 
