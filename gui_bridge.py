@@ -1515,12 +1515,13 @@ class ApiBridge:
             logger.debug("推送 token_usage 失败", exc_info=True)
 
     def _recalc_token_usage(self, session_name: str):
-        """切会话 / 清空历史后重新估算窗口占用。"""
+        """切会话 / 清空历史后重新估算窗口占用（含每轮现组的系统提示词）。"""
         try:
-            from core.llm import estimate_tokens, session_token_usage, token_usage_lock
+            from core.agent_service import estimate_history_tokens_with_system
+            from core.llm import session_token_usage, token_usage_lock
             active = get_active_model() or {}
             history = self._memory.get_history(session_name)
-            total = estimate_tokens(active.get("litellm_model", ""), history)
+            total = estimate_history_tokens_with_system(active.get("litellm_model", ""), history)
             with token_usage_lock:
                 session_token_usage["latest_total"] = total
                 session_token_usage["latest_prompt"] = 0

@@ -114,6 +114,22 @@ def load_system_prompt() -> str:
     return system_prompt
 
 
+def build_stable_system_message() -> dict:
+    """组装每轮请求首位的稳定系统提示词消息，供请求组装与 Token 估算复用。"""
+    from core.context_builder import build_stable_prompt
+    return {"role": "system", "content": build_stable_prompt(load_system_prompt())}
+
+
+def estimate_history_tokens_with_system(model_name: str, history: list) -> int:
+    """估算一轮请求的实际 Token 占用：历史消息 + 首部稳定系统提示词。
+
+    主系统提示词每轮现组、不落库，纯历史估算会漏掉它；
+    供 TUI/GUI 的窗口占用重算使用，口径与请求前的压缩阈值估算一致。
+    """
+    from core.llm import estimate_tokens
+    return estimate_tokens(model_name, [build_stable_system_message()] + list(history or []))
+
+
 def build_runtime_context(model_name: str, permission_mode: str):
     """组装本轮的运行上下文（时间 / 计划快照 / 长期记忆 / 技能 / 自定义子 Agent）。"""
     from core.context_builder import RuntimeContext
@@ -312,8 +328,19 @@ def prepare_turn_messages(
     # 获取专门供给大模型的已压缩截断与记忆挂载历史
     history = manager.get_history_for_llm(session_name)
 
-    # 【全新机制】在向大模型请求前，实时估算当前历史的 Token 数
-    estimated_tokens = estimate_tokens(model_name, history)
+    # 只在这一层组装一个稳定提示词和一份当前运行上下文。
+    from core.context_builder import (
+        DYNAMIC_CONTEXT_PREFIX,
+        build_dynamic_prompt,
+        build_time_note,
+    )
+
+    # 提前组装首部稳定系统提示词：Token 估算必须把它计入，
+    # 否则口径会低于实际请求（系统提示词不落库、每轮现组）
+    system_message = build_stable_system_message()
+
+    # 【全新机制】在向大模型请求前，实时估算当前历史的 Token 数（含系统提示词）
+    estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
     if estimated_tokens > limit and not _cancelled():
         # 超过阈值触发智能记忆压缩提炼。
@@ -329,44 +356,35 @@ def prepare_turn_messages(
             output_callback=lambda message: _notify("compress", message),
         )
         history = manager.get_history_for_llm(session_name)
-        estimated_tokens = estimate_tokens(model_name, history)
+        estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
         # 兜底：如果总结归纳后依然超限，触发物理大文件折叠机制
         if estimated_tokens > limit:
             manager.prune_history_files(session_name, max_turns=1, retain_recent=4)
             history = manager.get_history_for_llm(session_name)
-            estimated_tokens = estimate_tokens(model_name, history)
+            estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
         # 智能滑窗淘汰：如果仍超限，按完整轮次（user 开头到下一个 user 之前）
         # 为单位从内存中丢弃最早的旧消息，直到满足 Token 安全阈值
         while len(history) > 2 and estimated_tokens > limit:
             if not evict_oldest_turn(history):
                 break
-            estimated_tokens = estimate_tokens(model_name, history)
+            estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
     # 更新最新 Token 数供界面显示（与 UI 线程并发读写，必须持锁）
     with token_usage_lock:
         session_token_usage["latest_total"] = estimated_tokens
 
-    # 只在这一层组装一个稳定提示词和一份当前运行上下文。
-    from core.context_builder import (
-        DYNAMIC_CONTEXT_PREFIX,
-        build_dynamic_prompt,
-        build_stable_prompt,
-        build_time_note,
-    )
-
+    # 只在这一层组装当轮的运行上下文（稳定提示词已在估算前组装）。
     # 1) 清理 legacy 首部 system（稳定提示词每轮现组）；持久化的上下文块保留
     history = _drop_legacy_leading_systems(history)
     # 2) 持久化的上下文块（DB 中位于当轮 user 之后）前移回 user 之前，
     #    每轮确定性重排，保证跨轮请求 prefix 字节级连续
     history = _reposition_context_blocks(history)
 
-    system_prompt = load_system_prompt()
     runtime = build_runtime_context(model_name, permission_mode)
-    stable_prompt = build_stable_prompt(system_prompt)
     dynamic_prompt = build_dynamic_prompt(runtime)
-    history.insert(0, {"role": "system", "content": stable_prompt})
+    history.insert(0, system_message)
 
     # 3) 动态运行上下文块：内容不变则沿用历史中已持久化的那份（不重注、不删除），
     #    变化时才追加新块并持久化——append-only 是跨轮缓存命中的关键

@@ -459,3 +459,45 @@ def test_dynamic_prompt_excludes_time_and_marks_latest_wins():
     assert "当前时间" not in dynamic
     assert "以最新一份为准" in dynamic
     assert build_time_note(runtime) == "【当前时间】2026-08-03 10:00:00"
+
+
+def test_prepare_turn_messages_estimates_tokens_with_system_prompt(stub_llm, quiet_extras):
+    """压缩阈值估算必须把每轮现组的系统提示词计入，与实际请求口径一致。"""
+    from core.agent_service import prepare_turn_messages
+
+    captured = []
+    original = stub_llm.estimate_tokens
+
+    def spy(model, messages):
+        captured.append(messages)
+        return original(model, messages)
+
+    stub_llm.estimate_tokens = spy
+
+    manager = _make_manager()
+    session = "test_estimate_system"
+    manager.add_message(session, "user", "你好")
+
+    prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+
+    assert captured, "prepare 阶段应至少估算一次 Token"
+    first_messages = captured[0]
+    # 估算列表首位必须是稳定系统提示词（不落库、每轮现组，纯历史估算会漏掉它）
+    assert first_messages[0]["role"] == "system"
+    assert len(first_messages[0]["content"]) > 0
+    # 历史消息仍在估算范围内
+    assert any(
+        m.get("role") == "user" and m.get("content") == "你好" for m in first_messages
+    )
+
+
+def test_estimate_history_tokens_with_system_includes_system_prompt(stub_llm):
+    """TUI/GUI 重算窗口占用的共享口径：高于纯历史估算，差额即系统提示词。"""
+    from core.agent_service import estimate_history_tokens_with_system
+
+    history = [{"role": "user", "content": "你好"}]
+    history_only = stub_llm.estimate_tokens("openai/gpt-test", history)
+    with_system = estimate_history_tokens_with_system("openai/gpt-test", history)
+    assert with_system > history_only
