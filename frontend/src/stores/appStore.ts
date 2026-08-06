@@ -13,19 +13,105 @@ import type {
   TokenUsage,
   PermissionMode,
   PyWebViewAPI,
+  ToolStartEventData,
+  ToolFinishEventData,
+  DiffReadyEventData,
+  SubagentProgressEventData,
 } from '../types/pywebview';
 import { formatPermMode } from '../utils/markdown';
+import {
+  reduceExecutionState,
+  type ExecutionState,
+  type LegacyDiff,
+  type SubagentTaskSnapshot,
+  type ToolDisplay,
+  type ToolExecutionCall,
+  type ToolExecutionResult,
+} from '../utils/toolTrace';
 
 export interface ChatMessage {
   id?: string;
   role: 'user' | 'assistant' | 'tool';
   content?: string;
   reasoning_content?: string;
-  tool_calls?: any[];
+  tool_calls?: ToolExecutionCall[];
   tool_call_id?: string;
   name?: string;
   cancelled?: boolean;
-  diffs?: Array<{ file_path: string; diff_text: string }>;
+  // 未绑定到任何 tool_call 的历史文件变更（diff_ready 缺少/失配 tool_call_id 时兜底）
+  legacy_diffs?: LegacyDiff[];
+  // 本条助手消息所属回合的执行状态：running | completed | cancelled | error
+  execution_state?: ExecutionState;
+}
+
+const TOOL_CATEGORIES = new Set(['read', 'search', 'command', 'mutation', 'skill', 'other']);
+
+// 后端 display dict 字段可缺省/为空：没有任何有效内容时返回 undefined，
+// 让 toolTrace 按工具名回退到 legacy 分类。
+function normalizeToolDisplay(raw: any): ToolDisplay | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const metrics = raw.metrics && typeof raw.metrics === 'object' ? { ...raw.metrics } : {};
+  const hasContent =
+    !!(raw.action || raw.target || raw.command || raw.error_summary)
+    || !!raw.is_skill
+    || Object.keys(metrics).length > 0
+    || (typeof raw.category === 'string' && raw.category !== '');
+  if (!hasContent) return undefined;
+  return {
+    category: TOOL_CATEGORIES.has(raw.category) ? raw.category : 'other',
+    action: String(raw.action || ''),
+    target: String(raw.target || ''),
+    command: String(raw.command || ''),
+    metrics,
+    error_summary: String(raw.error_summary || ''),
+    is_skill: !!raw.is_skill,
+  };
+}
+
+// 历史会话里的旧形状 tool_call：{ id, function: { name, arguments }, summary }
+function normalizeHistoryCall(raw: any, toolMessages: Map<string, ChatMessage>): ToolExecutionCall {
+  const name = String(raw?.name || raw?.function?.name || raw?.tool_name || 'tool');
+  let label = String(raw?.label || raw?.summary || '');
+  if (!label) {
+    const args = raw?.function?.arguments;
+    if (args && typeof args === 'object') {
+      const p = args.file_path || args.path || args.query || args.command || '';
+      label = p ? `${name} ${p}` : name;
+    } else {
+      label = name;
+    }
+  }
+  const call: ToolExecutionCall = { id: String(raw?.id || ''), name, label };
+  const toolMsg = call.id ? toolMessages.get(call.id) : undefined;
+  if (toolMsg) {
+    const content = String(toolMsg.content || '');
+    call.result = { ok: true, summary: content, result: content };
+  }
+  return call;
+}
+
+// 加载历史会话（启动恢复 / switch_session）时，把旧契约的独立 role=tool 消息
+// 按显式 tool_call_id 配对进前一条助手消息的 tool_calls，配对完成后从列表移除。
+export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] {
+  const toolMessages = new Map<string, ChatMessage>();
+  for (const m of messages) {
+    if (m.role === 'tool' && m.tool_call_id) toolMessages.set(m.tool_call_id, m);
+  }
+  const paired: ChatMessage[] = [];
+  for (const m of messages) {
+    if (m.role === 'tool' && m.tool_call_id && toolMessages.has(m.tool_call_id)) continue;
+    if (m.role === 'assistant') {
+      paired.push({
+        ...m,
+        tool_calls: (m.tool_calls || []).map((raw: any) => normalizeHistoryCall(raw, toolMessages)),
+        legacy_diffs: m.legacy_diffs || [],
+        execution_state: m.execution_state || 'completed',
+      });
+    } else {
+      paired.push(m);
+    }
+  }
+  return paired;
 }
 
 export interface ConfirmState {
@@ -129,23 +215,10 @@ export const useAppStore = defineStore('app', {
     // 当前流式生成临时对象
     currentStreamingText: '',
     currentThinkingText: '',
-    toolResults: {} as Record<string, any>,
 
     // 内嵌终端（右侧面板）
     terminalOutput: '',
     terminalRunning: false,
-
-    // 子代理实时进度（后端 subagent_progress 事件推送，回合期间约 0.8s 一次）
-    subagentTasks: [] as Array<{
-      id: string;
-      description: string;
-      type: string;
-      status: string;
-      stage: string;
-      stage_detail: string;
-      elapsed: number;
-      background: boolean;
-    }>,
   }),
 
   getters: {
@@ -184,6 +257,16 @@ export const useAppStore = defineStore('app', {
         return null;
       }
       return api;
+    },
+
+    // 回合级事件（tool_start / tool_finish / diff_ready）必须落在当前助手消息上；
+    // 缺失说明后端事件序列违反契约，直接抛出显式错误而不是静默丢弃。
+    activeAssistantOrThrow(): ChatMessage {
+      const last = this.messages[this.messages.length - 1];
+      if (!last || last.role !== 'assistant') {
+        throw new Error('桥接契约错误：回合级事件到达时不存在活动助手消息');
+      }
+      return last;
     },
 
     toggleSidebar() {
@@ -287,7 +370,7 @@ export const useAppStore = defineStore('app', {
           ? (this.workdir.split('\\').pop() || this.workdir)
           : '对话';
         // 启动时后端自动恢复最近一次对话：同步消息列表与标题
-        this.messages = (init as any).messages || [];
+        this.messages = pairHistoryToolMessages((init as any).messages || []);
         for (const g of this.sessionGroups) {
           const hit = (g.sessions || []).find((s: any) => s.name === this.currentSessionName);
           if (hit) {
@@ -357,8 +440,7 @@ export const useAppStore = defineStore('app', {
       if (!api) return;
       try {
         const res = await api.switch_session(sessionName, targetWorkdir);
-        this.messages = res.messages || [];
-        this.toolResults = {};
+        this.messages = pairHistoryToolMessages(res.messages || []);
 
         if (res.is_global || res.workdir === 'GLOBAL') {
           this.currentWorkdirLabel = '对话';
@@ -564,11 +646,17 @@ export const useAppStore = defineStore('app', {
         this.running = true;
         this.currentStreamingText = '';
         this.currentThinkingText = '';
-        this.subagentTasks = [];
         // 内部回合（如后台任务自动汇总）：展示友好的系统提示文案，
         // 不把内部指令原文渲染成用户气泡
         this.messages.push({ role: 'user', content: data.display_text || data.user_text });
-        this.messages.push({ role: 'assistant', content: '', reasoning_content: '' });
+        this.messages.push({
+          role: 'assistant',
+          content: '',
+          reasoning_content: '',
+          tool_calls: [],
+          legacy_diffs: [],
+          execution_state: 'running',
+        });
         if (data.internal === 'bg_summary') {
           this.showToast('后台子代理任务已全部结束，正在自动汇总结果', 'ok');
         }
@@ -586,22 +674,79 @@ export const useAppStore = defineStore('app', {
           last.content = this.currentStreamingText;
         }
       } else if (type === 'tool_start') {
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
-          if (!last.tool_calls) last.tool_calls = [];
-          const idx = last.tool_calls.findIndex((tc: any) => tc.id === data.id);
-          const entry = { id: data.id, name: data.name, label: data.label };
-          if (idx >= 0) last.tool_calls[idx] = { ...last.tool_calls[idx], ...entry };
-          else last.tool_calls.push(entry);
+        const d = data as ToolStartEventData;
+        const msg = this.activeAssistantOrThrow();
+        const calls = msg.tool_calls ?? (msg.tool_calls = []);
+        const id = String(d.id || '');
+        const display = normalizeToolDisplay(d.display);
+        const idx = id ? calls.findIndex(c => c.id === id) : -1;
+        if (idx >= 0) {
+          // 同一调用重复推送：更新元信息，但保留首次插入时记录的 started_at_ms
+          calls[idx] = {
+            ...calls[idx],
+            name: String(d.name || calls[idx].name),
+            label: String(d.label || calls[idx].label),
+            ...(display ? { display } : {}),
+          };
+        } else if (id) {
+          calls.push({
+            id,
+            name: String(d.name || 'tool'),
+            label: String(d.label || d.name || 'tool'),
+            started_at_ms: Date.now(),
+            ...(display ? { display } : {}),
+          });
+        } else {
+          // 空 ID 违反后端契约：分配仅用于 UI 的占位 key，并强制归类为 other，
+          // 避免不同空 ID 调用被行构建误合并
+          console.error('tool_start 事件缺少 id，已分配 UI 占位 key:', d);
+          calls.push({
+            id: `contract-error-${calls.length + 1}`,
+            name: String(d.name || 'tool'),
+            label: String(d.label || d.name || 'tool'),
+            started_at_ms: Date.now(),
+            display: {
+              ...(display || {
+                action: '', target: '', command: '', metrics: {}, error_summary: '', is_skill: false,
+              }),
+              category: 'other',
+            },
+          });
         }
       } else if (type === 'tool_finish') {
-        this.toolResults[data.id] = {
-          ok: data.ok,
-          summary: data.summary,
-          result: data.result,
-          name: data.name,
-          label: data.label,
+        const d = data as ToolFinishEventData;
+        const msg = this.activeAssistantOrThrow();
+        const calls = msg.tool_calls ?? (msg.tool_calls = []);
+        const display = normalizeToolDisplay(d.display);
+        const result: ToolExecutionResult = {
+          ok: !!d.ok,
+          summary: String(d.summary || ''),
+          result: String(d.result || d.error || ''),
+          ...(d.duration_ms === undefined || d.duration_ms === null
+            ? {}
+            : { duration_ms: Number(d.duration_ms) }),
+          ...(display ? { display } : {}),
         };
+        const id = String(d.id || '');
+        const idx = id ? calls.findIndex(c => c.id === id) : -1;
+        if (idx >= 0) {
+          calls[idx] = {
+            ...calls[idx],
+            name: String(d.name || calls[idx].name),
+            label: String(d.label || calls[idx].label),
+            result,
+          };
+        } else {
+          // 没有匹配的 tool_start（后端契约异常）：显式创建孤儿完成记录，
+          // 让结果仍可追溯而不是静默丢失
+          console.error('tool_finish 事件没有匹配的 tool_start，已创建孤儿记录:', d);
+          calls.push({
+            id: id || `orphan-${calls.length + 1}`,
+            name: String(d.name || 'tool'),
+            label: String(d.label || d.name || 'tool'),
+            result,
+          });
+        }
       } else if (type === 'plan_updated') {
         if (data.items) {
           const items = data.items.map((it: any) => ({
@@ -646,6 +791,11 @@ export const useAppStore = defineStore('app', {
         });
       } else if (type === 'turn_finish' || type === 'turn_idle') {
         this.running = false;
+        // turn_finish 只在仍处于 running 时置为 completed；已取消/出错的状态不被覆盖
+        const last = this.messages[this.messages.length - 1];
+        if (last && last.role === 'assistant') {
+          last.execution_state = reduceExecutionState(last.execution_state, 'turn_finish');
+        }
         this.currentStreamingText = '';
         this.currentThinkingText = '';
         this.refreshTokenUsage();
@@ -656,11 +806,21 @@ export const useAppStore = defineStore('app', {
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
           last.cancelled = true;
+          last.execution_state = reduceExecutionState(last.execution_state, 'turn_cancelled');
         }
         this.currentStreamingText = '';
         this.currentThinkingText = '';
         this.refreshTokenUsage();
         this.refreshSessions();
+      } else if (type === 'turn_error') {
+        // 终态错误（toast 由随后的 error 事件负责展示）
+        this.running = false;
+        const last = this.messages[this.messages.length - 1];
+        if (last && last.role === 'assistant') {
+          last.execution_state = reduceExecutionState(last.execution_state, 'turn_error');
+        }
+        this.currentStreamingText = '';
+        this.currentThinkingText = '';
       } else if (type === 'token_usage') {
         this.tokenUsage = {
           used: data.used || 0,
@@ -671,13 +831,40 @@ export const useAppStore = defineStore('app', {
       } else if (type === 'mcp_status') {
         if (data.mcps) this.mcps = data.mcps;
       } else if (type === 'diff_ready') {
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
-          if (!last.diffs) last.diffs = [];
-          last.diffs.push({ file_path: data.file_path, diff_text: data.diff_text });
+        const d = data as DiffReadyEventData;
+        const msg = this.activeAssistantOrThrow();
+        const diff: LegacyDiff = {
+          file_path: String(d.file_path || ''),
+          diff_text: String(d.diff_text || ''),
+        };
+        // 只按非空 tool_call_id 绑定；空 ID 或找不到匹配调用时归入 legacy_diffs
+        const toolCallId = String(d.tool_call_id || '');
+        const target = toolCallId
+          ? (msg.tool_calls || []).find(c => c.id === toolCallId)
+          : undefined;
+        if (target) {
+          target.diff = diff;
+        } else {
+          (msg.legacy_diffs ??= []).push(diff);
         }
       } else if (type === 'subagent_progress') {
-        this.subagentTasks = data.tasks || [];
+        const d = data as SubagentProgressEventData;
+        // 快照归属到当前仍在串行运行的 run_subagent 调用；该调用完成后
+        // 不再接受更新，最后一次快照自然冻结在调用上
+        const last = this.messages[this.messages.length - 1];
+        if (!last || last.role !== 'assistant') return;
+        const target = [...(last.tool_calls || [])]
+          .reverse()
+          .find(c => c.name === 'run_subagent' && !c.result);
+        if (!target) return;
+        target.subagent_tasks = (d.tasks || []).map((t: any): SubagentTaskSnapshot => ({
+          id: String(t.id || ''),
+          description: String(t.description || ''),
+          status: String(t.status || ''),
+          stage: String(t.stage || ''),
+          ...(t.stage_detail ? { stage_detail: String(t.stage_detail) } : {}),
+          elapsed: Number(t.elapsed || 0),
+        }));
       } else if (type === 'background_subagent_terminal') {
         const statusLabel: Record<string, string> = {
           completed: '已完成', failed: '已失败', timed_out: '已超时', cancelled: '已取消',
@@ -896,7 +1083,6 @@ export const useAppStore = defineStore('app', {
         const res = await api.clear_session_history(this.currentSessionName);
         if (res && res.ok) {
           this.messages = [];
-          this.toolResults = {};
           this.showToast('已清空当前会话历史', 'ok');
         } else {
           this.showToast('清空失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');

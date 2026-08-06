@@ -111,7 +111,71 @@ export interface InitialState {
 }
 
 // window.onBridgeEvent 收到的事件信封；具体 data 形状随 type 变化，
-// 详见 appStore.ts 的 handleBridgeEvent 分支注释。
+// 回合/工具时间线事件的 payload 形状见下方接口（对应 gui_bridge.py
+// _consume_turn_events 的发射字段），其余事件详见 appStore.ts 的
+// handleBridgeEvent 分支注释。
+
+// 工具事件 display dict：后端原样透传，字段可缺省
+export interface ToolDisplayPayload {
+  category?: string;
+  action?: string;
+  target?: string;
+  command?: string;
+  metrics?: Record<string, number>;
+  error_summary?: string;
+  is_skill?: boolean;
+}
+
+export interface TurnStartEventData {
+  user_text: string;
+  display_text?: string;
+  session_name?: string;
+  internal?: string;
+}
+
+export interface ToolStartEventData {
+  id: string;
+  name: string;
+  label: string;
+  display?: ToolDisplayPayload;
+  started_at_ms?: number;
+}
+
+export interface ToolFinishEventData {
+  id: string;
+  name: string;
+  label: string;
+  ok: boolean;
+  summary: string;
+  result: string;
+  error?: string;
+  duration_ms?: number | null;
+  display?: ToolDisplayPayload;
+}
+
+export interface DiffReadyEventData {
+  tool_call_id: string;
+  file_path: string;
+  diff_text: string;
+}
+
+export interface TurnErrorEventData {
+  message: string;
+}
+
+export interface SubagentProgressEventData {
+  tasks: Array<{
+    id: string;
+    description: string;
+    type?: string;
+    status: string;
+    stage: string;
+    stage_detail?: string;
+    elapsed: number;
+    background?: boolean;
+  }>;
+}
+
 export interface BridgeEvent {
   type: string;
   data: any;
