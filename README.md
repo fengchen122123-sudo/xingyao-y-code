@@ -199,9 +199,12 @@ venv\Scripts\python build_release.py --skip-frontend
 |------|------|
 | `/permission <confirm\|plan\|full>` | 切换权限级别 |
 | `/sandbox <on\|off>` | 沙盒开关（on=允许访问工作目录外文件） |
-| `/verbose <on\|off>` | 工具显示模式（on=显示工具调用细节，off=只显示状态） |
 | `/clear` | 清屏 |
 | `/exit` | 退出程序 |
+
+> 工具执行反馈默认采用精简进度模式：CLI 与 GUI 会合并连续读取和搜索；
+> 命令、文件修改、子代理和失败操作单独留痕；普通工具失败会返回模型继续分析，
+> 不会被静默隐藏。GUI 可展开完整工具结果和对应文件 Diff。
 
 > 已启用的技能会自动作为 `/<skill_short_id>` 命令加入补全菜单。
 
