@@ -3452,10 +3452,6 @@ def run_cli():
 
     set_terminal_title("Y-code")
 
-    _trace_mark("before print_logo")
-    print_logo()
-    _trace_mark("after print_logo")
-
     # 首次启动/完全无配置模型时，自动引导开启全屏模型配置选择器
     active_info = get_active_model()
     if not active_info:
@@ -3625,9 +3621,13 @@ def run_cli():
         # Ctrl+C：跳过等待直接进入界面（后台 daemon 线程仍会继续预热）
         if _tty:
             print("\r  ⚠️ 已跳过预热等待，首轮对话可能稍慢。           ")
-    if _tty and all(not _t.is_alive() for _t in _preload_threads):
-        print(f"\r  ✔ 预热完成（{time.monotonic() - _preload_t0:.1f}s），星瑶已就绪！           ")
     _trace_mark("preload phase done")
+
+    # 预热全部完成后才铺主界面：print_logo 会清屏，启动提示与预热动画随之消失，
+    # 用户直接看到完整可输入的主页面（logo + 输入框 + 准确的状态栏）
+    _trace_mark("before print_logo")
+    print_logo()
+    _trace_mark("after print_logo")
 
     # 启动全局常驻 UI 刷新线程（用以维持思考计时器和星瑶运转状态微动画）
     def _ui_refresher_loop():
