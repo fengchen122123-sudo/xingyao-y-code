@@ -8,6 +8,28 @@ from pathlib import Path
 MEMORY_DIR = Path.home() / ".ycode" / "memory"
 SESSIONS_DIR = Path.home() / ".ycode" / "sessions"
 
+
+def is_memory_path(path):
+    """判断路径是否位于长期记忆目录（~/.ycode/memory）内。
+
+    该目录是 agent 自家记忆系统的读写区（系统提示词指示 agent 直接用
+    read_file/write_file 操作这里），不含凭据（凭据在 config.json/mcp.json），
+    因此沙盒外访问守卫对它豁免询问。~/.ycode 下其他文件不在豁免之列。
+    """
+    if not path:
+        return False
+    try:
+        candidate = str(path).strip()
+        if not candidate:
+            return False
+        candidate = os.path.normcase(
+            os.path.realpath(os.path.abspath(os.path.expanduser(candidate)))
+        )
+        root = os.path.normcase(os.path.realpath(str(MEMORY_DIR)))
+        return candidate == root or candidate.startswith(root + os.sep)
+    except Exception:
+        return False
+
 # 记忆文件读写锁：防止后台 dream 整理线程与主线程 append_to_daily_log 并发写导致丢行/截断
 _memory_io_lock = threading.Lock()
 
