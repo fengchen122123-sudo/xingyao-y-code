@@ -621,6 +621,62 @@ def test_sandbox_guard_asks_and_denies_outside_path(tmp_path, monkeypatch):
     assert err is not None and "拒绝" in err
 
 
+def test_sandbox_guard_exempts_memory_dir_for_read_and_write(tmp_path, monkeypatch):
+    """~/.ycode/memory 是自家记忆系统读写区：read/write 均豁免沙盒外询问。
+
+    豁免必须返回 bypass 上下文（而非 (None, None)），否则工具层
+    _resolve_workspace_path 兜底校验仍会拒绝。
+    """
+    import core.llm as llm_mod
+    import core.memory_kairos as mk
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    memory_dir = tmp_path / ".ycode" / "memory"
+    memory_dir.mkdir(parents=True)
+    monkeypatch.setattr(mk, "MEMORY_DIR", memory_dir)
+    asked = []
+    monkeypatch.setattr(
+        llm_mod, "check_permission_and_ask",
+        lambda *a, **kw: asked.append(1) or False,
+    )
+
+    for function_name in ("read_file", "write_file", "edit_file"):
+        cm, err = llm_mod._sandbox_outside_guard(
+            function_name, str(memory_dir / "note.md"),
+            None, "owner", "turn", "主代理", None,
+        )
+        assert err is None, f"{function_name} 访问 memory 目录不应被拒绝"
+        assert cm is not None, f"{function_name} 访问 memory 目录应获得 bypass 上下文"
+    assert asked == [], "memory 目录访问不应触发权限询问"
+
+
+def test_sandbox_guard_still_asks_for_ycode_files_outside_memory(tmp_path, monkeypatch):
+    """~/.ycode 下 memory 之外的文件（如 config.json）不在豁免之列，仍需询问"""
+    import core.llm as llm_mod
+    import core.memory_kairos as mk
+    import core.tools as tools_mod
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(mk, "MEMORY_DIR", tmp_path / ".ycode" / "memory")
+    monkeypatch.setattr(tools_mod, "_outside_workspace_allowed", lambda: False)
+    asked = []
+    monkeypatch.setattr(
+        llm_mod, "check_permission_and_ask",
+        lambda *a, **kw: asked.append(1) or False,
+    )
+
+    cm, err = llm_mod._sandbox_outside_guard(
+        "read_file", str(tmp_path / ".ycode" / "config.json"),
+        None, "owner", "turn", "主代理", None,
+    )
+    assert cm is None and err is not None and "拒绝" in err
+    assert asked == [1], "memory 之外的 .ycode 文件仍应触发权限询问"
+
+
 def test_sandbox_guard_rejects_unverifiable_path_without_asking(monkeypatch):
     """Path classification errors must fail closed before any permission prompt."""
     import core.llm as llm_mod

@@ -1917,6 +1917,14 @@ def _sandbox_outside_guard(
     if not outside:
         return None, None
     from core import tools as _tools
+    # 长期记忆目录（~/.ycode/memory）是自家记忆系统的读写区、不含凭据，
+    # read/write/edit 均豁免沙盒外询问；返回 bypass 上下文让工具层兜底校验放行
+    try:
+        from core.memory_kairos import is_memory_path
+        if is_memory_path(path_value):
+            return sandbox_bypass(), None
+    except Exception:
+        pass
     if function_name == "read_file":
         try:
             from core.skills import is_trusted_read_path
