@@ -1129,11 +1129,13 @@ def drain_ui_events():
 
 
 def recalc_token_usage():
-    """全局刷新当前会话的精确 Token 使用量（含每轮现组的系统提示词）"""
-    from core.agent_service import estimate_history_tokens_with_system
+    """全局刷新当前会话的 Token 占用（优先真实用量，无记录才估算兜底）"""
+    from core.agent_service import get_session_token_baseline
     history = manager.get_history(current_session)
     with token_usage_lock:
-        session_token_usage["latest_total"] = estimate_history_tokens_with_system(current_model, history)
+        session_token_usage["latest_total"] = get_session_token_baseline(
+            manager, current_session, current_model, history=history
+        )
 
 
 def _invalidate_ui():

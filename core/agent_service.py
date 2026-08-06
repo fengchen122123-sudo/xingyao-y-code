@@ -123,11 +123,30 @@ def build_stable_system_message() -> dict:
 def estimate_history_tokens_with_system(model_name: str, history: list) -> int:
     """估算一轮请求的实际 Token 占用：历史消息 + 首部稳定系统提示词。
 
-    主系统提示词每轮现组、不落库，纯历史估算会漏掉它；
-    供 TUI/GUI 的窗口占用重算使用，口径与请求前的压缩阈值估算一致。
+    主系统提示词每轮现组、不落库，纯历史估算会漏掉它。
+    仅作为“无真实用量记录”时的兜底口径（见 get_session_token_baseline）。
     """
     from core.llm import estimate_tokens
     return estimate_tokens(model_name, [build_stable_system_message()] + list(history or []))
+
+
+def get_session_token_baseline(manager, session_name: str, model_name: str,
+                               history: list | None = None) -> int:
+    """会话上下文占用基线：优先用本会话最近一次真实 API 用量。
+
+    下一轮请求的 prompt 必然包含上一轮的 prompt + completion（回复会进入历史），
+    所以最近一次真实 prompt_tokens + completion_tokens 就是最准的占用基线。
+    只有在会话没有任何真实记录时（老会话首次使用）才退化到本地估算。
+    """
+    try:
+        last = manager.get_last_token_usage(session_name)
+    except Exception:
+        last = None
+    if last:
+        return int(last.get("prompt_tokens") or 0) + int(last.get("completion_tokens") or 0)
+    if history is None:
+        history = manager.get_history(session_name)
+    return estimate_history_tokens_with_system(model_name, history)
 
 
 def build_runtime_context(model_name: str, permission_mode: str):
@@ -339,8 +358,12 @@ def prepare_turn_messages(
     # 否则口径会低于实际请求（系统提示词不落库、每轮现组）
     system_message = build_stable_system_message()
 
-    # 【全新机制】在向大模型请求前，实时估算当前历史的 Token 数（含系统提示词）
-    estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+    # 【全新机制】在向大模型请求前，判断当前上下文占用是否超阈值。
+    # 优先用本会话最近一次真实 API 用量作基线（下一轮 prompt 必然包含
+    # 上一轮的 prompt + completion）；无真实记录时才用含系统提示词的估算兜底。
+    estimated_tokens = get_session_token_baseline(
+        manager, session_name, model_name, history=history
+    )
 
     if estimated_tokens > limit and not _cancelled():
         # 超过阈值触发智能记忆压缩提炼。
@@ -356,6 +379,8 @@ def prepare_turn_messages(
             output_callback=lambda message: _notify("compress", message),
         )
         history = manager.get_history_for_llm(session_name)
+        # 压缩/裁剪改变了历史，此后的真实用量基线已失效，
+        # 退化到含系统提示词的估算来指导后续的折叠与滑窗淘汰
         estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
         # 兜底：如果总结归纳后依然超限，触发物理大文件折叠机制

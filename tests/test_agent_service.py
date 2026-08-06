@@ -501,3 +501,76 @@ def test_estimate_history_tokens_with_system_includes_system_prompt(stub_llm):
     history_only = stub_llm.estimate_tokens("openai/gpt-test", history)
     with_system = estimate_history_tokens_with_system("openai/gpt-test", history)
     assert with_system > history_only
+
+
+def test_prepare_turn_messages_uses_real_usage_baseline(stub_llm, quiet_extras):
+    """有真实用量记录时：压缩判断与窗口占用都用真实 prompt+completion，不再估算。"""
+    from core.agent_service import prepare_turn_messages
+
+    manager = _make_manager()
+    session = "test_real_baseline"
+    manager.add_message(session, "user", "你好")
+    manager.add_token_usage("openai", "gpt-test", 8000, 500, 0, 8500, session_id=session)
+
+    def boom(model, messages):
+        raise AssertionError("有真实基线时不应再走本地估算")
+
+    stub_llm.estimate_tokens = boom
+
+    prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+    # 窗口占用 = 最近一次真实 prompt + completion（下一轮请求必然包含上轮回复）
+    assert stub_llm.session_token_usage["latest_total"] == 8500
+
+
+def test_prepare_turn_messages_real_baseline_triggers_compression(stub_llm, quiet_extras, monkeypatch):
+    """真实基线超阈值时触发压缩；触发后才用估算指导后续收缩。"""
+    import core.memory_compressor as memory_compressor
+    from core.agent_service import prepare_turn_messages
+
+    calls = []
+    monkeypatch.setattr(
+        memory_compressor,
+        "compress_session_memory",
+        lambda *args, **kwargs: calls.append(args),
+    )
+
+    manager = _make_manager()
+    session = "test_real_baseline_compress"
+    manager.add_message(session, "user", "你好")
+    # 128000 * 0.70 = 89600，真实基线 95000 超阈值
+    manager.add_token_usage("openai", "gpt-test", 94000, 1000, 0, 95000, session_id=session)
+
+    prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+    assert len(calls) == 1
+
+
+def test_get_session_token_baseline_prefers_real_usage(stub_llm):
+    """共享基线：有真实记录直接返回 prompt+completion，不调用估算。"""
+    from core.agent_service import get_session_token_baseline
+
+    manager = _make_manager()
+    manager.add_token_usage("openai", "m1", 1200, 300, 0, 1500, session_id="s1")
+
+    def boom(model, messages):
+        raise AssertionError("不应调用估算")
+
+    stub_llm.estimate_tokens = boom
+    assert get_session_token_baseline(manager, "s1", "openai/m1") == 1500
+
+
+def test_get_session_token_baseline_falls_back_to_estimate(stub_llm):
+    """共享基线：无真实记录（老会话首次）退化到含系统提示词的估算。"""
+    from core.agent_service import get_session_token_baseline
+
+    manager = _make_manager()
+    manager.add_message("s1", "user", "你好")
+
+    baseline = get_session_token_baseline(manager, "s1", "openai/m1")
+    history_only = stub_llm.estimate_tokens(
+        "openai/m1", [{"role": "user", "content": "你好"}]
+    )
+    assert baseline > history_only

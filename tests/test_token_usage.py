@@ -178,3 +178,22 @@ def test_query_cache_invalidation_events():
     # 区间外无事件
     inv2 = manager.query_cache_invalidation_events("2026-09-01", "2026-09-30")
     assert inv2 == {"count": 0, "lost_tokens": 0}
+
+
+def test_get_last_token_usage_returns_latest_per_session():
+    """取指定会话最近一次真实用量；无记录返回 None（供真实基线口径）。"""
+    manager = MemoryManager(":memory:")
+    assert manager.get_last_token_usage("s1") is None
+
+    manager.add_token_usage("openai", "m1", 100, 10, 0, 110, session_id="s1")
+    manager.add_token_usage("openai", "m1", 200, 20, 0, 220, session_id="s2")
+    manager.add_token_usage("openai", "m1", 300, 30, 5, 330, session_id="s1")
+
+    last = manager.get_last_token_usage("s1")
+    assert last["prompt_tokens"] == 300
+    assert last["completion_tokens"] == 30
+    assert last["total_tokens"] == 330
+    assert last["cached_tokens"] == 5
+
+    other = manager.get_last_token_usage("s2")
+    assert other["prompt_tokens"] == 200
