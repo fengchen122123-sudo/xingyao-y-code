@@ -53,6 +53,11 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   `_fold_stale_media_locked` 在含媒体新消息入库的同一事务内折叠旧媒体。
 - `core/agent_service.py`：四级水位线（0.60 snip / 0.80 elide / 0.95 LLM 摘要），
   触发判断优先用上一轮真实 API 用量基线，本地估算只作兜底与改写后的复算。
+- `core/agent_service.py:build_stable_system_message`：稳定前缀 = 基础提示词 + 决策策略 +
+  通用编码规范 + 长期记忆 + 技能目录 + 子代理清单（跨轮不变内容全并入此处，~6.5K tokens，
+  撑满 DeepSeek 2048 整数倍缓存块）。铁律：跨轮不变的静态内容必须进稳定前缀，
+  不能放动态运行上下文块（`build_dynamic_prompt` 只承载模型/权限/目录/计划等可变字段），
+  否则前缀漂移导致缓存整体失效。
 - `core/llm.py`：`_RepeatCallGuard` 抑制同签名成功 ≥2 次的重复工具调用；
   DeepSeek thinking 路由为带 tool_calls 的 assistant 回补空 `reasoning_content` key。
 - `core/cache_keepalive.py`：前缀缓存保活默认 120 秒（0 关闭，最小 60），仅 DeepSeek/Kimi 路由生效。
