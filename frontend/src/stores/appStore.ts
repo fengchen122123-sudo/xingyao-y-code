@@ -688,6 +688,26 @@ export const useAppStore = defineStore('app', {
         if (data.internal === 'bg_summary') {
           this.showToast('后台子代理任务已全部结束，正在自动汇总结果', 'ok');
         }
+      } else if (type === 'round_started') {
+        // 每个 LLM 轮次一条 assistant 消息：与历史重放的分段结构对齐（分段思考）。
+        // 若当前 assistant 气泡还是空的（回合第一轮），幂等跳过。
+        const last = this.messages[this.messages.length - 1];
+        if (last && last.role === 'assistant' &&
+            ((last.reasoning_content && last.reasoning_content.trim()) ||
+             (last.content && last.content.trim()) ||
+             (last.tool_calls && last.tool_calls.length))) {
+          last.execution_state = 'completed';
+          this.currentStreamingText = '';
+          this.currentThinkingText = '';
+          this.messages.push({
+            role: 'assistant',
+            content: '',
+            reasoning_content: '',
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          });
+        }
       } else if (type === 'thinking_delta') {
         // 后端约 60ms 批量推送，data.text 可能包含多字符/多行，直接拼接即可
         this.currentThinkingText += data.text || '';

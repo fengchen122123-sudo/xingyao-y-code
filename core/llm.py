@@ -2935,6 +2935,10 @@ def _chat_with_model_generator(
         max_turns = 100
         for turn in range(max_turns):
             raise_if_cancelled()
+            if turn > 0:
+                # 轮次边界事件：GUI 流式渲染据此把每个 LLM 轮次拆成独立消息块，
+                # 与历史重放（每轮一条 DB 记录）的结构对齐；TUI/子代理只认已知事件，自动忽略
+                _notify_event(event_callback, "round_started", {"round": turn + 1})
 
             # API 调用指数退避与 Jitter 抖动重试
             response_stream = None
