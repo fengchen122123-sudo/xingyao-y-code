@@ -7,6 +7,16 @@
 >
 > **目标读者**：执行本计划的 agentic worker。建议配合 superpowers:executing-plans 或
 > subagent-driven-development 逐 Task 执行。Steps 使用 `- [ ]` 复选框跟踪。
+>
+> **实施状态（2026-08-07）**：Task 0-9 及 Task 10 的全量测试/文档已完成（9 个 commit，
+> 全量 669 tests 通过）。Task 10 的缓存基准与真实会话抽检（需真实 API）待用户执行。
+> 实施偏差记录：
+> 1. Task 4 经用户确认跳过——commit aca5f27 已让压缩触发优先使用真实 API 用量基线，
+>    Task 3 阶梯直接复用 `get_session_token_baseline`，未新增 `latest_real_prompt_tokens`。
+> 2. `estimate_text_tokens` 修正为 bytes/4 与 CJK 字符数取大者（方案原实现对纯 ASCII 高估 4 倍，
+>    与方案自身测试断言矛盾，按测试口径修正）。
+> 3. Task 2 测试 fixture 修正：tool_call_id 必须唯一（方案原写法 6 条同 id 会被配对清洗合并）。
+> 4. Task 3 测试窗口/数据量按实际保护区与系统提示词体积重新标定（语义不变：验证阶梯行为）。
 
 **Goal:** 将 DeepSeek 路由的加权热缓存命中率从 90%+ 提升到 97-99%（长会话热路径口径），
 同时不降低上下文质量（尾部保护区内的近期消息永远完整）。
@@ -67,7 +77,7 @@
 
 ### Task 0: 执行门槛确认
 
-- [ ] **Step 1: 确认 tool-progress 计划已完成**
+- [x] **Step 1: 确认 tool-progress 计划已完成**
 
 ```powershell
 git log --oneline -15
@@ -76,7 +86,7 @@ git status --short
 
 Expected: 能看到 tool-progress 的 10 个 task commit；工作区干净（除 `.superpowers/` 等忽略项）。
 
-- [ ] **Step 2: 确认测试环境**
+- [x] **Step 2: 确认测试环境**
 
 ```powershell
 .\.venv\Scripts\python.exe -V
@@ -101,7 +111,7 @@ Expected: Python 3.12；基线测试通过。若 `.venv` 不存在，按 tool-pr
 - Produces: `elide_tool_result(tool_name: str, text: str) -> str | None`
 - Consumed by: Task 2 `core/memory.py`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/test_tool_result_maintenance.py`：
 
@@ -174,7 +184,7 @@ def test_estimate_text_tokens_cjk_aware():
     assert estimate_text_tokens("a" * 400) == 100
 ```
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_tool_result_maintenance.py
@@ -182,7 +192,7 @@ def test_estimate_text_tokens_cjk_aware():
 
 Expected: `ModuleNotFoundError: core.tool_result_maintenance`。
 
-- [ ] **Step 3: 实现模块**
+- [x] **Step 3: 实现模块**
 
 创建 `core/tool_result_maintenance.py`（完整实现，直接可用）：
 
@@ -313,13 +323,13 @@ def elide_tool_result(tool_name, text):
     )
 ```
 
-- [ ] **Step 4: 运行并确认 GREEN**
+- [x] **Step 4: 运行并确认 GREEN**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_tool_result_maintenance.py
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add core\tool_result_maintenance.py tests\test_tool_result_maintenance.py
@@ -344,7 +354,7 @@ git commit -m "feat: add tiered tool result maintenance primitives"
 保护区从消息尾部向前累加估算 token 确定。tool 消息的 content 可能是 JSON dict
 （含 `name`/`content`）或纯字符串，两种都要处理；JSON 回写保持原结构。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 创建 `tests/test_memory_maintenance.py`（fixture 复用 `tests/test_memory.py` 中现有的
 临时数据库 manager 构造方式；执行时先读该文件对齐风格）：
@@ -407,7 +417,7 @@ def test_maintain_never_touches_error_results(manager_tmp):
     assert any(m.get("role") == "tool" and m["content"] == err for m in history)
 ```
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_memory_maintenance.py
@@ -415,7 +425,7 @@ def test_maintain_never_touches_error_results(manager_tmp):
 
 Expected: `AttributeError: ... no attribute 'maintain_tool_results'`。
 
-- [ ] **Step 3: 实现 maintain_tool_results**
+- [x] **Step 3: 实现 maintain_tool_results**
 
 在 `core/memory.py` 的 `MemoryManager` 中（紧跟 `prune_history_files` 之后）新增：
 
@@ -498,13 +508,13 @@ Expected: `AttributeError: ... no attribute 'maintain_tool_results'`。
 
 注意：整个函数已在 `self._lock` 内，遵循 AGENTS.md 的 commit 纪律（函数末尾 `conn.commit()`）。
 
-- [ ] **Step 4: 运行并确认 GREEN**
+- [x] **Step 4: 运行并确认 GREEN**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_memory_maintenance.py tests\test_memory.py
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add core\memory.py tests\test_memory_maintenance.py
@@ -528,7 +538,7 @@ git commit -m "feat: maintain stale tool results at DB layer with protection zon
 LLM 摘要是全量前缀重写（一整条 10 万级 token 的纯 miss 请求），能推多晚推多晚；
 本地 Snip/Elide 把压力按在线下时才彻底不摘要（压缩经济学）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/test_agent_service.py` 追加（fixture 复用该文件现有的 manager/service 构造）：
 
@@ -581,7 +591,7 @@ def test_prepare_turn_summarizes_only_above_095(monkeypatch, manager_tmp):
     assert len(calls) == 1
 ```
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_agent_service.py -k "tier_"
@@ -589,7 +599,7 @@ def test_prepare_turn_summarizes_only_above_095(monkeypatch, manager_tmp):
 
 Expected: 旧逻辑在 0.70 就调用了 compress_session_memory，第一个测试失败。
 
-- [ ] **Step 3: 实现阶梯**
+- [x] **Step 3: 实现阶梯**
 
 在 `core/agent_service.py` 模块常量区（`DEFAULT_COMPRESS_THRESHOLD` 旁）新增：
 
@@ -664,7 +674,7 @@ SUMMARIZE_RATIO = 0.95
 `compress_threshold` 形参与 `DEFAULT_COMPRESS_THRESHOLD` 常量（向后兼容，标注 deprecated，
 不删除以免破坏既有调用方与测试）。
 
-- [ ] **Step 4: 运行并确认 GREEN**
+- [x] **Step 4: 运行并确认 GREEN**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_agent_service.py tests\test_memory_maintenance.py
@@ -673,7 +683,7 @@ SUMMARIZE_RATIO = 0.95
 注意：既有测试中若有依赖"0.70 触发 compress"的断言，需同步更新到新水位（这是本计划的
 预期行为变更，允许改测试断言但不允许改被测语义之外的部分）。
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add core\agent_service.py tests\test_agent_service.py
@@ -692,7 +702,7 @@ git commit -m "feat: replace single-threshold compression with four-tier waterma
 - Produces: `latest_real_prompt_tokens() -> int`（无历史请求时返回 0）。
 - Consumed by: Task 3 的 `_pressure()`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_latest_real_prompt_tokens_reads_shared_usage():
@@ -702,7 +712,7 @@ def test_latest_real_prompt_tokens_reads_shared_usage():
     assert latest_real_prompt_tokens() == 4321
 ```
 
-- [ ] **Step 2: 实现（`core/llm.py`，放在 `session_token_usage` 定义附近）**
+- [x] **Step 2: 实现（`core/llm.py`，放在 `session_token_usage` 定义附近）**
 
 ```python
 def latest_real_prompt_tokens():
@@ -711,7 +721,7 @@ def latest_real_prompt_tokens():
         return int(session_token_usage.get("latest_prompt") or 0)
 ```
 
-- [ ] **Step 3: 运行并确认 GREEN 后 Commit**
+- [x] **Step 3: 运行并确认 GREEN 后 Commit**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_llm_events.py -k "latest_real_prompt"
@@ -736,7 +746,7 @@ git commit -m "feat: expose real prompt token watermark for compression ladder"
 且折叠后字节永久冻结，请求路径不再改写。`_strip_media_and_merge` 保留不动，作为旧会话
 （折叠前已存在媒体的历史）的兼容兜底——对已折叠消息它是 no-op。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_add_media_message_folds_previous_media_in_db(manager_tmp):
@@ -765,9 +775,9 @@ def test_add_media_message_folds_previous_media_in_db(manager_tmp):
 （执行时按 `get_history_for_llm` 实际返回结构调整断言；核心是"第一张折叠、第二张保留、
 折叠结果二次读取不变"。）
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 在 `core/memory.py` 模块级新增：
 
@@ -824,13 +834,13 @@ def _content_has_media(content):
 注意要用**原始 list** 判断（在 json.dumps 之前）；插入完成后、`self.conn.commit()` 之前，
 若 `has_new_media` 则调用 `self._fold_stale_media_locked(cursor, session_id)`。
 
-- [ ] **Step 4: 运行并确认 GREEN**
+- [x] **Step 4: 运行并确认 GREEN**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_memory_maintenance.py tests\test_memory.py
 ```
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add core\memory.py tests\test_memory_maintenance.py
@@ -847,7 +857,7 @@ git commit -m "feat: fold stale media at ingest instead of request time"
 **设计来源：** Reasonix `internal/boot/prompt_stability_test.go`——同一配置连续两次构建
 system prompt 必须逐字节相等；工具 schema 序列化必须确定性。
 
-- [ ] **Step 1: 直接实现并验证**
+- [x] **Step 1: 直接实现并验证**
 
 ```python
 """字节稳定性 Golden 测试：前缀缓存的第一道 CI 守卫。
@@ -902,7 +912,7 @@ git commit -m "test: guard prompt and schema byte stability"
 （`core/llm.py:_supports_cache_keepalive` 已有白名单门控），其他 provider 不受影响。
 保活请求 `tool_choice="none"` + `max_tokens=1`，成本可忽略，换来停顿后缓存不过期。
 
-- [ ] **Step 1: 修改默认值**
+- [x] **Step 1: 修改默认值**
 
 `core/cache_keepalive.py:18`：
 
@@ -914,13 +924,13 @@ git commit -m "test: guard prompt and schema byte stability"
 的断言并更新为 120（允许改断言，行为变更属本计划预期）。补一条测试：未配置时默认 120、
 显式配置 0 时仍关闭（用户可显式关掉）。
 
-- [ ] **Step 2: 运行并确认 GREEN**
+- [x] **Step 2: 运行并确认 GREEN**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_cache_keepalive.py
 ```
 
-- [ ] **Step 3: 更新 README 配置说明并 Commit**
+- [x] **Step 3: 更新 README 配置说明并 Commit**
 
 ```powershell
 git add core\cache_keepalive.py tests\test_cache_keepalive.py README.md
@@ -938,7 +948,7 @@ git commit -m "feat: enable prompt cache keepalive by default"
 **契约（Reasonix openai.go:735-763 实测）：** DeepSeek thinking 模式下，带 tool_calls 的
 assistant 消息回传时必须带 `reasoning_content` 这个 key（空字符串亦可），缺 key 会 400。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_deepseek_thinking_backfills_empty_reasoning_key():
@@ -957,7 +967,7 @@ def test_deepseek_thinking_backfills_empty_reasoning_key():
     assert fixed2 == fixed
 ```
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
 
 `core/llm.py` 新增辅助函数（放在 `_supports_reasoning_fields` 旁）：
 
@@ -985,7 +995,7 @@ def _requires_tool_call_reasoning(model_name):
 注意：执行时先用真实的 DeepSeek thinking 模型名核对 `_requires_tool_call_reasoning` 的
 判定（当前配置里 deepseek 系模型的确切名字），避免误判到非 thinking 模型改变其字节。
 
-- [ ] **Step 3: 运行并确认 GREEN 后 Commit**
+- [x] **Step 3: 运行并确认 GREEN 后 Commit**
 
 ```powershell
 git add core\llm.py tests\test_llm.py
@@ -1006,7 +1016,7 @@ git commit -m "fix: backfill reasoning_content key for deepseek thinking tool ca
 换方法。每次重复调用都是一整轮"前缀全命中但新增一大段重复工具结果"的浪费，拦截后
 连请求都少了。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```python
 def test_third_identical_successful_call_is_blocked():
@@ -1030,7 +1040,7 @@ def test_guard_ignores_failed_calls_and_resets_on_different_args():
     assert guard.should_execute("read_file", '{"file_path":"b.py"}') is True
 ```
 
-- [ ] **Step 2: 实现**
+- [x] **Step 2: 实现**
 
 `core/llm.py` 新增：
 
@@ -1075,7 +1085,7 @@ class _RepeatCallGuard:
 执行后按 `_tool_result_ok(...)` 的结果 `guard.record(...)`。
 guard 实例在 `_chat_with_model_generator` 每次会话循环开始时创建（随 turn 生命周期）。
 
-- [ ] **Step 3: 运行并确认 GREEN 后 Commit**
+- [x] **Step 3: 运行并确认 GREEN 后 Commit**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q tests\test_repeat_call_guard.py
@@ -1091,7 +1101,7 @@ git commit -m "feat: suppress repeated identical successful tool calls"
 - Modify: `AGENTS.md`（Plugin Architecture 节后补一段"上下文缓存架构"说明新模块职责）
 - 验证 Task 1-9 全部产物。
 
-- [ ] **Step 1: 全量 Python 测试**
+- [x] **Step 1: 全量 Python 测试**
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
@@ -1116,7 +1126,7 @@ git commit -m "feat: suppress repeated identical successful tool calls"
 - `cache_invalidation_reason` 应为空或仅出现在压缩轮（`上下文压缩或历史重写`）；
 - 压缩事件应显著少于改动前（0.95 水位 + 本地 snip/elide 扛压）。
 
-- [ ] **Step 4: 更新 AGENTS.md**
+- [x] **Step 4: 更新 AGENTS.md**
 
 在适当章节补充：
 
@@ -1130,7 +1140,7 @@ git commit -m "feat: suppress repeated identical successful tool calls"
 - 铁律：请求路径绝不改写历史中间字节；任何历史改写必须一次性、幂等、DB 层完成。
 ```
 
-- [ ] **Step 5: Commit 收尾**
+- [x] **Step 5: Commit 收尾**
 
 ```powershell
 git add AGENTS.md
@@ -1139,15 +1149,15 @@ git commit -m "docs: document context cache architecture"
 
 ## Final Review Checklist
 
-- [ ] Task 0 门槛确认：tool-progress 计划已完整落地、工作区干净。
-- [ ] 所有历史改写一次性 + 幂等（重复运行 maintain 返回 0 改写）。
-- [ ] 尾部保护区内的消息从未被改写（测试覆盖）。
-- [ ] 错误结果（🚨 前缀）从未被改写（测试覆盖）。
-- [ ] LLM 摘要只在 0.95 水位以上触发（测试覆盖）。
-- [ ] `_strip_media_and_merge` 保留作为旧会话兼容兜底，未删除。
-- [ ] Golden 字节稳定性测试进入常规测试套件。
-- [ ] keepalive 默认 120s，显式配置 0 仍可关闭。
-- [ ] 全量 pytest + py_compile 通过。
+- [x] Task 0 门槛确认：tool-progress 计划已完整落地、工作区干净。
+- [x] 所有历史改写一次性 + 幂等（重复运行 maintain 返回 0 改写）。
+- [x] 尾部保护区内的消息从未被改写（测试覆盖）。
+- [x] 错误结果（🚨 前缀）从未被改写（测试覆盖）。
+- [x] LLM 摘要只在 0.95 水位以上触发（测试覆盖）。
+- [x] `_strip_media_and_merge` 保留作为旧会话兼容兜底，未删除。
+- [x] Golden 字节稳定性测试进入常规测试套件。
+- [x] keepalive 默认 120s，显式配置 0 仍可关闭。
+- [x] 全量 pytest + py_compile 通过。
 - [ ] cache_benchmark 加权热命中率 ≥ 0.97；真实会话 /usage 抽检达标。
 
 ## 附录：不做的事（明确排除）
