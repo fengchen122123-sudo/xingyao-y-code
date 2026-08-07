@@ -64,3 +64,45 @@ def test_maintain_never_touches_error_results(manager_tmp):
     assert s == 0 and e == 0
     history = manager_tmp.get_history_for_llm(session)
     assert any(m.get("role") == "tool" and m["content"] == err for m in history)
+
+
+# ---------------------------------------------------------------------------
+# 入库时折叠旧媒体（替代请求路径改写历史）
+# ---------------------------------------------------------------------------
+
+
+def test_add_media_message_folds_previous_media_in_db(manager_tmp):
+    session = "media-fold"
+    img1 = [{"type": "text", "text": "看这张图"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]
+    img2 = [{"type": "text", "text": "再看这张"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBB"}}]
+    manager_tmp.add_message(session, "user", img1)
+    manager_tmp.add_message(session, "assistant", "看到了")
+    manager_tmp.add_message(session, "user", img2)
+    history = manager_tmp.get_history_for_llm(session)
+    users = [m for m in history if m.get("role") == "user"]
+    # 第一张已被折叠为文本占位符；第二张原样保留
+    first_content = users[0]["content"]
+    assert all(b.get("type") == "text" for b in first_content)
+    assert any("已折叠" in b.get("text", "") for b in first_content)
+    last_content = users[-1]["content"]
+    assert any(b.get("type") == "image_url" for b in last_content)
+    # 幂等：再次写入普通消息不影响已折叠内容
+    manager_tmp.add_message(session, "assistant", "明白")
+    history2 = manager_tmp.get_history_for_llm(session)
+    users2 = [m for m in history2 if m.get("role") == "user"]
+    assert users2[0]["content"] == first_content
+
+
+def test_add_media_message_single_media_stays_untouched(manager_tmp):
+    session = "media-single"
+    img = [{"type": "text", "text": "唯一的图"},
+           {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}}]
+    manager_tmp.add_message(session, "user", img)
+    manager_tmp.add_message(session, "assistant", "收到")
+    manager_tmp.add_message(session, "user", "纯文本追问")
+    history = manager_tmp.get_history_for_llm(session)
+    users = [m for m in history if m.get("role") == "user"]
+    # 只有一张媒体图且最新 user 是纯文本：图片仍保留（折叠只发生在新媒体入库时）
+    assert any(b.get("type") == "image_url" for b in users[0]["content"])
