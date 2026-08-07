@@ -3,6 +3,8 @@
 // 后端会单独重写以匹配此契约。
 
 export type PermissionMode = 'confirm' | 'auto' | 'plan' | 'full';
+// 推理强度档位：default = 模型条目未配置，用请求层内置默认
+export type ReasoningEffort = 'default' | 'low' | 'high' | 'max';
 
 export interface ModelInfo {
   id: string;
@@ -101,6 +103,7 @@ export interface InitialState {
   active_model_id: string;
   active_model_name: string;
   permission_mode: PermissionMode;
+  reasoning_effort?: ReasoningEffort;
   sessions: SessionGroup[];
   skills: SkillInfo[];
   mcps: McpInfo[];
@@ -196,6 +199,7 @@ export interface PyWebViewAPI {
   rename_session(oldName: string, newName: string): Promise<any>;
 
   set_model(modelId: string): Promise<any>;
+  set_reasoning_effort(level: ReasoningEffort): Promise<any>;
   set_permission_mode(mode: PermissionMode): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
 

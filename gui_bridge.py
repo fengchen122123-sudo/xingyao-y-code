@@ -30,8 +30,10 @@ from core.model_manager import (
     add_provider as mm_add_provider,
     delete_model as mm_delete_model,
     get_active_model,
+    get_model_reasoning_effort,
     load_config,
     set_active_model,
+    set_model_reasoning_effort,
 )
 from core.permission_broker import permission_broker
 from core.skills import get_active_skill_ids, save_active_skill_ids, scan_all_skills
@@ -535,6 +537,8 @@ class ApiBridge:
                 "providers": providers,
                 "active_model_id": str(config_data.get("active_model_id") or ""),
                 "active_model_name": str(active_model.get("name") or "未激活模型"),
+                # 当前激活模型的推理强度档位（None/"default" = 内置默认）
+                "reasoning_effort": get_model_reasoning_effort(config_data.get("active_model_id")) or "default",
                 "permission_mode": self._current_permission_mode,
                 "sessions": self.get_sessions(),
                 "skills": self._build_skill_list(),
@@ -555,6 +559,7 @@ class ApiBridge:
             return {
                 "models": [], "providers": [], "active_model_id": "",
                 "active_model_name": "未激活模型", "permission_mode": "confirm",
+                "reasoning_effort": "default",
                 "sessions": [], "skills": [], "mcps": [],
                 "workdir": "", "current_session": self._current_session,
                 "token_usage": {"used": 0, "window": 0, "cached_pct": 0, "cumulative": 0},
@@ -918,9 +923,30 @@ class ApiBridge:
                 "ok": True,
                 "active_model_id": str(model_id),
                 "active_model_name": str(matched.get("name", "")),
+                # 模型切换后前端需同步该模型自己的推理强度档位
+                "reasoning_effort": str(matched.get("reasoning_effort") or "default"),
             }
         except Exception as e:
             logger.exception("set_model 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_reasoning_effort(self, level: str) -> Dict[str, Any]:
+        """设置当前激活模型的推理强度档位（按模型持久化，下一轮请求生效）。"""
+        try:
+            active_id = str(load_config().get("active_model_id") or "")
+            if not active_id:
+                return {"ok": False, "msg": "当前没有激活模型"}
+            ok, message = set_model_reasoning_effort(active_id, level)
+            if not ok:
+                return {"ok": False, "msg": message}
+            effective = get_model_reasoning_effort(active_id) or "default"
+            # Anthropic 路由不注入 reasoning_effort（走 thinking_budget），明确告知前端
+            litellm_model = str((get_active_model() or {}).get("litellm_model") or "")
+            if litellm_model.split("/")[0].lower() == "anthropic":
+                message += "（当前模型走 Anthropic 路由，该档位不会注入请求）"
+            return {"ok": True, "reasoning_effort": effective, "msg": message}
+        except Exception as e:
+            logger.exception("set_reasoning_effort 失败")
             return {"ok": False, "msg": str(e)}
 
     def set_permission_mode(self, mode: str) -> Dict[str, Any]:

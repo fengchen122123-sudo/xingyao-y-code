@@ -900,3 +900,54 @@ def test_new_command_creates_and_switches_session(monkeypatch):
         assert any("全新会话" in p for p in printed)
     finally:
         main.current_session = old_session
+
+
+def test_effort_command_shows_current_level(monkeypatch):
+    import core.model_manager as mm
+
+    printed = []
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
+    monkeypatch.setattr(mm, "load_config", lambda: {"active_model_id": "m1", "providers": []})
+    monkeypatch.setattr(mm, "get_model_reasoning_effort", lambda model_id: "low")
+
+    main.handle_slash_command("/effort")
+
+    assert any("low" in line for line in printed)
+
+
+def test_effort_command_sets_level_and_warns_anthropic_route(monkeypatch):
+    import core.model_manager as mm
+
+    printed = []
+    calls = []
+    cfg = {
+        "active_model_id": "m1",
+        "providers": [
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "anthropic/k3-for-anthropic"}]}
+        ],
+    }
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
+    monkeypatch.setattr(main, "app_instance", None)
+    monkeypatch.setattr(mm, "load_config", lambda: cfg)
+    monkeypatch.setattr(
+        mm,
+        "set_model_reasoning_effort",
+        lambda model_id, level: calls.append((model_id, level)) or (True, "模型 m1 推理强度已设为 high"),
+    )
+
+    main.handle_slash_command("/effort high")
+
+    assert calls == [("m1", "high")]
+    assert any("Anthropic" in line for line in printed)
+
+
+def test_effort_command_rejects_without_active_model(monkeypatch):
+    import core.model_manager as mm
+
+    printed = []
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
+    monkeypatch.setattr(mm, "load_config", lambda: {"active_model_id": None, "providers": []})
+
+    main.handle_slash_command("/effort low")
+
+    assert any("没有激活模型" in line for line in printed)
