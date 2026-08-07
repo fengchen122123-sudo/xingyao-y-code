@@ -1583,3 +1583,37 @@ def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
         assert llm_mod.session_token_usage["latest_cached"] == 512
         assert llm_mod.session_token_usage["latest_prompt"] == 676
         assert llm_mod.session_token_usage["cumulative_cached"] == before + 512
+
+
+# ── DeepSeek thinking：带 tool_calls 的 assistant 必须回传 reasoning_content key ──
+
+
+def test_deepseek_thinking_backfills_empty_reasoning_key():
+    import core.llm as llm_mod
+
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x"},
+    ]
+    fixed, _, _ = llm_mod._strip_media_and_merge(messages, "deepseek/deepseek-thinking")
+    assert "reasoning_content" in fixed[0]
+    assert fixed[0]["reasoning_content"] == ""
+    # 幂等：再清洗一次字节不变
+    fixed2, _, _ = llm_mod._strip_media_and_merge(fixed, "deepseek/deepseek-thinking")
+    assert fixed2 == fixed
+
+
+def test_non_thinking_deepseek_not_backfilled():
+    import core.llm as llm_mod
+
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x"},
+    ]
+    # 非 thinking 的 deepseek 路由（如 openai/deepseek-v4-flash）字节不得改变
+    fixed, _, _ = llm_mod._strip_media_and_merge(messages, "openai/deepseek-v4-flash")
+    assert "reasoning_content" not in fixed[0]

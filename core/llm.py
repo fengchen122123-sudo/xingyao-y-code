@@ -1114,6 +1114,12 @@ def _supports_reasoning_fields(model_name):
     return _is_kimi_family(model_name)
 
 
+def _requires_tool_call_reasoning(model_name):
+    """DeepSeek thinking 模式：带 tool_calls 的 assistant 必须回传 reasoning_content key。"""
+    name = str(model_name or "").lower()
+    return name.split("/")[0] == "deepseek" and ("think" in name or "reason" in name)
+
+
 # 支持 prompt caching 的 provider 白名单（按 litellm model 前缀匹配）
 # 仅 Anthropic 需要显式 cache_control 标记：
 #   - anthropic: 需显式标记，命中后缓存 token 按 1/10 计费
@@ -1310,6 +1316,15 @@ def _strip_media_and_merge(messages, model_name=None):
             cleaned_msg["reasoning_content"] = msg["reasoning_content"]
         if keep_reasoning_fields and keep_thinking_blocks and msg.get("thinking_blocks") is not None:
             cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
+        # DeepSeek thinking 契约：带 tool_calls 的 assistant 必须携带 reasoning_content
+        # key（空串亦可），缺 key 会 400。补空串是确定性变换，不破坏前缀稳定性。
+        if (
+            role == "assistant"
+            and cleaned_msg.get("tool_calls")
+            and _requires_tool_call_reasoning(model_name)
+            and cleaned_msg.get("reasoning_content") is None
+        ):
+            cleaned_msg["reasoning_content"] = ""
 
         # 净化 assistant 消息：若 content 包含 protocol sanitised 占位符且有 tool_calls/reasoning，将 content 重置为空字符串
         if role == "assistant" and isinstance(cleaned_msg.get("content"), str):
