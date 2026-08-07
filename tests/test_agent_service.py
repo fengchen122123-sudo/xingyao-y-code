@@ -525,7 +525,7 @@ def test_prepare_turn_messages_uses_real_usage_baseline(stub_llm, quiet_extras):
 
 
 def test_prepare_turn_messages_real_baseline_triggers_compression(stub_llm, quiet_extras, monkeypatch):
-    """真实基线超阈值时触发压缩；触发后才用估算指导后续收缩。"""
+    """真实基线超过 0.95 水位时触发压缩；触发后才用估算指导后续收缩。"""
     import core.memory_compressor as memory_compressor
     from core.agent_service import prepare_turn_messages
 
@@ -539,13 +539,37 @@ def test_prepare_turn_messages_real_baseline_triggers_compression(stub_llm, quie
     manager = _make_manager()
     session = "test_real_baseline_compress"
     manager.add_message(session, "user", "你好")
-    # 128000 * 0.70 = 89600，真实基线 95000 超阈值
-    manager.add_token_usage("openai", "gpt-test", 94000, 1000, 0, 95000, session_id=session)
+    # 四级水位线后付费摘要只在 0.95 触发：128000 * 0.95 = 121600，真实基线 124500 超阈值
+    manager.add_token_usage("openai", "gpt-test", 123500, 1000, 0, 124500, session_id=session)
 
     prepare_turn_messages(
         manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
     )
     assert len(calls) == 1
+
+
+def test_prepare_turn_real_baseline_below_095_skips_compression(stub_llm, quiet_extras, monkeypatch):
+    """真实基线处于 0.60~0.95 之间且无可折叠工具结果时：不触发付费摘要。"""
+    import core.memory_compressor as memory_compressor
+    from core.agent_service import prepare_turn_messages
+
+    calls = []
+    monkeypatch.setattr(
+        memory_compressor,
+        "compress_session_memory",
+        lambda *args, **kwargs: calls.append(args),
+    )
+
+    manager = _make_manager()
+    session = "test_real_baseline_no_compress"
+    manager.add_message(session, "user", "你好")
+    # 95000 / 128000 ≈ 0.74：过 snip 水位但没有工具结果可维护，未到 0.95 摘要水位
+    manager.add_token_usage("openai", "gpt-test", 94000, 1000, 0, 95000, session_id=session)
+
+    prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+    assert calls == []
 
 
 def test_get_session_token_baseline_prefers_real_usage(stub_llm):
@@ -574,3 +598,75 @@ def test_get_session_token_baseline_falls_back_to_estimate(stub_llm):
         "openai/m1", [{"role": "user", "content": "你好"}]
     )
     assert baseline > history_only
+
+
+# ---------------------------------------------------------------------------
+# 四级水位线阶梯（0.60 snip / 0.80 elide / 0.95 LLM 摘要）
+# ---------------------------------------------------------------------------
+
+
+def _fill_big_tool_results(manager, session, count):
+    """写入 count 组 read_file 大结果（assistant tool_call + tool 配对，id 唯一）。"""
+    big = "\n".join(f"line-{i} " + "x" * 40 for i in range(300))
+    manager.add_message(session, "user", "开始")
+    for idx in range(count):
+        manager.add_messages(session, [
+            ("assistant", {"role": "assistant", "content": "", "tool_calls": [
+                {"id": f"call-{idx}", "type": "function",
+                 "function": {"name": "read_file", "arguments": "{}"}}]}),
+            ("tool", {"role": "tool", "tool_call_id": f"call-{idx}",
+                      "name": "read_file", "content": big}),
+        ])
+    manager.add_message(session, "user", "继续")
+
+
+def test_prepare_turn_snips_before_summarizing(stub_llm, quiet_extras, monkeypatch):
+    """水位过 0.60 但未过 0.95 时：只做本地 snip，绝不调用 LLM 摘要。"""
+    import core.memory_compressor as memory_compressor
+    from core.agent_service import prepare_turn_messages
+    from core.tool_result_maintenance import SNIPPED_PREFIX
+
+    calls = []
+    monkeypatch.setattr(
+        memory_compressor,
+        "compress_session_memory",
+        lambda *args, **kwargs: calls.append(args),
+    )
+
+    manager = _make_manager()
+    session = "tier-ladder"
+    _fill_big_tool_results(manager, session, 5)
+    # 窗口 100000：snip 水位 60000 < 初始估算；snip 后回落到 80000(elide)/95000(摘要) 之下
+    prepare_turn_messages(
+        manager, session, "deepseek-chat", 100000, permission_mode="auto"
+    )
+    assert calls == []  # 未触发付费摘要
+    history = manager.get_history_for_llm(session)
+    assert any(
+        m.get("role") == "tool" and str(m.get("content", "")).startswith(SNIPPED_PREFIX)
+        for m in history
+    )
+
+
+def test_prepare_turn_summarizes_only_above_095(stub_llm, quiet_extras, monkeypatch):
+    """超过 0.95 且本地 snip/elide 无能为力（无工具结果）时，才调用 LLM 摘要。"""
+    import core.memory_compressor as memory_compressor
+    from core.agent_service import prepare_turn_messages
+
+    calls = []
+    monkeypatch.setattr(
+        memory_compressor,
+        "compress_session_memory",
+        lambda *args, **kwargs: calls.append(args),
+    )
+
+    manager = _make_manager()
+    session = "tier-summarize"
+    # 用大量普通 user/assistant 消息（非 tool，snip 无能为力）制造高压
+    for i in range(40):
+        manager.add_message(session, "user", f"问题{i} " + "汉" * 300)
+        manager.add_message(session, "assistant", f"回答{i} " + "汉" * 300)
+    prepare_turn_messages(
+        manager, session, "deepseek-chat", 16000, permission_mode="auto"
+    )
+    assert len(calls) == 1
