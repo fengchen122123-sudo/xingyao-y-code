@@ -159,6 +159,9 @@ export const useAppStore = defineStore('app', {
     sessionGroups: [] as SessionGroup[],
     currentSessionName: '',
     currentSessionDisplayName: '新对话',
+    // 懒创建会话：点“新会话”只进入空白状态不落库；发首条消息时才真正创建，
+    // 值为目标归属（'GLOBAL' 或项目路径），null = 非 pending 状态
+    pendingWorkdir: null as string | null,
     currentWorkdirLabel: '对话',
     workdir: '',
     fileTree: [] as FileNode[],
@@ -461,6 +464,8 @@ export const useAppStore = defineStore('app', {
     },
 
     async switchSession(sessionName: string, displayName?: string, targetWorkdir?: string) {
+      // 切换到已有会话时丢弃未发送的空白 pending 会话
+      this.pendingWorkdir = null;
       this.currentSessionName = sessionName;
       if (displayName) this.currentSessionDisplayName = displayName;
 
@@ -488,23 +493,14 @@ export const useAppStore = defineStore('app', {
     },
 
     async createGlobalSession() {
-      const api = this._api();
-      if (!api) return;
-      try {
-        const res = await api.create_global_session('新对话');
-        if (res && res.session_name) {
-          this.currentSessionName = res.session_name;
-          const sessions = await api.get_sessions();
-          this.sessionGroups = sessions;
-          await this.switchSession(res.session_name, '新对话', 'GLOBAL');
-          this.showToast('已开启独立通用对话 (跳出项目文件夹)', 'ok');
-        } else {
-          this.showToast('创建通用对话失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
-        }
-      } catch (err) {
-        this.connected = false;
-        this.showToast('创建通用对话失败: ' + err, 'warn');
-      }
+      // 懒创建：只切换到空白自由对话状态，首条消息发出时才真正落库
+      this.pendingWorkdir = 'GLOBAL';
+      this.currentSessionName = '';
+      this.currentSessionDisplayName = '新对话';
+      this.messages = [];
+      this.currentWorkdirLabel = '对话';
+      this.workdir = '';
+      this.fileTree = [];
     },
 
     // 顶栏“新会话”按钮：跟随当前上下文——在项目中就在该项目新建，
@@ -518,20 +514,34 @@ export const useAppStore = defineStore('app', {
     },
 
     async createSessionInGroup(targetWorkdir: string) {
-      const api = this._api();
-      if (!api) return;
-      try {
-        const res = await api.create_session('新会话', targetWorkdir);
-        if (res && res.session_name) {
-          this.currentSessionName = res.session_name;
-          await this.switchSession(res.session_name, '新会话', targetWorkdir);
-          this.showToast('已在指定项目新建会话', 'ok');
-        } else {
-          this.showToast('在项目创建会话失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
-        }
-      } catch (err) {
-        this.connected = false;
-        this.showToast('在项目创建会话失败: ' + err, 'warn');
+      // 懒创建：只切换到该项目下的空白会话状态，首条消息发出时才真正落库
+      this.pendingWorkdir = targetWorkdir;
+      this.currentSessionName = '';
+      this.currentSessionDisplayName = '新会话';
+      this.messages = [];
+      this.workdir = targetWorkdir;
+      this.currentWorkdirLabel = targetWorkdir.split('\\').pop() || targetWorkdir;
+    },
+
+    async exitWorkspaceToGlobal() {
+      // 退出当前项目工作区：优先回到“对话”分组最近的会话，没有则进空白自由对话
+      const globalGroup = this.sessionGroups.find(g => g.is_global || g.folder_path === 'GLOBAL');
+      const latest = globalGroup && globalGroup.sessions && globalGroup.sessions[0];
+      if (latest) {
+        await this.switchSession(latest.name, latest.display_name || latest.name, 'GLOBAL');
+      } else {
+        await this.createGlobalSession();
+      }
+    },
+
+    async switchToWorkspaceGroup(folderPath: string) {
+      // 快捷切换到指定项目分组：进入该分组最近的会话
+      const group = this.sessionGroups.find(g => g.folder_path === folderPath);
+      const latest = group && group.sessions && group.sessions[0];
+      if (latest) {
+        await this.switchSession(latest.name, latest.display_name || latest.name, folderPath);
+      } else {
+        await this.createSessionInGroup(folderPath);
       }
     },
 
@@ -627,7 +637,21 @@ export const useAppStore = defineStore('app', {
         return;
       }
       try {
-        const res = await api.send_user_message(text.trim(), this.currentSessionName, attachList);
+        // 懒创建：pending 状态下首条消息才真正创建会话（名称匹配 session_[a-f0-9]{6}
+        // 才能被后端自动重命名为消息前几个字）
+        let sessionName = this.currentSessionName;
+        let pendingDir: string | undefined;
+        if (this.pendingWorkdir !== null) {
+          pendingDir = this.pendingWorkdir;
+          this.pendingWorkdir = null;
+          sessionName = 'session_' + Math.random().toString(16).slice(2, 8).padEnd(6, '0');
+          this.currentSessionName = sessionName;
+        }
+        const res = await api.send_user_message(text.trim(), sessionName, attachList, pendingDir);
+        if (res && res.ok && pendingDir) {
+          // 让新会话立即出现在左侧列表（自动重命名事件随后会再刷新一次）
+          this.refreshSessions();
+        }
         if (!res || !res.ok) {
           this.running = false;
           this.showToast('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');

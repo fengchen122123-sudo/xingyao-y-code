@@ -203,7 +203,7 @@ export interface PyWebViewAPI {
   set_permission_mode(mode: PermissionMode): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
 
-  send_user_message(text: string, sessionName?: string, attachments?: string[]): Promise<any>;
+  send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string): Promise<any>;
   stop_current_turn(): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;

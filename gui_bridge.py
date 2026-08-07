@@ -1040,7 +1040,7 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
-    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None) -> Dict[str, Any]:
+    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None) -> Dict[str, Any]:
         try:
             clean_text = str(text or "").strip()
             attach_list = [str(p) for p in (attachments or []) if str(p).strip()]
@@ -1063,10 +1063,15 @@ class ApiBridge:
                     self._bg_summary_triggered.discard(target_session)
 
                 self._cancel_event = threading.Event()
+                turn_kwargs = {"display_text": clean_text} if attach_list else {}
+                if workdir:
+                    # 懒创建会话：前端 pending 新会话在首条消息时才落库，
+                    # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
+                    turn_kwargs["pending_workdir"] = str(workdir)
                 self._active_turn_thread = threading.Thread(
                     target=self._run_turn_worker,
                     args=(full_text, target_session),
-                    kwargs={"display_text": clean_text} if attach_list else {},
+                    kwargs=turn_kwargs,
                     daemon=True,
                     name="gui-turn-worker",
                 )
@@ -1083,7 +1088,7 @@ class ApiBridge:
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = ""):
+    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = ""):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
 
         internal_kind 非空表示这是系统自动发起的内部回合（如后台任务汇总），
@@ -1133,7 +1138,7 @@ class ApiBridge:
             self._sync_active_model_context()
 
             # 确保会话存在，再解析用户输入（支持 @文件 / 图片挂载）并入库
-            self._memory.ensure_session(session_name, workdir=self._session_workdir(session_name), source="GUI")
+            self._memory.ensure_session(session_name, workdir=pending_workdir or self._session_workdir(session_name), source="GUI")
             try:
                 from core.input_parser import parse_user_input
                 parsed_content, attached_msgs = parse_user_input(user_text)
