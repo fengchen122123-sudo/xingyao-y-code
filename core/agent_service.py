@@ -22,9 +22,18 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
-# 记忆压缩触发阈值默认值：历史 token 数占上下文窗口的比例超过此值即触发压缩。
-# 与 main.py 的 MEMORY_COMPRESS_THRESHOLD 语义一致（0.70 折中值）。
+# Deprecated：四级水位线阶梯（下方 SNIP/ELIDE/SUMMARIZE_RATIO）已取代单一阈值。
+# 保留此常量与 prepare_turn_messages 的 compress_threshold 形参仅为向后兼容，
+# 阶梯逻辑内部不再使用。
 DEFAULT_COMPRESS_THRESHOLD = 0.70
+
+# 四级水位线（DeepSeek 前缀缓存友好，设计见
+# docs/superpowers/plans/2026-08-05-deepseek-cache-99.md）：
+# 本地改写（snip/elide）只发生在保护区之外、每条消息最多两次且字节永久冻结；
+# 付费 LLM 摘要（全量前缀重写，一整条 10 万级 token 的纯 miss 请求）推迟到 95% 水位才触发。
+SNIP_RATIO = 0.60
+ELIDE_RATIO = 0.80
+SUMMARIZE_RATIO = 0.95
 
 # 兜底系统提示词：提示词文件全部缺失时也不能让整轮对话失败
 FALLBACK_SYSTEM_PROMPT = "你叫星瑶，是一位顶尖的代码编程助手。"
@@ -306,7 +315,7 @@ def prepare_turn_messages(
     步骤严格保持与历史 TUI 实现一致的顺序：
       1. 清理超长历史文件记录 (prune_history_files)
       2. 取压缩后的 LLM 历史 + 估算 token
-      3. 超阈值时逐级升级：智能压缩 → 物理折叠 → 滑窗淘汰
+      3. 按四级水位线逐级升级：snip → elide → 智能压缩 → 物理折叠 → 滑窗淘汰
       4. 剔除历史遗留 system 消息
       5. 读取系统提示词（三级兜底）
       6. 组装 RuntimeContext，插入稳定提示词 + 动态上下文
@@ -339,7 +348,6 @@ def prepare_turn_messages(
         window = 0
     if window <= 0:
         window = 128000
-    limit = window * float(compress_threshold)
 
     # 【阶段4】后台静默清理超长历史文件记录
     manager.prune_history_files(session_name, max_turns=16, retain_recent=4)
@@ -358,15 +366,33 @@ def prepare_turn_messages(
     # 否则口径会低于实际请求（系统提示词不落库、每轮现组）
     system_message = build_stable_system_message()
 
-    # 【全新机制】在向大模型请求前，判断当前上下文占用是否超阈值。
-    # 优先用本会话最近一次真实 API 用量作基线（下一轮 prompt 必然包含
+    # 【四级水位线阶梯】在向大模型请求前，按水位逐级升级维护强度。
+    # 触发判断优先用本会话最近一次真实 API 用量作基线（下一轮 prompt 必然包含
     # 上一轮的 prompt + completion）；无真实记录时才用含系统提示词的估算兜底。
+    # 任何本地改写发生后真实基线即失效，退化到含系统提示词的估算指导后续层级。
     estimated_tokens = get_session_token_baseline(
         manager, session_name, model_name, history=history
     )
 
-    if estimated_tokens > limit and not _cancelled():
-        # 超过阈值触发智能记忆压缩提炼。
+    # Tier 1 (≥60%)：本地 snip 旧工具结果（一次性改写并冻结，不重排、不重写前缀主体）
+    if estimated_tokens > window * SNIP_RATIO and not _cancelled():
+        snipped, _ = manager.maintain_tool_results(session_name, tier=1)
+        if snipped:
+            _notify("compress", f"<ansiyellow>ℹ 已折叠 {snipped} 条旧工具结果以节省上下文。</ansiyellow>")
+            history = manager.get_history_for_llm(session_name)
+            estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+
+    # Tier 2 (≥80%)：旧工具结果整体占位符化（snipped 升级一次）
+    if estimated_tokens > window * ELIDE_RATIO and not _cancelled():
+        _, elided = manager.maintain_tool_results(session_name, tier=2)
+        if elided:
+            _notify("compress", f"<ansiyellow>ℹ 已归档 {elided} 条旧工具结果。</ansiyellow>")
+            history = manager.get_history_for_llm(session_name)
+            estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+
+    # Tier 3 (≥95%)：压缩经济学——本地维护已把压力拉回线下则跳过付费摘要
+    if estimated_tokens > window * SUMMARIZE_RATIO and not _cancelled():
+        # 超过 0.95 水位才触发智能记忆压缩提炼。
         # 注意：compress_session_memory 在调用线程内同步执行且暂不支持取消参数，
         # 压缩期间的取消信号要等压缩返回后才会生效（接口约束，暂不透传取消）。
         from core.memory_compressor import compress_session_memory
@@ -384,14 +410,14 @@ def prepare_turn_messages(
         estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
         # 兜底：如果总结归纳后依然超限，触发物理大文件折叠机制
-        if estimated_tokens > limit:
+        if estimated_tokens > window * SUMMARIZE_RATIO:
             manager.prune_history_files(session_name, max_turns=1, retain_recent=4)
             history = manager.get_history_for_llm(session_name)
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
         # 智能滑窗淘汰：如果仍超限，按完整轮次（user 开头到下一个 user 之前）
         # 为单位从内存中丢弃最早的旧消息，直到满足 Token 安全阈值
-        while len(history) > 2 and estimated_tokens > limit:
+        while len(history) > 2 and estimated_tokens > window * SUMMARIZE_RATIO:
             if not evict_oldest_turn(history):
                 break
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
