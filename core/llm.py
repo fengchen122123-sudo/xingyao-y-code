@@ -1986,11 +1986,11 @@ def _sandbox_outside_guard(
     if not outside:
         return None, None
     from core import tools as _tools
-    # 长期记忆目录（~/.ycode/memory）是自家记忆系统的读写区、不含凭据，
+    # ycode 数据目录（~/.ycode 全部内容：记忆/会话/配置）是自家运行数据，
     # read/write/edit 均豁免沙盒外询问；返回 bypass 上下文让工具层兜底校验放行
     try:
-        from core.memory_kairos import is_memory_path
-        if is_memory_path(path_value):
+        from core.memory_kairos import is_ycode_data_path
+        if is_ycode_data_path(path_value):
             return sandbox_bypass(), None
     except Exception:
         pass

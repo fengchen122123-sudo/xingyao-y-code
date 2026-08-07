@@ -134,6 +134,50 @@ def set_active_model(model_id: str):
     config.update_config(_mutate)
 
 
+REASONING_EFFORT_LEVELS = ("low", "high", "max")
+
+
+def get_model_reasoning_effort(model_id: str) -> str | None:
+    """返回模型条目上显式配置的 reasoning_effort；未配置返回 None（请求层用内置默认）。"""
+    if not model_id:
+        return None
+    data = load_config()
+    for provider in data.get("providers", []):
+        for model in provider.get("models", []):
+            if model.get("id") == model_id:
+                level = model.get("reasoning_effort")
+                return str(level).lower() if level else None
+    return None
+
+
+def set_model_reasoning_effort(model_id: str, level: str | None) -> tuple[bool, str]:
+    """按模型持久化推理强度档位；level 为 None/\"default\" 时删除字段恢复内置默认。"""
+    normalized = str(level or "").strip().lower()
+    if normalized in ("", "default"):
+        normalized = ""
+    elif normalized not in REASONING_EFFORT_LEVELS:
+        return False, f"无效档位: {level}（可选 low/high/max/default）"
+
+    found = []
+
+    def _mutate(data):
+        for provider in data.get("providers", []):
+            for model in provider.get("models", []):
+                if model.get("id") == model_id:
+                    found.append(model.get("name") or model_id)
+                    if normalized:
+                        model["reasoning_effort"] = normalized
+                    else:
+                        model.pop("reasoning_effort", None)
+                    return
+    config.update_config(_mutate)
+    if not found:
+        return False, f"未找到模型: {model_id}"
+    if normalized:
+        return True, f"模型 {found[0]} 推理强度已设为 {normalized}"
+    return True, f"模型 {found[0]} 推理强度已恢复默认"
+
+
 def get_model_config_by_litellm_model(litellm_model: str, base_url: str | None = None) -> dict | None:
     """根据 litellm_model 字符串（以及可选的 base_url）查找对应的模型配置条目。
 

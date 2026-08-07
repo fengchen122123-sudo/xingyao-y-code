@@ -12,6 +12,7 @@ import type {
   BackgroundTask,
   TokenUsage,
   PermissionMode,
+  ReasoningEffort,
   PyWebViewAPI,
   ToolStartEventData,
   ToolFinishEventData,
@@ -150,6 +151,9 @@ export const useAppStore = defineStore('app', {
 
     // 权限模式（规范值：confirm | auto | plan | full，展示一律经 formatPermMode）
     permissionMode: 'confirm' as PermissionMode,
+
+    // 当前激活模型的推理强度档位（default = 内置默认）
+    reasoningEffort: 'default' as ReasoningEffort,
 
     // 会话 / 项目工作区
     sessionGroups: [] as SessionGroup[],
@@ -357,6 +361,7 @@ export const useAppStore = defineStore('app', {
         this.activeModelId = init.active_model_id || '';
         this.activeModelName = init.active_model_name || '';
         this.permissionMode = init.permission_mode || 'confirm';
+        this.reasoningEffort = (init as any).reasoning_effort || 'default';
         this.sessionGroups = init.sessions || [];
         this.skills = init.skills || [];
         this.mcps = init.mcps || [];
@@ -402,6 +407,8 @@ export const useAppStore = defineStore('app', {
         if (res && res.ok) {
           this.activeModelId = res.active_model_id || modelId;
           this.activeModelName = res.active_model_name || this.activeModelName;
+          // 推理强度按模型保存：切换模型后同步该模型自己的档位
+          this.reasoningEffort = res.reasoning_effort || 'default';
           this.showToast('已切换活动模型: ' + this.activeModelName, 'ok');
         } else {
           this.showToast('切换模型失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
@@ -409,6 +416,27 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.showToast('切换模型失败: ' + err, 'warn');
+      }
+    },
+
+    async setReasoningEffort(level: ReasoningEffort) {
+      const prev = this.reasoningEffort;
+      this.reasoningEffort = level;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.set_reasoning_effort(level);
+        if (res && res.ok) {
+          this.reasoningEffort = res.reasoning_effort || level;
+          this.showToast(res.msg || ('推理强度已调整: ' + this.reasoningEffort), 'ok');
+        } else {
+          this.reasoningEffort = prev;
+          this.showToast('推理强度调整失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+        }
+      } catch (err) {
+        this.reasoningEffort = prev;
+        this.connected = false;
+        this.showToast('推理强度调整失败: ' + err, 'warn');
       }
     },
 

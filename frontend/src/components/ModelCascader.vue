@@ -34,6 +34,19 @@
       <div class="cascader-item cascader-manage" title="添加/管理供应商与模型" @click="manageModels">
         <span class="c-label">⚙ 管理模型</span>
       </div>
+      <template v-if="hasAnyModel">
+        <div class="cascader-sep"></div>
+        <div class="effort-row" title="当前模型的推理强度（按模型保存，下一轮请求生效）">
+          <span class="effort-label">推理强度</span>
+          <span
+            v-for="opt in effortOptions"
+            :key="opt.v"
+            class="effort-opt"
+            :class="{ active: store.reasoningEffort === opt.v }"
+            @click.stop="selectEffort(opt.v)"
+          >{{ opt.label }}</span>
+        </div>
+      </template>
     </div>
   </div>
 </template>
@@ -41,7 +54,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
-import type { ModelInfo } from '../types/pywebview';
+import type { ModelInfo, ReasoningEffort } from '../types/pywebview';
 
 const props = defineProps<{
   visible: boolean;
@@ -74,6 +87,18 @@ function selectModel(modelId: string) {
 function manageModels() {
   store.openSubpage('models');
   emit('close');
+}
+
+// 推理强度档位：default = 模型条目未配置（请求层内置默认）
+const effortOptions: Array<{ v: ReasoningEffort; label: string }> = [
+  { v: 'default', label: '默认' },
+  { v: 'low', label: '低' },
+  { v: 'high', label: '高' },
+  { v: 'max', label: '最深' },
+];
+
+function selectEffort(level: ReasoningEffort) {
+  store.setReasoningEffort(level);
 }
 
 watch(() => props.visible, (newVal) => {
@@ -207,5 +232,37 @@ onUnmounted(() => {
   font-size: 12px;
   color: var(--text-faint);
   text-align: center;
+}
+.effort-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 6px 10px 4px;
+  user-select: none;
+}
+.effort-label {
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-right: 4px;
+  white-space: nowrap;
+}
+.effort-opt {
+  font-size: 11px;
+  color: var(--text-dim);
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: 0.15s;
+  white-space: nowrap;
+}
+.effort-opt:hover {
+  background: var(--bg3);
+  color: var(--text);
+}
+.effort-opt.active {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--bg3);
 }
 </style>
