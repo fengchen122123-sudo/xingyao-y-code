@@ -38,6 +38,22 @@ SUMMARIZE_RATIO = 0.95
 # 兜底系统提示词：提示词文件全部缺失时也不能让整轮对话失败
 FALLBACK_SYSTEM_PROMPT = "你叫星瑶，是一位顶尖的代码编程助手。"
 
+# 通用编码规范（并入稳定系统提示词前缀，跨轮不变，对任何编码项目适用）。
+# 作为稳定前缀的扩充块，同时帮助 DeepSeek 磁盘缓存跨越更多完整缓存块。
+_GENERAL_CODING_STANDARDS = """【通用编码规范】
+1. 修改代码前先理解现有结构与调用链，坚持最小改动原则，不做无关重构。
+2. 改动后必须运行相关测试或编译/语法检查验证，验证通过才能声明任务完成。
+3. 错误排查先定位根因（读报错、复现、查最近变更），再给出 1-3 个可选方案，不盲目重试。
+4. 工具调用失败要如实保留错误信息，不隐瞒、不谎报成功；同因错误最多重试 2 次。
+5. 结论优先，再展开细节；不过度寒暄，保持专业高效。
+6. 删除文件/目录、危险 Git 操作、批量修改、安装全局依赖等破坏性操作先请求用户确认。
+7. 新增功能优先复用现有工具、函数与模式，避免重复造轮子。
+8. 命名遵循现有代码风格，注释补充必要上下文而非复述代码。
+9. 处理文本数据注意编码一致性，避免 GBK/UTF-8 混淆导致乱码。
+10. 长任务分阶段反馈进度，避免长时间静默。
+11. 交付代码遵循对应语言的社区规范，添加必要注释，给出可直接运行的完整代码块。
+12. 优先给出可执行的结论，不确定时明确说明假设，不臆测需求。"""
+
 # 后台子代理结果注入时，单条结果的最大长度
 _BG_RESULT_MAX_CHARS = 1500
 
@@ -124,10 +140,43 @@ def load_system_prompt() -> str:
 
 
 def build_stable_system_message() -> dict:
-    """组装每轮请求首位的稳定系统提示词消息，供请求组装与 Token 估算复用。"""
-    from core.context_builder import build_stable_prompt
-    return {"role": "system", "content": build_stable_prompt(load_system_prompt())}
+    """组装每轮请求首位的稳定系统提示词消息，供请求组装与 Token 估算复用。
 
+    稳定前缀 = 基础系统提示词 + 决策策略 + 通用编码规范 + 长期记忆
+               + 技能目录 + 自定义子 Agent 清单。
+    后四块内容跨轮基本不变（记忆仅在用户显式要求记录/归纳时变化，技能与子 Agent
+    在会话内稳定），并入稳定前缀可把前缀撑到 2048 token 的整数倍以上，
+    显著提升 DeepSeek 磁盘缓存（按 2048 token 块匹配）的命中覆盖范围。
+
+    注意：任何跨轮不变的静态内容都应优先并入这里，而不是放进动态运行上下文块，
+    动态块每轮变化会打断 provider 侧缓存前缀。
+    """
+    from core.context_builder import build_stable_prompt
+
+    parts = [build_stable_prompt(load_system_prompt())]
+    parts.append(_GENERAL_CODING_STANDARDS)
+    try:
+        import core.memory_kairos as memory_kairos
+        memory_section = memory_kairos.build_memory_system_section()
+        if memory_section.strip():
+            parts.append(memory_section)
+    except Exception:
+        pass
+    try:
+        from core.skills import get_active_skills_catalog
+        skills_catalog = get_active_skills_catalog()
+        if skills_catalog.strip():
+            parts.append(skills_catalog)
+    except Exception:
+        pass
+    try:
+        from core.subagent_registry import get_custom_subagents_catalog
+        subagents_catalog = get_custom_subagents_catalog()
+        if subagents_catalog.strip():
+            parts.append(subagents_catalog)
+    except Exception:
+        pass
+    return {"role": "system", "content": "\n\n".join(parts)}
 
 def estimate_history_tokens_with_system(model_name: str, history: list) -> int:
     """估算一轮请求的实际 Token 占用：历史消息 + 首部稳定系统提示词。
@@ -159,12 +208,14 @@ def get_session_token_baseline(manager, session_name: str, model_name: str,
 
 
 def build_runtime_context(model_name: str, permission_mode: str):
-    """组装本轮的运行上下文（时间 / 计划快照 / 长期记忆 / 技能 / 自定义子 Agent）。"""
+    """组装本轮的运行上下文（时间 / 计划快照 / 工作目录）。
+
+    长期记忆、技能目录、自定义子 Agent 清单已并入稳定系统提示词
+    （build_stable_system_message，跨轮不变的大段静态内容），
+    这里不再重复注入，避免动态块膨胀与重复消耗 token。
+    """
     from core.context_builder import RuntimeContext
-    from core.skills import get_active_skills_catalog
-    from core.subagent_registry import get_custom_subagents_catalog
     from core.plan import get_default_plan_manager
-    import core.memory_kairos as memory_kairos
 
     now = datetime.datetime.now()
     plan_items = get_default_plan_manager().snapshot()
@@ -177,9 +228,6 @@ def build_runtime_context(model_name: str, permission_mode: str):
         working_dir=os.getcwd(),
         current_time=now.strftime("%Y-%m-%d %H:%M:%S"),
         active_plan=active_plan,
-        memory=memory_kairos.build_memory_system_section(),
-        skills=get_active_skills_catalog() or "无",
-        custom_subagents=get_custom_subagents_catalog() or "无",
     )
 
 
