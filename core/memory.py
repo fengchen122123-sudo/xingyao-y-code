@@ -984,6 +984,86 @@ class MemoryManager:
                     self.conn.rollback()
                     raise
 
+    def maintain_tool_results(self, session_name, tier=1, protection_tokens=8000):
+        """分层本地维护旧工具结果（Snip/Elide），DB 层一次性改写并永久冻结。
+
+        tier=1 截断（snip）；tier=2 占位符化（elide，snipped 可升级一次）。
+        尾部 protection_tokens 估算 token 为保护区内消息，永不改写。
+        只处理 id > summarized_until_msg_id 的活跃消息（已被摘要排除的消息
+        不在请求前缀里，无需维护）。
+        返回 (snipped_count, elided_count)。
+        """
+        from core.tool_result_maintenance import (
+            elide_tool_result,
+            estimate_text_tokens,
+            snip_tool_result,
+        )
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT id, summarized_until_msg_id FROM sessions WHERE session_name = ?',
+                (session_name,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return (0, 0)
+            session_id, summarized_until = row[0], row[1] or 0
+            cursor.execute(
+                'SELECT id, role, content FROM messages '
+                'WHERE session_id = ? AND id > ? ORDER BY id ASC',
+                (session_id, summarized_until),
+            )
+            records = cursor.fetchall()
+
+            # 保护区：从尾部向前累加估算 token
+            protection_start = 0
+            total = 0
+            for i in range(len(records) - 1, -1, -1):
+                total += estimate_text_tokens(str(records[i][2] or ""))
+                if total >= protection_tokens:
+                    protection_start = i
+                    break
+
+            updates = []
+            snipped = elided = 0
+            for i in range(protection_start):
+                msg_id, role, raw = records[i]
+                if role != "tool":
+                    continue
+                parsed, ok = _try_parse_json(raw)
+                if ok and isinstance(parsed, dict):
+                    name = str(parsed.get("name") or "")
+                    text = str(parsed.get("content") or "")
+                else:
+                    name, text = "", str(raw or "")
+
+                new_text = None
+                if tier >= 2:
+                    new_text = elide_tool_result(name, text)
+                    if new_text is not None:
+                        elided += 1
+                if new_text is None and tier >= 1:
+                    new_text = snip_tool_result(name, text)
+                    if new_text is not None:
+                        snipped += 1
+                if new_text is None:
+                    continue
+                if ok and isinstance(parsed, dict):
+                    parsed["content"] = new_text
+                    new_raw = json.dumps(parsed, ensure_ascii=False)
+                else:
+                    new_raw = new_text
+                updates.append((new_raw, msg_id))
+
+            if updates:
+                try:
+                    cursor.executemany('UPDATE messages SET content = ? WHERE id = ?', updates)
+                    self.conn.commit()
+                except Exception:
+                    self.conn.rollback()
+                    raise
+            return (snipped, elided)
+
 
 # Backward-compatible public name used by the original test and extension API.
 SessionManager = MemoryManager
