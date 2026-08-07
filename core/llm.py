@@ -1741,6 +1741,60 @@ def _tool_result_ok(function_name, result):
     ))
 
 
+# 重复工具调用被拦截时返回给模型的指令性文本（引导换方法，而非错误前缀）
+REPEAT_CALL_BLOCKED_TEXT = (
+    "🛑 检测到相同的工具调用已成功执行过 2 次，结果未发生变化。请改用其他方式推进任务。"
+)
+
+
+class _RepeatCallGuard:
+    """重复工具调用抑制：同一 (工具, canonical 参数) 签名成功 N 次后拦截。
+
+    签名规范化：JSON unmarshal→marshal（key 排序、去空白），等价于 Reasonix
+    canonicalToolArgs。按轮次维度持有，跟随 _chat_with_model_generator 的循环生命周期。
+    每次重复调用都是一整轮“前缀全命中但新增一大段重复工具结果”的纯 miss。
+    """
+
+    BLOCK_AFTER_SUCCESSES = 2
+
+    def __init__(self):
+        self._success_counts = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def signature(name, arguments_json):
+        try:
+            parsed = json.loads(arguments_json or "{}")
+            canonical = json.dumps(
+                parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+        except Exception:
+            canonical = str(arguments_json or "")
+        return f"{name}:{canonical}"
+
+    def should_execute(self, name, arguments_json):
+        sig = self.signature(name, arguments_json)
+        with self._lock:
+            return self._success_counts.get(sig, 0) < self.BLOCK_AFTER_SUCCESSES
+
+    def record(self, name, arguments_json, ok):
+        if not ok:
+            return
+        sig = self.signature(name, arguments_json)
+        with self._lock:
+            self._success_counts[sig] = self._success_counts.get(sig, 0) + 1
+
+
+def _repeat_call_blocked_result(tool_call):
+    """为被重复调用抑制拦截的 tool_call 合成不落执行的 tool 结果消息。"""
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "name": tool_call["function"]["name"],
+        "content": REPEAT_CALL_BLOCKED_TEXT,
+    }
+
+
 def _raise_if_tool_cancelled(cancel_event):
     # 取消判断只认每 turn 传入的 cancel_event，不再读全局粘性布尔
     if cancel_event is not None and cancel_event.is_set():
@@ -2762,6 +2816,8 @@ def _chat_with_model_generator(
 
     tool_activity_seen = False
     final_summary_retry_count = 0
+    # 重复工具调用抑制：同一签名成功 2 次后拦截，随本轮会话循环生命周期
+    repeat_call_guard = _RepeatCallGuard()
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
     pending_persistence = []
@@ -3450,6 +3506,18 @@ def _chat_with_model_generator(
                 duration_ms = round((time.monotonic() - started_at) * 1000)
                 return result, max(0, duration_ms)
 
+            def execute_guarded(tool_call):
+                """重复调用抑制包装：同签名成功 2 次后不再执行，直接合成指令性结果。"""
+                func_name = tool_call["function"]["name"]
+                arguments = tool_call["function"].get("arguments")
+                if not repeat_call_guard.should_execute(func_name, arguments):
+                    return _repeat_call_blocked_result(tool_call), 0
+                result, duration_ms = execute_timed(tool_call)
+                repeat_call_guard.record(
+                    func_name, arguments, ok=_tool_result_ok(func_name, result)
+                )
+                return result, duration_ms
+
             # 只把显式声明为 parallel_safe 的相邻工具放入同一并发批次。
             batches = []
             for tc in tool_calls_list:
@@ -3479,7 +3547,7 @@ def _chat_with_model_generator(
                     from concurrent.futures import ThreadPoolExecutor
                     executor = ThreadPoolExecutor(max_workers=min(len(batch), 4))
                     try:
-                        timed_results = list(executor.map(execute_timed, batch))
+                        timed_results = list(executor.map(execute_guarded, batch))
                     finally:
                         executor.shutdown(wait=False, cancel_futures=True)
                     results = [result for result, _duration_ms in timed_results]
@@ -3497,7 +3565,7 @@ def _chat_with_model_generator(
                     # 修改类工具：串行处理以保证授权及状态顺序
                     for tc in batch:
                         raise_if_cancelled()
-                        res, duration_ms = execute_timed(tc)
+                        res, duration_ms = execute_guarded(tc)
                         messages.append(res)
                         _notify_event(
                             event_callback,
