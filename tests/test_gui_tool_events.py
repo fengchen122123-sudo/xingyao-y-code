@@ -226,3 +226,46 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
         data["message"] for kind, data in emitted if kind == "turn_error"
     ] == [yielded_message]
     assert [kind for kind, _ in emitted].count("turn_finish") == 1
+
+
+def test_bridge_set_reasoning_effort_returns_effective_level(monkeypatch):
+    bridge = ApiBridge.__new__(ApiBridge)
+    monkeypatch.setattr("gui_bridge.load_config", lambda: {"active_model_id": "m1"})
+    monkeypatch.setattr(
+        "gui_bridge.set_model_reasoning_effort",
+        lambda model_id, level: (True, "模型 m1 推理强度已设为 low"),
+    )
+    monkeypatch.setattr("gui_bridge.get_model_reasoning_effort", lambda model_id: "low")
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {"litellm_model": "openai/k3-256k"})
+
+    res = bridge.set_reasoning_effort("low")
+
+    assert res["ok"] is True
+    assert res["reasoning_effort"] == "low"
+    assert "low" in res["msg"]
+
+
+def test_bridge_set_reasoning_effort_requires_active_model(monkeypatch):
+    bridge = ApiBridge.__new__(ApiBridge)
+    monkeypatch.setattr("gui_bridge.load_config", lambda: {"active_model_id": ""})
+
+    res = bridge.set_reasoning_effort("low")
+
+    assert res["ok"] is False
+    assert "激活模型" in res["msg"]
+
+
+def test_bridge_set_reasoning_effort_warns_anthropic_route(monkeypatch):
+    bridge = ApiBridge.__new__(ApiBridge)
+    monkeypatch.setattr("gui_bridge.load_config", lambda: {"active_model_id": "m1"})
+    monkeypatch.setattr(
+        "gui_bridge.set_model_reasoning_effort",
+        lambda model_id, level: (True, "模型 m1 推理强度已设为 max"),
+    )
+    monkeypatch.setattr("gui_bridge.get_model_reasoning_effort", lambda model_id: "max")
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {"litellm_model": "anthropic/k3-for-anthropic"})
+
+    res = bridge.set_reasoning_effort("max")
+
+    assert res["ok"] is True
+    assert "Anthropic" in res["msg"]

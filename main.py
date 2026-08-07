@@ -1418,6 +1418,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【2. 模型与样式配置】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/models</ansicyan>                              : 打开全屏模型管理器 UI (切换模型、API 密钥、API 地址)"))
+        print_formatted_text(HTML("  <ansicyan>/effort &lt;low|high|max|default&gt;</ansicyan>      : 切换当前模型的推理强度档位 (按模型保存，下轮请求生效)"))
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|plan|full&gt;</ansicyan>        : 切换安全权限级别 (confirm:变更前确认 | plan:计划模式 | full:完全访问)"))
@@ -1571,6 +1572,34 @@ def handle_slash_command(command_text):
             for line in PERMISSION_HELP_LINES:
                 print_formatted_text(HTML(line))
             print_formatted_text(HTML("用法: <ansiyellow>/permission &lt;confirm|plan|full&gt;</ansiyellow>"))
+
+    elif cmd == "/effort":
+        # 推理强度按模型持久化；请求链路（core/llm.py）每轮新鲜读 config.json，改完下轮即生效
+        from core.model_manager import load_config, get_model_reasoning_effort, set_model_reasoning_effort
+        cfg = load_config()
+        active_id = cfg.get("active_model_id")
+        if not active_id:
+            print_formatted_text(HTML("<ansired>❌ 当前没有激活模型，请先用 /models 配置模型。</ansired>"))
+        elif len(parts) > 1:
+            level = parts[1].lower().strip("<>\"'")
+            ok, message = set_model_reasoning_effort(active_id, level)
+            if ok:
+                print_formatted_text(HTML(f"<ansigreen>✔ {_esc(message)}（下一轮请求生效）</ansigreen>"))
+                litellm_model = ""
+                for provider in cfg.get("providers", []):
+                    for m in provider.get("models", []):
+                        if m.get("id") == active_id:
+                            litellm_model = str(m.get("litellm_model") or "")
+                if litellm_model.split("/")[0].lower() == "anthropic":
+                    print_formatted_text(HTML("<ansiyellow>ℹ 当前模型走 Anthropic 路由，reasoning_effort 不会注入请求（该路由请在配置中设置 thinking_budget）。</ansiyellow>"))
+                if app_instance:
+                    app_instance.invalidate()
+            else:
+                print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        else:
+            current = get_model_reasoning_effort(active_id) or "default"
+            print_formatted_text(HTML(f"<b><ansicyan>当前模型推理强度: {current}</ansicyan></b> (low 最快 / max 最深思考)"))
+            print_formatted_text(HTML("用法: <ansiyellow>/effort &lt;low|high|max|default&gt;</ansiyellow>  (default = 恢复内置默认)"))
 
     elif cmd == "/sandbox":
         # 沙盒开关：控制文件工具是否可访问当前工作目录之外的路径
@@ -2347,6 +2376,7 @@ def _make_input_app():
         ("/session", "切换或创建新的记忆会话"),
         ("/new", "创建并切换到全新会话"),
         ("/models", "打开模型管理器"),
+        ("/effort", "切换当前模型推理强度 (low/high/max/default)"),
         ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
         ("/tasks", "查看或托管后台长周期进程"),
         ("/plan", "查看或控制当前任务计划"),

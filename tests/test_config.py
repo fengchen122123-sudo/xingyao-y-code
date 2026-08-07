@@ -162,3 +162,35 @@ def test_update_provider_and_model_prefixed_name_not_double_prefixed(tmp_path, m
     model = data["providers"][0]["models"][0]
     assert model["litellm_model"] == "anthropic/claude"
     assert model["context_window"] == 200000
+
+
+def test_set_model_reasoning_effort_roundtrip(tmp_path, monkeypatch):
+    """reasoning_effort 按模型写入/恢复默认，且落盘"""
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    ok, _ = model_manager.set_model_reasoning_effort("m1", "low")
+    assert ok
+    assert model_manager.get_model_reasoning_effort("m1") == "low"
+    on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+    assert on_disk["providers"][0]["models"][0]["reasoning_effort"] == "low"
+
+    ok, _ = model_manager.set_model_reasoning_effort("m1", "default")
+    assert ok
+    assert model_manager.get_model_reasoning_effort("m1") is None
+    on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "reasoning_effort" not in on_disk["providers"][0]["models"][0]
+
+
+def test_set_model_reasoning_effort_rejects_invalid(tmp_path, monkeypatch):
+    """非法档位与不存在的 model_id 都不写盘"""
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    ok, msg = model_manager.set_model_reasoning_effort("m1", "extreme")
+    assert not ok
+    assert "extreme" in msg
+
+    ok, msg = model_manager.set_model_reasoning_effort("missing", "low")
+    assert not ok
+
+    on_disk = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "reasoning_effort" not in on_disk["providers"][0]["models"][0]
