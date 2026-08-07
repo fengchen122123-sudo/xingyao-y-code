@@ -269,3 +269,12 @@ def test_bridge_set_reasoning_effort_warns_anthropic_route(monkeypatch):
 
     assert res["ok"] is True
     assert "Anthropic" in res["msg"]
+
+
+def test_bridge_forwards_round_started_event(monkeypatch):
+    """round_started 轮次边界事件必须透传给前端（流式分段思考依赖它）"""
+    events = make_events([("round_started", {"round": 2})])
+
+    emitted = consume_bridge_events(monkeypatch, events)
+
+    assert ("round_started", {"round": 2}) in emitted

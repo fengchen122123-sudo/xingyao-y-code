@@ -5,9 +5,8 @@
       {{ msg.content }}
     </div>
 
-    <!-- 助手消息 -->
+    <!-- 助手消息（无头像图标，仅显示“星瑶”名称） -->
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
-      <div class="avatar">✦</div>
       <div class="assistant-body">
         <div class="assistant-name">
           <b>星瑶</b> · <span style="font-size:11px;color:var(--text-faint)">{{ store.activeModelName || '模型' }}</span>
@@ -118,19 +117,6 @@ const thinkingOpen = computed({
 }
 .avatar-row {
   display: flex;
-  gap: 10px;
-}
-.avatar {
-  width: 28px;
-  height: 28px;
-  border-radius: 8px;
-  background: var(--accent);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: 14px;
-  flex-shrink: 0;
-  color: #fff;
 }
 .assistant-body {
   flex: 1;

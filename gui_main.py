@@ -62,6 +62,45 @@ def _debug_enabled() -> bool:
     return os.environ.get("YCODE_GUI_DEBUG", "").strip().lower() in ("1", "true", "yes", "on")
 
 
+def _start_preload_thread():
+    """后台预热 LLM 引擎：litellm import + tiktoken 编码加载 + 视觉能力探测。
+
+    GUI 的界面渲染在独立 WebView 进程，Python 侧后台预热不会卡 UI 首帧
+    （与 TUI 必须同步预热不同，见 main.py 启动预热段的注释）。
+    不做预热时，首个回合会在工作线程里现场完成这些 import，
+    表现为“第一条消息要等很久”。线程安全由 core.llm._litellm_lock 保证。
+    """
+    import threading
+
+    def _preload():
+        try:
+            from core.llm import _get_litellm, _litellm_token_counter, _supports_vision
+            _get_litellm()
+            model = None
+            try:
+                from core.model_manager import get_active_model
+                model = (get_active_model() or {}).get("litellm_model")
+            except Exception:
+                pass
+            try:
+                _litellm_token_counter(
+                    model or "openai/gpt-4o-mini",
+                    [{"role": "user", "content": "预热"}],
+                )
+            except Exception:
+                pass
+            try:
+                if model:
+                    _supports_vision(model)
+            except Exception:
+                pass
+        except Exception:
+            # 预热失败绝不能影响启动：首个回合会按原有惰性路径加载
+            pass
+
+    threading.Thread(target=_preload, daemon=True, name="gui-preload").start()
+
+
 def main():
     # 显式传入真正的 MCP 单例，避免桥接层拿到空的 MCP 管理器
     try:
@@ -69,6 +108,7 @@ def main():
     except Exception:
         mcp_manager = None
     api = ApiBridge(mcp_manager=mcp_manager)
+    _start_preload_thread()
     url = get_frontend_url()
 
     # 启动 PyWebView 原生桌面窗口

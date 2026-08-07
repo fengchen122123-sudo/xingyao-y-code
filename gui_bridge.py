@@ -1390,7 +1390,11 @@ class ApiBridge:
                 payload = event.get("data")
             data = _to_plain_dict(payload)
 
-            if kind == "thinking_delta":
+            if kind == "round_started":
+                # 轮次边界透传：前端据此把每个 LLM 轮次拆成独立消息块（分段思考）
+                # emit_event 内部会先 flush 累积的 delta，顺序天然正确
+                self.emit_event("round_started", {"round": data.get("round")})
+            elif kind == "thinking_delta":
                 self._emit_delta("thinking_delta", str(data.get("text", "")))
             elif kind in ("assistant_delta", "token_delta", "answer_delta"):
                 self._emit_delta("token_delta", str(data.get("text", "")))
