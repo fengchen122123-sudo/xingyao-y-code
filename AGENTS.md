@@ -45,6 +45,22 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 ---
 
+## 🗄️ 上下文缓存架构（DeepSeek 前缀缓存）
+
+- `core/tool_result_maintenance.py`：工具结果 Snip/Elide 纯函数层，marker 幂等，
+  每条消息字节最多改写两次（snip 一次 + elide 升级一次），改写后永久冻结。
+- `core/memory.py:maintain_tool_results`：DB 层维护入口，尾部 8000 估算 token 保护区不改写；
+  `_fold_stale_media_locked` 在含媒体新消息入库的同一事务内折叠旧媒体。
+- `core/agent_service.py`：四级水位线（0.60 snip / 0.80 elide / 0.95 LLM 摘要），
+  触发判断优先用上一轮真实 API 用量基线，本地估算只作兜底与改写后的复算。
+- `core/llm.py`：`_RepeatCallGuard` 抑制同签名成功 ≥2 次的重复工具调用；
+  DeepSeek thinking 路由为带 tool_calls 的 assistant 回补空 `reasoning_content` key。
+- `core/cache_keepalive.py`：前缀缓存保活默认 120 秒（0 关闭，最小 60），仅 DeepSeek/Kimi 路由生效。
+- 铁律：请求路径绝不改写历史中间字节；任何历史改写必须一次性、幂等、DB 层完成。
+- 回归守卫：`tests/test_prompt_byte_stability.py`（system prompt / tools schema 字节稳定性）。
+
+---
+
 ## 🎨 Code Style & Quality Guidelines
 
 1. **Terminal Output Constraints**:
