@@ -1,4 +1,4 @@
-"""可选的 provider prompt-cache 保活服务；默认关闭。"""
+"""可选的 provider prompt-cache 保活服务；默认 120 秒间隔（DeepSeek/Kimi 路由生效）。"""
 
 from __future__ import annotations
 
@@ -13,9 +13,10 @@ MIN_KEEPALIVE_SECONDS = 60
 
 
 def load_keepalive_interval() -> int:
+    """保活间隔秒数：默认 120；显式配置 0 关闭；0<x<60 拒绝（过于频繁）。"""
     from core.model_manager import load_config
 
-    raw = load_config().get("prompt_cache_keepalive_seconds", 0)
+    raw = load_config().get("prompt_cache_keepalive_seconds", 120)
     interval = int(raw or 0)
     if interval < 0:
         raise ValueError("prompt_cache_keepalive_seconds 不能为负数")

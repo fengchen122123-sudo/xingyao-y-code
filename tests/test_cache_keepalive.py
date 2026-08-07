@@ -1,10 +1,18 @@
 import pytest
 
 
-def test_keepalive_interval_defaults_off_and_rejects_too_short(monkeypatch):
+def test_keepalive_interval_defaults_120_and_rejects_too_short(monkeypatch):
     from core.cache_keepalive import load_keepalive_interval
 
+    # 未配置时默认 120 秒（防停顿后缓存 TTL 过期整轮 miss）
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
+    assert load_keepalive_interval() == 120
+
+    # 显式配置 0 仍可关闭
+    monkeypatch.setattr(
+        "core.model_manager.load_config",
+        lambda: {"prompt_cache_keepalive_seconds": 0},
+    )
     assert load_keepalive_interval() == 0
 
     monkeypatch.setattr(
