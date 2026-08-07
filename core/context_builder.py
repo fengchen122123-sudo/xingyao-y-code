@@ -49,11 +49,15 @@ TIME_NOTE_PREFIX = "【当前时间】"
 
 
 def build_dynamic_prompt(runtime: RuntimeContext) -> str:
-    """Build the semi-static runtime context block.
+    """Build the per-turn runtime context block.
 
     该块以 system 角色持久化到会话历史中（append-only），内容不变时不再
     重复注入，保证跨轮请求的 prefix 连续、最大化 provider 侧缓存命中。
     因此块内绝不放每轮必变的字段（当前时间单独用 build_time_note 注入）。
+
+    注意：长期记忆 / 技能目录 / 自定义子 Agent 清单等跨轮基本不变的静态内容
+    已并入稳定系统提示词（core.agent_service.build_stable_system_message），
+    本块只承载会话内可能变化的字段（模型 / 权限模式 / 工作目录 / 计划快照）。
     """
     return (
         f"{DYNAMIC_CONTEXT_PREFIX}\n"
@@ -61,9 +65,6 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
         f"当前权限模式：{runtime.permission_mode}\n"
         f"当前工作目录：{runtime.working_dir}\n"
         f"当前计划：{runtime.active_plan}\n"
-        f"长期记忆：{runtime.memory}\n"
-        f"已启用技能：{runtime.skills}\n"
-        f"可用自定义子 Agent：{runtime.custom_subagents}\n"
         "（若上下文中存在多份本块，以最新一份为准）"
     )
 

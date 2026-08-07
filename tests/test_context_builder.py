@@ -20,7 +20,9 @@ def test_context_builder_injects_runtime_layers_once():
     assert prompt.count("E:/project") == 1
     assert "当前权限模式：confirm" in prompt
     assert "当前计划：检查测试" in prompt
-    assert "用户偏好小步修改" in prompt
+    # 长期记忆/技能/子 Agent 已并入稳定系统提示词（build_stable_system_message），
+    # 动态块只承载会话内可能变化的字段（模型/权限/目录/计划），不再重复注入记忆。
+    assert "用户偏好小步修改" not in prompt
 
 
 def test_context_builder_adds_decisive_action_and_lazy_skill_policy():
