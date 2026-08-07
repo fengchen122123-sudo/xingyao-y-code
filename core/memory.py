@@ -33,6 +33,19 @@ def _try_parse_json(text):
         return None, False
 
 
+_FOLDED_MEDIA_TEXT = "[图片/媒体内容已折叠以节省 Token；如需再次查看请重新提供]"
+
+
+def _content_has_media(content):
+    return (
+        isinstance(content, list)
+        and any(
+            isinstance(b, dict) and b.get("type") in ("image", "image_url")
+            for b in content
+        )
+    )
+
+
 def _sanitize_tool_call_pairing(history):
     """修复 tool_call 配对，避免坏历史导致 API 报错后整个会话无法继续使用。
 
@@ -478,7 +491,11 @@ class MemoryManager:
     def add_messages(self, session_name, messages):
         """Atomically append one ordered batch of conversation messages."""
         serialized = []
+        has_new_media = False
         for role, content in messages:
+            # 注意：媒体判断必须用原始 list（json.dumps 之前就判定）
+            if str(role) == "user" and _content_has_media(content):
+                has_new_media = True
             if isinstance(content, (list, dict)):
                 content = json.dumps(content, ensure_ascii=False)
             else:
@@ -509,12 +526,46 @@ class MemoryManager:
                     (session_id, role, content)
                     for role, content in serialized
                 ])
+                # 新媒体入库的同一事务内折叠旧媒体：请求路径不再改写历史中间字节
+                if has_new_media:
+                    self._fold_stale_media_locked(cursor, session_id)
                 # 更新最近活跃时间，供会话列表按时间展示
                 cursor.execute('UPDATE sessions SET updated_at = ? WHERE id = ?', (now, session_id))
                 self.conn.commit()
             except Exception:
                 self.conn.rollback()
                 raise
+
+    def _fold_stale_media_locked(self, cursor, session_id):
+        """把会话中除最新一条外的含媒体 user 消息折叠为文本占位符（入库时一次性）。
+
+        在含媒体的新 user 消息写入的同一事务内调用，替代请求时改写历史的旧路径；
+        折叠后字节永久冻结（占位符是 text block，不再匹配媒体折叠条件）。
+        """
+        cursor.execute(
+            "SELECT id, content FROM messages WHERE session_id = ? AND role = 'user' "
+            "ORDER BY id ASC",
+            (session_id,),
+        )
+        media_rows = []
+        for msg_id, raw in cursor.fetchall():
+            parsed, ok = _try_parse_json(raw)
+            if ok and _content_has_media(parsed):
+                media_rows.append((msg_id, parsed))
+        folded = 0
+        for msg_id, blocks in media_rows[:-1]:  # 最新一条保留原样
+            new_blocks = [
+                {"type": "text", "text": _FOLDED_MEDIA_TEXT}
+                if isinstance(b, dict) and b.get("type") in ("image", "image_url")
+                else b
+                for b in blocks
+            ]
+            cursor.execute(
+                'UPDATE messages SET content = ? WHERE id = ?',
+                (json.dumps(new_blocks, ensure_ascii=False), msg_id),
+            )
+            folded += 1
+        return folded
 
     def ensure_session(self, session_name, workdir=None, source="GUI"):
         """确保会话记录存在（不存在则创建），返回是否为本次新建。
