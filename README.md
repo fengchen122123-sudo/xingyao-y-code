@@ -521,7 +521,8 @@ Y-code-cli/
   "theme": "cyan",
   "permission_mode": "confirm",
   "allow_outside_workspace": false,
-  "skill_search_paths": []
+  "skill_search_paths": [],
+  "prompt_cache_keepalive_seconds": 120
 }
 ```
 
@@ -540,6 +541,7 @@ Y-code-cli/
 | `permission_mode` | 权限模式（confirm / plan / full） |
 | `allow_outside_workspace` | 沙盒开关 |
 | `skill_search_paths` | 技能搜索路径（项目级） |
+| `prompt_cache_keepalive_seconds` | DeepSeek/Kimi 前缀缓存保活间隔（默认 120；0 关闭；最小 60） |
 
 ### 用户数据目录
 
