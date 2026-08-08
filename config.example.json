@@ -26,7 +26,7 @@
     {
       "id": "provider_1",
       "name": "Agnes AI",
-      "base_url": "https://apihub.agnes-ai.com/v1",
+      "base_url": "https://apihub.agnes-ai.cn/v1",
       "api_key": "sk-your-agnes-api-key-here",
       "protocol": "openai",
       "models": [
@@ -36,6 +36,17 @@
           "litellm_model": "openai/agnes-2.0-flash",
           "context_window": 128000,
           "supports_vision": false,
+          "max_tokens": 8192,
+          "thinking_budget": null,
+          "enable_thinking": null,
+          "reasoning_effort": null
+        },
+        {
+          "id": "model_2",
+          "name": "agnes-2.5-flash",
+          "litellm_model": "openai/agnes-2.5-flash",
+          "context_window": 128000,
+          "supports_vision": true,
           "max_tokens": 8192,
           "thinking_budget": null,
           "enable_thinking": null,
