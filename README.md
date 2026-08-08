@@ -85,7 +85,7 @@ cp config.example.json config.json
     {
       "id": "provider_1",
       "name": "Agnes AI",
-      "base_url": "https://apihub.agnes-ai.com/v1",
+      "base_url": "https://apihub.agnes-ai.cn/v1",
       "api_key": "sk-your-real-api-key-here",
       "protocol": "openai",
       "models": [
@@ -94,6 +94,13 @@ cp config.example.json config.json
           "name": "agnes-2.0-flash",
           "litellm_model": "openai/agnes-2.0-flash",
           "context_window": 128000
+        },
+        {
+          "id": "model_2",
+          "name": "agnes-2.5-flash",
+          "litellm_model": "openai/agnes-2.5-flash",
+          "context_window": 128000,
+          "supports_vision": true
         }
       ]
     }
