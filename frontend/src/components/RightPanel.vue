@@ -99,7 +99,7 @@
         </div>
 
         <div v-if="!store.fileTree || store.fileTree.length === 0" style="padding:20px 10px;text-align:center;color:var(--text-faint);font-size:12px">
-          当前为通用自由对话，暂未引入项目文件夹
+          {{ store.workdir ? '当前项目文件夹为空' : '当前为通用自由对话，暂未引入项目文件夹' }}
         </div>
 
         <div v-else id="file-tree">

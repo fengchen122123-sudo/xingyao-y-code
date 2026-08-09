@@ -28,7 +28,7 @@
 - Consumes: streamed tool chunks with `index`, `id`, `function.name`, and `function.arguments`.
 - Produces: non-empty `tool_calls[*].id` values shared by persistence and all tool lifecycle events.
 
-- [ ] **Step 1: Write the failing test**
+- [x] **Step 1: Write the failing test**
 
 Add a test that streams two parallel-safe calls with IDs `""`, executes both, and asserts requested and finished IDs are `call_0` and `call_1` in order.
 
@@ -52,13 +52,13 @@ def test_empty_tool_call_ids_get_unique_fallbacks(mocker):
     assert [e.payload["id"] for e in events if e.kind == "tool_finished"] == ["call_0", "call_1"]
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests/test_llm_events.py -k empty_tool_call_ids -q`
 
 Expected: FAIL because both events currently carry an empty ID.
 
-- [ ] **Step 3: Implement the minimal normalization**
+- [x] **Step 3: Implement the minimal normalization**
 
 Treat a falsey chunk ID as missing. Keep `call_<index>` until a later non-empty provider ID replaces it.
 
@@ -72,7 +72,7 @@ elif not existing_id:
     tool_calls_dict[idx]["id"] = f"call_{idx}"
 ```
 
-- [ ] **Step 4: Run the focused test and verify GREEN**
+- [x] **Step 4: Run the focused test and verify GREEN**
 
 Run the command from Step 2 and expect PASS.
 
@@ -89,7 +89,7 @@ Run the command from Step 2 and expect PASS.
 - Consumes: `pending_workdir` or `ApiBridge._session_workdir(session_name)`.
 - Produces: `ApiBridge.get_workspace_state(workdir) -> {ok, workdir, file_tree}` and a worker whose runtime context is built after workdir activation.
 
-- [ ] **Step 1: Write failing backend tests**
+- [x] **Step 1: Write failing backend tests**
 
 Add one worker test that starts outside a stored project and captures `os.getcwd()` inside `prepare_turn_messages`. Add one workspace-state test that creates a file under an explicit directory and expects that file in the returned tree.
 
@@ -118,13 +118,13 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     assert pathlib.Path(seen["cwd"]).resolve() == project.resolve()
 ```
 
-- [ ] **Step 2: Run the backend tests and verify RED**
+- [x] **Step 2: Run the backend tests and verify RED**
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests/test_gui_tool_events.py tests/test_gui_workspace_groups.py -q`
 
 Expected: the worker observes the launch directory and `get_workspace_state` does not exist.
 
-- [ ] **Step 3: Implement workspace binding and snapshot**
+- [x] **Step 3: Implement workspace binding and snapshot**
 
 Resolve the effective turn workdir before input parsing. Reject missing non-global directories, change into a valid project, update the manager's default workdir, and then build runtime context. Add the read-only snapshot method using `_resolve_real_path()` and `_get_file_tree()`.
 
@@ -144,7 +144,7 @@ if turn_workdir != "GLOBAL":
     self._memory.set_workdir(turn_workdir)
 ```
 
-- [ ] **Step 4: Re-run backend tests and verify GREEN**
+- [x] **Step 4: Re-run backend tests and verify GREEN**
 
 Run the command from Step 2 and expect PASS.
 
@@ -162,7 +162,7 @@ Run the command from Step 2 and expect PASS.
 - Consumes: `PyWebViewAPI.get_workspace_state(workdir)`.
 - Produces: a pending project state with normalized `workdir`, label, and populated `fileTree`.
 
-- [ ] **Step 1: Write the failing store test**
+- [x] **Step 1: Write the failing store test**
 
 Mock `get_workspace_state()` to return a project file and assert `createSessionInGroup()` requests the target directory and stores the returned tree while retaining `pendingWorkdir`.
 
@@ -182,13 +182,13 @@ it('loads files when entering a pending project conversation', async () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `npm.cmd test -- --run src/stores/appStore.workspace.test.ts`
 
 Expected: FAIL because `createSessionInGroup()` does not call the backend or set `fileTree`.
 
-- [ ] **Step 3: Implement pending workspace loading**
+- [x] **Step 3: Implement pending workspace loading**
 
 Call the new bridge method before committing the frontend project state. On failure, show a warning and leave the previous workspace intact. Add the API type. Make the empty-tree message distinguish an empty project from a global conversation.
 
@@ -204,7 +204,7 @@ this.currentWorkdirLabel = res.workdir.split('\\').pop() || res.workdir;
 this.fileTree = res.file_tree || [];
 ```
 
-- [ ] **Step 4: Re-run the focused test and verify GREEN**
+- [x] **Step 4: Re-run the focused test and verify GREEN**
 
 Run the command from Step 2 and expect PASS.
 
@@ -222,7 +222,7 @@ Run the command from Step 2 and expect PASS.
 - Consumes: `ExecutionState` from the enclosing assistant message.
 - Produces: trace rows whose missing-result status is running only for an active turn.
 
-- [ ] **Step 1: Write failing trace tests**
+- [x] **Step 1: Write failing trace tests**
 
 Assert one unresolved call maps to `running`, `completed`, `cancelled`, and `failed` for enclosing states `running`, `completed`, `cancelled`, and `error`. Mount the trace with a completed state and assert no `.spin` icon exists.
 
@@ -236,13 +236,13 @@ it('terminalizes unresolved calls with the enclosing turn', () => {
 });
 ```
 
-- [ ] **Step 2: Run trace tests and verify RED**
+- [x] **Step 2: Run trace tests and verify RED**
 
 Run: `npm.cmd test -- --run src/utils/toolTrace.test.ts src/components/ToolExecutionTrace.test.ts`
 
 Expected: terminal states still produce a running row and spinner.
 
-- [ ] **Step 3: Implement terminal-state-aware row building**
+- [x] **Step 3: Implement terminal-state-aware row building**
 
 Pass the enclosing state into `buildToolTraceRows()` and `statusFor()`. Keep completed tool results authoritative; only map calls without results from the outer state.
 
@@ -255,7 +255,7 @@ function statusFor(call: ToolExecutionCall, state: ExecutionState): ToolCallStat
 }
 ```
 
-- [ ] **Step 4: Re-run trace tests and verify GREEN**
+- [x] **Step 4: Re-run trace tests and verify GREEN**
 
 Run the command from Step 2 and expect PASS.
 
@@ -266,18 +266,18 @@ Run the command from Step 2 and expect PASS.
 **Files:**
 - Modify: `docs/superpowers/plans/2026-08-09-workspace-turn-binding.md`
 
-- [ ] **Step 1: Run Python regression suites**
+- [x] **Step 1: Run Python regression suites**
 
 Run: `.\.venv\Scripts\python.exe -m pytest tests/test_llm_events.py tests/test_gui_tool_events.py tests/test_gui_workspace_groups.py -q`
 
-- [ ] **Step 2: Run frontend tests and build**
+- [x] **Step 2: Run frontend tests and build**
 
 Run: `npm.cmd test -- --run` and `npm.cmd run build` from `frontend/`.
 
-- [ ] **Step 3: Verify the real GUI flow**
+- [x] **Step 3: Verify the real GUI flow**
 
 Use a temporary local workspace and mocked bridge to verify a pending project displays files, sends its workdir, and renders a completed unresolved historical call without animation.
 
-- [ ] **Step 4: Check the diff and commit**
+- [x] **Step 4: Check the diff and commit**
 
 Run `git diff --check`, stage only the planned files, and commit with `fix: bind GUI turns to project workspaces`.

@@ -48,7 +48,7 @@ const title = computed(
   () => `执行过程 · ${props.calls.length} 项 · ${STATE_LABELS[props.state] ?? props.state}`,
 );
 
-const rows = computed(() => buildToolTraceRows(props.calls, props.legacyDiffs));
+const rows = computed(() => buildToolTraceRows(props.calls, props.legacyDiffs, props.state));
 
 // 运行期间用唯一定时器刷新 now，驱动运行中行的实时时长徽标
 const now = ref(Date.now());

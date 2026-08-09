@@ -545,13 +545,29 @@ export const useAppStore = defineStore('app', {
     },
 
     async createSessionInGroup(targetWorkdir: string) {
-      // 懒创建：只切换到该项目下的空白会话状态，首条消息发出时才真正落库
-      this.pendingWorkdir = targetWorkdir;
+      const api = this._api();
+      if (!api) return;
+      let res: any;
+      try {
+        res = await api.get_workspace_state(targetWorkdir);
+      } catch (err) {
+        this.connected = false;
+        this.showToast('进入项目失败: ' + err, 'warn');
+        return;
+      }
+      if (!res || !res.ok || !res.workdir) {
+        this.showToast('进入项目失败: ' + (res?.msg || '未知错误'), 'warn');
+        return;
+      }
+
+      // 懒创建：加载项目快照并切换到空白会话，首条消息发出时才真正落库
+      this.pendingWorkdir = res.workdir;
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新会话';
       this.messages = [];
-      this.workdir = targetWorkdir;
-      this.currentWorkdirLabel = targetWorkdir.split('\\').pop() || targetWorkdir;
+      this.workdir = res.workdir;
+      this.currentWorkdirLabel = res.workdir.split('\\').pop() || res.workdir;
+      this.fileTree = res.file_tree || [];
     },
 
     async exitWorkspaceToGlobal() {

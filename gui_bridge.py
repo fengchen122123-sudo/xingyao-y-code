@@ -606,6 +606,21 @@ class ApiBridge:
             return []
         return _scan(path, depth)
 
+    def get_workspace_state(self, workdir: str) -> Dict[str, Any]:
+        """读取显式项目目录的前端快照，不依赖进程当前工作目录。"""
+        try:
+            path = _resolve_real_path(str(workdir or ""))
+            if not workdir or workdir == "GLOBAL" or not os.path.isdir(path):
+                return {"ok": False, "msg": f"项目文件夹不存在: {workdir or '<empty>'}"}
+            return {
+                "ok": True,
+                "workdir": path,
+                "file_tree": self._get_file_tree(path),
+            }
+        except Exception as e:
+            logger.exception("get_workspace_state 失败")
+            return {"ok": False, "msg": str(e)}
+
     def select_workspace_folder(self) -> Dict[str, Any]:
         """弹出原生文件夹对话框，选择并切换项目工作区文件夹。"""
         try:
@@ -1134,8 +1149,20 @@ class ApiBridge:
             ctx_win = active_model.get("context_window", 128000)
             self._sync_active_model_context()
 
+            # 会话归属目录是每一轮 Agent 的权威工作目录。待发送项目会话虽然
+            # 已把 workdir 透传到这里，但进程 cwd 仍可能停在启动目录或上一会话；
+            # 必须在解析附件、组装运行上下文和执行任何工具前完成绑定。
+            turn_workdir = pending_workdir or self._session_workdir(session_name)
+            if turn_workdir != "GLOBAL":
+                turn_workdir = _resolve_real_path(turn_workdir)
+                if not os.path.isdir(turn_workdir):
+                    raise FileNotFoundError(f"会话项目文件夹不存在: {turn_workdir}")
+                if os.path.abspath(turn_workdir) != os.path.abspath(os.getcwd()):
+                    os.chdir(turn_workdir)
+                self._memory.set_workdir(turn_workdir)
+
             # 确保会话存在，再解析用户输入（支持 @文件 / 图片挂载）并入库
-            self._memory.ensure_session(session_name, workdir=pending_workdir or self._session_workdir(session_name), source="GUI")
+            self._memory.ensure_session(session_name, workdir=turn_workdir, source="GUI")
             try:
                 from core.input_parser import parse_user_input
                 parsed_content, attached_msgs = parse_user_input(user_text)
