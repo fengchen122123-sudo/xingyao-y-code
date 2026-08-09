@@ -749,23 +749,117 @@ def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
             pass
 
 
-def _extract_cached_tokens(usage):
-    """读取 OpenAI 标准明细或 DeepSeek 原生 usage 中的精确缓存命中 token。"""
-    if usage is None:
-        return 0
-    details = usage.get("prompt_tokens_details") if isinstance(usage, dict) else getattr(
-        usage, "prompt_tokens_details", None
-    )
-    if isinstance(details, dict):
-        cached = details.get("cached_tokens", 0)
+_USAGE_FIELD_MISSING = object()
+
+
+def _usage_field(value, name):
+    """读取 dict 或 SDK 对象字段，并保留“缺失”与显式 None/0 的区别。"""
+    if isinstance(value, dict):
+        return value[name] if name in value else _USAGE_FIELD_MISSING
+    if value is None:
+        return _USAGE_FIELD_MISSING
+    return getattr(value, name, _USAGE_FIELD_MISSING)
+
+
+def _optional_nonnegative_int(raw, field_name, errors):
+    """把服务端整数规范为 int；拒绝会丢精度或掩盖异常的隐式转换。"""
+    if raw is _USAGE_FIELD_MISSING or raw is None:
+        return None
+    if isinstance(raw, bool):
+        errors.append(f"{field_name} must be a non-negative integer")
+        return None
+    if isinstance(raw, int):
+        value = raw
+    elif isinstance(raw, str) and raw.strip().isdigit():
+        value = int(raw.strip())
     else:
-        cached = getattr(details, "cached_tokens", 0) if details is not None else 0
-    if cached:
-        return int(cached)
-    direct = usage.get("prompt_cache_hit_tokens", 0) if isinstance(usage, dict) else getattr(
-        usage, "prompt_cache_hit_tokens", 0
+        errors.append(f"{field_name} must be a non-negative integer")
+        return None
+    if value < 0:
+        errors.append(f"{field_name} must be a non-negative integer")
+        return None
+    return value
+
+
+def _normalize_server_usage(usage):
+    """归一化并严格校验一次服务端 usage，不估算或夹断任何真实 token。"""
+    errors = []
+    prompt_raw = _usage_field(usage, "prompt_tokens")
+    completion_raw = _usage_field(usage, "completion_tokens")
+    total_raw = _usage_field(usage, "total_tokens")
+
+    prompt = _optional_nonnegative_int(prompt_raw, "prompt_tokens", errors)
+    completion = _optional_nonnegative_int(
+        completion_raw, "completion_tokens", errors
     )
-    return int(direct or 0)
+    total = _optional_nonnegative_int(total_raw, "total_tokens", errors)
+
+    if prompt_raw is _USAGE_FIELD_MISSING or prompt_raw is None:
+        errors.append("prompt_tokens is required")
+    if total_raw is _USAGE_FIELD_MISSING or total_raw is None:
+        errors.append("total_tokens is required")
+
+    details = _usage_field(usage, "prompt_tokens_details")
+    details_cached_raw = _usage_field(details, "cached_tokens")
+    direct_cached_raw = _usage_field(usage, "prompt_cache_hit_tokens")
+    miss_raw = _usage_field(usage, "prompt_cache_miss_tokens")
+
+    if details_cached_raw is not _USAGE_FIELD_MISSING and details_cached_raw is not None:
+        cached_raw = details_cached_raw
+    else:
+        cached_raw = direct_cached_raw
+    cache_reported = cached_raw is not _USAGE_FIELD_MISSING and cached_raw is not None
+    miss_reported = miss_raw is not _USAGE_FIELD_MISSING and miss_raw is not None
+
+    cached = _optional_nonnegative_int(cached_raw, "cached_tokens", errors)
+    cache_miss = _optional_nonnegative_int(miss_raw, "cache_miss_tokens", errors)
+
+    completion_was_reported = (
+        completion_raw is not _USAGE_FIELD_MISSING and completion_raw is not None
+    )
+    if not completion_was_reported and prompt is not None and total is not None:
+        if total < prompt:
+            errors.append("total_tokens is smaller than prompt_tokens")
+        else:
+            completion = total - prompt
+
+    if (
+        prompt is not None
+        and completion is not None
+        and total is not None
+        and prompt + completion != total
+    ):
+        errors.append("prompt + completion does not equal total_tokens")
+    if cached is not None and prompt is not None and cached > prompt:
+        errors.append("cached_tokens exceeds prompt_tokens")
+    if miss_reported and not cache_reported:
+        errors.append("cache miss reported without cache hit")
+    if (
+        cache_reported
+        and miss_reported
+        and cached is not None
+        and cache_miss is not None
+        and prompt is not None
+        and cached + cache_miss != prompt
+    ):
+        errors.append("cache hit + miss does not equal prompt_tokens")
+
+    return {
+        "valid": not errors,
+        "errors": tuple(errors),
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "cached_tokens": cached if cache_reported else None,
+        "cache_miss_tokens": cache_miss if miss_reported else None,
+        "cache_reported": cache_reported,
+    }
+
+
+def _extract_cached_tokens(usage):
+    """兼容旧调用方：读取缓存命中 token；未报告时返回 0。"""
+    record = _normalize_server_usage(usage)
+    return int(record["cached_tokens"] or 0)
 
 # The registry is the canonical capability metadata source.
 from core.tool_registry import build_default_registry
