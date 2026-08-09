@@ -69,6 +69,17 @@ def test_deepseek_keepalive_is_limited_to_official_routes():
     ) is False
 
 
+def test_kimi_keepalive_is_limited_to_official_routes():
+    from core.llm import _supports_cache_keepalive
+
+    assert _supports_cache_keepalive(
+        "openai/k3-256k", "https://api.kimi.com/coding/v1"
+    ) is True
+    assert _supports_cache_keepalive(
+        "openai/kimi-k2.6", "https://tokenrhythm.studio/v1"
+    ) is False
+
+
 def test_deepseek_thinking_keepalive_omits_tool_choice_and_disables_thinking():
     from core.cache_keepalive import build_keepalive_request
 

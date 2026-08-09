@@ -361,7 +361,11 @@ def _render_usage_section(manager, label, start_s, end_s):
     if not rows:
         print_formatted_text(HTML("  <ansigray>暂无记录</ansigray>"))
         return False
-    name_w = max(12, min(40, max(_term_display_width(r["model"]) for r in rows) + 2))
+    display_rows = [(row, _usage_route_label(row)) for row in rows]
+    name_w = max(
+        12,
+        min(60, max(_term_display_width(name) for _, name in display_rows) + 2),
+    )
     _header = (
         "  " + _pad_right("模型", name_w)
         + " " + _pad_left("输入", 14)
@@ -372,11 +376,11 @@ def _render_usage_section(manager, label, start_s, end_s):
         + " " + _pad_left("合计", 14)
     )
     print_formatted_text(HTML(f"<ansigray>{_header}</ansigray>"))
-    for r in rows:
+    for r, route_label in display_rows:
         _cache_prompt = int(r.get("cache_prompt", 0) or 0)
         _rate = _format_cache_hit_rate(r["cached"], _cache_prompt)
         print_formatted_text(HTML(
-            f"  {_pad_right(_esc(r['model']), name_w)} {r['prompt']:>14} "
+            f"  {_pad_right(_esc(route_label), name_w)} {r['prompt']:>14} "
             f"{r['completion']:>14} {_cache_prompt:>14} {r['cached']:>14} "
             f"{_rate:>10} {r['total']:>14}"
         ))
@@ -385,7 +389,8 @@ def _render_usage_section(manager, label, start_s, end_s):
             k: sum(int(r.get(k, 0) or 0) for r in rows)
             for k in ("prompt", "completion", "cached", "cache_prompt", "total")
         }
-        _sub_rate = _format_cache_hit_rate(sub["cached"], sub["cache_prompt"])
+        # endpoint/scope 的缓存身份彼此独立，跨路由百分比没有诊断意义。
+        _sub_rate = "--"
         print_formatted_text(HTML(
             f"  <ansicyan>{_pad_right('小计', name_w)} {sub['prompt']:>14} "
             f"{sub['completion']:>14} {sub['cache_prompt']:>14} {sub['cached']:>14} "
@@ -394,7 +399,7 @@ def _render_usage_section(manager, label, start_s, end_s):
     from core.cache_keepalive import load_keepalive_interval
     idle_seconds = int(load_keepalive_interval() or 120)
     diagnostic = manager.query_cache_diagnostic_summary(
-        start_s, end_s, idle_seconds=idle_seconds
+        start_s, end_s, idle_seconds=idle_seconds, cache_scope="main"
     )
     diagnostic_text = _format_cache_diagnostic_summary(diagnostic)
     if diagnostic_text:
@@ -443,6 +448,32 @@ def _format_cache_hit_rate(cached_tokens, cache_prompt_tokens):
     return f"{cached_tokens / cache_prompt_tokens * 100:.1f}%"
 
 
+def _usage_route_label(row):
+    """把同名模型的 endpoint 与请求作用域直接展示出来，避免聚合误读。"""
+    import hashlib
+    from urllib.parse import urlsplit
+
+    api_base = str(row.get("api_base") or "")
+    provider = str(row.get("provider") or "")
+    model = str(row.get("model") or "")
+    model_label = f"{provider}/{model}" if provider else model
+    scope = str(row.get("cache_scope") or "legacy")
+    if not api_base:
+        return f"{model_label} @ 未记录接口 [{scope}]"
+    try:
+        parsed = urlsplit(api_base)
+        host = str(parsed.hostname or "无效接口")
+        port = parsed.port
+        if port is not None and port not in (80, 443):
+            host += f":{port}"
+        path_material = str(parsed.path or "/")
+    except Exception:
+        host = "无效接口"
+        path_material = api_base
+    path_id = hashlib.sha256(path_material.encode("utf-8")).hexdigest()[:8]
+    return f"{model_label} @ {host} path#{path_id} [{scope}]"
+
+
 def _format_token_usage_summary(
     cumulative_prompt,
     cumulative_completion,
@@ -463,7 +494,7 @@ def _format_token_usage_summary(
         else "--"
     )
     return (
-        f"本进程 输入 {format_num(cumulative_prompt)} · "
+        f"全请求 输入 {format_num(cumulative_prompt)} · "
         f"输出 {format_num(cumulative_completion)} · "
         f"缓存输入 {format_num(cumulative_cache_prompt)} · "
         f"命中 {format_num(cumulative_cached)} · 命中率 {hit_rate}"

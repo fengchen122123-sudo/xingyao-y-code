@@ -1,5 +1,7 @@
+import sqlite3
 import time
 from datetime import date
+from pathlib import Path
 
 import pytest
 
@@ -14,6 +16,19 @@ def _ts_of(date_str):
     return int(time.mktime(time.strptime(date_str + " 12:00:00", "%Y-%m-%d %H:%M:%S")))
 
 
+def test_pytest_runtime_data_paths_are_isolated_from_real_ycode_home():
+    import config
+    from core.runtime_warnings import DEFAULT_WARNING_LOG
+
+    isolated = Path(config.YCODE_DIR).resolve()
+    real_home = (Path.home() / ".ycode").resolve()
+
+    assert isolated != real_home
+    assert Path(config.DB_FILE).resolve().parent == isolated
+    assert Path(config.GUI_DB_FILE).resolve().parent == isolated
+    assert Path(DEFAULT_WARNING_LOG).resolve().parent == isolated
+
+
 def test_token_usage_table_created():
     manager = MemoryManager(":memory:")
     cursor = manager.conn.cursor()
@@ -25,6 +40,39 @@ def test_token_usage_table_created():
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_token_usage_date'"
     )
     assert cursor.fetchone() is not None, "token_usage 日期索引没有被创建！"
+    columns = {
+        row[1] for row in manager.conn.execute("PRAGMA table_info(token_usage)")
+    }
+    assert {"api_base", "cache_scope"} <= columns
+
+
+def test_token_usage_schema_migrates_legacy_rows_without_inventing_scope(tmp_path):
+    db_path = tmp_path / "legacy-token-usage.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE token_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, date TEXT,
+            provider TEXT, model TEXT, prompt_tokens INTEGER,
+            completion_tokens INTEGER, cached_tokens INTEGER,
+            total_tokens INTEGER, session_id TEXT
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO token_usage "
+        "(ts,date,provider,model,prompt_tokens,completion_tokens,cached_tokens,total_tokens,session_id) "
+        "VALUES (1,'2026-08-09','openai','legacy-model',100,10,90,110,'legacy-session')"
+    )
+    conn.commit()
+    conn.close()
+
+    manager = MemoryManager(str(db_path))
+    row = manager.conn.execute(
+        "SELECT api_base, cache_scope FROM token_usage WHERE session_id='legacy-session'"
+    ).fetchone()
+
+    assert row == ("", "legacy")
 
 
 def test_add_and_query_token_usage_grouped_by_model():
@@ -49,6 +97,90 @@ def test_add_and_query_token_usage_grouped_by_model():
     assert rows[0]["total"] == 4600
     assert rows[1]["model"] == "kimi-k2"
     assert rows[1]["total"] == 550
+
+
+def test_token_usage_keeps_endpoint_and_scope_separate():
+    manager = MemoryManager(":memory:")
+    today = _ts_of("2026-08-05")
+    common = {
+        "provider": "openai", "model": "deepseek-v4-flash",
+        "prompt_tokens": 1000, "completion_tokens": 10,
+        "cached_tokens": 990, "total_tokens": 1010,
+        "session_id": "s1", "ts": today,
+    }
+    manager.add_token_usage(
+        **common, api_base="https://api.deepseek.com", cache_scope="main"
+    )
+    manager.add_token_usage(
+        **common, api_base="HTTPS://API.DEEPSEEK.COM:443/", cache_scope="main"
+    )
+    manager.add_token_usage(
+        **common, api_base="https://gateway.example/v1", cache_scope="main"
+    )
+    manager.add_token_usage(
+        **common, api_base="https://api.deepseek.com", cache_scope="keepalive"
+    )
+
+    rows = manager.query_token_usage_by_model("2026-08-05", "2026-08-05")
+
+    assert len(rows) == 3
+    assert {
+        (row["api_base"], row["cache_scope"]) for row in rows
+    } == {
+        ("https://api.deepseek.com", "main"),
+        ("https://gateway.example/v1", "main"),
+        ("https://api.deepseek.com", "keepalive"),
+    }
+    official_main = next(
+        row for row in rows
+        if row["api_base"] == "https://api.deepseek.com"
+        and row["cache_scope"] == "main"
+    )
+    assert official_main["prompt"] == 2000
+
+
+def test_token_usage_endpoint_identity_hashes_query_without_merging_routes():
+    manager = MemoryManager(":memory:")
+    today = _ts_of("2026-08-05")
+    common = {
+        "provider": "openai", "model": "m1", "prompt_tokens": 100,
+        "completion_tokens": 1, "cached_tokens": 90, "total_tokens": 101,
+        "session_id": "s1", "ts": today, "cache_scope": "main",
+    }
+    manager.add_token_usage(
+        **common, api_base="https://gateway.example/v1?tenant=secret-a"
+    )
+    manager.add_token_usage(
+        **common, api_base="https://gateway.example/v1?tenant=secret-b"
+    )
+
+    stored = [
+        row[0] for row in manager.conn.execute(
+            "SELECT api_base FROM token_usage ORDER BY id"
+        )
+    ]
+    rows = manager.query_token_usage_by_model("2026-08-05", "2026-08-05")
+
+    assert len(rows) == 2
+    assert stored[0] != stored[1]
+    assert all("tenant" not in value and "secret" not in value for value in stored)
+
+
+def test_token_usage_endpoint_parse_failure_never_persists_url_plaintext():
+    manager = MemoryManager(":memory:")
+    raw_url = "https://user:secret@api.example:bad/v1?token=hidden"
+
+    manager.add_token_usage(
+        "openai", "m1", 100, 1, 90, 101,
+        api_base=raw_url, cache_scope="main",
+    )
+
+    stored = manager.conn.execute(
+        "SELECT api_base FROM token_usage"
+    ).fetchone()[0]
+    assert stored.startswith("invalid-endpoint#")
+    for secret in ("user", "secret", "token", "hidden", "api.example"):
+        assert secret not in stored
 
 
 def test_query_token_usage_date_range_filter():
@@ -103,12 +235,16 @@ def test_persist_token_usage_splits_provider_and_model(monkeypatch):
         cached_tokens=5,
         total_tokens=120,
         session_id="sess-x",
+        api_base="https://api.deepseek.com",
+        cache_scope="main",
     )
     assert recorded["provider"] == "openai"
     assert recorded["model"] == "deepseek-v4-pro"
     assert recorded["prompt_tokens"] == 100
     assert recorded["total_tokens"] == 120
     assert recorded["session_id"] == "sess-x"
+    assert recorded["api_base"] == "https://api.deepseek.com"
+    assert recorded["cache_scope"] == "main"
 
 
 def test_persist_token_usage_without_manager_or_on_error(monkeypatch):
@@ -183,23 +319,104 @@ def test_pad_left_and_right_by_display_width():
     assert main._pad_left("123456789012345", 14) == "123456789012345"
 
 
+def test_usage_route_label_exposes_endpoint_and_scope():
+    label = main._usage_route_label({
+        "provider": "openai",
+        "model": "deepseek-v4-flash",
+        "api_base": "https://api.deepseek.com/v1",
+        "cache_scope": "main",
+    })
+    assert label.startswith("openai/deepseek-v4-flash @ api.deepseek.com path#")
+    assert label.endswith(" [main]")
+    assert main._usage_route_label({
+        "provider": "", "model": "legacy-model",
+        "api_base": "", "cache_scope": "legacy"
+    }) == "legacy-model @ 未记录接口 [legacy]"
+
+
+def test_usage_route_label_redacts_credentials_and_distinguishes_routes():
+    base = {
+        "provider": "openai", "model": "m1", "cache_scope": "main"
+    }
+    first = main._usage_route_label({
+        **base, "api_base": "https://user:secret@api.example/v1?token=hidden"
+    })
+    second = main._usage_route_label({
+        **base, "api_base": "https://api.example/tenant-b/v1"
+    })
+    other_provider = main._usage_route_label({
+        **base, "provider": "anthropic", "api_base": "https://api.example/v1"
+    })
+
+    assert "user" not in first
+    assert "secret" not in first
+    assert "hidden" not in first
+    assert first != second
+    assert first != other_provider
+
+
+def test_usage_section_does_not_compute_cross_route_subtotal_hit_rate(monkeypatch):
+    rows = [
+        {
+            "provider": "openai", "model": "m1",
+            "api_base": "https://api.example/v1", "cache_scope": "main",
+            "prompt": 100, "completion": 10, "cached": 99,
+            "cache_prompt": 100, "total": 110,
+        },
+        {
+            "provider": "openai", "model": "m1",
+            "api_base": "https://gateway.example/v1", "cache_scope": "keepalive",
+            "prompt": 100, "completion": 1, "cached": 0,
+            "cache_prompt": 100, "total": 101,
+        },
+    ]
+
+    class Manager:
+        def query_token_usage_by_model(self, start, end):
+            return rows
+
+        def query_cache_diagnostic_summary(self, *args, **kwargs):
+            return {"count": 0, "lost_tokens": 0, "unreported": 0, "categories": {}}
+
+    rate_calls = []
+    monkeypatch.setattr(
+        main, "_format_cache_hit_rate",
+        lambda cached, prompt: rate_calls.append((cached, prompt)) or "rate",
+    )
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+
+    main._render_usage_section(Manager(), "今日", "2026-08-09", "2026-08-09")
+
+    assert rate_calls == [(99, 100), (0, 100)]
+
+
 def test_query_cache_invalidation_events():
     manager = MemoryManager(":memory:")
     today = _ts_of("2026-08-05")
+    main = {"api_base": "https://api.example/v1", "cache_scope": "main"}
     # 大输入低命中 -> 失效事件
-    manager.add_token_usage("openai", "m1", 50000, 100, 3000, 50100, ts=today)
-    manager.add_token_usage("openai", "m1", 80000, 100, 0, 80000, ts=today)
+    manager.add_token_usage("openai", "m1", 50000, 100, 3000, 50100, ts=today, **main)
+    manager.add_token_usage("openai", "m1", 80000, 100, 0, 80000, ts=today, **main)
     # 大输入高命中 -> 不算
-    manager.add_token_usage("openai", "m1", 60000, 100, 59000, 60100, ts=today)
+    manager.add_token_usage("openai", "m1", 60000, 100, 59000, 60100, ts=today, **main)
     # 小输入低命中 -> 不算（低于 min_prompt_tokens 阈值）
-    manager.add_token_usage("openai", "m1", 5000, 100, 0, 5100, ts=today)
+    manager.add_token_usage("openai", "m1", 5000, 100, 0, 5100, ts=today, **main)
+    # 后台大输入低命中不得污染主链路失效数。
+    manager.add_token_usage(
+        "openai", "m1", 90000, 1, 0, 90001, ts=today,
+        api_base="https://api.example/v1", cache_scope="keepalive",
+    )
 
-    inv = manager.query_cache_invalidation_events("2026-08-05", "2026-08-05")
+    inv = manager.query_cache_invalidation_events(
+        "2026-08-05", "2026-08-05", cache_scope="main"
+    )
     assert inv["count"] == 2
     assert inv["lost_tokens"] == (50000 - 3000) + (80000 - 0)
 
     # 区间外无事件
-    inv2 = manager.query_cache_invalidation_events("2026-09-01", "2026-09-30")
+    inv2 = manager.query_cache_invalidation_events(
+        "2026-09-01", "2026-09-30", cache_scope="main"
+    )
     assert inv2 == {"count": 0, "lost_tokens": 0}
 
 
@@ -210,7 +427,14 @@ def test_get_last_token_usage_returns_latest_per_session():
 
     manager.add_token_usage("openai", "m1", 100, 10, 0, 110, session_id="s1")
     manager.add_token_usage("openai", "m1", 200, 20, 0, 220, session_id="s2")
-    manager.add_token_usage("openai", "m1", 300, 30, 5, 330, session_id="s1")
+    manager.add_token_usage(
+        "openai", "m1", 300, 30, 5, 330, session_id="s1",
+        api_base="https://main.example/v1", cache_scope="main",
+    )
+    manager.add_token_usage(
+        "openai", "m1", 10, 1, 10, 11, session_id="s1",
+        api_base="https://main.example/v1", cache_scope="keepalive",
+    )
 
     last = manager.get_last_token_usage("s1")
     assert last["prompt_tokens"] == 300

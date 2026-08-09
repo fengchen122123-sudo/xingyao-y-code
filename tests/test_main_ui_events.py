@@ -9,14 +9,14 @@ from rich.text import Text
 
 def test_format_token_usage_summary_uses_cumulative_hit_rate():
     assert main._format_token_usage_summary(315_100, 3_400, 312_000, 315_100) == (
-        "本进程 输入 315.1K · 输出 3.4K · 缓存输入 315.1K · "
+        "全请求 输入 315.1K · 输出 3.4K · 缓存输入 315.1K · "
         "命中 312.0K · 命中率 99%"
     )
 
 
 def test_format_token_usage_summary_handles_zero_input():
     assert main._format_token_usage_summary(0, 0, 0, 0) == (
-        "本进程 输入 0 · 输出 0 · 缓存输入 0 · 命中 0 · 命中率 --"
+        "全请求 输入 0 · 输出 0 · 缓存输入 0 · 命中 0 · 命中率 --"
     )
 
 

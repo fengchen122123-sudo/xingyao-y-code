@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import uuid
+from urllib.parse import urlsplit
 # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
 from concurrent.futures import TimeoutError as _FutureTimeoutError
@@ -966,7 +967,8 @@ def clear_cache_usage_session(session_name):
 
 
 def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
-                         cached_tokens, total_tokens, session_id=None):
+                         cached_tokens, total_tokens, session_id=None,
+                         api_base="", cache_scope="legacy"):
     """把本轮真实 token 用量追加到本地 token_usage 表，供 /usage 按模型/日期统计。
 
     失败仅记日志，绝不影响对话主流程。model_name 为 litellm 模型串
@@ -990,6 +992,8 @@ def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
             cached_tokens=cached_tokens,
             total_tokens=total_tokens,
             session_id=session_id,
+            api_base=api_base,
+            cache_scope=cache_scope,
         )
     except Exception as _persist_err:
         try:
@@ -1241,6 +1245,8 @@ def _account_server_usage(
         cached_tokens=cached_tokens,
         total_tokens=total_tokens,
         session_id=session_id,
+        api_base=api_base,
+        cache_scope=cache_scope,
     )
     return record
 
@@ -1576,6 +1582,32 @@ def _is_kimi_family(model_name, api_base=""):
     return "moonshot" in b or "kimi" in b
 
 
+def _is_official_kimi_route(api_base=""):
+    """只识别已知支持 Kimi 缓存亲和私有字段的官方 API。"""
+    try:
+        parsed = urlsplit(str(api_base or ""))
+        host = str(parsed.hostname or "").lower()
+        path = str(parsed.path or "").rstrip("/").lower()
+        port = parsed.port
+    except Exception:
+        return False
+    if (
+        str(parsed.scheme or "").lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if host == "api.kimi.com":
+        return path in {"/coding", "/coding/v1"}
+    return (
+        host in {"api.moonshot.cn", "api.moonshot.ai"}
+        and path in {"", "/v1"}
+    )
+
+
 def _is_deepseek_family(model_name, api_base=""):
     model = str(model_name or "").split("/")[-1].lower()
     return "deepseek" in model or _is_official_deepseek_route(api_base)
@@ -1604,7 +1636,10 @@ def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
 
 def _supports_cache_keepalive(model_name, api_base=""):
     """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi 路由。"""
-    return _is_kimi_family(model_name, api_base) or (
+    return (
+        _is_kimi_family(model_name, api_base)
+        and _is_official_kimi_route(api_base)
+    ) or (
         _is_deepseek_family(model_name, api_base)
         and _is_official_deepseek_route(api_base)
     )
@@ -1960,13 +1995,15 @@ def _attach_kimi_request_extras(
     """
     anthropic_route = str(model_name or "").split("/")[0].lower() == "anthropic"
 
-    session_id = _cache_affinity_session_id(
-        cache_scope=cache_scope,
-        model_name=model_name,
-        api_base=api_base,
-        tool_contract=tool_contract,
-        cache_session_id=cache_session_id,
-    )
+    session_id = None
+    if _is_official_kimi_route(api_base):
+        session_id = _cache_affinity_session_id(
+            cache_scope=cache_scope,
+            model_name=model_name,
+            api_base=api_base,
+            tool_contract=tool_contract,
+            cache_session_id=cache_session_id,
+        )
     if session_id:
         if anthropic_route:
             result.setdefault("metadata", {"user_id": session_id})
@@ -2069,6 +2106,10 @@ def _provider_request_options(
                     f"实际为 {effort!r}"
                 )
             result["reasoning_effort"] = effort
+            # LiteLLM 对尚未内置识别的 OpenAI 兼容模型会在客户端拒绝
+            # reasoning_effort。这里按参数白名单精确放行，不能用全局
+            # drop_params，否则会静默丢失用户要求的推理强度。
+            result["allowed_openai_params"] = ["reasoning_effort"]
     elif cfg_max_tokens is not None or cfg_thinking_budget is not None or cfg_enable_thinking is not None:
         # 用户显式配置优先
         if cfg_max_tokens is not None:
