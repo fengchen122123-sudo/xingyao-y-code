@@ -45,4 +45,3 @@ CLI 保留单 endpoint 参数，并支持一组可选的 compare 参数：
 ## 验收边界
 
 代码/离线测试通过只能证明统计和请求契约正确。达到 99% 必须以 provider 返回的真实 cached token 为证；没有相同模型的聚合 endpoint/凭据时，不生成虚假对比结论。
-

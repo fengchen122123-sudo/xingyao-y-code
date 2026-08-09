@@ -67,4 +67,3 @@ DeepSeek 只在官方 endpoint 自动启用保活。聚合路由默认关闭，�
 - 不伪造或本地估算 provider usage。
 - 不把非官方聚合网关宣称为与 DeepSeek 官方缓存等价。
 - 不通过空 `reasoning_content`、重试剥参或静默降级掩盖契约错误。
-
