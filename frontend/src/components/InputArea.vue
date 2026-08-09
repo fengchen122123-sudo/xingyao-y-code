@@ -13,14 +13,20 @@
         ></textarea>
 
         <div id="input-bar">
-          <button class="chip-btn plus-btn" title="附加文件" @click="handlePickFiles">＋</button>
+          <button
+            data-test="attachment-button"
+            class="chip-btn plus-btn"
+            title="附加文件"
+            @click="handlePickFiles"
+          >＋</button>
           <button
             ref="permBtnRef"
-            class="chip-btn"
-            :class="{ active: store.permissionMode === 'plan' || store.permissionMode === 'full' }"
+            data-test="permission-button"
+            class="chip-btn permission-mode-btn"
+            :class="`perm-${store.permissionMode}`"
             title="切换权限模式"
             @click.stop="togglePermDropdown"
-          >☑ {{ formatPermMode(store.permissionMode) }} <span style="font-size:9px;color:var(--text-faint)">▼</span></button>
+          >{{ formatPermMode(store.permissionMode) }} <span class="permission-chevron">▼</span></button>
           <button class="chip-btn" title="撤销星瑶上一次的文件修改" @click="store.undoLastEdit()">↩ 撤销</button>
 
           <button

@@ -18,15 +18,22 @@
 
       <div class="kimi-card-bar">
         <div style="display:flex;align-items:center;gap:8px">
-          <button class="kimi-pill-btn" title="添加附件" @click="handlePickFiles">附件</button>
+          <button
+            data-test="attachment-button"
+            class="kimi-pill-btn"
+            title="添加附件"
+            @click="handlePickFiles"
+          >＋</button>
           <button
             ref="permBtnRef"
-            class="kimi-pill-btn"
+            data-test="permission-button"
+            class="kimi-pill-btn permission-mode-btn"
+            :class="`perm-${store.permissionMode}`"
             title="切换权限模式"
             @click.stop="togglePermDropdown"
           >
-            ☑ <span>{{ formatPermMode(store.permissionMode) }}</span>
-            <span style="font-size:10px;color:var(--text-faint)">▼</span>
+            <span>{{ formatPermMode(store.permissionMode) }}</span>
+            <span class="permission-chevron">▼</span>
           </button>
         </div>
 
