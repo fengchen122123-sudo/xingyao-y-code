@@ -26,15 +26,20 @@ from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.memory import MemoryManager
 from core.model_manager import (
+    add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
     add_provider as mm_add_provider,
+    delete_provider as mm_delete_provider,
     delete_model as mm_delete_model,
     get_active_model,
     get_model_reasoning_effort,
     load_config,
     set_active_model,
     set_model_reasoning_effort,
+    update_model as mm_update_model,
+    update_provider as mm_update_provider,
 )
+from core.model_catalog import API_PROTOCOLS, get_preset_providers
 from core.permission_broker import permission_broker
 from core.skills import get_active_skill_ids, save_active_skill_ids, scan_all_skills
 from core.task_manager import kill_background_task, list_active_tasks
@@ -502,21 +507,9 @@ class ApiBridge:
             active_model = get_active_model() or {}
             config_data = load_config()
 
-            models = []
-            providers = []
-            for provider in config_data.get("providers", []):
-                providers.append({
-                    "id": str(provider.get("id", "")),
-                    "name": str(provider.get("name", "")),
-                    "base_url": str(provider.get("base_url", "")),
-                    "protocol": str(provider.get("protocol", "openai")),
-                })
-                for m in provider.get("models", []):
-                    models.append({
-                        "id": str(m.get("id", "")),
-                        "name": str(m.get("name", "")),
-                        "provider_name": str(provider.get("name", "")),
-                    })
+            model_settings = self.get_model_settings()
+            models = model_settings["models"]
+            providers = model_settings["providers"]
 
             # 以“当前会话归属”恢复工作区上下文（启动时已自动选中最近一次对话）：
             # GLOBAL 会话显示自由对话；项目会话切到其工作目录并加载对应文件树。
@@ -2158,19 +2151,62 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 模型管理
     # ------------------------------------------------------------------
-    def _all_models(self) -> List[Dict[str, Any]]:
+    def get_model_settings(self) -> Dict[str, Any]:
+        """返回不含 API Key 明文的完整模型设置快照。"""
+        config_data = load_config()
+        providers = []
         models = []
+        for provider in config_data.get("providers", []):
+            provider_models = []
+            for model in provider.get("models", []):
+                item = {
+                    "id": str(model.get("id", "")),
+                    "name": str(model.get("name", "")),
+                    "provider_id": str(provider.get("id", "")),
+                    "provider_name": str(provider.get("name", "")),
+                    "context_window": int(model.get("context_window", 128000) or 128000),
+                    "supports_vision": bool(model.get("supports_vision", False)),
+                }
+                provider_models.append(item)
+                models.append(dict(item))
+            provider_item = {
+                "id": str(provider.get("id", "")),
+                "name": str(provider.get("name", "")),
+                "base_url": str(provider.get("base_url", "")),
+                "protocol": str(provider.get("protocol", "openai")),
+                "preset_id": str(provider.get("preset_id", "")),
+                "has_api_key": bool(provider.get("api_key")),
+                "models": provider_models,
+            }
+            providers.append(provider_item)
+        return {
+            "protocols": [dict(item) for item in API_PROTOCOLS],
+            "presets": get_preset_providers(),
+            "providers": providers,
+            "models": models,
+            "active_model_id": str(config_data.get("active_model_id") or ""),
+        }
+
+    def _all_models(self) -> List[Dict[str, Any]]:
         try:
-            for provider in load_config().get("providers", []):
-                for m in provider.get("models", []):
-                    models.append({
-                        "id": str(m.get("id", "")),
-                        "name": str(m.get("name", "")),
-                        "provider_name": str(provider.get("name", "")),
-                    })
+            return self.get_model_settings()["models"]
         except Exception:
             logger.debug("读取模型列表失败", exc_info=True)
-        return models
+            return []
+
+    def add_preset_provider(self, preset_id: str, api_key: str) -> Dict[str, Any]:
+        try:
+            provider_id = mm_add_preset_provider(str(preset_id), str(api_key or "").strip())
+            self._sync_active_model_context()
+            return {
+                "ok": True,
+                "provider_id": provider_id,
+                "settings": self.get_model_settings(),
+                "msg": "预置厂商已添加",
+            }
+        except Exception as e:
+            logger.exception("add_preset_provider 失败")
+            return {"ok": False, "msg": str(e)}
 
     def add_provider(self, name: str, base_url: str, api_key: str, protocol: str) -> Dict[str, Any]:
         try:
@@ -2182,7 +2218,12 @@ class ApiBridge:
                 str(api_key or "").strip(),
                 str(protocol or "openai").strip() or "openai",
             )
-            return {"ok": True, "provider_id": provider_id, "msg": f"已添加供应商 {name}"}
+            return {
+                "ok": True,
+                "provider_id": provider_id,
+                "settings": self.get_model_settings(),
+                "msg": f"已添加供应商 {name}",
+            }
         except Exception as e:
             logger.exception("add_provider 失败")
             return {"ok": False, "msg": str(e)}
@@ -2201,7 +2242,44 @@ class ApiBridge:
                 return str(p.get("id"))
         return None
 
-    def add_model(self, provider_id: str, model_name: str, context_window: int = 128000) -> Dict[str, Any]:
+    def update_provider(
+        self,
+        provider_id: str,
+        name: str,
+        base_url: str,
+        api_key: str,
+        protocol: str,
+    ) -> Dict[str, Any]:
+        try:
+            mm_update_provider(
+                str(provider_id),
+                name=str(name or "").strip(),
+                base_url=str(base_url or "").strip(),
+                api_key=str(api_key or "").strip(),
+                protocol=str(protocol or "").strip(),
+            )
+            self._sync_active_model_context()
+            return {"ok": True, "settings": self.get_model_settings(), "msg": "厂商已更新"}
+        except Exception as e:
+            logger.exception("update_provider 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def delete_provider(self, provider_id: str) -> Dict[str, Any]:
+        try:
+            mm_delete_provider(str(provider_id))
+            self._sync_active_model_context()
+            return {"ok": True, "settings": self.get_model_settings(), "msg": "厂商已删除"}
+        except Exception as e:
+            logger.exception("delete_provider 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def add_model(
+        self,
+        provider_id: str,
+        model_name: str,
+        context_window: int = 128000,
+        supports_vision: bool = False,
+    ) -> Dict[str, Any]:
         try:
             if not str(model_name or "").strip():
                 return {"ok": False, "msg": "模型名称不能为空"}
@@ -2212,17 +2290,45 @@ class ApiBridge:
                 window = int(context_window or 128000)
             except (TypeError, ValueError):
                 window = 128000
-            # litellm_model 的拼接规则（含 "/" 时不重复加协议前缀）由 model_manager 统一处理
-            model_id = add_model_to_provider(real_provider_id, str(model_name).strip(), window)
+            # LiteLLM 传输前缀与厂商作用域模型 ID 的拼接规则由 model_manager 统一处理。
+            model_id = add_model_to_provider(
+                real_provider_id,
+                str(model_name).strip(),
+                window,
+                supports_vision=bool(supports_vision),
+            )
             self._sync_active_model_context()
             return {
                 "ok": True,
                 "model_id": model_id,
                 "models": self._all_models(),
+                "settings": self.get_model_settings(),
                 "msg": f"已添加模型 {model_name}",
             }
         except Exception as e:
             logger.exception("add_model 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def update_model(
+        self,
+        provider_id: str,
+        model_id: str,
+        model_name: str,
+        context_window: int,
+        supports_vision: bool,
+    ) -> Dict[str, Any]:
+        try:
+            mm_update_model(
+                str(provider_id),
+                str(model_id),
+                name=str(model_name or "").strip(),
+                context_window=int(context_window),
+                supports_vision=bool(supports_vision),
+            )
+            self._sync_active_model_context()
+            return {"ok": True, "settings": self.get_model_settings(), "msg": "模型已更新"}
+        except Exception as e:
+            logger.exception("update_model 失败")
             return {"ok": False, "msg": str(e)}
 
     def delete_model(self, model_id: str) -> Dict[str, Any]:
@@ -2232,13 +2338,17 @@ class ApiBridge:
                 return {"ok": False, "msg": f"未找到模型: {model_id}", "models": self._all_models()}
             mm_delete_model(str(model_id))
             self._sync_active_model_context()
-            return {"ok": True, "models": self._all_models()}
+            return {
+                "ok": True,
+                "models": self._all_models(),
+                "settings": self.get_model_settings(),
+            }
         except Exception as e:
             logger.exception("delete_model 失败")
             return {"ok": False, "msg": str(e)}
 
     def test_model(self, model_id: str) -> Dict[str, Any]:
-        """用一次最小 completion 请求验证模型可用性（15 秒超时）。"""
+        """按厂商实际协议发起最小流请求，验证完整请求链路。"""
         try:
             target = None
             provider = None
@@ -2256,16 +2366,24 @@ class ApiBridge:
 
             def _ping():
                 try:
-                    from core.llm import _get_litellm
-                    litellm = _get_litellm()
-                    litellm.completion(
-                        model=target.get("litellm_model"),
-                        api_key=provider.get("api_key") or "",
-                        base_url=provider.get("base_url") or None,
-                        messages=[{"role": "user", "content": "ping"}],
-                        max_tokens=1,
+                    from core.llm import _request_stream
+
+                    stream = _request_stream(
+                        provider.get("protocol", "openai"),
+                        {
+                            "model": target.get("litellm_model"),
+                            "api_key": provider.get("api_key") or "",
+                            "api_base": provider.get("base_url") or None,
+                            "messages": [{"role": "user", "content": "ping"}],
+                            "tools": [],
+                            "stream": True,
+                            "max_tokens": 1,
+                            "num_retries": 0,
+                        },
                         timeout=TEST_MODEL_TIMEOUT,
                     )
+                    for _ in stream:
+                        pass
                     result["ok"] = True
                     result["msg"] = "连接成功"
                 except Exception as e:

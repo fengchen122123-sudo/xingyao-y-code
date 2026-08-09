@@ -5,6 +5,25 @@ import core.model_selector as model_selector
 from core.model_manager import add_provider, load_config
 
 
+def test_connection_uses_shared_protocol_request_path(monkeypatch):
+    captured = {}
+
+    def fake_request_stream(protocol, kwargs, *, timeout):
+        captured.update(protocol=protocol, kwargs=kwargs, timeout=timeout)
+        return iter([object()])
+
+    monkeypatch.setattr("core.llm._request_stream", fake_request_stream)
+
+    model_selector._test_model_connection(
+        "responses", "deepseek-v4-flash", "https://api.deepseek.com", "secret"
+    )
+
+    assert captured["protocol"] == "responses"
+    assert captured["kwargs"]["model"] == "openai/deepseek-v4-flash"
+    assert captured["kwargs"]["stream"] is True
+    assert captured["timeout"] == 15
+
+
 def test_kimi_for_coding_has_parallel_openai_and_anthropic_presets():
     from core.model_selector import PRESET_PROVIDERS
 
