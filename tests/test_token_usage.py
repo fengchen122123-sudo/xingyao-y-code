@@ -262,3 +262,38 @@ def test_delete_workspace_sessions_clears_each_runtime_cache_bucket(tmp_path):
 
     for name in ("workspace-cache-a", "workspace-cache-b"):
         assert llm.get_token_usage_snapshot(name, model, base)["cache"]["available"] is False
+
+
+def test_format_cache_diagnostic_summary_is_evidence_based():
+    summary = {
+        "count": 7,
+        "lost_tokens": 123456,
+        "unreported": 2,
+        "categories": {
+            "cold_start": 1,
+            "identity_change": 1,
+            "tool_contract_change": 1,
+            "client_history_rewrite": 1,
+            "prompt_drop": 1,
+            "idle_gap": 1,
+            "provider_or_unknown": 1,
+        },
+    }
+
+    text = main._format_cache_diagnostic_summary(summary)
+
+    assert "低命中诊断 7 次" in text
+    assert "冷启动 1" in text
+    assert "历史重写 1" in text
+    assert "prompt 缩短 1" in text
+    assert "未确定 1" in text
+    assert "未报告缓存明细 2" in text
+    assert "缺少足够证据" in text
+    assert "客户端无法避免" not in text
+    assert "属 provider" not in text
+
+
+def test_format_cache_diagnostic_summary_omits_empty_summary():
+    assert main._format_cache_diagnostic_summary({
+        "count": 0, "lost_tokens": 0, "unreported": 0, "categories": {}
+    }) == ""

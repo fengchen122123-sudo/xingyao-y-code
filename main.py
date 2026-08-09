@@ -391,13 +391,49 @@ def _render_usage_section(manager, label, start_s, end_s):
             f"{sub['completion']:>14} {sub['cache_prompt']:>14} {sub['cached']:>14} "
             f"{_sub_rate:>10} {sub['total']:>14}</ansicyan>"
         ))
-    inv = manager.query_cache_invalidation_events(start_s, end_s)
-    if inv["count"]:
+    from core.cache_keepalive import load_keepalive_interval
+    idle_seconds = int(load_keepalive_interval() or 120)
+    diagnostic = manager.query_cache_diagnostic_summary(
+        start_s, end_s, idle_seconds=idle_seconds
+    )
+    diagnostic_text = _format_cache_diagnostic_summary(diagnostic)
+    if diagnostic_text:
         print_formatted_text(HTML(
-            f"  <ansigray>缓存失效事件 {inv['count']} 次（输入≥2万且命中率&lt;50%），"
-            f"多消耗输入 {inv['lost_tokens']} tokens——属 provider/网关侧缓存驱逐，客户端无法避免</ansigray>"
+            f"  <ansigray>{_esc(diagnostic_text)}</ansigray>"
         ))
     return True
+
+
+def _format_cache_diagnostic_summary(summary):
+    """只输出诊断证据支持的低命中分类，不把未知事件强归因给 provider。"""
+    count = int(summary.get("count", 0) or 0)
+    unreported = int(summary.get("unreported", 0) or 0)
+    if count == 0 and unreported == 0:
+        return ""
+    categories = summary.get("categories") or {}
+    labels = (
+        ("cold_start", "冷启动"),
+        ("identity_change", "模型/接口变化"),
+        ("tool_contract_change", "工具契约变化"),
+        ("client_history_rewrite", "历史重写"),
+        ("prompt_drop", "prompt 缩短"),
+        ("idle_gap", "空闲间隔"),
+        ("provider_or_unknown", "未确定"),
+    )
+    parts = [
+        f"{label} {int(categories.get(key, 0) or 0)}"
+        for key, label in labels
+        if int(categories.get(key, 0) or 0) > 0
+    ]
+    text = f"低命中诊断 {count} 次"
+    if parts:
+        text += "（" + "、".join(parts) + "）"
+    text += f"，多消耗输入 {int(summary.get('lost_tokens', 0) or 0)} tokens"
+    if unreported:
+        text += f"；未报告缓存明细 {unreported} 次"
+    if int(categories.get("provider_or_unknown", 0) or 0):
+        text += "；未确定事件缺少足够证据，需结合 endpoint A/B 或服务端日志确认"
+    return text
 
 
 def _format_cache_hit_rate(cached_tokens, cache_prompt_tokens):
