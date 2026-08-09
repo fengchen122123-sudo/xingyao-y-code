@@ -269,3 +269,19 @@ def test_get_history_for_llm_keeps_valid_tool_pairing(tmp_path):
 
     assert [m["role"] for m in history] == ["assistant", "tool", "assistant"]
     assert history[0]["tool_calls"][0]["id"] == "tool_C"
+def test_top_level_user_addition_runs_history_maintenance_at_ingestion(monkeypatch):
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(":memory:")
+    calls = []
+    monkeypatch.setattr(
+        manager, "prune_history_files", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+
+    manager.add_message("ingestion-maintenance", "user", "顶层输入")
+    manager.add_messages("ingestion-maintenance", [
+        ("user", "内部通知"),
+        ("assistant", "批量回复"),
+    ])
+
+    assert calls == [(('ingestion-maintenance',), {"max_turns": 16, "retain_recent": 4})]

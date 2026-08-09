@@ -120,6 +120,26 @@ def test_prepare_turn_messages_updates_token_usage(stub_llm, quiet_extras):
     assert stub_llm.session_token_usage["latest_total"] > 0
 
 
+def test_prepare_turn_messages_does_not_prune_history_on_normal_read(
+    monkeypatch, stub_llm, quiet_extras
+):
+    from core.agent_service import prepare_turn_messages
+
+    manager = _make_manager()
+    session = "test_prepare_read_only"
+    manager.add_message(session, "user", "正常低水位消息")
+    calls = []
+    monkeypatch.setattr(
+        manager, "prune_history_files", lambda *args, **kwargs: calls.append((args, kwargs))
+    )
+
+    prepare_turn_messages(
+        manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
+    )
+
+    assert calls == []
+
+
 def test_evict_oldest_turn_removes_complete_rounds_only():
     """滑窗淘汰必须以 user 消息为轮次边界。"""
     from core.agent_service import evict_oldest_turn
