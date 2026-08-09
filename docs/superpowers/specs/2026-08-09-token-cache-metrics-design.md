@@ -24,7 +24,7 @@ TUI 状态栏主要读取第一类数据，GUI 还错误地使用
 
 ## 非目标
 
-- 本阶段不修改 `token_usage` 数据库表结构。
+- 本阶段不新增 `token_usage` 数据库列；沿用 `cached_tokens` 可空能力，明确区分“真实 0 命中”和“服务端未报告缓存明细”。
 - 本阶段不解决历史消息重写、图片 canonical 化、DeepSeek thinking 契约或 keepalive 策略。
 - 本阶段不把进程内会话统计伪装成跨进程历史统计；应用重启后，三种缓存命中率从空状态重新累计。
 - 本阶段不根据本地 tokenizer 反推服务端计费 token。
@@ -79,6 +79,8 @@ TUI 状态栏主要读取第一类数据，GUI 还错误地使用
 ### 两类状态严格分离
 
 进程级计费累计继续保存在 `session_token_usage.cumulative_*`，语义明确为“本进程所有 LLM 请求累计”，不再用于当前会话缓存命中率。
+
+服务端未报告缓存明细时，`cached_tokens` 持久化为 SQL `NULL`，不能写成 `0`。历史聚合增加 `cache_prompt` 口径，只累计缓存明细已报告记录的 prompt；历史命中率使用 `cached / cache_prompt`。这样真实零命中仍是 `cached_tokens=0`，未知则是 `NULL`，两者不会混淆。
 
 缓存遥测状态使用以下 key：
 
