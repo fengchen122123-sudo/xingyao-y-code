@@ -1545,6 +1545,98 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # Token 用量
     # ------------------------------------------------------------------
+    def get_token_usage_statistics(self, days: int = 30) -> Dict[str, Any]:
+        """按 CLI /usage 口径返回 GUI 的每日与模型 Token 统计。"""
+        if type(days) is not int or days not in (1, 7, 30):
+            return {"ok": False, "msg": "统计范围仅支持 1、7、30 天"}
+        range_days = days
+
+        try:
+            from datetime import date, timedelta
+
+            end_date = date.today()
+            start_date = end_date - timedelta(days=range_days - 1)
+            rows = self._memory.query_token_usage_by_day_and_model(
+                start_date.isoformat(), end_date.isoformat()
+            )
+            metric_names = (
+                "prompt", "completion", "cached", "cache_prompt",
+                "total", "requests",
+            )
+
+            def empty_metrics() -> Dict[str, int]:
+                return {name: 0 for name in metric_names}
+
+            def add_metrics(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+                for name in metric_names:
+                    target[name] += int(source.get(name, 0) or 0)
+
+            def with_rate(metrics: Dict[str, Any]) -> Dict[str, Any]:
+                result = dict(metrics)
+                cache_prompt = int(result.get("cache_prompt", 0) or 0)
+                result["cache_hit_rate"] = (
+                    round(int(result.get("cached", 0) or 0) / cache_prompt * 100, 1)
+                    if cache_prompt > 0 else None
+                )
+                return result
+
+            summary = empty_metrics()
+            model_totals: Dict[str, Dict[str, Any]] = {}
+            day_lookup: Dict[str, Dict[str, Any]] = {}
+            for offset in range(range_days):
+                day = (start_date + timedelta(days=offset)).isoformat()
+                day_lookup[day] = {
+                    "date": day,
+                    **empty_metrics(),
+                    "models": [],
+                }
+
+            for row in rows:
+                provider = str(row.get("provider") or "")
+                model = str(row.get("model") or "")
+                key = f"{provider}/{model}" if provider else model
+                model_item = model_totals.setdefault(key, {
+                    "key": key,
+                    "provider": provider,
+                    "model": model,
+                    **empty_metrics(),
+                })
+                add_metrics(model_item, row)
+                add_metrics(summary, row)
+
+                day_item = day_lookup[str(row.get("date") or "")]
+                add_metrics(day_item, row)
+                day_item["models"].append(with_rate({
+                    "key": key,
+                    "provider": provider,
+                    "model": model,
+                    **{name: int(row.get(name, 0) or 0) for name in metric_names},
+                }))
+
+            models = [with_rate(item) for item in model_totals.values()]
+            models.sort(key=lambda item: (-item["total"], item["key"]))
+            day_items = []
+            for day_item in day_lookup.values():
+                day_item["models"].sort(
+                    key=lambda item: (-item["total"], item["key"])
+                )
+                day_items.append(with_rate(day_item))
+
+            return {
+                "ok": True,
+                "range": {
+                    "days": range_days,
+                    "start_date": start_date.isoformat(),
+                    "end_date": end_date.isoformat(),
+                },
+                "summary": with_rate(summary),
+                "models": models,
+                "days": day_items,
+            }
+        except Exception as exc:
+            logger.exception("get_token_usage_statistics 失败")
+            return {"ok": False, "msg": str(exc)}
+
     def get_token_usage(self) -> Dict[str, Any]:
         try:
             from core.llm import get_token_usage_snapshot
