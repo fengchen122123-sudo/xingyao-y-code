@@ -65,6 +65,20 @@ def test_normalize_usage_keeps_unreported_cache_distinct_from_zero_hit():
     assert zero_hit["cached_tokens"] == 0
 
 
+def test_normalize_usage_rejects_conflicting_cached_token_sources():
+    record = _normalize_server_usage({
+        "prompt_tokens": 100,
+        "completion_tokens": 20,
+        "total_tokens": 120,
+        "prompt_tokens_details": {"cached_tokens": 90},
+        "prompt_cache_hit_tokens": 80,
+        "prompt_cache_miss_tokens": 10,
+    })
+
+    assert record["valid"] is False
+    assert any("cached token sources disagree" in error for error in record["errors"])
+
+
 @pytest.mark.parametrize(
     ("usage", "expected_error"),
     [
