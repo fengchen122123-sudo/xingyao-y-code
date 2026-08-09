@@ -1553,6 +1553,32 @@ def _is_kimi_family(model_name, api_base=""):
     return "moonshot" in b or "kimi" in b
 
 
+def _is_deepseek_family(model_name, api_base=""):
+    model = str(model_name or "").split("/")[-1].lower()
+    return "deepseek" in model or _is_official_deepseek_route(api_base)
+
+
+def _is_official_deepseek_route(api_base=""):
+    normalized = str(api_base or "").rstrip("/").lower()
+    return normalized in {
+        "https://api.deepseek.com",
+        "https://api.deepseek.com/v1",
+        "https://api.deepseek.com/beta",
+    }
+
+
+def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
+    if not _is_deepseek_family(model_name, api_base):
+        return False
+    cfg = model_cfg or {}
+    if isinstance(cfg.get("enable_thinking"), bool):
+        return cfg["enable_thinking"]
+    if not _is_official_deepseek_route(api_base):
+        return False
+    model = str(model_name or "").split("/")[-1].lower()
+    return "v4" in model or "reasoner" in model
+
+
 def _supports_cache_keepalive(model_name, api_base=""):
     """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi 路由。"""
     identity = f"{model_name or ''} {api_base or ''}".lower()
@@ -1982,12 +2008,31 @@ def _provider_request_options(
     # 判定同时看模型名与 api_base（经销商/聚合网关的 base_url 千奇百怪，
     # 只认 base 会漏判，比如 api.scnet.cn 上的 Kimi-K2.6）。
     kimi_family = _is_kimi_family(model_name, api_base)
+    deepseek_family = _is_deepseek_family(model_name, api_base)
+    deepseek_thinking = _deepseek_thinking_enabled(
+        model_name, api_base, model_cfg
+    )
     route_prefix = str(model_name or "").split("/")[0].lower()
     anthropic_route = route_prefix == "anthropic"
 
     result = {}
 
-    if cfg_max_tokens is not None or cfg_thinking_budget is not None or cfg_enable_thinking is not None:
+    if deepseek_family:
+        if cfg_max_tokens is not None:
+            result["max_tokens"] = int(cfg_max_tokens)
+        if _is_official_deepseek_route(api_base) or isinstance(cfg_enable_thinking, bool):
+            result.setdefault("extra_body", {})["thinking"] = {
+                "type": "enabled" if deepseek_thinking else "disabled"
+            }
+        if deepseek_thinking:
+            effort = str(model_cfg.get("reasoning_effort") or "max").strip().lower()
+            if effort not in _REASONING_EFFORT_LEVELS:
+                raise ValueError(
+                    "DeepSeek reasoning_effort 仅支持 low/high/max，"
+                    f"实际为 {effort!r}"
+                )
+            result["reasoning_effort"] = effort
+    elif cfg_max_tokens is not None or cfg_thinking_budget is not None or cfg_enable_thinking is not None:
         # 用户显式配置优先
         if cfg_max_tokens is not None:
             result["max_tokens"] = int(cfg_max_tokens)
@@ -3359,7 +3404,6 @@ def _chat_with_model_generator(
         "stream_options": {"include_usage": True},
         "num_retries": 2,
     }
-    kwargs["tool_choice"] = "auto"
     kwargs.update(_provider_request_options(
         model_name,
         api_base,
@@ -3367,6 +3411,12 @@ def _chat_with_model_generator(
         cache_session_id=telemetry_session_id,
         tool_contract=request_tool_contract,
     ))
+    deepseek_thinking_request = (
+        _is_deepseek_family(model_name, api_base)
+        and kwargs.get("extra_body", {}).get("thinking", {}).get("type") == "enabled"
+    )
+    if not deepseek_thinking_request:
+        kwargs["tool_choice"] = "auto"
 
     # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小
     # 导致长回复被静默截断。若 provider 已显式配置则尊重其值。

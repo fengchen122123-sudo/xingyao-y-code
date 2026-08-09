@@ -163,6 +163,38 @@ def test_non_kimi_model_gets_no_cache_affinity(monkeypatch):
     assert opts == {}
 
 
+def test_official_deepseek_v4_uses_explicit_thinking_contract(monkeypatch):
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, None)
+
+    opts = _provider_request_options(
+        "openai/deepseek-v4-pro", "https://api.deepseek.com"
+    )
+
+    assert opts["reasoning_effort"] == "max"
+    assert opts["extra_body"]["thinking"] == {"type": "enabled"}
+
+
+def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, None)
+    assert _provider_request_options(
+        "openai/deepseek-v4-pro", "https://aggregator.example/v1"
+    ) == {}
+
+    _patch_model_cfg(monkeypatch, {
+        "enable_thinking": False,
+        "reasoning_effort": "max",
+    })
+    disabled = _provider_request_options(
+        "openai/deepseek-v4-pro", "https://api.deepseek.com"
+    )
+    assert "reasoning_effort" not in disabled
+    assert disabled["extra_body"]["thinking"] == {"type": "disabled"}
+
+
 def test_reasoning_effort_injected_for_kimi_openai_route(monkeypatch):
     """配置 reasoning_effort 后，Kimi OpenAI 兼容路由注入到 extra_body。"""
     from core.llm import _provider_request_options
