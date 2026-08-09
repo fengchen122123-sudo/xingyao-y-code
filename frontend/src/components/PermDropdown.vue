@@ -31,7 +31,7 @@ const store = useAppStore();
 const styleObj = ref<Record<string, string>>({});
 
 const permModes: Array<{ v: PermissionMode; c: string; desc: string }> = [
-  { v: 'confirm', c: 'var(--yellow)', desc: '每次变更前都会向你确认' },
+  { v: 'confirm', c: 'var(--green)', desc: '每次变更前都会向你确认' },
   { v: 'auto', c: 'var(--cyan)', desc: '自动接受文件编辑，其余操作仍需确认' },
   { v: 'plan', c: 'var(--purple)', desc: '仅规划任务，不直接执行改动' },
   { v: 'full', c: 'var(--red)', desc: '完全放行所有操作，风险自负' },
