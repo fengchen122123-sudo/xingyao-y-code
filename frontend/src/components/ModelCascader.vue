@@ -1,7 +1,7 @@
 <template>
   <div id="model-cascader" :class="{ show: visible, 'opens-up': opensUp }" :style="styleObj" @click.stop>
     <!-- 二级子面板：具体模型列表 -->
-    <div class="cascader-sub-panel" :class="{ show: activeProviderName }">
+    <div class="cascader-sub-panel" :class="{ show: activeProviderName }" :style="subPanelStyle">
       <div
         v-for="m in currentSubModels"
         :key="m.id || m.name"
@@ -23,7 +23,7 @@
           :key="provider"
           class="cascader-item"
           :class="{ active: activeProviderName === provider }"
-          @mouseenter="activeProviderName = provider as string"
+          @mouseenter="activateProvider(provider as string, $event)"
         >
           <span class="c-provider-icon">◇</span>
           <span class="c-label">{{ provider }}</span>
@@ -68,7 +68,14 @@ const store = useAppStore();
 
 const activeProviderName = ref<string | null>(null);
 const styleObj = ref<Record<string, string>>({});
+const subPanelStyle = ref<Record<string, string>>({});
 const opensUp = ref(false);
+
+const MENU_GAP = 8;
+const VIEWPORT_PADDING = 12;
+const SUB_PANEL_MIN_WIDTH = 240;
+// 1px border + 6px panel padding: aligns the first model row with the provider row.
+const SUB_PANEL_ITEM_INSET = 7;
 
 const groupedModels = computed(() => store.modelsByProvider);
 const hasAnyModel = computed(() => store.models.length > 0);
@@ -80,6 +87,36 @@ const currentSubModels = computed(() => {
 
 function hasCurrentModel(modelsList: ModelInfo[]) {
   return modelsList.some(m => m.id === store.activeModelId);
+}
+
+function activateProvider(provider: string, event: MouseEvent) {
+  activeProviderName.value = provider;
+
+  const providerRow = event.currentTarget as HTMLElement;
+  const mainPanel = providerRow.closest('.cascader-main-panel');
+  if (!(mainPanel instanceof HTMLElement)) {
+    throw new Error('Model provider row must be inside the cascader main panel');
+  }
+
+  const rowRect = providerRow.getBoundingClientRect();
+  const mainPanelRect = mainPanel.getBoundingClientRect();
+  const top = Math.max(VIEWPORT_PADDING, Math.floor(rowRect.top - SUB_PANEL_ITEM_INSET));
+  const left = Math.max(
+    VIEWPORT_PADDING,
+    Math.min(
+      Math.floor(mainPanelRect.right + MENU_GAP),
+      window.innerWidth - SUB_PANEL_MIN_WIDTH - VIEWPORT_PADDING,
+    ),
+  );
+
+  subPanelStyle.value = {
+    position: 'fixed',
+    top: `${top}px`,
+    left: `${left}px`,
+    right: 'auto',
+    bottom: 'auto',
+    maxHeight: `${Math.max(0, Math.floor(window.innerHeight - top - VIEWPORT_PADDING))}px`,
+  };
 }
 
 function selectModel(modelId: string) {
@@ -107,11 +144,9 @@ function selectEffort(level: ReasoningEffort) {
 watch(() => props.visible, (newVal) => {
   if (newVal && props.anchorEl) {
     const r = props.anchorEl.getBoundingClientRect();
-    const menuGap = 8;
-    const viewportPadding = 12;
-    const upwardHeight = Math.max(0, Math.floor(r.top - menuGap - viewportPadding));
+    const upwardHeight = Math.max(0, Math.floor(r.top - MENU_GAP - VIEWPORT_PADDING));
     const downwardHeight = Math.max(0, Math.floor(
-      window.innerHeight - r.bottom - menuGap - viewportPadding,
+      window.innerHeight - r.bottom - MENU_GAP - VIEWPORT_PADDING,
     ));
     const isBottomHalf = upwardHeight >= downwardHeight;
     const maxPanelHeight = isBottomHalf ? upwardHeight : downwardHeight;
@@ -121,7 +156,7 @@ watch(() => props.visible, (newVal) => {
       const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
       styleObj.value = {
         position: 'fixed',
-        bottom: `${window.innerHeight - r.top + menuGap}px`,
+        bottom: `${window.innerHeight - r.top + MENU_GAP}px`,
         left: `${left}px`,
         right: 'auto',
         top: 'auto',
@@ -131,7 +166,7 @@ watch(() => props.visible, (newVal) => {
       const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
       styleObj.value = {
         position: 'fixed',
-        top: `${r.bottom + menuGap}px`,
+        top: `${r.bottom + MENU_GAP}px`,
         left: `${left}px`,
         right: 'auto',
         bottom: 'auto',
@@ -141,6 +176,7 @@ watch(() => props.visible, (newVal) => {
 
     // 二级模型列表只在悬停供应商后展开，保持一级列表简洁。
     activeProviderName.value = null;
+    subPanelStyle.value = {};
   }
 });
 
