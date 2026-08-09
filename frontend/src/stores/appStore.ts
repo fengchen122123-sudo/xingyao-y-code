@@ -30,20 +30,29 @@ import {
   type ToolExecutionResult,
 } from '../utils/toolTrace';
 
-const emptyTokenUsage = (): TokenUsage => ({
-  used: 0,
-  window: 0,
-  cached_pct: 0,
-  cumulative: 0,
-  cache_latest_pct: null,
-  cache_hot_pct: null,
-  cache_session_pct: null,
-  cache_available: false,
-  cache_hot_turns: 0,
-  cache_invalidation_reason: '',
-  prompt_tokens: 0,
-  cached_tokens: 0,
-});
+export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
+  const nullableNumber = (value: unknown): number | null => {
+    if (value === null || value === undefined) return null;
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+  };
+  return {
+    used: Number(data.used ?? 0),
+    window: Number(data.window ?? 0),
+    cached_pct: Number(data.cached_pct ?? 0),
+    cumulative: Number(data.cumulative ?? 0),
+    cache_latest_pct: nullableNumber(data.cache_latest_pct),
+    cache_hot_pct: nullableNumber(data.cache_hot_pct),
+    cache_session_pct: nullableNumber(data.cache_session_pct),
+    cache_available: Boolean(data.cache_available),
+    cache_hot_turns: Number(data.cache_hot_turns ?? 0),
+    cache_invalidation_reason: String(data.cache_invalidation_reason ?? ''),
+    prompt_tokens: Number(data.prompt_tokens ?? 0),
+    cached_tokens: Number(data.cached_tokens ?? 0),
+  };
+};
+
+const emptyTokenUsage = (): TokenUsage => normalizeTokenUsage();
 
 export interface ChatMessage {
   id?: string;
@@ -406,7 +415,7 @@ export const useAppStore = defineStore('app', {
         document.body.classList.toggle('light', this.themeLight);
         api.set_titlebar_theme(!this.themeLight)?.catch(() => {});
         this.fileTree = (init as any).file_tree || [];
-        this.tokenUsage = init.token_usage || emptyTokenUsage();
+        this.tokenUsage = normalizeTokenUsage(init.token_usage);
         this.version = init.version || '';
         this.connected = true;
       } catch (err) {
@@ -909,20 +918,7 @@ export const useAppStore = defineStore('app', {
         this.currentStreamingText = '';
         this.currentThinkingText = '';
       } else if (type === 'token_usage') {
-        this.tokenUsage = {
-          used: Number(data.used ?? 0),
-          window: Number(data.window ?? 0),
-          cached_pct: Number(data.cached_pct ?? 0),
-          cumulative: Number(data.cumulative ?? 0),
-          cache_latest_pct: data.cache_latest_pct ?? null,
-          cache_hot_pct: data.cache_hot_pct ?? null,
-          cache_session_pct: data.cache_session_pct ?? null,
-          cache_available: Boolean(data.cache_available),
-          cache_hot_turns: Number(data.cache_hot_turns ?? 0),
-          cache_invalidation_reason: String(data.cache_invalidation_reason ?? ''),
-          prompt_tokens: Number(data.prompt_tokens ?? 0),
-          cached_tokens: Number(data.cached_tokens ?? 0),
-        };
+        this.tokenUsage = normalizeTokenUsage(data);
       } else if (type === 'mcp_status') {
         if (data.mcps) this.mcps = data.mcps;
       } else if (type === 'diff_ready') {
