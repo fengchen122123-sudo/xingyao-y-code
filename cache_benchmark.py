@@ -11,6 +11,7 @@ from core.agent_service import build_stable_system_message
 from core.llm import (
     _apply_cache_control,
     _complete_thinking_blocks,
+    _normalize_server_usage,
     _provider_request_options,
     _strip_media_and_merge,
     _tool_contract_fingerprint,
@@ -24,8 +25,10 @@ def _validated_round(item):
         raise ValueError("round usage 必须是字典")
     if "prompt_tokens" not in item or "cached_tokens" not in item:
         raise ValueError("round usage 缺少 prompt_tokens/cached_tokens")
-    prompt = int(item["prompt_tokens"])
-    cached = int(item["cached_tokens"])
+    prompt = item["prompt_tokens"]
+    cached = item["cached_tokens"]
+    if type(prompt) is not int or type(cached) is not int:
+        raise ValueError("round token usage 必须是精确整数")
     if prompt < 0 or cached < 0:
         raise ValueError("provider token usage 不能为负数")
     if cached > prompt:
@@ -134,6 +137,8 @@ def _run_one_request(*, model, api_base, api_key, messages, tools, cache_session
     )
     if not deepseek_thinking_request:
         request["tool_choice"] = "auto"
+    if "max_tokens" not in request and "max_completion_tokens" not in request:
+        request["max_tokens"] = 8192
 
     response_stream = completion(**request)
     usage = None
@@ -211,9 +216,16 @@ def run_benchmark(
             tools=tools,
             cache_session_id=cache_session_id,
         )
+        usage_record = _normalize_server_usage(usage)
+        if not usage_record["valid"]:
+            raise ValueError(
+                "provider usage 不一致: " + "; ".join(usage_record["errors"])
+            )
+        if not usage_record["cache_reported"]:
+            raise ValueError("provider usage 未报告 cached token，无法进行缓存基准")
         round_usage = {
-            "prompt_tokens": _prompt_tokens(usage),
-            "cached_tokens": _cached_tokens(usage),
+            "prompt_tokens": usage_record["prompt_tokens"],
+            "cached_tokens": usage_record["cached_tokens"],
         }
         results.append(_validated_round(round_usage))
         assistant = {"role": "assistant", "content": content or "OK"}

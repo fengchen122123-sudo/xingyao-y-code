@@ -57,6 +57,26 @@ def build_keepalive_request(request):
     return keepalive
 
 
+def account_keepalive_response(response, telemetry):
+    """严格记账一次保活响应；缺失或无效 usage 会停止后续保活。"""
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        raise RuntimeError("provider 保活响应未返回 usage")
+    from core.llm import _account_server_usage
+
+    record = _account_server_usage(
+        usage,
+        model_name=str(telemetry.get("model_name") or ""),
+        api_base=str(telemetry.get("api_base") or ""),
+        session_id=str(telemetry.get("session_id") or ""),
+        cache_scope="keepalive",
+        invalidation_reason="保活请求",
+    )
+    if record is None:
+        raise RuntimeError("provider 保活 usage 校验失败")
+    return record
+
+
 class CacheKeepaliveService:
     def __init__(self):
         self._condition = threading.Condition()
@@ -66,8 +86,9 @@ class CacheKeepaliveService:
         self._last_error = ""
         self._generation = 0
         self._thread = None
+        self._telemetry = None
 
-    def register_request(self, request, interval=None):
+    def register_request(self, request, interval=None, telemetry=None):
         resolved_interval = load_keepalive_interval() if interval is None else int(interval)
         if resolved_interval < 0 or 0 < resolved_interval < MIN_KEEPALIVE_SECONDS:
             raise ValueError(
@@ -77,6 +98,7 @@ class CacheKeepaliveService:
         with self._condition:
             self._generation += 1
             self._snapshot = snapshot
+            self._telemetry = deepcopy(telemetry) if snapshot else None
             self._interval = resolved_interval
             self._last_activity = time.monotonic()
             self._last_error = ""
@@ -108,18 +130,21 @@ class CacheKeepaliveService:
                     self._condition.wait(timeout=remaining)
                     continue
                 snapshot = deepcopy(self._snapshot)
+                telemetry = deepcopy(self._telemetry)
                 generation = self._generation
                 self._last_activity = time.monotonic()
 
             try:
                 from core.llm import _litellm_completion
-                _litellm_completion(**snapshot)
+                response = _litellm_completion(**snapshot)
+                account_keepalive_response(response, telemetry or {})
             except Exception as exc:
                 error_name = type(exc).__name__
                 logger.error("prompt cache 保活失败并已停止: %s", error_name)
                 with self._condition:
                     if self._generation == generation:
                         self._snapshot = None
+                        self._telemetry = None
                         self._interval = 0
                         self._last_error = error_name
             else:

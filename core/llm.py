@@ -1053,7 +1053,30 @@ def _normalize_server_usage(usage):
     direct_cached_raw = _usage_field(usage, "prompt_cache_hit_tokens")
     miss_raw = _usage_field(usage, "prompt_cache_miss_tokens")
 
-    if details_cached_raw is not _USAGE_FIELD_MISSING and details_cached_raw is not None:
+    details_cache_reported = (
+        details_cached_raw is not _USAGE_FIELD_MISSING
+        and details_cached_raw is not None
+    )
+    direct_cache_reported = (
+        direct_cached_raw is not _USAGE_FIELD_MISSING
+        and direct_cached_raw is not None
+    )
+    details_cached = _optional_nonnegative_int(
+        details_cached_raw, "prompt_tokens_details.cached_tokens", errors
+    )
+    direct_cached = _optional_nonnegative_int(
+        direct_cached_raw, "prompt_cache_hit_tokens", errors
+    )
+    if (
+        details_cache_reported
+        and direct_cache_reported
+        and details_cached is not None
+        and direct_cached is not None
+        and details_cached != direct_cached
+    ):
+        errors.append("cached token sources disagree")
+
+    if details_cache_reported:
         cached_raw = details_cached_raw
     else:
         cached_raw = direct_cached_raw
@@ -1810,7 +1833,10 @@ def _strip_media_and_merge(messages, model_name=None, api_base=""):
             role == "assistant"
             and cleaned_msg.get("tool_calls")
             and _requires_tool_call_reasoning(model_name, api_base)
-            and not cleaned_msg.get("reasoning_content")
+            and (
+                not isinstance(cleaned_msg.get("reasoning_content"), str)
+                or not cleaned_msg["reasoning_content"].strip()
+            )
         ):
             raise ValueError(
                 "DeepSeek thinking 工具轮缺少完整 reasoning_content，"
@@ -3790,7 +3816,15 @@ def _chat_with_model_generator(
                         break
 
             if cache_scope == "main" and keepalive_interval:
-                cache_keepalive_service.register_request(kwargs, interval=keepalive_interval)
+                cache_keepalive_service.register_request(
+                    kwargs,
+                    interval=keepalive_interval,
+                    telemetry={
+                        "model_name": model_name,
+                        "api_base": api_base,
+                        "session_id": telemetry_session_id,
+                    },
+                )
 
             # 流结束：按最终 usage chunk 严格校验并统一记账一次。
             _persist_cache_request_diagnostic(request_diagnostic, stream_usage)

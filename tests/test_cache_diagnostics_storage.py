@@ -1,6 +1,8 @@
 import json
 import time
 
+import pytest
+
 from core.memory import MemoryManager
 
 
@@ -59,6 +61,42 @@ def test_cache_diagnostic_round_trip_preserves_zero_null_and_errors():
     assert unknown["cache_reported"] is False
     assert unknown["usage_errors"] == ["usage missing cache details"]
     assert "SECRET" not in json.dumps(rows, ensure_ascii=False)
+
+
+def test_cache_diagnostic_commit_failure_rolls_back_and_connection_recovers():
+    manager = MemoryManager(":memory:")
+    real_conn = manager.conn
+
+    class FailCommitOnce:
+        def __init__(self, connection):
+            self.connection = connection
+            self.fail = True
+            self.rollbacks = 0
+
+        def execute(self, *args, **kwargs):
+            return self.connection.execute(*args, **kwargs)
+
+        def commit(self):
+            if self.fail:
+                self.fail = False
+                raise RuntimeError("commit failed")
+            return self.connection.commit()
+
+        def rollback(self):
+            self.rollbacks += 1
+            return self.connection.rollback()
+
+    proxy = FailCommitOnce(real_conn)
+    manager.conn = proxy
+
+    with pytest.raises(RuntimeError, match="commit failed"):
+        manager.add_cache_request_diagnostic(_diagnostic(session_id="failed"))
+    assert proxy.rollbacks == 1
+
+    manager.add_cache_request_diagnostic(_diagnostic(session_id="recovered"))
+    assert [row["session_id"] for row in manager.query_cache_request_diagnostics()] == [
+        "recovered"
+    ]
 
 
 def test_cache_diagnostic_summary_classifies_evidence_without_guessing_provider():
