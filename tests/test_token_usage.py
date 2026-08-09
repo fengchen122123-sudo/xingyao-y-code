@@ -45,6 +45,7 @@ def test_add_and_query_token_usage_grouped_by_model():
     assert rows[0]["prompt"] == 4000
     assert rows[0]["completion"] == 600
     assert rows[0]["cached"] == 600
+    assert rows[0]["cache_prompt"] == 4000
     assert rows[0]["total"] == 4600
     assert rows[1]["model"] == "kimi-k2"
     assert rows[1]["total"] == 550
@@ -63,6 +64,28 @@ def test_query_token_usage_date_range_filter():
 
     # 区间外无数据
     assert manager.query_token_usage_by_model("2026-09-01", "2026-09-30") == []
+
+
+def test_unreported_cache_is_stored_as_null_and_excluded_from_cache_denominator():
+    manager = MemoryManager(":memory:")
+    today = _ts_of("2026-08-05")
+    manager.add_token_usage(
+        "openai", "m1", 100, 10, 0, 110, session_id="reported", ts=today
+    )
+    manager.add_token_usage(
+        "openai", "m1", 200, 20, None, 220, session_id="unreported", ts=today
+    )
+
+    raw = manager.conn.execute(
+        "SELECT cached_tokens FROM token_usage WHERE session_id = 'unreported'"
+    ).fetchone()
+    rows = manager.query_token_usage_by_model("2026-08-05", "2026-08-05")
+
+    assert raw[0] is None
+    assert rows[0]["prompt"] == 300
+    assert rows[0]["cached"] == 0
+    assert rows[0]["cache_prompt"] == 100
+    assert manager.get_last_token_usage("unreported")["cached_tokens"] is None
 
 
 def test_persist_token_usage_splits_provider_and_model(monkeypatch):
