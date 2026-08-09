@@ -8,6 +8,8 @@ import { useAppStore } from '../stores/appStore';
 
 describe('ModelCascader', () => {
   beforeEach(() => {
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1024 });
+    Object.defineProperty(window, 'innerHeight', { configurable: true, value: 768 });
     setActivePinia(createPinia());
     useAppStore().$patch({
       models: [
@@ -41,6 +43,22 @@ describe('ModelCascader', () => {
     const manage = wrapper.findAll('.cascader-item').find(item => item.text().includes('管理模型'))!;
     await manage.trigger('click');
     expect(useAppStore().settingsOpen).toBe(true);
+  });
+
+  it('aligns the first model row with the hovered provider row', async () => {
+    const anchor = document.createElement('button');
+    const wrapper = mount(ModelCascader, { props: { visible: true, anchorEl: anchor } });
+    const provider = wrapper.find('.cascader-main-panel .cascader-item');
+    provider.element.getBoundingClientRect = () => ({
+      x: 100, y: 200, top: 200, right: 340, bottom: 236, left: 100,
+      width: 240, height: 36, toJSON: () => ({}),
+    });
+
+    await provider.trigger('mouseenter');
+
+    const subPanelStyle = wrapper.get('.cascader-sub-panel').attributes('style');
+    expect(subPanelStyle).toContain('top: 193px');
+    expect(subPanelStyle).toContain('max-height: 563px');
   });
 
   it('bottom-aligns both panels when the menu opens upward', async () => {
