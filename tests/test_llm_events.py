@@ -156,6 +156,42 @@ def test_parallel_tool_finished_events_keep_each_call_duration(mocker):
     assert finished["call-slow"]["duration_ms"] > finished["call-fast"]["duration_ms"]
 
 
+def test_empty_tool_call_ids_get_unique_fallbacks(mocker):
+    first_response = iter([_chunk(tool_calls=[
+        _tool_call(0, "", "glob_files", '{"pattern":"*.py"}'),
+        _tool_call(1, "", "glob_files", '{"pattern":"*.md"}'),
+    ])])
+    final_response = iter([_chunk("done")])
+    mocker.patch("core.llm.completion", side_effect=[first_response, final_response])
+
+    def fake_execute(tc, **_kwargs):
+        return {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": tc["function"]["name"],
+            "content": "ok",
+        }
+
+    mocker.patch("core.llm._execute_single_tool_call", side_effect=fake_execute)
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "inspect"}],
+        persist=False,
+        turn_id="turn-empty-ids",
+    ))
+
+    assert [
+        event.payload["id"] for event in events
+        if event.kind == "tool_requested"
+    ] == ["call_0", "call_1"]
+    assert [
+        event.payload["id"] for event in events
+        if event.kind == "tool_finished"
+    ] == ["call_0", "call_1"]
+
+
 def test_event_stream_orders_parallel_read_tools(mocker):
     first_response = iter([
         _chunk(

@@ -36,6 +36,19 @@ def test_get_sessions_registers_normal_project_dir(monkeypatch, tmp_path):
     assert gui_bridge._resolve_real_path(proj) in folder_paths
 
 
+def test_get_workspace_state_reads_explicit_project(tmp_path):
+    bridge = _bare_gui_bridge()
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / "README.md").write_text("project", encoding="utf-8")
+
+    result = bridge.get_workspace_state(str(project))
+
+    assert result["ok"] is True
+    assert result["workdir"] == gui_bridge._resolve_real_path(str(project))
+    assert [node["n"] for node in result["file_tree"]] == ["README.md"]
+
+
 def test_delete_folder_group_does_not_resurrect(monkeypatch):
     """删除安装目录幻影分组后，刷新列表不会再把它加回来。"""
     bridge = _bare_gui_bridge()

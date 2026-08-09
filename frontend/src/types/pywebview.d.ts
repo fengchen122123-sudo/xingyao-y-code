@@ -233,6 +233,7 @@ export interface BridgeEvent {
 export interface PyWebViewAPI {
   get_initial_state(): Promise<InitialState>;
   select_workspace_folder(): Promise<any>;
+  get_workspace_state(workdir: string): Promise<any>;
   get_sessions(): Promise<SessionGroup[]>;
   create_session(title?: string, workdir?: string): Promise<any>;
   create_global_session(title?: string): Promise<any>;

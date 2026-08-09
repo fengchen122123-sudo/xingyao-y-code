@@ -1,3 +1,4 @@
+import os
 import threading
 
 import pytest
@@ -158,6 +159,53 @@ def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch):
     assert ("error", expected) in emitted
 
 
+def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
+    project = tmp_path / "project"
+    project.mkdir()
+    launch = tmp_path / "launch"
+    launch.mkdir()
+    monkeypatch.chdir(launch)
+
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._cancel_event = threading.Event()
+    bridge._bg_summary_pending_session = ""
+    bridge._current_permission_mode = "confirm"
+    bridge._emit_token_usage = lambda: None
+    bridge._sync_active_model_context = lambda: None
+    bridge._session_workdir = lambda _session_name: str(project)
+    bridge._set_current_session = lambda _session_name: None
+    bridge._subagent_progress_poller = lambda _session_name, _stop: None
+    bridge._consume_turn_events = lambda *args, **kwargs: False
+    bridge._maybe_auto_rename = lambda _session_name: None
+    bridge._memory = type("Memory", (), {
+        "ensure_session": lambda self, *args, **kwargs: None,
+        "add_message": lambda self, *args, **kwargs: None,
+        "set_workdir": lambda self, workdir: None,
+    })()
+    bridge.emit_event = lambda _kind, _data: None
+    seen = {}
+
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {
+        "litellm_model": "model",
+        "api_key": "key",
+        "base_url": None,
+        "context_window": 128000,
+    })
+    monkeypatch.setattr("core.input_parser.parse_user_input", lambda text: (text, []))
+
+    def capture_context(*args, **kwargs):
+        seen["cwd"] = os.getcwd()
+        return []
+
+    monkeypatch.setattr("core.agent_service.prepare_turn_messages", capture_context)
+    monkeypatch.setattr("core.memory.begin_turn_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
+
+    bridge._run_turn_worker("inspect", "project-session")
+
+    assert os.path.realpath(seen["cwd"]) == os.path.realpath(project)
+
+
 @pytest.mark.parametrize(
     ("yielded_message", "raised_message", "expected_toast_messages"),
     [
@@ -190,6 +238,7 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     bridge._subagent_progress_poller = lambda session_name, stop: None
     bridge._maybe_auto_rename = lambda session_name: None
     bridge._memory = type("Memory", (), {
+        "set_workdir": lambda self, workdir: None,
         "ensure_session": lambda self, *args, **kwargs: None,
         "add_message": lambda self, *args, **kwargs: None,
     })()

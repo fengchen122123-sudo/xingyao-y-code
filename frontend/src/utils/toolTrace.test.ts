@@ -181,6 +181,15 @@ describe('buildToolTraceRows', () => {
     ]);
   });
 
+  it('terminalizes unresolved calls with the enclosing turn', () => {
+    const call = displayedCall('legacy-empty-id', 'list_directory', 'read');
+
+    expect(buildToolTraceRows([call], [], 'running')[0].status).toBe('running');
+    expect(buildToolTraceRows([call], [], 'completed')[0].status).toBe('completed');
+    expect(buildToolTraceRows([call], [], 'cancelled')[0].status).toBe('cancelled');
+    expect(buildToolTraceRows([call], [], 'error')[0].status).toBe('failed');
+  });
+
   it('keeps mutations and subagents as independent rows', () => {
     const rows = buildToolTraceRows([
       displayedCall('edit-1', 'edit_file', 'mutation', true),

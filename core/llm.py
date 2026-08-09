@@ -4048,10 +4048,10 @@ def _chat_with_model_generator(
                         # 这里用 None 占位，遇到真实 id 再回填；始终没有则用 call_{idx} 兜底。
                         tc_id = getattr(tc, "id", None)
                         existing_id = tool_calls_dict[idx].get("id")
-                        if tc_id is not None:
-                            if existing_id is None or str(existing_id).startswith("call_"):
-                                tool_calls_dict[idx]["id"] = tc_id
-                        elif existing_id is None:
+                        if tc_id:
+                            if not existing_id or str(existing_id).startswith("call_"):
+                                tool_calls_dict[idx]["id"] = str(tc_id)
+                        elif not existing_id:
                             tool_calls_dict[idx]["id"] = f"call_{idx}"
                         # name 只在为空时赋值：provider 重复发 name 时 += 会拼出
                         # "read_fileread_file" 之类的坏名字
