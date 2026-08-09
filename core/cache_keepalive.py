@@ -37,18 +37,21 @@ def build_keepalive_request(request):
         "api_base": request.get("api_base"),
         "messages": deepcopy(request["messages"]),
         "tools": deepcopy(request.get("tools") or []),
-        "tool_choice": "none",
         "stream": False,
         "max_tokens": 1,
         "num_retries": 0,
         "timeout": 30,
     }
+    if "tool_choice" in request:
+        keepalive["tool_choice"] = "none"
     if request.get("metadata") is not None:
         keepalive["metadata"] = deepcopy(request["metadata"])
     if request.get("extra_body") is not None:
         extra_body = deepcopy(request["extra_body"])
         # 推理强度与保活无关；移除后避免 1-token 上限与推理预算冲突。
         extra_body.pop("reasoning_effort", None)
+        if extra_body.get("thinking", {}).get("type") == "enabled":
+            extra_body["thinking"] = {"type": "disabled"}
         if extra_body:
             keepalive["extra_body"] = extra_body
     return keepalive
