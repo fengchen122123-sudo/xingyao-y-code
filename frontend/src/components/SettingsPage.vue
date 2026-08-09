@@ -192,7 +192,7 @@
       </section>
     </main>
 
-    <div v-if="modelModal.show" class="modal-mask" @click.self="closeModelModal">
+    <div v-if="modelModal.show" class="modal-mask">
       <form data-test="model-modal" class="model-modal" @submit.prevent="saveModel">
         <div class="modal-head"><h3>{{ modelModal.model_id ? '编辑模型' : '添加模型' }}</h3><button type="button" @click="closeModelModal">×</button></div>
         <label class="field-label">模型 ID</label>
