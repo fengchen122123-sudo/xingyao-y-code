@@ -17,29 +17,28 @@
 
 ### Task 1: DeepSeek 路由与请求参数
 
-- [ ] 写失败测试：`openai/deepseek-v4-pro` + 官方 endpoint 被识别为 thinking，发送 thinking/max 且不发送 `tool_choice`。
-- [ ] 写失败测试：显式关闭 thinking 恢复 `tool_choice=auto`；未显式开启的聚合 endpoint 不套官方参数。
-- [ ] 实现统一 DeepSeek family/official/thinking 判定并接入 `_provider_request_options`。
-- [ ] 运行聚焦测试并提交 `fix: enforce DeepSeek V4 request contract`。
+- [x] 写失败测试：`openai/deepseek-v4-pro` + 官方 endpoint 被识别为 thinking，发送 thinking/max 且不发送 `tool_choice`。
+- [x] 写失败测试：显式关闭 thinking 恢复 `tool_choice=auto`；未显式开启的聚合 endpoint 不套官方参数。
+- [x] 实现统一 DeepSeek family/official/thinking 判定并接入 `_provider_request_options`。
+- [x] 运行聚焦测试并提交 `fix: enforce DeepSeek V4 request contract`（22 passed）。
 
 ### Task 2: reasoning_content 完整性
 
-- [ ] 写失败测试：`openai/` 官方路由保留完整 reasoning；thinking 工具轮缺失/空值直接失败。
-- [ ] `_strip_media_and_merge` 接收 `api_base` 并使用统一契约；删除补空串逻辑。
-- [ ] 删除请求循环中针对 DeepSeek 的任何空值补救，仅保留独立 Kimi 契约。
-- [ ] 运行聚焦测试并提交 `fix: require complete DeepSeek tool reasoning`。
+- [x] 写失败测试：`openai/` 官方路由保留完整 reasoning；thinking 工具轮缺失/空值直接失败。
+- [x] `_strip_media_and_merge` 接收 `api_base` 并使用统一契约；删除补空串逻辑。
+- [x] 删除请求循环中针对 DeepSeek 的任何空值补救，仅保留独立 Kimi 契约。
+- [x] 运行聚焦测试并提交 `fix: require complete DeepSeek tool reasoning`（82 passed）。
 
 ### Task 3: 保活和默认配置
 
-- [ ] 写失败测试：官方 DeepSeek 支持保活，聚合 DeepSeek 默认不支持。
-- [ ] 写失败测试：不支持 `tool_choice` 的主请求生成的保活请求也不添加该字段，并关闭 thinking。
-- [ ] 更新新配置默认值、示例与本地 DeepSeek V4 配置。
-- [ ] 运行聚焦测试并提交 `fix: scope DeepSeek keepalive to official routes`。
+- [x] 写失败测试：官方 DeepSeek 支持保活，聚合 DeepSeek 默认不支持。
+- [x] 写失败测试：不支持 `tool_choice` 的主请求生成的保活请求也不添加该字段，并关闭 thinking。
+- [x] 更新新配置默认值、示例与本地 DeepSeek V4 配置。
+- [x] 运行聚焦测试并提交 `fix: scope DeepSeek keepalive to official routes`（35 passed）。
 
 ### Task 4: 完整验证
 
-- [ ] 运行相关 Python 测试与 `py_compile`。
-- [ ] 运行全量 pytest。
-- [ ] 运行前端测试与 build。
-- [ ] 记录证据并提交 `docs: complete DeepSeek V4 contract plan`。
-
+- [x] 运行相关 Python 测试与 `py_compile`（成功）。
+- [x] 运行全量 pytest（727 passed）。
+- [x] 运行前端测试与 build（44 passed；build 成功）。
+- [x] 记录证据并提交 `docs: complete DeepSeek V4 contract plan`。
