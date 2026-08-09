@@ -40,6 +40,8 @@ def test_round_summary_exposes_total_hot_minimum_and_catastrophic_misses():
         [{"prompt_tokens": 100, "cached_tokens": -1}],
         [{"prompt_tokens": 100, "cached_tokens": 101}],
         [{"prompt_tokens": 100}],
+        [{"prompt_tokens": True, "cached_tokens": 1}],
+        [{"prompt_tokens": 100.5, "cached_tokens": 99}],
     ],
 )
 def test_round_summary_rejects_invalid_provider_usage(rounds):
@@ -62,9 +64,12 @@ def test_stable_messages_use_production_system_prefix(monkeypatch):
 def test_run_benchmark_uses_production_contract_and_checks_threshold(monkeypatch):
     captured = []
     usages = iter([
-        SimpleNamespace(prompt_tokens=1000, prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
-        SimpleNamespace(prompt_tokens=1000, prompt_tokens_details=SimpleNamespace(cached_tokens=990)),
-        SimpleNamespace(prompt_tokens=1000, prompt_tokens_details=SimpleNamespace(cached_tokens=995)),
+        SimpleNamespace(prompt_tokens=1000, completion_tokens=1, total_tokens=1001,
+                        prompt_tokens_details=SimpleNamespace(cached_tokens=0)),
+        SimpleNamespace(prompt_tokens=1000, completion_tokens=1, total_tokens=1001,
+                        prompt_tokens_details=SimpleNamespace(cached_tokens=990)),
+        SimpleNamespace(prompt_tokens=1000, completion_tokens=1, total_tokens=1001,
+                        prompt_tokens_details=SimpleNamespace(cached_tokens=995)),
     ])
 
     def fake_one_request(**kwargs):
@@ -103,6 +108,8 @@ def test_one_request_matches_deepseek_and_regular_tool_choice_contract(monkeypat
             return iter([SimpleNamespace(
                 usage=SimpleNamespace(
                     prompt_tokens=100,
+                    completion_tokens=1,
+                    total_tokens=101,
                     prompt_tokens_details=SimpleNamespace(cached_tokens=0),
                 ),
                 choices=[],
@@ -137,7 +144,34 @@ def test_one_request_matches_deepseek_and_regular_tool_choice_contract(monkeypat
 
     assert "tool_choice" not in captured[0]
     assert captured[0]["extra_body"]["thinking"] == {"type": "enabled"}
+    assert captured[0]["max_tokens"] == 8192
     assert captured[1]["tool_choice"] == "auto"
+    assert captured[1]["max_tokens"] == 8192
+
+
+def test_benchmark_rejects_usage_that_fails_production_invariants(monkeypatch):
+    invalid = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=2,
+        total_tokens=101,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=90),
+    )
+    monkeypatch.setattr(
+        cache_benchmark,
+        "_run_one_request",
+        lambda **kwargs: ("ok", invalid, None, None),
+    )
+
+    with pytest.raises(ValueError, match=r"prompt \+ completion"):
+        cache_benchmark.run_benchmark(
+            model="openai/deepseek-v4-pro",
+            api_base="https://api.deepseek.com",
+            api_key="secret",
+            rounds=2,
+            minimum_hot_rate=99.0,
+            tools=[],
+            stable_messages=[{"role": "system", "content": "stable"}],
+        )
 
 
 def test_ab_benchmark_shares_contract_and_suite_seed(monkeypatch):

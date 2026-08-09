@@ -1808,7 +1808,7 @@ def test_nonpersistent_vision_turn_does_not_replace_database_content(
 # ── DeepSeek thinking：带 tool_calls 的 assistant 必须回传 reasoning_content key ──
 
 
-@pytest.mark.parametrize("reasoning", [None, ""])
+@pytest.mark.parametrize("reasoning", [None, "", " ", "\t"])
 def test_deepseek_thinking_requires_complete_reasoning_content(
     monkeypatch, reasoning
 ):

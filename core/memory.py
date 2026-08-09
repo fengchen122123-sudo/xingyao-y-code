@@ -526,12 +526,16 @@ class MemoryManager:
             json.dumps(list(diagnostic.get("usage_errors") or ()), ensure_ascii=False),
         ]
         with self._lock:
-            self.conn.execute(
-                "INSERT INTO cache_request_diagnostics (ts," + ",".join(fields) + ") "
-                "VALUES (" + ",".join("?" for _ in range(len(fields) + 1)) + ")",
-                [int(ts), *values],
-            )
-            self.conn.commit()
+            try:
+                self.conn.execute(
+                    "INSERT INTO cache_request_diagnostics (ts," + ",".join(fields) + ") "
+                    "VALUES (" + ",".join("?" for _ in range(len(fields) + 1)) + ")",
+                    [int(ts), *values],
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def query_cache_request_diagnostics(
         self, start_ts=None, end_ts=None, session_id=None

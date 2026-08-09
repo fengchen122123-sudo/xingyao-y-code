@@ -88,3 +88,47 @@ def test_deepseek_thinking_keepalive_omits_tool_choice_and_disables_thinking():
     assert "tool_choice" not in keepalive
     assert "reasoning_effort" not in keepalive
     assert keepalive["extra_body"]["thinking"] == {"type": "disabled"}
+
+
+def test_keepalive_response_is_accounted_in_dedicated_scope(monkeypatch):
+    from types import SimpleNamespace
+    import core.cache_keepalive as keepalive
+
+    calls = []
+    monkeypatch.setattr(
+        "core.llm._account_server_usage",
+        lambda usage, **kwargs: calls.append((usage, kwargs)) or {"valid": True},
+    )
+    usage = SimpleNamespace(
+        prompt_tokens=100,
+        completion_tokens=1,
+        total_tokens=101,
+        prompt_cache_hit_tokens=90,
+        prompt_cache_miss_tokens=10,
+    )
+
+    result = keepalive.account_keepalive_response(
+        SimpleNamespace(usage=usage),
+        {
+            "model_name": "openai/deepseek-v4-pro",
+            "api_base": "https://api.deepseek.com",
+            "session_id": "keepalive-session",
+        },
+    )
+
+    assert result == {"valid": True}
+    assert calls == [(usage, {
+        "model_name": "openai/deepseek-v4-pro",
+        "api_base": "https://api.deepseek.com",
+        "session_id": "keepalive-session",
+        "cache_scope": "keepalive",
+        "invalidation_reason": "保活请求",
+    })]
+
+
+def test_keepalive_response_without_usage_fails_loudly():
+    from types import SimpleNamespace
+    from core.cache_keepalive import account_keepalive_response
+
+    with pytest.raises(RuntimeError, match="usage"):
+        account_keepalive_response(SimpleNamespace(), {})
