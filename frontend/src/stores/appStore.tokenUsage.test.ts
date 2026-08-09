@@ -1,6 +1,6 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it } from 'vitest';
-import { useAppStore } from './appStore';
+import { normalizeTokenUsage, useAppStore } from './appStore';
 
 
 beforeEach(() => setActivePinia(createPinia()));
@@ -59,4 +59,19 @@ it('keeps unavailable cache rates as null instead of converting them to zero', (
   expect(store.tokenUsage.cache_hot_pct).toBeNull();
   expect(store.tokenUsage.cache_session_pct).toBeNull();
   expect(store.tokenUsage.cache_available).toBe(false);
+});
+
+it('normalizes a legacy backend payload without inventing cache rates', () => {
+  const usage = normalizeTokenUsage({
+    used: 12,
+    window: 128_000,
+    cached_pct: 0,
+    cumulative: 15,
+  });
+
+  expect(usage.used).toBe(12);
+  expect(usage.cache_latest_pct).toBeNull();
+  expect(usage.cache_hot_pct).toBeNull();
+  expect(usage.cache_session_pct).toBeNull();
+  expect(usage.cache_available).toBe(false);
 });
