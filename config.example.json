@@ -53,6 +53,35 @@
           "reasoning_effort": null
         }
       ]
+    },
+    {
+      "id": "provider_deepseek",
+      "name": "深度求索",
+      "base_url": "https://api.deepseek.com",
+      "api_key": "sk-your-deepseek-api-key-here",
+      "protocol": "openai",
+      "models": [
+        {
+          "id": "deepseek_v4_pro",
+          "name": "deepseek-v4-pro",
+          "litellm_model": "openai/deepseek-v4-pro",
+          "context_window": 1000000,
+          "supports_vision": false,
+          "max_tokens": 8192,
+          "enable_thinking": true,
+          "reasoning_effort": "max"
+        },
+        {
+          "id": "deepseek_v4_flash",
+          "name": "deepseek-v4-flash",
+          "litellm_model": "openai/deepseek-v4-flash",
+          "context_window": 1000000,
+          "supports_vision": false,
+          "max_tokens": 8192,
+          "enable_thinking": true,
+          "reasoning_effort": "max"
+        }
+      ]
     }
   ]
 }

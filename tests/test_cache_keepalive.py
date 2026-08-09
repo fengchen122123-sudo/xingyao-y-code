@@ -39,6 +39,7 @@ def test_keepalive_request_reuses_prefix_but_limits_output():
         "messages": [{"role": "system", "content": "stable"}],
         "tools": [{"type": "function", "function": {"name": "read_file"}}],
         "extra_body": {"prompt_cache_key": "stable-key", "reasoning_effort": "max"},
+        "tool_choice": "auto",
         "stream": True,
         "stream_options": {"include_usage": True},
         "max_tokens": 32000,
@@ -55,3 +56,35 @@ def test_keepalive_request_reuses_prefix_but_limits_output():
     assert keepalive["max_tokens"] == 1
     assert keepalive["tool_choice"] == "none"
     assert "stream_options" not in keepalive
+
+
+def test_deepseek_keepalive_is_limited_to_official_routes():
+    from core.llm import _supports_cache_keepalive
+
+    assert _supports_cache_keepalive(
+        "openai/deepseek-v4-pro", "https://api.deepseek.com"
+    ) is True
+    assert _supports_cache_keepalive(
+        "openai/deepseek-v4-pro", "https://aggregator.example/v1"
+    ) is False
+
+
+def test_deepseek_thinking_keepalive_omits_tool_choice_and_disables_thinking():
+    from core.cache_keepalive import build_keepalive_request
+
+    original = {
+        "model": "openai/deepseek-v4-pro",
+        "api_key": "secret",
+        "api_base": "https://api.deepseek.com",
+        "messages": [{"role": "system", "content": "stable"}],
+        "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        "reasoning_effort": "max",
+        "extra_body": {"thinking": {"type": "enabled"}},
+        "stream": True,
+    }
+
+    keepalive = build_keepalive_request(original)
+
+    assert "tool_choice" not in keepalive
+    assert "reasoning_effort" not in keepalive
+    assert keepalive["extra_body"]["thinking"] == {"type": "disabled"}
