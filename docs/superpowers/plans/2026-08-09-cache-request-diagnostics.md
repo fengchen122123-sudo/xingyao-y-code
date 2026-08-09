@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.12、SQLite、pytest、SHA-256、JSON。
 
+**Implementation Status (2026-08-09):** Task 1-4 已按 TDD 完成。最终验证：聚焦 75 passed、全量 Python 713 passed、前端 44 passed、`npm run build` 成功、Python 语法检查成功。实现提交：`2ff9195`、`a3cab41`、`529e106`、`a8c04ff`。
+
 ## Global Constraints
 
 - 只在 `dev` 分支工作。
