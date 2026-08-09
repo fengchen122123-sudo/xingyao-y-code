@@ -355,6 +355,41 @@ class MemoryManager:
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(date)"
                 )
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS cache_request_diagnostics (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts INTEGER NOT NULL,
+                        session_id TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        api_base TEXT NOT NULL,
+                        cache_scope TEXT NOT NULL,
+                        request_reason TEXT NOT NULL,
+                        messages_sha256 TEXT NOT NULL,
+                        system_sha256 TEXT NOT NULL,
+                        tools_sha256 TEXT NOT NULL,
+                        message_count INTEGER NOT NULL,
+                        system_message_count INTEGER NOT NULL,
+                        common_prefix_messages INTEGER NOT NULL,
+                        request_bytes INTEGER NOT NULL,
+                        system_bytes INTEGER NOT NULL,
+                        tools_bytes INTEGER NOT NULL,
+                        prompt_tokens INTEGER,
+                        cached_tokens INTEGER,
+                        cache_miss_tokens INTEGER,
+                        cache_reported INTEGER NOT NULL,
+                        usage_valid INTEGER NOT NULL,
+                        usage_errors TEXT NOT NULL
+                    )
+                ''')
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cache_diag_identity "
+                    "ON cache_request_diagnostics"
+                    "(session_id, model, api_base, cache_scope, id)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_cache_diag_ts "
+                    "ON cache_request_diagnostics(ts)"
+                )
                 # 保存修改
                 self.conn.commit()
             except Exception:
@@ -454,6 +489,163 @@ class MemoryManager:
                 }
                 for row in cursor.fetchall()
             ]
+
+    def add_cache_request_diagnostic(self, diagnostic):
+        """追加一条无正文的请求级缓存诊断记录。"""
+        import time
+        ts = diagnostic.get("ts")
+        if ts is None:
+            ts = int(time.time())
+        fields = (
+            "session_id", "model", "api_base", "cache_scope", "request_reason",
+            "messages_sha256", "system_sha256", "tools_sha256", "message_count",
+            "system_message_count", "common_prefix_messages", "request_bytes",
+            "system_bytes", "tools_bytes", "prompt_tokens", "cached_tokens",
+            "cache_miss_tokens", "cache_reported", "usage_valid", "usage_errors",
+        )
+        values = [
+            str(diagnostic.get("session_id") or ""),
+            str(diagnostic.get("model") or ""),
+            str(diagnostic.get("api_base") or ""),
+            str(diagnostic.get("cache_scope") or "main"),
+            str(diagnostic.get("request_reason") or ""),
+            str(diagnostic.get("messages_sha256") or ""),
+            str(diagnostic.get("system_sha256") or ""),
+            str(diagnostic.get("tools_sha256") or ""),
+            int(diagnostic.get("message_count") or 0),
+            int(diagnostic.get("system_message_count") or 0),
+            int(diagnostic.get("common_prefix_messages") or 0),
+            int(diagnostic.get("request_bytes") or 0),
+            int(diagnostic.get("system_bytes") or 0),
+            int(diagnostic.get("tools_bytes") or 0),
+            None if diagnostic.get("prompt_tokens") is None else int(diagnostic["prompt_tokens"]),
+            None if diagnostic.get("cached_tokens") is None else int(diagnostic["cached_tokens"]),
+            None if diagnostic.get("cache_miss_tokens") is None else int(diagnostic["cache_miss_tokens"]),
+            1 if diagnostic.get("cache_reported") else 0,
+            1 if diagnostic.get("usage_valid") else 0,
+            json.dumps(list(diagnostic.get("usage_errors") or ()), ensure_ascii=False),
+        ]
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO cache_request_diagnostics (ts," + ",".join(fields) + ") "
+                "VALUES (" + ",".join("?" for _ in range(len(fields) + 1)) + ")",
+                [int(ts), *values],
+            )
+            self.conn.commit()
+
+    def query_cache_request_diagnostics(
+        self, start_ts=None, end_ts=None, session_id=None
+    ):
+        """按时间/会话读取诊断行；NULL 与真实 0 保持原样。"""
+        clauses = []
+        params = []
+        if start_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(int(start_ts))
+        if end_ts is not None:
+            clauses.append("ts <= ?")
+            params.append(int(end_ts))
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(str(session_id))
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        columns = (
+            "id", "ts", "session_id", "model", "api_base", "cache_scope",
+            "request_reason", "messages_sha256", "system_sha256", "tools_sha256",
+            "message_count", "system_message_count", "common_prefix_messages",
+            "request_bytes", "system_bytes", "tools_bytes", "prompt_tokens",
+            "cached_tokens", "cache_miss_tokens", "cache_reported", "usage_valid",
+            "usage_errors",
+        )
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT " + ",".join(columns)
+                + " FROM cache_request_diagnostics" + where + " ORDER BY ts, id",
+                params,
+            ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(zip(columns, row))
+            item["cache_reported"] = bool(item["cache_reported"])
+            item["usage_valid"] = bool(item["usage_valid"])
+            item["usage_errors"] = json.loads(item["usage_errors"] or "[]")
+            result.append(item)
+        return result
+
+    def query_cache_diagnostic_summary(
+        self,
+        start_date,
+        end_date,
+        min_prompt_tokens=20000,
+        max_hit_ratio=0.5,
+        idle_seconds=120,
+    ):
+        """基于已持久化证据分类低命中事件，不猜测未证明的 provider 原因。"""
+        import time
+        start_ts = int(time.mktime(time.strptime(
+            str(start_date) + " 00:00:00", "%Y-%m-%d %H:%M:%S"
+        )))
+        end_ts = int(time.mktime(time.strptime(
+            str(end_date) + " 23:59:59", "%Y-%m-%d %H:%M:%S"
+        )))
+        rows = self.query_cache_request_diagnostics(start_ts, end_ts)
+        category_names = (
+            "cold_start", "identity_change", "tool_contract_change",
+            "client_history_rewrite", "prompt_drop", "idle_gap",
+            "provider_or_unknown",
+        )
+        categories = {name: 0 for name in category_names}
+        previous_by_identity = {}
+        count = 0
+        lost_tokens = 0
+        unreported = 0
+        explicit_categories = {
+            "冷启动": "cold_start",
+            "模型或接口变化": "identity_change",
+            "工具契约变化": "tool_contract_change",
+            "上下文压缩或历史重写": "client_history_rewrite",
+        }
+        for row in rows:
+            identity = (
+                row["session_id"], row["model"], row["api_base"], row["cache_scope"]
+            )
+            previous = previous_by_identity.get(identity)
+            prompt = row["prompt_tokens"]
+            cached = row["cached_tokens"]
+            if not row["cache_reported"]:
+                unreported += 1
+            is_low = (
+                row["usage_valid"]
+                and row["cache_reported"]
+                and prompt is not None
+                and cached is not None
+                and prompt >= int(min_prompt_tokens)
+                and cached < prompt * float(max_hit_ratio)
+            )
+            if is_low:
+                category = explicit_categories.get(row["request_reason"])
+                if category is None and previous is not None:
+                    previous_prompt = previous["prompt_tokens"]
+                    if (
+                        previous_prompt is not None
+                        and prompt < previous_prompt * 0.98
+                    ):
+                        category = "prompt_drop"
+                    elif row["ts"] - previous["ts"] > int(idle_seconds):
+                        category = "idle_gap"
+                if category is None:
+                    category = "provider_or_unknown"
+                categories[category] += 1
+                count += 1
+                lost_tokens += prompt - cached
+            if row["usage_valid"] and prompt is not None:
+                previous_by_identity[identity] = row
+        return {
+            "count": count,
+            "lost_tokens": lost_tokens,
+            "unreported": unreported,
+            "categories": categories,
+        }
 
     def query_cache_invalidation_events(
         self, start_date, end_date, min_prompt_tokens=20000, max_hit_ratio=0.5
