@@ -57,6 +57,9 @@
     <div id="input-meta">
       <div class="l">
         <span :class="tokenClass">Token: {{ tokenUsedDisplay }} / {{ tokenWindowDisplay }}</span>
+        <span class="cache-usage" :title="store.tokenUsage.cache_invalidation_reason || '当前会话主代理缓存命中率'">
+          缓存: {{ cacheRateDisplay }}
+        </span>
       </div>
       <div class="r">
         <span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行 · <span class="kbd">Esc</span> 中断
@@ -104,6 +107,14 @@ const tokenClass = computed(() => {
   if (tokenPct.value > 70) return 'tok-orange';
   return '';
 });
+const formatCacheRate = (value: number | null) => (
+  value === null ? '--' : `${value.toFixed(1)}%`
+);
+const cacheRateDisplay = computed(() => (
+  `本轮 ${formatCacheRate(store.tokenUsage.cache_latest_pct)} · `
+  + `热路径 ${formatCacheRate(store.tokenUsage.cache_hot_pct)} · `
+  + `全量 ${formatCacheRate(store.tokenUsage.cache_session_pct)}`
+));
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste } = useAttachments();
 
@@ -230,6 +241,13 @@ textarea {
   justify-content: space-between;
   font-size: 11.5px;
   color: var(--text-faint);
+}
+#input-meta .l {
+  display: flex;
+  gap: 12px;
+}
+.cache-usage {
+  white-space: nowrap;
 }
 .kbd {
   background: var(--bg3);

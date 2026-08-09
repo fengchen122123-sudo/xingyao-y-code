@@ -30,6 +30,21 @@ import {
   type ToolExecutionResult,
 } from '../utils/toolTrace';
 
+const emptyTokenUsage = (): TokenUsage => ({
+  used: 0,
+  window: 0,
+  cached_pct: 0,
+  cumulative: 0,
+  cache_latest_pct: null,
+  cache_hot_pct: null,
+  cache_session_pct: null,
+  cache_available: false,
+  cache_hot_turns: 0,
+  cache_invalidation_reason: '',
+  prompt_tokens: 0,
+  cached_tokens: 0,
+});
+
 export interface ChatMessage {
   id?: string;
   role: 'user' | 'assistant' | 'tool';
@@ -190,7 +205,7 @@ export const useAppStore = defineStore('app', {
     // 计划、后台任务、Token 用量
     planData: { title: '', items: [], progress: 0 } as PlanData,
     backgroundTasks: [] as BackgroundTask[],
-    tokenUsage: { used: 0, window: 0, cached_pct: 0, cumulative: 0 } as TokenUsage,
+    tokenUsage: emptyTokenUsage(),
 
     // Toast（支持可选的操作按钮，例如"打开所在文件夹"）
     toast: {
@@ -391,7 +406,7 @@ export const useAppStore = defineStore('app', {
         document.body.classList.toggle('light', this.themeLight);
         api.set_titlebar_theme(!this.themeLight)?.catch(() => {});
         this.fileTree = (init as any).file_tree || [];
-        this.tokenUsage = init.token_usage || { used: 0, window: 0, cached_pct: 0, cumulative: 0 };
+        this.tokenUsage = init.token_usage || emptyTokenUsage();
         this.version = init.version || '';
         this.connected = true;
       } catch (err) {
@@ -895,10 +910,18 @@ export const useAppStore = defineStore('app', {
         this.currentThinkingText = '';
       } else if (type === 'token_usage') {
         this.tokenUsage = {
-          used: data.used || 0,
-          window: data.window || 0,
-          cached_pct: data.cached_pct || 0,
-          cumulative: data.cumulative || 0,
+          used: Number(data.used ?? 0),
+          window: Number(data.window ?? 0),
+          cached_pct: Number(data.cached_pct ?? 0),
+          cumulative: Number(data.cumulative ?? 0),
+          cache_latest_pct: data.cache_latest_pct ?? null,
+          cache_hot_pct: data.cache_hot_pct ?? null,
+          cache_session_pct: data.cache_session_pct ?? null,
+          cache_available: Boolean(data.cache_available),
+          cache_hot_turns: Number(data.cache_hot_turns ?? 0),
+          cache_invalidation_reason: String(data.cache_invalidation_reason ?? ''),
+          prompt_tokens: Number(data.prompt_tokens ?? 0),
+          cached_tokens: Number(data.cached_tokens ?? 0),
         };
       } else if (type === 'mcp_status') {
         if (data.mcps) this.mcps = data.mcps;
