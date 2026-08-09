@@ -1635,6 +1635,123 @@ def test_stream_turn_persists_one_request_shape_diagnostic(mocker):
     assert usage is final_usage
 
 
+def test_vision_canonical_user_content_is_persisted_before_provider_request(
+    mocker, monkeypatch
+):
+    import core.app_context as app_context
+    import core.llm as llm_mod
+
+    original = [
+        {"type": "text", "text": "请分析"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    canonical = "请分析\n\n[图片分析结果]\n这是界面截图"
+    cas_calls = []
+    provider_messages = []
+
+    class FakeManager:
+        def replace_latest_user_message_content(self, session, expected, replacement):
+            cas_calls.append((session, expected, replacement))
+            return True
+
+        def add_messages(self, session, messages):
+            return None
+
+        def add_cache_request_diagnostic(self, diagnostic):
+            return None
+
+    class FakeStream:
+        chunks = [SimpleNamespace(usage=SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=10,
+            total_tokens=110,
+            prompt_cache_hit_tokens=0,
+            prompt_cache_miss_tokens=100,
+            prompt_tokens_details=None,
+        ))]
+
+        def __iter__(self):
+            return iter([_chunk("完成")])
+
+    def describe(messages, *args, **kwargs):
+        messages[-1]["content"] = canonical
+
+    def complete(**kwargs):
+        provider_messages.append(kwargs["messages"])
+        return FakeStream()
+
+    monkeypatch.setattr(app_context, "get_manager", lambda: FakeManager())
+    mocker.patch("core.llm._describe_images_with_secondary", side_effect=describe)
+    mocker.patch("core.llm.completion", side_effect=complete)
+
+    events = list(chat_with_model_events(
+        "openai/text-model",
+        "fake-key",
+        [{"role": "user", "content": original}],
+        "https://vision-cas.example/v1",
+        persist=True,
+        parent_session="vision-cas-session",
+        turn_id="vision-cas-turn",
+        consume_background_notifications=False,
+        cache_session_id="vision-cas-session",
+    ))
+
+    assert events[-1].kind == "turn_finished"
+    assert cas_calls == [("vision-cas-session", original, canonical)]
+    sent_user = next(m for m in provider_messages[0] if m["role"] == "user")
+    assert sent_user["content"] == canonical
+
+
+def test_nonpersistent_vision_turn_does_not_replace_database_content(
+    mocker, monkeypatch
+):
+    import core.app_context as app_context
+
+    cas_calls = []
+
+    class FakeManager:
+        def replace_latest_user_message_content(self, *args):
+            cas_calls.append(args)
+            return True
+
+        def add_cache_request_diagnostic(self, diagnostic):
+            return None
+
+    class FakeStream:
+        chunks = [SimpleNamespace(usage=SimpleNamespace(
+            prompt_tokens=100,
+            completion_tokens=10,
+            total_tokens=110,
+            prompt_cache_hit_tokens=0,
+            prompt_cache_miss_tokens=100,
+            prompt_tokens_details=None,
+        ))]
+
+        def __iter__(self):
+            return iter([_chunk("完成")])
+
+    def describe(messages, *args, **kwargs):
+        messages[-1]["content"] = "canonical"
+
+    monkeypatch.setattr(app_context, "get_manager", lambda: FakeManager())
+    mocker.patch("core.llm._describe_images_with_secondary", side_effect=describe)
+    mocker.patch("core.llm.completion", return_value=FakeStream())
+
+    events = list(chat_with_model_events(
+        "openai/text-model",
+        "fake-key",
+        [{"role": "user", "content": "original"}],
+        "https://vision-cas.example/v1",
+        persist=False,
+        turn_id="vision-no-persist-turn",
+        consume_background_notifications=False,
+        cache_session_id="vision-no-persist-session",
+    ))
+
+    assert events[-1].kind == "turn_finished"
+    assert cas_calls == []
+
+
 # ── DeepSeek thinking：带 tool_calls 的 assistant 必须回传 reasoning_content key ──
 
 
