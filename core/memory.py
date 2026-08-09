@@ -624,6 +624,7 @@ class MemoryManager:
         同时重置记忆摘要与压缩游标，避免清空后仍向大模型注入旧摘要。
         返回被删除的消息条数；会话不存在时返回 0。
         """
+        deleted = 0
         with self._lock:
             cursor = self.conn.cursor()
             try:
@@ -642,10 +643,12 @@ class MemoryManager:
                     WHERE id = ?
                 ''', (now, session_id))
                 self.conn.commit()
-                return deleted
             except Exception:
                 self.conn.rollback()
                 raise
+        from core.llm import clear_cache_usage_session
+        clear_cache_usage_session(session_name)
+        return deleted
 
     def create_session_explicit(self, session_name, workdir=None, source="GUI"):
         """明确指定 workdir（如 'GLOBAL' 或具体路径）创建一个会话记录。"""
@@ -854,6 +857,7 @@ class MemoryManager:
 
     def delete_session(self, session_name):
         """删除指定会话及其所有消息"""
+        deleted = False
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
@@ -864,20 +868,29 @@ class MemoryManager:
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
                     cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
                     self.conn.commit()
+                    deleted = True
                 except Exception:
                     self.conn.rollback()
                     raise
+        if deleted:
+            from core.llm import clear_cache_usage_session
+            clear_cache_usage_session(session_name)
 
     def delete_sessions_by_workdir(self, workdir):
         """删除指定工作目录下的所有历史会话及其消息记录（仅删除 DB 记录）"""
         workdir_norm = _normalize_workdir(workdir)
+        deleted_names = []
         with self._lock:
             cursor = self.conn.cursor()
             try:
-                cursor.execute('SELECT id FROM sessions WHERE workdir = ?', (workdir_norm,))
+                cursor.execute(
+                    'SELECT id, session_name FROM sessions WHERE workdir = ?',
+                    (workdir_norm,),
+                )
                 rows = cursor.fetchall()
                 for r in rows:
                     sid = r[0]
+                    deleted_names.append(r[1])
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (sid,))
                 cursor.execute('DELETE FROM sessions WHERE workdir = ?', (workdir_norm,))
                 cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (workdir_norm,))
@@ -885,6 +898,10 @@ class MemoryManager:
             except Exception:
                 self.conn.rollback()
                 raise
+        if deleted_names:
+            from core.llm import clear_cache_usage_session
+            for session_name in deleted_names:
+                clear_cache_usage_session(session_name)
 
     def add_workspace(self, workdir):
         if not workdir or workdir == "GLOBAL":
@@ -927,6 +944,7 @@ class MemoryManager:
         # 空名字/纯空白名字无意义，直接拒绝，避免产生空 session_name
         if not isinstance(new_name, str) or not new_name.strip():
             return False, old_name
+        result = (False, old_name)
         with self._lock:
             cursor = self.conn.cursor()
 
@@ -953,11 +971,14 @@ class MemoryManager:
             try:
                 cursor.execute('UPDATE sessions SET session_name = ? WHERE id = ?', (final_name, session_id))
                 self.conn.commit()
-                return True, final_name
+                result = (True, final_name)
             except Exception:
                 # 回滚半残更新，避免被下一次 commit 幽灵提交
                 self.conn.rollback()
                 return False, old_name
+        from core.llm import rename_cache_usage_session
+        rename_cache_usage_session(old_name, final_name)
+        return result
 
     def prune_history_files(self, session_name, max_turns=16, retain_recent=4):
         """物理级折叠历史挂载的大文件，以节省 token。"""

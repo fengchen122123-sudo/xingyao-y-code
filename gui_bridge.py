@@ -892,7 +892,11 @@ class ApiBridge:
         try:
             target = session_name or self._current_session
             deleted = self._memory.clear_session_messages(target)
-            self._recalc_token_usage(target)
+            from core.llm import session_token_usage, token_usage_lock
+            with token_usage_lock:
+                session_token_usage["latest_total"] = 0
+                session_token_usage["latest_prompt"] = 0
+                session_token_usage["latest_cached"] = 0
             self._emit_token_usage()
             return {"ok": True, "deleted": int(deleted), "msg": f"已清空 {deleted} 条历史记录"}
         except Exception as e:
@@ -1523,25 +1527,58 @@ class ApiBridge:
     # ------------------------------------------------------------------
     def get_token_usage(self) -> Dict[str, Any]:
         try:
-            from core.llm import session_token_usage, token_usage_lock
-            with token_usage_lock:
-                latest_prompt = int(session_token_usage.get("latest_prompt", 0) or 0)
-                latest_total = int(session_token_usage.get("latest_total", 0) or 0)
-                cumulative = int(session_token_usage.get("cumulative_total", 0) or 0)
-                cum_cached = int(session_token_usage.get("cumulative_cached", 0) or 0)
+            from core.llm import get_token_usage_snapshot
             active = get_active_model() or {}
+            snapshot = get_token_usage_snapshot(
+                self._current_session,
+                active.get("litellm_model", ""),
+                active.get("base_url", ""),
+                "main",
+            )
+            window_usage = snapshot["window"]
+            process_usage = snapshot["process"]
+            cache_usage = snapshot["cache"]
+            latest_prompt = int(window_usage.get("latest_prompt", 0) or 0)
+            latest_total = int(window_usage.get("latest_total", 0) or 0)
+            cumulative = int(process_usage.get("cumulative_total", 0) or 0)
             window = int(active.get("context_window", 128000) or 128000)
-            cached_pct = round((cum_cached / cumulative * 100), 1) if cumulative > 0 else 0
+            latest_rate = cache_usage["latest"].get("rate")
+            hot_rate = cache_usage["hot"].get("rate")
+            session_rate = cache_usage["session_all"].get("rate")
+
+            def rounded(value):
+                return None if value is None else round(float(value), 1)
+
             return {
                 # 首轮请求返回前 latest_prompt 还是 0，用本地估算的 latest_total 兜底
                 "used": latest_prompt or latest_total,
                 "window": window,
-                "cached_pct": cached_pct,
+                "cached_pct": rounded(session_rate) or 0.0,
                 "cumulative": cumulative,
+                "cache_latest_pct": rounded(latest_rate),
+                "cache_hot_pct": rounded(hot_rate),
+                "cache_session_pct": rounded(session_rate),
+                "cache_available": bool(cache_usage.get("available", False)),
+                "cache_hot_turns": int(cache_usage.get("hot_turns", 0) or 0),
+                "cache_invalidation_reason": str(
+                    cache_usage.get("invalidation_reason", "") or ""
+                ),
+                "prompt_tokens": int(
+                    cache_usage["session_all"].get("prompt_tokens", 0) or 0
+                ),
+                "cached_tokens": int(
+                    cache_usage["session_all"].get("cached_tokens", 0) or 0
+                ),
             }
         except Exception:
             logger.debug("get_token_usage 失败", exc_info=True)
-            return {"used": 0, "window": 0, "cached_pct": 0, "cumulative": 0}
+            return {
+                "used": 0, "window": 0, "cached_pct": 0.0, "cumulative": 0,
+                "cache_latest_pct": None, "cache_hot_pct": None,
+                "cache_session_pct": None, "cache_available": False,
+                "cache_hot_turns": 0, "cache_invalidation_reason": "",
+                "prompt_tokens": 0, "cached_tokens": 0,
+            }
 
     def _emit_token_usage(self):
         try:

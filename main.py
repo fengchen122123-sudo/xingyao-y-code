@@ -99,7 +99,12 @@ from core.memory import MemoryManager
 # 不在顶部 import，延迟到首次渲染历史/回答时在函数内加载。
 from core.paste_placeholders import PastedTextStore, normalize_pasted_text
 import core.agent_service as _agent_service
-from core.llm import chat_with_model_events, session_token_usage, token_usage_lock
+from core.llm import (
+    chat_with_model_events,
+    get_token_usage_snapshot,
+    session_token_usage,
+    token_usage_lock,
+)
 from core.permission_broker import PermissionRequest, permission_broker
 from core.tool_progress import ActiveToolStatus
 from core.turn_controller import TurnController
@@ -361,21 +366,30 @@ def _render_usage_section(manager, label, start_s, end_s):
         "  " + _pad_right("模型", name_w)
         + " " + _pad_left("输入", 14)
         + " " + _pad_left("输出", 14)
+        + " " + _pad_left("缓存输入", 14)
         + " " + _pad_left("缓存命中", 14)
         + " " + _pad_left("命中率", 10)
         + " " + _pad_left("合计", 14)
     )
     print_formatted_text(HTML(f"<ansigray>{_header}</ansigray>"))
     for r in rows:
-        _rate = f"{(r['cached'] / r['prompt'] * 100) if r['prompt'] else 0.0:.1f}%"
+        _cache_prompt = int(r.get("cache_prompt", 0) or 0)
+        _rate = _format_cache_hit_rate(r["cached"], _cache_prompt)
         print_formatted_text(HTML(
-            f"  {_pad_right(_esc(r['model']), name_w)} {r['prompt']:>14} {r['completion']:>14} {r['cached']:>14} {_rate:>10} {r['total']:>14}"
+            f"  {_pad_right(_esc(r['model']), name_w)} {r['prompt']:>14} "
+            f"{r['completion']:>14} {_cache_prompt:>14} {r['cached']:>14} "
+            f"{_rate:>10} {r['total']:>14}"
         ))
     if len(rows) > 1:
-        sub = {k: sum(r[k] for r in rows) for k in ("prompt", "completion", "cached", "total")}
-        _sub_rate = f"{(sub['cached'] / sub['prompt'] * 100) if sub['prompt'] else 0.0:.1f}%"
+        sub = {
+            k: sum(int(r.get(k, 0) or 0) for r in rows)
+            for k in ("prompt", "completion", "cached", "cache_prompt", "total")
+        }
+        _sub_rate = _format_cache_hit_rate(sub["cached"], sub["cache_prompt"])
         print_formatted_text(HTML(
-            f"  <ansicyan>{_pad_right('小计', name_w)} {sub['prompt']:>14} {sub['completion']:>14} {sub['cached']:>14} {_sub_rate:>10} {sub['total']:>14}</ansicyan>"
+            f"  <ansicyan>{_pad_right('小计', name_w)} {sub['prompt']:>14} "
+            f"{sub['completion']:>14} {sub['cache_prompt']:>14} {sub['cached']:>14} "
+            f"{_sub_rate:>10} {sub['total']:>14}</ansicyan>"
         ))
     inv = manager.query_cache_invalidation_events(start_s, end_s)
     if inv["count"]:
@@ -386,8 +400,18 @@ def _render_usage_section(manager, label, start_s, end_s):
     return True
 
 
+def _format_cache_hit_rate(cached_tokens, cache_prompt_tokens):
+    """历史聚合只用已报告缓存明细的输入 token 作为分母。"""
+    if cache_prompt_tokens <= 0:
+        return "--"
+    return f"{cached_tokens / cache_prompt_tokens * 100:.1f}%"
+
+
 def _format_token_usage_summary(
-    cumulative_prompt, cumulative_completion, cumulative_cached
+    cumulative_prompt,
+    cumulative_completion,
+    cumulative_cached,
+    cumulative_cache_prompt,
 ):
     """格式化状态栏累计 Token，并用同口径数据计算缓存命中率。"""
     def format_num(num):
@@ -398,14 +422,28 @@ def _format_token_usage_summary(
         return str(num)
 
     hit_rate = (
-        cumulative_cached / cumulative_prompt * 100
-        if cumulative_prompt > 0
-        else 0.0
+        f"{cumulative_cached / cumulative_cache_prompt * 100:.0f}%"
+        if cumulative_cache_prompt > 0
+        else "--"
     )
     return (
-        f"输入 {format_num(cumulative_prompt)} · "
+        f"本进程 输入 {format_num(cumulative_prompt)} · "
         f"输出 {format_num(cumulative_completion)} · "
-        f"命中 {format_num(cumulative_cached)} · 命中率 {hit_rate:.0f}%"
+        f"缓存输入 {format_num(cumulative_cache_prompt)} · "
+        f"命中 {format_num(cumulative_cached)} · 命中率 {hit_rate}"
+    )
+
+
+def _format_cache_usage_summary(cache):
+    """格式化本轮、热路径和当前会话全量三个不可混用的缓存口径。"""
+    def rate_text(section):
+        rate = (cache.get(section) or {}).get("rate")
+        return "--" if rate is None else f"{float(rate):.1f}%"
+
+    return (
+        f"本轮 {rate_text('latest')} · "
+        f"热路径 {rate_text('hot')} · "
+        f"会话全量 {rate_text('session_all')}"
     )
 
 
@@ -2670,12 +2708,13 @@ def _make_input_app():
         # 1. 提取短模型名（使用内存缓存，避免每次渲染都读盘解析 config.json）
         model_display = current_model_name or "未激活模型"
 
-        # 2. 计算 Token 消耗与缓存命中（分离概念）；与 worker 并发读写，必须持锁
-        with token_usage_lock:
-            cum_prompt = session_token_usage.get("cumulative_prompt", 0)
-            cum_completion = session_token_usage.get("cumulative_completion", 0)
-            cum_cached = session_token_usage.get("cumulative_cached", 0)
-            latest_total = session_token_usage["latest_total"]
+        # 2. 读取统一快照：计费累计与当前会话缓存遥测保持不同口径。
+        usage_snapshot = get_token_usage_snapshot(
+            current_session, current_model, current_url, "main"
+        )
+        process_usage = usage_snapshot["process"]
+        cache_usage = usage_snapshot["cache"]
+        latest_total = usage_snapshot["window"]["latest_total"]
         max_win = current_ctx_win
 
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
@@ -2693,8 +2732,13 @@ def _make_input_app():
         max_win_str = format_num(max_win)
 
         token_info = _format_token_usage_summary(
-            cum_prompt, cum_completion, cum_cached
-        ) + f" · 上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
+            process_usage["cumulative_prompt"],
+            process_usage["cumulative_completion"],
+            process_usage["cumulative_cached"],
+            process_usage["cumulative_cache_prompt"],
+        )
+        token_info += " · " + _format_cache_usage_summary(cache_usage)
+        token_info += f" · 上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
         from core.cache_keepalive import cache_keepalive_service
         keepalive_status = cache_keepalive_service.status()
         if keepalive_status["enabled"]:
