@@ -62,6 +62,23 @@ def test_load_config_file_not_found_creates_default(tmp_path, monkeypatch):
     assert cfg.exists(), "默认配置应被持久化到磁盘"
 
 
+def test_default_deepseek_v4_models_use_explicit_thinking_contract(
+    tmp_path, monkeypatch
+):
+    _use_tmp_config(tmp_path, monkeypatch)
+
+    data = model_manager.load_config()
+    deepseek_models = next(
+        provider["models"]
+        for provider in data["providers"]
+        if provider["base_url"] == "https://api.deepseek.com"
+    )
+
+    assert deepseek_models
+    assert all(model["enable_thinking"] is True for model in deepseek_models)
+    assert all(model["reasoning_effort"] == "max" for model in deepseek_models)
+
+
 def test_corrupt_config_is_restored_from_backup(tmp_path, monkeypatch):
     """主配置写坏时优先从 .bak 恢复（含 API Key），而不是静默重置为默认"""
     cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())

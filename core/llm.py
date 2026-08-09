@@ -1581,8 +1581,10 @@ def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
 
 def _supports_cache_keepalive(model_name, api_base=""):
     """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi 路由。"""
-    identity = f"{model_name or ''} {api_base or ''}".lower()
-    return _is_kimi_family(model_name, api_base) or "deepseek" in identity
+    return _is_kimi_family(model_name, api_base) or (
+        _is_deepseek_family(model_name, api_base)
+        and _is_official_deepseek_route(api_base)
+    )
 
 
 def _supports_reasoning_fields(model_name, api_base=""):
