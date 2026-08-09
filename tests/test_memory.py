@@ -285,3 +285,29 @@ def test_top_level_user_addition_runs_history_maintenance_at_ingestion(monkeypat
     ])
 
     assert calls == [(('ingestion-maintenance',), {"max_turns": 16, "retain_recent": 4})]
+
+
+def test_replace_latest_user_content_is_compare_and_swap():
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(":memory:")
+    session = "vision-canonical-cas"
+    original = [
+        {"type": "text", "text": "分析图片"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+    manager.add_message(session, "user", original)
+
+    assert manager.replace_latest_user_message_content(
+        session, original, "分析图片\n\n[图片分析结果]\n界面截图"
+    ) is True
+    assert manager.get_history(session)[-1]["content"] == (
+        "分析图片\n\n[图片分析结果]\n界面截图"
+    )
+
+    assert manager.replace_latest_user_message_content(
+        session, original, "不应覆盖"
+    ) is False
+    assert manager.get_history(session)[-1]["content"] == (
+        "分析图片\n\n[图片分析结果]\n界面截图"
+    )
