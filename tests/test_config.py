@@ -75,6 +75,12 @@ def test_default_deepseek_v4_models_use_explicit_thinking_contract(
     )
 
     assert deepseek_models
+    deepseek_provider = next(
+        provider for provider in data["providers"]
+        if provider["base_url"] == "https://api.deepseek.com"
+    )
+    assert deepseek_provider["protocol"] == "responses"
+    assert deepseek_provider["preset_id"] == "deepseek"
     assert all(model["enable_thinking"] is True for model in deepseek_models)
     assert all(model["reasoning_effort"] == "max" for model in deepseek_models)
 
@@ -211,3 +217,94 @@ def test_set_model_reasoning_effort_rejects_invalid(tmp_path, monkeypatch):
 
     on_disk = json.loads(cfg.read_text(encoding="utf-8"))
     assert "reasoning_effort" not in on_disk["providers"][0]["models"][0]
+
+
+def test_provider_protocol_must_be_registered(tmp_path, monkeypatch):
+    _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    try:
+        model_manager.add_provider("Bad", "https://bad.example", "key", "made-up")
+    except ValueError as exc:
+        assert "made-up" in str(exc)
+    else:
+        raise AssertionError("未注册协议必须立即失败")
+
+
+def test_add_preset_provider_uses_shared_catalog_metadata(tmp_path, monkeypatch):
+    cfg = _use_tmp_config(tmp_path, monkeypatch, {"providers": [], "active_model_id": None})
+
+    pid = model_manager.add_preset_provider("deepseek", "sk-deepseek")
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    provider = next(item for item in data["providers"] if item["id"] == pid)
+    assert provider["preset_id"] == "deepseek"
+    assert provider["protocol"] == "responses"
+    assert provider["api_key"] == "sk-deepseek"
+    assert provider["models"][0]["litellm_model"] == "openai/deepseek-v4-pro"
+    assert provider["models"][0]["supports_vision"] is False
+
+
+def test_update_provider_rewrites_model_route_and_preserves_blank_key(tmp_path, monkeypatch):
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    model_manager.update_provider(
+        "p1",
+        name="新厂商",
+        base_url="https://responses.example.com",
+        api_key="",
+        protocol="responses",
+    )
+
+    provider = json.loads(cfg.read_text(encoding="utf-8"))["providers"][0]
+    assert provider["name"] == "新厂商"
+    assert provider["api_key"] == "sk-test-key-123"
+    assert provider["protocol"] == "responses"
+    assert provider["models"][0]["litellm_model"] == "openai/gpt-4o"
+
+
+def test_delete_last_model_preserves_provider(tmp_path, monkeypatch):
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    model_manager.delete_model("m1")
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert [provider["id"] for provider in data["providers"]] == ["p1"]
+    assert data["providers"][0]["models"] == []
+    assert data["active_model_id"] is None
+
+
+def test_delete_provider_removes_models_and_active_selection(tmp_path, monkeypatch):
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    model_manager.delete_provider("p1")
+
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["providers"] == []
+    assert data["active_model_id"] is None
+
+
+def test_update_provider_rejects_blank_name(tmp_path, monkeypatch):
+    _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    try:
+        model_manager.update_provider(
+            "p1", name="", base_url="https://api.example.com", api_key="", protocol="openai"
+        )
+    except ValueError as exc:
+        assert "名称" in str(exc)
+    else:
+        raise AssertionError("空厂商名称必须立即失败")
+
+
+def test_update_model_rejects_invalid_public_fields(tmp_path, monkeypatch):
+    _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    for name, context_window in (("", 128000), ("model", 0)):
+        try:
+            model_manager.update_model(
+                "p1", "m1", name=name, context_window=context_window, supports_vision=False
+            )
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("无效模型公开字段必须立即失败")

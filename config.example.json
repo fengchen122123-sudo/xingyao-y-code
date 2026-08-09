@@ -59,7 +59,8 @@
       "name": "深度求索",
       "base_url": "https://api.deepseek.com",
       "api_key": "sk-your-deepseek-api-key-here",
-      "protocol": "openai",
+      "protocol": "responses",
+      "preset_id": "deepseek",
       "models": [
         {
           "id": "deepseek_v4_pro",
