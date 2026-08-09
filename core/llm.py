@@ -596,6 +596,7 @@ session_token_usage = {
     "cumulative_prompt": 0,
     "cumulative_completion": 0,
     "cumulative_cached": 0,
+    "cumulative_cache_prompt": 0,
     
     # 窗口占用（用来防止爆 128k 上下文）
     "latest_total": 0,
@@ -1034,6 +1035,84 @@ def _extract_cached_tokens(usage):
     """兼容旧调用方：读取缓存命中 token；未报告时返回 0。"""
     record = _normalize_server_usage(usage)
     return int(record["cached_tokens"] or 0)
+
+
+def _account_server_usage(
+    usage,
+    *,
+    model_name,
+    api_base,
+    session_id,
+    cache_scope,
+    invalidation_reason,
+):
+    """校验并一次性记账最终 usage；无效记录绝不进入正式统计。"""
+    record = _normalize_server_usage(usage)
+    if not record["valid"]:
+        reason = "usage 不一致: " + "; ".join(record["errors"])
+        if str(cache_scope or "main") == "main":
+            _mark_cache_usage_unavailable(
+                session_id, model_name, api_base, cache_scope, reason
+            )
+        logger.warning(
+            "拒绝 token 记账 model=%s api_base=%s session=%s scope=%s errors=%s raw=%r",
+            model_name,
+            api_base,
+            session_id,
+            cache_scope,
+            record["errors"],
+            usage,
+        )
+        return None
+
+    prompt_tokens = record["prompt_tokens"]
+    completion_tokens = record["completion_tokens"]
+    total_tokens = record["total_tokens"]
+    cached_tokens = record["cached_tokens"]
+    cache_reported = record["cache_reported"]
+    main_scope = str(cache_scope or "main") == "main"
+
+    with token_usage_lock:
+        session_token_usage["cumulative_total"] += total_tokens
+        session_token_usage["cumulative_prompt"] += prompt_tokens
+        session_token_usage["cumulative_completion"] += completion_tokens
+        if cache_reported:
+            session_token_usage["cumulative_cached"] += cached_tokens
+            session_token_usage["cumulative_cache_prompt"] += prompt_tokens
+        if main_scope:
+            session_token_usage["latest_total"] = total_tokens
+            session_token_usage["latest_prompt"] = prompt_tokens
+            session_token_usage["latest_cached"] = cached_tokens or 0
+
+    if main_scope:
+        if cache_reported:
+            _record_cache_usage(
+                session_id,
+                cache_scope,
+                prompt_tokens,
+                cached_tokens,
+                invalidation_reason,
+                model_name,
+                api_base,
+            )
+        else:
+            _mark_cache_usage_unavailable(
+                session_id,
+                model_name,
+                api_base,
+                cache_scope,
+                "服务端未报告缓存 token 明细",
+            )
+
+    _persist_token_usage(
+        model_name,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        cached_tokens=cached_tokens,
+        total_tokens=total_tokens,
+        session_id=session_id,
+    )
+    return record
 
 # The registry is the canonical capability metadata source.
 from core.tool_registry import build_default_registry
@@ -3515,38 +3594,15 @@ def _chat_with_model_generator(
             if cache_scope == "main" and keepalive_interval:
                 cache_keepalive_service.register_request(kwargs, interval=keepalive_interval)
 
-            # 流结束：按最终 usage chunk 统一记账一次（读写均走锁）
+            # 流结束：按最终 usage chunk 严格校验并统一记账一次。
             if stream_usage is not None:
-                latest_cached = _extract_cached_tokens(stream_usage)
-                prompt_tokens = getattr(stream_usage, "prompt_tokens", 0) or 0
-                _record_cache_usage(
-                    telemetry_session_id,
-                    cache_scope,
-                    prompt_tokens,
-                    latest_cached,
-                    request_cache_reason,
-                )
-                with token_usage_lock:
-                    session_token_usage["latest_total"] = getattr(stream_usage, "total_tokens", 0) or 0
-                    session_token_usage["latest_prompt"] = prompt_tokens
-                    # completion = total - prompt（多数 provider 不直接给 completion_tokens）
-                    session_token_usage["latest_cached"] = latest_cached
-                    session_token_usage["cumulative_total"] += session_token_usage["latest_total"]
-                    session_token_usage["cumulative_prompt"] += session_token_usage["latest_prompt"]
-                    session_token_usage["cumulative_completion"] += max(
-                        0, session_token_usage["latest_total"] - session_token_usage["latest_prompt"]
-                    )
-                    session_token_usage["cumulative_cached"] += latest_cached
-
-                # 持久化本轮真实用量（按模型分桶），供 /usage 统计今日/7天/30天
-                _total_tokens = getattr(stream_usage, "total_tokens", 0) or 0
-                _persist_token_usage(
-                    model_name,
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=max(0, _total_tokens - prompt_tokens),
-                    cached_tokens=latest_cached,
-                    total_tokens=_total_tokens,
+                _account_server_usage(
+                    stream_usage,
+                    model_name=model_name,
+                    api_base=api_base,
                     session_id=telemetry_session_id,
+                    cache_scope=cache_scope,
+                    invalidation_reason=request_cache_reason,
                 )
 
             reasoning_content, public_content = split_reasoning_text(accumulated_content)
