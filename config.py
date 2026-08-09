@@ -79,8 +79,11 @@ def _read_json_with_backup(path, default=None):
         except Exception:
             return default
 
-# 获取用户目录下的 .ycode 文件夹
-YCODE_DIR = os.path.join(os.path.expanduser("~"), ".ycode")
+# 获取用户目录下的 .ycode 文件夹。测试/隔离运行可在进程启动前显式覆盖，
+# 默认生产路径保持不变。
+YCODE_DIR = os.environ.get("YCODE_DATA_DIR") or os.path.join(
+    os.path.expanduser("~"), ".ycode"
+)
 os.makedirs(YCODE_DIR, exist_ok=True)
 
 # 集中定义所有持久化文件路径

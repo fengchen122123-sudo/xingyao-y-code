@@ -1,13 +1,53 @@
 import datetime
+import hashlib
 import json
 import logging
 import os
 import re
 import sqlite3
 import threading
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
 import pathlib
+
+
+def _canonicalize_api_base(value):
+    """规范 endpoint 身份并移除 userinfo/query/fragment，避免分桶漂移或泄密。"""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    digest = lambda data: hashlib.sha256(
+        str(data).encode("utf-8")
+    ).hexdigest()[:16]
+    try:
+        parsed = urlsplit(text)
+        scheme = str(parsed.scheme or "").lower()
+        host = str(parsed.hostname or "").lower()
+        if not scheme or not host:
+            return f"invalid-endpoint#{digest(text)}"
+        port = parsed.port
+        if ":" in host and not host.startswith("["):
+            host = f"[{host}]"
+        default_port = (scheme == "https" and port == 443) or (
+            scheme == "http" and port == 80
+        )
+        netloc = host if port is None or default_port else f"{host}:{port}"
+        path = str(parsed.path or "").rstrip("/")
+        identity = urlunsplit((scheme, netloc, path, "", ""))
+        if parsed.username is not None or parsed.password is not None:
+            identity += "|auth~" + digest(
+                f"{parsed.username or ''}:{parsed.password or ''}"
+            )
+        if parsed.query:
+            normalized_query = urlencode(
+                sorted(parse_qsl(parsed.query, keep_blank_values=True)),
+                doseq=True,
+            )
+            identity += "|query~" + digest(normalized_query)
+        return identity
+    except Exception:
+        return f"invalid-endpoint#{digest(text)}"
 
 def _normalize_workdir(path):
     """规范化工作目录路径（真实磁盘物理大小写），用于会话归属目录比较。"""
@@ -349,11 +389,29 @@ class MemoryManager:
                         completion_tokens INTEGER,
                         cached_tokens INTEGER,
                         total_tokens INTEGER,
-                        session_id TEXT
+                        session_id TEXT,
+                        api_base TEXT NOT NULL DEFAULT '',
+                        cache_scope TEXT NOT NULL DEFAULT 'legacy'
                     )
                 ''')
+                cursor.execute("PRAGMA table_info(token_usage)")
+                token_usage_columns = {col[1] for col in cursor.fetchall()}
+                if "api_base" not in token_usage_columns:
+                    cursor.execute(
+                        "ALTER TABLE token_usage "
+                        "ADD COLUMN api_base TEXT NOT NULL DEFAULT ''"
+                    )
+                if "cache_scope" not in token_usage_columns:
+                    cursor.execute(
+                        "ALTER TABLE token_usage "
+                        "ADD COLUMN cache_scope TEXT NOT NULL DEFAULT 'legacy'"
+                    )
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(date)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_token_usage_route "
+                    "ON token_usage(model, api_base, cache_scope, date)"
                 )
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS cache_request_diagnostics (
@@ -412,7 +470,8 @@ class MemoryManager:
                     pass
 
     def add_token_usage(self, provider, model, prompt_tokens, completion_tokens,
-                        cached_tokens, total_tokens, session_id=None, ts=None):
+                        cached_tokens, total_tokens, session_id=None, ts=None,
+                        api_base="", cache_scope="legacy"):
         """追加一条真实 token 用量记录（由 core/llm.py 流结束记账点调用）。"""
         import time
         if ts is None:
@@ -422,13 +481,16 @@ class MemoryManager:
             self.conn.execute(
                 "INSERT INTO token_usage "
                 "(ts, date, provider, model, prompt_tokens, completion_tokens, "
-                "cached_tokens, total_tokens, session_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                "cached_tokens, total_tokens, session_id, api_base, cache_scope) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     int(ts), day, str(provider or ""), str(model or ""),
                     int(prompt_tokens or 0), int(completion_tokens or 0),
                     None if cached_tokens is None else int(cached_tokens),
                     int(total_tokens or 0),
                     str(session_id) if session_id is not None else None,
+                    _canonicalize_api_base(api_base),
+                    str(cache_scope or "legacy"),
                 ),
             )
             self.conn.commit()
@@ -436,13 +498,16 @@ class MemoryManager:
     def get_last_token_usage(self, session_id):
         """查询指定会话最近一次真实 token 用量，无记录返回 None。
 
-        供窗口占用显示与压缩触发判断使用真实基线（下一轮请求的 prompt
-        必然包含上一轮的 prompt + completion），避免本地估算。
+        供窗口占用显示与压缩触发判断使用主链路真实基线（下一轮请求的
+        prompt 必然包含上一轮的 prompt + completion），避免保活/子代理的
+        独立上下文覆盖主会话基线。legacy 用于兼容迁移前记录。
         """
         with self._lock:
             cursor = self.conn.execute(
                 "SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens "
-                "FROM token_usage WHERE session_id = ? ORDER BY id DESC LIMIT 1",
+                "FROM token_usage WHERE session_id = ? "
+                "AND cache_scope IN ('main', 'legacy') "
+                "ORDER BY id DESC LIMIT 1",
                 (str(session_id),),
             )
             row = cursor.fetchone()
@@ -465,14 +530,14 @@ class MemoryManager:
         with self._lock:
             cursor = self.conn.execute(
                 """
-                SELECT provider, model,
+                SELECT provider, model, api_base, cache_scope,
                        SUM(prompt_tokens), SUM(completion_tokens),
                        SUM(cached_tokens),
                        SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
                        SUM(total_tokens)
                 FROM token_usage
                 WHERE date >= ? AND date <= ?
-                GROUP BY provider, model
+                GROUP BY provider, model, api_base, cache_scope
                 ORDER BY SUM(total_tokens) DESC
                 """,
                 (str(start_date), str(end_date)),
@@ -481,11 +546,13 @@ class MemoryManager:
                 {
                     "provider": row[0] or "",
                     "model": row[1] or "",
-                    "prompt": row[2] or 0,
-                    "completion": row[3] or 0,
-                    "cached": row[4] or 0,
-                    "cache_prompt": row[5] or 0,
-                    "total": row[6] or 0,
+                    "api_base": row[2] or "",
+                    "cache_scope": row[3] or "legacy",
+                    "prompt": row[4] or 0,
+                    "completion": row[5] or 0,
+                    "cached": row[6] or 0,
+                    "cache_prompt": row[7] or 0,
+                    "total": row[8] or 0,
                 }
                 for row in cursor.fetchall()
             ]
@@ -538,7 +605,7 @@ class MemoryManager:
                 raise
 
     def query_cache_request_diagnostics(
-        self, start_ts=None, end_ts=None, session_id=None
+        self, start_ts=None, end_ts=None, session_id=None, cache_scope=None
     ):
         """按时间/会话读取诊断行；NULL 与真实 0 保持原样。"""
         clauses = []
@@ -552,6 +619,9 @@ class MemoryManager:
         if session_id is not None:
             clauses.append("session_id = ?")
             params.append(str(session_id))
+        if cache_scope is not None:
+            clauses.append("cache_scope = ?")
+            params.append(str(cache_scope))
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         columns = (
             "id", "ts", "session_id", "model", "api_base", "cache_scope",
@@ -583,6 +653,7 @@ class MemoryManager:
         min_prompt_tokens=20000,
         max_hit_ratio=0.5,
         idle_seconds=120,
+        cache_scope=None,
     ):
         """基于已持久化证据分类低命中事件，不猜测未证明的 provider 原因。"""
         import time
@@ -592,7 +663,9 @@ class MemoryManager:
         end_ts = int(time.mktime(time.strptime(
             str(end_date) + " 23:59:59", "%Y-%m-%d %H:%M:%S"
         )))
-        rows = self.query_cache_request_diagnostics(start_ts, end_ts)
+        rows = self.query_cache_request_diagnostics(
+            start_ts, end_ts, cache_scope=cache_scope
+        )
         category_names = (
             "cold_start", "identity_change", "tool_contract_change",
             "client_history_rewrite", "prompt_drop", "idle_gap",
@@ -652,7 +725,8 @@ class MemoryManager:
         }
 
     def query_cache_invalidation_events(
-        self, start_date, end_date, min_prompt_tokens=20000, max_hit_ratio=0.5
+        self, start_date, end_date, min_prompt_tokens=20000, max_hit_ratio=0.5,
+        cache_scope=None,
     ):
         """统计指定日期区间内的“缓存全失效”事件：大输入但命中率极低。
 
@@ -660,6 +734,13 @@ class MemoryManager:
         这是 provider/网关侧前缀缓存条目被驱逐的标志，客户端无法避免。
         返回 {"count": 事件数, "lost_tokens": 这些事件多消耗的输入 token}。
         """
+        scope_clause = "" if cache_scope is None else " AND cache_scope = ?"
+        params = [
+            str(start_date), str(end_date),
+            int(min_prompt_tokens), float(max_hit_ratio),
+        ]
+        if cache_scope is not None:
+            params.append(str(cache_scope))
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -668,9 +749,8 @@ class MemoryManager:
                 WHERE date >= ? AND date <= ?
                   AND prompt_tokens >= ?
                   AND cached_tokens < prompt_tokens * ?
-                """,
-                (str(start_date), str(end_date),
-                 int(min_prompt_tokens), float(max_hit_ratio)),
+                """ + scope_clause,
+                params,
             )
             row = cursor.fetchone()
         return {"count": int(row[0] or 0), "lost_tokens": int(row[1] or 0)}

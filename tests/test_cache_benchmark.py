@@ -33,6 +33,22 @@ def test_round_summary_exposes_total_hot_minimum_and_catastrophic_misses():
     assert summary["passed"] is False
 
 
+def test_round_summary_keeps_unreported_cold_as_unknown_without_guessing_zero():
+    rounds = [
+        {"prompt_tokens": 1000, "cached_tokens": None},
+        {"prompt_tokens": 1000, "cached_tokens": 990},
+        {"prompt_tokens": 1000, "cached_tokens": 995},
+    ]
+
+    summary = cache_benchmark.summarize_rounds(
+        rounds, minimum_hot_rate=99.0
+    )
+
+    assert summary["all_rate"] is None
+    assert summary["hot_rate"] == pytest.approx(99.25)
+    assert summary["passed"] is True
+
+
 @pytest.mark.parametrize(
     "rounds",
     [
@@ -49,19 +65,17 @@ def test_round_summary_rejects_invalid_provider_usage(rounds):
         cache_benchmark.summarize_rounds(rounds, minimum_hot_rate=99.0)
 
 
-def test_stable_messages_use_production_system_prefix(monkeypatch):
-    expected = {"role": "system", "content": "真实生产稳定前缀"}
-    monkeypatch.setattr(
-        cache_benchmark, "build_stable_system_message", lambda: expected
-    )
-
+def test_stable_messages_are_fixed_and_contain_no_production_context():
     messages = cache_benchmark._stable_messages()
 
-    assert messages == [expected]
-    assert "cache-benchmark-stable-line" not in messages[0]["content"]
+    assert messages[0]["role"] == "system"
+    assert messages[0]["content"].startswith("YCODE SAFE CACHE BENCHMARK")
+    assert "cache-benchmark-stable-line" in messages[0]["content"]
+    assert "长期记忆" not in messages[0]["content"]
+    assert "技能目录" not in messages[0]["content"]
 
 
-def test_run_benchmark_uses_production_contract_and_checks_threshold(monkeypatch):
+def test_run_benchmark_uses_safe_default_contract_and_checks_threshold(monkeypatch):
     captured = []
     usages = iter([
         SimpleNamespace(prompt_tokens=1000, completion_tokens=1, total_tokens=1001,
@@ -77,8 +91,6 @@ def test_run_benchmark_uses_production_contract_and_checks_threshold(monkeypatch
         return "ok", next(usages), None, None
 
     monkeypatch.setattr(cache_benchmark, "_run_one_request", fake_one_request)
-    monkeypatch.setattr(cache_benchmark, "get_tools_schema", lambda: [{"type": "function"}])
-
     result = cache_benchmark.run_benchmark(
         model="openai/kimi-for-coding",
         api_base="https://api.kimi.com/coding/v1",
@@ -94,8 +106,44 @@ def test_run_benchmark_uses_production_contract_and_checks_threshold(monkeypatch
     assert result["minimum_hot_round_rate"] == 99.0
     assert result["catastrophic_miss_count"] == 0
     assert len(captured) == 3
-    assert all(call["tools"] == [{"type": "function"}] for call in captured)
+    assert all(call["tools"] == [] for call in captured)
+    assert all(
+        call["messages"][0]["content"].startswith("YCODE SAFE CACHE BENCHMARK")
+        for call in captured
+    )
     assert all(call["cache_session_id"] == "fixed-session" for call in captured)
+
+
+def test_run_benchmark_allows_only_cold_round_to_omit_cached_tokens(monkeypatch):
+    usages = iter([
+        SimpleNamespace(
+            prompt_tokens=1000, completion_tokens=1, total_tokens=1001,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=None),
+        ),
+        SimpleNamespace(
+            prompt_tokens=1000, completion_tokens=1, total_tokens=1001,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=990),
+        ),
+    ])
+    monkeypatch.setattr(
+        cache_benchmark,
+        "_run_one_request",
+        lambda **kwargs: ("OK", next(usages), None, None),
+    )
+
+    result = cache_benchmark.run_benchmark(
+        model="openai/k3-256k",
+        api_base="https://api.kimi.com/coding/v1",
+        api_key="secret",
+        rounds=2,
+        minimum_hot_rate=99.0,
+        tools=[],
+        stable_messages=[{"role": "system", "content": "stable"}],
+    )
+
+    assert result["rounds"][0]["cached_tokens"] is None
+    assert result["all_rate"] is None
+    assert result["hot_rate"] == 99.0
 
 
 def test_one_request_matches_deepseek_and_regular_tool_choice_contract(monkeypatch):
@@ -183,7 +231,6 @@ def test_ab_benchmark_shares_contract_and_suite_seed(monkeypatch):
         return {"model": kwargs["model"], "hot_rate": 99.0, "passed": True}
 
     monkeypatch.setattr(cache_benchmark, "run_benchmark", fake_run)
-    monkeypatch.setattr(cache_benchmark, "get_tools_schema", lambda: tools)
     targets = [
         {
             "label": "official",
@@ -200,7 +247,8 @@ def test_ab_benchmark_shares_contract_and_suite_seed(monkeypatch):
     ]
 
     result = cache_benchmark.run_ab_benchmark(
-        targets, rounds=4, minimum_hot_rate=99.0, suite_id="fixed-suite"
+        targets, rounds=4, minimum_hot_rate=99.0, suite_id="fixed-suite",
+        tools=tools,
     )
 
     assert [item["label"] for item in result["targets"]] == [
