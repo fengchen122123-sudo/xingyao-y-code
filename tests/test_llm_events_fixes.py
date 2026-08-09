@@ -1442,6 +1442,59 @@ def test_greeting_turn_keeps_tools_for_cache_stability(mocker):
     assert captured[0].get("tool_choice") == "auto"
 
 
+def test_official_deepseek_thinking_omits_tool_choice(mocker, monkeypatch):
+    captured = []
+
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_litellm_model",
+        lambda model, base_url=None: None,
+    )
+    mocker.patch(
+        "core.llm.completion",
+        side_effect=lambda **kwargs: captured.append(dict(kwargs)) or iter([_chunk("完成")]),
+    )
+
+    list(chat_with_model_events(
+        "openai/deepseek-v4-pro",
+        "fake-key",
+        [{"role": "user", "content": "你好"}],
+        "https://api.deepseek.com",
+        persist=False,
+        turn_id="turn-deepseek-thinking-contract",
+        consume_background_notifications=False,
+    ))
+
+    assert "tool_choice" not in captured[0]
+    assert captured[0]["reasoning_effort"] == "max"
+    assert captured[0]["extra_body"]["thinking"] == {"type": "enabled"}
+
+
+def test_deepseek_non_thinking_keeps_auto_tool_choice(mocker, monkeypatch):
+    captured = []
+
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_litellm_model",
+        lambda model, base_url=None: {"enable_thinking": False},
+    )
+    mocker.patch(
+        "core.llm.completion",
+        side_effect=lambda **kwargs: captured.append(dict(kwargs)) or iter([_chunk("完成")]),
+    )
+
+    list(chat_with_model_events(
+        "openai/deepseek-v4-pro",
+        "fake-key",
+        [{"role": "user", "content": "你好"}],
+        "https://api.deepseek.com",
+        persist=False,
+        turn_id="turn-deepseek-nonthinking-contract",
+        consume_background_notifications=False,
+    ))
+
+    assert captured[0]["tool_choice"] == "auto"
+    assert captured[0]["extra_body"]["thinking"] == {"type": "disabled"}
+
+
 def test_get_tools_schema_waits_for_mcp_only_once(mocker, monkeypatch):
     """进程内首次构建 tools 前同步等待 MCP 就绪（避免 MCP schema 第 N 轮
     突然出现破坏前缀缓存），后续调用恢复非阻塞。"""
