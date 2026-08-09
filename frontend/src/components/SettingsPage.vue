@@ -19,21 +19,7 @@
 
       <section class="model-settings-card">
         <aside class="provider-list">
-          <div class="list-label">预置厂商</div>
-          <button
-            v-for="preset in store.modelPresets"
-            :key="preset.id"
-            :data-test="`preset-${preset.id}`"
-            class="provider-item"
-            :class="{ active: selectedKind === 'preset' && selectedId === preset.id }"
-            @click="selectPreset(preset.id)"
-          >
-            <span class="provider-logo">{{ preset.name.slice(0, 1) }}</span>
-            <span class="provider-name">{{ preset.name }}</span>
-            <span class="provider-state" :class="{ ready: configuredPresetIds.has(preset.id) }"></span>
-          </button>
-
-          <div class="list-label configured-label">已配置厂商</div>
+          <div class="list-label">已配置厂商</div>
           <button
             v-for="provider in store.providers"
             :key="provider.id"
@@ -46,8 +32,38 @@
             <span class="provider-name">{{ provider.name }}</span>
             <span class="provider-state ready"></span>
           </button>
+          <div v-if="!store.providers.length" class="provider-empty">暂无已配置厂商</div>
 
-          <button class="add-provider-row" @click="startCustomProvider">＋ 添加自定义厂商</button>
+          <button
+            data-test="add-provider-toggle"
+            class="add-provider-row"
+            :class="{ active: showAddProviders }"
+            @click="showAddProviders = !showAddProviders"
+          >
+            <span>＋ 添加厂商</span><span>{{ showAddProviders ? '⌃' : '⌄' }}</span>
+          </button>
+
+          <div v-if="showAddProviders" class="add-provider-choices">
+            <div class="list-label">预置厂商</div>
+            <button
+              v-for="preset in store.modelPresets"
+              :key="preset.id"
+              :data-test="`preset-${preset.id}`"
+              class="provider-item"
+              :class="{ active: selectedKind === 'preset' && selectedId === preset.id }"
+              @click="selectPreset(preset.id)"
+            >
+              <span class="provider-logo">{{ preset.name.slice(0, 1) }}</span>
+              <span class="provider-name">{{ preset.name }}</span>
+              <span class="provider-state" :class="{ ready: configuredPresetIds.has(preset.id) }"></span>
+            </button>
+            <button
+              data-test="add-custom-provider"
+              class="add-provider-row custom-provider-row"
+              :class="{ active: selectedKind === 'custom' }"
+              @click="startCustomProvider"
+            >＋ 添加自定义厂商</button>
+          </div>
         </aside>
 
         <div class="provider-detail">
@@ -202,8 +218,9 @@ import { useAppStore } from '../stores/appStore';
 import type { ModelInfo } from '../types/pywebview';
 
 const store = useAppStore();
-const selectedKind = ref<'preset' | 'provider' | 'custom'>('preset');
-const selectedId = ref(store.modelPresets[0]?.id || store.providers[0]?.id || '');
+const selectedKind = ref<'preset' | 'provider' | 'custom'>('provider');
+const selectedId = ref(store.providers[0]?.id || '');
+const showAddProviders = ref(false);
 const presetApiKey = ref('');
 const showPresetKey = ref(false);
 const showProviderKey = ref(false);
@@ -248,10 +265,11 @@ watch(
     const providerExists = selectedKind.value === 'provider'
       && store.providers.some(item => item.id === selectedId.value);
     if (presetExists || providerExists) return;
-    if (store.modelPresets.length) {
-      selectPreset(store.modelPresets[0].id);
-    } else if (store.providers.length) {
+    if (store.providers.length) {
       selectProvider(store.providers[0].id);
+    } else {
+      selectedKind.value = 'provider';
+      selectedId.value = '';
     }
   },
   { immediate: true },
@@ -266,6 +284,7 @@ function selectPreset(id: string) {
 function selectProvider(id: string) {
   selectedKind.value = 'provider';
   selectedId.value = id;
+  showAddProviders.value = false;
 }
 
 function startCustomProvider() {
@@ -396,7 +415,7 @@ async function testModel(model: ModelInfo) {
 .model-settings-card { max-width: 1120px; min-height: 610px; margin: 0 auto; display: grid; grid-template-columns: 280px minmax(0, 1fr); border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); overflow: hidden; }
 .provider-list { padding: 16px 12px; border-right: 1px solid var(--border); background: var(--bg2); overflow-y: auto; }
 .list-label { padding: 4px 10px 10px; color: var(--text-faint); font-size: 11px; font-weight: 600; }
-.configured-label { margin-top: 18px; }
+.provider-empty { padding: 12px 10px; color: var(--text-faint); font-size: 11px; }
 .provider-item { width: 100%; display: flex; align-items: center; gap: 9px; padding: 9px 10px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; }
 .provider-item:hover, .provider-item.active { background: var(--bg3); color: var(--text); }
 .provider-item.active { border-color: var(--border); }
@@ -405,8 +424,11 @@ async function testModel(model: ModelInfo) {
 .provider-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
 .provider-state { width: 7px; height: 7px; border-radius: 50%; background: var(--text-faint); }
 .provider-state.ready { background: var(--green); }
-.add-provider-row { width: 100%; margin-top: 10px; padding: 9px; border: 1px dashed var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; }
+.add-provider-row { width: 100%; margin-top: 10px; padding: 9px; border: 1px dashed var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; display: flex; align-items: center; justify-content: space-between; }
 .add-provider-row:hover { border-color: var(--accent); color: var(--accent); }
+.add-provider-row.active { border-color: var(--accent); color: var(--accent); background: var(--bg3); }
+.add-provider-choices { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
+.custom-provider-row { margin-top: 10px; }
 .provider-detail { min-width: 0; padding: 38px; overflow-y: auto; }
 .detail-title-row { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 28px; }
 .detail-title-row h2 { margin: 0 0 8px; font-size: 20px; }

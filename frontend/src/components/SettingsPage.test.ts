@@ -52,11 +52,26 @@ describe('SettingsPage', () => {
   it('shows preset providers and only asks for an API key', async () => {
     const wrapper = mount(SettingsPage);
 
+    await wrapper.get('[data-test="add-provider-toggle"]').trigger('click');
     await wrapper.get('[data-test="preset-deepseek"]').trigger('click');
 
     expect(wrapper.find('[data-test="preset-api-key"]').exists()).toBe(true);
     expect(wrapper.text()).toContain('Responses (/responses)');
     expect(wrapper.find('[data-test="custom-name"]').exists()).toBe(false);
+  });
+
+  it('shows configured providers first and expands add-provider choices on demand', async () => {
+    const wrapper = mount(SettingsPage);
+
+    expect(wrapper.find('[data-test="provider-p1"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="preset-deepseek"]').exists()).toBe(false);
+
+    await wrapper.get('[data-test="add-provider-toggle"]').trigger('click');
+
+    const orderedActions = wrapper.findAll('[data-test]').map(item => item.attributes('data-test'));
+    expect(orderedActions.indexOf('provider-p1')).toBeLessThan(orderedActions.indexOf('add-provider-toggle'));
+    expect(orderedActions.indexOf('add-provider-toggle')).toBeLessThan(orderedActions.indexOf('preset-deepseek'));
+    expect(orderedActions.indexOf('preset-deepseek')).toBeLessThan(orderedActions.indexOf('add-custom-provider'));
   });
 
   it('opens a model editor with the multimodal choice', async () => {
@@ -70,7 +85,7 @@ describe('SettingsPage', () => {
     expect(wrapper.text()).toContain('是否支持多模态');
   });
 
-  it('selects the first preset when the backend snapshot arrives after mount', async () => {
+  it('selects the first configured provider when the backend snapshot arrives after mount', async () => {
     const store = useAppStore();
     const presets = JSON.parse(JSON.stringify(store.modelPresets));
     const providers = JSON.parse(JSON.stringify(store.providers));
@@ -82,8 +97,8 @@ describe('SettingsPage', () => {
     store.providers = providers;
     await wrapper.vm.$nextTick();
 
-    expect(wrapper.text()).toContain('预置厂商信息由 CLI 共享目录维护');
-    expect(wrapper.find('[data-test="preset-api-key"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="provider-p1"].active').exists()).toBe(true);
+    expect(wrapper.find('[data-test="preset-api-key"]').exists()).toBe(false);
   });
 
   it('keeps the model editor open when saving fails', async () => {
