@@ -42,4 +42,17 @@ describe('ModelCascader', () => {
     await manage.trigger('click');
     expect(useAppStore().settingsOpen).toBe(true);
   });
+
+  it('bottom-aligns both panels when the menu opens upward', async () => {
+    const anchor = document.createElement('button');
+    anchor.getBoundingClientRect = () => ({
+      x: 200, y: 700, top: 700, right: 420, bottom: 740, left: 200,
+      width: 220, height: 40, toJSON: () => ({}),
+    });
+
+    const wrapper = mount(ModelCascader, { props: { visible: false, anchorEl: anchor } });
+    await wrapper.setProps({ visible: true });
+
+    expect(wrapper.classes()).toContain('opens-up');
+  });
 });

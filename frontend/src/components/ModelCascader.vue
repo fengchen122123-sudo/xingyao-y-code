@@ -1,5 +1,5 @@
 <template>
-  <div id="model-cascader" :class="{ show: visible }" :style="styleObj" @click.stop>
+  <div id="model-cascader" :class="{ show: visible, 'opens-up': opensUp }" :style="styleObj" @click.stop>
     <!-- 二级子面板：具体模型列表 -->
     <div class="cascader-sub-panel" :class="{ show: activeProviderName }">
       <div
@@ -68,6 +68,7 @@ const store = useAppStore();
 
 const activeProviderName = ref<string | null>(null);
 const styleObj = ref<Record<string, string>>({});
+const opensUp = ref(false);
 
 const groupedModels = computed(() => store.modelsByProvider);
 const hasAnyModel = computed(() => store.models.length > 0);
@@ -107,6 +108,7 @@ watch(() => props.visible, (newVal) => {
   if (newVal && props.anchorEl) {
     const r = props.anchorEl.getBoundingClientRect();
     const isBottomHalf = r.top > window.innerHeight / 2;
+    opensUp.value = isBottomHalf;
 
     if (isBottomHalf) {
       const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
@@ -159,6 +161,9 @@ onUnmounted(() => {
 }
 #model-cascader.show {
   display: flex;
+}
+#model-cascader.opens-up {
+  align-items: flex-end;
 }
 .cascader-main-panel,
 .cascader-sub-panel {
