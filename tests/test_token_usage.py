@@ -99,6 +99,48 @@ def test_add_and_query_token_usage_grouped_by_model():
     assert rows[1]["total"] == 550
 
 
+def test_query_token_usage_by_day_and_model_keeps_days_and_models_separate():
+    manager = MemoryManager(":memory:")
+    manager.add_token_usage(
+        "openai", "m1", 100, 10, 90, 110, ts=_ts_of("2026-08-08")
+    )
+    manager.add_token_usage(
+        "openai", "m1", 200, 20, None, 220, ts=_ts_of("2026-08-08")
+    )
+    manager.add_token_usage(
+        "moonshot", "m2", 300, 30, 250, 330, ts=_ts_of("2026-08-09")
+    )
+
+    rows = manager.query_token_usage_by_day_and_model(
+        "2026-08-08", "2026-08-09"
+    )
+
+    assert rows == [
+        {
+            "date": "2026-08-08",
+            "provider": "openai",
+            "model": "m1",
+            "prompt": 300,
+            "completion": 30,
+            "cached": 90,
+            "cache_prompt": 100,
+            "total": 330,
+            "requests": 2,
+        },
+        {
+            "date": "2026-08-09",
+            "provider": "moonshot",
+            "model": "m2",
+            "prompt": 300,
+            "completion": 30,
+            "cached": 250,
+            "cache_prompt": 300,
+            "total": 330,
+            "requests": 1,
+        },
+    ]
+
+
 def test_token_usage_keeps_endpoint_and_scope_separate():
     manager = MemoryManager(":memory:")
     today = _ts_of("2026-08-05")

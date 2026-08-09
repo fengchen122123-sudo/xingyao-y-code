@@ -74,6 +74,17 @@ describe('SettingsPage', () => {
     expect(orderedActions.indexOf('preset-deepseek')).toBeLessThan(orderedActions.indexOf('add-custom-provider'));
   });
 
+  it('switches from model configuration to token statistics', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'loadTokenStatistics').mockResolvedValue(null);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="token-statistics-nav"]').trigger('click');
+
+    expect(wrapper.find('.model-settings-card').exists()).toBe(false);
+    expect(wrapper.find('[data-test="token-statistics-page"]').exists()).toBe(true);
+  });
+
   it('opens a model editor with the multimodal choice', async () => {
     const wrapper = mount(SettingsPage);
 
