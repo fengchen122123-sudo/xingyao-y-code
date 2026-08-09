@@ -361,13 +361,12 @@ def prepare_turn_messages(
     调用前提：用户本轮输入已经写入数据库（manager.add_message）。
 
     步骤严格保持与历史 TUI 实现一致的顺序：
-      1. 清理超长历史文件记录 (prune_history_files)
-      2. 取压缩后的 LLM 历史 + 估算 token
-      3. 按四级水位线逐级升级：snip → elide → 智能压缩 → 物理折叠 → 滑窗淘汰
-      4. 剔除历史遗留 system 消息
-      5. 读取系统提示词（三级兜底）
-      6. 组装 RuntimeContext，插入稳定提示词 + 动态上下文
-      7. 注入后台子代理结果汇总
+      1. 读取入库边界已经维护完成的 LLM 历史 + 估算 token
+      2. 按四级水位线逐级升级：snip → elide → 智能压缩 → 物理折叠 → 滑窗淘汰
+      3. 剔除历史遗留 system 消息
+      4. 读取系统提示词（三级兜底）
+      5. 组装 RuntimeContext，插入稳定提示词 + 动态上下文
+      6. 注入后台子代理结果汇总
 
     参数：
       notify: 可选的 notify(kind, message) 回调，用于把压缩进度等提示交回界面层，
@@ -396,9 +395,6 @@ def prepare_turn_messages(
         window = 0
     if window <= 0:
         window = 128000
-
-    # 【阶段4】后台静默清理超长历史文件记录
-    manager.prune_history_files(session_name, max_turns=16, retain_recent=4)
 
     # 获取专门供给大模型的已压缩截断与记忆挂载历史
     history = manager.get_history_for_llm(session_name)
