@@ -20,24 +20,24 @@
 
 **Files:** `core/memory.py`、`core/agent_service.py`、`tests/test_memory.py`、`tests/test_agent_service.py`
 
-- [ ] 写失败测试：低水位 `prepare_turn_messages` 的 manager spy 断言 prune 调用数为 0。
-- [ ] 写失败测试：`add_message(user)` 触发一次 prune；`add_messages` 批量 user/assistant 不触发。
-- [ ] 删除 prepare 的无条件调用，在 `add_message` 成功后仅对 `role == user` 调用维护。
-- [ ] 运行 `tests/test_agent_service.py tests/test_memory.py` 并提交 `fix: move history pruning to turn ingestion`。
+- [x] 写失败测试：低水位 `prepare_turn_messages` 的 manager spy 断言 prune 调用数为 0。
+- [x] 写失败测试：`add_message(user)` 触发一次 prune；`add_messages` 批量 user/assistant 不触发。
+- [x] 删除 prepare 的无条件调用，在 `add_message` 成功后仅对 `role == user` 调用维护。
+- [x] 运行 `tests/test_agent_service.py tests/test_memory.py` 并提交 `fix: move history pruning to turn ingestion`。
 
 ### Task 2: CAS 持久化视觉 canonical 消息
 
 **Files:** `core/memory.py`、`core/llm.py`、`tests/test_memory.py`、`tests/test_llm_events_fixes.py`
 
-- [ ] 写 CAS 成功/expected 不匹配失败测试，断言失败时 DB 原文不变。
-- [ ] 实现 `replace_latest_user_message_content(session_name, expected_content, canonical_content) -> bool`，复用 add_messages 序列化规则并 commit。
-- [ ] 写流式集成失败测试：非视觉主模型经副模型描述后，provider user content 必须等于 DB content；`persist=False` 不调用 CAS。
-- [ ] 在 `_describe_images_with_secondary` 前后捕获最新 user content；`stream and parent_session` 时调用 CAS，False 直接抛 RuntimeError。
-- [ ] 运行聚焦 LLM/Memory 测试并提交 `fix: persist canonical vision messages before requests`。
+- [x] 写 CAS 成功/expected 不匹配失败测试，断言失败时 DB 原文不变。
+- [x] 实现 `replace_latest_user_message_content(session_name, expected_content, canonical_content) -> bool`，复用 add_messages 序列化规则并 commit。
+- [x] 写流式集成失败测试：非视觉主模型经副模型描述后，provider user content 必须等于 DB content；`persist=False` 不调用 CAS。
+- [x] 在 `_describe_images_with_secondary` 前后捕获最新 user content；`stream and parent_session` 时调用 CAS，False 直接抛 RuntimeError。
+- [x] 运行聚焦 LLM/Memory 测试并提交 `fix: persist canonical vision messages before requests`。
 
 ### Task 3: 完整验证
 
-- [ ] 运行相关 Python 测试与 `py_compile`。
-- [ ] 运行全量 pytest。
-- [ ] 运行前端测试与 build。
-- [ ] 记录实际证据并提交 `docs: complete history byte stability plan`。
+- [x] 运行相关 Python 测试与 `py_compile`（104 passed；py_compile 成功）。
+- [x] 运行全量 pytest（718 passed）。
+- [x] 运行前端测试与 build（44 passed；build 成功）。
+- [x] 记录实际证据并提交 `docs: complete history byte stability plan`。
