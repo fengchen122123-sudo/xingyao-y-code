@@ -232,6 +232,40 @@ button {
   color: var(--text);
 }
 
+.permission-mode-btn.perm-confirm {
+  --permission-color: var(--green);
+}
+
+.permission-mode-btn.perm-auto {
+  --permission-color: var(--cyan);
+}
+
+.permission-mode-btn.perm-plan {
+  --permission-color: var(--purple);
+}
+
+.permission-mode-btn.perm-full {
+  --permission-color: var(--red);
+}
+
+.permission-mode-btn.permission-mode-btn.permission-mode-btn {
+  border-color: var(--permission-color);
+  color: var(--permission-color);
+  background: color-mix(in srgb, var(--permission-color) 12%, var(--bg2));
+}
+
+.permission-mode-btn.permission-mode-btn.permission-mode-btn:hover {
+  border-color: var(--permission-color);
+  color: var(--permission-color);
+  background: color-mix(in srgb, var(--permission-color) 20%, var(--bg2));
+}
+
+.permission-chevron {
+  color: currentColor;
+  font-size: 10px;
+  opacity: 0.7;
+}
+
 .kimi-send-btn {
   width: 36px;
   height: 36px;

@@ -30,7 +30,7 @@
 - Consumes: `store.permissionMode: 'confirm' | 'auto' | 'plan' | 'full'` and existing theme color variables.
 - Produces: `data-test="attachment-button"`, `data-test="permission-button"`, and semantic `perm-*` classes in both composers.
 
-- [ ] **Step 1: Write failing composer control tests**
+- [x] **Step 1: Write failing composer control tests**
 
 ```ts
 it.each([
@@ -53,13 +53,13 @@ it('uses green for confirm mode in the dropdown', () => {
 });
 ```
 
-- [ ] **Step 2: Run the new test and verify RED**
+- [x] **Step 2: Run the new test and verify RED**
 
 Run: `npm.cmd test -- --run src/components/ComposerControls.test.ts`
 
 Expected: FAIL because the composer test selectors/classes do not exist and confirm still uses yellow.
 
-- [ ] **Step 3: Implement shared semantic controls**
+- [x] **Step 3: Implement shared semantic controls**
 
 In both composer templates:
 
@@ -76,7 +76,7 @@ In both composer templates:
 
 In `PermDropdown.vue`, change the confirm color to `var(--green)`. In `style.css`, map `.perm-confirm`, `.perm-auto`, `.perm-plan`, and `.perm-full` to the existing green, cyan, purple, and red variables with matching border, text, and soft background.
 
-- [ ] **Step 4: Run focused and full verification**
+- [x] **Step 4: Run focused and full verification**
 
 ```powershell
 npm.cmd test -- --run src/components/ComposerControls.test.ts
@@ -86,7 +86,7 @@ npm.cmd run build
 
 Expected: the new tests, all frontend tests, and production build pass.
 
-- [ ] **Step 5: Verify GUI mode switching and commit**
+- [x] **Step 5: Verify GUI mode switching and commit**
 
 Use the local GUI to verify the empty composer and active composer, then switch all four modes and confirm green/cyan/purple/red states.
 
