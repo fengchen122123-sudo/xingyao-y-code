@@ -391,7 +391,8 @@ class MemoryManager:
                 (
                     int(ts), day, str(provider or ""), str(model or ""),
                     int(prompt_tokens or 0), int(completion_tokens or 0),
-                    int(cached_tokens or 0), int(total_tokens or 0),
+                    None if cached_tokens is None else int(cached_tokens),
+                    int(total_tokens or 0),
                     str(session_id) if session_id is not None else None,
                 ),
             )
@@ -416,21 +417,24 @@ class MemoryManager:
             "prompt_tokens": int(row[0] or 0),
             "completion_tokens": int(row[1] or 0),
             "total_tokens": int(row[2] or 0),
-            "cached_tokens": int(row[3] or 0),
+            "cached_tokens": None if row[3] is None else int(row[3]),
         }
 
     def query_token_usage_by_model(self, start_date, end_date):
         """按模型聚合指定日期区间（含端点，格式 YYYY-MM-DD）的 token 用量。
 
         返回按合计 token 降序排列的字典列表:
-        [{"provider", "model", "prompt", "completion", "cached", "total"}, ...]
+        [{"provider", "model", "prompt", "completion", "cached",
+          "cache_prompt", "total"}, ...]
         """
         with self._lock:
             cursor = self.conn.execute(
                 """
                 SELECT provider, model,
                        SUM(prompt_tokens), SUM(completion_tokens),
-                       SUM(cached_tokens), SUM(total_tokens)
+                       SUM(cached_tokens),
+                       SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
+                       SUM(total_tokens)
                 FROM token_usage
                 WHERE date >= ? AND date <= ?
                 GROUP BY provider, model
@@ -445,7 +449,8 @@ class MemoryManager:
                     "prompt": row[2] or 0,
                     "completion": row[3] or 0,
                     "cached": row[4] or 0,
-                    "total": row[5] or 0,
+                    "cache_prompt": row[5] or 0,
+                    "total": row[6] or 0,
                 }
                 for row in cursor.fetchall()
             ]

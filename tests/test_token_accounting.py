@@ -252,3 +252,180 @@ def test_cache_usage_lifecycle_renames_clears_and_returns_detached_snapshots():
     assert get_token_usage_snapshot(
         "accounting-new", model, base
     )["cache"]["available"] is False
+
+
+def test_account_server_usage_updates_exact_counters_and_persistence(monkeypatch):
+    import core.llm as llm
+
+    persisted = []
+    monkeypatch.setattr(llm, "_persist_token_usage", lambda *args, **kwargs: persisted.append(kwargs))
+    with llm.token_usage_lock:
+        before = {
+            key: llm.session_token_usage.get(key, 0)
+            for key in (
+                "cumulative_prompt",
+                "cumulative_completion",
+                "cumulative_total",
+                "cumulative_cached",
+                "cumulative_cache_prompt",
+            )
+        }
+
+    result = llm._account_server_usage(
+        {
+            "prompt_tokens": 1000,
+            "completion_tokens": 100,
+            "total_tokens": 1100,
+            "prompt_cache_hit_tokens": 990,
+            "prompt_cache_miss_tokens": 10,
+        },
+        model_name="openai/deepseek-v4",
+        api_base="https://account.example/v1",
+        session_id="accounting-stream-valid",
+        cache_scope="main",
+        invalidation_reason="冷启动",
+    )
+
+    assert result["valid"] is True
+    with llm.token_usage_lock:
+        assert llm.session_token_usage["cumulative_prompt"] == before["cumulative_prompt"] + 1000
+        assert llm.session_token_usage["cumulative_completion"] == before["cumulative_completion"] + 100
+        assert llm.session_token_usage["cumulative_total"] == before["cumulative_total"] + 1100
+        assert llm.session_token_usage["cumulative_cached"] == before["cumulative_cached"] + 990
+        assert llm.session_token_usage["cumulative_cache_prompt"] == before["cumulative_cache_prompt"] + 1000
+        assert llm.session_token_usage["latest_prompt"] == 1000
+        assert llm.session_token_usage["latest_total"] == 1100
+
+    snapshot = llm.get_token_usage_snapshot(
+        "accounting-stream-valid", "openai/deepseek-v4",
+        "https://account.example/v1",
+    )
+    assert snapshot["cache"]["latest"]["rate"] == 99.0
+    assert snapshot["cache"]["session_all"]["rate"] == 99.0
+    assert persisted == [{
+        "prompt_tokens": 1000,
+        "completion_tokens": 100,
+        "cached_tokens": 990,
+        "total_tokens": 1100,
+        "session_id": "accounting-stream-valid",
+    }]
+
+
+def test_account_server_usage_rejects_inconsistent_record_without_pollution(
+    monkeypatch, caplog
+):
+    import core.llm as llm
+
+    persisted = []
+    monkeypatch.setattr(llm, "_persist_token_usage", lambda *args, **kwargs: persisted.append(kwargs))
+    with llm.token_usage_lock:
+        before = {
+            key: llm.session_token_usage.get(key, 0)
+            for key in (
+                "cumulative_prompt",
+                "cumulative_completion",
+                "cumulative_total",
+                "cumulative_cached",
+                "cumulative_cache_prompt",
+            )
+        }
+
+    result = llm._account_server_usage(
+        {
+            "prompt_tokens": 1000,
+            "completion_tokens": 100,
+            "total_tokens": 1100,
+            "prompt_cache_hit_tokens": 990,
+            "prompt_cache_miss_tokens": 9,
+        },
+        model_name="openai/deepseek-v4",
+        api_base="https://invalid.example/v1",
+        session_id="accounting-stream-invalid",
+        cache_scope="main",
+        invalidation_reason="",
+    )
+
+    assert result is None
+    assert persisted == []
+    with llm.token_usage_lock:
+        assert {
+            key: llm.session_token_usage.get(key, 0)
+            for key in before
+        } == before
+    snapshot = llm.get_token_usage_snapshot(
+        "accounting-stream-invalid", "openai/deepseek-v4",
+        "https://invalid.example/v1",
+    )
+    assert snapshot["cache"]["available"] is False
+    assert "cache hit + miss" in snapshot["cache"]["invalidation_reason"]
+    assert "accounting-stream-invalid" in caplog.text
+    assert "openai/deepseek-v4" in caplog.text
+
+
+def test_account_server_usage_persists_unknown_cache_as_null(monkeypatch):
+    import core.llm as llm
+
+    persisted = []
+    monkeypatch.setattr(llm, "_persist_token_usage", lambda *args, **kwargs: persisted.append(kwargs))
+    with llm.token_usage_lock:
+        before_cache_prompt = llm.session_token_usage.get("cumulative_cache_prompt", 0)
+
+    result = llm._account_server_usage(
+        {"prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120},
+        model_name="openai/no-cache-details",
+        api_base="https://unknown.example/v1",
+        session_id="accounting-cache-unknown",
+        cache_scope="main",
+        invalidation_reason="",
+    )
+
+    assert result["valid"] is True
+    assert result["cache_reported"] is False
+    assert persisted[0]["cached_tokens"] is None
+    with llm.token_usage_lock:
+        assert llm.session_token_usage["cumulative_cache_prompt"] == before_cache_prompt
+    snapshot = llm.get_token_usage_snapshot(
+        "accounting-cache-unknown", "openai/no-cache-details",
+        "https://unknown.example/v1",
+    )
+    assert snapshot["cache"]["available"] is False
+    assert "未报告缓存" in snapshot["cache"]["invalidation_reason"]
+
+
+def test_non_main_usage_increases_process_cost_without_overwriting_main(monkeypatch):
+    import core.llm as llm
+
+    monkeypatch.setattr(llm, "_persist_token_usage", lambda *args, **kwargs: None)
+    common = {
+        "model_name": "openai/deepseek-v4",
+        "api_base": "https://scope.example/v1",
+        "session_id": "accounting-scope-main",
+    }
+    llm._account_server_usage(
+        {
+            "prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100,
+            "prompt_cache_hit_tokens": 990, "prompt_cache_miss_tokens": 10,
+        },
+        cache_scope="main", invalidation_reason="", **common,
+    )
+    before_snapshot = llm.get_token_usage_snapshot(
+        common["session_id"], common["model_name"], common["api_base"]
+    )
+    with llm.token_usage_lock:
+        before_process_total = llm.session_token_usage["cumulative_total"]
+
+    llm._account_server_usage(
+        {
+            "prompt_tokens": 500, "completion_tokens": 50, "total_tokens": 550,
+            "prompt_cache_hit_tokens": 0, "prompt_cache_miss_tokens": 500,
+        },
+        cache_scope="secondary:test", invalidation_reason="", **common,
+    )
+
+    after_snapshot = llm.get_token_usage_snapshot(
+        common["session_id"], common["model_name"], common["api_base"]
+    )
+    assert after_snapshot["window"] == before_snapshot["window"]
+    assert after_snapshot["cache"] == before_snapshot["cache"]
+    with llm.token_usage_lock:
+        assert llm.session_token_usage["cumulative_total"] == before_process_total + 550
