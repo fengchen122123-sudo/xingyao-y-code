@@ -107,26 +107,35 @@ function selectEffort(level: ReasoningEffort) {
 watch(() => props.visible, (newVal) => {
   if (newVal && props.anchorEl) {
     const r = props.anchorEl.getBoundingClientRect();
-    const isBottomHalf = r.top > window.innerHeight / 2;
+    const menuGap = 8;
+    const viewportPadding = 12;
+    const upwardHeight = Math.max(0, Math.floor(r.top - menuGap - viewportPadding));
+    const downwardHeight = Math.max(0, Math.floor(
+      window.innerHeight - r.bottom - menuGap - viewportPadding,
+    ));
+    const isBottomHalf = upwardHeight >= downwardHeight;
+    const maxPanelHeight = isBottomHalf ? upwardHeight : downwardHeight;
     opensUp.value = isBottomHalf;
 
     if (isBottomHalf) {
       const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
       styleObj.value = {
         position: 'fixed',
-        bottom: `${window.innerHeight - r.top + 8}px`,
+        bottom: `${window.innerHeight - r.top + menuGap}px`,
         left: `${left}px`,
         right: 'auto',
         top: 'auto',
+        '--cascader-max-height': `${maxPanelHeight}px`,
       };
     } else {
       const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
       styleObj.value = {
         position: 'fixed',
-        top: `${r.bottom + 8}px`,
+        top: `${r.bottom + menuGap}px`,
         left: `${left}px`,
         right: 'auto',
         bottom: 'auto',
+        '--cascader-max-height': `${maxPanelHeight}px`,
       };
     }
 
@@ -173,7 +182,8 @@ onUnmounted(() => {
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
   padding: 6px;
   min-width: 240px;
-  max-height: min(520px, calc(100vh - 90px));
+  max-height: var(--cascader-max-height, min(520px, calc(100vh - 90px)));
+  box-sizing: border-box;
   overflow-y: auto;
   backdrop-filter: blur(14px);
 }
