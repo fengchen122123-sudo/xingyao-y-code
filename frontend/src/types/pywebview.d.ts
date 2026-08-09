@@ -139,6 +139,39 @@ export interface TokenUsage {
   cached_tokens: number;
 }
 
+export interface TokenStatisticsMetrics {
+  prompt: number;
+  completion: number;
+  cached: number;
+  cache_prompt: number;
+  total: number;
+  requests: number;
+  cache_hit_rate: number | null;
+}
+
+export interface TokenStatisticsModel extends TokenStatisticsMetrics {
+  key: string;
+  provider: string;
+  model: string;
+}
+
+export interface TokenStatisticsDay extends TokenStatisticsMetrics {
+  date: string;
+  models: TokenStatisticsModel[];
+}
+
+export interface TokenStatisticsSnapshot {
+  ok: true;
+  range: {
+    days: 1 | 7 | 30;
+    start_date: string;
+    end_date: string;
+  };
+  summary: TokenStatisticsMetrics;
+  models: TokenStatisticsModel[];
+  days: TokenStatisticsDay[];
+}
+
 // get_initial_state() 的返回结构
 export interface InitialState {
   models: ModelInfo[];
@@ -251,6 +284,7 @@ export interface PyWebViewAPI {
   stop_current_turn(): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;
+  get_token_usage_statistics(days: 1 | 7 | 30): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
 
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
   get_plugins(): Promise<any>;

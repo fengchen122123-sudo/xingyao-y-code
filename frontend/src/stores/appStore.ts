@@ -14,6 +14,7 @@ import type {
   PlanData,
   BackgroundTask,
   TokenUsage,
+  TokenStatisticsSnapshot,
   PermissionMode,
   ReasoningEffort,
   PyWebViewAPI,
@@ -221,6 +222,9 @@ export const useAppStore = defineStore('app', {
     planData: { title: '', items: [], progress: 0 } as PlanData,
     backgroundTasks: [] as BackgroundTask[],
     tokenUsage: emptyTokenUsage(),
+    tokenStatistics: null as TokenStatisticsSnapshot | null,
+    tokenStatisticsLoading: false,
+    tokenStatisticsDays: 30 as 1 | 7 | 30,
 
     // Toast（支持可选的操作按钮，例如"打开所在文件夹"）
     toast: {
@@ -1347,6 +1351,31 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.showToast('加载模型配置失败: ' + err, 'warn');
+      }
+    },
+
+    async loadTokenStatistics(days: 1 | 7 | 30 = 30, force = false) {
+      if (!force && this.tokenStatistics && this.tokenStatisticsDays === days) {
+        return this.tokenStatistics;
+      }
+      const api = this._api();
+      if (!api) return null;
+      this.tokenStatisticsLoading = true;
+      try {
+        const result = await api.get_token_usage_statistics(days);
+        if (!result || !result.ok) {
+          this.showToast('加载 Token 统计失败: ' + (result?.msg || '未知错误'), 'warn');
+          return result;
+        }
+        this.tokenStatistics = result;
+        this.tokenStatisticsDays = result.range.days;
+        return result;
+      } catch (err) {
+        this.connected = false;
+        this.showToast('加载 Token 统计失败: ' + err, 'warn');
+        return null;
+      } finally {
+        this.tokenStatisticsLoading = false;
       }
     },
 

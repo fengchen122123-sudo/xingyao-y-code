@@ -3,12 +3,14 @@
     <aside class="settings-nav">
       <button class="back-workspace" @click="store.closeModelSettings()">← 返回工作区</button>
       <div class="nav-section">基础设置</div>
-      <button class="nav-item active"><span>▤</span>模型配置</button>
+      <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span>▤</span>模型配置</button>
+      <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span>◔</span>Token 统计</button>
       <div class="nav-spacer"></div>
       <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><span>⚙</span></div>
     </aside>
 
     <main class="settings-main">
+      <template v-if="activeSection === 'models'">
       <header class="settings-header">
         <div>
           <h1>模型配置</h1>
@@ -190,6 +192,8 @@
           <div v-else class="empty-detail">从左侧选择一个厂商开始配置</div>
         </div>
       </section>
+      </template>
+      <TokenUsageSettings v-else />
     </main>
 
     <div v-if="modelModal.show" class="modal-mask">
@@ -216,8 +220,10 @@
 import { computed, reactive, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import type { ModelInfo } from '../types/pywebview';
+import TokenUsageSettings from './TokenUsageSettings.vue';
 
 const store = useAppStore();
+const activeSection = ref<'models' | 'tokens'>('models');
 const selectedKind = ref<'preset' | 'provider' | 'custom'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');
 const showAddProviders = ref(false);

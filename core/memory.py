@@ -557,6 +557,38 @@ class MemoryManager:
                 for row in cursor.fetchall()
             ]
 
+    def query_token_usage_by_day_and_model(self, start_date, end_date):
+        """按日期与模型聚合真实 token 用量，供 GUI 时间序列图使用。"""
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT date, provider, model,
+                       SUM(prompt_tokens), SUM(completion_tokens),
+                       SUM(cached_tokens),
+                       SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
+                       SUM(total_tokens), COUNT(*)
+                FROM token_usage
+                WHERE date >= ? AND date <= ?
+                GROUP BY date, provider, model
+                ORDER BY date ASC, SUM(total_tokens) DESC, provider ASC, model ASC
+                """,
+                (str(start_date), str(end_date)),
+            )
+            return [
+                {
+                    "date": row[0] or "",
+                    "provider": row[1] or "",
+                    "model": row[2] or "",
+                    "prompt": row[3] or 0,
+                    "completion": row[4] or 0,
+                    "cached": row[5] or 0,
+                    "cache_prompt": row[6] or 0,
+                    "total": row[7] or 0,
+                    "requests": row[8] or 0,
+                }
+                for row in cursor.fetchall()
+            ]
+
     def add_cache_request_diagnostic(self, diagnostic):
         """追加一条无正文的请求级缓存诊断记录。"""
         import time
