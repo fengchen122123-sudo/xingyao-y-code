@@ -69,3 +69,53 @@ def test_request_details_measure_append_and_middle_rewrite_prefixes():
     assert appended["common_prefix_messages"] == len(base)
     assert rewritten["request_reason"] == "上下文压缩或历史重写"
     assert rewritten["common_prefix_messages"] == 0
+
+
+def test_persist_diagnostic_distinguishes_valid_invalid_and_missing_usage(monkeypatch):
+    import core.app_context as app_context
+    from core.llm import _persist_cache_request_diagnostic
+
+    captured = []
+
+    class FakeManager:
+        def add_cache_request_diagnostic(self, diagnostic):
+            captured.append(diagnostic)
+
+    monkeypatch.setattr(app_context, "get_manager", lambda: FakeManager())
+    details = {
+        "session_id": "persist-diag",
+        "model": "openai/deepseek-v4",
+        "api_base": "https://api.example/v1",
+        "cache_scope": "main",
+        "request_reason": "",
+        "messages_sha256": "a" * 64,
+        "system_sha256": "b" * 64,
+        "tools_sha256": "c" * 64,
+        "message_count": 2,
+        "system_message_count": 1,
+        "common_prefix_messages": 1,
+        "request_bytes": 100,
+        "system_bytes": 50,
+        "tools_bytes": 75,
+    }
+    valid_usage = {
+        "prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100,
+        "prompt_cache_hit_tokens": 990, "prompt_cache_miss_tokens": 10,
+    }
+    invalid_usage = {
+        "prompt_tokens": 1000, "completion_tokens": 100, "total_tokens": 1100,
+        "prompt_cache_hit_tokens": 990, "prompt_cache_miss_tokens": 9,
+    }
+
+    _persist_cache_request_diagnostic(details, valid_usage)
+    _persist_cache_request_diagnostic(details, invalid_usage)
+    _persist_cache_request_diagnostic(details, None)
+
+    assert captured[0]["usage_valid"] is True
+    assert captured[0]["prompt_tokens"] == 1000
+    assert captured[0]["cached_tokens"] == 990
+    assert captured[0]["cache_miss_tokens"] == 10
+    assert captured[1]["usage_valid"] is False
+    assert any("cache hit + miss" in err for err in captured[1]["usage_errors"])
+    assert captured[2]["usage_valid"] is False
+    assert captured[2]["usage_errors"] == ("usage missing",)

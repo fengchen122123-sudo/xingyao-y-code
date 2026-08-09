@@ -1111,6 +1111,39 @@ def _extract_cached_tokens(usage):
     return int(record["cached_tokens"] or 0)
 
 
+def _persist_cache_request_diagnostic(request_details, usage):
+    """补齐 usage 并持久化请求诊断；失败不影响回复或正式 token 记账。"""
+    if not request_details:
+        logger.warning("缓存请求诊断缺少请求形状，已跳过持久化")
+        return
+    if usage is None:
+        usage_record = {
+            "valid": False,
+            "errors": ("usage missing",),
+            "prompt_tokens": None,
+            "cached_tokens": None,
+            "cache_miss_tokens": None,
+            "cache_reported": False,
+        }
+    else:
+        usage_record = _normalize_server_usage(usage)
+    diagnostic = dict(request_details)
+    diagnostic.update({
+        "prompt_tokens": usage_record["prompt_tokens"],
+        "cached_tokens": usage_record["cached_tokens"],
+        "cache_miss_tokens": usage_record["cache_miss_tokens"],
+        "cache_reported": usage_record["cache_reported"],
+        "usage_valid": usage_record["valid"],
+        "usage_errors": tuple(usage_record["errors"]),
+    })
+    try:
+        manager = app_context.get_manager()
+        if manager is not None:
+            manager.add_cache_request_diagnostic(diagnostic)
+    except Exception as exc:
+        logger.warning("缓存请求诊断持久化失败: %s", exc)
+
+
 def _account_server_usage(
     usage,
     *,
@@ -3370,6 +3403,7 @@ def _chat_with_model_generator(
             overflow_compress_attempts = 0
             classified_message_shape = None
             request_cache_reason = "冷启动"
+            request_diagnostic = None
 
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
@@ -3389,14 +3423,16 @@ def _chat_with_model_generator(
                                 _m["reasoning_content"] = " "
                     current_message_shape = _cache_message_fingerprints(cleaned_messages)
                     if current_message_shape != classified_message_shape:
-                        request_cache_reason = _classify_cache_request(
+                        request_diagnostic = _classify_cache_request_details(
                             telemetry_session_id,
                             cache_scope,
                             model_name,
                             api_base,
                             request_tool_contract,
                             cleaned_messages,
+                            tools=request_tools,
                         )
+                        request_cache_reason = request_diagnostic["request_reason"]
                         classified_message_shape = current_message_shape
                     kwargs["messages"] = _apply_cache_control(cleaned_messages, model_name)
                     # 历史图片折叠属于正常节省行为，不再向用户弹提示打扰
@@ -3669,6 +3705,7 @@ def _chat_with_model_generator(
                 cache_keepalive_service.register_request(kwargs, interval=keepalive_interval)
 
             # 流结束：按最终 usage chunk 严格校验并统一记账一次。
+            _persist_cache_request_diagnostic(request_diagnostic, stream_usage)
             if stream_usage is not None:
                 _account_server_usage(
                     stream_usage,

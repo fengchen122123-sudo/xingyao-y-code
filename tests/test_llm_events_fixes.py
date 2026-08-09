@@ -1586,6 +1586,55 @@ def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
         assert llm_mod.session_token_usage["cumulative_cached"] == before + 512
 
 
+def test_stream_turn_persists_one_request_shape_diagnostic(mocker):
+    import core.llm as llm_mod
+
+    final_usage = SimpleNamespace(
+        total_tokens=1100,
+        prompt_tokens=1000,
+        completion_tokens=100,
+        prompt_cache_hit_tokens=990,
+        prompt_cache_miss_tokens=10,
+        prompt_tokens_details=None,
+    )
+
+    class FakeStream:
+        chunks = [SimpleNamespace(usage=final_usage)]
+
+        def __iter__(self):
+            return iter([_chunk("完成")])
+
+    captured = []
+    mocker.patch("core.llm.completion", side_effect=lambda **kwargs: FakeStream())
+    mocker.patch(
+        "core.llm._persist_cache_request_diagnostic",
+        side_effect=lambda details, usage: captured.append((details, usage)),
+    )
+
+    events = list(chat_with_model_events(
+        "openai/deepseek-v4",
+        "fake-key",
+        [{"role": "system", "content": "stable"}, {"role": "user", "content": "test"}],
+        "https://diag-stream.example/v1",
+        persist=False,
+        turn_id="turn-request-diagnostic",
+        consume_background_notifications=False,
+        cache_scope="main",
+        cache_session_id="stream-diag-session",
+    ))
+
+    assert events[-1].kind == "turn_finished"
+    assert len(captured) == 1
+    details, usage = captured[0]
+    assert details["session_id"] == "stream-diag-session"
+    assert details["model"] == "openai/deepseek-v4"
+    assert details["api_base"] == "https://diag-stream.example/v1"
+    assert details["cache_scope"] == "main"
+    assert len(details["messages_sha256"]) == 64
+    assert len(details["tools_sha256"]) == 64
+    assert usage is final_usage
+
+
 # ── DeepSeek thinking：带 tool_calls 的 assistant 必须回传 reasoning_content key ──
 
 
