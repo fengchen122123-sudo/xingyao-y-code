@@ -684,6 +684,10 @@ class MemoryManager:
     def add_message(self, session_name, role, content):
         """记笔记技能：把聊天内容存进数据库"""
         self.add_messages(session_name, [(role, content)])
+        if str(role) == "user":
+            self.prune_history_files(
+                session_name, max_turns=16, retain_recent=4
+            )
 
     def add_messages(self, session_name, messages):
         """Atomically append one ordered batch of conversation messages."""
