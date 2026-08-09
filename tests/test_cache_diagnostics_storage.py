@@ -141,9 +141,20 @@ def test_cache_diagnostic_summary_classifies_evidence_without_guessing_provider(
         ts=base_ts + 31, session_id="unreported", cached_tokens=None,
         cache_miss_tokens=None, cache_reported=False,
     ))
+    # 后台 scope 的低命中与未报告不得污染主链路摘要。
+    manager.add_cache_request_diagnostic(_diagnostic(
+        ts=base_ts + 32, session_id="background-low",
+        cache_scope="keepalive", cached_tokens=0, cache_miss_tokens=30000,
+    ))
+    manager.add_cache_request_diagnostic(_diagnostic(
+        ts=base_ts + 33, session_id="background-unreported",
+        cache_scope="subagent:explore", cached_tokens=None,
+        cache_miss_tokens=None, cache_reported=False,
+    ))
 
     summary = manager.query_cache_diagnostic_summary(
-        "2026-08-09", "2026-08-09", idle_seconds=120
+        "2026-08-09", "2026-08-09", idle_seconds=120,
+        cache_scope="main",
     )
 
     assert summary["count"] == 7

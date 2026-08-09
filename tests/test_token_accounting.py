@@ -322,6 +322,8 @@ def test_account_server_usage_updates_exact_counters_and_persistence(monkeypatch
         "cached_tokens": 990,
         "total_tokens": 1100,
         "session_id": "accounting-stream-valid",
+        "api_base": "https://account.example/v1",
+        "cache_scope": "main",
     }]
 
 

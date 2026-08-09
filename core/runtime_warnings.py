@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import logging
+import os
 from pathlib import Path
 
 
-DEFAULT_WARNING_LOG = Path.home() / ".ycode" / "runtime-warnings.log"
+DEFAULT_WARNING_LOG = Path(
+    os.environ.get("YCODE_DATA_DIR") or (Path.home() / ".ycode")
+) / "runtime-warnings.log"
 _HANDLER_MARKER = "_ycode_runtime_warning_handler"
 
 

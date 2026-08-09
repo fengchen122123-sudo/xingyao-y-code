@@ -1,4 +1,4 @@
-"""DeepSeek / Kimi 生产请求路径缓存命中率基准程序。"""
+"""DeepSeek / Kimi 安全合成前缀缓存命中率基准程序。"""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from copy import deepcopy
 import os
 import uuid
 
-from core.agent_service import build_stable_system_message
 from core.llm import (
     _apply_cache_control,
     _complete_thinking_blocks,
@@ -16,18 +15,31 @@ from core.llm import (
     _strip_media_and_merge,
     _tool_contract_fingerprint,
     completion,
-    get_tools_schema,
 )
 
 
-def _validated_round(item):
+_SAFE_SYSTEM_CONTENT = (
+    "YCODE SAFE CACHE BENCHMARK\n"
+    + "cache-benchmark-stable-line-0123456789abcdef\n" * 1200
+)
+
+
+def _validated_round(item, *, allow_unreported=False):
     if not isinstance(item, dict):
         raise ValueError("round usage 必须是字典")
     if "prompt_tokens" not in item or "cached_tokens" not in item:
         raise ValueError("round usage 缺少 prompt_tokens/cached_tokens")
     prompt = item["prompt_tokens"]
     cached = item["cached_tokens"]
-    if type(prompt) is not int or type(cached) is not int:
+    if type(prompt) is not int:
+        raise ValueError("round token usage 必须是精确整数")
+    if cached is None:
+        if not allow_unreported:
+            raise ValueError("热轮必须报告 cached token")
+        if prompt < 0:
+            raise ValueError("provider token usage 不能为负数")
+        return {"prompt_tokens": prompt, "cached_tokens": None}
+    if type(cached) is not int:
         raise ValueError("round token usage 必须是精确整数")
     if prompt < 0 or cached < 0:
         raise ValueError("provider token usage 不能为负数")
@@ -51,8 +63,14 @@ def weighted_hot_rate(rounds):
 def summarize_rounds(
     rounds, *, minimum_hot_rate, catastrophic_rate=50.0
 ):
-    validated = [_validated_round(item) for item in rounds]
-    hot_rounds = validated[1:]
+    raw_rounds = list(rounds)
+    if not raw_rounds:
+        raise ValueError("rounds 不能为空")
+    validated = [
+        _validated_round(item, allow_unreported=index == 0)
+        for index, item in enumerate(raw_rounds)
+    ]
+    hot_rounds = [_validated_round(item) for item in validated[1:]]
     hot_rates = [
         (item["cached_tokens"] / item["prompt_tokens"] * 100)
         if item["prompt_tokens"] else 0.0
@@ -63,7 +81,10 @@ def summarize_rounds(
         rate < float(catastrophic_rate) for rate in hot_rates
     )
     return {
-        "all_rate": _weighted_rate(validated),
+        "all_rate": (
+            None if validated[0]["cached_tokens"] is None
+            else _weighted_rate(validated)
+        ),
         "hot_rate": hot_rate,
         "minimum_hot_round_rate": min(hot_rates) if hot_rates else 0.0,
         "catastrophic_miss_count": catastrophic_miss_count,
@@ -177,7 +198,8 @@ def _run_one_request(*, model, api_base, api_key, messages, tools, cache_session
 
 
 def _stable_messages():
-    return [deepcopy(build_stable_system_message())]
+    """返回固定无敏感前缀；基准默认绝不读取生产提示词、记忆或工具。"""
+    return [{"role": "system", "content": _SAFE_SYSTEM_CONTENT}]
 
 
 def run_benchmark(
@@ -196,7 +218,7 @@ def run_benchmark(
     if not api_key:
         raise ValueError("API Key 不能为空")
 
-    tools = get_tools_schema() if tools is None else list(tools)
+    tools = [] if tools is None else list(tools)
     messages = deepcopy(
         _stable_messages() if stable_messages is None else stable_messages
     )
@@ -221,13 +243,13 @@ def run_benchmark(
             raise ValueError(
                 "provider usage 不一致: " + "; ".join(usage_record["errors"])
             )
-        if not usage_record["cache_reported"]:
+        if not usage_record["cache_reported"] and index != 0:
             raise ValueError("provider usage 未报告 cached token，无法进行缓存基准")
         round_usage = {
             "prompt_tokens": usage_record["prompt_tokens"],
             "cached_tokens": usage_record["cached_tokens"],
         }
-        results.append(_validated_round(round_usage))
+        results.append(_validated_round(round_usage, allow_unreported=index == 0))
         assistant = {"role": "assistant", "content": content or "OK"}
         if reasoning is not None:
             assistant["reasoning_content"] = reasoning
@@ -257,7 +279,7 @@ def run_ab_benchmark(
     targets = list(targets)
     if len(targets) < 2:
         raise ValueError("A/B 基准至少需要两个 target")
-    shared_tools = get_tools_schema() if tools is None else tools
+    shared_tools = [] if tools is None else tools
     shared_stable_messages = _stable_messages()
     resolved_suite_id = suite_id or f"benchmark-suite-{uuid.uuid4().hex}"
     results = []
@@ -291,13 +313,23 @@ def _print_benchmark_result(result, label=None):
     for index, item in enumerate(result["rounds"], 1):
         prompt = item["prompt_tokens"]
         cached = item["cached_tokens"]
-        rate = (cached / prompt * 100) if prompt else 0.0
-        print(
-            f"{prefix}round={index} prompt={prompt} "
-            f"cached={cached} rate={rate:.2f}%"
-        )
+        if cached is None:
+            print(
+                f"{prefix}round={index} prompt={prompt} "
+                "cached=unreported rate=unreported"
+            )
+        else:
+            rate = (cached / prompt * 100) if prompt else 0.0
+            print(
+                f"{prefix}round={index} prompt={prompt} "
+                f"cached={cached} rate={rate:.2f}%"
+            )
+    all_rate = (
+        "unreported" if result["all_rate"] is None
+        else f"{result['all_rate']:.2f}%"
+    )
     print(
-        f"{prefix}all_rate={result['all_rate']:.2f}% "
+        f"{prefix}all_rate={all_rate} "
         f"hot_rate={result['hot_rate']:.2f}% "
         f"minimum_hot_round_rate={result['minimum_hot_round_rate']:.2f}% "
         f"catastrophic_miss_count={result['catastrophic_miss_count']} "

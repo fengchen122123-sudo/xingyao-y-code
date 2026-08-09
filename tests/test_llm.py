@@ -135,6 +135,42 @@ def test_kimi_openai_route_sends_prompt_cache_key(monkeypatch):
     assert opts["max_tokens"] == 32000
 
 
+def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
+    """第三方 OpenAI 网关未声明支持 Kimi 私有字段时不得发送 prompt_cache_key。"""
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(monkeypatch, None)
+
+    opts = _provider_request_options(
+        "openai/kimi-k2.6", "https://tokenrhythm.studio/v1"
+    )
+
+    assert opts["max_tokens"] == 16384
+    assert "prompt_cache_key" not in opts.get("extra_body", {})
+
+
+@pytest.mark.parametrize("api_base", [
+    "http://api.moonshot.cn/v1",
+    "ftp://api.moonshot.ai/v1",
+    "https://user:pass@api.kimi.com/coding/v1",
+    "https://api.kimi.com:8443/coding/v1",
+    "https://api.kimi.com/coding-evil/v1",
+])
+def test_kimi_cache_affinity_rejects_noncanonical_official_urls(
+    monkeypatch, api_base
+):
+    from core.llm import _provider_request_options, _supports_cache_keepalive
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(monkeypatch, None)
+
+    opts = _provider_request_options("openai/kimi-k3", api_base)
+
+    assert "prompt_cache_key" not in opts.get("extra_body", {})
+    assert _supports_cache_keepalive("openai/kimi-k3", api_base) is False
+
+
 def test_kimi_anthropic_route_sends_metadata_user_id(monkeypatch):
     """Anthropic 路由（api.kimi.com/coding）：用 metadata.user_id 做缓存亲和。"""
     from core.llm import _provider_request_options

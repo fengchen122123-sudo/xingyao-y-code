@@ -1466,6 +1466,7 @@ def test_official_deepseek_thinking_omits_tool_choice(mocker, monkeypatch):
 
     assert "tool_choice" not in captured[0]
     assert captured[0]["reasoning_effort"] == "max"
+    assert captured[0]["allowed_openai_params"] == ["reasoning_effort"]
     assert captured[0]["extra_body"]["thinking"] == {"type": "enabled"}
 
 
@@ -1492,6 +1493,7 @@ def test_deepseek_non_thinking_keeps_auto_tool_choice(mocker, monkeypatch):
     ))
 
     assert captured[0]["tool_choice"] == "auto"
+    assert "allowed_openai_params" not in captured[0]
     assert captured[0]["extra_body"]["thinking"] == {"type": "disabled"}
 
 
@@ -1874,5 +1876,9 @@ def test_non_thinking_deepseek_not_backfilled():
         {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x"},
     ]
     # 非 thinking 的 deepseek 路由（如 openai/deepseek-v4-flash）字节不得改变
-    fixed, _, _ = llm_mod._strip_media_and_merge(messages, "openai/deepseek-v4-flash")
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/deepseek-v4-flash",
+        "https://aggregator.example/v1",
+    )
     assert "reasoning_content" not in fixed[0]
