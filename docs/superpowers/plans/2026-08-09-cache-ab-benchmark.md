@@ -37,5 +37,11 @@
 
 - [x] 运行 benchmark、token/accounting 聚焦测试与 `py_compile`（59 passed；py_compile 成功）。
 - [x] 检查真实 A/B 前提：本地仅有官方 DeepSeek V4 与聚合 DeepSeek V3.2，不是同模型；官方单端点付费实测因未获生产 prompt/API 费用外发授权未执行，不生成虚假 99% 结论。
-- [x] 运行全量 pytest、前端测试与 build（736 passed；44 passed；build 成功）。
+- [x] 运行全量 pytest、前端测试与 build（初验 736 passed；44 passed；build 成功）。
 - [x] 记录证据并提交 `docs: complete cache A/B benchmark plan`。
+
+### Final review follow-up
+
+- [x] 修复保活 usage 漏记、cached 双来源冲突、诊断事务 rollback、benchmark usage 守恒与默认输出参数、空白 reasoning 校验。
+- [x] 审查修复聚焦回归 107 passed。
+- [x] 最终全量回归 745 passed；前端 44 passed；production build 与 py_compile 成功。
