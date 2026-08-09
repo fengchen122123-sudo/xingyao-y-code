@@ -3377,7 +3377,32 @@ def _chat_with_model_generator(
         kwargs["api_base"] = api_base
 
     # 主模型不识图时，尝试用副模型先分析图片并替换为文字描述。
+    vision_user_message = next(
+        (message for message in reversed(messages) if message.get("role") == "user"),
+        None,
+    )
+    vision_original_content = (
+        deepcopy(vision_user_message.get("content"))
+        if vision_user_message is not None
+        else None
+    )
     _describe_images_with_secondary(messages, model_name, event_callback=event_callback, cancel_event=cancel_event)
+    if (
+        stream
+        and parent_session
+        and vision_user_message is not None
+        and vision_user_message.get("content") != vision_original_content
+    ):
+        manager = app_context.get_manager()
+        if manager is None:
+            raise RuntimeError("视觉 canonical 消息持久化失败：存储管理器不可用")
+        replaced = manager.replace_latest_user_message_content(
+            parent_session,
+            vision_original_content,
+            vision_user_message.get("content"),
+        )
+        if not replaced:
+            raise RuntimeError("视觉 canonical 消息持久化失败：最新用户消息已变化")
 
     # (pending_persistence and flush_persistence are now defined earlier)
 

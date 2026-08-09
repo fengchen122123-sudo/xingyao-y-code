@@ -689,6 +689,45 @@ class MemoryManager:
                 session_name, max_turns=16, retain_recent=4
             )
 
+    @staticmethod
+    def _serialize_message_content(content):
+        if isinstance(content, (list, dict)):
+            return json.dumps(content, ensure_ascii=False)
+        return str(content)
+
+    def replace_latest_user_message_content(
+        self, session_name, expected_content, canonical_content
+    ):
+        """CAS-replace the latest user message without touching newer history."""
+        expected_raw = self._serialize_message_content(expected_content)
+        canonical_raw = self._serialize_message_content(canonical_content)
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    """
+                    SELECT messages.id, messages.content
+                    FROM messages
+                    JOIN sessions ON sessions.id = messages.session_id
+                    WHERE sessions.session_name = ? AND messages.role = 'user'
+                    ORDER BY messages.id DESC
+                    LIMIT 1
+                    """,
+                    (session_name,),
+                )
+                row = cursor.fetchone()
+                if row is None or row[1] != expected_raw:
+                    return False
+                cursor.execute(
+                    "UPDATE messages SET content = ? WHERE id = ?",
+                    (canonical_raw, row[0]),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def add_messages(self, session_name, messages):
         """Atomically append one ordered batch of conversation messages."""
         serialized = []
@@ -697,10 +736,7 @@ class MemoryManager:
             # 注意：媒体判断必须用原始 list（json.dumps 之前就判定）
             if str(role) == "user" and _content_has_media(content):
                 has_new_media = True
-            if isinstance(content, (list, dict)):
-                content = json.dumps(content, ensure_ascii=False)
-            else:
-                content = str(content)
+            content = self._serialize_message_content(content)
             serialized.append((str(role), content))
         if not serialized:
             return
