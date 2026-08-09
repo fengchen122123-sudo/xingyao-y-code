@@ -95,6 +95,14 @@ export interface TokenUsage {
   window: number;
   cached_pct: number;
   cumulative: number;
+  cache_latest_pct: number | null;
+  cache_hot_pct: number | null;
+  cache_session_pct: number | null;
+  cache_available: boolean;
+  cache_hot_turns: number;
+  cache_invalidation_reason: string;
+  prompt_tokens: number;
+  cached_tokens: number;
 }
 
 // get_initial_state() 的返回结构
