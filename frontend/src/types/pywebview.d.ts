@@ -9,7 +9,10 @@ export type ReasoningEffort = 'default' | 'low' | 'high' | 'max';
 export interface ModelInfo {
   id: string;
   name: string;
+  provider_id: string;
   provider_name: string;
+  context_window: number;
+  supports_vision: boolean;
 }
 
 export interface ProviderInfo {
@@ -17,6 +20,37 @@ export interface ProviderInfo {
   name: string;
   base_url?: string;
   protocol?: string;
+  preset_id?: string;
+  has_api_key?: boolean;
+  models?: ModelInfo[];
+}
+
+export interface ApiProtocolInfo {
+  id: 'anthropic' | 'openai' | 'responses';
+  label: string;
+  path: string;
+}
+
+export interface PresetModelInfo {
+  name: string;
+  context_window: number;
+  supports_vision: boolean;
+}
+
+export interface PresetProviderInfo {
+  id: string;
+  name: string;
+  base_url: string;
+  protocol: ApiProtocolInfo['id'];
+  models: PresetModelInfo[];
+}
+
+export interface ModelSettingsSnapshot {
+  protocols: ApiProtocolInfo[];
+  presets: PresetProviderInfo[];
+  providers: ProviderInfo[];
+  models: ModelInfo[];
+  active_model_id: string;
 }
 
 export interface SkillInfo {
@@ -108,6 +142,7 @@ export interface TokenUsage {
 // get_initial_state() 的返回结构
 export interface InitialState {
   models: ModelInfo[];
+  providers?: ProviderInfo[];
   active_model_id: string;
   active_model_name: string;
   permission_mode: PermissionMode;
@@ -243,7 +278,12 @@ export interface PyWebViewAPI {
   kill_terminal_command(): Promise<any>;
 
   add_provider(name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
-  add_model(providerId: string, modelName: string, contextWindow: number): Promise<any>;
+  get_model_settings(): Promise<ModelSettingsSnapshot>;
+  add_preset_provider(presetId: string, apiKey: string): Promise<any>;
+  update_provider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
+  delete_provider(providerId: string): Promise<any>;
+  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean): Promise<any>;
+  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean): Promise<any>;
   delete_model(modelId: string): Promise<any>;
   test_model(modelId: string): Promise<any>;
 }

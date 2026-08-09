@@ -2,6 +2,9 @@ import { defineStore } from 'pinia';
 import type {
   ModelInfo,
   ProviderInfo,
+  ApiProtocolInfo,
+  PresetProviderInfo,
+  ModelSettingsSnapshot,
   SessionGroup,
   SkillInfo,
   McpInfo,
@@ -170,6 +173,8 @@ export const useAppStore = defineStore('app', {
     // 模型 / 供应商
     models: [] as ModelInfo[],
     providers: [] as ProviderInfo[],
+    modelProtocols: [] as ApiProtocolInfo[],
+    modelPresets: [] as PresetProviderInfo[],
     activeModelId: '',
     activeModelName: '',
 
@@ -210,6 +215,7 @@ export const useAppStore = defineStore('app', {
     sidebarCollapsed: false,
     rightPanelCollapsed: false,
     themeLight: false,
+    settingsOpen: false,
 
     // 计划、后台任务、Token 用量
     planData: { title: '', items: [], progress: 0 } as PlanData,
@@ -385,6 +391,7 @@ export const useAppStore = defineStore('app', {
       try {
         const init = await api.get_initial_state();
         this.models = init.models || [];
+        this.providers = init.providers || [];
         this.activeModelId = init.active_model_id || '';
         this.activeModelName = init.active_model_name || '';
         this.permissionMode = init.permission_mode || 'confirm';
@@ -1292,7 +1299,7 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.add_provider(name, baseUrl, apiKey, protocol);
         if (res && res.ok) {
-          this.providers.push({ id: res.provider_id, name });
+          if (res.settings) this.applyModelSettings(res.settings);
           this.showToast(res.msg || '供应商已添加', 'ok');
           return res;
         } else {
@@ -1306,13 +1313,96 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async addModel(providerId: string, modelName: string, contextWindow: number) {
+    applyModelSettings(snapshot: ModelSettingsSnapshot) {
+      this.modelProtocols = snapshot.protocols || [];
+      this.modelPresets = snapshot.presets || [];
+      this.providers = snapshot.providers || [];
+      this.models = snapshot.models || [];
+      this.activeModelId = snapshot.active_model_id || this.activeModelId;
+    },
+
+    async openModelSettings() {
+      this.settingsOpen = true;
+      this.subpage.show = false;
+      const api = this._api();
+      if (!api) return;
+      try {
+        this.applyModelSettings(await api.get_model_settings());
+      } catch (err) {
+        this.connected = false;
+        this.showToast('加载模型配置失败: ' + err, 'warn');
+      }
+    },
+
+    closeModelSettings() {
+      this.settingsOpen = false;
+    },
+
+    async addPresetProvider(presetId: string, apiKey: string) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.add_model(providerId, modelName, contextWindow);
+        const res = await api.add_preset_provider(presetId, apiKey);
+        if (res?.ok && res.settings) {
+          this.applyModelSettings(res.settings);
+          this.showToast(res.msg || '预置厂商已添加', 'ok');
+          return res;
+        }
+        this.showToast('添加预置厂商失败: ' + (res?.msg || '未知错误'), 'warn');
+        return null;
+      } catch (err) {
+        this.connected = false;
+        this.showToast('添加预置厂商失败: ' + err, 'warn');
+        return null;
+      }
+    },
+
+    async updateProvider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string) {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.update_provider(providerId, name, baseUrl, apiKey, protocol);
+        if (res?.ok && res.settings) {
+          this.applyModelSettings(res.settings);
+          this.showToast(res.msg || '厂商已更新', 'ok');
+          return res;
+        }
+        this.showToast('更新厂商失败: ' + (res?.msg || '未知错误'), 'warn');
+        return null;
+      } catch (err) {
+        this.connected = false;
+        this.showToast('更新厂商失败: ' + err, 'warn');
+        return null;
+      }
+    },
+
+    async deleteProvider(provider: ProviderInfo) {
+      const ok = await this.askConfirm('删除厂商', '旗下模型也会删除', `确定要删除厂商「${provider.name}」吗？`);
+      if (!ok) return;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.delete_provider(provider.id);
+        if (res?.ok && res.settings) {
+          this.applyModelSettings(res.settings);
+          this.showToast('厂商已删除', 'ok');
+        } else {
+          this.showToast('删除厂商失败: ' + (res?.msg || '未知错误'), 'warn');
+        }
+      } catch (err) {
+        this.connected = false;
+        this.showToast('删除厂商失败: ' + err, 'warn');
+      }
+    },
+
+    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false) {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision);
         if (res && res.ok) {
-          if (res.models) this.models = res.models;
+          if (res.settings) this.applyModelSettings(res.settings);
+          else if (res.models) this.models = res.models;
           this.showToast(res.msg || '模型已添加', 'ok');
           return res;
         } else {
@@ -1326,6 +1416,25 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean) {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision);
+        if (res?.ok && res.settings) {
+          this.applyModelSettings(res.settings);
+          this.showToast(res.msg || '模型已更新', 'ok');
+          return res;
+        }
+        this.showToast('更新模型失败: ' + (res?.msg || '未知错误'), 'warn');
+        return null;
+      } catch (err) {
+        this.connected = false;
+        this.showToast('更新模型失败: ' + err, 'warn');
+        return null;
+      }
+    },
+
     async deleteModel(model: ModelInfo) {
       const ok = await this.askConfirm('删除模型', '删除后需要重新添加才能使用', `确定要删除模型「${model.name}」吗？`);
       if (!ok) return;
@@ -1335,7 +1444,8 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.delete_model(model.id);
         if (res && res.ok) {
-          if (res.models) this.models = res.models;
+          if (res.settings) this.applyModelSettings(res.settings);
+          else if (res.models) this.models = res.models;
           this.showToast('模型已删除', 'ok');
         } else {
           this.showToast('删除模型失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');

@@ -1,7 +1,7 @@
 """
 core/model_selector.py
 /models 指令触发的全屏 TUI 选择器。
-包含 12 大常用预设厂商（只需输入 API Key）及自定义厂商添加功能。
+预置厂商、模型元数据与 GUI 共用 core.model_catalog，只需输入 API Key。
 """
 import io
 import uuid
@@ -25,27 +25,6 @@ from core.model_manager import (
     set_secondary_model, get_secondary_roles, set_secondary_roles
 )
 
-# litellm 懒加载，避免打包后导入问题，与 core/llm.py 实现一致
-_litellm_module = None
-_litellm_lock = threading.Lock()
-
-
-def _get_litellm():
-    import os
-    os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-    global _litellm_module
-    if _litellm_module is not None:
-        return _litellm_module
-    with _litellm_lock:
-        if _litellm_module is not None:
-            return _litellm_module
-        import litellm as _litellm
-        _litellm.suppress_debug_info = True
-        _litellm.set_verbose = False
-        _litellm_module = _litellm
-        return _litellm
-
-
 STYLE = Style.from_dict({
     "header":        "bold #00b4d8",
     "footer":        "#445566",
@@ -68,161 +47,32 @@ STYLE = Style.from_dict({
     "focused  cursor-column": "bg:#2a3a4a",
 })
 
-PROTOCOLS = [
-    ("openai",    "Chat Completions  (/chat/completions)"),
-    ("anthropic", "Anthropic Messages (/v1/messages)"),
-]
+from core.model_catalog import get_preset_providers, litellm_model_name, protocol_choices
 
-# 内置快捷预设厂商配置
-PRESET_PROVIDERS = [
-    # 注意：context_window 按官方口径 262144（256K）标注，宁可保守——
-    # 虚标会让记忆压缩在真实上限之后才触发，直接 400。
-    # supports_vision 保守标 False：把图片发给纯文本 Kimi 变体会直接报错，
-    # 确认某模型支持视觉后可在 config.json 中手动改回 True。
-    {
-        "name": "月之暗面kimi-for-coding",
-        "base_url": "https://api.kimi.com/coding",
-        "protocol": "anthropic",
-        "models": [
-            {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": True},
-            {"name": "k3", "context_window": 1000000, "supports_vision": True},
-            {"name": "k3-256k", "context_window": 256000, "supports_vision": True},
-        ],
-    },
-    {
-        "name": "月之暗面kimi-for-coding（OpenAI格式）",
-        "base_url": "https://api.kimi.com/coding/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": True},
-            {"name": "k3", "context_window": 1000000, "supports_vision": True},
-            {"name": "k3-256k", "context_window": 256000, "supports_vision": True},
-        ],
-    },
-    {
-        "name": "月之暗面",
-        "base_url": "https://api.moonshot.cn/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "kimi-k3", "context_window": 262144, "supports_vision": False},
-            {"name": "kimi-k2.7-code", "context_window": 262144, "supports_vision": False},
-            {"name": "kimi-k2.6", "context_window": 262144, "supports_vision": False},
-        ],
-    },
-    {
-        "name": "深度求索",
-        "base_url": "https://api.deepseek.com",
-        "protocol": "openai",
-        "models": [
-            {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
-            {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
-        ],
-    },
-    {
-        "name": "Agnes AI",
-        "base_url": "https://apihub.agnes-ai.cn/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "agnes-2.0-flash", "context_window": 1000000, "supports_vision": True},
-            {"name": "agnes-2.5-flash", "context_window": 1000000, "supports_vision": True},
-        ],
-    },
-    {
-        "name": "基元律动",
-        "base_url": "https://tokenrhythm.studio/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "deepseek-v4-flash-0731", "context_window": 1000000, "supports_vision": False},
-            {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
-            {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
-            {"name": "minimax-m2.5", "context_window": 200000, "supports_vision": False},
-            {"name": "minimax-m2.7", "context_window": 200000, "supports_vision": False},
-            {"name": "mimo-v2.5-pro", "context_window": 256000, "supports_vision": False},
-            {"name": "kimi-k2.5", "context_window": 256000, "supports_vision": True},
-            {"name": "kimi-k2.6", "context_window": 256000, "supports_vision": True},
-            {"name": "kimi-k2.7-code", "context_window": 256000, "supports_vision": True},
-            {"name": "qwen3.7-max", "context_window": 1000000, "supports_vision": False},
-            {"name": "qwen3.8-max", "context_window": 1000000, "supports_vision": True},
-            {"name": "glm-5", "context_window": 1000000, "supports_vision": False},
-            {"name": "glm-5.1", "context_window": 200000, "supports_vision": False},
-            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
-            {"name": "seed-2.1-turbo", "context_window": 262144, "supports_vision": True},
-            {"name": "seed-2.1-pro", "context_window": 262144, "supports_vision": True},
-        ],
-    },
-    {
-        "name": "美团",
-        "base_url": "https://api.longcat.chat/openai/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "LongCat-2.0", "context_window": 1000000, "supports_vision": False},
-        ],
-    },
-    {
-        "name": "商汤日日新",
-        "base_url": "https://token.sensenova.cn/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "sensenova-6.7-flash-lite", "context_window": 256000, "supports_vision": True},
-        ],
-    },
-    {
-        "name": "火山AgnetPlan",
-        "base_url": "https://ark.cn-beijing.volces.com/api/plan",
-        "protocol": "anthropic",
-        "models": [
-            {"name": "doubao-seed-2.0-code", "context_window": 256000, "supports_vision": True},
-            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
-            {"name": "doubao-seed-evolving", "context_window": 1000000, "supports_vision": True},
-            {"name": "ark-code-latest", "context_window": 256000, "supports_vision": True},
-        ],
-    },
-    {
-        "name": "火山CodingPlan",
-        "base_url": "https://ark.cn-beijing.volces.com/api/coding",
-        "protocol": "anthropic",
-        "models": [
-            {"name": "doubao-seed-2.0-code", "context_window": 256000, "supports_vision": True},
-            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
-            {"name": "ark-code-latest", "context_window": 256000, "supports_vision": True},
-        ],
-    },
-    {
-        "name": "阶跃星辰",
-        "base_url": "https://api.stepfun.com/step_plan/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "step-3.7-flash", "context_window": 256000, "supports_vision": True},
-            {"name": "step-router-v1", "context_window": 256000, "supports_vision": False},
-        ],
-    },
-    {
-        "name": "硅基流动",
-        "base_url": "https://api.siliconflow.cn/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "zai-org/GLM-5.2", "context_window": 1000000, "supports_vision": False},
-        ],
-    },
-    {
-        "name": "minimax",
-        "base_url": "https://api.minimaxi.com/v1",
-        "protocol": "openai",
-        "models": [
-            {"name": "MiniMax-M3", "context_window": 1000000, "supports_vision": True},
-            {"name": "MiniMax-M2.7", "context_window": 204800, "supports_vision": True},
-        ],
-    },
-    {
-        "name": "智谱",
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "protocol": "openai",
-        "models": [
-            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
-            {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
-        ],
-    },
-]
+PROTOCOLS = protocol_choices()
+PRESET_PROVIDERS = get_preset_providers()
+
+
+def _test_model_connection(protocol: str, model: str, base_url: str, api_key: str):
+    """使用与正式对话完全相同的协议入口验证模型连接。"""
+    from core.llm import _request_stream
+
+    kwargs = {
+        "model": litellm_model_name(protocol, model),
+        "messages": [{"role": "user", "content": "ping"}],
+        "max_tokens": 5,
+        "stream": True,
+        "num_retries": 0,
+    }
+    if api_key:
+        kwargs["api_key"] = api_key
+    if base_url:
+        kwargs["api_base"] = base_url
+
+    with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+        for _chunk in _request_stream(protocol, kwargs, timeout=15):
+            pass
+
 
 
 def _t(style: str, text: str):
@@ -323,11 +173,8 @@ def open_model_selector(on_model_selected=None):
                 pass
 
         def test_conn():
-            # model/err 变量在 try 之前赋值，避免 _get_litellm() 抛异常时
-            # except 块引用未绑定变量导致 UnboundLocalError 被线程静默吞掉
             model = state["edit_data"].get("model_name", "").strip()
             try:
-                litellm = _get_litellm()
                 url = state["edit_data"].get("base_url", "").strip()
                 key = state["edit_data"].get("api_key", "").strip()
                 
@@ -338,23 +185,7 @@ def open_model_selector(on_model_selected=None):
                         proto = provider.get("protocol", "openai")
                         break
                 
-                test_model = model
-                if not model.startswith(f"{proto}/"):
-                    test_model = f"{proto}/{model}"
-                
-                kwargs = {
-                    "model": test_model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 5,
-                    "timeout": 15,
-                }
-                if key:
-                    kwargs["api_key"] = key
-                if url:
-                    kwargs["api_base"] = url
-                
-                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                    litellm.completion(**kwargs)
+                _test_model_connection(proto, model, url, key)
                 
                 update_provider_and_model(
                     provider_id=state["edit_provider_id"],
@@ -416,24 +247,7 @@ def open_model_selector(on_model_selected=None):
             proto = preset["protocol"]
             first_model = preset["models"][0]["name"]
             try:
-                litellm = _get_litellm()
-                test_model = first_model
-                if not first_model.startswith(f"{proto}/"):
-                    test_model = f"{proto}/{first_model}"
-
-                kwargs = {
-                    "model": test_model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 5,
-                    "timeout": 15,
-                }
-                if key:
-                    kwargs["api_key"] = key
-                if url:
-                    kwargs["api_base"] = url
-
-                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                    litellm.completion(**kwargs)
+                _test_model_connection(proto, first_model, url, key)
 
                 pid = add_preset_provider_with_models(
                     name=preset["name"],
@@ -441,6 +255,7 @@ def open_model_selector(on_model_selected=None):
                     api_key=key,
                     protocol=proto,
                     models=preset["models"],
+                    preset_id=preset["id"],
                 )
                 if state.get("return_to_secondary"):
                     cfg = load_config()
@@ -498,33 +313,13 @@ def open_model_selector(on_model_selected=None):
                 pass
 
         def test_conn():
-            # model/err 变量在 try 之前赋值，避免 _get_litellm() 抛异常时
-            # except 块引用未绑定变量导致 UnboundLocalError 被线程静默吞掉
             model = state["add_data"].get("model_name", "").strip()
             try:
-                litellm = _get_litellm()
                 url = state["add_data"].get("base_url", "").strip()
                 key = state["add_data"].get("api_key", "").strip()
                 proto_idx = state["add_data"].get("proto_idx", 0)
                 proto = PROTOCOLS[proto_idx][0]
-                
-                test_model = model
-                if not model.startswith(f"{proto}/"):
-                    test_model = f"{proto}/{model}"
-                
-                kwargs = {
-                    "model": test_model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 5,
-                    "timeout": 15,
-                }
-                if key:
-                    kwargs["api_key"] = key
-                if url:
-                    kwargs["api_base"] = url
-                
-                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                    litellm.completion(**kwargs)
+                _test_model_connection(proto, model, url, key)
                 
                 if not state.get("new_provider_id"):
                     pid = add_provider(
@@ -588,7 +383,6 @@ def open_model_selector(on_model_selected=None):
         def test_conn():
             model = state["am_data"].get("model_name", "").strip()
             try:
-                litellm = _get_litellm()
                 url, key, proto = "", "", "openai"
                 provider_name = ""
                 cfg = load_config()
@@ -600,23 +394,7 @@ def open_model_selector(on_model_selected=None):
                         provider_name = provider.get("name", "")
                         break
 
-                test_model = model
-                if not model.startswith(f"{proto}/"):
-                    test_model = f"{proto}/{model}"
-
-                kwargs = {
-                    "model": test_model,
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 5,
-                    "timeout": 15,
-                }
-                if key:
-                    kwargs["api_key"] = key
-                if url:
-                    kwargs["api_base"] = url
-
-                with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-                    litellm.completion(**kwargs)
+                _test_model_connection(proto, model, url, key)
 
                 add_model_to_provider(
                     provider_id=state["am_provider_id"],

@@ -5,6 +5,8 @@
 
     <!-- 主体区域 -->
     <div id="main">
+      <SettingsPage v-if="store.settingsOpen" />
+      <template v-else>
       <!-- 左侧边栏 -->
       <Sidebar />
 
@@ -55,6 +57,7 @@
 
       <!-- 右侧控制面板 -->
       <RightPanel />
+      </template>
     </div>
 
     <!-- 状态栏 -->
@@ -109,6 +112,7 @@ import RightPanel from './components/RightPanel.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import PermModal from './components/PermModal.vue';
 import Subpage from './components/Subpage.vue';
+import SettingsPage from './components/SettingsPage.vue';
 
 const store = useAppStore();
 const chatScrollRef = ref<HTMLElement | null>(null);

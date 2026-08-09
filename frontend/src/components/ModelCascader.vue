@@ -10,6 +10,7 @@
         @click="selectModel(m.id)"
       >
         <span class="c-label">{{ m.name }}</span>
+        <span v-if="m.supports_vision" class="c-vision" title="支持多模态">◉</span>
         <span v-if="m.id === store.activeModelId" class="c-check checked">✓</span>
       </div>
     </div>
@@ -24,6 +25,7 @@
           :class="{ active: activeProviderName === provider }"
           @mouseenter="activeProviderName = provider as string"
         >
+          <span class="c-provider-icon">◇</span>
           <span class="c-label">{{ provider }}</span>
           <span v-if="hasCurrentModel(modelsInGroup)" class="c-check">✓</span>
           <span class="c-arrow">›</span>
@@ -85,7 +87,7 @@ function selectModel(modelId: string) {
 }
 
 function manageModels() {
-  store.openSubpage('models');
+  store.openModelSettings();
   emit('close');
 }
 
@@ -107,31 +109,27 @@ watch(() => props.visible, (newVal) => {
     const isBottomHalf = r.top > window.innerHeight / 2;
 
     if (isBottomHalf) {
+      const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
       styleObj.value = {
         position: 'fixed',
         bottom: `${window.innerHeight - r.top + 8}px`,
-        right: `${Math.max(10, window.innerWidth - r.right)}px`,
+        left: `${left}px`,
+        right: 'auto',
         top: 'auto',
-        left: 'auto',
       };
     } else {
+      const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
       styleObj.value = {
         position: 'fixed',
         top: `${r.bottom + 8}px`,
-        right: `${Math.max(10, window.innerWidth - r.right)}px`,
+        left: `${left}px`,
+        right: 'auto',
         bottom: 'auto',
-        left: 'auto',
       };
     }
 
-    // 默认高亮并展开当前模型的供应商
+    // 二级模型列表只在悬停供应商后展开，保持一级列表简洁。
     activeProviderName.value = null;
-    for (const [provider, list] of Object.entries(groupedModels.value)) {
-      if (hasCurrentModel(list)) {
-        activeProviderName.value = provider;
-        break;
-      }
-    }
   }
 });
 
@@ -154,7 +152,7 @@ onUnmounted(() => {
   position: fixed;
   z-index: 999;
   display: none;
-  flex-direction: row-reverse;
+  flex-direction: row;
   align-items: flex-start;
   gap: 8px;
   animation: fadein 0.15s cubic-bezier(0.16, 1, 0.3, 1);
@@ -169,10 +167,16 @@ onUnmounted(() => {
   border-radius: 14px;
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
   padding: 6px;
-  min-width: 180px;
+  min-width: 240px;
+  max-height: min(520px, calc(100vh - 90px));
+  overflow-y: auto;
   backdrop-filter: blur(14px);
 }
+.cascader-main-panel {
+  order: 1;
+}
 .cascader-sub-panel {
+  order: 2;
   display: none;
   animation: fadein 0.15s;
 }
@@ -201,6 +205,15 @@ onUnmounted(() => {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.c-provider-icon {
+  color: var(--text-faint);
+  margin-right: 8px;
+}
+.c-vision {
+  color: var(--accent);
+  font-size: 10px;
+  margin-left: 8px;
 }
 .cascader-item .c-check {
   color: var(--text-faint);

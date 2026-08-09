@@ -104,9 +104,17 @@
       </div>
     </div>
 
-    <div class="side-footer" title="点击切换项目工作区文件夹" @click="store.openWorkspaceFolder()">
-      {{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}<br>
-      SQLite 已连接
+    <div class="side-footer">
+      <button title="点击切换项目工作区文件夹" @click="store.openWorkspaceFolder()">
+        <span>▣</span>
+        <span class="footer-copy">
+          <b>{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</b>
+          <small>SQLite 已连接</small>
+        </span>
+      </button>
+      <button data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
+        <span>⚙</span><span class="footer-copy"><b>设置</b><small>模型配置</small></span>
+      </button>
     </div>
   </div>
 </template>
@@ -464,15 +472,28 @@ function getFolderTitle(g: SessionGroup) {
 }
 
 .side-footer {
-  padding: 10px;
+  padding: 7px;
   border-top: 1px solid var(--border);
-  font-size: 12.5px;
-  color: var(--text-faint);
-  cursor: pointer;
-  transition: 0.15s;
+  display: grid;
+  gap: 3px;
 }
-.side-footer:hover {
+.side-footer button {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 7px 8px;
+  border: 0;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-faint);
+  text-align: left;
+}
+.side-footer button:hover {
   color: var(--text);
   background: var(--bg2);
 }
+.footer-copy { display: flex; flex-direction: column; min-width: 0; }
+.footer-copy b { font-size: 12.5px; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.footer-copy small { font-size: 10px; color: var(--text-faint); }
 </style>

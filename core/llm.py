@@ -8,6 +8,7 @@ import subprocess
 import threading
 import time
 import uuid
+from types import SimpleNamespace
 from urllib.parse import urlsplit
 # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
@@ -99,6 +100,11 @@ def _get_litellm():
 def _litellm_completion(**kwargs):
     """litellm.completion 的懒加载包装。"""
     return _get_litellm().completion(**kwargs)
+
+
+def _litellm_responses(**kwargs):
+    """litellm.responses 的懒加载包装。"""
+    return _get_litellm().responses(**kwargs)
 
 
 def _litellm_token_counter(model, messages):
@@ -1289,6 +1295,219 @@ def get_tools_schema():
 def completion(**kwargs):
     """litellm.completion 的模块级导出的包装函数（可被测试 mocker.patch 拦截）。"""
     return _litellm_completion(**kwargs)
+
+
+def _obj_value(value, key, default=None):
+    if isinstance(value, dict):
+        return value.get(key, default)
+    return getattr(value, key, default)
+
+
+def _responses_input_from_messages(messages):
+    """把 Chat Completions 历史转换成 Responses input items。"""
+    def convert_content(content):
+        if not isinstance(content, list):
+            return content
+        blocks = []
+        for block in content:
+            if not isinstance(block, dict):
+                raise ValueError("Responses 多模态内容块必须是对象")
+            block_type = block.get("type")
+            if block_type in {"text", "input_text"}:
+                blocks.append({"type": "input_text", "text": str(block.get("text") or "")})
+            elif block_type in {"image_url", "input_image"}:
+                image_url = block.get("image_url")
+                if isinstance(image_url, dict):
+                    image_url = image_url.get("url")
+                if not image_url:
+                    raise ValueError("Responses 图片内容缺少 image_url")
+                blocks.append({"type": "input_image", "image_url": str(image_url)})
+            else:
+                raise ValueError(f"Responses 不支持的内容块: {block_type}")
+        return blocks
+
+    items = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role in {"system", "developer", "user"}:
+            items.append({"role": role, "content": convert_content(content)})
+        elif role == "assistant":
+            if content:
+                items.append({"role": "assistant", "content": convert_content(content)})
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") or {}
+                items.append({
+                    "type": "function_call",
+                    "call_id": call.get("id"),
+                    "name": function.get("name"),
+                    "arguments": function.get("arguments") or "{}",
+                })
+        elif role == "tool":
+            call_id = message.get("tool_call_id")
+            if not call_id:
+                raise ValueError("Responses 工具结果缺少 tool_call_id")
+            items.append({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
+            })
+        else:
+            raise ValueError(f"Responses 不支持的消息角色: {role}")
+    return items
+
+
+def _responses_tools_from_chat_tools(tools):
+    """把 Chat Completions function wrapper 展平为 Responses tool。"""
+    result = []
+    for tool in tools or []:
+        if tool.get("type") != "function" or not isinstance(tool.get("function"), dict):
+            raise ValueError("Responses 仅支持显式 function 工具定义")
+        function = tool["function"]
+        result.append({
+            "type": "function",
+            "name": function["name"],
+            "description": function.get("description", ""),
+            "parameters": function.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return result
+
+
+def _chat_chunk(*, content="", reasoning="", tool_calls=None, finish_reason=None, usage=None):
+    delta = SimpleNamespace(
+        content=content,
+        reasoning_content=reasoning,
+        tool_calls=tool_calls or [],
+    )
+    choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
+    return SimpleNamespace(choices=[choice], usage=usage)
+
+
+def _responses_usage_as_chat_usage(response):
+    usage = _obj_value(response, "usage")
+    if usage is None:
+        return None
+    input_details = _obj_value(usage, "input_tokens_details")
+    cached_tokens = int(_obj_value(input_details, "cached_tokens", 0) or 0)
+    prompt_tokens = int(_obj_value(usage, "input_tokens", 0) or 0)
+    completion_tokens = int(_obj_value(usage, "output_tokens", 0) or 0)
+    total_tokens = int(
+        _obj_value(usage, "total_tokens", prompt_tokens + completion_tokens)
+        or prompt_tokens + completion_tokens
+    )
+    return SimpleNamespace(
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        total_tokens=total_tokens,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=cached_tokens),
+    )
+
+
+def _responses_stream_as_chat_chunks(events):
+    """将 Responses SSE 事件严格映射成现有工具循环消费的 chat chunks。"""
+    saw_tool_calls = False
+    ignored = {
+        "response.created",
+        "response.in_progress",
+        "response.output_item.done",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.output_text.done",
+        "response.refusal.done",
+        "response.output_text.annotation.added",
+        "response.function_call_arguments.done",
+        "response.reasoning_summary_text.done",
+        "response.reasoning_summary_part.added",
+        "response.reasoning_summary_part.done",
+    }
+    for event in events:
+        event_type = str(_obj_value(event, "type", ""))
+        if event_type == "response.output_text.delta":
+            yield _chat_chunk(content=str(_obj_value(event, "delta", "")))
+        elif event_type == "response.reasoning_summary_text.delta":
+            yield _chat_chunk(reasoning=str(_obj_value(event, "delta", "")))
+        elif event_type == "response.refusal.delta":
+            yield _chat_chunk(content=str(_obj_value(event, "delta", "")))
+        elif event_type == "response.output_item.added":
+            item = _obj_value(event, "item")
+            if _obj_value(item, "type") != "function_call":
+                continue
+            saw_tool_calls = True
+            output_index = int(_obj_value(event, "output_index", 0) or 0)
+            call_id = _obj_value(item, "call_id") or _obj_value(item, "id")
+            name = _obj_value(item, "name")
+            if not call_id or not name:
+                raise RuntimeError("Responses function_call 缺少 call_id 或 name")
+            tool_call = SimpleNamespace(
+                index=output_index,
+                id=str(call_id),
+                function=SimpleNamespace(name=str(name), arguments=""),
+            )
+            yield _chat_chunk(tool_calls=[tool_call])
+        elif event_type == "response.function_call_arguments.delta":
+            saw_tool_calls = True
+            tool_call = SimpleNamespace(
+                index=int(_obj_value(event, "output_index", 0) or 0),
+                id=None,
+                function=SimpleNamespace(
+                    name="",
+                    arguments=str(_obj_value(event, "delta", "")),
+                ),
+            )
+            yield _chat_chunk(tool_calls=[tool_call])
+        elif event_type == "response.completed":
+            response = _obj_value(event, "response")
+            yield _chat_chunk(
+                finish_reason="tool_calls" if saw_tool_calls else "stop",
+                usage=_responses_usage_as_chat_usage(response),
+            )
+        elif event_type == "response.incomplete":
+            response = _obj_value(event, "response")
+            details = _obj_value(response, "incomplete_details")
+            reason = str(_obj_value(details, "reason", ""))
+            if reason == "max_output_tokens":
+                yield _chat_chunk(
+                    finish_reason="length",
+                    usage=_responses_usage_as_chat_usage(response),
+                )
+                continue
+            raise RuntimeError(f"Responses 请求未完成: {reason or '未知原因'}")
+        elif event_type in {"response.failed", "error"}:
+            response = _obj_value(event, "response", event)
+            error = _obj_value(response, "error", response)
+            message = _obj_value(error, "message") or str(error)
+            raise RuntimeError(f"Responses 请求失败: {message}")
+        elif event_type in ignored:
+            continue
+        else:
+            raise RuntimeError(f"未支持的 Responses 流事件: {event_type or '<empty>'}")
+
+
+def _request_stream(protocol, kwargs, *, timeout):
+    """按显式协议发起流请求；Responses 失败时禁止降级。"""
+    if protocol != "responses":
+        return completion(**kwargs, timeout=timeout)
+
+    response_kwargs = {
+        "model": kwargs["model"],
+        "api_key": kwargs.get("api_key"),
+        "input": _responses_input_from_messages(kwargs.get("messages") or []),
+        "tools": _responses_tools_from_chat_tools(kwargs.get("tools") or []),
+        "stream": True,
+        "timeout": timeout,
+    }
+    for source, target in (
+        ("api_base", "api_base"),
+        ("max_tokens", "max_output_tokens"),
+        ("tool_choice", "tool_choice"),
+        ("num_retries", "num_retries"),
+        ("extra_body", "extra_body"),
+    ):
+        if source in kwargs:
+            response_kwargs[target] = kwargs[source]
+    if kwargs.get("reasoning_effort"):
+        response_kwargs["reasoning"] = {"effort": kwargs["reasoning_effort"]}
+    return _responses_stream_as_chat_chunks(_litellm_responses(**response_kwargs))
 
 
 def __getattr__(name):
@@ -3360,6 +3579,11 @@ def _chat_with_model_generator(
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
     """
+    from core.model_manager import get_model_protocol
+
+    request_protocol = get_model_protocol(model_name, api_base)
+    if request_protocol is None:
+        request_protocol = "anthropic" if str(model_name).startswith("anthropic/") else "openai"
     turn_snapshot = deepcopy(messages)
     keepalive_interval = 0
     if cache_scope == "main":
@@ -3367,7 +3591,7 @@ def _chat_with_model_generator(
         configured_keepalive = load_keepalive_interval()
         # 每次主模型请求先停掉旧快照，防止切换 provider 后仍保活旧模型。
         cache_keepalive_service.register_request({}, interval=0)
-        if _supports_cache_keepalive(model_name, api_base):
+        if request_protocol != "responses" and _supports_cache_keepalive(model_name, api_base):
             keepalive_interval = configured_keepalive
     # 1. 自动注入 KAIROS 长期记忆指示与 MEMORY.md 索引。
     # 注意：main.py 的动态上下文（尾部第二条 system 消息）里已经带了完整记忆段，
@@ -3605,7 +3829,12 @@ def _chat_with_model_generator(
                     # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
                     from concurrent.futures import ThreadPoolExecutor
                     executor = ThreadPoolExecutor(max_workers=1)
-                    future = executor.submit(completion, **kwargs, timeout=attempt_timeout)
+                    future = executor.submit(
+                        _request_stream,
+                        request_protocol,
+                        kwargs,
+                        timeout=attempt_timeout,
+                    )
                     wait_started_at = time.monotonic()
                     last_wait_notice_at = wait_started_at
                     try:
