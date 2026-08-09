@@ -110,3 +110,145 @@ def test_normalize_usage_rejects_inconsistent_server_values(usage, expected_erro
 
     assert record["valid"] is False
     assert any(expected_error in error for error in record["errors"])
+
+
+def test_cache_usage_isolated_by_session_model_endpoint_and_scope():
+    from core.llm import _record_cache_usage, get_token_usage_snapshot
+
+    _record_cache_usage(
+        "accounting-isolation-s1", "main", 1000, 990, "",
+        "openai/deepseek-v4", "https://a.example/v1",
+    )
+    _record_cache_usage(
+        "accounting-isolation-s1", "main", 2000, 1000, "",
+        "openai/deepseek-v4", "https://b.example/v1",
+    )
+    _record_cache_usage(
+        "accounting-isolation-s1", "subagent:test", 3000, 0, "",
+        "openai/deepseek-v4", "https://a.example/v1",
+    )
+    _record_cache_usage(
+        "accounting-isolation-s2", "main", 4000, 1000, "",
+        "openai/deepseek-v4", "https://a.example/v1",
+    )
+    _record_cache_usage(
+        "accounting-isolation-s1", "main", 5000, 1000, "",
+        "openai/deepseek-v4-pro", "https://a.example/v1",
+    )
+
+    first = get_token_usage_snapshot(
+        "accounting-isolation-s1", "OPENAI/DEEPSEEK-V4",
+        "https://a.example/v1/", "main",
+    )
+    second_endpoint = get_token_usage_snapshot(
+        "accounting-isolation-s1", "openai/deepseek-v4",
+        "https://b.example/v1", "main",
+    )
+
+    assert first["cache"]["session_all"] == {
+        "prompt_tokens": 1000,
+        "cached_tokens": 990,
+        "rate": 99.0,
+    }
+    assert second_endpoint["cache"]["session_all"] == {
+        "prompt_tokens": 2000,
+        "cached_tokens": 1000,
+        "rate": 50.0,
+    }
+
+
+def test_cache_snapshot_distinguishes_unavailable_from_real_zero_hit():
+    from core.llm import _record_cache_usage, get_token_usage_snapshot
+
+    missing = get_token_usage_snapshot(
+        "accounting-missing", "openai/deepseek-v4", "https://a.example/v1"
+    )
+    assert missing["cache"]["available"] is False
+    assert missing["cache"]["latest"]["rate"] is None
+
+    _record_cache_usage(
+        "accounting-zero", "main", 100, 0, "冷启动",
+        "openai/deepseek-v4", "https://a.example/v1",
+    )
+    zero = get_token_usage_snapshot(
+        "accounting-zero", "openai/deepseek-v4", "https://a.example/v1"
+    )
+    assert zero["cache"]["available"] is True
+    assert zero["cache"]["latest"]["rate"] == 0.0
+    assert zero["cache"]["session_all"]["rate"] == 0.0
+    assert zero["cache"]["hot"]["rate"] is None
+    assert zero["cache"]["invalidation_reason"] == "冷启动"
+
+
+def test_cache_usage_rejects_invalid_values_instead_of_clamping():
+    from core.llm import _record_cache_usage
+
+    with pytest.raises(ValueError, match="prompt_tokens"):
+        _record_cache_usage(
+            "accounting-invalid", "main", -1, 0, "",
+            "openai/deepseek-v4", "https://a.example/v1",
+        )
+    with pytest.raises(ValueError, match="cached_tokens"):
+        _record_cache_usage(
+            "accounting-invalid", "main", 10, 11, "",
+            "openai/deepseek-v4", "https://a.example/v1",
+        )
+
+
+def test_cache_usage_unavailable_hides_stale_rates_until_next_valid_usage():
+    from core.llm import (
+        _mark_cache_usage_unavailable,
+        _record_cache_usage,
+        get_token_usage_snapshot,
+    )
+
+    args = (
+        "accounting-unavailable", "openai/deepseek-v4",
+        "https://a.example/v1", "main",
+    )
+    _record_cache_usage(args[0], args[3], 1000, 990, "", args[1], args[2])
+    _mark_cache_usage_unavailable(*args, "usage 不一致")
+
+    unavailable = get_token_usage_snapshot(*args)
+    assert unavailable["cache"]["available"] is False
+    assert unavailable["cache"]["latest"]["rate"] is None
+    assert unavailable["cache"]["hot"]["rate"] is None
+    assert unavailable["cache"]["session_all"]["rate"] is None
+    assert unavailable["cache"]["invalidation_reason"] == "usage 不一致"
+
+    _record_cache_usage(args[0], args[3], 1000, 980, "", args[1], args[2])
+    recovered = get_token_usage_snapshot(*args)
+    assert recovered["cache"]["available"] is True
+    assert recovered["cache"]["latest"]["rate"] == 98.0
+    assert recovered["cache"]["session_all"]["rate"] == 98.5
+
+
+def test_cache_usage_lifecycle_renames_clears_and_returns_detached_snapshots():
+    from core.llm import (
+        _record_cache_usage,
+        clear_cache_usage_session,
+        get_token_usage_snapshot,
+        rename_cache_usage_session,
+    )
+
+    model = "openai/deepseek-v4"
+    base = "https://a.example/v1"
+    _record_cache_usage(
+        "accounting-old", "main", 1000, 900, "", model, base
+    )
+    rename_cache_usage_session("accounting-old", "accounting-new")
+
+    assert get_token_usage_snapshot(
+        "accounting-old", model, base
+    )["cache"]["available"] is False
+    moved = get_token_usage_snapshot("accounting-new", model, base)
+    assert moved["cache"]["available"] is True
+    moved["cache"]["session_all"]["prompt_tokens"] = 1
+    assert get_token_usage_snapshot(
+        "accounting-new", model, base
+    )["cache"]["session_all"]["prompt_tokens"] == 1000
+
+    clear_cache_usage_session("accounting-new")
+    assert get_token_usage_snapshot(
+        "accounting-new", model, base
+    )["cache"]["available"] is False
