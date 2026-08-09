@@ -29,6 +29,11 @@ describe('composer controls', () => {
     await wrapper.vm.$nextTick();
 
     expect(wrapper.get('[data-test="permission-button"]').classes()).toContain('perm-plan');
+
+    store.permissionMode = 'full';
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.get('[data-test="permission-button"]').text().replace(/\s+/g, '')).toBe('完全访问▼');
     wrapper.unmount();
   });
 

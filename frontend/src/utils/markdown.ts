@@ -140,7 +140,7 @@ export function formatPermMode(mode: string): string {
     case 'confirm': return '变更前确认';
     case 'auto': return '自动接受编辑';
     case 'plan': return '计划模式';
-    case 'full': return '完全访问(YOLO)';
+    case 'full': return '完全访问';
     default: return mode || '变更前确认';
   }
 }
