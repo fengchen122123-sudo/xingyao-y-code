@@ -619,6 +619,16 @@ _cache_request_states = {}
 _cache_usage_states = {}
 
 
+def _cache_usage_key(session_id, model_name, api_base, cache_scope="main"):
+    """生成缓存遥测身份；同会话的不同模型、接口与作用域绝不合并。"""
+    return (
+        str(session_id),
+        str(model_name or "").lower(),
+        str(api_base or "").rstrip("/").lower(),
+        str(cache_scope or "main"),
+    )
+
+
 def _cache_message_fingerprints(messages):
     fingerprints = []
     for message in messages or []:
@@ -674,11 +684,27 @@ def _classify_cache_request(
     return reason
 
 
-def _record_cache_usage(session_id, cache_scope, prompt_tokens, cached_tokens, invalidation_reason):
+def _record_cache_usage(
+    session_id,
+    cache_scope,
+    prompt_tokens,
+    cached_tokens,
+    invalidation_reason,
+    model_name="",
+    api_base="",
+):
     """分别累计当前轮、热启动与会话总命中率，并返回该通道的最新快照。"""
-    prompt = max(0, int(prompt_tokens or 0))
-    cached = max(0, int(cached_tokens or 0))
-    state_key = (str(session_id), str(cache_scope or "main"))
+    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int) or prompt_tokens < 0:
+        raise ValueError("prompt_tokens must be a non-negative integer")
+    if isinstance(cached_tokens, bool) or not isinstance(cached_tokens, int) or cached_tokens < 0:
+        raise ValueError("cached_tokens must be a non-negative integer")
+    if cached_tokens > prompt_tokens:
+        raise ValueError("cached_tokens cannot exceed prompt_tokens")
+    prompt = prompt_tokens
+    cached = cached_tokens
+    state_key = _cache_usage_key(
+        session_id, model_name, api_base, cache_scope
+    )
     with token_usage_lock:
         state = _cache_usage_states.setdefault(state_key, {
             "cumulative_prompt": 0,
@@ -686,13 +712,23 @@ def _record_cache_usage(session_id, cache_scope, prompt_tokens, cached_tokens, i
             "hot_prompt": 0,
             "hot_cached": 0,
             "hot_turns": 0,
+            "latest_prompt": 0,
+            "latest_cached": 0,
+            "usage_valid": True,
+            "usage_error": "",
+            "invalidation_reason": "",
         })
+        state["latest_prompt"] = prompt
+        state["latest_cached"] = cached
         state["cumulative_prompt"] += prompt
         state["cumulative_cached"] += cached
         if not invalidation_reason:
             state["hot_prompt"] += prompt
             state["hot_cached"] += cached
             state["hot_turns"] += 1
+        state["usage_valid"] = True
+        state["usage_error"] = ""
+        state["invalidation_reason"] = str(invalidation_reason or "")
 
         snapshot = dict(state)
         snapshot["latest_rate"] = (cached / prompt * 100) if prompt else 0.0
@@ -714,6 +750,144 @@ def _record_cache_usage(session_id, cache_scope, prompt_tokens, cached_tokens, i
             session_token_usage["cache_cumulative_cached"] = snapshot["cumulative_cached"]
             session_token_usage["cache_invalidation_reason"] = snapshot["invalidation_reason"]
         return snapshot
+
+
+def _mark_cache_usage_unavailable(
+    session_id,
+    model_name,
+    api_base,
+    cache_scope="main",
+    reason="usage 不可用",
+):
+    """标记最新缓存 usage 不可用，同时保留此前已验证的累计计数。"""
+    state_key = _cache_usage_key(
+        session_id, model_name, api_base, cache_scope
+    )
+    with token_usage_lock:
+        state = _cache_usage_states.setdefault(state_key, {
+            "cumulative_prompt": 0,
+            "cumulative_cached": 0,
+            "hot_prompt": 0,
+            "hot_cached": 0,
+            "hot_turns": 0,
+            "latest_prompt": 0,
+            "latest_cached": 0,
+            "usage_valid": False,
+            "usage_error": "",
+            "invalidation_reason": "",
+        })
+        state["usage_valid"] = False
+        state["usage_error"] = str(reason or "usage 不可用")
+        if str(cache_scope or "main") == "main":
+            session_token_usage["cache_invalidation_reason"] = state["usage_error"]
+
+
+def get_token_usage_snapshot(
+    session_id,
+    model_name,
+    api_base,
+    cache_scope="main",
+):
+    """返回线程安全的 token 与当前缓存身份快照，不暴露内部可变状态。"""
+    state_key = _cache_usage_key(
+        session_id, model_name, api_base, cache_scope
+    )
+    with token_usage_lock:
+        state = _cache_usage_states.get(state_key)
+        window = {
+            "latest_total": int(session_token_usage.get("latest_total", 0) or 0),
+            "latest_prompt": int(session_token_usage.get("latest_prompt", 0) or 0),
+            "latest_cached": int(session_token_usage.get("latest_cached", 0) or 0),
+            "max_window": int(session_token_usage.get("max_window", 0) or 0),
+        }
+        process = {
+            "cumulative_total": int(session_token_usage.get("cumulative_total", 0) or 0),
+            "cumulative_prompt": int(session_token_usage.get("cumulative_prompt", 0) or 0),
+            "cumulative_completion": int(
+                session_token_usage.get("cumulative_completion", 0) or 0
+            ),
+            "cumulative_cached": int(session_token_usage.get("cumulative_cached", 0) or 0),
+            "cumulative_cache_prompt": int(
+                session_token_usage.get("cumulative_cache_prompt", 0) or 0
+            ),
+        }
+        if state is None:
+            cache = {
+                "available": False,
+                "usage_valid": False,
+                "latest": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+                "hot": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+                "session_all": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+                "hot_turns": 0,
+                "invalidation_reason": "",
+            }
+        else:
+            valid = bool(state.get("usage_valid", True))
+
+            def _rate(cached_value, prompt_value):
+                if not valid or not prompt_value:
+                    return None
+                return cached_value / prompt_value * 100
+
+            latest_prompt = int(state.get("latest_prompt", 0) or 0)
+            latest_cached = int(state.get("latest_cached", 0) or 0)
+            hot_prompt = int(state.get("hot_prompt", 0) or 0)
+            hot_cached = int(state.get("hot_cached", 0) or 0)
+            cumulative_prompt = int(state.get("cumulative_prompt", 0) or 0)
+            cumulative_cached = int(state.get("cumulative_cached", 0) or 0)
+            cache = {
+                "available": valid,
+                "usage_valid": valid,
+                "latest": {
+                    "prompt_tokens": latest_prompt,
+                    "cached_tokens": latest_cached,
+                    "rate": _rate(latest_cached, latest_prompt),
+                },
+                "hot": {
+                    "prompt_tokens": hot_prompt,
+                    "cached_tokens": hot_cached,
+                    "rate": _rate(hot_cached, hot_prompt),
+                },
+                "session_all": {
+                    "prompt_tokens": cumulative_prompt,
+                    "cached_tokens": cumulative_cached,
+                    "rate": _rate(cumulative_cached, cumulative_prompt),
+                },
+                "hot_turns": int(state.get("hot_turns", 0) or 0),
+                "invalidation_reason": str(
+                    state.get("usage_error")
+                    if not valid
+                    else state.get("invalidation_reason", "")
+                ),
+            }
+    return {"window": window, "process": process, "cache": cache}
+
+
+def rename_cache_usage_session(old_name, new_name):
+    """会话重命名时原子迁移缓存请求形状与 usage 遥测。"""
+    old_key = str(old_name)
+    new_key = str(new_name)
+    if old_key == new_key:
+        return
+    with token_usage_lock:
+        for mapping in (_cache_request_states, _cache_usage_states):
+            moves = [
+                (key, (new_key, *key[1:]), value)
+                for key, value in list(mapping.items())
+                if key and key[0] == old_key
+            ]
+            for source, target, value in moves:
+                mapping[target] = value
+                del mapping[source]
+
+
+def clear_cache_usage_session(session_name):
+    """清理指定会话的进程内缓存遥测，防止同名新会话继承旧状态。"""
+    session_key = str(session_name)
+    with token_usage_lock:
+        for mapping in (_cache_request_states, _cache_usage_states):
+            for key in [key for key in mapping if key and key[0] == session_key]:
+                del mapping[key]
 
 
 def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
