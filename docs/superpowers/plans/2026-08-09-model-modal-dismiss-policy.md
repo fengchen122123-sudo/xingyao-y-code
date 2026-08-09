@@ -27,7 +27,7 @@
 - Consumes: existing `modelModal.show`, `openModelModal()`, `closeModelModal()`, and `saveModel()`.
 - Produces: a modal backdrop that intercepts background clicks without changing modal state.
 
-- [ ] **Step 1: Add the failing backdrop behavior test**
+- [x] **Step 1: Add the failing backdrop behavior test**
 
 ```ts
 it('keeps the model editor open when the backdrop is clicked', async () => {
@@ -38,13 +38,13 @@ it('keeps the model editor open when the backdrop is clicked', async () => {
 });
 ```
 
-- [ ] **Step 2: Run the focused test and verify RED**
+- [x] **Step 2: Run the focused test and verify RED**
 
 Run: `npm.cmd test -- --run src/components/SettingsPage.test.ts`
 
 Expected: FAIL because the existing `@click.self="closeModelModal"` removes the modal.
 
-- [ ] **Step 3: Remove the backdrop close binding**
+- [x] **Step 3: Remove the backdrop close binding**
 
 Change the mask root from:
 
@@ -60,7 +60,7 @@ to:
 
 Do not change the close button, cancel button, or `if (result?.ok) closeModelModal()` submit behavior.
 
-- [ ] **Step 4: Add explicit close-path assertions and run verification**
+- [x] **Step 4: Add explicit close-path assertions and run verification**
 
 Extend the component tests so the top-right close button and cancel button each remove the modal. Run:
 
@@ -72,7 +72,7 @@ npm.cmd run build
 
 Expected: all component tests, all frontend tests, and the production build pass.
 
-- [ ] **Step 5: Verify the real GUI and commit**
+- [x] **Step 5: Verify the real GUI and commit**
 
 In the local GUI, open the model editor and verify backdrop click stays open, while close and cancel dismiss it.
 

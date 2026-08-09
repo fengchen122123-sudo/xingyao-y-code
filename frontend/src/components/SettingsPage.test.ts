@@ -85,6 +85,39 @@ describe('SettingsPage', () => {
     expect(wrapper.text()).toContain('是否支持多模态');
   });
 
+  it('keeps the model editor open when the backdrop is clicked', async () => {
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+    await wrapper.get('.modal-mask').trigger('click');
+
+    expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(true);
+  });
+
+  it.each([
+    ['close', '.modal-head button'],
+    ['cancel', '.modal-actions .secondary-button'],
+  ])('closes the model editor through the %s action', async (_action, selector) => {
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+    await wrapper.get(selector).trigger('click');
+
+    expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(false);
+  });
+
+  it('closes the model editor after saving succeeds', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'addModel').mockResolvedValue({ ok: true } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+    await wrapper.get('[data-test="model-modal"] input[placeholder="模型 ID"]').setValue('saved-model');
+    await wrapper.get('[data-test="model-modal"]').trigger('submit');
+
+    expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(false);
+  });
+
   it('selects the first configured provider when the backend snapshot arrives after mount', async () => {
     const store = useAppStore();
     const presets = JSON.parse(JSON.stringify(store.modelPresets));
