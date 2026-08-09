@@ -17,26 +17,25 @@
 
 ### Task 1: 多指标与严格 usage
 
-- [ ] 写失败测试：all/hot/min/catastrophic 指标分别正确，灾难失效不能被平均值掩盖。
-- [ ] 写失败测试：负数、cached > prompt、缺字段 usage 直接失败。
-- [ ] 实现 `summarize_rounds` 并让 `passed` 同时检查阈值与灾难失效。
+- [x] 写失败测试：all/hot/min/catastrophic 指标分别正确，灾难失效不能被平均值掩盖。
+- [x] 写失败测试：负数、cached > prompt、缺字段 usage 直接失败。
+- [x] 实现 `summarize_rounds` 并让 `passed` 同时检查阈值与灾难失效。
 
 ### Task 2: 生产前缀与请求契约
 
-- [ ] 写失败测试：stable messages 使用 `build_stable_system_message`，不存在 6000 行合成填充。
-- [ ] 写失败测试：官方 DeepSeek thinking 请求不含 `tool_choice`，普通路由使用 `auto`。
-- [ ] 接入生产前缀、`api_base` 消息清洗与 provider options。
+- [x] 写失败测试：stable messages 使用 `build_stable_system_message`，不存在 6000 行合成填充。
+- [x] 写失败测试：官方 DeepSeek thinking 请求不含 `tool_choice`，普通路由使用 `auto`。
+- [x] 接入生产前缀、`api_base` 消息清洗与 provider options。
 
 ### Task 3: A/B 与 CLI
 
-- [ ] 写失败测试：A/B targets 共用 tools/rounds/suite seed，结果独立汇总。
-- [ ] 实现 `run_ab_benchmark` 和 compare CLI 参数/输出。
-- [ ] 运行聚焦测试并提交 `feat: add production-shaped cache A/B benchmark`。
+- [x] 写失败测试：A/B targets 共用 tools/rounds/suite seed，结果独立汇总。
+- [x] 实现 `run_ab_benchmark` 和 compare CLI 参数/输出。
+- [x] 运行聚焦测试并提交 `feat: add production-shaped cache A/B benchmark`（基准 11 passed；缓存/token 联跑 59 passed）。
 
 ### Task 4: 验证与实测
 
-- [ ] 运行 benchmark、token/accounting 聚焦测试与 `py_compile`。
-- [ ] 若存在相同 DeepSeek V4 聚合模型与凭据，执行真实官方/聚合 A/B；否则明确记录不可比原因。
-- [ ] 运行全量 pytest、前端测试与 build。
-- [ ] 记录证据并提交 `docs: complete cache A/B benchmark plan`。
-
+- [x] 运行 benchmark、token/accounting 聚焦测试与 `py_compile`（59 passed；py_compile 成功）。
+- [x] 检查真实 A/B 前提：本地仅有官方 DeepSeek V4 与聚合 DeepSeek V3.2，不是同模型；官方单端点付费实测因未获生产 prompt/API 费用外发授权未执行，不生成虚假 99% 结论。
+- [x] 运行全量 pytest、前端测试与 build（736 passed；44 passed；build 成功）。
+- [x] 记录证据并提交 `docs: complete cache A/B benchmark plan`。
