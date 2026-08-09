@@ -61,6 +61,19 @@ describe('ToolExecutionTrace', () => {
     }
   });
 
+  it('does not spin an unresolved historical call after the turn completed', () => {
+    const wrapper = mount(ToolExecutionTrace, {
+      props: {
+        calls: [runningCall('legacy-empty-id', Date.now())],
+        legacyDiffs: [],
+        state: 'completed',
+      },
+    });
+
+    expect(wrapper.find('.trace-icon.spin').exists()).toBe(false);
+    expect(wrapper.get('.trace-row').classes()).toContain('status-completed');
+  });
+
   it('toggles aria-expanded from the header button and defaults to expanded', async () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [finishedCall('a')], legacyDiffs: [], state: 'completed' },

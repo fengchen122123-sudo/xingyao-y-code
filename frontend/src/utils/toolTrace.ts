@@ -99,9 +99,11 @@ function categoryFor(call: ToolExecutionCall): ToolCategory {
   return display?.category ?? LEGACY_CATEGORIES[call.name] ?? 'other';
 }
 
-function statusFor(call: ToolExecutionCall): ToolCallStatus {
-  if (!call.result) return 'running';
-  return call.result.ok ? 'completed' : 'failed';
+function statusFor(call: ToolExecutionCall, state: ExecutionState): ToolCallStatus {
+  if (call.result) return call.result.ok ? 'completed' : 'failed';
+  if (state === 'cancelled') return 'cancelled';
+  if (state === 'error') return 'failed';
+  return state === 'completed' ? 'completed' : 'running';
 }
 
 function kindFor(category: ToolCategory): ToolTraceRow['kind'] {
@@ -121,14 +123,14 @@ function durationFor(call: ToolExecutionCall): number | undefined {
   return call.result?.duration_ms;
 }
 
-function rowFor(call: ToolExecutionCall, index: number): ToolTraceRow {
+function rowFor(call: ToolExecutionCall, index: number, state: ExecutionState): ToolTraceRow {
   const display = displayFor(call);
   const category = categoryFor(call);
   const durationMs = durationFor(call);
   return {
     id: `${kindFor(category)}:${call.id || `missing-${index + 1}`}`,
     kind: kindFor(category),
-    status: statusFor(call),
+    status: statusFor(call, state),
     action: display?.action || call.label || call.name,
     detail: display?.target || '',
     command: display?.command || '',
@@ -198,11 +200,12 @@ function legacyDiffRow(legacyDiffs: LegacyDiff[]): ToolTraceRow {
 export function buildToolTraceRows(
   calls: ToolExecutionCall[],
   legacyDiffs: LegacyDiff[] = [],
+  state: ExecutionState = 'running',
 ): ToolTraceRow[] {
   const rows: ToolTraceRow[] = [];
   const rowIdCounts = new Map<string, number>();
   for (const [index, call] of calls.entries()) {
-    const next = rowFor(call, index);
+    const next = rowFor(call, index, state);
     const previous = rows.at(-1);
     if (previous && canJoinGroup(previous, next)) {
       rows[rows.length - 1] = appendToGroup(previous, next);
