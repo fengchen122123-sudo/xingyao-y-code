@@ -638,14 +638,106 @@ def _cache_message_fingerprints(messages):
             for key, value in message.items()
             if key != "cache_control"
         }
-        payload = json.dumps(
-            normalized,
-            ensure_ascii=False,
-            sort_keys=True,
-            separators=(",", ":"),
-        )
+        payload = _canonical_diagnostic_json(normalized)
         fingerprints.append(hashlib.sha256(payload.encode("utf-8")).hexdigest())
     return tuple(fingerprints)
+
+
+def _canonical_diagnostic_json(value):
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _build_cache_request_diagnostic(
+    session_id,
+    cache_scope,
+    model_name,
+    api_base,
+    tools,
+    messages,
+):
+    """构建不含正文的确定性请求形状诊断。"""
+    normalized_messages = [
+        {key: value for key, value in message.items() if key != "cache_control"}
+        for message in (messages or [])
+    ]
+    system_messages = [
+        message for message in normalized_messages
+        if message.get("role") == "system"
+    ]
+    normalized_tools = list(tools or [])
+    messages_json = _canonical_diagnostic_json(normalized_messages)
+    system_json = _canonical_diagnostic_json(system_messages)
+    tools_json = _canonical_diagnostic_json(normalized_tools)
+    return {
+        "session_id": str(session_id),
+        "model": str(model_name or "").lower(),
+        "api_base": str(api_base or "").rstrip("/").lower(),
+        "cache_scope": str(cache_scope or "main"),
+        "messages_sha256": hashlib.sha256(messages_json.encode("utf-8")).hexdigest(),
+        "system_sha256": hashlib.sha256(system_json.encode("utf-8")).hexdigest(),
+        "tools_sha256": hashlib.sha256(tools_json.encode("utf-8")).hexdigest(),
+        "message_count": len(normalized_messages),
+        "system_message_count": len(system_messages),
+        "request_bytes": len(messages_json.encode("utf-8")),
+        "system_bytes": len(system_json.encode("utf-8")),
+        "tools_bytes": len(tools_json.encode("utf-8")),
+        "_message_fingerprints": _cache_message_fingerprints(normalized_messages),
+    }
+
+
+def _classify_cache_request_details(
+    session_id,
+    cache_scope,
+    model_name,
+    api_base,
+    tool_contract,
+    messages,
+    tools=None,
+):
+    """记录请求形状并返回可持久化的原因、哈希与公共前缀长度。"""
+    state_key = (str(session_id), str(cache_scope or "main"))
+    details = _build_cache_request_diagnostic(
+        session_id, cache_scope, model_name, api_base, tools, messages
+    )
+    current = {
+        "model": details["model"],
+        "api_base": details["api_base"],
+        "tool_contract": str(tool_contract or details["tools_sha256"]),
+        "messages": details["_message_fingerprints"],
+    }
+    with token_usage_lock:
+        previous = _cache_request_states.get(state_key)
+        common_prefix = 0
+        if previous is not None:
+            for old_hash, new_hash in zip(previous["messages"], current["messages"]):
+                if old_hash != new_hash:
+                    break
+                common_prefix += 1
+        if previous is None:
+            reason = "冷启动"
+        elif (
+            previous["model"] != current["model"]
+            or previous["api_base"] != current["api_base"]
+        ):
+            reason = "模型或接口变化"
+        elif previous["tool_contract"] != current["tool_contract"]:
+            reason = "工具契约变化"
+        elif common_prefix != len(previous["messages"]):
+            reason = "上下文压缩或历史重写"
+        else:
+            reason = ""
+        _cache_request_states[state_key] = current
+        if len(_cache_request_states) > 128:
+            _cache_request_states.pop(next(iter(_cache_request_states)))
+    details["request_reason"] = reason
+    details["common_prefix_messages"] = common_prefix
+    del details["_message_fingerprints"]
+    return details
 
 
 def _classify_cache_request(
@@ -657,32 +749,14 @@ def _classify_cache_request(
     messages,
 ):
     """记录请求形状并返回确定性的缓存失效原因；空字符串表示严格追加。"""
-    state_key = (str(session_id), str(cache_scope or "main"))
-    current = {
-        "model": str(model_name or "").lower(),
-        "api_base": str(api_base or "").rstrip("/").lower(),
-        "tool_contract": str(tool_contract or ""),
-        "messages": _cache_message_fingerprints(messages),
-    }
-    with token_usage_lock:
-        previous = _cache_request_states.get(state_key)
-        if previous is None:
-            reason = "冷启动"
-        elif (
-            previous["model"] != current["model"]
-            or previous["api_base"] != current["api_base"]
-        ):
-            reason = "模型或接口变化"
-        elif previous["tool_contract"] != current["tool_contract"]:
-            reason = "工具契约变化"
-        elif current["messages"][:len(previous["messages"])] != previous["messages"]:
-            reason = "上下文压缩或历史重写"
-        else:
-            reason = ""
-        _cache_request_states[state_key] = current
-        if len(_cache_request_states) > 128:
-            _cache_request_states.pop(next(iter(_cache_request_states)))
-    return reason
+    return _classify_cache_request_details(
+        session_id,
+        cache_scope,
+        model_name,
+        api_base,
+        tool_contract,
+        messages,
+    )["request_reason"]
 
 
 def _record_cache_usage(
