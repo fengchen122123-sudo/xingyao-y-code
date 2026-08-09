@@ -8,6 +8,8 @@
 
 **Tech Stack:** Python 3.12、pytest、prompt_toolkit、PyWebView bridge、Vue 3、Pinia、TypeScript、Vitest、Vite。
 
+**Implementation Status (2026-08-09):** Task 1-6 已按 RED→GREEN 顺序完成。最终验证：聚焦 Python 174 passed、全量 Python 705 passed、前端 44 passed、`npm run build` 成功、AGENTS.md 要求的 Python 语法检查成功。实现提交：`3b362bb`、`bfe8454`、`c293a88`、`5ab6ebe`、`cd427dc`、`e9417f4`。
+
 ## Global Constraints
 
 - 只在 `dev` 分支工作，不创建或合并其他分支。
