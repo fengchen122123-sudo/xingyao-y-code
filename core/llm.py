@@ -1585,19 +1585,25 @@ def _supports_cache_keepalive(model_name, api_base=""):
     return _is_kimi_family(model_name, api_base) or "deepseek" in identity
 
 
-def _supports_reasoning_fields(model_name):
+def _supports_reasoning_fields(model_name, api_base=""):
     prefix = str(model_name or "").split("/")[0].lower()
     if prefix in _REASONING_FIELD_PROVIDERS:
         return True
     # Kimi 推理模型（含经销商 openai/ 路由）：多轮工具调用要求 assistant
     # 消息保留 reasoning_content，剥掉会导致 400 或推理链断裂
-    return _is_kimi_family(model_name)
+    return _is_kimi_family(model_name, api_base) or _is_deepseek_family(
+        model_name, api_base
+    )
 
 
-def _requires_tool_call_reasoning(model_name):
+def _requires_tool_call_reasoning(model_name, api_base=""):
     """DeepSeek thinking 模式：带 tool_calls 的 assistant 必须回传 reasoning_content key。"""
-    name = str(model_name or "").lower()
-    return name.split("/")[0] == "deepseek" and ("think" in name or "reason" in name)
+    try:
+        from core.model_manager import get_model_config_by_litellm_model
+        model_cfg = get_model_config_by_litellm_model(model_name, api_base) or {}
+    except Exception:
+        model_cfg = {}
+    return _deepseek_thinking_enabled(model_name, api_base, model_cfg)
 
 
 # 支持 prompt caching 的 provider 白名单（按 litellm model 前缀匹配）
@@ -1730,7 +1736,7 @@ def _flatten_media_content(content_list):
     return " ".join(text_parts)
 
 
-def _strip_media_and_merge(messages, model_name=None):
+def _strip_media_and_merge(messages, model_name=None, api_base=""):
     """
     1. 视觉输入处理：支持视觉的模型保留最近一条消息中的图片/视频（多模态负载原样透传），
        更早的历史图片一律折叠为占位符，避免每轮重复发送烧 Token；
@@ -1742,7 +1748,7 @@ def _strip_media_and_merge(messages, model_name=None):
 
     返回 (fixed_messages, folded_media_count, keep_media)。
     """
-    keep_reasoning_fields = _supports_reasoning_fields(model_name)
+    keep_reasoning_fields = _supports_reasoning_fields(model_name, api_base)
     keep_thinking_blocks = str(model_name or "").split("/")[0].lower() == "anthropic"
     keep_media = _supports_vision(model_name)
 
@@ -1796,15 +1802,18 @@ def _strip_media_and_merge(messages, model_name=None):
             cleaned_msg["reasoning_content"] = msg["reasoning_content"]
         if keep_reasoning_fields and keep_thinking_blocks and msg.get("thinking_blocks") is not None:
             cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
-        # DeepSeek thinking 契约：带 tool_calls 的 assistant 必须携带 reasoning_content
-        # key（空串亦可），缺 key 会 400。补空串是确定性变换，不破坏前缀稳定性。
+        # DeepSeek thinking 契约：带 tool_calls 的 assistant 必须携带模型返回的
+        # 完整 reasoning_content。缺失/空值无法重建，必须立即暴露，禁止补空串。
         if (
             role == "assistant"
             and cleaned_msg.get("tool_calls")
-            and _requires_tool_call_reasoning(model_name)
-            and cleaned_msg.get("reasoning_content") is None
+            and _requires_tool_call_reasoning(model_name, api_base)
+            and not cleaned_msg.get("reasoning_content")
         ):
-            cleaned_msg["reasoning_content"] = ""
+            raise ValueError(
+                "DeepSeek thinking 工具轮缺少完整 reasoning_content，"
+                "无法安全继续请求"
+            )
 
         # 净化 assistant 消息：若 content 包含 protocol sanitised 占位符且有 tool_calls/reasoning，将 content 重置为空字符串
         if role == "assistant" and isinstance(cleaned_msg.get("content"), str):
@@ -3483,7 +3492,9 @@ def _chat_with_model_generator(
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
                 try:
-                    cleaned_messages, folded_count, keep_media = _strip_media_and_merge(messages, model_name)
+                    cleaned_messages, folded_count, keep_media = _strip_media_and_merge(
+                        messages, model_name, api_base
+                    )
                     if _is_kimi_family(model_name, api_base):
                         # Moonshot 推理模型要求所有带 tool_calls 的 assistant 消息
                         # 携带 reasoning_content；从数据库重建的历史消息可能已被剥掉，

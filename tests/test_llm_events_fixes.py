@@ -1808,20 +1808,59 @@ def test_nonpersistent_vision_turn_does_not_replace_database_content(
 # ── DeepSeek thinking：带 tool_calls 的 assistant 必须回传 reasoning_content key ──
 
 
-def test_deepseek_thinking_backfills_empty_reasoning_key():
+@pytest.mark.parametrize("reasoning", [None, ""])
+def test_deepseek_thinking_requires_complete_reasoning_content(
+    monkeypatch, reasoning
+):
     import core.llm as llm_mod
 
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_litellm_model",
+        lambda model, base_url=None: None,
+    )
     messages = [
         {"role": "assistant", "content": "", "tool_calls": [
             {"id": "c1", "type": "function",
-             "function": {"name": "read_file", "arguments": "{}"}}]},
+             "function": {"name": "read_file", "arguments": "{}"}}],
+         "reasoning_content": reasoning},
         {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x"},
     ]
-    fixed, _, _ = llm_mod._strip_media_and_merge(messages, "deepseek/deepseek-thinking")
-    assert "reasoning_content" in fixed[0]
-    assert fixed[0]["reasoning_content"] == ""
-    # 幂等：再清洗一次字节不变
-    fixed2, _, _ = llm_mod._strip_media_and_merge(fixed, "deepseek/deepseek-thinking")
+
+    with pytest.raises(ValueError, match="reasoning_content"):
+        llm_mod._strip_media_and_merge(
+            messages,
+            "openai/deepseek-v4-pro",
+            "https://api.deepseek.com",
+        )
+
+
+def test_official_deepseek_openai_route_preserves_complete_reasoning(monkeypatch):
+    import core.llm as llm_mod
+
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_litellm_model",
+        lambda model, base_url=None: None,
+    )
+    messages = [
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c1", "type": "function",
+             "function": {"name": "read_file", "arguments": "{}"}}],
+         "reasoning_content": "完整分析过程"},
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x"},
+    ]
+
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/deepseek-v4-pro",
+        "https://api.deepseek.com",
+    )
+
+    assert fixed[0]["reasoning_content"] == "完整分析过程"
+    fixed2, _, _ = llm_mod._strip_media_and_merge(
+        fixed,
+        "openai/deepseek-v4-pro",
+        "https://api.deepseek.com",
+    )
     assert fixed2 == fixed
 
 
