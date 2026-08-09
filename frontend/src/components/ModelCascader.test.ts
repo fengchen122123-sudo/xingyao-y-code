@@ -54,5 +54,6 @@ describe('ModelCascader', () => {
     await wrapper.setProps({ visible: true });
 
     expect(wrapper.classes()).toContain('opens-up');
+    expect(wrapper.attributes('style')).toContain('--cascader-max-height: 680px');
   });
 });
