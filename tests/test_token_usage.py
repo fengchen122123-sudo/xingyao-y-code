@@ -220,3 +220,45 @@ def test_get_last_token_usage_returns_latest_per_session():
 
     other = manager.get_last_token_usage("s2")
     assert other["prompt_tokens"] == 200
+
+
+def test_memory_session_lifecycle_keeps_runtime_cache_state_in_sync():
+    import core.llm as llm
+
+    manager = MemoryManager(":memory:")
+    old_name = "memory-cache-old"
+    new_name = "memory-cache-new"
+    model = "openai/deepseek-v4"
+    base = "https://memory-lifecycle.example/v1"
+    manager.create_session_explicit(old_name)
+    llm._record_cache_usage(old_name, "main", 100, 90, "", model, base)
+
+    success, final_name = manager.rename_session(old_name, new_name)
+    assert success is True
+    assert final_name == new_name
+    assert llm.get_token_usage_snapshot(old_name, model, base)["cache"]["available"] is False
+    assert llm.get_token_usage_snapshot(new_name, model, base)["cache"]["available"] is True
+
+    manager.clear_session_messages(new_name)
+    assert llm.get_token_usage_snapshot(new_name, model, base)["cache"]["available"] is False
+
+    llm._record_cache_usage(new_name, "main", 100, 80, "", model, base)
+    manager.delete_session(new_name)
+    assert llm.get_token_usage_snapshot(new_name, model, base)["cache"]["available"] is False
+
+
+def test_delete_workspace_sessions_clears_each_runtime_cache_bucket(tmp_path):
+    import core.llm as llm
+
+    manager = MemoryManager(":memory:")
+    workdir = str(tmp_path)
+    model = "openai/deepseek-v4"
+    base = "https://workspace-delete.example/v1"
+    for name in ("workspace-cache-a", "workspace-cache-b"):
+        manager.create_session_explicit(name, workdir=workdir)
+        llm._record_cache_usage(name, "main", 100, 90, "", model, base)
+
+    manager.delete_sessions_by_workdir(workdir)
+
+    for name in ("workspace-cache-a", "workspace-cache-b"):
+        assert llm.get_token_usage_snapshot(name, model, base)["cache"]["available"] is False
