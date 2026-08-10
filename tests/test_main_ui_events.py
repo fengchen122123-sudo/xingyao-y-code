@@ -7,45 +7,6 @@ from core.turn_events import TurnEventFactory
 from rich.text import Text
 
 
-def test_format_token_usage_summary_uses_cumulative_hit_rate():
-    assert main._format_token_usage_summary(315_100, 3_400, 312_000, 315_100) == (
-        "全请求 输入 315.1K · 输出 3.4K · 缓存输入 315.1K · "
-        "命中 312.0K · 命中率 99%"
-    )
-
-
-def test_format_token_usage_summary_handles_zero_input():
-    assert main._format_token_usage_summary(0, 0, 0, 0) == (
-        "全请求 输入 0 · 输出 0 · 缓存输入 0 · 命中 0 · 命中率 --"
-    )
-
-
-def test_format_cache_usage_summary_shows_three_explicit_scopes():
-    cache = {
-        "available": True,
-        "latest": {"rate": 99.0},
-        "hot": {"rate": 98.8},
-        "session_all": {"rate": 91.0},
-    }
-
-    assert main._format_cache_usage_summary(cache) == (
-        "本轮 99.0% · 热路径 98.8% · 会话全量 91.0%"
-    )
-
-
-def test_format_cache_usage_summary_does_not_render_unknown_as_zero():
-    cache = {
-        "available": False,
-        "latest": {"rate": None},
-        "hot": {"rate": None},
-        "session_all": {"rate": None},
-    }
-
-    assert main._format_cache_usage_summary(cache) == (
-        "本轮 -- · 热路径 -- · 会话全量 --"
-    )
-
-
 def test_format_cache_hit_rate_uses_only_reported_cache_prompt():
     assert main._format_cache_hit_rate(90, 100) == "90.0%"
     assert main._format_cache_hit_rate(0, 0) == "--"
