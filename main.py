@@ -131,7 +131,7 @@ _startup_trace("MemoryManager ready")
 #   4. 后台线程绝不直接调用 print_formatted_text / app_instance.invalidate()。
 # ---------------------------------------------------------------------------
 current_theme = MY_THEME
-# 权限模式统一走 app_context 规范化，全系统只允许 confirm / auto / plan / full
+# 权限模式统一走 app_context 规范化，全系统只允许 confirm / plan / full
 import core.app_context as _app_ctx
 current_permission_mode = _app_ctx.normalize_permission_mode(MY_PERMISSION_MODE)
 plan_approved_this_turn = False
@@ -286,7 +286,7 @@ THEME_DESCS = {
 # /permission 帮助文本（list 子命令与无参数帮助共用）
 PERMISSION_HELP_LINES = (
     "  - <b>confirm</b> : 变更前确认 (修改文件、执行命令均需询问)",
-    "  - <b>plan</b>    : 计划模式 (开始执行修改前需一次性批准计划)",
+    "  - <b>plan</b>    : 计划模式 (沙盒内自由读取，只制定计划，不做任何修改)",
     "  - <b>full</b>    : 完全访问 (自动运行，无需任何确认)",
 )
 
@@ -472,46 +472,6 @@ def _usage_route_label(row):
         path_material = api_base
     path_id = hashlib.sha256(path_material.encode("utf-8")).hexdigest()[:8]
     return f"{model_label} @ {host} path#{path_id} [{scope}]"
-
-
-def _format_token_usage_summary(
-    cumulative_prompt,
-    cumulative_completion,
-    cumulative_cached,
-    cumulative_cache_prompt,
-):
-    """格式化状态栏累计 Token，并用同口径数据计算缓存命中率。"""
-    def format_num(num):
-        if num >= 1_000_000:
-            return f"{num / 1_000_000:.1f}M"
-        if num >= 1_000:
-            return f"{num / 1_000:.1f}K"
-        return str(num)
-
-    hit_rate = (
-        f"{cumulative_cached / cumulative_cache_prompt * 100:.0f}%"
-        if cumulative_cache_prompt > 0
-        else "--"
-    )
-    return (
-        f"全请求 输入 {format_num(cumulative_prompt)} · "
-        f"输出 {format_num(cumulative_completion)} · "
-        f"缓存输入 {format_num(cumulative_cache_prompt)} · "
-        f"命中 {format_num(cumulative_cached)} · 命中率 {hit_rate}"
-    )
-
-
-def _format_cache_usage_summary(cache):
-    """格式化本轮、热路径和当前会话全量三个不可混用的缓存口径。"""
-    def rate_text(section):
-        rate = (cache.get(section) or {}).get("rate")
-        return "--" if rate is None else f"{float(rate):.1f}%"
-
-    return (
-        f"本轮 {rate_text('latest')} · "
-        f"热路径 {rate_text('hot')} · "
-        f"会话全量 {rate_text('session_all')}"
-    )
 
 
 def set_terminal_title(title: str) -> None:
@@ -2775,15 +2735,21 @@ def _make_input_app():
         # 1. 提取短模型名（使用内存缓存，避免每次渲染都读盘解析 config.json）
         model_display = current_model_name or "未激活模型"
 
-        # 2. 读取统一快照：计费累计与当前会话缓存遥测保持不同口径。
+        # 2. 读取统一快照：取计费累计与上下文窗口用量
         usage_snapshot = get_token_usage_snapshot(
             current_session, current_model, current_url, "main"
         )
         process_usage = usage_snapshot["process"]
-        cache_usage = usage_snapshot["cache"]
         latest_total = usage_snapshot["window"]["latest_total"]
         max_win = current_ctx_win
 
+        cum_prompt = process_usage["cumulative_prompt"]
+        cum_completion = process_usage["cumulative_completion"]
+        cum_cached = process_usage["cumulative_cached"]
+
+        # 命中率分母用 prompt tokens（缓存只可能命中输入部分），
+        # 用 total（含输出）会把比率稀释失真
+        hit_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else 0
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
         
         def format_num(n):
@@ -2795,23 +2761,18 @@ def _make_input_app():
                 return f"{int(val)}K" if val.is_integer() else f"{val:.1f}K"
             return str(n)
             
+        prompt_str = format_num(cum_prompt)
+        completion_str = format_num(cum_completion)
+        cached_str = format_num(cum_cached)
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        token_info = _format_token_usage_summary(
-            process_usage["cumulative_prompt"],
-            process_usage["cumulative_completion"],
-            process_usage["cumulative_cached"],
-            process_usage["cumulative_cache_prompt"],
+        # 状态栏 Token 概览：输入/输出/命中/命中率/上下文
+        token_info = (
+            f"输入 {prompt_str} · 输出 {completion_str} · "
+            f"命中 {cached_str} ({hit_rate:.0f}%) · "
+            f"上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
         )
-        token_info += " · " + _format_cache_usage_summary(cache_usage)
-        token_info += f" · 上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
-        from core.cache_keepalive import cache_keepalive_service
-        keepalive_status = cache_keepalive_service.status()
-        if keepalive_status["enabled"]:
-            token_info += f" · 保活 {keepalive_status['interval']}s"
-        elif keepalive_status["error"]:
-            token_info += f" · 保活已停止: {keepalive_status['error']}"
 
         # 3. 统计星瑶的执行状态与播放动画，证明星瑶仍在操作/思考
         # 直接读模块全局变量，不再 import main 自引用
@@ -2838,11 +2799,6 @@ def _make_input_app():
         if current_permission_mode == "confirm":
             perm_label = " 变更前确认 "
             perm_style = "class:status.permission_confirm"
-        elif current_permission_mode == "auto":
-            # auto 由 GUI 侧设置并共享同一份 config，TUI 至少要如实显示当前状态，
-            # 避免用户在 GUI 切成"自动接受编辑"后回到 TUI 仍看到"变更前确认"
-            perm_label = " 自动接受编辑 "
-            perm_style = "class:status.permission_plan"
         elif current_permission_mode == "plan":
             perm_label = " 计划模式 "
             perm_style = "class:status.permission_plan"

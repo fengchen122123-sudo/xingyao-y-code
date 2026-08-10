@@ -63,3 +63,41 @@ def test_delete_folder_group_does_not_resurrect(monkeypatch):
     folder_paths = {g["folder_path"] for g in res["sessions"]}
     assert app_dir not in folder_paths
     assert bridge._memory.get_all_workspaces() == []
+
+
+def test_file_tree_per_dir_quota_keeps_late_top_level_entries(tmp_path):
+    """回归：字母序靠前的大目录不得吃满全局配额导致靠后的顶层条目被丢弃。"""
+    bridge = _bare_gui_bridge()
+    project = tmp_path / "project"
+    project.mkdir()
+    # 字母序靠前的大目录：条目数远超旧版全局 500 配额
+    big = project / "aaa_big"
+    big.mkdir()
+    for i in range(600):
+        (big / f"file_{i:04d}.txt").write_text("x", encoding="utf-8")
+    # 字母序靠后的顶层条目必须仍然可见
+    (project / "zzz_last.txt").write_text("x", encoding="utf-8")
+
+    tree = bridge._get_file_tree(str(project))
+    top_names = [node["n"] for node in tree]
+    assert "aaa_big" in top_names
+    assert "zzz_last.txt" in top_names
+
+
+def test_describe_permission_request_human_readable():
+    """权限询问文案必须写清楚执行什么命令 / 查看什么文件，不给 JSON 原文。"""
+    from core.tool_presenter import describe_permission_request
+
+    assert describe_permission_request(
+        "execute_command", {"command": "mvn install"}
+    ) == "执行命令：\nmvn install"
+    assert describe_permission_request(
+        "write_file", {"file_path": "a.txt"}
+    ) == "写入文件：a.txt"
+    summary = describe_permission_request(
+        "sandbox_outside_access",
+        {"path": r"D:\backup", "operation": "list_directory"},
+    )
+    assert "沙盒外" in summary
+    assert r"D:\backup" in summary
+    assert "查看目录" in summary

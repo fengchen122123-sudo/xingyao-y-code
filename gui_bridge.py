@@ -64,7 +64,10 @@ FILE_PREVIEW_MAX_BYTES = 256 * 1024
 
 # 文件树扫描限制
 FILE_TREE_MAX_DEPTH = 4
-FILE_TREE_MAX_ENTRIES = 500
+# 整棵树的总安全阀（防极端大目录拖慢 UI）
+FILE_TREE_MAX_ENTRIES = 2000
+# 每层目录独立配额：顶层条目不再被字母序靠前的大目录挤掉
+FILE_TREE_MAX_ENTRIES_PER_DIR = 100
 FILE_TREE_SKIP_DIRS = {
     ".git", "venv", ".venv", "node_modules", "__pycache__", "dist", "build",
 }
@@ -563,19 +566,25 @@ class ApiBridge:
     # 文件树 / 工作区
     # ------------------------------------------------------------------
     def _get_file_tree(self, path: str, depth: int = FILE_TREE_MAX_DEPTH) -> List[Dict[str, Any]]:
-        """递归扫描目录树；限制深度与总条目数，跳过体积巨大的构建/依赖目录。"""
-        counter = {"n": 0}
+        """递归扫描目录树；限制深度与条目数，跳过体积巨大的构建/依赖目录。
+
+        条目配额按【每层目录】独立计算：旧实现整棵树共享一个全局计数，
+        字母序靠前的大目录会吃满配额，导致靠后的顶层条目被静默丢弃，
+        表现为文件面板"显示不完全"。
+        """
+        budget = {"n": FILE_TREE_MAX_ENTRIES}
 
         def _scan(cur_path: str, cur_depth: int) -> List[Dict[str, Any]]:
-            if cur_depth <= 0 or counter["n"] >= FILE_TREE_MAX_ENTRIES:
+            if cur_depth <= 0 or budget["n"] <= 0:
                 return []
             items = []
             try:
                 entries = sorted(os.listdir(cur_path))
             except Exception:
                 return []
+            shown = 0
             for entry in entries:
-                if counter["n"] >= FILE_TREE_MAX_ENTRIES:
+                if shown >= FILE_TREE_MAX_ENTRIES_PER_DIR or budget["n"] <= 0:
                     break
                 if entry in FILE_TREE_SKIP_DIRS or entry.startswith("."):
                     continue
@@ -586,7 +595,8 @@ class ApiBridge:
                     is_dir = os.path.isdir(full_path)
                 except Exception:
                     continue
-                counter["n"] += 1
+                shown += 1
+                budget["n"] -= 1
                 # 同时提供两套字段名：n/d 供当前前端组件使用，
                 # name/type 为语义化别名，便于后续前端演进。
                 item: Dict[str, Any] = {
@@ -638,9 +648,11 @@ class ApiBridge:
                 return {"ok": False, "msg": "选择的路径不是文件夹"}
             os.chdir(selected_path)
             self._memory.add_workspace(selected_path)
-            # 当前会话跟随进入所选工作区：否则启动时挂在 GLOBAL 的会话
-            # 即使已在项目文件夹里干活，侧栏仍会一直显示在"对话"分组下
-            if self._current_session:
+            # 仅全局自由对话（GLOBAL）跟随迁入所选工作区：否则启动时挂在 GLOBAL
+            # 的会话即使已在项目文件夹里干活，侧栏仍会一直显示在"对话"分组下。
+            # 已归属其他项目的会话绝不能在此改写归属（否则引入新目录会把别的
+            # 项目的会话"搬"进新目录）
+            if self._current_session and self._session_workdir(self._current_session) == "GLOBAL":
                 self._memory.update_session_workdir(self._current_session, selected_path)
             return {
                 "ok": True,
@@ -718,7 +730,10 @@ class ApiBridge:
                 wdir = s.get("workdir")
                 display = "新会话" if is_default_name else name
 
-                if wdir == "GLOBAL":
+                # 无 workdir 的历史会话（旧数据/TUI 产生）固定归入"对话"分组；
+                # 不能兜底跟随进程 cwd，否则引入新目录 chdir 后它们会集体"搬"
+                # 到新目录下，表现为会话归属错乱
+                if not wdir or wdir == "GLOBAL":
                     global_group["sessions"].append({
                         "name": name,
                         "display_name": display,
@@ -729,7 +744,7 @@ class ApiBridge:
                     })
                     continue
 
-                wdir_norm = _resolve_real_path(wdir) if wdir else current_wdir
+                wdir_norm = _resolve_real_path(wdir)
                 s_info = {
                     "name": name,
                     "display_name": display,
@@ -749,10 +764,12 @@ class ApiBridge:
                     }
                 groups_dict[wdir_norm]["sessions"].append(s_info)
 
-            # 3. 全局对话组无条件保留在最顶部，随后接入引入的所有项目分组
+            # 3. 全局对话组无条件保留在最顶部，项目分组按名称稳定排序。
+            # 不能把"当前会话所在目录"置顶：否则点击不同目录的会话时列表
+            # 会整体跳动
             result_groups = [global_group]
             project_groups = list(groups_dict.values())
-            project_groups.sort(key=lambda g: (0 if g["is_current"] else 1, g["folder_name"]))
+            project_groups.sort(key=lambda g: g["folder_name"])
             result_groups.extend(project_groups)
             return result_groups
         except Exception:
@@ -828,9 +845,14 @@ class ApiBridge:
 
             is_global = (target_workdir == "GLOBAL" or stored_wdir == "GLOBAL")
 
-            if not is_global and target_workdir and os.path.isdir(target_workdir):
-                if os.path.abspath(target_workdir) != os.path.abspath(os.getcwd()):
-                    os.chdir(target_workdir)
+            if not is_global:
+                # 优先使用会话登记的 workdir：未传 target_workdir 的调用路径
+                # （如删除当前会话后的自动切换）若退回进程 cwd，会话 A 的工作区
+                # 会错显示成上一个项目 B 的目录
+                candidate_wdir = target_workdir or stored_wdir
+                if candidate_wdir and candidate_wdir != "GLOBAL" and os.path.isdir(candidate_wdir):
+                    if os.path.abspath(candidate_wdir) != os.path.abspath(os.getcwd()):
+                        os.chdir(candidate_wdir)
 
             msgs = self._load_session_messages(session_name)
 
@@ -988,8 +1010,10 @@ class ApiBridge:
     # 权限确认：统一走 core.permission_broker（与 TUI 同一套串行化机制）
     # ------------------------------------------------------------------
     def _activate_permission_request(self, request):
-        """broker 激活某个请求 → 推送到前端弹窗，并挂一个"超时即拒绝"的定时器。"""
+        """broker 激活某个请求 → 推送到前端对话流内联卡片，并挂一个"超时即拒绝"的定时器。"""
         try:
+            from core.tool_presenter import describe_permission_request
+            options = list(request.options or ())
             self.emit_event("permission_request", {
                 "request_id": request.request_id,
                 "function_name": request.function_name,
@@ -997,8 +1021,14 @@ class ApiBridge:
                 "tool_name": request.function_name,
                 "arguments": dict(request.arguments or {}),
                 "details": dict(request.arguments or {}),
+                # 人类可读描述（执行什么命令 / 查看什么文件），前端直接展示
+                "summary": describe_permission_request(
+                    request.function_name, dict(request.arguments or {})
+                ),
                 "source": request.source,
-                "options": list(request.options or ()),
+                "options": options,
+                # 沙盒外访问等场景只给 同意/拒绝 两项，不渲染"总是允许"
+                "allow_always": len(options) >= 3,
             })
         except Exception:
             logger.exception("推送权限请求失败")

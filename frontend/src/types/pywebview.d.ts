@@ -2,7 +2,7 @@
 // 本文件按后端桥接 API 契约编写（而非当前 gui_bridge.py 的实现），
 // 后端会单独重写以匹配此契约。
 
-export type PermissionMode = 'confirm' | 'auto' | 'plan' | 'full';
+export type PermissionMode = 'confirm' | 'plan' | 'full';
 // 推理强度档位：default = 模型条目未配置，用请求层内置默认
 export type ReasoningEffort = 'default' | 'low' | 'high' | 'max';
 

@@ -155,9 +155,11 @@ export interface ConfirmState {
 export interface PermReqState {
   show: boolean;
   reqId: string;
-  toolName: string;
-  details: string;
+  // 人类可读描述（后端 describe_permission_request 生成）：执行什么命令 / 查看什么文件
+  summary: string;
   source: string;
+  // 沙盒外访问等场景后端只给两项选项，不渲染“总是允许”
+  allowAlways: boolean;
 }
 
 export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models';
@@ -204,6 +206,8 @@ export const useAppStore = defineStore('app', {
     // 对话消息流
     messages: [] as ChatMessage[],
     running: false,
+    // 当前推送中的回合属于其他会话（如后台任务自动汇总）：事件不写入当前视图
+    foreignTurnActive: false,
     showThinking: false,
 
     // 后端连接状态 / 版本号
@@ -239,7 +243,7 @@ export const useAppStore = defineStore('app', {
     confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎' } as ConfirmState,
 
     // 权限请求弹窗
-    permModal: { show: false, reqId: '', toolName: '', details: '', source: '' } as PermReqState,
+    permRequest: { show: false, reqId: '', summary: '', source: '', allowAlways: false } as PermReqState,
 
     // 二级抽屉页面：技能 / MCP / 模型管理
     subpage: { show: false, type: 'skills' as SubpageType },
@@ -322,6 +326,8 @@ export const useAppStore = defineStore('app', {
       this.themeLight = !this.themeLight;
       // body.light 是唯一的浅色主题开关机制（对应 style.css 中的 body.light 选择器）
       document.body.classList.toggle('light', this.themeLight);
+      // localStorage 镜像：下次启动 splash 渲染前即可恢复主题（见 main.ts）
+      try { localStorage.setItem('ycode-theme-light', this.themeLight ? '1' : '0'); } catch {}
       // 持久化主题到后端 config.json（关闭重开不变），并同步 Windows 窗口标题栏明暗
       this._api()?.set_gui_theme(this.themeLight)?.catch(() => {});
     },
@@ -424,6 +430,7 @@ export const useAppStore = defineStore('app', {
         // 恢复持久化的界面主题（默认深色）：body 类与标题栏一并同步
         this.themeLight = !!(init as any).theme_light;
         document.body.classList.toggle('light', this.themeLight);
+        try { localStorage.setItem('ycode-theme-light', this.themeLight ? '1' : '0'); } catch {}
         api.set_titlebar_theme(!this.themeLight)?.catch(() => {});
         this.fileTree = (init as any).file_tree || [];
         this.tokenUsage = normalizeTokenUsage(init.token_usage);
@@ -508,6 +515,9 @@ export const useAppStore = defineStore('app', {
       if (!api) return;
       try {
         const res = await api.switch_session(sessionName, targetWorkdir);
+        // 竞态防护：快速连点不同会话时响应可能乱序返回，过期响应直接丢弃，
+        // 避免高亮停在 B 会话却渲染出 A 会话的内容
+        if (this.currentSessionName !== sessionName) return;
         this.messages = pairHistoryToolMessages(res.messages || []);
 
         if (res.is_global || res.workdir === 'GLOBAL') {
@@ -695,7 +705,14 @@ export const useAppStore = defineStore('app', {
         if (this.pendingWorkdir !== null) {
           pendingDir = this.pendingWorkdir;
           this.pendingWorkdir = null;
-          sessionName = 'session_' + Math.random().toString(16).slice(2, 8).padEnd(6, '0');
+          // 6 位随机名需避开已有会话：撞名会被后端 INSERT OR IGNORE 静默
+          // 并入已存在的会话，表现为两个会话内容互串
+          const existingNames = new Set(
+            this.sessionGroups.flatMap(g => (g.sessions || []).map(s => s.name)),
+          );
+          do {
+            sessionName = 'session_' + Math.random().toString(16).slice(2, 8).padEnd(6, '0');
+          } while (existingNames.has(sessionName));
           this.currentSessionName = sessionName;
         }
         const res = await api.send_user_message(text.trim(), sessionName, attachList, pendingDir);
@@ -745,7 +762,29 @@ export const useAppStore = defineStore('app', {
       // 只要有事件推送过来，说明桥接链路是通的
       this.connected = true;
 
+      // 其他会话的回合事件（典型场景：后台任务自动汇总）不写入当前会话视图，
+      // 只在该回合结束时恢复空闲状态；后端单回合 worker 保证事件不会交错
+      if (this.foreignTurnActive) {
+        if (type === 'turn_finish' || type === 'turn_cancelled' || type === 'turn_error' || type === 'turn_idle') {
+          this.foreignTurnActive = false;
+          this.running = false;
+          this.refreshSessions();
+        }
+        return;
+      }
+
       if (type === 'turn_start') {
+        // 回合归属校验：后端 turn_start 携带 session_name，不属于当前正在查看
+        // 的会话时只锁定输入（后端单回合，仍忙），不把气泡/流式内容推入当前视图
+        const turnSession = String(data.session_name || '');
+        if (turnSession && turnSession !== this.currentSessionName) {
+          this.foreignTurnActive = true;
+          this.running = true;
+          if (data.internal === 'bg_summary') {
+            this.showToast('后台子代理任务已全部结束，正在自动汇总结果', 'ok');
+          }
+          return;
+        }
         this.running = true;
         this.currentStreamingText = '';
         this.currentThinkingText = '';
@@ -887,16 +926,16 @@ export const useAppStore = defineStore('app', {
           };
         }
       } else if (type === 'permission_request') {
-        this.permModal = {
+        this.permRequest = {
           show: true,
           reqId: data.request_id,
-          toolName: data.function_name,
-          details: JSON.stringify(data.arguments || {}, null, 2),
+          summary: String(data.summary || data.function_name || ''),
           source: data.source || '',
+          allowAlways: !!data.allow_always,
         };
       } else if (type === 'permission_dismiss') {
-        // 后端权限队列已清空（请求被超时拒绝/取消）：收起弹窗，避免死请求残留
-        this.permModal.show = false;
+        // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留
+        this.permRequest.show = false;
       } else if (type === 'notice') {
         if (data.message) this.showToast(String(data.message), 'ok');
       } else if (type === 'session_renamed') {
@@ -1006,8 +1045,8 @@ export const useAppStore = defineStore('app', {
     },
 
     async respondPermission(allowed: boolean, always: boolean) {
-      const reqId = this.permModal.reqId;
-      this.permModal.show = false;
+      const reqId = this.permRequest.reqId;
+      this.permRequest.show = false;
       if (!reqId) return;
       const api = this._api();
       if (!api) return;

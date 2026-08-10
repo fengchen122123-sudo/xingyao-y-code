@@ -87,6 +87,32 @@ def _skill_name_from_path(file_path: str) -> str:
     return ""
 
 
+def describe_permission_request(function_name: str, arguments: dict) -> str:
+    """权限询问的人类可读描述：写清楚要执行什么命令 / 查看什么文件。
+
+    GUI 内联权限卡片与任何需要向用户解释工具意图的场景共用，
+    绝不把 arguments JSON 原文直接甩给用户。
+    """
+    args = dict(arguments or {})
+    if function_name == "sandbox_outside_access":
+        path = str(args.get("path") or "")
+        op = str(args.get("operation") or "")
+        op_label = _TOOL_ACTIONS.get(op, op or "访问")
+        return (
+            "访问沙盒外路径（当前项目目录之外）\n"
+            f"路径：{path}\n"
+            f"操作：{op_label}"
+        )
+    if function_name == "execute_command":
+        cmd = sanitize_tool_display_text(args.get("command") or "", limit=500)
+        return f"执行命令：\n{cmd}" if cmd else "执行命令"
+    action = _TOOL_ACTIONS.get(function_name, f"使用工具 {function_name}")
+    target = tool_target(function_name, args)
+    if target:
+        return f"{action}：{sanitize_tool_display_text(target, limit=300)}"
+    return action
+
+
 def tool_target(name: str, arguments: dict) -> str:
     key = _TOOL_COPY.get(name, ("使用工具", "工具执行完成", ""))[2]
     target = str(arguments.get(key, "")).strip() if key else ""

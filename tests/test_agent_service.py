@@ -158,23 +158,23 @@ def test_evict_oldest_turn_removes_complete_rounds_only():
 
 
 def test_normalize_permission_mode_maps_legacy_and_chinese_labels():
-    """权限模式规范化：只允许 confirm / auto / plan / full 四个值。"""
+    """权限模式规范化：只允许 confirm / plan / full 三个值。"""
     assert app_context.normalize_permission_mode("confirm") == "confirm"
-    assert app_context.normalize_permission_mode("AUTO") == "auto"
     assert app_context.normalize_permission_mode("plan") == "plan"
     assert app_context.normalize_permission_mode("full") == "full"
 
     # 历史遗留 / 中文标签
     assert app_context.normalize_permission_mode("default") == "confirm"
     assert app_context.normalize_permission_mode("默认模式") == "confirm"
-    assert app_context.normalize_permission_mode("自动接受编辑") == "auto"
     assert app_context.normalize_permission_mode("计划模式") == "plan"
     assert app_context.normalize_permission_mode("YOLO (全部允许)") == "full"
 
-    # 未知值与空值一律回落到最保守的 confirm，绝不放宽权限
+    # 未知值、空值与已下线的历史 auto 模式一律回落到最保守的 confirm，绝不放宽权限
     assert app_context.normalize_permission_mode("") == "confirm"
     assert app_context.normalize_permission_mode(None) == "confirm"
     assert app_context.normalize_permission_mode("随便乱写") == "confirm"
+    assert app_context.normalize_permission_mode("AUTO") == "confirm"
+    assert app_context.normalize_permission_mode("自动接受编辑") == "confirm"
 
 
 def test_set_permission_mode_stores_canonical_value():
@@ -182,8 +182,8 @@ def test_set_permission_mode_stores_canonical_value():
     original = app_context.get()
     try:
         app_context.register(None)
-        assert app_context.set_permission_mode("自动接受编辑") == "auto"
-        assert app_context.get_permission_mode() == "auto"
+        assert app_context.set_permission_mode("计划模式") == "plan"
+        assert app_context.get_permission_mode() == "plan"
         assert app_context.set_permission_mode("YOLO") == "full"
         assert app_context.get_permission_mode() == "full"
     finally:
@@ -658,7 +658,7 @@ def test_prepare_turn_snips_before_summarizing(stub_llm, quiet_extras, monkeypat
     _fill_big_tool_results(manager, session, 5)
     # 窗口 100000：snip 水位 60000 < 初始估算；snip 后回落到 80000(elide)/95000(摘要) 之下
     prepare_turn_messages(
-        manager, session, "deepseek-chat", 100000, permission_mode="auto"
+        manager, session, "deepseek-chat", 100000, permission_mode="confirm"
     )
     assert calls == []  # 未触发付费摘要
     history = manager.get_history_for_llm(session)
@@ -687,6 +687,6 @@ def test_prepare_turn_summarizes_only_above_095(stub_llm, quiet_extras, monkeypa
         manager.add_message(session, "user", f"问题{i} " + "汉" * 300)
         manager.add_message(session, "assistant", f"回答{i} " + "汉" * 300)
     prepare_turn_messages(
-        manager, session, "deepseek-chat", 16000, permission_mode="auto"
+        manager, session, "deepseek-chat", 16000, permission_mode="confirm"
     )
     assert len(calls) == 1

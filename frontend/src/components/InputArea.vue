@@ -27,7 +27,6 @@
             title="切换权限模式"
             @click.stop="togglePermDropdown"
           >{{ formatPermMode(store.permissionMode) }} <span class="permission-chevron">▼</span></button>
-          <button class="chip-btn" title="撤销星瑶上一次的文件修改" @click="store.undoLastEdit()">↩ 撤销</button>
 
           <button
             ref="modelBtnRef"
@@ -37,13 +36,10 @@
           >{{ store.activeModelName || '选择模型' }} <span style="font-size:9px;color:var(--text-faint)">▼</span></button>
           <button
             id="send-btn"
-            :class="{ stop: store.running }"
+            :class="{ stop: store.running, active: !store.running && (!!inputVal.trim() || attachments.length > 0) }"
             :title="store.running ? '停止生成 (Esc)' : '发送消息 (Enter)'"
             @click="handleSend"
-          >
-            <template v-if="store.running">■ 停止 (Esc)</template>
-            <template v-else>发送 ⏎</template>
-          </button>
+          >{{ store.running ? '■' : '↑' }}</button>
         </div>
       </div>
     </div>
@@ -151,7 +147,7 @@ function handleSend() {
   flex-shrink: 0;
 }
 #input-wrap {
-  max-width: 880px;
+  /* 自适应拉伸占满输入区，不再限宽居中（两侧不留白） */
   margin: 0 auto;
 }
 #input-box {
@@ -223,25 +219,33 @@ textarea {
 }
 
 #send-btn {
-  border-radius: 8px;
-  padding: 5px 14px;
-  font-size: 12.5px;
-  font-weight: 600;
+  /* 与首页一致的圆形箭头按钮 */
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
   border: none;
-  background: var(--accent);
-  color: #fff;
+  background: var(--bg3);
+  color: var(--text-faint);
+  font-size: 15px;
+  font-weight: 600;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
   transition: 0.15s;
 }
-#send-btn:hover {
-  filter: brightness(1.1);
+#input-box:focus-within #send-btn,
+#send-btn.active {
+  background: var(--accent);
+  color: #fff;
 }
 #send-btn.stop {
   background: var(--red);
+  color: #fff;
 }
 
 #input-meta {
-  max-width: 880px;
   margin: 6px auto 0;
   display: flex;
   justify-content: space-between;
