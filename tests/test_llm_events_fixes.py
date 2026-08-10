@@ -907,25 +907,55 @@ def test_imom_active_publish_root_reads_store(tmp_path, monkeypatch):
     assert llm_mod._get_imom_active_publish_root() == "/data/publish"
 
 
-def test_plan_mode_approved_still_asks_sandbox_outside_access(monkeypatch):
-    """回归：plan 模式计划已批准时，sandbox_outside_access 不得自动放行"""
+def test_plan_mode_still_asks_sandbox_outside_access(monkeypatch):
+    """回归：plan 模式下 sandbox_outside_access 仍必须询问（不自动放行）。
+
+    新语义：plan 模式不批准任何修改——修改/执行类工具在
+    _execute_single_tool_call 中被 PLAN_MODE_DENIED_MESSAGE 硬拦截，
+    不会进入 check_permission_and_ask；能走到这里的只剩
+    sandbox_outside_access 等必须逐次询问的场景。
+    """
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod.app_context, "get_permission_mode", lambda: "plan")
-    monkeypatch.setattr(llm_mod.app_context, "get_plan_approved", lambda: True)
     # 用权限回调充当“询问了用户”的探针：走到询问路径会调用它
     monkeypatch.setattr(
         llm_mod.app_context, "get_permission_callback", lambda: (lambda *a, **kw: "ASKED")
     )
 
-    # sandbox_outside_access 必须继续询问，不能被计划批准自动放行
+    # sandbox_outside_access 必须继续询问
     assert llm_mod.check_permission_and_ask(
         "sandbox_outside_access", {"path": "/outside", "operation": "write_file"}
     ) == "ASKED"
-    # 对照：普通写操作在计划批准后仍自动放行
-    assert llm_mod.check_permission_and_ask(
-        "write_file", {"file_path": "a.txt"}
-    ) is True
+
+
+def test_plan_mode_blocks_modifying_tools(monkeypatch):
+    """plan 模式硬拦截：任何需要权限的修改/执行类工具直接返回计划模式拒绝文案，
+    不执行、不询问；规划类工具（plan_write 等）不受影响。"""
+    import json as _json
+    import core.llm as llm_mod
+
+    monkeypatch.setattr(llm_mod.app_context, "get_permission_mode", lambda: "plan")
+    executed = []
+    monkeypatch.setattr(
+        llm_mod.tool_registry, "execute",
+        lambda name, **kw: executed.append(name),
+    )
+
+    def _tc(name, args):
+        return {
+            "id": f"tc-{name}",
+            "function": {"name": name, "arguments": _json.dumps(args)},
+        }
+
+    for name, args in (
+        ("write_file", {"file_path": "a.txt", "content": "x"}),
+        ("edit_file", {"file_path": "a.txt", "old_string": "a", "new_string": "b"}),
+        ("execute_command", {"command": "echo hi"}),
+    ):
+        result = llm_mod._execute_single_tool_call(_tc(name, args))
+        assert result["content"] == llm_mod.PLAN_MODE_DENIED_MESSAGE, name
+    assert executed == []
 
 
 # ── 多模态图片透传（_strip_media_and_merge / _supports_vision）──

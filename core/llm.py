@@ -143,6 +143,17 @@ ASK_USER_ERROR_PREFIX = "无法提问："
 TOOL_INTERNAL_ERROR_PREFIX = "Tool execution error:"
 PERMISSION_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 用户拒绝了执行该操作。"
 PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
+# 计划模式硬拦截：只读工具（requires_permission=False）不受影响；
+# 沙盒外只读访问仍由 _sandbox_outside_guard 逐次询问
+PLAN_MODE_DENIED_MESSAGE = (
+    f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息和制定计划，"
+    "不允许执行任何修改/命令。请改用 plan_write 把操作步骤写入计划，"
+    "并提示用户切换到「变更前确认」或「完全访问」模式后再执行。"
+)
+# 计划模式下仍然放行的规划类工具（其余需要权限的工具一律拦截）
+_PLAN_MODE_ALLOWED_TOOLS = frozenset({
+    "plan_write", "plan_read", "plan_update", "plan_retry", "ask_user",
+})
 PERMISSION_SYSTEM_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
     f"这不是用户拒绝，请稍后重试或检查权限组件状态。"
@@ -427,23 +438,9 @@ def check_permission_and_ask(
             _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
 
-    # 2.5 auto（自动接受编辑）模式：只自动放行文件写入/修改，
-    #     execute_command 等有副作用的操作仍然必须逐次确认。
-    if app_context.get_permission_mode() == "auto" and function_name in ("write_file", "edit_file"):
-        if event_callback is not None:
-            _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
-        return True
-
-    # 3. 如果是计划模式且本轮对话的计划已经获得批准，直接通过
-    #    但 sandbox_outside_access 不受计划批准自动放行，必须每次询问用户。
-    if (
-        app_context.get_permission_mode() == "plan"
-        and app_context.get_plan_approved()
-        and function_name != "sandbox_outside_access"
-    ):
-        if event_callback is not None:
-            _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
-        return True
+    # 3. 计划模式的修改/执行类操作不会走到这里（在 _execute_single_tool_call
+    #    中已被 PLAN_MODE_DENIED_MESSAGE 硬拦截）；走到这里的只剩
+    #    sandbox_outside_access 等必须逐次询问的场景，直接进入询问流程。
 
     _notify_event(event_callback, "permission_requested", {
         "function_name": function_name,
@@ -577,10 +574,6 @@ def check_permission_and_ask(
             return True
 
         approved = (choice_idx in (0, 2))
-        # plan 模式仅在用户明确选择“始终放行”时才批准整轮计划，
-        # “同意本次”(0) 只放行当前这一次操作
-        if choice_idx == 2 and app_context.get_permission_mode() == "plan":
-            app_context.set_plan_approved(True)
         return approved
     except Exception as e:
         _notify_event(event_callback, "error", {
@@ -2965,7 +2958,16 @@ def _execute_single_tool_call(
     # 沙盒外的 write_file/edit_file 由 _sandbox_outside_guard 单独询问（文案含路径），
     # 跳过此处的通用确认，避免同一操作被连续询问两次
     _defer_to_sandbox_guard = False
-    if requires_permission and function_name in ("write_file", "edit_file"):
+    # 计划模式：任何需要权限的修改/执行类操作一律硬拦截（规划类工具除外），
+    # 引导模型改为输出计划；只读工具不受影响，沙盒外只读访问仍逐次询问
+    if (
+        requires_permission
+        and not result
+        and app_context.get_permission_mode() == "plan"
+        and function_name not in _PLAN_MODE_ALLOWED_TOOLS
+    ):
+        result = PLAN_MODE_DENIED_MESSAGE
+    if requires_permission and not result and function_name in ("write_file", "edit_file"):
         try:
             _defer_to_sandbox_guard = is_outside_workspace(arguments.get("file_path", ""))
         except Exception:
@@ -3000,6 +3002,7 @@ def _execute_single_tool_call(
             PERMISSION_CANCELLED_MESSAGE,
             PERMISSION_SYSTEM_ERROR_MESSAGE,
             PATH_VALIDATION_ERROR_MESSAGE,
+            PLAN_MODE_DENIED_MESSAGE,
         ):
             pass
         elif function_name == "read_file":

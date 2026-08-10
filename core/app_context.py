@@ -21,8 +21,9 @@ _current_session_fallback: str = ""
 _manager_fallback: Optional[Any] = None
 _permission_mode_fallback: str = "confirm"
 
-# 规范权限模式集合：全系统只允许出现这四个值
-CANONICAL_PERMISSION_MODES = ("confirm", "auto", "plan", "full")
+# 规范权限模式集合：全系统只允许出现这三个值
+# confirm=变更前确认(任何操作都询问) / plan=计划模式(只读取与规划,不做任何修改) / full=完全访问(沙盒内全部放行,沙盒外仍询问)
+CANONICAL_PERMISSION_MODES = ("confirm", "plan", "full")
 
 # 历史遗留 / 中文标签 -> 规范值的映射表
 _PERMISSION_MODE_ALIASES = {
@@ -31,12 +32,6 @@ _PERMISSION_MODE_ALIASES = {
     "ask": "confirm",
     "变更前确认": "confirm",
     "默认模式": "confirm",
-    "auto": "auto",
-    "autoedit": "auto",
-    "auto_edit": "auto",
-    "acceptedits": "auto",
-    "自动接受编辑": "auto",
-    "自动模式": "auto",
     "plan": "plan",
     "planning": "plan",
     "计划模式": "plan",
@@ -67,9 +62,9 @@ def is_known_permission_mode(value: Any) -> bool:
 
 
 def normalize_permission_mode(value: Any) -> str:
-    """把任意来源的权限模式值规范化为 confirm / auto / plan / full 之一。
+    """把任意来源的权限模式值规范化为 confirm / plan / full 之一。
 
-    未知值一律回落到最保守的 'confirm'，绝不放宽权限。
+    未知值（含已下线的历史 auto 模式）一律回落到最保守的 'confirm'，绝不放宽权限。
     """
     text = str(value or "").strip()
     if not text:

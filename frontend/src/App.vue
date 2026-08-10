@@ -41,6 +41,9 @@
                 :msg="msg"
               />
             </template>
+
+            <!-- 权限询问内联卡片（codex 风格，跟随对话流末尾） -->
+            <PermCard />
           </div>
         </div>
 
@@ -76,9 +79,8 @@
       </div>
     </div>
 
-    <!-- 确认与权限弹窗 -->
+    <!-- 确认弹窗 -->
     <ConfirmModal />
-    <PermModal />
 
     <!-- 全局 Toast -->
     <div id="toast" :class="[store.toast.show ? 'show' : '', store.toast.type]">
@@ -110,7 +112,7 @@ import MessageBubble from './components/MessageBubble.vue';
 import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
-import PermModal from './components/PermModal.vue';
+import PermCard from './components/PermCard.vue';
 import Subpage from './components/Subpage.vue';
 import SettingsPage from './components/SettingsPage.vue';
 
@@ -151,6 +153,10 @@ watch(() => store.messages.length, () => {
   scrollToBottom();
 });
 watch(() => store.currentStreamingText, () => {
+  scrollToBottom();
+});
+// 权限卡片出现/收起时同步滚动，保证用户能立即看到询问
+watch(() => store.permRequest.show, () => {
   scrollToBottom();
 });
 

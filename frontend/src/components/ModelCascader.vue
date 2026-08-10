@@ -70,6 +70,9 @@ const activeProviderName = ref<string | null>(null);
 const styleObj = ref<Record<string, string>>({});
 const subPanelStyle = ref<Record<string, string>>({});
 const opensUp = ref(false);
+// 记住上次悬停的供应商行：主面板跟随锚点移动时同步重算二级面板位置
+const lastProviderRow = ref<HTMLElement | null>(null);
+let rafId = 0;
 
 const MENU_GAP = 8;
 const VIEWPORT_PADDING = 12;
@@ -89,10 +92,7 @@ function hasCurrentModel(modelsList: ModelInfo[]) {
   return modelsList.some(m => m.id === store.activeModelId);
 }
 
-function activateProvider(provider: string, event: MouseEvent) {
-  activeProviderName.value = provider;
-
-  const providerRow = event.currentTarget as HTMLElement;
+function positionSubPanel(providerRow: HTMLElement) {
   const mainPanel = providerRow.closest('.cascader-main-panel');
   if (!(mainPanel instanceof HTMLElement)) {
     throw new Error('Model provider row must be inside the cascader main panel');
@@ -119,6 +119,13 @@ function activateProvider(provider: string, event: MouseEvent) {
   };
 }
 
+function activateProvider(provider: string, event: MouseEvent) {
+  activeProviderName.value = provider;
+  const providerRow = event.currentTarget as HTMLElement;
+  lastProviderRow.value = providerRow;
+  positionSubPanel(providerRow);
+}
+
 function selectModel(modelId: string) {
   store.setModel(modelId);
   emit('close');
@@ -141,42 +148,59 @@ function selectEffort(level: ReasoningEffort) {
   store.setReasoningEffort(level);
 }
 
-watch(() => props.visible, (newVal) => {
-  if (newVal && props.anchorEl) {
-    const r = props.anchorEl.getBoundingClientRect();
-    const upwardHeight = Math.max(0, Math.floor(r.top - MENU_GAP - VIEWPORT_PADDING));
-    const downwardHeight = Math.max(0, Math.floor(
-      window.innerHeight - r.bottom - MENU_GAP - VIEWPORT_PADDING,
-    ));
-    const isBottomHalf = upwardHeight >= downwardHeight;
-    const maxPanelHeight = isBottomHalf ? upwardHeight : downwardHeight;
-    opensUp.value = isBottomHalf;
+function positionMainPanel() {
+  if (!props.anchorEl) return;
+  const r = props.anchorEl.getBoundingClientRect();
+  const upwardHeight = Math.max(0, Math.floor(r.top - MENU_GAP - VIEWPORT_PADDING));
+  const downwardHeight = Math.max(0, Math.floor(
+    window.innerHeight - r.bottom - MENU_GAP - VIEWPORT_PADDING,
+  ));
+  const isBottomHalf = upwardHeight >= downwardHeight;
+  const maxPanelHeight = isBottomHalf ? upwardHeight : downwardHeight;
+  opensUp.value = isBottomHalf;
 
-    if (isBottomHalf) {
-      const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
-      styleObj.value = {
-        position: 'fixed',
-        bottom: `${window.innerHeight - r.top + MENU_GAP}px`,
-        left: `${left}px`,
-        right: 'auto',
-        top: 'auto',
-        '--cascader-max-height': `${maxPanelHeight}px`,
-      };
-    } else {
-      const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
-      styleObj.value = {
-        position: 'fixed',
-        top: `${r.bottom + MENU_GAP}px`,
-        left: `${left}px`,
-        right: 'auto',
-        bottom: 'auto',
-        '--cascader-max-height': `${maxPanelHeight}px`,
-      };
-    }
+  const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
+  if (isBottomHalf) {
+    styleObj.value = {
+      position: 'fixed',
+      bottom: `${window.innerHeight - r.top + MENU_GAP}px`,
+      left: `${left}px`,
+      right: 'auto',
+      top: 'auto',
+      '--cascader-max-height': `${maxPanelHeight}px`,
+    };
+  } else {
+    styleObj.value = {
+      position: 'fixed',
+      top: `${r.bottom + MENU_GAP}px`,
+      left: `${left}px`,
+      right: 'auto',
+      bottom: 'auto',
+      '--cascader-max-height': `${maxPanelHeight}px`,
+    };
+  }
+}
+
+// 菜单打开期间逐帧跟随锚点：收起/展开右侧面板等布局变化（含 0.25s 过渡动画）
+// 会让锚点持续移动，一次性快照必然过期，导致主/子面板错位层叠
+function trackAnchor() {
+  positionMainPanel();
+  if (activeProviderName.value && lastProviderRow.value) {
+    positionSubPanel(lastProviderRow.value);
+  }
+  rafId = requestAnimationFrame(trackAnchor);
+}
+
+watch(() => props.visible, (newVal) => {
+  cancelAnimationFrame(rafId);
+  if (newVal && props.anchorEl) {
+    positionMainPanel();
 
     // 二级模型列表只在悬停供应商后展开，保持一级列表简洁。
     activeProviderName.value = null;
     subPanelStyle.value = {};
+    lastProviderRow.value = null;
+    rafId = requestAnimationFrame(trackAnchor);
   }
 });
 
@@ -191,6 +215,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   document.removeEventListener('click', onGlobalClick);
+  cancelAnimationFrame(rafId);
 });
 </script>
 
@@ -202,7 +227,8 @@ onUnmounted(() => {
   flex-direction: row;
   align-items: flex-start;
   gap: 8px;
-  animation: fadein 0.15s cubic-bezier(0.16, 1, 0.3, 1);
+  /* 入场动画在面板上而不在容器：容器动画的 transform 会创建 containing block，
+     使 fixed 定位的二级面板在动画期间相对容器而非视口，表现为短暂错位 */
 }
 #model-cascader.show {
   display: flex;
@@ -225,6 +251,7 @@ onUnmounted(() => {
 }
 .cascader-main-panel {
   order: 1;
+  animation: fadein 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
 .cascader-sub-panel {
   order: 2;
