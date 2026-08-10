@@ -1,8 +1,22 @@
 <template>
   <div class="msg" :class="[msg.role === 'user' ? 'msg-user' : 'msg-assistant']">
-    <!-- 用户消息 -->
+    <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大） -->
     <div v-if="msg.role === 'user'" class="bubble user-bubble">
-      {{ msg.content }}
+      <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
+      <div
+        v-if="msg.images && msg.images.length"
+        class="img-grid"
+        :class="{ single: msg.images.length === 1, duo: msg.images.length === 2 }"
+      >
+        <img
+          v-for="(img, i) in msg.images"
+          :key="i"
+          :src="img"
+          class="msg-img"
+          alt="用户发送的图片"
+          @click="store.openLightbox(msg.images!, i)"
+        >
+      </div>
     </div>
 
     <!-- 助手消息（无头像图标，仅显示“星瑶”名称） -->
@@ -115,6 +129,49 @@ const thinkingOpen = computed({
   max-width: 70%;
   line-height: 1.65;
 }
+.user-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+/* 用户消息图片：1 张大图 / 2 张并排 / 3 张及以上三列网格 */
+.img-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 6px;
+  margin-top: 8px;
+}
+.img-grid.single {
+  grid-template-columns: 1fr;
+}
+.img-grid.duo {
+  grid-template-columns: repeat(2, 1fr);
+}
+.user-text + .img-grid {
+  margin-top: 8px;
+}
+.img-grid:first-child {
+  margin-top: 0;
+}
+.msg-img {
+  width: 100%;
+  aspect-ratio: 1;
+  object-fit: cover;
+  border-radius: 8px;
+  cursor: zoom-in;
+  border: 1px solid var(--border);
+  transition: filter 0.15s;
+}
+.msg-img:hover {
+  filter: brightness(1.1);
+}
+.img-grid.single .msg-img,
+.img-grid.duo .msg-img {
+  aspect-ratio: auto;
+  max-height: 300px;
+  object-fit: contain;
+  background: var(--bg3);
+}
+
 .avatar-row {
   display: flex;
 }

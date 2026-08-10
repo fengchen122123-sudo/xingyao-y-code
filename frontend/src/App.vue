@@ -44,6 +44,19 @@
 
             <!-- 权限询问内联卡片（codex 风格，跟随对话流末尾） -->
             <PermCard />
+
+            <!-- 回合活动指示：内容开始输出后才显示（等待首内容阶段由气泡内
+                 等待线负责，两条不重叠）；结束后保留一行静态工作时间 -->
+            <div v-if="showFlowWorking" class="working-indicator">
+              <span class="wi-ring"></span>
+              <span class="wi-text">星瑶正在干活</span>
+              <span class="wi-dots"><i>.</i><i>.</i><i>.</i></span>
+              <span v-if="workElapsed >= 1" class="wi-elapsed">已工作 {{ fmtWorkTime(workElapsed) }}</span>
+            </div>
+            <div v-else-if="finalWorkTime !== null" class="working-indicator done">
+              <span class="wi-check">✓</span>
+              <span class="wi-text">星瑶本轮工作 {{ fmtWorkTime(finalWorkTime) }}</span>
+            </div>
           </div>
         </div>
 
@@ -54,7 +67,7 @@
           @close="store.closeSubpage()"
         />
 
-        <!-- 底部固定输入框 (当存在消息时固定呈现) -->
+        <!-- 底部固定输入框：跟随中间对话栏宽度（存在消息时呈现） -->
         <InputArea v-if="store.messages && store.messages.length > 0" />
       </div>
 
@@ -81,6 +94,9 @@
 
     <!-- 确认弹窗 -->
     <ConfirmModal />
+
+    <!-- 图片大图查看 -->
+    <ImageLightbox />
 
     <!-- 全局 Toast -->
     <div id="toast" :class="[store.toast.show ? 'show' : '', store.toast.type]">
@@ -113,6 +129,7 @@ import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import PermCard from './components/PermCard.vue';
+import ImageLightbox from './components/ImageLightbox.vue';
 import Subpage from './components/Subpage.vue';
 import SettingsPage from './components/SettingsPage.vue';
 
@@ -155,6 +172,65 @@ watch(() => store.messages.length, () => {
 watch(() => store.currentStreamingText, () => {
   scrollToBottom();
 });
+
+// ---------------------------------------------------------------------------
+// 回合活动指示与工时计时
+// 等待首内容阶段（空助手气泡）只显示气泡内等待线，流程指示不重复出现；
+// 有内容（正文/思考/工具调用）输出后才显示流程指示。回合结束后保留一行
+// 静态工作时间（不再增长），下轮开始 / 切会话 / 清空会话时重置。
+// ---------------------------------------------------------------------------
+const workElapsed = ref(0);
+const finalWorkTime = ref<number | null>(null);
+let workTimer: number | undefined;
+let turnStartTs = 0;
+
+function fmtWorkTime(s: number): string {
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m${s % 60}s`;
+}
+
+// 与 MessageBubble 的等待线互斥：最后一条是空助手气泡 = 等待首内容阶段
+const showFlowWorking = computed(() => {
+  if (!store.running) return false;
+  const msgs = store.messages;
+  if (!msgs.length) return false;
+  const last = msgs[msgs.length - 1];
+  if (last.role !== 'assistant') return true;
+  if (last.content && last.content.trim()) return true;
+  if (last.reasoning_content && last.reasoning_content.trim()) return true;
+  if (last.tool_calls && last.tool_calls.length) return true;
+  return false;
+});
+
+watch(() => store.running, (running) => {
+  if (running) {
+    turnStartTs = Date.now();
+    workElapsed.value = 0;
+    finalWorkTime.value = null;
+    window.clearInterval(workTimer);
+    workTimer = window.setInterval(() => {
+      workElapsed.value = Math.floor((Date.now() - turnStartTs) / 1000);
+    }, 1000);
+  } else {
+    window.clearInterval(workTimer);
+    workTimer = undefined;
+    // 回合结束（含用户终止）：保留本轮工时静态显示
+    if (turnStartTs) {
+      finalWorkTime.value = Math.max(0, Math.floor((Date.now() - turnStartTs) / 1000));
+      turnStartTs = 0;
+    }
+  }
+  scrollToBottom();
+});
+
+// 切会话 / 清空会话后，上一轮的工时残留无意义，一并重置
+watch(() => store.currentSessionName, () => {
+  finalWorkTime.value = null;
+});
+watch(() => store.messages.length, (len) => {
+  if (len === 0) finalWorkTime.value = null;
+});
+
+onUnmounted(() => window.clearInterval(workTimer));
 // 权限卡片出现/收起时同步滚动，保证用户能立即看到询问
 watch(() => store.permRequest.show, () => {
   scrollToBottom();
@@ -258,6 +334,71 @@ onUnmounted(() => {
 .splash-leave-to {
   opacity: 0;
   transform: scale(1.015);
+}
+
+/* ---------- 回合活动指示器 ---------- */
+.working-indicator {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 4px 4px;
+  font-size: 12.5px;
+  color: var(--text-faint);
+  user-select: none;
+  animation: wi-fadein 0.25s ease;
+}
+@keyframes wi-fadein {
+  from { opacity: 0; transform: translateY(4px); }
+  to { opacity: 1; transform: none; }
+}
+.wi-ring {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--accent-soft);
+  border-top-color: var(--accent);
+  animation: wi-spin 0.9s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes wi-spin {
+  to { transform: rotate(360deg); }
+}
+.wi-text {
+  letter-spacing: 1px;
+}
+.wi-dots {
+  display: inline-flex;
+  margin-left: -4px;
+  font-size: 16px;
+  line-height: 1;
+}
+.wi-dots i {
+  font-style: normal;
+  animation: wi-blink 1.2s infinite;
+}
+.wi-dots i:nth-child(2) {
+  animation-delay: 0.2s;
+}
+.wi-dots i:nth-child(3) {
+  animation-delay: 0.4s;
+}
+@keyframes wi-blink {
+  0%, 60%, 100% { opacity: 0.15; }
+  30% { opacity: 1; }
+}
+.wi-elapsed {
+  margin-left: 4px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+.working-indicator.done {
+  opacity: 0.75;
+}
+.wi-check {
+  color: var(--accent);
+  font-size: 12px;
+  flex-shrink: 0;
 }
 
 #app-root {

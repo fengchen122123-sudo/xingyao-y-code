@@ -1152,7 +1152,9 @@ def test_completed_tool_turn_persists_one_ordered_batch(mocker, monkeypatch):
     ]
 
 
-def test_cancelled_tool_turn_does_not_persist_partial_tool_chain(mocker, monkeypatch):
+def test_cancelled_tool_turn_salvages_completed_messages(mocker, monkeypatch):
+    """取消回合时，已产生的 assistant 消息必须打捞落库，悬空的 tool_calls
+    组补取消占位结果（否则重开会话看不到终止前进度，且下一轮 API 会 400）。"""
     import main
 
     persisted = []
@@ -1192,7 +1194,18 @@ def test_cancelled_tool_turn_does_not_persist_partial_tool_chain(mocker, monkeyp
     except KeyboardInterrupt:
         pass
 
-    assert persisted == []
+    # 一笔打捞 batch：assistant（带 tool_calls）+ 合成的取消占位 tool 结果
+    batches = [p for p in persisted if p[1] == "batch"]
+    assert len(batches) == 1
+    session, _kind, batch = batches[0]
+    assert session == "session-owned"
+    assert [role for role, _msg in batch] == ["assistant", "tool"]
+    assistant_msg = batch[0][1]
+    assert assistant_msg["tool_calls"][0]["id"] == "read"
+    tool_msg = batch[1][1]
+    assert tool_msg["tool_call_id"] == "read"
+    assert tool_msg["name"] == "read_file"
+    assert "终止" in tool_msg["content"]
 
 
 def test_edit_file_on_missing_file_gives_clear_error(mocker):

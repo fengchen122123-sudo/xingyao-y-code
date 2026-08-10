@@ -3646,6 +3646,30 @@ def _chat_with_model_generator(
             finally:
                 del pending_persistence[:]
 
+    def salvage_persistence_on_cancel():
+        """取消时打捞待写队列：带 tool_calls 的 assistant 消息若缺对应 tool
+        结果（工具未跑完就被终止），为每个缺失的 tool_call_id 合成取消占位
+        结果。保证落库历史对下一轮 API 合法（悬空 tool_calls 会 400），
+        同时保住终止前已完成的助手输出与工具结果，重开会话能看到进度。"""
+        answered = {
+            content.get("tool_call_id")
+            for role, content in pending_persistence
+            if role == "tool" and isinstance(content, dict)
+        }
+        for role, content in list(pending_persistence):
+            if role != "assistant" or not isinstance(content, dict):
+                continue
+            for tc in content.get("tool_calls") or []:
+                tcid = tc.get("id")
+                if tcid and tcid not in answered:
+                    answered.add(tcid)
+                    pending_persistence.append(("tool", {
+                        "role": "tool",
+                        "tool_call_id": tcid,
+                        "name": (tc.get("function") or {}).get("name"),
+                        "content": "[用户终止了对话，该工具未执行完成]",
+                    }))
+
     # 2. 注入后台子 Agent 回报数据 (XML task-notification)
     from core.tools import subagent_manager
     drained_notifications = []
@@ -4432,8 +4456,23 @@ def _chat_with_model_generator(
             response_stream.close()
         except Exception:
             pass
-        # 用户中断：安全回退删除此轮 Turn 添加的一切消息残影
+        # 用户中断：先把本轮已产生的完整消息打捞落库（悬空的 tool_calls 组补
+        # 取消占位结果），否则终止前已完成的助手输出/工具结果整批丢失，
+        # 重开会话看不到任何终止前进度。
+        salvage_persistence_on_cancel()
+        flush_persistence()
+        # 安全回退删除此轮 Turn 添加的内存消息残影（DB 已保留打捞部分）
         rollback_turn_messages()
+        raise
+    except GeneratorExit:
+        # GUI 消费端检测到取消后 break，生成器在 yield 点被 close：这条路径
+        # 会绕过上面的 KeyboardInterrupt 分支，必须同样打捞落库再退出。
+        try:
+            response_stream.close()
+        except Exception:
+            pass
+        salvage_persistence_on_cancel()
+        flush_persistence()
         raise
     except Exception as e:
         try:

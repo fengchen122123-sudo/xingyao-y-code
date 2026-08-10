@@ -64,9 +64,8 @@ FILE_PREVIEW_MAX_BYTES = 256 * 1024
 
 # 文件树扫描限制
 FILE_TREE_MAX_DEPTH = 4
-# 整棵树的总安全阀（防极端大目录拖慢 UI）
-FILE_TREE_MAX_ENTRIES = 2000
-# 每层目录独立配额：顶层条目不再被字母序靠前的大目录挤掉
+# 每层目录独立配额：保证顶层条目完整显示（旧实现整棵树共享全局计数，
+# 深度优先扫描会被字母序靠前目录的子树吃满配额，导致靠后的顶层条目被丢弃）
 FILE_TREE_MAX_ENTRIES_PER_DIR = 100
 FILE_TREE_SKIP_DIRS = {
     ".git", "venv", ".venv", "node_modules", "__pycache__", "dist", "build",
@@ -261,7 +260,13 @@ class ApiBridge:
         """设置 PyWebView window 引用"""
         self._window = window
         self._hwnd = 0
-        self._titlebar_dark = True  # 前端默认深色主题
+        # 标题栏主题初始值必须读持久化配置（gui_theme_light）：首次 DWM 着色
+        # 发生在句柄找到时，早于前端校正；硬编码深色会让浅色主题用户看到
+        # 标题栏先黑一闪再变白。
+        try:
+            self._titlebar_dark = not bool(load_config().get("gui_theme_light", False))
+        except Exception:
+            self._titlebar_dark = True  # 读不到配置时保持深色默认
         # 后台线程轮询获取原生窗口句柄，拿到后应用深色标题栏
         threading.Thread(target=self._find_hwnd_worker, daemon=True, name="gui-hwnd-find").start()
         # WebView2 就绪、最小化还原等时机 DWM 可能重建非客户区，把标题栏重置回白色。
@@ -566,16 +571,16 @@ class ApiBridge:
     # 文件树 / 工作区
     # ------------------------------------------------------------------
     def _get_file_tree(self, path: str, depth: int = FILE_TREE_MAX_DEPTH) -> List[Dict[str, Any]]:
-        """递归扫描目录树；限制深度与条目数，跳过体积巨大的构建/依赖目录。
+        """递归扫描目录树；限制深度与每层条目数，跳过体积巨大的构建/依赖目录。
 
-        条目配额按【每层目录】独立计算：旧实现整棵树共享一个全局计数，
-        字母序靠前的大目录会吃满配额，导致靠后的顶层条目被静默丢弃，
-        表现为文件面板"显示不完全"。
+        条目配额只按【每层目录】独立计算，不再设全局总预算：全局预算是
+        深度优先扫描，会被字母序靠前目录的子树吃满，导致靠后的顶层条目
+        被静默丢弃，表现为文件面板"显示不完全"。
+        点开头的隐藏条目照常显示（与文件资源管理器一致）；符号链接显示
+        但不递归进入（防循环）。
         """
-        budget = {"n": FILE_TREE_MAX_ENTRIES}
-
         def _scan(cur_path: str, cur_depth: int) -> List[Dict[str, Any]]:
-            if cur_depth <= 0 or budget["n"] <= 0:
+            if cur_depth <= 0:
                 return []
             items = []
             try:
@@ -584,19 +589,17 @@ class ApiBridge:
                 return []
             shown = 0
             for entry in entries:
-                if shown >= FILE_TREE_MAX_ENTRIES_PER_DIR or budget["n"] <= 0:
+                if shown >= FILE_TREE_MAX_ENTRIES_PER_DIR:
                     break
-                if entry in FILE_TREE_SKIP_DIRS or entry.startswith("."):
+                if entry in FILE_TREE_SKIP_DIRS:
                     continue
                 full_path = os.path.join(cur_path, entry)
                 try:
-                    if os.path.islink(full_path):
-                        continue
+                    is_link = os.path.islink(full_path)
                     is_dir = os.path.isdir(full_path)
                 except Exception:
                     continue
                 shown += 1
-                budget["n"] -= 1
                 # 同时提供两套字段名：n/d 供当前前端组件使用，
                 # name/type 为语义化别名，便于后续前端演进。
                 item: Dict[str, Any] = {
@@ -605,7 +608,7 @@ class ApiBridge:
                     "name": str(entry),
                     "type": "dir" if is_dir else "file",
                 }
-                if is_dir:
+                if is_dir and not is_link:
                     children = _scan(full_path, cur_depth - 1)
                     if children:
                         item["children"] = children
@@ -615,6 +618,71 @@ class ApiBridge:
         if not path or path == "GLOBAL" or not os.path.isdir(path):
             return []
         return _scan(path, depth)
+
+    def get_file_tree(self, workdir: str) -> Dict[str, Any]:
+        """异步拉取指定目录的文件树（会话切换后的后台加载通道）。
+
+        与 switch_session 分离：切换响应只带消息与工作区信息秒回，
+        树扫描由前端在切换完成后调用本接口在后台等待，过期结果前端丢弃。
+        """
+        try:
+            if not workdir or workdir == "GLOBAL" or not os.path.isdir(workdir):
+                return {"ok": False, "file_tree": []}
+            return {"ok": True, "file_tree": self._get_file_tree(workdir)}
+        except Exception as e:
+            logger.exception("get_file_tree 失败")
+            return {"ok": False, "file_tree": [], "msg": str(e)}
+
+    def get_dir_children(self, path: str) -> Dict[str, Any]:
+        """按需展开目录：只扫描指定目录的一层子项（前端文件树懒加载用）。
+
+        初始 file_tree 有深度上限，超出层级的目录没有预载 children；
+        前端展开这类目录时调用本接口按需取下一层，任意层级都能展开。
+        """
+        try:
+            if not path or path == "GLOBAL" or not os.path.isdir(path):
+                return {"ok": False, "children": [], "msg": "not a directory"}
+            return {"ok": True, "children": self._get_file_tree(path, depth=1)}
+        except Exception as e:
+            return {"ok": False, "children": [], "msg": str(e)}
+
+    # @ 引用补全忽略目录（与 TUI _list_workspace_files 保持一致）
+    _FILE_SUGGEST_IGNORE_DIRS = {
+        ".git", ".venv", "venv", "node_modules", "__pycache__", ".idea", ".vscode",
+    }
+    _FILE_SUGGEST_CACHE_TTL = 5.0
+
+    def _list_workspace_files_for_suggest(self) -> List[str]:
+        """递归扫描当前工作区文件（/ 分隔相对路径），TTL 缓存避免输入时反复 walk。"""
+        now = time.time()
+        cache = getattr(self, "_file_suggest_cache", None)
+        if cache and now - cache[0] < self._FILE_SUGGEST_CACHE_TTL:
+            return cache[1]
+        results: List[str] = []
+        for root, dirs, files in os.walk("."):
+            dirs[:] = [
+                d for d in dirs
+                if d not in self._FILE_SUGGEST_IGNORE_DIRS and not d.startswith(".")
+            ]
+            for f in files:
+                if f.startswith("."):
+                    continue
+                rel = os.path.relpath(os.path.join(root, f), ".").replace("\\", "/")
+                results.append(rel)
+        self._file_suggest_cache = (now, results)
+        return results
+
+    def search_workspace_files(self, query: str = "", limit: int = 50) -> Dict[str, Any]:
+        """@ 引用自动补全：大小写不敏感子串匹配工作区文件（与 TUI 语义一致）。"""
+        try:
+            q = str(query or "").strip().lower()
+            files = self._list_workspace_files_for_suggest()
+            if q:
+                files = [f for f in files if q in f.lower()]
+            return {"ok": True, "files": files[:max(1, int(limit or 50))]}
+        except Exception as e:
+            logger.exception("search_workspace_files 失败")
+            return {"ok": False, "msg": str(e), "files": []}
 
     def get_workspace_state(self, workdir: str) -> Dict[str, Any]:
         """读取显式项目目录的前端快照，不依赖进程当前工作目录。"""
@@ -865,14 +933,12 @@ class ApiBridge:
                 "sessions": self.get_sessions(),
             }
             if is_global:
-                result.update({"workdir": "GLOBAL", "is_global": True, "file_tree": []})
+                result.update({"workdir": "GLOBAL", "is_global": True})
             else:
                 current_workdir = _resolve_real_path(os.getcwd())
-                result.update({
-                    "workdir": current_workdir,
-                    "is_global": False,
-                    "file_tree": self._get_file_tree(current_workdir),
-                })
+                result.update({"workdir": current_workdir, "is_global": False})
+            # 文件树不再随切换响应同步扫描（大目录要数秒，拖慢切换）；
+            # 前端切换成功后调 get_file_tree 后台异步加载。
             self._emit_token_usage()
             return result
         except Exception as e:
@@ -1202,6 +1268,20 @@ class ApiBridge:
             for note in attached_msgs or []:
                 self.emit_event("notice", {"message": str(note)})
             self._memory.add_message(session_name, "user", parsed_content)
+            # 提取用户消息中的图片（base64 dataURL）补发给前端渲染气泡缩略图；
+            # turn_start 已先行发出保证气泡即时出现，图片随后补挂到该气泡上
+            if isinstance(parsed_content, list):
+                _images = [
+                    str(block.get("image_url", {}).get("url") or "")
+                    for block in parsed_content
+                    if isinstance(block, dict) and block.get("type") == "image_url"
+                ]
+                _images = [u for u in _images if u]
+                if _images:
+                    self.emit_event("user_message_images", {
+                        "session_name": session_name,
+                        "images": _images,
+                    })
 
             turn_id = f"{session_name}:{uuid.uuid4().hex[:8]}"
             self._set_current_session(session_name)

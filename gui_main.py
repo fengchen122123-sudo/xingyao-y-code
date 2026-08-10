@@ -42,11 +42,18 @@ def _get_base_dir() -> str:
 
 def get_frontend_url() -> str:
     # 1. 优先检查 Vite 实时热更新开发服务 (http://localhost:5173)
-    if is_port_open("127.0.0.1", 5173) and _is_ycode_vite_dev_server():
+    #    仅限源码开发模式：打包后的安装版绝不能走这条——用户机器上任何
+    #    项目的 Vite dev server（含旧版 ycode 自己的）都会被当作前端加载，
+    #    表现为“装了新版打开还是旧界面”（_is_ycode_vite_dev_server 的
+    #    vite 特征判断任何 Vite 项目都能通过）。
+    if not getattr(sys, "frozen", False) and is_port_open("127.0.0.1", 5173) and _is_ycode_vite_dev_server():
         print("Detected Vite dev server running at http://127.0.0.1:5173, loading HMR live version...")
         return "http://127.0.0.1:5173"
 
     # 2. 检查 Vue 3 静态编译产物 (frontend/dist/index.html)
+    #    必须返回本地路径形式（不能转 file:/// URI）：pywebview 只对“本地路径”
+    #    启动内置 HTTP 服务器并注入 js_api；file:// URI 会被当成外部 URL 直连，
+    #    JS 桥丢失且 vite 产物的绝对资源路径在 file:// 下 404（白屏根因）。
     base_dir = _get_base_dir()
     dist_path = os.path.abspath(os.path.join(base_dir, "frontend", "dist", "index.html"))
     if os.path.exists(dist_path):
@@ -55,6 +62,20 @@ def get_frontend_url() -> str:
 
     print(f"Error: No valid frontend entry point found!", file=sys.stderr)
     sys.exit(1)
+
+
+def _initial_theme_light() -> bool:
+    """启动前读取持久化主题（config.json 的 gui_theme_light，True=浅色）。
+
+    pywebview 默认 private_mode=True，WebView2 无痕模式不持久化 localStorage，
+    前端的 localStorage 主题镜像重启后即丢失；主题真值必须随 URL 传给前端，
+    同时同步原生窗口背景色，避免浅色主题用户看到黑色启动页/黑闪。
+    """
+    try:
+        from core.model_manager import load_config
+        return bool(load_config().get("gui_theme_light", False))
+    except Exception:
+        return False
 
 
 def _debug_enabled() -> bool:
@@ -110,8 +131,10 @@ def main():
     api = ApiBridge(mcp_manager=mcp_manager)
     _start_preload_thread()
     url = get_frontend_url()
+    theme_light = _initial_theme_light()
+    url += ("&" if "#" in url else "#") + "theme=" + ("light" if theme_light else "dark")
 
-    # 启动 PyWebView 原生桌面窗口
+    # 启动 PyWebView 原生桌面窗口（背景色与主题一致，页面加载前不闪反色）
     window = webview.create_window(
         title="Y-CODE · 星瑶",
         url=url,
@@ -121,7 +144,7 @@ def main():
         min_size=(960, 640),
         text_select=True,
         confirm_close=False,
-        background_color="#1a1a18"
+        background_color="#f4f4f1" if theme_light else "#1a1a18"
     )
 
     api.set_window(window)
