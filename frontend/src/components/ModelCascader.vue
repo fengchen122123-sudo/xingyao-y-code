@@ -1,7 +1,7 @@
 <template>
   <div id="model-cascader" :class="{ show: visible, 'opens-up': opensUp }" :style="styleObj" @click.stop>
     <!-- 二级子面板：具体模型列表 -->
-    <div class="cascader-sub-panel" :class="{ show: activeProviderName }" :style="subPanelStyle">
+    <div ref="subPanelEl" class="cascader-sub-panel" :class="{ show: activeProviderName }" :style="subPanelStyle">
       <div
         v-for="m in currentSubModels"
         :key="m.id || m.name"
@@ -69,6 +69,7 @@ const store = useAppStore();
 const activeProviderName = ref<string | null>(null);
 const styleObj = ref<Record<string, string>>({});
 const subPanelStyle = ref<Record<string, string>>({});
+const subPanelEl = ref<HTMLElement | null>(null);
 const opensUp = ref(false);
 // 记住上次悬停的供应商行：主面板跟随锚点移动时同步重算二级面板位置
 const lastProviderRow = ref<HTMLElement | null>(null);
@@ -92,6 +93,18 @@ function hasCurrentModel(modelsList: ModelInfo[]) {
   return modelsList.some(m => m.id === store.activeModelId);
 }
 
+// 按当前供应商最长模型名估算子面板宽度（中文按全角 2 倍计），
+// 用于右側放不下时的左翻判断；实测宽度渲染后由 offsetWidth 校正
+function estimateSubPanelWidth(): number {
+  let maxUnits = 0;
+  for (const m of currentSubModels.value) {
+    let units = 0;
+    for (const ch of m.name || '') units += ch.charCodeAt(0) > 255 ? 2 : 1;
+    maxUnits = Math.max(maxUnits, units);
+  }
+  return Math.max(SUB_PANEL_MIN_WIDTH, Math.ceil(maxUnits * 7.2) + 70);
+}
+
 function positionSubPanel(providerRow: HTMLElement) {
   const mainPanel = providerRow.closest('.cascader-main-panel');
   if (!(mainPanel instanceof HTMLElement)) {
@@ -101,13 +114,29 @@ function positionSubPanel(providerRow: HTMLElement) {
   const rowRect = providerRow.getBoundingClientRect();
   const mainPanelRect = mainPanel.getBoundingClientRect();
   const top = Math.max(VIEWPORT_PADDING, Math.floor(rowRect.top - SUB_PANEL_ITEM_INSET));
-  const left = Math.max(
-    VIEWPORT_PADDING,
-    Math.min(
-      Math.floor(mainPanelRect.right + MENU_GAP),
-      window.innerWidth - SUB_PANEL_MIN_WIDTH - VIEWPORT_PADDING,
-    ),
-  );
+
+  // 实测宽度优先（已渲染），否则按名字估算
+  const panelWidth = subPanelEl.value?.offsetWidth || estimateSubPanelWidth();
+  const rightLeft = Math.floor(mainPanelRect.right + MENU_GAP);
+  const rightSpace = window.innerWidth - rightLeft - VIEWPORT_PADDING;
+  const leftSpace = Math.floor(mainPanelRect.left - MENU_GAP) - VIEWPORT_PADDING;
+
+  let left: number;
+  let maxWidth = 0;
+  if (panelWidth <= rightSpace) {
+    // 右侧放得下：照常向右展开
+    left = rightLeft;
+  } else if (panelWidth <= leftSpace) {
+    // 右侧放不下、左侧够宽：翻到主面板左边
+    left = Math.floor(mainPanelRect.left - MENU_GAP - panelWidth);
+  } else if (rightSpace >= leftSpace) {
+    // 两侧都不够：放更宽的一侧并限宽，条目省略号兜底
+    left = rightLeft;
+    maxWidth = Math.max(160, rightSpace);
+  } else {
+    maxWidth = Math.max(160, leftSpace);
+    left = Math.max(VIEWPORT_PADDING, Math.floor(mainPanelRect.left - MENU_GAP - maxWidth));
+  }
 
   subPanelStyle.value = {
     position: 'fixed',
@@ -116,6 +145,7 @@ function positionSubPanel(providerRow: HTMLElement) {
     right: 'auto',
     bottom: 'auto',
     maxHeight: `${Math.max(0, Math.floor(window.innerHeight - top - VIEWPORT_PADDING))}px`,
+    ...(maxWidth ? { maxWidth: `${maxWidth}px` } : {}),
   };
 }
 

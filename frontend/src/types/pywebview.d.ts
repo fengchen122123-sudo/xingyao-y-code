@@ -303,6 +303,10 @@ export interface PyWebViewAPI {
   pick_files(): Promise<any>;
   get_files_info(paths: string[]): Promise<any>;
   save_clipboard_image(dataUrl: string): Promise<any>;
+  // @ 引用自动补全：工作区文件子串匹配
+  search_workspace_files(query: string, limit?: number): Promise<any>;
+  get_dir_children(path: string): Promise<any>;
+  get_file_tree(workdir: string): Promise<any>;
   set_titlebar_theme(dark: boolean): Promise<any>;
   set_gui_theme(theme_light: boolean): Promise<any>;
 
