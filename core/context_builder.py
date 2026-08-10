@@ -10,7 +10,7 @@ from typing import Any
 _DECISION_POLICY = """【决策与行动规则】
 1. 明确且简单的任务只做一次判断，然后立即执行，不为已经清楚的目标增加额外流程。
 2. 没有新证据时，不得反复重新讨论已经排除的方案、工具或风险。
-3. 接到任务先对照【可用技能目录】检查匹配的技能，哪怕只有轻微相关也先读取对应 SKILL.md 再动手，发现不匹配再放弃；确定无关的技能不加载。
+3. 收到任务的第一步（任何工具调用或文件修改之前）：对照【可用技能目录】检查匹配的技能，哪怕只有轻微相关也先 read_file 读取对应 SKILL.md 再动手，发现不匹配再放弃；确定无关的技能不加载。
 4. 需要多个互不依赖的工具或子任务时一次性并行发出，拿到结果后直接汇总。
 5. 推理只服务于确定下一步动作；证据充分后立即行动。
 6. 需要实时天气时使用 get_weather 并传入明确城市；城市未知时先询问；需要读取网页或 JSON 时使用 fetch_url；search_news 仅用于新闻。
@@ -70,7 +70,12 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
 
 
 def build_time_note(runtime: RuntimeContext) -> str:
-    """每轮新追加的时间注记（纯增量，不破坏 prefix 缓存，旧的保留不删）。"""
+    """每轮的时间注记，由 agent_service 内联到最后一条 user 消息 content 末尾。
+
+    不再作为独立 role=system 消息持久化——那样会使 system_sha256 每轮变化，
+    导致 provider 侧前缀缓存从 system 块开始整体失效。内联到 user 消息后，
+    system_messages 数组跨轮稳定，前缀缓存可覆盖整个对话历史。
+    """
     return f"{TIME_NOTE_PREFIX}{runtime.current_time}"
 
 

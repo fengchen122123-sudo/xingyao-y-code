@@ -20,6 +20,8 @@ import os
 import threading
 from typing import Any, Callable, Optional
 
+from core.context_builder import TIME_NOTE_PREFIX
+
 logger = logging.getLogger(__name__)
 
 # Deprecated：四级水位线阶梯（下方 SNIP/ELIDE/SUMMARIZE_RATIO）已取代单一阈值。
@@ -289,6 +291,59 @@ def _persist_context_block(manager, session_name: str, content: str) -> None:
         logger.warning("上下文块持久化失败，下一轮将重新注入", exc_info=True)
 
 
+def _strip_time_note_from_content(content):
+    """从 user 消息内容末尾移除上一轮追加的时间注记。
+
+    时间注记格式为 ``\\n\\n【当前时间】YYYY-MM-DD HH:MM:SS``，
+    可能被上一次 CAS 写入也可能被旧的 role=system 持久化方式留下。
+    """
+    text = content
+    if not isinstance(text, str):
+        return text
+    marker = "\n\n" + TIME_NOTE_PREFIX
+    idx = text.rfind(marker)
+    if idx != -1 and text[idx + len(marker):].strip():
+        # 仅在时间注记位于末尾时才移除
+        suffix = text[idx + len(marker):]
+        if len(suffix) <= 25:  # YYYY-MM-DD HH:MM:SS = 19 字符，留余量
+            text = text[:idx]
+    return text
+
+
+def _append_time_note_to_last_user(history, time_note, manager, session_name):
+    """把时间注记内联到最后一条 user 消息 content 末尾并 CAS 持久化。
+
+    时间注记不再作为独立 role=system 消息持久化（那样会使 system_sha256
+    每轮变化，打断 provider 侧前缀缓存）。改为追加到当前轮 user 消息
+    content 末尾，通过 CAS 写回 DB。
+    """
+    if not history:
+        return
+    # 找到最后一条 user 消息
+    last_user_idx = None
+    for i in range(len(history) - 1, -1, -1):
+        if history[i].get("role") == "user":
+            last_user_idx = i
+            break
+    if last_user_idx is None:
+        return
+    original_content = history[last_user_idx].get("content", "")
+    if not isinstance(original_content, str):
+        # 非文本 content（如媒体消息），跳过时间注记注入
+        return
+    # 移除上一轮可能遗留的时间注记，避免重复堆积
+    cleaned = _strip_time_note_from_content(original_content)
+    new_content = cleaned + "\n\n" + time_note
+    history[last_user_idx]["content"] = new_content
+    # CAS 持久化：把修改写回 DB（期望旧值 = 原始 content）
+    try:
+        manager.replace_latest_user_message_content(
+            session_name, original_content, new_content
+        )
+    except Exception:
+        logger.warning("时间注记 CAS 持久化失败，仅影响内存副本", exc_info=True)
+
+
 def build_background_task_summary(session_name: str) -> str:
     """提取本会话中所有终态且尚未消费的后台子代理任务，拼成注入用的 system 文本。
 
@@ -496,10 +551,13 @@ def prepare_turn_messages(
         _insert_before_last_user(history, {"role": "system", "content": dynamic_prompt})
         _persist_context_block(manager, session_name, dynamic_prompt)
 
-    # 4) 时间注记：每轮新追加一条（纯增量），旧注记保留不删
+    # 4) 时间注记：追加到最后一条 user 消息内容末尾并持久化。
+    #    以前时间注记是独立 role=system 消息，每轮新增一条会导致 system_sha256
+    #    变化，使 provider 侧前缀缓存从 system 块开始整体失效（实测命中率
+    #    从 ~99% 跌至 0-4%，多消耗数百万 tokens）。改为内联到 user 消息后，
+    #    system_messages 数组跨轮稳定，前缀缓存可覆盖整个对话历史。
     time_note = build_time_note(runtime)
-    _insert_before_last_user(history, {"role": "system", "content": time_note})
-    _persist_context_block(manager, session_name, time_note)
+    _append_time_note_to_last_user(history, time_note, manager, session_name)
 
     # 主代理汇总/兜底机制：提取本会话中所有终态（成功+失败）且尚未消费的后台子代理任务，
     # 注入到 history 中作为 system 消息，让主代理能汇总成功结果并用自身工具接手失败任务。
