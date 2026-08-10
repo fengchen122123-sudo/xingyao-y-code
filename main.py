@@ -361,7 +361,7 @@ def _render_usage_section(manager, label, start_s, end_s):
     if not rows:
         print_formatted_text(HTML("  <ansigray>暂无记录</ansigray>"))
         return False
-    display_rows = [(row, _usage_route_label(row)) for row in rows]
+    display_rows = [(row, _usage_model_label(row)) for row in rows]
     name_w = max(
         12,
         min(60, max(_term_display_width(name) for _, name in display_rows) + 2),
@@ -448,30 +448,12 @@ def _format_cache_hit_rate(cached_tokens, cache_prompt_tokens):
     return f"{cached_tokens / cache_prompt_tokens * 100:.1f}%"
 
 
-def _usage_route_label(row):
-    """把同名模型的 endpoint 与请求作用域直接展示出来，避免聚合误读。"""
-    import hashlib
-    from urllib.parse import urlsplit
-
-    api_base = str(row.get("api_base") or "")
+def _usage_model_label(row):
+    """用量表只显示 provider/model；接口域名/path 哈希/缓存作用域标签
+    对日常使用是噪音（历史遗留的 @ host path#xx [scope] 已按用户要求移除）。"""
     provider = str(row.get("provider") or "")
     model = str(row.get("model") or "")
-    model_label = f"{provider}/{model}" if provider else model
-    scope = str(row.get("cache_scope") or "legacy")
-    if not api_base:
-        return f"{model_label} @ 未记录接口 [{scope}]"
-    try:
-        parsed = urlsplit(api_base)
-        host = str(parsed.hostname or "无效接口")
-        port = parsed.port
-        if port is not None and port not in (80, 443):
-            host += f":{port}"
-        path_material = str(parsed.path or "/")
-    except Exception:
-        host = "无效接口"
-        path_material = api_base
-    path_id = hashlib.sha256(path_material.encode("utf-8")).hexdigest()[:8]
-    return f"{model_label} @ {host} path#{path_id} [{scope}]"
+    return f"{provider}/{model}" if provider else model
 
 
 def set_terminal_title(title: str) -> None:
