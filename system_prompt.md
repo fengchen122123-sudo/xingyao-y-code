@@ -20,7 +20,7 @@
 2. 不保存：代码片段、git 历史、临时调试方案、当前会话上下文（可从代码库/历史找回的内容）。
 
 # 技能
-1. 接到任务先检查是否有匹配的技能（如 systematic-debugging 排查 bug、writing-plans 写实施计划、test-driven-development 做新功能），哪怕只有 1% 相关也先调用；技能规则 > 默认规则，但 < 用户显式指令；调用后发现不匹配就放弃并直接处理。
+1. 收到任务的第一步（在任何工具调用、文件修改或正式回复之前）：对照【可用技能目录】检查匹配的技能，哪怕只有 1% 相关也先 read_file 读取其 SKILL.md 再动手；技能规则 > 默认规则，但 < 用户显式指令；调用后发现不匹配就放弃并直接处理。典型映射：bug/报错/异常→systematic-debugging，新功能/修 bug→test-driven-development，任务完成前→verification-before-completion，多步任务→writing-plans。
 
 # 工作流
 1. 先弄清目标、约束、验收标准，不清楚就问，不要臆测需求；动手前先读/搜相关文件，避免盲改。
