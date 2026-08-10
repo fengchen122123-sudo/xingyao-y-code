@@ -361,40 +361,18 @@ def test_pad_left_and_right_by_display_width():
     assert main._pad_left("123456789012345", 14) == "123456789012345"
 
 
-def test_usage_route_label_exposes_endpoint_and_scope():
-    label = main._usage_route_label({
+def test_usage_model_label_shows_provider_and_model_only():
+    """用量表标签只显示 provider/model，不带接口域名/path 哈希/作用域后缀。"""
+    assert main._usage_model_label({
         "provider": "openai",
         "model": "deepseek-v4-flash",
         "api_base": "https://api.deepseek.com/v1",
         "cache_scope": "main",
-    })
-    assert label.startswith("openai/deepseek-v4-flash @ api.deepseek.com path#")
-    assert label.endswith(" [main]")
-    assert main._usage_route_label({
+    }) == "openai/deepseek-v4-flash"
+    assert main._usage_model_label({
         "provider": "", "model": "legacy-model",
         "api_base": "", "cache_scope": "legacy"
-    }) == "legacy-model @ 未记录接口 [legacy]"
-
-
-def test_usage_route_label_redacts_credentials_and_distinguishes_routes():
-    base = {
-        "provider": "openai", "model": "m1", "cache_scope": "main"
-    }
-    first = main._usage_route_label({
-        **base, "api_base": "https://user:secret@api.example/v1?token=hidden"
-    })
-    second = main._usage_route_label({
-        **base, "api_base": "https://api.example/tenant-b/v1"
-    })
-    other_provider = main._usage_route_label({
-        **base, "provider": "anthropic", "api_base": "https://api.example/v1"
-    })
-
-    assert "user" not in first
-    assert "secret" not in first
-    assert "hidden" not in first
-    assert first != second
-    assert first != other_provider
+    }) == "legacy-model"
 
 
 def test_usage_section_does_not_compute_cross_route_subtotal_hit_rate(monkeypatch):
