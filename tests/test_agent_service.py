@@ -66,7 +66,7 @@ def _make_manager():
 
 
 def test_prepare_turn_messages_orders_system_and_dynamic_context(stub_llm, quiet_extras):
-    """system 提示词在最前，动态运行上下文与时间注记紧贴最后一条 user 消息之前。"""
+    """system 提示词在最前，动态运行上下文在 user 消息之前，时间注记内联到 user 消息。"""
     from core.agent_service import prepare_turn_messages
 
     manager = _make_manager()
@@ -87,23 +87,22 @@ def test_prepare_turn_messages_orders_system_and_dynamic_context(stub_llm, quiet
     assert messages[0]["role"] == "system"
     assert len(messages[0]["content"]) > 0
 
-    # 2) 最后一条仍然是用户本轮输入
+    # 2) 最后一条仍然是用户本轮输入（含内联时间注记）
     assert messages[-1]["role"] == "user"
-    assert messages[-1]["content"] == "第二个问题"
+    assert messages[-1]["content"].startswith("第二个问题")
+    assert "【当前时间】" in messages[-1]["content"]
 
-    # 3) 动态上下文与时间注记依次位于用户消息之前
-    dynamic = messages[-3]
-    time_note = messages[-2]
+    # 3) 动态上下文紧贴最后一条 user 消息之前
+    dynamic = messages[-2]
     assert dynamic["role"] == "system"
     assert "【当前运行上下文】" in dynamic["content"]
     assert "当前权限模式：confirm" in dynamic["content"]
-    # 时间已从动态块剥离，单独成块
+    # 时间已从动态块剥离
     assert "当前时间" not in dynamic["content"]
-    assert time_note["role"] == "system"
-    assert time_note["content"].startswith("【当前时间】")
 
-    # 4) 首轮恰好三条 system：稳定前缀 + 动态块 + 时间注记
-    assert sum(1 for m in messages if m["role"] == "system") == 3
+    # 4) 首轮恰好两条 system：稳定前缀 + 动态块
+    #    时间注记已内联到 user 消息，不再作为独立 system 消息
+    assert sum(1 for m in messages if m["role"] == "system") == 2
 
 
 def test_prepare_turn_messages_updates_token_usage(stub_llm, quiet_extras):
@@ -313,8 +312,8 @@ def test_compression_summary_survives_as_user_message(stub_llm, quiet_extras):
     assert len(summaries) == 1
     assert summaries[0]["role"] == "user"
     assert "调试数据库连接问题" in summaries[0]["content"]
-    # system 消息为稳定前缀 + 动态块 + 时间注记三条
-    assert sum(1 for m in messages if m["role"] == "system") == 3
+    # system 消息为稳定前缀 + 动态块两条（时间注记已内联到 user 消息）
+    assert sum(1 for m in messages if m["role"] == "system") == 2
 
 
 def test_mcp_warmup_starts_background_connect_once(monkeypatch):
@@ -391,11 +390,13 @@ def test_dynamic_context_not_duplicated_when_unchanged(stub_llm, quiet_extras):
     )
 
     dynamics = [m for m in messages if "【当前运行上下文】" in str(m.get("content", ""))]
-    time_notes = [
-        m for m in messages if str(m.get("content", "")).startswith("【当前时间】")
+    # 时间注记已内联到 user 消息末尾，不再作为独立 system 消息
+    time_notes_in_users = [
+        m for m in messages
+        if m.get("role") == "user" and "【当前时间】" in str(m.get("content", ""))
     ]
     assert len(dynamics) == 1
-    assert len(time_notes) == 2
+    assert len(time_notes_in_users) == 2
 
 
 def test_dynamic_context_appended_when_changed(stub_llm, quiet_extras):
@@ -418,11 +419,11 @@ def test_dynamic_context_appended_when_changed(stub_llm, quiet_extras):
     # 旧块在前、新块在后，新块包含最新权限模式
     assert "当前权限模式：confirm" in dynamics[0]["content"]
     assert "当前权限模式：full" in dynamics[1]["content"]
-    # 最新动态块位于最后一条 user 消息附近（其后只有时间注记与 user）
+    # 最新动态块位于最后一条 user 消息之前
     last_dynamic_idx = max(
         i for i, m in enumerate(messages) if "【当前运行上下文】" in str(m.get("content", ""))
     )
-    assert last_dynamic_idx >= len(messages) - 3
+    assert last_dynamic_idx >= len(messages) - 2
 
 
 def test_prefix_continuity_across_turns(stub_llm, quiet_extras):
@@ -444,7 +445,7 @@ def test_prefix_continuity_across_turns(stub_llm, quiet_extras):
 
     # turn2 的前 len(turn1) 条与 turn1 完全一致 → provider 侧前缀缓存可全部命中
     assert turn2[: len(turn1)] == turn1
-    # 后续依次为：上一轮的 assistant 回复、新一轮的时间注记、新一轮的用户输入
+    # 后续依次为：上一轮的 assistant 回复、新一轮的用户输入（含内联时间注记）
     assert turn2[len(turn1)]["role"] == "assistant"
     assert turn2[len(turn1)]["content"] == "回答一"
 
@@ -507,9 +508,9 @@ def test_prepare_turn_messages_estimates_tokens_with_system_prompt(stub_llm, qui
     # 估算列表首位必须是稳定系统提示词（不落库、每轮现组，纯历史估算会漏掉它）
     assert first_messages[0]["role"] == "system"
     assert len(first_messages[0]["content"]) > 0
-    # 历史消息仍在估算范围内
+    # 历史消息仍在估算范围内（user 消息含内联时间注记后缀）
     assert any(
-        m.get("role") == "user" and m.get("content") == "你好" for m in first_messages
+        m.get("role") == "user" and "你好" in str(m.get("content", "")) for m in first_messages
     )
 
 
