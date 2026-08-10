@@ -322,7 +322,13 @@ onMounted(() => {
 #right-content {
   flex: 1;
   overflow-y: auto;
+  overflow-x: auto; /* 深层文件树横向滚动，滚动条固定在面板底部 */
   padding: 12px;
+}
+/* 文件树宽度取最宽一行的内容宽度，撑出横向滚动区间 */
+#file-tree {
+  display: inline-block;
+  min-width: 100%;
 }
 .rpane {
   display: none;

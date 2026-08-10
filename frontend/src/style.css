@@ -390,6 +390,28 @@ button {
 .md-body li {
   margin: 4px 0;
 }
+.md-body table {
+  border-collapse: collapse;
+  margin: 10px 0;
+  font-size: 13px;
+  max-width: 100%;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  text-align: left;
+  vertical-align: top;
+}
+.md-body th {
+  background: var(--bg3);
+  color: var(--text-bright);
+  font-weight: 600;
+  white-space: nowrap;
+}
+.md-body tbody tr:nth-child(even) {
+  background: var(--bg2);
+}
 
 .cursor-blink {
   display: inline-block;

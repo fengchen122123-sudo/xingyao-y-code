@@ -62,6 +62,8 @@ export interface ChatMessage {
   id?: string;
   role: 'user' | 'assistant' | 'tool';
   content?: string;
+  // 用户消息附带的图片（base64 dataURL 列表，支持多张）
+  images?: string[];
   reasoning_content?: string;
   tool_calls?: ToolExecutionCall[];
   tool_call_id?: string;
@@ -119,6 +121,27 @@ function normalizeHistoryCall(raw: any, toolMessages: Map<string, ChatMessage>):
   return call;
 }
 
+// 历史用户消息的多模态 list 内容（[text, image_url, ...]）拆成纯文本 + 图片列表；
+// 更早的历史图片已被后端折叠为占位文本，自然留在 text 里
+function normalizeUserMediaMessage(m: ChatMessage): ChatMessage {
+  if (!Array.isArray(m.content)) return m;
+  const texts: string[] = [];
+  const images: string[] = [];
+  for (const block of m.content as any[]) {
+    if (block?.type === 'text') {
+      texts.push(String(block.text || ''));
+    } else if (block?.type === 'image_url') {
+      const url = String(block?.image_url?.url || '');
+      if (url) images.push(url);
+    }
+  }
+  return {
+    ...m,
+    content: texts.join('\n'),
+    images: images.length ? images : undefined,
+  };
+}
+
 // 加载历史会话（启动恢复 / switch_session）时，把旧契约的独立 role=tool 消息
 // 按显式 tool_call_id 配对进前一条助手消息的 tool_calls，配对完成后从列表移除。
 export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] {
@@ -136,6 +159,8 @@ export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] 
         legacy_diffs: m.legacy_diffs || [],
         execution_state: m.execution_state || 'completed',
       });
+    } else if (m.role === 'user') {
+      paired.push(normalizeUserMediaMessage(m));
     } else {
       paired.push(m);
     }
@@ -197,6 +222,8 @@ export const useAppStore = defineStore('app', {
     currentWorkdirLabel: '对话',
     workdir: '',
     fileTree: [] as FileNode[],
+    // 文件树后台加载序号：快速连切会话时过期结果凭序号丢弃
+    fileTreeReqSeq: 0,
 
     // 技能 / MCP / 插件
     skills: [] as SkillInfo[],
@@ -209,6 +236,9 @@ export const useAppStore = defineStore('app', {
     // 当前推送中的回合属于其他会话（如后台任务自动汇总）：事件不写入当前视图
     foreignTurnActive: false,
     showThinking: false,
+
+    // 图片大图查看（Lightbox）
+    lightbox: { show: false, images: [] as string[], index: 0 },
 
     // 后端连接状态 / 版本号
     connected: false,
@@ -314,6 +344,21 @@ export const useAppStore = defineStore('app', {
       return last;
     },
 
+    openLightbox(images: string[], index: number) {
+      if (!images || !images.length) return;
+      this.lightbox = { show: true, images, index: Math.max(0, Math.min(index, images.length - 1)) };
+    },
+
+    closeLightbox() {
+      this.lightbox.show = false;
+    },
+
+    lightboxNav(delta: number) {
+      const n = this.lightbox.images.length;
+      if (!this.lightbox.show || n <= 1) return;
+      this.lightbox.index = (this.lightbox.index + delta + n) % n;
+    },
+
     toggleSidebar() {
       this.sidebarCollapsed = !this.sidebarCollapsed;
     },
@@ -396,7 +441,9 @@ export const useAppStore = defineStore('app', {
         await finishSplash();
         return;
       }
-      // 启动时按当前主题同步一次标题栏（默认深色）
+      // 启动时按当前主题同步一次标题栏：main.ts 已按 URL #theme= 片段提前恢复
+      // body 类（后端真值），以 body 类为准，避免浅色主题启动期标题栏黑几秒
+      this.themeLight = document.body.classList.contains('light');
       api.set_titlebar_theme(!this.themeLight)?.catch(() => {});
       try {
         const init = await api.get_initial_state();
@@ -527,7 +574,10 @@ export const useAppStore = defineStore('app', {
         } else if (res.workdir) {
           this.workdir = res.workdir;
           this.currentWorkdirLabel = res.workdir.split('\\').pop() || res.workdir;
-          if (res.file_tree) this.fileTree = res.file_tree;
+          // 文件树不再随切换响应返回（后端同步扫描大目录要数秒，拖慢切换）：
+          // 先清空旧树秒开对话，树在后台异步加载，过期结果丢弃
+          this.fileTree = [];
+          this.loadFileTreeInBackground(sessionName, res.workdir);
         }
 
         if (res.sessions) this.sessionGroups = res.sessions;
@@ -535,6 +585,21 @@ export const useAppStore = defineStore('app', {
         this.connected = false;
         this.showToast('切换会话失败: ' + err, 'warn');
       }
+    },
+
+    async loadFileTreeInBackground(sessionName: string, workdir: string) {
+      // 会话切换后的文件树后台加载通道（与 switchSession 分离，切换秒开）
+      const api = this._api();
+      if (!api) return;
+      const seq = ++this.fileTreeReqSeq;
+      try {
+        const res = await api.get_file_tree(workdir);
+        // 竞态防护：期间又切了别的会话/项目，本结果直接丢弃
+        if (seq !== this.fileTreeReqSeq) return;
+        if (this.currentSessionName !== sessionName) return;
+        if (this.workdir !== workdir) return;
+        if (res && res.ok && res.file_tree) this.fileTree = res.file_tree;
+      } catch { /* 后台加载失败静默：树留空，不影响对话 */ }
     },
 
     async createGlobalSession() {
@@ -559,29 +624,22 @@ export const useAppStore = defineStore('app', {
     },
 
     async createSessionInGroup(targetWorkdir: string) {
-      const api = this._api();
-      if (!api) return;
-      let res: any;
-      try {
-        res = await api.get_workspace_state(targetWorkdir);
-      } catch (err) {
-        this.connected = false;
-        this.showToast('进入项目失败: ' + err, 'warn');
-        return;
-      }
-      if (!res || !res.ok || !res.workdir) {
-        this.showToast('进入项目失败: ' + (res?.msg || '未知错误'), 'warn');
-        return;
-      }
-
-      // 懒创建：加载项目快照并切换到空白会话，首条消息发出时才真正落库
-      this.pendingWorkdir = res.workdir;
+      // 秒开：前端已有工作区上下文（新会话首条消息发出时才懒落库），
+      // 不再同步等后端 get_workspace_state 扫文件树（大目录要数秒，
+      // 表现为“点新会话特别慢”）。
+      const treeMatches = this.workdir === targetWorkdir;
+      this.pendingWorkdir = targetWorkdir;
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新会话';
       this.messages = [];
-      this.workdir = res.workdir;
-      this.currentWorkdirLabel = res.workdir.split('\\').pop() || res.workdir;
-      this.fileTree = res.file_tree || [];
+      this.workdir = targetWorkdir;
+      this.currentWorkdirLabel = targetWorkdir.split('\\').pop() || targetWorkdir;
+      // 文件树：当前就在该工作区则直接保留已加载的树；
+      // 切到别的项目分组才清空并后台异步加载（过期结果有序号防护）
+      if (!treeMatches) {
+        this.fileTree = [];
+        this.loadFileTreeInBackground('', targetWorkdir);
+      }
     },
 
     async exitWorkspaceToGlobal() {
@@ -924,6 +982,20 @@ export const useAppStore = defineStore('app', {
             items,
             progress,
           };
+        }
+      } else if (type === 'user_message_images') {
+        // 后端解析附件后补发的图片：挂到当前会话最后一条用户气泡上
+        if (data.session_name && data.session_name !== this.currentSessionName) return;
+        const imgs = Array.isArray(data.images)
+          ? data.images.map((u: any) => String(u)).filter(Boolean)
+          : [];
+        if (imgs.length) {
+          for (let i = this.messages.length - 1; i >= 0; i--) {
+            if (this.messages[i].role === 'user') {
+              this.messages[i].images = imgs;
+              break;
+            }
+          }
         }
       } else if (type === 'permission_request') {
         this.permRequest = {

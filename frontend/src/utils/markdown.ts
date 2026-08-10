@@ -76,7 +76,7 @@ export function renderMarkdown(md: string): string {
   text = text.replace(/__(.*?)__/g, '<strong>$1</strong>');
   text = text.replace(/\*(.*?)\*/g, '<em>$1</em>');
 
-  // 7. 逐行处理列表 / 引用块 / 段落
+  // 7. 逐行处理表格 / 列表 / 引用块 / 段落
   const lines = text.split('\n');
   type Mode = 'ul' | 'ol' | 'bq' | null;
   let mode: Mode = null;
@@ -89,7 +89,41 @@ export function renderMarkdown(md: string): string {
     mode = null;
   };
 
-  lines.forEach(line => {
+  // GFM 表格：行以 | 开始结束；第二行是分隔行 |---|---|（允许 :---: 对齐标记）
+  const isTableRow = (l: string) => {
+    const t = l.trim();
+    return t.length > 1 && t.startsWith('|') && t.endsWith('|');
+  };
+  const isTableSep = (l: string) => {
+    const t = l.trim();
+    return isTableRow(t) && /^\|[\s:|-]+\|$/.test(t) && t.includes('-');
+  };
+  const splitRow = (l: string): string[] => {
+    const t = l.trim();
+    return t.slice(1, t.length - 1).split('|').map(c => c.trim());
+  };
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // 表格块：表头行 + 分隔行 + 若干数据行
+    if (isTableRow(line) && i + 1 < lines.length && isTableSep(lines[i + 1])) {
+      closeMode();
+      const headerCells = splitRow(line);
+      i++; // 跳过分隔行
+      const bodyRows: string[][] = [];
+      while (i + 1 < lines.length && isTableRow(lines[i + 1])) {
+        i++;
+        bodyRows.push(splitRow(lines[i]));
+      }
+      const thead = `<thead><tr>${headerCells.map(c => `<th>${c}</th>`).join('')}</tr></thead>`;
+      const tbody = bodyRows.length
+        ? `<tbody>${bodyRows.map(r => `<tr>${r.map(c => `<td>${c}</td>`).join('')}</tr>`).join('')}</tbody>`
+        : '';
+      resultLines.push(`<table>${thead}${tbody}</table>`);
+      continue;
+    }
+
     const ulMatch = line.match(/^(\s*)([-*+])\s+(.*)$/);
     const olMatch = line.match(/^(\s*)(\d+\.)\s+(.*)$/);
     // 引用块 "> xxx" 转义后变为 "&gt; xxx"，因此匹配转义后的形式
@@ -115,7 +149,7 @@ export function renderMarkdown(md: string): string {
         resultLines.push(line);
       }
     }
-  });
+  }
   closeMode();
 
   let html = resultLines.join('');
