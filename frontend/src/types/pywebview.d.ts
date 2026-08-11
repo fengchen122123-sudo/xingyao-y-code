@@ -291,7 +291,7 @@ export interface PyWebViewAPI {
   respond_permission_choice(requestId: string, choiceIndex: number): Promise<any>;
 
   send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string): Promise<any>;
-  stop_current_turn(): Promise<any>;
+  stop_current_turn(sessionName?: string): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;
   get_token_usage_statistics(days: 1 | 7 | 30): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;

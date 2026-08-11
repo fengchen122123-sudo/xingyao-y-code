@@ -240,8 +240,8 @@ export const useAppStore = defineStore('app', {
     // 对话消息流
     messages: [] as ChatMessage[],
     running: false,
-    // 当前推送中的回合属于其他会话（如后台任务自动汇总）：事件不写入当前视图
-    foreignTurnActive: false,
+    // 正在执行回合的会话集合（支持多会话并行）
+    runningSessions: [] as string[],
     showThinking: false,
 
     // 图片大图查看（Lightbox）
@@ -606,6 +606,8 @@ export const useAppStore = defineStore('app', {
       this.pendingWorkdir = null;
       this.currentSessionName = sessionName;
       if (displayName) this.currentSessionDisplayName = displayName;
+      // 同步 running 状态：切到的会话是否正在执行回合
+      this.running = this.runningSessions.includes(sessionName);
 
       const api = this._api();
       if (!api) return;
@@ -793,7 +795,7 @@ export const useAppStore = defineStore('app', {
     async sendMessage(text: string, attachments?: string[]) {
       // 生成中禁止再次发送（无论调用方是否已自行判断，均在此兜底拦截）
       const attachList = (attachments || []).filter(p => p && p.trim());
-      if ((!text.trim() && !attachList.length) || this.running) return;
+      if ((!text.trim() && !attachList.length) || this.runningSessions.includes(this.currentSessionName)) return;
       this.running = true;
 
       const api = window.pywebview && window.pywebview.api;
@@ -869,25 +871,35 @@ export const useAppStore = defineStore('app', {
       // 只要有事件推送过来，说明桥接链路是通的
       this.connected = true;
 
-      // 其他会话的回合事件（典型场景：后台任务自动汇总）不写入当前会话视图，
-      // 只在该回合结束时恢复空闲状态；后端单回合 worker 保证事件不会交错
-      if (this.foreignTurnActive) {
-        if (type === 'turn_finish' || type === 'turn_cancelled' || type === 'turn_error' || type === 'turn_idle') {
-          this.foreignTurnActive = false;
+      // 多会话并行：终态事件从 runningSessions 移除对应会话
+      if (type === 'turn_finish' || type === 'turn_cancelled' || type === 'turn_error' || type === 'turn_idle') {
+        const finSession = String(data.session_name || '');
+        if (finSession) {
+          this.runningSessions = this.runningSessions.filter(s => s !== finSession);
+        }
+        // 如果结束的是当前会话的回合，恢复当前视图的空闲状态
+        if (!finSession || finSession === this.currentSessionName) {
           this.running = false;
           this.subagentTasks = [];
+        }
+        // 没有活跃会话时刷新会话列表
+        if (this.runningSessions.length === 0) {
           this.refreshSessions();
         }
-        return;
+        // 如果不是当前会话的终态事件，不继续处理（避免写入当前视图）
+        if (finSession && finSession !== this.currentSessionName) {
+          return;
+        }
       }
 
       if (type === 'turn_start') {
-        // 回合归属校验：后端 turn_start 携带 session_name，不属于当前正在查看
-        // 的会话时只锁定输入（后端单回合，仍忙），不把气泡/流式内容推入当前视图
         const turnSession = String(data.session_name || '');
+        // 记录活跃会话
+        if (turnSession && !this.runningSessions.includes(turnSession)) {
+          this.runningSessions.push(turnSession);
+        }
+        // 不属于当前会话的回合：不写入当前视图，只标记活跃
         if (turnSession && turnSession !== this.currentSessionName) {
-          this.foreignTurnActive = true;
-          this.running = true;
           if (data.internal === 'bg_summary') {
             this.showToast('后台子代理任务已全部结束，正在自动汇总结果', 'ok');
           }
@@ -910,7 +922,16 @@ export const useAppStore = defineStore('app', {
         if (data.internal === 'bg_summary') {
           this.showToast('后台子代理任务已全部结束，正在自动汇总结果', 'ok');
         }
-      } else if (type === 'round_started') {
+      }
+
+      // 多会话并行：非当前会话的中间事件不写入当前视图，防止跨会话流式污染
+      // turn_start 和终态事件已在上面处理（需记录/移除 runningSessions），这里只过滤中间事件
+      const evtSession = String(data.session_name || '');
+      if (evtSession && evtSession !== this.currentSessionName) {
+        return;
+      }
+
+      if (type === 'round_started') {
         // 每个 LLM 轮次一条 assistant 消息：与历史重放的分段结构对齐（分段思考）。
         // 若当前 assistant 气泡还是空的（回合第一轮），幂等跳过。
         const last = this.messages[this.messages.length - 1];

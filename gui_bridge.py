@@ -204,8 +204,9 @@ class ApiBridge:
         self._current_permission_mode = app_context.normalize_permission_mode(MY_PERMISSION_MODE)
         self._plan_approved_this_turn = False
         self._task_status = "idle"
-        self._active_turn_thread: Optional[threading.Thread] = None
-        self._cancel_event = threading.Event()
+        # 多会话并行：按 session 隔离回合线程和取消事件
+        self._active_turns: dict[str, threading.Thread] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
         # 回合启动互斥：send_user_message 与后台自动汇总都可能启动 turn 线程，
         # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合
         self._turn_start_lock = threading.Lock()
@@ -216,10 +217,10 @@ class ApiBridge:
         # 终态回调到来时若有回合正在运行，挂起到回合结束后补触发
         self._bg_summary_pending_session: str = ""
 
-        # 流式 token 批量推送缓冲
+        # 按会话隔离的流式 delta 缓冲，防止多会话并行时 token 混合
         self._delta_lock = threading.Lock()
-        self._delta_buffer: List[str] = []
-        self._delta_kind = "token_delta"
+        self._delta_buffers: dict[str, List[str]] = {}
+        self._delta_kinds: dict[str, str] = {}
         self._delta_last_flush = 0.0
         self._delta_flusher: Optional[threading.Thread] = None
 
@@ -413,6 +414,17 @@ class ApiBridge:
         except Exception:
             logger.debug("同步激活模型到 app_context 失败", exc_info=True)
 
+    def _get_cancel_event(self, session_name: str) -> threading.Event:
+        """获取指定会话的取消事件（不存在则创建）。"""
+        if session_name not in self._cancel_events:
+            self._cancel_events[session_name] = threading.Event()
+        return self._cancel_events[session_name]
+
+    def _is_turn_active(self, session_name: str) -> bool:
+        """检查指定会话是否有正在运行的回合。"""
+        t = self._active_turns.get(session_name)
+        return t is not None and t.is_alive()
+
     def emit_event(self, event_type: str, data: Any):
         """向 JS 传递结构化事件（非流式事件会先冲刷 token 缓冲，保证顺序）。"""
         if event_type not in ("token_delta", "thinking_delta"):
@@ -433,19 +445,20 @@ class ApiBridge:
             print(f"[GuiBridge] Error emitting event {event_type}: {e}", file=sys.stderr)
 
     # -- 流式增量的批量推送 ------------------------------------------------
-    def _emit_delta(self, kind: str, text: str):
-        """累积流式文本，最多每 TOKEN_FLUSH_INTERVAL 推送一次。"""
+    def _emit_delta(self, kind: str, text: str, session_name: str = ""):
+        """累积流式文本，最多每 TOKEN_FLUSH_INTERVAL 推送一次。按会话隔离缓冲。"""
         if not text:
             return
         flush_now = False
         with self._delta_lock:
-            if kind != self._delta_kind and self._delta_buffer:
+            buf = self._delta_buffers.setdefault(session_name, [])
+            cur_kind = self._delta_kinds.get(session_name, "token_delta")
+            if kind != cur_kind and buf:
                 # 思考流与正文流切换时先把旧缓冲吐出去，避免串台
-                pending_kind, pending_text = self._delta_kind, "".join(self._delta_buffer)
-                self._delta_buffer = []
-                self._emit_raw(pending_kind, {"text": pending_text})
-            self._delta_kind = kind
-            self._delta_buffer.append(text)
+                self._emit_raw(cur_kind, {"text": "".join(buf), "session_name": session_name})
+                buf.clear()
+            self._delta_kinds[session_name] = kind
+            buf.append(text)
             now = time.monotonic()
             if now - self._delta_last_flush >= TOKEN_FLUSH_INTERVAL:
                 flush_now = True
@@ -455,13 +468,19 @@ class ApiBridge:
 
     def _flush_deltas(self):
         with self._delta_lock:
-            if not self._delta_buffer:
+            if not self._delta_buffers:
                 return
-            kind = self._delta_kind
-            text = "".join(self._delta_buffer)
-            self._delta_buffer = []
+            pending = []
+            for session_name, buf in self._delta_buffers.items():
+                if not buf:
+                    continue
+                kind = self._delta_kinds.get(session_name, "token_delta")
+                text = "".join(buf)
+                buf.clear()
+                pending.append((kind, text, session_name))
             self._delta_last_flush = time.monotonic()
-        self._emit_raw(kind, {"text": text})
+        for kind, text, session_name in pending:
+            self._emit_raw(kind, {"text": text, "session_name": session_name})
 
     def _ensure_delta_flusher(self):
         """惰性启动尾包冲刷线程：保证最后一小段文本不会滞留在缓冲里。"""
@@ -1150,9 +1169,15 @@ class ApiBridge:
         def _timeout_deny():
             try:
                 # 超时一律按"拒绝"处理，绝不因为用户没看到弹窗就放行
+                # ask_user 的选项是自定义文案，超时不是"拒绝"而是取消
                 if permission_broker.is_active(request.request_id):
-                    permission_broker.resolve(request.request_id, 1)
-                    self.emit_event("error", {"message": "权限确认超时，已自动拒绝该操作。"})
+                    from core.permission_broker import CANCELLED_RESULT
+                    if request.function_name == "ask_user":
+                        permission_broker.resolve(request.request_id, CANCELLED_RESULT)
+                        self.emit_event("error", {"message": "问题确认超时，已自动取消。"})
+                    else:
+                        permission_broker.resolve(request.request_id, 1)
+                        self.emit_event("error", {"message": "权限确认超时，已自动拒绝该操作。"})
             except Exception:
                 logger.debug("权限超时处理失败", exc_info=True)
 
@@ -1222,36 +1247,42 @@ class ApiBridge:
                 full_text = f"{clean_text} {joined}" if clean_text else joined
             target_session = session_name or self._current_session
             with self._turn_start_lock:
-                if self._active_turn_thread and self._active_turn_thread.is_alive():
-                    return {"ok": False, "msg": "已有正在运行的回合"}
+                if self._is_turn_active(target_session):
+                    return {"ok": False, "msg": "该会话已有正在运行的回合"}
 
                 # 用户主动发起新对话：重置该会话的自动汇总标志，
                 # 下一批后台任务完成时可以再次触发自动汇总（与 TUI 行为一致）
                 with self._bg_summary_lock:
                     self._bg_summary_triggered.discard(target_session)
 
-                self._cancel_event = threading.Event()
+                cancel_event = threading.Event()
+                self._cancel_events[target_session] = cancel_event
                 turn_kwargs = {"display_text": clean_text} if attach_list else {}
                 if workdir:
                     # 懒创建会话：前端 pending 新会话在首条消息时才落库，
                     # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
                     turn_kwargs["pending_workdir"] = str(workdir)
-                self._active_turn_thread = threading.Thread(
+                worker = threading.Thread(
                     target=self._run_turn_worker,
                     args=(full_text, target_session),
                     kwargs=turn_kwargs,
                     daemon=True,
-                    name="gui-turn-worker",
+                    name=f"gui-turn-{target_session}",
                 )
-                self._active_turn_thread.start()
+                self._active_turns[target_session] = worker
+                worker.start()
             return {"ok": True}
         except Exception as e:
             logger.exception("send_user_message 失败")
             return {"ok": False, "msg": str(e)}
 
-    def stop_current_turn(self) -> Dict[str, Any]:
+    def stop_current_turn(self, session_name: str = "") -> Dict[str, Any]:
         try:
-            self._cancel_event.set()
+            # 优先取消指定会话，未指定则取消当前会话
+            target = session_name or self._current_session
+            evt = self._cancel_events.get(target)
+            if evt:
+                evt.set()
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -1270,6 +1301,7 @@ class ApiBridge:
             "toast_messages": set(),
             "terminal_message": None,
         }
+        cancel_event = self._cancel_events.get(session_name) or self._get_cancel_event(session_name)
 
         def finish_once():
             """turn_finish 只允许发出一次（历史实现在 end + finally 各发一次）。"""
@@ -1277,10 +1309,14 @@ class ApiBridge:
             if turn_finished:
                 return
             turn_finished = True
-            self.emit_event("turn_finish", {})
+            self.emit_event("turn_finish", {"session_name": session_name})
             self._emit_token_usage()
 
-        self._task_status = "executing"
+        # 多会话并行：不再用全局 _task_status 表示"执行中"——它会被另一会话回合结束时的
+        # idle 覆盖，也会让仍在跑的会话状态错乱。各会话的活跃状态由 self._active_turns
+        # 字典承载（线程已在 send_user_message 中存入）。_task_status 仅在全部回合结束
+        # 时恢复 idle，保持 _GuiContext.task_status 兼容。
+        # self._task_status = "executing"
         turn_start_data = {"user_text": user_text, "session_name": session_name}
         if display_text and display_text != user_text:
             turn_start_data["display_text"] = display_text
@@ -1294,8 +1330,8 @@ class ApiBridge:
             active_model = get_active_model()
             if not active_model or not active_model.get("litellm_model"):
                 # 关键修复：没有激活模型时也必须让前端解锁输入框
-                self.emit_event("error", {"message": "当前未激活任何 LLM 模型，请先在模型管理中配置并激活模型。"})
-                self.emit_event("turn_cancelled", {})
+                self.emit_event("error", {"message": "当前未激活任何 LLM 模型，请先在模型管理中配置并激活模型。", "session_name": session_name})
+                self.emit_event("turn_cancelled", {"session_name": session_name})
                 finish_once()
                 return
 
@@ -1313,6 +1349,9 @@ class ApiBridge:
                 turn_workdir = _resolve_real_path(turn_workdir)
                 if not os.path.isdir(turn_workdir):
                     raise FileNotFoundError(f"会话项目文件夹不存在: {turn_workdir}")
+                # ⚠ 已知限制：os.chdir 是进程级全局状态，多会话真并行时
+                # 不同目录的回合会互相抢占 cwd，相对路径文件操作可能落错目录。
+                # 彻底解决需改 core 层工具函数传 workdir 参数，暂标注为已知限制。
                 if os.path.abspath(turn_workdir) != os.path.abspath(os.getcwd()):
                     os.chdir(turn_workdir)
                 self._memory.set_workdir(turn_workdir)
@@ -1344,7 +1383,12 @@ class ApiBridge:
                     })
 
             turn_id = f"{session_name}:{uuid.uuid4().hex[:8]}"
-            self._set_current_session(session_name)
+            # 多会话并行：不再强制切换全局 _current_session。_set_current_session 会
+            # 同步 tool_cache/undo/plan/app_context 等全局绑定，会话 B 的回合启动会
+            # 把这些改成 B，从而影响会话 A 正在进行的后台子代理回调。本回合所需的会话
+            # 上下文已通过 session_name 参数显式传递给 prepare_turn_messages /
+            # chat_with_model_events（parent_session），不依赖全局 _current_session。
+            # 会话归属目录的绑定（os.chdir / memory.set_workdir）已在上面按 session_name 完成。
 
             # 与 TUI 完全同源的上下文组装（记忆压缩 / 系统提示词 / 运行上下文 / 后台任务汇总）
             from core.agent_service import prepare_turn_messages
@@ -1354,7 +1398,7 @@ class ApiBridge:
                 model_name,
                 ctx_win,
                 permission_mode=self._current_permission_mode,
-                cancel_event=self._cancel_event,
+                cancel_event=cancel_event,
                 notify=lambda kind, message: self.emit_event("notice", {"message": str(message)}),
                 api_key=api_key,
                 api_base=api_base,
@@ -1397,14 +1441,25 @@ class ApiBridge:
                     logger.debug("提交检查点失败", exc_info=True)
 
             if cancelled:
-                self.emit_event("turn_cancelled", {})
+                self.emit_event("turn_cancelled", {"session_name": session_name})
             else:
                 self._maybe_auto_rename(session_name)
         except Exception as e:
             logger.exception("GUI 对话回合失败")
-            self._emit_owned_error(str(e), api_key, error_state, terminal=True)
+            self._emit_owned_error(str(e), api_key, error_state, terminal=True, session_name=session_name)
         finally:
-            self._task_status = "idle"
+            # 从活跃回合字典中移除本会话
+            self._active_turns.pop(session_name, None)
+            # 顺带清理已完成的 cancel 事件，防止字典只增不减
+            self._cancel_events.pop(session_name, None)
+            # 顺带清理 delta 缓冲（加锁防止与 _flush_deltas 的遍历竞态）
+            with self._delta_lock:
+                self._delta_buffers.pop(session_name, None)
+                self._delta_kinds.pop(session_name, None)
+            # 仅当没有其他活跃回合时才恢复 idle，避免会话 A 结束时把仍在跑的会话 B
+            # 的全局状态错置成 idle
+            if not any(t.is_alive() for t in self._active_turns.values()):
+                self._task_status = "idle"
             try:
                 permission_broker.cancel_owner(session_name)
             except Exception:
@@ -1465,28 +1520,30 @@ class ApiBridge:
         """
         from core.tools import subagent_manager
 
-        if not session or session != self._current_session:
+        if not session:
             return
         if subagent_manager.has_running_background_tasks(session):
             return
 
         with self._turn_start_lock:
-            if self._active_turn_thread and self._active_turn_thread.is_alive():
-                # 回合运行中不能并发起新回合；挂起，回合结束时补检查
+            if self._is_turn_active(session):
+                # 该会话回合运行中不能并发起新回合；挂起，回合结束时补检查
                 self._bg_summary_pending_session = session
                 return
             with self._bg_summary_lock:
                 if session in self._bg_summary_triggered:
                     return
                 self._bg_summary_triggered.add(session)
-            self._cancel_event = threading.Event()
-            self._active_turn_thread = threading.Thread(
+            cancel_event = threading.Event()
+            self._cancel_events[session] = cancel_event
+            worker = threading.Thread(
                 target=self._run_turn_worker,
                 args=(_BG_SUMMARY_PROMPT, session, "bg_summary"),
                 daemon=True,
-                name="gui-bg-summary-turn",
+                name=f"gui-bg-summary-{session}",
             )
-            self._active_turn_thread.start()
+            self._active_turns[session] = worker
+            worker.start()
 
     def _subagent_progress_poller(self, session_name: str, stop: threading.Event) -> None:
         """回合期间轮询子代理运行状态并推送 subagent_progress 事件。
@@ -1523,24 +1580,25 @@ class ApiBridge:
                 # 没有任务且上一轮也没有任务时不推事件，避免空轮询刷屏
                 if tasks or had_tasks:
                     had_tasks = bool(tasks)
-                    self.emit_event("subagent_progress", {"tasks": tasks})
+                    self.emit_event("subagent_progress", {"tasks": tasks, "session_name": session_name})
             except Exception:
                 logger.debug("推送子代理进度失败", exc_info=True)
             if stopped:
                 break
 
-    def _emit_owned_error(self, message, api_key, error_state, *, terminal):
+    def _emit_owned_error(self, message, api_key, error_state, *, terminal, session_name=""):
         """Emit one terminal state and one toast per sanitized error message."""
         sanitized = _sanitize_for_ui(str(message), api_key)
+        session_payload = {"session_name": session_name} if session_name else {}
         if terminal and error_state["terminal_message"] is None:
             error_state["terminal_message"] = sanitized
-            self.emit_event("turn_error", {"message": sanitized})
+            self.emit_event("turn_error", {"message": sanitized, **session_payload})
 
         toast_messages = error_state["toast_messages"]
         if sanitized in toast_messages:
             return
         toast_messages.add(sanitized)
-        self.emit_event("error", {"message": sanitized})
+        self.emit_event("error", {"message": sanitized, **session_payload})
 
     def _consume_turn_events(
         self,
@@ -1572,13 +1630,13 @@ class ApiBridge:
             api_base,
             persist=True,
             turn_id=turn_id,
-            cancel_event=self._cancel_event,
+            cancel_event=self._cancel_events.get(session_name) or self._get_cancel_event(session_name),
             parent_session=session_name,
             parent_turn_id=turn_id,
             permission_owner=turn_id,
             permission_source="主代理",
         ):
-            if self._cancel_event.is_set():
+            if (self._cancel_events.get(session_name) or self._get_cancel_event(session_name)).is_set():
                 cancelled = True
                 break
 
@@ -1593,11 +1651,11 @@ class ApiBridge:
             if kind == "round_started":
                 # 轮次边界透传：前端据此把每个 LLM 轮次拆成独立消息块（分段思考）
                 # emit_event 内部会先 flush 累积的 delta，顺序天然正确
-                self.emit_event("round_started", {"round": data.get("round")})
+                self.emit_event("round_started", {"round": data.get("round"), "session_name": session_name})
             elif kind == "thinking_delta":
-                self._emit_delta("thinking_delta", str(data.get("text", "")))
+                self._emit_delta("thinking_delta", str(data.get("text", "")), session_name=session_name)
             elif kind in ("assistant_delta", "token_delta", "answer_delta"):
-                self._emit_delta("token_delta", str(data.get("text", "")))
+                self._emit_delta("token_delta", str(data.get("text", "")), session_name=session_name)
             elif kind in ("tool_requested", "tool_started"):
                 tool_id = str(data.get("id") or "")
                 name = str(data.get("name") or "tool")
@@ -1611,6 +1669,7 @@ class ApiBridge:
                         "label": label,
                         "display": dict(data.get("display") or {}),
                         "started_at_ms": int(time.time() * 1000),
+                        "session_name": session_name,
                     })
             elif kind == "tool_finished":
                 tool_id = str(data.get("id") or "")
@@ -1626,6 +1685,7 @@ class ApiBridge:
                     "error": str(data.get("error") or ""),
                     "duration_ms": data.get("duration_ms"),
                     "display": dict(data.get("display") or {}),
+                    "session_name": session_name,
                 })
             elif kind == "diff_ready":
                 # 优先取纯文本 unified diff；缺失时才退回终端版本（含 ANSI 颜色）
@@ -1633,11 +1693,13 @@ class ApiBridge:
                     "tool_call_id": str(data.get("tool_call_id") or ""),
                     "file_path": str(data.get("file_path") or ""),
                     "diff_text": str(data.get("diff_text") or data.get("text") or ""),
+                    "session_name": session_name,
                 })
             elif kind in ("plan_updated", "plan_change"):
                 self.emit_event("plan_updated", {
                     "title": str(data.get("title") or "当前任务计划"),
                     "items": data.get("items") or [],
+                    "session_name": session_name,
                 })
             elif kind == "turn_cancelled":
                 cancelled = True
@@ -1647,6 +1709,7 @@ class ApiBridge:
                     api_key,
                     error_state,
                     terminal=True,
+                    session_name=session_name,
                 )
             elif kind == "error":
                 self._emit_owned_error(
@@ -1654,13 +1717,14 @@ class ApiBridge:
                     api_key,
                     error_state,
                     terminal=False,
+                    session_name=session_name,
                 )
             elif kind in ("notice", "status"):
                 message = data.get("message")
                 if message:
-                    self.emit_event("notice", {"message": str(message)})
+                    self.emit_event("notice", {"message": str(message), "session_name": session_name})
 
-        if self._cancel_event.is_set():
+        if (self._cancel_events.get(session_name) or self._get_cancel_event(session_name)).is_set():
             cancelled = True
         return cancelled
 
