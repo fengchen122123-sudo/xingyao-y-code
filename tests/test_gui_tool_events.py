@@ -47,7 +47,13 @@ def finish_payload(tool_id, ok, duration_ms):
 
 def consume_bridge_events(monkeypatch, events):
     bridge = ApiBridge.__new__(ApiBridge)
-    bridge._cancel_event = threading.Event()
+    bridge._cancel_events = {"session": threading.Event()}
+    bridge._active_turns = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
     emitted = []
     bridge.emit_event = lambda kind, data: emitted.append((kind, data))
     monkeypatch.setattr(
@@ -136,14 +142,23 @@ def test_bridge_error_then_turn_error_has_single_message_owner(monkeypatch):
 
     emitted = consume_bridge_events(monkeypatch, events)
 
-    expected = {"message": "provider disconnected"}
-    assert [data for kind, data in emitted if kind == "error"] == [expected]
-    assert [data for kind, data in emitted if kind == "turn_error"] == [expected]
+    # error/turn_error 现在附带 session_name，只校验 message 字段
+    error_msgs = [data.get("message") for kind, data in emitted if kind == "error"]
+    turn_error_msgs = [data.get("message") for kind, data in emitted if kind == "turn_error"]
+    assert error_msgs == ["provider disconnected"]
+    assert turn_error_msgs == ["provider disconnected"]
 
 
 def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch):
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._bg_summary_pending_session = ""
+    bridge._cancel_events = {"session": threading.Event()}
+    bridge._active_turns = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
     bridge._emit_token_usage = lambda: None
     emitted = []
     bridge.emit_event = lambda kind, data: emitted.append((kind, data))
@@ -154,9 +169,9 @@ def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch):
 
     bridge._run_turn_worker("hello", "session")
 
-    expected = {"message": "provider disconnected"}
-    assert ("turn_error", expected) in emitted
-    assert ("error", expected) in emitted
+    # error/turn_error 现在附带 session_name
+    assert any(kind == "turn_error" and data.get("message") == "provider disconnected" for kind, data in emitted)
+    assert any(kind == "error" and data.get("message") == "provider disconnected" for kind, data in emitted)
 
 
 def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
@@ -167,7 +182,13 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     monkeypatch.chdir(launch)
 
     bridge = ApiBridge.__new__(ApiBridge)
-    bridge._cancel_event = threading.Event()
+    bridge._cancel_events = {"project-session": threading.Event()}
+    bridge._active_turns = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
     bridge._bg_summary_pending_session = ""
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
@@ -228,7 +249,13 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     expected_toast_messages,
 ):
     bridge = ApiBridge.__new__(ApiBridge)
-    bridge._cancel_event = threading.Event()
+    bridge._cancel_events = {"session": threading.Event()}
+    bridge._active_turns = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
     bridge._bg_summary_pending_session = ""
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
@@ -326,4 +353,4 @@ def test_bridge_forwards_round_started_event(monkeypatch):
 
     emitted = consume_bridge_events(monkeypatch, events)
 
-    assert ("round_started", {"round": 2}) in emitted
+    assert any(kind == "round_started" and data.get("round") == 2 for kind, data in emitted)
