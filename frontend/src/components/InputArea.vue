@@ -81,17 +81,19 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, nextTick, onUnmounted } from 'vue';
+import { ref, computed, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
 import AttachmentChips from './AttachmentChips.vue';
-import InputSuggest, { type SuggestItem } from './InputSuggest.vue';
+import InputSuggest from './InputSuggest.vue';
 import { useAttachments } from '../composables/useAttachments';
+import { useSuggest } from '../composables/useSuggest';
 
 const store = useAppStore();
 const inputVal = ref('');
+const textareaRef = ref<HTMLTextAreaElement | null>(null);
 
 const showModelCascader = ref(false);
 const showPermDropdown = ref(false);
@@ -130,150 +132,13 @@ const cacheRateDisplay = computed(() => (
 ));
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste } = useAttachments();
-
-// ---------------------------------------------------------------------------
-// 输入自动补全：/ 斜杠（已启用技能 + 已启用 MCP 服务）与 @ 文件引用（子串匹配）
-// CLI 内置命令（/models /theme 等）在 GUI 均有可视化入口，不再列入候选。
-// ---------------------------------------------------------------------------
-const textareaRef = ref<HTMLTextAreaElement | null>(null);
-// 当前补全状态：mode=补全类型，start=词在文本中的起始下标，query=已输入部分
-const suggest = ref<{ mode: 'command' | 'file'; start: number; query: string } | null>(null);
-const suggestItems = ref<SuggestItem[]>([]);
-const suggestIndex = ref(0);
-let fileSuggestTimer: number | undefined;
-
-function buildCommandItems(query: string) {
-  const q = query.toLowerCase();
-  const items: SuggestItem[] = [];
-  // 已启用技能生成 /<short_id> 候选
-  for (const s of store.skills) {
-    if (!s.enabled || !s.short_id) continue;
-    items.push({
-      key: 'skill:' + s.short_id,
-      icon: '⚡',
-      label: '/' + s.short_id,
-      desc: s.description || s.name,
-      apply: '/' + s.short_id,
-    });
-  }
-  // 已启用 MCP 服务生成 /mcp:<name> 候选（提示模型调用该服务的工具）
-  for (const m of store.mcps) {
-    if (!m.enabled) continue;
-    items.push({
-      key: 'mcp:' + m.name,
-      icon: '🔌',
-      label: '/mcp:' + m.name,
-      desc: m.comment || `MCP 服务 · ${m.tools_count} 个工具`,
-      apply: '/mcp:' + m.name,
-    });
-  }
-  suggestItems.value = items
-    .filter(it => it.label.slice(1).toLowerCase().startsWith(q))
-    .slice(0, 8);
-  suggestIndex.value = 0;
-}
-
-function fetchFileItems(query: string) {
-  window.clearTimeout(fileSuggestTimer);
-  fileSuggestTimer = window.setTimeout(async () => {
-    const api = window.pywebview && window.pywebview.api;
-    if (!api) {
-      suggestItems.value = [];
-      return;
-    }
-    try {
-      const res = await api.search_workspace_files(query, 8);
-      // 防抖期间用户可能已离开 @ 语境：过期结果直接丢弃
-      if (!suggest.value || suggest.value.mode !== 'file') return;
-      const files: string[] = (res && res.files) || [];
-      suggestItems.value = files.map(f => ({
-        key: f,
-        icon: '📄',
-        label: f,
-        desc: '',
-        apply: '@' + f,
-      }));
-      suggestIndex.value = 0;
-    } catch {
-      suggestItems.value = [];
-    }
-  }, 150);
-}
-
-function detectToken() {
-  const ta = textareaRef.value;
-  if (!ta) {
-    suggest.value = null;
-    return;
-  }
-  const pos = ta.selectionStart ?? inputVal.value.length;
-  const before = inputVal.value.slice(0, pos);
-  // 斜杠命令：词首为 /（行首或空白之后），词内不含空白
-  const sm = before.match(/(?:^|\s)\/([^\s]*)$/);
-  if (sm) {
-    const query = sm[1];
-    suggest.value = { mode: 'command', start: pos - query.length - 1, query };
-    buildCommandItems(query);
-    return;
-  }
-  // @ 文件引用：光标前最后一个 @ 后的非空白串作为匹配词
-  const am = before.match(/@([^\s@]*)$/);
-  if (am) {
-    const query = am[1];
-    suggest.value = { mode: 'file', start: pos - query.length - 1, query };
-    fetchFileItems(query);
-    return;
-  }
-  // 不在补全语境：状态与候选列表一并关闭（候选残留会导致面板关不掉）
-  suggest.value = null;
-  suggestItems.value = [];
-}
-
-function applySuggest(item: SuggestItem) {
-  const s = suggest.value;
-  if (!s) return;
-  const ta = textareaRef.value;
-  const pos = ta ? (ta.selectionStart ?? inputVal.value.length) : inputVal.value.length;
-  const inserted = item.apply + ' ';
-  inputVal.value = inputVal.value.slice(0, s.start) + inserted + inputVal.value.slice(pos);
-  // 选中即关闭：状态与候选列表一起清空（InputSuggest 按 items.length 显隐）
-  suggest.value = null;
-  suggestItems.value = [];
-  nextTick(() => {
-    if (ta) {
-      ta.focus();
-      const cursor = s.start + inserted.length;
-      ta.setSelectionRange(cursor, cursor);
-    }
-  });
-}
+const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
 
 function onKeydown(e: KeyboardEvent) {
-  // 补全面板打开时优先消费导航键
-  if (suggest.value && suggestItems.value.length) {
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      suggestIndex.value = (suggestIndex.value + 1) % suggestItems.value.length;
-      return;
-    }
-    if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      suggestIndex.value = (suggestIndex.value - 1 + suggestItems.value.length) % suggestItems.value.length;
-      return;
-    }
-    if (e.key === 'Tab' || (e.key === 'Enter' && !e.shiftKey)) {
-      e.preventDefault();
-      applySuggest(suggestItems.value[suggestIndex.value]);
-      return;
-    }
-    if (e.key === 'Escape') {
-      e.preventDefault();
-      e.stopPropagation();
-      suggest.value = null;
-      suggestItems.value = [];
-      return;
-    }
-  }
+  // 先让 composable 处理补全导航键（方向键/Tab/Enter/Esc）
+  suggestKeydown(e);
+  if (e.defaultPrevented) return;
+  // 补全未拦截：Enter 发送，Escape 停止
   if (e.key === 'Enter' && !e.shiftKey) {
     e.preventDefault();
     handleSend();
@@ -282,7 +147,7 @@ function onKeydown(e: KeyboardEvent) {
   }
 }
 
-onUnmounted(() => window.clearTimeout(fileSuggestTimer));
+onUnmounted(() => clearSuggest());
 
 async function handlePickFiles() {
   await pickAttachments();

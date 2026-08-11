@@ -9,10 +9,21 @@
 
     <div class="kimi-card">
       <AttachmentChips :items="attachments" @remove="removeAttachment" />
-      <textarea 
-        v-model="inputVal" 
-        placeholder="尽管问，或做个任务..." 
-        @keydown.enter.exact.prevent="handleSend"
+      <!-- / 斜杠命令 与 @ 文件引用的自动补全面板 -->
+      <InputSuggest
+        :items="suggestItems"
+        :active-index="suggestIndex"
+        @select="applySuggest"
+        @hover="i => suggestIndex = i"
+      />
+      <textarea
+        ref="textareaRef"
+        v-model="inputVal"
+        placeholder="尽管问，或做个任务… / 调用技能与 MCP，@ 引用文件"
+        @keydown="handleKeydown"
+        @input="detectToken"
+        @click="detectToken"
+        @keyup="detectToken"
         @paste="handlePaste"
       ></textarea>
 
@@ -114,10 +125,13 @@ import { formatPermMode } from '../utils/markdown';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
 import AttachmentChips from './AttachmentChips.vue';
+import InputSuggest from './InputSuggest.vue';
 import { useAttachments } from '../composables/useAttachments';
+import { useSuggest } from '../composables/useSuggest';
 
 const store = useAppStore();
 const inputVal = ref('');
+const textareaRef = ref<HTMLTextAreaElement | null>(null);
 
 const showModelCascader = ref(false);
 const showPermDropdown = ref(false);
@@ -184,6 +198,9 @@ function togglePermDropdown() {
 }
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste } = useAttachments();
+const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
+
+onUnmounted(() => clearSuggest());
 
 async function handlePickFiles() {
   await pickAttachments();
@@ -191,12 +208,25 @@ async function handlePickFiles() {
 
 function handleSend() {
   if (store.running) return;
+  // 补全面板打开时由 onKeydown 拦截，不会走到这里
   const text = inputVal.value;
   const paths = attachments.value.map(a => a.path);
   if (!text.trim() && !paths.length) return;
   inputVal.value = '';
   clearAttachments();
   store.sendMessage(text, paths);
+}
+
+// 独立的 Enter 发送处理：onKeydown 没拦截时（补全未打开）才发送
+function handleKeydown(e: KeyboardEvent) {
+  onKeydown(e);
+  // 补全已处理（导航键/选中/关闭），不需要进一步处理
+  if (e.defaultPrevented) return;
+  // Enter 发送（补全关闭时）
+  if (e.key === 'Enter' && !e.shiftKey) {
+    e.preventDefault();
+    handleSend();
+  }
 }
 </script>
 

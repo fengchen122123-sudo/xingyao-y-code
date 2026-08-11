@@ -80,6 +80,11 @@
               @click="onSessionClick(s)"
             >
               <div class="t">{{ s.display_name || s.name }}</div>
+              <span
+                v-if="store.runningSessions.includes(s.name)"
+                class="s-spinner"
+                title="正在执行回合"
+              ></span>
               <div class="m">{{ relativeTime(s.updated_at) }}</div>
               <button
                 v-if="confirmDeleteName !== s.name"
@@ -422,6 +427,19 @@ function getFolderTitle(g: SessionGroup) {
 /* 悬停时删除按钮出现在最右侧，隐藏时间避免重叠 */
 .session-item:hover .m {
   visibility: hidden;
+}
+/* 正在执行回合的会话：名称右侧显示旋转动画图标 */
+.session-item .s-spinner {
+  flex-shrink: 0;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--orange);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
 }
 .session-item .s-del {
   position: absolute;
