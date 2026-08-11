@@ -118,10 +118,28 @@ def evict_oldest_turn(history: list) -> bool:
     return True
 
 
-def load_system_prompt() -> str:
-    """三级兜底读取系统提示词：配置路径 → 仓库内 system_prompt.md → 内置字面量。"""
+def load_system_prompt(is_gui: bool = False) -> str:
+    """三级兜底读取系统提示词：配置路径 → 仓库内提示词文件 → 内置字面量。
+
+    is_gui=True 时优先读取 GUI 专用提示词（system_prompt_gui.md），
+    找不到则回退到通用提示词，确保任何情况下都不会因文件缺失而整轮失败。
+    """
     system_prompt = ""
     try:
+        if is_gui:
+            from config import SYSTEM_PROMPT_GUI_FILE
+            prompt_path = SYSTEM_PROMPT_GUI_FILE
+            if os.path.exists(prompt_path):
+                with open(prompt_path, "r", encoding="utf-8") as f:
+                    system_prompt = f.read().strip()
+            if not system_prompt:
+                fallback_path = os.path.join(_repo_root(), "system_prompt_gui.md")
+                if os.path.exists(fallback_path):
+                    with open(fallback_path, "r", encoding="utf-8") as f:
+                        system_prompt = f.read().strip()
+            if system_prompt:
+                return system_prompt
+            # GUI 专用提示词不存在时回退到通用提示词
         from config import SYSTEM_PROMPT_FILE
         prompt_path = SYSTEM_PROMPT_FILE
         if os.path.exists(prompt_path):
@@ -141,7 +159,7 @@ def load_system_prompt() -> str:
     return system_prompt
 
 
-def build_stable_system_message() -> dict:
+def build_stable_system_message(is_gui: bool = False) -> dict:
     """组装每轮请求首位的稳定系统提示词消息，供请求组装与 Token 估算复用。
 
     稳定前缀 = 基础系统提示词 + 决策策略 + 通用编码规范 + 长期记忆
@@ -155,7 +173,7 @@ def build_stable_system_message() -> dict:
     """
     from core.context_builder import build_stable_prompt
 
-    parts = [build_stable_prompt(load_system_prompt())]
+    parts = [build_stable_prompt(load_system_prompt(is_gui))]
     parts.append(_GENERAL_CODING_STANDARDS)
     try:
         import core.memory_kairos as memory_kairos
@@ -180,14 +198,14 @@ def build_stable_system_message() -> dict:
         pass
     return {"role": "system", "content": "\n\n".join(parts)}
 
-def estimate_history_tokens_with_system(model_name: str, history: list) -> int:
+def estimate_history_tokens_with_system(model_name: str, history: list, is_gui: bool = False) -> int:
     """估算一轮请求的实际 Token 占用：历史消息 + 首部稳定系统提示词。
 
     主系统提示词每轮现组、不落库，纯历史估算会漏掉它。
     仅作为“无真实用量记录”时的兜底口径（见 get_session_token_baseline）。
     """
     from core.llm import estimate_tokens
-    return estimate_tokens(model_name, [build_stable_system_message()] + list(history or []))
+    return estimate_tokens(model_name, [build_stable_system_message(is_gui)] + list(history or []))
 
 
 def get_session_token_baseline(manager, session_name: str, model_name: str,
@@ -410,6 +428,7 @@ def prepare_turn_messages(
     api_key: str = "",
     api_base: str = "",
     compress_threshold: float = DEFAULT_COMPRESS_THRESHOLD,
+    is_gui: bool = False,
 ) -> list:
     """组装一轮对话真正发给大模型的完整消息列表。
 
@@ -463,7 +482,7 @@ def prepare_turn_messages(
 
     # 提前组装首部稳定系统提示词：Token 估算必须把它计入，
     # 否则口径会低于实际请求（系统提示词不落库、每轮现组）
-    system_message = build_stable_system_message()
+    system_message = build_stable_system_message(is_gui)
 
     # 【四级水位线阶梯】在向大模型请求前，按水位逐级升级维护强度。
     # 触发判断优先用本会话最近一次真实 API 用量作基线（下一轮 prompt 必然包含

@@ -1358,6 +1358,7 @@ class ApiBridge:
                 notify=lambda kind, message: self.emit_event("notice", {"message": str(message)}),
                 api_key=api_key,
                 api_base=api_base,
+                is_gui=True,
             )
 
             # 会话级检查点：本轮所有 write_file/edit_file 的旧内容会被自动记录
