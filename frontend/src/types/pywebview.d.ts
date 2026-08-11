@@ -51,6 +51,12 @@ export interface ModelSettingsSnapshot {
   providers: ProviderInfo[];
   models: ModelInfo[];
   active_model_id: string;
+  secondary_model_id: string;
+  secondary_model_roles: {
+    vision: boolean;
+    compression: boolean;
+    subagent: boolean;
+  };
 }
 
 export interface SkillInfo {
@@ -178,6 +184,9 @@ export interface InitialState {
   providers?: ProviderInfo[];
   active_model_id: string;
   active_model_name: string;
+  // 副模型（用于识图 / 压缩 / 子 Agent 等后台任务）
+  secondary_model_id?: string;
+  secondary_model_roles?: { vision: boolean; compression: boolean; subagent: boolean };
   permission_mode: PermissionMode;
   reasoning_effort?: ReasoningEffort;
   sessions: SessionGroup[];
@@ -279,6 +288,7 @@ export interface PyWebViewAPI {
   set_reasoning_effort(level: ReasoningEffort): Promise<any>;
   set_permission_mode(mode: PermissionMode): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
+  respond_permission_choice(requestId: string, choiceIndex: number): Promise<any>;
 
   send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string): Promise<any>;
   stop_current_turn(): Promise<any>;
@@ -325,6 +335,8 @@ export interface PyWebViewAPI {
   update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean): Promise<any>;
   delete_model(modelId: string): Promise<any>;
   test_model(modelId: string): Promise<any>;
+  set_secondary_model(modelId: string): Promise<any>;
+  set_secondary_roles(roles: { vision: boolean; compression: boolean; subagent: boolean }): Promise<any>;
 }
 
 declare global {

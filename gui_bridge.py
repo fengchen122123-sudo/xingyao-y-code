@@ -33,9 +33,12 @@ from core.model_manager import (
     delete_model as mm_delete_model,
     get_active_model,
     get_model_reasoning_effort,
+    get_secondary_roles,
     load_config,
     set_active_model,
     set_model_reasoning_effort,
+    set_secondary_model,
+    set_secondary_roles,
     update_model as mm_update_model,
     update_provider as mm_update_provider,
 )
@@ -1049,6 +1052,51 @@ class ApiBridge:
             logger.exception("set_reasoning_effort 失败")
             return {"ok": False, "msg": str(e)}
 
+    def set_secondary_model(self, model_id: str) -> Dict[str, Any]:
+        """设置/清除副模型（用于视觉/压缩/子代理等后台任务）。传空字符串清除。"""
+        try:
+            mid = str(model_id or "").strip()
+            if mid:
+                # 校验模型存在性
+                config_data = load_config()
+                found = False
+                for provider in config_data.get("providers", []):
+                    for m in provider.get("models", []):
+                        if str(m.get("id")) == mid:
+                            found = True
+                            break
+                    if found:
+                        break
+                if not found:
+                    return {"ok": False, "msg": f"未找到模型: {mid}"}
+                set_secondary_model(mid)
+                self._sync_active_model_context()
+                return {"ok": True, "settings": self.get_model_settings(),
+                        "msg": "副模型已设置"}
+            else:
+                set_secondary_model(None)
+                self._sync_active_model_context()
+                return {"ok": True, "settings": self.get_model_settings(),
+                        "msg": "副模型已清除"}
+        except Exception as e:
+            logger.exception("set_secondary_model 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_secondary_roles(self, roles: dict) -> Dict[str, Any]:
+        """更新副模型用途开关（vision/compression/subagent）。"""
+        try:
+            set_secondary_roles({
+                "vision": bool(roles.get("vision", True)),
+                "compression": bool(roles.get("compression", True)),
+                "subagent": bool(roles.get("subagent", True)),
+            })
+            self._sync_active_model_context()
+            return {"ok": True, "settings": self.get_model_settings(),
+                    "msg": "副模型用途已更新"}
+        except Exception as e:
+            logger.exception("set_secondary_roles 失败")
+            return {"ok": False, "msg": str(e)}
+
     def set_permission_mode(self, mode: str) -> Dict[str, Any]:
         try:
             # 规范化会把无法识别的值兜底成 confirm；这里要明确告诉前端"没识别出来"，
@@ -1143,6 +1191,18 @@ class ApiBridge:
             return {"ok": True}
         except Exception as e:
             logger.exception("respond_permission 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def respond_permission_choice(self, request_id: str, choice_index: int) -> Dict[str, Any]:
+        """按选项索引回答权限请求（用于 ask_user 澄清问题的自定义选项）。"""
+        try:
+            resolved = permission_broker.resolve(str(request_id), int(choice_index))
+            self._cancel_perm_timer(str(request_id))
+            if not resolved:
+                return {"ok": False, "msg": "该权限请求已失效或已被处理"}
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("respond_permission_choice 失败")
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
@@ -2414,6 +2474,8 @@ class ApiBridge:
             "providers": providers,
             "models": models,
             "active_model_id": str(config_data.get("active_model_id") or ""),
+            "secondary_model_id": str(config_data.get("secondary_model_id") or ""),
+            "secondary_model_roles": get_secondary_roles(),
         }
 
     def _all_models(self) -> List[Dict[str, Any]]:
