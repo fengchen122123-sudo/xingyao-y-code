@@ -50,7 +50,10 @@ const emit = defineEmits<{
   box-shadow: 0 -8px 30px rgba(0, 0, 0, 0.35);
   backdrop-filter: blur(14px);
   padding: 5px;
-  max-height: 264px;
+  /* 空会话页卡片居中，面板向上弹出时上方空间有限（约 280px），
+     限高 232px（约 6 条候选 + 吸底提示栏）避免顶部被消息容器裁剪；
+     超出部分面板内滚动，提示栏 sticky 常驻不会被裁 */
+  max-height: 232px;
   overflow-y: auto;
   z-index: 100;
 }
@@ -91,6 +94,11 @@ const emit = defineEmits<{
   max-width: 55%;
 }
 .sg-hint {
+  /* 吸底常驻：候选较多需要滚动时提示栏也不会被裁掉 */
+  position: sticky;
+  bottom: 0;
+  background: var(--float-bg);
+  border-radius: 0 0 7px 7px;
   padding: 5px 10px 3px;
   font-size: 10.5px;
   color: var(--text-faint);
