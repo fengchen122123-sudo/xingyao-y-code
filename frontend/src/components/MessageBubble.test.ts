@@ -30,6 +30,22 @@ function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
 beforeEach(() => setActivePinia(createPinia()));
 
 describe('MessageBubble', () => {
+  it('renders persistent attachment notes inside the user bubble', () => {
+    const wrapper = mount(MessageBubble, {
+      props: {
+        msg: {
+          role: 'user',
+          content: '请分析图片',
+          attachment_notes: ['🖼️ 已附加图片: sample.png（压缩后 320KB）'],
+        },
+      },
+    });
+
+    expect(wrapper.get('.attachment-notes').text()).toContain('sample.png');
+    expect(wrapper.get('.attachment-note').text()).toContain('压缩后 320KB');
+    wrapper.unmount();
+  });
+
   it('orders thinking block, execution trace, then markdown answer', () => {
     const msg = assistantMessage({
       reasoning_content: '先想想怎么做',

@@ -130,3 +130,30 @@ def test_responses_model_test_uses_responses_protocol(tmp_path, monkeypatch):
 
     assert result == {"ok": True, "msg": "连接成功"}
     assert called[0]["input"] == [{"role": "user", "content": "ping"}]
+
+
+def test_get_initial_state_includes_secondary_model_fields(tmp_path, monkeypatch):
+    """启动快照必须携带副模型配置，否则设置页会显示"无/全勾选"假象。"""
+    data = _configured_data()
+    data["secondary_model_id"] = "m1"
+    data["secondary_model_roles"] = {"vision": True, "compression": False, "subagent": False}
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    bridge = _bare_bridge()
+    bridge._current_session = ""
+    bridge._session_workdir = lambda session: "GLOBAL"
+    bridge._recalc_token_usage = lambda session: None
+    bridge._current_permission_mode = "confirm"
+    bridge.get_sessions = lambda: []
+    bridge._build_skill_list = lambda: []
+    bridge._build_mcp_list = lambda: []
+    bridge.get_plugins = lambda: []
+    bridge._load_session_messages = lambda session: []
+    bridge.get_token_usage = lambda: {}
+
+    state = bridge.get_initial_state()
+
+    assert state["secondary_model_id"] == "m1"
+    assert state["secondary_model_roles"] == {
+        "vision": True, "compression": False, "subagent": False,
+    }

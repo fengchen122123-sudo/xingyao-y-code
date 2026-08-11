@@ -33,8 +33,9 @@ const props = defineProps<{
   state: ExecutionState;
 }>();
 
-// 默认展开；折叠状态只影响本组件 UI，不写入任何 store
-const expanded = ref(true);
+// 默认收起（图二样式）：只显示"执行过程 · N 项 · 状态"一行，点击标题展开详情；
+// 折叠状态只影响本组件 UI，不写入任何 store
+const expanded = ref(false);
 
 const STATE_LABELS: Record<ExecutionState, string> = {
   running: '进行中',

@@ -17,6 +17,16 @@
           @click="store.openLightbox(msg.images!, i)"
         >
       </div>
+      <div
+        v-if="msg.attachment_notes && msg.attachment_notes.length"
+        class="attachment-notes"
+      >
+        <div
+          v-for="(note, i) in msg.attachment_notes"
+          :key="i"
+          class="attachment-note"
+        >{{ note }}</div>
+      </div>
     </div>
 
     <!-- 助手消息（无头像图标，仅显示“星瑶”名称） -->
@@ -48,6 +58,9 @@
 
         <!-- Markdown 文本内容 -->
         <div v-if="msg.content && msg.content.trim()" class="md-body" v-html="renderMarkdown(msg.content)"></div>
+
+        <!-- 回合进行中的非终态错误（挂在助手消息上，不插队成独立 error 消息） -->
+        <div v-if="msg.error_note" class="error-note">⚠ {{ msg.error_note }}</div>
 
         <!-- 等待模型响应期间的动态反馈（对齐 CLI 的“星瑶正在干活”） -->
         <div v-if="showWorking" class="working-line">
@@ -180,6 +193,21 @@ const thinkingOpen = computed({
   object-fit: contain;
   background: var(--bg3);
 }
+.attachment-notes {
+  margin-top: 8px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border);
+  color: var(--text-faint);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.attachment-note {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.attachment-note + .attachment-note {
+  margin-top: 2px;
+}
 
 .avatar-row {
   display: flex;
@@ -273,6 +301,21 @@ const thinkingOpen = computed({
 .md-body {
   margin-top: 8px;
   line-height: 1.7;
+}
+
+/* 挂在助手消息上的非终态错误提示 */
+.error-note {
+  margin-top: 8px;
+  padding: 8px 12px;
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 8%, var(--bg2));
+  border: 1px solid color-mix(in srgb, var(--red) 40%, var(--border));
+  border-left: 3px solid var(--red);
+  border-radius: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 
 .msg-error {

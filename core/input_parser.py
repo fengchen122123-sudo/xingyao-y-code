@@ -2,15 +2,32 @@ import re
 import os
 import base64
 import io
+from dataclasses import dataclass
 
 # 附件大小上限：防止大文件撑爆内存 / token
-MAX_IMAGE_BYTES = 5 * 1024 * 1024   # 图片 5MB
+MAX_IMAGE_BYTES = 20 * 1024 * 1024  # 图片 20MB
+MAX_DECODED_IMAGE_PIXELS = 40_000_000
 MAX_TEXT_BYTES = 200 * 1024         # 文本 200KB（超出部分截断）
 
 # 默认图片压缩参数：在视觉质量和 token 成本之间取平衡
-DEFAULT_MAX_IMAGE_EDGE = 1024       # 最大边长（像素）
-DEFAULT_IMAGE_QUALITY = 85          # JPEG/WebP 质量
-DEFAULT_MAX_IMAGE_OUTPUT_BYTES = 500 * 1024  # 压缩后目标上限（字节）
+DEFAULT_MAX_IMAGE_EDGE = 1536       # 最大边长（像素）
+DEFAULT_IMAGE_QUALITY = 90          # JPEG/WebP 质量
+DEFAULT_MAX_IMAGE_OUTPUT_BYTES = 1024 * 1024  # 压缩后目标上限（字节）
+
+
+@dataclass(frozen=True)
+class CompressedImage:
+    data: bytes
+    mime_type: str
+    extension: str
+
+
+def _quality_steps(quality):
+    first_quality = max(50, min(int(quality), 100))
+    steps = list(range(first_quality, 49, -5))
+    if steps[-1] != 50:
+        steps.append(50)
+    return steps
 
 
 def _is_image_file(path):
@@ -47,61 +64,104 @@ def _load_image_compression_config():
         }
 
 
-def _compress_image_bytes(raw_bytes, ext, max_edge=1024, quality=85, max_output_bytes=500*1024):
-    """用 Pillow 压缩图片，返回压缩后的 bytes。
-
-    策略：
-    1. 限制最大边长；
-    2. 对 JPEG/WebP 调整质量；
-    3. 如果压缩后反而更大，回退到原图；
-    4. Pillow 不可用时返回原图。
-
-    仅处理静态图片，GIF 跳过压缩（保留动图）。
-    """
-    if ext == "gif":
-        return raw_bytes
+def _compress_image_bytes(
+    raw_bytes,
+    ext,
+    max_edge=DEFAULT_MAX_IMAGE_EDGE,
+    quality=DEFAULT_IMAGE_QUALITY,
+    max_output_bytes=DEFAULT_MAX_IMAGE_OUTPUT_BYTES,
+    max_decoded_pixels=MAX_DECODED_IMAGE_PIXELS,
+):
+    """规范化并压缩静态图片，返回数据及其真实媒体类型。"""
     try:
-        from PIL import Image
-    except Exception:
-        return raw_bytes
+        from PIL import Image, ImageOps
+    except ImportError as exc:
+        raise RuntimeError("图片处理需要 Pillow，请先安装 pillow") from exc
 
-    try:
-        img = Image.open(io.BytesIO(raw_bytes))
-        # 统一转换为 RGB（PNG 带透明通道时转白底，视觉模型兼容性更好）
-        if img.mode in ("RGBA", "P"):
-            img = img.convert("RGB")
+    with Image.open(io.BytesIO(raw_bytes)) as opened:
+        source_format = str(opened.format or ext).lower()
+        if source_format == "jpg":
+            source_format = "jpeg"
+        mime_types = {
+            "jpeg": "image/jpeg",
+            "png": "image/png",
+            "webp": "image/webp",
+            "gif": "image/gif",
+        }
+        if source_format not in mime_types:
+            raise ValueError(f"不支持的图片格式: {source_format or ext}")
 
-        # 等比缩放，限制最大边长
-        width, height = img.size
+        width, height = opened.size
+        decoded_pixels = width * height
+        if decoded_pixels > max_decoded_pixels:
+            raise ValueError(
+                f"图片解码像素 {decoded_pixels:,} 超过 {max_decoded_pixels:,} 像素上限"
+            )
+        opened.load()
+
+        # GIF 保留原始动画和编码；仍执行格式识别与像素上限检查。
+        if source_format == "gif":
+            return CompressedImage(raw_bytes, mime_types[source_format], source_format)
+
+        orientation = opened.getexif().get(274, 1)
+        image = ImageOps.exif_transpose(opened)
+        transformed = orientation not in (None, 1)
+
+        width, height = image.size
         if max(width, height) > max_edge:
             ratio = max_edge / max(width, height)
-            new_size = (int(width * ratio), int(height * ratio))
-            img = img.resize(new_size, Image.LANCZOS)
+            new_size = (
+                max(1, round(width * ratio)),
+                max(1, round(height * ratio)),
+            )
+            image = image.resize(new_size, Image.Resampling.LANCZOS)
+            transformed = True
 
-        # 选择输出格式：原图是 PNG 且尺寸较大时转 JPEG 更省体积；否则保持 JPEG/WebP
-        out_ext = ext if ext in ("jpeg", "jpg", "webp") else "jpeg"
+        def encode_png():
+            buffer = io.BytesIO()
+            image.save(buffer, format="PNG", optimize=True)
+            return buffer.getvalue()
 
-        def _encode(q):
-            buf = io.BytesIO()
-            if out_ext == "webp":
-                img.save(buf, format="WEBP", quality=q, method=3)
+        def encode_lossy(candidate_quality):
+            buffer = io.BytesIO()
+            if source_format == "webp":
+                image.save(
+                    buffer,
+                    format="WEBP",
+                    quality=candidate_quality,
+                    method=4,
+                )
             else:
-                img.save(buf, format="JPEG", quality=q, optimize=True)
-            return buf.getvalue()
+                jpeg_image = image
+                if jpeg_image.mode not in ("RGB", "L"):
+                    jpeg_image = jpeg_image.convert("RGB")
+                jpeg_image.save(
+                    buffer,
+                    format="JPEG",
+                    quality=candidate_quality,
+                    optimize=True,
+                    progressive=True,
+                )
+            return buffer.getvalue()
 
-        # 先按默认质量编码
-        encoded = _encode(quality)
+        if source_format == "png":
+            encoded = encode_png()
+        else:
+            candidates = []
+            encoded = None
+            for candidate_quality in _quality_steps(quality):
+                candidate = encode_lossy(candidate_quality)
+                candidates.append(candidate)
+                if len(candidate) <= max_output_bytes:
+                    encoded = candidate
+                    break
+            if encoded is None:
+                encoded = min(candidates, key=len)
 
-        # 如果仍超限，逐步降低质量再试一次
-        if len(encoded) > max_output_bytes and quality > 50:
-            encoded = _encode(50)
-
-        # 压缩有效才使用；否则回退原图避免画质劣化无收益
-        if len(encoded) < len(raw_bytes):
-            return encoded
-        return raw_bytes
-    except Exception:
-        return raw_bytes
+        # 未发生旋转或缩放时，体积没有收益就保留原始编码，避免无谓重编码。
+        if not transformed and len(encoded) >= len(raw_bytes):
+            encoded = raw_bytes
+        return CompressedImage(encoded, mime_types[source_format], source_format)
 
 
 def parse_user_input(text):
@@ -150,9 +210,12 @@ def parse_user_input(text):
     for file_path in extracted_files:
         if _is_image_file(file_path):
             try:
-                # 图片大小上限 5MB，超限跳过
+                # 原始文件限制保护读取内存，解码后另有像素数量限制。
                 if os.path.getsize(file_path) > MAX_IMAGE_BYTES:
-                    attached_msgs.append(f"⚠️ 图片超过 5MB 上限，已跳过: {os.path.basename(file_path)}")
+                    limit_mb = MAX_IMAGE_BYTES // (1024 * 1024)
+                    attached_msgs.append(
+                        f"⚠️ 图片超过 {limit_mb}MB 上限，已跳过: {os.path.basename(file_path)}"
+                    )
                     continue
                 ext = os.path.splitext(file_path)[1].lower().strip('.')
                 if ext == 'jpg': ext = 'jpeg'
@@ -166,20 +229,20 @@ def parse_user_input(text):
                     quality=img_cfg["quality"],
                     max_output_bytes=img_cfg["max_output_bytes"],
                 )
-                if len(compressed) < len(raw_bytes):
-                    saved = len(raw_bytes) - len(compressed)
+                if len(compressed.data) < len(raw_bytes):
+                    saved = len(raw_bytes) - len(compressed.data)
                     attached_msgs.append(
                         f"🖼️ 已附加图片: {os.path.basename(file_path)}"
-                        f"（压缩后 {len(compressed)//1024}KB，节省 {saved//1024}KB）"
+                        f"（压缩后 {len(compressed.data)//1024}KB，节省 {saved//1024}KB）"
                     )
                 else:
                     attached_msgs.append(f"🖼️ 已附加图片: {os.path.basename(file_path)}")
 
-                encoded_string = base64.b64encode(compressed).decode('utf-8')
+                encoded_string = base64.b64encode(compressed.data).decode('utf-8')
                 final_content.append({
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:image/{ext};base64,{encoded_string}"
+                        "url": f"data:{compressed.mime_type};base64,{encoded_string}"
                     }
                 })
             except Exception as e:

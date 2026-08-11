@@ -137,6 +137,8 @@ const store = useAppStore();
 const chatScrollRef = ref<HTMLElement | null>(null);
 
 const showExportMenu = ref(false);
+// 滚动合并标记：同一帧内多次 scrollToBottom 只执行一次
+let scrollRaf: number | undefined;
 
 async function doExport(fmt: 'md' | 'html' | 'json') {
   showExportMenu.value = false;
@@ -159,18 +161,53 @@ const statusTokenClass = computed(() => {
 });
 
 function scrollToBottom() {
-  nextTick(() => {
+  // 合并到下一帧：流式输出期间会被高频调用，逐帧滚动足够顺滑且避免布局抖动
+  if (scrollRaf !== undefined) return;
+  scrollRaf = window.requestAnimationFrame(() => {
+    scrollRaf = undefined;
     if (chatScrollRef.value) {
       chatScrollRef.value.scrollTop = chatScrollRef.value.scrollHeight;
     }
   });
 }
 
+// 对话区 DOM 变化观察器：覆盖所有不经过 store 顶层状态的更新——
+// 思考流、工具执行时间线、Diff 展开、working 指示每秒计时等子组件内部变化。
+// 只有用户停留在底部附近（阈值 200px）时才自动吸底，向上翻历史不打扰。
+let bodyObserver: MutationObserver | undefined;
+let observedBody: HTMLElement | null = null;
+
+function ensureBodyObserver() {
+  nextTick(() => {
+    const body = document.getElementById('chat-body');
+    if (!body) return;
+    if (observedBody === body) return;
+    bodyObserver?.disconnect();
+    observedBody = body;
+    bodyObserver = new MutationObserver(() => {
+      const el = chatScrollRef.value;
+      if (!el) return;
+      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
+      if (nearBottom) scrollToBottom();
+    });
+    bodyObserver.observe(body, { childList: true, subtree: true, characterData: true, attributes: true });
+  });
+}
+
 watch(() => store.messages.length, () => {
   scrollToBottom();
+  ensureBodyObserver();
 });
 watch(() => store.currentStreamingText, () => {
   scrollToBottom();
+});
+// 从设置页返回对话：v-if 切换会重建对话区 DOM，滚动位置被重置到顶部，
+// 这里在 DOM 重建完成后滚回底部，保持"始终停留在最新消息"的体验
+watch(() => store.settingsOpen, (open) => {
+  if (!open) {
+    scrollToBottom();
+    ensureBodyObserver();
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -235,7 +272,6 @@ onUnmounted(() => window.clearInterval(workTimer));
 watch(() => store.permRequest.show, () => {
   scrollToBottom();
 });
-
 onMounted(() => {
   document.addEventListener('click', closeExportMenu);
 
@@ -257,10 +293,17 @@ onMounted(() => {
       }
     }, 100);
   }
-});
 
+  // 首次挂载后注册 DOM 观察器（chat-body 可能尚未渲染，由 nextTick 兜底）
+  ensureBodyObserver();
+});
 onUnmounted(() => {
   document.removeEventListener('click', closeExportMenu);
+  bodyObserver?.disconnect();
+  bodyObserver = undefined;
+  observedBody = null;
+  if (scrollRaf !== undefined) window.cancelAnimationFrame(scrollRaf);
+  scrollRaf = undefined;
 });
 </script>
 

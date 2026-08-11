@@ -221,6 +221,11 @@ export interface TurnStartEventData {
   internal?: string;
 }
 
+export interface UserAttachmentNotesEventData {
+  session_name: string;
+  notes: string[];
+}
+
 export interface ToolStartEventData {
   id: string;
   name: string;
