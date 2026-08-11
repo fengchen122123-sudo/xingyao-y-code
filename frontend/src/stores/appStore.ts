@@ -262,6 +262,7 @@ export const useAppStore = defineStore('app', {
     // 计划、后台任务、Token 用量
     planData: { title: '', items: [], progress: 0 } as PlanData,
     backgroundTasks: [] as BackgroundTask[],
+    subagentTasks: [] as SubagentTaskSnapshot[],
     tokenUsage: emptyTokenUsage(),
     tokenStatistics: null as TokenStatisticsSnapshot | null,
     tokenStatisticsLoading: false,
@@ -874,6 +875,7 @@ export const useAppStore = defineStore('app', {
         if (type === 'turn_finish' || type === 'turn_cancelled' || type === 'turn_error' || type === 'turn_idle') {
           this.foreignTurnActive = false;
           this.running = false;
+          this.subagentTasks = [];
           this.refreshSessions();
         }
         return;
@@ -1082,6 +1084,7 @@ export const useAppStore = defineStore('app', {
         }
         this.currentStreamingText = '';
         this.currentThinkingText = '';
+        this.subagentTasks = [];
         this.refreshTokenUsage();
         // 对话结束后消息数已变化，刷新侧栏会话列表（否则计数停留在启动快照）
         this.refreshSessions();
@@ -1094,6 +1097,7 @@ export const useAppStore = defineStore('app', {
         }
         this.currentStreamingText = '';
         this.currentThinkingText = '';
+        this.subagentTasks = [];
         this.refreshTokenUsage();
         this.refreshSessions();
       } else if (type === 'turn_error') {
@@ -1105,6 +1109,7 @@ export const useAppStore = defineStore('app', {
         }
         this.currentStreamingText = '';
         this.currentThinkingText = '';
+        this.subagentTasks = [];
       } else if (type === 'token_usage') {
         this.tokenUsage = normalizeTokenUsage(data);
       } else if (type === 'mcp_status') {
@@ -1136,7 +1141,7 @@ export const useAppStore = defineStore('app', {
           .reverse()
           .find(c => c.name === 'run_subagent' && !c.result);
         if (!target) return;
-        target.subagent_tasks = (d.tasks || []).map((t: any): SubagentTaskSnapshot => ({
+        const snapshots = (d.tasks || []).map((t: any): SubagentTaskSnapshot => ({
           id: String(t.id || ''),
           description: String(t.description || ''),
           status: String(t.status || ''),
@@ -1144,6 +1149,8 @@ export const useAppStore = defineStore('app', {
           ...(t.stage_detail ? { stage_detail: String(t.stage_detail) } : {}),
           elapsed: Number(t.elapsed || 0),
         }));
+        target.subagent_tasks = snapshots;
+        this.subagentTasks = snapshots;
       } else if (type === 'background_subagent_terminal') {
         const statusLabel: Record<string, string> = {
           completed: '已完成', failed: '已失败', timed_out: '已超时', cancelled: '已取消',

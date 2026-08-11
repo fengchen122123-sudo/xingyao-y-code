@@ -48,19 +48,37 @@
           <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="刷新后台任务列表" @click="refreshTasks">↻ 刷新</button>
         </div>
 
-        <div v-if="!store.backgroundTasks || store.backgroundTasks.length === 0" style="color:var(--text-faint);font-size:12px;padding:12px 0">
+        <div v-if="(!store.backgroundTasks || store.backgroundTasks.length === 0) && (!store.subagentTasks || store.subagentTasks.length === 0)" style="color:var(--text-faint);font-size:12px;padding:12px 0">
           暂无后台活跃任务
         </div>
 
-        <div v-else class="task-list">
-          <div v-for="t in store.backgroundTasks" :key="t.task_id" class="task-card">
+        <!-- 子代理任务（run_subagent 后台/前台任务） -->
+        <div v-if="store.subagentTasks && store.subagentTasks.length" class="task-section">
+          <div class="task-section-label">子代理任务</div>
+          <div v-for="t in store.subagentTasks" :key="t.id" class="task-card">
             <div class="tc-top">
-              <span class="tc-cmd">{{ t.command || t.task_id }}</span>
+              <span class="tc-cmd">{{ t.description || t.id }}</span>
               <span class="tc-status">{{ t.status || '运行中' }}</span>
             </div>
             <div class="tc-foot">
-              <span style="font-size:11px;color:var(--text-faint)">{{ t.running_time || '活跃' }}</span>
-              <button class="chip-btn danger" style="font-size:11px;padding:2px 7px" title="终止该后台任务" @click="killTask(t.task_id)">终止</button>
+              <span>{{ t.stage || '' }}{{ t.stage_detail ? ' · ' + t.stage_detail : '' }}</span>
+              <span v-if="t.elapsed">{{ t.elapsed }}s</span>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="store.backgroundTasks && store.backgroundTasks.length" class="task-section">
+          <div class="task-section-label">后台运行任务</div>
+          <div class="task-list">
+            <div v-for="t in store.backgroundTasks" :key="t.task_id" class="task-card">
+              <div class="tc-top">
+                <span class="tc-cmd">{{ t.command || t.task_id }}</span>
+                <span class="tc-status">{{ t.status || '运行中' }}</span>
+              </div>
+              <div class="tc-foot">
+                <span style="font-size:11px;color:var(--text-faint)">{{ t.running_time || '活跃' }}</span>
+                <button class="chip-btn danger" style="font-size:11px;padding:2px 7px" title="终止该后台任务" @click="killTask(t.task_id)">终止</button>
+              </div>
             </div>
           </div>
         </div>
@@ -471,6 +489,8 @@ onMounted(() => {
   flex-direction: column;
   gap: 8px;
 }
+.task-section { margin-bottom: 12px; }
+.task-section-label { padding: 4px 0 8px; color: var(--text-faint); font-size: 11px; font-weight: 600; }
 .task-card {
   background: var(--bg2);
   border: 1px solid var(--border);
