@@ -46,10 +46,10 @@
           >{{ store.activeModelName || '选择模型' }} <span style="font-size:9px;color:var(--text-faint)">▼</span></button>
           <button
             id="send-btn"
-            :class="{ stop: store.running, active: !store.running && (!!inputVal.trim() || attachments.length > 0) }"
-            :title="store.running ? '停止生成 (Esc)' : '发送消息 (Enter)'"
+            :class="{ stop: store.currentSessionRunning, active: !store.currentSessionRunning && (!!inputVal.trim() || attachments.length > 0) }"
+            :title="store.currentSessionRunning ? '停止生成 (Esc)' : '发送消息 (Enter)'"
             @click="handleSend"
-          >{{ store.running ? '■' : '↑' }}</button>
+          >{{ store.currentSessionRunning ? '■' : '↑' }}</button>
         </div>
       </div>
     </div>
@@ -154,7 +154,7 @@ async function handlePickFiles() {
 }
 
 function handleSend() {
-  if (store.running) {
+  if (store.currentSessionRunning) {
     store.stopCurrentTurn();
     return;
   }

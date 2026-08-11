@@ -74,19 +74,20 @@ describe('ToolExecutionTrace', () => {
     expect(wrapper.get('.trace-row').classes()).toContain('status-completed');
   });
 
-  it('toggles aria-expanded from the header button and defaults to expanded', async () => {
+  it('toggles aria-expanded from the header button and defaults to collapsed', async () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [finishedCall('a')], legacyDiffs: [], state: 'completed' },
     });
     const button = wrapper.get('button.trace-head');
-    expect(button.attributes('aria-expanded')).toBe('true');
-    expect(wrapper.find('.trace-body').attributes('style') || '').not.toContain('display: none');
-    await button.trigger('click');
+    // 默认收起（图二样式）：只显示标题行，详情折叠
     expect(button.attributes('aria-expanded')).toBe('false');
     expect(wrapper.find('.trace-body').attributes('style')).toContain('display: none');
     await button.trigger('click');
     expect(button.attributes('aria-expanded')).toBe('true');
     expect(wrapper.find('.trace-body').attributes('style') || '').not.toContain('display: none');
+    await button.trigger('click');
+    expect(button.attributes('aria-expanded')).toBe('false');
+    expect(wrapper.find('.trace-body').attributes('style')).toContain('display: none');
   });
 
   it('runs exactly one interval while running and clears it on terminal state and unmount', async () => {

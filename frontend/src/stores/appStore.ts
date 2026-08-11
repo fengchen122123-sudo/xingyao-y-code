@@ -33,6 +33,7 @@ import {
   type ToolExecutionCall,
   type ToolExecutionResult,
 } from '../utils/toolTrace';
+import { createSessionRuntime, type SessionRuntimeState } from './sessionRuntime';
 
 export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
   const nullableNumber = (value: unknown): number | null => {
@@ -64,6 +65,8 @@ export interface ChatMessage {
   content?: string;
   // 用户消息附带的图片（base64 dataURL 列表，支持多张）
   images?: string[];
+  // 后端完成附件解析后补发的持久说明，显示在对应用户消息内
+  attachment_notes?: string[];
   reasoning_content?: string;
   tool_calls?: ToolExecutionCall[];
   tool_call_id?: string;
@@ -73,6 +76,10 @@ export interface ChatMessage {
   legacy_diffs?: LegacyDiff[];
   // 本条助手消息所属回合的执行状态：running | completed | cancelled | error
   execution_state?: ExecutionState;
+  // 回合进行中到达的非终态错误：挂在当前助手消息上展示，
+  // 而不是插队成独立 error 消息（插队会破坏"最后一条是 assistant"的事件契约，
+  // 导致后续 tool_finish 抛错、running 状态卡死）
+  error_note?: string;
 }
 
 const TOOL_CATEGORIES = new Set(['read', 'search', 'command', 'mutation', 'skill', 'other']);
@@ -179,6 +186,7 @@ export interface ConfirmState {
 
 export interface PermReqState {
   show: boolean;
+  sessionName: string;
   reqId: string;
   // 人类可读描述（后端 describe_permission_request 生成）：执行什么命令 / 查看什么文件
   summary: string;
@@ -242,6 +250,8 @@ export const useAppStore = defineStore('app', {
     running: false,
     // 正在执行回合的会话集合（支持多会话并行）
     runningSessions: [] as string[],
+    // 每个会话独立保存流式消息和回合状态；切换会话不丢失后台事件
+    sessionRuntimeByName: {} as Record<string, SessionRuntimeState>,
     showThinking: false,
 
     // 图片大图查看（Lightbox）
@@ -281,7 +291,7 @@ export const useAppStore = defineStore('app', {
     confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎' } as ConfirmState,
 
     // 权限请求弹窗
-    permRequest: { show: false, reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' } as PermReqState,
+    permRequest: { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' } as PermReqState,
 
     // 二级抽屉页面：技能 / MCP / 模型管理
     subpage: { show: false, type: 'skills' as SubpageType },
@@ -305,6 +315,11 @@ export const useAppStore = defineStore('app', {
   }),
 
   getters: {
+    currentSessionRunning(state): boolean {
+      const key = state.currentSessionName || `__pending__:${state.pendingWorkdir || 'GLOBAL'}`;
+      return state.sessionRuntimeByName[key]?.running || false;
+    },
+
     // 按供应商分组的模型列表，ModelCascader 与 Subpage(models) 共用
     modelsByProvider(state): Record<string, ModelInfo[]> {
       const groups: Record<string, ModelInfo[]> = {};
@@ -330,6 +345,59 @@ export const useAppStore = defineStore('app', {
   },
 
   actions: {
+    _pendingRuntimeKey(this: any): string {
+      return `__pending__:${this.pendingWorkdir || 'GLOBAL'}`;
+    },
+
+    _runtimeKey(this: any, sessionName = this.currentSessionName): string {
+      return sessionName || this._pendingRuntimeKey();
+    },
+
+    _getSessionRuntime(this: any, sessionName = this.currentSessionName): SessionRuntimeState {
+      const key = this._runtimeKey(sessionName);
+      if (!this.sessionRuntimeByName[key]) {
+        this.sessionRuntimeByName[key] = createSessionRuntime();
+      }
+      return this.sessionRuntimeByName[key];
+    },
+
+    _captureRuntime(this: any, sessionName = this.currentSessionName) {
+      const runtime = this._getSessionRuntime(sessionName);
+      runtime.messages = this.messages;
+      runtime.streamingText = this.currentStreamingText;
+      runtime.thinkingText = this.currentThinkingText;
+      runtime.running = this.running;
+      runtime.subagentTasks = this.subagentTasks;
+      runtime.planData = this.planData;
+    },
+
+    _captureCurrentRuntime(this: any) {
+      this._captureRuntime(this.currentSessionName);
+    },
+
+    _bindSessionRuntime(this: any, sessionName = this.currentSessionName) {
+      const runtime = this._getSessionRuntime(sessionName);
+      this.messages = runtime.messages;
+      this.currentStreamingText = runtime.streamingText;
+      this.currentThinkingText = runtime.thinkingText;
+      this.running = runtime.running;
+      this.subagentTasks = runtime.subagentTasks;
+      this.planData = runtime.planData || { title: '', items: [], progress: 0 };
+    },
+
+    _setSessionRunning(this: any, sessionName: string, running: boolean) {
+      const runtime = this._getSessionRuntime(sessionName);
+      runtime.running = running;
+      if (sessionName === this.currentSessionName) this.running = running;
+      if (running) {
+        if (sessionName && !this.runningSessions.includes(sessionName)) {
+          this.runningSessions.push(sessionName);
+        }
+      } else {
+        this.runningSessions = this.runningSessions.filter((s: string) => s !== sessionName);
+      }
+    },
+
     // 统一的后端可用性检查：不可用时自动置 connected=false 并 toast 提示。
     // 返回值经 TS 收窄为局部 const，后续 await 调用不会丢失类型narrowing。
     _api(): PyWebViewAPI | null {
@@ -477,6 +545,7 @@ export const useAppStore = defineStore('app', {
           : '对话';
         // 启动时后端自动恢复最近一次对话：同步消息列表与标题
         this.messages = pairHistoryToolMessages((init as any).messages || []);
+        this._captureCurrentRuntime();
         for (const g of this.sessionGroups) {
           const hit = (g.sessions || []).find((s: any) => s.name === this.currentSessionName);
           if (hit) {
@@ -603,20 +672,48 @@ export const useAppStore = defineStore('app', {
 
     async switchSession(sessionName: string, displayName?: string, targetWorkdir?: string) {
       // 切换到已有会话时丢弃未发送的空白 pending 会话
+      this._captureCurrentRuntime();
       this.pendingWorkdir = null;
       this.currentSessionName = sessionName;
       if (displayName) this.currentSessionDisplayName = displayName;
-      // 同步 running 状态：切到的会话是否正在执行回合
-      this.running = this.runningSessions.includes(sessionName);
+      this.permRequest.show = this.permRequest.sessionName === sessionName;
+      // 优先恢复内存中的实时 runtime；运行中的会话不能被旧数据库快照覆盖
+      const runtime = this._getSessionRuntime(sessionName);
+      this._bindSessionRuntime(sessionName);
 
       const api = this._api();
       if (!api) return;
       try {
-        const res = await api.switch_session(sessionName, targetWorkdir);
+      const res = await api.switch_session(sessionName, targetWorkdir);
         // 竞态防护：快速连点不同会话时响应可能乱序返回，过期响应直接丢弃，
         // 避免高亮停在 B 会话却渲染出 A 会话的内容
         if (this.currentSessionName !== sessionName) return;
-        this.messages = pairHistoryToolMessages(res.messages || []);
+        if (!runtime.running && runtime.messages.length === 0) {
+          runtime.messages = pairHistoryToolMessages(res.messages || []);
+          this._bindSessionRuntime(sessionName);
+        }
+
+        // 多会话并行：切到正在运行回合的会话时，历史最后一条往往不是
+        // assistant（本轮 assistant 消息尚未落库，历史停留在 user 或
+        // 上一轮 completed）。此时该回合后续的 tool_start/tool_finish/
+        // diff_ready 需要挂在活动助手消息上，缺失会触发桥接契约错误，
+        // 因此按 running 状态补一条占位消息，让后续回合级事件有处可挂。
+        if (this.runningSessions.includes(sessionName)) {
+          const last = this.messages[this.messages.length - 1];
+          const needsPlaceholder = !last ||
+            last.role !== 'assistant' ||
+            last.execution_state !== 'running';
+          if (needsPlaceholder) {
+            this.messages.push({
+              role: 'assistant',
+              content: '',
+              reasoning_content: '',
+              tool_calls: [],
+              legacy_diffs: [],
+              execution_state: 'running',
+            });
+          }
+        }
 
         if (res.is_global || res.workdir === 'GLOBAL') {
           this.currentWorkdirLabel = '对话';
@@ -655,10 +752,18 @@ export const useAppStore = defineStore('app', {
 
     async createGlobalSession() {
       // 懒创建：只切换到空白自由对话状态，首条消息发出时才真正落库
+      this._captureCurrentRuntime();
       this.pendingWorkdir = 'GLOBAL';
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新对话';
+      this._bindSessionRuntime('');
       this.messages = [];
+      this.currentStreamingText = '';
+      this.currentThinkingText = '';
+      this.subagentTasks = [];
+      this.planData = { title: '', items: [], progress: 0 };
+      this.running = false;
+      this._captureRuntime('');
       this.currentWorkdirLabel = '对话';
       this.workdir = '';
       this.fileTree = [];
@@ -679,10 +784,18 @@ export const useAppStore = defineStore('app', {
       // 不再同步等后端 get_workspace_state 扫文件树（大目录要数秒，
       // 表现为“点新会话特别慢”）。
       const treeMatches = this.workdir === targetWorkdir;
+      this._captureCurrentRuntime();
       this.pendingWorkdir = targetWorkdir;
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新会话';
+      this._bindSessionRuntime('');
       this.messages = [];
+      this.currentStreamingText = '';
+      this.currentThinkingText = '';
+      this.subagentTasks = [];
+      this.planData = { title: '', items: [], progress: 0 };
+      this.running = false;
+      this._captureRuntime('');
       this.workdir = targetWorkdir;
       this.currentWorkdirLabel = targetWorkdir.split('\\').pop() || targetWorkdir;
       // 文件树：当前就在该工作区则直接保留已加载的树；
@@ -776,19 +889,19 @@ export const useAppStore = defineStore('app', {
     },
 
     async stopCurrentTurn() {
-      this.running = false;
+      const sessionName = this.currentSessionName;
       const api = this._api();
       if (!api) return;
       try {
-        const res = await api.stop_current_turn();
+        const res = await api.stop_current_turn(sessionName);
         if (!res || !res.ok) {
-          this.messages.push({ role: 'error', content: '中断请求未成功送达' });
+          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '中断请求未成功送达' });
         } else {
           this.showToast('已请求中断当前回合', 'warn');
         }
       } catch (err) {
         this.connected = false;
-        this.messages.push({ role: 'error', content: '中断请求失败: ' + err });
+        this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '中断请求失败: ' + err });
       }
     },
 
@@ -796,8 +909,6 @@ export const useAppStore = defineStore('app', {
       // 生成中禁止再次发送（无论调用方是否已自行判断，均在此兜底拦截）
       const attachList = (attachments || []).filter(p => p && p.trim());
       if ((!text.trim() && !attachList.length) || this.runningSessions.includes(this.currentSessionName)) return;
-      this.running = true;
-
       const api = window.pywebview && window.pywebview.api;
       if (!api) {
         // 本地无后端离线模拟，方便纯前端调试
@@ -806,12 +917,13 @@ export const useAppStore = defineStore('app', {
         this.running = false;
         return;
       }
+      let sessionName = this.currentSessionName;
       try {
         // 懒创建：pending 状态下首条消息才真正创建会话（名称匹配 session_[a-f0-9]{6}
         // 才能被后端自动重命名为消息前几个字）
-        let sessionName = this.currentSessionName;
         let pendingDir: string | undefined;
         if (this.pendingWorkdir !== null) {
+          const draftKey = this._runtimeKey();
           pendingDir = this.pendingWorkdir;
           this.pendingWorkdir = null;
           // 6 位随机名需避开已有会话：撞名会被后端 INSERT OR IGNORE 静默
@@ -822,20 +934,26 @@ export const useAppStore = defineStore('app', {
           do {
             sessionName = 'session_' + Math.random().toString(16).slice(2, 8).padEnd(6, '0');
           } while (existingNames.has(sessionName));
+          this.sessionRuntimeByName[sessionName] = this.sessionRuntimeByName[draftKey] || createSessionRuntime();
+          delete this.sessionRuntimeByName[draftKey];
           this.currentSessionName = sessionName;
         }
+        this._setSessionRunning(sessionName, true);
+        this._bindSessionRuntime(sessionName);
         const res = await api.send_user_message(text.trim(), sessionName, attachList, pendingDir);
         if (res && res.ok && pendingDir) {
           // 让新会话立即出现在左侧列表（自动重命名事件随后会再刷新一次）
           this.refreshSessions();
         }
         if (!res || !res.ok) {
-          this.running = false;
+          this._setSessionRunning(sessionName, false);
+          this._bindSessionRuntime(sessionName);
           this.messages.push({ role: 'error', content: '消息发送失败: ' + (res && res.msg ? res.msg : '未知错误') });
         }
         // 成功时不主动改 running，由后续 turn_start/turn_finish/turn_cancelled 等事件驱动
       } catch (err) {
-        this.running = false;
+        this._setSessionRunning(sessionName, false);
+        this._bindSessionRuntime(sessionName);
         this.connected = false;
         this.messages.push({ role: 'error', content: '消息发送失败: ' + err });
       }
@@ -871,24 +989,26 @@ export const useAppStore = defineStore('app', {
       // 只要有事件推送过来，说明桥接链路是通的
       this.connected = true;
 
+      const currentRuntimeKey = this._runtimeKey();
+      const eventSession = String(data.session_name || this.currentSessionName || '');
+      const targetRuntimeKey = eventSession || currentRuntimeKey;
+      const switchedRuntime = targetRuntimeKey !== currentRuntimeKey;
+      if (switchedRuntime) this._bindSessionRuntime(targetRuntimeKey);
+
+      try {
+
       // 多会话并行：终态事件从 runningSessions 移除对应会话
       if (type === 'turn_finish' || type === 'turn_cancelled' || type === 'turn_error' || type === 'turn_idle') {
         const finSession = String(data.session_name || '');
         if (finSession) {
           this.runningSessions = this.runningSessions.filter(s => s !== finSession);
         }
-        // 如果结束的是当前会话的回合，恢复当前视图的空闲状态
-        if (!finSession || finSession === this.currentSessionName) {
-          this.running = false;
-          this.subagentTasks = [];
-        }
+        // 当前 reducer 已绑定到目标 runtime，终态只更新目标会话。
+        this.running = false;
+        this.subagentTasks = [];
         // 没有活跃会话时刷新会话列表
         if (this.runningSessions.length === 0) {
           this.refreshSessions();
-        }
-        // 如果不是当前会话的终态事件，不继续处理（避免写入当前视图）
-        if (finSession && finSession !== this.currentSessionName) {
-          return;
         }
       }
 
@@ -897,13 +1017,6 @@ export const useAppStore = defineStore('app', {
         // 记录活跃会话
         if (turnSession && !this.runningSessions.includes(turnSession)) {
           this.runningSessions.push(turnSession);
-        }
-        // 不属于当前会话的回合：不写入当前视图，只标记活跃
-        if (turnSession && turnSession !== this.currentSessionName) {
-          if (data.internal === 'bg_summary') {
-            this.showToast('后台子代理任务已全部结束，正在自动汇总结果', 'ok');
-          }
-          return;
         }
         this.running = true;
         this.currentStreamingText = '';
@@ -922,13 +1035,6 @@ export const useAppStore = defineStore('app', {
         if (data.internal === 'bg_summary') {
           this.showToast('后台子代理任务已全部结束，正在自动汇总结果', 'ok');
         }
-      }
-
-      // 多会话并行：非当前会话的中间事件不写入当前视图，防止跨会话流式污染
-      // turn_start 和终态事件已在上面处理（需记录/移除 runningSessions），这里只过滤中间事件
-      const evtSession = String(data.session_name || '');
-      if (evtSession && evtSession !== this.currentSessionName) {
-        return;
       }
 
       if (type === 'round_started') {
@@ -1053,10 +1159,10 @@ export const useAppStore = defineStore('app', {
             items,
             progress,
           };
+          this._captureRuntime(targetRuntimeKey);
         }
       } else if (type === 'user_message_images') {
         // 后端解析附件后补发的图片：挂到当前会话最后一条用户气泡上
-        if (data.session_name && data.session_name !== this.currentSessionName) return;
         const imgs = Array.isArray(data.images)
           ? data.images.map((u: any) => String(u)).filter(Boolean)
           : [];
@@ -1068,9 +1174,22 @@ export const useAppStore = defineStore('app', {
             }
           }
         }
+      } else if (type === 'user_attachment_notes') {
+        const notes = Array.isArray(data.notes)
+          ? data.notes.map((note: any) => String(note)).filter(Boolean)
+          : [];
+        if (!notes.length) return;
+        for (let i = this.messages.length - 1; i >= 0; i--) {
+          if (this.messages[i].role === 'user') {
+            this.messages[i].attachment_notes = notes;
+            return;
+          }
+        }
+        throw new Error('桥接契约错误：附件提示到达时不存在用户消息');
       } else if (type === 'permission_request') {
         this.permRequest = {
           show: true,
+          sessionName: eventSession,
           reqId: data.request_id,
           summary: String(data.summary || data.function_name || ''),
           source: data.source || '',
@@ -1078,6 +1197,7 @@ export const useAppStore = defineStore('app', {
           options: Array.isArray(data.options) ? data.options.map(String) : [],
           functionName: String(data.function_name || ''),
         };
+        this.permRequest.show = this.permRequest.sessionName === this.currentSessionName;
       } else if (type === 'permission_dismiss') {
         // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留
         this.permRequest.show = false;
@@ -1087,6 +1207,14 @@ export const useAppStore = defineStore('app', {
         if (this.currentSessionName === data.old) {
           this.currentSessionName = data.new;
           this.currentSessionDisplayName = data.new;
+        }
+        // 运行中回合的会话名同步迁移：否则 runningSessions 残留旧名，
+        // 后续 turn_finish(新名) 无法正确移除，会导致 running 状态卡死
+        if (data.old && data.new) {
+          this.runningSessions = this.runningSessions.map(s => (s === data.old ? data.new : s));
+          if (this.permRequest.sessionName === data.old) {
+            this.permRequest.sessionName = data.new;
+          }
         }
         this.sessionGroups.forEach(g => {
           (g.sessions || []).forEach(s => {
@@ -1181,7 +1309,14 @@ export const useAppStore = defineStore('app', {
         if (data.status === 'completed') {
           this.showToast(`后台子代理${label}${desc}`, 'ok');
         } else {
-          this.messages.push({ role: 'error', content: `后台子代理${label}${desc}` });
+          // 与 error 事件一致：回合进行中不插队，挂在当前助手消息上展示
+          const last = this.messages[this.messages.length - 1];
+          if (last && last.role === 'assistant') {
+            last.error_note = `后台子代理${label}${desc}`;
+            this.showToast(`后台子代理${label}${desc}`, 'warn');
+          } else {
+            this.messages.push({ role: 'error', content: `后台子代理${label}${desc}` });
+          }
         }
       } else if (type === 'terminal_output') {
         this.terminalOutput += data.text || '';
@@ -1194,13 +1329,37 @@ export const useAppStore = defineStore('app', {
         const code = data.code;
         this.terminalOutput += `\n[进程已退出，代码 ${code}]\n\n`;
       } else if (type === 'error') {
-        // 写入对话流而非 toast 弹窗，避免余额不足等关键错误被忽略
-        this.messages.push({ role: 'error', content: data.message || '运行错误' });
+        const msgText = String(data.message || '运行错误');
+        // 回合进行中：错误挂在当前助手消息上展示，避免插队成独立 error 消息
+        // 破坏"最后一条是 assistant"的事件契约（否则后续 tool_finish 会抛错、
+        // "正在干活"指示器卡死）。回合结束/空闲时的错误仍写入对话流。
+        const last = this.messages[this.messages.length - 1];
+        if (last && last.role === 'assistant') {
+          last.error_note = msgText;
+          this.showToast(msgText, 'warn');
+        } else {
+          this.messages.push({ role: 'error', content: msgText });
+        }
+      }
+      } finally {
+        this._captureRuntime(targetRuntimeKey);
+        if (type === 'session_renamed' && data.old && data.new) {
+          const oldKey = String(data.old);
+          const newKey = String(data.new);
+          if (this.sessionRuntimeByName[oldKey]) {
+            this.sessionRuntimeByName[newKey] = this.sessionRuntimeByName[oldKey];
+            delete this.sessionRuntimeByName[oldKey];
+          }
+          if (this.currentSessionName === newKey) this._bindSessionRuntime(newKey);
+        } else if (switchedRuntime) {
+          this._bindSessionRuntime(currentRuntimeKey);
+        }
       }
     },
 
     async respondPermission(allowed: boolean, always: boolean) {
       const reqId = this.permRequest.reqId;
+      const sessionName = this.permRequest.sessionName;
       this.permRequest.show = false;
       if (!reqId) return;
       const api = this._api();
@@ -1208,16 +1367,17 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.respond_permission(reqId, allowed, always);
         if (!res || !res.ok) {
-          this.messages.push({ role: 'error', content: '权限响应发送失败' });
+          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '权限响应发送失败' });
         }
       } catch (err) {
         this.connected = false;
-        this.messages.push({ role: 'error', content: '权限响应发送失败: ' + err });
+        this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '权限响应发送失败: ' + err });
       }
     },
 
     async respondPermissionChoice(choiceIndex: number) {
       const reqId = this.permRequest.reqId;
+      const sessionName = this.permRequest.sessionName;
       this.permRequest.show = false;
       if (!reqId) return;
       const api = this._api();
@@ -1225,11 +1385,11 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.respond_permission_choice(reqId, choiceIndex);
         if (!res || !res.ok) {
-          this.messages.push({ role: 'error', content: '选项响应发送失败' });
+          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '选项响应发送失败' });
         }
       } catch (err) {
         this.connected = false;
-        this.messages.push({ role: 'error', content: '选项响应发送失败: ' + err });
+        this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '选项响应发送失败: ' + err });
       }
     },
 

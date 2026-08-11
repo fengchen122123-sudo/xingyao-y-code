@@ -1,17 +1,19 @@
 <template>
   <!-- 输入自动补全面板：/ 斜杠命令 与 @ 文件引用共用 -->
   <div v-if="items.length" class="suggest-panel">
-    <div
-      v-for="(it, i) in items"
-      :key="it.key"
-      class="sg-item"
-      :class="{ active: i === activeIndex }"
-      @mousedown.prevent="emit('select', it)"
-      @mouseenter="emit('hover', i)"
-    >
-      <span class="sg-icon">{{ it.icon }}</span>
-      <span class="sg-label">{{ it.label }}</span>
-      <span class="sg-desc">{{ it.desc }}</span>
+    <div class="sg-list">
+      <div
+        v-for="(it, i) in items"
+        :key="it.key"
+        class="sg-item"
+        :class="{ active: i === activeIndex }"
+        @mousedown.prevent="emit('select', it)"
+        @mouseenter="emit('hover', i)"
+      >
+        <span class="sg-icon">{{ it.icon }}</span>
+        <span class="sg-label">{{ it.label }}</span>
+        <span class="sg-desc">{{ it.desc }}</span>
+      </div>
     </div>
     <div class="sg-hint">↑↓ 选择 · Tab / Enter 确认 · Esc 关闭</div>
   </div>
@@ -44,6 +46,8 @@ const emit = defineEmits<{
   bottom: calc(100% + 6px);
   left: 0;
   right: 0;
+  display: flex;
+  flex-direction: column;
   background: var(--float-bg);
   border: 1px solid var(--border);
   border-radius: 10px;
@@ -52,10 +56,14 @@ const emit = defineEmits<{
   padding: 5px;
   /* 空会话页卡片居中，面板向上弹出时上方空间有限（约 280px），
      限高 232px（约 6 条候选 + 吸底提示栏）避免顶部被消息容器裁剪；
-     超出部分面板内滚动，提示栏 sticky 常驻不会被裁 */
+     超出部分由 .sg-list 独立滚动，提示条固定在面板最底部不被推挤 */
   max-height: 232px;
-  overflow-y: auto;
   z-index: 100;
+}
+.sg-list {
+  /* 候选列表独立滚动区，把滚动与提示条隔离 */
+  overflow-y: auto;
+  min-height: 0;
 }
 .sg-item {
   display: flex;
@@ -94,9 +102,8 @@ const emit = defineEmits<{
   max-width: 55%;
 }
 .sg-hint {
-  /* 吸底常驻：候选较多需要滚动时提示栏也不会被裁掉 */
-  position: sticky;
-  bottom: 0;
+  /* 固定最底部：flex 布局下不参与列表滚动，始终贴在面板底端 */
+  flex-shrink: 0;
   background: var(--float-bg);
   border-radius: 0 0 7px 7px;
   padding: 5px 10px 3px;

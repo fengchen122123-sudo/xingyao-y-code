@@ -66,6 +66,18 @@
               @click="startCustomProvider"
             >＋ 添加自定义厂商</button>
           </div>
+
+          <!-- 副模型入口（红框位置）：点击后在右侧设置副模型 -->
+          <button
+            data-test="secondary-entry"
+            class="secondary-entry-row"
+            :class="{ active: selectedKind === 'secondary' }"
+            @click="selectSecondary"
+          >
+            <span class="provider-logo">◈</span>
+            <span class="provider-name">副模型</span>
+            <span class="provider-state" :class="{ ready: !!secondaryModelId }"></span>
+          </button>
         </aside>
 
         <div class="provider-detail">
@@ -169,32 +181,35 @@
               </div>
             </div>
 
-            <div class="secondary-card">
-              <div class="secondary-card-head">
-                <h3>副模型</h3>
-                <span>用于识图 / 记忆压缩 / 子 Agent 等后台任务，独立于主模型。</span>
+          </template>
+
+          <template v-else-if="selectedKind === 'secondary'">
+            <div class="detail-title-row">
+              <div>
+                <h2>副模型</h2>
+                <p>用于识图 / 记忆压缩 / 子 Agent 等后台任务，独立于主模型。</p>
               </div>
-              <label class="field-label">副模型</label>
-              <select v-model="secondaryModelId" class="text-field" data-test="secondary-model" @change="onSecondaryModelChange">
-                <option value="">无（不启用副模型）</option>
-                <option v-for="m in store.models" :key="m.id" :value="m.id">
-                  {{ m.name }}（{{ m.provider_name }}）
-                </option>
-              </select>
-              <div class="role-row">
-                <label class="role-choice">
-                  <input v-model="secondaryRoles.vision" type="checkbox" data-test="secondary-role-vision" @change="onSecondaryRolesChange" />
-                  <span><b>识图</b><small>用于需要理解图片的任务</small></span>
-                </label>
-                <label class="role-choice">
-                  <input v-model="secondaryRoles.compression" type="checkbox" data-test="secondary-role-compression" @change="onSecondaryRolesChange" />
-                  <span><b>压缩</b><small>用于对话记忆压缩</small></span>
-                </label>
-                <label class="role-choice">
-                  <input v-model="secondaryRoles.subagent" type="checkbox" data-test="secondary-role-subagent" @change="onSecondaryRolesChange" />
-                  <span><b>子 Agent</b><small>用于子 Agent 调度</small></span>
-                </label>
-              </div>
+            </div>
+            <label class="field-label">副模型</label>
+            <select v-model="secondaryModelId" class="text-field" data-test="secondary-model" @change="onSecondaryModelChange">
+              <option value="">无（不启用副模型）</option>
+              <option v-for="m in store.models" :key="m.id" :value="m.id">
+                {{ m.name }}（{{ m.provider_name }}）
+              </option>
+            </select>
+            <div class="role-row">
+              <label class="role-choice">
+                <input v-model="secondaryRoles.vision" type="checkbox" data-test="secondary-role-vision" @change="onSecondaryRolesChange" />
+                <span><b>识图</b><small>用于需要理解图片的任务</small></span>
+              </label>
+              <label class="role-choice">
+                <input v-model="secondaryRoles.compression" type="checkbox" data-test="secondary-role-compression" @change="onSecondaryRolesChange" />
+                <span><b>压缩</b><small>用于对话记忆压缩</small></span>
+              </label>
+              <label class="role-choice">
+                <input v-model="secondaryRoles.subagent" type="checkbox" data-test="secondary-role-subagent" @change="onSecondaryRolesChange" />
+                <span><b>子 Agent</b><small>用于子 Agent 调度</small></span>
+              </label>
             </div>
           </template>
 
@@ -252,7 +267,7 @@ import TokenUsageSettings from './TokenUsageSettings.vue';
 
 const store = useAppStore();
 const activeSection = ref<'models' | 'tokens'>('models');
-const selectedKind = ref<'preset' | 'provider' | 'custom'>('provider');
+const selectedKind = ref<'preset' | 'provider' | 'custom' | 'secondary'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');
 const showAddProviders = ref(false);
 const presetApiKey = ref('');
@@ -296,7 +311,7 @@ watch(selectedProvider, (provider) => {
 watch(
   () => [store.modelPresets.map(item => item.id), store.providers.map(item => item.id)],
   () => {
-    if (selectedKind.value === 'custom') return;
+    if (selectedKind.value === 'custom' || selectedKind.value === 'secondary') return;
     const presetExists = selectedKind.value === 'preset'
       && store.modelPresets.some(item => item.id === selectedId.value);
     const providerExists = selectedKind.value === 'provider'
@@ -321,6 +336,13 @@ function selectPreset(id: string) {
 function selectProvider(id: string) {
   selectedKind.value = 'provider';
   selectedId.value = id;
+  showAddProviders.value = false;
+}
+
+// 点击左侧"副模型"入口：右侧切换到副模型设置面板
+function selectSecondary() {
+  selectedKind.value = 'secondary';
+  selectedId.value = '';
   showAddProviders.value = false;
 }
 
@@ -474,6 +496,28 @@ async function onSecondaryRolesChange() {
 .add-provider-row.active { border-color: var(--accent); color: var(--accent); background: var(--bg3); }
 .add-provider-choices { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--border); }
 .custom-provider-row { margin-top: 10px; }
+/* 副模型入口：位于左侧列表底部（添加厂商下方），点击后在右侧设置副模型 */
+.secondary-entry-row {
+  width: 100%;
+  margin-top: 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: transparent;
+  color: var(--text-dim);
+  text-align: left;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+.secondary-entry-row:hover, .secondary-entry-row.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--bg3);
+}
+.secondary-entry-row .provider-logo { background: var(--bg3); color: var(--text-dim); }
+.secondary-entry-row.active .provider-logo { color: var(--accent); }
+.secondary-entry-row .provider-name { font-size: 13px; }
 .provider-detail { min-width: 0; padding: 38px; overflow-y: auto; }
 .detail-title-row { display: flex; justify-content: space-between; gap: 18px; margin-bottom: 28px; }
 .detail-title-row h2 { margin: 0 0 8px; font-size: 20px; }
@@ -517,10 +561,6 @@ async function onSecondaryRolesChange() {
 .vision-choice { margin-top: 20px; display: flex; align-items: flex-start; gap: 10px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; color: var(--text); }
 .vision-choice span { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .vision-choice small { color: var(--text-faint); }
-.secondary-card { margin-top: 34px; padding: 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg2); }
-.secondary-card-head { display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px; }
-.secondary-card-head h3 { margin: 0 0 2px; font-size: 14px; }
-.secondary-card-head span { color: var(--text-faint); font-size: 11px; }
 .role-row { margin-top: 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
 .role-choice { display: flex; align-items: flex-start; gap: 9px; padding: 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg1); color: var(--text); }
 .role-choice span { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }

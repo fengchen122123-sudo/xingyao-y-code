@@ -1089,6 +1089,7 @@ def test_reasoning_only_promotion_is_truncated(mocker):
     responses = [
         iter([_chunk(reasoning=long_reasoning)]),
         iter([_chunk(reasoning=long_reasoning)]),  # 重试后仍只思考
+        iter([_chunk(reasoning=long_reasoning)]),  # 第二次重试后仍只思考
     ]
     mocker.patch("core.llm.completion", side_effect=responses)
     messages = [{"role": "user", "content": "使用方案A修改一下"}]
@@ -1108,6 +1109,66 @@ def test_reasoning_only_promotion_is_truncated(mocker):
     assert content.rstrip().endswith("[以上为模型思考过程，未生成正式回复]")
     assert "已截断" in content
     assert len(content) < 1000
+
+
+def test_reasoning_only_retries_twice_before_giving_up(mocker):
+    """模型连续多次只输出思考：系统应注入两次催促（重试两次）再收尾，
+    而不是重试一次后就静默结束（用户反馈"任务未执行完就结束"的根因）。"""
+    responses = [
+        iter([_chunk(reasoning="第一次思考")]),
+        iter([_chunk(reasoning="第二次思考")]),
+        iter([_chunk(reasoning="第三次思考")]),
+    ]
+    mocker.patch("core.llm.completion", side_effect=responses)
+    messages = [{"role": "user", "content": "使用方案A修改一下"}]
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        messages,
+        persist=False,
+        turn_id="turn-reasoning-only-retry-twice",
+        consume_background_notifications=False,
+    ))
+
+    # 注入两次催促（第一次与第二次失败后各一次）
+    nudges = [
+        m for m in messages
+        if m["role"] == "user" and "只输出了思考过程" in str(m.get("content", ""))
+    ]
+    assert len(nudges) == 2, f"应注入两次催促，实际 {len(nudges)} 条"
+
+    # 最终留下促升的可见正文，且带错误事件让 UI 明确感知回合未正常完成
+    final = [m for m in messages if m["role"] == "assistant" and m.get("content")]
+    assert final, "促升兜底仍应留下一条可见回复"
+    assert "未生成正式回复" in final[-1]["content"]
+    assert any(e.kind == "error" for e in events), "重试耗尽后必须发出 error 事件"
+
+
+def test_reasoning_only_emits_error_when_retries_exhausted(mocker):
+    """重试耗尽（连续多次只思考）后必须发出显式 error 事件，
+    而不是仅靠静默 notice——让 GUI 能把"任务未完成"写进对话流。"""
+    responses = [
+        iter([_chunk(reasoning="思考A")]),
+        iter([_chunk(reasoning="思考B")]),
+        iter([_chunk(reasoning="思考C")]),
+        iter([_chunk(reasoning="思考D")]),
+    ]
+    mocker.patch("core.llm.completion", side_effect=responses)
+    messages = [{"role": "user", "content": "请完成这个任务"}]
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        messages,
+        persist=False,
+        turn_id="turn-reasoning-only-error",
+        consume_background_notifications=False,
+    ))
+
+    error_events = [e for e in events if e.kind == "error"]
+    assert error_events, "重试耗尽后必须发出 error 事件"
+    assert any("未完成" in str(e.payload) or "未返回" in str(e.payload) for e in error_events)
 
 
 def _chunk_with_finish(content="", reasoning="", finish_reason=None):

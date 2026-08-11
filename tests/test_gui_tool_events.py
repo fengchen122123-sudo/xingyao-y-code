@@ -4,12 +4,18 @@ import threading
 import pytest
 
 from core.turn_events import TurnEventFactory
-from gui_bridge import ApiBridge
+from gui_bridge import ApiBridge, _session_from_turn_id
 
 
 def make_events(items):
     factory = TurnEventFactory("turn-gui-tools")
     return [factory.emit(kind, payload) for kind, payload in items]
+
+
+def test_session_from_turn_id_uses_the_prefix_before_the_last_separator():
+    assert _session_from_turn_id("session-a:turn-123") == "session-a"
+    assert _session_from_turn_id("renamed:session:turn-123") == "renamed:session"
+    assert _session_from_turn_id("") == ""
 
 
 def start_payload(tool_id):
@@ -225,6 +231,65 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     bridge._run_turn_worker("inspect", "project-session")
 
     assert os.path.realpath(seen["cwd"]) == os.path.realpath(project)
+
+
+def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(monkeypatch):
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._cancel_events = {"session_abc123": threading.Event()}
+    bridge._active_turns = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
+    bridge._bg_summary_pending_session = ""
+    bridge._current_permission_mode = "confirm"
+    bridge._emit_token_usage = lambda: None
+    bridge._sync_active_model_context = lambda: None
+    bridge._session_workdir = lambda _session_name: "GLOBAL"
+    bridge._subagent_progress_poller = lambda _session_name, _stop: None
+    bridge._consume_turn_events = lambda *args, **kwargs: False
+    bridge._maybe_auto_rename = lambda _session_name: "检查项目"
+    bridge._memory = type("Memory", (), {
+        "ensure_session": lambda self, *args, **kwargs: None,
+        "add_message": lambda self, *args, **kwargs: None,
+    })()
+    emitted = []
+    bridge.emit_event = lambda kind, data: emitted.append((kind, data))
+
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {
+        "litellm_model": "model",
+        "api_key": "key",
+        "base_url": None,
+        "context_window": 128000,
+    })
+    monkeypatch.setattr(
+        "core.input_parser.parse_user_input",
+        lambda text: (text, ["🖼️ 已附加图片: sample.png（压缩后 320KB）"]),
+    )
+    monkeypatch.setattr(
+        "core.agent_service.prepare_turn_messages", lambda *args, **kwargs: []
+    )
+    monkeypatch.setattr(
+        "core.memory.begin_turn_checkpoint", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
+
+    bridge._run_turn_worker("检查项目", "session_abc123")
+
+    attachment_events = [
+        data for kind, data in emitted if kind == "user_attachment_notes"
+    ]
+    assert attachment_events == [{
+        "session_name": "session_abc123",
+        "notes": ["🖼️ 已附加图片: sample.png（压缩后 320KB）"],
+    }]
+    assert not any(
+        kind == "notice" and "sample.png" in data.get("message", "")
+        for kind, data in emitted
+    )
+    finishes = [data for kind, data in emitted if kind == "turn_finish"]
+    assert finishes == [{"session_name": "检查项目"}]
 
 
 @pytest.mark.parametrize(

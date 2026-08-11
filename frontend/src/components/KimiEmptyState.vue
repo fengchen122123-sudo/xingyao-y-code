@@ -61,8 +61,8 @@
 
           <button
             class="kimi-send-btn"
-            :class="{ active: (inputVal.trim() || attachments.length) && !store.running }"
-            :disabled="store.running"
+            :class="{ active: (inputVal.trim() || attachments.length) && !store.currentSessionRunning }"
+            :disabled="store.currentSessionRunning"
             title="发送消息 (Enter)"
             @click="handleSend"
           >↑</button>
@@ -207,7 +207,7 @@ async function handlePickFiles() {
 }
 
 function handleSend() {
-  if (store.running) return;
+  if (store.currentSessionRunning) return;
   // 补全面板打开时由 onKeydown 拦截，不会走到这里
   const text = inputVal.value;
   const paths = attachments.value.map(a => a.path);

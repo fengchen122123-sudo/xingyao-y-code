@@ -58,3 +58,33 @@ it('keeps the loaded tree when creating a session in the current workdir', async
   expect(store.pendingWorkdir).toBe('E:\\projects\\demo');
   expect(store.currentSessionName).toBe('');
 });
+
+it('does not inherit another session running state when creating a new conversation', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-a';
+  store.handleBridgeEvent({
+    type: 'turn_start',
+    data: { session_name: 'session-a', user_text: '正在执行' },
+  });
+
+  await store.createGlobalSession();
+
+  expect(store.currentSessionName).toBe('');
+  expect(store.running).toBe(false);
+  expect(store.runningSessions).toEqual(['session-a']);
+});
+
+it('reports running only for the currently selected session', () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  store.sessionRuntimeByName['session-a'] = {
+    messages: [], streamingText: '', thinkingText: '', running: true, subagentTasks: [],
+  };
+  store.sessionRuntimeByName['session-b'] = {
+    messages: [], streamingText: '', thinkingText: '', running: false, subagentTasks: [],
+  };
+
+  expect(store.currentSessionRunning).toBe(false);
+  store.currentSessionName = 'session-a';
+  expect(store.currentSessionRunning).toBe(true);
+});
