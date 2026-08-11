@@ -510,9 +510,9 @@ Y-code-cli/
     "subagent": true
   },
   "image_compression": {
-    "max_edge": 1024,
-    "quality": 85,
-    "max_output_bytes": 512000
+    "max_edge": 1536,
+    "quality": 90,
+    "max_output_bytes": 1048576
   },
   "search_exclude_dirs": ["target", "out", "bin", "obj"],
   "memory_compression": {
@@ -540,7 +540,7 @@ Y-code-cli/
 | `active_model_id` | 当前激活的主模型 ID |
 | `secondary_model_id` | 副模型 ID（用于视觉 / 压缩 / 子代理） |
 | `secondary_model_roles` | 副模型角色开关（vision / compression / subagent） |
-| `image_compression` | 图片压缩参数（max_edge / quality / max_output_bytes） |
+| `image_compression` | 图片压缩参数（默认长边 1536、质量 90、目标 1MiB） |
 | `search_exclude_dirs` | 代码搜索排除目录 |
 | `memory_compression` | 记忆压缩参数 |
 | `providers` | 模型供应商列表 |
@@ -549,6 +549,10 @@ Y-code-cli/
 | `allow_outside_workspace` | 沙盒开关 |
 | `skill_search_paths` | 技能搜索路径（项目级） |
 | `prompt_cache_keepalive_seconds` | DeepSeek/Kimi 前缀缓存保活间隔（默认 120；0 关闭；最小 60） |
+
+图片附件最大允许 20MiB，解码后最多 4000 万像素。PNG（含透明通道）保持 PNG，
+JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视觉模型时使用与实际编码
+一致的 Base64 Data URL。GUI 中的处理结果会固定显示在对应用户消息下方。
 
 ### 用户数据目录
 

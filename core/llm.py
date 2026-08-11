@@ -3620,6 +3620,9 @@ def _chat_with_model_generator(
 
     tool_activity_seen = False
     final_summary_retry_count = 0
+    # "只思考不产出"时的最终总结重试上限：连续多次欠佳仍尝试补救，
+    # 避免长任务中一两轮失败就静默收尾（用户反馈"任务未执行完就结束"）。
+    FINAL_SUMMARY_MAX_RETRIES = 2
     # 重复工具调用抑制：同一签名成功 2 次后拦截，随本轮会话循环生命周期
     repeat_call_guard = _RepeatCallGuard()
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
@@ -4209,8 +4212,14 @@ def _chat_with_model_generator(
                 and (tool_activity_seen or promoted_reasoning)
             )
             # 只有真正要走重试分支时才跳过持久化（重试会 pop 掉这条消息）；
-            # 重试机会用尽后的最终消息必须照常入库，否则内存与 DB 分叉
-            will_retry_summary = needs_final_summary and final_summary_retry_count == 0
+            # 重试机会用尽后的最终消息必须照常入库，否则内存与 DB 分叉。
+            # 连续"只思考不产出"最多重试 FINAL_SUMMARY_MAX_RETRIES 次（共
+            # FINAL_SUMMARY_MAX_RETRIES+1 次机会），避免长任务中模型一两轮
+            # 欠佳就静默收尾，造成用户感知的"任务未执行完就结束"。
+            will_retry_summary = (
+                needs_final_summary
+                and final_summary_retry_count < FINAL_SUMMARY_MAX_RETRIES
+            )
 
             if stream and not will_retry_summary:
                 pending_persistence.append(("assistant", persisted_message))
@@ -4220,16 +4229,16 @@ def _chat_with_model_generator(
                     final_summary_retry_count += 1
                     # 上一轮因 max_tokens 截断（finish_reason == "length"）导致正文
                     # 未输出时，用相同上限重试几乎必然再次把预算全烧在思考上。
+                    # 同样地，"只思考不产出"也说明思考已烧掉大量输出预算。两者都
                     # 临时翻倍输出上限（封顶 32768）并在催促文案中要求压缩思考，
                     # 提高重试成功率。
                     length_truncated = finish_reason == "length"
-                    if length_truncated:
-                        if "max_completion_tokens" in kwargs:
-                            _cur_max = int(kwargs.get("max_completion_tokens") or 8192)
-                            kwargs["max_completion_tokens"] = min(_cur_max * 2, 32768)
-                        else:
-                            _cur_max = int(kwargs.get("max_tokens") or 8192)
-                            kwargs["max_tokens"] = min(_cur_max * 2, 32768)
+                    if "max_completion_tokens" in kwargs:
+                        _cur_max = int(kwargs.get("max_completion_tokens") or 8192)
+                        kwargs["max_completion_tokens"] = min(_cur_max * 2, 32768)
+                    else:
+                        _cur_max = int(kwargs.get("max_tokens") or 8192)
+                        kwargs["max_tokens"] = min(_cur_max * 2, 32768)
                     length_hint = (
                         "上一轮回复因输出长度限制被截断：请大幅压缩思考过程，"
                         "尽快开始输出正式内容。"
@@ -4294,19 +4303,24 @@ def _chat_with_model_generator(
                                 "不要在计划未完成时直接结束回答。"
                             ),
                         }
-                        messages.append(nudge_request)
-                        pending_persistence.append(("user", nudge_request))
                         _notify_event(event_callback, "notice", {
                             "message": "计划仍有未执行项，已提醒模型继续执行。",
                         })
                         continue
                 # 模型未调用工具且未生成任何正文：给出明确提示，避免 UI 在
                 # "思考完成" 后陷入沉默（常见于某些模型只输出 reasoning 或空回复）。
-                if not _is_meaningful_assistant_content(public_content):
-                    fallback_msg = "模型本轮未返回有效正文内容（可能只输出了思考过程或空回复）。"
+                # 判断用促升前的原始正文（raw_content_meaningful）：促升兜底本身
+                # 就说明模型没产出正式回复。重试耗尽后必须让用户明确感知回合未
+                # 正常完成：发 error 事件（GUI 会写进对话流/状态栏），而不是仅靠
+                # 静默 notice。
+                if not raw_content_meaningful:
+                    fallback_msg = "模型本轮未返回有效正文内容（可能只输出了思考过程或空回复），任务未正常完成。"
                     if reasoning_content and reasoning_content.strip():
                         fallback_msg += " 如需查看思考过程，可尝试换用支持推理展示的模型或重新提问。"
-                    _notify_event(event_callback, "notice", {"message": fallback_msg})
+                    if final_summary_retry_count > 0:
+                        _notify_event(event_callback, "error", {"message": fallback_msg})
+                    else:
+                        _notify_event(event_callback, "notice", {"message": fallback_msg})
                 # 促升的思考正文此前只写入了历史、从未推送到 UI——用户会看到
                 # 回合默默结束什么都没输出。此处补推给界面流式显示。
                 if promoted_reasoning and public_content:

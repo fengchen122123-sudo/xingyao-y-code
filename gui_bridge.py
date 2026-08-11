@@ -50,6 +50,12 @@ from core.version import __version__ as YCODE_VERSION
 
 logger = logging.getLogger(__name__)
 
+
+def _session_from_turn_id(turn_id: str) -> str:
+    """从 session:turn 复合 ID 提取会话名，不依赖可变的当前会话。"""
+    value = str(turn_id or "")
+    return value.rsplit(":", 1)[0] if ":" in value else ""
+
 # MCP 单例：import 失败（如未安装 mcp 依赖）不能拖垮整个 GUI
 try:
     from core.mcp_client import mcp_manager as _mcp_manager_singleton
@@ -562,6 +568,9 @@ class ApiBridge:
                 "active_model_name": str(active_model.get("name") or "未激活模型"),
                 # 当前激活模型的推理强度档位（None/"default" = 内置默认）
                 "reasoning_effort": get_model_reasoning_effort(config_data.get("active_model_id")) or "default",
+                # 副模型配置：启动时同步给前端，避免设置页显示"无/全勾选"假象
+                "secondary_model_id": str(config_data.get("secondary_model_id") or ""),
+                "secondary_model_roles": get_secondary_roles(),
                 "permission_mode": self._current_permission_mode,
                 "sessions": self.get_sessions(),
                 "skills": self._build_skill_list(),
@@ -1148,6 +1157,7 @@ class ApiBridge:
             from core.tool_presenter import describe_permission_request
             options = list(request.options or ())
             self.emit_event("permission_request", {
+                "session_name": _session_from_turn_id(request.parent_turn_id),
                 "request_id": request.request_id,
                 "function_name": request.function_name,
                 # 兼容字段：部分旧界面读 tool_name / details
@@ -1174,10 +1184,16 @@ class ApiBridge:
                     from core.permission_broker import CANCELLED_RESULT
                     if request.function_name == "ask_user":
                         permission_broker.resolve(request.request_id, CANCELLED_RESULT)
-                        self.emit_event("error", {"message": "问题确认超时，已自动取消。"})
+                        self.emit_event("error", {
+                            "session_name": _session_from_turn_id(request.parent_turn_id),
+                            "message": "问题确认超时，已自动取消。",
+                        })
                     else:
                         permission_broker.resolve(request.request_id, 1)
-                        self.emit_event("error", {"message": "权限确认超时，已自动拒绝该操作。"})
+                        self.emit_event("error", {
+                            "session_name": _session_from_turn_id(request.parent_turn_id),
+                            "message": "权限确认超时，已自动拒绝该操作。",
+                        })
             except Exception:
                 logger.debug("权限超时处理失败", exc_info=True)
 
@@ -1296,6 +1312,7 @@ class ApiBridge:
         """
         api_key = ""
         turn_finished = False
+        event_session_name = session_name
         cancelled = False
         error_state = {
             "toast_messages": set(),
@@ -1309,7 +1326,7 @@ class ApiBridge:
             if turn_finished:
                 return
             turn_finished = True
-            self.emit_event("turn_finish", {"session_name": session_name})
+            self.emit_event("turn_finish", {"session_name": event_session_name})
             self._emit_token_usage()
 
         # 多会话并行：不再用全局 _task_status 表示"执行中"——它会被另一会话回合结束时的
@@ -1364,8 +1381,11 @@ class ApiBridge:
             except Exception:
                 logger.debug("解析用户输入失败，退回纯文本", exc_info=True)
                 parsed_content, attached_msgs = user_text, []
-            for note in attached_msgs or []:
-                self.emit_event("notice", {"message": str(note)})
+            if attached_msgs:
+                self.emit_event("user_attachment_notes", {
+                    "session_name": session_name,
+                    "notes": [str(note) for note in attached_msgs],
+                })
             self._memory.add_message(session_name, "user", parsed_content)
             # 提取用户消息中的图片（base64 dataURL）补发给前端渲染气泡缩略图；
             # turn_start 已先行发出保证气泡即时出现，图片随后补挂到该气泡上
@@ -1443,7 +1463,7 @@ class ApiBridge:
             if cancelled:
                 self.emit_event("turn_cancelled", {"session_name": session_name})
             else:
-                self._maybe_auto_rename(session_name)
+                event_session_name = self._maybe_auto_rename(session_name) or session_name
         except Exception as e:
             logger.exception("GUI 对话回合失败")
             self._emit_owned_error(str(e), api_key, error_state, terminal=True, session_name=session_name)
@@ -1484,9 +1504,22 @@ class ApiBridge:
         职责二：延迟检查本会话是否所有后台任务都已终态，是则自动发起一轮
         汇总 turn，把结果主动呈现给用户——不用等用户手动发下一条消息。
         """
+        from core.tools import subagent_manager
+        session = next(
+            (
+                snap.parent_session
+                for snap in subagent_manager.snapshot()
+                if snap.task_id == task_id
+            ),
+            "",
+        )
+        if not session:
+            logger.warning("后台子代理终态缺少会话归属: %s", task_id)
+            return
         try:
             self.emit_event("background_subagent_terminal", {
                 "task_id": task_id,
+                "session_name": session,
                 "status": status,
                 "description": (description or "")[:60],
                 "summary": (summary or "")[:150],
@@ -1494,9 +1527,6 @@ class ApiBridge:
         except Exception:
             logger.debug("推送后台子代理终态通知失败", exc_info=True)
 
-        session = self._current_session
-        if not session:
-            return
         threading.Thread(
             target=self._deferred_bg_summary_check,
             args=(session,),
@@ -1738,15 +1768,15 @@ class ApiBridge:
             pass
         return _resolve_real_path(os.getcwd())
 
-    def _maybe_auto_rename(self, session_name: str):
+    def _maybe_auto_rename(self, session_name: str) -> str:
         """首轮对话完成后，把默认的 session_xxxxxx 命名换成提炼出的标题。"""
         if not re.match(r"^session_[a-f0-9]{6}$", session_name or ""):
-            return
+            return session_name
         try:
             history = self._memory.get_history(session_name)
             user_msgs = [m for m in history if m.get("role") == "user"]
             if not user_msgs:
-                return
+                return session_name
             raw = user_msgs[0].get("content", "")
             if isinstance(raw, list):
                 raw = " ".join(
@@ -1754,7 +1784,7 @@ class ApiBridge:
                 )
             first_text = str(raw).strip().replace("\n", " ")
             if not first_text:
-                return
+                return session_name
             base_title = first_text[:12]
             existing = {s.get("name") for s in self._memory.get_all_sessions(workdir=None)}
             new_title = base_title
@@ -1774,8 +1804,10 @@ class ApiBridge:
                     "new_name": final_name,
                     "sessions": self.get_sessions(),
                 })
+                return final_name
         except Exception:
             logger.debug("自动重命名会话失败", exc_info=True)
+        return session_name
 
     # ------------------------------------------------------------------
     # Token 用量
