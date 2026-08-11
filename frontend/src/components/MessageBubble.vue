@@ -1,5 +1,5 @@
 <template>
-  <div class="msg" :class="[msg.role === 'user' ? 'msg-user' : 'msg-assistant']">
+  <div class="msg" :class="msg.role === 'user' ? 'msg-user' : msg.role === 'error' ? 'msg-error' : 'msg-assistant'">
     <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大） -->
     <div v-if="msg.role === 'user'" class="bubble user-bubble">
       <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
@@ -55,6 +55,15 @@
           <span class="wl-text">星瑶正在干活<span class="wl-dots"><i>.</i><i>.</i><i>.</i></span></span>
           <span v-if="elapsed >= 3" class="wl-elapsed">已等待 {{ elapsed }}s</span>
         </div>
+      </div>
+    </div>
+
+    <!-- 错误提示（余额不足 / 模型异常等运行错误，写入对话流而非弹窗） -->
+    <div v-else-if="msg.role === 'error'" class="error-card">
+      <span class="error-icon">⚠</span>
+      <div class="error-body">
+        <div class="error-title">运行错误</div>
+        <div class="error-text">{{ msg.content }}</div>
       </div>
     </div>
   </div>
@@ -264,5 +273,43 @@ const thinkingOpen = computed({
 .md-body {
   margin-top: 8px;
   line-height: 1.7;
+}
+
+.msg-error {
+  display: flex;
+  justify-content: flex-start;
+}
+.error-card {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--red) 40%, var(--border));
+  border-left: 3px solid var(--red);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--red) 8%, var(--bg2));
+  font-size: 13px;
+  line-height: 1.6;
+}
+.error-icon {
+  flex-shrink: 0;
+  color: var(--red);
+  font-size: 16px;
+  line-height: 1.6;
+}
+.error-body {
+  flex: 1;
+  min-width: 0;
+}
+.error-title {
+  font-weight: 600;
+  color: var(--red);
+  margin-bottom: 2px;
+}
+.error-text {
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>
