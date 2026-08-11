@@ -175,6 +175,8 @@ button {
 }
 
 .kimi-card {
+  /* 补全面板 .suggest-panel 以此为绝对定位锚点（缺失会漂到窗口顶部） */
+  position: relative;
   width: 100%;
   max-width: 680px;
   background: var(--bg1);
