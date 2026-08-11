@@ -168,6 +168,34 @@
                 </div>
               </div>
             </div>
+
+            <div class="secondary-card">
+              <div class="secondary-card-head">
+                <h3>副模型</h3>
+                <span>用于识图 / 记忆压缩 / 子 Agent 等后台任务，独立于主模型。</span>
+              </div>
+              <label class="field-label">副模型</label>
+              <select v-model="secondaryModelId" class="text-field" data-test="secondary-model" @change="onSecondaryModelChange">
+                <option value="">无（不启用副模型）</option>
+                <option v-for="m in store.models" :key="m.id" :value="m.id">
+                  {{ m.name }}（{{ m.provider_name }}）
+                </option>
+              </select>
+              <div class="role-row">
+                <label class="role-choice">
+                  <input v-model="secondaryRoles.vision" type="checkbox" data-test="secondary-role-vision" @change="onSecondaryRolesChange" />
+                  <span><b>识图</b><small>用于需要理解图片的任务</small></span>
+                </label>
+                <label class="role-choice">
+                  <input v-model="secondaryRoles.compression" type="checkbox" data-test="secondary-role-compression" @change="onSecondaryRolesChange" />
+                  <span><b>压缩</b><small>用于对话记忆压缩</small></span>
+                </label>
+                <label class="role-choice">
+                  <input v-model="secondaryRoles.subagent" type="checkbox" data-test="secondary-role-subagent" @change="onSecondaryRolesChange" />
+                  <span><b>子 Agent</b><small>用于子 Agent 调度</small></span>
+                </label>
+              </div>
+            </div>
           </template>
 
           <template v-else-if="selectedKind === 'custom'">
@@ -236,6 +264,9 @@ const testResults = reactive<Record<string, string>>({});
 
 const providerForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 const customForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
+
+const secondaryModelId = ref(store.secondaryModelId);
+const secondaryRoles = reactive({ ...store.secondaryModelRoles });
 const modelModal = reactive({
   show: false,
   model_id: '',
@@ -399,6 +430,14 @@ async function testModel(model: ModelInfo) {
   testResults[model.id] = result.ok ? '✓ 连接成功' : `✕ ${result.msg}`;
   testingId.value = '';
 }
+
+async function onSecondaryModelChange() {
+  await store.setSecondaryModel(secondaryModelId.value);
+}
+
+async function onSecondaryRolesChange() {
+  await store.setSecondaryRoles({ ...secondaryRoles });
+}
 </script>
 
 <style scoped>
@@ -478,6 +517,14 @@ async function testModel(model: ModelInfo) {
 .vision-choice { margin-top: 20px; display: flex; align-items: flex-start; gap: 10px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; color: var(--text); }
 .vision-choice span { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .vision-choice small { color: var(--text-faint); }
+.secondary-card { margin-top: 34px; padding: 18px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg2); }
+.secondary-card-head { display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px; }
+.secondary-card-head h3 { margin: 0 0 2px; font-size: 14px; }
+.secondary-card-head span { color: var(--text-faint); font-size: 11px; }
+.role-row { margin-top: 14px; display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; }
+.role-choice { display: flex; align-items: flex-start; gap: 9px; padding: 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg1); color: var(--text); }
+.role-choice span { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.role-choice small { color: var(--text-faint); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 @media (max-width: 900px) {
   .settings-nav { width: 170px; }

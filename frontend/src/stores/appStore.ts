@@ -60,7 +60,7 @@ const emptyTokenUsage = (): TokenUsage => normalizeTokenUsage();
 
 export interface ChatMessage {
   id?: string;
-  role: 'user' | 'assistant' | 'tool';
+  role: 'user' | 'assistant' | 'tool' | 'error';
   content?: string;
   // 用户消息附带的图片（base64 dataURL 列表，支持多张）
   images?: string[];
@@ -185,6 +185,10 @@ export interface PermReqState {
   source: string;
   // 沙盒外访问等场景后端只给两项选项，不渲染“总是允许”
   allowAlways: boolean;
+  // ask_user 澄清问题的自定义选项（非空时渲染为选项列表而非三按钮）
+  options: string[];
+  // 请求来源工具名：'ask_user' 时为澄清问题，否则为标准权限请求
+  functionName: string;
 }
 
 export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models';
@@ -205,6 +209,9 @@ export const useAppStore = defineStore('app', {
     modelPresets: [] as PresetProviderInfo[],
     activeModelId: '',
     activeModelName: '',
+    // 副模型：可选，用于识图(vision)/上下文压缩(compression)/子Agent(subagent)等场景
+    secondaryModelId: '',
+    secondaryModelRoles: { vision: true, compression: true, subagent: true } as { vision: boolean; compression: boolean; subagent: boolean },
 
     // 权限模式（规范值：confirm | auto | plan | full，展示一律经 formatPermMode）
     permissionMode: 'confirm' as PermissionMode,
@@ -273,7 +280,7 @@ export const useAppStore = defineStore('app', {
     confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎' } as ConfirmState,
 
     // 权限请求弹窗
-    permRequest: { show: false, reqId: '', summary: '', source: '', allowAlways: false } as PermReqState,
+    permRequest: { show: false, reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' } as PermReqState,
 
     // 二级抽屉页面：技能 / MCP / 模型管理
     subpage: { show: false, type: 'skills' as SubpageType },
@@ -451,6 +458,8 @@ export const useAppStore = defineStore('app', {
         this.providers = init.providers || [];
         this.activeModelId = init.active_model_id || '';
         this.activeModelName = init.active_model_name || '';
+        this.secondaryModelId = init.secondary_model_id || '';
+        this.secondaryModelRoles = init.secondary_model_roles || { vision: true, compression: true, subagent: true };
         this.permissionMode = init.permission_mode || 'confirm';
         this.reasoningEffort = (init as any).reasoning_effort || 'default';
         this.sessionGroups = init.sessions || [];
@@ -549,6 +558,45 @@ export const useAppStore = defineStore('app', {
         this.permissionMode = prev;
         this.connected = false;
         this.showToast('权限模式调整失败: ' + err, 'warn');
+      }
+    },
+
+    // 选择/清除副模型（传空字符串清除），对齐 CLI 的 set_secondary
+    async setSecondaryModel(modelId: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.set_secondary_model(modelId);
+        if (res && res.ok) {
+          this.secondaryModelId = modelId || '';
+          this.showToast(res.msg || ('副模型已更新: ' + (this.secondaryModelId || '未设置')), 'ok');
+        } else {
+          this.showToast('副模型设置失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+        }
+      } catch (err) {
+        this.connected = false;
+        this.showToast('副模型设置失败: ' + err, 'warn');
+      }
+    },
+
+    // 设置副模型用途（识图 / 压缩 / 子Agent）。乐观更新，失败回滚。
+    async setSecondaryRoles(roles: { vision: boolean; compression: boolean; subagent: boolean }) {
+      const prev = this.secondaryModelRoles;
+      this.secondaryModelRoles = roles;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.set_secondary_roles(roles);
+        if (res && res.ok) {
+          this.showToast(res.msg || '副模型用途已更新', 'ok');
+        } else {
+          this.secondaryModelRoles = prev;
+          this.showToast('副模型用途设置失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+        }
+      } catch (err) {
+        this.secondaryModelRoles = prev;
+        this.connected = false;
+        this.showToast('副模型用途设置失败: ' + err, 'warn');
       }
     },
 
@@ -731,13 +779,13 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.stop_current_turn();
         if (!res || !res.ok) {
-          this.showToast('中断请求未成功送达', 'warn');
+          this.messages.push({ role: 'error', content: '中断请求未成功送达' });
         } else {
           this.showToast('已请求中断当前回合', 'warn');
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('中断请求失败: ' + err, 'warn');
+        this.messages.push({ role: 'error', content: '中断请求失败: ' + err });
       }
     },
 
@@ -751,7 +799,7 @@ export const useAppStore = defineStore('app', {
       if (!api) {
         // 本地无后端离线模拟，方便纯前端调试
         this.messages.push({ role: 'user', content: text.trim() });
-        this.showToast('无后端连接，仅处于开发离线预览视图', 'warn');
+        this.messages.push({ role: 'error', content: '无后端连接，仅处于开发离线预览视图' });
         this.running = false;
         return;
       }
@@ -780,13 +828,13 @@ export const useAppStore = defineStore('app', {
         }
         if (!res || !res.ok) {
           this.running = false;
-          this.showToast('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.messages.push({ role: 'error', content: '消息发送失败: ' + (res && res.msg ? res.msg : '未知错误') });
         }
         // 成功时不主动改 running，由后续 turn_start/turn_finish/turn_cancelled 等事件驱动
       } catch (err) {
         this.running = false;
         this.connected = false;
-        this.showToast('消息发送失败: ' + err, 'warn');
+        this.messages.push({ role: 'error', content: '消息发送失败: ' + err });
       }
     },
 
@@ -1004,6 +1052,8 @@ export const useAppStore = defineStore('app', {
           summary: String(data.summary || data.function_name || ''),
           source: data.source || '',
           allowAlways: !!data.allow_always,
+          options: Array.isArray(data.options) ? data.options.map(String) : [],
+          functionName: String(data.function_name || ''),
         };
       } else if (type === 'permission_dismiss') {
         // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留
@@ -1100,7 +1150,11 @@ export const useAppStore = defineStore('app', {
         };
         const label = statusLabel[data.status] || data.status;
         const desc = data.description ? `：${data.description}` : '';
-        this.showToast(`后台子代理${label}${desc}`, data.status === 'completed' ? 'ok' : 'warn');
+        if (data.status === 'completed') {
+          this.showToast(`后台子代理${label}${desc}`, 'ok');
+        } else {
+          this.messages.push({ role: 'error', content: `后台子代理${label}${desc}` });
+        }
       } else if (type === 'terminal_output') {
         this.terminalOutput += data.text || '';
         // 输出上限 200K 字符：超出后从头部截断，避免长任务把内存拖爆
@@ -1112,7 +1166,8 @@ export const useAppStore = defineStore('app', {
         const code = data.code;
         this.terminalOutput += `\n[进程已退出，代码 ${code}]\n\n`;
       } else if (type === 'error') {
-        this.showToast(data.message || '运行错误', 'warn');
+        // 写入对话流而非 toast 弹窗，避免余额不足等关键错误被忽略
+        this.messages.push({ role: 'error', content: data.message || '运行错误' });
       }
     },
 
@@ -1125,11 +1180,28 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.respond_permission(reqId, allowed, always);
         if (!res || !res.ok) {
-          this.showToast('权限响应发送失败', 'warn');
+          this.messages.push({ role: 'error', content: '权限响应发送失败' });
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('权限响应发送失败: ' + err, 'warn');
+        this.messages.push({ role: 'error', content: '权限响应发送失败: ' + err });
+      }
+    },
+
+    async respondPermissionChoice(choiceIndex: number) {
+      const reqId = this.permRequest.reqId;
+      this.permRequest.show = false;
+      if (!reqId) return;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.respond_permission_choice(reqId, choiceIndex);
+        if (!res || !res.ok) {
+          this.messages.push({ role: 'error', content: '选项响应发送失败' });
+        }
+      } catch (err) {
+        this.connected = false;
+        this.messages.push({ role: 'error', content: '选项响应发送失败: ' + err });
       }
     },
 

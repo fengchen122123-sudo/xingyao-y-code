@@ -11,7 +11,20 @@
       </div>
     </div>
     <div class="pc-body">{{ store.permRequest.summary }}</div>
-    <div class="pc-foot">
+    <!-- ask_user 澄清问题：选项列表，每个选项一行 -->
+    <div v-if="store.permRequest.functionName === 'ask_user' && store.permRequest.options.length" class="pc-choices">
+      <button
+        v-for="(opt, i) in store.permRequest.options"
+        :key="i"
+        class="pc-choice"
+        @click="store.respondPermissionChoice(i)"
+      >
+        <span class="pc-choice-letter">{{ String.fromCharCode(65 + i) }}</span>
+        <span class="pc-choice-text">{{ opt }}</span>
+      </button>
+    </div>
+    <!-- 标准权限请求：允许一次 / 总是允许 / 拒绝 -->
+    <div v-else class="pc-foot">
       <button class="pc-btn primary" @click="store.respondPermission(true, false)">允许一次</button>
       <button
         v-if="store.permRequest.allowAlways"
@@ -111,5 +124,50 @@ const store = useAppStore();
 .pc-btn.danger:hover {
   border-color: var(--red);
   background: rgba(248, 81, 73, 0.08);
+}
+.pc-choices {
+  padding: 0 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.pc-choice {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 13px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg2);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.pc-choice:hover {
+  border-color: var(--accent);
+  background: var(--bg3);
+}
+.pc-choice-letter {
+  flex-shrink: 0;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+}
+.pc-choice-text {
+  flex: 1;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
 }
 </style>
