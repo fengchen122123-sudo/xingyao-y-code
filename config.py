@@ -94,6 +94,7 @@ GUI_DB_FILE = os.path.join(YCODE_DIR, "ycode_gui.db")
 ACTIVE_SKILLS_FILE = os.path.join(YCODE_DIR, "active_skills.json")
 MCP_FILE = os.path.join(YCODE_DIR, "mcp.json")
 SYSTEM_PROMPT_FILE = os.path.join(YCODE_DIR, "system_prompt.md")
+SYSTEM_PROMPT_GUI_FILE = os.path.join(YCODE_DIR, "system_prompt_gui.md")
 
 # 自动从当前源码目录初始化默认配置文件
 if not os.path.exists(_CONFIG_FILE):
