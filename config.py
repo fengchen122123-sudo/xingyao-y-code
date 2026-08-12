@@ -3,17 +3,46 @@ import logging
 import os
 import shutil
 import threading
+from copy import deepcopy
+
+from core.credentials import DPAPI_PREFIX, KEYRING_PREFIX, protect_secret, unprotect_secret
 
 # 进程内配置写锁：防止并发写 config.json 互相截断
-_CONFIG_LOCK = threading.Lock()
+_CONFIG_LOCK = threading.RLock()
+
+
+def _transform_api_keys(data, transform):
+    result = deepcopy(data)
+    if not isinstance(result, dict):
+        return result
+    providers = result.get("providers")
+    if not isinstance(providers, list):
+        return result
+    for provider in providers:
+        if isinstance(provider, dict) and isinstance(provider.get("api_key"), str):
+            provider["api_key"] = transform(provider["api_key"])
+    return result
+
+
+def _prepare_for_storage(path, data):
+    if os.path.abspath(path) != os.path.abspath(_CONFIG_FILE):
+        return data
+    return _transform_api_keys(data, protect_secret)
+
+
+def _restore_after_read(path, data):
+    if os.path.abspath(path) != os.path.abspath(_CONFIG_FILE):
+        return data
+    return _transform_api_keys(data, unprotect_secret)
 
 
 def _backup_if_valid(path):
     """仅在当前文件是合法 JSON 时刷新 .bak 备份，保证备份始终是最近一份可用配置。"""
     try:
         with open(path, "r", encoding="utf-8") as f:
-            json.load(f)
-        shutil.copy(path, path + ".bak")
+            existing = json.load(f)
+        with open(path + ".bak", "w", encoding="utf-8") as backup:
+            json.dump(_prepare_for_storage(path, _restore_after_read(path, existing)), backup, indent=2, ensure_ascii=False)
     except Exception:
         pass
 
@@ -30,8 +59,9 @@ def _atomic_write_json(path, data, indent=2):
     """原子写 JSON：临时文件 + os.replace，写前刷新 .bak，避免写一半崩溃损坏配置。"""
     tmp_path = f"{path}.{os.getpid()}.{threading.get_ident()}.tmp"
     try:
+        stored_data = _prepare_for_storage(path, data)
         with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=indent, ensure_ascii=False)
+            json.dump(stored_data, f, indent=indent, ensure_ascii=False)
             f.flush()
             os.fsync(f.fileno())
         _backup_if_valid(path)
@@ -58,7 +88,19 @@ def _read_json_with_backup(path, default=None):
         if cache_entry["data"] is not None and cache_entry["mtime"] == current_mtime:
             return cache_entry["data"]
         with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
+            raw_data = json.load(f)
+            data = _restore_after_read(path, raw_data)
+            if (
+                os.path.abspath(path) == os.path.abspath(_CONFIG_FILE)
+                and any(
+                    isinstance(provider, dict)
+                    and provider.get("api_key")
+                    and not str(provider["api_key"]).startswith((DPAPI_PREFIX, KEYRING_PREFIX))
+                    for provider in raw_data.get("providers", [])
+                )
+            ):
+                with _CONFIG_LOCK:
+                    _atomic_write_json(path, data)
             cache_entry["mtime"] = current_mtime
             cache_entry["data"] = data
             return data
@@ -68,7 +110,7 @@ def _read_json_with_backup(path, default=None):
         backup = path + ".bak"
         try:
             with open(backup, "r", encoding="utf-8") as f:
-                data = json.load(f)
+                data = _restore_after_read(path, json.load(f))
             # 用备份回写主文件完成自愈；对 config.json 加锁，避免与正常写路径竞态覆盖新配置
             if path == _CONFIG_FILE:
                 with _CONFIG_LOCK:

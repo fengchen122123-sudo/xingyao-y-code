@@ -12,7 +12,7 @@ from types import SimpleNamespace
 from urllib.parse import urlsplit
 # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
-from concurrent.futures import TimeoutError as _FutureTimeoutError
+from concurrent.futures import Future, TimeoutError as _FutureTimeoutError
 from copy import deepcopy
 
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
@@ -25,6 +25,22 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 logging.getLogger("litellm").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _submit_daemon_call(function, *args, **kwargs):
+    """Run a blocking call without adding a non-daemon interpreter-exit hook."""
+    future = Future()
+
+    def runner():
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(function(*args, **kwargs))
+        except BaseException as error:
+            future.set_exception(error)
+
+    threading.Thread(target=runner, daemon=True, name="ycode-blocking-call").start()
+    return future
 
 # ---------------------------------------------------------------------------
 # litellm 懒加载：启动性能优化
@@ -198,6 +214,13 @@ _last_tracked_session = None
 _raw_permission_lock = threading.Lock()
 # 保护会话放行白名单与 _last_tracked_session 的跨线程读写
 _session_whitelist_lock = threading.Lock()
+
+
+def _canonical_permission_path(value):
+    try:
+        return os.path.normcase(os.path.realpath(os.path.abspath(str(value or ""))))
+    except (OSError, ValueError, TypeError):
+        return ""
 _plan_turn_lock = threading.Lock()
 _plan_turn_started_at = {}
 
@@ -362,13 +385,13 @@ def ask_in_raw_terminal(function_name, arguments):
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     with _session_whitelist_lock:
-                        session_allowed_write_files.add(file_path)
+                        session_allowed_write_files.add(_canonical_permission_path(file_path))
                     print(f"[当前会话已放行写入]：{file_path}")
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     with _session_whitelist_lock:
-                        session_allowed_edit_files.add(file_path)
+                        session_allowed_edit_files.add(_canonical_permission_path(file_path))
                     print(f"[当前会话已放行修改]：{file_path}")
             elif function_name == "sandbox_outside_access":
                 # 沙盒外访问不支持会话放行，always 仅本次通过
@@ -409,8 +432,9 @@ def check_permission_and_ask(
             return True
     elif function_name == "write_file":
         file_path = arguments.get("file_path", "")
+        canonical_path = _canonical_permission_path(file_path)
         with _session_whitelist_lock:
-            file_allowed = file_path in session_allowed_write_files
+            file_allowed = canonical_path in session_allowed_write_files
         if file_allowed:
             if event_callback is None:
                 from prompt_toolkit.formatted_text import HTML
@@ -420,8 +444,9 @@ def check_permission_and_ask(
             return True
     elif function_name == "edit_file":
         file_path = arguments.get("file_path", "")
+        canonical_path = _canonical_permission_path(file_path)
         with _session_whitelist_lock:
-            edit_allowed = file_path in session_allowed_edit_files
+            edit_allowed = canonical_path in session_allowed_edit_files
         if edit_allowed:
             if event_callback is None:
                 from prompt_toolkit.formatted_text import HTML
@@ -559,14 +584,14 @@ def check_permission_and_ask(
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     with _session_whitelist_lock:
-                        session_allowed_write_files.add(file_path)
+                        session_allowed_write_files.add(_canonical_permission_path(file_path))
                     if event_callback is None:
                         safe_print(ANSI(f"   ✨ [当前会话已放行写入]：{file_path}"))
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     with _session_whitelist_lock:
-                        session_allowed_edit_files.add(file_path)
+                        session_allowed_edit_files.add(_canonical_permission_path(file_path))
                     if event_callback is None:
                         safe_print(ANSI(f"   ✨ [当前会话已放行修改]：{file_path}"))
             # sandbox_outside_access 不提供“始终放行”选项（见 enqueue 处），
@@ -1523,6 +1548,7 @@ _token_estimate_cache = {"sig": None, "value": 0}
 # 前缀增量缓存：append-only 历史每轮只新增尾部消息，
 # 记录前缀（消息数/字符总长/token 数），下一轮免全量 tokenize
 _token_prefix_cache = {"model": None, "msg_count": 0, "char_len": 0, "value": 0}
+_token_cache_lock = threading.RLock()
 
 
 def _fold_old_media_for_estimate(messages):
@@ -1571,6 +1597,13 @@ def estimate_tokens(model_name, messages):
     """
     if not messages:
         return 0
+    # 两份缓存包含互相关联的字段，必须在一个临界区内读取、计算并提交，
+    # 否则并发模型会形成“模型 A 的签名 + 模型 B 的值”的混合快照。
+    with _token_cache_lock:
+        return _estimate_tokens_locked(model_name, messages)
+
+
+def _estimate_tokens_locked(model_name, messages):
     try:
         total_len = sum(len(str(m.get("content") or "")) for m in messages)
         sig = (str(model_name), len(messages), total_len)
@@ -1953,6 +1986,7 @@ def _apply_cache_control(messages, model_name):
 # _supports_vision 结果缓存（30s TTL）：该函数在工具循环里每轮都会被调用
 # （最多 100 次/用户轮），底层的 litellm.supports_vision 查表并不便宜。
 _vision_support_cache = {}
+_vision_support_cache_lock = threading.RLock()
 
 
 def _supports_vision(model_name):
@@ -1966,6 +2000,11 @@ def _supports_vision(model_name):
     """
     if not model_name:
         return False
+    with _vision_support_cache_lock:
+        return _supports_vision_locked(model_name)
+
+
+def _supports_vision_locked(model_name):
     cached = _vision_support_cache.get(model_name)
     if cached is not None and cached[1] > time.monotonic():
         return cached[0]
@@ -2780,7 +2819,9 @@ def _sandbox_outside_guard(
     try:
         from core.memory_kairos import is_ycode_data_path
         if is_ycode_data_path(path_value):
-            return sandbox_bypass(), None
+            basename = os.path.basename(str(path_value)).lower()
+            if basename not in {"config.json", "config.json.bak", "mcp.json", "mcp.json.bak"}:
+                return sandbox_bypass(), None
     except Exception:
         pass
     if function_name == "read_file":
@@ -3439,18 +3480,15 @@ def _call_vision_model_for_content(secondary, content, cancel_event=None, max_re
         tool_contract="no-tools",
     ))
 
-    from concurrent.futures import ThreadPoolExecutor
     warning_logger = logging.getLogger("py.warnings")
 
     for attempt in range(max_retries):
         try:
-            executor = ThreadPoolExecutor(max_workers=1)
-            future = executor.submit(_litellm_completion, **kwargs)
+            future = _submit_daemon_call(_litellm_completion, **kwargs)
             try:
                 while not future.done():
                     if cancel_event is not None and cancel_event.is_set():
                         future.cancel()
-                        executor.shutdown(wait=False, cancel_futures=True)
                         return ""
                     try:
                         future.result(timeout=0.1)
@@ -3462,7 +3500,6 @@ def _call_vision_model_for_content(secondary, content, cancel_event=None, max_re
                 resp = future.result()
             finally:
                 future.cancel()
-                executor.shutdown(wait=False, cancel_futures=True)
 
             if resp and getattr(resp, "choices", None):
                 c = resp.choices[0].message.content
@@ -3857,9 +3894,7 @@ def _chat_with_model_generator(
                     )
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
-                    from concurrent.futures import ThreadPoolExecutor
-                    executor = ThreadPoolExecutor(max_workers=1)
-                    future = executor.submit(
+                    future = _submit_daemon_call(
                         _request_stream,
                         request_protocol,
                         kwargs,
@@ -3902,7 +3937,6 @@ def _chat_with_model_generator(
                     finally:
                         # 用户取消时避免 shutdown(wait=True) 阻塞到网络请求完成（最长 90s）
                         future.cancel()
-                        executor.shutdown(wait=False, cancel_futures=True)
                     break
                 except Exception as api_err:
                     err_str = str(api_err).lower()
@@ -4416,12 +4450,16 @@ def _chat_with_model_generator(
                     # 并发上限固定为 4，结果仍按模型工具调用顺序写回。
                     # 不用 with 语句：with 的 __exit__ 会 shutdown(wait=True)，
                     # 取消时会卡住 UI 直到所有并行工具（可能是长时子代理）跑完。
-                    from concurrent.futures import ThreadPoolExecutor
-                    executor = ThreadPoolExecutor(max_workers=min(len(batch), 4))
-                    try:
-                        timed_results = list(executor.map(execute_guarded, batch))
-                    finally:
-                        executor.shutdown(wait=False, cancel_futures=True)
+                    futures = [_submit_daemon_call(execute_guarded, item) for item in batch]
+                    timed_results = []
+                    for future in futures:
+                        while not future.done():
+                            raise_if_cancelled()
+                            try:
+                                future.result(timeout=0.1)
+                            except _FutureTimeoutError:
+                                pass
+                        timed_results.append(future.result())
                     results = [result for result, _duration_ms in timed_results]
                     durations = [duration_ms for _result, duration_ms in timed_results]
                     messages.extend(results)

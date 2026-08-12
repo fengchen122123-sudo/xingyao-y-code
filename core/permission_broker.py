@@ -122,6 +122,10 @@ class PermissionBroker:
     def cancel_owner(self, owner_id: str) -> int:
         return self._cancel(lambda request: request.owner_id == owner_id)
 
+    def cancel_all(self) -> int:
+        """Cancel every active/queued request during application shutdown."""
+        return self._cancel(lambda _request: True)
+
     def active_request(self) -> PermissionRequest | None:
         with self._lock:
             return self._active
