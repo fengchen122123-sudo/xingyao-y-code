@@ -113,7 +113,16 @@
       <div v-show="activeTab === 'files'" class="rpane active">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)">
           <span style="font-size:12px;color:var(--text-dim);font-weight:600">项目文件</span>
-          <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="引入新的项目文件夹" @click="store.openWorkspaceFolder()">引入新文件夹</button>
+          <span style="display:flex;gap:6px">
+            <button
+              class="chip-btn"
+              style="font-size:11.5px;padding:3px 9px"
+              :disabled="store.fileTreeRefreshing"
+              title="重新扫描项目文件夹（外部新增/删除的文件会更新出来，展开状态保留）"
+              @click="store.refreshFileTree()"
+            >{{ store.fileTreeRefreshing ? '刷新中…' : '↻ 刷新' }}</button>
+            <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="引入新的项目文件夹" @click="store.openWorkspaceFolder()">引入新文件夹</button>
+          </span>
         </div>
 
         <div v-if="!store.fileTree || store.fileTree.length === 0" style="padding:20px 10px;text-align:center;color:var(--text-faint);font-size:12px">
@@ -150,7 +159,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import FileTreeNode from './FileTreeNode.vue';
 import hljs from 'highlight.js/lib/common';
@@ -284,8 +293,25 @@ async function killTask(id: string) {
   }
 }
 
+// 文件树自动刷新：切到“文件”页签或窗口重新聚焦时触发（节流 2 秒），
+// 覆盖“用户在外部文件夹里新增/删除了文件再回来看”的场景；也可点 ↻ 手动刷新
+let lastFileTreeAutoRefresh = 0;
+function maybeAutoRefreshFileTree() {
+  const now = Date.now();
+  if (now - lastFileTreeAutoRefresh < 2000) return;
+  lastFileTreeAutoRefresh = now;
+  if (store.workdir) void store.refreshFileTree();
+}
+watch(activeTab, t => { if (t === 'files') maybeAutoRefreshFileTree(); });
+const onWindowFocus = () => { if (activeTab.value === 'files') maybeAutoRefreshFileTree(); };
+
 onMounted(() => {
   refreshTasks();
+  window.addEventListener('focus', onWindowFocus);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('focus', onWindowFocus);
 });
 </script>
 

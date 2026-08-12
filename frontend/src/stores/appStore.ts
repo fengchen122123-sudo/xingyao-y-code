@@ -237,6 +237,10 @@ export const useAppStore = defineStore('app', {
     currentWorkdirLabel: '对话',
     workdir: '',
     fileTree: [] as FileNode[],
+    // 文件树刷新中标记（驱动刷新按钮的 loading 态，并防止并发刷新）
+    fileTreeRefreshing: false,
+    // 文件树展开状态（按完整路径记录）：刷新后据此恢复展开并逐层刷新内容
+    fileTreeExpanded: [] as string[],
     // 文件树后台加载序号：快速连切会话时过期结果凭序号丢弃
     fileTreeReqSeq: 0,
 
@@ -719,12 +723,14 @@ export const useAppStore = defineStore('app', {
           this.currentWorkdirLabel = '对话';
           this.workdir = '';
           this.fileTree = [];
+          this.fileTreeExpanded = [];
         } else if (res.workdir) {
           this.workdir = res.workdir;
           this.currentWorkdirLabel = res.workdir.split('\\').pop() || res.workdir;
           // 文件树不再随切换响应返回（后端同步扫描大目录要数秒，拖慢切换）：
           // 先清空旧树秒开对话，树在后台异步加载，过期结果丢弃
           this.fileTree = [];
+          this.fileTreeExpanded = [];
           this.loadFileTreeInBackground(sessionName, res.workdir);
         }
 
@@ -750,6 +756,53 @@ export const useAppStore = defineStore('app', {
       } catch { /* 后台加载失败静默：树留空，不影响对话 */ }
     },
 
+    // 按完整路径在已加载的文件树中定位节点（FileTreeNode 用 '\\' 拼路径，兼容两种分隔符）
+    _findFileNode(fullPath: string): FileNode | null {
+      const norm = (s: string) => s.replace(/\//g, '\\').replace(/\\+$/, '');
+      const base = norm(this.workdir);
+      const target = norm(fullPath);
+      if (!base || !target.startsWith(base + '\\')) return null;
+      const segs = target.slice(base.length + 1).split('\\').filter(Boolean);
+      let level: FileNode[] = this.fileTree;
+      let found: FileNode | null = null;
+      for (const seg of segs) {
+        found = level.find(n => n.n === seg) || null;
+        if (!found) return null;
+        level = found.children || [];
+      }
+      return found;
+    },
+
+    // 刷新文件树：重拉整棵树后，按展开记录逐层刷新子节点并恢复展开状态；
+    // 已被删除的目录从展开记录中清除。手动按钮与窗口聚焦/页签激活的自动刷新共用。
+    async refreshFileTree() {
+      const api = this._api();
+      if (!api || !this.workdir || this.fileTreeRefreshing) return;
+      this.fileTreeRefreshing = true;
+      const seq = ++this.fileTreeReqSeq;
+      try {
+        const res = await api.get_file_tree(this.workdir);
+        if (seq !== this.fileTreeReqSeq) return; // 期间切换了会话/项目，丢弃过期结果
+        if (!res || !res.ok || !res.file_tree) return;
+        this.fileTree = res.file_tree;
+        const expanded = [...this.fileTreeExpanded].sort((a, b) => a.length - b.length);
+        const stillExists: string[] = [];
+        for (const p of expanded) {
+          const node = this._findFileNode(p);
+          if (!node) continue; // 目录已删除
+          stillExists.push(p);
+          try {
+            const r = await api.get_dir_children(p);
+            node.children = (r && r.children) || [];
+          } catch {
+            node.children = [];
+          }
+        }
+        this.fileTreeExpanded = stillExists;
+      } catch { /* 刷新失败静默：保留旧树 */ }
+      finally { this.fileTreeRefreshing = false; }
+    },
+
     async createGlobalSession() {
       // 懒创建：只切换到空白自由对话状态，首条消息发出时才真正落库
       this._captureCurrentRuntime();
@@ -767,6 +820,7 @@ export const useAppStore = defineStore('app', {
       this.currentWorkdirLabel = '对话';
       this.workdir = '';
       this.fileTree = [];
+      this.fileTreeExpanded = [];
     },
 
     // 顶栏“新会话”按钮：跟随当前上下文——在项目中就在该项目新建，
@@ -802,6 +856,7 @@ export const useAppStore = defineStore('app', {
       // 切到别的项目分组才清空并后台异步加载（过期结果有序号防护）
       if (!treeMatches) {
         this.fileTree = [];
+        this.fileTreeExpanded = [];
         this.loadFileTreeInBackground('', targetWorkdir);
       }
     },
@@ -876,7 +931,7 @@ export const useAppStore = defineStore('app', {
         if (res && res.ok !== false && res.workdir) {
           this.workdir = res.workdir;
           this.currentWorkdirLabel = res.workdir.split('\\').pop() || res.workdir;
-          if (res.file_tree) this.fileTree = res.file_tree;
+          if (res.file_tree) { this.fileTree = res.file_tree; this.fileTreeExpanded = []; }
           if (res.sessions) this.sessionGroups = res.sessions;
           if (res.skills) this.skills = res.skills;
           this.showToast('已成功引入项目文件夹: ' + res.workdir, 'ok');
@@ -1199,8 +1254,10 @@ export const useAppStore = defineStore('app', {
         };
         this.permRequest.show = this.permRequest.sessionName === this.currentSessionName;
       } else if (type === 'permission_dismiss') {
-        // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留
-        this.permRequest.show = false;
+        // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留。
+        // 必须整体重置：仅 show=false 会残留 reqId/sessionName，
+        // switchSession 重显逻辑会把已失效的卡片复活，点击后报“权限响应发送失败”
+        this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' };
       } else if (type === 'notice') {
         if (data.message) this.showToast(String(data.message), 'ok');
       } else if (type === 'session_renamed') {
@@ -1367,11 +1424,19 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.respond_permission(reqId, allowed, always);
         if (!res || !res.ok) {
-          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '权限响应发送失败' });
+          const detail = res && res.msg ? `: ${res.msg}` : '';
+          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '权限响应发送失败' + detail });
         }
       } catch (err) {
         this.connected = false;
         this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '权限响应发送失败: ' + err });
+      } finally {
+        // 应答过的请求立即作废本地 reqId（保留新到的请求）：否则 switchSession 的
+        // 重显逻辑会把已应答的卡片复活，再次点击必然报“已失效或已被处理”
+        if (this.permRequest.reqId === reqId) {
+          this.permRequest.reqId = '';
+          this.permRequest.sessionName = '';
+        }
       }
     },
 
@@ -1385,11 +1450,18 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.respond_permission_choice(reqId, choiceIndex);
         if (!res || !res.ok) {
-          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '选项响应发送失败' });
+          const detail = res && res.msg ? `: ${res.msg}` : '';
+          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '选项响应发送失败' + detail });
         }
       } catch (err) {
         this.connected = false;
         this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '选项响应发送失败: ' + err });
+      } finally {
+        // 与 respondPermission 同理：应答后作废本地 reqId，防止死卡片被重显
+        if (this.permRequest.reqId === reqId) {
+          this.permRequest.reqId = '';
+          this.permRequest.sessionName = '';
+        }
       }
     },
 

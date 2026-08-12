@@ -29,14 +29,14 @@ const props = defineProps<{
 }>();
 
 const store = useAppStore();
-const isOpen = ref(false);
-const loading = ref(false);
-const loaded = ref(false);
-
 // FileNode 本身只带文件名(n)，需要沿递归路径拼接出完整路径供预览接口使用
 const fullPath = computed(() => {
   return props.parentPath ? props.parentPath + '\\' + props.node.n : props.node.n;
 });
+// 展开状态持久化在 store：文件树刷新后新组件实例也能凭路径恢复展开
+const isOpen = ref(store.fileTreeExpanded.includes(fullPath.value));
+const loading = ref(false);
+const loaded = ref(props.node.children !== undefined);
 
 const icon = computed(() => {
   if (props.node.d) return isOpen.value ? '📂' : '📁';
@@ -49,6 +49,14 @@ async function toggle() {
     return;
   }
   isOpen.value = !isOpen.value;
+  // 同步到 store 的展开记录：刷新文件树时据此恢复展开并逐层刷新内容
+  if (isOpen.value) {
+    if (!store.fileTreeExpanded.includes(fullPath.value)) {
+      store.fileTreeExpanded.push(fullPath.value);
+    }
+  } else {
+    store.fileTreeExpanded = store.fileTreeExpanded.filter(p => p !== fullPath.value);
+  }
   // 初始文件树有深度上限，超出层级的目录没有预载 children；
   // 展开这类目录时按需向后端取下一层，任意层级都能展开。
   // 空目录 children 同样缺省，取回空数组后用 loaded 标记避免重复请求。

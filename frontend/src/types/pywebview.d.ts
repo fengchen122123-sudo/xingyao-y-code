@@ -318,6 +318,8 @@ export interface PyWebViewAPI {
   pick_files(): Promise<any>;
   get_files_info(paths: string[]): Promise<any>;
   save_clipboard_image(dataUrl: string): Promise<any>;
+  // 拖拽 drop 桥接：取回 Python 侧已存储的拖拽文件完整路径
+  report_dropped_files(event: any): Promise<{ ok: boolean; paths?: string[] }>;
   // @ 引用自动补全：工作区文件子串匹配
   search_workspace_files(query: string, limit?: number): Promise<any>;
   get_dir_children(path: string): Promise<any>;
