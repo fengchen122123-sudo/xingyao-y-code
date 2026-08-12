@@ -26,7 +26,7 @@ datas = [
     ('config.example.json', '.'),
     ('system_prompt.md', '.'),
     # GUI 向导资源：虚化背景图 + 窗口图标
-    ('assets/setup_bg.png', 'assets'),
+    ('assets/ycode.png', 'assets'),
     ('assets/ycode.ico', 'assets'),
 ]
 # 核心程序载荷：优先单文件压缩包（onefile 启动解压快），
