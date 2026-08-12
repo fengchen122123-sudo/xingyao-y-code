@@ -1,6 +1,8 @@
 import os
 import subprocess
 import zipfile
+import ctypes
+from types import SimpleNamespace
 
 import pytest
 
@@ -145,6 +147,164 @@ def test_zip_payload_tui_install_skips_frontend(tmp_path, patched_env):
     assert not (tmp_path / "installed_zip_tui" / "Y-code.exe").exists()
 
 
+def test_zip_payload_rejects_parent_traversal(tmp_path, patched_env):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    with zipfile.ZipFile(bundle / "ycode_pkg.zip", "w") as zf:
+        zf.writestr("ycode.exe", "tui")
+        zf.writestr("Y-code.exe", "gui")
+        zf.writestr("../outside.txt", "owned")
+
+    with pytest.raises(InstallError, match="非法路径"):
+        run_install(
+            "full",
+            str(bundle),
+            InstallOptions(str(tmp_path / "installed")),
+            _startupinfo(),
+            log=lambda m: None,
+        )
+
+    assert not (tmp_path / "outside.txt").exists()
+
+
+def test_zip_payload_rejects_existing_junction_before_writing(tmp_path, monkeypatch):
+    bundle = _fake_bundle(tmp_path, as_zip=True)
+    with zipfile.ZipFile(bundle / "ycode_pkg.zip", "a") as zf:
+        zf.writestr("linked/escape.txt", "owned")
+    install_dir = tmp_path / "installed"
+    linked_dir = install_dir / "linked"
+    linked_dir.mkdir(parents=True)
+    real_isjunction = getattr(ycode_setup.os.path, "isjunction", lambda path: False)
+    monkeypatch.setattr(
+        ycode_setup.os.path,
+        "isjunction",
+        lambda path: os.path.normcase(os.path.abspath(path))
+        == os.path.normcase(os.path.abspath(linked_dir))
+        or real_isjunction(path),
+        raising=False,
+    )
+
+    with pytest.raises(InstallError, match="符号链接|目录联接"):
+        ycode_setup._copy_payload(
+            "zip",
+            str(bundle / "ycode_pkg.zip"),
+            str(install_dir),
+            tui_only=False,
+            log=lambda message: None,
+            progress=lambda value: None,
+        )
+
+    assert not (install_dir / "ycode.exe").exists()
+    assert not (linked_dir / "escape.txt").exists()
+
+
+def test_create_shortcut_escapes_powershell_single_quotes(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(
+        ycode_setup.subprocess,
+        "run",
+        lambda argv, **kwargs: captured.update(argv=argv, kwargs=kwargs),
+    )
+
+    ycode_setup.create_shortcut(
+        r"C:\Tom's Desktop\Y-code.lnk",
+        r"C:\Tom's Apps\Y-code.exe",
+        r"C:\Tom's Apps",
+        _startupinfo(),
+    )
+
+    command = captured["argv"][-1]
+    assert "Tom''s Desktop" in command
+    assert "Tom''s Apps" in command
+    assert "Tom's Apps" not in command
+
+
+@pytest.mark.parametrize("func_name", ["add_to_user_path", "add_to_system_path"])
+def test_path_registration_rejects_semicolon_in_install_dir(monkeypatch, func_name):
+    create_key_called = []
+    monkeypatch.setattr(
+        ycode_setup.winreg,
+        "CreateKey",
+        lambda *args: create_key_called.append(args),
+    )
+
+    with pytest.raises(InstallError, match="分号"):
+        getattr(ycode_setup, func_name)(r"C:\Y-code;C:\malicious")
+
+    assert create_key_called == []
+
+
+def test_relaunch_elevated_quotes_windows_arguments(monkeypatch):
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    shell32.CommandLineToArgvW.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.POINTER(ctypes.c_int),
+    ]
+    shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+    kernel32.LocalFree.restype = ctypes.c_void_p
+
+    def parse_windows_command_line(command):
+        argc = ctypes.c_int()
+        argv = shell32.CommandLineToArgvW(command, ctypes.byref(argc))
+        assert argv
+        try:
+            return [argv[index] for index in range(argc.value)]
+        finally:
+            kernel32.LocalFree(argv)
+
+    captured = {}
+    fake_shell32 = SimpleNamespace(
+        ShellExecuteW=lambda verb, action, exe, params, cwd, show: captured.update(
+            exe=exe, params=params
+        ) or 42
+    )
+    monkeypatch.setattr(ctypes.windll, "shell32", fake_shell32, raising=False)
+    monkeypatch.setattr(ycode_setup.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(ycode_setup.sys, "executable", r"C:\setup.exe")
+
+    options = InstallOptions(r'C:\Apps\quote" --cli=0 --shortcut=0', scope="machine")
+
+    assert ycode_setup.relaunch_elevated(options) is True
+    expected = [
+        "--elevated", "--machine", f"--dir={options.install_dir}",
+        "--cli=1", "--shortcut=1",
+    ]
+    parsed = parse_windows_command_line(
+        subprocess.list2cmdline(["placeholder.exe"]) + " " + captured["params"]
+    )[1:]
+    assert parsed == expected
+    elevated_options = ycode_setup._parse_elevated_args(parsed)
+    assert elevated_options == {
+        "scope": "machine",
+        "dir": options.install_dir,
+        "cli": True,
+        "shortcut": True,
+    }
+
+
+def test_seed_user_config_does_not_follow_existing_symlink(tmp_path, monkeypatch):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "config.example.json").write_text('{"safe": true}', encoding="utf-8")
+    (bundle / "system_prompt.md").write_text("safe prompt", encoding="utf-8")
+    home = tmp_path / "home"
+    ycode_dir = home / ".ycode"
+    ycode_dir.mkdir(parents=True)
+    victim = tmp_path / "victim.json"
+    victim.write_text("do not overwrite", encoding="utf-8")
+    try:
+        (ycode_dir / "config.json").symlink_to(victim)
+    except OSError:
+        pytest.skip("当前 Windows 环境不允许创建测试符号链接")
+    monkeypatch.setattr(ycode_setup.os.path, "expanduser", lambda p: str(home))
+
+    ycode_setup.seed_user_config(str(bundle), log=lambda message: None)
+
+    assert victim.read_text(encoding="utf-8") == "do not overwrite"
+
+
 # ── 安装范围（user/machine）与重装检测 ─────────────────────────────
 
 def test_full_install_machine_scope_uses_hklm_system_path_and_public_desktop(tmp_path, monkeypatch):
@@ -163,6 +323,7 @@ def test_full_install_machine_scope_uses_hklm_system_path_and_public_desktop(tmp
     monkeypatch.setattr(ycode_setup, "get_common_desktop_dir",
                         lambda: str(tmp_path / "PublicDesktop"))
     monkeypatch.setattr(ycode_setup.os.path, "expanduser", lambda p: str(tmp_path / "home"))
+    monkeypatch.setenv("ProgramFiles", str(tmp_path))
 
     install_dir = str(tmp_path / "installed_machine")
     res = run_install(
@@ -177,6 +338,22 @@ def test_full_install_machine_scope_uses_hklm_system_path_and_public_desktop(tmp
     assert calls["userpath"] == []  # machine 范围绝不写用户 PATH
     assert calls["registry"][0]["hive"] == _wr.HKEY_LOCAL_MACHINE
     assert calls["shortcut"][0][0].startswith(str(tmp_path / "PublicDesktop"))
+
+
+def test_machine_install_rejects_location_outside_program_files(tmp_path, monkeypatch):
+    bundle = _fake_bundle(tmp_path)
+    protected_root = tmp_path / "Program Files"
+    protected_root.mkdir()
+    monkeypatch.setenv("ProgramFiles", str(protected_root))
+
+    with pytest.raises(InstallError, match="Program Files"):
+        run_install(
+            "full", str(bundle),
+            InstallOptions(str(tmp_path / "attacker-writable"), scope="machine"),
+            _startupinfo(), log=lambda _message: None,
+        )
+
+    assert not (tmp_path / "attacker-writable").exists()
 
 
 def test_full_install_user_scope_writes_hkcu(tmp_path, patched_env):

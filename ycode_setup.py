@@ -22,6 +22,7 @@ Y-code 官方 Windows 安装向导（可视化 GUI 版，单一源码，靠内�
 """
 import os
 import queue
+import re
 import shutil
 import subprocess
 import sys
@@ -120,11 +121,14 @@ def get_common_desktop_dir():
 
 def create_shortcut(shortcut_path, target_path, working_dir, startupinfo):
     """用 PowerShell 的 WScript.Shell COM 对象动态生成 .lnk 快捷方式。"""
+    def _ps_single_quote(value):
+        return str(value).replace("'", "''")
+
     ps_cmd = (
         f"$WshShell = New-Object -ComObject WScript.Shell; "
-        f"$Shortcut = $WshShell.CreateShortcut('{shortcut_path}'); "
-        f"$Shortcut.TargetPath = '{target_path}'; "
-        f"$Shortcut.WorkingDirectory = '{working_dir}'; "
+        f"$Shortcut = $WshShell.CreateShortcut('{_ps_single_quote(shortcut_path)}'); "
+        f"$Shortcut.TargetPath = '{_ps_single_quote(target_path)}'; "
+        f"$Shortcut.WorkingDirectory = '{_ps_single_quote(working_dir)}'; "
         f"$Shortcut.Save();"
     )
     subprocess.run(
@@ -152,6 +156,7 @@ def broadcast_environment_change():
 
 def add_to_system_path(install_dir, log=print):
     """把安装目录加入系统 PATH（HKLM），machine 范围安装时使用，需要管理员权限。"""
+    _validate_path_entry(install_dir)
     key_path = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
     with winreg.CreateKey(winreg.HKEY_LOCAL_MACHINE, key_path) as key:
         try:
@@ -175,6 +180,7 @@ def add_to_user_path(install_dir, log=print):
     """把安装目录加入 HKCU\\Environment\\PATH，直接用 winreg 读写，保留原始值类型
     (REG_EXPAND_SZ)，不再依赖 `reg query` 的文本输出解析（旧实现在 PATH 值里
     出现多个空格、或碰巧包含子串 "PATH" 的路径分量时会解析错位）。"""
+    _validate_path_entry(install_dir)
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
         try:
             current_path, reg_type = winreg.QueryValueEx(key, "PATH")
@@ -269,14 +275,14 @@ def relaunch_elevated(options):
     args = ["--elevated"]
     if options.scope == "machine":
         args.append("--machine")
-    args.append(f'--dir="{options.install_dir}"')
+    args.append(f"--dir={options.install_dir}")
     args.append(f"--cli={1 if options.install_cli else 0}")
     args.append(f"--shortcut={1 if options.create_desktop_shortcut else 0}")
     exe = sys.executable
-    params = " ".join(args)
+    params = subprocess.list2cmdline(args)
     if not getattr(sys, "frozen", False):
         # 源码调试态：sys.executable 是 python 解释器，需要带上脚本路径
-        params = f'"{os.path.abspath(__file__)}" ' + params
+        params = subprocess.list2cmdline([os.path.abspath(__file__), *args])
     rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, params, None, 1)
     return rc > 32
 
@@ -293,22 +299,46 @@ def seed_user_config(bundle_dir, log=print):
     os.makedirs(ycode_user_dir, exist_ok=True)
 
     config_path = os.path.join(ycode_user_dir, "config.json")
-    if not os.path.exists(config_path):
-        src_config = os.path.join(bundle_dir, "config.example.json")
-        if os.path.exists(src_config):
-            shutil.copy2(src_config, config_path)
-            log(f"✔ 成功创建配置模板: {config_path}")
-        else:
-            with open(config_path, "w", encoding="utf-8") as f:
-                f.write('{"active_model_id": null, "providers": []}')
-            log(f"✔ 成功创建默认配置: {config_path}")
+    src_config = os.path.join(bundle_dir, "config.example.json")
+    if _seed_file_exclusive(
+        config_path,
+        source_path=src_config if os.path.exists(src_config) else None,
+        default_text='{"active_model_id": null, "providers": []}',
+    ):
+        log(f"✔ 成功创建配置模板: {config_path}")
 
     prompt_path = os.path.join(ycode_user_dir, "system_prompt.md")
-    if not os.path.exists(prompt_path):
-        src_prompt = os.path.join(bundle_dir, "system_prompt.md")
-        if os.path.exists(src_prompt):
-            shutil.copy2(src_prompt, prompt_path)
-            log(f"✔ 成功创建人设模板: {prompt_path}")
+    src_prompt = os.path.join(bundle_dir, "system_prompt.md")
+    if os.path.exists(src_prompt) and _seed_file_exclusive(
+        prompt_path,
+        source_path=src_prompt,
+    ):
+        log(f"✔ 成功创建人设模板: {prompt_path}")
+
+
+def _seed_file_exclusive(target_path, source_path=None, default_text=""):
+    """Create one seed file atomically without following an existing link."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        fd = os.open(target_path, flags, 0o600)
+    except FileExistsError:
+        return False
+    try:
+        with os.fdopen(fd, "wb") as destination:
+            if source_path:
+                with open(source_path, "rb") as source:
+                    shutil.copyfileobj(source, destination)
+            else:
+                destination.write(str(default_text).encode("utf-8"))
+    except BaseException:
+        try:
+            os.unlink(target_path)
+        except OSError:
+            pass
+        raise
+    return True
 
 
 # ============================================================================
@@ -317,6 +347,94 @@ def seed_user_config(bundle_dir, log=print):
 
 class InstallError(Exception):
     """致命安装错误：向导会中断并展示该消息。"""
+
+
+def _validate_path_entry(path):
+    if ";" in str(path or ""):
+        raise InstallError("安装路径不能包含分号，避免注入额外 PATH 条目。")
+
+
+def _is_within_path(path, root):
+    try:
+        candidate = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        base = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+        return os.path.commonpath([candidate, base]) == base
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _validate_install_target(path, scope):
+    install_dir = os.path.abspath(str(path or ""))
+    _validate_path_entry(install_dir)
+    if '"' in install_dir:
+        raise InstallError("安装路径不能包含双引号。")
+    drive, tail = os.path.splitdrive(install_dir)
+    if not tail.strip("\\/"):
+        raise InstallError("不能安装到磁盘根目录。")
+    if scope == "machine":
+        roots = [
+            value for value in (
+                os.environ.get("ProgramFiles"),
+                os.environ.get("ProgramFiles(x86)"),
+            ) if value
+        ]
+        if not roots or not any(
+            _is_within_path(install_dir, root)
+            and os.path.normcase(os.path.realpath(install_dir))
+            != os.path.normcase(os.path.realpath(root))
+            for root in roots
+        ):
+            raise InstallError("所有用户安装必须位于 Program Files 的子目录中。")
+    return install_dir
+
+
+def _safe_payload_path(install_dir, relative_path):
+    """Resolve an archive member and require it to stay below install_dir."""
+    rel = str(relative_path or "").replace("\\", "/")
+    if not rel or rel.startswith("/") or re.match(r"^[a-zA-Z]:", rel):
+        raise InstallError(f"安装包包含非法路径: {relative_path}")
+    parts = [part for part in rel.split("/") if part not in ("", ".")]
+    if any(part == ".." for part in parts):
+        raise InstallError(f"安装包包含非法路径: {relative_path}")
+    root = os.path.realpath(install_dir)
+    destination = os.path.realpath(os.path.join(root, *parts))
+    try:
+        inside = os.path.commonpath([root, destination]) == root
+    except ValueError:
+        inside = False
+    if not inside or destination == root:
+        raise InstallError(f"安装包包含非法路径: {relative_path}")
+    return destination
+
+
+def _is_reparse_path(path):
+    """Return whether an existing path redirects filesystem traversal."""
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction and isjunction(path))
+
+
+def _ensure_no_reparse_components(install_dir, destination):
+    """Reject symlink/junction components below the selected install root."""
+    root = os.path.abspath(install_dir)
+    parent = os.path.abspath(os.path.dirname(destination))
+    try:
+        if os.path.commonpath([root, parent]) != root:
+            raise InstallError(f"安装包目标路径越界: {destination}")
+    except ValueError as exc:
+        raise InstallError(f"安装包目标路径越界: {destination}") from exc
+
+    current = root
+    candidates = [current]
+    relative_parent = os.path.relpath(parent, root)
+    if relative_parent != ".":
+        for part in relative_parent.split(os.sep):
+            current = os.path.join(current, part)
+            candidates.append(current)
+    for candidate in candidates:
+        if os.path.lexists(candidate) and _is_reparse_path(candidate):
+            raise InstallError(f"安装路径包含符号链接或目录联接: {candidate}")
 
 
 class InstallOptions:
@@ -377,21 +495,26 @@ def _payload_names(kind, src, tui_only):
 def _copy_payload(kind, src, install_dir, tui_only, log, progress):
     """带进度回调的载荷释放（占整体进度的 0~85%）。"""
     names = _payload_names(kind, src, tui_only)
+    # 在创建任何目录/文件前完成全部成员校验，非法载荷不得留下部分安装。
+    destinations = [_safe_payload_path(install_dir, rel) for rel in names]
     total = max(1, len(names))
     os.makedirs(install_dir, exist_ok=True)
+    # Existing reparse points are rejected before the first payload byte is written.
+    for dest in destinations:
+        _ensure_no_reparse_components(install_dir, dest)
     if kind == "zip":
         import zipfile
         with zipfile.ZipFile(src) as zf:
-            for idx, rel in enumerate(names, 1):
-                dest = os.path.join(install_dir, rel.replace("/", os.sep))
+            for idx, (rel, dest) in enumerate(zip(names, destinations), 1):
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
+                _ensure_no_reparse_components(install_dir, dest)
                 with open(dest, "wb") as f:
                     f.write(zf.read(rel))
                 progress(idx / total * 85.0)
     else:
-        for idx, rel in enumerate(names, 1):
-            dest = os.path.join(install_dir, rel)
+        for idx, (rel, dest) in enumerate(zip(names, destinations), 1):
             os.makedirs(os.path.dirname(dest), exist_ok=True)
+            _ensure_no_reparse_components(install_dir, dest)
             shutil.copy2(os.path.join(src, rel), dest)
             progress(idx / total * 85.0)
     log(f"✔ 核心程序包及依赖成功释放到: {install_dir}")
@@ -402,8 +525,8 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
 
     返回汇总 dict：{"install_dir", "installed_cli", "desktop_shortcut", "merging_into_full"}。
     """
-    install_dir = options.install_dir
     scope = getattr(options, "scope", "user")
+    install_dir = _validate_install_target(options.install_dir, scope)
     payload_kind, payload_src = _open_payload(bundle_dir)
 
     tui_exe_path = os.path.join(install_dir, "ycode.exe")

@@ -5,6 +5,8 @@ import logging
 import threading
 import json
 import os
+import re
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -13,6 +15,117 @@ from mcp.client.stdio import stdio_client
 CONNECT_TIMEOUT = 10
 INITIALIZE_TIMEOUT = 10
 CALL_TOOL_TIMEOUT = 60
+
+_ALLOWED_MCP_COMMAND = re.compile(
+    r"^(?:npx(?:\.cmd|\.exe)?|node(?:\.exe)?|python(?:\d+(?:\.\d+)*)?(?:\.exe)?)$",
+    re.IGNORECASE,
+)
+_DANGEROUS_MCP_ENV_KEYS = {
+    "BASH_ENV",
+    "ENV",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "NODE_OPTIONS",
+    "PYTHONPATH",
+    "PYTHONSTARTUP",
+    "PATH",
+    "PATHEXT",
+    "COMSPEC",
+    "PYTHONHOME",
+    "NODE_PATH",
+}
+_SENSITIVE_NAME_PARTS = (
+    "api_key", "apikey", "auth", "credential", "dsn", "password",
+    "secret", "token", "conn_str", "connection_string",
+)
+_SENSITIVE_ARG_FLAGS = {
+    "--api-key", "--apikey", "--app-secret", "--appsecret", "--auth",
+    "--credential", "--dsn", "--password", "--secret", "--token",
+}
+_INHERITED_ENV_ALLOWLIST = {
+    "APPDATA", "COMSPEC", "HOME", "HOMEDRIVE", "HOMEPATH", "LANG", "LOCALAPPDATA",
+    "PATH", "PATHEXT", "PROGRAMDATA", "SYSTEMDRIVE", "SYSTEMROOT", "TEMP", "TMP",
+    "USERPROFILE", "WINDIR",
+}
+
+
+def _is_sensitive_name(name):
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(name or "").lower()).strip("_")
+    return any(part in normalized for part in _SENSITIVE_NAME_PARTS)
+
+
+def _redact_secret(value):
+    return "***" if value is not None else None
+
+
+def _redact_argument(argument):
+    text = str(argument)
+    # Authorization headers and other embedded secret shapes.
+    text = _redact_text(text)
+    # URI userinfo: scheme://user:password@host
+    text = re.sub(
+        r"(?P<prefix>[a-z][a-z0-9+.-]*://[^:/@\s]+:)[^@/\s]+@",
+        r"\g<prefix>***@",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # --secret=value / key=value forms.
+    if "=" in text:
+        key, _ = text.split("=", 1)
+        if _is_sensitive_name(key):
+            return f"{key}=***"
+    try:
+        parsed = urlsplit(text)
+        if parsed.scheme and parsed.netloc:
+            hostname = parsed.hostname or ""
+            port = f":{parsed.port}" if parsed.port else ""
+            userinfo = "***@" if parsed.username is not None else ""
+            query = []
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True):
+                query.append((key, "***" if _is_sensitive_name(key) else value))
+            text = urlunsplit((parsed.scheme, userinfo + hostname + port, parsed.path, urlencode(query), parsed.fragment))
+    except ValueError:
+        pass
+    return text
+
+
+def _redact_arguments(args):
+    redacted = []
+    hide_next = False
+    for argument in args if isinstance(args, list) else []:
+        text = str(argument)
+        if hide_next:
+            redacted.append("***")
+            hide_next = False
+            continue
+        redacted.append(_redact_argument(text))
+        hide_next = text.lower() in _SENSITIVE_ARG_FLAGS
+    return redacted
+
+
+def _redact_text(value):
+    text = str(value or "")
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer ***", text)
+    text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(@)", r"\1***\2", text)
+    text = re.sub(
+        r"(?i)(\b(?:api[_-]?key|token|secret|password|credential|auth|dsn)\s*[=:]\s*)[^\s,;]+",
+        r"\1***",
+        text,
+    )
+    return text
+
+
+def _validate_mcp_launch(command, env):
+    command_text = str(command or "").strip()
+    if command_text != os.path.basename(command_text) or "/" in command_text or "\\" in command_text:
+        return False, f"MCP 启动命令不允许包含路径: {command_text}"
+    if not _ALLOWED_MCP_COMMAND.fullmatch(command_text):
+        return False, f"MCP 启动命令不允许: {command_text}"
+    for key in (env or {}):
+        upper_key = str(key).upper()
+        if upper_key in _DANGEROUS_MCP_ENV_KEYS or upper_key.startswith("DYLD_"):
+            return False, f"MCP 环境变量不允许: {key}"
+    return True, ""
 
 
 # MCP 状态输出回调：默认写日志，由入口层（main.py / gui_bridge.py）
@@ -53,6 +166,7 @@ class MCPManager:
 
         self.config = {"mcpServers": {}}
         self._connect_lock = threading.Lock()
+        self._config_lock = threading.RLock()
         # 惰性连接标记：import 时绝不连接，首次使用时才启动
         self._connect_future = None
         self._connect_future_is_placeholder = False
@@ -63,20 +177,42 @@ class MCPManager:
         self.loop.run_forever()
 
     def _load_config(self):
-        if not os.path.exists(self.config_file):
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump({"mcpServers": {}}, f, indent=4)
+        with self._config_lock:
+            if not os.path.exists(self.config_file):
+                self.config = {"mcpServers": {}}
+                self._save_config_locked()
+            try:
+                with open(self.config_file, "r", encoding="utf-8") as f:
+                    self.config = json.load(f)
+            except Exception:
+                self.config = {"mcpServers": {}}
+
+    def _save_config_locked(self):
+        directory = os.path.dirname(os.path.abspath(self.config_file))
+        os.makedirs(directory, exist_ok=True)
+        temp_path = os.path.join(
+            directory,
+            f".{os.path.basename(self.config_file)}.{os.getpid()}.{threading.get_ident()}.tmp",
+        )
         try:
-            with open(self.config_file, "r", encoding="utf-8") as f:
-                self.config = json.load(f)
-        except Exception:
-            self.config = {"mcpServers": {}}
+            with open(temp_path, "w", encoding="utf-8") as stream:
+                json.dump(self.config, stream, indent=4, ensure_ascii=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temp_path, self.config_file)
+        finally:
+            try:
+                os.remove(temp_path)
+            except FileNotFoundError:
+                pass
 
     def _maybe_start_connection(self):
         """启动 MCP 连接或创建占位 future，不等待完成。
 
         必须在已持有 self._connect_lock 时调用。
         """
+        if self._closed:
+            return
         if self._connect_future is None:
             self._load_config()
             if self.config.get("mcpServers"):
@@ -99,7 +235,11 @@ class MCPManager:
         支持运行期配置变化：若之前是空配置占位 future，而当前 mcp.json 已
         包含 server，则重置连接标记并重新发起连接。
         """
+        if self._closed:
+            return False
         with self._connect_lock:
+            if self._closed:
+                return False
             self._load_config()
             servers_now = bool(self.config.get("mcpServers"))
             if servers_now and self._connect_future_is_placeholder:
@@ -129,7 +269,9 @@ class MCPManager:
                 if self._connect_future is future:
                     self._connect_future = None
                     self._connect_future_is_placeholder = False
-            _emit_status(f"\n[MCP] 连接过程超时或失败: {e}")
+            _emit_status(f"\n[MCP] 连接过程超时或失败: {_redact_text(e)}")
+            return False
+        return True
 
     async def _connect_server(self, name, server_config):
         stack = AsyncExitStack()
@@ -138,8 +280,11 @@ class MCPManager:
             args = server_config.get("args", [])
             env = server_config.get("env", None)
 
-            # 合并当前环境变量
-            full_env = os.environ.copy()
+            # MCP 子进程只继承非敏感运行环境；模型 API 凭据必须显式配置到该 server。
+            full_env = {
+                key: value for key, value in os.environ.items()
+                if str(key).upper() in _INHERITED_ENV_ALLOWLIST
+            }
             if env:
                 full_env.update(env)
 
@@ -190,7 +335,7 @@ class MCPManager:
                 await stack.aclose()
             except Exception:
                 pass
-            _emit_status(f"\n[MCP] 连接服务 {name} 失败: {e}")
+            _emit_status(f"\n[MCP] 连接服务 {name} 失败: {_redact_text(e)}")
 
     async def _cancel_pending_connections(self) -> None:
         """尝试取消当前事件循环中所有与 MCP 连接相关的挂起任务。
@@ -226,6 +371,8 @@ class MCPManager:
         排序返回：各 server 连接完成的先后顺序随网络波动，排序保证 tools 列表
         跨轮次逐字节稳定，这是 DeepSeek/Kimi 前缀缓存命中的前提。
         """
+        if self._closed:
+            return []
         with self._connect_lock:
             self._maybe_start_connection()
         return sorted(
@@ -257,11 +404,12 @@ class MCPManager:
                     text_outputs.append(str(content))
             return "\n".join(text_outputs)
         except Exception as e:
-            return f"🚨 MCP 工具调用异常: {str(e)}"
+            return f"🚨 MCP 工具调用异常: {_redact_text(e)}"
 
     def call_tool_sync(self, tool_name, arguments):
         """提供给同步框架调用的阻塞方法"""
-        self._ensure_connected()
+        if not self._ensure_connected():
+            return "MCP 管理器已关闭或连接失败"
         future = asyncio.run_coroutine_threadsafe(self._call_tool_async(tool_name, arguments), self.loop)
         return future.result(timeout=CALL_TOOL_TIMEOUT + 5)
 
@@ -288,7 +436,7 @@ class MCPManager:
                     future = asyncio.run_coroutine_threadsafe(self._close_all(), self.loop)
                     future.result(timeout=10)
             except Exception as e:
-                _emit_status(f"\n[MCP] 重连-关闭旧连接失败（继续重置）: {e}")
+                _emit_status(f"\n[MCP] 重连-关闭旧连接失败（继续重置）: {_redact_text(e)}")
             # 2) 清空状态，重置占位标记，下次访问会重新读 mcp.json 并发起连接
             with self._connect_lock:
                 self.tool_schemas = []
@@ -300,7 +448,7 @@ class MCPManager:
             self._ensure_connected()
             return True, "已清空旧连接并重新发起连接，下次调用 MCP 工具时生效"
         except Exception as e:
-            return False, f"重连失败: {e}"
+            return False, f"重连失败: {_redact_text(e)}"
 
     def set_server_enabled(self, name, enabled):
         """启用/禁用某个 MCP server，并立即重连生效。
@@ -314,17 +462,15 @@ class MCPManager:
             return False, "MCP 管理器已关闭（进程退出中）"
         try:
             # 1) 重新读盘拿最新配置
-            self._load_config()
-            servers = self.config.get("mcpServers", {})
-            if name not in servers:
-                return False, f"未找到 MCP 服务: {name}（可用 /mcp status 查看已配置项）"
-            if not isinstance(servers[name], dict):
-                return False, f"服务 {name} 的配置格式异常（应为对象）"
-            # 2) 更新 enabled 字段
-            servers[name]["enabled"] = bool(enabled)
-            # 3) 写回 mcp.json（保持缩进与编码）
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=4, ensure_ascii=False)
+            with self._config_lock:
+                self._load_config()
+                servers = self.config.get("mcpServers", {})
+                if name not in servers:
+                    return False, f"未找到 MCP 服务: {name}（可用 /mcp status 查看已配置项）"
+                if not isinstance(servers[name], dict):
+                    return False, f"服务 {name} 的配置格式异常（应为对象）"
+                servers[name]["enabled"] = bool(enabled)
+                self._save_config_locked()
             # 4) 触发重连让改动立即生效
             ok, msg = self.reconnect()
             if not ok:
@@ -332,7 +478,7 @@ class MCPManager:
             action = "启用" if enabled else "禁用"
             return True, f"已{action}服务 {name}，并重新发起连接"
         except Exception as e:
-            return False, f"更新失败: {e}"
+            return False, f"更新失败: {_redact_text(e)}"
 
     def add_server(self, name, command, args, env=None, enabled=True):
         """新增一个 MCP server 配置，并立即重连生效。
@@ -356,26 +502,29 @@ class MCPManager:
             return False, "args 必须是数组（如 [\"-y\", \"firecrawl-mcp\"]）"
         if env is not None and not isinstance(env, dict):
             return False, "env 必须是字典或 null"
+        launch_ok, launch_error = _validate_mcp_launch(command, env)
+        if not launch_ok:
+            return False, launch_error
         try:
-            self._load_config()
-            servers = self.config.setdefault("mcpServers", {})
-            if name in servers:
-                return False, f"已存在同名服务: {name}（如需更新请先 /mcp remove {name}）"
-            servers[name] = {
-                "enabled": bool(enabled),
-                "command": command,
-                "args": args,
-            }
-            if env:
-                servers[name]["env"] = env
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=4, ensure_ascii=False)
+            with self._config_lock:
+                self._load_config()
+                servers = self.config.setdefault("mcpServers", {})
+                if name in servers:
+                    return False, f"已存在同名服务: {name}（如需更新请先 /mcp remove {name}）"
+                servers[name] = {
+                    "enabled": bool(enabled),
+                    "command": command,
+                    "args": args,
+                }
+                if env:
+                    servers[name]["env"] = env
+                self._save_config_locked()
             ok, msg = self.reconnect()
             if not ok:
                 return True, f"已写入 {name} 配置，但重连失败: {msg}"
             return True, f"已新增服务 {name}（command={command}），并重新发起连接"
         except Exception as e:
-            return False, f"新增失败: {e}"
+            return False, f"新增失败: {_redact_text(e)}"
 
     def remove_server(self, name):
         """删除一个 MCP server 配置，并立即重连生效。
@@ -388,19 +537,19 @@ class MCPManager:
         if not name:
             return False, "server 名称不能为空"
         try:
-            self._load_config()
-            servers = self.config.get("mcpServers", {})
-            if name not in servers:
-                return False, f"未找到 MCP 服务: {name}"
-            del servers[name]
-            with open(self.config_file, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, indent=4, ensure_ascii=False)
+            with self._config_lock:
+                self._load_config()
+                servers = self.config.get("mcpServers", {})
+                if name not in servers:
+                    return False, f"未找到 MCP 服务: {name}"
+                del servers[name]
+                self._save_config_locked()
             ok, msg = self.reconnect()
             if not ok:
                 return True, f"已删除 {name}，但重连失败: {msg}"
             return True, f"已删除服务 {name}，并重新发起连接"
         except Exception as e:
-            return False, f"删除失败: {e}"
+            return False, f"删除失败: {_redact_text(e)}"
 
     def list_servers(self):
         """返回所有 MCP server 配置的 JSON 字符串（供 AI 工具读取）。
@@ -409,8 +558,9 @@ class MCPManager:
         （前 4 位 + **** + 后 4 位），避免敏感信息泄露给 LLM。
         """
         try:
-            self._load_config()
-            servers = self.config.get("mcpServers", {})
+            with self._config_lock:
+                self._load_config()
+                servers = dict(self.config.get("mcpServers", {}))
             result = []
             for name, conf in servers.items():
                 if not isinstance(conf, dict):
@@ -419,39 +569,42 @@ class MCPManager:
                     "name": name,
                     "enabled": conf.get("enabled", True) is not False,
                     "command": conf.get("command", ""),
-                    "args": conf.get("args", []),
+                    "args": _redact_arguments(conf.get("args", [])),
                     "connected": name in self.servers,
                 }
-                # env 中的 API Key 做掩码处理
+                # MCP 配置返回给模型时，环境变量值一律隐藏。调用方无需读取明文。
                 env = conf.get("env")
                 if env:
-                    masked = {}
-                    for k, v in env.items():
-                        if isinstance(v, str) and len(v) > 12 and ("key" in k.lower() or "token" in k.lower() or "secret" in k.lower()):
-                            masked[k] = v[:4] + "****" + v[-4:]
-                        else:
-                            masked[k] = v
-                    item["env"] = masked
+                    item["env"] = {key: _redact_secret(value) for key, value in env.items()}
                 else:
                     item["env"] = None
                 result.append(item)
             return json.dumps(result, ensure_ascii=False, indent=2)
         except Exception as e:
-            return json.dumps({"error": str(e)}, ensure_ascii=False)
+            return json.dumps({"error": _redact_text(e)}, ensure_ascii=False)
 
     def close(self):
-        """统一清理：关闭所有 server 子进程与 AsyncExitStack（进程退出时由 atexit 调用）。
-
-        注意：close 不停止后台 event loop——该 loop 跑在 daemon 线程上随进程退出；
-        运行期 stop loop 反而会让后续惰性重连不可用。
-        """
-        if self._closed:
-            return
-        self._closed = True
+        """Close servers and stop/join the private event-loop thread."""
+        with self._connect_lock:
+            if self._closed:
+                return
+            self._closed = True
+            future = self._connect_future
         try:
-            if self._connect_future is not None and not self.loop.is_closed():
-                future = asyncio.run_coroutine_threadsafe(self._close_all(), self.loop)
-                future.result(timeout=5)
+            if future is not None and not future.done():
+                future.cancel()
+            if not self.loop.is_closed():
+                close_future = asyncio.run_coroutine_threadsafe(self._close_all(), self.loop)
+                close_future.result(timeout=5)
+        except Exception:
+            pass
+        try:
+            if not self.loop.is_closed():
+                self.loop.call_soon_threadsafe(self.loop.stop)
+            if threading.current_thread() is not self.thread:
+                self.thread.join(timeout=2)
+            if not self.thread.is_alive() and not self.loop.is_closed():
+                self.loop.close()
         except Exception:
             pass
 
