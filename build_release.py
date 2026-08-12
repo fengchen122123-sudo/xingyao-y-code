@@ -8,8 +8,10 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
       ycode.exe                  TUI 控制台版 (console=True)
       _internal/                 两者共享的运行时依赖与数据文件
   dist/ycode_uninstall.exe     独立卸载向导
-  dist/ycode_tui_setup.exe     独立 TUI 安装向导（供主安装包内嵌，也可单独分发）
-  dist/ycode_setup.exe         主安装向导（默认装 GUI，可选附带装 TUI）
+  dist/ycode_tui_setup_v{版本}.exe  独立 TUI 安装向导（供主安装包内嵌，也可单独分发）
+  dist/ycode_setup_v{版本}.exe      主安装向导（默认装 GUI，可选附带装 TUI）
+  （两个安装向导文件名带版本号，便于多渠道分发时区分新旧；内嵌进主安装包的
+    tui/ycode_tui_setup.exe 仍用固定名，安装引擎按固定名查找。）
 
 用法：
   venv\\Scripts\\python build_release.py                   完整构建
@@ -19,6 +21,7 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
   venv\\Scripts\\python build_release.py --setup-only       只重建两个安装向导（复用现有载荷）
 """
 import argparse
+import glob
 import os
 import re
 import shutil
@@ -48,12 +51,12 @@ def parse_args():
     )
     parser.add_argument(
         "--tui-only", action="store_true",
-        help="只构建 TUI 相关产物 (dist/ycode、ycode_uninstall.exe、ycode_tui_setup.exe)，"
-             "跳过体积较大的主安装包 ycode_setup.exe。",
+        help="只构建 TUI 相关产物 (dist/ycode、ycode_uninstall.exe、ycode_tui_setup_v*.exe)，"
+             "跳过体积较大的主安装包 ycode_setup_v*.exe。",
     )
     parser.add_argument(
         "--setup-only", action="store_true",
-        help="只重建两个安装向导 (ycode_setup.exe / ycode_tui_setup.exe)：复用现有 dist/ycode "
+        help="只重建两个安装向导 (ycode_setup_v*.exe / ycode_tui_setup_v*.exe)：复用现有 dist/ycode "
              "载荷与 dist/ycode_uninstall.exe，适用于仅改动 ycode_setup.py 后的快速重建。",
     )
     return parser.parse_args()
@@ -323,19 +326,53 @@ def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_
 
 
 # ============================================================================
+# 步骤 4.5：安装包重命名为带版本号的最终分发名
+# ============================================================================
+
+def versioned_setup_name(base, version):
+    """安装包最终分发文件名（不含扩展名）：ycode_setup_v1.1.48 样式。"""
+    return f"{base}_v{version}"
+
+
+def step4b_rename_setups(project_dir, version, tui_only):
+    """把固定名构建产物重命名为带版本号的分发名，并清理上一版本的同名旧产物。
+
+    构建期仍用固定名（ycode_setup / ycode_tui_setup）：主安装包内嵌的
+    tui/ycode_tui_setup.exe 由安装引擎按固定名查找，不能带版本号；最终落到
+    dist/ 供分发的文件才改成带版本号的名字。"""
+    print("\n[步骤 4.5/5] 安装包重命名为带版本号的分发名...")
+    bases = ["ycode_tui_setup"] if tui_only else ["ycode_tui_setup", "ycode_setup"]
+    renamed = {}
+    for base in bases:
+        src = os.path.join(project_dir, "dist", f"{base}.exe")
+        if not os.path.exists(src):
+            print(f"❌ 未找到待重命名产物: {src}")
+            sys.exit(1)
+        # 清理历史版本留下的同名旧产物，避免 dist/ 里堆叠多个版本难以分辨
+        for old in glob.glob(os.path.join(project_dir, "dist", f"{base}_v*.exe")):
+            os.remove(old)
+        dst = os.path.join(project_dir, "dist", f"{versioned_setup_name(base, version)}.exe")
+        os.replace(src, dst)
+        renamed[base] = dst
+        print(f"✔ {base}.exe -> {os.path.basename(dst)}")
+    return renamed
+
+
+# ============================================================================
 # 步骤 5：汇总校验
 # ============================================================================
 
-def step5_summary(project_dir, tui_only):
+def step5_summary(project_dir, tui_only, version):
     print("\n[步骤 5/5] 校验构建产物...")
     rows = [
         (os.path.join("dist", "ycode", "Y-code.exe"), "GUI 主程序 (窗口版)"),
         (os.path.join("dist", "ycode", "ycode.exe"), "TUI 主程序 (控制台版)"),
         (os.path.join("dist", "ycode_uninstall.exe"), "卸载程序"),
-        (os.path.join("dist", "ycode_tui_setup.exe"), "TUI 独立安装包"),
+        (os.path.join("dist", f"{versioned_setup_name('ycode_tui_setup', version)}.exe"), "TUI 独立安装包"),
     ]
     if not tui_only:
-        rows.append((os.path.join("dist", "ycode_setup.exe"), "主安装包 (GUI + 可选 TUI)"))
+        rows.append((os.path.join("dist", f"{versioned_setup_name('ycode_setup', version)}.exe"),
+                     "主安装包 (GUI + 可选 TUI)"))
 
     print("\n" + "=" * 64)
     print("📦 构建产物一览")
@@ -356,9 +393,10 @@ def step5_summary(project_dir, tui_only):
 
     print("🎉 恭喜！发布包编译圆满成功！")
     if tui_only:
-        print("ℹ 已指定 --tui-only，主安装包 ycode_setup.exe 未构建（如需要请去掉该参数重新运行）。")
+        print("ℹ 已指定 --tui-only，主安装包未构建（如需要请去掉该参数重新运行）。")
     else:
-        print(f"👉 您的 Windows 双击主安装包位于: {os.path.join(project_dir, 'dist', 'ycode_setup.exe')}")
+        print(f"👉 您的 Windows 双击主安装包位于: "
+              f"{os.path.join(project_dir, 'dist', versioned_setup_name('ycode_setup', version) + '.exe')}")
     print("=" * 64)
 
 
@@ -399,7 +437,9 @@ def build():
     if not args.tui_only:
         step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, tui_setup_exe)
 
-    step5_summary(project_dir, args.tui_only)
+    version = read_project_version(project_dir)
+    step4b_rename_setups(project_dir, version, args.tui_only)
+    step5_summary(project_dir, args.tui_only, version)
 
 
 if __name__ == "__main__":
