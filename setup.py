@@ -27,6 +27,9 @@ setup(
         'mcp>=1.0.0',
         'psutil>=5.9.0',
         'pillow>=10.0.0',
+        'pywebview>=6.0.0',
+        'pystray>=0.19.5',
+        'keyring>=25.0.0; sys_platform != "win32"',
     ],
     entry_points={
         'console_scripts': [

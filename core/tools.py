@@ -465,6 +465,10 @@ def execute_command(
     _execution_result: _CommandExecutionResult | None = None,
 ):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
+    from core.command_policy import is_dangerous_command
+
+    if is_dangerous_command(command):
+        return "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
     try:
         timeout_seconds = int(timeout_seconds)
     except (TypeError, ValueError):
@@ -520,6 +524,7 @@ def execute_command(
             env=env,
             # GUI（无控制台）下避免系统为子进程分配新控制台窗口
             creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            start_new_session=os.name != "nt",
         )
         start_time = time.time()
         stdout_raw = b""
@@ -2358,6 +2363,25 @@ class SubagentManager:
     def snapshot(self) -> list[SubagentTaskSnapshot]:
         with self._lock:
             return [self._snapshot(task) for task in self._tasks.values()]
+
+    def shutdown(self, timeout: float = 5.0) -> None:
+        """Cooperatively cancel and bounded-wait all managed subagent threads."""
+        self.set_on_terminal(None)
+        with self._lock:
+            task_ids = [
+                task.task_id for task in self._tasks.values()
+                if task.status not in _SUBAGENT_TERMINAL_STATUSES
+            ]
+        for task_id in task_ids:
+            self.cancel(task_id, "application exiting")
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        current = threading.current_thread()
+        with self._lock:
+            threads = [task.thread for task in self._tasks.values() if task.thread is not None]
+        for thread in threads:
+            if thread is current or not thread.is_alive():
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
     def drain_notifications(self, parent_session: str) -> list[str]:
         with self._lock:

@@ -239,20 +239,40 @@ def relaunch_elevated_uninstall():
 
 
 def schedule_self_destruct(install_dir):
-    """安排卸载程序退出后的自销毁：删除 ycode_uninstall.exe 自身与安装目录残留。
+    """安排卸载程序退出后的自销毁：删除自身并移除已经为空的安装目录。
 
     用 Popen 的 cwd 参数把子进程工作目录显式设成与 install_dir 无关的绝对路径
     （%TEMP%，找不到则退回 C:\\），避免 cmd.exe 以 install_dir 为 cwd 导致
     rmdir 因“目录正被使用”而失败。CREATE_NO_WINDOW 避免黑窗闪现。
     """
-    self_exe = sys.executable
+    import tempfile
+
+    self_exe = os.path.abspath(sys.executable)
+    install_dir = os.path.abspath(install_dir)
+    if os.path.dirname(self_exe) != install_dir:
+        raise RuntimeError("卸载器不在待清理的安装目录中，拒绝自销毁")
     safe_cwd = os.environ.get("TEMP") or os.environ.get("TMP") or "C:\\"
-    cmd_self_delete = (
-        f'choice /t 1 /d y /n > nul & '
-        f'del /f /q "{self_exe}" & '
-        f'rmdir /q /s "{install_dir}"'
+    quote = lambda value: "'" + str(value).replace("'", "''") + "'"
+    script = (
+        "$ErrorActionPreference = 'SilentlyContinue'\n"
+        f"$targetExe = {quote(self_exe)}\n"
+        f"$installDir = {quote(install_dir)}\n"
+        "for ($i = 0; $i -lt 40 -and (Test-Path -LiteralPath $targetExe); $i++) {\n"
+        "  Start-Sleep -Milliseconds 250\n"
+        "  Remove-Item -LiteralPath $targetExe -Force\n"
+        "}\n"
+        "if (-not (Test-Path -LiteralPath $targetExe)) {\n"
+        "  [System.IO.Directory]::Delete($installDir, $false)\n"
+        "}\n"
     )
-    subprocess.Popen(cmd_self_delete, shell=True, cwd=safe_cwd,
+    fd, script_path = tempfile.mkstemp(prefix="ycode-uninstall-", suffix=".ps1")
+    with os.fdopen(fd, "w", encoding="utf-8-sig", newline="\r\n") as stream:
+        stream.write(script)
+    try:
+        ctypes.windll.kernel32.MoveFileExW(script_path, None, 0x4)
+    except Exception:
+        pass
+    subprocess.Popen(["powershell.exe", "-NoProfile", "-NonInteractive", "-File", script_path], shell=False, cwd=safe_cwd,
                      creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
 
 
@@ -656,7 +676,6 @@ def main():
     # 卸载正常完成后退出向导 → 触发自销毁（删除卸载程序自身与安装目录残留）
     if wizard.uninstall_done and getattr(sys, "frozen", False):
         schedule_self_destruct(install_dir)
-        time.sleep(1)
 
 
 if __name__ == "__main__":
