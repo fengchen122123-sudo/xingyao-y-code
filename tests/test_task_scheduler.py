@@ -531,3 +531,16 @@ def test_verification_runs_in_process_cwd_not_item_file_dir(monkeypatch):
     assert scheduler.complete("impl", "结果") is True
     assert captured.get("cwd") is None
     assert plan.snapshot()[0]["status"] == "completed"
+
+
+def test_verification_rejects_catastrophic_commands_before_spawn(monkeypatch):
+    monkeypatch.setattr(
+        "core.task_scheduler.subprocess.Popen",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+    scheduler = TaskScheduler(PlanManager())
+
+    passed, detail = scheduler._run_verification("rm -rf / && echo done")
+
+    assert passed is False
+    assert "危险命令" in detail

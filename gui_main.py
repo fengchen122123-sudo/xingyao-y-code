@@ -9,6 +9,7 @@ import json
 import socket
 import webview
 from gui_bridge import ApiBridge
+from core.gui_lifecycle import ApplicationLifecycle
 
 def is_port_open(host="127.0.0.1", port=5173) -> bool:
     """检查 Vite 开发服务器端口 5173 是否处于打开监听状态"""
@@ -28,8 +29,8 @@ def _is_ycode_vite_dev_server(url: str = "http://127.0.0.1:5173", timeout: float
         with urlopen(url, timeout=timeout) as resp:
             # 只读取前 8KB，避免大响应拖慢启动
             body = resp.read(8192).decode("utf-8", errors="ignore").lower()
-        # Vite 开发服务器的 index.html 通常包含 ycode/y-code 或 vite 特征
-        return "ycode" in body or "y-code" in body or "vite" in body
+        # 使用应用专属标记；通用的 /@vite/client 不能证明页面属于 Y-CODE。
+        return '<meta name="application-name" content="y-code"' in body
     except Exception:
         return False
 
@@ -149,6 +150,13 @@ def main():
     )
 
     api.set_window(window)
+    lifecycle = ApplicationLifecycle(
+        window,
+        api.shutdown,
+        icon_path=os.path.join(_get_base_dir(), "assets", "ycode.ico"),
+    )
+    lifecycle.start_tray()
+    window.events.closing += lifecycle.on_closing
 
     # pywebview 6.2+ 的拖拽文件完整路径注入：WebView2 只在
     # _dnd_state['num_listeners'] > 0（即通过 dom.on('drop') 注册过）时才
@@ -193,7 +201,10 @@ def main():
     threading.Thread(target=_register_dnd, daemon=True, name="gui-dnd-register").start()
 
     # 启动 WebView 消息主循环（默认关闭开发者工具，YCODE_GUI_DEBUG=1 时打开）
-    webview.start(debug=_debug_enabled())
+    try:
+        webview.start(debug=_debug_enabled())
+    finally:
+        lifecycle.finalize()
 
 if __name__ == "__main__":
     main()

@@ -14,6 +14,11 @@ ACTIVE_SKILLS_FILE = config.ACTIVE_SKILLS_FILE
 # 激活技能文件写锁，防止并发写互相截断
 _file_lock = threading.Lock()
 
+# Skill 元数据会进入稳定 system prompt；仅允许单行、有限长度的数据。
+SKILL_NAME_MAX_CHARS = 120
+SKILL_DESCRIPTION_MAX_CHARS = 500
+SKILL_TRIGGERS_MAX_CHARS = 240
+
 
 # ------------------------------------------------------------------
 # 内置技能：随安装包发布（PyInstaller datas 打包仓库 skills/ 目录），
@@ -326,6 +331,7 @@ def scan_all_skills():
     for base_dir in get_skill_dirs():
         if not os.path.exists(base_dir):
             continue
+        base_real = os.path.normcase(os.path.realpath(os.path.abspath(base_dir)))
 
         # 只遍历 base_dir 的直接子条目（不递归）
         try:
@@ -338,12 +344,19 @@ def scan_all_skills():
             skill_dir = os.path.join(base_dir, entry)
             if not os.path.isdir(skill_dir):
                 continue
+            skill_real = os.path.normcase(os.path.realpath(os.path.abspath(skill_dir)))
+            if not skill_real.startswith(base_real + os.sep):
+                _log_warning("跳过扫描根外的技能目录: %s", skill_dir)
+                continue
             # 优先匹配 SKILL.md，其次 skill.md（大小写兼容）
             for fname in ("SKILL.md", "skill.md"):
                 candidate = os.path.join(skill_dir, fname)
                 if os.path.isfile(candidate):
-                    file_path = os.path.abspath(candidate)
+                    file_path = os.path.realpath(os.path.abspath(candidate))
                     norm_id = os.path.normcase(file_path)
+                    if not norm_id.startswith(skill_real + os.sep):
+                        _log_warning("跳过技能包外的 SKILL.md: %s", candidate)
+                        break
                     if norm_id in seen_ids:
                         break
                     seen_ids.add(norm_id)
@@ -396,6 +409,12 @@ def _contains_cjk(text):
     return any('\u4e00' <= ch <= '\u9fff' for ch in (text or ""))
 
 
+def _bounded_skill_metadata(value, limit):
+    """Flatten controls/newlines so metadata cannot forge catalog structure."""
+    text = re.sub(r"[\x00-\x1f\x7f]+", " ", str(value or ""))
+    return " ".join(text.split())[:limit]
+
+
 def get_active_skills_catalog():
     """Return enabled skill metadata without eagerly injecting skill bodies."""
     active_ids = set(get_active_skill_ids())
@@ -417,13 +436,19 @@ def get_active_skills_catalog():
         key=lambda item: (item["name"].lower(), item["id"]),
     ):
         # 中文描述本身含触发语义，无需追加；英文描述追加极简中文触发词
-        hint = skill.get("triggers") or ""
-        if not hint and not _contains_cjk(skill["description"]):
+        name = _bounded_skill_metadata(skill.get("name"), SKILL_NAME_MAX_CHARS)
+        description = _bounded_skill_metadata(
+            skill.get("description"), SKILL_DESCRIPTION_MAX_CHARS
+        )
+        hint = _bounded_skill_metadata(
+            skill.get("triggers"), SKILL_TRIGGERS_MAX_CHARS
+        )
+        if not hint and not _contains_cjk(description):
             dir_name = os.path.basename(os.path.dirname(skill["id"]))
             hint = _TRIGGER_HINTS.get(dir_name, "")
         suffix = f"（触发:{hint}）" if hint else ""
         lines.append(
-            f'- {skill["name"]}: {skill["description"]}{suffix} | {skill["id"]}'
+            f'- {name}: {description}{suffix} | {skill["id"]}'
         )
     return "\n".join(lines)
 

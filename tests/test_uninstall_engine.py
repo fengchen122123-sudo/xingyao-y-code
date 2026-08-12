@@ -163,3 +163,25 @@ def test_detect_scope_fallback_by_location(tmp_path, monkeypatch):
     user_dir = str(tmp_path / "Users" / "someone" / "Y-code")
     assert detect_scope_for_install(pf_dir) == "machine"
     assert detect_scope_for_install(user_dir) == "user"
+
+
+def test_self_destruct_never_recursively_deletes_install_dir(tmp_path, monkeypatch):
+    install_dir = str(tmp_path / "Y-code")
+    captured = {}
+    monkeypatch.setattr(ycode_uninstall.sys, "executable", os.path.join(install_dir, "ycode_uninstall.exe"))
+    monkeypatch.setattr(
+        ycode_uninstall.subprocess,
+        "Popen",
+        lambda command, **kwargs: captured.update(command=command, kwargs=kwargs),
+    )
+
+    ycode_uninstall.schedule_self_destruct(install_dir)
+
+    argv = captured["command"]
+    assert argv[:4] == ["powershell.exe", "-NoProfile", "-NonInteractive", "-File"]
+    assert captured["kwargs"]["shell"] is False
+    script = open(argv[-1], "r", encoding="utf-8-sig").read()
+    assert "Directory]::Delete($installDir, $false)" in script
+    assert "$true" not in script
+    assert "ycode_uninstall.exe" in script
+    os.unlink(argv[-1])

@@ -6,7 +6,7 @@
 用法：
 - export_session_markdown(session_name): 导出为 Markdown
 - export_session_html(session_name): 导出为 HTML（含样式）
-- export_session_json(session_name): 导出为原始 JSON
+- export_session_json(session_name): 导出为默认脱敏 JSON
 
 与 OpenCode 区别：
 - 不做服务端分享链接（Y-code 是本地工具）
@@ -16,10 +16,31 @@
 import datetime
 import html
 import json
+import re
 import os
 from pathlib import Path
 
 import core.app_context as app_context
+
+
+def _redact_export_text(value):
+    text = str(value or "")
+    try:
+        from core.model_manager import load_config
+        for provider in load_config().get("providers", []):
+            secret = str(provider.get("api_key") or "")
+            if secret:
+                text = text.replace(secret, "***")
+    except Exception:
+        pass
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"',;]+", "Bearer ***", text)
+    text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(@)", r"\1***\2", text)
+    text = re.sub(
+        r"(?i)(\b(?:api[_-]?key|token|secret|password|passwd|auth)\s*[=:]\s*)[^\s,;]+",
+        r"\1***",
+        text,
+    )
+    return re.sub(r"\b(?:sk|ghp|glpat)-[A-Za-z0-9_.-]{8,}\b", "***", text)
 
 
 def _escape_html(text):
@@ -61,7 +82,7 @@ def _format_message_markdown(msg):
     if len(content) > 5000:
         content = content[:5000] + '\n... (内容已截断，共 ' + str(len(content)) + ' 字符)'
 
-    return f"### {role_display}\n\n{content}\n"
+    return f"### {role_display}\n\n{_redact_export_text(content)}\n"
 
 
 def export_session_markdown(session_name, manager=None, output_path=None):
@@ -168,6 +189,7 @@ def export_session_html(session_name, manager=None, output_path=None):
             'tool': '工具结果',
         }.get(role, role)
 
+        content = _redact_export_text(content)
         messages_html.append(f"""
         <div class="message {role_class}">
             <div class="role">{_escape_html(role_display)}</div>
@@ -218,7 +240,7 @@ def export_session_html(session_name, manager=None, output_path=None):
 
 
 def export_session_json(session_name, manager=None, output_path=None):
-    """导出会话为原始 JSON 文件。"""
+    """导出可分享 JSON；默认移除推理并脱敏常见凭据。"""
     if manager is None:
         # 未显式传入时回落到运行时上下文（TUI / GUI 启动时都会注册）
         manager = app_context.get_manager()
@@ -229,12 +251,20 @@ def export_session_json(session_name, manager=None, output_path=None):
     if not history:
         return f"🚨 会话 {session_name!r} 没有历史记录"
 
+    messages = []
+    for message in history:
+        if message.get('role') == 'system':
+            continue
+        cleaned = dict(message)
+        cleaned.pop('reasoning_content', None)
+        messages.append(cleaned)
     json_content = json.dumps({
         'session_name': session_name,
         'exported_at': datetime.datetime.now().isoformat(),
         'message_count': len(history),
-        'messages': [m for m in history if m.get('role') != 'system'],
+        'messages': messages,
     }, ensure_ascii=False, indent=2)
+    json_content = _redact_export_text(json_content)
 
     if output_path is None:
         export_dir = Path.home() / '.ycode' / 'exports'
