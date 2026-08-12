@@ -254,9 +254,16 @@ def parse_user_input(text):
                 truncated = len(raw) > MAX_TEXT_BYTES
                 raw = raw[:MAX_TEXT_BYTES]
 
-                # 二进制非图片文件：不尝试兜底解码，直接提示跳过
+                # 二进制非图片文件：无法直接内联内容，但把文件路径告知模型，
+                # 由模型自行用工具（Python 库/命令行）解析，而不是静默跳过
                 if _looks_binary(raw):
-                    attached_msgs.append(f"⚠️ 检测到二进制文件，已跳过: {os.path.basename(file_path)}")
+                    text_content += (
+                        f"\n\n[附带文件: {os.path.basename(file_path)}]\n"
+                        f"路径: {os.path.abspath(file_path)}\n"
+                        "（该文件为二进制格式（如 PDF/Word/Excel/zip），无法直接内联内容。"
+                        "如需读取内容，请使用可用工具（如运行 Python 脚本调用相应解析库）解析该文件。）\n"
+                    )
+                    attached_msgs.append(f"📎 已附加文件路径（二进制，模型可用工具读取）: {os.path.basename(file_path)}")
                     continue
 
                 try:

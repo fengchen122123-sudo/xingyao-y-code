@@ -7,7 +7,7 @@
       </div>
     </div>
 
-    <div class="kimi-card">
+    <div class="kimi-card" ref="kimiCardRef" :class="{ 'drop-hover': dragging }">
       <AttachmentChips :items="attachments" @remove="removeAttachment" />
       <!-- / 斜杠命令 与 @ 文件引用的自动补全面板 -->
       <InputSuggest
@@ -197,8 +197,12 @@ function togglePermDropdown() {
   showPermDropdown.value = !showPermDropdown.value;
 }
 
-const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste } = useAttachments();
+const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
+
+// 输入卡片容器：拖拽文件进入时高亮提示，drop 由原生事件桥（pywebview）提供完整路径
+const kimiCardRef = ref<HTMLElement | null>(null);
+onMounted(() => { if (kimiCardRef.value) bindDrop(kimiCardRef.value); });
 
 onUnmounted(() => clearSuggest());
 
@@ -210,6 +214,11 @@ function handleSend() {
   if (store.currentSessionRunning) return;
   // 补全面板打开时由 onKeydown 拦截，不会走到这里
   const text = inputVal.value;
+  // 拖拽的附件还在等路径时不允许发送，避免把占位的假路径发给后端
+  if (attachments.value.some(a => a.loading)) {
+    store.showToast('附件路径加载中，请稍候…', 'warn');
+    return;
+  }
   const paths = attachments.value.map(a => a.path);
   if (!text.trim() && !paths.length) return;
   inputVal.value = '';

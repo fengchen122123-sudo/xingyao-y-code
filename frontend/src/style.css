@@ -191,6 +191,12 @@ button {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
+.kimi-card.drop-hover {
+  border-color: var(--accent);
+  border-style: dashed;
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
 .kimi-card textarea {
   width: 100%;
   border: none;

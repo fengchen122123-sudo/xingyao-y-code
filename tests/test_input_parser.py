@@ -49,15 +49,16 @@ def test_forward_slash_absolute_path_is_extracted(tmp_path):
     assert "forward-data" in content
 
 
-def test_binary_file_is_skipped(tmp_path, monkeypatch):
-    """含 NUL 字节的二进制文件直接跳过并提示"""
+def test_binary_file_path_is_attached(tmp_path, monkeypatch):
+    """二进制文件无法内联内容，但路径会告知模型，由模型用工具解析"""
     monkeypatch.chdir(tmp_path)
     (tmp_path / "bin.dat").write_bytes(b"\x00\x01\x02binary")
 
     content, msgs = parse_user_input("@bin.dat")
 
     assert any("二进制" in m for m in msgs)
-    assert "binary" not in content
+    assert "bin.dat" in content  # 路径已告知模型
+    assert "```" not in content  # 原始字节不会被内联成代码块
 
 
 def test_oversized_image_is_skipped(tmp_path, monkeypatch):

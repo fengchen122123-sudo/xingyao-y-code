@@ -5,6 +5,7 @@ Y-CODE 现代原生 GUI 窗口启动入口
 """
 import os
 import sys
+import json
 import socket
 import webview
 from gui_bridge import ApiBridge
@@ -148,6 +149,48 @@ def main():
     )
 
     api.set_window(window)
+
+    # pywebview 6.2+ 的拖拽文件完整路径注入：WebView2 只在
+    # _dnd_state['num_listeners'] > 0（即通过 dom.on('drop') 注册过）时才
+    # 放行系统层拖拽事件。前端原生 addEventListener 不会增加计数，
+    # 导致 pywebviewFullPath 从未注入。
+    def _register_dnd():
+        try:
+            window.events.loaded.wait(timeout=10)
+            body = window.dom.get_element('body')
+            if not body:
+                return
+
+            def _on_body_drop(event):
+                # 事件 dataTransfer.files 已带 pywebviewFullPath（pywebview 注入，
+                # 注意：该字段只注入到 Python 侧的事件字典里，JS 侧 File 对象拿不到）
+                files = event.get('dataTransfer', {}).get('files', [])
+                items = [
+                    {'name': f.get('name') or os.path.basename(f.get('pywebviewFullPath') or ''),
+                     'path': f.get('pywebviewFullPath')}
+                    for f in files if f.get('pywebviewFullPath')
+                ]
+                if not items:
+                    return
+                api.store_dropped_paths([it['path'] for it in items])  # 兼容旧前端的轮询方式
+                # 事件驱动推送：前端 onDrop 等待此回调拿到完整路径，
+                # 替代"前端轮询 Python 存储"的竞态方式（曾导致首次拖拽取不到路径、
+                # 以及连续拖拽时读到上一次的旧路径）
+                try:
+                    payload = json.dumps({'files': items}, ensure_ascii=False)
+                    payload = payload.replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
+                    window.evaluate_js(
+                        f"window.__ycode_on_drop_paths && window.__ycode_on_drop_paths({payload})"
+                    )
+                except Exception:
+                    pass
+
+            body.on('drop', _on_body_drop)
+        except Exception:
+            pass
+
+    import threading
+    threading.Thread(target=_register_dnd, daemon=True, name="gui-dnd-register").start()
 
     # 启动 WebView 消息主循环（默认关闭开发者工具，YCODE_GUI_DEBUG=1 时打开）
     webview.start(debug=_debug_enabled())

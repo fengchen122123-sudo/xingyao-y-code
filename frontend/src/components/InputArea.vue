@@ -1,7 +1,7 @@
 <template>
   <div id="input-area">
     <div id="input-wrap">
-      <div id="input-box">
+      <div id="input-box" ref="inputBoxRef" :class="{ 'drop-hover': dragging }">
         <AttachmentChips :items="attachments" @remove="removeAttachment" />
         <!-- / 斜杠命令 与 @ 文件引用的自动补全面板 -->
         <InputSuggest
@@ -81,7 +81,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
 import ModelCascader from './ModelCascader.vue';
@@ -131,8 +131,12 @@ const cacheRateDisplay = computed(() => (
   + `全量 ${formatCacheRate(store.tokenUsage.cache_session_pct)}`
 ));
 
-const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste } = useAttachments();
+const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
+
+// 输入框容器：拖拽文件进入时高亮提示，drop 由原生事件桥（pywebview）提供完整路径
+const inputBoxRef = ref<HTMLElement | null>(null);
+onMounted(() => { if (inputBoxRef.value) bindDrop(inputBoxRef.value); });
 
 function onKeydown(e: KeyboardEvent) {
   // 先让 composable 处理补全导航键（方向键/Tab/Enter/Esc）
@@ -160,6 +164,11 @@ function handleSend() {
   }
 
   const text = inputVal.value;
+  // 拖拽的附件还在等路径时不允许发送，避免把占位的假路径发给后端
+  if (attachments.value.some(a => a.loading)) {
+    store.showToast('附件路径加载中，请稍候…', 'warn');
+    return;
+  }
   const paths = attachments.value.map(a => a.path);
   if (!text.trim() && !paths.length) return;
   inputVal.value = '';
@@ -190,6 +199,11 @@ function handleSend() {
 }
 #input-box:focus-within {
   border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+#input-box.drop-hover {
+  border-color: var(--accent);
+  border-style: dashed;
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 textarea {

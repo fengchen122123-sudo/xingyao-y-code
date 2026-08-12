@@ -40,6 +40,8 @@ common_datas = [
     ('system_prompt.md', '.'),
     ('vendor/ripgrep/rg.exe', 'vendor/ripgrep'),
     ('frontend/dist', 'frontend/dist'),
+    # 内置技能（plugin-creator 等）：首次启动释放到 ~/.ycode/skills，用户可自由开关
+    ('skills', 'skills'),
     # GUI 运行时用 WM_SETICON 设置窗口/任务栏图标，需随包携带 ico 文件
     ('assets/ycode.ico', 'assets'),
 ] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas
