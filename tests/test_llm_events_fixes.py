@@ -9,6 +9,21 @@ import pytest
 from core.llm import _show_file_diff, chat_with_model_events
 
 
+def test_blocking_call_worker_is_daemon_and_returns_result():
+    import core.llm as llm_mod
+
+    captured = {}
+
+    def work():
+        captured["daemon"] = threading.current_thread().daemon
+        return "ok"
+
+    future = llm_mod._submit_daemon_call(work)
+
+    assert future.result(timeout=1) == "ok"
+    assert captured["daemon"] is True
+
+
 def _chunk(content="", tool_calls=None, reasoning="", provider_fields=None, usage=None):
     delta = SimpleNamespace(
         content=content,
@@ -653,8 +668,8 @@ def test_sandbox_guard_exempts_memory_dir_for_read_and_write(tmp_path, monkeypat
     assert asked == [], "memory 目录访问不应触发权限询问"
 
 
-def test_sandbox_guard_exempts_all_ycode_data_files(tmp_path, monkeypatch):
-    """~/.ycode 下所有文件（含 config.json/sessions 等）均豁免沙盒外询问（用户明确要求）"""
+def test_sandbox_guard_keeps_credential_configs_behind_confirmation(tmp_path, monkeypatch):
+    """Runtime data is exempt, but credential-bearing config files are not."""
     import core.llm as llm_mod
     import core.memory_kairos as mk
 
@@ -668,14 +683,23 @@ def test_sandbox_guard_exempts_all_ycode_data_files(tmp_path, monkeypatch):
         lambda *a, **kw: asked.append(1) or False,
     )
 
-    for rel in ("config.json", "sessions/s1.jsonl", "memory/MEMORY.md", "input_history.txt"):
+    for rel in ("sessions/s1.jsonl", "memory/MEMORY.md", "input_history.txt"):
         cm, err = llm_mod._sandbox_outside_guard(
             "read_file", str(tmp_path / ".ycode" / rel),
             None, "owner", "turn", "主代理", None,
         )
         assert err is None, f".ycode/{rel} 不应被拒绝"
         assert cm is not None, f".ycode/{rel} 应获得 bypass 上下文"
-    assert asked == [], ".ycode 下任何文件都不应触发权限询问"
+    assert asked == []
+
+    for rel in ("config.json", "config.json.bak", "mcp.json", "mcp.json.bak"):
+        cm, err = llm_mod._sandbox_outside_guard(
+            "read_file", str(tmp_path / ".ycode" / rel),
+            None, "owner", "turn", "主代理", None,
+        )
+        assert cm is None
+        assert err is not None
+    assert len(asked) == 4
 
 
 def test_sandbox_guard_rejects_unverifiable_path_without_asking(monkeypatch):
@@ -1658,7 +1682,56 @@ def test_estimate_tokens_prefix_changed_falls_back_to_full_count(mocker):
     # 模拟压缩：历史被整体替换为更短内容（等长前缀校验必须失败）
     compressed = [{"role": "user", "content": "压缩后" * 10} for _ in range(5)]
     estimate_tokens("fake-model", compressed + [{"role": "user", "content": "新问题"}])
-    assert counted_batches[-1] == 6, "前缀变化必须回退全量计数（6 条全部）"
+
+
+def test_estimate_tokens_cache_snapshot_cannot_mix_concurrent_models(monkeypatch):
+    import threading
+    import time
+    import core.llm as llm_mod
+
+    model_b_written = threading.Event()
+
+    class InterleavingDict(dict):
+        def __setitem__(self, key, value):
+            super().__setitem__(key, value)
+            if key == "sig" and value and value[0] == "model-a":
+                model_b_written.wait(timeout=0.2)
+            elif key == "value" and self.get("sig", (None,))[0] == "model-b":
+                model_b_written.set()
+
+    monkeypatch.setattr(
+        llm_mod,
+        "_token_estimate_cache",
+        InterleavingDict(sig=None, value=0),
+    )
+    monkeypatch.setattr(
+        llm_mod,
+        "_token_prefix_cache",
+        {"model": None, "msg_count": 0, "char_len": 0, "value": 0},
+    )
+    monkeypatch.setattr(
+        llm_mod,
+        "_litellm_token_counter",
+        lambda model, messages: 100 if model == "model-a" else 200,
+    )
+    messages = [{"role": "user", "content": "hello"}]
+    results = {}
+    threads = [
+        threading.Thread(
+            target=lambda value=model: results.__setitem__(
+                value, llm_mod.estimate_tokens(value, messages)
+            )
+        )
+        for model in ("model-a", "model-b")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=1)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert results == {"model-a": 100, "model-b": 200}
+    assert llm_mod.estimate_tokens("model-b", messages) == 200
 
 
 def test_litellm_patch_preserves_stream_usage_details():

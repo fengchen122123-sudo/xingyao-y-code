@@ -119,7 +119,20 @@ def _sanitize_for_ui(text: str, api_key: Optional[str] = None) -> str:
         text = str(text)
     if api_key and len(api_key) >= 4 and api_key in text:
         text = text.replace(api_key, "***")
+    text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer ***", text)
+    text = re.sub(r"(?i)(\b(?:api[_-]?key|token|secret|password|passwd|auth)\s*[=:]\s*)[^\s,;]+", r"\1***", text)
+    text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(@)", r"\1***\2", text)
+    text = re.sub(r"\b(?:sk|pk|ghp|glpat)-[A-Za-z0-9_.-]{8,}\b", "***", text)
     return text
+
+
+def _path_is_within(path: str, root: str) -> bool:
+    try:
+        candidate = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        base = os.path.normcase(os.path.realpath(os.path.abspath(root)))
+        return os.path.commonpath([candidate, base]) == base
+    except (OSError, ValueError, TypeError):
+        return False
 
 
 def _to_plain_dict(obj) -> dict:
@@ -217,6 +230,9 @@ class ApiBridge:
         # 回合启动互斥：send_user_message 与后台自动汇总都可能启动 turn 线程，
         # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合
         self._turn_start_lock = threading.Lock()
+        # os.chdir 与 MemoryManager.workdir 均为进程级状态。显式串行化完整回合，
+        # 避免不同会话把相对路径工具切换到另一项目。
+        self._turn_workdir_lock = threading.Lock()
         # 后台子代理自动汇总（与 TUI 的 _bg_summary_triggered 同源）：
         # 每批后台任务只触发一次汇总，用户主动发新消息时重置
         self._bg_summary_triggered: set = set()
@@ -238,6 +254,8 @@ class ApiBridge:
         # 内嵌终端：右侧面板用户手动执行命令的子进程（同一时刻最多一个）
         self._term_proc = None
         self._term_lock = threading.Lock()
+        self._shutdown_lock = threading.Lock()
+        self._shutting_down = False
 
         # 注册 GUI 运行时上下文 + 权限应答通道
         app_context.register(_GuiContext(self))
@@ -289,6 +307,68 @@ class ApiBridge:
             window.events.restored += self._on_window_frame_event
         except Exception:
             logger.debug("订阅窗口事件失败", exc_info=True)
+
+    def shutdown(self) -> None:
+        """Idempotently stop GUI-owned work before the native window is destroyed."""
+        with self._shutdown_lock:
+            if self._shutting_down:
+                return
+            self._shutting_down = True
+
+        for event in list(self._cancel_events.values()):
+            event.set()
+        with self._bg_summary_lock:
+            self._bg_summary_pending_session = ""
+        with self._perm_lock:
+            timers = list(self._perm_timers.values())
+            self._perm_timers.clear()
+        for timer in timers:
+            timer.cancel()
+        permission_broker.cancel_all()
+
+        try:
+            self.kill_terminal_command()
+        except Exception:
+            logger.exception("退出时终止内嵌终端失败")
+
+        try:
+            from core.tools import subagent_manager
+            subagent_manager.shutdown(timeout=5.0)
+        except Exception:
+            logger.exception("退出时取消子代理失败")
+
+        # Cooperative cancellation must get a bounded drain window before DB/MCP
+        # teardown. Never wait on the current thread or block exit indefinitely.
+        deadline = time.monotonic() + 5.0
+        current = threading.current_thread()
+        while time.monotonic() < deadline:
+            active = [
+                thread for thread in list(self._active_turns.values())
+                if thread is not current and thread.is_alive()
+            ]
+            if not active:
+                break
+            for thread in active:
+                thread.join(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
+
+        try:
+            from core import task_scheduler
+            scheduler = getattr(task_scheduler, "_DEFAULT_SCHEDULER", None)
+            if scheduler is not None:
+                scheduler.cancel_all()
+                scheduler.shutdown()
+        except Exception:
+            logger.exception("退出时停止计划调度器失败")
+
+        if self._mcp is not None:
+            try:
+                self._mcp.close()
+            except Exception:
+                logger.exception("退出时关闭 MCP 失败")
+        try:
+            self._memory.close()
+        except Exception:
+            logger.exception("退出时关闭会话数据库失败")
 
     def _on_window_frame_event(self):
         """窗口框架事件回调：DWM 重建非客户区后重设标题栏主题（线程内延迟执行）。"""
@@ -434,12 +514,14 @@ class ApiBridge:
 
     def emit_event(self, event_type: str, data: Any):
         """向 JS 传递结构化事件（非流式事件会先冲刷 token 缓冲，保证顺序）。"""
+        if self._shutting_down:
+            return
         if event_type not in ("token_delta", "thinking_delta"):
             self._flush_deltas()
         self._emit_raw(event_type, data)
 
     def _emit_raw(self, event_type: str, data: Any):
-        if not self._window:
+        if self._shutting_down or not self._window:
             return
         try:
             # ensure_ascii=False 保留中文原文（体积更小、调试可读）；
@@ -557,9 +639,7 @@ class ApiBridge:
                 workdir = "GLOBAL"
                 file_tree: List[Dict[str, Any]] = []
             else:
-                if os.path.isdir(cur_wdir) and os.path.abspath(cur_wdir) != os.path.abspath(os.getcwd()):
-                    os.chdir(cur_wdir)
-                workdir = _resolve_real_path(os.getcwd())
+                workdir = _resolve_real_path(cur_wdir)
                 file_tree = self._get_file_tree(workdir)
             self._recalc_token_usage(self._current_session)
             return {
@@ -746,7 +826,6 @@ class ApiBridge:
             selected_path = _resolve_real_path(result[0])
             if not os.path.isdir(selected_path):
                 return {"ok": False, "msg": "选择的路径不是文件夹"}
-            os.chdir(selected_path)
             self._memory.add_workspace(selected_path)
             # 仅全局自由对话（GLOBAL）跟随迁入所选工作区：否则启动时挂在 GLOBAL
             # 的会话即使已在项目文件夹里干活，侧栏仍会一直显示在"对话"分组下。
@@ -951,8 +1030,7 @@ class ApiBridge:
                 # 会错显示成上一个项目 B 的目录
                 candidate_wdir = target_workdir or stored_wdir
                 if candidate_wdir and candidate_wdir != "GLOBAL" and os.path.isdir(candidate_wdir):
-                    if os.path.abspath(candidate_wdir) != os.path.abspath(os.getcwd()):
-                        os.chdir(candidate_wdir)
+                    candidate_wdir = _resolve_real_path(candidate_wdir)
 
             msgs = self._load_session_messages(session_name)
 
@@ -967,7 +1045,7 @@ class ApiBridge:
             if is_global:
                 result.update({"workdir": "GLOBAL", "is_global": True})
             else:
-                current_workdir = _resolve_real_path(os.getcwd())
+                current_workdir = _resolve_real_path(candidate_wdir or stored_wdir or os.getcwd())
                 result.update({"workdir": current_workdir, "is_global": False})
             # 文件树不再随切换响应同步扫描（大目录要数秒，拖慢切换）；
             # 前端切换成功后调 get_file_tree 后台异步加载。
@@ -1252,6 +1330,8 @@ class ApiBridge:
     # ------------------------------------------------------------------
     def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None) -> Dict[str, Any]:
         try:
+            if self._shutting_down:
+                return {"ok": False, "msg": "应用正在退出"}
             clean_text = str(text or "").strip()
             attach_list = [str(p) for p in (attachments or []) if str(p).strip()]
             if not clean_text and not attach_list:
@@ -1280,7 +1360,7 @@ class ApiBridge:
                     # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
                     turn_kwargs["pending_workdir"] = str(workdir)
                 worker = threading.Thread(
-                    target=self._run_turn_worker,
+                    target=self._run_turn_worker_serialized,
                     args=(full_text, target_session),
                     kwargs=turn_kwargs,
                     daemon=True,
@@ -1303,6 +1383,11 @@ class ApiBridge:
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
+
+    def _run_turn_worker_serialized(self, *args, **kwargs):
+        """Serialize turns that depend on process-wide cwd and memory workdir."""
+        with self._turn_workdir_lock:
+            return self._run_turn_worker(*args, **kwargs)
 
     def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = ""):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
@@ -1489,7 +1574,7 @@ class ApiBridge:
             # 回合运行期间若有后台子代理进入终态（当时不能并发起新回合），
             # 此时补触发自动汇总检查
             pending = self._bg_summary_pending_session
-            if pending:
+            if pending and not self._shutting_down:
                 self._bg_summary_pending_session = ""
                 threading.Thread(
                     target=self._deferred_bg_summary_check,
@@ -1505,6 +1590,8 @@ class ApiBridge:
         职责二：延迟检查本会话是否所有后台任务都已终态，是则自动发起一轮
         汇总 turn，把结果主动呈现给用户——不用等用户手动发下一条消息。
         """
+        if self._shutting_down:
+            return
         from core.tools import subagent_manager
         session = next(
             (
@@ -1539,6 +1626,8 @@ class ApiBridge:
         """延迟 0.5s 后检查是否触发自动汇总（给并发终态回调留出状态更新时间）。"""
         try:
             time.sleep(0.5)
+            if self._shutting_down:
+                return
             self._maybe_start_bg_summary_turn(session)
         except Exception:
             logger.debug("后台任务自动汇总触发失败", exc_info=True)
@@ -1551,7 +1640,7 @@ class ApiBridge:
         """
         from core.tools import subagent_manager
 
-        if not session:
+        if self._shutting_down or not session:
             return
         if subagent_manager.has_running_background_tasks(session):
             return
@@ -1568,7 +1657,7 @@ class ApiBridge:
             cancel_event = threading.Event()
             self._cancel_events[session] = cancel_event
             worker = threading.Thread(
-                target=self._run_turn_worker,
+                target=self._run_turn_worker_serialized,
                 args=(_BG_SUMMARY_PROMPT, session, "bg_summary"),
                 daemon=True,
                 name=f"gui-bg-summary-{session}",
@@ -2317,6 +2406,9 @@ class ApiBridge:
     def read_file_preview(self, path: str) -> Dict[str, Any]:
         try:
             real_path = _resolve_real_path(path)
+            workspace = self._session_workdir(self._current_session)
+            if workspace == "GLOBAL" or not _path_is_within(real_path, workspace):
+                return {"ok": False, "msg": "文件不在当前工作区内"}
             if not os.path.isfile(real_path):
                 return {"ok": False, "msg": "文件不存在或不是普通文件"}
             size = os.path.getsize(real_path)
@@ -2341,8 +2433,16 @@ class ApiBridge:
     def open_path(self, path: str) -> Dict[str, Any]:
         try:
             real_path = _resolve_real_path(path)
+            workspace = self._session_workdir(self._current_session)
+            if workspace == "GLOBAL" or not _path_is_within(real_path, workspace):
+                return {"ok": False, "msg": "路径不在当前工作区内"}
             if not os.path.exists(real_path):
                 return {"ok": False, "msg": "路径不存在"}
+            if os.path.isfile(real_path) and os.path.splitext(real_path)[1].lower() in {
+                ".bat", ".cmd", ".com", ".cpl", ".exe", ".hta", ".js", ".jse",
+                ".lnk", ".msi", ".msp", ".ps1", ".reg", ".scr", ".url", ".vbs", ".wsf",
+            }:
+                return {"ok": False, "msg": "安全策略禁止直接启动可执行或快捷方式文件"}
             opener = getattr(os, "startfile", None)
             if opener is not None:
                 opener(real_path)

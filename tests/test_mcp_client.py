@@ -115,3 +115,128 @@ def test_get_schemas_returns_sorted_by_tool_name(manager, tmp_path):
 
     names = [s["function"]["name"] for s in manager.get_schemas()]
     assert names == ["srva__alpha", "srva__beta", "srvb__zeta"]
+
+
+def test_mcp_admin_mutations_require_permission():
+    from core.tool_registry import build_default_registry
+
+    registry = build_default_registry()
+
+    for name in ("mcp_add_server", "mcp_remove_server", "mcp_set_enabled"):
+        assert registry.get(name).requires_permission is True
+
+
+def test_add_server_rejects_shell_interpreters(manager, tmp_path, monkeypatch):
+    _write_config(manager, tmp_path, {})
+    monkeypatch.setattr(manager, "reconnect", lambda: (True, "ok"))
+
+    ok, message = manager.add_server(
+        "unsafe",
+        "powershell",
+        ["-Command", "Write-Host compromised"],
+    )
+
+    assert ok is False
+    assert "不允许" in message
+    assert json.loads((tmp_path / "mcp.json").read_text(encoding="utf-8")) == {
+        "mcpServers": {}
+    }
+
+
+def test_add_server_rejects_process_injection_environment(manager, tmp_path, monkeypatch):
+    _write_config(manager, tmp_path, {})
+    monkeypatch.setattr(manager, "reconnect", lambda: (True, "ok"))
+
+    ok, message = manager.add_server(
+        "unsafe-env",
+        "node",
+        ["server.js"],
+        {"NODE_OPTIONS": "--require=payload.js"},
+    )
+
+    assert ok is False
+    assert "NODE_OPTIONS" in message
+
+
+@pytest.mark.parametrize("command", ["C:/attacker/node.exe", "..\\attacker\\python"])
+def test_add_server_rejects_executable_paths(manager, tmp_path, monkeypatch, command):
+    _write_config(manager, tmp_path, {})
+    monkeypatch.setattr(manager, "reconnect", lambda: (True, "ok"))
+
+    ok, _ = manager.add_server("bad", command, [])
+
+    assert ok is False
+
+
+@pytest.mark.parametrize(
+    "key", ["PATH", "PATHEXT", "COMSPEC", "PYTHONHOME", "NODE_PATH", "DYLD_INSERT_LIBRARIES"]
+)
+def test_add_server_rejects_loader_and_search_path_environment(
+    manager, tmp_path, monkeypatch, key
+):
+    _write_config(manager, tmp_path, {})
+    monkeypatch.setattr(manager, "reconnect", lambda: (True, "ok"))
+
+    ok, _ = manager.add_server("bad", "node", [], {key: "attacker"})
+
+    assert ok is False
+
+
+def test_list_servers_redacts_env_and_argument_secrets(manager, tmp_path):
+    _write_config(manager, tmp_path, {
+        "postgres": {
+            "command": "npx",
+            "args": [
+                "-y",
+                "server",
+                "postgresql://alice:secret-pass@localhost/app",
+                "--api-key=plain-token",
+                "--password",
+                "short",
+            ],
+            "env": {
+                "PASSWORD": "tiny",
+                "PUBLIC_MODE": "development",
+            },
+        }
+    })
+
+    payload = manager.list_servers()
+
+    assert "secret-pass" not in payload
+    assert "plain-token" not in payload
+    assert "tiny" not in payload
+    assert "development" not in payload
+    assert "***" in payload
+
+
+def test_list_servers_redacts_query_userinfo_and_authorization_header(manager, tmp_path):
+    _write_config(manager, tmp_path, {
+        "demo": {
+            "command": "node",
+            "args": [
+                "https://host/?mode=prod&token=plain-token",
+                "https://user-token@host/path",
+                "--header=Authorization: Bearer plain-bearer",
+            ],
+        }
+    })
+
+    rendered = manager.list_servers()
+
+    for secret in ("plain-token", "user-token", "plain-bearer"):
+        assert secret not in rendered
+
+
+def test_closed_manager_cannot_start_new_connections(manager, tmp_path, monkeypatch):
+    _write_config(manager, tmp_path, {"srv": {"command": "npx", "args": ["server"]}})
+    started = []
+
+    async def connect_all():
+        started.append(True)
+
+    monkeypatch.setattr(manager, "_connect_all", connect_all)
+    manager.close()
+
+    assert manager.get_schemas() == []
+    assert started == []

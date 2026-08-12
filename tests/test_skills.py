@@ -115,3 +115,41 @@ def test_frontmatter_triggers_override_builtin_hints(tmp_path, monkeypatch):
 
     assert "（触发:自定义触发词）" in catalog
     assert "排查/报错" not in catalog
+
+
+def test_skill_catalog_bounds_untrusted_metadata(tmp_path, monkeypatch):
+    skill_path = tmp_path / "skills" / "demo" / "SKILL.md"
+    parsed = _skill(
+        skill_path,
+        "n" * (skills.SKILL_NAME_MAX_CHARS + 20),
+        "d" * (skills.SKILL_DESCRIPTION_MAX_CHARS + 20),
+        "BODY",
+    )
+    parsed["triggers"] = "t" * (skills.SKILL_TRIGGERS_MAX_CHARS + 20)
+    monkeypatch.setattr(skills, "get_active_skill_ids", lambda: [str(skill_path)])
+    monkeypatch.setattr(skills, "scan_all_skills", lambda: [parsed])
+
+    catalog = skills.get_active_skills_catalog()
+
+    assert "n" * (skills.SKILL_NAME_MAX_CHARS + 1) not in catalog
+    assert "d" * (skills.SKILL_DESCRIPTION_MAX_CHARS + 1) not in catalog
+    assert "t" * (skills.SKILL_TRIGGERS_MAX_CHARS + 1) not in catalog
+
+
+def test_scan_skills_rejects_symlink_outside_search_root(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text(
+        "---\nname: escaped\ndescription: outside\n---\nBODY\n",
+        encoding="utf-8",
+    )
+    try:
+        (root / "escaped").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        import pytest
+        pytest.skip("当前 Windows 环境不允许创建测试符号链接")
+    monkeypatch.setattr(skills, "get_skill_dirs", lambda: [str(root)])
+
+    assert skills.scan_all_skills() == []

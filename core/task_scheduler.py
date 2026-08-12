@@ -7,6 +7,7 @@ import threading
 import subprocess
 import time
 import os
+import signal
 from copy import deepcopy
 from typing import Any, Callable
 
@@ -45,11 +46,14 @@ def _stop_process_tree(process: subprocess.Popen) -> None:
                 creationflags=subprocess.CREATE_NO_WINDOW,
             )
         else:
-            process.terminate()
+            os.killpg(process.pid, signal.SIGTERM)
         process.wait(timeout=5)
     except Exception:
         try:
-            process.kill()
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
         except Exception:
             pass
         try:
@@ -398,7 +402,11 @@ class TaskScheduler:
         item_id: str | None = None,
         cancel_event: threading.Event | None = None,
     ) -> tuple[bool, str]:
+        from core.command_policy import is_dangerous_command
         from core.process_io import decode_process_output, platform_console_encoding
+
+        if is_dangerous_command(command):
+            return False, "危险命令已被安全策略拒绝，未执行验证。"
 
         output_encoding = platform_console_encoding()
         env = dict(os.environ)
@@ -418,6 +426,7 @@ class TaskScheduler:
                 env=env,
                 # GUI（无控制台）下避免系统为子进程分配新控制台窗口
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                start_new_session=os.name != "nt",
             )
             if item_id:
                 with self._lock:

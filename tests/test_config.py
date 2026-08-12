@@ -41,7 +41,7 @@ def _use_tmp_config(tmp_path, monkeypatch, data=None):
 
 def test_load_valid_config(tmp_path, monkeypatch):
     """测试是否能正确读取多厂商结构的 config.json 并解析激活模型"""
-    _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
 
     data = model_manager.load_config()
     assert data["active_model_id"] == "m1"
@@ -50,6 +50,33 @@ def test_load_valid_config(tmp_path, monkeypatch):
     assert info["litellm_model"] == "openai/gpt-4o"
     assert info["api_key"] == "sk-test-key-123"
     assert info["base_url"] == "https://api.example.com"
+    on_disk = cfg.read_text(encoding="utf-8")
+    assert "sk-test-key-123" not in on_disk
+    assert "dpapi:" in on_disk
+
+
+def test_non_windows_api_keys_use_system_keyring(monkeypatch):
+    import core.credentials as credentials
+
+    stored = {}
+
+    class FakeKeyring:
+        @staticmethod
+        def set_password(service, account, value):
+            stored[(service, account)] = value
+
+        @staticmethod
+        def get_password(service, account):
+            return stored.get((service, account))
+
+    monkeypatch.setattr(credentials.sys, "platform", "linux")
+    monkeypatch.setitem(__import__("sys").modules, "keyring", FakeKeyring)
+
+    protected = credentials.protect_secret("sk-portable-secret")
+
+    assert protected.startswith(credentials.KEYRING_PREFIX)
+    assert "sk-portable-secret" not in protected
+    assert credentials.unprotect_secret(protected) == "sk-portable-secret"
 
 
 def test_load_config_file_not_found_creates_default(tmp_path, monkeypatch):
@@ -157,7 +184,7 @@ def test_add_model_with_prefixed_name_not_double_prefixed(tmp_path, monkeypatch)
 
     mid = model_manager.add_model_to_provider("p1", "openai/gpt-4o", 128000)
 
-    data = json.loads(cfg.read_text(encoding="utf-8"))
+    data = model_manager.load_config()
     added = [m for m in data["providers"][0]["models"] if m["id"] == mid][0]
     assert added["litellm_model"] == "openai/gpt-4o"
 
@@ -168,7 +195,7 @@ def test_add_model_without_prefix_gets_protocol_prefix(tmp_path, monkeypatch):
 
     mid = model_manager.add_model_to_provider("p1", "gpt-4o-mini", 128000)
 
-    data = json.loads(cfg.read_text(encoding="utf-8"))
+    data = model_manager.load_config()
     added = [m for m in data["providers"][0]["models"] if m["id"] == mid][0]
     assert added["litellm_model"] == "openai/gpt-4o-mini"
 
@@ -235,11 +262,12 @@ def test_add_preset_provider_uses_shared_catalog_metadata(tmp_path, monkeypatch)
 
     pid = model_manager.add_preset_provider("deepseek", "sk-deepseek")
 
-    data = json.loads(cfg.read_text(encoding="utf-8"))
+    data = model_manager.load_config()
     provider = next(item for item in data["providers"] if item["id"] == pid)
     assert provider["preset_id"] == "deepseek"
     assert provider["protocol"] == "responses"
     assert provider["api_key"] == "sk-deepseek"
+    assert "sk-deepseek" not in cfg.read_text(encoding="utf-8")
     assert provider["models"][0]["litellm_model"] == "openai/deepseek-v4-pro"
     assert provider["models"][0]["supports_vision"] is False
 
@@ -255,7 +283,7 @@ def test_update_provider_rewrites_model_route_and_preserves_blank_key(tmp_path, 
         protocol="responses",
     )
 
-    provider = json.loads(cfg.read_text(encoding="utf-8"))["providers"][0]
+    provider = model_manager.load_config()["providers"][0]
     assert provider["name"] == "新厂商"
     assert provider["api_key"] == "sk-test-key-123"
     assert provider["protocol"] == "responses"

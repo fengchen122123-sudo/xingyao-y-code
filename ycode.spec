@@ -110,6 +110,8 @@ gui_hiddenimports = common_hiddenimports + [
     # edgechromium 后端底层通过 pythonnet/clr_loader 桥接 .NET WebView2 控件。
     'clr_loader',
     'pythonnet',
+    'pystray',
+    'pystray._win32',
 ]
 
 a_gui = Analysis(

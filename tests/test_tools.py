@@ -242,6 +242,18 @@ def test_execute_command():
     assert "hello engine" in result
 
 
+def test_execute_command_rejects_catastrophic_commands_before_spawn(monkeypatch):
+    monkeypatch.setattr(
+        "core.tools.subprocess.Popen",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must not spawn")),
+    )
+
+    result = execute_command("rm -rf / && echo done")
+
+    assert result.startswith("🚨")
+    assert "危险命令" in result
+
+
 def test_skill_command_reports_missing_dependencies_without_installing(tmp_path, monkeypatch):
     script_dir = tmp_path / "skills" / "demo" / "scripts"
     script_dir.mkdir(parents=True)

@@ -28,23 +28,10 @@ _MAX_TASK_LOGS = 50
 # get_task_output 的 task_id 白名单，防止路径穿越读取任意日志文件
 _TASK_ID_PATTERN = re.compile(r"^[\w-]{1,64}$")
 
-# 后台任务命令的危险模式黑名单（最后一道防线，避免模型/用户输入直接触发破坏性操作）。
-# 该检查不替代上游权限确认，仅作为 shell=True 场景下的纵深防御。
-_DANGEROUS_COMMAND_PATTERNS = [
-    re.compile(r"rm\s+-rf\s+/\s*(?:#.*)?$", re.IGNORECASE),          # rm -rf /
-    re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|:\s*&\s*\}\s*;\s*:", re.IGNORECASE),  # fork bomb
-    re.compile(r">\s*/dev/[sh]d[a-z]", re.IGNORECASE),              # 覆写磁盘
-    re.compile(r"\bdd\s+.*\bof\s*=\s*/dev/", re.IGNORECASE),        # dd 到块设备
-    re.compile(r"\bmkfs\.\s*", re.IGNORECASE),                      # 格式化
-    re.compile(r"\bformat\s+", re.IGNORECASE),                      # Windows format
-    re.compile(r"\brd\s+/s\s+/q\s+", re.IGNORECASE),                # Windows 递归删目录
-    re.compile(r"\bdel\s+/[fq]\s+/s\s+", re.IGNORECASE),            # Windows 递归删文件
-]
+from core.command_policy import is_dangerous_command
 
-
-def _is_dangerous_command(command: str) -> bool:
-    stripped = (command or "").strip()
-    return any(p.search(stripped) for p in _DANGEROUS_COMMAND_PATTERNS)
+# 兼容已有内部调用和测试；策略实现集中在 command_policy。
+_is_dangerous_command = is_dangerous_command
 
 
 def _ensure_paths():
@@ -239,7 +226,8 @@ def start_background_task(command: str) -> str:
                 stdout=log_file,
                 stderr=log_file,
                 env=env,
-                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else 0
+                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else 0,
+                start_new_session=os.name != "nt",
             )
         except Exception:
             # Popen 失败时关闭日志句柄，避免文件句柄泄露
