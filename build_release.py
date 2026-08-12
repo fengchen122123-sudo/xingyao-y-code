@@ -298,8 +298,8 @@ def step3_build_tui_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_e
             (uninstall_exe, "."),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
-            # GUI 向导资源：虚化背景图 + 窗口图标
-            (os.path.join("assets", "setup_bg.png"), "assets"),
+            # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
+            (os.path.join("assets", "ycode.png"), "assets"),
             (os.path.join("assets", "ycode.ico"), "assets"),
         ],
     )
@@ -315,8 +315,8 @@ def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_
             (tui_setup_exe, "tui"),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
-            # GUI 向导资源：虚化背景图 + 窗口图标
-            (os.path.join("assets", "setup_bg.png"), "assets"),
+            # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
+            (os.path.join("assets", "ycode.png"), "assets"),
             (os.path.join("assets", "ycode.ico"), "assets"),
         ],
     )
