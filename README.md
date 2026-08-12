@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.1.32](https://img.shields.io/badge/Version-1.1.32-green.svg)](core/version.py)
+[![Version 1.1.48](https://img.shields.io/badge/Version-1.1.48-green.svg)](core/version.py)
 
 > 一个国产终端 AI 编程助手，代号「星瑶」。支持 TUI 控制台与 GUI 窗口双形态、多模型切换、子代理编排、计划执行、长期记忆、MCP 扩展与可插拔技能系统。
 
@@ -13,6 +13,8 @@
 ### 对话与界面
 - **终端交互界面**：基于 `prompt_toolkit` 的 Claude Code 风格输入框，支持斜杠命令、Tab 补全、`@文件` 快速挂载、多行粘贴
 - **GUI 窗口版**：基于 `pywebview` + Vue 3 + TypeScript 的图形界面，与 TUI 共享同一套核心引擎
+- **GUI 拖拽附件**：拖入文件即上屏占位并自动补全真实路径，PDF 等二进制文件注入路径提示供模型用工具解析
+- **文件树面板**：懒加载子目录，支持手动刷新与页签激活/窗口聚焦自动刷新，展开状态可恢复
 - **9 种终端主题**：cyan / matrix / nord / cyberpunk / dracula / lava / sunset / amber / white，`/theme` 一键切换
 - **终端 Markdown 渲染**：代码块语法高亮、表格、列表等富文本展示
 - **思考流显示**：实时呈现模型推理过程（`<thinking>` 标签解析 + 句子边界缓冲）
@@ -144,11 +146,47 @@ venv\Scripts\python build_release.py
 # 仅构建 TUI 相关产物
 venv\Scripts\python build_release.py --tui-only
 
-# 跳过前端构建
+# 跳过前端构建（复用现有 frontend/dist）
 venv\Scripts\python build_release.py --skip-frontend
+
+# 强制重新构建前端
+venv\Scripts\python build_release.py --rebuild-frontend
+
+# 只重建两个安装向导（复用现有载荷与卸载程序，约 2 分钟）
+venv\Scripts\python build_release.py --setup-only
 ```
 
-产出物位于 `dist/` 下：`Y-code.exe`（GUI）、`ycode.exe`（TUI）、`ycode_setup.exe`（主安装包）、`ycode_uninstall.exe`（卸载向导）。详见 [docs/BUILD.md](docs/BUILD.md)。
+产出物位于 `dist/` 下：`Y-code.exe`（GUI）、`ycode.exe`（TUI）、`ycode_setup_v{版本}.exe`（主安装包，文件名自动带版本号）、`ycode_uninstall.exe`（卸载向导）。详见 [docs/BUILD.md](docs/BUILD.md)。
+
+---
+
+## 📦 安装与卸载（Windows）
+
+发布产物是经典 Windows 安装程序样式（NSIS MUI2 风格）的图形化向导，白色顶部横幅 + 底部 上一步/下一步/取消 按钮组。
+
+### 安装向导（`ycode_setup_v{版本}.exe`）
+
+页面流程：**欢迎 → 安装用户 → 路径与选项 → 安装中 → 完成**
+
+- **安装用户选择**：
+  | 选项 | 安装位置 | 权限 | 卸载注册表 | PATH | 快捷方式 |
+  |------|---------|------|-----------|------|---------|
+  | 仅为我安装（推荐） | `%LOCALAPPDATA%\Programs\Y-code` | 无需管理员 | HKCU | 用户 PATH | 个人桌面 |
+  | 为所有人安装 | `%ProgramFiles%\Y-code` | 需管理员（自动 UAC 提权重启） | HKLM | 系统 PATH | 公共桌面 |
+- **可选组件**：同时安装命令行版 CLI（默认勾选）、创建桌面快捷方式（默认勾选）
+- **重装检测**：检测到已有安装时自动沿用原安装范围与路径，锁定相关选项并提示覆盖安装
+- **秒开体验**：核心程序包以单文件 zip 载荷内嵌，双击几秒出界面（旧方案散文件需 20~95 秒）
+
+### 卸载向导（`ycode_uninstall.exe`，随安装包释放到安装目录）
+
+同款经典样式的图形化向导：**欢迎 → 卸载选项 → 卸载中 → 完成**
+
+- 清理桌面快捷方式（GUI/CLI/旧版 TUI 命名都尝试）、PATH、注册表卸载入口
+- 按安装范围自动适配：machine 安装会清理 HKLM 注册项、系统 PATH 与公共桌面（非管理员运行时自动 UAC 提权）
+- 可选删除 `~/.ycode` 用户配置与历史会话（默认保留，重装后可继续使用）
+- 完成后退出向导自动自销毁，清空安装目录残留
+
+也可从「Windows 设置 → 应用 → 已安装的应用 → Y-code」发起卸载。
 
 ---
 
@@ -385,6 +423,9 @@ Y-code 内置 22 个工具，分为只读与变更两组：
 2. 兼容全局：`~/.agents/skills/`（仅已存在时扫描）
 3. 项目级：通过 `config.json` 的 `skill_search_paths` 显式配置
 
+**内置技能随安装包发布**：安装包内置的 `skills/` 会在首次启动时释放到 `~/.ycode/skills/`
+并默认启用；不覆盖用户已改动的同名技能，也不会复活用户主动删除的技能。
+
 **技能文件格式**：
 ```markdown
 ---
@@ -408,6 +449,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 **特性**：
 - 加载器由 `core/tool_registry.py:build_default_registry()` 末尾自动调用
+- 运行中新安装的插件即时可见（增量扫盘热加载，无需重启）
 - 单插件异常只记录日志并跳过，绝不影响 ycode 启动
 - 插件工具通过 `ToolSpec` 元数据自动获得权限拦截、schema 参数过滤与结果截断
 - `/plugins` 命令查看已安装插件
@@ -417,7 +459,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 ## 📁 项目结构
 
 ```
-Y-code-cli/
+xingyao-y-code/
 ├── main.py                  # TUI 主入口
 ├── gui_main.py              # GUI 主入口（pywebview）
 ├── gui_bridge.py            # GUI JS-API 桥接层
@@ -479,15 +521,17 @@ Y-code-cli/
 ├── plugins/                # 内置插件目录
 ├── vendor/ripgrep/         # 内置 ripgrep
 ├── packaging/              # 打包辅助
-├── tests/                  # pytest 测试用例（35+ 文件）
+├── tests/                  # pytest 测试用例（60+ 文件）
 ├── docs/                   # 文档
 │   ├── BUILD.md            # 构建文档
 │   ├── all_features.md     # 全功能文档
 │   └── superpowers/        # 设计与计划文档
 ├── build_release.py        # Windows 发布打包流水线
 ├── ycode.spec              # PyInstaller 双主程序打包 spec
-├── ycode_setup.py          # Windows 安装向导
-├── ycode_uninstall.py      # Windows 卸载向导
+├── ycode_setup.py          # Windows 安装向导（经典样式，user/machine 双范围）
+├── ycode_setup.spec        # 安装向导打包 spec（开发者手动构建参考用）
+├── ycode_uninstall.py      # Windows 卸载向导（经典样式 GUI）
+├── ycode_uninstall.spec    # 卸载向导打包 spec
 ├── mcp.example.json        # MCP 配置示例
 └── README.md               # 本文件
 ```
@@ -579,7 +623,7 @@ JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视
 pytest
 ```
 
-测试覆盖 35+ 个模块，包括 agent_turn_e2e、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools 等。
+测试覆盖 60+ 个模块，包括 agent_turn_e2e、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
 
 ---
 
@@ -588,7 +632,7 @@ pytest
 - `config.json`、`ycode.db`、`active_skills.json`、`mcp.json` 已加入 `.gitignore`，不会被提交
 - 永远不要把真实 API 密钥写进源码或 README
 - 如果意外把密钥提交到仓库，请立即到对应平台重置密钥
-- 卸载向导会清理桌面快捷方式、PATH 环境变量、注册表卸载入口（兼容新旧命名）与可选的 `~/.ycode` 用户配置
+- 卸载向导（GUI）会按安装范围清理桌面快捷方式、用户/系统 PATH、HKCU/HKLM 注册表卸载入口（兼容新旧命名），可选保留或删除 `~/.ycode` 用户配置
 
 ---
 
