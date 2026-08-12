@@ -198,6 +198,88 @@ def _load_one(plugin_dir: Path, registry) -> str:
     return name
 
 
+def refresh_plugins(registry=None) -> None:
+    """增量刷新插件信息：加载运行期间新安装的插件，移除已从磁盘删除的记录。
+
+    解决"运行期间安装的插件要重启进程才显示"的问题（此前 _PLUGIN_INFOS 只在
+    启动时 load_and_register 扫一次盘）。已加载的插件不会重复注册；
+    单插件失败仅记录，不影响其他插件。registry 缺省取运行时注册表单例。
+    """
+    if registry is None:
+        registry = _live_registry()
+
+    # 1) 移除磁盘上已删除（plugin.json 不存在）的插件记录
+    for info in list(_PLUGIN_INFOS):
+        path = info.get("path")
+        if path and not (Path(path) / "plugin.json").is_file():
+            _PLUGIN_INFOS.remove(info)
+
+    known_paths = {str(info.get("path") or "") for info in _PLUGIN_INFOS}
+    # 已被占用的插件名（overridden 记录不占用：它是被同名压制的那个）
+    taken_names = {
+        str(info.get("name") or "")
+        for info in _PLUGIN_INFOS
+        if info.get("status") != "overridden"
+    }
+
+    # 2) 扫盘发现新插件（目录优先级与记录结构同 load_and_register）
+    for idx, base in enumerate(plugin_dirs()):
+        source = "user" if idx == 0 else "builtin"
+        try:
+            if not base.is_dir():
+                continue
+            children = sorted(p for p in base.iterdir() if p.is_dir())
+        except OSError as exc:
+            _logger.warning("插件目录不可访问，已跳过 %s: %s", base, exc)
+            continue
+        for child in children:
+            if not (child / "plugin.json").is_file() or str(child) in known_paths:
+                continue
+            try:
+                with open(child / "plugin.json", "r", encoding="utf-8") as f:
+                    meta = json.load(f)
+                plugin_name = str(meta.get("name") or child.name)
+            except Exception:
+                meta = {}
+                plugin_name = child.name
+            info: dict = {
+                "name": plugin_name,
+                "version": str(meta.get("version") or "?"),
+                "description": str(meta.get("description") or ""),
+                "path": str(child),
+                "source": source,
+                "status": "loaded",
+                "tools": [],
+            }
+            if plugin_name in taken_names:
+                info["status"] = "overridden"
+                _PLUGIN_INFOS.append(info)
+                continue
+            if registry is None:
+                # 无运行时注册表（极端降级）：只记录元信息，不执行加载
+                info["status"] = "disabled" if meta.get("enabled", True) is False else "loaded"
+                taken_names.add(plugin_name)
+                _PLUGIN_INFOS.append(info)
+                continue
+            before_tools = {s.name for s in registry.all()}
+            try:
+                name = _load_one(child, registry)
+                taken_names.add(plugin_name)
+                if name:
+                    info["tools"] = sorted(
+                        s.name for s in registry.all() if s.name not in before_tools
+                    )
+                    _logger.info("插件已热加载: %s (%s)", name, child)
+                else:
+                    info["status"] = "disabled"
+            except Exception as exc:
+                taken_names.add(plugin_name)
+                info["status"] = "failed"
+                info["error"] = str(exc)
+                _logger.warning("插件 %s 热加载失败，已跳过: %s", child.name, exc)
+            _PLUGIN_INFOS.append(info)
+
+
 def load_and_register(registry) -> list[str]:
     """扫描所有插件目录并注册插件工具。返回成功加载的插件名列表。
 

@@ -1,11 +1,12 @@
 <template>
   <div v-if="items.length" class="attach-chips">
-    <div v-for="a in items" :key="a.path" class="attach-chip" :title="a.path">
+    <div v-for="a in items" :key="a.path" class="attach-chip" :class="{ loading: a.loading }" :title="a.loading ? a.name + '（路径加载中…）' : a.path">
       <span class="ac-icon">{{ extIcon(a.name) }}</span>
       <span class="ac-text">
         <span class="ac-name">{{ a.name }}</span>
-        <span class="ac-meta">{{ (a.ext || 'file').toUpperCase() }}<template v-if="formatFileSize(a.size)"> {{ formatFileSize(a.size) }}</template></span>
+        <span class="ac-meta">{{ a.loading ? '加载中…' : (a.ext || 'file').toUpperCase() }}<template v-if="!a.loading && formatFileSize(a.size)"> {{ formatFileSize(a.size) }}</template></span>
       </span>
+      <span v-if="a.loading" class="ac-progress"></span>
       <button class="ac-remove" title="移除附件" @click.stop="$emit('remove', a.path)">✕</button>
     </div>
   </div>
@@ -84,5 +85,34 @@ defineEmits<{ (e: 'remove', path: string): void }>();
 .ac-remove:hover {
   background: var(--bg3);
   color: var(--text);
+}
+/* 拖拽后立即上屏的加载态：chip 底部的不确定进度条 */
+.attach-chip.loading {
+  border-color: var(--accent);
+  padding-bottom: 9px;
+}
+.ac-progress {
+  position: absolute;
+  left: 8px;
+  right: 8px;
+  bottom: 3px;
+  height: 2px;
+  border-radius: 1px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+.ac-progress::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  width: 40%;
+  height: 100%;
+  border-radius: 1px;
+  background: var(--accent);
+  animation: ac-progress-slide 1s ease-in-out infinite;
+}
+@keyframes ac-progress-slide {
+  0% { left: -40%; }
+  100% { left: 100%; }
 }
 </style>

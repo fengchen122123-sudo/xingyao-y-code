@@ -231,3 +231,65 @@ def test_get_plugin_infos_returns_copies(plugin_env):
     infos = plugin_loader.get_plugin_infos()
     infos[0]["name"] = "tampered"
     assert plugin_loader.get_plugin_infos()[0]["name"] == "demo"
+
+
+# ── refresh_plugins：运行期间安装的插件无需重启即可显示 ──────────────
+
+def test_refresh_plugins_discovers_newly_installed(plugin_env):
+    """启动后新安装的插件，刷新后即可显示并热加载"""
+    user_dir, _ = plugin_env
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+    assert plugin_loader.get_plugin_infos() == []
+
+    # 模拟"运行期间 Agent 自己安装了插件"
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    plugin_loader.refresh_plugins(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    assert [i["name"] for i in infos] == ["demo"]
+    assert infos[0]["status"] == "loaded"
+    assert infos[0]["tools"] == ["demo_tool"]
+    assert registry.execute("demo_tool", x="hot").content == "hello hot"
+
+
+def test_refresh_plugins_does_not_reload_existing(plugin_env):
+    """已加载的插件不会被重复注册/重复记录"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    plugin_loader.refresh_plugins(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    assert len(infos) == 1
+    assert registry.execute("demo_tool", x="once").content == "hello once"
+
+
+def test_refresh_plugins_removes_deleted(plugin_env):
+    """插件目录被删除后，刷新即从列表移除"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    (user_dir / "demo" / "plugin.json").unlink()
+    plugin_loader.refresh_plugins(registry)
+
+    assert plugin_loader.get_plugin_infos() == []
+
+
+def test_refresh_plugins_records_disabled_new_plugin(plugin_env):
+    """新安装的禁用插件显示为 disabled，不注册工具"""
+    user_dir, _ = plugin_env
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+
+    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
+    plugin_loader.refresh_plugins(registry)
+
+    infos = plugin_loader.get_plugin_infos()
+    assert len(infos) == 1
+    assert infos[0]["status"] == "disabled"
+    assert registry.execute("demo_tool").is_error

@@ -192,6 +192,7 @@ class ApiBridge:
     def __init__(self, mcp_manager=None):
         # 内部状态变量使用下划线开头，防止 PyWebView 在 Windows .NET 检查中产生属性递归问题
         self._window = None
+        self._dropped_paths: list = []
         # GUI 专用会话库：与 TUI 的 ycode.db 分离，两边对话互不同步
         self._memory = MemoryManager(db_path=GUI_DB_FILE)
         # 修复：形参曾经遮蔽模块级单例，导致 self._mcp 永远是 None
@@ -2021,7 +2022,10 @@ class ApiBridge:
     # ------------------------------------------------------------------
     def get_plugins(self) -> List[Dict[str, Any]]:
         try:
-            from core.plugin_loader import get_plugin_infos
+            from core.plugin_loader import get_plugin_infos, refresh_plugins
+            # 增量扫盘：运行期间新安装/删除的插件无需重启即可反映到列表
+            # （此前只在进程启动时扫一次，Agent 自己装的插件必须重启才显示）
+            refresh_plugins()
             result = []
             for info in get_plugin_infos():
                 status = str(info.get("status") or "")
@@ -2403,6 +2407,26 @@ class ApiBridge:
         except Exception as e:
             logger.exception("save_clipboard_image 失败")
             return {"ok": False, "msg": str(e)}
+
+    def store_dropped_paths(self, paths: List[str]) -> None:
+        """pywebview 原生 drop 事件回调存储的完整路径，供前端 drop 时查询。"""
+        self._dropped_paths = list(paths or [])
+
+    def get_dropped_paths(self) -> List[str]:
+        """取出并清空最近一次的拖拽文件路径（一次性消费）。"""
+        paths = getattr(self, '_dropped_paths', []) or []
+        self._dropped_paths = []
+        return paths
+
+    def report_dropped_files(self, event: Any = None) -> Dict[str, Any]:
+        """前端拖拽 drop 事件触发的桥接调用。
+
+        pywebview 6.2+ 的路径注入机制已改为：Python 侧通过 dom.on('drop') 注册
+        原生事件，WebView2 在系统层放行拖拽，pywebviewEventHandler 把
+        pywebviewFullPath 注入到 event.dataTransfer.files。
+        前端调用此方法时，从 _dropped_paths 读取已存储的完整路径。
+        """
+        return {"ok": True, "paths": self.get_dropped_paths()}
 
     def get_files_info(self, paths: List[str]) -> List[Dict[str, Any]]:
         """批量返回附件的名称 / 扩展名 / 大小，供前端附件卡片展示。"""

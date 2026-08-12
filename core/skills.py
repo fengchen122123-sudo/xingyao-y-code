@@ -1,7 +1,9 @@
 import os
 import re
+import sys
 import json
 import glob
+import shutil
 import logging
 import threading
 
@@ -11,6 +13,96 @@ ACTIVE_SKILLS_FILE = config.ACTIVE_SKILLS_FILE
 
 # 激活技能文件写锁，防止并发写互相截断
 _file_lock = threading.Lock()
+
+
+# ------------------------------------------------------------------
+# 内置技能：随安装包发布（PyInstaller datas 打包仓库 skills/ 目录），
+# 首次启动释放到用户级技能目录，之后用户可自由开关 / 修改 / 删除。
+# ------------------------------------------------------------------
+_BUILTIN_SYNC_DONE = False
+
+
+def _builtin_skills_dir():
+    """内置技能源目录：打包后位于 _MEIPASS/skills，开发态为仓库根 skills/。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return os.path.join(meipass, "skills")
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "skills")
+
+
+def _builtin_released_file():
+    """记录已释放过的内置技能名：区分"从未释放"与"用户已删除"，防止重启后复活。"""
+    return os.path.join(os.path.expanduser("~"), ".ycode", "builtin_skills_released.json")
+
+
+def sync_builtin_skills():
+    """把内置技能释放到用户级技能目录（仅缺失时拷贝，绝不覆盖用户改动）。
+
+    - 首次释放的技能默认加入 active_skills.json（默认启用）；
+    - 用户在技能页关闭后，开关状态持久化，不会被重置；
+    - 用户删除技能目录后不会被重新拷贝（通过 builtin_skills_released.json 记录
+      "已释放过"，删除被视为用户主动移除；代价是后续版本的内置技能内容更新
+      不会自动覆盖到已释放过的技能，保持简单可预期）。
+    由 get_skill_dirs() 首次调用时自动触发一次（TUI/GUI 共用，无需各入口手动挂钩）。
+    """
+    global _BUILTIN_SYNC_DONE
+    if _BUILTIN_SYNC_DONE:
+        return
+    _BUILTIN_SYNC_DONE = True
+    src = _builtin_skills_dir()
+    if not os.path.isdir(src):
+        return
+    dest_base = os.path.join(os.path.expanduser("~"), ".ycode", "skills")
+    try:
+        released = config._read_json_with_backup(_builtin_released_file(), default=[])
+    except Exception:
+        released = []
+    if not isinstance(released, list):
+        released = []
+    newly_installed = []
+    released_changed = False
+    try:
+        for entry in sorted(os.listdir(src)):
+            if entry in released:
+                continue  # 释放过（含已被用户删除的），跳过
+            src_dir = os.path.join(src, entry)
+            if not os.path.isdir(src_dir):
+                continue
+            skill_md = None
+            for fname in ("SKILL.md", "skill.md"):
+                if os.path.isfile(os.path.join(src_dir, fname)):
+                    skill_md = fname
+                    break
+            if not skill_md:
+                continue
+            dest_dir = os.path.join(dest_base, entry)
+            if os.path.exists(dest_dir):
+                # 用户已有同名技能：不覆盖，仅标记为已处理（也不强制启用）
+                released.append(entry)
+                released_changed = True
+                continue
+            try:
+                os.makedirs(dest_base, exist_ok=True)
+                shutil.copytree(src_dir, dest_dir)
+                released.append(entry)
+                released_changed = True
+                newly_installed.append(os.path.abspath(os.path.join(dest_dir, skill_md)))
+            except Exception as e:
+                _log_warning("释放内置技能失败 %s -> %s: %s", src_dir, dest_dir, e)
+    except OSError as e:
+        _log_warning("读取内置技能目录失败 %s: %s", src, e)
+        return
+    if released_changed:
+        try:
+            config._atomic_write_json(_builtin_released_file(), released, indent=None)
+        except Exception as e:
+            _log_warning("保存内置技能释放记录失败: %s", e)
+    if newly_installed:
+        # 新释放的技能默认启用；只在 active_skills.json 里追加，不动用户既有选择
+        active_ids = get_active_skill_ids()
+        added = [sid for sid in newly_installed if sid not in active_ids]
+        if added:
+            save_active_skill_ids(active_ids + added)
 
 
 def _log_warning(message, *args):
@@ -67,6 +159,8 @@ def get_skill_dirs():
     也消除 cwd 在用户主目录下时与全局 .agents/skills 重合导致重复扫描的隐患。
     如需扫描项目级目录，请在 config.json 的 skill_search_paths 中显式配置（如 "./.agents/skills"）。
     """
+    # 首次扫描前释放随包内置技能（缺失才拷贝，不覆盖用户改动）
+    sync_builtin_skills()
     dirs = []
     seen = set()  # 按规范化绝对路径去重，防止多个路径指向同一物理位置时重复扫描
     user_home = os.path.expanduser("~")
