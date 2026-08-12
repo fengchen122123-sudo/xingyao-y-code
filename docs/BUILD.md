@@ -37,7 +37,7 @@ cd frontend && npm install && cd ..
 # 3. 一条命令构建全部产物
 venv\Scripts\python build_release.py
 
-# 4. 确认产物：最终交付用户的是 dist\ycode_setup.exe
+# 4. 确认产物：最终交付用户的是 dist\ycode_setup_v{版本}.exe
 dir dist
 ```
 
@@ -46,11 +46,11 @@ dir dist
 `ycode_uninstall.spec` / `ycode_uninstall.py`（卸载程序）、
 `ycode_setup.spec` / `ycode_setup.py`（tkinter 图形化安装向导，同一份源码按内嵌
 marker 区分 full/tui 两种模式）、`packaging/runtime_hook_nullstdout.py`
-（windowed 模式下 stdout 兜底的运行时钩子）、`assets/`（程序与向导图标、
-向导背景图 setup_bg.png）、`config.example.json` 与
+（windowed 模式下 stdout 兜底的运行时钩子）、`assets/`（程序与向导图标）、
+`config.example.json` 与
 `system_prompt.md`（安装时播种到 `~/.ycode` 的默认配置）、`frontend/`
 （Vue 3 前端源码）。版本号唯一来源是 `core/version.py`，安装包版本号
-自动从它读取，不要在别处硬编码。
+与文件名中的版本号都自动从它读取，不要在别处硬编码。
 
 ## 二、一条命令完成构建
 
@@ -61,7 +61,15 @@ venv\Scripts\python build_release.py
 ```
 
 该脚本会依次完成：前端构建 → 核心双主程序编译 → 载荷压缩 → 卸载程序编译 → TUI 独立安装向导
-编译 → 主安装向导编译 → 产物校验，并打印每一步的中文进度（✅ 成功 / ❌ 失败）。
+编译 → 主安装向导编译 → 安装包重命名为带版本号的分发名（步骤 4.5）→ 产物校验，并打印
+每一步的中文进度（✅ 成功 / ❌ 失败）。
+
+### 安装包文件名带版本号（步骤 4.5）
+
+构建期产物用固定名（`ycode_setup.exe` / `ycode_tui_setup.exe`），因为主安装包内嵌的
+`tui/ycode_tui_setup.exe` 由安装引擎按固定名查找。构建完成后统一重命名为
+`ycode_setup_v{版本}.exe` / `ycode_tui_setup_v{版本}.exe` 分发名，并自动清理 dist/
+里上一版本留下的同名旧产物，多渠道分发时可直接从文件名区分新旧。
 
 ### 单文件 zip 载荷（安装向导秒开的关键）
 
@@ -77,8 +85,8 @@ venv\Scripts\python build_release.py
 | --- | --- |
 | `--skip-frontend` | 跳过前端构建，直接复用现有的 `frontend/dist`（适合只改了 Python 代码时快速重新打包；若 `frontend/dist` 从未构建过，生成的 GUI 版会无法加载界面）。 |
 | `--rebuild-frontend` | 强制重新执行 `npm run build`，即使 `frontend/dist/index.html` 已经存在。 |
-| `--tui-only` | 只构建 TUI 相关产物（核心程序包、卸载程序、`ycode_tui_setup.exe`），跳过体积较大的主安装包 `ycode_setup.exe`，适合只想验证/分发命令行版时使用。 |
-| `--setup-only` | 只重建两个安装向导（`ycode_setup.exe` / `ycode_tui_setup.exe`）：跳过前端、核心程序包与卸载程序的编译，从现有 `dist/ycode` 重新压缩载荷后直接走步骤 3/4，全程约 2 分钟。仅改动 `ycode_setup.py` 后快速重建时使用；要求此前已经完整构建过一次（`dist/ycode` 与 `dist/ycode_uninstall.exe` 存在），全新机器上不可用。 |
+| `--tui-only` | 只构建 TUI 相关产物（核心程序包、卸载程序、`ycode_tui_setup_v{版本}.exe`），跳过体积较大的主安装包，适合只想验证/分发命令行版时使用。 |
+| `--setup-only` | 只重建两个安装向导：跳过前端、核心程序包与卸载程序的编译，从现有 `dist/ycode` 重新压缩载荷后直接走步骤 3/4，全程约 2 分钟。仅改动 `ycode_setup.py` 后快速重建时使用；要求此前已经完整构建过一次（`dist/ycode` 与 `dist/ycode_uninstall.exe` 存在），全新机器上不可用。 |
 
 ## 三、构建产物
 
@@ -89,27 +97,41 @@ venv\Scripts\python build_release.py
 | `dist/ycode/Y-code.exe` | GUI 窗口版主程序（`console=False`，双击直接打开窗口，无黑框） |
 | `dist/ycode/ycode.exe` | TUI 控制台版主程序 |
 | `dist/ycode/_internal/` | 两个主程序共享的运行时依赖与数据文件 |
-| `dist/ycode_uninstall.exe` | 独立卸载向导 |
-| `dist/ycode_tui_setup.exe` | TUI 独立安装向导（既内嵌在主安装包里，也可单独分发给只想要命令行版的用户） |
-| `dist/ycode_setup.exe` | 最终交付给用户的主安装包（双击这个即可） |
+| `dist/ycode_uninstall.exe` | 独立卸载向导（经典样式 GUI） |
+| `dist/ycode_tui_setup_v{版本}.exe` | TUI 独立安装向导（既内嵌在主安装包里，也可单独分发给只想要命令行版的用户） |
+| `dist/ycode_setup_v{版本}.exe` | 最终交付给用户的主安装包（双击这个即可） |
+
+> 两个安装向导文件名中的 `{版本}` 自动取 `core/version.py` 的版本号；重命名时会清理
+> dist/ 里上一版本留下的同名旧产物。主安装包内嵌的 `tui/ycode_tui_setup.exe`
+> 仍为固定名（安装引擎按名查找）。
 
 ## 四、可选 TUI 安装机制
 
-`ycode_setup.py` 是同一份源码的 tkinter 图形化向导（欢迎 → 安装选项 → 安装进度 → 完成
-四个页面），靠内嵌的 `setup_mode.txt` marker 文件区分两种运行模式：
+`ycode_setup.py` 是同一份源码的 tkinter 图形化向导（经典 Windows 安装程序样式，
+白色顶部横幅 + 底部 上一步/下一步/取消 按钮组），靠内嵌的 `setup_mode.txt` marker
+文件区分两种运行模式：
 
-- `full` 模式（`ycode_setup.exe`，默认）：
-  1. 选项页可修改安装目录，并有两个复选框（默认都勾选）：
+- `full` 模式（`ycode_setup_v{版本}.exe`，默认）：页面流程为
+  欢迎 → 安装用户 → 路径与选项 → 安装中 → 完成。
+  1. “安装用户”页选择安装范围：
+     - 仅为我安装（推荐）：默认装到 `%LOCALAPPDATA%\Programs\Y-code`，无需管理员，
+       写 HKCU 卸载注册项、用户 PATH、个人桌面快捷方式。
+     - 为所有人安装：默认装到 `%ProgramFiles%\Y-code`，写 HKLM 卸载注册项、系统 PATH、
+       公共桌面快捷方式；非管理员运行时自动以 UAC 提权重启自身（携带安装选项）后继续。
+  2. 选项页可修改安装目录，并有两个复选框（默认都勾选）：
      “同时安装命令行版 CLI” 与 “创建桌面快捷方式”。
-  2. “同时安装命令行版 CLI” 勾选时：保留 `ycode.exe`，把安装目录加入 PATH，
-     创建桌面快捷方式 “Y-code CLI”。不勾选时：从安装目录里删掉 `ycode.exe`，
-     不写 PATH，转而把内嵌的 `ycode_tui_setup.exe` 释放到
-     `<安装目录>\tui\ycode_tui_setup.exe`，完成页提示以后可双击它补装命令行版。
-  3. 无论怎么选，都会释放完整核心程序包（GUI + 依赖）、播种 `~/.ycode` 下的默认
-     配置，并在“控制面板 → 程序和功能”（注册表 `HKCU\...\Uninstall\Y-code`）里
-     注册一条卸载入口。
-- `tui` 模式（`ycode_tui_setup.exe`）：选项页无复选框，只安装 `ycode.exe` 及其依赖，
-  加入 PATH，创建 “Y-code CLI” 快捷方式。如果目标目录已经是一次完整版安装（检测到
+  3. “同时安装命令行版 CLI” 勾选时：保留 `ycode.exe`，把安装目录加入 PATH。
+     不勾选时：从安装目录里删掉 `ycode.exe`，不写 PATH，转而把内嵌的
+     `ycode_tui_setup.exe` 释放到 `<安装目录>\tui\ycode_tui_setup.exe`，
+     完成页提示以后可双击它补装命令行版。
+  4. 重装检测：读取卸载注册表发现已有安装时，自动沿用原安装范围与路径并锁定
+     相关选项，提示本次为覆盖安装。
+  5. 无论怎么选，都会释放完整核心程序包（GUI + 依赖）、播种 `~/.ycode` 下的默认
+     配置与内置技能，并在“应用和功能”里注册一条卸载入口（user 范围写
+     `HKCU\...\Uninstall\Y-code`，machine 范围写 HKLM 同路径）。
+- `tui` 模式（`ycode_tui_setup_v{版本}.exe`）：页面流程为 欢迎 → 路径与选项 → 安装中
+  → 完成（无“安装用户”页，CLI 始终按当前用户安装），只安装 `ycode.exe` 及其依赖，
+  加入用户 PATH，创建 “Y-code CLI” 快捷方式。如果目标目录已经是一次完整版安装（检测到
   `Y-code.exe` 已存在），会直接合并进去，并复用完整版已经注册好的卸载入口，
   不会重复注册。
 
@@ -121,9 +143,15 @@ venv\Scripts\python build_release.py
    "Y-code CLI"）→ 卸载。
 2. 直接运行安装目录下的 `ycode_uninstall.exe`。
 
-卸载向导会清理：桌面快捷方式（GUI 版 + CLI 版，兼容旧版 TUI 命名）、PATH 环境变量里的安装路径、
-注册表里的卸载入口（`Y-code` 与 `Y-code-CLI`（含旧版 `Y-code-TUI`）都会尝试清理）、可选的 `~/.ycode`
-用户配置与会话记录，最后自我删除并清空整个安装目录。
+卸载向导是同款经典样式的图形化向导（欢迎 → 卸载选项 → 卸载中 → 完成），会清理：
+桌面快捷方式（GUI 版 + CLI 版，兼容旧版 TUI 命名）、PATH 环境变量里的安装路径、
+注册表里的卸载入口（`Y-code` 与 `Y-code-CLI`（含旧版 `Y-code-TUI`）都会尝试清理）、
+可选的 `~/.ycode` 用户配置与会话记录（卸载选项页复选框，默认保留），最后自我删除并
+清空整个安装目录。
+
+卸载范围自动适配安装范围：检测到 machine 安装（HKLM 注册项或位于 Program Files）时，
+会额外清理 HKLM 卸载注册项、系统 PATH 与公共桌面快捷方式；非管理员运行时自动发起
+UAC 提权重启后继续。
 
 ## 六、常见问题排查
 
