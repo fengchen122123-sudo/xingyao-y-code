@@ -1,15 +1,18 @@
 # -*- mode: python ; coding: utf-8 -*-
-# 卸载向导：纯 onefile 控制台程序，不依赖任何项目内数据文件（安装目录、注册表
-# 路径等都是运行时通过 sys.executable / winreg 现算的），因此 Analysis 不需要
-# 额外的 datas/hiddenimports。由 build_release.py 直接
-# `pyinstaller --clean --noconfirm ycode_uninstall.spec` 调用，不再用 CLI flag
-# 重复表达一遍同样的配置。
+# 卸载向导：纯 onefile 窗口程序（经典安装程序样式 GUI）。安装目录、注册表路径等
+# 都是运行时通过 sys.executable / winreg 现算的；datas 只带窗口/横幅图标，
+# 与安装向导保持一致的视觉。复用 ycode_setup.py 的基础工具函数，
+# PyInstaller 会随 import 自动打包该模块。由 build_release.py 直接
+# `pyinstaller --clean --noconfirm ycode_uninstall.spec` 调用。
 
 a = Analysis(
     ['ycode_uninstall.py'],
     pathex=[],
     binaries=[],
-    datas=[],
+    datas=[
+        ('assets/ycode.ico', 'assets'),
+        ('assets/ycode.png', 'assets'),
+    ],
     hiddenimports=[],
     hookspath=[],
     hooksconfig={},
@@ -36,7 +39,8 @@ exe = EXE(
     upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
-    console=True,
+    # GUI 卸载向导：不附带控制台窗口
+    console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,
