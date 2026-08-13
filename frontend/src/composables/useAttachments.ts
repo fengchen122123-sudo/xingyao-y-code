@@ -18,6 +18,9 @@ export interface AttachmentItem {
 // ------------------------------------------------------------------
 interface DropWaiter {
   names: string[];
+  // M29：该次拖拽的占位 chip key；removeAttachment 删除占位时同步移除，
+  // 全部被删除时取消等待者，路径到达后不再复活已删附件
+  keys: string[];
   timer: number;
   resolve: (paths: string[]) => void;
 }
@@ -40,9 +43,16 @@ function ensureDropPushBound() {
       const valid = files.filter(f => f && f.path);
       if (!valid.length) return;
       const names = valid.map(f => String(f.name || ''));
-      let idx = dropWaiters.findIndex(w => sameNames(w.names, names));
-      // 名字对不上时（如拖拽被部分过滤）兜底匹配最早的等待者，避免永久悬挂
-      if (idx < 0) idx = dropWaiters.length ? 0 : -1;
+      // M28 修复：从尾部向前找"最新"的同名等待者（同名文件跨目录连续拖拽时，
+      // 路径到达顺序与拖拽顺序一致，最新等待者才是本次拖拽）；
+      // 超时的等待者已被其 timer 自行摘除，数组中存在的即未超时
+      let idx = -1;
+      for (let i = dropWaiters.length - 1; i >= 0; i--) {
+        if (sameNames(dropWaiters[i].names, names)) { idx = i; break; }
+      }
+      // 名字对不上时（如拖拽被部分过滤）仅在唯一等待者时才兜底，
+      // 多等待者场景下盲目兜底最早等待者会错配串单
+      if (idx < 0 && dropWaiters.length === 1) idx = 0;
       if (idx < 0) return;
       const waiter = dropWaiters.splice(idx, 1)[0];
       clearTimeout(waiter.timer);
@@ -50,11 +60,12 @@ function ensureDropPushBound() {
     };
 }
 
-function waitDroppedPaths(names: string[], timeoutMs: number): Promise<string[]> {
+function waitDroppedPaths(names: string[], timeoutMs: number, keys: string[] = []): Promise<string[]> {
   ensureDropPushBound();
   return new Promise(resolve => {
     const waiter: DropWaiter = {
       names,
+      keys: [...keys],
       resolve,
       timer: window.setTimeout(() => {
         const i = dropWaiters.indexOf(waiter);
@@ -64,6 +75,23 @@ function waitDroppedPaths(names: string[], timeoutMs: number): Promise<string[]>
     };
     dropWaiters.push(waiter);
   });
+}
+
+// M29：取消包含指定占位 chip 的等待者中已删除的 key；
+// 该等待者的占位全部被删除时直接取消等待（resolve([]) 走不到 addPaths）
+function cancelWaiterForRemovedChip(path: string) {
+  for (let i = dropWaiters.length - 1; i >= 0; i--) {
+    const w = dropWaiters[i];
+    const ki = w.keys.indexOf(path);
+    if (ki < 0) continue;
+    w.keys.splice(ki, 1);
+    if (!w.keys.length) {
+      dropWaiters.splice(i, 1);
+      clearTimeout(w.timer);
+      w.resolve([]);
+    }
+    return;
+  }
 }
 
 // 输入框附件列表的共享逻辑：选择文件 → 查询文件信息 → 去重维护列表。
@@ -137,6 +165,9 @@ export function useAttachments() {
 
   function removeAttachment(path: string) {
     attachments.value = attachments.value.filter(a => a.path !== path);
+    // M29 修复：删除拖拽占位 chip 时同步取消对应等待者，
+    // 否则 4s 等待结束后路径到达会把已删除的附件复活
+    cancelWaiterForRemovedChip(path);
   }
 
   function clearAttachments() {
@@ -194,7 +225,14 @@ export function useAttachments() {
     // 2) 等待 Python 侧 dom.on('drop') 推送完整路径（事件驱动，替代原先的
     //    "Python 存储 + 前端轮询"——那个方案有竞态：首次拖拽读不到、
     //    连续拖拽读到上一次的旧路径）
-    let paths = await waitDroppedPaths(dropped.map(f => f.name), 4000);
+    let paths = await waitDroppedPaths(dropped.map(f => f.name), 4000, pendingKeys);
+
+    // M29 修复：等待期间用户可能已删除全部占位 chip（等待者被 removeAttachment
+    // 取消，或手动逐个删掉），此时任何通道解析出的路径都不应再复活附件
+    if (!attachments.value.some(a => pendingKeys.includes(a.path))) {
+      removePending();
+      return;
+    }
 
     // 3) 推送超时：兜底轮询一次旧桥接（兼容尚未升级的 Python 侧），再退化为
     //    text/uri-list 解析
@@ -219,10 +257,17 @@ export function useAttachments() {
     }
 
     // 4) 替换占位 chip（等待期间用户可能已手动删除某些占位，removePending 只清还在的）
+    // M29：被删除占位对应的文件不复活——按文件名从解析结果中剔除
+    const removedNames = new Set(
+      pendingKeys
+        .filter(k => !attachments.value.some(a => a.path === k))
+        .map(k => k.replace(/^__pending__\d+_/, '')),
+    );
     removePending();
+    paths = paths.filter(p => !removedNames.has(baseName(p)));
     if (paths.length) {
       await addPaths(paths);
-    } else {
+    } else if (!removedNames.size) {
       store.showToast('未获取到文件路径，请重试或改用「＋」按钮选择文件', 'warn');
     }
   }

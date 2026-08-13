@@ -76,17 +76,22 @@ def ask_user(
         options=choices,
     )
     # 带短超时的轮询等待：取消信号到达时立即跳出，避免线程永久挂起
+    # 默认取消值：future 以异常完成或返回不可 int 化的值时按取消兜底，
+    # 绝不让 selected_index 未绑定或轮询直接崩溃
+    selected_index = CANCELLED_RESULT
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 permission_broker.cancel_owner(resolved_owner)
-                selected_index = CANCELLED_RESULT
                 break
             try:
                 selected_index = int(request.future.result(timeout=_POLL_INTERVAL_SECONDS))
                 break
             except (TimeoutError, _FutureTimeoutError):
                 continue
+            except Exception:
+                permission_broker.cancel_owner(resolved_owner)
+                break
     finally:
         # 异常退出（含 KeyboardInterrupt 等 BaseException）时回收已入队请求，
         # 否则 broker 串行化会让后续所有提问/权限提示永久排队

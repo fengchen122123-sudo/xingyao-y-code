@@ -8,9 +8,9 @@ from core.model_manager import add_provider, load_config
 def test_connection_uses_shared_protocol_request_path(monkeypatch):
     captured = {}
 
-    def fake_request_stream(protocol, kwargs, *, timeout):
+    def fake_request_stream(protocol, kwargs, *, timeout, cancel_event=None):
         captured.update(protocol=protocol, kwargs=kwargs, timeout=timeout)
-        return iter([object()])
+        return iter([object()]), None
 
     monkeypatch.setattr("core.llm._request_stream", fake_request_stream)
 

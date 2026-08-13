@@ -35,12 +35,21 @@ def _redact_export_text(value):
         pass
     text = re.sub(r"(?i)\bBearer\s+[^\s\"',;]+", "Bearer ***", text)
     text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(@)", r"\1***\2", text)
+    # 按 key 名匹配敏感字段：token/secret/password/key= 等 k=v / k:v 形式
     text = re.sub(
-        r"(?i)(\b(?:api[_-]?key|token|secret|password|passwd|auth)\s*[=:]\s*)[^\s,;]+",
+        r"(?i)(\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|auth|key)\s*[=:]\s*)[^\s,;&\"']+",
         r"\1***",
         text,
     )
-    return re.sub(r"\b(?:sk|ghp|glpat)-[A-Za-z0-9_.-]{8,}\b", "***", text)
+    # 常见 provider 密钥前缀（dash/underscore 分隔族 + Google AIza / AWS AKIA|ASIA / Google OAuth ya29.）
+    text = re.sub(
+        r"\b(?:sk|ghp|gho|ghu|ghs|ghr|glpat|hf|xoxb|xoxp|xoxa|xoxs)[-_][A-Za-z0-9_.-]{8,}\b",
+        "***",
+        text,
+    )
+    text = re.sub(r"\bAIza[A-Za-z0-9_-]{20,}\b", "***", text)
+    text = re.sub(r"\b(?:AKIA|ASIA)[A-Z0-9]{16}\b", "***", text)
+    return re.sub(r"\bya29\.[A-Za-z0-9._-]{10,}\b", "***", text)
 
 
 def _escape_html(text):

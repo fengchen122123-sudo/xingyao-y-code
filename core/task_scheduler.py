@@ -85,6 +85,25 @@ class TaskScheduler:
         self._verification_processes: dict[str, subprocess.Popen] = {}
         self._paused = False
         self._custom_verification_runner = verification_runner
+        # 记录创建时计划绑定的会话：shutdown 仅在会话未切换时回写在途项，
+        # 避免误改 bind_session 后新会话的同名计划项
+        self._plan_session_id = plan.session_id
+        self._reset_orphaned_in_progress()
+
+    def _reset_orphaned_in_progress(self) -> None:
+        """新调度器接管计划时兜底复位遗留 in_progress 项。
+
+        新实例的在途集合必然为空，此时任何 in_progress 项都是上一任调度器
+        异常退出（未走 shutdown/cancel_all）留下的孤儿：ready_items 不会选中它，
+        retry 也拒绝从 in_progress 恢复，不复位就会永久卡死。"""
+        for item in self.plan.snapshot():
+            if item.get("status") == "in_progress":
+                self.plan.update(
+                    item["id"],
+                    status="pending",
+                    error="调度器重建后已恢复为待执行",
+                    expected_status="in_progress",
+                )
 
     @property
     def paused(self) -> bool:
@@ -115,13 +134,17 @@ class TaskScheduler:
             self._revive_blocked_items()
             selected: list[dict[str, Any]] = []
             claimed = set(self._in_flight_files)
-            for item in self.plan.ready_items():
+            # ready_items 只取一次快照，整轮认领基于同一时刻判定，
+            # 避免每个候选项重复 O(n) 查询且两次快照间被其他线程改写
+            ready = self.plan.ready_items()
+            ready_ids = {candidate["id"] for candidate in ready}
+            for item in ready:
                 files = set(item.get("files", []))
                 if files & claimed:
                     continue
                 if len(self._in_flight_ids) >= self.max_workers:
                     break
-                current = self._start_item_locked(item, claimed=claimed)
+                current = self._start_item_locked(item, claimed=claimed, ready_ids=ready_ids)
                 if current is None:
                     continue
                 selected.append(current)
@@ -173,9 +196,14 @@ class TaskScheduler:
         *,
         claimed: set[str] | None = None,
         owner: str | None = None,
+        ready_ids: set[str] | None = None,
     ) -> dict[str, Any] | None:
         files = set(item.get("files", []))
-        if not self.plan.ready_items() or item["id"] not in {candidate["id"] for candidate in self.plan.ready_items()}:
+        # 调用方未提供共享快照时才自行查询，且只查一次（旧实现连续调用两次
+        # ready_items，两次快照之间可能被其他线程改写导致判定不一致）
+        if ready_ids is None:
+            ready_ids = {candidate["id"] for candidate in self.plan.ready_items()}
+        if item["id"] not in ready_ids:
             return None
         if files & self._in_flight_files:
             return None
@@ -323,13 +351,28 @@ class TaskScheduler:
         return cancelled
 
     def shutdown(self) -> None:
-        """会话被切换后调用：终止在途验证进程并清空在途记录，不回写已失效的计划。"""
+        """会话被切换后调用：终止在途验证进程并清空在途记录。
+
+        计划仍绑定原会话时把在途项回写 pending；计划已被新会话接管时
+        （bind_session 已替换全部计划项）不回写，避免误改新会话同名计划项。"""
         with self._lock:
             processes = list(self._verification_processes.values())
             self._verification_processes.clear()
+            in_flight_ids = set(self._in_flight_ids)
             self._in_flight_ids.clear()
             self._in_flight_files.clear()
             self._item_callbacks.clear()
+            can_write_back = self.plan.session_id == self._plan_session_id
+        # 不回写已失效的计划；会话未切换时在途项必须复位 pending，
+        # 否则计划项永久卡在 in_progress（不会被重新调度也无法 retry）
+        if can_write_back:
+            for item_id in in_flight_ids:
+                self.plan.update(
+                    item_id,
+                    status="pending",
+                    error="调度器关闭时已中断，恢复为待执行",
+                    expected_status="in_progress",
+                )
         for process in processes:
             if process.poll() is None:
                 _stop_process_tree(process)
@@ -462,6 +505,9 @@ class TaskScheduler:
 
 _DEFAULT_SCHEDULER: TaskScheduler | None = None
 _DEFAULT_SCHEDULER_SESSION: str | None = None
+# 全局单例的创建/切换锁：两线程并发首次调用必须只建一个实例，
+# 否则同一计划项会被两个调度器重复认领执行
+_DEFAULT_SCHEDULER_LOCK = threading.RLock()
 
 
 def get_default_scheduler(
@@ -474,17 +520,19 @@ def get_default_scheduler(
     global _DEFAULT_SCHEDULER, _DEFAULT_SCHEDULER_SESSION
     plan = get_default_plan_manager()
     session_id = plan.session_id
-    if _DEFAULT_SCHEDULER is not None and _DEFAULT_SCHEDULER_SESSION != session_id:
-        # 会话切换时收尾旧调度器，避免 in-flight 项回调失联；
-        # 若旧计划仍有效则 cancel_all，否则只清理在途资源（计划可能已被新会话替换）
-        if _DEFAULT_SCHEDULER.plan.session_id == _DEFAULT_SCHEDULER_SESSION:
-            _DEFAULT_SCHEDULER.cancel_all()
-        else:
-            _DEFAULT_SCHEDULER.shutdown()
-        _DEFAULT_SCHEDULER = None
-    if _DEFAULT_SCHEDULER is None:
-        _DEFAULT_SCHEDULER = TaskScheduler(plan, event_callback=event_callback)
-        _DEFAULT_SCHEDULER_SESSION = session_id
-    elif event_callback is not None:
-        _DEFAULT_SCHEDULER.set_event_callback(event_callback)
-    return _DEFAULT_SCHEDULER
+    # 读取-判定-创建全程持锁（RLock 允许会话切换时 cancel_all 的事件回调重入）
+    with _DEFAULT_SCHEDULER_LOCK:
+        if _DEFAULT_SCHEDULER is not None and _DEFAULT_SCHEDULER_SESSION != session_id:
+            # 会话切换时收尾旧调度器，避免 in-flight 项回调失联；
+            # 若旧计划仍有效则 cancel_all，否则只清理在途资源（计划可能已被新会话替换）
+            if _DEFAULT_SCHEDULER.plan.session_id == _DEFAULT_SCHEDULER_SESSION:
+                _DEFAULT_SCHEDULER.cancel_all()
+            else:
+                _DEFAULT_SCHEDULER.shutdown()
+            _DEFAULT_SCHEDULER = None
+        if _DEFAULT_SCHEDULER is None:
+            _DEFAULT_SCHEDULER = TaskScheduler(plan, event_callback=event_callback)
+            _DEFAULT_SCHEDULER_SESSION = session_id
+        elif event_callback is not None:
+            _DEFAULT_SCHEDULER.set_event_callback(event_callback)
+        return _DEFAULT_SCHEDULER

@@ -166,7 +166,7 @@ def test_responses_protocol_calls_native_responses_api(monkeypatch):
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("不得降级到 completion")),
     )
 
-    stream = llm._request_stream(
+    stream, _holder = llm._request_stream(
         "responses",
         {
             "model": "openai/deepseek-v4-pro",

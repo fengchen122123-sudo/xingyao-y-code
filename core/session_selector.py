@@ -47,10 +47,16 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
         mgr = None
         cur_session = "default"
 
+    try:
+        # DB 锁定/异常不能导致选择器打开即崩溃：空列表兜底，用户仍可 Esc 退出
+        sessions = mgr.get_all_sessions(workdir=os.getcwd()) if mgr else []
+    except Exception:
+        sessions = []
+
     state = {
         "cursor": 0,
         # 只显示当前工作目录下创建的会话（历史遗留的无目录会话仍可见）
-        "sessions": mgr.get_all_sessions(workdir=os.getcwd()) if mgr else [],
+        "sessions": sessions,
         "current": cur_session,
         "notice": "",
         "confirm_delete": None,

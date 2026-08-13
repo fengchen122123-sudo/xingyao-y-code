@@ -1,5 +1,6 @@
 """Structured events emitted while an agent turn is running."""
 
+import logging
 import threading
 from copy import deepcopy
 from dataclasses import dataclass
@@ -36,7 +37,17 @@ class TurnEventFactory:
         with self._sequence_lock:
             self._sequence += 1
             sequence = self._sequence
-        snapshot = deepcopy(dict(payload or {}))
+        # T3 修复：payload 含锁/句柄/generator 等不可深拷贝对象时，
+        # deepcopy 异常会冒泡中断整个 turn；退回浅拷贝并记日志。
+        try:
+            snapshot = deepcopy(dict(payload or {}))
+        except Exception:
+            logging.getLogger("py.warnings").warning(
+                "TurnEvent payload deepcopy failed (kind=%s), fallback to shallow copy",
+                kind,
+                exc_info=True,
+            )
+            snapshot = dict(payload or {})
         return TurnEvent(
             turn_id=self.turn_id,
             sequence=sequence,

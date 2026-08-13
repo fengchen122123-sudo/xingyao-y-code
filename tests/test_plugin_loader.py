@@ -7,6 +7,9 @@ import pytest
 from core import plugin_loader
 from core.tool_registry import ToolRegistry
 
+# autouse fixture 会替换 _confirm_plugin_trust，这里在导入期保留原始实现
+_REAL_CONFIRM = plugin_loader._confirm_plugin_trust
+
 
 def _make_plugin(plugin_dir, name, body, enabled=True, entry="plugin.py"):
     plugin_dir.mkdir(parents=True, exist_ok=True)
@@ -54,6 +57,13 @@ def plugin_env(tmp_path, monkeypatch):
     builtin_dir.mkdir()
     monkeypatch.setattr(plugin_loader, "plugin_dirs", lambda: [user_dir, builtin_dir])
     return user_dir, builtin_dir
+
+
+@pytest.fixture(autouse=True)
+def _trust_env(tmp_path, monkeypatch):
+    """隔离信任持久化文件，并默认自动通过信任确认（信任机制有专项测试覆盖）。"""
+    monkeypatch.setattr(plugin_loader, "_trust_file", lambda: tmp_path / "plugin_trust.json")
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: True)
 
 
 def test_load_plugin_registers_tool(plugin_env):
@@ -292,4 +302,106 @@ def test_refresh_plugins_records_disabled_new_plugin(plugin_env):
     infos = plugin_loader.get_plugin_infos()
     assert len(infos) == 1
     assert infos[0]["status"] == "disabled"
+    assert registry.execute("demo_tool").is_error
+
+
+# ── 插件信任机制：首次加载/指纹变化需确认 ─────────────────────────
+
+def test_user_plugin_skipped_when_not_confirmed(plugin_env, monkeypatch, caplog):
+    """headless/未确认场景：用户级插件跳过加载并记 warning"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
+
+    registry = ToolRegistry()
+    with caplog.at_level("WARNING", logger="ycode.plugins"):
+        loaded = plugin_loader.load_and_register(registry)
+
+    assert loaded == []
+    assert registry.execute("demo_tool").is_error
+    infos = plugin_loader.get_plugin_infos()
+    assert infos[0]["status"] == "untrusted"
+    assert any("未获信任" in r.message for r in caplog.records)
+
+
+def test_user_plugin_loads_after_confirmation_persisted(plugin_env, monkeypatch, tmp_path):
+    """确认一次后指纹持久化，之后无需再确认即可加载"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == ["demo"]
+    trust = json.loads((tmp_path / "plugin_trust.json").read_text(encoding="utf-8"))
+    assert len(trust) == 1
+
+    # 模拟下次启动：确认回调被拒绝，但指纹已持久化，仍应直接加载
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
+    registry2 = ToolRegistry()
+    assert plugin_loader.load_and_register(registry2) == ["demo"]
+
+
+def test_fingerprint_change_requires_reconfirmation(plugin_env, monkeypatch):
+    """已信任插件内容被篡改（指纹变化）后必须重新确认"""
+    user_dir, _ = plugin_env
+    plugin_dir = user_dir / "demo"
+    _make_plugin(plugin_dir, "demo", _GOOD_PLUGIN)
+    assert plugin_loader.load_and_register(ToolRegistry()) == ["demo"]
+
+    (plugin_dir / "plugin.py").write_text(_GOOD_PLUGIN + "\nX = 1\n", encoding="utf-8")
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
+
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == []
+    assert plugin_loader.get_plugin_infos()[0]["status"] == "untrusted"
+
+
+def test_builtin_plugin_auto_trusted(plugin_env, monkeypatch):
+    """内置插件随仓库发布：记录指纹并自动信任，无需确认"""
+    _, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "demo", "demo", _GOOD_PLUGIN)
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
+
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == ["demo"]
+
+
+def test_trust_prompt_callback_allows_loading(plugin_env, monkeypatch):
+    """入口层注册的确认回调返回 True 时加载"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    monkeypatch.setattr(plugin_loader, "_trust_prompt", lambda path, name, fp: True)
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", _REAL_CONFIRM)
+
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == ["demo"]
+
+
+def test_disabled_plugin_does_not_trigger_trust_prompt(plugin_env, monkeypatch):
+    """禁用插件不加载也不应弹出信任确认"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
+
+    def _boom(*a, **k):
+        raise AssertionError("禁用插件不应触发信任确认")
+
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", _boom)
+
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == []
+    assert plugin_loader.get_plugin_infos()[0]["status"] == "disabled"
+
+
+def test_toggle_enable_untrusted_plugin_refused(plugin_env, monkeypatch, tmp_path):
+    """热启用未获信任的插件：拒绝加载"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
+
+    ok, msg = plugin_loader.toggle_plugin("off", True)
+
+    assert ok is False
+    assert "信任" in msg
     assert registry.execute("demo_tool").is_error

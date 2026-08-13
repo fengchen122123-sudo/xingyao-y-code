@@ -164,6 +164,22 @@ def _compress_image_bytes(
         return CompressedImage(encoded, mime_types[source_format], source_format)
 
 
+def _is_within_sandbox(file_path):
+    """M38 修复：@ 挂载/绝对路径挂载必须与 core/tools.py 走同一套沙盒边界校验。
+
+    只读复用 tools.py 的 _resolve_workspace_path（不修改 tools.py）：
+    默认仅允许当前工作目录内的路径；/sandbox on（或会话级/线程级放行）时与
+    read_file 一样放行工作目录外路径。越界返回 False，由调用方跳过该附件，
+    避免 ../.env、C:\\...\\id_rsa 之类的敏感文件被直接内联进 LLM 上下文并持久化。
+    """
+    try:
+        from core.tools import _resolve_workspace_path
+        _resolve_workspace_path(file_path, allow_trusted_read=True)
+        return True
+    except Exception:
+        return False
+
+
 def parse_user_input(text):
     """
     解析用户输入中的文件路径（包括 @文件 和绝对路径）。
@@ -208,6 +224,13 @@ def parse_user_input(text):
     img_cfg = _load_image_compression_config()
 
     for file_path in extracted_files:
+        # M38 修复：越界路径拒绝挂载（与 read_file 的沙盒语义一致），
+        # 防止绕过工具层权限审批把沙盒外文件内联进 prompt。
+        if not _is_within_sandbox(file_path):
+            attached_msgs.append(
+                f"⚠️ 已跳过工作目录外的文件（可通过 /sandbox on 开放）: {os.path.basename(file_path)}"
+            )
+            continue
         if _is_image_file(file_path):
             try:
                 # 原始文件限制保护读取内存，解码后另有像素数量限制。

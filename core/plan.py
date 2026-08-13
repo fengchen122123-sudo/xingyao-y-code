@@ -29,6 +29,36 @@ TERMINAL_STATUSES = frozenset({"completed", "failed", "blocked", "cancelled"})
 PlanEventCallback = Callable[[str, dict[str, Any]], None]
 
 
+# ---------------------------------------------------------------------------
+# 计划续推抑制：用户主动取消回合后，llm 收尾时的"计划尚未执行完毕，请继续
+# run_subagent" nudge 会把刚取消的任务复活。suppress 后不再自动续推；
+# 计划项再次进入 in_progress（用户明确要求继续、模型重新派发）或计划清空时
+# 自动解除（见 clear_plan_auto_continue_suppression 的调用点）。
+# ---------------------------------------------------------------------------
+_PLAN_AUTO_CONTINUE_SUPPRESSED: set[str] = set()
+_PLAN_AUTO_CONTINUE_LOCK = threading.Lock()
+
+
+def suppress_plan_auto_continue(session_id: str) -> None:
+    """标记某会话的计划自动续推被用户取消抑制（GUI stop / TUI Ctrl+C 调用）。"""
+    if not session_id:
+        return
+    with _PLAN_AUTO_CONTINUE_LOCK:
+        _PLAN_AUTO_CONTINUE_SUPPRESSED.add(str(session_id))
+
+
+def plan_auto_continue_suppressed(session_id: str) -> bool:
+    with _PLAN_AUTO_CONTINUE_LOCK:
+        return str(session_id) in _PLAN_AUTO_CONTINUE_SUPPRESSED
+
+
+def clear_plan_auto_continue_suppression(session_id: str) -> None:
+    if not session_id:
+        return
+    with _PLAN_AUTO_CONTINUE_LOCK:
+        _PLAN_AUTO_CONTINUE_SUPPRESSED.discard(str(session_id))
+
+
 def _starts_with_cjk(text: str) -> bool:
     first = str(text or "").lstrip()[:1]
     return bool(first and "\u3400" <= first <= "\u9fff")
@@ -296,19 +326,27 @@ class PlanManager:
         visiting: set[str] = set()
         visited: set[str] = set()
 
-        def visit(item_id: str) -> None:
-            if item_id in visiting:
-                raise ValueError(f"plan dependency cycle involving: {item_id}")
-            if item_id in visited:
-                return
-            visiting.add(item_id)
-            for dependency in graph[item_id]:
-                visit(dependency)
-            visiting.remove(item_id)
-            visited.add(item_id)
-
-        for item_id in graph:
-            visit(item_id)
+        # 迭代式 DFS：超长依赖链（>1000 项）不会触发 RecursionError
+        for start in graph:
+            if start in visited:
+                continue
+            visiting.add(start)
+            stack = [(start, iter(graph[start]))]
+            while stack:
+                node, dependencies = stack[-1]
+                descended = False
+                for dependency in dependencies:
+                    if dependency in visiting:
+                        raise ValueError(f"plan dependency cycle involving: {dependency}")
+                    if dependency not in visited:
+                        visiting.add(dependency)
+                        stack.append((dependency, iter(graph[dependency])))
+                        descended = True
+                        break
+                if not descended:
+                    visiting.discard(node)
+                    visited.add(node)
+                    stack.pop()
 
     def _dependencies_completed_locked(self, item: dict[str, Any]) -> bool:
         status_by_id = {candidate["id"]: candidate["status"] for candidate in self._items}
@@ -394,6 +432,16 @@ def plan_write(items: list[dict[str, Any]] | None = None) -> str:
         return (
             f"计划参数错误：items 必须是数组，当前收到的是 {type(items).__name__}。"
             "请重新调用 plan_write(items=[...]) 并传入正确的计划项列表。"
+        )
+    invalid_items = [item for item in items if not isinstance(item, dict)]
+    if invalid_items:
+        # LLM 可能生成 items=[{...}, "oops"] 这类混合数组，必须在推导字段前
+        # 拦截，否则后续 item.get 会抛 AttributeError 击穿工具的错误文案契约
+        return (
+            f"计划参数错误：items 数组中有 {len(invalid_items)} 个元素不是对象"
+            f"（第 1 个非法元素：{invalid_items[0]!r}，类型 {type(invalid_items[0]).__name__}）。"
+            "每个计划项必须是对象，至少包含 id 和 subject 字段，"
+            '例如 {"id": "task1", "subject": "任务描述"}。请修正后重新调用 plan_write。'
         )
     non_pending = [
         f"'{item.get('id', '?')}'(status={item.get('status', 'pending')})"

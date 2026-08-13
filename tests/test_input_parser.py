@@ -28,8 +28,10 @@ def test_at_file_text_attachment(tmp_path, monkeypatch):
     assert any("note.txt" in m for m in msgs)
 
 
-def test_backslash_absolute_path_is_extracted(tmp_path):
-    """反斜杠盘符绝对路径 D:\\... 仍可识别"""
+def test_backslash_absolute_path_is_extracted(tmp_path, monkeypatch):
+    """反斜杠盘符绝对路径 D:\\... 仍可识别（模拟 /sandbox on 放行工作目录外路径）"""
+    # M38：默认沙盒下工作目录外路径会被拒绝，这里显式模拟 /sandbox on
+    monkeypatch.setattr(input_parser, "_is_within_sandbox", lambda p: True)
     p = tmp_path / "back.txt"
     p.write_text("backslash-data", encoding="utf-8")
 
@@ -38,8 +40,9 @@ def test_backslash_absolute_path_is_extracted(tmp_path):
     assert "backslash-data" in content
 
 
-def test_forward_slash_absolute_path_is_extracted(tmp_path):
-    """正斜杠盘符绝对路径 D:/... 也必须识别"""
+def test_forward_slash_absolute_path_is_extracted(tmp_path, monkeypatch):
+    """正斜杠盘符绝对路径 D:/... 也必须识别（模拟 /sandbox on 放行工作目录外路径）"""
+    monkeypatch.setattr(input_parser, "_is_within_sandbox", lambda p: True)
     p = tmp_path / "fwd.txt"
     p.write_text("forward-data", encoding="utf-8")
     fwd = str(p).replace("\\", "/")
@@ -47,6 +50,19 @@ def test_forward_slash_absolute_path_is_extracted(tmp_path):
     content, msgs = parse_user_input(f"分析 {fwd} 谢谢")
 
     assert "forward-data" in content
+
+
+def test_outside_workspace_attachment_is_rejected(tmp_path, monkeypatch):
+    """M38：默认沙盒下，工作目录外的文件不得被内联进 prompt"""
+    # 强制默认沙盒语义（不受本机 /sandbox on 配置影响）
+    monkeypatch.setattr("core.tools._outside_workspace_allowed", lambda: False)
+    p = tmp_path / "secret.txt"
+    p.write_text("top-secret", encoding="utf-8")
+
+    content, msgs = parse_user_input(f"分析 {str(p)}")
+
+    assert "top-secret" not in str(content)
+    assert any("已跳过" in m for m in msgs)
 
 
 def test_binary_file_path_is_attached(tmp_path, monkeypatch):

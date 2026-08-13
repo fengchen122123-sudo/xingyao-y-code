@@ -157,7 +157,9 @@ def test_bridge_error_then_turn_error_has_single_message_owner(monkeypatch):
 
 def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch):
     bridge = ApiBridge.__new__(ApiBridge)
-    bridge._bg_summary_pending_session = ""
+    bridge._bg_summary_pending_sessions = set()
+    bridge._bg_summary_lock = threading.Lock()
+    bridge._active_turn_ids = {}
     bridge._cancel_events = {"session": threading.Event()}
     bridge._active_turns = {}
     bridge._delta_buffers = {}
@@ -190,12 +192,14 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._cancel_events = {"project-session": threading.Event()}
     bridge._active_turns = {}
+    bridge._active_turn_ids = {}
     bridge._delta_buffers = {}
     bridge._delta_kinds = {}
     bridge._delta_lock = threading.Lock()
     bridge._delta_last_flush = 0.0
     bridge._delta_flusher = None
-    bridge._bg_summary_pending_session = ""
+    bridge._bg_summary_pending_sessions = set()
+    bridge._bg_summary_lock = threading.Lock()
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
     bridge._sync_active_model_context = lambda: None
@@ -237,12 +241,14 @@ def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._cancel_events = {"session_abc123": threading.Event()}
     bridge._active_turns = {}
+    bridge._active_turn_ids = {}
     bridge._delta_buffers = {}
     bridge._delta_kinds = {}
     bridge._delta_lock = threading.Lock()
     bridge._delta_last_flush = 0.0
     bridge._delta_flusher = None
-    bridge._bg_summary_pending_session = ""
+    bridge._bg_summary_pending_sessions = set()
+    bridge._bg_summary_lock = threading.Lock()
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
     bridge._sync_active_model_context = lambda: None
@@ -316,12 +322,14 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._cancel_events = {"session": threading.Event()}
     bridge._active_turns = {}
+    bridge._active_turn_ids = {}
     bridge._delta_buffers = {}
     bridge._delta_kinds = {}
     bridge._delta_lock = threading.Lock()
     bridge._delta_last_flush = 0.0
     bridge._delta_flusher = None
-    bridge._bg_summary_pending_session = ""
+    bridge._bg_summary_pending_sessions = set()
+    bridge._bg_summary_lock = threading.Lock()
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
     bridge._sync_active_model_context = lambda: None
@@ -419,3 +427,159 @@ def test_bridge_forwards_round_started_event(monkeypatch):
     emitted = consume_bridge_events(monkeypatch, events)
 
     assert any(kind == "round_started" and data.get("round") == 2 for kind, data in emitted)
+
+
+class _AliveThread:
+    """模拟存活的回合线程（is_alive 恒真）。"""
+
+    def is_alive(self):
+        return True
+
+
+def test_stop_current_turn_cancels_permission_wait_and_foreground_subagents(monkeypatch):
+    """H6：停止回合必须同步取消权限等待（owner=turn_id）与前台子代理，
+    否则回合线程悬置在 broker 等待或 run_subagent 上，一直持有 _turn_workdir_lock。"""
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._cancel_events = {"session": threading.Event()}
+    bridge._active_turn_ids = {"session": "session:turn-1"}
+
+    cancelled_owners = []
+    monkeypatch.setattr(
+        "gui_bridge.permission_broker.cancel_owner",
+        lambda owner: cancelled_owners.append(owner),
+    )
+    import core.tools as core_tools
+
+    cancelled_foreground = []
+    monkeypatch.setattr(
+        core_tools.subagent_manager,
+        "cancel_foreground",
+        lambda session, turn_id: cancelled_foreground.append((session, turn_id)),
+    )
+
+    res = bridge.stop_current_turn()
+
+    assert res["ok"] is True
+    assert bridge._cancel_events["session"].is_set()
+    assert cancelled_owners == ["session:turn-1"]
+    assert cancelled_foreground == [("session", "session:turn-1")]
+
+
+def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch):
+    """回合运行期间 _active_turn_ids 记录 session → turn_id，结束后清理；
+    回合结束按 turn_id（不是会话名）清理权限 broker 的残留等待。"""
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._cancel_events = {"session": threading.Event()}
+    bridge._active_turns = {}
+    bridge._active_turn_ids = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
+    bridge._bg_summary_pending_sessions = set()
+    bridge._bg_summary_lock = threading.Lock()
+    bridge._current_permission_mode = "confirm"
+    bridge._emit_token_usage = lambda: None
+    bridge._sync_active_model_context = lambda: None
+    bridge._session_workdir = lambda _session_name: "GLOBAL"
+    bridge._subagent_progress_poller = lambda _s, _stop: None
+    bridge._maybe_auto_rename = lambda _s: None
+    bridge._memory = type("Memory", (), {
+        "ensure_session": lambda self, *a, **k: None,
+        "add_message": lambda self, *a, **k: None,
+    })()
+    bridge.emit_event = lambda _kind, _data: None
+
+    seen_turn_ids = []
+
+    def capture_turn_id(*args, **kwargs):
+        seen_turn_ids.append(bridge._active_turn_ids.get("session"))
+        return False
+
+    bridge._consume_turn_events = capture_turn_id
+
+    cancelled_owners = []
+    monkeypatch.setattr(
+        "gui_bridge.permission_broker.cancel_owner",
+        lambda owner: cancelled_owners.append(owner),
+    )
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {
+        "litellm_model": "model",
+        "api_key": "key",
+        "base_url": None,
+        "context_window": 128000,
+    })
+    monkeypatch.setattr("core.input_parser.parse_user_input", lambda text: (text, []))
+    monkeypatch.setattr("core.agent_service.prepare_turn_messages", lambda *a, **k: [])
+    monkeypatch.setattr("core.memory.begin_turn_checkpoint", lambda *a, **k: None)
+    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
+
+    bridge._run_turn_worker("hello", "session")
+
+    assert seen_turn_ids and seen_turn_ids[0].startswith("session:")
+    assert "session" not in bridge._active_turn_ids
+    # 清理必须按 turn_id，历史实现传会话名永远不命中
+    assert cancelled_owners == seen_turn_ids
+
+
+def test_bg_summary_pending_is_bucketed_per_session(monkeypatch):
+    """M22：pending 按会话分桶，多会话并行时互不覆盖；回合结束只消费自己的桶。"""
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._shutting_down = False
+    bridge._bg_summary_pending_sessions = set()
+    bridge._bg_summary_lock = threading.Lock()
+    bridge._active_turns = {"s1": _AliveThread(), "s2": _AliveThread()}
+    bridge._turn_start_lock = threading.Lock()
+
+    monkeypatch.setattr(
+        "core.tools.subagent_manager.has_running_background_tasks",
+        lambda session: False,
+    )
+
+    bridge._maybe_start_bg_summary_turn("s1")
+    bridge._maybe_start_bg_summary_turn("s2")
+
+    assert bridge._bg_summary_pending_sessions == {"s1", "s2"}
+
+
+def test_stop_current_turn_marks_user_cancelled_and_skips_bg_summary(monkeypatch):
+    """用户点终止后：记录取消标记、清掉挂起的自动汇总、抑制计划续推；
+    _maybe_start_bg_summary_turn 对该会话不再自动发起汇总回合。"""
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._cancel_events = {"session": threading.Event()}
+    bridge._active_turn_ids = {}
+    bridge._bg_summary_lock = threading.Lock()
+    bridge._bg_summary_pending_sessions = {"session"}
+
+    res = bridge.stop_current_turn()
+
+    assert res["ok"] is True
+    assert "session" in bridge._user_cancelled_sessions
+    assert "session" not in bridge._bg_summary_pending_sessions
+
+    # 计划续推抑制已生效（core.plan 模块级状态，用后清理）
+    from core.plan import (
+        clear_plan_auto_continue_suppression,
+        plan_auto_continue_suppressed,
+    )
+    assert plan_auto_continue_suppressed("session")
+
+    # 被用户取消的会话不自动发起汇总回合：提前返回，不入 triggered、不起线程
+    bridge._shutting_down = False
+    bridge._turn_start_lock = threading.Lock()
+    bridge._active_turns = {}
+    bridge._bg_summary_triggered = set()
+    import core.tools as core_tools
+    monkeypatch.setattr(
+        core_tools.subagent_manager, "has_running_background_tasks", lambda s: False
+    )
+
+    bridge._maybe_start_bg_summary_turn("session")
+
+    assert "session" not in bridge._bg_summary_triggered
+    assert "session" not in bridge._active_turns
+
+    clear_plan_auto_continue_suppression("session")

@@ -31,13 +31,17 @@ frontmatter 字段：
 
 import os
 import re
+import hashlib
 import logging
 import threading
 
 # 内置 5 种 type，自定义 name 与之重名时跳过
 BUILTIN_SUBAGENT_TYPES = {"explore", "implement", "test", "review", "general"}
 
-# 扫描结果缓存与上次扫描的 mtime 指纹，避免每次调用都重扫磁盘
+# 指纹内容哈希只对小文件计算（子 agent 定义文件正常只有几 KB）
+_FINGERPRINT_HASH_MAX_BYTES = 256 * 1024
+
+# 扫描结果缓存与上次扫描的文件指纹，避免每次调用都重扫磁盘
 _cache_lock = threading.Lock()
 _cache = {"fingerprint": None, "subagents": []}
 
@@ -90,7 +94,7 @@ def get_agent_search_dirs():
 
 
 def _compute_fingerprint(dirs):
-    """计算扫描目录的 mtime 指纹，用于判断是否需要重新扫描。"""
+    """计算扫描目录的内容指纹，用于判断是否需要重新扫描。"""
     fingerprint = []
     for d in dirs:
         if not os.path.isdir(d):
@@ -100,7 +104,18 @@ def _compute_fingerprint(dirs):
                 full = os.path.join(d, entry)
                 if os.path.isfile(full) and entry.lower().endswith(".md"):
                     stat = os.stat(full)
-                    fingerprint.append((full, stat.st_mtime, stat.st_size))
+                    entry_fp = (full, stat.st_mtime, stat.st_size)
+                    # 仅有 (mtime, size) 时等长改写（同长替换/mtime 保留工具）会
+                    # 命中旧缓存；小文件附带内容哈希，让指纹真实反映内容变化
+                    if stat.st_size <= _FINGERPRINT_HASH_MAX_BYTES:
+                        try:
+                            with open(full, "rb") as fh:
+                                entry_fp = entry_fp + (
+                                    hashlib.sha256(fh.read()).hexdigest()[:16],
+                                )
+                        except Exception:
+                            pass
+                    fingerprint.append(entry_fp)
         except Exception:
             continue
     return tuple(fingerprint)

@@ -249,3 +249,23 @@ def test_plan_write_rejects_non_list_items():
         assert manager.snapshot() == []
     finally:
         bind_default_plan_session(previous_session)
+
+
+def test_plan_auto_continue_suppression_lifecycle():
+    """用户取消 → suppress；恢复执行/计划清空 → clear；空会话名是 no-op。"""
+    from core.plan import (
+        clear_plan_auto_continue_suppression,
+        plan_auto_continue_suppressed,
+        suppress_plan_auto_continue,
+    )
+
+    session = "s-nudge-suppress"
+    try:
+        assert not plan_auto_continue_suppressed(session)
+        suppress_plan_auto_continue(session)
+        assert plan_auto_continue_suppressed(session)
+        suppress_plan_auto_continue("")  # no-op，不抛异常
+        clear_plan_auto_continue_suppression(session)
+        assert not plan_auto_continue_suppressed(session)
+    finally:
+        clear_plan_auto_continue_suppression(session)

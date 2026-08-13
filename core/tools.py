@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import Request, build_opener, HTTPRedirectHandler
 from xml.sax.saxutils import escape
 
 from ddgs import DDGS
@@ -40,8 +40,77 @@ READ_FILE_MAX_LINES = 2000
 # 大文件阈值：超过此字节数的文件，未显式指定 limit 时自动只读前部分并提示分页
 READ_FILE_LARGE_BYTES = 50 * 1024
 READ_FILE_LARGE_DEFAULT_LINES = 500
+# execute_command 前台执行的输出总量上限（stdout+stderr 字节）：
+# yes 类命令在 0.1s 轮询下 600s 可累积数 GB 输出撑爆内存，超限即终止进程树
+EXECUTE_COMMAND_MAX_OUTPUT_BYTES = 1024 * 1024
 
 _logger = logging.getLogger(__name__)
+
+
+class _ToolCancelledError(Exception):
+    """工具在等待期间被用户取消（协作式取消，不暴露给模型调用方）。"""
+
+
+def _raise_if_cancelled(cancel_event):
+    if cancel_event is not None and cancel_event.is_set():
+        raise _ToolCancelledError()
+
+
+# 敏感信息脱敏：后台任务命令回显/日志前屏蔽内联凭据，
+# 避免 export TOKEN=sk-... 这类命令把密钥明文喂回模型或写入持久化记录。
+# 实现集中在 command_policy，供 task_manager 等持久化方复用
+# ---------------------------------------------------------------------------
+from core.command_policy import redact_sensitive_text as _redact_sensitive_text
+
+
+# ---------------------------------------------------------------------------
+# 文件编辑并发防护（多子代理并发编辑同一文件时后写者不再静默覆盖）：
+# 1. 按路径分桶的模块级锁，串行化同一文件的 读→改→写 全过程
+# 2. mtime 乐观校验：读时记录 mtime，写入前比对，变了则报错让调用方重读
+# ---------------------------------------------------------------------------
+_EDIT_FILE_LOCKS_GUARD = threading.Lock()
+_EDIT_FILE_LOCKS = {}
+
+
+def _edit_file_lock(resolved):
+    key = str(resolved)
+    with _EDIT_FILE_LOCKS_GUARD:
+        lock = _EDIT_FILE_LOCKS.get(key)
+        if lock is None:
+            # 防止长期运行后锁表无限增长，超限时整体重建（持锁中，安全）
+            if len(_EDIT_FILE_LOCKS) > 1024:
+                _EDIT_FILE_LOCKS.clear()
+            lock = _EDIT_FILE_LOCKS[key] = threading.Lock()
+        return lock
+
+
+def _stat_mtime_ns(path):
+    try:
+        return path.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _mtime_conflict_error(file_path, resolved, expected_mtime_ns):
+    """写入前乐观校验：读时记录的 mtime 若已变化，说明文件被并发/外部修改。
+
+    expected_mtime_ns 为 None 表示操作开始时文件尚不存在，写入前它仍不应存在。
+    返回 None 表示无冲突；否则返回错误文本（让调用方重读后再试）。
+    """
+    current = _stat_mtime_ns(resolved)
+    if expected_mtime_ns is None:
+        if current is not None:
+            return (
+                f"🚨 写入中止：文件 {file_path} 在本次操作期间被外部创建，"
+                f"为避免覆盖他人改动，请先 read_file 确认后再试。"
+            )
+    elif current != expected_mtime_ns:
+        return (
+            f"🚨 写入中止：文件 {file_path} 在读取后被外部修改"
+            f"（可能由并发子代理或其他程序写入）。为避免静默覆盖，"
+            f"请重新 read_file 后再重试本次编辑。"
+        )
+    return None
 
 
 def _compress_source_text(text):
@@ -242,43 +311,52 @@ def read_file(file_path, offset=0, limit=None, compress=False, with_line_numbers
             return shared
 
     # 大文件自适应：未显式指定 limit 时，按文件大小决定默认读取行数
-    file_size = resolved.stat().st_size
-    auto_limited = False
-    if limit is None and file_size > READ_FILE_LARGE_BYTES:
-        max_lines = READ_FILE_LARGE_DEFAULT_LINES
-        auto_limited = True
-    else:
-        max_lines = READ_FILE_MAX_LINES if limit is None else max(1, min(int(limit), READ_FILE_MAX_LINES))
+    # 对 stat/open 的 OSError 做友好返回（write_file/edit_file 均有同类保护）：
+    # 读已删除/无权限文件不应抛出异常栈
+    try:
+        file_size = resolved.stat().st_size
+        auto_limited = False
+        if limit is None and file_size > READ_FILE_LARGE_BYTES:
+            max_lines = READ_FILE_LARGE_DEFAULT_LINES
+            auto_limited = True
+        else:
+            max_lines = READ_FILE_MAX_LINES if limit is None else max(1, min(int(limit), READ_FILE_MAX_LINES))
 
-    # 大文件使用流式读取 + 快速行数统计，避免全量载入内存
-    if file_size > READ_FILE_LARGE_BYTES:
-        total = _count_lines_fast(resolved)
-        start = max(0, int(offset or 0))
-        if total == 0:
-            return ""
-        if start >= total:
-            return f"⚠️ 文件共 {total} 行，offset={start} 已超出范围。"
-        selected = _read_lines_streaming(resolved, start, max_lines)
-        result = "".join(selected)
-        end = start + len(selected)
-    else:
-        # 非 UTF-8 文件回退 GBK 读取（与原行为一致）
-        try:
-            with open(resolved, 'r', encoding='utf-8') as f:
-                lines = f.read().splitlines(keepends=True)
-        except UnicodeDecodeError:
-            with open(resolved, 'r', encoding='gbk', errors='replace') as f:
-                lines = f.read().splitlines(keepends=True)
+        # 大文件使用流式读取 + 快速行数统计，避免全量载入内存
+        if file_size > READ_FILE_LARGE_BYTES:
+            total = _count_lines_fast(resolved)
+            start = max(0, int(offset or 0))
+            if total == 0:
+                return ""
+            if start >= total:
+                return f"⚠️ 文件共 {total} 行，offset={start} 已超出范围。"
+            selected = _read_lines_streaming(resolved, start, max_lines)
+            result = "".join(selected)
+            end = start + len(selected)
+        else:
+            # 非 UTF-8 文件回退 GBK 读取（与原行为一致）
+            try:
+                with open(resolved, 'r', encoding='utf-8') as f:
+                    lines = f.read().splitlines(keepends=True)
+            except UnicodeDecodeError:
+                with open(resolved, 'r', encoding='gbk', errors='replace') as f:
+                    lines = f.read().splitlines(keepends=True)
 
-        total = len(lines)
-        start = max(0, int(offset or 0))
-        if total == 0:
-            return ""
-        if start >= total:
-            return f"⚠️ 文件共 {total} 行，offset={start} 已超出范围。"
-        selected = lines[start:start + max_lines]
-        result = "".join(selected)
-        end = start + len(selected)
+            total = len(lines)
+            start = max(0, int(offset or 0))
+            if total == 0:
+                return ""
+            if start >= total:
+                return f"⚠️ 文件共 {total} 行，offset={start} 已超出范围。"
+            selected = lines[start:start + max_lines]
+            result = "".join(selected)
+            end = start + len(selected)
+    except FileNotFoundError:
+        return f"🚨 读取文件失败：文件不存在或已被删除：{file_path}"
+    except PermissionError:
+        return f"🚨 读取文件失败：没有权限读取该文件：{file_path}"
+    except OSError as e:
+        return f"🚨 读取文件失败：{file_path}（{e}）"
 
     # 行号格式化：with_line_numbers=True 时把 selected 转为 "N: line" 格式
     # 1-based 行号，与 offset 配合（selected[i] 对应原始第 start+1+i 行）
@@ -328,48 +406,67 @@ def write_file(file_path, content):
     """
     resolved = _resolve_workspace_path(file_path)
 
-    # 大文件覆盖保护：强制使用 edit_file 做片段修改
-    if resolved.exists() and resolved.is_file():
-        existing_size = resolved.stat().st_size
-        existing_lines = 0
+    # 并发防护：同一文件的 检查→写入 全过程串行化，写前做 mtime 乐观校验
+    with _edit_file_lock(resolved):
+        # 大文件覆盖保护：强制使用 edit_file 做片段修改。
+        # 先 stat 大小短路拒绝：>50KB 的文件不再全量读入数行数（1GB 文件会 OOM），
+        # 只有小文件才读全量统计行数。
+        expected_mtime_ns = None
+        if resolved.exists() and resolved.is_file():
+            expected_mtime_ns = _stat_mtime_ns(resolved)
+            existing_size = resolved.stat().st_size
+            if existing_size > 50 * 1024:
+                return (
+                    f"🚨 write_file 拒绝覆盖已有大文件（{file_path}，约 {existing_size / 1024:.1f}KB）。\n"
+                    f"为保护未改动代码并避免 diff 全红，请改用 edit_file 对目标片段进行局部修改；"
+                    f"只有确定要完整重写整个文件时才告知用户此限制。"
+                )
+            existing_lines = 0
+            try:
+                existing_lines = len(resolved.read_text(encoding="utf-8", errors="replace").splitlines())
+            except OSError:
+                pass
+            if existing_lines > 500:
+                return (
+                    f"🚨 write_file 拒绝覆盖已有大文件（{file_path}，约 {existing_lines} 行 / {existing_size / 1024:.1f}KB）。\n"
+                    f"为保护未改动代码并避免 diff 全红，请改用 edit_file 对目标片段进行局部修改；"
+                    f"只有确定要完整重写整个文件时才告知用户此限制。"
+                )
+
+        # 与 edit_file 对齐：先写同目录临时文件再 os.replace，避免写入中断留下半个文件
+        # 自动创建父目录：用户/Agent 可能直接写到不存在的子目录（如 memory/feedback/），
+        # 不自动创建会导致 mkstemp 抛 FileNotFoundError，让 Agent 陷入无效重试。
         try:
-            existing_lines = len(resolved.read_text(encoding="utf-8", errors="replace").splitlines())
-        except OSError:
-            pass
-        if existing_size > 50 * 1024 or existing_lines > 500:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
             return (
-                f"🚨 write_file 拒绝覆盖已有大文件（{file_path}，约 {existing_lines} 行 / {existing_size / 1024:.1f}KB）。\n"
-                f"为保护未改动代码并避免 diff 全红，请改用 edit_file 对目标片段进行局部修改；"
-                f"只有确定要完整重写整个文件时才告知用户此限制。"
+                f"🚨 创建父目录失败：{resolved.parent}\n"
+                f"错误：{e}\n"
+                f"请检查路径是否正确，或权限是否充足。"
             )
 
-    # 与 edit_file 对齐：先写同目录临时文件再 os.replace，避免写入中断留下半个文件
-    # 自动创建父目录：用户/Agent 可能直接写到不存在的子目录（如 memory/feedback/），
-    # 不自动创建会导致 mkstemp 抛 FileNotFoundError，让 Agent 陷入无效重试。
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return (
-            f"🚨 创建父目录失败：{resolved.parent}\n"
-            f"错误：{e}\n"
-            f"请检查路径是否正确，或权限是否充足。"
+        fd, temp_name = tempfile.mkstemp(
+            prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
         )
-
-    fd, temp_name = tempfile.mkstemp(
-        prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
-    )
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
-            f.write(content)
-        os.replace(temp_name, resolved)
-    except BaseException:
-        # 使用 BaseException 确保 KeyboardInterrupt、MemoryError 等非 OSError 异常
-        # 同样能触发临时文件清理，避免孤儿 .ycode-tmp 文件在磁盘积累。
         try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+            with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+                f.write(content)
+            conflict = _mtime_conflict_error(file_path, resolved, expected_mtime_ns)
+            if conflict:
+                try:
+                    os.unlink(temp_name)
+                except OSError:
+                    pass
+                return conflict
+            os.replace(temp_name, resolved)
+        except BaseException:
+            # 使用 BaseException 确保 KeyboardInterrupt、MemoryError 等非 OSError 异常
+            # 同样能触发临时文件清理，避免孤儿 .ycode-tmp 文件在磁盘积累。
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
     return f"✔ 文件 {file_path} 写入成功！"
 
 # --- 下面是给星瑶装配的两个新神装 ---
@@ -488,7 +585,7 @@ def execute_command(
             return (
                 f"✔ 异步后台任务已成功启动！\n"
                 f"任务 ID: {task_id}\n"
-                f"命令内容: {command}\n"
+                f"命令内容: {_redact_sensitive_text(command)}\n"
                 f"系统已经把输出重定向到了日志中。你可以随时调用 `manage_task(action='status', task_id='{task_id}')` 来查看运行日志尾部，"
                 f"或者调用 `manage_task(action='kill', task_id='{task_id}')` 终结此后台服务。"
             )
@@ -501,65 +598,87 @@ def execute_command(
         # 直接子进程（cmd.exe）而泄露孙进程
         from core.task_scheduler import _stop_process_tree
 
-        def _close_process_pipes(proc):
-            """显式关闭子进程的 stdout/stderr 管道，防止 fd 泄漏。"""
-            for stream in (proc.stdout, proc.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except Exception:
-                        pass
-
         output_encoding = platform_console_encoding()
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = output_encoding
         env["PYTHONUTF8"] = "0"
 
-        process = subprocess.Popen(
-            command,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=False,
-            env=env,
-            # GUI（无控制台）下避免系统为子进程分配新控制台窗口
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-            start_new_session=os.name != "nt",
-        )
-        start_time = time.time()
-        stdout_raw = b""
-        stderr_raw = b""
-        while True:
-            if cancel_event is not None and cancel_event.is_set():
-                _stop_process_tree(process)
-                # 二次 communicate 加硬超时，防止孙进程 daemon 化脱离进程树后
-                # pipe 永不关闭导致 communicate() 无限阻塞卡死 worker 线程；
-                # 超时后显式关闭管道释放 fd，避免资源泄漏
-                try:
-                    process.communicate(timeout=5)
-                except subprocess.TimeoutExpired:
-                    pass
-                _close_process_pipes(process)
-                return "🛑 命令已被用户强行中断终止。"
+        # 输出重定向到临时文件而非 PIPE：管道方案依赖 communicate 内部缓冲，
+        # yes 类命令会在内存里无限累积（0.1s 轮询 × 600s 可达数 GB）；
+        # 写盘 + 周期性检查文件大小才能可靠执行总量上限
+        stdout_sink = tempfile.TemporaryFile(prefix="ycode-cmd-out-")
+        stderr_sink = tempfile.TemporaryFile(prefix="ycode-cmd-err-")
+
+        def _sink_size(sink):
             try:
-                stdout_raw, stderr_raw = process.communicate(timeout=0.1)
-                break
-            except subprocess.TimeoutExpired:
+                return os.fstat(sink.fileno()).st_size
+            except OSError:
+                return 0
+
+        def _read_sink_capped(sink):
+            size = _sink_size(sink)
+            sink.seek(0)
+            return sink.read(min(size, EXECUTE_COMMAND_MAX_OUTPUT_BYTES)), size
+
+        try:
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                stdout=stdout_sink,
+                stderr=stderr_sink,
+                text=False,
+                env=env,
+                # GUI（无控制台）下避免系统为子进程分配新控制台窗口
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                start_new_session=os.name != "nt",
+            )
+            start_time = time.time()
+            output_capped = False
+            while True:
+                if cancel_event is not None and cancel_event.is_set():
+                    _stop_process_tree(process)
+                    return "🛑 命令已被用户强行中断终止。"
+                if (
+                    _sink_size(stdout_sink) + _sink_size(stderr_sink)
+                    > EXECUTE_COMMAND_MAX_OUTPUT_BYTES
+                ):
+                    # 输出总量超限：终止进程树，只保留前 1MB，防止内存膨胀
+                    output_capped = True
+                    _stop_process_tree(process)
+                    break
+                if process.poll() is not None:
+                    break
                 if time.time() - start_time >= timeout_seconds:
                     _stop_process_tree(process)
-                    try:
-                        process.communicate(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        pass
-                    _close_process_pipes(process)
                     return f"🚨 命令执行超时（超过 {timeout_seconds} 秒），已被强行终止！"
+                time.sleep(0.1)
 
-        if _execution_result is not None:
-            _execution_result.returncode = process.returncode
+            if _execution_result is not None:
+                _execution_result.returncode = process.returncode
+            stdout_raw, stdout_size = _read_sink_capped(stdout_sink)
+            stderr_raw, stderr_size = _read_sink_capped(stderr_sink)
+        finally:
+            try:
+                stdout_sink.close()
+                stderr_sink.close()
+            except Exception:
+                pass
+
         output = decode_process_output(stdout_raw, output_encoding)
         if stderr_raw:
             stderr = decode_process_output(stderr_raw, output_encoding)
             output += f"\n[附加信息/警告]:\n{stderr}"
+
+        if output_capped:
+            return (
+                f"🚨 命令输出超过 {EXECUTE_COMMAND_MAX_OUTPUT_BYTES // 1024}KB 上限，"
+                f"进程已被强行终止（防止 yes 类命令撑爆内存）。以下为截断保留的部分输出：\n{output}"
+            )
+        if stdout_size > EXECUTE_COMMAND_MAX_OUTPUT_BYTES or stderr_size > EXECUTE_COMMAND_MAX_OUTPUT_BYTES:
+            output += (
+                f"\n\n[⚠️ 输出超过 {EXECUTE_COMMAND_MAX_OUTPUT_BYTES // 1024}KB 上限，已截断，"
+                f"仅保留前部分内容]"
+            )
 
         # 必须如实汇报退出码：此前非零退出但只要无输出就返回"执行成功"，
         # 调用方（尤其子代理）无法区分成败，会把失败命令当成通过。
@@ -584,11 +703,19 @@ def execute_command(
 
 # --- 星瑶的新神装：新闻搜索 ---
 
-def search_news(query, num_results=5):
+def search_news(query, num_results=5, cancel_event=None):
     """🌐 现代化新闻搜索工具：稳定可靠的联网引擎"""
     try:
+        # 钳制结果数：模型传 100000 会触发 DuckDuckGo 限流
+        try:
+            num_results = int(num_results)
+        except (TypeError, ValueError):
+            num_results = 5
+        num_results = max(1, min(num_results, 20))
+        _raise_if_cancelled(cancel_event)
         with DDGS() as ddgs:
             results = list(ddgs.news(query, max_results=num_results))
+            _raise_if_cancelled(cancel_event)
 
             if not results:
                 # 用 🚨 前缀让 _tool_result_ok 识别为工具失败，进而触发子代理 _terminate("failed")
@@ -610,6 +737,8 @@ def search_news(query, num_results=5):
 
             return "\n\n".join(formatted_results)
 
+    except _ToolCancelledError:
+        return "🛑 操作已被用户取消。"
     except Exception as e:
         return f"🚨 新闻搜索工具发生异常: {str(e)}"
 
@@ -704,43 +833,39 @@ def _get_fetch_url_allow_hosts():
 
 
 def _get_fetch_url_strict_ssrf():
-    """读取 config.json 的 fetch_url_strict_ssrf 开关（默认 False）。
+    """读取 config.json 的 fetch_url_strict_ssrf 开关（默认 True 严格模式）。
 
-    默认宽松模式（对齐 kimicode/opencode）：只拦截云元数据接口，
-    不做 DNS 解析后的 IP 校验。这样不会误杀 Clash/V2Ray 等代理工具的
-    fake-ip 段（如 198.18.0.0/15，被 Python ipaddress 判为 is_private）。
-
-    严格模式（True）：保留完整 IP 校验，适用于企业部署、多租户、
-    不信任用户输入的场景。
+    默认严格：IP 字面量 loopback/私网/保留段拒绝，主机名解析后校验，
+    防止 LLM 通过 fetch_url 探测内网/云元数据接口。
+    仅当用户显式在 config.json 设置 "fetch_url_strict_ssrf": false 时
+    才降级为宽松模式（只拦云元数据主机名，适用于本机使用 Clash/V2Ray
+    等代理工具 fake-ip 段被误判的场景）。
     """
     try:
         import config
         data = config._read_json_with_backup(config._CONFIG_FILE, default=None)
         if not isinstance(data, dict):
-            return False
-        return bool(data.get("fetch_url_strict_ssrf", False))
+            return True
+        return bool(data.get("fetch_url_strict_ssrf", True))
     except Exception:
-        return False
+        return True
 
 
 def _check_ssrf_url(url):
     """SSRF 防护：校验 URL 的主机名是否为安全目标。
 
-    双模式设计（参考 kimicode/opencode 的做法，它们默认不做 IP 校验）：
-
-    默认宽松模式（fetch_url_strict_ssrf=False，对齐 kimicode/opencode）：
+    两种模式共有（始终生效）：
       1. 主机名在显式白名单中 → 放行
       2. 主机名在云元数据黑名单中 → 拒绝（核心防护，始终保留）
-      3. 其他一律放行，不做 DNS 解析后的 IP 校验
-      这样不会误杀 Clash/V2Ray 等代理工具的 fake-ip 段（198.18.0.0/15 等），
-      也不会因为 CDN 双栈中一个 IPv6 解析到保留段就全拒。
 
-    严格模式（fetch_url_strict_ssrf=True）：
-      在默认模式基础上增加：
-      4. 如果 host 是 IP 字面量，校验是否公网
-      5. 否则 DNS 解析所有 A/AAAA 记录，任一非公网即拒绝
-      6. DNS 解析失败 → 拒绝（保守策略）
-      适用于企业部署、多租户、不信任用户输入的场景。
+    严格模式（fetch_url_strict_ssrf=True，默认）：
+      在上述基础上增加：
+      3. 如果 host 是 IP 字面量，校验是否公网（loopback/私网/保留段拒绝）
+      4. 否则 DNS 解析所有 A/AAAA 记录，任一非公网即拒绝
+      5. DNS 解析失败 → 拒绝（保守策略）
+
+    宽松模式（用户显式设置 fetch_url_strict_ssrf=false 才启用，对齐 kimicode/opencode）：
+      只做 1-2，不查 IP，避免误杀 Clash/V2Ray fake-ip 段（198.18.0.0/15 等）。
     """
     parsed = urlparse(str(url or "").strip())
     host = (parsed.hostname or "").lower()
@@ -815,7 +940,23 @@ def _decode_http_response(response, raw):
     return int(getattr(response, "status", getattr(response, "code", 200))), str(content_type), raw.decode(charset, errors="replace")
 
 
-def _request_http_text(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
+class _SSRFRecheckRedirectHandler(HTTPRedirectHandler):
+    """重定向逐跳 SSRF 校验：302 跳转目标必须重新过 _check_ssrf_url，
+
+    否则攻击者可先给一个合法公网 URL，再通过 302 跳到 169.254.169.254
+    或内网地址绕过首次校验。
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _check_ssrf_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# 用带 SSRF 逐跳校验的 opener 替换裸 urlopen；调用签名与 urlopen 兼容
+urlopen = build_opener(_SSRFRecheckRedirectHandler()).open
+
+
+def _request_http_text(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
     normalized_url = _validate_http_url(url)
     # SSRF 防护：在发起请求前校验主机与解析后的 IP
     # 即使 LLM 拼接了内网/元数据接口 URL，也会在此被拦截
@@ -823,6 +964,8 @@ def _request_http_text(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
     timeout = float(timeout_seconds)
     if not 1 <= timeout <= 60:
         raise ValueError("timeout_seconds 必须在 1 到 60 秒之间")
+    # urlopen 本身不可中断，至少在发起请求前后检查取消
+    _raise_if_cancelled(cancel_event)
     request = Request(
         normalized_url,
         headers=_build_browser_like_headers(),
@@ -844,6 +987,7 @@ def _request_http_text(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
                 + f"\n\n[⚠️ 响应超过 {HTTP_MAX_BYTES // 1024} KB 限制，已截断。"
                 f"文章正文通常已包含在上方内容中；如需完整内容请缩小请求范围或使用 search_news。]"
             )
+        _raise_if_cancelled(cancel_event)
         return status, content_type, text
 
 
@@ -855,14 +999,16 @@ def _format_http_error(error):
     return str(error)
 
 
-def fetch_url(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
+def fetch_url(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
     """通过本机 HTTP 客户端获取网页或 JSON 文本。"""
     try:
-        status, content_type, text = _request_http_text(url, timeout_seconds)
+        status, content_type, text = _request_http_text(url, timeout_seconds, cancel_event)
         header = f"HTTP {status}"
         if content_type:
             header += f" ({content_type})"
         return f"{header}\n{text}"
+    except _ToolCancelledError:
+        return "🛑 操作已被用户取消。"
     except SSRFBlockedError as exc:
         # SSRF 防护拦截：清晰提示用户被阻止的原因，并说明如何加白名单或关闭严格模式
         msg = str(exc)
@@ -884,8 +1030,8 @@ def fetch_url(url, timeout_seconds=HTTP_TIMEOUT_SECONDS):
                 "  1. 在 ~/.ycode/config.json 的 fetch_url_allow_hosts 数组中"
                 "添加该主机名以 opt-in（推荐，精确放行）\n"
                 "  2. 在 ~/.ycode/config.json 中设置 "
-                "\"fetch_url_strict_ssrf\": false 关闭严格 IP 校验"
-                "（默认已是 false，若曾开启请关闭）"
+                "\"fetch_url_strict_ssrf\": false 降级为宽松模式"
+                "（默认严格；使用 Clash/V2Ray 代理时可考虑降级）"
             )
         return f"🚨 {msg}\n" + "\n".join(hint_lines)
     except (HTTPError, URLError, TimeoutError, ValueError) as exc:
@@ -990,7 +1136,7 @@ def _format_open_meteo_payload(payload, location, forecast_url):
     return "\n".join(current_lines)
 
 
-def get_weather(city="", timeout_seconds=HTTP_TIMEOUT_SECONDS):
+def get_weather(city="", timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
     """通过 Open-Meteo 地理编码和预报接口获取指定城市天气。"""
     requested_city = str(city or "").strip()
     if not requested_city:
@@ -1001,7 +1147,7 @@ def get_weather(city="", timeout_seconds=HTTP_TIMEOUT_SECONDS):
         f"?name={encoded_city}&count=1&language=zh&format=json"
     )
     try:
-        _, _, geocoding_text = _request_http_text(geocoding_url, timeout_seconds)
+        _, _, geocoding_text = _request_http_text(geocoding_url, timeout_seconds, cancel_event)
         geocoding_payload = json.loads(geocoding_text)
         locations = geocoding_payload.get("results") or []
         if not locations:
@@ -1026,7 +1172,7 @@ def get_weather(city="", timeout_seconds=HTTP_TIMEOUT_SECONDS):
             "precipitation_probability_max,sunrise,sunset"
             "&timezone=auto&forecast_days=3"
         )
-        status, _, forecast_text = _request_http_text(forecast_url, timeout_seconds)
+        status, _, forecast_text = _request_http_text(forecast_url, timeout_seconds, cancel_event)
         forecast_payload = json.loads(forecast_text)
         if not isinstance(forecast_payload, dict):
             raise ValueError("天气服务返回的数据格式不是 JSON 对象")
@@ -1037,6 +1183,8 @@ def get_weather(city="", timeout_seconds=HTTP_TIMEOUT_SECONDS):
         )
     except json.JSONDecodeError:
         return "🚨 天气查询失败：天气服务返回的不是有效 JSON"
+    except _ToolCancelledError:
+        return "🛑 操作已被用户取消。"
     except (HTTPError, URLError, TimeoutError, ValueError) as exc:
         return f"🚨 天气查询失败：{_format_http_error(exc)}"
     except Exception as exc:
@@ -1048,6 +1196,46 @@ try:
     SEARCH_CODE_TIMEOUT_SECONDS = max(1, int(os.environ.get("YCODE_SEARCH_TIMEOUT", "30") or 30))
 except (TypeError, ValueError):
     SEARCH_CODE_TIMEOUT_SECONDS = 30
+
+
+def _run_process_polled(cmd, timeout_seconds, cancel_event=None):
+    """subprocess.run 的可取消替代：Popen + communicate 短轮询。
+
+    - 每 0.2s 检查一次 cancel_event，取消时终止进程树并返回 None
+    - 超时行为与 subprocess.run 对齐：抛 subprocess.TimeoutExpired
+    返回 subprocess.CompletedProcess。
+    """
+    from core.task_scheduler import _stop_process_tree
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        if cancel_event is not None and cancel_event.is_set():
+            _stop_process_tree(proc)
+            try:
+                proc.communicate(timeout=2)
+            except Exception:
+                pass
+            return None
+        try:
+            stdout, stderr = proc.communicate(timeout=0.2)
+            return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+        except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                _stop_process_tree(proc)
+                try:
+                    proc.communicate(timeout=2)
+                except Exception:
+                    pass
+                raise subprocess.TimeoutExpired(cmd, timeout_seconds)
 
 
 # search_code 的默认排除目录（Python 兜底路径使用）。
@@ -1069,7 +1257,7 @@ def _get_search_exclude_dirs():
     return dirs
 
 
-def search_code(query, dir_path="."):
+def search_code(query, dir_path=".", cancel_event=None):
     """精准搜索：跨文件全局查找代码片段或关键字。优先尝试 ripgrep。"""
     import subprocess
     try:
@@ -1077,6 +1265,9 @@ def search_code(query, dir_path="."):
         dir_path = str(_resolve_workspace_path(dir_path))
     except ValueError as e:
         return f"🚨 搜索失败: {e}"
+
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 搜索已被用户取消。"
 
     cache_key = _tool_cache.search_key("search_code", query, dir_path)
     cached = _tool_cache.search_get(cache_key)
@@ -1103,11 +1294,8 @@ def search_code(query, dir_path="."):
         if literal:
             cmd.append("-F")
         cmd += [args_query, dir_path]
-        return subprocess.run(
-            cmd, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=SEARCH_CODE_TIMEOUT_SECONDS,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
+        # 可取消轮询版本：取消时返回 None（原先 subprocess.run 阻塞最长 30s 不响应取消）
+        return _run_process_polled(cmd, SEARCH_CODE_TIMEOUT_SECONDS, cancel_event)
 
     def _format_rg_output(output):
         if not output:
@@ -1129,9 +1317,13 @@ def search_code(query, dir_path="."):
         # （慢查询叠加一个更慢的遍历只会让卡顿翻倍）。
         try:
             result = _run_rg(query)
+            if result is None:
+                return "🛑 搜索已被用户取消。"
             if result.returncode == 2:
                 # 正则语法错误 → 按字面量重试（模型经常传入含特殊字符的代码片段）
                 result = _run_rg(query, literal=True)
+                if result is None:
+                    return "🛑 搜索已被用户取消。"
             if result.returncode in (0, 1):
                 result_text = _format_rg_output(result.stdout.strip())
                 _tool_cache.search_put(cache_key, result_text)
@@ -1161,6 +1353,8 @@ def search_code(query, dir_path="."):
     
     try:
         for root, dirs, files in os.walk(dir_path):
+            if cancel_event is not None and cancel_event.is_set():
+                return "🛑 搜索已被用户取消。"
             dirs[:] = [d for d in dirs if d not in IGNORE_DIRS and not d.startswith('.')]
             
             for file in files:
@@ -1221,7 +1415,8 @@ def manage_task(action, task_id=None, event_callback=None, permission_owner=None
             return "ℹ 当前没有任何运行中的后台异步任务。"
         res = ["当前活跃后台任务列表："]
         for t in tasks:
-            res.append(f"- [任务 ID: {t['task_id']}] 运行 PID: {t['pid']} | 运行时间: {t['duration']} | 命令: {t['command']}")
+            # 命令可能包含内联凭据（export TOKEN=sk-...），回显模型前脱敏
+            res.append(f"- [任务 ID: {t['task_id']}] 运行 PID: {t['pid']} | 运行时间: {t['duration']} | 命令: {_redact_sensitive_text(t['command'])}")
         return "\n".join(res)
         
     elif action == "status":
@@ -1372,7 +1567,8 @@ def _fuzzy_replace(content, target, replacement, replace_all=False):
 
 
 def _edit_file_by_lines(
-    file_path, resolved, content, encoding, start_line, end_line, replacement_content
+    file_path, resolved, content, encoding, start_line, end_line, replacement_content,
+    expected_mtime_ns=None,
 ):
     """行号路径：按 1-based 行号范围（inclusive）切片替换，跳过字符串匹配。
 
@@ -1444,36 +1640,15 @@ def _edit_file_by_lines(
             f"未发生实际修改（{file_path}）。"
         )
 
-    # 校验通过后写入撤销栈
+    # 原子写入（含 mtime 乐观校验），成功后才写入撤销栈，避免失败编辑污染撤销历史
+    write_err = _atomic_write_edit_file(
+        resolved, encoding, new_content,
+        file_path=file_path, expected_mtime_ns=expected_mtime_ns,
+    )
+    if write_err:
+        return write_err
     from core.memory import set_undo_state
     set_undo_state(file_path, content)
-
-    # 原子写入（与 target_content 路径对齐）
-    try:
-        resolved.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return (
-            f"🚨 创建父目录失败：{resolved.parent}\n"
-            f"错误：{e}\n"
-            f"请检查路径是否正确，或权限是否充足。"
-        )
-
-    fd, temp_name = tempfile.mkstemp(
-        prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
-    )
-    temp_path = Path(temp_name)
-    try:
-        with os.fdopen(fd, "wb") as temp_file:
-            temp_file.write(new_content.encode(encoding))
-        os.replace(temp_path, resolved)
-    except BaseException as e:
-        # 使用 BaseException 确保 UnicodeEncodeError、KeyboardInterrupt 等非 OSError 异常
-        # 同样能触发临时文件清理，避免孤儿 .ycode-tmp 文件在磁盘积累
-        try:
-            temp_path.unlink(missing_ok=True)
-        except OSError:
-            pass
-        return f"🚨 行号编辑发生异常: {str(e)}"
 
     # 构建预览：被替换的原文前 3 行 + 后 2 行（超过 5 行时省略中间）
     replaced_preview_lines = replaced_block.splitlines()
@@ -1492,8 +1667,11 @@ def _edit_file_by_lines(
     )
 
 
-def _atomic_write_edit_file(resolved, encoding, new_content):
+def _atomic_write_edit_file(resolved, encoding, new_content, file_path=None, expected_mtime_ns=None):
     """原子写入 edit_file 结果：先写同目录临时文件再 os.replace。
+
+    expected_mtime_ns 不为 None 时，写入前做 mtime 乐观校验：
+    文件在读取后被外部/并发修改则拒绝覆盖，返回错误让调用方重读。
     返回 None 表示成功，返回字符串表示错误。
     """
     try:
@@ -1511,6 +1689,14 @@ def _atomic_write_edit_file(resolved, encoding, new_content):
     try:
         with os.fdopen(fd, "wb") as temp_file:
             temp_file.write(new_content.encode(encoding))
+        if expected_mtime_ns is not None:
+            conflict = _mtime_conflict_error(file_path or str(resolved), resolved, expected_mtime_ns)
+            if conflict:
+                try:
+                    temp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                return conflict
         os.replace(temp_path, resolved)
     except BaseException as e:
         # 使用 BaseException 确保 UnicodeEncodeError、KeyboardInterrupt 等非 OSError 异常
@@ -1592,16 +1778,25 @@ def _smart_replace_without_target(file_path, content, replacement, replace_all):
     if not candidates:
         return (
             f"🚨 智能替换失败：在 {file_path} 中未找到与 replacement_content "
-            f"足够相似的代码段（相似度阈值 0.5）。"
+            f"足够相似的代码段。"
             f"请显式提供 target_content（字符串匹配）或 start_line/end_line（行号路径）。"
         )
 
     # 按综合评分降序
     candidates.sort(key=lambda x: x[1], reverse=True)
-    best_idx, best_combined, best_ratio, best_block = candidates[0]
+
+    # 只有综合评分 >= 0.7 的候选才允许替换：低评分候选（如 0.3 相似度）
+    # 是瞎猜位置，必须让 LLM 显式提供 target 精确定位
+    high_score_candidates = [c for c in candidates if c[1] >= 0.7]
+    if not high_score_candidates:
+        best_combined = candidates[0][1]
+        return (
+            f"🚨 智能替换失败：在 {file_path} 中找到的最佳候选综合评分仅 "
+            f"{best_combined:.2f}（要求 >= 0.7），相似度不足以安全定位。"
+            f"请显式提供 target_content（字符串匹配）或 start_line/end_line（行号路径）。"
+        )
 
     # 多候选检测：综合评分 >= 0.7 的候选如果超过 1 个且未启用 replace_all，拒绝替换
-    high_score_candidates = [c for c in candidates if c[1] >= 0.7]
     if len(high_score_candidates) > 1 and not replace_all:
         locations = []
         for c in high_score_candidates[:3]:
@@ -1617,28 +1812,49 @@ def _smart_replace_without_target(file_path, content, replacement, replace_all):
             + f"\n请显式提供 target_content 或 start_line/end_line 精确定位。"
         )
 
+    # 确定要替换的候选集合：replace_all 时替换所有高评分候选（按起始行排序，
+    # 跳过与已选块重叠的窗口——滑窗会在同一区域产生大量重叠高评分候选）；
+    # 单点替换时只有唯一高评分候选
+    if replace_all:
+        chosen = []
+        last_end = -1
+        for cand in sorted(high_score_candidates, key=lambda c: c[0]):
+            start_idx = cand[0]
+            block_len = len(cand[3])
+            if start_idx < last_end:
+                continue
+            chosen.append(cand)
+            last_end = start_idx + block_len
+    else:
+        chosen = [high_score_candidates[0]]
+
     # 执行替换
     if "\r\n" in content:
         line_sep = "\r\n"
     else:
         line_sep = "\n"
 
-    new_lines = content_lines_stripped[:best_idx]
-    for line in replacement_lines:
-        new_lines.append(line)
-    new_lines.extend(content_lines_stripped[best_idx + len(best_block):])
+    new_lines = []
+    cursor = 0
+    for cand in chosen:
+        start_idx, _, _, block = cand
+        new_lines.extend(content_lines_stripped[cursor:start_idx])
+        new_lines.extend(replacement_lines)
+        cursor = start_idx + len(block)
+    new_lines.extend(content_lines_stripped[cursor:])
 
     new_content = line_sep.join(new_lines)
     if content.endswith("\n") or content.endswith("\r\n"):
         new_content += line_sep
 
-    # 构建被替换原文预览（前 5 行）
-    replaced_preview_lines = best_block[:5]
-    if len(best_block) > 5:
-        replaced_preview_lines.append(f"...（共 {len(best_block)} 行）")
+    # 构建被替换原文预览（第一处替换块的前 5 行）
+    first_block = chosen[0][3]
+    replaced_preview_lines = first_block[:5]
+    if len(first_block) > 5:
+        replaced_preview_lines.append(f"...（共 {len(first_block)} 行）")
     replaced_preview = "\n".join(replaced_preview_lines)
 
-    return (new_content, 1, replaced_preview)
+    return (new_content, len(chosen), replaced_preview)
 
 
 def edit_file(
@@ -1677,100 +1893,113 @@ def edit_file(
         resolved = _resolve_workspace_path(file_path)
     except ValueError as e:
         return f"🚨 精准修改失败！{e}"
-    try:
-        raw = resolved.read_bytes()
-    except OSError as e:
-        return f"🚨 精准修改失败！无法读取文件 {file_path}: {e}"
-    try:
-        # 优先 UTF-8，失败时回退 GBK，写回时保持原编码
-        content = raw.decode("utf-8")
-        encoding = "utf-8"
-    except UnicodeDecodeError:
+    # 并发防护：同一文件的 读→改→写 全过程按路径串行化（多子代理并发编辑同一
+    # 文件时后写者不再静默覆盖），写前另有 mtime 乐观校验检测外部修改
+    with _edit_file_lock(resolved):
+        # 先记录 mtime 再读取：写入前若 mtime 变化即拒绝覆盖。
+        # 宁可误报冲突（让调用方重读），也不放过读后写前的外部修改窗口。
+        expected_mtime_ns = _stat_mtime_ns(resolved)
         try:
-            content = raw.decode("gbk")
-            encoding = "gbk"
+            raw = resolved.read_bytes()
+        except OSError as e:
+            return f"🚨 精准修改失败！无法读取文件 {file_path}: {e}"
+        try:
+            # 优先 UTF-8，失败时回退 GBK，写回时保持原编码
+            content = raw.decode("utf-8")
+            encoding = "utf-8"
         except UnicodeDecodeError:
-            return f"🚨 精准修改失败！无法解码文件 {file_path}（既不是 UTF-8 也不是 GBK 编码）。"
+            try:
+                content = raw.decode("gbk")
+                encoding = "gbk"
+            except UnicodeDecodeError:
+                return f"🚨 精准修改失败！无法解码文件 {file_path}（既不是 UTF-8 也不是 GBK 编码）。"
 
-    # 行号路径：直接按行号切片替换，跳过字符串匹配
-    if start_line is not None or end_line is not None:
-        return _edit_file_by_lines(
-            file_path, resolved, content, encoding,
-            start_line, end_line, replacement_content
-        )
-
-    target = str(target_content or "")
-    replacement = str(replacement_content or "")
-    if not target:
-        # 智能降级：LLM 只传了 replacement_content（未提供 target_content 也未提供行号）。
-        # 与其报错让 LLM 重试 3 次最后 fallback 到 write_file，不如直接用 difflib
-        # 在文件中找出与 replacement 最相似的代码块进行替换。
-        # 这种"宽容调用"显著降低 LLM 工具使用门槛，提升用户体验。
-        if not replacement:
-            return (
-                f"🚨 edit_file 调用参数缺失：target_content 和 replacement_content 均为空，"
-                f"且未提供 start_line/end_line（{file_path}）。"
+        # 行号路径：直接按行号切片替换，跳过字符串匹配
+        if start_line is not None or end_line is not None:
+            return _edit_file_by_lines(
+                file_path, resolved, content, encoding,
+                start_line, end_line, replacement_content,
+                expected_mtime_ns=expected_mtime_ns,
             )
-        result = _smart_replace_without_target(
-            file_path, content, replacement, replace_all
+
+        target = str(target_content or "")
+        replacement = str(replacement_content or "")
+        if not target:
+            # 智能降级：LLM 只传了 replacement_content（未提供 target_content 也未提供行号）。
+            # 与其报错让 LLM 重试 3 次最后 fallback 到 write_file，不如直接用 difflib
+            # 在文件中找出与 replacement 最相似的代码块进行替换。
+            # 这种"宽容调用"显著降低 LLM 工具使用门槛，提升用户体验。
+            if not replacement:
+                return (
+                    f"🚨 edit_file 调用参数缺失：target_content 和 replacement_content 均为空，"
+                    f"且未提供 start_line/end_line（{file_path}）。"
+                )
+            result = _smart_replace_without_target(
+                file_path, content, replacement, replace_all
+            )
+            if isinstance(result, str) and result.startswith("🚨"):
+                return result
+            new_content, occurrences, replaced_preview = result
+            if new_content == content:
+                return (
+                    f"🚨 edit_file 智能替换失败：在 {file_path} 中未找到与 replacement_content "
+                    f"足够相似的代码段（建议显式提供 target_content 或 start_line/end_line）。"
+                )
+            # 原子写入（含 mtime 校验），成功后才写入撤销栈，避免失败编辑污染撤销历史
+            write_err = _atomic_write_edit_file(
+                resolved, encoding, new_content,
+                file_path=file_path, expected_mtime_ns=expected_mtime_ns,
+            )
+            if write_err:
+                return write_err
+            from core.memory import set_undo_state
+            set_undo_state(file_path, content)
+            return (
+                f"✔ 智能修改 {file_path}（自动定位最相似代码段，共 {occurrences} 处替换）\n"
+                f"被替换的原文（前 5 行）：\n{replaced_preview}"
+            )
+
+        # 换行风格自适应：把 target/replacement 统一成文件实际使用的换行风格，
+        # 写回时仍保持文件原编码/换行。先归一化再转换，避免已有 \r\n 被腐蚀成 \r\r\n。
+        match_target, match_replacement = target, replacement
+        if "\r\n" in content:
+            if "\r\n" not in target:
+                match_target = target.replace("\r\n", "\n").replace("\n", "\r\n")
+                match_replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
+        elif "\r\n" in target:
+            match_target = target.replace("\r\n", "\n")
+            match_replacement = replacement.replace("\r\n", "\n")
+
+        new_content, occurrences = _fuzzy_replace(
+            content, match_target, match_replacement, replace_all=replace_all
         )
-        if isinstance(result, str) and result.startswith("🚨"):
-            return result
-        new_content, occurrences, replaced_preview = result
+
+        if occurrences == 0:
+            return (
+                f"🚨 精准修改失败！在文件 {file_path} 中没有找到与 target_content 足够相似的代码段。\n"
+                f"建议：1) 使用 read_file(compress=False) 重新读取原始文本；"
+                f"2) 把 target_content 缩短到 1500 字符以内并包含唯一上下文；"
+                f"3) 若确实需要整体重写，再使用 write_file（write_file 会覆盖整个文件，diff 会显示全红）。"
+            )
+        if occurrences > 1 and not replace_all:
+            return (
+                f"🚨 精准修改失败！旧代码段在文件 {file_path} 中出现了 {occurrences} 次，无法确定唯一修改位置。\n"
+                f"请提供更长的、包含更多上下文的 target_content 以保证唯一匹配；如果确实需要全部替换，请显式设置 replace_all=True。"
+            )
+
         if new_content == content:
-            return (
-                f"🚨 edit_file 智能替换失败：在 {file_path} 中未找到与 replacement_content "
-                f"足够相似的代码段（建议显式提供 target_content 或 start_line/end_line）。"
-            )
-        # 写入撤销栈 + 原子写入（与字符串匹配路径共用逻辑）
-        from core.memory import set_undo_state
-        set_undo_state(file_path, content)
-        write_err = _atomic_write_edit_file(resolved, encoding, new_content)
+            return f"🚨 精准修改失败！定位成功但替换后的内容与原文相同，未发生实际修改（{file_path}）。"
+
+        # 原子写入（含 mtime 校验），成功后才写入撤销栈，避免失败的编辑污染撤销历史
+        write_err = _atomic_write_edit_file(
+            resolved, encoding, new_content,
+            file_path=file_path, expected_mtime_ns=expected_mtime_ns,
+        )
         if write_err:
             return write_err
-        return (
-            f"✔ 智能修改 {file_path}（自动定位最相似代码段，共 {occurrences} 处替换）\n"
-            f"被替换的原文（前 5 行）：\n{replaced_preview}"
-        )
-
-    # 换行风格自适应：把 target/replacement 统一成文件实际使用的换行风格，
-    # 写回时仍保持文件原编码/换行。先归一化再转换，避免已有 \r\n 被腐蚀成 \r\r\n。
-    match_target, match_replacement = target, replacement
-    if "\r\n" in content:
-        if "\r\n" not in target:
-            match_target = target.replace("\r\n", "\n").replace("\n", "\r\n")
-            match_replacement = replacement.replace("\r\n", "\n").replace("\n", "\r\n")
-    elif "\r\n" in target:
-        match_target = target.replace("\r\n", "\n")
-        match_replacement = replacement.replace("\r\n", "\n")
-
-    new_content, occurrences = _fuzzy_replace(
-        content, match_target, match_replacement, replace_all=replace_all
-    )
-
-    if occurrences == 0:
-        return (
-            f"🚨 精准修改失败！在文件 {file_path} 中没有找到与 target_content 足够相似的代码段。\n"
-            f"建议：1) 使用 read_file(compress=False) 重新读取原始文本；"
-            f"2) 把 target_content 缩短到 1500 字符以内并包含唯一上下文；"
-            f"3) 若确实需要整体重写，再使用 write_file（write_file 会覆盖整个文件，diff 会显示全红）。"
-        )
-    if occurrences > 1 and not replace_all:
-        return (
-            f"🚨 精准修改失败！旧代码段在文件 {file_path} 中出现了 {occurrences} 次，无法确定唯一修改位置。\n"
-            f"请提供更长的、包含更多上下文的 target_content 以保证唯一匹配；如果确实需要全部替换，请显式设置 replace_all=True。"
-        )
-
-    if new_content == content:
-        return f"🚨 精准修改失败！定位成功但替换后的内容与原文相同，未发生实际修改（{file_path}）。"
-
-    # 校验全部通过后才写入撤销栈，避免失败的编辑污染撤销历史
-    from core.memory import set_undo_state
-    set_undo_state(file_path, content)
-    write_err = _atomic_write_edit_file(resolved, encoding, new_content)
-    if write_err:
-        return write_err
-    return f"✔ 已修改文件：{file_path}"
+        from core.memory import set_undo_state
+        set_undo_state(file_path, content)
+        return f"✔ 已修改文件：{file_path}"
 
 _SUBAGENT_TERMINAL_STATUSES = {
     "completed",
@@ -1782,6 +2011,15 @@ _SUBAGENT_TERMINAL_STATUSES = {
 # 同一时刻真正执行的子代理上限：超出的任务保持排队状态等待空位。
 # 无上限时模型一次派发 6+ 个子代理会挤爆 API 并发与本机资源。
 _MAX_CONCURRENT_SUBAGENTS = 5
+
+# 并发闸门排队等待上限按任务自身超时预算计：排队时间不计入执行超时，
+# 但若排队超过自身预算仍未拿到名额（例如名额被卡死任务占用），直接判超时，
+# 避免前台 run_subagent 无限阻塞（曾因此整回合静默几十分钟）。
+
+# 审批等待独立上限（秒）：与 gui_bridge.PERMISSION_TIMEOUT_SECONDS（300）对齐。
+# 审批等待不计入执行超时，但权限 broker 卡死时任务不能无限悬挂占用并发闸门，
+# 超过该上限即终止任务并取消其名下权限请求。
+_SUBAGENT_APPROVAL_WAIT_LIMIT = 300
 
 # 子代理前台结果进入主代理上下文的长度上限（字符）。此前为 4000，多段式汇报
 # （如 explore 代理按任务分段的结论）会被拦腰截断，主代理只能基于残缺信息决策；
@@ -1879,6 +2117,11 @@ class SubagentTask:
     model_config: tuple | None = field(default=None, repr=False)
     thread: threading.Thread | None = field(default=None, repr=False)
     custom_config: dict | None = field(default=None, repr=False)
+    timeout_seconds: int = field(default=600, repr=False)
+    # 并发名额生命周期标记：超时/取消是协作式，线程可能仍卡在不可中断的
+    # LLM 请求里，但名额要立即归还（见 _release_slot），两者都必须幂等
+    slot_acquired: bool = field(default=False, repr=False)
+    slot_released: bool = field(default=False, repr=False)
 
 
 SubagentRunner = Callable[[SubagentTask], str]
@@ -2047,6 +2290,7 @@ class SubagentManager:
             subagent_type=normalized_type,
             plan_item_id=str(plan_item_id or ""),
             run_in_background=bool(run_in_background),
+            timeout_seconds=int(timeout_seconds),
             terminal_callback=terminal_callback,
             model_config=model_config,
             custom_config=custom_config,
@@ -2081,6 +2325,7 @@ class SubagentManager:
             }, ensure_ascii=False)
 
         last_tick = self._monotonic()
+        approval_wait = 0.0  # 连续审批等待计时（独立于 execution_elapsed）
         while not task.done_event.wait(self._wait_interval):
             if parent_cancel_event is not None and parent_cancel_event.is_set():
                 self._terminate(task.task_id, "cancelled", "parent turn cancelled")
@@ -2095,11 +2340,14 @@ class SubagentManager:
                     break
                 if waiting_for_approval:
                     task.approval_wait_elapsed += elapsed
+                    approval_wait += elapsed
                     self._record_stage_locked(task, "waiting_approval")
                 elif task.callback_invoked or task.stage == "queued":
                     # 终态回调执行中 / 并发闸门排队中：暂停计时避免误判超时
                     task.approval_wait_elapsed += elapsed
+                    approval_wait = 0.0
                 else:
+                    approval_wait = 0.0
                     task.execution_elapsed += elapsed
                     if task.stage in {"waiting_approval", "finalizing"}:
                         self._record_stage_locked(
@@ -2108,6 +2356,16 @@ class SubagentManager:
                             "approval resolved",
                         )
                 execution_elapsed = task.execution_elapsed
+            if waiting_for_approval and approval_wait >= _SUBAGENT_APPROVAL_WAIT_LIMIT:
+                # 权限 broker 卡死（无人响应审批）：终止任务，避免无限悬挂占并发闸门；
+                # _terminate(timed_out) 会一并 cancel_owner 取消名下权限请求
+                self._terminate(
+                    task.task_id,
+                    "timed_out",
+                    f"审批等待超过 {_SUBAGENT_APPROVAL_WAIT_LIMIT}s 未决"
+                    "（权限通道可能卡死），任务已终止" + _SUBAGENT_TIMEOUT_HINT,
+                )
+                break
             if execution_elapsed >= timeout_seconds:
                 self._terminate(
                     task.task_id,
@@ -2126,6 +2384,7 @@ class SubagentManager:
     ) -> None:
         """后台子代理的看门狗：执行与前台一致的超时/父取消监管（协作式取消）。"""
         last_tick = self._monotonic()
+        approval_wait = 0.0  # 连续审批等待计时（独立于 execution_elapsed）
         while not task.done_event.wait(self._wait_interval):
             if parent_cancel_event is not None and parent_cancel_event.is_set():
                 self._terminate(task.task_id, "cancelled", "parent turn cancelled")
@@ -2140,9 +2399,20 @@ class SubagentManager:
                 if waiting_for_approval or task.callback_invoked or task.stage == "queued":
                     # 等待审批 / 终态回调执行 / 并发闸门排队期间暂停计时，避免误判超时
                     task.approval_wait_elapsed += elapsed
+                    approval_wait = approval_wait + elapsed if waiting_for_approval else 0.0
                 else:
+                    approval_wait = 0.0
                     task.execution_elapsed += elapsed
                 execution_elapsed = task.execution_elapsed
+            if waiting_for_approval and approval_wait >= _SUBAGENT_APPROVAL_WAIT_LIMIT:
+                # 权限 broker 卡死（无人响应审批）：终止任务，避免无限悬挂占并发闸门
+                self._terminate(
+                    task.task_id,
+                    "timed_out",
+                    f"审批等待超过 {_SUBAGENT_APPROVAL_WAIT_LIMIT}s 未决"
+                    "（权限通道可能卡死），任务已终止" + _SUBAGENT_TIMEOUT_HINT,
+                )
+                return
             if execution_elapsed >= timeout_seconds:
                 self._terminate(
                     task.task_id,
@@ -2151,12 +2421,41 @@ class SubagentManager:
                 )
                 return
 
+    def _release_slot(self, task: SubagentTask) -> None:
+        """释放并发名额（幂等）。
+
+        超时/取消是协作式：子代理线程可能仍卡在不可中断的 LLM 请求里，但名额
+        必须立即归还，否则泄漏线程占满闸门（上限 5 个），后续子代理无限排队，
+        整回合假死。
+        """
+        with self._lock:
+            if task.slot_released or not task.slot_acquired:
+                return
+            task.slot_released = True
+        self._concurrency.release()
+
     def _run_task(self, task: SubagentTask) -> None:
-        # 并发闸门：拿到执行名额前保持 queued 状态（排队时间不计入超时），
-        # 期间响应取消与外部终态（如父回合取消、超时监管）
+        # 并发闸门：拿到执行名额前保持 queued 状态（排队时间不计入执行超时），
+        # 期间响应取消与外部终态（如父回合取消、超时监管）。
+        # 排队超过任务自身超时预算仍未拿到名额时直接判超时：名额可能被卡死
+        # 任务占用（协作式取消杀不死阻塞中的 LLM 请求），不能无限等。
+        # 注意：只有真正排过队才读取时钟（单任务直拿名额是主流路径，
+        # 不额外消耗注入的 monotonic 时钟序列）。
+        queue_wait_started = None
         while not self._concurrency.acquire(timeout=0.2):
             if task.cancel_event.is_set() or task.status in _SUBAGENT_TERMINAL_STATUSES:
                 return
+            if queue_wait_started is None:
+                queue_wait_started = self._monotonic()
+            elif self._monotonic() - queue_wait_started >= max(60, task.timeout_seconds):
+                self._terminate(
+                    task.task_id,
+                    "timed_out",
+                    f"排队超过 {int(self._monotonic() - queue_wait_started)}s 仍未获得并发名额"
+                    "（可能有卡死任务占用）" + _SUBAGENT_TIMEOUT_HINT,
+                )
+                return
+        task.slot_acquired = True
         try:
             with self._lock:
                 if task.status != "pending":
@@ -2192,7 +2491,7 @@ class SubagentManager:
             finally:
                 _tool_cache.set_current_session(None)
         finally:
-            self._concurrency.release()
+            self._release_slot(task)
 
     def _complete(self, task_id: str, result: str) -> bool:
         with self._lock:
@@ -2276,6 +2575,13 @@ class SubagentManager:
         if status in {"timed_out", "cancelled"}:
             from core.permission_broker import permission_broker
             permission_broker.cancel_owner(task_id)
+            # 硬中断该子代理的在飞 LLM 请求：关闭底层流让阻塞读立即退出，
+            # 而不是静默接收数据直到请求超时（最长数百秒）
+            from core.llm import abort_inflight_streams
+            abort_inflight_streams(task.cancel_event)
+            # 协作式取消杀不死阻塞中的线程（如 LLM 请求），但并发名额立即归还，
+            # 避免泄漏线程占满闸门导致排队子代理与前台回合无限等待
+            self._release_slot(task)
         # 后台任务终态实时通知（worker 线程内，回调自行切回 UI 线程）
         self._fire_terminal_notification(task)
         return True
@@ -3130,7 +3436,7 @@ def dream_consolidation():
         
     return run_dream_consolidation_sync(task_model, task_key, task_url)
 
-def glob_files(pattern, dir_path="."):
+def glob_files(pattern, dir_path=".", cancel_event=None):
     """快速文件模式匹配：使用 glob 表达式在项目目录中搜索匹配的文件路径列表。优先尝试 ripgrep。"""
     import glob
     import subprocess
@@ -3143,6 +3449,8 @@ def glob_files(pattern, dir_path="."):
         return f"🚨 错误: {e}"
     if not base.exists() or not base.is_dir():
         return f"🚨 错误：指定的目录不存在或非有效目录: {dir_path}"
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
 
     cache_key = _tool_cache.glob_key(pattern, str(base))
     cached = _tool_cache.glob_get(cache_key)
@@ -3163,8 +3471,11 @@ def glob_files(pattern, dir_path="."):
         for _d in sorted(_get_search_exclude_dirs()):
             cmd += ["--glob", f"!**/{_d}/"]
         cmd.append(str(base))
-        result = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=15,
-                                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+        # 与 search_code 统一使用 SEARCH_CODE_TIMEOUT_SECONDS（原先硬编码 15s 不一致），
+        # 且用可取消轮询版本响应 cancel_event
+        result = _run_process_polled(cmd, SEARCH_CODE_TIMEOUT_SECONDS, cancel_event)
+        if result is None:
+            return "🛑 操作已被用户取消。"
         if result.returncode in (0, 1):
             output = result.stdout.strip()
             if output:

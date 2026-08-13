@@ -282,11 +282,14 @@ def test_non_skill_command_bypasses_dependency_tokenization(monkeypatch):
     class FakeProcess:
         returncode = 0
 
-        def communicate(self, timeout=None):
-            return b"shell handled command", b""
+        def poll(self):
+            return 0
 
     def fake_popen(*args, **kwargs):
         calls.append((args, kwargs))
+        # 新版 execute_command 把输出重定向到临时文件 sink，fake 直接写入
+        kwargs["stdout"].write(b"shell handled command")
+        kwargs["stdout"].flush()
         return FakeProcess()
 
     monkeypatch.setattr("core.tools.subprocess.Popen", fake_popen)
@@ -2735,8 +2738,8 @@ def test_execute_command_no_output_nonzero_exit_is_informational(monkeypatch):
     class FakeProcess:
         returncode = 1
 
-        def communicate(self, timeout=None):
-            return b"", b""
+        def poll(self):
+            return 1
 
     monkeypatch.setattr(
         "core.tools.subprocess.Popen", lambda *args, **kwargs: FakeProcess()
@@ -2754,12 +2757,16 @@ def test_execute_command_nonzero_exit_with_output_still_error(monkeypatch):
     class FakeProcess:
         returncode = 2
 
-        def communicate(self, timeout=None):
-            return "爆炸了".encode("utf-8"), b""
+        def poll(self):
+            return 2
 
-    monkeypatch.setattr(
-        "core.tools.subprocess.Popen", lambda *args, **kwargs: FakeProcess()
-    )
+    def fake_popen(*args, **kwargs):
+        # 新版 execute_command 把输出重定向到临时文件 sink，fake 直接写入
+        kwargs["stdout"].write("爆炸了".encode("utf-8"))
+        kwargs["stdout"].flush()
+        return FakeProcess()
+
+    monkeypatch.setattr("core.tools.subprocess.Popen", fake_popen)
 
     result = execute_command("boom-command")
 
@@ -2779,3 +2786,365 @@ def test_list_directory_on_file_returns_soft_hint(tmp_path, monkeypatch):
 
     assert not result.startswith("🚨")
     assert "read_file" in result
+
+
+# ---------------------------------------------------------------------------
+# 源码审计修复的回归测试（High3-5 / M1-M8 / Low）
+# ---------------------------------------------------------------------------
+
+
+def test_ssrf_strict_mode_is_default_when_config_missing(monkeypatch):
+    """High 4：未显式配置时默认严格模式（仅用户显式配置 false 才降级宽松）。"""
+    import core.tools as tools_mod
+    import config as config_mod
+
+    monkeypatch.setattr(config_mod, "_read_json_with_backup", lambda *a, **k: {})
+    assert tools_mod._get_fetch_url_strict_ssrf() is True
+    monkeypatch.setattr(config_mod, "_read_json_with_backup", lambda *a, **k: {"fetch_url_strict_ssrf": False})
+    assert tools_mod._get_fetch_url_strict_ssrf() is False
+
+
+def test_ssrf_default_strict_blocks_loopback_and_private(monkeypatch):
+    """High 4：默认严格模式下 loopback/私网 IP 字面量被拒绝。"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+    for url in ("http://127.0.0.1:8080/admin", "http://localhost/", "http://10.0.0.1/"):
+        try:
+            tools_mod._check_ssrf_url(url)
+        except tools_mod.SSRFBlockedError:
+            continue
+        raise AssertionError(f"应被 SSRF 拦截: {url}")
+
+
+def test_redirect_revalidates_ssrf_per_hop(monkeypatch):
+    """High 5：302 重定向目标逐跳重新触发 SSRF 校验，跳到元数据接口被拦截。"""
+    import core.tools as tools_mod
+    from urllib.request import Request
+
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_strict_ssrf", lambda: True)
+    monkeypatch.setattr(tools_mod, "_get_fetch_url_allow_hosts", lambda: set())
+
+    handler = tools_mod._SSRFRecheckRedirectHandler()
+    req = Request("https://example.com/start")
+    with pytest.raises(tools_mod.SSRFBlockedError):
+        handler.redirect_request(req, None, 302, "Found", {}, "http://169.254.169.254/latest/meta-data")
+    with pytest.raises(tools_mod.SSRFBlockedError):
+        handler.redirect_request(req, None, 302, "Found", {}, "http://127.0.0.1/internal")
+
+
+def test_redirect_to_safe_url_passes(monkeypatch):
+    """High 5：重定向到安全公网地址时正常构造新请求。"""
+    import core.tools as tools_mod
+    from urllib.request import Request
+
+    monkeypatch.setattr(tools_mod, "_check_ssrf_url", lambda url: None)
+    handler = tools_mod._SSRFRecheckRedirectHandler()
+    req = Request("https://example.com/start")
+    new_req = handler.redirect_request(req, None, 302, "Found", {}, "https://example.com/next")
+    assert new_req is not None
+    assert new_req.full_url == "https://example.com/next"
+
+
+def test_execute_command_output_cap_terminates_verbose_command():
+    """M1：输出超过 1MB 上限时终止并截断，不再无限累积。"""
+    import sys
+    from core.tools import EXECUTE_COMMAND_MAX_OUTPUT_BYTES, execute_command
+
+    overflow = EXECUTE_COMMAND_MAX_OUTPUT_BYTES + 512 * 1024
+    result = execute_command(
+        f'{sys.executable} -c "import sys; sys.stdout.write(\'x\' * {overflow})"',
+        timeout_seconds=60,
+    )
+    assert "截断" in result or "上限" in result
+    # 返回内容被限制在上限附近，不会把完整 1.5MB 带回
+    assert len(result) < overflow
+
+
+def test_read_file_missing_file_returns_friendly_error(tmp_path, monkeypatch):
+    """M3：读已删除/不存在的文件返回友好错误文本，不抛异常栈。"""
+    from core.tools import read_file
+
+    monkeypatch.chdir(tmp_path)
+    result = read_file("definitely_missing.txt")
+    assert result.startswith("🚨")
+    assert "不存在" in result
+
+
+def test_edit_file_detects_external_modification_between_read_and_write(tmp_path, monkeypatch):
+    """M4：读取后文件被外部修改时，edit_file 拒绝静默覆盖并要求重读。"""
+    import core.tools as tools_mod
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "race.py"
+    target.write_text("alpha = 1\nbeta = 2\n", encoding="utf-8")
+
+    original_fuzzy = tools_mod._fuzzy_replace
+
+    def racing_fuzzy(content, match_target, match_replacement, replace_all=False):
+        # 模拟并发子代理：在 读→写 窗口内从外部改动同一文件
+        target.write_text("alpha = 1\nbeta = 2\ngamma = 3\n", encoding="utf-8")
+        return original_fuzzy(content, match_target, match_replacement, replace_all=replace_all)
+
+    monkeypatch.setattr(tools_mod, "_fuzzy_replace", racing_fuzzy)
+
+    result = edit_file("race.py", "beta = 2", "beta = 20")
+
+    assert result.startswith("🚨")
+    assert "外部修改" in result
+    # 文件保持外部修改后的内容，未被本次编辑覆盖
+    assert target.read_text(encoding="utf-8") == "alpha = 1\nbeta = 2\ngamma = 3\n"
+
+
+def test_write_file_detects_external_modification_before_replace(tmp_path, monkeypatch):
+    """M4：write_file 在写入前发现文件被外部创建/修改时中止。"""
+    import core.tools as tools_mod
+    from core.tools import write_file
+
+    monkeypatch.chdir(tmp_path)
+
+    original_mkstemp = tools_mod.tempfile.mkstemp
+
+    def racing_mkstemp(*args, **kwargs):
+        # 模拟并发写入：目标文件在检查后、os.replace 前被外部创建
+        (tmp_path / "new.txt").write_text("external", encoding="utf-8")
+        return original_mkstemp(*args, **kwargs)
+
+    monkeypatch.setattr(tools_mod.tempfile, "mkstemp", racing_mkstemp)
+
+    result = write_file("new.txt", "mine")
+
+    assert result.startswith("🚨")
+    assert (tmp_path / "new.txt").read_text(encoding="utf-8") == "external"
+
+
+def test_smart_replace_all_replaces_every_high_score_block(tmp_path, monkeypatch):
+    """M5：智能替换 replace_all=True 时替换所有高评分候选块。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "multi.py"
+    target.write_text(
+        "def old_func():\n    return 'old'\n\n"
+        "def old_func():\n    return 'old'\n",
+        encoding="utf-8",
+    )
+
+    result = edit_file(
+        "multi.py",
+        replacement_content="def new_func():\n    return 'new'\n",
+        replace_all=True,
+    )
+
+    assert result.startswith("✔")
+    assert "2 处" in result
+    content = target.read_text(encoding="utf-8")
+    assert content.count("new_func") == 2
+    assert "old_func" not in content
+
+
+def test_smart_replace_rejects_low_similarity_candidate(tmp_path, monkeypatch):
+    """M5：最佳候选综合评分不足 0.7 时拒绝瞎猜替换，要求显式 target。"""
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "loose.py"
+    target.write_text("alpha_keep\nbeta\nbeta\ngamma\n", encoding="utf-8")
+
+    result = edit_file(
+        "loose.py",
+        replacement_content="alpha_keep\ncompletely different\nnothing alike\n",
+    )
+
+    assert result.startswith("🚨")
+    assert "0.7" in result
+    assert "target_content" in result
+    # 文件未被改动
+    assert target.read_text(encoding="utf-8") == "alpha_keep\nbeta\nbeta\ngamma\n"
+
+
+def test_edit_file_write_failure_does_not_pollute_undo_stack(tmp_path, monkeypatch):
+    """Low：写入失败（os.replace 异常）时撤销栈不被提前污染。"""
+    import core.memory as memory_module
+    from core.tools import edit_file
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "undo2.py"
+    target.write_text("alpha\n", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(
+        memory_module,
+        "set_undo_state",
+        lambda file_path, content: captured.append((file_path, content)),
+    )
+
+    def failing_replace(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("core.tools.os.replace", failing_replace)
+
+    result = edit_file("undo2.py", "alpha", "beta")
+
+    assert result.startswith("🚨")
+    assert captured == []
+    assert target.read_text(encoding="utf-8") == "alpha\n"
+
+
+def test_search_code_respects_cancel_event(tmp_path, monkeypatch):
+    """M6：search_code 在取消后立即返回，不再阻塞等待 ripgrep。"""
+    import core.tools as tools_mod
+
+    monkeypatch.chdir(tmp_path)
+    cancel = threading.Event()
+    cancel.set()
+
+    result = tools_mod.search_code("anything", cancel_event=cancel)
+
+    assert result.startswith("🛑")
+
+
+def test_glob_files_respects_cancel_event(tmp_path, monkeypatch):
+    """M6：glob_files 在取消后立即返回。"""
+    import core.tools as tools_mod
+
+    monkeypatch.chdir(tmp_path)
+    cancel = threading.Event()
+    cancel.set()
+
+    result = tools_mod.glob_files("*.py", cancel_event=cancel)
+
+    assert result.startswith("🛑")
+
+
+def test_fetch_url_respects_cancel_event(monkeypatch):
+    """M6：fetch_url 在发起请求前检查取消。"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(tools_mod, "_check_ssrf_url", lambda url: None)
+    cancel = threading.Event()
+    cancel.set()
+
+    result = tools_mod.fetch_url("https://example.com/", cancel_event=cancel)
+
+    assert result.startswith("🛑")
+
+
+def test_search_news_clamps_num_results(monkeypatch):
+    """Low：search_news 的 num_results 钳制上限，防止模型传超大值触发限流。"""
+    import core.tools as tools_mod
+
+    captured = {}
+
+    class FakeDDGS:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def news(self, query, max_results=None):
+            captured["max_results"] = max_results
+            return [{"title": "t", "url": "u", "body": "b"}]
+
+    monkeypatch.setattr(tools_mod, "DDGS", lambda: FakeDDGS())
+
+    result = tools_mod.search_news("query", num_results=100000)
+
+    assert not result.startswith("🚨")
+    assert captured["max_results"] == 20
+
+
+def test_glob_files_uses_search_timeout_constant(tmp_path, monkeypatch):
+    """Low：glob_files 的 rg 超时与 search_code 统一为 SEARCH_CODE_TIMEOUT_SECONDS。"""
+    import subprocess as _subprocess
+    import core.tools as tools_mod
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tools_mod, "_get_rg_executable", lambda: "rg")
+    captured = {}
+
+    def fake_polled(cmd, timeout, cancel_event=None):
+        captured["timeout"] = timeout
+        return _subprocess.CompletedProcess(cmd, 1, "", "")
+
+    monkeypatch.setattr(tools_mod, "_run_process_polled", fake_polled)
+
+    tools_mod.glob_files("*.py")
+
+    assert captured["timeout"] == tools_mod.SEARCH_CODE_TIMEOUT_SECONDS
+
+
+def test_subagent_approval_wait_over_limit_is_terminated():
+    """M7：审批等待超过独立上限（300s）即终止任务，不再无限悬挂。"""
+    manager = SubagentManager(
+        runner=lambda record: record.cancel_event.wait(1),
+        monotonic=FakeMonotonic([0.0, 400.0]),
+        wait_interval=0.001,
+        permission_waiting=lambda owner_id: True,
+    )
+
+    result = manager.run("等待审批", "s1", "t1", timeout_seconds=600)
+
+    assert "超时" in result
+    assert "审批等待" in result
+    snapshot = manager.snapshot()[0]
+    assert snapshot.status == "timed_out"
+
+
+def test_background_subagent_approval_wait_over_limit_is_terminated():
+    """M7：后台看门狗同样执行审批等待上限。"""
+    import core.tools as tools_mod
+
+    release = threading.Event()
+    manager = SubagentManager(
+        runner=lambda record: record.cancel_event.wait(2) and "完成",
+        monotonic=FakeMonotonic([0.0, 400.0, 401.0]),
+        wait_interval=0.001,
+        permission_waiting=lambda owner_id: True,
+    )
+    manager.set_on_terminal(lambda *args: release.set())
+
+    manager.run("后台等待审批", "s1", "t1", run_in_background=True, timeout_seconds=600)
+
+    assert release.wait(5)
+    snapshot = manager.snapshot()[0]
+    assert snapshot.status == "timed_out"
+    assert "审批等待" in snapshot.error
+
+
+def test_execute_command_background_echo_redacts_inline_credentials(monkeypatch):
+    """M8：后台任务启动回显中的内联凭据被脱敏。"""
+    monkeypatch.setattr(
+        "core.task_manager.start_background_task",
+        lambda command: "abc12345",
+    )
+
+    result = execute_command(
+        "export TOKEN=sk-abc123def456 && npm run dev",
+        run_in_background=True,
+    )
+
+    assert "sk-abc123def456" not in result
+    assert "***" in result
+
+
+def test_manage_task_list_redacts_inline_credentials(monkeypatch):
+    """M8：manage_task list 回显的命令文本被脱敏。"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(
+        "core.task_manager.list_active_tasks",
+        lambda: [{
+            "task_id": "abc12345",
+            "pid": 1234,
+            "duration": "10秒",
+            "command": "export password=hunter2 && npm run dev",
+        }],
+    )
+
+    result = tools_mod.manage_task("list")
+
+    assert "hunter2" not in result
+    assert "***" in result

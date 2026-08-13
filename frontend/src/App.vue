@@ -36,8 +36,8 @@
             <!-- 消息流列表 -->
             <template v-else>
               <MessageBubble
-                v-for="(msg, i) in store.messages"
-                :key="i"
+                v-for="msg in store.messages"
+                :key="msgKey(msg)"
                 :msg="msg"
               />
             </template>
@@ -171,6 +171,20 @@ function scrollToBottom() {
   });
 }
 
+// M32 修复：消息列表 key 不用数组索引（插入/删除时组件局部状态会错挂）。
+// 消息对象没有后端 id，这里按对象身份分配稳定的渲染 key：
+// 同一消息对象在列表内移动/前后增删时 key 不变，组件状态不错位。
+const msgKeyMap = new WeakMap<object, number>();
+let msgKeySeq = 0;
+function msgKey(msg: object): number {
+  let k = msgKeyMap.get(msg);
+  if (k === undefined) {
+    k = ++msgKeySeq;
+    msgKeyMap.set(msg, k);
+  }
+  return k;
+}
+
 // 对话区 DOM 变化观察器：覆盖所有不经过 store 顶层状态的更新——
 // 思考流、工具执行时间线、Diff 展开、working 指示每秒计时等子组件内部变化。
 // 只有用户停留在底部附近（阈值 200px）时才自动吸底，向上翻历史不打扰。
@@ -272,24 +286,42 @@ onUnmounted(() => window.clearInterval(workTimer));
 watch(() => store.permRequest.show, () => {
   scrollToBottom();
 });
+// M25 修复：pywebviewready 事件与 100ms 兜底轮询是双通道，原先无互斥，
+// initFromBackend 可能执行两次互相覆盖；且事件监听器注册后从不移除。
+// initStarted 互斥标志保证只初始化一次，触发后移除监听并停轮询。
+let initStarted = false;
+let initPollTimer: number | undefined;
+function startInit() {
+  if (initStarted) return;
+  initStarted = true;
+  window.removeEventListener('pywebviewready', onPywebviewReady);
+  if (initPollTimer !== undefined) {
+    clearInterval(initPollTimer);
+    initPollTimer = undefined;
+  }
+  store.initFromBackend();
+}
+function onPywebviewReady() {
+  startInit();
+}
+
 onMounted(() => {
   document.addEventListener('click', closeExportMenu);
 
   if (window.pywebview && window.pywebview.api) {
-    store.initFromBackend();
+    startInit();
   } else {
-    window.addEventListener('pywebviewready', () => {
-      store.initFromBackend();
-    });
+    window.addEventListener('pywebviewready', onPywebviewReady);
     // 兜底轮询监听 PyWebView ready 注入
     let attempts = 0;
-    const timer = setInterval(() => {
+    initPollTimer = window.setInterval(() => {
       attempts++;
       if (window.pywebview && window.pywebview.api) {
-        clearInterval(timer);
-        store.initFromBackend();
+        startInit();
       } else if (attempts > 60) {
-        clearInterval(timer);
+        clearInterval(initPollTimer);
+        initPollTimer = undefined;
+        window.removeEventListener('pywebviewready', onPywebviewReady);
       }
     }, 100);
   }
@@ -299,6 +331,11 @@ onMounted(() => {
 });
 onUnmounted(() => {
   document.removeEventListener('click', closeExportMenu);
+  window.removeEventListener('pywebviewready', onPywebviewReady);
+  if (initPollTimer !== undefined) {
+    clearInterval(initPollTimer);
+    initPollTimer = undefined;
+  }
   bodyObserver?.disconnect();
   bodyObserver = undefined;
   observedBody = null;

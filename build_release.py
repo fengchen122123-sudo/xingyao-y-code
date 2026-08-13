@@ -135,8 +135,12 @@ def step0_build_frontend(project_dir, args):
 
     print("🚀 正在执行 npm run build ...")
     try:
-        # Windows 上 npm 实际可执行文件是 npm.cmd，必须 shell=True 才能被正确解析到。
-        result = subprocess.run(["npm", "run", "build"], cwd=frontend_dir, shell=True)
+        # Windows 上 npm 实际可执行文件是 npm.cmd：用 shutil.which 解析完整路径后
+        # 以列表参数直接调用（已验证无需 shell=True），消除 PATH 劫持/命令注入面
+        npm_bin = shutil.which("npm")
+        if npm_bin is None:
+            raise FileNotFoundError("PATH 环境变量中未找到 npm")
+        result = subprocess.run([npm_bin, "run", "build"], cwd=frontend_dir)
     except OSError as exc:
         print("❌ 前端构建失败：无法启动 npm 命令。")
         print(f"   错误详情: {exc}")

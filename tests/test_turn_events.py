@@ -45,3 +45,12 @@ def test_event_factory_sequences_are_unique_across_threads():
         assert thread.is_alive() is False
 
     assert sorted(sequences) == list(range(1, 8 * per_thread + 1))
+
+
+def test_event_payload_deepcopy_failure_falls_back_to_shallow_copy():
+    """T3：payload 含锁等不可深拷贝对象时不得中断 turn，退回浅拷贝。"""
+    lock = threading.Lock()
+    event = TurnEventFactory("turn-lock").emit("tool_started", {"lock": lock, "name": "x"})
+
+    assert event.payload["lock"] is lock
+    assert event.payload["name"] == "x"

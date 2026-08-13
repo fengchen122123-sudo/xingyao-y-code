@@ -86,6 +86,23 @@ def _content_has_media(content):
     )
 
 
+def message_content_to_text(raw_content):
+    """把入库的消息 content 提取为纯文本（多模态数组只拼接 text 块）。
+
+    供记忆压缩归纳等只需要文本的场景复用，避免各处重复 JSON 解析逻辑。
+    """
+    parsed, ok = _try_parse_json(raw_content)
+    if not ok:
+        return str(raw_content)
+    if isinstance(parsed, list):
+        text_parts = []
+        for item in parsed:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+        return " ".join(text_parts)
+    return str(parsed)
+
+
 def _sanitize_tool_call_pairing(history):
     """修复 tool_call 配对，避免坏历史导致 API 报错后整个会话无法继续使用。
 
@@ -478,22 +495,27 @@ class MemoryManager:
             ts = int(time.time())
         day = time.strftime("%Y-%m-%d", time.localtime(ts))
         with self._lock:
-            self.conn.execute(
-                "INSERT INTO token_usage "
-                "(ts, date, provider, model, prompt_tokens, completion_tokens, "
-                "cached_tokens, total_tokens, session_id, api_base, cache_scope) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    int(ts), day, str(provider or ""), str(model or ""),
-                    int(prompt_tokens or 0), int(completion_tokens or 0),
-                    None if cached_tokens is None else int(cached_tokens),
-                    int(total_tokens or 0),
-                    str(session_id) if session_id is not None else None,
-                    _canonicalize_api_base(api_base),
-                    str(cache_scope or "legacy"),
-                ),
-            )
-            self.conn.commit()
+            try:
+                self.conn.execute(
+                    "INSERT INTO token_usage "
+                    "(ts, date, provider, model, prompt_tokens, completion_tokens, "
+                    "cached_tokens, total_tokens, session_id, api_base, cache_scope) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        int(ts), day, str(provider or ""), str(model or ""),
+                        int(prompt_tokens or 0), int(completion_tokens or 0),
+                        None if cached_tokens is None else int(cached_tokens),
+                        int(total_tokens or 0),
+                        str(session_id) if session_id is not None else None,
+                        _canonicalize_api_base(api_base),
+                        str(cache_scope or "legacy"),
+                    ),
+                )
+                self.conn.commit()
+            except Exception:
+                # 与同模块其它写方法一致：失败必须回滚，避免连接遗留活动事务
+                self.conn.rollback()
+                raise
 
     def get_last_token_usage(self, session_id):
         """查询指定会话最近一次真实 token 用量，无记录返回 None。
@@ -801,9 +823,18 @@ class MemoryManager:
         """记笔记技能：把聊天内容存进数据库"""
         self.add_messages(session_name, [(role, content)])
         if str(role) == "user":
-            self.prune_history_files(
-                session_name, max_turns=16, retain_recent=4
-            )
+            try:
+                self.prune_history_files(
+                    session_name, max_turns=16, retain_recent=4
+                )
+            except Exception:
+                # 裁剪发生在消息入库提交之后（非原子）：裁剪失败时消息已安全落库，
+                # 不能让异常冒泡把“已成功的写入”误报为失败；裁剪是幂等的，
+                # 下一条 user 消息入库时会自动重试。
+                logging.getLogger("py.warnings").warning(
+                    "add_message: prune_history_files 失败，已延后到下次重试 (session=%s)",
+                    session_name, exc_info=True,
+                )
 
     @staticmethod
     def _serialize_message_content(content):
@@ -867,11 +898,18 @@ class MemoryManager:
                     session_id = row[0]
                 else:
                     target_wdir = self.workdir
+                    # 并发首写防御：两个连接同时 SELECT 均未命中时会双双 INSERT，
+                    # session_name UNIQUE 约束让后提交者整批消息 IntegrityError 丢失。
+                    # INSERT OR IGNORE + 重新 SELECT：冲突时采用已存在的会话行。
                     cursor.execute('''
-                        INSERT INTO sessions (session_name, workdir, created_at, updated_at, source)
+                        INSERT OR IGNORE INTO sessions (session_name, workdir, created_at, updated_at, source)
                         VALUES (?, ?, ?, ?, 'GUI')
                     ''', (session_name, target_wdir, now, now))
-                    session_id = cursor.lastrowid
+                    cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
+                    row = cursor.fetchone()
+                    if row is None:
+                        raise RuntimeError(f"会话档案创建失败: {session_name!r}")
+                    session_id = row[0]
                 cursor.executemany('''
                     INSERT INTO messages (session_id, role, content)
                     VALUES (?, ?, ?)
@@ -1137,6 +1175,14 @@ class MemoryManager:
                         DELETE FROM messages
                         WHERE session_id = ? AND id > ?
                     ''', (session_id, user_msg_id))
+                    # 同步失效压缩产物：撤销后旧摘要内容已失真（可能仍描述被撤销的
+                    # 修改），继续注入会误导模型；回退水位让被摘要排除的历史重新可见，
+                    # 超限由水位线阶梯在下轮重新压缩。与删除同事务，避免半完成状态。
+                    cursor.execute('''
+                        UPDATE sessions
+                        SET memory_summary = NULL, summarized_until_msg_id = 0
+                        WHERE id = ? AND (memory_summary IS NOT NULL OR summarized_until_msg_id)
+                    ''', (session_id,))
                     self.conn.commit()
                 except Exception:
                     self.conn.rollback()
@@ -1408,6 +1454,58 @@ class MemoryManager:
                 except Exception:
                     self.conn.rollback()
                     raise
+
+    def evict_oldest_turn_persistent(self, session_name):
+        """DB 层滑窗淘汰：推进 summarized_until_msg_id，把最早一个完整轮次
+        （首个非 system 消息到下一个 user 之前）一次性排除出活跃历史。
+
+        只推进水位、不改写任何消息字节（字节稳定性铁律允许的一次性 DB 层水位
+        推进）。纯内存淘汰会在下一轮 prepare 时被 get_history_for_llm 全量读回
+        而失效，淘汰必须持久化才真正生效。
+        返回 True 表示确实淘汰了一个轮次，False 表示没有可安全淘汰的内容。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    'SELECT id, summarized_until_msg_id FROM sessions WHERE session_name = ?',
+                    (session_name,),
+                )
+                row = cursor.fetchone()
+                if not row:
+                    return False
+                session_id = row[0]
+                boundary = row[1] or 0
+                cursor.execute(
+                    'SELECT id, role FROM messages WHERE session_id = ? AND id > ? ORDER BY id ASC',
+                    (session_id, boundary),
+                )
+                rows = cursor.fetchall()
+                start = next(
+                    (i for i, r in enumerate(rows) if r[1] != "system"),
+                    None,
+                )
+                if start is None:
+                    return False
+                end = next(
+                    (j for j in range(start + 1, len(rows)) if rows[j][1] == "user"),
+                    len(rows),
+                )
+                if end >= len(rows):
+                    # 最早轮次已是最后轮次：再淘汰会清空活跃历史，拒绝
+                    return False
+                new_boundary = rows[end - 1][0]
+                if new_boundary <= boundary:
+                    return False
+                cursor.execute(
+                    'UPDATE sessions SET summarized_until_msg_id = ? WHERE id = ?',
+                    (new_boundary, session_id),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
 
     def maintain_tool_results(self, session_name, tier=1, protection_tokens=8000):
         """分层本地维护旧工具结果（Snip/Elide），DB 层一次性改写并永久冻结。
