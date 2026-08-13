@@ -54,18 +54,6 @@ if (
 ):
     print("  星瑶正在启动，请稍候...", flush=True)
 
-# TEMP STARTUP TRACE (revert after diagnosis)：从启动提示处开始全程计时
-import time as _time
-_STARTUP_T0 = _time.monotonic()
-def _startup_trace(label):
-    try:
-        import os as _os
-        with open(_os.path.join(_os.path.expanduser("~"), ".ycode", "startup-trace.log"), "a", encoding="utf-8") as _tf:
-            _tf.write(f"{_time.monotonic()-_STARTUP_T0:8.2f}s  {_time.strftime('%H:%M:%S')}  {label}\n")
-    except Exception:
-        pass
-_startup_trace("startup line printed (import chain begins)")
-
 from core.runtime_warnings import configure_runtime_warnings
 configure_runtime_warnings()
 import datetime
@@ -115,11 +103,10 @@ from core.model_manager import get_active_model
 from core.version import __version__ as YCODE_VERSION
 # 警告：from-import 会在 import 时冻结常量值。新增调用方禁止 from-import 这些常量，
 # 应 import config 后动态读取（如 config.MY_MODEL），以便配置热更新生效。
-from config import MY_MODEL, MY_KEY, MY_BASE_URL, MY_THEME, MY_PERMISSION_MODE, DB_FILE
+# config.py 已通过模块级 __getattr__ 动态解析 MY_* 常量，必须走模块属性访问。
+import config
 
-_startup_trace("import chain done")
-manager = MemoryManager(db_path=DB_FILE)
-_startup_trace("MemoryManager ready")
+manager = MemoryManager(db_path=config.DB_FILE)
 
 # ---------------------------------------------------------------------------
 # 全局状态所有权约定（为后续 AppState 结构化重构铺路）：
@@ -130,10 +117,10 @@ _startup_trace("MemoryManager ready")
 #   3. session_token_usage 由 core.llm.token_usage_lock 保护，读写必须持锁。
 #   4. 后台线程绝不直接调用 print_formatted_text / app_instance.invalidate()。
 # ---------------------------------------------------------------------------
-current_theme = MY_THEME
+current_theme = config.MY_THEME
 # 权限模式统一走 app_context 规范化，全系统只允许 confirm / plan / full
 import core.app_context as _app_ctx
-current_permission_mode = _app_ctx.normalize_permission_mode(MY_PERMISSION_MODE)
+current_permission_mode = _app_ctx.normalize_permission_mode(config.MY_PERMISSION_MODE)
 plan_approved_this_turn = False
 show_memory_summary = False
 confirm_prompt = None
@@ -154,8 +141,10 @@ _assistant_stream_buffers = {}
 # 正文块渲染前才打印（而不是回合的第一个事件到来时），若本轮完全没有产出文字，
 # 则永远不会打印头部——这是符合预期的，见 _render_public_answer_block。
 _answer_header_printed = {}
-# 已触发自动汇总的会话集合：避免对同一批后台任务重复触发汇总 turn
+# 已触发自动汇总的会话集合（按会话分桶）：避免对同一批后台任务重复触发汇总 turn
 # 当用户发起新对话（新一轮后台任务）时，需要重置该会话的标志
+# M37 修复：终态回调创建时绑定会话快照、汇总投递也使用快照，
+# 不再读取全局 current_session，避免用户切换会话后汇总投递到错误的会话。
 _bg_summary_triggered = set()
 _bg_summary_lock = threading.Lock()  # 保护 _bg_summary_triggered 的检查+添加原子性
 active_thinking_text = ""
@@ -579,6 +568,11 @@ def _on_background_subagent_terminal(task_id: str, status: str, description: str
 
     schedule_ui(_print_notification)
 
+    # M37 修复：回调创建时立即捕获会话快照。后台子代理可能运行很久，
+    # 期间用户可切换会话；若 sleep 0.5s 后才读全局 current_session，
+    # 汇总指令会被投递到用户新切换的会话，污染无关会话历史。
+    _cb_session_snapshot = current_session
+
     # 自动汇总触发：在独立线程中延迟检查，避免与并发任务终态回调产生竞态。
     # 直接在回调中检查 has_running_background_tasks 可能误判——另一个后台任务
     # 可能正在终止过程中（状态还没更新到 SubagentManager）。
@@ -586,7 +580,8 @@ def _on_background_subagent_terminal(task_id: str, status: str, description: str
     def _deferred_summary_check():
         try:
             from core.tools import subagent_manager as _sm_for_trigger
-            session = current_session
+            # M37：使用回调创建时的会话快照，而非全局 current_session
+            session = _cb_session_snapshot
             if not session:
                 return
             # 短暂等待，让并发的终态回调完成状态更新
@@ -597,16 +592,20 @@ def _on_background_subagent_terminal(task_id: str, status: str, description: str
             # 本会话已触发过汇总时，不重复触发（用户发起新对话时会重置标志）。
             # 加锁保证检查+添加的原子性：两个子代理在 0.5s 内先后结束时，
             # 无锁版本会双双通过检查并触发两次汇总，白白烧掉一轮 token。
+            # M37：_bg_summary_triggered 为按会话分桶的 set，元素即会话名。
             with _bg_summary_lock:
                 if session in _bg_summary_triggered:
                     return
                 _bg_summary_triggered.add(session)
-            # 注入汇总指令到 msg_queue，让主代理自动开始汇总 turn
+            # 注入汇总指令到 msg_queue，让主代理自动开始汇总 turn。
+            # M37：携带会话快照（session 字段），worker 处理时（M35）优先使用
+            # 该快照而非全局 current_session，保证汇总写入发起后台任务的会话。
             msg_queue.put({
                 "text": "__ycode_internal__:summarize_background_tasks",
                 "was_queued": False,
                 "is_skill_call": False,
                 "is_internal": True,
+                "session": session,
             })
         except Exception:
             # 触发失败不能影响主流程
@@ -752,14 +751,22 @@ def _reset_turn_state():
 def _cancel_active_turn() -> None:
     from core.tools import subagent_manager
     from core.task_scheduler import get_default_scheduler
+    from core.plan import suppress_plan_auto_continue
 
     # 取消完全由每 turn 的 cancel_event 驱动（core.llm 已不再读取模块级 cancel_requested）
     if active_cancel_event is not None:
         active_cancel_event.set()
+        # 硬中断在飞 LLM 请求：先 set 事件再关闭底层流，
+        # 被关闭一侧归一为用户取消（KeyboardInterrupt 打捞路径）
+        from core.llm import abort_inflight_streams
+        abort_inflight_streams(active_cancel_event)
     if active_turn_id is not None:
         permission_broker.cancel_turn(active_turn_id)
         subagent_manager.cancel_foreground(current_session, active_turn_id)
     get_default_scheduler().cancel_all()
+    # 用户主动取消：抑制计划续推 nudge，否则下一个回合收尾时
+    # “计划尚未执行完毕”会把刚取消的任务复活
+    suppress_plan_auto_continue(current_session)
 
 
 def post_ui_event(event):
@@ -997,6 +1004,8 @@ def _render_ui_event(event):
             if state != "idle":
                 is_thinking = state in {"thinking", "executing"}
             else:
+                # idle 分支必须重置 is_thinking，否则旋转动画/排队判断会永久残留
+                is_thinking = False
                 _active_tool_status = None
         message = str(event.payload.get("message", ""))
         if message:
@@ -1790,7 +1799,9 @@ def handle_slash_command(command_text):
                 )
                 if shell_log_available:
                     print_formatted_text(HTML(f"<ansicyan><b>--- 任务 {safe_tid} 最新 30 行日志 ---</b></ansicyan>"))
-                    print(output)
+                    # Low 修复：任务日志可能携带 ANSI 控制序列，直接 print 会注入终端样式；
+                    # 与 history_renderer 一致，剥离 ESC 字符后再输出。
+                    print(output.replace("\x1b", ""))
                 else:
                     # 再查子代理任务状态
                     sub_tasks = subagent_manager.snapshot()
@@ -1919,7 +1930,7 @@ def handle_slash_command(command_text):
         # 会话级检查点管理：list 查看、restore <turn_id> 回滚整轮所有文件修改
         # 设计参考 Grok Build 的 workspace 级 checkpoint
         from core.memory import list_checkpoints, restore_checkpoint
-        parts = command_text.strip().split(maxsplit=2)
+        parts = command_text.strip().split(maxsplit=3)
         sub = parts[1] if len(parts) > 1 else "list"
 
         if sub == "list":
@@ -1955,6 +1966,25 @@ def handle_slash_command(command_text):
                 elif not snapshots:
                     print_formatted_text(HTML(f"<ansiyellow>ℹ 检查点 {_esc(target_turn_id)} 没有文件修改记录（该轮没有写/编辑操作）。</ansiyellow>"))
                 else:
+                    # T5 修复：old_content == "" 表示该文件是检查后新建的，回滚即删除。
+                    # 若用户之后重建/修改了同名文件，静默删除会造成数据丢失——
+                    # 与 /undo 的删除确认保持一致，要求显式追加 y/yes/--force。
+                    confirm_flag = parts[3].strip().lower() if len(parts) > 3 else ""
+                    forced = confirm_flag in ("y", "yes", "--force")
+                    pending_deletes = [
+                        s for s in snapshots
+                        if s.get("old_content") == ""
+                        and os.path.exists(s.get("file_path") or "")
+                    ]
+                    if pending_deletes and not forced:
+                        print_formatted_text(HTML(
+                            f"<ansiyellow>⚠️ 回滚将删除 {len(pending_deletes)} 个检查点后新建的文件；"
+                            f"若这些文件之后被你重建或修改过，内容将一并丢失。"
+                            f"确认请追加 y/yes/--force，例如：/checkpoint restore {_esc(target_turn_id)} --force</ansiyellow>"
+                        ))
+                        for s in pending_deletes:
+                            print_formatted_text(HTML(f"  <ansigray>将删除: {_esc(s.get('file_path', '?'))}</ansigray>"))
+                        return
                     print_formatted_text(HTML(f"<ansicyan>🔄 正在回滚检查点 {_esc(target_turn_id)}，共 {len(snapshots)} 个文件...</ansicyan>"))
                     from core.tools import write_file, sandbox_bypass
                     success = 0
@@ -2583,7 +2613,14 @@ def _make_input_app():
                     else:
                         _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}")
                         
-                    msg_queue.put({"text": text, "was_queued": was_queued, "is_skill_call": True})
+                    # M35：入队时快照当前会话名，worker 处理时使用快照，
+                    # 避免排队期间用户 /session switch 后消息写入错误的会话
+                    msg_queue.put({
+                        "text": text,
+                        "was_queued": was_queued,
+                        "is_skill_call": True,
+                        "session": current_session,
+                    })
                     input_area.text = ""
                 else:
                     # 正常的系统命令：设计上有意在 UI 线程同步执行（/session delete、
@@ -2608,7 +2645,12 @@ def _make_input_app():
                     # 正常的青色高亮提示
                     _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> {safe_input}")
                 
-                msg_queue.put({"text": text, "was_queued": was_queued})
+                # M35：入队时快照当前会话名（与上方技能调用分支一致）
+                msg_queue.put({
+                    "text": text,
+                    "was_queued": was_queued,
+                    "session": current_session,
+                })
                 input_area.text = ""
 
     @kb.add("c-n")
@@ -2656,14 +2698,16 @@ def _make_input_app():
     @kb.add("up", filter=Condition(lambda: confirm_prompt is not None))
     def confirm_arrow_up(event):
         global confirm_prompt
-        if confirm_prompt:
+        # T2 修复：options 为空时取模会 ZeroDivisionError，必须防御
+        if confirm_prompt and confirm_prompt.get('options'):
             confirm_prompt['current_idx'] = (confirm_prompt['current_idx'] - 1) % len(confirm_prompt['options'])
             event.app.invalidate()
 
     @kb.add("down", filter=Condition(lambda: confirm_prompt is not None))
     def confirm_arrow_down(event):
         global confirm_prompt
-        if confirm_prompt:
+        # T2 修复：options 为空时取模会 ZeroDivisionError，必须防御
+        if confirm_prompt and confirm_prompt.get('options'):
             confirm_prompt['current_idx'] = (confirm_prompt['current_idx'] + 1) % len(confirm_prompt['options'])
             event.app.invalidate()
 
@@ -3051,6 +3095,21 @@ def _make_input_app():
 _evict_oldest_turn = _agent_service.evict_oldest_turn
 
 
+def _report_task_result(task_data, ok, error=None):
+    """High 8 修复：worker 通过任务携带的共享 result 对象向投递方报告成败。
+
+    队列层（task_done/join）无法区分成功与失败，headless 等投递方需要一个
+    显式结果通道。仅当任务携带了 dict 类型的 "result" 字段时才上报。
+    """
+    if not isinstance(task_data, dict):
+        return
+    result = task_data.get("result")
+    if isinstance(result, dict):
+        result["ok"] = bool(ok)
+        if error:
+            result["error"] = str(error)
+
+
 def _background_worker():
     """后台消费者线程：专门处理排队的对话请求"""
     global plan_approved_this_turn, active_cancel_event, active_turn_id
@@ -3081,6 +3140,9 @@ def _background_worker():
 
             # 尽早发布取消事件：让 Ctrl+C 在“准备请求”阶段（读历史、压缩记忆等
             # 耗时步骤）也能生效。真正的 turn cancel_event 建立后会继承该状态。
+            # M36 修复：赋值必须保持在内层 try 块内（本 try 覆盖整个准备阶段），
+            # 外层 except 会显式置 None 清理——否则准备阶段抛异常时该残留 event
+            # 会让下一次 Ctrl+C 误判"执行中"，清空整个消息队列。
             early_cancel = threading.Event()
             active_cancel_event = early_cancel
 
@@ -3110,7 +3172,13 @@ def _background_worker():
                 schedule_ui(lambda: print_formatted_text(
                     HTML("\n<ansired>! 后台任务执行失败：收到空任务，已跳过。</ansired>\n")
                 ))
+                _report_task_result(task_data, False, "收到空任务")
                 continue
+
+            # M35 修复：优先信任入队时快照的会话名；只有缺失快照的遗留任务
+            # 才退回读取全局 current_session（发送后立即切会话时，消息仍落入
+            # 原会话，不会污染新会话）。
+            task_session = task_data.get("session") or current_session
 
             # 内部指令处理：把 __ycode_internal__:summarize_background_tasks
             # 转换为友好的用户消息，触发主代理汇总后台任务结果
@@ -3128,8 +3196,9 @@ def _background_worker():
             else:
                 # 用户主动发起的新对话：重置该会话的自动汇总标志，
                 # 这样下一批后台任务完成时可以再次触发自动汇总
+                # M35/M37：按任务快照会话分桶重置，不读全局 current_session
                 try:
-                    _bg_summary_triggered.discard(current_session)
+                    _bg_summary_triggered.discard(task_session)
                 except Exception:
                     pass
 
@@ -3147,12 +3216,12 @@ def _background_worker():
             from core.model_manager import get_active_model
             active_info = get_active_model()
             if not active_info or not active_info.get("litellm_model"):
+                _report_task_result(task_data, False, "未配置或激活任何大模型")
                 schedule_ui(lambda: print_formatted_text(
                     HTML("<ansired>! 您当前未配置或激活任何大模型！请输入 /models 添加并激活模型后再进行对话。</ansired>")
                 ))
                 continue
 
-            task_session = current_session
             sync_plan_session(task_session)
             task_model = active_info["litellm_model"]
             task_key = active_info.get("api_key", "")
@@ -3252,6 +3321,7 @@ def _background_worker():
                     app_instance.invalidate()
 
             turn_interrupted = False
+            turn_error = None  # High 8：捕获本轮失败原因，供 result 通道上报
             try:
                 schedule_ui(mark_turn_started)
 
@@ -3285,6 +3355,7 @@ def _background_worker():
                     end_turn_checkpoint()  # 取消也提交检查点（已记录的快照仍可用）
                     schedule_ui(_reset_turn_state)
                     turn_interrupted = True
+                    turn_error = "已被用户取消"
                 except Exception as e:
                     turn_controller.cancel()
                     end_turn_checkpoint()
@@ -3306,6 +3377,7 @@ def _background_worker():
                     ))
                     schedule_ui(_reset_turn_state)
                     turn_interrupted = True
+                    turn_error = f"{type(e).__name__}: {e}"
             finally:
                 # active_cancel_event / active_turn_id 由 worker 线程在本 turn 的
                 # try/finally 作用域内建立，也必须由 worker 线程在 finally 直接清空。
@@ -3367,6 +3439,8 @@ def _background_worker():
                     pass
 
             if not turn_interrupted:
+                # High 8：turn 完整走完才上报成功，供 headless 等投递方判定退出码
+                _report_task_result(task_data, True)
                 # 检查是否需要自动重命名会话（当且仅当是新建的默认 hex 会话）
                 if re.match(r"^session_[a-f0-9]{6}$", task_session):
                     history = manager.get_history(task_session)
@@ -3381,10 +3455,18 @@ def _background_worker():
                                 task_key,
                                 task_url
                             )
+            else:
+                _report_task_result(task_data, False, turn_error or "任务被取消或回复生成失败")
         except Exception as e:
             # 兜底防线：parse/add_message/prune/压缩/提示词组装等任何未预期异常
             # 都不允许杀死 worker 线程，否则之后所有用户输入会被静默吞掉、UI 卡死
+            # M36 修复：准备阶段（early_cancel 建立后、turn try/finally 之前）的异常
+            # 不会经过内层 finally，active_cancel_event 会残留非 None，导致后续
+            # Ctrl+C 误判“执行中”而清空整个消息队列——这里显式置 None 清理。
+            active_cancel_event = None
+            active_turn_id = None
             logging.getLogger("py.warnings").exception("background worker turn failed: %s", e)
+            _report_task_result(task_data, False, f"{type(e).__name__}: {e}")
             # 持久化兜底异常的失败标记，确保会话历史完整可排查
             try:
                 if task_session:
@@ -3464,6 +3546,10 @@ def run_headless(prompt, session_name=None) -> int:
         "text": prompt,
         "was_queued": False,
         "is_skill_call": False,
+        # M35：携带会话快照，worker 不再读全局 current_session
+        "session": current_session,
+        # High 8：worker 通过该共享对象上报成败，失败时返回退出码 1
+        "result": {},
     }
     msg_queue.put(task_data)
 
@@ -3477,18 +3563,38 @@ def run_headless(prompt, session_name=None) -> int:
         deadline = time.monotonic() + 1800  # 30 分钟
         while msg_queue.unfinished_tasks > 0:
             if time.monotonic() > deadline:
+                # Low 修复：杀进程前先给运行中的 turn 发取消信号，留短暂优雅
+                # 退出窗口（工具/子代理有机会收尾并持久化状态），而不是直接强杀。
+                if active_cancel_event is not None:
+                    active_cancel_event.set()
+                    grace_deadline = time.monotonic() + 5
+                    while msg_queue.unfinished_tasks > 0 and time.monotonic() < grace_deadline:
+                        time.sleep(0.1)
                 print("\n[headless 任务超时（30 分钟），强制退出]", file=sys.stderr)
                 return 1
             time.sleep(0.1)
         # 给事件队列一点时间排空
         time.sleep(0.5)
 
+        # High 8：失败与成功在队列层无法区分（task_done 在 finally 无条件调用），
+        # 必须看 worker 通过共享 result 对象上报的成败；失败返回 1 让 CI 流水线判败。
+        task_result = task_data.get("result") or {}
+        if not task_result.get("ok"):
+            detail = task_result.get("error") or "任务未成功完成"
+            print(f"\n[headless 任务失败: {detail}]", file=sys.stderr)
+            return 1
+
         # headless 下不经过 TUI 渲染，需要从数据库取出最终回复并打印到 stdout
         try:
             history = manager.get_history(current_session)
+            # High 8：过滤 worker 持久化的失败标记消息，避免被当作正常回复打印
             assistant_messages = [
                 msg for msg in history
                 if isinstance(msg, dict) and msg.get("role") == "assistant"
+                and not (
+                    isinstance(msg.get("content"), str)
+                    and msg["content"].startswith(("[回复生成失败]", "[后台任务异常]"))
+                )
             ]
             if assistant_messages:
                 last = assistant_messages[-1]
@@ -3514,10 +3620,6 @@ def run_cli():
     """主入口 — 封装在 while 循环里，支持弹出全屏选择器后自动重启"""
     global app_instance, pending_action, current_session
     global current_model, current_key, current_url, current_ctx_win, current_model_name
-
-    # TEMP STARTUP TRACE (revert after diagnosis)
-    _trace_mark = _startup_trace
-    _trace_mark("run_cli enter")
 
     # 运行时初始化副作用集中在入口执行（而非模块 import 时），保证 main.py 可被安全 import
     _app_ctx.set_ui_flavor("tui")
@@ -3595,7 +3697,6 @@ def run_cli():
             sys.exit(0)
 
     # 启动后台处理线程
-    _trace_mark("before worker_thread")
     worker_thread = threading.Thread(target=_background_worker, daemon=True)
     worker_thread.start()
 
@@ -3604,7 +3705,6 @@ def run_cli():
     # 若改为后台预热，litellm/mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
     # 抢 GIL，实测会把首帧绘制卡 8 秒、键盘输入无回显。因此三个预热任务在
     # 此处并发执行、主线程显示进度动画并等全部完成后再进入 TUI。
-    _trace_mark("preload phase begin")
 
     def _preload_litellm():
         """预热 LLM 引擎：litellm import、tiktoken 编码加载（token_counter
@@ -3629,12 +3729,13 @@ def run_cli():
             logging.getLogger("py.warnings").warning("预加载 litellm 失败: %s", e)
         finally:
             _llm_engine_ready = True
-            _trace_mark("preload litellm done")
 
     def _mcp_status_to_ui(message):
-        # 预热期 TUI 尚未启动：直接打印；TUI 运行后：经 schedule_ui 回 UI 线程
+        # 预热期 TUI 尚未启动：预热线程若直接 print 会与主线程预热进度动画
+        # 竞争同一 stdout，打乱终端输出；改走诊断日志。
+        # TUI 运行后：经 schedule_ui 回 UI 线程打印。
         if app_instance is None:
-            print_formatted_text(message)
+            logging.getLogger("py.warnings").info("MCP 状态: %s", message)
         else:
             schedule_ui(lambda text=message: print_formatted_text(text))
 
@@ -3655,7 +3756,6 @@ def run_cli():
                 not (isinstance(c, dict) and c.get("enabled", True) is False)
                 for c in _servers.values()
             ):
-                _trace_mark("preload mcp skipped (no enabled servers)")
                 return
         except Exception:
             pass  # 预检失败不阻碍正常预热流程
@@ -3664,7 +3764,6 @@ def run_cli():
             # MCP 连接状态改由 TUI 主线程打印（core/mcp_client 自身不再 import main）
             _set_mcp_status_logger(_mcp_status_to_ui)
             mcp_manager._ensure_connected()
-            _trace_mark("preload mcp done")
         except Exception as e:
             logging.getLogger("py.warnings").warning("MCP 后台连接失败: %s", e)
 
@@ -3673,7 +3772,6 @@ def run_cli():
         同步完成后状态栏 token 数在首绘时就是准确值。"""
         try:
             recalc_token_usage()
-            _trace_mark("warm token usage done")
         except Exception as e:
             logging.getLogger("py.warnings").warning("启动预热 recalc_token_usage 失败: %s", e)
 
@@ -3700,13 +3798,10 @@ def run_cli():
         # Ctrl+C：跳过等待直接进入界面（后台 daemon 线程仍会继续预热）
         if _tty:
             print("\r  ⚠️ 已跳过预热等待，首轮对话可能稍慢。           ")
-    _trace_mark("preload phase done")
 
     # 预热全部完成后才铺主界面：print_logo 会清屏，启动提示与预热动画随之消失，
     # 用户直接看到完整可输入的主页面（logo + 输入框 + 准确的状态栏）
-    _trace_mark("before print_logo")
     print_logo()
-    _trace_mark("after print_logo")
 
     # 启动全局常驻 UI 刷新线程（用以维持思考计时器和星瑶运转状态微动画）
     def _ui_refresher_loop():
@@ -3729,9 +3824,7 @@ def run_cli():
     # 主循环：支持 /models 弹出选择器并重启主 App
     while True:
         pending_action = None
-        _trace_mark("before _make_input_app")
         app_instance = _make_input_app()
-        _trace_mark("after _make_input_app")
 
         # 注册后台子代理终态实时通知回调
         # 后台任务完成/失败/超时/取消时，立即在终端打印一条通知，不等下一轮对话。
@@ -3743,17 +3836,6 @@ def run_cli():
             try:
                 # pre_run：App 重启间隙（如 /models 触发的退出与重建之间）
                 # schedule_ui 静默丢弃的积压事件，在新 App 启动时立即补渲染
-                _trace_mark("before app.run")
-                # TEMP STARTUP TRACE：记录首帧绘制的开始/结束时间点
-                _orig_renderer_render = app_instance.renderer.render
-                def _first_render_gate(*_a, **_kw):
-                    _trace_mark("first renderer.render begin (first paint)")
-                    app_instance.renderer.render = _orig_renderer_render
-                    try:
-                        return _orig_renderer_render(*_a, **_kw)
-                    finally:
-                        _trace_mark("first renderer.render end")
-                app_instance.renderer.render = _first_render_gate
                 app_instance.run(pre_run=drain_ui_events)
             except EOFError:
                 # Ctrl+D：退出系统

@@ -691,3 +691,43 @@ def test_prepare_turn_summarizes_only_above_095(stub_llm, quiet_extras, monkeypa
         manager, session, "deepseek-chat", 16000, permission_mode="confirm"
     )
     assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 取消语义：用户取消的任务绝不注入"接手完成"指令
+# ---------------------------------------------------------------------------
+
+
+def test_bg_summary_cancelled_task_not_takeover(monkeypatch):
+    """cancelled 任务只如实列出并标注无需接手；failed 任务仍要求接手完成。"""
+    from types import SimpleNamespace
+
+    import core.tools as core_tools
+    from core import agent_service
+
+    tasks = [
+        SimpleNamespace(
+            task_id="t-cancel", status="cancelled", description="查新闻",
+            result="", error="task cancelled",
+        ),
+        SimpleNamespace(
+            task_id="t-failed", status="failed", description="抓网页",
+            result="", error="boom",
+        ),
+    ]
+    monkeypatch.setattr(
+        core_tools.subagent_manager,
+        "drain_terminal_background_tasks",
+        lambda session: tasks,
+    )
+
+    summary = agent_service.build_background_task_summary("s1")
+
+    cancelled_section = summary.split("【任务 t-cancel")[1].split("【任务 t-failed")[0]
+    assert "已取消" in cancelled_section
+    # “无需接手完成”本身含“接手完成”子串，断言必须用指令前缀区分
+    assert "请用自身工具" not in cancelled_section
+    assert "无需接手" in cancelled_section
+
+    failed_section = summary.split("【任务 t-failed")[1]
+    assert "请用自身工具" in failed_section

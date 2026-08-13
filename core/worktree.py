@@ -45,6 +45,11 @@ def _is_git_repo(cwd=None):
     return code == 0
 
 
+def _is_option_like(value):
+    """T4 修复：以 - 开头的字符串会被 git 解析为选项（如 --force），必须拒绝。"""
+    return isinstance(value, str) and value.startswith('-')
+
+
 def create_worktree(branch, path, base_branch=None, cwd=None):
     """创建 git worktree，让指定分支在新路径工作。
 
@@ -59,11 +64,25 @@ def create_worktree(branch, path, base_branch=None, cwd=None):
     if not _is_git_repo(cwd):
         return "🚨 当前目录不是 git 仓库"
 
+    # T4 修复：先拒选项式字符串，再做字符集校验——
+    # 旧校验只查字符集，"--force" 去掉 - 后是纯字母可通过，会被 git 当作选项注入。
+    if _is_option_like(branch):
+        return f"🚨 分支名不能以 - 开头（会被 git 解析为选项）：{branch!r}"
     if not branch or not branch.replace('-', '').replace('_', '').replace('/', '').replace('.', '').isalnum():
         return f"🚨 分支名只能包含字母、数字、下划线、连字符、斜杠、点号：{branch!r}"
+    if base_branch and _is_option_like(base_branch):
+        return f"🚨 基分支名不能以 - 开头（会被 git 解析为选项）：{base_branch!r}"
+    if not path or _is_option_like(str(path)):
+        return f"🚨 worktree 路径不合法：{path!r}"
 
     # 解析 worktree 路径（相对路径应相对 cwd，而非进程当前目录）
-    abs_path = Path(cwd or os.getcwd(), path).resolve()
+    repo_root = Path(cwd or os.getcwd()).resolve()
+    abs_path = Path(repo_root, path).resolve()
+    # T4 修复：规范化后的边界校验——不能覆盖仓库根目录，也不能落在 .git 目录内
+    if abs_path == repo_root:
+        return "🚨 worktree 路径不能是仓库根目录本身"
+    if (repo_root / '.git') in abs_path.parents:
+        return "🚨 worktree 路径不能位于 .git 目录内"
     if abs_path.exists():
         return f"🚨 目标路径已存在: {abs_path}"
 
@@ -139,6 +158,10 @@ def remove_worktree(path, force=False, cwd=None):
     """
     if not _is_git_repo(cwd):
         return "🚨 当前目录不是 git 仓库"
+
+    # T4 修复：拒选项式字符串，防止被 git 解析为额外 flag
+    if not path or _is_option_like(str(path)):
+        return f"🚨 worktree 路径不合法：{path!r}"
 
     abs_path = Path(cwd or os.getcwd(), path).resolve()
     args = ['worktree', 'remove']

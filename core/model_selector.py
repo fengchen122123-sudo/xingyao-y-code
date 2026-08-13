@@ -70,7 +70,8 @@ def _test_model_connection(protocol: str, model: str, base_url: str, api_key: st
         kwargs["api_base"] = base_url
 
     with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
-        for _chunk in _request_stream(protocol, kwargs, timeout=15):
+        stream, _holder = _request_stream(protocol, kwargs, timeout=15)
+        for _chunk in stream:
             pass
 
 

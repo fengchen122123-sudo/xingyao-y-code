@@ -254,11 +254,15 @@ async function submitAddProvider() {
   }
   addingProvider.value = true;
   try {
-    await store.addProvider(newProvider.name.trim(), newProvider.base_url.trim(), newProvider.api_key.trim(), newProvider.protocol);
-    newProvider.name = '';
-    newProvider.base_url = '';
-    newProvider.api_key = '';
-    newProvider.protocol = 'openai';
+    // M34 修复：addProvider 失败（返回 null）时不检查返回值仍清空表单，
+    // 用户填写内容丢失且误以为已添加。成功才清空。
+    const res = await store.addProvider(newProvider.name.trim(), newProvider.base_url.trim(), newProvider.api_key.trim(), newProvider.protocol);
+    if (res && res.ok) {
+      newProvider.name = '';
+      newProvider.base_url = '';
+      newProvider.api_key = '';
+      newProvider.protocol = 'openai';
+    }
   } finally {
     addingProvider.value = false;
   }
@@ -275,8 +279,11 @@ async function submitAddModel() {
   }
   addingModel.value = true;
   try {
-    await store.addModel(newModel.provider_id, newModel.model_name.trim(), Number(newModel.context_window) || 0);
-    newModel.model_name = '';
+    // M34 修复：同上，addModel 成功才清空表单
+    const res = await store.addModel(newModel.provider_id, newModel.model_name.trim(), Number(newModel.context_window) || 0);
+    if (res && res.ok) {
+      newModel.model_name = '';
+    }
   } finally {
     addingModel.value = false;
   }

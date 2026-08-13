@@ -13,6 +13,12 @@ KEYRING_PREFIX = "keyring:"
 KEYRING_SERVICE = "Y-CODE API Keys"
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 
+# 应用级额外熵（pOptionalEntropy）：把密文绑定到 Y-CODE 自身，同一 Windows 用户
+# 下的其它进程仅用裸 DPAPI 无法解密本应用保存的密钥。
+# 迁移策略：写入一律带 entropy（新格式）；读取先尝试新格式，失败后回退无
+# entropy 的旧格式，保证升级前保存的密钥仍可解密（protect/unprotect 接口签名不变）。
+_DPAPI_ENTROPY = b"Y-CODE-DPAPI-Entropy-v1"
+
 
 class _DataBlob(ctypes.Structure):
     _fields_ = [("cbData", wintypes.DWORD), ("pbData", ctypes.POINTER(ctypes.c_byte))]
@@ -49,9 +55,10 @@ def protect_secret(value: str) -> str:
         keyring.set_password(KEYRING_SERVICE, account, text)
         return KEYRING_PREFIX + account
     source, source_buffer = _blob(text.encode("utf-8"))
+    entropy, entropy_buffer = _blob(_DPAPI_ENTROPY)
     output = _DataBlob()
     if not _crypt32().CryptProtectData(
-        ctypes.byref(source), "Y-CODE API Key", None, None, None,
+        ctypes.byref(source), "Y-CODE API Key", ctypes.byref(entropy), None, None,
         CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(output),
     ):
         raise ctypes.WinError()
@@ -60,7 +67,31 @@ def protect_secret(value: str) -> str:
         return DPAPI_PREFIX + base64.b64encode(encrypted).decode("ascii")
     finally:
         ctypes.windll.kernel32.LocalFree(output.pbData)
+        del source_buffer, entropy_buffer
+
+
+def _unprotect_dpapi(encrypted: bytes, use_entropy: bool) -> str:
+    source, source_buffer = _blob(encrypted)
+    entropy, entropy_buffer = (None, None)
+    if use_entropy:
+        entropy, entropy_buffer = _blob(_DPAPI_ENTROPY)
+    output = _DataBlob()
+    try:
+        if not _crypt32().CryptUnprotectData(
+            ctypes.byref(source), None,
+            ctypes.byref(entropy) if entropy is not None else None,
+            None, None,
+            CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(output),
+        ):
+            raise ctypes.WinError()
+        try:
+            return ctypes.string_at(output.pbData, output.cbData).decode("utf-8")
+        finally:
+            ctypes.windll.kernel32.LocalFree(output.pbData)
+    finally:
         del source_buffer
+        if entropy_buffer is not None:
+            del entropy_buffer
 
 
 def unprotect_secret(value: str) -> str:
@@ -76,15 +107,8 @@ def unprotect_secret(value: str) -> str:
     if not text or not text.startswith(DPAPI_PREFIX):
         return text
     encrypted = base64.b64decode(text[len(DPAPI_PREFIX):], validate=True)
-    source, source_buffer = _blob(encrypted)
-    output = _DataBlob()
-    if not _crypt32().CryptUnprotectData(
-        ctypes.byref(source), None, None, None, None,
-        CRYPTPROTECT_UI_FORBIDDEN, ctypes.byref(output),
-    ):
-        raise ctypes.WinError()
     try:
-        return ctypes.string_at(output.pbData, output.cbData).decode("utf-8")
-    finally:
-        ctypes.windll.kernel32.LocalFree(output.pbData)
-        del source_buffer
+        return _unprotect_dpapi(encrypted, use_entropy=True)
+    except OSError:
+        # 旧格式（无额外熵）密文回退：保证升级前保存的密钥仍可解密
+        return _unprotect_dpapi(encrypted, use_entropy=False)

@@ -14,6 +14,7 @@ PyWebView JS-API 桥接层：为 Vue 前端提供后端能力，并把一轮对�
 import json
 import logging
 import os
+import queue
 import pathlib
 import re
 import sys
@@ -65,6 +66,10 @@ except Exception:  # pragma: no cover - 依赖缺失时的降级路径
 # 流式 token 批量推送间隔（秒）：过密的 evaluate_js 调用会拖垮 WebView
 TOKEN_FLUSH_INTERVAL = 0.06
 
+# JS 事件派发队列容量：洪峰（工具大结果 + 计划更新 + 进度快照）下做缓冲；
+# 渲染进程挂起时撑满即丢弃新事件，生产者线程永不阻塞
+JS_QUEUE_MAXSIZE = 2000
+
 # 权限请求超时（秒）：超时一律按拒绝处理，绝不放行
 PERMISSION_TIMEOUT_SECONDS = 300
 
@@ -86,7 +91,8 @@ TEST_MODEL_TIMEOUT = 15
 # 后台子代理全部终态后自动发起的汇总回合（与 TUI 的内部汇总指令同文案）
 _BG_SUMMARY_PROMPT = (
     "请汇总所有后台子代理任务的结果并告诉我。如果某些任务失败了，"
-    "请用你自身的工具（如 search_news / fetch_url 等）接手完成，然后一并汇总。"
+    "可以用你自身的工具（如 search_news / fetch_url 等）接手完成；"
+    "但已被用户取消的任务不要接手或重试，如实说明即可。"
 )
 # 内部汇总回合在前端展示的系统提示文案（代替把上面的指令原文渲染成用户气泡）
 _BG_SUMMARY_DISPLAY_TEXT = "📦 所有后台子代理任务已结束，正在自动汇总结果…"
@@ -227,6 +233,9 @@ class ApiBridge:
         # 多会话并行：按 session 隔离回合线程和取消事件
         self._active_turns: dict[str, threading.Thread] = {}
         self._cancel_events: dict[str, threading.Event] = {}
+        # 每会话当前回合的 turn_id（session:xxx 复合 ID）：权限请求的 owner
+        # 是 turn_id 而非会话名，stop_current_turn 要按它精确取消权限等待
+        self._active_turn_ids: dict[str, str] = {}
         # 回合启动互斥：send_user_message 与后台自动汇总都可能启动 turn 线程，
         # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合
         self._turn_start_lock = threading.Lock()
@@ -237,8 +246,12 @@ class ApiBridge:
         # 每批后台任务只触发一次汇总，用户主动发新消息时重置
         self._bg_summary_triggered: set = set()
         self._bg_summary_lock = threading.Lock()
-        # 终态回调到来时若有回合正在运行，挂起到回合结束后补触发
-        self._bg_summary_pending_session: str = ""
+        # 终态回调到来时若有回合正在运行，挂起到回合结束后补触发；
+        # 按会话分桶（set），多会话并行时 pending 不会互相覆盖
+        self._bg_summary_pending_sessions: set = set()
+        # 用户主动点过“终止”的会话：抑制后台任务终态的自动汇总回合，
+        # 防止被取消的任务被“接手完成”机制复活；用户发新消息时解除
+        self._user_cancelled_sessions: set = set()
 
         # 按会话隔离的流式 delta 缓冲，防止多会话并行时 token 混合
         self._delta_lock = threading.Lock()
@@ -246,6 +259,8 @@ class ApiBridge:
         self._delta_kinds: dict[str, str] = {}
         self._delta_last_flush = 0.0
         self._delta_flusher: Optional[threading.Thread] = None
+        # 惰性创建 flusher 的双检锁：并发回合同时首次触发时不得创建两个
+        self._delta_flusher_lock = threading.Lock()
 
         # 权限请求：request_id -> 超时定时器
         self._perm_timers: Dict[str, threading.Timer] = {}
@@ -256,6 +271,18 @@ class ApiBridge:
         self._term_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
+
+        # JS 事件派发队列：evaluate_js 是同步调用（无超时），渲染进程挂起时
+        # 永不返回。若事件源线程（回合 worker / delta 冲刷 / 终端泵）直接调用，
+        # 一旦卡住会连带 _delta_lock 级联堵塞全管线（零 CPU、零网络的假死）。
+        # 改为单消费者 FIFO 队列：生产者只 put_nowait，队列满丢弃新事件并计数，
+        # 任何情况下事件源线程都不会被 WebView 阻塞。
+        self._js_queue: "queue.Queue" = queue.Queue(maxsize=JS_QUEUE_MAXSIZE)
+        self._js_dispatcher: Optional[threading.Thread] = None
+        self._js_dispatcher_lock = threading.Lock()
+        self._js_dropped = 0
+        # 标题栏主题延迟重设线程去重引用（每次窗口事件不再各开一个）
+        self._reapply_thread: Optional[threading.Thread] = None
 
         # 注册 GUI 运行时上下文 + 权限应答通道
         app_context.register(_GuiContext(self))
@@ -318,7 +345,7 @@ class ApiBridge:
         for event in list(self._cancel_events.values()):
             event.set()
         with self._bg_summary_lock:
-            self._bg_summary_pending_session = ""
+            self._bg_summary_pending_sessions.clear()
         with self._perm_lock:
             timers = list(self._perm_timers.values())
             self._perm_timers.clear()
@@ -365,6 +392,12 @@ class ApiBridge:
                 self._mcp.close()
             except Exception:
                 logger.exception("退出时关闭 MCP 失败")
+        # 通知 JS 派发线程退出（哨兵可能被丢弃/线程已卡死，均为守护线程，尽力而为）
+        try:
+            self._js_queue.put_nowait(None)
+        except Exception:
+            pass
+
         try:
             self._memory.close()
         except Exception:
@@ -372,22 +405,31 @@ class ApiBridge:
 
     def _on_window_frame_event(self):
         """窗口框架事件回调：DWM 重建非客户区后重设标题栏主题（线程内延迟执行）。"""
-        threading.Thread(target=self._reapply_worker, daemon=True,
-                         name="gui-titlebar-event-reapply").start()
+        self._start_reapply_thread()
+
+    def _start_reapply_thread(self, name: str = "gui-titlebar-event-reapply"):
+        """启动标题栏主题延迟重设线程；上一个还在跑就复用。
+        重设序列累计睡 55.5 秒，若每次窗口事件都新开线程，密集事件下线程
+        会越积越多。"""
+        t = getattr(self, "_reapply_thread", None)
+        if t is not None and t.is_alive():
+            return
+        t = threading.Thread(target=self._reapply_worker, daemon=True, name=name)
+        self._reapply_thread = t
+        t.start()
 
     # ------------------------------------------------------------------
     # 窗口标题栏主题（Windows DWM 沉浸式深色标题栏，保留原生最小化/关闭按钮）
     # ------------------------------------------------------------------
     def _find_hwnd_worker(self):
-        """按窗口标题轮询查找 HWND（原生窗口在 webview.start 后才创建）。
+        """按窗口标题轮询查找本进程顶层窗口的 HWND（原生窗口在 webview.start 后才创建）。
         冻结版启动慢（WebView2 初始化/首次解压），轮询预算放宽到 60 秒。"""
         if sys.platform != "win32":
             return
         try:
-            import ctypes
             title = getattr(self._window, "title", "") or ""
             for _ in range(300):  # 最多等 60 秒
-                hwnd = ctypes.windll.user32.FindWindowW(None, title)
+                hwnd = self._find_own_hwnd(title)
                 if hwnd:
                     self._hwnd = hwnd
                     # 先设图标再设标题栏主题：WM_SETICON 会触发 DWM 重建非客户区，
@@ -396,12 +438,39 @@ class ApiBridge:
                     time.sleep(0.05)
                     self._apply_titlebar_theme()
                     # WebView2 子窗口就绪、DPI 变化等时机也可能重建边框，延迟补两次
-                    threading.Thread(target=self._reapply_worker, daemon=True,
-                                     name="gui-titlebar-reapply").start()
+                    self._start_reapply_thread(name="gui-titlebar-reapply")
                     return
                 time.sleep(0.2)
         except Exception:
             logger.debug("查找窗口句柄失败", exc_info=True)
+
+    @staticmethod
+    def _find_own_hwnd(title: str) -> int:
+        """EnumWindows + GetWindowThreadProcessId 按当前进程 PID 过滤顶层窗口，
+        再按标题精确匹配。旧实现 FindWindowW 只按标题找窗，双开实例时可能
+        命中另一个实例的窗口，把图标/标题栏主题设错对象。"""
+        import ctypes
+        from ctypes import wintypes
+
+        u32 = ctypes.windll.user32
+        pid = os.getpid()
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _callback(hwnd, lparam):
+            proc_id = wintypes.DWORD()
+            u32.GetWindowThreadProcessId(hwnd, ctypes.byref(proc_id))
+            if proc_id.value == pid:
+                length = u32.GetWindowTextLengthW(hwnd)
+                buf = ctypes.create_unicode_buffer(length + 1)
+                u32.GetWindowTextW(hwnd, buf, length + 1)
+                if buf.value == title:
+                    found.append(hwnd)
+                    return False  # 找到即停止枚举
+            return True
+
+        u32.EnumWindows(_callback, 0)
+        return found[0] if found else 0
 
     def _reapply_worker(self):
         """找到窗口后延迟重设标题栏主题，覆盖启动后期边框被重建的场景。"""
@@ -437,6 +506,12 @@ class ApiBridge:
                 u32.SendMessageW(self._hwnd, WM_SETICON, 1, big)
             if small:
                 u32.SendMessageW(self._hwnd, WM_SETICON, 0, small)
+            # LoadImageW 创建的 HICON 所有权归调用方（WM_SETICON 不接管），
+            # 发完消息必须 DestroyIcon，否则每次设置都泄漏两个 GDI 句柄
+            if big:
+                u32.DestroyIcon(big)
+            if small:
+                u32.DestroyIcon(small)
         except Exception:
             logger.debug("设置窗口图标失败", exc_info=True)
 
@@ -509,7 +584,8 @@ class ApiBridge:
 
     def _is_turn_active(self, session_name: str) -> bool:
         """检查指定会话是否有正在运行的回合。"""
-        t = self._active_turns.get(session_name)
+        # getattr 兜底：测试里的裸实例（__new__ 构造）不经过 __init__
+        t = getattr(self, "_active_turns", {}).get(session_name)
         return t is not None and t.is_alive()
 
     def emit_event(self, event_type: str, data: Any):
@@ -529,9 +605,58 @@ class ApiBridge:
             # （JS 里属于行终止符，直接嵌入会造成语法错误），单独转义即可。
             payload = json.dumps({"type": event_type, "data": data}, ensure_ascii=False)
             payload = payload.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
-            self._window.evaluate_js(f"window.onBridgeEvent && window.onBridgeEvent({payload})")
         except Exception as e:
-            print(f"[GuiBridge] Error emitting event {event_type}: {e}", file=sys.stderr)
+            logger.warning("序列化事件 %s 失败: %s", event_type, e)
+            return
+        self._ensure_js_dispatcher()
+        try:
+            self._js_queue.put_nowait(payload)
+        except queue.Full:
+            # 渲染进程挂起/死亡时队列会持续占满：丢弃新事件（保留已有的顺序事件），
+            # 生产者绝不阻塞。计数限频记日志，便于事后诊断。
+            self._js_dropped += 1
+            if self._js_dropped == 1 or self._js_dropped % 500 == 0:
+                logger.warning(
+                    "JS 事件队列已满，丢弃事件（累计 %d）：渲染进程可能已挂起",
+                    self._js_dropped,
+                )
+
+    def _ensure_js_dispatcher(self):
+        """惰性启动 JS 事件派发线程：单消费者保证事件顺序，evaluate_js 只在此线程调用。"""
+        t = self._js_dispatcher
+        if t is not None and t.is_alive():
+            return
+        with self._js_dispatcher_lock:
+            t = self._js_dispatcher
+            if t is not None and t.is_alive():
+                return
+            t = threading.Thread(
+                target=self._js_dispatcher_loop,
+                daemon=True,
+                name="gui-js-dispatcher",
+            )
+            self._js_dispatcher = t
+            t.start()
+
+    def _js_dispatcher_loop(self):
+        while True:
+            payload = self._js_queue.get()
+            if payload is None:  # 关闭哨兵
+                return
+            # T9 时序闭环说明：shutdown() 先置 _shutting_down（_emit_raw/emit_event
+            # 此后直接返回，生产者侧已封闭），再把哨兵放入队列。哨兵前排队的
+            # 事件仍会被消费——此时窗口通常还活着，投递是期望行为；若窗口已在
+            # 销毁中，evaluate_js 抛异常被下方捕获丢弃。shutdown 之后不会再有
+            # 新事件入队（生产者被标志位挡住），所以不存在“销毁后 dispatcher
+            # 仍持续调 evaluate_js”的窗口期漏洞；最坏情况是 dispatcher 阻塞在
+            # 空队列的 get() 上，守护线程随进程退出。
+            try:
+                self._window.evaluate_js(
+                    f"window.onBridgeEvent && window.onBridgeEvent({payload})"
+                )
+            except Exception as e:
+                # WebView 销毁/跳转中 evaluate_js 会抛；事件丢掉即可，绝不带出线程
+                logger.debug("evaluate_js 失败: %s", e)
 
     # -- 流式增量的批量推送 ------------------------------------------------
     def _emit_delta(self, kind: str, text: str, session_name: str = ""):
@@ -539,18 +664,22 @@ class ApiBridge:
         if not text:
             return
         flush_now = False
+        swapped = None
         with self._delta_lock:
             buf = self._delta_buffers.setdefault(session_name, [])
             cur_kind = self._delta_kinds.get(session_name, "token_delta")
             if kind != cur_kind and buf:
-                # 思考流与正文流切换时先把旧缓冲吐出去，避免串台
-                self._emit_raw(cur_kind, {"text": "".join(buf), "session_name": session_name})
+                # 思考流与正文流切换时先把旧缓冲吐出去，避免串台。
+                # 注意只在锁内取出内容，emit 放到锁外，绝不在持锁时触碰 JS 桥。
+                swapped = (cur_kind, "".join(buf))
                 buf.clear()
             self._delta_kinds[session_name] = kind
             buf.append(text)
             now = time.monotonic()
             if now - self._delta_last_flush >= TOKEN_FLUSH_INTERVAL:
                 flush_now = True
+        if swapped is not None:
+            self._emit_raw(swapped[0], {"text": swapped[1], "session_name": session_name})
         self._ensure_delta_flusher()
         if flush_now:
             self._flush_deltas()
@@ -572,20 +701,27 @@ class ApiBridge:
             self._emit_raw(kind, {"text": text, "session_name": session_name})
 
     def _ensure_delta_flusher(self):
-        """惰性启动尾包冲刷线程：保证最后一小段文本不会滞留在缓冲里。"""
+        """惰性启动尾包冲刷线程：保证最后一小段文本不会滞留在缓冲里。
+        双检加锁：多会话并发首次触发时不得重复创建 flusher。"""
         if self._delta_flusher is not None and self._delta_flusher.is_alive():
             return
+        lock = getattr(self, "_delta_flusher_lock", None)
+        if lock is None:  # 裸实例兜底（测试不经过 __init__）
+            lock = self._delta_flusher_lock = threading.Lock()
+        with lock:
+            if self._delta_flusher is not None and self._delta_flusher.is_alive():
+                return
 
-        def _loop():
-            while True:
-                time.sleep(TOKEN_FLUSH_INTERVAL)
-                try:
-                    self._flush_deltas()
-                except Exception:
-                    logger.debug("冲刷流式缓冲失败", exc_info=True)
+            def _loop():
+                while True:
+                    time.sleep(TOKEN_FLUSH_INTERVAL)
+                    try:
+                        self._flush_deltas()
+                    except Exception:
+                        logger.debug("冲刷流式缓冲失败", exc_info=True)
 
-        self._delta_flusher = threading.Thread(target=_loop, daemon=True, name="gui-delta-flusher")
-        self._delta_flusher.start()
+            self._delta_flusher = threading.Thread(target=_loop, daemon=True, name="gui-delta-flusher")
+            self._delta_flusher.start()
 
     # ------------------------------------------------------------------
     # 初始状态
@@ -662,6 +798,12 @@ class ApiBridge:
                 "file_tree": file_tree,
                 "current_session": self._current_session,
                 "messages": self._load_session_messages(self._current_session),
+                # M23：当前有活跃回合的会话名列表。窗口重载/崩溃后前端重建时
+                # 据此恢复 running 态或解锁输入框（终态事件已在重载期间丢失）
+                "active_sessions": [
+                    name for name, t in getattr(self, "_active_turns", {}).items()
+                    if t.is_alive()
+                ],
                 "token_usage": self.get_token_usage(),
                 # 持久化的界面主题（True=浅色），前端启动时据此恢复，关闭重开不变
                 "theme_light": bool(config_data.get("gui_theme_light", False)),
@@ -675,6 +817,7 @@ class ApiBridge:
                 "reasoning_effort": "default",
                 "sessions": [], "skills": [], "mcps": [],
                 "workdir": "", "current_session": self._current_session,
+                "active_sessions": [],
                 "token_usage": {"used": 0, "window": 0, "cached_pct": 0, "cumulative": 0},
                 "version": str(YCODE_VERSION), "ok": False, "msg": str(e),
             }
@@ -1057,6 +1200,10 @@ class ApiBridge:
 
     def rename_session(self, old_name: str, new_name: str) -> Dict[str, Any]:
         try:
+            # M21：回合运行中禁止重命名——运行中的回合终态事件带的是旧会话名，
+            # 重命名后前端 running 态与新名失配（输入框锁死/状态残留）
+            if self._is_turn_active(old_name):
+                return {"ok": False, "msg": "该会话正在运行回合，请先停止或等待完成后再重命名", "name": old_name}
             success, final_name = self._memory.rename_session(old_name, new_name)
             if not success:
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
@@ -1069,6 +1216,10 @@ class ApiBridge:
 
     def delete_session(self, session_name: str) -> Dict[str, Any]:
         try:
+            # M21：回合运行中禁止删除——回合线程会继续往已删会话写消息，
+            # 产生幽灵数据；最小方案是直接拒绝，让用户先停止或等待完成
+            if self._is_turn_active(session_name):
+                return {"ok": False, "success": False, "msg": "该会话正在运行回合，请先停止或等待完成后再删除"}
             self._memory.delete_session(session_name)
             if self._current_session == session_name:
                 new_session = f"session_{uuid.uuid4().hex[:6]}"
@@ -1348,9 +1499,11 @@ class ApiBridge:
                     return {"ok": False, "msg": "该会话已有正在运行的回合"}
 
                 # 用户主动发起新对话：重置该会话的自动汇总标志，
-                # 下一批后台任务完成时可以再次触发自动汇总（与 TUI 行为一致）
+                # 下一批后台任务完成时可以再次触发自动汇总（与 TUI 行为一致）；
+                # 同时解除"用户取消"标记，恢复自动汇总与计划续推
                 with self._bg_summary_lock:
                     self._bg_summary_triggered.discard(target_session)
+                self._user_cancelled_sessions.discard(target_session)
 
                 cancel_event = threading.Event()
                 self._cancel_events[target_session] = cancel_event
@@ -1380,14 +1533,67 @@ class ApiBridge:
             evt = self._cancel_events.get(target)
             if evt:
                 evt.set()
+                # 硬中断在飞 LLM 请求：直接关闭底层 HTTP 流，阻塞读立即退出，
+                # 而不是协作式取消后仍静默接收数据直到请求超时（最长数百秒）。
+                # 必须先 set 事件再 abort：被关闭一侧据此归一为用户取消而非网络错误。
+                try:
+                    from core.llm import abort_inflight_streams
+                    abort_inflight_streams(evt)
+                except Exception:
+                    pass
+            # 用户主动取消：抑制后台任务终态的自动汇总回合与计划续推 nudge，
+            # 否则被取消的任务会被“接手完成”/“计划尚未完毕”机制复活
+            # （裸实例兜底：测试构造的桥可能未走完整 __init__）
+            cancelled_sessions = getattr(self, "_user_cancelled_sessions", None)
+            if cancelled_sessions is None:
+                cancelled_sessions = self._user_cancelled_sessions = set()
+            cancelled_sessions.add(target)
+            try:
+                with self._bg_summary_lock:
+                    self._bg_summary_pending_sessions.discard(target)
+            except AttributeError:
+                pass
+            try:
+                from core.plan import suppress_plan_auto_continue
+                suppress_plan_auto_continue(target)
+            except Exception:
+                pass
+            # H6：取消点不只有 LLM 事件迭代层——回合线程可能正阻塞在权限确认
+            # （最长 300s）或前台子代理的同步等待上，仅 set 事件线程不会退出，
+            # 会话会一直持有 _turn_workdir_lock 串行卡住其他会话。与 TUI
+            # _cancel_active_turn 同源：同步取消该回合的权限请求（owner 是
+            # turn_id 而非会话名）并协作式终止前台子代理。本回合派生的后台
+            # 子代理也会被看门狗经 parent_cancel_event 联动取消（tools.py
+            # _watch_background）；只有更早回合遗留的后台任务才继续运行。
+            turn_id = getattr(self, "_active_turn_ids", {}).get(target, "")
+            if turn_id:
+                try:
+                    permission_broker.cancel_owner(turn_id)
+                except Exception:
+                    pass
+                try:
+                    from core.tools import subagent_manager
+                    subagent_manager.cancel_foreground(target, turn_id)
+                except Exception:
+                    logger.debug("停止回合时取消前台子代理失败", exc_info=True)
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
-    def _run_turn_worker_serialized(self, *args, **kwargs):
-        """Serialize turns that depend on process-wide cwd and memory workdir."""
-        with self._turn_workdir_lock:
-            return self._run_turn_worker(*args, **kwargs)
+    def _run_turn_worker_serialized(self, user_text: str, session_name: str, *args, **kwargs):
+        """Serialize turns that depend on process-wide cwd and memory workdir.
+
+        T10：锁被其他会话的回合持有时，超过 1s 未拿到锁就通知前端本回合在
+        排队等待，避免界面长时间"运行中"却毫无动静；拿到锁后 _run_turn_worker
+        会立即发 turn_start，前端运行态自然衔接，无需额外的解除事件。
+        """
+        if not self._turn_workdir_lock.acquire(timeout=1.0):
+            self.emit_event("turn_queued", {"session_name": session_name})
+            self._turn_workdir_lock.acquire()
+        try:
+            return self._run_turn_worker(user_text, session_name, *args, **kwargs)
+        finally:
+            self._turn_workdir_lock.release()
 
     def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = ""):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
@@ -1400,6 +1606,7 @@ class ApiBridge:
         turn_finished = False
         event_session_name = session_name
         cancelled = False
+        turn_id = ""
         error_state = {
             "toast_messages": set(),
             "terminal_message": None,
@@ -1489,6 +1696,9 @@ class ApiBridge:
                     })
 
             turn_id = f"{session_name}:{uuid.uuid4().hex[:8]}"
+            # 记录会话 → turn_id 映射：stop_current_turn 按 turn_id 精确取消
+            # 权限等待（broker 的 owner 是 turn_id）与前台子代理
+            self._active_turn_ids[session_name] = turn_id
             # 多会话并行：不再强制切换全局 _current_session。_set_current_session 会
             # 同步 tool_cache/undo/plan/app_context 等全局绑定，会话 B 的回合启动会
             # 把这些改成 B，从而影响会话 A 正在进行的后台子代理回调。本回合所需的会话
@@ -1554,10 +1764,14 @@ class ApiBridge:
             logger.exception("GUI 对话回合失败")
             self._emit_owned_error(str(e), api_key, error_state, terminal=True, session_name=session_name)
         finally:
+            # 身份校验清理 cancel 事件：finally 竞态窗口内（本线程还没走完
+            # finally，但 _active_turns 已 pop）新回合可能已建立同名事件，
+            # 仅当字典里仍是本回合自己的事件对象时才删除，防误删新回合事件
+            if self._cancel_events.get(session_name) is cancel_event:
+                self._cancel_events.pop(session_name, None)
             # 从活跃回合字典中移除本会话
             self._active_turns.pop(session_name, None)
-            # 顺带清理已完成的 cancel 事件，防止字典只增不减
-            self._cancel_events.pop(session_name, None)
+            self._active_turn_ids.pop(session_name, None)
             # 顺带清理 delta 缓冲（加锁防止与 _flush_deltas 的遍历竞态）
             with self._delta_lock:
                 self._delta_buffers.pop(session_name, None)
@@ -1566,19 +1780,24 @@ class ApiBridge:
             # 的全局状态错置成 idle
             if not any(t.is_alive() for t in self._active_turns.values()):
                 self._task_status = "idle"
-            try:
-                permission_broker.cancel_owner(session_name)
-            except Exception:
-                pass
+            # 权限请求的 owner 是 turn_id（不是会话名），回合结束必须按 turn_id
+            # 清理残留等待；历史实现传会话名，永远不命中，等于没清理
+            if turn_id:
+                try:
+                    permission_broker.cancel_owner(turn_id)
+                except Exception:
+                    pass
             finish_once()
             # 回合运行期间若有后台子代理进入终态（当时不能并发起新回合），
-            # 此时补触发自动汇总检查
-            pending = self._bg_summary_pending_session
+            # 此时按会话取出自己的 pending 补触发自动汇总检查（set 分桶，
+            # 多会话并行互不覆盖）
+            with self._bg_summary_lock:
+                pending = session_name in self._bg_summary_pending_sessions
+                self._bg_summary_pending_sessions.discard(session_name)
             if pending and not self._shutting_down:
-                self._bg_summary_pending_session = ""
                 threading.Thread(
                     target=self._deferred_bg_summary_check,
-                    args=(pending,),
+                    args=(session_name,),
                     daemon=True,
                     name="gui-bg-summary-recheck",
                 ).start()
@@ -1642,13 +1861,19 @@ class ApiBridge:
 
         if self._shutting_down or not session:
             return
+        # （getattr 兜底：测试构造的裸桥可能未走完整 __init__）
+        if session in getattr(self, "_user_cancelled_sessions", ()):
+            # 本批后台任务是被用户取消的：不自动起汇总回合（用户下一条消息时
+            # 仍会在 prepare 阶段看到终态结果，但不再附“接手完成”指令）
+            return
         if subagent_manager.has_running_background_tasks(session):
             return
 
         with self._turn_start_lock:
             if self._is_turn_active(session):
                 # 该会话回合运行中不能并发起新回合；挂起，回合结束时补检查
-                self._bg_summary_pending_session = session
+                with self._bg_summary_lock:
+                    self._bg_summary_pending_sessions.add(session)
                 return
             with self._bg_summary_lock:
                 if session in self._bg_summary_triggered:
@@ -2500,7 +2725,11 @@ class ApiBridge:
             os.makedirs(paste_dir, exist_ok=True)
             ts = time.strftime("%Y%m%d_%H%M%S")
             ms = int(time.time() * 1000) % 1000
-            path = os.path.join(paste_dir, f"paste_{ts}_{ms:03d}{MIME_EXT[mime]}")
+            # 毫秒时间戳仍会撞名（同一毫秒内连续粘贴会互相覆盖），加随机后缀
+            path = os.path.join(
+                paste_dir,
+                f"paste_{ts}_{ms:03d}_{uuid.uuid4().hex[:6]}{MIME_EXT[mime]}",
+            )
             with open(path, "wb") as f:
                 f.write(raw)
             return {"ok": True, "path": path}
@@ -2587,17 +2816,25 @@ class ApiBridge:
             if self._term_proc is not None and self._term_proc.poll() is None:
                 return {"ok": False, "msg": "已有命令正在运行，请先等它结束或点击终止"}
             cwd = self._session_workdir(self._current_session)
+            if cwd == "GLOBAL" or not os.path.isdir(cwd):
+                # M19：GLOBAL 自由对话的 workdir 只是归属标记字符串，直接当
+                # Popen cwd 必抛 FileNotFoundError；统一归一为进程 cwd
+                cwd = _resolve_real_path(os.getcwd())
             try:
-                creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-                proc = subprocess.Popen(
-                    command,
-                    shell=True,
-                    cwd=cwd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=creationflags,
-                )
+                popen_kwargs = {
+                    "shell": True,
+                    "cwd": cwd,
+                    "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT,
+                    "stdin": subprocess.DEVNULL,
+                }
+                if os.name == "nt":
+                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                else:
+                    # M20：独立进程组启动，终止时用 killpg 杀整棵子树，
+                    # 避免只 kill shell 父进程后子进程成孤儿
+                    popen_kwargs["start_new_session"] = True
+                proc = subprocess.Popen(command, **popen_kwargs)
             except Exception as e:
                 return {"ok": False, "msg": str(e)}
             self._term_proc = proc
@@ -2653,7 +2890,13 @@ class ApiBridge:
                     creationflags=subprocess.CREATE_NO_WINDOW,
                 )
             else:
-                proc.kill()
+                # M20：配合 Popen 的 start_new_session，杀整个进程组而不是
+                # 只 kill shell 父进程（子树否则成孤儿）
+                import signal
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
@@ -2880,7 +3123,7 @@ class ApiBridge:
                 try:
                     from core.llm import _request_stream
 
-                    stream = _request_stream(
+                    stream, _holder = _request_stream(
                         provider.get("protocol", "openai"),
                         {
                             "model": target.get("litellm_model"),

@@ -25,6 +25,9 @@ SKILL_TRIGGERS_MAX_CHARS = 240
 # 首次启动释放到用户级技能目录，之后用户可自由开关 / 修改 / 删除。
 # ------------------------------------------------------------------
 _BUILTIN_SYNC_DONE = False
+# check-and-set 必须持锁：TUI/GUI 多线程首次调用 get_skill_dirs 时
+# 无锁并发会让释放流程重入执行
+_builtin_sync_lock = threading.Lock()
 
 
 def _builtin_skills_dir():
@@ -53,7 +56,15 @@ def sync_builtin_skills():
     global _BUILTIN_SYNC_DONE
     if _BUILTIN_SYNC_DONE:
         return
-    _BUILTIN_SYNC_DONE = True
+    with _builtin_sync_lock:
+        if _BUILTIN_SYNC_DONE:
+            return
+        _BUILTIN_SYNC_DONE = True
+        _sync_builtin_skills_impl()
+
+
+def _sync_builtin_skills_impl():
+    """sync_builtin_skills 的实际执行体（调用方已持 _builtin_sync_lock）。"""
     src = _builtin_skills_dir()
     if not os.path.isdir(src):
         return

@@ -2,6 +2,7 @@ import json
 import hashlib
 import logging
 import os
+import queue
 import random
 import re
 import subprocess
@@ -41,6 +42,112 @@ def _submit_daemon_call(function, *args, **kwargs):
 
     threading.Thread(target=runner, daemon=True, name="ycode-blocking-call").start()
     return future
+
+# ---------------------------------------------------------------------------
+# 在飞 LLM 请求硬中断注册表
+# 协作式取消（cancel_event）只能让主循环在下一个检查点退出，阻塞中的 HTTP 读
+# 仍要等到数据到达或超时（随载荷放大，封顶数百秒），用户点“停止”后连接仍在静默
+# 接收。这里把每个在飞流登记到对应 cancel_event 名下，停止路径调用
+# abort_inflight_streams() 直接关闭底层流，让阻塞读立即抛错退出。
+# 铁律：只关闭单个 response 流，绝不触碰 litellm 共享的连接池/client；
+# 关闭动作本身绝不向外抛异常（中断路径不能制造新故障）。
+# ---------------------------------------------------------------------------
+_inflight_lock = threading.Lock()
+_inflight_streams: Dict["threading.Event", List["_InflightStream"]] = {}
+
+
+def _close_stream_quietly(stream):
+    """尽力关闭单个流对象（不触碰共享 client/连接池），吞掉一切异常。
+
+    litellm 的 CustomStreamWrapper 没有 close()，真正的可关闭对象藏在
+    .completion_stream（openai SDK Stream，close() 会关底层 httpx response）
+    或 .response（httpx.Response）里，逐层探测。
+    """
+    seen = set()
+    queue = [stream]
+    while queue:
+        target = queue.pop(0)
+        if target is None or id(target) in seen:
+            continue
+        seen.add(id(target))
+        close = getattr(target, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                pass
+            return
+        queue.append(getattr(target, "completion_stream", None))
+        queue.append(getattr(target, "response", None))
+
+
+class _InflightStream:
+    """一个在飞 LLM 请求的可关闭句柄；attach 前/后调用 close 都安全且幂等。"""
+
+    __slots__ = ("stream", "closed")
+
+    def __init__(self):
+        self.stream = None
+        self.closed = False
+
+    def attach(self, stream):
+        with _inflight_lock:
+            if not self.closed:
+                self.stream = stream
+                return
+        # attach 前已被 abort：立即关闭新建流，避免泄漏连接
+        _close_stream_quietly(stream)
+
+    def close(self):
+        with _inflight_lock:
+            if self.closed:
+                return
+            self.closed = True
+            stream = self.stream
+        if stream is not None:
+            _close_stream_quietly(stream)
+
+
+def _register_inflight_stream(cancel_event):
+    """请求发出前登记；返回句柄，由流消费方在结束后 _unregister_inflight_stream。"""
+    if cancel_event is None:
+        return None
+    holder = _InflightStream()
+    with _inflight_lock:
+        _inflight_streams.setdefault(cancel_event, []).append(holder)
+    return holder
+
+
+def _unregister_inflight_stream(cancel_event, holder):
+    if cancel_event is None or holder is None:
+        return
+    with _inflight_lock:
+        holders = _inflight_streams.get(cancel_event)
+        if not holders:
+            return
+        try:
+            holders.remove(holder)
+        except ValueError:
+            pass
+        if not holders:
+            _inflight_streams.pop(cancel_event, None)
+
+
+def abort_inflight_streams(cancel_event):
+    """硬中断指定取消事件名下的全部在飞 LLM 请求（停止按钮/Ctrl+C 路径调用）。
+
+    调用方必须先 set cancel_event 再调用本函数：这样被关闭一侧的读循环
+    会把中断识别为用户取消（KeyboardInterrupt 打捞路径），而非网络错误重试。
+    """
+    if cancel_event is None:
+        return
+    with _inflight_lock:
+        holders = list(_inflight_streams.get(cancel_event, ()))
+    for holder in holders:
+        try:
+            holder.close()
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------------------
 # litellm 懒加载：启动性能优化
@@ -553,7 +660,7 @@ def check_permission_and_ask(
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 safe_print(ANSI(f"📝 星瑶申请修改文件: {file_path}"))
-            safe_print(ANSI(f"   👉 确认结果: {choices_map[choice_idx]}"))
+            safe_print(ANSI(f"   👉 确认结果: {choices_map.get(choice_idx, choices_map[0])}"))
         else:
             _notify_event(event_callback, "permission_resolved", {
                 "approved": choice_idx != 1,
@@ -1422,6 +1529,14 @@ def _responses_usage_as_chat_usage(response):
 
 
 def _responses_stream_as_chat_chunks(events):
+    """Responses 原始流 → chat chunks 的映射；生成器关闭时连带关闭底层流。"""
+    try:
+        yield from _responses_events_as_chat_chunks(events)
+    finally:
+        _close_stream_quietly(events)
+
+
+def _responses_events_as_chat_chunks(events):
     """将 Responses SSE 事件严格映射成现有工具循环消费的 chat chunks。"""
     saw_tool_calls = False
     ignored = {
@@ -1501,31 +1616,48 @@ def _responses_stream_as_chat_chunks(events):
             raise RuntimeError(f"未支持的 Responses 流事件: {event_type or '<empty>'}")
 
 
-def _request_stream(protocol, kwargs, *, timeout):
-    """按显式协议发起流请求；Responses 失败时禁止降级。"""
-    if protocol != "responses":
-        return completion(**kwargs, timeout=timeout)
+def _request_stream(protocol, kwargs, *, timeout, cancel_event=None):
+    """按显式协议发起流请求；Responses 失败时禁止降级。
 
-    response_kwargs = {
-        "model": kwargs["model"],
-        "api_key": kwargs.get("api_key"),
-        "input": _responses_input_from_messages(kwargs.get("messages") or []),
-        "tools": _responses_tools_from_chat_tools(kwargs.get("tools") or []),
-        "stream": True,
-        "timeout": timeout,
-    }
-    for source, target in (
-        ("api_base", "api_base"),
-        ("max_tokens", "max_output_tokens"),
-        ("tool_choice", "tool_choice"),
-        ("num_retries", "num_retries"),
-        ("extra_body", "extra_body"),
-    ):
-        if source in kwargs:
-            response_kwargs[target] = kwargs[source]
-    if kwargs.get("reasoning_effort"):
-        response_kwargs["reasoning"] = {"effort": kwargs["reasoning_effort"]}
-    return _responses_stream_as_chat_chunks(_litellm_responses(**response_kwargs))
+    返回 (stream, holder)：holder 登记在 cancel_event 名下的在飞注册表，
+    供停止路径硬中断；由调用方在流消费结束后 unregister。
+    """
+    holder = _register_inflight_stream(cancel_event)
+    try:
+        if protocol != "responses":
+            stream = completion(**kwargs, timeout=timeout)
+            if holder is not None:
+                holder.attach(stream)
+            return stream, holder
+
+        response_kwargs = {
+            "model": kwargs["model"],
+            "api_key": kwargs.get("api_key"),
+            "input": _responses_input_from_messages(kwargs.get("messages") or []),
+            "tools": _responses_tools_from_chat_tools(kwargs.get("tools") or []),
+            "stream": True,
+            "timeout": timeout,
+        }
+        for source, target in (
+            ("api_base", "api_base"),
+            ("max_tokens", "max_output_tokens"),
+            ("tool_choice", "tool_choice"),
+            ("num_retries", "num_retries"),
+            ("extra_body", "extra_body"),
+        ):
+            if source in kwargs:
+                response_kwargs[target] = kwargs[source]
+        if kwargs.get("reasoning_effort"):
+            response_kwargs["reasoning"] = {"effort": kwargs["reasoning_effort"]}
+        # 可关闭对象是底层原始流，不是外层映射生成器（生成器在执行中无法 close）
+        raw_stream = _litellm_responses(**response_kwargs)
+        if holder is not None:
+            holder.attach(raw_stream)
+        return _responses_stream_as_chat_chunks(raw_stream), holder
+    except Exception:
+        # 请求未建立：登记无意义，立即摘除避免空句柄滞留注册表
+        _unregister_inflight_stream(cancel_event, holder)
+        raise
 
 
 def __getattr__(name):
@@ -1549,6 +1681,35 @@ _token_estimate_cache = {"sig": None, "value": 0}
 # 记录前缀（消息数/字符总长/token 数），下一轮免全量 tokenize
 _token_prefix_cache = {"model": None, "msg_count": 0, "char_len": 0, "value": 0}
 _token_cache_lock = threading.RLock()
+
+
+def _sanitize_error_text(text):
+    """异常文本入 UI / 落库前脱敏。
+
+    litellm / 网关异常文本常携带完整请求 URL 与请求上下文（query 里的 api_key、
+    Authorization: Bearer 头、URL userinfo 等），直接发 error/turn_error 事件会把
+    凭据泄露到界面与会话记录。这里对 URL 凭据段与常见密钥模式做不可逆脱敏。
+    """
+    text = str(text or "")
+    # URL userinfo：scheme://user:password@host → scheme://user:***@host
+    text = re.sub(
+        r"([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(@)", r"\1***\2", text,
+        flags=re.IGNORECASE,
+    )
+    # key=value / key: value 形式的敏感字段（含 query string 里的 api_key=...）
+    text = re.sub(
+        r"(?i)(\b(?:api[_-]?key|access[_-]?token|token|secret|password|passwd|authorization)\s*[=:]\s*)[^\s,;&\"']+",
+        r"\1***",
+        text,
+    )
+    # Authorization: Bearer xxx
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"',;]+", "Bearer ***", text)
+    # 常见 provider 密钥前缀
+    return re.sub(
+        r"\b(?:sk|ghp|gho|ghu|ghs|ghr|glpat|hf|xoxb|xoxp|xoxa|AKIA|ASIA|AIza)[-_][A-Za-z0-9_.-]{6,}\b",
+        "***",
+        text,
+    )
 
 
 def _fold_old_media_for_estimate(messages):
@@ -1605,8 +1766,11 @@ def estimate_tokens(model_name, messages):
 
 def _estimate_tokens_locked(model_name, messages):
     try:
-        total_len = sum(len(str(m.get("content") or "")) for m in messages)
-        sig = (str(model_name), len(messages), total_len)
+        # 签名必须含内容哈希：仅用 (模型, 消息数, 总字符数) 时，等长内容突变
+        # （改写历史但长度不变）会命中旧缓存，返回过期的 token 估算
+        parts = [str(m.get("content") or "") for m in messages]
+        total_len = sum(len(p) for p in parts)
+        sig = (str(model_name), len(messages), total_len, hash(tuple(parts)))
     except Exception:
         sig = None
     if sig is not None and _token_estimate_cache.get("sig") == sig:
@@ -1803,7 +1967,7 @@ def chat_with_model_events(
         # 生成器前置区（记忆注入/通知 drain/请求构造）抛出的异常会穿透内部
         # try 直接传播到这里：补发 turn_error，保证调用方能感知回合失败
         yield from drain_public_events()
-        yield factory.emit("turn_error", {"message": str(exc)})
+        yield factory.emit("turn_error", {"message": _sanitize_error_text(exc)})
         raise
 
 # 支持原生推理字段回传的 provider 白名单（按 litellm model 前缀匹配）
@@ -2444,6 +2608,69 @@ def _complete_thinking_blocks(delta):
 def _notify_event(event_callback, kind, payload):
     if event_callback is not None:
         event_callback(kind, payload)
+
+
+def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_cancelled, inflight_holder=None, cancel_event=None):
+    """在守护线程中消费 LLM 流，主循环用带超时的队列读取。
+
+    直接 for chunk in response_stream 时，首个 chunk 之后流中段 stalled 没有任何
+    反馈，最长静默一整个请求超时（随载荷放大，封顶数百秒），用户无法区分
+    “慢”与“卡死”。改为后台线程 pump + 主线程带 0.5s 超时的队列读取：
+    空闲超阈值后按间隔上报等待状态，同时保持对取消事件的响应能力。
+    注意：调用方提前放弃（取消/异常）时 pump 线程会继续读到流结束，线程为
+    daemon 且流自身有读超时，不会泄漏存活。
+    inflight_holder：本流在在飞注册表中的句柄，消费结束（无论正常/异常/取消）
+    统一摘除；用户取消时流已被 abort_inflight_streams 关闭，pump 抛出的读错误
+    需经 raise_if_cancelled 归一为用户取消，避免误入网络错误分支。
+    """
+    chunks_queue: "queue.Queue" = queue.Queue()
+    _END = object()
+
+    def _pump():
+        try:
+            for chunk in response_stream:
+                chunks_queue.put((True, chunk))
+        except BaseException as err:
+            chunks_queue.put((False, err))
+        finally:
+            chunks_queue.put((False, _END))
+
+    threading.Thread(target=_pump, daemon=True, name="llm-stream-pump").start()
+    idle_started_at = time.monotonic()
+    last_notice_at = idle_started_at
+    try:
+        while True:
+            raise_if_cancelled()
+            try:
+                ok, item = chunks_queue.get(timeout=0.5)
+            except queue.Empty:
+                idle = time.monotonic() - idle_started_at
+                if (
+                    idle >= WAIT_NOTICE_THRESHOLD_SECONDS
+                    and time.monotonic() - last_notice_at >= WAIT_NOTICE_INTERVAL_SECONDS
+                ):
+                    last_notice_at = time.monotonic()
+                    wait_message = (
+                        f"模型流式响应中断，已 {int(idle)} 秒未收到新数据，仍在等待连接恢复；"
+                        "可按 Ctrl+C 中断"
+                    )
+                    if event_callback is None:
+                        print(f"\n[⏳ {wait_message}]")
+                    else:
+                        _notify_event(event_callback, "status", {"message": wait_message})
+                continue
+            idle_started_at = time.monotonic()
+            last_notice_at = idle_started_at
+            if not ok:
+                if item is _END:
+                    return
+                # 用户取消触发的硬中断会把底层流关掉，pump 随之抛读错误；
+                # 先走取消判定，保证归一为 KeyboardInterrupt 打捞路径而非网络错误
+                raise_if_cancelled()
+                raise item
+            yield item
+    finally:
+        _unregister_inflight_stream(cancel_event, inflight_holder)
 
 
 def _tool_call_arguments(tc):
@@ -3257,7 +3484,17 @@ def _execute_single_tool_call(
                     function_name, arguments.get("dir_path", "."), event_callback,
                     permission_owner, parent_turn_id, permission_source, cancel_event,
                 )
-            if function_name == "execute_command" and cancel_event is not None:
+            # 阻塞型工具的取消事件透传：execute_command 之外，search_code/glob_files
+            # 等长阻塞工具也接受 cancel_event（registry 经 _INTERNAL_ARG_KEYS 放行），
+            # 否则取消后 ripgrep/网络请求仍阻塞数十秒，子代理迟迟无法收敛
+            if cancel_event is not None and function_name in {
+                "execute_command",
+                "search_code",
+                "glob_files",
+                "fetch_url",
+                "get_weather",
+                "search_news",
+            }:
                 arguments["cancel_event"] = cancel_event
 
             if sandbox_err:
@@ -3840,6 +4077,7 @@ def _chat_with_model_generator(
 
             # API 调用指数退避与 Jitter 抖动重试
             response_stream = None
+            inflight_holder = None
             max_api_retries = 5
             base_delay = 1.0
             # 超窗自动压缩只允许一次：压缩后仍超限说明单条消息/附件本身过大，
@@ -3893,12 +4131,13 @@ def _chat_with_model_generator(
                         API_REQUEST_TIMEOUT_SECONDS + max(0, _est_prompt_tokens) // 1500,
                     )
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
-                    # 网络请求一旦发出无法真正中断，但调用方无需傻等到超时才能退出。
+                    # 在飞请求登记到 cancel_event 名下，停止路径可硬中断底层连接。
                     future = _submit_daemon_call(
                         _request_stream,
                         request_protocol,
                         kwargs,
                         timeout=attempt_timeout,
+                        cancel_event=cancel_event,
                     )
                     wait_started_at = time.monotonic()
                     last_wait_notice_at = wait_started_at
@@ -3933,12 +4172,15 @@ def _chat_with_model_generator(
                         exc = future.exception()
                         if exc is not None:
                             raise exc
-                        response_stream = future.result()
+                        response_stream, inflight_holder = future.result()
                     finally:
                         # 用户取消时避免 shutdown(wait=True) 阻塞到网络请求完成（最长 90s）
                         future.cancel()
                     break
                 except Exception as api_err:
+                    # 硬中断（用户取消关闭在飞流）会让请求线程抛连接错误；
+                    # 先走取消判定，确保不误入下面的网络错误重试
+                    raise_if_cancelled()
                     err_str = str(api_err).lower()
                     # 上下文窗口超限自动压缩历史记录并重试：
                     # 优先按异常类型判断，字符串匹配作为兜底且要求上下文相关关键词组合，
@@ -4055,7 +4297,10 @@ def _chat_with_model_generator(
             finish_reason = None
 
             stream_usage = None
-            for chunk in response_stream:
+            for chunk in _stream_chunks_with_idle_notice(
+                response_stream, event_callback, raise_if_cancelled,
+                inflight_holder=inflight_holder, cancel_event=cancel_event,
+            ):
                 raise_if_cancelled()
 
                 # 同一流中可能出现多个带 usage 的 chunk，只保留最后一个，
@@ -4312,6 +4557,10 @@ def _chat_with_model_generator(
                 if allow_subagents and parent_session and plan_continue_nudges < 2:
                     try:
                         from core.plan import get_default_plan_manager as _get_plan_for_nudge
+                        from core.plan import (
+                            clear_plan_auto_continue_suppression as _clear_nudge_suppress,
+                            plan_auto_continue_suppressed as _nudge_suppressed,
+                        )
                         _nudge_plan = _get_plan_for_nudge()
                         _nudge_ready = [
                             item for item in _nudge_plan.ready_items()
@@ -4321,9 +4570,15 @@ def _chat_with_model_generator(
                             item.get("status") == "in_progress"
                             for item in _nudge_plan.snapshot()
                         ) if _nudge_plan.session_id == str(parent_session) else False
+                        # 用户明确要求继续（计划项重新进入执行）或计划已清空时，
+                        # 解除“用户取消”的续推抑制；否则跳过本次 nudge，避免把
+                        # 刚被用户取消的任务复活
+                        if _nudge_running or not _nudge_plan.snapshot():
+                            _clear_nudge_suppress(parent_session)
+                        _nudge_skip = _nudge_suppressed(parent_session)
                     except Exception:
-                        _nudge_ready, _nudge_running = [], False
-                    if _nudge_ready and not _nudge_running:
+                        _nudge_ready, _nudge_running, _nudge_skip = [], False, False
+                    if _nudge_ready and not _nudge_running and not _nudge_skip:
                         plan_continue_nudges += 1
                         hints = ", ".join(
                             f"'{item['id']}'({item['subject']})" for item in _nudge_ready[:5]
@@ -4536,11 +4791,11 @@ def _chat_with_model_generator(
         rollback_turn_messages()
         if event_callback is not None:
             _notify_event(event_callback, "error", {
-                "message": str(e),
+                "message": _sanitize_error_text(e),
             })
             # 专用结束事件：chat_with_model_events 不再为异常回合发 turn_finished
             _notify_event(event_callback, "turn_error", {
-                "message": str(e),
+                "message": _sanitize_error_text(e),
             })
         else:
             from prompt_toolkit.formatted_text import HTML

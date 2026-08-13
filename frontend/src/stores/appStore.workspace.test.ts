@@ -76,13 +76,10 @@ it('does not inherit another session running state when creating a new conversat
 
 it('reports running only for the currently selected session', () => {
   const store = useAppStore();
+  // M30 修复后判定源统一为 runningSessions（与 sendMessage 拦截判定一致），
+  // 不再读 sessionRuntimeByName[key].running
   store.currentSessionName = 'session-b';
-  store.sessionRuntimeByName['session-a'] = {
-    messages: [], streamingText: '', thinkingText: '', running: true, subagentTasks: [],
-  };
-  store.sessionRuntimeByName['session-b'] = {
-    messages: [], streamingText: '', thinkingText: '', running: false, subagentTasks: [],
-  };
+  store.runningSessions = ['session-a'];
 
   expect(store.currentSessionRunning).toBe(false);
   store.currentSessionName = 'session-a';

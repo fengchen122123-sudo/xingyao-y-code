@@ -57,7 +57,10 @@ export function useSuggest(
       }
       try {
         const res = await api.search_workspace_files(query, 8);
+        // M26 修复：异步返回时不仅要校验仍在 file 模式，还要校验 query 未变，
+        // 否则旧查询的响应会覆盖新查询的列表（闭包捕获本次 query 比对）
         if (!suggest.value || suggest.value.mode !== 'file') return;
+        if (suggest.value.query !== query) return;
         const files: string[] = (res && res.files) || [];
         suggestItems.value = files.map(f => ({
           key: f,

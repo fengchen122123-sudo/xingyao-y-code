@@ -395,8 +395,12 @@ def build_background_task_summary(session_name: str) -> str:
                 summary_lines.append(f"结果: {result_text}")
             else:
                 summary_lines.append("结果: （空）")
+        elif t.status == "cancelled":
+            # 用户主动取消：如实列出即可，绝不附“接手完成”指令——否则用户取消后的
+            # 下一个回合（自动汇总或手动消息）会把被取消的任务接手做完，直接违背用户意图
+            summary_lines.append("该任务已被用户主动取消，无需接手完成，也不要重新派发或重试。")
         else:
-            # 失败任务：主代理应接手用自身工具完成
+            # 失败/超时任务：主代理应接手用自身工具完成
             has_failed = True
             if t.error:
                 err_short = t.error[:300]
@@ -534,11 +538,19 @@ def prepare_turn_messages(
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
         # 智能滑窗淘汰：如果仍超限，按完整轮次（user 开头到下一个 user 之前）
-        # 为单位从内存中丢弃最早的旧消息，直到满足 Token 安全阈值
+        # 为单位淘汰最早的旧消息，直到满足 Token 安全阈值。
+        # 淘汰必须在 DB 层推进 summarized_until_msg_id 持久化（一次性水位推进，
+        # 不改写消息字节）：纯内存淘汰下一轮 prepare 会从 DB 读回全部历史，淘汰失效。
         while len(history) > 2 and estimated_tokens > window * SUMMARIZE_RATIO:
-            if not evict_oldest_turn(history):
+            if not manager.evict_oldest_turn_persistent(session_name):
                 break
+            history = manager.get_history_for_llm(session_name)
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+
+        # 淘汰到底（仅剩最后轮次）仍超窗口：剩下的单条消息本身就超限。
+        # 明确告知用户，而不是裸发一个几乎必然被 provider 拒绝的超限请求。
+        if estimated_tokens > window and not _cancelled():
+            _notify("compress", "<ansired>⚠️ 当前上下文在压缩与淘汰后仍超过模型窗口，本轮请求可能被 provider 拒绝；建议精简输入、拆分任务或开启新会话。</ansired>")
 
     # 更新最新 Token 数供界面显示（与 UI 线程并发读写，必须持锁）
     with token_usage_lock:
@@ -587,8 +599,8 @@ def prepare_turn_messages(
             _insert_before_last_user(history, {"role": "system", "content": summary_msg})
             _persist_context_block(manager, session_name, summary_msg)
     except Exception:
-        # 汇总机制失败不能影响主流程
-        pass
+        # 汇总机制失败不能影响主流程，但必须留诊断痕迹（裸吞会让注入失效不可排查）
+        logger.warning("后台子代理汇总注入失败，已跳过本轮汇总", exc_info=True)
 
     return history
 

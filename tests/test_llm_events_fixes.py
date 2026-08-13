@@ -1564,6 +1564,13 @@ def test_official_deepseek_thinking_omits_tool_choice(mocker, monkeypatch):
         "core.model_manager.get_model_config_by_litellm_model",
         lambda model, base_url=None: None,
     )
+    # 默认配置把官方 DeepSeek 路由到 responses 协议，会绕开本用例要验证的
+    # chat completions tool_choice 契约（mock 的 completion 永远不被调用），
+    # 这里显式钉在 chat 协议
+    monkeypatch.setattr(
+        "core.model_manager.get_model_protocol",
+        lambda model, base_url=None: "openai",
+    )
     mocker.patch(
         "core.llm.completion",
         side_effect=lambda **kwargs: captured.append(dict(kwargs)) or iter([_chunk("完成")]),
@@ -1591,6 +1598,11 @@ def test_deepseek_non_thinking_keeps_auto_tool_choice(mocker, monkeypatch):
     monkeypatch.setattr(
         "core.model_manager.get_model_config_by_litellm_model",
         lambda model, base_url=None: {"enable_thinking": False},
+    )
+    # 同上：钉在 chat 协议，避免默认 responses 路由绕开 mock 的 completion
+    monkeypatch.setattr(
+        "core.model_manager.get_model_protocol",
+        lambda model, base_url=None: "openai",
     )
     mocker.patch(
         "core.llm.completion",

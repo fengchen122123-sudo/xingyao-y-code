@@ -38,6 +38,9 @@ def patched_env(tmp_path, monkeypatch):
             calls["registry"].append((name, hive)))
     monkeypatch.setattr(
         ycode_uninstall, "get_desktop_dir", lambda: str(tmp_path / "Desktop"))
+    # conftest 全局设置了 YCODE_DATA_DIR 隔离目录；卸载引擎按 config.py 逻辑
+    # 优先读它（修复 #2），测试需先移除，让 expanduser mock 下的 ~/.ycode 生效
+    monkeypatch.delenv("YCODE_DATA_DIR", raising=False)
     monkeypatch.setattr(
         ycode_uninstall, "get_common_desktop_dir", lambda: str(tmp_path / "PublicDesktop"))
     monkeypatch.setattr(
@@ -185,3 +188,61 @@ def test_self_destruct_never_recursively_deletes_install_dir(tmp_path, monkeypat
     assert "$true" not in script
     assert "ycode_uninstall.exe" in script
     os.unlink(argv[-1])
+
+
+# ── 审计修复回归：T22 / M47 注册表归属标记 ─────────────────────────────
+
+def test_detect_scope_matches_program_files_x86(tmp_path, monkeypatch):
+    """T22：Program Files (x86) 之下同样判定 machine（旧实现只查 ProgramFiles）。"""
+    def fake_open(hive, path):
+        raise OSError("not found")
+
+    monkeypatch.setattr(ycode_uninstall.winreg, "OpenKey", fake_open)
+    monkeypatch.delenv("ProgramFiles", raising=False)
+    monkeypatch.setenv("ProgramFiles(x86)", str(tmp_path / "Program Files (x86)"))
+
+    pf86_dir = str(tmp_path / "Program Files (x86)" / "Y-code")
+    user_dir = str(tmp_path / "Users" / "someone" / "Y-code")
+    assert detect_scope_for_install(pf86_dir) == "machine"
+    assert detect_scope_for_install(user_dir) == "user"
+
+
+def test_detect_scope_conservative_when_env_missing(tmp_path, monkeypatch):
+    """T22：两个 Program Files 环境变量都读不到时保守按 machine 处理并提示。"""
+    def fake_open(hive, path):
+        raise OSError("not found")
+
+    monkeypatch.setattr(ycode_uninstall.winreg, "OpenKey", fake_open)
+    monkeypatch.delenv("ProgramFiles", raising=False)
+    monkeypatch.delenv("ProgramFiles(x86)", raising=False)
+
+    logs = []
+    assert detect_scope_for_install(str(tmp_path / "anywhere" / "Y-code"),
+                                    log=logs.append) == "machine"
+    assert any("Program Files" in m for m in logs)
+
+
+def test_verify_install_dir_accepts_registry_marker(tmp_path, monkeypatch):
+    """M47+High-1：version.txt 缺失时，注册表归属标记可作为第二归属证据。"""
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    (install_dir / "Y-code.exe").write_text("gui", encoding="utf-8")
+
+    class _FakeKey:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    values = {"InstallLocation": str(install_dir), "YcodeInstallMarker": "Y-code"}
+    monkeypatch.setattr(ycode_uninstall.winreg, "OpenKey",
+                        lambda hive, path: _FakeKey())
+    monkeypatch.setattr(ycode_uninstall.winreg, "QueryValueEx",
+                        lambda key, name: (values[name], winreg.REG_SZ))
+
+    assert ycode_uninstall._verify_ycode_install_dir(str(install_dir)) is True
+
+    # 标记指向其他目录时不得通过
+    values["InstallLocation"] = str(tmp_path / "elsewhere")
+    assert ycode_uninstall._verify_ycode_install_dir(str(install_dir)) is False

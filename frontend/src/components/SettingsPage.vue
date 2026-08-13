@@ -280,8 +280,17 @@ const testResults = reactive<Record<string, string>>({});
 const providerForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 const customForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 
-const secondaryModelId = ref(store.secondaryModelId);
-const secondaryRoles = reactive({ ...store.secondaryModelRoles });
+// M33 修复：副模型状态不再在 setup 时一次性快照（会与 store 脱节，
+// 后端/其他入口变更后设置页显示陈旧值）。改为 computed 双向绑定，
+// 读始终取 store 当前值，写直接同步回 store（与 setSecondaryRoles 乐观更新语义一致）。
+const secondaryModelId = computed({
+  get: () => store.secondaryModelId,
+  set: (v: string) => { store.secondaryModelId = v; },
+});
+const secondaryRoles = computed({
+  get: () => store.secondaryModelRoles,
+  set: (v: { vision: boolean; compression: boolean; subagent: boolean }) => { store.secondaryModelRoles = v; },
+});
 const modelModal = reactive({
   show: false,
   model_id: '',
@@ -458,7 +467,7 @@ async function onSecondaryModelChange() {
 }
 
 async function onSecondaryRolesChange() {
-  await store.setSecondaryRoles({ ...secondaryRoles });
+  await store.setSecondaryRoles({ ...secondaryRoles.value });
 }
 </script>
 

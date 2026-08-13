@@ -15,6 +15,9 @@ MAX_MEMORY_ENTRIES_PER_MESSAGE = 8
 MAX_MEMORY_ENTRY_CHARS = 2000
 MAX_MEMORY_INDEX_LINES = 200
 MAX_MEMORY_INDEX_ENTRY_CHARS = 500
+# Dream 整理一次性读入 prompt 的日记账总量上限：单个/多个超大日志文件
+# 不能把整理请求撑爆（无上限时一次 dream 可能携带数十万字符）
+MAX_DREAM_LOG_CHARS = 30000
 _MEMORY_INDEX_ENTRY_RE = re.compile(
     r"^-\s+\[([^\]\r\n]{1,160})\]\(([^)\r\n]+\.md)\)\s+(?:—|-)\s+([^\r\n]{1,260})$"
 )
@@ -263,8 +266,11 @@ def run_dream_consolidation_sync(api_model, api_key, api_base=None):
     if logs_dir.exists():
         log_files = sorted(list(logs_dir.glob("**/*.md")))
         for f in log_files[-5:]:
+            if len(log_content) >= MAX_DREAM_LOG_CHARS:
+                break
             try:
-                log_content += f"\n### File: {f.name}\n" + f.read_text(encoding="utf-8")
+                remaining = MAX_DREAM_LOG_CHARS - len(log_content)
+                log_content += f"\n### File: {f.name}\n" + f.read_text(encoding="utf-8")[:remaining]
             except Exception:
                 pass
             

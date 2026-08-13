@@ -105,8 +105,14 @@ class PermissionBroker:
             request = self._active
             if request is None or request.request_id != request_id:
                 return False
+            # choice_index 可能是 UI 层透传的任意值：无法解析为整数时与越界索引
+            # 一样按取消处理，绝不让 int() 的 ValueError 击穿持锁路径
+            try:
+                choice_index = int(choice_index)
+            except (TypeError, ValueError):
+                choice_index = CANCELLED_RESULT
             # 越界索引统一按取消处理，避免调用方 KeyError / 语义不一致
-            if not 0 <= int(choice_index) < len(request.options):
+            if not 0 <= choice_index < len(request.options):
                 choice_index = CANCELLED_RESULT
             self._active = self._queued.popleft() if self._queued else None
             next_request = self._active
