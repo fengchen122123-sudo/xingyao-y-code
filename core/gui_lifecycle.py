@@ -114,8 +114,26 @@ class ApplicationLifecycle:
             if self._exiting:
                 return
             self._exiting = True
+        # 菜单回调运行在 pystray 消息循环线程上（win32 后端在 TrackPopupMenuEx
+        # 返回后同步调用）。shutdown 内含多段 join（回合线程 drain、子代理
+        # shutdown 各最长 5s），若在该线程同步执行会长时间卡死托盘消息循环，
+        # tray.stop() 投递的 WM_STOP 也得不到处理；window.destroy() 从托盘线程
+        # 直接调用也未被 pywebview 承诺线程安全。整个 stop + destroy 序列移到
+        # 独立退出线程执行，菜单回调立即返回。
+        # （已核实 pystray>=0.19.5：stop() 只 PostMessage 异步停消息循环，
+        # join 的是短命的 setup 线程且有 5s 超时，不存在自 join 死锁。）
+        threading.Thread(
+            target=self._exit_sequence,
+            daemon=True,
+            name="gui-exit-sequence",
+        ).start()
+
+    def _exit_sequence(self) -> None:
         self._finalize_once()
-        self._window.destroy()
+        try:
+            self._window.destroy()
+        except Exception:
+            logger.exception("销毁主窗口失败")
 
     def finalize(self) -> None:
         """Called after the native GUI loop exits by any non-tray path."""

@@ -1,8 +1,9 @@
 import contextlib
-import json
 import logging
 import re
 import threading
+
+from core.memory import message_content_to_text
 # litellm 改为懒导入：避免在 import core.memory_compressor 时强制加载 litellm（~1.4s）
 # 实际首次压缩时才加载，与 core.llm 的懒加载策略一致
 from prompt_toolkit import print_formatted_text  # noqa: F401 保留导入以兼容测试桩
@@ -29,8 +30,9 @@ def _load_compression_config():
         cfg = load_config()
         comp_cfg = cfg.get("memory_compression", {})
         return {
-            "retain_count": int(comp_cfg.get("retain_count", DEFAULT_RETAIN_COUNT)),
-            "retain_count_force": int(comp_cfg.get("retain_count_force", DEFAULT_RETAIN_COUNT_FORCE)),
+            # 保留条数至少为 1：配置成 0/负数会让截断切片为空并抛 IndexError 被静默吞掉
+            "retain_count": max(1, int(comp_cfg.get("retain_count", DEFAULT_RETAIN_COUNT))),
+            "retain_count_force": max(1, int(comp_cfg.get("retain_count_force", DEFAULT_RETAIN_COUNT_FORCE))),
             "tool_result_truncate_threshold_chars": int(
                 comp_cfg.get("tool_result_truncate_threshold_chars", DEFAULT_TOOL_RESULT_TRUNCATE_THRESHOLD_CHARS)
             ),
@@ -177,24 +179,10 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
 
             all_active_messages = []
             for msg_id, role, raw_content in cursor.fetchall():
-                try:
-                    parsed_content = json.loads(raw_content)
-                    # 处理可能包含图片等多媒体内容的情况
-                    if isinstance(parsed_content, list):
-                        text_parts = []
-                        for item in parsed_content:
-                            if isinstance(item, dict) and item.get("type") == "text":
-                                text_parts.append(item.get("text", ""))
-                        content_str = " ".join(text_parts)
-                    else:
-                        content_str = str(parsed_content)
-                except (ValueError, TypeError):
-                    content_str = str(raw_content)
-
                 all_active_messages.append({
                     "id": msg_id,
                     "role": role,
-                    "content": content_str
+                    "content": message_content_to_text(raw_content)
                 })
 
             # 3. 统计需要保留的最近活跃消息
@@ -211,8 +199,14 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             # 整个会话无法继续使用。此时把保留区开头的连续 tool 消息一并归入待压缩区。
             retained = all_active_messages[-retain_count:]
             extra = 0
-            while extra < len(retained) - 1 and retained[extra]["role"] == "tool":
+            while extra < len(retained) and retained[extra]["role"] == "tool":
                 extra += 1
+            if extra == len(retained):
+                # 保留区整条都是 tool 结果（其声明 assistant 必在待压缩区），
+                # 全部归入待压缩区后保留区清空：本次压缩没有可安全推进边界的
+                # 锚点，强行压缩会让孤儿 tool 进入摘要且活跃区无消息，直接拒绝。
+                emit("<ansiyellow>ℹ 保留区均为工具结果且配对助手消息在待压缩区，本次压缩已跳过（等待更多对话后再压缩）。</ansiyellow>")
+                return False
             if extra:
                 messages_to_summarize = all_active_messages[:len(all_active_messages) - retain_count + extra]
             # 获取被压缩的最大消息 id，以此作为下次截断的起点
@@ -233,7 +227,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 else:
                     role_display = "星瑶"
                 # 过滤内容里的思考标签以缩减 Token 负担
-                clean_content = re.sub(r"<(?:think|thinking)>.*?</(?:think|thinking)>", "", msg["content"], flags=re.DOTALL).strip()
+                clean_content = re.sub(r"<(?:think|thinking)>.*?</(?:think|thinking)>", "", msg["content"], flags=re.DOTALL | re.IGNORECASE).strip()
                 # 工具结果（role=tool）超长时预截断
                 if role == "tool" and clean_content:
                     clean_content = _truncate_long_tool_result(clean_content, config)
@@ -311,7 +305,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         response = _litellm_completion(
             **request_kwargs
         )
-        new_summary = response.choices[0].message.content.strip()
+        new_summary = (response.choices[0].message.content or "").strip()
         # 清除多余的 markdown 格式或引导词
         new_summary = re.sub(r"^记忆摘要[：:]\s*", "", new_summary)
         new_summary = new_summary.replace("```", "").strip()

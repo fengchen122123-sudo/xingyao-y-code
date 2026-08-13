@@ -15,6 +15,19 @@ _logger = logging.getLogger("py.warnings")
 ACTIVE_TASKS = {}
 _TASKS_LOCK = threading.RLock()
 
+# 本进程显式删除（kill/死亡清理）的任务 ID 墓碑：_save_tasks 做跨进程合并读时，
+# 用于区分"其他进程新启动的任务"（合并保留）与"本进程已删除的任务"（防止复活）
+_REMOVED_TIDS = set()
+_REMOVED_TIDS_CAP = 512
+
+
+def _forget_task_locked(tid):
+    """记录本进程显式删除的任务 ID（墓碑）；超过上限整体清空（此时墓碑保护失效，
+    但单会话删除 512 个任务后残留墓碑的实际风险可忽略）。"""
+    if len(_REMOVED_TIDS) >= _REMOVED_TIDS_CAP:
+        _REMOVED_TIDS.clear()
+    _REMOVED_TIDS.add(tid)
+
 # 任务日志目录（懒初始化：首次使用时按当前 cwd 解析，避免模块导入期副作用）
 LOG_DIR = None
 TASK_DB_PATH = None
@@ -28,7 +41,7 @@ _MAX_TASK_LOGS = 50
 # get_task_output 的 task_id 白名单，防止路径穿越读取任意日志文件
 _TASK_ID_PATTERN = re.compile(r"^[\w-]{1,64}$")
 
-from core.command_policy import is_dangerous_command
+from core.command_policy import is_dangerous_command, redact_sensitive_text
 
 # 兼容已有内部调用和测试；策略实现集中在 command_policy。
 _is_dangerous_command = is_dangerous_command
@@ -132,7 +145,7 @@ def _load_tasks():
         return
     with _TASKS_LOCK:
         for tid, info in data.items():
-            if tid in ACTIVE_TASKS:
+            if tid in ACTIVE_TASKS or tid in _REMOVED_TIDS:
                 continue
             # 防御手工编辑或旧版本格式导致字段缺失，避免 KeyError 击穿整个任务系统
             if not isinstance(info, dict):
@@ -170,7 +183,8 @@ def _save_tasks():
                 pid = info.get("pid") or (info["process"].pid if info.get("process") else None)
                 if pid:
                     data[tid] = {
-                        "command": info["command"],
+                        # 落盘前脱敏：内联凭据（export TOKEN=sk-...）不明文持久化
+                        "command": redact_sensitive_text(info["command"]),
                         "pid": pid,
                         "start_time": info["start_time"],
                         "create_time": info.get("create_time"),
@@ -179,6 +193,20 @@ def _save_tasks():
                             or platform_console_encoding()
                         ),
                     }
+            # 跨进程合并读：GUI/TUI 双进程并发写同一份 tasks.json 时，
+            # 把磁盘上其他进程新启动的任务记录合并进来，避免内存全量覆盖写
+            # 互相丢失任务；本进程已删除的记录靠墓碑集合防止被合并步骤复活
+            disk_data = None
+            if os.path.exists(TASK_DB_PATH):
+                try:
+                    with open(TASK_DB_PATH, 'r', encoding='utf-8') as f:
+                        disk_data = json.load(f)
+                except Exception:
+                    disk_data = None
+            if isinstance(disk_data, dict):
+                for tid, info in disk_data.items():
+                    if tid not in data and tid not in _REMOVED_TIDS and isinstance(info, dict):
+                        data[tid] = info
             # 先写临时文件，成功后再原子替换目标文件，
             # 避免写到一半进程崩溃或磁盘满时 tasks.json 损坏。
             tmp_path = TASK_DB_PATH + ".tmp"
@@ -333,6 +361,7 @@ def list_active_tasks():
                 except Exception as error:
                     _logger.warning("关闭任务日志句柄失败 %s: %s", tid, error)
                 del ACTIVE_TASKS[tid]
+                _forget_task_locked(tid)
                 dirty = True
             else:
                 running_time = int(time.time() - info["start_time"])
@@ -512,5 +541,6 @@ def kill_background_task(task_id: str) -> bool:
 
     with _TASKS_LOCK:
         ACTIVE_TASKS.pop(task_id, None)
+        _forget_task_locked(task_id)
         _save_tasks()
     return killed

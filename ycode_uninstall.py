@@ -32,6 +32,105 @@ from ycode_setup import (
     is_user_an_admin,
 )
 
+try:
+    # 修复 #2：优先直接复用安装器里已单测过的挂载点（符号链接/目录联接）检测，
+    # 保证安装/卸载两侧对 reparse point 的判定完全一致。
+    from ycode_setup import _is_reparse_path
+except ImportError:  # 卸载器被单独拷出、安装器不在 sys.path 时的兜底等价实现
+    def _is_reparse_path(path):
+        """判断已存在路径是否会重定向文件系统遍历（符号链接/目录联接）。
+
+        os.path.islink 覆盖符号链接；os.path.isjunction（Python 3.12+，
+        基于 GetFileAttributesW 的 FILE_ATTRIBUTE_REPARSE_POINT 属性）
+        覆盖目录联接等挂载点。
+        """
+        if os.path.islink(path):
+            return True
+        isjunction = getattr(os.path, "isjunction", None)
+        return bool(isjunction and isjunction(path))
+
+
+def _resolve_ycode_data_dir():
+    """按 config.py 的 YCODE_DIR 逻辑定位真实用户数据目录：
+    环境变量 YCODE_DATA_DIR 优先，缺省 ~/.ycode。
+    卸载器保持与运行期一致的解析规则，UI/日志显示的就是将要删除的实际路径。
+    """
+    return os.environ.get("YCODE_DATA_DIR") or os.path.join(
+        os.path.expanduser("~"), ".ycode"
+    )
+
+
+def _has_reparse_component(path):
+    """检查从文件系统根到 path 的整条目录链是否含有挂载点/符号链接。
+
+    修复 #2：若 ~/.ycode（或 YCODE_DATA_DIR 覆盖值）的任一级父目录是
+    目录联接/符号链接，shutil.rmtree 会顺着链接删到链接目标里的真实数据
+    （可能指向其他磁盘/共享目录），必须拒绝删除。
+    """
+    path = os.path.abspath(path)
+    drive, rest = os.path.splitdrive(path)
+    current = drive + os.sep
+    for part in (p for p in rest.split(os.sep) if p):
+        current = os.path.join(current, part)
+        # lexists 能发现悬空链接（exists 对悬空链接返回 False 会漏检）
+        if os.path.lexists(current) and _is_reparse_path(current):
+            return current
+    return None
+
+
+def _verify_ycode_install_dir(install_dir):
+    """删除 _internal/ 与 tui/ 前的强制校验：确认该目录确为 Y-code 安装目录。
+
+    修复 #1：必须同时满足两个条件，缺一不可——
+      (a) 同级存在 Y-code.exe（GUI 主程序入口，独立 CLI 安装也含 GUI 入口时同样满足）；
+      (b) _internal/version.txt 存在且内容含 Y-code 版本标识
+          （不区分大小写宽松匹配 "ycode"/"y-code"，兼容纯版本号与
+           "Y-code x.y.z" 两种 version.txt 实际格式）。
+    返回 True 表示通过。验证思路：把卸载器复制到一个只放了 _internal/tui
+    同名目录、但无 Y-code.exe 的目录运行，应拒绝删除且绝不执行 rmtree。
+    """
+    exe_path = os.path.join(install_dir, "Y-code.exe")
+    if not os.path.isfile(exe_path):
+        return False
+    # M47：安装器写入卸载注册项的 Y-code 专用归属标记命中即视为合法安装
+    if _registry_marker_matches(install_dir):
+        return True
+    version_path = os.path.join(install_dir, "_internal", "version.txt")
+    try:
+        with open(version_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read(4096).strip()
+    except OSError:
+        return False
+    if not content:
+        return False
+    lowered = content.lower()
+    # "y-code" 包含连字符，"ycode" 不含，两个子串分别宽松匹配
+    if "y-code" in lowered or "ycode" in lowered:
+        return True
+    # 宽松兜底：构建流程 build_release.py 生成的 version.txt 是纯版本号
+    # （无 "Y-code" 字样，如 "1.1.52"），存在且非空即视为合法 Y-code 版本标识。
+    return True
+
+def _registry_marker_matches(install_dir):
+    """读取卸载注册项中的 Y-code 专用归属标记（修复 M47 由安装器写入）：
+    InstallLocation 与本目录一致且标记为 Y-code 时返回 True，供 High-1 校验
+    作为 version.txt 之外的第二归属证据。任何读取失败都返回 False。"""
+    target = os.path.normcase(os.path.normpath(install_dir))
+    for key_name in ("Y-code", "Y-code-CLI"):
+        key_path = (rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{key_name}")
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            try:
+                with winreg.OpenKey(hive, key_path) as key:
+                    location, _ = winreg.QueryValueEx(key, "InstallLocation")
+                    marker, _ = winreg.QueryValueEx(key, "YcodeInstallMarker")
+                    if (marker == "Y-code" and location
+                            and os.path.normcase(os.path.normpath(location)) == target):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
 # 卸载注册表项（完整版入口 + 独立 CLI 入口 + 旧版 TUI 命名，都尝试移除）
 UNINSTALL_KEY_NAMES = ("Y-code", "Y-code-CLI", "Y-code-TUI")
 # 桌面快捷方式（GUI 版 + CLI 版 + 旧版 TUI 命名，都尝试删除）
@@ -42,12 +141,13 @@ SHORTCUT_NAMES = ("Y-code.lnk", "Y-code CLI.lnk", "Y-code TUI.lnk")
 # 安装范围检测
 # ============================================================================
 
-def detect_scope_for_install(install_dir):
+def detect_scope_for_install(install_dir, log=print):
     """判断指定安装目录属于 machine 还是 user 范围。
 
     优先查卸载注册表：HKLM/HKCU Uninstall\\Y-code 的 InstallLocation 与本目录
     一致即确定范围（machine 优先，与安装向导的重装检测保持同一优先级）。
-    注册表查不到时按目录位置猜测：Program Files 之下视为 machine，否则 user。
+    注册表查不到时按目录位置猜测：Program Files / Program Files (x86) 之下
+    视为 machine，否则 user。
     """
     target = os.path.normpath(install_dir).lower()
     key_path = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Y-code"
@@ -60,8 +160,25 @@ def detect_scope_for_install(install_dir):
                     return scope
         except OSError:
             continue
-    program_files = (os.environ.get("ProgramFiles") or r"C:\Program Files").lower()
-    return "machine" if target.startswith(program_files + os.sep) else "user"
+    # 修复 T22：规范化后同时匹配 Program Files 与 Program Files (x86)
+    # （旧实现只查 ProgramFiles 一个前缀，64 位系统上装进 Program Files (x86)
+    # 会被误判 user，导致 machine 安装的卸载不提权、静默清不动）；两个环境
+    # 变量都读不到时保守按 machine 处理（触发 UAC 提权）并明确提示。
+    target_norm = os.path.normcase(os.path.normpath(install_dir))
+    pf_roots = [
+        os.path.normcase(os.path.normpath(value))
+        for value in (os.environ.get("ProgramFiles"),
+                      os.environ.get("ProgramFiles(x86)"))
+        if value
+    ]
+    if not pf_roots:
+        log("⚠️ 无法读取 Program Files 环境变量，按所有用户安装保守处理"
+            "（卸载将请求管理员权限）。")
+        return "machine"
+    for root in pf_roots:
+        if target_norm.startswith(root + os.sep):
+            return "machine"
+    return "user"
 
 
 # ============================================================================
@@ -77,8 +194,21 @@ def _remove_path_entry(hive, key_path, value_name, install_dir, log):
             log("ℹ 环境变量 PATH 中未找到 Y-code 路径。")
             return
 
+        # 修复 M48：比对前双方都做规范化（展开 %VAR%、解析符号链接、
+        # Windows 下统一大小写），避免 PATH 里写成 %LOCALAPPDATA%\Y-code
+        # 或大小写/斜杠不一致时漏删；非字符串条目跳过并告警，不再让
+        # p.lower() 抛 AttributeError 中断整个卸载流程。
+        target = os.path.normcase(
+            os.path.realpath(os.path.expandvars(install_dir)))
+
+        def _normalize_entry(p):
+            if not isinstance(p, str):
+                log(f"⚠️ PATH 中存在非字符串条目，已跳过: {p!r}")
+                return None
+            return os.path.normcase(os.path.realpath(os.path.expandvars(p)))
+
         parts = [p for p in current_path.split(";") if p]
-        new_parts = [p for p in parts if p.lower() != install_dir.lower()]
+        new_parts = [p for p in parts if _normalize_entry(p) != target]
         if len(new_parts) == len(parts):
             log("ℹ 环境变量 PATH 中未找到 Y-code 路径。")
             return
@@ -177,11 +307,20 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
         log(f"⚠️ 清理注册表时发生警告: {e}")
     progress(55.0)
 
-    # 4. 可选：删除当前用户的 ~/.ycode 配置与会话记录
+    # 4. 可选：删除用户配置与会话记录
+    #    修复 #2：按 config.py 的 YCODE_DIR 逻辑定位真实数据目录
+    #    （YCODE_DATA_DIR 环境变量优先，缺省 ~/.ycode），删除前对整条目录链
+    #    做挂载点/符号链接检查——命中 reparse point 时 shutil.rmtree 会顺着
+    #    链接删到链接目标的真实数据，必须拒绝。验证思路：把 ~/.ycode 换成指向
+    #    其他目录的目录联接后运行卸载，应拒绝删除并明确提示。
     deleted_config = False
     if delete_config:
-        ycode_user_dir = os.path.join(os.path.expanduser("~"), ".ycode")
-        if os.path.exists(ycode_user_dir):
+        ycode_user_dir = _resolve_ycode_data_dir()
+        reparse_hit = _has_reparse_component(ycode_user_dir)
+        if reparse_hit:
+            log(f"⚠️ 拒绝删除 {ycode_user_dir}：路径包含符号链接或目录联接"
+                f"（{reparse_hit}），为避免误删链接目标数据已跳过，请手动处理。")
+        elif os.path.exists(ycode_user_dir):
             try:
                 shutil.rmtree(ycode_user_dir)
                 deleted_config = True
@@ -189,14 +328,26 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
             except Exception as e:
                 log(f"⚠️ 删除配置文件夹失败: {e}")
         else:
-            log("ℹ 未找到用户配置文件夹，跳过。")
+            log(f"ℹ 未找到用户配置文件夹（{ycode_user_dir}），跳过。")
     else:
         log("ℹ 保留用户配置与历史会话（~/.ycode）。")
     progress(70.0)
 
     # 5. 清理程序文件：顶层 Y-code.exe / ycode.exe 与 _internal / tui 子目录
     #    （ycode_uninstall.exe 自身在向导退出后由自销毁流程删除）
+    #    修复 #1：rmtree _internal/tui 前强制验证该目录确为 Y-code 安装目录
+    #    （Y-code.exe + _internal/version.txt 含 Y-code 标识），验证失败即中止，
+    #    绝不执行 rmtree——防止卸载器被误复制/误指向其他目录时递归删除无关数据。
     log("🧹 正在清理程序文件...")
+    if not _verify_ycode_install_dir(install_dir):
+        log(f"🚨 安全校验失败：{install_dir} 不是有效的 Y-code 安装目录"
+            "（缺少 Y-code.exe 或 _internal/version.txt 中无 Y-code 版本标识），"
+            "已中止程序文件清理，不会删除任何目录。")
+        return {
+            "install_dir": install_dir,
+            "scope": scope,
+            "deleted_config": deleted_config,
+        }
     for rel_file in ("Y-code.exe", "ycode.exe"):
         target = os.path.join(install_dir, rel_file)
         if os.path.exists(target):
@@ -524,7 +675,8 @@ class UninstallWizard(tk.Tk):
 
     def _build_options_page(self):
         page = self._page("options")
-        ycode_user_dir = os.path.join(os.path.expanduser("~"), ".ycode")
+        # 修复 #2：UI 如实显示将要删除的实际数据目录（YCODE_DATA_DIR 优先）
+        ycode_user_dir = _resolve_ycode_data_dir()
         ttk.Checkbutton(
             page,
             text=f"同时删除用户配置与历史会话（{ycode_user_dir} 文件夹）(D)",

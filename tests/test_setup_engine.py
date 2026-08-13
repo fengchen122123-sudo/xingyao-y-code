@@ -446,3 +446,101 @@ def test_parse_elevated_args():
     # user 范围 + 默认开关
     opts2 = ycode_setup._parse_elevated_args(["--elevated", "--dir=D:\\Y-code"])
     assert opts2 == {"scope": "user", "dir": "D:\\Y-code", "cli": True, "shortcut": True}
+
+
+# ── 审计修复回归：T21 / M46 / M47 ─────────────────────────────
+
+def test_parse_elevated_args_cli_10_is_not_true():
+    """T21：--cli=10 不得被误判为 True（旧实现 endswith("1") 的误判）。"""
+    opts = ycode_setup._parse_elevated_args(
+        ["--elevated", "--dir=D:\\Y-code", "--cli=10", "--shortcut=10"])
+    assert opts["cli"] is False
+    assert opts["shortcut"] is False
+    opts = ycode_setup._parse_elevated_args(
+        ["--elevated", "--dir=D:\\Y-code", "--cli=1", "--shortcut=1"])
+    assert opts["cli"] is True
+    assert opts["shortcut"] is True
+
+
+def test_copy_payload_rejects_symlink_target_file(tmp_path, monkeypatch):
+    """M46：目标文件自身是符号链接/挂载点时拒绝写入（目录链检查覆盖不到）。"""
+    bundle = _fake_bundle(tmp_path, as_zip=True)
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    victim = install_dir / "ycode.exe"
+    victim.write_text("old", encoding="utf-8")
+    real_islink = os.path.islink
+    monkeypatch.setattr(
+        ycode_setup.os.path,
+        "islink",
+        lambda path: os.path.normcase(os.path.abspath(path))
+        == os.path.normcase(os.path.abspath(str(victim)))
+        or real_islink(path),
+    )
+
+    with pytest.raises(InstallError, match="符号链接|目录联接"):
+        ycode_setup._copy_payload(
+            "zip", str(bundle / "ycode_pkg.zip"), str(install_dir),
+            tui_only=False, log=lambda m: None, progress=lambda p: None,
+        )
+
+    assert victim.read_text(encoding="utf-8") == "old"
+
+
+def test_copy_payload_rolls_back_created_files_on_failure(tmp_path, patched_env):
+    """M46：安装中途失败时回滚本次新创建的文件，不留半成品。"""
+    bundle = _fake_bundle(tmp_path, as_zip=True)
+    install_dir = tmp_path / "installed"
+    install_dir.mkdir()
+    # 让 Y-code.exe 的写入失败：预先创建同名目录，open(..., "wb") 会抛 IsADirectoryError
+    (install_dir / "Y-code.exe").mkdir()
+
+    with pytest.raises(Exception):
+        ycode_setup._copy_payload(
+            "zip", str(bundle / "ycode_pkg.zip"), str(install_dir),
+            tui_only=False, log=lambda m: None, progress=lambda p: None,
+        )
+
+    # ycode.exe 是本次新写入的文件，应被回滚删除；预置目录不动
+    assert not (install_dir / "ycode.exe").exists()
+    assert (install_dir / "Y-code.exe").is_dir()
+
+
+def test_overwrite_install_prunes_files_removed_in_new_version(tmp_path, patched_env):
+    """M46：覆盖安装时按上次清单清理新版已移除的旧文件。"""
+    bundle = _fake_bundle(tmp_path)
+    install_dir = str(tmp_path / "installed")
+    run_install("full", str(bundle),
+                InstallOptions(install_dir, install_cli=False, create_desktop_shortcut=False),
+                _startupinfo(), log=lambda m: None)
+    assert (tmp_path / "installed" / "_internal" / "core.dll").exists()
+
+    # 第二版载荷移除了 _internal/core.dll
+    bundle2 = tmp_path / "bundle2"
+    (bundle2 / "ycode_pkg" / "_internal").mkdir(parents=True)
+    (bundle2 / "ycode_pkg" / "ycode.exe").write_text("tui2", encoding="utf-8")
+    (bundle2 / "ycode_pkg" / "Y-code.exe").write_text("gui2", encoding="utf-8")
+    (bundle2 / "ycode_uninstall.exe").write_text("uninst", encoding="utf-8")
+    (bundle2 / "version.txt").write_text("9.9.10", encoding="utf-8")
+    run_install("full", str(bundle2),
+                InstallOptions(install_dir, install_cli=False, create_desktop_shortcut=False),
+                _startupinfo(), log=lambda m: None)
+
+    assert not (tmp_path / "installed" / "_internal" / "core.dll").exists()
+    assert (tmp_path / "installed" / "Y-code.exe").read_text() == "gui2"
+
+
+def test_is_unrecognized_non_empty_dir(tmp_path):
+    """M47：非空且无 Y-code 痕迹的目录才需要警告。"""
+    assert ycode_setup._is_unrecognized_non_empty_dir(str(tmp_path / "missing")) is False
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert ycode_setup._is_unrecognized_non_empty_dir(str(empty)) is False
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "readme.txt").write_text("x", encoding="utf-8")
+    assert ycode_setup._is_unrecognized_non_empty_dir(str(other)) is True
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    (existing / "Y-code.exe").write_text("gui", encoding="utf-8")
+    assert ycode_setup._is_unrecognized_non_empty_dir(str(existing)) is False

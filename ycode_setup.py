@@ -213,6 +213,8 @@ def write_uninstall_registry_key(app_key_name, display_name, version, install_di
         winreg.SetValueEx(key, "UninstallString", 0, winreg.REG_SZ, uninstall_string)
         winreg.SetValueEx(key, "DisplayIcon", 0, winreg.REG_SZ, display_icon)
         winreg.SetValueEx(key, "Publisher", 0, winreg.REG_SZ, "Y-code")
+        # 修复 M47：记录 Y-code 专用归属标记，供卸载侧校验安装目录归属（配合 High-1）
+        winreg.SetValueEx(key, "YcodeInstallMarker", 0, winreg.REG_SZ, "Y-code")
         winreg.SetValueEx(key, "NoModify", 0, winreg.REG_DWORD, 1)
         winreg.SetValueEx(key, "NoRepair", 0, winreg.REG_DWORD, 1)
 
@@ -259,9 +261,10 @@ def _parse_elevated_args(argv):
         elif arg.startswith("--dir="):
             opts["dir"] = arg[len("--dir="):].strip('"')
         elif arg.startswith("--cli="):
-            opts["cli"] = arg.endswith("1")
+            # 修复 T21：精确解析 = 后的值，避免 --cli=10 被 endswith("1") 误判为 True
+            opts["cli"] = arg.split("=", 1)[1] == "1"
         elif arg.startswith("--shortcut="):
-            opts["shortcut"] = arg.endswith("1")
+            opts["shortcut"] = arg.split("=", 1)[1] == "1"
     if not opts["dir"]:
         return None
     return opts
@@ -435,6 +438,27 @@ def _ensure_no_reparse_components(install_dir, destination):
     for candidate in candidates:
         if os.path.lexists(candidate) and _is_reparse_path(candidate):
             raise InstallError(f"安装路径包含符号链接或目录联接: {candidate}")
+    # 修复 M46：目标文件自身也可能是预置的符号链接/挂载点（目录链检查覆盖不到），
+    # 写入前用 lexists 校验（lexists 能发现悬空链接），命中即拒绝。
+    if os.path.lexists(destination) and _is_reparse_path(destination):
+        raise InstallError(f"安装目标文件是符号链接或目录联接: {destination}")
+
+
+def _is_unrecognized_non_empty_dir(install_dir):
+    """修复 M47：目标目录已存在、非空、且不含任何可识别的 Y-code 安装痕迹
+    （Y-code.exe / ycode.exe / ycode_uninstall.exe / _internal）时返回 True。
+    这类目录多半是用户的既有目录，装入后卸载有误删风险，需显式警告。"""
+    if not os.path.isdir(install_dir):
+        return False
+    try:
+        if not os.listdir(install_dir):
+            return False
+    except OSError:
+        return False
+    return not any(
+        os.path.exists(os.path.join(install_dir, marker))
+        for marker in ("Y-code.exe", "ycode.exe", "ycode_uninstall.exe", "_internal")
+    )
 
 
 class InstallOptions:
@@ -492,8 +516,54 @@ def _payload_names(kind, src, tui_only):
     return names
 
 
-def _copy_payload(kind, src, install_dir, tui_only, log, progress):
-    """带进度回调的载荷释放（占整体进度的 0~85%）。"""
+# 修复 M46：安装清单（记录本次释放的载荷相对路径），覆盖安装时据此清理
+# 旧版已移除的文件；放在 _internal 内，卸载时随 _internal 一起被 rmtree。
+INSTALL_MANIFEST_REL = "_internal/ycode_install_manifest.txt"
+
+
+def _install_manifest_path(install_dir):
+    return os.path.join(install_dir, *INSTALL_MANIFEST_REL.split("/"))
+
+
+def _prune_removed_payload(install_dir, new_names, log):
+    """修复 M46：覆盖安装时按上次安装清单清理新版已移除的旧文件，避免旧版
+    已删除的文件永久残留。只处理清单中记录、且不在新清单里的文件；清单被
+    篡改出越界路径时跳过，绝不出安装目录删文件。"""
+    manifest = _install_manifest_path(install_dir)
+    try:
+        with open(manifest, "r", encoding="utf-8") as f:
+            old_names = [line.strip() for line in f if line.strip()]
+    except OSError:
+        return
+    new_set = {name.replace("\\", "/") for name in new_names}
+    for rel in old_names:
+        if rel.replace("\\", "/") in new_set:
+            continue
+        try:
+            target = _safe_payload_path(install_dir, rel)
+        except InstallError:
+            continue
+        if os.path.isfile(target) or os.path.islink(target):
+            try:
+                os.remove(target)
+                log(f"ℹ 已清理旧版残留文件: {rel}")
+            except OSError as e:
+                log(f"⚠️ 清理旧版残留文件 {rel} 失败: {e}")
+
+
+def _write_install_manifest(install_dir, names):
+    manifest = _install_manifest_path(install_dir)
+    os.makedirs(os.path.dirname(manifest), exist_ok=True)
+    with open(manifest, "w", encoding="utf-8", newline="\n") as f:
+        f.write("\n".join(name.replace("\\", "/") for name in names) + "\n")
+
+
+def _copy_payload(kind, src, install_dir, tui_only, log, progress, manage_manifest=True):
+    """带进度回调的载荷释放（占整体进度的 0~85%）。
+
+    manage_manifest=False（tui 合并进已有完整版安装）时不清理也不覆盖安装清单，
+    避免按 CLI 子集清单误删 GUI 专属文件。
+    """
     names = _payload_names(kind, src, tui_only)
     # 在创建任何目录/文件前完成全部成员校验，非法载荷不得留下部分安装。
     destinations = [_safe_payload_path(install_dir, rel) for rel in names]
@@ -502,21 +572,40 @@ def _copy_payload(kind, src, install_dir, tui_only, log, progress):
     # Existing reparse points are rejected before the first payload byte is written.
     for dest in destinations:
         _ensure_no_reparse_components(install_dir, dest)
-    if kind == "zip":
-        import zipfile
-        with zipfile.ZipFile(src) as zf:
+    if manage_manifest:
+        _prune_removed_payload(install_dir, names, log)
+    # 修复 M46：记录本次新创建的文件，中途失败时回滚删除，避免半成品残留
+    # （已存在被覆盖的旧文件无法无损恢复，不在回滚范围内）。
+    created = []
+    try:
+        if kind == "zip":
+            import zipfile
+            with zipfile.ZipFile(src) as zf:
+                for idx, (rel, dest) in enumerate(zip(names, destinations), 1):
+                    os.makedirs(os.path.dirname(dest), exist_ok=True)
+                    _ensure_no_reparse_components(install_dir, dest)
+                    if not os.path.lexists(dest):
+                        created.append(dest)
+                    with open(dest, "wb") as f:
+                        f.write(zf.read(rel))
+                    progress(idx / total * 85.0)
+        else:
             for idx, (rel, dest) in enumerate(zip(names, destinations), 1):
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 _ensure_no_reparse_components(install_dir, dest)
-                with open(dest, "wb") as f:
-                    f.write(zf.read(rel))
+                if not os.path.lexists(dest):
+                    created.append(dest)
+                shutil.copy2(os.path.join(src, rel), dest)
                 progress(idx / total * 85.0)
-    else:
-        for idx, (rel, dest) in enumerate(zip(names, destinations), 1):
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            _ensure_no_reparse_components(install_dir, dest)
-            shutil.copy2(os.path.join(src, rel), dest)
-            progress(idx / total * 85.0)
+    except Exception:
+        for path in created:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        raise
+    if manage_manifest:
+        _write_install_manifest(install_dir, names)
     log(f"✔ 核心程序包及依赖成功释放到: {install_dir}")
 
 
@@ -544,7 +633,8 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
         log("🚀 正在安装程序核心依赖与组件...")
     try:
         _copy_payload(payload_kind, payload_src, install_dir,
-                      tui_only=(mode == "tui"), log=log, progress=progress)
+                      tui_only=(mode == "tui"), log=log, progress=progress,
+                      manage_manifest=not (mode == "tui" and merging_into_full))
     except InstallError:
         raise
     except Exception as e:
@@ -1070,6 +1160,19 @@ class SetupWizard(tk.Tk):
         if not install_dir:
             messagebox.showwarning("Y-code 安装", "请先选择有效的安装位置。", parent=self)
             return
+        # 修复 M47：user 范围安装目录无位置约束，可装进任意已有非空目录；
+        # 目标非空且不像既有 Y-code 安装时先警告（重装/提权重启前已确认过，跳过）。
+        if (not self.elevated_options and not self.previous_install
+                and _is_unrecognized_non_empty_dir(install_dir)):
+            if not messagebox.askyesno(
+                "Y-code 安装",
+                f"所选目录已存在且不为空：\n{install_dir}\n\n"
+                "继续安装会把 Y-code 文件写入该目录。为安全起见，建议改用空目录。\n\n"
+                "是否继续安装到该目录？",
+                icon="warning",
+                parent=self,
+            ):
+                return
         scope = "user" if self.mode == "tui" else self.var_scope.get()
         options = InstallOptions(
             install_dir=install_dir,

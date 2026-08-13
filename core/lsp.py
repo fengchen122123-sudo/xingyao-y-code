@@ -97,6 +97,10 @@ def find_definition(symbol, dir_path='.', file_extensions=None):
 
     if not symbol or not symbol.replace('_', '').isalnum():
         return f"🚨 符号名只能包含字母、数字、下划线：{symbol!r}"
+    # 符号名会被逐条拼进所有语言定义正则并合并为一个大的 alternation，
+    # 限制长度避免构造巨型正则拖垮 ripgrep 编译/搜索
+    if len(symbol) > 128:
+        return f"🚨 符号名过长（{len(symbol)} 字符，上限 128）"
 
     cache_key = _tool_cache.search_key("find_definition", symbol, dir_path, tuple(file_extensions) if file_extensions else None)
     cached = _tool_cache.search_get(cache_key)

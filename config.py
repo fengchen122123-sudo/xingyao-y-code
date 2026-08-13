@@ -30,10 +30,20 @@ def _prepare_for_storage(path, data):
     return _transform_api_keys(data, protect_secret)
 
 
+def _unprotect_api_key_safely(value):
+    """单个 provider 的 api_key 解密失败（DPAPI blob 损坏/跨账户）时置空该 key 并告警，
+    绝不让单点解密失败被误归类为整份配置损坏而触发 .bak 恢复甚至静默降级为默认值。"""
+    try:
+        return unprotect_secret(value)
+    except Exception as error:
+        _log_warning("config.json 中某个 provider 的 api_key 解密失败（%s），已置空该 key，其余配置保留", error)
+        return ""
+
+
 def _restore_after_read(path, data):
     if os.path.abspath(path) != os.path.abspath(_CONFIG_FILE):
         return data
-    return _transform_api_keys(data, unprotect_secret)
+    return _transform_api_keys(data, _unprotect_api_key_safely)
 
 
 def _backup_if_valid(path):
@@ -80,13 +90,21 @@ def _atomic_write_json(path, data, indent=2):
 _CONFIG_CACHE: dict[str, dict] = {}
 
 
+def _copy_cached(data):
+    """缓存命中时返回浅拷贝：调用方原地修改（如 update_config 的 mutator）
+    不应污染缓存，否则后续读取会看到未持久化的脏数据。"""
+    if isinstance(data, (dict, list)):
+        return data.copy()
+    return data
+
+
 def _read_json_with_backup(path, default=None):
     """读取 JSON；使用 mtime 缓存，仅在磁盘文件真正改变时才重新读取磁盘，极大提升多窗口/高频刷新性能。"""
     try:
         current_mtime = os.path.getmtime(path)
         cache_entry = _CONFIG_CACHE.setdefault(path, {"mtime": 0, "data": None})
         if cache_entry["data"] is not None and cache_entry["mtime"] == current_mtime:
-            return cache_entry["data"]
+            return _copy_cached(cache_entry["data"])
         with open(path, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
             data = _restore_after_read(path, raw_data)
@@ -103,7 +121,7 @@ def _read_json_with_backup(path, default=None):
                     _atomic_write_json(path, data)
             cache_entry["mtime"] = current_mtime
             cache_entry["data"] = data
-            return data
+            return _copy_cached(data)
     except FileNotFoundError:
         return default
     except (json.JSONDecodeError, OSError):
@@ -144,6 +162,8 @@ if not os.path.exists(_CONFIG_FILE):
     if os.path.exists(default_config_path):
         try:
             shutil.copy(default_config_path, _CONFIG_FILE)
+            # 源码目录遗留的 config.json 会被复制为用户配置，必须留下日志而非静默搬运
+            _log_warning("已从源码目录 %s 复制初始配置到 %s", default_config_path, _CONFIG_FILE)
         except Exception:
             pass
     if not os.path.exists(_CONFIG_FILE):

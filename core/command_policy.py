@@ -20,6 +20,26 @@ _QUERY_FLAGS = {"-v", "--version", "-version", "-h", "--help"}
 _UNSAFE_COMMAND_TEXT = (";", "&", "|", "<", ">", "`", "\r", "\n", "$(")
 _PYTHON_OR_PIP = re.compile(r"(?:python|pip)(?:\d+(?:\.\d+)*)?(?:\.exe)?\Z", re.IGNORECASE)
 
+# ---------------------------------------------------------------------------
+# 敏感信息脱敏：命令回显/日志/持久化前屏蔽内联凭据，
+# 避免 export TOKEN=sk-... 这类命令把密钥明文喂回模型或写入磁盘记录
+# ---------------------------------------------------------------------------
+_SK_KEY_RE = re.compile(r"\bsk-[A-Za-z0-9_-]{4,}")
+_SENSITIVE_KV_RE = re.compile(
+    r"(?i)\b(api[_-]?key|access[_-]?token|auth[_-]?token|token|secret|password|passwd|pwd)"
+    r"(\s*[=:]\s*['\"]?)([^\s'\";&|]+)"
+)
+_BEARER_RE = re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}")
+
+
+def redact_sensitive_text(text):
+    """对命令/日志文本中的内联凭据做脱敏（替换为 ***）。"""
+    redacted = str(text or "")
+    redacted = _SK_KEY_RE.sub("sk-***", redacted)
+    redacted = _SENSITIVE_KV_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", redacted)
+    redacted = _BEARER_RE.sub(lambda m: f"{m.group(1)}***", redacted)
+    return redacted
+
 _CATASTROPHIC_COMMAND_PATTERNS = (
     re.compile(r":\s*\(\s*\)\s*\{\s*:\s*\|:\s*&\s*\}\s*;\s*:", re.IGNORECASE),
     re.compile(
@@ -30,6 +50,22 @@ _CATASTROPHIC_COMMAND_PATTERNS = (
     re.compile(r"\bmkfs(?:\.[a-z0-9]+)?\s+", re.IGNORECASE),
     re.compile(
         r"\b(?:curl|wget)\b[^\r\n|]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|ksh)\b",
+        re.IGNORECASE,
+    ),
+    # 下载后交给脚本解释器执行（sh 家族之外的变体）
+    re.compile(
+        r"\b(?:curl|wget)\b[^\r\n|]*\|\s*(?:sudo\s+)?(?:python\d*(?:\.exe)?|perl|ruby)\b",
+        re.IGNORECASE,
+    ),
+    # base64 解码后管道执行：载荷被编码混淆，静态审查不可见
+    re.compile(
+        r"\bbase64\b[^\r\n|]*(?:\s-d\b|--decode\b)[^\r\n]*\|\s*(?:sudo\s+)?"
+        r"(?:sh|bash|zsh|ksh|python\d*(?:\.exe)?|perl)\b",
+        re.IGNORECASE,
+    ),
+    # PowerShell -EncodedCommand：base64 载荷无法静态审查，一律视为危险
+    re.compile(
+        r"\b(?:powershell|pwsh)(?:\.exe)?\b[^\r\n]*\s-(?:enc|ec|encodedcommand)\b",
         re.IGNORECASE,
     ),
     re.compile(r"^\s*(?:format(?:\.com)?\s+[a-z]:|reboot\b|halt\b|poweroff\b|shutdown\s+(?:/s|/r|-h|-r)\b)", re.IGNORECASE),
@@ -62,8 +98,11 @@ def _dangerous_rm(segment):
             force |= "f" in flags
         else:
             targets.append(token)
+    # 灾难性目标：根路径/家目录/通配符，以及纯变量展开目标（$VAR/${VAR}/%VAR%）。
+    # 纯变量目标的实际取值静态不可见，递归强制删除等同于未审查的 rm -rf /。
     catastrophic_target = re.compile(
-        r"^(?:/(?:\*|\.\*|\?)?|~(?:/(?:\*|\.\*|\?))?|\$HOME(?:/(?:\*|\.\*|\?))?|\.(?:/(?:\*|\.\*|\?))?|\*|\.\*|\?)$",
+        r"^(?:/(?:\*|\.\*|\?)?|~(?:/(?:\*|\.\*|\?))?|\$HOME(?:/(?:\*|\.\*|\?))?|\.(?:/(?:\*|\.\*|\?))?|\*|\.\*|\?"
+        r"|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%)$",
         re.IGNORECASE,
     )
     return recursive and force and any(catastrophic_target.fullmatch(t) for t in targets)

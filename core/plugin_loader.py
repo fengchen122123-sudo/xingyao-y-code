@@ -17,10 +17,19 @@
 
 插件内兄弟模块请用 import_sibling(__file__, "module_name") 加载，
 避免不同插件间的同名模块在 sys.modules 中互相覆盖。
+
+信任机制（首次加载确认）：
+- 插件以进程全权限执行，加载前按目录内容指纹（文件哈希）判定是否已获信任；
+- 内置 plugins/ 目录随仓库发布，视为用户自己的代码：记录指纹并自动信任；
+- 用户级 ~/.ycode/plugins/ 首次见到或指纹变化时必须确认：交互终端弹出
+  [y/N] 确认（入口层可用 set_trust_prompt 注册自定义确认回调）；
+  非交互/headless 环境默认跳过加载并 logger.warning 提示；
+- 已确认指纹持久化到 ~/.ycode/plugin_trust.json（YCODE_DATA_DIR 优先）。
 """
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -42,9 +51,133 @@ def get_plugin_infos() -> list[dict]:
     """返回最近一次插件扫描的信息列表（dict 副本，调用方修改不影响内部状态）。
 
     每条记录字段：name / version / description / path / source(user|builtin) /
-    status(loaded|disabled|failed|overridden) / tools(list[str]) / error(可选)。
+    status(loaded|disabled|failed|overridden|untrusted) / tools(list[str]) / error(可选)。
     """
     return [dict(info) for info in _PLUGIN_INFOS]
+
+
+# ─── 插件信任机制：首次加载/指纹变化需确认 ─────────────────────────
+
+# 已确认指纹持久化文件：{str(plugin_dir.resolve()): fingerprint}
+def _trust_file() -> Path:
+    try:
+        import config
+        return Path(config.YCODE_DIR) / "plugin_trust.json"
+    except Exception:
+        return Path.home() / ".ycode" / "plugin_trust.json"
+
+
+def _load_trust_store() -> dict:
+    try:
+        with open(_trust_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items()}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_trust_store(store: dict) -> None:
+    try:
+        path = _trust_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+    except Exception as exc:
+        _logger.warning("插件信任记录写入失败: %s", exc)
+
+
+def _plugin_fingerprint(plugin_dir: Path) -> str:
+    """计算插件目录内容指纹：所有文件（跳过 __pycache__/.pyc）的路径+内容哈希。"""
+    digest = hashlib.sha256()
+    for path in sorted(plugin_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(plugin_dir).as_posix()
+        if "__pycache__" in rel.split("/") or rel.endswith(".pyc"):
+            continue
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def _is_builtin_plugin(plugin_dir: Path) -> bool:
+    """判断是否内置插件目录（plugin_dirs() 中除首个用户目录外的任何目录之下）。"""
+    try:
+        resolved = plugin_dir.resolve()
+    except OSError:
+        resolved = plugin_dir
+    for base in plugin_dirs()[1:]:
+        try:
+            if resolved.is_relative_to(base.resolve()):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+# 插件信任确认回调：callback(path, name, fingerprint) -> bool；
+# None 时用默认行为（交互终端 input 确认，headless 拒绝）。
+_trust_prompt = None
+
+
+def set_trust_prompt(callback) -> None:
+    """注册插件信任确认回调（供入口层接入 TUI/GUI 弹窗）；传 None 恢复默认。"""
+    global _trust_prompt
+    _trust_prompt = callback
+
+
+def _confirm_plugin_trust(plugin_dir: Path, name: str, fingerprint: str) -> bool:
+    callback = _trust_prompt
+    if callback is not None:
+        try:
+            return bool(callback(str(plugin_dir), name, fingerprint))
+        except Exception:
+            return False
+    # 默认：交互终端（TUI）弹确认；非交互/headless 环境直接拒绝
+    if sys.stdin is not None and sys.stdout is not None \
+            and sys.stdin.isatty() and sys.stdout.isatty():
+        try:
+            print(f"\n[插件安全确认] 插件 {name} 首次加载或内容已变化: {plugin_dir}")
+            print("  插件代码将以 ycode 进程的全部权限执行，请确认来源可信。")
+            answer = input("  信任并加载该插件？[y/N] ").strip().lower()
+            return answer in ("y", "yes")
+        except (EOFError, OSError, KeyboardInterrupt):
+            return False
+    return False
+
+
+def _check_plugin_trusted(plugin_dir: Path, name: str) -> bool:
+    """判定插件是否可加载：内置自动信任；用户级按指纹确认，未确认拒绝。"""
+    try:
+        fingerprint = _plugin_fingerprint(plugin_dir)
+    except OSError as exc:
+        _logger.warning("插件 %s 指纹计算失败，已跳过: %s", name, exc)
+        return False
+    key = str(plugin_dir.resolve())
+    store = _load_trust_store()
+    if _is_builtin_plugin(plugin_dir):
+        # 内置插件随仓库发布，视为用户自己的代码：记录指纹并自动信任
+        if store.get(key) != fingerprint:
+            store[key] = fingerprint
+            _save_trust_store(store)
+        return True
+    if store.get(key) == fingerprint:
+        return True
+    if _confirm_plugin_trust(plugin_dir, name, fingerprint):
+        store[key] = fingerprint
+        _save_trust_store(store)
+        _logger.info("插件 %s 已确认信任并记录指纹", name)
+        return True
+    _logger.warning(
+        "插件 %s (%s) 未获信任，已跳过加载。"
+        "在交互终端启动 ycode 时会弹出信任确认；或在确认来源可信后重试。",
+        name, plugin_dir,
+    )
+    return False
 
 
 def _user_plugin_dir() -> Path:
@@ -104,6 +237,12 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
     if registry is not None:
         try:
             if enabled:
+                # 启用即加载：未获信任的插件拒绝热加载（信任持久化不受影响）
+                if not _check_plugin_trusted(target, name):
+                    return False, (
+                        f"插件 {name} 未通过信任确认，已拒绝热加载"
+                        "（在交互终端重启 ycode 时会弹出信任确认）"
+                    )
                 # 先卸下同名旧工具，避免重复开关时 duplicate 报错
                 for info in _PLUGIN_INFOS:
                     if info.get("name") == name:
@@ -261,6 +400,11 @@ def refresh_plugins(registry=None) -> None:
                 taken_names.add(plugin_name)
                 _PLUGIN_INFOS.append(info)
                 continue
+            if meta.get("enabled", True) is not False and not _check_plugin_trusted(child, plugin_name):
+                info["status"] = "untrusted"
+                taken_names.add(plugin_name)
+                _PLUGIN_INFOS.append(info)
+                continue
             before_tools = {s.name for s in registry.all()}
             try:
                 name = _load_one(child, registry)
@@ -320,6 +464,11 @@ def load_and_register(registry) -> list[str]:
             }
             if plugin_name in seen:
                 info["status"] = "overridden"
+                _PLUGIN_INFOS.append(info)
+                continue
+            if meta.get("enabled", True) is not False and not _check_plugin_trusted(child, plugin_name):
+                info["status"] = "untrusted"
+                seen.add(plugin_name)
                 _PLUGIN_INFOS.append(info)
                 continue
             before_tools = {s.name for s in registry.all()}

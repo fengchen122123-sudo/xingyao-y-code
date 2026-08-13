@@ -160,3 +160,71 @@ def test_get_dir_children_scans_one_level_on_demand(tmp_path):
     assert res["children"] == []
     res = bridge.get_dir_children(str(tmp_path / "no_such_dir"))
     assert res["ok"] is False
+
+
+class _AliveThread:
+    """模拟存活的回合线程（is_alive 恒真）。"""
+
+    def is_alive(self):
+        return True
+
+
+def test_delete_session_refused_while_turn_active():
+    """M21：回合运行中删除会话必须拒绝，否则回合线程继续写已删会话（幽灵数据）。"""
+    bridge = _bare_gui_bridge()
+    bridge._memory.create_session_explicit("活会话", workdir="GLOBAL", source="GUI")
+    bridge._active_turns = {"活会话": _AliveThread()}
+
+    res = bridge.delete_session("活会话")
+
+    assert res["ok"] is False and res["success"] is False
+    assert "运行" in res["msg"]
+    assert any(s.get("name") == "活会话" for s in bridge._memory.get_all_sessions(workdir=None, include_empty=True))
+
+
+def test_rename_session_refused_while_turn_active():
+    """M21：回合运行中重命名必须拒绝，否则终态事件带旧名导致前端状态失配。"""
+    bridge = _bare_gui_bridge()
+    bridge._memory.create_session_explicit("旧名", workdir="GLOBAL", source="GUI")
+    bridge._active_turns = {"旧名": _AliveThread()}
+
+    res = bridge.rename_session("旧名", "新名")
+
+    assert res["ok"] is False and res["name"] == "旧名"
+    assert any(s.get("name") == "旧名" for s in bridge._memory.get_all_sessions(workdir=None, include_empty=True))
+
+
+def test_terminal_command_normalizes_global_workdir(monkeypatch, tmp_path):
+    """M19：GLOBAL 自由对话的内嵌终端不能把字符串 "GLOBAL" 当 Popen cwd。"""
+    import subprocess
+
+    bridge = _bare_gui_bridge()
+    bridge._current_session = "global-session"
+    bridge._term_proc = None
+    bridge._term_lock = __import__("threading").Lock()
+    bridge._session_workdir = lambda _session: "GLOBAL"
+    bridge.emit_event = lambda _kind, _data: None
+
+    monkeypatch.chdir(tmp_path)
+    captured = {}
+
+    class FakeProc:
+        def __init__(self):
+            self.stdout = type("Out", (), {"readline": lambda self: b""})()
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            return 0
+
+    def fake_popen(command, **kwargs):
+        captured.update(kwargs)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+
+    res = bridge.run_terminal_command("echo hi")
+
+    assert res["ok"] is True
+    assert captured["cwd"] == gui_bridge._resolve_real_path(str(tmp_path))

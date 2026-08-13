@@ -17,7 +17,15 @@ def load_keepalive_interval() -> int:
     from core.model_manager import load_config
 
     raw = load_config().get("prompt_cache_keepalive_seconds", 120)
-    interval = int(raw or 0)
+    try:
+        interval = int(raw or 0)
+    except (TypeError, ValueError):
+        # 配置写成 "abc" 这类非法值时不能抛穿 register_request（每轮对话都会调用），
+        # 回落默认间隔并告警
+        logger.warning(
+            "prompt_cache_keepalive_seconds 配置非法: %r，已回落默认 120 秒", raw
+        )
+        interval = 120
     if interval < 0:
         raise ValueError("prompt_cache_keepalive_seconds 不能为负数")
     if 0 < interval < MIN_KEEPALIVE_SECONDS:

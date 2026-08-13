@@ -4,6 +4,7 @@ core/mcp_selector.py
 支持浏览/启用/禁用/新增/删除 MCP server，无需手动编辑 JSON。
 仿照 skill_selector.py 的实现风格。
 """
+import os
 import subprocess
 import sys
 
@@ -114,9 +115,11 @@ PRESET_MCPS = [
     {
         "name": "postgres",
         "command": "npx",
-        "args": ["-y", "@modelcontextprotocol/server-postgres", "{{connStr}}"],
+        "args": ["-y", "@modelcontextprotocol/server-postgres"],
         "fields": [
-            {"name": "connStr", "hint": "postgresql://user:pass@host:5432/db", "secret": True},
+            # DSN 含密码，走 env 传递（env 值写盘前会被 DPAPI 加密）；
+            # 放 args 会暴露在子进程命令行中（可被 WMI 读取）
+            {"name": "POSTGRES_CONNECTION_STRING", "hint": "postgresql://user:pass@host:5432/db", "secret": True},
         ],
         "desc": "PostgreSQL 数据库（只读查询/Schema 查看）",
         "signup_url": "https://github.com/modelcontextprotocol/servers/tree/main/src/postgres",
@@ -188,10 +191,21 @@ def _get_preset_fields(preset):
     return []
 
 
+def _expand_arg(arg):
+    """展开参数中的环境变量与用户目录（$HOME、~、%VAR%）。
+    修复 filesystem 等预设里 $HOME 在 Windows 下按字面量传给子进程的问题。"""
+    if not isinstance(arg, str):
+        return arg
+    if arg in ("$HOME", "${HOME}", "~"):
+        return os.path.expanduser("~")
+    return os.path.expandvars(os.path.expanduser(arg))
+
+
 def _build_server_config(preset, values):
     """根据预设和用户输入值，组装最终的 args/env。
     - args 中的 {{fieldName}} 占位符会被替换为用户输入值
     - 未在 args 中出现的字段值，会被写入 env[fieldName]
+    - args 中的 $HOME / ~ / %VAR% 会展开为实际路径
     """
     args = list(preset.get("args", []))
     env = {}
@@ -203,6 +217,7 @@ def _build_server_config(preset, values):
             args = [a.replace(placeholder, val) if isinstance(a, str) else a for a in args]
         else:
             env[name] = val
+    args = [_expand_arg(a) for a in args]
     return args, env
 
 

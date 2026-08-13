@@ -1,5 +1,7 @@
 from core.gui_lifecycle import ApplicationLifecycle
 
+import time
+
 
 class FakeWindow:
     def __init__(self):
@@ -42,6 +44,16 @@ class FakeTray:
         self.stopped += 1
 
 
+def _wait_for(predicate, timeout=5.0):
+    """exit_application 的 stop+destroy 序列在独立线程执行，测试轮询等待完成。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def test_close_hides_to_ready_tray_and_tray_exit_is_idempotent():
     window = FakeWindow()
     tray = FakeTray()
@@ -61,9 +73,9 @@ def test_close_hides_to_ready_tray_and_tray_exit_is_idempotent():
     lifecycle.exit_application()
 
     assert window.shown == 1
+    assert _wait_for(lambda: window.destroyed == 1)
     assert shutdown_calls == ["shutdown"]
     assert tray.stopped == 1
-    assert window.destroyed == 1
 
 
 def test_tray_start_failure_never_hides_the_only_window():

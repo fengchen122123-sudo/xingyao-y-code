@@ -7,9 +7,61 @@ import os
 import sys
 import json
 import socket
+import threading
+from pathlib import Path
 import webview
 from gui_bridge import ApiBridge
 from core.gui_lifecycle import ApplicationLifecycle
+
+
+def _configure_runtime_logging():
+    """GUI 滚动运行日志：打包版无控制台，logger/stderr 输出全部丢失，
+    出问题无从诊断。落 ~/.ycode/logs/gui-runtime.log（2MB x 3 滚动）。"""
+    try:
+        import logging
+        from logging.handlers import RotatingFileHandler
+
+        log_dir = Path(
+            os.environ.get("YCODE_DATA_DIR") or (Path.home() / ".ycode")
+        ) / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        target = log_dir / "gui-runtime.log"
+
+        root = logging.getLogger()
+        for handler in root.handlers:
+            if getattr(handler, "_ycode_gui_runtime_handler", False):
+                return  # 已配置，防重复调用
+        handler = RotatingFileHandler(
+            target, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+        )
+        setattr(handler, "_ycode_gui_runtime_handler", True)
+        handler.setFormatter(
+            logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s")
+        )
+        handler.setLevel(logging.INFO)
+        root.addHandler(handler)
+        if root.level == logging.NOTSET or root.level > logging.INFO:
+            root.setLevel(logging.INFO)
+
+        logger = logging.getLogger("gui_main")
+
+        def _excepthook(exc_type, exc, tb):
+            logger.error("未捕获异常", exc_info=(exc_type, exc, tb))
+
+        def _thread_excepthook(args):
+            logger.error(
+                "线程 %s 未捕获异常",
+                getattr(args.thread, "name", "?"),
+                exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+            )
+
+        sys.excepthook = _excepthook
+        threading.excepthook = _thread_excepthook
+        logger.info("GUI 运行日志初始化: %s", target)
+    except Exception:
+        # 日志初始化失败绝不能影响启动
+        pass
+
 
 def is_port_open(host="127.0.0.1", port=5173) -> bool:
     """检查 Vite 开发服务器端口 5173 是否处于打开监听状态"""
@@ -125,6 +177,7 @@ def _start_preload_thread():
 
 
 def main():
+    _configure_runtime_logging()
     # 显式传入真正的 MCP 单例，避免桥接层拿到空的 MCP 管理器
     try:
         from core.mcp_client import mcp_manager
@@ -197,7 +250,6 @@ def main():
         except Exception:
             pass
 
-    import threading
     threading.Thread(target=_register_dnd, daemon=True, name="gui-dnd-register").start()
 
     # 启动 WebView 消息主循环（默认关闭开发者工具，YCODE_GUI_DEBUG=1 时打开）
