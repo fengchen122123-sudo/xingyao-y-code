@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
 from concurrent.futures import Future, TimeoutError as _FutureTimeoutError
 from copy import deepcopy
+from typing import Dict, List
 
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
 # （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
@@ -2031,6 +2032,135 @@ def _is_official_deepseek_route(api_base=""):
     }
 
 
+def _uses_deepseek_prompt_ledger(
+    model_name, api_base, cache_scope, persist, parent_session
+):
+    """Select the isolated ledger only for official DeepSeek main sessions."""
+    return bool(
+        persist
+        and parent_session
+        and str(cache_scope or "main") == "main"
+        and _is_deepseek_family(model_name, api_base)
+        and _is_official_deepseek_route(api_base)
+    )
+
+
+def _select_request_tools_for_route(model_name, api_base, tools):
+    """Canonicalize only DeepSeek tools; preserve every other provider payload."""
+    if not (
+        _is_deepseek_family(model_name, api_base)
+        and _is_official_deepseek_route(api_base)
+    ):
+        return tools
+    selected = deepcopy(list(tools or []))
+    return sorted(
+        selected,
+        key=lambda tool: str(tool.get("function", {}).get("name") or ""),
+    )
+
+
+def _deepseek_stable_header_matches(generation, current_messages, current_tools):
+    """Compare the stable request header represented by this OpenAI payload."""
+    if generation["tools"] != current_tools:
+        return False
+    old_messages = generation["messages"]
+    if not old_messages or not current_messages:
+        return old_messages == current_messages
+    old_system = old_messages[0] if old_messages[0].get("role") == "system" else None
+    current_system = (
+        current_messages[0] if current_messages[0].get("role") == "system" else None
+    )
+    return old_system == current_system
+
+
+def _new_tail_after_ledger_prefix(ledger_messages, current_messages):
+    """Return the append-only tail without trusting rewritten normal history.
+
+    The common case is a literal prefix.  After normal-history maintenance, the
+    immutable ledger prefix may no longer occur in full; in that case its final
+    message must occur exactly once in the current request and acts as the
+    explicit hand-off boundary.  Ambiguous or missing boundaries fail loudly.
+    """
+    if current_messages[:len(ledger_messages)] == ledger_messages:
+        return deepcopy(current_messages[len(ledger_messages):])
+    if not ledger_messages:
+        return deepcopy(current_messages)
+    boundary = ledger_messages[-1]
+    matches = [
+        index for index, message in enumerate(current_messages)
+        if message == boundary
+    ]
+    if len(matches) != 1:
+        raise RuntimeError(
+            "DeepSeek prompt 账本无法与当前历史建立唯一追加边界"
+        )
+    return deepcopy(current_messages[matches[0] + 1:])
+
+
+def _prepare_deepseek_ledger_request(
+    manager, session_name, model_name, api_base, cache_scope, messages, tools,
+    *, force_new=False
+):
+    """Build and persist the immutable request view for one DeepSeek call."""
+    generation = manager.get_or_create_deepseek_prompt_generation(
+        session_name,
+        model_name,
+        api_base,
+        cache_scope,
+        deepcopy(messages),
+        deepcopy(tools),
+        force_new=force_new,
+    )
+    if generation.get("created"):
+        return {
+            "generation_id": generation["id"],
+            "messages": generation["messages"],
+            "tools": generation["tools"],
+        }
+    if not _deepseek_stable_header_matches(generation, messages, tools):
+        generation = manager.get_or_create_deepseek_prompt_generation(
+            session_name,
+            model_name,
+            api_base,
+            cache_scope,
+            deepcopy(messages),
+            deepcopy(tools),
+            force_new=True,
+        )
+        return {
+            "generation_id": generation["id"],
+            "messages": generation["messages"],
+            "tools": generation["tools"],
+        }
+    try:
+        tail = _new_tail_after_ledger_prefix(generation["messages"], messages)
+    except RuntimeError:
+        generation = manager.get_or_create_deepseek_prompt_generation(
+            session_name,
+            model_name,
+            api_base,
+            cache_scope,
+            deepcopy(messages),
+            deepcopy(tools),
+            force_new=True,
+        )
+        return {
+            "generation_id": generation["id"],
+            "messages": generation["messages"],
+            "tools": generation["tools"],
+        }
+    if tail:
+        manager.append_deepseek_prompt_messages(
+            generation["id"], tail, expected_count=len(generation["messages"])
+        )
+        generation["messages"].extend(tail)
+    return {
+        "generation_id": generation["id"],
+        "messages": generation["messages"],
+        "tools": generation["tools"],
+    }
+
+
 def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
     if not _is_deepseek_family(model_name, api_base):
         return False
@@ -2277,19 +2407,17 @@ def _strip_media_and_merge(messages, model_name=None, api_base=""):
             cleaned_msg["reasoning_content"] = msg["reasoning_content"]
         if keep_reasoning_fields and keep_thinking_blocks and msg.get("thinking_blocks") is not None:
             cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
-        # DeepSeek thinking 契约：带 tool_calls 的 assistant 必须携带模型返回的
-        # 完整 reasoning_content。缺失/空值无法重建，必须立即暴露，禁止补空串。
+        # DeepSeek thinking 契约：带 tool_calls 的 assistant 必须携带
+        # reasoning_content 字符串字段。供应商可能不产生 reasoning delta，
+        # 此时流组装层会保留显式空串；字段缺失、None 或类型错误仍立即暴露。
         if (
             role == "assistant"
             and cleaned_msg.get("tool_calls")
             and _requires_tool_call_reasoning(model_name, api_base)
-            and (
-                not isinstance(cleaned_msg.get("reasoning_content"), str)
-                or not cleaned_msg["reasoning_content"].strip()
-            )
+            and not isinstance(cleaned_msg.get("reasoning_content"), str)
         ):
             raise ValueError(
-                "DeepSeek thinking 工具轮缺少完整 reasoning_content，"
+                "DeepSeek thinking 工具轮缺少 reasoning_content 字符串字段，"
                 "无法安全继续请求"
             )
 
@@ -3993,8 +4121,19 @@ def _chat_with_model_generator(
         or schema.get("function", {}).get("name") not in _MCP_ADMIN_TOOLS
     ]
 
+    request_tools = _select_request_tools_for_route(
+        model_name, api_base, request_tools
+    )
     request_tool_contract = _tool_contract_fingerprint(request_tools)
     telemetry_session_id = _resolve_cache_session_identity(cache_session_id)
+    deepseek_ledger_enabled = _uses_deepseek_prompt_ledger(
+        model_name, api_base, cache_scope, stream, parent_session
+    )
+    deepseek_ledger_manager = (
+        app_context.get_manager() if deepseek_ledger_enabled else None
+    )
+    if deepseek_ledger_enabled and deepseek_ledger_manager is None:
+        raise RuntimeError("DeepSeek prompt 账本不可用：存储管理器未初始化")
 
     kwargs = {
         "model": model_name,
@@ -4083,16 +4222,41 @@ def _chat_with_model_generator(
             # 超窗自动压缩只允许一次：压缩后仍超限说明单条消息/附件本身过大，
             # 继续重试只会反复重发超大载荷空烧额度
             overflow_compress_attempts = 0
+            rotate_deepseek_generation = False
             classified_message_shape = None
             request_cache_reason = "冷启动"
             request_diagnostic = None
+            active_deepseek_generation_id = None
+            active_deepseek_message_count = None
 
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
                 try:
-                    cleaned_messages, folded_count, keep_media = _strip_media_and_merge(
+                    effective_request_tools = request_tools
+                    # 先生成 provider 真正会收到的 canonical 消息，再写入 DeepSeek
+                    # 账本。若先保存原始媒体/连续同角色消息，后续清洗会改变历史字节，
+                    # 账本记录就不再等于实际请求前缀。
+                    cleaned_current, folded_count, keep_media = _strip_media_and_merge(
                         messages, model_name, api_base
                     )
+                    cleaned_messages = cleaned_current
+                    if deepseek_ledger_enabled:
+                        ledger_request = _prepare_deepseek_ledger_request(
+                            deepseek_ledger_manager,
+                            parent_session,
+                            model_name,
+                            api_base,
+                            cache_scope,
+                            cleaned_current,
+                            request_tools,
+                            force_new=rotate_deepseek_generation,
+                        )
+                        rotate_deepseek_generation = False
+                        cleaned_messages = ledger_request["messages"]
+                        effective_request_tools = ledger_request["tools"]
+                        kwargs["tools"] = effective_request_tools
+                        active_deepseek_generation_id = ledger_request["generation_id"]
+                        active_deepseek_message_count = len(cleaned_messages)
                     if _is_kimi_family(model_name, api_base):
                         # Moonshot 推理模型要求所有带 tool_calls 的 assistant 消息
                         # 携带 reasoning_content；从数据库重建的历史消息可能已被剥掉，
@@ -4112,9 +4276,9 @@ def _chat_with_model_generator(
                             cache_scope,
                             model_name,
                             api_base,
-                            request_tool_contract,
+                            _tool_contract_fingerprint(effective_request_tools),
                             cleaned_messages,
-                            tools=request_tools,
+                            tools=effective_request_tools,
                         )
                         request_cache_reason = request_diagnostic["request_reason"]
                         classified_message_shape = current_message_shape
@@ -4237,6 +4401,8 @@ def _chat_with_model_generator(
                             # 原地替换为压缩后历史：禁止重新绑定局部名，
                             # 否则调用方持有的旧列表会失联、取消回滚也会作用错对象
                             messages[:] = manager.get_history(session)
+                            if deepseek_ledger_enabled:
+                                rotate_deepseek_generation = True
                             # 压缩已成功落库：同步回合快照，避免后续异常回滚把
                             # 内存恢复成未压缩状态（与 DB 分叉且下轮必再超限）
                             turn_snapshot = deepcopy(messages)
@@ -4458,11 +4624,21 @@ def _chat_with_model_generator(
             tool_calls_list = []
             for idx in sorted(tool_calls_dict.keys()):
                 tool_calls_list.append(tool_calls_dict[idx])
+
+            replay_reasoning_content = reasoning_content or None
+            if (
+                tool_calls_list
+                and _requires_tool_call_reasoning(model_name, api_base)
+                and isinstance(reasoning_content, str)
+            ):
+                # DeepSeek thinking 的下一轮工具续传要求该 key 始终存在。
+                # 没有 reasoning delta 时保留协议层空串，不伪造推理正文。
+                replay_reasoning_content = reasoning_content
                 
             message_to_append = {
                 "role": "assistant",
                 "content": public_content or None,
-                "reasoning_content": reasoning_content or None,
+                "reasoning_content": replay_reasoning_content,
             }
             if provider_thinking_blocks is not None:
                 message_to_append["thinking_blocks"] = provider_thinking_blocks
@@ -4473,7 +4649,7 @@ def _chat_with_model_generator(
             persisted_message = {
                 "role": "assistant",
                 "content": public_content or None,
-                "reasoning_content": reasoning_content or None,
+                "reasoning_content": replay_reasoning_content,
             }
             if provider_thinking_blocks is not None:
                 persisted_message["thinking_blocks"] = provider_thinking_blocks
@@ -4502,6 +4678,16 @@ def _chat_with_model_generator(
 
             if stream and not will_retry_summary:
                 pending_persistence.append(("assistant", persisted_message))
+
+            if deepseek_ledger_enabled and not will_retry_summary:
+                canonical_assistant, _, _ = _strip_media_and_merge(
+                    [message_to_append], model_name, api_base
+                )
+                deepseek_ledger_manager.append_deepseek_prompt_messages(
+                    active_deepseek_generation_id,
+                    canonical_assistant,
+                    expected_count=active_deepseek_message_count,
+                )
 
             if not tool_calls_list:
                 if will_retry_summary:
