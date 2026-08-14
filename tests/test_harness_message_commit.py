@@ -160,6 +160,67 @@ def test_mismatched_step_is_rejected_without_database_writes(tmp_path):
     assert manager.get_history("session") == []
 
 
+def test_missing_step_is_rejected_before_heartbeat_or_database_writes(tmp_path):
+    manager, journal, turn_id, _step_id = _started_step(tmp_path)
+    changes_before = manager.conn.total_changes
+    journal.clock_ms = lambda: 12_000
+
+    with pytest.raises(RuntimeError, match="missing or mismatched"):
+        journal.commit_messages(
+            "session",
+            turn_id,
+            "missing-step",
+            [("assistant", "answer")],
+            [
+                _committed_event(
+                    HarnessEventKind.ASSISTANT_COMMITTED,
+                    "missing-step",
+                    0,
+                )
+            ],
+        )
+
+    assert manager.conn.execute(
+        "SELECT heartbeat_at_ms FROM harness_owners WHERE owner_id = 'owner-test'"
+    ).fetchone() == (10_000,)
+    assert manager.conn.total_changes == changes_before
+    assert manager.get_history("session") == []
+    assert manager.get_harness_turn(turn_id)["last_sequence"] == 0
+
+
+def test_step_from_another_turn_and_session_is_rejected_before_heartbeat(tmp_path):
+    manager, journal, turn_id, _step_id = _started_step(tmp_path)
+    manager.create_session_explicit("other-session")
+    journal.create_turn("other-turn", "other-session")
+    journal.create_step("other-step", "other-turn", 1)
+    changes_before = manager.conn.total_changes
+    journal.clock_ms = lambda: 12_000
+
+    with pytest.raises(RuntimeError, match="missing or mismatched"):
+        journal.commit_messages(
+            "session",
+            turn_id,
+            "other-step",
+            [("assistant", "answer")],
+            [
+                _committed_event(
+                    HarnessEventKind.ASSISTANT_COMMITTED,
+                    "other-step",
+                    0,
+                )
+            ],
+        )
+
+    assert manager.conn.execute(
+        "SELECT heartbeat_at_ms FROM harness_owners WHERE owner_id = 'owner-test'"
+    ).fetchone() == (10_000,)
+    assert manager.conn.total_changes == changes_before
+    assert manager.get_history("session") == []
+    assert manager.get_history("other-session") == []
+    assert manager.get_harness_turn(turn_id)["last_sequence"] == 0
+    assert manager.get_harness_turn("other-turn")["last_sequence"] == 0
+
+
 def test_clear_session_removes_turn_journal(tmp_path):
     manager, journal, turn_id, step_id = _started_step(tmp_path)
     journal.commit_messages(

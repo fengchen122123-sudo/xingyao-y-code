@@ -199,6 +199,11 @@ class HarnessJournal:
             len(messages),
             step_id,
         )
+        self.manager._validate_harness_commit_ownership(
+            session_name,
+            turn_id,
+            step_id,
+        )
         self.heartbeat()
         return self.manager.add_messages_with_harness_events(
             session_name,
