@@ -1,3 +1,4 @@
+import gc
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
@@ -192,3 +193,98 @@ def test_owner_heartbeat_throttle_is_shared_per_manager_owner(tmp_path):
     assert sorted(refreshed) == [False, True, True]
     assert writes_a == [("owner-shared", 3_000)]
     assert writes_b == [("owner-shared", 3_000)]
+
+
+def test_owner_heartbeat_throttle_is_shared_by_connections_to_same_database(tmp_path):
+    path = tmp_path / "shared-lease.db"
+    managers = [MemoryManager(str(path)), MemoryManager(str(path.resolve()))]
+    now = [1_000]
+    writes = []
+    writes_lock = threading.Lock()
+
+    for manager in managers:
+        original = manager.heartbeat_harness_owner
+
+        def record(owner_id, now_ms, *, original=original):
+            with writes_lock:
+                writes.append((owner_id, now_ms))
+            return original(owner_id, now_ms)
+
+        manager.heartbeat_harness_owner = record
+
+    journals = [
+        HarnessJournal(manager, "owner-shared", clock_ms=lambda: now[0])
+        for manager in managers
+    ]
+    writes.clear()
+    now[0] = 3_000
+    barrier = threading.Barrier(2)
+
+    def heartbeat(journal):
+        barrier.wait()
+        return journal.heartbeat()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        refreshed = list(pool.map(heartbeat, journals))
+
+    assert sorted(refreshed) == [False, True]
+    assert writes == [("owner-shared", 3_000)]
+
+
+def test_in_memory_databases_have_independent_owner_throttles():
+    managers = [MemoryManager(":memory:"), MemoryManager(":memory:")]
+    now = [1_000]
+    journals = [
+        HarnessJournal(manager, "owner-shared", clock_ms=lambda: now[0])
+        for manager in managers
+    ]
+    now[0] = 3_000
+    barrier = threading.Barrier(2)
+
+    def heartbeat(journal):
+        barrier.wait()
+        return journal.heartbeat()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        refreshed = list(pool.map(heartbeat, journals))
+
+    assert refreshed == [True, True]
+    for manager in managers:
+        assert manager.conn.execute(
+            "SELECT heartbeat_at_ms FROM harness_owners "
+            "WHERE owner_id = 'owner-shared'"
+        ).fetchone() == (3_000,)
+
+
+def test_owner_throttle_survives_journal_recreation_across_connections(tmp_path):
+    path = tmp_path / "shared-lease.db"
+    managers = [MemoryManager(str(path)), MemoryManager(str(path.resolve()))]
+    now = [1_000]
+    writes = []
+
+    for manager in managers:
+        original = manager.heartbeat_harness_owner
+
+        def record(owner_id, now_ms, *, original=original):
+            writes.append((owner_id, now_ms))
+            return original(owner_id, now_ms)
+
+        manager.heartbeat_harness_owner = record
+
+    journal = HarnessJournal(
+        managers[0],
+        "owner-shared",
+        clock_ms=lambda: now[0],
+    )
+    del journal
+    gc.collect()
+    now[0] = 1_500
+
+    replacement = HarnessJournal(
+        managers[1],
+        "owner-shared",
+        clock_ms=lambda: now[0],
+    )
+
+    assert replacement.heartbeat() is False
+    assert writes == [("owner-shared", 1_000)]
