@@ -6,12 +6,18 @@ Y-CODE 现代原生 GUI 窗口启动入口
 import os
 import sys
 import json
+import logging
 import socket
 import threading
 from pathlib import Path
 import webview
 from gui_bridge import ApiBridge
 from core.gui_lifecycle import ApplicationLifecycle
+
+logger = logging.getLogger("gui_main")
+# 单实例互斥体句柄的模块级引用：句柄一旦被 GC 回收，Windows 会自动释放
+# 互斥体，单实例保护即失效，因此必须持有引用直到进程退出。
+_SINGLETON_MUTEX = None
 
 
 def _configure_runtime_logging():
@@ -176,8 +182,62 @@ def _start_preload_thread():
     threading.Thread(target=_preload, daemon=True, name="gui-preload").start()
 
 
+def _acquire_single_instance() -> bool:
+    """Windows 命名互斥锁实现单实例保护。
+
+    背景：窗口点 X 只是隐藏（托盘就绪时进程常驻），用户再次双击快捷方式会
+    启动第二个实例——右下角出现两个托盘图标，且两个实例并发抢同一份
+    ycode.db / WebView2 数据目录，新实例初始化被 SQLite 锁阻塞，表现为
+    “一直停留在加载页打不开，关掉重开才能进来”（gui-runtime.log 中 11:44:46
+    与 11:45:46 连续两次启动即为该现象的直接证据）。
+
+    本函数返回 True 表示已有实例在运行：本进程应激活已有窗口后退出；
+    返回 False 表示本进程是首个实例，可继续正常启动。
+
+    验证思路：安装后连续双击快捷方式两次，第二次应直接唤起已有窗口而不是
+    新起进程；任务管理器只应出现一个 Y-code.exe；托盘图标恒为 1 个。
+    """
+    if sys.platform != "win32":
+        return False  # 非 Windows 不启用单实例锁
+    import ctypes
+    from ctypes import wintypes
+
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.windll.kernel32
+
+    # Local 域（登录会话内可见）：避免 Global 域需要管理员权限创建互斥体。
+    # 命名含项目标识即可，升级安装不改变名字，保证新旧版本互相排斥。
+    mutex_name = "Local\\YCODE_GUI_SINGLETON"
+    mutex = kernel32.CreateMutexW(None, False, mutex_name)
+    if not mutex:
+        logger.warning("创建单实例互斥体失败，跳过单实例保护（启动将不受限制）")
+        return False
+
+    global _SINGLETON_MUTEX
+    _SINGLETON_MUTEX = mutex  # 持有句柄引用，防止被 GC 后互斥体失效
+
+    if kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
+        return False  # 本实例是第一个，正常启动
+
+    # 已有实例：找到其主窗口并唤起，然后本进程退出
+    user32 = ctypes.windll.user32
+    title = "Y-CODE · 星瑶"
+    hwnd = user32.FindWindowW(None, title)
+    if hwnd:
+        # SW_RESTORE(9)：若窗口被最小化/隐藏则恢复正常显示
+        user32.ShowWindow(hwnd, 9)
+        user32.SetForegroundWindow(hwnd)
+        logger.info("检测到已有实例，已唤起其主窗口，本实例退出")
+    else:
+        logger.warning("检测到已有实例但未找到其主窗口，本实例直接退出")
+    return True
+
+
 def main():
     _configure_runtime_logging()
+    # 单实例保护：已有实例运行时直接激活其窗口并退出本进程，避免双开
+    if _acquire_single_instance():
+        sys.exit(0)
     # 显式传入真正的 MCP 单例，避免桥接层拿到空的 MCP 管理器
     try:
         from core.mcp_client import mcp_manager
