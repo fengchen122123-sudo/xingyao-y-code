@@ -16,6 +16,18 @@ def test_turn_terminal_state_cannot_change():
         transition_turn(TurnStatus.COMPLETED, TurnStatus.RUNNING)
 
 
+@pytest.mark.parametrize(
+    ("transition", "target"),
+    [
+        (transition_turn, TurnStatus.PREPARING),
+        (transition_step, StepStatus.REQUESTING),
+    ],
+)
+def test_unknown_current_state_is_explicitly_rejected(transition, target):
+    with pytest.raises(InvalidHarnessTransition, match="unknown .* status"):
+        transition("unknown", target)
+
+
 def test_step_tool_path_is_explicit():
     state = transition_step(StepStatus.ASSISTANT_READY, StepStatus.TOOLS_RUNNING)
     assert transition_step(state, StepStatus.TOOLS_COMMITTED) is StepStatus.TOOLS_COMMITTED

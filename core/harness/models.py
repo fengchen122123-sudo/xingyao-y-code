@@ -113,7 +113,12 @@ def _state_value(state: object) -> object:
 
 def transition_turn(current: TurnStatus, target: TurnStatus) -> TurnStatus:
     """Validate and apply one explicitly allowed turn status transition."""
-    if target not in _TURN_TRANSITIONS.get(current, frozenset()):
+    if not isinstance(current, TurnStatus):
+        raise InvalidHarnessTransition(
+            f"Invalid turn transition: {_state_value(current)} -> {_state_value(target)} "
+            "(unknown turn status)"
+        )
+    if target not in _TURN_TRANSITIONS[current]:
         raise InvalidHarnessTransition(
             f"Invalid turn transition: {_state_value(current)} -> {_state_value(target)}"
         )
@@ -122,7 +127,12 @@ def transition_turn(current: TurnStatus, target: TurnStatus) -> TurnStatus:
 
 def transition_step(current: StepStatus, target: StepStatus) -> StepStatus:
     """Validate and apply one explicitly allowed step status transition."""
-    if target not in _STEP_TRANSITIONS.get(current, frozenset()):
+    if not isinstance(current, StepStatus):
+        raise InvalidHarnessTransition(
+            f"Invalid step transition: {_state_value(current)} -> {_state_value(target)} "
+            "(unknown step status)"
+        )
+    if target not in _STEP_TRANSITIONS[current]:
         raise InvalidHarnessTransition(
             f"Invalid step transition: {_state_value(current)} -> {_state_value(target)}"
         )
