@@ -1,5 +1,6 @@
 """Durable harness lifecycle journal and process-owner leases."""
 
+import os
 import threading
 import uuid
 import weakref
@@ -22,25 +23,53 @@ _OWNER_STALE_AFTER_MS = 10_000
 
 
 class _OwnerHeartbeatState:
-    def __init__(self):
+    def __init__(self, last_heartbeat_ms: int | None):
         self.lock = threading.Lock()
-        self.last_heartbeat_ms: int | None = None
+        self.last_heartbeat_ms = last_heartbeat_ms
 
 
 _OWNER_STATES_LOCK = threading.Lock()
-_OWNER_STATES = weakref.WeakKeyDictionary()
+_OWNER_STATES = weakref.WeakValueDictionary()
+_MEMORY_DATABASE_DOMAINS = weakref.WeakKeyDictionary()
+
+
+def _main_database_filename(manager: MemoryManager) -> str:
+    with manager.acquire_lock():
+        databases = manager.conn.execute("PRAGMA database_list").fetchall()
+    for _sequence, name, filename in databases:
+        if name == "main":
+            return filename
+    raise RuntimeError("SQLite connection has no main database")
+
+
+def _stored_owner_heartbeat(manager: MemoryManager, owner_id: str) -> int | None:
+    with manager.acquire_lock():
+        row = manager.conn.execute(
+            "SELECT heartbeat_at_ms FROM harness_owners WHERE owner_id = ?",
+            (owner_id,),
+        ).fetchone()
+    return None if row is None else int(row[0])
 
 
 def _owner_heartbeat_state(manager: MemoryManager, owner_id: str):
+    filename = _main_database_filename(manager)
+    stored_heartbeat_ms = _stored_owner_heartbeat(manager, owner_id)
     with _OWNER_STATES_LOCK:
-        manager_states = _OWNER_STATES.get(manager)
-        if manager_states is None:
-            manager_states = {}
-            _OWNER_STATES[manager] = manager_states
-        state = manager_states.get(owner_id)
+        if filename:
+            database_domain = (
+                "file",
+                os.path.normcase(os.path.realpath(os.path.abspath(filename))),
+            )
+        else:
+            database_domain = _MEMORY_DATABASE_DOMAINS.get(manager)
+            if database_domain is None:
+                database_domain = object()
+                _MEMORY_DATABASE_DOMAINS[manager] = database_domain
+        state_key = (database_domain, owner_id)
+        state = _OWNER_STATES.get(state_key)
         if state is None:
-            state = _OwnerHeartbeatState()
-            manager_states[owner_id] = state
+            state = _OwnerHeartbeatState(stored_heartbeat_ms)
+            _OWNER_STATES[state_key] = state
         return state
 
 
