@@ -385,6 +385,30 @@ class MemoryManager:
                         content TEXT
                     )
                 ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS deepseek_prompt_generations (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        session_name TEXT NOT NULL,
+                        model TEXT NOT NULL,
+                        api_base TEXT NOT NULL,
+                        cache_scope TEXT NOT NULL,
+                        tools_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS deepseek_prompt_messages (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        generation_id INTEGER NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        message_json TEXT NOT NULL,
+                        UNIQUE(generation_id, ordinal)
+                    )
+                ''')
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_deepseek_prompt_messages_generation "
+                    "ON deepseek_prompt_messages(generation_id, ordinal)"
+                )
                 # 创建一个叫 workspaces 的表持久化记录引入过的项目文件夹
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS workspaces (
@@ -516,6 +540,173 @@ class MemoryManager:
                 # 与同模块其它写方法一致：失败必须回滚，避免连接遗留活动事务
                 self.conn.rollback()
                 raise
+
+    @staticmethod
+    def _serialize_prompt_value(value):
+        """Serialize a provider request value once, preserving insertion order."""
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+    def get_deepseek_prompt_generation(self, generation_id):
+        """Return one immutable DeepSeek prompt generation and its ordered messages."""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT id, session_name, model, api_base, cache_scope, tools_json "
+                "FROM deepseek_prompt_generations WHERE id = ?",
+                (int(generation_id),),
+            )
+            row = cursor.fetchone()
+            if row is None:
+                return None
+            cursor.execute(
+                "SELECT message_json FROM deepseek_prompt_messages "
+                "WHERE generation_id = ? ORDER BY ordinal ASC",
+                (int(generation_id),),
+            )
+            return {
+                "id": row[0],
+                "session_name": row[1],
+                "model": row[2],
+                "api_base": row[3],
+                "cache_scope": row[4],
+                "tools": json.loads(row[5]),
+                "messages": [json.loads(item[0]) for item in cursor.fetchall()],
+            }
+
+    def get_or_create_deepseek_prompt_generation(
+        self, session_name, model, api_base, cache_scope, seed_messages, tools,
+        *, force_new=False
+    ):
+        """Return the route generation, seeding it exactly once.
+
+        The route identity deliberately excludes request-header fields. Callers compare
+        system/tools and create a fresh generation when that stable header changes.
+        """
+        identity = (
+            str(session_name), str(model).lower(), str(api_base).rstrip("/").lower(),
+            str(cache_scope),
+        )
+        seed_json = [self._serialize_prompt_value(item) for item in seed_messages]
+        tools_json = self._serialize_prompt_value(tools)
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT 1 FROM sessions WHERE session_name = ?",
+                    (identity[0],),
+                )
+                if cursor.fetchone() is None:
+                    raise RuntimeError(
+                        f"DeepSeek prompt 账本所属会话不存在: {identity[0]!r}"
+                    )
+                row = None
+                if not force_new:
+                    cursor.execute(
+                        "SELECT id FROM deepseek_prompt_generations "
+                        "WHERE session_name = ? AND model = ? AND api_base = ? AND cache_scope = ? "
+                        "ORDER BY id DESC LIMIT 1",
+                        identity,
+                    )
+                    row = cursor.fetchone()
+                if row is None:
+                    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    cursor.execute(
+                        "INSERT INTO deepseek_prompt_generations "
+                        "(session_name, model, api_base, cache_scope, tools_json, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (*identity, tools_json, now),
+                    )
+                    generation_id = cursor.lastrowid
+                    cursor.executemany(
+                        "INSERT INTO deepseek_prompt_messages "
+                        "(generation_id, ordinal, message_json) VALUES (?, ?, ?)",
+                        [
+                            (generation_id, ordinal, message_json)
+                            for ordinal, message_json in enumerate(seed_json)
+                        ],
+                    )
+                    self.conn.commit()
+                else:
+                    generation_id = row[0]
+                result = self.get_deepseek_prompt_generation(generation_id)
+                result["created"] = row is None
+                return result
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def append_deepseek_prompt_messages(
+        self, generation_id, messages, *, expected_count
+    ):
+        """CAS-append ordered messages; stale concurrent append attempts fail loudly."""
+        serialized = [self._serialize_prompt_value(item) for item in messages]
+        if not serialized:
+            return
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT COUNT(*), MAX(g.session_name) "
+                    "FROM deepseek_prompt_messages AS m "
+                    "JOIN deepseek_prompt_generations AS g ON g.id = m.generation_id "
+                    "WHERE m.generation_id = ?",
+                    (int(generation_id),),
+                )
+                count_row = cursor.fetchone()
+                actual_count = int(count_row[0])
+                generation_session = count_row[1]
+                if generation_session is None:
+                    raise RuntimeError("DeepSeek prompt 账本 generation 不存在")
+                cursor.execute(
+                    "SELECT 1 FROM sessions WHERE session_name = ?",
+                    (generation_session,),
+                )
+                if cursor.fetchone() is None:
+                    raise RuntimeError(
+                        f"DeepSeek prompt 账本所属会话不存在: {generation_session!r}"
+                    )
+                if actual_count != int(expected_count):
+                    raise RuntimeError(
+                        "DeepSeek prompt 账本消息数量已变化："
+                        f"expected={expected_count}, actual={actual_count}"
+                    )
+                cursor.executemany(
+                    "INSERT INTO deepseek_prompt_messages "
+                    "(generation_id, ordinal, message_json) VALUES (?, ?, ?)",
+                    [
+                        (int(generation_id), actual_count + offset, message_json)
+                        for offset, message_json in enumerate(serialized)
+                    ],
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def _delete_deepseek_prompt_generations_locked(self, cursor, session_names):
+        """Delete ledger messages before their generations inside caller transaction."""
+        names = [str(name) for name in session_names if str(name)]
+        if not names:
+            return
+        placeholders = ",".join("?" for _ in names)
+        cursor.execute(
+            "SELECT id FROM deepseek_prompt_generations "
+            f"WHERE session_name IN ({placeholders})",
+            names,
+        )
+        generation_ids = [row[0] for row in cursor.fetchall()]
+        if generation_ids:
+            generation_placeholders = ",".join("?" for _ in generation_ids)
+            cursor.execute(
+                "DELETE FROM deepseek_prompt_messages "
+                f"WHERE generation_id IN ({generation_placeholders})",
+                generation_ids,
+            )
+        cursor.execute(
+            "DELETE FROM deepseek_prompt_generations "
+            f"WHERE session_name IN ({placeholders})",
+            names,
+        )
 
     def get_last_token_usage(self, session_id):
         """查询指定会话最近一次真实 token 用量，无记录返回 None。
@@ -1022,6 +1213,7 @@ class MemoryManager:
                 cursor.execute('SELECT COUNT(*) FROM messages WHERE session_id = ?', (session_id,))
                 deleted = cursor.fetchone()[0] or 0
                 cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
+                self._delete_deepseek_prompt_generations_locked(cursor, [session_name])
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute('''
                     UPDATE sessions
@@ -1260,6 +1452,7 @@ class MemoryManager:
                 session_id = row[0]
                 try:
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
+                    self._delete_deepseek_prompt_generations_locked(cursor, [session_name])
                     cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
                     self.conn.commit()
                     deleted = True
@@ -1286,6 +1479,7 @@ class MemoryManager:
                     sid = r[0]
                     deleted_names.append(r[1])
                     cursor.execute('DELETE FROM messages WHERE session_id = ?', (sid,))
+                self._delete_deepseek_prompt_generations_locked(cursor, deleted_names)
                 cursor.execute('DELETE FROM sessions WHERE workdir = ?', (workdir_norm,))
                 cursor.execute('DELETE FROM workspaces WHERE workdir = ?', (workdir_norm,))
                 self.conn.commit()
@@ -1364,6 +1558,10 @@ class MemoryManager:
             # 3. 更新会话名称
             try:
                 cursor.execute('UPDATE sessions SET session_name = ? WHERE id = ?', (final_name, session_id))
+                cursor.execute(
+                    'UPDATE deepseek_prompt_generations SET session_name = ? WHERE session_name = ?',
+                    (final_name, old_name),
+                )
                 self.conn.commit()
                 result = (True, final_name)
             except Exception:
