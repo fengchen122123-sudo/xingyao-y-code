@@ -1407,6 +1407,43 @@ class MemoryManager:
             if draft.step_id != step_id:
                 raise ValueError("event step_id must match the committed harness step")
 
+    @staticmethod
+    def _get_harness_commit_session_id_locked(
+        cursor,
+        session_name,
+        turn_id,
+        step_id,
+    ):
+        cursor.execute(
+            "SELECT sessions.id FROM sessions "
+            "JOIN harness_turns ON harness_turns.session_id = sessions.id "
+            "JOIN harness_steps ON harness_steps.turn_id = harness_turns.turn_id "
+            "WHERE sessions.session_name = ? AND harness_turns.turn_id = ? "
+            "AND harness_steps.step_id = ?",
+            (session_name, turn_id, step_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "missing or mismatched harness session, turn, or step"
+            )
+        return row[0]
+
+    def _validate_harness_commit_ownership(
+        self,
+        session_name,
+        turn_id,
+        step_id,
+    ):
+        with self._lock:
+            cursor = self.conn.cursor()
+            self._get_harness_commit_session_id_locked(
+                cursor,
+                session_name,
+                turn_id,
+                step_id,
+            )
+
     def _insert_message_batch_locked(self, cursor, session_name, serialized):
         cursor.execute(
             "SELECT id FROM sessions WHERE session_name = ?",
@@ -1484,20 +1521,12 @@ class MemoryManager:
         with self._lock:
             cursor = self.conn.cursor()
             try:
-                cursor.execute(
-                    "SELECT sessions.id FROM sessions "
-                    "JOIN harness_turns ON harness_turns.session_id = sessions.id "
-                    "JOIN harness_steps ON harness_steps.turn_id = harness_turns.turn_id "
-                    "WHERE sessions.session_name = ? AND harness_turns.turn_id = ? "
-                    "AND harness_steps.step_id = ?",
-                    (session_name, turn_id, step_id),
+                session_id = self._get_harness_commit_session_id_locked(
+                    cursor,
+                    session_name,
+                    turn_id,
+                    step_id,
                 )
-                row = cursor.fetchone()
-                if row is None:
-                    raise RuntimeError(
-                        "missing or mismatched harness session, turn, or step"
-                    )
-                session_id = row[0]
                 message_ids = self._insert_message_batch_locked(
                     cursor,
                     session_name,
