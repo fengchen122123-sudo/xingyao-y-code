@@ -148,3 +148,47 @@ def test_heartbeat_is_throttled_for_two_seconds(tmp_path):
     assert first_heartbeat == (1_000,)
     assert throttled_heartbeat == (1_000,)
     assert refreshed_heartbeat == (3_000,)
+
+
+def test_owner_heartbeat_throttle_is_shared_per_manager_owner(tmp_path):
+    now = [1_000]
+    manager_a = MemoryManager(str(tmp_path / "lease-a.db"))
+    manager_b = MemoryManager(str(tmp_path / "lease-b.db"))
+    writes_a = []
+    writes_b = []
+    writes_lock = threading.Lock()
+    original_a = manager_a.heartbeat_harness_owner
+    original_b = manager_b.heartbeat_harness_owner
+
+    def record_a(owner_id, now_ms):
+        with writes_lock:
+            writes_a.append((owner_id, now_ms))
+        return original_a(owner_id, now_ms)
+
+    def record_b(owner_id, now_ms):
+        with writes_lock:
+            writes_b.append((owner_id, now_ms))
+        return original_b(owner_id, now_ms)
+
+    manager_a.heartbeat_harness_owner = record_a
+    manager_b.heartbeat_harness_owner = record_b
+    journals = [
+        HarnessJournal(manager_a, "owner-shared", clock_ms=lambda: now[0]),
+        HarnessJournal(manager_a, "owner-shared", clock_ms=lambda: now[0]),
+        HarnessJournal(manager_b, "owner-shared", clock_ms=lambda: now[0]),
+    ]
+    writes_a.clear()
+    writes_b.clear()
+    now[0] = 3_000
+    barrier = threading.Barrier(3)
+
+    def heartbeat(journal):
+        barrier.wait()
+        return journal.heartbeat()
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        refreshed = list(pool.map(heartbeat, journals))
+
+    assert sorted(refreshed) == [False, True, True]
+    assert writes_a == [("owner-shared", 3_000)]
+    assert writes_b == [("owner-shared", 3_000)]

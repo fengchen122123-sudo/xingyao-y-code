@@ -1,6 +1,8 @@
 """Durable harness lifecycle journal and process-owner leases."""
 
+import threading
 import uuid
+import weakref
 from collections.abc import Callable
 
 from core.harness.models import (
@@ -19,6 +21,29 @@ _HEARTBEAT_INTERVAL_MS = 2_000
 _OWNER_STALE_AFTER_MS = 10_000
 
 
+class _OwnerHeartbeatState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_heartbeat_ms: int | None = None
+
+
+_OWNER_STATES_LOCK = threading.Lock()
+_OWNER_STATES = weakref.WeakKeyDictionary()
+
+
+def _owner_heartbeat_state(manager: MemoryManager, owner_id: str):
+    with _OWNER_STATES_LOCK:
+        manager_states = _OWNER_STATES.get(manager)
+        if manager_states is None:
+            manager_states = {}
+            _OWNER_STATES[manager] = manager_states
+        state = manager_states.get(owner_id)
+        if state is None:
+            state = _OwnerHeartbeatState()
+            manager_states[owner_id] = state
+        return state
+
+
 class HarnessJournal:
     def __init__(
         self,
@@ -29,20 +54,22 @@ class HarnessJournal:
         self.manager = manager
         self.owner_id = owner_id
         self.clock_ms = clock_ms
-        self._last_heartbeat_ms: int | None = None
+        self._heartbeat_state = _owner_heartbeat_state(manager, owner_id)
         self.heartbeat()
 
     def heartbeat(self) -> bool:
-        now_ms = int(self.clock_ms())
-        if (
-            self._last_heartbeat_ms is not None
-            and now_ms - self._last_heartbeat_ms < _HEARTBEAT_INTERVAL_MS
-        ):
-            return False
-        self.manager.heartbeat_harness_owner(self.owner_id, now_ms)
-        self._last_heartbeat_ms = now_ms
-        self.recover_stale(now_ms=now_ms)
-        return True
+        state = self._heartbeat_state
+        with state.lock:
+            now_ms = int(self.clock_ms())
+            if (
+                state.last_heartbeat_ms is not None
+                and now_ms - state.last_heartbeat_ms < _HEARTBEAT_INTERVAL_MS
+            ):
+                return False
+            self.manager.heartbeat_harness_owner(self.owner_id, now_ms)
+            state.last_heartbeat_ms = now_ms
+            self.recover_stale(now_ms=now_ms)
+            return True
 
     def recover_stale(self, *, now_ms: int | None = None) -> int:
         current_ms = int(self.clock_ms()) if now_ms is None else int(now_ms)
