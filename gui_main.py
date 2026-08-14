@@ -188,22 +188,31 @@ def _acquire_single_instance() -> bool:
     背景：窗口点 X 只是隐藏（托盘就绪时进程常驻），用户再次双击快捷方式会
     启动第二个实例——右下角出现两个托盘图标，且两个实例并发抢同一份
     ycode.db / WebView2 数据目录，新实例初始化被 SQLite 锁阻塞，表现为
-    “一直停留在加载页打不开，关掉重开才能进来”（gui-runtime.log 中 11:44:46
+    "一直停留在加载页打不开，关掉重开才能进来"（gui-runtime.log 中 11:44:46
     与 11:45:46 连续两次启动即为该现象的直接证据）。
 
     本函数返回 True 表示已有实例在运行：本进程应激活已有窗口后退出；
     返回 False 表示本进程是首个实例，可继续正常启动。
 
-    验证思路：安装后连续双击快捷方式两次，第二次应直接唤起已有窗口而不是
-    新起进程；任务管理器只应出现一个 Y-code.exe；托盘图标恒为 1 个。
+    关键改进（2026-08-14）：当已有实例但找不到主窗口时（前一个实例卡在
+    加载页/webview.start() 尚未创建窗口句柄，或被用户从托盘退出但进程未
+    完全退出），不再静默退出，而是弹窗告知用户"已有实例正在运行/正在启动中"，
+    并等待 3 秒后重试激活（覆盖前一个实例正在退出但尚未释放互斥锁的短暂
+    窗口期），仍找不到才退出。
+
+    验证思路：连续双击快捷方式两次，第二次应唤起已有窗口；若前一个实例卡死
+    在加载页，第二次双击会弹窗提示而不是静默消失；任务管理器只应出现一个
+    Y-code.exe；托盘图标恒为 1 个。
     """
     if sys.platform != "win32":
         return False  # 非 Windows 不启用单实例锁
     import ctypes
     from ctypes import wintypes
+    import time
 
     ERROR_ALREADY_EXISTS = 183
     kernel32 = ctypes.windll.kernel32
+    user32 = ctypes.windll.user32
 
     # Local 域（登录会话内可见）：避免 Global 域需要管理员权限创建互斥体。
     # 命名含项目标识即可，升级安装不改变名字，保证新旧版本互相排斥。
@@ -220,7 +229,6 @@ def _acquire_single_instance() -> bool:
         return False  # 本实例是第一个，正常启动
 
     # 已有实例：找到其主窗口并唤起，然后本进程退出
-    user32 = ctypes.windll.user32
     title = "Y-CODE · 星瑶"
     hwnd = user32.FindWindowW(None, title)
     if hwnd:
@@ -228,8 +236,30 @@ def _acquire_single_instance() -> bool:
         user32.ShowWindow(hwnd, 9)
         user32.SetForegroundWindow(hwnd)
         logger.info("检测到已有实例，已唤起其主窗口，本实例退出")
-    else:
-        logger.warning("检测到已有实例但未找到其主窗口，本实例直接退出")
+        return True
+
+    # 已有实例但窗口未创建（前一个实例可能正卡在 webview.start() 前，或正在退出中）：
+    # 等 3 秒重试一次，覆盖前一个实例正在关闭/启动窗口的短暂窗口期
+    logger.warning("检测到已有实例但主窗口未创建，等待 3s 后重试激活...")
+    time.sleep(3)
+    hwnd = user32.FindWindowW(None, title)
+    if hwnd:
+        user32.ShowWindow(hwnd, 9)
+        user32.SetForegroundWindow(hwnd)
+        logger.info("检测到已有实例（重试成功），已唤起其主窗口，本实例退出")
+        return True
+
+    # 重试后仍找不到：前一个实例很可能卡在加载页或正在退出
+    # 弹窗提示用户，不要静默退出（避免用户以为"双击没反应"）
+    logger.warning("检测到已有实例但主窗口始终未创建，弹窗提示用户")
+    ctypes.windll.user32.MessageBoxW(
+        0,
+        "检测到 Y-code 已在运行，但主窗口当前不可见。\n\n"
+        "如果右下角托盘已有 Y-code 图标，请右键托盘图标选择“显示主窗口”。\n"
+        "如果程序卡死在启动页面，请稍后从托盘菜单退出后重新启动。",
+        "Y-code · 星瑶",
+        0x40,  # MB_ICONINFORMATION
+    )
     return True
 
 

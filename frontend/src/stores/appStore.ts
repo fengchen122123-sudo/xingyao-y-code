@@ -1462,6 +1462,19 @@ export const useAppStore = defineStore('app', {
         this.refreshSessions();
       } else if (type === 'token_usage') {
         this.tokenUsage = normalizeTokenUsage(data);
+      } else if (type === 'token_usage_updated') {
+        // 异步 token 重算完成（后端 _async_recalc_token_usage 推送），
+        // 数据形状与 token_usage 事件一致，直接复用同一归一化
+        this.tokenUsage = normalizeTokenUsage(data);
+      } else if (type === 'file_tree_loaded') {
+        // 异步文件树加载完成（后端 _async_load_file_tree 推送）：
+        // get_initial_state 不再同步扫树（大目录会卡加载页），改为后台扫描，
+        // 完成后通过此事件推送到前端刷新文件面板。仅在 workdir 未变时采纳，
+        // 防止用户启动后立刻切换会话导致旧树覆盖新会话的文件面板。
+        const treeWorkdir = String(data.workdir || '');
+        if (treeWorkdir && treeWorkdir === this.workdir) {
+          this.fileTree = Array.isArray(data.file_tree) ? data.file_tree : [];
+        }
       } else if (type === 'mcp_status') {
         if (data.mcps) this.mcps = data.mcps;
       } else if (type === 'diff_ready') {
