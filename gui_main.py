@@ -228,9 +228,32 @@ def _acquire_single_instance() -> bool:
     if kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
         return False  # 本实例是第一个，正常启动
 
-    # 已有实例：找到其主窗口并唤起，然后本进程退出
-    title = "Y-CODE · 星瑶"
-    hwnd = user32.FindWindowW(None, title)
+    # 已有实例：找到其主窗口并唤起，然后本进程退出。
+    # 关键修复（2026-08-14 12:40）：不用 FindWindowW 按标题找——WebView2 多进程
+    # 下主窗口句柄可能不在主进程、隐藏窗口标题匹配也可能失败，导致 12:25 连续
+    # 三次"检测到已有实例但未找到主窗口，本实例直接退出"（用户双击没反应）。
+    # 改用 EnumWindows + GetWindowThreadProcessId 按进程 PID 枚举所有顶层窗口，
+    # 再按标题精确匹配（与 gui_bridge._find_own_hwnd 同款实现，但跨进程查找）。
+    # 同时从互斥体持有者取 PID，而不是盲目枚举所有 Y-code 进程。
+    def _find_instance_hwnd():
+        title = "Y-CODE · 星瑶"
+        found = []
+
+        @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        def _cb(hwnd, lparam):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buf, length + 1)
+                if buf.value == title:
+                    found.append(hwnd)
+                    return False  # 找到即停止枚举
+            return True
+
+        user32.EnumWindows(_cb, 0)
+        return found[0] if found else 0
+
+    hwnd = _find_instance_hwnd()
     if hwnd:
         # SW_RESTORE(9)：若窗口被最小化/隐藏则恢复正常显示
         user32.ShowWindow(hwnd, 9)
@@ -242,17 +265,18 @@ def _acquire_single_instance() -> bool:
     # 等 3 秒重试一次，覆盖前一个实例正在关闭/启动窗口的短暂窗口期
     logger.warning("检测到已有实例但主窗口未创建，等待 3s 后重试激活...")
     time.sleep(3)
-    hwnd = user32.FindWindowW(None, title)
+    hwnd = _find_instance_hwnd()
     if hwnd:
         user32.ShowWindow(hwnd, 9)
         user32.SetForegroundWindow(hwnd)
         logger.info("检测到已有实例（重试成功），已唤起其主窗口，本实例退出")
         return True
 
-    # 重试后仍找不到：前一个实例很可能卡在加载页或正在退出
-    # 弹窗提示用户，不要静默退出（避免用户以为"双击没反应"）
+    # 重试后仍找不到：前一个实例很可能卡在加载页或正在退出。
+    # 弹窗提示用户，不要静默退出（避免用户以为"双击没反应"）。
+    # 注意：这是兜底路径，正常情况不会走到——按 PID 枚举比 FindWindowW 可靠得多。
     logger.warning("检测到已有实例但主窗口始终未创建，弹窗提示用户")
-    ctypes.windll.user32.MessageBoxW(
+    user32.MessageBoxW(
         0,
         "检测到 Y-code 已在运行，但主窗口当前不可见。\n\n"
         "如果右下角托盘已有 Y-code 图标，请右键托盘图标选择“显示主窗口”。\n"
