@@ -17,6 +17,14 @@ from concurrent.futures import Future, TimeoutError as _FutureTimeoutError
 from copy import deepcopy
 from typing import Dict, List
 
+from core.harness.request_envelope import (
+    PreparedStreamRequest,
+    RequestEnvelope,
+    _responses_input_from_messages,
+    _responses_tools_from_chat_tools,
+    prepare_stream_request,
+)
+
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
 # （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
 # 必须在 import litellm 之前设置该环境变量才生效
@@ -1429,76 +1437,6 @@ def _obj_value(value, key, default=None):
     return getattr(value, key, default)
 
 
-def _responses_input_from_messages(messages):
-    """把 Chat Completions 历史转换成 Responses input items。"""
-    def convert_content(content):
-        if not isinstance(content, list):
-            return content
-        blocks = []
-        for block in content:
-            if not isinstance(block, dict):
-                raise ValueError("Responses 多模态内容块必须是对象")
-            block_type = block.get("type")
-            if block_type in {"text", "input_text"}:
-                blocks.append({"type": "input_text", "text": str(block.get("text") or "")})
-            elif block_type in {"image_url", "input_image"}:
-                image_url = block.get("image_url")
-                if isinstance(image_url, dict):
-                    image_url = image_url.get("url")
-                if not image_url:
-                    raise ValueError("Responses 图片内容缺少 image_url")
-                blocks.append({"type": "input_image", "image_url": str(image_url)})
-            else:
-                raise ValueError(f"Responses 不支持的内容块: {block_type}")
-        return blocks
-
-    items = []
-    for message in messages:
-        role = message.get("role")
-        content = message.get("content")
-        if role in {"system", "developer", "user"}:
-            items.append({"role": role, "content": convert_content(content)})
-        elif role == "assistant":
-            if content:
-                items.append({"role": "assistant", "content": convert_content(content)})
-            for call in message.get("tool_calls") or []:
-                function = call.get("function") or {}
-                items.append({
-                    "type": "function_call",
-                    "call_id": call.get("id"),
-                    "name": function.get("name"),
-                    "arguments": function.get("arguments") or "{}",
-                })
-        elif role == "tool":
-            call_id = message.get("tool_call_id")
-            if not call_id:
-                raise ValueError("Responses 工具结果缺少 tool_call_id")
-            items.append({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
-            })
-        else:
-            raise ValueError(f"Responses 不支持的消息角色: {role}")
-    return items
-
-
-def _responses_tools_from_chat_tools(tools):
-    """把 Chat Completions function wrapper 展平为 Responses tool。"""
-    result = []
-    for tool in tools or []:
-        if tool.get("type") != "function" or not isinstance(tool.get("function"), dict):
-            raise ValueError("Responses 仅支持显式 function 工具定义")
-        function = tool["function"]
-        result.append({
-            "type": "function",
-            "name": function["name"],
-            "description": function.get("description", ""),
-            "parameters": function.get("parameters") or {"type": "object", "properties": {}},
-        })
-    return result
-
-
 def _chat_chunk(*, content="", reasoning="", tool_calls=None, finish_reason=None, usage=None):
     delta = SimpleNamespace(
         content=content,
@@ -1617,41 +1555,30 @@ def _responses_events_as_chat_chunks(events):
             raise RuntimeError(f"未支持的 Responses 流事件: {event_type or '<empty>'}")
 
 
-def _request_stream(protocol, kwargs, *, timeout, cancel_event=None):
+def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_event=None):
     """按显式协议发起流请求；Responses 失败时禁止降级。
 
     返回 (stream, holder)：holder 登记在 cancel_event 名下的在飞注册表，
     供停止路径硬中断；由调用方在流消费结束后 unregister。
     """
+    if isinstance(prepared_or_protocol, PreparedStreamRequest):
+        if kwargs is not None or timeout is not None:
+            raise TypeError("PreparedStreamRequest already contains provider kwargs and timeout")
+        prepared = prepared_or_protocol
+    else:
+        if kwargs is None or timeout is None:
+            raise TypeError("legacy request calls require kwargs and timeout")
+        prepared = prepare_stream_request(prepared_or_protocol, kwargs, timeout)
+
     holder = _register_inflight_stream(cancel_event)
     try:
-        if protocol != "responses":
-            stream = completion(**kwargs, timeout=timeout)
+        if prepared.protocol != "responses":
+            stream = completion(**prepared.kwargs)
             if holder is not None:
                 holder.attach(stream)
             return stream, holder
-
-        response_kwargs = {
-            "model": kwargs["model"],
-            "api_key": kwargs.get("api_key"),
-            "input": _responses_input_from_messages(kwargs.get("messages") or []),
-            "tools": _responses_tools_from_chat_tools(kwargs.get("tools") or []),
-            "stream": True,
-            "timeout": timeout,
-        }
-        for source, target in (
-            ("api_base", "api_base"),
-            ("max_tokens", "max_output_tokens"),
-            ("tool_choice", "tool_choice"),
-            ("num_retries", "num_retries"),
-            ("extra_body", "extra_body"),
-        ):
-            if source in kwargs:
-                response_kwargs[target] = kwargs[source]
-        if kwargs.get("reasoning_effort"):
-            response_kwargs["reasoning"] = {"effort": kwargs["reasoning_effort"]}
         # 可关闭对象是底层原始流，不是外层映射生成器（生成器在执行中无法 close）
-        raw_stream = _litellm_responses(**response_kwargs)
+        raw_stream = _litellm_responses(**prepared.kwargs)
         if holder is not None:
             holder.attach(raw_stream)
         return _responses_stream_as_chat_chunks(raw_stream), holder
@@ -4294,13 +4221,24 @@ def _chat_with_model_generator(
                         API_REQUEST_MAX_TIMEOUT_SECONDS,
                         API_REQUEST_TIMEOUT_SECONDS + max(0, _est_prompt_tokens) // 1500,
                     )
+                    prepared_request = prepare_stream_request(
+                        request_protocol,
+                        kwargs,
+                        attempt_timeout,
+                    )
+                    request_envelope = RequestEnvelope.capture(
+                        prepared_request,
+                        cache_scope=cache_scope,
+                        request_reason=request_cache_reason,
+                        attempt=attempt + 1,
+                        deepseek_generation_id=active_deepseek_generation_id,
+                        deepseek_message_count=active_deepseek_message_count,
+                    )
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 在飞请求登记到 cancel_event 名下，停止路径可硬中断底层连接。
                     future = _submit_daemon_call(
                         _request_stream,
-                        request_protocol,
-                        kwargs,
-                        timeout=attempt_timeout,
+                        prepared_request,
                         cancel_event=cancel_event,
                     )
                     wait_started_at = time.monotonic()
