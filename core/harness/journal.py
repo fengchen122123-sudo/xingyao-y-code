@@ -183,3 +183,28 @@ class HarnessJournal:
             draft,
             int(self.clock_ms()),
         )
+
+    def commit_messages(
+        self,
+        session_name: str,
+        turn_id: str,
+        step_id: str,
+        messages: list[tuple[str, object]],
+        events: list[JournalEventDraft],
+    ) -> tuple[int, ...]:
+        messages = list(messages)
+        events = list(events)
+        self.manager._validate_harness_message_events(
+            events,
+            len(messages),
+            step_id,
+        )
+        self.heartbeat()
+        return self.manager.add_messages_with_harness_events(
+            session_name,
+            messages,
+            turn_id=turn_id,
+            step_id=step_id,
+            events=events,
+            _created_at_ms=int(self.clock_ms()),
+        )
