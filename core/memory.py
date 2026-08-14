@@ -1385,8 +1385,7 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
-    def add_messages(self, session_name, messages):
-        """Atomically append one ordered batch of conversation messages."""
+    def _serialize_message_batch(self, messages):
         serialized = []
         has_new_media = False
         for role, content in messages:
@@ -1395,6 +1394,40 @@ class MemoryManager:
                 has_new_media = True
             content = self._serialize_message_content(content)
             serialized.append((str(role), content))
+        return serialized, has_new_media
+
+    @staticmethod
+    def _validate_harness_message_events(events, message_count, step_id):
+        for draft in events:
+            message_index = draft.message_index
+            if type(message_index) is not int:
+                raise ValueError("message_index must be a zero-based integer")
+            if message_index < 0 or message_index >= message_count:
+                raise ValueError("message_index is outside the submitted message batch")
+            if draft.step_id != step_id:
+                raise ValueError("event step_id must match the committed harness step")
+
+    def _insert_message_batch_locked(self, cursor, session_name, serialized):
+        cursor.execute(
+            "SELECT id FROM sessions WHERE session_name = ?",
+            (session_name,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"missing message session: {session_name}")
+        session_id = row[0]
+        message_ids = []
+        for role, content in serialized:
+            cursor.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                (session_id, role, content),
+            )
+            message_ids.append(int(cursor.lastrowid))
+        return tuple(message_ids)
+
+    def add_messages(self, session_name, messages):
+        """Atomically append one ordered batch of conversation messages."""
+        serialized, has_new_media = self._serialize_message_batch(messages)
         if not serialized:
             return
 
@@ -1420,19 +1453,107 @@ class MemoryManager:
                     if row is None:
                         raise RuntimeError(f"会话档案创建失败: {session_name!r}")
                     session_id = row[0]
-                cursor.executemany('''
-                    INSERT INTO messages (session_id, role, content)
-                    VALUES (?, ?, ?)
-                ''', [
-                    (session_id, role, content)
-                    for role, content in serialized
-                ])
+                self._insert_message_batch_locked(cursor, session_name, serialized)
                 # 新媒体入库的同一事务内折叠旧媒体：请求路径不再改写历史中间字节
                 if has_new_media:
                     self._fold_stale_media_locked(cursor, session_id)
                 # 更新最近活跃时间，供会话列表按时间展示
                 cursor.execute('UPDATE sessions SET updated_at = ? WHERE id = ?', (now, session_id))
                 self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def add_messages_with_harness_events(
+        self,
+        session_name,
+        messages,
+        *,
+        turn_id,
+        step_id,
+        events,
+        _created_at_ms=None,
+    ) -> tuple[int, ...]:
+        """Commit messages and their Harness event references atomically."""
+        serialized, has_new_media = self._serialize_message_batch(messages)
+        events = list(events)
+        self._validate_harness_message_events(events, len(serialized), step_id)
+        if not serialized:
+            return ()
+
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT sessions.id FROM sessions "
+                    "JOIN harness_turns ON harness_turns.session_id = sessions.id "
+                    "JOIN harness_steps ON harness_steps.turn_id = harness_turns.turn_id "
+                    "WHERE sessions.session_name = ? AND harness_turns.turn_id = ? "
+                    "AND harness_steps.step_id = ?",
+                    (session_name, turn_id, step_id),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    raise RuntimeError(
+                        "missing or mismatched harness session, turn, or step"
+                    )
+                session_id = row[0]
+                message_ids = self._insert_message_batch_locked(
+                    cursor,
+                    session_name,
+                    serialized,
+                )
+                if has_new_media:
+                    self._fold_stale_media_locked(cursor, session_id)
+
+                created_at_ms = (
+                    time.time_ns() // 1_000_000
+                    if _created_at_ms is None
+                    else int(_created_at_ms)
+                )
+                for draft in events:
+                    cursor.execute(
+                        "UPDATE harness_turns SET last_sequence = last_sequence + 1 "
+                        "WHERE turn_id = ?",
+                        (turn_id,),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(f"missing harness turn: {turn_id}")
+                    cursor.execute(
+                        "SELECT last_sequence FROM harness_turns WHERE turn_id = ?",
+                        (turn_id,),
+                    )
+                    sequence = int(cursor.fetchone()[0])
+                    cursor.execute(
+                        "INSERT INTO harness_events "
+                        "(turn_id, step_id, sequence, kind, created_at_ms, message_id, "
+                        "tool_name, call_ordinal, arguments_sha256, result_sha256, "
+                        "duration_ms, result_status, error_code) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            turn_id,
+                            draft.step_id,
+                            sequence,
+                            draft.kind.value,
+                            int(created_at_ms),
+                            message_ids[draft.message_index],
+                            draft.tool_name,
+                            draft.call_ordinal,
+                            draft.arguments_sha256,
+                            draft.result_sha256,
+                            draft.duration_ms,
+                            draft.result_status,
+                            draft.error_code,
+                        ),
+                    )
+
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (now, session_id),
+                )
+                self.conn.commit()
+                return message_ids
             except Exception:
                 self.conn.rollback()
                 raise
@@ -1531,6 +1652,7 @@ class MemoryManager:
                 session_id = row[0]
                 cursor.execute('SELECT COUNT(*) FROM messages WHERE session_id = ?', (session_id,))
                 deleted = cursor.fetchone()[0] or 0
+                cursor.execute('DELETE FROM harness_turns WHERE session_id = ?', (session_id,))
                 cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
                 self._delete_deepseek_prompt_generations_locked(cursor, [session_name])
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
