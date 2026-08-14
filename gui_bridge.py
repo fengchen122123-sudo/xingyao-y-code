@@ -766,9 +766,9 @@ class ApiBridge:
             models = model_settings["models"]
             providers = model_settings["providers"]
 
-            # 以“当前会话归属”恢复工作区上下文（启动时已自动选中最近一次对话）：
+            # 以"当前会话归属"恢复工作区上下文（启动时已自动选中最近一次对话）：
             # GLOBAL 会话显示自由对话；项目会话切到其工作目录并加载对应文件树。
-            # 不能用启动目录判断——否则会出现“显示在工作区、实际发进对话”的错位。
+            # 不能用启动目录判断——否则会出现"显示在工作区、实际发进对话"的错位。
             cur_wdir = self._session_workdir(self._current_session)
             is_global = (cur_wdir == "GLOBAL")
             if is_global:
@@ -776,8 +776,24 @@ class ApiBridge:
                 file_tree: List[Dict[str, Any]] = []
             else:
                 workdir = _resolve_real_path(cur_wdir)
-                file_tree = self._get_file_tree(workdir)
-            self._recalc_token_usage(self._current_session)
+                # 文件树扫描改为异步：大目录（如 node_modules 深层）扫描可能耗时数秒，
+                # 若在 get_initial_state 同步执行会卡住加载页（用户看到"一直转圈"）。
+                # 先返回空树，后台扫描完成后通过事件推送到前端刷新文件面板。
+                file_tree = []
+                threading.Thread(
+                    target=self._async_load_file_tree,
+                    args=(workdir,),
+                    daemon=True,
+                    name="gui-file-tree-loader",
+                ).start()
+            # token 用量重算也改为异步：SQLite 在旧实例未完全退出时可能持锁，
+            # 同步等待会卡住启动页。先返回空，后台算好后推送。
+            threading.Thread(
+                target=self._async_recalc_token_usage,
+                args=(self._current_session,),
+                daemon=True,
+                name="gui-token-recalc",
+            ).start()
             return {
                 "models": models,
                 "providers": providers,
@@ -987,10 +1003,44 @@ class ApiBridge:
             logger.exception("select_workspace_folder 失败")
             return {"ok": False, "msg": str(e)}
 
+    def _async_load_file_tree(self, workdir: str):
+        """异步加载文件树：后台扫描完成后通过事件推送到前端刷新文件面板。
+
+        原同步实现在 get_initial_state 中执行，大目录（node_modules 深层、
+        大量子目录）扫描耗时数秒，导致启动页卡死（前端一直在等
+        get_initial_state 返回，"交换页面"永远转圈）。改为异步后，
+        get_initial_state 立即返回空 file_tree，前端先渲染出主界面；
+        扫描完成后通过 file_tree_loaded 事件推送到前端，文件面板即时刷新。
+        """
+        try:
+            tree = self._get_file_tree(workdir)
+            self._emit_raw("file_tree_loaded", {
+                "file_tree": tree,
+                "workdir": workdir,
+            })
+            logger.info("异步文件树加载完成: %s（%d 项）", workdir, len(tree))
+        except Exception:
+            logger.warning("异步文件树加载失败: %s", workdir, exc_info=True)
+
+    def _async_recalc_token_usage(self, session_name: str):
+        """异步重算 token 用量：SQLite 锁竞争时不再阻塞启动页。
+
+        原同步实现在 get_initial_state 中调用 _recalc_token_usage，
+        当旧实例未完全退出（WAL 锁仍被持有）或 ycode_gui.db 较大时，
+        该调用可能卡住数十秒，表现为启动页转圈。改为后台执行，
+        完成后推送 token_usage_updated 事件让前端刷新用量显示。
+        """
+        try:
+            self._recalc_token_usage(session_name)
+            usage = self.get_token_usage()
+            self._emit_raw("token_usage_updated", usage)
+            logger.info("异步 token 用量重算完成: %s", session_name)
+        except Exception:
+            logger.debug("异步 token 用量重算失败: %s", session_name, exc_info=True)
+
     # ------------------------------------------------------------------
-    # 会话管理
-    # ------------------------------------------------------------------
-    def get_sessions(self) -> List[Dict[str, Any]]:
+    # 会话持久化：历史会话列表
+    # ------------------------------------------------------------------    def get_sessions(self) -> List[Dict[str, Any]]:
         try:
             # include_empty=True：空会话交给下方自己的跳过逻辑处理（当前会话
             # 即使还没有消息也要显示），否则刚新建的会话在侧栏永远是 0 个会话
