@@ -1986,8 +1986,8 @@ def test_nonpersistent_vision_turn_does_not_replace_database_content(
 # ── DeepSeek thinking：带 tool_calls 的 assistant 必须回传 reasoning_content key ──
 
 
-@pytest.mark.parametrize("reasoning", [None, "", " ", "\t"])
-def test_deepseek_thinking_requires_complete_reasoning_content(
+@pytest.mark.parametrize("reasoning", [None, 123])
+def test_deepseek_thinking_requires_reasoning_content_string_field(
     monkeypatch, reasoning
 ):
     import core.llm as llm_mod
@@ -2010,6 +2010,52 @@ def test_deepseek_thinking_requires_complete_reasoning_content(
             "openai/deepseek-v4-pro",
             "https://api.deepseek.com",
         )
+
+
+def test_deepseek_thinking_tool_call_without_reasoning_replays_empty_key(
+    mocker, monkeypatch
+):
+    """provider 不发 reasoning delta 时，下一请求仍须回传显式空 key。"""
+    import core.llm as llm_mod
+
+    monkeypatch.setattr(llm_mod, "get_tools_schema", lambda: [])
+    monkeypatch.setattr(
+        "core.model_manager.get_model_protocol",
+        lambda model, api_base=None: "openai",
+    )
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_litellm_model",
+        lambda model, api_base=None: {"enable_thinking": True},
+    )
+    captured = []
+
+    def fake_completion(**kwargs):
+        captured.append(json.loads(json.dumps(kwargs["messages"])))
+        if len(captured) == 1:
+            return iter([_chunk(tool_calls=[
+                _tool_call(0, "missing-reasoning", "unknown_tool", "{}"),
+            ])])
+        return iter([_chunk(content="完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+    messages = [{"role": "user", "content": "执行工具"}]
+
+    events = list(chat_with_model_events(
+        "openai/deepseek-v4-pro",
+        "fake-key",
+        messages,
+        "https://api.deepseek.com",
+        persist=False,
+        turn_id="deepseek-empty-reasoning",
+        consume_background_notifications=False,
+    ))
+
+    assert events[-1].kind == "turn_finished"
+    assistant = next(
+        message for message in captured[1]
+        if message.get("role") == "assistant" and message.get("tool_calls")
+    )
+    assert assistant["reasoning_content"] == ""
 
 
 def test_official_deepseek_openai_route_preserves_complete_reasoning(monkeypatch):
