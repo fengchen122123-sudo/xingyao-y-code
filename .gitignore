@@ -66,6 +66,7 @@ scratch/
 generate_interview_pdf*.py
 zip/
 *.pdf
+.pytest_tmp/
 
 # Build logs
 build_log.txt
