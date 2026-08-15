@@ -315,6 +315,7 @@ from core.command_policy import (
     session_rule_for_command,
 )
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
+from core.harness.stream_assembler import StreamAssembler, complete_thinking_blocks
 from core.tool_presenter import (
     build_tool_display,
     summarize_tool_finished,
@@ -2652,23 +2653,7 @@ def _provider_request_options(
 
 def _complete_thinking_blocks(delta):
     """Extract only complete provider blocks that are safe to round-trip."""
-    fields = getattr(delta, "provider_specific_fields", None) or {}
-    blocks = fields.get("thinking_blocks") if isinstance(fields, dict) else None
-    if not isinstance(blocks, list):
-        return None
-    complete = [
-        deepcopy(block)
-        for block in blocks
-        if isinstance(block, dict)
-        and (
-            bool(block.get("signature"))
-            or (
-                block.get("type") == "redacted_thinking"
-                and bool(block.get("data"))
-            )
-        )
-    ]
-    return complete or None
+    return complete_thinking_blocks(delta)
 
 def _notify_event(event_callback, kind, payload):
     if event_callback is not None:
@@ -3877,97 +3862,25 @@ def _chat_with_model_generator(
                     else:
                         raise api_err
 
-            accumulated_content = ""
-            tool_calls_dict = {}
-            in_native_think = False
-            provider_thinking_blocks = None
-            finish_reason = None
-
-            stream_usage = None
+            stream_assembler = StreamAssembler(
+                keep_reasoning_fields=_supports_reasoning_fields(
+                    model_name, api_base
+                ),
+                keep_thinking_blocks=(
+                    str(model_name or "").split("/")[0].lower() == "anthropic"
+                ),
+                require_tool_call_reasoning=_requires_tool_call_reasoning(
+                    model_name, api_base
+                ),
+            )
             for chunk in _stream_chunks_with_idle_notice(
                 response_stream, event_callback, raise_if_cancelled,
                 inflight_holder=inflight_holder, cancel_event=cancel_event,
             ):
                 raise_if_cancelled()
-
-                # 同一流中可能出现多个带 usage 的 chunk，只保留最后一个，
-                # 在流结束后统一记账一次，避免 cumulative_* 被反复累加
-                if getattr(chunk, 'usage', None):
-                    stream_usage = chunk.usage
-
-                if not chunk.choices:
-                    continue
-
-                chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                if chunk_finish_reason:
-                    finish_reason = chunk_finish_reason
-
-                delta = chunk.choices[0].delta
-
-                complete_blocks = _complete_thinking_blocks(delta)
-                if complete_blocks is not None:
-                    provider_thinking_blocks = complete_blocks
-                
-                # reasoning_content (DeepSeek R1/V3)
-                # 注意：thinking 事件只由下游 parser 根据 <think> 文本统一转换，
-                # 此处不再直接发事件，避免双重发射
-                reasoning = getattr(delta, "reasoning_content", "") or ""
-                if reasoning:
-                    if not in_native_think:
-                        yield "<think>"
-                        accumulated_content += "<think>"
-                        in_native_think = True
-                    yield reasoning
-                    accumulated_content += reasoning
-                    
-                # Content text
-                content = getattr(delta, "content", "") or ""
-                if content:
-                    if in_native_think:
-                        yield "</think>"
-                        accumulated_content += "</think>"
-                        in_native_think = False
-                    yield content
-                    accumulated_content += content
-                    
-                # Tool Calls
-                if getattr(delta, "tool_calls", None):
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_dict:
-                            tool_calls_dict[idx] = {
-                                "id": None,
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""}
-                            }
-                        # 某些 provider 首 chunk 的 tool_call id 为 None，在后续 chunk 才给出。
-                        # 这里用 None 占位，遇到真实 id 再回填；始终没有则用 call_{idx} 兜底。
-                        tc_id = getattr(tc, "id", None)
-                        existing_id = tool_calls_dict[idx].get("id")
-                        if tc_id:
-                            if not existing_id or str(existing_id).startswith("call_"):
-                                tool_calls_dict[idx]["id"] = str(tc_id)
-                        elif not existing_id:
-                            tool_calls_dict[idx]["id"] = f"call_{idx}"
-                        # name 只在为空时赋值：provider 重复发 name 时 += 会拼出
-                        # "read_fileread_file" 之类的坏名字
-                        if getattr(tc.function, "name", None) and not tool_calls_dict[idx]["function"]["name"]:
-                            tool_calls_dict[idx]["function"]["name"] = tc.function.name
-                        if getattr(tc.function, "arguments", None):
-                            tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
-            
-            if in_native_think:
-                yield "</think>"
-                accumulated_content += "</think>"
-
-            # 输出被模型长度限制截断：给出明确提示，避免用户以为任务已完成。
-            if finish_reason == "length":
-                truncated_notice = (
-                    "\n[回复已被模型长度限制截断。如需完整结果，请尝试："
-                    "1) 让模型分步骤输出；2) 换用输出上限更高的模型；"
-                    "3) 在 config.json 中为当前模型增大 max_tokens。]"
-                )
-                _notify_event(event_callback, "notice", {"message": truncated_notice.strip()})
+                update = stream_assembler.consume(chunk)
+                if update.public_text:
+                    yield update.public_text
 
             # litellm 流式包装器在 finish 之后收到的最终 usage chunk 会被吞进
             # wrapper.chunks 而不再 yield（StopIteration 分支）。迭代中拿到的
@@ -3978,8 +3891,24 @@ def _chat_with_model_generator(
                 for _tail_chunk in reversed(_tail_chunks):
                     _tail_usage = getattr(_tail_chunk, "usage", None)
                     if _tail_usage is not None:
-                        stream_usage = _tail_usage
+                        stream_assembler.observe_usage(_tail_usage)
                         break
+
+            assembled_response = stream_assembler.finish()
+            if stream_assembler.finish_public_text:
+                yield stream_assembler.finish_public_text
+
+            finish_reason = assembled_response.finish_reason
+            stream_usage = assembled_response.usage
+
+            # 输出被模型长度限制截断：给出明确提示，避免用户以为任务已完成。
+            if finish_reason == "length":
+                truncated_notice = (
+                    "\n[回复已被模型长度限制截断。如需完整结果，请尝试："
+                    "1) 让模型分步骤输出；2) 换用输出上限更高的模型；"
+                    "3) 在 config.json 中为当前模型增大 max_tokens。]"
+                )
+                _notify_event(event_callback, "notice", {"message": truncated_notice.strip()})
 
             if cache_scope == "main" and keepalive_interval:
                 cache_keepalive_service.register_request(
@@ -4004,7 +3933,8 @@ def _chat_with_model_generator(
                     invalidation_reason=request_cache_reason,
                 )
 
-            reasoning_content, public_content = split_reasoning_text(accumulated_content)
+            reasoning_content = stream_assembler.raw_reasoning_content
+            public_content = assembled_response.content
             from core.turn_renderer import sanitize_protocol_text
             public_content = sanitize_protocol_text(public_content)
 
@@ -4016,7 +3946,7 @@ def _chat_with_model_generator(
             raw_content_meaningful = _is_meaningful_assistant_content(public_content)
             promoted_reasoning = False
             if (
-                not tool_calls_dict
+                not assembled_response.tool_calls
                 and not raw_content_meaningful
                 and _is_meaningful_assistant_content(reasoning_content)
             ):
@@ -4042,20 +3972,10 @@ def _chat_with_model_generator(
                             "message": f"写入日记账记忆失败：{str(log_err)}",
                         })
 
-            tool_calls_list = []
-            for idx in sorted(tool_calls_dict.keys()):
-                tool_calls_list.append(tool_calls_dict[idx])
+            tool_calls_list = assembled_response.tool_calls
             current_tool_calls = tool_calls_list
-
-            replay_reasoning_content = reasoning_content or None
-            if (
-                tool_calls_list
-                and _requires_tool_call_reasoning(model_name, api_base)
-                and isinstance(reasoning_content, str)
-            ):
-                # DeepSeek thinking 的下一轮工具续传要求该 key 始终存在。
-                # 没有 reasoning delta 时保留协议层空串，不伪造推理正文。
-                replay_reasoning_content = reasoning_content
+            replay_reasoning_content = assembled_response.reasoning_content
+            provider_thinking_blocks = assembled_response.thinking_blocks
                 
             message_to_append = {
                 "role": "assistant",
