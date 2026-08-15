@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
+from concurrent.futures import Future, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 from typing import Callable
 
 import core.app_context as app_context
 from core.harness.tool_adapters import ToolAdapterSet
 from core.harness.tool_contracts import resolve_tool
+from core.harness.models import HarnessEventKind, JournalEventDraft
 from core.tool_registry import ToolRegistry
 
 
@@ -45,6 +48,10 @@ _PLAN_BOUND_ORCHESTRATORS = frozenset({"run_subagent", "ask_user"})
 _plan_turn_lock = threading.Lock()
 _plan_turn_started_at: dict[str, float] = {}
 
+REPEAT_CALL_BLOCKED_TEXT = (
+    "🛑 检测到相同的工具调用已成功执行过 2 次，结果未发生变化。请改用其他方式推进任务。"
+)
+
 
 @dataclass(frozen=True)
 class ToolExecutionContext:
@@ -66,6 +73,327 @@ class DecodedToolCall:
     name: str
     arguments: dict
     raw_arguments: str
+
+
+@dataclass(frozen=True)
+class ToolExecutionRecord:
+    call_ordinal: int
+    message: dict
+    duration_ms: int
+
+
+@dataclass(frozen=True)
+class ToolBatch:
+    parallel: bool
+    calls: tuple[dict, ...]
+
+
+@dataclass(frozen=True)
+class _PreparedToolCall:
+    call_ordinal: int
+    raw: dict
+    decoded: DecodedToolCall
+
+
+@dataclass(frozen=True)
+class _PreparedToolBatch:
+    parallel: bool
+    calls: tuple[_PreparedToolCall, ...]
+
+
+class RepeatCallGuard:
+    """Block a third successful call with the same canonical signature."""
+
+    BLOCK_AFTER_SUCCESSES = 2
+
+    def __init__(self):
+        self._success_counts: dict[str, int] = {}
+        self._lock = threading.Lock()
+
+    @staticmethod
+    def signature(name, arguments_json):
+        try:
+            parsed = json.loads(arguments_json or "{}")
+            canonical = json.dumps(
+                parsed,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        except Exception:
+            canonical = str(arguments_json or "")
+        return f"{name}:{canonical}"
+
+    def should_execute(self, name, arguments_json):
+        signature = self.signature(name, arguments_json)
+        with self._lock:
+            return self._success_counts.get(signature, 0) < self.BLOCK_AFTER_SUCCESSES
+
+    def record(self, name, arguments_json, ok):
+        if not ok:
+            return
+        signature = self.signature(name, arguments_json)
+        with self._lock:
+            self._success_counts[signature] = (
+                self._success_counts.get(signature, 0) + 1
+            )
+
+
+def _repeat_call_blocked_result(decoded: DecodedToolCall) -> dict:
+    return {
+        "role": "tool",
+        "tool_call_id": decoded.call_id,
+        "name": decoded.name,
+        "content": REPEAT_CALL_BLOCKED_TEXT,
+    }
+
+
+def _submit_daemon_call(function, *args, **kwargs):
+    future = Future()
+
+    def runner():
+        if not future.set_running_or_notify_cancel():
+            return
+        try:
+            future.set_result(function(*args, **kwargs))
+        except BaseException as error:
+            future.set_exception(error)
+
+    threading.Thread(
+        target=runner,
+        daemon=True,
+        name="ycode-tool-call",
+    ).start()
+    return future
+
+
+def group_tool_batches(tool_calls: list[dict], registry: ToolRegistry) -> tuple[ToolBatch, ...]:
+    batches: list[ToolBatch] = []
+    for tool_call in tool_calls:
+        name = tool_call["function"]["name"]
+        try:
+            parallel = bool(registry.get(name).parallel_safe)
+        except KeyError:
+            parallel = False
+        if batches and batches[-1].parallel and parallel:
+            previous = batches[-1]
+            batches[-1] = ToolBatch(True, (*previous.calls, tool_call))
+        else:
+            batches.append(ToolBatch(parallel, (tool_call,)))
+    return tuple(batches)
+
+
+def build_tool_result_event_draft(
+    step_id: str,
+    tool_call: dict,
+    record: ToolExecutionRecord,
+    *,
+    message_index: int,
+    ok: bool,
+) -> JournalEventDraft:
+    raw_arguments = tool_call["function"].get("arguments", "{}")
+    result_content = str(record.message.get("content", "") or "")
+    return JournalEventDraft(
+        HarnessEventKind.TOOL_RESULT_COMMITTED,
+        step_id=step_id,
+        message_index=message_index,
+        tool_name=tool_call["function"]["name"],
+        call_ordinal=record.call_ordinal,
+        arguments_sha256=hashlib.sha256(raw_arguments.encode("utf-8")).hexdigest(),
+        result_sha256=hashlib.sha256(result_content.encode("utf-8")).hexdigest(),
+        duration_ms=max(0, int(record.duration_ms)),
+        result_status="ok" if ok else "error",
+    )
+
+
+class ToolBatchExecutor:
+    """Execute adjacent safe tools concurrently and return model-ordered records."""
+
+    def __init__(
+        self,
+        pipeline: "ToolPipeline",
+        *,
+        repeat_guard: RepeatCallGuard | None = None,
+        execute_decoded: Callable[[DecodedToolCall, ToolExecutionContext], dict]
+        | None = None,
+        event_payload: Callable[[DecodedToolCall], dict] | None = None,
+        finished_event_payload: Callable[[DecodedToolCall, dict, int], dict]
+        | None = None,
+        result_ok: Callable[[str, dict], bool] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+        submit_call: Callable = _submit_daemon_call,
+        poll_interval: float = 0.1,
+        max_parallel: int = 4,
+    ):
+        if max_parallel < 1:
+            raise ValueError("max_parallel must be positive")
+        self.pipeline = pipeline
+        self.repeat_guard = repeat_guard or RepeatCallGuard()
+        self.execute_decoded = execute_decoded or pipeline.execute_decoded
+        self.event_payload = event_payload or self._default_event_payload
+        self.finished_event_payload = (
+            finished_event_payload or self._default_finished_event_payload
+        )
+        self.result_ok = result_ok or self._default_result_ok
+        self.clock = clock
+        self.submit_call = submit_call
+        self.poll_interval = min(0.1, max(0.001, float(poll_interval)))
+        self._parallel_slots = threading.BoundedSemaphore(max_parallel)
+
+    @staticmethod
+    def _default_event_payload(decoded):
+        return {
+            "id": decoded.call_id,
+            "name": decoded.name,
+            "arguments": decoded.arguments,
+        }
+
+    @staticmethod
+    def _default_result_ok(_name, message):
+        return not str(message.get("content", "") or "").startswith(TOOL_ERROR_PREFIX)
+
+    @classmethod
+    def _default_finished_event_payload(cls, decoded, message, duration_ms):
+        payload = cls._default_event_payload(decoded)
+        payload.update(
+            ok=cls._default_result_ok(decoded.name, message),
+            result=str(message.get("content", "") or ""),
+            duration_ms=max(0, int(duration_ms)),
+        )
+        return payload
+
+    @staticmethod
+    def _emit(on_event, kind, payload):
+        if on_event is not None:
+            on_event(kind, payload)
+
+    @staticmethod
+    def _raise_if_cancelled(cancel_event):
+        if cancel_event is not None and cancel_event.is_set():
+            raise KeyboardInterrupt("用户终止了工具执行。")
+
+    def _execute_timed(self, decoded, context):
+        started_at = self.clock()
+        message = self.execute_decoded(decoded, context)
+        duration_ms = round((self.clock() - started_at) * 1000)
+        return message, max(0, duration_ms)
+
+    def _execute_guarded(self, decoded, context):
+        if not self.repeat_guard.should_execute(decoded.name, decoded.raw_arguments):
+            return _repeat_call_blocked_result(decoded), 0
+        message, duration_ms = self._execute_timed(decoded, context)
+        self.repeat_guard.record(
+            decoded.name,
+            decoded.raw_arguments,
+            ok=self.result_ok(decoded.name, message),
+        )
+        return message, duration_ms
+
+    def _execute_parallel(self, decoded, context):
+        with self._parallel_slots:
+            return self._execute_guarded(decoded, context)
+
+    def _wait_for(self, future, cancel_event):
+        while not future.done():
+            self._raise_if_cancelled(cancel_event)
+            try:
+                future.result(timeout=self.poll_interval)
+            except FutureTimeoutError:
+                pass
+        self._raise_if_cancelled(cancel_event)
+        return future.result()
+
+    def prepare(self, tool_calls: list[dict], context: ToolExecutionContext):
+        decoded_by_id = {
+            id(tool_call): decode_tool_call(tool_call) for tool_call in tool_calls
+        }
+        ordinal_by_id = {
+            id(tool_call): ordinal for ordinal, tool_call in enumerate(tool_calls)
+        }
+        return tuple(
+            _PreparedToolBatch(
+                batch.parallel,
+                tuple(
+                    _PreparedToolCall(
+                        ordinal_by_id[id(tool_call)],
+                        tool_call,
+                        decoded_by_id[id(tool_call)],
+                    )
+                    for tool_call in batch.calls
+                ),
+            )
+            for batch in group_tool_batches(tool_calls, context.registry)
+        )
+
+    def begin_batch(self, batch, context, on_event):
+        self._raise_if_cancelled(context.cancel_event)
+        for prepared_call in batch.calls:
+            self._emit(
+                on_event,
+                "tool_requested",
+                self.event_payload(prepared_call.decoded),
+            )
+        for prepared_call in batch.calls:
+            self._emit(
+                on_event,
+                "tool_started",
+                self.event_payload(prepared_call.decoded),
+            )
+
+    def execute_batch(self, batch, context, on_event):
+        self._raise_if_cancelled(context.cancel_event)
+        if batch.parallel and len(batch.calls) > 1:
+            futures = [
+                self.submit_call(
+                    self._execute_parallel,
+                    prepared_call.decoded,
+                    context,
+                )
+                for prepared_call in batch.calls
+            ]
+            results = [
+                self._wait_for(future, context.cancel_event) for future in futures
+            ]
+        else:
+            results = []
+            for prepared_call in batch.calls:
+                self._raise_if_cancelled(context.cancel_event)
+                results.append(
+                    self._execute_guarded(prepared_call.decoded, context)
+                )
+
+        records = []
+        for prepared_call, (message, duration_ms) in zip(batch.calls, results):
+            record = ToolExecutionRecord(
+                prepared_call.call_ordinal,
+                message,
+                duration_ms,
+            )
+            records.append(record)
+            self._emit(
+                on_event,
+                "tool_finished",
+                self.finished_event_payload(
+                    prepared_call.decoded,
+                    message,
+                    duration_ms,
+                ),
+            )
+        return tuple(records)
+
+    def execute(
+        self,
+        tool_calls: list[dict],
+        context: ToolExecutionContext,
+        on_event: Callable[[str, dict], None] | None,
+    ) -> tuple[ToolExecutionRecord, ...]:
+        records: list[ToolExecutionRecord] = []
+
+        for batch in self.prepare(tool_calls, context):
+            self.begin_batch(batch, context, on_event)
+            records.extend(self.execute_batch(batch, context, on_event))
+
+        return tuple(sorted(records, key=lambda record: record.call_ordinal))
 
 
 def mark_plan_turn(turn_id):
@@ -309,21 +637,20 @@ class ToolPipeline:
             return PERMISSION_CANCELLED_MESSAGE
         return PERMISSION_DENIED_MESSAGE
 
-    def execute_one(self, tool_call, context) -> dict:
-        try:
-            decoded = decode_tool_call(tool_call)
-        except ValueError as parse_error:
-            name = tool_call["function"]["name"]
-            return {
-                "role": "tool",
-                "tool_call_id": tool_call["id"],
-                "name": name,
-                "content": (
-                    f"工具参数 JSON 解析失败：{parse_error}。"
-                    "请重新调用该工具，并确保 arguments 是合法、完整、未混入其他文本的 JSON。"
-                ),
-            }
+    @staticmethod
+    def _decode_error_message(tool_call, parse_error) -> dict:
+        name = tool_call["function"]["name"]
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "name": name,
+            "content": (
+                f"工具参数 JSON 解析失败：{parse_error}。"
+                "请重新调用该工具，并确保 arguments 是合法、完整、未混入其他文本的 JSON。"
+            ),
+        }
 
+    def execute_decoded(self, decoded: DecodedToolCall, context) -> dict:
         _raise_if_cancelled(context.cancel_event)
         constrained = self._plan_constraint(decoded, context)
         if constrained is not None:
@@ -347,3 +674,10 @@ class ToolPipeline:
         )
         content = self.truncate_result(decoded.name, result.to_message_content())
         return _tool_message(decoded, content)
+
+    def execute_one(self, tool_call, context) -> dict:
+        try:
+            decoded = decode_tool_call(tool_call)
+        except ValueError as parse_error:
+            return self._decode_error_message(tool_call, parse_error)
+        return self.execute_decoded(decoded, context)
