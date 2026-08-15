@@ -656,6 +656,8 @@ class ToolPipeline:
         if constrained is not None:
             return _tool_message(decoded, constrained)
 
+        # 契约解析（严格注册表 + MCP 回退）：invariant 异常（如损坏的注册表）
+        # 必须显式传播，不得吞成工具错误；仅"未找到"转为友好提示。
         try:
             resolved = resolve_tool(decoded.name, context.registry, context.mcp_manager)
         except KeyError:
@@ -663,17 +665,28 @@ class ToolPipeline:
                 decoded, f"{TOOL_ERROR_PREFIX} 未找到名为 {decoded.name} 的工具！"
             )
 
-        self.adapters.announce(decoded.name, decoded.arguments, context.event_callback)
-        denied = self._permission_decision(resolved, decoded, context)
-        if denied is not None:
-            return _tool_message(decoded, denied)
-        _raise_if_cancelled(context.cancel_event)
+        # 执行段（状态播报/权限询问/适配器 IO）与旧 _execute_single_tool_call
+        # 的兜底边界一致：单工具系统级异常（如权限终端 input 的 OSError）转成
+        # 工具错误结果返回，绝不击穿外层循环终结整个回合；KeyboardInterrupt
+        # （取消路径）不属于 Exception，仍向上传递。
+        try:
+            self.adapters.announce(
+                decoded.name, decoded.arguments, context.event_callback
+            )
+            denied = self._permission_decision(resolved, decoded, context)
+            if denied is not None:
+                return _tool_message(decoded, denied)
+            _raise_if_cancelled(context.cancel_event)
 
-        result = self.adapters.for_call(decoded.call_id).execute(
-            resolved, decoded.arguments, context
-        )
-        content = self.truncate_result(decoded.name, result.to_message_content())
-        return _tool_message(decoded, content)
+            result = self.adapters.for_call(decoded.call_id).execute(
+                resolved, decoded.arguments, context
+            )
+            content = result.to_message_content()
+        except Exception as tool_err:
+            content = (
+                f"{TOOL_ERROR_PREFIX} 调用工具 {decoded.name} 时发生系统内部错误：{tool_err}"
+            )
+        return _tool_message(decoded, self.truncate_result(decoded.name, content))
 
     def execute_one(self, tool_call, context) -> dict:
         try:
