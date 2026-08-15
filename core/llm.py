@@ -24,6 +24,7 @@ from core.harness.request_envelope import (
     _responses_tools_from_chat_tools,
     prepare_stream_request,
 )
+from core.harness.journal import journal_storage_supported
 from core.harness.runtime import TurnRuntime
 
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
@@ -1809,14 +1810,21 @@ def chat_with_model_events(
     """
     resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
     resolved_parent_turn_id = parent_turn_id or resolved_turn_id
-    harness_runtime = TurnRuntime.start(
-        resolved_turn_id,
-        parent_session,
-        persist=bool(persist),
-        manager=app_context.get_manager() if persist else None,
-        cancel_event=cancel_event,
-        clock_ms=lambda: time.time_ns() // 1_000_000,
-    )
+    # Duck-type 管理器（未实现 Journal 存储接口的旧测试替身/外部调用方）
+    # 不进入 Harness Journal，退回 legacy add_messages 持久化路径；
+    # 真实 MemoryManager 始终具备完整接口，照常走 Journal。
+    _manager = app_context.get_manager() if persist else None
+    if persist and not journal_storage_supported(_manager):
+        harness_runtime = None
+    else:
+        harness_runtime = TurnRuntime.start(
+            resolved_turn_id,
+            parent_session,
+            persist=bool(persist),
+            manager=_manager,
+            cancel_event=cancel_event,
+            clock_ms=lambda: time.time_ns() // 1_000_000,
+        )
     factory = TurnEventFactory(resolved_turn_id)
     pending_events = []
     pending_lock = threading.Lock()
@@ -1897,14 +1905,16 @@ def chat_with_model_events(
         if not turn_failed:
             yield factory.emit("turn_finished", {})
     except KeyboardInterrupt:
-        harness_runtime.cancel()
+        if harness_runtime is not None:
+            harness_runtime.cancel()
         yield from drain_public_events()
         yield factory.emit("turn_cancelled", {})
         raise
     except Exception as exc:
         # 生成器前置区（记忆注入/通知 drain/请求构造）抛出的异常会穿透内部
         # try 直接传播到这里：补发 turn_error，保证调用方能感知回合失败
-        harness_runtime.fail(type(exc).__name__)
+        if harness_runtime is not None:
+            harness_runtime.fail(type(exc).__name__)
         yield from drain_public_events()
         yield factory.emit("turn_error", {"message": _sanitize_error_text(exc)})
         raise
@@ -3097,6 +3107,10 @@ def _execute_single_tool_call(
 
 
 _ORIGINAL_EXECUTE_SINGLE_TOOL_CALL = _execute_single_tool_call
+
+# 旧测试和外部调用方可能仍从 core.llm 导入该内部兼容名；实现只保留在
+# 固定 Harness 管线中，避免形成第二套重复调用判定逻辑。
+from core.harness.tool_pipeline import RepeatCallGuard as _RepeatCallGuard
 
 # ─── 工具结果入上下文前的截断 ────────────────────────────────────
 # 这是最大的 token 泄漏点：一次 fetch_url 可以塞进 512KB（≈13 万 token）原文，
