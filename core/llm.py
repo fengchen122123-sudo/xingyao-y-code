@@ -3026,60 +3026,24 @@ def _show_file_diff(
     truncated_note,
     tool_call_id="",
 ):
-    """渲染文件修改 diff 面板（write_file / edit_file 共用）。"""
-    try:
-        from core.diff_viewer import generate_diff, render_diff_table
-        from rich.panel import Panel
-        from rich.console import Console
-        diff_text = generate_diff(old_content, new_content, file_path)
-        if not diff_text:
-            return
-        lines = diff_text.split('\n')
-        max_lines = 25
-        display_text = (
-            '\n'.join(lines[:max_lines]) + f"\n... (省略 {len(lines) - max_lines} 行，{truncated_note})"
-            if len(lines) > max_lines else diff_text
-        )
-        diff_table = render_diff_table(display_text)
-        panel = Panel(diff_table, title=panel_title, border_style="green", expand=False)
-        from prompt_toolkit.formatted_text import ANSI
-        rich_console = Console(force_terminal=True, color_system="truecolor")
-        with rich_console.capture() as capture:
-            rich_console.print(panel)
-        diff_output = capture.get()
-        if event_callback is None:
-            safe_print(ANSI(diff_output))
-        else:
-            _notify_event(event_callback, "diff_ready", {
-                "tool_call_id": str(tool_call_id or ""),
-                "file_path": file_path,
-                # text: 终端用的 rich 面板（含 ANSI 颜色），TUI 直接打印
-                "text": diff_output,
-                # diff_text: 纯文本 unified diff，供 GUI 等非终端界面自行着色渲染
-                # （ANSI 转义码在 HTML 里会原样显示成乱码）
-                "diff_text": display_text,
-            })
-    except Exception as diff_err:
-        logger.warning("渲染文件 diff 失败 (%s): %s", file_path, diff_err)
+    """Compatibility wrapper for the extracted diff adapter."""
+    from core.harness.tool_adapters import _show_file_diff as _render_file_diff
 
-
+    return _render_file_diff(
+        file_path,
+        old_content,
+        new_content,
+        event_callback,
+        panel_title,
+        truncated_note,
+        tool_call_id=tool_call_id,
+    )
 
 def _get_imom_active_publish_root():
-    """读取 imom_locator 插件的当前活跃项目 publish_root，用于沙盒守卫。"""
-    try:
-        store_file = os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json")
-        with open(store_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        active = data.get("active")
-        projects = data.get("projects", {})
-        if active and active in projects:
-            return projects[active].get("publish_root", "")
-        if len(projects) == 1:
-            return next(iter(projects.values())).get("publish_root", "")
-    except Exception:
-        pass
-    return ""
+    """Compatibility wrapper for the extracted imom adapter."""
+    from core.harness.tool_adapters import _get_imom_active_publish_root as _get_root
 
+    return _get_root()
 
 def _sandbox_outside_guard(
     function_name,
@@ -3090,62 +3054,22 @@ def _sandbox_outside_guard(
     permission_source,
     cancel_event,
 ):
-    """沙盒外路径访问守卫：无论何种权限模式，每次访问工作目录外路径都必须询问用户。
+    """Compatibility wrapper for the extracted sandbox adapter."""
+    from core.harness.tool_adapters import _sandbox_outside_guard as _guard
 
-    返回 (bypass_cm, error)：
-    - (None, None)：在沙盒内，无需特殊处理
-    - (cm, None)：用户同意本次，调用方需在 cm 上下文中执行工具
-    - (None, err)：用户拒绝/取消，err 为工具结果文案
-    """
-    if not path_value:
-        return None, None
-    try:
-        outside = is_outside_workspace(path_value)
-    except Exception:
-        return None, PATH_VALIDATION_ERROR_MESSAGE
-    if not outside:
-        return None, None
-    from core import tools as _tools
-    # ycode 数据目录（~/.ycode 全部内容：记忆/会话/配置）是自家运行数据，
-    # read/write/edit 均豁免沙盒外询问；返回 bypass 上下文让工具层兜底校验放行
-    try:
-        from core.memory_kairos import is_ycode_data_path
-        if is_ycode_data_path(path_value):
-            basename = os.path.basename(str(path_value)).lower()
-            if basename not in {"config.json", "config.json.bak", "mcp.json", "mcp.json.bak"}:
-                return sandbox_bypass(), None
-    except Exception:
-        pass
-    if function_name == "read_file":
-        try:
-            from core.skills import is_trusted_read_path
-            if is_trusted_read_path(str(path_value)):
-                return None, None
-        except Exception:
-            pass
-    # 仅线程内单次放行（已批准的嵌套操作不重复询问）；
-    # 会话级放行（/sandbox on、"始终放行"）不再跳过询问。
-    if getattr(_tools._sandbox_tls, "depth", 0) > 0:
-        return None, None
-
-    try:
-        approved = check_permission_and_ask(
-            "sandbox_outside_access",
-            {"path": str(path_value), "operation": function_name},
-            event_callback=event_callback,
-            permission_owner=permission_owner,
-            parent_turn_id=parent_turn_id,
-            permission_source=permission_source,
-            cancel_event=cancel_event,
-        )
-    except PermissionSystemError:
-        return None, PERMISSION_SYSTEM_ERROR_MESSAGE
-    if approved:
-        return sandbox_bypass(), None
-    if cancel_event is not None and cancel_event.is_set():
-        return None, PERMISSION_CANCELLED_MESSAGE
-    return None, "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径每次访问都需要用户确认。"
-
+    return _guard(
+        function_name,
+        path_value,
+        event_callback,
+        permission_owner,
+        parent_turn_id,
+        permission_source,
+        cancel_event,
+        permission_checker=check_permission_and_ask,
+        is_outside_workspace=is_outside_workspace,
+        sandbox_bypass=sandbox_bypass,
+        permission_error_type=PermissionSystemError,
+    )
 
 def _execute_single_tool_call(
     tc,
@@ -3158,558 +3082,53 @@ def _execute_single_tool_call(
     permission_owner=None,
     permission_source="主代理",
 ):
-    """执行单个工具调用，并返回对应的 JSON 结果结构。"""
-    function_name = tc["function"]["name"]
-    try:
-        arguments = _tool_call_arguments(tc)
-    except ValueError as parse_error:
-        # 参数 JSON 彻底无法解析：直接返回错误，避免用空参数继续执行产生更迷惑的行为。
-        # 这对 plan_write 等写操作尤为重要，可防止模型把对话历史混进参数后误清空计划。
-        return {
-            "role": "tool",
-            "tool_call_id": tc["id"],
-            "name": function_name,
-            "content": (
-                f"工具参数 JSON 解析失败：{parse_error}。"
-                "请重新调用该工具，并确保 arguments 是合法、完整、未混入其他文本的 JSON。"
-            ),
-        }
+    """Compatibility wrapper around the extracted deterministic pipeline."""
+    from core.harness.tool_adapters import ToolAdapterSet
+    from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
+    from core.tool_registry import ToolRegistry
 
-    _raise_if_tool_cancelled(cancel_event)
-
-    plan_enforced = allow_subagents and (
-        _is_plan_turn(parent_turn_id) or _has_pending_plan(parent_session)
+    bound_execute = tool_registry.execute
+    registry_execute_override = (
+        bound_execute
+        if getattr(bound_execute, "__func__", None) is not ToolRegistry.execute
+        else None
     )
-    if plan_enforced:
-        plan_item_id = str(arguments.get("plan_item_id", "") or "").strip()
-        if function_name == "plan_write" and _is_plan_turn(parent_turn_id):
-            from core.plan import get_default_plan_manager
-
-            if any(
-                item.get("status") != "pending"
-                for item in get_default_plan_manager().snapshot()
-            ):
-                return {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": function_name,
-                    "content": (
-                        "计划执行约束：不能重建已有执行记录，请使用 "
-                        "/plan retry <id> 重试失败项。"
-                    ),
-                }
-        if function_name in _PLAN_BOUND_ORCHESTRATORS and not plan_item_id:
-            return {
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": function_name,
-                "content": (
-                    f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} "
-                    "必须填写 plan_item_id，不能执行未归属计划项的任务。"
-                ),
-            }
-        if function_name in _PLAN_READ_ONLY_TOOLS:
-            # 只读工具允许主 Agent 直接使用，便于验证子代理产出和读取上下文
-            pass
-        elif function_name not in _PLAN_ROOT_CONTROL_TOOLS:
-            from core.plan import get_default_plan_manager as _get_plan
-            _plan = _get_plan()
-            ready_items = _plan.ready_items()
-            ready_execution = [
-                item for item in ready_items if item.get("kind") != "input_preparation"
-            ]
-            snapshot = _plan.snapshot()
-            in_progress = any(
-                item.get("status") == "in_progress" for item in snapshot
-            )
-            # 计划停滞且重试耗尽（剩余项全部 failed/blocked/cancelled 且均尝试>=2 次）时，
-            # 放开主 Agent 直接调用作为兜底出口，避免子代理连续失败后主 Agent
-            # 被逼入只能空转或等待用户介入的死局；首次失败仍必须走 run_subagent。
-            stalled_items = [
-                item for item in snapshot
-                if item.get("status") in {"failed", "blocked", "cancelled"}
-            ]
-            retry_exhausted = bool(stalled_items) and all(
-                int(item.get("attempts", 0)) >= 2 for item in stalled_items
-            )
-            if not ready_execution and not in_progress and retry_exhausted:
-                pass
-            else:
-                # 构造可执行计划项列表，引导 LLM 使用正确的 plan_item_id
-                ready_hints = ""
-                if ready_execution:
-                    hints = ", ".join(
-                        f"'{item['id']}'({item['subject']})" for item in ready_execution[:5]
-                    )
-                    ready_hints = f" 当前可执行的计划项: [{hints}]。"
-                return {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": function_name,
-                    "content": (
-                        f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} 必须通过 "
-                        f"run_subagent(plan_item_id=...) 执行，不能由主 Agent 直接绕过计划调用。{ready_hints}"
-                        "（若计划项多次失败（attempts>=2）全部停滞后，主 Agent 可直接调用工具修复。）"
-                    ),
-                }
-            
-    # 生成友好的中文提示
-    friendly_msg = f"⚙️ 星瑶正在后台悄悄使用工具: {function_name} 哒～"
-    if function_name == "read_file":
-        friendly_msg = f"🔍 星瑶正在读取文件：{arguments.get('file_path', '未知文件')}"
-    elif function_name == "write_file":
-        friendly_msg = f"✍️ 星瑶正在写入文件：{arguments.get('file_path', '未知文件')}"
-    elif function_name == "list_directory":
-        friendly_msg = f"📂 星瑶正在查看目录：{arguments.get('dir_path', '当前目录')}"
-    elif function_name == "execute_command":
-        cmd = arguments.get('command', '...')
-        if len(cmd) > 20: cmd = cmd[:20] + "..."
-        friendly_msg = f"💻 星瑶正在执行命令：{cmd}"
-    elif function_name == "search_code":
-        friendly_msg = f"🔍 星瑶正在全局查找: {arguments.get('query', '')}"
-    elif function_name == "find_definition":
-        friendly_msg = f"🔍 星瑶正在查找符号定义: {arguments.get('symbol', '')}"
-    elif function_name == "search_news":
-        friendly_msg = f"🌐 星瑶正在联网搜索：{arguments.get('query', '')}"
-    elif function_name == "fetch_url":
-        friendly_msg = f"🌐 星瑶正在访问网址：{arguments.get('url', '')}"
-    elif function_name == "get_weather":
-        friendly_msg = f"🌤 星瑶正在查询天气：{arguments.get('city', '') or '自动定位'}"
-
-    # The event-oriented path lets the UI render this status in order.
-    from prompt_toolkit.formatted_text import HTML
-    safe_friendly_msg = friendly_msg.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    if event_callback is None:
-        safe_print(HTML(f"<ansigreen>[ {safe_friendly_msg} ]</ansigreen>"))
-
-    result = ""
-    # 权限由工具能力元数据决定，而不是散落的函数名白名单。
-    try:
-        requires_permission = tool_registry.get(function_name).requires_permission
-    except KeyError:
-        requires_permission = function_name in ("write_file", "edit_file", "execute_command")
-    # 沙盒外的 write_file/edit_file 由 _sandbox_outside_guard 单独询问（文案含路径），
-    # 跳过此处的通用确认，避免同一操作被连续询问两次
-    _defer_to_sandbox_guard = False
-    # 计划模式：任何需要权限的修改/执行类操作一律硬拦截（规划类工具除外），
-    # 引导模型改为输出计划；只读工具不受影响，沙盒外只读访问仍逐次询问
-    if (
-        requires_permission
-        and not result
-        and app_context.get_permission_mode() == "plan"
-        and function_name not in _PLAN_MODE_ALLOWED_TOOLS
-    ):
-        result = PLAN_MODE_DENIED_MESSAGE
-    if requires_permission and not result and function_name in ("write_file", "edit_file"):
-        try:
-            _defer_to_sandbox_guard = is_outside_workspace(arguments.get("file_path", ""))
-        except Exception:
-            result = PATH_VALIDATION_ERROR_MESSAGE
-    if requires_permission and not result and not _defer_to_sandbox_guard:
-        try:
-            approved = check_permission_and_ask(
-                function_name,
-                arguments,
-                event_callback=event_callback,
-                permission_owner=permission_owner,
-                parent_turn_id=parent_turn_id,
-                permission_source=permission_source,
-                cancel_event=cancel_event,
-            )
-        except PermissionSystemError:
-            # 权限系统自身异常：明确告诉模型这是系统故障，不是用户拒绝
-            result = PERMISSION_SYSTEM_ERROR_MESSAGE
-        else:
-            if not approved:
-                # 取消与拒绝使用不同的工具结果文案，避免把“取消”误述为“拒绝”喂给模型
-                if cancel_event is not None and cancel_event.is_set():
-                    result = PERMISSION_CANCELLED_MESSAGE
-                else:
-                    result = PERMISSION_DENIED_MESSAGE
-
-    _raise_if_tool_cancelled(cancel_event)
-
-    try:
-        if result in (
-            PERMISSION_DENIED_MESSAGE,
-            PERMISSION_CANCELLED_MESSAGE,
-            PERMISSION_SYSTEM_ERROR_MESSAGE,
-            PATH_VALIDATION_ERROR_MESSAGE,
-            PLAN_MODE_DENIED_MESSAGE,
-        ):
-            pass
-        elif function_name == "read_file":
-            bypass_cm, sandbox_err = _sandbox_outside_guard(
-                function_name, arguments.get("file_path"), event_callback,
-                permission_owner, parent_turn_id, permission_source, cancel_event,
-            )
-            if sandbox_err:
-                result = sandbox_err
-            elif bypass_cm:
-                with bypass_cm:
-                    result = tool_registry.execute(function_name, **arguments).to_message_content()
-            else:
-                result = tool_registry.execute(function_name, **arguments).to_message_content()
-        elif function_name == "write_file":
-            file_path = arguments.get("file_path", "")
-            new_content = arguments.get("content", "")
-            # 沙盒外写入必须每次询问用户（即使 full 模式）
-            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
-                function_name, file_path, event_callback,
-                permission_owner, parent_turn_id, permission_source, cancel_event,
-            )
-            if _sandbox_err:
-                result = _sandbox_err
-            else:
-                _write_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
-                with _write_cm:
-                    old_content = ""
-                    if os.path.exists(file_path):
-                        try:
-                            old_content = _read_text_with_encoding_fallback(file_path)
-                        except OSError as read_err:
-                            logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
-                            old_content = ""
-                    write_result = write_file(file_path, new_content)
-                if isinstance(write_result, str) and write_result.startswith("🚨"):
-                    # 大文件覆盖保护等场景：write_file 拒绝写入，不应展示虚假 diff，也不记录 undo
-                    result = write_result
-                else:
-                    # 写入成功后再记录 undo 快照，避免未发生的修改污染撤销历史
-                    from core.memory import set_undo_state
-                    set_undo_state(file_path, old_content)
-                    # 生成 diff 并展示
-                    _show_file_diff(
-                        file_path,
-                        old_content,
-                        new_content,
-                        event_callback,
-                        panel_title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
-                        truncated_note="已成功写入文件",
-                        tool_call_id=tc["id"],
-                    )
-                    result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
-        elif function_name == "run_subagent":
-            if not allow_subagents:
-                result = f"{TOOL_ERROR_PREFIX} 子代理不能启动其他子代理。"
-            else:
-                result = run_subagent(
-                    task_description=arguments.get("task_description", ""),
-                    subagent_type=arguments.get("subagent_type", "general"),
-                    plan_item_id=arguments.get("plan_item_id", ""),
-                    run_in_background=arguments.get("run_in_background", False),
-                    # 不传时交给 run_subagent 按角色解析默认超时（只读角色更短）
-                    timeout_seconds=arguments.get("timeout_seconds"),
-                    parent_session=parent_session,
-                    parent_turn_id=parent_turn_id,
-                    parent_cancel_event=cancel_event,
-                    event_callback=event_callback,
-                )
-        elif function_name == "ask_user":
-            from core.ask_user import ask_user, normalize_question_request
-            plan_item_id = str(arguments.get("plan_item_id", "") or "").strip()
-            scheduler = None
-            try:
-                question, choices = normalize_question_request(
-                    arguments.get("question", ""),
-                    arguments.get("options"),
-                )
-            except ValueError as error:
-                result = str(error)
-            else:
-                arguments["question"] = question
-                arguments["options"] = choices
-
-            if not result and plan_item_id:
-                from core.task_scheduler import get_default_scheduler
-
-                scheduler = get_default_scheduler()
-                plan_item = next(
-                    (
-                        item
-                        for item in scheduler.plan.snapshot()
-                        if item["id"] == plan_item_id
-                    ),
-                    None,
-                )
-                # 收集可用的 input_preparation 项，用于错误提示
-                input_prep_items = [
-                    item for item in scheduler.plan.snapshot()
-                    if item.get("kind") == "input_preparation"
-                ]
-                prep_hints = ""
-                if input_prep_items:
-                    ids = ", ".join(f"'{item['id']}'({item['subject']})" for item in input_prep_items[:5])
-                    prep_hints = f" 当前 plan 中的 input_preparation 项: [{ids}]。"
-                if plan_item is None:
-                    result = json.dumps({
-                        "status": "blocked",
-                        "plan_item_id": plan_item_id,
-                        "error": f"用户输入准备项 '{plan_item_id}' 不存在。{prep_hints}",
-                    }, ensure_ascii=False)
-                elif plan_item.get("kind") != "input_preparation":
-                    result = (
-                        f"无法提问：plan_item_id='{plan_item_id}' 的 kind 是 "
-                        f"'{plan_item.get('kind', 'unknown')}'，不是 input_preparation。{prep_hints}"
-                    )
-                elif not scheduler.start_item(
-                    plan_item_id,
-                    owner="ask_user",
-                    event_callback=event_callback,
-                ):
-                    result = json.dumps({
-                        "status": "blocked",
-                        "plan_item_id": plan_item_id,
-                        "error": "计划项尚未满足依赖或当前计划不可执行。",
-                    }, ensure_ascii=False)
-                else:
-                    try:
-                        result = ask_user(
-                            question,
-                            choices,
-                            owner_id=permission_owner,
-                            parent_turn_id=parent_turn_id,
-                            source=permission_source,
-                            cancel_event=cancel_event,
-                        )
-                        try:
-                            result_payload = json.loads(str(result))
-                        except (TypeError, ValueError):
-                            result_payload = None
-                        if (
-                            isinstance(result_payload, dict)
-                            and result_payload.get("status") == "cancelled"
-                        ):
-                            scheduler.cancel(plan_item_id, "用户取消提问")
-                        elif str(result).startswith("无法") or str(result).startswith(TOOL_ERROR_PREFIX):
-                            scheduler.fail(plan_item_id, str(result))
-                        elif cancel_event is not None and cancel_event.is_set():
-                            scheduler.cancel(plan_item_id, "用户取消提问")
-                            result = json.dumps({
-                                "status": "cancelled",
-                                "plan_item_id": plan_item_id,
-                                "error": "用户取消提问",
-                            }, ensure_ascii=False)
-                        else:
-                            scheduler.complete(plan_item_id, str(result))
-                        _notify_event(event_callback, "plan_updated", {
-                            "items": scheduler.plan.snapshot(),
-                            "live_only": True,
-                        })
-                    except Exception as error:
-                        scheduler.fail(plan_item_id, str(error))
-                        raise
-            elif not result:
-                result = ask_user(
-                    question,
-                    choices,
-                    owner_id=permission_owner,
-                    parent_turn_id=parent_turn_id,
-                    source=permission_source,
-                    cancel_event=cancel_event,
-                )
-        elif function_name == "manage_task":
-            # 透传当前回合的回调/权限 owner/取消事件（kwargs 形式）。
-            # 按函数签名过滤，向后兼容尚未接受这些参数的 manage_task 版本。
-            import inspect as _inspect
-
-            _extra = {
-                "event_callback": event_callback,
-                "permission_owner": permission_owner,
-                "cancel_event": cancel_event,
-            }
-            _supported = {
-                key: value
-                for key, value in _extra.items()
-                if key in _inspect.signature(manage_task).parameters
-            }
-            result = manage_task(
-                action=arguments.get("action"),
-                task_id=arguments.get("task_id"),
-                **_supported,
-            )
-        elif function_name in {
-            "list_directory",
-            "search_code",
-            "find_definition",
-            "execute_command",
-            "search_news",
-            "fetch_url",
-            "get_weather",
-            "glob_files",
-            "plan_write",
-            "plan_update",
-            "plan_read",
-            "plan_retry",
-        }:
-            # 只读目录类工具在沙盒外访问时需用户逐次确认（沙盒外访问不提供会话放行）
-            bypass_cm, sandbox_err = None, None
-            if function_name in ("list_directory", "search_code", "find_definition", "glob_files"):
-                bypass_cm, sandbox_err = _sandbox_outside_guard(
-                    function_name, arguments.get("dir_path", "."), event_callback,
-                    permission_owner, parent_turn_id, permission_source, cancel_event,
-                )
-            # 阻塞型工具的取消事件透传：execute_command 之外，search_code/glob_files
-            # 等长阻塞工具也接受 cancel_event（registry 经 _INTERNAL_ARG_KEYS 放行），
-            # 否则取消后 ripgrep/网络请求仍阻塞数十秒，子代理迟迟无法收敛
-            if cancel_event is not None and function_name in {
-                "execute_command",
-                "search_code",
-                "glob_files",
-                "fetch_url",
-                "get_weather",
-                "search_news",
-            }:
-                arguments["cancel_event"] = cancel_event
-
-            if sandbox_err:
-                result = sandbox_err
-            elif bypass_cm:
-                with bypass_cm:
-                    result = tool_registry.execute(function_name, **arguments).to_message_content()
-            else:
-                result = tool_registry.execute(function_name, **arguments).to_message_content()
-            if function_name in {"plan_write", "plan_update"}:
-                if (
-                    function_name == "plan_write"
-                    and str(result).strip() == "计划已更新。"
-                ):
-                    _mark_plan_turn(parent_turn_id)
-                from core.plan import get_default_plan_manager
-                _notify_event(event_callback, "plan_updated", {
-                    "items": get_default_plan_manager().snapshot(),
-                    "live_only": True,
-                })
-        elif function_name == "edit_file":
-            file_path = arguments.get("file_path")
-            target = arguments.get("target_content")
-            repl = arguments.get("replacement_content")
-
-            # 沙盒外编辑必须先获批，再检查目标是否存在，避免把外部路径存在性泄露给调用方。
-            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
-                function_name, file_path, event_callback,
-                permission_owner, parent_turn_id, permission_source, cancel_event,
-            )
-            if _sandbox_err:
-                result = _sandbox_err
-
-            # 对过长的 target_content 提前拦截，避免 JSON 截断后反复失败浪费 token。
-            # 模型应拆分为多个小片段编辑，或改用 write_file 重写整个文件。
-            _EDIT_TARGET_MAX_LEN = 1500
-            if not result and target and len(target) > _EDIT_TARGET_MAX_LEN:
-                result = (
-                    f"{TOOL_ERROR_PREFIX} edit_file 的 target_content 过长（"
-                    f"{len(target)} 字符），超过 {_EDIT_TARGET_MAX_LEN} 字符限制，"
-                    f"容易在传输过程中被截断。请将本次编辑拆分为多个不超过 {_EDIT_TARGET_MAX_LEN} "
-                    f"字符的小段后重试；如需整体重写，请改用 write_file。"
-                )
-                return {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": function_name,
-                    "content": result,
-                }
-
-            # 文件不存在时直接报错（edit_file 只能修改已有文件），
-            # 避免对不存在的沙盒外路径做无意义的权限询问
-            if not result and not os.path.isfile(file_path or ""):
-                # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
-                # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
-                result = (
-                    f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
-                    "edit_file 只能修改已有文件；创建新文件请改用 write_file。"
-                )
-                return {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": function_name,
-                    "content": result,
-                }
-
-            if not result:
-                _edit_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
-                with _edit_cm:
-                    try:
-                        old_content = _read_text_with_encoding_fallback(file_path)
-                    except OSError as read_err:
-                        logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
-                        old_content = ""
-                    # 不再做精确子串预检查：edit_file 内部 _fuzzy_replace 已实现
-                    # 精确匹配、空白容错和 difflib 模糊匹配（相似度 >= 0.90），
-                    # 预检查过严会导致仅有轻微空白差异的合法编辑被误拦截。
-                    result = edit_file(
-                        file_path,
-                        target,
-                        repl,
-                        replace_all=bool(arguments.get("replace_all", False)),
-                        start_line=arguments.get("start_line"),
-                        end_line=arguments.get("end_line"),
-                    )
-                    if not result.startswith(TOOL_ERROR_PREFIX):
-                        try:
-                            new_content = _read_text_with_encoding_fallback(file_path)
-                        except OSError as read_err:
-                            logger.warning("读取新文件内容失败 (%s): %s", file_path, read_err)
-                            new_content = ""
-                        _show_file_diff(
-                            file_path,
-                            old_content,
-                            new_content,
-                            event_callback,
-                            panel_title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
-                            truncated_note="已局部替换并修改成功",
-                            tool_call_id=tc["id"],
-                        )
-        else:
-            # 通用兜底：优先查进程内工具注册表（含 imom_locator 等插件工具），
-            # 再降级到 MCP 工具，最后才报"未找到"。
-            try:
-                _spec = tool_registry.get(function_name)
-            except KeyError:
-                _spec = None
-            if _spec is not None:
-                # 插件工具（如 imom_locator）访问工作目录外文件，必须每次询问用户
-                _plugin_guard_path = None
-                if function_name == "imom_register_project":
-                    # hint_path 缺省时兜底 publish_root，避免守卫被静默跳过
-                    _plugin_guard_path = (
-                        arguments.get("hint_path")
-                        or arguments.get("publish_root")
-                        or ""
-                    )
-                elif function_name.startswith("imom_"):
-                    # 其他 imom 工具：取当前活跃项目的 publish_root 作为守卫路径
-                    try:
-                        _plugin_guard_path = _get_imom_active_publish_root()
-                    except Exception:
-                        _plugin_guard_path = None
-                if _plugin_guard_path:
-                    _p_bypass, _p_err = _sandbox_outside_guard(
-                        function_name, _plugin_guard_path, event_callback,
-                        permission_owner, parent_turn_id, permission_source, cancel_event,
-                    )
-                    if _p_err:
-                        result = _p_err
-                    else:
-                        _p_cm = _p_bypass if _p_bypass else sandbox_bypass()
-                        with _p_cm:
-                            result = tool_registry.execute(function_name, **arguments).to_message_content()
-                else:
-                    result = tool_registry.execute(function_name, **arguments).to_message_content()
-            elif any(s["function"]["name"] == function_name for s in _get_mcp_manager().get_schemas()):
-                result = _get_mcp_manager().call_tool_sync(function_name, arguments)
-            else:
-                result = f"{TOOL_ERROR_PREFIX} 未找到名为 {function_name} 的工具！"
-    except Exception as tool_err:
-        result = f"{TOOL_ERROR_PREFIX} 调用工具 {function_name} 时发生系统内部错误：{str(tool_err)}"
-
-    return {
-        "role": "tool",
-        "tool_call_id": tc["id"],
-        "name": function_name,
-        "content": _truncate_tool_result_for_context(function_name, str(result)),
-    }
-
+    adapters = ToolAdapterSet(
+        read_file=read_file,
+        write_file=write_file,
+        edit_file=edit_file,
+        run_subagent=run_subagent,
+        manage_task=manage_task,
+        show_file_diff=_show_file_diff,
+        get_imom_active_publish_root=_get_imom_active_publish_root,
+        sandbox_guard=_sandbox_outside_guard,
+        sandbox_bypass=sandbox_bypass,
+        read_text=_read_text_with_encoding_fallback,
+        notify_event=_notify_event,
+        mark_plan_turn=_mark_plan_turn,
+        registry_execute_override=registry_execute_override,
+        is_outside_workspace=is_outside_workspace,
+        safe_print=safe_print,
+    )
+    context = ToolExecutionContext(
+        event_callback=event_callback,
+        parent_session=parent_session,
+        parent_turn_id=parent_turn_id,
+        cancel_event=cancel_event,
+        allow_subagents=allow_subagents,
+        permission_owner=permission_owner,
+        permission_source=permission_source,
+        permission_checker=check_permission_and_ask,
+        registry=tool_registry,
+        mcp_manager=_get_mcp_manager(),
+    )
+    return ToolPipeline(
+        adapters,
+        permission_error_type=PermissionSystemError,
+        truncate_result=_truncate_tool_result_for_context,
+        plan_turn_checker=_is_plan_turn,
+        pending_plan_checker=_has_pending_plan,
+    ).execute_one(tc, context)
 
 # ─── 工具结果入上下文前的截断 ────────────────────────────────────
 # 这是最大的 token 泄漏点：一次 fetch_url 可以塞进 512KB（≈13 万 token）原文，
