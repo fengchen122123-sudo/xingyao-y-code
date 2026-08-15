@@ -46,24 +46,31 @@ class ToolRegistry:
     def api_schemas(self) -> list[dict[str, Any]]:
         return [spec.api_schema() for spec in self._specs.values()]
 
+    @staticmethod
+    def _filtered_arguments(spec: ToolSpec, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Drop model-invented arguments while preserving scheduler context."""
+        props = (spec.input_schema or {}).get("properties")
+        if isinstance(props, dict) and props:
+            return {
+                key: value for key, value in arguments.items()
+                if key in props or key in _INTERNAL_ARG_KEYS
+            }
+        return arguments
+
+    def execute_strict(self, name: str, **arguments: Any) -> ToolResult:
+        """Execute a registered tool while preserving execution exceptions."""
+        spec = self.get(name)
+        result = spec.execute(**self._filtered_arguments(spec, arguments))
+        if isinstance(result, ToolResult):
+            return result
+        return ToolResult(content=str(result) if result is not None else "")
+
     def execute(self, name: str, **arguments: Any) -> ToolResult:
         spec = self._specs.get(name)
         if spec is None:
             return ToolResult(content=f"Unknown tool: {name}", is_error=True)
-        # 模型偶尔会编造 schema 之外的参数（如 regex=true、max_results=50），
-        # 直接 **arguments 调用会 TypeError 变成 "Tool execution error"，
-        # 导致本可成功的调用整体失败；这里按 schema 丢弃未知参数保住调用
-        props = (spec.input_schema or {}).get("properties")
-        if isinstance(props, dict) and props:
-            arguments = {
-                key: value for key, value in arguments.items()
-                if key in props or key in _INTERNAL_ARG_KEYS
-            }
         try:
-            result = spec.execute(**arguments)
-            if isinstance(result, ToolResult):
-                return result
-            return ToolResult(content=str(result) if result is not None else "")
+            return self.execute_strict(name, **arguments)
         except Exception as exc:
             return ToolResult(content=f"Tool execution error: {exc}", is_error=True)
 
