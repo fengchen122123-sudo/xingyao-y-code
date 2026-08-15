@@ -6,7 +6,10 @@ import os
 import re
 import sqlite3
 import threading
+import time
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+from core.harness.models import JournalEventDraft
 
 
 import pathlib
@@ -301,6 +304,7 @@ class MemoryManager:
     def __init__(self, db_path="ycode.db"):
         # 1. 连接数据库（check_same_thread=False 允许多线程访问，timeout=30.0 防止多窗口并发挂起）
         self.conn = sqlite3.connect(db_path, check_same_thread=False, timeout=30.0)
+        self.conn.execute("PRAGMA foreign_keys=ON")
         # 2. 启用 WAL 模式与 busy_timeout，提升多进程多窗口并发读写性能，彻底解决锁死卡顿
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA synchronous=NORMAL")
@@ -311,6 +315,7 @@ class MemoryManager:
         self.workdir = _normalize_workdir(os.getcwd())
         # 5. 立刻建表
         self.create_tables()
+        self.interrupt_stale_harness_runs(time.time_ns() // 1_000_000 - 10_000)
 
     def set_workdir(self, path):
         """设置后续新建会话的归属工作目录。"""
@@ -385,6 +390,93 @@ class MemoryManager:
                         content TEXT
                     )
                 ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS harness_owners (
+                        owner_id TEXT PRIMARY KEY,
+                        heartbeat_at_ms INTEGER NOT NULL
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS harness_turns (
+                        turn_id TEXT PRIMARY KEY,
+                        session_id INTEGER NOT NULL,
+                        owner_id TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        started_at_ms INTEGER NOT NULL,
+                        finished_at_ms INTEGER,
+                        last_sequence INTEGER NOT NULL DEFAULT 0,
+                        error_code TEXT,
+                        FOREIGN KEY(session_id) REFERENCES sessions(id) ON DELETE CASCADE,
+                        FOREIGN KEY(owner_id) REFERENCES harness_owners(owner_id) ON DELETE RESTRICT
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS harness_steps (
+                        step_id TEXT PRIMARY KEY,
+                        turn_id TEXT NOT NULL,
+                        ordinal INTEGER NOT NULL,
+                        status TEXT NOT NULL,
+                        protocol TEXT,
+                        model TEXT,
+                        api_base TEXT,
+                        cache_scope TEXT,
+                        messages_sha256 TEXT,
+                        system_sha256 TEXT,
+                        tools_sha256 TEXT,
+                        options_sha256 TEXT,
+                        cache_lane_sha256 TEXT,
+                        message_count INTEGER,
+                        system_message_count INTEGER,
+                        request_bytes INTEGER,
+                        system_bytes INTEGER,
+                        tools_bytes INTEGER,
+                        options_bytes INTEGER,
+                        request_reason TEXT,
+                        attempt_count INTEGER NOT NULL DEFAULT 0,
+                        deepseek_generation_id INTEGER,
+                        started_at_ms INTEGER NOT NULL,
+                        finished_at_ms INTEGER,
+                        duration_ms INTEGER,
+                        finish_reason TEXT,
+                        error_code TEXT,
+                        UNIQUE(turn_id, ordinal),
+                        FOREIGN KEY(turn_id) REFERENCES harness_turns(turn_id) ON DELETE CASCADE
+                    )
+                ''')
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS harness_events (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        turn_id TEXT NOT NULL,
+                        step_id TEXT,
+                        sequence INTEGER NOT NULL,
+                        kind TEXT NOT NULL,
+                        created_at_ms INTEGER NOT NULL,
+                        message_id INTEGER,
+                        tool_name TEXT,
+                        call_ordinal INTEGER,
+                        arguments_sha256 TEXT,
+                        result_sha256 TEXT,
+                        duration_ms INTEGER,
+                        result_status TEXT,
+                        error_code TEXT,
+                        UNIQUE(turn_id, sequence),
+                        FOREIGN KEY(turn_id) REFERENCES harness_turns(turn_id) ON DELETE CASCADE,
+                        FOREIGN KEY(step_id) REFERENCES harness_steps(step_id) ON DELETE CASCADE,
+                        FOREIGN KEY(message_id) REFERENCES messages(id) ON DELETE SET NULL
+                    )
+                ''')
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_harness_turns_session_status "
+                    "ON harness_turns(session_id, status)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_harness_steps_turn_ordinal "
+                    "ON harness_steps(turn_id, ordinal)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_harness_events_turn_sequence "
+                    "ON harness_events(turn_id, sequence)"
+                )
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS deepseek_prompt_generations (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -498,6 +590,233 @@ class MemoryManager:
                 except Exception:
                     pass
                 raise
+
+    def create_harness_turn(self, turn_id: str, session_name: str, owner_id: str,
+                            started_at_ms: int) -> None:
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT id FROM sessions WHERE session_name = ?",
+                    (session_name,),
+                )
+                session = cursor.fetchone()
+                if session is None:
+                    raise RuntimeError(f"missing harness session: {session_name}")
+                cursor.execute(
+                    "INSERT INTO harness_turns "
+                    "(turn_id, session_id, owner_id, status, started_at_ms) "
+                    "VALUES (?, ?, ?, 'created', ?)",
+                    (turn_id, session[0], owner_id, int(started_at_ms)),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def create_harness_step(self, step_id: str, turn_id: str, ordinal: int,
+                            started_at_ms: int) -> None:
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "INSERT INTO harness_steps "
+                    "(step_id, turn_id, ordinal, status, started_at_ms) "
+                    "VALUES (?, ?, ?, 'created', ?)",
+                    (step_id, turn_id, int(ordinal), int(started_at_ms)),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def transition_harness_turn(self, turn_id: str, expected_status: str,
+                                target_status: str, now_ms: int, *,
+                                error_code: str | None = None) -> None:
+        terminal = {"completed", "cancelled", "failed", "interrupted"}
+        finished_at_ms = int(now_ms) if target_status in terminal else None
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE harness_turns "
+                    "SET status = ?, finished_at_ms = ?, error_code = ? "
+                    "WHERE turn_id = ? AND status = ?",
+                    (target_status, finished_at_ms, error_code, turn_id, expected_status),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"stale harness turn transition: {turn_id} expected {expected_status}"
+                    )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def transition_harness_step(self, step_id: str, expected_status: str,
+                                target_status: str, now_ms: int, *,
+                                duration_ms: int | None = None,
+                                finish_reason: str | None = None,
+                                error_code: str | None = None) -> None:
+        terminal = {"completed", "cancelled", "failed", "interrupted"}
+        finished_at_ms = int(now_ms) if target_status in terminal else None
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE harness_steps "
+                    "SET status = ?, finished_at_ms = ?, duration_ms = ?, "
+                    "finish_reason = ?, error_code = ? "
+                    "WHERE step_id = ? AND status = ?",
+                    (
+                        target_status,
+                        finished_at_ms,
+                        duration_ms,
+                        finish_reason,
+                        error_code,
+                        step_id,
+                        expected_status,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        f"stale harness step transition: {step_id} expected {expected_status}"
+                    )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def append_harness_event(self, turn_id: str, draft: JournalEventDraft,
+                             created_at_ms: int) -> int:
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                if draft.message_index is not None:
+                    raise ValueError(
+                        "message_index requires atomic message-id resolution"
+                    )
+                cursor.execute(
+                    "UPDATE harness_turns "
+                    "SET last_sequence = last_sequence + 1 WHERE turn_id = ?",
+                    (turn_id,),
+                )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(f"missing harness turn: {turn_id}")
+                cursor.execute(
+                    "SELECT last_sequence FROM harness_turns WHERE turn_id = ?",
+                    (turn_id,),
+                )
+                sequence = int(cursor.fetchone()[0])
+                cursor.execute(
+                    "INSERT INTO harness_events "
+                    "(turn_id, step_id, sequence, kind, created_at_ms, message_id, "
+                    "tool_name, call_ordinal, arguments_sha256, result_sha256, "
+                    "duration_ms, result_status, error_code) "
+                    "VALUES (?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        turn_id,
+                        draft.step_id,
+                        sequence,
+                        draft.kind.value,
+                        int(created_at_ms),
+                        draft.tool_name,
+                        draft.call_ordinal,
+                        draft.arguments_sha256,
+                        draft.result_sha256,
+                        draft.duration_ms,
+                        draft.result_status,
+                        draft.error_code,
+                    ),
+                )
+                self.conn.commit()
+                return sequence
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def heartbeat_harness_owner(self, owner_id, now_ms):
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "INSERT INTO harness_owners (owner_id, heartbeat_at_ms) "
+                    "VALUES (?, ?) "
+                    "ON CONFLICT(owner_id) DO UPDATE SET heartbeat_at_ms = excluded.heartbeat_at_ms",
+                    (owner_id, int(now_ms)),
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def interrupt_stale_harness_runs(self, stale_before_ms) -> int:
+        turn_nonterminal = ("created", "preparing", "running", "cancelling")
+        step_nonterminal = (
+            "created",
+            "requesting",
+            "streaming",
+            "assistant_ready",
+            "tools_running",
+            "tools_committed",
+        )
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "UPDATE harness_steps SET status = 'interrupted' "
+                    "WHERE status IN (?, ?, ?, ?, ?, ?) AND turn_id IN ("
+                    "SELECT harness_turns.turn_id FROM harness_turns "
+                    "JOIN harness_owners "
+                    "ON harness_owners.owner_id = harness_turns.owner_id "
+                    "WHERE harness_owners.heartbeat_at_ms < ?"
+                    ")",
+                    (*step_nonterminal, int(stale_before_ms)),
+                )
+                interrupted_steps = cursor.rowcount
+                cursor.execute(
+                    "UPDATE harness_turns SET status = 'interrupted' "
+                    "WHERE status IN (?, ?, ?, ?) AND owner_id IN ("
+                    "SELECT owner_id FROM harness_owners WHERE heartbeat_at_ms < ?"
+                    ")",
+                    (*turn_nonterminal, int(stale_before_ms)),
+                )
+                interrupted_turns = cursor.rowcount
+                self.conn.commit()
+                return interrupted_steps + interrupted_turns
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_harness_turn(self, turn_id):
+        columns = (
+            "turn_id", "session_id", "owner_id", "status", "started_at_ms",
+            "finished_at_ms", "last_sequence", "error_code",
+        )
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT turn_id, session_id, owner_id, status, started_at_ms, "
+                "finished_at_ms, last_sequence, error_code "
+                "FROM harness_turns WHERE turn_id = ?",
+                (turn_id,),
+            )
+            row = cursor.fetchone()
+            return None if row is None else dict(zip(columns, row))
+
+    def get_harness_step(self, step_id):
+        columns = (
+            "step_id", "turn_id", "ordinal", "status", "started_at_ms",
+            "finished_at_ms", "duration_ms", "finish_reason", "error_code",
+        )
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT step_id, turn_id, ordinal, status, started_at_ms, "
+                "finished_at_ms, duration_ms, finish_reason, error_code "
+                "FROM harness_steps WHERE step_id = ?",
+                (step_id,),
+            )
+            row = cursor.fetchone()
+            return None if row is None else dict(zip(columns, row))
 
     def checkpoint_wal(self):
         """主动执行 WAL checkpoint，整理被写的预写日志，防止 ycode.db-wal 文件体积无限膨胀。"""
@@ -1066,8 +1385,7 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
-    def add_messages(self, session_name, messages):
-        """Atomically append one ordered batch of conversation messages."""
+    def _serialize_message_batch(self, messages):
         serialized = []
         has_new_media = False
         for role, content in messages:
@@ -1076,6 +1394,77 @@ class MemoryManager:
                 has_new_media = True
             content = self._serialize_message_content(content)
             serialized.append((str(role), content))
+        return serialized, has_new_media
+
+    @staticmethod
+    def _validate_harness_message_events(events, message_count, step_id):
+        for draft in events:
+            message_index = draft.message_index
+            if type(message_index) is not int:
+                raise ValueError("message_index must be a zero-based integer")
+            if message_index < 0 or message_index >= message_count:
+                raise ValueError("message_index is outside the submitted message batch")
+            if draft.step_id != step_id:
+                raise ValueError("event step_id must match the committed harness step")
+
+    @staticmethod
+    def _get_harness_commit_session_id_locked(
+        cursor,
+        session_name,
+        turn_id,
+        step_id,
+    ):
+        cursor.execute(
+            "SELECT sessions.id FROM sessions "
+            "JOIN harness_turns ON harness_turns.session_id = sessions.id "
+            "JOIN harness_steps ON harness_steps.turn_id = harness_turns.turn_id "
+            "WHERE sessions.session_name = ? AND harness_turns.turn_id = ? "
+            "AND harness_steps.step_id = ?",
+            (session_name, turn_id, step_id),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(
+                "missing or mismatched harness session, turn, or step"
+            )
+        return row[0]
+
+    def _validate_harness_commit_ownership(
+        self,
+        session_name,
+        turn_id,
+        step_id,
+    ):
+        with self._lock:
+            cursor = self.conn.cursor()
+            self._get_harness_commit_session_id_locked(
+                cursor,
+                session_name,
+                turn_id,
+                step_id,
+            )
+
+    def _insert_message_batch_locked(self, cursor, session_name, serialized):
+        cursor.execute(
+            "SELECT id FROM sessions WHERE session_name = ?",
+            (session_name,),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            raise RuntimeError(f"missing message session: {session_name}")
+        session_id = row[0]
+        message_ids = []
+        for role, content in serialized:
+            cursor.execute(
+                "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+                (session_id, role, content),
+            )
+            message_ids.append(int(cursor.lastrowid))
+        return tuple(message_ids)
+
+    def add_messages(self, session_name, messages):
+        """Atomically append one ordered batch of conversation messages."""
+        serialized, has_new_media = self._serialize_message_batch(messages)
         if not serialized:
             return
 
@@ -1101,19 +1490,99 @@ class MemoryManager:
                     if row is None:
                         raise RuntimeError(f"会话档案创建失败: {session_name!r}")
                     session_id = row[0]
-                cursor.executemany('''
-                    INSERT INTO messages (session_id, role, content)
-                    VALUES (?, ?, ?)
-                ''', [
-                    (session_id, role, content)
-                    for role, content in serialized
-                ])
+                self._insert_message_batch_locked(cursor, session_name, serialized)
                 # 新媒体入库的同一事务内折叠旧媒体：请求路径不再改写历史中间字节
                 if has_new_media:
                     self._fold_stale_media_locked(cursor, session_id)
                 # 更新最近活跃时间，供会话列表按时间展示
                 cursor.execute('UPDATE sessions SET updated_at = ? WHERE id = ?', (now, session_id))
                 self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def add_messages_with_harness_events(
+        self,
+        session_name,
+        messages,
+        *,
+        turn_id,
+        step_id,
+        events,
+        _created_at_ms=None,
+    ) -> tuple[int, ...]:
+        """Commit messages and their Harness event references atomically."""
+        serialized, has_new_media = self._serialize_message_batch(messages)
+        events = list(events)
+        self._validate_harness_message_events(events, len(serialized), step_id)
+        if not serialized:
+            return ()
+
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                session_id = self._get_harness_commit_session_id_locked(
+                    cursor,
+                    session_name,
+                    turn_id,
+                    step_id,
+                )
+                message_ids = self._insert_message_batch_locked(
+                    cursor,
+                    session_name,
+                    serialized,
+                )
+                if has_new_media:
+                    self._fold_stale_media_locked(cursor, session_id)
+
+                created_at_ms = (
+                    time.time_ns() // 1_000_000
+                    if _created_at_ms is None
+                    else int(_created_at_ms)
+                )
+                for draft in events:
+                    cursor.execute(
+                        "UPDATE harness_turns SET last_sequence = last_sequence + 1 "
+                        "WHERE turn_id = ?",
+                        (turn_id,),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(f"missing harness turn: {turn_id}")
+                    cursor.execute(
+                        "SELECT last_sequence FROM harness_turns WHERE turn_id = ?",
+                        (turn_id,),
+                    )
+                    sequence = int(cursor.fetchone()[0])
+                    cursor.execute(
+                        "INSERT INTO harness_events "
+                        "(turn_id, step_id, sequence, kind, created_at_ms, message_id, "
+                        "tool_name, call_ordinal, arguments_sha256, result_sha256, "
+                        "duration_ms, result_status, error_code) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            turn_id,
+                            draft.step_id,
+                            sequence,
+                            draft.kind.value,
+                            int(created_at_ms),
+                            message_ids[draft.message_index],
+                            draft.tool_name,
+                            draft.call_ordinal,
+                            draft.arguments_sha256,
+                            draft.result_sha256,
+                            draft.duration_ms,
+                            draft.result_status,
+                            draft.error_code,
+                        ),
+                    )
+
+                now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cursor.execute(
+                    "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                    (now, session_id),
+                )
+                self.conn.commit()
+                return message_ids
             except Exception:
                 self.conn.rollback()
                 raise
@@ -1212,6 +1681,7 @@ class MemoryManager:
                 session_id = row[0]
                 cursor.execute('SELECT COUNT(*) FROM messages WHERE session_id = ?', (session_id,))
                 deleted = cursor.fetchone()[0] or 0
+                cursor.execute('DELETE FROM harness_turns WHERE session_id = ?', (session_id,))
                 cursor.execute('DELETE FROM messages WHERE session_id = ?', (session_id,))
                 self._delete_deepseek_prompt_generations_locked(cursor, [session_name])
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
