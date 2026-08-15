@@ -495,6 +495,14 @@ class MCPManager:
             key=lambda s: s.get("function", {}).get("name", ""),
         )
 
+    def get_schema(self, tool_name):
+        """Return one current schema without connecting or mutating state."""
+        with self._connect_lock:
+            for schema in self.tool_schemas:
+                if schema.get("function", {}).get("name") == tool_name:
+                    return schema
+        return None
+
     async def _call_tool_async(self, tool_name, arguments):
         server_name = self.server_of_tool.get(tool_name)
         if not server_name or server_name not in self.servers:
