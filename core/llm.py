@@ -1896,6 +1896,7 @@ def chat_with_model_events(
         if not turn_failed:
             yield factory.emit("turn_finished", {})
     except KeyboardInterrupt:
+        harness_runtime.cancel()
         yield from drain_public_events()
         yield factory.emit("turn_cancelled", {})
         raise
@@ -4700,7 +4701,7 @@ def _chat_with_model_generator(
                     # 该 user 催促消息也需要持久化，否则下一轮重建历史时上下文会缺失
                     pending_persistence.append(("user", summary_request))
                     flush_persistence()
-                    if current_step is not None:
+                    if current_step is not None and turn + 1 < max_turns:
                         current_step.complete()
                     # 内部兜底重试静默进行：底部状态栏已显示"正在干活..."，
                     # 这里不再发 status 通知暴露"模型未生成结论"的内部细节。
@@ -4750,7 +4751,7 @@ def _chat_with_model_generator(
                             "message": "计划仍有未执行项，已提醒模型继续执行。",
                         })
                         flush_persistence()
-                        if current_step is not None:
+                        if current_step is not None and turn + 1 < max_turns:
                             current_step.complete()
                         continue
                 # 模型未调用工具且未生成任何正文：给出明确提示，避免 UI 在
@@ -4803,7 +4804,8 @@ def _chat_with_model_generator(
                 flush_persistence()
                 if current_step is not None:
                     current_step.mark_tools_committed()
-                    current_step.complete()
+                    if turn + 1 < max_turns:
+                        current_step.complete()
                 _notify_event(event_callback, "notice", {
                     "message": "模型输出被长度限制截断，已拦截本批工具调用并要求模型拆小参数重试。",
                 })
@@ -4917,7 +4919,8 @@ def _chat_with_model_generator(
             flush_persistence()
             if current_step is not None:
                 current_step.mark_tools_committed()
-                current_step.complete()
+                if turn + 1 < max_turns:
+                    current_step.complete()
             
         # 超过轮次上限：提示消息写入历史并与正常结束一样落库，避免下一轮丢失上下文
         msg = f"{TOOL_ERROR_PREFIX} 任务轮次超过上限（100 轮），请把任务拆小一点再试！"
@@ -4926,6 +4929,8 @@ def _chat_with_model_generator(
         if stream:
             pending_persistence.append(("assistant", deepcopy(limit_message)))
         flush_persistence()
+        if current_step is not None:
+            current_step.complete()
         if harness_runtime is not None:
             harness_runtime.complete()
         yield from _yield_content(msg)
@@ -4946,11 +4951,15 @@ def _chat_with_model_generator(
         try:
             salvage_persistence_on_cancel()
             flush_persistence()
+        except Exception as salvage_error:
+            if harness_runtime is not None:
+                harness_runtime.fail(type(salvage_error).__name__)
+            raise
         finally:
             # 安全回退删除此轮 Turn 添加的内存消息残影（DB 已保留打捞部分）
             rollback_turn_messages()
-            if harness_runtime is not None:
-                harness_runtime.cancel()
+        if harness_runtime is not None:
+            harness_runtime.cancel()
         raise
     except GeneratorExit:
         # GUI 消费端检测到取消后 break，生成器在 yield 点被 close：这条路径
@@ -4965,9 +4974,12 @@ def _chat_with_model_generator(
         try:
             salvage_persistence_on_cancel()
             flush_persistence()
-        finally:
+        except Exception as salvage_error:
             if harness_runtime is not None:
-                harness_runtime.cancel()
+                harness_runtime.fail(type(salvage_error).__name__)
+            raise
+        if harness_runtime is not None:
+            harness_runtime.cancel()
         raise
     except Exception as e:
         try:
