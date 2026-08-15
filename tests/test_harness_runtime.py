@@ -153,6 +153,43 @@ def test_user_cancel_sets_cancelled_not_interrupted(mocker):
     assert _steps(manager, "turn-runtime")[-1]["status"] == "cancelled"
 
 
+def test_cancel_during_preparation_marks_the_turn_cancelled(mocker):
+    manager, cancel_event = _persistent_runtime_fixture(mocker)
+    mocker.patch(
+        "core.llm._describe_images_with_secondary",
+        side_effect=KeyboardInterrupt("cancel during preparation"),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        list(_persistent_events(cancel_event=cancel_event))
+
+    assert manager.get_harness_turn("turn-runtime")["status"] == "cancelled"
+    assert _steps(manager, "turn-runtime") == []
+
+
+def test_cancel_salvage_write_failure_marks_the_turn_failed(mocker):
+    manager, cancel_event = _persistent_runtime_fixture(mocker)
+    mocker.patch(
+        "core.llm.completion",
+        return_value=_tool_stream("call-1", "read_file", {"file_path": "a.py"}),
+    )
+    mocker.patch(
+        "core.llm._execute_single_tool_call",
+        side_effect=KeyboardInterrupt("cancel during tool"),
+    )
+    mocker.patch.object(
+        manager,
+        "add_messages_with_harness_events",
+        side_effect=RuntimeError("salvage write failed"),
+    )
+
+    with pytest.raises(RuntimeError, match="salvage write failed"):
+        list(_persistent_events(cancel_event=cancel_event))
+
+    assert manager.get_harness_turn("turn-runtime")["status"] == "failed"
+    assert _steps(manager, "turn-runtime")[-1]["status"] == "failed"
+
+
 def test_provider_error_sets_failed_and_keeps_turn_error_event(mocker):
     manager, _cancel_event = _persistent_runtime_fixture(mocker)
     mocker.patch("core.llm.completion", side_effect=RuntimeError("provider failed"))
@@ -162,6 +199,50 @@ def test_provider_error_sets_failed_and_keeps_turn_error_event(mocker):
 
     assert [event.kind for event in events].count("turn_error") == 1
     assert manager.get_harness_turn("turn-runtime")["status"] == "failed"
+
+
+def test_round_limit_message_is_committed_before_the_last_step_completes(mocker):
+    manager, _cancel_event = _persistent_runtime_fixture(mocker)
+    call_number = 0
+
+    def next_tool_stream(**_kwargs):
+        nonlocal call_number
+        call_number += 1
+        return _tool_stream(
+            f"call-{call_number}",
+            "read_file",
+            {"file_path": f"file-{call_number}.py"},
+        )
+
+    def fixed_tool_result(tool_call, **_kwargs):
+        return {
+            "role": "tool",
+            "tool_call_id": tool_call["id"],
+            "name": tool_call["function"]["name"],
+            "content": "ok",
+        }
+
+    mocker.patch("core.llm.completion", side_effect=next_tool_stream)
+    mocker.patch("core.llm._execute_single_tool_call", side_effect=fixed_tool_result)
+
+    list(_persistent_events())
+
+    assert manager.get_harness_turn("turn-runtime")["status"] == "completed"
+    assert len(_steps(manager, "turn-runtime")) == 100
+    final_step_events = manager.conn.execute(
+        "SELECT sequence, kind FROM harness_events "
+        "WHERE step_id = ? ORDER BY sequence",
+        ("turn-runtime:step:100",),
+    ).fetchall()
+    final_assistant_sequence = max(
+        sequence
+        for sequence, kind in final_step_events
+        if kind == "assistant_committed"
+    )
+    final_status_sequence = max(
+        sequence for sequence, kind in final_step_events if kind == "step_status"
+    )
+    assert final_status_sequence > final_assistant_sequence
 
 
 def test_message_persistence_failure_propagates_and_fails_the_turn(mocker):
