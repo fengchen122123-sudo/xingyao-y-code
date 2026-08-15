@@ -472,3 +472,317 @@ def test_strict_tool_executor_exception_gets_explicit_tool_error(monkeypatch):
         "name": "plugin_failure",
         "content": "🚨 调用工具 plugin_failure 时发生系统内部错误：boom",
     }
+
+
+def _batch_call(call_id, name, arguments="{}"):
+    raw_arguments = arguments if isinstance(arguments, str) else json.dumps(
+        arguments, ensure_ascii=False
+    )
+    return {
+        "id": call_id,
+        "function": {"name": name, "arguments": raw_arguments},
+    }
+
+
+def _batch_tool_message(call_id, name="read_file", content="ok"):
+    return {
+        "role": "tool",
+        "tool_call_id": call_id,
+        "name": name,
+        "content": content,
+    }
+
+
+def _batch_registry():
+    return ToolRegistry([
+        ToolSpec(
+            name="read_file",
+            description="read",
+            input_schema={"type": "object"},
+            execute=lambda: ToolResult("read"),
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+        ),
+        ToolSpec(
+            name="write_file",
+            description="write",
+            input_schema={"type": "object"},
+            execute=lambda: ToolResult("write"),
+            requires_permission=True,
+            parallel_safe=False,
+        ),
+    ])
+
+
+def _batch_context(*, cancel_event=None, registry=None):
+    from core.harness.tool_pipeline import ToolExecutionContext
+
+    return ToolExecutionContext(
+        event_callback=None,
+        parent_session=None,
+        parent_turn_id=None,
+        cancel_event=cancel_event,
+        allow_subagents=True,
+        permission_owner=None,
+        permission_source="主代理",
+        permission_checker=lambda *_args, **_kwargs: True,
+        registry=registry or _batch_registry(),
+        mcp_manager=object(),
+    )
+
+
+def _parallel_executor(execute):
+    from core.harness.tool_pipeline import ToolBatchExecutor, ToolPipeline
+
+    return ToolBatchExecutor(
+        ToolPipeline(),
+        execute_decoded=lambda decoded, context: execute(
+            {
+                "id": decoded.call_id,
+                "function": {
+                    "name": decoded.name,
+                    "arguments": decoded.raw_arguments,
+                },
+            },
+            context,
+        ),
+        event_payload=lambda decoded: {"id": decoded.call_id},
+        finished_event_payload=lambda decoded, message, duration_ms: {
+            "id": decoded.call_id,
+            "ok": not message["content"].startswith("🚨"),
+            "duration_ms": duration_ms,
+        },
+    )
+
+
+def test_parallel_completion_order_never_changes_model_result_order():
+    first_release = threading.Event()
+    second_finished = threading.Event()
+
+    def execute(call, _context):
+        if call["id"] == "first":
+            assert second_finished.wait(timeout=0.1)
+            first_release.set()
+        else:
+            second_finished.set()
+        return _batch_tool_message(call["id"])
+
+    records = _parallel_executor(execute).execute(
+        [_batch_call("first", "read_file"), _batch_call("second", "read_file")],
+        _batch_context(),
+        None,
+    )
+
+    assert first_release.is_set()
+    assert [record.call_ordinal for record in records] == [0, 1]
+    assert [record.message["tool_call_id"] for record in records] == [
+        "first",
+        "second",
+    ]
+
+
+def test_only_adjacent_parallel_safe_tools_share_a_batch():
+    from core.harness.tool_pipeline import group_tool_batches
+
+    registry = _batch_registry()
+    calls = [
+        _batch_call("r1", "read_file"),
+        _batch_call("w1", "write_file"),
+        _batch_call("r2", "read_file"),
+    ]
+    batches = group_tool_batches(calls, registry)
+
+    assert [[call["id"] for call in batch.calls] for batch in batches] == [
+        ["r1"],
+        ["w1"],
+        ["r2"],
+    ]
+    adjacent = group_tool_batches(
+        [_batch_call("r1", "read_file"), _batch_call("r2", "read_file")],
+        registry,
+    )
+    assert [[call["id"] for call in batch.calls] for batch in adjacent] == [
+        ["r1", "r2"],
+    ]
+
+
+def test_repeat_guard_blocks_third_successful_identical_signature():
+    from core.harness.tool_pipeline import RepeatCallGuard
+
+    guard = RepeatCallGuard()
+    call = _batch_call("one", "read_file", '{"file_path":"a.py"}')
+    arguments = call["function"]["arguments"]
+
+    assert guard.should_execute("read_file", arguments)
+    guard.record("read_file", arguments, ok=True)
+    assert guard.should_execute("read_file", arguments)
+    guard.record("read_file", arguments, ok=True)
+    assert guard.should_execute("read_file", arguments) is False
+
+
+def test_cancel_stops_polling_without_waiting_for_daemon_tool():
+    cancel_event = threading.Event()
+    blocker = threading.Event()
+
+    def blocked_execute(call, _context):
+        cancel_event.set()
+        blocker.wait()
+        return _batch_tool_message(call["id"])
+
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            _parallel_executor(blocked_execute).execute(
+                [
+                    _batch_call("blocked", "read_file"),
+                    _batch_call("also-blocked", "read_file"),
+                ],
+                _batch_context(cancel_event=cancel_event),
+                None,
+            )
+    finally:
+        blocker.set()
+
+
+def test_batch_events_cover_each_batch_before_execution_and_finish_in_model_order():
+    execution_order = []
+    events = []
+
+    def execute(call, _context):
+        execution_order.append(call["id"])
+        return _batch_tool_message(call["id"], name=call["function"]["name"])
+
+    records = _parallel_executor(execute).execute(
+        [
+            _batch_call("r1", "read_file"),
+            _batch_call("r2", "read_file"),
+            _batch_call("w1", "write_file"),
+        ],
+        _batch_context(),
+        lambda kind, payload: events.append((kind, payload["id"])),
+    )
+
+    assert events == [
+        ("tool_requested", "r1"),
+        ("tool_requested", "r2"),
+        ("tool_started", "r1"),
+        ("tool_started", "r2"),
+        ("tool_finished", "r1"),
+        ("tool_finished", "r2"),
+        ("tool_requested", "w1"),
+        ("tool_started", "w1"),
+        ("tool_finished", "w1"),
+    ]
+    assert execution_order == ["r1", "r2", "w1"]
+    assert [record.call_ordinal for record in records] == [0, 1, 2]
+
+
+def test_batch_executor_decodes_each_call_only_once(monkeypatch):
+    import core.harness.tool_pipeline as tool_pipeline
+
+    decode_count = 0
+    original_decode = tool_pipeline.decode_tool_call
+
+    def counting_decode(tool_call):
+        nonlocal decode_count
+        decode_count += 1
+        return original_decode(tool_call)
+
+    monkeypatch.setattr(tool_pipeline, "decode_tool_call", counting_decode)
+    events = []
+    executor = tool_pipeline.ToolBatchExecutor(
+        tool_pipeline.ToolPipeline(),
+        execute_decoded=lambda decoded, _context: _batch_tool_message(
+            decoded.call_id,
+            name=decoded.name,
+        ),
+    )
+
+    records = executor.execute(
+        [_batch_call("first", "read_file", '{"file_path":"a.py"}')],
+        _batch_context(),
+        lambda kind, payload: events.append((kind, payload)),
+    )
+
+    assert decode_count == 1
+    assert records[0].message["tool_call_id"] == "first"
+    assert [kind for kind, _payload in events] == [
+        "tool_requested",
+        "tool_started",
+        "tool_finished",
+    ]
+
+
+def test_repeat_blocked_record_is_model_visible_and_not_executed():
+    from core.harness.tool_pipeline import RepeatCallGuard
+
+    executions = []
+    guard = RepeatCallGuard()
+    arguments = '{"file_path":"a.py"}'
+    guard.record("read_file", arguments, ok=True)
+    guard.record("read_file", arguments, ok=True)
+    executor = _parallel_executor(
+        lambda call, _context: executions.append(call["id"])
+        or _batch_tool_message(call["id"])
+    )
+    executor.repeat_guard = guard
+
+    records = executor.execute(
+        [_batch_call("third", "read_file", arguments)],
+        _batch_context(),
+        None,
+    )
+
+    assert executions == []
+    assert records[0].message == {
+        "role": "tool",
+        "tool_call_id": "third",
+        "name": "read_file",
+        "content": (
+            "🛑 检测到相同的工具调用已成功执行过 2 次，"
+            "结果未发生变化。请改用其他方式推进任务。"
+        ),
+    }
+
+
+def test_tool_result_journal_draft_contains_only_hashes_and_ordered_metadata():
+    from core.harness.models import HarnessEventKind
+    from core.harness.tool_pipeline import (
+        ToolExecutionRecord,
+        build_tool_result_event_draft,
+    )
+
+    tool_call = _batch_call(
+        "call-1",
+        "read_file",
+        '{"file_path":"a.py"}',
+    )
+    record = ToolExecutionRecord(
+        call_ordinal=2,
+        message=_batch_tool_message("call-1", content="ok"),
+        duration_ms=17,
+    )
+
+    draft = build_tool_result_event_draft(
+        "step-1",
+        tool_call,
+        record,
+        message_index=3,
+        ok=True,
+    )
+
+    assert draft.kind is HarnessEventKind.TOOL_RESULT_COMMITTED
+    assert draft.step_id == "step-1"
+    assert draft.message_index == 3
+    assert draft.tool_name == "read_file"
+    assert draft.call_ordinal == 2
+    assert draft.arguments_sha256 == (
+        "39fab66fd02dd0c0d6a9ba0eed3ab8a2eb7a1a0fdd5d45a3d901d4ca060f937a"
+    )
+    assert draft.result_sha256 == (
+        "2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df"
+    )
+    assert draft.duration_ms == 17
+    assert draft.result_status == "ok"
+    assert not hasattr(draft, "arguments")
+    assert not hasattr(draft, "result")

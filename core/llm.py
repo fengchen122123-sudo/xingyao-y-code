@@ -2763,9 +2763,17 @@ def _tool_call_arguments(tc):
     return arguments
 
 
-def _tool_event_payload(tc):
-    function_name = tc["function"]["name"]
-    arguments = _tool_call_arguments(tc)
+def _tool_event_parts(tool_call):
+    if isinstance(tool_call, dict):
+        return (
+            tool_call.get("id", ""),
+            tool_call["function"]["name"],
+            _tool_call_arguments(tool_call),
+        )
+    return tool_call.call_id, tool_call.name, tool_call.arguments
+
+
+def _tool_event_payload_from_parts(call_id, function_name, arguments):
     preview = ""
     if function_name in ("read_file", "write_file", "edit_file"):
         preview = arguments.get("file_path", "")
@@ -2787,7 +2795,7 @@ def _tool_event_payload(tc):
     elif function_name == "run_subagent":
         preview = arguments.get("task_description", "")
     return {
-        "id": tc.get("id", ""),
+        "id": call_id,
         "name": function_name,
         "preview": str(preview)[:120],
         "arguments": arguments,
@@ -2796,12 +2804,15 @@ def _tool_event_payload(tc):
     }
 
 
-def _tool_finished_event_payload(tc, result, duration_ms):
-    function_name = tc["function"]["name"]
-    arguments = _tool_call_arguments(tc)
+def _tool_event_payload(tool_call):
+    return _tool_event_payload_from_parts(*_tool_event_parts(tool_call))
+
+
+def _tool_finished_event_payload(tool_call, result, duration_ms):
+    call_id, function_name, arguments = _tool_event_parts(tool_call)
     ok = _tool_result_ok(function_name, result)
     return {
-        **_tool_event_payload(tc),
+        **_tool_event_payload_from_parts(call_id, function_name, arguments),
         "ok": ok,
         "summary": _tool_output_preview(function_name, arguments, result),
         "result": _tool_result_text(result),
@@ -2859,60 +2870,6 @@ def _tool_result_ok(function_name, result):
         "计划运行状态由真实调度器管理",
         "新建计划项必须是 pending",
     ))
-
-
-# 重复工具调用被拦截时返回给模型的指令性文本（引导换方法，而非错误前缀）
-REPEAT_CALL_BLOCKED_TEXT = (
-    "🛑 检测到相同的工具调用已成功执行过 2 次，结果未发生变化。请改用其他方式推进任务。"
-)
-
-
-class _RepeatCallGuard:
-    """重复工具调用抑制：同一 (工具, canonical 参数) 签名成功 N 次后拦截。
-
-    签名规范化：JSON unmarshal→marshal（key 排序、去空白），等价于 Reasonix
-    canonicalToolArgs。按轮次维度持有，跟随 _chat_with_model_generator 的循环生命周期。
-    每次重复调用都是一整轮“前缀全命中但新增一大段重复工具结果”的纯 miss。
-    """
-
-    BLOCK_AFTER_SUCCESSES = 2
-
-    def __init__(self):
-        self._success_counts = {}
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def signature(name, arguments_json):
-        try:
-            parsed = json.loads(arguments_json or "{}")
-            canonical = json.dumps(
-                parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
-        except Exception:
-            canonical = str(arguments_json or "")
-        return f"{name}:{canonical}"
-
-    def should_execute(self, name, arguments_json):
-        sig = self.signature(name, arguments_json)
-        with self._lock:
-            return self._success_counts.get(sig, 0) < self.BLOCK_AFTER_SUCCESSES
-
-    def record(self, name, arguments_json, ok):
-        if not ok:
-            return
-        sig = self.signature(name, arguments_json)
-        with self._lock:
-            self._success_counts[sig] = self._success_counts.get(sig, 0) + 1
-
-
-def _repeat_call_blocked_result(tool_call):
-    """为被重复调用抑制拦截的 tool_call 合成不落执行的 tool 结果消息。"""
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call["id"],
-        "name": tool_call["function"]["name"],
-        "content": REPEAT_CALL_BLOCKED_TEXT,
-    }
 
 
 def _raise_if_tool_cancelled(cancel_event):
@@ -3071,8 +3028,7 @@ def _sandbox_outside_guard(
         permission_error_type=PermissionSystemError,
     )
 
-def _execute_single_tool_call(
-    tc,
+def _build_tool_pipeline_and_context(
     event_callback=None,
     *,
     parent_session=None,
@@ -3082,7 +3038,6 @@ def _execute_single_tool_call(
     permission_owner=None,
     permission_source="主代理",
 ):
-    """Compatibility wrapper around the extracted deterministic pipeline."""
     from core.harness.tool_adapters import ToolAdapterSet
     from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
     from core.tool_registry import ToolRegistry
@@ -3122,13 +3077,41 @@ def _execute_single_tool_call(
         registry=tool_registry,
         mcp_manager=_get_mcp_manager(),
     )
-    return ToolPipeline(
+    pipeline = ToolPipeline(
         adapters,
         permission_error_type=PermissionSystemError,
         truncate_result=_truncate_tool_result_for_context,
         plan_turn_checker=_is_plan_turn,
         pending_plan_checker=_has_pending_plan,
-    ).execute_one(tc, context)
+    )
+    return pipeline, context
+
+
+def _execute_single_tool_call(
+    tc,
+    event_callback=None,
+    *,
+    parent_session=None,
+    parent_turn_id=None,
+    cancel_event=None,
+    allow_subagents=True,
+    permission_owner=None,
+    permission_source="主代理",
+):
+    """Compatibility wrapper around the extracted deterministic pipeline."""
+    pipeline, context = _build_tool_pipeline_and_context(
+        event_callback,
+        parent_session=parent_session,
+        parent_turn_id=parent_turn_id,
+        cancel_event=cancel_event,
+        allow_subagents=allow_subagents,
+        permission_owner=permission_owner,
+        permission_source=permission_source,
+    )
+    return pipeline.execute_one(tc, context)
+
+
+_ORIGINAL_EXECUTE_SINGLE_TOOL_CALL = _execute_single_tool_call
 
 # ─── 工具结果入上下文前的截断 ────────────────────────────────────
 # 这是最大的 token 泄漏点：一次 fetch_url 可以塞进 512KB（≈13 万 token）原文，
@@ -3384,24 +3367,79 @@ def _chat_with_model_generator(
     # 避免长任务中一两轮失败就静默收尾（用户反馈"任务未执行完就结束"）。
     FINAL_SUMMARY_MAX_RETRIES = 2
     # 重复工具调用抑制：同一签名成功 2 次后拦截，随本轮会话循环生命周期
-    repeat_call_guard = _RepeatCallGuard()
+    from core.harness.tool_pipeline import RepeatCallGuard
+
+    repeat_call_guard = RepeatCallGuard()
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
     pending_persistence = []
     persistence_failure = None
     current_step = None
+    current_tool_calls = []
+    pending_tool_records = {}
 
     def flush_persistence():
         """把本轮已确认的助手/工具消息按序落库（与正常结束路径一致）。"""
-        nonlocal pending_persistence, persistence_failure
+        nonlocal pending_persistence, persistence_failure, pending_tool_records
         if stream and pending_persistence:
             try:
                 if harness_runtime is not None:
                     if current_step is None:
                         # 前置阶段产生的通知由首个 Step 一并原子提交。
                         return
-                    current_step.commit_messages(pending_persistence)
+                    from core.harness.models import HarnessEventKind, JournalEventDraft
+                    from core.harness.tool_pipeline import (
+                        ToolExecutionRecord,
+                        build_tool_result_event_draft,
+                    )
+
+                    tool_calls_by_id = {
+                        tool_call.get("id"): tool_call
+                        for tool_call in current_tool_calls
+                    }
+                    events = []
+                    for message_index, (role, content) in enumerate(pending_persistence):
+                        if role == "assistant":
+                            events.append(JournalEventDraft(
+                                HarnessEventKind.ASSISTANT_COMMITTED,
+                                step_id=current_step.step_id,
+                                message_index=message_index,
+                            ))
+                            continue
+                        if role != "tool" or not isinstance(content, dict):
+                            continue
+                        call_id = content.get("tool_call_id")
+                        tool_call = tool_calls_by_id.get(call_id)
+                        record = pending_tool_records.get(call_id)
+                        if tool_call is None:
+                            events.append(JournalEventDraft(
+                                HarnessEventKind.TOOL_RESULT_COMMITTED,
+                                step_id=current_step.step_id,
+                                message_index=message_index,
+                            ))
+                            continue
+                        if record is None:
+                            record = ToolExecutionRecord(
+                                call_ordinal=current_tool_calls.index(tool_call),
+                                message=content,
+                                duration_ms=0,
+                            )
+                        events.append(build_tool_result_event_draft(
+                            current_step.step_id,
+                            tool_call,
+                            record,
+                            message_index=message_index,
+                            ok=_tool_result_ok(tool_call["function"]["name"], content),
+                        ))
+                    current_step.turn.journal.commit_messages(
+                        current_step.turn.session_name,
+                        current_step.turn.turn_id,
+                        current_step.step_id,
+                        pending_persistence,
+                        events,
+                    )
                     del pending_persistence[:]
+                    pending_tool_records = {}
                     return
                 _mgr = app_context.get_manager()
                 if _mgr is None:
@@ -4007,6 +4045,7 @@ def _chat_with_model_generator(
             tool_calls_list = []
             for idx in sorted(tool_calls_dict.keys()):
                 tool_calls_list.append(tool_calls_dict[idx])
+            current_tool_calls = tool_calls_list
 
             replay_reasoning_content = reasoning_content or None
             if (
@@ -4237,97 +4276,75 @@ def _chat_with_model_generator(
             else:
                 _notify_event(event_callback, "status", {"state": "executing"})
 
-            def execute_in_context(tool_call):
-                return _execute_single_tool_call(
-                    tool_call,
-                    event_callback=event_callback,
-                    parent_session=parent_session,
-                    parent_turn_id=parent_turn_id,
-                    cancel_event=cancel_event,
-                    allow_subagents=allow_subagents,
-                    permission_owner=permission_owner,
-                    permission_source=permission_source,
+            from core.harness.tool_pipeline import ToolBatchExecutor
+
+            tool_pipeline, tool_context = _build_tool_pipeline_and_context(
+                event_callback,
+                parent_session=parent_session,
+                parent_turn_id=parent_turn_id,
+                cancel_event=cancel_event,
+                allow_subagents=allow_subagents,
+                permission_owner=permission_owner,
+                permission_source=permission_source,
+            )
+            tool_calls_by_id = {
+                tool_call["id"]: tool_call for tool_call in tool_calls_list
+            }
+
+            def execute_decoded(decoded, context):
+                if _execute_single_tool_call is not _ORIGINAL_EXECUTE_SINGLE_TOOL_CALL:
+                    return _execute_single_tool_call(
+                        tool_calls_by_id[decoded.call_id],
+                        event_callback=event_callback,
+                        parent_session=parent_session,
+                        parent_turn_id=parent_turn_id,
+                        cancel_event=cancel_event,
+                        allow_subagents=allow_subagents,
+                        permission_owner=permission_owner,
+                        permission_source=permission_source,
+                    )
+                return tool_pipeline.execute_decoded(decoded, context)
+
+            batch_executor = ToolBatchExecutor(
+                tool_pipeline,
+                repeat_guard=repeat_call_guard,
+                execute_decoded=execute_decoded,
+                event_payload=_tool_event_payload,
+                finished_event_payload=_tool_finished_event_payload,
+                result_ok=_tool_result_ok,
+            )
+            records = []
+            notify_tool_event = (
+                lambda kind, payload: _notify_event(event_callback, kind, payload)
+            )
+            for prepared_batch in batch_executor.prepare(
+                tool_calls_list,
+                tool_context,
+            ):
+                batch_executor.begin_batch(
+                    prepared_batch,
+                    tool_context,
+                    notify_tool_event,
                 )
-
-            def execute_timed(tool_call):
-                started_at = time.monotonic()
-                result = execute_in_context(tool_call)
-                duration_ms = round((time.monotonic() - started_at) * 1000)
-                return result, max(0, duration_ms)
-
-            def execute_guarded(tool_call):
-                """重复调用抑制包装：同签名成功 2 次后不再执行，直接合成指令性结果。"""
-                func_name = tool_call["function"]["name"]
-                arguments = tool_call["function"].get("arguments")
-                if not repeat_call_guard.should_execute(func_name, arguments):
-                    return _repeat_call_blocked_result(tool_call), 0
-                result, duration_ms = execute_timed(tool_call)
-                repeat_call_guard.record(
-                    func_name, arguments, ok=_tool_result_ok(func_name, result)
-                )
-                return result, duration_ms
-
-            # 只把显式声明为 parallel_safe 的相邻工具放入同一并发批次。
-            batches = []
-            for tc in tool_calls_list:
-                func_name = tc["function"]["name"]
-                try:
-                    is_parallel = tool_registry.get(func_name).parallel_safe
-                except KeyError:
-                    is_parallel = False
-                if batches and batches[-1][0] and is_parallel:
-                    batches[-1][1].append(tc)
-                else:
-                    batches.append((is_parallel, [tc]))
-
-            for is_parallel, batch in batches:
-                raise_if_cancelled()
-
-                for tc in batch:
-                    _notify_event(event_callback, "tool_requested", _tool_event_payload(tc))
-                for tc in batch:
-                    _notify_event(event_callback, "tool_started", _tool_event_payload(tc))
                 yield ""
-
-                if is_parallel and len(batch) > 1:
-                    # 并发上限固定为 4，结果仍按模型工具调用顺序写回。
-                    # 不用 with 语句：with 的 __exit__ 会 shutdown(wait=True)，
-                    # 取消时会卡住 UI 直到所有并行工具（可能是长时子代理）跑完。
-                    futures = [_submit_daemon_call(execute_guarded, item) for item in batch]
-                    timed_results = []
-                    for future in futures:
-                        while not future.done():
-                            raise_if_cancelled()
-                            try:
-                                future.result(timeout=0.1)
-                            except _FutureTimeoutError:
-                                pass
-                        timed_results.append(future.result())
-                    results = [result for result, _duration_ms in timed_results]
-                    durations = [duration_ms for _result, duration_ms in timed_results]
-                    messages.extend(results)
-                    for tc, res, duration_ms in zip(batch, results, durations):
-                        _notify_event(
-                            event_callback,
-                            "tool_finished",
-                            _tool_finished_event_payload(tc, res, duration_ms),
-                        )
-                    if stream:
-                        pending_persistence.extend(("tool", res) for res in results)
-                else:
-                    # 修改类工具：串行处理以保证授权及状态顺序
-                    for tc in batch:
-                        raise_if_cancelled()
-                        res, duration_ms = execute_guarded(tc)
-                        messages.append(res)
-                        _notify_event(
-                            event_callback,
-                            "tool_finished",
-                            _tool_finished_event_payload(tc, res, duration_ms),
-                        )
-                        if stream:
-                            pending_persistence.append(("tool", res))
+                records.extend(batch_executor.execute_batch(
+                    prepared_batch,
+                    tool_context,
+                    notify_tool_event,
+                ))
                 yield ""
+            records = tuple(sorted(
+                records,
+                key=lambda record: record.call_ordinal,
+            ))
+
+            results = [record.message for record in records]
+            messages.extend(results)
+            pending_tool_records = {
+                record.message.get("tool_call_id"): record for record in records
+            }
+            if stream:
+                pending_persistence.extend(("tool", result) for result in results)
             
             if event_callback is None:
                 app_context.set_task_status('executing')
