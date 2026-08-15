@@ -24,6 +24,7 @@ from core.harness.request_envelope import (
     _responses_tools_from_chat_tools,
     prepare_stream_request,
 )
+from core.harness.runtime import TurnRuntime
 
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
 # （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
@@ -1805,10 +1806,16 @@ def chat_with_model_events(
     the event-oriented entry point used by the TUI and is deliberately kept
     separate while the existing tool loop is migrated incrementally.
     """
-    if persist and not parent_session:
-        raise ValueError("parent_session is required when persist=True")
     resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
     resolved_parent_turn_id = parent_turn_id or resolved_turn_id
+    harness_runtime = TurnRuntime.start(
+        resolved_turn_id,
+        parent_session,
+        persist=bool(persist),
+        manager=app_context.get_manager() if persist else None,
+        cancel_event=cancel_event,
+        clock_ms=lambda: time.time_ns() // 1_000_000,
+    )
     factory = TurnEventFactory(resolved_turn_id)
     pending_events = []
     pending_lock = threading.Lock()
@@ -1872,6 +1879,7 @@ def chat_with_model_events(
         permission_source=permission_source,
         cache_scope=cache_scope,
         cache_session_id=cache_session_id or parent_session,
+        harness_runtime=harness_runtime,
     )
     try:
         for chunk in generator:
@@ -1894,6 +1902,7 @@ def chat_with_model_events(
     except Exception as exc:
         # 生成器前置区（记忆注入/通知 drain/请求构造）抛出的异常会穿透内部
         # try 直接传播到这里：补发 turn_error，保证调用方能感知回合失败
+        harness_runtime.fail(type(exc).__name__)
         yield from drain_public_events()
         yield factory.emit("turn_error", {"message": _sanitize_error_text(exc)})
         raise
@@ -3907,6 +3916,8 @@ def _chat_with_model_generator(
     permission_source="主代理",
     cache_scope="main",
     cache_session_id=None,
+    *,
+    harness_runtime=None,
 ):
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
@@ -3957,26 +3968,29 @@ def _chat_with_model_generator(
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
     pending_persistence = []
+    persistence_failure = None
+    current_step = None
 
     def flush_persistence():
         """把本轮已确认的助手/工具消息按序落库（与正常结束路径一致）。"""
-        nonlocal pending_persistence
+        nonlocal pending_persistence, persistence_failure
         if stream and pending_persistence:
-            _mgr = app_context.get_manager()
-            if not _mgr:
-                # 当前没有可用的存储管理器：保留队列，待下次 flush 时再尝试落库，
-                # 直接清空会导致整批消息静默丢失。
-                return
             try:
+                if harness_runtime is not None:
+                    if current_step is None:
+                        # 前置阶段产生的通知由首个 Step 一并原子提交。
+                        return
+                    current_step.commit_messages(pending_persistence)
+                    del pending_persistence[:]
+                    return
+                _mgr = app_context.get_manager()
+                if _mgr is None:
+                    raise RuntimeError("消息持久化失败：存储管理器不可用")
                 _mgr.add_messages(parent_session, pending_persistence)
-            except Exception as flush_err:
-                # 落库失败不回滚内存：add_messages 可能已部分写入，回滚会造成
-                # 内存/DB 分叉。仅上报错误事件并丢弃待写队列，避免重复写入。
-                _notify_event(event_callback, "error", {
-                    "message": f"消息持久化失败：{str(flush_err)}",
-                })
-            finally:
                 del pending_persistence[:]
+            except Exception as error:
+                persistence_failure = error
+                raise
 
     def salvage_persistence_on_cancel():
         """取消时打捞待写队列：带 tool_calls 的 assistant 消息若缺对应 tool
@@ -4129,13 +4143,20 @@ def _chat_with_model_generator(
     # (pending_persistence and flush_persistence are now defined earlier)
 
     def raise_if_cancelled():
+        if harness_runtime is not None:
+            harness_runtime.heartbeat()
         if cancel_event is not None and cancel_event.is_set():
             raise KeyboardInterrupt("用户终止了对话。")
 
+    response_stream = None
     try:
+        if harness_runtime is not None:
+            harness_runtime.mark_running()
         max_turns = 100
         for turn in range(max_turns):
             raise_if_cancelled()
+            if harness_runtime is not None:
+                current_step = harness_runtime.begin_step()
             if turn > 0:
                 # 轮次边界事件：GUI 流式渲染据此把每个 LLM 轮次拆成独立消息块，
                 # 与历史重放（每轮一条 DB 记录）的结构对齐；TUI/子代理只认已知事件，自动忽略
@@ -4234,6 +4255,8 @@ def _chat_with_model_generator(
                         deepseek_generation_id=active_deepseek_generation_id,
                         deepseek_message_count=active_deepseek_message_count,
                     )
+                    if current_step is not None:
+                        current_step.capture_request(request_envelope)
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 在飞请求登记到 cancel_event 名下，停止路径可硬中断底层连接。
                     future = _submit_daemon_call(
@@ -4275,6 +4298,8 @@ def _chat_with_model_generator(
                         if exc is not None:
                             raise exc
                         response_stream, inflight_holder = future.result()
+                        if current_step is not None:
+                            current_step.mark_streaming()
                     finally:
                         # 用户取消时避免 shutdown(wait=True) 阻塞到网络请求完成（最长 90s）
                         future.cancel()
@@ -4583,6 +4608,8 @@ def _chat_with_model_generator(
             if tool_calls_list:
                 message_to_append["tool_calls"] = tool_calls_list
             messages.append(message_to_append)
+            if current_step is not None:
+                current_step.mark_assistant_ready()
 
             persisted_message = {
                 "role": "assistant",
@@ -4672,6 +4699,9 @@ def _chat_with_model_generator(
                     messages.append(summary_request)
                     # 该 user 催促消息也需要持久化，否则下一轮重建历史时上下文会缺失
                     pending_persistence.append(("user", summary_request))
+                    flush_persistence()
+                    if current_step is not None:
+                        current_step.complete()
                     # 内部兜底重试静默进行：底部状态栏已显示"正在干活..."，
                     # 这里不再发 status 通知暴露"模型未生成结论"的内部细节。
                     continue
@@ -4719,6 +4749,9 @@ def _chat_with_model_generator(
                         _notify_event(event_callback, "notice", {
                             "message": "计划仍有未执行项，已提醒模型继续执行。",
                         })
+                        flush_persistence()
+                        if current_step is not None:
+                            current_step.complete()
                         continue
                 # 模型未调用工具且未生成任何正文：给出明确提示，避免 UI 在
                 # "思考完成" 后陷入沉默（常见于某些模型只输出 reasoning 或空回复）。
@@ -4739,7 +4772,14 @@ def _chat_with_model_generator(
                 if promoted_reasoning and public_content:
                     yield from _yield_content(public_content)
                 flush_persistence()
+                if current_step is not None:
+                    current_step.complete()
+                if harness_runtime is not None:
+                    harness_runtime.complete()
                 return
+
+            if current_step is not None:
+                current_step.mark_tools_running()
 
             # 输出被 max_tokens 截断时，工具参数几乎必然不完整（JSON 修复只能补全
             # 语法，无法找回被截断的内容）。此时绝不能执行任何工具——尤其是
@@ -4761,6 +4801,9 @@ def _chat_with_model_generator(
                     if stream:
                         pending_persistence.append(("tool", synth))
                 flush_persistence()
+                if current_step is not None:
+                    current_step.mark_tools_committed()
+                    current_step.complete()
                 _notify_event(event_callback, "notice", {
                     "message": "模型输出被长度限制截断，已拦截本批工具调用并要求模型拆小参数重试。",
                 })
@@ -4870,6 +4913,11 @@ def _chat_with_model_generator(
                 app_context.invalidate_ui()
             else:
                 _notify_event(event_callback, "status", {"state": "executing"})
+
+            flush_persistence()
+            if current_step is not None:
+                current_step.mark_tools_committed()
+                current_step.complete()
             
         # 超过轮次上限：提示消息写入历史并与正常结束一样落库，避免下一轮丢失上下文
         msg = f"{TOOL_ERROR_PREFIX} 任务轮次超过上限（100 轮），请把任务拆小一点再试！"
@@ -4878,10 +4926,15 @@ def _chat_with_model_generator(
         if stream:
             pending_persistence.append(("assistant", deepcopy(limit_message)))
         flush_persistence()
+        if harness_runtime is not None:
+            harness_runtime.complete()
         yield from _yield_content(msg)
         return
 
     except KeyboardInterrupt:
+        if cancel_event is not None:
+            cancel_event.set()
+            abort_inflight_streams(cancel_event)
         # 关闭底层 HTTP 流：否则每次取消都会泄漏一个连接/套接字
         try:
             response_stream.close()
@@ -4890,10 +4943,14 @@ def _chat_with_model_generator(
         # 用户中断：先把本轮已产生的完整消息打捞落库（悬空的 tool_calls 组补
         # 取消占位结果），否则终止前已完成的助手输出/工具结果整批丢失，
         # 重开会话看不到任何终止前进度。
-        salvage_persistence_on_cancel()
-        flush_persistence()
-        # 安全回退删除此轮 Turn 添加的内存消息残影（DB 已保留打捞部分）
-        rollback_turn_messages()
+        try:
+            salvage_persistence_on_cancel()
+            flush_persistence()
+        finally:
+            # 安全回退删除此轮 Turn 添加的内存消息残影（DB 已保留打捞部分）
+            rollback_turn_messages()
+            if harness_runtime is not None:
+                harness_runtime.cancel()
         raise
     except GeneratorExit:
         # GUI 消费端检测到取消后 break，生成器在 yield 点被 close：这条路径
@@ -4902,8 +4959,15 @@ def _chat_with_model_generator(
             response_stream.close()
         except Exception:
             pass
-        salvage_persistence_on_cancel()
-        flush_persistence()
+        if cancel_event is not None:
+            cancel_event.set()
+            abort_inflight_streams(cancel_event)
+        try:
+            salvage_persistence_on_cancel()
+            flush_persistence()
+        finally:
+            if harness_runtime is not None:
+                harness_runtime.cancel()
         raise
     except Exception as e:
         try:
@@ -4913,6 +4977,10 @@ def _chat_with_model_generator(
         # 异常路径同样回滚本轮未持久化的内存消息：既避免留下带 tool_calls 却无
         # tool 响应的悬空 assistant 消息（下一轮 API 会 400），也保持内存历史与 DB 一致
         rollback_turn_messages()
+        if harness_runtime is not None:
+            harness_runtime.fail(type(e).__name__)
+        if e is persistence_failure:
+            raise
         if event_callback is not None:
             _notify_event(event_callback, "error", {
                 "message": _sanitize_error_text(e),
