@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.1.52](https://img.shields.io/badge/Version-1.1.52-green.svg)](core/version.py)
+[![Version 1.2.1](https://img.shields.io/badge/Version-1.2.1-green.svg)](core/version.py)
 
 > 一个国产终端 AI 编程助手，代号「星瑶」。支持 TUI 控制台与 GUI 窗口双形态、多模型切换、子代理编排、计划执行、长期记忆、MCP 扩展与可插拔技能系统。
 
@@ -24,6 +24,13 @@
 - **副模型机制**：可配置副模型承担视觉识别、记忆压缩、子代理调用等任务，主副分工
 - **22 个内置工具**：文件读写、代码搜索、命令执行、网页抓取、天气查询、LSP 符号查找等（详见下文）
 - **工具结果缓存**：相同搜索/读取自动走本地缓存，节省 token 与时间
+
+### 核心内核（Harness）
+- **固定主代理内核**：严格状态机（Turn 8 态 / Step 10 态），非法状态转移显式失败；内核非插件化、不可动态替换
+- **SQLite Journal**：owner 租约 + 心跳防多进程冲突，事件序列单调分配，消息与事件同事务原子提交
+- **崩溃恢复**：未完成回合仅标记为 `interrupted`，绝不自动重放模型请求、命令或文件写入等副作用
+- **请求指纹**：对最终 Provider 请求生成不可变指纹，配合 byte-golden 回归防止缓存漂移
+- **工具管线**：同签名重复调用抑制（RepeatCallGuard），相邻只读工具并发批量执行
 
 ### 高级编排
 - **子代理系统**：5 种内置类型（explore / implement / test / review / general）+ 自定义子代理，支持依赖感知并行调度与嵌套（最深 3 层）
@@ -469,6 +476,7 @@ xingyao-y-code/
 ├── core/                    # 核心模块
 │   ├── version.py           # 版本号（单一来源）
 │   ├── agent_service.py     # 对话服务（TUI/GUI 共源）
+│   ├── harness/             # 固定主代理内核（严格状态机 / SQLite Journal / 工具管线）
 │   ├── llm.py               # LiteLLM 调用与工具编排
 │   ├── tools.py             # 本地工具实现
 │   ├── tool_registry.py     # 工具注册表
@@ -517,11 +525,12 @@ xingyao-y-code/
 │   │   └── utils/
 │   ├── package.json
 │   └── vite.config.ts
+├── dsh-desktop-shell/      # DeepSeek Harness 桌面壳插件（WebView2 窗口 + ycode 主题 React 皮肤）
 ├── skills/                 # 内置技能示例
 ├── plugins/                # 内置插件目录
 ├── vendor/ripgrep/         # 内置 ripgrep
 ├── packaging/              # 打包辅助
-├── tests/                  # pytest 测试用例（60+ 文件）
+├── tests/                  # pytest 测试用例（79 个文件）
 ├── docs/                   # 文档
 │   ├── BUILD.md            # 构建文档
 │   ├── all_features.md     # 全功能文档
@@ -623,7 +632,7 @@ JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视
 pytest
 ```
 
-测试覆盖 60+ 个模块，包括 agent_turn_e2e、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
+测试覆盖 79 个模块，包括 agent_turn_e2e、harness（models/journal/runtime/请求指纹/工具管线）、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
 
 ---
 
