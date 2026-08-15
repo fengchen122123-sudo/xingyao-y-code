@@ -17,6 +17,16 @@ from concurrent.futures import Future, TimeoutError as _FutureTimeoutError
 from copy import deepcopy
 from typing import Dict, List
 
+from core.harness.request_envelope import (
+    PreparedStreamRequest,
+    RequestEnvelope,
+    _responses_input_from_messages,
+    _responses_tools_from_chat_tools,
+    prepare_stream_request,
+)
+from core.harness.journal import journal_storage_supported
+from core.harness.runtime import TurnRuntime
+
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
 # （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
 # 必须在 import litellm 之前设置该环境变量才生效
@@ -306,6 +316,7 @@ from core.command_policy import (
     session_rule_for_command,
 )
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
+from core.harness.stream_assembler import StreamAssembler, complete_thinking_blocks
 from core.tool_presenter import (
     build_tool_display,
     summarize_tool_finished,
@@ -1429,76 +1440,6 @@ def _obj_value(value, key, default=None):
     return getattr(value, key, default)
 
 
-def _responses_input_from_messages(messages):
-    """把 Chat Completions 历史转换成 Responses input items。"""
-    def convert_content(content):
-        if not isinstance(content, list):
-            return content
-        blocks = []
-        for block in content:
-            if not isinstance(block, dict):
-                raise ValueError("Responses 多模态内容块必须是对象")
-            block_type = block.get("type")
-            if block_type in {"text", "input_text"}:
-                blocks.append({"type": "input_text", "text": str(block.get("text") or "")})
-            elif block_type in {"image_url", "input_image"}:
-                image_url = block.get("image_url")
-                if isinstance(image_url, dict):
-                    image_url = image_url.get("url")
-                if not image_url:
-                    raise ValueError("Responses 图片内容缺少 image_url")
-                blocks.append({"type": "input_image", "image_url": str(image_url)})
-            else:
-                raise ValueError(f"Responses 不支持的内容块: {block_type}")
-        return blocks
-
-    items = []
-    for message in messages:
-        role = message.get("role")
-        content = message.get("content")
-        if role in {"system", "developer", "user"}:
-            items.append({"role": role, "content": convert_content(content)})
-        elif role == "assistant":
-            if content:
-                items.append({"role": "assistant", "content": convert_content(content)})
-            for call in message.get("tool_calls") or []:
-                function = call.get("function") or {}
-                items.append({
-                    "type": "function_call",
-                    "call_id": call.get("id"),
-                    "name": function.get("name"),
-                    "arguments": function.get("arguments") or "{}",
-                })
-        elif role == "tool":
-            call_id = message.get("tool_call_id")
-            if not call_id:
-                raise ValueError("Responses 工具结果缺少 tool_call_id")
-            items.append({
-                "type": "function_call_output",
-                "call_id": call_id,
-                "output": content if isinstance(content, str) else json.dumps(content, ensure_ascii=False),
-            })
-        else:
-            raise ValueError(f"Responses 不支持的消息角色: {role}")
-    return items
-
-
-def _responses_tools_from_chat_tools(tools):
-    """把 Chat Completions function wrapper 展平为 Responses tool。"""
-    result = []
-    for tool in tools or []:
-        if tool.get("type") != "function" or not isinstance(tool.get("function"), dict):
-            raise ValueError("Responses 仅支持显式 function 工具定义")
-        function = tool["function"]
-        result.append({
-            "type": "function",
-            "name": function["name"],
-            "description": function.get("description", ""),
-            "parameters": function.get("parameters") or {"type": "object", "properties": {}},
-        })
-    return result
-
-
 def _chat_chunk(*, content="", reasoning="", tool_calls=None, finish_reason=None, usage=None):
     delta = SimpleNamespace(
         content=content,
@@ -1617,41 +1558,30 @@ def _responses_events_as_chat_chunks(events):
             raise RuntimeError(f"未支持的 Responses 流事件: {event_type or '<empty>'}")
 
 
-def _request_stream(protocol, kwargs, *, timeout, cancel_event=None):
+def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_event=None):
     """按显式协议发起流请求；Responses 失败时禁止降级。
 
     返回 (stream, holder)：holder 登记在 cancel_event 名下的在飞注册表，
     供停止路径硬中断；由调用方在流消费结束后 unregister。
     """
+    if isinstance(prepared_or_protocol, PreparedStreamRequest):
+        if kwargs is not None or timeout is not None:
+            raise TypeError("PreparedStreamRequest already contains provider kwargs and timeout")
+        prepared = prepared_or_protocol
+    else:
+        if kwargs is None or timeout is None:
+            raise TypeError("legacy request calls require kwargs and timeout")
+        prepared = prepare_stream_request(prepared_or_protocol, kwargs, timeout)
+
     holder = _register_inflight_stream(cancel_event)
     try:
-        if protocol != "responses":
-            stream = completion(**kwargs, timeout=timeout)
+        if prepared.protocol != "responses":
+            stream = completion(**prepared.kwargs)
             if holder is not None:
                 holder.attach(stream)
             return stream, holder
-
-        response_kwargs = {
-            "model": kwargs["model"],
-            "api_key": kwargs.get("api_key"),
-            "input": _responses_input_from_messages(kwargs.get("messages") or []),
-            "tools": _responses_tools_from_chat_tools(kwargs.get("tools") or []),
-            "stream": True,
-            "timeout": timeout,
-        }
-        for source, target in (
-            ("api_base", "api_base"),
-            ("max_tokens", "max_output_tokens"),
-            ("tool_choice", "tool_choice"),
-            ("num_retries", "num_retries"),
-            ("extra_body", "extra_body"),
-        ):
-            if source in kwargs:
-                response_kwargs[target] = kwargs[source]
-        if kwargs.get("reasoning_effort"):
-            response_kwargs["reasoning"] = {"effort": kwargs["reasoning_effort"]}
         # 可关闭对象是底层原始流，不是外层映射生成器（生成器在执行中无法 close）
-        raw_stream = _litellm_responses(**response_kwargs)
+        raw_stream = _litellm_responses(**prepared.kwargs)
         if holder is not None:
             holder.attach(raw_stream)
         return _responses_stream_as_chat_chunks(raw_stream), holder
@@ -1878,10 +1808,23 @@ def chat_with_model_events(
     the event-oriented entry point used by the TUI and is deliberately kept
     separate while the existing tool loop is migrated incrementally.
     """
-    if persist and not parent_session:
-        raise ValueError("parent_session is required when persist=True")
     resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
     resolved_parent_turn_id = parent_turn_id or resolved_turn_id
+    # Duck-type 管理器（未实现 Journal 存储接口的旧测试替身/外部调用方）
+    # 不进入 Harness Journal，退回 legacy add_messages 持久化路径；
+    # 真实 MemoryManager 始终具备完整接口，照常走 Journal。
+    _manager = app_context.get_manager() if persist else None
+    if persist and not journal_storage_supported(_manager):
+        harness_runtime = None
+    else:
+        harness_runtime = TurnRuntime.start(
+            resolved_turn_id,
+            parent_session,
+            persist=bool(persist),
+            manager=_manager,
+            cancel_event=cancel_event,
+            clock_ms=lambda: time.time_ns() // 1_000_000,
+        )
     factory = TurnEventFactory(resolved_turn_id)
     pending_events = []
     pending_lock = threading.Lock()
@@ -1945,6 +1888,7 @@ def chat_with_model_events(
         permission_source=permission_source,
         cache_scope=cache_scope,
         cache_session_id=cache_session_id or parent_session,
+        harness_runtime=harness_runtime,
     )
     try:
         for chunk in generator:
@@ -1961,12 +1905,16 @@ def chat_with_model_events(
         if not turn_failed:
             yield factory.emit("turn_finished", {})
     except KeyboardInterrupt:
+        if harness_runtime is not None:
+            harness_runtime.cancel()
         yield from drain_public_events()
         yield factory.emit("turn_cancelled", {})
         raise
     except Exception as exc:
         # 生成器前置区（记忆注入/通知 drain/请求构造）抛出的异常会穿透内部
         # try 直接传播到这里：补发 turn_error，保证调用方能感知回合失败
+        if harness_runtime is not None:
+            harness_runtime.fail(type(exc).__name__)
         yield from drain_public_events()
         yield factory.emit("turn_error", {"message": _sanitize_error_text(exc)})
         raise
@@ -2715,23 +2663,7 @@ def _provider_request_options(
 
 def _complete_thinking_blocks(delta):
     """Extract only complete provider blocks that are safe to round-trip."""
-    fields = getattr(delta, "provider_specific_fields", None) or {}
-    blocks = fields.get("thinking_blocks") if isinstance(fields, dict) else None
-    if not isinstance(blocks, list):
-        return None
-    complete = [
-        deepcopy(block)
-        for block in blocks
-        if isinstance(block, dict)
-        and (
-            bool(block.get("signature"))
-            or (
-                block.get("type") == "redacted_thinking"
-                and bool(block.get("data"))
-            )
-        )
-    ]
-    return complete or None
+    return complete_thinking_blocks(delta)
 
 def _notify_event(event_callback, kind, payload):
     if event_callback is not None:
@@ -2826,9 +2758,17 @@ def _tool_call_arguments(tc):
     return arguments
 
 
-def _tool_event_payload(tc):
-    function_name = tc["function"]["name"]
-    arguments = _tool_call_arguments(tc)
+def _tool_event_parts(tool_call):
+    if isinstance(tool_call, dict):
+        return (
+            tool_call.get("id", ""),
+            tool_call["function"]["name"],
+            _tool_call_arguments(tool_call),
+        )
+    return tool_call.call_id, tool_call.name, tool_call.arguments
+
+
+def _tool_event_payload_from_parts(call_id, function_name, arguments):
     preview = ""
     if function_name in ("read_file", "write_file", "edit_file"):
         preview = arguments.get("file_path", "")
@@ -2850,7 +2790,7 @@ def _tool_event_payload(tc):
     elif function_name == "run_subagent":
         preview = arguments.get("task_description", "")
     return {
-        "id": tc.get("id", ""),
+        "id": call_id,
         "name": function_name,
         "preview": str(preview)[:120],
         "arguments": arguments,
@@ -2859,12 +2799,15 @@ def _tool_event_payload(tc):
     }
 
 
-def _tool_finished_event_payload(tc, result, duration_ms):
-    function_name = tc["function"]["name"]
-    arguments = _tool_call_arguments(tc)
+def _tool_event_payload(tool_call):
+    return _tool_event_payload_from_parts(*_tool_event_parts(tool_call))
+
+
+def _tool_finished_event_payload(tool_call, result, duration_ms):
+    call_id, function_name, arguments = _tool_event_parts(tool_call)
     ok = _tool_result_ok(function_name, result)
     return {
-        **_tool_event_payload(tc),
+        **_tool_event_payload_from_parts(call_id, function_name, arguments),
         "ok": ok,
         "summary": _tool_output_preview(function_name, arguments, result),
         "result": _tool_result_text(result),
@@ -2922,60 +2865,6 @@ def _tool_result_ok(function_name, result):
         "计划运行状态由真实调度器管理",
         "新建计划项必须是 pending",
     ))
-
-
-# 重复工具调用被拦截时返回给模型的指令性文本（引导换方法，而非错误前缀）
-REPEAT_CALL_BLOCKED_TEXT = (
-    "🛑 检测到相同的工具调用已成功执行过 2 次，结果未发生变化。请改用其他方式推进任务。"
-)
-
-
-class _RepeatCallGuard:
-    """重复工具调用抑制：同一 (工具, canonical 参数) 签名成功 N 次后拦截。
-
-    签名规范化：JSON unmarshal→marshal（key 排序、去空白），等价于 Reasonix
-    canonicalToolArgs。按轮次维度持有，跟随 _chat_with_model_generator 的循环生命周期。
-    每次重复调用都是一整轮“前缀全命中但新增一大段重复工具结果”的纯 miss。
-    """
-
-    BLOCK_AFTER_SUCCESSES = 2
-
-    def __init__(self):
-        self._success_counts = {}
-        self._lock = threading.Lock()
-
-    @staticmethod
-    def signature(name, arguments_json):
-        try:
-            parsed = json.loads(arguments_json or "{}")
-            canonical = json.dumps(
-                parsed, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-            )
-        except Exception:
-            canonical = str(arguments_json or "")
-        return f"{name}:{canonical}"
-
-    def should_execute(self, name, arguments_json):
-        sig = self.signature(name, arguments_json)
-        with self._lock:
-            return self._success_counts.get(sig, 0) < self.BLOCK_AFTER_SUCCESSES
-
-    def record(self, name, arguments_json, ok):
-        if not ok:
-            return
-        sig = self.signature(name, arguments_json)
-        with self._lock:
-            self._success_counts[sig] = self._success_counts.get(sig, 0) + 1
-
-
-def _repeat_call_blocked_result(tool_call):
-    """为被重复调用抑制拦截的 tool_call 合成不落执行的 tool 结果消息。"""
-    return {
-        "role": "tool",
-        "tool_call_id": tool_call["id"],
-        "name": tool_call["function"]["name"],
-        "content": REPEAT_CALL_BLOCKED_TEXT,
-    }
 
 
 def _raise_if_tool_cancelled(cancel_event):
@@ -3089,60 +2978,24 @@ def _show_file_diff(
     truncated_note,
     tool_call_id="",
 ):
-    """渲染文件修改 diff 面板（write_file / edit_file 共用）。"""
-    try:
-        from core.diff_viewer import generate_diff, render_diff_table
-        from rich.panel import Panel
-        from rich.console import Console
-        diff_text = generate_diff(old_content, new_content, file_path)
-        if not diff_text:
-            return
-        lines = diff_text.split('\n')
-        max_lines = 25
-        display_text = (
-            '\n'.join(lines[:max_lines]) + f"\n... (省略 {len(lines) - max_lines} 行，{truncated_note})"
-            if len(lines) > max_lines else diff_text
-        )
-        diff_table = render_diff_table(display_text)
-        panel = Panel(diff_table, title=panel_title, border_style="green", expand=False)
-        from prompt_toolkit.formatted_text import ANSI
-        rich_console = Console(force_terminal=True, color_system="truecolor")
-        with rich_console.capture() as capture:
-            rich_console.print(panel)
-        diff_output = capture.get()
-        if event_callback is None:
-            safe_print(ANSI(diff_output))
-        else:
-            _notify_event(event_callback, "diff_ready", {
-                "tool_call_id": str(tool_call_id or ""),
-                "file_path": file_path,
-                # text: 终端用的 rich 面板（含 ANSI 颜色），TUI 直接打印
-                "text": diff_output,
-                # diff_text: 纯文本 unified diff，供 GUI 等非终端界面自行着色渲染
-                # （ANSI 转义码在 HTML 里会原样显示成乱码）
-                "diff_text": display_text,
-            })
-    except Exception as diff_err:
-        logger.warning("渲染文件 diff 失败 (%s): %s", file_path, diff_err)
+    """Compatibility wrapper for the extracted diff adapter."""
+    from core.harness.tool_adapters import _show_file_diff as _render_file_diff
 
-
+    return _render_file_diff(
+        file_path,
+        old_content,
+        new_content,
+        event_callback,
+        panel_title,
+        truncated_note,
+        tool_call_id=tool_call_id,
+    )
 
 def _get_imom_active_publish_root():
-    """读取 imom_locator 插件的当前活跃项目 publish_root，用于沙盒守卫。"""
-    try:
-        store_file = os.path.join(os.path.expanduser("~"), ".ycode", "imom_projects.json")
-        with open(store_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        active = data.get("active")
-        projects = data.get("projects", {})
-        if active and active in projects:
-            return projects[active].get("publish_root", "")
-        if len(projects) == 1:
-            return next(iter(projects.values())).get("publish_root", "")
-    except Exception:
-        pass
-    return ""
+    """Compatibility wrapper for the extracted imom adapter."""
+    from core.harness.tool_adapters import _get_imom_active_publish_root as _get_root
 
+    return _get_root()
 
 def _sandbox_outside_guard(
     function_name,
@@ -3153,61 +3006,80 @@ def _sandbox_outside_guard(
     permission_source,
     cancel_event,
 ):
-    """沙盒外路径访问守卫：无论何种权限模式，每次访问工作目录外路径都必须询问用户。
+    """Compatibility wrapper for the extracted sandbox adapter."""
+    from core.harness.tool_adapters import _sandbox_outside_guard as _guard
 
-    返回 (bypass_cm, error)：
-    - (None, None)：在沙盒内，无需特殊处理
-    - (cm, None)：用户同意本次，调用方需在 cm 上下文中执行工具
-    - (None, err)：用户拒绝/取消，err 为工具结果文案
-    """
-    if not path_value:
-        return None, None
-    try:
-        outside = is_outside_workspace(path_value)
-    except Exception:
-        return None, PATH_VALIDATION_ERROR_MESSAGE
-    if not outside:
-        return None, None
-    from core import tools as _tools
-    # ycode 数据目录（~/.ycode 全部内容：记忆/会话/配置）是自家运行数据，
-    # read/write/edit 均豁免沙盒外询问；返回 bypass 上下文让工具层兜底校验放行
-    try:
-        from core.memory_kairos import is_ycode_data_path
-        if is_ycode_data_path(path_value):
-            basename = os.path.basename(str(path_value)).lower()
-            if basename not in {"config.json", "config.json.bak", "mcp.json", "mcp.json.bak"}:
-                return sandbox_bypass(), None
-    except Exception:
-        pass
-    if function_name == "read_file":
-        try:
-            from core.skills import is_trusted_read_path
-            if is_trusted_read_path(str(path_value)):
-                return None, None
-        except Exception:
-            pass
-    # 仅线程内单次放行（已批准的嵌套操作不重复询问）；
-    # 会话级放行（/sandbox on、"始终放行"）不再跳过询问。
-    if getattr(_tools._sandbox_tls, "depth", 0) > 0:
-        return None, None
+    return _guard(
+        function_name,
+        path_value,
+        event_callback,
+        permission_owner,
+        parent_turn_id,
+        permission_source,
+        cancel_event,
+        permission_checker=check_permission_and_ask,
+        is_outside_workspace=is_outside_workspace,
+        sandbox_bypass=sandbox_bypass,
+        permission_error_type=PermissionSystemError,
+    )
 
-    try:
-        approved = check_permission_and_ask(
-            "sandbox_outside_access",
-            {"path": str(path_value), "operation": function_name},
-            event_callback=event_callback,
-            permission_owner=permission_owner,
-            parent_turn_id=parent_turn_id,
-            permission_source=permission_source,
-            cancel_event=cancel_event,
-        )
-    except PermissionSystemError:
-        return None, PERMISSION_SYSTEM_ERROR_MESSAGE
-    if approved:
-        return sandbox_bypass(), None
-    if cancel_event is not None and cancel_event.is_set():
-        return None, PERMISSION_CANCELLED_MESSAGE
-    return None, "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径每次访问都需要用户确认。"
+def _build_tool_pipeline_and_context(
+    event_callback=None,
+    *,
+    parent_session=None,
+    parent_turn_id=None,
+    cancel_event=None,
+    allow_subagents=True,
+    permission_owner=None,
+    permission_source="主代理",
+):
+    from core.harness.tool_adapters import ToolAdapterSet
+    from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
+    from core.tool_registry import ToolRegistry
+
+    bound_execute = tool_registry.execute
+    registry_execute_override = (
+        bound_execute
+        if getattr(bound_execute, "__func__", None) is not ToolRegistry.execute
+        else None
+    )
+    adapters = ToolAdapterSet(
+        read_file=read_file,
+        write_file=write_file,
+        edit_file=edit_file,
+        run_subagent=run_subagent,
+        manage_task=manage_task,
+        show_file_diff=_show_file_diff,
+        get_imom_active_publish_root=_get_imom_active_publish_root,
+        sandbox_guard=_sandbox_outside_guard,
+        sandbox_bypass=sandbox_bypass,
+        read_text=_read_text_with_encoding_fallback,
+        notify_event=_notify_event,
+        mark_plan_turn=_mark_plan_turn,
+        registry_execute_override=registry_execute_override,
+        is_outside_workspace=is_outside_workspace,
+        safe_print=safe_print,
+    )
+    context = ToolExecutionContext(
+        event_callback=event_callback,
+        parent_session=parent_session,
+        parent_turn_id=parent_turn_id,
+        cancel_event=cancel_event,
+        allow_subagents=allow_subagents,
+        permission_owner=permission_owner,
+        permission_source=permission_source,
+        permission_checker=check_permission_and_ask,
+        registry=tool_registry,
+        mcp_manager=_get_mcp_manager(),
+    )
+    pipeline = ToolPipeline(
+        adapters,
+        permission_error_type=PermissionSystemError,
+        truncate_result=_truncate_tool_result_for_context,
+        plan_turn_checker=_is_plan_turn,
+        pending_plan_checker=_has_pending_plan,
+    )
+    return pipeline, context
 
 
 def _execute_single_tool_call(
@@ -3221,558 +3093,24 @@ def _execute_single_tool_call(
     permission_owner=None,
     permission_source="主代理",
 ):
-    """执行单个工具调用，并返回对应的 JSON 结果结构。"""
-    function_name = tc["function"]["name"]
-    try:
-        arguments = _tool_call_arguments(tc)
-    except ValueError as parse_error:
-        # 参数 JSON 彻底无法解析：直接返回错误，避免用空参数继续执行产生更迷惑的行为。
-        # 这对 plan_write 等写操作尤为重要，可防止模型把对话历史混进参数后误清空计划。
-        return {
-            "role": "tool",
-            "tool_call_id": tc["id"],
-            "name": function_name,
-            "content": (
-                f"工具参数 JSON 解析失败：{parse_error}。"
-                "请重新调用该工具，并确保 arguments 是合法、完整、未混入其他文本的 JSON。"
-            ),
-        }
-
-    _raise_if_tool_cancelled(cancel_event)
-
-    plan_enforced = allow_subagents and (
-        _is_plan_turn(parent_turn_id) or _has_pending_plan(parent_session)
+    """Compatibility wrapper around the extracted deterministic pipeline."""
+    pipeline, context = _build_tool_pipeline_and_context(
+        event_callback,
+        parent_session=parent_session,
+        parent_turn_id=parent_turn_id,
+        cancel_event=cancel_event,
+        allow_subagents=allow_subagents,
+        permission_owner=permission_owner,
+        permission_source=permission_source,
     )
-    if plan_enforced:
-        plan_item_id = str(arguments.get("plan_item_id", "") or "").strip()
-        if function_name == "plan_write" and _is_plan_turn(parent_turn_id):
-            from core.plan import get_default_plan_manager
+    return pipeline.execute_one(tc, context)
 
-            if any(
-                item.get("status") != "pending"
-                for item in get_default_plan_manager().snapshot()
-            ):
-                return {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": function_name,
-                    "content": (
-                        "计划执行约束：不能重建已有执行记录，请使用 "
-                        "/plan retry <id> 重试失败项。"
-                    ),
-                }
-        if function_name in _PLAN_BOUND_ORCHESTRATORS and not plan_item_id:
-            return {
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "name": function_name,
-                "content": (
-                    f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} "
-                    "必须填写 plan_item_id，不能执行未归属计划项的任务。"
-                ),
-            }
-        if function_name in _PLAN_READ_ONLY_TOOLS:
-            # 只读工具允许主 Agent 直接使用，便于验证子代理产出和读取上下文
-            pass
-        elif function_name not in _PLAN_ROOT_CONTROL_TOOLS:
-            from core.plan import get_default_plan_manager as _get_plan
-            _plan = _get_plan()
-            ready_items = _plan.ready_items()
-            ready_execution = [
-                item for item in ready_items if item.get("kind") != "input_preparation"
-            ]
-            snapshot = _plan.snapshot()
-            in_progress = any(
-                item.get("status") == "in_progress" for item in snapshot
-            )
-            # 计划停滞且重试耗尽（剩余项全部 failed/blocked/cancelled 且均尝试>=2 次）时，
-            # 放开主 Agent 直接调用作为兜底出口，避免子代理连续失败后主 Agent
-            # 被逼入只能空转或等待用户介入的死局；首次失败仍必须走 run_subagent。
-            stalled_items = [
-                item for item in snapshot
-                if item.get("status") in {"failed", "blocked", "cancelled"}
-            ]
-            retry_exhausted = bool(stalled_items) and all(
-                int(item.get("attempts", 0)) >= 2 for item in stalled_items
-            )
-            if not ready_execution and not in_progress and retry_exhausted:
-                pass
-            else:
-                # 构造可执行计划项列表，引导 LLM 使用正确的 plan_item_id
-                ready_hints = ""
-                if ready_execution:
-                    hints = ", ".join(
-                        f"'{item['id']}'({item['subject']})" for item in ready_execution[:5]
-                    )
-                    ready_hints = f" 当前可执行的计划项: [{hints}]。"
-                return {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": function_name,
-                    "content": (
-                        f"{_PLAN_BYPASS_ERROR_PREFIX} {function_name} 必须通过 "
-                        f"run_subagent(plan_item_id=...) 执行，不能由主 Agent 直接绕过计划调用。{ready_hints}"
-                        "（若计划项多次失败（attempts>=2）全部停滞后，主 Agent 可直接调用工具修复。）"
-                    ),
-                }
-            
-    # 生成友好的中文提示
-    friendly_msg = f"⚙️ 星瑶正在后台悄悄使用工具: {function_name} 哒～"
-    if function_name == "read_file":
-        friendly_msg = f"🔍 星瑶正在读取文件：{arguments.get('file_path', '未知文件')}"
-    elif function_name == "write_file":
-        friendly_msg = f"✍️ 星瑶正在写入文件：{arguments.get('file_path', '未知文件')}"
-    elif function_name == "list_directory":
-        friendly_msg = f"📂 星瑶正在查看目录：{arguments.get('dir_path', '当前目录')}"
-    elif function_name == "execute_command":
-        cmd = arguments.get('command', '...')
-        if len(cmd) > 20: cmd = cmd[:20] + "..."
-        friendly_msg = f"💻 星瑶正在执行命令：{cmd}"
-    elif function_name == "search_code":
-        friendly_msg = f"🔍 星瑶正在全局查找: {arguments.get('query', '')}"
-    elif function_name == "find_definition":
-        friendly_msg = f"🔍 星瑶正在查找符号定义: {arguments.get('symbol', '')}"
-    elif function_name == "search_news":
-        friendly_msg = f"🌐 星瑶正在联网搜索：{arguments.get('query', '')}"
-    elif function_name == "fetch_url":
-        friendly_msg = f"🌐 星瑶正在访问网址：{arguments.get('url', '')}"
-    elif function_name == "get_weather":
-        friendly_msg = f"🌤 星瑶正在查询天气：{arguments.get('city', '') or '自动定位'}"
 
-    # The event-oriented path lets the UI render this status in order.
-    from prompt_toolkit.formatted_text import HTML
-    safe_friendly_msg = friendly_msg.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-    if event_callback is None:
-        safe_print(HTML(f"<ansigreen>[ {safe_friendly_msg} ]</ansigreen>"))
+_ORIGINAL_EXECUTE_SINGLE_TOOL_CALL = _execute_single_tool_call
 
-    result = ""
-    # 权限由工具能力元数据决定，而不是散落的函数名白名单。
-    try:
-        requires_permission = tool_registry.get(function_name).requires_permission
-    except KeyError:
-        requires_permission = function_name in ("write_file", "edit_file", "execute_command")
-    # 沙盒外的 write_file/edit_file 由 _sandbox_outside_guard 单独询问（文案含路径），
-    # 跳过此处的通用确认，避免同一操作被连续询问两次
-    _defer_to_sandbox_guard = False
-    # 计划模式：任何需要权限的修改/执行类操作一律硬拦截（规划类工具除外），
-    # 引导模型改为输出计划；只读工具不受影响，沙盒外只读访问仍逐次询问
-    if (
-        requires_permission
-        and not result
-        and app_context.get_permission_mode() == "plan"
-        and function_name not in _PLAN_MODE_ALLOWED_TOOLS
-    ):
-        result = PLAN_MODE_DENIED_MESSAGE
-    if requires_permission and not result and function_name in ("write_file", "edit_file"):
-        try:
-            _defer_to_sandbox_guard = is_outside_workspace(arguments.get("file_path", ""))
-        except Exception:
-            result = PATH_VALIDATION_ERROR_MESSAGE
-    if requires_permission and not result and not _defer_to_sandbox_guard:
-        try:
-            approved = check_permission_and_ask(
-                function_name,
-                arguments,
-                event_callback=event_callback,
-                permission_owner=permission_owner,
-                parent_turn_id=parent_turn_id,
-                permission_source=permission_source,
-                cancel_event=cancel_event,
-            )
-        except PermissionSystemError:
-            # 权限系统自身异常：明确告诉模型这是系统故障，不是用户拒绝
-            result = PERMISSION_SYSTEM_ERROR_MESSAGE
-        else:
-            if not approved:
-                # 取消与拒绝使用不同的工具结果文案，避免把“取消”误述为“拒绝”喂给模型
-                if cancel_event is not None and cancel_event.is_set():
-                    result = PERMISSION_CANCELLED_MESSAGE
-                else:
-                    result = PERMISSION_DENIED_MESSAGE
-
-    _raise_if_tool_cancelled(cancel_event)
-
-    try:
-        if result in (
-            PERMISSION_DENIED_MESSAGE,
-            PERMISSION_CANCELLED_MESSAGE,
-            PERMISSION_SYSTEM_ERROR_MESSAGE,
-            PATH_VALIDATION_ERROR_MESSAGE,
-            PLAN_MODE_DENIED_MESSAGE,
-        ):
-            pass
-        elif function_name == "read_file":
-            bypass_cm, sandbox_err = _sandbox_outside_guard(
-                function_name, arguments.get("file_path"), event_callback,
-                permission_owner, parent_turn_id, permission_source, cancel_event,
-            )
-            if sandbox_err:
-                result = sandbox_err
-            elif bypass_cm:
-                with bypass_cm:
-                    result = tool_registry.execute(function_name, **arguments).to_message_content()
-            else:
-                result = tool_registry.execute(function_name, **arguments).to_message_content()
-        elif function_name == "write_file":
-            file_path = arguments.get("file_path", "")
-            new_content = arguments.get("content", "")
-            # 沙盒外写入必须每次询问用户（即使 full 模式）
-            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
-                function_name, file_path, event_callback,
-                permission_owner, parent_turn_id, permission_source, cancel_event,
-            )
-            if _sandbox_err:
-                result = _sandbox_err
-            else:
-                _write_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
-                with _write_cm:
-                    old_content = ""
-                    if os.path.exists(file_path):
-                        try:
-                            old_content = _read_text_with_encoding_fallback(file_path)
-                        except OSError as read_err:
-                            logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
-                            old_content = ""
-                    write_result = write_file(file_path, new_content)
-                if isinstance(write_result, str) and write_result.startswith("🚨"):
-                    # 大文件覆盖保护等场景：write_file 拒绝写入，不应展示虚假 diff，也不记录 undo
-                    result = write_result
-                else:
-                    # 写入成功后再记录 undo 快照，避免未发生的修改污染撤销历史
-                    from core.memory import set_undo_state
-                    set_undo_state(file_path, old_content)
-                    # 生成 diff 并展示
-                    _show_file_diff(
-                        file_path,
-                        old_content,
-                        new_content,
-                        event_callback,
-                        panel_title=f"📝 [bold green]已修改文件: {file_path}[/bold green]",
-                        truncated_note="已成功写入文件",
-                        tool_call_id=tc["id"],
-                    )
-                    result = f"已成功将内容写入文件：{file_path}，并已向用户展示 Diff。"
-        elif function_name == "run_subagent":
-            if not allow_subagents:
-                result = f"{TOOL_ERROR_PREFIX} 子代理不能启动其他子代理。"
-            else:
-                result = run_subagent(
-                    task_description=arguments.get("task_description", ""),
-                    subagent_type=arguments.get("subagent_type", "general"),
-                    plan_item_id=arguments.get("plan_item_id", ""),
-                    run_in_background=arguments.get("run_in_background", False),
-                    # 不传时交给 run_subagent 按角色解析默认超时（只读角色更短）
-                    timeout_seconds=arguments.get("timeout_seconds"),
-                    parent_session=parent_session,
-                    parent_turn_id=parent_turn_id,
-                    parent_cancel_event=cancel_event,
-                    event_callback=event_callback,
-                )
-        elif function_name == "ask_user":
-            from core.ask_user import ask_user, normalize_question_request
-            plan_item_id = str(arguments.get("plan_item_id", "") or "").strip()
-            scheduler = None
-            try:
-                question, choices = normalize_question_request(
-                    arguments.get("question", ""),
-                    arguments.get("options"),
-                )
-            except ValueError as error:
-                result = str(error)
-            else:
-                arguments["question"] = question
-                arguments["options"] = choices
-
-            if not result and plan_item_id:
-                from core.task_scheduler import get_default_scheduler
-
-                scheduler = get_default_scheduler()
-                plan_item = next(
-                    (
-                        item
-                        for item in scheduler.plan.snapshot()
-                        if item["id"] == plan_item_id
-                    ),
-                    None,
-                )
-                # 收集可用的 input_preparation 项，用于错误提示
-                input_prep_items = [
-                    item for item in scheduler.plan.snapshot()
-                    if item.get("kind") == "input_preparation"
-                ]
-                prep_hints = ""
-                if input_prep_items:
-                    ids = ", ".join(f"'{item['id']}'({item['subject']})" for item in input_prep_items[:5])
-                    prep_hints = f" 当前 plan 中的 input_preparation 项: [{ids}]。"
-                if plan_item is None:
-                    result = json.dumps({
-                        "status": "blocked",
-                        "plan_item_id": plan_item_id,
-                        "error": f"用户输入准备项 '{plan_item_id}' 不存在。{prep_hints}",
-                    }, ensure_ascii=False)
-                elif plan_item.get("kind") != "input_preparation":
-                    result = (
-                        f"无法提问：plan_item_id='{plan_item_id}' 的 kind 是 "
-                        f"'{plan_item.get('kind', 'unknown')}'，不是 input_preparation。{prep_hints}"
-                    )
-                elif not scheduler.start_item(
-                    plan_item_id,
-                    owner="ask_user",
-                    event_callback=event_callback,
-                ):
-                    result = json.dumps({
-                        "status": "blocked",
-                        "plan_item_id": plan_item_id,
-                        "error": "计划项尚未满足依赖或当前计划不可执行。",
-                    }, ensure_ascii=False)
-                else:
-                    try:
-                        result = ask_user(
-                            question,
-                            choices,
-                            owner_id=permission_owner,
-                            parent_turn_id=parent_turn_id,
-                            source=permission_source,
-                            cancel_event=cancel_event,
-                        )
-                        try:
-                            result_payload = json.loads(str(result))
-                        except (TypeError, ValueError):
-                            result_payload = None
-                        if (
-                            isinstance(result_payload, dict)
-                            and result_payload.get("status") == "cancelled"
-                        ):
-                            scheduler.cancel(plan_item_id, "用户取消提问")
-                        elif str(result).startswith("无法") or str(result).startswith(TOOL_ERROR_PREFIX):
-                            scheduler.fail(plan_item_id, str(result))
-                        elif cancel_event is not None and cancel_event.is_set():
-                            scheduler.cancel(plan_item_id, "用户取消提问")
-                            result = json.dumps({
-                                "status": "cancelled",
-                                "plan_item_id": plan_item_id,
-                                "error": "用户取消提问",
-                            }, ensure_ascii=False)
-                        else:
-                            scheduler.complete(plan_item_id, str(result))
-                        _notify_event(event_callback, "plan_updated", {
-                            "items": scheduler.plan.snapshot(),
-                            "live_only": True,
-                        })
-                    except Exception as error:
-                        scheduler.fail(plan_item_id, str(error))
-                        raise
-            elif not result:
-                result = ask_user(
-                    question,
-                    choices,
-                    owner_id=permission_owner,
-                    parent_turn_id=parent_turn_id,
-                    source=permission_source,
-                    cancel_event=cancel_event,
-                )
-        elif function_name == "manage_task":
-            # 透传当前回合的回调/权限 owner/取消事件（kwargs 形式）。
-            # 按函数签名过滤，向后兼容尚未接受这些参数的 manage_task 版本。
-            import inspect as _inspect
-
-            _extra = {
-                "event_callback": event_callback,
-                "permission_owner": permission_owner,
-                "cancel_event": cancel_event,
-            }
-            _supported = {
-                key: value
-                for key, value in _extra.items()
-                if key in _inspect.signature(manage_task).parameters
-            }
-            result = manage_task(
-                action=arguments.get("action"),
-                task_id=arguments.get("task_id"),
-                **_supported,
-            )
-        elif function_name in {
-            "list_directory",
-            "search_code",
-            "find_definition",
-            "execute_command",
-            "search_news",
-            "fetch_url",
-            "get_weather",
-            "glob_files",
-            "plan_write",
-            "plan_update",
-            "plan_read",
-            "plan_retry",
-        }:
-            # 只读目录类工具在沙盒外访问时需用户逐次确认（沙盒外访问不提供会话放行）
-            bypass_cm, sandbox_err = None, None
-            if function_name in ("list_directory", "search_code", "find_definition", "glob_files"):
-                bypass_cm, sandbox_err = _sandbox_outside_guard(
-                    function_name, arguments.get("dir_path", "."), event_callback,
-                    permission_owner, parent_turn_id, permission_source, cancel_event,
-                )
-            # 阻塞型工具的取消事件透传：execute_command 之外，search_code/glob_files
-            # 等长阻塞工具也接受 cancel_event（registry 经 _INTERNAL_ARG_KEYS 放行），
-            # 否则取消后 ripgrep/网络请求仍阻塞数十秒，子代理迟迟无法收敛
-            if cancel_event is not None and function_name in {
-                "execute_command",
-                "search_code",
-                "glob_files",
-                "fetch_url",
-                "get_weather",
-                "search_news",
-            }:
-                arguments["cancel_event"] = cancel_event
-
-            if sandbox_err:
-                result = sandbox_err
-            elif bypass_cm:
-                with bypass_cm:
-                    result = tool_registry.execute(function_name, **arguments).to_message_content()
-            else:
-                result = tool_registry.execute(function_name, **arguments).to_message_content()
-            if function_name in {"plan_write", "plan_update"}:
-                if (
-                    function_name == "plan_write"
-                    and str(result).strip() == "计划已更新。"
-                ):
-                    _mark_plan_turn(parent_turn_id)
-                from core.plan import get_default_plan_manager
-                _notify_event(event_callback, "plan_updated", {
-                    "items": get_default_plan_manager().snapshot(),
-                    "live_only": True,
-                })
-        elif function_name == "edit_file":
-            file_path = arguments.get("file_path")
-            target = arguments.get("target_content")
-            repl = arguments.get("replacement_content")
-
-            # 沙盒外编辑必须先获批，再检查目标是否存在，避免把外部路径存在性泄露给调用方。
-            _bypass_cm, _sandbox_err = _sandbox_outside_guard(
-                function_name, file_path, event_callback,
-                permission_owner, parent_turn_id, permission_source, cancel_event,
-            )
-            if _sandbox_err:
-                result = _sandbox_err
-
-            # 对过长的 target_content 提前拦截，避免 JSON 截断后反复失败浪费 token。
-            # 模型应拆分为多个小片段编辑，或改用 write_file 重写整个文件。
-            _EDIT_TARGET_MAX_LEN = 1500
-            if not result and target and len(target) > _EDIT_TARGET_MAX_LEN:
-                result = (
-                    f"{TOOL_ERROR_PREFIX} edit_file 的 target_content 过长（"
-                    f"{len(target)} 字符），超过 {_EDIT_TARGET_MAX_LEN} 字符限制，"
-                    f"容易在传输过程中被截断。请将本次编辑拆分为多个不超过 {_EDIT_TARGET_MAX_LEN} "
-                    f"字符的小段后重试；如需整体重写，请改用 write_file。"
-                )
-                return {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": function_name,
-                    "content": result,
-                }
-
-            # 文件不存在时直接报错（edit_file 只能修改已有文件），
-            # 避免对不存在的沙盒外路径做无意义的权限询问
-            if not result and not os.path.isfile(file_path or ""):
-                # 文件不存在时 target_content 必然无法定位，若走下面的截断校验
-                # 会误报"JSON 修复后不完整"，掩盖真实原因（该用 write_file 建新文件）
-                result = (
-                    f"{TOOL_ERROR_PREFIX} edit_file 目标文件不存在：{file_path}。"
-                    "edit_file 只能修改已有文件；创建新文件请改用 write_file。"
-                )
-                return {
-                    "role": "tool",
-                    "tool_call_id": tc["id"],
-                    "name": function_name,
-                    "content": result,
-                }
-
-            if not result:
-                _edit_cm = _bypass_cm if _bypass_cm else sandbox_bypass()
-                with _edit_cm:
-                    try:
-                        old_content = _read_text_with_encoding_fallback(file_path)
-                    except OSError as read_err:
-                        logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_err)
-                        old_content = ""
-                    # 不再做精确子串预检查：edit_file 内部 _fuzzy_replace 已实现
-                    # 精确匹配、空白容错和 difflib 模糊匹配（相似度 >= 0.90），
-                    # 预检查过严会导致仅有轻微空白差异的合法编辑被误拦截。
-                    result = edit_file(
-                        file_path,
-                        target,
-                        repl,
-                        replace_all=bool(arguments.get("replace_all", False)),
-                        start_line=arguments.get("start_line"),
-                        end_line=arguments.get("end_line"),
-                    )
-                    if not result.startswith(TOOL_ERROR_PREFIX):
-                        try:
-                            new_content = _read_text_with_encoding_fallback(file_path)
-                        except OSError as read_err:
-                            logger.warning("读取新文件内容失败 (%s): %s", file_path, read_err)
-                            new_content = ""
-                        _show_file_diff(
-                            file_path,
-                            old_content,
-                            new_content,
-                            event_callback,
-                            panel_title=f"📝 [bold green]局部修改文件: {file_path}[/bold green]",
-                            truncated_note="已局部替换并修改成功",
-                            tool_call_id=tc["id"],
-                        )
-        else:
-            # 通用兜底：优先查进程内工具注册表（含 imom_locator 等插件工具），
-            # 再降级到 MCP 工具，最后才报"未找到"。
-            try:
-                _spec = tool_registry.get(function_name)
-            except KeyError:
-                _spec = None
-            if _spec is not None:
-                # 插件工具（如 imom_locator）访问工作目录外文件，必须每次询问用户
-                _plugin_guard_path = None
-                if function_name == "imom_register_project":
-                    # hint_path 缺省时兜底 publish_root，避免守卫被静默跳过
-                    _plugin_guard_path = (
-                        arguments.get("hint_path")
-                        or arguments.get("publish_root")
-                        or ""
-                    )
-                elif function_name.startswith("imom_"):
-                    # 其他 imom 工具：取当前活跃项目的 publish_root 作为守卫路径
-                    try:
-                        _plugin_guard_path = _get_imom_active_publish_root()
-                    except Exception:
-                        _plugin_guard_path = None
-                if _plugin_guard_path:
-                    _p_bypass, _p_err = _sandbox_outside_guard(
-                        function_name, _plugin_guard_path, event_callback,
-                        permission_owner, parent_turn_id, permission_source, cancel_event,
-                    )
-                    if _p_err:
-                        result = _p_err
-                    else:
-                        _p_cm = _p_bypass if _p_bypass else sandbox_bypass()
-                        with _p_cm:
-                            result = tool_registry.execute(function_name, **arguments).to_message_content()
-                else:
-                    result = tool_registry.execute(function_name, **arguments).to_message_content()
-            elif any(s["function"]["name"] == function_name for s in _get_mcp_manager().get_schemas()):
-                result = _get_mcp_manager().call_tool_sync(function_name, arguments)
-            else:
-                result = f"{TOOL_ERROR_PREFIX} 未找到名为 {function_name} 的工具！"
-    except Exception as tool_err:
-        result = f"{TOOL_ERROR_PREFIX} 调用工具 {function_name} 时发生系统内部错误：{str(tool_err)}"
-
-    return {
-        "role": "tool",
-        "tool_call_id": tc["id"],
-        "name": function_name,
-        "content": _truncate_tool_result_for_context(function_name, str(result)),
-    }
-
+# 旧测试和外部调用方可能仍从 core.llm 导入该内部兼容名；实现只保留在
+# 固定 Harness 管线中，避免形成第二套重复调用判定逻辑。
+from core.harness.tool_pipeline import RepeatCallGuard as _RepeatCallGuard
 
 # ─── 工具结果入上下文前的截断 ────────────────────────────────────
 # 这是最大的 token 泄漏点：一次 fetch_url 可以塞进 512KB（≈13 万 token）原文，
@@ -3980,6 +3318,8 @@ def _chat_with_model_generator(
     permission_source="主代理",
     cache_scope="main",
     cache_session_id=None,
+    *,
+    harness_runtime=None,
 ):
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
@@ -4026,30 +3366,88 @@ def _chat_with_model_generator(
     # 避免长任务中一两轮失败就静默收尾（用户反馈"任务未执行完就结束"）。
     FINAL_SUMMARY_MAX_RETRIES = 2
     # 重复工具调用抑制：同一签名成功 2 次后拦截，随本轮会话循环生命周期
-    repeat_call_guard = _RepeatCallGuard()
+    from core.harness.tool_pipeline import RepeatCallGuard
+
+    repeat_call_guard = RepeatCallGuard()
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
     pending_persistence = []
+    persistence_failure = None
+    current_step = None
+    current_tool_calls = []
+    pending_tool_records = {}
 
     def flush_persistence():
         """把本轮已确认的助手/工具消息按序落库（与正常结束路径一致）。"""
-        nonlocal pending_persistence
+        nonlocal pending_persistence, persistence_failure, pending_tool_records
         if stream and pending_persistence:
-            _mgr = app_context.get_manager()
-            if not _mgr:
-                # 当前没有可用的存储管理器：保留队列，待下次 flush 时再尝试落库，
-                # 直接清空会导致整批消息静默丢失。
-                return
             try:
+                if harness_runtime is not None:
+                    if current_step is None:
+                        # 前置阶段产生的通知由首个 Step 一并原子提交。
+                        return
+                    from core.harness.models import HarnessEventKind, JournalEventDraft
+                    from core.harness.tool_pipeline import (
+                        ToolExecutionRecord,
+                        build_tool_result_event_draft,
+                    )
+
+                    tool_calls_by_id = {
+                        tool_call.get("id"): tool_call
+                        for tool_call in current_tool_calls
+                    }
+                    events = []
+                    for message_index, (role, content) in enumerate(pending_persistence):
+                        if role == "assistant":
+                            events.append(JournalEventDraft(
+                                HarnessEventKind.ASSISTANT_COMMITTED,
+                                step_id=current_step.step_id,
+                                message_index=message_index,
+                            ))
+                            continue
+                        if role != "tool" or not isinstance(content, dict):
+                            continue
+                        call_id = content.get("tool_call_id")
+                        tool_call = tool_calls_by_id.get(call_id)
+                        record = pending_tool_records.get(call_id)
+                        if tool_call is None:
+                            events.append(JournalEventDraft(
+                                HarnessEventKind.TOOL_RESULT_COMMITTED,
+                                step_id=current_step.step_id,
+                                message_index=message_index,
+                            ))
+                            continue
+                        if record is None:
+                            record = ToolExecutionRecord(
+                                call_ordinal=current_tool_calls.index(tool_call),
+                                message=content,
+                                duration_ms=0,
+                            )
+                        events.append(build_tool_result_event_draft(
+                            current_step.step_id,
+                            tool_call,
+                            record,
+                            message_index=message_index,
+                            ok=_tool_result_ok(tool_call["function"]["name"], content),
+                        ))
+                    current_step.turn.journal.commit_messages(
+                        current_step.turn.session_name,
+                        current_step.turn.turn_id,
+                        current_step.step_id,
+                        pending_persistence,
+                        events,
+                    )
+                    del pending_persistence[:]
+                    pending_tool_records = {}
+                    return
+                _mgr = app_context.get_manager()
+                if _mgr is None:
+                    raise RuntimeError("消息持久化失败：存储管理器不可用")
                 _mgr.add_messages(parent_session, pending_persistence)
-            except Exception as flush_err:
-                # 落库失败不回滚内存：add_messages 可能已部分写入，回滚会造成
-                # 内存/DB 分叉。仅上报错误事件并丢弃待写队列，避免重复写入。
-                _notify_event(event_callback, "error", {
-                    "message": f"消息持久化失败：{str(flush_err)}",
-                })
-            finally:
                 del pending_persistence[:]
+            except Exception as error:
+                persistence_failure = error
+                raise
 
     def salvage_persistence_on_cancel():
         """取消时打捞待写队列：带 tool_calls 的 assistant 消息若缺对应 tool
@@ -4202,13 +3600,20 @@ def _chat_with_model_generator(
     # (pending_persistence and flush_persistence are now defined earlier)
 
     def raise_if_cancelled():
+        if harness_runtime is not None:
+            harness_runtime.heartbeat()
         if cancel_event is not None and cancel_event.is_set():
             raise KeyboardInterrupt("用户终止了对话。")
 
+    response_stream = None
     try:
+        if harness_runtime is not None:
+            harness_runtime.mark_running()
         max_turns = 100
         for turn in range(max_turns):
             raise_if_cancelled()
+            if harness_runtime is not None:
+                current_step = harness_runtime.begin_step()
             if turn > 0:
                 # 轮次边界事件：GUI 流式渲染据此把每个 LLM 轮次拆成独立消息块，
                 # 与历史重放（每轮一条 DB 记录）的结构对齐；TUI/子代理只认已知事件，自动忽略
@@ -4294,13 +3699,26 @@ def _chat_with_model_generator(
                         API_REQUEST_MAX_TIMEOUT_SECONDS,
                         API_REQUEST_TIMEOUT_SECONDS + max(0, _est_prompt_tokens) // 1500,
                     )
+                    prepared_request = prepare_stream_request(
+                        request_protocol,
+                        kwargs,
+                        attempt_timeout,
+                    )
+                    request_envelope = RequestEnvelope.capture(
+                        prepared_request,
+                        cache_scope=cache_scope,
+                        request_reason=request_cache_reason,
+                        attempt=attempt + 1,
+                        deepseek_generation_id=active_deepseek_generation_id,
+                        deepseek_message_count=active_deepseek_message_count,
+                    )
+                    if current_step is not None:
+                        current_step.capture_request(request_envelope)
                     # 将同步阻塞的 completion 放到线程池中执行，使主循环可以响应取消事件。
                     # 在飞请求登记到 cancel_event 名下，停止路径可硬中断底层连接。
                     future = _submit_daemon_call(
                         _request_stream,
-                        request_protocol,
-                        kwargs,
-                        timeout=attempt_timeout,
+                        prepared_request,
                         cancel_event=cancel_event,
                     )
                     wait_started_at = time.monotonic()
@@ -4337,6 +3755,8 @@ def _chat_with_model_generator(
                         if exc is not None:
                             raise exc
                         response_stream, inflight_holder = future.result()
+                        if current_step is not None:
+                            current_step.mark_streaming()
                     finally:
                         # 用户取消时避免 shutdown(wait=True) 阻塞到网络请求完成（最长 90s）
                         future.cancel()
@@ -4456,97 +3876,25 @@ def _chat_with_model_generator(
                     else:
                         raise api_err
 
-            accumulated_content = ""
-            tool_calls_dict = {}
-            in_native_think = False
-            provider_thinking_blocks = None
-            finish_reason = None
-
-            stream_usage = None
+            stream_assembler = StreamAssembler(
+                keep_reasoning_fields=_supports_reasoning_fields(
+                    model_name, api_base
+                ),
+                keep_thinking_blocks=(
+                    str(model_name or "").split("/")[0].lower() == "anthropic"
+                ),
+                require_tool_call_reasoning=_requires_tool_call_reasoning(
+                    model_name, api_base
+                ),
+            )
             for chunk in _stream_chunks_with_idle_notice(
                 response_stream, event_callback, raise_if_cancelled,
                 inflight_holder=inflight_holder, cancel_event=cancel_event,
             ):
                 raise_if_cancelled()
-
-                # 同一流中可能出现多个带 usage 的 chunk，只保留最后一个，
-                # 在流结束后统一记账一次，避免 cumulative_* 被反复累加
-                if getattr(chunk, 'usage', None):
-                    stream_usage = chunk.usage
-
-                if not chunk.choices:
-                    continue
-
-                chunk_finish_reason = getattr(chunk.choices[0], "finish_reason", None)
-                if chunk_finish_reason:
-                    finish_reason = chunk_finish_reason
-
-                delta = chunk.choices[0].delta
-
-                complete_blocks = _complete_thinking_blocks(delta)
-                if complete_blocks is not None:
-                    provider_thinking_blocks = complete_blocks
-                
-                # reasoning_content (DeepSeek R1/V3)
-                # 注意：thinking 事件只由下游 parser 根据 <think> 文本统一转换，
-                # 此处不再直接发事件，避免双重发射
-                reasoning = getattr(delta, "reasoning_content", "") or ""
-                if reasoning:
-                    if not in_native_think:
-                        yield "<think>"
-                        accumulated_content += "<think>"
-                        in_native_think = True
-                    yield reasoning
-                    accumulated_content += reasoning
-                    
-                # Content text
-                content = getattr(delta, "content", "") or ""
-                if content:
-                    if in_native_think:
-                        yield "</think>"
-                        accumulated_content += "</think>"
-                        in_native_think = False
-                    yield content
-                    accumulated_content += content
-                    
-                # Tool Calls
-                if getattr(delta, "tool_calls", None):
-                    for tc in delta.tool_calls:
-                        idx = tc.index
-                        if idx not in tool_calls_dict:
-                            tool_calls_dict[idx] = {
-                                "id": None,
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""}
-                            }
-                        # 某些 provider 首 chunk 的 tool_call id 为 None，在后续 chunk 才给出。
-                        # 这里用 None 占位，遇到真实 id 再回填；始终没有则用 call_{idx} 兜底。
-                        tc_id = getattr(tc, "id", None)
-                        existing_id = tool_calls_dict[idx].get("id")
-                        if tc_id:
-                            if not existing_id or str(existing_id).startswith("call_"):
-                                tool_calls_dict[idx]["id"] = str(tc_id)
-                        elif not existing_id:
-                            tool_calls_dict[idx]["id"] = f"call_{idx}"
-                        # name 只在为空时赋值：provider 重复发 name 时 += 会拼出
-                        # "read_fileread_file" 之类的坏名字
-                        if getattr(tc.function, "name", None) and not tool_calls_dict[idx]["function"]["name"]:
-                            tool_calls_dict[idx]["function"]["name"] = tc.function.name
-                        if getattr(tc.function, "arguments", None):
-                            tool_calls_dict[idx]["function"]["arguments"] += tc.function.arguments
-            
-            if in_native_think:
-                yield "</think>"
-                accumulated_content += "</think>"
-
-            # 输出被模型长度限制截断：给出明确提示，避免用户以为任务已完成。
-            if finish_reason == "length":
-                truncated_notice = (
-                    "\n[回复已被模型长度限制截断。如需完整结果，请尝试："
-                    "1) 让模型分步骤输出；2) 换用输出上限更高的模型；"
-                    "3) 在 config.json 中为当前模型增大 max_tokens。]"
-                )
-                _notify_event(event_callback, "notice", {"message": truncated_notice.strip()})
+                update = stream_assembler.consume(chunk)
+                if update.public_text:
+                    yield update.public_text
 
             # litellm 流式包装器在 finish 之后收到的最终 usage chunk 会被吞进
             # wrapper.chunks 而不再 yield（StopIteration 分支）。迭代中拿到的
@@ -4557,8 +3905,24 @@ def _chat_with_model_generator(
                 for _tail_chunk in reversed(_tail_chunks):
                     _tail_usage = getattr(_tail_chunk, "usage", None)
                     if _tail_usage is not None:
-                        stream_usage = _tail_usage
+                        stream_assembler.observe_usage(_tail_usage)
                         break
+
+            assembled_response = stream_assembler.finish()
+            if stream_assembler.finish_public_text:
+                yield stream_assembler.finish_public_text
+
+            finish_reason = assembled_response.finish_reason
+            stream_usage = assembled_response.usage
+
+            # 输出被模型长度限制截断：给出明确提示，避免用户以为任务已完成。
+            if finish_reason == "length":
+                truncated_notice = (
+                    "\n[回复已被模型长度限制截断。如需完整结果，请尝试："
+                    "1) 让模型分步骤输出；2) 换用输出上限更高的模型；"
+                    "3) 在 config.json 中为当前模型增大 max_tokens。]"
+                )
+                _notify_event(event_callback, "notice", {"message": truncated_notice.strip()})
 
             if cache_scope == "main" and keepalive_interval:
                 cache_keepalive_service.register_request(
@@ -4583,7 +3947,8 @@ def _chat_with_model_generator(
                     invalidation_reason=request_cache_reason,
                 )
 
-            reasoning_content, public_content = split_reasoning_text(accumulated_content)
+            reasoning_content = stream_assembler.raw_reasoning_content
+            public_content = assembled_response.content
             from core.turn_renderer import sanitize_protocol_text
             public_content = sanitize_protocol_text(public_content)
 
@@ -4595,7 +3960,7 @@ def _chat_with_model_generator(
             raw_content_meaningful = _is_meaningful_assistant_content(public_content)
             promoted_reasoning = False
             if (
-                not tool_calls_dict
+                not assembled_response.tool_calls
                 and not raw_content_meaningful
                 and _is_meaningful_assistant_content(reasoning_content)
             ):
@@ -4621,19 +3986,10 @@ def _chat_with_model_generator(
                             "message": f"写入日记账记忆失败：{str(log_err)}",
                         })
 
-            tool_calls_list = []
-            for idx in sorted(tool_calls_dict.keys()):
-                tool_calls_list.append(tool_calls_dict[idx])
-
-            replay_reasoning_content = reasoning_content or None
-            if (
-                tool_calls_list
-                and _requires_tool_call_reasoning(model_name, api_base)
-                and isinstance(reasoning_content, str)
-            ):
-                # DeepSeek thinking 的下一轮工具续传要求该 key 始终存在。
-                # 没有 reasoning delta 时保留协议层空串，不伪造推理正文。
-                replay_reasoning_content = reasoning_content
+            tool_calls_list = assembled_response.tool_calls
+            current_tool_calls = tool_calls_list
+            replay_reasoning_content = assembled_response.reasoning_content
+            provider_thinking_blocks = assembled_response.thinking_blocks
                 
             message_to_append = {
                 "role": "assistant",
@@ -4645,6 +4001,8 @@ def _chat_with_model_generator(
             if tool_calls_list:
                 message_to_append["tool_calls"] = tool_calls_list
             messages.append(message_to_append)
+            if current_step is not None:
+                current_step.mark_assistant_ready()
 
             persisted_message = {
                 "role": "assistant",
@@ -4734,6 +4092,9 @@ def _chat_with_model_generator(
                     messages.append(summary_request)
                     # 该 user 催促消息也需要持久化，否则下一轮重建历史时上下文会缺失
                     pending_persistence.append(("user", summary_request))
+                    flush_persistence()
+                    if current_step is not None and turn + 1 < max_turns:
+                        current_step.complete()
                     # 内部兜底重试静默进行：底部状态栏已显示"正在干活..."，
                     # 这里不再发 status 通知暴露"模型未生成结论"的内部细节。
                     continue
@@ -4781,6 +4142,9 @@ def _chat_with_model_generator(
                         _notify_event(event_callback, "notice", {
                             "message": "计划仍有未执行项，已提醒模型继续执行。",
                         })
+                        flush_persistence()
+                        if current_step is not None and turn + 1 < max_turns:
+                            current_step.complete()
                         continue
                 # 模型未调用工具且未生成任何正文：给出明确提示，避免 UI 在
                 # "思考完成" 后陷入沉默（常见于某些模型只输出 reasoning 或空回复）。
@@ -4801,7 +4165,14 @@ def _chat_with_model_generator(
                 if promoted_reasoning and public_content:
                     yield from _yield_content(public_content)
                 flush_persistence()
+                if current_step is not None:
+                    current_step.complete()
+                if harness_runtime is not None:
+                    harness_runtime.complete()
                 return
+
+            if current_step is not None:
+                current_step.mark_tools_running()
 
             # 输出被 max_tokens 截断时，工具参数几乎必然不完整（JSON 修复只能补全
             # 语法，无法找回被截断的内容）。此时绝不能执行任何工具——尤其是
@@ -4823,6 +4194,10 @@ def _chat_with_model_generator(
                     if stream:
                         pending_persistence.append(("tool", synth))
                 flush_persistence()
+                if current_step is not None:
+                    current_step.mark_tools_committed()
+                    if turn + 1 < max_turns:
+                        current_step.complete()
                 _notify_event(event_callback, "notice", {
                     "message": "模型输出被长度限制截断，已拦截本批工具调用并要求模型拆小参数重试。",
                 })
@@ -4835,103 +4210,87 @@ def _chat_with_model_generator(
             else:
                 _notify_event(event_callback, "status", {"state": "executing"})
 
-            def execute_in_context(tool_call):
-                return _execute_single_tool_call(
-                    tool_call,
-                    event_callback=event_callback,
-                    parent_session=parent_session,
-                    parent_turn_id=parent_turn_id,
-                    cancel_event=cancel_event,
-                    allow_subagents=allow_subagents,
-                    permission_owner=permission_owner,
-                    permission_source=permission_source,
+            from core.harness.tool_pipeline import ToolBatchExecutor
+
+            tool_pipeline, tool_context = _build_tool_pipeline_and_context(
+                event_callback,
+                parent_session=parent_session,
+                parent_turn_id=parent_turn_id,
+                cancel_event=cancel_event,
+                allow_subagents=allow_subagents,
+                permission_owner=permission_owner,
+                permission_source=permission_source,
+            )
+            tool_calls_by_id = {
+                tool_call["id"]: tool_call for tool_call in tool_calls_list
+            }
+
+            def execute_decoded(decoded, context):
+                if _execute_single_tool_call is not _ORIGINAL_EXECUTE_SINGLE_TOOL_CALL:
+                    return _execute_single_tool_call(
+                        tool_calls_by_id[decoded.call_id],
+                        event_callback=event_callback,
+                        parent_session=parent_session,
+                        parent_turn_id=parent_turn_id,
+                        cancel_event=cancel_event,
+                        allow_subagents=allow_subagents,
+                        permission_owner=permission_owner,
+                        permission_source=permission_source,
+                    )
+                return tool_pipeline.execute_decoded(decoded, context)
+
+            batch_executor = ToolBatchExecutor(
+                tool_pipeline,
+                repeat_guard=repeat_call_guard,
+                execute_decoded=execute_decoded,
+                event_payload=_tool_event_payload,
+                finished_event_payload=_tool_finished_event_payload,
+                result_ok=_tool_result_ok,
+            )
+            records = []
+            notify_tool_event = (
+                lambda kind, payload: _notify_event(event_callback, kind, payload)
+            )
+            for prepared_batch in batch_executor.prepare(
+                tool_calls_list,
+                tool_context,
+            ):
+                batch_executor.begin_batch(
+                    prepared_batch,
+                    tool_context,
+                    notify_tool_event,
                 )
-
-            def execute_timed(tool_call):
-                started_at = time.monotonic()
-                result = execute_in_context(tool_call)
-                duration_ms = round((time.monotonic() - started_at) * 1000)
-                return result, max(0, duration_ms)
-
-            def execute_guarded(tool_call):
-                """重复调用抑制包装：同签名成功 2 次后不再执行，直接合成指令性结果。"""
-                func_name = tool_call["function"]["name"]
-                arguments = tool_call["function"].get("arguments")
-                if not repeat_call_guard.should_execute(func_name, arguments):
-                    return _repeat_call_blocked_result(tool_call), 0
-                result, duration_ms = execute_timed(tool_call)
-                repeat_call_guard.record(
-                    func_name, arguments, ok=_tool_result_ok(func_name, result)
-                )
-                return result, duration_ms
-
-            # 只把显式声明为 parallel_safe 的相邻工具放入同一并发批次。
-            batches = []
-            for tc in tool_calls_list:
-                func_name = tc["function"]["name"]
-                try:
-                    is_parallel = tool_registry.get(func_name).parallel_safe
-                except KeyError:
-                    is_parallel = False
-                if batches and batches[-1][0] and is_parallel:
-                    batches[-1][1].append(tc)
-                else:
-                    batches.append((is_parallel, [tc]))
-
-            for is_parallel, batch in batches:
-                raise_if_cancelled()
-
-                for tc in batch:
-                    _notify_event(event_callback, "tool_requested", _tool_event_payload(tc))
-                for tc in batch:
-                    _notify_event(event_callback, "tool_started", _tool_event_payload(tc))
                 yield ""
-
-                if is_parallel and len(batch) > 1:
-                    # 并发上限固定为 4，结果仍按模型工具调用顺序写回。
-                    # 不用 with 语句：with 的 __exit__ 会 shutdown(wait=True)，
-                    # 取消时会卡住 UI 直到所有并行工具（可能是长时子代理）跑完。
-                    futures = [_submit_daemon_call(execute_guarded, item) for item in batch]
-                    timed_results = []
-                    for future in futures:
-                        while not future.done():
-                            raise_if_cancelled()
-                            try:
-                                future.result(timeout=0.1)
-                            except _FutureTimeoutError:
-                                pass
-                        timed_results.append(future.result())
-                    results = [result for result, _duration_ms in timed_results]
-                    durations = [duration_ms for _result, duration_ms in timed_results]
-                    messages.extend(results)
-                    for tc, res, duration_ms in zip(batch, results, durations):
-                        _notify_event(
-                            event_callback,
-                            "tool_finished",
-                            _tool_finished_event_payload(tc, res, duration_ms),
-                        )
-                    if stream:
-                        pending_persistence.extend(("tool", res) for res in results)
-                else:
-                    # 修改类工具：串行处理以保证授权及状态顺序
-                    for tc in batch:
-                        raise_if_cancelled()
-                        res, duration_ms = execute_guarded(tc)
-                        messages.append(res)
-                        _notify_event(
-                            event_callback,
-                            "tool_finished",
-                            _tool_finished_event_payload(tc, res, duration_ms),
-                        )
-                        if stream:
-                            pending_persistence.append(("tool", res))
+                records.extend(batch_executor.execute_batch(
+                    prepared_batch,
+                    tool_context,
+                    notify_tool_event,
+                ))
                 yield ""
+            records = tuple(sorted(
+                records,
+                key=lambda record: record.call_ordinal,
+            ))
+
+            results = [record.message for record in records]
+            messages.extend(results)
+            pending_tool_records = {
+                record.message.get("tool_call_id"): record for record in records
+            }
+            if stream:
+                pending_persistence.extend(("tool", result) for result in results)
             
             if event_callback is None:
                 app_context.set_task_status('executing')
                 app_context.invalidate_ui()
             else:
                 _notify_event(event_callback, "status", {"state": "executing"})
+
+            flush_persistence()
+            if current_step is not None:
+                current_step.mark_tools_committed()
+                if turn + 1 < max_turns:
+                    current_step.complete()
             
         # 超过轮次上限：提示消息写入历史并与正常结束一样落库，避免下一轮丢失上下文
         msg = f"{TOOL_ERROR_PREFIX} 任务轮次超过上限（100 轮），请把任务拆小一点再试！"
@@ -4940,10 +4299,17 @@ def _chat_with_model_generator(
         if stream:
             pending_persistence.append(("assistant", deepcopy(limit_message)))
         flush_persistence()
+        if current_step is not None:
+            current_step.complete()
+        if harness_runtime is not None:
+            harness_runtime.complete()
         yield from _yield_content(msg)
         return
 
     except KeyboardInterrupt:
+        if cancel_event is not None:
+            cancel_event.set()
+            abort_inflight_streams(cancel_event)
         # 关闭底层 HTTP 流：否则每次取消都会泄漏一个连接/套接字
         try:
             response_stream.close()
@@ -4952,10 +4318,18 @@ def _chat_with_model_generator(
         # 用户中断：先把本轮已产生的完整消息打捞落库（悬空的 tool_calls 组补
         # 取消占位结果），否则终止前已完成的助手输出/工具结果整批丢失，
         # 重开会话看不到任何终止前进度。
-        salvage_persistence_on_cancel()
-        flush_persistence()
-        # 安全回退删除此轮 Turn 添加的内存消息残影（DB 已保留打捞部分）
-        rollback_turn_messages()
+        try:
+            salvage_persistence_on_cancel()
+            flush_persistence()
+        except Exception as salvage_error:
+            if harness_runtime is not None:
+                harness_runtime.fail(type(salvage_error).__name__)
+            raise
+        finally:
+            # 安全回退删除此轮 Turn 添加的内存消息残影（DB 已保留打捞部分）
+            rollback_turn_messages()
+        if harness_runtime is not None:
+            harness_runtime.cancel()
         raise
     except GeneratorExit:
         # GUI 消费端检测到取消后 break，生成器在 yield 点被 close：这条路径
@@ -4964,8 +4338,18 @@ def _chat_with_model_generator(
             response_stream.close()
         except Exception:
             pass
-        salvage_persistence_on_cancel()
-        flush_persistence()
+        if cancel_event is not None:
+            cancel_event.set()
+            abort_inflight_streams(cancel_event)
+        try:
+            salvage_persistence_on_cancel()
+            flush_persistence()
+        except Exception as salvage_error:
+            if harness_runtime is not None:
+                harness_runtime.fail(type(salvage_error).__name__)
+            raise
+        if harness_runtime is not None:
+            harness_runtime.cancel()
         raise
     except Exception as e:
         try:
@@ -4975,6 +4359,10 @@ def _chat_with_model_generator(
         # 异常路径同样回滚本轮未持久化的内存消息：既避免留下带 tool_calls 却无
         # tool 响应的悬空 assistant 消息（下一轮 API 会 400），也保持内存历史与 DB 一致
         rollback_turn_messages()
+        if harness_runtime is not None:
+            harness_runtime.fail(type(e).__name__)
+        if e is persistence_failure:
+            raise
         if event_callback is not None:
             _notify_event(event_callback, "error", {
                 "message": _sanitize_error_text(e),

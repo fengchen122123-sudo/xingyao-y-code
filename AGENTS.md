@@ -59,6 +59,32 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 ---
 
+## 🧭 固定 Harness 内核
+
+- `core/harness/` 是非插件化的主代理内核：`models.py` 定义严格状态与事件值对象，
+  `journal.py` 管理 owner lease、Turn/Step 生命周期与事件序列，`runtime.py` 协调一次
+  Turn 及其 Step，`request_envelope.py` 只观察最终 Provider 请求并生成无正文指纹，
+  `stream_assembler.py` 负责流与 reasoning/tool call 组装，`tool_contracts.py`、
+  `tool_adapters.py`、`tool_pipeline.py` 负责严格工具解析、固定适配与有序执行。
+  `core/llm.py` 保留 GUI/TUI 和外部调用方兼容入口；插件仍只通过现有 `ToolRegistry`
+  扩展工具集合，不得动态替换 Harness 阶段。
+- `messages` 表是会话内容的唯一事实源。Harness Journal 只能记录状态、ID、序号、
+  时间、耗时与哈希；严禁写入用户/助手正文、reasoning、工具参数、工具结果、凭据或
+  Kimi 缓存亲和值原文。
+- 一个 Step 对应一次真实模型请求；Provider 内部重试必须留在同一个 Step，工具结果后
+  再次请求模型才创建下一个 Step。非法状态转换、Journal 序列化或数据库写入必须显式失败。
+- 崩溃恢复只把未完成 Turn/Step 标记为 `interrupted`，绝不自动重放模型请求、命令、
+  文件写入或其他副作用工具。
+- 修改请求构造、消息规范化、system prompt、tools、metadata、`extra_body` 或缓存亲和
+  逻辑前，必须先运行 Provider 请求 byte-golden 与 prompt byte-stability 回归；黄金字节
+  不得为迁就实现改写。
+- DeepSeek 官方主会话继续使用不可变 Prompt Ledger，保持 CAS、追加、切代、tools 顺序
+  以及 thinking tool call 的字符串 `reasoning_content`（允许空串）语义。Kimi 不新增
+  Prompt Ledger，保持现有 tools 顺序、OpenAI reasoning 占位、Anthropic thinking blocks、
+  metadata/cache-control 与缓存亲和材料不变。
+
+---
+
 ## 🗄️ 上下文缓存架构（DeepSeek 前缀缓存）
 
 - `core/tool_result_maintenance.py`：工具结果 Snip/Elide 纯函数层，marker 幂等，
@@ -72,7 +98,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   撑满 DeepSeek 2048 整数倍缓存块）。铁律：跨轮不变的静态内容必须进稳定前缀，
   不能放动态运行上下文块（`build_dynamic_prompt` 只承载模型/权限/目录/计划等可变字段），
   否则前缀漂移导致缓存整体失效。
-- `core/llm.py`：`_RepeatCallGuard` 抑制同签名成功 ≥2 次的重复工具调用；
+- `core/harness/tool_pipeline.py:RepeatCallGuard` 抑制同签名成功 ≥2 次的重复工具调用；
   DeepSeek thinking 路由为带 tool_calls 的 assistant 回补空 `reasoning_content` key。
 - `core/llm.py:_stream_chunks_with_idle_notice`：流式 chunk 由守护线程 pump、主线程带超时读队列，
   流中段 stalled 超阈值按间隔上报等待状态（此前首 chunk 后最长静默一整个请求超时）。
