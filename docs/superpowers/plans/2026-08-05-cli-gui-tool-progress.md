@@ -31,7 +31,7 @@ This plan supersedes `docs/superpowers/plans/2026-08-04-codebuddy-tool-progress.
 The checked-in `venv` currently points to a missing Python installation. Before Task 1, create the ignored `.venv` from the bundled workspace Python and install the declared project dependencies:
 
 ```powershell
-& 'C:\Users\USERNAME\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' -m venv .venv
+& "$env:USERPROFILE\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe" -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
 .\.venv\Scripts\python.exe -V
 ```

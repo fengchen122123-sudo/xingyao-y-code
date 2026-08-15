@@ -4,7 +4,7 @@
 
 ## 1. 概述
 
-- **测试对象**：deepseek-v4-flash（DeepSeek 官方 API，端点 `https://api.deepseek.com`，key 来自 `C:\Users\USERNAME\.ycode\config.json`）
+- **测试对象**：deepseek-v4-flash（DeepSeek 官方 API，端点 `https://api.deepseek.com`，key 来自 `~\.ycode\config.json`）
 - **测试目的**：评估该模型作为 Y-code 编码 agent 后端模型的适配度，覆盖缓存命中率、项目执行能力、任务闭环能力、token 节省能力四个维度
 - **测试工具**：本项目自研 `bench/adapt_bench.py` 基准脚本（支持 `--model` 切换，后续其他模型可直接复用）
 - **数据来源**：全部为真实 API 实测数据（`mytemp/bench_dsv4f_1.json`，9 次调用全部成功），无任何虚构数字
