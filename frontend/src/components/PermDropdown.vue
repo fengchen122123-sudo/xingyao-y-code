@@ -32,6 +32,7 @@ const styleObj = ref<Record<string, string>>({});
 
 const permModes: Array<{ v: PermissionMode; c: string; desc: string }> = [
   { v: 'confirm', c: 'var(--green)', desc: '执行任何操作前都会向你确认' },
+  { v: 'accept_edits', c: 'var(--yellow, #f1fa8c)', desc: '工作区内文件编辑自动放行，命令与沙盒外访问仍会询问' },
   { v: 'plan', c: 'var(--purple)', desc: '沙盒内可自由读取，只制定计划，不做任何修改' },
   { v: 'full', c: 'var(--red)', desc: '沙盒内全部放行，沙盒外操作仍会询问' },
 ];

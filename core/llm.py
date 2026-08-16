@@ -282,7 +282,7 @@ PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 PLAN_MODE_DENIED_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息和制定计划，"
     "不允许执行任何修改/命令。请改用 plan_write 把操作步骤写入计划，"
-    "并提示用户切换到「变更前确认」或「完全访问」模式后再执行。"
+    "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
 )
 # 计划模式下仍然放行的规划类工具（其余需要权限的工具一律拦截）
 _PLAN_MODE_ALLOWED_TOOLS = frozenset({
@@ -324,6 +324,7 @@ from core.tool_presenter import (
 )
 from core.turn_events import TurnEventFactory
 import core.app_context as app_context
+from core import permission_store
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
 session_allowed_commands: set[tuple[str, ...]] = set()  # 结构化命令规则
@@ -415,6 +416,14 @@ def check_session_reset():
             session_allowed_commands.clear()
             session_allowed_write_files.clear()
             session_allowed_edit_files.clear()
+            reset_session_scope = True
+        else:
+            reset_session_scope = False
+    if reset_session_scope:
+        # 会话级沙盒放行与三个白名单同生命周期：切会话一并收回
+        from core.tools import set_session_sandbox_bypass
+
+        set_session_sandbox_bypass(False)
 
 
 def _session_prefix_for_command(cmd):
@@ -450,7 +459,12 @@ def ask_in_raw_terminal(function_name, arguments):
     纯文本原始终端兜底：只在确实没有活动 TUI App 时才被调用（例如管道重定向或早期初始化时）。
     不使用任何 ANSI 转义序列或 msvcrt 菜单，直接用 print/input 避免污染 TUI 屏幕。
     """
-    mode_display = {"confirm": "每次确认", "plan": "计划确认"}
+    mode_display = {
+        "confirm": "每次确认",
+        "accept_edits": "自动编辑",
+        "plan": "计划确认",
+        "full": "完全访问",
+    }
     mode_tip = mode_display.get(app_context.get_permission_mode(), "确认")
     
     print("")  # 空行分隔
@@ -480,9 +494,9 @@ def ask_in_raw_terminal(function_name, arguments):
     # 纯文本 input 模式，不含任何 ANSI 序列
     try:
         if function_name == "sandbox_outside_access":
-            # 沙盒外路径访问必须每次确认，不提供 always 会话放行
-            print("请输入 [y]es 同意本次, [n]o 拒绝 (沙盒外访问每次都需要确认)")
-            res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
+            # 沙盒外路径访问可会话级放行，但不做持久化落盘
+            print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 本会话内放行沙盒外访问")
+            res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
         else:
             print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前会话放行)")
             res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
@@ -513,8 +527,11 @@ def ask_in_raw_terminal(function_name, arguments):
                         session_allowed_edit_files.add(_canonical_permission_path(file_path))
                     print(f"[当前会话已放行修改]：{file_path}")
             elif function_name == "sandbox_outside_access":
-                # 沙盒外访问不支持会话放行，always 仅本次通过
-                print("[沙盒外访问每次都需要确认，仅本次通过]")
+                # 会话级放行（不落盘）：本会话内后续沙盒外访问免询问
+                from core.tools import set_session_sandbox_bypass
+
+                set_session_sandbox_bypass(True)
+                print("[当前会话已放行沙盒外访问]")
             return True
             
         return res in ("", "y", "yes")
@@ -534,18 +551,30 @@ def check_permission_and_ask(
     # 0. 自动同步和重置会话级别的白名单缓存
     check_session_reset()
 
-    # 1. 检查当前会话中是否已被用户“永久允许”
+    # 1. 检查当前会话/当前项目中是否已被用户“始终允许”
+    #    会话白名单（内存）与项目持久化白名单（~/.ycode/permissions.json）依次命中
     if function_name == "execute_command":
         cmd = arguments.get("command", "")
         with _session_whitelist_lock:
-            allowed = any(
+            session_hit = any(
                 _command_matches_prefix(cmd, prefix)
                 for prefix in session_allowed_commands
             )
-        if allowed:
+        persistent_hit = False
+        if not session_hit:
+            try:
+                rules = permission_store.project_rules()
+                persistent_hit = any(
+                    _command_matches_prefix(cmd, prefix)
+                    for prefix in rules["commands"]
+                )
+            except Exception:
+                persistent_hit = False
+        if session_hit or persistent_hit:
+            scope_tip = "当前会话" if session_hit else "项目白名单（持久化）"
             if event_callback is None:
                 from prompt_toolkit.formatted_text import HTML
-                safe_print(HTML(f"<ansigreen>当前会话自动放行命令：{cmd}</ansigreen>"))
+                safe_print(HTML(f"<ansigreen>{scope_tip}自动放行命令：{cmd}</ansigreen>"))
             else:
                 _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
             return True
@@ -553,11 +582,19 @@ def check_permission_and_ask(
         file_path = arguments.get("file_path", "")
         canonical_path = _canonical_permission_path(file_path)
         with _session_whitelist_lock:
-            file_allowed = canonical_path in session_allowed_write_files
-        if file_allowed:
+            session_hit = canonical_path in session_allowed_write_files
+        persistent_hit = False
+        if not session_hit:
+            try:
+                rules = permission_store.project_rules()
+                persistent_hit = canonical_path in rules["write_files"]
+            except Exception:
+                persistent_hit = False
+        if session_hit or persistent_hit:
+            scope_tip = "当前会话" if session_hit else "项目白名单（持久化）"
             if event_callback is None:
                 from prompt_toolkit.formatted_text import HTML
-                safe_print(HTML(f"<ansigreen>当前会话自动放行写入：{file_path}</ansigreen>"))
+                safe_print(HTML(f"<ansigreen>{scope_tip}自动放行写入：{file_path}</ansigreen>"))
             else:
                 _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
             return True
@@ -565,19 +602,48 @@ def check_permission_and_ask(
         file_path = arguments.get("file_path", "")
         canonical_path = _canonical_permission_path(file_path)
         with _session_whitelist_lock:
-            edit_allowed = canonical_path in session_allowed_edit_files
-        if edit_allowed:
+            session_hit = canonical_path in session_allowed_edit_files
+        persistent_hit = False
+        if not session_hit:
+            try:
+                rules = permission_store.project_rules()
+                persistent_hit = canonical_path in rules["edit_files"]
+            except Exception:
+                persistent_hit = False
+        if session_hit or persistent_hit:
+            scope_tip = "当前会话" if session_hit else "项目白名单（持久化）"
             if event_callback is None:
                 from prompt_toolkit.formatted_text import HTML
-                safe_print(HTML(f"<ansigreen>当前会话自动放行修改：{file_path}</ansigreen>"))
+                safe_print(HTML(f"<ansigreen>{scope_tip}自动放行修改：{file_path}</ansigreen>"))
+            else:
+                _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
+            return True
+    elif function_name == "sandbox_outside_access":
+        # 会话级沙盒放行（用户此前选过“本会话内放行沙盒外访问”）：
+        # 免询问直接通过；切会话即收回，不做持久化
+        from core.tools import is_session_sandbox_bypass_enabled
+
+        if is_session_sandbox_bypass_enabled():
+            if event_callback is None:
+                from prompt_toolkit.formatted_text import HTML
+                safe_print(HTML("<ansigreen>当前会话已放行沙盒外访问</ansigreen>"))
             else:
                 _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
             return True
 
-    # 2. 如果权限是完全放行，直接通过
-    #    但 sandbox_outside_access（沙盒外路径访问）不受 full 模式自动放行，
-    #    必须每次询问用户，确保沙盒外操作始终受控。
-    if app_context.get_permission_mode() == "full" and function_name != "sandbox_outside_access":
+    # 2. 模式级快路径
+    #    full：沙盒内全部放行；accept_edits：工作区内文件编辑放行（命令仍询问）。
+    #    sandbox_outside_access（沙盒外路径访问）不受任何模式自动放行，
+    #    必须逐次询问用户（或走上面的会话级放行），确保沙盒外操作始终受控。
+    _mode = app_context.get_permission_mode()
+    if _mode == "full" and function_name != "sandbox_outside_access":
+        if event_callback is not None:
+            _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
+        return True
+    if _mode == "accept_edits" and function_name in ("write_file", "edit_file"):
+        # 工作区外的 write/edit 不会以 write_file/edit_file 名义到达这里
+        # （pipeline 已先转给沙盒 guard 询问 sandbox_outside_access），
+        # 因此此分支放行的只有工作区内编辑
         if event_callback is not None:
             _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
         return True
@@ -608,12 +674,13 @@ def check_permission_and_ask(
     # owner/turn_id 统一来源：优先显式传入，turn 兜底 owner，线程名最后兜底
     owner_id = str(permission_owner or parent_turn_id or threading.current_thread().name)
     turn_id = str(parent_turn_id or owner_id)
-    # 沙盒外路径访问必须每次确认，不提供“始终放行”选项
+    # 沙盒外路径访问提供会话级放行（不落盘、切会话收回、任何模式都不自动放行）
     _options = None
     if function_name == "sandbox_outside_access":
         _options = (
             "Yes, 同意本次操作 (y)",
             "No, 拒绝本次操作 (n)",
+            "Always, 本会话内放行沙盒外访问 (a)",
         )
     request = permission_broker.enqueue(
         function_name,
@@ -659,7 +726,7 @@ def check_permission_and_ask(
         choices_map = {
             0: "\033[92m✓ 已同意本次操作\033[0m",
             1: "\033[91m✗ 已拒绝本次操作\033[0m",
-            2: "\033[96m✨ 已选择始终放行此类操作 (当前会话)\033[0m"
+            2: "\033[96m✨ 已选择始终允许此类操作\033[0m"
         }
 
         if event_callback is None:
@@ -689,32 +756,59 @@ def check_permission_and_ask(
                 if prefix is None:
                     # 与 raw 终端路径行为对齐：内联执行命令不放行也不静默，明确提示
                     if event_callback is None:
-                        safe_print(ANSI("   ⚠️ [内联执行命令不做会话前缀放行，仅本次通过]"))
+                        safe_print(ANSI("   ⚠️ [内联执行命令不做前缀放行，仅本次通过]"))
                     else:
                         _notify_event(event_callback, "status", {
-                            "message": "内联执行命令不做会话前缀放行，仅本次通过。",
+                            "message": "内联执行命令不做前缀放行，仅本次通过。",
                         })
                 else:
                     with _session_whitelist_lock:
                         session_allowed_commands.add(prefix)
+                    persisted = False
+                    try:
+                        persisted = permission_store.add_command_rule(prefix)
+                    except Exception:
+                        persisted = False
                     if event_callback is None:
-                        safe_print(ANSI(f"   ✨ [当前会话已放行] {_format_session_command_rule(prefix)}"))
+                        if persisted:
+                            safe_print(ANSI(f"   ✨ [项目白名单已放行（持久化）] {_format_session_command_rule(prefix)}"))
+                        else:
+                            safe_print(ANSI(f"   ✨ [当前会话已放行] {_format_session_command_rule(prefix)}"))
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
+                    canonical = _canonical_permission_path(file_path)
                     with _session_whitelist_lock:
-                        session_allowed_write_files.add(_canonical_permission_path(file_path))
+                        session_allowed_write_files.add(canonical)
+                    persisted = False
+                    try:
+                        persisted = permission_store.add_write_file(canonical)
+                    except Exception:
+                        persisted = False
                     if event_callback is None:
-                        safe_print(ANSI(f"   ✨ [当前会话已放行写入]：{file_path}"))
+                        scope_tip = "项目白名单（持久化）" if persisted else "当前会话"
+                        safe_print(ANSI(f"   ✨ [{scope_tip}已放行写入]：{file_path}"))
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
+                    canonical = _canonical_permission_path(file_path)
                     with _session_whitelist_lock:
-                        session_allowed_edit_files.add(_canonical_permission_path(file_path))
+                        session_allowed_edit_files.add(canonical)
+                    persisted = False
+                    try:
+                        persisted = permission_store.add_edit_file(canonical)
+                    except Exception:
+                        persisted = False
                     if event_callback is None:
-                        safe_print(ANSI(f"   ✨ [当前会话已放行修改]：{file_path}"))
-            # sandbox_outside_access 不提供“始终放行”选项（见 enqueue 处），
-            # 沙盒外路径每次访问都必须逐次确认。
+                        scope_tip = "项目白名单（持久化）" if persisted else "当前会话"
+                        safe_print(ANSI(f"   ✨ [{scope_tip}已放行修改]：{file_path}"))
+            elif function_name == "sandbox_outside_access":
+                # 会话级放行：不落盘，切会话即收回（见 enqueue 处选项说明）
+                from core.tools import set_session_sandbox_bypass
+
+                set_session_sandbox_bypass(True)
+                if event_callback is None:
+                    safe_print(ANSI("   ✨ [当前会话已放行沙盒外访问]"))
             return True
 
         approved = (choice_idx in (0, 2))

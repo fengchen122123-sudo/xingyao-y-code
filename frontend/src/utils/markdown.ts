@@ -172,6 +172,7 @@ export function renderMarkdown(md: string): string {
 export function formatPermMode(mode: string): string {
   switch (mode) {
     case 'confirm': return '变更前确认';
+    case 'accept_edits': return '自动编辑';
     case 'plan': return '计划模式';
     case 'full': return '完全访问';
     default: return mode || '变更前确认';

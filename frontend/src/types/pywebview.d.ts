@@ -2,7 +2,7 @@
 // 本文件按后端桥接 API 契约编写（而非当前 gui_bridge.py 的实现），
 // 后端会单独重写以匹配此契约。
 
-export type PermissionMode = 'confirm' | 'plan' | 'full';
+export type PermissionMode = 'confirm' | 'accept_edits' | 'plan' | 'full';
 // 推理强度档位：default = 模型条目未配置，用请求层内置默认
 export type ReasoningEffort = 'default' | 'low' | 'high' | 'max';
 
@@ -188,6 +188,8 @@ export interface InitialState {
   secondary_model_id?: string;
   secondary_model_roles?: { vision: boolean; compression: boolean; subagent: boolean };
   permission_mode: PermissionMode;
+  // 沙盒开关（true=允许访问工作目录外文件），与 TUI /sandbox 共享配置
+  allow_outside_workspace?: boolean;
   reasoning_effort?: ReasoningEffort;
   sessions: SessionGroup[];
   skills: SkillInfo[];
@@ -292,6 +294,9 @@ export interface PyWebViewAPI {
   set_model(modelId: string): Promise<any>;
   set_reasoning_effort(level: ReasoningEffort): Promise<any>;
   set_permission_mode(mode: PermissionMode): Promise<any>;
+  set_sandbox_enabled(enabled: boolean): Promise<any>;
+  get_permission_rules(): Promise<any>;
+  clear_permission_rules(): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
   respond_permission_choice(requestId: string, choiceIndex: number): Promise<any>;
 

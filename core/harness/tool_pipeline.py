@@ -23,7 +23,7 @@ PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 PLAN_MODE_DENIED_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息和制定计划，"
     "不允许执行任何修改/命令。请改用 plan_write 把操作步骤写入计划，"
-    "并提示用户切换到「变更前确认」或「完全访问」模式后再执行。"
+    "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
 )
 PERMISSION_SYSTEM_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"

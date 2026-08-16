@@ -5,6 +5,7 @@
       <div class="nav-section">基础设置</div>
       <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span>▤</span>模型配置</button>
       <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span>◔</span>Token 统计</button>
+      <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span>🛡</span>权限与沙盒</button>
       <div class="nav-spacer"></div>
       <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><span>⚙</span></div>
     </aside>
@@ -236,6 +237,58 @@
         </div>
       </section>
       </template>
+      <template v-else-if="activeSection === 'permissions'">
+        <header class="settings-header">
+          <div>
+            <h1>权限与沙盒</h1>
+            <p>与 CLI 的 /sandbox、/whitelist 共享同一份配置与存储。</p>
+          </div>
+          <button class="icon-button" title="刷新白名单" @click="loadPermRules">↻</button>
+        </header>
+
+        <section class="perm-settings-card">
+          <div class="perm-row">
+            <div>
+              <h3>沙盒开关</h3>
+              <p>{{ store.sandboxEnabled ? '已解除：允许访问工作目录以外的文件（写操作仍会单独确认）' : '已开启：仅允许访问当前工作目录内的文件' }}</p>
+            </div>
+            <button
+              data-test="sandbox-toggle"
+              class="primary-button perm-action"
+              @click="store.setSandbox(!store.sandboxEnabled)"
+            >{{ store.sandboxEnabled ? '恢复沙盒限制' : '解除沙盒限制' }}</button>
+          </div>
+
+          <div class="perm-row">
+            <div>
+              <h3>当前权限模式</h3>
+              <p>{{ formatPermMode(store.permissionMode) }}（可在输入框旁的权限按钮切换）</p>
+            </div>
+          </div>
+
+          <div class="perm-whitelist">
+            <div class="whitelist-head">
+              <h3>项目持久化白名单</h3>
+              <button
+                data-test="clear-permission-rules"
+                class="secondary-button compact"
+                :disabled="permClearing"
+                @click="clearPermRules"
+              >清空本项目规则</button>
+            </div>
+            <p class="whitelist-tip">「始终允许」产生的授权按项目目录保存在本地（permissions.json），重启后仍生效。沙盒外访问的会话放行不落盘，切换会话即收回。</p>
+            <div v-if="permRules && (permRules.commands.length || permRules.write_files.length || permRules.edit_files.length)">
+              <div v-if="permRules.commands.length" class="wl-label">命令前缀规则</div>
+              <div v-for="(c, i) in permRules.commands" :key="'c' + i" class="wl-item mono">{{ c }}</div>
+              <div v-if="permRules.write_files.length" class="wl-label">放行写入的文件</div>
+              <div v-for="(p, i) in permRules.write_files" :key="'w' + i" class="wl-item mono">{{ p }}</div>
+              <div v-if="permRules.edit_files.length" class="wl-label">放行修改的文件</div>
+              <div v-for="(p, i) in permRules.edit_files" :key="'e' + i" class="wl-item mono">{{ p }}</div>
+            </div>
+            <div v-else class="wl-empty">暂无持久化规则</div>
+          </div>
+        </section>
+      </template>
       <TokenUsageSettings v-else />
     </main>
 
@@ -262,11 +315,12 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import { formatPermMode } from '../utils/markdown';
 import type { ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
 
 const store = useAppStore();
-const activeSection = ref<'models' | 'tokens'>('models');
+const activeSection = ref<'models' | 'tokens' | 'permissions'>('models');
 const selectedKind = ref<'preset' | 'provider' | 'custom' | 'secondary'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');
 const showAddProviders = ref(false);
@@ -469,6 +523,48 @@ async function onSecondaryModelChange() {
 async function onSecondaryRolesChange() {
   await store.setSecondaryRoles({ ...secondaryRoles.value });
 }
+
+// ── 权限与沙盒分区：加载/清空当前项目的持久化白名单 ──
+const permRules = ref<{ commands: string[]; write_files: string[]; edit_files: string[] } | null>(null);
+const permClearing = ref(false);
+
+async function loadPermRules() {
+  try {
+    const api = (window as any).pywebview?.api;
+    if (!api?.get_permission_rules) return;
+    const res = await api.get_permission_rules();
+    if (res && res.ok) {
+      permRules.value = {
+        commands: (res.commands || []).map(String),
+        write_files: (res.write_files || []).map(String),
+        edit_files: (res.edit_files || []).map(String),
+      };
+    }
+  } catch {
+    // 后端未就绪时静默忽略，保留上次结果
+  }
+}
+
+async function clearPermRules() {
+  permClearing.value = true;
+  try {
+    const api = (window as any).pywebview?.api;
+    if (!api?.clear_permission_rules) return;
+    const res = await api.clear_permission_rules();
+    if (res && res.ok) {
+      store.showToast(`已清空 ${res.removed || 0} 条持久化规则`, 'ok');
+      await loadPermRules();
+    } else {
+      store.showToast('清空失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+    }
+  } finally {
+    permClearing.value = false;
+  }
+}
+
+watch(activeSection, (v) => {
+  if (v === 'permissions') loadPermRules();
+});
 </script>
 
 <style scoped>
@@ -575,6 +671,20 @@ async function onSecondaryRolesChange() {
 .role-choice span { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
 .role-choice small { color: var(--text-faint); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
+
+/* ── 权限与沙盒分区 ── */
+.perm-settings-card { max-width: 860px; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
+.perm-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--border); }
+.perm-row h3 { margin: 0 0 6px; font-size: 14px; }
+.perm-row p { margin: 0; color: var(--text-faint); font-size: 12.5px; }
+.perm-action { margin-top: 0; white-space: nowrap; }
+.perm-whitelist { padding-top: 20px; }
+.whitelist-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.whitelist-head h3 { margin: 0; font-size: 14px; }
+.whitelist-tip { margin: 8px 0 14px; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
+.wl-label { margin: 14px 0 6px; color: var(--text-dim); font-size: 11.5px; font-weight: 600; }
+.wl-item { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-dim); font-size: 12px; margin-bottom: 6px; word-break: break-all; }
+.wl-empty { padding: 26px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
 @media (max-width: 900px) {
   .settings-nav { width: 170px; }
   .settings-main { padding: 28px 20px; }
