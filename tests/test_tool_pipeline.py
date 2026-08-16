@@ -449,7 +449,7 @@ def test_direct_pipeline_enforces_sandbox_boundary(tmp_path, monkeypatch):
     )
 
     assert result["content"] == (
-        "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径每次访问都需要用户确认。"
+        "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径访问需要用户确认（可选择本会话内放行，或用 /sandbox on 长期开放）。"
     )
 
 

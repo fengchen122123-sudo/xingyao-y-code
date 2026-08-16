@@ -274,9 +274,10 @@ THEME_DESCS = {
 
 # /permission 帮助文本（list 子命令与无参数帮助共用）
 PERMISSION_HELP_LINES = (
-    "  - <b>confirm</b> : 变更前确认 (修改文件、执行命令均需询问)",
-    "  - <b>plan</b>    : 计划模式 (沙盒内自由读取，只制定计划，不做任何修改)",
-    "  - <b>full</b>    : 完全访问 (自动运行，无需任何确认)",
+    "  - <b>confirm</b>      : 变更前确认 (修改文件、执行命令均需询问)",
+    "  - <b>accept_edits</b> : 自动编辑 (工作区内文件修改自动放行，执行命令仍需询问)",
+    "  - <b>plan</b>         : 计划模式 (沙盒内自由读取，只制定计划，不做任何修改)",
+    "  - <b>full</b>         : 完全访问 (自动运行，无需任何确认)",
 )
 
 # @文件补全的工作目录清单缓存（TTL 秒内重复按键不再重新 os.walk）
@@ -662,7 +663,7 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
         text += f"❓  星瑶需要你的选择: {_esc(q_display)}\n"
     elif func == "sandbox_outside_access":
         text += f"🛡  星瑶申请访问工作目录之外的路径: {_esc(args.get('path', ''))}\n"
-        text += "    （沙盒模式下默认仅限工作目录内；同意本次仅放行此操作，可用 /sandbox on 长期开放）\n"
+        text += "    （沙盒模式下默认仅限工作目录内；可选\"始终允许\"在本会话内放行，或用 /sandbox on 长期开放）\n"
     else:
         # 默认分支：其余工具（含 MCP 工具）展示函数名与参数摘要，不再显示空白
         summary = ", ".join(
@@ -1477,8 +1478,9 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/effort &lt;low|high|max|default&gt;</ansicyan>      : 切换当前模型的推理强度档位 (按模型保存，下轮请求生效)"))
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
-        print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|plan|full&gt;</ansicyan>        : 切换安全权限级别 (confirm:变更前确认 | plan:计划模式 | full:完全访问)"))
+        print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
         print_formatted_text(HTML("  <ansicyan>/sandbox &lt;on|off&gt;</ansicyan>                     : 沙盒开关 (on:允许访问工作目录外文件 | off:仅限工作目录内)"))
+        print_formatted_text(HTML("  <ansicyan>/whitelist &lt;clear&gt;</ansicyan>                   : 查看始终允许白名单 (clear=清空本项目持久化规则)"))
         print_formatted_text(HTML("  <ansicyan>/usage</ansicyan>                                : 查看 Token 用量统计 (按模型区分: 今日/近7天/近30天，精确数值)"))
         print_formatted_text(HTML("  <ansicyan>/usage &lt;日期&gt; [截止日期]</ansicyan>          : 查询指定单日或区间的 Token 用量 (例: /usage 2026-08-01 2026-08-05)"))
         print_formatted_text(HTML(""))
@@ -1510,7 +1512,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>Ctrl+N</ansicyan>                                    : 在输入框内输入新的一行换行符"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+C</ansicyan>                                : <b>星瑶思考中时立即发送强行中断信号</b>；闲置时清空输入框"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+T</ansicyan>                                : <b>切换展开/收起底部浮窗显示当前会话的背景记忆摘要</b>"))
-        print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 Y-CODE 权限模式</b> (变更前确认 ➡️ 计划模式 ➡️ 完全访问)"))
+        print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 Y-CODE 权限模式</b> (变更前确认 ➡️ 自动编辑 ➡️ 计划模式 ➡️ 完全访问)"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+D / /exit</ansicyan>                        : 安全退出 Y-code CLI"))
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
 
@@ -1605,29 +1607,31 @@ def handle_slash_command(command_text):
             print_formatted_text(HTML("用法: <ansiyellow>/theme &lt;主题名称&gt;</ansiyellow>"))
 
     elif cmd == "/permission":
-        if len(parts) > 1:
+        if len(parts) > 1 and parts[1] != "list":
             mode_name = parts[1].lower().strip("<>\"'")
-            if mode_name == "list":
-                print_formatted_text(HTML("<b><ansicyan>可用权限模式：</ansicyan></b>"))
-                for line in PERMISSION_HELP_LINES:
-                    print_formatted_text(HTML(line))
-            elif mode_name in ("confirm", "plan", "full"):
+            # 与 GUI 的 set_permission_mode 一致：接受已登记别名（yolo/中文标签等），
+            # 拼错的值明确报错，绝不静默回落成 confirm 后当作切换成功
+            if _app_ctx.is_known_permission_mode(mode_name):
                 from config import save_config_value
                 global current_permission_mode
-                # 统一经规范化后再落库与写内存，杜绝非规范值扩散
                 current_permission_mode = _app_ctx.normalize_permission_mode(mode_name)
                 save_config_value("permission_mode", current_permission_mode)
-                mapping = {"confirm": "变更前确认", "plan": "计划模式", "full": "完全访问"}
-                print_formatted_text(HTML(f"<ansigreen>✔ 权限控制模式已切换为: <b>{mapping[mode_name]}</b></ansigreen>"))
+                mapping = {
+                    "confirm": "变更前确认",
+                    "accept_edits": "自动编辑",
+                    "plan": "计划模式",
+                    "full": "完全访问",
+                }
+                print_formatted_text(HTML(f"<ansigreen>✔ 权限控制模式已切换为: <b>{mapping[current_permission_mode]}</b></ansigreen>"))
                 if app_instance:
                     app_instance.invalidate()
             else:
-                print_formatted_text(HTML(f"<ansired>❌ 未知权限模式「{_esc(mode_name)}」，可选模式：confirm, plan, full</ansired>"))
+                print_formatted_text(HTML(f"<ansired>❌ 未知权限模式「{_esc(mode_name)}」，可选模式：confirm, accept_edits, plan, full</ansired>"))
         else:
             print_formatted_text(HTML("<b><ansicyan>可用权限模式：</ansicyan></b>"))
             for line in PERMISSION_HELP_LINES:
                 print_formatted_text(HTML(line))
-            print_formatted_text(HTML("用法: <ansiyellow>/permission &lt;confirm|plan|full&gt;</ansiyellow>"))
+            print_formatted_text(HTML("用法: <ansiyellow>/permission &lt;confirm|accept_edits|plan|full&gt;</ansiyellow>"))
 
     elif cmd == "/effort":
         # 推理强度按模型持久化；请求链路（core/llm.py）每轮新鲜读 config.json，改完下轮即生效
@@ -1677,6 +1681,55 @@ def handle_slash_command(command_text):
             status = "已开放（可访问工作目录外）" if enabled else "已开启（仅限工作目录内）"
             print_formatted_text(HTML(f"<b><ansicyan>沙盒状态：{status}</ansicyan></b>"))
             print_formatted_text(HTML("用法: <ansiyellow>/sandbox &lt;on|off&gt;</ansiyellow>（on=允许访问工作目录外，off=仅限工作目录内）"))
+
+    elif cmd == "/whitelist":
+        # 查看与清除「始终允许」白名单（会话级 + 项目级持久化）
+        from core import permission_store
+        from core.llm import (
+            _session_whitelist_lock,
+            session_allowed_commands,
+            session_allowed_write_files,
+            session_allowed_edit_files,
+            _format_session_command_rule,
+        )
+        from core.tools import is_session_sandbox_bypass_enabled
+
+        if len(parts) > 1 and parts[1].lower() == "clear":
+            removed = permission_store.clear_project()
+            print_formatted_text(HTML(f"<ansigreen>✔ 已清空当前项目的持久化白名单（共 {removed} 条）。会话级白名单与沙盒会话放行不受影响。</ansigreen>"))
+        else:
+            print_formatted_text(HTML(f"<b><ansicyan>当前会话白名单（切会话即清空）：</ansicyan></b>"))
+            with _session_whitelist_lock:
+                session_cmds = sorted(session_allowed_commands)
+                session_writes = sorted(session_allowed_write_files)
+                session_edits = sorted(session_allowed_edit_files)
+            if session_cmds:
+                for rule in session_cmds:
+                    print_formatted_text(HTML(f"  命令: {_esc(_format_session_command_rule(rule))}"))
+            else:
+                print_formatted_text(HTML("  （无命令规则）"))
+            if session_writes:
+                for path in session_writes:
+                    print_formatted_text(HTML(f"  写入: {_esc(path)}"))
+            if session_edits:
+                for path in session_edits:
+                    print_formatted_text(HTML(f"  修改: {_esc(path)}"))
+            sandbox_state = "已放行" if is_session_sandbox_bypass_enabled() else "未放行"
+            print_formatted_text(HTML(f"  沙盒外访问（本会话）: {sandbox_state}"))
+
+            print_formatted_text(HTML(f"<b><ansicyan>当前项目持久化白名单（重启保留，/whitelist clear 清空）：</ansicyan></b>"))
+            rules = permission_store.project_rules()
+            if rules["commands"]:
+                for rule in sorted(rules["commands"]):
+                    print_formatted_text(HTML(f"  命令: {_esc(_format_session_command_rule(rule))}"))
+            if rules["write_files"]:
+                for path in sorted(rules["write_files"]):
+                    print_formatted_text(HTML(f"  写入: {_esc(path)}"))
+            if rules["edit_files"]:
+                for path in sorted(rules["edit_files"]):
+                    print_formatted_text(HTML(f"  修改: {_esc(path)}"))
+            if not (rules["commands"] or rules["write_files"] or rules["edit_files"]):
+                print_formatted_text(HTML("  （无持久化规则）"))
 
     elif cmd == "/new":
         # 创建全新会话并切换：历史会话全部保留，随时可用 /session 切回
@@ -2466,8 +2519,9 @@ def _make_input_app():
         ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
         ("/skills", "查看或安装/开启/禁用技能插件"),
         ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
-        ("/permission", "切换安全权限级别 (confirm/plan/full)"),
+        ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
         ("/sandbox", "沙盒开关 (on:允许访问工作目录外/off:仅限目录内)"),
+        ("/whitelist", "查看/清空「始终允许」白名单 (clear:清空本项目持久化规则)"),
         ("/clear", "清理当前屏幕"),
         ("/exit", "退出 Y-code"),
     ]
@@ -2745,7 +2799,7 @@ def _make_input_app():
     def toggle_permission_mode(event):
         """Shift+Tab 循环切换 Y-CODE 权限模式"""
         global current_permission_mode
-        modes = ["confirm", "plan", "full"]
+        modes = ["confirm", "accept_edits", "plan", "full"]
         try:
             curr_idx = modes.index(current_permission_mode)
         except ValueError:
@@ -2825,6 +2879,9 @@ def _make_input_app():
         if current_permission_mode == "confirm":
             perm_label = " 变更前确认 "
             perm_style = "class:status.permission_confirm"
+        elif current_permission_mode == "accept_edits":
+            perm_label = " 自动编辑 "
+            perm_style = "class:status.permission_accept_edits"
         elif current_permission_mode == "plan":
             perm_label = " 计划模式 "
             perm_style = "class:status.permission_plan"
@@ -3066,9 +3123,10 @@ def _make_input_app():
         "status.think":    "bold #e2e8f0",
         "status.task_active": "bold #39ff14",  # 矩阵亮绿
         "status.task_idle":   status_sep,
-        "status.permission_confirm": "bold #50fa7b",
-        "status.permission_plan":    "bold #88c0d0",
-        "status.permission_full":    "bold #ffb86c",
+        "status.permission_confirm":      "bold #50fa7b",
+        "status.permission_accept_edits": "bold #f1fa8c",
+        "status.permission_plan":         "bold #88c0d0",
+        "status.permission_full":         "bold #ffb86c",
         
         # 下拉补全菜单的颜色
         "completion-menu": "bg:#1a2a3a #e2e8f0",

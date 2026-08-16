@@ -37,6 +37,13 @@
             title="切换权限模式"
             @click.stop="togglePermDropdown"
           >{{ formatPermMode(store.permissionMode) }} <span class="permission-chevron">▼</span></button>
+          <button
+            data-test="sandbox-button"
+            class="chip-btn sandbox-btn"
+            :class="{ 'sandbox-open': store.sandboxEnabled }"
+            :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
+            @click.stop="store.setSandbox(!store.sandboxEnabled)"
+          >{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</button>
 
           <button
             ref="modelBtnRef"
@@ -261,6 +268,11 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   display: inline-block;
+}
+
+.sandbox-btn.sandbox-open {
+  border-color: var(--orange);
+  color: var(--orange);
 }
 
 #send-btn {

@@ -86,6 +86,11 @@
       <span class="si" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">{{ store.currentWorkdirLabel }}</span>
       <span class="si" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
       <span class="si">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
+      <span
+        class="si"
+        :class="{ 'si-warn': store.sandboxEnabled }"
+        :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅允许访问工作目录内文件'"
+      >沙盒: {{ store.sandboxEnabled ? '解除' : '限制' }}</span>
       <div class="right">
         <span class="si">{{ store.running ? '生成中…' : '空闲' }}</span>
         <span class="si">UTF-8</span>
@@ -594,6 +599,9 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 5px;
+}
+#statusbar .si-warn {
+  color: var(--orange);
 }
 #statusbar .right {
   margin-left: auto;
