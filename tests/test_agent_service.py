@@ -157,14 +157,17 @@ def test_evict_oldest_turn_removes_complete_rounds_only():
 
 
 def test_normalize_permission_mode_maps_legacy_and_chinese_labels():
-    """权限模式规范化：只允许 confirm / plan / full 三个值。"""
+    """权限模式规范化：只允许 confirm / accept_edits / plan / full 四个值。"""
     assert app_context.normalize_permission_mode("confirm") == "confirm"
+    assert app_context.normalize_permission_mode("accept_edits") == "accept_edits"
     assert app_context.normalize_permission_mode("plan") == "plan"
     assert app_context.normalize_permission_mode("full") == "full"
 
     # 历史遗留 / 中文标签
     assert app_context.normalize_permission_mode("default") == "confirm"
     assert app_context.normalize_permission_mode("默认模式") == "confirm"
+    assert app_context.normalize_permission_mode("accept-edits") == "accept_edits"
+    assert app_context.normalize_permission_mode("自动编辑") == "accept_edits"
     assert app_context.normalize_permission_mode("计划模式") == "plan"
     assert app_context.normalize_permission_mode("YOLO (全部允许)") == "full"
 
@@ -173,7 +176,6 @@ def test_normalize_permission_mode_maps_legacy_and_chinese_labels():
     assert app_context.normalize_permission_mode(None) == "confirm"
     assert app_context.normalize_permission_mode("随便乱写") == "confirm"
     assert app_context.normalize_permission_mode("AUTO") == "confirm"
-    assert app_context.normalize_permission_mode("自动接受编辑") == "confirm"
 
 
 def test_set_permission_mode_stores_canonical_value():

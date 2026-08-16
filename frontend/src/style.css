@@ -244,6 +244,10 @@ button {
   --permission-color: var(--green);
 }
 
+.permission-mode-btn.perm-accept_edits {
+  --permission-color: var(--yellow);
+}
+
 .permission-mode-btn.perm-auto {
   --permission-color: var(--cyan);
 }

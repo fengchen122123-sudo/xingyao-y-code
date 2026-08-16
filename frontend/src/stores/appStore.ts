@@ -221,8 +221,11 @@ export const useAppStore = defineStore('app', {
     secondaryModelId: '',
     secondaryModelRoles: { vision: true, compression: true, subagent: true } as { vision: boolean; compression: boolean; subagent: boolean },
 
-    // 权限模式（规范值：confirm | auto | plan | full，展示一律经 formatPermMode）
+    // 权限模式（规范值：confirm | accept_edits | plan | full，展示一律经 formatPermMode）
     permissionMode: 'confirm' as PermissionMode,
+
+    // 沙盒开关（true=允许访问工作目录外文件），与 TUI /sandbox 共享后端配置
+    sandboxEnabled: false,
 
     // 当前激活模型的推理强度档位（default = 内置默认）
     reasoningEffort: 'default' as ReasoningEffort,
@@ -557,6 +560,7 @@ export const useAppStore = defineStore('app', {
         this.secondaryModelId = init.secondary_model_id || '';
         this.secondaryModelRoles = init.secondary_model_roles || { vision: true, compression: true, subagent: true };
         this.permissionMode = init.permission_mode || 'confirm';
+        this.sandboxEnabled = !!(init as any).allow_outside_workspace;
         this.reasoningEffort = (init as any).reasoning_effort || 'default';
         this.sessionGroups = init.sessions || [];
         this.skills = init.skills || [];
@@ -667,6 +671,30 @@ export const useAppStore = defineStore('app', {
         this.permissionMode = prev;
         this.connected = false;
         this.showToast('权限模式调整失败: ' + err, 'warn');
+      }
+    },
+
+    // 切换沙盒开关（是否允许访问工作目录外文件），与 TUI /sandbox 同一配置
+    async setSandbox(enabled: boolean) {
+      const prev = this.sandboxEnabled;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.set_sandbox_enabled(enabled);
+        if (res && res.ok) {
+          this.sandboxEnabled = !!res.allow_outside_workspace;
+          this.showToast(
+            this.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅限工作目录内',
+            'ok'
+          );
+        } else {
+          this.sandboxEnabled = prev;
+          this.showToast('沙盒开关调整失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+        }
+      } catch (err) {
+        this.sandboxEnabled = prev;
+        this.connected = false;
+        this.showToast('沙盒开关调整失败: ' + err, 'warn');
       }
     },
 

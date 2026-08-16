@@ -211,6 +211,12 @@ def set_session_sandbox_bypass(enabled):
         _session_sandbox_bypass = bool(enabled)
 
 
+def is_session_sandbox_bypass_enabled():
+    """读取会话级沙盒放行标志（供 core.llm 权限快路径免询问判定）。"""
+    with _session_sandbox_lock:
+        return _session_sandbox_bypass
+
+
 def _outside_workspace_allowed():
     """读取运行时状态：是否允许访问工作目录外的文件。
 

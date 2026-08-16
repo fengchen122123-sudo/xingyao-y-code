@@ -30,7 +30,7 @@
         v-if="store.permRequest.allowAlways"
         class="pc-btn"
         @click="store.respondPermission(true, true)"
-      >总是允许此类操作</button>
+      >{{ store.permRequest.functionName === 'sandbox_outside_access' ? '本会话内放行沙盒外访问' : '总是允许此类操作' }}</button>
       <button class="pc-btn danger" @click="store.respondPermission(false, false)">拒绝</button>
     </div>
   </div>

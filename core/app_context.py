@@ -21,9 +21,10 @@ _current_session_fallback: str = ""
 _manager_fallback: Optional[Any] = None
 _permission_mode_fallback: str = "confirm"
 
-# 规范权限模式集合：全系统只允许出现这三个值
-# confirm=变更前确认(任何操作都询问) / plan=计划模式(只读取与规划,不做任何修改) / full=完全访问(沙盒内全部放行,沙盒外仍询问)
-CANONICAL_PERMISSION_MODES = ("confirm", "plan", "full")
+# 规范权限模式集合：全系统只允许出现这四个值
+# confirm=变更前确认(任何操作都询问) / accept_edits=自动编辑(工作区内文件编辑放行,命令仍询问)
+# plan=计划模式(只读取与规划,不做任何修改) / full=完全访问(沙盒内全部放行,沙盒外仍询问)
+CANONICAL_PERMISSION_MODES = ("confirm", "accept_edits", "plan", "full")
 
 # 历史遗留 / 中文标签 -> 规范值的映射表
 _PERMISSION_MODE_ALIASES = {
@@ -32,6 +33,13 @@ _PERMISSION_MODE_ALIASES = {
     "ask": "confirm",
     "变更前确认": "confirm",
     "默认模式": "confirm",
+    "accept_edits": "accept_edits",
+    "accept-edits": "accept_edits",
+    "acceptedits": "accept_edits",
+    "edits": "accept_edits",
+    "自动编辑": "accept_edits",
+    "自动接受编辑": "accept_edits",
+    "自动接受修改": "accept_edits",
     "plan": "plan",
     "planning": "plan",
     "计划模式": "plan",
@@ -135,7 +143,7 @@ def get_active_model_tuple() -> Optional[tuple]:
 # ---------------------------------------------------------------------------
 
 def get_permission_mode() -> str:
-    """返回当前权限模式的规范值（confirm / auto / plan / full）。"""
+    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。"""
     ctx = _context
     if ctx is None:
         return normalize_permission_mode(_permission_mode_fallback)

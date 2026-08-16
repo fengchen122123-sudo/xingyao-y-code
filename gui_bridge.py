@@ -70,7 +70,8 @@ TOKEN_FLUSH_INTERVAL = 0.06
 # 渲染进程挂起时撑满即丢弃新事件，生产者线程永不阻塞
 JS_QUEUE_MAXSIZE = 2000
 
-# 权限请求超时（秒）：超时一律按拒绝处理，绝不放行
+# ask_user 提问超时（秒）：超时按取消处理。权限确认与 TUI 一致无限等待，
+# 不再因用户暂时离开而自动拒绝（拒绝会让模型拿到"用户拒绝"继续跑偏）
 PERMISSION_TIMEOUT_SECONDS = 300
 
 # 文件预览上限：256KB
@@ -805,6 +806,8 @@ class ApiBridge:
                 "secondary_model_id": str(config_data.get("secondary_model_id") or ""),
                 "secondary_model_roles": get_secondary_roles(),
                 "permission_mode": self._current_permission_mode,
+                # 沙盒开关（是否允许访问工作目录外文件）：与 TUI /sandbox 共享同一配置键
+                "allow_outside_workspace": bool(config_data.get("allow_outside_workspace", False)),
                 "sessions": self.get_sessions(),
                 "skills": self._build_skill_list(),
                 "mcps": self._build_mcp_list(),
@@ -1430,6 +1433,58 @@ class ApiBridge:
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 沙盒开关与持久化白名单（与 TUI 的 /sandbox、/whitelist 同一配置与存储）
+    # ------------------------------------------------------------------
+    def set_sandbox_enabled(self, enabled: bool) -> Dict[str, Any]:
+        """沙盒开关：是否允许访问工作目录之外的文件（写 config，TUI/GUI 双端热生效）。"""
+        try:
+            from config import save_config_value
+
+            save_config_value("allow_outside_workspace", bool(enabled))
+            return {"ok": True, "allow_outside_workspace": bool(enabled)}
+        except Exception as e:
+            logger.exception("set_sandbox_enabled 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_permission_rules(self) -> Dict[str, Any]:
+        """返回当前项目的持久化白名单（含沙盒开关状态），供设置页展示。"""
+        try:
+            from core import permission_store
+            from core.model_manager import load_config
+            from core.tools import is_session_sandbox_bypass_enabled
+
+            rules = permission_store.project_rules()
+            def _rule_text(rule):
+                import subprocess
+                try:
+                    return subprocess.list2cmdline(rule)
+                except Exception:
+                    return " ".join(rule)
+            return {
+                "ok": True,
+                "workdir": permission_store.canonical_workdir(),
+                "allow_outside_workspace": bool(load_config().get("allow_outside_workspace", False)),
+                "session_sandbox_bypass": is_session_sandbox_bypass_enabled(),
+                "commands": [_rule_text(rule) for rule in sorted(rules["commands"])],
+                "write_files": sorted(rules["write_files"]),
+                "edit_files": sorted(rules["edit_files"]),
+            }
+        except Exception as e:
+            logger.exception("get_permission_rules 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def clear_permission_rules(self) -> Dict[str, Any]:
+        """清空当前项目的持久化白名单（会话级白名单与沙盒会话放行不受影响）。"""
+        try:
+            from core import permission_store
+
+            removed = permission_store.clear_project()
+            return {"ok": True, "removed": removed}
+        except Exception as e:
+            logger.exception("clear_permission_rules 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
     # 权限确认：统一走 core.permission_broker（与 TUI 同一套串行化机制）
     # ------------------------------------------------------------------
     def _activate_permission_request(self, request):
@@ -1457,28 +1512,26 @@ class ApiBridge:
         except Exception:
             logger.exception("推送权限请求失败")
 
-        def _timeout_deny():
+        # 超时语义与 TUI 对齐：权限确认无限等待，绝不因用户暂时离开而自动拒绝。
+        # （自动拒绝会让模型拿到"用户拒绝"反馈继续跑偏甚至反复重试；无限等待则
+        #   任务安全暂停，用户回来后仍可作答，或手动停止回合取消。）
+        # ask_user 提问类保留超时=取消，防止无人值守时回合永久卡死在提问上。
+        if request.function_name != "ask_user":
+            return
+
+        def _timeout_cancel():
             try:
-                # 超时一律按"拒绝"处理，绝不因为用户没看到弹窗就放行
-                # ask_user 的选项是自定义文案，超时不是"拒绝"而是取消
                 if permission_broker.is_active(request.request_id):
                     from core.permission_broker import CANCELLED_RESULT
-                    if request.function_name == "ask_user":
-                        permission_broker.resolve(request.request_id, CANCELLED_RESULT)
-                        self.emit_event("error", {
-                            "session_name": _session_from_turn_id(request.parent_turn_id),
-                            "message": "问题确认超时，已自动取消。",
-                        })
-                    else:
-                        permission_broker.resolve(request.request_id, 1)
-                        self.emit_event("error", {
-                            "session_name": _session_from_turn_id(request.parent_turn_id),
-                            "message": "权限确认超时，已自动拒绝该操作。",
-                        })
+                    permission_broker.resolve(request.request_id, CANCELLED_RESULT)
+                    self.emit_event("error", {
+                        "session_name": _session_from_turn_id(request.parent_turn_id),
+                        "message": "问题确认超时，已自动取消。",
+                    })
             except Exception:
-                logger.debug("权限超时处理失败", exc_info=True)
+                logger.debug("提问超时处理失败", exc_info=True)
 
-        timer = threading.Timer(PERMISSION_TIMEOUT_SECONDS, _timeout_deny)
+        timer = threading.Timer(PERMISSION_TIMEOUT_SECONDS, _timeout_cancel)
         timer.daemon = True
         with self._perm_lock:
             self._perm_timers[request.request_id] = timer

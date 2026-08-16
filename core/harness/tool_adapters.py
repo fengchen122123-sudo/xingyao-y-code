@@ -199,7 +199,7 @@ def _sandbox_outside_guard(
         return sandbox_bypass(), None
     if cancel_event is not None and cancel_event.is_set():
         return None, PERMISSION_CANCELLED_MESSAGE
-    return None, "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径每次访问都需要用户确认。"
+    return None, "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径访问需要用户确认（可选择本会话内放行，或用 /sandbox on 长期开放）。"
 
 
 class ToolAdapterSet:
