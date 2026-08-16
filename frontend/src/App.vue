@@ -103,11 +103,7 @@
     <!-- 图片大图查看 -->
     <ImageLightbox />
 
-    <!-- 全局 Toast -->
-    <div id="toast" :class="[store.toast.show ? 'show' : '', store.toast.type]">
-      <span>{{ store.toast.msg }}</span>
-      <button v-if="store.toast.action" class="toast-action" @click="store.toast.action.fn()">{{ store.toast.action.label }}</button>
-    </div>
+    <!-- 全局通知已迁移：对话类提示走对话流 notice 消息，非对话类提示走 ConfirmModal notice 模式 -->
 
     <!-- 启动画面：初始化期间全屏展示，加载完成后淡出进入对话 -->
     <Transition name="splash">
@@ -622,47 +618,5 @@ onUnmounted(() => {
 }
 .si.tok-red {
   color: var(--red);
-}
-
-#toast {
-  position: fixed;
-  bottom: 24px;
-  left: 50%;
-  transform: translateX(-50%) translateY(80px);
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  padding: 10px 18px;
-  font-size: 13px;
-  z-index: 10000;
-  transition: transform 0.3s;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-  display: flex;
-  align-items: center;
-  gap: 12px;
-}
-#toast.show {
-  transform: translateX(-50%);
-}
-#toast.ok {
-  border-color: var(--green);
-}
-#toast.warn {
-  border-color: var(--orange);
-}
-.toast-action {
-  background: var(--accent);
-  color: #fff;
-  border: none;
-  border-radius: 6px;
-  padding: 3px 10px;
-  font-size: 12px;
-  font-weight: 600;
-  cursor: pointer;
-  flex-shrink: 0;
-  transition: 0.15s;
-}
-.toast-action:hover {
-  opacity: 0.85;
 }
 </style>

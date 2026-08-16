@@ -272,7 +272,7 @@ async function refreshTasks() {
       const list = await window.pywebview.api.get_background_tasks();
       store.backgroundTasks = list || [];
     } catch (e) {
-      store.showToast('刷新后台任务失败: ' + e, 'warn');
+      store.notifyModal('后台任务', '刷新后台任务失败: ' + e);
     }
   }
 }
@@ -282,12 +282,12 @@ async function killTask(id: string) {
     try {
       const res = await window.pywebview.api.kill_task(id);
       if (!res || !res.ok) {
-        store.showToast('终止任务失败', 'warn');
+        store.notifyModal('后台任务', '终止任务失败');
       } else {
-        store.showToast('已请求终止后台任务: ' + id, 'warn');
+        store.notifyModal('后台任务', '已请求终止后台任务: ' + id);
       }
     } catch (e) {
-      store.showToast('终止任务失败: ' + e, 'warn');
+      store.notifyModal('后台任务', '终止任务失败: ' + e);
     }
     await refreshTasks();
   }

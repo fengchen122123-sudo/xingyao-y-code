@@ -30,6 +30,16 @@ function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
 beforeEach(() => setActivePinia(createPinia()));
 
 describe('MessageBubble', () => {
+  it('renders notice messages as a hint card instead of an error card', () => {
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'notice', content: '已切换活动模型: k3-256k' } },
+    });
+
+    expect(wrapper.get('.notice-card').text()).toContain('提示');
+    expect(wrapper.get('.notice-card').text()).toContain('已切换活动模型: k3-256k');
+    expect(wrapper.find('.error-card').exists()).toBe(false);
+  });
+
   it('renders persistent attachment notes inside the user bubble', () => {
     const wrapper = mount(MessageBubble, {
       props: {

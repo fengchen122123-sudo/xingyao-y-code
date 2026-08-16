@@ -216,7 +216,7 @@ function handleSend() {
   const text = inputVal.value;
   // 拖拽的附件还在等路径时不允许发送，避免把占位的假路径发给后端
   if (attachments.value.some(a => a.loading)) {
-    store.showToast('附件路径加载中，请稍候…', 'warn');
+    store.notifyChat('附件路径加载中，请稍候…');
     return;
   }
   const paths = attachments.value.map(a => a.path);

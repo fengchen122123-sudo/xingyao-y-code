@@ -1,5 +1,5 @@
 <template>
-  <div class="msg" :class="msg.role === 'user' ? 'msg-user' : msg.role === 'error' ? 'msg-error' : 'msg-assistant'">
+  <div class="msg" :class="msg.role === 'user' ? 'msg-user' : msg.role === 'error' ? 'msg-error' : msg.role === 'notice' ? 'msg-notice' : 'msg-assistant'">
     <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大） -->
     <div v-if="msg.role === 'user'" class="bubble user-bubble">
       <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
@@ -77,6 +77,15 @@
       <div class="error-body">
         <div class="error-title">运行错误</div>
         <div class="error-text">{{ msg.content }}</div>
+      </div>
+    </div>
+
+    <!-- 对话内系统提示（取代原 Toast：跟随对话流，不自动消失） -->
+    <div v-else-if="msg.role === 'notice'" class="notice-card">
+      <span class="notice-icon">ⓘ</span>
+      <div class="notice-body">
+        <div class="notice-title">提示</div>
+        <div class="notice-text">{{ msg.content }}</div>
       </div>
     </div>
   </div>
@@ -351,6 +360,45 @@ const thinkingOpen = computed({
   margin-bottom: 2px;
 }
 .error-text {
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 对话内系统提示条（取代原 Toast）：主色调、与错误卡区分 */
+.msg-notice {
+  display: flex;
+  justify-content: flex-start;
+}
+.notice-card {
+  width: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, var(--border));
+  border-left: 3px solid var(--accent);
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--accent) 7%, var(--bg2));
+  font-size: 13px;
+  line-height: 1.6;
+}
+.notice-icon {
+  flex-shrink: 0;
+  color: var(--accent);
+  font-size: 15px;
+  line-height: 1.6;
+}
+.notice-body {
+  flex: 1;
+  min-width: 0;
+}
+.notice-title {
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 2px;
+}
+.notice-text {
   color: var(--text);
   white-space: pre-wrap;
   word-break: break-word;

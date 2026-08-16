@@ -143,6 +143,10 @@ export interface TokenUsage {
   cache_invalidation_reason: string;
   prompt_tokens: number;
   cached_tokens: number;
+  /** CLI 状态栏口径：会话计费累计输入/输出/缓存命中 tokens */
+  total_prompt: number;
+  total_completion: number;
+  total_cached: number;
 }
 
 export interface TokenStatisticsMetrics {
