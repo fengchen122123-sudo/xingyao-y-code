@@ -268,7 +268,7 @@ export function useAttachments() {
     if (paths.length) {
       await addPaths(paths);
     } else if (!removedNames.size) {
-      store.showToast('未获取到文件路径，请重试或改用「＋」按钮选择文件', 'warn');
+      store.notifyChat('未获取到文件路径，请重试或改用「＋」按钮选择文件');
     }
   }
 

@@ -118,7 +118,7 @@
         </span>
       </button>
       <button data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
-        <span>⚙</span><span class="footer-copy"><b>设置</b><small>模型配置</small></span>
+        <span>⚙</span><span class="footer-copy"><b>设置</b></span>
       </button>
     </div>
   </div>

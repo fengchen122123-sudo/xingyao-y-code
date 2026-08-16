@@ -2,18 +2,23 @@
   <div class="modal-mask" :class="{ show: store.confirmModal.show }">
     <div class="modal">
       <div class="modal-head">
-        <div class="mh-ico">✕</div>
+        <div class="mh-ico" :class="{ notice: store.confirmModal.notice }">{{ store.confirmModal.notice ? 'ⓘ' : '✕' }}</div>
         <div>
-          <h3>{{ store.confirmModal.title || '确认操作' }}</h3>
-          <p>{{ store.confirmModal.sub || '请确认您的操作' }}</p>
+          <h3>{{ store.confirmModal.title || (store.confirmModal.notice ? '提示' : '确认操作') }}</h3>
+          <p v-if="store.confirmModal.sub || !store.confirmModal.notice">{{ store.confirmModal.sub || '请确认您的操作' }}</p>
         </div>
       </div>
       <div class="modal-body">
         {{ store.confirmModal.message }}
       </div>
       <div class="modal-foot">
-        <button class="btn" @click="store.resolveConfirm(false)">取消 (Esc)</button>
-        <button class="btn primary danger" @click="store.resolveConfirm(true)">{{ store.confirmModal.confirmLabel || '确定删除 ⏎' }}</button>
+        <button v-if="!store.confirmModal.notice" class="btn" @click="store.resolveConfirm(false)">取消 (Esc)</button>
+        <button
+          class="btn primary"
+          :class="{ danger: !store.confirmModal.notice }"
+          data-test="confirm-modal-ok"
+          @click="store.resolveConfirm(true)"
+        >{{ store.confirmModal.confirmLabel || (store.confirmModal.notice ? '确定' : '确定删除 ⏎') }}</button>
       </div>
     </div>
   </div>
@@ -74,6 +79,11 @@ const store = useAppStore();
   align-items: center;
   justify-content: center;
   font-size: 16px;
+}
+/* notice 模式：提示而非危险操作，用主色图标 */
+.modal-head .mh-ico.notice {
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 .modal-head h3 {
   font-size: 14.5px;
