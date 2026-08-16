@@ -61,6 +61,24 @@ it('keeps unavailable cache rates as null instead of converting them to zero', (
   expect(store.tokenUsage.cache_available).toBe(false);
 });
 
+it('normalizes CLI-style totals with zero fallback', () => {
+  const usage = normalizeTokenUsage({
+    total_prompt: 480000,
+    total_completion: 20000,
+    total_cached: 382200,
+  });
+
+  expect(usage.total_prompt).toBe(480000);
+  expect(usage.total_completion).toBe(20000);
+  expect(usage.total_cached).toBe(382200);
+
+  // 旧后端 payload 无新字段时回落 0，不产生 NaN
+  const legacy = normalizeTokenUsage({ used: 1, window: 128000 });
+  expect(legacy.total_prompt).toBe(0);
+  expect(legacy.total_completion).toBe(0);
+  expect(legacy.total_cached).toBe(0);
+});
+
 it('normalizes a legacy backend payload without inventing cache rates', () => {
   const usage = normalizeTokenUsage({
     used: 12,

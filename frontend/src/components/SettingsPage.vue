@@ -6,6 +6,8 @@
       <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span>▤</span>模型配置</button>
       <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span>◔</span>Token 统计</button>
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span>🛡</span>权限与沙盒</button>
+      <div class="nav-section">关于</div>
+      <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span>ⓘ</span>关于</button>
       <div class="nav-spacer"></div>
       <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><span>⚙</span></div>
     </aside>
@@ -289,6 +291,28 @@
           </div>
         </section>
       </template>
+      <template v-else-if="activeSection === 'about'">
+        <header class="settings-header">
+          <div>
+            <h1>关于</h1>
+            <p>Y-CODE · 星瑶 —— 你的 AI 编程搭档。</p>
+          </div>
+        </header>
+
+        <section class="perm-settings-card">
+          <div class="perm-row">
+            <div>
+              <h3>版本</h3>
+              <p>当前版本：<span class="mono" data-test="about-version">{{ store.version || '未知' }}</span></p>
+            </div>
+            <button
+              data-test="check-update"
+              class="primary-button perm-action"
+              @click="checkUpdate"
+            >检查更新</button>
+          </div>
+        </section>
+      </template>
       <TokenUsageSettings v-else />
     </main>
 
@@ -320,7 +344,7 @@ import type { ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
 
 const store = useAppStore();
-const activeSection = ref<'models' | 'tokens' | 'permissions'>('models');
+const activeSection = ref<'models' | 'tokens' | 'permissions' | 'about'>('models');
 const selectedKind = ref<'preset' | 'provider' | 'custom' | 'secondary'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');
 const showAddProviders = ref(false);
@@ -425,7 +449,7 @@ function formatContext(value: number) {
 
 async function savePreset() {
   if (!selectedPreset.value || !presetApiKey.value.trim()) {
-    store.showToast('请填写 API Key', 'warn');
+    store.notifyModal('表单校验', '请填写 API Key');
     return;
   }
   saving.value = true;
@@ -448,7 +472,7 @@ async function savePreset() {
 
 async function saveCustomProvider() {
   if (!customForm.name.trim() || !customForm.base_url.trim()) {
-    store.showToast('请填写名称和 Base URL', 'warn');
+    store.notifyModal('表单校验', '请填写名称和 Base URL');
     return;
   }
   saving.value = true;
@@ -489,7 +513,7 @@ function closeModelModal() {
 async function saveModel() {
   const provider = selectedProvider.value;
   if (!provider || !modelModal.name.trim() || modelModal.context_window < 1) {
-    store.showToast('请填写有效的模型 ID 和上下文窗口', 'warn');
+    store.notifyModal('表单校验', '请填写有效的模型 ID 和上下文窗口');
     return;
   }
   saving.value = true;
@@ -552,10 +576,10 @@ async function clearPermRules() {
     if (!api?.clear_permission_rules) return;
     const res = await api.clear_permission_rules();
     if (res && res.ok) {
-      store.showToast(`已清空 ${res.removed || 0} 条持久化规则`, 'ok');
+      store.notifyModal('权限与沙盒', `已清空 ${res.removed || 0} 条持久化规则`);
       await loadPermRules();
     } else {
-      store.showToast('清空失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+      store.notifyModal('权限与沙盒', '清空失败: ' + (res && res.msg ? res.msg : '未知错误'));
     }
   } finally {
     permClearing.value = false;
@@ -565,6 +589,11 @@ async function clearPermRules() {
 watch(activeSection, (v) => {
   if (v === 'permissions') loadPermRules();
 });
+
+// 「检查更新」为预留入口：更新通道尚未接入，先给出占位反馈（模态提示，点击确定才关闭）
+function checkUpdate() {
+  store.notifyModal('检查更新', '当前已是最新版本（更新通道后续接入）');
+}
 </script>
 
 <style scoped>

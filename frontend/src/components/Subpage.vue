@@ -199,7 +199,7 @@ const envModal = reactive({
 function submitEnvModal() {
   const missing = envModal.keys.filter(k => !(envModal.values[k] || '').trim());
   if (missing.length) {
-    store.showToast('请填写: ' + missing.join(', '), 'warn');
+    store.notifyModal('表单校验', '请填写: ' + missing.join(', '));
     return;
   }
   const name = envModal.name;
@@ -249,7 +249,7 @@ const addingProvider = ref(false);
 
 async function submitAddProvider() {
   if (!newProvider.name.trim() || !newProvider.base_url.trim()) {
-    store.showToast('请填写供应商名称与 API 地址', 'warn');
+    store.notifyModal('表单校验', '请填写供应商名称与 API 地址');
     return;
   }
   addingProvider.value = true;
@@ -274,7 +274,7 @@ const addingModel = ref(false);
 
 async function submitAddModel() {
   if (!newModel.provider_id || !newModel.model_name.trim()) {
-    store.showToast('请选择供应商并填写模型名称', 'warn');
+    store.notifyModal('表单校验', '请选择供应商并填写模型名称');
     return;
   }
   addingModel.value = true;

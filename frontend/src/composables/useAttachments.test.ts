@@ -94,8 +94,8 @@ describe('useAttachments 拖拽流程', () => {
 
   it('路径推送超时后清除占位并提示', async () => {
     const store = useAppStore();
-    const toast = vi.fn();
-    store.showToast = toast as unknown as typeof store.showToast;
+    const notify = vi.fn();
+    store.notifyChat = notify as unknown as typeof store.notifyChat;
 
     const { attachments, bindDrop, unbindDrop } = useAttachments();
     const el = document.createElement('div');
@@ -110,7 +110,7 @@ describe('useAttachments 拖拽流程', () => {
     await vi.advanceTimersByTimeAsync(5000);
 
     expect(attachments.value.length).toBe(0);
-    expect(toast).toHaveBeenCalled();
+    expect(notify).toHaveBeenCalled();
 
     unbindDrop();
   });

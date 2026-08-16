@@ -45,6 +45,24 @@
             @click.stop="store.setSandbox(!store.sandboxEnabled)"
           >{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</button>
 
+          <!-- 上下文统计圆环：弧线占比 = 已用上下文/窗口，悬停查看用量详情 -->
+          <span
+            class="ctx-ring"
+            :class="tokenClass"
+            :title="ctxTooltip"
+            data-test="context-ring"
+          >
+            <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
+              <circle class="ctx-ring-bg" cx="10" cy="10" r="8" />
+              <circle
+                class="ctx-ring-fg"
+                cx="10"
+                cy="10"
+                r="8"
+                :stroke-dasharray="`${ctxArc} ${CTX_CIRCUMFERENCE}`"
+              />
+            </svg>
+          </span>
           <button
             ref="modelBtnRef"
             class="chip-btn model-chip"
@@ -75,10 +93,7 @@
 
     <div id="input-meta">
       <div class="l">
-        <span :class="tokenClass">Token: {{ tokenUsedDisplay }} / {{ tokenWindowDisplay }}</span>
-        <span class="cache-usage" :title="store.tokenUsage.cache_invalidation_reason || '当前会话主代理缓存命中率'">
-          缓存: {{ cacheRateDisplay }}
-        </span>
+        <span class="token-summary" :title="summaryTitle">{{ tokenSummary }}</span>
       </div>
       <div class="r">
         <span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行 · <span class="kbd">Esc</span> 中断
@@ -97,6 +112,7 @@ import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
 import { useAttachments } from '../composables/useAttachments';
 import { useSuggest } from '../composables/useSuggest';
+import { buildTokenSummary, formatTokenCount } from '../utils/tokenFormat';
 
 const store = useAppStore();
 const inputVal = ref('');
@@ -117,8 +133,6 @@ function togglePermDropdown() {
   showPermDropdown.value = !showPermDropdown.value;
 }
 
-const tokenUsedDisplay = computed(() => (store.tokenUsage.used || 0).toLocaleString('zh-CN'));
-const tokenWindowDisplay = computed(() => (store.tokenUsage.window || 0).toLocaleString('zh-CN'));
 const tokenPct = computed(() => {
   const w = store.tokenUsage.window || 0;
   if (!w) return 0;
@@ -129,14 +143,24 @@ const tokenClass = computed(() => {
   if (tokenPct.value > 70) return 'tok-orange';
   return '';
 });
-const formatCacheRate = (value: number | null) => (
-  value === null ? '--' : `${value.toFixed(1)}%`
-);
-const cacheRateDisplay = computed(() => (
-  `本轮 ${formatCacheRate(store.tokenUsage.cache_latest_pct)} · `
-  + `热路径 ${formatCacheRate(store.tokenUsage.cache_hot_pct)} · `
-  + `全量 ${formatCacheRate(store.tokenUsage.cache_session_pct)}`
+
+// 状态栏摘要：与 CLI（main.py get_status）同口径——输入/输出/命中，命中率分母为输入
+const tokenSummary = computed(() => buildTokenSummary(store.tokenUsage));
+const summaryTitle = computed(() => (
+  store.tokenUsage.cache_invalidation_reason
+  || '会话累计 Token（输入 / 输出 / 缓存命中），口径与 CLI 状态栏一致'
 ));
+
+// 上下文圆环：周长固定，弧长按占用百分比推进，悬停显示用量详情
+const CTX_CIRCUMFERENCE = 2 * Math.PI * 8;
+const ctxArc = computed(() => (Math.min(tokenPct.value, 100) / 100) * CTX_CIRCUMFERENCE);
+const ctxTooltip = computed(() => {
+  const used = store.tokenUsage.used || 0;
+  const win = store.tokenUsage.window || 0;
+  const pct = win ? Math.round((used / win) * 100) : 0;
+  const remain = Math.max(win - used, 0);
+  return `上下文 ${pct}%（${formatTokenCount(used)} / ${formatTokenCount(win)}）· 剩余约 ${formatTokenCount(remain)}`;
+});
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
@@ -173,7 +197,7 @@ function handleSend() {
   const text = inputVal.value;
   // 拖拽的附件还在等路径时不允许发送，避免把占位的假路径发给后端
   if (attachments.value.some(a => a.loading)) {
-    store.showToast('附件路径加载中，请稍候…', 'warn');
+    store.notifyChat('附件路径加载中，请稍候…');
     return;
   }
   const paths = attachments.value.map(a => a.path);
@@ -262,12 +286,38 @@ textarea {
 }
 
 .model-chip {
-  margin-left: auto;
   max-width: 180px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   display: inline-block;
+}
+
+/* 上下文统计圆环：margin-left:auto 把它与模型/发送按钮一起顶到右侧（红圈位置） */
+.ctx-ring {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+  color: var(--accent);
+  cursor: default;
+}
+.ctx-ring svg {
+  display: block;
+  /* 弧线从 12 点方向开始推进 */
+  transform: rotate(-90deg);
+}
+.ctx-ring-bg {
+  fill: none;
+  stroke: var(--bg3);
+  stroke-width: 2.5;
+}
+.ctx-ring-fg {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.5;
+  stroke-linecap: round;
+  transition: stroke-dasharray 0.3s;
 }
 
 .sandbox-btn.sandbox-open {
@@ -313,7 +363,7 @@ textarea {
   display: flex;
   gap: 12px;
 }
-.cache-usage {
+.token-summary {
   white-space: nowrap;
 }
 .kbd {

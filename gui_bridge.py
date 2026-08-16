@@ -51,6 +51,14 @@ from core.version import __version__ as YCODE_VERSION
 
 logger = logging.getLogger(__name__)
 
+# TUI 的 prompt_toolkit 着色标记（<ansiyellow> 等）：GUI 不渲染，桥接层统一剥离，
+# 否则用户会在提示里看到 <ansiyellow> 原文。TUI 路径不经此处，不受影响。
+_ANSI_MARKUP_RE = re.compile(r"</?ansi\w*>")
+
+
+def _strip_ansi_markup(text) -> str:
+    return _ANSI_MARKUP_RE.sub("", str(text))
+
 
 def _session_from_turn_id(turn_id: str) -> str:
     """从 session:turn 复合 ID 提取会话名，不依赖可变的当前会话。"""
@@ -1819,7 +1827,7 @@ class ApiBridge:
                 ctx_win,
                 permission_mode=self._current_permission_mode,
                 cancel_event=cancel_event,
-                notify=lambda kind, message: self.emit_event("notice", {"message": str(message)}),
+                notify=lambda kind, message: self.emit_event("notice", {"message": _strip_ansi_markup(message)}),
                 api_key=api_key,
                 api_base=api_base,
                 is_gui=True,
@@ -2171,7 +2179,7 @@ class ApiBridge:
             elif kind in ("notice", "status"):
                 message = data.get("message")
                 if message:
-                    self.emit_event("notice", {"message": str(message), "session_name": session_name})
+                    self.emit_event("notice", {"message": _strip_ansi_markup(message), "session_name": session_name})
 
         if (self._cancel_events.get(session_name) or self._get_cancel_event(session_name)).is_set():
             cancelled = True
@@ -2367,6 +2375,12 @@ class ApiBridge:
                 "cached_tokens": int(
                     cache_usage["session_all"].get("cached_tokens", 0) or 0
                 ),
+                # CLI 状态栏口径（main.py get_status）：输入/输出/命中取计费累计
+                "total_prompt": int(process_usage.get("cumulative_prompt", 0) or 0),
+                "total_completion": int(
+                    process_usage.get("cumulative_completion", 0) or 0
+                ),
+                "total_cached": int(process_usage.get("cumulative_cached", 0) or 0),
             }
         except Exception:
             logger.debug("get_token_usage 失败", exc_info=True)

@@ -54,6 +54,10 @@ export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
     cache_invalidation_reason: String(data.cache_invalidation_reason ?? ''),
     prompt_tokens: Number(data.prompt_tokens ?? 0),
     cached_tokens: Number(data.cached_tokens ?? 0),
+    // CLI 状态栏口径：输入/输出/命中（计费累计），旧后端无此字段时回落 0
+    total_prompt: Number(data.total_prompt ?? 0),
+    total_completion: Number(data.total_completion ?? 0),
+    total_cached: Number(data.total_cached ?? 0),
   };
 };
 
@@ -61,7 +65,8 @@ const emptyTokenUsage = (): TokenUsage => normalizeTokenUsage();
 
 export interface ChatMessage {
   id?: string;
-  role: 'user' | 'assistant' | 'tool' | 'error';
+  // notice：对话流内的系统提示（取代原 Toast，不自动消失）
+  role: 'user' | 'assistant' | 'tool' | 'error' | 'notice';
   content?: string;
   // 用户消息附带的图片（base64 dataURL 列表，支持多张）
   images?: string[];
@@ -181,6 +186,8 @@ export interface ConfirmState {
   sub: string;
   message: string;
   confirmLabel: string;
+  // notice 模式：单按钮提示框（只有"确定"），用于必须让用户看到的非对话类提示
+  notice?: boolean;
   resolve?: (ok: boolean) => void;
 }
 
@@ -200,13 +207,6 @@ export interface PermReqState {
 }
 
 export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models';
-
-// 从完整路径中取出所在目录（不依赖 Node path 模块，纯字符串处理，兼容 \ 与 /）
-function dirName(p: string): string {
-  if (!p) return p;
-  const idx = Math.max(p.lastIndexOf('\\'), p.lastIndexOf('/'));
-  return idx >= 0 ? p.slice(0, idx) : p;
-}
 
 export const useAppStore = defineStore('app', {
   state: () => ({
@@ -297,17 +297,8 @@ export const useAppStore = defineStore('app', {
     tokenStatisticsLoading: false,
     tokenStatisticsDays: 30 as 1 | 7 | 30,
 
-    // Toast（支持可选的操作按钮，例如"打开所在文件夹"）
-    toast: {
-      show: false,
-      msg: '',
-      type: 'ok' as 'ok' | 'warn',
-      action: null as { label: string; fn: () => void } | null,
-    },
-    toastTimer: null as any,
-
-    // 确认弹窗
-    confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎' } as ConfirmState,
+    // 确认弹窗（notice 模式时退化为单按钮提示框，用户点击"确定"才关闭）
+    confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎', notice: false } as ConfirmState,
 
     // 权限请求弹窗
     permRequest: { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' } as PermReqState,
@@ -428,13 +419,13 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    // 统一的后端可用性检查：不可用时自动置 connected=false 并 toast 提示。
+    // 统一的后端可用性检查：不可用时自动置 connected=false 并弹窗提示。
     // 返回值经 TS 收窄为局部 const，后续 await 调用不会丢失类型narrowing。
     _api(): PyWebViewAPI | null {
       const api = window.pywebview && window.pywebview.api;
       if (!api) {
         this.connected = false;
-        this.showToast('后端连接失败：pywebview API 不可用', 'warn');
+        this.notifyModal('连接失败', '后端连接失败：pywebview API 不可用');
         return null;
       }
       return api;
@@ -495,16 +486,32 @@ export const useAppStore = defineStore('app', {
       this.subpage.show = false;
     },
 
-    showToast(msg: string, type: 'ok' | 'warn' = 'ok', action: { label: string; fn: () => void } | null = null) {
-      this.toast.msg = msg;
-      this.toast.type = type;
-      this.toast.action = action;
-      this.toast.show = true;
-      if (this.toastTimer) clearTimeout(this.toastTimer);
-      const duration = action ? 6000 : 2200;
-      this.toastTimer = setTimeout(() => {
-        this.toast.show = false;
-      }, duration);
+    // 对话类提示：写入当前会话消息流（notice 角色），不自动消失。
+    // 回合进行中必须插到 running assistant 之前：push 到末尾会破坏
+    // "回合中最后一条是 assistant" 的事件契约（后续 tool_finish 会失配）
+    notifyChat(msg: string) {
+      const last = this.messages[this.messages.length - 1];
+      if (last && last.role === 'assistant' && last.execution_state === 'running') {
+        this.messages.splice(this.messages.length - 1, 0, { role: 'notice', content: msg });
+      } else {
+        this.messages.push({ role: 'notice', content: msg });
+      }
+    },
+
+    // 非对话类提示：模态提示框，用户点击"确定"才关闭。
+    // 有待决确认框时先按"取消"安全收尾：直接覆盖会让其 promise 永久悬置。
+    notifyModal(title: string, msg: string) {
+      if (this.confirmModal.show && this.confirmModal.resolve) {
+        this.confirmModal.resolve(false);
+      }
+      this.confirmModal = {
+        show: true,
+        title,
+        sub: '',
+        message: msg,
+        confirmLabel: '确定',
+        notice: true,
+      };
     },
 
     askConfirm(title: string, sub: string, message: string, confirmLabel: string = '确定删除 ⏎'): Promise<boolean> {
@@ -607,7 +614,7 @@ export const useAppStore = defineStore('app', {
         this.connected = true;
       } catch (err) {
         this.connected = false;
-        this.showToast('后端连接失败：' + err, 'warn');
+        this.notifyModal('连接失败', '后端连接失败：' + err);
       } finally {
         await finishSplash();
       }
@@ -623,13 +630,13 @@ export const useAppStore = defineStore('app', {
           this.activeModelName = res.active_model_name || this.activeModelName;
           // 推理强度按模型保存：切换模型后同步该模型自己的档位
           this.reasoningEffort = res.reasoning_effort || 'default';
-          this.showToast('已切换活动模型: ' + this.activeModelName, 'ok');
+          this.notifyChat('已切换活动模型: ' + this.activeModelName);
         } else {
-          this.showToast('切换模型失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyChat('切换模型失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('切换模型失败: ' + err, 'warn');
+        this.notifyChat('切换模型失败: ' + err);
       }
     },
 
@@ -642,15 +649,15 @@ export const useAppStore = defineStore('app', {
         const res = await api.set_reasoning_effort(level);
         if (res && res.ok) {
           this.reasoningEffort = res.reasoning_effort || level;
-          this.showToast(res.msg || ('推理强度已调整: ' + this.reasoningEffort), 'ok');
+          this.notifyChat(res.msg || ('推理强度已调整: ' + this.reasoningEffort));
         } else {
           this.reasoningEffort = prev;
-          this.showToast('推理强度调整失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyChat('推理强度调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.reasoningEffort = prev;
         this.connected = false;
-        this.showToast('推理强度调整失败: ' + err, 'warn');
+        this.notifyChat('推理强度调整失败: ' + err);
       }
     },
 
@@ -662,15 +669,15 @@ export const useAppStore = defineStore('app', {
         const res = await api.set_permission_mode(mode);
         if (res && res.ok) {
           this.permissionMode = res.permission_mode || mode;
-          this.showToast('权限模式已调整: ' + formatPermMode(this.permissionMode), 'ok');
+          this.notifyChat('权限模式已调整: ' + formatPermMode(this.permissionMode));
         } else {
           this.permissionMode = prev;
-          this.showToast('权限模式调整失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyChat('权限模式调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.permissionMode = prev;
         this.connected = false;
-        this.showToast('权限模式调整失败: ' + err, 'warn');
+        this.notifyChat('权限模式调整失败: ' + err);
       }
     },
 
@@ -683,18 +690,17 @@ export const useAppStore = defineStore('app', {
         const res = await api.set_sandbox_enabled(enabled);
         if (res && res.ok) {
           this.sandboxEnabled = !!res.allow_outside_workspace;
-          this.showToast(
-            this.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅限工作目录内',
-            'ok'
+          this.notifyChat(
+            this.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅限工作目录内'
           );
         } else {
           this.sandboxEnabled = prev;
-          this.showToast('沙盒开关调整失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyChat('沙盒开关调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.sandboxEnabled = prev;
         this.connected = false;
-        this.showToast('沙盒开关调整失败: ' + err, 'warn');
+        this.notifyChat('沙盒开关调整失败: ' + err);
       }
     },
 
@@ -706,13 +712,13 @@ export const useAppStore = defineStore('app', {
         const res = await api.set_secondary_model(modelId);
         if (res && res.ok) {
           this.secondaryModelId = modelId || '';
-          this.showToast(res.msg || ('副模型已更新: ' + (this.secondaryModelId || '未设置')), 'ok');
+          this.notifyModal('副模型设置', res.msg || ('副模型已更新: ' + (this.secondaryModelId || '未设置')));
         } else {
-          this.showToast('副模型设置失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('副模型设置', '副模型设置失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('副模型设置失败: ' + err, 'warn');
+        this.notifyModal('副模型设置', '副模型设置失败: ' + err);
       }
     },
 
@@ -725,15 +731,15 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.set_secondary_roles(roles);
         if (res && res.ok) {
-          this.showToast(res.msg || '副模型用途已更新', 'ok');
+          this.notifyModal('副模型设置', res.msg || '副模型用途已更新');
         } else {
           this.secondaryModelRoles = prev;
-          this.showToast('副模型用途设置失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('副模型设置', '副模型用途设置失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.secondaryModelRoles = prev;
         this.connected = false;
-        this.showToast('副模型用途设置失败: ' + err, 'warn');
+        this.notifyModal('副模型设置', '副模型用途设置失败: ' + err);
       }
     },
 
@@ -800,7 +806,7 @@ export const useAppStore = defineStore('app', {
         if (res.sessions) this.sessionGroups = res.sessions;
       } catch (err) {
         this.connected = false;
-        this.showToast('切换会话失败: ' + err, 'warn');
+        this.notifyChat('切换会话失败: ' + err);
       }
     },
 
@@ -955,13 +961,13 @@ export const useAppStore = defineStore('app', {
         const res = await api.delete_folder_group(workdir);
         if (res && res.success) {
           this.sessionGroups = res.sessions;
-          this.showToast(`已移出项目分组: ${folderTitle} (磁盘文件完好)`, 'ok');
+          this.notifyModal('项目分组', `已移出项目分组: ${folderTitle} (磁盘文件完好)`);
         } else {
-          this.showToast('移除项目分组失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('项目分组', '移除项目分组失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('移除项目分组失败: ' + err, 'warn');
+        this.notifyModal('项目分组', '移除项目分组失败: ' + err);
       }
     },
 
@@ -984,13 +990,13 @@ export const useAppStore = defineStore('app', {
           if (sessionName === this.currentSessionName && res.current_session) {
             await this.switchSession(res.current_session, '新会话');
           }
-          this.showToast('会话记录已删除', 'ok');
+          this.notifyModal('会话管理', '会话记录已删除');
         } else {
-          this.showToast('删除会话失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('会话管理', '删除会话失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('删除会话失败: ' + err, 'warn');
+        this.notifyModal('会话管理', '删除会话失败: ' + err);
       }
     },
 
@@ -1005,12 +1011,12 @@ export const useAppStore = defineStore('app', {
           if (res.file_tree) { this.fileTree = res.file_tree; this.fileTreeExpanded = []; }
           if (res.sessions) this.sessionGroups = res.sessions;
           if (res.skills) this.skills = res.skills;
-          this.showToast('已成功引入项目文件夹: ' + res.workdir, 'ok');
+          this.notifyModal('项目分组', '已成功引入项目文件夹: ' + res.workdir);
         }
         // res.ok === false 代表用户取消了文件夹选择，静默忽略即可
       } catch (err) {
         this.connected = false;
-        this.showToast('选择文件夹失败: ' + err, 'warn');
+        this.notifyModal('项目分组', '选择文件夹失败: ' + err);
       }
     },
 
@@ -1036,7 +1042,7 @@ export const useAppStore = defineStore('app', {
           clearTimeout(stopFallbackTimer);
           this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '中断请求未成功送达' });
         } else {
-          this.showToast('已中断当前回合', 'warn');
+          this.notifyChat('已中断当前回合');
         }
       } catch (err) {
         clearTimeout(stopFallbackTimer);
@@ -1052,7 +1058,7 @@ export const useAppStore = defineStore('app', {
       // M30 修复：拦截必须用户可见——调用方已清空输入框，
       // 静默 return 会让用户以为消息已发出（实际被吞）
       if (this.runningSessions.includes(this.currentSessionName)) {
-        this.showToast('当前会话正在生成中，请先停止或稍后再发送', 'warn');
+        this.notifyChat('当前会话正在生成中，请先停止或稍后再发送');
         return;
       }
       const api = window.pywebview && window.pywebview.api;
@@ -1239,7 +1245,7 @@ export const useAppStore = defineStore('app', {
           execution_state: 'running',
         });
         if (data.internal === 'bg_summary') {
-          this.showToast('后台子代理任务已全部结束，正在自动汇总结果', 'ok');
+          this.notifyChat('后台子代理任务已全部结束，正在自动汇总结果');
         }
       }
 
@@ -1426,7 +1432,8 @@ export const useAppStore = defineStore('app', {
         // switchSession 重显逻辑会把已失效的卡片复活，点击后报“权限响应发送失败”
         this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' };
       } else if (type === 'notice') {
-        if (data.message) this.showToast(String(data.message), 'ok');
+        // 后端桥事件 notice：与当前会话相关，写入对话流
+        if (data.message) this.notifyChat(String(data.message));
       } else if (type === 'session_renamed') {
         if (this.currentSessionName === data.old) {
           this.currentSessionName = data.new;
@@ -1549,13 +1556,13 @@ export const useAppStore = defineStore('app', {
         const label = statusLabel[data.status] || data.status;
         const desc = data.description ? `：${data.description}` : '';
         if (data.status === 'completed') {
-          this.showToast(`后台子代理${label}${desc}`, 'ok');
+          this.notifyChat(`后台子代理${label}${desc}`);
         } else {
           // 与 error 事件一致：回合进行中不插队，挂在当前助手消息上展示
           const last = this.messages[this.messages.length - 1];
           if (last && last.role === 'assistant') {
             last.error_note = `后台子代理${label}${desc}`;
-            this.showToast(`后台子代理${label}${desc}`, 'warn');
+            this.notifyChat(`后台子代理${label}${desc}`);
           } else {
             this.messages.push({ role: 'error', content: `后台子代理${label}${desc}` });
           }
@@ -1579,7 +1586,7 @@ export const useAppStore = defineStore('app', {
         if (last && last.role === 'assistant') {
           // Low 修复：多条错误累计展示，不再被最后一条覆盖
           last.error_note = last.error_note ? last.error_note + '\n' + msgText : msgText;
-          this.showToast(msgText, 'warn');
+          this.notifyChat(msgText);
         } else {
           this.messages.push({ role: 'error', content: msgText });
         }
@@ -1659,11 +1666,11 @@ export const useAppStore = defineStore('app', {
         if (res && res.ok) {
           this.skills = res.skills || this.skills;
         } else {
-          this.showToast('切换技能状态失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('技能', '切换技能状态失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('切换技能状态失败: ' + err, 'warn');
+        this.notifyModal('技能', '切换技能状态失败: ' + err);
       }
     },
 
@@ -1674,13 +1681,13 @@ export const useAppStore = defineStore('app', {
         const res = await api.toggle_mcp_server(name, enabled);
         if (res && res.ok) {
           this.mcps = res.mcps || this.mcps;
-          this.showToast(res.msg || 'MCP 状态已更新', 'ok');
+          this.notifyModal('MCP 服务', res.msg || 'MCP 状态已更新');
         } else {
-          this.showToast('MCP 状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('MCP 服务', 'MCP 状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('MCP 状态更新失败: ' + err, 'warn');
+        this.notifyModal('MCP 服务', 'MCP 状态更新失败: ' + err);
       }
     },
 
@@ -1692,13 +1699,13 @@ export const useAppStore = defineStore('app', {
         const res = await api.enable_mcp_server(name, envValues || {});
         if (res && res.ok) {
           this.mcps = res.mcps || this.mcps;
-          this.showToast(res.msg || 'MCP 状态已更新', 'ok');
+          this.notifyModal('MCP 服务', res.msg || 'MCP 状态已更新');
         } else {
-          this.showToast('启用失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('MCP 服务', '启用失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('启用 MCP 服务失败: ' + err, 'warn');
+        this.notifyModal('MCP 服务', '启用 MCP 服务失败: ' + err);
       }
     },
 
@@ -1723,13 +1730,13 @@ export const useAppStore = defineStore('app', {
         const res = await api.toggle_plugin(name, enabled);
         if (res && res.ok) {
           this.plugins = res.plugins || this.plugins;
-          this.showToast(res.msg || '插件状态已更新', 'ok');
+          this.notifyModal('插件', res.msg || '插件状态已更新');
         } else {
-          this.showToast('插件状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('插件', '插件状态更新失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('插件状态更新失败: ' + err, 'warn');
+        this.notifyModal('插件', '插件状态更新失败: ' + err);
       }
     },
 
@@ -1740,13 +1747,13 @@ export const useAppStore = defineStore('app', {
         const res = await api.reconnect_mcp();
         if (res && res.ok) {
           this.mcps = res.mcps || this.mcps;
-          this.showToast(res.msg || 'MCP 已重新连接', 'ok');
+          this.notifyModal('MCP 服务', res.msg || 'MCP 已重新连接');
         } else {
-          this.showToast('MCP 重连失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('MCP 服务', 'MCP 重连失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('MCP 重连失败: ' + err, 'warn');
+        this.notifyModal('MCP 服务', 'MCP 重连失败: ' + err);
       }
     },
 
@@ -1790,10 +1797,10 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.kill_terminal_command();
         if (!res || !res.ok) {
-          this.showToast((res && res.msg) || '终止命令失败', 'warn');
+          this.notifyModal('后台任务', (res && res.msg) || '终止命令失败');
         }
       } catch (err) {
-        this.showToast('终止命令失败: ' + err, 'warn');
+        this.notifyModal('后台任务', '终止命令失败: ' + err);
       }
     },
 
@@ -1807,18 +1814,14 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.export_session(fmt);
         if (res && res.ok) {
-          const path = res.path || '';
-          this.showToast(
-            '导出成功: ' + path,
-            'ok',
-            path ? { label: '打开所在文件夹', fn: () => this.openInSystem(dirName(path)) } : null
-          );
+          // 导出结果写入对话流（取代 Toast）；路径完整展示，用户可自行到该目录查看
+          this.notifyChat('导出成功: ' + (res.path || ''));
         } else {
-          this.showToast('导出失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyChat('导出失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('导出失败: ' + err, 'warn');
+        this.notifyChat('导出失败: ' + err);
       }
     },
 
@@ -1846,13 +1849,13 @@ export const useAppStore = defineStore('app', {
           this.currentStreamingText = '';
           this.currentThinkingText = '';
           this._captureCurrentRuntime();
-          this.showToast('已清空当前会话历史', 'ok');
+          this.notifyChat('已清空当前会话历史');
         } else {
-          this.showToast('清空失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyChat('清空失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('清空失败: ' + err, 'warn');
+        this.notifyChat('清空失败: ' + err);
       }
     },
 
@@ -1870,13 +1873,13 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.undo_last_edit();
         if (res && res.ok) {
-          this.showToast(res.msg || '已撤销上一次文件修改', 'ok');
+          this.notifyChat(res.msg || '已撤销上一次文件修改');
         } else {
-          this.showToast('撤销失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyChat('撤销失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('撤销失败: ' + err, 'warn');
+        this.notifyChat('撤销失败: ' + err);
       }
     },
 
@@ -1889,7 +1892,7 @@ export const useAppStore = defineStore('app', {
         return [];
       } catch (err) {
         this.connected = false;
-        this.showToast('选择文件失败: ' + err, 'warn');
+        this.notifyChat('选择文件失败: ' + err);
         return [];
       }
     },
@@ -1914,10 +1917,10 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.save_clipboard_image(dataUrl);
         if (res && res.ok && res.path) return res.path;
-        this.showToast('粘贴图片失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+        this.notifyChat('粘贴图片失败: ' + (res && res.msg ? res.msg : '未知错误'));
         return '';
       } catch (err) {
-        this.showToast('粘贴图片失败: ' + err, 'warn');
+        this.notifyChat('粘贴图片失败: ' + err);
         return '';
       }
     },
@@ -1941,13 +1944,13 @@ export const useAppStore = defineStore('app', {
           this.filePreview.loading = false;
         } else {
           this.filePreview.show = false;
-          this.showToast('无法预览文件: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('文件预览', '无法预览文件: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         if (seq !== this.filePreviewReqSeq) return;
         this.filePreview.show = false;
         this.connected = false;
-        this.showToast('无法预览文件: ' + err, 'warn');
+        this.notifyModal('文件预览', '无法预览文件: ' + err);
       }
     },
 
@@ -1963,11 +1966,11 @@ export const useAppStore = defineStore('app', {
       try {
         const res = await api.open_path(path);
         if (!res || !res.ok) {
-          this.showToast('打开失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('打开文件', '打开失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('打开失败: ' + err, 'warn');
+        this.notifyModal('打开文件', '打开失败: ' + err);
       }
     },
 
@@ -1978,15 +1981,15 @@ export const useAppStore = defineStore('app', {
         const res = await api.add_provider(name, baseUrl, apiKey, protocol);
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
-          this.showToast(res.msg || '供应商已添加', 'ok');
+          this.notifyModal('供应商', res.msg || '供应商已添加');
           return res;
         } else {
-          this.showToast('添加供应商失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('供应商', '添加供应商失败: ' + (res && res.msg ? res.msg : '未知错误'));
           return null;
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('添加供应商失败: ' + err, 'warn');
+        this.notifyModal('供应商', '添加供应商失败: ' + err);
         return null;
       }
     },
@@ -2008,7 +2011,7 @@ export const useAppStore = defineStore('app', {
         this.applyModelSettings(await api.get_model_settings());
       } catch (err) {
         this.connected = false;
-        this.showToast('加载模型配置失败: ' + err, 'warn');
+        this.notifyModal('模型配置', '加载模型配置失败: ' + err);
       }
     },
 
@@ -2022,7 +2025,7 @@ export const useAppStore = defineStore('app', {
       try {
         const result = await api.get_token_usage_statistics(days);
         if (!result || !result.ok) {
-          this.showToast('加载 Token 统计失败: ' + (result?.msg || '未知错误'), 'warn');
+          this.notifyModal('Token 统计', '加载 Token 统计失败: ' + (result?.msg || '未知错误'));
           return result;
         }
         this.tokenStatistics = result;
@@ -2030,7 +2033,7 @@ export const useAppStore = defineStore('app', {
         return result;
       } catch (err) {
         this.connected = false;
-        this.showToast('加载 Token 统计失败: ' + err, 'warn');
+        this.notifyModal('Token 统计', '加载 Token 统计失败: ' + err);
         return null;
       } finally {
         this.tokenStatisticsLoading = false;
@@ -2048,14 +2051,14 @@ export const useAppStore = defineStore('app', {
         const res = await api.add_preset_provider(presetId, apiKey);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
-          this.showToast(res.msg || '预置厂商已添加', 'ok');
+          this.notifyModal('供应商', res.msg || '预置厂商已添加');
           return res;
         }
-        this.showToast('添加预置厂商失败: ' + (res?.msg || '未知错误'), 'warn');
+        this.notifyModal('供应商', '添加预置厂商失败: ' + (res?.msg || '未知错误'));
         return null;
       } catch (err) {
         this.connected = false;
-        this.showToast('添加预置厂商失败: ' + err, 'warn');
+        this.notifyModal('供应商', '添加预置厂商失败: ' + err);
         return null;
       }
     },
@@ -2067,14 +2070,14 @@ export const useAppStore = defineStore('app', {
         const res = await api.update_provider(providerId, name, baseUrl, apiKey, protocol);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
-          this.showToast(res.msg || '厂商已更新', 'ok');
+          this.notifyModal('供应商', res.msg || '厂商已更新');
           return res;
         }
-        this.showToast('更新厂商失败: ' + (res?.msg || '未知错误'), 'warn');
+        this.notifyModal('供应商', '更新厂商失败: ' + (res?.msg || '未知错误'));
         return null;
       } catch (err) {
         this.connected = false;
-        this.showToast('更新厂商失败: ' + err, 'warn');
+        this.notifyModal('供应商', '更新厂商失败: ' + err);
         return null;
       }
     },
@@ -2088,13 +2091,13 @@ export const useAppStore = defineStore('app', {
         const res = await api.delete_provider(provider.id);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
-          this.showToast('厂商已删除', 'ok');
+          this.notifyModal('供应商', '厂商已删除');
         } else {
-          this.showToast('删除厂商失败: ' + (res?.msg || '未知错误'), 'warn');
+          this.notifyModal('供应商', '删除厂商失败: ' + (res?.msg || '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('删除厂商失败: ' + err, 'warn');
+        this.notifyModal('供应商', '删除厂商失败: ' + err);
       }
     },
 
@@ -2106,15 +2109,15 @@ export const useAppStore = defineStore('app', {
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
           else if (res.models) this.models = res.models;
-          this.showToast(res.msg || '模型已添加', 'ok');
+          this.notifyModal('模型', res.msg || '模型已添加');
           return res;
         } else {
-          this.showToast('添加模型失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('模型', '添加模型失败: ' + (res && res.msg ? res.msg : '未知错误'));
           return null;
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('添加模型失败: ' + err, 'warn');
+        this.notifyModal('模型', '添加模型失败: ' + err);
         return null;
       }
     },
@@ -2126,14 +2129,14 @@ export const useAppStore = defineStore('app', {
         const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
-          this.showToast(res.msg || '模型已更新', 'ok');
+          this.notifyModal('模型', res.msg || '模型已更新');
           return res;
         }
-        this.showToast('更新模型失败: ' + (res?.msg || '未知错误'), 'warn');
+        this.notifyModal('模型', '更新模型失败: ' + (res?.msg || '未知错误'));
         return null;
       } catch (err) {
         this.connected = false;
-        this.showToast('更新模型失败: ' + err, 'warn');
+        this.notifyModal('模型', '更新模型失败: ' + err);
         return null;
       }
     },
@@ -2149,13 +2152,13 @@ export const useAppStore = defineStore('app', {
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
           else if (res.models) this.models = res.models;
-          this.showToast('模型已删除', 'ok');
+          this.notifyModal('模型', '模型已删除');
         } else {
-          this.showToast('删除模型失败: ' + (res && res.msg ? res.msg : '未知错误'), 'warn');
+          this.notifyModal('模型', '删除模型失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.showToast('删除模型失败: ' + err, 'warn');
+        this.notifyModal('模型', '删除模型失败: ' + err);
       }
     },
 
