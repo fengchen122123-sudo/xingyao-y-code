@@ -15,6 +15,8 @@ import os
 import threading
 from pathlib import Path
 
+from core.workspace_context import get_workdir
+
 logger = logging.getLogger(__name__)
 
 _STORE_LOCK = threading.Lock()
@@ -38,7 +40,7 @@ def _store_path() -> Path:
 def canonical_workdir(workdir=None) -> str:
     """规范化项目工作目录作为分组键（realpath + normcase，Windows 大小写不敏感）。"""
     try:
-        return os.path.normcase(os.path.realpath(os.path.abspath(str(workdir or os.getcwd()))))
+        return os.path.normcase(os.path.realpath(os.path.abspath(str(workdir or str(get_workdir())))))
     except (OSError, ValueError, TypeError):
         return ""
 

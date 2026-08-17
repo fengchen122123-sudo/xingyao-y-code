@@ -263,12 +263,17 @@ export const useAppStore = defineStore('app', {
     // 对话消息流
     messages: [] as ChatMessage[],
     running: false,
+    // 当前会话本轮回合开始时间戳（毫秒）："已工作 xx秒"计时用，随会话切换恢复
+    turnStartedAt: 0,
     // 正在执行回合的会话集合（支持多会话并行）
     runningSessions: [] as string[],
     // 批次D：回合已提交但在等 _turn_workdir_lock 的会话（turn_queued 事件）。
     // 排队也算运行中（同时在 runningSessions 中），此集合仅用于 UI 区分
     // "排队等其他会话"与"正在执行"；turn_start/终态事件到达时清除
     queuedSessions: [] as string[],
+    // 非当前会话的状态提醒点：sessionName → 'green'(完成) | 'yellow'(待确认) | 'red'(报错)
+    // 仅给非当前窗口打点，切换到该会话时清除
+    sessionStatusDots: {} as Record<string, 'green' | 'yellow' | 'red'>,
     // 每个会话独立保存流式消息和回合状态；切换会话不丢失后台事件
     sessionRuntimeByName: {} as Record<string, SessionRuntimeState>,
     showThinking: false,
@@ -388,10 +393,23 @@ export const useAppStore = defineStore('app', {
       runtime.running = this.running;
       runtime.subagentTasks = this.subagentTasks;
       runtime.planData = this.planData;
+      runtime.tokenUsage = this.tokenUsage;
+      runtime.turnStartedAt = this.turnStartedAt;
     },
 
     _captureCurrentRuntime(this: any) {
       this._captureRuntime(this.currentSessionName);
+    },
+
+    // 状态提醒点：非当前窗口才打点；手动停止(turn_cancelled)不打点
+    _setSessionStatusDot(this: any, sessionName: string, kind: 'green' | 'yellow' | 'red') {
+      if (!sessionName || sessionName === this.currentSessionName) return;
+      this.sessionStatusDots[sessionName] = kind;
+    },
+    _clearSessionStatusDot(this: any, sessionName: string) {
+      if (sessionName && sessionName in this.sessionStatusDots) {
+        delete this.sessionStatusDots[sessionName];
+      }
     },
 
     _bindSessionRuntime(this: any, sessionName = this.currentSessionName) {
@@ -402,6 +420,11 @@ export const useAppStore = defineStore('app', {
       this.running = runtime.running;
       this.subagentTasks = runtime.subagentTasks;
       this.planData = runtime.planData || { title: '', items: [], progress: 0 };
+      // 窗口口径 token 用量随会话切换：先恢复该会话上次快照避免闪烁，
+      // 后端 token_usage 事件到达后再校正为最新值
+      if (runtime.tokenUsage) this.tokenUsage = runtime.tokenUsage;
+      // "已工作 xx秒"计时随会话切换恢复该会话的回合开始时间戳
+      this.turnStartedAt = runtime.turnStartedAt || 0;
     },
 
     _setSessionRunning(this: any, sessionName: string, running: boolean) {
@@ -750,6 +773,8 @@ export const useAppStore = defineStore('app', {
       this.currentSessionName = sessionName;
       if (displayName) this.currentSessionDisplayName = displayName;
       this.permRequest.show = this.permRequest.sessionName === sessionName;
+      // 进入该会话即视为已读，清除其状态提醒点
+      this._clearSessionStatusDot(sessionName);
       // 优先恢复内存中的实时 runtime；运行中的会话不能被旧数据库快照覆盖
       const runtime = this._getSessionRuntime(sessionName);
       this._bindSessionRuntime(sessionName);
@@ -884,6 +909,7 @@ export const useAppStore = defineStore('app', {
       this.currentThinkingText = '';
       this.subagentTasks = [];
       this.planData = { title: '', items: [], progress: 0 };
+      this.tokenUsage = emptyTokenUsage();
       this.running = false;
       this._captureRuntime('');
       this.currentWorkdirLabel = '对话';
@@ -917,6 +943,7 @@ export const useAppStore = defineStore('app', {
       this.currentThinkingText = '';
       this.subagentTasks = [];
       this.planData = { title: '', items: [], progress: 0 };
+      this.tokenUsage = emptyTokenUsage();
       this.running = false;
       this._captureRuntime('');
       this.workdir = targetWorkdir;
@@ -990,7 +1017,7 @@ export const useAppStore = defineStore('app', {
           if (sessionName === this.currentSessionName && res.current_session) {
             await this.switchSession(res.current_session, '新会话');
           }
-          this.notifyModal('会话管理', '会话记录已删除');
+          // 删除成功静默完成：侧栏列表已随 res.sessions 刷新，无需再弹成功提示
         } else {
           this.notifyModal('会话管理', '删除会话失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
@@ -1107,6 +1134,29 @@ export const useAppStore = defineStore('app', {
         }
         this._setSessionRunning(sessionName, true);
         this._bindSessionRuntime(sessionName);
+        // 乐观渲染：串行排队时后端 turn_start 要等拿到 _turn_workdir_lock 才发，
+        // 期间新会话若无任何气泡会显示为一片空白（看似"没发送"）。
+        // 发送成功后立即渲染用户消息 + running 占位；turn_start 到达时去重占位，
+        // 用户消息已有则不重复添加。
+        const trimmed = text.trim();
+        if (trimmed) {
+          const runtimeMsgs = this._getSessionRuntime(sessionName).messages;
+          const lastMsg = runtimeMsgs[runtimeMsgs.length - 1];
+          if (!(lastMsg && lastMsg.role === 'user' && lastMsg.content === trimmed)) {
+            runtimeMsgs.push({ role: 'user', content: trimmed });
+          }
+          runtimeMsgs.push({
+            role: 'assistant',
+            content: '',
+            reasoning_content: '',
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          });
+          if (this.currentSessionName === sessionName) {
+            this._bindSessionRuntime(sessionName);
+          }
+        }
         const res = await api.send_user_message(text.trim(), sessionName, attachList, pendingDir);
         if (res && res.ok && pendingDir) {
           // 让新会话立即出现在左侧列表（自动重命名事件随后会再刷新一次）
@@ -1215,6 +1265,7 @@ export const useAppStore = defineStore('app', {
         }
         // 当前 reducer 已绑定到目标 runtime，终态只更新目标会话。
         this.running = false;
+        this.turnStartedAt = 0;
         this.subagentTasks = [];
         // M31 修复：会话列表刷新统一在各终态分支里只做一次，
         // 不再在此处与 turn_finish/turn_cancelled 分支重复触发
@@ -1231,19 +1282,36 @@ export const useAppStore = defineStore('app', {
           this.queuedSessions = this.queuedSessions.filter(s => s !== turnSession);
         }
         this.running = true;
+        // 记录本轮回合开始时间戳，供"已工作 xx秒"计时（随会话切换恢复，不重置）
+        if (!this.turnStartedAt) this.turnStartedAt = Date.now();
         this.currentStreamingText = '';
         this.currentThinkingText = '';
         // 内部回合（如后台任务自动汇总）：展示友好的系统提示文案，
         // 不把内部指令原文渲染成用户气泡
-        this.messages.push({ role: 'user', content: data.display_text || data.user_text || '' });
-        this.messages.push({
-          role: 'assistant',
-          content: '',
-          reasoning_content: '',
-          tool_calls: [],
-          legacy_diffs: [],
-          execution_state: 'running',
-        });
+        const turnUserText = data.display_text || data.user_text || '';
+        // 去重：sendMessage 已乐观渲染用户消息 + running 占位（串行排队时
+        // turn_start 滞后，避免新会话长时间空白）。若该用户消息已存在则不重复加。
+        const alreadyHasUser = turnUserText && this.messages.some(
+          (m: ChatMessage) => m.role === 'user' && m.content === turnUserText,
+        );
+        if (!alreadyHasUser) {
+          this.messages.push({ role: 'user', content: turnUserText });
+        }
+        // 占位 assistant：仅当末尾不是空 running 占位时才补（乐观渲染已加则复用）
+        const tail = this.messages[this.messages.length - 1];
+        const tailIsRunningPlaceholder = tail && tail.role === 'assistant'
+          && !tail.content && !tail.reasoning_content
+          && (!tail.tool_calls || tail.tool_calls.length === 0);
+        if (!tailIsRunningPlaceholder) {
+          this.messages.push({
+            role: 'assistant',
+            content: '',
+            reasoning_content: '',
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          });
+        }
         if (data.internal === 'bg_summary') {
           this.notifyChat('后台子代理任务已全部结束，正在自动汇总结果');
         }
@@ -1426,6 +1494,8 @@ export const useAppStore = defineStore('app', {
           functionName: String(data.function_name || ''),
         };
         this.permRequest.show = this.permRequest.sessionName === this.currentSessionName;
+        // 非当前窗口等待用户确认 → 黄点
+        this._setSessionStatusDot(eventSession, 'yellow');
       } else if (type === 'permission_dismiss') {
         // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留。
         // 必须整体重置：仅 show=false 会残留 reqId/sessionName，
@@ -1445,6 +1515,11 @@ export const useAppStore = defineStore('app', {
           this.runningSessions = this.runningSessions.map(s => (s === data.old ? data.new : s));
           // 排队标记同样随重命名迁移
           this.queuedSessions = this.queuedSessions.map(s => (s === data.old ? data.new : s));
+          // 状态提醒点随重命名迁移 key，避免旧 key 残留/丢失
+          if (data.old in this.sessionStatusDots) {
+            this.sessionStatusDots[data.new] = this.sessionStatusDots[data.old];
+            delete this.sessionStatusDots[data.old];
+          }
           if (this.permRequest.sessionName === data.old) {
             this.permRequest.sessionName = data.new;
           }
@@ -1470,6 +1545,8 @@ export const useAppStore = defineStore('app', {
         this.refreshTokenUsage();
         // 对话结束后消息数已变化，刷新侧栏会话列表（否则计数停留在启动快照）
         this.refreshSessions();
+        // 非当前窗口执行完成 → 绿点
+        this._setSessionStatusDot(eventSession, 'green');
       } else if (type === 'turn_cancelled') {
         this.running = false;
         const last = this.messages[this.messages.length - 1];
@@ -1495,6 +1572,8 @@ export const useAppStore = defineStore('app', {
         // Low 修复：turn_error 也补一次会话列表刷新（此前仅在公共终态块中
         // 按 runningSessions 为空兜底，与 turn_finish 重复且 turn_error 无覆盖）
         this.refreshSessions();
+        // 非当前窗口报错中断 → 红点
+        this._setSessionStatusDot(eventSession, 'red');
       } else if (type === 'token_usage') {
         this.tokenUsage = normalizeTokenUsage(data);
       } else if (type === 'token_usage_updated') {

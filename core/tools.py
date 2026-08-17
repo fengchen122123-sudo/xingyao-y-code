@@ -188,8 +188,9 @@ def _subagent_depth_scope():
 
 def is_outside_workspace(path_value):
     """判断路径是否在当前工作目录之外（resolve 后比较，符号链接/.. 均可识别）。"""
+    from core.workspace_context import get_workdir
     candidate = Path(str(path_value or "")).expanduser().resolve()
-    workspace = Path.cwd().resolve()
+    workspace = get_workdir()
     return candidate != workspace and workspace not in candidate.parents
 
 
@@ -252,7 +253,8 @@ def _resolve_workspace_path(file_path, *, allow_trusted_read=False):
             pass
     # 沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
     # 用户批准后通过 sandbox_bypass() 设置线程级放行，_outside_workspace_allowed() 即返回 True。
-    workspace = Path.cwd().resolve()
+    from core.workspace_context import get_workdir
+    workspace = get_workdir()
     if candidate != workspace and workspace not in candidate.parents:
         raise ValueError(
             f"路径越界：只允许访问当前工作目录（{workspace}）内的文件: {file_path}"
@@ -569,6 +571,7 @@ def execute_command(
 ):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
     from core.command_policy import is_dangerous_command
+    from core.workspace_context import get_workdir
 
     if is_dangerous_command(command):
         return "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
@@ -634,6 +637,7 @@ def execute_command(
                 stderr=stderr_sink,
                 text=False,
                 env=env,
+                cwd=str(get_workdir()),
                 # GUI（无控制台）下避免系统为子进程分配新控制台窗口
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
                 start_new_session=os.name != "nt",
@@ -2098,6 +2102,7 @@ class SubagentTask:
     parent_session: str
     parent_turn_id: str
     description: str
+    workdir: str = ""
     subagent_type: str = "general"
     plan_item_id: str = ""
     run_in_background: bool = False
@@ -2288,11 +2293,13 @@ class SubagentManager:
             except Exception:
                 custom_config = None
 
+        from core.workspace_context import get_workdir
         task = SubagentTask(
             task_id=f"subagent-{uuid.uuid4().hex[:8]}",
             parent_session=str(parent_session or ""),
             parent_turn_id=str(parent_turn_id or ""),
             description=description,
+            workdir=str(get_workdir()),
             subagent_type=normalized_type,
             plan_item_id=str(plan_item_id or ""),
             run_in_background=bool(run_in_background),
@@ -2472,6 +2479,10 @@ class SubagentManager:
 
             # 子代理线程标记父会话，使工具级共享缓存可被复用
             _tool_cache.set_current_session(task.parent_session)
+            # 子代理线程继承父回合的工作目录上下文（多会话并行隔离）
+            from core.workspace_context import set_workdir
+            if task.workdir:
+                set_workdir(task.workdir)
             try:
                 result = _strip_advisor_tags(str(self._runner(task) or "").strip())
             except BaseException as error:

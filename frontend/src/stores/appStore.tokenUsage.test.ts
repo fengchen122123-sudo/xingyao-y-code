@@ -93,3 +93,36 @@ it('normalizes a legacy backend payload without inventing cache rates', () => {
   expect(usage.cache_session_pct).toBeNull();
   expect(usage.cache_available).toBe(false);
 });
+
+it('captures and restores tokenUsage per session runtime (无闪烁切换)', () => {
+  const store = useAppStore();
+
+  // 会话 A 收到一份窗口用量
+  store.currentSessionName = 'session-a';
+  store.handleBridgeEvent({
+    type: 'token_usage',
+    data: { used: 36800, window: 128000, total_prompt: 36800, total_completion: 6745, total_cached: 30000 },
+  });
+  expect(store.tokenUsage.used).toBe(36800);
+
+  // 切走：捕获 A 的 runtime（含 tokenUsage）
+  store._captureRuntime('session-a');
+
+  // 切到会话 B（无暂存快照 → 保持当前值，等后端事件校正）
+  store._bindSessionRuntime('session-b');
+  expect(store.tokenUsage.used).toBe(36800);
+
+  // B 收到自己的用量
+  store.currentSessionName = 'session-b';
+  store.handleBridgeEvent({
+    type: 'token_usage',
+    data: { used: 5000, window: 128000, total_prompt: 5000, total_completion: 100, total_cached: 2000 },
+  });
+  store._captureRuntime('session-b');
+  expect(store.tokenUsage.used).toBe(5000);
+
+  // 切回 A：立即恢复 A 上次快照，无需等后端事件
+  store._bindSessionRuntime('session-a');
+  expect(store.tokenUsage.used).toBe(36800);
+  expect(store.tokenUsage.total_prompt).toBe(36800);
+});
