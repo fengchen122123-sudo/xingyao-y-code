@@ -81,6 +81,12 @@
             >
               <div class="t">{{ s.display_name || s.name }}</div>
               <span
+                v-if="store.sessionStatusDots[s.name]"
+                class="s-dot"
+                :class="`s-dot-${store.sessionStatusDots[s.name]}`"
+                :title="dotTitle(store.sessionStatusDots[s.name])"
+              ></span>
+              <span
                 v-if="store.runningSessions.includes(s.name)"
                 class="s-spinner"
                 title="正在执行回合"
@@ -205,6 +211,13 @@ function toggleGroupCollapsed(path: string) {
   }
   confirmDeleteGroupPath.value = '';
   collapsedGroups.value[path] = !collapsedGroups.value[path];
+}
+
+// 状态提醒点 hover 文案
+function dotTitle(kind: 'green' | 'yellow' | 'red') {
+  if (kind === 'green') return '该会话任务执行完成';
+  if (kind === 'yellow') return '该会话等待确认操作';
+  return '该会话任务报错中断';
 }
 
 function getFolderTitle(g: SessionGroup) {
@@ -437,6 +450,25 @@ function getFolderTitle(g: SessionGroup) {
   border-top-color: var(--orange);
   border-radius: 50%;
   animation: spin 0.8s linear infinite;
+}
+/* 状态提醒点：非当前会话任务完成/待确认/报错时显示，进入会话后消失 */
+.session-item .s-dot {
+  flex-shrink: 0;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+}
+.session-item .s-dot-green {
+  background: var(--green);
+  box-shadow: 0 0 4px var(--green);
+}
+.session-item .s-dot-yellow {
+  background: var(--orange);
+  box-shadow: 0 0 4px var(--orange);
+}
+.session-item .s-dot-red {
+  background: var(--red);
+  box-shadow: 0 0 4px var(--red);
 }
 @keyframes spin {
   to { transform: rotate(360deg); }

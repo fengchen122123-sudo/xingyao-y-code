@@ -264,8 +264,8 @@ class ApiBridge:
         # 回合启动互斥：send_user_message 与后台自动汇总都可能启动 turn 线程，
         # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合
         self._turn_start_lock = threading.Lock()
-        # os.chdir 与 MemoryManager.workdir 均为进程级状态。显式串行化完整回合，
-        # 避免不同会话把相对路径工具切换到另一项目。
+        # 已弃用：多会话并行改为线程本地 workdir 上下文（core.workspace_context），
+        # 不再需要进程级串行锁。保留变量定义避免历史引用报错。
         self._turn_workdir_lock = threading.Lock()
         # 后台子代理自动汇总（与 TUI 的 _bg_summary_triggered 同源）：
         # 每批后台任务只触发一次汇总，用户主动发新消息时重置
@@ -1626,6 +1626,20 @@ class ApiBridge:
                 if self._is_turn_active(target_session):
                     return {"ok": False, "msg": "该会话已有正在运行的回合"}
 
+                # pending 新会话：先用首条消息前 12 字命名，立即生效，
+                # 避免等整个回合跑完才由 _maybe_auto_rename 改名。
+                # 注意：rename_session 要求会话已落库，故先 ensure_session 创建。
+                if workdir and re.match(r"^session_[a-f0-9]{6}$", target_session or ""):
+                    base_title = clean_text[:12].replace("\n", " ").strip()
+                    if base_title:
+                        try:
+                            self._memory.ensure_session(target_session, workdir=str(workdir), source="GUI")
+                            new_session = self._rename_session_to_title(target_session, base_title)
+                            if new_session != target_session:
+                                target_session = new_session
+                        except Exception:
+                            logger.debug("落库即命名失败", exc_info=True)
+
                 # 用户主动发起新对话：重置该会话的自动汇总标志，
                 # 下一批后台任务完成时可以再次触发自动汇总（与 TUI 行为一致）；
                 # 同时解除"用户取消"标记，恢复自动汇总与计划续推
@@ -1709,19 +1723,10 @@ class ApiBridge:
             return {"ok": False, "msg": str(e)}
 
     def _run_turn_worker_serialized(self, user_text: str, session_name: str, *args, **kwargs):
-        """Serialize turns that depend on process-wide cwd and memory workdir.
-
-        T10：锁被其他会话的回合持有时，超过 1s 未拿到锁就通知前端本回合在
-        排队等待，避免界面长时间"运行中"却毫无动静；拿到锁后 _run_turn_worker
-        会立即发 turn_start，前端运行态自然衔接，无需额外的解除事件。
-        """
-        if not self._turn_workdir_lock.acquire(timeout=1.0):
-            self.emit_event("turn_queued", {"session_name": session_name})
-            self._turn_workdir_lock.acquire()
-        try:
-            return self._run_turn_worker(user_text, session_name, *args, **kwargs)
-        finally:
-            self._turn_workdir_lock.release()
+        """多会话并行：线程本地 workdir 上下文（core.workspace_context）已替代
+        进程级 os.chdir，回合不再需要 _turn_workdir_lock 串行化。
+        保留函数名避免改动所有调用点，实现直接转发到 _run_turn_worker。"""
+        return self._run_turn_worker(user_text, session_name, *args, **kwargs)
 
     def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = ""):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
@@ -1783,16 +1788,17 @@ class ApiBridge:
             # 已把 workdir 透传到这里，但进程 cwd 仍可能停在启动目录或上一会话；
             # 必须在解析附件、组装运行上下文和执行任何工具前完成绑定。
             turn_workdir = pending_workdir or self._session_workdir(session_name)
-            if turn_workdir != "GLOBAL":
+            if turn_workdir == "GLOBAL":
+                # 自由对话无具体项目目录，线程本地 workdir 兜底进程 cwd
+                turn_workdir = _resolve_real_path(os.getcwd())
+            else:
                 turn_workdir = _resolve_real_path(turn_workdir)
                 if not os.path.isdir(turn_workdir):
                     raise FileNotFoundError(f"会话项目文件夹不存在: {turn_workdir}")
-                # ⚠ 已知限制：os.chdir 是进程级全局状态，多会话真并行时
-                # 不同目录的回合会互相抢占 cwd，相对路径文件操作可能落错目录。
-                # 彻底解决需改 core 层工具函数传 workdir 参数，暂标注为已知限制。
-                if os.path.abspath(turn_workdir) != os.path.abspath(os.getcwd()):
-                    os.chdir(turn_workdir)
-                self._memory.set_workdir(turn_workdir)
+            # 线程本地 workdir 绑定：替代进程级 os.chdir，多会话并行时互不干扰
+            from core.workspace_context import set_workdir
+            set_workdir(turn_workdir)
+            self._memory.set_workdir(turn_workdir)
 
             # 确保会话存在，再解析用户输入（支持 @文件 / 图片挂载）并入库
             self._memory.ensure_session(session_name, workdir=turn_workdir, source="GUI")
@@ -2211,43 +2217,52 @@ class ApiBridge:
             pass
         return _resolve_real_path(os.getcwd())
 
+    def _derive_title_from_first_user_msg(self, session_name: str) -> Optional[str]:
+        """从会话首条用户消息提炼标题（前 12 字），提炼不出则返回 None。"""
+        history = self._memory.get_history(session_name)
+        user_msgs = [m for m in history if m.get("role") == "user"]
+        if not user_msgs:
+            return None
+        raw = user_msgs[0].get("content", "")
+        if isinstance(raw, list):
+            raw = " ".join(
+                str(item.get("text", "")) for item in raw if isinstance(item, dict)
+            )
+        first_text = str(raw).strip().replace("\n", " ")
+        return first_text[:12] if first_text else None
+
+    def _rename_session_to_title(self, session_name: str, base_title: str) -> str:
+        """把会话重命名为 base_title（撞名自动加序号），成功推送 session_renamed。"""
+        existing = {s.get("name") for s in self._memory.get_all_sessions(workdir=None)}
+        new_title = base_title
+        suffix = 2
+        while new_title in existing:
+            new_title = f"{base_title}({suffix})"
+            suffix += 1
+        success, final_name = self._memory.rename_session(session_name, new_title)
+        if success:
+            if self._current_session == session_name:
+                self._set_current_session(final_name)
+            self.emit_event("session_renamed", {
+                "old": session_name,
+                "new": final_name,
+                # 兼容旧字段名
+                "old_name": session_name,
+                "new_name": final_name,
+                "sessions": self.get_sessions(),
+            })
+            return final_name
+        return session_name
+
     def _maybe_auto_rename(self, session_name: str) -> str:
         """首轮对话完成后，把默认的 session_xxxxxx 命名换成提炼出的标题。"""
         if not re.match(r"^session_[a-f0-9]{6}$", session_name or ""):
             return session_name
         try:
-            history = self._memory.get_history(session_name)
-            user_msgs = [m for m in history if m.get("role") == "user"]
-            if not user_msgs:
+            base_title = self._derive_title_from_first_user_msg(session_name)
+            if not base_title:
                 return session_name
-            raw = user_msgs[0].get("content", "")
-            if isinstance(raw, list):
-                raw = " ".join(
-                    str(item.get("text", "")) for item in raw if isinstance(item, dict)
-                )
-            first_text = str(raw).strip().replace("\n", " ")
-            if not first_text:
-                return session_name
-            base_title = first_text[:12]
-            existing = {s.get("name") for s in self._memory.get_all_sessions(workdir=None)}
-            new_title = base_title
-            suffix = 2
-            while new_title in existing:
-                new_title = f"{base_title}({suffix})"
-                suffix += 1
-            success, final_name = self._memory.rename_session(session_name, new_title)
-            if success:
-                if self._current_session == session_name:
-                    self._set_current_session(final_name)
-                self.emit_event("session_renamed", {
-                    "old": session_name,
-                    "new": final_name,
-                    # 兼容旧字段名
-                    "old_name": session_name,
-                    "new_name": final_name,
-                    "sessions": self.get_sessions(),
-                })
-                return final_name
+            return self._rename_session_to_title(session_name, base_title)
         except Exception:
             logger.debug("自动重命名会话失败", exc_info=True)
         return session_name

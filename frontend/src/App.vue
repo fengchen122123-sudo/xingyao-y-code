@@ -255,8 +255,12 @@ const showFlowWorking = computed(() => {
 
 watch(() => store.running, (running) => {
   if (running) {
-    turnStartTs = Date.now();
-    workElapsed.value = 0;
+    // 用会话级回合开始时间戳（store.turnStartedAt），切回运行中的会话时
+    // 计时从该会话的真实开始时刻继续，而非重新从 0 计
+    turnStartTs = store.turnStartedAt || Date.now();
+    workElapsed.value = store.turnStartedAt
+      ? Math.floor((Date.now() - store.turnStartedAt) / 1000)
+      : 0;
     finalWorkTime.value = null;
     window.clearInterval(workTimer);
     workTimer = window.setInterval(() => {
@@ -277,6 +281,23 @@ watch(() => store.running, (running) => {
 // 切会话 / 清空会话后，上一轮的工时残留无意义，一并重置
 watch(() => store.currentSessionName, () => {
   finalWorkTime.value = null;
+  // 关键：A/B 都在运行时切换会话，store.running 值不变（true→true），
+  // watch(store.running) 不会触发，计时器会继续用旧会话的时间戳串号。
+  // 这里按目标会话的回合开始时间戳刷新计时。
+  if (store.running) {
+    turnStartTs = store.turnStartedAt || Date.now();
+    workElapsed.value = store.turnStartedAt
+      ? Math.floor((Date.now() - store.turnStartedAt) / 1000)
+      : 0;
+    window.clearInterval(workTimer);
+    workTimer = window.setInterval(() => {
+      workElapsed.value = Math.floor((Date.now() - turnStartTs) / 1000);
+    }, 1000);
+  } else {
+    window.clearInterval(workTimer);
+    workTimer = undefined;
+    turnStartTs = 0;
+  }
 });
 watch(() => store.messages.length, (len) => {
   if (len === 0) finalWorkTime.value = null;
