@@ -236,6 +236,7 @@ def build_runtime_context(model_name: str, permission_mode: str):
     """
     from core.context_builder import RuntimeContext
     from core.plan import get_default_plan_manager
+    from core.workspace_context import get_workdir
 
     now = datetime.datetime.now()
     plan_items = get_default_plan_manager().snapshot()
@@ -245,7 +246,7 @@ def build_runtime_context(model_name: str, permission_mode: str):
     return RuntimeContext(
         model_name=model_name,
         permission_mode=permission_mode,
-        working_dir=os.getcwd(),
+        working_dir=str(get_workdir()),
         current_time=now.strftime("%Y-%m-%d %H:%M:%S"),
         active_plan=active_plan,
     )

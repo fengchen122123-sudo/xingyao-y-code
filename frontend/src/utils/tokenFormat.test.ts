@@ -1,32 +1,32 @@
 import { describe, expect, it } from 'vitest';
 import { buildTokenSummary, formatTokenCount } from './tokenFormat';
 
-describe('formatTokenCount（与 CLI format_num 口径一致）', () => {
+describe('formatTokenCount（精确数值，千分位分隔）', () => {
   it('小于 1000 原样显示', () => {
     expect(formatTokenCount(0)).toBe('0');
     expect(formatTokenCount(999)).toBe('999');
   });
 
-  it('千级显示 K，整数不带小数点', () => {
-    expect(formatTokenCount(1000)).toBe('1K');
-    expect(formatTokenCount(52000)).toBe('52K');
-    expect(formatTokenCount(52900)).toBe('52.9K');
-    expect(formatTokenCount(1600)).toBe('1.6K');
+  it('千级及以上显示千分位完整数值', () => {
+    expect(formatTokenCount(1000)).toBe('1,000');
+    expect(formatTokenCount(52000)).toBe('52,000');
+    expect(formatTokenCount(52900)).toBe('52,900');
+    expect(formatTokenCount(803834)).toBe('803,834');
   });
 
-  it('百万级显示 M', () => {
-    expect(formatTokenCount(1000000)).toBe('1M');
-    expect(formatTokenCount(2500000)).toBe('2.5M');
+  it('百万级同样显示完整数值', () => {
+    expect(formatTokenCount(1000000)).toBe('1,000,000');
+    expect(formatTokenCount(2500000)).toBe('2,500,000');
   });
 });
 
-describe('buildTokenSummary（与 CLI 状态栏一致：输入/输出/命中）', () => {
-  it('按 CLI 格式组装，命中率分母为输入', () => {
+describe('buildTokenSummary（输入/输出/命中，完整数值）', () => {
+  it('完整数值组装，命中率分母为输入', () => {
     expect(buildTokenSummary({
-      total_prompt: 52900,
-      total_completion: 1600,
-      total_cached: 40700,
-    })).toBe('输入 52.9K · 输出 1.6K · 命中 40.7K (77%)');
+      total_prompt: 803834,
+      total_completion: 6745,
+      total_cached: 740967,
+    })).toBe('输入 803,834 · 输出 6,745 · 命中 740,967 (92%)');
   });
 
   it('输入为 0 时命中率为 0%', () => {
@@ -42,6 +42,6 @@ describe('buildTokenSummary（与 CLI 状态栏一致：输入/输出/命中）'
       total_prompt: 1000,
       total_completion: 100,
       total_cached: 766,
-    })).toBe('输入 1K · 输出 100 · 命中 766 (77%)');
+    })).toBe('输入 1,000 · 输出 100 · 命中 766 (77%)');
   });
 });
