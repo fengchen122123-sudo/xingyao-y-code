@@ -1646,6 +1646,12 @@ export const useAppStore = defineStore('app', {
             this.messages.push({ role: 'error', content: `后台子代理${label}${desc}` });
           }
         }
+      } else if (type === 'background_task_finished') {
+        // 后台命令任务（execute_command 的 run_in_background，如打包）完成通知
+        const code = Number(data.returncode);
+        const tid = String(data.task_id || '');
+        const statusText = code === 0 ? '已完成' : `已结束（退出码 ${code}）`;
+        this.notifyChat(`后台任务 ${tid} ${statusText}`);
       } else if (type === 'terminal_output') {
         this.terminalOutput += data.text || '';
         // 输出上限 200K 字符：超出后从头部截断，避免长任务把内存拖爆
