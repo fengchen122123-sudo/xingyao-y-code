@@ -46,6 +46,29 @@ from core.command_policy import is_dangerous_command, redact_sensitive_text
 # 兼容已有内部调用和测试；策略实现集中在 command_policy。
 _is_dangerous_command = is_dangerous_command
 
+# 后台命令任务完成回调（GUI 注册，用于任务退出后向前端推送通知）
+_on_task_finished = None
+
+
+def set_task_finished_callback(callback):
+    """注册后台命令任务完成回调；签名 callback(task_id, command, returncode)。"""
+    global _on_task_finished
+    _on_task_finished = callback
+
+
+def _watch_task_completion(task_id, process, command):
+    """监听线程：阻塞等待后台命令进程退出，退出后触发完成回调（仅一次）。"""
+    try:
+        returncode = process.wait()
+    except Exception:
+        return
+    cb = _on_task_finished
+    if cb is not None:
+        try:
+            cb(task_id, command, returncode)
+        except Exception as error:
+            _logger.warning("后台任务完成回调失败 %s: %s", task_id, error)
+
 
 def _ensure_paths():
     """按需解析日志目录与任务库路径（首次使用时按当前 cwd 确定）。"""
@@ -277,6 +300,14 @@ def start_background_task(command: str) -> str:
             }
             _save_tasks()
         _prune_old_logs()
+        # 启动完成监听线程：进程退出后触发完成回调，向前端推送通知
+        _watcher = threading.Thread(
+            target=_watch_task_completion,
+            args=(task_id, process, command),
+            daemon=True,
+            name=f"bg-task-watcher-{task_id}",
+        )
+        _watcher.start()
         return task_id
     except Exception as e:
         if log_file is not None:

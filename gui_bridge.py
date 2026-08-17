@@ -334,6 +334,14 @@ class ApiBridge:
         except Exception:
             logger.warning("注册后台子代理终态回调失败", exc_info=True)
 
+        # 注册后台命令任务完成回调：execute_command 的后台任务（如打包）退出后
+        # 立即向前端推送完成通知，避免用户只能手动查询任务状态
+        try:
+            from core.task_manager import set_task_finished_callback
+            set_task_finished_callback(self._on_background_task_finished)
+        except Exception:
+            logger.warning("注册后台命令任务完成回调失败", exc_info=True)
+
     # ------------------------------------------------------------------
     # 基础设施：窗口、事件推送
     # ------------------------------------------------------------------
@@ -1935,6 +1943,24 @@ class ApiBridge:
                     daemon=True,
                     name="gui-bg-summary-recheck",
                 ).start()
+
+    def _on_background_task_finished(self, task_id: str, command: str, returncode: int) -> None:
+        """后台命令任务完成通知（监听线程触发）：向前端推送完成/失败事件。
+
+        与 _on_background_subagent_terminal 的区别：后者是子代理后台任务，
+        本方法是 execute_command 的 run_in_background 后台命令（如打包）。
+        """
+        if self._shutting_down:
+            return
+        try:
+            from core.command_policy import redact_sensitive_text
+            self.emit_event("background_task_finished", {
+                "task_id": task_id,
+                "command": redact_sensitive_text(command or ""),
+                "returncode": int(returncode or 0),
+            })
+        except Exception:
+            logger.debug("推送后台命令任务完成通知失败", exc_info=True)
 
     def _on_background_subagent_terminal(self, task_id: str, status: str, description: str, summary: str) -> None:
         """后台子代理终态实时通知（worker 线程触发，与 TUI 同源的 GUI 版本）。
