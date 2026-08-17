@@ -52,6 +52,16 @@ REPEAT_CALL_BLOCKED_TEXT = (
     "🛑 检测到相同的工具调用已成功执行过 2 次，结果未发生变化。请改用其他方式推进任务。"
 )
 
+# 计划状态机工具不受重复调用抑制：plan_retry 设计为“首次返回根因分析提示、
+# 再次调用强制重置”，若被 RepeatCallGuard 拦截第二次调用，调度器会把计划项
+# 锁死在 failed 态（retry 被拒 → run_subagent 要求先重置 → 主 Agent 死锁）
+_REPEAT_GUARD_EXEMPT_TOOLS = frozenset({
+    "plan_write",
+    "plan_update",
+    "plan_read",
+    "plan_retry",
+})
+
 
 @dataclass(frozen=True)
 class ToolExecutionContext:
@@ -279,14 +289,16 @@ class ToolBatchExecutor:
         return message, max(0, duration_ms)
 
     def _execute_guarded(self, decoded, context):
-        if not self.repeat_guard.should_execute(decoded.name, decoded.raw_arguments):
+        guard_exempt = decoded.name in _REPEAT_GUARD_EXEMPT_TOOLS
+        if not guard_exempt and not self.repeat_guard.should_execute(decoded.name, decoded.raw_arguments):
             return _repeat_call_blocked_result(decoded), 0
         message, duration_ms = self._execute_timed(decoded, context)
-        self.repeat_guard.record(
-            decoded.name,
-            decoded.raw_arguments,
-            ok=self.result_ok(decoded.name, message),
-        )
+        if not guard_exempt:
+            self.repeat_guard.record(
+                decoded.name,
+                decoded.raw_arguments,
+                ok=self.result_ok(decoded.name, message),
+            )
         return message, duration_ms
 
     def _execute_parallel(self, decoded, context):
@@ -589,6 +601,11 @@ class ToolPipeline:
         retry_exhausted = bool(stalled) and all(
             int(item.get("attempts", 0)) >= 2 for item in stalled
         )
+        if not snapshot:
+            # 计划在同一回合内被清空（plan_write 成功标记了计划回合后又被清空）：
+            # 门禁失去意义，必须放行，否则主 Agent 陷入“没有计划项却被要求
+            # 提供 plan_item_id”的死锁（execute_command 全被拦截、无任何提示可跟）
+            return None
         if not ready and not in_progress and retry_exhausted:
             return None
         ready_hints = ""

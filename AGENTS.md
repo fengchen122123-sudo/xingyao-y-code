@@ -99,6 +99,10 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   不能放动态运行上下文块（`build_dynamic_prompt` 只承载模型/权限/目录/计划等可变字段），
   否则前缀漂移导致缓存整体失效。
 - `core/harness/tool_pipeline.py:RepeatCallGuard` 抑制同签名成功 ≥2 次的重复工具调用；
+  计划状态机工具（plan_write/plan_update/plan_read/plan_retry）豁免
+  （`_REPEAT_GUARD_EXEMPT_TOOLS`），否则会卡死 plan_retry 的“提示→强制重试”两段式流程。
+  计划门禁另一死锁防护：回合被标记为计划回合后若计划被清空（snapshot 为空），
+  执行工具门禁必须解除，不能继续要求 plan_item_id。
   DeepSeek thinking 路由为带 tool_calls 的 assistant 回补空 `reasoning_content` key。
 - `core/llm.py:_stream_chunks_with_idle_notice`：流式 chunk 由守护线程 pump、主线程带超时读队列，
   流中段 stalled 超阈值按间隔上报等待状态（此前首 chunk 后最长静默一整个请求超时）。

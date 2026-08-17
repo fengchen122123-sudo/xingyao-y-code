@@ -196,9 +196,9 @@ def _acquire_single_instance() -> bool:
 
     关键改进（2026-08-14）：当已有实例但找不到主窗口时（前一个实例卡在
     加载页/webview.start() 尚未创建窗口句柄，或被用户从托盘退出但进程未
-    完全退出），不再静默退出，而是弹窗告知用户"已有实例正在运行/正在启动中"，
-    并等待 3 秒后重试激活（覆盖前一个实例正在退出但尚未释放互斥锁的短暂
-    窗口期），仍找不到才退出。
+    完全退出），不立即弹窗，而是循环等待最长 20 秒：窗口出现则唤起退出；
+    互斥锁被旧实例释放则本实例接管启动；超时仍无窗口才弹窗提示，避免
+    "托盘退出后立刻双击图标"被误报为已有实例卡住。
 
     验证思路：连续双击快捷方式两次，第二次应唤起已有窗口；若前一个实例卡死
     在加载页，第二次双击会弹窗提示而不是静默消失；任务管理器只应出现一个
@@ -261,20 +261,33 @@ def _acquire_single_instance() -> bool:
         logger.info("检测到已有实例，已唤起其主窗口，本实例退出")
         return True
 
-    # 已有实例但窗口未创建（前一个实例可能正卡在 webview.start() 前，或正在退出中）：
-    # 等 3 秒重试一次，覆盖前一个实例正在关闭/启动窗口的短暂窗口期
-    logger.warning("检测到已有实例但主窗口未创建，等待 3s 后重试激活...")
-    time.sleep(3)
-    hwnd = _find_instance_hwnd()
-    if hwnd:
-        user32.ShowWindow(hwnd, 9)
-        user32.SetForegroundWindow(hwnd)
-        logger.info("检测到已有实例（重试成功），已唤起其主窗口，本实例退出")
-        return True
+    # 已有实例但窗口未创建，两种正常过渡场景：
+    # 1. 用户刚从托盘退出：窗口已销毁，但旧进程的 shutdown（回合线程 drain、
+    #    子代理 join 各最长 5s）尚未走完，互斥锁还没释放；
+    # 2. 前一个实例正在启动：已抢到互斥锁，但 webview 窗口还没创建出来。
+    # 这两种场景下弹窗都会误导用户（2026-08-14 用户从托盘退出后立即双击图标
+    # 就触发了误报弹窗）。改为循环等待：窗口出现则唤起退出；互斥锁被旧实例
+    # 释放（WaitForSingleObject 立即获得所有权）则本实例接管启动。
+    logger.warning("检测到已有实例但主窗口未创建，等待窗口出现或旧实例退出...")
+    WAIT_OBJECT_0 = 0
+    WAIT_ABANDONED = 0x80  # 旧进程异常终止未释放互斥体，视为已获得所有权
+    deadline = time.time() + 20
+    while time.time() < deadline:
+        hwnd = _find_instance_hwnd()
+        if hwnd:
+            user32.ShowWindow(hwnd, 9)
+            user32.SetForegroundWindow(hwnd)
+            logger.info("检测到已有实例（等待后窗口已创建），已唤起其主窗口，本实例退出")
+            return True
+        # 旧实例是否已退出：尝试立即获取互斥体所有权
+        wait_result = kernel32.WaitForSingleObject(mutex, 0)
+        if wait_result in (WAIT_OBJECT_0, WAIT_ABANDONED):
+            logger.info("旧实例已退出并释放互斥锁，本实例接管启动")
+            return False  # 互斥体所有权已归本进程，作为首个实例继续启动
+        time.sleep(0.5)
 
-    # 重试后仍找不到：前一个实例很可能卡在加载页或正在退出。
+    # 20 秒后窗口仍未出现且互斥锁未释放：前一个实例很可能卡在加载页。
     # 弹窗提示用户，不要静默退出（避免用户以为"双击没反应"）。
-    # 注意：这是兜底路径，正常情况不会走到——按 PID 枚举比 FindWindowW 可靠得多。
     logger.warning("检测到已有实例但主窗口始终未创建，弹窗提示用户")
     user32.MessageBoxW(
         0,
