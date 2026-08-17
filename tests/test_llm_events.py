@@ -1280,6 +1280,94 @@ def test_stalled_plan_after_repeated_failures_allows_direct_fix(mocker):
     bind_default_plan_session(previous_session)
 
 
+def test_cleared_plan_turn_releases_tool_gate(mocker):
+    """回归：计划在同一回合内被清空后，执行工具门禁必须解除。
+
+    plan_write 成功会把回合标记为计划回合；若模型随后清空计划（snapshot 为空），
+    门禁不能再以“必须通过 run_subagent(plan_item_id=...)”拦截主 Agent，
+    否则没有计划项可提供 plan_item_id，主 Agent 被锁死（GUI 实测死锁）。
+    """
+    from core.plan import bind_default_plan_session, get_default_plan_manager
+    import core.llm as llm
+
+    plan = get_default_plan_manager()
+    previous_session = plan.session_id
+    bind_default_plan_session("cleared-plan-gate-test")
+    plan.replace([])
+    llm._mark_plan_turn("turn-cleared-gate")
+    mocker.patch("core.llm.check_permission_and_ask", return_value=True)
+    execute = mocker.patch.object(
+        llm.tool_registry, "execute", return_value=mocker.Mock(
+            to_message_content=lambda: "执行成功"
+        )
+    )
+    try:
+        result = llm._execute_single_tool_call(
+            {
+                "id": "exec-direct",
+                "function": {
+                    "name": "execute_command",
+                    "arguments": '{"command": "echo hi"}',
+                },
+            },
+            event_callback=lambda *args, **kwargs: None,
+            parent_session="cleared-plan-gate-test",
+            parent_turn_id="turn-cleared-gate",
+        )
+
+        assert "必须通过 run_subagent" not in result["content"]
+        execute.assert_called_once()
+    finally:
+        bind_default_plan_session(previous_session)
+
+
+def test_plan_retry_repeat_calls_are_not_suppressed(mocker):
+    """回归：plan_retry 等计划状态机工具不受重复调用抑制。
+
+    plan_retry 的设计流程是“首次返回根因分析提示、再次调用强制重置”；
+    若被 _RepeatCallGuard 以“相同调用已成功 2 次”拦截，调度器会把计划项
+    锁死在 failed 态（run_subagent 要求先 plan_retry，plan_retry 又被守卫拦）。
+    """
+    from core.plan import bind_default_plan_session, get_default_plan_manager
+    import core.llm as llm
+
+    plan = get_default_plan_manager()
+    previous_session = plan.session_id
+    bind_default_plan_session("plan-retry-repeat-guard-test")
+    plan.replace([{"id": "t1", "subject": "任务"}])
+    mocker.patch("core.llm.check_permission_and_ask", return_value=True)
+    execute = mocker.patch.object(
+        llm.tool_registry, "execute",
+        return_value=mocker.Mock(to_message_content=lambda: "计划项已重置为 pending。"),
+    )
+    responses = [
+        iter([_chunk(tool_calls=[
+            _tool_call(0, f"retry-{i}", "plan_retry", '{"item_id":"t1"}')
+        ])])
+        for i in range(3)
+    ]
+    responses.append(iter([_chunk("完成")]))
+    mocker.patch("core.llm.completion", side_effect=responses)
+    messages = [{"role": "user", "content": "重试计划项"}]
+    try:
+        list(chat_with_model_events(
+            "fake-model",
+            "fake-key",
+            messages,
+            persist=False,
+            turn_id="turn-plan-retry-repeat",
+            parent_session="plan-retry-repeat-guard-test",
+            parent_turn_id="turn-plan-retry-repeat",
+            consume_background_notifications=False,
+        ))
+    finally:
+        bind_default_plan_session(previous_session)
+
+    assert execute.call_count == 3
+    tool_msgs = [m for m in messages if m.get("role") == "tool"]
+    assert all("🛑" not in m["content"] for m in tool_msgs)
+
+
 def test_unparseable_tool_arguments_return_error_without_executing():
     """当 tool_call arguments 是完全无法解析的畸形 JSON 时，应直接返回解析错误，
     而不是用空参数继续执行工具。"""

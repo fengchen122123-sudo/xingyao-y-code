@@ -129,16 +129,32 @@ def _app_install_dir() -> str:
 
 
 def _sanitize_for_ui(text: str, api_key: Optional[str] = None) -> str:
-    """将可能包含 API key 的错误文本脱敏后再输出到 UI。"""
+    """将可能包含 API key 的错误文本脱敏后再输出到 UI。
+
+    长度封顶（2026-08-14）：provider/网关异常文本可能携带完整请求体（整个
+    messages 数组），不截断直接推给前端会把聊天区变成一屏原始 JSON 文本墙
+    并压垮渲染进程。截断保留头尾。
+    """
     if not isinstance(text, str):
         text = str(text)
+    # 先粗截断再做正则：URL userinfo 正则对超长无空白文本是 O(n²) 灾难性回溯，
+    # 必须先限制参与匹配的长度（最终 UI 上限 2000，头尾各一段覆盖足够）
+    if len(text) > 10000:
+        text = text[:6000] + "\n…[错误文本过长，中段已截断]…\n" + text[-3000:]
     if api_key and len(api_key) >= 4 and api_key in text:
         text = text.replace(api_key, "***")
     text = re.sub(r"(?i)\bBearer\s+[^\s,;]+", "Bearer ***", text)
     text = re.sub(r"(?i)(\b(?:api[_-]?key|token|secret|password|passwd|auth)\s*[=:]\s*)[^\s,;]+", r"\1***", text)
-    text = re.sub(r"(?i)([a-z][a-z0-9+.-]*://[^\s/:@]+:)[^\s/@]+(@)", r"\1***\2", text)
+    # 各段加上界，避免病态输入下的回溯爆炸
+    text = re.sub(r"(?i)([a-z][a-z0-9+.-]{0,30}://[^\s/:@]{1,200}:)[^\s/@]{1,300}(@)", r"\1***\2", text)
     text = re.sub(r"\b(?:sk|pk|ghp|glpat)-[A-Za-z0-9_.-]{8,}\b", "***", text)
+    if len(text) > _MAX_UI_ERROR_TEXT_LEN:
+        text = text[:1200] + "\n…[错误文本过长，中段已截断]…\n" + text[-500:]
     return text
+
+
+# 错误文本入 UI 的长度上限（与 core/llm._sanitize_error_text 双保险）
+_MAX_UI_ERROR_TEXT_LEN = 2000
 
 
 def _path_is_within(path: str, root: str) -> bool:
