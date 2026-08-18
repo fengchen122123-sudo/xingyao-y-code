@@ -105,6 +105,8 @@ _BG_SUMMARY_PROMPT = (
 )
 # 内部汇总回合在前端展示的系统提示文案（代替把上面的指令原文渲染成用户气泡）
 _BG_SUMMARY_DISPLAY_TEXT = "📦 所有后台子代理任务已结束，正在自动汇总结果…"
+# 后台命令任务完成后的自动总结回合提示文案
+_BG_COMMAND_SUMMARY_DISPLAY_TEXT = "📦 后台任务已完成，正在总结结果…"
 
 
 def _resolve_real_path(path: str) -> str:
@@ -1773,7 +1775,11 @@ class ApiBridge:
             turn_start_data["display_text"] = display_text
         if internal_kind:
             turn_start_data["internal"] = internal_kind
-            turn_start_data["display_text"] = _BG_SUMMARY_DISPLAY_TEXT
+            turn_start_data["display_text"] = (
+                _BG_COMMAND_SUMMARY_DISPLAY_TEXT
+                if internal_kind == "bg_command_summary"
+                else _BG_SUMMARY_DISPLAY_TEXT
+            )
         self.emit_event("turn_start", turn_start_data)
 
         try:
@@ -1812,7 +1818,13 @@ class ApiBridge:
             self._memory.ensure_session(session_name, workdir=turn_workdir, source="GUI")
             try:
                 from core.input_parser import parse_user_input
-                parsed_content, attached_msgs = parse_user_input(user_text)
+                if internal_kind:
+                    # 内部回合（后台汇总/命令总结）：prompt 是系统构造的，不需要
+                    # @文件 / 路径挂载；跳过 parse_user_input，避免把日志里的
+                    # 盘符路径（如 dist\Y-code-1.2.2.exe）误当成附件挂载
+                    parsed_content, attached_msgs = user_text, []
+                else:
+                    parsed_content, attached_msgs = parse_user_input(user_text)
             except Exception:
                 logger.debug("解析用户输入失败，退回纯文本", exc_info=True)
                 parsed_content, attached_msgs = user_text, []
@@ -1944,8 +1956,9 @@ class ApiBridge:
                     name="gui-bg-summary-recheck",
                 ).start()
 
-    def _on_background_task_finished(self, task_id: str, command: str, returncode: int) -> None:
-        """后台命令任务完成通知（监听线程触发）：向前端推送完成/失败事件。
+    def _on_background_task_finished(self, task_id: str, command: str, returncode: int,
+                                     session_id: str = "", log_tail: str = "") -> None:
+        """后台命令任务完成通知（监听线程触发）：推送通知并触发 LLM 简短总结。
 
         与 _on_background_subagent_terminal 的区别：后者是子代理后台任务，
         本方法是 execute_command 的 run_in_background 后台命令（如打包）。
@@ -1961,6 +1974,51 @@ class ApiBridge:
             })
         except Exception:
             logger.debug("推送后台命令任务完成通知失败", exc_info=True)
+
+        # 有会话归属时，自动发起一轮简短总结回合（LLM 总结命令结果）
+        if session_id:
+            threading.Thread(
+                target=self._start_bg_command_summary,
+                args=(session_id, command, returncode, log_tail),
+                daemon=True,
+                name="gui-bg-command-summary",
+            ).start()
+
+    def _start_bg_command_summary(self, session: str, command: str,
+                                  returncode: int, log_tail: str) -> None:
+        """后台命令任务完成后，自动发起一轮 LLM 简短总结回合。"""
+        try:
+            time.sleep(0.5)
+            if self._shutting_down or not session:
+                return
+            if session in getattr(self, "_user_cancelled_sessions", ()):
+                return
+            # 该会话正在运行回合时不并发起新回合，直接放弃（避免打断用户当前对话）
+            with self._turn_start_lock:
+                if self._is_turn_active(session):
+                    return
+            from core.command_policy import redact_sensitive_text
+            cmd = redact_sensitive_text(command or "")
+            tail = (log_tail or "").strip()[-1500:]
+            prompt = (
+                "有一个后台命令任务执行完毕，请用一句话简短总结它的结果"
+                "（成功/失败 + 关键信息，不要复述命令本身）。\n"
+                f"命令: {cmd}\n"
+                f"退出码: {int(returncode or 0)}（0=成功，非0=失败）\n"
+                f"日志尾部:\n{tail or '(无输出)'}\n"
+            )
+            cancel_event = threading.Event()
+            self._cancel_events[session] = cancel_event
+            worker = threading.Thread(
+                target=self._run_turn_worker_serialized,
+                args=(prompt, session, "bg_command_summary"),
+                daemon=True,
+                name=f"gui-bg-command-summary-{session}",
+            )
+            self._active_turns[session] = worker
+            worker.start()
+        except Exception:
+            logger.debug("后台命令任务总结回合触发失败", exc_info=True)
 
     def _on_background_subagent_terminal(self, task_id: str, status: str, description: str, summary: str) -> None:
         """后台子代理终态实时通知（worker 线程触发，与 TUI 同源的 GUI 版本）。
@@ -3305,7 +3363,6 @@ class ApiBridge:
                             "api_key": provider.get("api_key") or "",
                             "api_base": provider.get("base_url") or None,
                             "messages": [{"role": "user", "content": "ping"}],
-                            "tools": [],
                             "stream": True,
                             "max_tokens": 1,
                             "num_retries": 0,

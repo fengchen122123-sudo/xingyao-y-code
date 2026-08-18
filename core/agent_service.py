@@ -20,7 +20,7 @@ import os
 import threading
 from typing import Any, Callable, Optional
 
-from core.context_builder import TIME_NOTE_PREFIX
+from core.context_builder import DYNAMIC_CONTEXT_PREFIX, TIME_NOTE_PREFIX
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +58,8 @@ _GENERAL_CODING_STANDARDS = """【通用编码规范】
 
 # 后台子代理结果注入时，单条结果的最大长度
 _BG_RESULT_MAX_CHARS = 1500
+
+_BG_SUMMARY_PREFIX = "📦 后台子代理任务结果汇总"
 
 # MCP schema 预热标记：进程内只尝试一次
 _MCP_WARMUP_STARTED = False
@@ -252,93 +254,66 @@ def build_runtime_context(model_name: str, permission_mode: str):
     )
 
 
-def _insert_before_last_user(history: list, message: dict) -> None:
-    """把 system 消息插到最后一条 user 消息之前；没有 user 结尾则直接追加。"""
-    if history and history[-1].get("role") == "user":
-        history.insert(len(history) - 1, message)
-    else:
-        history.append(message)
+def _drop_legacy_context_systems(history: list) -> list:
+    """丢弃历史中所有 role=system 的消息（旧格式遗留的上下文块）。
 
-
-def _drop_legacy_leading_systems(history: list) -> list:
-    """丢弃首个 user 消息之前的 system 消息（历史遗留的稳定提示词）。
-
-    稳定提示词每轮重新组装插入到 position 0，不持久化；append-only 持久化的
-    上下文块（动态块/时间注记/后台汇总）按设计都位于某条 user 消息之后，
-    不受本清理影响。
+    动态运行上下文 / 时间注记 / 后台汇总这些上下文块曾经以 system 角色
+    独立持久化，现已改为内联到 user 消息；历史里残留的 system 块应整体丢弃，
+    否则会把 system 消息留在 user 之后，违反 provider 的
+    「system 必须在数组开头」约束。
     """
-    cleaned = []
-    seen_user = False
-    for msg in history:
-        if msg.get("role") == "system" and not seen_user:
-            continue
-        cleaned.append(msg)
-        if msg.get("role") == "user":
-            seen_user = True
-    return cleaned
+    return [m for m in history if m.get("role") != "system"]
 
 
-def _reposition_context_blocks(history: list) -> list:
-    """把持久化的上下文块在内存中前移回对应 user 消息之前。
+def _strip_context_suffix(content):
+    """移除 user 消息内容末尾内联的上下文后缀（动态块 / 后台汇总 / 时间注记）。
 
-    持久化时上下文块按自然追加顺序落在当轮 user 消息之后（DB: [user][块]）；
-    发给模型时在内存中还原为 [块][user]，与当轮新注入的块位置约定一致。
-    该重排每轮确定性执行，保证跨轮请求的 prefix 字节级连续（缓存命中关键）。
-    """
-    out: list = []
-    for msg in history:
-        if msg.get("role") != "system" or not out:
-            out.append(msg)
-            continue
-        for i in range(len(out) - 1, -1, -1):
-            if out[i].get("role") == "user":
-                out.insert(i, msg)
-                break
-        else:
-            out.append(msg)
-    return out
-
-
-def _persist_context_block(manager, session_name: str, content: str) -> None:
-    """把上下文块以 system 角色持久化到会话历史（append-only，永不删除）。
-
-    落库失败只记录日志：下一轮会基于 DB 内容重新注入，不影响本轮请求。
-    """
-    try:
-        manager.add_message(session_name, "system", content)
-    except Exception:
-        logger.warning("上下文块持久化失败，下一轮将重新注入", exc_info=True)
-
-
-def _strip_time_note_from_content(content):
-    """从 user 消息内容末尾移除上一轮追加的时间注记。
-
-    时间注记格式为 ``\\n\\n【当前时间】YYYY-MM-DD HH:MM:SS``，
-    可能被上一次 CAS 写入也可能被旧的 role=system 持久化方式留下。
+    上下文后缀按固定顺序追加：动态块 → 后台汇总 → 时间注记。此处反向剥离，
+    直到末尾不再有可识别的上下文块标记为止，避免重入/重试时重复堆积。
     """
     text = content
     if not isinstance(text, str):
         return text
-    marker = "\n\n" + TIME_NOTE_PREFIX
-    idx = text.rfind(marker)
-    if idx != -1 and text[idx + len(marker):].strip():
-        # 仅在时间注记位于末尾时才移除
-        suffix = text[idx + len(marker):]
-        if len(suffix) <= 25:  # YYYY-MM-DD HH:MM:SS = 19 字符，留余量
+    changed = True
+    while changed:
+        changed = False
+        # 时间注记在最后（格式：YYYY-MM-DD HH:MM:SS，19 字符，留余量）
+        marker = "\n\n" + TIME_NOTE_PREFIX
+        idx = text.rfind(marker)
+        if idx != -1:
+            suffix = text[idx + len(marker):].strip()
+            if suffix and len(suffix) <= 25 and "\n" not in suffix:
+                text = text[:idx]
+                changed = True
+                continue
+        # 后台汇总块
+        marker = "\n\n" + _BG_SUMMARY_PREFIX
+        idx = text.rfind(marker)
+        if idx != -1:
             text = text[:idx]
+            changed = True
+            continue
+        # 动态运行上下文块
+        marker = "\n\n" + DYNAMIC_CONTEXT_PREFIX
+        idx = text.rfind(marker)
+        if idx != -1:
+            text = text[:idx]
+            changed = True
+            continue
     return text
 
 
-def _append_time_note_to_last_user(history, time_note, manager, session_name):
-    """把时间注记内联到最后一条 user 消息 content 末尾并 CAS 持久化。
+def _append_context_suffix_to_last_user(
+    history, dynamic_prompt, summary_msg, time_note, manager, session_name
+):
+    """把动态运行上下文 + 后台汇总 + 时间注记内联到最后一条 user 消息末尾并 CAS 持久化。
 
-    时间注记不再作为独立 role=system 消息持久化（那样会使 system_sha256
-    每轮变化，打断 provider 侧前缀缓存）。改为追加到当前轮 user 消息
-    content 末尾，通过 CAS 写回 DB。
+    上下文块不再作为独立 role=system 消息持久化（那会把 system 消息留到
+    user 之后，违反 provider 的「system 必须在开头」约束）。改为内联到
+    user 消息 content 末尾，messages 数组里只保留首位的稳定 system 提示词。
     """
     if not history:
         return
-    # 找到最后一条 user 消息
     last_user_idx = None
     for i in range(len(history) - 1, -1, -1):
         if history[i].get("role") == "user":
@@ -348,19 +323,20 @@ def _append_time_note_to_last_user(history, time_note, manager, session_name):
         return
     original_content = history[last_user_idx].get("content", "")
     if not isinstance(original_content, str):
-        # 非文本 content（如媒体消息），跳过时间注记注入
+        # 非文本 content（如媒体消息），跳过上下文内联
         return
-    # 移除上一轮可能遗留的时间注记，避免重复堆积
-    cleaned = _strip_time_note_from_content(original_content)
-    new_content = cleaned + "\n\n" + time_note
+    cleaned = _strip_context_suffix(original_content)
+    suffix_parts = [p for p in (dynamic_prompt, summary_msg, time_note) if p]
+    if not suffix_parts:
+        return
+    new_content = cleaned + "\n\n" + "\n\n".join(suffix_parts)
     history[last_user_idx]["content"] = new_content
-    # CAS 持久化：把修改写回 DB（期望旧值 = 原始 content）
     try:
         manager.replace_latest_user_message_content(
             session_name, original_content, new_content
         )
     except Exception:
-        logger.warning("时间注记 CAS 持久化失败，仅影响内存副本", exc_info=True)
+        logger.warning("上下文后缀 CAS 持久化失败，仅影响内存副本", exc_info=True)
 
 
 def build_background_task_summary(session_name: str) -> str:
@@ -480,7 +456,6 @@ def prepare_turn_messages(
 
     # 只在这一层组装一个稳定提示词和一份当前运行上下文。
     from core.context_builder import (
-        DYNAMIC_CONTEXT_PREFIX,
         build_dynamic_prompt,
         build_time_note,
     )
@@ -558,50 +533,26 @@ def prepare_turn_messages(
         session_token_usage["latest_total"] = estimated_tokens
 
     # 只在这一层组装当轮的运行上下文（稳定提示词已在估算前组装）。
-    # 1) 清理 legacy 首部 system（稳定提示词每轮现组）；持久化的上下文块保留
-    history = _drop_legacy_leading_systems(history)
-    # 2) 持久化的上下文块（DB 中位于当轮 user 之后）前移回 user 之前，
-    #    每轮确定性重排，保证跨轮请求 prefix 字节级连续
-    history = _reposition_context_blocks(history)
+    # 1) 丢弃历史遗留的所有 system 上下文块（旧格式）：动态块/时间注记/后台汇总
+    #    现已内联到 user 消息，稳定提示词每轮现组插到首位，历史里不应再有 system 块
+    history = _drop_legacy_context_systems(history)
 
     runtime = build_runtime_context(model_name, permission_mode)
     dynamic_prompt = build_dynamic_prompt(runtime)
     history.insert(0, system_message)
 
-    # 3) 动态运行上下文块：内容不变则沿用历史中已持久化的那份（不重注、不删除），
-    #    变化时才追加新块并持久化——append-only 是跨轮缓存命中的关键
-    latest_dynamic = next(
-        (
-            str(m.get("content") or "")
-            for m in reversed(history)
-            if m.get("role") == "system"
-            and str(m.get("content") or "").startswith(DYNAMIC_CONTEXT_PREFIX)
-        ),
-        None,
-    )
-    if dynamic_prompt != latest_dynamic:
-        _insert_before_last_user(history, {"role": "system", "content": dynamic_prompt})
-        _persist_context_block(manager, session_name, dynamic_prompt)
-
-    # 4) 时间注记：追加到最后一条 user 消息内容末尾并持久化。
-    #    以前时间注记是独立 role=system 消息，每轮新增一条会导致 system_sha256
-    #    变化，使 provider 侧前缀缓存从 system 块开始整体失效（实测命中率
-    #    从 ~99% 跌至 0-4%，多消耗数百万 tokens）。改为内联到 user 消息后，
-    #    system_messages 数组跨轮稳定，前缀缓存可覆盖整个对话历史。
+    # 2) 动态运行上下文块 + 后台汇总 + 时间注记统一内联到最后一条 user 消息末尾。
+    #    以前动态块/汇总块是独立 role=system 消息插到 user 之前，多轮对话里会落到
+    #    历史中间（前面的 user 之后），违反 provider 的「system 必须在开头」约束。
     time_note = build_time_note(runtime)
-    _append_time_note_to_last_user(history, time_note, manager, session_name)
-
-    # 主代理汇总/兜底机制：提取本会话中所有终态（成功+失败）且尚未消费的后台子代理任务，
-    # 注入到 history 中作为 system 消息，让主代理能汇总成功结果并用自身工具接手失败任务。
     try:
         summary_msg = build_background_task_summary(session_name)
-        if summary_msg:
-            # 与其他上下文块同样 append-only：注入一次后持久化保留
-            _insert_before_last_user(history, {"role": "system", "content": summary_msg})
-            _persist_context_block(manager, session_name, summary_msg)
     except Exception:
-        # 汇总机制失败不能影响主流程，但必须留诊断痕迹（裸吞会让注入失效不可排查）
         logger.warning("后台子代理汇总注入失败，已跳过本轮汇总", exc_info=True)
+        summary_msg = ""
+    _append_context_suffix_to_last_user(
+        history, dynamic_prompt, summary_msg, time_note, manager, session_name
+    )
 
     return history
 

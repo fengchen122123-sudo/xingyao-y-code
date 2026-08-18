@@ -590,7 +590,15 @@ def execute_command(
     if run_in_background:
         from core.task_manager import start_background_task
         try:
-            task_id = start_background_task(command)
+            # 记录父会话，任务完成回调据此触发 LLM 简短总结
+            session_id = _tool_cache.get_current_session() or ""
+            if not session_id:
+                try:
+                    import core.app_context as app_context
+                    session_id = app_context.get_current_session() or ""
+                except Exception:
+                    session_id = ""
+            task_id = start_background_task(command, session_id=session_id)
             return (
                 f"✔ 异步后台任务已成功启动！\n"
                 f"任务 ID: {task_id}\n"

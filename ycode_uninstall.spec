@@ -29,7 +29,7 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name='ycode_uninstall',
+    name='Y-code-uninstall',
     icon='assets/ycode.ico',
     debug=False,
     bootloader_ignore_signals=False,
