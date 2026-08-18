@@ -1192,6 +1192,9 @@ class ApiBridge:
             target_workdir = workdir or _resolve_real_path(os.getcwd())
             self._memory.create_session_explicit(new_name, workdir=target_workdir, source="GUI")
             self._set_current_session(new_name)
+            # 全局 session_token_usage 不按会话隔离，旧会话的 latest_total 会
+            # 残留到新会话；新建后立即按空历史重算为 0，避免窗口占比虚高
+            self._recalc_token_usage(new_name)
             return {
                 "ok": True,
                 "session_name": new_name,
@@ -1209,6 +1212,8 @@ class ApiBridge:
             new_name = f"session_{uuid.uuid4().hex[:6]}"
             self._memory.create_session_explicit(new_name, workdir="GLOBAL", source="GUI")
             self._set_current_session(new_name)
+            # 同 create_session：清掉旧会话残留在全局 latest_total 的窗口占用
+            self._recalc_token_usage(new_name)
             return {
                 "ok": True,
                 "session_name": new_name,
@@ -1367,6 +1372,10 @@ class ApiBridge:
 
             set_active_model(str(model_id))
             self._sync_active_model_context()
+            # 切模型后 window 立即变为新模型的 context_window，但全局
+            # latest_total 还是旧值（可能属于别的会话），必须先按当前会话
+            # 历史重算 used，否则前端会算出 600K/256K=243% 这类虚假占比
+            self._recalc_token_usage(self._current_session)
             self._emit_token_usage()
             return {
                 "ok": True,
