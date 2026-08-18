@@ -194,11 +194,11 @@ def step1_build_core(pyinstaller_bin, project_dir):
 # ============================================================================
 
 def step2_build_uninstaller(pyinstaller_bin, project_dir):
-    print("\n[步骤 2/5] 正在编译卸载程序 ycode_uninstall.exe...")
+    print("\n[步骤 2/5] 正在编译卸载程序 Y-code-uninstall.exe...")
     cmd = [pyinstaller_bin, "--clean", "--noconfirm", "ycode_uninstall.spec"]
     run_checked(cmd, "卸载程序编译")
 
-    uninstall_exe = os.path.join(project_dir, "dist", "ycode_uninstall.exe")
+    uninstall_exe = os.path.join(project_dir, "dist", "Y-code-uninstall.exe")
     if not os.path.exists(uninstall_exe):
         print(f"❌ 未找到预期产物: {uninstall_exe}")
         sys.exit(1)
@@ -334,7 +334,15 @@ def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_
 # ============================================================================
 
 def versioned_setup_name(base, version):
-    """安装包最终分发文件名（不含扩展名）：ycode_setup_v1.1.48 样式。"""
+    """安装包最终分发文件名（不含扩展名）。
+
+    主安装包用 Y-code-{version}（如 Y-code-1.2.2），CLI 独立安装包用
+    Y-code-cli-{version}。
+    """
+    if base == "ycode_setup":
+        return f"Y-code-{version}"
+    if base == "ycode_tui_setup":
+        return f"Y-code-cli-{version}"
     return f"{base}_v{version}"
 
 
@@ -355,6 +363,15 @@ def step4b_rename_setups(project_dir, version, tui_only):
         # 清理历史版本留下的同名旧产物，避免 dist/ 里堆叠多个版本难以分辨
         for old in glob.glob(os.path.join(project_dir, "dist", f"{base}_v*.exe")):
             os.remove(old)
+        if base == "ycode_setup":
+            # 主安装包新命名 Y-code-{版本}.exe 也清理旧版本残留；
+            # 用 [0-9] 前缀精确匹配，避免误删 Y-code-cli-*.exe（CLI 安装包）
+            for old in glob.glob(os.path.join(project_dir, "dist", "Y-code-[0-9]*.exe")):
+                os.remove(old)
+        if base == "ycode_tui_setup":
+            # CLI 安装包新命名 Y-code-cli-*.exe 也清理旧版本残留
+            for old in glob.glob(os.path.join(project_dir, "dist", "Y-code-cli-*.exe")):
+                os.remove(old)
         dst = os.path.join(project_dir, "dist", f"{versioned_setup_name(base, version)}.exe")
         os.replace(src, dst)
         renamed[base] = dst
@@ -371,7 +388,7 @@ def step5_summary(project_dir, tui_only, version):
     rows = [
         (os.path.join("dist", "ycode", "Y-code.exe"), "GUI 主程序 (窗口版)"),
         (os.path.join("dist", "ycode", "ycode.exe"), "TUI 主程序 (控制台版)"),
-        (os.path.join("dist", "ycode_uninstall.exe"), "卸载程序"),
+        (os.path.join("dist", "Y-code-uninstall.exe"), "卸载程序"),
         (os.path.join("dist", f"{versioned_setup_name('ycode_tui_setup', version)}.exe"), "TUI 独立安装包"),
     ]
     if not tui_only:
@@ -421,7 +438,7 @@ def build():
     if args.setup_only:
         # 快速通道：核心载荷与卸载程序未变，直接复用现有产物，只重新编译安装向导。
         ycode_dir = os.path.join(project_dir, "dist", "ycode")
-        uninstall_exe = os.path.join(project_dir, "dist", "ycode_uninstall.exe")
+        uninstall_exe = os.path.join(project_dir, "dist", "Y-code-uninstall.exe")
         if not os.path.isdir(ycode_dir):
             print(f"❌ --setup-only 需要现有核心载荷目录: {ycode_dir}（请先完整构建一次）。")
             sys.exit(1)

@@ -235,6 +235,18 @@ def detect_previous_install():
                     return scope, os.path.normpath(location)
         except OSError:
             continue
+
+    # 回退：注册表读不到（如残留清理、手动删除、跨版本迁移）时，扫描常见安装
+    # 目录。目录存在且含 Y-code.exe 即视为已安装，更新时自动填充路径，无需重选。
+    candidates = [
+        ("user", default_install_dir("user")),
+        ("machine", default_install_dir("machine")),
+    ]
+    if os.environ.get("ProgramFiles(x86)"):
+        candidates.append(("machine", os.path.join(os.environ["ProgramFiles(x86)"], "Y-code")))
+    for scope, dir_path in candidates:
+        if os.path.isdir(dir_path) and os.path.isfile(os.path.join(dir_path, "Y-code.exe")):
+            return scope, os.path.normpath(dir_path)
     return None, None
 
 
@@ -446,7 +458,7 @@ def _ensure_no_reparse_components(install_dir, destination):
 
 def _is_unrecognized_non_empty_dir(install_dir):
     """修复 M47：目标目录已存在、非空、且不含任何可识别的 Y-code 安装痕迹
-    （Y-code.exe / ycode.exe / ycode_uninstall.exe / _internal）时返回 True。
+    （Y-code.exe / ycode.exe / Y-code-uninstall.exe / _internal）时返回 True。
     这类目录多半是用户的既有目录，装入后卸载有误删风险，需显式警告。"""
     if not os.path.isdir(install_dir):
         return False
@@ -457,7 +469,7 @@ def _is_unrecognized_non_empty_dir(install_dir):
         return False
     return not any(
         os.path.exists(os.path.join(install_dir, marker))
-        for marker in ("Y-code.exe", "ycode.exe", "ycode_uninstall.exe", "_internal")
+        for marker in ("Y-code.exe", "ycode.exe", "Y-code-uninstall.exe", "_internal")
     )
 
 
@@ -558,6 +570,64 @@ def _write_install_manifest(install_dir, names):
         f.write("\n".join(name.replace("\\", "/") for name in names) + "\n")
 
 
+# 文件被占用时的"重启后替换"标记（保证更新时旧版正在运行也能成功替换）
+_MOVEFILE_REPLACE_EXISTING = 0x1
+_MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
+
+
+def _schedule_reboot_replace(tmp_src, dest):
+    """用 MoveFileEx 标记临时文件在重启后替换到 dest（目标被占用时）。"""
+    import ctypes
+    ok = ctypes.windll.kernel32.MoveFileExW(
+        tmp_src, dest, _MOVEFILE_REPLACE_EXISTING | _MOVEFILE_DELAY_UNTIL_REBOOT)
+    if not ok:
+        raise ctypes.WinError()
+
+
+def _write_bytes_with_reboot_fallback(dest, data, log):
+    """写字节到 dest；目标被占用时回退到重启后替换。返回是否需要重启。"""
+    try:
+        with open(dest, "wb") as f:
+            f.write(data)
+        return False
+    except PermissionError:
+        tmp = dest + ".ycode-new"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(data)
+            _schedule_reboot_replace(tmp, dest)
+            log(f"⚠️ 文件被占用，已安排重启后替换: {os.path.basename(dest)}")
+            return True
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+
+def _copy_file_with_reboot_fallback(src, dest, log):
+    """复制文件到 dest；目标被占用时回退到重启后替换。返回是否需要重启。"""
+    try:
+        shutil.copy2(src, dest)
+        return False
+    except PermissionError:
+        tmp = dest + ".ycode-new"
+        try:
+            shutil.copy2(src, tmp)
+            _schedule_reboot_replace(tmp, dest)
+            log(f"⚠️ 文件被占用，已安排重启后替换: {os.path.basename(dest)}")
+            return True
+        except Exception:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+            raise
+
+
 def _copy_payload(kind, src, install_dir, tui_only, log, progress, manage_manifest=True):
     """带进度回调的载荷释放（占整体进度的 0~85%）。
 
@@ -577,6 +647,7 @@ def _copy_payload(kind, src, install_dir, tui_only, log, progress, manage_manife
     # 修复 M46：记录本次新创建的文件，中途失败时回滚删除，避免半成品残留
     # （已存在被覆盖的旧文件无法无损恢复，不在回滚范围内）。
     created = []
+    needs_reboot = False
     try:
         if kind == "zip":
             import zipfile
@@ -586,8 +657,8 @@ def _copy_payload(kind, src, install_dir, tui_only, log, progress, manage_manife
                     _ensure_no_reparse_components(install_dir, dest)
                     if not os.path.lexists(dest):
                         created.append(dest)
-                    with open(dest, "wb") as f:
-                        f.write(zf.read(rel))
+                    if _write_bytes_with_reboot_fallback(dest, zf.read(rel), log):
+                        needs_reboot = True
                     progress(idx / total * 85.0)
         else:
             for idx, (rel, dest) in enumerate(zip(names, destinations), 1):
@@ -595,7 +666,8 @@ def _copy_payload(kind, src, install_dir, tui_only, log, progress, manage_manife
                 _ensure_no_reparse_components(install_dir, dest)
                 if not os.path.lexists(dest):
                     created.append(dest)
-                shutil.copy2(os.path.join(src, rel), dest)
+                if _copy_file_with_reboot_fallback(os.path.join(src, rel), dest, log):
+                    needs_reboot = True
                 progress(idx / total * 85.0)
     except Exception:
         for path in created:
@@ -607,6 +679,8 @@ def _copy_payload(kind, src, install_dir, tui_only, log, progress, manage_manife
     if manage_manifest:
         _write_install_manifest(install_dir, names)
     log(f"✔ 核心程序包及依赖成功释放到: {install_dir}")
+    if needs_reboot:
+        log("⚠️ 部分文件因正在运行而延迟到系统重启后替换，重启后更新才会完全生效。")
 
 
 def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lambda p: None):
@@ -700,9 +774,9 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
         progress(93.0)
 
         # 4. 复制卸载程序
-        dest_uninst = os.path.join(install_dir, "ycode_uninstall.exe")
+        dest_uninst = os.path.join(install_dir, "Y-code-uninstall.exe")
         try:
-            src_uninst = os.path.join(bundle_dir, "ycode_uninstall.exe")
+            src_uninst = os.path.join(bundle_dir, "Y-code-uninstall.exe")
             if os.path.exists(src_uninst):
                 shutil.copy2(src_uninst, dest_uninst)
                 log(f"✔ 卸载程序成功复制到: {dest_uninst}")
@@ -758,8 +832,8 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
             log("ℹ 已合并进现有的完整版安装，沿用原有卸载入口，不再重复注册。")
         else:
             try:
-                dest_uninst = os.path.join(install_dir, "ycode_uninstall.exe")
-                src_uninst = os.path.join(bundle_dir, "ycode_uninstall.exe")
+                dest_uninst = os.path.join(install_dir, "Y-code-uninstall.exe")
+                src_uninst = os.path.join(bundle_dir, "Y-code-uninstall.exe")
                 if os.path.exists(src_uninst):
                     shutil.copy2(src_uninst, dest_uninst)
                     log(f"✔ 卸载程序成功复制到: {dest_uninst}")
@@ -793,18 +867,26 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
-WINDOW_W, WINDOW_H = 750, 540
-BANNER_H = 64
-COLOR_BANNER = "#ffffff"
-COLOR_CONTENT = "#f0f0f0"
-COLOR_TEXT = "#1a1a1a"
-COLOR_TEXT_DIM = "#5f5f5f"
-COLOR_SEP = "#d3d3d3"
+# 品牌色与尺寸（现代风格：左侧深色品牌栏 + 右侧白色内容区）
+ACCENT = "#4F6EF7"
+ACCENT_DARK = "#3A52C4"
+ACCENT_DISABLED = "#C7CDE0"
+SIDEBAR_BG = "#1F2937"
+SIDEBAR_TEXT = "#E5E7EB"
+COLOR_CONTENT = "#FFFFFF"
+COLOR_TEXT = "#1F2937"
+COLOR_TEXT_DIM = "#6B7280"
+COLOR_SEP = "#E5E7EB"
+WINDOW_W, WINDOW_H = 820, 520
+SIDEBAR_W = 200
 
-FONT_PAGE_TITLE = ("Microsoft YaHei UI", 11, "bold")
-FONT_PAGE_SUB = ("Microsoft YaHei UI", 9)
-FONT_TITLE = ("Microsoft YaHei UI", 18, "bold")
-FONT_TEXT = ("Microsoft YaHei UI", 9)
+FONT_PAGE_TITLE = ("Microsoft YaHei UI", 16, "bold")
+FONT_PAGE_SUB = ("Microsoft YaHei UI", 10)
+FONT_TITLE = ("Microsoft YaHei UI", 15, "bold")
+FONT_BRAND = ("Microsoft YaHei UI", 18, "bold")
+FONT_TEXT = ("Microsoft YaHei UI", 10)
+FONT_TEXT_BOLD = ("Microsoft YaHei UI", 10, "bold")
+FONT_DIM = ("Microsoft YaHei UI", 9)
 FONT_VERSION = ("Microsoft YaHei UI", 8)
 
 
@@ -833,11 +915,8 @@ class SetupWizard(tk.Tk):
         self.configure(bg=COLOR_CONTENT)
         self._center_window()
         self._set_icon()
-        # vista 主题：原生按钮/复选框/绿色进度条（经典安装程序观感的关键）
-        try:
-            ttk.Style(self).theme_use("vista")
-        except Exception:
-            pass
+        # 现代扁平化样式：clam 主题 + 品牌色按钮/进度条
+        self._setup_style()
         # Windows 上最小化再恢复后，Tk 会把窗口收缩成只剩标题栏（实测可复现，
         # <Map> 事件无法捕获该时序），用轻量看门狗定期把固定几何声明回去。
         self.after(500, self._geometry_watchdog)
@@ -862,8 +941,6 @@ class SetupWizard(tk.Tk):
                       ["welcome", "options", "installing", "finish"])
 
         self._build_chrome()
-        self._content = tk.Frame(self, bg=COLOR_CONTENT)
-        self._content.pack(fill="both", expand=True)
 
         self._pages = {}
         self._build_pages()
@@ -925,51 +1002,94 @@ class SetupWizard(tk.Tk):
 
     # ------------------------------------------------------------------
     # 三段式框架：横幅 + 底部按钮栏（内容区由调用方随后 pack）
+    def _setup_style(self):
+        """现代扁平化样式：clam 主题 + 品牌色按钮/进度条。"""
+        style = ttk.Style(self)
+        try:
+            style.theme_use("clam")
+        except Exception:
+            pass
+        style.configure("Brand.TButton", background=ACCENT, foreground="white",
+                        font=FONT_TEXT_BOLD, padding=(20, 8), borderwidth=0,
+                        focusthickness=0)
+        style.map("Brand.TButton",
+                  background=[("active", ACCENT_DARK), ("disabled", ACCENT_DISABLED)])
+        style.configure("Ghost.TButton", background=COLOR_CONTENT, foreground=COLOR_TEXT_DIM,
+                        font=FONT_TEXT, padding=(16, 8), borderwidth=0,
+                        focusthickness=0)
+        style.map("Ghost.TButton", background=[("active", "#F3F4F6")])
+        style.configure("Brand.Horizontal.TProgressbar", background=ACCENT,
+                        troughcolor=COLOR_SEP, borderwidth=0, thickness=14)
+
+    # ------------------------------------------------------------------
+    # 两栏式框架：左侧深色品牌栏 + 右侧白色内容区 + 底部按钮栏
     # ------------------------------------------------------------------
     def _build_chrome(self):
-        # 顶部白色横幅
-        banner = tk.Frame(self, bg=COLOR_BANNER, height=BANNER_H)
-        banner.pack(fill="x")
-        banner.pack_propagate(False)
-        self._banner_title = tk.Label(
-            banner, font=FONT_PAGE_TITLE, fg=COLOR_TEXT, bg=COLOR_BANNER, anchor="w")
-        self._banner_title.place(x=20, y=9)
-        self._banner_sub = tk.Label(
-            banner, font=FONT_PAGE_SUB, fg=COLOR_TEXT_DIM, bg=COLOR_BANNER, anchor="w")
-        self._banner_sub.place(x=22, y=37)
-        icon_path = os.path.join(self.bundle_dir, "assets", "ycode.png")
-        if os.path.exists(icon_path):
+        # 左侧深色品牌栏：文字在上、Logo 在下
+        sidebar = tk.Frame(self, bg=SIDEBAR_BG, width=SIDEBAR_W)
+        sidebar.pack(side="left", fill="y")
+        sidebar.pack_propagate(False)
+
+        tk.Label(sidebar, text="Y-code 星瑶", font=FONT_BRAND, fg=SIDEBAR_TEXT,
+                 bg=SIDEBAR_BG).pack(pady=(44, 0))
+        tk.Label(sidebar, text="AI 编程助手", font=FONT_DIM, fg="#9CA3AF",
+                 bg=SIDEBAR_BG).pack()
+
+        # Logo 放大居中（用 PIL 精确缩放到 168x168）
+        self._sidebar_logo = None
+        logo_path = os.path.join(self.bundle_dir, "assets", "ycode.png")
+        if os.path.exists(logo_path):
             try:
-                img = tk.PhotoImage(file=icon_path)
-                factor = max(1, round(max(img.width(), img.height()) / 40))
-                if factor > 1:
-                    img = img.subsample(factor, factor)
-                self._banner_icon = img  # 持有引用防 GC
-                tk.Label(banner, image=img, bg=COLOR_BANNER, bd=0).place(
-                    relx=1.0, x=-16, rely=0.5, anchor="e")
+                from PIL import Image, ImageTk
+                im = Image.open(logo_path)
+                im = im.resize((168, 168), Image.LANCZOS)
+                self._sidebar_logo = ImageTk.PhotoImage(im)
+                tk.Label(sidebar, image=self._sidebar_logo, bg=SIDEBAR_BG).pack(pady=(16, 0))
             except Exception:
                 pass
-        tk.Frame(self, bg=COLOR_SEP, height=1).pack(fill="x")
 
-        # 底部按钮栏（pack 顺序：先 bottom 后 content，保证内容区填满剩余空间）
-        bottom = tk.Frame(self, bg=COLOR_CONTENT, height=46)
+        tk.Label(sidebar, text=f"v{self.version}", font=FONT_VERSION, fg="#6B7280",
+                 bg=SIDEBAR_BG).pack(side="bottom", pady=40)
+
+        # 右侧白色内容区
+        self._content = tk.Frame(self, bg=COLOR_CONTENT)
+        self._content.pack(side="left", fill="both", expand=True)
+
+        # 页面标题区
+        title_bar = tk.Frame(self._content, bg=COLOR_CONTENT, height=88)
+        title_bar.pack(fill="x")
+        title_bar.pack_propagate(False)
+        self._banner_title = tk.Label(title_bar, text="", font=FONT_PAGE_TITLE,
+                                      fg=COLOR_TEXT, bg=COLOR_CONTENT, anchor="w")
+        self._banner_title.place(x=40, y=20)
+        self._banner_sub = tk.Label(title_bar, text="", font=FONT_PAGE_SUB,
+                                    fg=COLOR_TEXT_DIM, bg=COLOR_CONTENT, anchor="w")
+        self._banner_sub.place(x=40, y=52)
+        tk.Frame(self._content, bg=COLOR_SEP, height=1).pack(fill="x")
+
+        # 页面容器（标题栏和底部按钮之间的中间区域，页面在其中 place 切换）
+        self._page_area = tk.Frame(self._content, bg=COLOR_CONTENT)
+        self._page_area.pack(fill="both", expand=True)
+
+        # 底部按钮栏
+        bottom = tk.Frame(self._content, bg=COLOR_CONTENT, height=64)
         bottom.pack(side="bottom", fill="x")
         bottom.pack_propagate(False)
         tk.Frame(bottom, bg=COLOR_SEP, height=1).pack(fill="x")
-        tk.Label(bottom, text=f"Y-code {self.version}", font=FONT_VERSION,
-                 fg=COLOR_TEXT_DIM, bg=COLOR_CONTENT).pack(side="left", padx=14)
-        self._btn_cancel = ttk.Button(bottom, text="取消(C)", command=self.destroy, width=10)
-        self._btn_next = ttk.Button(bottom, text="下一步(N) >", command=self._go_next, width=13)
-        self._btn_back = ttk.Button(bottom, text="< 上一步(P)", command=self._go_back, width=13)
-        self._btn_cancel.pack(side="right", padx=(4, 14), pady=9)
-        self._btn_next.pack(side="right", padx=4, pady=9)
-        self._btn_back.pack(side="right", padx=4, pady=9)
-
+        self._btn_cancel = ttk.Button(bottom, text="取消", style="Ghost.TButton",
+                                      width=8, command=self.destroy)
+        self._btn_next = ttk.Button(bottom, text="下一步", style="Brand.TButton",
+                                    width=12, command=self._go_next)
+        self._btn_back = ttk.Button(bottom, text="< 上一步", style="Ghost.TButton",
+                                    width=10, command=self._go_back)
+        self._btn_cancel.pack(side="right", padx=(4, 40), pady=13)
+        self._btn_next.pack(side="right", padx=8, pady=13)
+        self._btn_back.pack(side="right", padx=8, pady=13)
     # ------------------------------------------------------------------
     # 页面构建与导航
     # ------------------------------------------------------------------
     def _page(self, name):
-        page = tk.Frame(self._content, bg=COLOR_CONTENT)
+        page = tk.Frame(self._page_area, bg=COLOR_CONTENT)
         self._pages[name] = page
         return page
 
@@ -1005,16 +1125,18 @@ class SetupWizard(tk.Tk):
         if name == "finish":
             back.pack_forget()
             nxt.pack_forget()
-            cancel.configure(text="完成(F)", state="normal")
+            cancel.pack_forget()
+            cancel.configure(text="完成", state="normal")
+            cancel.pack(side="right", padx=(4, 40), pady=13)
             return
         # 非完成页：确保三个按钮都在（顺序：back next cancel 从右往左 pack）
         cancel.pack_forget()
         nxt.pack_forget()
         back.pack_forget()
-        self._btn_cancel.pack(side="right", padx=(4, 14), pady=9)
-        self._btn_next.pack(side="right", padx=4, pady=9)
-        self._btn_back.pack(side="right", padx=4, pady=9)
-        cancel.configure(text="取消(C)")
+        self._btn_cancel.pack(side="right", padx=(4, 40), pady=13)
+        self._btn_next.pack(side="right", padx=8, pady=13)
+        self._btn_back.pack(side="right", padx=8, pady=13)
+        cancel.configure(text="取消")
         if name == "installing":
             back.configure(state="disabled")
             nxt.configure(state="disabled")
@@ -1023,7 +1145,7 @@ class SetupWizard(tk.Tk):
             cancel.configure(state="normal")
             back.configure(state="normal" if self._flow.index(name) > 0 else "disabled")
             nxt.configure(state="normal",
-                          text="安装(I)" if name == "options" else "下一步(N) >")
+                          text="安装" if name == "options" else "下一步")
 
     def _go_next(self):
         name = self._current_page
@@ -1048,9 +1170,9 @@ class SetupWizard(tk.Tk):
     def _build_welcome_page(self):
         page = self._page("welcome")
         is_full = self.mode == "full"
-        self._label(page, "Y-code 星瑶", FONT_TITLE).place(relx=0.5, y=120, anchor="center")
+        self._label(page, "Y-code 星瑶", FONT_TITLE).place(relx=0.5, y=80, anchor="center")
         self._label(page, f"AI 编程助手   v{self.version}", FONT_PAGE_SUB, COLOR_TEXT_DIM).place(
-            relx=0.5, y=152, anchor="center")
+            relx=0.5, y=112, anchor="center")
         desc = (
             "本向导将在您的电脑上安装 Y-code 图形界面版 (GUI)，\n"
             "接下来您可以选择安装用户、安装位置，\n"
@@ -1059,20 +1181,28 @@ class SetupWizard(tk.Tk):
             "本向导将在您的电脑上安装 Y-code 命令行版 (CLI)，\n"
             "安装完成后可在终端中直接使用 ycode 命令。"
         )
-        self._label(page, desc, FONT_TEXT, justify="center").place(relx=0.5, y=230, anchor="center")
-        self._label(page, "单击“下一步(N)”继续，或单击“取消(C)”退出安装向导。",
-                    FONT_TEXT, COLOR_TEXT_DIM).place(relx=0.5, y=310, anchor="center")
+        self._label(page, desc, FONT_TEXT, justify="center").place(relx=0.5, y=190, anchor="center")
+        self._label(page, "单击“下一步”继续，或单击“取消”退出安装向导。",
+                    FONT_TEXT, COLOR_TEXT_DIM).place(relx=0.5, y=265, anchor="center")
         if self.previous_install:
             self._label(page, f"检测到已安装的 Y-code：{self.previous_install}，本次将覆盖安装。",
-                        FONT_TEXT, "#8a6d1a").place(relx=0.5, y=350, anchor="center")
+                        FONT_TEXT, "#8a6d1a").place(relx=0.5, y=305, anchor="center")
 
     def _build_scope_page(self):
         page = self._page("scope")
         locked = bool(self.previous_install)
-        rb1 = ttk.Radiobutton(page, text="仅为我安装（推荐）", variable=self.var_scope,
-                              value="user", command=self._on_scope_change)
-        rb2 = ttk.Radiobutton(page, text="为使用这台电脑的所有人安装", variable=self.var_scope,
-                              value="machine", command=self._on_scope_change)
+        rb1 = tk.Radiobutton(page, text="仅为我安装（推荐）", variable=self.var_scope,
+                             value="user", command=self._on_scope_change,
+                             bg=COLOR_CONTENT, fg=COLOR_TEXT, font=FONT_TEXT,
+                             selectcolor=COLOR_CONTENT, activebackground=COLOR_CONTENT,
+                             activeforeground=COLOR_TEXT, cursor="hand2",
+                             highlightthickness=0, bd=0)
+        rb2 = tk.Radiobutton(page, text="为使用这台电脑的所有人安装", variable=self.var_scope,
+                             value="machine", command=self._on_scope_change,
+                             bg=COLOR_CONTENT, fg=COLOR_TEXT, font=FONT_TEXT,
+                             selectcolor=COLOR_CONTENT, activebackground=COLOR_CONTENT,
+                             activeforeground=COLOR_TEXT, cursor="hand2",
+                             highlightthickness=0, bd=0)
         rb1.place(x=50, y=70)
         rb2.place(x=50, y=104)
         self._label(page, "为所有用户安装需要管理员权限（会弹出 UAC 确认），\n"
@@ -1101,19 +1231,28 @@ class SetupWizard(tk.Tk):
         locked = bool(self.previous_install)
         self._dir_entry = ttk.Entry(page, textvariable=self.var_dir,
                                     state="disabled" if locked else "normal")
-        self._dir_entry.place(x=40, y=76, width=520, height=26)
-        self._btn_browse = ttk.Button(page, text="浏览(R)...", command=self._browse_dir,
+        self._dir_entry.place(x=40, y=78, width=430, height=30)
+        self._btn_browse = ttk.Button(page, text="浏览...", style="Ghost.TButton",
+                                      command=self._browse_dir,
                                       state="disabled" if locked else "normal")
-        self._btn_browse.place(x=575, y=75, width=90)
+        self._btn_browse.place(x=480, y=78, width=90, height=30)
         if locked:
             self._label(page, "检测到已安装的 Y-code，将覆盖安装到原位置。",
                         FONT_PAGE_SUB, "#8a6d1a").place(x=40, y=108)
 
         if self.mode == "full":
-            ttk.Checkbutton(page, text="创建桌面快捷方式(S)",
-                            variable=self.var_shortcut).place(x=40, y=160)
-            ttk.Checkbutton(page, text="同时安装命令行版 CLI（终端中使用 ycode 命令）(L)",
-                            variable=self.var_cli).place(x=40, y=192)
+            tk.Checkbutton(page, text="创建桌面快捷方式",
+                           variable=self.var_shortcut,
+                           bg=COLOR_CONTENT, fg=COLOR_TEXT, font=FONT_TEXT,
+                           selectcolor=COLOR_CONTENT, activebackground=COLOR_CONTENT,
+                           activeforeground=COLOR_TEXT, cursor="hand2",
+                           highlightthickness=0, bd=0).place(x=40, y=160)
+            tk.Checkbutton(page, text="同时安装命令行版 CLI（终端中使用 ycode 命令）",
+                           variable=self.var_cli,
+                           bg=COLOR_CONTENT, fg=COLOR_TEXT, font=FONT_TEXT,
+                           selectcolor=COLOR_CONTENT, activebackground=COLOR_CONTENT,
+                           activeforeground=COLOR_TEXT, cursor="hand2",
+                           highlightthickness=0, bd=0).place(x=40, y=192)
         else:
             self._label(
                 page,
@@ -1124,16 +1263,17 @@ class SetupWizard(tk.Tk):
 
     def _build_installing_page(self):
         page = self._page("installing")
-        self._progress = ttk.Progressbar(page, mode="determinate", maximum=100.0)
-        self._progress.place(x=40, y=40, width=590, height=18)
+        self._progress = ttk.Progressbar(page, mode="determinate", maximum=100.0,
+                                         style="Brand.Horizontal.TProgressbar")
+        self._progress.place(x=40, y=40, width=500, height=14)
         self._pct_label = self._label(page, "0%", FONT_TEXT, COLOR_TEXT_DIM)
-        self._pct_label.place(x=640, y=40)
+        self._pct_label.place(x=550, y=38)
         self._log_text = tk.Text(
-            page, font=("Consolas", 9), bg="#ffffff", fg="#333333",
+            page, font=("Consolas", 9), bg="#FFFFFF", fg="#333333",
             bd=1, relief="solid", highlightthickness=0,
             state="disabled", wrap="word",
         )
-        self._log_text.place(x=40, y=76, width=670, height=300)
+        self._log_text.place(x=40, y=76, width=540, height=290)
 
     def _build_finish_page(self):
         page = self._page("finish")

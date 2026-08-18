@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.2.2](https://img.shields.io/badge/Version-1.2.2-green.svg)](core/version.py)
+[![Version 1.2.3](https://img.shields.io/badge/Version-1.2.3-green.svg)](core/version.py)
 
 > 一个国产终端 AI 编程助手，代号「星瑶」。支持 TUI 控制台与 GUI 窗口双形态、多模型切换、子代理编排、计划执行、长期记忆、MCP 扩展与可插拔技能系统。
 

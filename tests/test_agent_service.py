@@ -66,7 +66,7 @@ def _make_manager():
 
 
 def test_prepare_turn_messages_orders_system_and_dynamic_context(stub_llm, quiet_extras):
-    """system 提示词在最前，动态运行上下文在 user 消息之前，时间注记内联到 user 消息。"""
+    """system 提示词唯一且在最前，动态上下文与时间注记内联到最后一条 user 消息。"""
     from core.agent_service import prepare_turn_messages
 
     manager = _make_manager()
@@ -83,26 +83,20 @@ def test_prepare_turn_messages_orders_system_and_dynamic_context(stub_llm, quiet
         permission_mode="confirm",
     )
 
-    # 1) 第一条必须是稳定 system 提示词
+    # 1) 第一条且唯一一条 system：稳定提示词
     assert messages[0]["role"] == "system"
     assert len(messages[0]["content"]) > 0
+    assert sum(1 for m in messages if m["role"] == "system") == 1
 
-    # 2) 最后一条仍然是用户本轮输入（含内联时间注记）
+    # 2) 最后一条仍是用户本轮输入，动态运行上下文 + 时间注记已内联到其 content
     assert messages[-1]["role"] == "user"
     assert messages[-1]["content"].startswith("第二个问题")
+    assert "【当前运行上下文】" in messages[-1]["content"]
+    assert "当前权限模式：confirm" in messages[-1]["content"]
     assert "【当前时间】" in messages[-1]["content"]
 
-    # 3) 动态上下文紧贴最后一条 user 消息之前
-    dynamic = messages[-2]
-    assert dynamic["role"] == "system"
-    assert "【当前运行上下文】" in dynamic["content"]
-    assert "当前权限模式：confirm" in dynamic["content"]
-    # 时间已从动态块剥离
-    assert "当前时间" not in dynamic["content"]
-
-    # 4) 首轮恰好两条 system：稳定前缀 + 动态块
-    #    时间注记已内联到 user 消息，不再作为独立 system 消息
-    assert sum(1 for m in messages if m["role"] == "system") == 2
+    # 3) 历史 user 消息不含动态块（动态块只内联到最后一条 user）
+    assert "【当前运行上下文】" not in messages[1]["content"]
 
 
 def test_prepare_turn_messages_updates_token_usage(stub_llm, quiet_extras):
@@ -314,8 +308,8 @@ def test_compression_summary_survives_as_user_message(stub_llm, quiet_extras):
     assert len(summaries) == 1
     assert summaries[0]["role"] == "user"
     assert "调试数据库连接问题" in summaries[0]["content"]
-    # system 消息为稳定前缀 + 动态块两条（时间注记已内联到 user 消息）
-    assert sum(1 for m in messages if m["role"] == "system") == 2
+    # system 消息只有稳定前缀一条（动态块与时间注记均已内联到 user 消息）
+    assert sum(1 for m in messages if m["role"] == "system") == 1
 
 
 def test_mcp_warmup_starts_background_connect_once(monkeypatch):
@@ -376,8 +370,8 @@ def test_mcp_warmup_skips_when_no_enabled_servers(monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_dynamic_context_not_duplicated_when_unchanged(stub_llm, quiet_extras):
-    """运行上下文不变时第二轮不再重注动态块；时间注记每轮新增、旧的保留。"""
+def test_dynamic_context_inlined_to_each_user_turn(stub_llm, quiet_extras):
+    """动态上下文块内联到每条 user 消息末尾，作为各自轮次的运行环境快照。"""
     from core.agent_service import prepare_turn_messages
 
     manager = _make_manager()
@@ -392,17 +386,18 @@ def test_dynamic_context_not_duplicated_when_unchanged(stub_llm, quiet_extras):
     )
 
     dynamics = [m for m in messages if "【当前运行上下文】" in str(m.get("content", ""))]
-    # 时间注记已内联到 user 消息末尾，不再作为独立 system 消息
+    # 两条 user 各内联一份动态块（各自轮次的运行环境快照）
+    assert len(dynamics) == 2
+    assert all(m["role"] == "user" for m in dynamics)
     time_notes_in_users = [
         m for m in messages
         if m.get("role") == "user" and "【当前时间】" in str(m.get("content", ""))
     ]
-    assert len(dynamics) == 1
     assert len(time_notes_in_users) == 2
 
 
 def test_dynamic_context_appended_when_changed(stub_llm, quiet_extras):
-    """运行上下文变化时追加新块，旧块保留（append-only），最新块更靠近当前输入。"""
+    """运行上下文变化时，新 user 消息内联最新动态块，旧 user 保留旧块。"""
     from core.agent_service import prepare_turn_messages
 
     manager = _make_manager()
@@ -418,14 +413,11 @@ def test_dynamic_context_appended_when_changed(stub_llm, quiet_extras):
 
     dynamics = [m for m in messages if "【当前运行上下文】" in str(m.get("content", ""))]
     assert len(dynamics) == 2
-    # 旧块在前、新块在后，新块包含最新权限模式
+    # 旧 user 内联 confirm 块、新 user 内联 full 块
     assert "当前权限模式：confirm" in dynamics[0]["content"]
     assert "当前权限模式：full" in dynamics[1]["content"]
-    # 最新动态块位于最后一条 user 消息之前
-    last_dynamic_idx = max(
-        i for i, m in enumerate(messages) if "【当前运行上下文】" in str(m.get("content", ""))
-    )
-    assert last_dynamic_idx >= len(messages) - 2
+    # 最新动态块内联在最后一条 user 消息里
+    assert "当前权限模式：full" in messages[-1]["content"]
 
 
 def test_prefix_continuity_across_turns(stub_llm, quiet_extras):
@@ -450,22 +442,6 @@ def test_prefix_continuity_across_turns(stub_llm, quiet_extras):
     # 后续依次为：上一轮的 assistant 回复、新一轮的用户输入（含内联时间注记）
     assert turn2[len(turn1)]["role"] == "assistant"
     assert turn2[len(turn1)]["content"] == "回答一"
-
-
-def test_reposition_context_blocks_moves_system_before_user():
-    """DB 自然顺序 [user][块] 在内存中还原为 [块][user]，多块保持相对顺序。"""
-    from core.agent_service import _reposition_context_blocks
-
-    history = [
-        {"role": "user", "content": "问题"},
-        {"role": "system", "content": "【当前运行上下文】..."},
-        {"role": "system", "content": "【当前时间】..."},
-        {"role": "assistant", "content": "回答"},
-    ]
-    out = _reposition_context_blocks(history)
-    assert [m["role"] for m in out] == ["system", "system", "user", "assistant"]
-    assert out[0]["content"].startswith("【当前运行上下文】")
-    assert out[1]["content"].startswith("【当前时间】")
 
 
 def test_dynamic_prompt_excludes_time_and_marks_latest_wins():
