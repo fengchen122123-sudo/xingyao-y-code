@@ -26,25 +26,38 @@
 
       <!-- MCP 页 -->
       <div v-else-if="subType === 'mcp'">
-        <div class="sub-toolbar">
-          <button class="chip-btn" title="重新连接所有 MCP 服务" @click="store.reconnectMcp()">↻ 重连</button>
-        </div>
-        <div class="sub-grid">
+         <div class="sub-toolbar">
+           <button class="chip-btn" title="添加自定义 MCP 服务" @click="addForm.show = !addForm.show">＋ 添加服务</button>
+           <button class="chip-btn" title="重新连接所有 MCP 服务" @click="store.reconnectMcp()">↻ 重连</button>
+         </div>
+         <div v-if="addForm.show" class="mcp-add-form">
+           <div class="maf-row">
+             <input v-model="addForm.name" placeholder="服务名（如 filesystem）" style="width:180px" />
+             <input v-model="addForm.command" placeholder="启动命令（如 npx）" style="width:140px" />
+             <input v-model="addForm.args" placeholder="参数，空格分隔（如 -y @modelcontextprotocol/server-filesystem）" style="flex:1;min-width:220px" />
+           </div>
+           <textarea v-model="addForm.env" class="maf-env" rows="3" placeholder="环境变量（可选），每行一个 KEY=VALUE，如：&#10;API_KEY=sk-xxx"></textarea>
+           <div class="maf-row maf-actions">
+             <label class="maf-check"><input type="checkbox" v-model="addForm.enabled" /> 添加后立即启用</label>
+             <span style="flex:1"></span>
+             <button class="chip-btn" @click="addForm.show = false">取消</button>
+             <button class="chip-btn maf-confirm" @click="submitAddMcp">添加</button>
+           </div>
+         </div>        <div class="sub-grid">
           <div v-if="store.mcps.length === 0" class="sub-empty">暂无已配置的 MCP 服务</div>
           <div v-for="m in store.mcps" :key="m.name" class="sub-card mcp-card">
             <div class="sc-top">
               <div class="sc-ico">⧉</div>
               <div class="sc-name">
                 {{ m.name }}
-                <span v-if="!m.configured" class="mcp-preset-badge">预置</span>
               </div>
               <span class="status-dot" :class="mcpStatusClass(m)" :title="mcpStatusText(m)"></span>
-              <label class="switch" :title="m.configured ? '启用/禁用该 MCP 服务' : '启用该预置服务（缺密钥会弹窗填写）'" @click.stop>
+              <label class="switch" title="启用/禁用该 MCP 服务" @click.stop>
                 <input type="checkbox" :checked="m.enabled" @change="onToggleMcp(m, ($event.target as HTMLInputElement).checked)" />
                 <span class="switch-track"></span>
               </label>
             </div>
-            <div class="sc-desc">{{ m.configured ? ('工具数: ' + (m.tools_count ?? 0) + ' · ' + mcpStatusText(m)) : (m.comment || '预置服务模板') }}</div>
+            <div class="sc-desc">{{ '工具数: ' + (m.tools_count ?? 0) + ' · ' + mcpStatusText(m) }}</div>
           </div>
         </div>
       </div>
@@ -123,21 +136,6 @@
       </div>
     </div>
 
-    <!-- 预置 MCP 启用时的密钥输入弹窗 -->
-    <div v-if="envModal.show" class="env-modal-mask" @click.self="envModal.show = false">
-      <div class="env-modal">
-        <div class="em-title">启用 {{ envModal.name }}</div>
-        <div class="em-desc">该服务需要以下密钥，填写后会保存到 mcp.json，之后开关无需再输入</div>
-        <div v-for="key in envModal.keys" :key="key" class="em-row">
-          <label class="em-label">{{ key }}</label>
-          <input v-model="envModal.values[key]" type="password" :placeholder="'请输入 ' + key" class="em-input" />
-        </div>
-        <div class="em-actions">
-          <button class="chip-btn" @click="envModal.show = false">取消</button>
-          <button class="chip-btn em-confirm" @click="submitEnvModal">确认启用</button>
-        </div>
-      </div>
-    </div>
   </div>
 </template>
 
@@ -172,40 +170,44 @@ function onToggleSkill(s: SkillInfo, checked: boolean) {
 }
 
 function onToggleMcp(m: McpInfo, checked: boolean) {
-  if (checked && m.configured === false) {
-    // 预置服务首次启用：需要密钥的弹窗填写，不需要的直接启用
-    const keys = m.required_inputs || [];
-    if (keys.length) {
-      envModal.show = true;
-      envModal.name = m.name;
-      envModal.keys = keys;
-      envModal.values = Object.fromEntries(keys.map(k => [k, '']));
-      return;
-    }
-    store.enableMcpServer(m.name, {});
-    return;
-  }
   store.toggleMcpServer(m.name, checked);
 }
 
-// 预置 MCP 密钥输入弹窗状态
-const envModal = reactive({
+// 添加自定义 MCP 服务的表单状态
+const addForm = reactive({
   show: false,
   name: '',
-  keys: [] as string[],
-  values: {} as Record<string, string>,
+  command: 'npx',
+  args: '',
+  env: '',
+  enabled: true,
 });
 
-function submitEnvModal() {
-  const missing = envModal.keys.filter(k => !(envModal.values[k] || '').trim());
-  if (missing.length) {
-    store.notifyModal('表单校验', '请填写: ' + missing.join(', '));
+function submitAddMcp() {
+  const name = addForm.name.trim();
+  const command = addForm.command.trim();
+  if (!name || !command) {
+    store.notifyModal('表单校验', '请填写服务名和启动命令');
     return;
   }
-  const name = envModal.name;
-  const values = { ...envModal.values };
-  envModal.show = false;
-  store.enableMcpServer(name, values);
+  const args = addForm.args.split(/\s+/).filter(Boolean);
+  // 解析每行一个的 KEY=VALUE 环境变量
+  const env: Record<string, string> = {};
+  for (const line of addForm.env.split('\n')) {
+    const t = line.trim();
+    if (!t) continue;
+    const eq = t.indexOf('=');
+    if (eq <= 0) {
+      store.notifyModal('表单校验', '环境变量格式应为 KEY=VALUE: ' + t);
+      return;
+    }
+    env[t.slice(0, eq).trim()] = t.slice(eq + 1).trim();
+  }
+  store.addMcpServer(name, command, args, Object.keys(env).length ? env : undefined, addForm.enabled);
+  addForm.show = false;
+  addForm.name = '';
+  addForm.args = '';
+  addForm.env = '';
 }
 
 function mcpStatusClass(m: McpInfo) {
@@ -214,7 +216,6 @@ function mcpStatusClass(m: McpInfo) {
 }
 
 function mcpStatusText(m: McpInfo) {
-  if (m.configured === false) return '预置 · 未配置';
   if (!m.enabled) return '已禁用';
   return m.connected ? '已连接' : '已启用但未连接';
 }
@@ -420,59 +421,20 @@ async function testModelRow(m: ModelInfo) {
   margin-top: 4px;
 }
 
-/* 预置角标 */
-.mcp-preset-badge {
-  font-size: 10px;
-  padding: 0 6px;
-  border-radius: 6px;
-  margin-left: 4px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 400;
-}
-
-/* MCP 密钥输入弹窗 */
-.env-modal-mask {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 1300;
-}
-.env-modal {
-  width: 420px;
-  max-width: 90vw;
-  background: var(--bg1);
+/* MCP 添加服务表单 */
+.mcp-add-form {
+  margin-bottom: 12px;
+  padding: 12px;
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 18px;
-  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  border-radius: 10px;
+  background: var(--bg1);
 }
-.em-title {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text);
+.maf-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
 }
-.em-desc {
-  font-size: 12px;
-  color: var(--text-faint);
-  margin: 6px 0 14px;
-  line-height: 1.6;
-}
-.em-row {
-  margin-bottom: 10px;
-}
-.em-label {
-  display: block;
-  font-size: 11.5px;
-  color: var(--text-dim);
-  margin-bottom: 4px;
-  font-family: var(--mono);
-}
-.em-input {
-  width: 100%;
+.mcp-add-form input {
   background: var(--bg2);
   border: 1px solid var(--border);
   border-radius: 7px;
@@ -481,16 +443,36 @@ async function testModelRow(m: ModelInfo) {
   font-size: 12.5px;
   outline: none;
 }
-.em-input:focus {
+.mcp-add-form input:focus,
+.maf-env:focus {
   border-color: var(--accent);
 }
-.em-actions {
-  display: flex;
-  justify-content: flex-end;
-  gap: 8px;
-  margin-top: 14px;
+.maf-env {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  padding: 7px 10px;
+  color: var(--text);
+  font-size: 12px;
+  font-family: var(--mono);
+  outline: none;
+  resize: vertical;
+  margin-bottom: 8px;
 }
-.em-confirm {
+.maf-actions {
+  align-items: center;
+  margin-bottom: 0;
+}
+.maf-check {
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+.maf-confirm {
   border-color: var(--accent);
   color: var(--accent);
   background: var(--accent-soft);

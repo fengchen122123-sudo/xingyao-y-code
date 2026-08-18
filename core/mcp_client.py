@@ -6,6 +6,7 @@ import threading
 import json
 import os
 import re
+import sys
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from contextlib import AsyncExitStack
 from mcp import ClientSession, StdioServerParameters
@@ -179,6 +180,33 @@ def _emit_status(message):
         except Exception:
             pass
     logging.getLogger(__name__).info("%s", message)
+
+
+_STDIO_ERRLOG_FALLBACK = None  # 惰性打开的 os.devnull 流，进程级单例避免泄漏 fd
+
+
+def _resolve_stdio_errlog():
+    """为 stdio_client 选择可用的子进程 stderr 重定向目标。
+
+    stdio_client 默认 errlog=sys.stderr；打包 GUI（console=False）下 sys.stderr
+    是 None 或无 fileno 的哑流（见 packaging/runtime_hook_nullstdout.py），
+    anyio 拉起子进程时取 fileno() 会抛 'null stream has no fileno'，
+    导致所有 stdio MCP 连接失败。此时回退到 os.devnull。
+
+    连接只发生在 MCP 专用事件循环线程内，惰性单例无需加锁。
+    """
+    err = sys.stderr
+    if err is not None:
+        try:
+            err.fileno()
+            return err
+        except (OSError, ValueError, AttributeError):
+            pass
+    global _STDIO_ERRLOG_FALLBACK
+    if _STDIO_ERRLOG_FALLBACK is None or _STDIO_ERRLOG_FALLBACK.closed:
+        _STDIO_ERRLOG_FALLBACK = open(os.devnull, "w", encoding="utf-8", errors="replace")
+    return _STDIO_ERRLOG_FALLBACK
+
 
 class MCPManager:
     def __init__(self):
@@ -358,7 +386,9 @@ class MCPManager:
             # 使用 async with 模式连接；spawn 子进程也要包超时，
             # 防止 server 启动卡死导致连接协程永久挂起
             read, write = await asyncio.wait_for(
-                stack.enter_async_context(stdio_client(server_params)),
+                stack.enter_async_context(
+                    stdio_client(server_params, errlog=_resolve_stdio_errlog())
+                ),
                 timeout=CONNECT_TIMEOUT,
             )
             session = await stack.enter_async_context(ClientSession(read, write))

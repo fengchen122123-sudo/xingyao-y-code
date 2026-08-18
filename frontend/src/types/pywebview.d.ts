@@ -72,9 +72,6 @@ export interface McpInfo {
   enabled: boolean;
   connected: boolean;
   tools_count: number;
-  configured?: boolean;        // false = 预置模板，尚未写入 mcp.json
-  required_inputs?: string[];  // 启用前需要用户填写的密钥项
-  comment?: string;
 }
 
 export interface PluginInfo {
@@ -315,7 +312,7 @@ export interface PyWebViewAPI {
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
   get_mcp_servers(): Promise<McpInfo[]>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
-  enable_mcp_server(name: string, envValues?: Record<string, string>): Promise<any>;
+  add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;
   reconnect_mcp(): Promise<any>;
 
   export_session(fmt: 'md' | 'html' | 'json'): Promise<any>;

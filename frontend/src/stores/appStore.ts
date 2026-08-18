@@ -1776,21 +1776,21 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    // 启用 MCP 服务：预置服务需带上用户填写的密钥；已配置服务等价于 toggle
-    async enableMcpServer(name: string, envValues?: Record<string, string>) {
+    // 添加自定义 MCP 服务：写盘与重连在后端后台线程完成，结果通过 mcp_status 事件回推
+    async addMcpServer(name: string, command: string, args: string[], env?: Record<string, string>, enabled = true) {
       const api = this._api();
       if (!api) return;
       try {
-        const res = await api.enable_mcp_server(name, envValues || {});
+        const res = await api.add_mcp_server(name, command, args, env, enabled);
         if (res && res.ok) {
           this.mcps = res.mcps || this.mcps;
-          this.notifyModal('MCP 服务', res.msg || 'MCP 状态已更新');
+          this.notifyModal('MCP 服务', res.msg || '已提交添加');
         } else {
-          this.notifyModal('MCP 服务', '启用失败: ' + (res && res.msg ? res.msg : '未知错误'));
+          this.notifyModal('MCP 服务', '添加失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
         this.connected = false;
-        this.notifyModal('MCP 服务', '启用 MCP 服务失败: ' + err);
+        this.notifyModal('MCP 服务', '添加 MCP 服务失败: ' + err);
       }
     },
 
