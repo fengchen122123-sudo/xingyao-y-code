@@ -2614,46 +2614,6 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # MCP
     # ------------------------------------------------------------------
-    _MCP_EXAMPLE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mcp.example.json")
-
-    @staticmethod
-    def _is_placeholder(val: Any) -> bool:
-        """判断配置值是否为示例占位符（如 your-xxx-key / cli_your_app_id）。"""
-        return isinstance(val, str) and bool(re.search(r"your", val, re.I))
-
-    def _load_mcp_presets(self) -> Dict[str, Dict[str, Any]]:
-        """读取 mcp.example.json 中的预置服务模板，并解析出需要用户填写的密钥项。
-
-        必填项来源：env 中值为占位符的键（key=环境变量名），
-        以及 args 中整段为占位符的参数（key=占位符原文，如 cli_your_app_id）。
-        """
-        presets: Dict[str, Dict[str, Any]] = {}
-        try:
-            with open(self._MCP_EXAMPLE_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            return presets
-        for name, cfg in (data.get("mcpServers") or {}).items():
-            if not isinstance(cfg, dict):
-                continue
-            required: List[str] = []
-            env = cfg.get("env") or {}
-            if isinstance(env, dict):
-                for k, v in env.items():
-                    if self._is_placeholder(v):
-                        required.append(str(k))
-            for a in cfg.get("args") or []:
-                if self._is_placeholder(a) and str(a) not in required:
-                    required.append(str(a))
-            presets[str(name)] = {
-                "command": str(cfg.get("command") or ""),
-                "args": list(cfg.get("args") or []),
-                "env": dict(env) if isinstance(env, dict) else {},
-                "comment": str(cfg.get("comment") or ""),
-                "required_inputs": required,
-            }
-        return presets
-
     def _mcp_tool_counts(self) -> Dict[str, int]:
         """按 "{server}__{tool}" 前缀统计每个 server 已就绪的工具数。"""
         counts: Dict[str, int] = {}
@@ -2682,10 +2642,8 @@ class ApiBridge:
             return []
         counts = self._mcp_tool_counts()
         result = []
-        configured_names = set()
         for item in raw:
             name = str(item.get("name", ""))
-            configured_names.add(name)
             enabled = bool(item.get("enabled", True))
             if enabled_override and name in enabled_override:
                 enabled = enabled_override[name]
@@ -2694,22 +2652,6 @@ class ApiBridge:
                 "enabled": enabled,
                 "connected": bool(item.get("connected", False)),
                 "tools_count": int(counts.get(name, 0)),
-                "configured": True,
-                "required_inputs": [],
-                "comment": "",
-            })
-        # 追加 mcp.example.json 中尚未配置的预置服务，显示为“预置 · 未配置”
-        for pname, preset in self._load_mcp_presets().items():
-            if pname in configured_names:
-                continue
-            result.append({
-                "name": pname,
-                "enabled": False,
-                "connected": False,
-                "tools_count": 0,
-                "configured": False,
-                "required_inputs": list(preset.get("required_inputs") or []),
-                "comment": str(preset.get("comment") or ""),
             })
         return result
 
@@ -2744,58 +2686,52 @@ class ApiBridge:
             logger.exception("toggle_mcp_server 失败")
             return {"ok": False, "msg": str(e)}
 
-    def enable_mcp_server(self, name: str, env_values: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
-        """启用 MCP 服务：已配置的只拨开关；预置服务先把模板（注入用户填写的密钥）
-        写入 ~/.ycode/mcp.json 再启用，重连在后台线程完成。
-        已输入过的密钥持久化在 mcp.json 中，之后开关不再要求输入。"""
+    def add_mcp_server(
+        self,
+        name: str,
+        command: str,
+        args: Any,
+        env: Optional[Dict[str, str]] = None,
+        enabled: bool = True,
+    ) -> Dict[str, Any]:
+        """添加自定义 MCP 服务：先做基础字段校验，写盘与重连放后台线程避免阻塞界面。
+
+        命令白名单、危险 env 键等安全校验由 mcp_manager.add_server 强制执行，
+        这里只做 GUI 表单层面的类型/空值校验。"""
         if self._mcp is None:
             return {"ok": False, "msg": "MCP 管理器不可用（依赖未安装）"}
         name = str(name or "").strip()
+        command = str(command or "").strip()
         if not name:
             return {"ok": False, "msg": "服务名不能为空"}
-        try:
-            self._mcp._load_config()
-            configured = self._mcp.config.get("mcpServers", {}) or {}
-        except Exception:
-            configured = {}
-
-        if name in configured:
-            # 已配置过（密钥已持久化），直接拨开关即可
-            return self.toggle_mcp_server(name, True)
-
-        preset = self._load_mcp_presets().get(name)
-        if not preset:
-            return {"ok": False, "msg": f"未找到预置服务: {name}"}
-
-        values = {str(k): str(v) for k, v in (env_values or {}).items()}
-        # 校验必填项：env 键名 或 args 占位符原文，二者任一命中即可
-        missing = [k for k in preset["required_inputs"] if not values.get(k, "").strip()]
-        if missing:
-            return {"ok": False, "msg": "缺少必填密钥: " + ", ".join(missing), "required_inputs": preset["required_inputs"]}
-
-        # 组装真实配置：env 占位符按键名替换，args 整段占位符按原文替换
-        env = {}
-        for k, v in preset["env"].items():
-            env[k] = values[k] if self._is_placeholder(v) else v
-        args = [values[a] if self._is_placeholder(a) else a for a in preset["args"]]
+        if not command:
+            return {"ok": False, "msg": "启动命令不能为空"}
+        if not isinstance(args, list):
+            return {"ok": False, "msg": "args 必须是数组"}
+        if env is not None and not isinstance(env, dict):
+            return {"ok": False, "msg": "env 必须是对象"}
+        clean_args = [str(a) for a in args]
+        clean_env = {str(k): str(v) for k, v in (env or {}).items()} or None
 
         def _job():
             try:
-                ok, msg = self._mcp.add_server(name, preset["command"], args, env=env, enabled=True)
+                ok, msg = self._mcp.add_server(
+                    name, command, clean_args, env=clean_env, enabled=bool(enabled)
+                )
             except Exception as e:
                 ok, msg = False, str(e)
             time.sleep(1.5)
             self.emit_event("mcp_status", {"mcps": self._build_mcp_list(), "ok": ok, "msg": msg})
 
         try:
-            threading.Thread(target=_job, daemon=True, name="gui-mcp-enable").start()
+            threading.Thread(target=_job, daemon=True, name="gui-mcp-add").start()
             return {
                 "ok": True,
-                "msg": f"正在启用 {name}，连接完成后会自动刷新状态",
-                "mcps": self._build_mcp_list(enabled_override={name: True}),
+                "msg": f"正在添加 {name}，连接完成后会自动刷新状态",
+                "mcps": self._build_mcp_list(),
             }
         except Exception as e:
-            logger.exception("enable_mcp_server 失败")
+            logger.exception("add_mcp_server 失败")
             return {"ok": False, "msg": str(e)}
 
     def reconnect_mcp(self) -> Dict[str, Any]:
