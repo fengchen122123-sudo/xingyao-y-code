@@ -79,7 +79,7 @@ def test_stdio_spawn_is_wrapped_with_timeout(manager, monkeypatch):
         async def __aexit__(self, *exc):
             return False
 
-    monkeypatch.setattr(mcp_client, "stdio_client", lambda params: _HangingCM())
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _HangingCM())
     monkeypatch.setattr(mcp_client, "CONNECT_TIMEOUT", 0.2)
 
     asyncio.run(manager._connect_server("s1", {"command": "node"}))
@@ -247,7 +247,7 @@ def test_closed_manager_cannot_start_new_connections(manager, tmp_path, monkeypa
 def test_connect_server_rejects_hand_edited_unsafe_command(manager, monkeypatch):
     """手工写入 mcp.json 的任意命令：_connect_server 必须复核 _validate_mcp_launch 规则"""
     spawned = []
-    monkeypatch.setattr(mcp_client, "stdio_client", lambda params: spawned.append(params))
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: spawned.append(params))
 
     result = asyncio.run(manager._connect_server("bad", {"command": "powershell", "args": []}))
 
@@ -259,7 +259,7 @@ def test_connect_server_rejects_hand_edited_unsafe_command(manager, monkeypatch)
 def test_connect_server_rejects_dangerous_env_from_disk(manager, monkeypatch):
     """手工写入的危险环境变量（如 PATH 覆盖）：拒绝连接且不 spawn"""
     spawned = []
-    monkeypatch.setattr(mcp_client, "stdio_client", lambda params: spawned.append(params))
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: spawned.append(params))
 
     result = asyncio.run(
         manager._connect_server("bad", {"command": "node", "env": {"PATH": "C:\\evil"}})
@@ -273,7 +273,7 @@ def test_connect_server_env_merge_strips_inherited_key_overrides(manager, monkey
     """通过校验的 env 仍不得覆盖 PATH/COMSPEC/SYSTEMROOT 等继承键（合并时剔除）"""
     captured = {}
 
-    def _fake_stdio(params):
+    def _fake_stdio(params, errlog=None):
         captured["env"] = params.env
         raise RuntimeError("stop-after-capture")
 
@@ -290,7 +290,7 @@ def test_connect_server_env_merge_strips_inherited_key_overrides(manager, monkey
 
 def test_connect_server_rejects_non_dict_env(manager, monkeypatch):
     spawned = []
-    monkeypatch.setattr(mcp_client, "stdio_client", lambda params: spawned.append(params))
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: spawned.append(params))
 
     result = asyncio.run(manager._connect_server("bad", {"command": "node", "env": ["X=1"]}))
 
@@ -318,7 +318,7 @@ def test_connect_server_decrypts_prefixed_env_values(manager, monkeypatch):
     """读取连接时 dpapi:/keyring: 前缀的值必须解密后注入子进程环境"""
     captured = {}
 
-    def _fake_stdio(params):
+    def _fake_stdio(params, errlog=None):
         captured["env"] = params.env
         raise RuntimeError("stop-after-capture")
 
@@ -337,7 +337,7 @@ def test_connect_server_treats_unprefixed_env_as_plaintext(manager, monkeypatch)
     """向后兼容：无前缀旧值按明文处理"""
     captured = {}
 
-    def _fake_stdio(params):
+    def _fake_stdio(params, errlog=None):
         captured["env"] = params.env
         raise RuntimeError("stop-after-capture")
 
@@ -353,6 +353,58 @@ def test_connect_server_treats_unprefixed_env_as_plaintext(manager, monkeypatch)
     }))
 
     assert captured["env"]["API_KEY"] == "legacy-plain"
+
+
+def test_connect_server_passes_real_errlog_when_stderr_is_null_stream(manager, monkeypatch):
+    """打包 GUI（console=False）下 sys.stderr 被运行时钩子替换为无 fileno 的哑流，
+    stdio_client 默认 errlog=sys.stderr，anyio 拉起子进程时取 fileno() 会抛
+    'null stream has no fileno' 导致所有 stdio MCP 连接失败；
+    必须显式传入一个可真实重定向的 errlog。"""
+    captured = {}
+
+    def _fake_stdio(params, errlog=None):
+        captured["errlog"] = errlog
+        raise RuntimeError("stop-after-capture")
+
+    class _NullWriter:
+        def write(self, *a, **k):
+            return 0
+
+        def flush(self):
+            pass
+
+        def isatty(self):
+            return False
+
+        def fileno(self):
+            raise OSError("null stream has no fileno")
+
+    monkeypatch.setattr(mcp_client, "stdio_client", _fake_stdio)
+    monkeypatch.setattr("sys.stderr", _NullWriter())
+
+    asyncio.run(manager._connect_server("s1", {"command": "node"}))
+
+    errlog = captured.get("errlog")
+    assert errlog is not None, "必须显式传 errlog，不能依赖默认的 sys.stderr"
+    assert errlog.fileno() >= 0, "errlog 必须能取到真实 fd，anyio 才能做子进程重定向"
+
+
+def test_connect_server_passes_real_errlog_when_stderr_is_none(manager, monkeypatch):
+    """sys.stderr 直接是 None（未装运行时钩子的窗口程序）时同样要兜底"""
+    captured = {}
+
+    def _fake_stdio(params, errlog=None):
+        captured["errlog"] = errlog
+        raise RuntimeError("stop-after-capture")
+
+    monkeypatch.setattr(mcp_client, "stdio_client", _fake_stdio)
+    monkeypatch.setattr("sys.stderr", None)
+
+    asyncio.run(manager._connect_server("s1", {"command": "node"}))
+
+    errlog = captured.get("errlog")
+    assert errlog is not None
+    assert errlog.fileno() >= 0
 
 
 def test_encrypt_plaintext_env_on_disk_migrates_after_success(manager, tmp_path, monkeypatch):
@@ -421,7 +473,7 @@ def _session_cm(session):
 
 def test_reconnect_same_server_replaces_schemas_idempotently(manager, monkeypatch):
     """同 server 重复连接（取消-重试竞态）：不产生双份 server/双份工具 schema"""
-    monkeypatch.setattr(mcp_client, "stdio_client", lambda params: _FakeStdioCM())
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _FakeStdioCM())
     monkeypatch.setattr(
         mcp_client, "ClientSession", lambda r, w: _session_cm(_FakeSession(["alpha"]))
     )
@@ -450,7 +502,7 @@ def test_cancelled_connect_cleans_up_orphan_entry(manager, monkeypatch):
             closed.append(True)
             return False
 
-    monkeypatch.setattr(mcp_client, "stdio_client", lambda params: _FakeStdioCM())
+    monkeypatch.setattr(mcp_client, "stdio_client", lambda params, errlog=None: _FakeStdioCM())
     monkeypatch.setattr(mcp_client, "ClientSession", lambda r, w: _TrackStackCM())
 
     async def _run():

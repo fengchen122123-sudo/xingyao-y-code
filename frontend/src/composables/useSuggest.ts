@@ -37,7 +37,7 @@ export function useSuggest(
         key: 'mcp:' + m.name,
         icon: '🔌',
         label: '/mcp:' + m.name,
-        desc: m.comment || `MCP 服务 · ${m.tools_count} 个工具`,
+        desc: `MCP 服务 · ${m.tools_count} 个工具`,
         apply: '/mcp:' + m.name,
       });
     }

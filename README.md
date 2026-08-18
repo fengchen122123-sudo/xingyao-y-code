@@ -541,7 +541,6 @@ xingyao-y-code/
 ├── ycode_setup.spec        # 安装向导打包 spec（开发者手动构建参考用）
 ├── ycode_uninstall.py      # Windows 卸载向导（经典样式 GUI）
 ├── ycode_uninstall.spec    # 卸载向导打包 spec
-├── mcp.example.json        # MCP 配置示例
 └── README.md               # 本文件
 ```
 
