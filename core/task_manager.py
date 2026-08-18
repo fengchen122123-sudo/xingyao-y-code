@@ -51,12 +51,32 @@ _on_task_finished = None
 
 
 def set_task_finished_callback(callback):
-    """注册后台命令任务完成回调；签名 callback(task_id, command, returncode)。"""
+    """注册后台命令任务完成回调。
+
+    签名：callback(task_id, command, returncode, session_id, log_tail)。
+    """
     global _on_task_finished
     _on_task_finished = callback
 
 
-def _watch_task_completion(task_id, process, command):
+def _read_log_tail(task_id, max_chars=2000):
+    """读取后台任务日志尾部（供 LLM 简短总结用），失败返回空串。"""
+    try:
+        log_file_path = os.path.join(LOG_DIR, f"task_{task_id}.log")
+        if not os.path.exists(log_file_path):
+            return ""
+        with open(log_file_path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - max_chars))
+            raw = f.read()
+        from core.process_io import decode_process_output, platform_console_encoding
+        return decode_process_output(raw, platform_console_encoding())
+    except Exception:
+        return ""
+
+
+def _watch_task_completion(task_id, process, command, session_id):
     """监听线程：阻塞等待后台命令进程退出，退出后触发完成回调（仅一次）。"""
     try:
         returncode = process.wait()
@@ -65,7 +85,7 @@ def _watch_task_completion(task_id, process, command):
     cb = _on_task_finished
     if cb is not None:
         try:
-            cb(task_id, command, returncode)
+            cb(task_id, command, returncode, session_id, _read_log_tail(task_id))
         except Exception as error:
             _logger.warning("后台任务完成回调失败 %s: %s", task_id, error)
 
@@ -240,8 +260,11 @@ def _save_tasks():
         _logger.warning("写入任务记录失败 %s: %s", TASK_DB_PATH, error)
 
 
-def start_background_task(command: str) -> str:
-    """在后台开启一个异步长周期任务（如 npm run dev），重定向日志输出"""
+def start_background_task(command: str, session_id: str = "") -> str:
+    """在后台开启一个异步长周期任务（如 npm run dev），重定向日志输出。
+
+    session_id 记录发起该任务所属的会话，完成回调据此触发 LLM 总结。
+    """
     _ensure_paths()
     _ensure_loaded()
     if _is_dangerous_command(command):
@@ -290,6 +313,7 @@ def start_background_task(command: str) -> str:
             ACTIVE_TASKS[task_id] = {
                 "id": task_id,
                 "command": command,
+                "session_id": session_id,
                 "process": process,
                 "pid": process.pid,
                 "create_time": _process_create_time(process.pid),
@@ -303,7 +327,7 @@ def start_background_task(command: str) -> str:
         # 启动完成监听线程：进程退出后触发完成回调，向前端推送通知
         _watcher = threading.Thread(
             target=_watch_task_completion,
-            args=(task_id, process, command),
+            args=(task_id, process, command, session_id),
             daemon=True,
             name=f"bg-task-watcher-{task_id}",
         )
