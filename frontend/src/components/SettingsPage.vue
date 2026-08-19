@@ -1,15 +1,15 @@
 <template>
   <div class="settings-page">
     <aside class="settings-nav">
-      <button class="back-workspace" @click="store.closeModelSettings()">← 返回工作区</button>
+      <button class="back-workspace" @click="store.closeModelSettings()"><AppIcon name="arrow-left" :size="14" /> 返回工作区</button>
       <div class="nav-section">基础设置</div>
-      <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span>▤</span>模型配置</button>
-      <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span>◔</span>Token 统计</button>
-      <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span>🛡</span>权限与沙盒</button>
+      <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span class="nav-ico"><AppIcon name="file" :size="14" /></span>模型配置</button>
+      <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
+      <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
       <div class="nav-section">关于</div>
-      <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span>ⓘ</span>关于</button>
+      <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
       <div class="nav-spacer"></div>
-      <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><span>⚙</span></div>
+      <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><AppIcon name="settings" :size="13" /></div>
     </aside>
 
     <main class="settings-main">
@@ -19,7 +19,7 @@
           <h1>模型配置</h1>
           <p>CLI 与 GUI 共用同一份厂商、模型和 API 配置。</p>
         </div>
-        <button class="icon-button" title="刷新模型配置" @click="store.openModelSettings()">↻</button>
+        <button class="icon-button" title="刷新模型配置" @click="store.openModelSettings()"><AppIcon name="refresh" :size="14" /></button>
       </header>
 
       <section class="model-settings-card">
@@ -33,7 +33,7 @@
             :class="{ active: selectedKind === 'provider' && selectedId === provider.id }"
             @click="selectProvider(provider.id)"
           >
-            <span class="provider-logo cube">◇</span>
+            <span class="provider-logo cube"><AppIcon name="hexagon" :size="13" /></span>
             <span class="provider-name">{{ provider.name }}</span>
             <span class="provider-state ready"></span>
           </button>
@@ -45,7 +45,7 @@
             :class="{ active: showAddProviders }"
             @click="showAddProviders = !showAddProviders"
           >
-            <span>＋ 添加厂商</span><span>{{ showAddProviders ? '⌃' : '⌄' }}</span>
+            <span class="add-provider-label"><AppIcon name="plus" :size="13" /> 添加厂商</span><span><AppIcon :name="showAddProviders ? 'chevron-up' : 'chevron-down'" :size="13" /></span>
           </button>
 
           <div v-if="showAddProviders" class="add-provider-choices">
@@ -67,7 +67,7 @@
               class="add-provider-row custom-provider-row"
               :class="{ active: selectedKind === 'custom' }"
               @click="startCustomProvider"
-            >＋ 添加自定义厂商</button>
+            ><span class="add-provider-label"><AppIcon name="plus" :size="13" /> 添加自定义厂商</span></button>
           </div>
 
           <!-- 副模型入口（红框位置）：点击后在右侧设置副模型 -->
@@ -77,7 +77,7 @@
             :class="{ active: selectedKind === 'secondary' }"
             @click="selectSecondary"
           >
-            <span class="provider-logo">◈</span>
+            <span class="provider-logo"><AppIcon name="layers" :size="13" /></span>
             <span class="provider-name">副模型</span>
             <span class="provider-state" :class="{ ready: !!secondaryModelId }"></span>
           </button>
@@ -163,7 +163,7 @@
                 <h3>模型列表</h3>
                 <span>{{ selectedProvider.models?.length || 0 }} 个模型</span>
               </div>
-              <button data-test="add-model" class="secondary-button compact" @click="openModelModal()">＋ 添加模型</button>
+              <button data-test="add-model" class="secondary-button compact" @click="openModelModal()"><AppIcon name="plus" :size="12" /> 添加模型</button>
             </div>
             <div v-if="!selectedProvider.models?.length" class="empty-models">该厂商暂无模型</div>
             <div v-else class="configured-models">
@@ -175,7 +175,15 @@
                     {{ model.supports_vision ? '多模态' : '纯文本' }}
                   </span>
                 </div>
-                <span class="test-result">{{ testResults[model.id] || '' }}</span>
+                <span v-if="testResults[model.id]" class="test-result" :class="testResults[model.id].status">
+                  <AppIcon
+                    v-if="testResults[model.id].status !== 'testing'"
+                    :name="testResults[model.id].status === 'ok' ? 'check' : 'x'"
+                    :size="12"
+                    :stroke-width="2.25"
+                  />
+                  {{ testResults[model.id].msg }}
+                </span>
                 <div class="row-actions">
                   <button :disabled="testingId === model.id" @click="testModel(model)">测试</button>
                   <button @click="openModelModal(model)">编辑</button>
@@ -245,7 +253,7 @@
             <h1>权限与沙盒</h1>
             <p>与 CLI 的 /sandbox、/whitelist 共享同一份配置与存储。</p>
           </div>
-          <button class="icon-button" title="刷新白名单" @click="loadPermRules">↻</button>
+          <button class="icon-button" title="刷新白名单" @click="loadPermRules"><AppIcon name="refresh" :size="14" /></button>
         </header>
 
         <section class="perm-settings-card">
@@ -312,6 +320,29 @@
             >检查更新</button>
           </div>
         </section>
+
+        <section class="perm-settings-card" data-test="about-changelog">
+          <div class="changelog-head">
+            <h3>更新内容</h3>
+            <button
+              v-if="changelogEntries.length > 1"
+              data-test="changelog-history-btn"
+              class="secondary-button compact"
+              @click="showChangelogHistory = true"
+            >查看历史更新内容</button>
+          </div>
+          <div v-if="currentEntry" class="changelog-current">
+            <div class="changelog-version">
+              <span class="mono">v{{ currentEntry.version }}</span>
+              <span v-if="currentEntry.date" class="changelog-date">{{ currentEntry.date }}</span>
+            </div>
+            <ul class="changelog-notes">
+              <li v-for="(note, i) in currentEntry.notes" :key="i">{{ note }}</li>
+            </ul>
+          </div>
+          <p v-else-if="changelogLoaded" class="changelog-empty">本版本暂无更新说明。</p>
+          <p v-else class="changelog-empty">更新内容加载中…</p>
+        </section>
       </template>
       <TokenUsageSettings v-else />
     </main>
@@ -333,14 +364,37 @@
         </div>
       </form>
     </div>
+
+    <!-- 历史更新内容弹窗：随安装包发布的 CHANGELOG.md 全量条目 -->
+    <div v-if="showChangelogHistory" class="modal-mask" @click.self="showChangelogHistory = false">
+      <div data-test="changelog-history-modal" class="changelog-modal">
+        <div class="modal-head"><h3>历史更新内容</h3><button type="button" @click="showChangelogHistory = false">×</button></div>
+        <div class="changelog-history-list">
+          <div v-for="entry in changelogEntries" :key="entry.version" class="changelog-history-item">
+            <div class="changelog-version">
+              <span class="mono">v{{ entry.version }}</span>
+              <span v-if="entry.date" class="changelog-date">{{ entry.date }}</span>
+            </div>
+            <ul class="changelog-notes">
+              <li v-for="(note, i) in entry.notes" :key="i">{{ note }}</li>
+            </ul>
+          </div>
+          <p v-if="!changelogEntries.length" class="changelog-empty">暂无历史更新记录。</p>
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="primary-button" @click="showChangelogHistory = false">关闭</button>
+        </div>
+      </div>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, reactive, ref, watch } from 'vue';
+import { computed, onMounted, reactive, ref, watch } from 'vue';
+import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
-import type { ModelInfo } from '../types/pywebview';
+import type { ChangelogEntry, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
 
 const store = useAppStore();
@@ -353,7 +407,7 @@ const showPresetKey = ref(false);
 const showProviderKey = ref(false);
 const saving = ref(false);
 const testingId = ref('');
-const testResults = reactive<Record<string, string>>({});
+const testResults = reactive<Record<string, { status: 'testing' | 'ok' | 'fail'; msg: string }>>({});
 
 const providerForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 const customForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
@@ -534,9 +588,11 @@ async function saveModel() {
 
 async function testModel(model: ModelInfo) {
   testingId.value = model.id;
-  testResults[model.id] = '测试中…';
+  testResults[model.id] = { status: 'testing', msg: '测试中…' };
   const result = await store.testModel(model.id);
-  testResults[model.id] = result.ok ? '✓ 连接成功' : `✕ ${result.msg}`;
+  testResults[model.id] = result.ok
+    ? { status: 'ok', msg: '连接成功' }
+    : { status: 'fail', msg: result.msg };
   testingId.value = '';
 }
 
@@ -594,6 +650,41 @@ watch(activeSection, (v) => {
 function checkUpdate() {
   store.notifyModal('检查更新', '当前已是最新版本（更新通道后续接入）');
 }
+
+// ------------------------------------------------------------------
+// 更新内容（关于页）：随安装包发布的 assets/CHANGELOG.md
+// ------------------------------------------------------------------
+const changelogEntries = ref<ChangelogEntry[]>([]);
+const changelogLoaded = ref(false);
+const showChangelogHistory = ref(false);
+
+// 当前版本条目：优先精确匹配运行版本号，匹配不到（如源码跑未发布版本）
+// 则回落到文件里的最新一条，保证关于页始终有内容可看
+const currentEntry = computed<ChangelogEntry | null>(() => {
+  if (!changelogEntries.value.length) return null;
+  return (
+    changelogEntries.value.find((e) => e.version === store.version) ??
+    changelogEntries.value[0]
+  );
+});
+
+onMounted(async () => {
+  // 直接读 window.pywebview 而非 store._api()：后者为空时会弹
+  // "连接失败" 模态框，更新内容拉取失败不该打扰用户
+  const api = window.pywebview?.api;
+  if (!api) {
+    changelogLoaded.value = true;
+    return;
+  }
+  try {
+    const res = await api.get_changelog();
+    if (res && res.ok) changelogEntries.value = res.entries || [];
+  } catch {
+    // 更新内容属展示性信息，失败静默（关于页显示"暂无更新说明"）
+  } finally {
+    changelogLoaded.value = true;
+  }
+});
 </script>
 
 <style scoped>
@@ -683,7 +774,15 @@ function checkUpdate() {
 .model-list-header span { color: var(--text-faint); font-size: 11px; }
 .model-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; }
 .model-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-.test-result { color: var(--text-faint); font-size: 11px; }
+.test-result {
+  color: var(--text-faint);
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.test-result.ok { color: var(--green); }
+.test-result.fail { color: var(--red); }
 .row-actions { display: flex; gap: 7px; }
 .row-actions button:hover { color: var(--accent); }
 .empty-models, .empty-detail { padding: 48px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
@@ -692,6 +791,21 @@ function checkUpdate() {
 .modal-head { display: flex; align-items: center; justify-content: space-between; }
 .modal-head h3 { margin: 0; }
 .modal-head button { border: 0; background: transparent; color: var(--text-dim); font-size: 20px; }
+
+/* ---------- 关于页 · 更新内容 ---------- */
+.changelog-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }
+.changelog-head h3 { margin: 0; }
+.changelog-version { display: flex; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.changelog-version .mono { font-weight: 600; color: var(--accent); }
+.changelog-date { font-size: 11.5px; color: var(--text-faint); }
+.changelog-notes { margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 5px; }
+.changelog-notes li { font-size: 12.5px; line-height: 1.55; color: var(--text-dim); }
+.changelog-empty { font-size: 12.5px; color: var(--text-faint); margin: 4px 0; }
+.changelog-modal { width: min(620px, calc(100vw - 40px)); max-height: min(72vh, 640px); padding: 24px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 15px; background: var(--bg2); box-shadow: 0 24px 80px rgba(0, 0, 0, .55); display: flex; flex-direction: column; }
+.changelog-history-list { flex: 1; min-height: 0; overflow-y: auto; margin-top: 14px; padding-right: 6px; display: flex; flex-direction: column; gap: 18px; }
+.changelog-history-item { border-left: 2px solid var(--border); padding-left: 14px; }
+.changelog-history-item:first-child { border-left-color: var(--accent); }
+.changelog-modal .modal-actions { margin-top: 18px; display: flex; justify-content: flex-end; }
 .vision-choice { margin-top: 20px; display: flex; align-items: flex-start; gap: 10px; padding: 13px; border: 1px solid var(--border); border-radius: 10px; color: var(--text); }
 .vision-choice span { display: flex; flex-direction: column; gap: 4px; font-size: 12px; }
 .vision-choice small { color: var(--text-faint); }

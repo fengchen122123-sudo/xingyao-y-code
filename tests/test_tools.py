@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from core.tools import (
     SubagentManager,
+    _SUBAGENT_TERMINAL_STATUSES,
     execute_command,
     fetch_url,
     get_weather,
@@ -13,6 +14,30 @@ from core.tools import (
     read_file,
     write_file,
 )
+
+
+def _wait_until(condition, timeout=5.0, interval=0.02):
+    """轮询等待异步条件成立。
+
+    run(run_in_background=True) 的调用线程只等启动器返回，真正执行任务的
+    _run_task 工作线程与终态通知是异步落定的；join 启动线程后立即断言存在
+    竞态，必须轮询到条件成立（或超时失败）。
+    """
+    import time as _time
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline:
+        if condition():
+            return True
+        _time.sleep(interval)
+    return bool(condition())
+
+
+def _all_tasks_terminal(manager):
+    """manager 名下所有任务都已进入终态（用于 drain 前的等待）。"""
+    snapshots = manager.snapshot()
+    return bool(snapshots) and all(
+        s.status in _SUBAGENT_TERMINAL_STATUSES for s in snapshots
+    )
 
 
 def test_declared_search_dependency_uses_renamed_ddgs_package():
@@ -459,6 +484,7 @@ def test_background_subagent_terminal_notification_fires_on_complete():
     thread.start()
     thread.join(timeout=5.0)
 
+    assert _wait_until(lambda: len(notifications) >= 1), "应触发1次通知"
     with lock:
         assert len(notifications) == 1, f"应触发1次通知，实际 {len(notifications)}"
         tid, status, desc, summary = notifications[0]
@@ -492,6 +518,7 @@ def test_background_subagent_terminal_notification_fires_on_failure():
     thread.start()
     thread.join(timeout=5.0)
 
+    assert _wait_until(lambda: len(notifications) >= 1), "失败也应触发1次通知"
     with lock:
         assert len(notifications) == 1
         tid, status, desc, summary = notifications[0]
@@ -542,6 +569,7 @@ def test_set_on_terminal_can_register_callback_after_init():
     thread.start()
     thread.join(timeout=5.0)
 
+    assert _wait_until(lambda: len(notifications) >= 1), "后台任务完成后应触发通知"
     assert len(notifications) == 1
     assert notifications[0][1] == "completed"
 
@@ -567,6 +595,9 @@ def test_terminal_notification_callback_exception_does_not_break_subagent():
     thread.join(timeout=5.0)
 
     # 子代理状态应正常完成，回调异常被吞掉
+    assert _wait_until(
+        lambda: manager.snapshot() and manager.snapshot()[0].status == "completed"
+    ), "回调异常不应影响子代理完成"
     snapshots = manager.snapshot()
     assert snapshots[0].status == "completed"
 
@@ -630,6 +661,8 @@ def test_is_plan_item_running_returns_false_for_completed_task():
     thread.start()
     thread.join(timeout=5.0)
 
+    # 先等任务真正进入终态，避免"尚未注册即返回 False"的假阳性
+    assert _wait_until(lambda: _all_tasks_terminal(manager)), "后台任务应在超时前进入终态"
     # 任务已完成：应返回 False
     assert manager.is_plan_item_running("plan-done-1") is False
 
@@ -676,6 +709,9 @@ def test_drain_terminal_background_tasks_returns_all_terminal_unconsumed():
     thread2.start()
     thread2.join(timeout=5.0)
 
+    # 两个后台任务异步执行，drain 前必须等到全部进入终态
+    assert _wait_until(lambda: len(manager.snapshot()) == 2 and _all_tasks_terminal(manager)), \
+        "两个后台任务都应进入终态"
     # drain：应返回 2 个任务（1 成功 + 1 失败）
     drained = manager.drain_terminal_background_tasks("s-fallback")
     assert len(drained) == 2, f"应提取 2 个任务，实际 {len(drained)}"
@@ -720,6 +756,8 @@ def test_drain_terminal_independent_from_notification_consumed():
     thread.start()
     thread.join(timeout=5.0)
 
+    # drain_notifications 是消费式读取，先等任务进入终态再消费
+    assert _wait_until(lambda: _all_tasks_terminal(manager)), "后台任务应在超时前进入终态"
     # 先用 drain_notifications 消费通知（模拟普通 turn 的 LLM 上下文注入）
     notifications = manager.drain_notifications("s-indep")
     assert len(notifications) == 1, "drain_notifications 应返回 1 条通知"
@@ -2886,6 +2924,11 @@ def test_edit_file_detects_external_modification_between_read_and_write(tmp_path
     def racing_fuzzy(content, match_target, match_replacement, replace_all=False):
         # 模拟并发子代理：在 读→写 窗口内从外部改动同一文件
         target.write_text("alpha = 1\nbeta = 2\ngamma = 3\n", encoding="utf-8")
+        # Windows/NTFS mtime 粒度粗（实测相邻两次写入约半数概率 mtime 相同，
+        # 同片则检测窗口消失），显式推进 mtime 确定性地构造"读后被改"状态
+        import os as _os
+        st = target.stat()
+        _os.utime(target, ns=(st.st_atime_ns, st.st_mtime_ns + 1_000_000_000))
         return original_fuzzy(content, match_target, match_replacement, replace_all=replace_all)
 
     monkeypatch.setattr(tools_mod, "_fuzzy_replace", racing_fuzzy)
@@ -3118,7 +3161,7 @@ def test_execute_command_background_echo_redacts_inline_credentials(monkeypatch)
     """M8：后台任务启动回显中的内联凭据被脱敏。"""
     monkeypatch.setattr(
         "core.task_manager.start_background_task",
-        lambda command: "abc12345",
+        lambda command, session_id="": "abc12345",
     )
 
     result = execute_command(

@@ -81,7 +81,13 @@ class PlanManager:
         self._items: list[dict[str, Any]] = []
         self._event_callback = event_callback
         self._session_id = str(session_id).strip() if session_id else None
-        self._storage_dir = Path(storage_dir or Path.cwd() / ".ycode_tasks" / "plans")
+        if storage_dir is None:
+            # 存储目录跟随当前线程的工作目录（回合线程内即会话归属项目目录），
+            # 不再冻结在进程启动目录——GUI 多项目会话的计划各自落在各自项目下
+            from core.workspace_context import get_workdir
+
+            storage_dir = Path(get_workdir()) / ".ycode_tasks" / "plans"
+        self._storage_dir = Path(storage_dir)
         if self._session_id:
             self.load()
 
@@ -413,8 +419,65 @@ class PlanManager:
 
 _DEFAULT_PLAN_MANAGER = PlanManager()
 
+# ---------------------------------------------------------------------------
+# 多会话并行：按会话实例化的计划管理器注册表 + 线程本地路由
+# ---------------------------------------------------------------------------
+# 进程级单例 _DEFAULT_PLAN_MANAGER 只服务未绑定线程（TUI 主流程 / 测试主线程），
+# 语义与单会话时代完全一致（bind_default_plan_session 就地重绑）。
+# GUI 回合线程 / 子代理线程通过 set_current_plan_session 绑定自己的会话，
+# get_default_plan_manager 按线程路由到该会话专属的 PlanManager 实例：
+# 并行回合各自读写各自的管理器（实例内 RLock 串行化同一会话的并发访问，
+# 不同会话之间零共享临界区），彻底消除 A 回合读到/改写 B 计划的串扰。
+_PLAN_MANAGERS: dict[str, PlanManager] = {}
+_PLAN_MANAGERS_LOCK = threading.RLock()
+_plan_route_tls = threading.local()
+
+
+def set_current_plan_session(session_id: str | None, *, storage_dir=None) -> None:
+    """绑定当前线程的计划会话路由（GUI 回合线程 / 子代理线程入口调用）。
+
+    回合 finally 中传 None 解绑。storage_dir 可显式指定计划存储目录，
+    缺省在首次创建该会话管理器时按当前线程工作目录推导。
+    """
+    _plan_route_tls.session_id = (
+        str(session_id).strip() if session_id else None
+    )
+    _plan_route_tls.storage_dir = str(storage_dir) if storage_dir else None
+
+
+def get_bound_plan_session() -> str | None:
+    """返回当前线程绑定的计划会话；未绑定返回 None（走进程级单例）。"""
+    sid = getattr(_plan_route_tls, "session_id", None)
+    return str(sid) if sid else None
+
+
+def get_plan_manager_for(session_id: str, *, storage_dir=None) -> PlanManager:
+    """取（或惰性创建）指定会话的专属计划管理器。
+
+    每次变更都会落盘（_commit_locked），因此即使注册表条目被清理后重建，
+    也能从磁盘完整恢复该会话的计划状态。
+    """
+    key = str(session_id).strip()
+    with _PLAN_MANAGERS_LOCK:
+        manager = _PLAN_MANAGERS.get(key)
+        if manager is None:
+            manager = PlanManager(session_id=key, storage_dir=storage_dir)
+            _PLAN_MANAGERS[key] = manager
+        return manager
+
+
+def release_plan_manager(session_id: str) -> None:
+    """清理某会话的注册表条目（会话删除 / 测试隔离时调用）。"""
+    with _PLAN_MANAGERS_LOCK:
+        _PLAN_MANAGERS.pop(str(session_id), None)
+
 
 def get_default_plan_manager() -> PlanManager:
+    bound = get_bound_plan_session()
+    if bound:
+        return get_plan_manager_for(
+            bound, storage_dir=getattr(_plan_route_tls, "storage_dir", None)
+        )
     return _DEFAULT_PLAN_MANAGER
 
 

@@ -2,7 +2,7 @@
   <!-- codex 风格：权限询问以卡片形式内联在对话流末尾，不再用模态弹窗打断 -->
   <div v-if="store.permRequest.show" class="perm-card">
     <div class="pc-head">
-      <span class="pc-ico">⚠</span>
+      <span class="pc-ico"><AppIcon name="triangle-alert" :size="16" /></span>
       <div class="pc-title">
         <b>权限请求</b>
         <span class="pc-src">
@@ -37,6 +37,7 @@
 </template>
 
 <script setup lang="ts">
+import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 const store = useAppStore();
 </script>

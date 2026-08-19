@@ -114,6 +114,13 @@ export interface PlanTaskItem {
   status: 'todo' | 'in_progress' | 'done';
 }
 
+// get_changelog() 的单条版本条目
+export interface ChangelogEntry {
+  version: string;
+  date: string;
+  notes: string[];
+}
+
 export interface PlanData {
   title: string;
   items: PlanTaskItem[];
@@ -282,6 +289,7 @@ export interface BridgeEvent {
 // 具体字段读取处自行按契约文档取用，避免过度约束导致类型摩擦。
 export interface PyWebViewAPI {
   get_initial_state(): Promise<InitialState>;
+  get_changelog(): Promise<{ ok: boolean; entries: ChangelogEntry[]; msg?: string }>;
   select_workspace_folder(): Promise<any>;
   get_workspace_state(workdir: string): Promise<any>;
   get_sessions(): Promise<SessionGroup[]>;

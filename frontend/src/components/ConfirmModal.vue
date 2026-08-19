@@ -2,7 +2,9 @@
   <div class="modal-mask" :class="{ show: store.confirmModal.show }">
     <div class="modal">
       <div class="modal-head">
-        <div class="mh-ico" :class="{ notice: store.confirmModal.notice }">{{ store.confirmModal.notice ? 'ⓘ' : '✕' }}</div>
+        <div class="mh-ico" :class="{ notice: store.confirmModal.notice }">
+          <AppIcon :name="store.confirmModal.notice ? 'info' : 'triangle-alert'" :size="18" />
+        </div>
         <div>
           <h3>{{ store.confirmModal.title || (store.confirmModal.notice ? '提示' : '确认操作') }}</h3>
           <p v-if="store.confirmModal.sub || !store.confirmModal.notice">{{ store.confirmModal.sub || '请确认您的操作' }}</p>
@@ -25,6 +27,7 @@
 </template>
 
 <script setup lang="ts">
+import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 const store = useAppStore();
 </script>

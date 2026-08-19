@@ -9,6 +9,7 @@ import json
 import logging
 import socket
 import threading
+import time
 from pathlib import Path
 import webview
 from gui_bridge import ApiBridge
@@ -334,9 +335,57 @@ def main():
         window,
         api.shutdown,
         icon_path=os.path.join(_get_base_dir(), "assets", "ycode.ico"),
+        has_running_work=api.has_active_turns,
     )
     lifecycle.start_tray()
     window.events.closing += lifecycle.on_closing
+
+    # pywebview 桥注入看门狗：NavigationCompleted → inject_pywebview 在独立
+    # 线程执行，且首行 run_js 位于 try 之外——快速重启（上一个实例的 WebView2
+    # 浏览器进程尚未退净）等竞态下该线程可能异常终止或从未启动，前端
+    # pywebviewready 永不触发，启动页永久卡死。这里 15 秒探测一次注入结果，
+    # 失败则用与 edgechromium.on_navigation_completed 完全相同的调用重新注入，
+    # 把偶发竞态从"死屏"变成"晚几秒进入"。
+    def _register_bridge_watchdog():
+        # 探测条件与前端 pywebviewApiReady 保持一致：不仅 window.pywebview.api
+        # 存在，还要求 get_initial_state 方法已注入（api.js 注入后 api 只是空
+        # 对象 {}，此时桥通道尚未就绪，抢跑会丢消息导致启动页卡死）。
+        ready_js = (
+            "!!(window.pywebview && window.pywebview.api"
+            " && typeof window.pywebview.api.get_initial_state === 'function')"
+        )
+
+        def _probe() -> bool:
+            try:
+                return bool(window.evaluate_js(ready_js))
+            except Exception:
+                return False
+
+        def _watch():
+            for _ in range(15):
+                time.sleep(1.0)
+                if _probe():
+                    return
+            logger.warning("pywebview 桥 15 秒未注入，尝试重新注入 js bridge")
+            try:
+                from webview.util import inject_pywebview
+
+                inject_pywebview("edgechromium", window)
+            except Exception:
+                logger.exception("重新注入 pywebview 桥失败")
+                return
+            for _ in range(10):
+                time.sleep(1.0)
+                if _probe():
+                    logger.info("pywebview 桥重新注入成功")
+                    return
+            logger.error("pywebview 桥重新注入后仍未就绪，前端将提示连接失败")
+
+        threading.Thread(
+            target=_watch, daemon=True, name="gui-bridge-watchdog"
+        ).start()
+
+    _register_bridge_watchdog()
 
     # pywebview 6.2+ 的拖拽文件完整路径注入：WebView2 只在
     # _dnd_state['num_listeners'] > 0（即通过 dom.on('drop') 注册过）时才
@@ -380,8 +429,10 @@ def main():
     threading.Thread(target=_register_dnd, daemon=True, name="gui-dnd-register").start()
 
     # 启动 WebView 消息主循环（默认关闭开发者工具，YCODE_GUI_DEBUG=1 时打开）
+    logger.info("准备启动 WebView 消息主循环（webview.start）")
     try:
         webview.start(debug=_debug_enabled())
+        logger.info("webview.start 已返回（窗口/消息循环结束）")
     finally:
         lifecycle.finalize()
 

@@ -121,7 +121,6 @@ current_theme = config.MY_THEME
 # 权限模式统一走 app_context 规范化，全系统只允许 confirm / plan / full
 import core.app_context as _app_ctx
 current_permission_mode = _app_ctx.normalize_permission_mode(config.MY_PERMISSION_MODE)
-plan_approved_this_turn = False
 show_memory_summary = False
 confirm_prompt = None
 
@@ -204,15 +203,6 @@ class _TuiContext:
     def permission_mode(self, val: str):
         global current_permission_mode
         current_permission_mode = _app_ctx.normalize_permission_mode(val)
-
-    @property
-    def plan_approved_this_turn(self) -> bool:
-        return plan_approved_this_turn
-
-    @plan_approved_this_turn.setter
-    def plan_approved_this_turn(self, val: bool):
-        global plan_approved_this_turn
-        plan_approved_this_turn = val
 
     @property
     def task_status(self) -> str:
@@ -3170,15 +3160,12 @@ def _report_task_result(task_data, ok, error=None):
 
 def _background_worker():
     """后台消费者线程：专门处理排队的对话请求"""
-    global plan_approved_this_turn, active_cancel_event, active_turn_id
+    global active_cancel_event, active_turn_id
     while True:
         task_data = msg_queue.get()
         # worker 是 daemon 线程随主进程退出；队列从未投递 None 哨兵，无需判空分支
         task_session = None  # 预初始化，确保 except 块中可安全引用
         try:
-            # 新一轮对话，重置计划模式授权状态
-            plan_approved_this_turn = False
-
             # 立即给 UI 反馈：消息已收到，正在准备请求。
             # 后续构建 system prompt、读取历史、压缩记忆等步骤可能耗时数秒，
             # 提前显示状态可显著降低用户感知的“首次响应延迟”。

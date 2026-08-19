@@ -1,6 +1,13 @@
 <template>
   <div class="trace-row" :class="`status-${row.status}`">
-    <span class="trace-icon" :class="{ spin: row.status === 'running' }" aria-hidden="true">{{ statusIcon }}</span>
+    <span class="trace-icon" aria-hidden="true">
+      <AppIcon
+        :name="statusIcon"
+        :size="13"
+        :stroke-width="2"
+        :class="{ 'icon-spin': row.status === 'running' }"
+      />
+    </span>
     <div class="trace-main">
       <div class="trace-title">
         <span>{{ title }}</span>
@@ -58,6 +65,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue';
+import AppIcon from './AppIcon.vue';
 import {
   countDiffChanges,
   type LegacyDiff,
@@ -75,12 +83,12 @@ const resultOpen = ref(false);
 const diffOpen = ref(false);
 
 const STATUS_ICONS: Record<ToolTraceRow['status'], string> = {
-  running: '◌',
-  completed: '✓',
-  failed: '✕',
-  cancelled: '⊘',
+  running: 'loader',
+  completed: 'check',
+  failed: 'x',
+  cancelled: 'ban',
 };
-const statusIcon = computed(() => STATUS_ICONS[props.row.status] ?? '⚙');
+const statusIcon = computed(() => STATUS_ICONS[props.row.status] ?? 'circle');
 
 const title = computed(() => {
   const base = props.row.action || '工具调用';
@@ -222,8 +230,16 @@ function diffLineClass(line: string) {
 }
 .trace-icon {
   flex-shrink: 0;
-  font-size: 13px;
+  display: inline-flex;
+  align-items: center;
   line-height: 1.6;
+}
+.icon-spin {
+  animation: trace-icon-spin 0.9s linear infinite;
+}
+@keyframes trace-icon-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 .status-completed > .trace-icon {
   color: var(--green);
@@ -236,18 +252,6 @@ function diffLineClass(line: string) {
 }
 .status-running > .trace-icon {
   color: var(--accent);
-}
-.trace-icon.spin {
-  display: inline-block;
-  animation: trace-spin 1s linear infinite;
-}
-@keyframes trace-spin {
-  to { transform: rotate(360deg); }
-}
-@media (prefers-reduced-motion: reduce) {
-  .trace-icon.spin {
-    animation: none;
-  }
 }
 .trace-main {
   flex: 1;

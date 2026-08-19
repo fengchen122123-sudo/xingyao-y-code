@@ -10,8 +10,8 @@
         @click="selectModel(m.id)"
       >
         <span class="c-label">{{ m.name }}</span>
-        <span v-if="m.supports_vision" class="c-vision" title="支持多模态">◉</span>
-        <span v-if="m.id === store.activeModelId" class="c-check checked">✓</span>
+        <span v-if="m.supports_vision" class="c-vision" title="支持多模态"><AppIcon name="eye" :size="12" /></span>
+        <span v-if="m.id === store.activeModelId" class="c-check checked"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
       </div>
     </div>
 
@@ -25,16 +25,16 @@
           :class="{ active: activeProviderName === provider }"
           @mouseenter="activateProvider(provider as string, $event)"
         >
-          <span class="c-provider-icon">◇</span>
+          <span class="c-provider-icon"><AppIcon name="hexagon" :size="12" /></span>
           <span class="c-label">{{ provider }}</span>
-          <span v-if="hasCurrentModel(modelsInGroup)" class="c-check">✓</span>
-          <span class="c-arrow">›</span>
+          <span v-if="hasCurrentModel(modelsInGroup)" class="c-check"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
+          <span class="c-arrow"><AppIcon name="chevron-right" :size="13" /></span>
         </div>
         <div class="cascader-sep"></div>
       </template>
-      <div v-else class="cascader-empty">暂无模型，点击 ⚙ 添加</div>
+      <div v-else class="cascader-empty">暂无模型，去添加</div>
       <div class="cascader-item cascader-manage" title="添加/管理供应商与模型" @click="manageModels">
-        <span class="c-label">⚙ 管理模型</span>
+        <span class="c-label"><AppIcon name="settings" :size="12" /> 管理模型</span>
       </div>
       <template v-if="hasAnyModel">
         <div class="cascader-sep"></div>
@@ -55,6 +55,7 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import type { ModelInfo, ReasoningEffort } from '../types/pywebview';
 

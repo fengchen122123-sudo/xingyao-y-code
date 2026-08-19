@@ -44,6 +44,8 @@ common_datas = [
     ('skills', 'skills'),
     # GUI 运行时用 WM_SETICON 设置窗口/任务栏图标，需随包携带 ico 文件
     ('assets/ycode.ico', 'assets'),
+    # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）
+    ('assets/CHANGELOG.md', 'assets'),
 ] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas
 
 common_binaries = litellm_binaries + tiktoken_ext_binaries

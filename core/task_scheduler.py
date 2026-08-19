@@ -509,13 +509,36 @@ _DEFAULT_SCHEDULER_SESSION: str | None = None
 # 否则同一计划项会被两个调度器重复认领执行
 _DEFAULT_SCHEDULER_LOCK = threading.RLock()
 
+# 多会话并行：线程绑定了计划会话时，调度器按会话分桶（互不取消、互不阻塞）。
+# 原先"会话切换即 cancel_all"的单例语义只保留给未绑定线程（TUI 单会话主流程）
+# ——TUI 的 _DEFAULT_PLAN_MANAGER 是就地重绑的同一个对象，不收尾旧调度器
+# 会让在途计划项把结果写进切换后的新会话计划。
+_PARALLEL_SCHEDULERS: dict[str, TaskScheduler] = {}
+
 
 def get_default_scheduler(
     *,
     event_callback: SchedulerCallback | None = None,
 ) -> TaskScheduler:
-    """Return the process-wide scheduler for the currently bound plan session."""
-    from core.plan import get_default_plan_manager
+    """Return the scheduler for the currently bound plan session.
+
+    绑定线程（GUI 回合/子代理）：按会话取专属调度器，其他会话的调度器
+    不受影响（并行回合永不互相取消）。未绑定线程（TUI/测试主线程）：
+    维持进程级单例 + 切会话收尾的旧语义。
+    """
+    from core.plan import get_bound_plan_session, get_default_plan_manager
+
+    bound_session = get_bound_plan_session()
+    if bound_session is not None:
+        plan = get_default_plan_manager()
+        with _DEFAULT_SCHEDULER_LOCK:
+            scheduler = _PARALLEL_SCHEDULERS.get(bound_session)
+            if scheduler is None or scheduler.plan is not plan:
+                scheduler = TaskScheduler(plan, event_callback=event_callback)
+                _PARALLEL_SCHEDULERS[bound_session] = scheduler
+            elif event_callback is not None:
+                scheduler.set_event_callback(event_callback)
+            return scheduler
 
     global _DEFAULT_SCHEDULER, _DEFAULT_SCHEDULER_SESSION
     plan = get_default_plan_manager()
@@ -536,3 +559,23 @@ def get_default_scheduler(
         elif event_callback is not None:
             _DEFAULT_SCHEDULER.set_event_callback(event_callback)
         return _DEFAULT_SCHEDULER
+
+
+def shutdown_all_schedulers() -> int:
+    """退出时收尾全部调度器（并行分桶 + TUI 兜底单例），返回收尾数量。"""
+    global _DEFAULT_SCHEDULER
+    with _DEFAULT_SCHEDULER_LOCK:
+        schedulers = list(_PARALLEL_SCHEDULERS.values())
+        _PARALLEL_SCHEDULERS.clear()
+        if _DEFAULT_SCHEDULER is not None:
+            schedulers.append(_DEFAULT_SCHEDULER)
+            _DEFAULT_SCHEDULER = None
+    count = 0
+    for scheduler in schedulers:
+        try:
+            scheduler.cancel_all()
+            scheduler.shutdown()
+            count += 1
+        except Exception:
+            pass
+    return count
