@@ -9,7 +9,7 @@
         @click="activeTab = tab.id"
       >
         {{ tab.label }}
-        <span v-if="tab.id === 'plan' && store.planData.items.length > 0" class="badge-dot">●</span>
+        <span v-if="tab.id === 'plan' && store.planData.items.length > 0" class="badge-dot"></span>
       </button>
     </div>
 
@@ -34,7 +34,12 @@
             :class="item.status"
           >
             <span class="p-status-ico">
-              {{ item.status === 'done' ? '✓' : (item.status === 'in_progress' ? '⟳' : '○') }}
+              <AppIcon
+                :name="item.status === 'done' ? 'check' : (item.status === 'in_progress' ? 'refresh' : 'circle')"
+                :size="12"
+                :stroke-width="2"
+                :class="{ 'icon-spin': item.status === 'in_progress' }"
+              />
             </span>
             <span class="p-text">{{ item.text }}</span>
           </div>
@@ -45,7 +50,7 @@
       <div v-show="activeTab === 'tasks'" class="rpane active">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)">
           <span style="font-size:12px;color:var(--text-dim);font-weight:600">后台运行任务</span>
-          <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="刷新后台任务列表" @click="refreshTasks">↻ 刷新</button>
+          <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="刷新后台任务列表" @click="refreshTasks"><AppIcon name="refresh" :size="12" /> 刷新</button>
         </div>
 
         <div v-if="(!store.backgroundTasks || store.backgroundTasks.length === 0) && (!store.subagentTasks || store.subagentTasks.length === 0)" style="color:var(--text-faint);font-size:12px;padding:12px 0">
@@ -89,8 +94,8 @@
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border)">
           <span style="font-size:12px;color:var(--text-dim);font-weight:600">终端 · {{ store.currentWorkdirLabel }}</span>
           <div style="display:flex;gap:6px">
-            <button v-if="store.terminalRunning" class="chip-btn danger" style="font-size:11.5px;padding:3px 9px" title="终止正在运行的命令" @click="store.killTerminalCommand()">■ 终止</button>
-            <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="清空终端输出" @click="store.clearTerminal()">✕ 清空</button>
+            <button v-if="store.terminalRunning" class="chip-btn danger" style="font-size:11.5px;padding:3px 9px" title="终止正在运行的命令" @click="store.killTerminalCommand()"><AppIcon name="square" :size="11" :stroke-width="2" /> 终止</button>
+            <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="清空终端输出" @click="store.clearTerminal()"><AppIcon name="x" :size="11" :stroke-width="2" /> 清空</button>
           </div>
         </div>
         <div class="term-body" @click="focusTermInput">
@@ -120,7 +125,7 @@
               :disabled="store.fileTreeRefreshing"
               title="重新扫描项目文件夹（外部新增/删除的文件会更新出来，展开状态保留）"
               @click="store.refreshFileTree()"
-            >{{ store.fileTreeRefreshing ? '刷新中…' : '↻ 刷新' }}</button>
+            >{{ store.fileTreeRefreshing ? '刷新中…' : '' }}<AppIcon v-if="!store.fileTreeRefreshing" name="refresh" :size="12" /> {{ store.fileTreeRefreshing ? '' : '刷新' }}</button>
             <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="引入新的项目文件夹" @click="store.openWorkspaceFolder()">引入新文件夹</button>
           </span>
         </div>
@@ -139,19 +144,19 @@
     <div class="modal-mask" :class="{ show: store.filePreview.show }" @click.self="store.closeFilePreview()">
       <div class="modal file-preview-modal">
         <div class="modal-head">
-          <div class="mh-ico">▤</div>
+          <div class="mh-ico"><AppIcon name="file" :size="16" /></div>
           <div class="fp-title">
             <h3 class="fp-name">{{ fileBaseName(store.filePreview.path) }}</h3>
             <p class="fp-path">{{ store.filePreview.path }}</p>
           </div>
-          <button class="chip-btn" title="在系统中打开此文件" @click="store.openInSystem(store.filePreview.path)">🗂 在系统中打开</button>
-          <button class="chip-btn" title="关闭预览" @click="store.closeFilePreview()">✕ 关闭</button>
+          <button class="chip-btn" title="在系统中打开此文件" @click="store.openInSystem(store.filePreview.path)"><AppIcon name="folder" :size="12" /> 在系统中打开</button>
+          <button class="chip-btn" title="关闭预览" @click="store.closeFilePreview()"><AppIcon name="x" :size="12" :stroke-width="2" /> 关闭</button>
         </div>
         <div class="fp-body">
           <div v-if="store.filePreview.loading" class="fp-loading">加载中…</div>
           <div v-else-if="isMarkdownPreview" class="fp-md md-body" v-html="renderedMarkdown"></div>
           <pre v-else class="fp-pre"><code class="hljs" v-html="highlightedPreview"></code></pre>
-          <div v-if="store.filePreview.truncated" class="fp-truncated">⚠ 文件内容过长，已截断显示</div>
+          <div v-if="store.filePreview.truncated" class="fp-truncated"><AppIcon name="triangle-alert" :size="12" /> 文件内容过长，已截断显示</div>
         </div>
       </div>
     </div>
@@ -161,6 +166,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
 import hljs from 'highlight.js/lib/common';
 import { renderMarkdown } from '../utils/markdown';
@@ -356,11 +362,20 @@ onUnmounted(() => {
   border-bottom-color: var(--accent);
 }
 .badge-dot {
-  color: var(--accent);
-  font-size: 8px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--accent);
   position: absolute;
-  top: 4px;
-  right: 6px;
+  top: 5px;
+  right: 7px;
+}
+.icon-spin {
+  animation: rp-icon-spin 0.9s linear infinite;
+}
+@keyframes rp-icon-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
 }
 
 #right-content {
@@ -487,6 +502,11 @@ onUnmounted(() => {
 .plan-item-row.done {
   border-color: rgba(63, 185, 80, 0.3);
   background: rgba(63, 185, 80, 0.05);
+}
+.p-status-ico {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
 }
 .plan-item-row.done .p-status-ico {
   color: var(--green);

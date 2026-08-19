@@ -1,13 +1,15 @@
 <template>
   <!-- 图片大图查看：点击遮罩或 Esc 关闭，多图支持左右切换 -->
   <div v-if="store.lightbox.show" class="lightbox-mask" @click="store.closeLightbox()">
-    <button class="lb-close" title="关闭 (Esc)" @click.stop="store.closeLightbox()">✕</button>
+    <button class="lb-close" title="关闭 (Esc)" @click.stop="store.closeLightbox()">
+      <AppIcon name="x" :size="16" :stroke-width="2" />
+    </button>
     <button
       v-if="store.lightbox.images.length > 1"
       class="lb-nav prev"
       title="上一张 (←)"
       @click.stop="store.lightboxNav(-1)"
-    >‹</button>
+    ><AppIcon name="chevron-left" :size="22" :stroke-width="2" /></button>
     <img
       class="lb-img"
       :src="store.lightbox.images[store.lightbox.index]"
@@ -19,7 +21,7 @@
       class="lb-nav next"
       title="下一张 (→)"
       @click.stop="store.lightboxNav(1)"
-    >›</button>
+    ><AppIcon name="chevron-right" :size="22" :stroke-width="2" /></button>
     <div v-if="store.lightbox.images.length > 1" class="lb-counter">
       {{ store.lightbox.index + 1 }} / {{ store.lightbox.images.length }}
     </div>
@@ -28,6 +30,7 @@
 
 <script setup lang="ts">
 import { onMounted, onUnmounted } from 'vue';
+import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();

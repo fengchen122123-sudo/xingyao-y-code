@@ -43,7 +43,7 @@ describe('ToolExecutionTrace', () => {
         state: 'running',
       },
     });
-    expect(wrapper.get('.trace-title').text()).toBe('执行过程 · 2 项 · 进行中');
+    expect(wrapper.get('.fold-title').text()).toBe('执行过程 · 2 项 · 进行中');
   });
 
   it('maps terminal states to Chinese labels', () => {
@@ -56,7 +56,7 @@ describe('ToolExecutionTrace', () => {
       const wrapper = mount(ToolExecutionTrace, {
         props: { calls: [finishedCall('a')], legacyDiffs: [], state },
       });
-      expect(wrapper.get('.trace-title').text()).toBe(title);
+      expect(wrapper.get('.fold-title').text()).toBe(title);
       wrapper.unmount();
     }
   });
@@ -70,7 +70,7 @@ describe('ToolExecutionTrace', () => {
       },
     });
 
-    expect(wrapper.find('.trace-icon.spin').exists()).toBe(false);
+    expect(wrapper.find('.trace-icon .icon-spin').exists()).toBe(false);
     expect(wrapper.get('.trace-row').classes()).toContain('status-completed');
   });
 
@@ -78,16 +78,16 @@ describe('ToolExecutionTrace', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [finishedCall('a')], legacyDiffs: [], state: 'completed' },
     });
-    const button = wrapper.get('button.trace-head');
+    const button = wrapper.get('button.fold-head');
     // 默认收起（图二样式）：只显示标题行，详情折叠
     expect(button.attributes('aria-expanded')).toBe('false');
-    expect(wrapper.find('.trace-body').attributes('style')).toContain('display: none');
+    expect(wrapper.find('.fold-body').attributes('style')).toContain('display: none');
     await button.trigger('click');
     expect(button.attributes('aria-expanded')).toBe('true');
-    expect(wrapper.find('.trace-body').attributes('style') || '').not.toContain('display: none');
+    expect(wrapper.find('.fold-body').attributes('style') || '').not.toContain('display: none');
     await button.trigger('click');
     expect(button.attributes('aria-expanded')).toBe('false');
-    expect(wrapper.find('.trace-body').attributes('style')).toContain('display: none');
+    expect(wrapper.find('.fold-body').attributes('style')).toContain('display: none');
   });
 
   it('runs exactly one interval while running and clears it on terminal state and unmount', async () => {
@@ -125,7 +125,7 @@ describe('ToolExecutionTrace', () => {
     const wrapper = mount(ToolExecutionTrace, {
       props: { calls: [runningCall('b', Date.now())], legacyDiffs: [], state: 'running' },
     });
-    expect(wrapper.get('.trace-title').attributes('aria-live')).toBe('polite');
+    expect(wrapper.get('.fold-title [aria-live]').attributes('aria-live')).toBe('polite');
     expect(wrapper.get('.trace-duration').attributes('aria-live')).toBeUndefined();
   });
 

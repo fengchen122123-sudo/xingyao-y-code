@@ -98,33 +98,25 @@ def test_ui_sanitizer_redacts_common_secret_shapes():
         assert secret not in result
 
 
-def test_turn_workdir_gate_serializes_workers():
+def test_turn_worker_serialized_forwards_without_serialization():
+    """2026-08-17 多会话并行改造：_run_turn_worker_serialized 不再用
+    _turn_workdir_lock 串行化（直接转发 _run_turn_worker）；workdir 隔离
+    改由线程本地上下文（core.workspace_context）承担，并发回合允许并行。"""
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._turn_workdir_lock = threading.Lock()
-    active = 0
-    max_active = 0
-    guard = threading.Lock()
+    calls = []
 
     def worker(*args, **kwargs):
-        nonlocal active, max_active
-        with guard:
-            active += 1
-            max_active = max(max_active, active)
-        threading.Event().wait(0.03)
-        with guard:
-            active -= 1
+        calls.append((args, kwargs))
 
     bridge._run_turn_worker = worker
-    threads = [
-        threading.Thread(target=bridge._run_turn_worker_serialized, args=("x", str(i)))
-        for i in range(2)
-    ]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=1)
+    bridge._run_turn_worker_serialized("text", "session", internal_kind="bg_summary")
 
-    assert max_active == 1
+    # 直接转发：参数原样到达 _run_turn_worker
+    assert calls == [(("text", "session"), {"internal_kind": "bg_summary"})]
+    # 串行锁全程未被持有：并发路径不会被 _turn_workdir_lock 阻塞
+    assert bridge._turn_workdir_lock.acquire(blocking=False) is True
+    bridge._turn_workdir_lock.release()
 
 
 def test_shutdown_blocks_new_background_summary_turns():

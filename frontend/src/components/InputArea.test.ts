@@ -19,7 +19,8 @@ it('uses the current session state for the send/stop button', () => {
 
   const wrapper = mount(InputArea);
 
-  expect(wrapper.get('#send-btn').text()).toBe('↑');
+  // 发送图标已统一为 AppIcon SVG：断言按钮内渲染了内联 svg 且 title 语义不变
+  expect(wrapper.get('#send-btn').find('svg').exists()).toBe(true);
   expect(wrapper.get('#send-btn').attributes('title')).toContain('发送');
   wrapper.unmount();
 });

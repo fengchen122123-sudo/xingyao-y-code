@@ -19,11 +19,17 @@ class ApplicationLifecycle:
         *,
         icon_path: str = "",
         tray_factory: Callable | None = None,
+        has_running_work: Callable[[], bool] | None = None,
+        confirm_close_running: Callable[[bool], str] | None = None,
     ) -> None:
         self._window = window
         self._shutdown = shutdown
         self._icon_path = icon_path
         self._tray_factory = tray_factory or self._create_native_tray
+        self._has_running_work = has_running_work
+        self._confirm_close_running = (
+            confirm_close_running or self._native_confirm_close_running
+        )
         self._tray = None
         self._tray_ready = False
         self._exiting = False
@@ -76,13 +82,89 @@ class ApplicationLifecycle:
         return True
 
     def on_closing(self):
-        """pywebview closing callback: False cancels native close."""
+        """pywebview closing callback: False cancels native close.
+
+        关闭策略（避免"以为退出了、进程驻留后台改文件"的认知偏差）：
+        - 已在退出序列中 / 没有回合在跑：放行原生关闭（真退出）。
+        - 有回合在跑：弹原生确认框。
+          后台继续（仅托盘可用时提供）→ 隐藏窗口驻留托盘；
+          停止并退出 → 走 exit_application 完整关停序列（取消回合 → drain）；
+          取消 → 返回窗口。
+        - 未注入 has_running_work（旧调用方/测试替身）：退回旧行为，
+          托盘就绪即隐藏驻留。
+        """
         with self._lock:
-            hide = self._tray_ready and not self._exiting
-        if hide:
+            exiting = self._exiting
+            tray_ready = self._tray_ready
+        if exiting:
+            return True
+        if self._has_running_work is None:
+            # 旧行为兼容：托盘就绪 → 隐藏驻留
+            if tray_ready:
+                self._window.hide()
+                return False
+            return True
+        try:
+            running = bool(self._has_running_work())
+        except Exception:
+            logger.exception("检查运行中回合失败，按无回合处理")
+            running = False
+        if not running:
+            return True
+        choice = self._confirm_close_running(allow_background=tray_ready)
+        if choice == "cancel":
+            return False
+        if choice == "background":
             self._window.hide()
             return False
-        return True
+        # 'exit'：停止回合并退出（关停序列含回合取消与 drain）
+        self.exit_application()
+        return False
+
+    def _native_confirm_close_running(self, *, allow_background: bool) -> str:
+        """win32 原生三选/二选框；非 win32 或弹框失败时保守按退出处理。
+
+        返回 'background' / 'exit' / 'cancel'。
+        """
+        if sys.platform != "win32":
+            return "exit"
+        try:
+            import ctypes
+
+            MB_YESNOCANCEL = 0x3
+            MB_YESNO = 0x4
+            MB_ICONQUESTION = 0x20
+            MB_TOPMOST = 0x40000
+            IDYES, IDNO = 6, 7
+            if allow_background:
+                text = (
+                    "有对话回合仍在执行。\n\n"
+                    "【是】最小化到托盘继续运行\n"
+                    "【否】停止回合并退出 Y-CODE\n"
+                    "【取消】返回窗口"
+                )
+                ret = ctypes.windll.user32.MessageBoxW(
+                    None, text, "Y-CODE · 星瑶",
+                    MB_YESNOCANCEL | MB_ICONQUESTION | MB_TOPMOST,
+                )
+                if ret == IDYES:
+                    return "background"
+                if ret == IDNO:
+                    return "exit"
+                return "cancel"
+            text = (
+                "有对话回合仍在执行（系统托盘不可用，无法后台驻留）。\n\n"
+                "【是】停止回合并退出 Y-CODE\n"
+                "【否】返回窗口"
+            )
+            ret = ctypes.windll.user32.MessageBoxW(
+                None, text, "Y-CODE · 星瑶",
+                MB_YESNO | MB_ICONQUESTION | MB_TOPMOST,
+            )
+            return "exit" if ret == IDYES else "cancel"
+        except Exception:
+            logger.exception("关闭确认框弹出失败，按停止并退出处理")
+            return "exit"
 
     def show_window(self, *_args) -> None:
         with self._lock:

@@ -225,7 +225,9 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     monkeypatch.setattr("core.input_parser.parse_user_input", lambda text: (text, []))
 
     def capture_context(*args, **kwargs):
-        seen["cwd"] = os.getcwd()
+        # 多会话并行改造后，workdir 绑定在线程本地上下文而不再是进程 cwd
+        from core.workspace_context import get_workdir
+        seen["cwd"] = str(get_workdir())
         return []
 
     monkeypatch.setattr("core.agent_service.prepare_turn_messages", capture_context)
@@ -235,6 +237,9 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     bridge._run_turn_worker("inspect", "project-session")
 
     assert os.path.realpath(seen["cwd"]) == os.path.realpath(project)
+    # 回合结束后线程本地 workdir 必须恢复，不能泄漏到本回合之外
+    from core.workspace_context import get_workdir
+    assert str(get_workdir()) == os.path.realpath(launch)
 
 
 def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(monkeypatch):
@@ -259,6 +264,7 @@ def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
         "add_message": lambda self, *args, **kwargs: None,
+        "set_workdir": lambda self, workdir: None,
     })()
     emitted = []
     bridge.emit_event = lambda kind, data: emitted.append((kind, data))
@@ -489,6 +495,7 @@ def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch):
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *a, **k: None,
         "add_message": lambda self, *a, **k: None,
+        "set_workdir": lambda self, workdir: None,
     })()
     bridge.emit_event = lambda _kind, _data: None
 

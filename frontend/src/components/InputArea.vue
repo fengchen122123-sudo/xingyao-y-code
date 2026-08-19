@@ -28,7 +28,7 @@
             class="chip-btn plus-btn"
             title="附加文件"
             @click="handlePickFiles"
-          >＋</button>
+          ><AppIcon name="paperclip" :size="14" /></button>
           <button
             ref="permBtnRef"
             data-test="permission-button"
@@ -36,7 +36,7 @@
             :class="`perm-${store.permissionMode}`"
             title="切换权限模式"
             @click.stop="togglePermDropdown"
-          >{{ formatPermMode(store.permissionMode) }} <span class="permission-chevron">▼</span></button>
+          >{{ formatPermMode(store.permissionMode) }} <AppIcon class="permission-chevron" name="chevron-down" :size="11" :stroke-width="2" /></button>
           <button
             data-test="sandbox-button"
             class="chip-btn sandbox-btn"
@@ -68,13 +68,16 @@
             class="chip-btn model-chip"
             title="切换模型"
             @click.stop="toggleModelCascader"
-          >{{ store.activeModelName || '选择模型' }} <span style="font-size:9px;color:var(--text-faint)">▼</span></button>
+          >{{ store.activeModelName || '选择模型' }} <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" /></button>
           <button
             id="send-btn"
             :class="{ stop: store.currentSessionRunning, active: !store.currentSessionRunning && (!!inputVal.trim() || attachments.length > 0) }"
             :title="store.currentSessionRunning ? '停止生成 (Esc)' : '发送消息 (Enter)'"
             @click="handleSend"
-          >{{ store.currentSessionRunning ? '■' : '↑' }}</button>
+          >
+            <AppIcon v-if="store.currentSessionRunning" name="square" :size="14" :stroke-width="2" />
+            <AppIcon v-else name="arrow-up" :size="16" :stroke-width="2.25" />
+          </button>
         </div>
       </div>
     </div>
@@ -106,6 +109,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
+import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
 import AttachmentChips from './AttachmentChips.vue';
@@ -325,6 +329,11 @@ textarea {
   color: var(--orange);
 }
 
+/* 模型按钮上的小箭头（对齐旧 9px 文字箭头的视觉重量） */
+.model-chevron {
+  color: var(--text-faint);
+}
+
 #send-btn {
   /* 与首页一致的圆形箭头按钮 */
   width: 32px;
@@ -333,8 +342,6 @@ textarea {
   border: none;
   background: var(--bg3);
   color: var(--text-faint);
-  font-size: 15px;
-  font-weight: 600;
   cursor: pointer;
   display: flex;
   align-items: center;

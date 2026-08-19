@@ -17,7 +17,7 @@
           <span class="top-spacer"></span>
 
           <div class="export-wrap">
-            <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu">⤓ 导出</button>
+            <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" /> 导出</button>
             <div v-if="showExportMenu" class="export-menu" @click.stop>
               <div class="export-item" @click="doExport('md')">Markdown (.md)</div>
               <div class="export-item" @click="doExport('html')">HTML (.html)</div>
@@ -33,12 +33,13 @@
             <!-- Kimi 空状态卡片 -->
             <KimiEmptyState v-if="!store.messages || store.messages.length === 0" />
 
-            <!-- 消息流列表 -->
+            <!-- 消息流列表：按回合分组渲染——回合结束后中间过程折叠成一块，
+                 只突出组尾的最终总结；运行中的回合保持逐条实时显示 -->
             <template v-else>
-              <MessageBubble
-                v-for="msg in store.messages"
-                :key="msgKey(msg)"
-                :msg="msg"
+              <TurnGroup
+                v-for="group in messageGroups"
+                :key="groupKey(group)"
+                :group="group"
               />
             </template>
 
@@ -54,7 +55,7 @@
               <span v-if="workElapsed >= 1" class="wi-elapsed">已工作 {{ fmtWorkTime(workElapsed) }}</span>
             </div>
             <div v-else-if="finalWorkTime !== null" class="working-indicator done">
-              <span class="wi-check">✓</span>
+              <span class="wi-check"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
               <span class="wi-text">星瑶本轮工作 {{ fmtWorkTime(finalWorkTime) }}</span>
             </div>
           </div>
@@ -121,11 +122,13 @@
 import { ref, onMounted, onUnmounted, nextTick, computed, watch } from 'vue';
 import { useAppStore } from './stores/appStore';
 import { formatPermMode } from './utils/markdown';
+import { buildMessageGroups, msgKey, type TurnGroupInfo } from './utils/turnGroups';
 
 import Topbar from './components/Topbar.vue';
+import AppIcon from './components/AppIcon.vue';
 import Sidebar from './components/Sidebar.vue';
 import KimiEmptyState from './components/KimiEmptyState.vue';
-import MessageBubble from './components/MessageBubble.vue';
+import TurnGroup from './components/TurnGroup.vue';
 import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
@@ -173,17 +176,15 @@ function scrollToBottom() {
 }
 
 // M32 修复：消息列表 key 不用数组索引（插入/删除时组件局部状态会错挂）。
-// 消息对象没有后端 id，这里按对象身份分配稳定的渲染 key：
-// 同一消息对象在列表内移动/前后增删时 key 不变，组件状态不错位。
-const msgKeyMap = new WeakMap<object, number>();
-let msgKeySeq = 0;
-function msgKey(msg: object): number {
-  let k = msgKeyMap.get(msg);
-  if (k === undefined) {
-    k = ++msgKeySeq;
-    msgKeyMap.set(msg, k);
-  }
-  return k;
+// 消息对象没有后端 id，按对象身份分配稳定渲染 key（实现移至 utils/turnGroups，
+// 与 TurnGroup 折叠体共用，保证分组重排时组件实例不错位重挂载）。
+
+// 按回合分组消息流：user 消息开组，组内最后一条 assistant（最终总结）留在
+// 组外展示，其余中间过程在回合结束后折叠（见 TurnGroup.vue）
+const messageGroups = computed(() => buildMessageGroups(store.messages));
+
+function groupKey(group: TurnGroupInfo): number {
+  return msgKey(group.userMsg ?? group.middle[0] ?? group.tail[0]);
 }
 
 // 对话区 DOM 变化观察器：覆盖所有不经过 store 顶层状态的更新——
@@ -313,6 +314,15 @@ watch(() => store.permRequest.show, () => {
 // initStarted 互斥标志保证只初始化一次，触发后移除监听并停轮询。
 let initStarted = false;
 let initPollTimer: number | undefined;
+// 判断 pywebview JS 桥是否真正就绪。pywebview 分两步注入：先注入 api.js
+// （此时 window.pywebview.api 只是空对象 {}），再注入 finish.js 才把
+// get_initial_state 等方法填进去并触发 pywebviewready。若在第一步完成后
+// 就抢跑调用，桥通道尚未就绪，postMessage 消息丢失、Promise 永不 settle，
+// 表现为启动画面一直转圈。因此必须等到方法真正注入完成才算就绪。
+function pywebviewApiReady(): boolean {
+  const api = window.pywebview && window.pywebview.api;
+  return !!(api && typeof api.get_initial_state === 'function');
+}
 function startInit() {
   if (initStarted) return;
   initStarted = true;
@@ -330,7 +340,7 @@ function onPywebviewReady() {
 onMounted(() => {
   document.addEventListener('click', closeExportMenu);
 
-  if (window.pywebview && window.pywebview.api) {
+  if (pywebviewApiReady()) {
     startInit();
   } else {
     window.addEventListener('pywebviewready', onPywebviewReady);
@@ -338,12 +348,15 @@ onMounted(() => {
     let attempts = 0;
     initPollTimer = window.setInterval(() => {
       attempts++;
-      if (window.pywebview && window.pywebview.api) {
+      if (pywebviewApiReady()) {
         startInit();
-      } else if (attempts > 60) {
+      } else if (attempts > 300) {
         clearInterval(initPollTimer);
         initPollTimer = undefined;
         window.removeEventListener('pywebviewready', onPywebviewReady);
+        // 轮询放弃也走初始化：initFromBackend 里 _api() 为空时会弹
+        // "后端连接失败" 提示并撤下启动页，而不是永远卡在启动画面
+        startInit();
       }
     }, 100);
   }

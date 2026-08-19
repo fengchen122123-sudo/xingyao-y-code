@@ -9,6 +9,7 @@ core/llm.py 及其他核心模块通过此模块统一访问运行时状态，
 """
 
 from __future__ import annotations
+import threading
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
 _context: Optional[Any] = None  # 当前注册的上下文实例
@@ -165,19 +166,6 @@ def set_permission_mode(value: Any) -> str:
     return canonical
 
 
-def get_plan_approved() -> bool:
-    ctx = _context
-    if ctx is None:
-        return False
-    return bool(getattr(ctx, "plan_approved_this_turn", False))
-
-
-def set_plan_approved(val: bool) -> None:
-    ctx = _context
-    if ctx is not None:
-        ctx.plan_approved_this_turn = val
-
-
 def get_permission_callback() -> Optional[Callable]:
     """返回 GUI 注册的权限回调，TUI 模式下返回 None。"""
     ctx = _context
@@ -251,6 +239,30 @@ def set_current_session(name: str) -> None:
         except Exception:
             # ctx 的 current_session 常为只读属性（代理入口层全局变量），忽略即可
             pass
+
+
+# ---------------------------------------------------------------------------
+# 线程会话绑定（多会话并行隔离的统一路由锚点）
+# ---------------------------------------------------------------------------
+# GUI 回合线程 / 子代理线程在入口处绑定自己的会话名，core 层的"每会话"状态
+# （计划管理器、授权白名单、沙盒放行）据此路由到各自会话的存储，并行回合
+# 互不可见、互不阻塞。未绑定线程（TUI 后台 worker 之外的主流程、测试主线程）
+# 返回 None，调用方回落到进程级全局（与单会话时代行为一致）。
+# 注意：get_current_session 是"UI 当前查看的会话"（进程级，会随用户切换变化），
+# get_thread_session 是"本线程正在执行的回合所属会话"（线程级，回合期间稳定），
+# 并行场景下所有会话归属判断必须用后者。
+_thread_session_tls = threading.local()
+
+
+def set_thread_session(session_id: str | None) -> None:
+    """绑定/解绑当前线程的执行会话（回合入口绑定，finally 中传 None 解绑）。"""
+    _thread_session_tls.session_id = (
+        str(session_id).strip() if session_id else None
+    )
+
+
+def get_thread_session() -> str | None:
+    return getattr(_thread_session_tls, "session_id", None)
 
 
 # ---------------------------------------------------------------------------
