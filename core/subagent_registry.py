@@ -35,6 +35,8 @@ import hashlib
 import logging
 import threading
 
+from core.workspace_context import get_workdir
+
 # 内置 5 种 type，自定义 name 与之重名时跳过
 BUILTIN_SUBAGENT_TYPES = {"explore", "implement", "test", "review", "general"}
 
@@ -86,8 +88,8 @@ def get_agent_search_dirs():
             pass
     _add(user_dir)
 
-    # 2. 项目级（当前工作目录下）
-    project_dir = os.path.join(os.getcwd(), ".ycode", "agents")
+    # 2. 项目级（当前线程工作目录下，GUI 多会话并行时各自扫描各自项目）
+    project_dir = os.path.join(get_workdir(), ".ycode", "agents")
     _add(project_dir)
 
     return dirs

@@ -7,12 +7,15 @@
         <span class="ac-meta">{{ a.loading ? '加载中…' : (a.ext || 'file').toUpperCase() }}<template v-if="!a.loading && formatFileSize(a.size)"> {{ formatFileSize(a.size) }}</template></span>
       </span>
       <span v-if="a.loading" class="ac-progress"></span>
-      <button class="ac-remove" title="移除附件" @click.stop="$emit('remove', a.path)">✕</button>
+      <button class="ac-remove" title="移除附件" @click.stop="$emit('remove', a.path)">
+        <AppIcon name="x" :size="11" :stroke-width="2.25" />
+      </button>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
+import AppIcon from './AppIcon.vue';
 import type { AttachmentItem } from '../composables/useAttachments';
 import { extIcon, formatFileSize } from '../utils/fileIcon';
 

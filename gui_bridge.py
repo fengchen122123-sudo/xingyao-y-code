@@ -200,14 +200,6 @@ class _GuiContext:
         self._bridge._current_permission_mode = app_context.normalize_permission_mode(val)
 
     @property
-    def plan_approved_this_turn(self) -> bool:
-        return self._bridge._plan_approved_this_turn
-
-    @plan_approved_this_turn.setter
-    def plan_approved_this_turn(self, val: bool):
-        self._bridge._plan_approved_this_turn = val
-
-    @property
     def task_status(self) -> str:
         return self._bridge._task_status
 
@@ -255,7 +247,6 @@ class ApiBridge:
                 logger.warning("初始化 GUI 启动会话失败", exc_info=True)
 
         self._current_permission_mode = app_context.normalize_permission_mode(MY_PERMISSION_MODE)
-        self._plan_approved_this_turn = False
         self._task_status = "idle"
         # 多会话并行：按 session 隔离回合线程和取消事件
         self._active_turns: dict[str, threading.Thread] = {}
@@ -370,6 +361,14 @@ class ApiBridge:
         except Exception:
             logger.debug("订阅窗口事件失败", exc_info=True)
 
+    def has_active_turns(self) -> bool:
+        """是否有任一会话的回合线程仍在运行（关窗退出确认的判断依据）。
+
+        _active_turns 在回合 finally 中 pop，条目存在即代表回合已登记；
+        再用 is_alive 过滤刚登记尚未启动/已结束未清理的极窄竞态窗口。
+        """
+        return any(t.is_alive() for t in self._active_turns.values())
+
     def shutdown(self) -> None:
         """Idempotently stop GUI-owned work before the native window is destroyed."""
         with self._shutdown_lock:
@@ -414,11 +413,10 @@ class ApiBridge:
                 thread.join(timeout=min(0.1, max(0.0, deadline - time.monotonic())))
 
         try:
-            from core import task_scheduler
-            scheduler = getattr(task_scheduler, "_DEFAULT_SCHEDULER", None)
-            if scheduler is not None:
-                scheduler.cancel_all()
-                scheduler.shutdown()
+            # 多会话并行：调度器按会话分桶，退出时必须全部收尾
+            from core.task_scheduler import shutdown_all_schedulers
+
+            shutdown_all_schedulers()
         except Exception:
             logger.exception("退出时停止计划调度器失败")
 
@@ -598,6 +596,48 @@ class ApiBridge:
         ok = save_config_value("gui_theme_light", light)
         self.set_titlebar_theme(not light)
         return {"ok": bool(ok)}
+
+    def get_changelog(self) -> Dict[str, Any]:
+        """解析随安装包发布的 assets/CHANGELOG.md，供关于页展示更新内容。
+
+        格式约定：每个版本一节，标题行 `## <版本> (<日期>)`，
+        其后每行一条 `- <内容>`。返回按文件顺序（最新在前）的结构化条目。
+        """
+        try:
+            if getattr(sys, "frozen", False):
+                base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+            else:
+                base = os.path.dirname(os.path.abspath(__file__))
+            path = os.path.join(base, "assets", "CHANGELOG.md")
+            if not os.path.isfile(path):
+                return {"ok": False, "entries": [], "msg": "更新日志文件缺失"}
+            with open(path, "r", encoding="utf-8") as f:
+                text = f.read()
+
+            entries: List[Dict[str, Any]] = []
+            version = ""
+            date = ""
+            notes: List[str] = []
+            for raw_line in text.splitlines():
+                line = raw_line.strip()
+                if line.startswith("## "):
+                    if version:
+                        entries.append({"version": version, "date": date, "notes": notes})
+                    title = line[3:].strip()
+                    m = re.match(r"^(\S+)\s*[(（](.+?)[)）]$", title)
+                    if m:
+                        version, date = m.group(1), m.group(2)
+                    else:
+                        version, date = title, ""
+                    notes = []
+                elif line.startswith("- ") and version:
+                    notes.append(line[2:].strip())
+            if version:
+                entries.append({"version": version, "date": date, "notes": notes})
+            return {"ok": True, "entries": entries}
+        except Exception as e:
+            logger.exception("解析更新日志失败")
+            return {"ok": False, "entries": [], "msg": str(e)}
 
     def _sync_active_model_context(self):
         """把当前激活模型同步给 app_context，供 core 层（子代理等）读取。"""
@@ -793,6 +833,10 @@ class ApiBridge:
         return msgs
 
     def get_initial_state(self) -> Dict[str, Any]:
+        # 启动诊断：前端能调到本方法，说明 JS→Python 桥已打通。
+        # 若启动卡死时日志里没有这条，说明调用根本没到 Python（桥消息丢失），
+        # 而非本方法内部卡住——据此区分"前端没调进来"与"卡在入口"。
+        logger.info("get_initial_state 入口被调用（前端桥已打通）")
         try:
             active_model = get_active_model() or {}
             config_data = load_config()
@@ -1759,6 +1803,9 @@ class ApiBridge:
         event_session_name = session_name
         cancelled = False
         turn_id = ""
+        # 线程本地 workdir 作用域：绑定后必须在本回合 finally 中退出恢复，
+        # 防止主线程直调（测试）或未来线程复用场景下 workdir 泄漏到下一回合
+        _workdir_scope = None
         error_state = {
             "toast_messages": set(),
             "terminal_message": None,
@@ -1792,7 +1839,6 @@ class ApiBridge:
         self.emit_event("turn_start", turn_start_data)
 
         try:
-            self._plan_approved_this_turn = False
             active_model = get_active_model()
             if not active_model or not active_model.get("litellm_model"):
                 # 关键修复：没有激活模型时也必须让前端解锁输入框
@@ -1818,10 +1864,20 @@ class ApiBridge:
                 turn_workdir = _resolve_real_path(turn_workdir)
                 if not os.path.isdir(turn_workdir):
                     raise FileNotFoundError(f"会话项目文件夹不存在: {turn_workdir}")
-            # 线程本地 workdir 绑定：替代进程级 os.chdir，多会话并行时互不干扰
-            from core.workspace_context import set_workdir
-            set_workdir(turn_workdir)
+            # 线程本地 workdir 绑定：替代进程级 os.chdir，多会话并行时互不干扰。
+            # 用 workspace_scope（进入绑定/退出恢复原值）而非裸 set_workdir：
+            # 裸绑定在线程不被销毁的场景（主线程直调、未来线程池复用）会永久
+            # 残留，导致后续回合路径校验全部误判"越界"
+            from core.workspace_context import workspace_scope
+            _workdir_scope = workspace_scope(turn_workdir)
+            _workdir_scope.__enter__()
             self._memory.set_workdir(turn_workdir)
+            # 多会话并行路由锚点：本线程后续所有“每会话”状态（计划管理器、
+            # 授权白名单、沙盒放行、子代理调度器）都路由到 session_name，
+            # 与并行运行的其他会话回合彻底隔离
+            app_context.set_thread_session(session_name)
+            from core.plan import set_current_plan_session
+            set_current_plan_session(session_name)
 
             # 确保会话存在，再解析用户输入（支持 @文件 / 图片挂载）并入库
             self._memory.ensure_session(session_name, workdir=turn_workdir, source="GUI")
@@ -1927,6 +1983,18 @@ class ApiBridge:
             logger.exception("GUI 对话回合失败")
             self._emit_owned_error(str(e), api_key, error_state, terminal=True, session_name=session_name)
         finally:
+            # 先解绑本回合的会话路由与线程本地 workdir（workspace_scope 退出语义），
+            # 再走其余清理，保证任何提前 return / 异常路径都不会把本回合的
+            # 会话归属与工作目录泄漏到回合之外
+            try:
+                from core.plan import set_current_plan_session as _unbind_plan_route
+
+                _unbind_plan_route(None)
+            except Exception:
+                pass
+            app_context.set_thread_session(None)
+            if _workdir_scope is not None:
+                _workdir_scope.__exit__(None, None, None)
             # 身份校验清理 cancel 事件：finally 竞态窗口内（本线程还没走完
             # finally，但 _active_turns 已 pop）新回合可能已建立同名事件，
             # 仅当字典里仍是本回合自己的事件对象时才删除，防误删新回合事件

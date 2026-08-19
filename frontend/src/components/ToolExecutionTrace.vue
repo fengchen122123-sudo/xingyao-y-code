@@ -1,24 +1,22 @@
 <template>
-  <div class="exec-trace">
-    <button class="trace-head" :aria-expanded="expanded" @click="expanded = !expanded">
-      <span class="trace-caret" aria-hidden="true">{{ expanded ? '▾' : '▸' }}</span>
-      <!-- 状态变化（进行中 -> 已完成 等）通过 aria-live 礼貌播报；
-           行内 elapsed 秒数不在 live 区域内，避免高频打扰 -->
-      <span class="trace-title" aria-live="polite">{{ title }}</span>
-    </button>
-    <div v-show="expanded" class="trace-body">
-      <ToolExecutionRow
-        v-for="row in rows"
-        :key="row.id"
-        :row="row"
-        :elapsed-ms="activeElapsedMs"
-      />
-    </div>
-  </div>
+  <FoldCard v-model:open="expanded" class="exec-trace">
+    <!-- 状态变化（进行中 -> 已完成 等）通过 aria-live 礼貌播报；
+         行内 elapsed 秒数不在 live 区域内，避免高频打扰 -->
+    <template #title>
+      <span aria-live="polite">{{ title }}</span>
+    </template>
+    <ToolExecutionRow
+      v-for="row in rows"
+      :key="row.id"
+      :row="row"
+      :elapsed-ms="activeElapsedMs"
+    />
+  </FoldCard>
 </template>
 
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue';
+import FoldCard from './FoldCard.vue';
 import ToolExecutionRow from './ToolExecutionRow.vue';
 import {
   buildToolTraceRows,
@@ -95,35 +93,8 @@ const activeElapsedMs = computed(() => {
 </script>
 
 <style scoped>
+/* 折叠头/箭头/内容体样式统一由 FoldCard 提供 */
 .exec-trace {
   margin: 8px 0;
-}
-.trace-head {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  width: 100%;
-  background: none;
-  border: none;
-  padding: 2px 0;
-  cursor: pointer;
-  font-family: inherit;
-  font-size: 12px;
-  color: var(--text-faint);
-  text-align: left;
-}
-.trace-head:hover {
-  color: var(--text-dim);
-}
-.trace-caret {
-  flex-shrink: 0;
-  font-size: 11px;
-}
-.trace-title {
-  font-weight: 600;
-  letter-spacing: 0.2px;
-}
-.trace-body {
-  margin-top: 2px;
 }
 </style>

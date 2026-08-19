@@ -8,6 +8,7 @@ import logging
 import threading
 
 import config
+from core.workspace_context import get_workdir
 # 使用一个独立的文件来记录当前启用的技能列表
 ACTIVE_SKILLS_FILE = config.ACTIVE_SKILLS_FILE
 
@@ -129,12 +130,12 @@ def _log_warning(message, *args):
         pass
 
 def _expand_path(p):
-    """展开 ~ 与环境变量，相对路径相对 cwd 解析。返回展开后的路径（不强制存在）。"""
+    """展开 ~ 与环境变量，相对路径相对当前线程工作目录解析。返回展开后的路径（不强制存在）。"""
     if not isinstance(p, str) or not p.strip():
         return None
     p = os.path.expandvars(os.path.expanduser(p.strip()))
     if not os.path.isabs(p):
-        p = os.path.join(os.getcwd(), p)
+        p = os.path.join(get_workdir(), p)
     return os.path.normpath(p)
 
 
@@ -221,7 +222,7 @@ def is_skill_path(file_path):
         p = str(file_path).strip()
         p = os.path.expandvars(os.path.expanduser(p))
         if not os.path.isabs(p):
-            p = os.path.join(os.getcwd(), p)
+            p = os.path.join(get_workdir(), p)
         candidate = os.path.normcase(os.path.abspath(p))
     except Exception:
         return False
@@ -248,7 +249,7 @@ def is_trusted_read_path(file_path):
         candidate = os.path.expandvars(candidate)
         candidate = os.path.expanduser(candidate)
         if not os.path.isabs(candidate):
-            candidate = os.path.join(os.getcwd(), candidate)
+            candidate = os.path.join(get_workdir(), candidate)
         candidate = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
         if not os.path.exists(candidate):
             return False

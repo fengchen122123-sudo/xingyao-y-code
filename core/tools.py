@@ -153,8 +153,11 @@ def _compress_source_text(text):
 
 
 # 线程内临时放行（用户批准的单次沙盒外操作）与会话级放行（用户选“始终放行”）
+# 会话级放行按线程绑定的会话分桶存储（多会话并行隔离）：会话 A 放行不影响
+# 会话 B；未绑定线程（TUI 主流程）沿用进程级全局标志（单会话语义不变）。
 _sandbox_tls = threading.local()
 _session_sandbox_bypass = False
+_session_sandbox_bypass_by_session: dict[str, bool] = {}
 _session_sandbox_lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -205,16 +208,37 @@ def sandbox_bypass():
         _sandbox_tls.depth = depth
 
 
+def _sandbox_session_id():
+    """当前线程绑定的执行会话（多会话并行路由）；未绑定返回 None。"""
+    try:
+        import core.app_context as _app_context
+
+        sid = _app_context.get_thread_session()
+        return str(sid) if sid else None
+    except Exception:
+        return None
+
+
 def set_session_sandbox_bypass(enabled):
-    """会话级沙盒放行（用户在沙盒外访问确认中选择“始终放行”时置位）。"""
+    """会话级沙盒放行（用户在沙盒外访问确认中选择“始终放行”时置位）。
+
+    绑定了线程会话的回合写入各自会话的桶；未绑定线程写进程级全局标志。
+    """
     global _session_sandbox_bypass
+    sid = _sandbox_session_id()
     with _session_sandbox_lock:
-        _session_sandbox_bypass = bool(enabled)
+        if sid:
+            _session_sandbox_bypass_by_session[sid] = bool(enabled)
+        else:
+            _session_sandbox_bypass = bool(enabled)
 
 
 def is_session_sandbox_bypass_enabled():
     """读取会话级沙盒放行标志（供 core.llm 权限快路径免询问判定）。"""
+    sid = _sandbox_session_id()
     with _session_sandbox_lock:
+        if sid:
+            return _session_sandbox_bypass_by_session.get(sid, False)
         return _session_sandbox_bypass
 
 
@@ -226,9 +250,8 @@ def _outside_workspace_allowed():
     """
     if getattr(_sandbox_tls, "depth", 0) > 0:
         return True
-    with _session_sandbox_lock:
-        if _session_sandbox_bypass:
-            return True
+    if is_session_sandbox_bypass_enabled():
+        return True
     try:
         from core.model_manager import load_config
         return bool(load_config().get("allow_outside_workspace", False))
@@ -2491,6 +2514,15 @@ class SubagentManager:
             from core.workspace_context import set_workdir
             if task.workdir:
                 set_workdir(task.workdir)
+            # 计划/授权/沙盒放行等“每会话”状态同样路由到父会话：
+            # 子代理执行计划项、触发权限询问时操作的是父会话的桶，
+            # 不会串到其他并行会话
+            import core.app_context as _subagent_app_context
+
+            _subagent_app_context.set_thread_session(task.parent_session)
+            from core.plan import set_current_plan_session as _bind_plan_route
+
+            _bind_plan_route(task.parent_session)
             try:
                 result = _strip_advisor_tags(str(self._runner(task) or "").strip())
             except BaseException as error:

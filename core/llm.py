@@ -327,13 +327,90 @@ import core.app_context as app_context
 from core import permission_store
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
+# 模块级三个集合是"未绑定线程"（TUI 主流程 / 测试主线程）的默认桶；
+# 多会话并行下，绑定了线程会话的回合（GUI 回合/子代理线程）使用
+# _SESSION_GRANTS 里各自会话的专属桶，互不可见（详见 _session_grants_bucket）。
 session_allowed_commands: set[tuple[str, ...]] = set()  # 结构化命令规则
 session_allowed_write_files = set()   # 放行的写入文件绝对路径
 session_allowed_edit_files = set()    # 放行的修改文件绝对路径
+_SESSION_GRANTS: dict[str, dict[str, set]] = {}
+_SESSION_GRANTS_MAX_SESSIONS = 128
 _last_tracked_session = None
 _raw_permission_lock = threading.Lock()
 # 保护会话放行白名单与 _last_tracked_session 的跨线程读写
 _session_whitelist_lock = threading.Lock()
+
+
+def _session_grants_bucket() -> dict[str, set] | None:
+    """当前线程会话的授权桶；未绑定线程返回 None（调用方走模块级默认集合）。
+
+    桶结构：{"commands": set, "write_files": set, "edit_files": set}
+    """
+    sid = app_context.get_thread_session()
+    if not sid:
+        return None
+    with _session_whitelist_lock:
+        bucket = _SESSION_GRANTS.get(sid)
+        if bucket is None:
+            if len(_SESSION_GRANTS) >= _SESSION_GRANTS_MAX_SESSIONS:
+                _SESSION_GRANTS.pop(next(iter(_SESSION_GRANTS)), None)
+            bucket = {"commands": set(), "write_files": set(), "edit_files": set()}
+            _SESSION_GRANTS[sid] = bucket
+        return bucket
+
+
+def clear_session_grants(session_id: str) -> None:
+    """清空指定会话的授权桶（会话删除/测试隔离时调用）。"""
+    with _session_whitelist_lock:
+        _SESSION_GRANTS.pop(str(session_id), None)
+
+
+def _grant_command_add(prefix: tuple[str, ...]) -> None:
+    bucket = _session_grants_bucket()
+    with _session_whitelist_lock:
+        if bucket is None:
+            session_allowed_commands.add(prefix)
+        else:
+            bucket["commands"].add(prefix)
+
+
+def _grant_write_add(canonical_path: str) -> None:
+    bucket = _session_grants_bucket()
+    with _session_whitelist_lock:
+        if bucket is None:
+            session_allowed_write_files.add(canonical_path)
+        else:
+            bucket["write_files"].add(canonical_path)
+
+
+def _grant_edit_add(canonical_path: str) -> None:
+    bucket = _session_grants_bucket()
+    with _session_whitelist_lock:
+        if bucket is None:
+            session_allowed_edit_files.add(canonical_path)
+        else:
+            bucket["edit_files"].add(canonical_path)
+
+
+def _grant_command_hit(command: str) -> bool:
+    bucket = _session_grants_bucket()
+    with _session_whitelist_lock:
+        prefixes = session_allowed_commands if bucket is None else bucket["commands"]
+        return any(_command_matches_prefix(command, prefix) for prefix in prefixes)
+
+
+def _grant_write_hit(canonical_path: str) -> bool:
+    bucket = _session_grants_bucket()
+    with _session_whitelist_lock:
+        paths = session_allowed_write_files if bucket is None else bucket["write_files"]
+        return canonical_path in paths
+
+
+def _grant_edit_hit(canonical_path: str) -> bool:
+    bucket = _session_grants_bucket()
+    with _session_whitelist_lock:
+        paths = session_allowed_edit_files if bucket is None else bucket["edit_files"]
+        return canonical_path in paths
 
 
 def _canonical_permission_path(value):
@@ -409,6 +486,11 @@ def _has_pending_plan(session_id):
 
 def check_session_reset():
     global _last_tracked_session
+    # 多会话并行：本线程绑定了执行会话时，授权已按会话分桶、互不可见，
+    # UI 切换全局会话（用户只是去别的会话看一眼）不再收回运行中回合的授权。
+    # 仅未绑定线程（TUI 单会话主流程）保留"切会话即收回"的旧语义。
+    if app_context.get_thread_session():
+        return
     with _session_whitelist_lock:
         current = app_context.get_current_session()
         if current and _last_tracked_session != current:
@@ -511,20 +593,17 @@ def ask_in_raw_terminal(function_name, arguments):
                 if prefix is None:
                     print("[内联执行命令不做会话前缀放行，仅本次通过]")
                 else:
-                    with _session_whitelist_lock:
-                        session_allowed_commands.add(prefix)
+                    _grant_command_add(prefix)
                     print(f"[当前会话已放行] {_format_session_command_rule(prefix)}")
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
-                    with _session_whitelist_lock:
-                        session_allowed_write_files.add(_canonical_permission_path(file_path))
+                    _grant_write_add(_canonical_permission_path(file_path))
                     print(f"[当前会话已放行写入]：{file_path}")
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
-                    with _session_whitelist_lock:
-                        session_allowed_edit_files.add(_canonical_permission_path(file_path))
+                    _grant_edit_add(_canonical_permission_path(file_path))
                     print(f"[当前会话已放行修改]：{file_path}")
             elif function_name == "sandbox_outside_access":
                 # 会话级放行（不落盘）：本会话内后续沙盒外访问免询问
@@ -555,11 +634,7 @@ def check_permission_and_ask(
     #    会话白名单（内存）与项目持久化白名单（~/.ycode/permissions.json）依次命中
     if function_name == "execute_command":
         cmd = arguments.get("command", "")
-        with _session_whitelist_lock:
-            session_hit = any(
-                _command_matches_prefix(cmd, prefix)
-                for prefix in session_allowed_commands
-            )
+        session_hit = _grant_command_hit(cmd)
         persistent_hit = False
         if not session_hit:
             try:
@@ -581,8 +656,7 @@ def check_permission_and_ask(
     elif function_name == "write_file":
         file_path = arguments.get("file_path", "")
         canonical_path = _canonical_permission_path(file_path)
-        with _session_whitelist_lock:
-            session_hit = canonical_path in session_allowed_write_files
+        session_hit = _grant_write_hit(canonical_path)
         persistent_hit = False
         if not session_hit:
             try:
@@ -601,8 +675,7 @@ def check_permission_and_ask(
     elif function_name == "edit_file":
         file_path = arguments.get("file_path", "")
         canonical_path = _canonical_permission_path(file_path)
-        with _session_whitelist_lock:
-            session_hit = canonical_path in session_allowed_edit_files
+        session_hit = _grant_edit_hit(canonical_path)
         persistent_hit = False
         if not session_hit:
             try:
@@ -762,8 +835,7 @@ def check_permission_and_ask(
                             "message": "内联执行命令不做前缀放行，仅本次通过。",
                         })
                 else:
-                    with _session_whitelist_lock:
-                        session_allowed_commands.add(prefix)
+                    _grant_command_add(prefix)
                     persisted = False
                     try:
                         persisted = permission_store.add_command_rule(prefix)
@@ -778,8 +850,7 @@ def check_permission_and_ask(
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     canonical = _canonical_permission_path(file_path)
-                    with _session_whitelist_lock:
-                        session_allowed_write_files.add(canonical)
+                    _grant_write_add(canonical)
                     persisted = False
                     try:
                         persisted = permission_store.add_write_file(canonical)
@@ -792,8 +863,7 @@ def check_permission_and_ask(
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     canonical = _canonical_permission_path(file_path)
-                    with _session_whitelist_lock:
-                        session_allowed_edit_files.add(canonical)
+                    _grant_edit_add(canonical)
                     persisted = False
                     try:
                         persisted = permission_store.add_edit_file(canonical)

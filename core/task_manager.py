@@ -8,6 +8,7 @@ import time
 import uuid
 
 from core.process_io import decode_process_output, platform_console_encoding
+from core.workspace_context import get_workdir
 
 _logger = logging.getLogger("py.warnings")
 
@@ -91,10 +92,10 @@ def _watch_task_completion(task_id, process, command, session_id):
 
 
 def _ensure_paths():
-    """按需解析日志目录与任务库路径（首次使用时按当前 cwd 确定）。"""
+    """按需解析日志目录与任务库路径（首次使用时按当前线程工作目录确定）。"""
     global LOG_DIR, TASK_DB_PATH
     if LOG_DIR is None:
-        LOG_DIR = os.path.abspath(os.path.join(os.getcwd(), ".ycode_tasks"))
+        LOG_DIR = os.path.abspath(os.path.join(get_workdir(), ".ycode_tasks"))
         try:
             os.makedirs(LOG_DIR, exist_ok=True)
         except OSError as error:
@@ -294,12 +295,15 @@ def start_background_task(command: str, session_id: str = "") -> str:
         # stdout 和 stderr 都合并写入日志文件
         # shell=True 以支持复杂的脚本串联，creationflags 为后台启动做优化
         try:
+            # cwd 跟随发起任务的会话工作目录（多会话并行时命令跑在各自项目下），
+            # 不再隐式继承进程启动目录
             process = subprocess.Popen(
                 command,
                 shell=True,
                 stdout=log_file,
                 stderr=log_file,
                 env=env,
+                cwd=str(get_workdir()),
                 creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else 0,
                 start_new_session=os.name != "nt",
             )

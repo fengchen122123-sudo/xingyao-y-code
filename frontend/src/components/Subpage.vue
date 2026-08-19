@@ -1,7 +1,7 @@
 <template>
   <div id="subpage" :class="{ show: visible }">
     <div class="sub-head">
-      <button class="sub-back" @click="emit('close')">← 返回</button>
+      <button class="sub-back" @click="emit('close')"><AppIcon name="arrow-left" :size="13" /> 返回</button>
       <h2>{{ title }}</h2>
       <span class="sub-desc">{{ desc }}</span>
     </div>
@@ -12,7 +12,7 @@
         <div v-if="store.skills.length === 0" class="sub-empty">暂无可用技能</div>
         <div v-for="s in store.skills" :key="s.id" class="sub-card">
           <div class="sc-top">
-            <div class="sc-ico">❖</div>
+            <div class="sc-ico"><AppIcon name="gem" :size="16" /></div>
             <div class="sc-name">{{ s.name || s.id }}</div>
             <label class="switch" title="启用/禁用该技能" @click.stop>
               <input type="checkbox" :checked="s.enabled" @change="onToggleSkill(s, ($event.target as HTMLInputElement).checked)" />
@@ -27,8 +27,8 @@
       <!-- MCP 页 -->
       <div v-else-if="subType === 'mcp'">
          <div class="sub-toolbar">
-           <button class="chip-btn" title="添加自定义 MCP 服务" @click="addForm.show = !addForm.show">＋ 添加服务</button>
-           <button class="chip-btn" title="重新连接所有 MCP 服务" @click="store.reconnectMcp()">↻ 重连</button>
+           <button class="chip-btn" title="添加自定义 MCP 服务" @click="addForm.show = !addForm.show"><AppIcon name="plus" :size="12" /> 添加服务</button>
+           <button class="chip-btn" title="重新连接所有 MCP 服务" @click="store.reconnectMcp()"><AppIcon name="refresh" :size="12" /> 重连</button>
          </div>
          <div v-if="addForm.show" class="mcp-add-form">
            <div class="maf-row">
@@ -121,8 +121,16 @@
             <div class="model-group-title">{{ provider }}</div>
             <div v-for="m in list" :key="m.id" class="model-row">
               <span class="m-name">{{ m.name }}</span>
-              <span v-if="m.id === store.activeModelId" class="m-active">● 使用中</span>
-              <span v-if="testResults[m.id]" class="m-test-result">{{ testResults[m.id] }}</span>
+              <span v-if="m.id === store.activeModelId" class="m-active"><i class="m-active-dot"></i>使用中</span>
+              <span v-if="testResults[m.id]" class="m-test-result" :class="testResults[m.id].status">
+                <AppIcon
+                  v-if="testResults[m.id].status !== 'testing'"
+                  :name="testResults[m.id].status === 'ok' ? 'check' : 'x'"
+                  :size="11"
+                  :stroke-width="2.25"
+                />
+                {{ testResults[m.id].msg }}
+              </span>
               <span class="model-row-actions">
                 <button class="chip-btn" :disabled="testingModelId === m.id" title="测试连接" @click="testModelRow(m)">
                   <span v-if="testingModelId === m.id" class="mini-spin"></span>测试连接
@@ -141,6 +149,7 @@
 
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
+import AppIcon from './AppIcon.vue';
 import { useAppStore, type SubpageType } from '../stores/appStore';
 import type { SkillInfo, McpInfo, ModelInfo, PluginInfo } from '../types/pywebview';
 
@@ -292,13 +301,13 @@ async function submitAddModel() {
 
 // ---- 模型管理：测试连接 ----
 const testingModelId = ref<string | null>(null);
-const testResults = ref<Record<string, string>>({});
+const testResults = ref<Record<string, { status: 'testing' | 'ok' | 'fail'; msg: string }>>({});
 
 async function testModelRow(m: ModelInfo) {
   testingModelId.value = m.id;
-  testResults.value[m.id] = '';
+  testResults.value[m.id] = { status: 'testing', msg: '测试中…' };
   const res = await store.testModel(m.id);
-  testResults.value[m.id] = (res.ok ? '✓ ' : '✕ ') + res.msg;
+  testResults.value[m.id] = { status: res.ok ? 'ok' : 'fail', msg: res.msg };
   testingModelId.value = null;
 }
 </script>
@@ -697,11 +706,25 @@ async function testModelRow(m: ModelInfo) {
 .model-row .m-active {
   font-size: 10.5px;
   color: var(--green);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.model-row .m-active-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--green);
 }
 .model-row .m-test-result {
   font-size: 11px;
   color: var(--text-faint);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
+.model-row .m-test-result.ok { color: var(--green); }
+.model-row .m-test-result.fail { color: var(--red); }
 .model-row-actions {
   margin-left: auto;
   display: flex;

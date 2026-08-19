@@ -37,15 +37,13 @@
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
 
-        <!-- 思考过程 Block -->
+        <!-- 思考过程 Block（FoldCard 统一折叠体系，箭头在标题右侧） -->
         <div v-if="msg.reasoning_content && msg.reasoning_content.trim()" class="think-block">
-          <div class="tk-head" @click="thinkingOpen = !thinkingOpen">
-            <span>思考过程</span>
-            <span style="margin-left:auto">{{ thinkingOpen ? '▾' : '▸' }}</span>
-          </div>
-          <div v-show="thinkingOpen" class="tk-cnt">
-            {{ msg.reasoning_content }}
-          </div>
+          <FoldCard v-model:open="thinkingOpen" title="思考过程" caret="end">
+            <div class="tk-cnt">
+              {{ msg.reasoning_content }}
+            </div>
+          </FoldCard>
         </div>
 
         <!-- 工具执行时间线（含绑定/未绑定的文件变更 Diff） -->
@@ -60,7 +58,9 @@
         <div v-if="msg.content && msg.content.trim()" class="md-body" v-html="renderMarkdown(msg.content)"></div>
 
         <!-- 回合进行中的非终态错误（挂在助手消息上，不插队成独立 error 消息） -->
-        <div v-if="msg.error_note" class="error-note">⚠ {{ msg.error_note }}</div>
+        <div v-if="msg.error_note" class="error-note">
+          <AppIcon name="triangle-alert" :size="13" /> {{ msg.error_note }}
+        </div>
 
         <!-- 等待模型响应期间的动态反馈（对齐 CLI 的“星瑶正在干活”） -->
         <div v-if="showWorking" class="working-line">
@@ -73,7 +73,7 @@
 
     <!-- 错误提示（余额不足 / 模型异常等运行错误，写入对话流而非弹窗） -->
     <div v-else-if="msg.role === 'error'" class="error-card">
-      <span class="error-icon">⚠</span>
+      <span class="error-icon"><AppIcon name="triangle-alert" :size="16" /></span>
       <div class="error-body">
         <div class="error-title">运行错误</div>
         <div class="error-text">{{ msg.content }}</div>
@@ -82,7 +82,7 @@
 
     <!-- 对话内系统提示（取代原 Toast：跟随对话流，不自动消失） -->
     <div v-else-if="msg.role === 'notice'" class="notice-card">
-      <span class="notice-icon">ⓘ</span>
+      <span class="notice-icon"><AppIcon name="info" :size="15" /></span>
       <div class="notice-body">
         <div class="notice-title">提示</div>
         <div class="notice-text">{{ msg.content }}</div>
@@ -95,6 +95,8 @@
 import { ref, computed, watch, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdown } from '../utils/markdown';
+import AppIcon from './AppIcon.vue';
+import FoldCard from './FoldCard.vue';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
 
 const props = defineProps<{
@@ -251,12 +253,9 @@ const thinkingOpen = computed({
   font-size: 12.5px;
   color: var(--purple);
 }
-.tk-head {
-  display: flex;
-  align-items: center;
-  cursor: pointer;
-  user-select: none;
-  font-weight: 600;
+/* 思考块内的折叠头跟随块体紫色（覆盖 FoldCard 默认的 faint 灰） */
+.think-block :deep(.fold-head) {
+  color: inherit;
 }
 .tk-cnt {
   margin-top: 6px;
@@ -314,6 +313,9 @@ const thinkingOpen = computed({
 
 /* 挂在助手消息上的非终态错误提示 */
 .error-note {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
   margin-top: 8px;
   padding: 8px 12px;
   font-size: 12.5px;

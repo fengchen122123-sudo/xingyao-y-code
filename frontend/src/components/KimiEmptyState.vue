@@ -34,7 +34,7 @@
             class="kimi-pill-btn"
             title="添加附件"
             @click="handlePickFiles"
-          >＋</button>
+          ><AppIcon name="paperclip" :size="14" /></button>
           <button
             ref="permBtnRef"
             data-test="permission-button"
@@ -44,7 +44,7 @@
             @click.stop="togglePermDropdown"
           >
             <span>{{ formatPermMode(store.permissionMode) }}</span>
-            <span class="permission-chevron">▼</span>
+            <AppIcon class="permission-chevron" name="chevron-down" :size="11" :stroke-width="2" />
           </button>
         </div>
 
@@ -56,7 +56,7 @@
             @click.stop="toggleModelCascader"
           >
             <span>{{ store.activeModelName || '选择模型' }}</span>
-            <span style="font-size:10px;color:var(--text-faint)">▼</span>
+            <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" />
           </button>
 
           <button
@@ -65,7 +65,7 @@
             :disabled="store.currentSessionRunning"
             title="发送消息 (Enter)"
             @click="handleSend"
-          >↑</button>
+          ><AppIcon name="arrow-up" :size="16" :stroke-width="2.25" /></button>
         </div>
       </div>
     </div>
@@ -76,7 +76,7 @@
       @click.stop="toggleWorkdirDropdown"
     >
       <span>{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '进入项目工作区' : '当前工作区: ' + store.currentWorkdirLabel }}</span>
-      <span style="font-size:10px;color:var(--text-faint)">▼</span>
+      <AppIcon name="chevron-down" :size="11" :stroke-width="2" class="model-chevron" />
     </div>
 
     <!-- 工作区切换下拉：可退出工作区回自由对话 / 快捷切换项目 / 引入新项目 -->
@@ -95,12 +95,12 @@
         :class="{ active: g.folder_path === store.workdir }"
         @click="chooseProject(g.folder_path)"
       >
-        <span class="wd-label">📁 {{ g.folder_name }}</span>
-        <span v-if="g.folder_path === store.workdir" class="wd-check">✓</span>
+        <span class="wd-label"><AppIcon name="folder" :size="13" /> {{ g.folder_name }}</span>
+        <span v-if="g.folder_path === store.workdir" class="wd-check"><AppIcon name="check" :size="13" :stroke-width="2" /></span>
       </div>
       <div class="workdir-sep"></div>
       <div class="workdir-item" @click="chooseOpenFolder">
-        <span class="wd-label">➕ 进入项目工作区…</span>
+        <span class="wd-label"><AppIcon name="plus" :size="13" /> 进入项目工作区…</span>
       </div>
     </div>
 
@@ -122,6 +122,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
+import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
 import AttachmentChips from './AttachmentChips.vue';
@@ -273,11 +274,17 @@ function handleKeydown(e: KeyboardEvent) {
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
 .workdir-item .wd-check {
   color: var(--accent);
-  font-size: 12px;
   margin-left: 8px;
+}
+/* 模型/工作区按钮上的小箭头（对齐旧 10px 文字箭头的视觉重量） */
+.model-chevron {
+  color: var(--text-faint);
 }
 .workdir-sep {
   height: 1px;

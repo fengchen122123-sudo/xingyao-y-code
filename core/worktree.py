@@ -18,13 +18,15 @@ import os
 import subprocess
 from pathlib import Path
 
+from core.workspace_context import get_workdir
+
 
 def _run_git(args, cwd=None):
     """运行 git 命令，返回 (returncode, stdout, stderr)。"""
     try:
         result = subprocess.run(
             ['git'] + args,
-            cwd=cwd or os.getcwd(),
+            cwd=cwd or str(get_workdir()),
             capture_output=True, text=True,
             encoding='utf-8', errors='replace',
             timeout=30,
@@ -75,8 +77,8 @@ def create_worktree(branch, path, base_branch=None, cwd=None):
     if not path or _is_option_like(str(path)):
         return f"🚨 worktree 路径不合法：{path!r}"
 
-    # 解析 worktree 路径（相对路径应相对 cwd，而非进程当前目录）
-    repo_root = Path(cwd or os.getcwd()).resolve()
+    # 解析 worktree 路径（相对路径应相对会话工作目录，而非进程当前目录）
+    repo_root = Path(cwd or get_workdir()).resolve()
     abs_path = Path(repo_root, path).resolve()
     # T4 修复：规范化后的边界校验——不能覆盖仓库根目录，也不能落在 .git 目录内
     if abs_path == repo_root:
@@ -163,7 +165,7 @@ def remove_worktree(path, force=False, cwd=None):
     if not path or _is_option_like(str(path)):
         return f"🚨 worktree 路径不合法：{path!r}"
 
-    abs_path = Path(cwd or os.getcwd(), path).resolve()
+    abs_path = Path(cwd or get_workdir(), path).resolve()
     args = ['worktree', 'remove']
     if force:
         args.append('--force')

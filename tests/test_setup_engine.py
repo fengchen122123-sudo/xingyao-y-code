@@ -29,7 +29,7 @@ def _fake_bundle(tmp_path, as_zip=False):
             p = bundle / "ycode_pkg" / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
-    (bundle / "ycode_uninstall.exe").write_text("uninst", encoding="utf-8")
+    (bundle / "Y-code-uninstall.exe").write_text("uninst", encoding="utf-8")
     (bundle / "config.example.json").write_text("{}", encoding="utf-8")
     (bundle / "version.txt").write_text("9.9.9", encoding="utf-8")
     return bundle
@@ -70,7 +70,7 @@ def test_full_install_with_cli_and_shortcut(tmp_path, patched_env):
     assert (tmp_path / "installed" / "ycode.exe").exists()
     assert (tmp_path / "installed" / "Y-code.exe").exists()
     assert (tmp_path / "installed" / "_internal" / "frontend" / "index.html").exists()
-    assert (tmp_path / "installed" / "ycode_uninstall.exe").exists()
+    assert (tmp_path / "installed" / "Y-code-uninstall.exe").exists()
     assert patched_env["path"] == [install_dir]
     assert len(patched_env["shortcut"]) == 1
     assert patched_env["registry"][0]["app_key_name"] == "Y-code"
@@ -520,7 +520,7 @@ def test_overwrite_install_prunes_files_removed_in_new_version(tmp_path, patched
     (bundle2 / "ycode_pkg" / "_internal").mkdir(parents=True)
     (bundle2 / "ycode_pkg" / "ycode.exe").write_text("tui2", encoding="utf-8")
     (bundle2 / "ycode_pkg" / "Y-code.exe").write_text("gui2", encoding="utf-8")
-    (bundle2 / "ycode_uninstall.exe").write_text("uninst", encoding="utf-8")
+    (bundle2 / "Y-code-uninstall.exe").write_text("uninst", encoding="utf-8")
     (bundle2 / "version.txt").write_text("9.9.10", encoding="utf-8")
     run_install("full", str(bundle2),
                 InstallOptions(install_dir, install_cli=False, create_desktop_shortcut=False),

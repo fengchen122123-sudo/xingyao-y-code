@@ -1,8 +1,13 @@
 <template>
   <div>
     <div class="file-row" :class="{ open: isOpen }" @click="toggle">
-      <span class="fi">{{ node.d ? (isOpen ? '▾' : '▸') : '' }}</span>
-      <span class="ficon">{{ icon }}</span>
+      <span class="fi">
+        <AppIcon v-if="node.d" name="chevron-right" :size="12" :class="{ 'is-open': isOpen }" />
+      </span>
+      <span class="ficon">
+        <AppIcon v-if="node.d" :name="isOpen ? 'folder-open' : 'folder'" :size="14" />
+        <template v-else>{{ icon }}</template>
+      </span>
       <span class="fname">{{ node.n }}</span>
     </div>
     <div v-if="node.d && isOpen" class="file-children">
@@ -19,6 +24,7 @@
 
 <script setup lang="ts">
 import { ref, computed } from 'vue';
+import AppIcon from './AppIcon.vue';
 import type { FileNode } from '../types/pywebview';
 import { useAppStore } from '../stores/appStore';
 import { extIcon } from '../utils/fileIcon';
@@ -38,10 +44,8 @@ const isOpen = ref(store.fileTreeExpanded.includes(fullPath.value));
 const loading = ref(false);
 const loaded = ref(props.node.children !== undefined);
 
-const icon = computed(() => {
-  if (props.node.d) return isOpen.value ? '📂' : '📁';
-  return extIcon(props.node.n);
-});
+// 目录图标已由模板中的 AppIcon（folder/folder-open）渲染，这里只算文件类型徽标
+const icon = computed(() => (props.node.d ? '' : extIcon(props.node.n)));
 
 async function toggle() {
   if (!props.node.d) {
@@ -98,13 +102,17 @@ async function toggle() {
 }
 .file-row .fi {
   width: 15px;
-  text-align: center;
-  font-size: 12px;
+  display: inline-flex;
+  justify-content: center;
   flex-shrink: 0;
+}
+.file-row .fi .is-open {
+  transform: rotate(90deg);
 }
 .file-row .ficon {
   width: 18px;
-  text-align: center;
+  display: inline-flex;
+  justify-content: center;
   font-size: 13px;
   flex-shrink: 0;
 }

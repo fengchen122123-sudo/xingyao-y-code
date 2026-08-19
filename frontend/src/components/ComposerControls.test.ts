@@ -21,7 +21,8 @@ describe('composer controls', () => {
     const store = useAppStore();
     const wrapper = mount(component);
 
-    expect(wrapper.get('[data-test="attachment-button"]').text()).toBe('＋');
+    // 附件按钮与权限下拉箭头已统一为 AppIcon SVG 图标：断言按钮内渲染了内联 svg
+    expect(wrapper.get('[data-test="attachment-button"]').find('svg').exists()).toBe(true);
     expect(wrapper.get('[data-test="permission-button"]').text()).not.toContain('☑');
     expect(wrapper.get('[data-test="permission-button"]').classes()).toContain('perm-confirm');
 
@@ -33,7 +34,7 @@ describe('composer controls', () => {
     store.permissionMode = 'full';
     await wrapper.vm.$nextTick();
 
-    expect(wrapper.get('[data-test="permission-button"]').text().replace(/\s+/g, '')).toBe('完全访问▼');
+    expect(wrapper.get('[data-test="permission-button"]').text().replace(/\s+/g, '')).toBe('完全访问');
     wrapper.unmount();
   });
 

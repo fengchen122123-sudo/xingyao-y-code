@@ -9,13 +9,14 @@
     >
       <span class="dd-dot" :style="{ background: m.c }"></span>
       {{ formatPermMode(m.v) }}
-      <span v-if="store.permissionMode === m.v" class="ck">✓</span>
+      <span v-if="store.permissionMode === m.v" class="ck"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
 import { ref, watch, onMounted, onUnmounted } from 'vue';
+import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
 import type { PermissionMode } from '../types/pywebview';

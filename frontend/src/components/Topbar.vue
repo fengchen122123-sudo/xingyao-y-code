@@ -1,6 +1,8 @@
 <template>
   <div id="topbar">
-    <button class="icon-btn" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">☰</button>
+    <button class="icon-btn" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">
+      <AppIcon name="menu" :size="17" />
+    </button>
     <div class="logo" :title="store.version ? ('Y-CODE 星瑶 v' + store.version) : 'Y-CODE 星瑶'">
       <img class="mark" src="/icon.png" alt="Y-CODE">
       <div><span class="name">Y-CODE</span></div>
@@ -8,13 +10,16 @@
     <div class="top-spacer"></div>
 
     <button class="icon-btn" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
-      {{ store.themeLight ? '☀' : '☾' }}
+      <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" />
     </button>
-    <button class="icon-btn" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">▐</button>
+    <button class="icon-btn" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">
+      <AppIcon name="panel-right" :size="16" />
+    </button>
   </div>
 </template>
 
 <script setup lang="ts">
+import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
