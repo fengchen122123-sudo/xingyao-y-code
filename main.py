@@ -2639,14 +2639,17 @@ def _make_input_app():
         """Enter 提交（如果是指令则立即在主线程同步执行，不阻塞队列；如果是普通对话则放入后台队列）"""
         global confirm_prompt
         if confirm_prompt:
-            # ask_user 提问支持自由文本回答：输入区有内容时 Enter 优先作为
+            # ask_user 提问支持自由文本回答：输入区有内容时 Enter 一律作为
             # 自定义回答发送（与 GUI 第四项输入框语义一致）；输入为空则按
             # ↑/↓ 选中的选项回答
             if confirm_prompt.get("function_name") == "ask_user":
                 typed = _paste_store.expand(input_area.text.strip())
-                if typed and _resolve_confirm_custom(typed):
-                    input_area.text = ""
-                    event.app.invalidate()
+                if typed:
+                    # 发送失败（请求刚被其他路径处理）绝不 fall-through 到选项
+                    # 回答——那会把用户文字静默丢弃并误发选项；文字保留在输入区
+                    if _resolve_confirm_custom(typed):
+                        input_area.text = ""
+                        event.app.invalidate()
                     return
             idx = confirm_prompt['current_idx']
             if _resolve_confirm_prompt(idx):

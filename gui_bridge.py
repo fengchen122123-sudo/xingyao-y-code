@@ -1684,6 +1684,10 @@ class ApiBridge:
         """按选项索引回答权限请求（ask_user 支持自由文本回答）。"""
         try:
             custom = str(custom_text or "").strip()
+            if custom and permission_broker.active_function_name(str(request_id)) != "ask_user":
+                # 纵深防御：非 ask_user 请求的选项语义（允许/拒绝/始终允许）与
+                # 自由文本无对应关系，前端误传时按普通索引回答处理
+                custom = ""
             resolved = permission_broker.resolve(
                 str(request_id),
                 int(choice_index),
@@ -1700,7 +1704,7 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
-    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None) -> Dict[str, Any]:
+    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None) -> Dict[str, Any]:
         try:
             if self._shutting_down:
                 return {"ok": False, "msg": "应用正在退出"}
@@ -1715,6 +1719,7 @@ class ApiBridge:
                 joined = " ".join("@" + p for p in attach_list)
                 full_text = f"{clean_text} {joined}" if clean_text else joined
             target_session = session_name or self._current_session
+            clean_model_id = str(model_id or "").strip()
             with self._turn_start_lock:
                 if self._is_turn_active(target_session):
                     return {"ok": False, "msg": "该会话已有正在运行的回合"}
@@ -1732,6 +1737,15 @@ class ApiBridge:
                                 target_session = new_session
                         except Exception:
                             logger.debug("落库即命名失败", exc_info=True)
+                # pending 草稿会话预选的模型随首条消息落库：草稿期不能调 set_model
+                # （_current_session 还指向上一个真实会话，会污染旧会话绑定）。
+                # 必须在 worker 线程读取模型前完成绑定，否则回合回退全局默认模型
+                if workdir and clean_model_id:
+                    try:
+                        self._memory.ensure_session(target_session, workdir=str(workdir), source="GUI")
+                        self._memory.set_session_model_id(target_session, clean_model_id)
+                    except Exception:
+                        logger.debug("草稿模型绑定失败，回合回退默认模型", exc_info=True)
 
                 # 用户主动发起新对话：重置该会话的自动汇总标志，
                 # 下一批后台任务完成时可以再次触发自动汇总（与 CLI 行为一致）；
@@ -1884,7 +1898,9 @@ class ApiBridge:
             # 把本回合实际使用的模型写回会话级绑定：首次从全局默认进入该会话时
             # 自动落库，后续切换会话即可恢复该模型，不随全局配置漂移
             self._memory.set_session_model_id(session_name, active_model.get("id"))
-            self._sync_active_model_context()
+            # 显式传会话名：此刻线程 TLS 尚未绑定本会话（set_thread_session 在
+            # 下文才调用），不传会把全局模型同步给子代理继承链
+            self._sync_active_model_context(session_name)
 
             # 会话归属目录是每一轮 Agent 的权威工作目录。待发送项目会话虽然
             # 已把 workdir 透传到这里，但进程 cwd 仍可能停在启动目录或上一会话；
@@ -2566,7 +2582,9 @@ class ApiBridge:
     def get_token_usage(self) -> Dict[str, Any]:
         try:
             from core.llm import get_token_usage_snapshot
-            active = get_active_model() or {}
+            # 按当前会话取模型：会话绑定模型与全局默认不同时，
+            # 上下文圆圈的 window/used 必须按会话模型计算
+            active = get_active_model(self._current_session) or {}
             snapshot = get_token_usage_snapshot(
                 self._current_session,
                 active.get("litellm_model", ""),
@@ -2635,7 +2653,8 @@ class ApiBridge:
         try:
             from core.agent_service import get_session_token_baseline
             from core.llm import session_token_usage, token_usage_lock
-            active = get_active_model() or {}
+            # 按会话取模型：切模型后重算必须用该会话新绑定模型的窗口
+            active = get_active_model(session_name) or {}
             history = self._memory.get_history(session_name)
             total = get_session_token_baseline(
                 self._memory, session_name, active.get("litellm_model", ""), history=history
@@ -2655,7 +2674,9 @@ class ApiBridge:
         压缩后重算窗口占用并推送，前端红圈随之回落。无需压缩时静默跳过。
         """
         try:
-            active = get_active_model() or {}
+            # 按会话取模型：切到小窗口模型后是否需要立即压缩，
+            # 必须按该会话绑定模型的窗口判断，全局模型与此无关
+            active = get_active_model(session_name) or {}
             window = int(active.get("context_window") or 0)
             if window <= 0:
                 return

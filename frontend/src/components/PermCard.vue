@@ -52,7 +52,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 const store = useAppStore();
@@ -65,6 +65,12 @@ function submitCustom() {
   customAnswer.value = '';
   store.respondPermissionChoice(-1, text);
 }
+
+// 新提问到达时清空上一题的未提交草稿：卡片常驻不销毁（根节点 v-if 只控制
+// 显隐），残留草稿会被误发给下一个问题
+watch(() => store.permRequest.reqId, () => {
+  customAnswer.value = '';
+});
 </script>
 
 <style scoped>

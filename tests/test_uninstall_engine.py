@@ -62,6 +62,7 @@ def test_user_scope_uninstall_removes_everything(tmp_path, patched_env):
     assert not (install_dir / "ycode.exe").exists()
     assert not (install_dir / "_internal").exists()
     assert not (install_dir / "cli").exists()
+    assert not (install_dir / "tui").exists()  # 旧版 CLI 变体残留目录一并清理
     assert (install_dir / "ycode_uninstall.exe").exists()
     # 用户配置被删除
     assert not (tmp_path / "home" / ".ycode").exists()
@@ -69,9 +70,10 @@ def test_user_scope_uninstall_removes_everything(tmp_path, patched_env):
     assert patched_env["user_path"] == [os.path.normpath(str(install_dir))]
     assert patched_env["system_path"] == []
     assert all(hive == winreg.HKEY_CURRENT_USER for _, hive in patched_env["registry"])
+    # 注册表：现役两个入口 + 旧版 TUI 命名兼容清理
     assert {name for name, _ in patched_env["registry"]} == {
-        "Y-code", "Y-code-CLI"}
-    # 快捷方式：两个命名都尝试，目录不含公共桌面
+        "Y-code", "Y-code-CLI", "Y-code-TUI"}
+    # 快捷方式：全部命名都尝试，目录不含公共桌面
     assert {name for name, _ in patched_env["shortcut"]} == set(
         ycode_uninstall.SHORTCUT_NAMES)
     for _, dirs in patched_env["shortcut"]:

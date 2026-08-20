@@ -145,7 +145,7 @@ cd ..
 python gui_main.py
 ```
 
-> 前端开发调试时也可改为在 `frontend/` 下运行 `npm run dev`（Vite 开发服务器，端口 5173），`gui_main.py` 会优先加载它。两者都不可用时 GUI 无法启动，cli 模式不受影响。
+> 前端开发调试时也可改为在 `frontend/` 下运行 `npm run dev`（Vite 开发服务器，端口 5173），`gui_main.py` 会优先加载它。两者都不可用时 GUI 无法启动，CLI 模式不受影响。
 
 ### 6.（可选）构建 Windows 安装包
 
@@ -191,7 +191,7 @@ venv\Scripts\python build_release.py --setup-only
 
 同款经典样式的图形化向导：**欢迎 → 卸载选项 → 卸载中 → 完成**
 
-- 清理桌面快捷方式（GUI/CLI 命名都尝试）、PATH、注册表卸载入口
+- 清理桌面快捷方式（GUI/CLI 及旧版 TUI 命名都尝试）、PATH、注册表卸载入口
 - 按安装范围自动适配：machine 安装会清理 HKLM 注册项、系统 PATH 与公共桌面（非管理员运行时自动 UAC 提权）
 - 可选删除 `~/.ycode` 用户配置与历史会话（默认保留，重装后可继续使用）
 - 完成后退出向导自动自销毁，清空安装目录残留

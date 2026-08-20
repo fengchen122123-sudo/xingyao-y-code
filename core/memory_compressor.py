@@ -337,10 +337,11 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         except Exception:
             pass
         if compress_window <= 0:
-            # 压缩模型是主模型时取主模型窗口，仍取不到则按 128k 保守兜底
+            # 压缩模型是主模型时取主模型窗口（按会话解析：GUI 会话绑定的模型
+            # 可能与全局默认不同，取错窗口会让分段预算失真），仍取不到按 128k 兜底
             try:
                 from core.model_manager import get_active_model
-                active = get_active_model()
+                active = get_active_model(session_name)
                 if active and active.get("litellm_model") == compress_model:
                     compress_window = int(active.get("context_window") or 0)
             except Exception:

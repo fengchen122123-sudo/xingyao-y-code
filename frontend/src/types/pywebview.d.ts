@@ -309,7 +309,7 @@ export interface PyWebViewAPI {
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
   respond_permission_choice(requestId: string, choiceIndex: number, customText?: string): Promise<any>;
 
-  send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string): Promise<any>;
+  send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string, modelId?: string): Promise<any>;
   stop_current_turn(sessionName?: string): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;

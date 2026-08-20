@@ -237,6 +237,13 @@ export const useAppStore = defineStore('app', {
     // 懒创建会话：点“新会话”只进入空白状态不落库；发首条消息时才真正创建，
     // 值为目标归属（'GLOBAL' 或项目路径），null = 非 pending 状态
     pendingWorkdir: null as string | null,
+    // pending 草稿会话预选的模型：草稿期不落库（后端 _current_session 还指向上一个
+    // 真实会话，此时调 set_model 会污染旧会话），首条消息发送时随 send_user_message
+    // 一并提交落库；发送失败回退草稿时保留以便重发
+    draftModelId: '',
+    // 各会话模型选择的版本号：setModel 递增；switchSession 在途期间若版本变化，
+    // 说明用户又切了模型，后端响应携带的旧模型快照不再覆盖本地选择
+    _sessionModelVersion: {} as Record<string, number>,
     currentWorkdirLabel: '对话',
     workdir: '',
     fileTree: [] as FileNode[],
@@ -656,26 +663,46 @@ export const useAppStore = defineStore('app', {
     },
 
     async setModel(modelId: string) {
+      // 竞态防护：整个操作锚定进入时的会话。await 期间用户可能已切到别的会话，
+      // 响应回来必须写回原会话的 runtime，否则模型选择会错绑到切换后的会话
+      const targetSession = this.currentSessionName;
+      if (!targetSession) {
+        // pending 草稿会话：尚未落库，后端 _current_session 指向上一个真实会话，
+        // 此时调 set_model 会把模型静默绑到旧会话。只更新本地与草稿 runtime，
+        // 首条消息发送时随 send_user_message 落库
+        const model = this.models.find((m: ModelInfo) => m.id === modelId);
+        this.activeModelId = modelId;
+        this.activeModelName = (model && model.name) || modelId;
+        const runtime = this._getSessionRuntime('');
+        runtime.modelId = modelId;
+        runtime.modelName = this.activeModelName;
+        this.draftModelId = modelId;
+        return;
+      }
       const api = this._api();
       if (!api) return;
+      // 版本号在请求发出前递增：switchSession 在途响应若携带旧模型快照，
+      // 凭版本号变化跳过覆盖，保住用户刚做的选择
+      this._sessionModelVersion[targetSession] = (this._sessionModelVersion[targetSession] || 0) + 1;
       try {
         const res = await api.set_model(modelId);
         if (res && res.ok) {
-          this.activeModelId = res.active_model_id || modelId;
-          this.activeModelName = res.active_model_name || this.activeModelName;
-          // 推理强度按模型保存：切换模型后同步该模型自己的档位
-          this.reasoningEffort = res.reasoning_effort || 'default';
-          // 模型选择绑定到当前会话（含未落库的 pending 草稿）：写入 runtime，
-          // 切换会话时随 runtime 一并恢复，各会话模型互不影响
-          const runtime = this._getSessionRuntime(this.currentSessionName);
-          runtime.modelId = this.activeModelId;
-          runtime.modelName = this.activeModelName;
+          const runtime = this._getSessionRuntime(targetSession);
+          runtime.modelId = res.active_model_id || modelId;
+          runtime.modelName = res.active_model_name || this.activeModelName;
+          // 仅当用户仍停留在原会话时才更新顶层显示，避免覆盖切换后会话的状态栏
+          if (this.currentSessionName === targetSession) {
+            this.activeModelId = runtime.modelId!;
+            this.activeModelName = runtime.modelName!;
+            // 推理强度按模型保存：切换模型后同步该模型自己的档位
+            this.reasoningEffort = res.reasoning_effort || 'default';
+          }
           // 新会话或空会话切换模型不再弹提示/产生新页面：模型绑定静默完成，
-          // 仅当已有真实对话内容（user/assistant 消息）时才插入切换提示，
+          // 仅当该会话已有真实对话内容（user/assistant 消息）时才插入切换提示，
           // 否则 notice 会让空状态页消失，表现为切模型后页面跳转
-          const hasDialog = this.messages.some(m => m.role === 'user' || m.role === 'assistant');
-          if (hasDialog) {
-            this.notifyChat('已切换活动模型: ' + this.activeModelName);
+          const hasDialog = runtime.messages.some(m => m.role === 'user' || m.role === 'assistant');
+          if (hasDialog && this.currentSessionName === targetSession) {
+            this.notifyChat('已切换活动模型: ' + runtime.modelName);
           }
         } else {
           this.notifyChat('切换模型失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -804,6 +831,9 @@ export const useAppStore = defineStore('app', {
 
       const api = this._api();
       if (!api) return;
+      // 模型版本快照：响应在途期间用户若又切了模型（setModel 递增版本），
+      // 后端响应携带的是切换前的旧模型快照，不再覆盖本地选择
+      const modelVersion = this._sessionModelVersion[sessionName] || 0;
       try {
       const res = await api.switch_session(sessionName, targetWorkdir);
         // 竞态防护：快速连点不同会话时响应可能乱序返回，过期响应直接丢弃，
@@ -854,11 +884,15 @@ export const useAppStore = defineStore('app', {
         if (res.sessions) this.sessionGroups = res.sessions;
 
         // 会话级模型隔离：切到已有会话时恢复该会话绑定的模型，
-        // 避免 A 会话切到 B 会话后 A 的模型被全局覆盖
-        if (res.active_model_id) {
+        // 避免 A 会话切到 B 会话后 A 的模型被全局覆盖。
+        // 版本号变化 = 在途期间用户又切了模型，跳过本次恢复（本地已是新值）
+        if (res.active_model_id && (this._sessionModelVersion[sessionName] || 0) === modelVersion) {
           this.activeModelId = res.active_model_id;
           this.activeModelName = res.active_model_name || this.activeModelName;
           this.reasoningEffort = res.reasoning_effort || 'default';
+          const runtime2 = this._getSessionRuntime(sessionName);
+          runtime2.modelId = this.activeModelId;
+          runtime2.modelName = this.activeModelName;
         }
       } catch (err) {
         this.connected = false;
@@ -1188,10 +1222,20 @@ export const useAppStore = defineStore('app', {
             this._bindSessionRuntime(sessionName);
           }
         }
-        const res = await api.send_user_message(text.trim(), sessionName, attachList, pendingDir);
-        if (res && res.ok && pendingDir) {
+        const res = await api.send_user_message(
+          text.trim(),
+          sessionName,
+          attachList,
+          pendingDir,
+          pendingDir ? (this.draftModelId || undefined) : undefined,
+        );
+        if (res && res.ok) {
+          // 草稿模型已随后端落库（或本就不存在），不再保留待重发状态
+          this.draftModelId = '';
+          if (pendingDir) {
           // 让新会话立即出现在左侧列表（自动重命名事件随后会再刷新一次）
           this.refreshSessions();
+          }
         }
         if (!res || !res.ok) {
           // #13 修复：失败分支不再无条件 _bindSessionRuntime(sessionName)。

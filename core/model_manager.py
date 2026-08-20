@@ -133,23 +133,31 @@ def get_active_model(session_name: str | None = None) -> dict | None:
         except Exception:
             pass
     data = load_config()
-    if active_id is None:
-        active_id = data.get("active_model_id")
-    for provider in data.get("providers", []):
-        for model in provider.get("models", []):
-            if model["id"] == active_id:
-                return {
-                    "litellm_model":   model["litellm_model"],
-                    "api_key":         provider["api_key"],
-                    "base_url":         provider["base_url"],
-                    "context_window":  model.get("context_window", 128000),
-                    "supports_vision": model.get("supports_vision"),
-                    "name":            model["name"],
-                    "protocol":        provider.get("protocol", "openai"),
-                    "provider_name":   provider["name"],
-                    "id":              model["id"],
-                }
-    return None
+    global_id = data.get("active_model_id")
+    lookup = {
+        model.get("id"): (provider, model)
+        for provider in data.get("providers", [])
+        for model in provider.get("models", [])
+    }
+    if active_id in lookup:
+        provider, model = lookup[active_id]
+    elif global_id in lookup:
+        # 会话未绑定，或绑定的模型已被用户删除：回退全局默认，
+        # 不能让会话被死绑定卡死（表现为"未激活任何模型"）
+        provider, model = lookup[global_id]
+    else:
+        return None
+    return {
+        "litellm_model":   model["litellm_model"],
+        "api_key":         provider["api_key"],
+        "base_url":         provider["base_url"],
+        "context_window":  model.get("context_window", 128000),
+        "supports_vision": model.get("supports_vision"),
+        "name":            model["name"],
+        "protocol":        provider.get("protocol", "openai"),
+        "provider_name":   provider["name"],
+        "id":              model["id"],
+    }
 
 
 def set_active_model(model_id: str):
