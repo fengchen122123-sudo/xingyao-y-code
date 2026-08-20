@@ -105,7 +105,7 @@ def export_session_markdown(session_name, manager=None, output_path=None):
     返回：导出的文件路径，或错误信息
     """
     if manager is None:
-        # 未显式传入时回落到运行时上下文（TUI / GUI 启动时都会注册）
+        # 未显式传入时回落到运行时上下文（CLI / GUI 启动时都会注册）
         manager = app_context.get_manager()
     if manager is None:
         return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"
@@ -150,7 +150,7 @@ def export_session_markdown(session_name, manager=None, output_path=None):
 def export_session_html(session_name, manager=None, output_path=None):
     """导出会话为 HTML 文件（含样式，便于阅读）。"""
     if manager is None:
-        # 未显式传入时回落到运行时上下文（TUI / GUI 启动时都会注册）
+        # 未显式传入时回落到运行时上下文（CLI / GUI 启动时都会注册）
         manager = app_context.get_manager()
     if manager is None:
         return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"
@@ -251,7 +251,7 @@ def export_session_html(session_name, manager=None, output_path=None):
 def export_session_json(session_name, manager=None, output_path=None):
     """导出可分享 JSON；默认移除推理并脱敏常见凭据。"""
     if manager is None:
-        # 未显式传入时回落到运行时上下文（TUI / GUI 启动时都会注册）
+        # 未显式传入时回落到运行时上下文（CLI / GUI 启动时都会注册）
         manager = app_context.get_manager()
     if manager is None:
         return "🚨 无法获取会话管理器: 运行时上下文尚未注册 MemoryManager"

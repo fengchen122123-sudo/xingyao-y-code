@@ -42,7 +42,7 @@ from core.model_selector import _latest_total_tokens
 
 
 def _run_selector_headless(monkeypatch):
-    """用假 Application 捕获布局，不真正进入全屏 TUI"""
+    """用假 Application 捕获布局，不真正进入全屏 CLI"""
     captured = {}
 
     class FakeApp:

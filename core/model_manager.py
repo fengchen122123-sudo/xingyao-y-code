@@ -7,6 +7,7 @@ import os
 import uuid
 
 import config
+import core.app_context as app_context
 from core.model_catalog import (
     get_preset_provider,
     litellm_model_name,
@@ -114,14 +115,26 @@ def _write_config(data: dict):
         config._atomic_write_json(_CONFIG_FILE, data)
 
 
-def get_active_model() -> dict | None:
+def get_active_model(session_name: str | None = None) -> dict | None:
     """
     返回当前激活模型的完整信息字典，包含：
       litellm_model, api_key, base_url, context_window, name
     如果没有配置任何模型，返回 None。
+
+    当传入 session_name 时，优先取该会话在 sessions 表中绑定的 active_model_id；
+    未绑定则回退到全局 active_model_id。CLI/无会话调用方传 None，始终读全局配置。
     """
+    active_id = None
+    if session_name:
+        try:
+            manager = app_context.get_manager()
+            if manager is not None:
+                active_id = manager.get_session_model_id(session_name)
+        except Exception:
+            pass
     data = load_config()
-    active_id = data.get("active_model_id")
+    if active_id is None:
+        active_id = data.get("active_model_id")
     for provider in data.get("providers", []):
         for model in provider.get("models", []):
             if model["id"] == active_id:
@@ -134,6 +147,7 @@ def get_active_model() -> dict | None:
                     "name":            model["name"],
                     "protocol":        provider.get("protocol", "openai"),
                     "provider_name":   provider["name"],
+                    "id":              model["id"],
                 }
     return None
 

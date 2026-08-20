@@ -645,7 +645,7 @@ class MCPManager:
     def add_server(self, name, command, args, env=None, enabled=True):
         """新增一个 MCP server 配置，并立即重连生效。
 
-        供 AI 工具和 /mcp TUI 配置器调用，避免用户手动编辑 JSON。
+        供 AI 工具和 /mcp CLI 配置器调用，避免用户手动编辑 JSON。
         参数：
           name: server 名称（用作 mcpServers 下的 key，也是工具名前缀）
           command: 启动命令（如 "npx"）
@@ -693,7 +693,7 @@ class MCPManager:
     def remove_server(self, name):
         """删除一个 MCP server 配置，并立即重连生效。
 
-        供 AI 工具和 /mcp TUI 配置器调用。
+        供 AI 工具和 /mcp CLI 配置器调用。
         返回 (ok: bool, message: str)。
         """
         if self._closed:

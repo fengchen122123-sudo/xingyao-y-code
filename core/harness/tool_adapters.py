@@ -163,6 +163,11 @@ def _sandbox_outside_guard(
 
     from core import tools as tools_module
 
+    # ~/.ycode 整个数据目录读取豁免（用户要求：不管什么权限模式/沙盒状态，
+    # agent 都能读取自家运行数据）。凭据文件（config.json / mcp.json，含 .bak）
+    # 例外：读取同样放行（诊断配置问题的常见需求），但写入必须逐次询问——
+    # 改写 mcp.json 可注入恶意 MCP server，改坏 config.json 会让应用不可用。
+    credential_write = False
     try:
         from core.memory_kairos import is_ycode_data_path
 
@@ -170,8 +175,22 @@ def _sandbox_outside_guard(
             basename = os.path.basename(str(path_value)).lower()
             if basename not in {"config.json", "config.json.bak", "mcp.json", "mcp.json.bak"}:
                 return sandbox_bypass(), None
+            if function_name not in {"write_file", "edit_file"}:
+                return sandbox_bypass(), None
+            credential_write = True
     except Exception:
         pass
+    # 沙盒开关（/sandbox on / GUI 沙盒解除，allow_outside_workspace=True）打开时：
+    # 项目外路径读写直接放行，不再逐次询问（用户选定语义）。
+    # 凭据写入不受开关影响，始终进入下方询问流程。
+    if not credential_write:
+        try:
+            from core.model_manager import load_config
+
+            if bool(load_config().get("allow_outside_workspace", False)):
+                return sandbox_bypass(), None
+        except Exception:
+            pass
     if function_name == "read_file":
         try:
             from core.skills import is_trusted_read_path

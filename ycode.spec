@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 # ============================================================================
 # Y-code 双主程序打包 spec：一次 PyInstaller 构建同时产出
-#   - ycode.exe   ：TUI 控制台版 (入口 main.py,     console=True)
+#   - ycode.exe   ：CLI 控制台版 (入口 main.py,     console=True)
 #   - Y-code.exe  ：GUI 窗口版   (入口 gui_main.py, console=False)
 # 两者共享同一份运行时依赖，最终合并进同一个 onedir 输出目录 dist/ycode/
 # （两个 exe 平铺在根目录，依赖统一收在 dist/ycode/_internal/ 下），方便安装
@@ -10,7 +10,7 @@
 from PyInstaller.utils.hooks import collect_all
 
 # ---------------------------------------------------------------------------
-# 第三方库隐藏依赖收集。TUI 和 GUI 两个入口共用同一套核心机器（core.llm /
+# 第三方库隐藏依赖收集。CLI 和 GUI 两个入口共用同一套核心机器（core.llm /
 # core.tools 等模块两边都会 import），因此下面几个 collect_all 结果两个
 # Analysis 都要用到。
 # ---------------------------------------------------------------------------
@@ -22,7 +22,7 @@ litellm_datas, litellm_binaries, litellm_hiddenimports = collect_all('litellm')
 
 # pyfiglet 通过 importlib.resources 在 pyfiglet.fonts 包里加载 .flf 字体文件，
 # PyInstaller 默认不会收集，需要 collect_all 才能避免运行时 "No module named
-# 'pyfiglet.fonts'"（GUI 入口虽然不显示 ASCII Logo，但和 TUI 共用同一份
+# 'pyfiglet.fonts'"（GUI 入口虽然不显示 ASCII Logo，但和 CLI 共用同一份
 # _internal 依赖目录，统一收集更简单可靠）。
 pyfiglet_datas, pyfiglet_binaries, pyfiglet_hiddenimports = collect_all('pyfiglet')
 
@@ -31,9 +31,9 @@ pyfiglet_datas, pyfiglet_binaries, pyfiglet_hiddenimports = collect_all('pyfigle
 # 否则打包后会报 "Unknown encoding cl100k_base. Plugins found: []"。
 tiktoken_ext_datas, tiktoken_ext_binaries, tiktoken_ext_hiddenimports = collect_all('tiktoken_ext')
 
-# TUI 与 GUI 都会用到的数据文件：默认配置模板、系统提示词模板、内置 ripgrep
+# CLI 与 GUI 都会用到的数据文件：默认配置模板、系统提示词模板、内置 ripgrep
 # （core.tools 的 search_code 工具依赖，两个入口共享同一套工具注册表）、前端
-# 编译产物（GUI 加载的静态资源；TUI 虽然用不到，但沿用原 spec 已生效的打包
+# 编译产物（GUI 加载的静态资源；CLI 虽然用不到，但沿用原 spec 已生效的打包
 # 方式，避免改变既有行为）。
 common_datas = [
     ('config.example.json', '.'),
@@ -61,9 +61,9 @@ common_excludes = [
 
 
 # ============================================================================
-# TUI 入口：main.py → ycode.exe（控制台程序）
+# CLI 入口：main.py → ycode.exe（控制台程序）
 # ============================================================================
-a_tui = Analysis(
+a_cli = Analysis(
     ['main.py'],
     pathex=[],
     binaries=common_binaries,
@@ -76,11 +76,11 @@ a_tui = Analysis(
     noarchive=False,
     optimize=0,
 )
-pyz_tui = PYZ(a_tui.pure)
+pyz_cli = PYZ(a_cli.pure)
 
-exe_tui = EXE(
-    pyz_tui,
-    a_tui.scripts,
+exe_cli = EXE(
+    pyz_cli,
+    a_cli.scripts,
     [],
     exclude_binaries=True,
     name='ycode',
@@ -163,13 +163,13 @@ exe_gui = EXE(
 # ============================================================================
 coll = COLLECT(
     exe_gui,
-    exe_tui,
+    exe_cli,
     a_gui.binaries,
     a_gui.zipfiles,
     a_gui.datas,
-    a_tui.binaries,
-    a_tui.zipfiles,
-    a_tui.datas,
+    a_cli.binaries,
+    a_cli.zipfiles,
+    a_cli.datas,
     strip=False,
     upx=False,
     upx_exclude=[],

@@ -5,17 +5,17 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
 产出物（均在 dist/ 下）：
   dist/ycode/                  onedir 核心程序包，同时包含：
       Y-code.exe                 GUI 窗口版 (pywebview, console=False)
-      ycode.exe                  TUI 控制台版 (console=True)
+      ycode.exe                  CLI 控制台版 (console=True)
       _internal/                 两者共享的运行时依赖与数据文件
   dist/ycode_uninstall.exe     独立卸载向导
-  dist/ycode_tui_setup_v{版本}.exe  独立 TUI 安装向导（供主安装包内嵌，也可单独分发）
-  dist/ycode_setup_v{版本}.exe      主安装向导（默认装 GUI，可选附带装 TUI）
+  dist/ycode_cli_setup_v{版本}.exe  独立 CLI 安装向导（供主安装包内嵌，也可单独分发）
+  dist/ycode_setup_v{版本}.exe      主安装向导（默认装 GUI，可选附带装 CLI）
   （两个安装向导文件名带版本号，便于多渠道分发时区分新旧；内嵌进主安装包的
-    tui/ycode_tui_setup.exe 仍用固定名，安装引擎按固定名查找。）
+    cli/ycode_cli_setup.exe 仍用固定名，安装引擎按固定名查找。）
 
 用法：
   venv\\Scripts\\python build_release.py                   完整构建
-  venv\\Scripts\\python build_release.py --tui-only         只构建 TUI 相关产物，跳过主安装包
+  venv\\Scripts\\python build_release.py --cli-only         只构建 CLI 相关产物，跳过主安装包
   venv\\Scripts\\python build_release.py --skip-frontend    跳过前端构建，直接用现有 frontend/dist
   venv\\Scripts\\python build_release.py --rebuild-frontend 强制重新执行 npm run build
   venv\\Scripts\\python build_release.py --setup-only       只重建两个安装向导（复用现有载荷）
@@ -38,7 +38,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Y-code Windows 发布打包流水线（GUI 主安装包 + 可选 TUI 组件）。"
+        description="Y-code Windows 发布打包流水线（GUI 主安装包 + 可选 CLI 组件）。"
     )
     parser.add_argument(
         "--skip-frontend", action="store_true",
@@ -50,13 +50,13 @@ def parse_args():
         help="强制重新执行 npm run build，即使 frontend/dist/index.html 已经存在。",
     )
     parser.add_argument(
-        "--tui-only", action="store_true",
-        help="只构建 TUI 相关产物 (dist/ycode、ycode_uninstall.exe、ycode_tui_setup_v*.exe)，"
+        "--cli-only", action="store_true",
+        help="只构建 CLI 相关产物 (dist/ycode、ycode_uninstall.exe、ycode_cli_setup_v*.exe)，"
              "跳过体积较大的主安装包 ycode_setup_v*.exe。",
     )
     parser.add_argument(
         "--setup-only", action="store_true",
-        help="只重建两个安装向导 (ycode_setup_v*.exe / ycode_tui_setup_v*.exe)：复用现有 dist/ycode "
+        help="只重建两个安装向导 (ycode_setup_v*.exe / ycode_cli_setup_v*.exe)：复用现有 dist/ycode "
              "载荷与 dist/ycode_uninstall.exe，适用于仅改动 ycode_setup.py 后的快速重建。",
     )
     return parser.parse_args()
@@ -167,17 +167,17 @@ def step0_build_frontend(project_dir, args):
 # ============================================================================
 
 def step1_build_core(pyinstaller_bin, project_dir):
-    print("\n[步骤 1/5] 正在编译核心程序包 (Y-code.exe GUI + ycode.exe TUI)...")
+    print("\n[步骤 1/5] 正在编译核心程序包 (Y-code.exe GUI + ycode.exe CLI)...")
     # 用 ycode.spec 而不是一堆 CLI flag：spec 里配置了两套 Analysis（分别对应
-    # GUI/TUI 两个入口）、collect_all 依赖收集与 upx=False（避免启动时内存
+    # GUI/CLI 两个入口）、collect_all 依赖收集与 upx=False（避免启动时内存
     # 解压 + Defender 扫描拖慢启动速度），这些精细控制没法完全用 CLI 表达。
     cmd = [pyinstaller_bin, "--clean", "--noconfirm", "ycode.spec"]
     run_checked(cmd, "核心程序包编译")
 
     ycode_dir = os.path.join(project_dir, "dist", "ycode")
-    tui_exe = os.path.join(ycode_dir, "ycode.exe")
+    cli_exe = os.path.join(ycode_dir, "ycode.exe")
     gui_exe = os.path.join(ycode_dir, "Y-code.exe")
-    missing = [p for p in (tui_exe, gui_exe) if not os.path.exists(p)]
+    missing = [p for p in (cli_exe, gui_exe) if not os.path.exists(p)]
     if missing:
         print("❌ 核心程序包生成不完整，缺少以下文件：")
         for p in missing:
@@ -185,7 +185,7 @@ def step1_build_core(pyinstaller_bin, project_dir):
         sys.exit(1)
     print(f"✅ 核心程序包 (onedir) 生成成功: {ycode_dir}")
     print(f"   - GUI 窗口版  : {gui_exe}")
-    print(f"   - TUI 控制台版: {tui_exe}")
+    print(f"   - CLI 控制台版: {cli_exe}")
     return ycode_dir
 
 
@@ -209,14 +209,14 @@ def step2_build_uninstaller(pyinstaller_bin, project_dir):
 # ============================================================================
 # 步骤 3 / 4：安装向导
 # (ycode_setup.py 是同一份源码；靠内嵌的 setup_mode.txt marker 文件区分
-#  'tui' / 'full' 两种运行模式，因此这里构建两次、每次内嵌不同的数据。)
+#  'cli' / 'full' 两种运行模式，因此这里构建两次、每次内嵌不同的数据。)
 # ============================================================================
 
 def build_setup_variant(pyinstaller_bin, project_dir, mode, output_name, add_data_pairs):
-    """通用安装向导构建：把 mode（'tui'/'full'）和版本号写入临时 marker 文件，随构建一并打包进 exe。
+    """通用安装向导构建：把 mode（'cli'/'full'）和版本号写入临时 marker 文件，随构建一并打包进 exe。
 
-    这里没有用静态 .spec 文件表达 tui/full 两个变体，是因为它们依赖的内嵌数据
-    ——尤其是 dist/ycode_tui_setup.exe 这种“上一步骤才产出”的文件——在两次
+    这里没有用静态 .spec 文件表达 cli/full 两个变体，是因为它们依赖的内嵌数据
+    ——尤其是 dist/ycode_cli_setup.exe 这种“上一步骤才产出”的文件——在两次
     调用之间是不同的。用 CLI --add-data 动态拼装，比维护两份高度相似、还要
     应对“某些源文件此刻可能还不存在”的 spec 文件更清晰，也更不容易出现
     “spec 文件内容和实际构建命令对不上”的配置漂移。
@@ -292,14 +292,14 @@ def make_payload_archive(project_dir, ycode_dir):
     return zip_path
 
 
-def step3_build_tui_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe):
-    print("\n[步骤 3/5] 正在编译 TUI 独立安装向导 ycode_tui_setup.exe...")
+def step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe):
+    print("\n[步骤 3/5] 正在编译 CLI 独立安装向导 ycode_cli_setup.exe...")
     # 同时内嵌卸载程序：这样即便用户脱离主安装包、单独运行这个 CLI 安装向导
     # （即"安装目录下还没有 Y-code.exe"的独立安装场景），也能正常复制出
     # 卸载程序并注册 Y-code-CLI 卸载入口，而不是只能在合并进完整版安装后
     # 才具备可卸载性。
     return build_setup_variant(
-        pyinstaller_bin, project_dir, mode="tui", output_name="ycode_tui_setup",
+        pyinstaller_bin, project_dir, mode="cli", output_name="ycode_cli_setup",
         add_data_pairs=[
             (payload_zip, "."),
             (uninstall_exe, "."),
@@ -312,14 +312,14 @@ def step3_build_tui_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_e
     )
 
 
-def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, tui_setup_exe):
+def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, cli_setup_exe):
     print("\n[步骤 4/5] 正在编译主安装向导 ycode_setup.exe...")
     return build_setup_variant(
         pyinstaller_bin, project_dir, mode="full", output_name="ycode_setup",
         add_data_pairs=[
             (payload_zip, "."),
             (uninstall_exe, "."),
-            (tui_setup_exe, "tui"),
+            (cli_setup_exe, "cli"),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
             # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
@@ -341,19 +341,19 @@ def versioned_setup_name(base, version):
     """
     if base == "ycode_setup":
         return f"Y-code-{version}"
-    if base == "ycode_tui_setup":
+    if base == "ycode_cli_setup":
         return f"Y-code-cli-{version}"
     return f"{base}_v{version}"
 
 
-def step4b_rename_setups(project_dir, version, tui_only):
+def step4b_rename_setups(project_dir, version, cli_only):
     """把固定名构建产物重命名为带版本号的分发名，并清理上一版本的同名旧产物。
 
-    构建期仍用固定名（ycode_setup / ycode_tui_setup）：主安装包内嵌的
-    tui/ycode_tui_setup.exe 由安装引擎按固定名查找，不能带版本号；最终落到
+    构建期仍用固定名（ycode_setup / ycode_cli_setup）：主安装包内嵌的
+    cli/ycode_cli_setup.exe 由安装引擎按固定名查找，不能带版本号；最终落到
     dist/ 供分发的文件才改成带版本号的名字。"""
     print("\n[步骤 4.5/5] 安装包重命名为带版本号的分发名...")
-    bases = ["ycode_tui_setup"] if tui_only else ["ycode_tui_setup", "ycode_setup"]
+    bases = ["ycode_cli_setup"] if cli_only else ["ycode_cli_setup", "ycode_setup"]
     renamed = {}
     for base in bases:
         src = os.path.join(project_dir, "dist", f"{base}.exe")
@@ -368,7 +368,7 @@ def step4b_rename_setups(project_dir, version, tui_only):
             # 用 [0-9] 前缀精确匹配，避免误删 Y-code-cli-*.exe（CLI 安装包）
             for old in glob.glob(os.path.join(project_dir, "dist", "Y-code-[0-9]*.exe")):
                 os.remove(old)
-        if base == "ycode_tui_setup":
+        if base == "ycode_cli_setup":
             # CLI 安装包新命名 Y-code-cli-*.exe 也清理旧版本残留
             for old in glob.glob(os.path.join(project_dir, "dist", "Y-code-cli-*.exe")):
                 os.remove(old)
@@ -383,17 +383,17 @@ def step4b_rename_setups(project_dir, version, tui_only):
 # 步骤 5：汇总校验
 # ============================================================================
 
-def step5_summary(project_dir, tui_only, version):
+def step5_summary(project_dir, cli_only, version):
     print("\n[步骤 5/5] 校验构建产物...")
     rows = [
         (os.path.join("dist", "ycode", "Y-code.exe"), "GUI 主程序 (窗口版)"),
-        (os.path.join("dist", "ycode", "ycode.exe"), "TUI 主程序 (控制台版)"),
+        (os.path.join("dist", "ycode", "ycode.exe"), "CLI 主程序 (控制台版)"),
         (os.path.join("dist", "Y-code-uninstall.exe"), "卸载程序"),
-        (os.path.join("dist", f"{versioned_setup_name('ycode_tui_setup', version)}.exe"), "TUI 独立安装包"),
+        (os.path.join("dist", f"{versioned_setup_name('ycode_cli_setup', version)}.exe"), "CLI 独立安装包"),
     ]
-    if not tui_only:
+    if not cli_only:
         rows.append((os.path.join("dist", f"{versioned_setup_name('ycode_setup', version)}.exe"),
-                     "主安装包 (GUI + 可选 TUI)"))
+                     "主安装包 (GUI + 可选 CLI)"))
 
     print("\n" + "=" * 64)
     print("📦 构建产物一览")
@@ -413,8 +413,8 @@ def step5_summary(project_dir, tui_only, version):
         sys.exit(1)
 
     print("🎉 恭喜！发布包编译圆满成功！")
-    if tui_only:
-        print("ℹ 已指定 --tui-only，主安装包未构建（如需要请去掉该参数重新运行）。")
+    if cli_only:
+        print("ℹ 已指定 --cli-only，主安装包未构建（如需要请去掉该参数重新运行）。")
     else:
         print(f"👉 您的 Windows 双击主安装包位于: "
               f"{os.path.join(project_dir, 'dist', versioned_setup_name('ycode_setup', version) + '.exe')}")
@@ -453,14 +453,14 @@ def build():
         payload_zip = make_payload_archive(project_dir, ycode_dir)
         uninstall_exe = step2_build_uninstaller(pyinstaller_bin, project_dir)
 
-    tui_setup_exe = step3_build_tui_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
+    cli_setup_exe = step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
 
-    if not args.tui_only:
-        step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, tui_setup_exe)
+    if not args.cli_only:
+        step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, cli_setup_exe)
 
     version = read_project_version(project_dir)
-    step4b_rename_setups(project_dir, version, args.tui_only)
-    step5_summary(project_dir, args.tui_only, version)
+    step4b_rename_setups(project_dir, version, args.cli_only)
+    step5_summary(project_dir, args.cli_only, version)
 
 
 if __name__ == "__main__":

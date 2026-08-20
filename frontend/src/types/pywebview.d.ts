@@ -196,7 +196,7 @@ export interface InitialState {
   secondary_model_id?: string;
   secondary_model_roles?: { vision: boolean; compression: boolean; subagent: boolean };
   permission_mode: PermissionMode;
-  // 沙盒开关（true=允许访问工作目录外文件），与 TUI /sandbox 共享配置
+  // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享配置
   allow_outside_workspace?: boolean;
   reasoning_effort?: ReasoningEffort;
   sessions: SessionGroup[];
@@ -307,7 +307,7 @@ export interface PyWebViewAPI {
   get_permission_rules(): Promise<any>;
   clear_permission_rules(): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
-  respond_permission_choice(requestId: string, choiceIndex: number): Promise<any>;
+  respond_permission_choice(requestId: string, choiceIndex: number, customText?: string): Promise<any>;
 
   send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string): Promise<any>;
   stop_current_turn(sessionName?: string): Promise<any>;
@@ -329,6 +329,7 @@ export interface PyWebViewAPI {
 
   read_file_preview(path: string): Promise<any>;
   open_path(path: string): Promise<any>;
+  open_folder_in_explorer(path: string): Promise<any>;
   pick_files(): Promise<any>;
   get_files_info(paths: string[]): Promise<any>;
   save_clipboard_image(dataUrl: string): Promise<any>;

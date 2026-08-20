@@ -181,14 +181,14 @@ pending_action = None   # 待处理的主线程操作：目前可能的值有 "o
 _last_printed_plan_state: dict[str, str] = {}
 
 # ---------------------------------------------------------------------------
-# 注册 TUI 运行时上下文（让 core/llm.py 通过 app_context 访问，而非直接 import main）
+# 注册 CLI 运行时上下文（让 core/llm.py 通过 app_context 访问，而非直接 import main）
 # _app_ctx 已在文件顶部导入（权限模式规范化需要）
 # ---------------------------------------------------------------------------
 
-class _TuiContext:
-    """TUI 运行时上下文适配器，代理到 main 模块的全局变量。"""
+class _CLIContext:
+    """CLI 运行时上下文适配器，代理到 main 模块的全局变量。"""
 
-    # UI 形态：run_cli 启动时会写成 "tui"，headless 模式保持默认值
+    # UI 形态：run_cli 启动时会写成 "cli"，headless 模式保持默认值
     ui_flavor = "headless"
 
     @property
@@ -228,13 +228,13 @@ class _TuiContext:
 
     @property
     def permission_callback(self):
-        return None  # TUI 使用 prompt_toolkit broker，不需要 GUI 回调
+        return None  # CLI 使用 prompt_toolkit broker，不需要 GUI 回调
 
     def invalidate_ui(self):
         if app_instance and app_instance.loop:
             app_instance.loop.call_soon_threadsafe(app_instance.invalidate)
 
-_app_ctx.register(_TuiContext())
+_app_ctx.register(_CLIContext())
 
 
 def _sync_active_model_context():
@@ -661,7 +661,10 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
         )
         text += f"🔧  星瑶申请调用工具: {_esc(func)}({_esc(summary)})\n"
 
-    text += "👉 请选择确认操作:\n"
+    if func == "ask_user":
+        text += "👉 请选择确认操作（↑/↓ 选择后 Enter；或直接输入内容后 Enter 自定义回答）:\n"
+    else:
+        text += "👉 请选择确认操作:\n"
     for idx, option in enumerate(prompt["options"]):
         prefix = "  > " if idx == prompt["current_idx"] else "    "
         if idx == prompt["current_idx"]:
@@ -724,7 +727,7 @@ def _clear_active_thinking() -> None:
 
 
 def _thinking_panel_text() -> str:
-    """Return transient reasoning text for the live TUI panel only."""
+    """Return transient reasoning text for the live CLI panel only."""
     return active_thinking_text or "正在分析..."
 
 
@@ -761,7 +764,7 @@ def _cancel_active_turn() -> None:
 
 
 def post_ui_event(event):
-    """Queue a turn event and arrange for the main TUI loop to consume it."""
+    """Queue a turn event and arrange for the main CLI loop to consume it."""
     ui_event_queue.put(event)
     schedule_ui(drain_ui_events)
 
@@ -777,7 +780,7 @@ def _forward_response_events(events, post_event=post_ui_event):
 
 
 def _resolve_confirm_prompt(index):
-    """Resolve the active TUI question only when the selected option exists."""
+    """Resolve the active CLI question only when the selected option exists."""
     global confirm_prompt
     prompt = confirm_prompt
     if prompt is None or not 0 <= index < len(prompt.get("options", [])):
@@ -793,6 +796,22 @@ def _resolve_confirm_prompt(index):
         future.set_result(index)
         return True
     return False
+
+
+def _resolve_confirm_custom(text):
+    """以自由文本回答当前 ask_user 提问（选项都不合适时直接输入告诉星瑶）。
+
+    仅对经 broker 串行化的 ask_user 请求开放；其余权限确认的选项语义
+    （允许/拒绝/始终允许）与自由文本无对应关系。
+    """
+    prompt = confirm_prompt
+    cleaned = str(text or "").strip()
+    if prompt is None or prompt.get("function_name") != "ask_user" or not cleaned:
+        return False
+    request_id = prompt.get("request_id")
+    if not request_id:
+        return False
+    return permission_broker.resolve(str(request_id), -1, custom_answer=cleaned)
 
 
 def _format_plan_items(items):
@@ -1453,11 +1472,12 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
         print_formatted_text(HTML("<b><ansiyellow>【1. 会话与上下文管理】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名)"))
+        print_formatted_text(HTML("  <ansicyan>/session &lt;会话名称&gt;</ansicyan>              : 按名称直接切换到指定会话 (不存在则创建)"))
         print_formatted_text(HTML("  <ansicyan>/session all</ansicyan>                         : 列出所有目录下的历史会话 (含归属路径与时间)"))
         print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
         print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
         print_formatted_text(HTML("  <ansicyan>/new</ansicyan>                                    : 创建并切换到全新会话（历史会话保留，/session 可切回）"))
-        print_formatted_text(HTML("  <ansicyan>/undo</ansicyan>                                   : 撤销星瑶上一次修改的代码，并同步抹除模型记忆"))
+        print_formatted_text(HTML("  <ansicyan>/undo [y]</ansicyan>                               : 撤销星瑶上一次修改的代码，并同步抹除模型记忆 (撤销新建文件时需追加 y 确认删除)"))
         print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
         print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
         print_formatted_text(HTML("  <ansicyan>/worktree</ansicyan>                              : Git worktree 管理 (list/create/remove/prune)"))
@@ -1469,7 +1489,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
-        print_formatted_text(HTML("  <ansicyan>/sandbox &lt;on|off&gt;</ansicyan>                     : 沙盒开关 (on:允许访问工作目录外文件 | off:仅限工作目录内)"))
+        print_formatted_text(HTML("  <ansicyan>/sandbox &lt;on|off&gt;</ansicyan>                     : 沙盒开关 (on:工作目录外读写直接放行 | off:仅限工作目录内)"))
         print_formatted_text(HTML("  <ansicyan>/whitelist &lt;clear&gt;</ansicyan>                   : 查看始终允许白名单 (clear=清空本项目持久化规则)"))
         print_formatted_text(HTML("  <ansicyan>/usage</ansicyan>                                : 查看 Token 用量统计 (按模型区分: 今日/近7天/近30天，精确数值)"))
         print_formatted_text(HTML("  <ansicyan>/usage &lt;日期&gt; [截止日期]</ansicyan>          : 查询指定单日或区间的 Token 用量 (例: /usage 2026-08-01 2026-08-05)"))
@@ -1487,6 +1507,8 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【4. 任务托管与后台进程】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/tasks</ansicyan>                               : 查看或接管目前正在运行的后台长周期服务/命令"))
+        print_formatted_text(HTML("  <ansicyan>/tasks kill &lt;任务ID&gt;</ansicyan>              : 终结指定后台进程或子代理任务"))
+        print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;任务ID&gt;</ansicyan>              : 查看任务最新 30 行日志 (子代理任务显示运行状态)"))
         print_formatted_text(HTML("  <ansicyan>/plan</ansicyan>                                : 查看当前任务计划与逐项状态"))
         print_formatted_text(HTML("  <ansicyan>/plan &lt;pause|resume|retry ID|cancel&gt;</ansicyan>       : 暂停、恢复、重试或取消计划"))
         print_formatted_text(HTML(""))
@@ -1668,9 +1690,9 @@ def handle_slash_command(command_text):
                 print_formatted_text(HTML(f"<ansired>❌ 未知参数「{_esc(mode_name)}」，可选：on, off</ansired>"))
         else:
             enabled = bool(load_config().get("allow_outside_workspace", False))
-            status = "已开放（可访问工作目录外）" if enabled else "已开启（仅限工作目录内）"
+            status = "已开放（工作目录外读写直接放行，不再询问）" if enabled else "已开启（仅限工作目录内）"
             print_formatted_text(HTML(f"<b><ansicyan>沙盒状态：{status}</ansicyan></b>"))
-            print_formatted_text(HTML("用法: <ansiyellow>/sandbox &lt;on|off&gt;</ansiyellow>（on=允许访问工作目录外，off=仅限工作目录内）"))
+            print_formatted_text(HTML("用法: <ansiyellow>/sandbox &lt;on|off&gt;</ansiyellow>（on=工作目录外直接放行，off=仅限工作目录内）"))
 
     elif cmd == "/whitelist":
         # 查看与清除「始终允许」白名单（会话级 + 项目级持久化）
@@ -2102,8 +2124,8 @@ def handle_slash_command(command_text):
             print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /worktree [list|create|remove|prune]</ansired>"))
 
     elif cmd == "/mcp" or cmd.startswith("/mcp "):
-        # MCP 服务管理：默认打开全屏 TUI 配置器，也支持子命令
-        # 用法: /mcp                  -> 打开全屏 TUI 配置器（推荐）
+        # MCP 服务管理：默认打开全屏 CLI 配置器，也支持子命令
+        # 用法: /mcp                  -> 打开全屏 CLI 配置器（推荐）
         #       /mcp status           -> 查看连接状态（轻量，不开全屏）
         #       /mcp tools            -> 列出已注册 MCP 工具
         #       /mcp enable <name>    -> 启用某 server
@@ -2112,11 +2134,11 @@ def handle_slash_command(command_text):
         #       /mcp edit             -> 用记事本打开 mcp.json
         from core.mcp_client import mcp_manager
         parts = command_text.strip().split(maxsplit=2)
-        # 不带子命令时默认打开全屏 TUI 配置器
+        # 不带子命令时默认打开全屏 CLI 配置器
         sub = parts[1].strip() if len(parts) > 1 else "open"
 
         if sub == "open":
-            # 打开全屏 TUI 配置器：退出主 App，由主循环在主线程安全开启
+            # 打开全屏 CLI 配置器：退出主 App，由主循环在主线程安全开启
             # 注意：pending_action 已在函数顶部 /models 分支声明为 global，这里直接赋值
             pending_action = "open_mcp"
             if app_instance:
@@ -2239,7 +2261,7 @@ def handle_slash_command(command_text):
             # /mcp edit：用记事本打开 mcp.json（Windows 走 notepad，其他平台走 vi）
             config_path = mcp_manager.config_file
             print_formatted_text(HTML(f"<ansicyan>📝 正在打开配置文件: {_esc(config_path)}</ansicyan>"))
-            print_formatted_text(HTML("<ansigray>  编辑保存后，回到 TUI 运行 /mcp reconnect 让改动生效。</ansigray>"))
+            print_formatted_text(HTML("<ansigray>  编辑保存后，回到 CLI 运行 /mcp reconnect 让改动生效。</ansigray>"))
             try:
                 import platform
                 if platform.system() == "Windows":
@@ -2510,7 +2532,7 @@ def _make_input_app():
         ("/skills", "查看或安装/开启/禁用技能插件"),
         ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
         ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
-        ("/sandbox", "沙盒开关 (on:允许访问工作目录外/off:仅限目录内)"),
+        ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
         ("/whitelist", "查看/清空「始终允许」白名单 (clear:清空本项目持久化规则)"),
         ("/clear", "清理当前屏幕"),
         ("/exit", "退出 Y-code"),
@@ -2617,6 +2639,15 @@ def _make_input_app():
         """Enter 提交（如果是指令则立即在主线程同步执行，不阻塞队列；如果是普通对话则放入后台队列）"""
         global confirm_prompt
         if confirm_prompt:
+            # ask_user 提问支持自由文本回答：输入区有内容时 Enter 优先作为
+            # 自定义回答发送（与 GUI 第四项输入框语义一致）；输入为空则按
+            # ↑/↓ 选中的选项回答
+            if confirm_prompt.get("function_name") == "ask_user":
+                typed = _paste_store.expand(input_area.text.strip())
+                if typed and _resolve_confirm_custom(typed):
+                    input_area.text = ""
+                    event.app.invalidate()
+                    return
             idx = confirm_prompt['current_idx']
             if _resolve_confirm_prompt(idx):
                 event.app.invalidate()
@@ -2757,9 +2788,13 @@ def _make_input_app():
 
     # y/n/a 快捷键只对权限确认框（带 request_id 的 broker 请求）生效：
     # ask_user 的选项是任意文案（如"方案A/方案B"），y/n 与其毫无对应关系，
-    # 误触会静默选中错误选项。ask_user 框请用 ↑/↓ + Enter 选择。
+    # 误触会静默选中错误选项。ask_user 框请用 ↑/↓ + Enter 选择，
+    # 或直接输入内容后 Enter 作为自定义回答。
+    # （ask_user 同样经 broker 带 request_id，必须显式按 function_name 排除）
     _broker_confirm_active = Condition(
-        lambda: confirm_prompt is not None and bool(confirm_prompt.get("request_id"))
+        lambda: confirm_prompt is not None
+        and bool(confirm_prompt.get("request_id"))
+        and confirm_prompt.get("function_name") != "ask_user"
     )
 
     @kb.add("y", filter=_broker_confirm_active)
@@ -3139,7 +3174,7 @@ def _make_input_app():
 
 
 # 按完整轮次淘汰最早的一段历史（首个非 system 消息起到下一条 user 消息前）。
-# 实现已下沉到 core/agent_service.py 供 TUI 与 GUI 共用，这里保留同名别名。
+# 实现已下沉到 core/agent_service.py 供 CLI 与 GUI 共用，这里保留同名别名。
 _evict_oldest_turn = _agent_service.evict_oldest_turn
 
 
@@ -3372,7 +3407,7 @@ def _background_worker():
 
                 # 思考期间界面重绘已交由全局 UI 刷新线程托管，此处无需重复启动本地子线程
                 try:
-                    # 模型和工具层只产生事件；终端输出统一交给主 TUI 线程。
+                    # 模型和工具层只产生事件；终端输出统一交给主 CLI 线程。
                     response_gen = chat_with_model_events(
                         task_model,
                         task_key,
@@ -3528,7 +3563,7 @@ def _background_worker():
 
 
 def run_headless(prompt, session_name=None) -> int:
-    """Headless 模式：执行一次性任务后退出，不进入交互式 TUI。
+    """Headless 模式：执行一次性任务后退出，不进入交互式 CLI。
 
     用途：CI/脚本/管道集成
     参考：Grok Build/OpenCode 都支持的 headless 模式
@@ -3550,7 +3585,7 @@ def run_headless(prompt, session_name=None) -> int:
 
     # 1. 初始化运行时（与 run_cli 相同的副作用集中执行）
     bind_default_plan_session(current_session)
-    # headless 模式：不在 TUI 中与用户交互，自动拒绝所有权限请求，避免 worker 永久挂起
+    # headless 模式：不在 CLI 中与用户交互，自动拒绝所有权限请求，避免 worker 永久挂起
     def _deny_permission_request(request):
         try:
             permission_broker.resolve(request.request_id, 1)  # 1 = No, 拒绝
@@ -3629,7 +3664,7 @@ def run_headless(prompt, session_name=None) -> int:
             print(f"\n[headless 任务失败: {detail}]", file=sys.stderr)
             return 1
 
-        # headless 下不经过 TUI 渲染，需要从数据库取出最终回复并打印到 stdout
+        # headless 下不经过 CLI 渲染，需要从数据库取出最终回复并打印到 stdout
         try:
             history = manager.get_history(current_session)
             # High 8：过滤 worker 持久化的失败标记消息，避免被当作正常回复打印
@@ -3667,7 +3702,7 @@ def run_cli():
     global current_model, current_key, current_url, current_ctx_win, current_model_name
 
     # 运行时初始化副作用集中在入口执行（而非模块 import 时），保证 main.py 可被安全 import
-    _app_ctx.set_ui_flavor("tui")
+    _app_ctx.set_ui_flavor("cli")
     bind_default_plan_session(current_session)
     permission_broker.set_prompt_handlers(
         _activate_permission_request,
@@ -3745,11 +3780,11 @@ def run_cli():
     worker_thread = threading.Thread(target=_background_worker, daemon=True)
     worker_thread.start()
 
-    # ── 启动预热（同步阶段，TUI 出现前完成）──────────────────────────────
+    # ── 启动预热（同步阶段，CLI 出现前完成）──────────────────────────────
     # 设计取向：启动慢一点没关系，但进入界面后必须立即可用、输入不卡。
     # 若改为后台预热，litellm/mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
     # 抢 GIL，实测会把首帧绘制卡 8 秒、键盘输入无回显。因此三个预热任务在
-    # 此处并发执行、主线程显示进度动画并等全部完成后再进入 TUI。
+    # 此处并发执行、主线程显示进度动画并等全部完成后再进入 CLI。
 
     def _preload_litellm():
         """预热 LLM 引擎：litellm import、tiktoken 编码加载（token_counter
@@ -3776,9 +3811,9 @@ def run_cli():
             _llm_engine_ready = True
 
     def _mcp_status_to_ui(message):
-        # 预热期 TUI 尚未启动：预热线程若直接 print 会与主线程预热进度动画
+        # 预热期 CLI 尚未启动：预热线程若直接 print 会与主线程预热进度动画
         # 竞争同一 stdout，打乱终端输出；改走诊断日志。
-        # TUI 运行后：经 schedule_ui 回 UI 线程打印。
+        # CLI 运行后：经 schedule_ui 回 UI 线程打印。
         if app_instance is None:
             logging.getLogger("py.warnings").info("MCP 状态: %s", message)
         else:
@@ -3806,7 +3841,7 @@ def run_cli():
             pass  # 预检失败不阻碍正常预热流程
         try:
             from core.mcp_client import mcp_manager, set_status_logger as _set_mcp_status_logger
-            # MCP 连接状态改由 TUI 主线程打印（core/mcp_client 自身不再 import main）
+            # MCP 连接状态改由 CLI 主线程打印（core/mcp_client 自身不再 import main）
             _set_mcp_status_logger(_mcp_status_to_ui)
             mcp_manager._ensure_connected()
         except Exception as e:
@@ -3828,7 +3863,7 @@ def run_cli():
     for _t in _preload_threads:
         _t.start()
 
-    # 进度动画：纯文本终端阶段（TUI 未启动），非 tty 时安静等待
+    # 进度动画：纯文本终端阶段（CLI 未启动），非 tty 时安静等待
     _preload_t0 = time.monotonic()
     _spin_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
     _tty = sys.stdout is not None and sys.stdout.isatty()
@@ -3951,7 +3986,7 @@ def run_cli():
             continue
 
         elif pending_action == "open_mcp":
-            # /mcp 不带参数时打开的全屏 TUI 配置器
+            # /mcp 不带参数时打开的全屏 CLI 配置器
             from core.mcp_selector import open_mcp_selector
             open_mcp_selector()
             pending_action = None
@@ -4037,7 +4072,7 @@ def run_cli():
 
 
 if __name__ == "__main__":
-    # Headless 模式：ycode -p "task" 一次性执行任务后退出，不进入交互式 TUI
+    # Headless 模式：ycode -p "task" 一次性执行任务后退出，不进入交互式 CLI
     # 用途：CI/脚本/管道集成（参考 Grok Build/OpenCode 的 headless 模式）
     # 用法：
     #   ycode -p "解释这个代码库"

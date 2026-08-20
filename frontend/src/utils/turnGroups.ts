@@ -99,3 +99,75 @@ export function groupStats(group: TurnGroupInfo): { rounds: number; toolCount: n
   }
   return { rounds, toolCount };
 }
+
+// ---------------------------------------------------------------------------
+// 回合文件更改摘要（"N 个文件已更改" 折叠面板）
+//
+// 数据来源：本回合所有 assistant 消息里，mutation 工具调用绑定的 diff 与
+// 未绑定的历史 legacy_diffs。行数从 diff 文本启发式统计（与后端
+// core/turn_renderer._count_diff_changes 同一套口径：剥离 ANSI/行号后按
+// + / - 前缀计数，跳过 +++ / --- 文件头）。同一文件多次修改去重，行数累加。
+// ---------------------------------------------------------------------------
+
+export interface FileChangeEntry {
+  /** 文件名（basename），如 tools.py */
+  name: string;
+  /** 相对/原始路径，如 .\core\tools.py */
+  path: string;
+  added: number;
+  removed: number;
+  /** 该文件本回合全部修改的 unified diff 文本（多次修改拼接），用于展开查看 */
+  diffText: string;
+}
+
+const DIFF_ANSI_RE = /\x1b\[[0-9;]*m/g;
+const DIFF_MARKER_RE = /^[\d\s]*([+-])/;
+
+/** 与后端 _count_diff_changes 对齐的 +/− 行数统计 */
+export function countDiffChanges(diffText: string): { added: number; removed: number } {
+  let added = 0;
+  let removed = 0;
+  for (const rawLine of diffText.split('\n')) {
+    const line = rawLine.replace(DIFF_ANSI_RE, '').replace(/│/g, '').trim();
+    if (!line || line.startsWith('+++') || line.startsWith('---')) continue;
+    const m = line.match(DIFF_MARKER_RE);
+    if (!m) continue;
+    if (m[1] === '+') added += 1;
+    else removed += 1;
+  }
+  return { added, removed };
+}
+
+function baseName(p: string): string {
+  const norm = p.replace(/\\/g, '/');
+  const i = norm.lastIndexOf('/');
+  return i >= 0 ? norm.slice(i + 1) : norm;
+}
+
+/** 收集回合内的文件更改（去重 + 行数累加）。无更改返回空数组（面板不显示） */
+export function collectFileChanges(group: TurnGroupInfo): FileChangeEntry[] {
+  const byPath = new Map<string, FileChangeEntry>();
+  const push = (filePath: string, diffText: string) => {
+    const p = String(filePath || '').trim();
+    if (!p) return;
+    const { added, removed } = countDiffChanges(diffText || '');
+    const entry = byPath.get(p);
+    if (entry) {
+      entry.added += added;
+      entry.removed += removed;
+      if (diffText) entry.diffText += (entry.diffText ? '\n' : '') + diffText;
+    } else {
+      byPath.set(p, { name: baseName(p), path: p, added, removed, diffText: diffText || '' });
+    }
+  };
+  for (const m of [...group.middle, ...group.tail]) {
+    if (m.role !== 'assistant') continue;
+    for (const c of m.tool_calls ?? []) {
+      if (c.diff && c.diff.file_path) push(c.diff.file_path, c.diff.diff_text);
+    }
+    for (const d of m.legacy_diffs ?? []) {
+      push(d.file_path, d.diff_text);
+    }
+  }
+  return [...byPath.values()];
+}

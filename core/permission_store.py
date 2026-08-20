@@ -46,9 +46,15 @@ def canonical_workdir(workdir=None) -> str:
 
 
 def canonical_file_path(path) -> str:
-    """与 core.llm._canonical_permission_path 同语义的文件路径规范化。"""
+    """与 core.llm._canonical_permission_path 同语义的文件路径规范化。
+
+    相对路径按线程本地 workdir 解析（进程 cwd 在 GUI 多会话并行下不可靠），
+    绝对路径与 realpath+normcase 行为一致。
+    """
     try:
-        return os.path.normcase(os.path.realpath(os.path.abspath(str(path or ""))))
+        from core.tools import _resolve_against_workdir
+
+        return os.path.normcase(str(_resolve_against_workdir(path)))
     except (OSError, ValueError, TypeError):
         return ""
 

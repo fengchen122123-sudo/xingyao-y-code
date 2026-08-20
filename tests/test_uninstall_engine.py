@@ -11,9 +11,9 @@ def _fake_install_dir(tmp_path):
     """构造一个最小化的已安装目录结构。"""
     install_dir = tmp_path / "installed"
     (install_dir / "_internal" / "frontend").mkdir(parents=True)
-    (install_dir / "tui").mkdir(parents=True)
+    (install_dir / "cli").mkdir(parents=True)
     (install_dir / "Y-code.exe").write_text("gui", encoding="utf-8")
-    (install_dir / "ycode.exe").write_text("tui", encoding="utf-8")
+    (install_dir / "ycode.exe").write_text("cli", encoding="utf-8")
     (install_dir / "ycode_uninstall.exe").write_text("uninst", encoding="utf-8")
     (install_dir / "_internal" / "version.txt").write_text("9.9.9", encoding="utf-8")
     return install_dir
@@ -61,7 +61,7 @@ def test_user_scope_uninstall_removes_everything(tmp_path, patched_env):
     assert not (install_dir / "Y-code.exe").exists()
     assert not (install_dir / "ycode.exe").exists()
     assert not (install_dir / "_internal").exists()
-    assert not (install_dir / "tui").exists()
+    assert not (install_dir / "cli").exists()
     assert (install_dir / "ycode_uninstall.exe").exists()
     # 用户配置被删除
     assert not (tmp_path / "home" / ".ycode").exists()
@@ -70,8 +70,8 @@ def test_user_scope_uninstall_removes_everything(tmp_path, patched_env):
     assert patched_env["system_path"] == []
     assert all(hive == winreg.HKEY_CURRENT_USER for _, hive in patched_env["registry"])
     assert {name for name, _ in patched_env["registry"]} == {
-        "Y-code", "Y-code-CLI", "Y-code-TUI"}
-    # 快捷方式：三个命名都尝试，目录不含公共桌面
+        "Y-code", "Y-code-CLI"}
+    # 快捷方式：两个命名都尝试，目录不含公共桌面
     assert {name for name, _ in patched_env["shortcut"]} == set(
         ycode_uninstall.SHORTCUT_NAMES)
     for _, dirs in patched_env["shortcut"]:

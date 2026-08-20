@@ -19,7 +19,7 @@ dist/
 # PyInstaller (auto-generated, never commit)
 # 注意：ycode.spec / ycode_setup.spec / ycode_uninstall.spec 是项目自定义配置，
 # 已纳入版本控制；其他自动生成的 .spec（例如 build_release.py 用 --onefile
-# 动态构建 ycode_setup.exe / ycode_tui_setup.exe 时，PyInstaller 在临时目录
+# 动态构建 ycode_setup.exe / ycode_cli_setup.exe 时，PyInstaller 在临时目录
 # 里自动生成的那些）仍然忽略。
 *.spec
 !ycode.spec

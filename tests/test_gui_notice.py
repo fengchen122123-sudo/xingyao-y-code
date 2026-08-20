@@ -1,4 +1,4 @@
-"""GUI notice 桥接层：TUI 的 <ansi*> 着色标记必须在桥接层剥离，否则原样显示给用户。"""
+"""GUI notice 桥接层：CLI 的 <ansi*> 着色标记必须在桥接层剥离，否则原样显示给用户。"""
 import gui_bridge
 
 
@@ -10,9 +10,10 @@ def test_strip_ansi_markup_removes_color_tags():
 
 def test_strip_ansi_markup_handles_various_colors():
     assert gui_bridge._strip_ansi_markup("<ansigreen>✔ 完成</ansigreen>") == "✔ 完成"
+    # 首尾换行/空白也一并去掉（CLI 用 \n 分段，GUI notice 卡片会渲染成空行）
     assert gui_bridge._strip_ansi_markup(
         "\n<ansigray>🧠 正在后台智能压缩...</ansigray>"
-    ) == "\n🧠 正在后台智能压缩..."
+    ) == "🧠 正在后台智能压缩..."
 
 
 def test_strip_ansi_markup_keeps_plain_text_and_html_like_content():

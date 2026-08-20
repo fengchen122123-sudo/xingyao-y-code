@@ -149,7 +149,7 @@ os.makedirs(YCODE_DIR, exist_ok=True)
 # 集中定义所有持久化文件路径
 _CONFIG_FILE = os.path.join(YCODE_DIR, "config.json")
 DB_FILE = os.path.join(YCODE_DIR, "ycode.db")
-# GUI 使用独立的会话库：GUI 与 TUI 的对话记录互不可见、互不影响
+# GUI 使用独立的会话库：GUI 与 CLI 的对话记录互不可见、互不影响
 GUI_DB_FILE = os.path.join(YCODE_DIR, "ycode_gui.db")
 ACTIVE_SKILLS_FILE = os.path.join(YCODE_DIR, "active_skills.json")
 MCP_FILE = os.path.join(YCODE_DIR, "mcp.json")

@@ -13,6 +13,10 @@ from prompt_toolkit.formatted_text import HTML  # noqa: F401
 _compress_guard = threading.Lock()
 _compressing_sessions = set()
 
+# tiktoken 编码器惰性加载状态：idle → loading → ready / failed
+# ready 前（含等待超时）所有 token 估算走 CJK 感知的字符兜底
+_encoding_state = {"status": "idle", "enc": None}
+
 # 默认配置：在压缩收益与额度消耗之间取平衡
 DEFAULT_RETAIN_COUNT = 8
 DEFAULT_RETAIN_COUNT_FORCE = 4
@@ -57,17 +61,61 @@ def _load_compression_config():
         }
 
 
+def _get_encoding(timeout=10.0):
+    """惰性加载 tiktoken 编码器；网络不可达时绝不无限阻塞。
+
+    tiktoken 首次加载需联网下载 cl100k_base 编码文件（缓存在 %TEMP%），
+    网络受限时底层请求无超时、会永久挂起——此前压缩线程会被这一步卡死。
+    这里改为后台守护线程加载，主线程最多等 timeout 秒；未就绪则返回 None，
+    调用方退回字符估算。后台线程加载成功后后续调用直接复用。
+    """
+    import time as _time
+
+    state = _encoding_state
+    if state["status"] == "ready":
+        return state["enc"]
+    if state["status"] in ("loading", "failed"):
+        # loading：并发调用或上次等待超时——线程仍在后台跑，成功后自动就绪。
+        # 等待逻辑只走首次触发路径，避免每个调用方都阻塞一遍。
+        if state["status"] == "failed":
+            return None
+        return state["enc"]
+
+    state["status"] = "loading"
+
+    def _load():
+        try:
+            import tiktoken
+            enc = tiktoken.get_encoding("cl100k_base")
+            state["enc"] = enc
+            state["status"] = "ready"
+        except Exception:
+            state["status"] = "failed"
+
+    threading.Thread(target=_load, daemon=True, name="ycode-tiktoken-load").start()
+    deadline = _time.monotonic() + timeout
+    while _time.monotonic() < deadline and state["status"] == "loading":
+        _time.sleep(0.05)
+    return state["enc"] if state["status"] == "ready" else None
+
+
 def _estimate_tokens(text):
-    """估算文本 token 数。优先用 tiktoken，失败时按字符数近似（中文/英文混合约 1 token / 2 字符）。"""
+    """估算文本 token 数。优先用 tiktoken；不可用时退回 CJK 感知的字符估算。
+
+    兜底规则：CJK 字符按 1 token/字（中文实际 1~1.5 token/字，取下界），
+    其余按 1 token/4 字符（英文典型值）。相比一刀切的 len//2，
+    中文为主的文本不再被低估一半，分段预算更不容易把请求顶出窗口。
+    """
     if not isinstance(text, str):
         text = str(text)
-    try:
-        import tiktoken
-        enc = tiktoken.get_encoding("cl100k_base")
-        return len(enc.encode(text))
-    except Exception:
-        # 保守近似：英文 1 token / 4 字符，中文 1 token / 1 字符；混合取 1 token / 2 字符
-        return max(1, len(text) // 2)
+    enc = _get_encoding()
+    if enc is not None:
+        try:
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    cjk = sum(1 for ch in text if '\u4e00' <= ch <= '\u9fff')
+    return cjk + (len(text) - cjk) // 4
 
 
 def _truncate_long_tool_result(content, config=None):
@@ -104,6 +152,38 @@ def _truncate_long_tool_result(content, config=None):
         f"{head}\n"
         f"... [已省略 {omitted} 字符 / 约 {omitted_tokens} token 的工具结果内容] ...\n"
         f"{tail}"
+    )
+
+
+def _build_summary_prompt(old_summary, chat_log, summary_limit):
+    """构造总结 / 合并 prompt（分段压缩时逐段复用，文案与历史行为一致）。"""
+    if old_summary:
+        return (
+            "你是一个高度专业的记忆管理器。请根据【前期历史记忆摘要】和最新的【追加对话记录】，进行梳理和整合，生成一个全新的、合并后的中文背景记忆摘要。\n"
+            "新的记忆摘要必须完整包含前期和新近的所有关键事实：\n"
+            "1. 曾经讨论的技术决策和确定的技术方案；\n"
+            "2. 已经修改或创建的代码文件（包含文件名）；\n"
+            "3. 当前遗留、尚在排查的 Bug 或者是未完工的待办开发任务；\n"
+            "4. 用户当前正在进行的最终目标。\n"
+            "要求：\n"
+            f"- 保持极度精炼，整体字数严格控制在 {summary_limit} 字以内，千万不要长篇大论。\n"
+            "- 直接输出合并后的摘要内容，不要带废话，也不要带任何 Markdown 标题、说明性前言或结尾词。\n\n"
+            f"【前期历史记忆摘要】\n{old_summary}\n\n"
+            f"【追加对话记录】\n{chat_log}\n\n"
+            "全新合并后的记忆摘要："
+        )
+    return (
+        "你是一个高度专业的记忆管理器。请为以下一段长对话记录生成一个简短、结构清晰的中文背景记忆摘要。\n"
+        "你的摘要需要准确概括：\n"
+        "1. 关键讨论主题和技术决策；\n"
+        "2. 曾经修改或创建的关键代码文件名称；\n"
+        "3. 目前未解决的 Bug、排查中的问题或未完工的待办事项；\n"
+        "4. 用户当前正在进行的目标。\n"
+        "要求：\n"
+        f"- 保持极其简练，字数严格控制在 {summary_limit} 字以内。\n"
+        "- 不要带任何废话、Markdown标题或介绍，直接输出摘要内容。\n\n"
+        f"[对话历史记录]\n{chat_log}\n\n"
+        "记忆摘要："
     )
 
 
@@ -212,8 +292,9 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             # 获取被压缩的最大消息 id，以此作为下次截断的起点
             max_summarized_id = messages_to_summarize[-1]["id"]
 
-            # 4. 组装待总结对话文本日志
-            chat_log = ""
+            # 4. 组装待总结对话文本日志（清洗思考标签 + 预截断工具结果）
+            prepared_messages = []
+            total_chars = 0
             for msg in messages_to_summarize:
                 role = msg["role"]
                 # 上下文块（动态运行上下文/时间注记/后台汇总）是脚手架而非对话内容，
@@ -232,49 +313,18 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 if role == "tool" and clean_content:
                     clean_content = _truncate_long_tool_result(clean_content, config)
                 if clean_content:
-                    chat_log += f"{role_display}: {clean_content}\n"
+                    prepared_messages.append((role_display, clean_content))
+                    total_chars += len(clean_content)
 
-            if not chat_log.strip():
+            if not prepared_messages:
                 return False
-
-            summary_limit = config["summary_length_merge"] if old_summary else config["summary_length_first"]
-
-            # 5. 构造总结 / 合并 prompt 提交大模型
-            if old_summary:
-                prompt = (
-                    "你是一个高度专业的记忆管理器。请根据【前期历史记忆摘要】和最新的【追加对话记录】，进行梳理和整合，生成一个全新的、合并后的中文背景记忆摘要。\n"
-                    "新的记忆摘要必须完整包含前期和新近的所有关键事实：\n"
-                    "1. 曾经讨论的技术决策和确定的技术方案；\n"
-                    "2. 已经修改或创建的代码文件（包含文件名）；\n"
-                    "3. 当前遗留、尚在排查的 Bug 或者是未完工的待办开发任务；\n"
-                    "4. 用户当前正在进行的最终目标。\n"
-                    "要求：\n"
-                    f"- 保持极度精炼，整体字数严格控制在 {summary_limit} 字以内，千万不要长篇大论。\n"
-                    "- 直接输出合并后的摘要内容，不要带废话，也不要带任何 Markdown 标题、说明性前言或结尾词。\n\n"
-                    f"【前期历史记忆摘要】\n{old_summary}\n\n"
-                    f"【追加对话记录】\n{chat_log}\n\n"
-                    "全新合并后的记忆摘要："
-                )
-            else:
-                prompt = (
-                    "你是一个高度专业的记忆管理器。请为以下一段长对话记录生成一个简短、结构清晰的中文背景记忆摘要。\n"
-                    "你的摘要需要准确概括：\n"
-                    "1. 关键讨论主题和技术决策；\n"
-                    "2. 曾经修改或创建的关键代码文件名称；\n"
-                    "3. 目前未解决的 Bug、排查中的问题或未完工的待办事项；\n"
-                    "4. 用户当前正在进行的目标。\n"
-                    "要求：\n"
-                    f"- 保持极其简练，字数严格控制在 {summary_limit} 字以内。\n"
-                    "- 不要带任何废话、Markdown标题或介绍，直接输出摘要内容。\n\n"
-                    f"[对话历史记录]\n{chat_log}\n\n"
-                    "记忆摘要："
-                )
 
         # LLM 调用耗时较长，在锁外执行，避免阻塞其它线程的正常读写
         emit("\n<ansigray>🧠 正在后台智能压缩并整合长对话记忆...</ansigray>")
 
         # 优先使用 secondary（便宜）模型做摘要，降低后台记忆压缩的额度消耗
         compress_model, compress_key, compress_url = api_model, api_key, api_url
+        compress_window = 0
         try:
             from core.model_manager import get_secondary_model, get_secondary_roles
             if get_secondary_roles().get("compression"):
@@ -283,32 +333,95 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                     compress_model = secondary["litellm_model"]
                     compress_key = secondary["api_key"]
                     compress_url = secondary["base_url"]
+                    compress_window = int(secondary.get("context_window") or 0)
         except Exception:
             pass
+        if compress_window <= 0:
+            # 压缩模型是主模型时取主模型窗口，仍取不到则按 128k 保守兜底
+            try:
+                from core.model_manager import get_active_model
+                active = get_active_model()
+                if active and active.get("litellm_model") == compress_model:
+                    compress_window = int(active.get("context_window") or 0)
+            except Exception:
+                pass
+        if compress_window <= 0:
+            compress_window = 128000
+
+        # 历史一次性塞进单个 prompt 会在长会话下超过压缩模型窗口
+        # （如 88 万 token 历史 vs 26 万窗口），压缩请求本身超窗失败并反复重试。
+        # 按窗口的安全预算切成多段，逐段与累积摘要合并，全部完成后一次性写库。
+        # 预算取窗口 40%：其余留给指令、累积摘要、输出与估算偏差
+        # （tiktoken 对非 OpenAI 分词器的估算普遍偏低，必须留足余量）。
+        chunk_token_budget = max(2000, int(compress_window * 0.4))
+
+        chunks = []
+        current_chunk = []
+        current_tokens = 0
+        for role_display, content in prepared_messages:
+            token_count = _estimate_tokens(content)
+            if token_count > chunk_token_budget:
+                # 单条消息即超预算（如超长助手文本）：按 token 截断而非按字符，
+                # 中文 1 字符 ≈ 1~1.5 token，按字符截会严重超窗
+                # 二分查找：找到不超过预算的最大前缀
+                lo, hi = 0, len(content)
+                while lo < hi:
+                    mid = (lo + hi + 1) // 2
+                    if _estimate_tokens(content[:mid]) <= chunk_token_budget:
+                        lo = mid
+                    else:
+                        hi = mid - 1
+                content = content[:lo] + "\n...[该条消息过长，中段已截断]..."
+                token_count = chunk_token_budget
+            if current_chunk and current_tokens + token_count > chunk_token_budget:
+                chunks.append(current_chunk)
+                current_chunk, current_tokens = [], 0
+            current_chunk.append((role_display, content))
+            current_tokens += token_count
+        if current_chunk:
+            chunks.append(current_chunk)
+        total_chunks = len(chunks)
 
         # 懒加载 litellm.completion（首次调用触发 import，约 1.4s）
         from core.llm import _litellm_completion, _provider_cache_affinity_options
-        request_kwargs = {
-            "model": compress_model,
-            "api_key": compress_key,
-            "api_base": compress_url,
-            "messages": [{"role": "user", "content": prompt}],
-            "timeout": 15,
-        }
-        request_kwargs.update(_provider_cache_affinity_options(
-            compress_model,
-            compress_url,
-            cache_scope="secondary:compression",
-            cache_session_id=session_name,
-            tool_contract="no-tools",
-        ))
-        response = _litellm_completion(
-            **request_kwargs
-        )
-        new_summary = (response.choices[0].message.content or "").strip()
-        # 清除多余的 markdown 格式或引导词
-        new_summary = re.sub(r"^记忆摘要[：:]\s*", "", new_summary)
-        new_summary = new_summary.replace("```", "").strip()
+
+        new_summary = old_summary
+        for chunk_index, chunk in enumerate(chunks):
+            if total_chunks > 1:
+                emit(f"\n<ansigray>🧠 历史过长，分 {total_chunks} 段压缩中（第 {chunk_index + 1}/{total_chunks} 段）...</ansigray>")
+            chat_log = "".join(f"{role_display}: {content}\n" for role_display, content in chunk)
+            summary_limit = config["summary_length_merge"] if new_summary else config["summary_length_first"]
+            prompt = _build_summary_prompt(new_summary, chat_log, summary_limit)
+
+            request_kwargs = {
+                "model": compress_model,
+                "api_key": compress_key,
+                "api_base": compress_url,
+                "messages": [{"role": "user", "content": prompt}],
+                # 分段后单次载荷仍可能有数万 token，15s 对总结请求经常不够；
+                # 提高到 60s 与正常对话请求的量级对齐
+                "timeout": 60,
+            }
+            request_kwargs.update(_provider_cache_affinity_options(
+                compress_model,
+                compress_url,
+                cache_scope="secondary:compression",
+                cache_session_id=session_name,
+                tool_contract="no-tools",
+            ))
+            response = _litellm_completion(
+                **request_kwargs
+            )
+            candidate = (response.choices[0].message.content or "").strip()
+            # 清除多余的 markdown 格式或引导词
+            candidate = re.sub(r"^记忆摘要[：:]\s*", "", candidate)
+            candidate = candidate.replace("```", "").strip()
+            if not candidate:
+                # 某一段返回空结果：继续合并后续段会丢失该段事实，直接失败，
+                # 边界不推进，下轮压缩从头重试
+                emit("<ansiyellow>ℹ 记忆压缩中途返回空摘要，本次已中止（未改变任何数据）。</ansiyellow>")
+                return False
+            new_summary = candidate
 
         if new_summary:
             # 6. 将合并后的记忆摘要和截止 id 存回数据库。
@@ -327,7 +440,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                     return False
                 manager.conn.commit()
 
-            emit(f"<ansigreen>✔ 记忆压缩整合成功！腾出了约 {len(chat_log)//2} 字的历史对话空间。</ansigreen>")
+            emit(f"<ansigreen>✔ 记忆压缩整合成功！腾出了约 {total_chars//2} 字的历史对话空间。</ansigreen>")
             return True
 
     except Exception as e:

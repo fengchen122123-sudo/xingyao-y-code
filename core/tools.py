@@ -154,7 +154,7 @@ def _compress_source_text(text):
 
 # 线程内临时放行（用户批准的单次沙盒外操作）与会话级放行（用户选“始终放行”）
 # 会话级放行按线程绑定的会话分桶存储（多会话并行隔离）：会话 A 放行不影响
-# 会话 B；未绑定线程（TUI 主流程）沿用进程级全局标志（单会话语义不变）。
+# 会话 B；未绑定线程（CLI 主流程）沿用进程级全局标志（单会话语义不变）。
 _sandbox_tls = threading.local()
 _session_sandbox_bypass = False
 _session_sandbox_bypass_by_session: dict[str, bool] = {}
@@ -189,10 +189,27 @@ def _subagent_depth_scope():
         _subagent_depth_tls.depth = prev
 
 
-def is_outside_workspace(path_value):
-    """判断路径是否在当前工作目录之外（resolve 后比较，符号链接/.. 均可识别）。"""
+def _resolve_against_workdir(file_path):
+    """解析为绝对路径：相对路径按线程本地 workdir 解析，而非进程 cwd。
+
+    与 execute_command 的 cwd=str(get_workdir()) 语义一致。GUI 多会话并行时
+    进程 cwd 可能停在安装目录或上一会话，裸 Path.resolve() 会把相对路径
+    （含 list_directory 等目录工具默认的 "."）解析到错误目录，沙盒守卫
+    据此把项目根内的路径误判为"工作目录之外"。
+    """
     from core.workspace_context import get_workdir
-    candidate = Path(str(path_value or "")).expanduser().resolve()
+
+    candidate = Path(str(file_path or "")).expanduser()
+    if not candidate.is_absolute():
+        candidate = get_workdir() / candidate
+    return candidate.resolve()
+
+
+def is_outside_workspace(path_value):
+    """判断路径是否在当前工作目录之外（resolve 后比较，符号链接/.. 均可识别；
+    相对路径按线程本地 workdir 解析，见 _resolve_against_workdir）。"""
+    from core.workspace_context import get_workdir
+    candidate = _resolve_against_workdir(path_value)
     workspace = get_workdir()
     return candidate != workspace and workspace not in candidate.parents
 
@@ -246,7 +263,8 @@ def _outside_workspace_allowed():
     """读取运行时状态：是否允许访问工作目录外的文件。
 
     依次为：线程内单次放行 > 会话级放行 > 配置开关（/sandbox on）。
-    开放后写操作仍需权限确认（write_file/edit_file 的权限流程不变）。
+    开关打开后项目外读写均直接放行、不再逐次询问（~/.ycode 凭据文件除外，
+    见 tool_adapters._sandbox_outside_guard）。
     """
     if getattr(_sandbox_tls, "depth", 0) > 0:
         return True
@@ -263,14 +281,24 @@ def _resolve_workspace_path(file_path, *, allow_trusted_read=False):
     """将路径解析为绝对路径；默认强制限定在当前工作目录内，越界直接拒绝。
 
     当配置 allow_outside_workspace 为 True（/sandbox on）时解除目录限制。
+    相对路径按线程本地 workdir 解析（_resolve_against_workdir）。
     """
-    candidate = Path(str(file_path or "")).expanduser().resolve()
+    candidate = _resolve_against_workdir(file_path)
     if _outside_workspace_allowed():
         return candidate
     if allow_trusted_read:
         try:
             from core.skills import is_trusted_read_path
             if is_trusted_read_path(str(candidate)):
+                return candidate
+        except Exception:
+            pass
+        # ~/.ycode 数据目录读取豁免（与沙盒守卫的读取豁免同语义）：
+        # 覆盖 @附件挂载与 read_file 的免 bypass 直读；写入路径不传
+        # allow_trusted_read，凭据写入仍由沙盒守卫逐次询问。
+        try:
+            from core.memory_kairos import is_ycode_data_path
+            if is_ycode_data_path(str(candidate)):
                 return candidate
         except Exception:
             pass

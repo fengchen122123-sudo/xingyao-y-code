@@ -148,7 +148,7 @@ def _start_preload_thread():
     """后台预热 LLM 引擎：litellm import + tiktoken 编码加载 + 视觉能力探测。
 
     GUI 的界面渲染在独立 WebView 进程，Python 侧后台预热不会卡 UI 首帧
-    （与 TUI 必须同步预热不同，见 main.py 启动预热段的注释）。
+    （与 CLI 必须同步预热不同，见 main.py 启动预热段的注释）。
     不做预热时，首个回合会在工作线程里现场完成这些 import，
     表现为“第一条消息要等很久”。线程安全由 core.llm._litellm_lock 保证。
     """

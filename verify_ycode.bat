@@ -41,7 +41,7 @@ echo.
 echo [4/4] 验证完毕！
 echo.
 echo   现在可以：
-echo     体验 TUI：   venv\Scripts\python main.py
+echo     体验 CLI：   venv\Scripts\python main.py
 echo     体验 GUI：   venv\Scripts\python gui_main.py
 echo     生成安装包： venv\Scripts\python build_release.py
 echo.

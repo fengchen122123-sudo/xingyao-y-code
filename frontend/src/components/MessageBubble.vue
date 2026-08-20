@@ -84,8 +84,8 @@
     <div v-else-if="msg.role === 'notice'" class="notice-card">
       <span class="notice-icon"><AppIcon name="info" :size="15" /></span>
       <div class="notice-body">
-        <div class="notice-title">提示</div>
-        <div class="notice-text">{{ msg.content }}</div>
+        <span class="notice-title">提示</span>
+        <span class="notice-text">{{ msg.content }}</span>
       </div>
     </div>
   </div>
@@ -394,13 +394,19 @@ const thinkingOpen = computed({
 .notice-body {
   flex: 1;
   min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
 }
 .notice-title {
+  flex-shrink: 0;
   font-weight: 600;
   color: var(--accent);
-  margin-bottom: 2px;
 }
 .notice-text {
+  flex: 1;
+  min-width: 0;
   color: var(--text);
   white-space: pre-wrap;
   word-break: break-word;

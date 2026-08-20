@@ -668,8 +668,14 @@ def test_sandbox_guard_exempts_memory_dir_for_read_and_write(tmp_path, monkeypat
     assert asked == [], "memory 目录访问不应触发权限询问"
 
 
-def test_sandbox_guard_keeps_credential_configs_behind_confirmation(tmp_path, monkeypatch):
-    """Runtime data is exempt, but credential-bearing config files are not."""
+def test_sandbox_guard_reads_ycode_dir_but_asks_before_writing_credentials(
+    tmp_path, monkeypatch
+):
+    """~/.ycode 全目录读取豁免（用户要求）；凭据文件写入仍逐次询问。
+
+    改写 mcp.json 可注入恶意 MCP server、改坏 config.json 会让应用不可用，
+    这两个文件（含 .bak）的写操作不受沙盒开关与读取豁免影响。
+    """
     import core.llm as llm_mod
     import core.memory_kairos as mk
 
@@ -690,16 +696,26 @@ def test_sandbox_guard_keeps_credential_configs_behind_confirmation(tmp_path, mo
         )
         assert err is None, f".ycode/{rel} 不应被拒绝"
         assert cm is not None, f".ycode/{rel} 应获得 bypass 上下文"
-    assert asked == []
 
+    # 凭据文件读取：同样豁免（诊断模型配置是常见需求）
     for rel in ("config.json", "config.json.bak", "mcp.json", "mcp.json.bak"):
         cm, err = llm_mod._sandbox_outside_guard(
             "read_file", str(tmp_path / ".ycode" / rel),
             None, "owner", "turn", "主代理", None,
         )
+        assert err is None, f".ycode/{rel} 读取不应被拒绝"
+        assert cm is not None, f".ycode/{rel} 读取应获得 bypass 上下文"
+    assert asked == []
+
+    # 凭据文件写入：必须询问，用户拒绝则拒绝执行
+    for rel in ("config.json", "mcp.json"):
+        cm, err = llm_mod._sandbox_outside_guard(
+            "write_file", str(tmp_path / ".ycode" / rel),
+            None, "owner", "turn", "主代理", None,
+        )
         assert cm is None
         assert err is not None
-    assert len(asked) == 4
+    assert len(asked) == 2
 
 
 def test_sandbox_guard_rejects_unverifiable_path_without_asking(monkeypatch):
@@ -725,6 +741,72 @@ def test_sandbox_guard_rejects_unverifiable_path_without_asking(monkeypatch):
     assert cm is None
     assert err is not None and "无法验证路径" in err
     assert asked == []
+
+
+def test_sandbox_guard_toggle_on_auto_approves_outside_paths(tmp_path, monkeypatch):
+    """沙盒开关打开（allow_outside_workspace=True）：项目外读写直接放行，不再询问。"""
+    import core.llm as llm_mod
+    import core.model_manager as mm
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(
+        mm, "load_config", lambda: {"allow_outside_workspace": True}
+    )
+    asked = []
+    monkeypatch.setattr(
+        llm_mod, "check_permission_and_ask",
+        lambda *a, **kw: asked.append(1) or False,
+    )
+
+    for function_name in ("read_file", "write_file", "edit_file", "list_directory"):
+        cm, err = llm_mod._sandbox_outside_guard(
+            function_name, str(tmp_path / "outside.txt"),
+            None, "owner", "turn", "主代理", None,
+        )
+        assert err is None, f"{function_name} 开关打开时不应被拒绝"
+        assert cm is not None, f"{function_name} 开关打开时应获得 bypass 上下文"
+    assert asked == [], "开关打开时不应触发权限询问"
+
+
+def test_sandbox_guard_toggle_on_still_asks_credential_writes(tmp_path, monkeypatch):
+    """沙盒开关打开时，~/.ycode 凭据文件写入仍必须逐次询问（读取已豁免）。"""
+    import core.llm as llm_mod
+    import core.memory_kairos as mk
+    import core.model_manager as mm
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(mk, "YCODE_DIR", tmp_path / ".ycode")
+    monkeypatch.setattr(
+        mm, "load_config", lambda: {"allow_outside_workspace": True}
+    )
+    asked = []
+    monkeypatch.setattr(
+        llm_mod, "check_permission_and_ask",
+        lambda *a, **kw: asked.append(1) or False,
+    )
+
+    # 读取：豁免（与沙盒开关无关）
+    for rel in ("config.json", "mcp.json"):
+        cm, err = llm_mod._sandbox_outside_guard(
+            "read_file", str(tmp_path / ".ycode" / rel),
+            None, "owner", "turn", "主代理", None,
+        )
+        assert err is None and cm is not None
+    assert asked == []
+
+    # 写入：即使开关打开也要询问
+    for rel in ("config.json", "mcp.json"):
+        cm, err = llm_mod._sandbox_outside_guard(
+            "write_file", str(tmp_path / ".ycode" / rel),
+            None, "owner", "turn", "主代理", None,
+        )
+        assert cm is None
+        assert err is not None
+    assert len(asked) == 2
 
 
 @pytest.mark.parametrize(

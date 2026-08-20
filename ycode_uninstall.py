@@ -3,11 +3,11 @@ ycode_uninstall.py
 Y-code 官方 Windows 卸载向导（经典 Windows 安装程序样式 GUI，与安装向导一致）。
 
 会清理完整版 (GUI + 可选 CLI) 或独立 CLI 安装留下的全部痕迹：
-  - 桌面快捷方式 (Y-code.lnk / Y-code CLI.lnk / Y-code TUI.lnk 旧版，都尝试删除)
+  - 桌面快捷方式 (Y-code.lnk / Y-code CLI.lnk，都尝试删除)
   - HKCU\\Environment\\PATH（user 范围）或系统 PATH（machine 范围）里的安装目录
-  - HKCU/HKLM\\...\\Uninstall 下的注册表项 (Y-code / Y-code-CLI / Y-code-TUI 旧版)
+  - HKCU/HKLM\\...\\Uninstall 下的注册表项 (Y-code / Y-code-CLI)
   - 可选：~/.ycode 用户配置与会话记录
-  - 安装目录本身 (Y-code.exe / ycode.exe / _internal/ / tui/ 子目录)
+  - 安装目录本身 (Y-code.exe / ycode.exe / _internal/ / cli/ 子目录)
 
 安装范围 (scope) 与安装向导一侧的约定一致：
   user    → 当前用户安装：HKCU 卸载项 / 用户 PATH / 个人桌面快捷方式
@@ -79,14 +79,14 @@ def _has_reparse_component(path):
 
 
 def _verify_ycode_install_dir(install_dir):
-    """删除 _internal/ 与 tui/ 前的强制校验：确认该目录确为 Y-code 安装目录。
+    """删除 _internal/ 与 cli/ 前的强制校验：确认该目录确为 Y-code 安装目录。
 
     修复 #1：必须同时满足两个条件，缺一不可——
       (a) 同级存在 Y-code.exe（GUI 主程序入口，独立 CLI 安装也含 GUI 入口时同样满足）；
       (b) _internal/version.txt 存在且内容含 Y-code 版本标识
           （不区分大小写宽松匹配 "ycode"/"y-code"，兼容纯版本号与
            "Y-code x.y.z" 两种 version.txt 实际格式）。
-    返回 True 表示通过。验证思路：把卸载器复制到一个只放了 _internal/tui
+    返回 True 表示通过。验证思路：把卸载器复制到一个只放了 _internal/cli
     同名目录、但无 Y-code.exe 的目录运行，应拒绝删除且绝不执行 rmtree。
     """
     exe_path = os.path.join(install_dir, "Y-code.exe")
@@ -131,10 +131,10 @@ def _registry_marker_matches(install_dir):
     return False
 
 
-# 卸载注册表项（完整版入口 + 独立 CLI 入口 + 旧版 TUI 命名，都尝试移除）
-UNINSTALL_KEY_NAMES = ("Y-code", "Y-code-CLI", "Y-code-TUI")
-# 桌面快捷方式（GUI 版 + CLI 版 + 旧版 TUI 命名，都尝试删除）
-SHORTCUT_NAMES = ("Y-code.lnk", "Y-code CLI.lnk", "Y-code TUI.lnk")
+# 卸载注册表项（完整版入口 + 独立 CLI 入口，都尝试移除）
+UNINSTALL_KEY_NAMES = ("Y-code", "Y-code-CLI")
+# 桌面快捷方式（GUI 版 + CLI 版，都尝试删除）
+SHORTCUT_NAMES = ("Y-code.lnk", "Y-code CLI.lnk")
 
 
 # ============================================================================
@@ -294,7 +294,7 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
     progress(40.0)
 
     # 3. 移除“应用和功能”里的卸载注册项（machine 范围两个 hive 都清，
-    #    兼容完整版入口 + 独立 CLI 入口 + 旧版 TUI 命名）
+    #    兼容完整版入口 + 独立 CLI 入口 + 旧版 CLI 命名）
     log("🗂️ 正在清理注册表卸载信息...")
     try:
         hives = [winreg.HKEY_CURRENT_USER]
@@ -333,9 +333,9 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
         log("ℹ 保留用户配置与历史会话（~/.ycode）。")
     progress(70.0)
 
-    # 5. 清理程序文件：顶层 Y-code.exe / ycode.exe 与 _internal / tui 子目录
+    # 5. 清理程序文件：顶层 Y-code.exe / ycode.exe 与 _internal / CLI 子目录
     #    （ycode_uninstall.exe 自身在向导退出后由自销毁流程删除）
-    #    修复 #1：rmtree _internal/tui 前强制验证该目录确为 Y-code 安装目录
+    #    修复 #1：rmtree _internal/cli 前强制验证该目录确为 Y-code 安装目录
     #    （Y-code.exe + _internal/version.txt 含 Y-code 标识），验证失败即中止，
     #    绝不执行 rmtree——防止卸载器被误复制/误指向其他目录时递归删除无关数据。
     log("🧹 正在清理程序文件...")
@@ -356,7 +356,7 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
                 log(f"✔ 已成功删除: {rel_file}")
             except Exception as e:
                 log(f"⚠️ 删除 {rel_file} 失败: {e}")
-    for rel_dir in ("_internal", "tui"):
+    for rel_dir in ("_internal", "cli"):
         target_dir = os.path.join(install_dir, rel_dir)
         if os.path.isdir(target_dir):
             try:

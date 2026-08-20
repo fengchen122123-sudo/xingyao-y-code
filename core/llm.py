@@ -327,7 +327,7 @@ import core.app_context as app_context
 from core import permission_store
 
 # 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
-# 模块级三个集合是"未绑定线程"（TUI 主流程 / 测试主线程）的默认桶；
+# 模块级三个集合是"未绑定线程"（CLI 主流程 / 测试主线程）的默认桶；
 # 多会话并行下，绑定了线程会话的回合（GUI 回合/子代理线程）使用
 # _SESSION_GRANTS 里各自会话的专属桶，互不可见（详见 _session_grants_bucket）。
 session_allowed_commands: set[tuple[str, ...]] = set()  # 结构化命令规则
@@ -414,8 +414,13 @@ def _grant_edit_hit(canonical_path: str) -> bool:
 
 
 def _canonical_permission_path(value):
+    # 相对路径按线程本地 workdir 解析（GUI 多会话并行时进程 cwd 可能停在
+    # 安装目录，裸 abspath 会把相对路径规范化到错误位置，白名单授予与命中
+    # 错位）；绝对路径行为与原 realpath+normcase 一致。
     try:
-        return os.path.normcase(os.path.realpath(os.path.abspath(str(value or ""))))
+        from core.tools import _resolve_against_workdir
+
+        return os.path.normcase(str(_resolve_against_workdir(value)))
     except (OSError, ValueError, TypeError):
         return ""
 _plan_turn_lock = threading.Lock()
@@ -488,7 +493,7 @@ def check_session_reset():
     global _last_tracked_session
     # 多会话并行：本线程绑定了执行会话时，授权已按会话分桶、互不可见，
     # UI 切换全局会话（用户只是去别的会话看一眼）不再收回运行中回合的授权。
-    # 仅未绑定线程（TUI 单会话主流程）保留"切会话即收回"的旧语义。
+    # 仅未绑定线程（CLI 单会话主流程）保留"切会话即收回"的旧语义。
     if app_context.get_thread_session():
         return
     with _session_whitelist_lock:
@@ -525,7 +530,7 @@ def _format_session_command_rule(rule):
     return f"子命令规则：{command}（允许后续参数）"
 
 def safe_print(formatted_text):
-    """线程安全地在 TUI 终端输出格式化文本，避免破坏屏幕布局"""
+    """线程安全地在 CLI 终端输出格式化文本，避免破坏屏幕布局"""
     from prompt_toolkit import print_formatted_text
     _app = app_context.get_app_instance()
     if _app and _app.loop:
@@ -538,8 +543,8 @@ def safe_print(formatted_text):
 
 def ask_in_raw_terminal(function_name, arguments):
     """
-    纯文本原始终端兜底：只在确实没有活动 TUI App 时才被调用（例如管道重定向或早期初始化时）。
-    不使用任何 ANSI 转义序列或 msvcrt 菜单，直接用 print/input 避免污染 TUI 屏幕。
+    纯文本原始终端兜底：只在确实没有活动 CLI App 时才被调用（例如管道重定向或早期初始化时）。
+    不使用任何 ANSI 转义序列或 msvcrt 菜单，直接用 print/input 避免污染 CLI 屏幕。
     """
     mode_display = {
         "confirm": "每次确认",
@@ -736,7 +741,7 @@ def check_permission_and_ask(
     if _gui_cb is not None:
         return _gui_cb(function_name, arguments)
 
-    # TUI 模式：通过 prompt_toolkit app 或终端 input()
+    # cli 模式：通过 prompt_toolkit app 或终端 input()
     # GUI 模式没有 prompt_toolkit App，但已在 permission_broker 上注册了处理器，
     # 必须直接走下面的 broker 路径，绝不能退回阻塞式 input()。
     _app = app_context.get_app_instance()
@@ -1969,7 +1974,7 @@ def chat_with_model_events(
     """Yield ordered :class:`TurnEvent` snapshots for one model turn.
 
     The legacy ``chat_with_model`` API remains text-oriented. This adapter is
-    the event-oriented entry point used by the TUI and is deliberately kept
+    the event-oriented entry point used by the CLI and is deliberately kept
     separate while the existing tool loop is migrated incrementally.
     """
     resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
@@ -2998,7 +3003,7 @@ PROMOTED_REASONING_PREVIEW_CHARS = 600
 def _tool_result_text(result):
     """把工具消息正文取出并截断，作为 tool_finished 事件的 result 字段。
 
-    这是附加字段：TUI 只读 summary，多出的 result 对它无副作用。
+    这是附加字段：CLI 只读 summary，多出的 result 对它无副作用。
     """
     try:
         content = result.get("content", "") if isinstance(result, dict) else result
@@ -3780,7 +3785,7 @@ def _chat_with_model_generator(
                 current_step = harness_runtime.begin_step()
             if turn > 0:
                 # 轮次边界事件：GUI 流式渲染据此把每个 LLM 轮次拆成独立消息块，
-                # 与历史重放（每轮一条 DB 记录）的结构对齐；TUI/子代理只认已知事件，自动忽略
+                # 与历史重放（每轮一条 DB 记录）的结构对齐；CLI/子代理只认已知事件，自动忽略
                 _notify_event(event_callback, "round_started", {"round": turn + 1})
 
             # API 调用指数退避与 Jitter 抖动重试

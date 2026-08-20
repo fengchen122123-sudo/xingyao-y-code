@@ -260,7 +260,7 @@
           <div class="perm-row">
             <div>
               <h3>沙盒开关</h3>
-              <p>{{ store.sandboxEnabled ? '已解除：允许访问工作目录以外的文件（写操作仍会单独确认）' : '已开启：仅允许访问当前工作目录内的文件' }}</p>
+              <p>{{ store.sandboxEnabled ? '已解除：工作目录外的文件读写直接放行，不再询问（凭据文件除外）' : '已开启：仅允许访问当前工作目录内的文件' }}</p>
             </div>
             <button
               data-test="sandbox-toggle"
@@ -286,7 +286,7 @@
                 @click="clearPermRules"
               >清空本项目规则</button>
             </div>
-            <p class="whitelist-tip">「始终允许」产生的授权按项目目录保存在本地（permissions.json），重启后仍生效。沙盒外访问的会话放行不落盘，切换会话即收回。</p>
+            <p class="whitelist-tip">「始终允许」产生的授权按项目目录保存在本地（permissions.json），重启后仍生效。沙盒限制下访问工作目录外会逐次询问（可选本会话内放行，不落盘、切会话收回）；沙盒解除后不再询问。</p>
             <div v-if="permRules && (permRules.commands.length || permRules.write_files.length || permRules.edit_files.length)">
               <div v-if="permRules.commands.length" class="wl-label">命令前缀规则</div>
               <div v-for="(c, i) in permRules.commands" :key="'c' + i" class="wl-item mono">{{ c }}</div>

@@ -159,15 +159,28 @@ def _repeat_call_blocked_result(decoded: DecodedToolCall) -> dict:
 
 
 def _submit_daemon_call(function, *args, **kwargs):
+    # 并行工具线程必须继承提交线程的回合上下文（线程本地 workdir 与会话路由）。
+    # 裸 daemon 线程里 get_workdir() 会兜底到进程 cwd（GUI 打包版从快捷方式
+    # 启动时是安装目录），沙盒守卫据此把项目内路径误判为"工作目录之外"，
+    # 触发不该出现的权限询问；会话级沙盒放行等"每会话"状态同样依赖线程
+    # 会话绑定，丢失后即使选过"本会话内放行"也会反复询问。
+    from core.workspace_context import get_workdir, workspace_scope
+
+    workdir = get_workdir()
+    thread_session = app_context.get_thread_session()
+
     future = Future()
 
     def runner():
         if not future.set_running_or_notify_cancel():
             return
-        try:
-            future.set_result(function(*args, **kwargs))
-        except BaseException as error:
-            future.set_exception(error)
+        with workspace_scope(workdir):
+            if thread_session:
+                app_context.set_thread_session(thread_session)
+            try:
+                future.set_result(function(*args, **kwargs))
+            except BaseException as error:
+                future.set_exception(error)
 
     threading.Thread(
         target=runner,
