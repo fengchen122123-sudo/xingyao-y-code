@@ -137,6 +137,28 @@ def _get_imom_active_publish_root():
     return ""
 
 
+# ~/.ycode 顶层的应用凭据/配置文件：写入必须逐次询问
+_YCODE_CREDENTIAL_BASENAMES = {"config.json", "config.json.bak", "mcp.json", "mcp.json.bak"}
+
+
+def _win32_long_path(path: str) -> str:
+    """Windows 8.3 短名还原（best-effort）：realpath 不展开短名，
+    confi~1.json 必须还原成 config.json 才能做凭据文件比对。
+    文件不存在时返回原值（由调用方按不可确认路径保守处理）。"""
+    if os.name != "nt":
+        return path
+    try:
+        import ctypes
+
+        buffer = ctypes.create_unicode_buffer(1024)
+        result = ctypes.windll.kernel32.GetLongPathNameW(path, buffer, 1024)
+        if 0 < result < 1024:
+            return buffer.value
+    except Exception:
+        pass
+    return path
+
+
 def _sandbox_outside_guard(
     function_name,
     path_value,
@@ -172,9 +194,29 @@ def _sandbox_outside_guard(
         from core.memory_kairos import is_ycode_data_path
 
         if is_ycode_data_path(path_value):
-            basename = os.path.basename(str(path_value)).lower()
-            if basename not in {"config.json", "config.json.bak", "mcp.json", "mcp.json.bak"}:
+            # 归一化到真实路径再比对：8.3 短名（confi~1.json）、尾部点/空格
+            # （config.json.）、./ 穿插等变体都指向同一凭据文件，裸 basename
+            # 字符串比对会被绕过，导致免询问改写 mcp.json / config.json
+            resolved = os.path.realpath(os.path.expanduser(str(path_value)))
+            expanded = _win32_long_path(resolved)
+            # Win32 文件名会吞掉尾部的点与空格，比对前同样归一化
+            normalized = expanded.rstrip(". ")
+            ycode_root = os.path.realpath(os.path.expanduser("~/.ycode"))
+            basename = os.path.basename(normalized).lower()
+            top_level = os.path.normcase(os.path.dirname(normalized)) == os.path.normcase(ycode_root)
+            # 短名未能展开（目标不存在或系统禁用 8.3）时无法确认指向；
+            # 顶层目录下的写入按凭据处理，宁可多问不可漏放
+            ambiguous_short = "~" in basename and expanded == resolved
+            is_credential_target = top_level and (
+                basename in _YCODE_CREDENTIAL_BASENAMES
+                or (ambiguous_short and function_name in {"write_file", "edit_file"})
+            )
+            # 仅 ~/.ycode 顶层的凭据文件受限（子目录同名文件如
+            # plugins/x/config.json 不是应用配置，不弹逐次询问）
+            if not is_credential_target:
                 return sandbox_bypass(), None
+            # 凭据文件读取放行（诊断配置问题的常见需求），写入必须逐次询问——
+            # 改写 mcp.json 可注入恶意 MCP server，改坏 config.json 会让应用不可用
             if function_name not in {"write_file", "edit_file"}:
                 return sandbox_bypass(), None
             credential_write = True

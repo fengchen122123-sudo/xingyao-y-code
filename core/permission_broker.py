@@ -100,6 +100,17 @@ class PermissionBroker:
             self._activate_prompt(request)
         return request
 
+    def active_function_name(self, request_id: str) -> str | None:
+        """返回指定活跃请求的工具名；请求不存在/不活跃返回 None。
+
+        供 UI 桥接层做纵深防御：只有 ask_user 才透传自由文本回答。
+        """
+        with self._lock:
+            request = self._active
+            if request is None or request.request_id != request_id:
+                return None
+            return request.function_name
+
     def resolve(self, request_id: str, choice_index: int, custom_answer: str | None = None) -> bool:
         with self._lock:
             request = self._active
