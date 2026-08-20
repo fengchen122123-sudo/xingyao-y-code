@@ -16,13 +16,26 @@
 
   <!-- 组尾：总结轮 assistant + 其后的 error 消息，始终可见 -->
   <MessageBubble v-for="m in group.tail" :key="msgKey(m)" :msg="m" />
+
+  <!-- 回合结束且有文件改动时：底部展示可折叠的"文件更改"面板 -->
+  <ChangedFilesPanel
+    v-if="!group.running && fileChanges.length"
+    class="turn-changes"
+    :changes="fileChanges"
+  />
 </template>
 
 <script setup lang="ts">
 import { computed, ref } from 'vue';
+import ChangedFilesPanel from './ChangedFilesPanel.vue';
 import FoldCard from './FoldCard.vue';
 import MessageBubble from './MessageBubble.vue';
-import { groupStats, msgKey, type TurnGroupInfo } from '../utils/turnGroups';
+import {
+  collectFileChanges,
+  groupStats,
+  msgKey,
+  type TurnGroupInfo,
+} from '../utils/turnGroups';
 
 const props = defineProps<{
   group: TurnGroupInfo;
@@ -40,6 +53,9 @@ const STATE_LABELS: Record<TurnGroupInfo['state'], string> = {
 
 const stats = computed(() => groupStats(props.group));
 
+// 回合文件更改摘要（无改动则空数组，面板不渲染）
+const fileChanges = computed(() => collectFileChanges(props.group));
+
 const title = computed(() => {
   const { rounds, toolCount } = stats.value;
   const stateLabel = STATE_LABELS[props.group.state];
@@ -53,6 +69,9 @@ const title = computed(() => {
 <style scoped>
 .turn-fold {
   margin: 2px 0 6px;
+}
+.turn-changes {
+  margin: 6px 0 10px;
 }
 /* 回合折叠头在统一体系上加轻量 hover 底色，与消息流的区分度更强 */
 .turn-fold :deep(.fold-head) {

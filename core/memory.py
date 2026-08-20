@@ -380,6 +380,9 @@ class MemoryManager:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN updated_at TEXT")
                 if "source" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN source TEXT DEFAULT 'GUI'")
+                # 会话级主模型绑定：不继承全局 active_model_id，不同会话/不同界面互不干扰
+                if "active_model_id" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN active_model_id TEXT")
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -581,6 +584,7 @@ class MemoryManager:
                     "CREATE INDEX IF NOT EXISTS idx_cache_diag_ts "
                     "ON cache_request_diagnostics(ts)"
                 )
+                # 保存修改
                 # 保存修改
                 self.conn.commit()
             except Exception:
@@ -1461,7 +1465,6 @@ class MemoryManager:
             )
             message_ids.append(int(cursor.lastrowid))
         return tuple(message_ids)
-
     def add_messages(self, session_name, messages):
         """Atomically append one ordered batch of conversation messages."""
         serialized, has_new_media = self._serialize_message_batch(messages)
@@ -1664,6 +1667,33 @@ class MemoryManager:
                 self.conn.rollback()
                 raise
 
+    def set_session_model_id(self, session_name: str, model_id: str | None) -> bool:
+        """绑定会话级主模型。传 None/空字符串则清除绑定，回退到全局默认模型。"""
+        mid = str(model_id or "").strip() or None
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute('''
+                    UPDATE sessions SET active_model_id = ?, updated_at = ?
+                    WHERE session_name = ?
+                ''', (mid, now, session_name))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_session_model_id(self, session_name: str) -> str | None:
+        """取会话级主模型 ID；未设置返回 None，调用方应回退到全局默认。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT active_model_id FROM sessions WHERE session_name = ?
+            ''', (session_name,))
+            row = cursor.fetchone()
+            return str(row[0]).strip() if row and row[0] else None
+
     def clear_session_messages(self, session_name):
         """清空指定会话的全部消息，但保留会话本身（供 GUI "清空历史" 使用）。
 
@@ -1755,6 +1785,8 @@ class MemoryManager:
                 else:
                     history.append({"role": role, "content": parsed})
 
+
+            return history
             return history
 
     def get_history_for_llm(self, session_name):
@@ -1854,7 +1886,7 @@ class MemoryManager:
         """返回会话列表（名称/消息数/归属目录/时间/来源）。
 
         workdir 为 None 时返回全部会话；指定路径时只返回该目录下创建的会话。
-        source 参数用于过滤 GUI 或 TUI 专属会话。
+        source 参数用于过滤 GUI 或 CLI 专属会话。
         include_empty=False 时过滤掉无任何消息的空会话（参考 kimicode 的 is_empty 策略），
         避免会话列表被空会话污染；磁盘记录仍保留，不删除。
         """

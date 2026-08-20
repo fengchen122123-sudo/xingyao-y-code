@@ -237,7 +237,7 @@ def _save_tasks():
                             or platform_console_encoding()
                         ),
                     }
-            # 跨进程合并读：GUI/TUI 双进程并发写同一份 tasks.json 时，
+            # 跨进程合并读：GUI/CLI 双进程并发写同一份 tasks.json 时，
             # 把磁盘上其他进程新启动的任务记录合并进来，避免内存全量覆盖写
             # 互相丢失任务；本进程已删除的记录靠墓碑集合防止被合并步骤复活
             disk_data = None

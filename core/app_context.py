@@ -3,7 +3,7 @@ core/app_context.py
 ====================
 运行时上下文中间层。
 
-TUI (main.py) 和 GUI (gui_bridge.py) 在启动时各自注册一个上下文对象，
+CLI (main.py) 和 GUI (gui_bridge.py) 在启动时各自注册一个上下文对象，
 core/llm.py 及其他核心模块通过此模块统一访问运行时状态，
 彻底消除对 `import main` 的直接依赖。
 """
@@ -89,7 +89,7 @@ def normalize_permission_mode(value: Any) -> str:
 # ---------------------------------------------------------------------------
 
 def register(ctx: Any) -> None:
-    """由 TUI 或 GUI 在启动时调用，注册当前运行环境的上下文对象。"""
+    """由 CLI 或 GUI 在启动时调用，注册当前运行环境的上下文对象。"""
     global _context
     _context = ctx
 
@@ -99,14 +99,14 @@ def get() -> Optional[Any]:
 
 
 # ---------------------------------------------------------------------------
-# UI 形态（tui / gui / headless）
+# UI 形态（cli / gui / headless）
 # ---------------------------------------------------------------------------
 
 def set_ui_flavor(flavor: str) -> None:
     """由入口层声明当前 UI 形态，核心模块据此决定是否走终端交互路径。"""
     global _ui_flavor
     value = str(flavor or "headless").strip().lower()
-    _ui_flavor = value if value in ("tui", "gui", "headless") else "headless"
+    _ui_flavor = value if value in ("cli", "gui", "headless") else "headless"
     ctx = _context
     if ctx is not None:
         try:
@@ -167,7 +167,7 @@ def set_permission_mode(value: Any) -> str:
 
 
 def get_permission_callback() -> Optional[Callable]:
-    """返回 GUI 注册的权限回调，TUI 模式下返回 None。"""
+    """返回 GUI 注册的权限回调，cli 模式下返回 None。"""
     ctx = _context
     if ctx is None:
         return None
@@ -175,11 +175,11 @@ def get_permission_callback() -> Optional[Callable]:
 
 
 # ---------------------------------------------------------------------------
-# TUI App 实例
+# CLI App 实例
 # ---------------------------------------------------------------------------
 
 def get_app_instance() -> Optional[Any]:
-    """返回 TUI 的 prompt_toolkit App 实例；GUI 模式下为 None。"""
+    """返回 CLI 的 prompt_toolkit App 实例；GUI 模式下为 None。"""
     ctx = _context
     if ctx is None:
         return None
@@ -187,7 +187,7 @@ def get_app_instance() -> Optional[Any]:
 
 
 def invalidate_ui() -> None:
-    """通知 UI 重绘（仅 TUI 有效；GUI 通过事件驱动无需调用）。"""
+    """通知 UI 重绘（仅 CLI 有效；GUI 通过事件驱动无需调用）。"""
     ctx = _context
     if ctx is not None and hasattr(ctx, "invalidate_ui"):
         ctx.invalidate_ui()
@@ -246,7 +246,7 @@ def set_current_session(name: str) -> None:
 # ---------------------------------------------------------------------------
 # GUI 回合线程 / 子代理线程在入口处绑定自己的会话名，core 层的"每会话"状态
 # （计划管理器、授权白名单、沙盒放行）据此路由到各自会话的存储，并行回合
-# 互不可见、互不阻塞。未绑定线程（TUI 后台 worker 之外的主流程、测试主线程）
+# 互不可见、互不阻塞。未绑定线程（CLI 后台 worker 之外的主流程、测试主线程）
 # 返回 None，调用方回落到进程级全局（与单会话时代行为一致）。
 # 注意：get_current_session 是"UI 当前查看的会话"（进程级，会随用户切换变化），
 # get_thread_session 是"本线程正在执行的回合所属会话"（线程级，回合期间稳定），

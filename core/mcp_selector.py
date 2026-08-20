@@ -1,6 +1,6 @@
 """
 core/mcp_selector.py
-/mcp 指令触发的全屏 TUI 配置器。
+/mcp 指令触发的全屏 CLI 配置器。
 支持浏览/启用/禁用/新增/删除 MCP server，无需手动编辑 JSON。
 仿照 skill_selector.py 的实现风格。
 """
@@ -303,7 +303,7 @@ def _preset_line_count(preset):
 
 
 def open_mcp_selector(on_closed=None):
-    """全屏 TUI MCP 配置器。
+    """全屏 CLI MCP 配置器。
 
     操作说明：
       ↑/↓ 移动光标

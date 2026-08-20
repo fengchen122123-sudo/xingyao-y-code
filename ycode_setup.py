@@ -5,10 +5,10 @@ Y-code 官方 Windows 安装向导（可视化 GUI 版，单一源码，靠内�
   full 模式（默认）：完整版安装包。默认安装图形界面版 (Y-code.exe)，
                      安装选项页可勾选是否附带安装命令行版 (ycode.exe / ycode 命令)、
                      是否创建桌面快捷方式。
-                     若用户当时选择不装命令行版，会把内嵌的 TUI 独立安装向导
-                     释放到安装目录的 tui\\ 子目录下，方便以后随时补装。
+                     若用户当时选择不装命令行版，会把内嵌的 CLI 独立安装向导
+                     释放到安装目录的 cli\\ 子目录下，方便以后随时补装。
 
-  tui 模式：TUI 独立安装包。只安装命令行版，用于用户后续补装，或单独分发
+  cli 模式：CLI 独立安装包。只安装命令行版，用于用户后续补装，或单独分发
             给只想用命令行的用户。
 
 界面：tkinter（标准库，零新增依赖）+ 内嵌虚化背景图 assets/setup_bg.png。
@@ -16,7 +16,7 @@ Y-code 官方 Windows 安装向导（可视化 GUI 版，单一源码，靠内�
 可直接被 pytest 无界面测试。
 
 模式来源：build_release.py 用 --onefile 分别打包本脚本两次，每次都通过
---add-data 内嵌一个不同内容的 setup_mode.txt（'full' 或 'tui'）。如果直接用
+--add-data 内嵌一个不同内容的 setup_mode.txt（'full' 或 'cli'）。如果直接用
 项目根目录下的 ycode_setup.spec 手动构建（不经过 build_release.py），因为
 没有内嵌 setup_mode.txt，会自动按 'full' 模式运行。
 """
@@ -47,7 +47,7 @@ def read_setup_mode(bundle_dir):
         try:
             with open(marker_path, "r", encoding="utf-8") as f:
                 mode = f.read().strip().lower()
-            if mode in ("full", "tui"):
+            if mode in ("full", "cli"):
                 return mode
         except Exception:
             pass
@@ -499,10 +499,10 @@ def _open_payload(bundle_dir):
     raise InstallError("安装包中未找到核心程序包 (ycode_pkg)，安装终止。")
 
 
-def _payload_names(kind, src, tui_only):
+def _payload_names(kind, src, cli_only):
     """枚举待释放的载荷文件（相对路径列表）。
 
-    tui_only=True 时只取 ycode.exe + _internal，且跳过 _internal/frontend
+    cli_only=True 时只取 ycode.exe + _internal，且跳过 _internal/frontend
     （GUI 专属的前端静态资源）——独立安装命令行版体积更小。
     """
     if kind == "zip":
@@ -512,11 +512,11 @@ def _payload_names(kind, src, tui_only):
     else:
         names = []
         for root, dirs, files in os.walk(src):
-            if tui_only and os.path.normpath(root) == os.path.normpath(os.path.join(src, "_internal")):
+            if cli_only and os.path.normpath(root) == os.path.normpath(os.path.join(src, "_internal")):
                 dirs[:] = [d for d in dirs if d != "frontend"]
             for name in files:
                 names.append(os.path.relpath(os.path.join(root, name), src))
-    if tui_only:
+    if cli_only:
         names = [
             n for n in names
             if n.replace("\\", "/") == "ycode.exe"
@@ -628,13 +628,13 @@ def _copy_file_with_reboot_fallback(src, dest, log):
             raise
 
 
-def _copy_payload(kind, src, install_dir, tui_only, log, progress, manage_manifest=True):
+def _copy_payload(kind, src, install_dir, cli_only, log, progress, manage_manifest=True):
     """带进度回调的载荷释放（占整体进度的 0~85%）。
 
-    manage_manifest=False（tui 合并进已有完整版安装）时不清理也不覆盖安装清单，
+    manage_manifest=False（CLI 合并进已有完整版安装）时不清理也不覆盖安装清单，
     避免按 CLI 子集清单误删 GUI 专属文件。
     """
-    names = _payload_names(kind, src, tui_only)
+    names = _payload_names(kind, src, cli_only)
     # 在创建任何目录/文件前完成全部成员校验，非法载荷不得留下部分安装。
     destinations = [_safe_payload_path(install_dir, rel) for rel in names]
     total = max(1, len(names))
@@ -692,12 +692,12 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
     install_dir = _validate_install_target(options.install_dir, scope)
     payload_kind, payload_src = _open_payload(bundle_dir)
 
-    tui_exe_path = os.path.join(install_dir, "ycode.exe")
+    cli_exe_path = os.path.join(install_dir, "ycode.exe")
     gui_exe_path = os.path.join(install_dir, "Y-code.exe")
     merging_into_full = False
 
     # 1. 复制核心程序包
-    if mode == "tui":
+    if mode == "cli":
         # 目标目录已是完整版安装时只需合并进去，不重复写卸载注册表项
         merging_into_full = os.path.exists(gui_exe_path)
         if merging_into_full:
@@ -707,8 +707,8 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
         log("🚀 正在安装程序核心依赖与组件...")
     try:
         _copy_payload(payload_kind, payload_src, install_dir,
-                      tui_only=(mode == "tui"), log=log, progress=progress,
-                      manage_manifest=not (mode == "tui" and merging_into_full))
+                      cli_only=(mode == "cli"), log=log, progress=progress,
+                      manage_manifest=not (mode == "cli" and merging_into_full))
     except InstallError:
         raise
     except Exception as e:
@@ -740,18 +740,18 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
                 log(f"⚠️ 清理旧版 CLI 快捷方式失败: {e}")
         else:
             try:
-                if os.path.exists(tui_exe_path):
-                    os.remove(tui_exe_path)
+                if os.path.exists(cli_exe_path):
+                    os.remove(cli_exe_path)
                     log("ℹ 已跳过命令行版 (ycode.exe)，仅保留图形界面版。")
             except Exception as e:
                 log(f"⚠️ 移除命令行版组件失败: {e}")
             try:
-                bundled_tui_setup = os.path.join(bundle_dir, "tui", "ycode_tui_setup.exe")
-                if os.path.exists(bundled_tui_setup):
-                    tui_subdir = os.path.join(install_dir, "tui")
-                    os.makedirs(tui_subdir, exist_ok=True)
-                    dest = os.path.join(tui_subdir, "ycode_tui_setup.exe")
-                    shutil.copy2(bundled_tui_setup, dest)
+                bundled_cli_setup = os.path.join(bundle_dir, "cli", "ycode_cli_setup.exe")
+                if os.path.exists(bundled_cli_setup):
+                    cli_subdir = os.path.join(install_dir, "cli")
+                    os.makedirs(cli_subdir, exist_ok=True)
+                    dest = os.path.join(cli_subdir, "ycode_cli_setup.exe")
+                    shutil.copy2(bundled_cli_setup, dest)
                     log(f"✔ 已附带命令行版补装程序: {dest}，以后可双击它补装命令行版")
                 else:
                     log("⚠️ 安装包中未找到命令行版补装程序，跳过。")
@@ -808,7 +808,7 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
             log(f"⚠️ 写入卸载注册表项失败: {e}")
         progress(100.0)
 
-    else:  # tui 模式
+    else:  # cli 模式
         try:
             add_to_user_path(install_dir, log=log)
         except Exception as e:
@@ -843,7 +843,7 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
                         version=read_bundled_version(bundle_dir),
                         install_dir=install_dir,
                         uninstall_string=f'"{dest_uninst}"',
-                        display_icon=f'"{tui_exe_path}"',
+                        display_icon=f'"{cli_exe_path}"',
                     )
                     log("✔ 已在“应用和功能”中注册 Y-code CLI。")
                 else:
@@ -935,7 +935,7 @@ class SetupWizard(tk.Tk):
         self.var_scope = tk.StringVar(value=initial_scope)
         self.var_dir = tk.StringVar(value=initial_dir)
 
-        # 页面导航流程：tui 模式没有“安装用户”页（CLI 始终按当前用户安装）
+        # 页面导航流程：cli 模式没有“安装用户”页（CLI 始终按当前用户安装）
         self._flow = (["welcome", "scope", "options", "installing", "finish"]
                       if mode == "full" else
                       ["welcome", "options", "installing", "finish"])
@@ -1313,7 +1313,7 @@ class SetupWizard(tk.Tk):
                 parent=self,
             ):
                 return
-        scope = "user" if self.mode == "tui" else self.var_scope.get()
+        scope = "user" if self.mode == "cli" else self.var_scope.get()
         options = InstallOptions(
             install_dir=install_dir,
             install_cli=self.var_cli.get(),
@@ -1387,7 +1387,7 @@ class SetupWizard(tk.Tk):
             if result["installed_cli"]:
                 hints.append("打开新的命令行窗口 (CMD/PowerShell)，输入 ycode 使用命令行版。")
             else:
-                hints.append("本次未安装命令行版；如需要，可随时双击安装目录下 tui\\ycode_tui_setup.exe 补装。")
+                hints.append("本次未安装命令行版；如需要，可随时双击安装目录下 cli\\ycode_cli_setup.exe 补装。")
         else:
             hints = ["打开任意全新的命令行窗口 (CMD/PowerShell)，输入 ycode 敲回车即可开始使用。"]
         self._finish_detail.configure(

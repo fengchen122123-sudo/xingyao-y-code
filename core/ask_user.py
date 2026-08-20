@@ -1,4 +1,4 @@
-"""Interactive user question adapter backed by the existing TUI prompt."""
+"""Interactive user question adapter backed by the existing CLI prompt."""
 
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ def ask_user(
     except ValueError as error:
         return str(error)
 
-    # 统一走 permission_broker：TUI 由 prompt_toolkit 提示回答，
+    # 统一走 permission_broker：CLI 由 prompt_toolkit 提示回答，
     # GUI 由前端弹窗经 respond_permission 回答，headless 由入口层自动拒绝。
     # 不再检查具体 UI 实例，避免 core 层反向依赖 main。
     if not permission_broker.has_prompt_handlers():
@@ -79,13 +79,21 @@ def ask_user(
     # 默认取消值：future 以异常完成或返回不可 int 化的值时按取消兜底，
     # 绝不让 selected_index 未绑定或轮询直接崩溃
     selected_index = CANCELLED_RESULT
+    custom_answer: str | None = None
     try:
         while True:
             if cancel_event is not None and cancel_event.is_set():
                 permission_broker.cancel_owner(resolved_owner)
                 break
             try:
-                selected_index = int(request.future.result(timeout=_POLL_INTERVAL_SECONDS))
+                result = request.future.result(timeout=_POLL_INTERVAL_SECONDS)
+                if isinstance(result, str):
+                    # 自由文本回答（GUI 第四项输入框 / CLI 直接输入）：
+                    # 原样透传给模型，不与选项索引混用
+                    if result.strip():
+                        custom_answer = result.strip()
+                    break
+                selected_index = int(result)
                 break
             except (TimeoutError, _FutureTimeoutError):
                 continue
@@ -97,6 +105,13 @@ def ask_user(
         # 否则 broker 串行化会让后续所有提问/权限提示永久排队
         if not request.future.done():
             permission_broker.cancel_owner(resolved_owner)
+    if custom_answer is not None:
+        return json.dumps({
+            "question": question,
+            "selected_index": -1,
+            "selected": custom_answer,
+            "custom": True,
+        }, ensure_ascii=False)
     if selected_index < 0 or selected_index >= len(choices):
         # 取消或越界索引统一按取消处理，不再返回 selected: null 的伪成功
         return _cancelled_payload(question, selected_index)

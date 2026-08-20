@@ -6,7 +6,7 @@ PyWebView JS-API 桥接层：为 Vue 前端提供后端能力，并把一轮对�
 
 设计约束：
 - 绝不 import main 或任何依赖 prompt_toolkit 的模块，对话逻辑一律复用
-  core/agent_service.py（与 TUI 完全同源，保证回答质量一致）。
+  core/agent_service.py（与 CLI 完全同源，保证回答质量一致）。
 - 所有对外方法都返回可 JSON 序列化的 dict，异常一律吞掉后返回
   {"ok": False, "msg": ...}，绝不让异常穿过桥接层（否则前端 Promise 直接 reject）。
 """
@@ -51,13 +51,15 @@ from core.version import __version__ as YCODE_VERSION
 
 logger = logging.getLogger(__name__)
 
-# TUI 的 prompt_toolkit 着色标记（<ansiyellow> 等）：GUI 不渲染，桥接层统一剥离，
-# 否则用户会在提示里看到 <ansiyellow> 原文。TUI 路径不经此处，不受影响。
+# CLI 的 prompt_toolkit 着色标记（<ansiyellow> 等）：GUI 不渲染，桥接层统一剥离，
+# 否则用户会在提示里看到 <ansiyellow> 原文。CLI 路径不经此处，不受影响。
 _ANSI_MARKUP_RE = re.compile(r"</?ansi\w*>")
 
 
 def _strip_ansi_markup(text) -> str:
-    return _ANSI_MARKUP_RE.sub("", str(text))
+    # 剥离 CLI 着色标签后，再去掉首尾空白/换行：CLI 习惯用 \n 做段落分隔，
+    # 但 GUI notice 卡片用 white-space: pre-wrap 会把这个换行渲染成空行
+    return _ANSI_MARKUP_RE.sub("", str(text)).strip()
 
 
 def _session_from_turn_id(turn_id: str) -> str:
@@ -78,7 +80,7 @@ TOKEN_FLUSH_INTERVAL = 0.06
 # 渲染进程挂起时撑满即丢弃新事件，生产者线程永不阻塞
 JS_QUEUE_MAXSIZE = 2000
 
-# ask_user 提问超时（秒）：超时按取消处理。权限确认与 TUI 一致无限等待，
+# ask_user 提问超时（秒）：超时按取消处理。权限确认与 CLI 一致无限等待，
 # 不再因用户暂时离开而自动拒绝（拒绝会让模型拿到"用户拒绝"继续跑偏）
 PERMISSION_TIMEOUT_SECONDS = 300
 
@@ -97,7 +99,7 @@ FILE_TREE_SKIP_DIRS = {
 # 测试模型连通性的超时（秒）
 TEST_MODEL_TIMEOUT = 15
 
-# 后台子代理全部终态后自动发起的汇总回合（与 TUI 的内部汇总指令同文案）
+# 后台子代理全部终态后自动发起的汇总回合（与 CLI 的内部汇总指令同文案）
 _BG_SUMMARY_PROMPT = (
     "请汇总所有后台子代理任务的结果并告诉我。如果某些任务失败了，"
     "可以用你自身的工具（如 search_news / fetch_url 等）接手完成；"
@@ -189,7 +191,7 @@ class _GuiContext:
 
     @property
     def app_instance(self):
-        return None  # GUI 没有 TUI prompt_toolkit App
+        return None  # GUI 没有 CLI prompt_toolkit App
 
     @property
     def permission_mode(self) -> str:
@@ -220,7 +222,7 @@ class _GuiContext:
         return self._bridge._memory
 
     # 注意：不再提供 permission_callback。
-    # GUI 与 TUI 一样统一走 core.permission_broker（见 _activate_permission_request）。
+    # GUI 与 CLI 一样统一走 core.permission_broker（见 _activate_permission_request）。
 
     def invalidate_ui(self):
         pass  # GUI 通过事件驱动，不需要主动重绘
@@ -231,7 +233,7 @@ class ApiBridge:
         # 内部状态变量使用下划线开头，防止 PyWebView 在 Windows .NET 检查中产生属性递归问题
         self._window = None
         self._dropped_paths: list = []
-        # GUI 专用会话库：与 TUI 的 ycode.db 分离，两边对话互不同步
+        # GUI 专用会话库：与 CLI 的 ycode.db 分离，两边对话互不同步
         self._memory = MemoryManager(db_path=GUI_DB_FILE)
         # 修复：形参曾经遮蔽模块级单例，导致 self._mcp 永远是 None
         self._mcp = mcp_manager if mcp_manager is not None else _mcp_manager_singleton
@@ -260,7 +262,7 @@ class ApiBridge:
         # 已弃用：多会话并行改为线程本地 workdir 上下文（core.workspace_context），
         # 不再需要进程级串行锁。保留变量定义避免历史引用报错。
         self._turn_workdir_lock = threading.Lock()
-        # 后台子代理自动汇总（与 TUI 的 _bg_summary_triggered 同源）：
+        # 后台子代理自动汇总（与 CLI 的 _bg_summary_triggered 同源）：
         # 每批后台任务只触发一次汇总，用户主动发新消息时重置
         self._bg_summary_triggered: set = set()
         self._bg_summary_lock = threading.Lock()
@@ -320,7 +322,7 @@ class ApiBridge:
             pass
 
         # 注册后台子代理终态回调：任务结束立即通知前端；本会话全部后台任务
-        # 终态后自动发起一轮汇总 turn（对应 TUI 的 _on_background_subagent_terminal）
+        # 终态后自动发起一轮汇总 turn（对应 CLI 的 _on_background_subagent_terminal）
         try:
             from core.tools import subagent_manager
             subagent_manager.set_on_terminal(self._on_background_subagent_terminal)
@@ -639,10 +641,15 @@ class ApiBridge:
             logger.exception("解析更新日志失败")
             return {"ok": False, "entries": [], "msg": str(e)}
 
-    def _sync_active_model_context(self):
-        """把当前激活模型同步给 app_context，供 core 层（子代理等）读取。"""
+    def _sync_active_model_context(self, session_name: str | None = None):
+        """把当前激活模型同步给 app_context，供 core 层（子代理等）读取。
+
+        优先按传入的 session_name 取会话级模型；未传则取当前线程会话；
+        都没有则回退到全局默认模型。确保 GUI 各会话、CLI 互不干扰。
+        """
         try:
-            active = get_active_model() or {}
+            resolved_session = session_name or app_context.get_thread_session()
+            active = get_active_model(resolved_session) or {}
             app_context.set_active_model_tuple(
                 active.get("litellm_model", ""),
                 active.get("api_key", ""),
@@ -838,8 +845,10 @@ class ApiBridge:
         # 而非本方法内部卡住——据此区分"前端没调进来"与"卡在入口"。
         logger.info("get_initial_state 入口被调用（前端桥已打通）")
         try:
-            active_model = get_active_model() or {}
+            active_model = get_active_model(self._current_session) or {}
             config_data = load_config()
+            # 当前会话若已绑定模型，优先展示会话模型；否则展示全局默认
+            effective_model_id = active_model.get("id") or config_data.get("active_model_id") or ""
 
             model_settings = self.get_model_settings()
             models = model_settings["models"]
@@ -876,15 +885,15 @@ class ApiBridge:
             return {
                 "models": models,
                 "providers": providers,
-                "active_model_id": str(config_data.get("active_model_id") or ""),
+                "active_model_id": str(effective_model_id),
                 "active_model_name": str(active_model.get("name") or "未激活模型"),
                 # 当前激活模型的推理强度档位（None/"default" = 内置默认）
-                "reasoning_effort": get_model_reasoning_effort(config_data.get("active_model_id")) or "default",
+                "reasoning_effort": get_model_reasoning_effort(effective_model_id) or "default",
                 # 副模型配置：启动时同步给前端，避免设置页显示"无/全勾选"假象
                 "secondary_model_id": str(config_data.get("secondary_model_id") or ""),
                 "secondary_model_roles": get_secondary_roles(),
                 "permission_mode": self._current_permission_mode,
-                # 沙盒开关（是否允许访问工作目录外文件）：与 TUI /sandbox 共享同一配置键
+                # 沙盒开关（是否允许访问工作目录外文件）：与 CLI /sandbox 共享同一配置键
                 "allow_outside_workspace": bool(config_data.get("allow_outside_workspace", False)),
                 "sessions": self.get_sessions(),
                 "skills": self._build_skill_list(),
@@ -998,7 +1007,7 @@ class ApiBridge:
         except Exception as e:
             return {"ok": False, "children": [], "msg": str(e)}
 
-    # @ 引用补全忽略目录（与 TUI _list_workspace_files 保持一致）
+    # @ 引用补全忽略目录（与 CLI _list_workspace_files 保持一致）
     _FILE_SUGGEST_IGNORE_DIRS = {
         ".git", ".venv", "venv", "node_modules", "__pycache__", ".idea", ".vscode",
     }
@@ -1025,7 +1034,7 @@ class ApiBridge:
         return results
 
     def search_workspace_files(self, query: str = "", limit: int = 50) -> Dict[str, Any]:
-        """@ 引用自动补全：大小写不敏感子串匹配工作区文件（与 TUI 语义一致）。"""
+        """@ 引用自动补全：大小写不敏感子串匹配工作区文件（与 CLI 语义一致）。"""
         try:
             q = str(query or "").strip().lower()
             files = self._list_workspace_files_for_suggest()
@@ -1184,7 +1193,7 @@ class ApiBridge:
                 wdir = s.get("workdir")
                 display = "新会话" if is_default_name else name
 
-                # 无 workdir 的历史会话（旧数据/TUI 产生）固定归入"对话"分组；
+                # 无 workdir 的历史会话（旧数据/CLI 产生）固定归入"对话"分组；
                 # 不能兜底跟随进程 cwd，否则引入新目录 chdir 后它们会集体"搬"
                 # 到新目录下，表现为会话归属错乱
                 if not wdir or wdir == "GLOBAL":
@@ -1315,12 +1324,18 @@ class ApiBridge:
             msgs = self._load_session_messages(session_name)
 
             self._recalc_token_usage(session_name)
+            # 切换会话后把该会话绑定的模型信息一并返回给前端，
+            # 让状态栏与模型选择器随会话自动恢复，不再互相覆盖
+            session_model = get_active_model(session_name) or {}
             result = {
                 "ok": True,
                 "session_name": session_name,
                 "messages": msgs,
                 "skills": self._build_skill_list(),
                 "sessions": self.get_sessions(),
+                "active_model_id": str(session_model.get("id") or ""),
+                "active_model_name": str(session_model.get("name") or "未激活模型"),
+                "reasoning_effort": get_model_reasoning_effort(session_model.get("id")) or "default",
             }
             if is_global:
                 result.update({"workdir": "GLOBAL", "is_global": True})
@@ -1414,13 +1429,23 @@ class ApiBridge:
             if matched is None:
                 return {"ok": False, "msg": f"未找到模型: {model_id}"}
 
-            set_active_model(str(model_id))
+            session_name = self._current_session
+            if session_name:
+                # GUI 按会话绑定主模型：不同会话、不同界面互不干扰
+                self._memory.set_session_model_id(session_name, str(model_id))
+            else:
+                # 尚未进入任何会话（启动初始化阶段）时仍回写全局默认值
+                set_active_model(str(model_id))
             self._sync_active_model_context()
             # 切模型后 window 立即变为新模型的 context_window，但全局
             # latest_total 还是旧值（可能属于别的会话），必须先按当前会话
             # 历史重算 used，否则前端会算出 600K/256K=243% 这类虚假占比
-            self._recalc_token_usage(self._current_session)
+            self._recalc_token_usage(session_name)
             self._emit_token_usage()
+            # 从大窗口模型切到小窗口模型时，若当前会话占用已超新窗口的压缩
+            # 阈值，立即压缩历史，保证新窗口模型可直接使用而不是发消息报错。
+            # 压缩后再次重算并推送，让前端红圈及时回落。
+            self._ensure_fits_active_window(session_name)
             return {
                 "ok": True,
                 "active_model_id": str(model_id),
@@ -1520,10 +1545,10 @@ class ApiBridge:
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
-    # 沙盒开关与持久化白名单（与 TUI 的 /sandbox、/whitelist 同一配置与存储）
+    # 沙盒开关与持久化白名单（与 CLI 的 /sandbox、/whitelist 同一配置与存储）
     # ------------------------------------------------------------------
     def set_sandbox_enabled(self, enabled: bool) -> Dict[str, Any]:
-        """沙盒开关：是否允许访问工作目录之外的文件（写 config，TUI/GUI 双端热生效）。"""
+        """沙盒开关：是否允许访问工作目录之外的文件（写 config，CLI/GUI 双端热生效）。"""
         try:
             from config import save_config_value
 
@@ -1572,7 +1597,7 @@ class ApiBridge:
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
-    # 权限确认：统一走 core.permission_broker（与 TUI 同一套串行化机制）
+    # 权限确认：统一走 core.permission_broker（与 CLI 同一套串行化机制）
     # ------------------------------------------------------------------
     def _activate_permission_request(self, request):
         """broker 激活某个请求 → 推送到前端对话流内联卡片，并挂一个"超时即拒绝"的定时器。"""
@@ -1599,7 +1624,7 @@ class ApiBridge:
         except Exception:
             logger.exception("推送权限请求失败")
 
-        # 超时语义与 TUI 对齐：权限确认无限等待，绝不因用户暂时离开而自动拒绝。
+        # 超时语义与 CLI 对齐：权限确认无限等待，绝不因用户暂时离开而自动拒绝。
         # （自动拒绝会让模型拿到"用户拒绝"反馈继续跑偏甚至反复重试；无限等待则
         #   任务安全暂停，用户回来后仍可作答，或手动停止回合取消。）
         # ask_user 提问类保留超时=取消，防止无人值守时回合永久卡死在提问上。
@@ -1655,10 +1680,15 @@ class ApiBridge:
             logger.exception("respond_permission 失败")
             return {"ok": False, "msg": str(e)}
 
-    def respond_permission_choice(self, request_id: str, choice_index: int) -> Dict[str, Any]:
-        """按选项索引回答权限请求（用于 ask_user 澄清问题的自定义选项）。"""
+    def respond_permission_choice(self, request_id: str, choice_index: int, custom_text: str = "") -> Dict[str, Any]:
+        """按选项索引回答权限请求（ask_user 支持自由文本回答）。"""
         try:
-            resolved = permission_broker.resolve(str(request_id), int(choice_index))
+            custom = str(custom_text or "").strip()
+            resolved = permission_broker.resolve(
+                str(request_id),
+                int(choice_index),
+                custom_answer=custom or None,
+            )
             self._cancel_perm_timer(str(request_id))
             if not resolved:
                 return {"ok": False, "msg": "该权限请求已失效或已被处理"}
@@ -1704,7 +1734,7 @@ class ApiBridge:
                             logger.debug("落库即命名失败", exc_info=True)
 
                 # 用户主动发起新对话：重置该会话的自动汇总标志，
-                # 下一批后台任务完成时可以再次触发自动汇总（与 TUI 行为一致）；
+                # 下一批后台任务完成时可以再次触发自动汇总（与 CLI 行为一致）；
                 # 同时解除"用户取消"标记，恢复自动汇总与计划续推
                 with self._bg_summary_lock:
                     self._bg_summary_triggered.discard(target_session)
@@ -1765,7 +1795,7 @@ class ApiBridge:
                 pass
             # H6：取消点不只有 LLM 事件迭代层——回合线程可能正阻塞在权限确认
             # （最长 300s）或前台子代理的同步等待上，仅 set 事件线程不会退出，
-            # 会话会一直持有 _turn_workdir_lock 串行卡住其他会话。与 TUI
+            # 会话会一直持有 _turn_workdir_lock 串行卡住其他会话。与 CLI
             # _cancel_active_turn 同源：同步取消该回合的权限请求（owner 是
             # turn_id 而非会话名）并协作式终止前台子代理。本回合派生的后台
             # 子代理也会被看门狗经 parent_cancel_event 联动取消（tools.py
@@ -1839,7 +1869,7 @@ class ApiBridge:
         self.emit_event("turn_start", turn_start_data)
 
         try:
-            active_model = get_active_model()
+            active_model = get_active_model(session_name)
             if not active_model or not active_model.get("litellm_model"):
                 # 关键修复：没有激活模型时也必须让前端解锁输入框
                 self.emit_event("error", {"message": "当前未激活任何 LLM 模型，请先在模型管理中配置并激活模型。", "session_name": session_name})
@@ -1851,6 +1881,9 @@ class ApiBridge:
             api_key = active_model.get("api_key", "")
             api_base = active_model.get("base_url", "")
             ctx_win = active_model.get("context_window", 128000)
+            # 把本回合实际使用的模型写回会话级绑定：首次从全局默认进入该会话时
+            # 自动落库，后续切换会话即可恢复该模型，不随全局配置漂移
+            self._memory.set_session_model_id(session_name, active_model.get("id"))
             self._sync_active_model_context()
 
             # 会话归属目录是每一轮 Agent 的权威工作目录。待发送项目会话虽然
@@ -1925,7 +1958,7 @@ class ApiBridge:
             # chat_with_model_events（parent_session），不依赖全局 _current_session。
             # 会话归属目录的绑定（os.chdir / memory.set_workdir）已在上面按 session_name 完成。
 
-            # 与 TUI 完全同源的上下文组装（记忆压缩 / 系统提示词 / 运行上下文 / 后台任务汇总）
+            # 与 CLI 完全同源的上下文组装（记忆压缩 / 系统提示词 / 运行上下文 / 后台任务汇总）
             from core.agent_service import prepare_turn_messages
             history = prepare_turn_messages(
                 self._memory,
@@ -1939,6 +1972,13 @@ class ApiBridge:
                 api_base=api_base,
                 is_gui=True,
             )
+
+            # 压缩（四级水位线阶梯）可能发生在 prepare_turn_messages 内部，会改写
+            # 历史使上下文变小。压缩后 latest_prompt 仍是压缩前的上一轮真实用量，
+            # 前端据此算占比会停在红圈不更新。这里立即重算窗口占用并推送，
+            # 让上下文圆圈在压缩后及时回落。
+            self._recalc_token_usage(session_name)
+            self._emit_token_usage()
 
             # 会话级检查点：本轮所有 write_file/edit_file 的旧内容会被自动记录
             from core.memory import begin_turn_checkpoint, end_turn_checkpoint
@@ -2098,7 +2138,7 @@ class ApiBridge:
             logger.debug("后台命令任务总结回合触发失败", exc_info=True)
 
     def _on_background_subagent_terminal(self, task_id: str, status: str, description: str, summary: str) -> None:
-        """后台子代理终态实时通知（worker 线程触发，与 TUI 同源的 GUI 版本）。
+        """后台子代理终态实时通知（worker 线程触发，与 CLI 同源的 GUI 版本）。
 
         职责一：立即向前端推送一条终态通知（前端以 toast 呈现）。
         职责二：延迟检查本会话是否所有后台任务都已终态，是则自动发起一轮
@@ -2606,6 +2646,49 @@ class ApiBridge:
         except Exception:
             logger.debug("重算 token 用量失败", exc_info=True)
 
+    def _ensure_fits_active_window(self, session_name: str):
+        """切换模型后兜底：当前会话占用超过新激活模型窗口阈值时立即压缩历史。
+
+        从大窗口（如 100 万）切到小窗口（如 25.6 万）模型时，若占用超出新窗口
+        的压缩阈值（0.95），直接调用 prepare_turn_messages 触发同一套四级水位线
+        压缩（snip/elide/摘要/滑窗淘汰），让小窗口模型可用而非发消息报错。
+        压缩后重算窗口占用并推送，前端红圈随之回落。无需压缩时静默跳过。
+        """
+        try:
+            active = get_active_model() or {}
+            window = int(active.get("context_window") or 0)
+            if window <= 0:
+                return
+            from core.agent_service import SUMMARIZE_RATIO, get_session_token_baseline
+            history = self._memory.get_history(session_name)
+            total = get_session_token_baseline(
+                self._memory, session_name, active.get("litellm_model", ""), history=history
+            )
+            if total <= window * SUMMARIZE_RATIO:
+                return
+            from core.agent_service import prepare_turn_messages
+            logger.info(
+                "切换模型后会话占用 %d 超新窗口 %d 阈值，触发自动压缩", total, window
+            )
+            prepare_turn_messages(
+                self._memory,
+                session_name,
+                active.get("litellm_model", ""),
+                window,
+                permission_mode=self._current_permission_mode,
+                notify=lambda kind, message: self.emit_event(
+                    "notice", {"message": _strip_ansi_markup(message)}
+                ),
+                api_key=active.get("api_key", ""),
+                api_base=active.get("base_url", ""),
+                is_gui=True,
+            )
+            self._recalc_token_usage(session_name)
+            self._emit_token_usage()
+        except Exception:
+            # 压缩失败不阻断模型切换本身，发消息时 prepare 还会再兜底
+            logger.exception("切换模型后自动压缩失败")
+
     # ------------------------------------------------------------------
     # 技能
     # ------------------------------------------------------------------
@@ -2925,6 +3008,31 @@ class ApiBridge:
             return {"ok": True}
         except Exception as e:
             logger.exception("open_path 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def open_folder_in_explorer(self, path: str) -> Dict[str, Any]:
+        """在系统文件资源管理器中打开指定目录（侧栏分组文件夹图标点击）。
+
+        与 open_path 不同：不要求路径落在当前会话工作区内——侧栏分组的
+        folder_path 是用户主动引入的项目目录，点击图标即可打开该目录本身，
+        即使它不是当前激活会话所属的工作区。
+        """
+        try:
+            if not path:
+                return {"ok": False, "msg": "路径为空"}
+            real_path = _resolve_real_path(path)
+            if not os.path.isdir(real_path):
+                return {"ok": False, "msg": f"目录不存在: {real_path}"}
+            opener = getattr(os, "startfile", None)
+            if opener is not None:
+                opener(real_path)
+                return {"ok": True}
+            import subprocess
+            cmd = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.Popen([cmd, real_path])
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("open_folder_in_explorer 失败")
             return {"ok": False, "msg": str(e)}
 
     def pick_files(self) -> Dict[str, Any]:

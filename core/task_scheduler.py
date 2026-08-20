@@ -510,8 +510,8 @@ _DEFAULT_SCHEDULER_SESSION: str | None = None
 _DEFAULT_SCHEDULER_LOCK = threading.RLock()
 
 # 多会话并行：线程绑定了计划会话时，调度器按会话分桶（互不取消、互不阻塞）。
-# 原先"会话切换即 cancel_all"的单例语义只保留给未绑定线程（TUI 单会话主流程）
-# ——TUI 的 _DEFAULT_PLAN_MANAGER 是就地重绑的同一个对象，不收尾旧调度器
+# 原先"会话切换即 cancel_all"的单例语义只保留给未绑定线程（CLI 单会话主流程）
+# ——CLI 的 _DEFAULT_PLAN_MANAGER 是就地重绑的同一个对象，不收尾旧调度器
 # 会让在途计划项把结果写进切换后的新会话计划。
 _PARALLEL_SCHEDULERS: dict[str, TaskScheduler] = {}
 
@@ -523,7 +523,7 @@ def get_default_scheduler(
     """Return the scheduler for the currently bound plan session.
 
     绑定线程（GUI 回合/子代理）：按会话取专属调度器，其他会话的调度器
-    不受影响（并行回合永不互相取消）。未绑定线程（TUI/测试主线程）：
+    不受影响（并行回合永不互相取消）。未绑定线程（CLI/测试主线程）：
     维持进程级单例 + 切会话收尾的旧语义。
     """
     from core.plan import get_bound_plan_session, get_default_plan_manager
@@ -562,7 +562,7 @@ def get_default_scheduler(
 
 
 def shutdown_all_schedulers() -> int:
-    """退出时收尾全部调度器（并行分桶 + TUI 兜底单例），返回收尾数量。"""
+    """退出时收尾全部调度器（并行分桶 + CLI 兜底单例），返回收尾数量。"""
     global _DEFAULT_SCHEDULER
     with _DEFAULT_SCHEDULER_LOCK:
         schedulers = list(_PARALLEL_SCHEDULERS.values())

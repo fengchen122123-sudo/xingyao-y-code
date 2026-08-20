@@ -2,9 +2,9 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.2.3](https://img.shields.io/badge/Version-1.2.3-green.svg)](core/version.py)
+[![Version 1.2.5](https://img.shields.io/badge/Version-1.2.5-green.svg)](core/version.py)
 
-> 一个国产终端 AI 编程助手，代号「星瑶」。支持 TUI 控制台与 GUI 窗口双形态、多模型切换、子代理编排、计划执行、长期记忆、MCP 扩展与可插拔技能系统。
+> 一个国产终端 AI 编程助手，代号「星瑶」。支持 CLI 控制台与 GUI 窗口双形态、多模型切换、子代理编排、计划执行、长期记忆、MCP 扩展与可插拔技能系统。
 
 ---
 
@@ -12,7 +12,7 @@
 
 ### 对话与界面
 - **终端交互界面**：基于 `prompt_toolkit` 的 Claude Code 风格输入框，支持斜杠命令、Tab 补全、`@文件` 快速挂载、多行粘贴
-- **GUI 窗口版**：基于 `pywebview` + Vue 3 + TypeScript 的图形界面，与 TUI 共享同一套核心引擎
+- **GUI 窗口版**：基于 `pywebview` + Vue 3 + TypeScript 的图形界面，与 CLI 共享同一套核心引擎
 - **GUI 拖拽附件**：拖入文件即上屏占位并自动补全真实路径，PDF 等二进制文件注入路径提示供模型用工具解析
 - **文件树面板**：懒加载子目录，支持手动刷新与页签激活/窗口聚焦自动刷新，展开状态可恢复
 - **9 种终端主题**：cyan / matrix / nord / cyberpunk / dracula / lava / sunset / amber / white，`/theme` 一键切换
@@ -48,7 +48,7 @@
 ### 扩展生态
 - **技能系统（Skills）**：扫描 `SKILL.md` 并动态注入系统提示词，支持项目级与用户级
 - **插件系统（Plugins）**：进程内插件扩展工具能力，零核心侵入，单插件异常不影响启动
-- **MCP 客户端**：全屏 TUI 配置器 + 10+ 预设模板（飞书 / 高德 / B 站 / SQLite / Postgres 等），AI 可自配置 MCP
+- **MCP 客户端**：全屏 CLI 配置器 + 10+ 预设模板（飞书 / 高德 / B 站 / SQLite / Postgres 等），AI 可自配置 MCP
 - **Git Worktree**：`/worktree` 管理多分支并行工作区
 
 ---
@@ -120,7 +120,7 @@ cp config.example.json config.json
 ### 4. 启动星瑶
 
 ```bash
-# TUI 控制台版（推荐）
+# CLI 控制台版（推荐）
 python main.py
 
 # 或安装后使用命令
@@ -142,16 +142,16 @@ cd ..
 python gui_main.py
 ```
 
-> 前端开发调试时也可改为在 `frontend/` 下运行 `npm run dev`（Vite 开发服务器，端口 5173），`gui_main.py` 会优先加载它。两者都不可用时 GUI 无法启动，TUI 模式不受影响。
+> 前端开发调试时也可改为在 `frontend/` 下运行 `npm run dev`（Vite 开发服务器，端口 5173），`gui_main.py` 会优先加载它。两者都不可用时 GUI 无法启动，cli 模式不受影响。
 
 ### 6.（可选）构建 Windows 安装包
 
 ```bash
-# 完整构建（GUI 主安装包 + 可选 TUI 组件）
+# 完整构建（GUI 主安装包 + 可选 CLI 组件）
 venv\Scripts\python build_release.py
 
-# 仅构建 TUI 相关产物
-venv\Scripts\python build_release.py --tui-only
+# 仅构建 CLI 相关产物
+venv\Scripts\python build_release.py --cli-only
 
 # 跳过前端构建（复用现有 frontend/dist）
 venv\Scripts\python build_release.py --skip-frontend
@@ -163,7 +163,7 @@ venv\Scripts\python build_release.py --rebuild-frontend
 venv\Scripts\python build_release.py --setup-only
 ```
 
-产出物位于 `dist/` 下：`Y-code.exe`（GUI）、`ycode.exe`（TUI）、`ycode_setup_v{版本}.exe`（主安装包，文件名自动带版本号）、`ycode_uninstall.exe`（卸载向导）。详见 [docs/BUILD.md](docs/BUILD.md)。
+产出物位于 `dist/` 下：`Y-code.exe`（GUI）、`ycode.exe`（CLI）、`ycode_setup_v{版本}.exe`（主安装包，文件名自动带版本号）、`ycode_uninstall.exe`（卸载向导）。详见 [docs/BUILD.md](docs/BUILD.md)。
 
 ---
 
@@ -188,7 +188,7 @@ venv\Scripts\python build_release.py --setup-only
 
 同款经典样式的图形化向导：**欢迎 → 卸载选项 → 卸载中 → 完成**
 
-- 清理桌面快捷方式（GUI/CLI/旧版 TUI 命名都尝试）、PATH、注册表卸载入口
+- 清理桌面快捷方式（GUI/CLI 命名都尝试）、PATH、注册表卸载入口
 - 按安装范围自动适配：machine 安装会清理 HKLM 注册项、系统 PATH 与公共桌面（非管理员运行时自动 UAC 提权）
 - 可选删除 `~/.ycode` 用户配置与历史会话（默认保留，重装后可继续使用）
 - 完成后退出向导自动自销毁，清空安装目录残留
@@ -406,7 +406,7 @@ Y-code 内置 22 个工具，分为只读与变更两组：
 - 惰性连接：首次使用时才启动，独立 asyncio 事件循环在 daemon 线程
 - 超时保护：连接 10s、调用工具 60s
 
-### 全屏 TUI 配置器
+### 全屏 CLI 配置器
 `/mcp` 打开配置器，内置 10+ 预设模板，用户选中后按提示输入字段即可，无需手动编辑 JSON：
 
 - **国内官方**：高德地图、飞书、微信公众号
@@ -467,7 +467,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 ```
 xingyao-y-code/
-├── main.py                  # TUI 主入口
+├── main.py                  # CLI 主入口
 ├── gui_main.py              # GUI 主入口（pywebview）
 ├── gui_bridge.py            # GUI JS-API 桥接层
 ├── config.py                # 配置加载（原子写 + 自愈）
@@ -475,7 +475,7 @@ xingyao-y-code/
 ├── system_prompt.md         # 系统提示词
 ├── core/                    # 核心模块
 │   ├── version.py           # 版本号（单一来源）
-│   ├── agent_service.py     # 对话服务（TUI/GUI 共源）
+│   ├── agent_service.py     # 对话服务（CLI/GUI 共源）
 │   ├── harness/             # 固定主代理内核（严格状态机 / SQLite Journal / 工具管线）
 │   ├── llm.py               # LiteLLM 调用与工具编排
 │   ├── tools.py             # 本地工具实现
@@ -613,8 +613,8 @@ JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视
 | 路径 | 用途 |
 |------|------|
 | `config.json` | 用户级配置 |
-| `ycode.db` | TUI 会话数据库 |
-| `ycode_gui.db` | GUI 会话数据库（与 TUI 互不可见） |
+| `ycode.db` | CLI 会话数据库 |
+| `ycode_gui.db` | GUI 会话数据库（与 CLI 互不可见） |
 | `active_skills.json` | 已启用技能列表 |
 | `mcp.json` | MCP 服务配置 |
 | `system_prompt.md` | 用户级系统提示词覆盖 |

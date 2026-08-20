@@ -48,7 +48,12 @@
         <div v-for="group in store.sessionGroups" :key="group.folder_path || group.folder_name" class="session-group">
           <div class="group-header" @click="toggleGroupCollapsed(group.folder_path)">
             <span class="g-arrow">{{ collapsedGroups[group.folder_path] ? '▸' : '▾' }}</span>
-            <span v-if="!group.is_global && group.folder_path !== 'GLOBAL'" class="g-folder-ico">📁</span>
+            <span
+              v-if="!group.is_global && group.folder_path !== 'GLOBAL'"
+              class="g-folder-ico"
+              title="在资源管理器中打开此目录"
+              @click.stop="openFolder(group.folder_path)"
+            >📁</span>
             <span class="g-title" :style="{ color: group.is_current ? 'var(--accent)' : 'inherit' }">
               {{ getFolderTitle(group) }}
               <span v-if="group.is_current" style="font-size:10px;color:var(--green)"> [当前]</span>
@@ -217,6 +222,20 @@ function toggleGroupCollapsed(path: string) {
   collapsedGroups.value[path] = !collapsedGroups.value[path];
 }
 
+// 点击分组文件夹图标：在系统资源管理器中打开该目录
+async function openFolder(path: string) {
+  const api = window.pywebview && window.pywebview.api;
+  if (!api || !path) return;
+  try {
+    const res = await api.open_folder_in_explorer(path);
+    if (res && res.ok === false && res.msg) {
+      store.notifyModal('打开目录失败', res.msg);
+    }
+  } catch (err) {
+    store.notifyModal('打开目录失败', String(err));
+  }
+}
+
 // 状态提醒点 hover 文案
 function dotTitle(kind: 'green' | 'yellow' | 'red') {
   if (kind === 'green') return '该会话任务执行完成';
@@ -335,6 +354,14 @@ function getFolderTitle(g: SessionGroup) {
 .group-header .g-folder-ico {
   font-size: 13px;
   flex-shrink: 0;
+  cursor: pointer;
+  padding: 0 2px;
+  border-radius: 4px;
+  transition: 0.15s;
+}
+.group-header .g-folder-ico:hover {
+  background: var(--bg3);
+  transform: scale(1.15);
 }
 .more-toggle {
   padding: 5px 8px 5px 12px;

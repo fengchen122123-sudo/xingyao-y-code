@@ -644,6 +644,49 @@ def test_cancel_stops_polling_without_waiting_for_daemon_tool():
         blocker.set()
 
 
+def test_parallel_tool_threads_inherit_workdir_and_thread_session(tmp_path):
+    """回归：并行工具线程必须继承提交线程的 workdir 与会话绑定。
+
+    裸 daemon 线程丢失线程本地 workdir 后，get_workdir() 兜底到进程 cwd，
+    沙盒守卫会把项目内路径误判为沙盒外并弹权限询问（GUI 打包版进程
+    cwd 是安装目录时必现）；线程会话绑定丢失则"本会话内放行沙盒外
+    访问"等每会话状态在并行线程里全部失效。
+    """
+    from core.workspace_context import get_workdir, workspace_scope
+
+    import core.app_context as app_context_module
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    expected_workdir = str(workspace.resolve())
+    seen = []
+
+    def execute(call, _context):
+        seen.append((str(get_workdir()), app_context_module.get_thread_session()))
+        return _batch_tool_message(call["id"])
+
+    with workspace_scope(str(workspace)):
+        app_context_module.set_thread_session("session-parallel-check")
+        try:
+            records = _parallel_executor(execute).execute(
+                [
+                    _batch_call("r1", "read_file"),
+                    _batch_call("r2", "read_file"),
+                ],
+                _batch_context(),
+                None,
+            )
+        finally:
+            app_context_module.set_thread_session(None)
+
+    assert [record.message["tool_call_id"] for record in records] == ["r1", "r2"]
+    assert len(seen) == 2
+    assert all(
+        workdir == expected_workdir and session == "session-parallel-check"
+        for workdir, session in seen
+    )
+
+
 def test_batch_events_cover_each_batch_before_execution_and_finish_in_model_order():
     execution_order = []
     events = []

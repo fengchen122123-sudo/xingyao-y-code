@@ -31,7 +31,7 @@ venv\Scripts\python -m pytest tests/ -q
 venv\Scripts\python build_release.py
 ```
 
-产出 dist\ycode_setup.exe（主安装包，安装 GUI + 可选 TUI）。要点：
+产出 dist\ycode_setup.exe（主安装包，安装 GUI + 可选 CLI）。要点：
 - 前端改过 → 加 --rebuild-frontend；只改 Python → 加 --skip-frontend 提速。
 - 打包所需文件全部在版本库内：build_release.py、ycode.spec、
   ycode_setup.spec、ycode_uninstall.spec、ycode_setup.py、ycode_uninstall.py、
@@ -44,7 +44,7 @@ venv\Scripts\python build_release.py
 ## 🎨 Code Style & Quality Guidelines
 
 1. **Terminal Output Constraints**:
-   - Since the TUI terminal interface prints raw text without a Markdown renderer, **never** output markdown formatting such as `**` (bold) or `*` (italic) around words. Use clean indentations, capitalization, or extra spacing to highlight text.
+   - Since the CLI terminal interface prints raw text without a Markdown renderer, **never** output markdown formatting such as `**` (bold) or `*` (italic) around words. Use clean indentations, capitalization, or extra spacing to highlight text.
 2. **Concurrency and UI Thread-safety**:
    - Any background worker threads or asynchronous helper threads **must not** directly touch global layout variables, call `print_formatted_text`, or run `app.invalidate()`.
    - Always route UI updates back to the main prompt_toolkit thread loop using `app_instance.loop.call_soon_threadsafe(callback)`.

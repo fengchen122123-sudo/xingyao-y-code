@@ -3,7 +3,7 @@ core/agent_service.py
 =====================
 无界面（headless）的一轮对话准备逻辑。
 
-TUI (main.py) 与 GUI (gui_bridge.py) 共用同一套上下文组装流程，
+CLI (main.py) 与 GUI (gui_bridge.py) 共用同一套上下文组装流程，
 保证两端的回答质量完全一致：记忆压缩、系统提示词、运行上下文、
 后台子代理结果注入等步骤只在这里实现一次。
 
@@ -212,21 +212,26 @@ def estimate_history_tokens_with_system(model_name: str, history: list, is_gui: 
 
 def get_session_token_baseline(manager, session_name: str, model_name: str,
                                history: list | None = None) -> int:
-    """会话上下文占用基线：优先用本会话最近一次真实 API 用量。
+    """会话上下文占用基线：真实 API 用量与本地估算取较小值。
 
     下一轮请求的 prompt 必然包含上一轮的 prompt + completion（回复会进入历史），
-    所以最近一次真实 prompt_tokens + completion_tokens 就是最准的占用基线。
-    只有在会话没有任何真实记录时（老会话首次使用）才退化到本地估算。
+    正常情况下最近一次真实 prompt_tokens + completion_tokens 是最准的占用基线。
+    但从大窗口模型切到小窗口模型后，上一轮真实用量仍是大窗口下的旧值，会虚高于
+    当前历史的实际占用；此时含系统提示词的本地估算更贴近真实，取较小值可避免
+    对着过期的大基线误判"无需压缩"。无真实记录时退化为纯本地估算。
     """
     try:
         last = manager.get_last_token_usage(session_name)
     except Exception:
         last = None
-    if last:
-        return int(last.get("prompt_tokens") or 0) + int(last.get("completion_tokens") or 0)
     if history is None:
         history = manager.get_history(session_name)
-    return estimate_history_tokens_with_system(model_name, history)
+    estimated = estimate_history_tokens_with_system(model_name, history)
+    if last:
+        real = int(last.get("prompt_tokens") or 0) + int(last.get("completion_tokens") or 0)
+        if real > 0:
+            return min(real, estimated)
+    return estimated
 
 
 def build_runtime_context(model_name: str, permission_mode: str):
@@ -415,7 +420,7 @@ def prepare_turn_messages(
 
     调用前提：用户本轮输入已经写入数据库（manager.add_message）。
 
-    步骤严格保持与历史 TUI 实现一致的顺序：
+    步骤严格保持与历史 CLI 实现一致的顺序：
       1. 读取入库边界已经维护完成的 LLM 历史 + 估算 token
       2. 按四级水位线逐级升级：snip → elide → 智能压缩 → 物理折叠 → 滑窗淘汰
       3. 剔除历史遗留 system 消息
@@ -465,9 +470,10 @@ def prepare_turn_messages(
     system_message = build_stable_system_message(is_gui)
 
     # 【四级水位线阶梯】在向大模型请求前，按水位逐级升级维护强度。
-    # 触发判断优先用本会话最近一次真实 API 用量作基线（下一轮 prompt 必然包含
-    # 上一轮的 prompt + completion）；无真实记录时才用含系统提示词的估算兜底。
-    # 任何本地改写发生后真实基线即失效，退化到含系统提示词的估算指导后续层级。
+    # 触发判断用本会话最近一次真实 API 用量与本地估算的较小值作基线：
+    # 真实用量通常更准，但从大窗口模型切到小窗口模型后，上一轮真实用量仍是
+    # 大窗口下的旧值，会虚高于当前历史的实际占用——此时取估算能让压缩对新
+    # 窗口真正生效，而不是对着过期的大基线误判"无需压缩"。
     estimated_tokens = get_session_token_baseline(
         manager, session_name, model_name, history=history
     )
@@ -558,7 +564,7 @@ def prepare_turn_messages(
 
 
 # ---------------------------------------------------------------------------
-# /undo 的可复用非界面部分：TUI 与 GUI 共用
+# /undo 的可复用非界面部分：CLI 与 GUI 共用
 # ---------------------------------------------------------------------------
 
 def undo_last_edit(manager, session_name: str, force: bool = False) -> tuple[bool, str]:

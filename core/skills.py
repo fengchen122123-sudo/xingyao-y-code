@@ -26,7 +26,7 @@ SKILL_TRIGGERS_MAX_CHARS = 240
 # 首次启动释放到用户级技能目录，之后用户可自由开关 / 修改 / 删除。
 # ------------------------------------------------------------------
 _BUILTIN_SYNC_DONE = False
-# check-and-set 必须持锁：TUI/GUI 多线程首次调用 get_skill_dirs 时
+# check-and-set 必须持锁：CLI/GUI 多线程首次调用 get_skill_dirs 时
 # 无锁并发会让释放流程重入执行
 _builtin_sync_lock = threading.Lock()
 
@@ -52,7 +52,7 @@ def sync_builtin_skills():
     - 用户删除技能目录后不会被重新拷贝（通过 builtin_skills_released.json 记录
       "已释放过"，删除被视为用户主动移除；代价是后续版本的内置技能内容更新
       不会自动覆盖到已释放过的技能，保持简单可预期）。
-    由 get_skill_dirs() 首次调用时自动触发一次（TUI/GUI 共用，无需各入口手动挂钩）。
+    由 get_skill_dirs() 首次调用时自动触发一次（CLI/GUI 共用，无需各入口手动挂钩）。
     """
     global _BUILTIN_SYNC_DONE
     if _BUILTIN_SYNC_DONE:
@@ -325,7 +325,7 @@ def parse_skill_md(file_path):
                 "body": content.strip()
             }
     except Exception as e:
-        # 诊断走 runtime warnings 日志：后台扫描路径不允许裸 print 污染 TUI
+        # 诊断走 runtime warnings 日志：后台扫描路径不允许裸 print 污染 CLI
         _log_warning("解析技能文件失败 %s: %s", file_path, e)
         return None
 

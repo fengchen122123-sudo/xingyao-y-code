@@ -1,6 +1,6 @@
 """
 core/model_selector.py
-/models 指令触发的全屏 TUI 选择器。
+/models 指令触发的全屏 CLI 选择器。
 预置厂商、模型元数据与 GUI 共用 core.model_catalog，只需输入 API Key。
 """
 import io

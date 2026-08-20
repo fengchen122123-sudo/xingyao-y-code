@@ -15,7 +15,7 @@ def _fake_bundle(tmp_path, as_zip=False):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     files = {
-        "ycode.exe": "tui",
+        "ycode.exe": "cli",
         "Y-code.exe": "gui",
         "_internal/core.dll": "dll",
         "_internal/frontend/index.html": "html",
@@ -78,7 +78,7 @@ def test_full_install_with_cli_and_shortcut(tmp_path, patched_env):
     assert progress_log[-1] == 100.0
 
 
-def test_full_install_without_cli_removes_tui_exe(tmp_path, patched_env):
+def test_full_install_without_cli_removes_cli_exe(tmp_path, patched_env):
     bundle = _fake_bundle(tmp_path)
     install_dir = str(tmp_path / "installed")
     res = run_install(
@@ -95,18 +95,18 @@ def test_full_install_without_cli_removes_tui_exe(tmp_path, patched_env):
     assert patched_env["shortcut"] == []
 
 
-def test_tui_install_skips_frontend(tmp_path, patched_env):
+def test_cli_install_skips_frontend(tmp_path, patched_env):
     bundle = _fake_bundle(tmp_path)
-    install_dir = str(tmp_path / "installed_tui")
+    install_dir = str(tmp_path / "installed_cli")
     res = run_install(
-        "tui", str(bundle), InstallOptions(install_dir), _startupinfo(), log=lambda m: None,
+        "cli", str(bundle), InstallOptions(install_dir), _startupinfo(), log=lambda m: None,
     )
     assert res["installed_cli"] is True
-    assert (tmp_path / "installed_tui" / "ycode.exe").exists()
-    assert not (tmp_path / "installed_tui" / "Y-code.exe").exists()
-    assert (tmp_path / "installed_tui" / "_internal" / "core.dll").exists()
-    # TUI 独立安装不携带 GUI 前端资源
-    assert not (tmp_path / "installed_tui" / "_internal" / "frontend").exists()
+    assert (tmp_path / "installed_cli" / "ycode.exe").exists()
+    assert not (tmp_path / "installed_cli" / "Y-code.exe").exists()
+    assert (tmp_path / "installed_cli" / "_internal" / "core.dll").exists()
+    # CLI 独立安装不携带 GUI 前端资源
+    assert not (tmp_path / "installed_cli" / "_internal" / "frontend").exists()
     assert patched_env["registry"][0]["app_key_name"] == "Y-code-CLI"
 
 
@@ -129,29 +129,29 @@ def test_zip_payload_full_install(tmp_path, patched_env):
         _startupinfo(), log=lambda m: None, progress=progress_log.append,
     )
     assert res["installed_cli"] is True
-    assert (tmp_path / "installed_zip" / "ycode.exe").read_text() == "tui"
+    assert (tmp_path / "installed_zip" / "ycode.exe").read_text() == "cli"
     assert (tmp_path / "installed_zip" / "Y-code.exe").read_text() == "gui"
     assert (tmp_path / "installed_zip" / "_internal" / "frontend" / "index.html").exists()
     assert progress_log[-1] == 100.0
 
 
-def test_zip_payload_tui_install_skips_frontend(tmp_path, patched_env):
+def test_zip_payload_cli_install_skips_frontend(tmp_path, patched_env):
     bundle = _fake_bundle(tmp_path, as_zip=True)
-    install_dir = str(tmp_path / "installed_zip_tui")
+    install_dir = str(tmp_path / "installed_zip_cli")
     res = run_install(
-        "tui", str(bundle), InstallOptions(install_dir), _startupinfo(), log=lambda m: None,
+        "cli", str(bundle), InstallOptions(install_dir), _startupinfo(), log=lambda m: None,
     )
-    assert (tmp_path / "installed_zip_tui" / "ycode.exe").exists()
-    assert (tmp_path / "installed_zip_tui" / "_internal" / "core.dll").exists()
-    assert not (tmp_path / "installed_zip_tui" / "_internal" / "frontend").exists()
-    assert not (tmp_path / "installed_zip_tui" / "Y-code.exe").exists()
+    assert (tmp_path / "installed_zip_cli" / "ycode.exe").exists()
+    assert (tmp_path / "installed_zip_cli" / "_internal" / "core.dll").exists()
+    assert not (tmp_path / "installed_zip_cli" / "_internal" / "frontend").exists()
+    assert not (tmp_path / "installed_zip_cli" / "Y-code.exe").exists()
 
 
 def test_zip_payload_rejects_parent_traversal(tmp_path, patched_env):
     bundle = tmp_path / "bundle"
     bundle.mkdir()
     with zipfile.ZipFile(bundle / "ycode_pkg.zip", "w") as zf:
-        zf.writestr("ycode.exe", "tui")
+        zf.writestr("ycode.exe", "cli")
         zf.writestr("Y-code.exe", "gui")
         zf.writestr("../outside.txt", "owned")
 
@@ -189,7 +189,7 @@ def test_zip_payload_rejects_existing_junction_before_writing(tmp_path, monkeypa
             "zip",
             str(bundle / "ycode_pkg.zip"),
             str(install_dir),
-            tui_only=False,
+            cli_only=False,
             log=lambda message: None,
             progress=lambda value: None,
         )
@@ -481,7 +481,7 @@ def test_copy_payload_rejects_symlink_target_file(tmp_path, monkeypatch):
     with pytest.raises(InstallError, match="符号链接|目录联接"):
         ycode_setup._copy_payload(
             "zip", str(bundle / "ycode_pkg.zip"), str(install_dir),
-            tui_only=False, log=lambda m: None, progress=lambda p: None,
+            cli_only=False, log=lambda m: None, progress=lambda p: None,
         )
 
     assert victim.read_text(encoding="utf-8") == "old"
@@ -498,7 +498,7 @@ def test_copy_payload_rolls_back_created_files_on_failure(tmp_path, patched_env)
     with pytest.raises(Exception):
         ycode_setup._copy_payload(
             "zip", str(bundle / "ycode_pkg.zip"), str(install_dir),
-            tui_only=False, log=lambda m: None, progress=lambda p: None,
+            cli_only=False, log=lambda m: None, progress=lambda p: None,
         )
 
     # ycode.exe 是本次新写入的文件，应被回滚删除；预置目录不动
@@ -518,7 +518,7 @@ def test_overwrite_install_prunes_files_removed_in_new_version(tmp_path, patched
     # 第二版载荷移除了 _internal/core.dll
     bundle2 = tmp_path / "bundle2"
     (bundle2 / "ycode_pkg" / "_internal").mkdir(parents=True)
-    (bundle2 / "ycode_pkg" / "ycode.exe").write_text("tui2", encoding="utf-8")
+    (bundle2 / "ycode_pkg" / "ycode.exe").write_text("cli2", encoding="utf-8")
     (bundle2 / "ycode_pkg" / "Y-code.exe").write_text("gui2", encoding="utf-8")
     (bundle2 / "Y-code-uninstall.exe").write_text("uninst", encoding="utf-8")
     (bundle2 / "version.txt").write_text("9.9.10", encoding="utf-8")

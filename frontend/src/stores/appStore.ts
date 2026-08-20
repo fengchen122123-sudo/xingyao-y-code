@@ -224,7 +224,7 @@ export const useAppStore = defineStore('app', {
     // 权限模式（规范值：confirm | accept_edits | plan | full，展示一律经 formatPermMode）
     permissionMode: 'confirm' as PermissionMode,
 
-    // 沙盒开关（true=允许访问工作目录外文件），与 TUI /sandbox 共享后端配置
+    // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享后端配置
     sandboxEnabled: false,
 
     // 当前激活模型的推理强度档位（default = 内置默认）
@@ -395,6 +395,9 @@ export const useAppStore = defineStore('app', {
       runtime.planData = this.planData;
       runtime.tokenUsage = this.tokenUsage;
       runtime.turnStartedAt = this.turnStartedAt;
+      // 模型选择随会话保存：切换会话时各会话恢复各自的模型，互不覆盖
+      runtime.modelId = this.activeModelId;
+      runtime.modelName = this.activeModelName;
     },
 
     _captureCurrentRuntime(this: any) {
@@ -425,6 +428,15 @@ export const useAppStore = defineStore('app', {
       if (runtime.tokenUsage) this.tokenUsage = runtime.tokenUsage;
       // "已工作 xx秒"计时随会话切换恢复该会话的回合开始时间戳
       this.turnStartedAt = runtime.turnStartedAt || 0;
+      // 模型选择随会话即时恢复（不等后端 switch_session 响应）：该会话显式
+      // 选过模型才恢复，且该模型仍存在（未被删除）；否则保持当前值，
+      // 由后端响应校正为该会话落库的绑定模型
+      if (runtime.modelId !== undefined) {
+        if (!this.models.length || this.models.some((m: ModelInfo) => m.id === runtime.modelId)) {
+          this.activeModelId = runtime.modelId;
+          this.activeModelName = runtime.modelName || this.activeModelName;
+        }
+      }
     },
 
     _setSessionRunning(this: any, sessionName: string, running: boolean) {
@@ -653,7 +665,18 @@ export const useAppStore = defineStore('app', {
           this.activeModelName = res.active_model_name || this.activeModelName;
           // 推理强度按模型保存：切换模型后同步该模型自己的档位
           this.reasoningEffort = res.reasoning_effort || 'default';
-          this.notifyChat('已切换活动模型: ' + this.activeModelName);
+          // 模型选择绑定到当前会话（含未落库的 pending 草稿）：写入 runtime，
+          // 切换会话时随 runtime 一并恢复，各会话模型互不影响
+          const runtime = this._getSessionRuntime(this.currentSessionName);
+          runtime.modelId = this.activeModelId;
+          runtime.modelName = this.activeModelName;
+          // 新会话或空会话切换模型不再弹提示/产生新页面：模型绑定静默完成，
+          // 仅当已有真实对话内容（user/assistant 消息）时才插入切换提示，
+          // 否则 notice 会让空状态页消失，表现为切模型后页面跳转
+          const hasDialog = this.messages.some(m => m.role === 'user' || m.role === 'assistant');
+          if (hasDialog) {
+            this.notifyChat('已切换活动模型: ' + this.activeModelName);
+          }
         } else {
           this.notifyChat('切换模型失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
@@ -704,7 +727,7 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    // 切换沙盒开关（是否允许访问工作目录外文件），与 TUI /sandbox 同一配置
+    // 切换沙盒开关（是否允许访问工作目录外文件），与 CLI /sandbox 同一配置
     async setSandbox(enabled: boolean) {
       const prev = this.sandboxEnabled;
       const api = this._api();
@@ -829,6 +852,14 @@ export const useAppStore = defineStore('app', {
         }
 
         if (res.sessions) this.sessionGroups = res.sessions;
+
+        // 会话级模型隔离：切到已有会话时恢复该会话绑定的模型，
+        // 避免 A 会话切到 B 会话后 A 的模型被全局覆盖
+        if (res.active_model_id) {
+          this.activeModelId = res.active_model_id;
+          this.activeModelName = res.active_model_name || this.activeModelName;
+          this.reasoningEffort = res.reasoning_effort || 'default';
+        }
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
@@ -1718,7 +1749,7 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async respondPermissionChoice(choiceIndex: number) {
+    async respondPermissionChoice(choiceIndex: number, customText?: string) {
       const reqId = this.permRequest.reqId;
       const sessionName = this.permRequest.sessionName;
       this.permRequest.show = false;
@@ -1726,7 +1757,7 @@ export const useAppStore = defineStore('app', {
       const api = this._api();
       if (!api) return;
       try {
-        const res = await api.respond_permission_choice(reqId, choiceIndex);
+        const res = await api.respond_permission_choice(reqId, choiceIndex, customText);
         if (!res || !res.ok) {
           const detail = res && res.msg ? `: ${res.msg}` : '';
           this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '选项响应发送失败' + detail });

@@ -125,7 +125,7 @@ _trust_prompt = None
 
 
 def set_trust_prompt(callback) -> None:
-    """注册插件信任确认回调（供入口层接入 TUI/GUI 弹窗）；传 None 恢复默认。"""
+    """注册插件信任确认回调（供入口层接入 CLI/GUI 弹窗）；传 None 恢复默认。"""
     global _trust_prompt
     _trust_prompt = callback
 
@@ -137,7 +137,7 @@ def _confirm_plugin_trust(plugin_dir: Path, name: str, fingerprint: str) -> bool
             return bool(callback(str(plugin_dir), name, fingerprint))
         except Exception:
             return False
-    # 默认：交互终端（TUI）弹确认；非交互/headless 环境直接拒绝
+    # 默认：交互终端（CLI）弹确认；非交互/headless 环境直接拒绝
     if sys.stdin is not None and sys.stdout is not None \
             and sys.stdin.isatty() and sys.stdout.isatty():
         try:

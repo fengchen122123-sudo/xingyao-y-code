@@ -77,7 +77,7 @@ _TOOL_USER_MSG_TEMPLATE = (
 
 # 工具结果（模拟）：随轮数变化，避免内容完全一致影响对比
 _TOOL_RESULT_TEMPLATE = (
-    "read_file 返回：文件 E:/fch/Y-code_tui/core/llm.py 第 1-120 行，"
+    "read_file 返回：文件 E:/fch/Y-code_cli/core/llm.py 第 1-120 行，"
     "包含 litellm 懒加载与 completion 包装函数（模拟结果，第 {n} 轮）。"
 )
 
@@ -374,7 +374,7 @@ def run_tool_scenario(fn, model, api_key, api_base, tool_rounds, system_prompt):
             synthetic_seq += 1
             call_id = "call_synth_%d" % synthetic_seq
             call_name = "read_file"
-            call_args = '{"path": "E:/fch/Y-code_tui/core/llm.py"}'
+            call_args = '{"path": "E:/fch/Y-code_cli/core/llm.py"}'
             all_tool_calls = [{
                 "id": call_id,
                 "type": "function",

@@ -38,7 +38,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 ```
 
 - 加载器：`core/plugin_loader.py`，由 `core/tool_registry.py:build_default_registry()` 末尾自动调用。
-- 插件扫描结果（含禁用/失败/被覆盖/未信任）由 `plugin_loader.get_plugin_infos()` 提供，TUI 内用 `/plugins` 命令查看。
+- 插件扫描结果（含禁用/失败/被覆盖/未信任）由 `plugin_loader.get_plugin_infos()` 提供，CLI 内用 `/plugins` 命令查看。
 - 单插件异常只记录日志并跳过，绝不影响 ycode 启动。
 - 插件内兄弟模块用 `from core.plugin_loader import import_sibling; m = import_sibling(__file__, "module")` 加载。
 - 插件工具通过 `ToolSpec` 元数据自动获得权限拦截、schema 参数过滤与结果截断。
@@ -66,7 +66,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   Turn 及其 Step，`request_envelope.py` 只观察最终 Provider 请求并生成无正文指纹，
   `stream_assembler.py` 负责流与 reasoning/tool call 组装，`tool_contracts.py`、
   `tool_adapters.py`、`tool_pipeline.py` 负责严格工具解析、固定适配与有序执行。
-  `core/llm.py` 保留 GUI/TUI 和外部调用方兼容入口；插件仍只通过现有 `ToolRegistry`
+  `core/llm.py` 保留 GUI/CLI 和外部调用方兼容入口；插件仍只通过现有 `ToolRegistry`
   扩展工具集合，不得动态替换 Harness 阶段。
 - `messages` 表是会话内容的唯一事实源。Harness Journal 只能记录状态、ID、序号、
   时间、耗时与哈希；严禁写入用户/助手正文、reasoning、工具参数、工具结果、凭据或
@@ -111,7 +111,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   避免泄漏线程占满 5 个名额导致前台回合无限阻塞。
 - `core/cache_keepalive.py`：前缀缓存保活默认 120 秒（0 关闭，最小 60），仅 DeepSeek/Kimi 路由生效。
 - `core/llm.py` 在飞请求硬中断：`_request_stream` 把每个流请求登记到 cancel_event 名下
-  （`_inflight_streams` 注册表），停止路径（GUI stop / TUI Ctrl+C / 子代理 `_terminate`）
+  （`_inflight_streams` 注册表），停止路径（GUI stop / CLI Ctrl+C / 子代理 `_terminate`）
   先 set cancel_event 再调 `abort_inflight_streams()` 直接关闭底层流，阻塞读立即抛错退出，
   不再静默接收数据直到请求超时。铁律：只关单个 response 流（逐层探测 close/completion_stream/
   response），绝不触碰 litellm 共享连接池；关闭动作吞掉一切异常；先 set 事件再 abort，
@@ -124,7 +124,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 ## 🎨 Code Style & Quality Guidelines
 
 1. **Terminal Output Constraints**:
-   - Since the TUI terminal interface prints raw text without a Markdown renderer, **never** output markdown formatting such as `**` (bold) or `*` (italic) around words. Use clean indentations, capitalization, or extra spacing to highlight text.
+   - Since the CLI terminal interface prints raw text without a Markdown renderer, **never** output markdown formatting such as `**` (bold) or `*` (italic) around words. Use clean indentations, capitalization, or extra spacing to highlight text.
 2. **Concurrency and UI Thread-safety**:
    - Any background worker threads or asynchronous helper threads **must not** directly touch global layout variables, call `print_formatted_text`, or run `app.invalidate()`.
    - Always route UI updates back to the main prompt_toolkit thread loop using `app_instance.loop.call_soon_threadsafe(callback)`.
@@ -133,7 +133,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
      绝不在 `_delta_lock` 内触碰 JS 桥（曾因渲染进程挂起导致全管线级联冻结）。
    - GUI 运行日志：`~/.ycode/logs/gui-runtime.log`（2MB x 3 滚动，`gui_main._configure_runtime_logging`），
      打包版无控制台，排查 GUI 问题先查此文件。
-   - 取消语义铁律：用户主动取消（GUI stop / TUI Ctrl+C）后，cancelled 任务绝不注入“接手完成”指令
+   - 取消语义铁律：用户主动取消（GUI stop / CLI Ctrl+C）后，cancelled 任务绝不注入“接手完成”指令
      （`agent_service.build_background_task_summary` 只对 failed/timed_out 接手）；自动汇总回合被
      `gui_bridge._user_cancelled_sessions` 抑制、计划续推 nudge 被 `plan.suppress_plan_auto_continue`
      抑制，防止被取消的工作在后续回合复活；用户发新消息或计划项重新进入 in_progress 时解除。
