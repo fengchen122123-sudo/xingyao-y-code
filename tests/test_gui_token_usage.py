@@ -39,7 +39,7 @@ def _snapshot(*, available=True):
 
 def test_gui_token_payload_uses_session_prompt_as_cache_denominator(monkeypatch):
     bridge = _bridge_without_init()
-    monkeypatch.setattr(gui_bridge, "get_active_model", lambda: {
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
         "litellm_model": "openai/deepseek-v4",
         "base_url": "https://gui.example/v1",
         "context_window": 1000000,
@@ -64,7 +64,7 @@ def test_gui_token_payload_uses_session_prompt_as_cache_denominator(monkeypatch)
 def test_gui_token_payload_exposes_cli_style_totals(monkeypatch):
     """状态栏与 CLI 口径一致：输入/输出/命中取自 process 累计（计费口径）。"""
     bridge = _bridge_without_init()
-    monkeypatch.setattr(gui_bridge, "get_active_model", lambda: {
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
         "litellm_model": "openai/deepseek-v4",
         "base_url": "https://gui.example/v1",
         "context_window": 1000000,
@@ -80,7 +80,7 @@ def test_gui_token_payload_exposes_cli_style_totals(monkeypatch):
 
 def test_gui_token_payload_keeps_unavailable_distinct_from_zero(monkeypatch):
     bridge = _bridge_without_init()
-    monkeypatch.setattr(gui_bridge, "get_active_model", lambda: {
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
         "litellm_model": "openai/deepseek-v4",
         "base_url": "https://gui.example/v1",
         "context_window": 1000000,

@@ -5,7 +5,11 @@ import threading
 from datetime import date, datetime
 from pathlib import Path, PurePosixPath
 
-YCODE_DIR = Path.home() / ".ycode"
+from config import YCODE_DIR as CONFIG_YCODE_DIR
+
+
+# 数据目录唯一事实源来自 config：默认 ~/.ycode，YCODE_DATA_DIR 可覆盖。
+YCODE_DIR = Path(CONFIG_YCODE_DIR)
 MEMORY_DIR = YCODE_DIR / "memory"
 SESSIONS_DIR = YCODE_DIR / "sessions"
 
@@ -37,11 +41,14 @@ def _is_within_dir(path, root_dir):
         candidate = str(path).strip()
         if not candidate:
             return False
-        candidate = os.path.normcase(
-            os.path.realpath(os.path.abspath(os.path.expanduser(candidate)))
-        )
+        candidate = os.path.expanduser(candidate)
+        if not os.path.isabs(candidate):
+            from core.workspace_context import get_workdir
+
+            candidate = os.path.join(str(get_workdir()), candidate)
+        candidate = os.path.normcase(os.path.realpath(candidate))
         root = os.path.normcase(os.path.realpath(str(root_dir)))
-        return candidate == root or candidate.startswith(root + os.sep)
+        return os.path.commonpath((candidate, root)) == root
     except Exception:
         return False
 

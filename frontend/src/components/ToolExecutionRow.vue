@@ -67,7 +67,7 @@
 import { computed, ref } from 'vue';
 import AppIcon from './AppIcon.vue';
 import {
-  countDiffChanges,
+  diffCounts,
   type LegacyDiff,
   type SubagentTaskSnapshot,
   type ToolTraceRow,
@@ -137,7 +137,7 @@ const diffStats = computed(() => {
     let added = 0;
     let removed = 0;
     for (const diff of diffs.value) {
-      const changes = countDiffChanges(diff.diff_text);
+      const changes = diffCounts(diff);
       added += changes.added;
       removed += changes.removed;
     }

@@ -61,7 +61,7 @@ def _no_secondary(monkeypatch):
 
 
 def test_long_history_is_compressed_in_window_sized_chunks(manager, monkeypatch):
-    _seed_history(manager, 60)  # 每条约 1.2k token，总远超 4096*0.4 预算
+    _seed_history(manager, 60)  # 每条约 1.2k token，总远超 4096*0.25 预算
 
     prompts = []
 
@@ -77,7 +77,7 @@ def test_long_history_is_compressed_in_window_sized_chunks(manager, monkeypatch)
 
     # 必须切成了多段，且每段 prompt 估算 token 都在窗口预算内
     assert len(prompts) >= 2
-    budget = int(4096 * 0.4)
+    budget = int(4096 * 0.25)
     for p in prompts:
         assert mc._estimate_tokens(p) <= budget + 1200  # 指令与累积摘要的固定开销
 
@@ -129,6 +129,29 @@ def test_single_chunk_keeps_first_summary_length(manager, monkeypatch):
     ) is True
     assert len(prompts) == 1
     assert "前期历史记忆摘要" not in prompts[0]
+
+
+def test_compression_request_uses_token_adaptive_timeout(manager, monkeypatch):
+    """压缩调用必须使用按本段 token 计算的超时，而不是固定 60 秒。"""
+    _seed_history(manager, 11, filler=3)
+    timeouts = []
+
+    def fake_completion(**kwargs):
+        timeouts.append(kwargs["timeout"])
+        return _Resp("单一摘要")
+
+    monkeypatch.setattr(mc, "_compression_request_timeout", lambda _tokens: 321)
+    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+
+    assert compress_session_memory(
+        manager,
+        "chunk-session",
+        "fake/compress-model",
+        "k",
+        "",
+        output_callback=lambda _message: None,
+    ) is True
+    assert timeouts == [321]
 
 
 def test_empty_chunk_result_aborts_without_touching_db(manager, monkeypatch):
@@ -183,7 +206,7 @@ def test_chinese_long_message_truncated_by_token_not_chars(manager, monkeypatch)
 
     # 压缩被触发且生成了请求
     assert len(prompts) >= 1
-    budget = int(4096 * 0.4)
+    budget = int(4096 * 0.25)
     for p in prompts:
         # 每段 prompt 估算 token 必须在预算内（含指令与累积摘要的固定开销 ~1200）
         assert mc._estimate_tokens(p) <= budget + 1200

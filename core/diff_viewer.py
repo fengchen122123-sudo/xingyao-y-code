@@ -1,6 +1,20 @@
 import difflib
 import re
 
+
+def count_diff_changes(diff_text):
+    """统计 unified diff 的完整新增/删除行数，不把文件头计入。"""
+    added = 0
+    removed = 0
+    for line in str(diff_text or "").splitlines():
+        if re.match(r"^(?:\+\+\+|---)(?:[\t ]|$)", line):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    return added, removed
+
 def generate_diff(old_content, new_content, file_path):
     """生成标准 unified diff"""
     old_lines = old_content.splitlines(keepends=True)

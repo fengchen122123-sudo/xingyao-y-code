@@ -12,6 +12,7 @@ def _fake_install_dir(tmp_path):
     install_dir = tmp_path / "installed"
     (install_dir / "_internal" / "frontend").mkdir(parents=True)
     (install_dir / "cli").mkdir(parents=True)
+    (install_dir / "tui").mkdir(parents=True)
     (install_dir / "Y-code.exe").write_text("gui", encoding="utf-8")
     (install_dir / "ycode.exe").write_text("cli", encoding="utf-8")
     (install_dir / "ycode_uninstall.exe").write_text("uninst", encoding="utf-8")

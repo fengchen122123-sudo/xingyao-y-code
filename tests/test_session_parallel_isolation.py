@@ -11,6 +11,7 @@
 """
 
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -473,6 +474,111 @@ def test_skills_relative_paths_follow_thread_workdir(tmp_path):
 
     assert results["A"][1] == os.path.normpath(str(proj_a / "skills-local"))
     assert results["B"][1] == os.path.normpath(str(proj_b / "skills-local"))
+
+
+def test_subagent_model_snapshot_uses_parent_session_when_global_was_overwritten(
+    monkeypatch,
+):
+    """会话 B 后启动覆盖全局 tuple 后，会话 A 的子代理仍必须继承 A。"""
+    from core import tools as tools_module
+
+    app_context.set_active_model_tuple("openai/model-B", "key-B", "url-B")
+    monkeypatch.setattr(
+        "core.model_manager.get_secondary_roles", lambda: {"subagent": False}
+    )
+    models = {
+        "session-A": {
+            "litellm_model": "openai/model-A",
+            "api_key": "key-A",
+            "base_url": "url-A",
+        },
+        "session-B": {
+            "litellm_model": "openai/model-B",
+            "api_key": "key-B",
+            "base_url": "url-B",
+        },
+    }
+    monkeypatch.setattr(
+        "core.model_manager.get_active_model", lambda session=None: models.get(session)
+    )
+
+    assert tools_module._snapshot_model_config(session_name="session-A") == (
+        "openai/model-A", "key-A", "url-A",
+    )
+
+
+def test_explicit_session_model_lookup_never_reuses_process_tuple(monkeypatch):
+    """显式会话解析为空时必须失败，不能把最后写入者 B 当成 A。"""
+    from core import tools as tools_module
+
+    app_context.set_active_model_tuple("openai/model-B", "key-B", "url-B")
+    monkeypatch.setattr(
+        "core.model_manager.get_secondary_roles", lambda: {"subagent": False}
+    )
+    monkeypatch.setattr("core.model_manager.get_active_model", lambda _session=None: None)
+
+    assert tools_module._snapshot_model_config(session_name="session-A") is None
+
+
+def test_subagent_manager_run_snapshots_parent_session_model(monkeypatch):
+    """验证实际 run 入口把 parent_session 对应模型冻结到任务。"""
+    from core import tools as tools_module
+
+    monkeypatch.setattr(
+        "core.model_manager.get_secondary_roles", lambda: {"subagent": False}
+    )
+    monkeypatch.setattr(
+        "core.model_manager.get_active_model",
+        lambda session=None: {
+            "litellm_model": f"openai/{session}",
+            "api_key": f"key-{session}",
+            "base_url": f"url-{session}",
+        },
+    )
+    captured = []
+    manager = tools_module.SubagentManager()
+    manager._runner = lambda task: captured.append(task.model_config) or "完成"
+
+    manager.run("检查模型快照", "session-A", "turn-A", timeout_seconds=30)
+
+    assert captured == [("openai/session-A", "key-session-A", "url-session-A")]
+
+
+def test_custom_inherit_uses_parent_session_model(monkeypatch):
+    """自定义子代理 inherit 的真实模型请求必须使用父会话，而非任务 fallback。"""
+    from core import tools as tools_module
+
+    monkeypatch.setattr(
+        "core.model_manager.get_active_model",
+        lambda session=None: {
+            "litellm_model": "openai/model-A",
+            "api_key": "key-A",
+            "base_url": "url-A",
+        } if session == "session-A" else None,
+    )
+    captured = {}
+
+    def fake_events(model, key, messages, url, **kwargs):
+        captured.update(model=model, key=key, url=url)
+        yield SimpleNamespace(
+            kind="assistant_delta",
+            payload={"text": "完整结论" * 40},
+        )
+
+    monkeypatch.setattr("core.llm.chat_with_model_events", fake_events)
+    manager = tools_module.SubagentManager(runner=lambda _task: "unused")
+    task = tools_module.SubagentTask(
+        task_id="custom-inherit",
+        parent_session="session-A",
+        parent_turn_id="turn-A",
+        description="验证继承",
+        model_config=("openai/model-B", "key-B", "url-B"),
+        custom_config={"model": "inherit", "base_type": "general"},
+    )
+
+    manager._run_default_subagent(task)
+
+    assert captured == {"model": "openai/model-A", "key": "key-A", "url": "url-A"}
 
 
 def test_unbound_thread_falls_back_to_default_singletons(tmp_path):

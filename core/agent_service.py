@@ -228,6 +228,12 @@ def get_session_token_baseline(manager, session_name: str, model_name: str,
         history = manager.get_history(session_name)
     estimated = estimate_history_tokens_with_system(model_name, history)
     if last:
+        usage_model = str(last.get("model_name") or "").strip()
+        current_model = str(model_name or "").strip()
+        # 最近真实用量属于别的模型时分词口径已失效。尤其切到分词密度
+        # 更高的模型，继续取 min(real, estimated) 会低估并延迟压缩。
+        if usage_model and usage_model != current_model:
+            return estimated
         real = int(last.get("prompt_tokens") or 0) + int(last.get("completion_tokens") or 0)
         if real > 0:
             return min(real, estimated)

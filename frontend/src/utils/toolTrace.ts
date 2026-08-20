@@ -45,6 +45,8 @@ export interface SubagentTaskSnapshot {
 export interface LegacyDiff {
   file_path: string;
   diff_text: string;
+  added?: number;
+  removed?: number;
 }
 
 export interface ToolExecutionCall {
@@ -185,7 +187,7 @@ function legacyDiffRow(legacyDiffs: LegacyDiff[]): ToolTraceRow {
     count: legacyDiffs.length,
     metrics: legacyDiffs.reduce(
       (totals, diff) => {
-        const changes = countDiffChanges(diff.diff_text);
+        const changes = diffCounts(diff);
         totals.added += changes.added;
         totals.removed += changes.removed;
         return totals;
@@ -223,12 +225,21 @@ export function buildToolTraceRows(
 export function countDiffChanges(diffText: string): { added: number; removed: number } {
   let added = 0;
   let removed = 0;
-  for (const line of diffText.split(/\r?\n/)) {
+  for (const rawLine of diffText.split(/\r?\n/)) {
+    const line = rawLine.replace(/\x1b\[[0-9;]*m/g, '').replace(/│/g, '').trim();
     if (/^(?:\+\+\+|---)(?:[\t ]|$)/.test(line)) continue;
-    if (line.startsWith('+')) added += 1;
-    if (line.startsWith('-')) removed += 1;
+    const marker = line.match(/^[\d\s]*([+-])/);
+    if (marker?.[1] === '+') added += 1;
+    if (marker?.[1] === '-') removed += 1;
   }
   return { added, removed };
+}
+
+export function diffCounts(diff: LegacyDiff): { added: number; removed: number } {
+  if (Number.isFinite(diff.added) && Number.isFinite(diff.removed)) {
+    return { added: Number(diff.added), removed: Number(diff.removed) };
+  }
+  return countDiffChanges(diff.diff_text);
 }
 
 export function reduceExecutionState(

@@ -81,7 +81,7 @@ def _show_file_diff(
 ):
     """Render the existing write/edit diff without changing its UI payload."""
     try:
-        from core.diff_viewer import generate_diff, render_diff_table
+        from core.diff_viewer import count_diff_changes, generate_diff, render_diff_table
         from prompt_toolkit.formatted_text import ANSI
         from rich.console import Console
         from rich.panel import Panel
@@ -89,6 +89,7 @@ def _show_file_diff(
         diff_text = generate_diff(old_content, new_content, file_path)
         if not diff_text:
             return
+        added, removed = count_diff_changes(diff_text)
         lines = diff_text.split("\n")
         max_lines = 25
         display_text = (
@@ -115,6 +116,8 @@ def _show_file_diff(
                 "file_path": file_path,
                 "text": diff_output,
                 "diff_text": display_text,
+                "added": added,
+                "removed": removed,
             })
     except Exception as diff_error:
         logger.warning("渲染文件 diff 失败 (%s): %s", file_path, diff_error)
@@ -191,17 +194,19 @@ def _sandbox_outside_guard(
     # 改写 mcp.json 可注入恶意 MCP server，改坏 config.json 会让应用不可用。
     credential_write = False
     try:
-        from core.memory_kairos import is_ycode_data_path
+        from core.memory_kairos import YCODE_DIR, is_ycode_data_path
 
-        if is_ycode_data_path(path_value):
+        # 必须在“是否属于 ~/.ycode”之前展开 8.3 短名；否则短路径根目录本身
+        # 可能与长路径 YCODE_DIR 比对失败，并在沙盒全局开放时被直接放行。
+        resolved = os.path.realpath(os.path.expanduser(str(path_value)))
+        expanded = _win32_long_path(resolved)
+        if is_ycode_data_path(expanded):
             # 归一化到真实路径再比对：8.3 短名（confi~1.json）、尾部点/空格
             # （config.json.）、./ 穿插等变体都指向同一凭据文件，裸 basename
             # 字符串比对会被绕过，导致免询问改写 mcp.json / config.json
-            resolved = os.path.realpath(os.path.expanduser(str(path_value)))
-            expanded = _win32_long_path(resolved)
             # Win32 文件名会吞掉尾部的点与空格，比对前同样归一化
             normalized = expanded.rstrip(". ")
-            ycode_root = os.path.realpath(os.path.expanduser("~/.ycode"))
+            ycode_root = _win32_long_path(os.path.realpath(os.path.expanduser(str(YCODE_DIR))))
             basename = os.path.basename(normalized).lower()
             top_level = os.path.normcase(os.path.dirname(normalized)) == os.path.normcase(ycode_root)
             # 短名未能展开（目标不存在或系统禁用 8.3）时无法确认指向；
@@ -221,7 +226,9 @@ def _sandbox_outside_guard(
                 return sandbox_bypass(), None
             credential_write = True
     except Exception:
-        pass
+        # 数据目录/凭据分类属于安全边界。无法确认时必须失败关闭，不能继续
+        # 落入 allow_outside_workspace 的普通外部路径自动放行分支。
+        return None, PATH_VALIDATION_ERROR_MESSAGE
     # 沙盒开关（/sandbox on / GUI 沙盒解除，allow_outside_workspace=True）打开时：
     # 项目外路径读写直接放行，不再逐次询问（用户选定语义）。
     # 凭据写入不受开关影响，始终进入下方询问流程。

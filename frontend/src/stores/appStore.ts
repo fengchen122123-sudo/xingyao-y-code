@@ -309,6 +309,25 @@ export const useAppStore = defineStore('app', {
     tokenStatisticsLoading: false,
     tokenStatisticsDays: 30 as 1 | 7 | 30,
 
+    // 软件更新状态
+    updateState: {
+      status: 'idle' as 'idle' | 'checking' | 'available' | 'downloading' | 'downloaded' | 'installing' | 'error',
+      hasUpdate: false,
+      latestVersion: '',
+      currentVersion: '',
+      releaseTitle: '',
+      releaseNotes: '',
+      downloadUrl: '',
+      assetName: '',
+      assetSize: 0,
+      downloadProgress: 0,
+      downloadedBytes: 0,
+      totalBytes: 0,
+      installerPath: '',
+      showUpdateModal: false,
+      errorMessage: '',
+    },
+
     // 确认弹窗（notice 模式时退化为单按钮提示框，用户点击"确定"才关闭）
     confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎', notice: false } as ConfirmState,
 
@@ -654,6 +673,8 @@ export const useAppStore = defineStore('app', {
         this.tokenUsage = normalizeTokenUsage(init.token_usage);
         this.version = init.version || '';
         this.connected = true;
+        // 启动后静默检查更新（不打扰用户）
+        this.checkUpdate(false);
       } catch (err) {
         this.connected = false;
         this.notifyModal('连接失败', '后端连接失败：' + err);
@@ -964,11 +985,21 @@ export const useAppStore = defineStore('app', {
 
     async createGlobalSession() {
       // 懒创建：只切换到空白自由对话状态，首条消息发出时才真正落库
+      const inheritedModelId = this.activeModelId;
+      const inheritedModelName = this.activeModelName;
       this._captureCurrentRuntime();
       this.pendingWorkdir = 'GLOBAL';
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新对话';
       this._bindSessionRuntime('');
+      // 新会话继承用户当前窗口正在使用的模型。pending 会话尚未落库，
+      // 首条消息发送时通过 draftModelId 一并提交，不能回退到全局默认模型。
+      const runtime = this._getSessionRuntime('');
+      runtime.modelId = inheritedModelId;
+      runtime.modelName = inheritedModelName;
+      this.activeModelId = inheritedModelId;
+      this.activeModelName = inheritedModelName;
+      this.draftModelId = inheritedModelId;
       this.messages = [];
       this.currentStreamingText = '';
       this.currentThinkingText = '';
@@ -998,11 +1029,19 @@ export const useAppStore = defineStore('app', {
       // 不再同步等后端 get_workspace_state 扫文件树（大目录要数秒，
       // 表现为“点新会话特别慢”）。
       const treeMatches = this.workdir === targetWorkdir;
+      const inheritedModelId = this.activeModelId;
+      const inheritedModelName = this.activeModelName;
       this._captureCurrentRuntime();
       this.pendingWorkdir = targetWorkdir;
       this.currentSessionName = '';
       this.currentSessionDisplayName = '新会话';
       this._bindSessionRuntime('');
+      const runtime = this._getSessionRuntime('');
+      runtime.modelId = inheritedModelId;
+      runtime.modelName = inheritedModelName;
+      this.activeModelId = inheritedModelId;
+      this.activeModelName = inheritedModelName;
+      this.draftModelId = inheritedModelId;
       this.messages = [];
       this.currentStreamingText = '';
       this.currentThinkingText = '';
@@ -1672,6 +1711,8 @@ export const useAppStore = defineStore('app', {
         const diff: LegacyDiff = {
           file_path: String(d.file_path || ''),
           diff_text: String(d.diff_text || ''),
+          ...(Number.isFinite(d.added) ? { added: Number(d.added) } : {}),
+          ...(Number.isFinite(d.removed) ? { removed: Number(d.removed) } : {}),
         };
         // 只按非空 tool_call_id 绑定；空 ID 或找不到匹配调用时归入 legacy_diffs
         const toolCallId = String(d.tool_call_id || '');
@@ -1737,6 +1778,20 @@ export const useAppStore = defineStore('app', {
         this.terminalRunning = false;
         const code = data.code;
         this.terminalOutput += `\n[进程已退出，代码 ${code}]\n\n`;
+      } else if (type === 'update_download_progress') {
+        this.updateState.status = 'downloading';
+        this.updateState.downloadProgress = Number(data.percent) || 0;
+        this.updateState.downloadedBytes = Number(data.downloaded) || 0;
+        this.updateState.totalBytes = Number(data.total) || 0;
+      } else if (type === 'update_download_complete') {
+        this.updateState.status = 'downloaded';
+        this.updateState.downloadProgress = 100;
+        this.updateState.installerPath = String(data.installer_path || '');
+        this.handleDownloadComplete();
+      } else if (type === 'update_download_error') {
+        this.updateState.status = 'error';
+        this.updateState.errorMessage = String(data.message || '下载失败');
+        this.notifyModal('更新下载失败', `下载安装包时出错：${data.message || '未知错误'}`);
       } else if (type === 'error') {
         const msgText = String(data.message || '运行错误');
         // 回合进行中：错误挂在当前助手消息上展示，避免插队成独立 error 消息
@@ -2332,6 +2387,153 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         return { ok: false, msg: String(err) };
+      }
+    },
+
+    // ============================================================================
+    // 软件更新（Gitee Releases 联动）
+    // ============================================================================
+    openUpdateModal() {
+      this.updateState.showUpdateModal = true;
+    },
+
+    closeUpdateModal() {
+      this.updateState.showUpdateModal = false;
+    },
+
+    hasActiveTasks(): boolean {
+      const busyTurns = this.running || this.runningSessions.length > 0;
+      const busyTasks = Array.isArray(this.backgroundTasks) && this.backgroundTasks.some(t => t.status === 'running');
+      return busyTurns || busyTasks;
+    },
+
+    async checkUpdate(manual: boolean = false) {
+      const api = this._api();
+      if (!api) return;
+
+      this.updateState.status = 'checking';
+      try {
+        const res = await api.check_update(manual);
+        if (res && res.ok) {
+          this.updateState.hasUpdate = !!res.has_update;
+          this.updateState.latestVersion = res.latest_version || '';
+          this.updateState.currentVersion = res.current_version || this.version || '';
+          this.updateState.releaseTitle = res.release_title || '';
+          this.updateState.releaseNotes = res.release_notes || '';
+          this.updateState.downloadUrl = res.download_url || '';
+          this.updateState.assetName = res.asset_name || '';
+          this.updateState.assetSize = Number(res.asset_size || 0);
+          this.updateState.status = res.has_update ? 'available' : 'idle';
+
+          if (res.has_update && manual) {
+            this.openUpdateModal();
+          } else if (!res.has_update && manual) {
+            this.notifyModal('检查更新', `当前已是最新版本 (v${this.version || res.current_version || '1.2.5'})`);
+          }
+        } else {
+          this.updateState.status = 'idle';
+          if (manual) {
+            this.notifyModal('检查更新', res?.msg || '检查更新失败，请检查网络');
+          }
+        }
+      } catch (err) {
+        this.updateState.status = 'idle';
+        if (manual) {
+          this.notifyModal('检查更新', '检查更新失败：' + err);
+        }
+      }
+    },
+
+    async startDownloadUpdate() {
+      const api = this._api();
+      if (!api || !this.updateState.downloadUrl) return;
+
+      this.updateState.status = 'downloading';
+      this.updateState.downloadProgress = 0;
+      this.updateState.downloadedBytes = 0;
+
+      try {
+        const res = await api.download_update(this.updateState.downloadUrl, this.updateState.latestVersion);
+        if (!res || !res.ok) {
+          this.updateState.status = 'available';
+          this.notifyModal('下载失败', res?.msg || '无法启动下载任务');
+        }
+      } catch (err) {
+        this.updateState.status = 'available';
+        this.notifyModal('下载失败', '启动下载异常：' + err);
+      }
+    },
+
+    async cancelDownloadUpdate() {
+      const api = this._api();
+      if (!api) return;
+
+      try {
+        await api.cancel_download_update();
+        this.updateState.status = 'available';
+        this.updateState.downloadProgress = 0;
+      } catch {}
+    },
+
+    async handleDownloadComplete() {
+      const busy = this.hasActiveTasks();
+      if (!busy) {
+        const ok = await this.askConfirm(
+          '新版本已就绪',
+          `Y-CODE v${this.updateState.latestVersion} 安装包下载完成`,
+          '安装包已下载就绪，是否立即启动安装程序并重启软件？',
+          '立即安装 ⏎'
+        );
+        if (ok) {
+          await this.launchInstaller();
+        }
+      }
+    },
+
+    async handleInstallClick() {
+      if (!this.updateState.installerPath) {
+        this.openUpdateModal();
+        return;
+      }
+
+      const busy = this.hasActiveTasks();
+      if (busy) {
+        const ok = await this.askConfirm(
+          '任务进行中警告',
+          '当前仍有对话或后台任务正在执行中',
+          '继续安装将关闭当前软件并中断正在执行的任务。是否确定现在立即安装？',
+          '中断并安装'
+        );
+        if (ok) {
+          await this.launchInstaller();
+        }
+      } else {
+        const ok = await this.askConfirm(
+          '启动安装',
+          `准备安装 Y-CODE v${this.updateState.latestVersion}`,
+          '是否立即启动安装向导并退出当前程序？',
+          '立即安装 ⏎'
+        );
+        if (ok) {
+          await this.launchInstaller();
+        }
+      }
+    },
+
+    async launchInstaller() {
+      const api = this._api();
+      if (!api || !this.updateState.installerPath) return;
+
+      this.updateState.status = 'installing';
+      try {
+        const res = await api.launch_installer(this.updateState.installerPath);
+        if (!res || !res.ok) {
+          this.updateState.status = 'downloaded';
+          this.notifyModal('安装失败', res?.msg || '无法唤起安装向导');
+        }
+      } catch (err) {
+        this.updateState.status = 'downloaded';
+        this.notifyModal('安装失败', '唤起安装程序异常：' + err);
       }
     },
   },

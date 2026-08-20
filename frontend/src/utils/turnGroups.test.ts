@@ -196,7 +196,8 @@ describe('countDiffChanges', () => {
     // Rich 表格/面板渲染后的行：行首带边框 │，内容带 ANSI 颜色码
     const diff = ['[32m│ +[0m added line │', '[31m│ -[0m removed line │'].join('\n');
     expect(countDiffChanges(diff)).toEqual({ added: 1, removed: 1 });
-  });});
+  });
+});
 
 describe('collectFileChanges', () => {
   it('收集 mutation 绑定 diff 与 legacy diff，同一文件去重累加行数', () => {
@@ -228,6 +229,36 @@ describe('collectFileChanges', () => {
   it('无文件改动时返回空数组', () => {
     const g = buildMessageGroups([user('hi'), assistant({ content: 'hello' })])[0];
     expect(collectFileChanges(g)).toEqual([]);
+  });
+
+  it('优先使用后端基于完整 diff 提供的统计', () => {
+    const g = buildMessageGroups([
+      user('大改文件'),
+      assistant({
+        tool_calls: [{
+          id: 't',
+          diff: { file_path: 'core/large.py', diff_text: '+仅展示一行', added: 120, removed: 45 },
+        } as any],
+      }),
+    ])[0];
+
+    const change = collectFileChanges(g)[0];
+    expect(change.added).toBe(120);
+    expect(change.removed).toBe(45);
+  });
+
+  it('旧 ANSI/Rich legacy diff 缺少统计字段时仍能估算', () => {
+    const g = buildMessageGroups([
+      user('旧记录'),
+      assistant({
+        legacy_diffs: [{
+          file_path: 'core/legacy.py',
+          diff_text: '\x1b[32m│ + added line │\x1b[0m\n\x1b[31m│ - removed line │\x1b[0m',
+        } as any],
+      }),
+    ])[0];
+
+    expect(collectFileChanges(g)[0]).toMatchObject({ added: 1, removed: 1 });
   });
 
   it('Windows 反斜杠路径正确取 basename', () => {

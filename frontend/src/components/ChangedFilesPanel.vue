@@ -51,7 +51,7 @@
 
         <!-- 展开：该文件的改动 diff（红删/绿增，改动行上下各 5 行，带真实行号） -->
         <div v-if="expandedPath === c.path" class="cfp-diff">
-          <template v-for="(block, bi) in diffBlocks(c.diffText)" :key="bi">
+          <template v-for="(block, bi) in (diffBlocksByPath.get(c.path) || [])" :key="bi">
             <div v-if="bi > 0 || block.topHidden > 0" class="cfp-diff-gap">⋯</div>
             <div
               v-for="(l, li) in block.lines"
@@ -91,10 +91,9 @@ const expandedPath = ref('');
 
 const totalAdded = computed(() => props.changes.reduce((s, c) => s + c.added, 0));
 const totalRemoved = computed(() => props.changes.reduce((s, c) => s + c.removed, 0));
-
-function diffBlocks(diffText: string): DiffViewBlock[] {
-  return buildDiffBlocks(diffText, 5);
-}
+const diffBlocksByPath = computed(() => new Map<string, DiffViewBlock[]>(
+  props.changes.map((change) => [change.path, buildDiffBlocks(change.diffText, 5)]),
+));
 
 function toggleExpand(path: string) {
   expandedPath.value = expandedPath.value === path ? '' : path;
@@ -286,14 +285,14 @@ async function openFile(path: string) {
   padding-right: 12px;
 }
 .cfp-diff-line.d-add {
-  background: rgba(78, 169, 106, 0.13);
+  background: color-mix(in srgb, var(--green) 13%, transparent);
 }
 .cfp-diff-line.d-add .cfp-sign,
 .cfp-diff-line.d-add .cfp-code {
   color: var(--green);
 }
 .cfp-diff-line.d-del {
-  background: rgba(217, 99, 91, 0.13);
+  background: color-mix(in srgb, var(--red) 13%, transparent);
 }
 .cfp-diff-line.d-del .cfp-sign,
 .cfp-diff-line.d-del .cfp-code {

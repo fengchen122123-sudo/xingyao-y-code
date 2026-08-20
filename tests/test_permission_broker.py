@@ -495,6 +495,97 @@ def test_ask_user_custom_answer_is_forwarded_as_custom_payload(monkeypatch):
     assert payload["selected_index"] == -1
 
 
+def test_cli_custom_answer_uses_real_ask_user_broker_path(monkeypatch):
+    """CLI 自由文本经激活提示与真实 ask_user 轮询完整返回。"""
+    import json
+    import core.ask_user as ask_user_module
+    import main
+
+    class ImmediateLoop:
+        @staticmethod
+        def call_soon_threadsafe(callback):
+            callback()
+
+    class FakeApp:
+        loop = ImmediateLoop()
+
+        @staticmethod
+        def invalidate():
+            return None
+
+    broker = PermissionBroker()
+    monkeypatch.setattr(ask_user_module, "permission_broker", broker, raising=False)
+    monkeypatch.setattr(main, "permission_broker", broker)
+    monkeypatch.setattr(main, "app_instance", FakeApp())
+    monkeypatch.setattr(main, "confirm_prompt", None)
+    broker.set_prompt_handlers(
+        main._activate_permission_request,
+        main._dismiss_permission_prompt,
+    )
+    result = {}
+    thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            ask_user_module.ask_user(
+                "怎么处理？",
+                ["方案A", "方案B"],
+                owner_id="cli-custom",
+                parent_turn_id="turn-cli-custom",
+            ),
+        )
+    )
+    thread.start()
+    deadline = time.monotonic() + 1
+    while main.confirm_prompt is None and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    assert main.confirm_prompt is not None
+    assert main._resolve_confirm_custom("保留输入，改用方案C") is True
+    thread.join(timeout=1)
+
+    payload = json.loads(result["value"])
+    assert payload["selected"] == "保留输入，改用方案C"
+    assert payload["custom"] is True
+    assert main.confirm_prompt is None
+
+
+def test_cli_stale_custom_answer_reports_failure_without_resolving_a_choice(monkeypatch):
+    """请求已失效时返回 False，Enter 调用方据此保留输入且直接 return。"""
+    import main
+
+    broker = PermissionBroker(activate_prompt=lambda request: None)
+    request = broker.enqueue("ask_user", {"question": "怎么处理？"}, "root", "turn", "主代理")
+    monkeypatch.setattr(main, "permission_broker", broker)
+    monkeypatch.setattr(
+        main,
+        "confirm_prompt",
+        {
+            "request_id": request.request_id,
+            "function_name": "ask_user",
+            "current_idx": 1,
+        },
+    )
+    assert broker.resolve(request.request_id, 0) is True
+    cleared = []
+    invalidated = []
+    choices = []
+    monkeypatch.setattr(
+        main,
+        "_resolve_confirm_prompt",
+        lambda index: choices.append(index) or True,
+    )
+
+    assert main._submit_confirm_input(
+        "这段输入必须保留",
+        lambda: cleared.append(True),
+        lambda: invalidated.append(True),
+    ) is True
+    assert request.future.result() == 0
+    assert cleared == []
+    assert invalidated == []
+    assert choices == []
+
+
 def test_custom_answer_for_non_ask_user_is_treated_as_cancelled():
     """权限确认（允许/拒绝类）不开放自由文本：按取消兜底，不产出字符串结果。"""
     broker = PermissionBroker(activate_prompt=lambda request: None)

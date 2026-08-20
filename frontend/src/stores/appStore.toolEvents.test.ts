@@ -45,14 +45,14 @@ it('binds diff_ready only to the matching tool call', () => {
   store.handleBridgeEvent(event('turn_start', { user_text: '改代码' }));
   store.handleBridgeEvent(event('tool_start', editStart('edit-1', 'a.py')));
   store.handleBridgeEvent(event('tool_start', editStart('edit-2', 'b.py')));
-  const bound = { tool_call_id: 'edit-2', file_path: 'b.py', diff_text: '--- b.py\n+++ b.py\n-old\n+new' };
+  const bound = { tool_call_id: 'edit-2', file_path: 'b.py', diff_text: '--- b.py\n+++ b.py\n-old\n+new', added: 40, removed: 30 };
   const orphan = { tool_call_id: '', file_path: 'c.py', diff_text: '--- c.py\n+++ c.py\n-x\n+y' };
   store.handleBridgeEvent(event('diff_ready', bound));
   store.handleBridgeEvent(event('diff_ready', orphan));
 
   const message = store.messages.at(-1)!;
   expect(message.tool_calls![0].diff).toBeUndefined();
-  expect(message.tool_calls![1].diff).toEqual({ file_path: 'b.py', diff_text: bound.diff_text });
+  expect(message.tool_calls![1].diff).toEqual({ file_path: 'b.py', diff_text: bound.diff_text, added: 40, removed: 30 });
   expect(message.legacy_diffs).toEqual([{ file_path: 'c.py', diff_text: orphan.diff_text }]);
 });
 

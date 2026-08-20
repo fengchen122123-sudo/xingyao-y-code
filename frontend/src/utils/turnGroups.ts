@@ -1,4 +1,7 @@
 import type { ChatMessage } from '../stores/appStore';
+import { diffCounts, type LegacyDiff } from './toolTrace';
+
+export { countDiffChanges } from './toolTrace';
 
 // ---------------------------------------------------------------------------
 // 稳定消息 key：对象身份 -> 递增数字。
@@ -104,9 +107,8 @@ export function groupStats(group: TurnGroupInfo): { rounds: number; toolCount: n
 // 回合文件更改摘要（"N 个文件已更改" 折叠面板）
 //
 // 数据来源：本回合所有 assistant 消息里，mutation 工具调用绑定的 diff 与
-// 未绑定的历史 legacy_diffs。行数从 diff 文本启发式统计（与后端
-// core/turn_renderer._count_diff_changes 同一套口径：剥离 ANSI/行号后按
-// + / - 前缀计数，跳过 +++ / --- 文件头）。同一文件多次修改去重，行数累加。
+// 未绑定的历史 legacy_diffs。新事件优先使用后端基于完整 diff 计算的统计；
+// 旧历史数据才从截断/渲染文本启发式统计。同一文件多次修改去重，行数累加。
 // ---------------------------------------------------------------------------
 
 export interface FileChangeEntry {
@@ -120,24 +122,6 @@ export interface FileChangeEntry {
   diffText: string;
 }
 
-const DIFF_ANSI_RE = /\x1b\[[0-9;]*m/g;
-const DIFF_MARKER_RE = /^[\d\s]*([+-])/;
-
-/** 与后端 _count_diff_changes 对齐的 +/− 行数统计 */
-export function countDiffChanges(diffText: string): { added: number; removed: number } {
-  let added = 0;
-  let removed = 0;
-  for (const rawLine of diffText.split('\n')) {
-    const line = rawLine.replace(DIFF_ANSI_RE, '').replace(/│/g, '').trim();
-    if (!line || line.startsWith('+++') || line.startsWith('---')) continue;
-    const m = line.match(DIFF_MARKER_RE);
-    if (!m) continue;
-    if (m[1] === '+') added += 1;
-    else removed += 1;
-  }
-  return { added, removed };
-}
-
 function baseName(p: string): string {
   const norm = p.replace(/\\/g, '/');
   const i = norm.lastIndexOf('/');
@@ -147,10 +131,12 @@ function baseName(p: string): string {
 /** 收集回合内的文件更改（去重 + 行数累加）。无更改返回空数组（面板不显示） */
 export function collectFileChanges(group: TurnGroupInfo): FileChangeEntry[] {
   const byPath = new Map<string, FileChangeEntry>();
-  const push = (filePath: string, diffText: string) => {
+  const push = (diff: LegacyDiff) => {
+    const filePath = diff.file_path;
+    const diffText = diff.diff_text;
     const p = String(filePath || '').trim();
     if (!p) return;
-    const { added, removed } = countDiffChanges(diffText || '');
+    const { added, removed } = diffCounts(diff);
     const entry = byPath.get(p);
     if (entry) {
       entry.added += added;
@@ -163,10 +149,10 @@ export function collectFileChanges(group: TurnGroupInfo): FileChangeEntry[] {
   for (const m of [...group.middle, ...group.tail]) {
     if (m.role !== 'assistant') continue;
     for (const c of m.tool_calls ?? []) {
-      if (c.diff && c.diff.file_path) push(c.diff.file_path, c.diff.diff_text);
+      if (c.diff && c.diff.file_path) push(c.diff);
     }
     for (const d of m.legacy_diffs ?? []) {
-      push(d.file_path, d.diff_text);
+      push(d);
     }
   }
   return [...byPath.values()];
