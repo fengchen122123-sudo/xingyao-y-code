@@ -133,7 +133,10 @@ class TurnRenderer:
             self._saw_tool_event = True
             diff = str(data.get("text") or data.get("diff") or "")
             if diff:
-                added, removed = _count_diff_changes(diff)
+                if isinstance(data.get("added"), int) and isinstance(data.get("removed"), int):
+                    added, removed = int(data["added"]), int(data["removed"])
+                else:
+                    added, removed = _count_diff_changes(diff)
                 self._append_tool_lines(
                     self._tool_progress.record_diff(
                         str(data.get("tool_call_id") or data.get("id") or ""),

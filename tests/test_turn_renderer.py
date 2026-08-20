@@ -112,6 +112,26 @@ def test_renderer_forwards_diff_to_mutation_progress_without_duplication():
     assert result == []
 
 
+def test_renderer_prefers_complete_diff_counts_from_event():
+    renderer = TurnRenderer()
+    mutation = tool_payload("edit-full", "edit_file", "mutation", "修改文件", "large.py")
+    renderer.consume("tool_started", mutation)
+
+    output = plain(renderer.consume(
+        "diff_ready",
+        {
+            "tool_call_id": "edit-full",
+            "file_path": "large.py",
+            "text": "-truncated\n+truncated\n",
+            "added": 120,
+            "removed": 45,
+        },
+    ))
+
+    assert "+120" in output
+    assert "-45" in output
+
+
 def test_renderer_uses_only_safe_display_fields_for_tool_progress():
     renderer = TurnRenderer()
     payload = command_payload("cmd", "python -m pytest -q", ok=True)

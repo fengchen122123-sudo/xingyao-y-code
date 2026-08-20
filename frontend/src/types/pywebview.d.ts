@@ -208,11 +208,6 @@ export interface InitialState {
   version: string;
 }
 
-// window.onBridgeEvent 收到的事件信封；具体 data 形状随 type 变化，
-// 回合/工具时间线事件的 payload 形状见下方接口（对应 gui_bridge.py
-// _consume_turn_events 的发射字段），其余事件详见 appStore.ts 的
-// handleBridgeEvent 分支注释。
-
 // 工具事件 display dict：后端原样透传，字段可缺省
 export interface ToolDisplayPayload {
   category?: string;
@@ -260,6 +255,8 @@ export interface DiffReadyEventData {
   tool_call_id: string;
   file_path: string;
   diff_text: string;
+  added?: number;
+  removed?: number;
 }
 
 export interface TurnErrorEventData {
@@ -359,6 +356,12 @@ export interface PyWebViewAPI {
   test_model(modelId: string): Promise<any>;
   set_secondary_model(modelId: string): Promise<any>;
   set_secondary_roles(roles: { vision: boolean; compression: boolean; subagent: boolean }): Promise<any>;
+
+  check_update(manual?: boolean): Promise<any>;
+  download_update(downloadUrl: string, targetVersion: string): Promise<any>;
+  cancel_download_update(): Promise<any>;
+  has_active_tasks(): Promise<any>;
+  launch_installer(filePath: string): Promise<any>;
 }
 
 declare global {

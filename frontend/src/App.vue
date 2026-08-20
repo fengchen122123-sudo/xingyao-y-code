@@ -101,6 +101,9 @@
     <!-- 确认弹窗 -->
     <ConfirmModal />
 
+    <!-- 软件更新弹窗 -->
+    <UpdateModal />
+
     <!-- 图片大图查看 -->
     <ImageLightbox />
 
@@ -132,6 +135,7 @@ import TurnGroup from './components/TurnGroup.vue';
 import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
+import UpdateModal from './components/UpdateModal.vue';
 import PermCard from './components/PermCard.vue';
 import ImageLightbox from './components/ImageLightbox.vue';
 import Subpage from './components/Subpage.vue';

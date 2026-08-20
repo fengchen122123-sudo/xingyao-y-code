@@ -461,9 +461,14 @@ def test_get_last_token_usage_returns_latest_per_session():
     assert last["completion_tokens"] == 30
     assert last["total_tokens"] == 330
     assert last["cached_tokens"] == 5
+    assert last["model_name"] == "openai/m1"
 
     other = manager.get_last_token_usage("s2")
     assert other["prompt_tokens"] == 200
+    assert other["model_name"] == "openai/m1"
+
+    manager.add_token_usage("", "bare-model", 5, 1, 0, 6, session_id="bare")
+    assert manager.get_last_token_usage("bare")["model_name"] == "bare-model"
 
 
 def test_memory_session_lifecycle_keeps_runtime_cache_state_in_sync():

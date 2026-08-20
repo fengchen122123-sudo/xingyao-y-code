@@ -316,8 +316,12 @@
             <button
               data-test="check-update"
               class="primary-button perm-action"
-              @click="checkUpdate"
-            >检查更新</button>
+              :class="{
+                'install-action-btn': store.updateState.status === 'downloaded'
+              }"
+              :disabled="store.updateState.status === 'checking' || store.updateState.status === 'installing'"
+              @click="handleAboutUpdateClick"
+            >{{ aboutUpdateBtnText }}</button>
           </div>
         </section>
 
@@ -646,9 +650,22 @@ watch(activeSection, (v) => {
   if (v === 'permissions') loadPermRules();
 });
 
-// 「检查更新」为预留入口：更新通道尚未接入，先给出占位反馈（模态提示，点击确定才关闭）
-function checkUpdate() {
-  store.notifyModal('检查更新', '当前已是最新版本（更新通道后续接入）');
+const aboutUpdateBtnText = computed(() => {
+  if (store.updateState.status === 'checking') return '正在检查...';
+  if (store.updateState.status === 'downloading') return `下载中 (${store.updateState.downloadProgress}%)`;
+  if (store.updateState.status === 'downloaded') return '立即安装更新';
+  if (store.updateState.status === 'available') return `更新至 v${store.updateState.latestVersion}`;
+  return '检查更新';
+});
+
+function handleAboutUpdateClick() {
+  if (store.updateState.status === 'downloaded') {
+    store.handleInstallClick();
+  } else if (store.updateState.status === 'available') {
+    store.openUpdateModal();
+  } else {
+    store.checkUpdate(true);
+  }
 }
 
 // ------------------------------------------------------------------

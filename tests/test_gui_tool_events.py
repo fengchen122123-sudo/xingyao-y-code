@@ -4,7 +4,11 @@ import threading
 import pytest
 
 from core.turn_events import TurnEventFactory
-from gui_bridge import ApiBridge, _session_from_turn_id
+from gui_bridge import (
+    ApiBridge,
+    _ensure_session_model_binding,
+    _session_from_turn_id,
+)
 
 
 def make_events(items):
@@ -16,6 +20,63 @@ def test_session_from_turn_id_uses_the_prefix_before_the_last_separator():
     assert _session_from_turn_id("session-a:turn-123") == "session-a"
     assert _session_from_turn_id("renamed:session:turn-123") == "renamed:session"
     assert _session_from_turn_id("") == ""
+
+
+def test_session_is_created_before_model_binding_and_unchanged_binding_skips_update():
+    """首回合必须先建 session；第二回合同模型不得重复 UPDATE+commit。"""
+    calls = []
+
+    class Memory:
+        model_id = None
+
+        def ensure_session(self, session_name, workdir=None, source="GUI"):
+            calls.append(("ensure", session_name, workdir, source))
+
+        def get_session_model_id(self, session_name):
+            calls.append(("get", session_name))
+            return self.model_id
+
+        def set_session_model_id(self, session_name, model_id):
+            calls.append(("set", session_name, model_id))
+            self.model_id = model_id
+
+    memory = Memory()
+    _ensure_session_model_binding(memory, "session-a", "m1", "GLOBAL")
+    _ensure_session_model_binding(memory, "session-a", "m1", "GLOBAL")
+
+    assert calls == [
+        ("ensure", "session-a", "GLOBAL", "GUI"),
+        ("get", "session-a"),
+        ("set", "session-a", "m1"),
+        ("ensure", "session-a", "GLOBAL", "GUI"),
+        ("get", "session-a"),
+    ]
+
+
+def test_worker_model_snapshot_does_not_overwrite_newer_session_binding():
+    """worker 的旧模型 A 不得覆盖用户并发切换后已经落库的 B。"""
+    calls = []
+
+    class Memory:
+        model_id = "model-B"
+
+        def ensure_session(self, session_name, workdir=None, source="GUI"):
+            calls.append(("ensure", session_name))
+
+        def get_session_model_id(self, session_name):
+            calls.append(("get", session_name))
+            return self.model_id
+
+        def set_session_model_id(self, session_name, model_id):
+            calls.append(("set", session_name, model_id))
+            self.model_id = model_id
+
+    memory = Memory()
+
+    _ensure_session_model_binding(memory, "session-a", "model-A", "GLOBAL")
+
+    assert memory.model_id == "model-B"
+    assert calls == [("ensure", "session-a"), ("get", "session-a")]
 
 
 def start_payload(tool_id):
@@ -124,12 +185,14 @@ def test_bridge_emits_one_start_for_empty_tool_id(monkeypatch):
     assert starts[0]["id"] == ""
 
 
-def test_bridge_forwards_diff_tool_call_id(monkeypatch):
+def test_bridge_forwards_diff_binding_and_full_counts(monkeypatch):
     events = make_events([
         ("diff_ready", {
             "tool_call_id": "edit-1",
             "file_path": "a.py",
             "diff_text": "--- a.py\n+++ a.py\n-old\n+new",
+            "added": 120,
+            "removed": 45,
         }),
         ("turn_finished", {}),
     ])
@@ -138,6 +201,8 @@ def test_bridge_forwards_diff_tool_call_id(monkeypatch):
 
     diff = next(data for kind, data in emitted if kind == "diff_ready")
     assert diff["tool_call_id"] == "edit-1"
+    assert diff["added"] == 120
+    assert diff["removed"] == 45
 
 
 def test_bridge_error_then_turn_error_has_single_message_owner(monkeypatch):
@@ -172,7 +237,7 @@ def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch):
     bridge.emit_event = lambda kind, data: emitted.append((kind, data))
     monkeypatch.setattr(
         "gui_bridge.get_active_model",
-        lambda: (_ for _ in ()).throw(RuntimeError("provider disconnected")),
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("provider disconnected")),
     )
 
     bridge._run_turn_worker("hello", "session")
@@ -202,7 +267,7 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     bridge._bg_summary_lock = threading.Lock()
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
-    bridge._sync_active_model_context = lambda: None
+    bridge._sync_active_model_context = lambda *_args: None
     bridge._session_workdir = lambda _session_name: str(project)
     bridge._set_current_session = lambda _session_name: None
     bridge._subagent_progress_poller = lambda _session_name, _stop: None
@@ -210,13 +275,15 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     bridge._maybe_auto_rename = lambda _session_name: None
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
+        "get_session_model_id": lambda self, *args: None,
+        "set_session_model_id": lambda self, *args: None,
         "add_message": lambda self, *args, **kwargs: None,
         "set_workdir": lambda self, workdir: None,
     })()
     bridge.emit_event = lambda _kind, _data: None
     seen = {}
 
-    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda *_args: {
         "litellm_model": "model",
         "api_key": "key",
         "base_url": None,
@@ -256,20 +323,22 @@ def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(
     bridge._bg_summary_lock = threading.Lock()
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
-    bridge._sync_active_model_context = lambda: None
+    bridge._sync_active_model_context = lambda *_args: None
     bridge._session_workdir = lambda _session_name: "GLOBAL"
     bridge._subagent_progress_poller = lambda _session_name, _stop: None
     bridge._consume_turn_events = lambda *args, **kwargs: False
     bridge._maybe_auto_rename = lambda _session_name: "检查项目"
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
+        "get_session_model_id": lambda self, *args: None,
+        "set_session_model_id": lambda self, *args: None,
         "add_message": lambda self, *args, **kwargs: None,
         "set_workdir": lambda self, workdir: None,
     })()
     emitted = []
     bridge.emit_event = lambda kind, data: emitted.append((kind, data))
 
-    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda *_args: {
         "litellm_model": "model",
         "api_key": "key",
         "base_url": None,
@@ -338,7 +407,7 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     bridge._bg_summary_lock = threading.Lock()
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
-    bridge._sync_active_model_context = lambda: None
+    bridge._sync_active_model_context = lambda *_args: None
     bridge._session_workdir = lambda session_name: "."
     bridge._set_current_session = lambda session_name: None
     bridge._subagent_progress_poller = lambda session_name, stop: None
@@ -346,6 +415,8 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     bridge._memory = type("Memory", (), {
         "set_workdir": lambda self, workdir: None,
         "ensure_session": lambda self, *args, **kwargs: None,
+        "get_session_model_id": lambda self, *args: None,
+        "set_session_model_id": lambda self, *args: None,
         "add_message": lambda self, *args, **kwargs: None,
     })()
     emitted = []
@@ -356,7 +427,7 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
         yield factory.emit("turn_error", {"message": yielded_message})
         raise RuntimeError(raised_message)
 
-    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda *_args: {
         "litellm_model": "model",
         "api_key": "key",
         "base_url": None,
@@ -488,12 +559,14 @@ def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch):
     bridge._bg_summary_lock = threading.Lock()
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
-    bridge._sync_active_model_context = lambda: None
+    bridge._sync_active_model_context = lambda *_args: None
     bridge._session_workdir = lambda _session_name: "GLOBAL"
     bridge._subagent_progress_poller = lambda _s, _stop: None
     bridge._maybe_auto_rename = lambda _s: None
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *a, **k: None,
+        "get_session_model_id": lambda self, *a: None,
+        "set_session_model_id": lambda self, *a: None,
         "add_message": lambda self, *a, **k: None,
         "set_workdir": lambda self, workdir: None,
     })()
@@ -512,7 +585,7 @@ def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch):
         "gui_bridge.permission_broker.cancel_owner",
         lambda owner: cancelled_owners.append(owner),
     )
-    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda *_args: {
         "litellm_model": "model",
         "api_key": "key",
         "base_url": None,

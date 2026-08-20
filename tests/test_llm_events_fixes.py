@@ -1,6 +1,8 @@
 """回归测试：代码审查修复的关键 bug（压缩重绑定、thinking 双发、turn_error 等）。"""
 
 import json
+import os
+import pathlib
 import threading
 from types import SimpleNamespace
 
@@ -807,6 +809,179 @@ def test_sandbox_guard_toggle_on_still_asks_credential_writes(tmp_path, monkeypa
         assert cm is None
         assert err is not None
     assert len(asked) == 2
+
+
+def test_sandbox_guard_uses_configured_ycode_data_dir_for_credentials(monkeypatch):
+    """YCODE_DATA_DIR 是真实数据根；其中普通数据放行，顶层配置写入仍询问。"""
+    import config
+    import core.llm as llm_mod
+    import core.model_manager as mm
+
+    data_dir = pathlib.Path(config.YCODE_DIR)
+    monkeypatch.setattr(mm, "load_config", lambda: {"allow_outside_workspace": True})
+    monkeypatch.setattr(llm_mod, "is_outside_workspace", lambda _path: True)
+    asked = []
+    monkeypatch.setattr(
+        llm_mod,
+        "check_permission_and_ask",
+        lambda *args, **kwargs: asked.append(args) or False,
+    )
+
+    for function_name, target in (
+        ("read_file", data_dir / "sessions" / "s1.jsonl"),
+        ("write_file", data_dir / "ycode.db"),
+        ("write_file", data_dir / "memory" / "note.md"),
+    ):
+        bypass, error = llm_mod._sandbox_outside_guard(
+            function_name, str(target), None, "owner", "turn", "主代理", None
+        )
+        assert error is None
+        assert bypass is not None
+    assert asked == []
+
+    bypass, error = llm_mod._sandbox_outside_guard(
+        "write_file",
+        str(data_dir / "config.json"),
+        None,
+        "owner",
+        "turn",
+        "主代理",
+        None,
+    )
+    assert bypass is None
+    assert error is not None
+    assert len(asked) == 1
+
+
+def test_sandbox_guard_credential_classification_failure_is_fail_closed(
+    monkeypatch,
+):
+    import core.llm as llm_mod
+    import core.memory_kairos as mk
+    import core.model_manager as mm
+
+    monkeypatch.setattr(llm_mod, "is_outside_workspace", lambda _path: True)
+    monkeypatch.setattr(mm, "load_config", lambda: {"allow_outside_workspace": True})
+    monkeypatch.setattr(
+        mk,
+        "is_ycode_data_path",
+        lambda _path: (_ for _ in ()).throw(RuntimeError("classification failed")),
+    )
+    asked = []
+    monkeypatch.setattr(
+        llm_mod,
+        "check_permission_and_ask",
+        lambda *args, **kwargs: asked.append(args) or True,
+    )
+
+    bypass, error = llm_mod._sandbox_outside_guard(
+        "write_file",
+        str(mk.YCODE_DIR / "config.json"),
+        None,
+        "owner",
+        "turn",
+        "主代理",
+        None,
+    )
+
+    assert bypass is None
+    assert error is not None and "无法验证路径" in error
+    assert asked == []
+
+
+def test_sandbox_guard_tail_dot_credential_still_requires_confirmation(
+    tmp_path, monkeypatch
+):
+    import core.llm as llm_mod
+    import core.memory_kairos as mk
+    import core.model_manager as mm
+
+    ycode_dir = tmp_path / ".ycode"
+    ycode_dir.mkdir()
+    monkeypatch.setattr(mk, "YCODE_DIR", ycode_dir)
+    monkeypatch.setattr(mm, "load_config", lambda: {"allow_outside_workspace": True})
+    asked = []
+    monkeypatch.setattr(
+        llm_mod,
+        "check_permission_and_ask",
+        lambda *args, **kwargs: asked.append(args) or False,
+    )
+
+    bypass, error = llm_mod._sandbox_outside_guard(
+        "write_file",
+        str(ycode_dir / "config.json") + ".",
+        None,
+        "owner",
+        "turn",
+        "主代理",
+        None,
+    )
+
+    assert bypass is None
+    assert error is not None
+    assert len(asked) == 1
+
+
+def test_sandbox_guard_plugin_config_is_not_a_top_level_credential(
+    tmp_path, monkeypatch
+):
+    import core.llm as llm_mod
+    import core.memory_kairos as mk
+
+    ycode_dir = tmp_path / ".ycode"
+    plugin_config = ycode_dir / "plugins" / "x" / "config.json"
+    plugin_config.parent.mkdir(parents=True)
+    monkeypatch.setattr(mk, "YCODE_DIR", ycode_dir)
+    asked = []
+    monkeypatch.setattr(
+        llm_mod,
+        "check_permission_and_ask",
+        lambda *args, **kwargs: asked.append(args) or False,
+    )
+
+    bypass, error = llm_mod._sandbox_outside_guard(
+        "write_file", str(plugin_config), None, "owner", "turn", "主代理", None
+    )
+
+    assert error is None
+    assert bypass is not None
+    assert asked == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows 8.3 short paths only")
+def test_sandbox_guard_short_name_credential_requires_confirmation(
+    tmp_path, monkeypatch
+):
+    import ctypes
+    import core.llm as llm_mod
+    import core.memory_kairos as mk
+    import core.model_manager as mm
+
+    ycode_dir = tmp_path / ".ycode"
+    ycode_dir.mkdir()
+    target = ycode_dir / "config.json"
+    target.write_text("{}", encoding="utf-8")
+    buffer = ctypes.create_unicode_buffer(32768)
+    result = ctypes.windll.kernel32.GetShortPathNameW(str(target), buffer, len(buffer))
+    if not result or "~" not in buffer.value:
+        pytest.skip("此卷未提供 8.3 短文件名")
+
+    monkeypatch.setattr(mk, "YCODE_DIR", ycode_dir)
+    monkeypatch.setattr(mm, "load_config", lambda: {"allow_outside_workspace": True})
+    asked = []
+    monkeypatch.setattr(
+        llm_mod,
+        "check_permission_and_ask",
+        lambda *args, **kwargs: asked.append(args) or False,
+    )
+
+    bypass, error = llm_mod._sandbox_outside_guard(
+        "write_file", buffer.value, None, "owner", "turn", "主代理", None
+    )
+
+    assert bypass is None
+    assert error is not None
+    assert len(asked) == 1
 
 
 @pytest.mark.parametrize(

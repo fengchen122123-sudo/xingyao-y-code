@@ -2,40 +2,36 @@
   <div id="sidebar" :class="{ collapsed: store.sidebarCollapsed }">
     <div class="side-menu">
       <div class="menu-item" @click="store.createSessionSmart()">
-        <span class="mi-ico"><AppIcon name="pencil" :size="15" /></span>
+        <span class="mi-ico">✎</span>
         <span class="mi-label">新会话</span>
         <span class="mi-count">{{ store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</span>
-        <span class="mi-arrow"><AppIcon name="plus" :size="13" /></span>
+        <span class="mi-arrow">＋</span>
       </div>
       <div class="menu-item" @click="store.openSubpage('skills')">
-        <span class="mi-ico"><AppIcon name="gem" :size="15" /></span>
+        <span class="mi-ico">❖</span>
         <span class="mi-label">技能 Skills</span>
         <span class="mi-count">{{ store.skills.length }}</span>
-        <span class="mi-arrow"><AppIcon name="chevron-right" :size="13" /></span>
+        <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="store.openSubpage('mcp')">
-        <span class="mi-ico"><AppIcon name="blocks" :size="15" /></span>
+        <span class="mi-ico">⧉</span>
         <span class="mi-label">MCP 服务</span>
         <span class="mi-count">{{ connectedMcpCount }} / {{ store.mcps.length }} 在线</span>
-        <span class="mi-arrow"><AppIcon name="chevron-right" :size="13" /></span>
+        <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="store.openSubpage('plugins')">
-        <span class="mi-ico"><AppIcon name="hexagon" :size="15" /></span>
+        <span class="mi-ico">⬡</span>
         <span class="mi-label">插件</span>
         <span class="mi-count">{{ enabledPluginCount }} / {{ store.plugins.length }}</span>
-        <span class="mi-arrow"><AppIcon name="chevron-right" :size="13" /></span>
+        <span class="mi-arrow">›</span>
       </div>
     </div>
 
     <div class="side-section">
       项目会话
       <span>
-        <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()">
-          <AppIcon name="folder-plus" :size="14" />
-        </button>
-        <button class="add-btn" title="新建自由通用对话(跳出文件夹)" @click="store.createGlobalSession()">
-          <AppIcon name="message-square-plus" :size="14" />
-        </button>
+        <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()">▣</button>
+        <button class="add-btn" title="新建自由通用对话(跳出文件夹)" @click="store.createGlobalSession()">＋</button>
       </span>
     </div>
 
@@ -71,7 +67,7 @@
               class="g-del"
               title="删除此项目分组及组内对话"
               @click.stop="askDeleteGroup(group.folder_path)"
-            ><AppIcon name="x" :size="12" /></button>
+            >✕</button>
             <button
               v-if="!group.is_global && group.folder_path !== 'GLOBAL' && confirmDeleteGroupPath === group.folder_path"
               class="g-confirm"

@@ -2200,7 +2200,10 @@ SubagentRunner = Callable[[SubagentTask], str]
 _BACKGROUND_NOTIFICATION_TTL_SECONDS = 600
 
 
-def _snapshot_model_config(prefer_secondary: bool = True) -> tuple | None:
+def _snapshot_model_config(
+    prefer_secondary: bool = True,
+    session_name: str | None = None,
+) -> tuple | None:
     """启动时快照当前模型配置，避免子代理运行途中用户切换模型/密钥导致配置混用。
 
     若 config.json 中配置了 secondary_model_id 且 prefer_secondary=True（默认），
@@ -2222,11 +2225,26 @@ def _snapshot_model_config(prefer_secondary: bool = True) -> tuple | None:
             )
     except Exception:
         pass
-    return _active_model_tuple_or_none()
+    return _active_model_tuple_or_none(session_name)
 
 
-def _active_model_tuple_or_none():
-    """从运行时上下文取当前激活模型 (model, key, url)；取不到时读 config.json 兜底。"""
+def _active_model_tuple_or_none(session_name: str | None = None):
+    """按会话取主模型 tuple；无会话调用方保留 CLI 全局兼容语义。"""
+    if session_name:
+        try:
+            from core.model_manager import get_active_model
+
+            active = get_active_model(session_name)
+            if active:
+                return (
+                    active.get("litellm_model"),
+                    active.get("api_key"),
+                    active.get("base_url"),
+                )
+        except Exception:
+            return None
+        # 显式会话路径到此即终止：无模型时不得读取进程级最后写入者。
+        return None
     try:
         import core.app_context as app_context
         current = app_context.get_active_model_tuple()
@@ -2337,7 +2355,7 @@ class SubagentManager:
         if not description:
             raise ValueError("task_description must not be empty")
         if model_config is None and self._uses_default_runner:
-            model_config = _snapshot_model_config()
+            model_config = _snapshot_model_config(session_name=parent_session)
 
         # 加载自定义子 agent 配置：subagent_type 非内置 5 种时尝试从注册中心获取
         # 容错：加载失败回退到 None（_run_default_subagent 会按内置 general 处理）
@@ -3024,7 +3042,7 @@ class SubagentManager:
             except Exception:
                 current_model, current_key, current_url = _fallback_model()
         elif model_pref == "inherit":
-            inherited = _active_model_tuple_or_none()
+            inherited = _active_model_tuple_or_none(task.parent_session)
             if inherited:
                 current_model, current_key, current_url = inherited
             else:

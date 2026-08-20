@@ -609,6 +609,27 @@ def test_get_session_token_baseline_falls_back_to_estimate(stub_llm):
     assert baseline > history_only
 
 
+def test_get_session_token_baseline_discards_real_usage_from_other_model(
+    stub_llm, monkeypatch
+):
+    """切到分词更贵的模型时，旧模型的小 real 不能压低新模型估算。"""
+    import core.agent_service as agent_service
+
+    manager = _make_manager()
+    manager.add_token_usage(
+        "openai", "old-model", 80, 20, 0, 100, session_id="s1"
+    )
+    monkeypatch.setattr(
+        agent_service,
+        "estimate_history_tokens_with_system",
+        lambda _model, _history: 900,
+    )
+
+    assert agent_service.get_session_token_baseline(
+        manager, "s1", "openai/new-model", history=[]
+    ) == 900
+
+
 # ---------------------------------------------------------------------------
 # 四级水位线阶梯（0.60 snip / 0.80 elide / 0.95 LLM 摘要）
 # ---------------------------------------------------------------------------
