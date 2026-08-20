@@ -3,11 +3,11 @@ ycode_uninstall.py
 Y-code 官方 Windows 卸载向导（经典 Windows 安装程序样式 GUI，与安装向导一致）。
 
 会清理完整版 (GUI + 可选 CLI) 或独立 CLI 安装留下的全部痕迹：
-  - 桌面快捷方式 (Y-code.lnk / Y-code CLI.lnk，都尝试删除)
+  - 桌面快捷方式 (Y-code.lnk / Y-code CLI.lnk / 旧版 Y-code TUI.lnk，都尝试删除)
   - HKCU\\Environment\\PATH（user 范围）或系统 PATH（machine 范围）里的安装目录
-  - HKCU/HKLM\\...\\Uninstall 下的注册表项 (Y-code / Y-code-CLI)
+  - HKCU/HKLM\\...\\Uninstall 下的注册表项 (Y-code / Y-code-CLI / 旧版 Y-code-TUI)
   - 可选：~/.ycode 用户配置与会话记录
-  - 安装目录本身 (Y-code.exe / ycode.exe / _internal/ / cli/ 子目录)
+  - 安装目录本身 (Y-code.exe / ycode.exe / _internal/ / cli/ 及旧版 tui/ 子目录)
 
 安装范围 (scope) 与安装向导一侧的约定一致：
   user    → 当前用户安装：HKCU 卸载项 / 用户 PATH / 个人桌面快捷方式
@@ -116,7 +116,7 @@ def _registry_marker_matches(install_dir):
     InstallLocation 与本目录一致且标记为 Y-code 时返回 True，供 High-1 校验
     作为 version.txt 之外的第二归属证据。任何读取失败都返回 False。"""
     target = os.path.normcase(os.path.normpath(install_dir))
-    for key_name in ("Y-code", "Y-code-CLI"):
+    for key_name in ("Y-code", "Y-code-CLI", "Y-code-TUI"):
         key_path = (rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{key_name}")
         for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
             try:
@@ -131,10 +131,11 @@ def _registry_marker_matches(install_dir):
     return False
 
 
-# 卸载注册表项（完整版入口 + 独立 CLI 入口，都尝试移除）
-UNINSTALL_KEY_NAMES = ("Y-code", "Y-code-CLI")
-# 桌面快捷方式（GUI 版 + CLI 版，都尝试删除）
-SHORTCUT_NAMES = ("Y-code.lnk", "Y-code CLI.lnk")
+# 卸载注册表项（完整版入口 + 独立 CLI 入口 + 旧版 TUI 命名兼容清理，都尝试移除；
+# "Y-code-TUI" 是兼容旧版安装的历史数据，不属于代码中的界面命名）
+UNINSTALL_KEY_NAMES = ("Y-code", "Y-code-CLI", "Y-code-TUI")
+# 桌面快捷方式（GUI 版 + CLI 版 + 旧版 TUI 命名兼容清理）
+SHORTCUT_NAMES = ("Y-code.lnk", "Y-code CLI.lnk", "Y-code TUI.lnk")
 
 
 # ============================================================================
@@ -356,7 +357,9 @@ def run_uninstall(install_dir, scope="user", delete_config=False,
                 log(f"✔ 已成功删除: {rel_file}")
             except Exception as e:
                 log(f"⚠️ 删除 {rel_file} 失败: {e}")
-    for rel_dir in ("_internal", "cli"):
+    for rel_dir in ("_internal", "cli", "tui"):
+        # tui 为旧版 CLI 变体安装残留目录：不清理会导致自销毁脚本的
+        # 非递归 Directory.Delete 失败，整个安装目录都删不掉
         target_dir = os.path.join(install_dir, rel_dir)
         if os.path.isdir(target_dir):
             try:

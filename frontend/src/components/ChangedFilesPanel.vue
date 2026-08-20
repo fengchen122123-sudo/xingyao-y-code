@@ -103,8 +103,16 @@ function toggleExpand(path: string) {
 async function openFile(path: string) {
   const api = window.pywebview && window.pywebview.api;
   if (!api || !path) return;
+  // diff 的 file_path 是工具参数原始值（模型常给相对路径），后端 open_path 按
+  // GUI 进程 CWD 解析相对路径——多会话下进程 CWD 不随会话变，校验必然失败。
+  // 在前端按当前会话工作目录拼出绝对路径再交给后端
+  let target = path;
+  const isAbsolute = /^[a-zA-Z]:[\\/]/.test(path) || path.startsWith('\\\\') || path.startsWith('/');
+  if (!isAbsolute && store.workdir) {
+    target = store.workdir.replace(/[\\/]+$/, '') + '\\' + path.replace(/^[\\/]+/, '');
+  }
   try {
-    const res = await api.open_path(path);
+    const res = await api.open_path(target);
     if (res && res.ok === false && res.msg) {
       store.notifyModal('打开失败', res.msg);
     }

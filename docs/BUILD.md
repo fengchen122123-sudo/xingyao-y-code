@@ -145,7 +145,7 @@ venv\Scripts\python build_release.py
 
 卸载向导是同款经典样式的图形化向导（欢迎 → 卸载选项 → 卸载中 → 完成），会清理：
 桌面快捷方式（GUI 版 + CLI 版）、PATH 环境变量里的安装路径、
-注册表里的卸载入口（`Y-code` 与 `Y-code-CLI`（含旧版 `Y-code-CLI`）都会尝试清理）、
+注册表里的卸载入口（`Y-code` 与 `Y-code-CLI`，含旧版 `Y-code-TUI` 命名兼容清理）、
 可选的 `~/.ycode` 用户配置与会话记录（卸载选项页复选框，默认保留），最后自我删除并
 清空整个安装目录。
 

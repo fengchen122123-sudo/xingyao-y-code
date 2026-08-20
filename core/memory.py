@@ -585,7 +585,6 @@ class MemoryManager:
                     "ON cache_request_diagnostics(ts)"
                 )
                 # 保存修改
-                # 保存修改
                 self.conn.commit()
             except Exception:
                 # DDL 失败时回滚，避免遗留未提交事务阻塞后续写操作
