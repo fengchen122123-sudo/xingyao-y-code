@@ -125,6 +125,95 @@ def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
     assert events[0][1]["file_path"] == str(target)
     assert "-old" in events[0][1]["diff_text"]
     assert "+new" in events[0][1]["diff_text"]
+    assert events[0][1]["added"] == 1
+    assert events[0][1]["removed"] == 1
+
+
+def test_large_diff_keeps_full_counts_when_display_is_truncated(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "large.txt"
+    events = []
+    content = "".join(f"line-{index}\n" for index in range(60))
+    monkeypatch.setattr(llm, "check_permission_and_ask", lambda *_args, **_kwargs: True)
+
+    _call(
+        "write_file",
+        {"file_path": str(target), "content": content},
+        event_callback=lambda kind, payload: events.append((kind, payload)),
+    )
+
+    diff = next(payload for kind, payload in events if kind == "diff_ready")
+    assert "... (省略" in diff["diff_text"]
+    assert diff["added"] == 60
+    assert diff["removed"] == 0
+
+
+@pytest.mark.parametrize("allow_outside", [False, True])
+def test_credential_write_prompts_through_full_pipeline_even_when_sandbox_open(
+    tmp_path, monkeypatch, allow_outside
+):
+    import core.harness.tool_adapters as tool_adapters
+    import core.memory_kairos as memory_kairos
+    import core.model_manager as model_manager
+
+    ycode_dir = tmp_path / ".ycode"
+    ycode_dir.mkdir()
+    target = ycode_dir / "config.json"
+    original_expanduser = tool_adapters.os.path.expanduser
+    monkeypatch.setattr(memory_kairos, "YCODE_DIR", ycode_dir)
+    monkeypatch.setattr(
+        tool_adapters.os.path,
+        "expanduser",
+        lambda path: str(ycode_dir) if str(path) == "~/.ycode" else original_expanduser(path),
+    )
+    monkeypatch.setattr(llm, "is_outside_workspace", lambda _path: True)
+    monkeypatch.setattr(
+        model_manager,
+        "load_config",
+        lambda: {"allow_outside_workspace": allow_outside},
+    )
+    prompts = []
+    monkeypatch.setattr(
+        llm,
+        "check_permission_and_ask",
+        lambda function_name, *args, **kwargs: prompts.append(function_name) or True,
+    )
+
+    result = _call("write_file", {"file_path": str(target), "content": "{}\n"})
+
+    assert result["content"].startswith("已成功将内容写入文件")
+    assert target.read_text(encoding="utf-8") == "{}\n"
+    assert prompts.count("sandbox_outside_access") == 1
+
+
+def test_plugin_subdirectory_config_is_not_treated_as_top_level_credential(
+    tmp_path, monkeypatch
+):
+    import core.harness.tool_adapters as tool_adapters
+    import core.memory_kairos as memory_kairos
+
+    ycode_dir = tmp_path / ".ycode"
+    target = ycode_dir / "plugins" / "x" / "config.json"
+    target.parent.mkdir(parents=True)
+    original_expanduser = tool_adapters.os.path.expanduser
+    monkeypatch.setattr(memory_kairos, "YCODE_DIR", ycode_dir)
+    monkeypatch.setattr(
+        tool_adapters.os.path,
+        "expanduser",
+        lambda path: str(ycode_dir) if str(path) == "~/.ycode" else original_expanduser(path),
+    )
+    monkeypatch.setattr(llm, "is_outside_workspace", lambda _path: True)
+    prompts = []
+    monkeypatch.setattr(
+        llm,
+        "check_permission_and_ask",
+        lambda function_name, *args, **kwargs: prompts.append(function_name) or True,
+    )
+
+    result = _call("write_file", {"file_path": str(target), "content": "plugin\n"})
+
+    assert result["content"].startswith("已成功将内容写入文件")
+    assert "sandbox_outside_access" not in prompts
 
 
 def test_edit_file_missing_target_returns_exact_message(tmp_path, monkeypatch):

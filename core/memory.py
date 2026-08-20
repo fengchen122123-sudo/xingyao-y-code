@@ -1039,7 +1039,8 @@ class MemoryManager:
         """
         with self._lock:
             cursor = self.conn.execute(
-                "SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens "
+                "SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens, "
+                "provider, model "
                 "FROM token_usage WHERE session_id = ? "
                 "AND cache_scope IN ('main', 'legacy') "
                 "ORDER BY id DESC LIMIT 1",
@@ -1048,11 +1049,14 @@ class MemoryManager:
             row = cursor.fetchone()
         if not row:
             return None
+        provider = str(row[4] or "").strip()
+        model = str(row[5] or "").strip()
         return {
             "prompt_tokens": int(row[0] or 0),
             "completion_tokens": int(row[1] or 0),
             "total_tokens": int(row[2] or 0),
             "cached_tokens": None if row[3] is None else int(row[3]),
+            "model_name": f"{provider}/{model}" if provider else model,
         }
 
     def query_token_usage_by_model(self, start_date, end_date):

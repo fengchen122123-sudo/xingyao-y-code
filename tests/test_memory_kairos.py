@@ -1,6 +1,7 @@
 import json
 
 import core.memory_kairos as mk
+from core.workspace_context import workspace_scope
 
 
 class _FakeMessage:
@@ -16,6 +17,22 @@ class _FakeChoice:
 class _FakeResponse:
     def __init__(self, content):
         self.choices = [_FakeChoice(content)]
+
+
+def test_ycode_relative_path_uses_thread_workdir_not_process_cwd(
+    tmp_path, monkeypatch
+):
+    """并行回合的相对路径必须跟随线程 workdir，不能落到进程 cwd。"""
+    process_dir = tmp_path / "process"
+    session_dir = tmp_path / "session"
+    process_dir.mkdir()
+    (session_dir / ".ycode").mkdir(parents=True)
+    monkeypatch.chdir(process_dir)
+    monkeypatch.setattr(mk, "YCODE_DIR", session_dir / ".ycode")
+
+    with workspace_scope(session_dir):
+        assert mk.is_ycode_data_path(".ycode/config.json") is True
+        assert mk.is_ycode_data_path("../process/config.json") is False
 
 
 def _run_dream_with_actions(tmp_path, monkeypatch, actions):

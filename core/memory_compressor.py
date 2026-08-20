@@ -15,7 +15,11 @@ _compressing_sessions = set()
 
 # tiktoken 编码器惰性加载状态：idle → loading → ready / failed
 # ready 前（含等待超时）所有 token 估算走 CJK 感知的字符兜底
-_encoding_state = {"status": "idle", "enc": None}
+_encoding_state = {"status": "idle", "enc": None, "failed_at": None}
+_encoding_lock = threading.Lock()
+ENCODING_RETRY_COOLDOWN_SECONDS = 300.0
+
+TRUNCATION_SUFFIX = "\n...[该条消息过长，中段已截断]..."
 
 # 默认配置：在压缩收益与额度消耗之间取平衡
 DEFAULT_RETAIN_COUNT = 8
@@ -25,6 +29,8 @@ DEFAULT_TOOL_RESULT_PREVIEW_LIMIT_CHARS = 800
 DEFAULT_TOOL_RESULT_TOKEN_LIMIT = 600      # 近似 token 上限（优先于字符阈值）
 DEFAULT_SUMMARY_LENGTH_FIRST = 250
 DEFAULT_SUMMARY_LENGTH_MERGE = 350
+COMPRESSION_CHUNK_WINDOW_RATIO = 0.25
+COMPRESSION_TIMEOUT_TOKENS_PER_SECOND = 1500
 
 
 def _load_compression_config():
@@ -72,31 +78,81 @@ def _get_encoding(timeout=10.0):
     import time as _time
 
     state = _encoding_state
-    if state["status"] == "ready":
-        return state["enc"]
-    if state["status"] in ("loading", "failed"):
-        # loading：并发调用或上次等待超时——线程仍在后台跑，成功后自动就绪。
-        # 等待逻辑只走首次触发路径，避免每个调用方都阻塞一遍。
-        if state["status"] == "failed":
+    now = _time.monotonic()
+    with _encoding_lock:
+        status = state["status"]
+        if status == "ready":
+            return state["enc"]
+        if status == "loading":
+            # 已有唯一加载线程在跑；并发调用不重复等待或再次下载。
             return None
-        return state["enc"]
-
-    state["status"] = "loading"
+        if status == "failed":
+            failed_at = state.get("failed_at")
+            if (
+                failed_at is not None
+                and now - float(failed_at) < ENCODING_RETRY_COOLDOWN_SECONDS
+            ):
+                return None
+        state["status"] = "loading"
+        state["enc"] = None
+        state["failed_at"] = None
 
     def _load():
         try:
             import tiktoken
             enc = tiktoken.get_encoding("cl100k_base")
-            state["enc"] = enc
-            state["status"] = "ready"
+            with _encoding_lock:
+                state["enc"] = enc
+                state["status"] = "ready"
+                state["failed_at"] = None
         except Exception:
-            state["status"] = "failed"
+            with _encoding_lock:
+                state["enc"] = None
+                state["status"] = "failed"
+                state["failed_at"] = _time.monotonic()
 
     threading.Thread(target=_load, daemon=True, name="ycode-tiktoken-load").start()
     deadline = _time.monotonic() + timeout
     while _time.monotonic() < deadline and state["status"] == "loading":
         _time.sleep(0.05)
     return state["enc"] if state["status"] == "ready" else None
+
+
+def _compression_chunk_budget(context_window):
+    """压缩正文预算：窗口的 25%，极小窗口也至少保留 512 token。"""
+    return max(512, int(int(context_window) * COMPRESSION_CHUNK_WINDOW_RATIO))
+
+
+def _compression_request_timeout(prompt_tokens):
+    """按本段实际 prompt token 放大超时，并与主请求共用上下限。"""
+    from core.llm import API_REQUEST_MAX_TIMEOUT_SECONDS, API_REQUEST_TIMEOUT_SECONDS
+
+    estimated_tokens = max(0, int(prompt_tokens or 0))
+    return min(
+        API_REQUEST_MAX_TIMEOUT_SECONDS,
+        API_REQUEST_TIMEOUT_SECONDS
+        + estimated_tokens // COMPRESSION_TIMEOUT_TOKENS_PER_SECOND,
+    )
+
+
+def _truncate_to_token_budget(content, token_budget):
+    """截断单条超长正文，并保证截断标记也计入 token 预算。"""
+    token_count = _estimate_tokens(content)
+    if token_count <= token_budget:
+        return content, token_count
+    suffix_tokens = _estimate_tokens(TRUNCATION_SUFFIX)
+    prefix_budget = int(token_budget) - suffix_tokens
+    if prefix_budget < 0:
+        raise ValueError("token budget is smaller than the truncation suffix")
+    lo, hi = 0, len(content)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _estimate_tokens(content[:mid]) <= prefix_budget:
+            lo = mid
+        else:
+            hi = mid - 1
+    truncated = content[:lo] + TRUNCATION_SUFFIX
+    return truncated, _estimate_tokens(truncated)
 
 
 def _estimate_tokens(text):
@@ -352,9 +408,9 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         # 历史一次性塞进单个 prompt 会在长会话下超过压缩模型窗口
         # （如 88 万 token 历史 vs 26 万窗口），压缩请求本身超窗失败并反复重试。
         # 按窗口的安全预算切成多段，逐段与累积摘要合并，全部完成后一次性写库。
-        # 预算取窗口 40%：其余留给指令、累积摘要、输出与估算偏差
-        # （tiktoken 对非 OpenAI 分词器的估算普遍偏低，必须留足余量）。
-        chunk_token_budget = max(2000, int(compress_window * 0.4))
+        # 预算取窗口 25%：其余留给指令、累积摘要、输出、Provider 处理延迟
+        # 与估算偏差（tiktoken 对非 OpenAI 分词器的估算普遍偏低）。
+        chunk_token_budget = _compression_chunk_budget(compress_window)
 
         chunks = []
         current_chunk = []
@@ -364,16 +420,9 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             if token_count > chunk_token_budget:
                 # 单条消息即超预算（如超长助手文本）：按 token 截断而非按字符，
                 # 中文 1 字符 ≈ 1~1.5 token，按字符截会严重超窗
-                # 二分查找：找到不超过预算的最大前缀
-                lo, hi = 0, len(content)
-                while lo < hi:
-                    mid = (lo + hi + 1) // 2
-                    if _estimate_tokens(content[:mid]) <= chunk_token_budget:
-                        lo = mid
-                    else:
-                        hi = mid - 1
-                content = content[:lo] + "\n...[该条消息过长，中段已截断]..."
-                token_count = chunk_token_budget
+                content, token_count = _truncate_to_token_budget(
+                    content, chunk_token_budget
+                )
             if current_chunk and current_tokens + token_count > chunk_token_budget:
                 chunks.append(current_chunk)
                 current_chunk, current_tokens = [], 0
@@ -388,20 +437,27 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
 
         new_summary = old_summary
         for chunk_index, chunk in enumerate(chunks):
-            if total_chunks > 1:
-                emit(f"\n<ansigray>🧠 历史过长，分 {total_chunks} 段压缩中（第 {chunk_index + 1}/{total_chunks} 段）...</ansigray>")
             chat_log = "".join(f"{role_display}: {content}\n" for role_display, content in chunk)
             summary_limit = config["summary_length_merge"] if new_summary else config["summary_length_first"]
             prompt = _build_summary_prompt(new_summary, chat_log, summary_limit)
+            prompt_tokens = _estimate_tokens(prompt)
+            request_timeout = _compression_request_timeout(prompt_tokens)
+            if total_chunks > 1:
+                emit(
+                    "\n<ansigray>🧠 历史过长，分 "
+                    f"{total_chunks} 段压缩中（第 {chunk_index + 1}/{total_chunks} 段，"
+                    f"模型 {compress_model}，约 {prompt_tokens // 1000}k token，"
+                    f"超时 {request_timeout} 秒）...</ansigray>"
+                )
 
             request_kwargs = {
                 "model": compress_model,
                 "api_key": compress_key,
                 "api_base": compress_url,
                 "messages": [{"role": "user", "content": prompt}],
-                # 分段后单次载荷仍可能有数万 token，15s 对总结请求经常不够；
-                # 提高到 60s 与正常对话请求的量级对齐
-                "timeout": 60,
+                # 分段载荷仍可能有数万 token，按实际 prompt 大小放大超时；
+                # 固定 60 秒会让 64K～100K token 的摘要请求稳定超时。
+                "timeout": request_timeout,
             }
             request_kwargs.update(_provider_cache_affinity_options(
                 compress_model,

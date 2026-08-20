@@ -48,6 +48,12 @@ from core.permission_broker import permission_broker
 from core.skills import get_active_skill_ids, save_active_skill_ids, scan_all_skills
 from core.task_manager import kill_background_task, list_active_tasks
 from core.version import __version__ as YCODE_VERSION
+from core.updater import (
+    cleanup_old_installers,
+    fetch_latest_release,
+    updater_downloader,
+    launch_installer_and_cleanup,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,9 +69,16 @@ def _strip_ansi_markup(text) -> str:
 
 
 def _session_from_turn_id(turn_id: str) -> str:
-    """从 session:turn 复合 ID 提取会话名，不依赖可变的当前会话。"""
     value = str(turn_id or "")
     return value.rsplit(":", 1)[0] if ":" in value else ""
+
+
+def _ensure_session_model_binding(memory, session_name: str, model_id, workdir: str) -> None:
+    """先创建会话，仅初始化空绑定；已有值可能是用户刚做的新选择。"""
+    memory.ensure_session(session_name, workdir=workdir, source="GUI")
+    normalized_model_id = str(model_id or "").strip() or None
+    if memory.get_session_model_id(session_name) is None and normalized_model_id is not None:
+        memory.set_session_model_id(session_name, normalized_model_id)
 
 # MCP 单例：import 失败（如未安装 mcp 依赖）不能拖垮整个 GUI
 try:
@@ -336,6 +349,13 @@ class ApiBridge:
             set_task_finished_callback(self._on_background_task_finished)
         except Exception:
             logger.warning("注册后台命令任务完成回调失败", exc_info=True)
+
+        # 启动时后台清理历史残留安装包与临时文件
+        threading.Thread(
+            target=cleanup_old_installers,
+            daemon=True,
+            name="gui-update-cleaner",
+        ).start()
 
     # ------------------------------------------------------------------
     # 基础设施：窗口、事件推送
@@ -640,6 +660,85 @@ class ApiBridge:
         except Exception as e:
             logger.exception("解析更新日志失败")
             return {"ok": False, "entries": [], "msg": str(e)}
+
+    def check_update(self, manual: bool = False) -> Dict[str, Any]:
+        """检查 Gitee Releases 是否有新版本。"""
+        try:
+            return fetch_latest_release()
+        except Exception as e:
+            logger.exception("检查更新失败")
+            return {"ok": False, "has_update": False, "msg": f"检查更新失败: {e}"}
+
+    def download_update(self, download_url: str, target_version: str) -> Dict[str, Any]:
+        """开启后台线程流式下载安装包，并通过 JS 事件实时广播进度。"""
+        try:
+            def _on_progress(data):
+                self.emit_event("update_download_progress", data)
+
+            def _on_complete(dest_path):
+                self.emit_event("update_download_complete", {"installer_path": dest_path})
+
+            def _on_error(err_msg):
+                self.emit_event("update_download_error", {"message": err_msg})
+
+            started = updater_downloader.start_download(
+                download_url=download_url,
+                target_version=target_version,
+                on_progress=_on_progress,
+                on_complete=_on_complete,
+                on_error=_on_error,
+            )
+            return {"ok": started, "msg": "下载已开始" if started else "已有下载任务在进行中"}
+        except Exception as e:
+            logger.exception("启动下载异常")
+            return {"ok": False, "msg": str(e)}
+
+    def cancel_download_update(self) -> Dict[str, Any]:
+        """取消当前安装包下载。"""
+        try:
+            updater_downloader.cancel()
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def has_active_tasks(self) -> Dict[str, Any]:
+        """查询当前是否有对话/后台任务正在执行（安装门禁判定）。"""
+        try:
+            has_turns = self.has_active_turns()
+            active_tasks = list_active_tasks()
+            busy = has_turns or bool(active_tasks)
+            return {
+                "ok": True,
+                "busy": busy,
+                "has_turns": has_turns,
+                "active_task_count": len(active_tasks),
+            }
+        except Exception as e:
+            return {"ok": True, "busy": False, "msg": str(e)}
+
+    def launch_installer(self, file_path: str) -> Dict[str, Any]:
+        """唤起外部安装向导并安全退出当前程序（带安装后自清理）。"""
+        try:
+            ok = launch_installer_and_cleanup(file_path)
+            if ok:
+                threading.Thread(target=self._delayed_exit, daemon=True).start()
+                return {"ok": True}
+            return {"ok": False, "msg": "唤起安装包失败"}
+        except Exception as e:
+            logger.exception("唤起安装包异常")
+            return {"ok": False, "msg": str(e)}
+
+    def _delayed_exit(self):
+        """延迟退出，确保 JS Promise 正常返回。"""
+        time.sleep(0.5)
+        try:
+            self.shutdown()
+            if self._window is not None:
+                self._window.destroy()
+        except Exception:
+            pass
+        finally:
+            os._exit(0)
 
     def _sync_active_model_context(self, session_name: str | None = None):
         """把当前激活模型同步给 app_context，供 core 层（子代理等）读取。
@@ -1895,9 +1994,11 @@ class ApiBridge:
             api_key = active_model.get("api_key", "")
             api_base = active_model.get("base_url", "")
             ctx_win = active_model.get("context_window", 128000)
-            # 把本回合实际使用的模型写回会话级绑定：首次从全局默认进入该会话时
-            # 自动落库，后续切换会话即可恢复该模型，不随全局配置漂移
-            self._memory.set_session_model_id(session_name, active_model.get("id"))
+            # 首轮必须先创建会话再写模型绑定；后续模型未变化时不重复写库。
+            session_workdir = pending_workdir or self._session_workdir(session_name)
+            _ensure_session_model_binding(
+                self._memory, session_name, active_model.get("id"), session_workdir
+            )
             # 显式传会话名：此刻线程 TLS 尚未绑定本会话（set_thread_session 在
             # 下文才调用），不传会把全局模型同步给子代理继承链
             self._sync_active_model_context(session_name)
@@ -1905,7 +2006,7 @@ class ApiBridge:
             # 会话归属目录是每一轮 Agent 的权威工作目录。待发送项目会话虽然
             # 已把 workdir 透传到这里，但进程 cwd 仍可能停在启动目录或上一会话；
             # 必须在解析附件、组装运行上下文和执行任何工具前完成绑定。
-            turn_workdir = pending_workdir or self._session_workdir(session_name)
+            turn_workdir = session_workdir
             if turn_workdir == "GLOBAL":
                 # 自由对话无具体项目目录，线程本地 workdir 兜底进程 cwd
                 turn_workdir = _resolve_real_path(os.getcwd())
@@ -1928,8 +2029,7 @@ class ApiBridge:
             from core.plan import set_current_plan_session
             set_current_plan_session(session_name)
 
-            # 确保会话存在，再解析用户输入（支持 @文件 / 图片挂载）并入库
-            self._memory.ensure_session(session_name, workdir=turn_workdir, source="GUI")
+            # 会话已在模型绑定阶段创建；此处直接解析用户输入并入库。
             try:
                 from core.input_parser import parse_user_input
                 if internal_kind:
@@ -2389,6 +2489,8 @@ class ApiBridge:
                     "tool_call_id": str(data.get("tool_call_id") or ""),
                     "file_path": str(data.get("file_path") or ""),
                     "diff_text": str(data.get("diff_text") or data.get("text") or ""),
+                    "added": data.get("added"),
+                    "removed": data.get("removed"),
                     "session_name": session_name,
                 })
             elif kind in ("plan_updated", "plan_change"):
