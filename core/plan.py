@@ -40,7 +40,7 @@ _PLAN_AUTO_CONTINUE_LOCK = threading.Lock()
 
 
 def suppress_plan_auto_continue(session_id: str) -> None:
-    """标记某会话的计划自动续推被用户取消抑制（GUI stop / TUI Ctrl+C 调用）。"""
+    """标记某会话的计划自动续推被用户取消抑制（GUI stop / CLI Ctrl+C 调用）。"""
     if not session_id:
         return
     with _PLAN_AUTO_CONTINUE_LOCK:
@@ -422,7 +422,7 @@ _DEFAULT_PLAN_MANAGER = PlanManager()
 # ---------------------------------------------------------------------------
 # 多会话并行：按会话实例化的计划管理器注册表 + 线程本地路由
 # ---------------------------------------------------------------------------
-# 进程级单例 _DEFAULT_PLAN_MANAGER 只服务未绑定线程（TUI 主流程 / 测试主线程），
+# 进程级单例 _DEFAULT_PLAN_MANAGER 只服务未绑定线程（CLI 主流程 / 测试主线程），
 # 语义与单会话时代完全一致（bind_default_plan_session 就地重绑）。
 # GUI 回合线程 / 子代理线程通过 set_current_plan_session 绑定自己的会话，
 # get_default_plan_manager 按线程路由到该会话专属的 PlanManager 实例：

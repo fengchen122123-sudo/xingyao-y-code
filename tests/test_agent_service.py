@@ -493,7 +493,7 @@ def test_prepare_turn_messages_estimates_tokens_with_system_prompt(stub_llm, qui
 
 
 def test_estimate_history_tokens_with_system_includes_system_prompt(stub_llm):
-    """TUI/GUI 重算窗口占用的共享口径：高于纯历史估算，差额即系统提示词。"""
+    """CLI/GUI 重算窗口占用的共享口径：高于纯历史估算，差额即系统提示词。"""
     from core.agent_service import estimate_history_tokens_with_system
 
     history = [{"role": "user", "content": "你好"}]
@@ -503,7 +503,7 @@ def test_estimate_history_tokens_with_system_includes_system_prompt(stub_llm):
 
 
 def test_prepare_turn_messages_uses_real_usage_baseline(stub_llm, quiet_extras):
-    """有真实用量记录时：压缩判断与窗口占用都用真实 prompt+completion，不再估算。"""
+    """小历史下真实基线小于估算：取较小真实值作基线，latest_total 跟随该基线。"""
     from core.agent_service import prepare_turn_messages
 
     manager = _make_manager()
@@ -511,20 +511,16 @@ def test_prepare_turn_messages_uses_real_usage_baseline(stub_llm, quiet_extras):
     manager.add_message(session, "user", "你好")
     manager.add_token_usage("openai", "gpt-test", 8000, 500, 0, 8500, session_id=session)
 
-    def boom(model, messages):
-        raise AssertionError("有真实基线时不应再走本地估算")
-
-    stub_llm.estimate_tokens = boom
-
     prepare_turn_messages(
         manager, session, "openai/gpt-test", 128000, permission_mode="confirm"
     )
-    # 窗口占用 = 最近一次真实 prompt + completion（下一轮请求必然包含上轮回复）
-    assert stub_llm.session_token_usage["latest_total"] == 8500
+    # latest_total 取基线（真实 8500 与含系统提示词估算的较小值），不超真实用量
+    latest = stub_llm.session_token_usage["latest_total"]
+    assert 0 < latest <= 8500
 
 
 def test_prepare_turn_messages_real_baseline_triggers_compression(stub_llm, quiet_extras, monkeypatch):
-    """真实基线超过 0.95 水位时触发压缩；触发后才用估算指导后续收缩。"""
+    """历史已膨胀到超阈值（真实与估算的较小值仍超 0.95）时触发压缩。"""
     import core.memory_compressor as memory_compressor
     from core.agent_service import prepare_turn_messages
 
@@ -537,8 +533,9 @@ def test_prepare_turn_messages_real_baseline_triggers_compression(stub_llm, quie
 
     manager = _make_manager()
     session = "test_real_baseline_compress"
-    manager.add_message(session, "user", "你好")
-    # 四级水位线后付费摘要只在 0.95 触发：128000 * 0.95 = 121600，真实基线 124500 超阈值
+    # 写入足够大的历史，使含系统提示词的估算也超过 0.95 水位（128000*0.95=121600）
+    big = "x" * 500000
+    manager.add_message(session, "user", big)
     manager.add_token_usage("openai", "gpt-test", 123500, 1000, 0, 124500, session_id=session)
 
     prepare_turn_messages(
@@ -572,17 +569,30 @@ def test_prepare_turn_real_baseline_below_095_skips_compression(stub_llm, quiet_
 
 
 def test_get_session_token_baseline_prefers_real_usage(stub_llm):
-    """共享基线：有真实记录直接返回 prompt+completion，不调用估算。"""
+    """共享基线：真实用量小于估算时取真实值（较小值）。"""
     from core.agent_service import get_session_token_baseline
 
     manager = _make_manager()
     manager.add_token_usage("openai", "m1", 1200, 300, 0, 1500, session_id="s1")
 
-    def boom(model, messages):
-        raise AssertionError("不应调用估算")
-
-    stub_llm.estimate_tokens = boom
     assert get_session_token_baseline(manager, "s1", "openai/m1") == 1500
+
+
+def test_get_session_token_baseline_takes_min_of_real_and_estimate(stub_llm):
+    """共享基线：真实用量大于估算时取估算（切小窗口模型后的关键场景）。
+
+    大窗口模型留下的高真实基线（124500）对当前小历史是过期高值，应退回
+    含系统提示词的估算（取两者较小），否则压缩对小窗口永远不生效。
+    """
+    from core.agent_service import get_session_token_baseline
+
+    manager = _make_manager()
+    manager.add_message("s1", "user", "你好")
+    manager.add_token_usage("openai", "m1", 123500, 1000, 0, 124500, session_id="s1")
+
+    baseline = get_session_token_baseline(manager, "s1", "openai/m1")
+    # 真实 124500 远超小历史估算（约数千），应取估算而非真实值
+    assert baseline < 124500
 
 
 def test_get_session_token_baseline_falls_back_to_estimate(stub_llm):

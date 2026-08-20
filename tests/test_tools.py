@@ -1398,6 +1398,67 @@ def test_file_tools_allow_outside_workspace_when_sandbox_off(tmp_path, monkeypat
     assert "note.txt" in list_directory(str(outside))
 
 
+def test_relative_paths_resolve_against_thread_workdir(tmp_path, monkeypatch):
+    """回归：相对路径（含目录工具默认 "."）必须按线程本地 workdir 解析。
+
+    GUI 多会话并行时进程 cwd 可能停在安装目录；若相对路径按进程 cwd
+    解析，沙盒守卫会把项目根内的相对路径误判为"工作目录之外"——开关
+    打开时静默放行到错误目录，开关关闭时误弹权限询问。
+    """
+    from core.workspace_context import workspace_scope
+    from core.tools import _resolve_workspace_path, is_outside_workspace
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "note.txt").write_text("内容", encoding="utf-8")
+
+    # 进程 cwd 故意停在 workdir 之外（模拟打包版 GUI：cwd=安装目录）
+    monkeypatch.chdir(tmp_path)
+
+    with workspace_scope(str(workspace)):
+        assert is_outside_workspace("note.txt") is False
+        assert is_outside_workspace(".") is False
+        assert is_outside_workspace("../outside.txt") is True
+        assert _resolve_workspace_path("note.txt") == (workspace / "note.txt").resolve()
+        assert read_file("note.txt").rstrip("\n") == "内容"
+
+
+def test_ycode_dir_reads_allowed_under_sandbox_restriction(tmp_path, monkeypatch):
+    """回归：沙盒限制开启时，~/.ycode 全目录读取（含凭据文件）必须可用。
+
+    覆盖 @附件挂载与 read_file 的免 bypass 直读路径（allow_trusted_read）；
+    写入路径不走该豁免，凭据写入仍由沙盒守卫逐次询问。
+    """
+    import core.memory_kairos as mk
+    from core.tools import _resolve_workspace_path
+    from core.workspace_context import workspace_scope
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    ycode_dir = tmp_path / ".ycode"
+    (ycode_dir / "memory").mkdir(parents=True)
+    (ycode_dir / "memory" / "MEMORY.md").write_text("记忆", encoding="utf-8")
+    (ycode_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(mk, "YCODE_DIR", ycode_dir)
+    monkeypatch.chdir(workspace)
+
+    with workspace_scope(str(workspace)):
+        # 读取（含凭据文件）：沙盒限制下也直接解析成功
+        for rel in ("memory/MEMORY.md", "config.json"):
+            resolved = _resolve_workspace_path(str(ycode_dir / rel), allow_trusted_read=True)
+            assert resolved == (ycode_dir / rel).resolve()
+
+        # 写入语义（不传 allow_trusted_read）：.ycode 仍视为沙盒外，
+        # 必须走守卫询问（此处断言边界校验会拒绝裸写入）
+        try:
+            _resolve_workspace_path(str(ycode_dir / "config.json"))
+            raised = False
+        except ValueError:
+            raised = True
+        assert raised, "沙盒限制下裸写入 .ycode 路径应被边界校验拒绝"
+
+
 def test_ycode_and_agents_files_are_not_trusted_read_paths(tmp_path, monkeypatch):
     """Only configured Skill packages may bypass the workspace sandbox for reads."""
     import core.skills as skills_mod

@@ -57,7 +57,7 @@ def test_context_builder_always_selects_dedicated_network_tools():
 
 
 def test_main_uses_metadata_only_skill_catalog():
-    # 轮次上下文组装已下沉到 core/agent_service.py（TUI 与 GUI 共用），
+    # 轮次上下文组装已下沉到 core/agent_service.py（CLI 与 GUI 共用），
     # 技能目录必须仍然是"仅元数据"版本，不能整篇注入技能正文。
     main_source = Path("main.py").read_text(encoding="utf-8")
     agent_service_source = Path("core/agent_service.py").read_text(encoding="utf-8")

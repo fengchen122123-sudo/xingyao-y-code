@@ -313,12 +313,12 @@ def test_check_session_reset_keeps_bound_session_grants(tmp_path):
     run_in_session("sess-running", workdir, _grant_and_park, results, "bound")
     assert results["bound"] == ("ok", True)
 
-    # 未绑定线程（TUI 单会话语义）保留旧语义：切会话即收回
+    # 未绑定线程（CLI 单会话语义）保留旧语义：切会话即收回
     # （单元素规则是精确规则：只有裸命令 "ls" 命中）
-    app_context._current_session_fallback = "tui-sess-1"
+    app_context._current_session_fallback = "cli-sess-1"
     llm._grant_command_add(("ls",))
     assert llm._grant_command_hit("ls") is True
-    app_context._current_session_fallback = "tui-sess-2"
+    app_context._current_session_fallback = "cli-sess-2"
     llm.check_session_reset()
     assert llm._grant_command_hit("ls") is False
 
@@ -476,7 +476,7 @@ def test_skills_relative_paths_follow_thread_workdir(tmp_path):
 
 
 def test_unbound_thread_falls_back_to_default_singletons(tmp_path):
-    """未绑定线程（TUI 主流程 / headless）走进程级默认单例，行为不回归。"""
+    """未绑定线程（CLI 主流程 / headless）走进程级默认单例，行为不回归。"""
     import core.llm as llm
     from core import tools as tools_module
 

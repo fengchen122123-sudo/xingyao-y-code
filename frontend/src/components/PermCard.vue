@@ -22,6 +22,21 @@
         <span class="pc-choice-letter">{{ String.fromCharCode(65 + i) }}</span>
         <span class="pc-choice-text">{{ opt }}</span>
       </button>
+      <!-- 第四项：自定义回答输入框，选项都不合适时直接输入告诉星瑶 -->
+      <div class="pc-choice pc-custom">
+        <span class="pc-choice-letter">{{ String.fromCharCode(65 + store.permRequest.options.length) }}</span>
+        <input
+          v-model="customAnswer"
+          class="pc-custom-input"
+          placeholder="以上都不合适？输入你的回答..."
+          @keydown.enter.prevent="submitCustom"
+        >
+        <button
+          class="pc-custom-btn"
+          :disabled="!customAnswer.trim()"
+          @click="submitCustom"
+        ><AppIcon name="send" :size="14" /></button>
+      </div>
     </div>
     <!-- 标准权限请求：允许一次 / 总是允许 / 拒绝 -->
     <div v-else class="pc-foot">
@@ -37,9 +52,19 @@
 </template>
 
 <script setup lang="ts">
+import { ref } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 const store = useAppStore();
+
+// ask_user 第四项：自定义回答（选项都不合适时直接输入告诉星瑶）
+const customAnswer = ref('');
+function submitCustom() {
+  const text = customAnswer.value.trim();
+  if (!text) return;
+  customAnswer.value = '';
+  store.respondPermissionChoice(-1, text);
+}
 </script>
 
 <style scoped>
@@ -170,5 +195,47 @@ const store = useAppStore();
   min-width: 0;
   white-space: pre-wrap;
   word-break: break-word;
+}
+/* 第四项自定义输入行：沿用选项行视觉，右侧替换为输入框 + 发送按钮 */
+.pc-custom {
+  cursor: default;
+  align-items: center;
+}
+.pc-custom-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font-size: 13px;
+  font-family: inherit;
+  line-height: 1.5;
+  padding: 0;
+}
+.pc-custom-input::placeholder {
+  color: var(--text-faint);
+}
+.pc-custom-btn {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text-dim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.pc-custom-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.pc-custom-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 </style>

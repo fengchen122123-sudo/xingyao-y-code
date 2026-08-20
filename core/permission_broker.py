@@ -100,25 +100,34 @@ class PermissionBroker:
             self._activate_prompt(request)
         return request
 
-    def resolve(self, request_id: str, choice_index: int) -> bool:
+    def resolve(self, request_id: str, choice_index: int, custom_answer: str | None = None) -> bool:
         with self._lock:
             request = self._active
             if request is None or request.request_id != request_id:
                 return False
-            # choice_index 可能是 UI 层透传的任意值：无法解析为整数时与越界索引
-            # 一样按取消处理，绝不让 int() 的 ValueError 击穿持锁路径
-            try:
-                choice_index = int(choice_index)
-            except (TypeError, ValueError):
-                choice_index = CANCELLED_RESULT
-            # 越界索引统一按取消处理，避免调用方 KeyError / 语义不一致
-            if not 0 <= choice_index < len(request.options):
-                choice_index = CANCELLED_RESULT
+            custom: str | None = None
+            if custom_answer is not None and str(custom_answer).strip():
+                # 自由文本回答仅对 ask_user 开放：其余权限请求的选项语义是
+                # 允许/拒绝/始终允许，文本无从映射，按取消兜底避免语义错乱
+                if request.function_name == "ask_user":
+                    custom = str(custom_answer).strip()
+                else:
+                    choice_index = CANCELLED_RESULT
+            else:
+                # choice_index 可能是 UI 层透传的任意值：无法解析为整数时与越界索引
+                # 一样按取消处理，绝不让 int() 的 ValueError 击穿持锁路径
+                try:
+                    choice_index = int(choice_index)
+                except (TypeError, ValueError):
+                    choice_index = CANCELLED_RESULT
+                # 越界索引统一按取消处理，避免调用方 KeyError / 语义不一致
+                if not 0 <= choice_index < len(request.options):
+                    choice_index = CANCELLED_RESULT
             self._active = self._queued.popleft() if self._queued else None
             next_request = self._active
 
         if not request.future.done():
-            request.future.set_result(choice_index)
+            request.future.set_result(custom if custom is not None else choice_index)
         self._show_next(next_request)
         return True
 

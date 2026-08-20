@@ -348,7 +348,7 @@ def test_ui_fragments_are_flushed_to_the_terminal(monkeypatch):
     assert calls == [{"end": "\n", "flush": True}]
 
 
-def test_active_tui_prints_fragments_through_run_in_terminal(monkeypatch):
+def test_active_cli_prints_fragments_through_run_in_terminal(monkeypatch):
     terminal_calls = []
     printed = []
 

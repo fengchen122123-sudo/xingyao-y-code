@@ -73,6 +73,7 @@ PRESET_PROVIDERS = (
             {"name": "deepseek-v4-flash-0731", "context_window": 1000000, "supports_vision": False},
             {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
             {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
+            {"name": "deepseek-v4-pro-0813", "context_window": 1000000, "supports_vision": False},
             {"name": "minimax-m2.5", "context_window": 200000, "supports_vision": False},
             {"name": "minimax-m2.7", "context_window": 200000, "supports_vision": False},
             {"name": "mimo-v2.5-pro", "context_window": 256000, "supports_vision": False},
@@ -137,6 +138,17 @@ PRESET_PROVIDERS = (
         "models": [
             {"name": "step-3.7-flash", "context_window": 256000, "supports_vision": True},
             {"name": "step-router-v1", "context_window": 256000, "supports_vision": False},
+        ],
+    },
+    {
+        "id": "stepfun-anthropic",
+        "name": "阶跃星辰（Anthropic格式）",
+        "base_url": "https://api.stepfun.com/step_plan",
+        "protocol": "anthropic",
+        "models": [
+            {"name": "step-3.7-flash", "context_window": 256000, "supports_vision": True},
+            {"name": "step-router-v1", "context_window": 256000, "supports_vision": False},
+            {"name": "step-explore", "context_window": 1000000, "supports_vision": False},
         ],
     },
     {

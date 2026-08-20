@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { buildMessageGroups, groupHasProcess, groupStats, msgKey } from './turnGroups';
+import {
+  buildMessageGroups,
+  collectFileChanges,
+  countDiffChanges,
+  groupHasProcess,
+  groupStats,
+  msgKey,
+} from './turnGroups';
 import type { ChatMessage } from '../stores/appStore';
 
 function user(text: string): ChatMessage {
@@ -168,5 +175,68 @@ describe('groupStats', () => {
     ])[0];
 
     expect(groupStats(g)).toEqual({ rounds: 3, toolCount: 3 });
+  });
+});
+
+describe('countDiffChanges', () => {
+  it('按 + / - 前缀统计，跳过 +++ / --- 文件头', () => {
+    const diff = [
+      '--- a/x.py',
+      '+++ b/x.py',
+      '@@ -1,3 +1,4 @@',
+      ' ctx',
+      '-old line',
+      '+new line',
+      '+brand new',
+    ].join('\n');
+    expect(countDiffChanges(diff)).toEqual({ added: 2, removed: 1 });
+  });
+
+  it('剥离 ANSI 转义码与 Rich 边框后仍能统计', () => {
+    // Rich 表格/面板渲染后的行：行首带边框 │，内容带 ANSI 颜色码
+    const diff = ['[32m│ +[0m added line │', '[31m│ -[0m removed line │'].join('\n');
+    expect(countDiffChanges(diff)).toEqual({ added: 1, removed: 1 });
+  });});
+
+describe('collectFileChanges', () => {
+  it('收集 mutation 绑定 diff 与 legacy diff，同一文件去重累加行数', () => {
+    const g = buildMessageGroups([
+      user('改文件'),
+      assistant({
+        tool_calls: [
+          { id: 't1', diff: { file_path: 'core/a.py', diff_text: '--- a\n+++ a\n-x\n+y\n+z' } } as any,
+          { id: 't2', diff: { file_path: 'core/a.py', diff_text: '--- a\n+++ a\n-y\n+q' } } as any,
+        ],
+      }),
+      assistant({
+        legacy_diffs: [{ file_path: 'core/b.py', diff_text: '--- b\n+++ b\n-m' } as any],
+      }),
+      assistant({ content: '完成' }),
+    ])[0];
+
+    const changes = collectFileChanges(g);
+    expect(changes).toHaveLength(2);
+    const a = changes.find((c) => c.name === 'a.py')!;
+    expect(a.path).toBe('core/a.py');
+    expect(a.added).toBe(3); // 2 + 1
+    expect(a.removed).toBe(2); // 1 + 1
+    const b = changes.find((c) => c.name === 'b.py')!;
+    expect(b.added).toBe(0);
+    expect(b.removed).toBe(1);
+  });
+
+  it('无文件改动时返回空数组', () => {
+    const g = buildMessageGroups([user('hi'), assistant({ content: 'hello' })])[0];
+    expect(collectFileChanges(g)).toEqual([]);
+  });
+
+  it('Windows 反斜杠路径正确取 basename', () => {
+    const g = buildMessageGroups([
+      user('x'),
+      assistant({ tool_calls: [{ id: 't', diff: { file_path: 'D:\\proj\\core\\tools.py', diff_text: '+a' } } as any] }),
+    ])[0];
+    const c = collectFileChanges(g)[0];
+    expect(c.name).toBe('tools.py');
+    expect(c.added).toBe(1);
   });
 });

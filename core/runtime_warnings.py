@@ -1,4 +1,4 @@
-"""Route host-process warnings to a diagnostic file instead of the TUI."""
+"""Route host-process warnings to a diagnostic file instead of the CLI."""
 
 from __future__ import annotations
 

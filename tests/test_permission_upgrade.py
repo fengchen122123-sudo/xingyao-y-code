@@ -4,7 +4,7 @@
 - accept_edits 第四档模式：工作区内文件编辑自动放行、命令与沙盒外访问仍询问
 - 沙盒外访问第三选项：choice 2 置位会话级放行，后续免询问；切会话收回
 - 「始终允许」项目级持久化：写 permissions.json、模拟重启后仍放行、内联命令不落盘
-- GUI：沙盒开关写配置；权限请求不挂超时定时器（与 TUI 无限等待对齐）、ask_user 仍挂
+- GUI：沙盒开关写配置；权限请求不挂超时定时器（与 CLI 无限等待对齐）、ask_user 仍挂
 """
 
 import threading
@@ -35,7 +35,7 @@ class _FakeApp:
 def interactive_env(monkeypatch):
     """让 check_permission_and_ask 走 broker 路径而非阻塞的 raw input()。"""
     monkeypatch.setattr(llm.app_context, "get_app_instance", lambda: _FakeApp())
-    monkeypatch.setattr(llm.app_context, "get_ui_flavor", lambda: "tui")
+    monkeypatch.setattr(llm.app_context, "get_ui_flavor", lambda: "cli")
     monkeypatch.setattr(llm, "safe_print", lambda *args, **kwargs: None)
     monkeypatch.setattr(llm.app_context, "get_current_session", lambda: "session-test")
 
@@ -168,6 +168,44 @@ def test_check_session_reset_clears_session_sandbox_bypass(
     llm.check_session_reset()  # 切会话收回
 
     assert tools_mod.is_session_sandbox_bypass_enabled() is False
+
+
+def test_canonical_permission_path_resolves_relative_against_workdir(
+    clean_permission_state, monkeypatch, tmp_path
+):
+    """回归：白名单路径规范化必须按线程 workdir 解析相对路径。
+
+    GUI 多会话并行下进程 cwd 不可靠（打包版停在安装目录）；相对路径若按
+    进程 cwd 规范化，「始终允许」的授予键与后续命中键会错位。llm 与
+    permission_store 两处规范化必须保持同语义。
+    """
+    import os
+    from pathlib import Path
+
+    from core import permission_store
+    from core.workspace_context import workspace_scope
+
+    workspace = tmp_path / "project"
+    (workspace / "src").mkdir(parents=True)
+    # 进程 cwd 故意停在 workdir 之外（模拟打包版 GUI：cwd=安装目录）
+    monkeypatch.chdir(tmp_path)
+
+    with workspace_scope(str(workspace)):
+        canonical = llm._canonical_permission_path("src/app.py")
+        assert canonical == permission_store.canonical_file_path("src/app.py")
+        assert canonical == os.path.normcase(str((workspace / "src" / "app.py")))
+
+        # 授予与命中同一规范化：进程 cwd 再漂移也不影响匹配
+        llm._grant_write_add(llm._canonical_permission_path("src/app.py"))
+        assert llm._grant_write_hit(llm._canonical_permission_path("src/app.py"))
+        monkeypatch.chdir(workspace)
+        assert llm._grant_write_hit(llm._canonical_permission_path("src/app.py"))
+
+        # 绝对路径行为与 realpath+normcase 一致
+        abs_path = str(workspace / "src" / "app.py")
+        assert llm._canonical_permission_path(abs_path) == os.path.normcase(
+            str(Path(abs_path).resolve())
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -315,7 +353,7 @@ def _make_request(function_name, options):
 
 
 def test_gui_permission_request_has_no_timeout_timer(monkeypatch):
-    """权限确认与 TUI 一致无限等待：不再挂 300s 自动拒绝定时器。"""
+    """权限确认与 CLI 一致无限等待：不再挂 300s 自动拒绝定时器。"""
     from gui_bridge import _session_from_turn_id  # 确保模块可导入
 
     bridge = _bare_bridge()

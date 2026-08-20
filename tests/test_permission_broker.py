@@ -453,3 +453,61 @@ def test_ask_user_poll_exception_releases_enqueued_request(monkeypatch):
 
     assert raised is True
     assert broker.cancelled == ["child-explode"]
+
+
+def test_ask_user_custom_answer_is_forwarded_as_custom_payload(monkeypatch):
+    """GUI 第四项输入框 / CLI 直接输入：自由文本回答原样透传给模型。"""
+    import json
+    import core.ask_user as ask_user_module
+    import main
+
+    class FakeApp:
+        loop = object()
+
+    activated = []
+    broker = PermissionBroker(activate_prompt=activated.append)
+    monkeypatch.setattr(ask_user_module, "permission_broker", broker, raising=False)
+    monkeypatch.setattr(main, "app_instance", FakeApp())
+    result = {}
+
+    thread = threading.Thread(
+        target=lambda: result.setdefault(
+            "value",
+            ask_user_module.ask_user(
+                "选择方案",
+                ["方案A", "方案B"],
+                owner_id="child-custom",
+                parent_turn_id="turn-custom",
+            ),
+        )
+    )
+    thread.start()
+    deadline = time.monotonic() + 1
+    while not activated and time.monotonic() < deadline:
+        time.sleep(0.001)
+
+    assert broker.resolve(activated[0].request_id, -1, custom_answer="  两个都不要，用方案C ") is True
+    thread.join(timeout=1)
+
+    payload = json.loads(result["value"])
+    assert payload["custom"] is True
+    assert payload["selected"] == "两个都不要，用方案C"
+    assert payload["selected_index"] == -1
+
+
+def test_custom_answer_for_non_ask_user_is_treated_as_cancelled():
+    """权限确认（允许/拒绝类）不开放自由文本：按取消兜底，不产出字符串结果。"""
+    broker = PermissionBroker(activate_prompt=lambda request: None)
+    request = broker.enqueue("execute_command", {"command": "rm -rf"}, "root", "turn-1", "主代理")
+
+    assert broker.resolve(request.request_id, 0, custom_answer="随便说点什么") is True
+    assert request.future.result() == CANCELLED_RESULT
+
+
+def test_resolve_custom_answer_ignores_choice_index(monkeypatch):
+    """自定义回答时 choice_index 不参与语义（前端传 -1 也不按取消处理）。"""
+    broker = PermissionBroker(activate_prompt=lambda request: None)
+    request = broker.enqueue("ask_user", {"question": "选哪个"}, "root", "turn-1", "主代理")
+
+    assert broker.resolve(request.request_id, -1, custom_answer="自定义内容") is True
+    assert request.future.result() == "自定义内容"

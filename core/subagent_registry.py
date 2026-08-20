@@ -49,7 +49,7 @@ _cache = {"fingerprint": None, "subagents": []}
 
 
 def _log_warning(message, *args):
-    """异常诊断写入 runtime warnings 日志，不裸 print 污染 TUI。"""
+    """异常诊断写入 runtime warnings 日志，不裸 print 污染 CLI。"""
     try:
         logging.getLogger("py.warnings").warning(message, *args)
     except Exception:
