@@ -67,6 +67,27 @@ logger = logging.getLogger(__name__)
 # 否则用户会在提示里看到 <ansiyellow> 原文。CLI 路径不经此处，不受影响。
 _ANSI_MARKUP_RE = re.compile(r"</?ansi\w*>")
 _RGB_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+_DWM_COLOR_CAPABILITY_SUPPORTED = "supported"
+_DWM_COLOR_CAPABILITY_UNSUPPORTED = "unsupported"
+_DWM_COLOR_CAPABILITY_PENDING = "pending"
+_DWM_COLOR_CAPABILITY_NOT_APPLICABLE = "not_applicable"
+_DWM_COLOR_CAPABILITY_UNKNOWN = "unknown"
+
+# DwmSetWindowAttribute returns HRESULT. Pre-Win11 builds report custom color
+# attributes 34/35/36 as E_INVALIDARG; E_NOTIMPL and HRESULT_FROM_WIN32(
+# ERROR_NOT_SUPPORTED) are also explicit capability signals. No other failure
+# is treated as unsupported.
+_DWM_UNSUPPORTED_HRESULTS = frozenset({0x80070057, 0x80004001, 0x80070032})
+
+
+def _windows_build_number() -> Optional[int]:
+    if sys.platform != "win32":
+        return None
+    try:
+        return int(sys.getwindowsversion().build)
+    except (AttributeError, OSError, TypeError, ValueError):
+        logger.exception("无法确定 Windows build，不能判定 DWM 自定义颜色能力")
+        return None
 
 
 def _rgb_hex_to_colorref(color: str) -> int:
@@ -402,6 +423,7 @@ class ApiBridge:
         self._js_dropped = 0
         # 标题栏主题延迟重设线程去重引用（每次窗口事件不再各开一个）
         self._reapply_thread: Optional[threading.Thread] = None
+        self._native_titlebar_color_capability = _DWM_COLOR_CAPABILITY_PENDING
 
         # 注册 GUI 运行时上下文 + 权限应答通道
         app_context.register(_GuiContext(self))
@@ -450,6 +472,7 @@ class ApiBridge:
         """设置 PyWebView window 引用"""
         self._window = window
         self._hwnd = 0
+        self._native_titlebar_color_capability = _DWM_COLOR_CAPABILITY_PENDING
         # 首次 DWM 着色直接解析当前活动主题。gui_theme_id 是唯一真值；旧的
         # gui_theme_light 只由仓库迁移逻辑读取，不再单独决定标题栏。
         try:
@@ -658,7 +681,24 @@ class ApiBridge:
         except Exception:
             logger.debug("设置窗口图标失败", exc_info=True)
 
-    def _write_native_titlebar_dwm(self, native_titlebar: Dict[str, Any]) -> bool:
+    @staticmethod
+    def _native_titlebar_write_result(ok: bool, color_capability: str) -> Dict[str, Any]:
+        return {"ok": bool(ok), "color_capability": color_capability}
+
+    @classmethod
+    def _coerce_native_titlebar_write_result(cls, result: Any) -> Dict[str, Any]:
+        """Accept legacy boolean test doubles while production returns capability data."""
+        if isinstance(result, dict) and isinstance(result.get("ok"), bool):
+            return result
+        if isinstance(result, bool):
+            capability = (
+                _DWM_COLOR_CAPABILITY_SUPPORTED
+                if result else _DWM_COLOR_CAPABILITY_UNKNOWN
+            )
+            return cls._native_titlebar_write_result(result, capability)
+        return cls._native_titlebar_write_result(False, _DWM_COLOR_CAPABILITY_UNKNOWN)
+
+    def _write_native_titlebar_dwm(self, native_titlebar: Dict[str, Any]) -> Dict[str, Any]:
         """Write all required DWM attributes; never mutate bridge theme state."""
         try:
             if not isinstance(native_titlebar, dict):
@@ -670,11 +710,16 @@ class ApiBridge:
             text = _rgb_hex_to_colorref(native_titlebar["text"])
             border = _rgb_hex_to_colorref(native_titlebar["border"])
 
-            # Non-Windows has no DWM, and before HWND discovery there is no native
-            # surface to write. The caller may still commit validated pending state;
-            # the existing reapply worker writes it after the HWND appears.
-            if not getattr(self, "_hwnd", 0) or sys.platform != "win32":
-                return True
+            if sys.platform != "win32":
+                return self._native_titlebar_write_result(
+                    True, _DWM_COLOR_CAPABILITY_NOT_APPLICABLE,
+                )
+            # Before HWND discovery there is no native surface. Commit validated
+            # pending state; the existing reapply worker writes it after discovery.
+            if not getattr(self, "_hwnd", 0):
+                return self._native_titlebar_write_result(
+                    True, _DWM_COLOR_CAPABILITY_PENDING,
+                )
 
             dwm = ctypes.windll.dwmapi
             val = ctypes.c_int(1 if mode == "dark" else 0)
@@ -687,34 +732,78 @@ class ApiBridge:
                     break
             if not immersive_applied:
                 logger.error("DWM 沉浸式标题栏属性 20/19 均应用失败")
-                return False
-            # Custom themes require all three colors. A non-zero HRESULT is a
-            # failed transaction, not an ignorable best-effort result.
+                return self._native_titlebar_write_result(
+                    False, _DWM_COLOR_CAPABILITY_UNKNOWN,
+                )
+            color_results = []
             for attr, color in ((35, caption), (36, text), (34, border)):
                 cval = ctypes.c_int(color)
-                if dwm.DwmSetWindowAttribute(
+                result = dwm.DwmSetWindowAttribute(
                     self._hwnd, attr, ctypes.byref(cval), ctypes.sizeof(cval)
-                ) != 0:
-                    logger.error("DWM 标题栏属性 %s 应用失败", attr)
-                    return False
-            return True
+                )
+                normalized = int(result) & 0xFFFFFFFF
+                if result != 0 and normalized not in _DWM_UNSUPPORTED_HRESULTS:
+                    logger.error("DWM 标题栏属性 %s 应用失败: HRESULT=0x%08X", attr, normalized)
+                    return self._native_titlebar_write_result(
+                        False, _DWM_COLOR_CAPABILITY_UNKNOWN,
+                    )
+                color_results.append(normalized)
+            if all(result == 0 for result in color_results):
+                return self._native_titlebar_write_result(
+                    True, _DWM_COLOR_CAPABILITY_SUPPORTED,
+                )
+            if all(result in _DWM_UNSUPPORTED_HRESULTS for result in color_results):
+                build = _windows_build_number()
+                if build is None or build >= 22000:
+                    logger.error(
+                        "支持 DWM 自定义颜色的平台返回不支持 HRESULT: build=%s results=%s",
+                        build, color_results,
+                    )
+                    return self._native_titlebar_write_result(
+                        False, _DWM_COLOR_CAPABILITY_UNKNOWN,
+                    )
+                logger.warning("当前 Windows 不支持 DWM 自定义标题栏颜色，已仅应用明暗模式")
+                return self._native_titlebar_write_result(
+                    True, _DWM_COLOR_CAPABILITY_UNSUPPORTED,
+                )
+            logger.error("DWM 自定义标题栏颜色能力返回不一致: %s", color_results)
+            return self._native_titlebar_write_result(
+                False, _DWM_COLOR_CAPABILITY_UNKNOWN,
+            )
         except Exception:
             logger.debug("设置标题栏主题失败", exc_info=True)
-            return False
+            return self._native_titlebar_write_result(
+                False, _DWM_COLOR_CAPABILITY_UNKNOWN,
+            )
 
     def _apply_native_titlebar_theme(self, native_titlebar: Dict[str, Any]) -> bool:
         """Transactionally apply DWM colors and commit memory only after success."""
         previous = copy.deepcopy(getattr(self, "_native_titlebar", None))
         previous_dark = bool(getattr(self, "_titlebar_dark", True))
+        previous_capability = getattr(
+            self, "_native_titlebar_color_capability", _DWM_COLOR_CAPABILITY_PENDING,
+        )
         candidate = copy.deepcopy(native_titlebar)
-        if not self._write_native_titlebar_dwm(candidate):
-            if previous is not None and not self._write_native_titlebar_dwm(previous):
+        write_result = self._coerce_native_titlebar_write_result(
+            self._write_native_titlebar_dwm(candidate),
+        )
+        if not write_result["ok"]:
+            rollback_result = self._native_titlebar_write_result(
+                True, previous_capability,
+            )
+            if previous is not None:
+                rollback_result = self._coerce_native_titlebar_write_result(
+                    self._write_native_titlebar_dwm(previous),
+                )
+            if not rollback_result["ok"]:
                 logger.error("DWM 标题栏应用失败后的原主题回滚也失败")
             self._native_titlebar = previous
             self._titlebar_dark = previous_dark
+            self._native_titlebar_color_capability = previous_capability
             return False
         self._native_titlebar = candidate
         self._titlebar_dark = candidate["mode"] == "dark"
+        self._native_titlebar_color_capability = write_result["color_capability"]
         return True
 
     def _apply_titlebar_colors(self, native_titlebar: Dict[str, Any]) -> bool:
@@ -728,6 +817,13 @@ class ApiBridge:
             return False
         return self._apply_native_titlebar_theme(native_titlebar)
 
+    def _native_titlebar_capability(self) -> str:
+        return str(getattr(
+            self,
+            "_native_titlebar_color_capability",
+            _DWM_COLOR_CAPABILITY_PENDING,
+        ))
+
     def set_titlebar_theme(self, dark: bool) -> Dict[str, Any]:
         """前端主题切换时同步窗口标题栏明暗，避免深色内容配白色标题栏刺眼。"""
         def operation():
@@ -735,7 +831,10 @@ class ApiBridge:
             theme = get_gui_theme_repository().get_theme(theme_id)
             if not self._apply_titlebar_colors(theme["native_titlebar"]):
                 raise ThemeError("native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败")
-            return {"ok": True}
+            return {
+                "ok": True,
+                "native_titlebar_color_capability": self._native_titlebar_capability(),
+            }
 
         return self._run_gui_theme_operation("set_titlebar_theme", operation, "native_titlebar")
 
@@ -810,6 +909,7 @@ class ApiBridge:
             theme = repository.get_theme(theme_id)
             previous_titlebar = copy.deepcopy(getattr(self, "_native_titlebar", None))
             previous_dark = bool(getattr(self, "_titlebar_dark", True))
+            previous_capability = self._native_titlebar_capability()
             if not self._apply_titlebar_colors(theme["native_titlebar"]):
                 raise ThemeError(
                     "native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败",
@@ -820,7 +920,10 @@ class ApiBridge:
                 rollback_ok = True
                 try:
                     if previous_titlebar is not None:
-                        rollback_ok = self._write_native_titlebar_dwm(previous_titlebar)
+                        rollback_result = self._coerce_native_titlebar_write_result(
+                            self._write_native_titlebar_dwm(previous_titlebar),
+                        )
+                        rollback_ok = rollback_result["ok"]
                 except Exception:
                     rollback_ok = False
                     logger.exception("活动主题持久化失败后的 DWM 回滚发生异常")
@@ -829,6 +932,7 @@ class ApiBridge:
                     # theme so a later frame reapply can heal native DWM state.
                     self._native_titlebar = previous_titlebar
                     self._titlebar_dark = previous_dark
+                    self._native_titlebar_color_capability = previous_capability
                 if not rollback_ok:
                     logger.error("活动主题持久化失败后，原生标题栏 DWM 回滚失败")
                 raise
@@ -838,7 +942,11 @@ class ApiBridge:
             from config import save_config_value
             if not save_config_value("gui_theme_light", active_theme["appearance"] == "light"):
                 logger.warning("写入兼容配置 gui_theme_light 失败")
-            return {"ok": True, "theme": active_theme}
+            return {
+                "ok": True,
+                "theme": active_theme,
+                "native_titlebar_color_capability": self._native_titlebar_capability(),
+            }
 
         return self._run_gui_theme_operation("set_active_gui_theme", operation, "gui_theme_id")
 
@@ -944,7 +1052,10 @@ class ApiBridge:
                 raise ThemeError(
                     "native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败",
                 )
-            return {"ok": True}
+            return {
+                "ok": True,
+                "native_titlebar_color_capability": self._native_titlebar_capability(),
+            }
 
         return self._run_gui_theme_operation(
             "preview_native_titlebar", operation, "native_titlebar",
@@ -957,7 +1068,10 @@ class ApiBridge:
                 raise ThemeError(
                     "native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败",
                 )
-            return {"ok": True}
+            return {
+                "ok": True,
+                "native_titlebar_color_capability": self._native_titlebar_capability(),
+            }
 
         return self._run_gui_theme_operation(
             "restore_native_titlebar", operation, "native_titlebar",
@@ -1402,6 +1516,7 @@ class ApiBridge:
                 "gui_themes": gui_themes,
                 "gui_theme_error": gui_theme_error,
                 "gui_theme_list_error": gui_theme_list_error,
+                "native_titlebar_color_capability": self._native_titlebar_capability(),
                 "version": str(YCODE_VERSION),
             }
         except Exception as e:
@@ -1417,6 +1532,7 @@ class ApiBridge:
                 "gui_themes": gui_themes,
                 "gui_theme_error": gui_theme_error,
                 "gui_theme_list_error": gui_theme_list_error,
+                "native_titlebar_color_capability": self._native_titlebar_capability(),
                 "token_usage": {"used": 0, "window": 0, "cached_pct": 0, "cumulative": 0},
                 "version": str(YCODE_VERSION), "ok": False, "msg": str(e),
             }

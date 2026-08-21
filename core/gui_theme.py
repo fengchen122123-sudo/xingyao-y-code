@@ -11,6 +11,7 @@ import re
 import shutil
 import stat
 import tempfile
+import uuid
 from zipfile import BadZipFile, ZIP_DEFLATED, ZipFile
 from collections.abc import Mapping
 from pathlib import Path, PurePosixPath
@@ -356,8 +357,7 @@ class ThemeRepository:
         manifest = self._manifest_for_copy(source_theme, new_id, new_name)
         destination = self._require_free_destination(new_id)
         staging_dir = self._staging_directory()
-        destination_created = False
-        config_updated = False
+        retired_directory = self.root.parent / f".gui-theme-retired-{theme_id}-{uuid.uuid4().hex}"
         with config._CONFIG_LOCK:
             config_data = self._read_config()
             was_active = config_data.get("gui_theme_id") == theme_id
@@ -365,20 +365,32 @@ class ThemeRepository:
                 shutil.copytree(self.root / theme_id, staging_dir, dirs_exist_ok=True)
                 self._write_manifest(staging_dir / "theme.json", manifest)
                 os.replace(staging_dir, destination)
-                destination_created = True
-                if was_active:
-                    config_data["gui_theme_id"] = new_id
-                    config._atomic_write_json(str(self.config_file), config_data)
-                    config_updated = True
-                shutil.rmtree(self.root / theme_id)
             except Exception:
-                if config_updated:
-                    config_data["gui_theme_id"] = theme_id
-                    config._atomic_write_json(str(self.config_file), config_data)
-                if destination_created:
-                    shutil.rmtree(destination, ignore_errors=True)
                 shutil.rmtree(staging_dir, ignore_errors=True)
                 raise
+            if was_active:
+                # At this point both IDs are complete. An ambiguous config write
+                # may leave either ID active, but both remain valid; never delete
+                # either copy in this failure path.
+                config_data["gui_theme_id"] = new_id
+                config._atomic_write_json(str(self.config_file), config_data)
+            try:
+                # Remove the old user-visible ID atomically. Recursive cleanup is
+                # performed only on a tombstone outside the scanned themes root,
+                # so partial deletion can never corrupt the active theme.
+                os.replace(self.root / theme_id, retired_directory)
+            except OSError as error:
+                raise ThemeError(
+                    "theme_cleanup_failed", "id",
+                    "主题已复制，旧主题目录暂未移入清理区",
+                ) from error
+        try:
+            shutil.rmtree(retired_directory)
+        except OSError as error:
+            raise ThemeError(
+                "theme_cleanup_failed", "id",
+                "主题已重命名，旧主题清理区删除失败",
+            ) from error
         return _merge_theme(BUILTIN_THEMES[manifest["extends"]], manifest)
 
     def import_image(self, theme_id: str, region: str, source: Path) -> str:
