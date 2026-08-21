@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 from unittest.mock import Mock
 from zipfile import ZIP_STORED, ZipFile
 
@@ -39,6 +40,26 @@ def make_repo_with_saved_theme(tmp_path, theme_id):
 def write_image(path, image_format, size):
     Image.new("RGB", size, "#d96b9f").save(path, format=image_format)
     return path
+
+
+def write_noisy_png(path, seed):
+    side = 1800
+    pixels = os.urandom(side * side * 3)
+    Image.frombytes("RGB", (side, side), pixels).save(path, format="PNG")
+    return path
+
+
+def link_directory(link, target):
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except OSError:
+        result = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode:
+            pytest.skip("当前 Windows 环境无法创建目录链接")
 
 
 def test_builtin_dark_is_complete(tmp_path):
@@ -280,7 +301,7 @@ def test_export_and_import_zip_round_trip_referenced_image(tmp_path):
     archive = source_repo.export_zip("rose", tmp_path / "rose.zip")
     with ZipFile(archive) as zf:
         asset_names = [name for name in zf.namelist() if name.startswith("assets/") and name != "assets/"]
-        assert sorted(zf.namelist()) == ["assets/", asset_names[0], "theme.json"]
+        assert sorted(zf.namelist()) == [asset_names[0], "theme.json"]
 
     imported = make_repo(tmp_path / "target").import_zip(archive)
     assert imported["id"] == "rose"
@@ -297,3 +318,104 @@ def test_delete_theme_rejects_active_and_deletes_inactive_theme(tmp_path):
     repo.set_active("builtin.light")
     repo.delete_theme("rose")
     assert not (repo.root / "rose").exists()
+
+
+@pytest.mark.parametrize("entry_name", ["assets/payload.js", "assets/clip.mp4", "assets/animated.gif"])
+def test_import_zip_rejects_unreferenced_asset_entries(tmp_path, entry_name):
+    repo = make_repo(tmp_path)
+    archive = tmp_path / "payload.zip"
+    with ZipFile(archive, "w") as zf:
+        zf.writestr("theme.json", json.dumps(minimal_theme("evil")))
+        zf.writestr(entry_name, b"unreferenced payload")
+    with pytest.raises(ThemeError) as exc:
+        repo.import_zip(archive)
+    assert exc.value.code == "invalid_archive"
+    assert not (repo.root / "evil").exists()
+
+
+def test_import_zip_rejects_referenced_asset_with_unsupported_content(tmp_path):
+    repo = make_repo(tmp_path)
+    archive = tmp_path / "animated.zip"
+    theme = minimal_theme("evil")
+    theme["regions"] = {"workspace": {"image": "assets/animated.gif"}}
+    gif = write_image(tmp_path / "animated.gif", "GIF", (32, 24))
+    with ZipFile(archive, "w") as zf:
+        zf.writestr("theme.json", json.dumps(theme))
+        zf.write(gif, "assets/animated.gif")
+    with pytest.raises(ThemeError) as exc:
+        repo.import_zip(archive)
+    assert exc.value.code == "unsupported_image"
+    assert not (repo.root / "evil").exists()
+
+
+def test_import_image_replaces_unshared_old_asset(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    old_path = repo.import_image(
+        "rose", "workspace", write_image(tmp_path / "old.png", "PNG", (32, 24)),
+    )
+    new_path = repo.import_image(
+        "rose", "workspace", write_image(tmp_path / "new.png", "PNG", (33, 24)),
+    )
+    assert new_path != old_path
+    assert not (repo.root / "rose" / old_path).exists()
+
+
+def test_import_image_rejects_theme_total_over_30_mib(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    for region, seed in zip(("app_header", "sidebar", "workspace"), range(3)):
+        repo.import_image(region=region, theme_id="rose", source=write_noisy_png(tmp_path / f"{seed}.png", seed))
+    with pytest.raises(ThemeError) as exc:
+        repo.import_image(
+            "rose", "composer", write_noisy_png(tmp_path / "next.png", 3),
+        )
+    assert exc.value.code == "theme_too_large"
+    assert repo.get_theme("rose")["regions"]["composer"]["image"] is None
+
+
+@pytest.mark.parametrize("asset_path", ["assets//a.png", "assets/./a.png", "assets/a.png/"])
+def test_manifest_rejects_noncanonical_asset_paths(tmp_path, asset_path):
+    theme = minimal_theme("rose")
+    theme["regions"] = {"workspace": {"image": asset_path}}
+    with pytest.raises(ThemeError) as exc:
+        make_repo(tmp_path).save_theme(theme)
+    assert exc.value.code == "asset_escape"
+
+
+def test_import_zip_rejects_noncanonical_referenced_asset_path(tmp_path):
+    repo = make_repo(tmp_path)
+    archive = tmp_path / "noncanonical.zip"
+    theme = minimal_theme("evil")
+    theme["regions"] = {"workspace": {"image": "assets//background.png"}}
+    image = write_image(tmp_path / "background.png", "PNG", (32, 24))
+    with ZipFile(archive, "w") as zf:
+        zf.writestr("theme.json", json.dumps(theme))
+        zf.write(image, "assets//background.png")
+    with pytest.raises(ThemeError) as exc:
+        repo.import_zip(archive)
+    assert exc.value.code == "asset_escape"
+
+
+def test_import_image_rejects_source_with_symlinked_parent(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    image = write_image(outside / "source.png", "PNG", (32, 24))
+    linked_parent = tmp_path / "linked-parent"
+    link_directory(linked_parent, outside)
+    with pytest.raises(ThemeError) as exc:
+        repo.import_image("rose", "workspace", linked_parent / image.name)
+    assert exc.value.code == "asset_escape"
+
+
+def test_read_asset_rejects_resource_with_symlinked_parent_inside_theme(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    asset_path = repo.import_image(
+        "rose", "workspace", write_image(tmp_path / "source.png", "PNG", (32, 24)),
+    )
+    assets = repo.root / "rose" / "assets"
+    real_assets = repo.root / "rose" / "assets-real"
+    assets.rename(real_assets)
+    link_directory(assets, real_assets)
+    with pytest.raises(ThemeError) as exc:
+        repo.read_asset("rose", asset_path)
+    assert exc.value.code == "asset_escape"
