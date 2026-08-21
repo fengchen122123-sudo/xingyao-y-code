@@ -596,12 +596,24 @@ class ThemeRepository:
     def _assert_no_symlink_components(path: Path, error_path: str) -> None:
         current = Path(path)
         while True:
-            is_junction = getattr(current, "is_junction", lambda: False)
-            if current.is_symlink() or is_junction():
+            if ThemeRepository._is_disallowed_path_link(current):
                 raise ThemeError("asset_escape", error_path, "路径不能包含符号链接")
             if current.parent == current:
                 return
             current = current.parent
+
+    @staticmethod
+    def _is_disallowed_path_link(path: Path) -> bool:
+        try:
+            path_stat = os.lstat(path)
+        except FileNotFoundError:
+            return False
+        if stat.S_ISLNK(path_stat.st_mode):
+            return True
+        if os.name != "nt":
+            return False
+        reparse_point = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x0400)
+        return bool(getattr(path_stat, "st_file_attributes", 0) & reparse_point)
 
     def _theme_directory_size(self, theme_dir: Path) -> int:
         self._assert_no_symlink_components(theme_dir, "assets")

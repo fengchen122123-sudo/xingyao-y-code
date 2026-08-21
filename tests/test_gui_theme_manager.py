@@ -1,5 +1,6 @@
 import json
 import os
+import stat
 import subprocess
 from unittest.mock import Mock
 from zipfile import ZIP_STORED, ZipFile
@@ -60,6 +61,20 @@ def link_directory(link, target):
         )
         if result.returncode:
             pytest.skip("当前 Windows 环境无法创建目录链接")
+
+
+def make_junction(link, target):
+    if os.name != "nt":
+        pytest.skip("junction 仅适用于 Windows")
+    result = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(target)],
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode(errors="replace")
+    attributes = os.lstat(link).st_file_attributes
+    assert attributes & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    assert not link.is_symlink()
 
 
 def test_builtin_dark_is_complete(tmp_path):
@@ -421,26 +436,28 @@ def test_read_asset_rejects_resource_with_symlinked_parent_inside_theme(tmp_path
     assert exc.value.code == "asset_escape"
 
 
-def test_save_theme_rejects_junction_destination_without_external_write(tmp_path):
+def test_save_theme_rejects_junction_destination_without_external_write(tmp_path, monkeypatch):
     repo = make_repo(tmp_path)
     repo.root.mkdir()
     outside = tmp_path / "outside"
     outside.mkdir()
-    link_directory(repo.root / "rose", outside)
+    make_junction(repo.root / "rose", outside)
+    monkeypatch.setattr(type(repo.root), "is_junction", lambda _path: False)
     with pytest.raises(ThemeError) as exc:
         repo.save_theme(minimal_theme("rose"))
     assert exc.value.code == "asset_escape"
     assert not (outside / "theme.json").exists()
 
 
-def test_import_zip_rejects_junction_root_without_external_write(tmp_path):
+def test_import_zip_rejects_junction_root_without_external_write(tmp_path, monkeypatch):
     outside = tmp_path / "outside"
     outside.mkdir()
     config_file = tmp_path / "config.json"
     config_file.write_text("{}", encoding="utf-8")
     root = tmp_path / "gui-themes"
-    link_directory(root, outside)
+    make_junction(root, outside)
     repo = ThemeRepository(root, config_file)
+    monkeypatch.setattr(type(root), "is_junction", lambda _path: False)
     archive = tmp_path / "evil.zip"
     with ZipFile(archive, "w") as zf:
         zf.writestr("theme.json", json.dumps(minimal_theme("evil")))
