@@ -52,6 +52,9 @@ function cloneGuiTheme(theme: GuiTheme): GuiTheme {
 }
 
 function guiThemeFailure(error: unknown, path = 'theme'): GuiThemeFailure {
+  if (error && typeof error === 'object' && 'ok' in error && error.ok === false && 'error' in error) {
+    return guiThemeFailure(error.error, path);
+  }
   if (error && typeof error === 'object' && 'code' in error && 'message' in error) {
     const value = error as { code: unknown; path?: unknown; message: unknown };
     return {
@@ -71,6 +74,19 @@ function guiThemeFailure(error: unknown, path = 'theme'): GuiThemeFailure {
       message: error instanceof Error ? error.message : String(error),
     },
   };
+}
+
+type GuiThemeActionResult = GuiThemeResult<{ theme: GuiTheme }>;
+const guiThemeOperationQueues = new WeakMap<object, Promise<void>>();
+
+function enqueueGuiThemeOperation(
+  store: object,
+  operation: () => Promise<GuiThemeActionResult>,
+): Promise<GuiThemeActionResult> {
+  const previous = guiThemeOperationQueues.get(store) ?? Promise.resolve();
+  const result = previous.then(operation);
+  guiThemeOperationQueues.set(store, result.then(() => undefined, () => undefined));
+  return result;
 }
 
 export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
@@ -595,14 +611,54 @@ export const useAppStore = defineStore('app', {
       this.rightPanelCollapsed = !this.rightPanelCollapsed;
     },
 
-    async _restorePreviousNativeTitlebar(this: any, theme: GuiTheme | null) {
+    async _resyncAuthoritativeGuiTheme(this: any, failure: GuiThemeFailure): Promise<GuiThemeFailure> {
       const api = this._api();
-      if (!api) return;
+      this.guiThemeError = failure.error;
+      if (!api) return failure;
       try {
-        if (theme) await api.preview_native_titlebar(theme.native_titlebar);
-        else await api.restore_native_titlebar();
-      } catch {
-        // 保留调用方的原始错误；原生恢复失败不伪装成成功。
+        const authoritative = await api.get_active_gui_theme();
+        if (!authoritative.ok) {
+          const recoveryFailure = guiThemeFailure({
+            code: 'theme_recovery_failed',
+            path: 'gui_theme_id',
+            message: `${failure.error.message}；重新读取活动主题失败：${authoritative.error.message}`,
+          });
+          this.guiThemeError = recoveryFailure.error;
+          return recoveryFailure;
+        }
+        this.savedGuiTheme = cloneGuiTheme(authoritative.theme);
+        this.guiThemeDraft = cloneGuiTheme(authoritative.theme);
+        this.nativeTitlebarColorCapability = authoritative.native_titlebar_color_capability;
+        return failure;
+      } catch (error) {
+        const recovery = guiThemeFailure(error, 'gui_theme_id');
+        const recoveryFailure = guiThemeFailure({
+          code: 'theme_recovery_failed',
+          path: 'gui_theme_id',
+          message: `${failure.error.message}；重新读取活动主题失败：${recovery.error.message}`,
+        });
+        this.guiThemeError = recoveryFailure.error;
+        return recoveryFailure;
+      }
+    },
+
+    async _restorePreviousNativeTitlebar(
+      this: any,
+      theme: GuiTheme | null,
+    ): Promise<GuiThemeResult> {
+      const api = this._api();
+      if (!api) return this._resyncAuthoritativeGuiTheme(
+        guiThemeFailure(new Error('pywebview API 不可用'), 'native_titlebar'),
+      );
+      try {
+        const result = theme
+          ? await api.preview_native_titlebar(theme.native_titlebar)
+          : await api.restore_native_titlebar();
+        if (!result.ok) return this._resyncAuthoritativeGuiTheme(result);
+        this.nativeTitlebarColorCapability = result.native_titlebar_color_capability;
+        return { ok: true };
+      } catch (error) {
+        return this._resyncAuthoritativeGuiTheme(guiThemeFailure(error, 'native_titlebar'));
       }
     },
 
@@ -636,7 +692,8 @@ export const useAppStore = defineStore('app', {
           if (!result.ok) {
             candidateHandle.dispose();
             this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
-            await this._restorePreviousNativeTitlebar(previousTheme);
+            const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
+            if (!rollback.ok) return rollback;
             return result;
           }
           this.nativeTitlebarColorCapability = result.native_titlebar_color_capability;
@@ -645,7 +702,8 @@ export const useAppStore = defineStore('app', {
           if (!result.ok) {
             candidateHandle.dispose();
             this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
-            await this._restorePreviousNativeTitlebar(previousTheme);
+            const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
+            if (!rollback.ok) return rollback;
             return result;
           }
           this.nativeTitlebarColorCapability = result.native_titlebar_color_capability;
@@ -653,7 +711,8 @@ export const useAppStore = defineStore('app', {
       } catch (error) {
         candidateHandle.dispose();
         this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
-        await this._restorePreviousNativeTitlebar(previousTheme);
+        const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
+        if (!rollback.ok) return rollback;
         return guiThemeFailure(error, 'native_titlebar');
       }
 
@@ -664,21 +723,42 @@ export const useAppStore = defineStore('app', {
       return { ok: true, theme: cloneGuiTheme(theme) };
     },
 
-    async previewGuiTheme(theme: GuiTheme): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+    async _previewGuiTheme(this: any, theme: GuiTheme): Promise<GuiThemeActionResult> {
       const result = await this._applyGuiThemeCandidate(cloneGuiTheme(theme), 'preview');
       if (result.ok) this.guiThemeDraft = cloneGuiTheme(theme);
       return result;
     },
 
-    async cancelGuiThemePreview(): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
-      if (!this.savedGuiTheme) return guiThemeFailure(new Error('没有可恢复的已保存主题'));
-      const saved = cloneGuiTheme(this.savedGuiTheme);
-      const result = await this._applyGuiThemeCandidate(saved, 'restore');
-      if (result.ok) this.guiThemeDraft = cloneGuiTheme(saved);
-      return result;
+    previewGuiTheme(theme: GuiTheme): Promise<GuiThemeActionResult> {
+      const requestedTheme = cloneGuiTheme(theme);
+      return enqueueGuiThemeOperation(this, () => this._previewGuiTheme(requestedTheme));
     },
 
-    async _activateGuiThemeId(this: any, themeId: string): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+    async _cancelGuiThemePreview(this: any): Promise<GuiThemeActionResult> {
+      const api = this._api();
+      if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+      let restored;
+      try {
+        restored = await api.restore_native_titlebar();
+      } catch (error) {
+        return this._resyncAuthoritativeGuiTheme(guiThemeFailure(error, 'native_titlebar'));
+      }
+      if (!restored.ok) return this._resyncAuthoritativeGuiTheme(restored);
+
+      const result = await this._applyGuiThemeCandidate(restored.theme, 'unchanged');
+      if (!result.ok) return this._resyncAuthoritativeGuiTheme(result);
+      this.nativeTitlebarColorCapability = restored.native_titlebar_color_capability;
+      this.savedGuiTheme = cloneGuiTheme(restored.theme);
+      this.guiThemeDraft = cloneGuiTheme(restored.theme);
+      this.guiThemeError = null;
+      return { ok: true, theme: cloneGuiTheme(restored.theme) };
+    },
+
+    cancelGuiThemePreview(): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, () => this._cancelGuiThemePreview());
+    },
+
+    async _activateGuiThemeId(this: any, themeId: string): Promise<GuiThemeActionResult> {
       const api = this._api();
       if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
       const previousSaved = this.savedGuiTheme ? cloneGuiTheme(this.savedGuiTheme) : null;
@@ -693,21 +773,38 @@ export const useAppStore = defineStore('app', {
       const applied = await this._applyGuiThemeCandidate(activated.theme, 'unchanged');
       if (!applied.ok) {
         if (previousSaved && previousSaved.id !== activated.theme.id) {
-          try { await api.set_active_gui_theme(previousSaved.id); } catch { /* 返回原始运行时错误 */ }
+          let rollback;
+          try {
+            rollback = await api.set_active_gui_theme(previousSaved.id);
+          } catch (error) {
+            const cause = guiThemeFailure(error, 'gui_theme_id');
+            return this._resyncAuthoritativeGuiTheme(
+              guiThemeFailure({
+                code: 'theme_rollback_failed',
+                path: 'gui_theme_id',
+                message: `恢复原活动主题失败：${cause.error.message}`,
+              }),
+            );
+          }
+          if (!rollback.ok) return this._resyncAuthoritativeGuiTheme(rollback);
+          this.savedGuiTheme = cloneGuiTheme(rollback.theme);
+          this.nativeTitlebarColorCapability = rollback.native_titlebar_color_capability;
+          return applied;
         }
-        return applied;
+        return this._resyncAuthoritativeGuiTheme(applied);
       }
       this.nativeTitlebarColorCapability = activated.native_titlebar_color_capability;
       this.savedGuiTheme = cloneGuiTheme(activated.theme);
       this.guiThemeDraft = cloneGuiTheme(activated.theme);
+      this.guiThemeError = null;
       return activated;
     },
 
-    async activateGuiTheme(themeId: string): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
-      return this._activateGuiThemeId(themeId);
+    activateGuiTheme(themeId: string): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, () => this._activateGuiThemeId(themeId));
     },
 
-    async saveGuiThemeDraft(): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+    async _saveGuiThemeDraft(this: any): Promise<GuiThemeActionResult> {
       if (!this.guiThemeDraft) return guiThemeFailure(new Error('没有可保存的主题草稿'));
       const api = this._api();
       if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
@@ -722,14 +819,26 @@ export const useAppStore = defineStore('app', {
       return this._activateGuiThemeId(draft.id);
     },
 
-    async resetInvalidGuiTheme(themeId: 'builtin.dark' | 'builtin.light') {
-      const result = await this.activateGuiTheme(themeId);
-      if (result.ok) this.guiThemeError = null;
-      return result;
+    saveGuiThemeDraft(): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, () => this._saveGuiThemeDraft());
     },
 
-    async toggleTheme() {
-      return this.activateGuiTheme(this.themeLight ? 'builtin.dark' : 'builtin.light');
+    resetInvalidGuiTheme(themeId: 'builtin.dark' | 'builtin.light'): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const result = await this._activateGuiThemeId(themeId);
+        if (result.ok) this.guiThemeError = null;
+        return result;
+      });
+    },
+
+    toggleTheme(): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const result = await this._activateGuiThemeId(
+          this.themeLight ? 'builtin.dark' : 'builtin.light',
+        );
+        if (result.ok) this.guiThemeError = null;
+        return result;
+      });
     },
 
     toggleShowThinking() {
@@ -820,7 +929,11 @@ export const useAppStore = defineStore('app', {
         this.guiThemeListError = init.gui_theme_list_error || null;
         this.nativeTitlebarColorCapability = init.native_titlebar_color_capability || 'unknown';
         if (!this.guiThemeError && init.gui_theme) {
-          const applied = await this._applyGuiThemeCandidate(init.gui_theme, 'unchanged');
+          const startupTheme = cloneGuiTheme(init.gui_theme);
+          const applied = await enqueueGuiThemeOperation(
+            this,
+            () => this._applyGuiThemeCandidate(startupTheme, 'unchanged'),
+          );
           if (applied.ok) {
             this.savedGuiTheme = cloneGuiTheme(init.gui_theme);
             this.guiThemeDraft = cloneGuiTheme(init.gui_theme);

@@ -137,9 +137,27 @@ def test_preview_and_restore_titlebar_do_not_change_active_id(monkeypatch):
     apply = Mock(return_value=True)
     monkeypatch.setattr(bridge, "_apply_titlebar_colors", apply)
     assert bridge.preview_native_titlebar(complete_light_theme()["native_titlebar"])["ok"] is True
-    assert bridge.restore_native_titlebar()["ok"] is True
+    restored = bridge.restore_native_titlebar()
+    assert restored["ok"] is True
+    assert restored["theme"] == complete_light_theme()
     assert repo.calls == ["get_active"]
     assert not any(call.startswith("set_active:") for call in repo.calls)
+
+
+def test_get_active_gui_theme_returns_authoritative_theme_without_writing_dwm(monkeypatch):
+    bridge = _bare_bridge()
+    theme = complete_light_theme()
+    repo = RecordingRepo(theme=theme)
+    monkeypatch.setattr(gui_bridge, "get_gui_theme_repository", lambda: repo)
+    apply = Mock(return_value=True)
+    monkeypatch.setattr(bridge, "_apply_titlebar_colors", apply)
+
+    result = bridge.get_active_gui_theme()
+
+    assert result["ok"] is True
+    assert result["theme"] == theme
+    assert repo.calls == ["get_active"]
+    apply.assert_not_called()
 
 
 @pytest.mark.parametrize("color,expected", [
@@ -297,6 +315,7 @@ def test_set_active_rollback_write_failure_still_restores_memory(monkeypatch):
     result = bridge.set_active_gui_theme("rose")
 
     assert result["ok"] is False
+    assert result["error"]["code"] == "native_titlebar_rollback_failed"
     assert bridge._native_titlebar == old_titlebar
     assert bridge._titlebar_dark is True
 
