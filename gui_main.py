@@ -15,6 +15,7 @@ from typing import Optional
 import webview
 from gui_bridge import ApiBridge
 from core.gui_lifecycle import ApplicationLifecycle
+from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 
 logger = logging.getLogger("gui_main")
 # 单实例互斥体句柄的模块级引用：句柄一旦被 GC 回收，Windows 会自动释放
@@ -174,18 +175,29 @@ def get_frontend_url() -> str:
     sys.exit(1)
 
 
-def _initial_theme_light() -> bool:
-    """启动前读取持久化主题（config.json 的 gui_theme_light，True=浅色）。
-
-    pywebview 默认 private_mode=True，WebView2 无痕模式不持久化 localStorage，
-    前端的 localStorage 主题镜像重启后即丢失；主题真值必须随 URL 传给前端，
-    同时同步原生窗口背景色，避免浅色主题用户看到黑色启动页/黑闪。
-    """
+def _initial_gui_theme() -> dict:
+    """Resolve startup appearance/background without rewriting an invalid active id."""
     try:
-        from core.model_manager import load_config
-        return bool(load_config().get("gui_theme_light", False))
-    except Exception:
-        return False
+        theme = get_gui_theme_repository().get_active()
+        return {
+            "appearance": theme["appearance"],
+            "background": theme["tokens"]["background_app"],
+        }
+    except ThemeError as error:
+        # Keep the existing dark splash shell visible. The fragment marker lets
+        # the frontend distinguish this from a valid dark theme; get_initial_state
+        # carries the structured error details once the bridge is ready.
+        logger.error("启动 GUI 主题无效: %s", error.as_dict())
+        return {
+            "appearance": "dark",
+            "background": "#1a1a18",
+            "error": error.as_dict(),
+        }
+
+
+def _initial_theme_light() -> bool:
+    """Compatibility helper retained for callers from the boolean-theme release."""
+    return _initial_gui_theme()["appearance"] == "light"
 
 
 def _debug_enabled() -> bool:
@@ -389,8 +401,14 @@ def main():
     api = ApiBridge(mcp_manager=mcp_manager)
     _start_preload_thread()
     url = get_frontend_url()
-    theme_light = _initial_theme_light()
-    url += ("&" if "#" in url else "#") + "theme=" + ("light" if theme_light else "dark")
+    gui_theme = _initial_gui_theme()
+    fragment = (
+        f"theme={gui_theme['appearance']}"
+        f"&bg={gui_theme['background'].lstrip('#')}"
+    )
+    if gui_theme.get("error") is not None:
+        fragment += "&theme_error=1"
+    url += ("&" if "#" in url else "#") + fragment
 
     # 启动 PyWebView 原生桌面窗口（背景色与主题一致，页面加载前不闪反色）
     window = webview.create_window(
@@ -402,7 +420,7 @@ def main():
         min_size=(960, 640),
         text_select=True,
         confirm_close=False,
-        background_color="#f4f4f1" if theme_light else "#1a1a18"
+        background_color=gui_theme["background"]
     )
 
     api.set_window(window)
