@@ -122,9 +122,29 @@ describe('applyGuiTheme', () => {
         }),
     } as unknown as PyWebViewAPI;
 
-    await expect(applyGuiTheme(value, api)).rejects.toThrow('missing');
+    await expect(applyGuiTheme(value, api)).rejects.toMatchObject({
+      code: 'asset_not_found',
+      path: 'asset_path',
+      message: 'missing',
+    });
     expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:workspace');
     expect(document.documentElement.style.getPropertyValue('--theme-accent')).toBe('#old-value');
+  });
+
+  it('preserves security error details from the asset bridge', async () => {
+    const value = themeWithWorkspaceImage();
+    const api = {
+      get_gui_theme_asset: vi.fn().mockResolvedValue({
+        ok: false,
+        error: { code: 'asset_escape', path: 'asset_path', message: '资源路径越界' },
+      }),
+    } as unknown as PyWebViewAPI;
+
+    await expect(applyGuiTheme(value, api)).rejects.toMatchObject({
+      code: 'asset_escape',
+      path: 'asset_path',
+      message: '资源路径越界',
+    });
   });
 });
 

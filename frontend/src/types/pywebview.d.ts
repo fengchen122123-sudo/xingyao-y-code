@@ -373,6 +373,10 @@ export interface PyWebViewAPI {
   }>>;
   list_gui_themes(): Promise<GuiThemeResult<{ themes: GuiThemeSummary[] }>>;
   get_gui_theme(themeId: string): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
+  get_active_gui_theme(): Promise<GuiThemeResult<{
+    theme: GuiTheme;
+    native_titlebar_color_capability: NativeTitlebarColorCapability;
+  }>>;
   save_gui_theme(theme: GuiTheme): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
   set_active_gui_theme(themeId: string): Promise<GuiThemeResult<{
     theme: GuiTheme;
@@ -397,6 +401,7 @@ export interface PyWebViewAPI {
     native_titlebar_color_capability: NativeTitlebarColorCapability;
   }>>;
   restore_native_titlebar(): Promise<GuiThemeResult<{
+    theme: GuiTheme;
     native_titlebar_color_capability: NativeTitlebarColorCapability;
   }>>;
 

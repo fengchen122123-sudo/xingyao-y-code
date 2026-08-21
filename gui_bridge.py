@@ -891,6 +891,18 @@ class ApiBridge:
             lambda: {"ok": True, "theme": get_gui_theme_repository().get_theme(theme_id)},
         )
 
+    def get_active_gui_theme(self) -> Dict[str, Any]:
+        def operation():
+            return {
+                "ok": True,
+                "theme": get_gui_theme_repository().get_active(),
+                "native_titlebar_color_capability": self._native_titlebar_capability(),
+            }
+
+        return self._run_gui_theme_operation(
+            "get_active_gui_theme", operation, "gui_theme_id",
+        )
+
     def save_gui_theme(self, theme: Dict[str, Any]) -> Dict[str, Any]:
         def operation():
             # get_gui_theme returns a full DTO with the derived read-only
@@ -916,7 +928,7 @@ class ApiBridge:
                 )
             try:
                 active_theme = repository.set_active(theme_id)
-            except Exception:
+            except Exception as persist_error:
                 rollback_ok = True
                 try:
                     if previous_titlebar is not None:
@@ -935,6 +947,11 @@ class ApiBridge:
                     self._native_titlebar_color_capability = previous_capability
                 if not rollback_ok:
                     logger.error("活动主题持久化失败后，原生标题栏 DWM 回滚失败")
+                    raise ThemeError(
+                        "native_titlebar_rollback_failed",
+                        "native_titlebar",
+                        "活动主题持久化失败，且原生标题栏回滚失败",
+                    ) from persist_error
                 raise
 
             # Temporary compatibility mirror for one release. The repository's
@@ -1070,6 +1087,7 @@ class ApiBridge:
                 )
             return {
                 "ok": True,
+                "theme": theme,
                 "native_titlebar_color_capability": self._native_titlebar_capability(),
             }
 
