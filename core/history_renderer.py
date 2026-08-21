@@ -57,6 +57,8 @@ def _strip_escapes(value):
 
 def _sanitize_user_content(raw) -> str:
     """提取用户消息文本并剥离 ANSI 转义序列，防止 \x1b[ 注入劫持终端。"""
+    from core.agent_service import strip_context_suffix
+
     if isinstance(raw, list):
         # 多模态 list 内容：只提取 text 块，图片块以占位说明表示
         parts = []
@@ -69,6 +71,9 @@ def _sanitize_user_content(raw) -> str:
         content = " ".join(part for part in parts if part)
     else:
         content = str(raw or "")
+    # 历史回放：剥离当轮注入的「当前运行上下文 / 当前时间」后缀，
+    # 那部分是给模型看的运行快照，不该回放到终端历史里
+    content = strip_context_suffix(content)
     return content.replace("\x1b", "")
 
 

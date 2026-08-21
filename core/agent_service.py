@@ -121,37 +121,26 @@ def evict_oldest_turn(history: list) -> bool:
 
 
 def load_system_prompt(is_gui: bool = False) -> str:
-    """三级兜底读取系统提示词：配置路径 → 仓库内提示词文件 → 内置字面量。
+    """读取系统提示词：只从随包文件加载（仓库内 / 安装版 _internal），不从用户目录读取。
 
-    is_gui=True 时优先读取 GUI 专用提示词（system_prompt_gui.md），
-    找不到则回退到通用提示词，确保任何情况下都不会因文件缺失而整轮失败。
+    设计决策（2026-08-21）：系统提示词是应用行为契约的一部分，跟随安装包分发，
+    不允许用户在 ~/.ycode 下修改或替换（用户目录只放数据与记忆，不放行为指令）。
+    用户可控的自定义入口是 ~/.ycode/memory/ 全局记忆体系，不是提示词文件。
+
+    严格分离（2026-08-21）：GUI 与 CLI 各自只读自己的提示词文件，绝不回退混用——
+    GUI 读 system_prompt_gui.md，CLI 读 system_prompt.md。GUI 版包含"不支持斜杠
+    命令、引导用户看右侧面板"等 GUI 专属规则，回退到 CLI 版会让星瑶在图形界面里
+    建议用户使用根本不存在的 /mcp /tasks 等命令，属于必须避免的行为错乱。
     """
     system_prompt = ""
     try:
-        if is_gui:
-            from config import SYSTEM_PROMPT_GUI_FILE
-            prompt_path = SYSTEM_PROMPT_GUI_FILE
-            if os.path.exists(prompt_path):
-                with open(prompt_path, "r", encoding="utf-8") as f:
-                    system_prompt = f.read().strip()
-            if not system_prompt:
-                fallback_path = os.path.join(_repo_root(), "system_prompt_gui.md")
-                if os.path.exists(fallback_path):
-                    with open(fallback_path, "r", encoding="utf-8") as f:
-                        system_prompt = f.read().strip()
-            if system_prompt:
-                return system_prompt
-            # GUI 专用提示词不存在时回退到通用提示词
-        from config import SYSTEM_PROMPT_FILE
-        prompt_path = SYSTEM_PROMPT_FILE
+        filename = "system_prompt_gui.md" if is_gui else "system_prompt.md"
+        prompt_path = os.path.join(_repo_root(), filename)
         if os.path.exists(prompt_path):
             with open(prompt_path, "r", encoding="utf-8") as f:
                 system_prompt = f.read().strip()
-        if not system_prompt:
-            fallback_path = os.path.join(_repo_root(), "system_prompt.md")
-            if os.path.exists(fallback_path):
-                with open(fallback_path, "r", encoding="utf-8") as f:
-                    system_prompt = f.read().strip()
+            if system_prompt:
+                return system_prompt
     except Exception as e:
         logging.warning("读取 system prompt 失败: %s", e)
         system_prompt = ""
@@ -276,11 +265,17 @@ def _drop_legacy_context_systems(history: list) -> list:
     return [m for m in history if m.get("role") != "system"]
 
 
-def _strip_context_suffix(content):
+def strip_context_suffix(content):
     """移除 user 消息内容末尾内联的上下文后缀（动态块 / 后台汇总 / 时间注记）。
 
     上下文后缀按固定顺序追加：动态块 → 后台汇总 → 时间注记。此处反向剥离，
     直到末尾不再有可识别的上下文块标记为止，避免重入/重试时重复堆积。
+
+    用途有两处：
+      1. 请求组装重入前清理（内部 _append_context_suffix_to_last_user 调用）；
+      2. 历史消息展示层（GUI 气泡 / CLI 回放）——数据库里持久化的 user 消息
+         仍带着当轮上下文后缀（那是给模型看的运行快照），但展示给用户时应剥掉，
+         否则历史对话里每条提问都拖着一大块「当前运行上下文 / 当前时间」。
     """
     text = content
     if not isinstance(text, str):
@@ -336,7 +331,7 @@ def _append_context_suffix_to_last_user(
     if not isinstance(original_content, str):
         # 非文本 content（如媒体消息），跳过上下文内联
         return
-    cleaned = _strip_context_suffix(original_content)
+    cleaned = strip_context_suffix(original_content)
     suffix_parts = [p for p in (dynamic_prompt, summary_msg, time_note) if p]
     if not suffix_parts:
         return

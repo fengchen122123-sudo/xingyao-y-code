@@ -25,6 +25,7 @@ from typing import Any, Dict, List, Optional
 
 from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
+from core.agent_service import strip_context_suffix
 from core.memory import MemoryManager
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
@@ -952,9 +953,14 @@ class ApiBridge:
             for msg in self._memory.get_history(session_name):
                 role = msg.get("role")
                 if role in ("user", "assistant", "tool"):
+                    content = msg.get("content") or ""
+                    if role == "user":
+                        # 历史回放：剥离当轮注入的「当前运行上下文 / 当前时间」后缀，
+                        # 那部分是给模型看的运行快照，不该显示在历史气泡里
+                        content = strip_context_suffix(content)
                     msgs.append({
                         "role": role,
-                        "content": msg.get("content") or "",
+                        "content": content,
                         "reasoning_content": msg.get("reasoning_content") or "",
                         "tool_calls": msg.get("tool_calls") or [],
                         "name": msg.get("name") or "",
@@ -2742,7 +2748,9 @@ class ApiBridge:
             raw = " ".join(
                 str(item.get("text", "")) for item in raw if isinstance(item, dict)
             )
-        first_text = str(raw).strip().replace("\n", " ")
+        # 首条用户消息也带着当轮注入的上下文后缀，提炼标题前剥掉，
+        # 否则标题会混入「【当前运行上下文】当前模型：…」这类运行时文字
+        first_text = str(strip_context_suffix(raw)).strip().replace("\n", " ")
         return first_text[:12] if first_text else None
 
     def _rename_session_to_title(self, session_name: str, base_title: str) -> str:

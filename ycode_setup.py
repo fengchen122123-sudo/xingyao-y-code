@@ -326,8 +326,12 @@ def relaunch_elevated(options):
 # ============================================================================
 
 def seed_user_config(bundle_dir, log=print):
-    """从安装包内置的 config.example.json / system_prompt.md 初始化 ~/.ycode 用户配置
-    (仅在用户目录下尚不存在对应文件时才写入，不会覆盖用户已有的配置)。"""
+    """从安装包内置的 config.example.json 初始化 ~/.ycode 用户配置
+    (仅在用户目录下尚不存在对应文件时才写入，不会覆盖用户已有的配置)。
+
+    注意：系统提示词不再初始化到用户目录——它随安装包分发、只读跟随系统，
+    用户目录只放数据与记忆（见 core/agent_service.load_system_prompt）。
+    """
     user_home = os.path.expanduser("~")
     ycode_user_dir = os.path.join(user_home, ".ycode")
     os.makedirs(ycode_user_dir, exist_ok=True)
@@ -340,14 +344,6 @@ def seed_user_config(bundle_dir, log=print):
         default_text='{"active_model_id": null, "providers": []}',
     ):
         log(f"✔ 成功创建配置模板: {config_path}")
-
-    prompt_path = os.path.join(ycode_user_dir, "system_prompt.md")
-    src_prompt = os.path.join(bundle_dir, "system_prompt.md")
-    if os.path.exists(src_prompt) and _seed_file_exclusive(
-        prompt_path,
-        source_path=src_prompt,
-    ):
-        log(f"✔ 成功创建人设模板: {prompt_path}")
 
 
 def _seed_file_exclusive(target_path, source_path=None, default_text=""):
@@ -1004,18 +1000,26 @@ class SetupWizard(tk.Tk):
         try:
             import ctypes
             u32 = ctypes.windll.user32
-            hwnd = int(self.wm_frame(), 16)  # 顶层窗口 HWND
+            # wm_frame() 在 Python 3.13+ 返回十进制字符串（旧版是 0x... 十六进制），
+            # 两种格式都兼容；解析失败则整个 Win32 图标替换静默跳过（回退默认羽毛）
+            frame = self.wm_frame().strip()
+            hwnd = int(frame, 16) if frame.lower().startswith("0x") else int(frame)
             LR_LOADFROMFILE = 0x10
             IMAGE_ICON = 1
             WM_SETICON = 0x0080
-            h_big = u32.LoadImageW(None, ico, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
-            h_small = u32.LoadImageW(None, ico, IMAGE_ICON, 16, 16, LR_LOADFROMFILE)
+            ICON_SMALL = 0
+            ICON_BIG = 1
+            GCLP_HICON = -14
+            GCLP_HICONSM = -13  # 正确值是 -13（此前误写成 -34，小图标始终未替换）
+            # 大图标用 256（任务栏高 DPI 清晰），小图标用 32（标题栏/Alt-Tab）
+            h_big = u32.LoadImageW(None, ico, IMAGE_ICON, 256, 256, LR_LOADFROMFILE)
+            h_small = u32.LoadImageW(None, ico, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
             if h_big:
-                u32.SendMessageW(hwnd, WM_SETICON, 1, h_big)      # ICON_BIG
-                u32.SetClassLongPtrW(hwnd, -14, h_big)            # GCLP_HICON
+                u32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, h_big)
+                u32.SetClassLongPtrW(hwnd, GCLP_HICON, h_big)
             if h_small:
-                u32.SendMessageW(hwnd, WM_SETICON, 0, h_small)    # ICON_SMALL
-                u32.SetClassLongPtrW(hwnd, -34, h_small)          # GCLP_HICONSM
+                u32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_small)
+                u32.SetClassLongPtrW(hwnd, GCLP_HICONSM, h_small)
         except Exception:
             pass
 
@@ -1254,7 +1258,7 @@ class SetupWizard(tk.Tk):
         self._btn_browse = ttk.Button(page, text="浏览...", style="Ghost.TButton",
                                       command=self._browse_dir,
                                       state="disabled" if locked else "normal")
-        self._btn_browse.place(x=480, y=78, width=90, height=30)
+        self._btn_browse.place(x=470, y=78, width=110, height=30)
         if locked:
             self._label(page, "检测到已安装的 Y-code，将覆盖安装到原位置。",
                         FONT_PAGE_SUB, "#8a6d1a").place(x=40, y=108)
