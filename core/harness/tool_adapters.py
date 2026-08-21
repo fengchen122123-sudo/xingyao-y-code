@@ -34,6 +34,9 @@ PERMISSION_SYSTEM_ERROR_MESSAGE = (
 PATH_VALIDATION_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 无法验证路径是否位于当前工作区，已拒绝执行。"
 )
+# diff_ready 事件发给前端的 diff_text 行数上限（防失控；正常改动远达不到）。
+# 前端 diffView.ts 会自行裁剪上下文，这里只兜底超大文件全量重写之类的极端场景。
+_EVENT_DIFF_MAX_LINES = 2000
 
 
 def _as_tool_result(value) -> ToolResult:
@@ -91,6 +94,10 @@ def _show_file_diff(
             return
         added, removed = count_diff_changes(diff_text)
         lines = diff_text.split("\n")
+        # 终端 ANSI 面板保留 25 行截断（CLI 滚动区可读性）；
+        # 发给前端的 diff_text 传完整 diff（仅防失控上限）——前端
+        # diffView.ts 自带"改动 ±5 行上下文"裁剪，后端若先截 25 行，
+        # GUI「文件更改」面板里的大改动只能看到前 25 行。
         max_lines = 25
         display_text = (
             "\n".join(lines[:max_lines])
@@ -98,6 +105,12 @@ def _show_file_diff(
             if len(lines) > max_lines
             else diff_text
         )
+        event_diff_text = diff_text
+        if len(lines) > _EVENT_DIFF_MAX_LINES:
+            event_diff_text = (
+                "\n".join(lines[:_EVENT_DIFF_MAX_LINES])
+                + f"\n... (超出 {_EVENT_DIFF_MAX_LINES} 行展示上限，已截断)"
+            )
         panel = Panel(
             render_diff_table(display_text),
             title=panel_title,
@@ -115,7 +128,7 @@ def _show_file_diff(
                 "tool_call_id": str(tool_call_id or ""),
                 "file_path": file_path,
                 "text": diff_output,
-                "diff_text": display_text,
+                "diff_text": event_diff_text,
                 "added": added,
                 "removed": removed,
             })

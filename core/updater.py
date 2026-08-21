@@ -3,8 +3,15 @@ core/updater.py
 ===============
 Y-CODE 自动与手动更新管理模块：
 对接 Gitee Releases API，支持版本检测、后台流式分块下载、进度通知与安装后自清理。
+
+Gitee 单附件 100MB 上限的适配（方案 A 分卷）：
+  主安装包超过 100MB 时由 build_release.py 切成 .part1/.part2/... 二进制分卷
+  （每片 ≤ 95MB）作为 Release 附件上传；本模块识别分卷序列后顺序下载、
+  流式拼接还原 exe，并用 Release 描述里发布的 SHA256 强制校验拼接结果，
+  校验不过即拒绝安装（防分卷被篡改后二次传播）。
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -17,7 +24,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from core.version import __version__ as YCODE_VERSION
 
@@ -27,6 +34,102 @@ logger = logging.getLogger(__name__)
 GITEE_REPO = "feng-chenhao/xingyao-y-code"
 GITEE_API_URL = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/releases/latest"
 HTTP_USER_AGENT = f"ycode-updater/{YCODE_VERSION} (Windows)"
+
+# 版本号白名单：tag_name 来自远程 API，拼接进文件名与 cmd 前必须约束字符集
+_SAFE_VERSION_RE = re.compile(r"^[0-9A-Za-z.\-_]+$")
+
+# Release 描述中的官方 SHA256 标记行（约定：SHA256: <64 位十六进制>）。
+# 分卷/单文件安装包下载完成后必须与之比对，不一致即拒绝安装
+_SHA256_RE = re.compile(r"SHA256\s*[:：]\s*([0-9a-fA-F]{64})", re.IGNORECASE)
+
+# 分卷附件名尾部序号（如 Y-code-1.2.6.exe.part2）
+_PART_SUFFIX_RE = re.compile(r"\.part(\d+)$", re.IGNORECASE)
+
+
+def is_safe_version_string(version: str) -> bool:
+    """校验版本号仅含安全字符（数字/字母/点/横线/下划线），防路径穿越与 shell 注入。"""
+    return bool(version) and bool(_SAFE_VERSION_RE.match(version))
+
+
+def parse_release_sha256(body: str) -> str:
+    """从 Release 描述解析官方 SHA256（小写归一）。未发布校验和时返回空串。"""
+    m = _SHA256_RE.search(str(body or ""))
+    return m.group(1).lower() if m else ""
+
+
+def _collect_split_parts(assets: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+    """按基名分组收集 .partN 分卷，返回 {基名: [按序号升序的附件]}。
+
+    每组序号必须从 1 连续编号——断号（漏传某片）的组直接丢弃，
+    防止拼出残缺文件。同一 Release 允许多组分卷共存（主安装包 + CLI
+    安装包），由调用方按命名规则挑选要下载的那组。
+    """
+    groups: Dict[str, Dict[int, Dict[str, Any]]] = {}
+    for asset in assets or []:
+        name = str(asset.get("name") or "")
+        m = _PART_SUFFIX_RE.search(name)
+        if not m:
+            continue
+        idx = int(m.group(1))
+        if idx < 1:
+            continue
+        stem = name[: m.start()]
+        groups.setdefault(stem, {})[idx] = asset
+    complete: Dict[str, List[Dict[str, Any]]] = {}
+    for stem, idx_map in groups.items():
+        count = max(idx_map)
+        if sorted(idx_map) == list(range(1, count + 1)):
+            complete[stem] = [idx_map[i] for i in range(1, count + 1)]
+        else:
+            logger.warning("分卷 %s 序号不连续（1..%d 缺片），忽略该组", stem, count)
+    return complete
+
+
+def _pick_main_installer_group(
+    complete: Dict[str, List[Dict[str, Any]]], version: str
+) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
+    """从多组完整分卷里挑主安装包（GUI 版）那组。
+
+    优先精确匹配主安装包分发名 Y-code-{版本}.exe；退而求其次取
+    Y-code 前缀且不含 cli 的基名；都没有时返回第一组（极端兜底，
+    总比拒绝更新好）。找不到任何完整分卷时返回 None。
+    """
+    if not complete:
+        return None
+    exact = f"Y-code-{version}.exe"
+    if exact in complete:
+        return exact, complete[exact]
+    for stem in complete:
+        low = stem.lower()
+        if low.startswith("y-code") and "cli" not in low:
+            return stem, complete[stem]
+    stem = next(iter(complete))
+    return stem, complete[stem]
+
+
+def _pick_main_installer_exe(
+    assets: List[Dict[str, Any]], version: str
+) -> Optional[Dict[str, Any]]:
+    """从单 exe 附件里挑主安装包（GUI 版）。
+
+    同 Release 可能同时挂主安装包与 CLI 安装包两个 exe，自动更新必须
+    优先选主安装包：精确名 > Y-code 前缀且非 cli > 任意 exe。
+    """
+    exe_assets = [
+        a for a in (assets or [])
+        if str(a.get("name") or "").lower().endswith(".exe")
+    ]
+    if not exe_assets:
+        return None
+    exact = f"Y-code-{version}.exe"
+    for asset in exe_assets:
+        if str(asset.get("name")) == exact:
+            return asset
+    for asset in exe_assets:
+        low = str(asset.get("name") or "").lower()
+        if low.startswith("y-code") and "cli" not in low:
+            return asset
+    return exe_assets[0]
 
 
 def parse_version(v_str: str) -> Tuple[int, ...]:
@@ -143,20 +246,38 @@ def fetch_latest_release(
     latest_version = raw_tag.lstrip("vV").strip() or raw_tag
     release_title = data.get("name") or f"Y-CODE v{latest_version}"
     release_notes = data.get("body") or "暂无更新说明。"
+    official_sha256 = parse_release_sha256(release_notes)
 
-    # 寻找匹配的 Windows 安装包附件（.exe）
     assets = data.get("assets") or []
     download_url = ""
     asset_name = ""
     asset_size = 0
+    part_urls: List[str] = []
+    part_count = 0
 
-    for asset in assets:
-        name = asset.get("name", "")
-        if name.lower().endswith(".exe"):
-            download_url = asset.get("browser_download_url", "")
-            asset_name = name
-            asset_size = int(asset.get("size") or 0)
-            break
+    # 优先识别分卷序列（主安装包 > 100MB 时按 .partN 分卷发布）。
+    # 同一 Release 可能同时挂主安装包与 CLI 安装包两组分卷，必须按
+    # 命名规则挑主安装包那组，否则自动更新可能错下 CLI 安装包
+    picked = _pick_main_installer_group(_collect_split_parts(assets), latest_version)
+    if picked:
+        parts_base, part_assets = picked
+        part_urls = [str(a.get("browser_download_url") or "") for a in part_assets]
+        part_count = len(part_assets)
+        asset_name = parts_base
+        asset_size = sum(int(a.get("size") or 0) for a in part_assets)
+        # 分卷模式下载由 part_urls 驱动；download_url 指向 Release 页面
+        # 供人工查看，自动更新流程不再使用它
+        download_url = f"https://gitee.com/{repo}/releases/tag/{raw_tag}"
+        logger.info(
+            "识别到分卷安装包: %s 共 %d 片 (%d 字节)", parts_base, part_count, asset_size
+        )
+    else:
+        # 回退单 exe 附件：同 Release 多个 exe 时优先主安装包（非 CLI）
+        picked_exe = _pick_main_installer_exe(assets, latest_version)
+        if picked_exe:
+            download_url = picked_exe.get("browser_download_url", "")
+            asset_name = picked_exe.get("name", "")
+            asset_size = int(picked_exe.get("size") or 0)
 
     # 若未找到 exe 附件，回退到 Release 页面直链
     if not download_url:
@@ -174,11 +295,35 @@ def fetch_latest_release(
         "download_url": download_url,
         "asset_name": asset_name,
         "asset_size": asset_size,
+        # 分卷信息：part_urls 非空即分卷模式（下载器顺序下载拼接）
+        "part_urls": part_urls,
+        "part_count": part_count,
+        "is_split": bool(part_urls),
+        # 官方 SHA256（来自 Release 描述）。有值时下载器强制校验，
+        # 不匹配即拒绝安装；空串表示该 Release 未发布校验和（仅提示）
+        "sha256": official_sha256,
     }
 
 
+def _sha256_file(path: str) -> str:
+    """分块计算文件 SHA256（安装包几百 MB，不能一次读入内存）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(4 * 1024 * 1024)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
 class UpdateDownloader:
-    """后台分块流式下载器，支持实时进度汇报与取消控制。"""
+    """后台分块流式下载器，支持实时进度汇报与取消控制。
+
+    分卷模式（part_urls 非空）：顺序下载各分卷并流式追加进同一个临时文件
+    （首片重建、后续追加），全部完成后计算 SHA256 与官方校验和比对。
+    边下边拼接，无二次全量读写，还原耗时约等于纯磁盘写入。
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
@@ -200,7 +345,46 @@ class UpdateDownloader:
         on_progress: Callable[[Dict[str, Any]], None],
         on_complete: Callable[[str], None],
         on_error: Callable[[str], None],
+        part_urls: Optional[List[str]] = None,
+        expected_sha256: str = "",
+        total_size_hint: int = 0,
     ) -> bool:
+        """启动后台下载。
+
+        download_url    单文件模式的安装包直链（分卷模式忽略）
+        part_urls       分卷 URL 列表（按 .part1..partN 顺序）；非空即分卷模式
+        expected_sha256 官方 SHA256（来自 Release 描述）。非空时下载完成后
+                        强制校验，不匹配即删除产物并报错拒绝安装
+        total_size_hint 总字节数（分卷模式 = 各片之和），用于稳定进度百分比
+        """
+        # 版本号白名单校验：target_version 会拼进文件名与 shell 命令，必须先约束
+        if not is_safe_version_string(target_version):
+            logger.error("非法版本号，拒绝下载: %r", target_version)
+            try:
+                on_error(f"非法版本号: {target_version!r}")
+            except Exception:
+                pass
+            return False
+
+        # 归一化分卷列表：仅接受 http(s) 直链
+        clean_parts: List[str] = []
+        for u in (part_urls or []):
+            u = str(u or "").strip()
+            if u.lower().startswith(("http://", "https://")):
+                clean_parts.append(u)
+        if len(clean_parts) == 1:
+            # 单片"分卷"没有拼接意义，直接按单文件下载
+            download_url = clean_parts[0]
+            clean_parts = []
+
+        if not clean_parts and not str(download_url or "").strip():
+            logger.error("下载地址为空，拒绝启动")
+            try:
+                on_error("下载地址为空")
+            except Exception:
+                pass
+            return False
+
         with self._lock:
             if self._is_downloading:
                 return False
@@ -214,59 +398,115 @@ class UpdateDownloader:
         self._current_dest_path = dest_path
         self._current_tmp_path = tmp_path
 
+        def _cleanup_tmp():
+            try:
+                if os.path.isfile(tmp_path):
+                    os.remove(tmp_path)
+            except Exception:
+                pass
+
         def _worker():
             try:
-                logger.info("开始下载新版本安装包: %s -> %s", download_url, tmp_path)
-                req = urllib.request.Request(
-                    download_url,
-                    headers={"User-Agent": HTTP_USER_AGENT},
+                # 下载源序列：分卷模式用 part_urls，单文件模式用 download_url
+                urls = clean_parts or [str(download_url or "").strip()]
+                logger.info(
+                    "开始下载新版本安装包: %d 个分卷 -> %s", len(urls), tmp_path
                 )
-                with urllib.request.urlopen(req, timeout=30.0) as resp:
-                    total_size = int(resp.headers.get("Content-Length", 0))
-                    downloaded = 0
-                    chunk_size = 64 * 1024  # 64 KB
-                    last_emit_time = 0.0
-                    last_percent = -1
+                downloaded_total = 0
+                # 进度分母：优先 total_size_hint（分卷求和，来自 Release 元数据）；
+                # 缺省时由首片 Content-Length 推算
+                grand_total = int(total_size_hint or 0)
+                last_emit_time = 0.0
+                last_percent = -1
+                part_index = 0
 
-                    with open(tmp_path, "wb") as f:
-                        while True:
-                            if self._cancel_event.is_set():
-                                logger.info("下载被用户主动取消")
-                                break
-                            chunk = resp.read(chunk_size)
-                            if not chunk:
-                                break
-                            f.write(chunk)
-                            downloaded += len(chunk)
+                def _report_progress(force: bool = False):
+                    nonlocal last_emit_time, last_percent
+                    now = time.monotonic()
+                    percent = (
+                        int(downloaded_total * 100 / grand_total)
+                        if grand_total > 0
+                        else 0
+                    )
+                    if force or (
+                        now - last_emit_time >= 0.15 or percent != last_percent
+                    ):
+                        last_emit_time = now
+                        last_percent = percent
+                        on_progress(
+                            {
+                                "percent": percent,
+                                "downloaded": downloaded_total,
+                                "total": grand_total,
+                                "part_index": part_index,
+                                "part_count": len(urls),
+                            }
+                        )
 
-                            # 节流上报：每 0.15 秒或进度变化超过 1% 时上报一次
-                            now = time.monotonic()
-                            percent = (
-                                int(downloaded * 100 / total_size)
-                                if total_size > 0
-                                else 0
-                            )
-                            if (
-                                now - last_emit_time >= 0.15
-                                or percent != last_percent
-                            ):
-                                last_emit_time = now
-                                last_percent = percent
-                                on_progress(
-                                    {
-                                        "percent": percent,
-                                        "downloaded": downloaded,
-                                        "total": total_size,
-                                    }
-                                )
+                # 首片重建文件（"wb"），后续追加（"ab"）：边下边拼接
+                open_mode = "wb"
+                for i, url in enumerate(urls):
+                    part_index = i + 1
+                    req = urllib.request.Request(
+                        url,
+                        headers={"User-Agent": HTTP_USER_AGENT},
+                    )
+                    with urllib.request.urlopen(req, timeout=30.0) as resp:
+                        part_total = int(resp.headers.get("Content-Length", 0))
+                        if grand_total <= 0:
+                            grand_total = part_total * len(urls)
+                        part_downloaded = 0
+                        with open(tmp_path, open_mode) as f:
+                            while True:
+                                if self._cancel_event.is_set():
+                                    logger.info("下载被用户主动取消")
+                                    break
+                                chunk = resp.read(64 * 1024)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                part_downloaded += len(chunk)
+                                downloaded_total += len(chunk)
+                                _report_progress()
+                        open_mode = "ab"
 
-                if self._cancel_event.is_set():
-                    try:
-                        if os.path.isfile(tmp_path):
-                            os.remove(tmp_path)
-                    except Exception:
-                        pass
-                    return
+                    if self._cancel_event.is_set():
+                        _cleanup_tmp()
+                        return
+
+                    # 完整性校验：声明了 Content-Length 的分片，实际字节数
+                    # 必须一致，否则视为连接中断的截断下载，拒绝继续
+                    if part_total > 0 and part_downloaded != part_total:
+                        logger.error(
+                            "分卷 %d/%d 下载不完整: 期望 %d 字节，实际 %d 字节",
+                            i + 1,
+                            len(urls),
+                            part_total,
+                            part_downloaded,
+                        )
+                        _cleanup_tmp()
+                        on_error(
+                            f"安装包下载不完整（分卷 {i + 1}/{len(urls)}："
+                            f"{part_downloaded}/{part_total} 字节），请重试"
+                        )
+                        return
+
+                # 官方 SHA256 强制校验：分卷被篡改/缺片时拼接结果哈希必然
+                # 对不上，这里直接拒绝安装并清理产物（安全底线）
+                if expected_sha256:
+                    actual_hash = _sha256_file(tmp_path)
+                    if actual_hash != expected_sha256.lower():
+                        logger.error(
+                            "安装包 SHA256 校验失败: 期望 %s，实际 %s",
+                            expected_sha256.lower(),
+                            actual_hash,
+                        )
+                        _cleanup_tmp()
+                        on_error(
+                            "安装包完整性校验失败（SHA256 不匹配），"
+                            "文件可能被篡改或下载损坏，已拒绝安装"
+                        )
+                        return
 
                 # 下载完成，重命名临时文件为正式安装包
                 if os.path.exists(dest_path):
@@ -276,14 +516,11 @@ class UpdateDownloader:
                         pass
                 os.replace(tmp_path, dest_path)
                 logger.info("安装包下载成功: %s", dest_path)
+                _report_progress(force=True)
                 on_complete(dest_path)
             except Exception as e:
                 logger.exception("下载安装包失败")
-                try:
-                    if os.path.isfile(tmp_path):
-                        os.remove(tmp_path)
-                except Exception:
-                    pass
+                _cleanup_tmp()
                 on_error(str(e))
             finally:
                 with self._lock:
@@ -316,6 +553,11 @@ def launch_installer_and_cleanup(installer_path: str) -> bool:
         return False
 
     norm_path = os.path.normpath(installer_path)
+    # 纵深防御：路径将拼进 cmd 字符串，必须不含引号/& 等 shell 特殊字符
+    base_name = os.path.basename(norm_path)
+    if not is_safe_version_string(base_name.replace(".exe", "")):
+        logger.error("安装包文件名含特殊字符，拒绝启动: %s", norm_path)
+        return False
     # cmd 批处理命令：等待安装向导退出后自删除安装包
     cmd = f'start /wait "" "{norm_path}" & del /f /q "{norm_path}"'
     logger.info("唤起安装程序自清理脚本: %s", cmd)

@@ -85,6 +85,25 @@ def default_install_dir(scope="user"):
     return os.path.join(local_appdata, "Programs", "Y-code")
 
 
+def normalize_browsed_install_dir(chosen):
+    """浏览选择的目录统一在其下追加 Y-code 子目录（所选目录本身已叫
+    Y-code 时不重复追加）。
+
+    避免用户选择盘符根目录（如 D:\\）或普通目录时，把程序文件直接
+    平铺进所选目录。仅作用于向导「浏览...」选择的结果；路径输入框
+    手动输入的路径不受影响（仍由 _validate_install_target 兜底校验）。
+    覆盖安装（更新）时路径锁定为原安装位置，不走本函数。
+    """
+    chosen = os.path.normpath(str(chosen))
+    if os.path.basename(chosen).lower() == "y-code":
+        return chosen
+    # 裸盘符（如 "D:"，normpath 不会补斜杠）拼 join 会得到相对当前目录的
+    # "D:Y-code"，必须先补根斜杠
+    if len(chosen) == 2 and chosen[1] == ":":
+        chosen += os.sep
+    return os.path.join(chosen, "Y-code")
+
+
 def get_desktop_dir():
     """获取用户真实桌面路径。
 
@@ -1293,7 +1312,9 @@ class SetupWizard(tk.Tk):
         chosen = filedialog.askdirectory(parent=self, title="选择安装位置",
                                          initialdir=self.var_dir.get() or None)
         if chosen:
-            self.var_dir.set(os.path.normpath(chosen))
+            # 浏览选择后自动在所选目录下追加 Y-code 子目录（已叫 Y-code 不重复），
+            # 避免选盘符根目录时把程序文件直接平铺进 D:\ 之类的位置
+            self.var_dir.set(normalize_browsed_install_dir(chosen))
 
     def _start_install(self):
         install_dir = self.var_dir.get().strip()
