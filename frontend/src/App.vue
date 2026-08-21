@@ -1,5 +1,24 @@
 <template>
   <div id="app-root">
+    <div v-if="store.guiThemeError" class="gui-theme-error" data-test="gui-theme-error">
+      <div class="gui-theme-error-card">
+        <div class="gui-theme-error-kicker">GUI 主题无法加载</div>
+        <h1>需要选择一个可用主题</h1>
+        <p>{{ store.guiThemeError.message }}</p>
+        <div class="gui-theme-error-code">
+          {{ store.guiThemeError.code }} · {{ store.guiThemeError.path }}
+        </div>
+        <div class="gui-theme-error-actions">
+          <button data-test="gui-theme-reset" @click="store.resetInvalidGuiTheme('builtin.dark')">
+            重置为内置深色
+          </button>
+          <button data-test="gui-theme-reset" @click="store.resetInvalidGuiTheme('builtin.light')">
+            重置为内置浅色
+          </button>
+        </div>
+      </div>
+    </div>
+    <template v-else>
     <!-- 顶栏 -->
     <Topbar />
 
@@ -113,12 +132,13 @@
     <!-- 启动画面：初始化期间全屏展示，加载完成后淡出进入对话 -->
     <Transition name="splash">
       <div v-if="!store.initialized" id="splash">
-        <img class="sp-logo" src="/icon.png" alt="Y-CODE">
+        <img class="sp-logo" :src="'/icon.png'" alt="Y-CODE">
         <div class="sp-title">Y-CODE</div>
         <div class="sp-sub">星瑶·编码助手</div>
         <div class="sp-bar"><i></i></div>
       </div>
     </Transition>
+    </template>
   </div>
 </template>
 
@@ -396,6 +416,63 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+.gui-theme-error {
+  position: fixed;
+  inset: 0;
+  z-index: 2100;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: var(--bg0);
+  color: var(--text);
+}
+.gui-theme-error-card {
+  width: min(520px, 100%);
+  padding: 32px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg1);
+  box-shadow: 0 18px 60px rgba(0, 0, 0, 0.35);
+}
+.gui-theme-error-kicker {
+  color: var(--red);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+}
+.gui-theme-error-card h1 {
+  margin: 10px 0 8px;
+  font-size: 22px;
+}
+.gui-theme-error-card p {
+  margin: 0;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+.gui-theme-error-code {
+  margin-top: 14px;
+  color: var(--text-faint);
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.gui-theme-error-actions {
+  display: flex;
+  gap: 10px;
+  margin-top: 24px;
+}
+.gui-theme-error-actions button {
+  flex: 1;
+  padding: 9px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg2);
+  color: var(--text);
+}
+.gui-theme-error-actions button:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
 /* ---------- 启动画面 ---------- */
 #splash {
   position: fixed;
