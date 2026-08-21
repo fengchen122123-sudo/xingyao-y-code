@@ -308,6 +308,46 @@ def fmt_size_mb(path):
     return os.path.getsize(path) / 1024 / 1024
 
 
+def parse_version_from_tag(tag):
+    """从 tag 提取版本号元组供比较（'v1.2.8' -> (1,2,8)）。"""
+    m = re.match(r"^v?(\d+)\.(\d+)\.(\d+)", tag)
+    return tuple(map(int, m.groups())) if m else (0, 0, 0)
+
+
+def cleanup_old_releases(token, current_tag, releases, keep_last_n=2):
+    """自动清理旧 Release：保留最近 keep_last_n 个版本，删除更早的。
+
+    用于控制 Gitee 仓库附件总容量（免费版约 500MB）。例如当前 v1.2.8，
+    keep_last_n=2 时保留 v1.2.8 + v1.2.7，删除 v1.2.6 及更早版本。
+    """
+    if not releases:
+        return
+
+    # 按版本号降序排序（新 -> 旧）
+    sorted_releases = sorted(
+        releases,
+        key=lambda r: parse_version_from_tag(r.get("tag_name", "")),
+        reverse=True,
+    )
+
+    # 保留前 keep_last_n 个，删除其余的
+    to_delete = sorted_releases[keep_last_n:]
+    if not to_delete:
+        print(f"ℹ 现有 Release 共 {len(releases)} 个，无需清理（保留最近 {keep_last_n} 个）")
+        return
+
+    print(f"\n🗑️  自动清理旧 Release（保留最近 {keep_last_n} 个版本）...")
+    for r in to_delete:
+        tag = r.get("tag_name", "")
+        rid = r.get("id")
+        name = r.get("name", "")
+        try:
+            delete_release(token, rid)
+            print(f"   ✔ 已删除 {tag}  {name}  (id={rid})")
+        except Exception as e:
+            print(f"   ⚠ 删除 {tag} 失败: {e}（可手动到网页端删除）")
+
+
 def main():
     parser = argparse.ArgumentParser(description="一键发布 dist/release_parts/ 到 Gitee Releases")
     parser.add_argument("--check", action="store_true", help="只验证令牌并列出现有 Release")
@@ -463,6 +503,16 @@ def main():
     print(f"🎉 发布成功！{ok}/{total} 个附件全部上传。")
     print(f"👉 Release 页面: https://gitee.com/{GITEE_REPO}/releases/tag/{tag}")
     print("ℹ 老版本应用内『检查更新』即可自动下载分卷拼接并校验安装。")
+
+    # 发布成功后自动清理旧版本附件（保留最近 2 个版本：当前 + 上一个）
+    # 避免 Gitee 仓库附件总容量超限（免费版约 500MB）
+    if not args.dry_run and releases:
+        try:
+            # 重新拉取最新 Release 列表（包含刚发布的）
+            updated_releases = list_releases(token)
+            cleanup_old_releases(token, tag, updated_releases, keep_last_n=2)
+        except Exception as e:
+            print(f"⚠ 自动清理旧 Release 失败: {e}（不影响本次发布，可手动清理）")
 
 
 if __name__ == "__main__":
