@@ -38,6 +38,37 @@ def test_builtin_dark_is_complete(tmp_path):
     assert theme["native_titlebar"]["background"] == "#20201e"
 
 
+@pytest.mark.parametrize("theme_id,expected_tokens", [
+    ("builtin.dark", {
+        "background_app": "#1a1a18", "background_panel": "#20201e",
+        "background_card": "#272724", "background_elevated": "#302f2b",
+        "border": "#34332f", "text_primary": "#d9d9d4", "text_bright": "#edede9",
+        "text_secondary": "#a8a7a0", "text_faint": "#85847d", "accent": "#6a92d8",
+        "accent_secondary": "#6a92d8", "accent_soft": "#6a92d829",
+        "success": "#4ea96a", "warning": "#c9a24a", "danger": "#d9635b",
+        "orange": "#d08a4e", "info": "#4aabba", "purple": "#a58bd8",
+        "code_background": "#141412", "float_background": "#20201ef7",
+        "font_mono": "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace",
+        "font_sans": "'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif",
+    }),
+    ("builtin.light", {
+        "background_app": "#f4f4f1", "background_panel": "#ffffff",
+        "background_card": "#efefec", "background_elevated": "#e4e4e0",
+        "border": "#e3e3de", "text_primary": "#2c2c2a", "text_bright": "#171716",
+        "text_secondary": "#5c5c56", "text_faint": "#7a7a73", "accent": "#3a6dd8",
+        "accent_secondary": "#3a6dd8", "accent_soft": "#3a6dd81a",
+        "success": "#2c8a4c", "warning": "#96700f", "danger": "#cf3d36",
+        "orange": "#b85e1f", "info": "#1a7f92", "purple": "#7b5fc0",
+        "code_background": "#f0f0ec", "float_background": "#fffffff7",
+        "font_mono": "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace",
+        "font_sans": "'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif",
+    }),
+])
+def test_builtin_tokens_cover_every_current_css_variable(tmp_path, theme_id, expected_tokens):
+    tokens = ThemeRepository(tmp_path / "gui-themes", tmp_path / "config.json").get_theme(theme_id)["tokens"]
+    assert {key: tokens[key] for key in expected_tokens} == expected_tokens
+
+
 def test_user_theme_inherits_only_missing_fields(tmp_path):
     repo = make_repo(tmp_path)
     repo.save_theme(minimal_theme("rose", accent="#d96b9f"))
@@ -57,6 +88,20 @@ def test_invalid_manifest_is_rejected(tmp_path, field, value, code):
     manifest[field] = value
     with pytest.raises(ThemeError) as exc:
         repo.save_theme(manifest)
+    assert exc.value.code == code
+
+
+@pytest.mark.parametrize("field,value,code", [
+    ("appearance", [], "invalid_appearance"),
+    ("appearance", {}, "invalid_appearance"),
+    ("extends", [], "invalid_base"),
+    ("extends", {}, "invalid_base"),
+])
+def test_enum_fields_reject_unhashable_json_values_with_theme_error(tmp_path, field, value, code):
+    manifest = minimal_theme("rose")
+    manifest[field] = value
+    with pytest.raises(ThemeError) as exc:
+        make_repo(tmp_path).save_theme(manifest)
     assert exc.value.code == code
 
 

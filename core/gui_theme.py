@@ -29,9 +29,10 @@ _ROOT_KEYS = frozenset({
     "native_titlebar", "regions",
 })
 _TOKEN_COLOR_KEYS = frozenset({
-    "background_app", "background_panel", "background_card", "text_primary",
-    "text_secondary", "text_faint", "accent", "accent_soft", "border",
-    "success", "warning", "danger", "info", "code_background", "shadow_color",
+    "background_app", "background_panel", "background_card", "background_elevated",
+    "text_primary", "text_bright", "text_secondary", "text_faint", "accent",
+    "accent_secondary", "accent_soft", "border", "success", "warning", "danger",
+    "orange", "info", "purple", "code_background", "float_background", "shadow_color",
 })
 _TOKEN_FONT_KEYS = frozenset({"font_sans", "font_mono"})
 _TOKEN_RADIUS_KEYS = frozenset({"radius_small", "radius_medium", "radius_large"})
@@ -105,10 +106,12 @@ BUILTIN_THEMES = {
         "dark",
         {
             "background_app": "#1a1a18", "background_panel": "#20201e", "background_card": "#272724",
-            "text_primary": "#d9d9d4", "text_secondary": "#a8a7a0", "text_faint": "#85847d",
-            "accent": "#6a92d8", "accent_soft": "#6a92d829", "border": "#34332f",
-            "success": "#4ea96a", "warning": "#c9a24a", "danger": "#d9635b", "info": "#4aabba",
-            "code_background": "#141412",
+            "background_elevated": "#302f2b", "border": "#34332f",
+            "text_primary": "#d9d9d4", "text_bright": "#edede9", "text_secondary": "#a8a7a0",
+            "text_faint": "#85847d", "accent": "#6a92d8", "accent_secondary": "#6a92d8",
+            "accent_soft": "#6a92d829", "success": "#4ea96a", "warning": "#c9a24a",
+            "danger": "#d9635b", "orange": "#d08a4e", "info": "#4aabba", "purple": "#a58bd8",
+            "code_background": "#141412", "float_background": "#20201ef7",
             "font_sans": "'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif",
             "font_mono": "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace",
             "radius_small": 4, "radius_medium": 8, "radius_large": 14,
@@ -121,10 +124,12 @@ BUILTIN_THEMES = {
         "light",
         {
             "background_app": "#f4f4f1", "background_panel": "#ffffff", "background_card": "#efefec",
-            "text_primary": "#2c2c2a", "text_secondary": "#5c5c56", "text_faint": "#7a7a73",
-            "accent": "#3a6dd8", "accent_soft": "#3a6dd81a", "border": "#e3e3de",
-            "success": "#2c8a4c", "warning": "#96700f", "danger": "#cf3d36", "info": "#1a7f92",
-            "code_background": "#f0f0ec",
+            "background_elevated": "#e4e4e0", "border": "#e3e3de",
+            "text_primary": "#2c2c2a", "text_bright": "#171716", "text_secondary": "#5c5c56",
+            "text_faint": "#7a7a73", "accent": "#3a6dd8", "accent_secondary": "#3a6dd8",
+            "accent_soft": "#3a6dd81a", "success": "#2c8a4c", "warning": "#96700f",
+            "danger": "#cf3d36", "orange": "#b85e1f", "info": "#1a7f92", "purple": "#7b5fc0",
+            "code_background": "#f0f0ec", "float_background": "#fffffff7",
             "font_sans": "'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif",
             "font_mono": "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace",
             "radius_small": 4, "radius_medium": 8, "radius_large": 14,
@@ -171,9 +176,9 @@ def _validate_manifest(theme: Mapping[str, Any]) -> dict[str, Any]:
         raise ThemeError("invalid_id", "id", "主题 ID 只能包含小写字母、数字和连字符")
     if not isinstance(manifest["name"], str) or not manifest["name"].strip():
         raise ThemeError("invalid_name", "name", "主题名称不能为空")
-    if manifest["appearance"] not in _APPEARANCES:
+    if not isinstance(manifest["appearance"], str) or manifest["appearance"] not in _APPEARANCES:
         raise ThemeError("invalid_appearance", "appearance", "外观只能是 light 或 dark")
-    if manifest["extends"] not in BUILTIN_IDS:
+    if not isinstance(manifest["extends"], str) or manifest["extends"] not in BUILTIN_IDS:
         raise ThemeError("invalid_base", "extends", "用户主题只能继承内置主题")
 
     tokens = _require_mapping(manifest["tokens"], "tokens")
@@ -197,7 +202,7 @@ def _validate_manifest(theme: Mapping[str, Any]) -> dict[str, Any]:
     for key, value in titlebar.items():
         path = f"native_titlebar.{key}"
         if key == "mode":
-            if value not in _APPEARANCES:
+            if not isinstance(value, str) or value not in _APPEARANCES:
                 raise ThemeError("invalid_value", path, "标题栏模式只能是 light 或 dark")
         else:
             _validate_color(value, path)
@@ -218,9 +223,9 @@ def _validate_manifest(theme: Mapping[str, Any]) -> dict[str, Any]:
             elif key == "image":
                 if value is not None and not isinstance(value, str):
                     raise ThemeError("invalid_type", path, "图片必须是相对路径或 null")
-            elif key == "image_size" and value not in _IMAGE_SIZES:
+            elif key == "image_size" and (not isinstance(value, str) or value not in _IMAGE_SIZES):
                 raise ThemeError("invalid_value", path, "不支持的图片缩放方式")
-            elif key == "image_position" and value not in _IMAGE_POSITIONS:
+            elif key == "image_position" and (not isinstance(value, str) or value not in _IMAGE_POSITIONS):
                 raise ThemeError("invalid_value", path, "不支持的图片位置")
     return copy.deepcopy(dict(manifest))
 
