@@ -217,12 +217,20 @@ def build_release_body(version, sha256, part_files):
     if split_groups:
         lines.append("### 手动下载合并（未走应用内自动更新的用户）")
         lines.append("")
-        lines.append("下载同一安装包的全部分卷放到同一目录后执行合并：")
+        lines.append("下载同一安装包的全部分卷放到同一目录后，按你的终端类型执行合并：")
         lines.append("")
         for base, parts in split_groups.items():
             joined = "+".join(parts)
-            lines.append(f"```")
+            lines.append(f"**{base}**")
+            lines.append("")
+            lines.append("CMD 用户：")
+            lines.append(f"```cmd")
             lines.append(f"copy /b {joined} {base}")
+            lines.append(f"```")
+            lines.append("")
+            lines.append("PowerShell 用户：")
+            lines.append(f"```powershell")
+            lines.append(f"cmd /c \"copy /b {joined} {base}\"")
             lines.append(f"```")
             lines.append("")
 
