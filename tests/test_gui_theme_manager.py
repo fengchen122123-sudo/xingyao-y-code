@@ -442,7 +442,7 @@ def test_save_theme_rejects_junction_destination_without_external_write(tmp_path
     outside = tmp_path / "outside"
     outside.mkdir()
     make_junction(repo.root / "rose", outside)
-    monkeypatch.setattr(type(repo.root), "is_junction", lambda _path: False)
+    monkeypatch.setattr(type(repo.root), "is_junction", lambda _path: False, raising=False)
     with pytest.raises(ThemeError) as exc:
         repo.save_theme(minimal_theme("rose"))
     assert exc.value.code == "asset_escape"
@@ -457,7 +457,7 @@ def test_import_zip_rejects_junction_root_without_external_write(tmp_path, monke
     root = tmp_path / "gui-themes"
     make_junction(root, outside)
     repo = ThemeRepository(root, config_file)
-    monkeypatch.setattr(type(root), "is_junction", lambda _path: False)
+    monkeypatch.setattr(type(root), "is_junction", lambda _path: False, raising=False)
     archive = tmp_path / "evil.zip"
     with ZipFile(archive, "w") as zf:
         zf.writestr("theme.json", json.dumps(minimal_theme("evil")))
