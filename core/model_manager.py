@@ -367,6 +367,21 @@ def delete_model(model_id: str):
             for model in provider["models"][:]:
                 if model["id"] == model_id:
                     provider["models"].remove(model)
+                    # 预置厂商模型记录删除痕迹：sync_preset_provider_models
+                    # 只追加"用户没见过的新模型"，被手动删掉的不会因同步复活
+                    # （如需找回，删除厂商后重新添加即可）
+                    preset_id = provider.get("preset_id")
+                    if preset_id:
+                        try:
+                            preset = get_preset_provider(preset_id)
+                        except KeyError:
+                            preset = None
+                        if preset and any(
+                            m.get("name") == model.get("name") for m in preset.get("models", [])
+                        ):
+                            removed = provider.setdefault("removed_preset_models", [])
+                            if model.get("name") not in removed:
+                                removed.append(model.get("name"))
         # 如果删掉的是 secondary 模型，一并清除
         if data.get("secondary_model_id") == model_id:
             data.pop("secondary_model_id", None)
@@ -547,3 +562,45 @@ def add_preset_provider(preset_id: str, api_key: str) -> str:
         preset["models"],
         preset_id=preset["id"],
     )
+
+
+def sync_preset_provider_models(preset_id: str) -> int:
+    """把预置目录中该厂商新增的模型增量合并进用户配置，返回本次新增数量。
+
+    预置目录（model_catalog.py）更新不会自动同步到已添加过该厂商的旧
+    config.json（添加时是快照拷贝）。按 preset_id 定位厂商，只追加用户
+    配置中缺少的模型（按模型 name 比对），绝不删除：用户手动删掉的
+    预置模型（delete_model 时记录于 removed_preset_models）与自定义
+    模型都保持原样。厂商不存在（未添加过或已删除）时静默返回 0。
+    """
+    preset = get_preset_provider(preset_id)
+    added_count = 0
+
+    def _mutate(data):
+        nonlocal added_count
+        provider = next(
+            (p for p in data.get("providers", []) if p.get("preset_id") == preset_id),
+            None,
+        )
+        if provider is None:
+            return
+        existing_names = {m.get("name") for m in provider.get("models", [])}
+        skipped_names = set(provider.get("removed_preset_models", []))
+        for m in preset["models"]:
+            if m["name"] in existing_names or m["name"] in skipped_names:
+                continue
+            entry = {
+                "id": str(uuid.uuid4())[:8],
+                "name": m["name"],
+                "litellm_model": litellm_model_name(
+                    provider.get("protocol", "openai"), m["name"]
+                ),
+                "context_window": m.get("context_window", 128000),
+            }
+            if "supports_vision" in m:
+                entry["supports_vision"] = bool(m["supports_vision"])
+            provider.setdefault("models", []).append(entry)
+            added_count += 1
+
+    config.update_config(_mutate)
+    return added_count

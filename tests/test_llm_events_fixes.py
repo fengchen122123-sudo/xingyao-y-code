@@ -74,6 +74,37 @@ def test_diff_ready_contains_exact_tool_call_id():
     assert events[0][1]["file_path"] == "sample.py"
 
 
+def test_diff_ready_event_carries_full_diff_beyond_terminal_25_lines():
+    """发给前端的 diff_text 必须是完整 diff（带防失控上限）：
+
+    终端 ANSI 面板保留 25 行截断（text 字段），但 GUI「文件更改」面板
+    消费的 diff_text 若同样被截 25 行，大改动只能看到开头——前端
+    diffView.ts 自带上下文裁剪，后端不应替前端做激进截断。
+    """
+    old_lines = "\n".join(f"old line {i}" for i in range(60)) + "\n"
+    new_lines = "\n".join(f"new line {i}" for i in range(60)) + "\n"
+    events = []
+
+    _show_file_diff(
+        "big.py",
+        old_lines,
+        new_lines,
+        lambda kind, payload: events.append((kind, payload)),
+        panel_title="test diff",
+        truncated_note="test",
+        tool_call_id="edit-big",
+    )
+
+    payload = events[0][1]
+    # 前端拿到完整 diff：60 行改动（60 删 + 60 增）远超 25 行仍完整送达
+    assert payload["diff_text"].count("\n") > 25
+    assert "省略" not in payload["diff_text"]
+    assert payload["diff_text"].count("-old line 59") == 1
+    assert payload["diff_text"].count("+new line 59") == 1
+    # 终端面板（text）仍按 25 行截断，带省略提示
+    assert "省略" in payload["text"]
+
+
 def test_write_file_execution_emits_diff_ready_for_exact_tool_call_id(mocker, tmp_path):
     import core.llm as llm
 

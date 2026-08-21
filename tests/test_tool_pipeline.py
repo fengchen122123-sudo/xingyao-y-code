@@ -143,7 +143,11 @@ def test_large_diff_keeps_full_counts_when_display_is_truncated(tmp_path, monkey
     )
 
     diff = next(payload for kind, payload in events if kind == "diff_ready")
-    assert "... (省略" in diff["diff_text"]
+    # 前端消费的 diff_text 传完整 diff（只有 2000 行防失控上限），
+    # 25 行截断只作用于终端 ANSI 面板（text 字段）
+    assert "... (省略" not in diff["diff_text"]
+    assert "+line-59" in diff["diff_text"]
+    assert "... (省略" in diff["text"]
     assert diff["added"] == 60
     assert diff["removed"] == 0
 

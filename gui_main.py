@@ -11,6 +11,7 @@ import socket
 import threading
 import time
 from pathlib import Path
+from typing import Optional
 import webview
 from gui_bridge import ApiBridge
 from core.gui_lifecycle import ApplicationLifecycle
@@ -19,6 +20,54 @@ logger = logging.getLogger("gui_main")
 # 单实例互斥体句柄的模块级引用：句柄一旦被 GC 回收，Windows 会自动释放
 # 互斥体，单实例保护即失效，因此必须持有引用直到进程退出。
 _SINGLETON_MUTEX = None
+
+# 首个实例写入的自身信息文件：第二个实例检测到互斥体已存在时读取并记日志，
+# 用于诊断"venv 与系统 Python / 安装版双进程共存"问题（谁在运行、哪个版本、
+# 何时启动）。与日志同目录，随进程退出删除；崩溃残留的旧文件按时间戳可辨。
+_INSTANCE_INFO_NAME = "gui_instance.json"
+
+
+def _data_dir() -> Path:
+    return Path(os.environ.get("YCODE_DATA_DIR") or (Path.home() / ".ycode"))
+
+
+def _write_instance_info():
+    """首个实例落盘自身信息（best-effort，失败不影响启动）。"""
+    try:
+        info = {
+            "pid": os.getpid(),
+            "exe": sys.executable,
+            "argv": sys.argv,
+            "python": sys.version.split()[0],
+            "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        target = _data_dir() / _INSTANCE_INFO_NAME
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        logger.debug("写入实例信息文件失败", exc_info=True)
+
+
+def _read_instance_info() -> Optional[dict]:
+    try:
+        target = _data_dir() / _INSTANCE_INFO_NAME
+        if not target.exists():
+            return None
+        return json.loads(target.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _remove_instance_info():
+    """本进程退出时清理实例信息文件（best-effort）。"""
+    try:
+        target = _data_dir() / _INSTANCE_INFO_NAME
+        info = _read_instance_info()
+        # 只有文件仍归属本进程时才删，避免误删新接管实例的信息
+        if info and info.get("pid") == os.getpid():
+            target.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def _configure_runtime_logging():
@@ -227,7 +276,23 @@ def _acquire_single_instance() -> bool:
     _SINGLETON_MUTEX = mutex  # 持有句柄引用，防止被 GC 后互斥体失效
 
     if kernel32.GetLastError() != ERROR_ALREADY_EXISTS:
-        return False  # 本实例是第一个，正常启动
+        # 本实例是第一个：落盘自身信息供后续实例诊断，正常启动
+        _write_instance_info()
+        return False
+
+    # 已有实例在运行：读取其落盘信息记入日志（PID/exe/启动时间），
+    # 用于诊断 venv 与系统 Python / 安装版双进程共存问题
+    existing = _read_instance_info()
+    if existing:
+        logger.warning(
+            "检测到已有实例（互斥体被持有）: PID=%s exe=%s python=%s started=%s",
+            existing.get("pid"),
+            existing.get("exe"),
+            existing.get("python"),
+            existing.get("started_at"),
+        )
+    else:
+        logger.warning("检测到已有实例（互斥体被持有），但无实例信息文件（可能是旧版本实例）")
 
     # 已有实例：找到其主窗口并唤起，然后本进程退出。
     # 关键修复（2026-08-14 12:40）：不用 FindWindowW 按标题找——WebView2 多进程
@@ -284,6 +349,7 @@ def _acquire_single_instance() -> bool:
         wait_result = kernel32.WaitForSingleObject(mutex, 0)
         if wait_result in (WAIT_OBJECT_0, WAIT_ABANDONED):
             logger.info("旧实例已退出并释放互斥锁，本实例接管启动")
+            _write_instance_info()  # 接管后本进程成为唯一实例，更新信息文件
             return False  # 互斥体所有权已归本进程，作为首个实例继续启动
         time.sleep(0.5)
 
@@ -303,6 +369,15 @@ def _acquire_single_instance() -> bool:
 
 def main():
     _configure_runtime_logging()
+    # 无条件记录本进程身份：诊断"venv 与系统 Python / 安装版双进程共存"
+    # 时可直接从日志判断每个启动的进程来自哪个可执行文件
+    logger.info(
+        "GUI 进程启动: PID=%s exe=%s python=%s argv=%s",
+        os.getpid(),
+        sys.executable,
+        sys.version.split()[0],
+        sys.argv,
+    )
     # 单实例保护：已有实例运行时直接激活其窗口并退出本进程，避免双开
     if _acquire_single_instance():
         sys.exit(0)
@@ -435,6 +510,7 @@ def main():
         logger.info("webview.start 已返回（窗口/消息循环结束）")
     finally:
         lifecycle.finalize()
+        _remove_instance_info()
 
 if __name__ == "__main__":
     main()

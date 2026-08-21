@@ -272,6 +272,126 @@ def test_add_preset_provider_uses_shared_catalog_metadata(tmp_path, monkeypatch)
     assert provider["models"][0]["supports_vision"] is False
 
 
+def _preset_catalog():
+    """隔离的假预置目录：model-a/b 是"老"模型，model-new 是目录更新后新增。"""
+    return {
+        "id": "fake-preset",
+        "name": "假预置厂商",
+        "base_url": "https://fake.example.com",
+        "protocol": "openai",
+        "models": [
+            {"name": "model-a", "context_window": 128000},
+            {"name": "model-b", "context_window": 256000, "supports_vision": True},
+            {"name": "model-new", "context_window": 1000000},
+        ],
+    }
+
+
+def _preset_provider_config():
+    return {
+        "active_model_id": "m1",
+        "providers": [
+            {
+                "id": "p1",
+                "name": "假预置厂商",
+                "base_url": "https://fake.example.com",
+                "api_key": "sk-test-key-123",
+                "protocol": "openai",
+                "preset_id": "fake-preset",
+                "models": [
+                    {"id": "m1", "name": "model-a", "litellm_model": "openai/model-a", "context_window": 128000},
+                    {"id": "m2", "name": "custom-x", "litellm_model": "openai/custom-x", "context_window": 64000},
+                ],
+            }
+        ],
+    }
+
+
+def test_sync_preset_models_appends_only_missing(tmp_path, monkeypatch):
+    """同步只追加缺失的预置模型：已有模型与自定义模型原样保留。"""
+    _use_tmp_config(tmp_path, monkeypatch, _preset_provider_config())
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
+
+    added = model_manager.sync_preset_provider_models("fake-preset")
+
+    assert added == 2  # model-b 与 model-new
+    data = model_manager.load_config()
+    names = [m["name"] for m in data["providers"][0]["models"]]
+    assert set(names) == {"model-a", "custom-x", "model-b", "model-new"}
+    # 追加条目带路由与目录元数据
+    appended = next(m for m in data["providers"][0]["models"] if m["name"] == "model-new")
+    assert appended["litellm_model"] == "openai/model-new"
+    assert appended["context_window"] == 1000000
+    vision = next(m for m in data["providers"][0]["models"] if m["name"] == "model-b")
+    assert vision["supports_vision"] is True
+
+
+def test_sync_preset_models_skips_manually_removed(tmp_path, monkeypatch):
+    """用户手动删除的预置模型不得因同步复活（delete_model 已记录删除痕迹）。"""
+    cfg_data = _preset_provider_config()
+    cfg_data["providers"][0]["removed_preset_models"] = ["model-b"]
+    _use_tmp_config(tmp_path, monkeypatch, cfg_data)
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
+
+    added = model_manager.sync_preset_provider_models("fake-preset")
+
+    assert added == 1  # 只有 model-new；model-b 被删除痕迹挡住
+    data = model_manager.load_config()
+    names = [m["name"] for m in data["providers"][0]["models"]]
+    assert "model-b" not in names
+    assert "model-new" in names
+
+
+def test_delete_preset_model_records_removal_trace(tmp_path, monkeypatch):
+    """删除预置厂商的模型时记录删除痕迹，供同步跳过；删除痕迹不重复追加。"""
+    _use_tmp_config(tmp_path, monkeypatch, _preset_provider_config())
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
+
+    model_manager.delete_model("m1")  # model-a 是预置模型
+
+    data = model_manager.load_config()
+    provider = data["providers"][0]
+    assert provider["removed_preset_models"] == ["model-a"]
+    assert [m["name"] for m in provider["models"]] == ["custom-x"]
+
+
+def test_delete_custom_model_records_no_trace(tmp_path, monkeypatch):
+    """删除自定义模型不写删除痕迹（不在预置目录中）。"""
+    _use_tmp_config(tmp_path, monkeypatch, _preset_provider_config())
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
+
+    model_manager.delete_model("m2")  # custom-x 非预置模型
+
+    data = model_manager.load_config()
+    provider = data["providers"][0]
+    assert "removed_preset_models" not in provider
+    assert [m["name"] for m in provider["models"]] == ["model-a"]
+
+
+def test_sync_preset_models_unknown_preset_id_raises(tmp_path, monkeypatch):
+    _use_tmp_config(tmp_path, monkeypatch, _preset_provider_config())
+
+    def _missing(_pid):
+        raise KeyError(f"未知预置厂商: {_pid}")
+
+    monkeypatch.setattr(model_manager, "get_preset_provider", _missing)
+    try:
+        model_manager.sync_preset_provider_models("no-such")
+    except KeyError:
+        pass
+    else:
+        raise AssertionError("未知预置厂商必须抛 KeyError")
+
+
+def test_sync_preset_models_missing_provider_returns_zero(tmp_path, monkeypatch):
+    """厂商未添加（或已删除）时静默返回 0，不写任何配置。"""
+    cfg = _use_tmp_config(tmp_path, monkeypatch, {"providers": [], "active_model_id": None})
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
+
+    assert model_manager.sync_preset_provider_models("fake-preset") == 0
+    assert json.loads(cfg.read_text(encoding="utf-8")) == {"providers": [], "active_model_id": None}
+
+
 def test_update_provider_rewrites_model_route_and_preserves_blank_key(tmp_path, monkeypatch):
     cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
 

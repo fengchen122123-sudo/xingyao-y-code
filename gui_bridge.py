@@ -42,6 +42,7 @@ from core.model_manager import (
     set_secondary_roles,
     update_model as mm_update_model,
     update_provider as mm_update_provider,
+    sync_preset_provider_models as mm_sync_preset_provider_models,
 )
 from core.model_catalog import API_PROTOCOLS, get_preset_providers
 from core.permission_broker import permission_broker
@@ -272,6 +273,10 @@ class ApiBridge:
         # 回合启动互斥：send_user_message 与后台自动汇总都可能启动 turn 线程，
         # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合
         self._turn_start_lock = threading.Lock()
+        # 用户消息排队：会话回合运行中收到的新消息进入该队列（FIFO），
+        # 回合 finally 结束时自动补发队首。条目含 id/text/display_text/
+        # attachments，供前端排队条目展示与取消/插队操作定位
+        self._message_queues: dict[str, list[dict]] = {}
         # 已弃用：多会话并行改为线程本地 workdir 上下文（core.workspace_context），
         # 不再需要进程级串行锁。保留变量定义避免历史引用报错。
         self._turn_workdir_lock = threading.Lock()
@@ -669,9 +674,25 @@ class ApiBridge:
             logger.exception("检查更新失败")
             return {"ok": False, "has_update": False, "msg": f"检查更新失败: {e}"}
 
-    def download_update(self, download_url: str, target_version: str) -> Dict[str, Any]:
-        """开启后台线程流式下载安装包，并通过 JS 事件实时广播进度。"""
+    def download_update(
+        self,
+        download_url: str,
+        target_version: str,
+        part_urls: Optional[List[str]] = None,
+        sha256: str = "",
+        total_size: int = 0,
+    ) -> Dict[str, Any]:
+        """开启后台线程流式下载安装包，并通过 JS 事件实时广播进度。
+
+        分卷模式（part_urls 非空）：Gitee 单附件 100MB 上限导致主安装包
+        按 .partN 分卷发布，下载器顺序下载拼接还原 exe，并用 Release
+        描述里发布的 sha256 强制校验，不匹配即拒绝安装。
+        """
         try:
+            # 分卷列表归一化：pywebview 侧传 null/标量时兜底成空列表
+            clean_parts = [str(u) for u in (part_urls or []) if str(u).strip()]
+            clean_sha = str(sha256 or "").strip().lower()
+
             def _on_progress(data):
                 self.emit_event("update_download_progress", data)
 
@@ -687,6 +708,9 @@ class ApiBridge:
                 on_progress=_on_progress,
                 on_complete=_on_complete,
                 on_error=_on_error,
+                part_urls=clean_parts,
+                expected_sha256=clean_sha,
+                total_size_hint=int(total_size or 0),
             )
             return {"ok": started, "msg": "下载已开始" if started else "已有下载任务在进行中"}
         except Exception as e:
@@ -714,7 +738,9 @@ class ApiBridge:
                 "active_task_count": len(active_tasks),
             }
         except Exception as e:
-            return {"ok": True, "busy": False, "msg": str(e)}
+            # 失败关闭：查询异常时按"有任务"处理，避免安装中断真实运行中的任务
+            logger.exception("查询活动任务失败")
+            return {"ok": False, "busy": True, "msg": str(e)}
 
     def launch_installer(self, file_path: str) -> Dict[str, Any]:
         """唤起外部安装向导并安全退出当前程序（带安装后自清理）。"""
@@ -1009,6 +1035,12 @@ class ApiBridge:
                     name for name, t in getattr(self, "_active_turns", {}).items()
                     if t.is_alive()
                 ],
+                # 排队消息随初始状态返回：重载期间 message_queue 事件丢失，
+                # 前端据此恢复各会话的排队条目展示
+                "message_queues": {
+                    name: self._message_queue_snapshot(name)
+                    for name in list(getattr(self, "_message_queues", {}).keys())
+                },
                 "token_usage": self.get_token_usage(),
                 # 持久化的界面主题（True=浅色），前端启动时据此恢复，关闭重开不变
                 "theme_light": bool(config_data.get("gui_theme_light", False)),
@@ -1435,6 +1467,8 @@ class ApiBridge:
                 "active_model_id": str(session_model.get("id") or ""),
                 "active_model_name": str(session_model.get("name") or "未激活模型"),
                 "reasoning_effort": get_model_reasoning_effort(session_model.get("id")) or "default",
+                # 排队中的用户消息随切换返回：前端免额外往返即可渲染排队条目
+                "message_queue": self._message_queue_snapshot(session_name),
             }
             if is_global:
                 result.update({"workdir": "GLOBAL", "is_global": True})
@@ -1460,6 +1494,12 @@ class ApiBridge:
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
             if self._current_session == old_name:
                 self._set_current_session(final_name)
+            # 排队消息随会话迁移到新名（重命名时无运行回合，但队列可能非空：
+            # 上一回合刚结束、补发线程尚未调度等窗口），快照让前端同步
+            with self._turn_start_lock:
+                if old_name in self._message_queues:
+                    self._message_queues[final_name] = self._message_queues.pop(old_name)
+                    self._emit_message_queue_snapshot(final_name)
             return {"ok": True, "name": final_name, "sessions": self.get_sessions()}
         except Exception as e:
             logger.exception("rename_session 失败")
@@ -1468,9 +1508,15 @@ class ApiBridge:
     def delete_session(self, session_name: str) -> Dict[str, Any]:
         try:
             # M21：回合运行中禁止删除——回合线程会继续往已删会话写消息，
-            # 产生幽灵数据；最小方案是直接拒绝，让用户先停止或等待完成
-            if self._is_turn_active(session_name):
-                return {"ok": False, "success": False, "msg": "该会话正在运行回合，请先停止或等待完成后再删除"}
+            # 产生幽灵数据；最小方案是直接拒绝，让用户先停止或等待完成。
+            # 检查与排队消息清理收进 _turn_start_lock：否则在"旧回合已 pop
+            # _active_turns、补发排队消息的线程尚未调度"窗口内删除会话，
+            # 补发线程随后会把排队消息写进已删除的会话（幽灵数据）
+            with self._turn_start_lock:
+                if self._is_turn_active(session_name):
+                    return {"ok": False, "success": False, "msg": "该会话正在运行回合，请先停止或等待完成后再删除"}
+                # 会话删除后排队消息一并丢弃
+                self._message_queues.pop(session_name, None)
             self._memory.delete_session(session_name)
             if self._current_session == session_name:
                 new_session = f"session_{uuid.uuid4().hex[:6]}"
@@ -1489,8 +1535,17 @@ class ApiBridge:
     def delete_folder_group(self, workdir: str) -> Dict[str, Any]:
         """移除项目文件夹分组：仅删除 DB 记录中的会话与分组记录，绝不删除磁盘文件"""
         try:
+            # 删除前先取组内会话名单：组内会话的排队消息一并丢弃，
+            # 避免补发线程把排队消息写进已删除的会话（幽灵数据）
+            group_sessions = [
+                str(s.get("name") or "")
+                for s in self._memory.get_all_sessions(workdir=workdir, include_empty=True)
+            ]
             self._memory.delete_sessions_by_workdir(workdir)
             self._memory.delete_workspace(workdir)
+            with self._turn_start_lock:
+                for name in group_sessions:
+                    self._message_queues.pop(name, None)
             return {"ok": True, "success": True, "sessions": self.get_sessions()}
         except Exception as e:
             logger.exception("delete_folder_group 失败")
@@ -1821,7 +1876,18 @@ class ApiBridge:
             clean_model_id = str(model_id or "").strip()
             with self._turn_start_lock:
                 if self._is_turn_active(target_session):
-                    return {"ok": False, "msg": "该会话已有正在运行的回合"}
+                    # 回合运行中：消息进入排队（FIFO），回合结束由
+                    # _run_turn_worker 的 finally 补发，不再直接拒绝丢弃
+                    self._message_queues.setdefault(target_session, []).append({
+                        "id": f"q_{uuid.uuid4().hex[:8]}",
+                        "text": full_text,
+                        "display_text": clean_text,
+                        "attachments": attach_list,
+                        "queued_at": time.time(),
+                    })
+                    # 快照在锁内发：保证与补发/取消等后续变更的顺序一致
+                    self._emit_message_queue_snapshot(target_session)
+                    return {"ok": True, "queued": True}
 
                 # pending 新会话：先用首条消息前 12 字命名，立即生效，
                 # 避免等整个回合跑完才由 _maybe_auto_rename 改名。
@@ -1849,30 +1915,101 @@ class ApiBridge:
                 # 用户主动发起新对话：重置该会话的自动汇总标志，
                 # 下一批后台任务完成时可以再次触发自动汇总（与 CLI 行为一致）；
                 # 同时解除"用户取消"标记，恢复自动汇总与计划续推
-                with self._bg_summary_lock:
-                    self._bg_summary_triggered.discard(target_session)
-                self._user_cancelled_sessions.discard(target_session)
-
-                cancel_event = threading.Event()
-                self._cancel_events[target_session] = cancel_event
-                turn_kwargs = {"display_text": clean_text} if attach_list else {}
-                if workdir:
-                    # 懒创建会话：前端 pending 新会话在首条消息时才落库，
-                    # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
-                    turn_kwargs["pending_workdir"] = str(workdir)
-                worker = threading.Thread(
-                    target=self._run_turn_worker_serialized,
-                    args=(full_text, target_session),
-                    kwargs=turn_kwargs,
-                    daemon=True,
-                    name=f"gui-turn-{target_session}",
+                # （清理解构在 _spawn_turn_worker 内，与排队补发路径同源）
+                self._spawn_turn_worker(
+                    full_text,
+                    target_session,
+                    display_text=clean_text,
+                    pending_workdir=str(workdir) if workdir else "",
                 )
-                self._active_turns[target_session] = worker
-                worker.start()
             return {"ok": True}
         except Exception as e:
             logger.exception("send_user_message 失败")
             return {"ok": False, "msg": str(e)}
+
+    def _spawn_turn_worker(self, full_text: str, target_session: str,
+                           display_text: str = "", pending_workdir: str = "") -> None:
+        """启动一个新回合线程。调用方必须已持有 _turn_start_lock 且确认
+        _is_turn_active(target_session) 为 False（检查+启动原子）。
+
+        send_user_message 与排队补发（_drain_message_queue）共用本路径：
+        后台汇总标志重置与"用户取消"解除对两者语义一致——排队消息也是
+        用户主动发的新消息。
+        """
+        with self._bg_summary_lock:
+            self._bg_summary_triggered.discard(target_session)
+        self._user_cancelled_sessions.discard(target_session)
+        cancel_event = threading.Event()
+        self._cancel_events[target_session] = cancel_event
+        turn_kwargs: dict = {}
+        if display_text:
+            turn_kwargs["display_text"] = display_text
+        if pending_workdir:
+            # 懒创建会话：前端 pending 新会话在首条消息时才落库，
+            # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
+            turn_kwargs["pending_workdir"] = str(pending_workdir)
+        worker = threading.Thread(
+            target=self._run_turn_worker_serialized,
+            args=(full_text, target_session),
+            kwargs=turn_kwargs,
+            daemon=True,
+            name=f"gui-turn-{target_session}",
+        )
+        self._active_turns[target_session] = worker
+        worker.start()
+
+    def _message_queue_snapshot(self, session_name: str) -> List[Dict[str, Any]]:
+        """排队消息的前端展示快照（展示文本用 display_text，不含 @路径）。"""
+        queue = self._message_queues.get(session_name) or []
+        return [
+            {
+                "id": str(item.get("id") or ""),
+                "text": str(item.get("display_text") or item.get("text") or ""),
+                "attachments": [str(p) for p in (item.get("attachments") or [])],
+            }
+            for item in queue
+        ]
+
+    def _emit_message_queue_snapshot(self, session_name: str) -> None:
+        """推送某会话排队消息全量快照（前端幂等替换渲染，防漂移）。"""
+        try:
+            self.emit_event("message_queue", {
+                "session_name": session_name,
+                "queue": self._message_queue_snapshot(session_name),
+            })
+        except Exception:
+            logger.debug("推送排队消息快照失败", exc_info=True)
+
+    def _drain_message_queue(self, session_name: str) -> None:
+        """回合结束后按 FIFO 补发该会话排队中的用户消息。
+
+        只在回合线程 finally 尾部调用：此刻本回合已从 _active_turns 移除，
+        若并发竞态下新回合已被 send_user_message 建立（_is_turn_active 为
+        True），剩余队列留给那个回合自己的 finally 处理。
+        """
+        if self._shutting_down:
+            return
+        try:
+            with self._turn_start_lock:
+                if self._is_turn_active(session_name):
+                    return
+                queue = self._message_queues.get(session_name)
+                if not queue:
+                    return
+                entry = queue.pop(0)
+                try:
+                    self._spawn_turn_worker(
+                        str(entry.get("text") or ""),
+                        session_name,
+                        display_text=str(entry.get("display_text") or ""),
+                    )
+                except Exception:
+                    logger.exception("补发排队消息失败")
+                    queue.insert(0, entry)
+                    return
+                self._emit_message_queue_snapshot(session_name)
+        except Exception:
+            logger.exception("排队消息补发流程异常")
 
     def stop_current_turn(self, session_name: str = "") -> Dict[str, Any]:
         try:
@@ -1926,6 +2063,61 @@ class ApiBridge:
                     logger.debug("停止回合时取消前台子代理失败", exc_info=True)
             return {"ok": True}
         except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def get_message_queue(self, session_name: str = "") -> Dict[str, Any]:
+        """查询指定会话当前排队中的用户消息（前端会话切换/重载时拉取）。"""
+        target = session_name or self._current_session
+        return {
+            "ok": True,
+            "session_name": target,
+            "queue": self._message_queue_snapshot(target),
+        }
+
+    def cancel_queued_message(self, session_name: str, message_id: str) -> Dict[str, Any]:
+        """取消一条排队中的消息：仅从队列移除，不影响正在执行的回合。"""
+        try:
+            target = session_name or self._current_session
+            message_id = str(message_id or "")
+            with self._turn_start_lock:
+                queue = self._message_queues.get(target) or []
+                remaining = [m for m in queue if m.get("id") != message_id]
+                removed = len(queue) - len(remaining)
+                if removed:
+                    if remaining:
+                        self._message_queues[target] = remaining
+                    else:
+                        self._message_queues.pop(target, None)
+                    self._emit_message_queue_snapshot(target)
+            return {"ok": True, "removed": removed}
+        except Exception as e:
+            logger.exception("cancel_queued_message 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def jump_queue(self, session_name: str, message_id: str) -> Dict[str, Any]:
+        """插队发送：把排队消息移到队首并停止当前正在执行的回合；
+        回合结束后 _drain_message_queue 立即补发队首（即刚插队的这条），
+        其余排队消息顺位后移不受影响。
+        """
+        try:
+            target = session_name or self._current_session
+            message_id = str(message_id or "")
+            with self._turn_start_lock:
+                queue = self._message_queues.get(target) or []
+                entry = next((m for m in queue if m.get("id") == message_id), None)
+                if entry is None:
+                    return {"ok": False, "msg": "该消息已不在排队中"}
+                queue.remove(entry)
+                queue.insert(0, entry)
+                self._emit_message_queue_snapshot(target)
+                turn_active = self._is_turn_active(target)
+            if turn_active:
+                # 停止当前回合（取消事件 + 硬中断在飞请求等完整语义），
+                # 不直接起新回合：旧回合的 finally 会原子地补发队首消息
+                self.stop_current_turn(target)
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("jump_queue 失败")
             return {"ok": False, "msg": str(e)}
 
     def _run_turn_worker_serialized(self, user_text: str, session_name: str, *args, **kwargs):
@@ -2188,6 +2380,9 @@ class ApiBridge:
                     daemon=True,
                     name="gui-bg-summary-recheck",
                 ).start()
+            # finally 末尾：补发排队中的用户消息（FIFO）。放在所有清理之后，
+            # 保证补发回合的 turn_start 事件一定晚于本回合的终态事件到达前端
+            self._drain_message_queue(session_name)
 
     def _on_background_task_finished(self, task_id: str, command: str, returncode: int,
                                      session_id: str = "", log_tail: str = "") -> None:
@@ -3438,6 +3633,21 @@ class ApiBridge:
             }
         except Exception as e:
             logger.exception("add_preset_provider 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def sync_preset_models(self, preset_id: str) -> Dict[str, Any]:
+        """把预置目录中该厂商新增的模型增量合并进用户配置（只追加不删除）。"""
+        try:
+            added = mm_sync_preset_provider_models(str(preset_id))
+            self._sync_active_model_context()
+            return {
+                "ok": True,
+                "added": added,
+                "settings": self.get_model_settings(),
+                "msg": f"已同步 {added} 个新模型" if added else "预置模型已是最新",
+            }
+        except Exception as e:
+            logger.exception("sync_preset_models 失败")
             return {"ok": False, "msg": str(e)}
 
     def add_provider(self, name: str, base_url: str, api_key: str, protocol: str) -> Dict[str, Any]:
