@@ -1,5 +1,5 @@
 import type { PyWebViewAPI } from '../types/pywebview';
-import type { GuiTheme, GuiThemeResult, ThemeRegionId } from './types';
+import type { GuiTheme, GuiThemeError, GuiThemeResult, ThemeRegionId } from './types';
 
 const SEMANTIC_VARIABLES = {
   background_app: '--theme-background-app',
@@ -51,13 +51,31 @@ export interface AppliedTheme {
   dispose(): void;
 }
 
+export class GuiThemeRuntimeError extends Error implements GuiThemeError {
+  readonly code: string;
+  readonly path: string;
+
+  constructor(code: string, path: string, message: string) {
+    super(message);
+    this.name = 'GuiThemeRuntimeError';
+    this.code = code;
+    this.path = path;
+  }
+}
+
 function tokenValue(name: string, value: string | number): string {
   return typeof value === 'number' && PIXEL_TOKENS.has(name) ? `${value}px` : String(value);
 }
 
 function assetError(result: GuiThemeResult<AssetSuccess>): Error {
-  if (!result.ok) return new Error(result.error.message);
-  return new Error('主题图片响应格式无效');
+  if (!result.ok) {
+    return new GuiThemeRuntimeError(
+      result.error.code,
+      result.error.path,
+      result.error.message,
+    );
+  }
+  return new GuiThemeRuntimeError('invalid_asset_response', 'asset_path', '主题图片响应格式无效');
 }
 
 function decodeAsset(result: GuiThemeResult<AssetSuccess>): Blob {
@@ -68,7 +86,7 @@ function decodeAsset(result: GuiThemeResult<AssetSuccess>): Blob {
   try {
     binary = atob(result.base64);
   } catch {
-    throw new Error('主题图片 Base64 数据无效');
+    throw new GuiThemeRuntimeError('invalid_asset_base64', 'asset_path', '主题图片 Base64 数据无效');
   }
   const bytes = new Uint8Array(binary.length);
   for (let index = 0; index < binary.length; index += 1) {
