@@ -5,6 +5,7 @@ import { useAppStore } from './appStore';
 describe('appStore update functionality', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
+    localStorage.clear();
     (window as any).pywebview = {
       api: {
         check_update: vi.fn(),
@@ -14,6 +15,35 @@ describe('appStore update functionality', () => {
         launch_installer: vi.fn(),
       },
     };
+  });
+
+  it('skips silent checkUpdate within cooldown window', async () => {
+    const store = useAppStore();
+    const api = (window as any).pywebview.api;
+    api.check_update.mockResolvedValue({ ok: true, has_update: false });
+
+    // 距上次检查不足 1 小时：静默检查应被跳过
+    localStorage.setItem('ycode-last-update-check', String(Date.now()));
+    await store.checkUpdate(false);
+    expect(api.check_update).not.toHaveBeenCalled();
+    expect(store.updateState.status).toBe('idle');
+
+    // 手动检查不受防抖限制
+    await store.checkUpdate(true);
+    expect(api.check_update).toHaveBeenCalledTimes(1);
+  });
+
+  it('performs silent checkUpdate after cooldown expired and records timestamp', async () => {
+    const store = useAppStore();
+    const api = (window as any).pywebview.api;
+    api.check_update.mockResolvedValue({ ok: true, has_update: false });
+
+    // 上次检查在 2 小时前：应正常发起请求并刷新时间戳
+    localStorage.setItem('ycode-last-update-check', String(Date.now() - 2 * 3600 * 1000));
+    await store.checkUpdate(false);
+    expect(api.check_update).toHaveBeenCalledTimes(1);
+    const recorded = Number(localStorage.getItem('ycode-last-update-check'));
+    expect(Date.now() - recorded).toBeLessThan(5000);
   });
 
   it('updates state on checkUpdate when new version is available', async () => {

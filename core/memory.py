@@ -354,6 +354,12 @@ class MemoryManager:
                         cursor.execute("DROP TABLE IF EXISTS sessions")
                         cursor.execute("DROP TABLE IF EXISTS messages")
 
+                # 历史遗留清理：session_diffs 表来自 1.2.5 开发期的 diff 持久化
+                # 方案（后按用户决定移除，仅保留实时 diff_ready 显示）。现行代码
+                # 无任何读写，这里幂等清表，避免旧构建留下的表与数据长期残留；
+                # 若将来恢复持久化，CREATE TABLE 会按新 schema 重建。
+                cursor.execute("DROP TABLE IF EXISTS session_diffs")
+
                 # 创建一个叫 sessions 的表，加入摘要字段
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS sessions (

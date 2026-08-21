@@ -22,6 +22,7 @@ import type {
   ToolFinishEventData,
   DiffReadyEventData,
   SubagentProgressEventData,
+  QueuedMessage,
 } from '../types/pywebview';
 import { formatPermMode } from '../utils/markdown';
 import {
@@ -278,6 +279,10 @@ export const useAppStore = defineStore('app', {
     // 排队也算运行中（同时在 runningSessions 中），此集合仅用于 UI 区分
     // "排队等其他会话"与"正在执行"；turn_start/终态事件到达时清除
     queuedSessions: [] as string[],
+    // 会话消息排队：回合运行期间发送的消息按 FIFO 入队（键为会话名）。
+    // 后端每次入队/取消/插队/补发都推送 message_queue 全量快照，
+    // 前端幂等替换渲染，回合结束后自动补发队首
+    messageQueues: {} as Record<string, QueuedMessage[]>,
     // 非当前会话的状态提醒点：sessionName → 'green'(完成) | 'yellow'(待确认) | 'red'(报错)
     // 仅给非当前窗口打点，切换到该会话时清除
     sessionStatusDots: {} as Record<string, 'green' | 'yellow' | 'red'>,
@@ -320,6 +325,10 @@ export const useAppStore = defineStore('app', {
       downloadUrl: '',
       assetName: '',
       assetSize: 0,
+      // 分卷下载（Gitee 单附件 100MB 限制）：非空时 downloadUrl 不再直接使用
+      partUrls: [] as string[],
+      // 官方 SHA256（来自 Release 描述），下载完成后后端强制校验
+      sha256: '',
       downloadProgress: 0,
       downloadedBytes: 0,
       totalBytes: 0,
@@ -368,6 +377,11 @@ export const useAppStore = defineStore('app', {
     // 批次D：当前会话是否在排队等其他会话的回合释放锁（turn_queued）
     currentSessionQueued(state): boolean {
       return !!state.currentSessionName && state.queuedSessions.includes(state.currentSessionName);
+    },
+
+    // 当前会话排队中的消息（输入框上方排队条渲染源）
+    currentMessageQueue(state): QueuedMessage[] {
+      return (state.currentSessionName && state.messageQueues[state.currentSessionName]) || [];
     },
 
     // 按供应商分组的模型列表，ModelCascader 与 Subpage(models) 共用
@@ -652,6 +666,9 @@ export const useAppStore = defineStore('app', {
           : [];
         this.runningSessions = activeSessions;
         this.queuedSessions = [];
+        // 排队消息随初始状态恢复：窗口重载期间 message_queue 事件已丢失，
+        // 后端在初始状态里带回所有会话的队列快照
+        this.messageQueues = ((init as any).message_queues || {}) as Record<string, QueuedMessage[]>;
         for (const name of activeSessions) {
           this._getSessionRuntime(name).running = true;
         }
@@ -904,6 +921,14 @@ export const useAppStore = defineStore('app', {
 
         if (res.sessions) this.sessionGroups = res.sessions;
 
+        // 排队中的消息随切换响应恢复：切换到该会话即可见排队条目
+        // （后端在该响应里带回该会话的队列快照）
+        if (Array.isArray(res.message_queue)) {
+          this.messageQueues[sessionName] = res.message_queue as QueuedMessage[];
+        } else {
+          delete this.messageQueues[sessionName];
+        }
+
         // 会话级模型隔离：切到已有会话时恢复该会话绑定的模型，
         // 避免 A 会话切到 B 会话后 A 的模型被全局覆盖。
         // 版本号变化 = 在途期间用户又切了模型，跳过本次恢复（本地已是新值）
@@ -1117,6 +1142,8 @@ export const useAppStore = defineStore('app', {
           // 中均不应再有该会话条目。
           this.runningSessions = this.runningSessions.filter(s => s !== sessionName);
           this.queuedSessions = this.queuedSessions.filter(s => s !== sessionName);
+          // 排队消息随会话删除一并清理（后端已同步清空，此处防快照事件丢失残留）
+          delete this.messageQueues[sessionName];
           delete this.sessionRuntimeByName[sessionName];
           if (sessionName === this.currentSessionName && res.current_session) {
             await this.switchSession(res.current_session, '新会话');
@@ -1182,16 +1209,46 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 取消一条排队中的消息：仅从队列移除，不影响正在执行的回合。
+    // 队列条目的移除由后端 message_queue 快照事件驱动，本地不增量删
+    async cancelQueuedMessage(sessionName: string, messageId: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.cancel_queued_message(sessionName, messageId);
+        if (!res || !res.ok) {
+          this.notifyChat('取消排队失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyChat('取消排队失败: ' + err);
+      }
+    },
+
+    // 插队发送：把排队消息移到队首并停止当前回合，回合结束后优先补发它
+    // （其余排队消息顺位后移）。停止与补发均由后端完成，前端只透传意图
+    async jumpQueue(sessionName: string, messageId: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.jump_queue(sessionName, messageId);
+        if (!res || !res.ok) {
+          this.notifyChat('插队发送失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyChat('插队发送失败: ' + err);
+      }
+    },
+
     async sendMessage(text: string, attachments?: string[]) {
-      // 生成中禁止再次发送（无论调用方是否已自行判断，均在此兜底拦截）
+      // 生成中不再拦截发送：后端把消息加入该会话排队（FIFO），回合结束后
+      // 自动补发。本地跳过乐观渲染——排队消息还没真正进入回合，用户气泡
+      // 与 running 占位等补发回合的 turn_start 到达时再渲染；排队条目由
+      // 后端 message_queue 快照事件驱动显示在输入框上方
+      const willQueue = this.runningSessions.includes(this.currentSessionName);
       const attachList = (attachments || []).filter(p => p && p.trim());
       if (!text.trim() && !attachList.length) return;
-      // M30 修复：拦截必须用户可见——调用方已清空输入框，
-      // 静默 return 会让用户以为消息已发出（实际被吞）
-      if (this.runningSessions.includes(this.currentSessionName)) {
-        this.notifyChat('当前会话正在生成中，请先停止或稍后再发送');
-        return;
-      }
       const api = window.pywebview && window.pywebview.api;
       if (!api) {
         // 本地无后端离线模拟，方便纯前端调试
@@ -1236,29 +1293,32 @@ export const useAppStore = defineStore('app', {
           delete this.sessionRuntimeByName[draftKey];
           this.currentSessionName = sessionName;
         }
-        this._setSessionRunning(sessionName, true);
-        this._bindSessionRuntime(sessionName);
-        // 乐观渲染：串行排队时后端 turn_start 要等拿到 _turn_workdir_lock 才发，
-        // 期间新会话若无任何气泡会显示为一片空白（看似"没发送"）。
-        // 发送成功后立即渲染用户消息 + running 占位；turn_start 到达时去重占位，
-        // 用户消息已有则不重复添加。
-        const trimmed = text.trim();
-        if (trimmed) {
-          const runtimeMsgs = this._getSessionRuntime(sessionName).messages;
-          const lastMsg = runtimeMsgs[runtimeMsgs.length - 1];
-          if (!(lastMsg && lastMsg.role === 'user' && lastMsg.content === trimmed)) {
-            runtimeMsgs.push({ role: 'user', content: trimmed });
-          }
-          runtimeMsgs.push({
-            role: 'assistant',
-            content: '',
-            reasoning_content: '',
-            tool_calls: [],
-            legacy_diffs: [],
-            execution_state: 'running',
-          });
-          if (this.currentSessionName === sessionName) {
-            this._bindSessionRuntime(sessionName);
+        if (!willQueue) {
+          this._setSessionRunning(sessionName, true);
+          this._bindSessionRuntime(sessionName);
+          // 乐观渲染：串行排队时后端 turn_start 要等拿到 _turn_workdir_lock 才发，
+          // 期间新会话若无任何气泡会显示为一片空白（看似"没发送"）。
+          // 发送成功后立即渲染用户消息 + running 占位；turn_start 到达时去重占位，
+          // 用户消息已有则不重复添加。（willQueue 时整段跳过：排队消息由
+          // message_queue 快照渲染排队条目，气泡等补发回合的 turn_start）
+          const trimmed = text.trim();
+          if (trimmed) {
+            const runtimeMsgs = this._getSessionRuntime(sessionName).messages;
+            const lastMsg = runtimeMsgs[runtimeMsgs.length - 1];
+            if (!(lastMsg && lastMsg.role === 'user' && lastMsg.content === trimmed)) {
+              runtimeMsgs.push({ role: 'user', content: trimmed });
+            }
+            runtimeMsgs.push({
+              role: 'assistant',
+              content: '',
+              reasoning_content: '',
+              tool_calls: [],
+              legacy_diffs: [],
+              execution_state: 'running',
+            });
+            if (this.currentSessionName === sessionName) {
+              this._bindSessionRuntime(sessionName);
+            }
           }
         }
         const res = await api.send_user_message(
@@ -1284,7 +1344,9 @@ export const useAppStore = defineStore('app', {
           // 仅当用户仍停留在该会话（currentSessionName === sessionName）
           // 时才重新绑定以保持顶层引用与 runtime 一致。
           // 验证思路：发送后立即切换会话并模拟失败返回，当前会话消息不被覆盖。
-          this._setSessionRunning(sessionName, false);
+          // willQueue 时该会话原有回合仍在跑（入队失败不影响它），
+          // 不能清除运行态，否则停止按钮消失、重复发送不再入队
+          if (!willQueue) this._setSessionRunning(sessionName, false);
           this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '消息发送失败: ' + (res && res.msg ? res.msg : '未知错误') });
           if (pendingDir) {
             revertGhostSession();
@@ -1295,8 +1357,8 @@ export const useAppStore = defineStore('app', {
         // 成功时不主动改 running，由后续 turn_start/turn_finish/turn_cancelled 等事件驱动
       } catch (err) {
         // #13 同上：catch 分支也只向目标会话 runtime 写入错误，
-        // 仅用户仍在该会话时才恢复绑定
-        this._setSessionRunning(sessionName, false);
+        // 仅用户仍在该会话时才恢复绑定（willQueue 时原有回合仍在跑，不清运行态）
+        if (!willQueue) this._setSessionRunning(sessionName, false);
         this.connected = false;
         this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '消息发送失败: ' + err });
         if (pendingDir) {
@@ -1615,6 +1677,25 @@ export const useAppStore = defineStore('app', {
         // 必须整体重置：仅 show=false 会残留 reqId/sessionName，
         // switchSession 重显逻辑会把已失效的卡片复活，点击后报“权限响应发送失败”
         this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' };
+      } else if (type === 'message_queue') {
+        // 排队消息全量快照：幂等替换该会话队列。后端在入队/取消/插队/补发
+        // 后都会推送，前端不做增量合并，天然免疫事件乱序与丢失漂移
+        const qSession = String(data.session_name || eventSession || '');
+        const rawQueue = Array.isArray(data.queue) ? data.queue : [];
+        const normalized: QueuedMessage[] = (rawQueue as any[])
+          .map((m: any) => ({
+            id: String((m && m.id) || ''),
+            text: String((m && m.text) || ''),
+            attachments: Array.isArray(m && m.attachments) ? m.attachments.map(String) : [],
+          }))
+          .filter((m: QueuedMessage) => !!m.id);
+        if (qSession) {
+          if (normalized.length) {
+            this.messageQueues[qSession] = normalized;
+          } else {
+            delete this.messageQueues[qSession];
+          }
+        }
       } else if (type === 'notice') {
         // 后端桥事件 notice：与当前会话相关，写入对话流
         if (data.message) this.notifyChat(String(data.message));
@@ -2278,6 +2359,25 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    async syncPresetModels(presetId: string) {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.sync_preset_models(presetId);
+        if (res?.ok && res.settings) {
+          this.applyModelSettings(res.settings);
+          this.notifyModal('供应商', res.msg || '预置模型已同步');
+          return res;
+        }
+        this.notifyModal('供应商', '同步预置模型失败: ' + (res?.msg || '未知错误'));
+        return null;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('供应商', '同步预置模型失败: ' + err);
+        return null;
+      }
+    },
+
     async updateProvider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string) {
       const api = this._api();
       if (!api) return null;
@@ -2411,9 +2511,22 @@ export const useAppStore = defineStore('app', {
       const api = this._api();
       if (!api) return;
 
+      // 静默检查防抖：距上次检查不足冷却窗口则跳过，避免崩溃循环/频繁重启
+      // 反复请求 Gitee API 触发限流；手动检查不受限制
+      const UPDATE_CHECK_COOLDOWN_MS = 3600 * 1000;
+      if (!manual) {
+        try {
+          const last = Number(localStorage.getItem('ycode-last-update-check') || '0');
+          if (last && Date.now() - last < UPDATE_CHECK_COOLDOWN_MS) {
+            return;
+          }
+        } catch {}
+      }
+
       this.updateState.status = 'checking';
       try {
         const res = await api.check_update(manual);
+        try { localStorage.setItem('ycode-last-update-check', String(Date.now())); } catch {}
         if (res && res.ok) {
           this.updateState.hasUpdate = !!res.has_update;
           this.updateState.latestVersion = res.latest_version || '';
@@ -2423,6 +2536,9 @@ export const useAppStore = defineStore('app', {
           this.updateState.downloadUrl = res.download_url || '';
           this.updateState.assetName = res.asset_name || '';
           this.updateState.assetSize = Number(res.asset_size || 0);
+          // 分卷信息：非空时下载走分卷拼接路径；SHA256 由后端下载完成后强制校验
+          this.updateState.partUrls = Array.isArray(res.part_urls) ? res.part_urls.map(String) : [];
+          this.updateState.sha256 = String(res.sha256 || '');
           this.updateState.status = res.has_update ? 'available' : 'idle';
 
           if (res.has_update && manual) {
@@ -2446,14 +2562,23 @@ export const useAppStore = defineStore('app', {
 
     async startDownloadUpdate() {
       const api = this._api();
-      if (!api || !this.updateState.downloadUrl) return;
+      // 分卷模式下 downloadUrl 是 Release 页面链接（非直链），启动条件放宽为
+      // "有直链或有分卷列表"二者其一即可
+      if (!api) return;
+      if (!this.updateState.downloadUrl && this.updateState.partUrls.length === 0) return;
 
       this.updateState.status = 'downloading';
       this.updateState.downloadProgress = 0;
       this.updateState.downloadedBytes = 0;
 
       try {
-        const res = await api.download_update(this.updateState.downloadUrl, this.updateState.latestVersion);
+        const res = await api.download_update(
+          this.updateState.downloadUrl,
+          this.updateState.latestVersion,
+          this.updateState.partUrls,
+          this.updateState.sha256,
+          this.updateState.assetSize,
+        );
         if (!res || !res.ok) {
           this.updateState.status = 'available';
           this.notifyModal('下载失败', res?.msg || '无法启动下载任务');

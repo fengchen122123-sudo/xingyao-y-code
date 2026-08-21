@@ -448,6 +448,24 @@ def test_parse_elevated_args():
     assert opts2 == {"scope": "user", "dir": "D:\\Y-code", "cli": True, "shortcut": True}
 
 
+# ── 浏览目录自动追加 Y-code 子目录 ─────────────────────────────
+
+def test_normalize_browsed_install_dir_appends_ycode_subdir():
+    """浏览选中的目录自动追加 Y-code 子目录：选盘符根目录不再平铺进根目录。"""
+    assert ycode_setup.normalize_browsed_install_dir("D:\\") == "D:\\Y-code"
+    assert ycode_setup.normalize_browsed_install_dir("D:") == "D:\\Y-code"
+    assert ycode_setup.normalize_browsed_install_dir("E:/") == "E:\\Y-code"
+    assert ycode_setup.normalize_browsed_install_dir("D:\\MyApps") == "D:\\MyApps\\Y-code"
+    assert ycode_setup.normalize_browsed_install_dir("D:\\tools\\") == "D:\\tools\\Y-code"
+
+
+def test_normalize_browsed_install_dir_keeps_ycode_named_dir():
+    """所选目录本身已叫 Y-code（大小写不敏感）时不重复追加。"""
+    assert ycode_setup.normalize_browsed_install_dir("D:\\Y-code") == "D:\\Y-code"
+    assert ycode_setup.normalize_browsed_install_dir("D:\\y-code") == "D:\\y-code"
+    assert ycode_setup.normalize_browsed_install_dir("D:\\y-CODE\\") == "D:\\y-CODE"
+
+
 # ── 审计修复回归：T21 / M46 / M47 ─────────────────────────────
 
 def test_parse_elevated_args_cli_10_is_not_true():

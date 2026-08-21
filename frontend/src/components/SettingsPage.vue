@@ -133,6 +133,13 @@
               <div class="readonly-field">{{ selectedProvider.base_url }}</div>
               <label class="field-label">API 格式</label>
               <div class="readonly-field">{{ protocolLabel(selectedProvider.protocol || 'openai') }}</div>
+              <button
+                data-test="sync-preset-models"
+                class="secondary-button compact sync-preset-button"
+                :disabled="syncingPreset"
+                @click="syncPresetModels"
+              >{{ syncingPreset ? '同步中…' : '同步预置模型更新' }}</button>
+              <p class="sync-preset-hint">拉取预置目录新增模型；已有模型不受影响，手动删除的模型不会恢复</p>
             </template>
             <template v-else>
               <label class="field-label">名称</label>
@@ -410,6 +417,7 @@ const presetApiKey = ref('');
 const showPresetKey = ref(false);
 const showProviderKey = ref(false);
 const saving = ref(false);
+const syncingPreset = ref(false);
 const testingId = ref('');
 const testResults = reactive<Record<string, { status: 'testing' | 'ok' | 'fail'; msg: string }>>({});
 
@@ -526,6 +534,16 @@ async function savePreset() {
     presetApiKey.value = '';
     selectProvider(existing?.id || result.provider_id);
   }
+}
+
+// 预置目录（后端 model_catalog.py）更新后，把该厂商新增的模型增量合并进
+// 用户配置：只追加缺失模型，不影响已有模型（用户手动删除的不会恢复）
+async function syncPresetModels() {
+  const provider = selectedProvider.value;
+  if (!provider?.preset_id) return;
+  syncingPreset.value = true;
+  await store.syncPresetModels(provider.preset_id);
+  syncingPreset.value = false;
 }
 
 async function saveCustomProvider() {
@@ -784,6 +802,8 @@ onMounted(async () => {
 .primary-button { background: var(--text); color: var(--bg0); }
 .secondary-button { background: var(--bg3); color: var(--text); }
 .secondary-button.compact { margin: 0; min-height: 34px; }
+.sync-preset-button { margin-top: 18px; align-self: flex-start; }
+.sync-preset-hint { margin: 8px 0 0; color: var(--text-faint); font-size: 11px; }
 .danger-icon { border: 0; background: transparent; color: var(--text-faint); font-size: 18px; }
 .danger-icon:hover, .row-actions .danger:hover { color: var(--red); }
 .model-list-header { display: flex; align-items: center; justify-content: space-between; margin: 34px 0 10px; }

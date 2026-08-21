@@ -1,5 +1,31 @@
 <template>
   <div id="input-area">
+    <!-- 排队消息条：回合运行期间发送的消息在此排队，不打断当前任务；
+         删除按钮取消排队，闪电按钮停止当前任务并优先发送该消息 -->
+    <div v-if="queueItems.length" id="queue-strip">
+      <div
+        v-for="(item, idx) in queueItems"
+        :key="item.id"
+        class="queue-item"
+        data-test="queue-item"
+      >
+        <span class="queue-badge">{{ idx + 1 }}</span>
+        <span class="queue-text" :title="item.text">{{ item.text }}</span>
+        <button
+          class="queue-btn queue-jump-btn"
+          data-test="queue-jump-btn"
+          title="停止当前任务并优先发送这条消息"
+          @click="store.jumpQueue(store.currentSessionName, item.id)"
+        ><AppIcon name="zap" :size="13" :stroke-width="2" /></button>
+        <button
+          class="queue-btn queue-cancel-btn"
+          data-test="queue-cancel-btn"
+          title="取消排队"
+          @click="store.cancelQueuedMessage(store.currentSessionName, item.id)"
+        ><AppIcon name="trash" :size="13" :stroke-width="2" /></button>
+      </div>
+    </div>
+
     <div id="input-wrap">
       <div id="input-box" ref="inputBoxRef" :class="{ 'drop-hover': dragging }">
         <AttachmentChips :items="attachments" @remove="removeAttachment" />
@@ -71,11 +97,11 @@
           >{{ store.activeModelName || '选择模型' }} <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" /></button>
           <button
             id="send-btn"
-            :class="{ stop: store.currentSessionRunning, active: !store.currentSessionRunning && (!!inputVal.trim() || attachments.length > 0) }"
-            :title="store.currentSessionRunning ? '停止生成 (Esc)' : '发送消息 (Enter)'"
+            :class="{ stop: sendStopMode, active: !sendStopMode && hasInputContent }"
+            :title="sendStopMode ? '停止生成 (Esc)' : (store.currentSessionRunning ? '排队发送 (Enter)' : '发送消息 (Enter)')"
             @click="handleSend"
           >
-            <AppIcon v-if="store.currentSessionRunning" name="square" :size="14" :stroke-width="2" />
+            <AppIcon v-if="sendStopMode" name="square" :size="14" :stroke-width="2" />
             <AppIcon v-else name="arrow-up" :size="16" :stroke-width="2.25" />
           </button>
         </div>
@@ -169,6 +195,14 @@ const ctxTooltip = computed(() => {
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
 
+// 排队消息：回合运行期间发送的消息（后端 message_queue 快照驱动）
+const queueItems = computed(() => store.currentMessageQueue);
+// 输入框是否有可发送内容（文本或附件）
+const hasInputContent = computed(() => !!inputVal.value.trim() || attachments.value.length > 0);
+// 运行中且没有新内容时发送按钮为"停止"态；有内容则保持"发送"态
+// （运行中发送 = 加入排队，不打断正在执行的任务）
+const sendStopMode = computed(() => store.currentSessionRunning && !hasInputContent.value);
+
 // 输入框容器：拖拽文件进入时高亮提示，drop 由原生事件桥（pywebview）提供完整路径
 const inputBoxRef = ref<HTMLElement | null>(null);
 onMounted(() => { if (inputBoxRef.value) bindDrop(inputBoxRef.value); });
@@ -193,7 +227,9 @@ async function handlePickFiles() {
 }
 
 function handleSend() {
-  if (store.currentSessionRunning) {
+  // 运行中且没有新内容：按钮为停止态，点击中断当前回合；
+  // 有内容则照常发送——后端把消息加入该会话排队，回合结束后自动补发
+  if (sendStopMode.value) {
     store.stopCurrentTurn();
     return;
   }
@@ -223,6 +259,71 @@ function handleSend() {
 #input-wrap {
   /* 自适应拉伸占满输入区，不再限宽居中（两侧不留白） */
   margin: 0 auto;
+}
+
+/* 排队消息条：输入框上方逐条展示回合运行期间发送的排队消息 */
+#queue-strip {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+.queue-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 5px 6px 5px 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+.queue-badge {
+  flex-shrink: 0;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 2px;
+  border-radius: 999px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.queue-text {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queue-btn {
+  flex-shrink: 0;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  transition: 0.15s;
+}
+.queue-btn:hover {
+  border-color: var(--border);
+  background: var(--bg3);
+  color: var(--text);
+}
+.queue-cancel-btn:hover {
+  color: var(--red);
+}
+.queue-jump-btn:hover {
+  color: var(--accent);
 }
 #input-box {
   position: relative;

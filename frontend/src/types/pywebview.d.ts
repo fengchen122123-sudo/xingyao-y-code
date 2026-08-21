@@ -94,6 +94,13 @@ export interface SessionInfo {
   updated_at?: string;
 }
 
+// 会话消息排队：回合运行期间发送的消息（快照展示文本，不含 @路径拼接）
+export interface QueuedMessage {
+  id: string;
+  text: string;
+  attachments: string[];
+}
+
 export interface SessionGroup {
   folder_path: string;
   folder_name: string;
@@ -206,6 +213,10 @@ export interface InitialState {
   file_tree?: FileNode[];
   token_usage: TokenUsage;
   version: string;
+  // 仍有活跃回合的会话名（窗口重载时恢复运行态）
+  active_sessions?: string[];
+  // 各会话排队中的消息（窗口重载时恢复排队条目）
+  message_queues?: Record<string, QueuedMessage[]>;
 }
 
 // 工具事件 display dict：后端原样透传，字段可缺省
@@ -308,6 +319,10 @@ export interface PyWebViewAPI {
 
   send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string, modelId?: string): Promise<any>;
   stop_current_turn(sessionName?: string): Promise<any>;
+  // 会话消息排队：查询 / 取消排队 / 插队发送（停止当前回合优先补发该消息）
+  get_message_queue(sessionName?: string): Promise<{ ok: boolean; session_name: string; queue: QueuedMessage[] }>;
+  cancel_queued_message(sessionName: string, messageId: string): Promise<any>;
+  jump_queue(sessionName: string, messageId: string): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;
   get_token_usage_statistics(days: 1 | 7 | 30): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
@@ -348,6 +363,7 @@ export interface PyWebViewAPI {
   add_provider(name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_model_settings(): Promise<ModelSettingsSnapshot>;
   add_preset_provider(presetId: string, apiKey: string): Promise<any>;
+  sync_preset_models(presetId: string): Promise<any>;
   update_provider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   delete_provider(providerId: string): Promise<any>;
   add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean): Promise<any>;
@@ -358,7 +374,10 @@ export interface PyWebViewAPI {
   set_secondary_roles(roles: { vision: boolean; compression: boolean; subagent: boolean }): Promise<any>;
 
   check_update(manual?: boolean): Promise<any>;
-  download_update(downloadUrl: string, targetVersion: string): Promise<any>;
+  // 分卷模式：partUrls 为 .part1..partN 直链序列（Gitee 单附件 100MB 限制），
+  // 下载器顺序下载拼接还原 exe；sha256 为 Release 描述里发布的官方校验和，
+  // 非空时强制校验，不匹配即拒绝安装；totalSize 为各分卷字节数之和（进度分母）
+  download_update(downloadUrl: string, targetVersion: string, partUrls?: string[], sha256?: string, totalSize?: number): Promise<any>;
   cancel_download_update(): Promise<any>;
   has_active_tasks(): Promise<any>;
   launch_installer(filePath: string): Promise<any>;

@@ -10,6 +10,9 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
   dist/ycode_uninstall.exe     独立卸载向导
   dist/ycode_cli_setup_v{版本}.exe  独立 CLI 安装向导（供主安装包内嵌，也可单独分发）
   dist/ycode_setup_v{版本}.exe      主安装向导（默认装 GUI，可选附带装 CLI）
+  dist/release_parts/          Gitee Release 附件（超 100MB 的安装包按 ≤95MB
+                               二进制分卷 .part1/.part2/...，附 RELEASE_NOTES.txt
+                               上传指引，内含 SHA256 校验行）
   （两个安装向导文件名带版本号，便于多渠道分发时区分新旧；内嵌进主安装包的
     cli/ycode_cli_setup.exe 仍用固定名，安装引擎按固定名查找。）
 
@@ -19,9 +22,11 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
   venv\\Scripts\\python build_release.py --skip-frontend    跳过前端构建，直接用现有 frontend/dist
   venv\\Scripts\\python build_release.py --rebuild-frontend 强制重新执行 npm run build
   venv\\Scripts\\python build_release.py --setup-only       只重建两个安装向导（复用现有载荷）
+  venv\\Scripts\\python build_release.py --no-split-parts   跳过分卷切割（产物不分发到 Gitee 时用）
 """
 import argparse
 import glob
+import hashlib
 import os
 import re
 import shutil
@@ -58,6 +63,10 @@ def parse_args():
         "--setup-only", action="store_true",
         help="只重建两个安装向导 (ycode_setup_v*.exe / ycode_cli_setup_v*.exe)：复用现有 dist/ycode "
              "载荷与 dist/ycode_uninstall.exe，适用于仅改动 ycode_setup.py 后的快速重建。",
+    )
+    parser.add_argument(
+        "--no-split-parts", action="store_true",
+        help="跳过步骤 4.7 的 Gitee Release 分卷切割（产物不经 Gitee 分发时用）。",
     )
     return parser.parse_args()
 
@@ -380,6 +389,130 @@ def step4b_rename_setups(project_dir, version, cli_only):
 
 
 # ============================================================================
+# 步骤 4.7：Gitee Release 分卷附件（绕过单附件 100MB 上限）
+# ============================================================================
+
+# Gitee Release 单附件上限 100MB；留 5MB 余量切割
+SPLIT_PART_BYTES = 95 * 1024 * 1024
+
+
+def sha256_file(path):
+    """分块计算文件 SHA256（安装包几百 MB，不能一次读入内存）。"""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(4 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def split_file_for_release(src_path, out_dir, part_bytes=SPLIT_PART_BYTES):
+    """把超限文件切成 .partN 二进制分卷并移入 out_dir。
+
+    分卷是纯字节切割（无压缩/加密）：按序号顺序拼接即还原原文件。
+    文件本身 ≤ 100MB 时直接原样拷贝（单片分卷没有拼接意义）。
+    返回 (分卷文件名列表, 原文件 SHA256)。
+    """
+    size = os.path.getsize(src_path)
+    base = os.path.basename(src_path)
+    if size <= part_bytes:
+        shutil.copy2(src_path, os.path.join(out_dir, base))
+        return [base], sha256_file(src_path)
+
+    names = []
+    with open(src_path, "rb") as f:
+        idx = 1
+        while True:
+            chunk = f.read(part_bytes)
+            if not chunk:
+                break
+            part_name = f"{base}.part{idx}"
+            with open(os.path.join(out_dir, part_name), "wb") as pf:
+                pf.write(chunk)
+            names.append(part_name)
+            idx += 1
+    return names, sha256_file(src_path)
+
+
+def step4c_make_release_parts(project_dir, version, cli_only):
+    """生成 Gitee Release 上传用的分卷附件目录 dist/release_parts/。
+
+    主安装包（约 290MB）与 CLI 安装包（约 145MB）都超过 Gitee 单附件
+    100MB 上限，统一切成 ≤95MB 分卷；自动更新端（core/updater.py）识别
+    .partN 序列后顺序下载拼接，并用 RELEASE_NOTES.txt 中发布的 SHA256
+    校验拼接结果，校验不过即拒绝安装。
+    """
+    print("\n[步骤 4.7/5] 生成 Gitee Release 分卷附件 (dist/release_parts/)...")
+    out_dir = os.path.join(project_dir, "dist", "release_parts")
+    # 整目录重建：清掉上一版本残留的分卷与指引，避免多版本文件混传
+    if os.path.isdir(out_dir):
+        shutil.rmtree(out_dir)
+    os.makedirs(out_dir, exist_ok=True)
+
+    targets = [
+        (os.path.join("dist", f"{versioned_setup_name('ycode_cli_setup', version)}.exe"),
+         "CLI 独立安装包"),
+    ]
+    if not cli_only:
+        targets.append(
+            (os.path.join("dist", f"{versioned_setup_name('ycode_setup', version)}.exe"),
+             "主安装包 (GUI + 可选 CLI)")
+        )
+
+    entries = []  # (描述, 文件名, 分卷列表, sha256)
+    for rel_path, desc in targets:
+        abs_path = os.path.join(project_dir, rel_path)
+        if not os.path.exists(abs_path):
+            print(f"⚠️ 跳过（产物缺失）: {rel_path}")
+            continue
+        names, digest = split_file_for_release(abs_path, out_dir)
+        entries.append((desc, os.path.basename(abs_path), names, digest))
+        parts_desc = f"{len(names)} 片" if len(names) > 1 else "无需分卷（≤100MB 直接传）"
+        print(f"✔ {os.path.basename(abs_path)} -> {parts_desc}  SHA256: {digest[:16]}...")
+
+    if not entries:
+        print("⚠️ 没有可切分的安装包产物，跳过 RELEASE_NOTES 生成。")
+        return
+
+    # 生成上传指引 + 发布说明模板（SHA256 行供 updater 解析，勿改动格式）
+    main_entry = next((e for e in entries if "主安装包" in e[0]), entries[0])
+    lines = []
+    lines.append(f"Y-CODE v{version} Gitee Release 附件上传指引")
+    lines.append("=" * 52)
+    lines.append("")
+    lines.append("1. Gitee 仓库 -> 发布 -> 新建发布，Tag 填 v" + version)
+    lines.append("2. 描述粘贴下方『发布说明模板』（SHA256 校验行格式勿改动，")
+    lines.append("   自动更新依赖它做安装包完整性校验）")
+    lines.append("3. 附件上传本目录 (dist/release_parts/) 下的全部分卷文件")
+    lines.append("4. 勾选『设为最新发布版本』后发布")
+    lines.append("")
+    lines.append("发布说明模板")
+    lines.append("-" * 52)
+    lines.append("## 更新内容")
+    lines.append("（从 assets/CHANGELOG.md 复制本版本条目）")
+    lines.append("")
+    lines.append(f"SHA256: {main_entry[3]}")
+    lines.append("")
+    lines.append("手动合并安装（未走应用内自动更新的用户）")
+    lines.append("-" * 52)
+    for _desc, fname, names, _digest in entries:
+        if len(names) > 1:
+            joined = "+".join(names)
+            lines.append(f"下载全部分卷后在同一目录执行：")
+            lines.append(f"  copy /b {joined} {fname}")
+    lines.append("")
+    lines.append("产物 SHA256")
+    lines.append("-" * 52)
+    for desc, fname, names, digest in entries:
+        parts_desc = f"（{len(names)} 分卷）" if len(names) > 1 else ""
+        lines.append(f"{fname:<40} {parts_desc} {digest}")
+
+    notes_path = os.path.join(out_dir, "RELEASE_NOTES.txt")
+    with open(notes_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+    print(f"✔ 上传指引已生成: {notes_path}")
+
+
+# ============================================================================
 # 步骤 5：汇总校验
 # ============================================================================
 
@@ -418,6 +551,8 @@ def step5_summary(project_dir, cli_only, version):
     else:
         print(f"👉 您的 Windows 双击主安装包位于: "
               f"{os.path.join(project_dir, 'dist', versioned_setup_name('ycode_setup', version) + '.exe')}")
+    print(f"👉 Gitee Release 附件（分卷 + 上传指引）位于: "
+          f"{os.path.join(project_dir, 'dist', 'release_parts')}")
     print("=" * 64)
 
 
@@ -460,6 +595,8 @@ def build():
 
     version = read_project_version(project_dir)
     step4b_rename_setups(project_dir, version, args.cli_only)
+    if not args.no_split_parts:
+        step4c_make_release_parts(project_dir, version, args.cli_only)
     step5_summary(project_dir, args.cli_only, version)
 
 
