@@ -60,6 +60,8 @@
 - Produces: `ThemeRepository.list_themes() -> list[dict[str, Any]]`.
 - Produces: `ThemeRepository.get_theme(theme_id: str) -> dict[str, Any]`，返回已合并完整快照。
 - Produces: `ThemeRepository.save_theme(theme: Mapping[str, Any]) -> dict[str, Any]`.
+- Produces: `ThemeRepository.copy_theme(source_id: str, new_id: str, new_name: str) -> dict[str, Any]`.
+- Produces: `ThemeRepository.rename_theme(theme_id: str, new_id: str, new_name: str) -> dict[str, Any]`.
 - Produces: `ThemeRepository.set_active(theme_id: str) -> dict[str, Any]`.
 - Produces: `ThemeRepository.get_active() -> dict[str, Any]`.
 - Produces: `get_repository() -> ThemeRepository`，生产环境使用 `config.YCODE_DIR/gui-themes` 与 `config._CONFIG_FILE`。
@@ -185,11 +187,32 @@ def test_failed_save_preserves_previous_manifest(tmp_path, monkeypatch):
     with pytest.raises(OSError, match="disk full"):
         repo.save_theme({**minimal_theme("rose"), "name": "changed"})
     assert (repo.root / "rose" / "theme.json").read_bytes() == before
+
+
+def test_copy_builtin_creates_editable_user_theme(tmp_path):
+    repo = make_repo(tmp_path)
+    copied = repo.copy_theme("builtin.light", "rose", "Rose")
+    assert copied["id"] == "rose"
+    assert copied["name"] == "Rose"
+    assert copied["builtin"] is False
+    assert (repo.root / "rose" / "theme.json").is_file()
+
+
+def test_rename_theme_moves_directory_and_preserves_assets(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.save_theme(minimal_theme("rose"))
+    asset = repo.root / "rose" / "assets" / "background.png"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(b"asset")
+    renamed = repo.rename_theme("rose", "rose-new", "Rose New")
+    assert renamed["id"] == "rose-new"
+    assert (repo.root / "rose-new" / "assets" / "background.png").read_bytes() == b"asset"
+    assert not (repo.root / "rose").exists()
 ```
 
 - [ ] **Step 5: Implement atomic repository operations**
 
-Use `config._atomic_write_json` for config mutation under `config._CONFIG_LOCK`. For `theme.json`, write UTF-8 JSON to a unique sibling temporary file, flush and `os.fsync`, then `os.replace`. `set_active()` must resolve and validate the theme before writing `gui_theme_id`.
+Use `config._atomic_write_json` for config mutation under `config._CONFIG_LOCK`. For `theme.json`, write UTF-8 JSON to a unique sibling temporary file, flush and `os.fsync`, then `os.replace`. `set_active()` must resolve and validate the theme before writing `gui_theme_id`. Copy and rename operate through a sibling temporary directory and `os.replace`; they reject existing destinations and built-in rename attempts before touching disk.
 
 - [ ] **Step 6: Run tests and verify GREEN**
 
@@ -333,6 +356,8 @@ git commit -m "feat: secure GUI theme assets"
 - Produces bridge envelopes shaped as `{"ok": True, ...}` or `{"ok": False, "error": ThemeError.as_dict()}`.
 - Produces initial state fields `gui_theme`, `gui_themes`, and `gui_theme_error`.
 - Produces URL fragment `theme=<light|dark>&bg=<RRGGBB>`.
+- Produces bridge methods `copy_gui_theme(source_id, new_id, new_name)` and `rename_gui_theme(theme_id, new_id, new_name)`.
+- Produces bridge methods `preview_native_titlebar(native_titlebar)` and `restore_native_titlebar()`; preview never writes configuration, restore resolves the current active theme again.
 
 Add these doubles to `tests/test_gui_theme.py` before the new tests:
 
@@ -357,6 +382,10 @@ class RecordingRepo:
 
     def set_active(self, theme_id):
         self.calls.append(f"set_active:{theme_id}")
+        return self.theme
+
+    def get_active(self):
+        self.calls.append("get_active")
         return self.theme
 
 
@@ -400,6 +429,18 @@ def test_dwm_failure_does_not_change_active_id(monkeypatch):
     assert result["ok"] is False
     assert result["error"]["code"] == "native_titlebar_failed"
     assert repo.calls == ["get:rose"]
+
+
+def test_preview_and_restore_titlebar_do_not_change_active_id(monkeypatch):
+    bridge = _bare_bridge()
+    repo = RecordingRepo(theme=complete_light_theme())
+    monkeypatch.setattr(gui_bridge, "get_gui_theme_repository", lambda: repo)
+    apply = Mock(return_value=True)
+    monkeypatch.setattr(bridge, "_apply_titlebar_colors", apply)
+    assert bridge.preview_native_titlebar(complete_light_theme()["native_titlebar"])["ok"] is True
+    assert bridge.restore_native_titlebar()["ok"] is True
+    assert repo.calls == ["get_active"]
+    assert not any(call.startswith("set_active:") for call in repo.calls)
 ```
 
 - [ ] **Step 2: Write failing startup and COLORREF tests**
@@ -428,7 +469,7 @@ Expected: failures report missing new bridge and startup functions.
 
 - [ ] **Step 4: Implement the bridge and startup path**
 
-Replace fixed `_TITLEBAR_COLORS` lookup with `_rgb_hex_to_colorref()` and `_apply_titlebar_colors(native_titlebar) -> bool`. Add repository-backed methods for list/get/save/set/create/delete/import/export/image/read-asset. File dialogs must run only through `self._window.create_file_dialog`; `get_gui_theme_asset()` returns Base64 from validated `read_asset()` bytes.
+Replace fixed `_TITLEBAR_COLORS` lookup with `_rgb_hex_to_colorref()` and `_apply_titlebar_colors(native_titlebar) -> bool`. Add repository-backed methods for list/get/save/set/copy/rename/delete/import/export/image/read-asset and the two preview/restore methods above. File dialogs must run only through `self._window.create_file_dialog`; `get_gui_theme_asset()` returns Base64 from validated `read_asset()` bytes.
 
 `get_initial_state()` must include:
 
@@ -685,7 +726,7 @@ Expected: missing state/actions cause failures.
 
 - [ ] **Step 3: Implement store state and actions**
 
-Maintain one `AppliedTheme | null` handle. Every successful preview disposes the previous handle after the new apply completes. Failed preview keeps the previous applied theme and returns the bridge/runtime error. `saveGuiThemeDraft()` must call `save_gui_theme` then `set_active_gui_theme`; only both success responses may replace `savedGuiTheme` and clear dirty state.
+Maintain one `AppliedTheme | null` handle. Every successful preview disposes the previous handle after the new apply completes and calls `preview_native_titlebar(draft.native_titlebar)`. Failed preview keeps the previous applied theme and returns the bridge/runtime error. `cancelGuiThemePreview()` reapplies `savedGuiTheme` and calls `restore_native_titlebar()`. `saveGuiThemeDraft()` must call `save_gui_theme` then `set_active_gui_theme`; only both success responses may replace `savedGuiTheme` and clear dirty state.
 
 - [ ] **Step 4: Add an explicit startup theme error gate**
 
