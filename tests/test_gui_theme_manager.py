@@ -1,13 +1,16 @@
 import json
 import os
 from unittest.mock import Mock
+from zipfile import ZIP_STORED, ZipFile
 
 import pytest
+from PIL import Image
 
 from core.gui_theme import ThemeError, ThemeRepository
 
 
 def make_repo(tmp_path, config_data=None):
+    tmp_path.mkdir(parents=True, exist_ok=True)
     config_file = tmp_path / "config.json"
     config_file.write_text(json.dumps(config_data or {}), encoding="utf-8")
     return ThemeRepository(tmp_path / "gui-themes", config_file)
@@ -25,6 +28,17 @@ def minimal_theme(theme_id, accent=None):
         "native_titlebar": {},
         "regions": {},
     }
+
+
+def make_repo_with_saved_theme(tmp_path, theme_id):
+    repo = make_repo(tmp_path)
+    repo.save_theme(minimal_theme(theme_id))
+    return repo
+
+
+def write_image(path, image_format, size):
+    Image.new("RGB", size, "#d96b9f").save(path, format=image_format)
+    return path
 
 
 def test_builtin_dark_is_complete(tmp_path):
@@ -171,4 +185,115 @@ def test_rename_theme_moves_directory_and_preserves_assets(tmp_path):
     renamed = repo.rename_theme("rose", "rose-new", "Rose New")
     assert renamed["id"] == "rose-new"
     assert (repo.root / "rose-new" / "assets" / "background.png").read_bytes() == b"asset"
+    assert not (repo.root / "rose").exists()
+
+
+def test_import_image_copies_valid_webp_into_theme(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    source = write_image(tmp_path / "source.webp", "WEBP", (32, 24))
+    rel = repo.import_image("rose", "workspace", source)
+    assert rel.startswith("assets/") and rel.endswith(".webp")
+    assert (repo.root / "rose" / rel).is_file()
+    assert repo.get_theme("rose")["regions"]["workspace"]["image"] == rel
+
+
+@pytest.mark.parametrize("factory,code", [
+    (lambda p: p.write_bytes(b"not an image"), "invalid_image"),
+    (lambda p: write_image(p, "GIF", (32, 24)), "unsupported_image"),
+])
+def test_import_image_rejects_bad_content(tmp_path, factory, code):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    source = tmp_path / "input.bin"
+    factory(source)
+    with pytest.raises(ThemeError) as exc:
+        repo.import_image("rose", "workspace", source)
+    assert exc.value.code == code
+
+
+def test_read_asset_rejects_escape(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    with pytest.raises(ThemeError) as exc:
+        repo.read_asset("rose", "../config.json")
+    assert exc.value.code == "asset_escape"
+
+
+def test_read_asset_returns_validated_mime_type_and_bytes(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    source = write_image(tmp_path / "source.png", "PNG", (32, 24))
+    relative_path = repo.import_image("rose", "workspace", source)
+    mime_type, data = repo.read_asset("rose", relative_path)
+    assert mime_type == "image/png"
+    assert data == source.read_bytes()
+
+
+def test_remove_image_clears_manifest_and_unreferenced_asset(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    relative_path = repo.import_image(
+        "rose", "workspace", write_image(tmp_path / "source.png", "PNG", (32, 24)),
+    )
+    updated = repo.remove_image("rose", "workspace")
+    assert updated["regions"]["workspace"]["image"] is None
+    assert not (repo.root / "rose" / relative_path).exists()
+
+
+def test_import_zip_rejects_zip_slip_without_partial_directory(tmp_path):
+    repo = make_repo(tmp_path)
+    archive = tmp_path / "evil.zip"
+    with ZipFile(archive, "w") as zf:
+        zf.writestr("theme.json", json.dumps(minimal_theme("evil")))
+        zf.writestr("../escaped.txt", "owned")
+    with pytest.raises(ThemeError) as exc:
+        repo.import_zip(archive)
+    assert exc.value.code == "asset_escape"
+    assert not (repo.root / "evil").exists()
+    assert not (tmp_path / "escaped.txt").exists()
+
+
+def test_import_zip_rejects_declared_size_over_30_mib(tmp_path):
+    repo = make_repo(tmp_path)
+    archive = tmp_path / "large.zip"
+    with ZipFile(archive, "w", compression=ZIP_STORED) as zf:
+        zf.writestr("theme.json", json.dumps(minimal_theme("large")))
+        with zf.open("assets/large.bin", "w") as entry:
+            chunk = b"0" * (1024 * 1024)
+            for _ in range(31):
+                entry.write(chunk)
+    with pytest.raises(ThemeError) as exc:
+        repo.import_zip(archive)
+    assert exc.value.code == "theme_too_large"
+
+
+def test_manifest_rejects_remote_image_url(tmp_path):
+    theme = minimal_theme("rose")
+    theme["regions"] = {"workspace": {"image": "https://example.com/rose.webp"}}
+    with pytest.raises(ThemeError) as exc:
+        make_repo(tmp_path).save_theme(theme)
+    assert exc.value.code == "asset_escape"
+
+
+def test_export_and_import_zip_round_trip_referenced_image(tmp_path):
+    source_repo = make_repo_with_saved_theme(tmp_path / "source", "rose")
+    source_repo.import_image(
+        "rose", "workspace", write_image(tmp_path / "rose.png", "PNG", (32, 24)),
+    )
+    (source_repo.root / "rose" / "assets" / "unused.bin").write_bytes(b"unused")
+    archive = source_repo.export_zip("rose", tmp_path / "rose.zip")
+    with ZipFile(archive) as zf:
+        asset_names = [name for name in zf.namelist() if name.startswith("assets/") and name != "assets/"]
+        assert sorted(zf.namelist()) == ["assets/", asset_names[0], "theme.json"]
+
+    imported = make_repo(tmp_path / "target").import_zip(archive)
+    assert imported["id"] == "rose"
+    assert imported["regions"]["workspace"]["image"].startswith("assets/")
+
+
+def test_delete_theme_rejects_active_and_deletes_inactive_theme(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    repo.set_active("rose")
+    with pytest.raises(ThemeError) as exc:
+        repo.delete_theme("rose")
+    assert exc.value.code == "active_theme_delete"
+
+    repo.set_active("builtin.light")
+    repo.delete_theme("rose")
     assert not (repo.root / "rose").exists()
