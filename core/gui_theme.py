@@ -318,11 +318,11 @@ class ThemeRepository:
 
     def save_theme(self, theme: Mapping[str, Any]) -> dict[str, Any]:
         manifest = _validate_manifest(theme)
-        self.root.mkdir(parents=True, exist_ok=True)
-        theme_dir = self.root / manifest["id"]
+        theme_dir = self._validated_theme_destination(manifest["id"], create_root=True)
         if theme_dir.exists() and not theme_dir.is_dir():
             raise ThemeError("theme_exists", "id", "主题路径不是目录")
         theme_dir.mkdir(exist_ok=True)
+        self._assert_no_symlink_components(theme_dir, "id")
         self._write_manifest(theme_dir / "theme.json", manifest)
         return _merge_theme(BUILTIN_THEMES[manifest["extends"]], manifest)
 
@@ -330,13 +330,12 @@ class ThemeRepository:
         source_theme = self.get_theme(source_id)
         manifest = self._manifest_for_copy(source_theme, new_id, new_name)
         self._require_free_destination(new_id)
-        self.root.mkdir(parents=True, exist_ok=True)
         staging_dir = self._staging_directory()
         try:
             if source_id not in BUILTIN_IDS:
                 shutil.copytree(self.root / source_id, staging_dir, dirs_exist_ok=True)
             self._write_manifest(staging_dir / "theme.json", manifest)
-            os.replace(staging_dir, self.root / new_id)
+            os.replace(staging_dir, self._require_free_destination(new_id))
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
             raise
@@ -348,12 +347,11 @@ class ThemeRepository:
         source_theme = self.get_theme(theme_id)
         manifest = self._manifest_for_copy(source_theme, new_id, new_name)
         self._require_free_destination(new_id)
-        self.root.mkdir(parents=True, exist_ok=True)
         staging_dir = self._staging_directory()
         try:
             shutil.copytree(self.root / theme_id, staging_dir, dirs_exist_ok=True)
             self._write_manifest(staging_dir / "theme.json", manifest)
-            os.replace(staging_dir, self.root / new_id)
+            os.replace(staging_dir, self._require_free_destination(new_id))
             shutil.rmtree(self.root / theme_id)
         except Exception:
             shutil.rmtree(staging_dir, ignore_errors=True)
@@ -445,7 +443,6 @@ class ThemeRepository:
             self._validate_zip_theme_entries(infos, manifest)
             theme_id = manifest["id"]
             self._require_free_destination(theme_id)
-            self.root.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix=".gui-theme-import-", dir=self.root.parent) as temporary:
                 staging_dir = Path(temporary) / theme_id
                 staging_dir.mkdir()
@@ -458,7 +455,7 @@ class ThemeRepository:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     extracted = self._extract_zip_member(archive, info, target, extracted)
                 self._validate_theme_assets(staging_dir, manifest)
-                os.replace(staging_dir, self.root / theme_id)
+                os.replace(staging_dir, self._require_free_destination(theme_id))
         return self.get_theme(theme_id)
 
     def export_zip(self, theme_id: str, destination: Path) -> Path:
@@ -538,10 +535,23 @@ class ThemeRepository:
         return self._manifest_for_copy(theme, theme_id, theme["name"])
 
     def _theme_directory(self, theme_id: str) -> Path:
+        return self._validated_theme_destination(theme_id)
+
+    def _validated_theme_destination(
+        self, theme_id: str, *, create_root: bool = False, require_free: bool = False,
+    ) -> Path:
         if not isinstance(theme_id, str) or not THEME_ID_RE.fullmatch(theme_id):
             raise ThemeError("invalid_id", "id", "主题 ID 无效")
+        self._assert_no_symlink_components(self.root, "root")
+        if create_root:
+            if self.root.exists() and not self.root.is_dir():
+                raise ThemeError("theme_exists", "root", "主题根路径不是目录")
+            self.root.mkdir(parents=True, exist_ok=True)
+            self._assert_no_symlink_components(self.root, "root")
         theme_dir = self.root / theme_id
         self._assert_no_symlink_components(theme_dir, "id")
+        if require_free and theme_dir.exists():
+            raise ThemeError("theme_exists", "id", "主题已存在")
         return theme_dir
 
     def _asset_file(self, theme_id: str, asset_path: str) -> Path:
@@ -694,11 +704,8 @@ class ThemeRepository:
         manifest["name"] = new_name
         return _validate_manifest(manifest)
 
-    def _require_free_destination(self, theme_id: str) -> None:
-        if not isinstance(theme_id, str) or not THEME_ID_RE.fullmatch(theme_id):
-            raise ThemeError("invalid_id", "id", "主题 ID 只能包含小写字母、数字和连字符")
-        if (self.root / theme_id).exists():
-            raise ThemeError("theme_exists", "id", "主题已存在")
+    def _require_free_destination(self, theme_id: str) -> Path:
+        return self._validated_theme_destination(theme_id, create_root=True, require_free=True)
 
     def _staging_directory(self) -> Path:
         return Path(tempfile.mkdtemp(prefix=".gui-theme-", dir=self.root))
