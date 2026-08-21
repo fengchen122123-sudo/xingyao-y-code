@@ -35,6 +35,43 @@ import {
   type ToolExecutionResult,
 } from '../utils/toolTrace';
 import { createSessionRuntime, type SessionRuntimeState } from './sessionRuntime';
+import { applyGuiTheme, type AppliedTheme } from '../themes/runtime';
+import type {
+  GuiTheme,
+  GuiThemeError,
+  GuiThemeFailure,
+  GuiThemeResult,
+  GuiThemeSummary,
+  NativeTitlebarColorCapability,
+} from '../themes/types';
+
+function cloneGuiTheme(theme: GuiTheme): GuiTheme {
+  // Pinia exposes state through Vue proxies, which structuredClone rejects.
+  // The bridge contract is JSON-only, so a JSON round trip is the exact clone boundary.
+  return JSON.parse(JSON.stringify(theme)) as GuiTheme;
+}
+
+function guiThemeFailure(error: unknown, path = 'theme'): GuiThemeFailure {
+  if (error && typeof error === 'object' && 'code' in error && 'message' in error) {
+    const value = error as { code: unknown; path?: unknown; message: unknown };
+    return {
+      ok: false,
+      error: {
+        code: String(value.code),
+        path: String(value.path ?? path),
+        message: String(value.message),
+      },
+    };
+  }
+  return {
+    ok: false,
+    error: {
+      code: 'theme_runtime_failed',
+      path,
+      message: error instanceof Error ? error.message : String(error),
+    },
+  };
+}
 
 export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
   const nullableNumber = (value: unknown): number | null => {
@@ -306,6 +343,14 @@ export const useAppStore = defineStore('app', {
     sidebarCollapsed: false,
     rightPanelCollapsed: false,
     themeLight: false,
+    guiTheme: null as GuiTheme | null,
+    savedGuiTheme: null as GuiTheme | null,
+    guiThemeDraft: null as GuiTheme | null,
+    guiThemes: [] as GuiThemeSummary[],
+    guiThemeError: null as GuiThemeError | null,
+    guiThemeListError: null as GuiThemeError | null,
+    nativeTitlebarColorCapability: 'unknown' as NativeTitlebarColorCapability,
+    _appliedGuiTheme: null as AppliedTheme | null,
     settingsOpen: false,
 
     // 计划、后台任务、Token 用量
@@ -408,6 +453,10 @@ export const useAppStore = defineStore('app', {
         if (!map.has(m.provider_name)) map.set(m.provider_name, m.provider_name);
       });
       return Array.from(map.entries()).map(([id, name]) => ({ id, name }));
+    },
+
+    themeDirty(state): boolean {
+      return JSON.stringify(state.guiThemeDraft) !== JSON.stringify(state.savedGuiTheme);
     },
   },
 
@@ -546,14 +595,141 @@ export const useAppStore = defineStore('app', {
       this.rightPanelCollapsed = !this.rightPanelCollapsed;
     },
 
-    toggleTheme() {
-      this.themeLight = !this.themeLight;
-      // body.light 是唯一的浅色主题开关机制（对应 style.css 中的 body.light 选择器）
-      document.body.classList.toggle('light', this.themeLight);
-      // localStorage 镜像：下次启动 splash 渲染前即可恢复主题（见 main.ts）
-      try { localStorage.setItem('ycode-theme-light', this.themeLight ? '1' : '0'); } catch {}
-      // 持久化主题到后端 config.json（关闭重开不变），并同步 Windows 窗口标题栏明暗
-      this._api()?.set_gui_theme(this.themeLight)?.catch(() => {});
+    async _restorePreviousNativeTitlebar(this: any, theme: GuiTheme | null) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        if (theme) await api.preview_native_titlebar(theme.native_titlebar);
+        else await api.restore_native_titlebar();
+      } catch {
+        // 保留调用方的原始错误；原生恢复失败不伪装成成功。
+      }
+    },
+
+    _restoreGuiThemeDomSnapshot(rootStyle: string | null, light: boolean) {
+      if (rootStyle === null) document.documentElement.removeAttribute('style');
+      else document.documentElement.setAttribute('style', rootStyle);
+      document.body.classList.toggle('light', light);
+    },
+
+    async _applyGuiThemeCandidate(
+      this: any,
+      theme: GuiTheme,
+      nativeMode: 'preview' | 'restore' | 'unchanged',
+    ): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+      const api = this._api();
+      if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+      const previousTheme = this.guiTheme as GuiTheme | null;
+      const previousHandle = this._appliedGuiTheme as AppliedTheme | null;
+      const previousRootStyle = document.documentElement.getAttribute('style');
+      const previousLight = document.body.classList.contains('light');
+      let candidateHandle: AppliedTheme;
+      try {
+        candidateHandle = await applyGuiTheme(theme, api);
+      } catch (error) {
+        return guiThemeFailure(error);
+      }
+
+      try {
+        if (nativeMode === 'preview') {
+          const result = await api.preview_native_titlebar(theme.native_titlebar);
+          if (!result.ok) {
+            candidateHandle.dispose();
+            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+            await this._restorePreviousNativeTitlebar(previousTheme);
+            return result;
+          }
+          this.nativeTitlebarColorCapability = result.native_titlebar_color_capability;
+        } else if (nativeMode === 'restore') {
+          const result = await api.restore_native_titlebar();
+          if (!result.ok) {
+            candidateHandle.dispose();
+            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+            await this._restorePreviousNativeTitlebar(previousTheme);
+            return result;
+          }
+          this.nativeTitlebarColorCapability = result.native_titlebar_color_capability;
+        }
+      } catch (error) {
+        candidateHandle.dispose();
+        this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+        await this._restorePreviousNativeTitlebar(previousTheme);
+        return guiThemeFailure(error, 'native_titlebar');
+      }
+
+      previousHandle?.dispose();
+      this._appliedGuiTheme = candidateHandle;
+      this.guiTheme = cloneGuiTheme(theme);
+      this.themeLight = theme.appearance === 'light';
+      return { ok: true, theme: cloneGuiTheme(theme) };
+    },
+
+    async previewGuiTheme(theme: GuiTheme): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+      const result = await this._applyGuiThemeCandidate(cloneGuiTheme(theme), 'preview');
+      if (result.ok) this.guiThemeDraft = cloneGuiTheme(theme);
+      return result;
+    },
+
+    async cancelGuiThemePreview(): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+      if (!this.savedGuiTheme) return guiThemeFailure(new Error('没有可恢复的已保存主题'));
+      const saved = cloneGuiTheme(this.savedGuiTheme);
+      const result = await this._applyGuiThemeCandidate(saved, 'restore');
+      if (result.ok) this.guiThemeDraft = cloneGuiTheme(saved);
+      return result;
+    },
+
+    async _activateGuiThemeId(this: any, themeId: string): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+      const api = this._api();
+      if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+      const previousSaved = this.savedGuiTheme ? cloneGuiTheme(this.savedGuiTheme) : null;
+      let activated;
+      try {
+        activated = await api.set_active_gui_theme(themeId);
+      } catch (error) {
+        return guiThemeFailure(error, 'gui_theme_id');
+      }
+      if (!activated.ok) return activated;
+
+      const applied = await this._applyGuiThemeCandidate(activated.theme, 'unchanged');
+      if (!applied.ok) {
+        if (previousSaved && previousSaved.id !== activated.theme.id) {
+          try { await api.set_active_gui_theme(previousSaved.id); } catch { /* 返回原始运行时错误 */ }
+        }
+        return applied;
+      }
+      this.nativeTitlebarColorCapability = activated.native_titlebar_color_capability;
+      this.savedGuiTheme = cloneGuiTheme(activated.theme);
+      this.guiThemeDraft = cloneGuiTheme(activated.theme);
+      return activated;
+    },
+
+    async activateGuiTheme(themeId: string): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+      return this._activateGuiThemeId(themeId);
+    },
+
+    async saveGuiThemeDraft(): Promise<GuiThemeResult<{ theme: GuiTheme }>> {
+      if (!this.guiThemeDraft) return guiThemeFailure(new Error('没有可保存的主题草稿'));
+      const api = this._api();
+      if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+      const draft = cloneGuiTheme(this.guiThemeDraft);
+      let saved;
+      try {
+        saved = await api.save_gui_theme(draft);
+      } catch (error) {
+        return guiThemeFailure(error);
+      }
+      if (!saved.ok) return saved;
+      return this._activateGuiThemeId(draft.id);
+    },
+
+    async resetInvalidGuiTheme(themeId: 'builtin.dark' | 'builtin.light') {
+      const result = await this.activateGuiTheme(themeId);
+      if (result.ok) this.guiThemeError = null;
+      return result;
+    },
+
+    async toggleTheme() {
+      return this.activateGuiTheme(this.themeLight ? 'builtin.dark' : 'builtin.light');
     },
 
     toggleShowThinking() {
@@ -636,12 +812,22 @@ export const useAppStore = defineStore('app', {
         await finishSplash();
         return;
       }
-      // 启动时按当前主题同步一次标题栏：main.ts 已按 URL #theme= 片段提前恢复
-      // body 类（后端真值），以 body 类为准，避免浅色主题启动期标题栏黑几秒
       this.themeLight = document.body.classList.contains('light');
-      api.set_titlebar_theme(!this.themeLight)?.catch(() => {});
       try {
         const init = await api.get_initial_state();
+        this.guiThemes = init.gui_themes || [];
+        this.guiThemeError = init.gui_theme_error || null;
+        this.guiThemeListError = init.gui_theme_list_error || null;
+        this.nativeTitlebarColorCapability = init.native_titlebar_color_capability || 'unknown';
+        if (!this.guiThemeError && init.gui_theme) {
+          const applied = await this._applyGuiThemeCandidate(init.gui_theme, 'unchanged');
+          if (applied.ok) {
+            this.savedGuiTheme = cloneGuiTheme(init.gui_theme);
+            this.guiThemeDraft = cloneGuiTheme(init.gui_theme);
+          } else {
+            this.guiThemeError = applied.error;
+          }
+        }
         this.models = init.models || [];
         this.providers = init.providers || [];
         this.activeModelId = init.active_model_id || '';
@@ -688,11 +874,6 @@ export const useAppStore = defineStore('app', {
             break;
           }
         }
-        // 恢复持久化的界面主题（默认深色）：body 类与标题栏一并同步
-        this.themeLight = !!(init as any).theme_light;
-        document.body.classList.toggle('light', this.themeLight);
-        try { localStorage.setItem('ycode-theme-light', this.themeLight ? '1' : '0'); } catch {}
-        api.set_titlebar_theme(!this.themeLight)?.catch(() => {});
         this.fileTree = (init as any).file_tree || [];
         this.tokenUsage = normalizeTokenUsage(init.token_usage);
         this.version = init.version || '';

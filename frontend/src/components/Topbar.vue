@@ -4,7 +4,7 @@
       <AppIcon name="menu" :size="17" />
     </button>
     <div class="logo" :title="store.version ? ('Y-CODE 星瑶 v' + store.version) : 'Y-CODE 星瑶'">
-      <img class="mark" src="/icon.png" alt="Y-CODE">
+      <img class="mark" :src="'/icon.png'" alt="Y-CODE">
       <div><span class="name">Y-CODE</span></div>
     </div>
     <div class="top-spacer"></div>
