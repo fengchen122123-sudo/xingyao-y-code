@@ -423,14 +423,21 @@ class UpdateDownloader:
                 def _report_progress(force: bool = False):
                     nonlocal last_emit_time, last_percent
                     now = time.monotonic()
-                    percent = (
-                        int(downloaded_total * 100 / grand_total)
-                        if grand_total > 0
-                        else 0
-                    )
-                    if force or (
-                        now - last_emit_time >= 0.15 or percent != last_percent
-                    ):
+                    if len(urls) > 1 and grand_total <= 0:
+                        # 分卷且无总大小元数据（Gitee 公开 API 附件不带 size）：
+                        # 按片数比例混算（片完成度 + 当前片内进度），避免末片
+                        # 偏小导致"估总分母"进度漂移（如 77% 直接跳 100%）
+                        part_frac = part_downloaded / part_total if part_total > 0 else 0
+                        percent = int(min(99, ((part_index - 1 + part_frac) / len(urls)) * 100))
+                    else:
+                        percent = (
+                            int(downloaded_total * 100 / grand_total)
+                            if grand_total > 0
+                            else 0
+                        )
+                    if force:
+                        percent = 100
+                    if now - last_emit_time >= 0.15 or percent != last_percent:
                         last_emit_time = now
                         last_percent = percent
                         on_progress(
