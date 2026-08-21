@@ -989,11 +989,12 @@ class SetupWizard(tk.Tk):
     def _set_icon(self):
         ico = os.path.join(self.bundle_dir, "assets", "ycode.ico")
         if not os.path.exists(ico):
+            print(f"⚠️ 图标文件不存在: {ico}")
             return
         try:
             self.iconbitmap(ico)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"⚠️ iconbitmap 失败: {e}")
         # tk 的 iconbitmap 不一定覆盖任务栏用的 ICON_BIG，且 Tk 窗口类的类图标
         # 始终是默认羽毛（任务栏/Alt-Tab 可能回退到它），这里用 Win32 显式把
         # 窗口大/小图标与类图标全部换成我们的图标。
@@ -1011,17 +1012,28 @@ class SetupWizard(tk.Tk):
             ICON_BIG = 1
             GCLP_HICON = -14
             GCLP_HICONSM = -13  # 正确值是 -13（此前误写成 -34，小图标始终未替换）
-            # 大图标用 256（任务栏高 DPI 清晰），小图标用 32（标题栏/Alt-Tab）
-            h_big = u32.LoadImageW(None, ico, IMAGE_ICON, 256, 256, LR_LOADFROMFILE)
+            # 大图标加载失败时尝试多个尺寸（256 → 128 → 64 → 48 → 32）
+            h_big = 0
+            for size in (256, 128, 64, 48, 32):
+                h_big = u32.LoadImageW(None, ico, IMAGE_ICON, size, size, LR_LOADFROMFILE)
+                if h_big:
+                    print(f"✔ 大图标加载成功 ({size}x{size})")
+                    break
             h_small = u32.LoadImageW(None, ico, IMAGE_ICON, 32, 32, LR_LOADFROMFILE)
+            if h_small:
+                print("✔ 小图标加载成功 (32x32)")
             if h_big:
                 u32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, h_big)
                 u32.SetClassLongPtrW(hwnd, GCLP_HICON, h_big)
+            else:
+                print("⚠️ 大图标加载失败（所有尺寸都试过），任务栏可能回退默认羽毛")
             if h_small:
                 u32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, h_small)
                 u32.SetClassLongPtrW(hwnd, GCLP_HICONSM, h_small)
-        except Exception:
-            pass
+            else:
+                print("⚠️ 小图标加载失败")
+        except Exception as e:
+            print(f"⚠️ Win32 图标替换异常: {e}")
 
     # ------------------------------------------------------------------
     # 三段式框架：横幅 + 底部按钮栏（内容区由调用方随后 pack）
@@ -1258,7 +1270,9 @@ class SetupWizard(tk.Tk):
         self._btn_browse = ttk.Button(page, text="浏览...", style="Ghost.TButton",
                                       command=self._browse_dir,
                                       state="disabled" if locked else "normal")
-        self._btn_browse.place(x=470, y=78, width=110, height=30)
+        # Ghost.TButton 样式 padding=(16,8) 会占掉 32px 宽度，110px 按钮实际可用
+        # 仅 78px，"浏览..." 显示不下。单独调小 padding 或加宽到 120px
+        self._btn_browse.place(x=470, y=78, width=120, height=30)
         if locked:
             self._label(page, "检测到已安装的 Y-code，将覆盖安装到原位置。",
                         FONT_PAGE_SUB, "#8a6d1a").place(x=40, y=108)
