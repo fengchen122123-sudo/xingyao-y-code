@@ -254,6 +254,9 @@ export const useAppStore = defineStore('app', {
     fileTreeExpanded: [] as string[],
     // 文件树后台加载序号：快速连切会话时过期结果凭序号丢弃
     fileTreeReqSeq: 0,
+    // 本回合实际用到的技能名（从 is_skill 工具调用收集）：turn_start 时清空，
+    // 回合结束后固化为本回合结果，状态栏"技能"项据此显示；随会话 runtime 保存/恢复
+    usedSkills: [] as string[],
     // M31 修复：各类异步刷新的请求序号，响应返回时序号已过期则丢弃，
     // 避免并发/重复刷新时旧快照覆盖新快照
     sessionsReqSeq: 0,
@@ -438,6 +441,8 @@ export const useAppStore = defineStore('app', {
       // 模型选择随会话保存：切换会话时各会话恢复各自的模型，互不覆盖
       runtime.modelId = this.activeModelId;
       runtime.modelName = this.activeModelName;
+      // 本回合用到的技能随会话保存
+      runtime.usedSkills = this.usedSkills;
     },
 
     _captureCurrentRuntime(this: any) {
@@ -468,6 +473,8 @@ export const useAppStore = defineStore('app', {
       if (runtime.tokenUsage) this.tokenUsage = runtime.tokenUsage;
       // "已工作 xx秒"计时随会话切换恢复该会话的回合开始时间戳
       this.turnStartedAt = runtime.turnStartedAt || 0;
+      // 本回合用到的技能随会话恢复
+      this.usedSkills = runtime.usedSkills || [];
       // 模型选择随会话即时恢复（不等后端 switch_session 响应）：该会话显式
       // 选过模型才恢复，且该模型仍存在（未被删除）；否则保持当前值，
       // 由后端响应校正为该会话落库的绑定模型
@@ -1458,6 +1465,8 @@ export const useAppStore = defineStore('app', {
           this.queuedSessions = this.queuedSessions.filter(s => s !== turnSession);
         }
         this.running = true;
+        // 本回合技能收集重置：从这一刻起的 is_skill 工具调用归入本回合
+        this.usedSkills = [];
         // 记录本轮回合开始时间戳，供"已工作 xx秒"计时（随会话切换恢复，不重置）
         if (!this.turnStartedAt) this.turnStartedAt = Date.now();
         this.currentStreamingText = '';
@@ -1548,6 +1557,11 @@ export const useAppStore = defineStore('app', {
         const calls = msg.tool_calls ?? (msg.tool_calls = []);
         const id = String(d.id || '');
         const display = normalizeToolDisplay(d.display);
+        // 技能调用收集：display.is_skill 时把技能名记入本回合 usedSkills（去重），
+        // 供状态栏"技能"项与回合结束后的统计展示
+        if (display?.is_skill && display.target && !this.usedSkills.includes(display.target)) {
+          this.usedSkills.push(display.target);
+        }
         const idx = id ? calls.findIndex(c => c.id === id) : -1;
         if (idx >= 0) {
           // 同一调用重复推送：更新元信息，但保留首次插入时记录的 started_at_ms
@@ -2144,6 +2158,7 @@ export const useAppStore = defineStore('app', {
           this.messages = [];
           this.currentStreamingText = '';
           this.currentThinkingText = '';
+          this.usedSkills = [];
           this._captureCurrentRuntime();
           this.notifyChat('已清空当前会话历史');
         } else {

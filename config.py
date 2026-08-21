@@ -153,8 +153,6 @@ DB_FILE = os.path.join(YCODE_DIR, "ycode.db")
 GUI_DB_FILE = os.path.join(YCODE_DIR, "ycode_gui.db")
 ACTIVE_SKILLS_FILE = os.path.join(YCODE_DIR, "active_skills.json")
 MCP_FILE = os.path.join(YCODE_DIR, "mcp.json")
-SYSTEM_PROMPT_FILE = os.path.join(YCODE_DIR, "system_prompt.md")
-SYSTEM_PROMPT_GUI_FILE = os.path.join(YCODE_DIR, "system_prompt_gui.md")
 
 # 自动从当前源码目录初始化默认配置文件
 if not os.path.exists(_CONFIG_FILE):
@@ -199,20 +197,6 @@ if not os.path.exists(_CONFIG_FILE):
                     ]
                 }
                 json.dump(default_data, f, indent=2, ensure_ascii=False)
-        except Exception:
-            pass
-
-if not os.path.exists(SYSTEM_PROMPT_FILE):
-    default_prompt_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "system_prompt.md")
-    if os.path.exists(default_prompt_path):
-        try:
-            shutil.copy(default_prompt_path, SYSTEM_PROMPT_FILE)
-        except Exception:
-            pass
-    if not os.path.exists(SYSTEM_PROMPT_FILE):
-        try:
-            with open(SYSTEM_PROMPT_FILE, "w", encoding="utf-8") as f:
-                f.write("你叫星瑶，是一个顶尖的女性黑客与代码编程高手。")
         except Exception:
             pass
 
