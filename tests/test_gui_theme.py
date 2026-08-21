@@ -2,6 +2,7 @@ import base64
 import copy
 import ctypes
 import json
+import shutil
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -330,11 +331,96 @@ def test_native_titlebar_required_attribute_failure_is_reported(monkeypatch):
 
     fake_dwm.DwmSetWindowAttribute.side_effect = set_attribute
     monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
+    monkeypatch.setattr(gui_bridge, "_windows_build_number", lambda: 19045, raising=False)
     monkeypatch.setattr(ctypes, "windll", SimpleNamespace(dwmapi=fake_dwm), raising=False)
     monkeypatch.setattr(gui_bridge, "ctypes", ctypes, raising=False)
 
-    assert bridge._write_native_titlebar_dwm(complete_light_theme()["native_titlebar"]) is False
+    result = bridge._write_native_titlebar_dwm(complete_light_theme()["native_titlebar"])
+    assert result["ok"] is False
     assert [call.args[1] for call in fake_dwm.DwmSetWindowAttribute.call_args_list] == [20, 35, 36]
+
+
+def test_win10_unsupported_custom_colors_still_activates_theme(tmp_path, monkeypatch):
+    _use_tmp_config(tmp_path, monkeypatch)
+    bridge = _bare_bridge()
+    bridge._hwnd = 123
+    bridge._native_titlebar = copy.deepcopy(BUILTIN_THEMES["builtin.dark"]["native_titlebar"])
+    bridge._native_titlebar_color_capability = "supported"
+    fake_dwm = Mock()
+    unsupported = ctypes.c_int32(0x80070057).value  # E_INVALIDARG on pre-Win11 color attrs
+
+    def set_attribute(_hwnd, attr, _value, _size):
+        return 0 if attr in (20, 19) else unsupported
+
+    fake_dwm.DwmSetWindowAttribute.side_effect = set_attribute
+    monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
+    monkeypatch.setattr(gui_bridge, "_windows_build_number", lambda: 19045, raising=False)
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(dwmapi=fake_dwm), raising=False)
+    monkeypatch.setattr(gui_bridge, "ctypes", ctypes, raising=False)
+
+    result = bridge.set_active_gui_theme("builtin.light")
+
+    assert result["ok"] is True
+    assert result["native_titlebar_color_capability"] == "unsupported"
+    assert bridge._native_titlebar_color_capability == "unsupported"
+    assert model_manager.load_config()["gui_theme_id"] == "builtin.light"
+    assert [call.args[1] for call in fake_dwm.DwmSetWindowAttribute.call_args_list] == [
+        20, 35, 36, 34,
+    ]
+
+
+def test_known_unsupported_mixed_with_real_failure_is_not_downgraded(monkeypatch):
+    bridge = _bare_bridge()
+    bridge._hwnd = 123
+    bridge._native_titlebar = copy.deepcopy(BUILTIN_THEMES["builtin.dark"]["native_titlebar"])
+    bridge._native_titlebar_color_capability = "supported"
+    fake_dwm = Mock()
+    unsupported = ctypes.c_int32(0x80070057).value
+
+    def set_attribute(_hwnd, attr, _value, _size):
+        return {20: 0, 35: unsupported, 36: unsupported, 34: 5}[attr]
+
+    fake_dwm.DwmSetWindowAttribute.side_effect = set_attribute
+    monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
+    monkeypatch.setattr(gui_bridge, "_windows_build_number", lambda: 19045, raising=False)
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(dwmapi=fake_dwm), raising=False)
+    monkeypatch.setattr(gui_bridge, "ctypes", ctypes, raising=False)
+
+    assert bridge._apply_native_titlebar_theme(
+        complete_light_theme()["native_titlebar"],
+    ) is False
+    assert bridge._native_titlebar["mode"] == "dark"
+    assert bridge._native_titlebar_color_capability == "supported"
+    assert [call.args[1] for call in fake_dwm.DwmSetWindowAttribute.call_args_list] == [
+        20, 35, 36, 34, 20, 35, 36, 34,
+    ]
+
+
+def test_win11_known_unsupported_hresult_is_treated_as_real_failure(monkeypatch):
+    bridge = _bare_bridge()
+    bridge._hwnd = 123
+    bridge._native_titlebar = copy.deepcopy(BUILTIN_THEMES["builtin.dark"]["native_titlebar"])
+    bridge._native_titlebar_color_capability = "supported"
+    fake_dwm = Mock()
+    unsupported = ctypes.c_int32(0x80070057).value
+
+    def set_attribute(_hwnd, attr, _value, _size):
+        return 0 if attr == 20 else unsupported
+
+    fake_dwm.DwmSetWindowAttribute.side_effect = set_attribute
+    monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
+    monkeypatch.setattr(gui_bridge, "_windows_build_number", lambda: 22631, raising=False)
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(dwmapi=fake_dwm), raising=False)
+    monkeypatch.setattr(gui_bridge, "ctypes", ctypes, raising=False)
+
+    assert bridge._apply_native_titlebar_theme(
+        complete_light_theme()["native_titlebar"],
+    ) is False
+    assert bridge._native_titlebar["mode"] == "dark"
+    assert bridge._native_titlebar_color_capability == "supported"
+    assert [call.args[1] for call in fake_dwm.DwmSetWindowAttribute.call_args_list] == [
+        20, 35, 36, 34, 20, 35, 36, 34,
+    ]
 
 
 def test_native_titlebar_rejects_alpha_while_web_tokens_allow_it(tmp_path):
@@ -390,6 +476,69 @@ def test_active_theme_rename_updates_authoritative_id(tmp_path):
 
     assert json.loads(config_file.read_text(encoding="utf-8"))["gui_theme_id"] == "rose-new"
     assert repo.get_active()["id"] == "rose-new"
+
+
+def test_active_rename_partial_old_cleanup_keeps_complete_new_active(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{}", encoding="utf-8")
+    repo = ThemeRepository(tmp_path / "themes", config_file)
+    repo.copy_theme("builtin.light", "rose", "Rose")
+    repo.set_active("rose")
+    original_rmtree = shutil.rmtree
+
+    def partial_cleanup(path, *args, **kwargs):
+        path = type(repo.root)(path)
+        if path.name == "rose" or path.name.startswith(".gui-theme-retired-"):
+            (path / "theme.json").unlink(missing_ok=True)
+            raise OSError("partial cleanup")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(shutil, "rmtree", partial_cleanup)
+
+    with pytest.raises(ThemeError) as exc:
+        repo.rename_theme("rose", "rose-new", "Rose New")
+
+    assert exc.value.code == "theme_cleanup_failed"
+    assert json.loads(config_file.read_text(encoding="utf-8"))["gui_theme_id"] == "rose-new"
+    assert repo.get_active()["id"] == "rose-new"
+    assert (repo.root / "rose-new" / "theme.json").is_file()
+
+
+def test_active_rename_cleanup_failure_never_attempts_unsafe_config_rollback(
+    tmp_path, monkeypatch,
+):
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{}", encoding="utf-8")
+    repo = ThemeRepository(tmp_path / "themes", config_file)
+    repo.copy_theme("builtin.light", "rose", "Rose")
+    repo.set_active("rose")
+    original_write = config._atomic_write_json
+    original_rmtree = shutil.rmtree
+    config_writes = 0
+
+    def reject_rollback(path, data):
+        nonlocal config_writes
+        config_writes += 1
+        if config_writes > 1:
+            raise OSError("rollback write failed")
+        return original_write(path, data)
+
+    def fail_retired_cleanup(path, *args, **kwargs):
+        path = type(repo.root)(path)
+        if path.name == "rose" or path.name.startswith(".gui-theme-retired-"):
+            raise OSError("cleanup failed")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(config, "_atomic_write_json", reject_rollback)
+    monkeypatch.setattr(shutil, "rmtree", fail_retired_cleanup)
+
+    with pytest.raises(ThemeError) as exc:
+        repo.rename_theme("rose", "rose-new", "Rose New")
+
+    assert exc.value.code == "theme_cleanup_failed"
+    assert config_writes == 1
+    assert repo.get_active()["id"] == "rose-new"
+    assert (repo.root / "rose-new" / "theme.json").is_file()
 
 
 def test_gui_theme_crud_success_envelopes(tmp_path, monkeypatch):
