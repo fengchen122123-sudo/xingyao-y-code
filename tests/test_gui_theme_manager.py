@@ -419,3 +419,32 @@ def test_read_asset_rejects_resource_with_symlinked_parent_inside_theme(tmp_path
     with pytest.raises(ThemeError) as exc:
         repo.read_asset("rose", asset_path)
     assert exc.value.code == "asset_escape"
+
+
+def test_save_theme_rejects_junction_destination_without_external_write(tmp_path):
+    repo = make_repo(tmp_path)
+    repo.root.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link_directory(repo.root / "rose", outside)
+    with pytest.raises(ThemeError) as exc:
+        repo.save_theme(minimal_theme("rose"))
+    assert exc.value.code == "asset_escape"
+    assert not (outside / "theme.json").exists()
+
+
+def test_import_zip_rejects_junction_root_without_external_write(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{}", encoding="utf-8")
+    root = tmp_path / "gui-themes"
+    link_directory(root, outside)
+    repo = ThemeRepository(root, config_file)
+    archive = tmp_path / "evil.zip"
+    with ZipFile(archive, "w") as zf:
+        zf.writestr("theme.json", json.dumps(minimal_theme("evil")))
+    with pytest.raises(ThemeError) as exc:
+        repo.import_zip(archive)
+    assert exc.value.code == "asset_escape"
+    assert not (outside / "evil").exists()
