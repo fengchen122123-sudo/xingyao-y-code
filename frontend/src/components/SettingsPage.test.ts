@@ -85,6 +85,14 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="token-statistics-page"]').exists()).toBe(true);
   });
 
+  it('opens the GUI appearance page from settings navigation', async () => {
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="appearance-nav"]').trigger('click');
+
+    expect(wrapper.get('[data-test="gui-theme-settings"]').isVisible()).toBe(true);
+  });
+
   it('opens a model editor with the multimodal choice', async () => {
     const wrapper = mount(SettingsPage);
 
