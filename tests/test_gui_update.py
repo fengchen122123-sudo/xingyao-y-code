@@ -415,8 +415,11 @@ def test_fetch_latest_release_single_exe_keeps_compat():
 class _FakePartResp:
     """模拟单个分卷响应：返回固定字节串并声明 Content-Length。"""
 
-    def __init__(self, payload: bytes):
-        self.headers = {"Content-Length": str(len(payload))}
+    def __init__(self, payload: bytes, content_type: str = "application/octet-stream"):
+        self.headers = {
+            "Content-Length": str(len(payload)),
+            "Content-Type": content_type,
+        }
         self._payload = payload
         self._pos = 0
 
@@ -432,14 +435,96 @@ class _FakePartResp:
         return False
 
 
+def test_download_rejects_html_error_page():
+    """Gitee 限流/登录墙返回 HTML 时必须立即报错，不得写入磁盘当成功。"""
+    from core.updater import UpdateDownloader
+    import threading
+
+    # 清理可能的残留文件
+    dest = os.path.join(get_update_cache_dir(), "Y-CODE-Setup-v9.9.9.exe")
+    if os.path.exists(dest):
+        os.remove(dest)
+
+    html_payload = b"<!DOCTYPE html><html><head><title>Login</title></head><body>Please login</body></html>"
+    responses = [_FakePartResp(html_payload, content_type="text/html; charset=utf-8")]
+
+    downloader = UpdateDownloader()
+    done = threading.Event()
+    result = {}
+
+    with patch("urllib.request.urlopen", side_effect=lambda req, timeout=None: responses.pop(0)):
+        started = downloader.start_download(
+            download_url="https://gitee.com/fake.exe",
+            target_version="9.9.9",
+            on_progress=lambda d: None,
+            on_complete=lambda p: (result.update(ok=p), done.set()),
+            on_error=lambda m: (result.update(err=m), done.set()),
+        )
+        assert started is True
+        assert done.wait(timeout=10)
+
+    assert "err" in result
+    assert "html" in result["err"].lower() or "登录" in result["err"] or "限流" in result["err"]
+    # 不得落盘
+    dest = os.path.join(get_update_cache_dir(), "Y-CODE-Setup-v9.9.9.exe")
+    assert not os.path.exists(dest)
+
+
+def test_download_rejects_suspiciously_small_file():
+    """安装包 < 1MB 时视为错误页/残缺文件，拒绝落盘。"""
+    from core.updater import UpdateDownloader
+    import threading
+
+    # 清理可能的残留文件
+    dest = os.path.join(get_update_cache_dir(), "Y-CODE-Setup-v9.9.8.exe")
+    if os.path.exists(dest):
+        os.remove(dest)
+
+    tiny_payload = b"x" * 500  # 500 字节，远小于真实安装包
+    responses = [_FakePartResp(tiny_payload)]
+
+    downloader = UpdateDownloader()
+    done = threading.Event()
+    result = {}
+
+    with patch("urllib.request.urlopen", side_effect=lambda req, timeout=None: responses.pop(0)):
+        started = downloader.start_download(
+            download_url="https://gitee.com/fake.exe",
+            target_version="9.9.8",
+            on_progress=lambda d: None,
+            on_complete=lambda p: (result.update(ok=p), done.set()),
+            on_error=lambda m: (result.update(err=m), done.set()),
+        )
+        assert started is True
+        assert done.wait(timeout=10)
+
+    assert "err" in result
+    assert "过小" in result["err"] or "异常" in result["err"] or "invalid" in result["err"].lower()
+    dest = os.path.join(get_update_cache_dir(), "Y-CODE-Setup-v9.9.8.exe")
+    assert not os.path.exists(dest)
+
+
+def test_launch_installer_rejects_non_pe_file():
+    """启动安装前检查 PE 头（MZ），非可执行文件直接拒绝。"""
+    fake_exe = os.path.join(tempfile.gettempdir(), "fake_installer.html")
+    with open(fake_exe, "wb") as f:
+        f.write(b"<!DOCTYPE html><html><body>not an exe</body></html>")
+
+    try:
+        assert launch_installer_and_cleanup(fake_exe) is False
+    finally:
+        os.remove(fake_exe)
+
+
 def test_split_download_concatenates_and_verifies():
     """分卷下载：顺序拼接还原 exe，SHA256 匹配时才落盘成功。"""
     from core.updater import UpdateDownloader, _sha256_file
     import hashlib
     import threading
 
-    part1 = b"A" * 100
-    part2 = b"B" * 50
+    # 测试 payload 必须 > 1MB，否则会触发大小异常校验
+    part1 = b"A" * (1024 * 1024 + 100)
+    part2 = b"B" * (1024 * 1024 + 50)
     full = part1 + part2
     good_sha = hashlib.sha256(full).hexdigest()
 
@@ -478,8 +563,9 @@ def test_split_download_rejects_sha256_mismatch():
     from core.updater import UpdateDownloader
     import threading
 
-    part1 = b"A" * 100
-    part2 = b"B" * 50
+    # 测试 payload 必须 > 1MB
+    part1 = b"A" * (1024 * 1024 + 100)
+    part2 = b"B" * (1024 * 1024 + 50)
 
     cache_dir = get_update_cache_dir()
     dest_path = os.path.join(cache_dir, "Y-CODE-Setup-v7.7.7.exe")
@@ -518,8 +604,9 @@ def test_split_download_reports_part_progress():
     from core.updater import UpdateDownloader
     import threading
 
-    part1 = b"A" * 60
-    part2 = b"B" * 40
+    # 测试 payload 必须 > 1MB
+    part1 = b"A" * (1024 * 1024 + 60)
+    part2 = b"B" * (1024 * 1024 + 40)
     responses = [_FakePartResp(part1), _FakePartResp(part2)]
     progress_events = []
     done = threading.Event()
@@ -533,7 +620,7 @@ def test_split_download_reports_part_progress():
             on_complete=lambda p: done.set(),
             on_error=lambda m: done.set(),
             part_urls=["https://gitee.com/p1", "https://gitee.com/p2"],
-            total_size_hint=100,
+            total_size_hint=len(part1) + len(part2),
         )
         assert started is True
         assert done.wait(timeout=10)
@@ -542,7 +629,7 @@ def test_split_download_reports_part_progress():
     last = progress_events[-1]
     assert last["part_count"] == 2
     assert last["percent"] == 100
-    assert last["downloaded"] == 100
+    assert last["downloaded"] == len(part1) + len(part2)
     # 覆盖到第二片时 part_index 必须推进到 2
     assert any(e["part_index"] == 2 for e in progress_events)
     # 清理产物
@@ -556,7 +643,8 @@ def test_single_part_url_falls_back_to_direct_download():
     from core.updater import UpdateDownloader
     import threading
 
-    payload = b"C" * 30
+    # 测试 payload 必须 > 1MB
+    payload = b"C" * (1024 * 1024 + 30)
     responses = [_FakePartResp(payload)]
     done = threading.Event()
     result = {}

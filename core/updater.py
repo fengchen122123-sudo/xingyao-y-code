@@ -459,6 +459,22 @@ class UpdateDownloader:
                         headers={"User-Agent": HTTP_USER_AGENT},
                     )
                     with urllib.request.urlopen(req, timeout=30.0) as resp:
+                        # 安全防线 1：Content-Type 校验。Gitee 限流/登录墙/风控页
+                        # 会返回 text/html，必须立即拒绝，不能写入磁盘当成功
+                        content_type = str(resp.headers.get("Content-Type", "")).lower()
+                        if "text/html" in content_type or "text/plain" in content_type:
+                            logger.error(
+                                "下载源返回 HTML/文本页（可能是登录墙/限流/风控），拒绝下载: %s (Content-Type: %s)",
+                                url,
+                                content_type,
+                            )
+                            _cleanup_tmp()
+                            on_error(
+                                "下载源返回了网页而非安装包（Gitee 可能触发了登录验证或限流），"
+                                "请稍后重试，或前往 Release 页面手动下载"
+                            )
+                            return
+
                         part_total = int(resp.headers.get("Content-Length", 0))
                         if grand_total <= 0:
                             grand_total = part_total * len(urls)
@@ -495,6 +511,22 @@ class UpdateDownloader:
                         on_error(
                             f"安装包下载不完整（分卷 {i + 1}/{len(urls)}："
                             f"{part_downloaded}/{part_total} 字节），请重试"
+                        )
+                        return
+
+                    # 安全防线 2：单片分卷必须 > 1MB（真实分卷 ≥ 95MB，HTML 错误页
+                    # 通常只有几十 KB）。小于阈值视为异常，拒绝继续
+                    if part_downloaded < 1024 * 1024:
+                        logger.error(
+                            "分卷 %d/%d 大小异常（仅 %d 字节），可能是错误页或残缺文件",
+                            i + 1,
+                            len(urls),
+                            part_downloaded,
+                        )
+                        _cleanup_tmp()
+                        on_error(
+                            f"下载的安装包大小异常（仅 {part_downloaded} 字节），"
+                            "可能是 Gitee 返回了错误页，请稍后重试或手动下载"
                         )
                         return
 
@@ -557,6 +589,21 @@ def launch_installer_and_cleanup(installer_path: str) -> bool:
     """
     if not os.path.isfile(installer_path):
         logger.error("安装程序不存在: %s", installer_path)
+        return False
+
+    # 安全防线 3：启动前检查 PE 头（MZ 魔数），非可执行文件直接拒绝
+    # （防止把 HTML 错误页当安装包启动导致静默失败）
+    try:
+        with open(installer_path, "rb") as f:
+            magic = f.read(2)
+        if magic != b"MZ":
+            logger.error(
+                "安装包不是有效的 Windows 可执行文件（MZ 头缺失，可能是 HTML 错误页）: %s",
+                installer_path,
+            )
+            return False
+    except Exception as e:
+        logger.error("读取安装包文件头失败: %s - %s", installer_path, e)
         return False
 
     norm_path = os.path.normpath(installer_path)
