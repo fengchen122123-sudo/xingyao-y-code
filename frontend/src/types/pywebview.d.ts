@@ -2,6 +2,15 @@
 // 本文件按后端桥接 API 契约编写（而非当前 gui_bridge.py 的实现），
 // 后端会单独重写以匹配此契约。
 
+import type {
+  GuiTheme,
+  GuiThemeResult,
+  GuiThemeSummary,
+  NativeTitlebarColorCapability,
+  NativeTitlebarTheme,
+  ThemeRegionId,
+} from '../themes/types';
+
 export type PermissionMode = 'confirm' | 'accept_edits' | 'plan' | 'full';
 // 推理强度档位：default = 模型条目未配置，用请求层内置默认
 export type ReasoningEffort = 'default' | 'low' | 'high' | 'max';
@@ -217,6 +226,12 @@ export interface InitialState {
   active_sessions?: string[];
   // 各会话排队中的消息（窗口重载时恢复排队条目）
   message_queues?: Record<string, QueuedMessage[]>;
+  theme_light?: boolean;
+  gui_theme: GuiTheme | null;
+  gui_themes: GuiThemeSummary[];
+  gui_theme_error: import('../themes/types').GuiThemeError | null;
+  gui_theme_list_error: import('../themes/types').GuiThemeError | null;
+  native_titlebar_color_capability: NativeTitlebarColorCapability;
 }
 
 // 工具事件 display dict：后端原样透传，字段可缺省
@@ -352,7 +367,38 @@ export interface PyWebViewAPI {
   get_dir_children(path: string): Promise<any>;
   get_file_tree(workdir: string): Promise<any>;
   set_titlebar_theme(dark: boolean): Promise<any>;
-  set_gui_theme(theme_light: boolean): Promise<any>;
+  set_gui_theme(theme_light: boolean): Promise<GuiThemeResult<{
+    theme: GuiTheme;
+    native_titlebar_color_capability: NativeTitlebarColorCapability;
+  }>>;
+  list_gui_themes(): Promise<GuiThemeResult<{ themes: GuiThemeSummary[] }>>;
+  get_gui_theme(themeId: string): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
+  save_gui_theme(theme: GuiTheme): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
+  set_active_gui_theme(themeId: string): Promise<GuiThemeResult<{
+    theme: GuiTheme;
+    native_titlebar_color_capability: NativeTitlebarColorCapability;
+  }>>;
+  copy_gui_theme(sourceId: string, newId: string, newName: string): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
+  rename_gui_theme(themeId: string, newId: string, newName: string): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
+  delete_gui_theme(themeId: string): Promise<GuiThemeResult>;
+  import_gui_theme(): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
+  export_gui_theme(themeId: string): Promise<GuiThemeResult<{ path: string }>>;
+  import_gui_theme_image(themeId: string, region: ThemeRegionId): Promise<GuiThemeResult<{ asset_path: string }>>;
+  remove_gui_theme_image(themeId: string, region: ThemeRegionId): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
+  read_gui_theme_asset(themeId: string, assetPath: string): Promise<GuiThemeResult<{
+    mime: string;
+    base64: string;
+  }>>;
+  get_gui_theme_asset(themeId: string, assetPath: string): Promise<GuiThemeResult<{
+    mime: string;
+    base64: string;
+  }>>;
+  preview_native_titlebar(nativeTitlebar: NativeTitlebarTheme): Promise<GuiThemeResult<{
+    native_titlebar_color_capability: NativeTitlebarColorCapability;
+  }>>;
+  restore_native_titlebar(): Promise<GuiThemeResult<{
+    native_titlebar_color_capability: NativeTitlebarColorCapability;
+  }>>;
 
   get_background_tasks(): Promise<BackgroundTask[]>;
   kill_task(taskId: string): Promise<any>;
