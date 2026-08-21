@@ -11,6 +11,7 @@ PyWebView JS-API 桥接层：为 Vue 前端提供后端能力，并把一轮对�
   {"ok": False, "msg": ...}，绝不让异常穿过桥接层（否则前端 Promise 直接 reject）。
 """
 
+import base64
 import json
 import logging
 import os
@@ -27,6 +28,7 @@ from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.agent_service import strip_context_suffix
 from core.memory import MemoryManager
+from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -62,6 +64,17 @@ logger = logging.getLogger(__name__)
 # CLI 的 prompt_toolkit 着色标记（<ansiyellow> 等）：GUI 不渲染，桥接层统一剥离，
 # 否则用户会在提示里看到 <ansiyellow> 原文。CLI 路径不经此处，不受影响。
 _ANSI_MARKUP_RE = re.compile(r"</?ansi\w*>")
+_RGB_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
+
+
+def _rgb_hex_to_colorref(color: str) -> int:
+    """Convert CSS #RRGGBB to the Windows COLORREF 0x00BBGGRR layout."""
+    if not isinstance(color, str) or not _RGB_HEX_RE.fullmatch(color):
+        raise ValueError("color must be #RRGGBB")
+    red = int(color[1:3], 16)
+    green = int(color[3:5], 16)
+    blue = int(color[5:7], 16)
+    return red | (green << 8) | (blue << 16)
 
 
 def _strip_ansi_markup(text) -> str:
@@ -370,13 +383,15 @@ class ApiBridge:
         """设置 PyWebView window 引用"""
         self._window = window
         self._hwnd = 0
-        # 标题栏主题初始值必须读持久化配置（gui_theme_light）：首次 DWM 着色
-        # 发生在句柄找到时，早于前端校正；硬编码深色会让浅色主题用户看到
-        # 标题栏先黑一闪再变白。
+        # 首次 DWM 着色直接解析当前活动主题。gui_theme_id 是唯一真值；旧的
+        # gui_theme_light 只由仓库迁移逻辑读取，不再单独决定标题栏。
         try:
-            self._titlebar_dark = not bool(load_config().get("gui_theme_light", False))
-        except Exception:
-            self._titlebar_dark = True  # 读不到配置时保持深色默认
+            theme = get_gui_theme_repository().get_active()
+            self._native_titlebar = theme["native_titlebar"]
+            self._titlebar_dark = self._native_titlebar["mode"] == "dark"
+        except ThemeError:
+            self._native_titlebar = None
+            logger.warning("读取活动 GUI 主题失败，标题栏暂不着色", exc_info=True)
         # 后台线程轮询获取原生窗口句柄，拿到后应用深色标题栏
         threading.Thread(target=self._find_hwnd_worker, daemon=True, name="gui-hwnd-find").start()
         # WebView2 就绪、最小化还原等时机 DWM 可能重建非客户区，把标题栏重置回白色。
@@ -576,54 +591,252 @@ class ApiBridge:
         except Exception:
             logger.debug("设置窗口图标失败", exc_info=True)
 
-    # 与前端 style.css 主题变量保持一致（标题栏取 --bg1 与应用顶栏无缝衔接，文字取 --text）
-    _TITLEBAR_COLORS = {
-        # dark:  (caption, text)   COLORREF = 0x00BBGGRR
-        True:  (0x001E2020, 0x00D4D9D9),  # #20201e / #d9d9d4
-        False: (0x00FFFFFF, 0x002A2C2C),  # #ffffff / #2c2c2a
-    }
-
-    def _apply_titlebar_theme(self):
-        """把当前标题栏主题写入 DWM；19 兼容旧版 Win10，20 为 Win11/新版 Win10。
-        Win11 22000+ 额外用 CAPTION/TEXT/BORDER_COLOR 让标题栏颜色与界面背景完全一致。"""
-        if not self._hwnd or sys.platform != "win32":
-            return
+    def _apply_titlebar_colors(self, native_titlebar: Dict[str, Any]) -> bool:
+        """Apply a resolved theme's native titlebar colors without persisting it."""
         try:
+            if not isinstance(native_titlebar, dict):
+                raise ValueError("native_titlebar must be an object")
+            mode = native_titlebar["mode"]
+            if mode not in ("light", "dark"):
+                raise ValueError("native_titlebar.mode must be light or dark")
+            caption = _rgb_hex_to_colorref(native_titlebar["background"])
+            text = _rgb_hex_to_colorref(native_titlebar["text"])
+            border = _rgb_hex_to_colorref(native_titlebar["border"])
+            self._native_titlebar = dict(native_titlebar)
+            self._titlebar_dark = mode == "dark"
+
+            # Tests, non-Windows development, and calls before HWND discovery have
+            # no native surface yet. The remembered colors are applied by the
+            # existing HWND/reapply workers as soon as one exists.
+            if not getattr(self, "_hwnd", 0) or sys.platform != "win32":
+                return True
+
             import ctypes
             dwm = ctypes.windll.dwmapi
             val = ctypes.c_int(1 if self._titlebar_dark else 0)
+            immersive_applied = False
             for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE
                 if dwm.DwmSetWindowAttribute(
                     self._hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)
                 ) == 0:
+                    immersive_applied = True
                     break
-            caption, text = self._TITLEBAR_COLORS[self._titlebar_dark]
             # DWMWA_CAPTION_COLOR=35 / TEXT_COLOR=36 / BORDER_COLOR=34（Win11 起支持，失败忽略）
-            for attr, color in ((35, caption), (36, text), (34, caption)):
+            for attr, color in ((35, caption), (36, text), (34, border)):
                 cval = ctypes.c_int(color)
                 dwm.DwmSetWindowAttribute(
                     self._hwnd, attr, ctypes.byref(cval), ctypes.sizeof(cval)
                 )
+            return immersive_applied
         except Exception:
             logger.debug("设置标题栏主题失败", exc_info=True)
+            return False
+
+    def _apply_titlebar_theme(self) -> bool:
+        """Reapply the last resolved native titlebar after DWM rebuilds the frame."""
+        native_titlebar = getattr(self, "_native_titlebar", None)
+        if native_titlebar is None:
+            return False
+        return self._apply_titlebar_colors(native_titlebar)
 
     def set_titlebar_theme(self, dark: bool) -> Dict[str, Any]:
         """前端主题切换时同步窗口标题栏明暗，避免深色内容配白色标题栏刺眼。"""
-        self._titlebar_dark = bool(dark)
-        self._apply_titlebar_theme()
-        return {"ok": True}
+        theme_id = "builtin.dark" if bool(dark) else "builtin.light"
+        try:
+            theme = get_gui_theme_repository().get_theme(theme_id)
+            if not self._apply_titlebar_colors(theme["native_titlebar"]):
+                raise ThemeError("native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败")
+            return {"ok": True}
+        except ThemeError as error:
+            return {"ok": False, "error": error.as_dict()}
 
     def set_gui_theme(self, theme_light: bool) -> Dict[str, Any]:
-        """持久化界面主题明暗（原子写入 config.json），并同步窗口标题栏。
+        """One-release compatibility adapter for the old boolean theme API."""
+        theme_id = "builtin.light" if bool(theme_light) else "builtin.dark"
+        return self.set_active_gui_theme(theme_id)
 
-        用户关闭再打开后主题保持不变：启动时由 get_initial_state 的
-        theme_light 字段恢复。默认 False（深色）。
-        """
-        light = bool(theme_light)
-        from config import save_config_value
-        ok = save_config_value("gui_theme_light", light)
-        self.set_titlebar_theme(not light)
-        return {"ok": bool(ok)}
+    @staticmethod
+    def _gui_theme_error(error: ThemeError) -> Dict[str, Any]:
+        return {"ok": False, "error": error.as_dict()}
+
+    @staticmethod
+    def _dialog_path(result: Any) -> Optional[pathlib.Path]:
+        if not result:
+            return None
+        if isinstance(result, (list, tuple)):
+            if not result:
+                return None
+            result = result[0]
+        return pathlib.Path(str(result))
+
+    def _require_theme_window(self):
+        if self._window is None:
+            raise ThemeError("window_not_ready", "window", "窗口尚未就绪")
+        return self._window
+
+    def list_gui_themes(self) -> Dict[str, Any]:
+        try:
+            return {"ok": True, "themes": get_gui_theme_repository().list_themes()}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def get_gui_theme(self, theme_id: str) -> Dict[str, Any]:
+        try:
+            return {"ok": True, "theme": get_gui_theme_repository().get_theme(theme_id)}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def save_gui_theme(self, theme: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            saved = get_gui_theme_repository().save_theme(theme)
+            return {"ok": True, "theme": saved}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def set_active_gui_theme(self, theme_id: str) -> Dict[str, Any]:
+        """Apply native colors first; persist gui_theme_id only after DWM accepts them."""
+        try:
+            repository = get_gui_theme_repository()
+            theme = repository.get_theme(theme_id)
+            if not self._apply_titlebar_colors(theme["native_titlebar"]):
+                raise ThemeError(
+                    "native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败",
+                )
+            active_theme = repository.set_active(theme_id)
+
+            # Temporary compatibility mirror for one release. The repository's
+            # gui_theme_id write above is authoritative.
+            from config import save_config_value
+            if not save_config_value("gui_theme_light", active_theme["appearance"] == "light"):
+                logger.warning("写入兼容配置 gui_theme_light 失败")
+            return {"ok": True, "theme": active_theme}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def copy_gui_theme(self, source_id: str, new_id: str, new_name: str) -> Dict[str, Any]:
+        try:
+            theme = get_gui_theme_repository().copy_theme(source_id, new_id, new_name)
+            return {"ok": True, "theme": theme}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def rename_gui_theme(self, theme_id: str, new_id: str, new_name: str) -> Dict[str, Any]:
+        try:
+            theme = get_gui_theme_repository().rename_theme(theme_id, new_id, new_name)
+            return {"ok": True, "theme": theme}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def delete_gui_theme(self, theme_id: str) -> Dict[str, Any]:
+        try:
+            get_gui_theme_repository().delete_theme(theme_id)
+            return {"ok": True}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def import_gui_theme(self) -> Dict[str, Any]:
+        try:
+            import webview
+
+            result = self._require_theme_window().create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("Y-CODE GUI Theme (*.zip)",),
+            )
+            source = self._dialog_path(result)
+            if source is None:
+                raise ThemeError("dialog_cancelled", "source", "已取消导入")
+            theme = get_gui_theme_repository().import_zip(source)
+            return {"ok": True, "theme": theme}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+        except Exception as error:
+            logger.exception("import_gui_theme 失败")
+            return self._gui_theme_error(
+                ThemeError("file_dialog_failed", "source", str(error)),
+            )
+
+    def export_gui_theme(self, theme_id: str) -> Dict[str, Any]:
+        try:
+            import webview
+
+            result = self._require_theme_window().create_file_dialog(
+                webview.SAVE_DIALOG,
+                save_filename=f"{theme_id}.zip",
+                file_types=("Y-CODE GUI Theme (*.zip)",),
+            )
+            destination = self._dialog_path(result)
+            if destination is None:
+                raise ThemeError("dialog_cancelled", "destination", "已取消导出")
+            if destination.suffix.lower() != ".zip":
+                destination = destination.with_suffix(".zip")
+            exported = get_gui_theme_repository().export_zip(theme_id, destination)
+            return {"ok": True, "path": str(exported)}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+        except Exception as error:
+            logger.exception("export_gui_theme 失败")
+            return self._gui_theme_error(
+                ThemeError("file_dialog_failed", "destination", str(error)),
+            )
+
+    def import_gui_theme_image(self, theme_id: str, region: str) -> Dict[str, Any]:
+        try:
+            import webview
+
+            result = self._require_theme_window().create_file_dialog(
+                webview.OPEN_DIALOG,
+                allow_multiple=False,
+                file_types=("Images (*.png;*.jpg;*.jpeg;*.webp)",),
+            )
+            source = self._dialog_path(result)
+            if source is None:
+                raise ThemeError("dialog_cancelled", "source", "已取消选择图片")
+            asset_path = get_gui_theme_repository().import_image(theme_id, region, source)
+            return {"ok": True, "asset_path": asset_path}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+        except Exception as error:
+            logger.exception("import_gui_theme_image 失败")
+            return self._gui_theme_error(
+                ThemeError("file_dialog_failed", "source", str(error)),
+            )
+
+    def remove_gui_theme_image(self, theme_id: str, region: str) -> Dict[str, Any]:
+        try:
+            theme = get_gui_theme_repository().remove_image(theme_id, region)
+            return {"ok": True, "theme": theme}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def get_gui_theme_asset(self, theme_id: str, asset_path: str) -> Dict[str, Any]:
+        try:
+            mime_type, data = get_gui_theme_repository().read_asset(theme_id, asset_path)
+            return {
+                "ok": True,
+                "mime_type": mime_type,
+                "data": base64.b64encode(data).decode("ascii"),
+            }
+        except ThemeError as error:
+            return self._gui_theme_error(error)
+
+    def preview_native_titlebar(self, native_titlebar: Dict[str, Any]) -> Dict[str, Any]:
+        if self._apply_titlebar_colors(native_titlebar):
+            return {"ok": True}
+        return self._gui_theme_error(
+            ThemeError("native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败"),
+        )
+
+    def restore_native_titlebar(self) -> Dict[str, Any]:
+        try:
+            theme = get_gui_theme_repository().get_active()
+            if not self._apply_titlebar_colors(theme["native_titlebar"]):
+                raise ThemeError(
+                    "native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败",
+                )
+            return {"ok": True}
+        except ThemeError as error:
+            return self._gui_theme_error(error)
 
     def get_changelog(self) -> Dict[str, Any]:
         """解析随安装包发布的 assets/CHANGELOG.md，供关于页展示更新内容。
@@ -975,9 +1188,22 @@ class ApiBridge:
         # 若启动卡死时日志里没有这条，说明调用根本没到 Python（桥消息丢失），
         # 而非本方法内部卡住——据此区分"前端没调进来"与"卡在入口"。
         logger.info("get_initial_state 入口被调用（前端桥已打通）")
+        active_gui_theme = None
+        gui_themes: List[Dict[str, Any]] = []
+        gui_theme_error = None
         try:
             active_model = get_active_model(self._current_session) or {}
             config_data = load_config()
+            theme_repository = get_gui_theme_repository()
+            try:
+                gui_themes = theme_repository.list_themes()
+            except ThemeError as error:
+                gui_theme_error = error.as_dict()
+            try:
+                active_gui_theme = theme_repository.get_active()
+            except ThemeError as error:
+                if gui_theme_error is None:
+                    gui_theme_error = error.as_dict()
             # 当前会话若已绑定模型，优先展示会话模型；否则展示全局默认
             effective_model_id = active_model.get("id") or config_data.get("active_model_id") or ""
 
@@ -1048,8 +1274,16 @@ class ApiBridge:
                     for name in list(getattr(self, "_message_queues", {}).keys())
                 },
                 "token_usage": self.get_token_usage(),
-                # 持久化的界面主题（True=浅色），前端启动时据此恢复，关闭重开不变
-                "theme_light": bool(config_data.get("gui_theme_light", False)),
+                # 旧前端的一代兼容字段；必须由权威 gui_theme_id 解析结果派生，
+                # 不能反过来让可能陈旧的 gui_theme_light 覆盖活动主题。
+                "theme_light": (
+                    active_gui_theme["appearance"] == "light"
+                    if active_gui_theme is not None
+                    else bool(config_data.get("gui_theme_light", False))
+                ),
+                "gui_theme": active_gui_theme,
+                "gui_themes": gui_themes,
+                "gui_theme_error": gui_theme_error,
                 "version": str(YCODE_VERSION),
             }
         except Exception as e:
@@ -1061,6 +1295,9 @@ class ApiBridge:
                 "sessions": [], "skills": [], "mcps": [],
                 "workdir": "", "current_session": self._current_session,
                 "active_sessions": [],
+                "gui_theme": active_gui_theme,
+                "gui_themes": gui_themes,
+                "gui_theme_error": gui_theme_error,
                 "token_usage": {"used": 0, "window": 0, "cached_pct": 0, "cumulative": 0},
                 "version": str(YCODE_VERSION), "ok": False, "msg": str(e),
             }
