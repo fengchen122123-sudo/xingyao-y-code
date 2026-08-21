@@ -87,6 +87,7 @@
       <span class="si" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">{{ store.currentWorkdirLabel }}</span>
       <span class="si" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
       <span class="si">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
+      <span class="si" :title="statusSkillTitle">技能: {{ statusSkillText }}</span>
       <span
         class="si"
         :class="{ 'si-warn': store.sandboxEnabled }"
@@ -167,6 +168,17 @@ const statusTokenClass = computed(() => {
   if (statusTokenPct.value > 70) return 'tok-orange';
   return '';
 });
+
+// 状态栏"技能"项：显示本回合实际用到的技能名（来自 is_skill 工具调用收集），
+// 回合结束后固化；未使用任何技能时显示"无"，让"很少触发"从感觉变成可见数字
+const statusSkillText = computed(() =>
+  store.usedSkills.length ? store.usedSkills.join('、') : '无',
+);
+const statusSkillTitle = computed(() =>
+  store.usedSkills.length
+    ? '本回合使用的技能：' + store.usedSkills.join('、')
+    : '本回合未使用任何技能',
+);
 
 function scrollToBottom() {
   // 合并到下一帧：流式输出期间会被高频调用，逐帧滚动足够顺滑且避免布局抖动

@@ -38,6 +38,8 @@ tiktoken_ext_datas, tiktoken_ext_binaries, tiktoken_ext_hiddenimports = collect_
 common_datas = [
     ('config.example.json', '.'),
     ('system_prompt.md', '.'),
+    # GUI 专用提示词：与通用版并列随包，GUI 严格使用自己的，不回退混用
+    ('system_prompt_gui.md', '.'),
     ('vendor/ripgrep/rg.exe', 'vendor/ripgrep'),
     ('frontend/dist', 'frontend/dist'),
     # 内置技能（plugin-creator 等）：首次启动释放到 ~/.ycode/skills，用户可自由开关

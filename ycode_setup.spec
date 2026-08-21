@@ -25,6 +25,8 @@ datas = [
     ('dist/ycode_uninstall.exe', '.'),
     ('config.example.json', '.'),
     ('system_prompt.md', '.'),
+    # GUI 专用提示词：与通用版并列随包，GUI 严格使用自己的，不回退混用
+    ('system_prompt_gui.md', '.'),
     # GUI 向导资源：虚化背景图 + 窗口图标
     ('assets/ycode.png', 'assets'),
     ('assets/ycode.ico', 'assets'),
