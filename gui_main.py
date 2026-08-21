@@ -184,20 +184,39 @@ def _initial_gui_theme() -> dict:
             "background": theme["tokens"]["background_app"],
         }
     except ThemeError as error:
-        # Keep the existing dark splash shell visible. The fragment marker lets
-        # the frontend distinguish this from a valid dark theme; get_initial_state
-        # carries the structured error details once the bridge is ready.
         logger.error("启动 GUI 主题无效: %s", error.as_dict())
-        return {
-            "appearance": "dark",
-            "background": "#1a1a18",
-            "error": error.as_dict(),
-        }
+        startup_error = error
+    except (OSError, IOError) as error:
+        logger.exception("启动 GUI 主题读取遇到 I/O 错误")
+        startup_error = ThemeError("theme_io_failed", "gui_theme_id", str(error))
+    except Exception:
+        logger.exception("启动 GUI 主题读取发生未预期错误")
+        startup_error = ThemeError(
+            "theme_operation_failed", "gui_theme_id", "读取启动 GUI 主题失败",
+        )
+    # Keep the existing dark splash shell visible. The fragment marker lets
+    # the frontend distinguish this from a valid dark theme; get_initial_state
+    # carries the structured error details once the bridge is ready.
+    return {
+        "appearance": "dark",
+        "background": "#1a1a18",
+        "error": startup_error.as_dict(),
+    }
 
 
 def _initial_theme_light() -> bool:
     """Compatibility helper retained for callers from the boolean-theme release."""
     return _initial_gui_theme()["appearance"] == "light"
+
+
+def _build_gui_theme_fragment(gui_theme: dict) -> str:
+    fragment = (
+        f"theme={gui_theme['appearance']}"
+        f"&bg={gui_theme['background'].lstrip('#')}"
+    )
+    if gui_theme.get("error") is not None:
+        fragment += "&gui_theme_error=1"
+    return fragment
 
 
 def _debug_enabled() -> bool:
@@ -402,13 +421,7 @@ def main():
     _start_preload_thread()
     url = get_frontend_url()
     gui_theme = _initial_gui_theme()
-    fragment = (
-        f"theme={gui_theme['appearance']}"
-        f"&bg={gui_theme['background'].lstrip('#')}"
-    )
-    if gui_theme.get("error") is not None:
-        fragment += "&theme_error=1"
-    url += ("&" if "#" in url else "#") + fragment
+    url += ("&" if "#" in url else "#") + _build_gui_theme_fragment(gui_theme)
 
     # 启动 PyWebView 原生桌面窗口（背景色与主题一致，页面加载前不闪反色）
     window = webview.create_window(

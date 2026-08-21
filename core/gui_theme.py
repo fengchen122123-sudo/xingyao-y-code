@@ -29,6 +29,7 @@ REGION_IDS = (
     "composer", "right_panel", "statusbar",
 )
 COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$")
+OPAQUE_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 _ROOT_KEYS = frozenset({
     "schema_version", "id", "name", "appearance", "extends", "tokens",
@@ -178,6 +179,11 @@ def _validate_color(value: Any, path: str) -> None:
         raise ThemeError("invalid_color", path, "颜色必须是 #RRGGBB 或 #RRGGBBAA")
 
 
+def _validate_opaque_color(value: Any, path: str) -> None:
+    if not isinstance(value, str) or not OPAQUE_COLOR_RE.fullmatch(value):
+        raise ThemeError("invalid_color", path, "原生标题栏颜色必须是 #RRGGBB")
+
+
 def _validate_manifest(theme: Mapping[str, Any]) -> dict[str, Any]:
     manifest = _require_mapping(theme, "")
     _reject_unknown(manifest, _ROOT_KEYS, "")
@@ -221,7 +227,9 @@ def _validate_manifest(theme: Mapping[str, Any]) -> dict[str, Any]:
             if not isinstance(value, str) or value not in _APPEARANCES:
                 raise ThemeError("invalid_value", path, "标题栏模式只能是 light 或 dark")
         else:
-            _validate_color(value, path)
+            # Windows COLORREF has no alpha channel. Web tokens/regions retain
+            # #RRGGBBAA support, while native chrome is explicitly opaque.
+            _validate_opaque_color(value, path)
 
     regions = _require_mapping(manifest["regions"], "regions")
     _reject_unknown(regions, frozenset(REGION_IDS), "regions")
@@ -346,16 +354,31 @@ class ThemeRepository:
             raise ThemeError("builtin_read_only", "id", "内置主题不能重命名")
         source_theme = self.get_theme(theme_id)
         manifest = self._manifest_for_copy(source_theme, new_id, new_name)
-        self._require_free_destination(new_id)
+        destination = self._require_free_destination(new_id)
         staging_dir = self._staging_directory()
-        try:
-            shutil.copytree(self.root / theme_id, staging_dir, dirs_exist_ok=True)
-            self._write_manifest(staging_dir / "theme.json", manifest)
-            os.replace(staging_dir, self._require_free_destination(new_id))
-            shutil.rmtree(self.root / theme_id)
-        except Exception:
-            shutil.rmtree(staging_dir, ignore_errors=True)
-            raise
+        destination_created = False
+        config_updated = False
+        with config._CONFIG_LOCK:
+            config_data = self._read_config()
+            was_active = config_data.get("gui_theme_id") == theme_id
+            try:
+                shutil.copytree(self.root / theme_id, staging_dir, dirs_exist_ok=True)
+                self._write_manifest(staging_dir / "theme.json", manifest)
+                os.replace(staging_dir, destination)
+                destination_created = True
+                if was_active:
+                    config_data["gui_theme_id"] = new_id
+                    config._atomic_write_json(str(self.config_file), config_data)
+                    config_updated = True
+                shutil.rmtree(self.root / theme_id)
+            except Exception:
+                if config_updated:
+                    config_data["gui_theme_id"] = theme_id
+                    config._atomic_write_json(str(self.config_file), config_data)
+                if destination_created:
+                    shutil.rmtree(destination, ignore_errors=True)
+                shutil.rmtree(staging_dir, ignore_errors=True)
+                raise
         return _merge_theme(BUILTIN_THEMES[manifest["extends"]], manifest)
 
     def import_image(self, theme_id: str, region: str, source: Path) -> str:

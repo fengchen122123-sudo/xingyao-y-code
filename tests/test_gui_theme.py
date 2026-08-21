@@ -1,4 +1,8 @@
+import base64
 import copy
+import ctypes
+import json
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -7,7 +11,7 @@ import config
 import core.model_manager as model_manager
 import gui_bridge
 import gui_main
-from core.gui_theme import BUILTIN_THEMES, ThemeError
+from core.gui_theme import BUILTIN_THEMES, ThemeError, ThemeRepository
 from gui_bridge import ApiBridge
 
 
@@ -29,6 +33,12 @@ def _bare_bridge():
 
 def complete_light_theme():
     return copy.deepcopy(BUILTIN_THEMES["builtin.light"])
+
+
+def editable_light_theme(theme_id="rose"):
+    theme = complete_light_theme()
+    theme.update({"id": theme_id, "name": "Rose", "extends": "builtin.light", "builtin": False})
+    return theme
 
 
 class BrokenRepo:
@@ -60,6 +70,32 @@ class RepoWithActive:
 
     def get_active(self):
         return self.theme
+
+
+class RepoWithBrokenList(RepoWithActive):
+    def list_themes(self):
+        raise ThemeError("invalid_manifest", "broken/theme.json", "broken")
+
+
+class FailingSetActiveRepo(RecordingRepo):
+    def set_active(self, theme_id):
+        self.calls.append(f"set_active:{theme_id}")
+        raise OSError("disk full")
+
+
+class ExplodingRepo:
+    def __init__(self, method_name, error):
+        self.method_name = method_name
+        self.error = error
+
+    def __getattr__(self, name):
+        if name != self.method_name:
+            raise AttributeError(name)
+
+        def explode(*_args, **_kwargs):
+            raise self.error
+
+        return explode
 
 
 def test_list_gui_themes_returns_structured_error(monkeypatch):
@@ -120,12 +156,267 @@ def test_initial_theme_metadata_comes_from_repository(monkeypatch):
     assert meta == {"appearance": "light", "background": "#f4f4f1"}
 
 
+def test_read_edit_save_complete_gui_theme_dto(tmp_path, monkeypatch):
+    repo = ThemeRepository(tmp_path / "themes", tmp_path / "config.json")
+    repo.copy_theme("builtin.light", "rose", "Rose")
+    monkeypatch.setattr(gui_bridge, "get_gui_theme_repository", lambda: repo)
+    bridge = _bare_bridge()
+
+    dto = bridge.get_gui_theme("rose")["theme"]
+    assert dto["builtin"] is False
+    dto["name"] = "Rose Edited"
+    result = bridge.save_gui_theme(dto)
+
+    assert result["ok"] is True
+    assert result["theme"]["name"] == "Rose Edited"
+    assert repo.get_theme("rose")["name"] == "Rose Edited"
+
+
+def test_read_gui_theme_asset_returns_exact_base64_envelope(monkeypatch):
+    repo = SimpleNamespace(read_asset=lambda _theme_id, _asset_path: ("image/png", b"\x00\x01"))
+    monkeypatch.setattr(gui_bridge, "get_gui_theme_repository", lambda: repo)
+
+    result = _bare_bridge().read_gui_theme_asset("rose", "assets/a.png")
+
+    assert result == {
+        "ok": True,
+        "mime": "image/png",
+        "base64": base64.b64encode(b"\x00\x01").decode("ascii"),
+    }
+
+
+def test_broken_non_active_theme_list_is_non_blocking(monkeypatch):
+    monkeypatch.setattr(
+        gui_bridge,
+        "get_gui_theme_repository",
+        lambda: RepoWithBrokenList(complete_light_theme()),
+    )
+
+    state = gui_bridge._load_initial_gui_theme_state()
+
+    assert state["gui_theme"]["id"] == "builtin.light"
+    assert state["gui_themes"] == []
+    assert state["gui_theme_error"] is None
+    assert state["gui_theme_list_error"]["code"] == "invalid_manifest"
+
+
+def test_initial_theme_repository_failure_is_structured(monkeypatch):
+    def fail_repository():
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(gui_bridge, "get_gui_theme_repository", fail_repository)
+
+    state = gui_bridge._load_initial_gui_theme_state()
+
+    assert state["gui_theme"] is None
+    assert state["gui_themes"] == []
+    assert state["gui_theme_error"]["code"] == "theme_io_failed"
+
+
+def test_initial_gui_theme_io_failure_returns_startup_marker(monkeypatch):
+    def fail_repository():
+        raise OSError("unavailable")
+
+    monkeypatch.setattr(gui_main, "get_gui_theme_repository", fail_repository)
+
+    startup = gui_main._initial_gui_theme()
+
+    assert startup["appearance"] == "dark"
+    assert startup["error"]["code"] == "theme_io_failed"
+
+
+def test_invalid_startup_theme_keeps_config_bytes(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.json"
+    config_file.write_text('{"gui_theme_id":"missing-theme","other":1}', encoding="utf-8")
+    repo = ThemeRepository(tmp_path / "themes", config_file)
+    before = config_file.read_bytes()
+    monkeypatch.setattr(gui_main, "get_gui_theme_repository", lambda: repo)
+
+    startup = gui_main._initial_gui_theme()
+
+    assert startup["error"]["code"] == "theme_not_found"
+    assert config_file.read_bytes() == before
+
+
+def test_startup_fragment_marks_only_active_theme_error():
+    assert gui_main._build_gui_theme_fragment({
+        "appearance": "light", "background": "#f4f4f1",
+    }) == "theme=light&bg=f4f4f1"
+    assert gui_main._build_gui_theme_fragment({
+        "appearance": "dark",
+        "background": "#1a1a18",
+        "error": {"code": "theme_not_found", "path": "gui_theme_id", "message": "missing"},
+    }) == "theme=dark&bg=1a1a18&gui_theme_error=1"
+
+
+def test_set_active_persist_failure_restores_native_titlebar(monkeypatch):
+    old_titlebar = copy.deepcopy(BUILTIN_THEMES["builtin.dark"]["native_titlebar"])
+    new_theme = editable_light_theme()
+    repo = FailingSetActiveRepo(new_theme)
+    bridge = _bare_bridge()
+    bridge._native_titlebar = old_titlebar
+    bridge._titlebar_dark = True
+    writes = []
+
+    def write_dwm(native_titlebar):
+        writes.append(copy.deepcopy(native_titlebar))
+        return True
+
+    monkeypatch.setattr(gui_bridge, "get_gui_theme_repository", lambda: repo)
+    monkeypatch.setattr(bridge, "_write_native_titlebar_dwm", write_dwm, raising=False)
+
+    result = bridge.set_active_gui_theme("rose")
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "theme_io_failed"
+    assert repo.calls == ["get:rose", "set_active:rose"]
+    assert writes == [new_theme["native_titlebar"], old_titlebar]
+    assert bridge._native_titlebar == old_titlebar
+    assert bridge._titlebar_dark is True
+
+
+def test_set_active_rollback_write_failure_still_restores_memory(monkeypatch):
+    old_titlebar = copy.deepcopy(BUILTIN_THEMES["builtin.dark"]["native_titlebar"])
+    repo = FailingSetActiveRepo(editable_light_theme())
+    bridge = _bare_bridge()
+    bridge._native_titlebar = old_titlebar
+    bridge._titlebar_dark = True
+    writes = 0
+
+    def write_dwm(_native_titlebar):
+        nonlocal writes
+        writes += 1
+        if writes == 2:
+            raise OSError("DWM unavailable")
+        return True
+
+    monkeypatch.setattr(gui_bridge, "get_gui_theme_repository", lambda: repo)
+    monkeypatch.setattr(bridge, "_write_native_titlebar_dwm", write_dwm)
+
+    result = bridge.set_active_gui_theme("rose")
+
+    assert result["ok"] is False
+    assert bridge._native_titlebar == old_titlebar
+    assert bridge._titlebar_dark is True
+
+
+def test_native_titlebar_failed_apply_restores_old_dwm_and_memory(monkeypatch):
+    old_titlebar = copy.deepcopy(BUILTIN_THEMES["builtin.dark"]["native_titlebar"])
+    new_titlebar = copy.deepcopy(BUILTIN_THEMES["builtin.light"]["native_titlebar"])
+    bridge = _bare_bridge()
+    bridge._native_titlebar = old_titlebar
+    bridge._titlebar_dark = True
+    writes = []
+
+    def write_dwm(native_titlebar):
+        writes.append(copy.deepcopy(native_titlebar))
+        return native_titlebar == old_titlebar
+
+    monkeypatch.setattr(bridge, "_write_native_titlebar_dwm", write_dwm, raising=False)
+
+    assert bridge._apply_native_titlebar_theme(new_titlebar) is False
+    assert writes == [new_titlebar, old_titlebar]
+    assert bridge._native_titlebar == old_titlebar
+    assert bridge._titlebar_dark is True
+
+
+def test_native_titlebar_required_attribute_failure_is_reported(monkeypatch):
+    bridge = _bare_bridge()
+    bridge._hwnd = 123
+    fake_dwm = Mock()
+
+    def set_attribute(_hwnd, attr, _value, _size):
+        return 1 if attr == 36 else 0
+
+    fake_dwm.DwmSetWindowAttribute.side_effect = set_attribute
+    monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(dwmapi=fake_dwm), raising=False)
+    monkeypatch.setattr(gui_bridge, "ctypes", ctypes, raising=False)
+
+    assert bridge._write_native_titlebar_dwm(complete_light_theme()["native_titlebar"]) is False
+    assert [call.args[1] for call in fake_dwm.DwmSetWindowAttribute.call_args_list] == [20, 35, 36]
+
+
+def test_native_titlebar_rejects_alpha_while_web_tokens_allow_it(tmp_path):
+    repo = ThemeRepository(tmp_path / "themes", tmp_path / "config.json")
+    valid = {
+        key: value for key, value in editable_light_theme().items() if key != "builtin"
+    }
+    valid["tokens"]["accent_soft"] = "#11223344"
+    assert repo.save_theme(valid)["tokens"]["accent_soft"] == "#11223344"
+
+    invalid = copy.deepcopy(valid)
+    invalid["native_titlebar"]["background"] = "#11223344"
+    with pytest.raises(ThemeError) as exc:
+        repo.save_theme(invalid)
+    assert exc.value.code == "invalid_color"
+    assert exc.value.path == "native_titlebar.background"
+
+
+@pytest.mark.parametrize("bridge_method,repo_method,args", [
+    ("list_gui_themes", "list_themes", ()),
+    ("get_gui_theme", "get_theme", ("rose",)),
+    ("save_gui_theme", "save_theme", (editable_light_theme(),)),
+    ("copy_gui_theme", "copy_theme", ("builtin.light", "rose", "Rose")),
+    ("rename_gui_theme", "rename_theme", ("rose", "rose-new", "Rose New")),
+    ("delete_gui_theme", "delete_theme", ("rose",)),
+    ("remove_gui_theme_image", "remove_image", ("rose", "workspace")),
+    ("read_gui_theme_asset", "read_asset", ("rose", "assets/a.png")),
+])
+def test_gui_theme_bridge_unexpected_errors_are_structured(
+    monkeypatch, bridge_method, repo_method, args,
+):
+    monkeypatch.setattr(
+        gui_bridge,
+        "get_gui_theme_repository",
+        lambda: ExplodingRepo(repo_method, RuntimeError("boom")),
+    )
+
+    result = getattr(_bare_bridge(), bridge_method)(*args)
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "theme_operation_failed"
+    assert result["error"]["message"]
+
+
+def test_active_theme_rename_updates_authoritative_id(tmp_path):
+    config_file = tmp_path / "config.json"
+    config_file.write_text("{}", encoding="utf-8")
+    repo = ThemeRepository(tmp_path / "themes", config_file)
+    repo.copy_theme("builtin.light", "rose", "Rose")
+    repo.set_active("rose")
+
+    repo.rename_theme("rose", "rose-new", "Rose New")
+
+    assert json.loads(config_file.read_text(encoding="utf-8"))["gui_theme_id"] == "rose-new"
+    assert repo.get_active()["id"] == "rose-new"
+
+
+def test_gui_theme_crud_success_envelopes(tmp_path, monkeypatch):
+    repo = ThemeRepository(tmp_path / "themes", tmp_path / "config.json")
+    monkeypatch.setattr(gui_bridge, "get_gui_theme_repository", lambda: repo)
+    bridge = _bare_bridge()
+
+    copied = bridge.copy_gui_theme("builtin.light", "rose", "Rose")
+    fetched = bridge.get_gui_theme("rose")
+    renamed = bridge.rename_gui_theme("rose", "rose-new", "Rose New")
+    listed = bridge.list_gui_themes()
+    deleted = bridge.delete_gui_theme("rose-new")
+
+    assert copied["ok"] is True and copied["theme"]["id"] == "rose"
+    assert fetched["ok"] is True and fetched["theme"]["builtin"] is False
+    assert renamed["ok"] is True and renamed["theme"]["id"] == "rose-new"
+    assert any(item["id"] == "rose-new" for item in listed["themes"])
+    assert deleted == {"ok": True}
+
+
 def test_set_gui_theme_persists_light(tmp_path, monkeypatch):
     _use_tmp_config(tmp_path, monkeypatch)
     bridge = _bare_bridge()
     res = bridge.set_gui_theme(True)
     assert res["ok"] is True
     assert model_manager.load_config().get("gui_theme_light") is True
+    assert model_manager.load_config().get("gui_theme_id") == "builtin.light"
     # 标题栏同步为浅色（dark=False）
     assert bridge._titlebar_dark is False
 
@@ -136,6 +427,7 @@ def test_set_gui_theme_persists_dark(tmp_path, monkeypatch):
     bridge.set_gui_theme(True)
     bridge.set_gui_theme(False)
     assert model_manager.load_config().get("gui_theme_light") is False
+    assert model_manager.load_config().get("gui_theme_id") == "builtin.dark"
     assert bridge._titlebar_dark is True
 
 
