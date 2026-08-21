@@ -254,6 +254,7 @@ def _validate_asset_reference(value: Any, path: str) -> str:
     asset_path = PurePosixPath(value)
     if (
         asset_path.is_absolute()
+        or asset_path.as_posix() != value
         or len(asset_path.parts) < 2
         or asset_path.parts[0] != "assets"
         or any(part in {"", ".", ".."} for part in asset_path.parts)
@@ -364,8 +365,7 @@ class ThemeRepository:
         if region not in REGION_IDS:
             raise ThemeError("invalid_region", "region", "主题区域不存在")
         source = Path(source)
-        if source.is_symlink():
-            raise ThemeError("asset_escape", "source", "不允许符号链接图片")
+        self._assert_no_symlink_components(source, "source")
         try:
             data = source.read_bytes()
         except OSError as error:
@@ -373,10 +373,30 @@ class ThemeRepository:
         extension, _ = _inspect_image(data, "source")
         relative_path = f"assets/{hashlib.sha256(data).hexdigest()[:16]}.{extension}"
         target = self._asset_file(theme_id, relative_path)
+        theme_dir = self._theme_directory(theme_id)
+        previous = manifest["regions"][region]["image"]
+        referenced_elsewhere = {
+            item["image"] for region_id, item in manifest["regions"].items()
+            if region_id != region and item["image"]
+        }
+        old_size = 0
+        if previous and previous != relative_path and previous not in referenced_elsewhere:
+            old_asset = self._asset_file(theme_id, previous)
+            try:
+                old_size = old_asset.stat().st_size
+            except FileNotFoundError:
+                pass
+        try:
+            new_size = 0 if target.exists() else len(data)
+        except OSError as error:
+            raise ThemeError("asset_escape", relative_path, "图片资源路径无法访问") from error
+        if self._theme_directory_size(theme_dir) - old_size + new_size > _MAX_ZIP_EXPANDED_BYTES:
+            raise ThemeError("theme_too_large", "assets", "主题目录不能超过 30 MiB")
         target.parent.mkdir(parents=True, exist_ok=True)
         self._write_bytes(target, data)
         manifest["regions"][region]["image"] = relative_path
-        self._write_manifest(self._theme_directory(theme_id) / "theme.json", manifest)
+        self._write_manifest(theme_dir / "theme.json", manifest)
+        self._remove_asset_if_unreferenced(theme_id, manifest, previous)
         return relative_path
 
     def remove_image(self, theme_id: str, region: str) -> dict[str, Any]:
@@ -384,19 +404,9 @@ class ThemeRepository:
         if region not in REGION_IDS:
             raise ThemeError("invalid_region", "region", "主题区域不存在")
         previous = manifest["regions"][region]["image"]
-        asset = self._asset_file(theme_id, previous) if previous else None
-        if asset and asset.is_symlink():
-            raise ThemeError("asset_escape", previous, "不允许符号链接资源")
         manifest["regions"][region]["image"] = None
         self._write_manifest(self._theme_directory(theme_id) / "theme.json", manifest)
-        if previous and previous not in {
-            item["image"] for item in manifest["regions"].values() if item["image"]
-        }:
-            assert asset is not None
-            try:
-                asset.unlink()
-            except FileNotFoundError:
-                pass
+        self._remove_asset_if_unreferenced(theme_id, manifest, previous)
         return _merge_theme(BUILTIN_THEMES[manifest["extends"]], manifest)
 
     def read_asset(self, theme_id: str, asset_path: str) -> tuple[str, bytes]:
@@ -408,8 +418,6 @@ class ThemeRepository:
         if asset_path not in referenced_assets:
             raise ThemeError("asset_not_found", "asset_path", "图片资源未被主题引用")
         asset = self._asset_file(theme_id, asset_path)
-        if asset.is_symlink():
-            raise ThemeError("asset_escape", asset_path, "不允许符号链接资源")
         try:
             data = asset.read_bytes()
         except OSError as error:
@@ -419,8 +427,7 @@ class ThemeRepository:
 
     def import_zip(self, source: Path) -> dict[str, Any]:
         source = Path(source)
-        if source.is_symlink():
-            raise ThemeError("asset_escape", "source", "不允许符号链接归档")
+        self._assert_no_symlink_components(source, "source")
         try:
             archive = ZipFile(source)
         except (BadZipFile, OSError) as error:
@@ -435,6 +442,7 @@ class ThemeRepository:
                 manifest = _validate_manifest(json.loads(archive.read(theme_info)))
             except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
                 raise ThemeError("invalid_manifest", "theme.json", "主题清单无法读取") from error
+            self._validate_zip_theme_entries(infos, manifest)
             theme_id = manifest["id"]
             self._require_free_destination(theme_id)
             self.root.mkdir(parents=True, exist_ok=True)
@@ -464,8 +472,6 @@ class ThemeRepository:
         try:
             with ZipFile(temporary, "w", compression=ZIP_DEFLATED) as archive:
                 archive.writestr("theme.json", json.dumps(manifest, ensure_ascii=False, indent=2))
-                if referenced_assets:
-                    archive.writestr("assets/", b"")
                 for asset_path in referenced_assets:
                     _, data = self.read_asset(theme_id, asset_path)
                     archive.writestr(asset_path, data)
@@ -535,14 +541,14 @@ class ThemeRepository:
         if not isinstance(theme_id, str) or not THEME_ID_RE.fullmatch(theme_id):
             raise ThemeError("invalid_id", "id", "主题 ID 无效")
         theme_dir = self.root / theme_id
-        if theme_dir.is_symlink():
-            raise ThemeError("asset_escape", "id", "不允许符号链接主题目录")
+        self._assert_no_symlink_components(theme_dir, "id")
         return theme_dir
 
     def _asset_file(self, theme_id: str, asset_path: str) -> Path:
         asset_path = _validate_asset_reference(asset_path, "asset_path")
         theme_dir = self._theme_directory(theme_id)
         candidate = theme_dir.joinpath(*PurePosixPath(asset_path).parts)
+        self._assert_no_symlink_components(candidate, asset_path)
         try:
             candidate.resolve().relative_to(theme_dir.resolve())
         except ValueError as error:
@@ -556,13 +562,50 @@ class ThemeRepository:
                 continue
             asset_path = _validate_asset_reference(asset_path, "regions.image")
             asset = theme_dir.joinpath(*PurePosixPath(asset_path).parts)
-            if asset.is_symlink():
-                raise ThemeError("asset_escape", asset_path, "不允许符号链接资源")
+            self._assert_no_symlink_components(asset, asset_path)
             try:
                 data = asset.read_bytes()
             except OSError as error:
                 raise ThemeError("asset_not_found", asset_path, "图片资源不存在") from error
             _inspect_image(data, asset_path)
+
+    def _remove_asset_if_unreferenced(
+        self, theme_id: str, manifest: Mapping[str, Any], asset_path: str | None,
+    ) -> None:
+        if not asset_path or asset_path in {
+            item["image"] for item in manifest["regions"].values() if item["image"]
+        }:
+            return
+        asset = self._asset_file(theme_id, asset_path)
+        try:
+            asset.unlink()
+        except FileNotFoundError:
+            pass
+
+    @staticmethod
+    def _assert_no_symlink_components(path: Path, error_path: str) -> None:
+        current = Path(path)
+        while True:
+            is_junction = getattr(current, "is_junction", lambda: False)
+            if current.is_symlink() or is_junction():
+                raise ThemeError("asset_escape", error_path, "路径不能包含符号链接")
+            if current.parent == current:
+                return
+            current = current.parent
+
+    def _theme_directory_size(self, theme_dir: Path) -> int:
+        self._assert_no_symlink_components(theme_dir, "assets")
+        total_size = 0
+        for directory, subdirectories, files in os.walk(theme_dir, followlinks=False):
+            directory_path = Path(directory)
+            self._assert_no_symlink_components(directory_path, "assets")
+            for name in subdirectories:
+                self._assert_no_symlink_components(directory_path / name, "assets")
+            for name in files:
+                file_path = directory_path / name
+                self._assert_no_symlink_components(file_path, "assets")
+                total_size += file_path.stat().st_size
+        return total_size
 
     @staticmethod
     def _validate_zip_infos(infos: list[Any]) -> None:
@@ -582,25 +625,38 @@ class ThemeRepository:
                 raise ThemeError("asset_escape", name or "archive", "归档路径不安全")
             names.add(name)
             path = PurePosixPath(name)
-            if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+            if (
+                path.is_absolute()
+                or path.as_posix() != name
+                or any(part in {"", ".", ".."} for part in path.parts)
+            ):
                 raise ThemeError("asset_escape", name, "归档路径不安全")
             if info.flag_bits & 0x1:
                 raise ThemeError("invalid_archive", name, "不支持加密主题归档")
             if name != "theme.json" and not name.startswith("assets/"):
                 raise ThemeError("invalid_archive", name, "归档包含不支持的文件")
-            if info.is_dir() and name != "assets/":
-                raise ThemeError("invalid_archive", name, "归档包含不支持的目录")
-            if not info.is_dir():
-                expanded_size += info.file_size
-                if expanded_size > _MAX_ZIP_EXPANDED_BYTES:
-                    raise ThemeError("theme_too_large", name, "归档解压后不能超过 30 MiB")
-                if info.file_size and (
-                    not info.compress_size
-                    or info.file_size / info.compress_size > _MAX_ZIP_COMPRESSION_RATIO
-                ):
-                    raise ThemeError("theme_too_large", name, "归档压缩比过高")
-                if name.startswith("assets/") and info.file_size > _MAX_IMAGE_BYTES:
-                    raise ThemeError("image_too_large", name, "图片文件不能超过 10 MiB")
+            if info.is_dir():
+                raise ThemeError("invalid_archive", name, "归档不能包含目录条目")
+            expanded_size += info.file_size
+            if expanded_size > _MAX_ZIP_EXPANDED_BYTES:
+                raise ThemeError("theme_too_large", name, "归档解压后不能超过 30 MiB")
+            if info.file_size and (
+                not info.compress_size
+                or info.file_size / info.compress_size > _MAX_ZIP_COMPRESSION_RATIO
+            ):
+                raise ThemeError("theme_too_large", name, "归档压缩比过高")
+            if name.startswith("assets/") and info.file_size > _MAX_IMAGE_BYTES:
+                raise ThemeError("image_too_large", name, "图片文件不能超过 10 MiB")
+
+    @staticmethod
+    def _validate_zip_theme_entries(infos: list[Any], manifest: Mapping[str, Any]) -> None:
+        referenced_assets = {
+            region["image"] for region in manifest["regions"].values() if region["image"]
+        }
+        expected_entries = {"theme.json", *referenced_assets}
+        actual_entries = {info.filename for info in infos}
+        if actual_entries != expected_entries:
+            raise ThemeError("invalid_archive", "archive", "归档必须只包含清单引用的图片资源")
 
     @staticmethod
     def _extract_zip_member(archive: ZipFile, info: Any, target: Path, extracted: int) -> int:
