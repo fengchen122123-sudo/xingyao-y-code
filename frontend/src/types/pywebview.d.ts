@@ -367,6 +367,11 @@ export interface PyWebViewAPI {
   get_dir_children(path: string): Promise<any>;
   get_file_tree(workdir: string): Promise<any>;
   set_titlebar_theme(dark: boolean): Promise<any>;
+  // 自绘标题栏窗口控制（frameless 模式）
+  window_minimize(): Promise<{ ok: boolean; error?: string }>;
+  window_toggle_maximize(): Promise<{ ok: boolean; maximized?: boolean; error?: string }>;
+  window_close(): Promise<{ ok: boolean; error?: string }>;
+  window_is_maximized(): Promise<{ ok: boolean; maximized?: boolean }>;
   set_gui_theme(theme_light: boolean): Promise<GuiThemeResult<{
     theme: GuiTheme;
     native_titlebar_color_capability: NativeTitlebarColorCapability;
