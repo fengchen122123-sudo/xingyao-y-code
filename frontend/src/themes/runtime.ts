@@ -100,6 +100,7 @@ function setRegionVariables(
   regionId: ThemeRegionId,
   region: GuiTheme['regions'][ThemeRegionId],
   imageValue: string,
+  suppressBackground = false,
 ): void {
   const prefix = REGION_VARIABLE_PREFIXES[regionId];
   values.set(`${prefix}-bg`, region.background);
@@ -108,8 +109,13 @@ function setRegionVariables(
   values.set(`${prefix}-accent`, region.accent);
   values.set(`${prefix}-bg-opacity`, String(region.background_opacity));
   // 预乘成百分比整数：CSS 的 color-mix 在某些 WebView2 版本里不支持嵌 calc()，
-  // 直接给出 "75%" 形式的变量，CSS 侧无需 calc，避免整条声明失效回退实色
-  values.set(`${prefix}-bg-opacity-pct`, `${Math.round(region.background_opacity * 100)}%`);
+  // 直接给出 "75%" 形式的变量，CSS 侧无需 calc，避免整条声明失效回退实色。
+  // 全局背景图模式下分区背景强制透明（suppressBackground）：
+  // 全局大于一切——不透明的分区背景会把垫在最底层的全局图整个盖住。
+  values.set(
+    `${prefix}-bg-opacity-pct`,
+    suppressBackground ? '0%' : `${Math.round(region.background_opacity * 100)}%`,
+  );
   // 图片遮罩透明度（1 - image_opacity）：滚动容器分区用元素自身 background 时，
   // 无法用独立伪元素控制图片 opacity，改用一层背景色遮罩罩淡图片
   values.set(`${prefix}-image-mask-pct`, `${Math.round((1 - region.image_opacity) * 100)}%`);
@@ -151,12 +157,12 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
     setAppImageVariables(values, appImage, appImageValue);
     for (const regionId of Object.keys(REGION_VARIABLE_PREFIXES) as ThemeRegionId[]) {
       const region = theme.regions[regionId];
-      // 全局图优先：设置全局背景图后，分区自己的背景图全部失效，窗口统一显示全局图。
-      // 分区图资源不再解码，直接写 none，由全局图（body::before）透出。
+      // 全局图优先：设置全局背景图后，分区自己的背景图与背景色全部失效
+      // （背景透明让全局图透出），窗口统一显示全局图；移除全局图后恢复分区设置。
       const imageValue = (!hasAppImage && region.image !== null)
         ? await loadAsset(region.image)
         : 'none';
-      setRegionVariables(values, regionId, region, imageValue);
+      setRegionVariables(values, regionId, region, imageValue, hasAppImage);
     }
   } catch (error) {
     for (const objectUrl of assetUrls.values()) URL.revokeObjectURL(objectUrl);
