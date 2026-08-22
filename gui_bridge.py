@@ -516,6 +516,64 @@ class ApiBridge:
         ctypes.windll.user32.SendMessageW(hwnd, 0x0112, sc_code, 0)
         return True
 
+    def window_begin_drag(self) -> Dict[str, Any]:
+        """标题栏拖拽：进入系统原生移动循环（SC_MOVE + HTCAPTION）。
+
+        JS 逐帧调 move() 的程序化移动不触发 Aero Snap；SC_MOVE 是系统菜单
+        "移动"同路径，进入 DefWindowProc 的模态移动循环，拖到屏幕边缘的
+        Snap / 动画全部原生。调用会阻塞到用户松开鼠标（移动循环结束）。
+        必须在 GUI 线程执行（Invoke），否则移动循环消息泵不工作。
+        """
+        try:
+            hwnd = getattr(self, "_hwnd", 0)
+            form = getattr(self, "_browser_form", None)
+            if not hwnd or form is None or sys.platform != "win32":
+                return {"ok": False, "error": "窗口未就绪"}
+            import ctypes
+
+            done = {"ok": False}
+
+            def _drag():
+                try:
+                    import ctypes as _ct
+                    from ctypes import wintypes as _wt
+
+                    u = _ct.windll.user32
+                    u.ReleaseCapture()
+                    # SC_MOVE(0xF010)+HTCAPTION(2)：鼠标驱动的原生移动循环（窗口
+                    # 跟随、松手结束）。该循环不触发 Aero Snap（caption 专有），
+                    # 松手后按光标贴边情况补发 Win+方向键触发系统 Snap。
+                    u.SendMessageW(hwnd, 0x0112, 0xF012, 0)
+                    # 移动循环已结束（用户松手）：光标贴边 → 模拟系统 Snap 快捷键
+                    sw = u.GetSystemMetrics(0)
+                    point = _wt.POINT()
+                    u.GetCursorPos(_ct.byref(point))
+                    vk = None
+                    if point.x <= 2:
+                        vk = 0x25  # VK_LEFT → 左半屏
+                    elif point.x >= sw - 2:
+                        vk = 0x27  # VK_RIGHT → 右半屏
+                    elif point.y <= 2:
+                        vk = 0x26  # VK_UP → 最大化
+                    if vk:
+                        KEYUP = 0x0002
+                        u.keybd_event(0x5B, 0, 0, 0)      # LWIN 按下
+                        u.keybd_event(vk, 0, 0, 0)
+                        u.keybd_event(vk, 0, KEYUP, 0)
+                        u.keybd_event(0x5B, 0, KEYUP, 0)  # LWIN 抬起
+                    done["ok"] = True
+                except Exception as error:  # noqa: BLE001
+                    done["ok"] = False
+                    done["error"] = str(error)
+
+            from System.Windows import Forms as WinForms
+
+            form.Invoke(WinForms.MethodInvoker(_drag))
+            return {"ok": done["ok"], "error": done.get("error")}
+        except Exception as error:  # noqa: BLE001
+            logger.warning("标题栏拖拽启动失败: %s", error)
+            return {"ok": False, "error": str(error)}
+
     def _is_window_zoomed(self) -> bool:
         hwnd = getattr(self, "_hwnd", 0)
         if not hwnd or sys.platform != "win32":
@@ -761,6 +819,7 @@ class ApiBridge:
             for _ in range(60):
                 form = wf.BrowserView.instances.get(uid)
                 if form is not None and form.Handle is not None and form.Handle.ToInt32() != 0:
+                    self._browser_form = form  # window_begin_drag 的 GUI 线程 Invoke 用
                     enable_native_window_behaviors(form)
                     return
                 _time.sleep(0.2)

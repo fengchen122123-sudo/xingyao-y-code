@@ -8,11 +8,12 @@
       <div><span class="name">Y-CODE</span></div>
     </div>
 
-    <!-- 标题栏拖拽区：pywebview JS 拖拽（WebView2 深层窗口属跨进程层，
-         HTCAPTION 不可达，JS 拖拽为主）；矩形仍上报后端供宿主边缘层判定 -->
+    <!-- 标题栏拖拽区：mousedown 进系统原生移动循环（SC_MOVE+HTCAPTION），
+         Aero Snap / 动画全部原生；双击最大化 -->
     <div
       ref="dragRegionRef"
-      class="titlebar-drag pywebview-drag-region"
+      class="titlebar-drag"
+      @mousedown.left="beginDrag"
       @dblclick="toggleMaximize"
     ></div>
 
@@ -66,6 +67,10 @@ const api = () => (window as any).pywebview?.api;
 async function toggleMaximize() {
   const result = await api()?.window_toggle_maximize?.();
   if (result?.ok) maximized.value = !!result.maximized;
+}
+async function beginDrag() {
+  // 系统原生移动循环：Snap / 动画原生。桥调用会阻塞到拖拽结束，不 await 结果
+  void api()?.window_begin_drag?.();
 }
 async function winMinimize() {
   await api()?.window_minimize?.();
