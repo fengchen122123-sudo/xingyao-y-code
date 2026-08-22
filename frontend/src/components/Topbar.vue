@@ -1,5 +1,5 @@
 <template>
-  <div id="topbar">
+  <div id="topbar" data-theme-region="app_header">
     <button class="icon-btn" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">
       <AppIcon name="menu" :size="17" />
     </button>
@@ -66,7 +66,6 @@ function handleUpdateClick() {
 <style scoped>
 #topbar {
   height: 48px;
-  background: var(--bg1);
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;

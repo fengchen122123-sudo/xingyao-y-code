@@ -31,7 +31,7 @@
 
       <!-- 中间主对话与聊天区域 -->
       <div id="center">
-        <div id="chat-header">
+        <div id="chat-header" data-theme-region="conversation_toolbar">
           <span class="crumb">会话 / <b>{{ store.currentSessionDisplayName }}</b></span>
           <span class="top-spacer"></span>
 
@@ -47,7 +47,7 @@
         </div>
 
         <!-- 对话主体滚动区 -->
-        <div ref="chatScrollRef" id="chat-scroll">
+        <div ref="chatScrollRef" id="chat-scroll" data-theme-region="workspace">
           <div id="chat-body">
             <!-- Kimi 空状态卡片 -->
             <KimiEmptyState v-if="!store.messages || store.messages.length === 0" />
@@ -97,7 +97,7 @@
     </div>
 
     <!-- 状态栏 -->
-    <div id="statusbar">
+    <div id="statusbar" data-theme-region="statusbar">
       <span class="si">
         <span class="s-dot" :class="{ off: !store.connected }"></span>
         <span>{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
@@ -640,7 +640,6 @@ onUnmounted(() => {
   align-items: center;
   padding: 0 16px;
   gap: 10px;
-  background: var(--bg1);
   flex-shrink: 0;
 }
 #chat-header .crumb {
@@ -708,14 +707,12 @@ onUnmounted(() => {
 
 #statusbar {
   height: 24px;
-  background: var(--bg1);
   border-top: 1px solid var(--border);
   display: flex;
   align-items: center;
   padding: 0 12px;
   gap: 16px;
   font-size: 11px;
-  color: var(--text-faint);
   flex-shrink: 0;
 }
 #statusbar .si {

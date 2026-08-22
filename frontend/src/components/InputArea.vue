@@ -1,5 +1,5 @@
 <template>
-  <div id="input-area">
+  <div id="input-area" data-theme-region="composer">
     <!-- 排队消息条：回合运行期间发送的消息在此排队，不打断当前任务；
          删除按钮取消排队，闪电按钮停止当前任务并优先发送该消息 -->
     <div v-if="queueItems.length" id="queue-strip">
@@ -251,7 +251,6 @@ function handleSend() {
 <style scoped>
 #input-area {
   border-top: 1px solid var(--border);
-  background: var(--bg1);
   /* 两侧只留 10px 呼吸位，输入框拉伸占满中间栏，不再留 28px 大白边 */
   padding: 12px 10px 10px;
   flex-shrink: 0;
