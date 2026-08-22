@@ -322,12 +322,21 @@ async function selectTheme(summary: GuiThemeSummary) {
 async function saveTheme() {
   if (busy.value || !draft.value || !fieldsValid.value) return;
   busy.value = true;
+  const snapshot = clone(draft.value);
   try {
     // 显式传最终草稿：预览排队未消化时也不丢快速输入的最后值。
-    const result = await store.saveGuiThemeDraft(clone(draft.value));
+    const result = await store.saveGuiThemeDraft(clone(snapshot));
     if (result.ok) {
       actionError.value = '';
-      draft.value = clone(result.theme);
+      // 保存飞行中用户又编辑时保留草稿增量（基于已保存快照，可再保存）；
+      // 只有飞行中无新编辑才整体采纳服务器返回的规范化主题。
+      if (!draft.value) return;
+      if (JSON.stringify(draft.value) === JSON.stringify(snapshot)) {
+        draft.value = clone(result.theme);
+      } else {
+        draft.value.id = result.theme.id;
+        draft.value.name = result.theme.name;
+      }
     } else {
       actionError.value = result.error.message;
     }
@@ -509,7 +518,8 @@ async function removeImage() {
   try {
     const result = await store.removeGuiThemeImage(draft.value.id, regionId);
     if (result.ok) {
-      draft.value.regions[regionId] = clone(result.theme.regions[regionId]);
+      // 只清图片引用，保留该分区其他未保存编辑；完整草稿随保存写回。
+      draft.value.regions[regionId].image = null;
       actionError.value = '';
       schedulePreview();
     } else {
