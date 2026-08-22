@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
+import { nextTick } from 'vue';
 import { createPinia, setActivePinia } from 'pinia';
 
 import GuiThemeSettings from './GuiThemeSettings.vue';
@@ -77,6 +78,7 @@ let saveGuiThemeDraft: ReturnType<typeof vi.fn>;
 let cancelGuiThemePreview: ReturnType<typeof vi.fn>;
 let activateGuiTheme: ReturnType<typeof vi.fn>;
 let askConfirm: ReturnType<typeof vi.fn>;
+let deleteGuiTheme: ReturnType<typeof vi.fn>;
 let api: Record<string, ReturnType<typeof vi.fn>>;
 
 function summary(theme: GuiTheme): GuiThemeSummary {
@@ -107,6 +109,7 @@ function mountThemeSettings(options: { active: GuiTheme; dirty?: boolean }) {
   cancelGuiThemePreview = vi.spyOn(store, 'cancelGuiThemePreview').mockResolvedValue({ ok: true, theme: active });
   activateGuiTheme = vi.spyOn(store, 'activateGuiTheme').mockResolvedValue({ ok: true, theme: active });
   askConfirm = vi.spyOn(store, 'askConfirm').mockResolvedValue(false);
+  deleteGuiTheme = vi.spyOn(store, 'deleteGuiTheme').mockResolvedValue({ ok: true });
 
   return mount(GuiThemeSettings, { global: { plugins: [pinia] } });
 }
@@ -135,6 +138,30 @@ describe('GuiThemeSettings', () => {
     expect(wrapper.get('[data-test="copy-theme"]').text()).toContain('复制为自定义主题');
     expect(wrapper.find('[data-test="rename-theme"]').exists()).toBe(false);
     expect(wrapper.find('[data-test="save-theme"]').exists()).toBe(false);
+  });
+
+  it('disables the editor delete button for the active theme (backend refuses)', () => {
+    const wrapper = mountThemeSettings({ active: userTheme() });
+    // 活动主题（正在使用）不能删除：按钮禁用并给出提示
+    const btn = wrapper.get('[data-test="delete-theme"]');
+    expect(btn.attributes('disabled')).toBeDefined();
+    expect(btn.attributes('title')).toContain('先在左侧切换');
+  });
+
+  it('deletes an inactive user theme from the list entry', async () => {
+    const other = makeTheme('spare-theme', false);
+    const wrapper = mountThemeSettings({ active: userTheme() });
+    // 列表里追加一个非活动用户主题
+    const store = useAppStore();
+    store.guiThemes = [...store.guiThemes, summary(other)];
+    await nextTick();
+
+    askConfirm.mockResolvedValueOnce(true);
+    await wrapper.get('[data-test="delete-theme-spare-theme"]').trigger('click');
+
+    expect(deleteGuiTheme).toHaveBeenCalledWith('spare-theme');
+    // 列表里活动主题自己没有删除入口
+    expect(wrapper.find('[data-test="delete-theme-rose"]').exists()).toBe(false);
   });
 
   it('keeps color picker and hex input synchronized and previews immediately', async () => {

@@ -5,20 +5,33 @@
       <div v-if="store.guiThemeListError" data-test="theme-list-error" class="theme-list-error">
         主题列表读取失败：{{ store.guiThemeListError.message }}
       </div>
-      <button
+      <div
         v-for="theme in store.guiThemes"
         :key="theme.id"
-        :data-test="`theme-${theme.id.replaceAll('.', '-')}`"
-        class="theme-item"
-        :class="{ active: theme.id === activeThemeId, builtin: theme.builtin }"
-        :disabled="busy"
-        :title="theme.builtin ? '内置主题：只能启用或复制' : theme.id"
-        @click="selectTheme(theme)"
+        class="theme-item-row"
       >
-        <span class="theme-item-name">{{ theme.name }}</span>
-        <span v-if="theme.id === activeThemeId" class="theme-item-tag">使用中</span>
-        <span v-else-if="theme.builtin" class="theme-item-tag">内置</span>
-      </button>
+        <button
+          :data-test="`theme-${theme.id.replaceAll('.', '-')}`"
+          class="theme-item"
+          :class="{ active: theme.id === activeThemeId, builtin: theme.builtin }"
+          :disabled="busy"
+          :title="theme.builtin ? '内置主题：只能启用或复制' : theme.id"
+          @click="selectTheme(theme)"
+        >
+          <span class="theme-item-name">{{ theme.name }}</span>
+          <span v-if="theme.id === activeThemeId" class="theme-item-tag">使用中</span>
+          <span v-else-if="theme.builtin" class="theme-item-tag">内置</span>
+        </button>
+        <!-- 非活动的用户主题可从列表直接删除；活动主题必须先切换（后端拒绝删除活动主题） -->
+        <button
+          v-if="!theme.builtin && theme.id !== activeThemeId"
+          :data-test="`delete-theme-${theme.id.replaceAll('.', '-')}`"
+          class="theme-item-delete"
+          :disabled="busy"
+          title="删除此主题"
+          @click.stop="deleteThemeFromList(theme)"
+        >×</button>
+      </div>
       <button
         data-test="import-theme"
         class="theme-import"
@@ -57,7 +70,14 @@
           <template v-else>
             <button data-test="rename-theme" type="button" :disabled="busy" @click="openRenameDialog">重命名</button>
             <button data-test="export-theme" type="button" :disabled="busy" @click="exportTheme">导出 ZIP</button>
-            <button data-test="delete-theme" type="button" :disabled="busy" class="danger" @click="deleteActiveTheme">删除</button>
+            <button
+              data-test="delete-theme"
+              type="button"
+              :disabled="busy || !canDeleteDraft"
+              :title="canDeleteDraft ? '删除此主题' : '使用中的主题不能删除，请先在左侧切换到其他主题'"
+              class="danger"
+              @click="deleteActiveTheme"
+            >删除</button>
             <button data-test="save-theme" class="primary-button" type="button" :disabled="busy || !fieldsValid" @click="saveTheme">保存</button>
             <button data-test="cancel-theme" type="button" :disabled="busy" @click="cancelEdits">取消</button>
           </template>
@@ -466,8 +486,13 @@ async function confirmRename() {
 }
 
 // ── 删除 / 导入 / 导出 ──
+// 编辑器删除按钮仅对非活动用户主题可用（后端拒绝删除活动主题）
+const canDeleteDraft = computed(() =>
+  !!draft.value && !draft.value.builtin && draft.value.id !== activeThemeId.value,
+);
+
 async function deleteActiveTheme() {
-  if (!draft.value || busy.value) return;
+  if (!draft.value || busy.value || !canDeleteDraft.value) return;
   const confirmed = await store.askConfirm(
     '删除主题', '', `确定要删除主题「${draft.value.name}」吗？此操作不可恢复。`,
   );
@@ -477,6 +502,21 @@ async function deleteActiveTheme() {
     const result = await store.deleteGuiTheme(draft.value.id);
     if (result.ok) actionError.value = '';
     else actionError.value = result.error.message;
+  } finally {
+    busy.value = false;
+  }
+}
+
+async function deleteThemeFromList(summary: GuiThemeSummary) {
+  if (busy.value || summary.builtin || summary.id === activeThemeId.value) return;
+  const confirmed = await store.askConfirm(
+    '删除主题', '', `确定要删除主题「${summary.name}」吗？此操作不可恢复。`,
+  );
+  if (!confirmed) return;
+  busy.value = true;
+  try {
+    const result = await store.deleteGuiTheme(summary.id);
+    if (!result.ok) actionError.value = result.error.message;
   } finally {
     busy.value = false;
   }
@@ -609,7 +649,11 @@ async function clearGlobalInherit() {
 .theme-list { border: 1px solid var(--border); border-radius: 14px; background: var(--bg1); padding: 14px; display: flex; flex-direction: column; gap: 6px; }
 .list-title { font-size: 12px; font-weight: 600; color: var(--text-faint); padding: 2px 6px 8px; }
 .theme-list-error { padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--red); font-size: 11.5px; line-height: 1.5; margin-bottom: 6px; }
-.theme-item { width: 100%; display: flex; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; font-size: 13px; }
+.theme-item-row { display: flex; align-items: center; gap: 4px; }
+.theme-item { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; font-size: 13px; }
+.theme-item-delete { width: 26px; height: 26px; flex-shrink: 0; border: 0; border-radius: 7px; background: transparent; color: var(--text-faint); font-size: 15px; line-height: 1; display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s, background 0.12s; }
+.theme-item-row:hover .theme-item-delete { opacity: 1; }
+.theme-item-delete:hover { color: var(--red); background: color-mix(in srgb, var(--red) 12%, transparent); }
 .theme-item:hover { background: var(--bg2); color: var(--text); }
 .theme-item.active { background: var(--bg3); color: var(--text); border-color: var(--border); }
 .theme-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
