@@ -669,6 +669,8 @@ export const useAppStore = defineStore('app', {
     _restoreGuiThemeDomSnapshot(rootStyle: string | null, light: boolean) {
       if (rootStyle === null) document.documentElement.removeAttribute('style');
       else document.documentElement.setAttribute('style', rootStyle);
+      // light 类在 html 与 body 上成对维护（见 runtime.applyGuiTheme）
+      document.documentElement.classList.toggle('light', light);
       document.body.classList.toggle('light', light);
     },
 

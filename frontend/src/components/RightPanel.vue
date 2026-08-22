@@ -1,5 +1,5 @@
 <template>
-  <div id="rightbar" :class="{ collapsed: store.rightPanelCollapsed }">
+  <div id="rightbar" data-theme-region="right_panel" :class="{ collapsed: store.rightPanelCollapsed }">
     <div id="right-tabs">
       <button
         v-for="tab in tabs"
@@ -140,26 +140,29 @@
       </div>
     </div>
 
-    <!-- 文件预览弹窗 -->
-    <div class="modal-mask" :class="{ show: store.filePreview.show }" @click.self="store.closeFilePreview()">
-      <div class="modal file-preview-modal">
-        <div class="modal-head">
-          <div class="mh-ico"><AppIcon name="file" :size="16" /></div>
-          <div class="fp-title">
-            <h3 class="fp-name">{{ fileBaseName(store.filePreview.path) }}</h3>
-            <p class="fp-path">{{ store.filePreview.path }}</p>
+    <!-- 文件预览弹窗：Teleport 到 body——右栏分区带 isolation 分层，
+         fixed 模态留在分区内会被后绘制的兄弟分区盖住 -->
+    <Teleport to="body">
+      <div class="modal-mask" :class="{ show: store.filePreview.show }" @click.self="store.closeFilePreview()">
+        <div class="modal file-preview-modal">
+          <div class="modal-head">
+            <div class="mh-ico"><AppIcon name="file" :size="16" /></div>
+            <div class="fp-title">
+              <h3 class="fp-name">{{ fileBaseName(store.filePreview.path) }}</h3>
+              <p class="fp-path">{{ store.filePreview.path }}</p>
+            </div>
+            <button class="chip-btn" title="在系统中打开此文件" @click="store.openInSystem(store.filePreview.path)"><AppIcon name="folder" :size="12" /> 在系统中打开</button>
+            <button class="chip-btn" title="关闭预览" @click="store.closeFilePreview()"><AppIcon name="x" :size="12" :stroke-width="2" /> 关闭预览</button>
           </div>
-          <button class="chip-btn" title="在系统中打开此文件" @click="store.openInSystem(store.filePreview.path)"><AppIcon name="folder" :size="12" /> 在系统中打开</button>
-          <button class="chip-btn" title="关闭预览" @click="store.closeFilePreview()"><AppIcon name="x" :size="12" :stroke-width="2" /> 关闭</button>
-        </div>
-        <div class="fp-body">
-          <div v-if="store.filePreview.loading" class="fp-loading">加载中…</div>
-          <div v-else-if="isMarkdownPreview" class="fp-md md-body" v-html="renderedMarkdown"></div>
-          <pre v-else class="fp-pre"><code class="hljs" v-html="highlightedPreview"></code></pre>
-          <div v-if="store.filePreview.truncated" class="fp-truncated"><AppIcon name="triangle-alert" :size="12" /> 文件内容过长，已截断显示</div>
+          <div class="fp-body">
+            <div v-if="store.filePreview.loading" class="fp-loading">加载中…</div>
+            <div v-else-if="isMarkdownPreview" class="fp-md md-body" v-html="renderedMarkdown"></div>
+            <pre v-else class="fp-pre"><code class="hljs" v-html="highlightedPreview"></code></pre>
+            <div v-if="store.filePreview.truncated" class="fp-truncated"><AppIcon name="triangle-alert" :size="12" /> 文件内容过长，已截断显示</div>
+          </div>
         </div>
       </div>
-    </div>
+    </Teleport>
   </div>
 </template>
 
@@ -324,7 +327,6 @@ onUnmounted(() => {
 <style scoped>
 #rightbar {
   width: 330px;
-  background: var(--bg1);
   border-left: 1px solid var(--border);
   display: flex;
   flex-direction: column;

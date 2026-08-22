@@ -142,6 +142,10 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
   }
 
   for (const [name, value] of values) document.documentElement.style.setProperty(name, value);
+  // light 类必须同时落在 html 与 body 上：html 上的 :root.light 提供无主题时的
+  // 浅色语义默认值，运行时写入 documentElement 的 inline 主题变量才能覆盖它；
+  // body 上的 light 继续服务既有 body.light 后代选择器（代码高亮等）。
+  document.documentElement.classList.toggle('light', theme.appearance === 'light');
   document.body.classList.toggle('light', theme.appearance === 'light');
 
   let disposed = false;
@@ -164,6 +168,7 @@ export function applyBootTheme(hash: string, body: HTMLElement): void {
   const appearance = literalFragmentValue(fragment, 'theme');
   if (appearance === 'light' || appearance === 'dark') {
     body.classList.toggle('light', appearance === 'light');
+    body.ownerDocument.documentElement.classList.toggle('light', appearance === 'light');
   }
 
   const background = literalFragmentValue(fragment, 'bg');
