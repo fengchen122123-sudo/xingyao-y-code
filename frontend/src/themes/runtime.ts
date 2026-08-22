@@ -146,11 +146,16 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
     };
     // 全局背景图：垫在所有分区之下（body::before 消费 --theme-app-image-*）
     const appImage = theme.app_image;
-    const appImageValue = appImage.image !== null ? await loadAsset(appImage.image) : 'none';
+    const hasAppImage = appImage.image !== null;
+    const appImageValue = hasAppImage ? await loadAsset(appImage.image!) : 'none';
     setAppImageVariables(values, appImage, appImageValue);
     for (const regionId of Object.keys(REGION_VARIABLE_PREFIXES) as ThemeRegionId[]) {
       const region = theme.regions[regionId];
-      const imageValue = region.image !== null ? await loadAsset(region.image) : 'none';
+      // 全局图优先：设置全局背景图后，分区自己的背景图全部失效，窗口统一显示全局图。
+      // 分区图资源不再解码，直接写 none，由全局图（body::before）透出。
+      const imageValue = (!hasAppImage && region.image !== null)
+        ? await loadAsset(region.image)
+        : 'none';
       setRegionVariables(values, regionId, region, imageValue);
     }
   } catch (error) {
