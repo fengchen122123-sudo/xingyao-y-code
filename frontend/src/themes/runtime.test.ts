@@ -24,6 +24,9 @@ function theme(): GuiTheme {
     native_titlebar: {
       background: '#fff7fb', text: '#2c2529', border: '#e5ccd8', mode: 'light',
     },
+    app_image: {
+      image: null, image_opacity: 1, image_size: 'cover' as const, image_position: 'center' as const,
+    },
     regions: Object.fromEntries(regionIds.map(id => [id, { ...region }])) as GuiTheme['regions'],
   };
 }
@@ -92,6 +95,29 @@ describe('applyGuiTheme', () => {
     applied.dispose();
     expect(revoke).toHaveBeenCalledTimes(1);
     expect(revoke).toHaveBeenCalledWith('blob:workspace');
+  });
+
+  it('applies a global app image beneath all regions and shares the blob cache', async () => {
+    const value = themeWithWorkspaceImage();
+    value.app_image.image = 'assets/workspace.webp';
+    const api = fakeApiWithAsset();
+
+    const applied = await applyGuiTheme(value, api);
+
+    // 全局图与 workspace 分区引用同一资源：只解码一次、共用一个 Blob URL
+    expect(api.get_gui_theme_asset).toHaveBeenCalledTimes(1);
+    expect(URL.createObjectURL).toHaveBeenCalledTimes(1);
+    expect(document.documentElement.style.getPropertyValue('--theme-app-image'))
+      .toBe('url("blob:workspace")');
+    expect(document.documentElement.style.getPropertyValue('--theme-app-image-opacity')).toBe('1');
+    applied.dispose();
+    expect(URL.revokeObjectURL).toHaveBeenCalledWith('blob:workspace');
+  });
+
+  it('writes "none" for the global image when the theme has none', async () => {
+    const applied = await applyGuiTheme(theme(), fakeApi());
+    expect(document.documentElement.style.getPropertyValue('--theme-app-image')).toBe('none');
+    applied.dispose();
   });
 
   it('reuses a blob URL when multiple regions reference the same asset', async () => {

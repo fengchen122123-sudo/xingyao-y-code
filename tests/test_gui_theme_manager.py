@@ -290,6 +290,52 @@ def test_read_asset_rejects_oversize_asset_before_parsing(tmp_path):
     assert exc.value.code == "image_too_large"
 
 
+def test_app_image_round_trip_and_included_in_references(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    source = write_image(tmp_path / "bg.png", "PNG", (32, 24))
+    relative_path = repo.import_image("rose", "app", source)
+    assert relative_path.startswith("assets/")
+    theme = repo.get_theme("rose")
+    assert theme["app_image"]["image"] == relative_path
+    # 全局图计入引用集，可读回且导出时被收进 ZIP
+    mime_type, _ = repo.read_asset("rose", relative_path)
+    assert mime_type == "image/png"
+    destination = tmp_path / "out.zip"
+    repo.export_zip("rose", destination)
+    with ZipFile(destination) as archive:
+        assert relative_path in archive.namelist()
+
+
+def test_app_image_removed_and_unreferenced_asset_deleted(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    relative_path = repo.import_image(
+        "rose", "app", write_image(tmp_path / "bg.png", "PNG", (32, 24)),
+    )
+    updated = repo.remove_image("rose", "app")
+    assert updated["app_image"]["image"] is None
+    assert not (repo.root / "rose" / relative_path).exists()
+
+
+def test_app_image_invalid_scope_rejected(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    with pytest.raises(ThemeError) as exc:
+        repo.import_image("rose", "no_such_scope", tmp_path / "x.png")
+    assert exc.value.code == "invalid_region"
+
+
+def test_old_theme_without_app_image_migrates_default(tmp_path):
+    # 旧清单无 app_image：读取时补默认值，活动主题不因新增字段损坏
+    repo = make_repo(tmp_path)
+    theme = minimal_theme("legacy")
+    theme.pop("app_image", None)  # minimal_theme 本就不含，确保显式缺失
+    theme_dir = repo.root / "legacy"
+    theme_dir.mkdir(parents=True)
+    (theme_dir / "theme.json").write_text(json.dumps(theme), encoding="utf-8")
+    loaded = repo.get_theme("legacy")
+    assert loaded["app_image"]["image"] is None
+    assert loaded["app_image"]["image_size"] == "cover"
+
+
 def test_remove_image_clears_manifest_and_unreferenced_asset(tmp_path):
     repo = make_repo_with_saved_theme(tmp_path, "rose")
     relative_path = repo.import_image(

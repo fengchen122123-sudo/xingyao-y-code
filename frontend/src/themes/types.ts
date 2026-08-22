@@ -28,6 +28,14 @@ export interface NativeTitlebarTheme {
   mode: ThemeAppearance;
 }
 
+// 全局背景图：垫在所有分区之下的最底层（body::before），无文字/边框语义
+export interface AppImageTheme {
+  image: string | null;
+  image_opacity: number;
+  image_size: 'cover' | 'contain' | 'auto';
+  image_position: 'center' | 'top' | 'bottom' | 'left' | 'right';
+}
+
 export interface GuiTheme {
   schema_version: 1;
   id: string;
@@ -37,6 +45,7 @@ export interface GuiTheme {
   builtin: boolean;
   tokens: Record<string, string | number>;
   native_titlebar: NativeTitlebarTheme;
+  app_image: AppImageTheme;
   regions: Record<ThemeRegionId, ThemeRegion>;
 }
 

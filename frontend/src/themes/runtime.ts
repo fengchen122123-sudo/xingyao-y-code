@@ -113,6 +113,13 @@ function setRegionVariables(
   values.set(`${prefix}-image-position`, region.image_position);
 }
 
+function setAppImageVariables(values: Map<string, string>, appImage: GuiTheme['app_image'], imageValue: string): void {
+  values.set('--theme-app-image', imageValue);
+  values.set('--theme-app-image-opacity', String(appImage.image_opacity));
+  values.set('--theme-app-image-size', appImage.image_size);
+  values.set('--theme-app-image-position', appImage.image_position);
+}
+
 export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise<AppliedTheme> {
   const values = new Map<string, string>();
   for (const [name, cssVariable] of Object.entries(SEMANTIC_VARIABLES)) {
@@ -122,18 +129,22 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
 
   const assetUrls = new Map<string, string>();
   try {
+    const loadAsset = async (assetPath: string): Promise<string> => {
+      let objectUrl = assetUrls.get(assetPath);
+      if (objectUrl === undefined) {
+        const result = await api.get_gui_theme_asset(theme.id, assetPath);
+        objectUrl = URL.createObjectURL(decodeAsset(result));
+        assetUrls.set(assetPath, objectUrl);
+      }
+      return `url("${objectUrl}")`;
+    };
+    // 全局背景图：垫在所有分区之下（body::before 消费 --theme-app-image-*）
+    const appImage = theme.app_image;
+    const appImageValue = appImage.image !== null ? await loadAsset(appImage.image) : 'none';
+    setAppImageVariables(values, appImage, appImageValue);
     for (const regionId of Object.keys(REGION_VARIABLE_PREFIXES) as ThemeRegionId[]) {
       const region = theme.regions[regionId];
-      let imageValue = 'none';
-      if (region.image !== null) {
-        let objectUrl = assetUrls.get(region.image);
-        if (objectUrl === undefined) {
-          const result = await api.get_gui_theme_asset(theme.id, region.image);
-          objectUrl = URL.createObjectURL(decodeAsset(result));
-          assetUrls.set(region.image, objectUrl);
-        }
-        imageValue = `url("${objectUrl}")`;
-      }
+      const imageValue = region.image !== null ? await loadAsset(region.image) : 'none';
       setRegionVariables(values, regionId, region, imageValue);
     }
   } catch (error) {
