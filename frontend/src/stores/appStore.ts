@@ -372,6 +372,9 @@ export const useAppStore = defineStore('app', {
     nativeTitlebarColorCapability: 'unknown' as NativeTitlebarColorCapability,
     _appliedGuiTheme: null as AppliedTheme | null,
     settingsOpen: false,
+    // 主题预览模式：设置页"预览效果"收起设置、直接看真实首页（草稿已实时渲染），
+    // 顶部浮条提供返回编辑；保存/取消/切主题时退出该模式
+    themePreviewMode: false,
 
     // 计划、后台任务、Token 用量
     planData: { title: '', items: [], progress: 0 } as PlanData,

@@ -77,7 +77,8 @@ watch(() => store.permRequest.reqId, () => {
 .perm-card {
   max-width: 880px;
   margin: 10px auto;
-  background: var(--bg1);
+  /* 用分区表面色：workspace 调低背景透明度时权限卡透出背景图，默认实色可读 */
+  background: var(--theme-region-surface-panel, var(--bg1));
   border: 1px solid var(--border);
   border-left: 3px solid var(--orange);
   border-radius: 12px;

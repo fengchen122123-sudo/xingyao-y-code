@@ -155,7 +155,8 @@ const thinkingOpen = computed({
   justify-content: flex-end;
 }
 .msg-user .bubble {
-  background: var(--bg2);
+  /* 用分区表面色：workspace 调低背景透明度时气泡透出背景图，默认实色可读 */
+  background: var(--theme-region-surface, var(--bg2));
   border: 1px solid var(--border);
   border-radius: 12px 12px 4px 12px;
   padding: 10px 14px;
