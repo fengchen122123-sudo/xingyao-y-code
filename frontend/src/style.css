@@ -152,14 +152,13 @@ html {
   --theme-region-image-position: var(--theme-statusbar-image-position, center);
 }
 
-/* 分区公共层：isolation 建立独立 stacking context，::before 用负 z-index
-   垫在分区自身背景色之上、全部内容之下，且 pointer-events: none 不拦截
-   点击与滚动。背景色透明度只作用于颜色层，不影响文字与控件。 */
+/* 分区公共层：isolation 建立独立 stacking context。背景色放 ::after（z-2 最底），
+   背景图放 ::before（z-1 中间），内容在最上——元素自身 background 必须保持透明，
+   否则实色背景会盖住负 z-index 的伪元素，导致背景图永不显示（本次修复的 bug）。 */
 [data-theme-region] {
   position: relative;
   isolation: isolate;
   color: var(--theme-region-text);
-  background: color-mix(in srgb, var(--theme-region-bg) calc(var(--theme-region-bg-opacity) * 100%), transparent);
   /* 分区内旧别名改指向分区值：文字、边框、强调色随分区生效 */
   --text: var(--theme-region-text);
   --text-bright: var(--theme-region-text);
@@ -181,12 +180,21 @@ html {
   background: var(--theme-region-surface);
 }
 
-[data-theme-region]::before {
+[data-theme-region]::before,
+[data-theme-region]::after {
   content: '';
   position: absolute;
   inset: 0;
-  z-index: -1;
   pointer-events: none;
+}
+/* 背景色层（最底）：按 bg-opacity 决定透明度，1 时实色不透全局图 */
+[data-theme-region]::after {
+  z-index: -2;
+  background: color-mix(in srgb, var(--theme-region-bg) calc(var(--theme-region-bg-opacity) * 100%), transparent);
+}
+/* 背景图层（在背景色之上、内容之下）：图片透明度独立于背景色 */
+[data-theme-region]::before {
+  z-index: -1;
   background-image: var(--theme-region-image);
   background-size: var(--theme-region-image-size);
   background-position: var(--theme-region-image-position);
