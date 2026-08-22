@@ -80,6 +80,7 @@ html {
   --theme-region-border: var(--theme-app-header-border, var(--theme-border));
   --theme-region-accent: var(--theme-app-header-accent, var(--theme-accent));
   --theme-region-bg-opacity: var(--theme-app-header-bg-opacity, 1);
+  --theme-region-bg-opacity-pct: var(--theme-app-header-bg-opacity-pct, 100%);
   --theme-region-image: var(--theme-app-header-image, none);
   --theme-region-image-opacity: var(--theme-app-header-image-opacity, 1);
   --theme-region-image-size: var(--theme-app-header-image-size, cover);
@@ -91,6 +92,7 @@ html {
   --theme-region-border: var(--theme-sidebar-border, var(--theme-border));
   --theme-region-accent: var(--theme-sidebar-accent, var(--theme-accent));
   --theme-region-bg-opacity: var(--theme-sidebar-bg-opacity, 1);
+  --theme-region-bg-opacity-pct: var(--theme-sidebar-bg-opacity-pct, 100%);
   --theme-region-image: var(--theme-sidebar-image, none);
   --theme-region-image-opacity: var(--theme-sidebar-image-opacity, 1);
   --theme-region-image-size: var(--theme-sidebar-image-size, cover);
@@ -102,6 +104,7 @@ html {
   --theme-region-border: var(--theme-conversation-toolbar-border, var(--theme-border));
   --theme-region-accent: var(--theme-conversation-toolbar-accent, var(--theme-accent));
   --theme-region-bg-opacity: var(--theme-conversation-toolbar-bg-opacity, 1);
+  --theme-region-bg-opacity-pct: var(--theme-conversation-toolbar-bg-opacity-pct, 100%);
   --theme-region-image: var(--theme-conversation-toolbar-image, none);
   --theme-region-image-opacity: var(--theme-conversation-toolbar-image-opacity, 1);
   --theme-region-image-size: var(--theme-conversation-toolbar-image-size, cover);
@@ -113,6 +116,7 @@ html {
   --theme-region-border: var(--theme-workspace-border, var(--theme-border));
   --theme-region-accent: var(--theme-workspace-accent, var(--theme-accent));
   --theme-region-bg-opacity: var(--theme-workspace-bg-opacity, 1);
+  --theme-region-bg-opacity-pct: var(--theme-workspace-bg-opacity-pct, 100%);
   --theme-region-image: var(--theme-workspace-image, none);
   --theme-region-image-opacity: var(--theme-workspace-image-opacity, 1);
   --theme-region-image-size: var(--theme-workspace-image-size, cover);
@@ -124,6 +128,7 @@ html {
   --theme-region-border: var(--theme-composer-border, var(--theme-border));
   --theme-region-accent: var(--theme-composer-accent, var(--theme-accent));
   --theme-region-bg-opacity: var(--theme-composer-bg-opacity, 1);
+  --theme-region-bg-opacity-pct: var(--theme-composer-bg-opacity-pct, 100%);
   --theme-region-image: var(--theme-composer-image, none);
   --theme-region-image-opacity: var(--theme-composer-image-opacity, 1);
   --theme-region-image-size: var(--theme-composer-image-size, cover);
@@ -135,6 +140,7 @@ html {
   --theme-region-border: var(--theme-right-panel-border, var(--theme-border));
   --theme-region-accent: var(--theme-right-panel-accent, var(--theme-accent));
   --theme-region-bg-opacity: var(--theme-right-panel-bg-opacity, 1);
+  --theme-region-bg-opacity-pct: var(--theme-right-panel-bg-opacity-pct, 100%);
   --theme-region-image: var(--theme-right-panel-image, none);
   --theme-region-image-opacity: var(--theme-right-panel-image-opacity, 1);
   --theme-region-image-size: var(--theme-right-panel-image-size, cover);
@@ -146,6 +152,7 @@ html {
   --theme-region-border: var(--theme-statusbar-border, var(--theme-border));
   --theme-region-accent: var(--theme-statusbar-accent, var(--theme-accent));
   --theme-region-bg-opacity: var(--theme-statusbar-bg-opacity, 1);
+  --theme-region-bg-opacity-pct: var(--theme-statusbar-bg-opacity-pct, 100%);
   --theme-region-image: var(--theme-statusbar-image, none);
   --theme-region-image-opacity: var(--theme-statusbar-image-opacity, 1);
   --theme-region-image-size: var(--theme-statusbar-image-size, cover);
@@ -166,18 +173,21 @@ html {
   --accent: var(--theme-region-accent);
   /* 表面色（气泡/卡片/输入框底色）：默认取卡片语义色，opacity=1 时实色不透图，
      调低分区背景透明度时表面随之半透明，让分区背景图透进气泡区域 */
-  --theme-region-surface: color-mix(in srgb, var(--theme-background-card) calc(var(--theme-region-bg-opacity) * 100%), transparent);
-  --theme-region-surface-panel: color-mix(in srgb, var(--theme-background-panel) calc(var(--theme-region-bg-opacity) * 100%), transparent);
+  --theme-region-surface: color-mix(in srgb, var(--theme-background-card) var(--theme-region-bg-opacity-pct), transparent);
+  --theme-region-surface-panel: color-mix(in srgb, var(--theme-background-panel) var(--theme-region-bg-opacity-pct), transparent);
 }
 
 /* 分区前景表面接管：气泡/输入框/权限卡的实色背景改随分区背景透明度。
-   代码块（--code-bg）、按钮等小元素保持实色以保证可读；主遮挡面才透图。 */
-[data-theme-region="workspace"] .msg-user .bubble,
-[data-theme-region="workspace"] .perm-card {
-  background: var(--theme-region-surface-panel);
+   代码块（--code-bg）、按钮等小元素保持实色以保证可读；主遮挡面才透图。
+   特异性说明：目标是 scoped 组件样式（.bubble[data-v-hash] = 0,3,0，且组件
+   CSS 在 style.css 之后加载）。此处用 [data-theme-region] + 类 + [class] 叠加到
+   (0,4,0)，确保覆盖 scoped 的 var(--bg2)/var(--bg1)。 */
+[data-theme-region="workspace"] .msg-user .bubble[class],
+[data-theme-region="workspace"] .perm-card[class] {
+  background: var(--theme-region-surface-panel) !important;
 }
-[data-theme-region="composer"] #input-box {
-  background: var(--theme-region-surface);
+[data-theme-region="composer"] #input-box[id] {
+  background: var(--theme-region-surface) !important;
 }
 
 [data-theme-region]::before,
@@ -190,7 +200,7 @@ html {
 /* 背景色层（最底）：按 bg-opacity 决定透明度，1 时实色不透全局图 */
 [data-theme-region]::after {
   z-index: -2;
-  background: color-mix(in srgb, var(--theme-region-bg) calc(var(--theme-region-bg-opacity) * 100%), transparent);
+  background: color-mix(in srgb, var(--theme-region-bg) var(--theme-region-bg-opacity-pct), transparent);
 }
 /* 背景图层（在背景色之上、内容之下）：图片透明度独立于背景色 */
 [data-theme-region]::before {
