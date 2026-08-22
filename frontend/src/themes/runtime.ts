@@ -110,6 +110,9 @@ function setRegionVariables(
   // 预乘成百分比整数：CSS 的 color-mix 在某些 WebView2 版本里不支持嵌 calc()，
   // 直接给出 "75%" 形式的变量，CSS 侧无需 calc，避免整条声明失效回退实色
   values.set(`${prefix}-bg-opacity-pct`, `${Math.round(region.background_opacity * 100)}%`);
+  // 图片遮罩透明度（1 - image_opacity）：滚动容器分区用元素自身 background 时，
+  // 无法用独立伪元素控制图片 opacity，改用一层背景色遮罩罩淡图片
+  values.set(`${prefix}-image-mask-pct`, `${Math.round((1 - region.image_opacity) * 100)}%`);
   values.set(`${prefix}-image`, imageValue);
   values.set(`${prefix}-image-opacity`, String(region.image_opacity));
   values.set(`${prefix}-image-size`, region.image_size);
