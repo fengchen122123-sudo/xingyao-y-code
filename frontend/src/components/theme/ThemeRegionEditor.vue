@@ -105,7 +105,7 @@
       </div>
     </template>
 
-    <!-- 全局模式：语义颜色令牌 -->
+    <!-- 全局模式：语义颜色令牌 + 全局背景图 -->
     <template v-else-if="mode === 'global'">
       <div class="editor-group">
         <div class="group-title">全局语义颜色</div>
@@ -118,11 +118,48 @@
             :value="stringValue((modelValue as Record<string, string | number>)[field.key])"
             :disabled="disabled"
             :opaque-only="false"
-          @commit="commitTokenField"
-          @validity="valid => onFieldValidity(field.key, valid)"
-        />
+            @commit="commitTokenField"
+            @validity="valid => onFieldValidity(field.key, valid)"
+          />
         </div>
         <p class="editor-hint">修改会即时预览；字体、圆角等非颜色令牌保持当前值不变。</p>
+      </div>
+
+      <div class="editor-group">
+        <div class="group-title">全局背景图片</div>
+        <div v-if="appImage.image" class="image-row">
+          <span class="image-path mono">{{ appImage.image }}</span>
+          <button v-if="!disabled" data-test="remove-app-image" class="secondary-button compact" type="button" @click="$emit('remove-image')">移除图片</button>
+        </div>
+        <button v-else-if="!disabled" data-test="choose-app-image" class="secondary-button compact" type="button" :disabled="disabled" @click="$emit('choose-image')">选择背景图片…</button>
+        <p v-else class="image-empty">未设置背景图片</p>
+
+        <label class="range-row">
+          <span class="range-label">图片透明度</span>
+          <input data-test="app-image-opacity" type="range" min="0" max="1" step="0.05" :value="appImage.image_opacity" :disabled="disabled" @input="commitAppImageNumber('image_opacity', $event)" />
+          <span class="range-value">{{ appImage.image_opacity }}</span>
+        </label>
+        <div class="select-grid">
+          <label class="select-field">
+            <span>填充方式</span>
+            <select data-test="app-image-size" :value="appImage.image_size" :disabled="disabled" @change="commitAppImageSelect('image_size', $event)">
+              <option value="cover">cover（铺满）</option>
+              <option value="contain">contain（完整显示）</option>
+              <option value="auto">auto（原始尺寸）</option>
+            </select>
+          </label>
+          <label class="select-field">
+            <span>位置</span>
+            <select data-test="app-image-position" :value="appImage.image_position" :disabled="disabled" @change="commitAppImageSelect('image_position', $event)">
+              <option value="center">居中</option>
+              <option value="top">顶部</option>
+              <option value="bottom">底部</option>
+              <option value="left">左侧</option>
+              <option value="right">右侧</option>
+            </select>
+          </label>
+        </div>
+        <p class="editor-hint">全局背景图垫在所有分区之下，无图分区会透出它。支持 PNG / JPEG / WebP，单张最大 10 MiB。</p>
       </div>
     </template>
 
@@ -168,17 +205,21 @@
 </template>
 
 <script setup lang="ts">
+import { computed } from 'vue';
 import ColorField from './ColorField.vue';
-import type { NativeTitlebarTheme, ThemeRegion } from '../../themes/types';
+import type { AppImageTheme, NativeTitlebarTheme, ThemeRegion } from '../../themes/types';
 
 const props = defineProps<{
   mode: 'region' | 'global' | 'native';
   modelValue: ThemeRegion | Record<string, string | number> | NativeTitlebarTheme;
   disabled?: boolean;
+  /** 全局模式下的全局背景图（由父组件从草稿读写） */
+  appImage?: AppImageTheme;
 }>();
 
 const emit = defineEmits<{
   (e: 'update:modelValue', value: ThemeRegion | Record<string, string | number> | NativeTitlebarTheme): void;
+  (e: 'update:appImage', value: AppImageTheme): void;
   (e: 'choose-image'): void;
   (e: 'remove-image'): void;
   (e: 'clear-overrides'): void;
@@ -261,6 +302,20 @@ function commitNativeField(key: string, value: string) {
 function commitNativeMode(event: Event) {
   const mode = (event.target as HTMLSelectElement).value as NativeTitlebarTheme['mode'];
   emit('update:modelValue', { ...(props.modelValue as NativeTitlebarTheme), mode } as NativeTitlebarTheme);
+}
+
+// 全局背景图：空默认兜底，字段编辑向上层 emit 更新草稿
+const appImage = computed<AppImageTheme>(() => props.appImage ?? {
+  image: null, image_opacity: 1, image_size: 'cover', image_position: 'center',
+});
+function commitAppImageNumber(key: 'image_opacity', event: Event) {
+  const parsed = Number((event.target as HTMLInputElement).value);
+  if (!Number.isFinite(parsed) || parsed < 0 || parsed > 1) return;
+  emit('update:appImage', { ...appImage.value, [key]: parsed });
+}
+function commitAppImageSelect(key: 'image_size' | 'image_position', event: Event) {
+  const value = (event.target as HTMLSelectElement).value as AppImageTheme['image_size'];
+  emit('update:appImage', { ...appImage.value, [key]: value });
 }
 </script>
 

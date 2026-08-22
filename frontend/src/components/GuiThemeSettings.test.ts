@@ -54,6 +54,7 @@ function makeTheme(id: string, builtin: boolean): GuiTheme {
       border: '#333333',
       mode: appearance,
     },
+    app_image: { image: null, image_opacity: 1, image_size: 'cover' as const, image_position: 'center' as const },
     regions: Object.fromEntries(REGION_IDS.map(region => [region, {
       background: '#181818',
       text: '#f0f0f0',
