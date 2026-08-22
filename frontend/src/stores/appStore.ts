@@ -372,6 +372,8 @@ export const useAppStore = defineStore('app', {
     nativeTitlebarColorCapability: 'unknown' as NativeTitlebarColorCapability,
     _appliedGuiTheme: null as AppliedTheme | null,
     settingsOpen: false,
+    // frameless 关闭确认框（替代 win32 原生 MessageBox）：有回合运行时三选
+    closeConfirm: { show: false, trayAvailable: false } as { show: boolean; trayAvailable: boolean },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
     settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'about',
@@ -1868,6 +1870,32 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // ── frameless 关闭确认（现代三选框） ──
+    async _handleCloseRequested(this: any, hasRunningWork: boolean, trayAvailable: boolean) {
+      const api = this._api();
+      if (!api) return;
+      // 没有回合在跑：直接退出（与原生 closing 无确认路径一致）
+      if (!hasRunningWork) {
+        try { await api.window_confirm_close('exit'); } catch (error) { console.warn('关闭失败', error); }
+        return;
+      }
+      // 有回合：弹现代三选框，选择结果交回后端执行
+      this.closeConfirm = { show: true, trayAvailable };
+    },
+
+    async resolveCloseConfirm(this: any, choice: 'exit' | 'background' | 'cancel') {
+      this.closeConfirm.show = false;
+      if (choice === 'cancel') return;
+      const api = this._api();
+      if (!api) return;
+      try {
+        await api.window_confirm_close(choice);
+      } catch (error) {
+        console.warn('关闭确认执行失败', error);
+        this.notifyModal('关闭失败', '窗口关闭失败：' + error);
+      }
+    },
+
     handleBridgeEvent(event: BridgeEvent) {
       const type = event.type;
       const data = event.data || {};
@@ -1875,6 +1903,12 @@ export const useAppStore = defineStore('app', {
       this.connected = true;
 
       const currentRuntimeKey = this._runtimeKey();
+      // frameless 自绘标题栏关闭请求：弹现代确认框（替代 win32 原生 MessageBox），
+      // 不参与会话 runtime 归属逻辑，处理完直接返回
+      if (type === 'close_requested') {
+        void this._handleCloseRequested(!!data.has_running_work, !!data.tray_available);
+        return;
+      }
       // H2 修复：终态事件缺失 session_name 时，不能落到当前显示会话
       // （可能覆盖无关会话的运行态，且 runningSessions 残留导致发送被永久拦截）。
       // 兜底策略：仅当 runningSessions 恰有唯一会话时采纳该会话（此时归属无歧义），

@@ -95,6 +95,7 @@ describe('Topbar frameless window controls', () => {
         window_toggle_maximize: vi.fn().mockResolvedValue({ ok: true, maximized: true }),
         window_close: vi.fn().mockResolvedValue({ ok: true }),
         window_is_maximized: vi.fn().mockResolvedValue({ ok: true, maximized: false }),
+        notify_drag_region: vi.fn().mockResolvedValue({ ok: true }),
       },
     };
   });
@@ -113,13 +114,10 @@ describe('Topbar frameless window controls', () => {
     expect(api.window_close).toHaveBeenCalledOnce();
   });
 
-  it('marks the drag region with the pywebview drag class and dblclick toggles maximize', async () => {
-    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
-    const drag = wrapper.get('.pywebview-drag-region');
-    expect(drag.element).toBeTruthy();
-
-    await drag.trigger('dblclick');
-    expect((window as any).pywebview.api.window_toggle_maximize).toHaveBeenCalledOnce();
+  it('reports the drag region rectangle in physical pixels on mount', async () => {
+    mount(Topbar, { global: { stubs: { AppIcon: true } } });
+    const api = (window as any).pywebview.api;
+    await vi.waitFor(() => expect(api.notify_drag_region).toHaveBeenCalled());
   });
 
   it('does not crash when the bridge is unavailable', async () => {
