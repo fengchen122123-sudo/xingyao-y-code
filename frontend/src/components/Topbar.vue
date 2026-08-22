@@ -1,18 +1,23 @@
 <template>
   <div id="topbar" data-theme-region="app_header">
-    <button class="icon-btn" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">
+    <button class="icon-btn no-drag" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">
       <AppIcon name="menu" :size="17" />
     </button>
-    <div class="logo" :title="store.version ? ('Y-CODE 星瑶 v' + store.version) : 'Y-CODE 星瑶'">
+    <div class="logo no-drag" :title="store.version ? ('Y-CODE 星瑶 v' + store.version) : 'Y-CODE 星瑶'">
       <img class="mark" :src="'/icon.png'" alt="Y-CODE">
       <div><span class="name">Y-CODE</span></div>
     </div>
-    <div class="top-spacer"></div>
+
+    <!-- 标题栏拖拽区：双击最大化/还原；只有这块 pywebview-drag-region 可拖动窗口 -->
+    <div
+      class="titlebar-drag pywebview-drag-region"
+      @dblclick="toggleMaximize"
+    ></div>
 
     <!-- 软件更新提示按钮：发现新版本或下载就绪时展示 -->
     <button
       v-if="store.updateState.hasUpdate"
-      class="update-topbar-btn"
+      class="update-topbar-btn no-drag"
       :class="{
         'is-downloaded': store.updateState.status === 'downloaded',
         'is-downloading': store.updateState.status === 'downloading'
@@ -26,21 +31,51 @@
       <span v-if="store.updateState.status === 'downloading'" class="progress-tag">{{ store.updateState.downloadProgress }}%</span>
     </button>
 
-    <button class="icon-btn" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
+    <button class="icon-btn no-drag" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
       <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" />
     </button>
-    <button class="icon-btn" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">
+    <button class="icon-btn no-drag" id="btn-toggle-right" title="切换面板" @click="store.toggleRightPanel()">
       <AppIcon name="panel-right" :size="16" />
     </button>
+
+    <!-- 自绘窗口控制按钮（frameless）：颜色随主题，hover 态清晰 -->
+    <div class="window-controls no-drag">
+      <button class="win-btn" title="最小化" data-test="win-min" @click="winMinimize">—</button>
+      <button class="win-btn" :title="maximized ? '还原' : '最大化'" data-test="win-max" @click="toggleMaximize">
+        {{ maximized ? '❐' : '▢' }}
+      </button>
+      <button class="win-btn win-close" title="关闭" data-test="win-close" @click="winClose">✕</button>
+    </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed } from 'vue';
+import { computed, onMounted, ref } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
+
+// 自绘标题栏窗口控制：通过 pywebview 桥调用，窗体控制按钮颜色随主题
+const maximized = ref(false);
+const api = () => (window as any).pywebview?.api;
+
+async function toggleMaximize() {
+  const result = await api()?.window_toggle_maximize?.();
+  if (result?.ok) maximized.value = !!result.maximized;
+}
+async function winMinimize() {
+  await api()?.window_minimize?.();
+}
+function winClose() {
+  // 关闭走 destroy 触发 closing 事件，由后端生命周期层做退出确认
+  void api()?.window_close?.();
+}
+
+onMounted(async () => {
+  const result = await api()?.window_is_maximized?.();
+  if (result?.ok) maximized.value = !!result.maximized;
+});
 
 const topbarUpdateLabel = computed(() => {
   if (store.updateState.status === 'downloaded') return '立即安装更新';
@@ -96,6 +131,44 @@ function handleUpdateClick() {
 }
 .top-spacer {
   flex: 1;
+}
+
+/* 自绘标题栏拖拽区：占据按钮之间的空隙，双击最大化；pywebview 据此拖动窗口 */
+.titlebar-drag {
+  flex: 1;
+  align-self: stretch;
+  min-width: 40px;
+}
+
+/* 自绘窗口控制按钮：颜色随主题文字色，关闭 hover 用危险色 */
+.window-controls {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: 4px;
+}
+.win-btn {
+  width: 40px;
+  height: 32px;
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 14px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.12s, color 0.12s;
+}
+.win-btn:hover {
+  background: var(--bg2);
+  color: var(--text);
+}
+.win-close:hover {
+  background: var(--red);
+  color: #fff;
 }
 
 /* 更新提示按钮 */

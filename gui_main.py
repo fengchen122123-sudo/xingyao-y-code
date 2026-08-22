@@ -423,7 +423,8 @@ def main():
     gui_theme = _initial_gui_theme()
     url += ("&" if "#" in url else "#") + _build_gui_theme_fragment(gui_theme)
 
-    # 启动 PyWebView 原生桌面窗口（背景色与主题一致，页面加载前不闪反色）
+    # 启动 PyWebView 无边框桌面窗口（自绘标题栏；背景色与主题一致，加载前不闪反色）
+    # easy_drag=False：只有 .pywebview-drag-region 标记的标题栏区域可拖拽移动窗口
     window = webview.create_window(
         title="Y-CODE · 星瑶",
         url=url,
@@ -433,7 +434,9 @@ def main():
         min_size=(960, 640),
         text_select=True,
         confirm_close=False,
-        background_color=gui_theme["background"]
+        background_color=gui_theme["background"],
+        frameless=True,
+        easy_drag=False,
     )
 
     api.set_window(window)

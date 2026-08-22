@@ -502,6 +502,47 @@ class ApiBridge:
         """
         return any(t.is_alive() for t in self._active_turns.values())
 
+    # ------------------------------------------------------------------
+    # 自绘标题栏窗口控制（frameless 模式）：最小化 / 最大化还原 / 关闭
+    # ------------------------------------------------------------------
+    def window_minimize(self) -> Dict[str, Any]:
+        try:
+            if self._window is not None:
+                self._window.minimize()
+            return {"ok": True}
+        except Exception as error:  # noqa: BLE001
+            logger.warning("窗口最小化失败: %s", error)
+            return {"ok": False, "error": str(error)}
+
+    def window_toggle_maximize(self) -> Dict[str, Any]:
+        """最大化 / 还原。frameless 下无原生标题栏状态，用自维护标志位切换。"""
+        try:
+            if self._window is None:
+                return {"ok": False, "error": "窗口未就绪"}
+            if getattr(self, "_frameless_maximized", False):
+                self._window.restore()
+                self._frameless_maximized = False
+            else:
+                self._window.maximize()
+                self._frameless_maximized = True
+            return {"ok": True, "maximized": self._frameless_maximized}
+        except Exception as error:  # noqa: BLE001
+            logger.warning("窗口最大化切换失败: %s", error)
+            return {"ok": False, "error": str(error)}
+
+    def window_close(self) -> Dict[str, Any]:
+        """关闭窗口：走 destroy 触发 closing 事件，由生命周期层做退出确认。"""
+        try:
+            if self._window is not None:
+                self._window.destroy()
+            return {"ok": True}
+        except Exception as error:  # noqa: BLE001
+            logger.warning("窗口关闭失败: %s", error)
+            return {"ok": False, "error": str(error)}
+
+    def window_is_maximized(self) -> Dict[str, Any]:
+        return {"ok": True, "maximized": bool(getattr(self, "_frameless_maximized", False))}
+
     def shutdown(self) -> None:
         """Idempotently stop GUI-owned work before the native window is destroyed."""
         with self._shutdown_lock:
@@ -586,6 +627,8 @@ class ApiBridge:
 
     # ------------------------------------------------------------------
     # 窗口标题栏主题（Windows DWM 沉浸式深色标题栏，保留原生最小化/关闭按钮）
+    # 注：frameless 自绘标题栏模式下无原生标题栏，DWM 改色停用，仅保留窗口图标，
+    # 并启用 WM_NCHITTEST 子类化以恢复边缘调整大小与 Aero Snap。
     # ------------------------------------------------------------------
     def _find_hwnd_worker(self):
         """按窗口标题轮询查找本进程顶层窗口的 HWND（原生窗口在 webview.start 后才创建）。
@@ -594,21 +637,46 @@ class ApiBridge:
             return
         try:
             title = getattr(self._window, "title", "") or ""
+            frameless = bool(getattr(self._window, "frameless", False))
             for _ in range(300):  # 最多等 60 秒
                 hwnd = self._find_own_hwnd(title)
                 if hwnd:
                     self._hwnd = hwnd
-                    # 先设图标再设标题栏主题：WM_SETICON 会触发 DWM 重建非客户区，
-                    # 把已应用的标题栏颜色重置回系统默认（白），顺序不能反。
+                    # 先设图标：WM_SETICON 触发 DWM 重建非客户区
                     self._apply_window_icon()
-                    time.sleep(0.05)
-                    self._apply_titlebar_theme()
-                    # WebView2 子窗口就绪、DPI 变化等时机也可能重建边框，延迟补两次
-                    self._start_reapply_thread(name="gui-titlebar-reapply")
+                    if frameless:
+                        # 无边框：启用边缘调整大小 + Aero Snap（GUI 线程内子类化）
+                        self._enable_frameless_resize()
+                    else:
+                        time.sleep(0.05)
+                        self._apply_titlebar_theme()
+                        # WebView2 子窗口就绪、DPI 变化等时机也可能重建边框，延迟补两次
+                        self._start_reapply_thread(name="gui-titlebar-reapply")
                     return
                 time.sleep(0.2)
         except Exception:
             logger.debug("查找窗口句柄失败", exc_info=True)
+
+    def _enable_frameless_resize(self):
+        """frameless 窗口恢复边缘调整大小与 Aero Snap（WM_NCHITTEST 子类化）。"""
+        try:
+            import webview.platforms.winforms as wf
+
+            from core.frameless import subclass_frameless_resize
+
+            # 轮询等待 BrowserForm 注册（pywebview 在 webview.start 后才创建）
+            import time as _time
+
+            uid = getattr(self._window, "uid", "master")
+            for _ in range(60):
+                form = wf.BrowserView.instances.get(uid)
+                if form is not None and form.Handle is not None and form.Handle.ToInt32() != 0:
+                    subclass_frameless_resize(form)
+                    return
+                _time.sleep(0.2)
+            logger.warning("frameless 边缘调整大小：BrowserForm 未就绪，未启用")
+        except Exception:
+            logger.warning("frameless 边缘调整大小初始化失败", exc_info=True)
 
     @staticmethod
     def _find_own_hwnd(title: str) -> int:
@@ -809,6 +877,22 @@ class ApiBridge:
     def _apply_titlebar_colors(self, native_titlebar: Dict[str, Any]) -> bool:
         """Compatibility name retained for the Task 3 bridge contract."""
         return self._apply_native_titlebar_theme(native_titlebar)
+
+    def _is_frameless(self) -> bool:
+        """当前窗口是否为 frameless 自绘标题栏模式（无原生非客户区）。
+        裸实例（测试）或未 set_window 时按非 frameless 处理，走原 DWM 路径。"""
+        window = getattr(self, "_window", None)
+        return bool(getattr(window, "frameless", False)) if window is not None else False
+
+    def _apply_frameless_titlebar_memory(self, native_titlebar: Dict[str, Any]) -> None:
+        """frameless 下仅校验并提交标题栏内存态（mode 供自绘按钮明暗用），不调 DWM。"""
+        candidate = copy.deepcopy(native_titlebar)
+        mode = candidate.get("mode")
+        if mode not in ("light", "dark"):
+            raise ThemeError("invalid_value", "native_titlebar.mode", "标题栏模式只能是 light 或 dark")
+        self._native_titlebar = candidate
+        self._titlebar_dark = mode == "dark"
+        self._native_titlebar_color_capability = _DWM_COLOR_CAPABILITY_NOT_APPLICABLE
 
     def _apply_titlebar_theme(self) -> bool:
         """Reapply the last resolved native titlebar after DWM rebuilds the frame."""
@@ -1065,6 +1149,14 @@ class ApiBridge:
 
     def preview_native_titlebar(self, native_titlebar: Dict[str, Any]) -> Dict[str, Any]:
         def operation():
+            # frameless 自绘标题栏：无原生栏可改色，控制按钮明暗由前端按 mode 自绘。
+            # 校验通过后直接提交内存态，返回 not_applicable。
+            if self._is_frameless():
+                self._apply_frameless_titlebar_memory(native_titlebar)
+                return {
+                    "ok": True,
+                    "native_titlebar_color_capability": _DWM_COLOR_CAPABILITY_NOT_APPLICABLE,
+                }
             if not self._apply_titlebar_colors(native_titlebar):
                 raise ThemeError(
                     "native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败",
@@ -1081,6 +1173,14 @@ class ApiBridge:
     def restore_native_titlebar(self) -> Dict[str, Any]:
         def operation():
             theme = get_gui_theme_repository().get_active()
+            # frameless：同上，仅提交内存态，不做 DWM 调用
+            if self._is_frameless():
+                self._apply_frameless_titlebar_memory(theme["native_titlebar"])
+                return {
+                    "ok": True,
+                    "theme": theme,
+                    "native_titlebar_color_capability": _DWM_COLOR_CAPABILITY_NOT_APPLICABLE,
+                }
             if not self._apply_titlebar_colors(theme["native_titlebar"]):
                 raise ThemeError(
                     "native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败",
