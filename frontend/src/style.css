@@ -262,6 +262,11 @@ body {
   display: flex;
   flex-direction: column;
   overflow: hidden;
+  /* 建立层叠上下文：body::before 的 z-index:-1 默认会穿透到 html 画布背景
+     （不透明实色）之下导致全局图被盖住。position:relative 把伪元素层叠限制在
+     body 内部，使全局图保持在 html 背景之上、各分区之下。 */
+  position: relative;
+  isolation: isolate;
   /* 不强制 antialiased：细体渲染会让小字发虚，用系统默认次像素渲染字形更饱满 */
 }
 
