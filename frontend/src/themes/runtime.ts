@@ -107,6 +107,9 @@ function setRegionVariables(
   values.set(`${prefix}-border`, region.border);
   values.set(`${prefix}-accent`, region.accent);
   values.set(`${prefix}-bg-opacity`, String(region.background_opacity));
+  // 预乘成百分比整数：CSS 的 color-mix 在某些 WebView2 版本里不支持嵌 calc()，
+  // 直接给出 "75%" 形式的变量，CSS 侧无需 calc，避免整条声明失效回退实色
+  values.set(`${prefix}-bg-opacity-pct`, `${Math.round(region.background_opacity * 100)}%`);
   values.set(`${prefix}-image`, imageValue);
   values.set(`${prefix}-image-opacity`, String(region.image_opacity));
   values.set(`${prefix}-image-size`, region.image_size);
