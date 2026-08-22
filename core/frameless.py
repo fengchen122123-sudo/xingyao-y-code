@@ -43,7 +43,14 @@ WS_MAXIMIZEBOX = 0x00010000
 # Windows 的 Aero Snap（键盘 Win+方向键与拖拽贴边）要求窗口带 WS_THICKFRAME，
 # FormBorderStyle.None 把它剥掉了。加回后 DWM 同时恢复窗口阴影（无边框窗口
 # 常配）；DefWindowProc 的默认命中测试也会在边缘返回边框码，与子类化叠加无害。
+# 副作用：THICKFRAME 由系统画 1px 原生边框，颜色用 DWM 色板可自定义
+# （set_frame_border_color），跟随主题 native_titlebar.border。
 WS_THICKFRAME = 0x00040000
+
+# DWM 边框/标题色属性（DWMWA_*）
+_DWMWA_BORDER_COLOR = 34
+_DWMWA_TEXT_COLOR = 36
+_DWMWA_CAPTION_COLOR = 35
 
 # 边缘可拖拽宽度（物理像素）：同时决定 WebView2 缩进的边带宽度。
 # 命中带与视觉边带同宽（跨进程限制，无法分离）：过窄会导致边缘 resize
@@ -151,6 +158,36 @@ def set_drag_region(x: int, y: int, w: int, h: int) -> None:
     global _drag_region
     _drag_region = [int(x), int(y), int(w), int(h)]
     logger.info("frameless 拖拽区已登记: x=%s y=%s w=%s h=%s", _drag_region[0], _drag_region[1], _drag_region[2], _drag_region[3])
+
+
+def set_frame_border_color(hwnd: int, color_hex: str) -> bool:
+    """自绘模式下用 DWM 色板设置 THICKFRAME 的 1px 系统边框颜色。
+
+    主题 native_titlebar.border 在 frameless 下重新定义为窗口边框色；
+    浅色主题边框设浅色，黑边即消失。返回是否成功（静默失败无害）。
+    """
+    if not hwnd:
+        return False
+    try:
+        color = _hex_to_colorref(color_hex)
+        hr = ctypes.windll.dwmapi.DwmSetWindowAttribute(
+            hwnd, _DWMWA_BORDER_COLOR, ctypes.byref(ctypes.c_int(color)), 4,
+        )
+        if hr == 0:
+            logger.info("frameless 窗口边框色已设为 %s", color_hex)
+            return True
+        logger.debug("DWMWA_BORDER_COLOR 失败 hr=0x%08X", hr & 0xFFFFFFFF)
+        return False
+    except Exception:
+        logger.warning("设置窗口边框色失败", exc_info=True)
+        return False
+
+
+def _hex_to_colorref(value: str) -> int:
+    """#RRGGBB → COLORREF（0x00BBGGRR）。"""
+    v = value.lstrip("#")
+    r, g, b = int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16)
+    return r | (g << 8) | (b << 16)
 
 
 def _inset_webview(form, pad: int) -> None:
