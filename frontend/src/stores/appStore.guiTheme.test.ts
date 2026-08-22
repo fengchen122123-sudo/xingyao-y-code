@@ -59,6 +59,15 @@ const previewTitlebar = vi.fn();
 const restoreTitlebar = vi.fn();
 const getActiveTheme = vi.fn();
 const getInitialState = vi.fn();
+const listThemes = vi.fn();
+const getTheme = vi.fn();
+const copyTheme = vi.fn();
+const renameTheme = vi.fn();
+const deleteTheme = vi.fn();
+const importTheme = vi.fn();
+const exportTheme = vi.fn();
+const importThemeImage = vi.fn();
+const removeThemeImage = vi.fn();
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -113,6 +122,24 @@ beforeEach(() => {
     gui_theme_list_error: null,
     native_titlebar_color_capability: 'pending',
   });
+  listThemes.mockReset().mockResolvedValue({
+    ok: true,
+    themes: [
+      { id: 'builtin.dark', name: '内置深色', appearance: 'dark', extends: 'builtin.dark', builtin: true },
+      { id: 'builtin.light', name: '内置浅色', appearance: 'light', extends: 'builtin.light', builtin: true },
+    ],
+  });
+  getTheme.mockReset().mockImplementation(async (id: string) => ({
+    ok: true,
+    theme: makeTheme(id, id.includes('light') ? 'light' : 'dark'),
+  }));
+  copyTheme.mockReset().mockResolvedValue({ ok: true, theme: makeTheme('copied') });
+  renameTheme.mockReset().mockResolvedValue({ ok: true, theme: makeTheme('renamed') });
+  deleteTheme.mockReset().mockResolvedValue({ ok: true });
+  importTheme.mockReset().mockResolvedValue({ ok: true, theme: makeTheme('imported') });
+  exportTheme.mockReset().mockResolvedValue({ ok: true, path: 'C:/tmp/rose.zip' });
+  importThemeImage.mockReset().mockResolvedValue({ ok: true, asset_path: 'assets/workspace.webp' });
+  removeThemeImage.mockReset().mockResolvedValue({ ok: true, theme: makeTheme('rose') });
   (window as any).pywebview = {
     api: {
       save_gui_theme: saveTheme,
@@ -122,6 +149,15 @@ beforeEach(() => {
       get_active_gui_theme: getActiveTheme,
       get_gui_theme_asset: vi.fn(),
       get_initial_state: getInitialState,
+      list_gui_themes: listThemes,
+      get_gui_theme: getTheme,
+      copy_gui_theme: copyTheme,
+      rename_gui_theme: renameTheme,
+      delete_gui_theme: deleteTheme,
+      import_gui_theme: importTheme,
+      export_gui_theme: exportTheme,
+      import_gui_theme_image: importThemeImage,
+      remove_gui_theme_image: removeThemeImage,
       check_update: vi.fn().mockResolvedValue({ ok: true, has_update: false }),
     },
   };
@@ -542,5 +578,128 @@ describe('GUI theme store', () => {
     expect(setActive).toHaveBeenCalledWith('builtin.dark');
     expect(store.guiThemeError).toBeNull();
     expect(store.savedGuiTheme?.id).toBe('builtin.dark');
+  });
+});
+
+describe('GUI theme library management', () => {
+  it('refreshes the theme list and only reports list errors as non-blocking', async () => {
+    listThemes.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'theme_operation_failed', path: 'gui_themes', message: '列表读取失败' },
+    });
+    const store = useAppStore();
+
+    const failed = await store.refreshGuiThemes();
+
+    expect(failed.ok).toBe(false);
+    expect(store.guiThemeListError?.code).toBe('theme_operation_failed');
+    expect(store.guiThemeError).toBeNull();
+
+    const ok = await store.refreshGuiThemes();
+
+    expect(ok.ok).toBe(true);
+    expect(store.guiThemes.map(t => t.id)).toEqual(['builtin.dark', 'builtin.light']);
+    expect(store.guiThemeListError).toBeNull();
+  });
+
+  it('copies a theme through the bridge and refreshes the list', async () => {
+    const store = useAppStore();
+
+    const result = await store.copyGuiTheme('builtin.light', 'rose', 'Rose');
+
+    expect(copyTheme).toHaveBeenCalledWith('builtin.light', 'rose', 'Rose');
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.theme.id).toBe('copied');
+    expect(listThemes).toHaveBeenCalled();
+  });
+
+  it('renames the active theme and updates every snapshot id without losing draft edits', async () => {
+    const store = useAppStore();
+    const draft = makeTheme('rose');
+    draft.regions.workspace.background = '#123456';
+    store.guiTheme = makeTheme('rose');
+    store.savedGuiTheme = makeTheme('rose');
+    store.guiThemeDraft = draft;
+
+    const result = await store.renameGuiTheme('rose', 'sakura', '樱花');
+
+    expect(renameTheme).toHaveBeenCalledWith('rose', 'sakura', '樱花');
+    expect(result.ok).toBe(true);
+    expect(store.guiTheme?.id).toBe('sakura');
+    expect(store.savedGuiTheme?.id).toBe('sakura');
+    expect(store.guiThemeDraft?.id).toBe('sakura');
+    expect(store.guiThemeDraft?.regions.workspace.background).toBe('#123456');
+  });
+
+  it('surfaces backend rejection when deleting the active theme and keeps state', async () => {
+    deleteTheme.mockResolvedValueOnce({
+      ok: false,
+      error: { code: 'active_theme_delete', path: 'theme_id', message: '不能删除活动主题' },
+    });
+    const store = useAppStore();
+    store.savedGuiTheme = makeTheme('rose');
+
+    const result = await store.deleteGuiTheme('rose');
+
+    expect(result.ok).toBe(false);
+    expect(result.ok === false && result.error.code).toBe('active_theme_delete');
+    expect(store.savedGuiTheme?.id).toBe('rose');
+    expect(listThemes).not.toHaveBeenCalled();
+  });
+
+  it('imports a theme zip and refreshes the list', async () => {
+    const store = useAppStore();
+
+    const result = await store.importGuiTheme();
+
+    expect(importTheme).toHaveBeenCalledOnce();
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.theme.id).toBe('imported');
+    expect(listThemes).toHaveBeenCalled();
+  });
+
+  it('exports a theme and returns the destination path', async () => {
+    const store = useAppStore();
+
+    const result = await store.exportGuiTheme('rose');
+
+    expect(exportTheme).toHaveBeenCalledWith('rose');
+    expect(result.ok && result.path).toBe('C:/tmp/rose.zip');
+  });
+
+  it('imports a region image asset path without touching the draft', async () => {
+    const store = useAppStore();
+    store.guiThemeDraft = makeTheme('rose');
+    store.guiThemeDraft.regions.workspace.image = null;
+
+    const result = await store.importGuiThemeImage('rose', 'workspace');
+
+    expect(importThemeImage).toHaveBeenCalledWith('rose', 'workspace');
+    expect(result.ok && result.asset_path).toBe('assets/workspace.webp');
+    expect(store.guiThemeDraft.regions.workspace.image).toBeNull();
+  });
+
+  it('loads an arbitrary theme for inheritance restore', async () => {
+    const store = useAppStore();
+
+    const result = await store.loadGuiTheme('builtin.light');
+
+    expect(getTheme).toHaveBeenCalledWith('builtin.light');
+    expect(result.ok && result.theme.id).toBe('builtin.light');
+  });
+
+  it('stages an explicit final draft when saving directly from the editor', async () => {
+    const store = useAppStore();
+    store.savedGuiTheme = makeTheme('rose');
+    store.guiThemeDraft = makeTheme('rose');
+    const finalDraft = makeTheme('rose');
+    finalDraft.regions.workspace.background = '#654321';
+
+    await store.saveGuiThemeDraft(finalDraft);
+
+    expect(saveTheme).toHaveBeenCalledOnce();
+    const saved = saveTheme.mock.calls[0][0] as GuiTheme;
+    expect(saved.regions.workspace.background).toBe('#654321');
+    expect(setActive).toHaveBeenCalledWith('rose');
   });
 });

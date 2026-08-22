@@ -43,6 +43,7 @@ import type {
   GuiThemeResult,
   GuiThemeSummary,
   NativeTitlebarColorCapability,
+  ThemeRegionId,
 } from '../themes/types';
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
@@ -77,12 +78,15 @@ function guiThemeFailure(error: unknown, path = 'theme'): GuiThemeFailure {
 }
 
 type GuiThemeActionResult = GuiThemeResult<{ theme: GuiTheme }>;
+type GuiThemeListResult = GuiThemeResult<{ themes: GuiThemeSummary[] }>;
+type GuiThemeAssetResult = GuiThemeResult<{ asset_path: string }>;
+type GuiThemePathResult = GuiThemeResult<{ path: string }>;
 const guiThemeOperationQueues = new WeakMap<object, Promise<void>>();
 
-function enqueueGuiThemeOperation(
+function enqueueGuiThemeOperation<T extends object>(
   store: object,
-  operation: () => Promise<GuiThemeActionResult>,
-): Promise<GuiThemeActionResult> {
+  operation: () => Promise<GuiThemeResult<T>>,
+): Promise<GuiThemeResult<T>> {
   const previous = guiThemeOperationQueues.get(store) ?? Promise.resolve();
   const result = previous.then(operation);
   guiThemeOperationQueues.set(store, result.then(() => undefined, () => undefined));
@@ -804,23 +808,26 @@ export const useAppStore = defineStore('app', {
       return enqueueGuiThemeOperation(this, () => this._activateGuiThemeId(themeId));
     },
 
-    async _saveGuiThemeDraft(this: any): Promise<GuiThemeActionResult> {
+    async _saveGuiThemeDraft(this: any, draft?: GuiTheme): Promise<GuiThemeActionResult> {
+      // 编辑器可在仍有预览排队时直接保存最终草稿：显式传入的草稿优先于
+      // 异步预览尚未回写的 store 草稿，保证快速输入的最后值不丢失。
+      if (draft) this.guiThemeDraft = cloneGuiTheme(draft);
       if (!this.guiThemeDraft) return guiThemeFailure(new Error('没有可保存的主题草稿'));
       const api = this._api();
       if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
-      const draft = cloneGuiTheme(this.guiThemeDraft);
+      const theme = cloneGuiTheme(this.guiThemeDraft);
       let saved;
       try {
-        saved = await api.save_gui_theme(draft);
+        saved = await api.save_gui_theme(theme);
       } catch (error) {
         return guiThemeFailure(error);
       }
       if (!saved.ok) return saved;
-      return this._activateGuiThemeId(draft.id);
+      return this._activateGuiThemeId(theme.id);
     },
 
-    saveGuiThemeDraft(): Promise<GuiThemeActionResult> {
-      return enqueueGuiThemeOperation(this, () => this._saveGuiThemeDraft());
+    saveGuiThemeDraft(draft?: GuiTheme): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, () => this._saveGuiThemeDraft(draft));
     },
 
     resetInvalidGuiTheme(themeId: 'builtin.dark' | 'builtin.light'): Promise<GuiThemeActionResult> {
@@ -838,6 +845,159 @@ export const useAppStore = defineStore('app', {
         );
         if (result.ok) this.guiThemeError = null;
         return result;
+      });
+    },
+
+    // ── 主题库管理（Task 6）：组件只调用这些 action，不直接触碰桥 ──
+
+    async _refreshGuiThemeSummaries(this: any): Promise<GuiThemeListResult> {
+      const api = this._api();
+      if (!api) return guiThemeFailure(new Error('pywebview API 不可用'), 'gui_themes');
+      let result;
+      try {
+        result = await api.list_gui_themes();
+      } catch (error) {
+        return guiThemeFailure(error, 'gui_themes');
+      }
+      if (!result.ok) return result;
+      this.guiThemes = result.themes || [];
+      this.guiThemeListError = null;
+      return result;
+    },
+
+    // 列表刷新失败只进 guiThemeListError（非阻断），绝不写 guiThemeError。
+    refreshGuiThemes(): Promise<GuiThemeListResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const result = await this._refreshGuiThemeSummaries();
+        if (!result.ok) this.guiThemeListError = result.error;
+        return result;
+      });
+    },
+
+    loadGuiTheme(themeId: string): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const api = this._api();
+        if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+        try {
+          const result = await api.get_gui_theme(themeId);
+          if (!result.ok) return result;
+          return { ok: true, theme: result.theme };
+        } catch (error) {
+          return guiThemeFailure(error);
+        }
+      });
+    },
+
+    copyGuiTheme(sourceId: string, newId: string, newName: string): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const api = this._api();
+        if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+        let result;
+        try {
+          result = await api.copy_gui_theme(sourceId, newId, newName);
+        } catch (error) {
+          return guiThemeFailure(error);
+        }
+        if (!result.ok) return result;
+        await this._refreshGuiThemeSummaries();
+        return { ok: true, theme: result.theme };
+      });
+    },
+
+    renameGuiTheme(themeId: string, newId: string, newName: string): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const api = this._api();
+        if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+        let result;
+        try {
+          result = await api.rename_gui_theme(themeId, newId, newName);
+        } catch (error) {
+          return guiThemeFailure(error);
+        }
+        if (!result.ok) return result;
+        // 活动主题被重命名时同步三份主题快照的 ID/名称，保留其余草稿内容。
+        for (const key of ['guiTheme', 'savedGuiTheme', 'guiThemeDraft'] as const) {
+          const snapshot = this[key] as GuiTheme | null;
+          if (snapshot && snapshot.id === themeId) {
+            snapshot.id = newId;
+            snapshot.name = newName;
+          }
+        }
+        await this._refreshGuiThemeSummaries();
+        return { ok: true, theme: result.theme };
+      });
+    },
+
+    deleteGuiTheme(themeId: string): Promise<GuiThemeResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const api = this._api();
+        if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+        let result;
+        try {
+          result = await api.delete_gui_theme(themeId);
+        } catch (error) {
+          return guiThemeFailure(error);
+        }
+        if (!result.ok) return result;
+        await this._refreshGuiThemeSummaries();
+        return { ok: true };
+      });
+    },
+
+    // ZIP 导入：文件选择对话框由后端桥负责；取消对话框返回 dialog_cancelled。
+    importGuiTheme(): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const api = this._api();
+        if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+        let result;
+        try {
+          result = await api.import_gui_theme();
+        } catch (error) {
+          return guiThemeFailure(error, 'source');
+        }
+        if (!result.ok) return result;
+        await this._refreshGuiThemeSummaries();
+        return { ok: true, theme: result.theme };
+      });
+    },
+
+    exportGuiTheme(themeId: string): Promise<GuiThemePathResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const api = this._api();
+        if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+        try {
+          return await api.export_gui_theme(themeId);
+        } catch (error) {
+          return guiThemeFailure(error, 'destination');
+        }
+      });
+    },
+
+    // 分区背景图：只做桥调用并返回 asset 路径，草稿与预览由调用方（编辑器）驱动。
+    importGuiThemeImage(themeId: string, region: ThemeRegionId): Promise<GuiThemeAssetResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const api = this._api();
+        if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+        try {
+          return await api.import_gui_theme_image(themeId, region);
+        } catch (error) {
+          return guiThemeFailure(error, 'source');
+        }
+      });
+    },
+
+    removeGuiThemeImage(themeId: string, region: ThemeRegionId): Promise<GuiThemeActionResult> {
+      return enqueueGuiThemeOperation(this, async () => {
+        const api = this._api();
+        if (!api) return guiThemeFailure(new Error('pywebview API 不可用'));
+        let result;
+        try {
+          result = await api.remove_gui_theme_image(themeId, region);
+        } catch (error) {
+          return guiThemeFailure(error);
+        }
+        if (!result.ok) return result;
+        return { ok: true, theme: result.theme };
       });
     },
 
