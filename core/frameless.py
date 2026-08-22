@@ -42,8 +42,9 @@ WS_MINIMIZEBOX = 0x00020000
 WS_MAXIMIZEBOX = 0x00010000
 
 # 边缘可拖拽宽度（物理像素）：同时决定 WebView2 缩进的边带宽度。
-# 8px 视觉偏宽，收到 5px：仍易命中（Windows 原生边框命中区约 4-8px）
-RESIZE_BORDER = 5
+# 命中带与视觉边带同宽（跨进程限制，无法分离）：过窄会导致边缘 resize
+# 几乎无法命中。3px 视觉纤细且仍可命中；Windows 原生约 4-8px。
+RESIZE_BORDER = 3
 
 _WNDPROC = ctypes.WINFUNCTYPE(
     wintypes.LPARAM, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM
