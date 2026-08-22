@@ -505,8 +505,30 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 自绘标题栏窗口控制（frameless 模式）：最小化 / 最大化还原 / 关闭
     # ------------------------------------------------------------------
+    def _send_sys_command(self, sc_code: int) -> bool:
+        """原生系统命令（WM_SYSCOMMAND）：与系统菜单同路径，最小化/最大化
+        动画、任务栏交互全部原生。需已找到 hwnd。"""
+        hwnd = getattr(self, "_hwnd", 0)
+        if not hwnd or sys.platform != "win32":
+            return False
+        import ctypes
+
+        ctypes.windll.user32.SendMessageW(hwnd, 0x0112, sc_code, 0)
+        return True
+
+    def _is_window_zoomed(self) -> bool:
+        hwnd = getattr(self, "_hwnd", 0)
+        if not hwnd or sys.platform != "win32":
+            return False
+        import ctypes
+
+        return bool(ctypes.windll.user32.IsZoomed(hwnd))
+
     def window_minimize(self) -> Dict[str, Any]:
         try:
+            # SC_MINIMIZE（0xF020）：原生路径带最小化到任务栏的动画
+            if self._send_sys_command(0xF020):
+                return {"ok": True}
             if self._window is not None:
                 self._window.minimize()
             return {"ok": True}
@@ -515,16 +537,19 @@ class ApiBridge:
             return {"ok": False, "error": str(error)}
 
     def window_toggle_maximize(self) -> Dict[str, Any]:
-        """最大化 / 还原。frameless 下无原生标题栏状态，用自维护标志位切换。"""
+        """最大化 / 还原。走原生 SC_MAXIMIZE / SC_RESTORE（带动画），
+        最大化状态用 IsZoomed 原生查询，不自己维护标志。"""
         try:
             if self._window is None:
                 return {"ok": False, "error": "窗口未就绪"}
-            if getattr(self, "_frameless_maximized", False):
-                self._window.restore()
-                self._frameless_maximized = False
+            maximized = bool(self._is_window_zoomed())
+            if maximized:
+                if not self._send_sys_command(0xF120):  # SC_RESTORE
+                    self._window.restore()
             else:
-                self._window.maximize()
-                self._frameless_maximized = True
+                if not self._send_sys_command(0xF030):  # SC_MAXIMIZE
+                    self._window.maximize()
+            self._frameless_maximized = not maximized
             return {"ok": True, "maximized": self._frameless_maximized}
         except Exception as error:  # noqa: BLE001
             logger.warning("窗口最大化切换失败: %s", error)
@@ -577,7 +602,7 @@ class ApiBridge:
             self._window.destroy()
 
     def window_is_maximized(self) -> Dict[str, Any]:
-        return {"ok": True, "maximized": bool(getattr(self, "_frameless_maximized", False))}
+        return {"ok": True, "maximized": bool(self._is_window_zoomed()) or bool(getattr(self, "_frameless_maximized", False))}
 
     def notify_drag_region(self, x: float, y: float, w: float, h: float) -> Dict[str, Any]:
         """前端上报标题栏拖拽区矩形（CSS 像素 × devicePixelRatio 已含在内由前端换算）。
