@@ -235,4 +235,42 @@ describe('GuiThemeSettings', () => {
     expect(cancelGuiThemePreview).toHaveBeenCalledOnce();
     expect(wrapper.get<HTMLInputElement>('[data-test="background-hex"]').element.value).toBe('#181818');
   });
+
+  it('keeps edits made while a save is in flight instead of overwriting them', async () => {
+    let releaseSave!: (value: any) => void;
+    const saving = new Promise(resolve => { releaseSave = resolve; });
+    const wrapper = mountThemeSettings({ active: userTheme() });
+    saveGuiThemeDraft.mockImplementationOnce(() => saving);
+    await wrapper.get('[data-test="background-hex"]').setValue('#111111');
+    await wrapper.get('[data-test="save-theme"]').trigger('click');
+    expect(saveGuiThemeDraft).toHaveBeenCalledOnce();
+
+    // 保存飞行中继续输入：最终值不能被服务器返回的保存快照覆盖
+    await wrapper.get('[data-test="background-hex"]').setValue('#222222');
+    const savedOnServer = userTheme();
+    savedOnServer.regions.workspace.background = '#111111';
+    releaseSave({ ok: true, theme: savedOnServer });
+    await flushPromises();
+
+    expect(wrapper.get<HTMLInputElement>('[data-test="background-hex"]').element.value).toBe('#222222');
+  });
+
+  it('removing an image keeps other unsaved region edits in the draft', async () => {
+    const wrapper = mountThemeSettings({ active: userTheme() });
+    api.import_gui_theme_image.mockResolvedValue({ ok: true, asset_path: 'assets/workspace.webp' });
+    await wrapper.get('[data-test="choose-image"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="background-hex"]').setValue('#112233');
+
+    // 服务器移除图片后返回的主题不含飞行前的本地颜色修改
+    const serverTheme = userTheme();
+    serverTheme.regions.workspace.image = null;
+    api.remove_gui_theme_image.mockResolvedValue({ ok: true, theme: serverTheme });
+
+    await wrapper.get('[data-test="remove-image"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get<HTMLInputElement>('[data-test="background-hex"]').element.value).toBe('#112233');
+    expect(previewGuiTheme.mock.calls.at(-1)?.[0].regions.workspace.image).toBeNull();
+  });
 });
