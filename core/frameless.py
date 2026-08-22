@@ -40,6 +40,10 @@ GWL_STYLE = -16
 GWLP_WNDPROC = -4
 WS_MINIMIZEBOX = 0x00020000
 WS_MAXIMIZEBOX = 0x00010000
+# Windows 的 Aero Snap（键盘 Win+方向键与拖拽贴边）要求窗口带 WS_THICKFRAME，
+# FormBorderStyle.None 把它剥掉了。加回后 DWM 同时恢复窗口阴影（无边框窗口
+# 常配）；DefWindowProc 的默认命中测试也会在边缘返回边框码，与子类化叠加无害。
+WS_THICKFRAME = 0x00040000
 
 # 边缘可拖拽宽度（物理像素）：同时决定 WebView2 缩进的边带宽度。
 # 命中带与视觉边带同宽（跨进程限制，无法分离）：过窄会导致边缘 resize
@@ -234,9 +238,13 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
         """幂等安装：样式位 + 父/宿主侧后代子类化 + WebView2 边缘缩进。
         可安全重复调用。"""
         try:
-            # 1. 顶层窗口样式位：恢复最小化动画 / 双击最大化 / 任务栏交互
+            # 1. 顶层窗口样式位：恢复最小化动画 / 双击最大化 / 任务栏交互 /
+            #    Aero Snap（THICKFRAME 是 Snap 的硬前提，实测缺它 Win+Left 无效）
             style = _u32.GetWindowLongW(hwnd, GWL_STYLE)
-            _u32.SetWindowLongW(hwnd, GWL_STYLE, style | WS_MINIMIZEBOX | WS_MAXIMIZEBOX)
+            _u32.SetWindowLongW(
+                hwnd, GWL_STYLE,
+                style | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_THICKFRAME,
+            )
             # 2. 顶层窗口子类化（幂等：同句柄只装一次）
             if hwnd not in _SUBCLASSED:
                 state["orig_parent"] = _u32.SetWindowLongPtrW(

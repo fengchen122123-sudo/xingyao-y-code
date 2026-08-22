@@ -96,6 +96,7 @@ describe('Topbar frameless window controls', () => {
         window_close: vi.fn().mockResolvedValue({ ok: true }),
         window_is_maximized: vi.fn().mockResolvedValue({ ok: true, maximized: false }),
         notify_drag_region: vi.fn().mockResolvedValue({ ok: true }),
+        window_begin_drag: vi.fn().mockResolvedValue({ ok: true }),
       },
     };
   });
@@ -118,6 +119,12 @@ describe('Topbar frameless window controls', () => {
     mount(Topbar, { global: { stubs: { AppIcon: true } } });
     const api = (window as any).pywebview.api;
     await vi.waitFor(() => expect(api.notify_drag_region).toHaveBeenCalled());
+  });
+
+  it('starts the native move loop on drag-region mousedown (Aero Snap)', async () => {
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+    await wrapper.get('.titlebar-drag').trigger('mousedown', { button: 0 });
+    expect((window as any).pywebview.api.window_begin_drag).toHaveBeenCalledOnce();
   });
 
   it('does not crash when the bridge is unavailable', async () => {

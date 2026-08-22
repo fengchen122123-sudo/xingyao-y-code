@@ -373,6 +373,7 @@ export interface PyWebViewAPI {
   window_close(): Promise<{ ok: boolean; error?: string }>;
   window_is_maximized(): Promise<{ ok: boolean; maximized?: boolean }>;
   notify_drag_region(x: number, y: number, w: number, h: number): Promise<{ ok: boolean; error?: string }>;
+  window_begin_drag(): Promise<{ ok: boolean; error?: string }>;
   window_confirm_close(choice: 'exit' | 'background' | 'cancel'): Promise<{ ok: boolean; error?: string }>;
   set_gui_theme(theme_light: boolean): Promise<GuiThemeResult<{
     theme: GuiTheme;
