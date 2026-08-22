@@ -72,12 +72,16 @@ def _signed_short(value: int) -> int:
     return value - 0x10000 if value >= 0x8000 else value
 
 
-def _edge_code(hwnd: int, lparam: int, border: int) -> int | None:
-    """屏幕坐标命中 → 边框码；不在边缘返回 None。"""
+def _edge_code(hwnd: int, lparam: int, border: int, ref_hwnd: int | None = None) -> int | None:
+    """屏幕坐标命中 → 边框码；不在边缘返回 None。
+
+    ref_hwnd：边缘判定相对该窗口的 rect（默认 hwnd 自身）。子窗口命中时传
+    父窗口句柄——子窗口几乎填满客户区，必须按父窗口边缘判定。
+    """
     x = _signed_short(lparam & 0xFFFF)
     y = _signed_short((lparam >> 16) & 0xFFFF)
     rect = wintypes.RECT()
-    if not _u32.GetWindowRect(hwnd, ctypes.byref(rect)):
+    if not _u32.GetWindowRect(ref_hwnd or hwnd, ctypes.byref(rect)):
         return None
     px, py = x - rect.left, y - rect.top
     width = rect.right - rect.left
@@ -138,6 +142,7 @@ def set_drag_region(x: int, y: int, w: int, h: int) -> None:
     """前端上报标题栏拖拽区矩形（WebView2 客户区物理像素）。"""
     global _drag_region
     _drag_region = [int(x), int(y), int(w), int(h)]
+    logger.info("frameless 拖拽区已登记: x=%s y=%s w=%s h=%s", _drag_region[0], _drag_region[1], _drag_region[2], _drag_region[3])
 
 
 def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
@@ -170,12 +175,12 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
         return _u32.CallWindowProcW(state["orig_parent"], hwnd_arg, msg, wparam, lparam)
 
     def _child_wndproc(hwnd_arg, msg, wparam, lparam):
-        # WebView2 子窗口：拖拽区/边缘 → HTTRANSPARENT（穿透到父窗口继续命中测试）
+        # WebView2 子窗口：拖拽区/边缘 → HTTRANSPARENT（穿透到父窗口继续命中测试）。
+        # 边缘/拖拽区都相对父窗口 rect 判定（子窗口填满客户区，自身 rect 不等于父边缘）。
         if msg == WM_NCHITTEST:
-            if _in_drag_region(hwnd_arg, lparam):
+            if _in_drag_region(hwnd, lparam):
                 return HTTRANSPARENT
-            edge = _edge_code(hwnd_arg, lparam, border)
-            if edge is not None:
+            if _edge_code(hwnd_arg, lparam, border, ref_hwnd=hwnd) is not None:
                 return HTTRANSPARENT
         orig = orig_children.get(hwnd_arg)
         if orig is None:

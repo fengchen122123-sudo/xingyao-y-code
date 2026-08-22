@@ -100,10 +100,16 @@ onMounted(async () => {
     if (dragRegionRef.value) resizeObserver.observe(dragRegionRef.value);
   }
   window.addEventListener('resize', reportDragRegion);
+  // 桥注入晚于组件挂载时首轮上报会丢失：load 后与延迟多次补报，确保登记
+  window.addEventListener('load', reportDragRegion);
+  for (const delay of [1000, 3000, 8000]) {
+    window.setTimeout(reportDragRegion, delay);
+  }
 });
 onBeforeUnmount(() => {
   resizeObserver?.disconnect();
   window.removeEventListener('resize', reportDragRegion);
+  window.removeEventListener('load', reportDragRegion);
 });
 
 const topbarUpdateLabel = computed(() => {
