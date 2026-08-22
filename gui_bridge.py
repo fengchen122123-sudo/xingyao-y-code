@@ -794,6 +794,16 @@ class ApiBridge:
                     if frameless:
                         # 无边框：启用边缘调整大小 + Aero Snap（GUI 线程内子类化）
                         self._enable_frameless_resize()
+                        # 启动即应用主题的窗口边框色（1px 系统边框，避免黑边）
+                        if self._native_titlebar is not None:
+                            try:
+                                from core.frameless import set_frame_border_color
+
+                                border = self._native_titlebar.get("border")
+                                if border:
+                                    set_frame_border_color(hwnd, border)
+                            except Exception:
+                                logger.debug("启动边框色应用失败", exc_info=True)
                     else:
                         time.sleep(0.05)
                         self._apply_titlebar_theme()
@@ -1034,7 +1044,9 @@ class ApiBridge:
         return bool(getattr(window, "frameless", False)) if window is not None else False
 
     def _apply_frameless_titlebar_memory(self, native_titlebar: Dict[str, Any]) -> None:
-        """frameless 下仅校验并提交标题栏内存态（mode 供自绘按钮明暗用），不调 DWM。"""
+        """frameless 下仅校验并提交标题栏内存态（mode 供自绘按钮明暗用），不调 DWM。
+        例外：native_titlebar.border 重新定义为 THICKFRAME 的 1px 系统边框色，
+        通过 DWM 色板写入，让窗口边框随主题（否则浅色主题下是显眼的黑色边）。"""
         candidate = copy.deepcopy(native_titlebar)
         mode = candidate.get("mode")
         if mode not in ("light", "dark"):
@@ -1042,6 +1054,16 @@ class ApiBridge:
         self._native_titlebar = candidate
         self._titlebar_dark = mode == "dark"
         self._native_titlebar_color_capability = _DWM_COLOR_CAPABILITY_NOT_APPLICABLE
+        # 边框色跟随主题（最佳努力，失败不影响主题应用）
+        border = candidate.get("border")
+        hwnd = getattr(self, "_hwnd", 0)
+        if border and hwnd:
+            try:
+                from core.frameless import set_frame_border_color
+
+                set_frame_border_color(hwnd, border)
+            except Exception:
+                logger.debug("边框色应用失败（不影响主题）", exc_info=True)
 
     def _apply_titlebar_theme(self) -> bool:
         """Reapply the last resolved native titlebar after DWM rebuilds the frame."""
