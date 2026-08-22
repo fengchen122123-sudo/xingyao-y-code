@@ -19,6 +19,12 @@
       </div>
     </div>
     <template v-else>
+    <!-- 主题预览浮条：设置页点"预览效果"后收起设置、直接看真实首页，提供返回编辑 -->
+    <div v-if="store.themePreviewMode && !store.settingsOpen" class="theme-preview-bar" data-test="theme-preview-bar">
+      <span class="tpb-text">正在预览主题效果（未保存）</span>
+      <button class="tpb-btn primary" data-test="preview-back" @click="backToThemeEditor">返回编辑</button>
+    </div>
+
     <!-- 顶栏 -->
     <Topbar />
 
@@ -164,6 +170,12 @@ import SettingsPage from './components/SettingsPage.vue';
 
 const store = useAppStore();
 const chatScrollRef = ref<HTMLElement | null>(null);
+
+// 主题预览：从真实首页返回设置页继续编辑（退出预览模式并重开设置）
+function backToThemeEditor() {
+  store.themePreviewMode = false;
+  store.settingsOpen = true;
+}
 
 const showExportMenu = ref(false);
 // 滚动合并标记：同一帧内多次 scrollToBottom 只执行一次
@@ -416,6 +428,31 @@ onUnmounted(() => {
 </script>
 
 <style scoped>
+/* 主题预览浮条：设置页预览效果时置顶显示 */
+.theme-preview-bar {
+  position: sticky;
+  top: 0;
+  z-index: 90;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+  padding: 7px 14px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12.5px;
+  flex-shrink: 0;
+}
+.tpb-btn {
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.16);
+  color: #fff;
+  border-radius: 7px;
+  padding: 3px 12px;
+  font-size: 12px;
+}
+.tpb-btn:hover { background: rgba(255, 255, 255, 0.28); }
+
 .gui-theme-error {
   position: fixed;
   inset: 0;
