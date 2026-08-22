@@ -120,6 +120,25 @@ describe('applyGuiTheme', () => {
     applied.dispose();
   });
 
+  it('global image overrides every region image (region images become none)', async () => {
+    const value = themeWithWorkspaceImage();
+    value.app_image.image = 'assets/global.png';
+    value.regions.workspace.image = 'assets/workspace.webp';
+    value.regions.composer.image = 'assets/composer.png';
+    const api = fakeApiWithAsset();
+
+    const applied = await applyGuiTheme(value, api);
+
+    // 全局图生效：分区图全部强制 none，且分区图资源不被解码（只解码全局图一次）
+    expect(document.documentElement.style.getPropertyValue('--theme-app-image'))
+      .toBe('url("blob:workspace")');
+    expect(document.documentElement.style.getPropertyValue('--theme-workspace-image')).toBe('none');
+    expect(document.documentElement.style.getPropertyValue('--theme-composer-image')).toBe('none');
+    expect(api.get_gui_theme_asset).toHaveBeenCalledTimes(1);
+    expect(api.get_gui_theme_asset).toHaveBeenCalledWith('rose', 'assets/global.png');
+    applied.dispose();
+  });
+
   it('reuses a blob URL when multiple regions reference the same asset', async () => {
     const value = themeWithWorkspaceImage();
     value.regions.app_header.image = 'assets/workspace.webp';
