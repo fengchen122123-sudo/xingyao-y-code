@@ -372,6 +372,9 @@ export const useAppStore = defineStore('app', {
     nativeTitlebarColorCapability: 'unknown' as NativeTitlebarColorCapability,
     _appliedGuiTheme: null as AppliedTheme | null,
     settingsOpen: false,
+    // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
+    // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'about',
     // 主题预览模式：设置页"预览效果"收起设置、直接看真实首页（草稿已实时渲染），
     // 顶部浮条提供返回编辑；保存/取消/切主题时退出该模式
     themePreviewMode: false,

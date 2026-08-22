@@ -326,8 +326,7 @@ function handleSend() {
 }
 #input-box {
   position: relative;
-  /* 用分区表面色：composer 调低背景透明度时输入框透出背景图，默认实色可读 */
-  background: var(--theme-region-surface, var(--bg2));
+  background: var(--bg2);
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 10px;
