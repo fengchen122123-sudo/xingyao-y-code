@@ -169,6 +169,64 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
   };
 }
 
+// ── 设置页内嵌预览：把草稿解析成 CSS 变量 + 资源 URL，不写真实 DOM ──
+export interface ResolvedThemePreview {
+  /** 语义 token 变量名（--theme-*）→ 值 */
+  tokens: Record<string, string>;
+  /** 各分区变量前缀（--theme-app-header 等）→ 完整变量映射 */
+  regions: Record<string, Record<string, string>>;
+  /** 全局背景图变量（--theme-app-image 等） */
+  appImage: Record<string, string>;
+  dispose(): void;
+}
+
+export async function resolveThemePreview(theme: GuiTheme, api: PyWebViewAPI): Promise<ResolvedThemePreview> {
+  const tokens: Record<string, string> = {};
+  for (const [name, cssVariable] of Object.entries(SEMANTIC_VARIABLES)) {
+    const value = theme.tokens[name];
+    if (value !== undefined) tokens[cssVariable] = tokenValue(name, value);
+  }
+  const assetUrls = new Map<string, string>();
+  try {
+    const loadAsset = async (assetPath: string): Promise<string> => {
+      let objectUrl = assetUrls.get(assetPath);
+      if (objectUrl === undefined) {
+        const result = await api.get_gui_theme_asset(theme.id, assetPath);
+        objectUrl = URL.createObjectURL(decodeAsset(result));
+        assetUrls.set(assetPath, objectUrl);
+      }
+      return `url("${objectUrl}")`;
+    };
+    const appImage: Record<string, string> = {};
+    const appImageValue = theme.app_image.image !== null ? await loadAsset(theme.app_image.image) : 'none';
+    appImage['--theme-app-image'] = appImageValue;
+    appImage['--theme-app-image-opacity'] = String(theme.app_image.image_opacity);
+    appImage['--theme-app-image-size'] = theme.app_image.image_size;
+    appImage['--theme-app-image-position'] = theme.app_image.image_position;
+
+    const regions: Record<string, Record<string, string>> = {};
+    for (const regionId of Object.keys(REGION_VARIABLE_PREFIXES) as ThemeRegionId[]) {
+      const region = theme.regions[regionId];
+      const imageValue = region.image !== null ? await loadAsset(region.image) : 'none';
+      const regionValues = new Map<string, string>();
+      setRegionVariables(regionValues, regionId, region, imageValue);
+      regions[regionId] = Object.fromEntries(regionValues);
+    }
+    let disposed = false;
+    return {
+      tokens, regions, appImage,
+      dispose() {
+        if (disposed) return;
+        disposed = true;
+        for (const objectUrl of assetUrls.values()) URL.revokeObjectURL(objectUrl);
+      },
+    };
+  } catch (error) {
+    for (const objectUrl of assetUrls.values()) URL.revokeObjectURL(objectUrl);
+    throw error;
+  }
+}
+
 function literalFragmentValue(fragment: string, name: string): string | null {
   const match = fragment.match(new RegExp(`(?:^|&)${name}=([^&]*)(?:&|$)`));
   return match?.[1] ?? null;
