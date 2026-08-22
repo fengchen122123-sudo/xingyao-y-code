@@ -63,6 +63,12 @@
   box-sizing: border-box;
 }
 
+/* 应用兜底底色：body 已透明以透出全局背景图（body::before），
+   无全局图时由 html 的语义应用背景色承接，保持不透明 */
+html {
+  background: var(--theme-background-app);
+}
+
 /* ---------- GUI 主题分区接线 ----------
    运行时在 documentElement 上写入 --theme-<region>-* 变量（region 下划线转连字符，
    如 app_header → --theme-app-header-*）。每个分区先把自身变量别名到统一的
@@ -189,7 +195,8 @@
 }
 
 body {
-  background: var(--bg0);
+  /* 不设实色背景：全局背景图（body::before）在最底层透出；
+     无图时由 --theme-background-app 语义色经 html/body 默认背景供应 */
   color: var(--text);
   font-family: var(--sans);
   font-size: 14.5px;
@@ -198,6 +205,21 @@ body {
   flex-direction: column;
   overflow: hidden;
   /* 不强制 antialiased：细体渲染会让小字发虚，用系统默认次像素渲染字形更饱满 */
+}
+
+/* 全局背景图：最底层，垫在所有分区之下。fixed 视口定位、负 z-index、
+   pointer-events 关闭，分区有自己的背景图时盖在它上面，无图分区透出它。 */
+body::before {
+  content: '';
+  position: fixed;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: var(--theme-app-image, none);
+  background-size: var(--theme-app-image-size, cover);
+  background-position: var(--theme-app-image-position, center);
+  background-repeat: no-repeat;
+  opacity: var(--theme-app-image-opacity, 1);
 }
 
 ::-webkit-scrollbar {

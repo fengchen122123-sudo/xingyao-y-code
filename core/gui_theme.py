@@ -34,7 +34,7 @@ OPAQUE_COLOR_RE = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 _ROOT_KEYS = frozenset({
     "schema_version", "id", "name", "appearance", "extends", "tokens",
-    "native_titlebar", "regions",
+    "native_titlebar", "app_image", "regions",
 })
 _TOKEN_COLOR_KEYS = frozenset({
     "background_app", "background_panel", "background_card", "background_elevated",
@@ -47,6 +47,8 @@ _TOKEN_RADIUS_KEYS = frozenset({"radius_small", "radius_medium", "radius_large"}
 _TOKEN_NUMBER_KEYS = _TOKEN_RADIUS_KEYS | frozenset({"shadow_strength"})
 _TOKEN_KEYS = _TOKEN_COLOR_KEYS | _TOKEN_FONT_KEYS | _TOKEN_NUMBER_KEYS
 _TITLEBAR_KEYS = frozenset({"background", "text", "border", "mode"})
+# 全局背景图：垫在所有分区之下的最底层（前端 body::before），无文字/边框语义
+_APP_IMAGE_KEYS = frozenset({"image", "image_opacity", "image_size", "image_position"})
 _REGION_KEYS = frozenset({
     "background", "text", "border", "accent", "background_opacity", "image",
     "image_opacity", "image_size", "image_position",
@@ -113,6 +115,12 @@ def _builtin_theme(
         "builtin": True,
         "tokens": tokens,
         "native_titlebar": titlebar,
+        "app_image": {
+            "image": None,
+            "image_opacity": 1.0,
+            "image_size": "cover",
+            "image_position": "center",
+        },
         "regions": regions,
     }
 
@@ -185,8 +193,16 @@ def _validate_opaque_color(value: Any, path: str) -> None:
         raise ThemeError("invalid_color", path, "原生标题栏颜色必须是 #RRGGBB")
 
 
+def _default_app_image() -> dict[str, Any]:
+    return {"image": None, "image_opacity": 1.0, "image_size": "cover", "image_position": "center"}
+
+
 def _validate_manifest(theme: Mapping[str, Any]) -> dict[str, Any]:
-    manifest = _require_mapping(theme, "")
+    manifest = dict(_require_mapping(theme, ""))
+    # 向后兼容：app_image 是 schema v1 后续新增的可继承字段，旧主题清单缺省时
+    # 补默认值（确定性迁移），与未知字段"明确报错"不冲突——只补这一个已知新键。
+    if "app_image" not in manifest:
+        manifest["app_image"] = _default_app_image()
     _reject_unknown(manifest, _ROOT_KEYS, "")
     for key in _ROOT_KEYS:
         if key not in manifest:
@@ -252,6 +268,21 @@ def _validate_manifest(theme: Mapping[str, Any]) -> dict[str, Any]:
                 raise ThemeError("invalid_value", path, "不支持的图片缩放方式")
             elif key == "image_position" and (not isinstance(value, str) or value not in _IMAGE_POSITIONS):
                 raise ThemeError("invalid_value", path, "不支持的图片位置")
+
+    app_image = _require_mapping(manifest["app_image"], "app_image")
+    _reject_unknown(app_image, _APP_IMAGE_KEYS, "app_image")
+    for key, value in app_image.items():
+        path = f"app_image.{key}"
+        if key == "image":
+            if value is not None:
+                _validate_asset_reference(value, path)
+        elif key == "image_opacity":
+            if not _is_number(value) or not 0 <= value <= 1:
+                raise ThemeError("invalid_range", path, "透明度必须在 0 到 1 之间")
+        elif key == "image_size" and (not isinstance(value, str) or value not in _IMAGE_SIZES):
+            raise ThemeError("invalid_value", path, "不支持的图片缩放方式")
+        elif key == "image_position" and (not isinstance(value, str) or value not in _IMAGE_POSITIONS):
+            raise ThemeError("invalid_value", path, "不支持的图片位置")
     return copy.deepcopy(dict(manifest))
 
 
@@ -317,7 +348,7 @@ def _inspect_image(data: bytes, path: str) -> tuple[str, str]:
 
 def _merge_theme(base: dict[str, Any], manifest: Mapping[str, Any]) -> dict[str, Any]:
     merged = copy.deepcopy(base)
-    for key in ("tokens", "native_titlebar"):
+    for key in ("tokens", "native_titlebar", "app_image"):
         merged[key].update(manifest[key])
     for region_id, region in manifest["regions"].items():
         merged["regions"][region_id].update(region)
@@ -325,6 +356,17 @@ def _merge_theme(base: dict[str, Any], manifest: Mapping[str, Any]) -> dict[str,
         merged[key] = manifest[key]
     merged["builtin"] = False
     return merged
+
+
+def _manifest_asset_references(manifest: Mapping[str, Any]) -> set[str]:
+    """主题清单引用的全部资源相对路径（分区图 + 全局背景图）。"""
+    references = {
+        region["image"] for region in manifest["regions"].values() if region["image"]
+    }
+    app_image = manifest["app_image"]["image"]
+    if app_image:
+        references.add(app_image)
+    return references
 
 
 class ThemeRepository:
@@ -417,7 +459,9 @@ class ThemeRepository:
 
     def import_image(self, theme_id: str, region: str, source: Path) -> str:
         manifest = self._editable_manifest(theme_id)
-        if region not in REGION_IDS:
+        # region 取值：七个分区之一，或 "app"（全局背景图，写入 app_image.image）
+        is_app_image = region == "app"
+        if not is_app_image and region not in REGION_IDS:
             raise ThemeError("invalid_region", "region", "主题区域不存在")
         source = Path(source)
         self._assert_no_symlink_components(source, "source")
@@ -428,11 +472,12 @@ class ThemeRepository:
         relative_path = f"assets/{hashlib.sha256(data).hexdigest()[:16]}.{extension}"
         target = self._asset_file(theme_id, relative_path)
         theme_dir = self._theme_directory(theme_id)
-        previous = manifest["regions"][region]["image"]
-        referenced_elsewhere = {
-            item["image"] for region_id, item in manifest["regions"].items()
-            if region_id != region and item["image"]
-        }
+        previous = (
+            manifest["app_image"]["image"] if is_app_image
+            else manifest["regions"][region]["image"]
+        )
+        # 统计旧图是否仍被别处引用（其它分区或全局图），决定是否计入删除后的体积
+        referenced_elsewhere = _manifest_asset_references(manifest) - {previous}
         old_size = 0
         if previous and previous != relative_path and previous not in referenced_elsewhere:
             old_asset = self._asset_file(theme_id, previous)
@@ -448,17 +493,25 @@ class ThemeRepository:
             raise ThemeError("theme_too_large", "assets", "主题目录不能超过 30 MiB")
         target.parent.mkdir(parents=True, exist_ok=True)
         self._write_bytes(target, data)
-        manifest["regions"][region]["image"] = relative_path
+        if is_app_image:
+            manifest["app_image"]["image"] = relative_path
+        else:
+            manifest["regions"][region]["image"] = relative_path
         self._write_manifest(theme_dir / "theme.json", manifest)
         self._remove_asset_if_unreferenced(theme_id, manifest, previous)
         return relative_path
 
     def remove_image(self, theme_id: str, region: str) -> dict[str, Any]:
         manifest = self._editable_manifest(theme_id)
-        if region not in REGION_IDS:
+        is_app_image = region == "app"
+        if not is_app_image and region not in REGION_IDS:
             raise ThemeError("invalid_region", "region", "主题区域不存在")
-        previous = manifest["regions"][region]["image"]
-        manifest["regions"][region]["image"] = None
+        if is_app_image:
+            previous = manifest["app_image"]["image"]
+            manifest["app_image"]["image"] = None
+        else:
+            previous = manifest["regions"][region]["image"]
+            manifest["regions"][region]["image"] = None
         self._write_manifest(self._theme_directory(theme_id) / "theme.json", manifest)
         self._remove_asset_if_unreferenced(theme_id, manifest, previous)
         return _merge_theme(BUILTIN_THEMES[manifest["extends"]], manifest)
@@ -466,9 +519,7 @@ class ThemeRepository:
     def read_asset(self, theme_id: str, asset_path: str) -> tuple[str, bytes]:
         manifest = self._read_manifest(theme_id)
         asset_path = _validate_asset_reference(asset_path, "asset_path")
-        referenced_assets = {
-            region["image"] for region in manifest["regions"].values() if region["image"]
-        }
+        referenced_assets = _manifest_asset_references(manifest)
         if asset_path not in referenced_assets:
             raise ThemeError("asset_not_found", "asset_path", "图片资源未被主题引用")
         asset = self._asset_file(theme_id, asset_path)
@@ -518,9 +569,7 @@ class ThemeRepository:
         destination = Path(destination)
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
-        referenced_assets = sorted({
-            region["image"] for region in manifest["regions"].values() if region["image"]
-        })
+        referenced_assets = sorted(_manifest_asset_references(manifest))
         try:
             with ZipFile(temporary, "w", compression=ZIP_DEFLATED) as archive:
                 archive.writestr("theme.json", json.dumps(manifest, ensure_ascii=False, indent=2))
@@ -621,10 +670,7 @@ class ThemeRepository:
         return candidate
 
     def _validate_theme_assets(self, theme_dir: Path, manifest: Mapping[str, Any]) -> None:
-        for region in manifest["regions"].values():
-            asset_path = region["image"]
-            if not asset_path:
-                continue
+        for asset_path in _manifest_asset_references(manifest):
             asset_path = _validate_asset_reference(asset_path, "regions.image")
             asset = theme_dir.joinpath(*PurePosixPath(asset_path).parts)
             self._assert_no_symlink_components(asset, asset_path)
@@ -637,9 +683,7 @@ class ThemeRepository:
     def _remove_asset_if_unreferenced(
         self, theme_id: str, manifest: Mapping[str, Any], asset_path: str | None,
     ) -> None:
-        if not asset_path or asset_path in {
-            item["image"] for item in manifest["regions"].values() if item["image"]
-        }:
+        if not asset_path or asset_path in _manifest_asset_references(manifest):
             return
         asset = self._asset_file(theme_id, asset_path)
         try:
@@ -727,9 +771,7 @@ class ThemeRepository:
 
     @staticmethod
     def _validate_zip_theme_entries(infos: list[Any], manifest: Mapping[str, Any]) -> None:
-        referenced_assets = {
-            region["image"] for region in manifest["regions"].values() if region["image"]
-        }
+        referenced_assets = _manifest_asset_references(manifest)
         expected_entries = {"theme.json", *referenced_assets}
         actual_entries = {info.filename for info in infos}
         if actual_entries != expected_entries:

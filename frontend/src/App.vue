@@ -613,7 +613,7 @@ onUnmounted(() => {
   height: 100vh;
   display: flex;
   flex-direction: column;
-  background: var(--bg0);
+  /* 不设背景色：全局背景图（body::before，最底层）可透到各分区间隙 */
   color: var(--text);
   font-family: var(--sans);
   overflow: hidden;
