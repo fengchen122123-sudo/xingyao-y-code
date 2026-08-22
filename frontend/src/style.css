@@ -117,6 +117,7 @@ html {
   --theme-region-accent: var(--theme-workspace-accent, var(--theme-accent));
   --theme-region-bg-opacity: var(--theme-workspace-bg-opacity, 1);
   --theme-region-bg-opacity-pct: var(--theme-workspace-bg-opacity-pct, 100%);
+  --theme-workspace-image-mask-pct: var(--theme-workspace-image-mask-pct, 0%);
   --theme-region-image: var(--theme-workspace-image, none);
   --theme-region-image-opacity: var(--theme-workspace-image-opacity, 1);
   --theme-region-image-size: var(--theme-workspace-image-size, cover);
@@ -210,6 +211,31 @@ html {
   background-position: var(--theme-region-image-position);
   background-repeat: no-repeat;
   opacity: var(--theme-region-image-opacity);
+}
+
+/* 滚动容器特判：overflow-y:auto 的分区（workspace），负 z-index 伪元素会被
+   滚动内容盖住（Chromium 对滚动容器层叠的标准行为，诊断已证实 ::before 画了
+   图但被压在滚动内容下）。改用元素自身 background 承载背景图，永远在内容之下。 */
+[data-theme-region="workspace"] {
+  /* 元素自身多重背景（上层在前）：
+     1) 图片遮罩层——用背景色按 (1-image_opacity) 罩淡图片，模拟独立图片透明度
+     2) 背景图层
+     background-color 承载按 bg-opacity 混合的分区背景色（最底）。 */
+  background-image:
+    linear-gradient(
+      color-mix(in srgb, var(--theme-region-bg) var(--theme-workspace-image-mask-pct, 0%), transparent),
+      color-mix(in srgb, var(--theme-region-bg) var(--theme-workspace-image-mask-pct, 0%), transparent)
+    ),
+    var(--theme-region-image);
+  background-size: cover, var(--theme-region-image-size);
+  background-position: center, var(--theme-region-image-position);
+  background-repeat: no-repeat;
+  background-color: color-mix(in srgb, var(--theme-region-bg) var(--theme-region-bg-opacity-pct), transparent);
+}
+/* workspace 停用伪元素背景，避免与元素自身 background 重复 */
+[data-theme-region="workspace"]::before,
+[data-theme-region="workspace"]::after {
+  content: none;
 }
 
 /* 分区 isolation 会让分区内的下拉/浮层困在分区层级，被 DOM 靠后的
