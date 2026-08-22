@@ -57,4 +57,33 @@ describe('GUI theme startup error gate', () => {
 
     wrapper.unmount();
   });
+
+  it('shows the theme preview bar over the real home and returns to the editor', async () => {
+    const store = useAppStore();
+    store.initialized = true;
+    store.guiThemeError = null;
+    store.messages = [{ role: 'user', content: 'hello' }];
+    store.themePreviewMode = true;
+    store.settingsOpen = false;
+    const wrapper = mount(App, {
+      global: {
+        stubs: {
+          Topbar: true, Sidebar: true, KimiEmptyState: true, TurnGroup: true,
+          InputArea: true, RightPanel: true, ConfirmModal: true, UpdateModal: true,
+          PermCard: true, ImageLightbox: true, Subpage: true, SettingsPage: true, AppIcon: true,
+        },
+      },
+    });
+
+    // 预览模式 + 设置页已收起：浮条覆盖在真实首页上
+    const bar = wrapper.get('[data-test="theme-preview-bar"]');
+    expect(bar.text()).toContain('正在预览主题效果');
+    expect(wrapper.find('#main').exists()).toBe(true);
+
+    await wrapper.get('[data-test="preview-back"]').trigger('click');
+    expect(store.themePreviewMode).toBe(false);
+    expect(store.settingsOpen).toBe(true);
+
+    wrapper.unmount();
+  });
 });

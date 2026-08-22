@@ -62,16 +62,10 @@
             <button data-test="cancel-theme" type="button" :disabled="busy" @click="cancelEdits">取消</button>
           </template>
           <button data-test="toggle-preview" type="button" :disabled="busy" @click="togglePreview">
-            {{ previewOpen ? '关闭预览' : '预览效果' }}
+            预览效果
           </button>
         </div>
       </header>
-
-      <!-- 内嵌迷你预览：点击“预览效果”时用当前草稿生成，非实时 -->
-      <div v-if="previewOpen" class="preview-panel">
-        <ThemePreviewMock v-if="previewData" :preview="previewData" />
-        <p v-else class="preview-hint">{{ previewError || '正在生成预览…' }}</p>
-      </div>
 
       <div v-if="actionError" data-test="theme-action-error" class="theme-action-error">{{ actionError }}</div>
 
@@ -170,8 +164,6 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue';
 import ThemeRegionEditor from './theme/ThemeRegionEditor.vue';
-import ThemePreviewMock from './theme/ThemePreviewMock.vue';
-import { resolveThemePreview, type ResolvedThemePreview } from '../themes/runtime';
 import { useAppStore } from '../stores/appStore';
 import type {
   GuiTheme,
@@ -261,37 +253,14 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true;
-  previewData.value?.dispose();
 });
 
-// ── 内嵌预览：点击“预览效果”用当前草稿生成迷你首页，非实时；再次点击关闭 ──
-const previewOpen = ref(false);
-const previewData = shallowRef<ResolvedThemePreview | null>(null);
-const previewError = ref('');
-
-async function togglePreview() {
-  if (previewOpen.value) {
-    previewOpen.value = false;
-    previewData.value?.dispose();
-    previewData.value = null;
-    previewError.value = '';
-    return;
-  }
+// ── 预览：收起设置遮罩，直接看真实首页（草稿已实时渲染到真实 DOM）。
+//    顶部浮条由 App.vue 在 themePreviewMode 时显示，提供返回编辑。──
+function togglePreview() {
   if (!draft.value) return;
-  previewOpen.value = true;
-  previewError.value = '';
-  previewData.value?.dispose();
-  previewData.value = null;
-  const api = (window as any).pywebview?.api;
-  if (!api) {
-    previewError.value = '预览不可用：后端桥未就绪';
-    return;
-  }
-  try {
-    previewData.value = await resolveThemePreview(clone(draft.value), api);
-  } catch (error) {
-    previewError.value = error instanceof Error ? error.message : '预览生成失败';
-  }
+  store.themePreviewMode = true;
+  store.settingsOpen = false;
 }
 
 // 设置页用 v-show 常驻本组件，切换分区不丢草稿；关闭设置页前用它做脏检查。
@@ -329,6 +298,7 @@ function onAppImageChange(value: GuiTheme['app_image']) {
 // ── 主题切换（含脏编辑守卫：保存 / 放弃 / 留在当前） ──
 async function selectTheme(summary: GuiThemeSummary) {
   if (busy.value || summary.id === activeThemeId.value) return;
+  store.themePreviewMode = false;
   busy.value = true;
   try {
     if (hasLocalChanges.value) {
@@ -367,6 +337,7 @@ async function selectTheme(summary: GuiThemeSummary) {
 // ── 保存 / 取消 ──
 async function saveTheme() {
   if (busy.value || !draft.value || !fieldsValid.value) return;
+  store.themePreviewMode = false;
   busy.value = true;
   const snapshot = clone(draft.value);
   try {
@@ -393,6 +364,7 @@ async function saveTheme() {
 
 async function cancelEdits() {
   if (busy.value) return;
+  store.themePreviewMode = false;
   busy.value = true;
   try {
     const result = await store.cancelGuiThemePreview();
@@ -659,8 +631,6 @@ async function clearGlobalInherit() {
 .builtin-hint { font-size: 11.5px; color: var(--text-faint); }
 .theme-action-error { margin-top: 14px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--red) 45%, var(--border)); border-radius: 9px; background: color-mix(in srgb, var(--red) 8%, var(--bg2)); color: var(--red); font-size: 12px; }
 .region-tabs { display: flex; flex-wrap: wrap; gap: 7px; margin: 18px 0 16px; }
-.preview-panel { margin-top: 16px; }
-.preview-hint { padding: 24px; text-align: center; color: var(--text-faint); font-size: 12.5px; }
 .region-tabs button { padding: 7px 12px; border: 1px solid var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); font-size: 12px; }
 .region-tabs button:hover { color: var(--text); background: var(--bg2); }
 .region-tabs button.active { background: var(--bg3); color: var(--text); border-color: var(--accent); }
