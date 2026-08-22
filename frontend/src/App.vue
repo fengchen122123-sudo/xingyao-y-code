@@ -144,6 +144,23 @@
         <div class="sp-bar"><i></i></div>
       </div>
     </Transition>
+
+    <!-- frameless 关闭确认（现代样式，替代 win32 原生 MessageBox） -->
+    <div v-if="store.closeConfirm.show" class="close-confirm-mask" data-test="close-confirm">
+      <div class="close-confirm-card">
+        <h3>有对话回合仍在执行</h3>
+        <p>关闭窗口前，请选择如何处理正在运行的任务。</p>
+        <div class="cc-actions">
+          <button v-if="store.closeConfirm.trayAvailable" class="cc-btn" data-test="cc-background" @click="store.resolveCloseConfirm('background')">
+            最小化到托盘继续
+          </button>
+          <button class="cc-btn danger" data-test="cc-exit" @click="store.resolveCloseConfirm('exit')">
+            停止任务并退出
+          </button>
+          <button class="cc-btn ghost" data-test="cc-cancel" @click="store.resolveCloseConfirm('cancel')">取消</button>
+        </div>
+      </div>
+    </div>
     </template>
   </div>
 </template>
@@ -430,6 +447,41 @@ onUnmounted(() => {
 
 <style scoped>
 /* 主题预览浮条：设置页预览效果时置顶显示 */
+/* frameless 关闭确认（现代三选框） */
+.close-confirm-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(6px);
+}
+.close-confirm-card {
+  width: min(420px, calc(100vw - 48px));
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  background: var(--bg1);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+.close-confirm-card h3 { margin: 0 0 8px; font-size: 16px; }
+.close-confirm-card p { margin: 0 0 18px; color: var(--text-dim); font-size: 13px; line-height: 1.6; }
+.cc-actions { display: flex; flex-direction: column; gap: 8px; }
+.cc-btn {
+  min-height: 38px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--bg2);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+  transition: border-color 0.12s, background 0.12s;
+}
+.cc-btn:hover { border-color: var(--accent); }
+.cc-btn.danger { color: var(--red); border-color: color-mix(in srgb, var(--red) 45%, var(--border)); }
+.cc-btn.danger:hover { background: color-mix(in srgb, var(--red) 10%, var(--bg2)); }
+.cc-btn.ghost { background: transparent; color: var(--text-dim); }
 .theme-preview-bar {
   position: sticky;
   top: 0;

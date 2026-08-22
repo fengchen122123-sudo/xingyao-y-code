@@ -8,11 +8,9 @@
       <div><span class="name">Y-CODE</span></div>
     </div>
 
-    <!-- 标题栏拖拽区：双击最大化/还原；只有这块 pywebview-drag-region 可拖动窗口 -->
-    <div
-      class="titlebar-drag pywebview-drag-region"
-      @dblclick="toggleMaximize"
-    ></div>
+    <!-- 标题栏拖拽区：矩形上报后端，WM_NCHITTEST 返回 HTCAPTION——
+         系统原生拖拽 / 双击最大化 / Aero Snap / 动画全部原生 -->
+    <div ref="dragRegionRef" class="titlebar-drag"></div>
 
     <!-- 软件更新提示按钮：发现新版本或下载就绪时展示 -->
     <button
@@ -50,7 +48,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 
@@ -58,6 +56,7 @@ const store = useAppStore();
 
 // 自绘标题栏窗口控制：通过 pywebview 桥调用，窗体控制按钮颜色随主题
 const maximized = ref(false);
+const dragRegionRef = ref<HTMLElement | null>(null);
 const api = () => (window as any).pywebview?.api;
 
 async function toggleMaximize() {
@@ -72,9 +71,37 @@ function winClose() {
   void api()?.window_close?.();
 }
 
+// 拖拽区矩形上报（物理像素）：HTCAPTION 区域由 WM_NCHITTEST 判定，窗口 resize
+// 或布局变化时更新；客户区坐标系下窗口移动不影响矩形
+let resizeObserver: ResizeObserver | null = null;
+function reportDragRegion() {
+  const el = dragRegionRef.value;
+  if (!el) return;
+  const rect = el.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  void api()?.notify_drag_region?.(
+    Math.round(rect.x * dpr), Math.round(rect.y * dpr),
+    Math.round(rect.width * dpr), Math.round(rect.height * dpr),
+  );
+}
 onMounted(async () => {
-  const result = await api()?.window_is_maximized?.();
-  if (result?.ok) maximized.value = !!result.maximized;
+  try {
+    const result = await api()?.window_is_maximized?.();
+    if (result?.ok) maximized.value = !!result.maximized;
+  } catch {
+    // 桥未就绪（浏览器开发态）时忽略
+  }
+  reportDragRegion();
+  // jsdom 等环境无 ResizeObserver；窗口 resize 兜底上报
+  if (typeof ResizeObserver !== 'undefined') {
+    resizeObserver = new ResizeObserver(() => reportDragRegion());
+    if (dragRegionRef.value) resizeObserver.observe(dragRegionRef.value);
+  }
+  window.addEventListener('resize', reportDragRegion);
+});
+onBeforeUnmount(() => {
+  resizeObserver?.disconnect();
+  window.removeEventListener('resize', reportDragRegion);
 });
 
 const topbarUpdateLabel = computed(() => {

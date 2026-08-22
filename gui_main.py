@@ -446,6 +446,10 @@ def main():
         icon_path=os.path.join(_get_base_dir(), "assets", "ycode.ico"),
         has_running_work=api.has_active_turns,
     )
+    # frameless 自绘标题栏的关闭确认走前端现代确认框：注入托盘就绪查询与
+    # 完整退出序列（取消回合 → drain → destroy），托盘/系统关机路径不变
+    api._tray_ready_flag = lambda: lifecycle.is_tray_ready()
+    api._exit_application = lifecycle.exit_application
     lifecycle.start_tray()
     window.events.closing += lifecycle.on_closing
 

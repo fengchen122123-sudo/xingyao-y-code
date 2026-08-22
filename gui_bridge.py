@@ -531,17 +531,65 @@ class ApiBridge:
             return {"ok": False, "error": str(error)}
 
     def window_close(self) -> Dict[str, Any]:
-        """关闭窗口：走 destroy 触发 closing 事件，由生命周期层做退出确认。"""
+        """关闭（frameless 自绘按钮）：推送 close_requested 事件，由前端弹现代确认框；
+        托盘退出、系统关机等其它关闭路径仍走原生 closing 流程兜底。"""
         try:
-            if self._window is not None:
-                self._window.destroy()
+            if self._window is None:
+                return {"ok": False, "error": "窗口未就绪"}
+            self.emit_event("close_requested", {
+                "has_running_work": self.has_active_turns(),
+                "tray_available": self._tray_available(),
+            })
             return {"ok": True}
         except Exception as error:  # noqa: BLE001
-            logger.warning("窗口关闭失败: %s", error)
+            logger.warning("关闭请求派发失败: %s", error)
             return {"ok": False, "error": str(error)}
+
+    def window_confirm_close(self, choice: str) -> Dict[str, Any]:
+        """前端确认框结果：exit（停止回合并退出）/ background（托盘驻留）/ cancel。"""
+        try:
+            if choice == "cancel":
+                return {"ok": True}
+            if choice == "background":
+                self._window.hide()
+                return {"ok": True}
+            if choice == "exit":
+                self._lifecycle_exit()
+                return {"ok": True}
+            return {"ok": False, "error": f"未知选择: {choice}"}
+        except Exception as error:  # noqa: BLE001
+            logger.warning("关闭确认执行失败: %s", error)
+            return {"ok": False, "error": str(error)}
+
+    def _tray_available(self) -> bool:
+        """托盘是否就绪（由 ApplicationLifecycle 注入，未注入按不可用）。"""
+        try:
+            return bool(getattr(self, "_tray_ready_flag", lambda: False)())
+        except Exception:
+            return False
+
+    def _lifecycle_exit(self) -> None:
+        """走完整退出序列（取消回合 → drain → destroy）；无生命周期时直接 destroy。"""
+        exit_fn = getattr(self, "_exit_application", None)
+        if callable(exit_fn):
+            exit_fn()
+        else:
+            self._window.destroy()
 
     def window_is_maximized(self) -> Dict[str, Any]:
         return {"ok": True, "maximized": bool(getattr(self, "_frameless_maximized", False))}
+
+    def notify_drag_region(self, x: float, y: float, w: float, h: float) -> Dict[str, Any]:
+        """前端上报标题栏拖拽区矩形（CSS 像素 × devicePixelRatio 已含在内由前端换算）。
+        WM_NCHITTEST 据此把该区域作为 HTCAPTION：系统原生拖拽、双击最大化、Aero Snap。"""
+        try:
+            from core.frameless import set_drag_region
+
+            set_drag_region(int(x), int(y), int(w), int(h))
+            return {"ok": True}
+        except Exception as error:  # noqa: BLE001
+            logger.warning("登记标题栏拖拽区失败: %s", error)
+            return {"ok": False, "error": str(error)}
 
     def shutdown(self) -> None:
         """Idempotently stop GUI-owned work before the native window is destroyed."""
@@ -658,11 +706,12 @@ class ApiBridge:
             logger.debug("查找窗口句柄失败", exc_info=True)
 
     def _enable_frameless_resize(self):
-        """frameless 窗口恢复边缘调整大小与 Aero Snap（WM_NCHITTEST 子类化）。"""
+        """frameless 窗口恢复原生行为：边缘调整大小、HTCAPTION 拖拽（Aero Snap）、
+        最小化/最大化动画（WM_NCHITTEST 双窗口子类化 + 样式位）。"""
         try:
             import webview.platforms.winforms as wf
 
-            from core.frameless import subclass_frameless_resize
+            from core.frameless import enable_native_window_behaviors
 
             # 轮询等待 BrowserForm 注册（pywebview 在 webview.start 后才创建）
             import time as _time
@@ -671,12 +720,12 @@ class ApiBridge:
             for _ in range(60):
                 form = wf.BrowserView.instances.get(uid)
                 if form is not None and form.Handle is not None and form.Handle.ToInt32() != 0:
-                    subclass_frameless_resize(form)
+                    enable_native_window_behaviors(form)
                     return
                 _time.sleep(0.2)
-            logger.warning("frameless 边缘调整大小：BrowserForm 未就绪，未启用")
+            logger.warning("frameless 原生窗口行为：BrowserForm 未就绪，未启用")
         except Exception:
-            logger.warning("frameless 边缘调整大小初始化失败", exc_info=True)
+            logger.warning("frameless 原生窗口行为初始化失败", exc_info=True)
 
     @staticmethod
     def _find_own_hwnd(title: str) -> int:

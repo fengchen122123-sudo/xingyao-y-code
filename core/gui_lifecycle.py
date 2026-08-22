@@ -81,6 +81,11 @@ class ApplicationLifecycle:
             self._tray_ready = True
         return True
 
+    def is_tray_ready(self) -> bool:
+        """托盘是否就绪（frameless 前端关闭确认框据决定是否提供后台驻留选项）。"""
+        with self._lock:
+            return self._tray_ready
+
     def on_closing(self):
         """pywebview closing callback: False cancels native close.
 
