@@ -29,6 +29,7 @@ from ctypes import wintypes
 logger = logging.getLogger(__name__)
 
 WM_NCHITTEST = 0x0084
+WM_NCCALCSIZE = 0x0083
 HTCLIENT = 1
 HTTRANSPARENT = -1
 HTCAPTION = 2
@@ -241,6 +242,10 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
     orig_children: dict = {}
 
     def _parent_wndproc(hwnd_arg, msg, wparam, lparam):
+        # WM_NCCALCSIZE：THICKFRAME 无边框窗口顶部会残留一条黑色伪标题栏
+        # （non-client 顶部条）。wParam=1 时返回 0 清空非客户区，黑线消失。
+        if msg == WM_NCCALCSIZE and wparam:
+            return 0
         # 顶层窗口：穿透上来的命中 → 边框码（优先，顶部边缘也能 resize）/
         # 拖拽区 HTCAPTION
         if msg == WM_NCHITTEST:
