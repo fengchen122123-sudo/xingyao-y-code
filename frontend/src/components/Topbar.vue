@@ -8,11 +8,13 @@
       <div><span class="name">Y-CODE</span></div>
     </div>
 
-    <!-- 标题栏拖拽区：矩形上报后端，WM_NCHITTEST 返回 HTCAPTION——系统原生
-         拖拽/双击最大化/Aero Snap 全部原生；pywebview-drag-region 作为兜底：
-         子类化未生效时 pywebview 的 JS 拖拽仍能移动窗口（HTCAPTION 生效时
-         JS 收不到 mousedown，二者不冲突） -->
-    <div ref="dragRegionRef" class="titlebar-drag pywebview-drag-region"></div>
+    <!-- 标题栏拖拽区：pywebview JS 拖拽（WebView2 深层窗口属跨进程层，
+         HTCAPTION 不可达，JS 拖拽为主）；矩形仍上报后端供宿主边缘层判定 -->
+    <div
+      ref="dragRegionRef"
+      class="titlebar-drag pywebview-drag-region"
+      @dblclick="toggleMaximize"
+    ></div>
 
     <!-- 软件更新提示按钮：发现新版本或下载就绪时展示 -->
     <button
