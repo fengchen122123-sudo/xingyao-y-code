@@ -139,6 +139,27 @@ describe('applyGuiTheme', () => {
     applied.dispose();
   });
 
+  it('global image also makes region background colors transparent', async () => {
+    const value = themeWithWorkspaceImage();
+    value.app_image.image = 'assets/global.png';
+    // 分区背景设为不透明——全局图模式下仍必须强制透明，否则实底盖住全局图
+    value.regions.workspace.background_opacity = 1;
+    const api = fakeApiWithAsset();
+
+    const applied = await applyGuiTheme(value, api);
+
+    expect(document.documentElement.style.getPropertyValue('--theme-workspace-bg-opacity-pct')).toBe('0%');
+    // 原始 0-1 值仍如实写入（供编辑器回读）
+    expect(document.documentElement.style.getPropertyValue('--theme-workspace-bg-opacity')).toBe('1');
+    applied.dispose();
+
+    // 移除全局图后分区背景透明度恢复用户设置
+    value.app_image.image = null;
+    const restored = await applyGuiTheme(value, api);
+    expect(document.documentElement.style.getPropertyValue('--theme-workspace-bg-opacity-pct')).toBe('100%');
+    restored.dispose();
+  });
+
   it('reuses a blob URL when multiple regions reference the same asset', async () => {
     const value = themeWithWorkspaceImage();
     value.regions.app_header.image = 'assets/workspace.webp';
