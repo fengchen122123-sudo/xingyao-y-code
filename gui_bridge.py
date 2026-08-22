@@ -661,6 +661,22 @@ class ApiBridge:
     def _on_window_frame_event(self):
         """窗口框架事件回调：DWM 重建非客户区后重设标题栏主题（线程内延迟执行）。"""
         self._start_reapply_thread()
+        # frameless：WebView2 子窗口在页面加载时可能销毁重建，loaded 事件后重装
+        if self._is_frameless():
+            self._schedule_frameless_reinstall()
+
+    def _schedule_frameless_reinstall(self):
+        """延迟多次重装子窗口子类化（覆盖 WebView2 加载期间窗口销毁重建）。"""
+        def _work():
+            import time as _t
+            for delay in (0.5, 2.0, 5.0):
+                _t.sleep(delay)
+                try:
+                    self._enable_frameless_resize()
+                except Exception:
+                    logger.debug("frameless 重装子类化失败", exc_info=True)
+
+        threading.Thread(target=_work, daemon=True, name="gui-frameless-reinstall").start()
 
     def _start_reapply_thread(self, name: str = "gui-titlebar-event-reapply"):
         """启动标题栏主题延迟重设线程；上一个还在跑就复用。

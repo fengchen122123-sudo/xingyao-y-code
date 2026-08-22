@@ -117,8 +117,12 @@ def _in_drag_region(hwnd: int, lparam: int) -> bool:
     return x <= point.x < x + w and y <= point.y < y + h
 
 
-def find_webview_child_hwnd(parent_hwnd: int) -> int:
-    """枚举直接子窗口，返回第一个子窗口句柄（WebView2 渲染窗口）。"""
+def find_webview_child_hwnds(parent_hwnd: int) -> list[int]:
+    """枚举全部后代窗口（EnumChildWindows 递归），返回句柄列表。
+
+    WebView2 的鼠标命中发生在最深层后代（Chrome_WidgetWin_0 常有嵌套层级），
+    只子类化第一层不够；且页面加载时这些窗口会销毁重建，调用方需延迟重装。
+    """
     found: list[int] = []
 
     @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -127,7 +131,7 @@ def find_webview_child_hwnd(parent_hwnd: int) -> int:
         return True
 
     _u32.EnumChildWindows(parent_hwnd, _cb, 0)
-    return found[0] if found else 0
+    return found
 
 
 def set_drag_region(x: int, y: int, w: int, h: int) -> None:
@@ -148,7 +152,9 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
     if hwnd == 0:
         return False
 
-    state: dict = {"orig_parent": None, "orig_child": None, "child": 0, "ok": False, "error": None}
+    state: dict = {"orig_parent": None, "ok": False, "error": None}
+    # 每个子窗口的原过程按句柄记录（子类化多个后代，闭包共享）
+    orig_children: dict = {}
 
     def _parent_wndproc(hwnd_arg, msg, wparam, lparam):
         # 顶层窗口：WebView2 穿透上来的命中 → HTCAPTION / 边框码
@@ -171,7 +177,10 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
             edge = _edge_code(hwnd_arg, lparam, border)
             if edge is not None:
                 return HTTRANSPARENT
-        return _u32.CallWindowProcW(state["orig_child"], hwnd_arg, msg, wparam, lparam)
+        orig = orig_children.get(hwnd_arg)
+        if orig is None:
+            return 0  # 未记录原过程：保守放行默认
+        return _u32.CallWindowProcW(orig, hwnd_arg, msg, wparam, lparam)
 
     # 保持引用防 GC
     parent_proc_ref = _WNDPROC(_parent_wndproc)
@@ -191,20 +200,26 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
                     state["error"] = "parent SetWindowLongPtrW failed"
                     return
                 _SUBCLASSED[hwnd] = parent_proc_ref
-            # 3. WebView2 子窗口子类化
-            child = find_webview_child_hwnd(hwnd)
-            if not child:
+            # 3. WebView2 全部后代窗口子类化（命中测试发生在最深层后代，
+            #    且页面加载时这些窗口可能销毁重建——新句柄在此幂等补装）
+            children = find_webview_child_hwnds(hwnd)
+            if not children:
                 state["error"] = "no webview child hwnd"
                 return
-            if child not in _SUBCLASSED:
-                state["child"] = child
-                state["orig_child"] = _u32.SetWindowLongPtrW(
+            installed_children = 0
+            for child in children:
+                if child in _SUBCLASSED:
+                    installed_children += 1
+                    continue
+                orig = _u32.SetWindowLongPtrW(
                     child, GWLP_WNDPROC, ctypes.cast(child_proc_ref, ctypes.c_void_p).value,
                 )
-                if state["orig_child"] in (None, 0):
-                    state["error"] = "child SetWindowLongPtrW failed"
-                    return
+                if orig in (None, 0):
+                    continue  # 单个后代失败不阻塞其它
+                orig_children[child] = orig  # 记录该句柄的原过程，供 _child_wndproc 转发
                 _SUBCLASSED[child] = child_proc_ref
+                installed_children += 1
+            state["children"] = installed_children
             state["ok"] = True
         except Exception as error:  # noqa: BLE001 - 安装失败绝不带出 GUI 线程
             state["error"] = str(error)
@@ -220,5 +235,5 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
     if not state["ok"]:
         logger.warning("frameless 原生窗口行为启用失败: %s", state["error"])
         return False
-    logger.info("frameless 原生窗口行为已启用 (parent=%s child=%s)", hwnd, state["child"])
+    logger.info("frameless 原生窗口行为已启用 (parent=%s children=%s)", hwnd, state.get("children"))
     return True
