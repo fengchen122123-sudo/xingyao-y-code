@@ -1,23 +1,28 @@
-"""无边框窗口的原生窗口行为支持。
+"""无边框（frameless）窗口的原生窗口行为支持。
 
 frameless 窗口（FormBorderStyle.None）默认丢失：边缘拖拽调整大小、Aero Snap、
-最小化/最大化动画。本模块恢复它们：
+最小化/最大化动画。本模块恢复它们，方案按实测约束分层：
 
-1. 子类化顶层窗口（WinForms Form）：加回 WS_MINIMIZEBOX/WS_MAXIMIZEBOX 样式位
-   （恢复最小化动画与任务栏交互），并对 WebView2 穿透上来的命中返回
-   HTCAPTION（标题栏拖拽区）或边框码（边缘调整）。
-2. 子类化 WebView2 子窗口：真实鼠标命中测试发生在子窗口上。命中在
-   「标题栏拖拽区矩形」或「窗口边缘」内时返回 HTTRANSPARENT，让 Windows
-   继续对父窗口做命中测试，父窗口再返回 HTCAPTION/边框码——系统随即接管，
-   原生 resize / 拖拽 / Aero Snap / 动画全部生效。
+1. 窗口样式位（GUI 线程内 SetWindowLong）：
+   - WS_MINIMIZEBOX | WS_MAXIMIZEBOX：恢复最小化动画、双击最大化、任务栏交互
+   - WS_THICKFRAME：Aero Snap 的硬前提（缺它 Win+方向键无效）；副作用是系统
+     画 1px 边框，颜色经 DWMWA_BORDER_COLOR 色板跟随主题（浅色主题无黑边）
+2. WM_NCCALCSIZE 拦截（wParam=1 → 返回 0）：清空非客户区，消除 THICKFRAME
+   无边框窗口顶部的黑色伪标题栏残留条
+3. WebView2 边缘缩进（_inset_webview）：WebView2 控件四周缩进 RESIZE_BORDER
+   像素。跨进程约束：WebView2 深层渲染窗口（Chrome_WidgetWin_1 /
+   RenderWidgetHostHWND）属于 msedgewebview2.exe，宿主无法子类化它们，而
+   真实鼠标命中恰发生在那层——缩进后边缘带只被宿主进程窗口覆盖，
+   鼠标在边缘命中宿主 → 返回边框码 → 系统原生 resize（带动画）
+4. 宿主侧窗口子类化（WM_NCHITTEST）：边缘返回边框码（优先）、标题栏拖拽区
+   矩形内返回 HTCAPTION；标题栏拖拽由前端 mousedown 触发 window_begin_drag
+   （SC_MOVE+HTCAPTION 原生移动循环），松手后按光标贴边补发 Win+方向键
+   触发系统 Aero Snap
+5. 周期补装定时器（90 秒）：宿主侧后代窗口在页面渲染期间可能销毁重建，
+   幂等补装子类化与缩进
 
 线程安全：SetWindowLongPtrW 跨线程子类化不可靠，必须通过 form.Invoke 在
-WinForms GUI 线程内执行（实测验证）。HTTRANSPARENT 只对同线程子窗口有效，
-WebView2 子窗口与宿主同在 UI 线程，满足条件。
-
-拖拽区矩形：前端把标题栏拖拽区在客户区内的矩形（物理像素）上报给
-set_drag_region()。客户区坐标系下窗口移动不改变矩形，仅窗口 resize /
-前端布局变化时需要更新。
+WinForms GUI 线程内执行（实测验证）。
 """
 
 from __future__ import annotations
