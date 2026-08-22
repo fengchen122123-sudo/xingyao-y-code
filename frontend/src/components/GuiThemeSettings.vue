@@ -58,17 +58,20 @@
             <button data-test="rename-theme" type="button" :disabled="busy" @click="openRenameDialog">重命名</button>
             <button data-test="export-theme" type="button" :disabled="busy" @click="exportTheme">导出 ZIP</button>
             <button data-test="delete-theme" type="button" :disabled="busy" class="danger" @click="deleteActiveTheme">删除</button>
-            <button
-              data-test="save-theme"
-              class="primary-button"
-              type="button"
-              :disabled="busy || !fieldsValid"
-              @click="saveTheme"
-            >保存</button>
+            <button data-test="save-theme" class="primary-button" type="button" :disabled="busy || !fieldsValid" @click="saveTheme">保存</button>
             <button data-test="cancel-theme" type="button" :disabled="busy" @click="cancelEdits">取消</button>
           </template>
+          <button data-test="toggle-preview" type="button" :disabled="busy" @click="togglePreview">
+            {{ previewOpen ? '关闭预览' : '预览效果' }}
+          </button>
         </div>
       </header>
+
+      <!-- 内嵌迷你预览：点击“预览效果”时用当前草稿生成，非实时 -->
+      <div v-if="previewOpen" class="preview-panel">
+        <ThemePreviewMock v-if="previewData" :preview="previewData" />
+        <p v-else class="preview-hint">{{ previewError || '正在生成预览…' }}</p>
+      </div>
 
       <div v-if="actionError" data-test="theme-action-error" class="theme-action-error">{{ actionError }}</div>
 
@@ -100,8 +103,12 @@
         :key="`global:${draft.id}`"
         mode="global"
         :model-value="draft.tokens"
+        :app-image="draft.app_image"
         :disabled="isBuiltin"
         @update:model-value="onTokensChange"
+        @update:app-image="onAppImageChange"
+        @choose-image="chooseImage"
+        @remove-image="removeImage"
         @clear-overrides="clearGlobalInherit"
         @validity="fieldsValid = $event"
       />
@@ -163,6 +170,8 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, shallowRef } from 'vue';
 import ThemeRegionEditor from './theme/ThemeRegionEditor.vue';
+import ThemePreviewMock from './theme/ThemePreviewMock.vue';
+import { resolveThemePreview, type ResolvedThemePreview } from '../themes/runtime';
 import { useAppStore } from '../stores/appStore';
 import type {
   GuiTheme,
@@ -252,7 +261,38 @@ onMounted(() => {
 
 onUnmounted(() => {
   disposed = true;
+  previewData.value?.dispose();
 });
+
+// ── 内嵌预览：点击“预览效果”用当前草稿生成迷你首页，非实时；再次点击关闭 ──
+const previewOpen = ref(false);
+const previewData = shallowRef<ResolvedThemePreview | null>(null);
+const previewError = ref('');
+
+async function togglePreview() {
+  if (previewOpen.value) {
+    previewOpen.value = false;
+    previewData.value?.dispose();
+    previewData.value = null;
+    previewError.value = '';
+    return;
+  }
+  if (!draft.value) return;
+  previewOpen.value = true;
+  previewError.value = '';
+  previewData.value?.dispose();
+  previewData.value = null;
+  const api = (window as any).pywebview?.api;
+  if (!api) {
+    previewError.value = '预览不可用：后端桥未就绪';
+    return;
+  }
+  try {
+    previewData.value = await resolveThemePreview(clone(draft.value), api);
+  } catch (error) {
+    previewError.value = error instanceof Error ? error.message : '预览生成失败';
+  }
+}
 
 // 设置页用 v-show 常驻本组件，切换分区不丢草稿；关闭设置页前用它做脏检查。
 defineExpose({
@@ -277,6 +317,12 @@ function onTokensChange(value: EditorModel) {
 function onNativeChange(value: EditorModel) {
   if (!draft.value) return;
   draft.value.native_titlebar = value as NativeTitlebarTheme;
+  schedulePreview();
+}
+
+function onAppImageChange(value: GuiTheme['app_image']) {
+  if (!draft.value) return;
+  draft.value.app_image = value;
   schedulePreview();
 }
 
@@ -492,15 +538,20 @@ async function exportTheme() {
   }
 }
 
-// ── 分区背景图 ──
+// ── 分区/全局背景图 ──
+function imageScope(): string {
+  return selectedRegion.value === 'global' ? 'app' : (selectedRegion.value as string);
+}
+
 async function chooseImage() {
   if (!draft.value || busy.value) return;
-  const regionId = selectedRegion.value as ThemeRegionId;
+  const scope = imageScope();
   busy.value = true;
   try {
-    const result = await store.importGuiThemeImage(draft.value.id, regionId);
+    const result = await store.importGuiThemeImage(draft.value.id, scope as ThemeRegionId);
     if (result.ok) {
-      draft.value.regions[regionId].image = result.asset_path;
+      if (scope === 'app') draft.value.app_image.image = result.asset_path;
+      else draft.value.regions[scope as ThemeRegionId].image = result.asset_path;
       actionError.value = '';
       schedulePreview();
     } else if (result.error.code !== 'dialog_cancelled') {
@@ -513,13 +564,14 @@ async function chooseImage() {
 
 async function removeImage() {
   if (!draft.value || busy.value) return;
-  const regionId = selectedRegion.value as ThemeRegionId;
+  const scope = imageScope();
   busy.value = true;
   try {
-    const result = await store.removeGuiThemeImage(draft.value.id, regionId);
+    const result = await store.removeGuiThemeImage(draft.value.id, scope as ThemeRegionId);
     if (result.ok) {
-      // 只清图片引用，保留该分区其他未保存编辑；完整草稿随保存写回。
-      draft.value.regions[regionId].image = null;
+      // 只清图片引用，保留该分区/全局其他未保存编辑；完整草稿随保存写回。
+      if (scope === 'app') draft.value.app_image.image = null;
+      else draft.value.regions[scope as ThemeRegionId].image = null;
       actionError.value = '';
       schedulePreview();
     } else {
@@ -607,6 +659,8 @@ async function clearGlobalInherit() {
 .builtin-hint { font-size: 11.5px; color: var(--text-faint); }
 .theme-action-error { margin-top: 14px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--red) 45%, var(--border)); border-radius: 9px; background: color-mix(in srgb, var(--red) 8%, var(--bg2)); color: var(--red); font-size: 12px; }
 .region-tabs { display: flex; flex-wrap: wrap; gap: 7px; margin: 18px 0 16px; }
+.preview-panel { margin-top: 16px; }
+.preview-hint { padding: 24px; text-align: center; color: var(--text-faint); font-size: 12.5px; }
 .region-tabs button { padding: 7px 12px; border: 1px solid var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); font-size: 12px; }
 .region-tabs button:hover { color: var(--text); background: var(--bg2); }
 .region-tabs button.active { background: var(--bg3); color: var(--text); border-color: var(--accent); }

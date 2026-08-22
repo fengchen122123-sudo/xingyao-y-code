@@ -29,6 +29,7 @@ function builtinTheme(id: 'builtin.light' | 'builtin.dark'): GuiTheme {
       background: region.background, text: region.text, border: region.border,
       mode: light ? 'light' : 'dark',
     },
+    app_image: { image: null, image_opacity: 1, image_size: 'cover' as const, image_position: 'center' as const },
     regions: Object.fromEntries(regionIds.map(regionId => [regionId, { ...region }])) as GuiTheme['regions'],
   };
 }
