@@ -1,11 +1,12 @@
 <template>
   <div class="settings-page">
     <aside class="settings-nav">
-      <button class="back-workspace" @click="store.closeModelSettings()"><AppIcon name="arrow-left" :size="14" /> 返回工作区</button>
+      <button class="back-workspace" @click="attemptCloseSettings"><AppIcon name="arrow-left" :size="14" /> 返回工作区</button>
       <div class="nav-section">基础设置</div>
       <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span class="nav-ico"><AppIcon name="file" :size="14" /></span>模型配置</button>
       <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
+      <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
       <div class="nav-spacer"></div>
@@ -355,7 +356,21 @@
           <p v-else class="changelog-empty">更新内容加载中…</p>
         </section>
       </template>
-      <TokenUsageSettings v-else />
+      <TokenUsageSettings v-else-if="activeSection === 'tokens'" />
+
+      <!-- 外观与主题常驻挂载（v-show）：切换设置分区不丢失未保存的主题草稿 -->
+      <div v-show="activeSection === 'appearance'" class="appearance-section">
+        <header class="settings-header">
+          <div>
+            <h1>外观与主题</h1>
+            <p>为 GUI 创建、编辑和切换可视化主题；CLI 的 /theme 配置保持独立、互不影响。</p>
+          </div>
+        </header>
+
+        <section class="appearance-settings-card">
+          <GuiThemeSettings ref="themeEditorRef" />
+        </section>
+      </div>
     </main>
 
     <div v-if="modelModal.show" class="modal-mask">
@@ -407,9 +422,10 @@ import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
 import type { ChangelogEntry, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
+import GuiThemeSettings from './GuiThemeSettings.vue';
 
 const store = useAppStore();
-const activeSection = ref<'models' | 'tokens' | 'permissions' | 'about'>('models');
+const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'about'>('models');
 const selectedKind = ref<'preset' | 'provider' | 'custom' | 'secondary'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');
 const showAddProviders = ref(false);
@@ -442,6 +458,19 @@ const modelModal = reactive({
   context_window: 128000,
   supports_vision: false,
 });
+
+// 外观与主题编辑器（常驻挂载，通过 defineExpose 暴露脏检查）
+const themeEditorRef = ref<InstanceType<typeof GuiThemeSettings> | null>(null);
+
+async function attemptCloseSettings() {
+  if (themeEditorRef.value?.isDirty?.()) {
+    const leave = await store.askConfirm(
+      '未保存的主题修改', '', '离开设置页将丢失未保存的主题修改，确定离开？', '直接离开',
+    );
+    if (!leave) return;
+  }
+  store.closeModelSettings();
+}
 
 const selectedPreset = computed(() => selectedKind.value === 'preset'
   ? store.modelPresets.find(item => item.id === selectedId.value)
@@ -854,6 +883,9 @@ onMounted(async () => {
 
 /* ── 权限与沙盒分区 ── */
 .perm-settings-card { max-width: 860px; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
+
+/* ── 外观与主题分区 ── */
+.appearance-settings-card { max-width: 1120px; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 22px 24px; }
 .perm-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--border); }
 .perm-row h3 { margin: 0 0 6px; font-size: 14px; }
 .perm-row p { margin: 0; color: var(--text-faint); font-size: 12.5px; }
