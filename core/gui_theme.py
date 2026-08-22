@@ -272,6 +272,28 @@ def _validate_asset_reference(value: Any, path: str) -> str:
     return asset_path.as_posix()
 
 
+def _read_image_bounded(path: Path, label: str, unreadable: ThemeError) -> bytes:
+    """先检查文件元数据、再有上限地读取，防止超大文件先整块进入内存。
+
+    stat 与读取之间文件可能增长，因此读取上限仍是 _MAX_IMAGE_BYTES + 1，
+    读到的字节数超限同样拒绝。
+    """
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise unreadable from error
+    if size > _MAX_IMAGE_BYTES:
+        raise ThemeError("image_too_large", label, "图片文件不能超过 10 MiB")
+    try:
+        with path.open("rb") as handle:
+            data = handle.read(_MAX_IMAGE_BYTES + 1)
+    except OSError as error:
+        raise unreadable from error
+    if len(data) > _MAX_IMAGE_BYTES:
+        raise ThemeError("image_too_large", label, "图片文件不能超过 10 MiB")
+    return data
+
+
 def _inspect_image(data: bytes, path: str) -> tuple[str, str]:
     if not data:
         raise ThemeError("invalid_image", path, "图片内容为空或无法解析")
@@ -399,10 +421,9 @@ class ThemeRepository:
             raise ThemeError("invalid_region", "region", "主题区域不存在")
         source = Path(source)
         self._assert_no_symlink_components(source, "source")
-        try:
-            data = source.read_bytes()
-        except OSError as error:
-            raise ThemeError("invalid_image", "source", "图片文件无法读取") from error
+        data = _read_image_bounded(
+            source, "source", ThemeError("invalid_image", "source", "图片文件无法读取"),
+        )
         extension, _ = _inspect_image(data, "source")
         relative_path = f"assets/{hashlib.sha256(data).hexdigest()[:16]}.{extension}"
         target = self._asset_file(theme_id, relative_path)
@@ -451,10 +472,9 @@ class ThemeRepository:
         if asset_path not in referenced_assets:
             raise ThemeError("asset_not_found", "asset_path", "图片资源未被主题引用")
         asset = self._asset_file(theme_id, asset_path)
-        try:
-            data = asset.read_bytes()
-        except OSError as error:
-            raise ThemeError("asset_not_found", asset_path, "图片资源不存在") from error
+        data = _read_image_bounded(
+            asset, asset_path, ThemeError("asset_not_found", asset_path, "图片资源不存在"),
+        )
         _, mime_type = _inspect_image(data, asset_path)
         return mime_type, data
 
@@ -556,7 +576,7 @@ class ThemeRepository:
         try:
             with manifest_path.open("r", encoding="utf-8") as handle:
                 manifest = json.load(handle)
-        except (OSError, json.JSONDecodeError) as error:
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
             raise ThemeError("invalid_manifest", "theme.json", "主题清单无法读取") from error
         manifest = _validate_manifest(manifest)
         if manifest["id"] != theme_id:

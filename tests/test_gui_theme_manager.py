@@ -262,6 +262,34 @@ def test_read_asset_returns_validated_mime_type_and_bytes(tmp_path):
     assert data == source.read_bytes()
 
 
+def test_non_utf8_manifest_is_structured_invalid_manifest(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    (repo.root / "rose" / "theme.json").write_bytes(b"\xff\xfe\x00b\x00r\x00o\x00k\x00e\x00n")
+    with pytest.raises(ThemeError) as exc:
+        repo.get_theme("rose")
+    assert exc.value.code == "invalid_manifest"
+
+
+def test_import_image_rejects_oversize_source_before_parsing(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    source = tmp_path / "oversize.bin"
+    # 全零内容不是合法图片：若大小检查没有先于内容解析，会得到 invalid_image
+    source.write_bytes(b"\x00" * (10 * 1024 * 1024 + 1))
+    with pytest.raises(ThemeError) as exc:
+        repo.import_image("rose", "workspace", source)
+    assert exc.value.code == "image_too_large"
+
+
+def test_read_asset_rejects_oversize_asset_before_parsing(tmp_path):
+    repo = make_repo_with_saved_theme(tmp_path, "rose")
+    source = write_image(tmp_path / "source.png", "PNG", (32, 24))
+    relative_path = repo.import_image("rose", "workspace", source)
+    (repo.root / "rose" / relative_path).write_bytes(b"\x00" * (10 * 1024 * 1024 + 1))
+    with pytest.raises(ThemeError) as exc:
+        repo.read_asset("rose", relative_path)
+    assert exc.value.code == "image_too_large"
+
+
 def test_remove_image_clears_manifest_and_unreferenced_asset(tmp_path):
     repo = make_repo_with_saved_theme(tmp_path, "rose")
     relative_path = repo.import_image(

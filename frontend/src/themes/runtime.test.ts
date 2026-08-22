@@ -146,6 +146,44 @@ describe('applyGuiTheme', () => {
       message: '资源路径越界',
     });
   });
+
+  it('decodes validated assets into blobs with the exact mime and bytes', async () => {
+    // base64 'AQID' → 字节 01 02 03
+    const api = {
+      get_gui_theme_asset: vi.fn().mockResolvedValue({
+        ok: true, mime: 'image/png', base64: 'AQID',
+      }),
+    } as unknown as PyWebViewAPI;
+
+    const applied = await applyGuiTheme(themeWithWorkspaceImage(), api);
+
+    const blob = vi.mocked(URL.createObjectURL).mock.calls[0][0] as Blob;
+    expect(blob.type).toBe('image/png');
+    expect(Array.from(new Uint8Array(await blob.arrayBuffer()))).toEqual([1, 2, 3]);
+    applied.dispose();
+  });
+
+  it('rejects unsupported asset mime or base64 without touching current variables', async () => {
+    document.documentElement.style.setProperty('--theme-accent', '#old-value');
+    const gifApi = {
+      get_gui_theme_asset: vi.fn().mockResolvedValue({
+        ok: true, mime: 'image/gif', base64: 'AA==',
+      }),
+    } as unknown as PyWebViewAPI;
+    await expect(applyGuiTheme(themeWithWorkspaceImage(), gifApi))
+      .rejects.toMatchObject({ code: 'invalid_asset_response', path: 'asset_path' });
+
+    const brokenBase64Api = {
+      get_gui_theme_asset: vi.fn().mockResolvedValue({
+        ok: true, mime: 'image/png', base64: '###not-base64###',
+      }),
+    } as unknown as PyWebViewAPI;
+    await expect(applyGuiTheme(themeWithWorkspaceImage(), brokenBase64Api))
+      .rejects.toMatchObject({ code: 'invalid_asset_base64', path: 'asset_path' });
+
+    expect(document.documentElement.style.getPropertyValue('--theme-accent')).toBe('#old-value');
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+  });
 });
 
 describe('applyBootTheme', () => {
