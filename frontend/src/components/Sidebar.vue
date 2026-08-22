@@ -1,5 +1,5 @@
 <template>
-  <div id="sidebar" :class="{ collapsed: store.sidebarCollapsed }">
+  <div id="sidebar" data-theme-region="sidebar" :class="{ collapsed: store.sidebarCollapsed }">
     <div class="side-menu">
       <div class="menu-item" @click="store.createSessionSmart()">
         <span class="mi-ico">✎</span>
@@ -249,7 +249,6 @@ function getFolderTitle(g: SessionGroup) {
 <style scoped>
 #sidebar {
   width: 240px;
-  background: var(--bg1);
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;

@@ -1,33 +1,191 @@
 :root {
-  /* 深色：参考 ZCode 暖中性黑——不带蓝调、层次柔和、边框低对比 */
-  --bg0: #1a1a18;
-  --bg1: #20201e;
-  --bg2: #272724;
-  --bg3: #302f2b;
-  --border: #34332f;
-  --text: #d9d9d4;
-  --text-bright: #edede9;
-  --text-dim: #a8a7a0;
-  --text-faint: #85847d;
-  --accent: #6a92d8;
-  --accent2: #6a92d8;
-  --accent-soft: rgba(106, 146, 216, 0.16);
-  --green: #4ea96a;
-  --yellow: #c9a24a;
-  --red: #d9635b;
-  --orange: #d08a4e;
-  --cyan: #4aabba;
-  --purple: #a58bd8;
-  --code-bg: #141412;
-  --float-bg: rgba(32, 32, 30, 0.97);
-  --mono: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
-  --sans: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+  /* GUI 主题语义 token（深色默认值）。
+     主题运行时（themes/runtime.ts）按相同变量名在 documentElement 上写入
+     inline 值覆盖这里的默认值；组件一律消费下方兼容别名或语义 token，
+     不直接硬编码颜色。 */
+  --theme-background-app: #1a1a18;
+  --theme-background-panel: #20201e;
+  --theme-background-card: #272724;
+  --theme-background-elevated: #302f2b;
+  --theme-text-primary: #d9d9d4;
+  --theme-text-bright: #edede9;
+  --theme-text-secondary: #a8a7a0;
+  --theme-text-faint: #85847d;
+  --theme-accent: #6a92d8;
+  --theme-accent-secondary: #6a92d8;
+  --theme-accent-soft: rgba(106, 146, 216, 0.16);
+  --theme-border: #34332f;
+  --theme-success: #4ea96a;
+  --theme-warning: #c9a24a;
+  --theme-danger: #d9635b;
+  --theme-orange: #d08a4e;
+  --theme-info: #4aabba;
+  --theme-purple: #a58bd8;
+  --theme-code-background: #141412;
+  --theme-float-background: rgba(32, 32, 30, 0.97);
+  --theme-font-sans: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+  --theme-font-mono: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+  --theme-radius-small: 6px;
+  --theme-radius-medium: 10px;
+  --theme-radius-large: 14px;
+  --theme-shadow-color: rgba(0, 0, 0, 0.5);
+  --theme-shadow-strength: 0.5;
+
+  /* 兼容别名：旧组件继续使用 --bg0/--text/--accent 等变量名，
+     全部映射到语义 token，未迁移组件随主题自动换肤 */
+  --bg0: var(--theme-background-app);
+  --bg1: var(--theme-background-panel);
+  --bg2: var(--theme-background-card);
+  --bg3: var(--theme-background-elevated);
+  --border: var(--theme-border);
+  --text: var(--theme-text-primary);
+  --text-bright: var(--theme-text-bright);
+  --text-dim: var(--theme-text-secondary);
+  --text-faint: var(--theme-text-faint);
+  --accent: var(--theme-accent);
+  --accent2: var(--theme-accent-secondary);
+  --accent-soft: var(--theme-accent-soft);
+  --green: var(--theme-success);
+  --yellow: var(--theme-warning);
+  --red: var(--theme-danger);
+  --orange: var(--theme-orange);
+  --cyan: var(--theme-info);
+  --purple: var(--theme-purple);
+  --code-bg: var(--theme-code-background);
+  --float-bg: var(--theme-float-background);
+  --mono: var(--theme-font-mono);
+  --sans: var(--theme-font-sans);
 }
 
 * {
   margin: 0;
   padding: 0;
   box-sizing: border-box;
+}
+
+/* ---------- GUI 主题分区接线 ----------
+   运行时在 documentElement 上写入 --theme-<region>-* 变量（region 下划线转连字符，
+   如 app_header → --theme-app-header-*）。每个分区先把自身变量别名到统一的
+   --theme-region-*，未加载主题时回落到全局语义 token。禁止按主题生成动态
+   class 或注入 style 字符串，全部通过 CSS 变量驱动。 */
+[data-theme-region="app_header"] {
+  --theme-region-bg: var(--theme-app-header-bg, var(--theme-background-panel));
+  --theme-region-text: var(--theme-app-header-text, var(--theme-text-primary));
+  --theme-region-border: var(--theme-app-header-border, var(--theme-border));
+  --theme-region-accent: var(--theme-app-header-accent, var(--theme-accent));
+  --theme-region-bg-opacity: var(--theme-app-header-bg-opacity, 1);
+  --theme-region-image: var(--theme-app-header-image, none);
+  --theme-region-image-opacity: var(--theme-app-header-image-opacity, 1);
+  --theme-region-image-size: var(--theme-app-header-image-size, cover);
+  --theme-region-image-position: var(--theme-app-header-image-position, center);
+}
+[data-theme-region="sidebar"] {
+  --theme-region-bg: var(--theme-sidebar-bg, var(--theme-background-panel));
+  --theme-region-text: var(--theme-sidebar-text, var(--theme-text-primary));
+  --theme-region-border: var(--theme-sidebar-border, var(--theme-border));
+  --theme-region-accent: var(--theme-sidebar-accent, var(--theme-accent));
+  --theme-region-bg-opacity: var(--theme-sidebar-bg-opacity, 1);
+  --theme-region-image: var(--theme-sidebar-image, none);
+  --theme-region-image-opacity: var(--theme-sidebar-image-opacity, 1);
+  --theme-region-image-size: var(--theme-sidebar-image-size, cover);
+  --theme-region-image-position: var(--theme-sidebar-image-position, center);
+}
+[data-theme-region="conversation_toolbar"] {
+  --theme-region-bg: var(--theme-conversation-toolbar-bg, var(--theme-background-panel));
+  --theme-region-text: var(--theme-conversation-toolbar-text, var(--theme-text-primary));
+  --theme-region-border: var(--theme-conversation-toolbar-border, var(--theme-border));
+  --theme-region-accent: var(--theme-conversation-toolbar-accent, var(--theme-accent));
+  --theme-region-bg-opacity: var(--theme-conversation-toolbar-bg-opacity, 1);
+  --theme-region-image: var(--theme-conversation-toolbar-image, none);
+  --theme-region-image-opacity: var(--theme-conversation-toolbar-image-opacity, 1);
+  --theme-region-image-size: var(--theme-conversation-toolbar-image-size, cover);
+  --theme-region-image-position: var(--theme-conversation-toolbar-image-position, center);
+}
+[data-theme-region="workspace"] {
+  --theme-region-bg: var(--theme-workspace-bg, var(--theme-background-app));
+  --theme-region-text: var(--theme-workspace-text, var(--theme-text-primary));
+  --theme-region-border: var(--theme-workspace-border, var(--theme-border));
+  --theme-region-accent: var(--theme-workspace-accent, var(--theme-accent));
+  --theme-region-bg-opacity: var(--theme-workspace-bg-opacity, 1);
+  --theme-region-image: var(--theme-workspace-image, none);
+  --theme-region-image-opacity: var(--theme-workspace-image-opacity, 1);
+  --theme-region-image-size: var(--theme-workspace-image-size, cover);
+  --theme-region-image-position: var(--theme-workspace-image-position, center);
+}
+[data-theme-region="composer"] {
+  --theme-region-bg: var(--theme-composer-bg, var(--theme-background-panel));
+  --theme-region-text: var(--theme-composer-text, var(--theme-text-primary));
+  --theme-region-border: var(--theme-composer-border, var(--theme-border));
+  --theme-region-accent: var(--theme-composer-accent, var(--theme-accent));
+  --theme-region-bg-opacity: var(--theme-composer-bg-opacity, 1);
+  --theme-region-image: var(--theme-composer-image, none);
+  --theme-region-image-opacity: var(--theme-composer-image-opacity, 1);
+  --theme-region-image-size: var(--theme-composer-image-size, cover);
+  --theme-region-image-position: var(--theme-composer-image-position, center);
+}
+[data-theme-region="right_panel"] {
+  --theme-region-bg: var(--theme-right-panel-bg, var(--theme-background-panel));
+  --theme-region-text: var(--theme-right-panel-text, var(--theme-text-primary));
+  --theme-region-border: var(--theme-right-panel-border, var(--theme-border));
+  --theme-region-accent: var(--theme-right-panel-accent, var(--theme-accent));
+  --theme-region-bg-opacity: var(--theme-right-panel-bg-opacity, 1);
+  --theme-region-image: var(--theme-right-panel-image, none);
+  --theme-region-image-opacity: var(--theme-right-panel-image-opacity, 1);
+  --theme-region-image-size: var(--theme-right-panel-image-size, cover);
+  --theme-region-image-position: var(--theme-right-panel-image-position, center);
+}
+[data-theme-region="statusbar"] {
+  --theme-region-bg: var(--theme-statusbar-bg, var(--theme-background-panel));
+  --theme-region-text: var(--theme-statusbar-text, var(--theme-text-faint));
+  --theme-region-border: var(--theme-statusbar-border, var(--theme-border));
+  --theme-region-accent: var(--theme-statusbar-accent, var(--theme-accent));
+  --theme-region-bg-opacity: var(--theme-statusbar-bg-opacity, 1);
+  --theme-region-image: var(--theme-statusbar-image, none);
+  --theme-region-image-opacity: var(--theme-statusbar-image-opacity, 1);
+  --theme-region-image-size: var(--theme-statusbar-image-size, cover);
+  --theme-region-image-position: var(--theme-statusbar-image-position, center);
+}
+
+/* 分区公共层：isolation 建立独立 stacking context，::before 用负 z-index
+   垫在分区自身背景色之上、全部内容之下，且 pointer-events: none 不拦截
+   点击与滚动。背景色透明度只作用于颜色层，不影响文字与控件。 */
+[data-theme-region] {
+  position: relative;
+  isolation: isolate;
+  color: var(--theme-region-text);
+  background: color-mix(in srgb, var(--theme-region-bg) calc(var(--theme-region-bg-opacity) * 100%), transparent);
+  /* 分区内旧别名改指向分区值：文字、边框、强调色随分区生效 */
+  --text: var(--theme-region-text);
+  --text-bright: var(--theme-region-text);
+  --border: var(--theme-region-border);
+  --accent: var(--theme-region-accent);
+}
+
+[data-theme-region]::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: var(--theme-region-image);
+  background-size: var(--theme-region-image-size);
+  background-position: var(--theme-region-image-position);
+  background-repeat: no-repeat;
+  opacity: var(--theme-region-image-opacity);
+}
+
+/* 分区 isolation 会让分区内的下拉/浮层困在分区层级，被 DOM 靠后的
+   兄弟分区盖住。带向下弹出浮层的分区按需提升 z-index：
+   会话工具栏（导出菜单）> 工作区（空状态建议面板）> 输入区（补全/模型/
+   权限下拉）> 其余分区；全部低于全屏 Subpage(50) 与模态层（1000+）。 */
+[data-theme-region="conversation_toolbar"] {
+  z-index: 10;
+}
+[data-theme-region="workspace"] {
+  z-index: 6;
+}
+[data-theme-region="composer"] {
+  z-index: 5;
 }
 
 body {
@@ -440,28 +598,32 @@ button {
   }
 }
 
-/* 浅色主题：参考 ZCode 暖白——近白不刺眼、纯白卡片、边框极柔和 */
-body.light {
-  --bg0: #f4f4f1;
-  --bg1: #ffffff;
-  --bg2: #efefec;
-  --bg3: #e4e4e0;
-  --border: #e3e3de;
-  --text: #2c2c2a;
-  --text-bright: #171716;
-  --text-dim: #5c5c56;
-  --text-faint: #7a7a73;
-  --accent: #3a6dd8;
-  --accent2: #3a6dd8;
-  --accent-soft: rgba(58, 109, 216, 0.10);
-  --green: #2c8a4c;
-  --yellow: #96700f;
-  --red: #cf3d36;
-  --orange: #b85e1f;
-  --cyan: #1a7f92;
-  --purple: #7b5fc0;
-  --code-bg: #f0f0ec;
-  --float-bg: rgba(255, 255, 255, 0.97);
+/* 浅色主题：参考 ZCode 暖白——近白不刺眼、纯白卡片、边框极柔和。
+   默认值挂在 :root.light（html 元素）上：运行时把 light 类同步到 html，
+   主题变量以 inline 形式写入 documentElement 时可覆盖这里的默认值；
+   若仍挂在 body.light 上，body 自身声明会盖过从 html 继承的主题变量。 */
+:root.light {
+  --theme-background-app: #f4f4f1;
+  --theme-background-panel: #ffffff;
+  --theme-background-card: #efefec;
+  --theme-background-elevated: #e4e4e0;
+  --theme-text-primary: #2c2c2a;
+  --theme-text-bright: #171716;
+  --theme-text-secondary: #5c5c56;
+  --theme-text-faint: #7a7a73;
+  --theme-accent: #3a6dd8;
+  --theme-accent-secondary: #3a6dd8;
+  --theme-accent-soft: rgba(58, 109, 216, 0.10);
+  --theme-border: #e3e3de;
+  --theme-success: #2c8a4c;
+  --theme-warning: #96700f;
+  --theme-danger: #cf3d36;
+  --theme-orange: #b85e1f;
+  --theme-info: #1a7f92;
+  --theme-purple: #7b5fc0;
+  --theme-code-background: #f0f0ec;
+  --theme-float-background: rgba(255, 255, 255, 0.97);
+  --theme-shadow-color: rgba(0, 0, 0, 0.18);
 }
 body.light .tool-head .tname {
   color: var(--text);
