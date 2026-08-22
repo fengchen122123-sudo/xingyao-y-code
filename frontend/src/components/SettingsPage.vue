@@ -425,7 +425,10 @@ import TokenUsageSettings from './TokenUsageSettings.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
 
 const store = useAppStore();
-const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'about'>('models');
+// 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
+// 组件常驻，返回编辑器时通过 watch 同步
+const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'about'>(store.settingsSection);
+watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 const selectedKind = ref<'preset' | 'provider' | 'custom' | 'secondary'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');
 const showAddProviders = ref(false);

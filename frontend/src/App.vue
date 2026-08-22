@@ -171,9 +171,10 @@ import SettingsPage from './components/SettingsPage.vue';
 const store = useAppStore();
 const chatScrollRef = ref<HTMLElement | null>(null);
 
-// 主题预览：从真实首页返回设置页继续编辑（退出预览模式并重开设置）
+// 主题预览：从真实首页返回设置页继续编辑（退出预览模式、重开设置并落到外观与主题）
 function backToThemeEditor() {
   store.themePreviewMode = false;
+  store.settingsSection = 'appearance';
   store.settingsOpen = true;
 }
 

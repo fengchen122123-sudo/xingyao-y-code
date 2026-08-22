@@ -171,6 +171,16 @@ html {
   --theme-region-surface-panel: color-mix(in srgb, var(--theme-background-panel) calc(var(--theme-region-bg-opacity) * 100%), transparent);
 }
 
+/* 分区前景表面接管：气泡/输入框/权限卡的实色背景改随分区背景透明度。
+   代码块（--code-bg）、按钮等小元素保持实色以保证可读；主遮挡面才透图。 */
+[data-theme-region="workspace"] .msg-user .bubble,
+[data-theme-region="workspace"] .perm-card {
+  background: var(--theme-region-surface-panel);
+}
+[data-theme-region="composer"] #input-box {
+  background: var(--theme-region-surface);
+}
+
 [data-theme-region]::before {
   content: '';
   position: absolute;

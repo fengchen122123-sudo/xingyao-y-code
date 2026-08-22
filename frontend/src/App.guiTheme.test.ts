@@ -83,6 +83,8 @@ describe('GUI theme startup error gate', () => {
     await wrapper.get('[data-test="preview-back"]').trigger('click');
     expect(store.themePreviewMode).toBe(false);
     expect(store.settingsOpen).toBe(true);
+    // 返回编辑器必须落回“外观与主题”分区，而不是默认的模型配置
+    expect(store.settingsSection).toBe('appearance');
 
     wrapper.unmount();
   });
