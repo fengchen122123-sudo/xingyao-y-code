@@ -86,3 +86,48 @@ describe('Topbar GUI theme shortcut', () => {
     expect(store.savedGuiTheme?.id).toBe('builtin.dark');
   });
 });
+
+describe('Topbar frameless window controls', () => {
+  beforeEach(() => {
+    (window as any).pywebview = {
+      api: {
+        window_minimize: vi.fn().mockResolvedValue({ ok: true }),
+        window_toggle_maximize: vi.fn().mockResolvedValue({ ok: true, maximized: true }),
+        window_close: vi.fn().mockResolvedValue({ ok: true }),
+        window_is_maximized: vi.fn().mockResolvedValue({ ok: true, maximized: false }),
+      },
+    };
+  });
+
+  it('renders minimize/maximize/close buttons and wires them to the bridge', async () => {
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+    const api = (window as any).pywebview.api;
+
+    await wrapper.get('[data-test="win-min"]').trigger('click');
+    expect(api.window_minimize).toHaveBeenCalledOnce();
+
+    await wrapper.get('[data-test="win-max"]').trigger('click');
+    expect(api.window_toggle_maximize).toHaveBeenCalledOnce();
+
+    await wrapper.get('[data-test="win-close"]').trigger('click');
+    expect(api.window_close).toHaveBeenCalledOnce();
+  });
+
+  it('marks the drag region with the pywebview drag class and dblclick toggles maximize', async () => {
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+    const drag = wrapper.get('.pywebview-drag-region');
+    expect(drag.element).toBeTruthy();
+
+    await drag.trigger('dblclick');
+    expect((window as any).pywebview.api.window_toggle_maximize).toHaveBeenCalledOnce();
+  });
+
+  it('does not crash when the bridge is unavailable', async () => {
+    (window as any).pywebview = undefined;
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+    await wrapper.get('[data-test="win-min"]').trigger('click');
+    await wrapper.get('[data-test="win-max"]').trigger('click');
+    await wrapper.get('[data-test="win-close"]').trigger('click');
+    expect(wrapper.find('[data-test="win-min"]').exists()).toBe(true);
+  });
+});
