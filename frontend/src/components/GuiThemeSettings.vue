@@ -259,6 +259,7 @@ onUnmounted(() => {
 //    顶部浮条由 App.vue 在 themePreviewMode 时显示，提供返回编辑。──
 function togglePreview() {
   if (!draft.value) return;
+  store.settingsSection = 'appearance';
   store.themePreviewMode = true;
   store.settingsOpen = false;
 }
