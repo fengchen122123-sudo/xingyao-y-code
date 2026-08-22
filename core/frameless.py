@@ -65,6 +65,8 @@ _u32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 _drag_region: list[int] | None = None
 # 已子类化窗口的回调引用（防 GC 回收导致窗口过程悬空）
 _SUBCLASSED: dict[int, object] = {}
+# 周期补装定时器是否已启动（防 loaded/restored 重装触发多个定时器）
+_periodic_started = False
 
 
 def _signed_short(value: int) -> int:
@@ -145,6 +147,40 @@ def set_drag_region(x: int, y: int, w: int, h: int) -> None:
     logger.info("frameless 拖拽区已登记: x=%s y=%s w=%s h=%s", _drag_region[0], _drag_region[1], _drag_region[2], _drag_region[3])
 
 
+def _inset_webview(form, pad: int) -> None:
+    """WebView2 控件四周缩进 pad 像素，把边缘带留给宿主进程窗口（可子类化层）。
+
+    必须在 GUI 线程调用。pywebview 用 Dock=Fill 停靠控件，SetBounds 会被 Dock
+    立即覆盖，必须先解除停靠。窗口 resize 时保持缩进（SizeChanged 订阅，幂等）。
+    """
+    try:
+        ctrl = getattr(form, "webview", None)
+        if ctrl is None:
+            return
+        if not getattr(form, "_ycode_inset_bound", False):
+            from System.Windows.Forms import DockStyle
+
+            # pythonnet：None 是 Python 关键字，用 getattr 取 DockStyle.None
+            ctrl.Dock = getattr(DockStyle, "None")
+
+            def _layout(*_args):
+                try:
+                    width = form.ClientSize.Width
+                    height = form.ClientSize.Height
+                    ctrl.SetBounds(pad, pad, max(1, width - 2 * pad), max(1, height - 2 * pad))
+                except Exception:
+                    pass
+            form.SizeChanged += _layout
+            form._ycode_inset_bound = True
+            form._ycode_inset_layout = _layout  # 防 GC
+        width = form.ClientSize.Width
+        height = form.ClientSize.Height
+        ctrl.SetBounds(pad, pad, max(1, width - 2 * pad), max(1, height - 2 * pad))
+        logger.info("frameless WebView2 已缩进 %spx（边缘留给原生 resize）", pad)
+    except Exception:
+        logger.warning("frameless WebView2 缩进失败", exc_info=True)
+
+
 def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
     """启用 frameless 窗口原生行为：边缘 resize + HTCAPTION 拖拽（Snap/动画）。
 
@@ -162,15 +198,16 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
     orig_children: dict = {}
 
     def _parent_wndproc(hwnd_arg, msg, wparam, lparam):
-        # 顶层窗口：WebView2 穿透上来的命中 → HTCAPTION / 边框码
+        # 顶层窗口：穿透上来的命中 → 边框码（优先，顶部边缘也能 resize）/
+        # 拖拽区 HTCAPTION
         if msg == WM_NCHITTEST:
             result = _u32.CallWindowProcW(state["orig_parent"], hwnd_arg, msg, wparam, lparam)
             if result == HTCLIENT:
-                if _in_drag_region(hwnd_arg, lparam):
-                    return HTCAPTION
                 edge = _edge_code(hwnd_arg, lparam, border)
                 if edge is not None:
                     return edge
+                if _in_drag_region(hwnd_arg, lparam):
+                    return HTCAPTION
             return result
         return _u32.CallWindowProcW(state["orig_parent"], hwnd_arg, msg, wparam, lparam)
 
@@ -192,6 +229,8 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
     child_proc_ref = _WNDPROC(_child_wndproc)
 
     def _do_install():
+        """幂等安装：样式位 + 父/宿主侧后代子类化 + WebView2 边缘缩进。
+        可安全重复调用。"""
         try:
             # 1. 顶层窗口样式位：恢复最小化动画 / 双击最大化 / 任务栏交互
             style = _u32.GetWindowLongW(hwnd, GWL_STYLE)
@@ -205,8 +244,14 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
                     state["error"] = "parent SetWindowLongPtrW failed"
                     return
                 _SUBCLASSED[hwnd] = parent_proc_ref
-            # 3. WebView2 全部后代窗口子类化（命中测试发生在最深层后代，
-            #    且页面加载时这些窗口可能销毁重建——新句柄在此幂等补装）
+            # 3. WebView2 边缘缩进（跨进程限制的标准解法）：WebView2 的深层渲染
+            #    窗口（Chrome_WidgetWin_1 / RenderWidgetHostHWND）属于
+            #    msedgewebview2.exe，宿主进程无法 SetWindowLongPtrW 子类化它们，
+            #    鼠标命中又恰恰发生在那层。把 WebView2 控件整体缩进 8px，边缘带
+            #    只剩宿主进程窗口（已子类化）→ 鼠标在边缘命中宿主 → 原生 resize。
+            #    8px 边带透出窗口背景色，视觉上即窗口边框。
+            _inset_webview(form, border)
+            # 4. 宿主侧后代窗口子类化（容器 / Chrome_WidgetWin_0 等，属本进程）
             children = find_webview_child_hwnds(hwnd)
             if not children:
                 state["error"] = "no webview child hwnd"
@@ -224,15 +269,48 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
                 orig_children[child] = orig  # 记录该句柄的原过程，供 _child_wndproc 转发
                 _SUBCLASSED[child] = child_proc_ref
                 installed_children += 1
+                logger.info("frameless 后代窗口已子类化: hwnd=%s（累计 %s）", child, installed_children)
             state["children"] = installed_children
             state["ok"] = True
         except Exception as error:  # noqa: BLE001 - 安装失败绝不带出 GUI 线程
             state["error"] = str(error)
 
+    def _start_periodic_install():
+        """GUI 线程定时器周期补装：深层 WebView2 后代（Chrome_WidgetWin_1 /
+        RenderWidgetHostHWND）在页面实际渲染时才创建，比首屏 Vue 挂载晚得多，
+        短稳定期判定会提前停手（实测漏装深层窗口）。固定每 1.5s 枚举补装，
+        跑满 90 秒；EnumChildWindows 开销极小。"""
+        global _periodic_started
+        if _periodic_started:
+            return  # 已有周期补装在跑（loaded/restored 重装触发时防重入）
+        _periodic_started = True
+        try:
+            timer = WinForms.Timer()
+
+            def _tick(_sender, _args):
+                _do_install()
+                if not state.get("ok"):
+                    return
+                if getattr(_tick, "count", 0) + 1 >= 60:
+                    timer.Stop()
+                    timer.Dispose()
+                    logger.info(
+                        "frameless 周期补装完成: 共子类化 %s 个窗口", len(_SUBCLASSED),
+                    )
+                _tick.count = getattr(_tick, "count", 0) + 1
+
+            timer.Interval = 1500
+            timer.Tick += _tick
+            timer.Start()
+            # 持有引用防 GC
+            _SUBCLASSED[-1] = timer
+        except Exception:
+            logger.warning("frameless 周期补装定时器创建失败", exc_info=True)
+
     try:
         from System.Windows import Forms as WinForms
 
-        form.Invoke(WinForms.MethodInvoker(_do_install))
+        form.Invoke(WinForms.MethodInvoker(lambda: (_do_install(), _start_periodic_install())))
     except Exception as error:  # noqa: BLE001
         logger.warning("frameless 原生窗口行为启用失败: %s", error)
         return False
