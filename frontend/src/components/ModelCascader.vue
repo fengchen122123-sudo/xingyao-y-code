@@ -273,7 +273,9 @@ onUnmounted(() => {
 }
 .cascader-main-panel,
 .cascader-sub-panel {
-  background: var(--float-bg);
+  /* 半透明毛玻璃：以主题浮窗色为基准混入 20% 透明，配合下方 blur 透出
+     全局背景图/分区层（Teleport 后位于所有图层之上，可读性由模糊保证） */
+  background: color-mix(in srgb, var(--theme-float-background) 80%, transparent);
   border: 1px solid var(--border);
   border-radius: 14px;
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.55);
