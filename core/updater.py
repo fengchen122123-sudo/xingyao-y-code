@@ -35,6 +35,10 @@ GITEE_REPO = "feng-chenhao/xingyao-y-code"
 GITEE_API_URL = f"https://gitee.com/api/v5/repos/{GITEE_REPO}/releases/latest"
 HTTP_USER_AGENT = f"ycode-updater/{YCODE_VERSION} (Windows)"
 
+# 分卷下载失败（HTML 拒绝/网络错误/截断）的退避重试间隔（秒）。
+# Gitee 限流/风控是瞬时性的，退避后通常可恢复；测试可 patch 为 (0,0,0) 加速。
+RETRY_DELAYS = (2, 5, 10)
+
 # 版本号白名单：tag_name 来自远程 API，拼接进文件名与 cmd 前必须约束字符集
 _SAFE_VERSION_RE = re.compile(r"^[0-9A-Za-z.\-_]+$")
 
@@ -450,84 +454,122 @@ class UpdateDownloader:
                             }
                         )
 
+                # 带 Cookie 的 opener：Gitee 下载链是 302 重定向（releases/download →
+                # attach_files → foruda CDN），携带 Set-Cookie 的 session 更接近
+                # 浏览器行为，降低触发风控/登录墙的概率。install_opener 后 urlopen
+                # 即走该 opener（测试 patch urlopen 时不受影响）
+                import http.cookiejar as _cj
+
+                urllib.request.install_opener(
+                    urllib.request.build_opener(
+                        urllib.request.HTTPCookieProcessor(_cj.CookieJar())
+                    )
+                )
+
                 # 首片重建文件（"wb"），后续追加（"ab"）：边下边拼接
                 open_mode = "wb"
-                for i, url in enumerate(urls):
+
+                def _download_one_part(i: int, url: str) -> bool:
+                    """下载单个分卷（流式追加到 tmp_path）。Gitee 限流/风控是
+                    瞬时性的，HTML 拒绝/网络错误自动退避重试（2/5/10s），重试前
+                    截断本片未完成的字节。全部失败才 on_error。"""
+                    nonlocal open_mode, downloaded_total, part_index, grand_total
                     part_index = i + 1
-                    req = urllib.request.Request(
-                        url,
-                        headers={"User-Agent": HTTP_USER_AGENT},
+                    start_offset = 0 if i == 0 else (
+                        os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
                     )
-                    with urllib.request.urlopen(req, timeout=30.0) as resp:
-                        # 安全防线 1：Content-Type 校验。Gitee 限流/登录墙/风控页
-                        # 会返回 text/html，必须立即拒绝，不能写入磁盘当成功
-                        content_type = str(resp.headers.get("Content-Type", "")).lower()
-                        if "text/html" in content_type or "text/plain" in content_type:
-                            logger.error(
-                                "下载源返回 HTML/文本页（可能是登录墙/限流/风控），拒绝下载: %s (Content-Type: %s)",
-                                url,
-                                content_type,
-                            )
+                    last_reason = ""
+                    for attempt in range(len(RETRY_DELAYS) + 1):
+                        if self._cancel_event.is_set():
                             _cleanup_tmp()
-                            on_error(
-                                "下载源返回了网页而非安装包（Gitee 可能触发了登录验证或限流），"
-                                "请稍后重试，或前往 Release 页面手动下载"
+                            return False
+                        if attempt:
+                            delay = RETRY_DELAYS[attempt - 1]
+                            logger.info(
+                                "分卷 %d/%d 下载失败（%s），%ds 后重试（%d/%d）",
+                                i + 1, len(urls), last_reason, delay,
+                                attempt, len(RETRY_DELAYS),
                             )
-                            return
-
-                        part_total = int(resp.headers.get("Content-Length", 0))
-                        if grand_total <= 0:
-                            grand_total = part_total * len(urls)
+                            time.sleep(delay)
+                            # 截断上一次失败残留的不完整字节
+                            try:
+                                with open(tmp_path, "r+b") as f:
+                                    f.truncate(start_offset)
+                            except OSError:
+                                pass
+                        req = urllib.request.Request(
+                            url, headers={"User-Agent": HTTP_USER_AGENT},
+                        )
+                        part_total = 0
                         part_downloaded = 0
-                        with open(tmp_path, open_mode) as f:
-                            while True:
-                                if self._cancel_event.is_set():
-                                    logger.info("下载被用户主动取消")
-                                    break
-                                chunk = resp.read(64 * 1024)
-                                if not chunk:
-                                    break
-                                f.write(chunk)
-                                part_downloaded += len(chunk)
-                                downloaded_total += len(chunk)
-                                _report_progress()
+                        try:
+                            with urllib.request.urlopen(req, timeout=30.0) as resp:
+                                # 安全防线 1：Content-Type 校验。Gitee 限流/登录墙/
+                                # 风控页会返回 text/html，拒绝当成功（但可重试）
+                                content_type = str(
+                                    resp.headers.get("Content-Type", "")
+                                ).lower()
+                                if (
+                                    "text/html" in content_type
+                                    or "text/plain" in content_type
+                                ):
+                                    last_reason = f"返回网页 ({content_type})"
+                                    continue
+                                part_total = int(
+                                    resp.headers.get("Content-Length", 0)
+                                )
+                                # 分卷且无总大小元数据时，用首片 Content-Length
+                                # 推算总分母（进度展示用）
+                                if grand_total <= 0 and part_total > 0:
+                                    grand_total = part_total * len(urls)
+                                with open(tmp_path, open_mode) as f:
+                                    while True:
+                                        if self._cancel_event.is_set():
+                                            _cleanup_tmp()
+                                            return False
+                                        chunk = resp.read(64 * 1024)
+                                        if not chunk:
+                                            break
+                                        f.write(chunk)
+                                        part_downloaded += len(chunk)
+                                        downloaded_total += len(chunk)
+                                        _report_progress()
+                        except (urllib.error.URLError, OSError) as error:
+                            last_reason = f"网络错误 ({error})"
+                            continue
+                        # 完整性校验：声明了 Content-Length 的分片，实际字节数
+                        # 必须一致，否则视为连接中断的截断下载（可重试）
+                        if part_total > 0 and part_downloaded != part_total:
+                            last_reason = (
+                                f"不完整 {part_downloaded}/{part_total} 字节"
+                            )
+                            continue
+                        # 安全防线 2：单片分卷必须 > 1MB（真实分卷 ≥ 95MB，HTML
+                        # 错误页通常只有几十 KB）。小于阈值视为异常（可重试）
+                        if part_downloaded < 1024 * 1024:
+                            last_reason = f"大小异常 ({part_downloaded} 字节)"
+                            continue
                         open_mode = "ab"
+                        return True
+                    # 重试耗尽
+                    logger.error(
+                        "分卷 %d/%d 重试 %d 次后仍失败: %s",
+                        i + 1, len(urls), len(RETRY_DELAYS), last_reason,
+                    )
+                    _cleanup_tmp()
+                    retry_note = f"已自动重试 {len(RETRY_DELAYS)} 次" if RETRY_DELAYS else ""
+                    on_error(
+                        f"安装包下载失败（{last_reason}）"
+                        f"{'，' + retry_note if retry_note else ''}，"
+                        "请稍后重试，或前往 Release 页面手动下载"
+                    )
+                    return False
 
+                for i, url in enumerate(urls):
+                    if not _download_one_part(i, url):
+                        return
                     if self._cancel_event.is_set():
                         _cleanup_tmp()
-                        return
-
-                    # 完整性校验：声明了 Content-Length 的分片，实际字节数
-                    # 必须一致，否则视为连接中断的截断下载，拒绝继续
-                    if part_total > 0 and part_downloaded != part_total:
-                        logger.error(
-                            "分卷 %d/%d 下载不完整: 期望 %d 字节，实际 %d 字节",
-                            i + 1,
-                            len(urls),
-                            part_total,
-                            part_downloaded,
-                        )
-                        _cleanup_tmp()
-                        on_error(
-                            f"安装包下载不完整（分卷 {i + 1}/{len(urls)}："
-                            f"{part_downloaded}/{part_total} 字节），请重试"
-                        )
-                        return
-
-                    # 安全防线 2：单片分卷必须 > 1MB（真实分卷 ≥ 95MB，HTML 错误页
-                    # 通常只有几十 KB）。小于阈值视为异常，拒绝继续
-                    if part_downloaded < 1024 * 1024:
-                        logger.error(
-                            "分卷 %d/%d 大小异常（仅 %d 字节），可能是错误页或残缺文件",
-                            i + 1,
-                            len(urls),
-                            part_downloaded,
-                        )
-                        _cleanup_tmp()
-                        on_error(
-                            f"下载的安装包大小异常（仅 {part_downloaded} 字节），"
-                            "可能是 Gitee 返回了错误页，请稍后重试或手动下载"
-                        )
                         return
 
                 # 官方 SHA256 强制校验：分卷被篡改/缺片时拼接结果哈希必然

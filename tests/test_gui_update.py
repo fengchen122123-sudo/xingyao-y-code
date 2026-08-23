@@ -26,6 +26,14 @@ from core.version import __version__ as YCODE_VERSION
 from gui_bridge import ApiBridge
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff():
+    """下载重试会多次调用 urlopen 并 sleep，测试默认关闭退避（单次尝试），
+    需要验证重试行为的用例单独 patch RETRY_DELAYS。"""
+    with patch("core.updater.RETRY_DELAYS", ()):
+        yield
+
+
 def test_parse_and_compare_versions():
     assert parse_version("v1.2.6") == (1, 2, 6)
     assert parse_version("1.2.5") == (1, 2, 5)
@@ -468,6 +476,50 @@ def test_download_rejects_html_error_page():
     # 不得落盘
     dest = os.path.join(get_update_cache_dir(), "Y-CODE-Setup-v9.9.9.exe")
     assert not os.path.exists(dest)
+
+
+def test_download_recovers_after_transient_html_with_retry():
+    """Gitee 瞬时限流：首响应 HTML，退避重试后拿到真实数据 → 下载成功。"""
+    from core.updater import UpdateDownloader
+    import threading
+
+    dest = os.path.join(get_update_cache_dir(), "Y-CODE-Setup-v9.9.7.exe")
+    if os.path.exists(dest):
+        os.remove(dest)
+
+    html_payload = b"<html>login</html>"
+    real_payload = b"MZ" + b"\x00" * (2 * 1024 * 1024)  # >1MB 才通过小文件防线
+    responses = [
+        _FakePartResp(html_payload, content_type="text/html; charset=utf-8"),
+        _FakePartResp(real_payload),
+    ]
+    attempts = {"n": 0}
+
+    downloader = UpdateDownloader()
+    done = threading.Event()
+    result = {}
+
+    def _urlopen(req, timeout=None):
+        attempts["n"] += 1
+        return responses.pop(0)
+
+    with patch("urllib.request.urlopen", side_effect=_urlopen), \
+         patch("core.updater.RETRY_DELAYS", (0,)):
+        started = downloader.start_download(
+            download_url="https://gitee.com/fake.exe",
+            target_version="9.9.7",
+            on_progress=lambda d: None,
+            on_complete=lambda p: (result.update(ok=p), done.set()),
+            on_error=lambda m: (result.update(err=m), done.set()),
+        )
+        assert started is True
+        assert done.wait(timeout=10)
+
+    assert "ok" in result and "err" not in result, result
+    assert attempts["n"] == 2  # 首次 HTML + 重试成功
+    assert os.path.exists(dest)
+    assert os.path.getsize(dest) == len(real_payload)
+    os.remove(dest)
 
 
 def test_download_rejects_suspiciously_small_file():
