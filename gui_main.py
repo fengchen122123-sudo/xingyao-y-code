@@ -523,17 +523,11 @@ def main():
                 if not items:
                     return
                 api.store_dropped_paths([it['path'] for it in items])  # 兼容旧前端的轮询方式
-                # 事件驱动推送：前端 onDrop 等待此回调拿到完整路径，
-                # 替代"前端轮询 Python 存储"的竞态方式（曾导致首次拖拽取不到路径、
-                # 以及连续拖拽时读到上一次的旧路径）
-                try:
-                    payload = json.dumps({'files': items}, ensure_ascii=False)
-                    payload = payload.replace('\u2028', '\\u2028').replace('\u2029', '\\u2029')
-                    window.evaluate_js(
-                        f"window.__ycode_on_drop_paths && window.__ycode_on_drop_paths({payload})"
-                    )
-                except Exception:
-                    pass
+                # 事件驱动推送：必须走 api 的 _js_queue 单消费者派发（evaluate_js
+                # 只允许 dispatcher 线程调用）。此回调运行在 GUI 线程（WebView2 的
+                # WebMessageReceived 直接分发），回调内同步 evaluate_js 会因脚本的
+                # continuation 排在 GUI 消息队列而死锁整个窗口（拖放必卡死）。
+                api.emit_event("dropped_paths_push", {"files": items})
 
             body.on('drop', _on_body_drop)
         except Exception:
