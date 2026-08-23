@@ -506,9 +506,19 @@ def main():
     # 导致 pywebviewFullPath 从未注入。
     def _register_dnd():
         try:
-            window.events.loaded.wait(timeout=10)
-            body = window.dom.get_element('body')
+            # loaded 事件 + 轮询双保险：冻结版冷启动（杀毒扫描）可能超过单次
+            # wait 超时；body 拿不到时 5s 重试，最多 60s。订阅成功前
+            # _dnd_state['num_listeners'] 为 0，WebView2 不放行系统拖拽（拖入无效），
+            # 所以必须保证慢启动下也能完成订阅。
+            body = None
+            for _ in range(12):
+                if window.events.loaded.wait(timeout=5):
+                    body = window.dom.get_element('body')
+                    if body:
+                        break
+                logger.info("等待页面就绪以注册拖拽订阅（冷启动慢）...")
             if not body:
+                logger.error("60s 内未能注册拖拽订阅：拖放文件功能将不可用")
                 return
 
             def _on_body_drop(event):
