@@ -398,6 +398,28 @@ def _acquire_single_instance() -> bool:
     return True
 
 
+def _create_main_window(api, url: str, gui_theme: dict):
+    """创建主窗口，并从源头禁用 pywebview 的 1px DWM frame 延伸。"""
+    # 启动 PyWebView 无边框桌面窗口（自绘标题栏；背景色与主题一致，加载前不闪反色）
+    # easy_drag=False：只有 .pywebview-drag-region 标记的标题栏区域可拖拽移动窗口
+    return webview.create_window(
+        title="Y-CODE · 星瑶",
+        url=url,
+        js_api=api,
+        width=1320,
+        height=840,
+        min_size=(960, 640),
+        text_select=True,
+        confirm_close=False,
+        background_color=gui_theme["background"],
+        frameless=True,
+        easy_drag=False,
+        # 默认 shadow=True 会先 DwmExtendFrameIntoClientArea(1px)，形成固定灰线。
+        # WS_THICKFRAME 稍后仍提供系统阴影、Snap 与动画语义。
+        shadow=False,
+    )
+
+
 def main():
     _configure_runtime_logging()
     # 无条件记录本进程身份：诊断"venv 与系统 Python / 安装版双进程共存"
@@ -422,22 +444,7 @@ def main():
     url = get_frontend_url()
     gui_theme = _initial_gui_theme()
     url += ("&" if "#" in url else "#") + _build_gui_theme_fragment(gui_theme)
-
-    # 启动 PyWebView 无边框桌面窗口（自绘标题栏；背景色与主题一致，加载前不闪反色）
-    # easy_drag=False：只有 .pywebview-drag-region 标记的标题栏区域可拖拽移动窗口
-    window = webview.create_window(
-        title="Y-CODE · 星瑶",
-        url=url,
-        js_api=api,
-        width=1320,
-        height=840,
-        min_size=(960, 640),
-        text_select=True,
-        confirm_close=False,
-        background_color=gui_theme["background"],
-        frameless=True,
-        easy_drag=False,
-    )
+    window = _create_main_window(api, url, gui_theme)
 
     api.set_window(window)
     lifecycle = ApplicationLifecycle(

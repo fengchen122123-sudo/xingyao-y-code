@@ -2185,6 +2185,10 @@ class SubagentTask:
     terminal_callback: Callable | None = field(default=None, repr=False)
     callback_invoked: bool = field(default=False, repr=False)
     model_config: tuple | None = field(default=None, repr=False)
+    # 子代理 diff_ready 等事件转发回父回合的事件回调（主对话 emit）。
+    # 子代理工具（edit_file/write_file）产生的 diff 若不转发，父回合的
+    # "文件更改"面板会丢失子代理修改的文件。
+    event_callback: Callable | None = field(default=None, repr=False)
     thread: threading.Thread | None = field(default=None, repr=False)
     custom_config: dict | None = field(default=None, repr=False)
     timeout_seconds: int = field(default=600, repr=False)
@@ -2343,6 +2347,7 @@ class SubagentManager:
         plan_item_id: str = "",
         terminal_callback: Callable | None = None,
         model_config: tuple | None = None,
+        event_callback: Callable | None = None,
     ) -> str:
         """运行一个子代理任务。
 
@@ -2384,6 +2389,7 @@ class SubagentManager:
             terminal_callback=terminal_callback,
             model_config=model_config,
             custom_config=custom_config,
+            event_callback=event_callback,
         )
         with self._lock:
             self._make_capacity_locked()
@@ -3210,6 +3216,17 @@ class SubagentManager:
                         )
                     else:
                         tool_errors.pop(name, None)
+                elif event.kind == "diff_ready":
+                    # 子代理修改文件产生的 diff 必须转发回父回合，否则父回合的
+                    # "文件更改"面板会丢失子代理的改动。tool_call_id 是子代理
+                    # 内部的调用 id，父端匹配不到会归入 legacy_diffs 兜底，
+                    # 仍能汇总展示。后台子代理在父回合结束后才转发时，父端
+                    # 事件流已收尾，转发为 best-effort（失败不影响主流程）。
+                    if task.event_callback is not None:
+                        try:
+                            task.event_callback("diff_ready", dict(event.payload))
+                        except Exception:
+                            logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
         task.tool_errors.update(tool_errors)
         result_text = "".join(answer)
 
@@ -3511,6 +3528,7 @@ def run_subagent(
             subagent_type=subagent_type,
             plan_item_id=plan_item_id,
             terminal_callback=terminal_callback if scheduler is not None else None,
+            event_callback=event_callback,
         )
     except Exception as error:
         # 启动失败（如容量满）时回滚计划项，释放 _in_flight_files 占用

@@ -28,6 +28,18 @@
     <!-- 顶栏 -->
     <Topbar />
 
+    <!-- frameless 窗口透明 resize 热区：WebView 保持全铺，不露出宿主边带 -->
+    <div
+      v-for="edge in WINDOW_RESIZE_EDGES"
+      v-if="!windowMaximized"
+      :key="edge"
+      class="window-resize-handle"
+      :class="`resize-${edge.replace('_', '-')}`"
+      data-test="window-resize-handle"
+      :data-resize-edge="edge"
+      @mousedown.left.prevent="beginWindowResize(edge)"
+    ></div>
+
     <!-- 主体区域 -->
     <div id="main">
       <SettingsPage v-if="store.settingsOpen" />
@@ -184,6 +196,36 @@ import PermCard from './components/PermCard.vue';
 import ImageLightbox from './components/ImageLightbox.vue';
 import Subpage from './components/Subpage.vue';
 import SettingsPage from './components/SettingsPage.vue';
+
+type WindowResizeEdge =
+  | 'left' | 'right' | 'top' | 'bottom'
+  | 'top_left' | 'top_right' | 'bottom_left' | 'bottom_right';
+
+const WINDOW_RESIZE_EDGES: WindowResizeEdge[] = [
+  'left', 'right', 'top', 'bottom',
+  'top_left', 'top_right', 'bottom_left', 'bottom_right',
+];
+
+function beginWindowResize(edge: WindowResizeEdge) {
+  void window.pywebview?.api?.window_begin_resize?.(edge);
+}
+
+const windowMaximized = ref(false);
+
+async function refreshWindowMaximized() {
+  try {
+    const result = await window.pywebview?.api?.window_is_maximized?.();
+    if (result?.ok) windowMaximized.value = !!result.maximized;
+  } catch {
+    // 浏览器开发态或桥接初始化期间保持普通窗口状态。
+  }
+}
+
+onMounted(() => {
+  void refreshWindowMaximized();
+  window.addEventListener('resize', refreshWindowMaximized);
+});
+onUnmounted(() => window.removeEventListener('resize', refreshWindowMaximized));
 
 const store = useAppStore();
 const chatScrollRef = ref<HTMLElement | null>(null);
@@ -714,6 +756,43 @@ onUnmounted(() => {
   display: flex;
   min-height: 0;
 }
+
+.window-resize-handle {
+  position: fixed;
+  /* 高于常规内容，低于所有 1000+ 模态层，弹窗不会被边缘热区穿透。 */
+  z-index: 999;
+  background: transparent;
+  user-select: none;
+}
+.resize-left,
+.resize-right {
+  top: 6px;
+  bottom: 6px;
+  width: 3px;
+  cursor: ew-resize;
+}
+.resize-left { left: 0; }
+.resize-right { right: 0; }
+.resize-top,
+.resize-bottom {
+  left: 6px;
+  right: 6px;
+  height: 3px;
+  cursor: ns-resize;
+}
+.resize-top { top: 0; }
+.resize-bottom { bottom: 0; }
+.resize-top-left,
+.resize-top-right,
+.resize-bottom-left,
+.resize-bottom-right {
+  width: 6px;
+  height: 6px;
+}
+.resize-top-left { top: 0; left: 0; cursor: nwse-resize; }
+.resize-top-right { top: 0; right: 0; cursor: nesw-resize; }
+.resize-bottom-left { bottom: 0; left: 0; cursor: nesw-resize; }
+.resize-bottom-right { right: 0; bottom: 0; cursor: nwse-resize; }
 
 #center {
   flex: 1;

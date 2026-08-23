@@ -251,12 +251,12 @@ function handleSend() {
 <style scoped>
 #input-area {
   border-top: 1px solid var(--border);
-  /* 两侧只留 10px 呼吸位，输入框拉伸占满中间栏，不再留 28px 大白边 */
+  /* 顶部分隔线保持全宽，输入框本体限宽居中与上方消息列对齐 */
   padding: 12px 10px 10px;
   flex-shrink: 0;
 }
 #input-wrap {
-  /* 自适应拉伸占满输入区，不再限宽居中（两侧不留白） */
+  max-width: var(--chat-col-width);
   margin: 0 auto;
 }
 
@@ -265,7 +265,8 @@ function handleSend() {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  margin-bottom: 8px;
+  margin: 0 auto 8px;
+  max-width: var(--chat-col-width);
 }
 .queue-item {
   display: flex;
@@ -461,6 +462,7 @@ textarea {
 
 #input-meta {
   margin: 6px auto 0;
+  max-width: var(--chat-col-width);
   display: flex;
   justify-content: space-between;
   font-size: 11.5px;

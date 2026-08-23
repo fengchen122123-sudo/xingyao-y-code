@@ -75,7 +75,7 @@ watch(() => store.permRequest.reqId, () => {
 
 <style scoped>
 .perm-card {
-  max-width: 880px;
+  max-width: var(--chat-col-width);
   margin: 10px auto;
   background: var(--bg1);
   border: 1px solid var(--border);

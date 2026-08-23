@@ -55,6 +55,11 @@
   --float-bg: var(--theme-float-background);
   --mono: var(--theme-font-mono);
   --sans: var(--theme-font-sans);
+
+  /* 对话内容列宽度：消息、执行过程折叠卡、文件更改面板、输入框统一占满可用
+     宽度，不再固定 880px 居中，收起两侧面板后无大片留白，各元素左对齐线
+     一致。属布局变量，非主题 token，不受主题运行时覆盖。 */
+  --chat-col-width: 100%;
 }
 
 * {
@@ -176,6 +181,7 @@ html {
      调低分区背景透明度时表面随之半透明，让分区背景图透进气泡区域 */
   --theme-region-surface: color-mix(in srgb, var(--theme-background-card) var(--theme-region-bg-opacity-pct), transparent);
   --theme-region-surface-panel: color-mix(in srgb, var(--theme-background-panel) var(--theme-region-bg-opacity-pct), transparent);
+  --theme-region-surface-code: color-mix(in srgb, var(--theme-code-background) var(--theme-region-bg-opacity-pct), transparent);
 }
 
 /* 分区前景表面接管：气泡/输入框/权限卡的实色背景改随分区背景透明度。
@@ -189,6 +195,14 @@ html {
 }
 [data-theme-region="composer"] #input-box[id] {
   background: var(--theme-region-surface) !important;
+}
+/* MD 代码块与"文件更改"面板同样随分区背景透明度透图：全局背景图模式下
+   不再以实色块突兀遮挡，代码块用 code 语义色参与透明混合 */
+[data-theme-region="workspace"] .md-body pre {
+  background: var(--theme-region-surface-code) !important;
+}
+[data-theme-region="workspace"] .cfp[class] {
+  background: var(--theme-region-surface-panel) !important;
 }
 
 [data-theme-region]::before,
@@ -422,7 +436,7 @@ button {
   position: relative;
   width: 100%;
   max-width: 680px;
-  background: var(--bg1);
+  background: var(--theme-region-surface, var(--bg1));
   border: 1px solid var(--border);
   border-radius: 14px;
   padding: 16px 18px 12px;
@@ -552,7 +566,7 @@ button {
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  background: var(--bg1);
+  background: var(--theme-region-surface-panel, var(--bg1));
   border: 1px solid var(--border);
   border-radius: 10px;
   padding: 8px 16px;
