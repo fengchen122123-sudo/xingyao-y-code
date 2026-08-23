@@ -33,7 +33,7 @@ describe('ModelCascader', () => {
       width: 220, height: 40, toJSON: () => ({}),
     });
     document.body.appendChild(anchor);
-    const wrapper = mount(ModelCascader, { props: { visible: true, anchorEl: anchor } });
+    const wrapper = mount(ModelCascader, { props: { visible: true, anchorEl: anchor }, global: { stubs: { teleport: true } } });
 
     const provider = wrapper.findAll('.cascader-item').find(item => item.text().includes('厂商一'))!;
     await provider.trigger('mouseenter');
@@ -47,7 +47,7 @@ describe('ModelCascader', () => {
 
   it('aligns the first model row with the hovered provider row', async () => {
     const anchor = document.createElement('button');
-    const wrapper = mount(ModelCascader, { props: { visible: true, anchorEl: anchor } });
+    const wrapper = mount(ModelCascader, { props: { visible: true, anchorEl: anchor }, global: { stubs: { teleport: true } } });
     const provider = wrapper.find('.cascader-main-panel .cascader-item');
     provider.element.getBoundingClientRect = () => ({
       x: 100, y: 200, top: 200, right: 340, bottom: 236, left: 100,
@@ -68,10 +68,12 @@ describe('ModelCascader', () => {
       width: 220, height: 40, toJSON: () => ({}),
     });
 
-    const wrapper = mount(ModelCascader, { props: { visible: false, anchorEl: anchor } });
+    const wrapper = mount(ModelCascader, { props: { visible: false, anchorEl: anchor }, global: { stubs: { teleport: true } } });
     await wrapper.setProps({ visible: true });
 
-    expect(wrapper.classes()).toContain('opens-up');
-    expect(wrapper.attributes('style')).toContain('--cascader-max-height: 680px');
+    // teleport 桩后组件根是 stub，样式断言查真实根元素
+    const root = wrapper.get('#model-cascader');
+    expect(root.classes()).toContain('opens-up');
+    expect(root.attributes('style')).toContain('--cascader-max-height: 680px');
   });
 });
