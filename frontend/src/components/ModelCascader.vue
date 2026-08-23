@@ -1,5 +1,8 @@
 <template>
-  <div id="model-cascader" :class="{ show: visible, 'opens-up': opensUp }" :style="styleObj" @click.stop>
+  <!-- Teleport 到 body：fixed 浮层必须逃离所在分区的 isolation 层叠上下文
+       （composer 分区 z=5，否则往上弹时被 workspace(6)/会话工具栏(10) 盖住） -->
+  <Teleport to="body">
+    <div id="model-cascader" :class="{ show: visible, 'opens-up': opensUp }" :style="styleObj" @click.stop>
     <!-- 二级子面板：具体模型列表 -->
     <div ref="subPanelEl" class="cascader-sub-panel" :class="{ show: activeProviderName }" :style="subPanelStyle">
       <div
@@ -50,7 +53,8 @@
         </div>
       </template>
     </div>
-  </div>
+    </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
