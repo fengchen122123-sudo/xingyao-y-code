@@ -1903,6 +1903,13 @@ export const useAppStore = defineStore('app', {
       this.connected = true;
 
       const currentRuntimeKey = this._runtimeKey();
+      // 拖放文件路径推送（GUI 线程死锁修复后改走 _js_queue 事件管线）：
+      // 转发给 useAttachments 挂在 window 上的匹配逻辑，不参与会话 runtime 归属
+      if (type === 'dropped_paths_push') {
+        const push = (window as unknown as { __ycode_on_drop_paths?: (p: unknown) => void }).__ycode_on_drop_paths;
+        if (push) push(data);
+        return;
+      }
       // frameless 自绘标题栏关闭请求：弹现代确认框（替代 win32 原生 MessageBox），
       // 不参与会话 runtime 归属逻辑，处理完直接返回
       if (type === 'close_requested') {
