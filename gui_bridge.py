@@ -574,6 +574,58 @@ class ApiBridge:
             logger.warning("标题栏拖拽启动失败: %s", error)
             return {"ok": False, "error": str(error)}
 
+    def window_begin_resize(self, edge: str) -> Dict[str, Any]:
+        """由页面透明边缘热区进入 Windows 原生八方向 resize 循环。"""
+        resize_codes = {
+            "left": 1,
+            "right": 2,
+            "top": 3,
+            "top_left": 4,
+            "top_right": 5,
+            "bottom": 6,
+            "bottom_left": 7,
+            "bottom_right": 8,
+        }
+        code = resize_codes.get(str(edge))
+        if code is None:
+            return {"ok": False, "error": "无效的窗口缩放方向"}
+        hwnd = getattr(self, "_hwnd", 0)
+        form = getattr(self, "_browser_form", None)
+        if not hwnd or form is None or sys.platform != "win32":
+            return {"ok": False, "error": "窗口未就绪"}
+        done = {"ok": False, "error": None}
+
+        def _resize():
+            try:
+                from ctypes import wintypes
+
+                user32 = ctypes.windll.user32
+                user32.IsZoomed.argtypes = [wintypes.HWND]
+                user32.IsZoomed.restype = wintypes.BOOL
+                user32.ReleaseCapture.argtypes = []
+                user32.ReleaseCapture.restype = wintypes.BOOL
+                user32.SendMessageW.argtypes = [
+                    wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM,
+                ]
+                user32.SendMessageW.restype = wintypes.LPARAM
+                if user32.IsZoomed(hwnd):
+                    done["error"] = "最大化窗口不能调整大小"
+                    return
+                user32.ReleaseCapture()
+                user32.SendMessageW(hwnd, 0x0112, 0xF000 | code, 0)
+                done["ok"] = True
+            except Exception as error:  # noqa: BLE001
+                done["error"] = str(error)
+
+        try:
+            from System.Windows import Forms as WinForms
+
+            form.Invoke(WinForms.MethodInvoker(_resize))
+            return done
+        except Exception as error:  # noqa: BLE001
+            logger.warning("窗口边缘缩放启动失败: %s", error)
+            return {"ok": False, "error": str(error)}
+
     def _is_window_zoomed(self) -> bool:
         hwnd = getattr(self, "_hwnd", 0)
         if not hwnd or sys.platform != "win32":
@@ -794,16 +846,9 @@ class ApiBridge:
                     if frameless:
                         # 无边框：启用边缘调整大小 + Aero Snap（GUI 线程内子类化）
                         self._enable_frameless_resize()
-                        # 启动即应用主题的窗口边框色（1px 系统边框，避免黑边）
-                        if self._native_titlebar is not None:
-                            try:
-                                from core.frameless import set_frame_border_color
-
-                                border = self._native_titlebar.get("border")
-                                if border:
-                                    set_frame_border_color(hwnd, border)
-                            except Exception:
-                                logger.debug("启动边框色应用失败", exc_info=True)
+                        # 统一走标题栏应用入口：撤销 pywebview 延伸进客户区的
+                        # 1px frame，并隐藏 WS_THICKFRAME 的 DWM 外框。
+                        self._apply_titlebar_theme()
                     else:
                         time.sleep(0.05)
                         self._apply_titlebar_theme()
@@ -869,7 +914,12 @@ class ApiBridge:
         """找到窗口后延迟重设标题栏主题，覆盖启动后期边框被重建的场景。"""
         for delay in (0.5, 3, 7, 15, 30):
             time.sleep(delay)
-            self._apply_titlebar_theme()
+            try:
+                self._apply_titlebar_theme()
+            except Exception:
+                # DWM / HWND 在 loaded、restored 交界可能短暂不可写；保留后续
+                # 重放机会，避免一次瞬态失败终止整条 55.5 秒恢复序列。
+                logger.warning("延迟重放 frameless 窗口框架失败", exc_info=True)
 
     def _apply_window_icon(self):
         """用 assets/ycode.ico 替换窗口标题栏与任务栏图标（WM_SETICON）。"""
@@ -1044,32 +1094,41 @@ class ApiBridge:
         return bool(getattr(window, "frameless", False)) if window is not None else False
 
     def _apply_frameless_titlebar_memory(self, native_titlebar: Dict[str, Any]) -> None:
-        """frameless 下仅校验并提交标题栏内存态（mode 供自绘按钮明暗用），不调 DWM。
-        例外：native_titlebar.border 重新定义为 THICKFRAME 的 1px 系统边框色，
-        通过 DWM 色板写入，让窗口边框随主题（否则浅色主题下是显眼的黑色边）。"""
+        """frameless 下提交标题栏内存态，并确保 DWM 不绘制 THICKFRAME 外框。"""
         candidate = copy.deepcopy(native_titlebar)
         mode = candidate.get("mode")
         if mode not in ("light", "dark"):
             raise ThemeError("invalid_value", "native_titlebar.mode", "标题栏模式只能是 light 或 dark")
+        hwnd = getattr(self, "_hwnd", 0)
+        if hwnd:
+            try:
+                from core.frameless import suppress_frame_border
+
+                suppressed = suppress_frame_border(hwnd)
+            except Exception as error:
+                raise ThemeError(
+                    "native_titlebar_failed",
+                    "native_titlebar.border",
+                    "隐藏 frameless DWM 窗口外框失败",
+                ) from error
+            if suppressed is False:
+                raise ThemeError(
+                    "native_titlebar_failed",
+                    "native_titlebar.border",
+                    "隐藏 frameless DWM 窗口外框失败",
+                )
         self._native_titlebar = candidate
         self._titlebar_dark = mode == "dark"
         self._native_titlebar_color_capability = _DWM_COLOR_CAPABILITY_NOT_APPLICABLE
-        # 边框色跟随主题（最佳努力，失败不影响主题应用）
-        border = candidate.get("border")
-        hwnd = getattr(self, "_hwnd", 0)
-        if border and hwnd:
-            try:
-                from core.frameless import set_frame_border_color
-
-                set_frame_border_color(hwnd, border)
-            except Exception:
-                logger.debug("边框色应用失败（不影响主题）", exc_info=True)
 
     def _apply_titlebar_theme(self) -> bool:
         """Reapply the last resolved native titlebar after DWM rebuilds the frame."""
         native_titlebar = getattr(self, "_native_titlebar", None)
         if native_titlebar is None:
             return False
+        if self._is_frameless():
+            self._apply_frameless_titlebar_memory(native_titlebar)
+            return True
         return self._apply_native_titlebar_theme(native_titlebar)
 
     def _native_titlebar_capability(self) -> str:
@@ -1084,7 +1143,9 @@ class ApiBridge:
         def operation():
             theme_id = "builtin.dark" if bool(dark) else "builtin.light"
             theme = get_gui_theme_repository().get_theme(theme_id)
-            if not self._apply_titlebar_colors(theme["native_titlebar"]):
+            if self._is_frameless():
+                self._apply_frameless_titlebar_memory(theme["native_titlebar"])
+            elif not self._apply_titlebar_colors(theme["native_titlebar"]):
                 raise ThemeError("native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败")
             return {
                 "ok": True,
@@ -1177,7 +1238,10 @@ class ApiBridge:
             previous_titlebar = copy.deepcopy(getattr(self, "_native_titlebar", None))
             previous_dark = bool(getattr(self, "_titlebar_dark", True))
             previous_capability = self._native_titlebar_capability()
-            if not self._apply_titlebar_colors(theme["native_titlebar"]):
+            if self._is_frameless():
+                # frameless 自绘标题栏：撤销 1px frame 延伸并隐藏 DWM 外框。
+                self._apply_frameless_titlebar_memory(theme["native_titlebar"])
+            elif not self._apply_titlebar_colors(theme["native_titlebar"]):
                 raise ThemeError(
                     "native_titlebar_failed", "native_titlebar", "原生标题栏颜色应用失败",
                 )
@@ -1187,13 +1251,16 @@ class ApiBridge:
                 rollback_ok = True
                 try:
                     if previous_titlebar is not None:
-                        rollback_result = self._coerce_native_titlebar_write_result(
-                            self._write_native_titlebar_dwm(previous_titlebar),
-                        )
-                        rollback_ok = rollback_result["ok"]
+                        if self._is_frameless():
+                            self._apply_frameless_titlebar_memory(previous_titlebar)
+                        else:
+                            rollback_result = self._coerce_native_titlebar_write_result(
+                                self._write_native_titlebar_dwm(previous_titlebar),
+                            )
+                            rollback_ok = rollback_result["ok"]
                 except Exception:
                     rollback_ok = False
-                    logger.exception("活动主题持久化失败后的 DWM 回滚发生异常")
+                    logger.exception("活动主题持久化失败后的标题栏回滚发生异常")
                 finally:
                     # Memory must always describe the authoritative persisted
                     # theme so a later frame reapply can heal native DWM state.

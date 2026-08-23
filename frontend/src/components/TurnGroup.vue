@@ -68,10 +68,12 @@ const title = computed(() => {
 
 <style scoped>
 .turn-fold {
-  margin: 2px 0 6px;
+  max-width: var(--chat-col-width);
+  margin: 2px auto 6px;
 }
 .turn-changes {
-  margin: 6px 0 10px;
+  max-width: var(--chat-col-width);
+  margin: 6px auto 10px;
 }
 /* 回合折叠头在统一体系上加轻量 hover 底色，与消息流的区分度更强 */
 .turn-fold :deep(.fold-head) {

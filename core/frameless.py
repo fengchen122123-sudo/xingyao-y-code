@@ -6,20 +6,18 @@ frameless 窗口（FormBorderStyle.None）默认丢失：边缘拖拽调整大�
 1. 窗口样式位（GUI 线程内 SetWindowLong）：
    - WS_MINIMIZEBOX | WS_MAXIMIZEBOX：恢复最小化动画、双击最大化、任务栏交互
    - WS_THICKFRAME：Aero Snap 的硬前提（缺它 Win+方向键无效）；副作用是系统
-     画 1px 边框，颜色经 DWMWA_BORDER_COLOR 色板跟随主题（浅色主题无黑边）
+     画原生外框；通过 DWMWA_COLOR_NONE 禁止绘制，并用 DWM 标准圆角偏好保留
+     Windows 11 的窗口圆角，只保留 resize/Snap/阴影语义
 2. WM_NCCALCSIZE 拦截（wParam=1 → 返回 0）：清空非客户区，消除 THICKFRAME
    无边框窗口顶部的黑色伪标题栏残留条
-3. WebView2 边缘缩进（_inset_webview）：WebView2 控件四周缩进 RESIZE_BORDER
-   像素。跨进程约束：WebView2 深层渲染窗口（Chrome_WidgetWin_1 /
-   RenderWidgetHostHWND）属于 msedgewebview2.exe，宿主无法子类化它们，而
-   真实鼠标命中恰发生在那层——缩进后边缘带只被宿主进程窗口覆盖，
-   鼠标在边缘命中宿主 → 返回边框码 → 系统原生 resize（带动画）
-4. 宿主侧窗口子类化（WM_NCHITTEST）：边缘返回边框码（优先）、标题栏拖拽区
+3. 宿主侧窗口子类化（WM_NCHITTEST）：边缘返回边框码（优先）、标题栏拖拽区
    矩形内返回 HTCAPTION；标题栏拖拽由前端 mousedown 触发 window_begin_drag
    （SC_MOVE+HTCAPTION 原生移动循环），松手后按光标贴边补发 Win+方向键
    触发系统 Aero Snap
+4. 页面四边/四角的透明热区调用 window_begin_resize，WebView2 保持全铺，
+   不再为了命中测试而露出可见宿主边带
 5. 周期补装定时器（90 秒）：宿主侧后代窗口在页面渲染期间可能销毁重建，
-   幂等补装子类化与缩进
+   幂等补装子类化
 
 线程安全：SetWindowLongPtrW 跨线程子类化不可靠，必须通过 form.Invoke 在
 WinForms GUI 线程内执行（实测验证）。
@@ -29,6 +27,7 @@ from __future__ import annotations
 
 import ctypes
 import logging
+import sys
 from ctypes import wintypes
 
 logger = logging.getLogger(__name__)
@@ -49,18 +48,27 @@ WS_MAXIMIZEBOX = 0x00010000
 # Windows 的 Aero Snap（键盘 Win+方向键与拖拽贴边）要求窗口带 WS_THICKFRAME，
 # FormBorderStyle.None 把它剥掉了。加回后 DWM 同时恢复窗口阴影（无边框窗口
 # 常配）；DefWindowProc 的默认命中测试也会在边缘返回边框码，与子类化叠加无害。
-# 副作用：THICKFRAME 由系统画 1px 原生边框，颜色用 DWM 色板可自定义
-# （set_frame_border_color），跟随主题 native_titlebar.border。
+# 副作用：THICKFRAME 会让系统恢复原生外框；suppress_frame_border 用
+# DWMWA_COLOR_NONE 禁止绘制外框，但不移除样式位。
 WS_THICKFRAME = 0x00040000
 
-# DWM 边框/标题色属性（DWMWA_*）
+# DWM 窗口外观属性（Windows 11 22000+）
+_DWMWA_WINDOW_CORNER_PREFERENCE = 33
 _DWMWA_BORDER_COLOR = 34
-_DWMWA_TEXT_COLOR = 36
-_DWMWA_CAPTION_COLOR = 35
+_DWMWCP_ROUND = 2
+_DWMWA_COLOR_NONE = 0xFFFFFFFE
 
-# 边缘可拖拽宽度（物理像素）：同时决定 WebView2 缩进的边带宽度。
-# 命中带与视觉边带同宽（跨进程限制，无法分离）：过窄会导致边缘 resize
-# 几乎无法命中。3px 视觉纤细且仍可命中；Windows 原生约 4-8px。
+
+class _DWM_MARGINS(ctypes.Structure):
+    _fields_ = [
+        ("cxLeftWidth", ctypes.c_int),
+        ("cxRightWidth", ctypes.c_int),
+        ("cyTopHeight", ctypes.c_int),
+        ("cyBottomHeight", ctypes.c_int),
+    ]
+
+# 原生 WM_NCHITTEST 边缘命中宽度（物理像素）；页面层另有透明 CSS 热区，
+# 深层 WebView2 窗口接管命中时也能进入相同的系统 resize 循环。
 RESIZE_BORDER = 3
 
 _WNDPROC = ctypes.WINFUNCTYPE(
@@ -86,6 +94,7 @@ _drag_region: list[int] | None = None
 _SUBCLASSED: dict[int, object] = {}
 # 周期补装定时器是否已启动（防 loaded/restored 重装触发多个定时器）
 _periodic_started = False
+_border_suppression_unsupported_logged = False
 
 
 def _signed_short(value: int) -> int:
@@ -166,68 +175,61 @@ def set_drag_region(x: int, y: int, w: int, h: int) -> None:
     logger.info("frameless 拖拽区已登记: x=%s y=%s w=%s h=%s", _drag_region[0], _drag_region[1], _drag_region[2], _drag_region[3])
 
 
-def set_frame_border_color(hwnd: int, color_hex: str) -> bool:
-    """自绘模式下用 DWM 色板设置 THICKFRAME 的 1px 系统边框颜色。
+def suppress_frame_border(hwnd: int) -> bool | None:
+    """禁止 DWM 绘制 WS_THICKFRAME 外框，并保留 Windows 11 标准圆角。
 
-    主题 native_titlebar.border 在 frameless 下重新定义为窗口边框色；
-    浅色主题边框设浅色，黑边即消失。返回是否成功（静默失败无害）。
+    返回 True 表示成功，False 表示 Windows 11 调用失败，None 表示系统版本
+    早于 Windows 11 22000、公开 DWM API 不支持该能力。
     """
+    global _border_suppression_unsupported_logged
     if not hwnd:
         return False
-    try:
-        color = _hex_to_colorref(color_hex)
-        hr = ctypes.windll.dwmapi.DwmSetWindowAttribute(
-            hwnd, _DWMWA_BORDER_COLOR, ctypes.byref(ctypes.c_int(color)), 4,
-        )
-        if hr == 0:
-            logger.info("frameless 窗口边框色已设为 %s", color_hex)
-            return True
-        logger.debug("DWMWA_BORDER_COLOR 失败 hr=0x%08X", hr & 0xFFFFFFFF)
+    # pywebview 在 shadow=True 时会先把 DWM frame 向客户区延伸 1px；即使
+    # DWMWA_BORDER_COLOR=NONE，这层 glass margin 仍会形成固定灰线。先把
+    # 四边 margin 清零，再关闭 THICKFRAME 的 DWM 外框绘制。
+    margins = _DWM_MARGINS(0, 0, 0, 0)
+    extend_frame = ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea
+    extend_frame.argtypes = [wintypes.HWND, ctypes.POINTER(_DWM_MARGINS)]
+    extend_frame.restype = ctypes.c_long
+    hr = extend_frame(hwnd, ctypes.pointer(margins))
+    if hr != 0:
+        logger.warning("撤销 pywebview DWM frame 延伸失败 hr=0x%08X", hr & 0xFFFFFFFF)
         return False
-    except Exception:
-        logger.warning("设置窗口边框色失败", exc_info=True)
+    if sys.getwindowsversion().build < 22000:
+        if not _border_suppression_unsupported_logged:
+            logger.warning("当前 Windows 版本不支持隐藏 DWM 窗口外框")
+            _border_suppression_unsupported_logged = True
+        return None
+    color = ctypes.c_uint32(_DWMWA_COLOR_NONE)
+    set_attribute = ctypes.windll.dwmapi.DwmSetWindowAttribute
+    set_attribute.argtypes = [
+        wintypes.HWND,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        wintypes.DWORD,
+    ]
+    set_attribute.restype = ctypes.c_long
+    corner_preference = ctypes.c_int(_DWMWCP_ROUND)
+    hr = set_attribute(
+        hwnd,
+        _DWMWA_WINDOW_CORNER_PREFERENCE,
+        ctypes.byref(corner_preference),
+        ctypes.sizeof(corner_preference),
+    )
+    if hr != 0:
+        logger.warning("启用 frameless 标准窗口圆角失败 hr=0x%08X", hr & 0xFFFFFFFF)
         return False
-
-
-def _hex_to_colorref(value: str) -> int:
-    """#RRGGBB → COLORREF（0x00BBGGRR）。"""
-    v = value.lstrip("#")
-    r, g, b = int(v[0:2], 16), int(v[2:4], 16), int(v[4:6], 16)
-    return r | (g << 8) | (b << 16)
-
-
-def _inset_webview(form, pad: int) -> None:
-    """WebView2 控件四周缩进 pad 像素，把边缘带留给宿主进程窗口（可子类化层）。
-
-    必须在 GUI 线程调用。pywebview 用 Dock=Fill 停靠控件，SetBounds 会被 Dock
-    立即覆盖，必须先解除停靠。窗口 resize 时保持缩进（SizeChanged 订阅，幂等）。
-    """
-    try:
-        ctrl = getattr(form, "webview", None)
-        if ctrl is None:
-            return
-        if not getattr(form, "_ycode_inset_bound", False):
-            from System.Windows.Forms import DockStyle
-
-            # pythonnet：None 是 Python 关键字，用 getattr 取 DockStyle.None
-            ctrl.Dock = getattr(DockStyle, "None")
-
-            def _layout(*_args):
-                try:
-                    width = form.ClientSize.Width
-                    height = form.ClientSize.Height
-                    ctrl.SetBounds(pad, pad, max(1, width - 2 * pad), max(1, height - 2 * pad))
-                except Exception:
-                    pass
-            form.SizeChanged += _layout
-            form._ycode_inset_bound = True
-            form._ycode_inset_layout = _layout  # 防 GC
-        width = form.ClientSize.Width
-        height = form.ClientSize.Height
-        ctrl.SetBounds(pad, pad, max(1, width - 2 * pad), max(1, height - 2 * pad))
-        logger.info("frameless WebView2 已缩进 %spx（边缘留给原生 resize）", pad)
-    except Exception:
-        logger.warning("frameless WebView2 缩进失败", exc_info=True)
+    hr = set_attribute(
+        hwnd,
+        _DWMWA_BORDER_COLOR,
+        ctypes.byref(color),
+        ctypes.sizeof(color),
+    )
+    if hr == 0:
+        logger.info("frameless DWM 窗口外框已隐藏")
+        return True
+    logger.warning("隐藏 frameless DWM 窗口外框失败 hr=0x%08X", hr & 0xFFFFFFFF)
+    return False
 
 
 def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
@@ -282,7 +284,7 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
     child_proc_ref = _WNDPROC(_child_wndproc)
 
     def _do_install():
-        """幂等安装：样式位 + 父/宿主侧后代子类化 + WebView2 边缘缩进。
+        """幂等安装：样式位 + 父/宿主侧后代子类化。
         可安全重复调用。"""
         try:
             # 1. 顶层窗口样式位：恢复最小化动画 / 双击最大化 / 任务栏交互 /
@@ -301,14 +303,7 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
                     state["error"] = "parent SetWindowLongPtrW failed"
                     return
                 _SUBCLASSED[hwnd] = parent_proc_ref
-            # 3. WebView2 边缘缩进（跨进程限制的标准解法）：WebView2 的深层渲染
-            #    窗口（Chrome_WidgetWin_1 / RenderWidgetHostHWND）属于
-            #    msedgewebview2.exe，宿主进程无法 SetWindowLongPtrW 子类化它们，
-            #    鼠标命中又恰恰发生在那层。把 WebView2 控件整体缩进 8px，边缘带
-            #    只剩宿主进程窗口（已子类化）→ 鼠标在边缘命中宿主 → 原生 resize。
-            #    8px 边带透出窗口背景色，视觉上即窗口边框。
-            _inset_webview(form, border)
-            # 4. 宿主侧后代窗口子类化（容器 / Chrome_WidgetWin_0 等，属本进程）
+            # 3. 宿主侧后代窗口子类化（容器 / Chrome_WidgetWin_0 等，属本进程）
             children = find_webview_child_hwnds(hwnd)
             if not children:
                 state["error"] = "no webview child hwnd"
