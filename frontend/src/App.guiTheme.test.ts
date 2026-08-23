@@ -88,4 +88,55 @@ describe('GUI theme startup error gate', () => {
 
     wrapper.unmount();
   });
+
+  it('routes eight transparent window-edge handles to native resize', async () => {
+    const beginResize = vi.fn().mockResolvedValue({ ok: true });
+    (window as any).pywebview = { api: { window_begin_resize: beginResize } };
+    const store = useAppStore();
+    store.initialized = true;
+    store.guiThemeError = null;
+    const wrapper = mount(App, {
+      global: {
+        stubs: {
+          Topbar: true, Sidebar: true, KimiEmptyState: true, TurnGroup: true,
+          InputArea: true, RightPanel: true, ConfirmModal: true, UpdateModal: true,
+          PermCard: true, ImageLightbox: true, Subpage: true, SettingsPage: true, AppIcon: true,
+        },
+      },
+    });
+
+    expect(wrapper.findAll('[data-test="window-resize-handle"]')).toHaveLength(8);
+    await wrapper.get('[data-resize-edge="right"]').trigger('mousedown', { button: 0 });
+    expect(beginResize).toHaveBeenCalledOnce();
+    expect(beginResize).toHaveBeenCalledWith('right');
+
+    wrapper.unmount();
+  });
+
+  it('removes window-edge handles while the native window is maximized', async () => {
+    (window as any).pywebview = {
+      api: {
+        window_is_maximized: vi.fn().mockResolvedValue({ ok: true, maximized: true }),
+        window_begin_resize: vi.fn().mockResolvedValue({ ok: true }),
+      },
+    };
+    const store = useAppStore();
+    store.initialized = true;
+    store.guiThemeError = null;
+    const wrapper = mount(App, {
+      global: {
+        stubs: {
+          Topbar: true, Sidebar: true, KimiEmptyState: true, TurnGroup: true,
+          InputArea: true, RightPanel: true, ConfirmModal: true, UpdateModal: true,
+          PermCard: true, ImageLightbox: true, Subpage: true, SettingsPage: true, AppIcon: true,
+        },
+      },
+    });
+
+    await vi.waitFor(() => {
+      expect(wrapper.findAll('[data-test="window-resize-handle"]')).toHaveLength(0);
+    });
+
+    wrapper.unmount();
+  });
 });

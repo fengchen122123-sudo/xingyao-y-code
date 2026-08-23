@@ -147,7 +147,7 @@ const thinkingOpen = computed({
 
 <style scoped>
 .msg {
-  max-width: 880px;
+  max-width: var(--chat-col-width);
   margin: 0 auto 18px;
 }
 .msg-user {
