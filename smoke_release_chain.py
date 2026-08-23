@@ -45,9 +45,9 @@ check("payload 无 U+2028/2029 行终止符风险", u2028_safe)
 # ── 2. 检查更新：对 v1.2.9（当前 latest）真实识别分卷组 ─────────────────
 info = fetch_latest_release()
 check("fetch_latest_release 网络 OK", info.get("ok"), info.get("msg", ""))
-check("识别到 v1.2.9 分卷组（主安装包）",
+check("识别到最新版分卷组（主安装包）",
       info.get("is_split") is True and info.get("part_count", 0) >= 4,
-      f"parts={info.get('part_count')}")
+      f"v{info.get('latest_version')} parts={info.get('part_count')}")
 check("SHA256 从 Release 说明解析成功", bool(info.get("sha256")), info.get("sha256", "")[:16] + "…")
 
 # ── 3. 真实下载：最小的 part4（7.7MB）走完整 UpdateDownloader ───────────
@@ -74,7 +74,8 @@ if downloaded and os.path.isfile(downloaded):
     check("下载产物大小与分卷一致（~7.7MB）", 7 * 1024 * 1024 < size < 9 * 1024 * 1024, f"{size/1048576:.1f}MB")
     # 完整性黄金对照：与本地构建的同名分卷逐字节一致（part4 是尾片无 MZ 头，
     # PE 头校验只对拼接后的整包有意义——真实更新流程在 SHA256 全包校验后执行）
-    local_part4 = os.path.join("dist", "release_parts", "Y-code-1.2.9.exe.part4")
+    remote_name = part4_url.rsplit("/", 1)[-1]
+    local_part4 = os.path.join("dist", "release_parts", remote_name)
     if os.path.isfile(local_part4):
         h_down = updater._sha256_file(downloaded)
         h_local = updater._sha256_file(local_part4)
