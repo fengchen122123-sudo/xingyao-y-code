@@ -8,13 +8,14 @@
       <div><span class="name">Y-CODE</span></div>
     </div>
 
-    <!-- 标题栏拖拽区：mousedown 进系统原生移动循环（SC_MOVE+HTCAPTION），
-         Aero Snap / 动画全部原生；双击最大化 -->
+    <!-- 标题栏拖拽区：mousedown 延迟进原生移动循环（SC_MOVE+HTCAPTION），
+         若系统判定为双击（detail>=2）则取消移动、改走原生最大化/还原；
+         避免 SC_MOVE 移动循环吞掉双击序列。 -->
     <div
       ref="dragRegionRef"
       class="titlebar-drag"
       @mousedown.left="beginDrag"
-      @dblclick="toggleMaximize"
+      @dblclick="toggleMaximizeNative"
     ></div>
 
     <!-- 软件更新提示按钮：发现新版本或下载就绪时展示 -->
@@ -68,9 +69,69 @@ async function toggleMaximize() {
   const result = await api()?.window_toggle_maximize?.();
   if (result?.ok) maximized.value = !!result.maximized;
 }
-async function beginDrag() {
-  // 系统原生移动循环：Snap / 动画原生。桥调用会阻塞到拖拽结束，不 await 结果
+
+// 原生最大化/还原（双击标题栏等效 HTCAPTION 双击）：优先原生 SC_MAXIMIZE/
+// SC_RESTORE，bridge 缺省新接口时回退 window_toggle_maximize（JS 桥）。
+async function toggleMaximizeNative() {
+  const bridge = api();
+  if (bridge?.window_native_maximize) {
+    const result = await bridge.window_native_maximize();
+    if (result?.ok) maximized.value = !!result.maximized;
+    return;
+  }
+  await toggleMaximize();
+}
+
+// 双击判定窗口（毫秒）：超过则按拖拽处理；系统双击间隔内第二次按下 detail>=2。
+const DBLCLICK_MS = 400;
+let dragTimer: ReturnType<typeof setTimeout> | null = null;
+let dragArmed = false;
+
+function cancelPendingDrag() {
+  if (dragTimer !== null) {
+    clearTimeout(dragTimer);
+    dragTimer = null;
+  }
+  dragArmed = false;
+}
+
+function enterNativeMoveLoop() {
+  dragTimer = null;
+  if (!dragArmed) return;
+  dragArmed = false;
+  // 系统原生移动循环：Snap / 动画原生。桥调用阻塞到拖拽结束，不 await。
   void api()?.window_begin_drag?.();
+}
+
+// 位移超过该阈值视为拖拽意图，立即进入移动循环（不傻等双击判定窗口）
+const DRAG_THRESHOLD_PX = 4;
+
+async function beginDrag(event: MouseEvent) {
+  // detail>=2：双击的第二次按下——取消待触发的移动循环，交给 dblclick 最大化。
+  if (event.detail >= 2) {
+    cancelPendingDrag();
+    return;
+  }
+  // 第一次按下：先设防，延迟进入原生移动循环，等待是否为双击。
+  // 若用户在判定窗口内已开始拖动（位移超阈值），立即进移动循环，避免拖拽粘滞。
+  cancelPendingDrag();
+  dragArmed = true;
+  const startX = event.clientX;
+  const startY = event.clientY;
+  const onMove = (ev: MouseEvent) => {
+    if (Math.abs(ev.clientX - startX) > DRAG_THRESHOLD_PX ||
+        Math.abs(ev.clientY - startY) > DRAG_THRESHOLD_PX) {
+      window.removeEventListener('mousemove', onMove, true);
+      dragTimer = null;
+      dragArmed = true;
+      enterNativeMoveLoop();
+    }
+  };
+  window.addEventListener('mousemove', onMove, true);
+  dragTimer = setTimeout(() => {
+    window.removeEventListener('mousemove', onMove, true);
+    enterNativeMoveLoop();
+  }, DBLCLICK_MS);
 }
 async function winMinimize() {
   await api()?.window_minimize?.();
@@ -114,6 +175,7 @@ onMounted(async () => {
   }
 });
 onBeforeUnmount(() => {
+  cancelPendingDrag();
   resizeObserver?.disconnect();
   window.removeEventListener('resize', reportDragRegion);
   window.removeEventListener('load', reportDragRegion);
