@@ -269,3 +269,54 @@ def test_plan_auto_continue_suppression_lifecycle():
         assert not plan_auto_continue_suppressed(session)
     finally:
         clear_plan_auto_continue_suppression(session)
+
+
+def test_maybe_clear_completed_plan_clears_when_all_terminal(tmp_path, monkeypatch):
+    """显式 session_id 路由：全部终态时清空并返回 True。"""
+    import core.plan as plan
+    manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-all-terminal")
+    manager.replace([
+        {"id": "a", "subject": "任务A", "status": "completed"},
+        {"id": "b", "subject": "任务B", "status": "failed"},
+    ])
+    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+
+    assert plan.maybe_clear_completed_plan("clear-all-terminal") is True
+    assert manager.snapshot() == []
+
+
+def test_maybe_clear_completed_plan_keeps_pending(tmp_path, monkeypatch):
+    """仍有 pending 项时不清空（跨回合任务不能被提前抹掉）。"""
+    import core.plan as plan
+    manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-has-pending")
+    manager.replace([
+        {"id": "a", "subject": "任务A", "status": "completed"},
+        {"id": "b", "subject": "任务B", "status": "pending"},
+    ])
+    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+
+    assert plan.maybe_clear_completed_plan("clear-has-pending") is False
+    assert len(manager.snapshot()) == 2
+
+
+def test_maybe_clear_completed_plan_noop_when_empty(tmp_path, monkeypatch):
+    """无计划项时返回 False，不误报清空。"""
+    import core.plan as plan
+    manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-empty")
+    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+
+    assert plan.maybe_clear_completed_plan("clear-empty") is False
+    assert manager.snapshot() == []
+
+
+def test_maybe_clear_completed_plan_noarg_routes_default_manager(tmp_path, monkeypatch):
+    """不传 session_id（CLI 路径）：走 get_default_plan_manager 默认路由。"""
+    import core.plan as plan
+    manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-noarg")
+    manager.replace([
+        {"id": "a", "subject": "任务A", "status": "cancelled"},
+    ])
+    monkeypatch.setattr(plan, "get_default_plan_manager", lambda: manager)
+
+    assert plan.maybe_clear_completed_plan() is True
+    assert manager.snapshot() == []
