@@ -233,6 +233,9 @@ def test_worker_exception_emits_turn_error_and_error_toast(monkeypatch):
     bridge._delta_last_flush = 0.0
     bridge._delta_flusher = None
     bridge._emit_token_usage = lambda: None
+    bridge._shutting_down = False
+    bridge._turn_start_lock = threading.Lock()
+    bridge._message_queues = {}
     emitted = []
     bridge.emit_event = lambda kind, data: emitted.append((kind, data))
     monkeypatch.setattr(
@@ -273,6 +276,9 @@ def test_worker_activates_session_workdir_before_context(monkeypatch, tmp_path):
     bridge._subagent_progress_poller = lambda _session_name, _stop: None
     bridge._consume_turn_events = lambda *args, **kwargs: False
     bridge._maybe_auto_rename = lambda _session_name: None
+    bridge._shutting_down = False
+    bridge._turn_start_lock = threading.Lock()
+    bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
         "get_session_model_id": lambda self, *args: None,
@@ -328,6 +334,9 @@ def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(
     bridge._subagent_progress_poller = lambda _session_name, _stop: None
     bridge._consume_turn_events = lambda *args, **kwargs: False
     bridge._maybe_auto_rename = lambda _session_name: "检查项目"
+    bridge._shutting_down = False
+    bridge._turn_start_lock = threading.Lock()
+    bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *args, **kwargs: None,
         "get_session_model_id": lambda self, *args: None,
@@ -412,6 +421,9 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     bridge._set_current_session = lambda session_name: None
     bridge._subagent_progress_poller = lambda session_name, stop: None
     bridge._maybe_auto_rename = lambda session_name: None
+    bridge._shutting_down = False
+    bridge._turn_start_lock = threading.Lock()
+    bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "set_workdir": lambda self, workdir: None,
         "ensure_session": lambda self, *args, **kwargs: None,
@@ -563,6 +575,9 @@ def test_run_turn_worker_tracks_and_clears_turn_id(monkeypatch):
     bridge._session_workdir = lambda _session_name: "GLOBAL"
     bridge._subagent_progress_poller = lambda _s, _stop: None
     bridge._maybe_auto_rename = lambda _s: None
+    bridge._shutting_down = False
+    bridge._turn_start_lock = threading.Lock()
+    bridge._message_queues = {}
     bridge._memory = type("Memory", (), {
         "ensure_session": lambda self, *a, **k: None,
         "get_session_model_id": lambda self, *a: None,
