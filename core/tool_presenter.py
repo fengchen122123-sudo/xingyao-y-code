@@ -105,7 +105,9 @@ def describe_permission_request(function_name: str, arguments: dict) -> str:
         )
     if function_name == "execute_command":
         cmd = sanitize_tool_display_text(args.get("command") or "", limit=500)
-        return f"执行命令：\n{cmd}" if cmd else "执行命令"
+        shell_id = sanitize_tool_display_text(args.get("shell_id") or "", limit=40)
+        shell_line = f"\n解释器：{shell_id}（显式覆盖）" if shell_id else ""
+        return f"执行命令{shell_line}：\n{cmd}" if cmd else f"执行命令{shell_line}"
     action = _TOOL_ACTIONS.get(function_name, f"使用工具 {function_name}")
     target = tool_target(function_name, args)
     if target:

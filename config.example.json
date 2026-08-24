@@ -2,6 +2,7 @@
   "active_model_id": "model_1",
   "permission_mode": "confirm",
   "allow_outside_workspace": false,
+  "command_shell": "auto",
   "secondary_model_id": null,
   "secondary_model_roles": {
     "vision": true,

@@ -273,6 +273,26 @@ def test_always_allow_command_rule_matches_prefix_family(
     assert asked3 == ["execute_command"]
 
 
+def test_shell_override_never_reuses_default_shell_command_allowlist(
+    interactive_env, clean_permission_state, monkeypatch, tmp_path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
+    llm.check_session_reset()
+    llm._grant_command_add(("git", "status"))
+
+    asked, requests = [], []
+    _auto_answer_broker(monkeypatch, 0, asked, requests)
+
+    assert llm.check_permission_and_ask(
+        "execute_command",
+        {"command": "git status", "shell_id": "cmd"},
+    ) is True
+    assert asked == ["execute_command"]
+    assert len(requests[0].options) == 2
+    assert requests[0].arguments["shell_id"] == "cmd"
+
+
 def test_inline_exec_command_always_allow_is_session_exact_only(
     interactive_env, clean_permission_state, monkeypatch, tmp_path
 ):

@@ -68,6 +68,22 @@ export interface ModelSettingsSnapshot {
   };
 }
 
+export interface CommandShellOption {
+  id: string;
+  label: string;
+  description: string;
+  available: boolean;
+  executable: string;
+  unavailable_reason: string;
+}
+
+export interface SystemSettingsSnapshot {
+  command_shell: string;
+  command_shell_options: CommandShellOption[];
+  command_shell_available: boolean;
+  command_shell_error: string;
+}
+
 export interface SkillInfo {
   id: string;
   short_id?: string;
@@ -214,6 +230,7 @@ export interface InitialState {
   permission_mode: PermissionMode;
   // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享配置
   allow_outside_workspace?: boolean;
+  system_settings?: SystemSettingsSnapshot;
   reasoning_effort?: ReasoningEffort;
   sessions: SessionGroup[];
   skills: SkillInfo[];
@@ -327,6 +344,8 @@ export interface PyWebViewAPI {
   set_reasoning_effort(level: ReasoningEffort): Promise<any>;
   set_permission_mode(mode: PermissionMode): Promise<any>;
   set_sandbox_enabled(enabled: boolean): Promise<any>;
+  get_system_settings(): Promise<SystemSettingsSnapshot>;
+  set_command_shell(shellId: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   get_permission_rules(): Promise<any>;
   clear_permission_rules(): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
