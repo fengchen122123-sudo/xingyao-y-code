@@ -279,7 +279,7 @@ def test_maybe_clear_completed_plan_clears_when_all_terminal(tmp_path, monkeypat
         {"id": "a", "subject": "任务A", "status": "completed"},
         {"id": "b", "subject": "任务B", "status": "failed"},
     ])
-    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+    monkeypatch.setattr(plan, "_PLAN_MANAGERS", {"clear-all-terminal": manager})
 
     assert plan.maybe_clear_completed_plan("clear-all-terminal") is True
     assert manager.snapshot() == []
@@ -293,7 +293,7 @@ def test_maybe_clear_completed_plan_keeps_pending(tmp_path, monkeypatch):
         {"id": "a", "subject": "任务A", "status": "completed"},
         {"id": "b", "subject": "任务B", "status": "pending"},
     ])
-    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+    monkeypatch.setattr(plan, "_PLAN_MANAGERS", {"clear-has-pending": manager})
 
     assert plan.maybe_clear_completed_plan("clear-has-pending") is False
     assert len(manager.snapshot()) == 2
@@ -303,7 +303,7 @@ def test_maybe_clear_completed_plan_noop_when_empty(tmp_path, monkeypatch):
     """无计划项时返回 False，不误报清空。"""
     import core.plan as plan
     manager = plan.PlanManager(storage_dir=tmp_path, session_id="clear-empty")
-    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+    monkeypatch.setattr(plan, "_PLAN_MANAGERS", {"clear-empty": manager})
 
     assert plan.maybe_clear_completed_plan("clear-empty") is False
     assert manager.snapshot() == []
@@ -320,3 +320,13 @@ def test_maybe_clear_completed_plan_noarg_routes_default_manager(tmp_path, monke
 
     assert plan.maybe_clear_completed_plan() is True
     assert manager.snapshot() == []
+
+
+def test_maybe_clear_completed_plan_does_not_create_registry_entry(monkeypatch):
+    """显式 session_id 且注册表无条目（早退回合场景）：no-op 返回 False，
+    且绝不惰性创建条目——get_plan_manager_for 会以当前线程 workdir 推导
+    storage_dir，早退路径 workdir 未绑定会创建指向进程 cwd 的污染条目。"""
+    import core.plan as plan
+    monkeypatch.setattr(plan, "_PLAN_MANAGERS", {})
+    assert plan.maybe_clear_completed_plan("never-seen-session") is False
+    assert "never-seen-session" not in plan._PLAN_MANAGERS

@@ -687,7 +687,7 @@ def test_turn_finish_emits_empty_plan_updated_when_plan_all_terminal(tmp_path, m
     manager.replace([
         {"id": "a", "subject": "任务A", "status": "completed"},
     ])
-    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+    monkeypatch.setattr(plan, "_PLAN_MANAGERS", {"sess-plan-cleared": manager})
 
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._cancel_events = {"sess-plan-cleared": threading.Event()}
@@ -760,7 +760,7 @@ def test_turn_finish_survives_plan_clear_failure(tmp_path, monkeypatch):
         raise OSError("disk full")
 
     manager.clear = _disk_full_clear
-    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+    monkeypatch.setattr(plan, "_PLAN_MANAGERS", {"sess-plan-clear-fail": manager})
 
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._cancel_events = {"sess-plan-clear-fail": threading.Event()}
