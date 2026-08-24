@@ -731,3 +731,68 @@ def test_turn_finish_emits_empty_plan_updated_when_plan_all_terminal(tmp_path, m
     finishes = [data for kind, data in emitted if kind == "turn_finish"]
     assert finishes == [{"session_name": "检查项目"}]
     assert manager.snapshot() == []
+
+
+def test_turn_finish_survives_plan_clear_failure(tmp_path, monkeypatch):
+    import core.plan as plan
+
+    manager = plan.PlanManager(storage_dir=tmp_path, session_id="sess-plan-clear-fail")
+    manager.replace([
+        {"id": "a", "subject": "任务A", "status": "completed"},
+    ])
+
+    def _disk_full_clear():
+        raise OSError("disk full")
+
+    manager.clear = _disk_full_clear
+    monkeypatch.setattr(plan, "get_plan_manager_for", lambda session_id, **kwargs: manager)
+
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._cancel_events = {"sess-plan-clear-fail": threading.Event()}
+    bridge._active_turns = {}
+    bridge._active_turn_ids = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
+    bridge._bg_summary_pending_sessions = set()
+    bridge._bg_summary_lock = threading.Lock()
+    bridge._current_permission_mode = "confirm"
+    bridge._emit_token_usage = lambda: None
+    bridge._sync_active_model_context = lambda *_args: None
+    bridge._session_workdir = lambda _session_name: "GLOBAL"
+    bridge._subagent_progress_poller = lambda _session_name, _stop: None
+    bridge._consume_turn_events = lambda *args, **kwargs: False
+    bridge._maybe_auto_rename = lambda _session_name: "检查项目"
+    bridge._shutting_down = False
+    bridge._turn_start_lock = threading.Lock()
+    bridge._message_queues = {}
+    bridge._memory = type("Memory", (), {
+        "ensure_session": lambda self, *args, **kwargs: None,
+        "get_session_model_id": lambda self, *args: None,
+        "set_session_model_id": lambda self, *args: None,
+        "add_message": lambda self, *args, **kwargs: None,
+        "set_workdir": lambda self, workdir: None,
+    })()
+    emitted = []
+    bridge.emit_event = lambda kind, data: emitted.append((kind, data))
+
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda *_args: {
+        "litellm_model": "model",
+        "api_key": "key",
+        "base_url": None,
+        "context_window": 128000,
+    })
+    monkeypatch.setattr("core.input_parser.parse_user_input", lambda text: (text, []))
+    monkeypatch.setattr("core.agent_service.prepare_turn_messages", lambda *args, **kwargs: [])
+    monkeypatch.setattr("core.memory.begin_turn_checkpoint", lambda *args, **kwargs: None)
+    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda: None)
+
+    bridge._run_turn_worker("检查项目", "sess-plan-clear-fail")
+
+    # 计划清空落盘失败（磁盘满/权限）不能吞掉 turn_finish：前端输入框靠它解锁
+    kinds = [kind for kind, _data in emitted]
+    assert "turn_finish" in kinds
+    finishes = [data for kind, data in emitted if kind == "turn_finish"]
+    assert finishes == [{"session_name": "检查项目"}]
