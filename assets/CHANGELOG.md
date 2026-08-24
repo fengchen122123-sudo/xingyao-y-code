@@ -12,7 +12,7 @@
 
 ### 修复
 
-- 修复无边框标题栏双击最大化→还原后立即点击/拖动时鼠标短暂显示禁用光标的问题：无边框标题栏被注册为原生 HTCAPTION 命中区后 WebView 不保证每次收到 DOM mouseup，前端 400ms 拖动判定定时器在左键已松开后仍触发，导致在无有效左键手势下进入 SC_MOVE。现于 GUI 线程执行原生移动命令前用 GetAsyncKeyState(VK_LBUTTON) 校验真实左键状态，左键已松开则拒绝过期拖动请求（返回 left_button_released），不再进入 SC_MOVE
+- 修复无边框标题栏双击最大化→还原后快速拖动失效并闪现禁用光标的问题：根因是标题栏拖拽区 HTCAPTION 命中拦截与前端 DOM 驱动的双轨冲突——实测全部交互（双击、拖动）均走 DOM 事件，原生 caption 路径从未承接，但拦截间歇生效会在手势中途把 mousemove/mouseup 重新路由为非客户区消息，DOM 事件流半途丢失、位移阈值路径失效，拖动退化为 400ms 定时器兜底；快速拖动在松手瞬间才进入 SC_MOVE（数毫秒即被终结）从而闪现禁用光标。现移除拖拽区 HTCAPTION/HTTRANSPARENT 命中拦截（边缘 resize 拦截保留），标题栏交互完全由前端 DOM 事件驱动（mousedown + 位移阈值即时进入原生移动循环，双击走 SC_MAXIMIZE/SC_RESTORE）；同时保留 GUI 线程内 GetAsyncKeyState(VK_LBUTTON) 权威状态守卫，左键已松开的过期拖动请求一律拒绝（返回 left_button_released），绝不进入无有效按键手势的 SC_MOVE
 - 修复多显示器下窗口拖拽贴边/最大化误判：Aero Snap 贴边判定此前拿主屏宽度与原点直接比较光标坐标，第二屏（负坐标或超出主屏范围）中间松手会被误判为贴主屏边缘。现改用 `MonitorFromPoint` + `GetMonitorInfoW` 定位光标实际所在显示器、相对其边界判定；第二屏中间不再误触发，真实贴边（含第二屏边缘）仍正确生效
 - 修复空会话切换推理强度/权限模式/沙盒开关导致欢迎页消失（表现为页面跳转）：空会话下不再插入通知消息，仅会话已有真实对话时才提示；调整失败时仍保留失败提示
 - 修复 GUI 计划编排「计划项不存在」：8-19 引入的按会话路由计划注册表生效后，`plan_write`/`plan_update`/`plan_retry`/`plan_read` 四个工具函数仍在裸写进程级单例 `_DEFAULT_PLAN_MANAGER`，而 `run_subagent` 的调度器读的是会话专属管理器，导致 plan_read 能看到、run_subagent 却报「计划项不存在」。现四个函数全部改走 `get_default_plan_manager()` 线程路由，GUI 会话中计划读写与调度器读取一致
