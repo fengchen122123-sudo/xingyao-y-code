@@ -9,7 +9,7 @@
     </div>
 
     <!-- 标题栏拖拽区：mousedown 延迟进原生移动循环（SC_MOVE+HTCAPTION），
-         若系统判定为双击（detail>=2）则取消移动、改走原生最大化/还原；
+         连续点击的偶数次按下交给 dblclick，奇数次按下仍可开始新拖动；
          避免 SC_MOVE 移动循环吞掉双击序列。 -->
     <div
       ref="dragRegionRef"
@@ -73,6 +73,7 @@ async function toggleMaximize() {
 // 原生最大化/还原（双击标题栏等效 HTCAPTION 双击）：优先原生 SC_MAXIMIZE/
 // SC_RESTORE，bridge 缺省新接口时回退 window_toggle_maximize（JS 桥）。
 async function toggleMaximizeNative() {
+  cancelPendingDrag();
   const bridge = api();
   if (bridge?.window_native_maximize) {
     const result = await bridge.window_native_maximize();
@@ -82,23 +83,26 @@ async function toggleMaximizeNative() {
   await toggleMaximize();
 }
 
-// 双击判定窗口（毫秒）：超过则按拖拽处理；系统双击间隔内第二次按下 detail>=2。
+// 双击判定窗口（毫秒）：超过则按拖拽处理；连续点击的偶数次按下交给 dblclick。
 const DBLCLICK_MS = 400;
 let dragTimer: ReturnType<typeof setTimeout> | null = null;
 let dragArmed = false;
+let removePendingDragListeners: (() => void) | null = null;
 
 function cancelPendingDrag() {
   if (dragTimer !== null) {
     clearTimeout(dragTimer);
     dragTimer = null;
   }
+  removePendingDragListeners?.();
+  removePendingDragListeners = null;
   dragArmed = false;
 }
 
 function enterNativeMoveLoop() {
-  dragTimer = null;
-  if (!dragArmed) return;
-  dragArmed = false;
+  const shouldStart = dragArmed;
+  cancelPendingDrag();
+  if (!shouldStart) return;
   // 系统原生移动循环：Snap / 动画原生。桥调用阻塞到拖拽结束，不 await。
   void api()?.window_begin_drag?.();
 }
@@ -107,12 +111,12 @@ function enterNativeMoveLoop() {
 const DRAG_THRESHOLD_PX = 4;
 
 async function beginDrag(event: MouseEvent) {
-  // detail>=2：双击的第二次按下——取消待触发的移动循环，交给 dblclick 最大化。
-  if (event.detail >= 2) {
+  // 连续点击序列中的偶数次按下交给 dblclick；第三次等奇数按下可开始新拖动。
+  if (event.detail > 0 && event.detail % 2 === 0) {
     cancelPendingDrag();
     return;
   }
-  // 第一次按下：先设防，延迟进入原生移动循环，等待是否为双击。
+  // 奇数次按下：先设防，延迟进入原生移动循环，等待是否为双击。
   // 若用户在判定窗口内已开始拖动（位移超阈值），立即进移动循环，避免拖拽粘滞。
   cancelPendingDrag();
   dragArmed = true;
@@ -121,17 +125,17 @@ async function beginDrag(event: MouseEvent) {
   const onMove = (ev: MouseEvent) => {
     if (Math.abs(ev.clientX - startX) > DRAG_THRESHOLD_PX ||
         Math.abs(ev.clientY - startY) > DRAG_THRESHOLD_PX) {
-      window.removeEventListener('mousemove', onMove, true);
-      dragTimer = null;
-      dragArmed = true;
       enterNativeMoveLoop();
     }
   };
-  window.addEventListener('mousemove', onMove, true);
-  dragTimer = setTimeout(() => {
+  const onMouseUp = () => cancelPendingDrag();
+  removePendingDragListeners = () => {
     window.removeEventListener('mousemove', onMove, true);
-    enterNativeMoveLoop();
-  }, DBLCLICK_MS);
+    window.removeEventListener('mouseup', onMouseUp, true);
+  };
+  window.addEventListener('mousemove', onMove, true);
+  window.addEventListener('mouseup', onMouseUp, true);
+  dragTimer = setTimeout(enterNativeMoveLoop, DBLCLICK_MS);
 }
 async function winMinimize() {
   await api()?.window_minimize?.();
