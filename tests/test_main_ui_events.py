@@ -944,3 +944,23 @@ def test_effort_command_rejects_without_active_model(monkeypatch):
     main.handle_slash_command("/effort low")
 
     assert any("没有激活模型" in line for line in printed)
+
+
+def test_turn_finished_clears_completed_plan(tmp_path, monkeypatch):
+    import core.plan as plan
+
+    manager = plan.PlanManager(storage_dir=tmp_path, session_id="cli-clear")
+    manager.replace([
+        {"id": "a", "subject": "任务A", "status": "completed"},
+    ])
+    monkeypatch.setattr(plan, "get_default_plan_manager", lambda: manager)
+
+    factory = TurnEventFactory("turn-plan-clear")
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_print_ui_fragment", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "app_instance", None)
+    main.ui_renderers.pop("turn-plan-clear", None)
+
+    main._render_ui_event(factory.emit("turn_finished"))
+
+    assert manager.snapshot() == []

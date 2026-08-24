@@ -1179,6 +1179,14 @@ def _render_ui_event(event):
             _print_ui_fragment(fragment)
 
     if event.kind == "turn_finished":
+        from core.plan import maybe_clear_completed_plan
+
+        if maybe_clear_completed_plan():
+            # 计划全部终态已清空：CLI 计划面板是拉取式渲染
+            # （get_live_plan_content 每次读取快照），需要一次 invalidate
+            # 触发重绘为「暂无计划步骤」；本分支自身无 invalidate
+            if app_instance is not None:
+                app_instance.invalidate()
         for fragment in renderer.flush_tool_progress():
             _print_ui_fragment(fragment)
         # 把渲染器里滞留的尾部正文（保守持留的末尾字符、收尾代码围栏等）
