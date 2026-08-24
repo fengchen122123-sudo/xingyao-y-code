@@ -10,41 +10,30 @@
       </button>
     </header>
 
-    <section class="system-card">
-      <div class="setting-heading">
-        <div>
+    <section class="settings-list">
+      <div class="setting-row">
+        <div class="setting-copy">
           <h2>默认命令解释器</h2>
           <p>AI 命令、后台任务、计划验证和右侧终端统一优先使用所选解释器。</p>
         </div>
-      </div>
-
-      <div class="shell-options">
-        <label
-          v-for="option in store.systemSettings.command_shell_options"
-          :key="option.id"
-          :data-test="`shell-${option.id}`"
-          class="shell-option"
-          :class="{ unavailable: !option.available, selected: option.id === store.systemSettings.command_shell }"
+        <select
+          data-test="command-shell-select"
+          class="setting-select"
+          :value="store.systemSettings.command_shell"
+          :disabled="saving"
+          @change="selectShell(($event.target as HTMLSelectElement).value)"
         >
-          <input
-            type="radio"
-            name="command-shell"
+          <option
+            v-for="option in store.systemSettings.command_shell_options"
+            :key="option.id"
+            :data-test="`shell-${option.id}`"
             :value="option.id"
-            :checked="option.id === store.systemSettings.command_shell"
-            :disabled="!option.available || saving"
-            @change="selectShell(option.id)"
-          />
-          <span class="shell-copy">
-            <span class="shell-title">
-              {{ option.label }}
-              <span v-if="!option.available" class="unavailable-badge">{{ option.unavailable_reason || '未安装' }}</span>
-            </span>
-            <span class="shell-description">{{ option.description }}</span>
-            <span v-if="option.executable" class="shell-path">{{ option.executable }}</span>
-          </span>
-        </label>
+            :disabled="!option.available"
+          >
+            {{ option.label }}{{ option.available ? '' : `（${option.unavailable_reason || '未安装'}）` }}
+          </option>
+        </select>
       </div>
-
       <p v-if="store.systemSettings.command_shell_error" class="setting-error">
         {{ store.systemSettings.command_shell_error }}
       </p>
@@ -82,20 +71,18 @@ async function selectShell(shellId: string) {
 .system-header p { margin: 0; color: var(--text-faint); font-size: 13px; }
 .refresh-button { width: 32px; height: 32px; display: grid; place-items: center; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-dim); }
 .refresh-button:hover { color: var(--text); background: var(--bg3); }
-.system-card { border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 24px 26px; }
-.setting-heading h2 { margin: 0 0 7px; font-size: 15px; }
-.setting-heading p { margin: 0; color: var(--text-faint); font-size: 12.5px; line-height: 1.6; }
-.shell-options { display: grid; gap: 10px; margin-top: 20px; }
-.shell-option { display: flex; align-items: flex-start; gap: 12px; padding: 14px 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--bg2); cursor: pointer; }
-.shell-option:hover:not(.unavailable) { border-color: var(--accent); }
-.shell-option.selected { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, var(--bg2)); }
-.shell-option.unavailable { opacity: .58; cursor: not-allowed; }
-.shell-option input { margin-top: 3px; accent-color: var(--accent); }
-.shell-copy { min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.shell-title { display: flex; align-items: center; gap: 8px; font-size: 13.5px; font-weight: 600; }
-.shell-description { color: var(--text-faint); font-size: 12px; }
-.shell-path { color: var(--text-dim); font: 11px/1.5 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
-.unavailable-badge { padding: 2px 6px; border-radius: 999px; background: var(--bg3); color: var(--text-faint); font-size: 10px; font-weight: 500; }
-.setting-error { margin: 16px 0 0; color: var(--danger); font-size: 12px; }
-.setting-note { margin: 18px 0 0; padding-top: 16px; border-top: 1px solid var(--border); color: var(--text-faint); font-size: 12px; line-height: 1.7; }
+.settings-list { border-top: 1px solid var(--border); }
+.setting-row { display: flex; align-items: center; justify-content: space-between; gap: 24px; min-height: 90px; border-bottom: 1px solid var(--border); }
+.setting-copy { min-width: 0; }
+.setting-copy h2 { margin: 0 0 6px; font-size: 15px; }
+.setting-copy p { margin: 0; color: var(--text-faint); font-size: 12.5px; line-height: 1.6; }
+.setting-select { flex: 0 0 240px; max-width: 45%; height: 38px; padding: 0 34px 0 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
+.setting-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
+.setting-select:disabled { cursor: wait; opacity: .7; }
+.setting-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
+.setting-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
+@media (max-width: 620px) {
+  .setting-row { align-items: stretch; flex-direction: column; gap: 12px; padding: 16px 0; }
+  .setting-select { flex-basis: auto; max-width: none; width: 100%; }
+}
 </style>

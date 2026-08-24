@@ -11,7 +11,7 @@ describe('SystemSettings', () => {
     setActivePinia(createPinia());
   });
 
-  it('disables unavailable interpreters and keeps the selected interpreter checked', () => {
+  it('renders the selected interpreter in one compact select and disables unavailable options', () => {
     const store = useAppStore();
     store.systemSettings = {
       command_shell: 'powershell',
@@ -31,9 +31,12 @@ describe('SystemSettings', () => {
 
     const wrapper = mount(SystemSettings);
 
-    expect(wrapper.get('[data-test="shell-pwsh"] input').attributes('disabled')).toBeDefined();
-    expect(wrapper.get('[data-test="shell-pwsh"]').text()).toContain('未安装');
-    expect((wrapper.get('[data-test="shell-powershell"] input').element as HTMLInputElement).checked).toBe(true);
+    const select = wrapper.get<HTMLSelectElement>('[data-test="command-shell-select"]');
+    const unavailable = wrapper.get('[data-test="shell-pwsh"]');
+
+    expect(select.element.value).toBe('powershell');
+    expect(unavailable.attributes('disabled')).toBeDefined();
+    expect(unavailable.text()).toContain('未安装');
   });
 
   it('saves an available interpreter selected by the user', async () => {
@@ -56,7 +59,7 @@ describe('SystemSettings', () => {
     const save = vi.spyOn(store, 'setCommandShell').mockResolvedValue(true);
     const wrapper = mount(SystemSettings);
 
-    await wrapper.get('[data-test="shell-cmd"] input').setValue(true);
+    await wrapper.get<HTMLSelectElement>('[data-test="command-shell-select"]').setValue('cmd');
 
     expect(save).toHaveBeenCalledWith('cmd');
   });
