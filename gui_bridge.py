@@ -577,52 +577,33 @@ class ApiBridge:
         必须在 GUI 线程执行（Invoke），否则移动循环消息泵不工作。
         """
         try:
-            request_started = time.perf_counter()
             hwnd = getattr(self, "_hwnd", 0)
             form = getattr(self, "_browser_form", None)
             if not hwnd or form is None or sys.platform != "win32":
                 return {"ok": False, "error": "窗口未就绪"}
-            import ctypes
-
-            user32 = ctypes.windll.user32
-            logger.info(
-                "标题栏拖拽请求: hwnd=%s thread=%s left_down=%s zoomed=%s enabled=%s",
-                hwnd,
-                threading.current_thread().name,
-                bool(user32.GetAsyncKeyState(0x01) & 0x8000),
-                bool(user32.IsZoomed(hwnd)),
-                bool(user32.IsWindowEnabled(hwnd)),
-            )
             done = {"ok": False}
 
             def _drag():
                 try:
-                    import ctypes as _ct
+                    import ctypes
 
-                    u = _ct.windll.user32
-                    gui_started = time.perf_counter()
-                    logger.info(
-                        "标题栏拖拽进入 GUI 线程: queue_ms=%.1f left_down=%s zoomed=%s enabled=%s",
-                        (gui_started - request_started) * 1000,
-                        bool(u.GetAsyncKeyState(0x01) & 0x8000),
-                        bool(u.IsZoomed(hwnd)),
-                        bool(u.IsWindowEnabled(hwnd)),
-                    )
+                    u = ctypes.windll.user32
+                    # 权威状态守卫：无边框标题栏被注册为 HTCAPTION 命中区后，
+                    # WebView 不保证每次都收到 DOM mouseup，前端 400ms 拖动
+                    # 定时器可能在左键已松开后仍触发。此处必须在 GUI 线程内、
+                    # 紧邻 ReleaseCapture/SendMessageW 之前读取真实左键状态：
+                    # 已松开则拒绝过期请求，绝不进入无有效按键手势的 SC_MOVE
+                    # （否则 Windows 显示禁用光标）。
+                    if not (u.GetAsyncKeyState(0x01) & 0x8000):
+                        done["ok"] = False
+                        done["error"] = "left_button_released"
+                        logger.info("拒绝左键已释放的过期拖动请求: hwnd=%s", hwnd)
+                        return
                     u.ReleaseCapture()
                     # SC_MOVE(0xF010)+HTCAPTION(2)：鼠标驱动的原生移动循环（窗口
                     # 跟随、松手结束）。该循环不触发 Aero Snap（caption 专有），
                     # 松手后按光标贴边情况补发 Win+方向键触发系统 Snap。
-                    move_started = time.perf_counter()
                     u.SendMessageW(hwnd, 0x0112, 0xF012, 0)
-                    move_finished = time.perf_counter()
-                    logger.info(
-                        "标题栏拖拽移动循环结束: loop_ms=%.1f total_ms=%.1f left_down=%s zoomed=%s enabled=%s",
-                        (move_finished - move_started) * 1000,
-                        (move_finished - request_started) * 1000,
-                        bool(u.GetAsyncKeyState(0x01) & 0x8000),
-                        bool(u.IsZoomed(hwnd)),
-                        bool(u.IsWindowEnabled(hwnd)),
-                    )
                     # 移动循环已结束（用户松手）：光标贴边 → 模拟系统 Snap 快捷键。
                     # 多显示器坐标不能用主屏宽度直接比较（见 _cursor_snap_vk），
                     # 统一交给该辅助函数按光标所在显示器边界判定。
@@ -722,18 +703,9 @@ class ApiBridge:
         """最大化 / 还原。走原生 SC_MAXIMIZE / SC_RESTORE（带动画），
         最大化状态用 IsZoomed 原生查询，不自己维护标志。"""
         try:
-            request_started = time.perf_counter()
             if self._window is None:
                 return {"ok": False, "error": "窗口未就绪"}
             maximized = bool(self._is_window_zoomed())
-            user32 = ctypes.windll.user32 if sys.platform == "win32" else None
-            logger.info(
-                "窗口最大化切换请求: hwnd=%s thread=%s maximized=%s left_down=%s",
-                getattr(self, "_hwnd", 0),
-                threading.current_thread().name,
-                maximized,
-                bool(user32.GetAsyncKeyState(0x01) & 0x8000) if user32 is not None else False,
-            )
             if maximized:
                 if not self._send_sys_command(0xF120):  # SC_RESTORE
                     self._window.restore()
@@ -741,12 +713,6 @@ class ApiBridge:
                 if not self._send_sys_command(0xF030):  # SC_MAXIMIZE
                     self._window.maximize()
             self._frameless_maximized = not maximized
-            logger.info(
-                "窗口最大化切换完成: elapsed_ms=%.1f maximized=%s left_down=%s",
-                (time.perf_counter() - request_started) * 1000,
-                bool(self._is_window_zoomed()),
-                bool(user32.GetAsyncKeyState(0x01) & 0x8000) if user32 is not None else False,
-            )
             return {"ok": True, "maximized": self._frameless_maximized}
         except Exception as error:  # noqa: BLE001
             logger.warning("窗口最大化切换失败: %s", error)
