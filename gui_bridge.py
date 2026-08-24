@@ -588,12 +588,11 @@ class ApiBridge:
                     import ctypes
 
                     u = ctypes.windll.user32
-                    # 权威状态守卫：无边框标题栏被注册为 HTCAPTION 命中区后，
-                    # WebView 不保证每次都收到 DOM mouseup，前端 400ms 拖动
-                    # 定时器可能在左键已松开后仍触发。此处必须在 GUI 线程内、
-                    # 紧邻 ReleaseCapture/SendMessageW 之前读取真实左键状态：
-                    # 已松开则拒绝过期请求，绝不进入无有效按键手势的 SC_MOVE
-                    # （否则 Windows 显示禁用光标）。
+                    # 权威状态守卫：前端 400ms 拖动定时器可能在左键已松开后
+                    # 仍触发（DOM mouseup 不保证每次到达）。此处必须在 GUI
+                    # 线程内、紧邻 ReleaseCapture/SendMessageW 之前读取真实
+                    # 左键状态：已松开则拒绝过期请求，绝不进入无有效按键手势
+                    # 的 SC_MOVE（否则 Windows 显示禁用光标）。
                     if not (u.GetAsyncKeyState(0x01) & 0x8000):
                         done["ok"] = False
                         done["error"] = "left_button_released"
@@ -777,18 +776,6 @@ class ApiBridge:
     def window_is_maximized(self) -> Dict[str, Any]:
         return {"ok": True, "maximized": bool(self._is_window_zoomed()) or bool(getattr(self, "_frameless_maximized", False))}
 
-    def notify_drag_region(self, x: float, y: float, w: float, h: float) -> Dict[str, Any]:
-        """前端上报标题栏拖拽区矩形（CSS 像素 × devicePixelRatio 已含在内由前端换算）。
-        WM_NCHITTEST 据此把该区域作为 HTCAPTION：系统原生拖拽、双击最大化、Aero Snap。"""
-        try:
-            from core.frameless import set_drag_region
-
-            set_drag_region(int(x), int(y), int(w), int(h))
-            return {"ok": True}
-        except Exception as error:  # noqa: BLE001
-            logger.warning("登记标题栏拖拽区失败: %s", error)
-            return {"ok": False, "error": str(error)}
-
     def shutdown(self) -> None:
         """Idempotently stop GUI-owned work before the native window is destroyed."""
         with self._shutdown_lock:
@@ -923,8 +910,8 @@ class ApiBridge:
             logger.debug("查找窗口句柄失败", exc_info=True)
 
     def _enable_frameless_resize(self):
-        """frameless 窗口恢复原生行为：边缘调整大小、HTCAPTION 拖拽（Aero Snap）、
-        最小化/最大化动画（WM_NCHITTEST 双窗口子类化 + 样式位）。"""
+        """frameless 窗口恢复原生行为：边缘调整大小、最小化/最大化动画
+        （WM_NCHITTEST 双窗口子类化仅处理边缘；标题栏交互由前端 DOM 驱动）。"""
         try:
             import webview.platforms.winforms as wf
 
