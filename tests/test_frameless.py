@@ -361,6 +361,89 @@ def test_window_begin_resize_rejects_maximized_window_inside_gui_thread(monkeypa
     user32.SendMessageW.assert_not_called()
 
 
+def test_window_begin_drag_rejects_released_left_button(monkeypatch):
+    """左键已松开时拒绝过期拖动请求，绝不进入原生 SC_MOVE 移动循环。"""
+    in_gui_thread = {"value": False}
+    checked_in_gui_thread = []
+
+    def invoke(callback):
+        in_gui_thread["value"] = True
+        try:
+            callback()
+        finally:
+            in_gui_thread["value"] = False
+
+    def get_async_key_state(_vk):
+        checked_in_gui_thread.append(in_gui_thread["value"])
+        return 0x0000  # VK_LBUTTON 未按下
+
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._hwnd = 321
+    bridge._browser_form = SimpleNamespace(Invoke=invoke)
+    user32 = SimpleNamespace(
+        GetAsyncKeyState=Mock(side_effect=get_async_key_state),
+        ReleaseCapture=Mock(return_value=True),
+        SendMessageW=Mock(return_value=0),
+    )
+    monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
+    monkeypatch.setattr(gui_bridge.ctypes, "windll", SimpleNamespace(user32=user32))
+    monkeypatch.setitem(
+        sys.modules,
+        "System.Windows",
+        SimpleNamespace(Forms=SimpleNamespace(MethodInvoker=lambda callback: callback)),
+    )
+    monkeypatch.setattr(gui_bridge, "_cursor_snap_vk", lambda: None)
+
+    result = bridge.window_begin_drag()
+
+    assert result == {"ok": False, "error": "left_button_released"}
+    user32.ReleaseCapture.assert_not_called()
+    user32.SendMessageW.assert_not_called()
+    # 状态守卫必须位于 GUI 线程回调内部，而非桥请求线程提前检查
+    assert checked_in_gui_thread and all(checked_in_gui_thread)
+
+
+def test_window_begin_drag_starts_native_move_when_left_button_down(monkeypatch):
+    """左键仍按下时保持原生移动循环与贴边快捷处理。"""
+    in_gui_thread = {"value": False}
+    checked_in_gui_thread = []
+
+    def invoke(callback):
+        in_gui_thread["value"] = True
+        try:
+            callback()
+        finally:
+            in_gui_thread["value"] = False
+
+    def get_async_key_state(_vk):
+        checked_in_gui_thread.append(in_gui_thread["value"])
+        return 0x8000  # VK_LBUTTON 按下
+
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._hwnd = 321
+    bridge._browser_form = SimpleNamespace(Invoke=invoke)
+    user32 = SimpleNamespace(
+        GetAsyncKeyState=Mock(side_effect=get_async_key_state),
+        ReleaseCapture=Mock(return_value=True),
+        SendMessageW=Mock(return_value=0),
+    )
+    monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
+    monkeypatch.setattr(gui_bridge.ctypes, "windll", SimpleNamespace(user32=user32))
+    monkeypatch.setitem(
+        sys.modules,
+        "System.Windows",
+        SimpleNamespace(Forms=SimpleNamespace(MethodInvoker=lambda callback: callback)),
+    )
+    monkeypatch.setattr(gui_bridge, "_cursor_snap_vk", lambda: None)
+
+    result = bridge.window_begin_drag()
+
+    assert result == {"ok": True, "error": None}
+    user32.ReleaseCapture.assert_called_once()
+    user32.SendMessageW.assert_called_once_with(321, 0x0112, 0xF012, 0)
+    assert checked_in_gui_thread and all(checked_in_gui_thread)
+
+
 def test_frameless_reapply_continues_after_a_transient_dwm_failure(monkeypatch):
     """一次 DWM 瞬态失败不得吞掉后续延迟重放机会。"""
     bridge = ApiBridge.__new__(ApiBridge)
