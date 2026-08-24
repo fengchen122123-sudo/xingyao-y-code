@@ -12,7 +12,6 @@
          连续点击的偶数次按下交给 dblclick，奇数次按下仍可开始新拖动；
          避免 SC_MOVE 移动循环吞掉双击序列。 -->
     <div
-      ref="dragRegionRef"
       class="titlebar-drag"
       @mousedown.left="beginDrag"
       @dblclick="toggleMaximizeNative"
@@ -62,7 +61,6 @@ const store = useAppStore();
 
 // 自绘标题栏窗口控制：通过 pywebview 桥调用，窗体控制按钮颜色随主题
 const maximized = ref(false);
-const dragRegionRef = ref<HTMLElement | null>(null);
 const api = () => (window as any).pywebview?.api;
 
 async function toggleMaximize() {
@@ -137,6 +135,7 @@ async function beginDrag(event: MouseEvent) {
   window.addEventListener('mouseup', onMouseUp, true);
   dragTimer = setTimeout(enterNativeMoveLoop, DBLCLICK_MS);
 }
+
 async function winMinimize() {
   await api()?.window_minimize?.();
 }
@@ -145,19 +144,6 @@ function winClose() {
   void api()?.window_close?.();
 }
 
-// 拖拽区矩形上报（物理像素）：HTCAPTION 区域由 WM_NCHITTEST 判定，窗口 resize
-// 或布局变化时更新；客户区坐标系下窗口移动不影响矩形
-let resizeObserver: ResizeObserver | null = null;
-function reportDragRegion() {
-  const el = dragRegionRef.value;
-  if (!el) return;
-  const rect = el.getBoundingClientRect();
-  const dpr = window.devicePixelRatio || 1;
-  void api()?.notify_drag_region?.(
-    Math.round(rect.x * dpr), Math.round(rect.y * dpr),
-    Math.round(rect.width * dpr), Math.round(rect.height * dpr),
-  );
-}
 onMounted(async () => {
   try {
     const result = await api()?.window_is_maximized?.();
@@ -165,24 +151,9 @@ onMounted(async () => {
   } catch {
     // 桥未就绪（浏览器开发态）时忽略
   }
-  reportDragRegion();
-  // jsdom 等环境无 ResizeObserver；窗口 resize 兜底上报
-  if (typeof ResizeObserver !== 'undefined') {
-    resizeObserver = new ResizeObserver(() => reportDragRegion());
-    if (dragRegionRef.value) resizeObserver.observe(dragRegionRef.value);
-  }
-  window.addEventListener('resize', reportDragRegion);
-  // 桥注入晚于组件挂载时首轮上报会丢失：load 后与延迟多次补报，确保登记
-  window.addEventListener('load', reportDragRegion);
-  for (const delay of [1000, 3000, 8000]) {
-    window.setTimeout(reportDragRegion, delay);
-  }
 });
 onBeforeUnmount(() => {
   cancelPendingDrag();
-  resizeObserver?.disconnect();
-  window.removeEventListener('resize', reportDragRegion);
-  window.removeEventListener('load', reportDragRegion);
 });
 
 const topbarUpdateLabel = computed(() => {
