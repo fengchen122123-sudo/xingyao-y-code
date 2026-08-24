@@ -481,6 +481,35 @@ def get_default_plan_manager() -> PlanManager:
     return _DEFAULT_PLAN_MANAGER
 
 
+def maybe_clear_completed_plan(session_id: str | None = None) -> bool:
+    """回合结束时调用：若指定会话（缺省取当前路由）的计划所有项都进入
+    终态（completed/failed/blocked/cancelled），清空计划快照并返回 True
+    （发生了清空）；否则返回 False。
+
+    任务完成后计划面板/任务规划自动归零，避免已完成计划长期残留。
+    只要还有 pending/in_progress 项（任务未完成）就不清空，保证跨回合任务
+    的计划不会被提前抹掉。
+
+    session_id 必须由 GUI 回合结束路径显式传入：finish_once 执行时计划会话
+    TLS 路由已解绑（_run_turn_worker finally 前段），get_default_plan_manager()
+    会退回进程级单例——多会话并行下该单例可能已被 _set_current_session 重绑
+    到其他会话，裸用会清错会话的计划。显式 session_id 走 get_plan_manager_for
+    注册表路由（条目在回合内创建后跨回合存活，storage_dir 正确）。
+    CLI 单会话顺序执行，不传 session_id 走 get_default_plan_manager() 默认路由。
+    """
+    if session_id:
+        manager = get_plan_manager_for(session_id)
+    else:
+        manager = get_default_plan_manager()
+    items = manager.snapshot()
+    if not items:
+        return False
+    if any(item.get("status") not in TERMINAL_STATUSES for item in items):
+        return False
+    manager.clear()
+    return True
+
+
 def bind_default_plan_session(session_id: str | None) -> None:
     _DEFAULT_PLAN_MANAGER.bind_session(session_id)
 
