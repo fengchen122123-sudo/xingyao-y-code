@@ -48,6 +48,7 @@ def clean_permission_state():
     llm.session_allowed_commands.clear()
     llm.session_allowed_write_files.clear()
     llm.session_allowed_edit_files.clear()
+    llm.session_allowed_exact_commands.clear()
     llm._last_tracked_session = None
     tools_mod.set_session_sandbox_bypass(False)
     yield
@@ -55,6 +56,7 @@ def clean_permission_state():
     llm.session_allowed_commands.clear()
     llm.session_allowed_write_files.clear()
     llm.session_allowed_edit_files.clear()
+    llm.session_allowed_exact_commands.clear()
 
 
 def _auto_answer_broker(monkeypatch, choice, asked, requests):
@@ -271,7 +273,7 @@ def test_always_allow_command_rule_matches_prefix_family(
     assert asked3 == ["execute_command"]
 
 
-def test_inline_exec_command_never_persisted(
+def test_inline_exec_command_always_allow_is_session_exact_only(
     interactive_env, clean_permission_state, monkeypatch, tmp_path
 ):
     from core import permission_store
@@ -279,15 +281,28 @@ def test_inline_exec_command_never_persisted(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
 
+    inline_cmd = 'python -c "print(1)"'
     asked, requests = [], []
     _auto_answer_broker(monkeypatch, 2, asked, requests)
-    assert llm.check_permission_and_ask(
-        "execute_command", {"command": 'python -c "print(1)"'}
-    ) is True
+    assert llm.check_permission_and_ask("execute_command", {"command": inline_cmd}) is True
 
-    # 内联执行命令不生成任何持久化规则（防投毒）
+    # 内联执行命令不生成前缀规则、也不持久化（防投毒）
     assert permission_store.project_rules()["commands"] == set()
     assert llm.session_allowed_commands == set()
+    # 但会做「本会话精确放行」：完全相同的命令免问
+    assert inline_cmd in llm.session_allowed_exact_commands
+
+    # 第二次完全相同的命令：命中会话精确放行，不再询问
+    asked2, requests2 = [], []
+    _auto_answer_broker(monkeypatch, 0, asked2, requests2)
+    assert llm.check_permission_and_ask("execute_command", {"command": inline_cmd}) is True
+    assert asked2 == []
+
+    # 变体内联命令：不命中精确放行，仍询问
+    asked3, requests3 = [], []
+    _auto_answer_broker(monkeypatch, 0, asked3, requests3)
+    assert llm.check_permission_and_ask("execute_command", {"command": 'python -c "print(2)"'}) is True
+    assert asked3 == ["execute_command"]
 
 
 def test_permission_store_isolated_by_workdir(tmp_path, monkeypatch):

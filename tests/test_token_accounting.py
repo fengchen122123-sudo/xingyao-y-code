@@ -126,6 +126,55 @@ def test_normalize_usage_rejects_inconsistent_server_values(usage, expected_erro
     assert any(expected_error in error for error in record["errors"])
 
 
+def test_normalize_anthropic_usage_maps_input_output_and_cache_read():
+    record = _normalize_server_usage({
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "cache_read_input_tokens": 300,
+        "cache_creation_input_tokens": 500,
+    })
+
+    assert record == {
+        "valid": True,
+        "errors": (),
+        "prompt_tokens": 1000,
+        "completion_tokens": 200,
+        "total_tokens": 1200,
+        "cached_tokens": 300,
+        "cache_miss_tokens": None,
+        "cache_reported": True,
+    }
+
+
+def test_normalize_anthropic_usage_without_cache_is_unreported_not_zero():
+    record = _normalize_server_usage({
+        "input_tokens": 1000,
+        "output_tokens": 200,
+    })
+
+    assert record["valid"] is True
+    assert record["prompt_tokens"] == 1000
+    assert record["completion_tokens"] == 200
+    assert record["total_tokens"] == 1200
+    assert record["cache_reported"] is False
+    assert record["cached_tokens"] is None
+
+
+def test_normalize_usage_prefers_openai_fields_over_anthropic():
+    record = _normalize_server_usage({
+        "prompt_tokens": 10,
+        "completion_tokens": 2,
+        "total_tokens": 12,
+        "input_tokens": 999,
+        "output_tokens": 999,
+    })
+
+    assert record["valid"] is True
+    assert record["prompt_tokens"] == 10
+    assert record["completion_tokens"] == 2
+    assert record["total_tokens"] == 12
+
+
 def test_cache_usage_isolated_by_session_model_endpoint_and_scope():
     from core.llm import _record_cache_usage, get_token_usage_snapshot
 

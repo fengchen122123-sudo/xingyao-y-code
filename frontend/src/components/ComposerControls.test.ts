@@ -41,6 +41,7 @@ describe('composer controls', () => {
   it('uses green for confirm mode in the dropdown', () => {
     const wrapper = mount(PermDropdown, {
       props: { visible: true, anchorEl: document.createElement('button') },
+      global: { stubs: { teleport: true } },
     });
 
     expect(wrapper.findAll('.dd-dot')[0].attributes('style')).toContain('var(--green)');

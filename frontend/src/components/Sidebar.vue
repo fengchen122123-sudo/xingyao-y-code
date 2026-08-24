@@ -30,7 +30,7 @@
     <div class="side-section">
       项目会话
       <span>
-        <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()">▣</button>
+        <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="13" /></button>
         <button class="add-btn" title="新建自由通用对话(跳出文件夹)" @click="store.createGlobalSession()">＋</button>
       </span>
     </div>
@@ -121,13 +121,6 @@
     </div>
 
     <div class="side-footer">
-      <button title="点击切换项目工作区文件夹" @click="store.openWorkspaceFolder()">
-        <span>▣</span>
-        <span class="footer-copy">
-          <b>{{ store.currentWorkdirLabel === 'GLOBAL' || store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</b>
-          <small>SQLite 已连接</small>
-        </span>
-      </button>
       <button data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
         <span>⚙</span><span class="footer-copy"><b>设置</b></span>
       </button>
@@ -138,6 +131,7 @@
 <script setup lang="ts">
 import { ref, computed } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import AppIcon from './AppIcon.vue';
 import type { SessionGroup } from '../types/pywebview';
 
 const store = useAppStore();
@@ -571,5 +565,4 @@ function getFolderTitle(g: SessionGroup) {
 }
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }
 .footer-copy b { font-size: 12.5px; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.footer-copy small { font-size: 10px; color: var(--text-faint); }
 </style>
