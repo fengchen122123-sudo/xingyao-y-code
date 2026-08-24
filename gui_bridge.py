@@ -2992,12 +2992,18 @@ class ApiBridge:
             # 裸调会退回进程级单例——多会话并行下该单例可能已被切换会话重绑
             # （_set_current_session），清错会话的计划。注册表路由（回合内已
             # 创建本会话条目，跨回合存活）保证取到正确的管理器实例。
-            if maybe_clear_completed_plan(session_name):
-                self.emit_event("plan_updated", {
-                    "title": "当前任务计划",
-                    "items": [],
-                    "session_name": event_session_name,
-                })
+            # 清空失败（磁盘满/权限等落盘 IO 异常）只记录日志，绝不阻断
+            # turn_finish——幂等标志已置位，异常逃逸会让 turn_finish 永久丢失
+            # （前端输入框不解锁），finally 尾部的补查与排队消息补发也被跳过。
+            try:
+                if maybe_clear_completed_plan(session_name):
+                    self.emit_event("plan_updated", {
+                        "title": "当前任务计划",
+                        "items": [],
+                        "session_name": event_session_name,
+                    })
+            except Exception:
+                logger.debug("回合结束清空已完成计划失败", exc_info=True)
             self.emit_event("turn_finish", {"session_name": event_session_name})
             self._emit_token_usage()
 
