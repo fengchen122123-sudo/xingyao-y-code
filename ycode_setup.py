@@ -326,8 +326,13 @@ def relaunch_elevated(options):
 # ============================================================================
 
 def seed_user_config(bundle_dir, log=print):
-    """从安装包内置的 config.example.json 初始化 ~/.ycode 用户配置
-    (仅在用户目录下尚不存在对应文件时才写入，不会覆盖用户已有的配置)。
+    """初始化 ~/.ycode 用户配置为干净的空配置（无预置厂商）。
+
+    仅在用户目录下尚不存在对应文件时才写入，不会覆盖用户已有的配置。
+    不再复制安装包内的 config.example.json：那是带占位符 API key 的示例
+    模板，直接播种会把「Agnes AI / 深度求索」等假厂商塞给用户，看似已
+    配置、实际 key 无效无法调用。安装后用户自行在模型页添加厂商并填写
+    真实 key（bundle_dir 参数仅为兼容调用签名保留，不再使用）。
 
     注意：系统提示词不再初始化到用户目录——它随安装包分发、只读跟随系统，
     用户目录只放数据与记忆（见 core/agent_service.load_system_prompt）。
@@ -337,13 +342,12 @@ def seed_user_config(bundle_dir, log=print):
     os.makedirs(ycode_user_dir, exist_ok=True)
 
     config_path = os.path.join(ycode_user_dir, "config.json")
-    src_config = os.path.join(bundle_dir, "config.example.json")
     if _seed_file_exclusive(
         config_path,
-        source_path=src_config if os.path.exists(src_config) else None,
+        source_path=None,
         default_text='{"active_model_id": null, "providers": []}',
     ):
-        log(f"✔ 成功创建配置模板: {config_path}")
+        log(f"✔ 成功创建干净配置: {config_path}")
 
 
 def _seed_file_exclusive(target_path, source_path=None, default_text=""):

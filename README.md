@@ -1,7 +1,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.2.6](https://img.shields.io/badge/Version-1.2.6-green.svg)](core/version.py)
+[![Version 1.2.12](https://img.shields.io/badge/Version-1.2.12-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
@@ -39,7 +39,7 @@
 - **子代理系统**：5 种内置类型（explore / implement / test / review / general）+ 自定义子代理，支持依赖感知并行调度与嵌套（最深 3 层）
 - **计划执行模式**：复杂任务先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
 - **后台任务管理**：长周期命令后台执行，`/tasks` 查看状态、`/tasks tail` 看日志、`/tasks kill` 终结
-- **权限系统**：三种模式（confirm 逐次确认 / plan 计划批准 / full 完全自动），沙盒控制工作目录访问边界
+- **权限系统**：四种模式（confirm 变更前确认 / accept_edits 自动编辑 / plan 计划模式 / full 完全访问），沙盒控制工作目录访问边界
 
 ### 记忆与上下文
 
@@ -82,7 +82,11 @@ pip install -e .
 
 ### 3. 配置 API 密钥
 
-**⚠️ 安全提醒：仓库内不会提交真实密钥，请把示例配置复制为正式配置后填写。**
+**⚠️ 安全提醒：仓库内不会提交真实密钥。**
+
+推荐方式：启动后在 GUI 模型页「添加厂商」（或 CLI `/models`）从预置厂商目录选择厂商并填写 API Key，无需手动编辑文件。
+
+也可手动复制示例配置后编辑：
 
 ```bash
 cp config.example.json config.json
@@ -250,7 +254,7 @@ venv\Scripts\python build_release.py --setup-only
 
 | 命令 | 说明 |
 |------|------|
-| `/permission <confirm\|plan\|full>` | 切换权限级别 |
+| `/permission <confirm\|accept_edits\|plan\|full>` | 切换权限级别 |
 | `/sandbox <on\|off>` | 沙盒开关（on=允许访问工作目录外文件） |
 | `/clear` | 清屏 |
 | `/exit` | 退出程序 |
@@ -343,13 +347,14 @@ Y-code 内置 22 个工具，分为只读与变更两组：
 
 ## 🔒 权限与安全
 
-### 三种权限模式
+### 四种权限模式
 
 | 模式 | 说明 |
 |------|------|
 | `confirm`（默认） | 变更前逐次确认（修改文件、执行命令均需询问） |
-| `plan` | 计划模式（开始执行修改前需一次性批准计划） |
-| `full` | 完全访问（自动运行，无需任何确认） |
+| `accept_edits` | 自动编辑（工作区内文件编辑自动放行，命令仍询问） |
+| `plan` | 计划模式（只读取与制定计划，不做任何修改） |
+| `full` | 完全访问（沙盒内全部放行，沙盒外访问仍询问） |
 
 ### 沙盒模式
 
@@ -507,17 +512,16 @@ xingyao-y-code/
 │   └── app_context.py       # 应用上下文
 ├── frontend/               # GUI 前端（Vue 3 + TypeScript + Vite）
 │   ├── src/
-│   │   ├── components/      # 12 个 Vue 组件
+│   │   ├── components/      # 25 个 Vue 组件
 │   │   ├── stores/          # Pinia 状态管理
 │   │   └── utils/
 │   ├── package.json
 │   └── vite.config.ts
-├── dsh-desktop-shell/      # DeepSeek Harness 桌面壳插件（WebView2 窗口 + ycode 主题 React 皮肤）
 ├── skills/                 # 内置技能示例
 ├── plugins/                # 内置插件目录
 ├── vendor/ripgrep/         # 内置 ripgrep
 ├── packaging/              # 打包辅助
-├── tests/                  # pytest 测试用例（79 个文件）
+├── tests/                  # pytest 测试用例（90 个文件）
 ├── docs/                   # 文档
 │   ├── BUILD.md            # 构建文档
 │   ├── all_features.md     # 全功能文档
@@ -533,7 +537,7 @@ xingyao-y-code/
 
 ## ⚙️ 配置详解
 
-配置文件位置：`~/.ycode/config.json`（首次启动自动从源码目录复制默认配置）。
+配置文件位置：`~/.ycode/config.json`。全新安装默认得到干净空配置，用户通过 GUI 模型页「添加厂商」或 CLI `/models` 从预置厂商目录选择并填写 API Key；源码开发也可手动 `cp config.example.json config.json` 后编辑。
 
 ### 完整配置项
 
@@ -582,7 +586,7 @@ xingyao-y-code/
 | `memory_compression` | 记忆压缩参数 |
 | `providers` | 模型供应商列表 |
 | `theme` | 终端配色主题（9 种） |
-| `permission_mode` | 权限模式（confirm / plan / full） |
+| `permission_mode` | 权限模式（confirm / accept_edits / plan / full） |
 | `allow_outside_workspace` | 沙盒开关 |
 | `skill_search_paths` | 技能搜索路径（项目级） |
 | `prompt_cache_keepalive_seconds` | DeepSeek/Kimi 前缀缓存保活间隔（默认 120；0 关闭；最小 60） |
@@ -614,7 +618,7 @@ JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视
 pytest
 ```
 
-测试覆盖 79 个模块，包括 agent_turn_e2e、harness（models/journal/runtime/请求指纹/工具管线）、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
+测试覆盖 90 个模块，包括 agent_turn_e2e、harness（models/journal/runtime/请求指纹/工具管线）、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
 
 ## 🔒 安全与隐私
 

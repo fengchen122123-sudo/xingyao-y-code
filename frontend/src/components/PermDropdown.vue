@@ -1,17 +1,21 @@
 <template>
-  <div id="dropdown" :class="{ show: visible }" :style="styleObj" @click.stop>
-    <div
-      v-for="m in permModes"
-      :key="m.v"
-      class="dd-item"
-      :title="m.desc"
-      @click="selectMode(m.v)"
-    >
-      <span class="dd-dot" :style="{ background: m.c }"></span>
-      {{ formatPermMode(m.v) }}
-      <span v-if="store.permissionMode === m.v" class="ck"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
+  <!-- Teleport 到 body：fixed 浮层必须逃离所在分区的 isolation 层叠上下文
+       （composer 分区 z=5，否则往上弹时被 workspace(6)/会话工具栏(10) 盖住） -->
+  <Teleport to="body">
+    <div id="dropdown" :class="{ show: visible }" :style="styleObj" @click.stop>
+      <div
+        v-for="m in permModes"
+        :key="m.v"
+        class="dd-item"
+        :title="m.desc"
+        @click="selectMode(m.v)"
+      >
+        <span class="dd-dot" :style="{ background: m.c }"></span>
+        {{ formatPermMode(m.v) }}
+        <span v-if="store.permissionMode === m.v" class="ck"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
+      </div>
     </div>
-  </div>
+  </Teleport>
 </template>
 
 <script setup lang="ts">
