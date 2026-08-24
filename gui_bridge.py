@@ -709,6 +709,16 @@ class ApiBridge:
             logger.warning("窗口最大化切换失败: %s", error)
             return {"ok": False, "error": str(error)}
 
+    def window_native_maximize(self) -> Dict[str, Any]:
+        """原生最大化/还原（SC_MAXIMIZE/SC_RESTORE），等价标题栏 HTCAPTION 双击。
+
+        前端双击标题栏拖拽区时调用：与 HTCAPTION 双击完全同路径（系统命令），
+        避免 beginDrag 的 SC_MOVE 移动循环吞掉双击序列导致无法最大化。
+        语义与 window_toggle_maximize 一致，单独接口便于前端区分“按钮切换”
+        与“双击原生最大化”两条路径。
+        """
+        return self.window_toggle_maximize()
+
     def window_close(self) -> Dict[str, Any]:
         """关闭（frameless 自绘按钮）：推送 close_requested 事件，由前端弹现代确认框；
         托盘退出、系统关机等其它关闭路径仍走原生 closing 流程兜底。"""

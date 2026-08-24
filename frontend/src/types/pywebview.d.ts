@@ -370,6 +370,8 @@ export interface PyWebViewAPI {
   // 自绘标题栏窗口控制（frameless 模式）
   window_minimize(): Promise<{ ok: boolean; error?: string }>;
   window_toggle_maximize(): Promise<{ ok: boolean; maximized?: boolean; error?: string }>;
+  // 原生最大化/还原（SC_MAXIMIZE/SC_RESTORE），等价标题栏 HTCAPTION 双击；可缺省
+  window_native_maximize?(): Promise<{ ok: boolean; maximized?: boolean; error?: string }>;
   window_close(): Promise<{ ok: boolean; error?: string }>;
   window_is_maximized(): Promise<{ ok: boolean; maximized?: boolean }>;
   notify_drag_region(x: number, y: number, w: number, h: number): Promise<{ ok: boolean; error?: string }>;
