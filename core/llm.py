@@ -333,6 +333,9 @@ from core import permission_store
 session_allowed_commands: set[tuple[str, ...]] = set()  # 结构化命令规则
 session_allowed_write_files = set()   # 放行的写入文件绝对路径
 session_allowed_edit_files = set()    # 放行的修改文件绝对路径
+# 内联/复合命令的「本会话精确放行」：点“总是允许”后仅对完全相同的命令免问，
+# 不做前缀扩展、不落盘（防投毒）。结构化命令仍走上面的 commands 桶。
+session_allowed_exact_commands: set[str] = set()
 _SESSION_GRANTS: dict[str, dict[str, set]] = {}
 _SESSION_GRANTS_MAX_SESSIONS = 128
 _last_tracked_session = None
@@ -344,7 +347,7 @@ _session_whitelist_lock = threading.Lock()
 def _session_grants_bucket() -> dict[str, set] | None:
     """当前线程会话的授权桶；未绑定线程返回 None（调用方走模块级默认集合）。
 
-    桶结构：{"commands": set, "write_files": set, "edit_files": set}
+    桶结构：{"commands": set, "write_files": set, "edit_files": set, "exact_commands": set}
     """
     sid = app_context.get_thread_session()
     if not sid:
@@ -354,7 +357,7 @@ def _session_grants_bucket() -> dict[str, set] | None:
         if bucket is None:
             if len(_SESSION_GRANTS) >= _SESSION_GRANTS_MAX_SESSIONS:
                 _SESSION_GRANTS.pop(next(iter(_SESSION_GRANTS)), None)
-            bucket = {"commands": set(), "write_files": set(), "edit_files": set()}
+            bucket = {"commands": set(), "write_files": set(), "edit_files": set(), "exact_commands": set()}
             _SESSION_GRANTS[sid] = bucket
         return bucket
 
@@ -397,6 +400,28 @@ def _grant_command_hit(command: str) -> bool:
     with _session_whitelist_lock:
         prefixes = session_allowed_commands if bucket is None else bucket["commands"]
         return any(_command_matches_prefix(command, prefix) for prefix in prefixes)
+
+
+def _grant_exact_command_add(command: str) -> None:
+    bucket = _session_grants_bucket()
+    key = str(command or "").strip()
+    if not key:
+        return
+    with _session_whitelist_lock:
+        if bucket is None:
+            session_allowed_exact_commands.add(key)
+        else:
+            bucket["exact_commands"].add(key)
+
+
+def _grant_exact_command_hit(command: str) -> bool:
+    bucket = _session_grants_bucket()
+    key = str(command or "").strip()
+    if not key:
+        return False
+    with _session_whitelist_lock:
+        s = session_allowed_exact_commands if bucket is None else bucket["exact_commands"]
+        return key in s
 
 
 def _grant_write_hit(canonical_path: str) -> bool:
@@ -503,6 +528,7 @@ def check_session_reset():
             session_allowed_commands.clear()
             session_allowed_write_files.clear()
             session_allowed_edit_files.clear()
+            session_allowed_exact_commands.clear()
             reset_session_scope = True
         else:
             reset_session_scope = False
@@ -640,6 +666,7 @@ def check_permission_and_ask(
     if function_name == "execute_command":
         cmd = arguments.get("command", "")
         session_hit = _grant_command_hit(cmd)
+        exact_hit = _grant_exact_command_hit(cmd)
         persistent_hit = False
         if not session_hit:
             try:
@@ -650,8 +677,8 @@ def check_permission_and_ask(
                 )
             except Exception:
                 persistent_hit = False
-        if session_hit or persistent_hit:
-            scope_tip = "当前会话" if session_hit else "项目白名单（持久化）"
+        if session_hit or exact_hit or persistent_hit:
+            scope_tip = "当前会话" if (session_hit or exact_hit) else "项目白名单（持久化）"
             if event_callback is None:
                 from prompt_toolkit.formatted_text import HTML
                 safe_print(HTML(f"<ansigreen>{scope_tip}自动放行命令：{cmd}</ansigreen>"))
@@ -832,12 +859,14 @@ def check_permission_and_ask(
                 cmd = arguments.get("command", "")
                 prefix = _session_prefix_for_command(cmd)
                 if prefix is None:
-                    # 与 raw 终端路径行为对齐：内联执行命令不放行也不静默，明确提示
+                    # 内联/复合命令：无法安全提取前缀，改为「本会话精确放行」——
+                    # 仅对完全相同的命令免问，不做前缀扩展、不落盘（防投毒）。
+                    _grant_exact_command_add(cmd)
                     if event_callback is None:
-                        safe_print(ANSI("   ⚠️ [内联执行命令不做前缀放行，仅本次通过]"))
+                        safe_print(ANSI("   ✨ [本会话已放行此命令（不持久化）]"))
                     else:
                         _notify_event(event_callback, "status", {
-                            "message": "内联执行命令不做前缀放行，仅本次通过。",
+                            "message": "已在本会话内放行此命令（不持久化，仅对完全相同的命令生效）。",
                         })
                 else:
                     _grant_command_add(prefix)
@@ -1353,6 +1382,18 @@ def _normalize_server_usage(usage):
     completion_raw = _usage_field(usage, "completion_tokens")
     total_raw = _usage_field(usage, "total_tokens")
 
+    # Anthropic 协议端点（Kimi /coding、聚合网关等）返回 input_tokens/
+    # output_tokens 且通常不返回 total_tokens。OpenAI 字段缺失时改读
+    # anthropic 字段兜底，避免整条记账被 "prompt_tokens is required" 拒绝。
+    if prompt_raw is _USAGE_FIELD_MISSING or prompt_raw is None:
+        anthropic_prompt = _usage_field(usage, "input_tokens")
+        if anthropic_prompt is not _USAGE_FIELD_MISSING and anthropic_prompt is not None:
+            prompt_raw = anthropic_prompt
+    if completion_raw is _USAGE_FIELD_MISSING or completion_raw is None:
+        anthropic_completion = _usage_field(usage, "output_tokens")
+        if anthropic_completion is not _USAGE_FIELD_MISSING and anthropic_completion is not None:
+            completion_raw = anthropic_completion
+
     prompt = _optional_nonnegative_int(prompt_raw, "prompt_tokens", errors)
     completion = _optional_nonnegative_int(
         completion_raw, "completion_tokens", errors
@@ -1362,11 +1403,16 @@ def _normalize_server_usage(usage):
     if prompt_raw is _USAGE_FIELD_MISSING or prompt_raw is None:
         errors.append("prompt_tokens is required")
     if total_raw is _USAGE_FIELD_MISSING or total_raw is None:
-        errors.append("total_tokens is required")
+        # Anthropic 协议不返回 total_tokens：由 input+output 推导，不算缺失。
+        if prompt is not None and completion is not None:
+            total = prompt + completion
+        else:
+            errors.append("total_tokens is required")
 
     details = _usage_field(usage, "prompt_tokens_details")
     details_cached_raw = _usage_field(details, "cached_tokens")
     direct_cached_raw = _usage_field(usage, "prompt_cache_hit_tokens")
+    anthropic_cached_raw = _usage_field(usage, "cache_read_input_tokens")
     miss_raw = _usage_field(usage, "prompt_cache_miss_tokens")
 
     details_cache_reported = (
@@ -1394,8 +1440,10 @@ def _normalize_server_usage(usage):
 
     if details_cache_reported:
         cached_raw = details_cached_raw
-    else:
+    elif direct_cache_reported:
         cached_raw = direct_cached_raw
+    else:
+        cached_raw = anthropic_cached_raw
     cache_reported = cached_raw is not _USAGE_FIELD_MISSING and cached_raw is not None
     miss_reported = miss_raw is not _USAGE_FIELD_MISSING and miss_raw is not None
 

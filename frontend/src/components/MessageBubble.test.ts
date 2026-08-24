@@ -68,8 +68,8 @@ describe('MessageBubble', () => {
     const think = wrapper.get('.think-block').element;
     const trace = wrapper.get('.exec-trace').element;
     const md = wrapper.get('.md-body').element;
-    expect(think.compareDocumentPosition(trace) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    expect(trace.compareDocumentPosition(md) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(think.compareDocumentPosition(md) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(md.compareDocumentPosition(trace) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(wrapper.get('.md-body').text()).toContain('最终答案');
     wrapper.unmount();
   });

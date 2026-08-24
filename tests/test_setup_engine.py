@@ -305,6 +305,33 @@ def test_seed_user_config_does_not_follow_existing_symlink(tmp_path, monkeypatch
     assert victim.read_text(encoding="utf-8") == "do not overwrite"
 
 
+def test_seed_user_config_seeds_empty_config_instead_of_example(tmp_path, monkeypatch):
+    import json
+
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    # 即使安装包内置了带占位符厂商的示例配置，播种结果也必须是干净空配置，
+    # 不能把「Agnes AI / 深度求索」等假厂商（占位符 key）塞给新用户。
+    (bundle / "config.example.json").write_text(
+        json.dumps({
+            "active_model_id": "model_1",
+            "providers": [
+                {"id": "p1", "name": "Agnes AI", "api_key": "sk-placeholder"},
+                {"id": "p2", "name": "深度求索", "api_key": "sk-placeholder"},
+            ],
+        }),
+        encoding="utf-8",
+    )
+    home = tmp_path / "home"
+    monkeypatch.setattr(ycode_setup.os.path, "expanduser", lambda p: str(home))
+
+    ycode_setup.seed_user_config(str(bundle), log=lambda message: None)
+
+    config_path = home / ".ycode" / "config.json"
+    data = json.loads(config_path.read_text(encoding="utf-8"))
+    assert data == {"active_model_id": None, "providers": []}
+
+
 # ── 安装范围（user/machine）与重装检测 ─────────────────────────────
 
 def test_full_install_machine_scope_uses_hklm_system_path_and_public_desktop(tmp_path, monkeypatch):

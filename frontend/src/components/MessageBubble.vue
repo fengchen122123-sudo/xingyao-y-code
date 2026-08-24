@@ -46,6 +46,9 @@
           </FoldCard>
         </div>
 
+        <!-- Markdown 文本内容 -->
+        <div v-if="msg.content && msg.content.trim()" class="md-body" v-html="renderMarkdown(msg.content)"></div>
+
         <!-- 工具执行时间线（含绑定/未绑定的文件变更 Diff） -->
         <ToolExecutionTrace
           v-if="(msg.tool_calls && msg.tool_calls.length > 0) || (msg.legacy_diffs && msg.legacy_diffs.length > 0)"
@@ -53,9 +56,6 @@
           :legacy-diffs="msg.legacy_diffs || []"
           :state="msg.execution_state || 'completed'"
         />
-
-        <!-- Markdown 文本内容 -->
-        <div v-if="msg.content && msg.content.trim()" class="md-body" v-html="renderMarkdown(msg.content)"></div>
 
         <!-- 回合进行中的非终态错误（挂在助手消息上，不插队成独立 error 消息） -->
         <div v-if="msg.error_note" class="error-note">
