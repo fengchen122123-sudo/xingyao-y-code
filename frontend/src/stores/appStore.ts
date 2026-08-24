@@ -1231,7 +1231,10 @@ export const useAppStore = defineStore('app', {
         const res = await api.set_reasoning_effort(level);
         if (res && res.ok) {
           this.reasoningEffort = res.reasoning_effort || level;
-          this.notifyChat(res.msg || ('推理强度已调整: ' + this.reasoningEffort));
+          // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
+          if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
+            this.notifyChat(res.msg || ('推理强度已调整: ' + this.reasoningEffort));
+          }
         } else {
           this.reasoningEffort = prev;
           this.notifyChat('推理强度调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -1251,7 +1254,10 @@ export const useAppStore = defineStore('app', {
         const res = await api.set_permission_mode(mode);
         if (res && res.ok) {
           this.permissionMode = res.permission_mode || mode;
-          this.notifyChat('权限模式已调整: ' + formatPermMode(this.permissionMode));
+          // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
+          if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
+            this.notifyChat('权限模式已调整: ' + formatPermMode(this.permissionMode));
+          }
         } else {
           this.permissionMode = prev;
           this.notifyChat('权限模式调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
@@ -1272,9 +1278,12 @@ export const useAppStore = defineStore('app', {
         const res = await api.set_sandbox_enabled(enabled);
         if (res && res.ok) {
           this.sandboxEnabled = !!res.allow_outside_workspace;
-          this.notifyChat(
-            this.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅限工作目录内'
-          );
+          // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
+          if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
+            this.notifyChat(
+              this.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅限工作目录内'
+            );
+          }
         } else {
           this.sandboxEnabled = prev;
           this.notifyChat('沙盒开关调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
