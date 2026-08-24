@@ -146,6 +146,66 @@ describe('Topbar frameless window controls', () => {
     }
   });
 
+  it('allows an immediate drag after dblclick when mousedown detail is 3', async () => {
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+    const beginDrag = (window as any).pywebview.api.window_begin_drag;
+
+    wrapper.get('.titlebar-drag').element.dispatchEvent(new MouseEvent('mousedown', {
+      bubbles: true, button: 0, detail: 3, clientX: 10, clientY: 10,
+    }));
+    window.dispatchEvent(new MouseEvent('mousemove', {
+      bubbles: true, buttons: 1, clientX: 20, clientY: 10,
+    }));
+
+    expect(beginDrag).toHaveBeenCalledOnce();
+  });
+
+  it('cancels a pending drag when the mouse button is released', async () => {
+    vi.useFakeTimers();
+    try {
+      const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+      const beginDrag = (window as any).pywebview.api.window_begin_drag;
+
+      wrapper.get('.titlebar-drag').element.dispatchEvent(new MouseEvent('mousedown', {
+        bubbles: true, button: 0, detail: 1, clientX: 10, clientY: 10,
+      }));
+      window.dispatchEvent(new MouseEvent('mouseup', { bubbles: true, button: 0 }));
+      await vi.advanceTimersByTimeAsync(450);
+
+      expect(beginDrag).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clears an early-drag timer before the next drag attempt starts', async () => {
+    vi.useFakeTimers();
+    try {
+      const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+      const beginDrag = (window as any).pywebview.api.window_begin_drag;
+
+      wrapper.get('.titlebar-drag').element.dispatchEvent(new MouseEvent('mousedown', {
+        bubbles: true, button: 0, detail: 1, clientX: 0, clientY: 0,
+      }));
+      window.dispatchEvent(new MouseEvent('mousemove', {
+        bubbles: true, buttons: 1, clientX: 10, clientY: 0,
+      }));
+      expect(beginDrag).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(300);
+      wrapper.get('.titlebar-drag').element.dispatchEvent(new MouseEvent('mousedown', {
+        bubbles: true, button: 0, detail: 1, clientX: 0, clientY: 0,
+      }));
+      await vi.advanceTimersByTimeAsync(101);
+      expect(beginDrag).toHaveBeenCalledOnce();
+
+      await vi.advanceTimersByTimeAsync(299);
+      expect(beginDrag).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('does not crash when the bridge is unavailable', async () => {
     (window as any).pywebview = undefined;
     const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
