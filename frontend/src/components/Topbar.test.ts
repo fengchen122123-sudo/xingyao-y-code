@@ -95,6 +95,7 @@ describe('Topbar frameless window controls', () => {
         window_toggle_maximize: vi.fn().mockResolvedValue({ ok: true, maximized: true }),
         window_close: vi.fn().mockResolvedValue({ ok: true }),
         window_is_maximized: vi.fn().mockResolvedValue({ ok: true, maximized: false }),
+        window_native_maximize: vi.fn().mockResolvedValue({ ok: true }),
         notify_drag_region: vi.fn().mockResolvedValue({ ok: true }),
         window_begin_drag: vi.fn().mockResolvedValue({ ok: true }),
       },
@@ -121,10 +122,28 @@ describe('Topbar frameless window controls', () => {
     await vi.waitFor(() => expect(api.notify_drag_region).toHaveBeenCalled());
   });
 
-  it('starts the native move loop on drag-region mousedown (Aero Snap)', async () => {
+  it('toggles maximize natively on drag-region dblclick (not the JS-move path)', async () => {
     const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
-    await wrapper.get('.titlebar-drag').trigger('mousedown', { button: 0 });
-    expect((window as any).pywebview.api.window_begin_drag).toHaveBeenCalledOnce();
+    const api = (window as any).pywebview.api;
+    await wrapper.get('.titlebar-drag').trigger('dblclick');
+    // 原生最大化（HTCAPTION 双击等效）：window_native_maximize 可缺省回退
+    expect(api.window_native_maximize).toHaveBeenCalledOnce();
+    // 禁止走 beginDrag 的 SC_MOVE 移动循环路径，避免吃掉双击
+    expect(api.window_begin_drag).not.toHaveBeenCalled();
+  });
+
+  it('starts the native move loop on drag-region mousedown (Aero Snap)', async () => {
+    vi.useFakeTimers();
+    try {
+      const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+      await wrapper.get('.titlebar-drag').trigger('mousedown', { button: 0 });
+      // 延迟判定：mousedown 后不立即移动，等待是否为双击
+      expect((window as any).pywebview.api.window_begin_drag).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(450);
+      expect((window as any).pywebview.api.window_begin_drag).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('does not crash when the bridge is unavailable', async () => {
