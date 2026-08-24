@@ -215,6 +215,60 @@ def test_native_window_install_keeps_webview_full_bleed(monkeypatch):
     webview.SetBounds.assert_not_called()
 
 
+def _make_fake_user32(cursor, monitor_rect, monitor=1):
+    """构造 _cursor_snap_vk 所需的最小 user32 桩：光标坐标 + 所在显示器边界。"""
+
+    def get_cursor_pos(point_ptr):
+        pt = ctypes.cast(point_ptr, ctypes.POINTER(ctypes.wintypes.POINT)).contents
+        pt.x, pt.y = cursor
+        return True
+
+    def get_monitor_info(_mon, mi_ptr):
+        mi = ctypes.cast(mi_ptr, ctypes.POINTER(gui_bridge._MONITORINFO)).contents
+        left, top, right, bottom = monitor_rect
+        mi.rcMonitor.left = left
+        mi.rcMonitor.top = top
+        mi.rcMonitor.right = right
+        mi.rcMonitor.bottom = bottom
+        return True
+
+    return SimpleNamespace(
+        MonitorFromPoint=Mock(return_value=monitor),
+        GetMonitorInfoW=Mock(side_effect=get_monitor_info),
+        GetCursorPos=Mock(side_effect=get_cursor_pos),
+    )
+
+
+@pytest.mark.parametrize(
+    ("cursor", "monitor_rect", "expected"),
+    [
+        # 第二屏在左边（负坐标）中间：原 bug 会误判 point.x <= 2 → 贴左边
+        ((-1000, 500), (-1920, 0, 0, 1080), None),
+        # 第二屏在上方（负 y）中间：原 bug 会误判 point.y <= 2 → 最大化
+        ((500, -500), (0, -1080, 1920, 0), None),
+        # 第二屏在右边中间：原 bug 会误判 point.x >= 主屏宽-2 → 贴右边
+        ((2500, 500), (1920, 0, 3840, 1080), None),
+        # 主屏正常贴左/右/上边缘
+        ((0, 500), (0, 0, 1920, 1080), 0x25),
+        ((1919, 500), (0, 0, 1920, 1080), 0x27),
+        ((500, 0), (0, 0, 1920, 1080), 0x26),
+        # 第二屏的真实边缘仍应正确触发
+        ((3839, 500), (1920, 0, 3840, 1080), 0x27),
+        ((-1919, 500), (-1920, 0, 0, 1080), 0x25),
+    ],
+)
+def test_cursor_snap_vk_uses_monitor_bounds(monkeypatch, cursor, monitor_rect, expected):
+    """多显示器下贴边判定必须相对光标所在显示器，而非主屏原点/宽度。"""
+    monkeypatch.setattr(gui_bridge.sys, "platform", "win32")
+    monkeypatch.setattr(
+        gui_bridge.ctypes,
+        "windll",
+        SimpleNamespace(user32=_make_fake_user32(cursor, monitor_rect)),
+    )
+
+    assert gui_bridge._cursor_snap_vk() == expected
+
+
 def test_frameless_preview_fails_when_dwm_border_cannot_be_hidden(monkeypatch):
     """Windows 11 的 DWM 写入失败不能被伪装成主题预览成功。"""
     bridge = ApiBridge.__new__(ApiBridge)

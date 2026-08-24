@@ -83,6 +83,16 @@
           "max_tokens": 8192,
           "enable_thinking": true,
           "reasoning_effort": "max"
+        },
+        {
+          "id": "deepseek_v4_flash_vision_exp",
+          "name": "deepseek-v4-flash-vision-exp",
+          "litellm_model": "openai/deepseek-v4-flash-vision-exp",
+          "context_window": 1000000,
+          "supports_vision": true,
+          "max_tokens": 8192,
+          "enable_thinking": true,
+          "reasoning_effort": "max"
         }
       ]
     }

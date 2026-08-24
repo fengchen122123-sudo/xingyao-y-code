@@ -52,6 +52,7 @@ PRESET_PROVIDERS = (
         "models": [
             {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
             {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
+            {"name": "deepseek-v4-flash-vision-exp", "context_window": 1000000, "supports_vision": True},
         ],
     },
     {

@@ -567,7 +567,9 @@ def plan_write(items: list[dict[str, Any]] | None = None) -> str:
                 "例如 'cd test20260722 && python -m pytest test_wc.py -v'）。"
             )
     try:
-        _DEFAULT_PLAN_MANAGER.replace(items)
+        # 必须走线程路由：绑定会话的回合线程里写进程级单例，run_subagent 的
+        # 调度器读的是会话专属管理器，会永远报"计划项不存在"
+        get_default_plan_manager().replace(items)
     except ValueError as exc:
         return f"计划写入失败：{exc}。请修正每一项的 id、subject 和依赖关系后重试。"
     return "计划已更新。"
@@ -603,7 +605,7 @@ def plan_update(
             f"请使用 plan_retry(item_id='{item_id}') 重置为 pending。"
         )
     # status == "pending" 是 LLM 重置失败项的自然操作，允许从 terminal 状态恢复
-    updated = _DEFAULT_PLAN_MANAGER.update(
+    updated = get_default_plan_manager().update(
         item_id,
         status=status,
         subject=subject,
@@ -630,7 +632,7 @@ def plan_retry(item_id: str) -> str:
     from core.task_scheduler import get_default_scheduler
 
     scheduler = get_default_scheduler()
-    snapshot = _DEFAULT_PLAN_MANAGER.snapshot()
+    snapshot = get_default_plan_manager().snapshot()
     item = next((i for i in snapshot if i["id"] == item_id), None)
     if item is None:
         return f"计划项 '{item_id}' 不存在。"
@@ -672,7 +674,7 @@ def plan_read(item_id: str | None = None) -> str:
     若提供 item_id，返回该计划项的详细信息；
     否则返回完整计划快照。
     """
-    snapshot = _DEFAULT_PLAN_MANAGER.snapshot()
+    snapshot = get_default_plan_manager().snapshot()
     if not snapshot:
         return "当前没有计划项。"
 
@@ -693,7 +695,7 @@ def plan_read(item_id: str | None = None) -> str:
         deps = f" ← {item['depends_on']}" if item["depends_on"] else ""
         ready_mark = " ✓就绪" if (
             item["status"] == "pending"
-            and _DEFAULT_PLAN_MANAGER._dependencies_completed_locked(item)
+            and get_default_plan_manager()._dependencies_completed_locked(item)
         ) else ""
         lines.append(
             f"  [{item['status']:12s}] {item['id']:20s} | {item['subject'][:40]}{deps}{ready_mark}"
