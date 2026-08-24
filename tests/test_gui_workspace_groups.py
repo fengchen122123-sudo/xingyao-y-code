@@ -112,6 +112,11 @@ def test_describe_permission_request_human_readable():
     assert describe_permission_request(
         "execute_command", {"command": "mvn install"}
     ) == "执行命令：\nmvn install"
+    override_summary = describe_permission_request(
+        "execute_command", {"command": "Get-Date", "shell_id": "powershell"}
+    )
+    assert "解释器：powershell（显式覆盖）" in override_summary
+    assert "Get-Date" in override_summary
     assert describe_permission_request(
         "write_file", {"file_path": "a.txt"}
     ) == "写入文件：a.txt"

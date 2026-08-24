@@ -577,12 +577,22 @@ class ApiBridge:
         必须在 GUI 线程执行（Invoke），否则移动循环消息泵不工作。
         """
         try:
+            request_started = time.perf_counter()
             hwnd = getattr(self, "_hwnd", 0)
             form = getattr(self, "_browser_form", None)
             if not hwnd or form is None or sys.platform != "win32":
                 return {"ok": False, "error": "窗口未就绪"}
             import ctypes
 
+            user32 = ctypes.windll.user32
+            logger.info(
+                "标题栏拖拽请求: hwnd=%s thread=%s left_down=%s zoomed=%s enabled=%s",
+                hwnd,
+                threading.current_thread().name,
+                bool(user32.GetAsyncKeyState(0x01) & 0x8000),
+                bool(user32.IsZoomed(hwnd)),
+                bool(user32.IsWindowEnabled(hwnd)),
+            )
             done = {"ok": False}
 
             def _drag():
@@ -590,11 +600,29 @@ class ApiBridge:
                     import ctypes as _ct
 
                     u = _ct.windll.user32
+                    gui_started = time.perf_counter()
+                    logger.info(
+                        "标题栏拖拽进入 GUI 线程: queue_ms=%.1f left_down=%s zoomed=%s enabled=%s",
+                        (gui_started - request_started) * 1000,
+                        bool(u.GetAsyncKeyState(0x01) & 0x8000),
+                        bool(u.IsZoomed(hwnd)),
+                        bool(u.IsWindowEnabled(hwnd)),
+                    )
                     u.ReleaseCapture()
                     # SC_MOVE(0xF010)+HTCAPTION(2)：鼠标驱动的原生移动循环（窗口
                     # 跟随、松手结束）。该循环不触发 Aero Snap（caption 专有），
                     # 松手后按光标贴边情况补发 Win+方向键触发系统 Snap。
+                    move_started = time.perf_counter()
                     u.SendMessageW(hwnd, 0x0112, 0xF012, 0)
+                    move_finished = time.perf_counter()
+                    logger.info(
+                        "标题栏拖拽移动循环结束: loop_ms=%.1f total_ms=%.1f left_down=%s zoomed=%s enabled=%s",
+                        (move_finished - move_started) * 1000,
+                        (move_finished - request_started) * 1000,
+                        bool(u.GetAsyncKeyState(0x01) & 0x8000),
+                        bool(u.IsZoomed(hwnd)),
+                        bool(u.IsWindowEnabled(hwnd)),
+                    )
                     # 移动循环已结束（用户松手）：光标贴边 → 模拟系统 Snap 快捷键。
                     # 多显示器坐标不能用主屏宽度直接比较（见 _cursor_snap_vk），
                     # 统一交给该辅助函数按光标所在显示器边界判定。
@@ -694,9 +722,18 @@ class ApiBridge:
         """最大化 / 还原。走原生 SC_MAXIMIZE / SC_RESTORE（带动画），
         最大化状态用 IsZoomed 原生查询，不自己维护标志。"""
         try:
+            request_started = time.perf_counter()
             if self._window is None:
                 return {"ok": False, "error": "窗口未就绪"}
             maximized = bool(self._is_window_zoomed())
+            user32 = ctypes.windll.user32 if sys.platform == "win32" else None
+            logger.info(
+                "窗口最大化切换请求: hwnd=%s thread=%s maximized=%s left_down=%s",
+                getattr(self, "_hwnd", 0),
+                threading.current_thread().name,
+                maximized,
+                bool(user32.GetAsyncKeyState(0x01) & 0x8000) if user32 is not None else False,
+            )
             if maximized:
                 if not self._send_sys_command(0xF120):  # SC_RESTORE
                     self._window.restore()
@@ -704,6 +741,12 @@ class ApiBridge:
                 if not self._send_sys_command(0xF030):  # SC_MAXIMIZE
                     self._window.maximize()
             self._frameless_maximized = not maximized
+            logger.info(
+                "窗口最大化切换完成: elapsed_ms=%.1f maximized=%s left_down=%s",
+                (time.perf_counter() - request_started) * 1000,
+                bool(self._is_window_zoomed()),
+                bool(user32.GetAsyncKeyState(0x01) & 0x8000) if user32 is not None else False,
+            )
             return {"ok": True, "maximized": self._frameless_maximized}
         except Exception as error:  # noqa: BLE001
             logger.warning("窗口最大化切换失败: %s", error)
@@ -1893,6 +1936,7 @@ class ApiBridge:
                 "permission_mode": self._current_permission_mode,
                 # 沙盒开关（是否允许访问工作目录外文件）：与 CLI /sandbox 共享同一配置键
                 "allow_outside_workspace": bool(config_data.get("allow_outside_workspace", False)),
+                "system_settings": self.get_system_settings(),
                 "sessions": self.get_sessions(),
                 "skills": self._build_skill_list(),
                 "mcps": self._build_mcp_list(),
@@ -2599,6 +2643,25 @@ class ApiBridge:
         except Exception as e:
             logger.exception("set_sandbox_enabled 失败")
             return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 系统设置
+    # ------------------------------------------------------------------
+    def get_system_settings(self) -> Dict[str, Any]:
+        """返回可扩展的系统级设置快照；不得包含凭据。"""
+        from core.command_shell import get_system_settings
+
+        return get_system_settings()
+
+    def set_command_shell(self, shell_id: str) -> Dict[str, Any]:
+        """设置命令默认解释器；不可用解释器必须显式拒绝，不做静默降级。"""
+        from core.command_shell import CommandShellError, set_selected_command_shell
+
+        try:
+            settings = set_selected_command_shell(shell_id)
+            return {"ok": True, "settings": settings, "msg": "默认命令解释器已更新"}
+        except (CommandShellError, ValueError) as error:
+            return {"ok": False, "msg": str(error), "settings": self.get_system_settings()}
 
     def get_permission_rules(self) -> Dict[str, Any]:
         """返回当前项目的持久化白名单（含沙盒开关状态），供设置页展示。"""
@@ -4386,6 +4449,7 @@ class ApiBridge:
     # ------------------------------------------------------------------
     def run_terminal_command(self, command: str) -> Dict[str, Any]:
         import subprocess
+        from core.command_shell import CommandShellError, build_command_invocation
 
         command = str(command or "").strip()
         if not command:
@@ -4400,20 +4464,25 @@ class ApiBridge:
                 # Popen cwd 必抛 FileNotFoundError；统一归一为进程 cwd
                 cwd = _resolve_real_path(os.getcwd())
             try:
+                invocation = build_command_invocation(command)
                 popen_kwargs = {
-                    "shell": True,
+                    "shell": invocation.use_system_shell,
                     "cwd": cwd,
                     "stdout": subprocess.PIPE,
                     "stderr": subprocess.STDOUT,
                     "stdin": subprocess.DEVNULL,
                 }
+                if invocation.executable:
+                    popen_kwargs["executable"] = invocation.executable
                 if os.name == "nt":
                     popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
                 else:
                     # M20：独立进程组启动，终止时用 killpg 杀整棵子树，
                     # 避免只 kill shell 父进程后子进程成孤儿
                     popen_kwargs["start_new_session"] = True
-                proc = subprocess.Popen(command, **popen_kwargs)
+                proc = subprocess.Popen(invocation.argv, **popen_kwargs)
+            except CommandShellError as e:
+                return {"ok": False, "msg": f"命令解释器不可用: {e}"}
             except Exception as e:
                 return {"ok": False, "msg": str(e)}
             self._term_proc = proc
@@ -4462,7 +4531,7 @@ class ApiBridge:
             return {"ok": False, "msg": "当前没有正在运行的命令"}
         try:
             if os.name == "nt":
-                # shell=True 会套一层 cmd，必须 /T 杀掉整棵进程树
+                # Windows 命令解释器会再派生子进程，必须 /T 杀掉整棵进程树
                 subprocess.run(
                     ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
                     capture_output=True,

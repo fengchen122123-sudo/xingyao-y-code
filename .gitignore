@@ -84,3 +84,6 @@ test20*/
 
 # Local superpowers brainstorm state
 .superpowers/
+
+# Runtime diagnostic output (playwright screenshots, contact sheets, etc.)
+output/

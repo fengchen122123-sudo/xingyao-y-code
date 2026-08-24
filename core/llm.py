@@ -600,13 +600,23 @@ def ask_in_raw_terminal(function_name, arguments):
         print(f"   [+] 计划替换: {repl.strip()[:100]}")
     elif function_name == "execute_command":
         cmd = arguments.get("command", "")
+        shell_id = str(arguments.get("shell_id") or "").strip()
         bg = arguments.get("run_in_background", False)
         bg_str = " (后台运行)" if bg else ""
         print(f"[执行命令] 星瑶申请执行命令{bg_str}: {cmd}")
+        if shell_id:
+            print(f"   [解释器显式覆盖]: {shell_id}")
     
     # 纯文本 input 模式，不含任何 ANSI 序列
     try:
-        if function_name == "sandbox_outside_access":
+        shell_override = (
+            function_name == "execute_command"
+            and bool(str(arguments.get("shell_id") or "").strip())
+        )
+        if shell_override:
+            print("请输入 [y]es 同意本次, [n]o 拒绝（解释器覆盖不支持加入白名单）")
+            res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
+        elif function_name == "sandbox_outside_access":
             # 沙盒外路径访问可会话级放行，但不做持久化落盘
             print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 本会话内放行沙盒外访问")
             res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
@@ -614,6 +624,9 @@ def ask_in_raw_terminal(function_name, arguments):
             print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前会话放行)")
             res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
         
+        if shell_override:
+            return res in ("", "y", "yes")
+
         if res in ("n", "no"):
             return False
             
@@ -660,10 +673,14 @@ def check_permission_and_ask(
 ):
     # 0. 自动同步和重置会话级别的白名单缓存
     check_session_reset()
+    command_shell_override = (
+        function_name == "execute_command"
+        and bool(str(arguments.get("shell_id") or "").strip())
+    )
 
     # 1. 检查当前会话/当前项目中是否已被用户“始终允许”
     #    会话白名单（内存）与项目持久化白名单（~/.ycode/permissions.json）依次命中
-    if function_name == "execute_command":
+    if function_name == "execute_command" and not command_shell_override:
         cmd = arguments.get("command", "")
         session_hit = _grant_command_hit(cmd)
         exact_hit = _grant_exact_command_hit(cmd)
@@ -787,6 +804,11 @@ def check_permission_and_ask(
             "No, 拒绝本次操作 (n)",
             "Always, 本会话内放行沙盒外访问 (a)",
         )
+    elif command_shell_override:
+        _options = (
+            "Yes, 同意本次操作 (y)",
+            "No, 拒绝本次操作 (n)",
+        )
     request = permission_broker.enqueue(
         function_name,
         arguments,
@@ -837,7 +859,9 @@ def check_permission_and_ask(
         if event_callback is None:
             if function_name == "execute_command":
                 cmd = arguments.get("command", "")
-                safe_print(ANSI(f"💻 星瑶申请执行命令: {cmd}"))
+                shell_id = str(arguments.get("shell_id") or "").strip()
+                shell_tip = f"（解释器显式覆盖：{shell_id}）" if shell_id else ""
+                safe_print(ANSI(f"💻 星瑶申请执行命令{shell_tip}: {cmd}"))
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 safe_print(ANSI(f"✍️ 星瑶申请写入文件: {file_path}"))

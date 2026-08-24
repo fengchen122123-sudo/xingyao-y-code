@@ -618,6 +618,7 @@ def execute_command(
     timeout_seconds=30,
     cancel_event=None,
     *,
+    shell_id="",
     _execution_result: _CommandExecutionResult | None = None,
 ):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
@@ -649,7 +650,10 @@ def execute_command(
                     session_id = app_context.get_current_session() or ""
                 except Exception:
                     session_id = ""
-            task_id = start_background_task(command, session_id=session_id)
+            background_kwargs = {"session_id": session_id}
+            if shell_id:
+                background_kwargs["shell_id"] = shell_id
+            task_id = start_background_task(command, **background_kwargs)
             return (
                 f"✔ 异步后台任务已成功启动！\n"
                 f"任务 ID: {task_id}\n"
@@ -662,8 +666,9 @@ def execute_command(
 
     try:
         from core.process_io import decode_process_output, platform_console_encoding
+        from core.command_shell import CommandShellError, build_command_invocation
         # 复用调度器的进程树终止逻辑，避免 subprocess.run(timeout=...) 超时只杀
-        # 直接子进程（cmd.exe）而泄露孙进程
+        # 直接解释器进程而泄露孙进程
         from core.task_scheduler import _stop_process_tree
 
         output_encoding = platform_console_encoding()
@@ -689,17 +694,26 @@ def execute_command(
             return sink.read(min(size, EXECUTE_COMMAND_MAX_OUTPUT_BYTES)), size
 
         try:
-            process = subprocess.Popen(
-                command,
-                shell=True,
-                stdout=stdout_sink,
-                stderr=stderr_sink,
-                text=False,
-                env=env,
-                cwd=str(get_workdir()),
+            try:
+                invocation = build_command_invocation(command, shell_id=shell_id)
+            except CommandShellError as exc:
+                return f"🚨 命令解释器不可用: {exc}"
+            popen_kwargs = {
+                "shell": invocation.use_system_shell,
+                "stdout": stdout_sink,
+                "stderr": stderr_sink,
+                "text": False,
+                "env": env,
+                "cwd": str(get_workdir()),
                 # GUI（无控制台）下避免系统为子进程分配新控制台窗口
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                start_new_session=os.name != "nt",
+                "creationflags": subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                "start_new_session": os.name != "nt",
+            }
+            if invocation.executable:
+                popen_kwargs["executable"] = invocation.executable
+            process = subprocess.Popen(
+                invocation.argv,
+                **popen_kwargs,
             )
             start_time = time.time()
             output_capped = False

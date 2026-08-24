@@ -7,6 +7,7 @@
       <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
       <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
+      <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
       <div class="nav-spacer"></div>
@@ -350,6 +351,7 @@
         </section>
       </template>
       <TokenUsageSettings v-else-if="activeSection === 'tokens'" />
+      <SystemSettings v-else-if="activeSection === 'system'" />
 
       <!-- 外观与主题常驻挂载（v-show）：切换设置分区不丢失未保存的主题草稿 -->
       <div v-show="activeSection === 'appearance'" class="appearance-section">
@@ -416,11 +418,12 @@ import { formatPermMode } from '../utils/markdown';
 import type { ChangelogEntry, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
+import SystemSettings from './SystemSettings.vue';
 
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'about'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'about'>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 const selectedKind = ref<'preset' | 'provider' | 'custom' | 'secondary'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');

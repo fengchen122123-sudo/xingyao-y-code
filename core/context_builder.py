@@ -27,6 +27,7 @@ class RuntimeContext:
     working_dir: str
     current_time: str
     active_plan: str = "无"
+    command_shell: str = "自动（系统默认）"
     memory: str = "无"
     skills: str = "无"
     custom_subagents: str = "无"
@@ -64,6 +65,9 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
         f"当前模型：{runtime.model_name}\n"
         f"当前权限模式：{runtime.permission_mode}\n"
         f"当前工作目录：{runtime.working_dir}\n"
+        f"默认命令解释器：{runtime.command_shell}\n"
+        "生成命令时必须优先使用该解释器的语法；命令失败后根据错误调整语法，"
+        "必要时可通过 execute_command 的 shell_id 显式选择其他已安装解释器。\n"
         f"当前计划：{runtime.active_plan}\n"
         "（若上下文中存在多份本块，以最新一份为准）"
     )

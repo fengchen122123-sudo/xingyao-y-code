@@ -261,7 +261,7 @@ def _save_tasks():
         _logger.warning("写入任务记录失败 %s: %s", TASK_DB_PATH, error)
 
 
-def start_background_task(command: str, session_id: str = "") -> str:
+def start_background_task(command: str, session_id: str = "", shell_id: str = "") -> str:
     """在后台开启一个异步长周期任务（如 npm run dev），重定向日志输出。
 
     session_id 记录发起该任务所属的会话，完成回调据此触发 LLM 总结。
@@ -270,6 +270,8 @@ def start_background_task(command: str, session_id: str = "") -> str:
     _ensure_loaded()
     if _is_dangerous_command(command):
         raise RuntimeError(f"拒绝执行包含危险模式的后台命令：{command}")
+    from core.command_shell import build_command_invocation
+    invocation = build_command_invocation(command, shell_id=shell_id)
     # 8 位 uuid 有碰撞可能，若目标日志已存在则重新生成
     for _ in range(10):
         task_id = str(uuid.uuid4())[:8]
@@ -293,19 +295,24 @@ def start_background_task(command: str, session_id: str = "") -> str:
 
         # 启动后台进程
         # stdout 和 stderr 都合并写入日志文件
-        # shell=True 以支持复杂的脚本串联，creationflags 为后台启动做优化
+        # 命令由系统设置选择的解释器承载；auto 保持平台默认 Shell 兼容行为。
         try:
             # cwd 跟随发起任务的会话工作目录（多会话并行时命令跑在各自项目下），
             # 不再隐式继承进程启动目录
+            popen_kwargs = {
+                "shell": invocation.use_system_shell,
+                "stdout": log_file,
+                "stderr": log_file,
+                "env": env,
+                "cwd": str(get_workdir()),
+                "creationflags": (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else 0,
+                "start_new_session": os.name != "nt",
+            }
+            if invocation.executable:
+                popen_kwargs["executable"] = invocation.executable
             process = subprocess.Popen(
-                command,
-                shell=True,
-                stdout=log_file,
-                stderr=log_file,
-                env=env,
-                cwd=str(get_workdir()),
-                creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW) if os.name == 'nt' else 0,
-                start_new_session=os.name != "nt",
+                invocation.argv,
+                **popen_kwargs,
             )
         except Exception:
             # Popen 失败时关闭日志句柄，避免文件句柄泄露

@@ -569,6 +569,7 @@ xingyao-y-code/
   "theme": "cyan",
   "permission_mode": "confirm",
   "allow_outside_workspace": false,
+  "command_shell": "auto",
   "skill_search_paths": [],
   "prompt_cache_keepalive_seconds": 120
 }
@@ -588,6 +589,7 @@ xingyao-y-code/
 | `theme` | 终端配色主题（9 种） |
 | `permission_mode` | 权限模式（confirm / accept_edits / plan / full） |
 | `allow_outside_workspace` | 沙盒开关 |
+| `command_shell` | 默认命令解释器（auto / pwsh / powershell / cmd；GUI「系统设置」会按实际安装情况限制选择） |
 | `skill_search_paths` | 技能搜索路径（项目级） |
 | `prompt_cache_keepalive_seconds` | DeepSeek/Kimi 前缀缓存保活间隔（默认 120；0 关闭；最小 60） |
 

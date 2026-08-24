@@ -157,3 +157,5 @@ def test_get_initial_state_includes_secondary_model_fields(tmp_path, monkeypatch
     assert state["secondary_model_roles"] == {
         "vision": True, "compression": False, "subagent": False,
     }
+    assert state["system_settings"]["command_shell"] == "auto"
+    assert state["system_settings"]["command_shell_available"] is True

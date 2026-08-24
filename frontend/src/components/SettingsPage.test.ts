@@ -93,6 +93,14 @@ describe('SettingsPage', () => {
     expect(wrapper.get('[data-test="gui-theme-settings"]').isVisible()).toBe(true);
   });
 
+  it('opens the extensible system settings page from settings navigation', async () => {
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="system-settings-nav"]').trigger('click');
+
+    expect(wrapper.get('[data-test="system-settings-page"]').isVisible()).toBe(true);
+  });
+
   it('opens a model editor with the multimodal choice', async () => {
     const wrapper = mount(SettingsPage);
 

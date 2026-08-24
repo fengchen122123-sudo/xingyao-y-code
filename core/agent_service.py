@@ -237,6 +237,7 @@ def build_runtime_context(model_name: str, permission_mode: str):
     这里不再重复注入，避免动态块膨胀与重复消耗 token。
     """
     from core.context_builder import RuntimeContext
+    from core.command_shell import describe_selected_command_shell
     from core.plan import get_default_plan_manager
     from core.workspace_context import get_workdir
 
@@ -251,6 +252,7 @@ def build_runtime_context(model_name: str, permission_mode: str):
         working_dir=str(get_workdir()),
         current_time=now.strftime("%Y-%m-%d %H:%M:%S"),
         active_plan=active_plan,
+        command_shell=describe_selected_command_shell(),
     )
 
 
