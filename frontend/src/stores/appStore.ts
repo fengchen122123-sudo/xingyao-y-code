@@ -17,6 +17,7 @@ import type {
   TokenStatisticsSnapshot,
   PermissionMode,
   ReasoningEffort,
+  SystemSettingsSnapshot,
   PyWebViewAPI,
   ToolStartEventData,
   ToolFinishEventData,
@@ -285,6 +286,14 @@ export const useAppStore = defineStore('app', {
     // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享后端配置
     sandboxEnabled: false,
 
+    // 系统设置使用独立快照，后续新增系统级选项时继续扩展该对象。
+    systemSettings: {
+      command_shell: 'auto',
+      command_shell_options: [],
+      command_shell_available: true,
+      command_shell_error: '',
+    } as SystemSettingsSnapshot,
+
     // 当前激活模型的推理强度档位（default = 内置默认）
     reasoningEffort: 'default' as ReasoningEffort,
 
@@ -376,7 +385,7 @@ export const useAppStore = defineStore('app', {
     closeConfirm: { show: false, trayAvailable: false } as { show: boolean; trayAvailable: boolean },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'about',
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'about',
     // 主题预览模式：设置页"预览效果"收起设置、直接看真实首页（草稿已实时渲染），
     // 顶部浮条提供返回编辑；保存/取消/切主题时退出该模式
     themePreviewMode: false,
@@ -1119,6 +1128,9 @@ export const useAppStore = defineStore('app', {
         this.secondaryModelRoles = init.secondary_model_roles || { vision: true, compression: true, subagent: true };
         this.permissionMode = init.permission_mode || 'confirm';
         this.sandboxEnabled = !!(init as any).allow_outside_workspace;
+        if (init.system_settings) {
+          this.systemSettings = init.system_settings;
+        }
         this.reasoningEffort = (init as any).reasoning_effort || 'default';
         this.sessionGroups = init.sessions || [];
         this.skills = init.skills || [];
@@ -1292,6 +1304,41 @@ export const useAppStore = defineStore('app', {
         this.sandboxEnabled = prev;
         this.connected = false;
         this.notifyChat('沙盒开关调整失败: ' + err);
+      }
+    },
+
+    async refreshSystemSettings() {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const settings = await api.get_system_settings();
+        this.systemSettings = settings;
+        return settings;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('系统设置', '加载系统设置失败: ' + err);
+        return null;
+      }
+    },
+
+    async setCommandShell(shellId: string): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_command_shell(shellId);
+        if (result && result.ok) {
+          this.systemSettings = result.settings;
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', '命令解释器设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', '命令解释器设置失败: ' + err);
+        return false;
       }
     },
 

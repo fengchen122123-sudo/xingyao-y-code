@@ -169,6 +169,7 @@ if not os.path.exists(_CONFIG_FILE):
             with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
                 default_data = {
                     "active_model_id": "ds-v4-pro",
+                    "command_shell": "auto",
                     "providers": [
                         {
                             "id": "deepseek-provider",

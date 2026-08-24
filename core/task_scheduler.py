@@ -446,10 +446,15 @@ class TaskScheduler:
         cancel_event: threading.Event | None = None,
     ) -> tuple[bool, str]:
         from core.command_policy import is_dangerous_command
+        from core.command_shell import CommandShellError, build_command_invocation
         from core.process_io import decode_process_output, platform_console_encoding
 
         if is_dangerous_command(command):
             return False, "危险命令已被安全策略拒绝，未执行验证。"
+        try:
+            invocation = build_command_invocation(command)
+        except CommandShellError as exc:
+            return False, f"命令解释器不可用: {exc}"
 
         output_encoding = platform_console_encoding()
         env = dict(os.environ)
@@ -460,16 +465,21 @@ class TaskScheduler:
         # 历史上这里会根据计划项 files 把 cwd 偷换成文件所在目录，导致模型按项目根
         # 目录编写的验证命令（如 `cd subdir && ...`）在错误目录下执行而永远失败。
         try:
-            process = subprocess.Popen(
-                command,
-                shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=False,
-                env=env,
+            popen_kwargs = {
+                "shell": invocation.use_system_shell,
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "text": False,
+                "env": env,
                 # GUI（无控制台）下避免系统为子进程分配新控制台窗口
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-                start_new_session=os.name != "nt",
+                "creationflags": subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                "start_new_session": os.name != "nt",
+            }
+            if invocation.executable:
+                popen_kwargs["executable"] = invocation.executable
+            process = subprocess.Popen(
+                invocation.argv,
+                **popen_kwargs,
             )
             if item_id:
                 with self._lock:

@@ -363,6 +363,11 @@ def build_default_registry() -> ToolRegistry:
                     "minimum": 1,
                     "maximum": 600,
                 },
+                "shell_id": {
+                    "type": "string",
+                    "enum": ["auto", "cmd", "powershell", "pwsh", "bash", "zsh", "sh"],
+                    "description": "可选的单次解释器覆盖；仅在需要根据报错调整时显式传入，且目标必须已安装。",
+                },
             }, ["command"]),
             execute=tools.execute_command,
             activity_description="执行命令",
