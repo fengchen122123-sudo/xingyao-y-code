@@ -79,6 +79,58 @@ _DWM_COLOR_CAPABILITY_UNKNOWN = "unknown"
 # is treated as unsupported.
 _DWM_UNSUPPORTED_HRESULTS = frozenset({0x80070057, 0x80004001, 0x80070032})
 
+# MonitorFromPoint 的 dwFlags：找不到时回退到最近的显示器
+_MONITOR_DEFAULTTONEAREST = 2
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", ctypes.wintypes.DWORD),
+        ("rcMonitor", ctypes.wintypes.RECT),
+        ("rcWork", ctypes.wintypes.RECT),
+        ("dwFlags", ctypes.wintypes.DWORD),
+    ]
+
+
+def _cursor_snap_vk() -> Optional[int]:
+    """光标贴到所在显示器边缘时返回对应的 Win+方向键 VK 码，否则 None。
+
+    GetCursorPos 返回的是虚拟桌面坐标：多显示器下，位于主屏左边或上边的显示器
+    是负坐标、右边/下边会超出主屏宽高。因此不能拿主屏宽度/原点直接比较，必须
+    用 MonitorFromPoint 定位光标实际所在显示器，再相对该显示器 rcMonitor 判断，
+    否则第二屏上的拖拽松手会被误判成贴主屏边缘，触发自动贴边/最大化。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        user32 = ctypes.windll.user32
+        user32.MonitorFromPoint.argtypes = [ctypes.wintypes.POINT, ctypes.wintypes.DWORD]
+        user32.MonitorFromPoint.restype = ctypes.wintypes.HANDLE
+        user32.GetMonitorInfoW.argtypes = [
+            ctypes.wintypes.HANDLE, ctypes.POINTER(_MONITORINFO),
+        ]
+        user32.GetMonitorInfoW.restype = ctypes.wintypes.BOOL
+        point = ctypes.wintypes.POINT()
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            return None
+        monitor = user32.MonitorFromPoint(point, _MONITOR_DEFAULTTONEAREST)
+        if not monitor:
+            return None
+        mi = _MONITORINFO()
+        mi.cbSize = ctypes.sizeof(_MONITORINFO)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(mi)):
+            return None
+        if point.x <= mi.rcMonitor.left + 2:
+            return 0x25  # VK_LEFT → 左半屏
+        if point.x >= mi.rcMonitor.right - 2:
+            return 0x27  # VK_RIGHT → 右半屏
+        if point.y <= mi.rcMonitor.top + 2:
+            return 0x26  # VK_UP → 最大化
+        return None
+    except Exception:  # noqa: BLE001
+        logger.debug("光标贴边判定失败", exc_info=True)
+        return None
+
 
 def _windows_build_number() -> Optional[int]:
     if sys.platform != "win32":
@@ -536,7 +588,6 @@ class ApiBridge:
             def _drag():
                 try:
                     import ctypes as _ct
-                    from ctypes import wintypes as _wt
 
                     u = _ct.windll.user32
                     u.ReleaseCapture()
@@ -544,17 +595,10 @@ class ApiBridge:
                     # 跟随、松手结束）。该循环不触发 Aero Snap（caption 专有），
                     # 松手后按光标贴边情况补发 Win+方向键触发系统 Snap。
                     u.SendMessageW(hwnd, 0x0112, 0xF012, 0)
-                    # 移动循环已结束（用户松手）：光标贴边 → 模拟系统 Snap 快捷键
-                    sw = u.GetSystemMetrics(0)
-                    point = _wt.POINT()
-                    u.GetCursorPos(_ct.byref(point))
-                    vk = None
-                    if point.x <= 2:
-                        vk = 0x25  # VK_LEFT → 左半屏
-                    elif point.x >= sw - 2:
-                        vk = 0x27  # VK_RIGHT → 右半屏
-                    elif point.y <= 2:
-                        vk = 0x26  # VK_UP → 最大化
+                    # 移动循环已结束（用户松手）：光标贴边 → 模拟系统 Snap 快捷键。
+                    # 多显示器坐标不能用主屏宽度直接比较（见 _cursor_snap_vk），
+                    # 统一交给该辅助函数按光标所在显示器边界判定。
+                    vk = _cursor_snap_vk()
                     if vk:
                         KEYUP = 0x0002
                         u.keybd_event(0x5B, 0, 0, 0)      # LWIN 按下
