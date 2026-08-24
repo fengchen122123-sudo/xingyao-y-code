@@ -2134,7 +2134,7 @@ export const useAppStore = defineStore('app', {
           });
         }
       } else if (type === 'plan_updated') {
-        if (data.items) {
+        if (Array.isArray(data.items)) {
           const items = data.items.map((it: any) => ({
             id: it.id || String(Math.random()),
             // 后端计划项的正文字段是 subject（见 core/plan.py snapshot）
