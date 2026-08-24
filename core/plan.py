@@ -493,12 +493,21 @@ def maybe_clear_completed_plan(session_id: str | None = None) -> bool:
     session_id 必须由 GUI 回合结束路径显式传入：finish_once 执行时计划会话
     TLS 路由已解绑（_run_turn_worker finally 前段），get_default_plan_manager()
     会退回进程级单例——多会话并行下该单例可能已被 _set_current_session 重绑
-    到其他会话，裸用会清错会话的计划。显式 session_id 走 get_plan_manager_for
-    注册表路由（条目在回合内创建后跨回合存活，storage_dir 正确）。
+    到其他会话，裸用会清错会话的计划。显式 session_id 只 peek 注册表已有条目
+    （条目在回合内创建后跨回合存活，storage_dir 正确），绝不惰性创建：
+    回合可能在 TLS 绑定前早退（无激活模型 / 项目目录缺失 / 中途异常），
+    此时 workdir scope 未进入，get_plan_manager_for 会以进程 cwd 推导
+    storage_dir 创建指向错误路径的污染条目并永久占据注册表 key，
+    导致该会话后续所有回合的计划工具命中污染条目（plan_read 永远空、
+    plan_write 落错误位置），计划功能静默失效。
     CLI 单会话顺序执行，不传 session_id 走 get_default_plan_manager() 默认路由。
     """
     if session_id:
-        manager = get_plan_manager_for(session_id)
+        key = str(session_id).strip()
+        with _PLAN_MANAGERS_LOCK:
+            manager = _PLAN_MANAGERS.get(key)
+        if manager is None:
+            return False
     else:
         manager = get_default_plan_manager()
     items = manager.snapshot()
