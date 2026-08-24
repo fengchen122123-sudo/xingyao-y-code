@@ -215,6 +215,76 @@ def test_native_window_install_keeps_webview_full_bleed(monkeypatch):
     webview.SetBounds.assert_not_called()
 
 
+def test_hit_test_leaves_titlebar_area_to_webview(monkeypatch):
+    """标题栏拖拽区命中必须保持 HTCLIENT，不得拦截为 HTCAPTION/HTTRANSPARENT。
+
+    实测 HTCAPTION 拦截从未承接交互（双击/拖动全部走 DOM），只会在手势
+    进行中间歇把 mousemove/mouseup 抖动路由为非客户区消息，导致快速拖动
+    失效并闪现禁用光标。标题栏交互统一由前端 DOM 事件驱动。
+    """
+
+    class EventHook:
+        def __iadd__(self, _callback):
+            return self
+
+    def get_window_rect(_hwnd, rect_ptr):
+        rect = ctypes.cast(rect_ptr, ctypes.POINTER(ctypes.wintypes.RECT)).contents
+        rect.left, rect.top, rect.right, rect.bottom = 0, 0, 1200, 800
+        return True
+
+    installed: dict[int, int] = {}
+
+    def set_window_long_ptr(hwnd, _index, proc_addr):
+        installed[hwnd] = proc_addr
+        return 99
+
+    webview = SimpleNamespace(Dock="Fill", SetBounds=Mock())
+    form = SimpleNamespace(
+        Handle=SimpleNamespace(ToInt32=lambda: 123),
+        Invoke=lambda callback: callback(),
+        webview=webview,
+        ClientSize=SimpleNamespace(Width=1200, Height=800),
+        SizeChanged=EventHook(),
+    )
+    def screen_to_client(_hwnd, point_ptr):
+        # 测试窗口原点在 (0,0)：屏幕坐标即客户区坐标
+        return True
+
+    user32 = SimpleNamespace(
+        GetWindowLongW=Mock(return_value=0),
+        SetWindowLongW=Mock(return_value=0),
+        SetWindowLongPtrW=Mock(side_effect=set_window_long_ptr),
+        CallWindowProcW=Mock(return_value=frameless.HTCLIENT),
+        GetWindowRect=Mock(side_effect=get_window_rect),
+        ScreenToClient=Mock(side_effect=screen_to_client),
+    )
+    dock_style = SimpleNamespace()
+    setattr(dock_style, "None", "None")
+    monkeypatch.setattr(frameless, "_u32", user32)
+    monkeypatch.setattr(frameless, "_SUBCLASSED", {})
+    monkeypatch.setattr(frameless, "_periodic_started", True)
+    monkeypatch.setattr(frameless, "find_webview_child_hwnds", lambda _hwnd: [456])
+    monkeypatch.setitem(
+        sys.modules,
+        "System.Windows",
+        SimpleNamespace(Forms=SimpleNamespace(MethodInvoker=lambda callback: callback)),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "System.Windows.Forms",
+        SimpleNamespace(DockStyle=dock_style),
+    )
+
+    assert frameless.enable_native_window_behaviors(form) is True
+
+    # 标题栏区域中部（屏幕坐标 600,30），距 3px 边缘之外：父/子窗口过程都应放行
+    parent_proc = frameless._WNDPROC(installed[123])
+    child_proc = frameless._WNDPROC(installed[456])
+    lparam = (30 << 16) | 600
+    assert parent_proc(123, frameless.WM_NCHITTEST, 0, lparam) == frameless.HTCLIENT
+    assert child_proc(456, frameless.WM_NCHITTEST, 0, lparam) == frameless.HTCLIENT
+
+
 def _make_fake_user32(cursor, monitor_rect, monitor=1):
     """构造 _cursor_snap_vk 所需的最小 user32 桩：光标坐标 + 所在显示器边界。"""
 

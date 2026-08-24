@@ -96,7 +96,6 @@ describe('Topbar frameless window controls', () => {
         window_close: vi.fn().mockResolvedValue({ ok: true }),
         window_is_maximized: vi.fn().mockResolvedValue({ ok: true, maximized: false }),
         window_native_maximize: vi.fn().mockResolvedValue({ ok: true }),
-        notify_drag_region: vi.fn().mockResolvedValue({ ok: true }),
         window_begin_drag: vi.fn().mockResolvedValue({ ok: true }),
       },
     };
@@ -114,12 +113,6 @@ describe('Topbar frameless window controls', () => {
 
     await wrapper.get('[data-test="win-close"]').trigger('click');
     expect(api.window_close).toHaveBeenCalledOnce();
-  });
-
-  it('reports the drag region rectangle in physical pixels on mount', async () => {
-    mount(Topbar, { global: { stubs: { AppIcon: true } } });
-    const api = (window as any).pywebview.api;
-    await vi.waitFor(() => expect(api.notify_drag_region).toHaveBeenCalled());
   });
 
   it('toggles maximize natively on drag-region dblclick (not the JS-move path)', async () => {

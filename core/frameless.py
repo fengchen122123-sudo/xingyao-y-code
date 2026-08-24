@@ -10,10 +10,13 @@ frameless 窗口（FormBorderStyle.None）默认丢失：边缘拖拽调整大�
      Windows 11 的窗口圆角，只保留 resize/Snap/阴影语义
 2. WM_NCCALCSIZE 拦截（wParam=1 → 返回 0）：清空非客户区，消除 THICKFRAME
    无边框窗口顶部的黑色伪标题栏残留条
-3. 宿主侧窗口子类化（WM_NCHITTEST）：边缘返回边框码（优先）、标题栏拖拽区
-   矩形内返回 HTCAPTION；标题栏拖拽由前端 mousedown 触发 window_begin_drag
-   （SC_MOVE+HTCAPTION 原生移动循环），松手后按光标贴边补发 Win+方向键
-   触发系统 Aero Snap
+3. 宿主侧窗口子类化（WM_NCHITTEST）：仅边缘返回边框码。标题栏区域保持
+   HTCLIENT 交给 WebView——实测 HTCAPTION 拦截从未承接交互（双击/拖动全部
+   走 DOM 事件），只会在手势进行中间歇把 mousemove/mouseup 抖动路由为非
+   客户区消息，导致快速拖动失效并闪现禁用光标。标题栏拖拽统一由前端
+   mousedown + 位移阈值触发 window_begin_drag（SC_MOVE 原生移动循环），
+   双击走前端 dblclick → SC_MAXIMIZE/SC_RESTORE，松手后按光标贴边补发
+   Win+方向键触发系统 Aero Snap
 4. 页面四边/四角的透明热区调用 window_begin_resize，WebView2 保持全铺，
    不再为了命中测试而露出可见宿主边带
 5. 周期补装定时器（90 秒）：宿主侧后代窗口在页面渲染期间可能销毁重建，
@@ -36,7 +39,6 @@ WM_NCHITTEST = 0x0084
 WM_NCCALCSIZE = 0x0083
 HTCLIENT = 1
 HTTRANSPARENT = -1
-HTCAPTION = 2
 HTLEFT, HTRIGHT, HTTOP = 10, 11, 12
 HTTOPLEFT, HTTOPRIGHT = 13, 14
 HTBOTTOM, HTBOTTOMLEFT, HTBOTTOMRIGHT = 15, 16, 17
@@ -86,10 +88,8 @@ _u32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
 _u32.SetWindowLongW.restype = wintypes.LONG
 _u32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 _u32.GetWindowLongW.restype = wintypes.LONG
-_u32.ScreenToClient.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 
-# 拖拽区矩形（WebView2 客户区物理像素）：[x, y, w, h]
-_drag_region: list[int] | None = None
+
 # 已子类化窗口的回调引用（防 GC 回收导致窗口过程悬空）
 _SUBCLASSED: dict[int, object] = {}
 # 周期补装定时器是否已启动（防 loaded/restored 重装触发多个定时器）
@@ -137,20 +137,6 @@ def _edge_code(hwnd: int, lparam: int, border: int, ref_hwnd: int | None = None)
     return None
 
 
-def _in_drag_region(hwnd: int, lparam: int) -> bool:
-    """屏幕坐标是否落在前端上报的标题栏拖拽区内（客户区坐标比较）。"""
-    if _drag_region is None:
-        return False
-    point = wintypes.POINT(
-        _signed_short(lparam & 0xFFFF),
-        _signed_short((lparam >> 16) & 0xFFFF),
-    )
-    if not _u32.ScreenToClient(hwnd, ctypes.byref(point)):
-        return False
-    x, y, w, h = _drag_region
-    return x <= point.x < x + w and y <= point.y < y + h
-
-
 def find_webview_child_hwnds(parent_hwnd: int) -> list[int]:
     """枚举全部后代窗口（EnumChildWindows 递归），返回句柄列表。
 
@@ -166,13 +152,6 @@ def find_webview_child_hwnds(parent_hwnd: int) -> list[int]:
 
     _u32.EnumChildWindows(parent_hwnd, _cb, 0)
     return found
-
-
-def set_drag_region(x: int, y: int, w: int, h: int) -> None:
-    """前端上报标题栏拖拽区矩形（WebView2 客户区物理像素）。"""
-    global _drag_region
-    _drag_region = [int(x), int(y), int(w), int(h)]
-    logger.info("frameless 拖拽区已登记: x=%s y=%s w=%s h=%s", _drag_region[0], _drag_region[1], _drag_region[2], _drag_region[3])
 
 
 def suppress_frame_border(hwnd: int) -> bool | None:
@@ -233,7 +212,7 @@ def suppress_frame_border(hwnd: int) -> bool | None:
 
 
 def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
-    """启用 frameless 窗口原生行为：边缘 resize + HTCAPTION 拖拽（Snap/动画）。
+    """启用 frameless 窗口原生行为：边缘 resize（标题栏保持 HTCLIENT 走 DOM）。
 
     form 为 pywebview BrowserForm；必须在 GUI 线程外的调用线程里通过 form.Invoke
     送入执行。返回是否成功。幂等：重复调用只补样式位，不重复子类化。
@@ -253,25 +232,22 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
         # （non-client 顶部条）。wParam=1 时返回 0 清空非客户区，黑线消失。
         if msg == WM_NCCALCSIZE and wparam:
             return 0
-        # 顶层窗口：穿透上来的命中 → 边框码（优先，顶部边缘也能 resize）/
-        # 拖拽区 HTCAPTION
+        # 顶层窗口：穿透上来的命中只在边缘返回边框码（顶部边缘也能 resize）。
+        # 标题栏区域保持 HTCLIENT 交给 WebView（见模块 docstring 第 3 点）。
         if msg == WM_NCHITTEST:
             result = _u32.CallWindowProcW(state["orig_parent"], hwnd_arg, msg, wparam, lparam)
             if result == HTCLIENT:
                 edge = _edge_code(hwnd_arg, lparam, border)
                 if edge is not None:
                     return edge
-                if _in_drag_region(hwnd_arg, lparam):
-                    return HTCAPTION
             return result
         return _u32.CallWindowProcW(state["orig_parent"], hwnd_arg, msg, wparam, lparam)
 
     def _child_wndproc(hwnd_arg, msg, wparam, lparam):
-        # WebView2 子窗口：拖拽区/边缘 → HTTRANSPARENT（穿透到父窗口继续命中测试）。
-        # 边缘/拖拽区都相对父窗口 rect 判定（子窗口填满客户区，自身 rect 不等于父边缘）。
+        # WebView2 子窗口：仅边缘 → HTTRANSPARENT（穿透到父窗口继续命中测试）。
+        # 边缘相对父窗口 rect 判定（子窗口填满客户区，自身 rect 不等于父边缘）；
+        # 标题栏区域不拦截，保持 HTCLIENT 让 DOM 事件流完整到达前端。
         if msg == WM_NCHITTEST:
-            if _in_drag_region(hwnd, lparam):
-                return HTTRANSPARENT
             if _edge_code(hwnd_arg, lparam, border, ref_hwnd=hwnd) is not None:
                 return HTTRANSPARENT
         orig = orig_children.get(hwnd_arg)
