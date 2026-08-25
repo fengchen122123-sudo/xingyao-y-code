@@ -1,5 +1,12 @@
 # Y-CODE 更新日志
 
+## 1.2.15 (2026-08-25)
+
+### 修复
+
+- 修复无边框窗口最大化再次遮挡任务栏的问题（回归）：1.2.13 引入的 `WM_GETMINMAXINFO` 工作区钳制在真实运行时静默失效。根因是 `core/frameless.py` 与 `gui_bridge.py` 各自定义了同名 `_MONITORINFO` 结构体，且都在同一个 `ctypes.windll.user32` 单例上设置 `GetMonitorInfoW.argtypes`，后加载的 `gui_bridge` 覆盖了 `frameless` 的 argtypes，导致 frameless 的窗口过程回调调用 `GetMonitorInfoW` 时因结构体类型不匹配抛 `ArgumentError`——打包版 `console=False` 的 stderr 被空写器吞掉，异常静默、钳制未执行，最大化按 `rcMonitor` 全屏盖住任务栏（单元测试因 mock 独立 user32 未触发冲突而始终绿）。现统一从 `core.frameless` 导入单一 `_MONITORINFO` 结构体来源，消除 argtypes 互相覆盖；并为窗口过程的 `WM_GETMINMAXINFO` 分支加 `try/except` + 日志，今后窗口过程异常落入 `gui-runtime.log` 而非静默吞掉
+- 版本号升至 1.2.15
+
 ## 1.2.14 (2026-08-25)
 
 ### 修复
