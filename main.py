@@ -3440,6 +3440,7 @@ def _background_worker():
                         parent_turn_id=turn_id,
                         permission_owner=turn_id,
                         permission_source="主代理",
+                        model_id=active_info.get("id"),
                     )
                     # 回复头部由 _render_ui_event 在主线程统一输出；
                     # 消息已由 generator 在生成迭代中实时持久化入库，此处不再重复写入

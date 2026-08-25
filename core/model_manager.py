@@ -229,12 +229,32 @@ def set_model_reasoning_choice(model_id: str, choice: str | None) -> tuple[bool,
         return False, f"模型 {current.get('name') or model_id} 不支持思考选项 {normalized}（可选 {allowed}）"
 
     changed = []
+    validation_error = []
 
     def _mutate(data):
         model = _find_config_model(data, model_id)
         if model is None:
             return
+        current_capability = get_reasoning_capability(_reasoning_model_name(model))
+        if current_capability.kind == "fixed":
+            validation_error.append(current_capability.disabled_reason)
+            return
+        if current_capability.kind == "hidden":
+            validation_error.append(
+                f"模型 {model.get('name') or model_id} 未声明可调思考能力"
+            )
+            return
+        if normalized not in current_capability.options:
+            allowed = "/".join(current_capability.options)
+            validation_error.append(
+                f"模型 {model.get('name') or model_id} 不支持思考选项 "
+                f"{normalized}（可选 {allowed}）"
+            )
+            return
         changed.append(model.get("name") or model_id)
+        # thinking_budget 属于旧通用 thinking 协议。模型专属选择启用后必须由
+        # request_strategy 独占编码，否则会同时发送两套相互冲突的开关。
+        model.pop("thinking_budget", None)
         if normalized == "default":
             model.pop("reasoning_choice", None)
             model.pop("enable_thinking", None)
@@ -253,6 +273,8 @@ def set_model_reasoning_choice(model_id: str, choice: str | None) -> tuple[bool,
             model["reasoning_effort"] = normalized
 
     config.update_config(_mutate)
+    if validation_error:
+        return False, validation_error[0]
     if not changed:
         return False, f"未找到模型: {model_id}"
     if normalized == "default":
@@ -286,6 +308,12 @@ def get_model_config_by_litellm_model(litellm_model: str, base_url: str | None =
                 if not base_url or not p_base or p_base == base_url:
                     return model
     return None
+
+
+def get_model_config_by_id(model_id: str) -> dict | None:
+    """按唯一模型 ID 返回配置浅拷贝，避免同一路由重名模型互相串设置。"""
+    model = _find_config_model(load_config(), str(model_id or ""))
+    return dict(model) if model is not None else None
 
 
 def get_model_protocol(litellm_model: str, base_url: str | None = None) -> str | None:

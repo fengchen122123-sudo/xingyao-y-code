@@ -133,6 +133,32 @@ def consume_bridge_events(monkeypatch, events):
     return emitted
 
 
+def test_bridge_forwards_exact_model_id_to_request_layer(monkeypatch):
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._cancel_events = {"session": threading.Event()}
+    bridge._active_turns = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
+    captured = {}
+    bridge.emit_event = lambda *_args, **_kwargs: None
+
+    def fake_events(*_args, **kwargs):
+        captured.update(kwargs)
+        return iter(())
+
+    monkeypatch.setattr("core.llm.chat_with_model_events", fake_events)
+
+    bridge._consume_turn_events(
+        [], "openai/deepseek-v4-flash", "key", "https://gateway.example/v1",
+        "session", "turn-id", model_id="model-b",
+    )
+
+    assert captured["model_id"] == "model-b"
+
+
 def test_bridge_deduplicates_start_and_forwards_structured_fields(monkeypatch):
     monkeypatch.setattr("gui_bridge.time.time", lambda: 1234.5)
     events = make_events([

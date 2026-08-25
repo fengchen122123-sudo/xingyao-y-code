@@ -2001,7 +2001,9 @@ def _read_text_with_encoding_fallback(file_path):
         return raw.decode("gbk", errors="replace")
 
 
-def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
+def chat_with_model(
+    model_name, api_key, messages, api_base=None, stream=False, model_id=None
+):
     """
     大模型通信网关：支持流式（stream=True）与非流式（stream=False，后台 Agent 自动消化）
     """
@@ -2011,6 +2013,7 @@ def chat_with_model(model_name, api_key, messages, api_base=None, stream=False):
         messages,
         api_base=api_base,
         stream=False,
+        model_id=model_id,
     )
     if stream:
         return gen
@@ -2042,6 +2045,7 @@ def chat_with_model_events(
     permission_source="主代理",
     cache_scope="main",
     cache_session_id=None,
+    model_id=None,
 ):
     """Yield ordered :class:`TurnEvent` snapshots for one model turn.
 
@@ -2129,6 +2133,7 @@ def chat_with_model_events(
         permission_source=permission_source,
         cache_scope=cache_scope,
         cache_session_id=cache_session_id or parent_session,
+        model_id=model_id,
         harness_runtime=harness_runtime,
     )
     try:
@@ -2838,6 +2843,15 @@ def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=Fa
 def _assert_reasoning_request_consistent(result, capability):
     """禁止把思考强度单独发送给需要显式开启思考的模型。"""
     extra_body = result.get("extra_body") or {}
+    top_level_thinking_enabled = (
+        (result.get("thinking") or {}).get("type") == "enabled"
+    )
+    extra_thinking_disabled = (
+        (extra_body.get("thinking") or {}).get("type") == "disabled"
+        or extra_body.get("enable_thinking") is False
+    )
+    if top_level_thinking_enabled and extra_thinking_disabled:
+        raise ValueError("请求同时包含开启和关闭两套冲突的思考参数")
     has_effort = "reasoning_effort" in result or "reasoning_effort" in extra_body
     if not has_effort:
         return
@@ -2883,6 +2897,7 @@ def _provider_request_options(
     model_name,
     api_base,
     *,
+    model_id=None,
     cache_scope="main",
     cache_session_id=None,
     tool_contract="",
@@ -2901,15 +2916,33 @@ def _provider_request_options(
 
     # 1. 读取用户在 config.json 中的显式配置
     try:
-        from core.model_manager import get_model_config_by_litellm_model
-        model_cfg = get_model_config_by_litellm_model(model_name, api_base) or {}
+        from core.model_manager import (
+            get_model_config_by_id,
+            get_model_config_by_litellm_model,
+        )
+        model_cfg = (
+            get_model_config_by_id(model_id)
+            if model_id
+            else get_model_config_by_litellm_model(model_name, api_base)
+        ) or {}
     except Exception:
+        if model_id:
+            raise
         model_cfg = {}
+    if model_id and not model_cfg:
+        raise ValueError(f"未找到模型配置: {model_id}")
 
     cfg_max_tokens = model_cfg.get("max_tokens")
     cfg_thinking_budget = model_cfg.get("thinking_budget")
     cfg_enable_thinking = model_cfg.get("enable_thinking")
     has_reasoning_choice = bool(str(model_cfg.get("reasoning_choice") or "").strip())
+    has_legacy_reasoning_choice = (
+        isinstance(cfg_enable_thinking, bool)
+        or bool(str(model_cfg.get("reasoning_effort") or "").strip())
+    )
+    from core.reasoning_capabilities import get_reasoning_capability
+    configured_capability = get_reasoning_capability(model_name)
+    has_registered_reasoning = configured_capability.kind != "hidden"
 
     # 判定同时看模型名与 api_base（经销商/聚合网关的 base_url 千奇百怪，
     # 只认 base 会漏判，比如 api.scnet.cn 上的 Kimi-K2.6）。
@@ -2923,10 +2956,15 @@ def _provider_request_options(
 
     result = {}
 
+    if cfg_max_tokens is not None:
+        result["max_tokens"] = int(cfg_max_tokens)
+
     if deepseek_family:
         if cfg_max_tokens is not None:
             result["max_tokens"] = int(cfg_max_tokens)
-        if not has_reasoning_choice:
+        if not has_reasoning_choice and (
+            not has_registered_reasoning or not has_legacy_reasoning_choice
+        ):
             if _is_official_deepseek_route(api_base) or isinstance(cfg_enable_thinking, bool):
                 result.setdefault("extra_body", {})["thinking"] = {
                     "type": "enabled" if deepseek_thinking else "disabled"
@@ -2943,7 +2981,7 @@ def _provider_request_options(
                 # reasoning_effort。这里按参数白名单精确放行，不能用全局
                 # drop_params，否则会静默丢失用户要求的推理强度。
                 result["allowed_openai_params"] = ["reasoning_effort"]
-    elif (
+    elif not has_reasoning_choice and not has_registered_reasoning and (
         cfg_max_tokens is not None
         or cfg_thinking_budget is not None
         or (cfg_enable_thinking is not None and not has_reasoning_choice)
@@ -2972,17 +3010,15 @@ def _provider_request_options(
             # Claude 系列识别为支持 thinking 的 anthropic 模型，对 "K3" 这类陌生
             # 模型名会直接抛 UnsupportedParamsError（请求根本发不出去），需要显式豁免。
             if is_k3:
-                result = {
-                    "thinking": {"type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048},
-                    "max_tokens": 32000 if is_kimi_coding else 16000,
-                    "allowed_openai_params": ["thinking"],
-                }
+                result.setdefault("thinking", {
+                    "type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048,
+                })
+                result.setdefault("max_tokens", 32000 if is_kimi_coding else 16000)
+                result.setdefault("allowed_openai_params", ["thinking"])
             else:
-                result = {
-                    "thinking": {"type": "enabled", "budget_tokens": 2048},
-                    "max_tokens": 16000,
-                    "allowed_openai_params": ["thinking"],
-                }
+                result.setdefault("thinking", {"type": "enabled", "budget_tokens": 2048})
+                result.setdefault("max_tokens", 16000)
+                result.setdefault("allowed_openai_params", ["thinking"])
         else:
             # OpenAI 兼容路由（api.moonshot.cn/v1 及各类经销商）：
             # 绝不发送 Anthropic 形状的 thinking 参数——Moonshot 的
@@ -2990,9 +3026,9 @@ def _provider_request_options(
             # Kimi 推理模型（k2.5/k2.6/k2.7/k3 等）在该路由上会原生输出
             # reasoning_content，无需显式开启，只需给足输出上限。
             if is_k3:
-                result = {"max_tokens": 32000}
+                result.setdefault("max_tokens", 32000)
             else:
-                result = {"max_tokens": 16384}
+                result.setdefault("max_tokens", 16384)
 
     if kimi_family:
         _attach_kimi_request_extras(
@@ -3671,6 +3707,7 @@ def _chat_with_model_generator(
     permission_source="主代理",
     cache_scope="main",
     cache_session_id=None,
+    model_id=None,
     *,
     harness_runtime=None,
 ):
@@ -3921,9 +3958,24 @@ def _chat_with_model_generator(
         "stream_options": {"include_usage": True},
         "num_retries": 2,
     }
+    request_model_id = str(model_id or "") or None
+    if request_model_id is None and parent_session:
+        try:
+            from core.model_manager import get_active_model as _get_bound_model
+            bound_model = _get_bound_model(parent_session) or {}
+            same_model = str(bound_model.get("litellm_model") or "") == str(model_name or "")
+            same_base = (
+                str(bound_model.get("base_url") or "").rstrip("/").lower()
+                == str(api_base or "").rstrip("/").lower()
+            )
+            if same_model and same_base:
+                request_model_id = str(bound_model.get("id") or "") or None
+        except Exception:
+            request_model_id = None
     kwargs.update(_provider_request_options(
         model_name,
         api_base,
+        model_id=request_model_id,
         cache_scope=cache_scope,
         cache_session_id=telemetry_session_id,
         tool_contract=request_tool_contract,

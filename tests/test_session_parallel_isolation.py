@@ -488,11 +488,13 @@ def test_subagent_model_snapshot_uses_parent_session_when_global_was_overwritten
     )
     models = {
         "session-A": {
+            "id": "model-id-A",
             "litellm_model": "openai/model-A",
             "api_key": "key-A",
             "base_url": "url-A",
         },
         "session-B": {
+            "id": "model-id-B",
             "litellm_model": "openai/model-B",
             "api_key": "key-B",
             "base_url": "url-B",
@@ -503,7 +505,7 @@ def test_subagent_model_snapshot_uses_parent_session_when_global_was_overwritten
     )
 
     assert tools_module._snapshot_model_config(session_name="session-A") == (
-        "openai/model-A", "key-A", "url-A",
+        "openai/model-A", "key-A", "url-A", "model-id-A",
     )
 
 
@@ -530,6 +532,7 @@ def test_subagent_manager_run_snapshots_parent_session_model(monkeypatch):
     monkeypatch.setattr(
         "core.model_manager.get_active_model",
         lambda session=None: {
+            "id": f"id-{session}",
             "litellm_model": f"openai/{session}",
             "api_key": f"key-{session}",
             "base_url": f"url-{session}",
@@ -541,7 +544,9 @@ def test_subagent_manager_run_snapshots_parent_session_model(monkeypatch):
 
     manager.run("检查模型快照", "session-A", "turn-A", timeout_seconds=30)
 
-    assert captured == [("openai/session-A", "key-session-A", "url-session-A")]
+    assert captured == [(
+        "openai/session-A", "key-session-A", "url-session-A", "id-session-A"
+    )]
 
 
 def test_custom_inherit_uses_parent_session_model(monkeypatch):
@@ -551,6 +556,7 @@ def test_custom_inherit_uses_parent_session_model(monkeypatch):
     monkeypatch.setattr(
         "core.model_manager.get_active_model",
         lambda session=None: {
+            "id": "model-id-A",
             "litellm_model": "openai/model-A",
             "api_key": "key-A",
             "base_url": "url-A",
@@ -559,7 +565,7 @@ def test_custom_inherit_uses_parent_session_model(monkeypatch):
     captured = {}
 
     def fake_events(model, key, messages, url, **kwargs):
-        captured.update(model=model, key=key, url=url)
+        captured.update(model=model, key=key, url=url, model_id=kwargs.get("model_id"))
         yield SimpleNamespace(
             kind="assistant_delta",
             payload={"text": "完整结论" * 40},
@@ -578,7 +584,10 @@ def test_custom_inherit_uses_parent_session_model(monkeypatch):
 
     manager._run_default_subagent(task)
 
-    assert captured == {"model": "openai/model-A", "key": "key-A", "url": "url-A"}
+    assert captured == {
+        "model": "openai/model-A", "key": "key-A", "url": "url-A",
+        "model_id": "model-id-A",
+    }
 
 
 def test_unbound_thread_falls_back_to_default_singletons(tmp_path):
