@@ -589,3 +589,43 @@ def test_is_unrecognized_non_empty_dir(tmp_path):
     existing.mkdir()
     (existing / "Y-code.exe").write_text("gui", encoding="utf-8")
     assert ycode_setup._is_unrecognized_non_empty_dir(str(existing)) is False
+
+
+def test_launch_gui_app_direct_when_not_admin(tmp_path, monkeypatch):
+    """普通权限安装完成后直接启动 Y-code.exe。"""
+    (tmp_path / "Y-code.exe").write_text("gui", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(ycode_setup, "is_user_an_admin", lambda: False)
+    monkeypatch.setattr(ycode_setup.subprocess, "Popen",
+                        lambda args, **kw: calls.append((args, kw)))
+    assert ycode_setup.launch_gui_app(str(tmp_path), _startupinfo()) is True
+    assert calls[0][0] == [str(tmp_path / "Y-code.exe")]
+
+
+def test_launch_gui_app_de_elevates_via_explorer_when_admin(tmp_path, monkeypatch):
+    """管理员身份（为所有用户安装场景）时经 explorer.exe 中转降权启动。"""
+    (tmp_path / "Y-code.exe").write_text("gui", encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(ycode_setup, "is_user_an_admin", lambda: True)
+    monkeypatch.setattr(ycode_setup.subprocess, "Popen",
+                        lambda args, **kw: calls.append((args, kw)))
+    assert ycode_setup.launch_gui_app(str(tmp_path), _startupinfo()) is True
+    assert calls[0][0][0] == "explorer.exe"
+    assert calls[0][0][1] == str(tmp_path / "Y-code.exe")
+
+
+def test_launch_gui_app_missing_exe_returns_false(tmp_path):
+    """安装目录下没有 Y-code.exe 时不启动，返回 False。"""
+    assert ycode_setup.launch_gui_app(str(tmp_path), _startupinfo()) is False
+
+
+def test_launch_gui_app_popen_failure_returns_false(tmp_path, monkeypatch):
+    """启动被拦截（OSError）时不抛异常，静默返回 False。"""
+    (tmp_path / "Y-code.exe").write_text("gui", encoding="utf-8")
+    monkeypatch.setattr(ycode_setup, "is_user_an_admin", lambda: False)
+
+    def _boom(*a, **k):
+        raise OSError("blocked")
+
+    monkeypatch.setattr(ycode_setup.subprocess, "Popen", _boom)
+    assert ycode_setup.launch_gui_app(str(tmp_path), _startupinfo()) is False

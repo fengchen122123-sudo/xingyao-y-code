@@ -321,6 +321,27 @@ def relaunch_elevated(options):
     return rc > 32
 
 
+def launch_gui_app(install_dir, startupinfo):
+    """安装完成后启动图形界面版 Y-code.exe。返回是否成功发起启动。
+
+    管理员身份（"为所有用户安装"经 UAC 提权）时经 explorer.exe 中转启动，
+    使程序回落到普通用户权限，避免继承安装器的提权上下文（拖放文件失效、
+    配置写入管理员账户目录等问题）。启动失败静默返回 False，不阻塞向导退出。
+    """
+    exe_path = os.path.join(install_dir, "Y-code.exe")
+    if not os.path.exists(exe_path):
+        return False
+    try:
+        if is_user_an_admin():
+            # explorer.exe 以桌面 Shell 的普通用户身份代为启动目标程序
+            subprocess.Popen(["explorer.exe", exe_path], startupinfo=startupinfo)
+        else:
+            subprocess.Popen([exe_path], cwd=install_dir, startupinfo=startupinfo)
+    except OSError:
+        return False
+    return True
+
+
 # ============================================================================
 # 用户配置播种
 # ============================================================================
@@ -953,6 +974,11 @@ class SetupWizard(tk.Tk):
             self.var_shortcut = tk.BooleanVar(value=True)
         self.var_scope = tk.StringVar(value=initial_scope)
         self.var_dir = tk.StringVar(value=initial_dir)
+        # 完成页「立即运行」复选框（仅 full 模式展示）；安装结果状态供
+        # 「完成」按钮判断是否需要在退出前启动程序
+        self.var_launch = tk.BooleanVar(value=True)
+        self._install_success = False
+        self._install_dir = None
 
         # 页面导航流程：cli 模式没有“安装用户”页（CLI 始终按当前用户安装）
         self._flow = (["welcome", "scope", "options", "installing", "finish"]
@@ -1116,7 +1142,7 @@ class SetupWizard(tk.Tk):
         bottom.pack_propagate(False)
         tk.Frame(bottom, bg=COLOR_SEP, height=1).pack(fill="x")
         self._btn_cancel = ttk.Button(bottom, text="取消", style="Ghost.TButton",
-                                      width=8, command=self.destroy)
+                                      width=8, command=self._on_cancel_or_finish)
         self._btn_next = ttk.Button(bottom, text="下一步", style="Brand.TButton",
                                     width=12, command=self._go_next)
         self._btn_back = ttk.Button(bottom, text="< 上一步", style="Ghost.TButton",
@@ -1326,6 +1352,14 @@ class SetupWizard(tk.Tk):
         self._finish_detail.place(relx=0.5, y=200, anchor="center")
         self._finish_hint = self._label(page, "", FONT_TEXT, COLOR_TEXT_DIM, justify="center")
         self._finish_hint.place(relx=0.5, y=280, anchor="center")
+        # 「立即运行」复选框：先建好不摆放，安装成功且为 full 模式时才显示
+        self._launch_check = tk.Checkbutton(
+            page, text="立即运行 Y-code",
+            variable=self.var_launch,
+            bg=COLOR_CONTENT, fg=COLOR_TEXT, font=FONT_TEXT,
+            selectcolor=COLOR_CONTENT, activebackground=COLOR_CONTENT,
+            activeforeground=COLOR_TEXT, cursor="hand2",
+            highlightthickness=0, bd=0)
 
     # ------------------------------------------------------------------
     # 交互逻辑
@@ -1424,6 +1458,8 @@ class SetupWizard(tk.Tk):
 
     def _show_finish(self, result):
         install_dir = result["install_dir"]
+        self._install_success = True
+        self._install_dir = install_dir
         ycode_user_dir = os.path.join(os.path.expanduser("~"), ".ycode")
         if self.mode == "full":
             hints = ["双击桌面上的 [Y-code] 快捷方式，或到安装目录启动 Y-code.exe。"]
@@ -1437,14 +1473,28 @@ class SetupWizard(tk.Tk):
             text=f"安装路径: {install_dir}\n配置文件夹: {ycode_user_dir}"
         )
         self._finish_hint.configure(text="\n".join(hints))
+        # 仅图形界面版安装成功时提供「立即运行」；CLI 模式装的是终端命令，无可启动窗口
+        if self.mode == "full":
+            self._launch_check.place(relx=0.5, y=340, anchor="center")
         self.show_page("finish")
 
     def _show_error(self, message):
+        self._install_success = False
+        self._install_dir = None
+        self._launch_check.place_forget()
         self._finish_icon.configure(text="🚨")
         self._finish_title.configure(text="安装失败", fg="#c0392b")
         self._finish_detail.configure(text=message)
         self._finish_hint.configure(text="您可以关闭向导后重试，或更换安装位置。")
         self.show_page("finish")
+
+    def _on_cancel_or_finish(self):
+        """底部「取消/完成」按钮：安装成功且勾选「立即运行」时先启动程序再退出。"""
+        if (self._current_page == "finish" and self._install_success
+                and self.mode == "full" and self.var_launch.get()
+                and self._install_dir):
+            launch_gui_app(self._install_dir, self.startupinfo)
+        self.destroy()
 
 
 # ============================================================================
