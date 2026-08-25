@@ -2,9 +2,23 @@
 
 ## 1.2.15 (2026-08-25)
 
+### 新增
+
+- 对话输入框在模型选择器右侧新增思考强度选择器，并按模型名称自动适配可选项：不同模型分别显示“默认 / 关闭 / 开启 / 低 / 中 / 高 / 超高 / 最高”等已确认能力，不按厂商或 API 地址猜测；未确认能力的模型不显示该入口
+- 固定开启思考的模型仍显示“开启”，但下拉菜单禁用，明确反馈当前状态；可调模型保留“默认”选项，恢复模型或服务端原有默认行为
+- 思考设置随模型配置持久化，并在模型切换、会话切换和新会话初始化时同步刷新；空会话调整不会插入提示消息或让欢迎页消失
+
 ### 修复
 
+- 修复只发送 `reasoning_effort`、却没有同时开启思考导致强度参数无效的问题：DeepSeek、Qwen、GLM、Seed / Doubao、Mimo、Kimi、MiniMax、LongCat 等预置模型按各自协议精确编码 `thinking`、`enable_thinking` 与 `reasoning_effort`，显式选择强度时必定满足对应模型的思考开启条件
+- 修复历史 `thinking_budget` / `enable_thinking` 与新模型专属参数同时发送两套冲突协议的问题；已登记能力的模型统一由专属请求策略独占编码，“默认”不会残留旧覆盖参数
+- 修复同一 API 路由配置多个模型时可能读取第一条模型思考设置的问题：GUI、CLI、普通请求、副模型及子代理主请求/总结请求均贯穿唯一模型 ID，避免不同模型之间串设置
+- 修复快速连续切换思考强度时，较早请求的成功、失败或网络异常覆盖最新选择、误报断线的问题；现在只有最后一次选择可以更新或回滚界面状态
 - 修复无边框窗口最大化再次遮挡任务栏的问题（回归）：1.2.13 引入的 `WM_GETMINMAXINFO` 工作区钳制在真实运行时静默失效。根因是 `core/frameless.py` 与 `gui_bridge.py` 各自定义了同名 `_MONITORINFO` 结构体，且都在同一个 `ctypes.windll.user32` 单例上设置 `GetMonitorInfoW.argtypes`，后加载的 `gui_bridge` 覆盖了 `frameless` 的 argtypes，导致 frameless 的窗口过程回调调用 `GetMonitorInfoW` 时因结构体类型不匹配抛 `ArgumentError`——打包版 `console=False` 的 stderr 被空写器吞掉，异常静默、钳制未执行，最大化按 `rcMonitor` 全屏盖住任务栏（单元测试因 mock 独立 user32 未触发冲突而始终绿）。现统一从 `core.frameless` 导入单一 `_MONITORINFO` 结构体来源，消除 argtypes 互相覆盖；并为窗口过程的 `WM_GETMINMAXINFO` 分支加 `try/except` + 日志，今后窗口过程异常落入 `gui-runtime.log` 而非静默吞掉
+
+### 测试
+
+- 新增模型能力矩阵、配置持久化、前端交互与竞态、精确模型 ID 路由测试，并为 DeepSeek、Qwen 3.7 / 3.8、Kimi K3、LongCat 等请求补充完整 provider 字节黄金回归
 - 版本号升至 1.2.15
 
 ## 1.2.14 (2026-08-25)
