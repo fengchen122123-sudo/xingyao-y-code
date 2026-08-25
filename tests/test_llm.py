@@ -231,6 +231,109 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
     assert disabled["extra_body"]["thinking"] == {"type": "disabled"}
 
 
+@pytest.mark.parametrize(
+    ("model_name", "choice", "expected"),
+    [
+        (
+            "openai/kimi-k3",
+            "high",
+            {"extra_body": {"reasoning_effort": "high"}},
+        ),
+        (
+            "openai/deepseek-v4-flash",
+            "high",
+            {
+                "extra_body": {"thinking": {"type": "enabled"}},
+                "reasoning_effort": "high",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
+        ),
+        (
+            "openai/qwen3.8-max",
+            "medium",
+            {"extra_body": {"enable_thinking": True, "reasoning_effort": "medium"}},
+        ),
+        (
+            "openai/glm-5.2",
+            "max",
+            {
+                "extra_body": {"thinking": {"type": "enabled"}},
+                "reasoning_effort": "max",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
+        ),
+        (
+            "openai/kimi-k2.6",
+            "off",
+            {"extra_body": {"thinking": {"type": "disabled"}}},
+        ),
+        (
+            "openai/LongCat-2.0",
+            "on",
+            {"extra_body": {"thinking": {"type": "enabled"}}},
+        ),
+        (
+            "openai/mimo-v2.5-pro",
+            "off",
+            {
+                "reasoning_effort": "none",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
+        ),
+        (
+            "openai/qwen3.7-max",
+            "off",
+            {"extra_body": {"enable_thinking": False}},
+        ),
+        (
+            "openai/seed-2.1-pro",
+            "low",
+            {
+                "extra_body": {"thinking": {"type": "enabled"}},
+                "reasoning_effort": "low",
+                "allowed_openai_params": ["reasoning_effort"],
+            },
+        ),
+    ],
+)
+def test_model_reasoning_choice_uses_its_exact_request_contract(
+    monkeypatch, model_name, choice, expected
+):
+    """不同模型不能复用一套会遗漏开关或发送非法档位的参数。"""
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": choice})
+
+    result = _provider_request_options(model_name, "https://gateway.example/v1")
+
+    for key, value in expected.items():
+        assert result[key] == value
+
+
+def test_default_reasoning_choice_adds_no_user_override(monkeypatch):
+    """默认必须保留模型端行为，不能暗中强制某个档位。"""
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": "default"})
+
+    assert _provider_request_options(
+        "openai/qwen3.8-max", "https://gateway.example/v1"
+    ) == {}
+
+
+def test_effort_without_enabled_thinking_fails_before_transport():
+    """请求中出现强度却没有开启思考时必须立即失败。"""
+    from core.llm import _assert_reasoning_request_consistent
+    from core.reasoning_capabilities import get_reasoning_capability
+
+    capability = get_reasoning_capability("deepseek-v4-flash")
+
+    with pytest.raises(ValueError, match="思考强度.*未开启思考"):
+        _assert_reasoning_request_consistent(
+            {"reasoning_effort": "high"}, capability
+        )
+
+
 def test_reasoning_effort_injected_for_kimi_openai_route(monkeypatch):
     """配置 reasoning_effort 后，Kimi OpenAI 兼容路由注入到 extra_body。"""
     from core.llm import _provider_request_options
@@ -245,8 +348,8 @@ def test_reasoning_effort_injected_for_kimi_openai_route(monkeypatch):
     assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
 
 
-def test_reasoning_effort_skipped_on_anthropic_route_and_invalid_value(monkeypatch):
-    """Anthropic 路由不注入 reasoning_effort；非法值被忽略且不影响其他参数。"""
+def test_reasoning_effort_skipped_on_anthropic_route_and_invalid_value_fails(monkeypatch):
+    """Anthropic 固定路由不注入档位；损坏配置必须显式失败。"""
     from core.llm import _provider_request_options
 
     _patch_session(monkeypatch, "session_abc123")
@@ -256,11 +359,10 @@ def test_reasoning_effort_skipped_on_anthropic_route_and_invalid_value(monkeypat
     opts = _provider_request_options("anthropic/kimi-for-coding", "https://api.kimi.com/coding")
     assert "extra_body" not in opts
 
-    # 非法值：忽略，其余参数正常
+    # 非法值：不能静默忽略后继续发送
     _patch_model_cfg(monkeypatch, {"reasoning_effort": "turbo"})
-    opts = _provider_request_options("openai/kimi-k3", "https://api.moonshot.cn/v1")
-    assert "reasoning_effort" not in opts["extra_body"]
-    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
+    with pytest.raises(ValueError, match="turbo"):
+        _provider_request_options("openai/kimi-k3", "https://api.moonshot.cn/v1")
 
 
 def test_explicit_model_config_still_gets_cache_affinity(monkeypatch):

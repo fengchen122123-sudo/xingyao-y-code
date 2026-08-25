@@ -33,7 +33,7 @@ def _register(names: tuple[str, ...], capability: ReasoningCapability) -> None:
 
 
 _register(
-    ("k3", "k3-256k", "kimi-k3"),
+    ("k3", "k3-256k", "kimi-k3", "kimi-k3-256k"),
     ReasoningCapability(
         "effort", ("default", "low", "high", "max"), "always_on_effort"
     ),
