@@ -214,36 +214,79 @@ def test_update_provider_and_model_prefixed_name_not_double_prefixed(tmp_path, m
     assert model["context_window"] == 200000
 
 
-def test_set_model_reasoning_effort_roundtrip(tmp_path, monkeypatch):
-    """reasoning_effort 按模型写入/恢复默认，且落盘"""
-    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+def test_reasoning_effort_persists_with_thinking_enabled(tmp_path, monkeypatch):
+    """写入具体强度时不能遗漏思考开启状态。"""
+    data = _provider_config()
+    model = data["providers"][0]["models"][0]
+    model["name"] = "deepseek-v4-flash"
+    model["litellm_model"] = "openai/deepseek-v4-flash"
+    cfg = _use_tmp_config(tmp_path, monkeypatch, data)
 
-    ok, _ = model_manager.set_model_reasoning_effort("m1", "low")
+    ok, _ = model_manager.set_model_reasoning_choice("m1", "high")
+
     assert ok
-    assert model_manager.get_model_reasoning_effort("m1") == "low"
-    on_disk = json.loads(cfg.read_text(encoding="utf-8"))
-    assert on_disk["providers"][0]["models"][0]["reasoning_effort"] == "low"
-
-    ok, _ = model_manager.set_model_reasoning_effort("m1", "default")
-    assert ok
-    assert model_manager.get_model_reasoning_effort("m1") is None
-    on_disk = json.loads(cfg.read_text(encoding="utf-8"))
-    assert "reasoning_effort" not in on_disk["providers"][0]["models"][0]
+    on_disk = json.loads(cfg.read_text(encoding="utf-8"))["providers"][0]["models"][0]
+    assert on_disk["reasoning_choice"] == "high"
+    assert on_disk["enable_thinking"] is True
+    assert on_disk["reasoning_effort"] == "high"
+    assert model_manager.get_model_reasoning_choice("m1") == "high"
 
 
-def test_set_model_reasoning_effort_rejects_invalid(tmp_path, monkeypatch):
-    """非法档位与不存在的 model_id 都不写盘"""
-    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+def test_reasoning_off_and_default_remove_conflicting_overrides(tmp_path, monkeypatch):
+    """关闭或恢复默认时不能残留会重新开启思考的强度字段。"""
+    data = _provider_config()
+    model = data["providers"][0]["models"][0]
+    model["name"] = "deepseek-v4-flash"
+    model["litellm_model"] = "openai/deepseek-v4-flash"
+    cfg = _use_tmp_config(tmp_path, monkeypatch, data)
 
-    ok, msg = model_manager.set_model_reasoning_effort("m1", "extreme")
+    assert model_manager.set_model_reasoning_choice("m1", "max")[0]
+    assert model_manager.set_model_reasoning_choice("m1", "off")[0]
+    on_disk = json.loads(cfg.read_text(encoding="utf-8"))["providers"][0]["models"][0]
+    assert on_disk["reasoning_choice"] == "off"
+    assert on_disk["enable_thinking"] is False
+    assert "reasoning_effort" not in on_disk
+
+    assert model_manager.set_model_reasoning_choice("m1", "default")[0]
+    on_disk = json.loads(cfg.read_text(encoding="utf-8"))["providers"][0]["models"][0]
+    assert "reasoning_choice" not in on_disk
+    assert "enable_thinking" not in on_disk
+    assert "reasoning_effort" not in on_disk
+    assert model_manager.get_model_reasoning_choice("m1") == "default"
+
+
+def test_fixed_reasoning_model_rejects_changes_without_writing(tmp_path, monkeypatch):
+    """固定思考模型不能被设置接口伪装成可关闭模型。"""
+    data = _provider_config()
+    model = data["providers"][0]["models"][0]
+    model["name"] = "kimi-k2.7-code"
+    model["litellm_model"] = "openai/kimi-k2.7-code"
+    cfg = _use_tmp_config(tmp_path, monkeypatch, data)
+    model_manager.load_config()
+    before = cfg.read_bytes()
+
+    ok, message = model_manager.set_model_reasoning_choice("m1", "off")
+
     assert not ok
-    assert "extreme" in msg
+    assert "始终开启" in message
+    assert cfg.read_bytes() == before
 
-    ok, msg = model_manager.set_model_reasoning_effort("missing", "low")
+
+def test_reasoning_choice_rejects_invalid_or_missing_model(tmp_path, monkeypatch):
+    """模型不支持的档位与不存在的 model_id 都不能落盘。"""
+    data = _provider_config()
+    model = data["providers"][0]["models"][0]
+    model["name"] = "qwen3.8-max"
+    model["litellm_model"] = "openai/qwen3.8-max"
+    cfg = _use_tmp_config(tmp_path, monkeypatch, data)
+    model_manager.load_config()
+    before = cfg.read_bytes()
+
+    ok, message = model_manager.set_model_reasoning_choice("m1", "max")
     assert not ok
-
-    on_disk = json.loads(cfg.read_text(encoding="utf-8"))
-    assert "reasoning_effort" not in on_disk["providers"][0]["models"][0]
+    assert "max" in message
+    assert not model_manager.set_model_reasoning_choice("missing", "low")[0]
+    assert cfg.read_bytes() == before
 
 
 def test_provider_protocol_must_be_registered(tmp_path, monkeypatch):

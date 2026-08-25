@@ -466,47 +466,73 @@ def test_worker_owns_terminal_state_without_hiding_distinct_errors(
     assert [kind for kind, _ in emitted].count("turn_finish") == 1
 
 
-def test_bridge_set_reasoning_effort_returns_effective_level(monkeypatch):
+def test_bridge_set_reasoning_choice_returns_model_snapshot(monkeypatch):
+    """设置成功必须返回当前模型的精确选项，而不是通用档位。"""
     bridge = ApiBridge.__new__(ApiBridge)
-    monkeypatch.setattr("gui_bridge.load_config", lambda: {"active_model_id": "m1"})
     monkeypatch.setattr(
-        "gui_bridge.set_model_reasoning_effort",
-        lambda model_id, level: (True, "模型 m1 推理强度已设为 low"),
+        "gui_bridge.set_model_reasoning_choice",
+        lambda model_id, choice: (True, "模型 m1 思考设置已设为 medium"),
     )
-    monkeypatch.setattr("gui_bridge.get_model_reasoning_effort", lambda model_id: "low")
-    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {"litellm_model": "openai/k3-256k"})
+    monkeypatch.setattr("gui_bridge.get_model_reasoning_choice", lambda model_id: "medium")
+    monkeypatch.setattr(
+        "gui_bridge.get_active_model",
+        lambda: {"id": "m1", "name": "qwen3.8-max", "litellm_model": "openai/qwen3.8-max"},
+    )
+    monkeypatch.setattr(
+        "gui_bridge.load_config",
+        lambda: {
+            "active_model_id": "m1",
+            "providers": [{
+                "id": "p1",
+                "name": "测试厂商",
+                "base_url": "https://example.test/v1",
+                "api_key": "encrypted:test",
+                "protocol": "openai",
+                "models": [{
+                    "id": "m1",
+                    "name": "qwen3.8-max",
+                    "litellm_model": "openai/qwen3.8-max",
+                    "context_window": 1000000,
+                }],
+            }],
+        },
+    )
 
-    res = bridge.set_reasoning_effort("low")
+    res = bridge.set_reasoning_choice("m1", "medium")
 
     assert res["ok"] is True
-    assert res["reasoning_effort"] == "low"
-    assert "low" in res["msg"]
+    assert res["reasoning"]["choice"] == "medium"
+    assert [item["value"] for item in res["reasoning"]["options"]] == [
+        "default", "off", "low", "medium", "xhigh",
+    ]
 
 
-def test_bridge_set_reasoning_effort_requires_active_model(monkeypatch):
+def test_bridge_set_reasoning_choice_requires_model_id(monkeypatch):
+    """前端没有给出按钮对应模型时不能猜测全局模型。"""
     bridge = ApiBridge.__new__(ApiBridge)
-    monkeypatch.setattr("gui_bridge.load_config", lambda: {"active_model_id": ""})
 
-    res = bridge.set_reasoning_effort("low")
+    res = bridge.set_reasoning_choice("", "low")
 
     assert res["ok"] is False
     assert "激活模型" in res["msg"]
 
 
-def test_bridge_set_reasoning_effort_warns_anthropic_route(monkeypatch):
+def test_bridge_set_reasoning_choice_exposes_fixed_model_as_disabled(monkeypatch):
+    """固定思考模型的桥接快照必须锁定为开启。"""
     bridge = ApiBridge.__new__(ApiBridge)
-    monkeypatch.setattr("gui_bridge.load_config", lambda: {"active_model_id": "m1"})
     monkeypatch.setattr(
-        "gui_bridge.set_model_reasoning_effort",
-        lambda model_id, level: (True, "模型 m1 推理强度已设为 max"),
+        "gui_bridge.set_model_reasoning_choice",
+        lambda model_id, choice: (False, "该模型始终开启思考"),
     )
-    monkeypatch.setattr("gui_bridge.get_model_reasoning_effort", lambda model_id: "max")
-    monkeypatch.setattr("gui_bridge.get_active_model", lambda: {"litellm_model": "anthropic/k3-for-anthropic"})
+    monkeypatch.setattr(
+        "gui_bridge.get_active_model",
+        lambda: {"id": "m1", "name": "kimi-k2.7-code"},
+    )
 
-    res = bridge.set_reasoning_effort("max")
+    res = bridge.set_reasoning_choice("m1", "off")
 
-    assert res["ok"] is True
-    assert "Anthropic" in res["msg"]
+    assert res["ok"] is False
+    assert "始终开启" in res["msg"]
 
 
 def test_bridge_forwards_round_started_event(monkeypatch):
