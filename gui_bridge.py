@@ -699,19 +699,39 @@ class ApiBridge:
             return {"ok": False, "error": str(error)}
 
     def window_toggle_maximize(self) -> Dict[str, Any]:
-        """最大化 / 还原。走原生 SC_MAXIMIZE / SC_RESTORE（带动画），
-        最大化状态用 IsZoomed 原生查询，不自己维护标志。"""
+        """最大化 / 还原（原生系统路径）。
+
+        frameless 窗口带 WS_THICKFRAME 时原生 SC_MAXIMIZE 默认扩展到全屏
+        （含任务栏）；core.frameless 的 WM_GETMINMAXINFO 处理已把最大尺寸
+        钳制到当前显示器工作区（排除任务栏），因此这里直接走原生
+        SC_MAXIMIZE/SC_RESTORE：动画、任务栏交互、多显示器/DPI 全部系统接管。
+        最大化状态以 IsZoomed 为权威来源（不再维护伪最大化标志）。
+        """
         try:
             if self._window is None:
                 return {"ok": False, "error": "窗口未就绪"}
+            if sys.platform != "win32":
+                # 非 Windows 回退到 pywebview 原生路径
+                maximized = bool(self._is_window_zoomed())
+                if maximized:
+                    self._window.restore()
+                else:
+                    self._window.maximize()
+                self._frameless_maximized = not maximized
+                return {"ok": True, "maximized": self._frameless_maximized}
+
             maximized = bool(self._is_window_zoomed())
             if maximized:
                 if not self._send_sys_command(0xF120):  # SC_RESTORE
                     self._window.restore()
+                self._frameless_maximized = False
             else:
                 if not self._send_sys_command(0xF030):  # SC_MAXIMIZE
                     self._window.maximize()
-            self._frameless_maximized = not maximized
+                self._frameless_maximized = True
+
+            # 同步最大化状态到前端（按钮渲染）
+            self.emit_event("window_maximize_state", {"maximized": self._frameless_maximized})
             return {"ok": True, "maximized": self._frameless_maximized}
         except Exception as error:  # noqa: BLE001
             logger.warning("窗口最大化切换失败: %s", error)
@@ -1823,6 +1843,9 @@ class ApiBridge:
                         "tool_calls": msg.get("tool_calls") or [],
                         "name": msg.get("name") or "",
                         "tool_call_id": msg.get("tool_call_id") or "",
+                        # 透传生成该消息时所用模型的显示元数据（旧消息无 _display 时为空串）
+                        "model_id": (msg.get("_display") or {}).get("model_id") or "",
+                        "model_name": (msg.get("_display") or {}).get("model_name") or "",
                     })
         except Exception:
             logger.debug("加载会话消息失败", exc_info=True)
@@ -2454,7 +2477,7 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 模型与权限模式
     # ------------------------------------------------------------------
-    def set_model(self, model_id: str) -> Dict[str, Any]:
+    def set_model(self, model_id: str, session_name: Optional[str] = None):
         try:
             config_data = load_config()
             matched = None
@@ -2468,7 +2491,7 @@ class ApiBridge:
             if matched is None:
                 return {"ok": False, "msg": f"未找到模型: {model_id}"}
 
-            session_name = self._current_session
+            session_name = session_name or self._current_session
             if session_name:
                 # GUI 按会话绑定主模型：不同会话、不同界面互不干扰
                 self._memory.set_session_model_id(session_name, str(model_id))
@@ -2809,12 +2832,18 @@ class ApiBridge:
                 # pending 草稿会话预选的模型随首条消息落库：草稿期不能调 set_model
                 # （_current_session 还指向上一个真实会话，会污染旧会话绑定）。
                 # 必须在 worker 线程读取模型前完成绑定，否则回合回退全局默认模型
-                if workdir and clean_model_id:
+                if workdir:
                     try:
                         self._memory.ensure_session(target_session, workdir=str(workdir), source="GUI")
+                    except Exception:
+                        logger.debug("落库即命名失败", exc_info=True)
+                # 已存在会话也随消息刷新模型绑定：前端始终携带当前激活模型 id，
+                # 让"选模型立即生效"，不再只在 pending 新会话时绑定
+                if clean_model_id:
+                    try:
                         self._memory.set_session_model_id(target_session, clean_model_id)
                     except Exception:
-                        logger.debug("草稿模型绑定失败，回合回退默认模型", exc_info=True)
+                        logger.debug("会话模型绑定失败，回合回退默认模型", exc_info=True)
 
                 # 用户主动发起新对话：重置该会话的自动汇总标志，
                 # 下一批后台任务完成时可以再次触发自动汇总（与 CLI 行为一致）；
