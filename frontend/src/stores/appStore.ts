@@ -16,7 +16,8 @@ import type {
   TokenUsage,
   TokenStatisticsSnapshot,
   PermissionMode,
-  ReasoningEffort,
+  ReasoningChoice,
+  ReasoningSnapshot,
   SystemSettingsSnapshot,
   PyWebViewAPI,
   ToolStartEventData,
@@ -297,8 +298,15 @@ export const useAppStore = defineStore('app', {
       command_shell_error: '',
     } as SystemSettingsSnapshot,
 
-    // 当前激活模型的推理强度档位（default = 内置默认）
-    reasoningEffort: 'default' as ReasoningEffort,
+    // 当前激活模型的思考能力与选择；未知模型保持隐藏，不在前端猜测能力。
+    reasoning: {
+      kind: 'hidden',
+      visible: false,
+      disabled: false,
+      disabled_reason: '',
+      choice: 'default',
+      options: [],
+    } as ReasoningSnapshot,
 
     // 会话 / 项目工作区
     sessionGroups: [] as SessionGroup[],
@@ -1137,7 +1145,7 @@ export const useAppStore = defineStore('app', {
         if (init.system_settings) {
           this.systemSettings = init.system_settings;
         }
-        this.reasoningEffort = (init as any).reasoning_effort || 'default';
+        if (init.reasoning) this.reasoning = init.reasoning;
         this.sessionGroups = init.sessions || [];
         this.skills = init.skills || [];
         this.mcps = init.mcps || [];
@@ -1204,6 +1212,18 @@ export const useAppStore = defineStore('app', {
         runtime.modelId = modelId;
         runtime.modelName = this.activeModelName;
         this.draftModelId = modelId;
+        const api = this._api();
+        if (api) {
+          try {
+            const res = await api.get_reasoning_snapshot(modelId);
+            if (res && res.ok && this.activeModelId === modelId) {
+              this.reasoning = res.reasoning;
+            }
+          } catch (err) {
+            this.connected = false;
+            this.notifyChat('读取模型思考设置失败: ' + err);
+          }
+        }
         return;
       }
       const api = this._api();
@@ -1221,8 +1241,7 @@ export const useAppStore = defineStore('app', {
           if (this.currentSessionName === targetSession) {
             this.activeModelId = runtime.modelId!;
             this.activeModelName = runtime.modelName!;
-            // 推理强度按模型保存：切换模型后同步该模型自己的档位
-            this.reasoningEffort = res.reasoning_effort || 'default';
+            this.reasoning = res.reasoning;
           }
           // 新会话或空会话切换模型不再弹提示/产生新页面：模型绑定静默完成，
           // 仅当该会话已有真实对话内容（user/assistant 消息）时才插入切换提示，
@@ -1240,27 +1259,35 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async setReasoningEffort(level: ReasoningEffort) {
-      const prev = this.reasoningEffort;
-      this.reasoningEffort = level;
+    async setReasoningChoice(choice: ReasoningChoice) {
+      const targetModelId = this.activeModelId;
+      const previous: ReasoningSnapshot = {
+        ...this.reasoning,
+        options: this.reasoning.options.map(option => ({ ...option })),
+      };
+      this.reasoning = { ...this.reasoning, choice };
       const api = this._api();
-      if (!api) return;
+      if (!api) {
+        this.reasoning = previous;
+        return;
+      }
       try {
-        const res = await api.set_reasoning_effort(level);
+        const res = await api.set_reasoning_choice(targetModelId, choice);
+        if (this.activeModelId !== targetModelId) return;
         if (res && res.ok) {
-          this.reasoningEffort = res.reasoning_effort || level;
+          this.reasoning = res.reasoning;
           // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
           if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
-            this.notifyChat(res.msg || ('推理强度已调整: ' + this.reasoningEffort));
+            this.notifyChat(res.msg || ('思考设置已调整: ' + this.reasoning.choice));
           }
         } else {
-          this.reasoningEffort = prev;
-          this.notifyChat('推理强度调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
+          this.reasoning = previous;
+          this.notifyChat('思考设置调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
-        this.reasoningEffort = prev;
+        if (this.activeModelId === targetModelId) this.reasoning = previous;
         this.connected = false;
-        this.notifyChat('推理强度调整失败: ' + err);
+        this.notifyChat('思考设置调整失败: ' + err);
       }
     },
 
@@ -1468,7 +1495,7 @@ export const useAppStore = defineStore('app', {
         if (res.active_model_id && (this._sessionModelVersion[sessionName] || 0) === modelVersion) {
           this.activeModelId = res.active_model_id;
           this.activeModelName = res.active_model_name || this.activeModelName;
-          this.reasoningEffort = res.reasoning_effort || 'default';
+          this.reasoning = res.reasoning;
           const runtime2 = this._getSessionRuntime(sessionName);
           runtime2.modelId = this.activeModelId;
           runtime2.modelName = this.activeModelName;

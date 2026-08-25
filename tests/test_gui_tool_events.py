@@ -517,6 +517,29 @@ def test_bridge_set_reasoning_choice_requires_model_id(monkeypatch):
     assert "激活模型" in res["msg"]
 
 
+def test_bridge_get_reasoning_snapshot_is_read_only(monkeypatch):
+    """pending 草稿切模型时只读取能力快照，不能改写模型配置。"""
+    bridge = ApiBridge.__new__(ApiBridge)
+    model = {
+        "id": "m1",
+        "name": "qwen3.8-max",
+        "litellm_model": "openai/qwen3.8-max",
+    }
+    monkeypatch.setattr(
+        "gui_bridge.load_config",
+        lambda: {"providers": [{"id": "p1", "models": [model]}]},
+    )
+    monkeypatch.setattr("gui_bridge.get_model_reasoning_choice", lambda _id: "medium")
+
+    res = bridge.get_reasoning_snapshot("m1")
+
+    assert res["ok"] is True
+    assert res["reasoning"]["choice"] == "medium"
+    assert [item["value"] for item in res["reasoning"]["options"]] == [
+        "default", "off", "low", "medium", "xhigh",
+    ]
+
+
 def test_bridge_set_reasoning_choice_exposes_fixed_model_as_disabled(monkeypatch):
     """固定思考模型的桥接快照必须锁定为开启。"""
     bridge = ApiBridge.__new__(ApiBridge)
