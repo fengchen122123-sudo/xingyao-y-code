@@ -19,6 +19,10 @@ describe('composer controls', () => {
     ['active composer', InputArea],
   ])('renders simplified and colored controls in the %s', async (_name, component) => {
     const store = useAppStore();
+    store.reasoning = {
+      kind: 'effort', visible: true, disabled: false, disabled_reason: '', choice: 'high',
+      options: [{ value: 'high', label: '高' }],
+    };
     const wrapper = mount(component);
 
     // 附件按钮与权限下拉箭头已统一为 AppIcon SVG 图标：断言按钮内渲染了内联 svg
@@ -35,6 +39,12 @@ describe('composer controls', () => {
     await wrapper.vm.$nextTick();
 
     expect(wrapper.get('[data-test="permission-button"]').text().replace(/\s+/g, '')).toBe('完全访问');
+
+    const model = wrapper.get('[data-test="model-button"]').element;
+    const reasoning = wrapper.get('[data-test="reasoning-button"]').element;
+    const send = wrapper.get('[data-test="send-button"]').element;
+    expect(model.compareDocumentPosition(reasoning) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(reasoning.compareDocumentPosition(send) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     wrapper.unmount();
   });
 
