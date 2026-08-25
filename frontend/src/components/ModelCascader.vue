@@ -47,7 +47,7 @@
             v-for="opt in effortOptions"
             :key="opt.v"
             class="effort-opt"
-            :class="{ active: store.reasoningEffort === opt.v }"
+            :class="{ active: store.reasoning.choice === opt.v }"
             @click.stop="selectEffort(opt.v)"
           >{{ opt.label }}</span>
         </div>
@@ -61,7 +61,7 @@
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
-import type { ModelInfo, ReasoningEffort } from '../types/pywebview';
+import type { ModelInfo, ReasoningChoice } from '../types/pywebview';
 
 const props = defineProps<{
   visible: boolean;
@@ -172,15 +172,15 @@ function manageModels() {
 }
 
 // 推理强度档位：default = 模型条目未配置（请求层内置默认）
-const effortOptions: Array<{ v: ReasoningEffort; label: string }> = [
+const effortOptions: Array<{ v: ReasoningChoice; label: string }> = [
   { v: 'default', label: '默认' },
   { v: 'low', label: '低' },
   { v: 'high', label: '高' },
   { v: 'max', label: '最深' },
 ];
 
-function selectEffort(level: ReasoningEffort) {
-  store.setReasoningEffort(level);
+function selectEffort(level: ReasoningChoice) {
+  store.setReasoningChoice(level);
 }
 
 function positionMainPanel() {

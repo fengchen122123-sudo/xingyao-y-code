@@ -2557,6 +2557,32 @@ class ApiBridge:
             logger.exception("set_reasoning_choice 失败")
             return {"ok": False, "msg": str(e)}
 
+    def get_reasoning_snapshot(self, model_id: str) -> Dict[str, Any]:
+        """只读返回指定模型的思考能力与当前选择，供 pending 草稿切模型同步 UI。"""
+        try:
+            target_id = str(model_id or "").strip()
+            if not target_id:
+                return {"ok": False, "msg": "当前没有激活模型"}
+            config_data = load_config()
+            target_model = next(
+                (
+                    model
+                    for provider in config_data.get("providers", [])
+                    for model in provider.get("models", [])
+                    if str(model.get("id")) == target_id
+                ),
+                None,
+            )
+            if target_model is None:
+                return {"ok": False, "msg": f"未找到模型: {target_id}"}
+            return {
+                "ok": True,
+                "reasoning": _reasoning_snapshot_for_model(target_model),
+            }
+        except Exception as e:
+            logger.exception("get_reasoning_snapshot 失败")
+            return {"ok": False, "msg": str(e)}
+
     def set_secondary_model(self, model_id: str) -> Dict[str, Any]:
         """设置/清除副模型（用于视觉/压缩/子代理等后台任务）。传空字符串清除。"""
         try:

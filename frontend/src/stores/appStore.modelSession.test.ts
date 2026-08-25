@@ -5,6 +5,22 @@ import { useAppStore } from './appStore';
 // 模型与会话的绑定关系：每个会话（含尚未落库的 pending 草稿）都有自己
 // 独立的模型选择，互不影响；切换会话时即时恢复该会话上次使用的模型。
 
+function reasoningSnapshot(choice = 'default') {
+  return {
+    kind: 'effort' as const,
+    visible: true,
+    disabled: false,
+    disabled_reason: '',
+    choice,
+    options: [
+      { value: 'default', label: '默认' },
+      { value: 'off', label: '关闭' },
+      { value: 'medium', label: '中' },
+      { value: 'high', label: '高' },
+    ],
+  };
+}
+
 function mockBridgeApi(overrides: Record<string, unknown> = {}) {
   (window as any).pywebview = {
     api: {
@@ -12,7 +28,7 @@ function mockBridgeApi(overrides: Record<string, unknown> = {}) {
         ok: true,
         active_model_id: modelId,
         active_model_name: `模型-${modelId}`,
-        reasoning_effort: 'default',
+        reasoning: reasoningSnapshot(),
       })),
       switch_session: vi.fn(async () => ({
         messages: [],
@@ -21,7 +37,11 @@ function mockBridgeApi(overrides: Record<string, unknown> = {}) {
         sessions: [],
         active_model_id: 'm-global',
         active_model_name: '模型-m-global',
-        reasoning_effort: 'default',
+        reasoning: reasoningSnapshot(),
+      })),
+      get_reasoning_snapshot: vi.fn(async () => ({
+        ok: true,
+        reasoning: reasoningSnapshot('medium'),
       })),
       send_user_message: vi.fn(async () => ({ ok: true })),
       get_sessions: vi.fn(async () => []),
@@ -62,6 +82,7 @@ it('pending 新会话切换模型写入 pending runtime，不回写其它会话'
   const runtime = store.sessionRuntimeByName['__pending__:GLOBAL'];
   expect(runtime.modelId).toBe('m-kimi');
   expect(runtime.modelName).toBe('模型-m-kimi');
+  expect(store.reasoning.choice).toBe('medium');
 });
 
 it('已有真实对话的会话切换模型仍显示切换提示', async () => {
@@ -150,7 +171,7 @@ it('switchSession 恢复后端返回的会话模型', async () => {
     switch_session: vi.fn(async () => ({
       messages: [], workdir: 'GLOBAL', is_global: true, sessions: [],
       active_model_id: 'm-session', active_model_name: '模型-m-session',
-      reasoning_effort: 'high',
+      reasoning: reasoningSnapshot('high'),
     })),
   });
   const store = useAppStore();
@@ -159,7 +180,7 @@ it('switchSession 恢复后端返回的会话模型', async () => {
 
   expect(store.activeModelId).toBe('m-session');
   expect(store.activeModelName).toBe('模型-m-session');
-  expect(store.reasoningEffort).toBe('high');
+  expect(store.reasoning.choice).toBe('high');
 });
 
 it('switchSession 在途期间 setModel 后旧响应不覆盖本地选择', async () => {
@@ -176,12 +197,40 @@ it('switchSession 在途期间 setModel 后旧响应不覆盖本地选择', asyn
   release({
     messages: [], workdir: 'GLOBAL', is_global: true, sessions: [],
     active_model_id: 'm-old', active_model_name: '模型-m-old',
-    reasoning_effort: 'default',
+    reasoning: reasoningSnapshot(),
   });
   await switching;
 
   expect(store.activeModelId).toBe('m-new');
   expect(store.activeModelName).toBe('模型-m-new');
+});
+
+it('setReasoningChoice 应用后端规范化后的完整快照', async () => {
+  const setChoice = vi.fn(async () => ({
+    ok: true,
+    reasoning: reasoningSnapshot('medium'),
+  }));
+  mockBridgeApi({ set_reasoning_choice: setChoice });
+  const store = useAppStore();
+  store.activeModelId = 'm-qwen';
+
+  await store.setReasoningChoice('medium');
+
+  expect(setChoice).toHaveBeenCalledWith('m-qwen', 'medium');
+  expect(store.reasoning).toEqual(reasoningSnapshot('medium'));
+});
+
+it('setReasoningChoice 失败时恢复之前的完整快照', async () => {
+  mockBridgeApi({
+    set_reasoning_choice: vi.fn(async () => ({ ok: false, msg: '不支持' })),
+  });
+  const store = useAppStore();
+  store.activeModelId = 'm-deepseek';
+  store.reasoning = reasoningSnapshot('high') as any;
+
+  await store.setReasoningChoice('off');
+
+  expect(store.reasoning).toEqual(reasoningSnapshot('high'));
 });
 
 it('会话模型被删除后回落到后端配置模型', async () => {
