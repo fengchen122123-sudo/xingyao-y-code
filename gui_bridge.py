@@ -29,6 +29,7 @@ from typing import Any, Dict, List, Optional
 from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.agent_service import strip_context_suffix
+from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 from core.model_manager import (
@@ -84,13 +85,10 @@ _DWM_UNSUPPORTED_HRESULTS = frozenset({0x80070057, 0x80004001, 0x80070032})
 _MONITOR_DEFAULTTONEAREST = 2
 
 
-class _MONITORINFO(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", ctypes.wintypes.DWORD),
-        ("rcMonitor", ctypes.wintypes.RECT),
-        ("rcWork", ctypes.wintypes.RECT),
-        ("dwFlags", ctypes.wintypes.DWORD),
-    ]
+# _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
+# 在同一个 ctypes.windll.user32 上互相覆盖 GetMonitorInfoW.argtypes，导致
+# frameless 的 WM_GETMINMAXINFO 回调调用 GetMonitorInfoW 时抛 ArgumentError，
+# 最大化钳制静默失效、窗口覆盖任务栏。单一来源后两者 argtypes 一致，不再冲突。
 
 
 def _cursor_snap_vk() -> Optional[int]:
@@ -3309,6 +3307,7 @@ class ApiBridge:
                     api_base,
                     session_name,
                     turn_id,
+                    model_id=active_model.get("id"),
                     error_state=error_state,
                 )
             finally:
@@ -3595,6 +3594,7 @@ class ApiBridge:
         session_name,
         turn_id,
         *,
+        model_id=None,
         error_state=None,
     ) -> bool:
         """迭代模型事件并翻译为前端事件；返回本轮是否被取消。"""
@@ -3621,6 +3621,7 @@ class ApiBridge:
             parent_turn_id=turn_id,
             permission_owner=turn_id,
             permission_source="主代理",
+            model_id=model_id,
         ):
             if (self._cancel_events.get(session_name) or self._get_cancel_event(session_name)).is_set():
                 cancelled = True
