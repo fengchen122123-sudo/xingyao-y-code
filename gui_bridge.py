@@ -38,11 +38,11 @@ from core.model_manager import (
     delete_provider as mm_delete_provider,
     delete_model as mm_delete_model,
     get_active_model,
-    get_model_reasoning_effort,
+    get_model_reasoning_choice,
     get_secondary_roles,
     load_config,
     set_active_model,
-    set_model_reasoning_effort,
+    set_model_reasoning_choice,
     set_secondary_model,
     set_secondary_roles,
     update_model as mm_update_model,
@@ -50,6 +50,7 @@ from core.model_manager import (
     sync_preset_provider_models as mm_sync_preset_provider_models,
 )
 from core.model_catalog import API_PROTOCOLS, get_preset_providers
+from core.reasoning_capabilities import build_reasoning_snapshot
 from core.permission_broker import permission_broker
 from core.skills import get_active_skill_ids, save_active_skill_ids, scan_all_skills
 from core.task_manager import kill_background_task, list_active_tasks
@@ -394,6 +395,15 @@ class _GuiContext:
 
     def invalidate_ui(self):
         pass  # GUI 通过事件驱动，不需要主动重绘
+
+
+def _reasoning_snapshot_for_model(model: dict | None) -> dict:
+    """返回指定模型的能力与持久化选择，避免依赖全局活动模型。"""
+    snapshot = build_reasoning_snapshot(model)
+    model_id = str((model or {}).get("id") or "")
+    if model_id and snapshot["kind"] not in {"fixed", "hidden"}:
+        snapshot["choice"] = get_model_reasoning_choice(model_id)
+    return snapshot
 
 
 class ApiBridge:
@@ -1904,8 +1914,7 @@ class ApiBridge:
                 "providers": providers,
                 "active_model_id": str(effective_model_id),
                 "active_model_name": str(active_model.get("name") or "未激活模型"),
-                # 当前激活模型的推理强度档位（None/"default" = 内置默认）
-                "reasoning_effort": get_model_reasoning_effort(effective_model_id) or "default",
+                "reasoning": _reasoning_snapshot_for_model(active_model),
                 # 副模型配置：启动时同步给前端，避免设置页显示"无/全勾选"假象
                 "secondary_model_id": str(config_data.get("secondary_model_id") or ""),
                 "secondary_model_roles": get_secondary_roles(),
@@ -1954,7 +1963,7 @@ class ApiBridge:
             return {
                 "models": [], "providers": [], "active_model_id": "",
                 "active_model_name": "未激活模型", "permission_mode": "confirm",
-                "reasoning_effort": "default",
+                "reasoning": _reasoning_snapshot_for_model(None),
                 "sessions": [], "skills": [], "mcps": [],
                 "workdir": "", "current_session": self._current_session,
                 "active_sessions": [],
@@ -2374,7 +2383,7 @@ class ApiBridge:
                 "sessions": self.get_sessions(),
                 "active_model_id": str(session_model.get("id") or ""),
                 "active_model_name": str(session_model.get("name") or "未激活模型"),
-                "reasoning_effort": get_model_reasoning_effort(session_model.get("id")) or "default",
+                "reasoning": _reasoning_snapshot_for_model(session_model),
                 # 排队中的用户消息随切换返回：前端免额外往返即可渲染排队条目
                 "message_queue": self._message_queue_snapshot(session_name),
             }
@@ -2512,30 +2521,40 @@ class ApiBridge:
                 "ok": True,
                 "active_model_id": str(model_id),
                 "active_model_name": str(matched.get("name", "")),
-                # 模型切换后前端需同步该模型自己的推理强度档位
-                "reasoning_effort": str(matched.get("reasoning_effort") or "default"),
+                "reasoning": _reasoning_snapshot_for_model(matched),
             }
         except Exception as e:
             logger.exception("set_model 失败")
             return {"ok": False, "msg": str(e)}
 
-    def set_reasoning_effort(self, level: str) -> Dict[str, Any]:
-        """设置当前激活模型的推理强度档位（按模型持久化，下一轮请求生效）。"""
+    def set_reasoning_choice(self, model_id: str, choice: str) -> Dict[str, Any]:
+        """设置指定模型的思考开关或强度（下一轮请求生效）。"""
         try:
-            active_id = str(load_config().get("active_model_id") or "")
-            if not active_id:
+            target_id = str(model_id or "").strip()
+            if not target_id:
                 return {"ok": False, "msg": "当前没有激活模型"}
-            ok, message = set_model_reasoning_effort(active_id, level)
+            ok, message = set_model_reasoning_choice(target_id, choice)
             if not ok:
                 return {"ok": False, "msg": message}
-            effective = get_model_reasoning_effort(active_id) or "default"
-            # Anthropic 路由不注入 reasoning_effort（走 thinking_budget），明确告知前端
-            litellm_model = str((get_active_model() or {}).get("litellm_model") or "")
-            if litellm_model.split("/")[0].lower() == "anthropic":
-                message += "（当前模型走 Anthropic 路由，该档位不会注入请求）"
-            return {"ok": True, "reasoning_effort": effective, "msg": message}
+            config_data = load_config()
+            target_model = next(
+                (
+                    model
+                    for provider in config_data.get("providers", [])
+                    for model in provider.get("models", [])
+                    if str(model.get("id")) == target_id
+                ),
+                None,
+            )
+            if target_model is None:
+                raise ValueError(f"未找到模型: {target_id}")
+            return {
+                "ok": True,
+                "reasoning": _reasoning_snapshot_for_model(target_model),
+                "msg": message,
+            }
         except Exception as e:
-            logger.exception("set_reasoning_effort 失败")
+            logger.exception("set_reasoning_choice 失败")
             return {"ok": False, "msg": str(e)}
 
     def set_secondary_model(self, model_id: str) -> Dict[str, Any]:
