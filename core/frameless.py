@@ -265,19 +265,24 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
         # 位置/尺寸钳制到窗口所在显示器的工作区（rcWork，排除任务栏），最大化
         # 仍走系统原生路径：动画、WebView2 布局、DPI、多屏全部系统接管。
         if msg == WM_GETMINMAXINFO:
-            hmon = _u32.MonitorFromWindow(hwnd_arg, 2)  # MONITOR_DEFAULTTONEAREST
-            if hmon:
-                mi = _MONITORINFO()
-                mi.cbSize = ctypes.sizeof(_MONITORINFO)
-                if _u32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
-                    mmi = ctypes.cast(
-                        lparam, ctypes.POINTER(_MINMAXINFO),
-                    ).contents
-                    mmi.ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left
-                    mmi.ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top
-                    mmi.ptMaxSize.x = mi.rcWork.right - mi.rcWork.left
-                    mmi.ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top
-                    return 0  # 已定制，不再走默认
+            try:
+                hmon = _u32.MonitorFromWindow(hwnd_arg, 2)  # MONITOR_DEFAULTTONEAREST
+                if hmon:
+                    mi = _MONITORINFO()
+                    mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                    if _u32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                        mmi = ctypes.cast(
+                            lparam, ctypes.POINTER(_MINMAXINFO),
+                        ).contents
+                        mmi.ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left
+                        mmi.ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top
+                        mmi.ptMaxSize.x = mi.rcWork.right - mi.rcWork.left
+                        mmi.ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top
+                        return 0  # 已定制，不再走默认
+            except Exception as error:  # noqa: BLE001
+                # 窗口过程绝不抛异常（打包版 stderr 为空会静默吞掉、极难排查）；
+                # 记录后回退默认最大化，避免拖垮整个窗口消息循环。
+                logger.error("WM_GETMINMAXINFO 处理失败，回退默认最大化: %s", error)
         # 顶层窗口：穿透上来的命中只在边缘返回边框码（顶部边缘也能 resize）。
         # 标题栏区域保持 HTCLIENT 交给 WebView（见模块 docstring 第 3 点）。
         if msg == WM_NCHITTEST:
