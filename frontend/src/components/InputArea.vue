@@ -91,12 +91,19 @@
           </span>
           <button
             ref="modelBtnRef"
+            data-test="model-button"
             class="chip-btn model-chip"
             title="切换模型"
             @click.stop="toggleModelCascader"
           >{{ store.activeModelName || '选择模型' }} <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" /></button>
+          <ReasoningSelector
+            ref="reasoningSelectorRef"
+            variant="compact"
+            @open="closeComposerMenus"
+          />
           <button
             id="send-btn"
+            data-test="send-button"
             :class="{ stop: sendStopMode, active: !sendStopMode && hasInputContent }"
             :title="sendStopMode ? '停止生成 (Esc)' : (store.currentSessionRunning ? '排队发送 (Enter)' : '发送消息 (Enter)')"
             @click="handleSend"
@@ -138,6 +145,7 @@ import { formatPermMode } from '../utils/markdown';
 import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
+import ReasoningSelector from './ReasoningSelector.vue';
 import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
 import { useAttachments } from '../composables/useAttachments';
@@ -152,13 +160,21 @@ const showModelCascader = ref(false);
 const showPermDropdown = ref(false);
 const modelBtnRef = ref<HTMLElement | null>(null);
 const permBtnRef = ref<HTMLElement | null>(null);
+const reasoningSelectorRef = ref<{ close: () => void } | null>(null);
+
+function closeComposerMenus() {
+  showModelCascader.value = false;
+  showPermDropdown.value = false;
+}
 
 function toggleModelCascader() {
+  reasoningSelectorRef.value?.close();
   showPermDropdown.value = false;
   showModelCascader.value = !showModelCascader.value;
 }
 
 function togglePermDropdown() {
+  reasoningSelectorRef.value?.close();
   showModelCascader.value = false;
   showPermDropdown.value = !showPermDropdown.value;
 }

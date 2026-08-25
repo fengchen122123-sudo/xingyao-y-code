@@ -76,4 +76,13 @@ describe('ModelCascader', () => {
     expect(root.classes()).toContain('opens-up');
     expect(root.attributes('style')).toContain('--cascader-max-height: 680px');
   });
+
+  it('模型菜单不再显示通用推理强度行', () => {
+    const wrapper = mount(ModelCascader, {
+      props: { visible: true, anchorEl: document.createElement('button') },
+      global: { stubs: { teleport: true } },
+    });
+
+    expect(wrapper.find('.effort-row').exists()).toBe(false);
+  });
 });

@@ -51,6 +51,7 @@
         <div style="display:flex;align-items:center;gap:10px">
           <button
             ref="modelBtnRef"
+            data-test="model-button"
             class="kimi-pill-btn"
             title="切换模型"
             @click.stop="toggleModelCascader"
@@ -59,7 +60,14 @@
             <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" />
           </button>
 
+          <ReasoningSelector
+            ref="reasoningSelectorRef"
+            variant="hero"
+            @open="closeComposerMenus"
+          />
+
           <button
+            data-test="send-button"
             class="kimi-send-btn"
             :class="{ active: (inputVal.trim() || attachments.length) && !store.currentSessionRunning }"
             :disabled="store.currentSessionRunning"
@@ -125,6 +133,7 @@ import { formatPermMode } from '../utils/markdown';
 import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
 import PermDropdown from './PermDropdown.vue';
+import ReasoningSelector from './ReasoningSelector.vue';
 import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
 import { useAttachments } from '../composables/useAttachments';
@@ -142,6 +151,7 @@ const workdirDropdownStyle = ref<Record<string, string>>({});
 const modelBtnRef = ref<HTMLElement | null>(null);
 const permBtnRef = ref<HTMLElement | null>(null);
 const workdirBtnRef = ref<HTMLElement | null>(null);
+const reasoningSelectorRef = ref<{ close: () => void } | null>(null);
 
 // 工作区下拉数据：非 GLOBAL 的项目分组
 const projectGroups = computed(() =>
@@ -152,6 +162,7 @@ const isGlobalWorkdir = computed(() =>
 );
 
 function toggleWorkdirDropdown() {
+  reasoningSelectorRef.value?.close();
   showWorkdirDropdown.value = !showWorkdirDropdown.value;
   if (showWorkdirDropdown.value && workdirBtnRef.value) {
     const r = workdirBtnRef.value.getBoundingClientRect();
@@ -189,13 +200,21 @@ onMounted(() => document.addEventListener('click', onGlobalClickForWorkdir));
 onUnmounted(() => document.removeEventListener('click', onGlobalClickForWorkdir));
 
 function toggleModelCascader() {
+  reasoningSelectorRef.value?.close();
   showPermDropdown.value = false;
   showModelCascader.value = !showModelCascader.value;
 }
 
 function togglePermDropdown() {
+  reasoningSelectorRef.value?.close();
   showModelCascader.value = false;
   showPermDropdown.value = !showPermDropdown.value;
+}
+
+function closeComposerMenus() {
+  showModelCascader.value = false;
+  showPermDropdown.value = false;
+  showWorkdirDropdown.value = false;
 }
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop } = useAttachments();
