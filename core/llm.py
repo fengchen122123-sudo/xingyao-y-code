@@ -2719,11 +2719,9 @@ def _attach_kimi_request_extras(
     cache_session_id=None,
     tool_contract="",
 ):
-    """给 Kimi 系模型的请求参数附加缓存亲和与推理强度配置（原地修改 result）。
+    """给 Kimi 系模型的请求参数附加缓存亲和配置（原地修改 result）。
 
     - 缓存亲和：OpenAI 兼容路由传 prompt_cache_key，Anthropic 路由传 metadata.user_id。
-    - reasoning_effort：K3 官方推理强度档位（low/high/max，默认 max），仅 OpenAI
-      兼容路由支持；Anthropic 路由的推理强度由 thinking_budget 控制，不注入。
     """
     anthropic_route = str(model_name or "").split("/")[0].lower() == "anthropic"
 
@@ -2742,18 +2740,119 @@ def _attach_kimi_request_extras(
         else:
             result.setdefault("extra_body", {})["prompt_cache_key"] = session_id
 
-    effort = str(model_cfg.get("reasoning_effort") or "").strip().lower()
-    if effort:
-        if effort not in _REASONING_EFFORT_LEVELS:
-            logger.warning(
-                "模型配置 reasoning_effort=%r 无效（仅支持 %s），已忽略",
-                effort, "/".join(_REASONING_EFFORT_LEVELS),
+
+
+def _configured_reasoning_choice(model_cfg, capability):
+    """把新选择字段和历史配置统一成能力表中的一个合法选择。"""
+    configured_choice = str(model_cfg.get("reasoning_choice") or "").strip().lower()
+    if configured_choice:
+        if configured_choice not in capability.options:
+            raise ValueError(
+                f"模型不支持思考选项 {configured_choice!r}，"
+                f"仅支持 {', '.join(capability.options) or '固定开启'}"
             )
-        elif anthropic_route:
-            # Anthropic 路由（api.kimi.com/coding 等）的推理强度用 thinking_budget 控制
-            logger.info("reasoning_effort 仅对 OpenAI 兼容路由生效，Anthropic 路由请配置 thinking_budget")
+        return configured_choice
+
+    legacy_enabled = model_cfg.get("enable_thinking")
+    if legacy_enabled is False and "off" in capability.options:
+        return "off"
+
+    legacy_effort = str(model_cfg.get("reasoning_effort") or "").strip().lower()
+    if legacy_effort:
+        if legacy_effort not in capability.options:
+            raise ValueError(
+                f"模型 reasoning_effort={legacy_effort!r} 不受支持，"
+                f"仅支持 {', '.join(capability.options) or '固定开启'}"
+            )
+        return legacy_effort
+
+    if legacy_enabled is True and "on" in capability.options:
+        return "on"
+    return "default"
+
+
+def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=False):
+    """按模型能力表把思考选择编码为该模型的精确请求参数。"""
+    from core.reasoning_capabilities import get_reasoning_capability
+
+    capability = get_reasoning_capability(model_name)
+    has_explicit_choice = bool(str(model_cfg.get("reasoning_choice") or "").strip())
+    has_legacy_choice = (
+        bool(str(model_cfg.get("reasoning_effort") or "").strip())
+        or isinstance(model_cfg.get("enable_thinking"), bool)
+    )
+    if not has_explicit_choice and not has_legacy_choice:
+        return capability
+
+    if capability.kind == "hidden":
+        if has_explicit_choice:
+            raise ValueError(f"模型 {model_name!r} 没有已确认的思考参数能力")
+        return capability
+    if capability.kind == "fixed":
+        if has_explicit_choice:
+            raise ValueError(f"模型 {model_name!r} 的思考固定开启，不能设置思考选项")
+        logger.info("模型 %s 的思考固定开启，忽略历史思考配置", model_name)
+        return capability
+
+    choice = _configured_reasoning_choice(model_cfg, capability)
+    if choice == "default":
+        return capability
+
+    strategy = capability.request_strategy
+    if strategy == "always_on_effort":
+        if anthropic_route:
+            raise ValueError("Anthropic 路由不支持该模型的 reasoning_effort 参数")
+        result.setdefault("extra_body", {})["reasoning_effort"] = choice
+    elif strategy == "thinking_object_effort":
+        enabled = choice != "off"
+        result.setdefault("extra_body", {})["thinking"] = {
+            "type": "enabled" if enabled else "disabled"
+        }
+        if enabled:
+            result["reasoning_effort"] = choice
+            result["allowed_openai_params"] = ["reasoning_effort"]
         else:
-            result.setdefault("extra_body", {})["reasoning_effort"] = effort
+            result.pop("reasoning_effort", None)
+    elif strategy == "enable_thinking_effort":
+        enabled = choice != "off"
+        extra_body = result.setdefault("extra_body", {})
+        extra_body["enable_thinking"] = enabled
+        if enabled:
+            extra_body["reasoning_effort"] = choice
+        else:
+            extra_body.pop("reasoning_effort", None)
+    elif strategy == "effort_switch":
+        result["reasoning_effort"] = "none" if choice == "off" else choice
+        result["allowed_openai_params"] = ["reasoning_effort"]
+    elif strategy == "thinking_object_toggle":
+        result.setdefault("extra_body", {})["thinking"] = {
+            "type": "enabled" if choice == "on" else "disabled"
+        }
+    elif strategy == "enable_thinking_toggle":
+        result.setdefault("extra_body", {})["enable_thinking"] = choice == "on"
+    else:
+        raise ValueError(f"未实现的思考请求策略: {strategy}")
+    return capability
+
+
+def _assert_reasoning_request_consistent(result, capability):
+    """禁止把思考强度单独发送给需要显式开启思考的模型。"""
+    extra_body = result.get("extra_body") or {}
+    has_effort = "reasoning_effort" in result or "reasoning_effort" in extra_body
+    if not has_effort:
+        return
+
+    strategy = capability.request_strategy
+    if strategy in {"always_on_effort", "effort_switch"}:
+        return
+    if strategy == "thinking_object_effort":
+        enabled = (extra_body.get("thinking") or {}).get("type") == "enabled"
+    elif strategy == "enable_thinking_effort":
+        enabled = extra_body.get("enable_thinking") is True
+    else:
+        enabled = False
+    if not enabled:
+        raise ValueError("请求包含思考强度，但未开启思考")
 
 
 def _provider_cache_affinity_options(
@@ -2795,7 +2894,7 @@ def _provider_request_options(
     2. 内置的 Kimi/Moonshot 模型默认表
     3. 空字典（由调用方兜底 max_tokens=8192）
 
-    无论走哪个分支，Kimi 系模型都会附加缓存亲和与 reasoning_effort 配置。
+    无论走哪个分支，Kimi 系模型都会附加缓存亲和配置。思考参数随后按模型能力表编码。
     """
     normalized_base = str(api_base or "").rstrip("/").lower()
     normalized_model = str(model_name or "").split("/")[-1].lower()
@@ -2810,6 +2909,7 @@ def _provider_request_options(
     cfg_max_tokens = model_cfg.get("max_tokens")
     cfg_thinking_budget = model_cfg.get("thinking_budget")
     cfg_enable_thinking = model_cfg.get("enable_thinking")
+    has_reasoning_choice = bool(str(model_cfg.get("reasoning_choice") or "").strip())
 
     # 判定同时看模型名与 api_base（经销商/聚合网关的 base_url 千奇百怪，
     # 只认 base 会漏判，比如 api.scnet.cn 上的 Kimi-K2.6）。
@@ -2826,23 +2926,28 @@ def _provider_request_options(
     if deepseek_family:
         if cfg_max_tokens is not None:
             result["max_tokens"] = int(cfg_max_tokens)
-        if _is_official_deepseek_route(api_base) or isinstance(cfg_enable_thinking, bool):
-            result.setdefault("extra_body", {})["thinking"] = {
-                "type": "enabled" if deepseek_thinking else "disabled"
-            }
-        if deepseek_thinking:
-            effort = str(model_cfg.get("reasoning_effort") or "max").strip().lower()
-            if effort not in _REASONING_EFFORT_LEVELS:
-                raise ValueError(
-                    "DeepSeek reasoning_effort 仅支持 low/high/max，"
-                    f"实际为 {effort!r}"
-                )
-            result["reasoning_effort"] = effort
-            # LiteLLM 对尚未内置识别的 OpenAI 兼容模型会在客户端拒绝
-            # reasoning_effort。这里按参数白名单精确放行，不能用全局
-            # drop_params，否则会静默丢失用户要求的推理强度。
-            result["allowed_openai_params"] = ["reasoning_effort"]
-    elif cfg_max_tokens is not None or cfg_thinking_budget is not None or cfg_enable_thinking is not None:
+        if not has_reasoning_choice:
+            if _is_official_deepseek_route(api_base) or isinstance(cfg_enable_thinking, bool):
+                result.setdefault("extra_body", {})["thinking"] = {
+                    "type": "enabled" if deepseek_thinking else "disabled"
+                }
+            if deepseek_thinking:
+                effort = str(model_cfg.get("reasoning_effort") or "max").strip().lower()
+                if effort not in _REASONING_EFFORT_LEVELS:
+                    raise ValueError(
+                        "DeepSeek reasoning_effort 仅支持 low/high/max，"
+                        f"实际为 {effort!r}"
+                    )
+                result["reasoning_effort"] = effort
+                # LiteLLM 对尚未内置识别的 OpenAI 兼容模型会在客户端拒绝
+                # reasoning_effort。这里按参数白名单精确放行，不能用全局
+                # drop_params，否则会静默丢失用户要求的推理强度。
+                result["allowed_openai_params"] = ["reasoning_effort"]
+    elif (
+        cfg_max_tokens is not None
+        or cfg_thinking_budget is not None
+        or (cfg_enable_thinking is not None and not has_reasoning_choice)
+    ):
         # 用户显式配置优先
         if cfg_max_tokens is not None:
             result["max_tokens"] = int(cfg_max_tokens)
@@ -2899,6 +3004,13 @@ def _provider_request_options(
             cache_session_id=cache_session_id,
             tool_contract=tool_contract,
         )
+    capability = _apply_reasoning_choice(
+        result,
+        model_name,
+        model_cfg,
+        anthropic_route=anthropic_route,
+    )
+    _assert_reasoning_request_consistent(result, capability)
     return result
 
 
