@@ -340,7 +340,7 @@ export interface PyWebViewAPI {
   delete_folder_group(workdir: string): Promise<any>;
   rename_session(oldName: string, newName: string): Promise<any>;
 
-  set_model(modelId: string): Promise<any>;
+  set_model(modelId: string, sessionName?: string): Promise<any>;
   set_reasoning_effort(level: ReasoningEffort): Promise<any>;
   set_permission_mode(mode: PermissionMode): Promise<any>;
   set_sandbox_enabled(enabled: boolean): Promise<any>;

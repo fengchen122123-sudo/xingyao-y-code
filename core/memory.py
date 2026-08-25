@@ -1832,6 +1832,9 @@ class MemoryManager:
                     normalized = {"role": role}
                     normalized.update(parsed)
                     normalized["role"] = role
+                    # 剔除模型显示元数据（_display 仅供 UI 展示），
+                    # 避免混入发给 LLM 的提示词
+                    normalized.pop("_display", None)
                     history.append(normalized)
                 else:
                     history.append({"role": role, "content": parsed})

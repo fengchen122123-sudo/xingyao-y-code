@@ -64,8 +64,12 @@
           <button class="chip-btn" title="清空当前会话历史" @click="store.clearSessionHistory()">清空</button>
         </div>
 
-        <!-- 对话主体滚动区 -->
-        <div ref="chatScrollRef" id="chat-scroll" data-theme-region="workspace">
+        <!-- 对话主体滚动区：.chat-viewport 是不滚动的定位外壳，
+             红点轨道与"回到底部"按钮放在它里面、#chat-scroll 外面——
+             若放进 overflow 滚动的 #chat-scroll 内，position:absolute 会相对
+             整个内容区定位，会话一长红点就被推到内容中部、随内容滚出视口 -->
+        <div class="chat-viewport">
+          <div ref="chatScrollRef" id="chat-scroll" data-theme-region="workspace" @scroll="handleScroll">
           <div id="chat-body">
             <!-- Kimi 空状态卡片 -->
             <KimiEmptyState v-if="!store.messages || store.messages.length === 0" />
@@ -96,6 +100,25 @@
               <span class="wi-text">星瑶本轮工作 {{ fmtWorkTime(finalWorkTime) }}</span>
             </div>
           </div>
+          </div>
+
+          <!-- 红点导航轨道：相对外壳定位，钉在右侧不随内容滚动 -->
+          <MessageNavRail
+            ref="railRef"
+            :get-scroll-el="() => chatScrollRef"
+            :get-user-msg-elements="getUserMsgElements"
+          />
+
+          <!-- 回到底部悬浮按钮：用户上滑浏览历史时出现 -->
+          <button
+            v-if="showJumpButton"
+            class="jump-bottom"
+            data-test="jump-bottom"
+            title="回到底部"
+            @click="scrollToBottom(true)"
+          >
+            <AppIcon name="chevron-down" :size="16" :stroke-width="2.25" />
+          </button>
         </div>
 
         <!-- 二级抽屉页面 -->
@@ -182,9 +205,11 @@ import { ref, onMounted, onUnmounted, nextTick, computed, watch } from 'vue';
 import { useAppStore } from './stores/appStore';
 import { formatPermMode } from './utils/markdown';
 import { buildMessageGroups, msgKey, type TurnGroupInfo } from './utils/turnGroups';
+import { useChatScroll } from './composables/useChatScroll';
 
 import Topbar from './components/Topbar.vue';
 import AppIcon from './components/AppIcon.vue';
+import MessageNavRail from './components/MessageNavRail.vue';
 import Sidebar from './components/Sidebar.vue';
 import KimiEmptyState from './components/KimiEmptyState.vue';
 import TurnGroup from './components/TurnGroup.vue';
@@ -210,22 +235,9 @@ function beginWindowResize(edge: WindowResizeEdge) {
   void window.pywebview?.api?.window_begin_resize?.(edge);
 }
 
-const windowMaximized = ref(false);
-
-async function refreshWindowMaximized() {
-  try {
-    const result = await window.pywebview?.api?.window_is_maximized?.();
-    if (result?.ok) windowMaximized.value = !!result.maximized;
-  } catch {
-    // 浏览器开发态或桥接初始化期间保持普通窗口状态。
-  }
-}
-
-onMounted(() => {
-  void refreshWindowMaximized();
-  window.addEventListener('resize', refreshWindowMaximized);
-});
-onUnmounted(() => window.removeEventListener('resize', refreshWindowMaximized));
+// 最大化状态从 store 读取（后端通过 window_maximize_state 事件推送），
+// 本地不再维护独立 ref 和事件监听
+const windowMaximized = computed(() => store.windowMaximized);
 
 const store = useAppStore();
 const chatScrollRef = ref<HTMLElement | null>(null);
@@ -238,8 +250,6 @@ function backToThemeEditor() {
 }
 
 const showExportMenu = ref(false);
-// 滚动合并标记：同一帧内多次 scrollToBottom 只执行一次
-let scrollRaf: number | undefined;
 
 async function doExport(fmt: 'md' | 'html' | 'json') {
   showExportMenu.value = false;
@@ -272,16 +282,28 @@ const statusSkillTitle = computed(() =>
     : '本回合未使用任何技能',
 );
 
-function scrollToBottom() {
-  // 合并到下一帧：流式输出期间会被高频调用，逐帧滚动足够顺滑且避免布局抖动
-  if (scrollRaf !== undefined) return;
-  scrollRaf = window.requestAnimationFrame(() => {
-    scrollRaf = undefined;
-    if (chatScrollRef.value) {
-      chatScrollRef.value.scrollTop = chatScrollRef.value.scrollHeight;
-    }
-  });
+// 智能滚动：跟随模式（贴底自动吸底 / 上滑冻结）+ force 场景强制回底
+const {
+  scrollToBottom,
+  handleScroll,
+  syncStick,
+  showJumpButton,
+} = useChatScroll(() => chatScrollRef.value);
+
+// 红点导航轨道：每条「我发的消息」对应一个红点，DOM 变化后重算红点数量
+const railRef = ref<InstanceType<typeof MessageNavRail> | null>(null);
+function refreshRail() {
+  railRef.value?.refresh();
 }
+function getUserMsgElements(): HTMLElement[] {
+  return Array.from(chatScrollRef.value?.querySelectorAll('.msg-user') ?? []);
+}
+
+// 新用户消息（发送）→ 强制回底并恢复跟随；其余消息变化仅在跟随模式下跟随
+const userMsgCount = computed(() => store.messages.filter((m) => m.role === 'user').length);
+watch(userMsgCount, (n, o) => {
+  if (n > o) scrollToBottom(true);
+});
 
 // M32 修复：消息列表 key 不用数组索引（插入/删除时组件局部状态会错挂）。
 // 消息对象没有后端 id，按对象身份分配稳定渲染 key（实现移至 utils/turnGroups，
@@ -309,10 +331,9 @@ function ensureBodyObserver() {
     bodyObserver?.disconnect();
     observedBody = body;
     bodyObserver = new MutationObserver(() => {
-      const el = chatScrollRef.value;
-      if (!el) return;
-      const nearBottom = el.scrollHeight - el.scrollTop - el.clientHeight < 200;
-      if (nearBottom) scrollToBottom();
+      // 内容变化（思考流/工具时间线/Diff 展开/工时计时等）：跟随模式下自动吸底
+      scrollToBottom();
+      refreshRail();
     });
     bodyObserver.observe(body, { childList: true, subtree: true, characterData: true, attributes: true });
   });
@@ -321,16 +342,21 @@ function ensureBodyObserver() {
 watch(() => store.messages.length, () => {
   scrollToBottom();
   ensureBodyObserver();
+  refreshRail();
 });
 watch(() => store.currentStreamingText, () => {
   scrollToBottom();
 });
 // 从设置页返回对话：v-if 切换会重建对话区 DOM，滚动位置被重置到顶部，
-// 这里在 DOM 重建完成后滚回底部，保持"始终停留在最新消息"的体验
+// 这里在 DOM 重建完成后强制滚回底部并重算轨道位置，恢复"停留在最新消息"体验
 watch(() => store.settingsOpen, (open) => {
   if (!open) {
-    scrollToBottom();
+    scrollToBottom(true);
     ensureBodyObserver();
+    nextTick(() => {
+      syncStick();
+      refreshRail();
+    });
   }
 });
 
@@ -390,6 +416,9 @@ watch(() => store.running, (running) => {
 // 切会话 / 清空会话后，上一轮的工时残留无意义，一并重置
 watch(() => store.currentSessionName, () => {
   finalWorkTime.value = null;
+  // 切会话回到底部并恢复跟随，红点轨道按新会话消息重算
+  scrollToBottom(true);
+  nextTick(refreshRail);
   // 关键：A/B 都在运行时切换会话，store.running 值不变（true→true），
   // watch(store.running) 不会触发，计时器会继续用旧会话的时间戳串号。
   // 这里按目标会话的回合开始时间戳刷新计时。
@@ -413,9 +442,9 @@ watch(() => store.messages.length, (len) => {
 });
 
 onUnmounted(() => window.clearInterval(workTimer));
-// 权限卡片出现/收起时同步滚动，保证用户能立即看到询问
+// 权限卡片出现/收起时同步滚动，保证用户能立即看到询问（强制回底）
 watch(() => store.permRequest.show, () => {
-  scrollToBottom();
+  scrollToBottom(true);
 });
 // M25 修复：pywebviewready 事件与 100ms 兜底轮询是双通道，原先无互斥，
 // initFromBackend 可能执行两次互相覆盖；且事件监听器注册后从不移除。
@@ -482,8 +511,6 @@ onUnmounted(() => {
   bodyObserver?.disconnect();
   bodyObserver = undefined;
   observedBody = null;
-  if (scrollRaf !== undefined) window.cancelAnimationFrame(scrollRaf);
-  scrollRaf = undefined;
 });
 </script>
 
@@ -822,10 +849,45 @@ onUnmounted(() => {
   flex: 1;
 }
 
+.chat-viewport {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  position: relative;
+}
 #chat-scroll {
   flex: 1;
   overflow-y: auto;
   padding: 20px 28px 10px;
+}
+/* 对话内容容器：消息列表的公共父级 */
+#chat-body {
+  position: relative;
+}
+/* 回到底部悬浮按钮：用户上滑浏览历史时出现（相对 .chat-viewport 定位） */
+.jump-bottom {
+  position: absolute;
+  right: 24px;
+  bottom: 18px;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--border);
+  border-radius: 50%;
+  background: var(--float-bg);
+  color: var(--text-dim);
+  cursor: pointer;
+  box-shadow: 0 6px 18px var(--theme-shadow-color);
+  z-index: 30;
+  transition: color 0.15s, border-color 0.15s, transform 0.15s;
+}
+.jump-bottom:hover {
+  color: var(--text);
+  border-color: var(--text-faint);
+  transform: translateY(-1px);
 }
 
 .chip-btn {

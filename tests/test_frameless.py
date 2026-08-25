@@ -325,6 +325,8 @@ def _make_fake_user32(cursor, monitor_rect, monitor=1):
         # 第二屏的真实边缘仍应正确触发
         ((3839, 500), (1920, 0, 3840, 1080), 0x27),
         ((-1919, 500), (-1920, 0, 0, 1080), 0x25),
+        # 第二屏在上方（负 y）顶边：贴顶必须触发最大化，而非被主屏原点误判吞掉
+        ((500, -1079), (0, -1080, 1920, 0), 0x26),
     ],
 )
 def test_cursor_snap_vk_uses_monitor_bounds(monkeypatch, cursor, monitor_rect, expected):
@@ -560,3 +562,65 @@ def test_frameless_startup_uses_complete_frame_application(monkeypatch):
 
     assert bridge._hwnd == 456
     assert calls == ["icon", "resize", "frame"]
+
+
+def test_getminmaxinfo_clamps_maximize_to_monitor_work_area(monkeypatch):
+    """WM_GETMINMAXINFO 必须把最大尺寸/位置钳制到所在显示器工作区（排除任务栏）。
+
+    这是 frameless 窗口最大化不遮挡任务栏的核心：系统原生最大化
+    （SC_MAXIMIZE/Aero Snap/双击标题栏）读取 ptMaxSize/ptMaxPosition 决定
+    最大化窗口的位置与尺寸，默认按 rcMonitor 全屏（连任务栏一起盖）。
+    多显示器下必须按窗口所在显示器（MonitorFromWindow）计算。
+    """
+    installed: dict[int, int] = {}
+
+    def set_window_long_ptr(hwnd, _index, proc_addr):
+        installed[hwnd] = proc_addr
+        return 99
+
+    def get_monitor_info(_mon, mi_ptr):
+        mi = ctypes.cast(mi_ptr, ctypes.POINTER(frameless._MONITORINFO)).contents
+        # 第二屏（主屏上方，负 y）：显示器 rcMonitor=(0,-1080,1920,0)，
+        # 工作区底部留 40px 任务栏 → rcWork=(0,-1080,1920,-40)
+        mi.rcMonitor.left, mi.rcMonitor.top = 0, -1080
+        mi.rcMonitor.right, mi.rcMonitor.bottom = 1920, 0
+        mi.rcWork.left, mi.rcWork.top = 0, -1080
+        mi.rcWork.right, mi.rcWork.bottom = 1920, -40
+        return True
+
+    user32 = SimpleNamespace(
+        GetWindowLongW=Mock(return_value=0),
+        SetWindowLongW=Mock(return_value=0),
+        SetWindowLongPtrW=Mock(side_effect=set_window_long_ptr),
+        CallWindowProcW=Mock(return_value=frameless.HTCLIENT),
+        GetWindowRect=Mock(return_value=True),
+        MonitorFromWindow=Mock(return_value=2),
+        GetMonitorInfoW=Mock(side_effect=get_monitor_info),
+    )
+    form = SimpleNamespace(
+        Handle=SimpleNamespace(ToInt32=lambda: 123),
+        Invoke=lambda callback: callback(),
+    )
+    monkeypatch.setattr(frameless, "_u32", user32)
+    monkeypatch.setattr(frameless, "_SUBCLASSED", {})
+    monkeypatch.setattr(frameless, "_periodic_started", True)
+    monkeypatch.setattr(frameless, "find_webview_child_hwnds", lambda _hwnd: [456])
+    monkeypatch.setitem(
+        sys.modules,
+        "System.Windows",
+        SimpleNamespace(Forms=SimpleNamespace(MethodInvoker=lambda callback: callback)),
+    )
+
+    assert frameless.enable_native_window_behaviors(form) is True
+    parent_proc = frameless._WNDPROC(installed[123])
+
+    mmi = frameless._MINMAXINFO()
+    mmi_ptr = ctypes.addressof(mmi)
+    result = parent_proc(123, frameless.WM_GETMINMAXINFO, 0, mmi_ptr)
+    assert result == 0
+
+    # ptMaxPosition 是工作区相对 rcMonitor 左上角的偏移（多屏下可为负）
+    assert (mmi.ptMaxPosition.x, mmi.ptMaxPosition.y) == (0, 0)
+    # ptMaxSize 是工作区宽高（1920x1040，底部 40px 任务栏被排除）
+    assert (mmi.ptMaxSize.x, mmi.ptMaxSize.y) == (1920, 1040)
+    user32.MonitorFromWindow.assert_called_once_with(123, 2)

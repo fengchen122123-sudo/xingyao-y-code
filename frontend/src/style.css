@@ -204,6 +204,15 @@ html {
 [data-theme-region="workspace"] .cfp[class] {
   background: var(--theme-region-surface-panel) !important;
 }
+/* 对话内提示卡 / 错误卡（权限调整、切模型、运行错误等）同样随分区背景
+   透明度透图：保留语义色混合（accent/red 7%）与左边框提示，仅把其中的实色
+   基底换成随分区透明度混合的 surface，全局背景图模式下不再以实色块遮挡 */
+[data-theme-region="workspace"] .notice-card[class] {
+  background: color-mix(in srgb, var(--accent) 7%, var(--theme-region-surface-panel)) !important;
+}
+[data-theme-region="workspace"] .error-card[class] {
+  background: color-mix(in srgb, var(--red) 8%, var(--theme-region-surface-panel)) !important;
+}
 
 [data-theme-region]::before,
 [data-theme-region]::after {
@@ -635,6 +644,12 @@ button {
   font-size: 12.5px;
   color: var(--text);
 }
+
+/* 行内代码随分区背景透明度透图：实色基底换成半透明混合，
+   文字保持实色保证可读性，全局背景图模式下不再以实色块遮挡 */
+[data-theme-region="workspace"] .md-body code {
+  background: color-mix(in srgb, var(--bg3) 70%, transparent) !important;
+}
 .md-body pre {
   background: var(--code-bg);
   border: 1px solid var(--border);
@@ -680,6 +695,15 @@ button {
 }
 .md-body tbody tr:nth-child(even) {
   background: var(--bg2);
+}
+
+/* 表格随分区背景透明度透图：表头/斑马纹用 surface 半透明混合（不透明度
+   跟随主题设置），文字保持实色保证可读性，全局背景图模式下不再以实色块遮挡 */
+[data-theme-region="workspace"] .md-body th {
+  background: color-mix(in srgb, var(--bg3) 65%, transparent) !important;
+}
+[data-theme-region="workspace"] .md-body tbody tr:nth-child(even) {
+  background: color-mix(in srgb, var(--bg2) 55%, transparent) !important;
 }
 
 .cursor-blink {

@@ -33,7 +33,7 @@
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
       <div class="assistant-body">
         <div class="assistant-name">
-          <b>星瑶</b> · <span style="font-size:11px;color:var(--text-faint)">{{ store.activeModelName || '模型' }}</span>
+          <b>星瑶</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
 

@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 
 WM_NCHITTEST = 0x0084
 WM_NCCALCSIZE = 0x0083
+WM_GETMINMAXINFO = 0x0024
 HTCLIENT = 1
 HTTRANSPARENT = -1
 HTLEFT, HTRIGHT, HTTOP = 10, 11, 12
@@ -69,6 +70,25 @@ class _DWM_MARGINS(ctypes.Structure):
         ("cyBottomHeight", ctypes.c_int),
     ]
 
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+class _MINMAXINFO(ctypes.Structure):
+    _fields_ = [
+        ("ptReserved", wintypes.POINT),
+        ("ptMaxSize", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("ptMinTrackSize", wintypes.POINT),
+        ("ptMaxTrackSize", wintypes.POINT),
+    ]
+
 # 原生 WM_NCHITTEST 边缘命中宽度（物理像素）；页面层另有透明 CSS 热区，
 # 深层 WebView2 窗口接管命中时也能进入相同的系统 resize 循环。
 RESIZE_BORDER = 3
@@ -88,6 +108,14 @@ _u32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
 _u32.SetWindowLongW.restype = wintypes.LONG
 _u32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 _u32.GetWindowLongW.restype = wintypes.LONG
+_u32.MonitorFromPoint.argtypes = [wintypes.POINT, wintypes.DWORD]
+_u32.MonitorFromPoint.restype = wintypes.HANDLE
+_u32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+_u32.MonitorFromWindow.restype = wintypes.HANDLE
+_u32.GetMonitorInfoW.argtypes = [wintypes.HANDLE, ctypes.POINTER(_MONITORINFO)]
+_u32.GetMonitorInfoW.restype = wintypes.BOOL
+_u32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_u32.GetWindowRect.restype = wintypes.BOOL
 
 
 # 已子类化窗口的回调引用（防 GC 回收导致窗口过程悬空）
@@ -232,6 +260,24 @@ def enable_native_window_behaviors(form, border: int = RESIZE_BORDER) -> bool:
         # （non-client 顶部条）。wParam=1 时返回 0 清空非客户区，黑线消失。
         if msg == WM_NCCALCSIZE and wparam:
             return 0
+        # WM_GETMINMAXINFO：系统最大化（SC_MAXIMIZE/Aero Snap/Win+Up/双击标题栏）
+        # 默认按 rcMonitor 全屏放置 frameless 窗口，会覆盖任务栏。这里把最大
+        # 位置/尺寸钳制到窗口所在显示器的工作区（rcWork，排除任务栏），最大化
+        # 仍走系统原生路径：动画、WebView2 布局、DPI、多屏全部系统接管。
+        if msg == WM_GETMINMAXINFO:
+            hmon = _u32.MonitorFromWindow(hwnd_arg, 2)  # MONITOR_DEFAULTTONEAREST
+            if hmon:
+                mi = _MONITORINFO()
+                mi.cbSize = ctypes.sizeof(_MONITORINFO)
+                if _u32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+                    mmi = ctypes.cast(
+                        lparam, ctypes.POINTER(_MINMAXINFO),
+                    ).contents
+                    mmi.ptMaxPosition.x = mi.rcWork.left - mi.rcMonitor.left
+                    mmi.ptMaxPosition.y = mi.rcWork.top - mi.rcMonitor.top
+                    mmi.ptMaxSize.x = mi.rcWork.right - mi.rcWork.left
+                    mmi.ptMaxSize.y = mi.rcWork.bottom - mi.rcWork.top
+                    return 0  # 已定制，不再走默认
         # 顶层窗口：穿透上来的命中只在边缘返回边框码（顶部边缘也能 resize）。
         # 标题栏区域保持 HTCLIENT 交给 WebView（见模块 docstring 第 3 点）。
         if msg == WM_NCHITTEST:
