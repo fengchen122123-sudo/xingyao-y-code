@@ -144,6 +144,9 @@ export interface ChatMessage {
   // 而不是插队成独立 error 消息（插队会破坏"最后一条是 assistant"的事件契约，
   // 导致后续 tool_finish 抛错、running 状态卡死）
   error_note?: string;
+  // 本条助手消息生成时所用的模型快照（后端历史回放透传；旧消息可能缺省）
+  model_id?: string;
+  model_name?: string;
 }
 
 const TOOL_CATEGORIES = new Set(['read', 'search', 'command', 'mutation', 'skill', 'other']);
@@ -385,7 +388,7 @@ export const useAppStore = defineStore('app', {
     closeConfirm: { show: false, trayAvailable: false } as { show: boolean; trayAvailable: boolean },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'about',
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'about' | 'contact',
     // 主题预览模式：设置页"预览效果"收起设置、直接看真实首页（草稿已实时渲染），
     // 顶部浮条提供返回编辑；保存/取消/切主题时退出该模式
     themePreviewMode: false,
@@ -443,6 +446,9 @@ export const useAppStore = defineStore('app', {
     // 当前流式生成临时对象
     currentStreamingText: '',
     currentThinkingText: '',
+
+    // frameless 窗口最大化状态（后端 window_maximize_state 事件推送）
+    windowMaximized: false,
 
     // 内嵌终端（右侧面板）
     terminalOutput: '',
@@ -1206,7 +1212,7 @@ export const useAppStore = defineStore('app', {
       // 凭版本号变化跳过覆盖，保住用户刚做的选择
       this._sessionModelVersion[targetSession] = (this._sessionModelVersion[targetSession] || 0) + 1;
       try {
-        const res = await api.set_model(modelId);
+        const res = await api.set_model(modelId, targetSession);
         if (res && res.ok) {
           const runtime = this._getSessionRuntime(targetSession);
           runtime.modelId = res.active_model_id || modelId;
@@ -1853,7 +1859,7 @@ export const useAppStore = defineStore('app', {
           sessionName,
           attachList,
           pendingDir,
-          pendingDir ? (this.draftModelId || undefined) : undefined,
+          pendingDir ? (this.draftModelId || undefined) : (this.activeModelId || undefined),
         );
         if (res && res.ok) {
           // 草稿模型已随后端落库（或本就不存在），不再保留待重发状态
@@ -1970,6 +1976,11 @@ export const useAppStore = defineStore('app', {
       // 不参与会话 runtime 归属逻辑，处理完直接返回
       if (type === 'close_requested') {
         void this._handleCloseRequested(!!data.has_running_work, !!data.tray_available);
+        return;
+      }
+      // frameless 最大化状态变更（原生双击/Snap/拖拽还原路径）：同步到 store
+      if (type === 'window_maximize_state') {
+        this.windowMaximized = !!data.maximized;
         return;
       }
       // H2 修复：终态事件缺失 session_name 时，不能落到当前显示会话

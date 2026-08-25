@@ -10,6 +10,7 @@
       <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
+      <button data-test="contact-nav" class="nav-item" :class="{ active: activeSection === 'contact' }" @click="activeSection = 'contact'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>联系我们</button>
       <div class="nav-spacer"></div>
       <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><AppIcon name="settings" :size="13" /></div>
     </aside>
@@ -301,6 +302,58 @@
           </div>
         </section>
       </template>
+      <template v-else-if="activeSection === 'contact'">
+        <header class="settings-header">
+          <div>
+            <h1>联系我们</h1>
+            <p>有任何问题或建议，欢迎通过以下方式与我们取得联系。</p>
+          </div>
+        </header>
+
+        <div class="contact-cards">
+          <section class="contact-card">
+            <div class="contact-card-icon">
+              <AppIcon name="mail" :size="22" />
+            </div>
+            <h3>邮箱</h3>
+            <p class="contact-desc">发送邮件与我们沟通</p>
+            <div class="contact-value mono" data-test="contact-email">{{ contactEmail }}</div>
+            <button
+              data-test="copy-email"
+              class="primary-button contact-copy-btn"
+              :class="{ copied: emailCopied }"
+              @click="copyEmail"
+            >
+              <AppIcon :name="emailCopied ? 'check' : 'pencil'" :size="13" />
+              {{ emailCopied ? '已复制' : '复制邮箱' }}
+            </button>
+          </section>
+
+          <section class="contact-card">
+            <div class="contact-card-icon">
+              <AppIcon name="qr" :size="22" />
+            </div>
+            <h3>微信群</h3>
+            <p class="contact-desc">扫码加入官方微信群</p>
+            <div class="contact-qr-wrap" @click="enlargedQr = { src: qrcodeWechat, alt: '微信群二维码' }">
+              <img :src="qrcodeWechat" alt="微信群二维码" class="contact-qr" data-test="contact-wechat-qr" />
+            </div>
+            <p class="contact-expiry">该二维码 7 天内（9月1日前）有效</p>
+          </section>
+
+          <section class="contact-card">
+            <div class="contact-card-icon">
+              <AppIcon name="qr" :size="22" />
+            </div>
+            <h3>飞书群</h3>
+            <p class="contact-desc">扫码加入官方飞书群</p>
+            <div class="contact-qr-wrap" @click="enlargedQr = { src: qrcodeFeishu, alt: '飞书群二维码' }">
+              <img :src="qrcodeFeishu" alt="飞书群二维码" class="contact-qr" data-test="contact-feishu-qr" />
+            </div>
+            <p class="contact-expiry">该二维码 1 年内有效</p>
+          </section>
+        </div>
+      </template>
       <template v-else-if="activeSection === 'about'">
         <header class="settings-header">
           <div>
@@ -368,6 +421,11 @@
       </div>
     </main>
 
+    <!-- 二维码放大查看 -->
+    <div v-if="enlargedQr" class="qr-enlarge-mask" @click="enlargedQr = null">
+      <img :src="enlargedQr.src" :alt="enlargedQr.alt" class="qr-enlarge-img" />
+    </div>
+
     <div v-if="modelModal.show" class="modal-mask">
       <form data-test="model-modal" class="model-modal" @submit.prevent="saveModel">
         <div class="modal-head"><h3>{{ modelModal.model_id ? '编辑模型' : '添加模型' }}</h3><button type="button" @click="closeModelModal">×</button></div>
@@ -419,11 +477,13 @@ import type { ChangelogEntry, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
 import SystemSettings from './SystemSettings.vue';
+import qrcodeWechat from '../assets/qrcode-wechat.png';
+import qrcodeFeishu from '../assets/qrcode-feishu.png';
 
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'about'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'about' | 'contact'>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 const selectedKind = ref<'preset' | 'provider' | 'custom' | 'secondary'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');
@@ -720,6 +780,25 @@ const currentEntry = computed<ChangelogEntry | null>(() => {
   );
 });
 
+// ------------------------------------------------------------------
+// 联系我们页
+// ------------------------------------------------------------------
+const contactEmail = 'fchyjy@qq.com';
+const emailCopied = ref(false);
+const enlargedQr = ref<{ src: string; alt: string } | null>(null);
+let emailCopyTimer: ReturnType<typeof setTimeout> | null = null;
+
+async function copyEmail() {
+  try {
+    await navigator.clipboard.writeText(contactEmail);
+  } catch {
+    // 剪贴板 API 不可用时静默失败
+  }
+  emailCopied.value = true;
+  if (emailCopyTimer) clearTimeout(emailCopyTimer);
+  emailCopyTimer = setTimeout(() => { emailCopied.value = false; }, 2000);
+}
+
 onMounted(async () => {
   // 直接读 window.pywebview 而非 store._api()：后者为空时会弹
   // "连接失败" 模态框，更新内容拉取失败不该打扰用户
@@ -843,6 +922,23 @@ onMounted(async () => {
 .modal-head { display: flex; align-items: center; justify-content: space-between; }
 .modal-head h3 { margin: 0; }
 .modal-head button { border: 0; background: transparent; color: var(--text-dim); font-size: 20px; }
+
+/* ---------- 联系我们页 ---------- */
+.contact-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px; }
+.contact-card { display: flex; flex-direction: column; align-items: center; text-align: center; padding: 24px 18px; background: var(--bg1); border: 1px solid var(--border); border-radius: 10px; transition: border-color 0.2s; }
+.contact-card:hover { border-color: var(--text-faint); }
+.contact-card-icon { width: 44px; height: 44px; border-radius: 10px; background: var(--bg2); display: flex; align-items: center; justify-content: center; color: var(--text-dim); margin-bottom: 14px; }
+.contact-card h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+.contact-desc { margin: 0 0 14px; font-size: 12px; color: var(--text-dim); }
+.contact-value { font-size: 14px; padding: 8px 14px; background: var(--bg2); border-radius: 6px; margin-bottom: 14px; word-break: break-all; }
+.contact-copy-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; font-size: 12px; }
+.contact-copy-btn.copied { opacity: 0.85; }
+.contact-qr-wrap { width: 160px; height: 160px; border-radius: 8px; overflow: hidden; background: #fff; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; padding: 6px; cursor: zoom-in; transition: transform 0.15s; }
+.contact-qr-wrap:hover { transform: scale(1.03); }
+.contact-qr { width: 100%; height: 100%; object-fit: contain; }
+.qr-enlarge-mask { position: fixed; inset: 0; z-index: 999; background: rgba(0, 0, 0, 0.7); display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
+.qr-enlarge-img { max-width: 80vw; max-height: 80vh; border-radius: 12px; box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5); }
+.contact-expiry { margin: 0; font-size: 11px; color: var(--text-faint); }
 
 /* ---------- 关于页 · 更新内容 ---------- */
 .changelog-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 10px; }

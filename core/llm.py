@@ -3618,6 +3618,27 @@ def _chat_with_model_generator(
     current_tool_calls = []
     pending_tool_records = {}
 
+    def _model_display_snapshot():
+        """为落库的 assistant 消息附加"生成所用模型"的显示元数据。
+        从 config 的 providers[].models[] 反查 model_name（litellm_model）对应的
+        显示名 name；查不到或读取异常时静默回退为 model_name 本身，绝不抛错
+        （此处位于持久化热路径，任何异常都不能影响消息落库）。"""
+        try:
+            from core.model_manager import load_config
+            for provider in load_config().get("providers", []):
+                for model in provider.get("models", []):
+                    if (
+                        model.get("litellm_model") == model_name
+                        or model.get("id") == model_name
+                    ):
+                        return {"_display": {
+                            "model_id": model_name,
+                            "model_name": model.get("name") or model_name,
+                        }}
+        except Exception:
+            pass
+        return {"_display": {"model_id": model_name, "model_name": model_name}}
+
     def flush_persistence():
         """把本轮已确认的助手/工具消息按序落库（与正常结束路径一致）。"""
         nonlocal pending_persistence, persistence_failure, pending_tool_records
@@ -4254,6 +4275,8 @@ def _chat_with_model_generator(
                 persisted_message["thinking_blocks"] = provider_thinking_blocks
             if tool_calls_list:
                 persisted_message["tool_calls"] = tool_calls_list
+            # 落库副本补充生成所用模型的显示元数据（仅持久化，不发给 LLM）
+            persisted_message.update(_model_display_snapshot())
 
             # 用"促升前"的原始正文判断：思考内容被促升为正文后不能算作有效结论，
             # 否则模型纯思考收尾时会跳过最终总结重试，用户什么都看不到。
@@ -4538,7 +4561,11 @@ def _chat_with_model_generator(
         limit_message = {"role": "assistant", "content": msg}
         messages.append(limit_message)
         if stream:
-            pending_persistence.append(("assistant", deepcopy(limit_message)))
+            # 深拷贝落库副本：上限提示同样绑定生成时所用模型，且不污染内存中的
+            # limit_message（后者会进入发给 LLM 的 messages）
+            persisted_limit_message = deepcopy(limit_message)
+            persisted_limit_message.update(_model_display_snapshot())
+            pending_persistence.append(("assistant", persisted_limit_message))
         flush_persistence()
         if current_step is not None:
             current_step.complete()
