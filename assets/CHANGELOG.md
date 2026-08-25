@@ -20,7 +20,7 @@
 
 ### 修复
 
-- 修复无边框窗口最大化覆盖任务栏：原生 `SC_MAXIMIZE` 与 Aero Snap 拖拽贴边都会把客户区扩展到全屏遮挡任务栏。现统一改为 `SetWindowPos` 伪最大化——最大化时保存当前窗口位置、将窗口设置到当前显示器工作区（`MonitorFromPoint` + `GetMonitorInfoW`，支持多显示器），还原时恢复保存位置；`window_toggle_maximize`（按钮点击）与 `WM_SYSCOMMAND` 拦截（Aero Snap/Win+Up）两条路径共享同一套伪最大化状态，任务栏始终可见
+- 修复无边框窗口最大化遮挡任务栏/第二屏无法最大化/拖动失效：此前伪最大化方案（拦截 `SC_MAXIMIZE` 改 `SetWindowPos` 全屏）架构不成立——主屏 `rcWork` 不可靠且 WebView2 仍按全屏渲染导致遮任务栏，第二屏负坐标下 WinForms 坐标系错乱导致无法拖动与显示异常。现改为 Windows 官方支持的 `WM_GETMINMAXINFO` 处理：把最大尺寸/位置钳制到窗口所在显示器的工作区（`MonitorFromWindow` + `rcWork`，排除任务栏），最大化仍走系统原生路径，动画、任务栏交互、多显示器、DPI 全部系统接管；`window_toggle_maximize` 回归原生 `SC_MAXIMIZE`/`SC_RESTORE`，最大化状态以 `IsZoomed` 为权威来源
 - 修复无边框标题栏双击最大化→还原后快速拖动失效并闪现禁用光标的问题：根因是标题栏拖拽区 HTCAPTION 命中拦截与前端 DOM 驱动的双轨冲突——实测全部交互（双击、拖动）均走 DOM 事件，原生 caption 路径从未承接，但拦截间歇生效会在手势中途把 mousemove/mouseup 重新路由为非客户区消息，DOM 事件流半途丢失、位移阈值路径失效，拖动退化为 400ms 定时器兜底；快速拖动在松手瞬间才进入 SC_MOVE（数毫秒即被终结）从而闪现禁用光标。现移除拖拽区 HTCAPTION/HTTRANSPARENT 命中拦截（边缘 resize 拦截保留），标题栏交互完全由前端 DOM 事件驱动（mousedown + 位移阈值即时进入原生移动循环，双击走 SC_MAXIMIZE/SC_RESTORE）；同时保留 GUI 线程内 GetAsyncKeyState(VK_LBUTTON) 权威状态守卫，左键已松开的过期拖动请求一律拒绝（返回 left_button_released），绝不进入无有效按键手势的 SC_MOVE
 - 修复多显示器下窗口拖拽贴边/最大化误判：Aero Snap 贴边判定此前拿主屏宽度与原点直接比较光标坐标，第二屏（负坐标或超出主屏范围）中间松手会被误判为贴主屏边缘。现改用 `MonitorFromPoint` + `GetMonitorInfoW` 定位光标实际所在显示器、相对其边界判定；第二屏中间不再误触发，真实贴边（含第二屏边缘）仍正确生效
 - 修复空会话切换推理强度/权限模式/沙盒开关导致欢迎页消失（表现为页面跳转）：空会话下不再插入通知消息，仅会话已有真实对话时才提示；调整失败时仍保留失败提示
