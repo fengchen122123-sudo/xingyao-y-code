@@ -238,6 +238,7 @@ def test_reasoning_off_and_default_remove_conflicting_overrides(tmp_path, monkey
     model = data["providers"][0]["models"][0]
     model["name"] = "deepseek-v4-flash"
     model["litellm_model"] = "openai/deepseek-v4-flash"
+    model["thinking_budget"] = 4096
     cfg = _use_tmp_config(tmp_path, monkeypatch, data)
 
     assert model_manager.set_model_reasoning_choice("m1", "max")[0]
@@ -246,12 +247,14 @@ def test_reasoning_off_and_default_remove_conflicting_overrides(tmp_path, monkey
     assert on_disk["reasoning_choice"] == "off"
     assert on_disk["enable_thinking"] is False
     assert "reasoning_effort" not in on_disk
+    assert "thinking_budget" not in on_disk
 
     assert model_manager.set_model_reasoning_choice("m1", "default")[0]
     on_disk = json.loads(cfg.read_text(encoding="utf-8"))["providers"][0]["models"][0]
     assert "reasoning_choice" not in on_disk
     assert "enable_thinking" not in on_disk
     assert "reasoning_effort" not in on_disk
+    assert "thinking_budget" not in on_disk
     assert model_manager.get_model_reasoning_choice("m1") == "default"
 
 

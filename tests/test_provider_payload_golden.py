@@ -1,5 +1,6 @@
 from copy import deepcopy
 from types import SimpleNamespace
+import pytest
 
 from tests.request_payload_snapshot import ALPHA_TOOL, ZETA_TOOL, snapshot_provider_kwargs
 
@@ -22,7 +23,10 @@ def _chunk():
     )
 
 
-def _capture(monkeypatch, *, model, api_base, protocol, model_cfg, messages, **kwargs):
+def _capture(
+    monkeypatch, *, model, api_base, protocol, model_cfg, messages,
+    route_model_cfg=None, **kwargs
+):
     import core.llm as llm
 
     captured = []
@@ -34,7 +38,12 @@ def _capture(monkeypatch, *, model, api_base, protocol, model_cfg, messages, **k
     )
     monkeypatch.setattr(
         "core.model_manager.get_model_config_by_litellm_model",
+        lambda *_args, **_kwargs: model_cfg if route_model_cfg is None else route_model_cfg,
+    )
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_id",
         lambda *_args, **_kwargs: model_cfg,
+        raising=False,
     )
     monkeypatch.setattr(
         "core.memory_kairos.build_memory_system_section",
@@ -220,3 +229,122 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
         "num_retries": 2,
     }
     assert_exact_provider_kwargs(captured, expected)
+
+
+@pytest.mark.parametrize(
+    ("model", "model_cfg", "provider_tail", "tools"),
+    [
+        (
+            "openai/deepseek-v4-flash",
+            {"reasoning_choice": "high", "enable_thinking": True, "reasoning_effort": "high"},
+            {
+                "extra_body": {"thinking": {"type": "enabled"}},
+                "reasoning_effort": "high",
+                "allowed_openai_params": ["reasoning_effort"],
+                "max_tokens": 8192,
+            },
+            [ZETA_TOOL, ALPHA_TOOL],
+        ),
+        (
+            "openai/qwen3.7-max",
+            {"reasoning_choice": "off", "enable_thinking": False},
+            {
+                "extra_body": {"enable_thinking": False},
+                "tool_choice": "auto",
+                "max_tokens": 8192,
+            },
+            [ZETA_TOOL, ALPHA_TOOL],
+        ),
+        (
+            "openai/qwen3.8-max",
+            {
+                "reasoning_choice": "medium",
+                "enable_thinking": True,
+                "reasoning_effort": "medium",
+            },
+            {
+                "extra_body": {
+                    "enable_thinking": True,
+                    "reasoning_effort": "medium",
+                },
+                "tool_choice": "auto",
+                "max_tokens": 8192,
+            },
+            [ZETA_TOOL, ALPHA_TOOL],
+        ),
+        (
+            "openai/LongCat-2.0",
+            {"reasoning_choice": "on", "enable_thinking": True},
+            {
+                "extra_body": {"thinking": {"type": "enabled"}},
+                "tool_choice": "auto",
+                "max_tokens": 8192,
+            },
+            [ZETA_TOOL, ALPHA_TOOL],
+        ),
+        (
+            "openai/kimi-k3",
+            {"reasoning_choice": "high", "enable_thinking": True, "reasoning_effort": "high"},
+            {
+                "max_tokens": 32000,
+                "extra_body": {"reasoning_effort": "high"},
+                "tool_choice": "auto",
+            },
+            [ZETA_TOOL, ALPHA_TOOL],
+        ),
+    ],
+)
+def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
+    monkeypatch, model, model_cfg, provider_tail, tools
+):
+    """新思考策略的最终 provider 字节必须精确，不允许混入第二套开关。"""
+    import core.llm as llm
+
+    messages = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "inspect"},
+    ]
+    expected_messages = deepcopy(messages)
+    captured = _capture(
+        monkeypatch,
+        model=model,
+        api_base="https://gateway.example/v1",
+        protocol="openai",
+        model_cfg=model_cfg,
+        messages=messages,
+    )
+    expected = {
+        "model": model,
+        "api_key": "<redacted>",
+        "messages": expected_messages,
+        "tools": tools,
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "num_retries": 2,
+        **provider_tail,
+        "api_base": "https://gateway.example/v1",
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
+
+    assert_exact_provider_kwargs(captured, expected)
+
+
+def test_exact_model_id_reaches_final_provider_payload(monkeypatch):
+    """重复 route 时，真实事件入口必须使用当前模型 ID 对应的选择。"""
+    captured = _capture(
+        monkeypatch,
+        model="openai/deepseek-v4-flash",
+        api_base="https://gateway.example/v1",
+        protocol="openai",
+        model_cfg={"reasoning_choice": "off", "enable_thinking": False},
+        route_model_cfg={
+            "reasoning_choice": "high",
+            "enable_thinking": True,
+            "reasoning_effort": "high",
+        },
+        messages=[{"role": "user", "content": "inspect"}],
+        model_id="model-second",
+    )
+
+    assert captured[0]["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert "reasoning_effort" not in captured[0]

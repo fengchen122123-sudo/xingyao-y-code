@@ -2240,6 +2240,7 @@ def _snapshot_model_config(
                 secondary["litellm_model"],
                 secondary["api_key"],
                 secondary["base_url"],
+                secondary.get("id"),
             )
     except Exception:
         pass
@@ -2258,6 +2259,7 @@ def _active_model_tuple_or_none(session_name: str | None = None):
                     active.get("litellm_model"),
                     active.get("api_key"),
                     active.get("base_url"),
+                    active.get("id"),
                 )
         except Exception:
             return None
@@ -2267,7 +2269,18 @@ def _active_model_tuple_or_none(session_name: str | None = None):
         import core.app_context as app_context
         current = app_context.get_active_model_tuple()
         if current and current[0]:
-            return tuple(current)
+            try:
+                from core.model_manager import get_active_model
+                active = get_active_model() or {}
+                same_model = str(active.get("litellm_model") or "") == str(current[0] or "")
+                same_base = (
+                    str(active.get("base_url") or "").rstrip("/").lower()
+                    == str(current[2] or "").rstrip("/").lower()
+                )
+                model_id = active.get("id") if same_model and same_base else None
+            except Exception:
+                model_id = None
+            return (*tuple(current), model_id)
     except Exception:
         pass
     try:
@@ -2278,10 +2291,23 @@ def _active_model_tuple_or_none(session_name: str | None = None):
                 active.get("litellm_model"),
                 active.get("api_key"),
                 active.get("base_url"),
+                active.get("id"),
             )
     except Exception:
         pass
     return None
+
+
+def _unpack_model_config(model_config: tuple | None):
+    """兼容旧三元组，并把新模型 ID 作为第四项贯穿到请求层。"""
+    values = tuple(model_config or ())
+    if not values:
+        return (None, None, None, None)
+    if len(values) == 3:
+        return (*values, None)
+    if len(values) == 4:
+        return values
+    raise ValueError("model_config 必须是 (model, key, base_url[, model_id])")
 
 
 def _permission_owner_waiting(owner_id: str) -> bool:
@@ -3045,8 +3071,8 @@ class SubagentManager:
         # - 其他 → task.model_config（启动时快照）或 main 全局
         def _fallback_model():
             if task.model_config is not None:
-                return task.model_config
-            return _active_model_tuple_or_none() or (None, None, None)
+                return _unpack_model_config(task.model_config)
+            return _unpack_model_config(_active_model_tuple_or_none())
 
         model_pref = custom.get("model") if custom else None
         if model_pref == "secondary":
@@ -3057,18 +3083,19 @@ class SubagentManager:
                     current_model = secondary["litellm_model"]
                     current_key = secondary["api_key"]
                     current_url = secondary["base_url"]
+                    current_model_id = secondary.get("id")
                 else:
-                    current_model, current_key, current_url = _fallback_model()
+                    current_model, current_key, current_url, current_model_id = _fallback_model()
             except Exception:
-                current_model, current_key, current_url = _fallback_model()
+                current_model, current_key, current_url, current_model_id = _fallback_model()
         elif model_pref == "inherit":
             inherited = _active_model_tuple_or_none(task.parent_session)
             if inherited:
-                current_model, current_key, current_url = inherited
+                current_model, current_key, current_url, current_model_id = _unpack_model_config(inherited)
             else:
-                current_model, current_key, current_url = _fallback_model()
+                current_model, current_key, current_url, current_model_id = _fallback_model()
         else:
-            current_model, current_key, current_url = _fallback_model()
+            current_model, current_key, current_url, current_model_id = _fallback_model()
 
         role_instructions = {
             "explore": (
@@ -3193,6 +3220,7 @@ class SubagentManager:
             permission_source=f"子代理：{task.description[:40]}",
             cache_scope=f"subagent:{role}",
             cache_session_id=task.parent_session,
+            model_id=current_model_id,
         )
         answer = []
         tool_errors: dict[str, str] = {}
@@ -3289,6 +3317,7 @@ class SubagentManager:
                     parent_turn_id=None,
                     permission_owner=task.task_id,
                     permission_source=f"子代理总结：{task.description[:40]}",
+                    model_id=current_model_id,
                 )
                 cont_answer = []
                 with _subagent_depth_scope():
@@ -3564,7 +3593,9 @@ def dream_consolidation():
     在后台发起一次梦境归类整理，将日记账中的记忆提炼合并，并更新 MEMORY.md 索引。
     """
     from core.memory_kairos import run_dream_consolidation_sync
-    task_model, task_key, task_url = _active_model_tuple_or_none() or (None, None, None)
+    task_model, task_key, task_url, _task_model_id = _unpack_model_config(
+        _active_model_tuple_or_none()
+    )
 
     if not task_key:
         return "🚨 整理失败：大模型密钥尚未配置，无法提炼记忆。"

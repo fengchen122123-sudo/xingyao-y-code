@@ -322,6 +322,8 @@ export const useAppStore = defineStore('app', {
     // 各会话模型选择的版本号：setModel 递增；switchSession 在途期间若版本变化，
     // 说明用户又切了模型，后端响应携带的旧模型快照不再覆盖本地选择
     _sessionModelVersion: {} as Record<string, number>,
+    // 同一模型的思考选择请求版本：只有最后一次请求可以回写或回滚 UI。
+    _reasoningChoiceVersion: {} as Record<string, number>,
     currentWorkdirLabel: '对话',
     workdir: '',
     fileTree: [] as FileNode[],
@@ -1261,6 +1263,8 @@ export const useAppStore = defineStore('app', {
 
     async setReasoningChoice(choice: ReasoningChoice) {
       const targetModelId = this.activeModelId;
+      const requestVersion = (this._reasoningChoiceVersion[targetModelId] || 0) + 1;
+      this._reasoningChoiceVersion[targetModelId] = requestVersion;
       const previous: ReasoningSnapshot = {
         ...this.reasoning,
         options: this.reasoning.options.map(option => ({ ...option })),
@@ -1273,7 +1277,10 @@ export const useAppStore = defineStore('app', {
       }
       try {
         const res = await api.set_reasoning_choice(targetModelId, choice);
-        if (this.activeModelId !== targetModelId) return;
+        if (
+          this.activeModelId !== targetModelId
+          || this._reasoningChoiceVersion[targetModelId] !== requestVersion
+        ) return;
         if (res && res.ok) {
           this.reasoning = res.reasoning;
           // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
@@ -1285,7 +1292,11 @@ export const useAppStore = defineStore('app', {
           this.notifyChat('思考设置调整失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
       } catch (err) {
-        if (this.activeModelId === targetModelId) this.reasoning = previous;
+        if (
+          this.activeModelId !== targetModelId
+          || this._reasoningChoiceVersion[targetModelId] !== requestVersion
+        ) return;
+        this.reasoning = previous;
         this.connected = false;
         this.notifyChat('思考设置调整失败: ' + err);
       }

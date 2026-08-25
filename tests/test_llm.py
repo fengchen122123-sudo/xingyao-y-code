@@ -237,7 +237,7 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
         (
             "openai/kimi-k3",
             "high",
-            {"extra_body": {"reasoning_effort": "high"}},
+            {"max_tokens": 32000, "extra_body": {"reasoning_effort": "high"}},
         ),
         (
             "openai/deepseek-v4-flash",
@@ -265,7 +265,7 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
         (
             "openai/kimi-k2.6",
             "off",
-            {"extra_body": {"thinking": {"type": "disabled"}}},
+            {"max_tokens": 16384, "extra_body": {"thinking": {"type": "disabled"}}},
         ),
         (
             "openai/LongCat-2.0",
@@ -306,8 +306,101 @@ def test_model_reasoning_choice_uses_its_exact_request_contract(
 
     result = _provider_request_options(model_name, "https://gateway.example/v1")
 
-    for key, value in expected.items():
-        assert result[key] == value
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("model_name", "choice", "expected"),
+    [
+        (
+            "openai/kimi-k2.6",
+            "off",
+            {"max_tokens": 16384, "extra_body": {"thinking": {"type": "disabled"}}},
+        ),
+        (
+            "openai/qwen3.7-max",
+            "off",
+            {"extra_body": {"enable_thinking": False}},
+        ),
+        (
+            "openai/kimi-k3",
+            "high",
+            {"max_tokens": 8192, "extra_body": {"reasoning_effort": "high"}},
+        ),
+    ],
+)
+def test_new_reasoning_choice_owns_the_request_contract_over_legacy_fields(
+    monkeypatch, model_name, choice, expected
+):
+    """新选择存在时，旧 budget/enable 字段不能再生成第二套冲突参数。"""
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, {
+        "reasoning_choice": choice,
+        "enable_thinking": choice != "off",
+        "thinking_budget": 4096,
+        "max_tokens": 8192 if model_name.endswith("kimi-k3") else None,
+    })
+
+    result = _provider_request_options(model_name, "https://gateway.example/v1")
+
+    if result.get("max_tokens") is None:
+        result.pop("max_tokens", None)
+    assert result == expected
+
+
+@pytest.mark.parametrize(
+    ("model_name", "model_cfg", "expected"),
+    [
+        (
+            "openai/qwen3.7-max",
+            {"enable_thinking": True},
+            {"extra_body": {"enable_thinking": True}},
+        ),
+        (
+            "openai/kimi-k3",
+            {"enable_thinking": True, "reasoning_effort": "high"},
+            {"max_tokens": 32000, "extra_body": {"reasoning_effort": "high"}},
+        ),
+        (
+            "openai/qwen3.7-max",
+            {"thinking_budget": 4096},
+            {},
+        ),
+    ],
+)
+def test_registered_models_migrate_legacy_reasoning_without_double_encoding(
+    monkeypatch, model_name, model_cfg, expected
+):
+    """已注册模型的历史字段也只能由模型专属策略编码。"""
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, model_cfg)
+
+    assert _provider_request_options(model_name, "https://gateway.example/v1") == expected
+
+
+def test_provider_options_use_exact_model_id_when_routes_are_duplicated(monkeypatch):
+    """同一路由的两个模型 ID 可以保存不同选择，请求必须读取当前 ID。"""
+    from core.llm import _provider_request_options
+
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_id",
+        lambda model_id: {"id": model_id, "reasoning_choice": "off"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_litellm_model",
+        lambda *_args, **_kwargs: {"id": "first", "reasoning_choice": "high"},
+    )
+
+    result = _provider_request_options(
+        "openai/deepseek-v4-flash",
+        "https://gateway.example/v1",
+        model_id="second",
+    )
+
+    assert result == {"extra_body": {"thinking": {"type": "disabled"}}}
 
 
 def test_default_reasoning_choice_adds_no_user_override(monkeypatch):
