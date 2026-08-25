@@ -13,6 +13,7 @@ from core.model_catalog import (
     litellm_model_name,
     validate_protocol,
 )
+from core.reasoning_capabilities import get_reasoning_capability
 _CONFIG_FILE = config._CONFIG_FILE
 
 
@@ -168,48 +169,106 @@ def set_active_model(model_id: str):
     config.update_config(_mutate)
 
 
-REASONING_EFFORT_LEVELS = ("low", "high", "max")
+def _reasoning_model_name(model: dict) -> str:
+    return str(model.get("litellm_model") or model.get("name") or "")
 
 
-def get_model_reasoning_effort(model_id: str) -> str | None:
-    """返回模型条目上显式配置的 reasoning_effort；未配置返回 None（请求层用内置默认）。"""
-    if not model_id:
-        return None
-    data = load_config()
+def _find_config_model(data: dict, model_id: str) -> dict | None:
     for provider in data.get("providers", []):
         for model in provider.get("models", []):
-            if model.get("id") == model_id:
-                level = model.get("reasoning_effort")
-                return str(level).lower() if level else None
+            if str(model.get("id")) == str(model_id):
+                return model
     return None
 
 
-def set_model_reasoning_effort(model_id: str, level: str | None) -> tuple[bool, str]:
-    """按模型持久化推理强度档位；level 为 None/\"default\" 时删除字段恢复内置默认。"""
-    normalized = str(level or "").strip().lower()
-    if normalized in ("", "default"):
-        normalized = ""
-    elif normalized not in REASONING_EFFORT_LEVELS:
-        return False, f"无效档位: {level}（可选 low/high/max/default）"
+def _reasoning_choice_from_model(model: dict) -> str:
+    capability = get_reasoning_capability(_reasoning_model_name(model))
+    stored = str(model.get("reasoning_choice") or "").strip().lower()
+    if stored:
+        if stored not in capability.options:
+            raise ValueError(
+                f"模型 {model.get('name') or model.get('id')} 保存了不支持的思考选项: {stored}"
+            )
+        return stored
+    if model.get("enable_thinking") is False and "off" in capability.options:
+        return "off"
+    effort = str(model.get("reasoning_effort") or "").strip().lower()
+    if effort:
+        if effort not in capability.options:
+            raise ValueError(
+                f"模型 {model.get('name') or model.get('id')} 保存了不支持的思考强度: {effort}"
+            )
+        return effort
+    if model.get("enable_thinking") is True and "on" in capability.options:
+        return "on"
+    return "default"
 
-    found = []
+
+def get_model_reasoning_choice(model_id: str) -> str:
+    """返回模型的通用思考选择；无覆盖时返回 default。"""
+    if not model_id:
+        return "default"
+    model = _find_config_model(load_config(), model_id)
+    return _reasoning_choice_from_model(model) if model else "default"
+
+
+def set_model_reasoning_choice(model_id: str, choice: str | None) -> tuple[bool, str]:
+    """严格校验并原子持久化模型思考开关与强度。"""
+    normalized = str(choice or "default").strip().lower() or "default"
+    current = _find_config_model(load_config(), model_id)
+    if current is None:
+        return False, f"未找到模型: {model_id}"
+
+    capability = get_reasoning_capability(_reasoning_model_name(current))
+    if capability.kind == "fixed":
+        return False, capability.disabled_reason
+    if capability.kind == "hidden":
+        return False, f"模型 {current.get('name') or model_id} 未声明可调思考能力"
+    if normalized not in capability.options:
+        allowed = "/".join(capability.options)
+        return False, f"模型 {current.get('name') or model_id} 不支持思考选项 {normalized}（可选 {allowed}）"
+
+    changed = []
 
     def _mutate(data):
-        for provider in data.get("providers", []):
-            for model in provider.get("models", []):
-                if model.get("id") == model_id:
-                    found.append(model.get("name") or model_id)
-                    if normalized:
-                        model["reasoning_effort"] = normalized
-                    else:
-                        model.pop("reasoning_effort", None)
-                    return
+        model = _find_config_model(data, model_id)
+        if model is None:
+            return
+        changed.append(model.get("name") or model_id)
+        if normalized == "default":
+            model.pop("reasoning_choice", None)
+            model.pop("enable_thinking", None)
+            model.pop("reasoning_effort", None)
+        elif normalized == "off":
+            model["reasoning_choice"] = "off"
+            model["enable_thinking"] = False
+            model.pop("reasoning_effort", None)
+        elif normalized == "on":
+            model["reasoning_choice"] = "on"
+            model["enable_thinking"] = True
+            model.pop("reasoning_effort", None)
+        else:
+            model["reasoning_choice"] = normalized
+            model["enable_thinking"] = True
+            model["reasoning_effort"] = normalized
+
     config.update_config(_mutate)
-    if not found:
+    if not changed:
         return False, f"未找到模型: {model_id}"
-    if normalized:
-        return True, f"模型 {found[0]} 推理强度已设为 {normalized}"
-    return True, f"模型 {found[0]} 推理强度已恢复默认"
+    if normalized == "default":
+        return True, f"模型 {changed[0]} 思考设置已恢复默认"
+    return True, f"模型 {changed[0]} 思考设置已设为 {normalized}"
+
+
+def get_model_reasoning_effort(model_id: str) -> str | None:
+    """兼容 CLI 旧调用：仅在当前选择是具体强度时返回值。"""
+    choice = get_model_reasoning_choice(model_id)
+    return choice if choice in {"low", "medium", "high", "xhigh", "max"} else None
+
+
+def set_model_reasoning_effort(model_id: str, level: str | None) -> tuple[bool, str]:
+    """兼容 CLI 旧调用，委托给通用选择接口。"""
+    return set_model_reasoning_choice(model_id, level)
 
 
 def get_model_config_by_litellm_model(litellm_model: str, base_url: str | None = None) -> dict | None:
