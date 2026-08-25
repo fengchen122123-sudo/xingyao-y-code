@@ -12,8 +12,21 @@ import type {
 } from '../themes/types';
 
 export type PermissionMode = 'confirm' | 'accept_edits' | 'plan' | 'full';
-// 推理强度档位：default = 模型条目未配置，用请求层内置默认
-export type ReasoningEffort = 'default' | 'low' | 'high' | 'max';
+export type ReasoningChoice = 'default' | 'off' | 'on' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+
+export interface ReasoningOption {
+  value: ReasoningChoice;
+  label: string;
+}
+
+export interface ReasoningSnapshot {
+  kind: 'effort' | 'toggle' | 'fixed' | 'hidden';
+  visible: boolean;
+  disabled: boolean;
+  disabled_reason: string;
+  choice: ReasoningChoice;
+  options: ReasoningOption[];
+}
 
 export interface ModelInfo {
   id: string;
@@ -231,7 +244,7 @@ export interface InitialState {
   // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享配置
   allow_outside_workspace?: boolean;
   system_settings?: SystemSettingsSnapshot;
-  reasoning_effort?: ReasoningEffort;
+  reasoning?: ReasoningSnapshot;
   sessions: SessionGroup[];
   skills: SkillInfo[];
   mcps: McpInfo[];
@@ -341,7 +354,8 @@ export interface PyWebViewAPI {
   rename_session(oldName: string, newName: string): Promise<any>;
 
   set_model(modelId: string, sessionName?: string): Promise<any>;
-  set_reasoning_effort(level: ReasoningEffort): Promise<any>;
+  get_reasoning_snapshot(modelId: string): Promise<any>;
+  set_reasoning_choice(modelId: string, choice: ReasoningChoice): Promise<any>;
   set_permission_mode(mode: PermissionMode): Promise<any>;
   set_sandbox_enabled(enabled: boolean): Promise<any>;
   get_system_settings(): Promise<SystemSettingsSnapshot>;
