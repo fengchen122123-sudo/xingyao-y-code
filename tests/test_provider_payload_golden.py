@@ -331,6 +331,8 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
 
 def test_exact_model_id_reaches_final_provider_payload(monkeypatch):
     """重复 route 时，真实事件入口必须使用当前模型 ID 对应的选择。"""
+    import core.llm as llm
+
     captured = _capture(
         monkeypatch,
         model="openai/deepseek-v4-flash",
@@ -345,6 +347,19 @@ def test_exact_model_id_reaches_final_provider_payload(monkeypatch):
         messages=[{"role": "user", "content": "inspect"}],
         model_id="model-second",
     )
+    expected = {
+        "model": "openai/deepseek-v4-flash",
+        "api_key": "<redacted>",
+        "messages": [{"role": "user", "content": "inspect"}],
+        "tools": [ZETA_TOOL, ALPHA_TOOL],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "num_retries": 2,
+        "extra_body": {"thinking": {"type": "disabled"}},
+        "tool_choice": "auto",
+        "max_tokens": 8192,
+        "api_base": "https://gateway.example/v1",
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
 
-    assert captured[0]["extra_body"] == {"thinking": {"type": "disabled"}}
-    assert "reasoning_effort" not in captured[0]
+    assert_exact_provider_kwargs(captured, expected)
