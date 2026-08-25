@@ -233,6 +233,80 @@ it('setReasoningChoice 失败时恢复之前的完整快照', async () => {
   expect(store.reasoning).toEqual(reasoningSnapshot('high'));
 });
 
+it('同一模型连续选择时旧成功响应不能覆盖最后一次选择', async () => {
+  let resolveHigh!: (value: any) => void;
+  let resolveMax!: (value: any) => void;
+  mockBridgeApi({
+    set_reasoning_choice: vi.fn((_modelId: string, choice: string) => new Promise(resolve => {
+      if (choice === 'high') resolveHigh = resolve;
+      else resolveMax = resolve;
+    })),
+  });
+  const store = useAppStore();
+  store.activeModelId = 'm1';
+  store.reasoning = reasoningSnapshot('default') as any;
+
+  const highRequest = store.setReasoningChoice('high');
+  const maxRequest = store.setReasoningChoice('max');
+  resolveMax({ ok: true, reasoning: reasoningSnapshot('max') });
+  await maxRequest;
+  resolveHigh({ ok: true, reasoning: reasoningSnapshot('high') });
+  await highRequest;
+
+  expect(store.reasoning.choice).toBe('max');
+});
+
+it('同一模型的旧失败响应不能回滚后续已成功选择', async () => {
+  let rejectOld!: (value: any) => void;
+  let resolveNew!: (value: any) => void;
+  mockBridgeApi({
+    set_reasoning_choice: vi.fn((_modelId: string, choice: string) => new Promise(resolve => {
+      if (choice === 'high') rejectOld = resolve;
+      else resolveNew = resolve;
+    })),
+  });
+  const store = useAppStore();
+  store.activeModelId = 'm1';
+  store.reasoning = reasoningSnapshot('default') as any;
+
+  const oldRequest = store.setReasoningChoice('high');
+  const newRequest = store.setReasoningChoice('max');
+  resolveNew({ ok: true, reasoning: reasoningSnapshot('max') });
+  await newRequest;
+  rejectOld({ ok: false, msg: '旧请求失败' });
+  await oldRequest;
+
+  expect(store.reasoning.choice).toBe('max');
+});
+
+it('同一模型的旧异常不能把最新成功状态标记为断线', async () => {
+  let rejectOld!: (reason: any) => void;
+  let resolveNew!: (value: any) => void;
+  const notify = vi.fn();
+  mockBridgeApi({
+    set_reasoning_choice: vi.fn((_modelId: string, choice: string) => new Promise((resolve, reject) => {
+      if (choice === 'high') rejectOld = reject;
+      else resolveNew = resolve;
+    })),
+  });
+  const store = useAppStore();
+  store.activeModelId = 'm1';
+  store.reasoning = reasoningSnapshot('default') as any;
+  store.connected = true;
+  store.notifyChat = notify as any;
+
+  const oldRequest = store.setReasoningChoice('high');
+  const newRequest = store.setReasoningChoice('max');
+  resolveNew({ ok: true, reasoning: reasoningSnapshot('max') });
+  await newRequest;
+  rejectOld(new Error('旧请求异常'));
+  await oldRequest;
+
+  expect(store.reasoning.choice).toBe('max');
+  expect(store.connected).toBe(true);
+  expect(notify).not.toHaveBeenCalledWith(expect.stringContaining('旧请求异常'));
+});
+
 it('会话模型被删除后回落到后端配置模型', async () => {
   const store = useAppStore();
   // A 绑定的模型（runtime 中的 m-gone）已在模型管理里被删除
