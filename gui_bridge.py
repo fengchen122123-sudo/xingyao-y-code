@@ -26,6 +26,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional
 
+import config
 from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.agent_service import strip_context_suffix
@@ -2829,6 +2830,49 @@ class ApiBridge:
             return {"ok": True}
         except Exception as e:
             logger.exception("respond_permission_choice 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 局域网手机远程控制（配对 token / 二维码 / TTL）
+    # ------------------------------------------------------------------
+    def _ensure_lan_server(self):
+        """惰性创建并启动局域网远程控制服务，失败返回 None（不抛给调用方）。"""
+        try:
+            if self._lan_server is None:
+                from core.lan_server import LanServer
+
+                self._lan_server = LanServer(bridge=self)
+                data = config._load()
+                ttl = data.get(
+                    config.REMOTE_TOKEN_TTL_KEY, config.REMOTE_TOKEN_TTL_DEFAULT
+                )
+                self._lan_server.set_ttl(ttl)
+                self._lan_server.start()
+            return self._lan_server
+        except Exception as e:
+            logger.exception("局域网远程控制服务启动失败")
+            return None
+
+    def get_remote_bind_qr(self) -> Dict[str, Any]:
+        """签发配对 token 并生成二维码，供手机扫码绑定。"""
+        try:
+            srv = self._ensure_lan_server()
+            if srv is None:
+                return {"ok": False, "msg": "远程服务启动失败"}
+            return srv.get_bind_info()
+        except Exception as e:
+            logger.exception("get_remote_bind_qr 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_remote_token_ttl(self, seconds: int) -> Dict[str, Any]:
+        """持久化远程控制 token 过期时间，并同步到已启动的服务。"""
+        try:
+            config.save_config_value(config.REMOTE_TOKEN_TTL_KEY, int(seconds))
+            if self._lan_server is not None:
+                self._lan_server.set_ttl(int(seconds))
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("set_remote_token_ttl 失败")
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
