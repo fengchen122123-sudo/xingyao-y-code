@@ -18,6 +18,12 @@
           @click="store.jumpQueue(store.currentSessionName, item.id)"
         ><AppIcon name="zap" :size="13" :stroke-width="2" /></button>
         <button
+          class="queue-btn queue-undo-btn"
+          data-test="queue-undo-btn"
+          title="撤销到输入框"
+          @click="undoQueue(item)"
+        ><AppIcon name="undo" :size="13" :stroke-width="2" /></button>
+        <button
           class="queue-btn queue-cancel-btn"
           data-test="queue-cancel-btn"
           title="取消排队"
@@ -141,6 +147,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import type { QueuedMessage } from '../types/pywebview';
 import { formatPermMode } from '../utils/markdown';
 import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
@@ -208,7 +215,7 @@ const ctxTooltip = computed(() => {
   return `上下文 ${pct}%（${formatTokenCount(used)} / ${formatTokenCount(win)}）· 剩余约 ${formatTokenCount(remain)}`;
 });
 
-const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop } = useAttachments();
+const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
 
 // 排队消息：回合运行期间发送的消息（后端 message_queue 快照驱动）
@@ -261,6 +268,17 @@ function handleSend() {
   inputVal.value = '';
   clearAttachments();
   store.sendMessage(text, paths);
+}
+
+// 撤销排队消息：把该条消息的文本与附件（图片/文件）恢复到输入框，供重新
+// 编辑；随后从排队队列移除（复用取消排队）。文本覆盖当前输入，附件按路径
+// 合并去重（addPaths 已去重）。
+async function undoQueue(item: QueuedMessage) {
+  inputVal.value = item.text;
+  if (item.attachments && item.attachments.length) {
+    await addPaths(item.attachments);
+  }
+  store.cancelQueuedMessage(store.currentSessionName, item.id);
 }
 </script>
 
@@ -340,6 +358,9 @@ function handleSend() {
 }
 .queue-jump-btn:hover {
   color: var(--accent);
+}
+.queue-undo-btn:hover {
+  color: var(--green);
 }
 #input-box {
   position: relative;

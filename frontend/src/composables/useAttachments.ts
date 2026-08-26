@@ -297,6 +297,6 @@ export function useAttachments() {
 
   return {
     attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste,
-    dragging, bindDrop, unbindDrop,
+    dragging, bindDrop, unbindDrop, addPaths,
   };
 }
