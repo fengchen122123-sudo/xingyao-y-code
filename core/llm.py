@@ -2602,18 +2602,16 @@ def _strip_media_and_merge(messages, model_name=None, api_base=""):
         if keep_reasoning_fields and keep_thinking_blocks and msg.get("thinking_blocks") is not None:
             cleaned_msg["thinking_blocks"] = deepcopy(msg["thinking_blocks"])
         # DeepSeek thinking 契约：带 tool_calls 的 assistant 必须携带
-        # reasoning_content 字符串字段。供应商可能不产生 reasoning delta，
-        # 此时流组装层会保留显式空串；字段缺失、None 或类型错误仍立即暴露。
+        # reasoning_content 字符串字段。流组装层正常会保留显式空串；但
+        # 从数据库重建或中途切换思考开关的历史消息可能缺失该字段（None
+        # 或非字符串），这里回填空串占位，避免整轮请求被契约校验卡死。
         if (
             role == "assistant"
             and cleaned_msg.get("tool_calls")
             and _requires_tool_call_reasoning(model_name, api_base)
             and not isinstance(cleaned_msg.get("reasoning_content"), str)
         ):
-            raise ValueError(
-                "DeepSeek thinking 工具轮缺少 reasoning_content 字符串字段，"
-                "无法安全继续请求"
-            )
+            cleaned_msg["reasoning_content"] = ""
 
         # 净化 assistant 消息：若 content 包含 protocol sanitised 占位符且有 tool_calls/reasoning，将 content 重置为空字符串
         if role == "assistant" and isinstance(cleaned_msg.get("content"), str):
