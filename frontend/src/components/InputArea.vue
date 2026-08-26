@@ -68,14 +68,14 @@
             :class="`perm-${store.permissionMode}`"
             title="切换权限模式"
             @click.stop="togglePermDropdown"
-          >{{ formatPermMode(store.permissionMode) }} <AppIcon class="permission-chevron" name="chevron-down" :size="11" :stroke-width="2" /></button>
+          ><AppIcon class="perm-icon" name="shield" :size="13" :stroke-width="2" /><span class="perm-label">{{ formatPermMode(store.permissionMode) }}</span> <AppIcon class="permission-chevron" name="chevron-down" :size="11" :stroke-width="2" /></button>
           <button
             data-test="sandbox-button"
             class="chip-btn sandbox-btn"
             :class="{ 'sandbox-open': store.sandboxEnabled }"
             :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
             @click.stop="store.setSandbox(!store.sandboxEnabled)"
-          >{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</button>
+          ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
 
           <!-- 上下文统计圆环：弧线占比 = 已用上下文/窗口，悬停查看用量详情 -->
           <span
@@ -101,7 +101,7 @@
             class="chip-btn model-chip"
             title="切换模型"
             @click.stop="toggleModelCascader"
-          >{{ store.activeModelName || '选择模型' }} <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" /></button>
+          ><AppIcon class="model-icon" name="brain" :size="13" :stroke-width="2" /><span class="model-label">{{ store.activeModelName || '选择模型' }}</span> <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" /></button>
           <ReasoningSelector
             ref="reasoningSelectorRef"
             variant="compact"
@@ -526,9 +526,30 @@ textarea {
   color: var(--red);
 }
 
+/* 紧凑形态元素（图标/短文案）仅手机端显示，桌面端隐藏 */
+.perm-icon,
+.model-icon,
+.sandbox-label-short {
+  display: none;
+}
+
 @media (max-width: 768px) {
   .keyboard-hints {
     display: none;
   }
-}
-</style>
+  /* 手机端收窄按钮：权限/模型只显示图标（颜色仍跟随状态），沙盒只留 开/限 */
+  .permission-mode-btn .perm-label,
+  .permission-mode-btn .permission-chevron,
+  .model-chip .model-label,
+  .model-chip .model-chevron,
+  .sandbox-label-full {
+    display: none;
+  }
+  .perm-icon,
+  .model-icon {
+    display: inline-flex;
+  }
+  .sandbox-label-short {
+    display: inline;
+  }
+}</style>

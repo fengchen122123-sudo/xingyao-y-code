@@ -390,6 +390,7 @@ export interface PyWebViewAPI {
   undo_last_edit(): Promise<any>;
 
   read_file_preview(path: string): Promise<any>;
+  check_paths_kind(paths: string[]): Promise<Array<{ path: string; kind: 'file' | 'dir' | 'missing' }>>;
   open_path(path: string): Promise<any>;
   open_folder_in_explorer(path: string): Promise<any>;
   pick_files(): Promise<any>;

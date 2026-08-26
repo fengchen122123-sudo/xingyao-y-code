@@ -174,4 +174,45 @@ describe('MessageBubble', () => {
     wrapper.unmount();
     delete (window as any).pywebview;
   });
+
+  it('目录与不存在的路径链接降级为纯文本，真实文件保持链接', async () => {
+    const store = useAppStore();
+    store.workdir = 'D:\\proj';
+    // 组件可能因 immediate watcher + ref 变化多次触发、且只传未缓存的子集，
+    // mock 必须按路径语义返回而不是依赖数组顺序
+    vi.spyOn(store, 'checkPathsKind').mockImplementation(async (paths: string[]) =>
+      paths.map(p => ({
+        path: p,
+        kind: p.endsWith('dist') ? 'dir' as const : p.endsWith('gone.md') ? 'missing' as const : 'file' as const,
+      })),
+    );
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: assistantMessage({ content: '目录 D:\\proj\\dist，文件 D:\\proj\\ok.md，缺失 D:\\proj\\gone.md' }) },
+    });
+    await flushPromises();
+
+
+    const links = wrapper.findAll('a[data-file-link]');
+    expect(links.length).toBe(1);
+    expect(links[0].text()).toBe('D:\\proj\\ok.md');
+    const text = wrapper.get('.md-body').text();
+    expect(text).toContain('D:\\proj\\dist');
+    expect(text).toContain('D:\\proj\\gone.md');
+    wrapper.unmount();
+  });
+
+  it('路径类型校验失败时保留链接原样', async () => {
+    const store = useAppStore();
+    store.workdir = 'D:\\proj';
+    vi.spyOn(store, 'checkPathsKind').mockRejectedValue(new Error('api down'));
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: assistantMessage({ content: '见 D:\\proj\\docs\\foo.md 文件' }) },
+    });
+    await flushPromises();
+
+    expect(wrapper.findAll('a[data-file-link]').length).toBe(1);
+    wrapper.unmount();
+  });
 });

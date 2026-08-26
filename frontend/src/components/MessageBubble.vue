@@ -61,8 +61,15 @@
           </FoldCard>
         </div>
 
-        <!-- Markdown 文本内容（代码块复制按钮通过事件委托处理点击） -->
-        <div v-if="msg.content && msg.content.trim()" class="md-body" v-html="renderMarkdown(msg.content)" @click="onMdBodyClick"></div>
+        <!-- Markdown 文本内容（代码块复制按钮通过事件委托处理点击）；
+             文件链接先渲染、后经后端批量校验，目录/不存在的路径降级为纯文本 -->
+        <div
+          v-if="msg.content && msg.content.trim()"
+          ref="mdBodyRef"
+          class="md-body"
+          v-html="renderMarkdown(msg.content)"
+          @click="onMdBodyClick"
+        ></div>
 
         <!-- 工具执行时间线（含绑定/未绑定的文件变更 Diff） -->
         <ToolExecutionTrace
@@ -107,7 +114,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onUnmounted } from 'vue';
+import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdown } from '../utils/markdown';
 import { toAbsoluteLocalPath } from '../utils/localPath';
@@ -215,6 +222,72 @@ function onMdBodyClick(e: MouseEvent) {
       // 复制失败保持原样，不额外提示
     });
 }
+
+// ---- 文件链接后置校验：目录 / 不存在的路径降级为纯文本 ----
+// 渲染层（renderMarkdown）是纯字符串函数无法查磁盘，先按路径形态渲染成链接，
+// 挂载/内容变化后再由后端批量确认真实类型；目录与不存在的路径还原为纯文本，
+// 避免用户点击后才发现「无法预览」。校验失败（如 API 未就绪）时保留链接原样。
+const mdBodyRef = ref<HTMLElement | null>(null);
+// 跨渲染的路径类型缓存：v-html 在 content 每次变化时整体重建 DOM，
+// 节点级标记会随 innerHTML 替换丢失，因此按路径文本缓存校验结果；
+// 流式输出期间同一路径只请求一次后端。
+const pathKindCache = new Map<string, string>();
+let pathCheckSeq = 0;
+
+function downgradeInvalidFileLinks(root: HTMLElement | null): void {
+  if (!root) return;
+  const anchors = Array.from(root.querySelectorAll('a[data-file-link]'));
+  if (!anchors.length) return;
+  // 先应用缓存：已确认目录/不存在路径直接降级，仅未知路径送后端
+  const pending: Array<{ raw: string; abs: string }> = [];
+  const seen = new Set<string>();
+  for (const a of anchors) {
+    const raw = a.getAttribute('data-file-link') || '';
+    const cached = pathKindCache.get(raw);
+    if (cached && cached !== 'file') {
+      const span = document.createElement('span');
+      span.textContent = a.textContent || '';
+      a.replaceWith(span);
+      continue;
+    }
+    if (!cached && !seen.has(raw)) {
+      seen.add(raw);
+      pending.push({ raw, abs: toAbsoluteLocalPath(raw, store.workdir) || raw });
+    }
+  }
+  if (!pending.length) return;
+  const seq = ++pathCheckSeq;
+  store.checkPathsKind(pending.map(p => p.abs)).then((results) => {
+    if (seq !== pathCheckSeq) return; // 期间内容又变了，丢弃过期结果
+    // 按返回的 path 字段对应（而非索引），对重复触发/乱序更稳健
+    for (const r of results || []) {
+      if (r && r.kind) {
+        const hit = pending.find(p => p.abs === r.path);
+        if (hit) pathKindCache.set(hit.raw, r.kind);
+      }
+    }
+    for (const a of anchors) {
+      if (!a.isConnected) continue;
+      const raw = a.getAttribute('data-file-link') || '';
+      const kind = pathKindCache.get(raw);
+      // 校验不到的条目（理论不发生）保持链接原样，宁可多留可点链接也不误伤
+      if (kind && kind !== 'file') {
+        const span = document.createElement('span');
+        span.textContent = a.textContent || '';
+        a.replaceWith(span);
+      }
+    }
+  }).catch(() => { /* 校验失败保留链接，点击时后端仍有兜底提示 */ });
+}
+
+watch(
+  () => [props.msg.content, mdBodyRef.value],
+  async () => {
+    await nextTick();
+    downgradeInvalidFileLinks(mdBodyRef.value);
+  },
+  { immediate: true },
+);
 
 // 用户消息复制：点击复制按钮把本条消息文本写入剪贴板，按钮短暂显示「已复制」
 async function copyUserMessage() {

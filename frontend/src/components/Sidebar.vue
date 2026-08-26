@@ -138,7 +138,7 @@
     @click="store.toggleSidebar()"
   ></div>
 
-  <div v-if="remoteBind" class="modal-mask" data-test="remote-bind-modal" @click.self="closeRemoteBind()">
+  <div v-if="remoteBind" class="modal-mask" data-test="remote-bind-modal">
     <div class="modal">
       <div class="modal-head">
         <div class="mh-ico"><AppIcon name="smartphone" :size="18" /></div>
