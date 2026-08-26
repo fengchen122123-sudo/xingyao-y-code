@@ -38,3 +38,15 @@ def test_route_rejects_non_whitelisted():
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
     srv._route_message(fake, json.dumps({"method": "window_close", "args": {}, "id": 1}))
     assert "method not allowed" in fake.sent[0]
+
+
+def test_get_bind_info_returns_url_token_qr():
+    srv = LanServer(bridge=None)
+    srv.port = 8765
+    srv.lan_ip = "192.168.1.5"
+    info = srv.get_bind_info()
+    assert info["ok"]
+    assert info["url"].startswith("http://192.168.1.5:8765/?token=")
+    assert info["token"]
+    assert info["qr"].startswith("data:image/png;base64,")
+    assert info["expires_in"] == srv._ttl
