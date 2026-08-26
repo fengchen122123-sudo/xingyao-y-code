@@ -119,15 +119,32 @@ _register(
     ("kimi-for-coding", "kimi-k2.7-code", "minimax-m2.5", "minimax-m2.7"),
     ReasoningCapability("fixed", (), "always_on", "该模型始终开启思考"),
 )
+# 阶跃星辰：推理模型始终输出 reasoning，用 reasoning_effort 控制深度（low/medium/high），无 off 开关。
+_register(
+    ("step-3.7-flash", "step-router-v1"),
+    ReasoningCapability(
+        "effort", ("default", "low", "medium", "high"), "always_on_effort"
+    ),
+)
+# Agnes AI：OpenAI 兼容接口用 chat_template_kwargs.enable_thinking 开关思考，无强度档位。
+_register(
+    ("agnes-2.0-flash", "agnes-2.5-flash"),
+    ReasoningCapability(
+        "toggle", ("default", "off", "on"), "agnes_enable_thinking"
+    ),
+)
+# 腾讯混元（hy3，经 CloudBase AI 网关 OpenAI 兼容接口）：顶层 enable_thinking 开关，无强度档位。
+_register(
+    ("hy3",),
+    ReasoningCapability(
+        "toggle", ("default", "off", "on"), "enable_thinking_toggle"
+    ),
+)
 _register(
     (
         "deepseek-v4-flash-vision-exp",
-        "agnes-2.0-flash",
-        "agnes-2.5-flash",
         "sensenova-6.7-flash-lite",
-        "step-3.7-flash",
         "step-explore",
-        "step-router-v1",
         "doubao-seed-evolving",
         "ark-code-latest",
     ),
