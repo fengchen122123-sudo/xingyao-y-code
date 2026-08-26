@@ -4350,6 +4350,25 @@ class ApiBridge:
             logger.exception("undo_last_edit 失败")
             return {"ok": False, "msg": str(e)}
 
+    def check_paths_kind(self, paths: List[str]) -> List[Dict[str, Any]]:
+        """批量返回路径类型（file / dir / missing），供前端把目录与不存在的
+        路径链接降级为纯文本，避免点击后才发现无法预览。"""
+        results: List[Dict[str, Any]] = []
+        for p in paths or []:
+            raw = str(p)
+            try:
+                real_path = _resolve_real_path(raw)
+                if os.path.isfile(real_path):
+                    kind = "file"
+                elif os.path.isdir(real_path):
+                    kind = "dir"
+                else:
+                    kind = "missing"
+            except Exception:
+                kind = "missing"
+            results.append({"path": raw, "kind": kind})
+        return results
+
     def read_file_preview(self, path: str) -> Dict[str, Any]:
         try:
             real_path = _resolve_real_path(path)
@@ -4357,6 +4376,9 @@ class ApiBridge:
             if workspace == "GLOBAL" or not _path_is_within(real_path, workspace):
                 return {"ok": False, "msg": "文件不在当前工作区内"}
             if not os.path.isfile(real_path):
+                # 目录路径（模型常在回复中输出文件夹路径，点击预览属常见操作）
+                if os.path.isdir(real_path):
+                    return {"ok": False, "msg": "这是一个文件夹，不支持文本预览（可在侧栏文件树中浏览其内容）"}
                 return {"ok": False, "msg": "文件不存在或不是普通文件"}
             size = os.path.getsize(real_path)
             truncated = size > FILE_PREVIEW_MAX_BYTES

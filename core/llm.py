@@ -2710,6 +2710,14 @@ def _cache_affinity_session_id(
 _process_cache_key_fallback = None
 
 _REASONING_EFFORT_LEVELS = ("low", "high", "max")
+_K3_REASONING_MODEL_NAMES = frozenset(
+    {"k3", "k3-256k", "kimi-k3", "kimi-k3-256k"}
+)
+_ANTHROPIC_REASONING_BUDGETS = {
+    "low": 1024,
+    "high": 4096,
+    "max": 16384,
+}
 
 
 def _attach_kimi_request_extras(
@@ -2776,7 +2784,10 @@ def _configured_reasoning_choice(model_cfg, capability):
 
 def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=False):
     """按模型能力表把思考选择编码为该模型的精确请求参数。"""
-    from core.reasoning_capabilities import get_reasoning_capability
+    from core.reasoning_capabilities import (
+        get_reasoning_capability,
+        normalize_reasoning_model_name,
+    )
 
     capability = get_reasoning_capability(model_name)
     has_explicit_choice = bool(str(model_cfg.get("reasoning_choice") or "").strip())
@@ -2804,8 +2815,18 @@ def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=Fa
     strategy = capability.request_strategy
     if strategy == "always_on_effort":
         if anthropic_route:
-            raise ValueError("Anthropic 路由不支持该模型的 reasoning_effort 参数")
-        result.setdefault("extra_body", {})["reasoning_effort"] = choice
+            if normalize_reasoning_model_name(model_name) not in _K3_REASONING_MODEL_NAMES:
+                raise ValueError("Anthropic 路由不支持该模型的 reasoning_effort 参数")
+            budget_tokens = _ANTHROPIC_REASONING_BUDGETS[choice]
+            result["thinking"] = {
+                "type": "enabled",
+                "budget_tokens": budget_tokens,
+            }
+            result["max_tokens"] = max(
+                int(result.get("max_tokens") or 0), budget_tokens + 1
+            )
+        else:
+            result.setdefault("extra_body", {})["reasoning_effort"] = choice
     elif strategy == "thinking_object_effort":
         enabled = choice != "off"
         result.setdefault("extra_body", {})["thinking"] = {

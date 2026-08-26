@@ -874,6 +874,11 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     transform: translateX(0);
     transition: transform 0.25s ease;
     box-shadow: 12px 0 40px var(--theme-shadow-color);
+    /* 手机端侧栏是悬浮层，透明主题下半透明会与下层对话内容重叠导致不可读，
+       强制不透明。主题变量写在 :root inline 上，元素自身声明优先于继承值，
+       因此此处覆盖即可生效；桌面端不受影响。 */
+    --theme-sidebar-bg-opacity: 1;
+    --theme-sidebar-bg-opacity-pct: 100%;
   }
   #main > #sidebar.collapsed {
     transform: translateX(-100%);
@@ -893,14 +898,46 @@ body.light .fp-pre .hljs-deletion { color: #82071e; }
     display: none;
   }
 
-  /* 状态栏：窄屏下横向滚动，避免多项状态信息溢出 */
+  /* 状态栏：手机端只保留连接、模型、工作区、沙盒、运行状态五项，其余隐藏。
+     注意：隐藏规则必须 !important —— App.vue scoped 的 `#statusbar .si[data-v-x]{display:flex}`
+     特异性 (1,2,0) 高于普通媒体查询规则，会顶掉 display:none。 */
   #statusbar {
-    overflow-x: auto;
+    box-sizing: border-box;
+    height: calc(28px + env(safe-area-inset-bottom));
+    padding: 0 8px env(safe-area-inset-bottom);
+    gap: 8px;
+    overflow: hidden;
+    flex-wrap: nowrap;
   }
   #statusbar .si {
-    flex-shrink: 0;
+    min-width: 0;
+    white-space: nowrap;
   }
-
+  #statusbar [data-mobile-status="hidden"] {
+    display: none !important;
+  }
+  #statusbar .conn-full {
+    display: none;
+  }
+  #statusbar .conn-short {
+    display: inline;
+  }
+  #statusbar .status-connection,
+  #statusbar .status-sandbox,
+  #statusbar .status-runtime {
+    flex: 0 0 auto;
+  }
+  #statusbar .status-model {
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  #statusbar .status-workspace {
+    flex: 0 1 auto;
+    max-width: 22vw;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
   /* 触屏优化：表单控件字号 >=16px，防 iOS 聚焦时自动放大页面 */
   textarea,
   input,

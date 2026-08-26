@@ -2871,6 +2871,16 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    async checkPathsKind(paths: string[]) {
+      const api = this._api();
+      if (!api) return [];
+      try {
+        return (await api.check_paths_kind(paths)) || [];
+      } catch {
+        return [];
+      }
+    },
+
     async openFilePreview(path: string) {
       this.filePreview = { show: true, path, content: '', truncated: false, loading: true };
       const api = this._api();

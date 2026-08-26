@@ -202,6 +202,47 @@ def test_kimi_anthropic_provider_kwargs_keep_thinking_and_metadata(monkeypatch):
     assert_exact_provider_kwargs(captured, expected)
 
 
+def test_kimi_anthropic_max_reasoning_provider_kwargs_are_byte_golden(monkeypatch):
+    import core.llm as llm
+
+    captured = _capture(
+        monkeypatch,
+        model="anthropic/k3",
+        api_base="https://api.kimi.com/coding",
+        protocol="anthropic",
+        model_cfg={"reasoning_choice": "max"},
+        cache_session_id="golden-kimi-anthropic",
+        messages=[
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "inspect"},
+        ],
+    )
+    expected = {
+        "model": "anthropic/k3",
+        "api_key": "<redacted>",
+        "messages": [
+            {
+                "role": "system",
+                "content": "stable",
+                "cache_control": {"type": "ephemeral"},
+            },
+            {"role": "user", "content": "inspect"},
+        ],
+        "tools": [ZETA_TOOL, ALPHA_TOOL],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "num_retries": 2,
+        "thinking": {"type": "enabled", "budget_tokens": 16384},
+        "max_tokens": 32000,
+        "allowed_openai_params": ["thinking"],
+        "metadata": {"user_id": "ycode-c49d43ff17a8-1f26e809b954b97b"},
+        "tool_choice": "auto",
+        "api_base": "https://api.kimi.com/coding",
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
+    assert_exact_provider_kwargs(captured, expected)
+
+
 def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
     import core.llm as llm
 
