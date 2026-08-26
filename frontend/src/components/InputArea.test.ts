@@ -25,6 +25,17 @@ it('uses the current session state for the send/stop button', () => {
   wrapper.unmount();
 });
 
+it('为键盘快捷键提示提供独立的手机端隐藏标记', () => {
+  const wrapper = mount(InputArea);
+  const hints = wrapper.get('[data-test="keyboard-hints"]');
+
+  expect(hints.classes()).toContain('keyboard-hints');
+  expect(hints.text()).toContain('Enter');
+  expect(hints.text()).toContain('Shift+Enter');
+  expect(hints.text()).toContain('Esc');
+  wrapper.unmount();
+});
+
 it('排队消息显示在输入框上方，提供取消与插队按钮', async () => {
   const store = useAppStore();
   store.currentSessionName = 'session-b';
