@@ -471,6 +471,8 @@ class ApiBridge:
         self._term_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
+        # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
+        self._lan_server = None
 
         # JS 事件派发队列：evaluate_js 是同步调用（无超时），渲染进程挂起时
         # 永不返回。若事件源线程（回合 worker / delta 冲刷 / 终端泵）直接调用，
@@ -1714,6 +1716,10 @@ class ApiBridge:
                     "JS 事件队列已满，丢弃事件（累计 %d）：渲染进程可能已挂起",
                     self._js_dropped,
                 )
+        # 广播到局域网手机客户端（broadcast 内部已吞异常，不影响桌面 JS 派发）
+        lan = getattr(self, "_lan_server", None)
+        if lan is not None:
+            lan.broadcast(payload)
 
     def _ensure_js_dispatcher(self):
         """惰性启动 JS 事件派发线程：单消费者保证事件顺序，evaluate_js 只在此线程调用。"""
