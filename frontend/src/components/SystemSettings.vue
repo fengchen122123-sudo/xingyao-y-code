@@ -34,6 +34,25 @@
           </option>
         </select>
       </div>
+      <div class="setting-row">
+        <div class="setting-copy">
+          <h2>远程控制 token 过期时间</h2>
+          <p>手机扫码配对后，token 在所选时长后自动失效，到期需重新扫码。</p>
+        </div>
+        <select
+          data-test="remote-token-ttl-select"
+          class="setting-select"
+          :value="store.systemSettings.remote_token_ttl"
+          :disabled="saving"
+          @change="selectTokenTtl(($event.target as HTMLSelectElement).value)"
+        >
+          <option :value="0">永久</option>
+          <option :value="3600">1 小时</option>
+          <option :value="43200">12 小时</option>
+          <option :value="86400">24 小时</option>
+          <option :value="604800">7 天</option>
+        </select>
+      </div>
       <p v-if="store.systemSettings.command_shell_error" class="setting-error">
         {{ store.systemSettings.command_shell_error }}
       </p>
@@ -58,6 +77,17 @@ async function selectShell(shellId: string) {
   saving.value = true;
   try {
     await store.setCommandShell(shellId);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function selectTokenTtl(value: string) {
+  const seconds = Number(value);
+  if (seconds === store.systemSettings.remote_token_ttl || saving.value) return;
+  saving.value = true;
+  try {
+    await store.setRemoteTokenTtl(seconds);
   } finally {
     saving.value = false;
   }

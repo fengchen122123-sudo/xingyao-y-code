@@ -95,6 +95,7 @@ export interface SystemSettingsSnapshot {
   command_shell_options: CommandShellOption[];
   command_shell_available: boolean;
   command_shell_error: string;
+  remote_token_ttl: number;
 }
 
 export interface SkillInfo {
@@ -360,6 +361,7 @@ export interface PyWebViewAPI {
   set_sandbox_enabled(enabled: boolean): Promise<any>;
   get_system_settings(): Promise<SystemSettingsSnapshot>;
   set_command_shell(shellId: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   get_permission_rules(): Promise<any>;
   clear_permission_rules(): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;

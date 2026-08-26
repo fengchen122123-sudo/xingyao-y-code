@@ -145,11 +145,18 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
     else:
         error = ""
         selected_available = True
+    try:
+        remote_token_ttl = int(
+            config._load().get(config.REMOTE_TOKEN_TTL_KEY, config.REMOTE_TOKEN_TTL_DEFAULT)
+        )
+    except (TypeError, ValueError):
+        remote_token_ttl = config.REMOTE_TOKEN_TTL_DEFAULT
     return {
         "command_shell": selected,
         "command_shell_options": options,
         "command_shell_available": selected_available,
         "command_shell_error": error,
+        "remote_token_ttl": remote_token_ttl,
     }
 
 

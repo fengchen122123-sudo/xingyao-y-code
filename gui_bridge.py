@@ -2870,7 +2870,7 @@ class ApiBridge:
             config.save_config_value(config.REMOTE_TOKEN_TTL_KEY, int(seconds))
             if self._lan_server is not None:
                 self._lan_server.set_ttl(int(seconds))
-            return {"ok": True}
+            return {"ok": True, "settings": self.get_system_settings()}
         except Exception as e:
             logger.exception("set_remote_token_ttl 失败")
             return {"ok": False, "msg": str(e)}
