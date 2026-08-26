@@ -474,6 +474,8 @@ class ApiBridge:
         self._shutting_down = False
         # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
         self._lan_server = None
+        # 保护 _lan_server 惰性创建的双检锁：并发（启动后台线程 + 用户点二维码）时不得创建两个实例
+        self._lan_lock = threading.Lock()
 
         # JS 事件派发队列：evaluate_js 是同步调用（无超时），渲染进程挂起时
         # 永不返回。若事件源线程（回合 worker / delta 冲刷 / 终端泵）直接调用，
@@ -857,6 +859,12 @@ class ApiBridge:
             shutdown_all_schedulers()
         except Exception:
             logger.exception("退出时停止计划调度器失败")
+
+        try:
+            if self._lan_server is not None:
+                self._lan_server.stop()
+        except Exception:
+            logger.exception("退出时停止局域网远程控制服务失败")
 
         if self._mcp is not None:
             try:
@@ -1871,6 +1879,15 @@ class ApiBridge:
         # 若启动卡死时日志里没有这条，说明调用根本没到 Python（桥消息丢失），
         # 而非本方法内部卡住——据此区分"前端没调进来"与"卡在入口"。
         logger.info("get_initial_state 入口被调用（前端桥已打通）")
+        # 前端桥已打通：后台惰性启动局域网手机远程控制服务（不阻塞初始化）
+        try:
+            threading.Thread(
+                target=self._ensure_lan_server,
+                daemon=True,
+                name="lan-remote-startup",
+            ).start()
+        except Exception:
+            logger.debug("局域网远程控制服务启动线程创建失败", exc_info=True)
         gui_theme_state = _load_initial_gui_theme_state()
         active_gui_theme = gui_theme_state["gui_theme"]
         gui_themes = gui_theme_state["gui_themes"]
@@ -2836,22 +2853,32 @@ class ApiBridge:
     # 局域网手机远程控制（配对 token / 二维码 / TTL）
     # ------------------------------------------------------------------
     def _ensure_lan_server(self):
-        """惰性创建并启动局域网远程控制服务，失败返回 None（不抛给调用方）。"""
-        try:
-            if self._lan_server is None:
+        """惰性创建并启动局域网远程控制服务，失败返回 None（不抛给调用方）。
+
+        双检锁保证并发（启动后台线程 + 用户点二维码）只创建一个实例；start()
+        成功回填真实端口后才发布 self._lan_server，避免并发方拿到 port=0 的
+        半成品（二维码 URL 会变成 http://ip:0/）。
+        """
+        if self._lan_server is not None:
+            return self._lan_server
+        with self._lan_lock:
+            if self._lan_server is not None:
+                return self._lan_server
+            try:
                 from core.lan_server import LanServer
 
-                self._lan_server = LanServer(bridge=self)
+                srv = LanServer(bridge=self)
                 data = config._load()
                 ttl = data.get(
                     config.REMOTE_TOKEN_TTL_KEY, config.REMOTE_TOKEN_TTL_DEFAULT
                 )
-                self._lan_server.set_ttl(ttl)
-                self._lan_server.start()
-            return self._lan_server
-        except Exception as e:
-            logger.exception("局域网远程控制服务启动失败")
-            return None
+                srv.set_ttl(ttl)
+                srv.start()
+                self._lan_server = srv
+                return srv
+            except Exception as e:
+                logger.exception("局域网远程控制服务启动失败")
+                return None
 
     def get_remote_bind_qr(self) -> Dict[str, Any]:
         """签发配对 token 并生成二维码，供手机扫码绑定。"""
