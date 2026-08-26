@@ -39,7 +39,7 @@ export function renderMarkdown(md: string): string {
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
     const idx = codeBlocks.length;
     const escaped = escapeHtml(code);
-    codeBlocks.push(`<pre><code class="language-${escapeHtml(lang || '')}">${escaped}</code></pre>`);
+    codeBlocks.push(`<div class="code-block"><button class="code-copy" type="button">复制</button><pre><code class="language-${escapeHtml(lang || '')}">${escaped}</code></pre></div>`);
     return `${PH}CB${idx}${PH}`;
   });
 
