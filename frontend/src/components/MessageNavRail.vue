@@ -11,11 +11,23 @@
       type="button"
       class="rail-dot"
       :class="{ active: i === activeIndex }"
-      :title="`跳转到第 ${i + 1} 条我的消息`"
       :aria-label="`跳转到第 ${i + 1} 条我的消息`"
       data-test="rail-dot"
       @click="jumpTo(i)"
+      @mouseenter="onDotHover(i, $event)"
+      @mouseleave="onDotLeave"
     ></button>
+
+    <!-- 悬停预览浮层：Teleport 到 body，脱离 .nav-rail 的 overflow:hidden 裁剪；
+         定位于红点左侧，max-width 20em 约 20 字一行自动换行，不溢出窗口 -->
+    <Teleport to="body">
+      <div
+        v-if="hoverIndex >= 0"
+        class="rail-tip"
+        data-test="rail-tip"
+        :style="tipStyle"
+      >{{ msgTexts[hoverIndex] || `跳转到第 ${hoverIndex + 1} 条我的消息` }}</div>
+    </Teleport>
   </div>
 </template>
 
@@ -32,7 +44,42 @@ const props = defineProps<{
 // 红点数量 = 用户消息条数。用户消息在任何形态下都完整渲染（折叠只收中间
 // 过程），因此点数随消息增加而增加，上下文压缩也不会丢点。
 const msgCount = ref(0);
+// 每条用户消息的悬停预览文本（与红点一一对应，超长截断）
+const msgTexts = ref<string[]>([]);
 const dots = computed(() => Array.from({ length: msgCount.value }));
+
+// 悬停预览最大字符数：消息过长时不显示完整内容
+const MAX_PREVIEW_LEN = 100;
+
+// 提取用户消息的纯文本预览：折叠换行/连续空白为单空格，超长截断加省略号；
+// 纯图片消息（无文字）退回「[图片]」占位。
+function buildPreview(el: HTMLElement): string {
+  const textEl = el.querySelector('.user-text');
+  const text = textEl?.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+  if (text) {
+    return text.length > MAX_PREVIEW_LEN ? `${text.slice(0, MAX_PREVIEW_LEN)}…` : text;
+  }
+  if (el.querySelector('.msg-img')) return '[图片]';
+  return '';
+}
+
+// 悬停红点索引（-1 = 无悬停），驱动浮层显隐
+const hoverIndex = ref(-1);
+// 浮层定位样式：垂直对齐红点中心，水平贴红点左侧 12px
+const tipStyle = ref<Record<string, string>>({});
+
+function onDotHover(i: number, e: MouseEvent) {
+  hoverIndex.value = i;
+  const rect = (e.currentTarget as HTMLElement).getBoundingClientRect();
+  tipStyle.value = {
+    top: `${rect.top + rect.height / 2}px`,
+    right: `${window.innerWidth - rect.left + 12}px`,
+  };
+}
+
+function onDotLeave() {
+  hoverIndex.value = -1;
+}
 
 // 渐进式紧凑策略：对话少时松散，随数量增加逐步收紧，最后才缩点径。
 // 三级：宽松(22px槽位) → 适中(16px) → 紧凑(12px) → 极限(点径缩小)
@@ -48,7 +95,9 @@ const dotSize = ref(BASE_DOT_SIZE);
 const slotHeight = ref(BASE_SLOT);
 
 function refresh() {
-  msgCount.value = props.getUserMsgElements().length;
+  const els = props.getUserMsgElements();
+  msgCount.value = els.length;
+  msgTexts.value = els.map(buildPreview);
   const scrollEl = props.getScrollEl();
   if (!scrollEl || !msgCount.value) {
     dotSize.value = BASE_DOT_SIZE;
@@ -216,5 +265,26 @@ defineExpose({ refresh });
 .rail-dot:hover::before {
   transform: scale(1.4);
   opacity: 1;
+}
+
+/* 悬停预览浮层：fixed 定位在红点左侧，约 20 字（20em）一行自动换行，
+   长文本多行展示而不溢出窗口；复用主题浮窗色与毛玻璃质感 */
+.rail-tip {
+  position: fixed;
+  transform: translateY(-50%);
+  max-width: 20em;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--theme-float-background) 92%, transparent);
+  color: var(--theme-text-bright);
+  border: 1px solid var(--theme-border);
+  border-radius: var(--theme-radius-small);
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: normal;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  box-shadow: 0 4px 16px var(--theme-shadow-color);
+  z-index: 1000;
+  pointer-events: none;
 }
 </style>
