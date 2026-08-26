@@ -1,25 +1,25 @@
 <template>
   <div id="sidebar" data-theme-region="sidebar" :class="{ collapsed: store.sidebarCollapsed }">
     <div class="side-menu">
-      <div class="menu-item" @click="store.createSessionSmart()">
+      <div class="menu-item" @click="newSession()">
         <span class="mi-ico">✎</span>
         <span class="mi-label">新会话</span>
         <span class="mi-count">{{ store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</span>
         <span class="mi-arrow">＋</span>
       </div>
-      <div class="menu-item" @click="store.openSubpage('skills')">
+      <div class="menu-item" @click="openSkills()">
         <span class="mi-ico">❖</span>
         <span class="mi-label">技能 Skills</span>
         <span class="mi-count">{{ store.skills.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
-      <div class="menu-item" @click="store.openSubpage('mcp')">
+      <div class="menu-item" @click="openMcp()">
         <span class="mi-ico">⧉</span>
         <span class="mi-label">MCP 服务</span>
         <span class="mi-count">{{ connectedMcpCount }} / {{ store.mcps.length }} 在线</span>
         <span class="mi-arrow">›</span>
       </div>
-      <div class="menu-item" @click="store.openSubpage('plugins')">
+      <div class="menu-item" @click="openPlugins()">
         <span class="mi-ico">⬡</span>
         <span class="mi-label">插件</span>
         <span class="mi-count">{{ enabledPluginCount }} / {{ store.plugins.length }}</span>
@@ -130,6 +130,14 @@
     </div>
   </div>
 
+  <!-- 移动端侧栏遮罩：侧栏展开时盖住主区，点击收起（桌面端由 CSS 隐藏） -->
+  <div
+    v-if="!store.sidebarCollapsed"
+    class="sidebar-backdrop"
+    data-test="sidebar-backdrop"
+    @click="store.toggleSidebar()"
+  ></div>
+
   <div v-if="remoteBind" class="modal-mask" data-test="remote-bind-modal" @click.self="closeRemoteBind()">
     <div class="modal">
       <div class="modal-head">
@@ -194,6 +202,40 @@ function onSessionClick(s: { name: string; display_name?: string; workdir?: stri
   }
   confirmDeleteName.value = '';
   store.switchSession(s.name, s.display_name || s.name, s.workdir);
+  collapseSidebarIfMobile();
+}
+
+// 移动端视口判定：<=768px 时侧栏为覆盖层，点遮罩 / 选择会话 / 点击菜单后收起
+function isMobileViewport(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(max-width: 768px)').matches
+  );
+}
+
+function collapseSidebarIfMobile() {
+  if (isMobileViewport()) {
+    store.sidebarCollapsed = true;
+  }
+}
+
+// 侧栏菜单项：触发动作后，移动端自动收起覆盖层
+function newSession() {
+  store.createSessionSmart();
+  collapseSidebarIfMobile();
+}
+function openSkills() {
+  store.openSubpage('skills');
+  collapseSidebarIfMobile();
+}
+function openMcp() {
+  store.openSubpage('mcp');
+  collapseSidebarIfMobile();
+}
+function openPlugins() {
+  store.openSubpage('plugins');
+  collapseSidebarIfMobile();
 }
 
 // 一个目录下超过 5 条会话时默认折叠，点“显示更多”再展开全部
@@ -736,5 +778,20 @@ function getFolderTitle(g: SessionGroup) {
   border: none;
   color: #fff;
   font-weight: 600;
+}
+
+/* 移动端侧栏遮罩：桌面端不显示，仅在 <=768px 侧栏展开时盖住主区。
+   层级低于侧栏（style.css 中 #main > #sidebar z-index:400）以便侧栏可点击 */
+.sidebar-backdrop {
+  display: none;
+}
+@media (max-width: 768px) {
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 390;
+    background: rgba(0, 0, 0, 0.5);
+  }
 }
 </style>
