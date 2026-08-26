@@ -3,7 +3,7 @@ import { nextTick } from 'vue';
 import { mount } from '@vue/test-utils';
 import MessageNavRail from './MessageNavRail.vue';
 
-function makeEl(top: number, height: number): HTMLElement {
+function makeEl(top: number, height: number, text?: string): HTMLElement {
   return {
     getBoundingClientRect: () => ({
       top,
@@ -13,6 +13,12 @@ function makeEl(top: number, height: number): HTMLElement {
       bottom: top + height,
       width: 0,
     }),
+    querySelector: (sel: string) => {
+      if (sel === '.user-text' && text !== undefined) {
+        return { textContent: text } as HTMLElement;
+      }
+      return null;
+    },
   } as unknown as HTMLElement;
 }
 
@@ -44,6 +50,57 @@ describe('MessageNavRail', () => {
     await nextTick();
 
     expect(wrapper.findAll('[data-test="rail-dot"]').length).toBe(3);
+  });
+
+  it('悬停红点显示消息内容', async () => {
+    const els = [makeEl(100, 40, '帮我查一下库存'), makeEl(300, 40, '好的谢谢')];
+    const wrapper = mount(MessageNavRail, {
+      props: {
+        getScrollEl: () => makeScrollEl(),
+        getUserMsgElements: () => els,
+      },
+      global: { stubs: { teleport: true } },
+    });
+    await nextTick();
+
+    const dots = wrapper.findAll('[data-test="rail-dot"]');
+    await dots[0].trigger('mouseenter');
+    expect(wrapper.find('[data-test="rail-tip"]').text()).toBe('帮我查一下库存');
+    await dots[1].trigger('mouseenter');
+    expect(wrapper.find('[data-test="rail-tip"]').text()).toBe('好的谢谢');
+  });
+
+  it('消息过长时截断显示，不加完整内容', async () => {
+    const long = 'x'.repeat(150);
+    const els = [makeEl(100, 40, long)];
+    const wrapper = mount(MessageNavRail, {
+      props: {
+        getScrollEl: () => makeScrollEl(),
+        getUserMsgElements: () => els,
+      },
+      global: { stubs: { teleport: true } },
+    });
+    await nextTick();
+
+    await wrapper.find('[data-test="rail-dot"]').trigger('mouseenter');
+    const tip = wrapper.find('[data-test="rail-tip"]').text();
+    expect(tip).toBe(`${'x'.repeat(100)}…`);
+    expect(tip.length).toBeLessThan(long.length);
+  });
+
+  it('纯图片消息（无文字）退回索引标签', async () => {
+    const els = [makeEl(100, 40, '')];
+    const wrapper = mount(MessageNavRail, {
+      props: {
+        getScrollEl: () => makeScrollEl(),
+        getUserMsgElements: () => els,
+      },
+      global: { stubs: { teleport: true } },
+    });
+    await nextTick();
+
+    await wrapper.find('[data-test="rail-dot"]').trigger('mouseenter');
+    expect(wrapper.find('[data-test="rail-tip"]').text()).toBe('跳转到第 1 条我的消息');
   });
 
   it('点击红点滚动到对应消息', async () => {
