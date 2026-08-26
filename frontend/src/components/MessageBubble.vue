@@ -46,8 +46,8 @@
           </FoldCard>
         </div>
 
-        <!-- Markdown 文本内容 -->
-        <div v-if="msg.content && msg.content.trim()" class="md-body" v-html="renderMarkdown(msg.content)"></div>
+        <!-- Markdown 文本内容（代码块复制按钮通过事件委托处理点击） -->
+        <div v-if="msg.content && msg.content.trim()" class="md-body" v-html="renderMarkdown(msg.content)" @click="onMdBodyClick"></div>
 
         <!-- 工具执行时间线（含绑定/未绑定的文件变更 Diff） -->
         <ToolExecutionTrace
@@ -143,6 +143,44 @@ const thinkingOpen = computed({
   get: () => (localThinkOverride.value !== null ? localThinkOverride.value : store.showThinking),
   set: (v: boolean) => { localThinkOverride.value = v; },
 });
+
+// 复制文本到剪贴板：优先 Clipboard API，失败回退 execCommand（pywebview/旧内核兼容）
+async function copyToClipboard(text: string): Promise<void> {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+}
+
+// Markdown 代码块复制按钮：事件委托，命中 .code-copy 时复制同级 <code> 内容
+function onMdBodyClick(e: MouseEvent) {
+  const btn = (e.target as HTMLElement).closest('.code-copy');
+  if (!btn) return;
+  const code = btn.closest('.code-block')?.querySelector('code');
+  if (!code) return;
+  const text = code.textContent || '';
+  copyToClipboard(text)
+    .then(() => {
+      const original = btn.textContent;
+      btn.textContent = '已复制';
+      btn.classList.add('copied');
+      window.setTimeout(() => {
+        btn.textContent = original;
+        btn.classList.remove('copied');
+      }, 1500);
+    })
+    .catch(() => {
+      // 复制失败保持原样，不额外提示
+    });
+}
 </script>
 
 <style scoped>

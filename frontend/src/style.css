@@ -666,6 +666,37 @@ button {
   padding: 0;
   color: var(--text);
 }
+/* 代码块复制按钮：容器定位 + 悬停浮现 */
+.md-body .code-block {
+  position: relative;
+  margin: 10px 0;
+}
+.md-body .code-block pre {
+  margin: 0;
+}
+.md-body .code-copy {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  padding: 3px 10px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s;
+  z-index: 1;
+}
+.md-body .code-block:hover .code-copy,
+.md-body .code-copy.copied {
+  opacity: 1;
+}
+.md-body .code-copy:hover {
+  color: var(--text-bright);
+}
 .md-body ul,
 .md-body ol {
   padding-left: 22px;
