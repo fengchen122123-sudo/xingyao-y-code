@@ -383,7 +383,12 @@ export const useAppStore = defineStore('app', {
     initialized: false,
 
     // 侧栏与面板开合状态
-    sidebarCollapsed: false,
+    // 移动端（<=768px）默认收起侧栏：侧栏作为 fixed 覆盖层，展开时滑入，
+    // 避免在手机上初始加载即被侧栏遮挡主对话区。
+    sidebarCollapsed:
+      typeof window !== 'undefined' &&
+      typeof window.matchMedia === 'function' &&
+      window.matchMedia('(max-width: 768px)').matches,
     rightPanelCollapsed: false,
     themeLight: false,
     guiTheme: null as GuiTheme | null,
