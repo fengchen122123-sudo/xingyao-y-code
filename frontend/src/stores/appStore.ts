@@ -296,6 +296,7 @@ export const useAppStore = defineStore('app', {
       command_shell_options: [],
       command_shell_available: true,
       command_shell_error: '',
+      remote_token_ttl: 86400,
     } as SystemSettingsSnapshot,
 
     // 当前激活模型的思考能力与选择；未知模型保持隐藏，不在前端猜测能力。
@@ -1382,6 +1383,27 @@ export const useAppStore = defineStore('app', {
         this.systemSettings = previous;
         this.connected = false;
         this.notifyModal('系统设置', '命令解释器设置失败: ' + err);
+        return false;
+      }
+    },
+
+    async setRemoteTokenTtl(seconds: number): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_remote_token_ttl(seconds);
+        if (result && result.ok) {
+          this.systemSettings = result.settings;
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', '远程控制 token 过期时间设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', '远程控制 token 过期时间设置失败: ' + err);
         return false;
       }
     },
