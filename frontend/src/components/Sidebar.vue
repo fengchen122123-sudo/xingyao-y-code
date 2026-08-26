@@ -124,6 +124,29 @@
       <button data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
         <span>⚙</span><span class="footer-copy"><b>设置</b></span>
       </button>
+      <button class="phone-btn" data-test="remote-bind-button" title="手机远程控制" @click="openRemoteBind()">
+        <AppIcon name="smartphone" :size="16" />
+      </button>
+    </div>
+  </div>
+
+  <div v-if="remoteBind" class="modal-mask" data-test="remote-bind-modal" @click.self="closeRemoteBind()">
+    <div class="modal">
+      <div class="modal-head">
+        <div class="mh-ico"><AppIcon name="smartphone" :size="18" /></div>
+        <div>
+          <h3>手机远程控制</h3>
+          <p>用手机扫码即可作为第二个前端控制本机</p>
+        </div>
+      </div>
+      <div class="modal-body">
+        <img class="qr-img" :src="remoteBind.qr" alt="绑定二维码" />
+        <div class="bind-url">{{ remoteBind.url }}</div>
+        <div class="bind-hint">链接有效期：{{ formatExpiry(remoteBind.expires_in) }}，请在过期前扫码</div>
+      </div>
+      <div class="modal-foot">
+        <button class="btn primary" data-test="remote-bind-close" @click="closeRemoteBind()">关闭</button>
+      </div>
     </div>
   </div>
 </template>
@@ -142,6 +165,8 @@ const expandedGroups = ref<Record<string, boolean>>({});
 const confirmDeleteName = ref('');
 // 正在等待二次确认删除的项目分组路径
 const confirmDeleteGroupPath = ref('');
+// 手机远程控制绑定信息（点击手机图标后弹出二维码）
+const remoteBind = ref<null | { url: string; qr: string; expires_in: number }>(null);
 
 function askDeleteGroup(path: string) {
   confirmDeleteGroupPath.value = path;
@@ -224,6 +249,45 @@ async function openFolder(path: string) {
   } catch (err) {
     store.notifyModal('打开目录失败', String(err));
   }
+}
+
+// 打开手机远程控制绑定弹窗：向后端请求二维码与配对链接
+async function openRemoteBind() {
+  const api = window.pywebview && window.pywebview.api;
+  if (!api) {
+    store.notifyModal('手机远程控制', '后端连接失败：pywebview API 不可用');
+    return;
+  }
+  try {
+    // get_remote_bind_qr 为后端桥接方法，前端类型契约尚未收录，故此处按返回结构取用
+    const result = await (api as any).get_remote_bind_qr();
+    if (result && result.ok && result.qr && result.url) {
+      remoteBind.value = {
+        url: result.url,
+        qr: result.qr,
+        expires_in: result.expires_in ?? 0,
+      };
+    } else {
+      store.notifyModal('手机远程控制', (result && result.msg) || '获取绑定二维码失败');
+    }
+  } catch (err) {
+    store.notifyModal('手机远程控制', String(err));
+  }
+}
+
+function closeRemoteBind() {
+  remoteBind.value = null;
+}
+
+// 将 expires_in（秒）转成友好文案；0 表示永久有效
+function formatExpiry(seconds: number): string {
+  if (!seconds || seconds <= 0) return '永久有效';
+  if (seconds < 60) return `${seconds} 秒`;
+  const min = Math.floor(seconds / 60);
+  if (min < 60) return `${min} 分钟`;
+  const hour = Math.floor(min / 60);
+  if (hour < 24) return `${hour} 小时`;
+  return `${Math.floor(hour / 24)} 天`;
 }
 
 // 状态提醒点 hover 文案
@@ -545,6 +609,7 @@ function getFolderTitle(g: SessionGroup) {
   padding: 7px;
   border-top: 1px solid var(--border);
   display: grid;
+  grid-template-columns: 1fr auto;
   gap: 3px;
 }
 .side-footer button {
@@ -563,6 +628,113 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--text);
   background: var(--bg2);
 }
+/* 手机远程控制入口：与设置按钮同行右侧的小方形图标按钮 */
+.side-footer .phone-btn {
+  width: 32px;
+  justify-content: center;
+  padding: 7px;
+  gap: 0;
+}
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }
 .footer-copy b { font-size: 12.5px; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* 手机远程控制绑定弹窗（结构参照 ConfirmModal 的 modal-mask 风格） */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  backdrop-filter: blur(2px);
+}
+.modal {
+  width: 380px;
+  background: var(--bg1);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  overflow: hidden;
+  animation: remote-pop 0.2s;
+}
+@keyframes remote-pop {
+  from { transform: scale(0.95); opacity: 0; }
+  to { transform: none; opacity: 1; }
+}
+.modal-head {
+  padding: 14px 18px;
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.modal-head .mh-ico {
+  width: 32px;
+  height: 32px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+.modal-head h3 {
+  font-size: 14.5px;
+}
+.modal-head p {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+.modal-body {
+  padding: 18px;
+  background: var(--bg2);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.qr-img {
+  width: 200px;
+  height: 200px;
+  border-radius: 10px;
+  background: #fff;
+  padding: 6px;
+}
+.bind-url {
+  font-size: 12px;
+  color: var(--text-dim);
+  word-break: break-all;
+  text-align: center;
+  max-width: 100%;
+}
+.bind-hint {
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.modal-foot {
+  padding: 13px 18px;
+  display: flex;
+  gap: 9px;
+  justify-content: flex-end;
+}
+.btn {
+  border-radius: 8px;
+  padding: 7px 16px;
+  font-size: 13px;
+  border: 1px solid var(--border);
+  background: var(--bg3);
+  color: var(--text);
+  transition: 0.15s;
+}
+.btn:hover {
+  border-color: var(--text-faint);
+}
+.btn.primary {
+  background: var(--accent);
+  border: none;
+  color: #fff;
+  font-weight: 600;
+}
 </style>
