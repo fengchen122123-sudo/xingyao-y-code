@@ -17,6 +17,7 @@ describe('SystemSettings', () => {
       command_shell: 'powershell',
       command_shell_available: true,
       command_shell_error: '',
+      remote_token_ttl: 86400,
       command_shell_options: [
         {
           id: 'pwsh', label: 'PowerShell 7+', description: '现代 PowerShell',
@@ -45,6 +46,7 @@ describe('SystemSettings', () => {
       command_shell: 'auto',
       command_shell_available: true,
       command_shell_error: '',
+      remote_token_ttl: 86400,
       command_shell_options: [
         {
           id: 'auto', label: '自动（系统默认）', description: '兼容旧行为',
@@ -62,5 +64,25 @@ describe('SystemSettings', () => {
     await wrapper.get<HTMLSelectElement>('[data-test="command-shell-select"]').setValue('cmd');
 
     expect(save).toHaveBeenCalledWith('cmd');
+  });
+
+  it('renders the remote token ttl select and saves the chosen value', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setRemoteTokenTtl').mockResolvedValue(true);
+    const wrapper = mount(SystemSettings);
+
+    const select = wrapper.get<HTMLSelectElement>('[data-test="remote-token-ttl-select"]');
+    expect(select.element.value).toBe('86400');
+
+    await select.setValue('604800');
+
+    expect(save).toHaveBeenCalledWith(604800);
   });
 });
