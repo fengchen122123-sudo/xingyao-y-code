@@ -1,6 +1,6 @@
-import { mount } from '@vue/test-utils';
+import { mount, flushPromises } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import MessageBubble from './MessageBubble.vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import type { ToolExecutionCall } from '../utils/toolTrace';
@@ -108,6 +108,30 @@ describe('MessageBubble', () => {
     const trace = wrapper.get('.exec-trace');
     expect(trace.text()).toContain('运行命令');
     expect(trace.text()).toContain('未绑定的历史文件变更');
+    wrapper.unmount();
+  });
+
+  it('用户消息下方操作栏有复制按钮，点击复制消息文本', async () => {
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'user', content: '帮我查一下库存' } },
+    });
+
+    const btn = wrapper.find('[data-test="user-copy-btn"]');
+    expect(btn.exists()).toBe(true);
+    await btn.trigger('click');
+    await flushPromises();
+    expect(writeText).toHaveBeenCalledWith('帮我查一下库存');
+    wrapper.unmount();
+  });
+
+  it('纯图片消息（无文本）不显示复制按钮', () => {
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'user', images: ['data:image/png;base64,xxx'] } },
+    });
+    expect(wrapper.find('[data-test="user-copy-btn"]').exists()).toBe(false);
     wrapper.unmount();
   });
 });

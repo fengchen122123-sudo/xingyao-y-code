@@ -1,4 +1,4 @@
-import { mount } from '@vue/test-utils';
+import { mount, flushPromises } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
 import InputArea from './InputArea.vue';
@@ -75,5 +75,30 @@ it('运行中输入为空时按钮为停止态，点击中断当前回合', asyn
   expect(btn.attributes('title')).toContain('停止');
   await btn.trigger('click');
   expect(stopSpy).toHaveBeenCalled();
+  wrapper.unmount();
+});
+
+it('点击撤销按钮把排队消息文本和附件恢复到输入框并取消排队', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-b';
+  store.messageQueues['session-b'] = [
+    { id: 'q1', text: '要撤销的消息', attachments: ['d:/a.png', 'd:/b.txt'] },
+  ];
+  const cancelSpy = vi.spyOn(store, 'cancelQueuedMessage').mockResolvedValue(undefined);
+  store.getFilesInfo = vi.fn(async (paths: string[]) =>
+    paths.map(p => ({ path: p, name: p.split(/[\\/]/).pop()!, ext: 'txt', size: 1, ok: true })));
+
+  const wrapper = mount(InputArea);
+  const undoBtn = wrapper.find('[data-test="queue-undo-btn"]');
+  expect(undoBtn.exists()).toBe(true);
+  await undoBtn.trigger('click');
+  await flushPromises();
+
+  // 文本回到输入框
+  expect(wrapper.get('textarea').element.value).toBe('要撤销的消息');
+  // 从队列移除（复用取消排队）
+  expect(cancelSpy).toHaveBeenCalledWith('session-b', 'q1');
+  // 附件（图片+文件）一并回到输入框
+  expect(wrapper.findAll('.attach-chip')).toHaveLength(2);
   wrapper.unmount();
 });

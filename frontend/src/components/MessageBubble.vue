@@ -1,33 +1,48 @@
 <template>
   <div class="msg" :class="msg.role === 'user' ? 'msg-user' : msg.role === 'error' ? 'msg-error' : msg.role === 'notice' ? 'msg-notice' : 'msg-assistant'">
-    <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大） -->
-    <div v-if="msg.role === 'user'" class="bubble user-bubble">
-      <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
-      <div
-        v-if="msg.images && msg.images.length"
-        class="img-grid"
-        :class="{ single: msg.images.length === 1, duo: msg.images.length === 2 }"
-      >
-        <img
-          v-for="(img, i) in msg.images"
-          :key="i"
-          :src="img"
-          class="msg-img"
-          alt="用户发送的图片"
-          @click="store.openLightbox(msg.images!, i)"
-        >
-      </div>
-      <div
-        v-if="msg.attachment_notes && msg.attachment_notes.length"
-        class="attachment-notes"
-      >
+    <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大）；气泡下方悬停浮现操作栏 -->
+    <template v-if="msg.role === 'user'">
+      <div class="bubble user-bubble">
+        <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
         <div
-          v-for="(note, i) in msg.attachment_notes"
-          :key="i"
-          class="attachment-note"
-        >{{ note }}</div>
+          v-if="msg.images && msg.images.length"
+          class="img-grid"
+          :class="{ single: msg.images.length === 1, duo: msg.images.length === 2 }"
+        >
+          <img
+            v-for="(img, i) in msg.images"
+            :key="i"
+            :src="img"
+            class="msg-img"
+            alt="用户发送的图片"
+            @click="store.openLightbox(msg.images!, i)"
+          >
+        </div>
+        <div
+          v-if="msg.attachment_notes && msg.attachment_notes.length"
+          class="attachment-notes"
+        >
+          <div
+            v-for="(note, i) in msg.attachment_notes"
+            :key="i"
+            class="attachment-note"
+          >{{ note }}</div>
+        </div>
       </div>
-    </div>
+      <!-- 用户消息操作栏：气泡下方，悬停气泡时浮现，点击复制本条消息文本 -->
+      <div v-if="msg.content" class="user-action-bar">
+        <button
+          class="msg-copy-btn"
+          :class="{ copied: userCopied }"
+          :title="userCopied ? '已复制' : '复制消息'"
+          data-test="user-copy-btn"
+          @click="copyUserMessage"
+        >
+          <AppIcon name="copy" :size="13" :stroke-width="2" />
+          <span>{{ userCopied ? '已复制' : '复制' }}</span>
+        </button>
+      </div>
+    </template>
 
     <!-- 助手消息（无头像图标，仅显示“星瑶”名称） -->
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
@@ -106,6 +121,9 @@ const props = defineProps<{
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
 // 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。
 const store = useAppStore();
+// 用户消息复制按钮的「已复制」反馈状态与定时器
+const userCopied = ref(false);
+let userCopiedTimer: number | undefined;
 const showWorking = computed(() => {
   if (props.msg.role !== 'assistant' || !store.running) return false;
   const msgs = store.messages;
@@ -134,6 +152,7 @@ watch(showWorking, (v) => {
 }, { immediate: true });
 onUnmounted(() => {
   if (elapsedTimer) window.clearInterval(elapsedTimer);
+  if (userCopiedTimer) window.clearTimeout(userCopiedTimer);
 });
 
 // 思考块默认跟随全局 store.showThinking；用户在本条消息上手动切换过一次后，
@@ -181,6 +200,16 @@ function onMdBodyClick(e: MouseEvent) {
       // 复制失败保持原样，不额外提示
     });
 }
+
+// 用户消息复制：点击复制按钮把本条消息文本写入剪贴板，按钮短暂显示「已复制」
+async function copyUserMessage() {
+  const text = props.msg.content || '';
+  if (!text) return;
+  await copyToClipboard(text);
+  userCopied.value = true;
+  if (userCopiedTimer) window.clearTimeout(userCopiedTimer);
+  userCopiedTimer = window.setTimeout(() => { userCopied.value = false; }, 1500);
+}
 </script>
 
 <style scoped>
@@ -190,7 +219,8 @@ function onMdBodyClick(e: MouseEvent) {
 }
 .msg-user {
   display: flex;
-  justify-content: flex-end;
+  flex-direction: column;
+  align-items: flex-end;
 }
 .msg-user .bubble {
   background: var(--bg2);
@@ -256,6 +286,34 @@ function onMdBodyClick(e: MouseEvent) {
 }
 .attachment-note + .attachment-note {
   margin-top: 2px;
+}
+/* 用户消息操作栏：气泡下方一行，悬停气泡时浮现（时间戳后续补充） */
+.user-action-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.msg-user:hover .user-action-bar {
+  opacity: 1;
+}
+.msg-copy-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--text-faint);
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.msg-copy-btn:hover {
+  color: var(--text-bright);
 }
 
 .avatar-row {
