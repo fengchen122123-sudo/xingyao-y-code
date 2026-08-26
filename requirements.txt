@@ -13,6 +13,8 @@ pywebview>=6.0.0
 pillow>=10.0.0
 pystray>=0.19.5
 keyring>=25.0.0; sys_platform != "win32"
+websockets>=12.0
+qrcode>=7.4
 
 # Development / test dependencies
 pytest>=7.0.0
