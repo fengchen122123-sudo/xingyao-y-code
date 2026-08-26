@@ -134,4 +134,44 @@ describe('MessageBubble', () => {
     expect(wrapper.find('[data-test="user-copy-btn"]').exists()).toBe(false);
     wrapper.unmount();
   });
+
+  it('点击本地文件链接用绝对路径打开内嵌预览', async () => {
+    const store = useAppStore();
+    store.workdir = 'D:\\proj';
+    const readFilePreview = vi.fn().mockResolvedValue({ ok: true, content: 'hello', truncated: false, path: 'D:\\proj\\docs\\foo.md' });
+    (window as any).pywebview = { api: { read_file_preview: readFilePreview } };
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: assistantMessage({ content: '见 docs/foo.md 文件' }) },
+    });
+
+    const link = wrapper.find('a[data-file-link]');
+    expect(link.exists()).toBe(true);
+    await link.trigger('click');
+    await flushPromises();
+
+    expect(readFilePreview).toHaveBeenCalledWith('D:\\proj\\docs\\foo.md');
+    wrapper.unmount();
+    delete (window as any).pywebview;
+  });
+
+  it('相对路径且未绑定工作目录时提示，不发起预览', async () => {
+    const store = useAppStore();
+    store.workdir = '';
+    const readFilePreview = vi.fn();
+    (window as any).pywebview = { api: { read_file_preview: readFilePreview } };
+    const notify = vi.spyOn(store, 'notifyModal').mockImplementation(() => {});
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: assistantMessage({ content: 'docs/foo.md' }) },
+    });
+
+    await wrapper.find('a[data-file-link]').trigger('click');
+    await flushPromises();
+
+    expect(notify).toHaveBeenCalled();
+    expect(readFilePreview).not.toHaveBeenCalled();
+    wrapper.unmount();
+    delete (window as any).pywebview;
+  });
 });
