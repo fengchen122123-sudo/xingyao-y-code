@@ -2275,7 +2275,7 @@ def test_nonpersistent_vision_turn_does_not_replace_database_content(
 
 
 @pytest.mark.parametrize("reasoning", [None, 123])
-def test_deepseek_thinking_requires_reasoning_content_string_field(
+def test_deepseek_thinking_backfills_reasoning_content_string_field(
     monkeypatch, reasoning
 ):
     import core.llm as llm_mod
@@ -2292,12 +2292,13 @@ def test_deepseek_thinking_requires_reasoning_content_string_field(
         {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "x"},
     ]
 
-    with pytest.raises(ValueError, match="reasoning_content"):
-        llm_mod._strip_media_and_merge(
-            messages,
-            "openai/deepseek-v4-pro",
-            "https://api.deepseek.com",
-        )
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/deepseek-v4-pro",
+        "https://api.deepseek.com",
+    )
+
+    assert fixed[0]["reasoning_content"] == ""
 
 
 def test_deepseek_thinking_tool_call_without_reasoning_replays_empty_key(
