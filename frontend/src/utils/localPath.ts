@@ -19,7 +19,7 @@ function isKnownExtension(s: string): boolean {
   return KNOWN_EXTENSIONS.has(extOf(s));
 }
 
-export function isLocalFileLink(url: string): boolean {
+export function isLocalFileLink(url: string, opts?: { allowBareFilename?: boolean }): boolean {
   const s = url.trim();
   if (!s) return false;
   // 含空白 / HTML 特殊字符 / 反引号的字符串一律不算路径（防注入 + 防误判）
@@ -30,9 +30,12 @@ export function isLocalFileLink(url: string): boolean {
   if (/^[A-Za-z]:[\\/]/.test(s)) return true; // 盘符
   if (s.startsWith('./') || s.startsWith('../')) return true;
   if (s.startsWith('/') && s.length > 1 && !s.startsWith('//')) return true; // Unix 绝对路径
-  // 已知扩展名结尾（含分隔符的相对路径或纯文件名，如 docs/foo.md、README.md、
-  // 2026-08-26.md）。"1.2.3" 的尾段 '3' 不在白名单，已被 isKnownExtension 排除。
-  if (isKnownExtension(s)) return true;
+  if (/[\\/]/.test(s) && isKnownExtension(s)) return true; // 含分隔符 + 已知扩展名
+  // 纯文件名（无分隔符）：仅当允许裸文件名时才识别。反引号内是明确的代码/字面量
+  // 语境，纯文件名（如 pom.xml）更可能是字面量，不识别为链接。
+  if (!/[\\/]/.test(s) && isKnownExtension(s)) {
+    return opts?.allowBareFilename !== false;
+  }
   return false;
 }
 

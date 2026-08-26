@@ -33,6 +33,10 @@ describe('isLocalFileLink', () => {
     expect(isLocalFileLink('hello world.md')).toBe(false);
     expect(isLocalFileLink('<img src=x.md>')).toBe(false);
   });
+  it('allowBareFilename=false 时不识别纯文件名，但仍识别含分隔符的路径', () => {
+    expect(isLocalFileLink('pom.xml', { allowBareFilename: false })).toBe(false);
+    expect(isLocalFileLink('docs/foo.md', { allowBareFilename: false })).toBe(true);
+  });
 });
 
 describe('toAbsoluteLocalPath', () => {
