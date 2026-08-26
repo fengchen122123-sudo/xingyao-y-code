@@ -5,6 +5,8 @@
 // 这样即使模型输出包含 <img onerror=...> 之类的内容，也只会被当作纯文本显示，
 // 不会被 v-html 当作可执行的 HTML/JS 处理。
 
+import { isLocalFileLink } from './localPath';
+
 function escapeHtml(text: string): string {
   return text
     .replace(/&/g, '&amp;')
@@ -25,6 +27,12 @@ export function sanitizeHref(href: string): string {
   return '#';
 }
 
+// 本地文件路径链接：href 用 # 阻止默认跳转，真实路径放 data-file-link 属性，
+// 由 MessageBubble 的点击委托捕获后走内嵌预览。
+function fileLinkHtml(path: string): string {
+  return `<a href="#" data-file-link="${escapeHtml(path)}" data-file-local="1">${escapeHtml(path)}</a>`;
+}
+
 export function renderMarkdown(md: string): string {
   if (!md) return '';
   let text = md;
@@ -36,6 +44,8 @@ export function renderMarkdown(md: string): string {
 
   // 1. 保护代码块 ```code```（块内容单独转义后直接生成安全 HTML 片段）
   const codeBlocks: string[] = [];
+  const fileLinks: string[] = [];
+  const links: string[] = [];
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
     const idx = codeBlocks.length;
     const escaped = escapeHtml(code);
@@ -43,33 +53,53 @@ export function renderMarkdown(md: string): string {
     return `${PH}CB${idx}${PH}`;
   });
 
-  // 2. 保护行内代码 `code`
+  // 2. 行内代码：反引号内若是本地文件路径则渲染为可点击链接，否则保持 <code>
   const inlineCodes: string[] = [];
   text = text.replace(/`([^`]+)`/g, (_, code) => {
+    if (isLocalFileLink(code, { allowBareFilename: false })) {
+      const idx = fileLinks.length;
+      fileLinks.push(fileLinkHtml(code));
+      return `${PH}FL${idx}${PH}`;
+    }
     const idx = inlineCodes.length;
-    const escaped = escapeHtml(code);
-    inlineCodes.push(`<code>${escaped}</code>`);
+    inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
     return `${PH}IC${idx}${PH}`;
   });
 
-  // 3. 关键修复：转义剩余的全部文本，再叠加标记。
+  // 3. 显式链接 [label](url)：本地文件路径 → 可点击预览；否则走 http/https/mailto 白名单
+  text = text.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, label, url) => {
+    const idx = links.length;
+    if (isLocalFileLink(url)) {
+      links.push(`<a href="#" data-file-link="${escapeHtml(url)}" data-file-local="1">${escapeHtml(label)}</a>`);
+    } else {
+      const safeHref = sanitizeHref(url);
+      links.push(`<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${escapeHtml(label)}</a>`);
+    }
+    return `${PH}L${idx}${PH}`;
+  });
+
+  // 4. 裸路径识别：此时代码块/行内代码/显式链接均已占位，只在剩余纯文本上匹配，
+  //    命中后用 isLocalFileLink 二次过滤（正则尾段会匹配到 1.2 / foo.bar 等，靠白名单排除）
+  const LOCAL_PATH_RE = /(?:file:\/\/[^\s<>"'`()]+|[A-Za-z]:[\\/][^\s<>"'`()]+|\.{1,2}[\\/][^\s<>"'`()]+|[^\s<>"'`()]+[\\/][^\s<>"'`()]*\.[A-Za-z0-9]+|[A-Za-z0-9_\-]+\.[A-Za-z0-9]+)/g;
+  text = text.replace(LOCAL_PATH_RE, (m) => {
+    if (!isLocalFileLink(m)) return m;
+    const idx = fileLinks.length;
+    fileLinks.push(fileLinkHtml(m));
+    return `${PH}FL${idx}${PH}`;
+  });
+
+  // 5. 关键修复：转义剩余的全部文本，再叠加标记。
   //    此步之后，文本中原有的 <, >, &, ", ' 均已变为安全实体，
   //    后续所有正则只会在“已转义”的文本上叠加真正的标签。
   text = escapeHtml(text);
 
-  // 4. 标题（# / ## / ###，井号不会被转义，故可在转义后继续匹配）
+  // 6. 标题（# / ## / ###，井号不会被转义，故可在转义后继续匹配）
   text = text.replace(/^### (.*)$/gim, '<h4>$1</h4>');
   text = text.replace(/^## (.*)$/gim, '<h3>$1</h3>');
   text = text.replace(/^# (.*)$/gim, '<h2>$1</h2>');
 
-  // 4.5 分割线 --- 或 ***
+  // 6.5 分割线 --- 或 ***
   text = text.replace(/^(?:---|\*\*\*)$/gim, '<hr>');
-
-  // 5. 链接 [text](url) —— href 经 sanitizeHref 白名单过滤
-  text = text.replace(/\[([^\]]*)\]\(([^)\s]+)\)/g, (_m, label, url) => {
-    const safeHref = sanitizeHref(url);
-    return `<a href="${safeHref}" target="_blank" rel="noopener noreferrer">${label}</a>`;
-  });
 
   // 6. 粗体、斜体
   text = text.replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>');
@@ -167,6 +197,12 @@ export function renderMarkdown(md: string): string {
   });
   inlineCodes.forEach((ic, idx) => {
     html = html.replace(`${PH}IC${idx}${PH}`, () => ic);
+  });
+  fileLinks.forEach((fl, idx) => {
+    html = html.replace(`${PH}FL${idx}${PH}`, () => fl);
+  });
+  links.forEach((l, idx) => {
+    html = html.replace(`${PH}L${idx}${PH}`, () => l);
   });
 
   return html;
