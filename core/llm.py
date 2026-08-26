@@ -2833,6 +2833,11 @@ def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=Fa
         }
     elif strategy == "enable_thinking_toggle":
         result.setdefault("extra_body", {})["enable_thinking"] = choice == "on"
+    elif strategy == "agnes_enable_thinking":
+        # Agnes AI 的 OpenAI 兼容接口把思考开关嵌套在 chat_template_kwargs 下。
+        result.setdefault("extra_body", {}).setdefault(
+            "chat_template_kwargs", {}
+        )["enable_thinking"] = choice == "on"
     else:
         raise ValueError(f"未实现的思考请求策略: {strategy}")
     return capability

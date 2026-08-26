@@ -36,6 +36,11 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "glm-5.1": ("default", "off", "on"),
         "MiniMax-M3": ("default", "off", "on"),
         "LongCat-2.0": ("default", "off", "on"),
+        "step-3.7-flash": ("default", "low", "medium", "high"),
+        "step-router-v1": ("default", "low", "medium", "high"),
+        "agnes-2.0-flash": ("default", "off", "on"),
+        "agnes-2.5-flash": ("default", "off", "on"),
+        "hy3": ("default", "off", "on"),
     }
 
     for model_name, options in expected.items():
@@ -62,12 +67,8 @@ def test_fixed_models_are_visible_locked_on_and_unknown_models_are_hidden():
 
     for model_name in (
         "deepseek-v4-flash-vision-exp",
-        "agnes-2.0-flash",
-        "agnes-2.5-flash",
         "sensenova-6.7-flash-lite",
-        "step-3.7-flash",
         "step-explore",
-        "step-router-v1",
         "doubao-seed-evolving",
         "ark-code-latest",
         "some-future-model",
