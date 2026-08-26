@@ -74,6 +74,14 @@ _register(
         "effort", ("default", "off", "high", "max"), "thinking_object_effort"
     ),
 )
+# GLM-5.3 强制思考：不支持关闭（thinking.type 传 disabled 会报错），
+# reasoning_effort 仅支持 low/high/max。
+_register(
+    ("glm-5.3",),
+    ReasoningCapability(
+        "effort", ("default", "low", "high", "max"), "thinking_object_effort"
+    ),
+)
 _register(
     ("seed-2.1-turbo", "seed-2.1-pro", "doubao-seed-2.0-code"),
     ReasoningCapability(
