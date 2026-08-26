@@ -154,6 +154,10 @@ GUI_DB_FILE = os.path.join(YCODE_DIR, "ycode_gui.db")
 ACTIVE_SKILLS_FILE = os.path.join(YCODE_DIR, "active_skills.json")
 MCP_FILE = os.path.join(YCODE_DIR, "mcp.json")
 
+# 局域网手机远程控制的配对 token 过期时间（秒）
+REMOTE_TOKEN_TTL_KEY = "remote_token_ttl"
+REMOTE_TOKEN_TTL_DEFAULT = 86400
+
 # 自动从当前源码目录初始化默认配置文件
 if not os.path.exists(_CONFIG_FILE):
     default_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")

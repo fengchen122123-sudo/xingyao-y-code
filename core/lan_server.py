@@ -7,6 +7,8 @@
 事件广播总线见 ``broadcast``；手机通过 ``ALLOWED_METHODS`` 白名单调用 bridge。
 """
 
+import base64
+import io
 import json
 import mimetypes
 import os
@@ -14,6 +16,8 @@ import secrets
 import socket
 import threading
 import time
+
+import qrcode
 from http import HTTPStatus
 from typing import Any, Dict, Optional
 
@@ -91,6 +95,26 @@ class LanServer:
         self._token = secrets.token_urlsafe(24).encode()
         self._token_expires = time.time() + self._ttl
         return self._token.decode()
+
+    def set_ttl(self, seconds: int) -> None:
+        """更新配对 token 的有效期（秒）。"""
+        self._ttl = int(seconds)
+
+    def get_bind_info(self) -> Dict:
+        """签发 token 并生成二维码，返回手机扫码绑定所需信息。"""
+        token = self._issue_token()
+        url = self.bind_url(token)
+        img = qrcode.make(url)
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        qr_b64 = base64.b64encode(buf.getvalue()).decode()
+        return {
+            "ok": True,
+            "url": url,
+            "token": token,
+            "qr": f"data:image/png;base64,{qr_b64}",
+            "expires_in": self._ttl,
+        }
 
     # ------------------------------------------------------------------ #
     # 事件广播
