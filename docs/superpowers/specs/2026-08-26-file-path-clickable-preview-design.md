@@ -1,7 +1,7 @@
 # 回复正文文件路径可点击（内嵌预览）设计
 
 日期：2026-08-26
-状态：已确认，待实现
+状态：已实现（2026-08-26）
 
 ## 1. 背景与目标
 
@@ -51,11 +51,12 @@ AI 输出 "docs/foo.md"
 
 **新增路径识别工具：**
 
-- `isLocalFileLink(url: string): boolean` —— 判断一个链接 URL 是否为本地文件路径形态。
+- `isLocalFileLink(url: string, opts?: { allowBareFilename?: boolean }): boolean` —— 判断一个链接 URL 是否为本地文件路径形态。该工具实现在 `frontend/src/utils/localPath.ts`（非 markdown.ts 内联）。
 - 本地路径判定规则（分层，命中任一即视为本地路径）：
   1. 结构锚点：`file://` 前缀、Windows 盘符 `^[A-Za-z]:[\\/]`、`./`、`../` 前缀、`^/` 开头（在链接括号上下文）。
-  2. 路径形态 + 已知扩展名：`[A-Za-z0-9_\-./\\]+\.ext`，`ext` ∈ 已知文本文件扩展名白名单，且 token 含 `/` 或 `\`。
-  3. 纯文件名（无分隔符）但以已知扩展名结尾：识别，但需额外排除 `数字.数字.数字` 之类的版本号形态。
+  2. 路径形态 + 已知扩展名：含 `/` 或 `\` 且以白名单扩展名结尾。
+  3. 纯文件名（无分隔符）但以已知扩展名结尾：默认识别；传 `allowBareFilename: false` 时不识别（反引号是代码/字面量语境，纯文件名如 `pom.xml` 更可能是字面量，保持 `<code>`）。
+- 含空白或 `< > " ' \`` ` 的字符串一律不算路径（防注入 + 防误判）；带 scheme 的 URL（http/https/...）一律非本地路径。
 - 已知扩展名白名单：`.md .markdown .py .ts .tsx .js .jsx .vue .html .htm .css .scss .less .json .yml .yaml .toml .ini .cfg .conf .txt .log .csv .xml .sql .sh .bat .ps1 .c .h .cpp .hpp .java .go .rs .rb .php .kt .swift .cs .fs .m .gradle .properties .env .gitignore`。
 
 **扩展 `sanitizeHref`：**
@@ -86,15 +87,15 @@ if (link) {
 }
 ```
 
-**新增路径拼接工具（建议放 `utils/markdown.ts` 或新 `utils/localPath.ts`）：**
+**路径拼接工具 `toAbsoluteLocalPath`（实现在 `frontend/src/utils/localPath.ts`）：**
 
 ```ts
 function toAbsoluteLocalPath(raw: string, workdir: string): string | null
 ```
 
-- 已是绝对路径（盘符 / `\\server` / `^/` / `file://`）→ 归一化返回。
-- 相对路径且 `workdir` 非空 → `workdir + 分隔符 + raw`，归一化后返回。
-- 相对路径且 `workdir` 为空 → 调用 `store.notifyModal` 提示「当前会话未绑定工作目录」并返回 null。
+- 已是绝对路径（盘符 / `\\server` / `^/`）→ 原样返回；`file://` 前缀解码为本地路径（`file:///C:/x/y.md` → `C:/x/y.md`）。
+- 相对路径且 `workdir` 非空 → 逐段归一化拼到 workdir 下：跳过空段与 `.`，遇到 `..` 回退一层（不越过盘符/根）。
+- 相对路径且 `workdir` 为空 → 返回 null，由调用方（`onMdBodyClick`）`store.notifyModal` 提示「当前会话未绑定工作目录」。
 
 ### 5.3 样式
 
@@ -121,3 +122,14 @@ function toAbsoluteLocalPath(raw: string, workdir: string): string | null
 - 上述测试全部通过。
 - 手动验证：回复中输出裸路径与显式链接路径，点击均能弹出内嵌预览并显示文件内容。
 - 普通文本与代码块内的路径不被误识别。
+
+## 9. 实现记录（2026-08-26）
+
+实现已落地，相对设计有两处补充：
+
+1. **`allowBareFilename` 开关**：实现中反引号内纯文件名（如 `` `pom.xml` ``）若识别为链接，会破坏既有 `markdown-table.test.ts`「行内代码不破坏表格」的契约。故 `isLocalFileLink` 增加 `allowBareFilename` 参数，反引号场景传 `false`（不识别纯文件名），裸路径/显式链接场景默认 `true`。
+2. **相对路径归一化**：`toAbsoluteLocalPath` 改为逐段处理 `.`（跳过）与 `..`（回退一层），替代最初的简单字符串拼接，避免 `./foo.py` 拼出 `D:\proj\.\foo.py`。
+
+验证结果：
+- 本次功能相关测试全绿：`localPath` 12、`markdown-filelink` 8、`MessageBubble` 9，既有 markdown 系列无回归。
+- 全量测试 321/323 通过；另有 2 个失败来自并行功能线（局域网远程控制 / mobile responsive / remote token ttl），与本次改动无关（git 已确认本功能 3 个代码提交仅涉及 6 个文件）。
