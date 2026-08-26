@@ -137,7 +137,7 @@
       <div class="l">
         <span class="token-summary" :title="summaryTitle">{{ tokenSummary }}</span>
       </div>
-      <div class="r">
+      <div class="r keyboard-hints" data-test="keyboard-hints">
         <span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行 · <span class="kbd">Esc</span> 中断
       </div>
     </div>
@@ -524,5 +524,11 @@ textarea {
 }
 .tok-red {
   color: var(--red);
+}
+
+@media (max-width: 768px) {
+  .keyboard-hints {
+    display: none;
+  }
 }
 </style>
