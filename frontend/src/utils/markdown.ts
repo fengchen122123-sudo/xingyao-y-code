@@ -133,7 +133,12 @@ export function renderMarkdown(md: string): string {
       if (mode !== 'ul') { closeMode(); resultLines.push('<ul>'); mode = 'ul'; }
       resultLines.push(`<li>${ulMatch[3]}</li>`);
     } else if (olMatch) {
-      if (mode !== 'ol') { closeMode(); resultLines.push('<ol>'); mode = 'ol'; }
+      if (mode !== 'ol') {
+        closeMode();
+        const num = parseInt(olMatch[2], 10);
+        resultLines.push(`<ol start="${num}">`);
+        mode = 'ol';
+      }
       resultLines.push(`<li>${olMatch[3]}</li>`);
     } else if (bqMatch) {
       if (mode !== 'bq') { closeMode(); resultLines.push('<blockquote>'); mode = 'bq'; }
