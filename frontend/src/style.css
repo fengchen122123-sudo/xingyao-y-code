@@ -852,3 +852,90 @@ body.light .fp-pre .hljs-selector-class,
 body.light .fp-pre .hljs-selector-id { color: #8250df; }
 body.light .fp-pre .hljs-addition { color: #116329; }
 body.light .fp-pre .hljs-deletion { color: #82071e; }
+
+/* ============================================================================
+   移动端响应式布局（<=768px）
+   手机端通过 mobile-shim.js 加载同一套 dist 前端，此处只做布局/尺寸适配，
+   不改任何主题 CSS 变量（--accent/--border/--bg* 等），主题与桌面一致。
+   ========================================================================== */
+@media (max-width: 768px) {
+  /* 侧栏：改为 fixed 覆盖层，不占横向空间；默认收起（初始态由 appStore 按
+     视口判定），展开时从左侧滑入，收起滑出。选择器加 #main 前缀以覆盖
+     Sidebar.vue scoped 样式（scoped 为 #sidebar[data-v-hash]，特异性更高）。 */
+  #main > #sidebar {
+    position: fixed;
+    top: 48px; /* 顶栏高度 */
+    bottom: 24px; /* 状态栏高度 */
+    left: 0;
+    width: min(300px, 86vw);
+    z-index: 400;
+    margin-left: 0;
+    transform: translateX(0);
+    transition: transform 0.25s ease;
+    box-shadow: 12px 0 40px var(--theme-shadow-color);
+  }
+  #main > #sidebar.collapsed {
+    transform: translateX(-100%);
+    box-shadow: none;
+  }
+
+  /* 隐藏桌面专属控件：自绘窗口控制、标题栏拖拽区、软件更新按钮、右面板切换 */
+  #topbar .window-controls,
+  #topbar .titlebar-drag,
+  #topbar .update-topbar-btn,
+  #topbar #btn-toggle-right {
+    display: none;
+  }
+
+  /* 右面板：手机上默认隐藏（无切换入口，内容经全屏 Subpage 可达） */
+  #main > #rightbar {
+    display: none;
+  }
+
+  /* 状态栏：窄屏下横向滚动，避免多项状态信息溢出 */
+  #statusbar {
+    overflow-x: auto;
+  }
+  #statusbar .si {
+    flex-shrink: 0;
+  }
+
+  /* 触屏优化：表单控件字号 >=16px，防 iOS 聚焦时自动放大页面 */
+  textarea,
+  input,
+  select {
+    font-size: 16px !important;
+  }
+
+  /* 图标按钮 / 发送按钮 / 输入区按钮增大点击热区 */
+  .icon-btn {
+    min-width: 40px;
+    min-height: 40px;
+  }
+  #input-area #send-btn {
+    width: 40px;
+    height: 40px;
+  }
+  #input-area .chip-btn {
+    min-height: 36px;
+  }
+
+  /* 对话区窄屏压缩左右留白，消息气泡不溢出 */
+  #center #chat-scroll {
+    padding: 16px 14px 10px;
+  }
+  #chat-body .msg-user .bubble {
+    max-width: 88%;
+  }
+
+  /* 代码块窄屏横向滚动，不撑破页面 */
+  .md-body {
+    overflow-wrap: break-word;
+    word-break: break-word;
+  }
+  .md-body pre {
+    max-width: 100%;
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+  }
+}
