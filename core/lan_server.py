@@ -77,7 +77,24 @@ class LanServer:
     # ------------------------------------------------------------------ #
 
     def _detect_lan_ip(self) -> str:
-        """探测本机局域网出口 IP，失败回退到 hostname 解析。"""
+        """探测本机局域网 IP：优先 WiFi 网卡，其次默认路由出口，最后 hostname 解析。
+
+        多网卡（WiFi + 有线 + 虚拟网卡）环境下，UDP connect 探测默认路由出口 IP
+        会随路由 metric 变化而漂移（可能返回有线/虚拟网卡 IP），导致手机按错误
+        IP 访问失败。这里优先识别 WLAN 网卡，保证「手机连同一 WiFi」的典型场景正确。
+        """
+        # 1. 优先 WiFi 网卡（WLAN / Wi-Fi / 无线），排除 loopback 与 APIPA
+        try:
+            import psutil
+
+            for iface, addrs in psutil.net_if_addrs().items():
+                if any(key in iface.lower() for key in ("wlan", "wi-fi", "wireless", "wifi", "无线")):
+                    for addr in addrs:
+                        if addr.family == socket.AF_INET and not addr.address.startswith(("127.", "169.254.")):
+                            return addr.address
+        except Exception:
+            pass
+        # 2. 回退：UDP connect 取默认路由出口 IP
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             try:
@@ -86,7 +103,9 @@ class LanServer:
             finally:
                 s.close()
         except Exception:
-            return socket.gethostbyname(socket.gethostname())
+            pass
+        # 3. 最后：hostname 解析
+        return socket.gethostbyname(socket.gethostname())
 
     def bind_url(self, token: str) -> str:
         """生成手机扫码打开时携带配对 token 的绑定 URL。"""
