@@ -110,6 +110,7 @@
 import { ref, computed, watch, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdown } from '../utils/markdown';
+import { toAbsoluteLocalPath } from '../utils/localPath';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
@@ -179,8 +180,22 @@ async function copyToClipboard(text: string): Promise<void> {
   }
 }
 
-// Markdown 代码块复制按钮：事件委托，命中 .code-copy 时复制同级 <code> 内容
+// Markdown 内容点击事件委托：本地文件链接走内嵌预览，代码块复制按钮走复制
 function onMdBodyClick(e: MouseEvent) {
+  const fileLink = (e.target as HTMLElement).closest('a[data-file-link]');
+  if (fileLink) {
+    e.preventDefault();
+    const raw = fileLink.getAttribute('data-file-link') || '';
+    if (!raw) return;
+    const target = toAbsoluteLocalPath(raw, store.workdir);
+    if (!target) {
+      store.notifyModal('文件预览', '当前会话未绑定工作目录，无法解析相对路径');
+      return;
+    }
+    store.openFilePreview(target);
+    return;
+  }
+
   const btn = (e.target as HTMLElement).closest('.code-copy');
   if (!btn) return;
   const code = btn.closest('.code-block')?.querySelector('code');
@@ -405,6 +420,13 @@ async function copyUserMessage() {
 .md-body {
   margin-top: 8px;
   line-height: 1.7;
+}
+
+/* 本地文件链接：虚线强调，与普通 http 链接区分，点击走内嵌预览 */
+.md-body :deep(a[data-file-link]) {
+  color: var(--accent);
+  text-decoration: underline dotted;
+  cursor: pointer;
 }
 
 /* 挂在助手消息上的非终态错误提示 */
