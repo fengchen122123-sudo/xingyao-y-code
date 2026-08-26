@@ -4,7 +4,7 @@
 - HTTP：静态前端（复用 frontend/dist 构建产物）
 - WebSocket：手机端 RPC（白名单桥接）与事件广播
 
-事件广播总线见 ``broadcast``；手机通过 ``FORBIDDEN_METHODS`` 黑名单调用 bridge。
+事件广播总线见 ``broadcast``；手机通过 ``ALLOWED_METHODS`` 白名单调用 bridge。
 """
 
 import base64
@@ -31,17 +31,33 @@ class LanServer:
     与桌面 GUI 共享同一 bridge，使手机通过 Web 页面作为第二个前端。
     """
 
-    # 手机端禁止调用的 bridge 方法黑名单（桌面专属/危险方法绝不暴露）
-    FORBIDDEN_METHODS = frozenset({
-        # 窗口控制（桌面专属）
-        "window_minimize", "window_toggle_maximize", "window_native_maximize",
-        "window_close", "window_is_maximized", "window_begin_drag",
-        "window_begin_resize", "window_confirm_close", "set_titlebar_theme",
-        # 桌面文件/系统交互（手机无意义）
-        "select_workspace_folder", "open_folder_in_explorer", "open_path",
-        "pick_files", "report_dropped_files", "save_clipboard_image",
-        # 更新/安装（危险，桌面专属）
-        "download_update", "cancel_download_update", "launch_installer", "check_update",
+    # 手机端只暴露白名单内的 bridge 方法（需求 Global Constraint：手机端只暴露
+    # ALLOWED_METHODS 白名单，绝不暴露 window_close / 拖拽 / 文件选择 / 更新安装等
+    # 桌面专属或危险方法）。
+    # 注意：方法名必须与 ApiBridge 实际方法名一致（见 gui_bridge.py），否则 RPC 调不通。
+    # 需求 Task 2 白名单初版的部分方法名在实现时已改名，这里按实际方法名映射：
+    #   get_session_groups -> get_sessions
+    #   new_session        -> create_session
+    #   cancel_turn        -> stop_current_turn
+    # 历史消息通过 get_initial_state / switch_session 的返回体获取，无独立 RPC 方法。
+    ALLOWED_METHODS = frozenset({
+        # 初始化（Task 6 shim 契约：api.get_initial_state 必须存在）
+        "get_initial_state",
+        # 消息 / 会话（Task 2 白名单初版）
+        "send_user_message",
+        "get_sessions",
+        "create_session",
+        "switch_session",
+        "stop_current_turn",
+        "cancel_queued_message",
+        # 权限审批（手机沿用电脑当前权限模式）
+        "respond_permission",
+        "respond_permission_choice",
+        # 主题（手机端主题一致）
+        "get_gui_theme",
+        # 只读文件浏览（Task 8 增补）
+        "get_file_tree",
+        "read_file_preview",
     })
 
     def __init__(self, bridge=None, port=0):
@@ -170,7 +186,7 @@ class LanServer:
         method = msg.get("method")
         args = msg.get("args") or {}
         msg_id = msg.get("id")
-        if method in self.FORBIDDEN_METHODS:
+        if method not in self.ALLOWED_METHODS:
             ws.send(json.dumps({"id": msg_id, "error": "method not allowed"}))
             return
         result = self._call_bridge(method, args)
