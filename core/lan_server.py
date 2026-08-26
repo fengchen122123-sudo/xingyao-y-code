@@ -4,7 +4,7 @@
 - HTTP：静态前端（复用 frontend/dist 构建产物）
 - WebSocket：手机端 RPC（白名单桥接）与事件广播
 
-事件广播总线见 ``broadcast``；手机通过 ``ALLOWED_METHODS`` 白名单调用 bridge。
+事件广播总线见 ``broadcast``；手机通过 ``FORBIDDEN_METHODS`` 黑名单调用 bridge。
 """
 
 import base64
@@ -31,21 +31,18 @@ class LanServer:
     与桌面 GUI 共享同一 bridge，使手机通过 Web 页面作为第二个前端。
     """
 
-    # 手机端可调用的 bridge 方法白名单（桌面专属方法如 window_close 绝不暴露）
-    ALLOWED_METHODS = frozenset(
-        {
-            "send_user_message",
-            "respond_permission",
-            "respond_permission_choice",
-            "get_history",
-            "get_session_groups",
-            "switch_session",
-            "new_session",
-            "cancel_turn",
-            "get_gui_theme",
-            "get_active_model",
-        }
-    )
+    # 手机端禁止调用的 bridge 方法黑名单（桌面专属/危险方法绝不暴露）
+    FORBIDDEN_METHODS = frozenset({
+        # 窗口控制（桌面专属）
+        "window_minimize", "window_toggle_maximize", "window_native_maximize",
+        "window_close", "window_is_maximized", "window_begin_drag",
+        "window_begin_resize", "window_confirm_close", "set_titlebar_theme",
+        # 桌面文件/系统交互（手机无意义）
+        "select_workspace_folder", "open_folder_in_explorer", "open_path",
+        "pick_files", "report_dropped_files", "save_clipboard_image",
+        # 更新/安装（危险，桌面专属）
+        "download_update", "cancel_download_update", "launch_installer", "check_update",
+    })
 
     def __init__(self, bridge=None, port=0):
         self.bridge = bridge
@@ -173,21 +170,25 @@ class LanServer:
         method = msg.get("method")
         args = msg.get("args") or {}
         msg_id = msg.get("id")
-        if method not in self.ALLOWED_METHODS:
+        if method in self.FORBIDDEN_METHODS:
             ws.send(json.dumps({"id": msg_id, "error": "method not allowed"}))
             return
         result = self._call_bridge(method, args)
         ws.send(json.dumps({"id": msg_id, "result": result}))
 
     def _call_bridge(self, method, args) -> Dict[str, Any]:
-        """调用白名单内的 bridge 方法，异常统一吞掉回包。"""
+        """调用 bridge 方法（支持位置参数与关键字参数），异常统一吞掉回包。"""
         if self.bridge is None:
             return {"ok": False, "msg": "bridge 未初始化"}
         fn = getattr(self.bridge, method, None)
         if fn is None:
             return {"ok": False, "msg": "未知方法"}
         try:
-            return fn(**args)
+            if isinstance(args, list):
+                return fn(*args)
+            if isinstance(args, dict):
+                return fn(**args)
+            return fn()
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -245,8 +246,20 @@ class LanServer:
         return self._http_response(200, html, "text/html; charset=utf-8")
 
     def _serve_shim(self) -> Response:
-        """mobile-shim 占位：真实内容在 Task 6 补全。"""
-        return self._http_404()
+        """返回 frontend/mobile-shim.js 的真实内容。"""
+        shim_path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "frontend",
+            "mobile-shim.js",
+        )
+        try:
+            with open(shim_path, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._http_404()
+        return self._http_response(
+            200, data, "application/javascript; charset=utf-8"
+        )
 
     def _serve_theme(self) -> Response:
         """主题占位：Task 后续补真实主题 tokens。"""
