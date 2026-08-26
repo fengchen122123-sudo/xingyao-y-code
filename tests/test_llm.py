@@ -458,6 +458,47 @@ def test_reasoning_effort_skipped_on_anthropic_route_and_invalid_value_fails(mon
         _provider_request_options("openai/kimi-k3", "https://api.moonshot.cn/v1")
 
 
+@pytest.mark.parametrize(
+    ("choice", "budget_tokens"),
+    [("low", 1024), ("high", 4096), ("max", 16384)],
+)
+def test_k3_reasoning_choice_maps_to_anthropic_thinking_budget(
+    monkeypatch, choice, budget_tokens
+):
+    """K3 的分级思考在 Anthropic 路由必须转换为原生 token 预算。"""
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": choice})
+
+    opts = _provider_request_options(
+        "anthropic/k3", "https://api.kimi.com/coding"
+    )
+
+    assert opts["thinking"] == {
+        "type": "enabled",
+        "budget_tokens": budget_tokens,
+    }
+    assert opts["max_tokens"] == 32000
+    assert "reasoning_effort" not in opts
+    assert "reasoning_effort" not in opts.get("extra_body", {})
+
+
+def test_anthropic_thinking_budget_conversion_is_limited_to_k3(monkeypatch):
+    """复用 effort 策略的非 K3 模型不能误套 K3 的 token 预算。"""
+    from core.llm import _provider_request_options
+
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": "medium"})
+
+    with pytest.raises(
+        ValueError,
+        match="Anthropic 路由不支持该模型的 reasoning_effort 参数",
+    ):
+        _provider_request_options(
+            "anthropic/step-3.7-flash", "https://api.stepfun.com/step_plan"
+        )
+
+
 def test_explicit_model_config_still_gets_cache_affinity(monkeypatch):
     """用户显式配置 max_tokens 时，缓存亲和依然生效（改动前该分支会提前返回）。"""
     from core.llm import _provider_request_options

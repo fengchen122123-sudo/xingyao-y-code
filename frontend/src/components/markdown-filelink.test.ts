@@ -40,4 +40,9 @@ describe('renderMarkdown 本地文件路径链接', () => {
     expect(html).toContain('href="https://example.com"');
     expect(html).toContain('target="_blank"');
   });
+  it('路径后紧跟中文标点时不吞入标点', () => {
+    const html = renderMarkdown('见 E:\\proj\\dist，和 E:\\proj\\ok.md。');
+    expect(html).toContain('data-file-link="E:\\proj\\dist"');
+    expect(html).toContain('data-file-link="E:\\proj\\ok.md"');
+  });
 });

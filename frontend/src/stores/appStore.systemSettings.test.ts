@@ -8,6 +8,7 @@ const settings = {
   command_shell: 'powershell',
   command_shell_available: true,
   command_shell_error: '',
+  remote_token_ttl: 86400,
   command_shell_options: [
     {
       id: 'auto',

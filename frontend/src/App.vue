@@ -139,23 +139,26 @@
 
     <!-- 状态栏 -->
     <div id="statusbar" data-theme-region="statusbar">
-      <span class="si">
+      <span class="si status-connection" data-test="status-connection" data-mobile-status="primary">
         <span class="s-dot" :class="{ off: !store.connected }"></span>
-        <span>{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
+        <span class="conn-full">{{ store.connected ? '后端已连接' : '连接已断开' }}</span>
+        <span class="conn-short">{{ store.connected ? '已连接' : '已断开' }}</span>
       </span>
-      <span class="si" :title="'当前模型: ' + (store.activeModelName || '未选择')">{{ store.activeModelName || '未选择模型' }}</span>
-      <span class="si" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">{{ store.currentWorkdirLabel }}</span>
-      <span class="si" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
-      <span class="si">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
-      <span class="si" :title="statusSkillTitle">技能: {{ statusSkillText }}</span>
+      <span class="si status-model" data-test="status-model" data-mobile-status="primary" :title="'当前模型: ' + (store.activeModelName || '未选择')">{{ store.activeModelName || '未选择模型' }}</span>
+      <span class="si status-workspace" data-test="status-workspace" data-mobile-status="primary" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">{{ store.currentWorkdirLabel }}</span>
+      <span class="si status-token" data-test="status-token" data-mobile-status="hidden" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
+      <span class="si status-permission" data-test="status-permission" data-mobile-status="hidden">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
+      <span class="si status-skill" data-test="status-skill" data-mobile-status="hidden" :title="statusSkillTitle">技能: {{ statusSkillText }}</span>
       <span
-        class="si"
+        class="si status-sandbox"
+        data-test="status-sandbox"
+        data-mobile-status="primary"
         :class="{ 'si-warn': store.sandboxEnabled }"
         :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅允许访问工作目录内文件'"
       >沙盒: {{ store.sandboxEnabled ? '解除' : '限制' }}</span>
-      <div class="right">
-        <span class="si">{{ store.running ? '生成中…' : '空闲' }}</span>
-        <span class="si">UTF-8</span>
+      <div class="right status-runtime" data-test="status-runtime">
+        <span class="si" data-test="status-running" data-mobile-status="primary">{{ store.running ? '生成中…' : '空闲' }}</span>
+        <span class="si" data-test="status-charset" data-mobile-status="hidden">UTF-8</span>
       </div>
     </div>
 
@@ -967,6 +970,9 @@ onUnmounted(() => {
 }
 .s-dot.off {
   background: var(--red);
+}
+.status-connection .conn-short {
+  display: none;
 }
 .si.tok-orange {
   color: var(--orange);
