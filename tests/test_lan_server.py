@@ -42,12 +42,14 @@ def test_route_rejects_window_close():
     assert "method not allowed" in fake.sent[0]
 
 
-def test_route_rejects_non_whitelisted():
-    """白名单语义：不在 ALLOWED_METHODS 内的普通 bridge 方法也应被拒绝。"""
+def test_route_allows_non_forbidden_method():
+    """黑名单语义：不在 FORBIDDEN_METHODS 内的普通 bridge 方法（如 get_background_tasks）应被放行。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
-    srv._route_message(fake, json.dumps({"method": "get_system_settings", "args": {}, "id": 1}))
-    assert "method not allowed" in fake.sent[0]
+    srv._route_message(fake, json.dumps({"method": "get_background_tasks", "args": {}, "id": 1}))
+    assert "method not allowed" not in fake.sent[0]
+    resp = json.loads(fake.sent[0])
+    assert resp["id"] == 1
 
 
 def test_route_allows_get_initial_state():
