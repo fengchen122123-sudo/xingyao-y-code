@@ -33,11 +33,36 @@ def test_broadcast_sends_to_clients():
     assert fake.sent == ['{"type":"token_delta"}']
 
 
-def test_route_rejects_non_whitelisted():
+def test_route_rejects_forbidden():
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
     srv._route_message(fake, json.dumps({"method": "window_close", "args": {}, "id": 1}))
     assert "method not allowed" in fake.sent[0]
+
+
+def test_route_allows_get_initial_state():
+    srv = LanServer(bridge=None)
+    fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    # bridge 无 get_initial_state 时 _call_bridge 返回 {"ok": False, "msg": "未知方法"}，但不应被黑名单拒绝
+    srv._route_message(fake, json.dumps({"method": "get_initial_state", "args": [], "id": 1}))
+    resp = json.loads(fake.sent[0])
+    assert "method not allowed" not in fake.sent[0]
+    assert resp["id"] == 1
+
+
+def test_call_bridge_positional_args():
+    srv = LanServer(bridge=None)
+    class B:
+        def echo(self, a, b=None): return {"ok": True, "a": a, "b": b}
+    srv.bridge = B()
+    assert srv._call_bridge("echo", [1, 2]) == {"ok": True, "a": 1, "b": 2}
+
+
+def test_serve_shim_returns_js():
+    srv = LanServer(bridge=None)
+    resp = srv._serve_shim()
+    assert resp.status_code == 200
+    assert b"pywebview" in resp.body
 
 
 def test_get_bind_info_returns_url_token_qr():
