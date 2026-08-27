@@ -2424,6 +2424,30 @@ export const useAppStore = defineStore('app', {
         // 异步 token 重算完成（后端 _async_recalc_token_usage 推送），
         // 数据形状与 token_usage 事件一致，直接复用同一归一化
         this.tokenUsage = normalizeTokenUsage(data);
+      } else if (type === 'model_changed') {
+        // 其他端（手机/桌面）切换了模型：更新对应会话的模型与思考强度，
+        // 并递增版本号使在途 switchSession 的旧模型快照不再回覆盖。
+        // 事件管线已把 store 绑定到事件会话：同会话直接改顶层（finally 捕获
+        // 回 runtime）；跨会话则先把原会话模型钉进原 runtime（finally 只捕获
+        // 目标会话），顶层临时切到事件模型，重绑回原会话时精确还原显示
+        {
+          const newId = String(data.model_id || '');
+          const newName = String(data.model_name || '');
+          if (switchedRuntime) {
+            const origRuntime = this._getSessionRuntime(currentRuntimeKey);
+            origRuntime.modelId = this.activeModelId;
+            origRuntime.modelName = this.activeModelName;
+            if (newId) this.activeModelId = newId;
+            if (newName) this.activeModelName = newName;
+          } else {
+            if (newId) this.activeModelId = newId;
+            if (newName) this.activeModelName = newName;
+            if (data.reasoning) this.reasoning = data.reasoning;
+          }
+          if (newId || newName) {
+            this._sessionModelVersion[eventSession] = (this._sessionModelVersion[eventSession] || 0) + 1;
+          }
+        }
       } else if (type === 'file_tree_loaded') {
         // 异步文件树加载完成（后端 _async_load_file_tree 推送）：
         // get_initial_state 不再同步扫树（大目录会卡加载页），改为后台扫描，

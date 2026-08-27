@@ -1,10 +1,21 @@
 import { mount, flushPromises } from '@vue/test-utils';
+import { nextTick } from 'vue';
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
 import InputArea from './InputArea.vue';
 import { useAppStore } from '../stores/appStore';
+import { COMPOSER_HEIGHT_KEY } from '../composables/useComposerResize';
 
-beforeEach(() => setActivePinia(createPinia()));
+beforeEach(() => {
+  setActivePinia(createPinia());
+  localStorage.removeItem(COMPOSER_HEIGHT_KEY);
+});
+
+// jsdom 的 PointerEvent 属性是 getter-only，VTU trigger 直接赋值 clientY 会报错，
+// 统一用原生构造器派发（bubbles 保证 window 上的 pointermove/up 监听能收到）
+function firePointer(el: EventTarget, type: string, clientY: number) {
+  el.dispatchEvent(new PointerEvent(type, { bubbles: true, cancelable: true, clientY, pointerId: 1 }));
+}
 
 it('uses the current session state for the send/stop button', () => {
   const store = useAppStore();
@@ -111,5 +122,79 @@ it('点击撤销按钮把排队消息文本和附件恢复到输入框并取消�
   expect(cancelSpy).toHaveBeenCalledWith('session-b', 'q1');
   // 附件（图片+文件）一并回到输入框
   expect(wrapper.findAll('.attach-chip')).toHaveLength(2);
+  wrapper.unmount();
+});
+
+it('拖拽顶边手柄抬高输入框，向下拖以默认高度为下限，松手记忆', async () => {
+  const wrapper = mount(InputArea);
+  const textareaEl = () => (wrapper.get('textarea').element as HTMLTextAreaElement).style.height;
+
+  // jsdom 无布局：默认高度走 46px 兜底常量
+  const handleEl = wrapper.get('[data-test="composer-resize-handle"]').element;
+  firePointer(handleEl, 'pointerdown', 100);
+  await nextTick();
+  expect(wrapper.get('#input-area').classes()).toContain('is-resizing');
+
+  // 向上拖 60px → 默认 46px + 60px
+  firePointer(window, 'pointermove', 40);
+  await nextTick();
+  expect(textareaEl()).toBe('106px');
+
+  // 继续向上拖超过窗口 60% 上限（jsdom innerHeight=768 → 上限 461px）
+  firePointer(window, 'pointermove', -400);
+  await nextTick();
+  expect(textareaEl()).toBe('461px');
+
+  // 向下拖过头 → 回到默认高度即触底
+  firePointer(window, 'pointermove', 500);
+  await nextTick();
+  expect(textareaEl()).toBe('46px');
+
+  // 松手：拖回默认高度视为未拉伸，不写入记忆
+  firePointer(window, 'pointerup', 500);
+  await nextTick();
+  expect(wrapper.get('#input-area').classes()).not.toContain('is-resizing');
+  expect(localStorage.getItem(COMPOSER_HEIGHT_KEY)).toBeNull();
+
+  // 再拖高并松手 → 写入 localStorage
+  firePointer(handleEl, 'pointerdown', 100);
+  firePointer(window, 'pointermove', 40);
+  await nextTick();
+  firePointer(window, 'pointerup', 40);
+  expect(localStorage.getItem(COMPOSER_HEIGHT_KEY)).toBe('106');
+  wrapper.unmount();
+});
+
+it('挂载时恢复上次记忆的高度，并按当前窗口重新夹取', async () => {
+  localStorage.setItem(COMPOSER_HEIGHT_KEY, '200');
+  let wrapper = mount(InputArea);
+  await nextTick();
+  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('200px');
+  wrapper.unmount();
+
+  // 存储的上限按当前窗口夹取（461px），低于默认高度则视为未拉伸
+  localStorage.setItem(COMPOSER_HEIGHT_KEY, '99999');
+  wrapper = mount(InputArea);
+  await nextTick();
+  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('461px');
+  wrapper.unmount();
+
+  localStorage.setItem(COMPOSER_HEIGHT_KEY, '30');
+  wrapper = mount(InputArea);
+  await nextTick();
+  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('');
+  wrapper.unmount();
+});
+
+it('双击手柄恢复默认高度并清除记忆', async () => {
+  localStorage.setItem(COMPOSER_HEIGHT_KEY, '200');
+  const wrapper = mount(InputArea);
+  await nextTick();
+  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('200px');
+
+  await wrapper.get('[data-test="composer-resize-handle"]').trigger('dblclick');
+
+  expect((wrapper.get('textarea').element as HTMLTextAreaElement).style.height).toBe('');
+  expect(localStorage.getItem(COMPOSER_HEIGHT_KEY)).toBeNull();
   wrapper.unmount();
 });

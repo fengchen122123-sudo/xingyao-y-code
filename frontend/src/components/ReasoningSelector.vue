@@ -10,9 +10,10 @@
     @click.stop="toggleMenu"
   >
     <AppIcon name="brain" :size="14" :stroke-width="1.9" />
-    <span>{{ currentLabel }}</span>
+    <!-- compact 变体只留脑子图标（ZCode 式），等级经 title 与下拉菜单呈现 -->
+    <span v-if="variant === 'hero'">{{ currentLabel }}</span>
     <AppIcon
-      v-if="!store.reasoning.disabled"
+      v-if="variant === 'hero' && !store.reasoning.disabled"
       name="chevron-down"
       :size="10"
       :stroke-width="2"
@@ -162,7 +163,7 @@ defineExpose({ close });
 }
 .reasoning-compact {
   border-radius: 7px;
-  padding: 4px 9px;
+  padding: 4px 8px;
   font-size: 12.5px;
 }
 .reasoning-hero {
