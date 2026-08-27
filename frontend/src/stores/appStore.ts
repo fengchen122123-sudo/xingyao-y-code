@@ -2895,6 +2895,21 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 手机/平板端经 WS RPC 上传文件（base64），返回落盘路径（失败返回空串并 toast）
+    async uploadFile(name: string, dataB64: string): Promise<string> {
+      const api = this._api();
+      if (!api) return '';
+      try {
+        const res = await api.upload_file(name, dataB64);
+        if (res && res.ok && res.path) return res.path;
+        this.notifyChat('上传失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return '';
+      } catch (err) {
+        this.notifyChat('上传失败: ' + err);
+        return '';
+      }
+    },
+
     async checkPathsKind(paths: string[]) {
       const api = this._api();
       if (!api) return [];

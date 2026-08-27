@@ -115,6 +115,39 @@ export function useAttachments() {
     await addPaths(paths);
   }
 
+  const UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
+
+  function fileToDataB64(file: File): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = String(reader.result || '');
+        resolve(dataUrl.slice(dataUrl.indexOf(',') + 1));
+      };
+      reader.onerror = () => reject(reader.error);
+      reader.readAsDataURL(file);
+    });
+  }
+
+  // 手机/平板端：把 <input type=file> 选中的文件逐个经 WS RPC 上传到电脑，再加入附件列表
+  async function uploadFiles(files: File[]) {
+    const paths: string[] = [];
+    for (const file of files) {
+      if (file.size > UPLOAD_MAX_BYTES) {
+        store.notifyChat(`「${file.name}」超过 50MB，无法上传`);
+        continue;
+      }
+      try {
+        const b64 = await fileToDataB64(file);
+        const path = await store.uploadFile(file.name, b64);
+        if (path) paths.push(path);
+      } catch {
+        store.notifyChat(`「${file.name}」上传失败，请重试`);
+      }
+    }
+    if (paths.length) await addPaths(paths);
+  }
+
   async function addPaths(paths: string[]) {
     let infos: AttachmentItem[] = [];
     try {
@@ -297,6 +330,6 @@ export function useAttachments() {
 
   return {
     attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste,
-    dragging, bindDrop, unbindDrop, addPaths,
+    dragging, bindDrop, unbindDrop, addPaths, uploadFiles,
   };
 }
