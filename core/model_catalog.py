@@ -175,9 +175,33 @@ PRESET_PROVIDERS = (
     },
     {
         "id": "zhipu",
-        "name": "智谱",
+        "name": "智谱API",
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "protocol": "openai",
+        "models": [
+            {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
+            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},
+            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
+            {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
+        ],
+    },
+    {
+        "id": "zhipu-coding-openai",
+        "name": "智谱CodingPlan(OpenAI)",
+        "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+        "protocol": "openai",
+        "models": [
+            {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
+            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},
+            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
+            {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
+        ],
+    },
+    {
+        "id": "zhipu-coding-anthropic",
+        "name": "智谱CodingPlan(Anthropic)",
+        "base_url": "https://open.bigmodel.cn/api/anthropic",
+        "protocol": "anthropic",
         "models": [
             {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},

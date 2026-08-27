@@ -154,6 +154,17 @@ def test_zhipu_keepalive_is_limited_to_official_routes():
     assert _supports_cache_keepalive(
         "zhipu/glm-5.2", "https://open.bigmodel.cn/api/paas/v4"
     ) is True
+    # 同域官方 CodingPlan 套餐端点（OpenAI/Anthropic 协议）同样放行
+    assert _supports_cache_keepalive(
+        "openai/glm-5.3", "https://open.bigmodel.cn/api/coding/paas/v4"
+    ) is True
+    assert _supports_cache_keepalive(
+        "anthropic/glm-5.3-flash", "https://open.bigmodel.cn/api/anthropic"
+    ) is True
+    # 官方域名下的未知路径不放行
+    assert _supports_cache_keepalive(
+        "openai/glm-5.3", "https://open.bigmodel.cn/api/unknown"
+    ) is False
     # 第三方中转的 GLM 模型不放行
     assert _supports_cache_keepalive(
         "openai/glm-5.3", "https://tokenrhythm.studio/v1"

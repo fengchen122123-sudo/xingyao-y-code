@@ -2231,6 +2231,7 @@ def _is_official_zhipu_route(api_base=""):
 
     智谱上下文缓存为服务端隐式自动命中（无亲和参数、无显式标记），仅官方
     直连可确定生效；聚合网关/经销商挂载的 GLM 模型不放行。
+    同域官方端点覆盖普通 API 与 CodingPlan 两种套餐（OpenAI/Anthropic 协议）。
     """
     try:
         parsed = urlsplit(str(api_base or ""))
@@ -2248,7 +2249,12 @@ def _is_official_zhipu_route(api_base=""):
         or parsed.fragment
     ):
         return False
-    return host == "open.bigmodel.cn" and path in {"", "/api/paas/v4"}
+    return host == "open.bigmodel.cn" and path in {
+        "",
+        "/api/paas/v4",
+        "/api/coding/paas/v4",
+        "/api/anthropic",
+    }
 
 
 def _is_glm_family(model_name, api_base=""):
