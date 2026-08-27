@@ -87,6 +87,7 @@ PRESET_PROVIDERS = (
             {"name": "glm-5.1", "context_window": 200000, "supports_vision": False},
             {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
+            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},
             {"name": "seed-2.1-turbo", "context_window": 262144, "supports_vision": True},
             {"name": "seed-2.1-pro", "context_window": 262144, "supports_vision": True},
         ],
@@ -179,6 +180,7 @@ PRESET_PROVIDERS = (
         "protocol": "openai",
         "models": [
             {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
+            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},
             {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
         ],
