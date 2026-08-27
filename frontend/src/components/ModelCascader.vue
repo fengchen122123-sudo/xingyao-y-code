@@ -3,8 +3,8 @@
        （composer 分区 z=5，否则往上弹时被 workspace(6)/会话工具栏(10) 盖住） -->
   <Teleport to="body">
     <div id="model-cascader" :class="{ show: visible, 'opens-up': opensUp }" :style="styleObj" @click.stop>
-    <!-- 二级子面板：具体模型列表 -->
-    <div ref="subPanelEl" class="cascader-sub-panel" :class="{ show: activeProviderName }" :style="subPanelStyle">
+    <!-- 二级子面板：具体模型列表（窄屏为主面板左侧的独立方盒） -->
+    <div ref="subPanelEl" class="cascader-sub-panel" :class="{ show: activeProviderName, 'narrow-side': narrowMode }" :style="subPanelStyle">
       <div
         v-for="m in currentSubModels"
         :key="m.id || m.name"
@@ -18,11 +18,26 @@
       </div>
     </div>
 
-    <!-- 一级主面板：供应商列表 -->
-    <div class="cascader-main-panel">
+    <!-- 一级主面板：供应商列表（窄屏顶部内联当前供应商的模型，ZCode 式） -->
+    <div class="cascader-main-panel" :style="mainPanelStyle">
       <template v-if="hasAnyModel">
+        <template v-if="narrowMode && currentProviderName">
+          <div class="cascader-provider-header">{{ currentProviderName }}</div>
+          <div
+            v-for="m in currentProviderModels"
+            :key="'cur-' + (m.id || m.name)"
+            class="cascader-item"
+            :class="{ active: m.id === store.activeModelId }"
+            @click="selectModel(m.id)"
+          >
+            <span class="c-label">{{ m.name }}</span>
+            <span v-if="m.supports_vision" class="c-vision" title="支持多模态"><AppIcon name="eye" :size="12" /></span>
+            <span v-if="m.id === store.activeModelId" class="c-check checked"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
+          </div>
+          <div class="cascader-sep"></div>
+        </template>
         <div
-          v-for="(modelsInGroup, provider) in groupedModels"
+          v-for="(modelsInGroup, provider) in listedProviders"
           :key="provider"
           class="cascader-item"
           :class="{ active: activeProviderName === provider }"
@@ -60,9 +75,13 @@ const store = useAppStore();
 
 const activeProviderName = ref<string | null>(null);
 const styleObj = ref<Record<string, string>>({});
+const mainPanelStyle = ref<Record<string, string>>({});
 const subPanelStyle = ref<Record<string, string>>({});
 const subPanelEl = ref<HTMLElement | null>(null);
 const opensUp = ref(false);
+// 窄屏（ZCode 式）：主面板窄版靠右、当前供应商模型内联，二级模型列表为
+// 主面板左侧的独立方盒；打开菜单时判定一次
+const narrowMode = ref(false);
 // 记住上次悬停的供应商行：主面板跟随锚点移动时同步重算二级面板位置
 const lastProviderRow = ref<HTMLElement | null>(null);
 let rafId = 0;
@@ -75,6 +94,45 @@ const SUB_PANEL_ITEM_INSET = 7;
 
 const groupedModels = computed(() => store.modelsByProvider);
 const hasAnyModel = computed(() => store.models.length > 0);
+
+// 移动端视口判定，与 Sidebar.vue 同一断点；matchMedia 不可用（jsdom）按桌面处理
+function isNarrowViewport(): boolean {
+  return (
+    typeof window !== 'undefined' &&
+    typeof window.matchMedia === 'function' &&
+    window.matchMedia('(max-width: 768px)').matches
+  );
+}
+
+// 窄屏双列宽度：左方盒不超 200px（45% 视口），主面板吃掉剩余宽度；
+// 10px 屏边距 x2 + 6px 列间距，两列恰好铺满且永不重叠
+const NARROW_MARGIN = 10;
+const NARROW_GAP = 6;
+function narrowLayout(): { subW: number; mainW: number } {
+  const vw = window.innerWidth;
+  const subW = Math.min(200, Math.floor(vw * 0.45));
+  const mainW = Math.min(220, vw - subW - NARROW_MARGIN * 2 - NARROW_GAP);
+  return { subW, mainW };
+}
+
+// 当前供应商（按激活模型归属）：窄屏下其模型内联在主面板顶部
+const currentProviderName = computed(() => {
+  const current = store.models.find(m => m.id === store.activeModelId);
+  return current?.provider_name || null;
+});
+const currentProviderModels = computed(() => {
+  if (!currentProviderName.value) return [];
+  return groupedModels.value[currentProviderName.value] || [];
+});
+// 窄屏供应商列表去掉当前供应商（其模型已在顶部内联，避免重复入口）
+const listedProviders = computed(() => {
+  if (!narrowMode.value || !currentProviderName.value) return groupedModels.value;
+  const rest: Record<string, ModelInfo[]> = {};
+  for (const [provider, models] of Object.entries(groupedModels.value)) {
+    if (provider !== currentProviderName.value) rest[provider] = models;
+  }
+  return rest;
+});
 
 const currentSubModels = computed(() => {
   if (!activeProviderName.value) return [];
@@ -106,6 +164,35 @@ function positionSubPanel(providerRow: HTMLElement) {
   const rowRect = providerRow.getBoundingClientRect();
   const mainPanelRect = mainPanel.getBoundingClientRect();
   const top = Math.max(VIEWPORT_PADDING, Math.floor(rowRect.top - SUB_PANEL_ITEM_INSET));
+
+  // 窄屏：主面板左侧的独立方盒（ZCode 式），垂直方向与主面板同侧对齐
+  if (narrowMode.value) {
+    const { subW } = narrowLayout();
+    const left = Math.max(NARROW_MARGIN, Math.floor(mainPanelRect.left - NARROW_GAP - subW));
+    const maxH = Math.max(0, Math.floor(mainPanelRect.height));
+    subPanelStyle.value = opensUp.value
+      ? {
+        position: 'fixed',
+        top: 'auto',
+        bottom: `${Math.floor(window.innerHeight - mainPanelRect.bottom)}px`,
+        left: `${left}px`,
+        right: 'auto',
+        width: `${subW}px`,
+        minWidth: '0',
+        maxHeight: `${maxH}px`,
+      }
+      : {
+        position: 'fixed',
+        top: `${Math.floor(mainPanelRect.top)}px`,
+        bottom: 'auto',
+        left: `${left}px`,
+        right: 'auto',
+        width: `${subW}px`,
+        minWidth: '0',
+        maxHeight: `${maxH}px`,
+      };
+    return;
+  }
 
   // 实测宽度优先（已渲染），否则按名字估算
   const panelWidth = subPanelEl.value?.offsetWidth || estimateSubPanelWidth();
@@ -169,7 +256,17 @@ function positionMainPanel() {
   const maxPanelHeight = isBottomHalf ? upwardHeight : downwardHeight;
   opensUp.value = isBottomHalf;
 
-  const left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
+  let left: number;
+  if (narrowMode.value) {
+    // 窄屏：主面板窄版靠右（ZCode 式，左侧留给二级方盒）
+    const { mainW } = narrowLayout();
+    left = Math.max(NARROW_MARGIN, Math.floor(window.innerWidth - NARROW_MARGIN - mainW));
+    mainPanelStyle.value = { width: `${mainW}px`, minWidth: '0' };
+  } else {
+    left = Math.max(10, Math.min(r.left, window.innerWidth - 520));
+    mainPanelStyle.value = {};
+  }
+
   if (isBottomHalf) {
     styleObj.value = {
       position: 'fixed',
@@ -204,9 +301,11 @@ function trackAnchor() {
 watch(() => props.visible, (newVal) => {
   cancelAnimationFrame(rafId);
   if (newVal && props.anchorEl) {
+    // 先定窄屏模式再定位：主面板宽度/靠右都依赖该标记
+    narrowMode.value = isNarrowViewport();
     positionMainPanel();
 
-    // 二级模型列表只在悬停供应商后展开，保持一级列表简洁。
+    // 二级模型列表只在悬停/点选供应商后展开，保持一级列表简洁。
     activeProviderName.value = null;
     subPanelStyle.value = {};
     lastProviderRow.value = null;
@@ -272,6 +371,18 @@ onUnmounted(() => {
 }
 .cascader-sub-panel.show {
   display: block;
+}
+/* 窄屏左方盒与主面板列间距极小，显式抬高层级：两面板都有 backdrop-filter，
+   Chromium 按合成层 DOM 顺序绘制（主面板在模板中靠后），会盖住 fixed 子面板 */
+.cascader-sub-panel.narrow-side {
+  z-index: 1;
+}
+/* 窄屏主面板顶部内联的当前供应商标题（ZCode 式） */
+.cascader-provider-header {
+  padding: 8px 12px 3px;
+  font-size: 12px;
+  color: var(--text-faint);
+  user-select: none;
 }
 .cascader-item {
   padding: 9px 12px;

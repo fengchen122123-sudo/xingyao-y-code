@@ -2539,6 +2539,14 @@ class ApiBridge:
             # 阈值，立即压缩历史，保证新窗口模型可直接使用而不是发消息报错。
             # 压缩后再次重算并推送，让前端红圈及时回落。
             self._ensure_fits_active_window(session_name)
+            # 广播模型变更到所有端（桌面 JS 桥 + 局域网手机）：任一端切换模型后，
+            # 其他端的模型芯片/状态栏/轮次标签实时跟随，避免两端显示与真实不符
+            self.emit_event("model_changed", {
+                "session_name": session_name or "",
+                "model_id": str(model_id),
+                "model_name": str(matched.get("name", "")),
+                "reasoning": _reasoning_snapshot_for_model(matched),
+            })
             return {
                 "ok": True,
                 "active_model_id": str(model_id),
@@ -2880,13 +2888,17 @@ class ApiBridge:
                 logger.exception("局域网远程控制服务启动失败")
                 return None
 
-    def get_remote_bind_qr(self) -> Dict[str, Any]:
-        """签发配对 token 并生成二维码，供手机扫码绑定。"""
+    def get_remote_bind_qr(self, force_new: bool = False) -> Dict[str, Any]:
+        """返回手机扫码绑定信息。
+
+        token 固定：未过期直接复用；过期自动重签；force_new=True 由前端
+        "刷新"按钮触发，强制重签并使旧 token 失效。
+        """
         try:
             srv = self._ensure_lan_server()
             if srv is None:
                 return {"ok": False, "msg": "远程服务启动失败"}
-            return srv.get_bind_info()
+            return srv.get_bind_info(force_new=bool(force_new))
         except Exception as e:
             logger.exception("get_remote_bind_qr 失败")
             return {"ok": False, "msg": str(e)}
