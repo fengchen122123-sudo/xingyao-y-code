@@ -112,10 +112,27 @@ class LanServer:
         except Exception:
             return False
 
+    def _kick_all_clients(self) -> None:
+        """断开所有已连接客户端并清空列表（token 轮换时防止旧链接继续可控）。
+
+        必须在持锁状态下调用：先摘除列表再逐个 close，close 的网络 IO 放锁外，
+        避免阻塞注册路径。
+        """
+        with self._clients_lock:
+            clients = self._clients
+            self._clients = []
+        for client in clients:
+            try:
+                client.close(code=4401, reason="token rotated")
+            except Exception:
+                pass
+
     def _issue_token(self) -> str:
-        """签发新配对 token（旧 token 立即失效），持久化后返回明文。"""
+        """签发新配对 token（旧 token 立即失效，已连接客户端全部断开），持久化后返回明文。"""
         self._token = secrets.token_urlsafe(24).encode()
         self._token_expires = time.time() + self._ttl
+        # 踢掉旧 token 时代的连接：否则已扫码手机在刷新二维码后依然可控
+        self._kick_all_clients()
         try:
             _save_config_value(config.REMOTE_PAIR_TOKEN_KEY, self._token.decode())
             _save_config_value(
@@ -125,6 +142,18 @@ class LanServer:
             # 持久化失败不阻断签发：仅影响重启后的固定性，不影响本次可用性
             pass
         return self._token.decode()
+
+    def _authenticate_and_register(self, ws, token) -> bool:
+        """校验 token 并原子注册客户端：通过则加入列表，失败返回 False。
+
+        校验与注册在同一把锁内完成，避免与 _issue_token 的轮换竞态：
+        旧 token 校验通过的瞬间不会被并发重签钻空子。
+        """
+        with self._clients_lock:
+            if not self._verify_token(token):
+                return False
+            self._clients.append(ws)
+            return True
 
     def _load_persisted_token(self, token: str, expires_at: float) -> None:
         """从持久层恢复未过期的配对 token；已过期或为空则忽略。"""
@@ -204,14 +233,14 @@ class LanServer:
             msg = json.loads(raw) if isinstance(raw, (str, bytes)) else None
         except Exception:
             msg = None
-        if not isinstance(msg, dict) or not self._verify_token(msg.get("token")):
+        if not isinstance(msg, dict) or not self._authenticate_and_register(
+            ws, msg.get("token")
+        ):
             try:
                 ws.close(code=4401, reason="invalid token")
             except Exception:
                 pass
             return
-        with self._clients_lock:
-            self._clients.append(ws)
         try:
             for raw in ws:
                 self._route_message(ws, raw)

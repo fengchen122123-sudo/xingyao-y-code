@@ -171,6 +171,9 @@
     <!-- 图片大图查看 -->
     <ImageLightbox />
 
+    <!-- 手机端内置目录浏览器（引入新项目工作区） -->
+    <RemoteDirBrowser />
+
     <!-- 全局通知已迁移：对话类提示走对话流 notice 消息，非对话类提示走 ConfirmModal notice 模式 -->
 
     <!-- 启动画面：初始化期间全屏展示，加载完成后淡出进入对话 -->
@@ -222,6 +225,7 @@ import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
 import PermCard from './components/PermCard.vue';
 import ImageLightbox from './components/ImageLightbox.vue';
+import RemoteDirBrowser from './components/RemoteDirBrowser.vue';
 import Subpage from './components/Subpage.vue';
 import SettingsPage from './components/SettingsPage.vue';
 
