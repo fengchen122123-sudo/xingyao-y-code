@@ -288,7 +288,7 @@ onUnmounted(() => document.removeEventListener('click', onGlobalClickForAttachMe
 // 菜单定位到回形针按钮上方
 const attachMenuStyle = computed<Record<string, string>>(() => {
   const el = attachBtnRef.value;
-  if (!el) return {};
+  if (!el) return {} as Record<string, string>;
   const r = el.getBoundingClientRect();
   return {
     position: 'fixed',
@@ -370,7 +370,9 @@ function handleKeydown(e: KeyboardEvent) {
 }
 /* 模型/工作区按钮上的小箭头（对齐旧 10px 文字箭头的视觉重量） */
 .model-chevron {
-  color: var(--text-faint.workdir-sep {
+  color: var(--text-faint);
+}
+.workdir-sep {
   height: 1px;
   background: var(--border);
   margin: 5px 6px;
