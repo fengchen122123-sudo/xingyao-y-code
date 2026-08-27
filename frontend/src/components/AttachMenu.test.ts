@@ -23,14 +23,16 @@ describe.each([
   beforeEach(() => setActivePinia(createPinia()));
   afterEach(() => vi.restoreAllMocks());
 
-  it('触摸设备点回形针弹出拍照/相册/文件菜单', async () => {
+  it('触摸设备点回形针直接触发系统文件选择，不弹自定义菜单', async () => {
     mockTouch(true);
     const wrapper = mount(Comp as never, { global: { stubs: { teleport: true } } });
+    // 设计简化：不再有应用内「拍照/相册/文件」浮层，只保留一个通用隐藏文件入口
+    expect(wrapper.find('[data-test="attach-menu"]').exists()).toBe(false);
+    expect(wrapper.findAll('input[type="file"]')).toHaveLength(1);
+    const inputEl = wrapper.find('input[type="file"]').element as HTMLInputElement;
+    const clickSpy = vi.spyOn(inputEl, 'click');
     await wrapper.get('[data-test="attachment-button"]').trigger('click');
-    expect(wrapper.find('[data-test="attach-menu"]').exists()).toBe(true);
-    expect(wrapper.find('[data-test="attach-camera"]').exists()).toBe(true);
-    expect(wrapper.find('[data-test="attach-album"]').exists()).toBe(true);
-    expect(wrapper.find('[data-test="attach-file"]').exists()).toBe(true);
+    expect(clickSpy).toHaveBeenCalledTimes(1);
     wrapper.unmount();
   });
 
