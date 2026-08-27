@@ -362,6 +362,7 @@ class LanServer:
             host="0.0.0.0",
             port=self.port,
             process_request=self._serve_http,
+            max_size=70 * 1024 * 1024,  # 支持手机上传 ≤50MB 文件（base64 约 67MB）
         )
         # port=0 时内核动态分配，真实端口回填
         self.port = self._server.socket.getsockname()[1]
