@@ -156,10 +156,18 @@
             <div class="key-field">
               <input
                 v-model="providerForm.api_key"
+                data-test="provider-api-key"
                 :type="showProviderKey ? 'text' : 'password'"
                 :placeholder="selectedProvider.has_api_key ? '已配置；留空表示不修改' : '输入 API Key'"
               />
-              <button @click="showProviderKey = !showProviderKey">{{ showProviderKey ? '隐藏' : '显示' }}</button>
+              <button
+                class="icon-button"
+                title="复制 API Key"
+                data-test="copy-provider-key"
+                :disabled="!selectedProvider.has_api_key && !providerForm.api_key"
+                @click="copyProviderKey"
+              ><AppIcon :name="keyCopied ? 'check' : 'copy'" :size="14" /></button>
+              <button data-test="toggle-provider-key" @click="toggleProviderKey">{{ showProviderKey ? '隐藏' : '显示' }}</button>
             </div>
             <button class="secondary-button" :disabled="saving" @click="saveProvider">保存厂商配置</button>
 
@@ -502,6 +510,8 @@ const showAddProviders = ref(false);
 const presetApiKey = ref('');
 const showPresetKey = ref(false);
 const showProviderKey = ref(false);
+const keyCopied = ref(false);
+let keyCopyTimer: ReturnType<typeof setTimeout> | null = null;
 const saving = ref(false);
 const testingId = ref('');
 const testResults = reactive<Record<string, { status: 'testing' | 'ok' | 'fail'; msg: string }>>({});
@@ -557,7 +567,40 @@ watch(selectedProvider, (provider) => {
   providerForm.base_url = provider.base_url || '';
   providerForm.api_key = '';
   providerForm.protocol = provider.protocol || 'openai';
+  showProviderKey.value = false;
 }, { immediate: true });
+
+// 输入框为空但后端已配置 Key 时，按需从后端取回明文填入（快照不含明文）
+async function revealProviderKey(): Promise<boolean> {
+  const provider = selectedProvider.value;
+  if (!provider) return false;
+  if (providerForm.api_key) return true;
+  if (!provider.has_api_key) return false;
+  const key = await store.getProviderApiKey(provider.id);
+  if (key === null || !key) return false;
+  providerForm.api_key = key;
+  return true;
+}
+
+async function toggleProviderKey() {
+  if (showProviderKey.value) {
+    showProviderKey.value = false;
+    return;
+  }
+  if (await revealProviderKey()) showProviderKey.value = true;
+}
+
+async function copyProviderKey() {
+  if (!(await revealProviderKey())) return;
+  try {
+    await navigator.clipboard.writeText(providerForm.api_key);
+  } catch {
+    // 剪贴板 API 不可用时静默失败
+  }
+  keyCopied.value = true;
+  if (keyCopyTimer) clearTimeout(keyCopyTimer);
+  keyCopyTimer = setTimeout(() => { keyCopied.value = false; }, 2000);
+}
 
 watch(
   () => [store.modelPresets.map(item => item.id), store.providers.map(item => item.id)],
@@ -666,6 +709,7 @@ async function saveProvider() {
     provider.preset_id ? (provider.protocol || 'openai') : providerForm.protocol,
   );
   providerForm.api_key = '';
+  showProviderKey.value = false;
   saving.value = false;
 }
 
@@ -904,6 +948,8 @@ onMounted(async () => {
 .key-field input { flex: 1; min-width: 0; height: 40px; padding: 0 13px; border: 0; background: transparent; color: var(--text); outline: 0; }
 .key-field button, .row-actions button { border: 0; background: transparent; color: var(--text-faint); }
 .key-field button { padding: 0 13px; }
+.key-field .icon-button { display: flex; align-items: center; padding: 0 10px; cursor: pointer; }
+.key-field .icon-button:disabled { opacity: 0.4; cursor: default; }
 .mono { font-family: var(--mono); }
 .model-preview-title { margin: 24px 0 9px; color: var(--text-dim); font-size: 12px; }
 .preset-models, .configured-models { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }

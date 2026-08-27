@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 
 import SettingsPage from './SettingsPage.vue';
@@ -172,5 +172,54 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
     expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(true);
+  });
+
+  it('reveals the configured API key when clicking 显示', async () => {
+    const store = useAppStore();
+    const spy = vi.spyOn(store, 'getProviderApiKey').mockResolvedValue('sk-real-key');
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const input = wrapper.get('[data-test="provider-api-key"]');
+    expect(input.attributes('type')).toBe('password');
+
+    await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
+    await flushPromises();
+
+    expect(spy).toHaveBeenCalledWith('p1');
+    expect((input.element as HTMLInputElement).value).toBe('sk-real-key');
+    expect(input.attributes('type')).toBe('text');
+
+    await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
+    await flushPromises();
+    expect(input.attributes('type')).toBe('password');
+  });
+
+  it('does not reveal when the key cannot be loaded', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'getProviderApiKey').mockResolvedValue(null);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    await wrapper.get('[data-test="toggle-provider-key"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="provider-api-key"]').attributes('type')).toBe('password');
+  });
+
+  it('copies the API key through the copy button', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'getProviderApiKey').mockResolvedValue('sk-real-key');
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    await wrapper.get('[data-test="copy-provider-key"]').trigger('click');
+    await flushPromises();
+
+    expect(writeText).toHaveBeenCalledWith('sk-real-key');
+    // 复制后输入框仍为掩码态，仅剪贴板拿到明文
+    expect(wrapper.get('[data-test="provider-api-key"]').attributes('type')).toBe('password');
   });
 });

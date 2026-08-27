@@ -462,6 +462,7 @@ export interface PyWebViewAPI {
   add_preset_provider(presetId: string, apiKey: string): Promise<any>;
   sync_preset_models(presetId: string): Promise<any>;
   update_provider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
+  get_provider_api_key(providerId: string): Promise<{ ok: boolean; api_key?: string; msg?: string }>;
   delete_provider(providerId: string): Promise<any>;
   add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean): Promise<any>;
   update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean): Promise<any>;
