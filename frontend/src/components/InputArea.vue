@@ -1,5 +1,15 @@
 <template>
-  <div id="input-area" data-theme-region="composer">
+  <div id="input-area" data-theme-region="composer" :class="{ 'is-resizing': isResizing }">
+    <!-- 顶边拖拽手柄：向上拖抬高输入框（多显示几行），向下拖以默认高度为下限；
+         双击恢复默认高度 -->
+    <div
+      class="resize-handle"
+      data-test="composer-resize-handle"
+      title="拖拽调节输入框高度 · 双击恢复默认"
+      :class="{ active: isResizing }"
+      @pointerdown="onHandlePointerdown"
+      @dblclick="resetHeight"
+    ></div>
     <!-- 排队消息条：回合运行期间发送的消息在此排队，不打断当前任务；
          删除按钮取消排队，闪电按钮停止当前任务并优先发送该消息 -->
     <div v-if="queueItems.length" id="queue-strip">
@@ -46,6 +56,7 @@
           ref="textareaRef"
           v-model="inputVal"
           rows="2"
+          :style="textareaHeight != null ? { height: textareaHeight + 'px' } : undefined"
           placeholder="向星瑶提问… / 调用技能与 MCP，@ 引用文件"
           @keydown="onKeydown"
           @input="detectToken"
@@ -101,7 +112,7 @@
             class="chip-btn model-chip"
             title="切换模型"
             @click.stop="toggleModelCascader"
-          ><AppIcon class="model-icon" name="brain" :size="13" :stroke-width="2" /><span class="model-label">{{ store.activeModelName || '选择模型' }}</span> <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" /></button>
+          ><AppIcon class="model-icon" name="box" :size="13" :stroke-width="2" /><span class="model-label">{{ store.activeModelName || '选择模型' }}</span> <AppIcon name="chevron-down" :size="10" :stroke-width="2" class="model-chevron" /></button>
           <ReasoningSelector
             ref="reasoningSelectorRef"
             variant="compact"
@@ -138,7 +149,8 @@
         <span class="token-summary" :title="summaryTitle">{{ tokenSummary }}</span>
       </div>
       <div class="r keyboard-hints" data-test="keyboard-hints">
-        <span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行 · <span class="kbd">Esc</span> 中断
+        <span class="ctx-percent" :class="tokenClass" :title="ctxTooltip">{{ ctxPctLabel }}</span>
+        <span class="hint-full"><span class="kbd">Enter</span> 发送 · <span class="kbd">Shift+Enter</span> 换行 · <span class="kbd">Esc</span> 中断</span>
       </div>
     </div>
   </div>
@@ -157,6 +169,7 @@ import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
 import { useAttachments } from '../composables/useAttachments';
 import { useSuggest } from '../composables/useSuggest';
+import { useComposerResize } from '../composables/useComposerResize';
 import { buildTokenSummary, formatTokenCount } from '../utils/tokenFormat';
 
 const store = useAppStore();
@@ -207,16 +220,18 @@ const summaryTitle = computed(() => (
 // 上下文圆环：周长固定，弧长按占用百分比推进，悬停显示用量详情
 const CTX_CIRCUMFERENCE = 2 * Math.PI * 8;
 const ctxArc = computed(() => (Math.min(tokenPct.value, 100) / 100) * CTX_CIRCUMFERENCE);
+const ctxPctLabel = computed(() => `上下文 ${Math.round(tokenPct.value)}%`);
 const ctxTooltip = computed(() => {
   const used = store.tokenUsage.used || 0;
   const win = store.tokenUsage.window || 0;
-  const pct = win ? Math.round((used / win) * 100) : 0;
   const remain = Math.max(win - used, 0);
-  return `上下文 ${pct}%（${formatTokenCount(used)} / ${formatTokenCount(win)}）· 剩余约 ${formatTokenCount(remain)}`;
+  return `${ctxPctLabel.value}（${formatTokenCount(used)} / ${formatTokenCount(win)}）· 剩余约 ${formatTokenCount(remain)}`;
 });
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
+// 输入框高度拖拽：最小=默认渲染高度，向上拖抬高、松手记忆，双击恢复
+const { textareaHeight, isResizing, onHandlePointerdown, resetHeight } = useComposerResize(() => textareaRef.value);
 
 // 排队消息：回合运行期间发送的消息（后端 message_queue 快照驱动）
 const queueItems = computed(() => store.currentMessageQueue);
@@ -288,6 +303,38 @@ async function undoQueue(item: QueuedMessage) {
   /* 顶部分隔线保持全宽，输入框本体限宽居中与上方消息列对齐 */
   padding: 12px 10px 10px;
   flex-shrink: 0;
+  position: relative;
+}
+/* 拖拽手柄：钉在输入区顶边（红线位置），全宽命中便于拖拽 */
+.resize-handle {
+  position: absolute;
+  top: -3px;
+  left: 0;
+  right: 0;
+  height: 10px;
+  cursor: row-resize;
+  z-index: 5;
+  touch-action: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.resize-handle::before {
+  content: '';
+  width: 36px;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--border);
+  transition: background 0.15s, width 0.15s;
+}
+.resize-handle:hover::before,
+.resize-handle.active::before {
+  background: var(--accent);
+  width: 56px;
+}
+/* 拖拽过程中禁止选中文本，避免指针划过消息区时高亮一片 */
+#input-area.is-resizing {
+  user-select: none;
 }
 #input-wrap {
   max-width: var(--chat-col-width);
@@ -519,6 +566,11 @@ textarea {
   padding: 1px 5px;
   font-size: 10px;
 }
+/* 上下文百分比：仅手机端元信息条右侧显示（桌面该位置是快捷键提示） */
+.ctx-percent {
+  display: none;
+  white-space: nowrap;
+}
 .tok-orange {
   color: var(--orange);
 }
@@ -534,8 +586,12 @@ textarea {
 }
 
 @media (max-width: 768px) {
-  .keyboard-hints {
+  /* 手机端元信息条右侧改显上下文百分比，快捷键提示隐藏 */
+  .keyboard-hints .hint-full {
     display: none;
+  }
+  .ctx-percent {
+    display: inline;
   }
   /* 手机端收窄按钮：权限/模型只显示图标（颜色仍跟随状态），沙盒只留 开/限 */
   .permission-mode-btn .perm-label,
