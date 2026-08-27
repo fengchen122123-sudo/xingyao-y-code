@@ -74,10 +74,10 @@ _register(
         "effort", ("default", "off", "high", "max"), "thinking_object_effort"
     ),
 )
-# GLM-5.3 强制思考：不支持关闭（thinking.type 传 disabled 会报错），
+# GLM-5.3/5.3-flash 强制思考：不支持关闭（thinking.type 传 disabled 会报错），
 # reasoning_effort 仅支持 low/high/max。
 _register(
-    ("glm-5.3",),
+    ("glm-5.3", "glm-5.3-flash"),
     ReasoningCapability(
         "effort", ("default", "low", "high", "max"), "thinking_object_effort"
     ),
