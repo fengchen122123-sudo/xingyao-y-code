@@ -143,3 +143,72 @@ def test_keepalive_response_without_usage_fails_loudly():
 
     with pytest.raises(RuntimeError, match="usage"):
         account_keepalive_response(SimpleNamespace(), {})
+
+
+def test_zhipu_keepalive_is_limited_to_official_routes():
+    from core.llm import _supports_cache_keepalive
+
+    assert _supports_cache_keepalive(
+        "openai/glm-5.3", "https://open.bigmodel.cn/api/paas/v4"
+    ) is True
+    assert _supports_cache_keepalive(
+        "zhipu/glm-5.2", "https://open.bigmodel.cn/api/paas/v4"
+    ) is True
+    # 第三方中转的 GLM 模型不放行
+    assert _supports_cache_keepalive(
+        "openai/glm-5.3", "https://tokenrhythm.studio/v1"
+    ) is False
+    assert _supports_cache_keepalive(
+        "openai/zai-org/GLM-5.2", "https://api.siliconflow.cn/v1"
+    ) is False
+    assert _supports_cache_keepalive(
+        "anthropic/glm-5.2", "https://ark.cn-beijing.volces.com/api/coding"
+    ) is False
+
+
+def test_glm_forced_thinking_keepalive_preserves_thinking_and_raises_output():
+    from core.cache_keepalive import (
+        KEEPALIVE_THINKING_MODEL_MAX_TOKENS,
+        build_keepalive_request,
+    )
+
+    original = {
+        "model": "openai/glm-5.3",
+        "api_key": "secret",
+        "api_base": "https://open.bigmodel.cn/api/paas/v4",
+        "messages": [{"role": "system", "content": "stable"}],
+        "tools": [{"type": "function", "function": {"name": "read_file"}}],
+        "reasoning_effort": "max",
+        "extra_body": {"thinking": {"type": "enabled"}},
+        "tool_choice": "auto",
+        "stream": True,
+    }
+
+    keepalive = build_keepalive_request(original)
+
+    # 强制思考模型收到 disabled 会直接报错；保活必须保留 enabled 并抬高上限
+    assert keepalive["extra_body"]["thinking"] == {"type": "enabled"}
+    assert "reasoning_effort" not in keepalive
+    assert keepalive["max_tokens"] == KEEPALIVE_THINKING_MODEL_MAX_TOKENS
+    assert keepalive["max_tokens"] > 1
+    assert keepalive["tool_choice"] == "none"
+
+
+def test_glm_closable_thinking_keepalive_still_flips_disabled():
+    from core.cache_keepalive import build_keepalive_request
+
+    original = {
+        "model": "openai/glm-5.2",
+        "api_key": "secret",
+        "api_base": "https://open.bigmodel.cn/api/paas/v4",
+        "messages": [{"role": "system", "content": "stable"}],
+        "extra_body": {"thinking": {"type": "enabled"}, "reasoning_effort": "high"},
+        "stream": True,
+    }
+
+    keepalive = build_keepalive_request(original)
+
+    # 有关闭档的 GLM 模型沿用既有行为：翻转 disabled + 1 token 上限
+    assert keepalive["extra_body"]["thinking"] == {"type": "disabled"}
+    assert "reasoning_effort" not in keepalive["extra_body"]
+    assert keepalive["max_tokens"] == 1

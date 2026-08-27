@@ -10,6 +10,9 @@ import time
 
 logger = logging.getLogger(__name__)
 MIN_KEEPALIVE_SECONDS = 60
+# GLM 强制思考模型的保活快照保留思考时，给思考 token 预留的输出上限；
+# 实际按生成量计费，该值只是防 1-token 截断报错的保险丝。
+KEEPALIVE_THINKING_MODEL_MAX_TOKENS = 1024
 
 
 def load_keepalive_interval() -> int:
@@ -35,10 +38,26 @@ def load_keepalive_interval() -> int:
     return interval
 
 
+def _request_thinking_locked(model):
+    """判定保活请求是否不得关闭思考（GLM 强制思考模型特例）。"""
+    try:
+        from core.llm import _glm_keepalive_thinking_locked
+
+        return bool(_glm_keepalive_thinking_locked(str(model or "")))
+    except Exception:
+        return False
+
+
 def build_keepalive_request(request):
-    """复制缓存相关请求前缀，并把保活输出严格限制为 1 token。"""
+    """复制缓存相关请求前缀，并把保活输出严格限制为 1 token。
+
+    例外：GLM 强制思考模型（glm-5.3/5.3-flash）收到 thinking.type=disabled
+    会直接报错，其保活快照保留 thinking 原样并抬高输出上限给思考留预算，
+    否则首次保活即失败并令服务自我停用。其余模型行为保持不变。
+    """
     if not request.get("model") or not request.get("messages"):
         raise ValueError("保活请求缺少 model 或 messages")
+    thinking_locked = _request_thinking_locked(request.get("model"))
     keepalive = {
         "model": request["model"],
         "api_key": request.get("api_key", ""),
@@ -46,7 +65,9 @@ def build_keepalive_request(request):
         "messages": deepcopy(request["messages"]),
         "tools": deepcopy(request.get("tools") or []),
         "stream": False,
-        "max_tokens": 1,
+        "max_tokens": (
+            KEEPALIVE_THINKING_MODEL_MAX_TOKENS if thinking_locked else 1
+        ),
         "num_retries": 0,
         "timeout": 30,
     }
@@ -56,9 +77,12 @@ def build_keepalive_request(request):
         keepalive["metadata"] = deepcopy(request["metadata"])
     if request.get("extra_body") is not None:
         extra_body = deepcopy(request["extra_body"])
-        # 推理强度与保活无关；移除后避免 1-token 上限与推理预算冲突。
+        # 推理强度与保活无关；移除后避免输出上限与推理预算冲突。
         extra_body.pop("reasoning_effort", None)
-        if extra_body.get("thinking", {}).get("type") == "enabled":
+        if (
+            not thinking_locked
+            and extra_body.get("thinking", {}).get("type") == "enabled"
+        ):
             extra_body["thinking"] = {"type": "disabled"}
         if extra_body:
             keepalive["extra_body"] = extra_body
