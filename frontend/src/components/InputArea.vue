@@ -67,11 +67,16 @@
 
         <div id="input-bar">
           <button
+            ref="attachBtnRef"
             data-test="attachment-button"
             class="chip-btn plus-btn"
             title="附加文件"
-            @click="handlePickFiles"
+            @click.stop="onAttachClick"
           ><AppIcon name="paperclip" :size="14" /></button>
+          <!-- 触摸设备的拍照/相册/文件隐藏入口 -->
+          <input ref="cameraInputRef" type="file" accept="image/*" capture="environment" style="display:none" @change="onPickInputChange">
+          <input ref="albumInputRef" type="file" accept="image/*" multiple style="display:none" @change="onPickInputChange">
+          <input ref="fileInputRef" type="file" multiple style="display:none" @change="onPickInputChange">
           <button
             ref="permBtnRef"
             data-test="permission-button"
@@ -144,6 +149,21 @@
       @close="showPermDropdown = false"
     />
 
+    <!-- 触摸设备附件菜单：拍照 / 相册 / 文件 -->
+    <Teleport to="body">
+      <div
+        v-if="showAttachMenu && attachBtnRef"
+        class="attach-menu"
+        data-test="attach-menu"
+        :style="attachMenuStyle"
+        @click.stop
+      >
+        <button data-test="attach-camera" class="attach-menu-item" @click="pickFrom('camera')">📷 拍照</button>
+        <button data-test="attach-album" class="attach-menu-item" @click="pickFrom('album')">🖼 相册</button>
+        <button data-test="attach-file" class="attach-menu-item" @click="pickFrom('file')">📁 文件</button>
+      </div>
+    </Teleport>
+
     <div id="input-meta">
       <div class="l">
         <span class="token-summary" :title="summaryTitle">{{ tokenSummary }}</span>
@@ -168,6 +188,7 @@ import ReasoningSelector from './ReasoningSelector.vue';
 import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
 import { useAttachments } from '../composables/useAttachments';
+import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
 import { useComposerResize } from '../composables/useComposerResize';
 import { buildTokenSummary, formatTokenCount } from '../utils/tokenFormat';
@@ -228,7 +249,7 @@ const ctxTooltip = computed(() => {
   return `${ctxPctLabel.value}（${formatTokenCount(used)} / ${formatTokenCount(win)}）· 剩余约 ${formatTokenCount(remain)}`;
 });
 
-const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths } = useAttachments();
+const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths, uploadFiles } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
 // 输入框高度拖拽：最小=默认渲染高度，向上拖抬高、松手记忆，双击恢复
 const { textareaHeight, isResizing, onHandlePointerdown, resetHeight } = useComposerResize(() => textareaRef.value);
@@ -263,6 +284,52 @@ onUnmounted(() => clearSuggest());
 async function handlePickFiles() {
   await pickAttachments();
 }
+
+// 触摸设备（手机/平板）：点回形针弹「拍照/相册/文件」菜单；桌面仍走系统文件对话框
+const isTouch = useIsTouch();
+const showAttachMenu = ref(false);
+const attachBtnRef = ref<HTMLElement | null>(null);
+const cameraInputRef = ref<HTMLInputElement | null>(null);
+const albumInputRef = ref<HTMLInputElement | null>(null);
+const fileInputRef = ref<HTMLInputElement | null>(null);
+
+function onAttachClick() {
+  if (!isTouch.value) { handlePickFiles(); return; }
+  showAttachMenu.value = !showAttachMenu.value;
+}
+
+function pickFrom(kind: 'camera' | 'album' | 'file') {
+  showAttachMenu.value = false;
+  const el = kind === 'camera' ? cameraInputRef.value : kind === 'album' ? albumInputRef.value : fileInputRef.value;
+  el?.click();
+}
+
+async function onPickInputChange(e: Event) {
+  const input = e.target as HTMLInputElement;
+  const files = Array.from(input.files || []);
+  input.value = '';  // 允许重复选同一文件
+  if (files.length) await uploadFiles(files);
+}
+
+function onGlobalClickForAttachMenu(e: MouseEvent) {
+  if (showAttachMenu.value && attachBtnRef.value && !attachBtnRef.value.contains(e.target as Node)) {
+    showAttachMenu.value = false;
+  }
+}
+onMounted(() => document.addEventListener('click', onGlobalClickForAttachMenu));
+onUnmounted(() => document.removeEventListener('click', onGlobalClickForAttachMenu));
+
+// 菜单定位到回形针按钮上方
+const attachMenuStyle = computed<Record<string, string>>(() => {
+  const el = attachBtnRef.value;
+  if (!el) return {};
+  const r = el.getBoundingClientRect();
+  return {
+    position: 'fixed',
+    left: `${Math.round(r.left)}px`,
+    bottom: `${Math.round(window.innerHeight - r.top + 8)}px`,
+  };
+});
 
 function handleSend() {
   // 运行中且没有新内容：按钮为停止态，点击中断当前回合；
@@ -608,4 +675,35 @@ textarea {
   .sandbox-label-short {
     display: inline;
   }
-}</style>
+}
+
+/* 触摸设备附件菜单（拍照/相册/文件） */
+.attach-menu {
+  z-index: 1200;
+  min-width: 140px;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--float-bg);
+  box-shadow: 0 16px 42px rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(16px);
+}
+.attach-menu-item {
+  width: 100%;
+  min-height: 40px;
+  padding: 9px 12px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 14px;
+  text-align: left;
+  cursor: pointer;
+  display: block;
+}
+.attach-menu-item:hover {
+  background: var(--bg3);
+  color: var(--text);
+}
+</style>
