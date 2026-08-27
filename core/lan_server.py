@@ -24,6 +24,9 @@ from typing import Any, Dict, Optional
 from websockets.http11 import Headers, Response
 from websockets.sync.server import serve
 
+import config
+from config import save_config_value as _save_config_value
+
 
 class LanServer:
     """在 Y-code 进程内运行的局域网远程控制服务。
@@ -110,18 +113,52 @@ class LanServer:
             return False
 
     def _issue_token(self) -> str:
-        """签发新配对 token（旧 token 立即失效），返回可展示的明文。"""
+        """签发新配对 token（旧 token 立即失效），持久化后返回明文。"""
         self._token = secrets.token_urlsafe(24).encode()
         self._token_expires = time.time() + self._ttl
+        try:
+            _save_config_value(config.REMOTE_PAIR_TOKEN_KEY, self._token.decode())
+            _save_config_value(
+                config.REMOTE_PAIR_TOKEN_EXPIRES_KEY, self._token_expires
+            )
+        except Exception:
+            # 持久化失败不阻断签发：仅影响重启后的固定性，不影响本次可用性
+            pass
         return self._token.decode()
 
-    def set_ttl(self, seconds: int) -> None:
-        """更新配对 token 的有效期（秒）。"""
-        self._ttl = int(seconds)
+    def _load_persisted_token(self, token: str, expires_at: float) -> None:
+        """从持久层恢复未过期的配对 token；已过期或为空则忽略。"""
+        clean = str(token or "").strip()
+        try:
+            expires_at = float(expires_at)
+        except (TypeError, ValueError):
+            return
+        if not clean or time.time() >= expires_at:
+            return
+        self._token = clean.encode()
+        self._token_expires = expires_at
 
-    def get_bind_info(self) -> Dict:
-        """签发 token 并生成二维码，返回手机扫码绑定所需信息。"""
-        token = self._issue_token()
+    def _load_token_from_config(self) -> None:
+        """启动时从 config.json 恢复未过期 token（不存在则忽略）。"""
+        try:
+            data = config._load()
+            self._load_persisted_token(
+                data.get(config.REMOTE_PAIR_TOKEN_KEY),
+                data.get(config.REMOTE_PAIR_TOKEN_EXPIRES_KEY),
+            )
+        except Exception:
+            pass
+
+    def get_bind_info(self, force_new: bool = False) -> Dict:
+        """返回手机扫码绑定信息。
+
+        token 固定策略：未过期直接复用（多次打开/应用重启 token 不变）；
+        已过期自动重签；force_new=True（前端"刷新"按钮）强制重签并使旧
+        token 立即失效。expires_in 返回剩余有效秒数（而非完整 TTL）。
+        """
+        if force_new or not self._token or time.time() >= self._token_expires:
+            self._issue_token()
+        token = self._token.decode()
         url = self.bind_url(token)
         img = qrcode.make(url)
         buf = io.BytesIO()
@@ -132,8 +169,12 @@ class LanServer:
             "url": url,
             "token": token,
             "qr": f"data:image/png;base64,{qr_b64}",
-            "expires_in": self._ttl,
+            "expires_in": max(0, int(self._token_expires - time.time())),
         }
+
+    def set_ttl(self, seconds: int) -> None:
+        """更新配对 token 的有效期（秒）。"""
+        self._ttl = int(seconds)
 
     # ------------------------------------------------------------------ #
     # 事件广播
@@ -314,6 +355,8 @@ class LanServer:
 
     def start(self) -> Dict:
         """启动单端口 HTTP + WebSocket 服务（阻塞 serve 放到 daemon 线程）。"""
+        # 启动时恢复上次的配对 token：保证应用重启后二维码 token 保持固定
+        self._load_token_from_config()
         self._server = serve(
             self._handle_ws,
             host="0.0.0.0",
