@@ -1,5 +1,5 @@
 <template>
-  <div class="settings-page">
+  <div class="settings-page" :class="{ 'settings-page--mobile': isMobile }">
     <aside class="settings-nav">
       <button class="back-workspace" @click="attemptCloseSettings"><AppIcon name="arrow-left" :size="14" /> 返回工作区</button>
       <div class="nav-section">基础设置</div>
@@ -26,7 +26,7 @@
       </header>
 
       <section class="model-settings-card">
-        <aside class="provider-list">
+        <aside class="provider-list" v-if="!isMobile || !mobileDetail">
           <div class="list-label">已配置厂商</div>
           <button
             v-for="provider in store.providers"
@@ -86,7 +86,9 @@
           </button>
         </aside>
 
-        <div class="provider-detail">
+        <div class="provider-detail" v-if="!isMobile || mobileDetail">
+          <!-- 手机端钻取：详情顶栏返回列表（桌面端不渲染该按钮） -->
+          <button v-if="isMobile" class="mobile-detail-back" @click="closeMobileDetail"><AppIcon name="arrow-left" :size="14" /> 返回列表</button>
           <template v-if="selectedPreset">
             <div class="detail-title-row">
               <div>
@@ -477,6 +479,7 @@ import type { ChangelogEntry, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
 import SystemSettings from './SystemSettings.vue';
+import { useIsMobile } from '../composables/useViewport';
 import qrcodeWechat from '../assets/qrcode-wechat.png';
 import qrcodeFeishu from '../assets/qrcode-feishu.png';
 
@@ -485,6 +488,14 @@ const store = useAppStore();
 // 组件常驻，返回编辑器时通过 watch 同步
 const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'about' | 'contact'>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
+// ── 手机端钻取式布局（≤768px）────────────────────────────────
+// 桌面：分区侧栏 + 厂商列表 + 详情三栏并排（isMobile=false，模板不变）。
+// 手机：厂商列表全宽；点选后列表/详情互斥显示，详情顶栏带"返回列表"。
+const isMobile = useIsMobile();
+const mobileDetail = ref(false);
+function openMobileDetail() { if (isMobile.value) mobileDetail.value = true; }
+function closeMobileDetail() { mobileDetail.value = false; }
+
 const selectedKind = ref<'preset' | 'provider' | 'custom' | 'secondary'>('provider');
 const selectedId = ref(store.providers[0]?.id || '');
 const showAddProviders = ref(false);
@@ -567,16 +578,21 @@ watch(
   { immediate: true },
 );
 
+// 手机端把窗口拉宽到桌面尺寸时退出钻取态，避免详情被隐藏导致"卡"在列表
+watch(isMobile, (mobile) => { if (!mobile) mobileDetail.value = false; });
+
 function selectPreset(id: string) {
   selectedKind.value = 'preset';
   selectedId.value = id;
   presetApiKey.value = '';
+  openMobileDetail();
 }
 
 function selectProvider(id: string) {
   selectedKind.value = 'provider';
   selectedId.value = id;
   showAddProviders.value = false;
+  openMobileDetail();
 }
 
 // 点击左侧"副模型"入口：右侧切换到副模型设置面板
@@ -584,11 +600,13 @@ function selectSecondary() {
   selectedKind.value = 'secondary';
   selectedId.value = '';
   showAddProviders.value = false;
+  openMobileDetail();
 }
 
 function startCustomProvider() {
   selectedKind.value = 'custom';
   selectedId.value = '';
+  openMobileDetail();
 }
 
 function protocolLabel(id: string) {
@@ -979,10 +997,79 @@ onMounted(async () => {
 .wl-label { margin: 14px 0 6px; color: var(--text-dim); font-size: 11.5px; font-weight: 600; }
 .wl-item { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-dim); font-size: 12px; margin-bottom: 6px; word-break: break-all; }
 .wl-empty { padding: 26px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
+/* ── 手机端钻取式布局（≤768px）──────────────────────────────
+   分区导航变顶部横滑条；模型配置卡片单列，列表/详情互斥显示。
+   仅在窄断点生效，桌面端布局不受任何影响。 */
+.mobile-detail-back {
+  display: none; /* 桌面端隐藏；详情返回按钮仅手机端渲染 */
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  margin-bottom: 14px;
+  padding: 6px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg2);
+  color: var(--text);
+}
 @media (max-width: 900px) {
   .settings-nav { width: 170px; }
   .settings-main { padding: 28px 20px; }
   .model-settings-card { grid-template-columns: 220px minmax(0, 1fr); }
   .provider-detail { padding: 24px; }
+}
+@media (max-width: 768px) {
+  /* 页面纵向布局：导航在上、内容在下 */
+  .settings-page--mobile { flex-direction: column; }
+
+  /* 分区导航 → 顶部横滑胶囊条；分组标题与底部用户区隐藏 */
+  .settings-page--mobile .settings-nav {
+    width: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 7px;
+    padding: 10px 10px;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+    overflow-x: auto;
+    -webkit-overflow-scrolling: touch;
+    flex: none;
+  }
+  .settings-page--mobile .back-workspace { width: auto; flex: none; color: var(--accent); font-weight: 600; padding: 8px 4px; }
+  .settings-page--mobile .nav-section,
+  .settings-page--mobile .nav-spacer,
+  .settings-page--mobile .settings-user { display: none; }
+  .settings-page--mobile .nav-item {
+    flex: none;
+    /* 基础样式为纵向侧栏设计的 width:100% 必须复位，否则每个 chip 占满
+       一整屏宽，7 个分区要横向拖 7 屏（width:100% + flex:none 不收缩） */
+    width: auto;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 5px 11px;
+    font-size: 12.5px;
+  }
+  .settings-page--mobile .nav-item.active { background: var(--bg3); }
+
+  /* 内容区：去大留白 */
+  .settings-page--mobile .settings-main { padding: 16px 12px 22px; }
+  .settings-page--mobile .settings-header { margin-bottom: 14px; }
+  .settings-page--mobile .settings-header h1 { font-size: 24px; letter-spacing: -0.5px; }
+  .settings-page--mobile .settings-header p, .settings-page--mobile .detail-title-row p { font-size: 12px; }
+
+  /* 模型配置卡片：单列全宽；列表/详情由 v-show + isMobile 互斥显示 */
+  .settings-page--mobile .model-settings-card {
+    grid-template-columns: minmax(0, 1fr);
+    min-height: 0;
+    max-width: none;
+  }
+  .settings-page--mobile .provider-list { border-right: 0; border-bottom: 0; padding: 12px 12px 14px; }
+  .settings-page--mobile .provider-detail { padding: 18px 16px 22px; overflow-y: visible; }
+  .settings-page--mobile .detail-title-row { flex-wrap: wrap; gap: 10px; margin-bottom: 18px; }
+  .settings-page--mobile .mobile-detail-back { display: inline-flex; }
+
+  /* 其余分区的卡片跟随收紧（Token 统计等子组件自带适配，此处只调容器） */
+  .settings-page--mobile .perm-settings-card { padding: 6px 16px 20px; }
+  .settings-page--mobile .appearance-settings-card { padding: 16px 14px; }
 }
 </style>
