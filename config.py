@@ -157,6 +157,9 @@ MCP_FILE = os.path.join(YCODE_DIR, "mcp.json")
 # 局域网手机远程控制的配对 token 过期时间（秒）
 REMOTE_TOKEN_TTL_KEY = "remote_token_ttl"
 REMOTE_TOKEN_TTL_DEFAULT = 86400
+# 配对 token 与绝对过期时间戳（秒）的持久化键：应用重启后 token 保持固定
+REMOTE_PAIR_TOKEN_KEY = "remote_pair_token"
+REMOTE_PAIR_TOKEN_EXPIRES_KEY = "remote_pair_token_expires_at"
 
 # 自动从当前源码目录初始化默认配置文件
 if not os.path.exists(_CONFIG_FILE):

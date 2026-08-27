@@ -105,7 +105,8 @@ def test_get_bind_info_returns_url_token_qr():
     assert info["url"].startswith("http://192.168.1.5:8765/?token=")
     assert info["token"]
     assert info["qr"].startswith("data:image/png;base64,")
-    assert info["expires_in"] == srv._ttl
+    # expires_in 为剩余有效秒数：不超过完整 TTL 且为正
+    assert 0 < info["expires_in"] <= srv._ttl
 
 
 def test_ensure_lan_server_concurrent_single_instance(monkeypatch):
