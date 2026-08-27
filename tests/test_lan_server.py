@@ -158,3 +158,68 @@ def test_ensure_lan_server_concurrent_single_instance(monkeypatch):
     assert len(created) == 1
     assert all(r is bridge._lan_server for r in results)
     assert bridge._lan_server.port == 8765
+
+
+class _FakeClient:
+    """模拟已连接的 WebSocket 客户端，记录 send/close 调用。"""
+
+    def __init__(self):
+        self.sent = []
+        self.closed = []
+
+    def send(self, payload):
+        self.sent.append(payload)
+
+    def close(self, code=None, reason=None):
+        self.closed.append((code, reason))
+
+
+def test_issue_token_kicks_connected_clients():
+    """重签 token 必须断开所有已连接客户端并清空列表。
+
+    回归保护：修复前 token 只在连接建立时校验一次，刷新二维码后旧手机
+    的 WebSocket 依然存活，旧链接持续可控（二维码泄露无法补救）。
+    """
+    srv = LanServer(bridge=None)
+    c1, c2 = _FakeClient(), _FakeClient()
+    srv._clients = [c1, c2]
+
+    srv._issue_token()
+
+    assert srv._clients == []
+    assert c1.closed and c2.closed
+    assert c1.closed[0][0] == 4401
+    assert c2.closed[0][0] == 4401
+
+
+def test_refresh_bind_info_disconnects_old_clients():
+    """点击刷新（force_new）后：旧客户端被断开、旧 token 校验失败、新 token 可用。"""
+    srv = LanServer(bridge=None)
+    srv.port = 8765
+    srv.lan_ip = "192.168.1.5"
+    old = srv.get_bind_info()
+    client = _FakeClient()
+    srv._clients = [client]
+
+    new = srv.get_bind_info(force_new=True)
+
+    assert new["token"] != old["token"]
+    assert client.closed and client.closed[0][0] == 4401
+    assert srv._clients == []
+    assert not srv._verify_token(old["token"])
+    assert srv._verify_token(new["token"])
+
+
+def test_register_rejects_old_token_after_rotation():
+    """token 轮换后持旧 token 的连接不能注册为客户端（校验与注册需原子）。"""
+    srv = LanServer(bridge=None)
+    old = srv._issue_token()
+    srv._issue_token()  # 轮换，旧 token 失效
+
+    stale = _FakeClient()
+    assert srv._authenticate_and_register(stale, old) is False
+    assert srv._clients == []
+
+    fresh = _FakeClient()
+    assert srv._authenticate_and_register(fresh, srv._token.decode()) is True
+    assert srv._clients == [fresh]

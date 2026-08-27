@@ -402,6 +402,16 @@ export const useAppStore = defineStore('app', {
     settingsOpen: false,
     // frameless 关闭确认框（替代 win32 原生 MessageBox）：有回合运行时三选
     closeConfirm: { show: false, trayAvailable: false } as { show: boolean; trayAvailable: boolean },
+    // 手机端内置目录浏览器（引入新项目工作区用，桌面不使用）
+    remoteDirBrowser: {
+      show: false,
+      loading: false,
+      error: '',
+      current: '',
+      isRoot: true,
+      selected: '',
+      dirs: [] as Array<{ name: string; path: string }>,
+    },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
     settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'about' | 'contact',
@@ -1759,6 +1769,12 @@ export const useAppStore = defineStore('app', {
     async openWorkspaceFolder() {
       const api = this._api();
       if (!api) return;
+      // 触摸设备（手机/平板）：原生文件夹对话框只在电脑屏幕弹出，手机端
+      // 走内置目录浏览器（browse_remote_dirs + select_workspace_by_path）
+      if (window.matchMedia && window.matchMedia('(pointer: coarse)').matches) {
+        this.openRemoteDirBrowser();
+        return;
+      }
       try {
         const res = await api.select_workspace_folder();
         if (res && res.ok !== false && res.workdir) {
@@ -1773,6 +1789,66 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.notifyModal('项目分组', '选择文件夹失败: ' + err);
+      }
+    },
+
+    // ---- 手机端内置目录浏览器（引入新项目工作区） ----
+    async openRemoteDirBrowser() {
+      this.remoteDirBrowser.show = true;
+      this.remoteDirBrowser.loading = true;
+      this.remoteDirBrowser.error = '';
+      this.remoteDirBrowser.dirs = [];
+      this.remoteDirBrowser.selected = '';
+      await this.browseRemoteDirs('');
+    },
+
+    async browseRemoteDirs(path: string) {
+      const api = this._api();
+      if (!api) return;
+      this.remoteDirBrowser.loading = true;
+      this.remoteDirBrowser.error = '';
+      try {
+        const res = await (api as any).browse_remote_dirs(path);
+        if (res && res.ok) {
+          this.remoteDirBrowser.current = res.current || '';
+          this.remoteDirBrowser.isRoot = !!res.is_root;
+          this.remoteDirBrowser.dirs = res.dirs || [];
+        } else {
+          this.remoteDirBrowser.error = (res && res.msg) || '目录读取失败';
+        }
+      } catch (err) {
+        this.remoteDirBrowser.error = String(err);
+      } finally {
+        this.remoteDirBrowser.loading = false;
+      }
+    },
+
+    closeRemoteDirBrowser() {
+      this.remoteDirBrowser.show = false;
+    },
+
+    async confirmRemoteWorkspace(useCurrent = false) {
+      const api = this._api();
+      if (!api) return;
+      // 未勾选时允许直接把当前浏览目录作为工作区（"使用当前目录"按钮）
+      const path = this.remoteDirBrowser.selected
+        || (useCurrent ? this.remoteDirBrowser.current : '');
+      if (!path) return;
+      try {
+        const res = await (api as any).select_workspace_by_path(path);
+        if (res && res.ok && res.workdir) {
+          this.workdir = res.workdir;
+          this.currentWorkdirLabel = res.workdir.split('\\').pop() || res.workdir;
+          if (res.file_tree) { this.fileTree = res.file_tree; this.fileTreeExpanded = []; }
+          if (res.sessions) this.sessionGroups = res.sessions;
+          if (res.skills) this.skills = res.skills;
+          this.remoteDirBrowser.show = false;
+          this.notifyModal('项目分组', '已成功引入项目文件夹: ' + res.workdir);
+        } else {
+          this.notifyModal('项目分组', '引入项目文件夹失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.notifyModal('项目分组', '引入项目文件夹失败: ' + err);
       }
     },
 
