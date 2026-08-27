@@ -2130,6 +2130,73 @@ class ApiBridge:
             logger.exception("get_workspace_state 失败")
             return {"ok": False, "msg": str(e)}
 
+    def browse_remote_dirs(self, path: str = "") -> Dict[str, Any]:
+        """列出指定目录的子目录（手机端内置文件夹浏览器数据源）。
+
+        path 为空时返回盘符列表（仅 Windows）。只列目录不列文件，
+        无副作用，供 LAN 远程调用；真实目录校验在 select_workspace_by_path。
+        """
+        try:
+            target = str(path or "").strip()
+            if not target:
+                if os.name == "nt":
+                    import string
+                    drives = []
+                    for letter in string.ascii_uppercase:
+                        drive = f"{letter}:\\"
+                        if os.path.exists(drive):
+                            drives.append({"name": drive, "path": drive})
+                    return {"ok": True, "is_root": True, "current": "", "dirs": drives}
+                home = os.path.expanduser("~")
+                return self.browse_remote_dirs(home)
+            real = _resolve_real_path(target)
+            if not real or not os.path.isdir(real):
+                return {"ok": False, "dirs": [], "msg": "目录不存在"}
+            dirs = []
+            try:
+                for entry in os.scandir(real):
+                    try:
+                        if entry.is_dir(follow_symlinks=False) and not entry.name.startswith("."):
+                            dirs.append({
+                                "name": entry.name,
+                                "path": os.path.normpath(os.path.join(real, entry.name)),
+                            })
+                    except OSError:
+                        continue
+            except PermissionError:
+                pass
+            dirs.sort(key=lambda d: d["name"].lower())
+            return {"ok": True, "is_root": False, "current": real, "dirs": dirs}
+        except Exception as e:
+            logger.exception("browse_remote_dirs 失败")
+            return {"ok": False, "dirs": [], "msg": str(e)}
+
+    def select_workspace_by_path(self, path: str) -> Dict[str, Any]:
+        """按绝对路径直接切换项目工作区（手机端内置浏览器的确认动作）。
+
+        与 select_workspace_folder 的收尾逻辑一致：登记工作区、迁移 GLOBAL
+        会话归属、返回文件树与会话列表；但跳过原生对话框，由前端传入路径。
+        """
+        try:
+            selected_path = _resolve_real_path(str(path or ""))
+            if not selected_path or not os.path.isdir(selected_path):
+                return {"ok": False, "msg": "路径不是有效文件夹"}
+            if self._memory is None:
+                return {"ok": False, "msg": "后端未就绪"}
+            self._memory.add_workspace(selected_path)
+            if self._current_session and self._session_workdir(self._current_session) == "GLOBAL":
+                self._memory.update_session_workdir(self._current_session, selected_path)
+            return {
+                "ok": True,
+                "workdir": selected_path,
+                "file_tree": self._get_file_tree(selected_path),
+                "sessions": self.get_sessions(),
+                "skills": self._build_skill_list(),
+            }
+        except Exception as e:
+            logger.exception("select_workspace_by_path 失败")
+            return {"ok": False, "msg": str(e)}
+
     def select_workspace_folder(self) -> Dict[str, Any]:
         """弹出原生文件夹对话框，选择并切换项目工作区文件夹。"""
         try:
