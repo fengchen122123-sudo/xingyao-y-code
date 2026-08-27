@@ -322,7 +322,7 @@ onUnmounted(() => document.removeEventListener('click', onGlobalClickForAttachMe
 // 菜单定位到回形针按钮上方
 const attachMenuStyle = computed<Record<string, string>>(() => {
   const el = attachBtnRef.value;
-  if (!el) return {};
+  if (!el) return {} as Record<string, string>;
   const r = el.getBoundingClientRect();
   return {
     position: 'fixed',
