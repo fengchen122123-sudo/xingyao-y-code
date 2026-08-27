@@ -4522,6 +4522,41 @@ class ApiBridge:
         """pywebview 原生 drop 事件回调存储的完整路径，供前端 drop 时查询。"""
         self._dropped_paths = list(paths or [])
 
+    UPLOAD_MAX_BYTES = 50 * 1024 * 1024  # 50MB
+
+    def _save_bytes_to_temp(self, raw: bytes, ext: str) -> str:
+        """把二进制写入 ycode_paste 临时目录，返回完整路径（时间戳+随机后缀防撞名）。"""
+        import tempfile
+
+        paste_dir = os.path.join(tempfile.gettempdir(), "ycode_paste")
+        os.makedirs(paste_dir, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        ms = int(time.time() * 1000) % 1000
+        path = os.path.join(
+            paste_dir,
+            f"upload_{ts}_{ms:03d}_{uuid.uuid4().hex[:6]}{ext}",
+        )
+        with open(path, "wb") as f:
+            f.write(raw)
+        return path
+
+    def upload_file(self, name: str, data_b64: str) -> Dict[str, Any]:
+        """手机/平板端经 WS RPC 上传文件（base64），落盘后返回路径供作为附件发送。"""
+        try:
+            raw = base64.b64decode(data_b64 or "", validate=True)
+        except Exception:
+            return {"ok": False, "msg": "无效的文件数据"}
+        try:
+            if len(raw) > self.UPLOAD_MAX_BYTES:
+                return {"ok": False, "msg": "文件超过 50MB，无法上传"}
+            base = os.path.basename(str(name or "file"))
+            _, ext = os.path.splitext(base)
+            path = self._save_bytes_to_temp(raw, ext or ".bin")
+            return {"ok": True, "path": path}
+        except Exception as e:
+            logger.exception("upload_file 失败")
+            return {"ok": False, "msg": str(e)}
+
     def get_dropped_paths(self) -> List[str]:
         """取出并清空最近一次的拖拽文件路径（一次性消费）。"""
         paths = getattr(self, '_dropped_paths', []) or []
