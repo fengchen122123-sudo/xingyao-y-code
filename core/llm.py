@@ -2226,6 +2226,55 @@ def _is_official_deepseek_route(api_base=""):
     }
 
 
+def _is_official_zhipu_route(api_base=""):
+    """只识别智谱官方隐式缓存路由（open.bigmodel.cn）。
+
+    智谱上下文缓存为服务端隐式自动命中（无亲和参数、无显式标记），仅官方
+    直连可确定生效；聚合网关/经销商挂载的 GLM 模型不放行。
+    """
+    try:
+        parsed = urlsplit(str(api_base or ""))
+        host = str(parsed.hostname or "").lower()
+        path = str(parsed.path or "").rstrip("/").lower()
+        port = parsed.port
+    except Exception:
+        return False
+    if (
+        str(parsed.scheme or "").lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    return host == "open.bigmodel.cn" and path in {"", "/api/paas/v4"}
+
+
+def _is_glm_family(model_name, api_base=""):
+    """判断是否智谱 GLM 系模型（模型名优先，api_base 兜底）。"""
+    model = str(model_name or "").split("/")[-1].lower()
+    return "glm" in model or _is_official_zhipu_route(api_base)
+
+
+def _glm_keepalive_thinking_locked(model_name):
+    """GLM 强制思考模型判定：思考没有关闭档，保活不得翻转成 disabled。
+
+    能力表里 glm-5.3 / glm-5.3-flash 强制思考（thinking.type=disabled 直接
+    报错），无 off/on 关闭档即视为强制思考。显式限定 GLM 家族：Kimi-K3、
+    kimi-for-coding、minimax 等同样没有关闭档的非 GLM 模型不进此分支，
+    其保活快照保持既有字节不变。
+    """
+    if not _is_glm_family(model_name):
+        return False
+    from core.reasoning_capabilities import get_reasoning_capability
+
+    capability = get_reasoning_capability(model_name)
+    if capability.kind == "hidden":
+        return False
+    return not ({"off", "on"} & set(capability.options))
+
+
 def _uses_deepseek_prompt_ledger(
     model_name, api_base, cache_scope, persist, parent_session
 ):
@@ -2368,13 +2417,16 @@ def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
 
 
 def _supports_cache_keepalive(model_name, api_base=""):
-    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi 路由。"""
+    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi/智谱官方路由。"""
     return (
         _is_kimi_family(model_name, api_base)
         and _is_official_kimi_route(api_base)
     ) or (
         _is_deepseek_family(model_name, api_base)
         and _is_official_deepseek_route(api_base)
+    ) or (
+        _is_glm_family(model_name, api_base)
+        and _is_official_zhipu_route(api_base)
     )
 
 

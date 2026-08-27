@@ -110,6 +110,14 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   但 `_release_slot` 幂等立即归还名额，排队超过任务自身超时预算直接判 timed_out，
   避免泄漏线程占满 5 个名额导致前台回合无限阻塞。
 - `core/cache_keepalive.py`：前缀缓存保活默认 120 秒（0 关闭，最小 60），仅 DeepSeek/Kimi 路由生效。
+- 智谱 GLM 缓存路线：官方隐式自动缓存（无亲和参数、无显式标记、命中五折、TTL 不透明），
+  客户端走「稳定字节 + 保活」。`core/llm.py:_supports_cache_keepalive` 对官方
+  open.bigmodel.cn（`_is_official_zhipu_route`）放行，第三方中转的 GLM 模型不放行。
+  特例：GLM 强制思考模型（glm-5.3/5.3-flash，能力表无关闭档，`thinking.type=disabled`
+  直接报错）的保活快照必须保留 thinking.enabled 并把 max_tokens 抬到
+  `KEEPALIVE_THINKING_MODEL_MAX_TOKENS=1024`（`core/cache_keepalive.py`，
+  判定入口 `_glm_keepalive_thinking_locked` 显式限定 GLM 家族——Kimi-K3/minimax 等
+  同样无关闭档的非 GLM 模型不得进此分支）；否则首次保活即报错并令服务自我停用。
 - `core/llm.py` 在飞请求硬中断：`_request_stream` 把每个流请求登记到 cancel_event 名下
   （`_inflight_streams` 注册表），停止路径（GUI stop / CLI Ctrl+C / 子代理 `_terminate`）
   先 set cancel_event 再调 `abort_inflight_streams()` 直接关闭底层流，阻塞读立即抛错退出，
