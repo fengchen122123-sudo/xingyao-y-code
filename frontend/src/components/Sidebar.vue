@@ -150,9 +150,12 @@
       <div class="modal-body">
         <img class="qr-img" :src="remoteBind.qr" alt="绑定二维码" />
         <div class="bind-url">{{ remoteBind.url }}</div>
-        <div class="bind-hint">链接有效期：{{ formatExpiry(remoteBind.expires_in) }}，请在过期前扫码</div>
+        <div class="bind-hint" data-test="remote-bind-hint">
+          {{ remoteBindRefreshing ? '正在刷新配对链接…' : `链接有效期：${formatExpiry(remoteBind.expires_in)}，请在过期前扫码` }}
+        </div>
       </div>
       <div class="modal-foot">
+        <button class="btn" data-test="remote-bind-refresh" :disabled="remoteBindRefreshing" @click="refreshRemoteBind()">刷新</button>
         <button class="btn primary" data-test="remote-bind-close" @click="closeRemoteBind()">关闭</button>
       </div>
     </div>
@@ -175,6 +178,10 @@ const confirmDeleteName = ref('');
 const confirmDeleteGroupPath = ref('');
 // 手机远程控制绑定信息（点击手机图标后弹出二维码）
 const remoteBind = ref<null | { url: string; qr: string; expires_in: number }>(null);
+// 配对链接刷新中标记：刷新期间禁用按钮避免重复点击
+const remoteBindRefreshing = ref(false);
+// 过期检查定时器：弹窗打开期间每秒检测，过期自动刷新 token
+let remoteBindExpiryTimer: ReturnType<typeof setInterval> | null = null;
 
 function askDeleteGroup(path: string) {
   confirmDeleteGroupPath.value = path;
@@ -293,8 +300,9 @@ async function openFolder(path: string) {
   }
 }
 
-// 打开手机远程控制绑定弹窗：向后端请求二维码与配对链接
-async function openRemoteBind() {
+// 打开手机远程控制绑定弹窗：向后端请求二维码与配对链接。
+// 后端 token 固定：未过期直接复用，应用重启也不变；过期由后端自动重签。
+async function fetchRemoteBind(forceNew: boolean) {
   const api = window.pywebview && window.pywebview.api;
   if (!api) {
     store.notifyModal('手机远程控制', '后端连接失败：pywebview API 不可用');
@@ -302,22 +310,60 @@ async function openRemoteBind() {
   }
   try {
     // get_remote_bind_qr 为后端桥接方法，前端类型契约尚未收录，故此处按返回结构取用
-    const result = await (api as any).get_remote_bind_qr();
+    const result = await (api as any).get_remote_bind_qr(forceNew);
     if (result && result.ok && result.qr && result.url) {
       remoteBind.value = {
         url: result.url,
         qr: result.qr,
         expires_in: result.expires_in ?? 0,
       };
-    } else {
+      startExpiryWatch();
+    } else if (!forceNew || !remoteBind.value) {
       store.notifyModal('手机远程控制', (result && result.msg) || '获取绑定二维码失败');
+    } else {
+      // 手动刷新失败时保留旧弹窗内容，仅提示
+      store.notifyModal('手机远程控制', (result && result.msg) || '刷新配对链接失败');
     }
   } catch (err) {
     store.notifyModal('手机远程控制', String(err));
+  } finally {
+    remoteBindRefreshing.value = false;
+  }
+}
+
+async function openRemoteBind() {
+  await fetchRemoteBind(false);
+}
+
+// 手动刷新：强制后端重签 token，已绑定的旧链接立即失效
+async function refreshRemoteBind() {
+  if (remoteBindRefreshing.value) return;
+  remoteBindRefreshing.value = true;
+  await fetchRemoteBind(true);
+}
+
+// 弹窗打开期间每秒检测剩余有效期，到期自动向后端请求新 token（未过期时后端会直接复用）
+function startExpiryWatch() {
+  stopExpiryWatch();
+  remoteBindExpiryTimer = setInterval(() => {
+    if (!remoteBind.value) return;
+    remoteBind.value.expires_in -= 1;
+    if (remoteBind.value.expires_in <= 0) {
+      // 过期：自动刷新（后端检测到过期会重签新 token）
+      fetchRemoteBind(false);
+    }
+  }, 1000);
+}
+
+function stopExpiryWatch() {
+  if (remoteBindExpiryTimer !== null) {
+    clearInterval(remoteBindExpiryTimer);
+    remoteBindExpiryTimer = null;
   }
 }
 
 function closeRemoteBind() {
+  stopExpiryWatch();
   remoteBind.value = null;
 }
 

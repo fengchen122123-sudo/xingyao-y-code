@@ -76,3 +76,66 @@ it('点击弹窗遮罩不关闭，仅点击关闭按钮才关闭', async () => {
   await wrapper.find('[data-test="remote-bind-close"]').trigger('click');
   expect(wrapper.find('[data-test="remote-bind-modal"]').exists()).toBe(false);
 });
+
+it('重复打开弹窗直接复用同一 token（不强制重签）', async () => {
+  const get_remote_bind_qr = vi.fn(async () => ({
+    ok: true,
+    url: 'http://192.168.1.5:8765/?token=abc123',
+    token: 'abc123',
+    qr: 'data:image/png;base64,QUJD',
+    expires_in: 86400,
+  }));
+  (window as any).pywebview = { api: { get_remote_bind_qr } };
+
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+  // 关闭后再打开：仍应不带 force_new 调用，由后端决定复用
+  await wrapper.find('[data-test="remote-bind-close"]').trigger('click');
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(get_remote_bind_qr).toHaveBeenCalledTimes(2);
+  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(1, false);
+  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(2, false);
+});
+
+it('点击刷新按钮以 force_new 重新获取 token', async () => {
+  const get_remote_bind_qr = vi
+    .fn()
+    .mockResolvedValueOnce({
+      ok: true,
+      url: 'http://192.168.1.5:8765/?token=old',
+      token: 'old',
+      qr: 'data:image/png;base64,OLD',
+      expires_in: 86400,
+    })
+    .mockResolvedValueOnce({
+      ok: true,
+      url: 'http://192.168.1.5:8765/?token=new',
+      token: 'new',
+      qr: 'data:image/png;base64,NEW',
+      expires_in: 86400,
+    });
+  (window as any).pywebview = { api: { get_remote_bind_qr } };
+
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+  expect(wrapper.find('[data-test="remote-bind-modal"]').exists()).toBe(true);
+
+  const refreshBtn = wrapper.find('[data-test="remote-bind-refresh"]');
+  expect(refreshBtn.exists()).toBe(true);
+  await refreshBtn.trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(get_remote_bind_qr).toHaveBeenLastCalledWith(true);
+  const modal = wrapper.find('[data-test="remote-bind-modal"]');
+  expect(modal.find('img').attributes('src')).toBe('data:image/png;base64,NEW');
+});
