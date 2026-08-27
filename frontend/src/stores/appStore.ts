@@ -3172,6 +3172,21 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    async getProviderApiKey(providerId: string): Promise<string | null> {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.get_provider_api_key(providerId);
+        if (res?.ok) return res.api_key || '';
+        this.notifyModal('供应商', '读取 API Key 失败: ' + (res?.msg || '未知错误'));
+        return null;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('供应商', '读取 API Key 失败: ' + err);
+        return null;
+      }
+    },
+
     async deleteProvider(provider: ProviderInfo) {
       const ok = await this.askConfirm('删除厂商', '旗下模型也会删除', `确定要删除厂商「${provider.name}」吗？`);
       if (!ok) return;

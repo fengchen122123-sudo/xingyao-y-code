@@ -4831,6 +4831,18 @@ class ApiBridge:
             "secondary_model_roles": get_secondary_roles(),
         }
 
+    def get_provider_api_key(self, provider_id: str) -> Dict[str, Any]:
+        """按需返回厂商 API Key 明文（仅设置页用户主动点击"显示/复制"时调用）。"""
+        try:
+            config_data = load_config()
+            for provider in config_data.get("providers", []):
+                if str(provider.get("id")) == str(provider_id):
+                    return {"ok": True, "api_key": str(provider.get("api_key") or "")}
+            return {"ok": False, "msg": "厂商不存在"}
+        except Exception as e:
+            logger.exception("get_provider_api_key 失败")
+            return {"ok": False, "msg": str(e)}
+
     def _all_models(self) -> List[Dict[str, Any]]:
         try:
             return self.get_model_settings()["models"]
