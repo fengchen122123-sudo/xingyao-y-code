@@ -18,7 +18,7 @@ describe('ReasoningSelector', () => {
       disabled_reason: '该模型始终开启思考', choice: 'on', options: [],
     };
 
-    // hero 变体带文字标签；compact 只留图标，等级经 title 呈现
+    // hero 变体带文字标签；compact 也显示文字标签（等级）
     const wrapper = mount(ReasoningSelector, { props: { variant: 'hero' } });
     const button = wrapper.get('[data-test="reasoning-button"]');
 
@@ -27,7 +27,7 @@ describe('ReasoningSelector', () => {
     expect(button.attributes('title')).toBe('该模型始终开启思考');
   });
 
-  it('compact 变体只显示脑子图标，不带文字标签', () => {
+  it('compact 变体显示脑子图标和文字标签', () => {
     const store = useAppStore();
     store.reasoning = {
       kind: 'fixed', visible: true, disabled: true,
@@ -38,7 +38,7 @@ describe('ReasoningSelector', () => {
     const button = wrapper.get('[data-test="reasoning-button"]');
 
     expect(button.find('svg').exists()).toBe(true);
-    expect(button.text()).not.toContain('开启');
+    expect(button.text()).toContain('开启');
     expect(button.attributes('title')).toBe('该模型始终开启思考');
   });
 

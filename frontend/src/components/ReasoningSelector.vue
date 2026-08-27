@@ -10,10 +10,10 @@
     @click.stop="toggleMenu"
   >
     <AppIcon name="brain" :size="14" :stroke-width="1.9" />
-    <!-- compact 变体只留脑子图标（ZCode 式），等级经 title 与下拉菜单呈现 -->
-    <span v-if="variant === 'hero'">{{ currentLabel }}</span>
+    <!-- compact 变体也显示文字标签（等级），方便用户一眼看到当前思考强度 -->
+    <span class="reasoning-label">{{ currentLabel }}</span>
     <AppIcon
-      v-if="variant === 'hero' && !store.reasoning.disabled"
+      v-if="!store.reasoning.disabled"
       name="chevron-down"
       :size="10"
       :stroke-width="2"
@@ -171,6 +171,13 @@ defineExpose({ close });
   padding: 0 11px;
   font-size: 13px;
   background: transparent;
+}
+/* 手机端：思考按钮只显示脑子图标，隐藏等级文字与展开箭头 */
+@media (max-width: 768px) {
+  .reasoning-label,
+  .reasoning-chevron {
+    display: none;
+  }
 }
 .reasoning-chevron {
   color: var(--text-faint);
