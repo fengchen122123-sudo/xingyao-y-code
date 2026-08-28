@@ -25,9 +25,53 @@ def _call(name, arguments, *, call_id="call-1", **context):
 
 @pytest.fixture(autouse=True)
 def _stable_tool_environment(monkeypatch):
+    from core import permission_grants, permission_store
+
+    class EmptyMcp:
+        def get_schemas(self):
+            return []
+
+        def get_schema(self, _name):
+            return None
+
+    permission_grants._clear_all_for_tests()
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
     monkeypatch.setattr(llm, "is_outside_workspace", lambda _path: False)
     monkeypatch.setattr(llm, "safe_print", lambda _message: None)
+    monkeypatch.setattr(llm, "_get_mcp_manager", lambda: EmptyMcp())
+    monkeypatch.setattr(
+        permission_store,
+        "project_rules",
+        lambda *_args, **_kwargs: {
+            "commands": set(),
+            "write_files": set(),
+            "edit_files": set(),
+        },
+    )
+    yield
+    permission_grants._clear_all_for_tests()
+
+
+def _auto_answer_pipeline_permission(monkeypatch, choice, asked, requests):
+    from core.permission_broker import PermissionBroker
+
+    broker = PermissionBroker()
+
+    def activate(request):
+        asked.append(request.function_name)
+        requests.append(request)
+        broker.resolve(request.request_id, choice)
+
+    broker.set_prompt_handlers(activate, lambda: None)
+    monkeypatch.setattr(llm, "permission_broker", broker)
+
+
+def _authorization(allowed, reason="test", *, sandbox_bypass=False):
+    return llm.AuthorizationResult(
+        allowed,
+        reason,
+        sandbox_bypass=sandbox_bypass,
+    )
 
 
 def test_invalid_json_returns_exact_tool_message():
@@ -63,6 +107,105 @@ def test_unknown_tool_returns_exact_tool_message(monkeypatch):
     }
 
 
+def test_accept_edits_runs_query_and_normal_mutation_but_asks_sensitive(monkeypatch):
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
+    executed = []
+    registry = ToolRegistry([
+        ToolSpec(
+            name="execute_command",
+            description="command",
+            input_schema={
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+            },
+            execute=lambda command: executed.append(command) or ToolResult("ok"),
+        )
+    ])
+    monkeypatch.setattr(llm, "tool_registry", registry)
+    asked, requests = [], []
+    _auto_answer_pipeline_permission(monkeypatch, 1, asked, requests)
+
+    assert _call("execute_command", {"command": "git status"})["content"] == "ok"
+    assert _call("execute_command", {"command": "npm run build"})["content"] == "ok"
+    result = _call("execute_command", {"command": "git push origin dev"})
+
+    assert result["content"] == llm.PERMISSION_DENIED_MESSAGE
+    assert asked == ["execute_command"]
+    assert executed == ["git status", "npm run build"]
+
+
+def test_plan_mode_allows_read_only_command_and_denies_write(monkeypatch):
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "plan")
+    registry = ToolRegistry([
+        ToolSpec(
+            name="execute_command",
+            description="command",
+            input_schema={
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+            },
+            execute=lambda command: ToolResult("query-ok"),
+        ),
+        ToolSpec(
+            name="write_file",
+            description="write",
+            input_schema={"type": "object"},
+            execute=lambda **_kwargs: ToolResult("must-not-run"),
+            mutates_files=True,
+        ),
+    ])
+    monkeypatch.setattr(llm, "tool_registry", registry)
+
+    query = _call("execute_command", {"command": "git status"})
+    denied = _call("write_file", {"file_path": "plan-denied.txt", "content": "x"})
+
+    assert query["content"] == "query-ok"
+    assert denied["content"] == llm.PLAN_MODE_DENIED_MESSAGE
+
+
+def test_plan_mode_denies_query_command_with_explicit_shell_override(monkeypatch):
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "plan")
+    registry = ToolRegistry([
+        ToolSpec(
+            name="execute_command",
+            description="command",
+            input_schema={"type": "object"},
+            execute=lambda **_kwargs: ToolResult("must-not-run"),
+        )
+    ])
+    monkeypatch.setattr(llm, "tool_registry", registry)
+
+    result = _call(
+        "execute_command",
+        {"command": "git status", "shell_id": "powershell"},
+    )
+
+    assert result["content"] == llm.PLAN_MODE_DENIED_MESSAGE
+
+
+def test_catastrophic_command_never_enqueues_permission(monkeypatch):
+    registry = ToolRegistry([
+        ToolSpec(
+            name="execute_command",
+            description="command",
+            input_schema={"type": "object"},
+            execute=lambda **_kwargs: ToolResult("must-not-run"),
+        )
+    ])
+    monkeypatch.setattr(llm, "tool_registry", registry)
+    enqueued = []
+    monkeypatch.setattr(
+        llm.permission_broker,
+        "enqueue",
+        lambda *args, **kwargs: enqueued.append((args, kwargs)),
+    )
+
+    result = _call("execute_command", {"command": "format C:"})
+
+    assert result["content"] == "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+    assert enqueued == []
+
+
 def test_read_file_returns_exact_file_bytes(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "sample.txt"
@@ -79,7 +222,11 @@ def test_read_file_returns_exact_file_bytes(tmp_path, monkeypatch):
 def test_denied_write_file_returns_exact_message_without_mutating(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "denied.txt"
-    monkeypatch.setattr(llm, "check_permission_and_ask", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(
+        llm,
+        "authorize_tool_call",
+        lambda *_args, **_kwargs: _authorization(False, "user_denied"),
+    )
 
     result = _call("write_file", {"file_path": str(target), "content": "no"})
 
@@ -99,7 +246,11 @@ def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
     target = tmp_path / "approved.txt"
     target.write_bytes(b"old\n")
     events = []
-    monkeypatch.setattr(llm, "check_permission_and_ask", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        llm,
+        "authorize_tool_call",
+        lambda *_args, **_kwargs: _authorization(True),
+    )
     set_undo_session("tool-pipeline-write")
     try:
         result = _call(
@@ -134,7 +285,11 @@ def test_large_diff_keeps_full_counts_when_display_is_truncated(tmp_path, monkey
     target = tmp_path / "large.txt"
     events = []
     content = "".join(f"line-{index}\n" for index in range(60))
-    monkeypatch.setattr(llm, "check_permission_and_ask", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        llm,
+        "authorize_tool_call",
+        lambda *_args, **_kwargs: _authorization(True),
+    )
 
     _call(
         "write_file",
@@ -179,8 +334,11 @@ def test_credential_write_prompts_through_full_pipeline_even_when_sandbox_open(
     prompts = []
     monkeypatch.setattr(
         llm,
-        "check_permission_and_ask",
-        lambda function_name, *args, **kwargs: prompts.append(function_name) or True,
+        "authorize_tool_call",
+        lambda function_name, *args, **kwargs: (
+            prompts.append("sandbox_outside_access")
+            or _authorization(True, sandbox_bypass=True)
+        ),
     )
 
     result = _call("write_file", {"file_path": str(target), "content": "{}\n"})
@@ -210,8 +368,10 @@ def test_plugin_subdirectory_config_is_not_treated_as_top_level_credential(
     prompts = []
     monkeypatch.setattr(
         llm,
-        "check_permission_and_ask",
-        lambda function_name, *args, **kwargs: prompts.append(function_name) or True,
+        "authorize_tool_call",
+        lambda function_name, *args, **kwargs: (
+            prompts.append(function_name) or _authorization(True)
+        ),
     )
 
     result = _call("write_file", {"file_path": str(target), "content": "plugin\n"})
@@ -223,7 +383,11 @@ def test_plugin_subdirectory_config_is_not_treated_as_top_level_credential(
 def test_edit_file_missing_target_returns_exact_message(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "missing.txt"
-    monkeypatch.setattr(llm, "check_permission_and_ask", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        llm,
+        "authorize_tool_call",
+        lambda *_args, **_kwargs: _authorization(True),
+    )
 
     assert _call(
         "edit_file",
@@ -254,7 +418,11 @@ def test_execute_command_uses_registry_and_returns_exact_message(monkeypatch):
         )
     ])
     monkeypatch.setattr(llm, "tool_registry", registry)
-    monkeypatch.setattr(llm, "check_permission_and_ask", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        llm,
+        "authorize_tool_call",
+        lambda *_args, **_kwargs: _authorization(True),
+    )
 
     assert _call("execute_command", {"command": "echo hi"}) == {
         "role": "tool",
@@ -541,8 +709,56 @@ def test_direct_pipeline_enforces_sandbox_boundary(tmp_path, monkeypatch):
         context,
     )
 
-    assert result["content"] == (
-        "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径访问需要用户确认（可选择本会话内放行，或用 /sandbox on 长期开放）。"
+    assert result["content"] == llm.PERMISSION_DENIED_MESSAGE
+
+
+def test_project_whitelist_cannot_bypass_sandbox_boundary(tmp_path, monkeypatch):
+    from core import permission_store
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside.txt"
+    monkeypatch.chdir(workspace)
+    canonical = llm._canonical_permission_path(str(outside))
+    monkeypatch.setattr(
+        permission_store,
+        "project_rules",
+        lambda *_args, **_kwargs: {
+            "commands": set(),
+            "write_files": {canonical},
+            "edit_files": set(),
+        },
+    )
+    monkeypatch.setattr(
+        "core.model_manager.load_config",
+        lambda: {"allow_outside_workspace": False},
+    )
+    monkeypatch.setattr(llm, "is_outside_workspace", lambda _path: True)
+    registry = ToolRegistry([
+        ToolSpec(
+            name="write_file",
+            description="write",
+            input_schema={"type": "object"},
+            execute=lambda **_kwargs: ToolResult("must-not-run"),
+            mutates_files=True,
+        )
+    ])
+    monkeypatch.setattr(llm, "tool_registry", registry)
+    asked, requests = [], []
+    _auto_answer_pipeline_permission(monkeypatch, 1, asked, requests)
+
+    result = _call(
+        "write_file",
+        {"file_path": str(outside), "content": "blocked"},
+    )
+
+    assert result["content"] == llm.PERMISSION_DENIED_MESSAGE
+    assert not outside.exists()
+    assert asked == ["sandbox_outside_access"]
+    assert requests[0].option_keys == (
+        "allow_once",
+        "deny",
+        "allow_task_sandbox",
     )
 
 

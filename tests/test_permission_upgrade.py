@@ -38,25 +38,24 @@ def interactive_env(monkeypatch):
     monkeypatch.setattr(llm.app_context, "get_ui_flavor", lambda: "cli")
     monkeypatch.setattr(llm, "safe_print", lambda *args, **kwargs: None)
     monkeypatch.setattr(llm.app_context, "get_current_session", lambda: "session-test")
+    monkeypatch.setattr(
+        "core.model_manager.load_config",
+        lambda: {"allow_outside_workspace": False},
+    )
 
 
 @pytest.fixture
 def clean_permission_state():
     """清空会话白名单与沙盒会话放行，退出时同样复位，避免污染其他测试。"""
+    from core import permission_grants
     import core.tools as tools_mod
 
-    llm.session_allowed_commands.clear()
-    llm.session_allowed_write_files.clear()
-    llm.session_allowed_edit_files.clear()
-    llm.session_allowed_exact_commands.clear()
+    permission_grants._clear_all_for_tests()
     llm._last_tracked_session = None
     tools_mod.set_session_sandbox_bypass(False)
     yield
     tools_mod.set_session_sandbox_bypass(False)
-    llm.session_allowed_commands.clear()
-    llm.session_allowed_write_files.clear()
-    llm.session_allowed_edit_files.clear()
-    llm.session_allowed_exact_commands.clear()
+    permission_grants._clear_all_for_tests()
 
 
 def _auto_answer_broker(monkeypatch, choice, asked, requests):
@@ -80,7 +79,7 @@ def _auto_answer_broker(monkeypatch, choice, asked, requests):
 # accept_edits 第四档模式
 # ---------------------------------------------------------------------------
 
-def test_accept_edits_auto_approves_file_edits_but_asks_commands(
+def test_accept_edits_auto_approves_queries_and_edits_but_asks_sensitive_commands(
     interactive_env, clean_permission_state, monkeypatch, tmp_path
 ):
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
@@ -98,6 +97,11 @@ def test_accept_edits_auto_approves_file_edits_but_asks_commands(
     assert asked == []
 
     assert llm.check_permission_and_ask("execute_command", {"command": "git status"}) is True
+    assert asked == []
+    assert llm.check_permission_and_ask(
+        "execute_command",
+        {"command": "git push origin dev"},
+    ) is True
     assert asked == ["execute_command"]
 
 
@@ -146,7 +150,7 @@ def test_sandbox_outside_access_third_option_sets_session_bypass(
     ) is True
     # 选项恢复为 3 项，第三项是会话级放行
     assert len(requests[0].options) == 3
-    assert "会话" in requests[0].options[2]
+    assert "任务" in requests[0].options[2]
     assert tools_mod.is_session_sandbox_bypass_enabled() is True
 
     # 同会话第二次访问：免询问自动放行
@@ -156,7 +160,7 @@ def test_sandbox_outside_access_third_option_sets_session_bypass(
     assert asked == ["sandbox_outside_access"]
 
 
-def test_check_session_reset_clears_session_sandbox_bypass(
+def test_visible_session_switch_preserves_each_task_sandbox_bypass(
     clean_permission_state, monkeypatch
 ):
     import core.tools as tools_mod
@@ -164,12 +168,15 @@ def test_check_session_reset_clears_session_sandbox_bypass(
     state = {"session": "s1"}
     monkeypatch.setattr(llm.app_context, "get_current_session", lambda: state["session"])
 
-    llm.check_session_reset()  # 建立 s1 基线
+    llm.check_session_reset()
     tools_mod.set_session_sandbox_bypass(True)
     state["session"] = "s2"
-    llm.check_session_reset()  # 切会话收回
+    llm.check_session_reset()
 
     assert tools_mod.is_session_sandbox_bypass_enabled() is False
+
+    state["session"] = "s1"
+    assert tools_mod.is_session_sandbox_bypass_enabled() is True
 
 
 def test_canonical_permission_path_resolves_relative_against_workdir(
@@ -224,7 +231,7 @@ def test_always_allow_write_file_persists_across_restart(
     target = str(tmp_path / "a.py")
 
     asked, requests = [], []
-    _auto_answer_broker(monkeypatch, 2, asked, requests)  # 始终允许
+    _auto_answer_broker(monkeypatch, 3, asked, requests)  # 加入项目白名单
     assert llm.check_permission_and_ask("write_file", {"file_path": target, "content": "x"}) is True
 
     canonical = permission_store.canonical_file_path(target)
@@ -245,7 +252,7 @@ def test_always_allow_write_file_persists_across_restart(
     assert asked3 == ["write_file"]
 
 
-def test_always_allow_command_rule_matches_prefix_family(
+def test_project_command_rule_matches_prefix_family(
     interactive_env, clean_permission_state, monkeypatch, tmp_path
 ):
     from core import permission_store
@@ -254,22 +261,31 @@ def test_always_allow_command_rule_matches_prefix_family(
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
 
     asked, requests = [], []
-    _auto_answer_broker(monkeypatch, 2, asked, requests)
-    assert llm.check_permission_and_ask("execute_command", {"command": "git status"}) is True
+    _auto_answer_broker(monkeypatch, 3, asked, requests)
+    assert llm.check_permission_and_ask(
+        "execute_command",
+        {"command": "git push origin"},
+    ) is True
 
     rules = permission_store.project_rules()["commands"]
-    assert ("git", "status") in rules
+    assert ("git", "push", "origin") in rules
 
     # 同前缀族的后续命令免询问（模拟重启：仅靠持久化规则）
     llm.session_allowed_commands.clear()
     asked2, requests2 = [], []
     _auto_answer_broker(monkeypatch, 0, asked2, requests2)
-    assert llm.check_permission_and_ask("execute_command", {"command": "git status --short"}) is True
+    assert llm.check_permission_and_ask(
+        "execute_command",
+        {"command": "git push origin dev"},
+    ) is True
     assert asked2 == []
     # 前缀族之外的命令仍询问
     asked3, requests3 = [], []
     _auto_answer_broker(monkeypatch, 0, asked3, requests3)
-    assert llm.check_permission_and_ask("execute_command", {"command": "git push origin main"}) is True
+    assert llm.check_permission_and_ask(
+        "execute_command",
+        {"command": "git commit -m change"},
+    ) is True
     assert asked3 == ["execute_command"]
 
 
@@ -279,14 +295,14 @@ def test_shell_override_never_reuses_default_shell_command_allowlist(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
     llm.check_session_reset()
-    llm._grant_command_add(("git", "status"))
+    llm._grant_command_add(("git", "push"))
 
     asked, requests = [], []
     _auto_answer_broker(monkeypatch, 0, asked, requests)
 
     assert llm.check_permission_and_ask(
         "execute_command",
-        {"command": "git status", "shell_id": "cmd"},
+        {"command": "git push origin dev", "shell_id": "cmd"},
     ) is True
     assert asked == ["execute_command"]
     assert len(requests[0].options) == 2
@@ -340,6 +356,62 @@ def test_permission_store_isolated_by_workdir(tmp_path, monkeypatch):
     # 清空只影响目标项目
     assert permission_store.clear_project(workdir=proj_a) == 1
     assert permission_store.project_rules(workdir=proj_a)["commands"] == set()
+
+
+def test_manual_add_and_remove_command_rule(tmp_path, monkeypatch):
+    import config
+    from core import permission_store
+
+    monkeypatch.setattr(config, "YCODE_DIR", tmp_path / "data")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    added = permission_store.add_rule("command", "git push origin", workdir=project)
+    assert added.status == "added"
+    assert added.normalized_value == "git push origin"
+    assert ("git", "push", "origin") in permission_store.project_rules(project)["commands"]
+
+    duplicate = permission_store.add_rule("command", "git push origin", workdir=project)
+    assert duplicate.status == "exists"
+
+    removed = permission_store.remove_rule("command", "git push origin", workdir=project)
+    assert removed.status == "removed"
+    assert permission_store.project_rules(project)["commands"] == set()
+
+    missing = permission_store.remove_rule("command", "git push origin", workdir=project)
+    assert missing.status == "not_found"
+
+
+def test_file_rule_is_exact_and_canonical(tmp_path, monkeypatch):
+    import config
+    from core import permission_store
+
+    monkeypatch.setattr(config, "YCODE_DIR", tmp_path / "data")
+    project = tmp_path / "project"
+    project.mkdir()
+
+    result = permission_store.add_rule("write", "src/app.py", workdir=project)
+    expected = permission_store.canonical_file_path(project / "src" / "app.py")
+
+    assert result.normalized_value == expected
+    assert expected in permission_store.project_rules(project)["write_files"]
+
+
+def test_store_write_failure_is_not_reported_as_success(tmp_path, monkeypatch):
+    import config
+    from core import permission_store
+
+    monkeypatch.setattr(config, "YCODE_DIR", tmp_path / "data")
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setattr(
+        permission_store,
+        "_save",
+        lambda _data: (_ for _ in ()).throw(OSError("disk full")),
+    )
+
+    with pytest.raises(permission_store.PermissionStoreError, match="disk full"):
+        permission_store.add_rule("edit", str(project / "a.py"), workdir=project)
 
 
 # ---------------------------------------------------------------------------
@@ -409,3 +481,84 @@ def test_gui_ask_user_still_has_timeout_timer():
     finally:
         bridge._cancel_perm_timer(request.request_id)
     assert bridge._perm_timers == {}
+
+
+def test_gui_add_and_remove_permission_rule(monkeypatch):
+    from core import permission_store
+
+    bridge = _bare_bridge()
+    monkeypatch.setattr(
+        permission_store,
+        "add_rule",
+        lambda kind, value: type(
+            "R",
+            (),
+            {"status": "added", "rule_type": kind, "normalized_value": value},
+        )(),
+    )
+    monkeypatch.setattr(
+        permission_store,
+        "remove_rule",
+        lambda kind, value: type(
+            "R",
+            (),
+            {"status": "removed", "rule_type": kind, "normalized_value": value},
+        )(),
+    )
+
+    assert bridge.add_permission_rule("command", "git status")["status"] == "added"
+    assert bridge.remove_permission_rule("command", "git status")["status"] == "removed"
+
+
+def test_gui_permission_rule_failure_statuses_are_not_reported_as_success(monkeypatch):
+    from core import permission_store
+
+    bridge = _bare_bridge()
+    monkeypatch.setattr(
+        permission_store,
+        "add_rule",
+        lambda kind, value: type(
+            "R",
+            (),
+            {"status": "limit_reached", "rule_type": kind, "normalized_value": value},
+        )(),
+    )
+    monkeypatch.setattr(
+        permission_store,
+        "remove_rule",
+        lambda kind, value: type(
+            "R",
+            (),
+            {"status": "not_found", "rule_type": kind, "normalized_value": value},
+        )(),
+    )
+
+    assert bridge.add_permission_rule("command", "git status")["ok"] is False
+    assert bridge.remove_permission_rule("command", "git status")["ok"] is False
+
+
+def test_gui_permission_event_exposes_keyed_options():
+    from core.permission_broker import PermissionBroker, PermissionOption
+
+    emitted = []
+    bridge = _bare_bridge()
+    bridge.emit_event = lambda kind, payload: emitted.append((kind, payload))
+    broker = PermissionBroker(activate_prompt=lambda _request: None)
+    request = broker.enqueue(
+        "write_file",
+        {"file_path": "a.py"},
+        "owner",
+        "session:s1|turn-1",
+        "主代理",
+        options=(
+            PermissionOption("allow_once", "允许本次"),
+            PermissionOption("deny", "拒绝"),
+        ),
+    )
+
+    bridge._activate_permission_request(request)
+
+    assert emitted[0][1]["permission_options"] == [
+        {"key": "allow_once", "label": "允许本次"},
+        {"key": "deny", "label": "拒绝"},
+    ]

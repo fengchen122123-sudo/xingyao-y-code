@@ -7,11 +7,26 @@ import uuid
 from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
+from enum import Enum
 from typing import Callable, Mapping
 
 
 # 取消路径使用的独立结果值，与用户的 "拒绝" (1) 明确区分
 CANCELLED_RESULT = -1
+
+
+class PermissionOptionKey(str, Enum):
+    ALLOW_ONCE = "allow_once"
+    DENY = "deny"
+    ALLOW_TASK = "allow_task"
+    ALLOW_PROJECT = "allow_project"
+    ALLOW_TASK_SANDBOX = "allow_task_sandbox"
+
+
+@dataclass(frozen=True)
+class PermissionOption:
+    key: str
+    label: str
 
 
 @dataclass(frozen=True)
@@ -24,6 +39,13 @@ class PermissionRequest:
     source: str
     options: tuple[str, ...]
     future: Future
+    permission_options: tuple[PermissionOption, ...] = ()
+
+    @property
+    def option_keys(self) -> tuple[str, ...]:
+        if self.permission_options:
+            return tuple(option.key for option in self.permission_options)
+        return tuple(f"choice_{index}" for index in range(len(self.options)))
 
 
 class PermissionBroker:
@@ -70,15 +92,33 @@ class PermissionBroker:
         owner_id: str,
         parent_turn_id: str,
         source: str,
-        options: list[str] | tuple[str, ...] | None = None,
+        options: (
+            list[str]
+            | tuple[str, ...]
+            | list[PermissionOption]
+            | tuple[PermissionOption, ...]
+            | None
+        ) = None,
     ) -> PermissionRequest:
-        choices = tuple(options or (
+        raw_choices = tuple(options or (
             "Yes, 同意本次操作 (y)",
             "No, 拒绝本次操作 (n)",
-            "Always, 始终允许此类操作 (a)",
+            "Always, 本任务同类操作放行 (a)",
         ))
-        if not 1 <= len(choices) <= 3:
-            raise ValueError("permission request options must contain 1 to 3 items")
+        if raw_choices and all(isinstance(choice, PermissionOption) for choice in raw_choices):
+            permission_options = tuple(raw_choices)
+            if not 1 <= len(permission_options) <= 4:
+                raise ValueError("keyed permission options must contain 1 to 4 items")
+        elif raw_choices and all(isinstance(choice, str) for choice in raw_choices):
+            if not 1 <= len(raw_choices) <= 3:
+                raise ValueError("legacy permission options must contain 1 to 3 items")
+            permission_options = tuple(
+                PermissionOption(f"choice_{index}", choice)
+                for index, choice in enumerate(raw_choices)
+            )
+        else:
+            raise ValueError("permission request options must use one consistent type")
+        choices = tuple(option.label for option in permission_options)
         request = PermissionRequest(
             request_id=f"permission-{uuid.uuid4().hex[:10]}",
             function_name=str(function_name),
@@ -87,6 +127,7 @@ class PermissionBroker:
             parent_turn_id=str(parent_turn_id),
             source=str(source),
             options=choices,
+            permission_options=permission_options,
             future=Future(),
         )
         activate = False
@@ -119,7 +160,7 @@ class PermissionBroker:
             custom: str | None = None
             if custom_answer is not None and str(custom_answer).strip():
                 # 自由文本回答仅对 ask_user 开放：其余权限请求的选项语义是
-                # 允许/拒绝/始终允许，文本无从映射，按取消兜底避免语义错乱
+                # 允许/拒绝/任务放行等选项无法由自由文本可靠映射，按取消处理
                 if request.function_name == "ask_user":
                     custom = str(custom_answer).strip()
                 else:
@@ -141,6 +182,17 @@ class PermissionBroker:
             request.future.set_result(custom if custom is not None else choice_index)
         self._show_next(next_request)
         return True
+
+    def resolve_by_key(self, request_id: str, option_key: str) -> bool:
+        with self._lock:
+            request = self._active
+            if request is None or request.request_id != request_id:
+                return False
+            try:
+                choice_index = request.option_keys.index(str(option_key))
+            except ValueError:
+                return False
+        return self.resolve(request_id, choice_index)
 
     def cancel_turn(self, parent_turn_id: str) -> int:
         return self._cancel(lambda request: request.parent_turn_id == parent_turn_id)

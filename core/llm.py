@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
 from concurrent.futures import Future, TimeoutError as _FutureTimeoutError
 from copy import deepcopy
+from dataclasses import dataclass
 from typing import Dict, List
 
 from core.harness.request_envelope import (
@@ -280,14 +281,10 @@ PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 # 计划模式硬拦截：只读工具（requires_permission=False）不受影响；
 # 沙盒外只读访问仍由 _sandbox_outside_guard 逐次询问
 PLAN_MODE_DENIED_MESSAGE = (
-    f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息和制定计划，"
-    "不允许执行任何修改/命令。请改用 plan_write 把操作步骤写入计划，"
+    f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息、执行明确的只读查询和制定计划，"
+    "不允许执行修改或删除操作。请改用 plan_write 把操作步骤写入计划，"
     "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
 )
-# 计划模式下仍然放行的规划类工具（其余需要权限的工具一律拦截）
-_PLAN_MODE_ALLOWED_TOOLS = frozenset({
-    "plan_write", "plan_read", "plan_update", "plan_retry", "ask_user",
-})
 PERMISSION_SYSTEM_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
     f"这不是用户拒绝，请稍后重试或检查权限组件状态。"
@@ -304,16 +301,37 @@ class PermissionSystemError(Exception):
     """
     pass
 
+
+@dataclass(frozen=True)
+class AuthorizationResult:
+    allowed: bool
+    reason: str
+    sandbox_bypass: bool = False
+    cancelled: bool = False
+
 # 🌟 注意这里：我们把四个工具全都引进来了！
 from core.tools import read_file, write_file, list_directory, execute_command, search_news, search_code, edit_file, manage_task, run_subagent, glob_files, fetch_url, get_weather, sandbox_bypass, is_outside_workspace
 # 注意：core.mcp_client 不在此处顶部 import（mcp 包会连带 pydantic/httpx/anyio，
 # 冷启动约 1.1s）。mcp_manager 通过下方模块级 __getattr__ 惰性加载，首次访问时
 # 才 import core.mcp_client；启动时的预热由 main.py 的 _preload_mcp 后台线程负责。
-from core.permission_broker import CANCELLED_RESULT, permission_broker
+from core.permission_broker import (
+    CANCELLED_RESULT,
+    PermissionOption,
+    PermissionOptionKey,
+    permission_broker,
+)
 from core.command_policy import (
     _session_rule_is_exact,
+    classify_command_risk,
     command_matches_session_rule,
+    parse_manual_command_rule,
     session_rule_for_command,
+)
+from core.permission_policy import (
+    PermissionAction,
+    PermissionFacts,
+    PermissionRisk,
+    decide_permission,
 )
 from core.reasoning_stream import ReasoningStreamParser, split_reasoning_text
 from core.harness.stream_assembler import StreamAssembler, complete_thinking_blocks
@@ -324,118 +342,55 @@ from core.tool_presenter import (
 )
 from core.turn_events import TurnEventFactory
 import core.app_context as app_context
-from core import permission_store
+from core import permission_grants, permission_store
 
-# 会话授权白名单（当前会话生命周期内有效，切换会话时自动清理）
-# 模块级三个集合是"未绑定线程"（CLI 主流程 / 测试主线程）的默认桶；
-# 多会话并行下，绑定了线程会话的回合（GUI 回合/子代理线程）使用
-# _SESSION_GRANTS 里各自会话的专属桶，互不可见（详见 _session_grants_bucket）。
-session_allowed_commands: set[tuple[str, ...]] = set()  # 结构化命令规则
-session_allowed_write_files = set()   # 放行的写入文件绝对路径
-session_allowed_edit_files = set()    # 放行的修改文件绝对路径
-# 内联/复合命令的「本会话精确放行」：点“总是允许”后仅对完全相同的命令免问，
-# 不做前缀扩展、不落盘（防投毒）。结构化命令仍走上面的 commands 桶。
-session_allowed_exact_commands: set[str] = set()
-_SESSION_GRANTS: dict[str, dict[str, set]] = {}
-_SESSION_GRANTS_MAX_SESSIONS = 128
+# 兼容旧调用方的动态集合视图；实际所有权在 core.permission_grants，
+# 通过稳定任务 ID 路由，切换可见界面不会清除授权。
+session_allowed_commands = permission_grants.task_set_view("commands")
+session_allowed_write_files = permission_grants.task_set_view("write_files")
+session_allowed_edit_files = permission_grants.task_set_view("edit_files")
+session_allowed_exact_commands = permission_grants.task_set_view("exact_commands")
+_SESSION_GRANTS = permission_grants._TASK_GRANTS
 _last_tracked_session = None
 _raw_permission_lock = threading.Lock()
-# 保护会话放行白名单与 _last_tracked_session 的跨线程读写
-_session_whitelist_lock = threading.Lock()
-
-
-def _session_grants_bucket() -> dict[str, set] | None:
-    """当前线程会话的授权桶；未绑定线程返回 None（调用方走模块级默认集合）。
-
-    桶结构：{"commands": set, "write_files": set, "edit_files": set, "exact_commands": set}
-    """
-    sid = app_context.get_thread_session()
-    if not sid:
-        return None
-    with _session_whitelist_lock:
-        bucket = _SESSION_GRANTS.get(sid)
-        if bucket is None:
-            if len(_SESSION_GRANTS) >= _SESSION_GRANTS_MAX_SESSIONS:
-                _SESSION_GRANTS.pop(next(iter(_SESSION_GRANTS)), None)
-            bucket = {"commands": set(), "write_files": set(), "edit_files": set(), "exact_commands": set()}
-            _SESSION_GRANTS[sid] = bucket
-        return bucket
+_session_whitelist_lock = permission_grants._GRANTS_LOCK
 
 
 def clear_session_grants(session_id: str) -> None:
-    """清空指定会话的授权桶（会话删除/测试隔离时调用）。"""
-    with _session_whitelist_lock:
-        _SESSION_GRANTS.pop(str(session_id), None)
+    """清空指定任务的授权桶（任务删除时调用）。"""
+    permission_grants.clear_task(session_id)
 
 
 def _grant_command_add(prefix: tuple[str, ...]) -> None:
-    bucket = _session_grants_bucket()
-    with _session_whitelist_lock:
-        if bucket is None:
-            session_allowed_commands.add(prefix)
-        else:
-            bucket["commands"].add(prefix)
+    permission_grants.grant_command_rule(prefix)
 
 
 def _grant_write_add(canonical_path: str) -> None:
-    bucket = _session_grants_bucket()
-    with _session_whitelist_lock:
-        if bucket is None:
-            session_allowed_write_files.add(canonical_path)
-        else:
-            bucket["write_files"].add(canonical_path)
+    permission_grants.grant_file("write", canonical_path)
 
 
 def _grant_edit_add(canonical_path: str) -> None:
-    bucket = _session_grants_bucket()
-    with _session_whitelist_lock:
-        if bucket is None:
-            session_allowed_edit_files.add(canonical_path)
-        else:
-            bucket["edit_files"].add(canonical_path)
+    permission_grants.grant_file("edit", canonical_path)
 
 
 def _grant_command_hit(command: str) -> bool:
-    bucket = _session_grants_bucket()
-    with _session_whitelist_lock:
-        prefixes = session_allowed_commands if bucket is None else bucket["commands"]
-        return any(_command_matches_prefix(command, prefix) for prefix in prefixes)
+    return permission_grants.matches_command(command)
 
 
 def _grant_exact_command_add(command: str) -> None:
-    bucket = _session_grants_bucket()
-    key = str(command or "").strip()
-    if not key:
-        return
-    with _session_whitelist_lock:
-        if bucket is None:
-            session_allowed_exact_commands.add(key)
-        else:
-            bucket["exact_commands"].add(key)
+    permission_grants.grant_exact_command(command)
 
 
 def _grant_exact_command_hit(command: str) -> bool:
-    bucket = _session_grants_bucket()
-    key = str(command or "").strip()
-    if not key:
-        return False
-    with _session_whitelist_lock:
-        s = session_allowed_exact_commands if bucket is None else bucket["exact_commands"]
-        return key in s
+    return permission_grants.matches_exact_command(command)
 
 
 def _grant_write_hit(canonical_path: str) -> bool:
-    bucket = _session_grants_bucket()
-    with _session_whitelist_lock:
-        paths = session_allowed_write_files if bucket is None else bucket["write_files"]
-        return canonical_path in paths
+    return permission_grants.matches_file("write", canonical_path)
 
 
 def _grant_edit_hit(canonical_path: str) -> bool:
-    bucket = _session_grants_bucket()
-    with _session_whitelist_lock:
-        paths = session_allowed_edit_files if bucket is None else bucket["edit_files"]
-        return canonical_path in paths
+    return permission_grants.matches_file("edit", canonical_path)
 
 
 def _canonical_permission_path(value):
@@ -516,27 +471,9 @@ def _has_pending_plan(session_id):
 
 def check_session_reset():
     global _last_tracked_session
-    # 多会话并行：本线程绑定了执行会话时，授权已按会话分桶、互不可见，
-    # UI 切换全局会话（用户只是去别的会话看一眼）不再收回运行中回合的授权。
-    # 仅未绑定线程（CLI 单会话主流程）保留"切会话即收回"的旧语义。
-    if app_context.get_thread_session():
-        return
-    with _session_whitelist_lock:
-        current = app_context.get_current_session()
-        if current and _last_tracked_session != current:
-            _last_tracked_session = current
-            session_allowed_commands.clear()
-            session_allowed_write_files.clear()
-            session_allowed_edit_files.clear()
-            session_allowed_exact_commands.clear()
-            reset_session_scope = True
-        else:
-            reset_session_scope = False
-    if reset_session_scope:
-        # 会话级沙盒放行与三个白名单同生命周期：切会话一并收回
-        from core.tools import set_session_sandbox_bypass
-
-        set_session_sandbox_bypass(False)
+    # 授权按稳定任务 ID 分桶。这里只保留兼容跟踪值，切换可见任务不清理；
+    # 物理删除任务时由入口层显式调用 clear_session_grants。
+    _last_tracked_session = permission_grants.current_task_id()
 
 
 def _session_prefix_for_command(cmd):
@@ -617,11 +554,11 @@ def ask_in_raw_terminal(function_name, arguments):
             print("请输入 [y]es 同意本次, [n]o 拒绝（解释器覆盖不支持加入白名单）")
             res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
         elif function_name == "sandbox_outside_access":
-            # 沙盒外路径访问可会话级放行，但不做持久化落盘
-            print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 本会话内放行沙盒外访问")
+            # 沙盒外路径访问可任务级放行，但不做持久化落盘
+            print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 本任务内放行沙盒外访问")
             res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
         else:
-            print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前会话放行)")
+            print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前任务放行)")
             res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
         
         if shell_override:
@@ -635,32 +572,363 @@ def ask_in_raw_terminal(function_name, arguments):
                 cmd = arguments.get("command", "")
                 prefix = _session_prefix_for_command(cmd)
                 if prefix is None:
-                    print("[内联执行命令不做会话前缀放行，仅本次通过]")
+                    print("[内联执行命令不做任务前缀放行，仅本次通过]")
                 else:
                     _grant_command_add(prefix)
-                    print(f"[当前会话已放行] {_format_session_command_rule(prefix)}")
+                    print(f"[当前任务已放行] {_format_session_command_rule(prefix)}")
             elif function_name == "write_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     _grant_write_add(_canonical_permission_path(file_path))
-                    print(f"[当前会话已放行写入]：{file_path}")
+                    print(f"[当前任务已放行写入]：{file_path}")
             elif function_name == "edit_file":
                 file_path = arguments.get("file_path", "")
                 if file_path:
                     _grant_edit_add(_canonical_permission_path(file_path))
-                    print(f"[当前会话已放行修改]：{file_path}")
+                    print(f"[当前任务已放行修改]：{file_path}")
             elif function_name == "sandbox_outside_access":
-                # 会话级放行（不落盘）：本会话内后续沙盒外访问免询问
+                # 任务级放行（不落盘）：本任务内后续沙盒外访问免询问
                 from core.tools import set_session_sandbox_bypass
 
                 set_session_sandbox_bypass(True)
-                print("[当前会话已放行沙盒外访问]")
+                print("[当前任务已放行沙盒外访问]")
             return True
             
         return res in ("", "y", "yes")
     except (KeyboardInterrupt, EOFError):
         print("\n[操作已取消]")
         return False
+
+_PLAN_INTERNAL_PERMISSION_TOOLS = frozenset({
+    "plan_write",
+    "plan_read",
+    "plan_update",
+    "plan_retry",
+    "ask_user",
+})
+_KNOWN_QUERY_TOOLS = frozenset({
+    "read_file",
+    "list_directory",
+    "search_code",
+    "find_definition",
+    "glob_files",
+    "fetch_url",
+    "search_news",
+    "get_weather",
+})
+_SENSITIVE_TOOL_NAMES = frozenset({
+    "delete_file",
+    "remove_file",
+    "kill_process",
+    "git_commit",
+    "git_push",
+})
+
+
+def _permission_risk(function_name, arguments, tool_spec, path_access):
+    if function_name == "sandbox_outside_access":
+        return PermissionRisk.QUERY
+    if function_name == "execute_command":
+        if bool(str(arguments.get("shell_id") or "").strip()):
+            return PermissionRisk.SENSITIVE_MUTATION
+        return classify_command_risk(str(arguments.get("command", "")))
+    if function_name == "manage_task":
+        action = str(arguments.get("action", "")).strip().lower()
+        return (
+            PermissionRisk.SENSITIVE_MUTATION
+            if action in {"kill", "stop", "terminate", "cancel"}
+            else PermissionRisk.QUERY
+        )
+    if path_access == "credential_write" or function_name in _SENSITIVE_TOOL_NAMES:
+        return PermissionRisk.SENSITIVE_MUTATION
+    if function_name in _PLAN_INTERNAL_PERMISSION_TOOLS:
+        return PermissionRisk.NORMAL_MUTATION
+    if function_name == "run_subagent":
+        return PermissionRisk.QUERY
+    if function_name in _KNOWN_QUERY_TOOLS or bool(getattr(tool_spec, "read_only", False)):
+        return PermissionRisk.QUERY
+    if bool(getattr(tool_spec, "mutates_files", False)):
+        return PermissionRisk.NORMAL_MUTATION
+    if bool(getattr(tool_spec, "requires_permission", True)):
+        return PermissionRisk.NORMAL_MUTATION
+    return PermissionRisk.QUERY
+
+
+def _permission_rule_facts(function_name, arguments):
+    task_hit = False
+    project_hit = False
+    task_grant = None
+    project_rule = None
+    shell_override = (
+        function_name == "execute_command"
+        and bool(str(arguments.get("shell_id") or "").strip())
+    )
+    rules = permission_store.project_rules()
+
+    if function_name == "execute_command":
+        command = str(arguments.get("command", ""))
+        if not shell_override:
+            task_hit = permission_grants.matches_command(command)
+            project_hit = any(
+                command_matches_session_rule(command, prefix)
+                for prefix in rules["commands"]
+            )
+            task_grant = ("command", command)
+            try:
+                parse_manual_command_rule(command)
+            except ValueError:
+                project_rule = None
+            else:
+                project_rule = ("command", command)
+    elif function_name in {"write_file", "edit_file"}:
+        kind = "write" if function_name == "write_file" else "edit"
+        field = "write_files" if kind == "write" else "edit_files"
+        canonical = _canonical_permission_path(arguments.get("file_path", ""))
+        if canonical:
+            task_hit = permission_grants.matches_file(kind, canonical)
+            project_hit = canonical in rules[field]
+            task_grant = (kind, canonical)
+            project_rule = (kind, canonical)
+    return task_hit, project_hit, task_grant, project_rule
+
+
+def _permission_options(*, sandbox_request, task_grant, project_rule):
+    if sandbox_request:
+        return (
+            PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
+            PermissionOption(PermissionOptionKey.DENY.value, "拒绝"),
+            PermissionOption(
+                PermissionOptionKey.ALLOW_TASK_SANDBOX.value,
+                "本任务内放行沙盒外访问",
+            ),
+        )
+    options = [
+        PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
+        PermissionOption(PermissionOptionKey.DENY.value, "拒绝"),
+    ]
+    if task_grant is not None:
+        options.append(
+            PermissionOption(
+                PermissionOptionKey.ALLOW_TASK.value,
+                "本任务同类操作放行",
+            )
+        )
+    if project_rule is not None:
+        options.append(
+            PermissionOption(
+                PermissionOptionKey.ALLOW_PROJECT.value,
+                "加入项目白名单",
+            )
+        )
+    return tuple(options)
+
+
+def _wait_permission_option(
+    function_name,
+    arguments,
+    options,
+    *,
+    event_callback,
+    permission_owner,
+    parent_turn_id,
+    permission_source,
+    cancel_event,
+):
+    _notify_event(event_callback, "permission_requested", {
+        "function_name": function_name,
+        "arguments": dict(arguments),
+        "source": permission_source,
+    })
+
+    if not permission_broker.has_prompt_handlers():
+        gui_callback = app_context.get_permission_callback()
+        if gui_callback is not None:
+            return (
+                PermissionOptionKey.ALLOW_ONCE.value
+                if gui_callback(function_name, arguments)
+                else PermissionOptionKey.DENY.value
+            )
+        app = app_context.get_app_instance()
+        if (not app or not app.loop) and app_context.get_ui_flavor() != "gui":
+            with _raw_permission_lock:
+                return (
+                    PermissionOptionKey.ALLOW_ONCE.value
+                    if ask_in_raw_terminal(function_name, arguments)
+                    else PermissionOptionKey.DENY.value
+                )
+
+    owner_id = str(permission_owner or parent_turn_id or threading.current_thread().name)
+    turn_id = str(parent_turn_id or owner_id)
+    request = permission_broker.enqueue(
+        function_name,
+        arguments,
+        owner_id,
+        turn_id,
+        permission_source,
+        options=options,
+    )
+    try:
+        while True:
+            if request.future.done():
+                choice_index = request.future.result()
+                break
+            if cancel_event is not None and cancel_event.is_set():
+                permission_broker.cancel_owner(owner_id)
+                choice_index = CANCELLED_RESULT
+                break
+            try:
+                choice_index = request.future.result(timeout=0.1)
+                break
+            except (TimeoutError, _FutureTimeoutError):
+                continue
+        if choice_index == CANCELLED_RESULT:
+            return "cancelled"
+        try:
+            return request.option_keys[int(choice_index)]
+        except (IndexError, TypeError, ValueError) as exc:
+            raise PermissionSystemError("权限响应选项无效") from exc
+    finally:
+        if not request.future.done():
+            permission_broker.cancel_owner(owner_id)
+
+
+def authorize_tool_call(
+    function_name,
+    arguments,
+    *,
+    tool_spec,
+    outside_workspace=False,
+    event_callback=None,
+    permission_owner=None,
+    parent_turn_id=None,
+    permission_source="主代理",
+    cancel_event=None,
+):
+    check_session_reset()
+    path_access = "outside" if outside_workspace else "inside"
+    path_value = arguments.get("file_path")
+    if path_value and function_name in {"read_file", "write_file", "edit_file"}:
+        try:
+            from core.harness.tool_adapters import classify_path_access
+
+            path_access = classify_path_access(
+                function_name,
+                path_value,
+                is_outside_workspace=is_outside_workspace,
+            )
+        except Exception as exc:
+            raise PermissionSystemError(f"路径权限分类失败: {exc}") from exc
+        if outside_workspace and path_access == "inside":
+            path_access = "outside"
+    if function_name == "sandbox_outside_access":
+        path_access = "outside"
+
+    risk = _permission_risk(function_name, arguments, tool_spec, path_access)
+    plan_internal = function_name in _PLAN_INTERNAL_PERMISSION_TOOLS
+    task_hit, project_hit, task_grant, project_rule = _permission_rule_facts(
+        function_name,
+        arguments,
+    )
+
+    outside = path_access in {"outside", "credential_write"}
+    try:
+        from core.model_manager import load_config
+
+        sandbox_restricted = not bool(
+            load_config().get("allow_outside_workspace", False)
+        )
+    except Exception as exc:
+        raise PermissionSystemError(f"读取沙盒配置失败: {exc}") from exc
+    if path_access == "credential_write":
+        sandbox_restricted = True
+    from core.tools import is_session_sandbox_bypass_enabled
+
+    task_sandbox_bypass = is_session_sandbox_bypass_enabled()
+    decision = decide_permission(PermissionFacts(
+        mode=app_context.get_permission_mode(),
+        risk=risk,
+        plan_internal=plan_internal,
+        outside_workspace=outside,
+        sandbox_restricted=sandbox_restricted,
+        task_sandbox_bypass=task_sandbox_bypass,
+        task_grant_hit=task_hit,
+        project_rule_hit=project_hit,
+    ))
+
+    if decision.action is PermissionAction.ALLOW:
+        _notify_event(event_callback, "permission_resolved", {
+            "approved": True,
+            "automatic": True,
+            "reason": decision.reason,
+        })
+        return AuthorizationResult(True, decision.reason, sandbox_bypass=outside)
+    if decision.action is PermissionAction.DENY:
+        return AuthorizationResult(False, decision.reason)
+
+    sandbox_request = decision.reason == "sandbox_boundary_requires_confirmation"
+    options = _permission_options(
+        sandbox_request=sandbox_request,
+        task_grant=task_grant,
+        project_rule=project_rule,
+    )
+    try:
+        option_key = _wait_permission_option(
+            "sandbox_outside_access" if sandbox_request else function_name,
+            (
+                {"path": str(path_value or arguments.get("path", "")), "operation": function_name}
+                if sandbox_request
+                else arguments
+            ),
+            options,
+            event_callback=event_callback,
+            permission_owner=permission_owner,
+            parent_turn_id=parent_turn_id,
+            permission_source=permission_source,
+            cancel_event=cancel_event,
+        )
+        if option_key == "cancelled":
+            _notify_event(event_callback, "permission_resolved", {
+                "approved": False,
+                "cancelled": True,
+            })
+            return AuthorizationResult(False, "cancelled", cancelled=True)
+        if option_key == PermissionOptionKey.DENY.value:
+            _notify_event(event_callback, "permission_resolved", {"approved": False})
+            return AuthorizationResult(False, "user_denied")
+        if option_key == PermissionOptionKey.ALLOW_TASK.value:
+            if task_grant is None:
+                raise PermissionSystemError("当前操作不支持任务级授权")
+            kind, value = task_grant
+            if kind == "command":
+                permission_grants.grant_command(value)
+            else:
+                permission_grants.grant_file(kind, value)
+        elif option_key == PermissionOptionKey.ALLOW_PROJECT.value:
+            if project_rule is None:
+                raise PermissionSystemError("当前操作不能加入项目白名单")
+            kind, value = project_rule
+            mutation = permission_store.add_rule(kind, value)
+            if mutation.status not in {"added", "exists"}:
+                raise PermissionSystemError(
+                    f"项目白名单写入失败: {mutation.status}"
+                )
+        elif option_key == PermissionOptionKey.ALLOW_TASK_SANDBOX.value:
+            from core.tools import set_session_sandbox_bypass
+
+            set_session_sandbox_bypass(True)
+        elif option_key != PermissionOptionKey.ALLOW_ONCE.value:
+            raise PermissionSystemError(f"未知权限选项: {option_key}")
+    except PermissionSystemError:
+        raise
+    except Exception as exc:
+        raise PermissionSystemError(str(exc)) from exc
+
+    _notify_event(event_callback, "permission_resolved", {
+        "approved": True,
+        "option_key": option_key,
+    })
+    return AuthorizationResult(True, option_key, sandbox_bypass=outside)
+
 
 def check_permission_and_ask(
     function_name,
@@ -670,290 +938,55 @@ def check_permission_and_ask(
     parent_turn_id=None,
     permission_source="主代理",
     cancel_event=None,
+    *,
+    tool_spec=None,
+    outside_workspace=None,
+    structured=False,
 ):
-    # 0. 自动同步和重置会话级别的白名单缓存
-    check_session_reset()
-    command_shell_override = (
-        function_name == "execute_command"
-        and bool(str(arguments.get("shell_id") or "").strip())
-    )
-
-    # 1. 检查当前会话/当前项目中是否已被用户“始终允许”
-    #    会话白名单（内存）与项目持久化白名单（~/.ycode/permissions.json）依次命中
-    if function_name == "execute_command" and not command_shell_override:
-        cmd = arguments.get("command", "")
-        session_hit = _grant_command_hit(cmd)
-        exact_hit = _grant_exact_command_hit(cmd)
-        persistent_hit = False
-        if not session_hit:
+    if tool_spec is None:
+        try:
+            tool_spec = tool_registry.get(function_name)
+        except Exception:
+            tool_spec = SimpleNamespace(
+                name=function_name,
+                read_only=function_name in _KNOWN_QUERY_TOOLS,
+                mutates_files=function_name in {"write_file", "edit_file"},
+                requires_permission=True,
+            )
+    outside = outside_workspace
+    if outside is None:
+        outside = function_name == "sandbox_outside_access"
+        if function_name in {"read_file", "write_file", "edit_file"}:
             try:
-                rules = permission_store.project_rules()
-                persistent_hit = any(
-                    _command_matches_prefix(cmd, prefix)
-                    for prefix in rules["commands"]
-                )
+                outside = is_outside_workspace(arguments.get("file_path", ""))
             except Exception:
-                persistent_hit = False
-        if session_hit or exact_hit or persistent_hit:
-            scope_tip = "当前会话" if (session_hit or exact_hit) else "项目白名单（持久化）"
-            if event_callback is None:
-                from prompt_toolkit.formatted_text import HTML
-                safe_print(HTML(f"<ansigreen>{scope_tip}自动放行命令：{cmd}</ansigreen>"))
-            else:
-                _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
-            return True
-    elif function_name == "write_file":
-        file_path = arguments.get("file_path", "")
-        canonical_path = _canonical_permission_path(file_path)
-        session_hit = _grant_write_hit(canonical_path)
-        persistent_hit = False
-        if not session_hit:
-            try:
-                rules = permission_store.project_rules()
-                persistent_hit = canonical_path in rules["write_files"]
-            except Exception:
-                persistent_hit = False
-        if session_hit or persistent_hit:
-            scope_tip = "当前会话" if session_hit else "项目白名单（持久化）"
-            if event_callback is None:
-                from prompt_toolkit.formatted_text import HTML
-                safe_print(HTML(f"<ansigreen>{scope_tip}自动放行写入：{file_path}</ansigreen>"))
-            else:
-                _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
-            return True
-    elif function_name == "edit_file":
-        file_path = arguments.get("file_path", "")
-        canonical_path = _canonical_permission_path(file_path)
-        session_hit = _grant_edit_hit(canonical_path)
-        persistent_hit = False
-        if not session_hit:
-            try:
-                rules = permission_store.project_rules()
-                persistent_hit = canonical_path in rules["edit_files"]
-            except Exception:
-                persistent_hit = False
-        if session_hit or persistent_hit:
-            scope_tip = "当前会话" if session_hit else "项目白名单（持久化）"
-            if event_callback is None:
-                from prompt_toolkit.formatted_text import HTML
-                safe_print(HTML(f"<ansigreen>{scope_tip}自动放行修改：{file_path}</ansigreen>"))
-            else:
-                _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
-            return True
-    elif function_name == "sandbox_outside_access":
-        # 会话级沙盒放行（用户此前选过“本会话内放行沙盒外访问”）：
-        # 免询问直接通过；切会话即收回，不做持久化
-        from core.tools import is_session_sandbox_bypass_enabled
-
-        if is_session_sandbox_bypass_enabled():
-            if event_callback is None:
-                from prompt_toolkit.formatted_text import HTML
-                safe_print(HTML("<ansigreen>当前会话已放行沙盒外访问</ansigreen>"))
-            else:
-                _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
-            return True
-
-    # 2. 模式级快路径
-    #    full：沙盒内全部放行；accept_edits：工作区内文件编辑放行（命令仍询问）。
-    #    sandbox_outside_access（沙盒外路径访问）不受任何模式自动放行，
-    #    必须逐次询问用户（或走上面的会话级放行），确保沙盒外操作始终受控。
-    _mode = app_context.get_permission_mode()
-    if _mode == "full" and function_name != "sandbox_outside_access":
-        if event_callback is not None:
-            _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
-        return True
-    if _mode == "accept_edits" and function_name in ("write_file", "edit_file"):
-        # 工作区外的 write/edit 不会以 write_file/edit_file 名义到达这里
-        # （pipeline 已先转给沙盒 guard 询问 sandbox_outside_access），
-        # 因此此分支放行的只有工作区内编辑
-        if event_callback is not None:
-            _notify_event(event_callback, "permission_resolved", {"approved": True, "automatic": True})
-        return True
-
-    # 3. 计划模式的修改/执行类操作不会走到这里（在 _execute_single_tool_call
-    #    中已被 PLAN_MODE_DENIED_MESSAGE 硬拦截）；走到这里的只剩
-    #    sandbox_outside_access 等必须逐次询问的场景，直接进入询问流程。
-
-    _notify_event(event_callback, "permission_requested", {
-        "function_name": function_name,
-        "arguments": dict(arguments),
-        "source": permission_source,
-    })
-
-    # GUI 模式：使用已注册的 GUI 权限回调，避免阻塞在 input()
-    _gui_cb = app_context.get_permission_callback()
-    if _gui_cb is not None:
-        return _gui_cb(function_name, arguments)
-
-    # cli 模式：通过 prompt_toolkit app 或终端 input()
-    # GUI 模式没有 prompt_toolkit App，但已在 permission_broker 上注册了处理器，
-    # 必须直接走下面的 broker 路径，绝不能退回阻塞式 input()。
-    _app = app_context.get_app_instance()
-    if (not _app or not _app.loop) and app_context.get_ui_flavor() != "gui":
-        with _raw_permission_lock:
-            return ask_in_raw_terminal(function_name, arguments)
-
-    # owner/turn_id 统一来源：优先显式传入，turn 兜底 owner，线程名最后兜底
-    owner_id = str(permission_owner or parent_turn_id or threading.current_thread().name)
-    turn_id = str(parent_turn_id or owner_id)
-    # 沙盒外路径访问提供会话级放行（不落盘、切会话收回、任何模式都不自动放行）
-    _options = None
-    if function_name == "sandbox_outside_access":
-        _options = (
-            "Yes, 同意本次操作 (y)",
-            "No, 拒绝本次操作 (n)",
-            "Always, 本会话内放行沙盒外访问 (a)",
-        )
-    elif command_shell_override:
-        _options = (
-            "Yes, 同意本次操作 (y)",
-            "No, 拒绝本次操作 (n)",
-        )
-    request = permission_broker.enqueue(
+                outside = False
+    result = authorize_tool_call(
         function_name,
         arguments,
-        owner_id,
-        turn_id,
-        permission_source,
-        options=_options,
+        tool_spec=tool_spec,
+        outside_workspace=bool(outside),
+        event_callback=event_callback,
+        permission_owner=permission_owner,
+        parent_turn_id=parent_turn_id,
+        permission_source=permission_source,
+        cancel_event=cancel_event,
     )
+    return result if structured else result.allowed
 
-    try:
-        # 带短超时的轮询等待：取消信号到达时立即跳出，避免线程永久挂起；
-        # 先查 future 再判 cancel，避免用户刚点“同意”被竞态误判为取消
-        while True:
-            if request.future.done():
-                choice_idx = request.future.result()
-                break
-            if cancel_event is not None and cancel_event.is_set():
-                permission_broker.cancel_owner(owner_id)
-                choice_idx = CANCELLED_RESULT
-                break
-            try:
-                choice_idx = request.future.result(timeout=0.1)
-                break
-            except (TimeoutError, _FutureTimeoutError):
-                # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建
-                # TimeoutError 的别名，只 except TimeoutError 会漏接，
-                # 导致轮询循环直接抛 PermissionSystemError（等待期必崩）
-                continue
 
-        from prompt_toolkit.formatted_text import ANSI
+def _pipeline_permission_checker(function_name, arguments, **context):
+    """Keep the historical permission injection point while returning rich decisions.
 
-        if choice_idx == CANCELLED_RESULT:
-            if event_callback is None:
-                safe_print(ANSI("   🛑 操作已取消"))
-            else:
-                _notify_event(event_callback, "permission_resolved", {
-                    "approved": False,
-                    "cancelled": True,
-                })
-            return False
-
-        choices_map = {
-            0: "\033[92m✓ 已同意本次操作\033[0m",
-            1: "\033[91m✗ 已拒绝本次操作\033[0m",
-            2: "\033[96m✨ 已选择始终允许此类操作\033[0m"
-        }
-
-        if event_callback is None:
-            if function_name == "execute_command":
-                cmd = arguments.get("command", "")
-                shell_id = str(arguments.get("shell_id") or "").strip()
-                shell_tip = f"（解释器显式覆盖：{shell_id}）" if shell_id else ""
-                safe_print(ANSI(f"💻 星瑶申请执行命令{shell_tip}: {cmd}"))
-            elif function_name == "write_file":
-                file_path = arguments.get("file_path", "")
-                safe_print(ANSI(f"✍️ 星瑶申请写入文件: {file_path}"))
-            elif function_name == "edit_file":
-                file_path = arguments.get("file_path", "")
-                safe_print(ANSI(f"📝 星瑶申请修改文件: {file_path}"))
-            safe_print(ANSI(f"   👉 确认结果: {choices_map.get(choice_idx, choices_map[0])}"))
-        else:
-            _notify_event(event_callback, "permission_resolved", {
-                "approved": choice_idx != 1,
-                "always": choice_idx == 2,
-            })
-
-        if choice_idx == 1:
-            return False
-
-        if choice_idx == 2:
-            if function_name == "execute_command":
-                cmd = arguments.get("command", "")
-                prefix = _session_prefix_for_command(cmd)
-                if prefix is None:
-                    # 内联/复合命令：无法安全提取前缀，改为「本会话精确放行」——
-                    # 仅对完全相同的命令免问，不做前缀扩展、不落盘（防投毒）。
-                    _grant_exact_command_add(cmd)
-                    if event_callback is None:
-                        safe_print(ANSI("   ✨ [本会话已放行此命令（不持久化）]"))
-                    else:
-                        _notify_event(event_callback, "status", {
-                            "message": "已在本会话内放行此命令（不持久化，仅对完全相同的命令生效）。",
-                        })
-                else:
-                    _grant_command_add(prefix)
-                    persisted = False
-                    try:
-                        persisted = permission_store.add_command_rule(prefix)
-                    except Exception:
-                        persisted = False
-                    if event_callback is None:
-                        if persisted:
-                            safe_print(ANSI(f"   ✨ [项目白名单已放行（持久化）] {_format_session_command_rule(prefix)}"))
-                        else:
-                            safe_print(ANSI(f"   ✨ [当前会话已放行] {_format_session_command_rule(prefix)}"))
-            elif function_name == "write_file":
-                file_path = arguments.get("file_path", "")
-                if file_path:
-                    canonical = _canonical_permission_path(file_path)
-                    _grant_write_add(canonical)
-                    persisted = False
-                    try:
-                        persisted = permission_store.add_write_file(canonical)
-                    except Exception:
-                        persisted = False
-                    if event_callback is None:
-                        scope_tip = "项目白名单（持久化）" if persisted else "当前会话"
-                        safe_print(ANSI(f"   ✨ [{scope_tip}已放行写入]：{file_path}"))
-            elif function_name == "edit_file":
-                file_path = arguments.get("file_path", "")
-                if file_path:
-                    canonical = _canonical_permission_path(file_path)
-                    _grant_edit_add(canonical)
-                    persisted = False
-                    try:
-                        persisted = permission_store.add_edit_file(canonical)
-                    except Exception:
-                        persisted = False
-                    if event_callback is None:
-                        scope_tip = "项目白名单（持久化）" if persisted else "当前会话"
-                        safe_print(ANSI(f"   ✨ [{scope_tip}已放行修改]：{file_path}"))
-            elif function_name == "sandbox_outside_access":
-                # 会话级放行：不落盘，切会话即收回（见 enqueue 处选项说明）
-                from core.tools import set_session_sandbox_bypass
-
-                set_session_sandbox_bypass(True)
-                if event_callback is None:
-                    safe_print(ANSI("   ✨ [当前会话已放行沙盒外访问]"))
-            return True
-
-        approved = (choice_idx in (0, 2))
-        return approved
-    except Exception as e:
-        _notify_event(event_callback, "error", {
-            "message": f"权限询问交互发生异常: {str(e)}",
-        })
-        # 系统异常不应伪装成"用户拒绝"（False 会被模型理解为用户主动拒绝）。
-        # 抛出 PermissionSystemError，由调用方返回专门的系统异常提示。
-        permission_broker.cancel_owner(owner_id)
-        raise PermissionSystemError(str(e)) from e
-    finally:
-        # 异常退出（含 KeyboardInterrupt 等 BaseException）时回收已入队请求，
-        # 否则 broker 串行化会让后续所有权限提示永久排队
-        if not request.future.done():
-            permission_broker.cancel_owner(owner_id)
+    Tests and embedders may replace ``check_permission_and_ask``. Their boolean result
+    remains valid because ToolPipeline accepts both booleans and AuthorizationResult.
+    """
+    return check_permission_and_ask(
+        function_name,
+        arguments,
+        structured=True,
+        **context,
+    )
 
 # 全局变量：分离“本次窗口占比”和“整体累积消耗”
 session_token_usage = {
@@ -981,6 +1014,18 @@ session_token_usage = {
 }
 # session_token_usage 会被后台 worker 线程与 UI 线程同时读写，所有读写必须走锁
 token_usage_lock = threading.Lock()
+
+# 记账完成回调：GUI（gui_bridge.py）启动时注册 _emit_token_usage，
+# 让统计栏/上下文圆圈在每次 LLM 请求记账后立即刷新，而不必等整个
+# 回合结束。CLI 不注册则完全无感。仅保存回调引用，不持锁调用，
+# 避免回调里再取 token_usage_lock 时死锁。
+_token_usage_listener = None
+
+
+def set_token_usage_listener(callback):
+    """注册/注销（传 None）token 记账完成监听器；幂等且线程安全（GIL 原子赋值）。"""
+    global _token_usage_listener
+    _token_usage_listener = callback
 
 _cache_request_states = {}
 _cache_usage_states = {}
@@ -1632,6 +1677,16 @@ def _account_server_usage(
         api_base=api_base,
         cache_scope=cache_scope,
     )
+
+    # 记账落库已完成，立即通知 UI 监听器（GUI 推送 token_usage 事件实现
+    # 统计栏/上下文圆圈逐请求实时刷新）。监听器异常只记日志，绝不影响
+    # 记账主流程（持久化已完成后调用，失败也不会丢账）。
+    listener = _token_usage_listener
+    if listener is not None:
+        try:
+            listener()
+        except Exception:
+            logger.debug("token_usage 监听器执行失败", exc_info=True)
     return record
 
 # The registry is the canonical capability metadata source.
@@ -3539,7 +3594,7 @@ def _build_tool_pipeline_and_context(
         allow_subagents=allow_subagents,
         permission_owner=permission_owner,
         permission_source=permission_source,
-        permission_checker=check_permission_and_ask,
+        permission_checker=_pipeline_permission_checker,
         registry=tool_registry,
         mcp_manager=_get_mcp_manager(),
     )

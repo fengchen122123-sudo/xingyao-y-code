@@ -175,6 +175,54 @@ def _win32_long_path(path: str) -> str:
     return path
 
 
+def classify_path_access(
+    function_name,
+    path_value,
+    *,
+    is_outside_workspace=_is_outside_workspace,
+):
+    """Classify one path without prompting or mutating authorization state."""
+    if not path_value:
+        return "inside"
+    if not is_outside_workspace(path_value):
+        return "inside"
+
+    from core.memory_kairos import YCODE_DIR, is_ycode_data_path
+
+    resolved = os.path.realpath(os.path.expanduser(str(path_value)))
+    expanded = _win32_long_path(resolved)
+    if is_ycode_data_path(expanded):
+        normalized = expanded.rstrip(". ")
+        ycode_root = _win32_long_path(
+            os.path.realpath(os.path.expanduser(str(YCODE_DIR)))
+        )
+        basename = os.path.basename(normalized).lower()
+        top_level = os.path.normcase(os.path.dirname(normalized)) == os.path.normcase(
+            ycode_root
+        )
+        ambiguous_short = "~" in basename and expanded == resolved
+        credential_target = top_level and (
+            basename in _YCODE_CREDENTIAL_BASENAMES
+            or (
+                ambiguous_short
+                and function_name in {"write_file", "edit_file"}
+            )
+        )
+        if credential_target and function_name in {"write_file", "edit_file"}:
+            return "credential_write"
+        return "trusted_read"
+
+    if function_name == "read_file":
+        try:
+            from core.skills import is_trusted_read_path
+
+            if is_trusted_read_path(str(path_value)):
+                return "trusted_read"
+        except Exception:
+            pass
+    return "outside"
+
+
 def _sandbox_outside_guard(
     function_name,
     path_value,
@@ -280,7 +328,7 @@ def _sandbox_outside_guard(
         return sandbox_bypass(), None
     if cancel_event is not None and cancel_event.is_set():
         return None, PERMISSION_CANCELLED_MESSAGE
-    return None, "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径访问需要用户确认（可选择本会话内放行，或用 /sandbox on 长期开放）。"
+    return None, "🚨 用户拒绝了访问沙盒外路径的请求。沙盒外路径访问需要用户确认（可选择本任务内放行，或用 /sandbox on 长期开放）。"
 
 
 class ToolAdapterSet:
@@ -329,6 +377,13 @@ class ToolAdapterSet:
         adapter = copy(self)
         adapter.tool_call_id = str(tool_call_id or "")
         return adapter
+
+    def classify_path_access(self, function_name, path_value):
+        return classify_path_access(
+            function_name,
+            path_value,
+            is_outside_workspace=self.is_outside_workspace,
+        )
 
     def announce(self, name, arguments, event_callback):
         if event_callback is not None:

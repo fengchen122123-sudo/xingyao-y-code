@@ -60,6 +60,13 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
     已并入稳定系统提示词（core.agent_service.build_stable_system_message），
     本块只承载会话内可能变化的字段（模型 / 权限模式 / 工作目录 / 计划快照）。
     """
+    plan_instruction = ""
+    if runtime.permission_mode == "plan":
+        plan_instruction = (
+            "计划模式约束：只允许读取信息、执行明确的只读查询和维护计划元数据；"
+            "不得修改或删除工作区文件。最终回答必须输出可执行计划，并说明需要"
+            "切换到变更前确认、自动编辑或完全访问模式后再实施。\n"
+        )
     return (
         f"{DYNAMIC_CONTEXT_PREFIX}\n"
         f"当前模型：{runtime.model_name}\n"
@@ -69,6 +76,7 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
         "生成命令时必须优先使用该解释器的语法；命令失败后根据错误调整语法，"
         "必要时可通过 execute_command 的 shell_id 显式选择其他已安装解释器。\n"
         f"当前计划：{runtime.active_plan}\n"
+        f"{plan_instruction}"
         "（若上下文中存在多份本块，以最新一份为准）"
     )
 

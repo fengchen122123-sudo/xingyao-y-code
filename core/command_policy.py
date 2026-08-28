@@ -4,6 +4,8 @@ import os
 import re
 import shlex
 
+from core.permission_policy import PermissionRisk
+
 
 _INLINE_EXEC_FLAGS = {
     "-c",
@@ -19,6 +21,53 @@ _INLINE_EXEC_FLAGS = {
 _QUERY_FLAGS = {"-v", "--version", "-version", "-h", "--help"}
 _UNSAFE_COMMAND_TEXT = (";", "&", "|", "<", ">", "`", "\r", "\n", "$(")
 _PYTHON_OR_PIP = re.compile(r"(?:python|pip)(?:\d+(?:\.\d+)*)?(?:\.exe)?\Z", re.IGNORECASE)
+_QUERY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files"}
+_DELETE_COMMANDS = {"rm", "del", "erase", "rd", "rmdir", "remove-item"}
+_PROCESS_KILL_COMMANDS = {"kill", "pkill", "taskkill", "stop-process"}
+_PACKAGE_MUTATION_PAIRS = {
+    ("pip", "install"),
+    ("pip", "uninstall"),
+    ("npm", "install"),
+    ("npm", "uninstall"),
+    ("npm", "remove"),
+    ("npm", "update"),
+    ("pnpm", "add"),
+    ("pnpm", "install"),
+    ("pnpm", "remove"),
+    ("yarn", "add"),
+    ("yarn", "install"),
+    ("yarn", "remove"),
+    ("cargo", "install"),
+    ("cargo", "uninstall"),
+}
+_QUERY_COMMANDS = {
+    "cat",
+    "get-childitem",
+    "get-content",
+    "head",
+    "ls",
+    "pwd",
+    "rg",
+    "ripgrep",
+    "select-string",
+    "tail",
+    "test-path",
+    "type",
+    "where",
+    "where.exe",
+    "whoami",
+}
+_VERSION_QUERY_COMMANDS = {
+    "cargo",
+    "java",
+    "mvn",
+    "node",
+    "npm",
+    "pip",
+    "pnpm",
+    "python",
+    "yarn",
+}
 
 # ---------------------------------------------------------------------------
 # 敏感信息脱敏：命令回显/日志/持久化前屏蔽内联凭据，
@@ -76,9 +125,48 @@ def _shell_segments(text):
     return [part.strip() for part in re.split(r"(?:&&|\|\||[;&])", text) if part.strip()]
 
 
-def _dangerous_rm(segment):
+def _normalize_delete_target(target, *, workdir=None):
+    text = str(target or "").strip().strip("\"'")
+    if not text:
+        return ""
+    expanded = os.path.expandvars(os.path.expanduser(text))
+    if not os.path.isabs(expanded):
+        try:
+            if workdir is None:
+                from core.workspace_context import get_workdir
+
+                workdir = str(get_workdir())
+            expanded = os.path.join(str(workdir), expanded)
+        except Exception:
+            return ""
     try:
-        tokens = shlex.split(segment, posix=True)
+        return os.path.normcase(os.path.realpath(os.path.abspath(expanded)))
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
+def _is_protected_delete_target(target, *, workdir=None, home=None):
+    candidate = _normalize_delete_target(target, workdir=workdir)
+    if not candidate:
+        return False
+    protected_values = [workdir]
+    protected_values.append(home if home is not None else os.path.expanduser("~"))
+    for protected_value in protected_values:
+        protected = _normalize_delete_target(protected_value, workdir=workdir)
+        if not protected:
+            continue
+        try:
+            common = os.path.commonpath((candidate, protected))
+        except ValueError:
+            continue
+        if os.path.normcase(common) == candidate:
+            return True
+    return False
+
+
+def _dangerous_rm(segment, *, workdir=None, home=None):
+    try:
+        tokens = shlex.split(segment, posix=os.name != "nt")
     except ValueError:
         return False
     if tokens and tokens[0].lower() == "sudo":
@@ -105,22 +193,37 @@ def _dangerous_rm(segment):
         r"|\$\{?[A-Za-z_][A-Za-z0-9_]*\}?|%[A-Za-z_][A-Za-z0-9_]*%)$",
         re.IGNORECASE,
     )
-    return recursive and force and any(catastrophic_target.fullmatch(t) for t in targets)
+    return recursive and force and any(
+        catastrophic_target.fullmatch(target.strip("\"'"))
+        or _is_protected_delete_target(target, workdir=workdir, home=home)
+        for target in targets
+    )
 
 
-def _dangerous_windows_delete(segment):
+def _dangerous_windows_delete(segment, *, workdir=None, home=None):
     command_match = re.match(r"^(?:cmd(?:\.exe)?\s+/(?:c|k)\s+)?(del|erase|rd|rmdir)\b(.*)$", segment, re.IGNORECASE)
     if not command_match:
         return False
     body = command_match.group(2)
     flags = set(re.findall(r"(?:^|\s)/([a-z])(?=\s|$)", body, re.IGNORECASE))
     root_target = re.search(r"(?:^|\s)[\"']?(?:[a-z]:\\|\\\\)[\"']?(?=\s|$)", body, re.IGNORECASE)
-    return bool(root_target) and "s" in {flag.lower() for flag in flags} and (
-        command_match.group(1).lower() in {"rd", "rmdir"} or "q" in {flag.lower() for flag in flags}
+    recursive = "s" in {flag.lower() for flag in flags}
+    forceful = command_match.group(1).lower() in {"rd", "rmdir"} or "q" in {
+        flag.lower() for flag in flags
+    }
+    try:
+        body_tokens = shlex.split(body, posix=False)
+    except ValueError:
+        body_tokens = []
+    targets = [token for token in body_tokens if not token.startswith("/")]
+    protected_target = any(
+        _is_protected_delete_target(target, workdir=workdir, home=home)
+        for target in targets
     )
+    return recursive and forceful and (bool(root_target) or protected_target)
 
 
-def _dangerous_powershell_delete(segment):
+def _dangerous_powershell_delete(segment, *, workdir=None, home=None):
     command = re.match(r"^\s*(?:powershell|pwsh)(?:\.exe)?\b", segment, re.IGNORECASE)
     if command:
         match = re.search(r"\b(Remove-Item|Format-Volume)\b(.*)$", segment, re.IGNORECASE)
@@ -131,18 +234,44 @@ def _dangerous_powershell_delete(segment):
     if match.group(1).lower() == "format-volume":
         return True
     body = match.group(2)
-    return (
-        re.search(
+    recursive = re.search(
+        r"(?:^|\s)-(?:Recurse|R)(?=\s|$|[\"'])",
+        body,
+        re.IGNORECASE,
+    ) is not None
+    forceful = re.search(
+        r"(?:^|\s)-(?:Force|F)(?=\s|$|[\"'])",
+        body,
+        re.IGNORECASE,
+    ) is not None
+    root_target = re.search(
             r"(?:^|\s|[\"'])(?:[a-z]:\\+|\\\\|~(?:[/\\]|$)|\$HOME(?:[/\\]|$)|[*.?])(?=\s|$|[\"'])",
             body,
             re.IGNORECASE,
         ) is not None
-        and re.search(r"(?:^|\s)-(?:Recurse|R)(?=\s|$|[\"'])", body, re.IGNORECASE) is not None
-        and re.search(r"(?:^|\s)-(?:Force|F)(?=\s|$|[\"'])", body, re.IGNORECASE) is not None
+    try:
+        body_tokens = shlex.split(body, posix=False)
+    except ValueError:
+        body_tokens = []
+    targets = []
+    consume_path = False
+    for token in body_tokens:
+        lowered = token.lower()
+        if consume_path:
+            targets.append(token)
+            consume_path = False
+        elif lowered in {"-path", "-literalpath"}:
+            consume_path = True
+        elif not token.startswith("-"):
+            targets.append(token)
+    protected_target = any(
+        _is_protected_delete_target(target, workdir=workdir, home=home)
+        for target in targets
     )
+    return recursive and forceful and (root_target or protected_target)
 
 
-def is_dangerous_command(command: str) -> bool:
+def is_dangerous_command(command: str, *, workdir=None, home=None) -> bool:
     """Identify unambiguously catastrophic shell operations.
 
     This is defense in depth, not a complete shell sandbox. Permission
@@ -154,9 +283,9 @@ def is_dangerous_command(command: str) -> bool:
     if any(pattern.search(text) for pattern in _CATASTROPHIC_COMMAND_PATTERNS):
         return True
     return any(
-        _dangerous_rm(segment)
-        or _dangerous_windows_delete(segment)
-        or _dangerous_powershell_delete(segment)
+        _dangerous_rm(segment, workdir=workdir, home=home)
+        or _dangerous_windows_delete(segment, workdir=workdir, home=home)
+        or _dangerous_powershell_delete(segment, workdir=workdir, home=home)
         for segment in _shell_segments(text)
     )
 
@@ -187,6 +316,66 @@ def _has_inline_exec_flag(tokens: tuple[str, ...]) -> bool:
         if flag in _INLINE_EXEC_FLAGS:
             return True
     return False
+
+
+def _normalized_executable(token: str) -> str:
+    executable = os.path.basename(token.strip('"')).lower()
+    if executable.endswith(".exe"):
+        executable = executable[:-4]
+    return executable
+
+
+def classify_command_risk(command: str, *, workdir=None, home=None) -> PermissionRisk:
+    """Classify a shell command without executing or expanding it."""
+    if is_dangerous_command(command, workdir=workdir, home=home):
+        return PermissionRisk.CATASTROPHIC
+
+    tokens = _safe_tokens(command)
+    if tokens is None or _has_inline_exec_flag(tokens):
+        return PermissionRisk.SENSITIVE_MUTATION
+
+    executable = _normalized_executable(tokens[0])
+    arguments = tuple(token.lower() for token in tokens[1:])
+
+    if executable == "git":
+        if not arguments or (
+            len(arguments) == 1 and arguments[0] in _QUERY_FLAGS
+        ):
+            return PermissionRisk.QUERY
+        if arguments[0] in _QUERY_GIT_SUBCOMMANDS:
+            return PermissionRisk.QUERY
+        return PermissionRisk.SENSITIVE_MUTATION
+
+    if executable in _DELETE_COMMANDS or executable in _PROCESS_KILL_COMMANDS:
+        return PermissionRisk.SENSITIVE_MUTATION
+
+    if arguments and (executable, arguments[0]) in _PACKAGE_MUTATION_PAIRS:
+        return PermissionRisk.SENSITIVE_MUTATION
+
+    if executable in _QUERY_COMMANDS:
+        return PermissionRisk.QUERY
+
+    if (
+        executable in _VERSION_QUERY_COMMANDS
+        and len(arguments) == 1
+        and arguments[0] in _QUERY_FLAGS
+    ):
+        return PermissionRisk.QUERY
+
+    return PermissionRisk.NORMAL_MUTATION
+
+
+def parse_manual_command_rule(command: str) -> tuple[str, ...]:
+    """Parse a complete, persistable token prefix entered by the user."""
+    if is_dangerous_command(command):
+        raise ValueError("灾难性命令不能加入白名单")
+
+    tokens = _safe_tokens(command)
+    if tokens is None:
+        raise ValueError("命令白名单不支持管道、串联、重定向或变量展开")
+    if _has_inline_exec_flag(tokens):
+        raise ValueError("内联解释器命令不能加入白名单")
+    return tokens
 
 
 def session_rule_for_command(command: str) -> tuple[str, ...] | None:

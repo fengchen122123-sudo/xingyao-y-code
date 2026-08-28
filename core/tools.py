@@ -152,9 +152,9 @@ def _compress_source_text(text):
     return "\n".join(result) + ("\n" if result else "")
 
 
-# 线程内临时放行（用户批准的单次沙盒外操作）与会话级放行（用户选“始终放行”）
-# 会话级放行按线程绑定的会话分桶存储（多会话并行隔离）：会话 A 放行不影响
-# 会话 B；未绑定线程（CLI 主流程）沿用进程级全局标志（单会话语义不变）。
+# 线程内临时放行（用户批准的单次沙盒外操作）与任务级放行
+# 任务级放行按线程绑定的稳定任务 ID 分桶存储：任务 A 放行不影响任务 B；
+# 未绑定任务的 headless 流程使用 __default__ 桶。
 _sandbox_tls = threading.local()
 _session_sandbox_bypass = False
 _session_sandbox_bypass_by_session: dict[str, bool] = {}
@@ -226,20 +226,20 @@ def sandbox_bypass():
 
 
 def _sandbox_session_id():
-    """当前线程绑定的执行会话（多会话并行路由）；未绑定返回 None。"""
+    """返回稳定任务 ID；执行线程绑定优先于当前可见任务。"""
     try:
         import core.app_context as _app_context
 
-        sid = _app_context.get_thread_session()
-        return str(sid) if sid else None
+        sid = _app_context.get_thread_session() or _app_context.get_current_session()
+        return str(sid) if sid else "__default__"
     except Exception:
-        return None
+        return "__default__"
 
 
 def set_session_sandbox_bypass(enabled):
-    """会话级沙盒放行（用户在沙盒外访问确认中选择“始终放行”时置位）。
+    """任务级沙盒放行（用户选择“本任务内放行沙盒外访问”时置位）。
 
-    绑定了线程会话的回合写入各自会话的桶；未绑定线程写进程级全局标志。
+    绑定了任务的回合写入对应任务桶；未绑定任务写入 __default__ 桶。
     """
     global _session_sandbox_bypass
     sid = _sandbox_session_id()
@@ -250,8 +250,31 @@ def set_session_sandbox_bypass(enabled):
             _session_sandbox_bypass = bool(enabled)
 
 
+def clear_session_sandbox_bypass(task_id: str) -> None:
+    normalized = str(task_id or "").strip()
+    if not normalized:
+        raise ValueError("任务 ID 不能为空")
+    with _session_sandbox_lock:
+        _session_sandbox_bypass_by_session.pop(normalized, None)
+
+
+def rename_session_sandbox_bypass(old_task_id: str, new_task_id: str) -> None:
+    old_key = str(old_task_id or "").strip()
+    new_key = str(new_task_id or "").strip()
+    if not old_key or not new_key:
+        raise ValueError("任务 ID 不能为空")
+    if old_key == new_key:
+        return
+    with _session_sandbox_lock:
+        if _session_sandbox_bypass_by_session.get(new_key, False):
+            raise ValueError(f"目标任务 {new_key} 已有沙盒授权，不能覆盖")
+        enabled = _session_sandbox_bypass_by_session.pop(old_key, None)
+        if enabled is not None:
+            _session_sandbox_bypass_by_session[new_key] = enabled
+
+
 def is_session_sandbox_bypass_enabled():
-    """读取会话级沙盒放行标志（供 core.llm 权限快路径免询问判定）。"""
+    """读取任务级沙盒放行标志（供 core.llm 权限决策使用）。"""
     sid = _sandbox_session_id()
     with _session_sandbox_lock:
         if sid:
@@ -262,7 +285,7 @@ def is_session_sandbox_bypass_enabled():
 def _outside_workspace_allowed():
     """读取运行时状态：是否允许访问工作目录外的文件。
 
-    依次为：线程内单次放行 > 会话级放行 > 配置开关（/sandbox on）。
+    依次为：线程内单次放行 > 任务级放行 > 配置开关（/sandbox on）。
     开关打开后项目外读写均直接放行、不再逐次询问（~/.ycode 凭据文件除外，
     见 tool_adapters._sandbox_outside_guard）。
     """

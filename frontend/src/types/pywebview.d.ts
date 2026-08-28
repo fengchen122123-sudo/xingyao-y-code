@@ -363,8 +363,11 @@ export interface PyWebViewAPI {
   set_command_shell(shellId: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   get_permission_rules(): Promise<any>;
+  add_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;
+  remove_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;
   clear_permission_rules(): Promise<any>;
   respond_permission(requestId: string, allow: boolean, always: boolean): Promise<any>;
+  respond_permission_option(requestId: string, optionKey: string): Promise<any>;
   respond_permission_choice(requestId: string, choiceIndex: number, customText?: string): Promise<any>;
 
   send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string, modelId?: string): Promise<any>;
