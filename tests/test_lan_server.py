@@ -96,6 +96,34 @@ def test_serve_shim_returns_js():
     assert b"pywebview" in resp.body
 
 
+def test_serve_shim_falls_back_when_file_missing(monkeypatch):
+    """磁盘上 mobile-shim.js 缺失时，_serve_shim 必须回退内嵌快照而不是 404。
+
+    回归保护：1.2.16 安装包漏打包 frontend/mobile-shim.js，手机端 404 导致
+    window.pywebview 永不注入、前端弹「pywebview API 不可用」。
+    """
+    import core.lan_server as lan_mod
+
+    srv = LanServer(bridge=None)
+    monkeypatch.setattr(
+        lan_mod.LanServer, "_dist_dir", staticmethod(lambda: "Z:/nonexistent")
+    )
+    # 将 shim 路径指到不存在的目录：直接模拟文件缺失
+    monkeypatch.setattr(
+        lan_mod.os.path,
+        "join",
+        lambda *parts: (
+            "Z:/nonexistent/frontend/mobile-shim.js"
+            if parts[-1] == "mobile-shim.js"
+            else lan_mod.os.path.join(*parts)
+        ),
+    )
+    resp = srv._serve_shim()
+    assert resp.status_code == 200
+    assert b"pywebview" in resp.body
+    assert b"WebSocket" in resp.body
+
+
 def test_get_bind_info_returns_url_token_qr():
     srv = LanServer(bridge=None)
     srv.port = 8765

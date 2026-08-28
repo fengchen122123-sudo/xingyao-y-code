@@ -42,6 +42,10 @@ common_datas = [
     ('system_prompt_gui.md', '.'),
     ('vendor/ripgrep/rg.exe', 'vendor/ripgrep'),
     ('frontend/dist', 'frontend/dist'),
+    # 手机远程控制传输 shim：LAN server 注入到手机端页面 <head>，
+    # _serve_shim() 在打包环境从 _MEIPASS/frontend/ 读取；缺失时手机端
+    # window.pywebview 永不注入，前端 30s 轮询超时后弹「pywebview API 不可用」
+    ('frontend/mobile-shim.js', 'frontend'),
     # 内置技能（plugin-creator 等）：首次启动释放到 ~/.ycode/skills，用户可自由开关
     ('skills', 'skills'),
     # GUI 运行时用 WM_SETICON 设置窗口/任务栏图标，需随包携带 ico 文件
