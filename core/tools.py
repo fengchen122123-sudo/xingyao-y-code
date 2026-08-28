@@ -1504,37 +1504,76 @@ def search_code(query, dir_path=".", cancel_event=None):
 
 # --- 星瑶的新神装：后台任务管理与局部代码修改 ---
 
-def manage_task(action, task_id=None, event_callback=None, permission_owner=None, cancel_event=None):
+def manage_task(action, task_id=None, after_revision=None, timeout_seconds=30, event_callback=None, permission_owner=None, cancel_event=None):
     """
-    后台进程管理器：对丢在后台运行的长周期任务（如服务器）进行查杀和状态管理。
+    后台进程管理器：对丢在后台运行的长周期任务（如服务器）进行查杀、状态查询和条件等待。
     参数:
-      action: 可选值：'list'（查看所有运行中的后台任务）, 'status'（查看指定任务的实时日志尾部）, 'kill'（强制杀掉指定任务）。
-      task_id: 目标任务的 ID，如果是 'status' 或 'kill' 行动，则为必填项。
+      action: 可选值：'list'（列出运行中的后台任务）, 'status'（查看指定任务快照与日志尾部）,
+        'wait'（条件等待：revision 超过 after_revision、进入终态或超时后返回）, 'kill'（强制杀掉指定任务）。
+      task_id: 目标任务的 ID，'status'/'wait'/'kill' 行动必填。
+      after_revision: wait 必填，上次快照的 revision（非负整数）。
+      timeout_seconds: wait 的最长等待秒数（1-60，默认 30）；超时返回当前快照且 changed=false，不是错误。
       event_callback/permission_owner/cancel_event: 调度层透传的权限上下文（不暴露给模型），
         子代理线程内调用 kill 时必须传入，缺省路径仅在主线程上下文可用。
+    status/wait 返回 JSON：{"task_id","status","revision","terminal","exit_code","output"}，
+    wait 另含 "changed"；list 返回 {"tasks": [...]}。
     """
-    from core.task_manager import list_active_tasks, get_task_output, kill_background_task
-    
+    from core.task_manager import (
+        get_task_snapshot, kill_background_task, list_task_snapshots, wait_task_change,
+    )
+
+    def _snapshot_payload(snap, changed=None):
+        payload = {
+            "task_id": snap.task_id,
+            "status": snap.status,
+            "revision": snap.revision,
+            "terminal": snap.terminal,
+            "exit_code": snap.exit_code,
+            "output": snap.output,
+        }
+        if changed is not None:
+            payload["changed"] = changed
+        return payload
+
     if action == "list":
-        tasks = list_active_tasks()
-        if not tasks:
+        running = [s for s in list_task_snapshots() if not s.terminal]
+        if not running:
             return "ℹ 当前没有任何运行中的后台异步任务。"
-        res = ["当前活跃后台任务列表："]
-        for t in tasks:
-            # 命令可能包含内联凭据（export TOKEN=sk-...），回显模型前脱敏
-            res.append(f"- [任务 ID: {t['task_id']}] 运行 PID: {t['pid']} | 运行时间: {t['duration']} | 命令: {_redact_sensitive_text(t['command'])}")
-        return "\n".join(res)
-        
+        return json.dumps(
+            {"tasks": [_snapshot_payload(s) for s in running]},
+            ensure_ascii=False,
+        )
+
     elif action == "status":
         if not task_id:
             return "🚨 错误：查看状态必须提供 task_id 参数。"
-        output = get_task_output(task_id, tail_lines=40)
-        return f"--- 任务 {task_id} 最新 40 行日志输出 ---\n{output}"
-        
+        snap = get_task_snapshot(task_id)
+        if snap is None:
+            return f"🚨 未找到任务 {task_id}。"
+        return json.dumps(_snapshot_payload(snap), ensure_ascii=False)
+
+    elif action == "wait":
+        if not task_id:
+            return "🚨 错误：等待任务必须提供 task_id 参数。"
+        if after_revision is None:
+            return "🚨 错误：等待任务必须提供 after_revision 参数（非负整数）。"
+        try:
+            after = int(after_revision)
+        except (TypeError, ValueError):
+            return "🚨 错误：after_revision 必须是非负整数。"
+        if after < 0:
+            return "🚨 错误：after_revision 必须是非负整数。"
+        if timeout_seconds is None:
+            timeout_seconds = 30
+        snap = wait_task_change(task_id, after, timeout_seconds, cancel_event=cancel_event)
+        if snap is None:
+            return f"🚨 未找到任务 {task_id}。"
+        return json.dumps(_snapshot_payload(snap, changed=snap.revision > after), ensure_ascii=False)
+
     elif action == "kill":
         if not task_id:
             return "🚨 错误：终结任务必须提供 task_id 参数。"
-        # 只在 kill 类操作时要求用户确认，list/status 只读操作不弹确认
+        # 只在 kill 类操作时要求用户确认，list/status/wait 只读操作不弹确认
         from core.llm import check_permission_and_ask, PermissionSystemError
         # 注意：缺省（无 event_callback）路径会在调用线程内直接 safe_print 触碰终端，
         # 仅在主线程上下文中可用；子代理/调度层调用时必须透传权限上下文参数。
@@ -1555,9 +1594,9 @@ def manage_task(action, task_id=None, event_callback=None, permission_owner=None
             return f"✔ 后台任务 {task_id} 已被强行终结清除。"
         else:
             return f"🚨 未能成功杀掉任务 {task_id}（可能进程已经提前结束，或找不到 ID）。"
-            
+
     else:
-        return "🚨 错误：未知行动参数。可选值有 'list', 'status', 'kill'。"
+        return "🚨 错误：未知行动参数。可选值有 'list', 'status', 'wait', 'kill'。"
 
 def _fuzzy_replace(content, target, replacement, replace_all=False):
     """
