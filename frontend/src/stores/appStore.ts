@@ -265,6 +265,7 @@ export interface PermReqState {
   allowAlways: boolean;
   // ask_user 澄清问题的自定义选项（非空时渲染为选项列表而非三按钮）
   options: string[];
+  permissionOptions: Array<{ key: string; label: string }>;
   // 请求来源工具名：'ask_user' 时为澄清问题，否则为标准权限请求
   functionName: string;
 }
@@ -455,7 +456,7 @@ export const useAppStore = defineStore('app', {
     confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎', notice: false } as ConfirmState,
 
     // 权限请求弹窗
-    permRequest: { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' } as PermReqState,
+    permRequest: { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '' } as PermReqState,
 
     // 二级抽屉页面：技能 / MCP / 模型管理
     subpage: { show: false, type: 'skills' as SubpageType },
@@ -2262,6 +2263,23 @@ export const useAppStore = defineStore('app', {
         if (last && last.role === 'assistant') {
           last.content = this.currentStreamingText;
         }
+      } else if (type === 'message_final') {
+        // 自愈校正：流式 delta 经 evaluate_js 投递可能静默丢失（表现为回复尾部
+        // 缺一段），后端在 turn_finish 前补发最后一条助手消息全文。仅在全文更长
+        // （确有尾部缺失）时覆盖——正常路径长度相等，是无害 no-op，绝不回退内容。
+        const last = this.messages[this.messages.length - 1];
+        if (last && last.role === 'assistant') {
+          const finalText = String(data.content || '');
+          const finalReasoning = String(data.reasoning_content || '');
+          if (finalText.length > (last.content || '').length) {
+            last.content = finalText;
+            this.currentStreamingText = finalText;
+          }
+          if (finalReasoning.length > (last.reasoning_content || '').length) {
+            last.reasoning_content = finalReasoning;
+            this.currentThinkingText = finalReasoning;
+          }
+        }
       } else if (type === 'tool_start') {
         const d = data as ToolStartEventData;
         const msg = this.activeAssistantOrThrow();
@@ -2392,6 +2410,12 @@ export const useAppStore = defineStore('app', {
           source: data.source || '',
           allowAlways: !!data.allow_always,
           options: Array.isArray(data.options) ? data.options.map(String) : [],
+          permissionOptions: Array.isArray(data.permission_options)
+            ? data.permission_options.map((option: any) => ({
+              key: String(option?.key || ''),
+              label: String(option?.label || ''),
+            })).filter((option: { key: string; label: string }) => option.key && option.label)
+            : [],
           functionName: String(data.function_name || ''),
         };
         this.permRequest.show = this.permRequest.sessionName === this.currentSessionName;
@@ -2401,7 +2425,7 @@ export const useAppStore = defineStore('app', {
         // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留。
         // 必须整体重置：仅 show=false 会残留 reqId/sessionName，
         // switchSession 重显逻辑会把已失效的卡片复活，点击后报“权限响应发送失败”
-        this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], functionName: '' };
+        this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '' };
       } else if (type === 'message_queue') {
         // 排队消息全量快照：幂等替换该会话队列。后端在入队/取消/插队/补发
         // 后都会推送，前端不做增量合并，天然免疫事件乱序与丢失漂移
@@ -2671,6 +2695,35 @@ export const useAppStore = defineStore('app', {
       } finally {
         // 应答过的请求立即作废本地 reqId（保留新到的请求）：否则 switchSession 的
         // 重显逻辑会把已应答的卡片复活，再次点击必然报“已失效或已被处理”
+        if (this.permRequest.reqId === reqId) {
+          this.permRequest.reqId = '';
+          this.permRequest.sessionName = '';
+        }
+      }
+    },
+
+    async respondPermissionOption(optionKey: string) {
+      const reqId = this.permRequest.reqId;
+      const sessionName = this.permRequest.sessionName;
+      this.permRequest.show = false;
+      if (!reqId) return;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.respond_permission_option(reqId, optionKey);
+        if (!res?.ok) {
+          this._getSessionRuntime(sessionName).messages.push({
+            role: 'error',
+            content: '权限响应发送失败: ' + (res?.msg || '未知错误'),
+          });
+        }
+      } catch (err) {
+        this.connected = false;
+        this._getSessionRuntime(sessionName).messages.push({
+          role: 'error',
+          content: '权限响应发送失败: ' + err,
+        });
+      } finally {
         if (this.permRequest.reqId === reqId) {
           this.permRequest.reqId = '';
           this.permRequest.sessionName = '';
