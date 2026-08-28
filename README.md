@@ -1,7 +1,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.2.17](https://img.shields.io/badge/Version-1.2.17-green.svg)](core/version.py)
+[![Version 1.2.18](https://img.shields.io/badge/Version-1.2.18-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
