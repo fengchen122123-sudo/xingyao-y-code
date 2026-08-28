@@ -202,6 +202,8 @@ def test_provider_error_sets_failed_and_keeps_turn_error_event(mocker):
 
 
 def test_round_limit_message_is_committed_before_the_last_step_completes(mocker):
+    # 用 write_file（修改类工具）让每步产生真实进展：只有真实进展才能
+    # 跑满 100 轮上限——纯观察类循环会先被 TurnProgressGuard 熔断
     manager, _cancel_event = _persistent_runtime_fixture(mocker)
     call_number = 0
 
@@ -210,8 +212,8 @@ def test_round_limit_message_is_committed_before_the_last_step_completes(mocker)
         call_number += 1
         return _tool_stream(
             f"call-{call_number}",
-            "read_file",
-            {"file_path": f"file-{call_number}.py"},
+            "write_file",
+            {"file_path": f"file-{call_number}.py", "content": "x"},
         )
 
     def fixed_tool_result(tool_call, **_kwargs):
@@ -258,3 +260,134 @@ def test_message_persistence_failure_propagates_and_fails_the_turn(mocker):
         list(_persistent_events())
 
     assert manager.get_harness_turn("turn-runtime")["status"] == "failed"
+
+
+def _fixed_tool_result(tool_call, **_kwargs):
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "name": tool_call["function"]["name"],
+        "content": "ok",
+    }
+
+
+def _status_tool_result(tool_call, **_kwargs):
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "name": tool_call["function"]["name"],
+        "content": (
+            '{"task_id":"t1","status":"running","revision":0,'
+            '"terminal":false,"exit_code":null,"output":""}'
+        ),
+    }
+
+
+def test_no_progress_guard_aborts_turn_before_seventh_request(tmp_path, mocker):
+    # 模型连续返回同一 manage_task(status) 观察类调用：任务指纹/计划占位/结果哈希
+    # 全部不变、无 mutation，第 6 个无进展 Step 后熔断，第 7 次 Provider 请求不得发送。
+    manager = MemoryManager(str(tmp_path / "runtime.db"))
+    manager.create_session_explicit("session")
+    mocker.patch("core.app_context.get_manager", return_value=manager)
+    request_count = 0
+
+    def next_tool_stream(**_kwargs):
+        nonlocal request_count
+        request_count += 1
+        return _tool_stream(
+            f"call-{request_count}",
+            "manage_task",
+            {"action": "status", "task_id": "t1"},
+        )
+
+    mocker.patch("core.llm.completion", side_effect=next_tool_stream)
+    mocker.patch("core.llm._execute_single_tool_call", side_effect=_status_tool_result)
+
+    events = list(_persistent_events())
+
+    turn = manager.get_harness_turn("turn-runtime")
+    assert turn["status"] == "failed"
+    assert turn["error_code"] == "NoProgressError"
+    assert request_count == 6
+    # 用户可见错误：固定文案经 error 事件推送（GUI 据此展示 NoProgressError）
+    error_events = [event for event in events if event.kind == "error"]
+    assert any(
+        "连续 6 轮没有检测到后台任务、计划或工具结果状态变化"
+        in str(event.payload.get("message", ""))
+        for event in error_events
+    )
+    steps = _steps(manager, "turn-runtime")
+    assert len(steps) == 6
+    assert all(step["status"] == "completed" for step in steps)
+    history = manager.get_history("session")
+    assert history[-1]["role"] == "assistant"
+    assert "连续 6 轮没有检测到" in str(history[-1]["content"])
+
+
+def test_no_progress_guard_resets_when_mutation_committed(tmp_path, mocker):
+    # 第 5 步之后出现一次真实修改（write_file 成功提交），停滞计数清零、Turn 继续。
+    manager = MemoryManager(str(tmp_path / "runtime.db"))
+    manager.create_session_explicit("session")
+    mocker.patch("core.app_context.get_manager", return_value=manager)
+    request_count = 0
+
+    def next_stream(**_kwargs):
+        nonlocal request_count
+        request_count += 1
+        if request_count <= 5:
+            return _tool_stream(
+                f"call-{request_count}",
+                "manage_task",
+                {"action": "status", "task_id": "t1"},
+            )
+        if request_count == 6:
+            return _tool_stream(
+                "call-6",
+                "write_file",
+                {"file_path": "progress.txt", "content": "hello"},
+            )
+        return _text_stream("已完成。")
+
+    mocker.patch("core.llm.completion", side_effect=next_stream)
+    mocker.patch("core.llm._execute_single_tool_call", side_effect=_fixed_tool_result)
+
+    list(_persistent_events())
+
+    turn = manager.get_harness_turn("turn-runtime")
+    assert turn["status"] == "completed"
+    assert request_count == 7
+
+
+def _plan_read_tool_result(tool_call, **_kwargs):
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call["id"],
+        "name": tool_call["function"]["name"],
+        "content": "  [failed    ] task-x            | 某计划项",
+    }
+
+
+def test_plan_read_loop_without_state_change_aborts(tmp_path, mocker):
+    # 计划快照不变时反复 plan_read：结果文本相同、计划指纹不变、无 mutation，
+    # 第 6 个无进展 Step 后熔断（spec 测试矩阵：计划 read/retry/subagent 循环）。
+    manager = MemoryManager(str(tmp_path / "runtime.db"))
+    manager.create_session_explicit("session")
+    mocker.patch("core.app_context.get_manager", return_value=manager)
+    # 确保计划注册表无 "session" 条目：plan_state_fingerprint 返回稳定空态指纹
+    mocker.patch.dict("core.plan._PLAN_MANAGERS", {}, clear=True)
+    request_count = 0
+
+    def next_tool_stream(**_kwargs):
+        nonlocal request_count
+        request_count += 1
+        return _tool_stream(f"call-{request_count}", "plan_read", {})
+
+    mocker.patch("core.llm.completion", side_effect=next_tool_stream)
+    mocker.patch("core.llm._execute_single_tool_call", side_effect=_plan_read_tool_result)
+
+    list(_persistent_events())
+
+    turn = manager.get_harness_turn("turn-runtime")
+    assert turn["status"] == "failed"
+    assert turn["error_code"] == "NoProgressError"
+    assert request_count == 6

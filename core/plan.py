@@ -481,6 +481,66 @@ def get_default_plan_manager() -> PlanManager:
     return _DEFAULT_PLAN_MANAGER
 
 
+def plan_state_fingerprint(session_id: str | None = None) -> str:
+    """计划 canonical 快照指纹（SHA-256），供 TurnProgressGuard 判定真实进展。
+
+    只纳入影响调度的确定性字段：plan session id、每个计划项的
+    id/status/attempts/depends_on、当前 in-progress 项、auto-continue
+    suppression 状态。展示文案（subject/result/error 等）与时间戳不参与，
+    避免无业务变化却不断重置停滞计数。
+    显式 session_id 只 peek 注册表已有条目，绝不惰性创建（与
+    maybe_clear_completed_plan 的早退防护同理）。
+    """
+    import hashlib
+
+    manager = None
+    if session_id:
+        key = str(session_id).strip()
+        with _PLAN_MANAGERS_LOCK:
+            manager = _PLAN_MANAGERS.get(key)
+        if manager is None:
+            payload = {
+                "session": key,
+                "items": [],
+                "in_progress": None,
+                "auto_continue_suppressed": plan_auto_continue_suppressed(key),
+            }
+            canonical = json.dumps(
+                payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+            )
+            return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    else:
+        manager = get_default_plan_manager()
+
+    items = manager.snapshot()
+    in_progress = manager.in_progress()
+    payload = {
+        "session": manager.session_id,
+        "items": sorted(
+            (
+                [
+                    str(item.get("id", "")),
+                    str(item.get("status", "")),
+                    int(item.get("attempts", 0)),
+                    list(item.get("depends_on", [])),
+                ]
+                for item in items
+            ),
+            key=lambda row: row[0],
+        ),
+        "in_progress": (in_progress or {}).get("id"),
+        "auto_continue_suppressed": (
+            plan_auto_continue_suppressed(manager.session_id)
+            if manager.session_id
+            else False
+        ),
+    }
+    canonical = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 def maybe_clear_completed_plan(session_id: str | None = None) -> bool:
     """回合结束时调用：若指定会话（缺省取当前路由）的计划所有项都进入
     终态（completed/failed/blocked/cancelled），清空计划快照并返回 True
