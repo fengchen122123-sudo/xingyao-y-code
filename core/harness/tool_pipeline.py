@@ -53,7 +53,8 @@ _plan_turn_lock = threading.Lock()
 _plan_turn_started_at: dict[str, float] = {}
 
 REPEAT_CALL_BLOCKED_TEXT = (
-    "🛑 检测到相同的工具调用已成功执行过 2 次，结果未发生变化。请改用其他方式推进任务。"
+    "🚨 相同工具调用已经成功执行过 2 次，本次调用未执行。"
+    "请检查已有结果或改变执行方案。"
 )
 
 # 计划状态机工具不受重复调用抑制：plan_retry 设计为“首次返回根因分析提示、
@@ -65,6 +66,21 @@ _REPEAT_GUARD_EXEMPT_TOOLS = frozenset({
     "plan_read",
     "plan_retry",
 })
+
+
+# 后台任务观察类 action 不消耗重复额度：模型等待后台任务时需要反复
+# status/list/wait，拦截会迫使模型改用空输出命令当计时器（确定性循环根因）。
+# kill/stop/terminate/cancel 与未知 action 按保守策略不豁免。
+_REPEAT_GUARD_EXEMPT_MANAGE_TASK_ACTIONS = frozenset({"status", "list", "wait"})
+
+
+def repeat_guard_exempt(name: str, arguments: dict) -> bool:
+    if name in _REPEAT_GUARD_EXEMPT_TOOLS:
+        return True
+    if name == "manage_task":
+        action = str((arguments or {}).get("action", "")).strip().lower()
+        return action in _REPEAT_GUARD_EXEMPT_MANAGE_TASK_ACTIONS
+    return False
 
 
 @dataclass(frozen=True)
@@ -306,7 +322,7 @@ class ToolBatchExecutor:
         return message, max(0, duration_ms)
 
     def _execute_guarded(self, decoded, context):
-        guard_exempt = decoded.name in _REPEAT_GUARD_EXEMPT_TOOLS
+        guard_exempt = repeat_guard_exempt(decoded.name, decoded.arguments)
         if not guard_exempt and not self.repeat_guard.should_execute(decoded.name, decoded.raw_arguments):
             return _repeat_call_blocked_result(decoded), 0
         message, duration_ms = self._execute_timed(decoded, context)
