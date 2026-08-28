@@ -27,6 +27,95 @@ from websockets.sync.server import serve
 import config
 from config import save_config_value as _save_config_value
 
+# 手机端传输 shim 的内嵌快照：_serve_shim() 优先读磁盘上的
+# frontend/mobile-shim.js（随包分发、可独立更新）；磁盘文件读不到时
+# （如 1.2.16 及更早的安装包漏打包该文件）回退这份内嵌内容，保证手机端
+# 永远能拿到 shim，不再出现「pywebview API 不可用」。
+# 注意：修改磁盘版 mobile-shim.js 后请同步更新此快照，保持两边一致。
+_MOBILE_SHIM_FALLBACK_JS = """/**
+ * mobile-shim.js —— 局域网手机远程控制的 transport shim（内嵌回退快照）
+ *
+ * 桌面上 pywebview 注入 window.pywebview.api（RPC）与 window.onBridgeEvent（事件）。
+ * 手机上无 pywebview，本 shim 用 WebSocket 模拟这两者，使手机加载同一个 dist 前端、
+ * 复用全部组件与主题。
+ *
+ * 约定（与 core/lan_server.py 对齐）：
+ * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验。
+ * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
+ * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串）。
+ */
+(function () {
+  if (window.pywebview) return; // 桌面环境不注入，防御性
+
+  var token = new URLSearchParams(window.location.search).get('token') || '';
+  var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';
+
+  var ws = null;
+  var seq = 0;
+  var pending = new Map(); // id -> {resolve, reject}
+
+  function rpc(method, args) {
+    return new Promise(function (resolve, reject) {
+      if (!ws || ws.readyState !== 1) {
+        reject(new Error('\\u8fde\\u63a5\\u672a\\u5c31\\u7eea'));
+        return;
+      }
+      var id = ++seq;
+      pending.set(id, { resolve: resolve, reject: reject });
+      ws.send(JSON.stringify({ method: method, args: args, id: id }));
+    });
+  }
+
+  function connect() {
+    ws = new WebSocket(wsUrl);
+    ws.onopen = function () {
+      ws.send(JSON.stringify({ token: token }));
+      // 就绪后才注入 api，并触发前端等待的 pywebviewready 事件
+      window.pywebview = {
+        api: new Proxy({}, {
+          get: function (_target, prop) {
+            if (typeof prop !== 'string') return undefined;
+            return function () {
+              return rpc(prop, Array.prototype.slice.call(arguments));
+            };
+          },
+        }),
+      };
+      window.dispatchEvent(new Event('pywebviewready'));
+    };
+    ws.onmessage = function (event) {
+      var msg;
+      try {
+        msg = JSON.parse(event.data);
+      } catch (_) {
+        return;
+      }
+      if (msg && typeof msg.id !== 'undefined') {
+        // RPC 响应
+        var p = pending.get(msg.id);
+        if (p) {
+          pending.delete(msg.id);
+          if (msg.error) {
+            p.reject(new Error(msg.error));
+          } else {
+            p.resolve(msg.result);
+          }
+        }
+      } else if (msg && msg.type && window.onBridgeEvent) {
+        // 事件广播（对象 {type, data}）
+        window.onBridgeEvent(msg);
+      }
+    };
+    ws.onclose = function () {
+      setTimeout(connect, 2000); // 基础断线重连
+    };
+    ws.onerror = function () {};
+  }
+
+  connect();
+})();
+"""
+
 
 class LanServer:
     """在 Y-code 进程内运行的局域网远程控制服务。
@@ -338,7 +427,11 @@ class LanServer:
         return self._http_response(200, html, "text/html; charset=utf-8")
 
     def _serve_shim(self) -> Response:
-        """返回 frontend/mobile-shim.js 的真实内容。"""
+        """返回 mobile-shim.js：优先磁盘文件，缺失时回退内嵌快照。
+
+        磁盘版随包分发、可独立更新；内嵌快照兜底旧安装包漏打包该文件
+        导致的 404（手机端表现为「pywebview API 不可用」）。
+        """
         shim_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
             "frontend",
@@ -348,7 +441,8 @@ class LanServer:
             with open(shim_path, "rb") as f:
                 data = f.read()
         except OSError:
-            return self._http_404()
+            # 回退：旧安装包未携带磁盘版时使用代码内嵌快照，保证手机可用
+            data = _MOBILE_SHIM_FALLBACK_JS.encode("utf-8")
         return self._http_response(
             200, data, "application/javascript; charset=utf-8"
         )
