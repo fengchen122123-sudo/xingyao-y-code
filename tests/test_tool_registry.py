@@ -168,3 +168,20 @@ def test_edit_file_choice_constraint_is_moonshot_compatible():
         ["target_content"],
         ["start_line", "end_line"],
     ]
+
+
+def test_manage_task_schema_exposes_wait_parameters():
+    registry = build_default_registry()
+    spec = registry.get("manage_task")
+
+    assert spec.requires_permission is False
+    parameters = spec.api_schema()["function"]["parameters"]
+    assert parameters["required"] == ["action"]
+    properties = parameters["properties"]
+    assert properties["action"]["enum"] == ["list", "status", "wait", "kill"]
+    assert properties["after_revision"]["type"] == "integer"
+    assert properties["after_revision"]["minimum"] == 0
+    assert properties["timeout_seconds"]["type"] == "integer"
+    assert properties["timeout_seconds"]["minimum"] == 1
+    assert properties["timeout_seconds"]["maximum"] == 60
+    assert properties["timeout_seconds"]["default"] == 30

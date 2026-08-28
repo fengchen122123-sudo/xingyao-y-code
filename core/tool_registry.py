@@ -374,10 +374,16 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="manage_task",
-            description="查看或终止后台任务。list/status 为只读操作不弹确认；仅 kill 操作会请求用户确认。",
+            description=(
+                "查看、等待或终止后台任务。list/status/wait 为只读操作不弹确认；"
+                "仅 kill 操作会请求用户确认。等待后台任务进展优先用 wait："
+                "传入上次快照的 revision，任务状态或输出变化时立即返回。"
+            ),
             input_schema=_schema({
-                "action": {"type": "string"},
+                "action": {"type": "string", "enum": ["list", "status", "wait", "kill"]},
                 "task_id": {"type": "string"},
+                "after_revision": {"type": "integer", "minimum": 0},
+                "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60, "default": 30},
             }, ["action"]),
             execute=tools.manage_task,
             requires_permission=False,

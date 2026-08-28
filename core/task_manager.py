@@ -7,6 +7,8 @@ import threading
 import time
 import uuid
 
+from dataclasses import dataclass
+
 from core.process_io import decode_process_output, platform_console_encoding
 from core.workspace_context import get_workdir
 
@@ -20,6 +22,34 @@ _TASKS_LOCK = threading.RLock()
 # 用于区分"其他进程新启动的任务"（合并保留）与"本进程已删除的任务"（防止复活）
 _REMOVED_TIDS = set()
 _REMOVED_TIDS_CAP = 512
+
+# 任务生命周期状态：running 之外均为终态（terminal）
+TASK_STATUS_RUNNING = "running"
+TASK_STATUS_COMPLETED = "completed"
+TASK_STATUS_FAILED = "failed"
+TASK_STATUS_TIMED_OUT = "timed_out"
+TASK_STATUS_CANCELLED = "cancelled"
+_TERMINAL_STATUSES = frozenset({
+    TASK_STATUS_COMPLETED, TASK_STATUS_FAILED,
+    TASK_STATUS_TIMED_OUT, TASK_STATUS_CANCELLED,
+})
+# 状态变更条件变量：revision 递增与 notify_all 必须在同一把锁内完成，
+# manage_task(wait) 的等待方借此在状态/输出变化时被即时唤醒，而非固定轮询忙等
+_TASKS_COND = threading.Condition(_TASKS_LOCK)
+# 终态任务保留上限，防止 ACTIVE_TASKS 无限增长
+_TERMINAL_KEEP_CAP = 64
+
+
+@dataclass(frozen=True)
+class TaskStatusSnapshot:
+    """后台任务某一时刻的不可变状态快照；revision 单调递增，仅在可观察状态变化时增长。"""
+
+    task_id: str
+    status: str
+    revision: int
+    terminal: bool
+    output: str
+    exit_code: int | None
 
 
 def _forget_task_locked(tid):
@@ -78,11 +108,27 @@ def _read_log_tail(task_id, max_chars=2000):
 
 
 def _watch_task_completion(task_id, process, command, session_id):
-    """监听线程：阻塞等待后台命令进程退出，退出后触发完成回调（仅一次）。"""
-    try:
-        returncode = process.wait()
-    except Exception:
-        return
+    """监听线程：0.5s 节拍同步任务状态（日志大小/进程退出），退出后触发完成回调（仅一次）。
+
+    每拍在 _TASKS_COND 内执行 _sync_task_locked：日志 size 变化或进程退出都会
+    bump revision 并 notify_all，manage_task(wait) 的等待方据此即时被唤醒。
+    """
+    returncode = None
+    while True:
+        try:
+            returncode = process.poll()
+        except Exception:
+            return
+        with _TASKS_COND:
+            info = ACTIVE_TASKS.get(task_id)
+            if info is not None and info.get("process") is process:
+                _sync_task_locked(task_id, info)
+                if returncode is not None:
+                    # 进程退出后落盘一次：磁盘库只保留 running 任务
+                    _save_tasks()
+        if returncode is not None:
+            break
+        time.sleep(0.5)
     cb = _on_task_finished
     if cb is not None:
         try:
@@ -214,6 +260,10 @@ def _load_tasks():
                     info.get("output_encoding")
                     or platform_console_encoding()
                 ),
+                "status": TASK_STATUS_RUNNING,
+                "exit_code": None,
+                "revision": 0,
+                "last_log_size": 0,
             }
 
 
@@ -224,6 +274,9 @@ def _save_tasks():
         with _TASKS_LOCK:
             data = {}
             for tid, info in ACTIVE_TASKS.items():
+                # 只落盘仍在运行的任务；终态任务仅保留在内存供快照/wait 查询（磁盘格式不变）
+                if info.get("status", TASK_STATUS_RUNNING) != TASK_STATUS_RUNNING:
+                    continue
                 pid = info.get("pid") or (info["process"].pid if info.get("process") else None)
                 if pid:
                     data[tid] = {
@@ -332,6 +385,10 @@ def start_background_task(command: str, session_id: str = "", shell_id: str = ""
                 "log_handle": log_file,
                 "start_time": time.time(),
                 "output_encoding": output_encoding,
+                "status": TASK_STATUS_RUNNING,
+                "exit_code": None,
+                "revision": 0,
+                "last_log_size": 0,
             }
             _save_tasks()
         _prune_old_logs()
@@ -383,61 +440,185 @@ def _prune_old_logs():
         _logger.warning("清理历史任务日志失败: %s", error)
 
 
+def _bump_revision_locked(info):
+    """锁内递增任务 revision 并唤醒所有 wait 等待方（必须已持有 _TASKS_COND/_TASKS_LOCK）。"""
+    info["revision"] = int(info.get("revision", 0)) + 1
+    _TASKS_COND.notify_all()
+
+
+def _sync_task_locked(tid, info):
+    """锁内同步单个任务：日志大小变化/进程退出 → 状态与 revision。返回是否变化。"""
+    changed = False
+    try:
+        size = os.path.getsize(info["log_file_path"])
+    except OSError:
+        size = info.get("last_log_size", 0)
+    if size != info.get("last_log_size", 0):
+        info["last_log_size"] = size
+        _bump_revision_locked(info)
+        changed = True
+    if info.get("status") == TASK_STATUS_RUNNING:
+        exit_code = None
+        dead = False
+        proc = info.get("process")
+        if proc is not None:
+            poll = proc.poll()
+            if poll is not None:
+                dead, exit_code = True, int(poll)
+        elif info.get("pid") is not None:
+            if not is_pid_running(info["pid"]):
+                dead = True  # 重建任务无法取退出码，exit_code 保持 None
+            else:
+                # PID 复用防护：磁盘重建任务需校验进程启动时间，
+                # 否则无关进程复用 PID 会让死任务永远挂在活跃列表里
+                recorded_create_time = info.get("create_time")
+                current_create_time = _process_create_time(info["pid"])
+                if (
+                    recorded_create_time is not None
+                    and current_create_time is not None
+                    and abs(current_create_time - recorded_create_time) > 2
+                ):
+                    dead = True
+        else:
+            dead = True
+        if dead:
+            info["status"] = (
+                TASK_STATUS_COMPLETED if exit_code in (None, 0) else TASK_STATUS_FAILED
+            )
+            info["exit_code"] = exit_code
+            try:
+                if info.get("log_handle"):
+                    info["log_handle"].close()
+            except Exception:
+                pass
+            _bump_revision_locked(info)
+            changed = True
+    return changed
+
+
+def _snapshot_locked(tid, info, tail_lines=40) -> TaskStatusSnapshot:
+    return TaskStatusSnapshot(
+        task_id=tid,
+        status=info.get("status", TASK_STATUS_RUNNING),
+        revision=int(info.get("revision", 0)),
+        terminal=info.get("status", TASK_STATUS_RUNNING) in _TERMINAL_STATUSES,
+        output=get_task_output(tid, tail_lines=tail_lines),
+        exit_code=info.get("exit_code"),
+    )
+
+
+def get_task_snapshot(task_id):
+    """返回任务当前快照；任务不存在（含终态记录已淘汰）返回 None。"""
+    _ensure_paths()
+    _ensure_loaded()
+    with _TASKS_COND:
+        info = ACTIVE_TASKS.get(task_id)
+        if info is None:
+            return None
+        _sync_task_locked(task_id, info)
+        return _snapshot_locked(task_id, info)
+
+
+def list_task_snapshots():
+    """返回全部任务（含终态）的快照列表。"""
+    _ensure_paths()
+    _ensure_loaded()
+    with _TASKS_COND:
+        snaps = []
+        for tid, info in list(ACTIVE_TASKS.items()):
+            _sync_task_locked(tid, info)
+            snaps.append(_snapshot_locked(tid, info))
+        return snaps
+
+
+def wait_task_change(task_id, after_revision, timeout_seconds, cancel_event=None):
+    """条件等待任务变化：revision 超过 after_revision、进入终态或超时后返回快照。
+
+    任务不存在返回 None；超时返回当前快照（是否变化由调用方比较 revision 得出），
+    超时不是错误；cancel_event 置位抛 KeyboardInterrupt（不伪装超时）。
+    """
+    _ensure_paths()
+    _ensure_loaded()
+    deadline = time.monotonic() + max(1, min(60, int(timeout_seconds)))
+    with _TASKS_COND:
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt("用户终止了工具执行。")
+            info = ACTIVE_TASKS.get(task_id)
+            if info is None:
+                return None
+            _sync_task_locked(task_id, info)
+            snap = _snapshot_locked(task_id, info)
+            if snap.revision > int(after_revision) or snap.terminal:
+                return snap
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return snap
+            _TASKS_COND.wait(timeout=min(remaining, 0.5))
+
+
+def background_tasks_fingerprint() -> str:
+    """全部任务 {task_id: [status, revision, terminal, exit_code]} canonical JSON 的 SHA-256。"""
+    import hashlib
+    with _TASKS_COND:
+        state = {
+            tid: [info.get("status", TASK_STATUS_RUNNING),
+                  int(info.get("revision", 0)),
+                  info.get("status", TASK_STATUS_RUNNING) in _TERMINAL_STATUSES,
+                  info.get("exit_code")]
+            for tid, info in sorted(ACTIVE_TASKS.items())
+        }
+    canonical = json.dumps(state, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _evict_terminal_locked():
+    """终态任务超过 _TERMINAL_KEEP_CAP 时淘汰最旧终态（按 start_time），并记墓碑。"""
+    terminal = [
+        (tid, info) for tid, info in ACTIVE_TASKS.items()
+        if info.get("status", TASK_STATUS_RUNNING) in _TERMINAL_STATUSES
+    ]
+    if len(terminal) <= _TERMINAL_KEEP_CAP:
+        return False
+    terminal.sort(key=lambda pair: pair[1].get("start_time") or 0)
+    for tid, _info in terminal[: len(terminal) - _TERMINAL_KEEP_CAP]:
+        del ACTIVE_TASKS[tid]
+        _forget_task_locked(tid)
+    return True
+
+
 def list_active_tasks():
-    """返回当前所有活跃的任务列表，具备死亡状态自动清理与磁盘存盘同步"""
+    """返回当前所有仍在运行的任务列表（返回值结构与历史一致，只含 running 任务）。
+
+    死亡任务不再直接删除，而是标记终态保留在 ACTIVE_TASKS 供快照/wait 查询；
+    终态记录超过 _TERMINAL_KEEP_CAP 时淘汰最旧；磁盘库只保存 running 任务。
+    """
     _ensure_paths()
     results = []
-    # 强制重新从本地加载以接管外部常驻进程，同时自动清理已死亡进程
+    # 强制重新从本地加载以接管外部常驻进程
     _load_tasks()
 
     dirty = False
-    with _TASKS_LOCK:
+    with _TASKS_COND:
         for tid, info in list(ACTIVE_TASKS.items()):
+            was_terminal = info.get("status", TASK_STATUS_RUNNING) in _TERMINAL_STATUSES
+            _sync_task_locked(tid, info)
+            if info.get("status", TASK_STATUS_RUNNING) in _TERMINAL_STATUSES:
+                if not was_terminal:
+                    dirty = True
+                continue
             proc = info.get("process")
             pid = info.get("pid")
+            running_time = int(time.time() - info["start_time"])
+            results.append({
+                "task_id": tid,
+                "command": info["command"],
+                "pid": pid or (proc.pid if proc else -1),
+                "duration": f"{running_time}秒"
+            })
 
-            # 判定进程是否已经彻底结束
-            is_dead = False
-            if proc is not None:
-                poll = proc.poll()
-                if poll is not None:
-                    is_dead = True
-            elif pid is not None:
-                if not is_pid_running(pid):
-                    is_dead = True
-                else:
-                    # PID 复用防护：磁盘重建任务需校验进程启动时间，
-                    # 否则无关进程复用 PID 会让死任务永远挂在活跃列表里
-                    recorded_create_time = info.get("create_time")
-                    current_create_time = _process_create_time(pid)
-                    if (
-                        recorded_create_time is not None
-                        and current_create_time is not None
-                        and abs(current_create_time - recorded_create_time) > 2
-                    ):
-                        is_dead = True
-            else:
-                is_dead = True
-
-            if is_dead:
-                # 进程已死，关闭文件句柄并从活跃库移除
-                try:
-                    if info.get("log_handle"):
-                        info["log_handle"].close()
-                except Exception as error:
-                    _logger.warning("关闭任务日志句柄失败 %s: %s", tid, error)
-                del ACTIVE_TASKS[tid]
-                _forget_task_locked(tid)
-                dirty = True
-            else:
-                running_time = int(time.time() - info["start_time"])
-                results.append({
-                    "task_id": tid,
-                    "command": info["command"],
-                    "pid": pid or (proc.pid if proc else -1),
-                    "duration": f"{running_time}秒"
-                })
-
+        if _evict_terminal_locked():
+            dirty = True
         if dirty:
             _save_tasks()
 
@@ -548,6 +729,7 @@ def kill_background_task(task_id: str) -> bool:
     pid = info.get("pid")
 
     killed = False
+    natural_death = False  # 进程在 kill 之前已自行结束（终态按自然退出落定）
     try:
         if pid:
             pid = int(pid)
@@ -573,9 +755,11 @@ def kill_background_task(task_id: str) -> bool:
             if pid_reused:
                 # 视为任务已结束，只清理记录，不执行 taskkill
                 killed = False
+                natural_death = True
             elif not is_pid_running(pid):
                 # 进程已自行结束
                 killed = True
+                natural_death = True
             elif os.name == 'nt':
                 # Windows 下利用 taskkill 杀死整个进程树（列表参数，不做 shell 插值）
                 result = subprocess.run(
@@ -605,8 +789,18 @@ def kill_background_task(task_id: str) -> bool:
     except Exception as error:
         _logger.warning("关闭任务日志句柄失败 %s: %s", task_id, error)
 
-    with _TASKS_LOCK:
-        ACTIVE_TASKS.pop(task_id, None)
+    with _TASKS_COND:
+        current = ACTIVE_TASKS.get(task_id)
+        if current is not None:
+            if natural_death:
+                # 进程在 kill 之前已自行结束：按自然终态落定，不覆盖为 cancelled
+                _sync_task_locked(task_id, current)
+            if current.get("status") == TASK_STATUS_RUNNING:
+                # 保留记录为终态（快照/wait 可继续查询），不再立即删除
+                current["status"] = TASK_STATUS_CANCELLED
+                current["exit_code"] = None
+                _bump_revision_locked(current)
+        # 墓碑防止 _save_tasks 的跨进程合并读把磁盘旧记录复活
         _forget_task_locked(task_id)
         _save_tasks()
     return killed

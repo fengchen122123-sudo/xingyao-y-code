@@ -654,6 +654,8 @@ class ToolAdapterSet:
             "event_callback": context.event_callback,
             "permission_owner": context.permission_owner,
             "cancel_event": context.cancel_event,
+            "after_revision": arguments.get("after_revision"),
+            "timeout_seconds": arguments.get("timeout_seconds", 30),
         }
         supported = {
             key: value
