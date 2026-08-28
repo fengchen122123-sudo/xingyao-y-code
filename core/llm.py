@@ -3393,6 +3393,62 @@ def _tool_result_ok(function_name, result):
     ))
 
 
+def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
+    """构造本 Step 的确定性进展观察（供 TurnProgressGuard 判定）。
+
+    只聚合确定性状态：后台任务指纹、计划 canonical 快照指纹、
+    非观察类工具结果哈希、修改类提交标记；不读取模型自然语言。
+    """
+    from core.harness.progress_guard import ProgressObservation
+    from core.harness.tool_pipeline import (
+        _PLAN_READ_ONLY_TOOLS,
+        REPEAT_CALL_BLOCKED_TEXT,
+    )
+    from core.plan import plan_state_fingerprint
+    from core.task_manager import background_tasks_fingerprint
+
+    result_parts = []
+    mutation_committed = False
+    for record in records or ():
+        message = getattr(record, "message", None) or {}
+        name = str(message.get("name", "") or "")
+        content = str(message.get("content", "") or "")
+        # RepeatCallGuard 拦截结果是固定文案，不代表任何业务状态变化
+        if content == REPEAT_CALL_BLOCKED_TEXT:
+            continue
+        ok = _tool_result_ok(name, message)
+        if ok and name in {"write_file", "edit_file"}:
+            mutation_committed = True
+        elif ok and name == "execute_command" and tool_calls_by_id:
+            command = ""
+            tool_call = tool_calls_by_id.get(message.get("tool_call_id")) or {}
+            try:
+                command = str(
+                    json.loads(tool_call.get("function", {}).get("arguments") or "{}")
+                    .get("command", "")
+                )
+            except (TypeError, ValueError):
+                command = ""
+            if command:
+                from core.command_policy import classify_command_risk
+                from core.permission_policy import PermissionRisk
+
+                if classify_command_risk(command) is not PermissionRisk.QUERY:
+                    mutation_committed = True
+        if name not in _PLAN_READ_ONLY_TOOLS:
+            result_parts.append([name, content])
+
+    canonical = json.dumps(
+        result_parts, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    return ProgressObservation(
+        task_snapshots_sha256=background_tasks_fingerprint(),
+        plan_snapshot_sha256=plan_state_fingerprint(session_id),
+        tool_results_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+        mutation_committed=mutation_committed,
+    )
+
+
 def _raise_if_tool_cancelled(cancel_event):
     # 取消判断只认每 turn 传入的 cancel_event，不再读全局粘性布尔
     if cancel_event is not None and cancel_event.is_set():
@@ -3896,6 +3952,11 @@ def _chat_with_model_generator(
     from core.harness.tool_pipeline import RepeatCallGuard
 
     repeat_call_guard = RepeatCallGuard()
+    # 确定性无进展熔断：只比较后台任务/计划/工具结果哈希与修改类提交标记，
+    # 连续 MAX_STALLED_STEPS 步无真实状态变化即终止回合，随本轮会话循环生命周期
+    from core.harness.progress_guard import TurnProgressGuard
+
+    progress_guard = TurnProgressGuard()
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
     pending_persistence = []
@@ -4175,6 +4236,25 @@ def _chat_with_model_generator(
         max_turns = 100
         for turn in range(max_turns):
             raise_if_cancelled()
+            # 无进展熔断：连续 MAX_STALLED_STEPS 步无确定性状态变化时，
+            # 在创建新 Step（即发送下一次 Provider 请求）之前终止回合
+            if progress_guard.should_abort():
+                msg = (
+                    f"{TOOL_ERROR_PREFIX} 连续 6 轮没有检测到后台任务、计划或工具结果"
+                    "状态变化，回合已终止，避免继续循环消耗。"
+                )
+                no_progress_message = {"role": "assistant", "content": msg}
+                messages.append(no_progress_message)
+                if stream:
+                    persisted_no_progress = deepcopy(no_progress_message)
+                    persisted_no_progress.update(_model_display_snapshot())
+                    pending_persistence.append(("assistant", persisted_no_progress))
+                flush_persistence()
+                if harness_runtime is not None:
+                    harness_runtime.fail("NoProgressError")
+                _notify_event(event_callback, "error", {"message": msg})
+                yield from _yield_content(msg)
+                return
             if harness_runtime is not None:
                 current_step = harness_runtime.begin_step()
             if turn > 0:
@@ -4658,6 +4738,10 @@ def _chat_with_model_generator(
                     # 该 user 催促消息也需要持久化，否则下一轮重建历史时上下文会缺失
                     pending_persistence.append(("user", summary_request))
                     flush_persistence()
+                    # 无工具执行的催促轮同样计入进展观察（无状态变化 → 停滞计数 +1）
+                    progress_guard.observe(
+                        _step_progress_observation(None, session_id=parent_session)
+                    )
                     if current_step is not None and turn + 1 < max_turns:
                         current_step.complete()
                     # 内部兜底重试静默进行：底部状态栏已显示"正在干活..."，
@@ -4708,6 +4792,10 @@ def _chat_with_model_generator(
                             "message": "计划仍有未执行项，已提醒模型继续执行。",
                         })
                         flush_persistence()
+                        # 续推打转本身不产生进展：计划快照无变化时停滞计数 +1
+                        progress_guard.observe(
+                            _step_progress_observation(None, session_id=parent_session)
+                        )
                         if current_step is not None and turn + 1 < max_turns:
                             current_step.complete()
                         continue
@@ -4766,6 +4854,10 @@ def _chat_with_model_generator(
                 _notify_event(event_callback, "notice", {
                     "message": "模型输出被长度限制截断，已拦截本批工具调用并要求模型拆小参数重试。",
                 })
+                # 截断拦截未执行任何工具：合成错误结果相同，无状态变化 → 停滞 +1
+                progress_guard.observe(
+                    _step_progress_observation(None, session_id=parent_session)
+                )
                 continue
 
             tool_activity_seen = True
@@ -4856,7 +4948,15 @@ def _chat_with_model_generator(
                 current_step.mark_tools_committed()
                 if turn + 1 < max_turns:
                     current_step.complete()
-            
+
+            # 工具提交完成后的进展观察：后台任务指纹/计划快照/非观察类结果哈希/
+            # 修改类提交标记任一变化即算真实进展，否则停滞计数 +1
+            progress_guard.observe(
+                _step_progress_observation(
+                    records, tool_calls_by_id, session_id=parent_session
+                )
+            )
+
         # 超过轮次上限：提示消息写入历史并与正常结束一样落库，避免下一轮丢失上下文
         msg = f"{TOOL_ERROR_PREFIX} 任务轮次超过上限（100 轮），请把任务拆小一点再试！"
         limit_message = {"role": "assistant", "content": msg}

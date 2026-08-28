@@ -330,3 +330,77 @@ def test_maybe_clear_completed_plan_does_not_create_registry_entry(monkeypatch):
     monkeypatch.setattr(plan, "_PLAN_MANAGERS", {})
     assert plan.maybe_clear_completed_plan("never-seen-session") is False
     assert "never-seen-session" not in plan._PLAN_MANAGERS
+
+
+def _fingerprint_fixture(tmp_path, monkeypatch, session="fp-session"):
+    import core.plan as plan
+
+    manager = plan.PlanManager(storage_dir=tmp_path, session_id=session)
+    manager.replace([
+        {"id": "a", "subject": "探索", "status": "pending"},
+        {"id": "b", "subject": "实施", "status": "pending", "depends_on": ["a"]},
+    ])
+    monkeypatch.setattr(plan, "_PLAN_MANAGERS", {session: manager})
+    return plan, manager, session
+
+
+def test_plan_state_fingerprint_stable_for_same_state(tmp_path, monkeypatch):
+    plan, _manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
+    assert plan.plan_state_fingerprint(session) == plan.plan_state_fingerprint(session)
+
+
+def test_plan_state_fingerprint_changes_on_status_change(tmp_path, monkeypatch):
+    plan, manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
+    before = plan.plan_state_fingerprint(session)
+    assert manager.update("a", status="completed") is True
+    assert plan.plan_state_fingerprint(session) != before
+
+
+def test_plan_state_fingerprint_changes_on_retry_reset(tmp_path, monkeypatch):
+    # plan_retry 真正重置 failed→pending（attempts+1）时指纹必须变化：
+    # TurnProgressGuard 据此清零停滞计数，两段式重试不被误杀
+    plan, manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
+    assert manager.update("b", status="failed", attempts=1, error="boom") is True
+    before = plan.plan_state_fingerprint(session)
+    assert manager.update("b", status="pending", attempts=2) is True
+    assert plan.plan_state_fingerprint(session) != before
+
+
+def test_plan_state_fingerprint_ignores_display_text(tmp_path, monkeypatch):
+    # subject/result/error 等展示文案变化不算业务状态变化，指纹保持稳定
+    plan, manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
+    before = plan.plan_state_fingerprint(session)
+    assert manager.update("a", subject="改写后的任务标题") is True
+    assert manager.update("a", result="新的结果文案", error="新的错误文案") is True
+    assert plan.plan_state_fingerprint(session) == before
+
+
+def test_plan_state_fingerprint_tracks_auto_continue_suppression(tmp_path, monkeypatch):
+    plan, _manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
+    before = plan.plan_state_fingerprint(session)
+    plan.suppress_plan_auto_continue(session)
+    try:
+        assert plan.plan_state_fingerprint(session) != before
+    finally:
+        plan.clear_plan_auto_continue_suppression(session)
+
+
+def test_plan_state_fingerprint_tracks_in_progress_item(tmp_path, monkeypatch):
+    plan, manager, session = _fingerprint_fixture(tmp_path, monkeypatch)
+    before = plan.plan_state_fingerprint(session)
+    assert manager.update("a", status="in_progress") is True
+    after = plan.plan_state_fingerprint(session)
+    assert after != before
+    assert manager.update("a", status="completed") is True
+    # in_progress 从 a 变回 None：与 before 不同（a 的 status 已变），
+    # 与"in_progress 为 a"的状态也不同
+    assert plan.plan_state_fingerprint(session) != after
+
+
+def test_plan_state_fingerprint_unknown_session_is_stable_and_clean(tmp_path, monkeypatch):
+    # 未知会话：不惰性创建注册表条目（早退回合场景），返回稳定空态指纹
+    import core.plan as plan
+    monkeypatch.setattr(plan, "_PLAN_MANAGERS", {})
+    first = plan.plan_state_fingerprint("never-planned")
+    assert first == plan.plan_state_fingerprint("never-planned")
+    assert "never-planned" not in plan._PLAN_MANAGERS

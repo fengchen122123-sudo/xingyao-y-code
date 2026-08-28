@@ -537,6 +537,43 @@ def test_tool_result_error_prefix_is_not_reported_as_success():
     ) is False
 
 
+def test_repeat_blocked_result_commits_journal_error_status():
+    # 重复调用拦截结果（🚨 前缀）必须被识别为失败：
+    # llm.py 提交路径用 _tool_result_ok 判定 ok，
+    # build_tool_result_event_draft 据此写 result_status="error"。
+    from core.harness.tool_pipeline import (
+        REPEAT_CALL_BLOCKED_TEXT,
+        ToolExecutionRecord,
+        build_tool_result_event_draft,
+    )
+    from core.llm import _tool_result_ok
+
+    message = {
+        "role": "tool",
+        "tool_call_id": "kill-third",
+        "name": "manage_task",
+        "content": REPEAT_CALL_BLOCKED_TEXT,
+    }
+    ok = _tool_result_ok("manage_task", message)
+    assert ok is False
+
+    tool_call = {
+        "id": "kill-third",
+        "function": {
+            "name": "manage_task",
+            "arguments": '{"action":"kill","task_id":"t1"}',
+        },
+    }
+    draft = build_tool_result_event_draft(
+        "step-1",
+        tool_call,
+        ToolExecutionRecord(call_ordinal=0, message=message, duration_ms=0),
+        message_index=1,
+        ok=ok,
+    )
+    assert draft.result_status == "error"
+
+
 def test_generator_exception_does_not_leak_raw_error_as_public_answer(mocker):
     mocker.patch(
         "core.llm.completion",
@@ -1420,3 +1457,208 @@ def test_summarize_execute_command_started_truncates_long_command():
     assert "星瑶正在执行命令" in summary
     assert "..." in summary
     assert len(summary) <= len("星瑶正在执行命令：") + 30
+
+
+_NO_PROGRESS_MESSAGE = (
+    "🚨 连续 6 轮没有检测到后台任务、计划或工具结果状态变化，"
+    "回合已终止，避免继续循环消耗。"
+)
+
+
+def _progress_record(call_id, name, content, ordinal=0):
+    from core.harness.tool_pipeline import ToolExecutionRecord
+
+    return ToolExecutionRecord(
+        call_ordinal=ordinal,
+        message={
+            "role": "tool",
+            "tool_call_id": call_id,
+            "name": name,
+            "content": content,
+        },
+        duration_ms=0,
+    )
+
+
+def test_no_progress_abort_emits_fixed_user_visible_error(mocker):
+    request_count = 0
+
+    def next_tool_stream(**_kwargs):
+        nonlocal request_count
+        request_count += 1
+        return iter([_chunk(tool_calls=[
+            _tool_call(
+                0,
+                f"call-{request_count}",
+                "manage_task",
+                '{"action":"status","task_id":"t1"}',
+            ),
+        ])])
+
+    def fixed_tool_result(tc, **_kwargs):
+        return {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": tc["function"]["name"],
+            "content": '{"task_id":"t1","status":"running"}',
+        }
+
+    mocker.patch("core.llm.completion", side_effect=next_tool_stream)
+    mocker.patch("core.llm._execute_single_tool_call", side_effect=fixed_tool_result)
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "盯着后台任务"}],
+        persist=False,
+        turn_id="turn-no-progress",
+    ))
+
+    error_events = [event for event in events if event.kind == "error"]
+    assert error_events, "无进展熔断必须产生用户可见 error 事件"
+    assert error_events[0].payload["message"] == _NO_PROGRESS_MESSAGE
+    public_text = "".join(
+        str(event.payload.get("text", ""))
+        for event in events
+        if event.kind == "assistant_delta"
+    )
+    assert _NO_PROGRESS_MESSAGE in public_text
+    assert request_count == 6
+
+
+def test_no_progress_abort_works_without_harness_runtime(mocker):
+    # legacy chat_with_model（无 Harness）场景：guard 照常观察、门禁照常生效，
+    # 终止消息写入历史并作为回合回复返回。
+    from core.llm import chat_with_model
+
+    request_count = 0
+
+    def next_tool_stream(**_kwargs):
+        nonlocal request_count
+        request_count += 1
+        return iter([_chunk(tool_calls=[
+            _tool_call(
+                0,
+                f"call-{request_count}",
+                "manage_task",
+                '{"action":"status","task_id":"t1"}',
+            ),
+        ])])
+
+    def fixed_tool_result(tc, **_kwargs):
+        return {
+            "role": "tool",
+            "tool_call_id": tc["id"],
+            "name": tc["function"]["name"],
+            "content": '{"task_id":"t1","status":"running"}',
+        }
+
+    mocker.patch("core.llm.completion", side_effect=next_tool_stream)
+    mocker.patch("core.llm._execute_single_tool_call", side_effect=fixed_tool_result)
+
+    messages = [{"role": "user", "content": "盯着后台任务"}]
+    reply = chat_with_model("fake-model", "fake-key", messages)
+
+    assert reply == _NO_PROGRESS_MESSAGE
+    assert request_count == 6
+    assert messages[-1] == {"role": "assistant", "content": _NO_PROGRESS_MESSAGE}
+
+
+def test_step_progress_observation_ignores_call_ids_and_plan_placeholder():
+    import hashlib
+
+    from core.llm import _step_progress_observation
+
+    records_a = [_progress_record("call-1", "write_file", "写入完成")]
+    records_b = [_progress_record("call-xyz", "write_file", "写入完成")]
+
+    obs_a = _step_progress_observation(records_a, {})
+    obs_b = _step_progress_observation(records_b, {})
+
+    # 只改变工具 call id 不算进展：结果哈希必须一致
+    assert obs_a.tool_results_sha256 == obs_b.tool_results_sha256
+    # 计划快照为真实计划指纹：不传 session 时走默认路由，同状态两次调用稳定一致
+    from core.plan import plan_state_fingerprint
+
+    assert obs_a.plan_snapshot_sha256 == plan_state_fingerprint(None)
+    assert obs_a.plan_snapshot_sha256 == obs_b.plan_snapshot_sha256
+
+
+def test_step_progress_observation_skips_observation_tools_and_blocked_results():
+    from core.harness.tool_pipeline import REPEAT_CALL_BLOCKED_TEXT
+    from core.llm import _step_progress_observation
+
+    baseline = _step_progress_observation(None, None)
+
+    # 观察类工具（manage_task 等）结果不纳入结果哈希
+    obs = _step_progress_observation(
+        [_progress_record("c1", "manage_task", '{"status":"running"}')],
+        {},
+    )
+    assert obs.tool_results_sha256 == baseline.tool_results_sha256
+    assert obs.mutation_committed is False
+
+    # RepeatCallGuard 拦截结果跳过：不纳入哈希、不算 mutation
+    obs_blocked = _step_progress_observation(
+        [_progress_record("c2", "write_file", REPEAT_CALL_BLOCKED_TEXT)],
+        {},
+    )
+    assert obs_blocked.tool_results_sha256 == baseline.tool_results_sha256
+    assert obs_blocked.mutation_committed is False
+
+    # 非观察类工具结果纳入结果哈希
+    obs_written = _step_progress_observation(
+        [_progress_record("c3", "write_file", "写入完成")],
+        {},
+    )
+    assert obs_written.tool_results_sha256 != baseline.tool_results_sha256
+
+
+def test_step_progress_observation_mutation_rules():
+    from core.llm import _step_progress_observation
+
+    # write_file/edit_file 结果 ok → mutation
+    obs = _step_progress_observation(
+        [_progress_record("c1", "write_file", "写入完成")],
+        {},
+    )
+    assert obs.mutation_committed is True
+
+    # 失败结果不算 mutation
+    obs_fail = _step_progress_observation(
+        [_progress_record("c2", "edit_file", "🚨 文件不存在")],
+        {},
+    )
+    assert obs_fail.mutation_committed is False
+
+    # execute_command 查询类命令（QUERY）不算 mutation
+    query_calls = {
+        "c3": {
+            "id": "c3",
+            "function": {
+                "name": "execute_command",
+                "arguments": '{"command":"ls"}',
+            },
+        },
+    }
+    obs_query = _step_progress_observation(
+        [_progress_record("c3", "execute_command", "ok")],
+        query_calls,
+    )
+    assert obs_query.mutation_committed is False
+
+    # execute_command 修改类命令且结果 ok → mutation
+    mutation_calls = {
+        "c4": {
+            "id": "c4",
+            "function": {
+                "name": "execute_command",
+                "arguments": '{"command":"mkdir progress_guard_tmp"}',
+            },
+        },
+    }
+    obs_mutation = _step_progress_observation(
+        [_progress_record("c4", "execute_command", "ok")],
+        mutation_calls,
+    )
+    assert obs_mutation.mutation_committed is True
