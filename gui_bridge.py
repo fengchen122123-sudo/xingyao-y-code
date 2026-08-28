@@ -1764,8 +1764,17 @@ class ApiBridge:
                     f"window.onBridgeEvent && window.onBridgeEvent({payload})"
                 )
             except Exception as e:
-                # WebView 销毁/跳转中 evaluate_js 会抛；事件丢掉即可，绝不带出线程
-                logger.debug("evaluate_js 失败: %s", e)
+                # WebView 销毁/跳转中 evaluate_js 会抛；事件丢掉即可，绝不带出线程。
+                # 但渲染进程繁忙时的投递失败是「流式尾部丢失」的直接原因，必须可诊断：
+                # 前 3 次与每 100 次记 warning，其余保持 debug 防刷屏。
+                self._js_eval_failed = getattr(self, "_js_eval_failed", 0) + 1
+                if self._js_eval_failed <= 3 or self._js_eval_failed % 100 == 0:
+                    logger.warning(
+                        "evaluate_js 投递事件失败（累计 %d 次，该事件已丢失）: %s",
+                        self._js_eval_failed, e,
+                    )
+                else:
+                    logger.debug("evaluate_js 失败: %s", e)
 
     # -- 流式增量的批量推送 ------------------------------------------------
     def _emit_delta(self, kind: str, text: str, session_name: str = ""):
@@ -1808,6 +1817,54 @@ class ApiBridge:
             self._delta_last_flush = time.monotonic()
         for kind, text, session_name in pending:
             self._emit_raw(kind, {"text": text, "session_name": session_name})
+
+    def _finalize_session_deltas(self, session_name: str) -> None:
+        """回合收尾：先冲刷再清理该会话的 delta 缓冲。
+
+        顺序敏感：回合末尾最后一块文本可能还滞留在缓冲里（距上次冲刷不足
+        60ms、冲刷线程还没轮到），直接 pop 会把尾部静默丢弃——前端消息靠
+        delta 累加渲染，这块文本就永久缺失（「回复尾部缺一段」的根因）。
+        finish_once 的 turn_finish 虽会触发冲刷，但那之前缓冲若已被 pop，
+        冲刷的就是个空。任何异常吞掉，绝不阻断回合收尾。
+        """
+        try:
+            self._flush_deltas()
+        except Exception:
+            logger.debug("回合收尾冲刷流式缓冲失败", exc_info=True)
+        try:
+            with self._delta_lock:
+                self._delta_buffers.pop(session_name, None)
+                self._delta_kinds.pop(session_name, None)
+        except Exception:
+            logger.debug("回合收尾清理流式缓冲失败", exc_info=True)
+
+    def _emit_message_final(self, session_name: str) -> None:
+        """补发最后一条助手消息的全文（message_final 事件），供前端自愈校正。
+
+        前端气泡内容完全靠 token_delta 累加，delta 在 evaluate_js 投递环节丢失
+        后没有任何校正手段（表现为「回复尾部缺一段」）。回合结束时从数据库读取
+        已落库的全文补发，前端仅在全文更长时覆盖，正常路径是无害 no-op。
+        任何异常都吞掉：本事件是兜底增强，绝不能阻断 turn_finish。
+        """
+        try:
+            history = self._memory.get_history(session_name)
+            final_text = ""
+            final_reasoning = ""
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    content = msg.get("content")
+                    reasoning = msg.get("reasoning_content")
+                    final_text = content if isinstance(content, str) else ""
+                    final_reasoning = reasoning if isinstance(reasoning, str) else ""
+                    break
+            if final_text or final_reasoning:
+                self.emit_event("message_final", {
+                    "session_name": session_name,
+                    "content": final_text,
+                    "reasoning_content": final_reasoning,
+                })
+        except Exception:
+            logger.debug("补发 message_final 失败", exc_info=True)
 
     def _ensure_delta_flusher(self):
         """惰性启动尾包冲刷线程：保证最后一小段文本不会滞留在缓冲里。
@@ -2500,6 +2557,11 @@ class ApiBridge:
                 return {"ok": False, "msg": "重命名失败（可能目标名称已存在）", "name": old_name}
             if self._current_session == old_name:
                 self._set_current_session(final_name)
+            from core import permission_grants
+            from core.tools import rename_session_sandbox_bypass
+
+            permission_grants.rename_task(old_name, final_name)
+            rename_session_sandbox_bypass(old_name, final_name)
             # 排队消息随会话迁移到新名（重命名时无运行回合，但队列可能非空：
             # 上一回合刚结束、补发线程尚未调度等窗口），快照让前端同步
             with self._turn_start_lock:
@@ -2524,6 +2586,11 @@ class ApiBridge:
                 # 会话删除后排队消息一并丢弃
                 self._message_queues.pop(session_name, None)
             self._memory.delete_session(session_name)
+            from core import permission_grants
+            from core.tools import clear_session_sandbox_bypass
+
+            permission_grants.clear_task(session_name)
+            clear_session_sandbox_bypass(session_name)
             if self._current_session == session_name:
                 new_session = f"session_{uuid.uuid4().hex[:6]}"
                 self._memory.create_session_explicit(new_session, workdir="GLOBAL", source="GUI")
@@ -2552,6 +2619,13 @@ class ApiBridge:
             with self._turn_start_lock:
                 for name in group_sessions:
                     self._message_queues.pop(name, None)
+            from core import permission_grants
+            from core.tools import clear_session_sandbox_bypass
+
+            for name in group_sessions:
+                if name:
+                    permission_grants.clear_task(name)
+                    clear_session_sandbox_bypass(name)
             return {"ok": True, "success": True, "sessions": self.get_sessions()}
         except Exception as e:
             logger.exception("delete_folder_group 失败")
@@ -2819,6 +2893,34 @@ class ApiBridge:
             logger.exception("clear_permission_rules 失败")
             return {"ok": False, "msg": str(e)}
 
+    def add_permission_rule(self, rule_type: str, value: str) -> Dict[str, Any]:
+        try:
+            from core import permission_store
+
+            result = permission_store.add_rule(rule_type, value)
+            return {
+                "ok": True,
+                "status": result.status,
+                "rule_type": result.rule_type,
+                "normalized_value": result.normalized_value,
+            }
+        except (ValueError, permission_store.PermissionStoreError) as exc:
+            return {"ok": False, "msg": str(exc)}
+
+    def remove_permission_rule(self, rule_type: str, value: str) -> Dict[str, Any]:
+        try:
+            from core import permission_store
+
+            result = permission_store.remove_rule(rule_type, value)
+            return {
+                "ok": True,
+                "status": result.status,
+                "rule_type": result.rule_type,
+                "normalized_value": result.normalized_value,
+            }
+        except (ValueError, permission_store.PermissionStoreError) as exc:
+            return {"ok": False, "msg": str(exc)}
+
     # ------------------------------------------------------------------
     # 权限确认：统一走 core.permission_broker（与 CLI 同一套串行化机制）
     # ------------------------------------------------------------------
@@ -2827,6 +2929,10 @@ class ApiBridge:
         try:
             from core.tool_presenter import describe_permission_request
             options = list(request.options or ())
+            permission_options = [
+                {"key": key, "label": label}
+                for key, label in zip(request.option_keys, options)
+            ]
             self.emit_event("permission_request", {
                 "session_name": _session_from_turn_id(request.parent_turn_id),
                 "request_id": request.request_id,
@@ -2841,6 +2947,7 @@ class ApiBridge:
                 ),
                 "source": request.source,
                 "options": options,
+                "permission_options": permission_options,
                 # 沙盒外访问等场景只给 同意/拒绝 两项，不渲染"总是允许"
                 "allow_always": len(options) >= 3,
             })
@@ -2895,9 +3002,9 @@ class ApiBridge:
             else:
                 choice = 0
             resolved = permission_broker.resolve(str(request_id), choice)
-            self._cancel_perm_timer(str(request_id))
             if not resolved:
                 return {"ok": False, "msg": "该权限请求已失效或已被处理"}
+            self._cancel_perm_timer(str(request_id))
             return {"ok": True}
         except Exception as e:
             logger.exception("respond_permission 失败")
@@ -2916,12 +3023,26 @@ class ApiBridge:
                 int(choice_index),
                 custom_answer=custom or None,
             )
-            self._cancel_perm_timer(str(request_id))
             if not resolved:
                 return {"ok": False, "msg": "该权限请求已失效或已被处理"}
+            self._cancel_perm_timer(str(request_id))
             return {"ok": True}
         except Exception as e:
             logger.exception("respond_permission_choice 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def respond_permission_option(self, request_id: str, option_key: str) -> Dict[str, Any]:
+        try:
+            resolved = permission_broker.resolve_by_key(
+                str(request_id),
+                str(option_key),
+            )
+            if not resolved:
+                return {"ok": False, "msg": "该权限请求已失效、选项无效或已被处理"}
+            self._cancel_perm_timer(str(request_id))
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("respond_permission_option 失败")
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
@@ -3302,6 +3423,11 @@ class ApiBridge:
                     })
             except Exception:
                 logger.debug("回合结束清空已完成计划失败", exc_info=True)
+            # 自愈校正：流式 delta 经 evaluate_js 投递可能静默丢失（渲染进程繁忙
+            # 时执行失败此前只记 debug），前端消息纯靠 delta 累加、尾部一丢就永久
+            # 缺失。turn_finish 前补发 message_final 携带最后一条助手消息全文，
+            # 前端仅在全文更长时覆盖——正常路径是无害 no-op，丢包路径自我修复。
+            self._emit_message_final(event_session_name)
             self.emit_event("turn_finish", {"session_name": event_session_name})
             self._emit_token_usage()
 
@@ -3501,10 +3627,7 @@ class ApiBridge:
             # 从活跃回合字典中移除本会话
             self._active_turns.pop(session_name, None)
             self._active_turn_ids.pop(session_name, None)
-            # 顺带清理 delta 缓冲（加锁防止与 _flush_deltas 的遍历竞态）
-            with self._delta_lock:
-                self._delta_buffers.pop(session_name, None)
-                self._delta_kinds.pop(session_name, None)
+            self._finalize_session_deltas(session_name)
             # 仅当没有其他活跃回合时才恢复 idle，避免会话 A 结束时把仍在跑的会话 B
             # 的全局状态错置成 idle
             if not any(t.is_alive() for t in self._active_turns.values()):
