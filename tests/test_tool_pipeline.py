@@ -1091,10 +1091,78 @@ def test_repeat_blocked_record_is_model_visible_and_not_executed():
         "tool_call_id": "third",
         "name": "read_file",
         "content": (
-            "🛑 检测到相同的工具调用已成功执行过 2 次，"
-            "结果未发生变化。请改用其他方式推进任务。"
+            "🚨 相同工具调用已经成功执行过 2 次，本次调用未执行。"
+            "请检查已有结果或改变执行方案。"
         ),
     }
+
+
+def test_repeat_guard_exempt_allows_readonly_manage_task_actions():
+    from core.harness.tool_pipeline import repeat_guard_exempt
+
+    for action in ("status", "list", "wait"):
+        assert repeat_guard_exempt("manage_task", {"action": action}) is True
+
+
+def test_repeat_guard_exempt_blocks_side_effect_and_unknown_actions():
+    from core.harness.tool_pipeline import repeat_guard_exempt
+
+    for action in ("kill", "stop", "terminate", "cancel", "bogus", ""):
+        assert repeat_guard_exempt("manage_task", {"action": action}) is False
+
+
+def test_repeat_guard_exempt_keeps_plan_tools_exempt():
+    from core.harness.tool_pipeline import repeat_guard_exempt
+
+    for name in ("plan_write", "plan_update", "plan_read", "plan_retry"):
+        assert repeat_guard_exempt(name, {}) is True
+    assert repeat_guard_exempt("read_file", {}) is False
+
+
+def test_manage_task_status_called_three_times_all_execute():
+    # manage_task(status) 连续三次均真实执行，不被 RepeatCallGuard 拦截
+    executions = []
+    executor = _parallel_executor(
+        lambda call, _context: executions.append(call["id"])
+        or _batch_tool_message(call["id"], content="status ok")
+    )
+    for i in range(3):
+        records = executor.execute(
+            [_batch_call(f"s{i}", "manage_task", '{"action":"status","task_id":"t1"}')],
+            _batch_context(),
+            None,
+        )
+    assert len(executions) == 3
+    assert all("🚨" not in str(r.message.get("content", "")) for r in records)
+
+
+def test_manage_task_kill_third_call_blocked_with_error_semantics():
+    from core.harness.tool_pipeline import REPEAT_CALL_BLOCKED_TEXT
+
+    executions = []
+    executor = _parallel_executor(
+        lambda call, _context: executions.append(call["id"])
+        or _batch_tool_message(call["id"], content="killed")
+    )
+    for i in range(3):
+        records = executor.execute(
+            [_batch_call(f"k{i}", "manage_task", '{"action":"kill","task_id":"t1"}')],
+            _batch_context(),
+            None,
+        )
+    assert len(executions) == 2
+    assert records[0].message["content"] == REPEAT_CALL_BLOCKED_TEXT
+    assert REPEAT_CALL_BLOCKED_TEXT.startswith("🚨")
+
+
+def test_repeat_blocked_text_exact_and_no_result_comparison_claim():
+    from core.harness.tool_pipeline import REPEAT_CALL_BLOCKED_TEXT
+
+    assert REPEAT_CALL_BLOCKED_TEXT == (
+        "🚨 相同工具调用已经成功执行过 2 次，本次调用未执行。"
+        "请检查已有结果或改变执行方案。"
+    )
+    assert "结果未发生变化" not in REPEAT_CALL_BLOCKED_TEXT
 
 
 def test_tool_result_journal_draft_contains_only_hashes_and_ordered_metadata():
