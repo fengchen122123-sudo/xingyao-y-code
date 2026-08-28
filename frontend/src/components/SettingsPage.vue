@@ -292,21 +292,57 @@
           <div class="perm-whitelist">
             <div class="whitelist-head">
               <h3>项目持久化白名单</h3>
-              <button
-                data-test="clear-permission-rules"
-                class="secondary-button compact"
-                :disabled="permClearing"
-                @click="clearPermRules"
-              >清空本项目规则</button>
+              <div class="whitelist-actions">
+                <button
+                  data-test="add-permission-rule"
+                  class="secondary-button compact"
+                  @click="showPermRuleForm = !showPermRuleForm"
+                >手动添加</button>
+                <button
+                  data-test="clear-permission-rules"
+                  class="secondary-button compact"
+                  :disabled="permClearing"
+                  @click="clearPermRules"
+                >清空本项目规则</button>
+              </div>
             </div>
-            <p class="whitelist-tip">「始终允许」产生的授权按项目目录保存在本地（permissions.json），重启后仍生效。沙盒限制下访问工作目录外会逐次询问（可选本会话内放行，不落盘、切会话收回）；沙盒解除后不再询问。</p>
+            <p class="whitelist-tip">用户手动添加或审批时选择“加入项目白名单”的规则会按项目目录保存到 permissions.json，重启后仍生效。命令按 token 前缀匹配；文件只放行规范化后的精确路径。任务级授权切换界面不清除，删除任务或重启后失效。</p>
+            <div v-if="showPermRuleForm" class="wl-form">
+              <select v-model="permRuleType" data-test="permission-rule-type" class="text-field">
+                <option value="command">命令前缀</option>
+                <option value="write">写入文件</option>
+                <option value="edit">修改文件</option>
+              </select>
+              <input
+                v-model="permRuleValue"
+                data-test="permission-rule-value"
+                class="text-field wl-value-input"
+                :placeholder="permRuleType === 'command' ? '例如 git status' : '输入精确文件路径'"
+                @keydown.enter.prevent="savePermRule"
+              >
+              <button
+                data-test="save-permission-rule"
+                class="primary-button compact"
+                :disabled="permSaving || !permRuleValue.trim()"
+                @click="savePermRule"
+              >保存</button>
+            </div>
             <div v-if="permRules && (permRules.commands.length || permRules.write_files.length || permRules.edit_files.length)">
               <div v-if="permRules.commands.length" class="wl-label">命令前缀规则</div>
-              <div v-for="(c, i) in permRules.commands" :key="'c' + i" class="wl-item mono">{{ c }}</div>
+              <div v-for="(c, i) in permRules.commands" :key="'c' + i" class="wl-item">
+                <span class="mono">{{ c }}</span>
+                <button :data-test="`remove-permission-command-${i}`" class="wl-remove" @click="removePermRule('command', c)">删除</button>
+              </div>
               <div v-if="permRules.write_files.length" class="wl-label">放行写入的文件</div>
-              <div v-for="(p, i) in permRules.write_files" :key="'w' + i" class="wl-item mono">{{ p }}</div>
+              <div v-for="(p, i) in permRules.write_files" :key="'w' + i" class="wl-item">
+                <span class="mono">{{ p }}</span>
+                <button :data-test="`remove-permission-write-${i}`" class="wl-remove" @click="removePermRule('write', p)">删除</button>
+              </div>
               <div v-if="permRules.edit_files.length" class="wl-label">放行修改的文件</div>
-              <div v-for="(p, i) in permRules.edit_files" :key="'e' + i" class="wl-item mono">{{ p }}</div>
+              <div v-for="(p, i) in permRules.edit_files" :key="'e' + i" class="wl-item">
+                <span class="mono">{{ p }}</span>
+                <button :data-test="`remove-permission-edit-${i}`" class="wl-remove" @click="removePermRule('edit', p)">删除</button>
+              </div>
             </div>
             <div v-else class="wl-empty">暂无持久化规则</div>
           </div>
@@ -768,6 +804,11 @@ async function onSecondaryRolesChange() {
 // ── 权限与沙盒分区：加载/清空当前项目的持久化白名单 ──
 const permRules = ref<{ commands: string[]; write_files: string[]; edit_files: string[] } | null>(null);
 const permClearing = ref(false);
+type PermissionRuleType = 'command' | 'write' | 'edit';
+const showPermRuleForm = ref(false);
+const permRuleType = ref<PermissionRuleType>('command');
+const permRuleValue = ref('');
+const permSaving = ref(false);
 
 async function loadPermRules() {
   try {
@@ -787,6 +828,13 @@ async function loadPermRules() {
 }
 
 async function clearPermRules() {
+  const confirmed = await store.askConfirm(
+    '清空项目白名单',
+    '该操作会删除当前项目的全部持久化权限规则',
+    '确定清空本项目规则吗？任务级临时授权不会受到影响。',
+    '确认清空',
+  );
+  if (!confirmed) return;
   permClearing.value = true;
   try {
     const api = (window as any).pywebview?.api;
@@ -800,6 +848,44 @@ async function clearPermRules() {
     }
   } finally {
     permClearing.value = false;
+  }
+}
+
+async function savePermRule() {
+  const value = permRuleValue.value.trim();
+  if (!value) return;
+  permSaving.value = true;
+  try {
+    const api = (window as any).pywebview?.api;
+    if (!api?.add_permission_rule) return;
+    const res = await api.add_permission_rule(permRuleType.value, value);
+    if (res?.ok) {
+      permRuleValue.value = '';
+      showPermRuleForm.value = false;
+      await loadPermRules();
+    } else {
+      store.notifyModal('权限与沙盒', '新增失败: ' + (res?.msg || '未知错误'));
+    }
+  } finally {
+    permSaving.value = false;
+  }
+}
+
+async function removePermRule(ruleType: PermissionRuleType, value: string) {
+  const confirmed = await store.askConfirm(
+    '删除白名单规则',
+    '删除后相关操作将重新按当前权限模式判断',
+    `确定删除规则「${value}」吗？`,
+    '确认删除',
+  );
+  if (!confirmed) return;
+  const api = (window as any).pywebview?.api;
+  if (!api?.remove_permission_rule) return;
+  const res = await api.remove_permission_rule(ruleType, value);
+  if (res?.ok) {
+    await loadPermRules();
+  } else {
+    store.notifyModal('权限与沙盒', '删除失败: ' + (res?.msg || '未知错误'));
   }
 }
 
@@ -1038,10 +1124,16 @@ onMounted(async () => {
 .perm-action { margin-top: 0; white-space: nowrap; }
 .perm-whitelist { padding-top: 20px; }
 .whitelist-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+.whitelist-actions { display: flex; align-items: center; gap: 8px; }
 .whitelist-head h3 { margin: 0; font-size: 14px; }
 .whitelist-tip { margin: 8px 0 14px; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
+.wl-form { display: flex; gap: 8px; align-items: center; margin: 12px 0 16px; }
+.wl-form select { flex: 0 0 130px; }
+.wl-value-input { flex: 1; min-width: 0; }
 .wl-label { margin: 14px 0 6px; color: var(--text-dim); font-size: 11.5px; font-weight: 600; }
-.wl-item { padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-dim); font-size: 12px; margin-bottom: 6px; word-break: break-all; }
+.wl-item { padding: 8px 10px 8px 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg2); color: var(--text-dim); font-size: 12px; margin-bottom: 6px; display: flex; align-items: center; gap: 10px; }
+.wl-item > span { flex: 1; min-width: 0; word-break: break-all; }
+.wl-remove { flex: none; border: 0; background: transparent; color: var(--red); cursor: pointer; padding: 4px 6px; }
 .wl-empty { padding: 26px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
 /* ── 手机端钻取式布局（≤768px）──────────────────────────────
    分区导航变顶部横滑条；模型配置卡片单列，列表/详情互斥显示。
@@ -1116,6 +1208,9 @@ onMounted(async () => {
 
   /* 其余分区的卡片跟随收紧（Token 统计等子组件自带适配，此处只调容器） */
   .settings-page--mobile .perm-settings-card { padding: 6px 16px 20px; }
+  .settings-page--mobile .whitelist-head { align-items: flex-start; flex-direction: column; }
+  .settings-page--mobile .wl-form { align-items: stretch; flex-direction: column; }
+  .settings-page--mobile .wl-form select { flex-basis: auto; }
   .settings-page--mobile .appearance-settings-card { padding: 16px 14px; }
 }
 </style>

@@ -91,17 +91,13 @@ def run_in_session(session_id, workdir, fn, results, key, barrier=None):
 def clean_session_state():
     """测试前后清空所有按会话分桶的全局状态，避免用例间串扰。"""
     import core.llm as llm
-    from core import tools as tools_module
+    from core import permission_grants, tools as tools_module
 
     def _reset():
         with plan_module._PLAN_MANAGERS_LOCK:
             plan_module._PLAN_MANAGERS.clear()
-        with llm._session_whitelist_lock:
-            llm._SESSION_GRANTS.clear()
-            llm.session_allowed_commands.clear()
-            llm.session_allowed_write_files.clear()
-            llm.session_allowed_edit_files.clear()
-            llm._last_tracked_session = None
+        permission_grants._clear_all_for_tests()
+        llm._last_tracked_session = None
         with tools_module._session_sandbox_lock:
             tools_module._session_sandbox_bypass_by_session.clear()
             tools_module._session_sandbox_bypass = False
@@ -230,6 +226,31 @@ def test_plan_manager_registry_reuses_instance_per_session(tmp_path):
 # H2：授权白名单 / 沙盒放行按会话分桶
 # ---------------------------------------------------------------------------
 
+def test_task_grant_survives_visible_session_switch(monkeypatch):
+    from core import app_context
+    from core.permission_grants import grant_command, matches_command
+
+    visible = {"name": "task-a"}
+    monkeypatch.setattr(app_context, "get_current_session", lambda: visible["name"])
+    grant_command("git status")
+    visible["name"] = "task-b"
+    assert matches_command("git status --short") is False
+    visible["name"] = "task-a"
+    assert matches_command("git status --short") is True
+
+
+def test_bound_background_task_keeps_its_own_grant(monkeypatch):
+    from core import app_context
+    from core.permission_grants import grant_file, matches_file
+
+    app_context.set_thread_session("background-a")
+    try:
+        grant_file("write", "C:/project/a.py")
+        monkeypatch.setattr(app_context, "get_current_session", lambda: "visible-b")
+        assert matches_file("write", "C:/project/a.py") is True
+    finally:
+        app_context.set_thread_session(None)
+
 def test_command_grants_isolated_between_sessions(tmp_path):
     """会话 A 授权的命令前缀，会话 B 不继承。"""
     import core.llm as llm
@@ -290,12 +311,8 @@ def test_write_edit_grants_isolated_between_sessions(tmp_path):
     assert results["B"] == ("ok", (False, False))
 
 
-def test_check_session_reset_keeps_bound_session_grants(tmp_path):
-    """UI 切换全局会话（未绑定线程）不再收回运行中回合（绑定线程）的授权。
-
-    回归背景：用户在会话 A 回合运行中切到会话 B 查看进度，
-    check_session_reset 曾把 A 的授权白名单整体清空。
-    """
+def test_check_session_reset_keeps_task_grants_across_visible_switches(tmp_path):
+    """UI 切换只改变路由，不清理绑定线程或可见任务的授权。"""
     import core.llm as llm
 
     workdir = tmp_path / "proj"
@@ -314,14 +331,15 @@ def test_check_session_reset_keeps_bound_session_grants(tmp_path):
     run_in_session("sess-running", workdir, _grant_and_park, results, "bound")
     assert results["bound"] == ("ok", True)
 
-    # 未绑定线程（CLI 单会话语义）保留旧语义：切会话即收回
-    # （单元素规则是精确规则：只有裸命令 "ls" 命中）
-    app_context._current_session_fallback = "cli-sess-1"
+    # 未绑定线程也按当前任务 ID 分桶，切换后隔离，切回来仍保留。
+    app_context.set_current_session("cli-sess-1")
     llm._grant_command_add(("ls",))
     assert llm._grant_command_hit("ls") is True
-    app_context._current_session_fallback = "cli-sess-2"
+    app_context.set_current_session("cli-sess-2")
     llm.check_session_reset()
     assert llm._grant_command_hit("ls") is False
+    app_context.set_current_session("cli-sess-1")
+    assert llm._grant_command_hit("ls") is True
 
 
 def test_sandbox_bypass_isolated_between_sessions(tmp_path):

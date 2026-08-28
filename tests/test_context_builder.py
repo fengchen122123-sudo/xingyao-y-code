@@ -1,6 +1,32 @@
 from pathlib import Path
 
-from core.context_builder import RuntimeContext, build_system_prompt
+from core.context_builder import RuntimeContext, build_dynamic_prompt, build_system_prompt
+
+
+def test_plan_mode_dynamic_context_requires_plan_output():
+    runtime = RuntimeContext(
+        model_name="test",
+        permission_mode="plan",
+        working_dir="C:/project",
+        current_time="2026-08-28 12:00:00",
+    )
+
+    prompt = build_dynamic_prompt(runtime)
+
+    assert "只允许读取信息、执行明确的只读查询和维护计划元数据" in prompt
+    assert "最终回答必须输出可执行计划" in prompt
+    assert "切换到变更前确认、自动编辑或完全访问模式后再实施" in prompt
+
+
+def test_non_plan_dynamic_context_has_no_plan_only_instruction():
+    runtime = RuntimeContext(
+        model_name="test",
+        permission_mode="confirm",
+        working_dir="C:/project",
+        current_time="2026-08-28 12:00:00",
+    )
+
+    assert "最终回答必须输出可执行计划" not in build_dynamic_prompt(runtime)
 
 
 def test_context_builder_injects_runtime_layers_once():

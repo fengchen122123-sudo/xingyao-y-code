@@ -1,7 +1,7 @@
 from concurrent.futures import Future
 
 import main
-from core.permission_broker import PermissionBroker
+from core.permission_broker import PermissionBroker, PermissionOption
 from core.tool_progress import ActiveToolStatus
 from core.turn_events import TurnEventFactory
 from rich.text import Text
@@ -97,6 +97,104 @@ def test_complete_permission_panel_includes_source_operation_and_options():
     assert "星瑶申请执行命令: Get-Date" in text
     assert "> 同意" in text
     assert "拒绝" in text
+
+
+def test_cli_permission_prompt_renders_all_backend_options():
+    broker = PermissionBroker(activate_prompt=lambda _request: None)
+    request = broker.enqueue(
+        "write_file",
+        {"file_path": "a.py"},
+        "root",
+        "turn",
+        "主代理",
+        options=(
+            PermissionOption("allow_once", "允许本次"),
+            PermissionOption("deny", "拒绝"),
+            PermissionOption("allow_task", "本任务同类操作放行"),
+            PermissionOption("allow_project", "加入项目白名单"),
+        ),
+    )
+
+    text = main._confirm_prompt_text(main._permission_prompt(request))
+
+    assert "允许本次" in text
+    assert "本任务同类操作放行" in text
+    assert "加入项目白名单" in text
+
+
+def test_whitelist_add_and_remove_command(monkeypatch):
+    from core import permission_store
+
+    calls = []
+    monkeypatch.setattr(
+        permission_store,
+        "add_rule",
+        lambda rule_type, value: calls.append(("add", rule_type, value))
+        or type("R", (), {"status": "added", "normalized_value": value})(),
+    )
+    monkeypatch.setattr(
+        permission_store,
+        "remove_rule",
+        lambda rule_type, value: calls.append(("remove", rule_type, value))
+        or type("R", (), {"status": "removed", "normalized_value": value})(),
+    )
+    monkeypatch.setattr(main, "print_formatted_text", lambda *_args, **_kwargs: None)
+
+    main.handle_slash_command("/whitelist add command git status")
+    main.handle_slash_command("/whitelist remove command git status")
+
+    assert calls == [
+        ("add", "command", "git status"),
+        ("remove", "command", "git status"),
+    ]
+
+
+def test_whitelist_clear_requires_explicit_confirmation(monkeypatch):
+    from core import permission_store
+
+    clears = []
+    outputs = []
+    monkeypatch.setattr(
+        permission_store,
+        "clear_project",
+        lambda: clears.append(True) or 3,
+    )
+    monkeypatch.setattr(
+        main,
+        "print_formatted_text",
+        lambda message, *_args, **_kwargs: outputs.append(str(message)),
+    )
+
+    main.handle_slash_command("/whitelist clear")
+    assert clears == []
+    assert any("clear confirm" in output for output in outputs)
+
+    main.handle_slash_command("/whitelist clear confirm")
+    assert clears == [True]
+
+
+def test_whitelist_failure_status_uses_error_output(monkeypatch):
+    from core import permission_store
+
+    outputs = []
+    monkeypatch.setattr(
+        permission_store,
+        "add_rule",
+        lambda rule_type, value: type(
+            "R",
+            (),
+            {"status": "limit_reached", "normalized_value": value},
+        )(),
+    )
+    monkeypatch.setattr(
+        main,
+        "print_formatted_text",
+        lambda message, *_args, **_kwargs: outputs.append(str(message)),
+    )
+
+    main.handle_slash_command("/whitelist add command git status")
+
+    assert any("❌" in output and "上限" in output for output in outputs)
 
 
 def test_cancel_active_turn_cancels_permissions_and_foreground_subagents(monkeypatch):

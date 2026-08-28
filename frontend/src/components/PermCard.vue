@@ -38,14 +38,25 @@
         ><AppIcon name="send" :size="14" /></button>
       </div>
     </div>
-    <!-- 标准权限请求：允许一次 / 总是允许 / 拒绝 -->
+    <!-- 标准权限请求：完全按后端下发的稳定 key 渲染。 -->
+    <div v-else-if="store.permRequest.permissionOptions.length" class="pc-foot">
+      <button
+        v-for="option in store.permRequest.permissionOptions"
+        :key="option.key"
+        data-test="permission-option"
+        class="pc-btn"
+        :class="{ primary: option.key === 'allow_once', danger: option.key === 'deny' }"
+        @click="store.respondPermissionOption(option.key)"
+      >{{ option.label }}</button>
+    </div>
+    <!-- 兼容旧后端事件，完整升级后可移除。 -->
     <div v-else class="pc-foot">
       <button class="pc-btn primary" @click="store.respondPermission(true, false)">允许一次</button>
       <button
         v-if="store.permRequest.allowAlways"
         class="pc-btn"
         @click="store.respondPermission(true, true)"
-      >{{ store.permRequest.functionName === 'sandbox_outside_access' ? '本会话内放行沙盒外访问' : '总是允许此类操作' }}</button>
+      >{{ store.permRequest.functionName === 'sandbox_outside_access' ? '本任务内放行沙盒外访问' : '总是允许此类操作' }}</button>
       <button class="pc-btn danger" @click="store.respondPermission(false, false)">拒绝</button>
     </div>
   </div>

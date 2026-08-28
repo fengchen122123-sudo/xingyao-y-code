@@ -1,8 +1,8 @@
 """项目级权限白名单持久化存储。
 
-「始终允许」产生的命令前缀规则与文件路径白名单按项目工作目录分组，
+用户手动添加或审批产生的命令前缀规则与文件路径白名单按项目工作目录分组，
 持久化到 ~/.ycode/permissions.json（YCODE_DATA_DIR 优先）。
-重启与切换会话后自动恢复；沙盒外访问的会话级放行不在此存储（不落盘）。
+重启与切换任务后自动恢复；沙盒外访问的任务级放行不在此存储（不落盘）。
 
 读写复用 config 的 mtime 缓存与原子写（含 .bak 自愈），单项目条目设上限
 防止长期累积膨胀。任何损坏都回落空规则，绝不影响启动与正常询问流程。
@@ -10,14 +10,13 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
+from core.command_policy import parse_manual_command_rule
 from core.workspace_context import get_workdir
-
-logger = logging.getLogger(__name__)
 
 _STORE_LOCK = threading.Lock()
 
@@ -26,6 +25,17 @@ MAX_COMMAND_RULES_PER_PROJECT = 100
 MAX_FILE_ENTRIES_PER_PROJECT = 500
 
 _VERSION = 1
+
+
+class PermissionStoreError(RuntimeError):
+    """Raised when a requested whitelist mutation cannot be persisted."""
+
+
+@dataclass(frozen=True)
+class RuleMutationResult:
+    status: str
+    rule_type: str
+    normalized_value: str
 
 
 def _store_path() -> Path:
@@ -82,7 +92,16 @@ def _save(data: dict) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         config._atomic_write_json(path, data)
     except Exception as exc:
-        logger.warning("权限白名单写入失败: %s", exc)
+        raise PermissionStoreError(f"权限白名单写入失败: {exc}") from exc
+
+
+def _persist(data: dict) -> None:
+    try:
+        _save(data)
+    except PermissionStoreError:
+        raise
+    except Exception as exc:
+        raise PermissionStoreError(f"权限白名单写入失败: {exc}") from exc
 
 
 def _project_bucket(data: dict, key: str) -> dict:
@@ -91,9 +110,9 @@ def _project_bucket(data: dict, key: str) -> dict:
     if not isinstance(bucket, dict):
         bucket = {}
         projects[key] = bucket
-    bucket.setdefault("commands", [])
-    bucket.setdefault("write_files", [])
-    bucket.setdefault("edit_files", [])
+    for field in ("commands", "write_files", "edit_files"):
+        if not isinstance(bucket.get(field), list):
+            bucket[field] = []
     return bucket
 
 
@@ -120,14 +139,97 @@ def project_rules(workdir=None) -> dict:
     }
 
 
-def _append_unique(items: list, value, cap: int) -> bool:
-    """去重追加；超出上限时丢弃新条目并返回 False（已有条目始终保留）。"""
-    if value in items:
-        return True
-    if len(items) >= cap:
-        return False
-    items.append(value)
-    return True
+def _add_stored_rule(
+    *,
+    key: str,
+    field: str,
+    stored_value,
+    cap: int,
+) -> str:
+    with _STORE_LOCK:
+        data = _load()
+        bucket = _project_bucket(data, key)
+        if stored_value in bucket[field]:
+            return "exists"
+        if len(bucket[field]) >= cap:
+            return "limit_reached"
+        bucket[field].append(stored_value)
+        _persist(data)
+        return "added"
+
+
+def _canonical_file_for_workdir(path, workdir=None) -> str:
+    try:
+        raw_path = os.fspath(path)
+    except TypeError:
+        return ""
+    if workdir is not None and not os.path.isabs(raw_path):
+        raw_path = os.path.join(os.fspath(workdir), raw_path)
+    return canonical_file_path(raw_path)
+
+
+def _normalized_rule(rule_type: str, value, workdir=None):
+    normalized_type = str(rule_type or "").strip().lower()
+    if normalized_type == "command":
+        tokens = parse_manual_command_rule(str(value or ""))
+        return normalized_type, "commands", list(tokens), " ".join(tokens)
+    if normalized_type in {"write", "edit"}:
+        canonical = _canonical_file_for_workdir(value, workdir)
+        if not canonical:
+            raise ValueError("文件白名单路径无效")
+        field = "write_files" if normalized_type == "write" else "edit_files"
+        return normalized_type, field, canonical, canonical
+    raise ValueError("规则类型必须是 command、write 或 edit")
+
+
+def add_rule(rule_type: str, value, workdir=None) -> RuleMutationResult:
+    """Add one manually entered command-prefix or exact-file rule."""
+    key = canonical_workdir(workdir)
+    if not key:
+        raise ValueError("项目工作目录无效")
+    normalized_type, field, stored_value, display_value = _normalized_rule(
+        rule_type,
+        value,
+        workdir,
+    )
+    cap = (
+        MAX_COMMAND_RULES_PER_PROJECT
+        if field == "commands"
+        else MAX_FILE_ENTRIES_PER_PROJECT
+    )
+    status = _add_stored_rule(
+        key=key,
+        field=field,
+        stored_value=stored_value,
+        cap=cap,
+    )
+    return RuleMutationResult(status, normalized_type, display_value)
+
+
+def remove_rule(rule_type: str, value, workdir=None) -> RuleMutationResult:
+    """Remove one exact persisted rule from the selected project."""
+    key = canonical_workdir(workdir)
+    if not key:
+        raise ValueError("项目工作目录无效")
+    normalized_type, field, stored_value, display_value = _normalized_rule(
+        rule_type,
+        value,
+        workdir,
+    )
+    with _STORE_LOCK:
+        data = _load()
+        bucket = data["projects"].get(key)
+        if not isinstance(bucket, dict) or not isinstance(bucket.get(field), list):
+            status = "not_found"
+        elif stored_value not in bucket[field]:
+            status = "not_found"
+        else:
+            bucket[field].remove(stored_value)
+            if not any(bucket.get(name) for name in ("commands", "write_files", "edit_files")):
+                data["projects"].pop(key, None)
+            _persist(data)
+            status = "removed"
+    return RuleMutationResult(status, normalized_type, display_value)
 
 
 def add_command_rule(rule, workdir=None) -> bool:
@@ -136,27 +238,27 @@ def add_command_rule(rule, workdir=None) -> bool:
     if not key or not isinstance(rule, (tuple, list)) or not rule:
         return False
     stored = [str(token) for token in rule]
-    with _STORE_LOCK:
-        data = _load()
-        bucket = _project_bucket(data, key)
-        ok = _append_unique(bucket["commands"], stored, MAX_COMMAND_RULES_PER_PROJECT)
-        if ok:
-            _save(data)
-        return ok
+    status = _add_stored_rule(
+        key=key,
+        field="commands",
+        stored_value=stored,
+        cap=MAX_COMMAND_RULES_PER_PROJECT,
+    )
+    return status in {"added", "exists"}
 
 
 def _add_file(field: str, path, workdir=None) -> bool:
     key = canonical_workdir(workdir)
-    canonical = canonical_file_path(path)
+    canonical = _canonical_file_for_workdir(path, workdir)
     if not key or not canonical:
         return False
-    with _STORE_LOCK:
-        data = _load()
-        bucket = _project_bucket(data, key)
-        ok = _append_unique(bucket[field], canonical, MAX_FILE_ENTRIES_PER_PROJECT)
-        if ok:
-            _save(data)
-        return ok
+    status = _add_stored_rule(
+        key=key,
+        field=field,
+        stored_value=canonical,
+        cap=MAX_FILE_ENTRIES_PER_PROJECT,
+    )
+    return status in {"added", "exists"}
 
 
 def add_write_file(path, workdir=None) -> bool:
@@ -184,5 +286,5 @@ def clear_project(workdir=None) -> int:
             + len(bucket.get("write_files", []))
             + len(bucket.get("edit_files", []))
         )
-        _save(data)
+        _persist(data)
         return removed
