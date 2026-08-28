@@ -312,6 +312,86 @@ def upload_attachment(token, release_id, filepath, retries=3):
     raise last_err
 
 
+def delete_attachment(token, release_id, attach_file_id):
+    """删除单个 Release 附件。Gitee 该接口成功返回 204（无响应体）。"""
+    url = (f"{API_BASE}/repos/{GITEE_REPO}/releases/{release_id}"
+           f"/attach_files/{attach_file_id}?access_token={token}")
+    req = urllib.request.Request(url, method="DELETE",
+                                 headers={"User-Agent": "ycode-publisher"})
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        return resp.status in (200, 204)
+
+
+def verify_remote_attachment(download_url, local_path, timeout=30.0):
+    """上传后回读校验：确认 Gitee 附件管道没有按内容嗅探篡改文件。
+
+    v1.2.16 事故：part4 首字节 FE 91 被误判为 UTF-16 文本，CDN 注入 FF
+    拼成 BOM（体积 +1 字节）并以 text/plain; charset=utf-16le 返回，
+    旧客户端的 Content-Type 防线将其误判为风控页，自动更新确定性失败。
+
+    三重比对（只读首 64 字节，不整文件下载）：
+      1. Content-Type 不得为 text/html / text/plain（文本/网页标记）
+      2. Content-Length 必须与本地文件一致（注入/截断必导致不等）
+      3. 首 64 字节必须与本地完全一致（同长度的内容改写也能检出）
+    返回 (ok, 失败原因)；ok=True 时原因为空串。
+    """
+    try:
+        req = urllib.request.Request(
+            download_url, headers={"User-Agent": "ycode-publisher-verify"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            content_type = str(resp.headers.get("Content-Type", "")).lower()
+            remote_len = int(resp.headers.get("Content-Length") or 0)
+            remote_head = resp.read(64)
+    except Exception as e:
+        return False, f"回读校验请求失败: {e}"
+    if "text/html" in content_type or "text/plain" in content_type:
+        return False, (f"附件被 CDN 标记为网页/文本 ({content_type})，"
+                       "疑似内容嗅探篡改（如 UTF-16 BOM 注入）")
+    local_size = os.path.getsize(local_path)
+    if remote_len and remote_len != local_size:
+        return False, (f"附件大小不一致（远端 {remote_len} != 本地 {local_size} "
+                       f"字节），疑似被注入/截断")
+    with open(local_path, "rb") as f:
+        local_head = f.read(64)
+    if remote_head != local_head:
+        return False, "附件首 64 字节与本地不一致，内容已被篡改"
+    return True, ""
+
+
+def upload_and_verify(token, release_id, filepath):
+    """上传附件并立即回读校验；校验失败自动删除坏附件重传一次。
+
+    重传仍失败时抛 RuntimeError——绝把被 CDN 篡改的附件留在 Release 上
+    （旧客户端会因此确定性更新失败）。
+    成功时返回最后一次上传的 API 响应 dict。
+    """
+    last_reason = ""
+    for attempt in (1, 2):
+        resp = upload_attachment(token, release_id, filepath)
+        download_url = str((resp or {}).get("browser_download_url") or "")
+        if not download_url:
+            last_reason = "上传响应缺少 browser_download_url，无法回读校验"
+        else:
+            ok, reason = verify_remote_attachment(download_url, filepath)
+            if ok:
+                return resp
+            last_reason = reason
+        # 校验不过：删掉这片坏附件再重传（响应里没有 id 时只能放弃删除，
+        # 但重传覆盖前必须先尝试，避免坏片残留）
+        attach_id = (resp or {}).get("id")
+        if attach_id:
+            try:
+                delete_attachment(token, release_id, attach_id)
+            except Exception as e:
+                print(f"   ⚠ 删除校验失败的附件(id={attach_id})出错: {e}")
+        if attempt == 1:
+            print(f"   ⚠ 上传后校验失败（{last_reason}），已删除坏附件，重传一次...",
+                  flush=True)
+    raise RuntimeError(
+        f"{os.path.basename(filepath)} 重传后仍未通过回读校验: {last_reason}"
+    )
+
+
 def fmt_size_mb(path):
     return os.path.getsize(path) / 1024 / 1024
 
@@ -363,6 +443,8 @@ def main():
     parser.add_argument("--force", action="store_true", help="tag 已存在时删除旧 Release 重建")
     parser.add_argument("--attach-only", action="store_true",
                         help="不创建 Release，只向已存在的 Release 补传缺失附件（断点续传）")
+    parser.add_argument("--verify", action="store_true",
+                        help="只回读校验当前版本 Release 的远端附件与本地分卷是否一致，不上传")
     args = parser.parse_args()
 
     token, source = resolve_token()
@@ -413,6 +495,40 @@ def main():
         print("❌ dist/release_parts/ 下没有可上传的附件")
         sys.exit(1)
 
+    # 回读校验模式：逐片比对远端附件与本地分卷（Content-Type/大小/首 64 字节），
+    # 用于发布事故排查与发布后的独立审计
+    if args.verify:
+        try:
+            release = get_release_by_tag(token, tag)
+        except Exception as e:
+            print(f"❌ Release {tag} 不存在或读取失败：{e}")
+            sys.exit(1)
+        url_by_name = {
+            str(a.get("name") or ""): str(a.get("browser_download_url") or "")
+            for a in (release.get("assets") or [])
+        }
+        bad = 0
+        for name in part_files:
+            url = url_by_name.get(name)
+            if not url:
+                print(f"❌ {name}: Release 上缺少该附件")
+                bad += 1
+                continue
+            ok, reason = verify_remote_attachment(
+                url, os.path.join(parts_dir, name))
+            if ok:
+                print(f"✔ {name}")
+            else:
+                print(f"❌ {name}: {reason}")
+                bad += 1
+        if bad:
+            print(f"\n⚠ {bad}/{len(part_files)} 个附件校验失败：删除坏附件后用 "
+                  f"--attach-only 重传（若重传仍被篡改，需调整分卷切分边界，"
+                  f"见 build_release.py 的 _safe_part_boundary）")
+            sys.exit(1)
+        print(f"\n🎉 全部 {len(part_files)} 个远端附件与本地一致。")
+        return
+
     sha256 = read_main_sha256(notes_path)
     if not sha256:
         print("❌ RELEASE_NOTES.txt 里没有 SHA256 行（自动更新完整性校验依赖它，不能缺）")
@@ -453,7 +569,7 @@ def main():
             path = os.path.join(parts_dir, name)
             print(f"⬆ [{i}/{total}] 补传 {name} ({fmt_size_mb(path):.1f} MB) ...", flush=True)
             try:
-                upload_attachment(token, release_id, path)
+                upload_and_verify(token, release_id, path)
                 ok += 1
                 print("✔ 完成")
             except Exception as e:
@@ -494,7 +610,7 @@ def main():
         path = os.path.join(parts_dir, name)
         print(f"⬆ [{i}/{total}] 上传 {name} ({fmt_size_mb(path):.1f} MB) ...", flush=True)
         try:
-            upload_attachment(token, release_id, path)
+            upload_and_verify(token, release_id, path)
             ok += 1
             print(f"✔ 完成")
         except Exception as e:
