@@ -1,4 +1,5 @@
 import os
+import threading
 
 import gui_bridge
 from core.memory import MemoryManager
@@ -10,6 +11,9 @@ def _bare_gui_bridge(db=":memory:"):
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._memory = MemoryManager(db)
     bridge._current_session = "测试会话"
+    bridge._turn_start_lock = threading.RLock()
+    bridge._message_queues = {}
+    bridge._active_turns = {}
     return bridge
 
 
@@ -197,6 +201,35 @@ def test_rename_session_refused_while_turn_active():
 
     assert res["ok"] is False and res["name"] == "旧名"
     assert any(s.get("name") == "旧名" for s in bridge._memory.get_all_sessions(workdir=None, include_empty=True))
+
+
+def test_delete_session_clears_task_permission_grants():
+    from core import permission_grants
+
+    permission_grants._clear_all_for_tests()
+    bridge = _bare_gui_bridge()
+    bridge._memory.create_session_explicit("待删除", workdir="GLOBAL", source="GUI")
+    permission_grants.grant_command("git push origin", task_id="待删除")
+
+    result = bridge.delete_session("待删除")
+
+    assert result["ok"] is True
+    assert permission_grants.snapshot("待删除")["commands"] == set()
+
+
+def test_rename_session_migrates_task_permission_grants():
+    from core import permission_grants
+
+    permission_grants._clear_all_for_tests()
+    bridge = _bare_gui_bridge()
+    bridge._memory.create_session_explicit("旧任务", workdir="GLOBAL", source="GUI")
+    permission_grants.grant_command("git push origin", task_id="旧任务")
+
+    result = bridge.rename_session("旧任务", "新任务")
+
+    assert result["ok"] is True
+    assert permission_grants.matches_command("git push origin dev", "旧任务") is False
+    assert permission_grants.matches_command("git push origin dev", "新任务") is True
 
 
 def test_terminal_command_normalizes_global_workdir(monkeypatch, tmp_path):

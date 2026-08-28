@@ -36,10 +36,10 @@ const store = useAppStore();
 const styleObj = ref<Record<string, string>>({});
 
 const permModes: Array<{ v: PermissionMode; c: string; desc: string }> = [
-  { v: 'confirm', c: 'var(--green)', desc: '执行任何操作前都会向你确认' },
-  { v: 'accept_edits', c: 'var(--yellow, #f1fa8c)', desc: '工作区内文件编辑自动放行；命令仍会询问，沙盒外访问由沙盒开关决定' },
-  { v: 'plan', c: 'var(--purple)', desc: '沙盒内可自由读取，只制定计划，不做任何修改' },
-  { v: 'full', c: 'var(--red)', desc: '沙盒内全部放行；沙盒外访问由沙盒开关决定（开=放行，关=询问）' },
+  { v: 'confirm', c: 'var(--green)', desc: '查询自动放行；任何变更都需要确认' },
+  { v: 'accept_edits', c: 'var(--yellow, #f1fa8c)', desc: '普通编辑和构建自动放行；删除、提交、推送等敏感操作需要确认' },
+  { v: 'plan', c: 'var(--purple)', desc: '允许读取、查询和制定计划；禁止修改或删除任务文件' },
+  { v: 'full', c: 'var(--red)', desc: '沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制' },
 ];
 
 function selectMode(val: PermissionMode) {

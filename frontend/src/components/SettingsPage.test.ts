@@ -207,6 +207,38 @@ describe('SettingsPage', () => {
     expect(wrapper.get('[data-test="provider-api-key"]').attributes('type')).toBe('password');
   });
 
+  it('adds and removes a command permission rule', async () => {
+    const add = vi.fn(async () => ({ ok: true, status: 'added' }));
+    const remove = vi.fn(async () => ({ ok: true, status: 'removed' }));
+    (window as any).pywebview = {
+      api: {
+        get_permission_rules: vi.fn(async () => ({
+          ok: true,
+          commands: ['git status'],
+          write_files: [],
+          edit_files: [],
+        })),
+        add_permission_rule: add,
+        remove_permission_rule: remove,
+      },
+    };
+    const store = useAppStore();
+    vi.spyOn(store, 'askConfirm').mockResolvedValue(true);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="permission-nav"]').trigger('click');
+    await flushPromises();
+    await wrapper.get('[data-test="add-permission-rule"]').trigger('click');
+    await wrapper.get('[data-test="permission-rule-type"]').setValue('command');
+    await wrapper.get('[data-test="permission-rule-value"]').setValue('git diff');
+    await wrapper.get('[data-test="save-permission-rule"]').trigger('click');
+
+    expect(add).toHaveBeenCalledWith('command', 'git diff');
+
+    await wrapper.get('[data-test="remove-permission-command-0"]').trigger('click');
+    expect(remove).toHaveBeenCalledWith('command', 'git status');
+  });
+
   it('copies the API key through the copy button', async () => {
     const store = useAppStore();
     vi.spyOn(store, 'getProviderApiKey').mockResolvedValue('sk-real-key');

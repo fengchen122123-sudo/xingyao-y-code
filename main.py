@@ -118,7 +118,7 @@ manager = MemoryManager(db_path=config.DB_FILE)
 #   4. 后台线程绝不直接调用 print_formatted_text / app_instance.invalidate()。
 # ---------------------------------------------------------------------------
 current_theme = config.MY_THEME
-# 权限模式统一走 app_context 规范化，全系统只允许 confirm / plan / full
+# 权限模式统一走 app_context 规范化，全系统只允许四种已定义模式
 import core.app_context as _app_ctx
 current_permission_mode = _app_ctx.normalize_permission_mode(config.MY_PERMISSION_MODE)
 show_memory_summary = False
@@ -264,10 +264,10 @@ THEME_DESCS = {
 
 # /permission 帮助文本（list 子命令与无参数帮助共用）
 PERMISSION_HELP_LINES = (
-    "  - <b>confirm</b>      : 变更前确认 (修改文件、执行命令均需询问)",
-    "  - <b>accept_edits</b> : 自动编辑 (工作区内文件修改自动放行，执行命令仍需询问)",
-    "  - <b>plan</b>         : 计划模式 (沙盒内自由读取，只制定计划，不做任何修改)",
-    "  - <b>full</b>         : 完全访问 (自动运行，无需任何确认)",
+    "  - <b>confirm</b>      : 变更前确认 (查询自动放行；任何变更都需要确认)",
+    "  - <b>accept_edits</b> : 自动编辑 (普通编辑和构建自动放行；删除、提交、推送等敏感操作需要确认)",
+    "  - <b>plan</b>         : 计划模式 (允许读取、查询和制定计划；禁止修改或删除任务文件)",
+    "  - <b>full</b>         : 完全访问 (沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制)",
 )
 
 # @文件补全的工作目录清单缓存（TTL 秒内重复按键不再重新 os.walk）
@@ -653,7 +653,7 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
         text += f"❓  星瑶需要你的选择: {_esc(q_display)}\n"
     elif func == "sandbox_outside_access":
         text += f"🛡  星瑶申请访问工作目录之外的路径: {_esc(args.get('path', ''))}\n"
-        text += "    （沙盒模式下默认仅限工作目录内；可选\"始终允许\"在本会话内放行，或用 /sandbox on 长期开放）\n"
+        text += "    （沙盒模式下默认仅限工作目录内；可选择在本任务内放行，或用 /sandbox on 长期开放）\n"
     else:
         # 默认分支：其余工具（含 MCP 工具）展示函数名与参数摘要，不再显示空白
         summary = ", ".join(
@@ -802,7 +802,7 @@ def _resolve_confirm_custom(text):
     """以自由文本回答当前 ask_user 提问（选项都不合适时直接输入告诉星瑶）。
 
     仅对经 broker 串行化的 ask_user 请求开放；其余权限确认的选项语义
-    （允许/拒绝/始终允许）与自由文本无对应关系。
+    （允许/拒绝/任务放行/项目白名单）与自由文本无对应关系。
     """
     prompt = confirm_prompt
     cleaned = str(text or "").strip()
@@ -1516,7 +1516,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
         print_formatted_text(HTML("  <ansicyan>/sandbox &lt;on|off&gt;</ansicyan>                     : 沙盒开关 (on:工作目录外读写直接放行 | off:仅限工作目录内)"))
-        print_formatted_text(HTML("  <ansicyan>/whitelist &lt;clear&gt;</ansicyan>                   : 查看始终允许白名单 (clear=清空本项目持久化规则)"))
+        print_formatted_text(HTML("  <ansicyan>/whitelist list|add|remove|clear</ansicyan>        : 管理当前项目白名单 (command/write/edit)"))
         print_formatted_text(HTML("  <ansicyan>/usage</ansicyan>                                : 查看 Token 用量统计 (按模型区分: 今日/近7天/近30天，精确数值)"))
         print_formatted_text(HTML("  <ansicyan>/usage &lt;日期&gt; [截止日期]</ansicyan>          : 查询指定单日或区间的 Token 用量 (例: /usage 2026-08-01 2026-08-05)"))
         print_formatted_text(HTML(""))
@@ -1721,26 +1721,70 @@ def handle_slash_command(command_text):
             print_formatted_text(HTML("用法: <ansiyellow>/sandbox &lt;on|off&gt;</ansiyellow>（on=工作目录外直接放行，off=仅限工作目录内）"))
 
     elif cmd == "/whitelist":
-        # 查看与清除「始终允许」白名单（会话级 + 项目级持久化）
-        from core import permission_store
-        from core.llm import (
-            _session_whitelist_lock,
-            session_allowed_commands,
-            session_allowed_write_files,
-            session_allowed_edit_files,
-            _format_session_command_rule,
-        )
+        # 查看、手动新增和删除任务级/项目级白名单。
+        from core import permission_grants, permission_store
+        from core.llm import _format_session_command_rule
         from core.tools import is_session_sandbox_bypass_enabled
 
-        if len(parts) > 1 and parts[1].lower() == "clear":
-            removed = permission_store.clear_project()
-            print_formatted_text(HTML(f"<ansigreen>✔ 已清空当前项目的持久化白名单（共 {removed} 条）。会话级白名单与沙盒会话放行不受影响。</ansigreen>"))
+        whitelist_parts = command_text.strip().split(maxsplit=3)
+        action = whitelist_parts[1].lower() if len(whitelist_parts) > 1 else "list"
+        if action in {"add", "remove"}:
+            if len(whitelist_parts) != 4:
+                print_formatted_text(HTML(
+                    "<ansired>❌ 用法：/whitelist add|remove command|write|edit &lt;命令或文件路径&gt;</ansired>"
+                ))
+            else:
+                rule_type = whitelist_parts[2].lower()
+                value = whitelist_parts[3]
+                try:
+                    operation = (
+                        permission_store.add_rule
+                        if action == "add"
+                        else permission_store.remove_rule
+                    )
+                    result = operation(rule_type, value)
+                except (ValueError, permission_store.PermissionStoreError) as exc:
+                    print_formatted_text(HTML(f"<ansired>❌ {_esc(exc)}</ansired>"))
+                else:
+                    labels = {
+                        "added": "已新增",
+                        "exists": "已存在",
+                        "removed": "已删除",
+                        "not_found": "未找到",
+                        "limit_reached": "已达到规则数量上限",
+                    }
+                    label = labels.get(result.status, result.status)
+                    if result.status in {"limit_reached", "not_found"}:
+                        print_formatted_text(HTML(
+                            f"<ansired>❌ {label}：{_esc(result.normalized_value)}</ansired>"
+                        ))
+                    else:
+                        color = "ansiyellow" if result.status == "exists" else "ansigreen"
+                        print_formatted_text(HTML(
+                            f"<{color}>✔ {label} {rule_type} 规则：{_esc(result.normalized_value)}</{color}>"
+                        ))
+        elif action == "clear":
+            confirmed = (
+                len(whitelist_parts) >= 3
+                and whitelist_parts[2].lower() == "confirm"
+            )
+            if not confirmed:
+                print_formatted_text(HTML(
+                    "<ansiyellow>⚠ 清空会删除当前项目的全部持久化规则；确认执行请使用 /whitelist clear confirm</ansiyellow>"
+                ))
+            else:
+                removed = permission_store.clear_project()
+                print_formatted_text(HTML(f"<ansigreen>✔ 已清空当前项目的持久化白名单（共 {removed} 条）。任务级白名单与沙盒任务放行不受影响。</ansigreen>"))
+        elif action != "list":
+            print_formatted_text(HTML(
+                "<ansired>❌ 用法：/whitelist list|add|remove|clear</ansired>"
+            ))
         else:
-            print_formatted_text(HTML(f"<b><ansicyan>当前会话白名单（切会话即清空）：</ansicyan></b>"))
-            with _session_whitelist_lock:
-                session_cmds = sorted(session_allowed_commands)
-                session_writes = sorted(session_allowed_write_files)
-                session_edits = sorted(session_allowed_edit_files)
+            print_formatted_text(HTML(f"<b><ansicyan>当前任务白名单（切换界面不清除，删除任务或重启后失效）：</ansicyan></b>"))
+            task_rules = permission_grants.snapshot()
+            session_cmds = sorted(task_rules["commands"])
+            session_writes = sorted(task_rules["write_files"])
+            session_edits = sorted(task_rules["edit_files"])
             if session_cmds:
                 for rule in session_cmds:
                     print_formatted_text(HTML(f"  命令: {_esc(_format_session_command_rule(rule))}"))
@@ -1753,9 +1797,9 @@ def handle_slash_command(command_text):
                 for path in session_edits:
                     print_formatted_text(HTML(f"  修改: {_esc(path)}"))
             sandbox_state = "已放行" if is_session_sandbox_bypass_enabled() else "未放行"
-            print_formatted_text(HTML(f"  沙盒外访问（本会话）: {sandbox_state}"))
+            print_formatted_text(HTML(f"  沙盒外访问（本任务）: {sandbox_state}"))
 
-            print_formatted_text(HTML(f"<b><ansicyan>当前项目持久化白名单（重启保留，/whitelist clear 清空）：</ansicyan></b>"))
+            print_formatted_text(HTML(f"<b><ansicyan>当前项目持久化白名单（重启保留，/whitelist clear confirm 清空）：</ansicyan></b>"))
             rules = permission_store.project_rules()
             if rules["commands"]:
                 for rule in sorted(rules["commands"]):
@@ -1793,6 +1837,11 @@ def handle_slash_command(command_text):
                     print_formatted_text(HTML(f"<ansired>❌ 会话 {safe_target} 不存在，未执行删除。</ansired>"))
                     return
                 manager.delete_session(target)
+                from core import permission_grants
+                from core.tools import clear_session_sandbox_bypass
+
+                permission_grants.clear_task(target)
+                clear_session_sandbox_bypass(target)
                 print_formatted_text(HTML(f"<ansigreen>✔ 会话 {safe_target} 已被成功删除。</ansigreen>"))
 
                 # 如果删除的是当前活动会话，触发安全切回
@@ -2559,7 +2608,7 @@ def _make_input_app():
         ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
         ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
         ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
-        ("/whitelist", "查看/清空「始终允许」白名单 (clear:清空本项目持久化规则)"),
+        ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
         ("/clear", "清理当前屏幕"),
         ("/exit", "退出 Y-code"),
     ]

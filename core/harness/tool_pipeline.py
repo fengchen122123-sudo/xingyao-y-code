@@ -7,6 +7,7 @@ import json
 import threading
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Callable
 
@@ -15,15 +16,21 @@ from core.harness.tool_adapters import ToolAdapterSet
 from core.harness.tool_contracts import resolve_tool
 from core.harness.models import HarnessEventKind, JournalEventDraft
 from core.tool_registry import ToolRegistry
+from core.command_policy import classify_command_risk
+from core.permission_policy import PermissionRisk
 
 
 TOOL_ERROR_PREFIX = "🚨"
 PERMISSION_DENIED_MESSAGE = f"{TOOL_ERROR_PREFIX} 用户拒绝了执行该操作。"
 PERMISSION_CANCELLED_MESSAGE = f"{TOOL_ERROR_PREFIX} 操作已取消。"
 PLAN_MODE_DENIED_MESSAGE = (
-    f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息和制定计划，"
-    "不允许执行任何修改/命令。请改用 plan_write 把操作步骤写入计划，"
+    f"{TOOL_ERROR_PREFIX} 当前处于计划模式：只允许读取信息、执行明确的只读查询和制定计划，"
+    "不允许执行修改或删除操作。请改用 plan_write 把操作步骤写入计划，"
     "并提示用户切换到「变更前确认」「自动编辑」或「完全访问」模式后再执行。"
+)
+DANGEROUS_COMMAND_DENIED_MESSAGE = (
+    f"{TOOL_ERROR_PREFIX} 危险命令已被安全策略拒绝。"
+    "请改用范围明确、可恢复的操作。"
 )
 PERMISSION_SYSTEM_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 权限询问系统异常，操作未能完成。"
@@ -32,9 +39,6 @@ PERMISSION_SYSTEM_ERROR_MESSAGE = (
 PATH_VALIDATION_ERROR_MESSAGE = (
     f"{TOOL_ERROR_PREFIX} 无法验证路径是否位于当前工作区，已拒绝执行。"
 )
-_PLAN_MODE_ALLOWED_TOOLS = frozenset({
-    "plan_write", "plan_read", "plan_update", "plan_retry", "ask_user",
-})
 _PLAN_BYPASS_ERROR_PREFIX = "计划已创建：工具"
 _PLAN_ROOT_CONTROL_TOOLS = frozenset({
     "plan_write", "plan_update", "plan_read", "plan_retry", "run_subagent", "ask_user",
@@ -162,8 +166,8 @@ def _submit_daemon_call(function, *args, **kwargs):
     # 并行工具线程必须继承提交线程的回合上下文（线程本地 workdir 与会话路由）。
     # 裸 daemon 线程里 get_workdir() 会兜底到进程 cwd（GUI 打包版从快捷方式
     # 启动时是安装目录），沙盒守卫据此把项目内路径误判为"工作目录之外"，
-    # 触发不该出现的权限询问；会话级沙盒放行等"每会话"状态同样依赖线程
-    # 会话绑定，丢失后即使选过"本会话内放行"也会反复询问。
+    # 触发不该出现的权限询问；任务级沙盒放行依赖稳定任务 ID 的线程绑定，
+    # 绑定丢失后即使选过“本任务内放行”也会反复询问。
     from core.workspace_context import get_workdir, workspace_scope
 
     workdir = get_workdir()
@@ -587,6 +591,13 @@ class ToolPipeline:
             return None
         arguments = decoded.arguments
         name = decoded.name
+        if (
+            name == "execute_command"
+            and not bool(str(arguments.get("shell_id") or "").strip())
+            and classify_command_risk(str(arguments.get("command", "")))
+            is PermissionRisk.QUERY
+        ):
+            return None
         plan_item_id = str(arguments.get("plan_item_id", "") or "").strip()
         if name == "plan_write" and self.plan_turn_checker(context.parent_turn_id):
             from core.plan import get_default_plan_manager
@@ -632,27 +643,22 @@ class ToolPipeline:
         )
 
     def _permission_decision(self, resolved, decoded, context):
-        if not resolved.spec.requires_permission:
-            return None
         name = decoded.name
         arguments = decoded.arguments
-        if app_context.get_permission_mode() == "plan" and name not in _PLAN_MODE_ALLOWED_TOOLS:
-            return PLAN_MODE_DENIED_MESSAGE
-
-        defer_to_sandbox = False
-        if name in {"write_file", "edit_file"}:
+        path_value = arguments.get("file_path")
+        outside_workspace = False
+        if path_value and name in {"read_file", "write_file", "edit_file"}:
             try:
-                defer_to_sandbox = self.adapters.is_outside_workspace(
-                    arguments.get("file_path", "")
-                )
+                path_access = self.adapters.classify_path_access(name, path_value)
             except Exception:
-                return PATH_VALIDATION_ERROR_MESSAGE
-        if defer_to_sandbox:
-            return None
+                return None, PATH_VALIDATION_ERROR_MESSAGE
+            outside_workspace = path_access in {"outside", "credential_write"}
         try:
-            approved = context.permission_checker(
+            authorization = context.permission_checker(
                 name,
                 arguments,
+                tool_spec=resolved.spec,
+                outside_workspace=outside_workspace,
                 event_callback=context.event_callback,
                 permission_owner=context.permission_owner,
                 parent_turn_id=context.parent_turn_id,
@@ -660,12 +666,18 @@ class ToolPipeline:
                 cancel_event=context.cancel_event,
             )
         except self.permission_error_type:
-            return PERMISSION_SYSTEM_ERROR_MESSAGE
-        if approved:
-            return None
-        if context.cancel_event is not None and context.cancel_event.is_set():
-            return PERMISSION_CANCELLED_MESSAGE
-        return PERMISSION_DENIED_MESSAGE
+            return None, PERMISSION_SYSTEM_ERROR_MESSAGE
+        if isinstance(authorization, bool):
+            return authorization, None if authorization else PERMISSION_DENIED_MESSAGE
+        if authorization.allowed:
+            return authorization, None
+        if authorization.reason == "catastrophic_denied":
+            return authorization, DANGEROUS_COMMAND_DENIED_MESSAGE
+        if authorization.reason == "plan_mutation_denied":
+            return authorization, PLAN_MODE_DENIED_MESSAGE
+        if authorization.cancelled or authorization.reason == "cancelled":
+            return authorization, PERMISSION_CANCELLED_MESSAGE
+        return authorization, PERMISSION_DENIED_MESSAGE
 
     @staticmethod
     def _decode_error_message(tool_call, parse_error) -> dict:
@@ -703,14 +715,16 @@ class ToolPipeline:
             self.adapters.announce(
                 decoded.name, decoded.arguments, context.event_callback
             )
-            denied = self._permission_decision(resolved, decoded, context)
+            authorization, denied = self._permission_decision(resolved, decoded, context)
             if denied is not None:
                 return _tool_message(decoded, denied)
             _raise_if_cancelled(context.cancel_event)
 
-            result = self.adapters.for_call(decoded.call_id).execute(
-                resolved, decoded.arguments, context
-            )
+            bypass = bool(getattr(authorization, "sandbox_bypass", False))
+            with self.adapters.sandbox_bypass() if bypass else nullcontext():
+                result = self.adapters.for_call(decoded.call_id).execute(
+                    resolved, decoded.arguments, context
+                )
             content = result.to_message_content()
         except Exception as tool_err:
             content = (

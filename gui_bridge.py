@@ -500,6 +500,14 @@ class ApiBridge:
             self._activate_permission_request,
             self._dismiss_permission_prompt,
         )
+        # 注册 token 记账完成监听器：每次 LLM 请求（含子代理/副模型）记账后
+        # 立即推送 token_usage 事件，统计栏与上下文圆圈逐请求实时刷新，
+        # 不再等整个回合结束才更新。CLI 未注册时无任何额外开销。
+        try:
+            from core.llm import set_token_usage_listener
+            set_token_usage_listener(self._emit_token_usage)
+        except Exception:
+            logger.warning("注册 token 用量实时推送监听器失败", exc_info=True)
         # MCP 状态提示改走日志（GUI 不需要终端输出）
         try:
             from core.mcp_client import set_status_logger
@@ -2883,7 +2891,7 @@ class ApiBridge:
             return {"ok": False, "msg": str(e)}
 
     def clear_permission_rules(self) -> Dict[str, Any]:
-        """清空当前项目的持久化白名单（会话级白名单与沙盒会话放行不受影响）。"""
+        """清空当前项目的持久化白名单（任务级授权不受影响）。"""
         try:
             from core import permission_store
 
@@ -2898,6 +2906,8 @@ class ApiBridge:
             from core import permission_store
 
             result = permission_store.add_rule(rule_type, value)
+            if result.status == "limit_reached":
+                return {"ok": False, "status": result.status, "msg": "项目白名单规则数量已达到上限"}
             return {
                 "ok": True,
                 "status": result.status,
@@ -2912,6 +2922,8 @@ class ApiBridge:
             from core import permission_store
 
             result = permission_store.remove_rule(rule_type, value)
+            if result.status == "not_found":
+                return {"ok": False, "status": result.status, "msg": "指定的项目白名单规则不存在"}
             return {
                 "ok": True,
                 "status": result.status,
@@ -2994,7 +3006,7 @@ class ApiBridge:
 
     def respond_permission(self, request_id: str, allow: bool, always: bool = False) -> Dict[str, Any]:
         try:
-            # 选项索引与 PermissionBroker 默认选项一致：0=同意 1=拒绝 2=始终允许
+            # 兼容旧前端：默认选项索引为 0=同意、1=拒绝、2=本任务放行
             if not allow:
                 choice = 1
             elif always:
@@ -3015,7 +3027,7 @@ class ApiBridge:
         try:
             custom = str(custom_text or "").strip()
             if custom and permission_broker.active_function_name(str(request_id)) != "ask_user":
-                # 纵深防御：非 ask_user 请求的选项语义（允许/拒绝/始终允许）与
+                # 纵深防御：非 ask_user 请求的授权选项与
                 # 自由文本无对应关系，前端误传时按普通索引回答处理
                 custom = ""
             resolved = permission_broker.resolve(

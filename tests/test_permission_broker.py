@@ -1,4 +1,8 @@
-from core.permission_broker import CANCELLED_RESULT, PermissionBroker
+from core.permission_broker import (
+    CANCELLED_RESULT,
+    PermissionBroker,
+    PermissionOption,
+)
 import threading
 import time
 
@@ -30,6 +34,47 @@ def test_stale_request_cannot_resolve_the_active_future():
     assert broker.resolve("missing-request", 0) is False
     assert request.future.done() is False
     assert broker.active_request().request_id == request.request_id
+
+
+def test_broker_accepts_four_keyed_permission_options():
+    broker = PermissionBroker(activate_prompt=lambda _request: None)
+    request = broker.enqueue(
+        "write_file",
+        {},
+        "owner",
+        "turn",
+        "主代理",
+        options=(
+            PermissionOption("allow_once", "允许本次"),
+            PermissionOption("deny", "拒绝"),
+            PermissionOption("allow_task", "本任务同类操作放行"),
+            PermissionOption("allow_project", "加入项目白名单"),
+        ),
+    )
+
+    assert request.option_keys == (
+        "allow_once",
+        "deny",
+        "allow_task",
+        "allow_project",
+    )
+    assert broker.resolve_by_key(request.request_id, "allow_project") is True
+    assert request.future.result() == 3
+
+
+def test_unknown_permission_option_key_does_not_resolve_request():
+    broker = PermissionBroker(activate_prompt=lambda _request: None)
+    request = broker.enqueue(
+        "write_file",
+        {},
+        "owner",
+        "turn",
+        "主代理",
+        options=(PermissionOption("allow_once", "允许本次"),),
+    )
+
+    assert broker.resolve_by_key(request.request_id, "missing") is False
+    assert request.future.done() is False
 
 
 def test_resolving_last_request_dismisses_the_prompt():
@@ -373,6 +418,10 @@ def test_permission_poll_exception_releases_enqueued_request(monkeypatch):
     class FakeBroker:
         def __init__(self):
             self.cancelled = []
+
+        @staticmethod
+        def has_prompt_handlers():
+            return True
 
         def enqueue(self, *args, **kwargs):
             from types import SimpleNamespace
