@@ -405,11 +405,72 @@ def sha256_file(path):
     return h.hexdigest()
 
 
+# 首 512 字节内连续可解码为 UTF-16 非控制字符的码元对数阈值：
+# 达到即判定"看起来像 UTF-16 文本"，边界必须避开（v1.2.16 事故片的
+# 危险头部实测可连续解码 36 对；正常二进制分卷实测 ≤2 对即遇裸代理项）
+_UTF16_RUN_THRESHOLD = 16
+
+
+def _looks_like_utf16_text(head: bytes) -> bool:
+    """首 512 字节在 UTF-16LE 或 BE 下是否像文本（连续可解码的非控制码元
+    达到阈值）。二进制数据通常几对之内就会撞上裸代理项（U+D800-DFFF）
+    或控制字符，连续 16 对都能解码的极少见——那种数据会被 CDN 嗅探成
+    text/plain; charset=utf-16le 并注入 BOM（v1.2.16 part4 事故）。
+    """
+    for little in (True, False):
+        run = 0
+        for i in range(0, min(len(head), 512) - 1, 2):
+            unit = int.from_bytes(head[i:i + 2], "little" if little else "big")
+            if 0xD800 <= unit <= 0xDFFF:
+                break  # 裸代理项：非合法 UTF-16
+            if unit < 0x20 and unit not in (0x09, 0x0A, 0x0D):
+                break  # C0 控制字符
+            if 0x7F <= unit <= 0x9F:
+                break  # DEL / C1 控制字符
+            run += 1
+            if run >= _UTF16_RUN_THRESHOLD:
+                return True
+    return False
+
+
+def _safe_part_boundary(f, off, file_size):
+    """分卷边界微调：避免分卷起始字节被 CDN 内容嗅探误判为文本。
+
+    v1.2.16 事故：part4 起始字节 FE 91 FF 9D... 前 72 字节可连续按
+    UTF-16LE 解码成 CJK 字符，Gitee/foruda CDN 将其误判为 UTF-16 文本，
+    注入 0xFF 拼成 FF FE BOM（体积 +1 字节）并以
+    text/plain; charset=utf-16le 返回，老版本 core/updater.py 的
+    Content-Type 防线把它当成风控页面拒绝下载（自动更新确定性失败）。
+
+    边界整体向后挪到首个"非 BOM、前 512 字节含 0x00、且看起来不像
+    UTF-16 文本"的位置，只改变切片点，不影响拼接还原结果。
+    注意本规则只是降低命中概率的启发式，真正的兜底是发布侧的
+    上传后回读校验（publish_release.verify_remote_attachment）。
+    """
+    while off < file_size:
+        f.seek(off)
+        head = f.read(512)
+        if head[:3] == b"\xef\xbb\xbf" or head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+            off += 1
+            continue
+        if b"\x00" not in head:
+            off += 1
+            continue
+        if _looks_like_utf16_text(head):
+            off += 1
+            continue
+        return off
+    return off
+
+
 def split_file_for_release(src_path, out_dir, part_bytes=SPLIT_PART_BYTES):
     """把超限文件切成 .partN 二进制分卷并移入 out_dir。
 
     分卷是纯字节切割（无压缩/加密）：按序号顺序拼接即还原原文件。
     文件本身 ≤ 100MB 时直接原样拷贝（单片分卷没有拼接意义）。
+    采用均衡切分：先定片数再均摊片长，避免固定片长切出极小的尾卷
+    （曾出现 78KB 尾卷被 core/updater.py 的 >1MB 完整性防线误判为
+    HTML 错误页而拒绝下载，见 v1.2.16 发布事故）。
     返回 (分卷文件名列表, 原文件 SHA256)。
     """
     size = os.path.getsize(src_path)
@@ -418,18 +479,33 @@ def split_file_for_release(src_path, out_dir, part_bytes=SPLIT_PART_BYTES):
         shutil.copy2(src_path, os.path.join(out_dir, base))
         return [base], sha256_file(src_path)
 
+    # 片数按上限取整，再把总长均摊到各片：每片大小相近且都不超上限
+    part_count = -(-size // part_bytes)  # ceil(size / part_bytes)
+    balanced_part_bytes = -(-size // part_count)  # ceil(size / part_count)
+
+    # 计算各片边界（首个边界为 0，末边界为文件末尾），并对中间边界做
+    # 内容嗅探安全微调
     names = []
     with open(src_path, "rb") as f:
-        idx = 1
-        while True:
-            chunk = f.read(part_bytes)
-            if not chunk:
-                break
+        boundaries = [0]
+        for k in range(1, part_count):
+            boundaries.append(
+                _safe_part_boundary(f, balanced_part_bytes * k, size)
+            )
+        boundaries.append(size)
+
+        for idx, (start, end) in enumerate(zip(boundaries, boundaries[1:]), 1):
             part_name = f"{base}.part{idx}"
             with open(os.path.join(out_dir, part_name), "wb") as pf:
-                pf.write(chunk)
+                f.seek(start)
+                remaining = end - start
+                while remaining > 0:
+                    chunk = f.read(min(4 * 1024 * 1024, remaining))
+                    if not chunk:
+                        break
+                    pf.write(chunk)
+                    remaining -= len(chunk)
             names.append(part_name)
-            idx += 1
     return names, sha256_file(src_path)
 
 
