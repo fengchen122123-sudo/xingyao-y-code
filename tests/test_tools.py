@@ -3235,20 +3235,269 @@ def test_execute_command_background_echo_redacts_inline_credentials(monkeypatch)
 
 
 def test_manage_task_list_redacts_inline_credentials(monkeypatch):
-    """M8：manage_task list 回显的命令文本被脱敏。"""
+    """M8：manage_task list 返回的快照 JSON 不含命令字段，内联凭据无回显通道。"""
     import core.tools as tools_mod
+    from core.task_manager import TaskStatusSnapshot
 
     monkeypatch.setattr(
-        "core.task_manager.list_active_tasks",
-        lambda: [{
-            "task_id": "abc12345",
-            "pid": 1234,
-            "duration": "10秒",
-            "command": "export password=hunter2 && npm run dev",
-        }],
+        "core.task_manager.list_task_snapshots",
+        lambda: [
+            TaskStatusSnapshot(
+                task_id="abc12345",
+                status="running",
+                revision=0,
+                terminal=False,
+                output="",
+                exit_code=None,
+            )
+        ],
     )
 
     result = tools_mod.manage_task("list")
+    payload = json.loads(result)
 
+    assert set(payload) == {"tasks"}
+    assert payload["tasks"][0]["task_id"] == "abc12345"
+    assert "command" not in payload["tasks"][0]
     assert "hunter2" not in result
-    assert "***" in result
+
+
+# ---------------------------------------------------------------------------
+# 阶段 B：后台任务 revision 快照 + manage_task(wait) 条件等待
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def isolated_task_manager(tmp_path, monkeypatch):
+    """隔离 task_manager 全局状态：日志目录/任务库指向 tmp_path，任务表清空。"""
+    import core.task_manager as tm
+
+    monkeypatch.setattr(tm, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(tm, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(tm, "_LOADED", True)
+    monkeypatch.setattr(tm, "ACTIVE_TASKS", {})
+    monkeypatch.setattr(tm, "_REMOVED_TIDS", set())
+    yield tm
+    # 清理：杀掉测试遗留的后台进程，避免泄漏真实子进程
+    for tid in list(tm.ACTIVE_TASKS):
+        try:
+            tm.kill_background_task(tid)
+        except Exception:
+            pass
+
+
+def _py_cmd(script):
+    """构造经系统 shell 执行的 venv python 短脚本命令（解释器路径加双引号）。"""
+    import sys as _sys
+
+    return f'"{_sys.executable}" -c "{script}"'
+
+
+def test_background_task_revision_bumps_on_new_output(isolated_task_manager):
+    tm = isolated_task_manager
+    tid = tm.start_background_task(
+        _py_cmd("import time; time.sleep(1.5); print('marker-hello', flush=True); time.sleep(30)")
+    )
+    try:
+        snap0 = tm.get_task_snapshot(tid)
+        assert snap0 is not None
+        assert snap0.revision == 0
+        assert snap0.status == "running"
+        assert snap0.terminal is False
+
+        def _advanced():
+            snap = tm.get_task_snapshot(tid)
+            return snap.revision > 0 and "marker-hello" in snap.output
+
+        assert _wait_until(_advanced, timeout=10.0), "日志出现新输出后 revision 必须单调增加"
+    finally:
+        tm.kill_background_task(tid)
+
+
+def test_background_task_terminal_transition_bumps_revision_and_exit_code(isolated_task_manager):
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("import sys; sys.exit(3)"))
+
+    assert _wait_until(lambda: tm.get_task_snapshot(tid).terminal, timeout=10.0)
+    snap = tm.get_task_snapshot(tid)
+    assert snap.status == "failed"
+    assert snap.exit_code == 3
+    assert snap.revision >= 1
+    # 终态任务保留在快照中，但不出现在 running 列表里
+    assert tid in {s.task_id for s in tm.list_task_snapshots()}
+    assert tid not in {t["task_id"] for t in tm.list_active_tasks()}
+
+
+def test_background_task_success_exit_marks_completed(isolated_task_manager):
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("pass"))
+
+    assert _wait_until(lambda: tm.get_task_snapshot(tid).terminal, timeout=10.0)
+    snap = tm.get_task_snapshot(tid)
+    assert snap.status == "completed"
+    assert snap.exit_code == 0
+
+
+def test_wait_returns_immediately_when_revision_advanced(isolated_task_manager):
+    import time
+    from core.tools import manage_task
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(
+        _py_cmd("import time; time.sleep(1.0); print('marker-adv', flush=True); time.sleep(30)")
+    )
+    try:
+        rev0 = tm.get_task_snapshot(tid).revision
+        assert _wait_until(
+            lambda: tm.get_task_snapshot(tid).revision > rev0, timeout=10.0
+        )
+
+        started = time.monotonic()
+        result = manage_task("wait", task_id=tid, after_revision=rev0, timeout_seconds=10)
+        elapsed = time.monotonic() - started
+
+        payload = json.loads(result)
+        assert payload["changed"] is True
+        assert payload["revision"] > rev0
+        assert payload["task_id"] == tid
+        assert elapsed < 2.0, "revision 已推进时 wait 必须立即返回"
+    finally:
+        tm.kill_background_task(tid)
+
+
+def test_wait_timeout_returns_changed_false_without_error(isolated_task_manager):
+    import time
+    from core.tools import manage_task
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    try:
+        rev0 = tm.get_task_snapshot(tid).revision
+
+        started = time.monotonic()
+        result = manage_task("wait", task_id=tid, after_revision=rev0, timeout_seconds=1)
+        elapsed = time.monotonic() - started
+
+        assert not result.startswith("🚨"), "超时不是错误，不得返回 🚨 前缀"
+        payload = json.loads(result)
+        assert payload["changed"] is False
+        assert payload["revision"] == rev0
+        assert payload["status"] == "running"
+        assert 0.8 <= elapsed < 5.0
+    finally:
+        tm.kill_background_task(tid)
+
+
+def test_wait_returns_terminal_snapshot_immediately(isolated_task_manager):
+    import time
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("pass"))
+    assert _wait_until(lambda: tm.get_task_snapshot(tid).terminal, timeout=10.0)
+    rev = tm.get_task_snapshot(tid).revision
+
+    started = time.monotonic()
+    snap = tm.wait_task_change(tid, rev, 10)  # revision 未超过 after 也应立即返回
+    elapsed = time.monotonic() - started
+
+    assert snap is not None
+    assert snap.terminal is True
+    assert snap.exit_code == 0
+    assert elapsed < 2.0
+
+
+def test_wait_cancel_event_interrupts_immediately(isolated_task_manager):
+    import time
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    try:
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with pytest.raises(KeyboardInterrupt):
+            tm.wait_task_change(tid, 0, 30, cancel_event=cancel_event)
+
+        # 等待中途置位同样打断，不伪装超时
+        cancel_event2 = threading.Event()
+        timer = threading.Timer(0.3, cancel_event2.set)
+        timer.start()
+        started = time.monotonic()
+        try:
+            with pytest.raises(KeyboardInterrupt):
+                tm.wait_task_change(tid, 0, 30, cancel_event=cancel_event2)
+        finally:
+            timer.cancel()
+        assert time.monotonic() - started < 5.0
+    finally:
+        tm.kill_background_task(tid)
+
+
+def test_manage_task_status_and_list_return_stable_json(isolated_task_manager):
+    from core.tools import manage_task
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    try:
+        status_payload = json.loads(manage_task("status", task_id=tid))
+        assert status_payload["task_id"] == tid
+        assert status_payload["status"] == "running"
+        assert status_payload["revision"] == 0
+        assert status_payload["terminal"] is False
+        assert status_payload["exit_code"] is None
+        assert "output" in status_payload
+        assert "changed" not in status_payload  # status 省略 changed 键（wait 必含）
+
+        list_payload = json.loads(manage_task("list"))
+        entry = next(t for t in list_payload["tasks"] if t["task_id"] == tid)
+        assert entry["status"] == "running"
+        assert entry["terminal"] is False
+    finally:
+        tm.kill_background_task(tid)
+
+    # 仅剩终态任务时保持旧文案
+    assert manage_task("list") == "ℹ 当前没有任何运行中的后台异步任务。"
+
+
+def test_manage_task_wait_validates_arguments(isolated_task_manager):
+    from core.tools import manage_task
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    try:
+        assert manage_task("wait", after_revision=0).startswith("🚨")
+        assert manage_task("wait", task_id=tid).startswith("🚨")
+        assert manage_task("wait", task_id=tid, after_revision=-1).startswith("🚨")
+        assert manage_task("wait", task_id=tid, after_revision="abc").startswith("🚨")
+        assert manage_task("wait", task_id="不存在id", after_revision=0).startswith("🚨")
+        assert manage_task("status", task_id="不存在id").startswith("🚨")
+    finally:
+        tm.kill_background_task(tid)
+
+
+def test_background_tasks_fingerprint_tracks_task_state(isolated_task_manager):
+    tm = isolated_task_manager
+    fp_empty = tm.background_tasks_fingerprint()
+    assert len(fp_empty) == 64
+    tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    try:
+        fp_running = tm.background_tasks_fingerprint()
+        assert fp_running != fp_empty
+        # 无任何可观察变化时指纹稳定
+        assert tm.background_tasks_fingerprint() == fp_running
+    finally:
+        tm.kill_background_task(tid)
+    # kill 置 cancelled + bump revision 后指纹变化
+    assert tm.background_tasks_fingerprint() != fp_running
+
+
+def test_kill_marks_task_cancelled_and_keeps_record(isolated_task_manager):
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    rev0 = tm.get_task_snapshot(tid).revision
+
+    assert tm.kill_background_task(tid) is True
+    snap = tm.get_task_snapshot(tid)
+    assert snap is not None, "kill 后任务记录必须保留为终态"
+    assert snap.status == "cancelled"
+    assert snap.terminal is True
+    assert snap.revision > rev0
+    assert tid not in {t["task_id"] for t in tm.list_active_tasks()}
