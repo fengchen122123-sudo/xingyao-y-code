@@ -177,7 +177,8 @@ const confirmDeleteName = ref('');
 // 正在等待二次确认删除的项目分组路径
 const confirmDeleteGroupPath = ref('');
 // 手机远程控制绑定信息（点击手机图标后弹出二维码）
-const remoteBind = ref<null | { url: string; qr: string; expires_in: number }>(null);
+// permanent=true 表示永久有效（后端 expires_in=0），不做倒计时自动刷新
+const remoteBind = ref<null | { url: string; qr: string; expires_in: number; permanent?: boolean }>(null);
 // 配对链接刷新中标记：刷新期间禁用按钮避免重复点击
 const remoteBindRefreshing = ref(false);
 // 过期检查定时器：弹窗打开期间每秒检测，过期自动刷新 token
@@ -315,7 +316,9 @@ async function fetchRemoteBind(forceNew: boolean) {
       remoteBind.value = {
         url: result.url,
         qr: result.qr,
+        // expires_in=0：永久有效（TTL 选“永久”时后端永不过期）
         expires_in: result.expires_in ?? 0,
+        permanent: !(result.expires_in > 0),
       };
       startExpiryWatch();
     } else if (!forceNew || !remoteBind.value) {
@@ -345,6 +348,8 @@ async function refreshRemoteBind() {
 // 弹窗打开期间每秒检测剩余有效期，到期自动向后端请求新 token（未过期时后端会直接复用）
 function startExpiryWatch() {
   stopExpiryWatch();
+  // 永久有效（expires_in=0）无需倒计时，也就永远不会触发自动刷新
+  if (remoteBind.value?.permanent) return;
   remoteBindExpiryTimer = setInterval(() => {
     if (!remoteBind.value) return;
     remoteBind.value.expires_in -= 1;

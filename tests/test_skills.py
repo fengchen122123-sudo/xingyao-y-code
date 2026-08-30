@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import config
 import core.skills as skills
 
 
@@ -26,6 +27,24 @@ def test_active_skill_catalog_exposes_metadata_without_body(tmp_path, monkeypatc
     assert "Demo skill" in catalog
     assert str(skill_path) in catalog
     assert "SECRET BODY" not in catalog
+
+
+def test_default_skill_scan_uses_configured_ycode_dir(tmp_path, monkeypatch):
+    """YCODE_DATA_DIR 覆盖必须同时约束内置释放与默认扫描目录。"""
+    configured_dir = tmp_path / "isolated-ycode"
+    configured_skills = configured_dir / "skills"
+    configured_skills.mkdir(parents=True)
+    legacy_home = tmp_path / "legacy-home"
+    (legacy_home / ".ycode" / "skills").mkdir(parents=True)
+
+    monkeypatch.setattr(config, "YCODE_DIR", str(configured_dir))
+    monkeypatch.setattr(skills, "sync_builtin_skills", lambda: None)
+    monkeypatch.setattr(skills.os.path, "expanduser", lambda _value: str(legacy_home))
+
+    paths = [Path(path).resolve() for path in skills.get_skill_dirs()]
+
+    assert configured_skills.resolve() in paths
+    assert (legacy_home / ".ycode" / "skills").resolve() not in paths
 
 
 def test_active_skill_catalog_is_stable_and_compatibility_api_is_lazy(

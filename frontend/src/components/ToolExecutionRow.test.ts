@@ -84,6 +84,19 @@ function subagentRow(): ToolTraceRow {
 }
 
 
+function resultRow(results: string[]): ToolTraceRow {
+  return {
+    id: 'result-row', kind: 'tool', status: 'failed', action: '运行子代理',
+    detail: '', command: '', errorSummary: '', count: results.length,
+    metrics: {},
+    calls: results.map((result, index) => ({
+      id: `call-${index}`, name: 'run_subagent', label: '运行子代理',
+      result: { ok: false, summary: '完成', result },
+    })),
+  };
+}
+
+
 describe('ToolExecutionRow', () => {
   it('shows a failed command and continues to expose details', async () => {
     const wrapper = mount(ToolExecutionRow, { props: { row: failedCommandRow() } });
@@ -134,5 +147,36 @@ describe('ToolExecutionRow', () => {
     expect(wrapper.text()).toContain('整理测试报告');
     expect(wrapper.text()).toContain('12s');
     expect(wrapper.text()).toContain('30s');
+  });
+
+  it.each([
+    ['main_takeover', '主 Agent 已接管'],
+    ['takeover_queued', '等待主 Agent 接管'],
+  ])('shows the %s handoff badge', (handoff, expected) => {
+    const result = JSON.stringify({ status: 'timed_out', handoff });
+    const wrapper = mount(ToolExecutionRow, { props: { row: resultRow([result]) } });
+    expect(wrapper.get('.trace-takeover-badge').text()).toBe(expected);
+    expect(wrapper.classes()).toContain('status-failed');
+  });
+
+  it.each([
+    JSON.stringify({ status: 'failed', handoff: 'main_takeover' }),
+    'ordinary non-json failure',
+  ])('does not show a handoff badge for %s', (result) => {
+    const wrapper = mount(ToolExecutionRow, { props: { row: resultRow([result]) } });
+    expect(wrapper.find('.trace-takeover-badge').exists()).toBe(false);
+  });
+
+  it('parses each grouped call result and selects the first timed-out handoff', () => {
+    const wrapper = mount(ToolExecutionRow, {
+      props: {
+        row: resultRow([
+          'ordinary result',
+          JSON.stringify({ status: 'timed_out', handoff: 'takeover_queued' }),
+          JSON.stringify({ status: 'timed_out', handoff: 'main_takeover' }),
+        ]),
+      },
+    });
+    expect(wrapper.get('.trace-takeover-badge').text()).toBe('等待主 Agent 接管');
   });
 });

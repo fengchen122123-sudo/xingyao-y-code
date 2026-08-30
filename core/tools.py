@@ -515,6 +515,21 @@ def write_file(file_path, content):
                     f"只有确定要完整重写整个文件时才告知用户此限制。"
                 )
 
+        # D3：撤销优先保存原始字节，确保空文件与非 UTF-8 文件
+        # 能精确恢复；old_content 只用于 Diff/旧调用方兼容。
+        existed_before = resolved.exists() and resolved.is_file()
+        old_content = ""
+        old_bytes = None
+        if existed_before:
+            try:
+                old_bytes = resolved.read_bytes()
+            except OSError as error:
+                return f"🚨 无法读取文件原始内容，已拒绝覆盖 {file_path}：{error}"
+            try:
+                old_content = old_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                old_content = old_bytes.decode("gbk", errors="replace")
+
         # 与 edit_file 对齐：先写同目录临时文件再 os.replace，避免写入中断留下半个文件
         # 自动创建父目录：用户/Agent 可能直接写到不存在的子目录（如 memory/feedback/），
         # 不自动创建会导致 mkstemp 抛 FileNotFoundError，让 Agent 陷入无效重试。
@@ -549,6 +564,14 @@ def write_file(file_path, content):
             except OSError:
                 pass
             raise
+        # 与 edit_file 对齐：仅在写入成功后入撤销栈。
+        from core.memory import set_undo_state
+        set_undo_state(
+            str(resolved),
+            old_content,
+            existed_before=existed_before,
+            old_bytes=old_bytes,
+        )
     return f"✔ 文件 {file_path} 写入成功！"
 
 # --- 下面是给星瑶装配的两个新神装 ---
@@ -665,14 +688,21 @@ def execute_command(
     if run_in_background:
         from core.task_manager import start_background_task
         try:
-            # 记录父会话，任务完成回调据此触发 LLM 简短总结
-            session_id = _tool_cache.get_current_session() or ""
-            if not session_id:
-                try:
-                    import core.app_context as app_context
-                    session_id = app_context.get_current_session() or ""
-                except Exception:
-                    session_id = ""
+            # 记录父会话，任务完成回调据此触发 LLM 简短总结。
+            # 归属必须取发起回合的会话：线程级绑定（GUI 回合 worker / 子代理
+            # 线程入口 set_thread_session）优先；进程级 current_session 是
+            # "UI 当前查看的会话"，草稿会话首条消息流程不更新它，只能作最后
+            # 兜底，否则任务总结会误注入上一个真实会话
+            try:
+                import core.app_context as app_context
+                session_id = (
+                    app_context.get_thread_session()
+                    or _tool_cache.get_current_session()
+                    or app_context.get_current_session()
+                    or ""
+                )
+            except Exception:
+                session_id = _tool_cache.get_current_session() or ""
             background_kwargs = {"session_id": session_id}
             if shell_id:
                 background_kwargs["shell_id"] = shell_id
@@ -1504,26 +1534,50 @@ def search_code(query, dir_path=".", cancel_event=None):
 
 # --- 星瑶的新神装：后台任务管理与局部代码修改 ---
 
+def _normalize_wait_timeout(value):
+    if isinstance(value, bool) or not isinstance(value, int):
+        return "🚨 错误：timeout_seconds 必须是 1 到 60 的整数。"
+    if not 1 <= value <= 60:
+        return "🚨 错误：timeout_seconds 必须是 1 到 60 的整数。"
+    return value
+
+
+# manage_task 子代理快照的 result 摘要上限：与 agent_service._BG_RESULT_MAX_CHARS
+# （自动汇总回流上限）对齐，避免回合内主动查询与回合后回流重复灌入大段相同内容。
+_SUBAGENT_STATUS_RESULT_MAX_CHARS = 1500
+_SUBAGENT_STATUS_DESC_MAX_CHARS = 120
+
+
 def manage_task(action, task_id=None, after_revision=None, timeout_seconds=30, event_callback=None, permission_owner=None, cancel_event=None):
     """
-    后台进程管理器：对丢在后台运行的长周期任务（如服务器）进行查杀、状态查询和条件等待。
+    后台任务统一管理器：同时管理两类后台任务——
+      1. shell 后台命令（execute_command run_in_background 启动，ID 为 8 位十六进制）；
+      2. 后台/前台子代理任务（run_subagent 启动，task_id 形如 subagent-xxxxxxxx）。
     参数:
-      action: 可选值：'list'（列出运行中的后台任务）, 'status'（查看指定任务快照与日志尾部）,
-        'wait'（条件等待：revision 超过 after_revision、进入终态或超时后返回）, 'kill'（强制杀掉指定任务）。
+      action: 可选值：'list'（列出运行中的后台任务，两类合并）,
+        'status'（查看指定任务快照；shell 附日志尾部，子代理附阶段与耗时）,
+        'wait'（条件等待）, 'kill'（强制终止指定任务）。
       task_id: 目标任务的 ID，'status'/'wait'/'kill' 行动必填。
-      after_revision: wait 必填，上次快照的 revision（非负整数）。
+      after_revision: 仅对 shell 任务生效，缺省视为 0（首次等待）；子代理任务无 revision，传入则忽略。
       timeout_seconds: wait 的最长等待秒数（1-60，默认 30）；超时返回当前快照且 changed=false，不是错误。
       event_callback/permission_owner/cancel_event: 调度层透传的权限上下文（不暴露给模型），
         子代理线程内调用 kill 时必须传入，缺省路径仅在主线程上下文可用。
-    status/wait 返回 JSON：{"task_id","status","revision","terminal","exit_code","output"}，
-    wait 另含 "changed"；list 返回 {"tasks": [...]}。
+    wait 语义：shell 任务为「revision 超过 after_revision、进入终态或超时」；
+      子代理任务为「进入终态或超时」（终态时附 result 摘要，供回合内直接收割结果）。
+    status/wait 返回 JSON（含 "kind": "shell"|"subagent"）；shell 载荷为
+    {"task_id","status","revision","terminal","exit_code","output"}，wait 另含 "changed"；
+    list 返回 {"tasks": [...]}，每条含 kind 字段。
     """
     from core.task_manager import (
-        get_task_snapshot, kill_background_task, list_task_snapshots, wait_task_change,
+        KILL_RESULT_FAILED, KILL_RESULT_IDENTITY_UNVERIFIABLE,
+        KILL_RESULT_KILLED, KILL_RESULT_NATURAL_DEATH, KILL_RESULT_NOT_FOUND,
+        get_task_snapshot, kill_background_task_detailed, list_task_snapshots,
+        wait_task_change,
     )
 
     def _snapshot_payload(snap, changed=None):
         payload = {
+            "kind": "shell",
             "task_id": snap.task_id,
             "status": snap.status,
             "revision": snap.revision,
@@ -1535,18 +1589,60 @@ def manage_task(action, task_id=None, after_revision=None, timeout_seconds=30, e
             payload["changed"] = changed
         return payload
 
+    def _subagent_snapshot_payload(snap, changed=None, include_result=False):
+        description = str(snap.description or "")
+        if len(description) > _SUBAGENT_STATUS_DESC_MAX_CHARS:
+            description = description[:_SUBAGENT_STATUS_DESC_MAX_CHARS] + "…"
+        payload = {
+            "kind": "subagent",
+            "task_id": snap.task_id,
+            "status": snap.status,
+            "subagent_type": snap.subagent_type,
+            "run_in_background": snap.run_in_background,
+            "stage": snap.stage,
+            "execution_elapsed": round(float(snap.execution_elapsed or 0.0), 1),
+            "terminal": snap.status in _SUBAGENT_TERMINAL_STATUSES,
+            "description": description,
+        }
+        if include_result:
+            result = str(snap.result or "")
+            if result:
+                if len(result) > _SUBAGENT_STATUS_RESULT_MAX_CHARS:
+                    omitted = len(result) - _SUBAGENT_STATUS_RESULT_MAX_CHARS
+                    result = (
+                        result[:_SUBAGENT_STATUS_RESULT_MAX_CHARS]
+                        + f"… [结果已截断，省略 {omitted} 字符；完整结果将在回合结束后的自动汇总中注入]"
+                    )
+                payload["result"] = result
+            if snap.error:
+                payload["error"] = str(snap.error)
+        if changed is not None:
+            payload["changed"] = changed
+        return payload
+
     if action == "list":
         running = [s for s in list_task_snapshots() if not s.terminal]
-        if not running:
+        subagent_running = [
+            s for s in subagent_manager.snapshot()
+            if s.status not in _SUBAGENT_TERMINAL_STATUSES
+        ]
+        if not running and not subagent_running:
             return "ℹ 当前没有任何运行中的后台异步任务。"
-        return json.dumps(
-            {"tasks": [_snapshot_payload(s) for s in running]},
-            ensure_ascii=False,
-        )
+        tasks = [_snapshot_payload(s) for s in running]
+        tasks.extend(_subagent_snapshot_payload(s) for s in subagent_running)
+        return json.dumps({"tasks": tasks}, ensure_ascii=False)
 
     elif action == "status":
         if not task_id:
             return "🚨 错误：查看状态必须提供 task_id 参数。"
+        if is_subagent_task_id(task_id):
+            snap = subagent_manager.task_snapshot(task_id)
+            if snap is None:
+                return f"🚨 未找到任务 {task_id}。"
+            return json.dumps(
+                _subagent_snapshot_payload(snap, include_result=True),
+                ensure_ascii=False,
+            )
         snap = get_task_snapshot(task_id)
         if snap is None:
             return f"🚨 未找到任务 {task_id}。"
@@ -1555,20 +1651,38 @@ def manage_task(action, task_id=None, after_revision=None, timeout_seconds=30, e
     elif action == "wait":
         if not task_id:
             return "🚨 错误：等待任务必须提供 task_id 参数。"
+        timeout = _normalize_wait_timeout(timeout_seconds)
+        if isinstance(timeout, str):
+            return timeout
+        if is_subagent_task_id(task_id):
+            # 子代理无 revision：after_revision 忽略，等待条件为进入终态或超时
+            snap = subagent_manager.wait_terminal(
+                task_id, timeout, cancel_event=cancel_event
+            )
+            if snap is None:
+                return f"🚨 未找到任务 {task_id}。"
+            return json.dumps(
+                _subagent_snapshot_payload(
+                    snap, changed=snap.status in _SUBAGENT_TERMINAL_STATUSES,
+                    include_result=True,
+                ),
+                ensure_ascii=False,
+            )
         if after_revision is None:
-            return "🚨 错误：等待任务必须提供 after_revision 参数（非负整数）。"
-        try:
-            after = int(after_revision)
-        except (TypeError, ValueError):
+            after_revision = 0  # 首次等待语义：等任意输出或终态
+        if isinstance(after_revision, bool) or not isinstance(after_revision, int):
             return "🚨 错误：after_revision 必须是非负整数。"
-        if after < 0:
+        if after_revision < 0:
             return "🚨 错误：after_revision 必须是非负整数。"
-        if timeout_seconds is None:
-            timeout_seconds = 30
-        snap = wait_task_change(task_id, after, timeout_seconds, cancel_event=cancel_event)
+        snap = wait_task_change(
+            task_id, after_revision, timeout, cancel_event=cancel_event
+        )
         if snap is None:
             return f"🚨 未找到任务 {task_id}。"
-        return json.dumps(_snapshot_payload(snap, changed=snap.revision > after), ensure_ascii=False)
+        return json.dumps(
+            _snapshot_payload(snap, changed=snap.revision > after_revision),
+            ensure_ascii=False,
+        )
 
     elif action == "kill":
         if not task_id:
@@ -1589,11 +1703,34 @@ def manage_task(action, task_id=None, after_revision=None, timeout_seconds=30, e
             return "🚨 权限询问系统异常，未能终结后台任务。请稍后重试。"
         if not approved:
             return "🚨 用户拒绝了终结后台任务的操作。"
-        success = kill_background_task(task_id)
-        if success:
+        if is_subagent_task_id(task_id):
+            # 子代理为协作式取消：置位 cancel_event 并走终态提交，不强制杀线程
+            if subagent_manager.cancel(task_id, reason="user requested via manage_task"):
+                return (
+                    f"✔ 后台子代理任务 {task_id} 已请求取消（协作式，任务会尽快退出）；"
+                    "可用 manage_task status 跟踪其终态。"
+                )
+            return (
+                f"🚨 未能取消任务 {task_id}（可能不存在或已进入终态）；"
+                "可用 manage_task status 查看当前状态。"
+            )
+        success = kill_background_task_detailed(task_id)
+        if success == KILL_RESULT_KILLED:
             return f"✔ 后台任务 {task_id} 已被强行终结清除。"
-        else:
-            return f"🚨 未能成功杀掉任务 {task_id}（可能进程已经提前结束，或找不到 ID）。"
+        if success == KILL_RESULT_NATURAL_DEATH:
+            # 进程在 kill 之前已自行结束：不是终止失败，按自然终态落定
+            return (
+                f"ℹ 后台任务 {task_id} 在终结前已自行结束，终态按自然退出结果落定，"
+                "无需强行终止；可用 manage_task status 查看其最终状态与输出。"
+            )
+        if success == KILL_RESULT_NOT_FOUND:
+            return f"🚨 未找到任务 {task_id}。"
+        if success == KILL_RESULT_IDENTITY_UNVERIFIABLE:
+            return (
+                f"🚨 未能终结任务 {task_id}：无法校验进程身份（psutil 缺失或权限不足），"
+                "已按保守策略拒绝终止，避免误杀 PID 被复用的无关进程。"
+            )
+        return f"🚨 终止后台任务 {task_id} 失败，进程可能仍在运行，请稍后重试。"
 
     else:
         return "🚨 错误：未知行动参数。可选值有 'list', 'status', 'wait', 'kill'。"
@@ -2153,6 +2290,20 @@ _SUBAGENT_TERMINAL_STATUSES = {
     "cancelled",
 }
 
+_SUBAGENT_TASK_ID_RE = re.compile(r"^subagent-[0-9a-f]{8}$")
+
+
+def is_subagent_task_id(value: str) -> bool:
+    """仅接受生产生成的子 Agent 执行租约 ID，避免会话/turn 前缀误判。"""
+    return _SUBAGENT_TASK_ID_RE.fullmatch(str(value or "")) is not None
+
+
+def _new_subagent_task_id() -> str:
+    task_id = f"subagent-{uuid.uuid4().hex[:8]}"
+    if not is_subagent_task_id(task_id):
+        raise RuntimeError("generated invalid subagent task id")
+    return task_id
+
 # 同一时刻真正执行的子代理上限：超出的任务保持排队状态等待空位。
 # 无上限时模型一次派发 6+ 个子代理会挤爆 API 并发与本机资源。
 _MAX_CONCURRENT_SUBAGENTS = 5
@@ -2199,8 +2350,8 @@ def _strip_advisor_tags(text: str) -> str:
 
 _SUBAGENT_TIMEOUT_HINT = (
     "（子代理可能已产出部分结果，例如文件已写入；"
-    "请先用 read_file/list_directory 确认工作成果，再决定 plan_retry 重试或调整任务，"
-    "避免重复执行已完成的工作）"
+    "请先用 read_file/list_directory 确认工作成果，再由主 Agent 直接接手继续，"
+    "避免重复执行已完成的工作；接管项验证失败时使用 plan_resume_takeover）"
 )
 
 
@@ -2272,6 +2423,10 @@ class SubagentTask:
     # LLM 请求里，但名额要立即归还（见 _release_slot），两者都必须幂等
     slot_acquired: bool = field(default=False, repr=False)
     slot_released: bool = field(default=False, repr=False)
+    # 超时移交结果（run_subagent 的 terminal_callback 写入）：
+    # ""=未移交；"main_takeover"/"takeover_queued"=移交成功；
+    # "failed"=移交失败（保留 timed_out 事实，不得改写为普通 failed 重新委派）
+    handoff: str = field(default="", repr=False)
 
 
 SubagentRunner = Callable[[SubagentTask], str]
@@ -2450,11 +2605,14 @@ class SubagentManager:
         terminal_callback: Callable | None = None,
         model_config: tuple | None = None,
         event_callback: Callable | None = None,
+        task_id: str | None = None,
     ) -> str:
         """运行一个子代理任务。
 
         注意：超时是协作式取消——超时/取消只设置 cancel_event 并记录终态，
         子代理线程需要响应 cancel_event 才会真正退出；前后台任务都受同一超时监管。
+        task_id：调用方（run_subagent）预先分配的真实执行租约 id，必须在
+        manager 锁内注册前拒绝碰撞；省略时保持自动生成行为（后台/兼容调用）。
         """
         if not 30 <= timeout_seconds <= 3600:
             raise ValueError("timeout_seconds must be between 30 and 3600")
@@ -2479,7 +2637,7 @@ class SubagentManager:
 
         from core.workspace_context import get_workdir
         task = SubagentTask(
-            task_id=f"subagent-{uuid.uuid4().hex[:8]}",
+            task_id=str(task_id or _new_subagent_task_id()),
             parent_session=str(parent_session or ""),
             parent_turn_id=str(parent_turn_id or ""),
             description=description,
@@ -2494,6 +2652,10 @@ class SubagentManager:
             event_callback=event_callback,
         )
         with self._lock:
+            if task.task_id in self._tasks:
+                # 执行租约 id 冲突属于调用方 invariant 破坏：显式失败，
+                # 绝不允许静默改写 id 造成计划项租约与任务记录脱钩
+                raise ValueError(f"duplicate subagent task id: {task.task_id}")
             self._make_capacity_locked()
             self._tasks[task.task_id] = task
             self._record_stage_locked(task, "queued")
@@ -2534,8 +2696,6 @@ class SubagentManager:
             last_tick = now
             waiting_for_approval = self._permission_waiting(task.task_id)
             with self._lock:
-                if task.status in _SUBAGENT_TERMINAL_STATUSES:
-                    break
                 if waiting_for_approval:
                     task.approval_wait_elapsed += elapsed
                     approval_wait += elapsed
@@ -2677,6 +2837,9 @@ class SubagentManager:
             from core.plan import set_current_plan_session as _bind_plan_route
 
             _bind_plan_route(task.parent_session)
+            from core.memory import bind_turn_checkpoint as _bind_turn_checkpoint
+
+            _bind_turn_checkpoint(task.parent_session, task.parent_turn_id)
             try:
                 result = _strip_advisor_tags(str(self._runner(task) or "").strip())
             except BaseException as error:
@@ -2702,6 +2865,9 @@ class SubagentManager:
             finally:
                 _tool_cache.set_current_session(None)
         finally:
+            from core.memory import clear_turn_checkpoint_binding
+
+            clear_turn_checkpoint_binding()
             self._release_slot(task)
 
     def _complete(self, task_id: str, result: str) -> bool:
@@ -2735,9 +2901,12 @@ class SubagentManager:
             task.result = result
             task.finished_at = time.time()
             self._record_stage_locked(task, "completed")
-            task.done_event.set()
         # 后台任务终态实时通知（worker 线程内，回调自行切回 UI 线程）
         self._fire_terminal_notification(task)
+        # done_event 是整个终态提交（计划回写 + 通知）的唯一完成屏障。
+        # 必须最后设置，否则 idle/capacity 观察者会看到半完成记录。
+        with self._lock:
+            task.done_event.set()
         return True
 
     def _terminate(
@@ -2751,38 +2920,34 @@ class SubagentManager:
         if status not in _SUBAGENT_TERMINAL_STATUSES - {"completed"}:
             raise ValueError(f"invalid terminal status: {status}")
         callback = None
+        task = None
+        signal_only = False
         with self._lock:
             task = self._tasks[task_id]
             if task.status in _SUBAGENT_TERMINAL_STATUSES:
                 return False
-            if status == "timed_out" and task.callback_invoked:
-                # 终态回调正在执行（可能同步跑验证命令），不再因超时二次终止，
-                # 避免监管侧 timed_out 与回调侧计划回写状态分裂
-                return False
-            if invoke_callback and not task.callback_invoked:
-                # 锁内原子认领回调，保证 terminal_callback 全局只发一次
+            if invoke_callback and task.callback_invoked:
+                # _complete 已原子认领 completed 回调时，外部取消/看门狗只能
+                # 发出协作式中断信号，不能篡改终态或再次调用 terminal_callback。
+                task.cancel_event.set()
+                signal_only = True
+            if signal_only:
+                callback = None
+            else:
+                # 锁内原子认领 callback；invoke_callback=False 用于已认领回调
+                # 返回错误后的内部终态提交，同样阻止任何后续回调竞争者。
                 task.callback_invoked = True
-                callback = task.terminal_callback
-                if callback is not None:
-                    # 回调期间标记 finalizing，前台/后台监管循环据此暂停超时计时
-                    self._record_stage_locked(task, "finalizing")
-        if callback is not None:
-            try:
-                callback_error = callback(task, status, "", str(error))
-                if callback_error:
-                    error = f"{error}; {callback_error}"
-            except BaseException as callback_exception:
-                error = f"{error}; 计划回写失败: {callback_exception}"
-        with self._lock:
-            task = self._tasks[task_id]
-            if task.status in _SUBAGENT_TERMINAL_STATUSES:
-                return False
-            task.status = status
-            task.error = str(error)
-            task.finished_at = time.time()
-            self._record_stage_locked(task, status, str(error))
-            task.cancel_event.set()
-            task.done_event.set()
+                callback = task.terminal_callback if invoke_callback else None
+                task.status = status
+                task.error = str(error)
+                task.finished_at = time.time()
+                self._record_stage_locked(task, status, str(error))
+                task.cancel_event.set()
+            # 锁内原子认领终态与回调：先写终态事实（status/error/finished_at）
+            # 并 set cancel_event，再在锁外执行后续清理与计划回调。
+            # 顺序铁律：cancel_event 必须先于 terminal callback——超时移交
+            # （handoff_to_main）与权限 fencing 都依赖"回调执行时任务已取消"；
+            # done_event 是前台结果可见屏障，绝不能早于 handoff callback。
         if status in {"timed_out", "cancelled"}:
             from core.permission_broker import permission_broker
             permission_broker.cancel_owner(task_id)
@@ -2793,8 +2958,26 @@ class SubagentManager:
             # 协作式取消杀不死阻塞中的线程（如 LLM 请求），但并发名额立即归还，
             # 避免泄漏线程占满闸门导致排队子代理与前台回合无限等待
             self._release_slot(task)
+        if signal_only:
+            return True
+        if callback is not None:
+            try:
+                callback_error = callback(task, status, "", str(error))
+                if callback_error:
+                    error = f"{error}; {callback_error}"
+                    # callback 失败时保留 timed_out/cancelled 终态事实，
+                    # 只追加错误详情，绝不把超时改写成普通 failed 重新委派
+                    with self._lock:
+                        task.error = str(error)
+            except BaseException as callback_exception:
+                error = f"{error}; 计划回写失败: {callback_exception}"
+                with self._lock:
+                    task.error = str(error)
         # 后台任务终态实时通知（worker 线程内，回调自行切回 UI 线程）
         self._fire_terminal_notification(task)
+        with self._lock:
+            task = self._tasks[task_id]
+            task.done_event.set()
         return True
 
 
@@ -2812,6 +2995,20 @@ class SubagentManager:
                         + f"\n\n... [子代理结果已截断，省略 {omitted} 字符]"
                     )
                 return result
+            if task.status == "timed_out" and task.handoff:
+                # 计划项子代理超时移交：返回结构化 JSON，让主 Agent 直接进入
+                # 接管核查流程（检查现场 → 继续执行 → plan_finish），
+                # 绝不允许把超时当成普通失败重新委派同一计划项。
+                return json.dumps({
+                    "status": "timed_out",
+                    "handoff": task.handoff,
+                    "plan_item_id": task.plan_item_id,
+                    "task_id": task.task_id,
+                    "inspection_required": True,
+                    "stage": task.stage,
+                    "execution_elapsed": round(task.execution_elapsed, 1),
+                    "error": task.error,
+                }, ensure_ascii=False)
             # 失败/超时/取消：返回结构化文本，让主 agent 能快速理解决策下一步
             # 不用 JSON 是因为终端环境可读性差，主 agent 直接读文本即可
             return self._format_failure_text(task)
@@ -2908,6 +3105,7 @@ class SubagentManager:
                 if task.run_in_background
                 and task.parent_session == parent_session
                 and task.status in _SUBAGENT_TERMINAL_STATUSES
+                and task.done_event.is_set()
                 and not task.notification_consumed
             ]
             for task in tasks:
@@ -2934,7 +3132,7 @@ class SubagentManager:
     def get_active_count(self) -> int:
         with self._lock:
             return sum(
-                task.status not in _SUBAGENT_TERMINAL_STATUSES
+                not task.done_event.is_set()
                 for task in self._tasks.values()
             )
 
@@ -2951,10 +3149,25 @@ class SubagentManager:
             for task in self._tasks.values():
                 if (
                     task.plan_item_id == plan_item_id
-                    and task.status not in _SUBAGENT_TERMINAL_STATUSES
+                    and not task.done_event.is_set()
                 ):
                     return True
             return False
+
+    def is_execution_lease_active(self, task_id: str) -> bool:
+        """判断执行租约是否仍然有效：任务存在且未进入终态。
+
+        超时/取消/失败后租约立即失效：ToolPipeline 据此 fencing 旧子代理的
+        延迟工具调用（permission_owner=该 task_id 的调用在权限询问与 adapter
+        之前被取消），防止已由主 Agent 接管的计划项被旧执行者继续改写。
+        """
+        with self._lock:
+            task = self._tasks.get(str(task_id or ""))
+            return (
+                task is not None
+                and task.status not in _SUBAGENT_TERMINAL_STATUSES
+                and not task.cancel_event.is_set()
+            )
 
     def has_running_background_tasks(self, parent_session: str) -> bool:
         """检查指定会话是否仍有运行中（非终态）的后台子代理任务。
@@ -2968,7 +3181,7 @@ class SubagentManager:
                 if (
                     task.run_in_background
                     and task.parent_session == parent_session
-                    and task.status not in _SUBAGENT_TERMINAL_STATUSES
+                    and not task.done_event.is_set()
                 ):
                     return True
             return False
@@ -2986,6 +3199,7 @@ class SubagentManager:
                     task.run_in_background
                     and task.parent_session == parent_session
                     and task.status in _SUBAGENT_TERMINAL_STATUSES
+                    and task.done_event.is_set()
                     and not task.notification_consumed
                 ):
                     return True
@@ -3007,6 +3221,7 @@ class SubagentManager:
                     task.run_in_background
                     and task.parent_session == parent_session
                     and task.status in _SUBAGENT_TERMINAL_STATUSES
+                    and task.done_event.is_set()
                     and not task.summary_injected
                 ):
                     task.summary_injected = True
@@ -3026,6 +3241,53 @@ class SubagentManager:
                 return False
         return self._terminate(task_id, "cancelled", reason)
 
+    def task_snapshot(self, task_id: str) -> SubagentTaskSnapshot | None:
+        """返回指定任务当前快照；任务不存在（含已被容量清理）返回 None。
+
+        供 manage_task(status) 桥接查询，终态任务在其被清理前仍可查。
+        与既有 snapshot()（全量列表）区分：本方法按 task_id 精确查单个任务。
+        """
+        with self._lock:
+            task = self._tasks.get(str(task_id or ""))
+            if task is None:
+                return None
+            return self._snapshot(task)
+
+    def wait_terminal(
+        self,
+        task_id: str,
+        timeout_seconds: float,
+        cancel_event: threading.Event | None = None,
+    ) -> SubagentTaskSnapshot | None:
+        """等待任务进入终态或超时，返回快照。
+
+        任务不存在返回 None；等待期间任务被容量清理（清理者必为终态）则返回
+        最后一次快照；超时返回当前快照（是否终态由调用方检查，超时不是错误）；
+        cancel_event 置位抛 KeyboardInterrupt（不伪装超时）。
+
+        done_event 是终态提交的唯一屏障（_complete/_terminate 均最后设置），
+        锁内取快照与事件引用、锁外等待，与 task_manager.wait_task_change 同构。
+        """
+        deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+        last_snapshot: SubagentTaskSnapshot | None = None
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                raise KeyboardInterrupt("用户终止了工具执行。")
+            with self._lock:
+                task = self._tasks.get(str(task_id or ""))
+                if task is None:
+                    return last_snapshot
+                last_snapshot = self._snapshot(task)
+                if (
+                    task.status in _SUBAGENT_TERMINAL_STATUSES
+                    and task.done_event.is_set()
+                ):
+                    return last_snapshot
+                done_event = task.done_event
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return last_snapshot
+            done_event.wait(timeout=min(remaining, 0.5))
 
     def wait_for_idle(self, timeout: float) -> bool:
         deadline = time.monotonic() + timeout
@@ -3046,6 +3308,7 @@ class SubagentManager:
             task_id
             for task_id, task in self._tasks.items()
             if task.status in _SUBAGENT_TERMINAL_STATUSES
+            and task.done_event.is_set()
             and (
                 not task.run_in_background
                 or task.notification_consumed
@@ -3411,6 +3674,56 @@ _SUBAGENT_DEFAULT_TIMEOUTS = {
 }
 
 
+def make_authorized_verification_runner(
+    *,
+    permission_owner,
+    parent_turn_id,
+    permission_source,
+    cancel_event,
+    event_callback=None,
+):
+    """构造计划项验证命令执行器：先经本回合授权，再真实执行并返回 (passed, detail)。
+
+    run_subagent（子代理 completed 路径）与 plan_finish（主 Agent 接管收尾）
+    共用同一套验证逻辑，不得复制两套。
+    """
+    def authorized_verification_runner(command):
+        from core.llm import PermissionSystemError, check_permission_and_ask
+
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "验证命令已取消"
+        try:
+            approved = check_permission_and_ask(
+                "execute_command",
+                {"command": command},
+                event_callback=event_callback,
+                permission_owner=permission_owner,
+                parent_turn_id=parent_turn_id,
+                permission_source=permission_source,
+                cancel_event=cancel_event,
+            )
+        except PermissionSystemError:
+            return False, "验证命令授权系统异常"
+        if not approved:
+            return False, "验证命令未获用户授权"
+
+        execution_result = _CommandExecutionResult()
+        detail = str(
+            execute_command(
+                command,
+                # 与旧 _run_verification 一致：验证命令（如跑测试套件）
+                # 耗时常超过 execute_command 默认的 30 秒，保持 120 秒上限
+                timeout_seconds=120,
+                cancel_event=cancel_event,
+                _execution_result=execution_result,
+            )
+            or ""
+        ).strip()
+        return execution_result.returncode == 0, detail or "验证通过"
+
+    return authorized_verification_runner
+
+
 def run_subagent(
     task_description,
     run_in_background=False,
@@ -3455,11 +3768,33 @@ def run_subagent(
                 "plan_item_id": str(plan_item_id or ""),
                 "error": "timeout_seconds 必须在 30 到 3600 秒之间。",
             }, ensure_ascii=False)
+        if not run_in_background and timeout_seconds > 600:
+            # 前台硬上限（内部调用同样受限）：模型不得把前台子 Agent 超时扩大到
+            # 2400/3600 秒；长命令应使用后台任务 + manage_task(wait) 等待。
+            return json.dumps({
+                "status": "failed",
+                "plan_item_id": str(plan_item_id or ""),
+                "error": (
+                    "前台子代理 timeout_seconds 硬上限为 600 秒（当前 {} 秒）。"
+                    "长任务请拆分为更小的计划项，或改用 run_in_background=true "
+                    "启动后台任务并用 manage_task(action='wait') 等待结果。"
+                ).format(timeout_seconds),
+            }, ensure_ascii=False)
     if not str(task_description or "").strip():
         return json.dumps({
             "status": "failed",
             "plan_item_id": str(plan_item_id or ""),
             "error": "task_description 不能为空。",
+        }, ensure_ascii=False)
+    if len(str(task_description or "")) > 6000:
+        # 超长任务描述明确失败：不截断、不静默改写，避免模型误判任务范围
+        return json.dumps({
+            "status": "failed",
+            "plan_item_id": str(plan_item_id or ""),
+            "error": (
+                "task_description 超过 6000 字符上限（当前 {} 字符）。"
+                "请拆分为多个计划项/子任务，或精简任务描述；本次输入未被截断或改写。"
+            ).format(len(str(task_description))),
         }, ensure_ascii=False)
     if parent_session is None or parent_turn_id is None:
         import core.app_context as app_context
@@ -3486,17 +3821,46 @@ def run_subagent(
                 "build": "implement",
                 "review": "review",
             }.get(plan_item.get("stage"), "general")
+        if plan_item is not None and bool(plan_item.get("takeover_required", False)):
+            # 首次超时后主 Agent 已接管（或排队等待接管）：同一计划项禁止再次
+            # 派发子代理（timed_out → takeover ≠ retry → 新子代理）。
+            # 主 Agent 应先只读核查现场，再直接用自身工具继续并 plan_finish。
+            status = str(plan_item.get("status", ""))
+            mode = str(plan_item.get("execution_mode", ""))
+            if status in {"failed", "blocked", "cancelled"}:
+                guidance = (
+                    f"请调用 plan_resume_takeover(item_id='{plan_item_id}')，"
+                    "由当前主 Agent 回合继续原尝试。"
+                )
+            elif mode == "takeover_queued":
+                guidance = "该项正在等待主 Agent 按 FIFO 认领，请勿重新派发。"
+            else:
+                guidance = "主 Agent 应直接检查现场并继续执行，完成后用 plan_finish 收尾。"
+            return json.dumps({
+                "status": "blocked",
+                "reason": "main_takeover_required",
+                "plan_item_id": str(plan_item_id),
+                "error": (
+                    f"计划项 '{plan_item_id}' 已发生过子代理超时接管"
+                    f"（status={status}, execution_mode={mode or 'none'}）。"
+                    f"禁止重新派发子代理；{guidance}"
+                ),
+            }, ensure_ascii=False)
         owner = f"subagent:{subagent_type or 'general'}"
-        if not scheduler.start_item(
+        # 先生成真实执行租约 id：计划项认领（start_delegated_item）与
+        # SubagentManager 注册必须绑定同一个 id，禁止事后猜测或用角色名代替
+        delegated_task_id = _new_subagent_task_id()
+        if not scheduler.start_delegated_item(
             str(plan_item_id),
-            owner=owner,
-            event_callback=event_callback,
+            delegated_task_id,
+            owner,
+            event_callback,
         ):
             # 构造详细的失败原因，帮助 LLM 诊断
             actual_status = plan_item.get("status", "unknown") if plan_item else "不存在"
             reason_parts = [f"计划项 '{plan_item_id}' 当前状态为 '{actual_status}'"]
             if plan_item and actual_status in {"failed", "blocked", "cancelled"}:
-                reason_parts.append("（需先用 plan_retry(item_id='{0}') 重置为 pending 后重试）".format(plan_item_id))
+                reason_parts.append("（普通失败项需先用 plan_retry 重置；超时接管项必须用 plan_resume_takeover）")
             if plan_item:
                 deps = plan_item.get("depends_on", [])
                 if deps:
@@ -3530,6 +3894,35 @@ def run_subagent(
         if scheduler is None or not task.plan_item_id:
             return None
         item_id = task.plan_item_id
+        if status == "timed_out":
+            # 首次超时：原子移交主 Agent（同一次尝试的延续，不增加 attempts）。
+            # handoff 失败时保留 timed_out 事实（handoff=failed），
+            # 绝不改写成普通 failed 后重新委派。
+            handoff_item = scheduler.handoff_to_main(
+                item_id,
+                task.task_id,
+                parent_turn_id,
+                error or "subagent timeout",
+            )
+            if handoff_item is not None:
+                task.handoff = str(
+                    handoff_item.get("execution_mode") or "main_takeover"
+                )
+                if event_callback is not None:
+                    # GUI/CLI 接管可见性：真实调度状态唯一来源仍是
+                    # PlanManager/TaskScheduler，本事件只做状态展示
+                    from core.task_scheduler import takeover_handoff_payload
+
+                    event_callback(
+                        "plan_item_handoff",
+                        takeover_handoff_payload(handoff_item),
+                    )
+                return None
+            task.handoff = "failed"
+            return (
+                f"计划项 {item_id} 移交主 Agent 失败（现场状态异常），"
+                "请勿重新委派子代理；主 Agent 应直接用 plan_read 检查后接管。"
+            )
         if status == "completed":
             plan_item = next(
                 (item for item in scheduler.plan.snapshot() if item["id"] == item_id),
@@ -3537,47 +3930,13 @@ def run_subagent(
             )
             subject = str(plan_item.get("subject") or item_id) if plan_item else item_id
 
-            def authorized_verification_runner(
-                command,
-                *,
+            authorized_verification_runner = make_authorized_verification_runner(
                 permission_owner=owner,
-                verification_parent_turn_id=parent_turn_id,
+                parent_turn_id=parent_turn_id,
                 permission_source=f"计划项验证：{subject}",
                 cancel_event=task.cancel_event,
-            ):
-                """Run a plan verification command only after the owning turn authorizes it."""
-                from core.llm import PermissionSystemError, check_permission_and_ask
-
-                if cancel_event is not None and cancel_event.is_set():
-                    return False, "验证命令已取消"
-                try:
-                    approved = check_permission_and_ask(
-                        "execute_command",
-                        {"command": command},
-                        event_callback=event_callback,
-                        permission_owner=permission_owner,
-                        parent_turn_id=verification_parent_turn_id,
-                        permission_source=permission_source,
-                        cancel_event=cancel_event,
-                    )
-                except PermissionSystemError:
-                    return False, "验证命令授权系统异常"
-                if not approved:
-                    return False, "验证命令未获用户授权"
-
-                execution_result = _CommandExecutionResult()
-                detail = str(
-                    execute_command(
-                        command,
-                        # 与旧 _run_verification 一致：验证命令（如跑测试套件）
-                        # 耗时常超过 execute_command 默认的 30 秒，保持 120 秒上限
-                        timeout_seconds=120,
-                        cancel_event=cancel_event,
-                        _execution_result=execution_result,
-                    )
-                    or ""
-                ).strip()
-                return execution_result.returncode == 0, detail or "验证通过"
+                event_callback=event_callback,
+            )
 
             if scheduler.complete(
                 item_id,
@@ -3634,6 +3993,7 @@ def run_subagent(
             plan_item_id=plan_item_id,
             terminal_callback=terminal_callback if scheduler is not None else None,
             event_callback=event_callback,
+            task_id=delegated_task_id if scheduler is not None else None,
         )
     except Exception as error:
         # 启动失败（如容量满）时回滚计划项，释放 _in_flight_files 占用

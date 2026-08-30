@@ -283,6 +283,94 @@ def test_undo_last_edit_requires_force_to_delete_new_file(tmp_path):
     assert not target.exists()
 
 
+def test_write_file_records_undo_state(tmp_path, monkeypatch):
+    """D3：write_file 也必须记录撤销状态。
+
+    新建文件走 force 删除确认（而不是报"没有可以撤销的操作记录"），
+    覆盖已有文件时无需 force 即可还原旧内容。
+    """
+    from core import memory as memory_mod
+    from core.agent_service import undo_last_edit
+    from core.tools import write_file
+
+    manager = _make_manager()
+    session = "test_write_file_undo"
+    monkeypatch.chdir(tmp_path)
+
+    new_file = tmp_path / "created-by-write.txt"
+    old_file = tmp_path / "existing.txt"
+    old_file.write_text("旧内容v1", encoding="utf-8")
+
+    memory_mod.set_undo_session(session)
+
+    # 1) 新建文件：write_file 后 /undo（无 force）必须要求显式确认删除
+    result = write_file(str(new_file), "新内容")
+    assert "写入成功" in result
+    ok, msg = undo_last_edit(manager, session, force=False)
+    assert ok is False
+    assert "需要显式确认" in msg, f"新建文件应要求 force 确认，实际: {msg}"
+    assert new_file.exists()
+
+    # force 确认后删除新建文件
+    ok, msg = undo_last_edit(manager, session, force=True)
+    assert ok is True, msg
+    assert not new_file.exists()
+
+    # 2) 覆盖已有文件：无需 force 即可还原旧内容
+    memory_mod.set_undo_session(session)
+    result = write_file(str(old_file), "旧内容v1\n追加新内容")
+    assert "写入成功" in result
+    ok, msg = undo_last_edit(manager, session, force=False)
+    assert ok is True, msg
+    assert old_file.read_text(encoding="utf-8") == "旧内容v1"
+
+
+def test_write_file_undo_preserves_preexisting_empty_file(tmp_path, monkeypatch):
+    """覆盖前已存在的空文件不是“新建文件”，撤销不得要求删除确认。"""
+    from core import memory as memory_mod
+    from core.agent_service import undo_last_edit
+    from core.tools import write_file
+
+    manager = _make_manager()
+    session = "test_write_file_empty_undo"
+    target = tmp_path / "empty.txt"
+    target.write_bytes(b"")
+    monkeypatch.chdir(tmp_path)
+    memory_mod.set_undo_session(session)
+    try:
+        assert "写入成功" in write_file(str(target), "new content")
+        ok, message = undo_last_edit(manager, session, force=False)
+    finally:
+        memory_mod.set_undo_session(None)
+
+    assert ok is True, message
+    assert target.exists()
+    assert target.read_bytes() == b""
+
+
+def test_write_file_undo_restores_original_non_utf8_bytes(tmp_path, monkeypatch):
+    """撤销必须还原覆盖前的原始字节，不得把解码替换字符写回文件。"""
+    from core import memory as memory_mod
+    from core.agent_service import undo_last_edit
+    from core.tools import write_file
+
+    manager = _make_manager()
+    session = "test_write_file_gbk_undo"
+    target = tmp_path / "legacy-gbk.txt"
+    original = "旧版中文内容".encode("gbk")
+    target.write_bytes(original)
+    monkeypatch.chdir(tmp_path)
+    memory_mod.set_undo_session(session)
+    try:
+        assert "写入成功" in write_file(str(target), "replacement")
+        ok, message = undo_last_edit(manager, session, force=False)
+    finally:
+        memory_mod.set_undo_session(None)
+
+    assert ok is True, message
+    assert target.read_bytes() == original
+
+
 def test_compression_summary_survives_as_user_message(stub_llm, quiet_extras):
     """压缩摘要必须以 user 角色到达模型（不被 without_system_messages 误删）。"""
     from core.agent_service import prepare_turn_messages

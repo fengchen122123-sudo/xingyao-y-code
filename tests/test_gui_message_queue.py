@@ -3,9 +3,43 @@
 覆盖：回合运行中入队、回合结束 FIFO 补发、取消排队、插队发送。
 全部用裸实例 + 桩函数构造，不依赖真实 LLM / DB / 前端。
 """
+import json
 import threading
 
+import config
+import core.model_manager as model_manager
+
 from gui_bridge import ApiBridge
+
+
+def _use_tmp_config(tmp_path, monkeypatch, data):
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
+    monkeypatch.setattr(model_manager, "_CONFIG_FILE", str(cfg))
+    return cfg
+
+
+_ONE_MODEL_CONFIG = {
+    "active_model_id": "m1",
+    "providers": [
+        {
+            "id": "p1",
+            "name": "测试厂商",
+            "base_url": "https://api.example.com",
+            "api_key": "",
+            "protocol": "openai",
+            "models": [
+                {
+                    "id": "m1",
+                    "name": "model-one",
+                    "litellm_model": "openai/model-one",
+                    "context_window": 200000,
+                }
+            ],
+        }
+    ],
+}
 
 
 def _make_bridge(is_turn_active):
@@ -62,6 +96,43 @@ def test_send_user_message_direct_when_idle():
     assert spawned[0][0] == ("你好", "s1")
     assert "s1" not in bridge._message_queues
     assert events == []
+
+
+def test_send_user_message_binds_known_model(tmp_path, monkeypatch):
+    """前端携带的模型 id 在配置中存在时，随消息写入会话绑定。"""
+    _use_tmp_config(tmp_path, monkeypatch, dict(_ONE_MODEL_CONFIG))
+    bridge, spawned, _, _ = _make_bridge(lambda s: False)
+    bound = []
+    bridge._memory = type(
+        "M", (), {"set_session_model_id": lambda self, s, m: bound.append((s, m))}
+    )()
+
+    res = bridge.send_user_message("你好", None, None, None, "m1")
+
+    assert res == {"ok": True}
+    assert bound == [("s1", "m1")]
+    assert len(spawned) == 1
+
+
+def test_send_user_message_ignores_unknown_model_binding(tmp_path, monkeypatch):
+    """前端携带的模型 id 不在配置中（陈旧/已删除）时不得写入会话绑定。
+
+    回归防线：显示态一旦被陈旧全局值污染，不能让下一条消息把错误
+    绑定落成真实的会话模型。
+    """
+    _use_tmp_config(tmp_path, monkeypatch, dict(_ONE_MODEL_CONFIG))
+    bridge, spawned, _, _ = _make_bridge(lambda s: False)
+    bound = []
+    bridge._memory = type(
+        "M", (), {"set_session_model_id": lambda self, s, m: bound.append((s, m))}
+    )()
+
+    res = bridge.send_user_message("你好", None, None, None, "m-deleted")
+
+    assert res == {"ok": True}
+    assert bound == []
+    # 回合照常启动，仅忽略非法绑定
+    assert len(spawned) == 1
 
 
 def test_drain_message_queue_spawns_head_fifo():

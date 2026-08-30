@@ -162,9 +162,9 @@ def test_edit_file_execution_emits_diff_ready_for_exact_tool_call_id(mocker, tmp
 
 def test_compression_replaces_messages_in_place(mocker, monkeypatch):
     """上下文压缩后必须原地替换 messages，调用方持有的列表不失联。"""
-    import main
+    from core import app_context
 
-    monkeypatch.setattr(main, "current_session", "compress-session")
+    monkeypatch.setattr(app_context, "get_current_session", lambda: "compress-session")
     compressed = [{"role": "user", "content": "压缩后的历史"}]
 
     class FakeManager:
@@ -172,7 +172,7 @@ def test_compression_replaces_messages_in_place(mocker, monkeypatch):
             assert session == "compress-session"
             return list(compressed)
 
-    monkeypatch.setattr(main, "manager", FakeManager())
+    monkeypatch.setattr(app_context, "get_manager", lambda: FakeManager())
 
     compress_calls = []
 
@@ -206,16 +206,16 @@ def test_compression_replaces_messages_in_place(mocker, monkeypatch):
 
 def test_rate_limit_error_does_not_trigger_compression(mocker, monkeypatch):
     """rate limit 等错误不触发压缩路径。"""
-    import main
+    from core import app_context
 
-    monkeypatch.setattr(main, "current_session", "rate-limit-session")
+    monkeypatch.setattr(app_context, "get_current_session", lambda: "rate-limit-session")
     compress_called = []
 
     class FakeManager:
         def get_history(self, session):
             return []
 
-    monkeypatch.setattr(main, "manager", FakeManager())
+    monkeypatch.setattr(app_context, "get_manager", lambda: FakeManager())
 
     def fake_compress(manager, session, api_model, api_key, api_url, force=False, output_callback=None):
         compress_called.append(session)
@@ -427,9 +427,9 @@ def test_reasoning_fields_stripped_for_unsupported_providers(mocker):
 
 def test_compression_uses_parent_session_not_main_session(mocker, monkeypatch):
     """子代理回合触发压缩时，压缩与取历史都必须作用于子会话而非主 UI 会话。"""
-    import main
+    from core import app_context
 
-    monkeypatch.setattr(main, "current_session", "main-ui-session")
+    monkeypatch.setattr(app_context, "get_current_session", lambda: "main-ui-session")
     calls = []
     compressed = [{"role": "user", "content": "压缩后的子代理历史"}]
 
@@ -438,7 +438,8 @@ def test_compression_uses_parent_session_not_main_session(mocker, monkeypatch):
             calls.append(("history", session))
             return list(compressed)
 
-    monkeypatch.setattr(main, "manager", FakeManager())
+    fake_manager = FakeManager()
+    monkeypatch.setattr(app_context, "get_manager", lambda: fake_manager)
 
     def fake_compress(manager, session, api_model, api_key, api_url, force=False, output_callback=None):
         calls.append(("compress", session))
@@ -470,16 +471,16 @@ def test_compression_uses_parent_session_not_main_session(mocker, monkeypatch):
 
 def test_rollback_after_successful_compression_keeps_compressed_history(mocker, monkeypatch):
     """压缩成功后本轮再异常：回滚不得把内存恢复成未压缩快照（DB 已被压缩）。"""
-    import main
+    from core import app_context
 
-    monkeypatch.setattr(main, "current_session", "compress-then-fail")
+    monkeypatch.setattr(app_context, "get_current_session", lambda: "compress-then-fail")
     compressed = [{"role": "user", "content": "压缩后的历史"}]
 
     class FakeManager:
         def get_history(self, session):
             return list(compressed)
 
-    monkeypatch.setattr(main, "manager", FakeManager())
+    monkeypatch.setattr(app_context, "get_manager", lambda: FakeManager())
 
     def fake_compress(manager, session, api_model, api_key, api_url, force=False, output_callback=None):
         pass
@@ -556,7 +557,14 @@ def test_write_file_old_content_falls_back_to_gbk(mocker, tmp_path):
     snapshots = {}
 
     mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
-    mocker.patch("core.memory.set_undo_state", side_effect=lambda path, old: snapshots.update(path=path, old=old))
+    mocker.patch(
+        "core.memory.set_undo_state",
+        side_effect=lambda path, old, **metadata: snapshots.update(
+            path=path,
+            old=old,
+            **metadata,
+        ),
+    )
 
     tool_call = {
         "id": "call-gbk-write",
@@ -1219,7 +1227,7 @@ def test_imom_active_publish_root_reads_store(tmp_path, monkeypatch):
     assert llm_mod._get_imom_active_publish_root() == "/data/publish"
 
 
-def test_plan_mode_still_asks_sandbox_outside_access(monkeypatch):
+def test_plan_mode_still_asks_sandbox_outside_read_access(monkeypatch):
     """回归：plan 模式下 sandbox_outside_access 仍必须询问（不自动放行）。
 
     新语义：plan 模式不批准任何修改——修改/执行类工具在
@@ -1230,15 +1238,22 @@ def test_plan_mode_still_asks_sandbox_outside_access(monkeypatch):
     import core.llm as llm_mod
 
     monkeypatch.setattr(llm_mod.app_context, "get_permission_mode", lambda: "plan")
-    # 用权限回调充当“询问了用户”的探针：走到询问路径会调用它
+    asked = []
+    # 权限回调的生产契约是布尔值；记录调用证明 plan 模式没有自动放行。
     monkeypatch.setattr(
-        llm_mod.app_context, "get_permission_callback", lambda: (lambda *a, **kw: "ASKED")
+        llm_mod.app_context,
+        "get_permission_callback",
+        lambda: (lambda *args, **kwargs: asked.append((args, kwargs)) or True),
     )
 
     # sandbox_outside_access 必须继续询问
     assert llm_mod.check_permission_and_ask(
-        "sandbox_outside_access", {"path": "/outside", "operation": "write_file"}
-    ) == "ASKED"
+        "sandbox_outside_access", {"path": "/outside", "operation": "read_file"}
+    ) is True
+    assert asked == [(('sandbox_outside_access', {
+        "path": "/outside",
+        "operation": "read_file",
+    }), {})]
 
 
 def test_plan_mode_blocks_modifying_tools(monkeypatch):
@@ -1605,15 +1620,15 @@ def test_length_truncated_retry_bumps_max_tokens(mocker):
 
 def test_context_overflow_circuit_breaker_after_compression(mocker, monkeypatch):
     """压缩过一次后仍超窗必须直接熔断失败，不得继续重发超大载荷空烧额度。"""
-    import main
+    from core import app_context
 
-    monkeypatch.setattr(main, "current_session", "overflow-breaker-session")
+    monkeypatch.setattr(app_context, "get_current_session", lambda: "overflow-breaker-session")
 
     class FakeManager:
         def get_history(self, session):
             return [{"role": "user", "content": "压缩后的历史"}]
 
-    monkeypatch.setattr(main, "manager", FakeManager())
+    monkeypatch.setattr(app_context, "get_manager", lambda: FakeManager())
 
     compress_calls = []
 
@@ -2393,3 +2408,63 @@ def test_non_thinking_deepseek_not_backfilled():
         "https://aggregator.example/v1",
     )
     assert "reasoning_content" not in fixed[0]
+
+
+def test_protocol_empty_content_marker_is_not_persisted_or_rendered(
+    tmp_path, mocker
+):
+    from core.memory import MemoryManager
+
+    marker = "[System: Empty message content sanitised to satisfy protocol]"
+    manager = MemoryManager(str(tmp_path / "runtime.db"))
+    manager.create_session_explicit("session")
+    mocker.patch("core.app_context.get_manager", return_value=manager)
+    responses = [
+        iter([_chunk(
+            marker,
+            tool_calls=[_tool_call(
+                0,
+                "read-1",
+                "read_file",
+                '{"file_path":"x.py"}',
+            )],
+        )]),
+        iter([_chunk("检查完成。")]),
+    ]
+    mocker.patch("core.llm.completion", side_effect=responses)
+    mocker.patch(
+        "core.llm._execute_single_tool_call",
+        return_value={
+            "role": "tool",
+            "tool_call_id": "read-1",
+            "name": "read_file",
+            "content": "ok",
+        },
+    )
+    messages = [{"role": "user", "content": "检查"}]
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        messages,
+        persist=True,
+        parent_session="session",
+        turn_id="turn-protocol-marker",
+        consume_background_notifications=False,
+    ))
+
+    tool_request = next(
+        message
+        for message in messages
+        if message["role"] == "assistant" and message.get("tool_calls")
+    )
+    assert tool_request["content"] is None
+    assert tool_request["tool_calls"][0]["id"] == "read-1"
+    persisted_tool_request = next(
+        message
+        for message in manager.get_history("session")
+        if message["role"] == "assistant" and message.get("tool_calls")
+    )
+    assert persisted_tool_request["content"] is None
+    assert persisted_tool_request["tool_calls"][0]["id"] == "read-1"
+    assert marker not in str(manager.get_history("session"))

@@ -1,3 +1,4 @@
+import io
 from types import SimpleNamespace
 
 import core.task_manager as task_manager
@@ -116,6 +117,9 @@ def test_kill_refuses_to_kill_reused_pid(tmp_path, monkeypatch):
                 "command": "demo",
                 "process": None,
                 "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
                 "create_time": 1000.0,
                 "log_file_path": str(tmp_path / "task_reused.log"),
                 "log_handle": None,
@@ -136,7 +140,9 @@ def test_kill_refuses_to_kill_reused_pid(tmp_path, monkeypatch):
 
     assert task_manager.kill_background_task("reused") is False
     assert taskkill_calls == []
-    assert "reused" not in task_manager.ACTIVE_TASKS
+    retained = task_manager.ACTIVE_TASKS["reused"]
+    assert retained["status"] == task_manager.TASK_STATUS_COMPLETED
+    assert retained["revision"] == 1
 
 
 def test_kill_refuses_when_process_identity_cannot_be_verified(tmp_path, monkeypatch):
@@ -153,6 +159,9 @@ def test_kill_refuses_when_process_identity_cannot_be_verified(tmp_path, monkeyp
                 "command": "demo",
                 "process": None,
                 "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
                 "create_time": 1000.0,
                 "log_file_path": str(tmp_path / "task_unverifiable.log"),
                 "log_handle": None,
@@ -165,6 +174,9 @@ def test_kill_refuses_when_process_identity_cannot_be_verified(tmp_path, monkeyp
                 "command": "demo",
                 "process": None,
                 "pid": 4322,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
                 "create_time": None,
                 "log_file_path": str(tmp_path / "task_legacy.log"),
                 "log_handle": None,
@@ -186,10 +198,21 @@ def test_kill_refuses_when_process_identity_cannot_be_verified(tmp_path, monkeyp
     assert task_manager.kill_background_task("unverifiable") is False
     assert task_manager.kill_background_task("legacy") is False
     assert taskkill_calls == []
-    assert task_manager.ACTIVE_TASKS == {}
+    assert {
+        task_id: info["status"]
+        for task_id, info in task_manager.ACTIVE_TASKS.items()
+    } == {
+        "unverifiable": task_manager.TASK_STATUS_FAILED,
+        "legacy": task_manager.TASK_STATUS_FAILED,
+    }
+    assert all(
+        info["revision"] == 1
+        for info in task_manager.ACTIVE_TASKS.values()
+    )
 
 
 def test_kill_returns_false_when_taskkill_fails(tmp_path, monkeypatch):
+    log_handle = io.BytesIO()
     monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
     monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
     monkeypatch.setattr(
@@ -201,9 +224,12 @@ def test_kill_returns_false_when_taskkill_fails(tmp_path, monkeypatch):
                 "command": "demo",
                 "process": None,
                 "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
                 "create_time": 1000.0,
                 "log_file_path": str(tmp_path / "task_stubborn.log"),
-                "log_handle": None,
+                "log_handle": log_handle,
                 "start_time": 1,
                 "output_encoding": "utf-8",
             }
@@ -217,5 +243,197 @@ def test_kill_returns_false_when_taskkill_fails(tmp_path, monkeypatch):
         lambda *args, **kwargs: SimpleNamespace(returncode=1),
     )
 
-    assert task_manager.kill_background_task("stubborn") is False
-    assert "stubborn" not in task_manager.ACTIVE_TASKS
+    try:
+        assert task_manager.kill_background_task("stubborn") is False
+        retained = task_manager.ACTIVE_TASKS["stubborn"]
+        assert retained.get("status", task_manager.TASK_STATUS_RUNNING) == (
+            task_manager.TASK_STATUS_RUNNING
+        )
+        assert retained.get("revision", 0) == 0
+        assert log_handle.closed is False
+    finally:
+        log_handle.close()
+
+
+def test_kill_keeps_running_when_taskkill_reports_success_but_pid_survives(
+    tmp_path, monkeypatch
+):
+    log_handle = io.BytesIO()
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(
+        task_manager,
+        "ACTIVE_TASKS",
+        {
+            "survivor": {
+                "id": "survivor",
+                "command": "demo",
+                "process": None,
+                "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
+                "create_time": 1000.0,
+                "log_file_path": str(tmp_path / "task_survivor.log"),
+                "log_handle": log_handle,
+                "start_time": 1,
+                "output_encoding": "utf-8",
+            }
+        },
+    )
+    monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: 1000.0)
+    monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: True)
+    monkeypatch.setattr(
+        task_manager, "_confirm_process_stopped", lambda pid, proc=None: False
+    )
+    monkeypatch.setattr(
+        task_manager.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0),
+    )
+
+    try:
+        assert task_manager.kill_background_task("survivor") is False
+        retained = task_manager.ACTIVE_TASKS["survivor"]
+        assert retained["status"] == task_manager.TASK_STATUS_RUNNING
+        assert retained["revision"] == 0
+        assert log_handle.closed is False
+    finally:
+        log_handle.close()
+
+
+def test_kill_fallback_rechecks_process_after_proc_kill(tmp_path, monkeypatch):
+    class FakeProcess:
+        pid = 4321
+
+        def __init__(self):
+            self.kill_calls = 0
+
+        def poll(self):
+            return None
+
+        def kill(self):
+            self.kill_calls += 1
+
+    proc = FakeProcess()
+    log_handle = io.BytesIO()
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(
+        task_manager,
+        "ACTIVE_TASKS",
+        {
+            "fallback-survivor": {
+                "id": "fallback-survivor",
+                "command": "demo",
+                "process": proc,
+                "pid": proc.pid,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
+                "create_time": 1000.0,
+                "log_file_path": str(tmp_path / "task_fallback_survivor.log"),
+                "log_handle": log_handle,
+                "start_time": 1,
+                "output_encoding": "utf-8",
+            }
+        },
+    )
+    monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: True)
+    monkeypatch.setattr(
+        task_manager, "_confirm_process_stopped", lambda pid, proc=None: False
+    )
+    monkeypatch.setattr(
+        task_manager.subprocess,
+        "run",
+        lambda *args, **kwargs: (_ for _ in ()).throw(OSError("taskkill failed")),
+    )
+
+    try:
+        assert task_manager.kill_background_task("fallback-survivor") is False
+        assert proc.kill_calls == 1
+        retained = task_manager.ACTIVE_TASKS["fallback-survivor"]
+        assert retained["status"] == task_manager.TASK_STATUS_RUNNING
+        assert retained["revision"] == 0
+        assert log_handle.closed is False
+    finally:
+        log_handle.close()
+
+
+def test_kill_returns_false_for_already_exited_task(tmp_path, monkeypatch):
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(
+        task_manager,
+        "ACTIVE_TASKS",
+        {
+            "already-exited": {
+                "id": "already-exited",
+                "command": "demo",
+                "process": None,
+                "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
+                "create_time": 1000.0,
+                "log_file_path": str(tmp_path / "task_already_exited.log"),
+                "log_handle": None,
+                "start_time": 1,
+                "output_encoding": "utf-8",
+            }
+        },
+    )
+    monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: None)
+    monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: False)
+
+    assert task_manager.kill_background_task("already-exited") is False
+    retained = task_manager.ACTIVE_TASKS["already-exited"]
+    assert retained["status"] == task_manager.TASK_STATUS_COMPLETED
+    assert retained["revision"] == 1
+
+
+def test_kill_detailed_classifies_natural_death(tmp_path, monkeypatch):
+    """进程在 kill 之前已自行结束：细分类为 natural_death，bool 包装保持 False。"""
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(
+        task_manager,
+        "ACTIVE_TASKS",
+        {
+            "already-exited-2": {
+                "id": "already-exited-2",
+                "command": "demo",
+                "process": None,
+                "pid": 4322,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
+                "create_time": 1000.0,
+                "log_file_path": str(tmp_path / "task_already_exited_2.log"),
+                "log_handle": None,
+                "start_time": 1,
+                "output_encoding": "utf-8",
+            }
+        },
+    )
+    # 启动时间与记录一致：进程身份可验证，排除 conservative 拒绝分支，
+    # 才能走到"进程已自行结束"的 natural_death 分类
+    monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: 1000.0)
+    monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: False)
+
+    assert (
+        task_manager.kill_background_task_detailed("already-exited-2")
+        == task_manager.KILL_RESULT_NATURAL_DEATH
+    )
+    assert task_manager.kill_background_task("already-exited-2") is False
+
+
+def test_kill_detailed_reports_not_found_for_unknown_task(tmp_path, monkeypatch):
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(task_manager, "ACTIVE_TASKS", {})
+
+    assert (
+        task_manager.kill_background_task_detailed("missing")
+        == task_manager.KILL_RESULT_NOT_FOUND
+    )

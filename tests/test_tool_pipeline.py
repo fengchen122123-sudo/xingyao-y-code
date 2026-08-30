@@ -1,6 +1,7 @@
 import json
 import threading
 from dataclasses import FrozenInstanceError
+from pathlib import Path
 
 import pytest
 
@@ -269,7 +270,12 @@ def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
         "content": f"已成功将内容写入文件：{target}，并已向用户展示 Diff。",
     }
     assert target.read_bytes() == b"new\n"
-    assert undo == {"file_path": str(target), "old_content": "old\n"}
+    assert undo == {
+        "file_path": str(target),
+        "old_content": "old\n",
+        "existed_before": True,
+        "old_bytes": b"old\n",
+    }
     assert len(events) == 1
     assert events[0][0] == "diff_ready"
     assert events[0][1]["tool_call_id"] == "call-1"
@@ -278,6 +284,137 @@ def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
     assert "+new" in events[0][1]["diff_text"]
     assert events[0][1]["added"] == 1
     assert events[0][1]["removed"] == 1
+
+
+def test_injected_write_file_adapter_records_new_file_as_not_preexisting(
+    tmp_path, monkeypatch
+):
+    from core.harness.tool_adapters import ToolAdapterSet
+    from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
+    from core.memory import get_undo_state, set_undo_session
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "created-by-override.txt"
+
+    def fake_write(file_path, content):
+        Path(file_path).write_text(content, encoding="utf-8")
+        return "ok"
+
+    registry = ToolRegistry([ToolSpec(
+        name="write_file",
+        description="write",
+        input_schema={"type": "object"},
+        execute=lambda **_kwargs: ToolResult("must-not-run"),
+        mutates_files=True,
+    )])
+    context = ToolExecutionContext(
+        event_callback=None,
+        parent_session=None,
+        parent_turn_id=None,
+        cancel_event=None,
+        allow_subagents=True,
+        permission_owner=None,
+        permission_source="主代理",
+        permission_checker=lambda *_args, **_kwargs: True,
+        registry=registry,
+        mcp_manager=object(),
+    )
+    pipeline = ToolPipeline(
+        adapters=ToolAdapterSet(
+            write_file=fake_write,
+            show_file_diff=lambda *_args, **_kwargs: None,
+        ),
+        plan_turn_checker=lambda _turn_id: False,
+        pending_plan_checker=lambda _session_id: False,
+    )
+    set_undo_session("adapter-override-new-file")
+    try:
+        pipeline.execute_one({
+            "id": "call-override",
+            "function": {
+                "name": "write_file",
+                "arguments": json.dumps({
+                    "file_path": str(target),
+                    "content": "new",
+                }),
+            },
+        }, context)
+        undo = get_undo_state("adapter-override-new-file")
+    finally:
+        set_undo_session(None)
+
+    assert target.exists()
+    assert undo["existed_before"] is False
+
+
+def test_injected_write_file_adapter_resolves_relative_path_from_workspace(
+    tmp_path, monkeypatch
+):
+    from core.harness.tool_adapters import ToolAdapterSet
+    from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
+    from core.memory import get_undo_state, set_undo_session
+    from core.workspace_context import workspace_scope
+
+    process_cwd = tmp_path / "process-cwd"
+    workspace = tmp_path / "workspace"
+    process_cwd.mkdir()
+    workspace.mkdir()
+    monkeypatch.chdir(process_cwd)
+    target = workspace / "existing-empty.txt"
+    target.write_bytes(b"")
+
+    def fake_write(file_path, content):
+        Path(file_path).write_text(content, encoding="utf-8")
+        return "ok"
+
+    registry = ToolRegistry([ToolSpec(
+        name="write_file",
+        description="write",
+        input_schema={"type": "object"},
+        execute=lambda **_kwargs: ToolResult("must-not-run"),
+        mutates_files=True,
+    )])
+    context = ToolExecutionContext(
+        event_callback=None,
+        parent_session=None,
+        parent_turn_id=None,
+        cancel_event=None,
+        allow_subagents=True,
+        permission_owner=None,
+        permission_source="主代理",
+        permission_checker=lambda *_args, **_kwargs: True,
+        registry=registry,
+        mcp_manager=object(),
+    )
+    pipeline = ToolPipeline(
+        adapters=ToolAdapterSet(
+            write_file=fake_write,
+            show_file_diff=lambda *_args, **_kwargs: None,
+        ),
+        plan_turn_checker=lambda _turn_id: False,
+        pending_plan_checker=lambda _session_id: False,
+    )
+    set_undo_session("adapter-relative-workspace")
+    try:
+        with workspace_scope(str(workspace)):
+            pipeline.execute_one({
+                "id": "call-relative",
+                "function": {
+                    "name": "write_file",
+                    "arguments": json.dumps({
+                        "file_path": "existing-empty.txt",
+                        "content": "updated",
+                    }),
+                },
+            }, context)
+        undo = get_undo_state("adapter-relative-workspace")
+    finally:
+        set_undo_session(None)
+
+    assert target.read_text(encoding="utf-8") == "updated"
+    assert not (process_cwd / "existing-empty.txt").exists()
+    assert undo["file_path"] == str(target)
+    assert undo["existed_before"] is True
 
 
 def test_large_diff_keeps_full_counts_when_display_is_truncated(tmp_path, monkeypatch):
@@ -346,6 +483,83 @@ def test_credential_write_prompts_through_full_pipeline_even_when_sandbox_open(
     assert result["content"].startswith("已成功将内容写入文件")
     assert target.read_text(encoding="utf-8") == "{}\n"
     assert prompts.count("sandbox_outside_access") == 1
+
+
+def test_credential_write_ignores_task_sandbox_bypass_and_requires_confirmation(
+    tmp_path, monkeypatch
+):
+    """任务级沙箱放行不能覆盖 ~/.ycode 顶层凭据写入的逐次确认。"""
+    import core.harness.tool_adapters as tool_adapters
+    import core.memory_kairos as memory_kairos
+    import core.model_manager as model_manager
+    import core.tools as tools_module
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ycode_dir = tmp_path / ".ycode"
+    ycode_dir.mkdir()
+    target = ycode_dir / "config.json"
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(memory_kairos, "YCODE_DIR", ycode_dir)
+    monkeypatch.setattr(llm, "is_outside_workspace", lambda _path: True)
+    monkeypatch.setattr(
+        tool_adapters.os.path,
+        "expanduser",
+        lambda path: str(ycode_dir) if str(path) == "~/.ycode" else str(path),
+    )
+    monkeypatch.setattr(
+        model_manager,
+        "load_config",
+        lambda: {"allow_outside_workspace": True},
+    )
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "full")
+    tools_module.set_session_sandbox_bypass(True)
+    asked, requests = [], []
+    _auto_answer_pipeline_permission(monkeypatch, 1, asked, requests)  # deny
+
+    try:
+        result = _call(
+            "write_file",
+            {"file_path": str(target), "content": "must-not-write\n"},
+        )
+    finally:
+        tools_module.set_session_sandbox_bypass(False)
+
+    assert result["content"] == llm.PERMISSION_DENIED_MESSAGE
+    assert asked == ["sandbox_outside_access"]
+    assert requests[0].arguments == {
+        "path": str(target),
+        "operation": "write_file",
+    }
+    assert not target.exists()
+
+
+def test_plan_mode_denies_external_write_before_permission_prompt(tmp_path, monkeypatch):
+    """沙箱提示名不能把外部写入降级为 plan 模式允许的查询。"""
+    import core.model_manager as model_manager
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = tmp_path / "outside.txt"
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(llm, "is_outside_workspace", lambda _path: True)
+    monkeypatch.setattr(
+        model_manager,
+        "load_config",
+        lambda: {"allow_outside_workspace": False},
+    )
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "plan")
+    asked, requests = [], []
+    _auto_answer_pipeline_permission(monkeypatch, 0, asked, requests)
+
+    result = _call(
+        "write_file",
+        {"file_path": str(target), "content": "must-not-write\n"},
+    )
+
+    assert result["content"] == llm.PLAN_MODE_DENIED_MESSAGE
+    assert asked == []
+    assert not target.exists()
 
 
 def test_plugin_subdirectory_config_is_not_treated_as_top_level_credential(
@@ -479,7 +693,7 @@ def test_pending_plan_rejects_root_tool_with_exact_message(monkeypatch):
         "content": (
             "计划已创建：工具 write_file 必须通过 run_subagent(plan_item_id=...) 执行，"
             "不能由主 Agent 直接绕过计划调用。 当前可执行的计划项: ['impl'(实现)]。"
-            "（若计划项多次失败（attempts>=2）全部停滞后，主 Agent 可直接调用工具修复。）"
+            "（若计划项子代理超时，主 Agent 接管后即可直接调用工具修复。）"
         ),
     }
 
@@ -495,6 +709,29 @@ def test_run_subagent_disabled_returns_exact_message():
         "name": "run_subagent",
         "content": "🚨 子代理不能启动其他子代理。",
     }
+
+
+def test_run_subagent_hidden_timeout_is_not_forwarded_to_adapter(monkeypatch):
+    """模型伪造 schema 外参数时，时间预算仍必须由系统选择。"""
+    received = {}
+
+    def run_subagent(**kwargs):
+        received.update(kwargs)
+        return "done"
+
+    monkeypatch.setattr(llm, "run_subagent", run_subagent)
+
+    result = _call(
+        "run_subagent",
+        {
+            "task_description": "检查模块",
+            "subagent_type": "explore",
+            "timeout_seconds": 3600,
+        },
+    )
+
+    assert result["content"] == "done"
+    assert received["timeout_seconds"] is None
 
 
 def test_ask_user_cancellation_preserves_exact_result(monkeypatch):
@@ -1114,7 +1351,10 @@ def test_repeat_guard_exempt_blocks_side_effect_and_unknown_actions():
 def test_repeat_guard_exempt_keeps_plan_tools_exempt():
     from core.harness.tool_pipeline import repeat_guard_exempt
 
-    for name in ("plan_write", "plan_update", "plan_read", "plan_retry"):
+    for name in (
+        "plan_write", "plan_update", "plan_read", "plan_retry",
+        "plan_resume_takeover",
+    ):
         assert repeat_guard_exempt(name, {}) is True
     assert repeat_guard_exempt("read_file", {}) is False
 
@@ -1206,3 +1446,490 @@ def test_tool_result_journal_draft_contains_only_hashes_and_ordered_metadata():
     assert draft.result_status == "ok"
     assert not hasattr(draft, "arguments")
     assert not hasattr(draft, "result")
+
+
+def _fenced_owner_manager(monkeypatch):
+    """构造一个已超时终态的真实子代理任务，并接管进程级 manager。"""
+    import core.tools as tools_module
+    from core.tools import SubagentManager
+
+    release = threading.Event()
+    manager = SubagentManager(runner=lambda record: release.wait(1) and "unused")
+    background = manager.run(
+        "旧任务", "s1", "t1", timeout_seconds=30, run_in_background=True,
+    )
+    task_id = json.loads(background)["task_id"]
+    assert manager._terminate(task_id, "timed_out", "foreground timeout") is True
+    monkeypatch.setattr(tools_module, "subagent_manager", manager)
+    release.set()
+    return task_id
+
+
+def _fence_context(registry, permission_owner):
+    from core.harness.tool_pipeline import ToolExecutionContext
+
+    return ToolExecutionContext(
+        event_callback=None,
+        parent_session="s1",
+        parent_turn_id="t1",
+        cancel_event=None,
+        allow_subagents=True,
+        permission_owner=permission_owner,
+        permission_source="子代理",
+        permission_checker=lambda *_args, **_kwargs: True,
+        registry=registry,
+        mcp_manager=object(),
+    )
+
+
+def test_stale_subagent_owner_tools_are_fenced_before_permission(
+    tmp_path, monkeypatch
+):
+    """旧子 Agent 的延迟工具调用必须在权限询问与 adapter 之前返回取消错误。"""
+    from core.harness.tool_pipeline import ToolPipeline
+
+    executed = []
+
+    def _record(value):
+        executed.append(value)
+        return ToolResult("should-not-happen")
+
+    registry = ToolRegistry([
+        ToolSpec(
+            name="write_file",
+            description="write",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "file_path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+            },
+            execute=lambda file_path, content: _record(file_path),
+            mutates_files=True,
+        ),
+        ToolSpec(
+            name="read_file",
+            description="read",
+            input_schema={
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+            },
+            execute=lambda file_path: _record(file_path),
+            read_only=True,
+            requires_permission=False,
+        ),
+    ])
+    task_id = _fenced_owner_manager(monkeypatch)
+    context = _fence_context(registry, task_id)
+    pipeline = ToolPipeline()
+
+    write_message = pipeline.execute_one(
+        {
+            "id": "call-w",
+            "function": {
+                "name": "write_file",
+                "arguments": json.dumps({
+                    "file_path": str(tmp_path / "a.py"),
+                    "content": "x",
+                }),
+            },
+        },
+        context,
+    )
+    read_message = pipeline.execute_one(
+        {
+            "id": "call-r",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"file_path": str(tmp_path / "a.py")}),
+            },
+        },
+        context,
+    )
+
+    assert "已取消" in write_message["content"]
+    assert "已取消" in read_message["content"]
+    assert executed == []
+
+
+def test_active_subagent_owner_tools_are_not_fenced(tmp_path, monkeypatch):
+    """运行中的子代理租约有效，工具调用照常执行，不受 fencing 影响。"""
+    import core.tools as tools_module
+    from core.harness.tool_pipeline import ToolPipeline
+
+    release = threading.Event()
+    manager = tools_module.SubagentManager(
+        runner=lambda record: release.wait(1) and "unused",
+    )
+    background = manager.run(
+        "运行中任务", "s1", "t1", timeout_seconds=30, run_in_background=True,
+    )
+    task_id = json.loads(background)["task_id"]
+    monkeypatch.setattr(tools_module, "subagent_manager", manager)
+
+    executed = []
+    registry = ToolRegistry([
+        ToolSpec(
+            name="read_file",
+            description="read",
+            input_schema={
+                "type": "object",
+                "properties": {"file_path": {"type": "string"}},
+            },
+            execute=lambda file_path: (
+                executed.append(file_path),
+                ToolResult("content"),
+            )[1],
+            read_only=True,
+            requires_permission=False,
+        ),
+    ])
+    context = _fence_context(registry, task_id)
+    message = ToolPipeline().execute_one(
+        {
+            "id": "call-r",
+            "function": {
+                "name": "read_file",
+                "arguments": json.dumps({"file_path": str(tmp_path / "a.py")}),
+            },
+        },
+        context,
+    )
+
+    assert message["content"] == "content"
+    assert executed == [str(tmp_path / "a.py")]
+
+    assert manager._terminate(task_id, "cancelled", "test cleanup") is True
+    release.set()
+
+
+def _install_active_takeover(monkeypatch, *, item, turn, files=None):
+    """用生产调度 API 构造 active takeover 现场并路由默认单例。
+
+    只搭状态，不复制被测实现：接管字段全部经 start_delegated_item/
+    handoff_to_main 写入。
+    """
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    raw = {"id": item, "subject": item}
+    if files is not None:
+        raw["files"] = list(files)
+    plan.replace([raw])
+    scheduler = TaskScheduler(plan)
+    assert scheduler.start_delegated_item(
+        item, f"subagent-{item}", "subagent:implement", None
+    )
+    assert scheduler.handoff_to_main(item, f"subagent-{item}", turn, "timeout")
+    monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler", lambda: scheduler
+    )
+    llm._mark_plan_turn(turn)
+    return scheduler
+
+
+def test_main_takeover_allows_direct_mutation_for_current_turn(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
+    _install_active_takeover(monkeypatch, item="a", turn="turn-1")
+
+    result = _call(
+        "write_file",
+        {"file_path": str(tmp_path / "a.py"), "content": "x"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+
+    assert "必须通过 run_subagent" not in result["content"]
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "x"
+
+
+def test_takeover_does_not_unlock_other_turn_or_whole_plan(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
+    _install_active_takeover(monkeypatch, item="a", turn="turn-1")
+    # 新回合在计划未完成时同样会被标记为计划回合（生产路径 llm 调 _mark_plan_turn）
+    llm._mark_plan_turn("turn-2")
+
+    blocked = _call(
+        "write_file",
+        {"file_path": str(tmp_path / "b.py"), "content": "x"},
+        parent_session="session-1",
+        parent_turn_id="turn-2",
+    )
+
+    assert "必须通过 run_subagent" in blocked["content"]
+    assert not (tmp_path / "b.py").exists()
+
+
+def test_takeover_scoped_unlock_still_asks_in_confirm_mode(monkeypatch, tmp_path):
+    """scoped 放行只解除计划门禁，confirm 模式权限询问必须照常发生。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
+    _install_active_takeover(monkeypatch, item="a", turn="turn-1")
+    asked, requests = [], []
+    _auto_answer_pipeline_permission(monkeypatch, 0, asked, requests)
+
+    result = _call(
+        "write_file",
+        {"file_path": str(tmp_path / "c.py"), "content": "x"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+
+    assert "必须通过 run_subagent" not in result["content"]
+    assert asked == ["write_file"]
+    assert (tmp_path / "c.py").read_text(encoding="utf-8") == "x"
+
+
+def test_takeover_files_scope_restricts_write_targets(monkeypatch, tmp_path):
+    """计划项声明 files 时，接管期间的写文件只允许命中这些路径。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
+    _install_active_takeover(
+        monkeypatch, item="a", turn="turn-1", files=["allowed.py"]
+    )
+
+    allowed = _call(
+        "write_file",
+        {"file_path": str(tmp_path / "allowed.py"), "content": "x"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+    denied = _call(
+        "write_file",
+        {"file_path": str(tmp_path / "other.py"), "content": "x"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+
+    assert "必须通过 run_subagent" not in allowed["content"]
+    assert (tmp_path / "allowed.py").read_text(encoding="utf-8") == "x"
+    assert "计划接管约束" in denied["content"]
+    assert "allowed.py" in denied["content"]
+    assert not (tmp_path / "other.py").exists()
+
+
+def test_takeover_files_scope_canonicalizes_real_paths(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
+    _install_active_takeover(
+        monkeypatch, item="a", turn="turn-1", files=["allowed.py"]
+    )
+    realpath_calls = []
+    original_realpath = __import__("os").path.realpath
+
+    def recording_realpath(value, *args, **kwargs):
+        realpath_calls.append(str(value))
+        return original_realpath(value, *args, **kwargs)
+
+    monkeypatch.setattr("core.harness.tool_pipeline.os.path.realpath", recording_realpath)
+
+    denied = _call(
+        "write_file",
+        {"file_path": str(tmp_path / "other.py"), "content": "x"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+
+    assert "计划接管约束" in denied["content"]
+    assert any(path.endswith("allowed.py") for path in realpath_calls)
+    assert any(path.endswith("other.py") for path in realpath_calls)
+
+
+def test_non_task_owner_with_subagent_prefix_is_not_fenced(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "visible.txt"
+    target.write_text("visible", encoding="utf-8")
+
+    result = _call(
+        "read_file",
+        {"file_path": str(target)},
+        permission_owner="subagent-demo:12345678",
+        parent_turn_id="subagent-demo:12345678",
+    )
+
+    assert result["content"] == "visible"
+
+
+def test_fencing_lookup_failure_is_fail_closed_before_permission_and_adapter(
+    monkeypatch, tmp_path
+):
+    import core.tools as tools_module
+    from core.harness.tool_pipeline import STALE_EXECUTION_LEASE_TEXT
+
+    class BrokenLeaseManager:
+        def is_execution_lease_active(self, _task_id):
+            raise RuntimeError("lease registry unavailable")
+
+    permission_calls = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(tools_module, "subagent_manager", BrokenLeaseManager())
+    monkeypatch.setattr(
+        llm,
+        "check_permission_and_ask",
+        lambda *args, **kwargs: permission_calls.append((args, kwargs)) or True,
+    )
+    target = tmp_path / "must-not-read.txt"
+    target.write_text("secret", encoding="utf-8")
+
+    result = _call(
+        "read_file",
+        {"file_path": str(target)},
+        permission_owner="subagent-1234abcd",
+        parent_turn_id="child-turn",
+    )
+
+    assert result["content"] == STALE_EXECUTION_LEASE_TEXT
+    assert permission_calls == []
+
+
+def test_plan_finish_completes_active_takeover_and_promotes_next(
+    monkeypatch, tmp_path
+):
+    """active 接管项 plan_finish 成功后标记 completed 并 FIFO 提升下一排队项。"""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
+
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{"id": "a", "subject": "first"}, {"id": "b", "subject": "second"}])
+    scheduler = TaskScheduler(plan, max_workers=2)
+    assert scheduler.start_delegated_item("a", "subagent-aa1", "subagent:implement", None)
+    assert scheduler.start_delegated_item("b", "subagent-bb2", "subagent:implement", None)
+    assert scheduler.handoff_to_main("a", "subagent-aa1", "turn-1", "timeout")
+    assert scheduler.handoff_to_main("b", "subagent-bb2", "turn-1", "timeout")
+    monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler", lambda: scheduler
+    )
+    llm._mark_plan_turn("turn-1")
+
+    result = _call(
+        "plan_finish",
+        {"item_id": "a", "result": "修复完成"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+
+    assert "已完成" in result["content"]
+    items = {item["id"]: item for item in plan.snapshot()}
+    assert items["a"]["status"] == "completed"
+    assert items["b"]["status"] == "in_progress"
+    assert items["b"]["execution_mode"] == "main_takeover"
+    assert items["b"]["takeover_turn_id"] == "turn-1"
+
+
+def test_plan_finish_verification_failure_marks_failed_without_redelegation(
+    monkeypatch, tmp_path
+):
+    """verification 命令非零退出：计划项进入 failed，绝不重新委派。"""
+    import sys
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
+
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{
+        "id": "a",
+        "subject": "verify fail",
+        "verification_type": "command",
+        "verification": f'"{sys.executable}" -c "import sys; sys.exit(3)"',
+    }])
+    scheduler = TaskScheduler(plan)
+    assert scheduler.start_delegated_item("a", "subagent-aa1", "subagent:implement", None)
+    assert scheduler.handoff_to_main("a", "subagent-aa1", "turn-1", "timeout")
+    monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler", lambda: scheduler
+    )
+    llm._mark_plan_turn("turn-1")
+
+    result = _call(
+        "plan_finish",
+        {"item_id": "a", "result": "self-reported done"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+
+    assert "验证" in result["content"] or "失败" in result["content"]
+    item = plan.snapshot()[0]
+    assert item["status"] == "failed"
+    assert item["execution_mode"] == "main_takeover"
+    assert item["takeover_required"] is True
+
+    retry = _call(
+        "plan_retry",
+        {"item_id": "a", "force": True},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+    assert "plan_resume_takeover" in retry["content"]
+    assert plan.snapshot()[0]["status"] == "failed"
+
+    redelegation = _call(
+        "run_subagent",
+        {"task_description": "重新执行", "plan_item_id": "a"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+    blocked = json.loads(redelegation["content"])
+    assert blocked["status"] == "blocked"
+    assert blocked["reason"] == "main_takeover_required"
+    assert "plan_resume_takeover" in blocked["error"]
+
+    resume_events = []
+    resumed = _call(
+        "plan_resume_takeover",
+        {"item_id": "a"},
+        parent_session="session-1",
+        parent_turn_id="turn-2",
+        event_callback=lambda kind, payload: resume_events.append((kind, payload)),
+    )
+    assert "已恢复" in resumed["content"]
+    item = plan.snapshot()[0]
+    assert item["status"] == "in_progress"
+    assert item["execution_mode"] == "main_takeover"
+    assert item["takeover_turn_id"] == "turn-2"
+    assert item["attempts"] == 1
+    assert item["delegation_count"] == 1
+    handoffs = [
+        payload for kind, payload in resume_events
+        if kind == "plan_item_handoff"
+    ]
+    assert len(handoffs) == 1
+    assert handoffs[0]["item"]["id"] == "a"
+    assert handoffs[0]["mode"] == "main_takeover"
+    assert handoffs[0]["queue_position"] == 0
+
+
+def test_plan_resume_takeover_rejects_ordinary_item(monkeypatch):
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{"id": "ordinary", "subject": "普通项目", "status": "failed"}])
+    scheduler = TaskScheduler(plan)
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "accept_edits")
+    monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler", lambda: scheduler
+    )
+
+    result = _call(
+        "plan_resume_takeover",
+        {"item_id": "ordinary"},
+        parent_session="session-1",
+        parent_turn_id="turn-1",
+    )
+
+    assert "不是超时接管项" in result["content"]
+    assert plan.snapshot()[0]["status"] == "failed"

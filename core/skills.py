@@ -41,7 +41,7 @@ def _builtin_skills_dir():
 
 def _builtin_released_file():
     """记录已释放过的内置技能名：区分"从未释放"与"用户已删除"，防止重启后复活。"""
-    return os.path.join(os.path.expanduser("~"), ".ycode", "builtin_skills_released.json")
+    return os.path.join(config.YCODE_DIR, "builtin_skills_released.json")
 
 
 def sync_builtin_skills():
@@ -69,7 +69,7 @@ def _sync_builtin_skills_impl():
     src = _builtin_skills_dir()
     if not os.path.isdir(src):
         return
-    dest_base = os.path.join(os.path.expanduser("~"), ".ycode", "skills")
+    dest_base = os.path.join(config.YCODE_DIR, "skills")
     try:
         released = config._read_json_with_backup(_builtin_released_file(), default=[])
     except Exception:
@@ -192,7 +192,7 @@ def get_skill_dirs():
         dirs.append(p)
 
     # 1. 用户级全局目录（属于 Y-code 自己的数据目录，允许自动创建）
-    global_skills = os.path.join(user_home, ".ycode", "skills")
+    global_skills = os.path.join(config.YCODE_DIR, "skills")
     if not os.path.exists(global_skills):
         try:
             os.makedirs(global_skills, exist_ok=True)

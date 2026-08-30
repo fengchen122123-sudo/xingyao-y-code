@@ -1,6 +1,8 @@
 import pytest
 import json
 import threading
+import time
+from collections import deque
 from unittest.mock import ANY
 from types import SimpleNamespace
 from pathlib import Path
@@ -14,6 +16,20 @@ from core.tools import (
     read_file,
     write_file,
 )
+
+
+def test_subagent_task_id_validation_is_strict():
+    from core.tools import is_subagent_task_id
+
+    assert is_subagent_task_id("subagent-1234abcd") is True
+    for value in (
+        "subagent-demo:12345678",
+        "subagent-1234ABCd",
+        "subagent-1234abc",
+        "prefix-subagent-1234abcd",
+        "subagent-1234abcd-extra",
+    ):
+        assert is_subagent_task_id(value) is False
 
 
 def _wait_until(condition, timeout=5.0, interval=0.02):
@@ -344,6 +360,75 @@ def test_foreground_subagent_waits_and_returns_public_result():
     ]
 
 
+def test_subagent_write_is_recorded_in_parent_turn_checkpoint(tmp_path, monkeypatch):
+    from core.memory import begin_turn_checkpoint, end_turn_checkpoint
+
+    monkeypatch.chdir(tmp_path)
+    target = tmp_path / "subagent-owned.txt"
+    target.write_bytes(b"before")
+    begin_turn_checkpoint("checkpoint-session", "checkpoint-turn", 0)
+
+    def runner(_record):
+        assert "写入成功" in write_file(str(target), "after")
+        return "子代理写入完成"
+
+    try:
+        result = SubagentManager(runner=runner).run(
+            "修改文件",
+            "checkpoint-session",
+            "checkpoint-turn",
+            timeout_seconds=30,
+        )
+    finally:
+        checkpoint = end_turn_checkpoint()
+
+    assert result == "子代理写入完成"
+    assert checkpoint["file_snapshots"] == [{
+        "file_path": str(target),
+        "old_content": "before",
+        "existed_before": True,
+        "old_bytes": b"before",
+    }]
+
+
+def test_completed_parent_checkpoint_rejects_late_subagent_snapshot(tmp_path):
+    from core.memory import (
+        begin_turn_checkpoint,
+        bind_turn_checkpoint,
+        clear_turn_checkpoint_binding,
+        end_turn_checkpoint,
+        record_file_snapshot_for_current_turn,
+    )
+
+    bound = threading.Event()
+    continue_after_parent_commit = threading.Event()
+    begin_turn_checkpoint("late-session", "late-turn", 0)
+
+    def late_subagent():
+        try:
+            assert bind_turn_checkpoint("late-session", "late-turn") is True
+            bound.set()
+            assert continue_after_parent_commit.wait(timeout=10)
+            record_file_snapshot_for_current_turn(
+                str(tmp_path / "late.txt"),
+                "before",
+                existed_before=True,
+                old_bytes=b"before",
+            )
+        finally:
+            clear_turn_checkpoint_binding()
+
+    thread = threading.Thread(target=late_subagent, daemon=True)
+    thread.start()
+    assert bound.wait(timeout=10)
+    checkpoint = end_turn_checkpoint()
+    continue_after_parent_commit.set()
+    thread.join(timeout=10)
+
+    assert not thread.is_alive()
+    assert checkpoint["file_snapshots"] == []
+
+
 def test_subagent_records_role_and_plan_item():
     manager = SubagentManager(runner=lambda record: "完成")
 
@@ -379,6 +464,65 @@ def test_subagent_terminal_callback_receives_real_result():
 
     assert result == "真实结果"
     assert completed == [("item-1", "completed", "真实结果", "")]
+
+
+def test_completed_callback_claim_blocks_cancel_idle_and_prune_until_done():
+    """completed 回调一旦被认领，取消不得二次回调；finalizing 仍属于 active。"""
+    entered = threading.Event()
+    release = threading.Event()
+    callbacks = []
+    plan_terminal = []
+
+    def terminal_callback(_task, status, _result, _error):
+        callbacks.append(status)
+        entered.set()
+        assert release.wait(2.0)
+        plan_terminal.append(status)
+
+    manager = SubagentManager(runner=lambda _record: "完成")
+    run_thread = threading.Thread(
+        target=manager.run,
+        args=("执行任务", "s-finalize", "turn-finalize"),
+        kwargs={"timeout_seconds": 30, "terminal_callback": terminal_callback},
+        daemon=True,
+    )
+    run_thread.start()
+    assert entered.wait(2.0)
+    task = next(iter(manager._tasks.values()))
+
+    cancel_results = []
+    cancel_thread = threading.Thread(
+        target=lambda: cancel_results.append(
+            manager.cancel_foreground("s-finalize", "turn-finalize")
+        ),
+        daemon=True,
+    )
+    cancel_thread.start()
+    time.sleep(0.05)
+
+    try:
+        callbacks_while_blocked = list(callbacks)
+        active_while_blocked = manager.get_active_count()
+        idle_while_blocked = manager.wait_for_idle(0)
+        with manager._lock:
+            manager._prune_completed_locked()
+            retained_while_blocked = task.task_id in manager._tasks
+            # 旧实现可能错误清掉 finalizing 记录；补回仅用于让测试线程安全收尾。
+            manager._tasks.setdefault(task.task_id, task)
+    finally:
+        release.set()
+        run_thread.join(timeout=2.0)
+        cancel_thread.join(timeout=2.0)
+
+    assert callbacks_while_blocked == ["completed"]
+    assert active_while_blocked == 1
+    assert idle_while_blocked is False
+    assert retained_while_blocked is True
+    assert callbacks == ["completed"]
+    assert plan_terminal == ["completed"]
+    assert manager.snapshot()[0].status == "completed"
+    assert task.done_event.is_set()
+    assert manager.get_active_count() == 0
 
 
 def test_subagent_structured_tool_failure_cannot_complete():
@@ -1241,6 +1385,154 @@ def test_parent_cancel_marks_foreground_task_cancelled():
     assert manager.snapshot()[0].status == "cancelled"
 
 
+def test_timeout_sets_cancel_before_handoff_callback():
+    """超时移交前必须先取消旧子代理：回调执行时 cancel_event 必须已置位。"""
+    seen = {}
+
+    def terminal_callback(task, status, _result, _error):
+        seen["status"] = status
+        seen["cancelled"] = task.cancel_event.is_set()
+
+    manager = SubagentManager(
+        runner=lambda record: record.cancel_event.wait(1),
+        monotonic=FakeMonotonic([0.0, 31.0]),
+        wait_interval=0.001,
+    )
+    manager.run(
+        "slow", "s", "t", timeout_seconds=30,
+        terminal_callback=terminal_callback,
+    )
+    assert seen == {"status": "timed_out", "cancelled": True}
+
+
+def test_run_subagent_timeout_hands_off_plan_item_to_main(monkeypatch):
+    """计划项子代理首次超时：原计划项移交主 Agent，不进入 failed/retry。"""
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{"id": "task-1", "subject": "超时任务"}])
+    scheduler = TaskScheduler(plan)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler", lambda: scheduler
+    )
+    monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
+
+    slow_manager = SubagentManager(
+        runner=lambda record: record.cancel_event.wait(1),
+        monotonic=FakeMonotonic([0.0, 31.0]),
+        wait_interval=0.001,
+    )
+    monkeypatch.setattr(tools_module, "subagent_manager", slow_manager)
+
+    result = tools_module.run_subagent(
+        "慢任务",
+        parent_session="s-handoff",
+        parent_turn_id="turn-h1",
+        plan_item_id="task-1",
+        subagent_type="implement",
+        timeout_seconds=30,
+    )
+
+    payload = json.loads(result)
+    assert payload["status"] == "timed_out"
+    assert payload["handoff"] == "main_takeover"
+    assert payload["plan_item_id"] == "task-1"
+    assert payload["inspection_required"] is True
+    item = plan.snapshot()[0]
+    assert item["status"] == "in_progress"
+    assert item["execution_mode"] == "main_takeover"
+    assert item["takeover_turn_id"] == "turn-h1"
+    assert item["attempts"] == 1
+    assert item["handoff_task_id"] == payload["task_id"]
+    assert item["handoff_task_id"].startswith("subagent-")
+
+
+def test_run_subagent_rejects_redelegation_after_timeout_takeover(monkeypatch):
+    """接管中的计划项禁止重新派发子代理（timed_out → takeover ≠ retry）。"""
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{"id": "item", "subject": "same work"}])
+    scheduler = TaskScheduler(plan)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler", lambda: scheduler
+    )
+    monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
+
+    # 用生产调度 API 构造首次超时后的接管现场
+    assert scheduler.start_delegated_item(
+        "item", "subagent-abcd1234", "subagent:implement", None
+    ) is True
+    assert scheduler.handoff_to_main(
+        "item", "subagent-abcd1234", "turn-1", "foreground timeout"
+    ) is not None
+
+    class UnusedManager:
+        def run(self, *args, **kwargs):
+            raise AssertionError("接管中的计划项不得再次派发子代理")
+
+    monkeypatch.setattr(tools_module, "subagent_manager", UnusedManager())
+
+    result = tools_module.run_subagent(
+        "retry same work",
+        parent_session="s",
+        parent_turn_id="t",
+        plan_item_id="item",
+        subagent_type="implement",
+    )
+    payload = json.loads(result)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "main_takeover_required"
+    item = plan.snapshot()[0]
+    assert item["status"] == "in_progress"
+    assert item["execution_mode"] == "main_takeover"
+
+
+def test_run_subagent_rejects_redelegation_of_queued_takeover(monkeypatch):
+    """排队等待接管的计划项同样禁止重新派发。"""
+    import core.tools as tools_module
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([
+        {"id": "first", "subject": "first"},
+        {"id": "second", "subject": "second"},
+    ])
+    scheduler = TaskScheduler(plan, max_workers=2)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler", lambda: scheduler
+    )
+    monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
+
+    for item_id, source in (("first", "subagent-aaa1"), ("second", "subagent-bbb2")):
+        assert scheduler.start_delegated_item(
+            item_id, source, "subagent:implement", None
+        ) is True
+    assert scheduler.handoff_to_main(
+        "first", "subagent-aaa1", "turn-1", "timeout"
+    ) is not None
+    assert scheduler.handoff_to_main(
+        "second", "subagent-bbb2", "turn-1", "timeout"
+    ) is not None
+
+    result = tools_module.run_subagent(
+        "retry queued",
+        parent_session="s",
+        parent_turn_id="t",
+        plan_item_id="second",
+        subagent_type="implement",
+    )
+    payload = json.loads(result)
+    assert payload["status"] == "blocked"
+    assert payload["reason"] == "main_takeover_required"
+    assert plan.snapshot()[1]["execution_mode"] == "takeover_queued"
+
+
 @pytest.mark.parametrize(
     "runner",
     [
@@ -1360,6 +1652,51 @@ def test_manage_task_kill_passes_permission_context(monkeypatch):
     assert captured["permission_owner"] == "owner-1"
     assert captured["cancel_event"] is cancel_event
     assert captured["event_callback"] is not None
+
+
+@pytest.mark.parametrize(
+    "result_constant,expected_fragment",
+    [
+        ("KILL_RESULT_KILLED", "已被强行终结清除"),
+        ("KILL_RESULT_NATURAL_DEATH", "已自行结束"),
+        ("KILL_RESULT_NOT_FOUND", "未找到任务"),
+        ("KILL_RESULT_FAILED", "仍在运行"),
+    ],
+)
+def test_manage_task_kill_messages_match_kill_result(monkeypatch, result_constant, expected_fragment):
+    """kill 结果分类必须映射到准确文案：自然死亡不得误报为"终止失败"。"""
+    import core.tools as tools_module
+    import core.task_manager as task_manager_module
+
+    monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        task_manager_module,
+        "kill_background_task_detailed",
+        lambda task_id: getattr(task_manager_module, result_constant),
+    )
+
+    result = tools_module.manage_task("kill", task_id="t1")
+
+    assert expected_fragment in result
+    if result_constant == "KILL_RESULT_NATURAL_DEATH":
+        assert "失败" not in result
+
+
+def test_manage_task_kill_identity_unverifiable_message(monkeypatch):
+    """无法校验进程身份时的保守拒绝也应有专属文案，而不是笼统的终止失败。"""
+    import core.tools as tools_module
+    import core.task_manager as task_manager_module
+
+    monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *args, **kwargs: True)
+    monkeypatch.setattr(
+        task_manager_module,
+        "kill_background_task_detailed",
+        lambda task_id: task_manager_module.KILL_RESULT_IDENTITY_UNVERIFIABLE,
+    )
+
+    result = tools_module.manage_task("kill", task_id="t1")
+
+    assert "无法校验进程身份" in result
 
 
 def test_file_tools_reject_paths_outside_workspace(tmp_path, monkeypatch):
@@ -2073,13 +2410,19 @@ def test_run_subagent_resolves_per_role_default_timeout(monkeypatch):
         )
         assert captured["timeout_seconds"] == expected, role
 
-    # 显式传入时以显式值为准
+    # 显式传入时以显式值为准，但受前台硬上限 600 秒约束（Task 8）
     captured.clear()
     tools_module.run_subagent(
         "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
-        subagent_type="explore", timeout_seconds=3600,
+        subagent_type="explore", timeout_seconds=600,
     )
-    assert captured["timeout_seconds"] == 3600
+    assert captured["timeout_seconds"] == 600
+    captured.clear()
+    tools_module.run_subagent(
+        "任务", parent_session="s-timeout", parent_turn_id="t-timeout",
+        subagent_type="explore", timeout_seconds=601,
+    )
+    assert "timeout_seconds" not in captured
 
 
 def test_run_subagent_surfaces_real_verification_error(monkeypatch):
@@ -3276,6 +3619,7 @@ def isolated_task_manager(tmp_path, monkeypatch):
     monkeypatch.setattr(tm, "_LOADED", True)
     monkeypatch.setattr(tm, "ACTIVE_TASKS", {})
     monkeypatch.setattr(tm, "_REMOVED_TIDS", set())
+    monkeypatch.setattr(tm, "_REMOVED_TIDS_FIFO", deque(), raising=False)
     yield tm
     # 清理：杀掉测试遗留的后台进程，避免泄漏真实子进程
     for tid in list(tm.ACTIVE_TASKS):
@@ -3431,6 +3775,68 @@ def test_wait_cancel_event_interrupts_immediately(isolated_task_manager):
         tm.kill_background_task(tid)
 
 
+def test_background_command_attributes_launching_thread_session(isolated_task_manager):
+    """后台命令任务归属：发起回合的线程绑定优先于进程级"UI 当前查看的会话"。
+
+    回归：GUI 草稿会话首条消息流程不更新进程级 current_session，旧实现兜底
+    取它导致 A 会话发起的后台命令总结被误注入 B 会话（B 是切换前真实会话）。
+    """
+    import re as _re
+
+    import core.app_context as app_context
+    from core import tool_cache
+
+    tm = isolated_task_manager
+    original_current = app_context.get_current_session()
+    app_context.set_current_session("分析一下当前目录代码中有")
+    app_context.set_thread_session("请在项目E盘执行修复计划")
+    tool_cache.set_current_session(None)
+    try:
+        result = execute_command(
+            _py_cmd("import time; time.sleep(30)"), run_in_background=True
+        )
+        m = _re.search(r"任务 ID: ([0-9a-f]{8})", result)
+        assert m, result
+        assert tm.ACTIVE_TASKS[m.group(1)]["session_id"] == "请在项目E盘执行修复计划"
+    finally:
+        for tid in list(tm.ACTIVE_TASKS):
+            try:
+                tm.kill_background_task(tid)
+            except Exception:
+                pass
+        app_context.set_thread_session(None)
+        app_context.set_current_session(original_current)
+
+
+def test_background_command_falls_back_to_visible_session(isolated_task_manager):
+    """无线程绑定时（CLI 主流程）保持原行为：兜底进程级当前会话。"""
+    import re as _re
+
+    import core.app_context as app_context
+    from core import tool_cache
+
+    tm = isolated_task_manager
+    original_current = app_context.get_current_session()
+    app_context.set_current_session("cli-session")
+    app_context.set_thread_session(None)
+    tool_cache.set_current_session(None)
+    try:
+        result = execute_command(
+            _py_cmd("import time; time.sleep(30)"), run_in_background=True
+        )
+        m = _re.search(r"任务 ID: ([0-9a-f]{8})", result)
+        assert m, result
+        assert tm.ACTIVE_TASKS[m.group(1)]["session_id"] == "cli-session"
+    finally:
+        for tid in list(tm.ACTIVE_TASKS):
+            try:
+                tm.kill_background_task(tid)
+            except Exception:
+                pass
+        app_context.set_thread_session(None)
+        app_context.set_current_session(original_current)
+
+
 def test_manage_task_status_and_list_return_stable_json(isolated_task_manager):
     from core.tools import manage_task
 
@@ -3464,11 +3870,194 @@ def test_manage_task_wait_validates_arguments(isolated_task_manager):
     tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
     try:
         assert manage_task("wait", after_revision=0).startswith("🚨")
-        assert manage_task("wait", task_id=tid).startswith("🚨")
+        # 缺省 after_revision 不再报错：按 0 处理（首次等待），无输出时超时返回
+        result = manage_task("wait", task_id=tid, timeout_seconds=1)
+        assert not result.startswith("🚨")
+        assert json.loads(result)["changed"] is False
         assert manage_task("wait", task_id=tid, after_revision=-1).startswith("🚨")
         assert manage_task("wait", task_id=tid, after_revision="abc").startswith("🚨")
         assert manage_task("wait", task_id="不存在id", after_revision=0).startswith("🚨")
         assert manage_task("status", task_id="不存在id").startswith("🚨")
+    finally:
+        tm.kill_background_task(tid)
+
+
+def test_manage_task_wait_shell_defaults_after_revision_to_zero(isolated_task_manager):
+    """P0-2：shell wait 缺省 after_revision 按 0 处理，阻塞到首条输出出现。"""
+    from core.tools import manage_task
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(
+        _py_cmd("import time; time.sleep(1.0); print('marker-default-rev', flush=True); time.sleep(30)")
+    )
+    try:
+        result = manage_task("wait", task_id=tid, timeout_seconds=10)
+        payload = json.loads(result)
+        assert payload["changed"] is True
+        assert payload["revision"] > 0
+        assert "marker-default-rev" in payload["output"]
+    finally:
+        tm.kill_background_task(tid)
+
+
+def _bridge_manager(monkeypatch, runner):
+    """构造隔离的 SubagentManager 并替换模块单例，供 manage_task 桥接测试使用。"""
+    import core.tools as tools_module
+
+    manager = SubagentManager(runner=runner, wait_interval=0.02)
+    monkeypatch.setattr(tools_module, "subagent_manager", manager)
+    return manager
+
+
+def test_manage_task_status_and_wait_route_subagent(monkeypatch):
+    """P0-1：subagent-* ID 路由到 SubagentManager，wait 终态返回 result 摘要。"""
+    import core.tools as tools_module
+    from core.tools import manage_task
+
+    release = threading.Event()
+
+    def runner(_record):
+        release.wait(timeout=5)
+        return "审查结论：改动可以提交"
+
+    manager = _bridge_manager(monkeypatch, runner)
+    start_result = manager.run(
+        "审查未提交改动", "bridge-session", "bridge-turn",
+        run_in_background=True, timeout_seconds=30,
+    )
+    task_id = json.loads(start_result)["task_id"]
+    try:
+        # run() 返回只代表启动线程已提交，工作线程置 running 是异步的，需轮询
+        assert _wait_until(
+            lambda: json.loads(
+                manage_task("status", task_id=task_id)
+            )["status"] == "running"
+        )
+        status_payload = json.loads(manage_task("status", task_id=task_id))
+        assert status_payload["kind"] == "subagent"
+        assert status_payload["task_id"] == task_id
+        assert status_payload["status"] == "running"
+        assert status_payload["terminal"] is False
+        assert status_payload["subagent_type"] == "general"
+        assert "changed" not in status_payload  # status 省略 changed 键（wait 必含）
+
+        release.set()
+        wait_payload = json.loads(manage_task("wait", task_id=task_id, timeout_seconds=10))
+        assert wait_payload["kind"] == "subagent"
+        assert wait_payload["terminal"] is True
+        assert wait_payload["status"] == "completed"
+        assert wait_payload["changed"] is True
+        assert "审查结论：改动可以提交" in wait_payload["result"]
+    finally:
+        release.set()
+        manager.shutdown(timeout=5)
+
+
+def test_manage_task_wait_subagent_ignores_after_revision_and_unknown(monkeypatch):
+    """子代理 wait 不要求 after_revision（传入则忽略）；未知 ID 返回未找到。"""
+    from core.tools import manage_task
+
+    manager = _bridge_manager(monkeypatch, lambda _record: "完成")
+    assert manage_task("wait", task_id="subagent-00000000", timeout_seconds=1).startswith("🚨")
+    assert manage_task(
+        "wait", task_id="subagent-00000000", after_revision=0, timeout_seconds=1
+    ).startswith("🚨")
+    assert manage_task("status", task_id="subagent-00000000").startswith("🚨")
+
+
+def test_manage_task_list_merges_shell_and_subagent(isolated_task_manager, monkeypatch):
+    """list 合并展示两类运行中任务，kind 字段区分 shell 与 subagent。"""
+    from core.tools import manage_task
+
+    tm = isolated_task_manager
+    shell_tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    release = threading.Event()
+
+    def runner(_record):
+        release.wait(timeout=5)
+        return "完成"
+
+    manager = _bridge_manager(monkeypatch, runner)
+    sub_tid = json.loads(manager.run(
+        "后台审查", "merge-session", "merge-turn",
+        run_in_background=True, timeout_seconds=30,
+    ))["task_id"]
+    try:
+        payload = json.loads(manage_task("list"))
+        kinds = {t["task_id"]: t["kind"] for t in payload["tasks"]}
+        assert kinds[shell_tid] == "shell"
+        assert kinds[sub_tid] == "subagent"
+        sub_entry = next(t for t in payload["tasks"] if t["task_id"] == sub_tid)
+        assert sub_entry["terminal"] is False
+        assert "result" not in sub_entry  # list 不附结果，收割走 status/wait
+    finally:
+        release.set()
+        manager.shutdown(timeout=5)
+        tm.kill_background_task(shell_tid)
+
+
+def test_manage_task_kill_subagent_uses_cooperative_cancel(monkeypatch):
+    """kill 子代理走协作式 cancel 且保留用户确认；拒绝路径不触碰任务。"""
+    import core.tools as tools_module
+    from core.tools import manage_task
+
+    release = threading.Event()
+
+    def runner(_record):
+        release.wait(timeout=5)
+        return "完成"
+
+    manager = _bridge_manager(monkeypatch, runner)
+    task_id = json.loads(manager.run(
+        "待取消任务", "kill-session", "kill-turn",
+        run_in_background=True, timeout_seconds=30,
+    ))["task_id"]
+    try:
+        # 拒绝路径：不弹确认通过，任务保持运行
+        monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *a, **k: False)
+        assert manage_task("kill", task_id=task_id).startswith("🚨 用户拒绝")
+        assert manager.task_snapshot(task_id).status == "running"
+
+        # 批准路径：协作式取消进入 cancelled 终态
+        monkeypatch.setattr("core.llm.check_permission_and_ask", lambda *a, **k: True)
+        result = manage_task("kill", task_id=task_id)
+        assert result.startswith("✔"), result
+        assert _wait_until(
+            lambda: manager.task_snapshot(task_id).status == "cancelled"
+        )
+    finally:
+        release.set()
+        manager.shutdown(timeout=5)
+
+
+@pytest.mark.parametrize("value", [0, 61, "abc", True, 1.5])
+def test_manage_task_wait_rejects_invalid_timeout(isolated_task_manager, value):
+    from core.tools import manage_task
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    try:
+        result = manage_task(
+            "wait", task_id=tid, after_revision=0, timeout_seconds=value
+        )
+        assert result.startswith("🚨")
+    finally:
+        tm.kill_background_task(tid)
+
+
+@pytest.mark.parametrize("value", [-1, "abc", True, 1.5])
+def test_manage_task_wait_rejects_invalid_after_revision(
+    isolated_task_manager, value
+):
+    from core.tools import manage_task
+
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
+    try:
+        result = manage_task(
+            "wait", task_id=tid, after_revision=value, timeout_seconds=1
+        )
+        assert result.startswith("🚨")
     finally:
         tm.kill_background_task(tid)
 
@@ -3489,6 +4078,28 @@ def test_background_tasks_fingerprint_tracks_task_state(isolated_task_manager):
     assert tm.background_tasks_fingerprint() != fp_running
 
 
+def test_background_fingerprint_syncs_restored_dead_task(isolated_task_manager):
+    tm = isolated_task_manager
+    tm.ACTIVE_TASKS["restored1"] = {
+        "id": "restored1",
+        "command": "restored",
+        "pid": 99999999,
+        "process": None,
+        "start_time": time.time(),
+        "create_time": None,
+        "status": tm.TASK_STATUS_RUNNING,
+        "exit_code": None,
+        "revision": 0,
+        "last_log_size": 0,
+    }
+    before = tm.background_tasks_fingerprint()
+    snap = tm.get_task_snapshot("restored1")
+    after = tm.background_tasks_fingerprint()
+
+    assert snap.terminal is True
+    assert before == after
+
+
 def test_kill_marks_task_cancelled_and_keeps_record(isolated_task_manager):
     tm = isolated_task_manager
     tid = tm.start_background_task(_py_cmd("import time; time.sleep(30)"))
@@ -3501,3 +4112,306 @@ def test_kill_marks_task_cancelled_and_keeps_record(isolated_task_manager):
     assert snap.terminal is True
     assert snap.revision > rev0
     assert tid not in {t["task_id"] for t in tm.list_active_tasks()}
+
+
+def test_natural_terminal_task_is_not_merged_back_into_tasks_file(
+    isolated_task_manager, tmp_path
+):
+    tm = isolated_task_manager
+    tid = tm.start_background_task(_py_cmd("pass"))
+    assert _wait_until(lambda: tm.get_task_snapshot(tid).terminal, timeout=10)
+    tm._save_tasks()
+    saved = json.loads(Path(tm.TASK_DB_PATH).read_text(encoding="utf-8"))
+    assert tid not in saved
+
+
+def test_snapshot_api_evicts_terminal_records_at_cap(isolated_task_manager, tmp_path):
+    tm = isolated_task_manager
+    log_file_path = tmp_path / "terminal-record.log"
+    log_file_path.write_text("", encoding="utf-8")
+    for index in range(tm._TERMINAL_KEEP_CAP + 1):
+        tid = f"term{index:04d}"
+        tm.ACTIVE_TASKS[tid] = {
+            "id": tid,
+            "command": "finished",
+            "pid": None,
+            "process": None,
+            "start_time": index,
+            "log_file_path": str(log_file_path),
+            "status": tm.TASK_STATUS_COMPLETED,
+            "exit_code": 0,
+            "revision": 1,
+            "last_log_size": 0,
+        }
+    snapshots = tm.list_task_snapshots()
+    assert len([snap for snap in snapshots if snap.terminal]) == tm._TERMINAL_KEEP_CAP
+    assert "term0000" not in tm.ACTIVE_TASKS
+
+
+def test_removed_tombstones_drop_oldest_instead_of_clearing_all(isolated_task_manager):
+    tm = isolated_task_manager
+    for index in range(tm._REMOVED_TIDS_CAP + 1):
+        tm._record_removed_locked(f"task{index:04d}")
+    assert len(tm._REMOVED_TIDS) == tm._REMOVED_TIDS_CAP
+    assert "task0000" not in tm._REMOVED_TIDS
+    assert f"task{tm._REMOVED_TIDS_CAP:04d}" in tm._REMOVED_TIDS
+
+
+def test_watcher_initial_poll_error_reports_failed_callback(
+    isolated_task_manager, tmp_path, monkeypatch
+):
+    tm = isolated_task_manager
+
+    class PollRaisesProcess:
+        def poll(self):
+            raise RuntimeError("poll failed")
+
+    log_file_path = tmp_path / "task_pollerr1.log"
+    log_file_path.write_text("", encoding="utf-8")
+    process = PollRaisesProcess()
+    callbacks = []
+    monkeypatch.setattr(tm, "_on_task_finished", lambda *args: callbacks.append(args))
+    tm.ACTIVE_TASKS["pollerr1"] = {
+        "id": "pollerr1",
+        "command": "broken poll",
+        "pid": None,
+        "process": process,
+        "start_time": time.time(),
+        "log_file_path": str(log_file_path),
+        "status": tm.TASK_STATUS_RUNNING,
+        "exit_code": None,
+        "revision": 0,
+        "last_log_size": 0,
+    }
+    tm._watch_task_completion("pollerr1", process, "cmd", "session")
+    snap = tm.get_task_snapshot("pollerr1")
+    assert snap.status == tm.TASK_STATUS_FAILED
+    assert snap.terminal is True
+    assert snap.exit_code is None
+    assert len(callbacks) == 1
+    assert callbacks[0][2] == -1
+
+
+def test_watcher_sync_poll_error_stops_before_a_third_poll(
+    isolated_task_manager, tmp_path, monkeypatch
+):
+    tm = isolated_task_manager
+
+    class FirstPollReturnsThenSyncPollRaises:
+        def __init__(self):
+            self.calls = 0
+
+        def poll(self):
+            self.calls += 1
+            if self.calls == 1:
+                return None
+            raise RuntimeError("sync poll failed")
+
+    log_file_path = tmp_path / "task_pollerr2.log"
+    log_file_path.write_text("", encoding="utf-8")
+    process = FirstPollReturnsThenSyncPollRaises()
+    callbacks = []
+    monkeypatch.setattr(tm, "_on_task_finished", lambda *args: callbacks.append(args))
+    monkeypatch.setattr(tm.time, "sleep", lambda _seconds: None)
+    tm.ACTIVE_TASKS["pollerr2"] = {
+        "id": "pollerr2",
+        "command": "broken sync poll",
+        "pid": None,
+        "process": process,
+        "start_time": time.time(),
+        "log_file_path": str(log_file_path),
+        "status": tm.TASK_STATUS_RUNNING,
+        "exit_code": None,
+        "revision": 0,
+        "last_log_size": 0,
+    }
+
+    tm._watch_task_completion("pollerr2", process, "cmd", "session")
+
+    snap = tm.get_task_snapshot("pollerr2")
+    assert snap.status == tm.TASK_STATUS_FAILED
+    assert snap.terminal is True
+    assert snap.exit_code is None
+    assert process.calls == 2
+    assert len(callbacks) == 1
+    assert callbacks[0][2] == -1
+
+
+def test_plan_finish_rejects_wrong_turn_non_active_and_queued(monkeypatch):
+    """plan_finish 只接受本回合 active 接管项；其余一律拒绝。"""
+    from core.plan import PlanManager, plan_finish
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([
+        {"id": "active", "subject": "active"},
+        {"id": "queued", "subject": "queued"},
+        {"id": "plain", "subject": "plain"},
+    ])
+    scheduler = TaskScheduler(plan, max_workers=3)
+    monkeypatch.setattr(
+        "core.task_scheduler.get_default_scheduler", lambda: scheduler
+    )
+    monkeypatch.setattr("core.plan.get_default_plan_manager", lambda: plan)
+
+    assert scheduler.start_delegated_item(
+        "active", "subagent-act1", "subagent:implement", None
+    ) is True
+    assert scheduler.start_delegated_item(
+        "queued", "subagent-que2", "subagent:implement", None
+    ) is True
+    assert scheduler.handoff_to_main(
+        "active", "subagent-act1", "turn-1", "timeout"
+    ) is not None
+    assert scheduler.handoff_to_main(
+        "queued", "subagent-que2", "turn-1", "timeout"
+    ) is not None
+
+
+    # 错误 turn：接管租约绑定 turn-1
+    wrong_turn = plan_finish(
+        "active", "done", parent_turn_id="turn-2",
+    )
+    assert wrong_turn.startswith("🚨")
+    # queued 项拒绝
+    queued = plan_finish("queued", "done", parent_turn_id="turn-1")
+    assert queued.startswith("🚨")
+    # 未接管的普通项拒绝
+    plain = plan_finish("plain", "done", parent_turn_id="turn-1")
+    assert plain.startswith("🚨")
+    # 缺少运行上下文拒绝
+    no_turn = plan_finish("active", "done", parent_turn_id=None)
+    assert no_turn.startswith("🚨")
+
+    items = {item["id"]: item for item in plan.snapshot()}
+    assert items["active"]["status"] == "in_progress"
+    assert items["queued"]["status"] == "in_progress"
+    assert items["plain"]["status"] == "pending"
+
+
+def test_plan_finish_schema_hides_runtime_context():
+    """plan_finish 模型可见 schema 只暴露 item_id/result，运行上下文由 adapter 注入。"""
+    from core.tool_registry import build_default_registry
+
+    schema = (
+        build_default_registry().get("plan_finish")
+        .api_schema()["function"]["parameters"]
+    )
+    assert set(schema["properties"]) == {"item_id", "result"}
+    assert set(schema["required"]) == {"item_id", "result"}
+
+
+def test_run_subagent_rejects_oversized_description(monkeypatch):
+    """task_description 超过 6000 字符：明确失败，不截断、不静默改写。"""
+    import core.tools as tools_module
+
+    result = tools_module.run_subagent(
+        "x" * 6001, parent_session="s", parent_turn_id="t",
+    )
+    payload = json.loads(result)
+    assert payload["status"] == "failed"
+    assert "6000" in payload["error"]
+
+
+def test_run_subagent_enforces_foreground_hard_timeout(monkeypatch):
+    """前台子代理硬上限 600 秒：内部调用传 601 返回参数错误，不启动子代理。"""
+    import core.tools as tools_module
+
+    class UnusedManager:
+        def run(self, *args, **kwargs):
+            raise AssertionError("前台硬上限拦截后不得启动子代理")
+
+    monkeypatch.setattr(tools_module, "subagent_manager", UnusedManager())
+    result = tools_module.run_subagent(
+        "长任务", parent_session="s", parent_turn_id="t", timeout_seconds=601,
+    )
+    payload = json.loads(result)
+    assert payload["status"] == "failed"
+    assert "600" in payload["error"]
+    assert "manage_task" in payload["error"]
+
+
+def test_internal_run_subagent_keeps_explicit_foreground_timeout(monkeypatch):
+    """内部 Python 调用仍可在硬上限内显式选择时间预算。"""
+    import core.tools as tools_module
+
+    received = {}
+
+    class CapturingManager:
+        def run(self, *args, **kwargs):
+            received.update(kwargs)
+            return "completed"
+
+    monkeypatch.setattr(tools_module, "subagent_manager", CapturingManager())
+
+    result = tools_module.run_subagent(
+        "内部任务",
+        parent_session="s",
+        parent_turn_id="t",
+        timeout_seconds=600,
+    )
+
+    assert result == "completed"
+    assert received["timeout_seconds"] == 600
+
+
+def test_run_subagent_background_still_allows_long_timeout(monkeypatch):
+    """后台模式保留 3600 秒上限：确有长任务时不会误伤后台工作流。"""
+    import core.tools as tools_module
+
+    bg_manager = SubagentManager(runner=lambda record: "完成")
+    monkeypatch.setattr(tools_module, "subagent_manager", bg_manager)
+    try:
+        result = tools_module.run_subagent(
+            "后台长任务",
+            run_in_background=True,
+            parent_session="s",
+            parent_turn_id="t",
+            timeout_seconds=3600,
+        )
+        payload = json.loads(result)
+        assert payload["status"] == "running"
+    finally:
+        assert bg_manager.wait_for_idle(2)
+
+
+def test_foreground_waits_for_failed_terminal_callback_before_returning():
+    entered = threading.Event()
+    release = threading.Event()
+    results = []
+
+    def runner(_record):
+        raise RuntimeError("boom")
+
+    def terminal_callback(_task, _status, _result, _error):
+        entered.set()
+        assert release.wait(2.0)
+
+    manager = SubagentManager(runner=runner, wait_interval=0.001)
+    thread = threading.Thread(
+        target=lambda: results.append(manager.run(
+            "失败任务",
+            "session",
+            "turn",
+            timeout_seconds=30,
+            terminal_callback=terminal_callback,
+        )),
+        daemon=True,
+    )
+    thread.start()
+    assert entered.wait(2.0)
+    task = next(iter(manager._tasks.values()))
+
+    try:
+        time.sleep(0.05)
+        assert thread.is_alive() is True
+        assert task.status == "failed"
+        assert task.done_event.is_set() is False
+        assert results == []
+    finally:
+        release.set()
+        thread.join(timeout=2.0)
+
+    assert thread.is_alive() is False
+    assert task.done_event.is_set() is True
+    assert len(results) == 1

@@ -41,7 +41,7 @@
                 :class="{ 'icon-spin': item.status === 'in_progress' }"
               />
             </span>
-            <span class="p-text">{{ item.text }}</span>
+            <span class="p-text">{{ item.handoff_note || item.text }}</span>
           </div>
         </div>
       </div>
@@ -291,9 +291,9 @@ async function killTask(id: string) {
     try {
       const res = await window.pywebview.api.kill_task(id);
       if (!res || !res.ok) {
-        store.notifyModal('后台任务', '终止任务失败');
+        store.notifyModal('后台任务', res?.msg ? `终止任务失败: ${res.msg}` : '终止任务失败');
       } else {
-        store.notifyModal('后台任务', '已请求终止后台任务: ' + id);
+        store.notifyModal('后台任务', res.msg ? `${res.msg}: ${id}` : '已请求终止后台任务: ' + id);
       }
     } catch (e) {
       store.notifyModal('后台任务', '终止任务失败: ' + e);
