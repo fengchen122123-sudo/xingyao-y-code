@@ -1,9 +1,15 @@
 import type { ChatMessage } from './appStore';
 import type { PlanData, TokenUsage } from '../types/pywebview';
 import type { SubagentTaskSnapshot } from '../utils/toolTrace';
+import type { AttachmentItem } from '../types/composer';
 
 export interface SessionRuntimeState {
   messages: ChatMessage[];
+  // 尚未发送的输入文字属于会话运行态，组件卸载或切换会话时不能丢失/串用。
+  composerText?: string;
+  // 与文字草稿同生命周期；数组引用在 pending 会话迁移为真实会话时保持不变，
+  // 让已开始的异步上传仍能写回发起操作的会话。
+  composerAttachments?: AttachmentItem[];
   streamingText: string;
   thinkingText: string;
   running: boolean;
@@ -28,6 +34,8 @@ export interface SessionRuntimeState {
 export function createSessionRuntime(): SessionRuntimeState {
   return {
     messages: [],
+    composerText: '',
+    composerAttachments: [],
     streamingText: '',
     thinkingText: '',
     running: false,

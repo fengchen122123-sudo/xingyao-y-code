@@ -55,3 +55,17 @@ it('makes the large new-conversation surfaces follow the transparent workspace s
   workspace.remove();
   style.remove();
 });
+
+it('未落库新会话离开空状态页后重新挂载仍恢复文字草稿', async () => {
+  const store = useAppStore();
+  store.currentSessionName = '';
+  store.pendingWorkdir = 'GLOBAL';
+
+  let wrapper = mount(KimiEmptyState);
+  await wrapper.get('textarea').setValue('新会话尚未发送的内容');
+  wrapper.unmount();
+
+  wrapper = mount(KimiEmptyState);
+  expect(wrapper.get('textarea').element.value).toBe('新会话尚未发送的内容');
+  wrapper.unmount();
+});

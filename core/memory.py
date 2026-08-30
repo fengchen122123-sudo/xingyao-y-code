@@ -1734,6 +1734,61 @@ class MemoryManager:
             folded += 1
         return folded
 
+    def iter_assistant_media_migration_rows(self):
+        """媒体清单迁移候选行：无 media_v1 的 JSON dict 形态 assistant 消息。
+
+        返回 [(message_id, session_workdir, parsed_content_dict), ...]。
+        纯文本旧格式消息不迁移（保持展示层文件链接兜底，避免改写消息结构）；
+        已带 media_v1 的消息跳过（迁移幂等的关键）。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT messages.id, messages.content, sessions.workdir "
+                "FROM messages JOIN sessions ON sessions.id = messages.session_id "
+                "WHERE messages.role = 'assistant' ORDER BY messages.id ASC"
+            )
+            rows = []
+            for msg_id, raw, workdir in cursor.fetchall():
+                parsed, ok = _try_parse_json(raw)
+                if not ok or not isinstance(parsed, dict):
+                    continue
+                display = parsed.get("_display")
+                if isinstance(display, dict) and "media_v1" in display:
+                    continue
+                content = parsed.get("content")
+                if not isinstance(content, str) or not content:
+                    continue
+                rows.append((msg_id, workdir, parsed))
+            return rows
+
+    def update_message_display_media(self, message_id, media_v1) -> bool:
+        """给单条消息补写 _display.media_v1（正文其余字节不动），幂等。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute("SELECT content FROM messages WHERE id = ?", (message_id,))
+                row = cursor.fetchone()
+                if row is None:
+                    return False
+                parsed, ok = _try_parse_json(row[0])
+                if not ok or not isinstance(parsed, dict):
+                    return False
+                display = parsed.get("_display")
+                if not isinstance(display, dict):
+                    display = {}
+                display["media_v1"] = media_v1
+                parsed["_display"] = display
+                cursor.execute(
+                    "UPDATE messages SET content = ? WHERE id = ?",
+                    (json.dumps(parsed, ensure_ascii=False), message_id),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def ensure_session(self, session_name, workdir=None, source="GUI"):
         """确保会话记录存在（不存在则创建），返回是否为本次新建。
 

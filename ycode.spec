@@ -41,6 +41,9 @@ common_datas = [
     # GUI 专用提示词：与通用版并列随包，GUI 严格使用自己的，不回退混用
     ('system_prompt_gui.md', '.'),
     ('vendor/ripgrep/rg.exe', 'vendor/ripgrep'),
+    # Mermaid 渲染器（CLI 流程图导出用：core.diagram_export 生成的本地 HTML
+    # 以 file:// 引用此文件，浏览器端离线渲染；缺失时页面降级只显示源码）
+    ('vendor/mermaid/mermaid-11.17.2.min.js', 'vendor/mermaid'),
     ('frontend/dist', 'frontend/dist'),
     # 手机远程控制传输 shim：LAN server 注入到手机端页面 <head>，
     # _serve_shim() 在打包环境从 _MEIPASS/frontend/ 读取；缺失时手机端

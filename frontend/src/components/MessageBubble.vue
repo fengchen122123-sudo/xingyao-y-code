@@ -62,12 +62,13 @@
         </div>
 
         <!-- Markdown 文本内容（代码块复制按钮通过事件委托处理点击）；
-             文件链接先渲染、后经后端批量校验，目录/不存在的路径降级为纯文本 -->
+             文件链接先渲染、后经后端批量校验，目录/不存在的路径降级为纯文本；
+             媒体清单（media_v1）存在时 ![..](..)/[video:..](..) 渲染为图片/视频 -->
         <div
           v-if="msg.content && msg.content.trim()"
           ref="mdBodyRef"
           class="md-body"
-          v-html="renderMarkdown(msg.content)"
+          v-html="renderMarkdown(msg.content, mediaCtx)"
           @click="onMdBodyClick"
         ></div>
 
@@ -117,6 +118,7 @@
 import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdown } from '../utils/markdown';
+import { renderMermaidBlocks } from '../utils/mermaidRenderer';
 import { toAbsoluteLocalPath } from '../utils/localPath';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
@@ -171,6 +173,11 @@ const thinkingOpen = computed({
   set: (v: boolean) => { localThinkOverride.value = v; },
 });
 
+// 媒体渲染上下文：media_v1 清单按 ordinal 与正文中的媒体语法对齐
+const mediaCtx = computed(() =>
+  props.msg.media && props.msg.media.length ? { items: props.msg.media } : undefined
+);
+
 // 复制文本到剪贴板：优先 Clipboard API，失败回退 execCommand（pywebview/旧内核兼容）
 async function copyToClipboard(text: string): Promise<void> {
   try {
@@ -187,8 +194,21 @@ async function copyToClipboard(text: string): Promise<void> {
   }
 }
 
-// Markdown 内容点击事件委托：本地文件链接走内嵌预览，代码块复制按钮走复制
+// Markdown 内容点击事件委托：本地文件链接走内嵌预览，代码块复制按钮走复制；
+// 媒体图片点击进灯箱（与本条消息内其他图片共用导航序列）
 function onMdBodyClick(e: MouseEvent) {
+  const mdImg = (e.target as HTMLElement).closest('img.md-img');
+  if (mdImg) {
+    const urls = (props.msg.media || [])
+      .filter(m => m.kind === 'image' && m.url)
+      .map(m => m.url as string);
+    if (urls.length) {
+      const src = mdImg.getAttribute('src') || '';
+      store.openLightbox(urls, Math.max(0, urls.indexOf(src)));
+    }
+    return;
+  }
+
   const fileLink = (e.target as HTMLElement).closest('a[data-file-link]');
   if (fileLink) {
     e.preventDefault();
@@ -200,6 +220,12 @@ function onMdBodyClick(e: MouseEvent) {
       return;
     }
     store.openFilePreview(target);
+    return;
+  }
+
+  const mermaidCopy = (e.target as HTMLElement).closest('.mermaid-copy');
+  if (mermaidCopy) {
+    onMermaidCopyClick(mermaidCopy as HTMLElement);
     return;
   }
 
@@ -216,6 +242,23 @@ function onMdBodyClick(e: MouseEvent) {
       window.setTimeout(() => {
         btn.textContent = original;
         btn.classList.remove('copied');
+      }, 1500);
+    })
+    .catch(() => {
+      // 复制失败保持原样，不额外提示
+    });
+}
+
+// mermaid 块复制源码：渲染成功与否都可从隐藏/展示的 pre.mermaid-src 取原文
+function onMermaidCopyClick(btn: HTMLElement) {
+  const source = btn.closest('.mermaid-block')?.querySelector('pre.mermaid-src');
+  if (!source) return;
+  copyToClipboard(source.textContent || '')
+    .then(() => {
+      const original = btn.textContent;
+      btn.textContent = '已复制';
+      window.setTimeout(() => {
+        btn.textContent = original;
       }, 1500);
     })
     .catch(() => {
@@ -285,6 +328,8 @@ watch(
   async () => {
     await nextTick();
     downgradeInvalidFileLinks(mdBodyRef.value);
+    // mermaid 块异步渲染：渲染失败/加载失败时块内降级显示源码，不阻塞正文
+    void renderMermaidBlocks(mdBodyRef.value);
   },
   { immediate: true },
 );
@@ -500,6 +545,109 @@ async function copyUserMessage() {
   color: var(--accent);
   text-decoration: underline dotted;
   cursor: pointer;
+}
+
+/* ---- 媒体语法渲染：图片网格 / 视频播放器 / 明确失败态 ---- */
+.md-body :deep(img.md-img) {
+  display: block;
+  max-width: min(420px, 100%);
+  max-height: 320px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin: 6px 0;
+  cursor: zoom-in;
+  object-fit: contain;
+}
+.md-body :deep(video.md-video) {
+  display: block;
+  max-width: min(480px, 100%);
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  margin: 6px 0;
+  background: #000;
+}
+.md-body :deep(.md-media-error) {
+  display: inline-block;
+  margin: 4px 0;
+  padding: 3px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg2);
+  color: var(--text-faint);
+  font-size: 12px;
+}
+
+/* ---- mermaid 图表块：渲染中/成功/失败三态 ----
+   markdown.ts 只产出占位容器（源码已转义在 pre.mermaid-src 内），
+   mermaidRenderer 异步注入净化后的 SVG；流式重建 DOM 后凭缓存 key 秒回。 */
+.md-body :deep(.mermaid-block) {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg2);
+  padding: 8px 10px;
+  margin: 8px 0;
+  overflow-x: auto;
+}
+.md-body :deep(.mermaid-head) {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.md-body :deep(.mermaid-tag) {
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.md-body :deep(.mermaid-copy) {
+  margin-left: auto;
+  font-size: 11px;
+  padding: 2px 8px;
+  color: var(--text-faint);
+  background: var(--bg3);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+.md-body :deep(.mermaid-copy:hover) {
+  color: var(--text-bright);
+}
+.md-body :deep(.mermaid-block svg) {
+  max-width: 100%;
+  height: auto;
+}
+/* 渲染中占位 */
+.md-body :deep(.mermaid-block[data-state='pending'])::after,
+.md-body :deep(.mermaid-block[data-state='rendering'])::after {
+  content: '图表渲染中…';
+  display: block;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-faint);
+  padding: 8px 0;
+}
+/* 渲染失败：显示源码 + 明确提示（渲染器加载失败同此态） */
+.md-body :deep(.mermaid-block[data-state='error']) .mermaid-src {
+  display: block;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.6;
+  margin: 0;
+  color: var(--text);
+}
+.md-body :deep(.mermaid-block[data-state='error'])::after {
+  content: '⚠️ 图表渲染失败，已显示 Mermaid 源码。可点击「复制源码」到其他渲染工具查看。';
+  display: block;
+  font-size: 12px;
+  color: var(--orange);
+  margin-top: 6px;
+}
+/* 成功态与渲染中隐藏源码（error 态由上面规则放开） */
+.md-body :deep(.mermaid-block[data-state='done'] .mermaid-src),
+.md-body :deep(.mermaid-block[data-state='pending'] .mermaid-src),
+.md-body :deep(.mermaid-block[data-state='rendering'] .mermaid-src) {
+  display: none;
 }
 
 /* 挂在助手消息上的非终态错误提示 */

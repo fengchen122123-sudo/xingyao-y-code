@@ -1,0 +1,215 @@
+"""core/media_server.py
+=====================
+受控媒体 HTTP 服务：向 GUI 前端提供媒体仓库 Blob 的只读访问。
+
+设计见 docs/superpowers/specs/2026-08-30-media-display-design.md。
+要点：
+- 仅绑定 127.0.0.1，随机端口；每次启动生成随机能力令牌，错令牌返回 404
+  （不区分 401/404，避免探测）。
+- 只服务 ``<sha256hex>.<白名单扩展名>`` 形式的文件名（media_store.blob_name_is_safe），
+  不存在任何路径成分，配合 blob_path_for 的 realpath 越界校验双保险。
+- 内容寻址不可变：Cache-Control immutable；视频拖动依赖 Range → 206/416。
+- 进程内单例惰性启动（首个媒体 URL 生成时拉起），随进程销毁。
+"""
+
+from __future__ import annotations
+
+import hmac
+import logging
+import os
+import secrets
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+from core.media_store import (
+    SUPPORTED_MIME,
+    MediaStoreError,
+    blob_name_is_safe,
+    blob_path_for,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class MediaServer:
+    """127.0.0.1 单端口媒体只读服务；线程安全，进程内共享一个实例。"""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._server: ThreadingHTTPServer | None = None
+        self._token: str = ""
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+    def ensure_started(self) -> bool:
+        """惰性启动；返回服务是否可用。启动失败只记日志并返回 False。"""
+        with self._lock:
+            if self._server is not None:
+                return True
+            token = secrets.token_urlsafe(32)
+            try:
+                server = ThreadingHTTPServer(("127.0.0.1", 0), _MediaRequestHandler)
+                server.daemon_threads = True
+            except OSError:
+                logger.warning("媒体服务启动失败（端口绑定异常）", exc_info=True)
+                return False
+            server.media_server_ref = self  # type: ignore[attr-defined]
+            thread = threading.Thread(
+                target=server.serve_forever,
+                kwargs={"poll_interval": 0.5},
+                name="media-http-server",
+                daemon=True,
+            )
+            thread.start()
+            self._server = server
+            self._token = token
+            logger.info("媒体服务已启动: %s", self.base_url())
+            return True
+
+    def base_url(self) -> str:
+        if self._server is None:
+            return ""
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def check_token(self, token: str) -> bool:
+        return bool(token) and hmac.compare_digest(token, self._token)
+
+    def public_url(self, digest: str, ext: str) -> str:
+        """生成带令牌的媒体访问 URL；服务不可用时返回空串。"""
+        if not self.ensure_started():
+            return ""
+        return f"{self.base_url()}/m/{digest}.{ext}?t={self._token}"
+
+
+# 进程内单例；gui_bridge 直接复用，保证令牌与端口全进程一致
+media_server = MediaServer()
+
+
+class _MediaRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+    server_version = "YCodeMedia/1"
+
+    # ------------------------------------------------------------------
+    def log_message(self, fmt, *args):  # noqa: N802 (BaseHTTPRequestHandler 约定)
+        logger.debug("media http: " + fmt, *args)
+
+    def _send(self, status: int, headers: dict, body: bytes = b"") -> None:
+        try:
+            self.send_response(status)
+            for key, value in headers.items():
+                self.send_header(key, value)
+            self.end_headers()
+            if body and self.command != "HEAD":
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _not_found(self) -> None:
+        self._send(404, {"Content-Type": "text/plain; charset=utf-8",
+                         "Content-Length": "0"}, b"")
+
+    def _do(self) -> None:
+        server: MediaServer = self.server.media_server_ref  # type: ignore[attr-defined]
+        parsed = urlparse(self.path)
+        parts = parsed.path.split("/")
+        # 只接受 /m/<digest>.<ext>
+        if len(parts) != 3 or parts[1] != "m" or not blob_name_is_safe(parts[2]):
+            self._not_found()
+            return
+        token = (parse_qs(parsed.query).get("t") or [""])[0]
+        if not server.check_token(token):
+            self._not_found()
+            return
+        blob_name = parts[2]
+        digest, _, ext = blob_name.partition(".")
+        mime = next(
+            (m for m, e in SUPPORTED_MIME.items() if e.lstrip(".") == ext), None
+        )
+        if mime is None:
+            self._not_found()
+            return
+        try:
+            path = blob_path_for(digest, mime)
+            size = os.path.getsize(path)
+        except (MediaStoreError, OSError):
+            self._not_found()
+            return
+
+        base_headers = {
+            "Content-Type": mime,
+            "Accept-Ranges": "bytes",
+            "Cache-Control": "private, max-age=31536000, immutable",
+            "X-Content-Type-Options": "nosniff",
+        }
+
+        range_header = self.headers.get("Range") or ""
+        if range_header.startswith("bytes="):
+            start, end = _parse_range(range_header[len("bytes="):], size)
+            if start is None:
+                self._send(416, {
+                    "Content-Range": f"bytes */{size}",
+                    "Content-Length": "0",
+                })
+                return
+            length = end - start + 1
+            headers = dict(base_headers)
+            headers.update({
+                "Content-Range": f"bytes {start}-{end}/{size}",
+                "Content-Length": str(length),
+            })
+            self._send(206, headers)
+            self._stream(path, start, length)
+            return
+
+        headers = dict(base_headers)
+        headers["Content-Length"] = str(size)
+        self._send(200, headers)
+        self._stream(path, 0, size)
+
+    def _stream(self, path: str, start: int, length: int) -> None:
+        if self.command == "HEAD" or length <= 0:
+            return
+        chunk = 256 * 1024
+        try:
+            with open(path, "rb") as handle:
+                handle.seek(start)
+                remaining = length
+                while remaining > 0:
+                    data = handle.read(min(chunk, remaining))
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    remaining -= len(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # 客户端拖动进度条会频繁中断旧 Range 连接，属正常现象
+            pass
+
+    do_GET = _do
+    do_HEAD = _do
+
+
+def _parse_range(spec: str, size: int):
+    """解析 bytes=a-b 单区间；合法返回 (start, end) 闭区间，否则 (None, None)。"""
+    try:
+        first, _, last = spec.partition("-")
+        first = first.strip()
+        last = last.strip()
+        if not first:
+            # bytes=-N：末尾 N 字节
+            suffix = int(last)
+            if suffix <= 0 or size == 0:
+                return None, None
+            start = max(0, size - suffix)
+            return start, size - 1
+        start = int(first)
+        if start >= size:
+            return None, None
+        if not last:
+            return start, size - 1
+        end = int(last)
+        return start, min(end, size - 1)
+    except (ValueError, TypeError):
+        return None, None

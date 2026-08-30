@@ -173,6 +173,8 @@ REMOTE_TOKEN_TTL_DEFAULT = 86400
 # 配对 token 与绝对过期时间戳（秒）的持久化键：应用重启后 token 保持固定
 REMOTE_PAIR_TOKEN_KEY = "remote_pair_token"
 REMOTE_PAIR_TOKEN_EXPIRES_KEY = "remote_pair_token_expires_at"
+# 配对端口持久化键：重启后复用同一端口，二维码 URL 不变、无需重新扫码
+REMOTE_PAIR_PORT_KEY = "remote_pair_port"
 
 # 自动从当前源码目录初始化默认配置文件
 if not os.path.exists(_CONFIG_FILE):

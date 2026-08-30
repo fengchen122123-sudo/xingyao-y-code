@@ -209,6 +209,7 @@ function onSessionClick(s: { name: string; display_name?: string; workdir?: stri
     return;
   }
   confirmDeleteName.value = '';
+  store.closeSubpage();
   store.switchSession(s.name, s.display_name || s.name, s.workdir);
   collapseSidebarIfMobile();
 }
@@ -230,6 +231,7 @@ function collapseSidebarIfMobile() {
 
 // 侧栏菜单项：触发动作后，移动端自动收起覆盖层
 function newSession() {
+  store.closeSubpage();
   store.createSessionSmart();
   collapseSidebarIfMobile();
 }

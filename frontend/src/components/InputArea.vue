@@ -179,7 +179,10 @@ import { useComposerResize } from '../composables/useComposerResize';
 import { buildTokenSummary, formatTokenCount } from '../utils/tokenFormat';
 
 const store = useAppStore();
-const inputVal = ref('');
+const inputVal = computed<string>({
+  get: () => store._getSessionRuntime().composerText || '',
+  set: value => { store._getSessionRuntime().composerText = value; },
+});
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 
 const showModelCascader = ref(false);

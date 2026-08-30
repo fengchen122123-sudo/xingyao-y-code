@@ -1,15 +1,9 @@
-import { ref, onUnmounted } from 'vue';
+import { computed, ref, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import { fileExt } from '../utils/fileIcon';
+import type { AttachmentItem } from '../types/composer';
 
-export interface AttachmentItem {
-  path: string;
-  name: string;
-  ext: string;
-  size: number | null;
-  // 拖拽后立即上屏的加载态：路径尚未从 Python 侧取回，chips 上显示进度条
-  loading?: boolean;
-}
+export type { AttachmentItem } from '../types/composer';
 
 // ------------------------------------------------------------------
 // 拖拽路径的等待者注册表（模块级，两个输入区共用）：
@@ -98,7 +92,15 @@ function cancelWaiterForRemovedChip(path: string) {
 // InputArea 与 KimiEmptyState 两处输入区共用。
 export function useAttachments() {
   const store = useAppStore();
-  const attachments = ref<AttachmentItem[]>([]);
+  function currentAttachments(): AttachmentItem[] {
+    const runtime = store._getSessionRuntime();
+    if (!runtime.composerAttachments) runtime.composerAttachments = [];
+    return runtime.composerAttachments;
+  }
+  const attachments = computed<AttachmentItem[]>({
+    get: currentAttachments,
+    set: value => { store._getSessionRuntime().composerAttachments = value; },
+  });
   // 拖拽悬停状态：驱动输入框高亮提示
   const dragging = ref(false);
   let dragDepth = 0;
@@ -110,9 +112,10 @@ export function useAttachments() {
   }
 
   async function pickAttachments() {
+    const target = currentAttachments();
     const paths = await store.pickFiles();
     if (!paths.length) return;
-    await addPaths(paths);
+    await addPaths(paths, target);
   }
 
   const UPLOAD_MAX_BYTES = 50 * 1024 * 1024;
@@ -131,6 +134,7 @@ export function useAttachments() {
 
   // 手机/平板端：把 <input type=file> 选中的文件逐个经 WS RPC 上传到电脑，再加入附件列表
   async function uploadFiles(files: File[]) {
+    const target = currentAttachments();
     const paths: string[] = [];
     for (const file of files) {
       if (file.size > UPLOAD_MAX_BYTES) {
@@ -145,10 +149,10 @@ export function useAttachments() {
         store.notifyChat(`「${file.name}」上传失败，请重试`);
       }
     }
-    if (paths.length) await addPaths(paths);
+    if (paths.length) await addPaths(paths, target);
   }
 
-  async function addPaths(paths: string[]) {
+  async function addPaths(paths: string[], target = currentAttachments()) {
     let infos: AttachmentItem[] = [];
     try {
       infos = await store.getFilesInfo(paths);
@@ -158,10 +162,10 @@ export function useAttachments() {
     }
     const byPath = new Map(infos.map(i => [i.path, i]));
     for (const p of paths) {
-      if (attachments.value.some(a => a.path === p)) continue;
+      if (target.some(a => a.path === p)) continue;
       const info = byPath.get(p);
       const name = info?.name || baseName(p);
-      attachments.value.push({
+      target.push({
         path: p,
         name,
         ext: info?.ext ?? fileExt(name),
@@ -184,27 +188,30 @@ export function useAttachments() {
     }
     if (!images.length) return;
     e.preventDefault();
+    const target = currentAttachments();
     for (const file of images) {
       const reader = new FileReader();
       reader.onload = async () => {
         const dataUrl = String(reader.result || '');
         if (!dataUrl) return;
         const path = await store.saveClipboardImage(dataUrl);
-        if (path) await addPaths([path]);
+        if (path) await addPaths([path], target);
       };
       reader.readAsDataURL(file);
     }
   }
 
   function removeAttachment(path: string) {
-    attachments.value = attachments.value.filter(a => a.path !== path);
+    const target = currentAttachments();
+    const index = target.findIndex(a => a.path === path);
+    if (index >= 0) target.splice(index, 1);
     // M29 修复：删除拖拽占位 chip 时同步取消对应等待者，
     // 否则 4s 等待结束后路径到达会把已删除的附件复活
     cancelWaiterForRemovedChip(path);
   }
 
-  function clearAttachments() {
-    attachments.value = [];
+  function clearAttachments(target = currentAttachments()) {
+    target.splice(0, target.length);
   }
 
   // ------------------------------------------------------------------
@@ -234,6 +241,7 @@ export function useAttachments() {
     dragging.value = false;
     const files = e.dataTransfer?.files;
     if (!files || !files.length) return;
+    const target = currentAttachments();
 
     // 1) 立即上屏：pywebviewFullPath 只注入到 Python 侧事件，JS 的 File 对象
     //    拿不到路径，但文件名/大小可同步读取——先渲染 loading 占位 chip
@@ -243,7 +251,7 @@ export function useAttachments() {
     for (const f of dropped) {
       const key = `__pending__${Date.now()}_${f.name}`;
       pendingKeys.push(key);
-      attachments.value.push({
+      target.push({
         path: key,
         name: f.name,
         ext: fileExt(f.name),
@@ -252,7 +260,9 @@ export function useAttachments() {
       });
     }
     const removePending = () => {
-      attachments.value = attachments.value.filter(a => !pendingKeys.includes(a.path));
+      for (let i = target.length - 1; i >= 0; i--) {
+        if (pendingKeys.includes(target[i].path)) target.splice(i, 1);
+      }
     };
 
     // 2) 等待 Python 侧 dom.on('drop') 推送完整路径（事件驱动，替代原先的
@@ -262,14 +272,16 @@ export function useAttachments() {
 
     // M29 修复：等待期间用户可能已删除全部占位 chip（等待者被 removeAttachment
     // 取消，或手动逐个删掉），此时任何通道解析出的路径都不应再复活附件
-    if (!attachments.value.some(a => pendingKeys.includes(a.path))) {
+    if (!target.some(a => pendingKeys.includes(a.path))) {
       removePending();
       return;
     }
 
     // 3) 推送超时：兜底轮询一次旧桥接（兼容尚未升级的 Python 侧），再退化为
     //    text/uri-list 解析
-    if (!paths.length) {
+    // 旧桥接只有一个全局槽位，无法区分并发拖拽。仍有其他 waiter 时禁止消费，
+    // 否则先超时的会话可能拿走另一会话的路径并写入错误草稿。
+    if (!paths.length && dropWaiters.length === 0) {
       const api = window.pywebview?.api;
       if (api?.report_dropped_files) {
         try {
@@ -293,13 +305,13 @@ export function useAttachments() {
     // M29：被删除占位对应的文件不复活——按文件名从解析结果中剔除
     const removedNames = new Set(
       pendingKeys
-        .filter(k => !attachments.value.some(a => a.path === k))
+        .filter(k => !target.some(a => a.path === k))
         .map(k => k.replace(/^__pending__\d+_/, '')),
     );
     removePending();
     paths = paths.filter(p => !removedNames.has(baseName(p)));
     if (paths.length) {
-      await addPaths(paths);
+      await addPaths(paths, target);
     } else if (!removedNames.size) {
       store.notifyChat('未获取到文件路径，请重试或改用「＋」按钮选择文件');
     }

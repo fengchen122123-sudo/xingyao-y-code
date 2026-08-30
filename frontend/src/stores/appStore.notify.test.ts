@@ -87,3 +87,77 @@ it('setPermissionMode 失败时即使在空会话也保留失败提示', async (
   expect(last.role).toBe('notice');
   expect(last.content).toContain('权限模式调整失败');
 });
+
+// ---- 双端同步提示（post_notice 广播 + notice 桥事件回环插入）----
+
+it('桥可用时 notifyChat 经 post_notice 广播，本地不直接插入（等事件回环）', () => {
+  const postNotice = vi.fn(async () => ({ ok: true }));
+  (window as any).pywebview = { api: { post_notice: postNotice } };
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+  store.messages.push({ role: 'user', content: '你好' } as never);
+
+  store.notifyChat('已切换活动模型: k3');
+
+  expect(postNotice).toHaveBeenCalledWith('已切换活动模型: k3', 's1', 'notice');
+  // 本地不直插：等 notice 桥事件回环后统一插入，避免发起端重复
+  expect(store.messages).toHaveLength(1);
+});
+
+it('post_notice 调用失败时降级为本地插入', async () => {
+  (window as any).pywebview = {
+    api: { post_notice: vi.fn(async () => { throw new Error('桥断开'); }) },
+  };
+  const store = useAppStore();
+
+  store.notifyChat('提示内容');
+  await new Promise(r => setTimeout(r, 0));
+
+  const last = store.messages[store.messages.length - 1];
+  expect(last.role).toBe('notice');
+  expect(last.content).toBe('提示内容');
+});
+
+it('notice 桥事件按 kind=error 插入错误卡片（双端同步的统落点）', () => {
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+  store.messages.push({ role: 'user', content: '你好' } as never);
+
+  store.handleBridgeEvent({
+    type: 'notice',
+    data: { message: '消息发送失败: x', kind: 'error', session_name: 's1' },
+  } as any);
+
+  const last = store.messages[store.messages.length - 1];
+  expect(last.role).toBe('error');
+  expect(last.content).toBe('消息发送失败: x');
+});
+
+it('notice 桥事件指向本端从未加载的会话时直接丢弃（不阻断历史回填）', () => {
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+
+  store.handleBridgeEvent({
+    type: 'notice',
+    data: { message: '别的会话的提示', kind: 'notice', session_name: 's2' },
+  } as any);
+
+  expect(store.messages).toHaveLength(0);
+  // runtime 可能被创建但必须为空：非空会阻断打开 s2 时的数据库历史回填
+  expect(store._getSessionRuntime('s2').messages).toHaveLength(0);
+});
+
+it('notice 桥事件写入已加载的非当前会话 runtime，切回可见', () => {
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+  store._getSessionRuntime('s2').messages.push({ role: 'user', content: '旧消息' } as never);
+
+  store.handleBridgeEvent({
+    type: 'notice',
+    data: { message: '切换模型失败: x', kind: 'notice', session_name: 's2' },
+  } as any);
+
+  const s2Msgs = store._getSessionRuntime('s2').messages;
+  expect(s2Msgs[s2Msgs.length - 1].role).toBe('notice');
+  expect(s2Msgs[s2Msgs.length - 1].content).toBe('切换模型失败: x');
+});
