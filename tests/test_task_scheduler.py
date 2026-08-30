@@ -54,7 +54,11 @@ def test_scheduler_marks_failure_and_retry_requeues_item():
     assert scheduler.retry("a") is True
     retried = plan.snapshot()[0]
     assert retried["status"] == "pending"
-    assert retried["attempts"] == 2
+    # attempts 只在真实执行开始时自增（Task 3 语义）：retry 仅重置状态，
+    # 下一次 run_ready/start_item 才会计入第 2 次尝试
+    assert retried["attempts"] == 1
+    assert [item["id"] for item in scheduler.start_ready()] == ["a"]
+    assert plan.snapshot()[0]["attempts"] == 2
 
 
 def test_scheduler_pause_and_resume():
@@ -544,3 +548,91 @@ def test_verification_rejects_catastrophic_commands_before_spawn(monkeypatch):
 
     assert passed is False
     assert "危险命令" in detail
+
+
+def test_release_uses_claimed_file_snapshot_not_mutated_plan_files():
+    plan = PlanManager()
+    plan.replace([{"id": "item", "subject": "work", "files": ["a.py"]}])
+    scheduler = TaskScheduler(plan)
+    assert scheduler.start_item("item") is True
+
+    # 模拟内部调用方绕过模型边界修改计划，调度器仍必须释放真实租约。
+    assert plan.update("item", files=["b.py"]) is True
+    assert scheduler.cancel("item") is True
+
+    assert scheduler._in_flight_ids == set()
+    assert scheduler._in_flight_files == set()
+    assert scheduler._in_flight_files_by_item == {}
+
+
+def test_promote_recovered_takeover_claims_files_before_activation():
+    plan = PlanManager()
+    plan.replace([{
+        "id": "item",
+        "subject": "recovered",
+        "status": "pending",
+        "files": ["shared.py"],
+        "execution_mode": "takeover_queued",
+        "takeover_required": True,
+        "takeover_sequence": 1,
+    }])
+    scheduler = TaskScheduler(plan)
+
+    promoted = scheduler.promote_next_takeover("turn-2")
+
+    assert promoted is not None
+    assert promoted["execution_mode"] == "main_takeover"
+    assert scheduler._in_flight_ids == {"item"}
+    assert scheduler._in_flight_files == {"shared.py"}
+    assert scheduler._in_flight_files_by_item == {
+        "item": frozenset({"shared.py"})
+    }
+
+
+def test_promote_takeover_keeps_queue_when_files_are_claimed():
+    plan = PlanManager()
+    plan.replace([
+        {"id": "active", "subject": "active", "files": ["shared.py"]},
+        {
+            "id": "queued",
+            "subject": "queued",
+            "status": "pending",
+            "files": ["shared.py"],
+            "execution_mode": "takeover_queued",
+            "takeover_required": True,
+            "takeover_sequence": 1,
+        },
+    ])
+    scheduler = TaskScheduler(plan, max_workers=2)
+    assert scheduler.start_item("active") is True
+
+    assert scheduler.promote_next_takeover("turn-2") is None
+    queued = next(item for item in plan.snapshot() if item["id"] == "queued")
+    assert queued["status"] == "pending"
+    assert queued["execution_mode"] == "takeover_queued"
+
+
+def test_promote_refuses_queued_item_without_takeover_flag():
+    """CAS 防御：takeover_queued 但 takeover_required=False 的异常项不得晋升，
+    与 claim_takeover_for_turn / resume_takeover 的接管防御级别保持一致。
+
+    plan 层 _normalize_item 会把 queued 模式强制补上 takeover_required，
+    因此这里用 transition_execution 模拟内部调用方绕过不变量的场景。"""
+    plan = PlanManager()
+    plan.replace([{"id": "item", "subject": "broken-flag", "status": "pending", "files": ["a.py"]}])
+    assert plan.transition_execution(
+        "item",
+        expected_status="pending",
+        expected_mode="",
+        status="pending",
+        execution_mode="takeover_queued",
+        takeover_required=False,
+        takeover_sequence=1,
+    ) is not None
+    scheduler = TaskScheduler(plan)
+
+    assert scheduler.promote_next_takeover("turn-2") is None
+    item = next(item for item in plan.snapshot() if item["id"] == "item")
+    assert item["status"] == "pending"
+    assert item["execution_mode"] == "takeover_queued"
+    assert scheduler._in_flight_ids == set()

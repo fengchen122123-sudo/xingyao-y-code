@@ -71,7 +71,7 @@ from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.controls import FormattedTextControl
 from prompt_toolkit.application import Application, run_in_terminal
 from prompt_toolkit.key_binding import KeyBindings
-from prompt_toolkit.styles import Style
+from prompt_toolkit.styles import Style, DynamicStyle
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.layout.dimension import D
@@ -1016,6 +1016,7 @@ def _render_ui_event(event):
     global is_thinking, task_status, think_start_time, activity_start_time
     global active_thinking_text, active_thinking_turn_id, _active_tool_status
     global _thinking_panel_linger
+    global _last_printed_plan_state
     renderer = ui_renderers.get(event.turn_id)
     if renderer is None:
         # 简短模式：只显示"星瑶正在干活"汇总行 + 收尾统计行，不显示具体工具调用细节。
@@ -1058,6 +1059,37 @@ def _render_ui_event(event):
             app_instance.invalidate()
         return
 
+    if event.kind == "plan_item_handoff":
+        # 子 Agent 超时接管可见性：active 打印一次固定接管提示，
+        # queued 显示队列位置；同 item 同 mode 的重复 live update 不刷屏
+        item = dict(event.payload.get("item") or {})
+        item_id = str(item.get("id", "")).strip()
+        mode = str(
+            event.payload.get("mode") or item.get("execution_mode") or ""
+        ).strip()
+        queue_position = event.payload.get("queue_position") or 0
+        state_key = f"{item_id}:plan_item_handoff:{mode}"
+        if _last_printed_plan_state.get(state_key) == item_id:
+            if app_instance is not None:
+                app_instance.invalidate()
+            return
+        _last_printed_plan_state[state_key] = item_id
+        subject = str(item.get("subject", "")).replace("\x1b", "").strip()
+        if mode == "takeover_queued":
+            line = (
+                f"{subject} 等待主 Agent 接管（队列第 {queue_position} 项）"
+                if subject else f"等待主 Agent 接管（队列第 {queue_position} 项）"
+            )
+        else:
+            line = (
+                f"{subject} 子 Agent 已超时，主 Agent 正在接管并核查现场"
+                if subject else "子 Agent 已超时，主 Agent 正在接管并核查现场"
+            )
+        _print_ui_fragment(f"\n⏵ {line}\n")
+        if app_instance is not None:
+            app_instance.invalidate()
+        return
+
     if event.kind == "plan_updated" or event.kind.startswith("plan_item_"):
         if event.kind.startswith("plan_item_"):
             item = dict(event.payload.get("item") or {})
@@ -1067,7 +1099,6 @@ def _render_ui_event(event):
             if subject and item_id:
                 # 同一个计划项的同一状态只打印一次，避免失败重试时刷屏
                 state_key = f"{item_id}:{event.kind}"
-                global _last_printed_plan_state
                 if _last_printed_plan_state.get(state_key) == subject:
                     if app_instance is not None:
                         app_instance.invalidate()
@@ -2048,7 +2079,11 @@ def handle_slash_command(command_text):
         file_path = state.get("file_path")
         old_content = state.get("old_content")
         # 删除新建文件是高危操作：要求显式确认，避免跨会话/误操作导致用户数据丢失
-        will_delete = bool(file_path) and old_content == ""
+        existed_before = state.get("existed_before")
+        if existed_before is None:
+            # 兼容旧版本只保存 old_content 的撤销记录。
+            existed_before = old_content != ""
+        will_delete = bool(file_path) and not bool(existed_before)
         confirm = command_text.strip().split()
         forced = len(confirm) >= 2 and confirm[1].lower() in ("y", "yes", "--force")
         if will_delete and not forced:
@@ -2106,14 +2141,19 @@ def handle_slash_command(command_text):
                 elif not snapshots:
                     print_formatted_text(HTML(f"<ansiyellow>ℹ 检查点 {_esc(target_turn_id)} 没有文件修改记录（该轮没有写/编辑操作）。</ansiyellow>"))
                 else:
-                    # T5 修复：old_content == "" 表示该文件是检查后新建的，回滚即删除。
+                    # 旧记录用 old_content == "" 表示新建文件；新记录显式保存
+                    # existed_before，避免把原本存在的空文件误判为新建文件。
                     # 若用户之后重建/修改了同名文件，静默删除会造成数据丢失——
                     # 与 /undo 的删除确认保持一致，要求显式追加 y/yes/--force。
                     confirm_flag = parts[3].strip().lower() if len(parts) > 3 else ""
                     forced = confirm_flag in ("y", "yes", "--force")
                     pending_deletes = [
                         s for s in snapshots
-                        if s.get("old_content") == ""
+                        if not bool(
+                            s.get("existed_before")
+                            if s.get("existed_before") is not None
+                            else s.get("old_content") != ""
+                        )
                         and os.path.exists(s.get("file_path") or "")
                     ]
                     if pending_deletes and not forced:
@@ -2126,23 +2166,31 @@ def handle_slash_command(command_text):
                             print_formatted_text(HTML(f"  <ansigray>将删除: {_esc(s.get('file_path', '?'))}</ansigray>"))
                         return
                     print_formatted_text(HTML(f"<ansicyan>🔄 正在回滚检查点 {_esc(target_turn_id)}，共 {len(snapshots)} 个文件...</ansicyan>"))
-                    from core.tools import write_file, sandbox_bypass
+                    from core.agent_service import _restore_file_bytes
+                    from core.tools import sandbox_bypass
                     success = 0
                     failed = 0
                     for snap in snapshots:
                         try:
                             file_path = snap["file_path"]
                             old_content = snap["old_content"]
-                            if old_content == "":
+                            existed_before = snap.get("existed_before")
+                            if existed_before is None:
+                                existed_before = old_content != ""
+                            if not existed_before:
                                 # 原本不存在该文件，删除
                                 if os.path.exists(file_path):
                                     os.remove(file_path)
                                 print_formatted_text(HTML(f"  <ansigreen>✔ 删除新建文件: {_esc(file_path)}</ansigreen>"))
                             else:
                                 # 回滚是用户显式发起的恢复操作：沙盒外路径也直接放行，
-                                # 避免之前单次批准写出的沙盒外文件无法回滚
+                                # 避免之前单次批准写出的沙盒外文件无法回滚。新记录
+                                # 优先写回原始字节；旧记录按 UTF-8 文本兼容恢复。
+                                old_bytes = snap.get("old_bytes")
+                                if not isinstance(old_bytes, bytes):
+                                    old_bytes = str(old_content).encode("utf-8")
                                 with sandbox_bypass():
-                                    write_file(file_path, old_content)
+                                    _restore_file_bytes(file_path, old_bytes)
                                 print_formatted_text(HTML(f"  <ansigreen>✔ 恢复文件: {_esc(file_path)}</ansigreen>"))
                             success += 1
                         except Exception as e:
@@ -2655,9 +2703,11 @@ def _make_input_app():
                     if count > 50:
                         break
 
-    # 输入历史：跨会话持久化，Up/Down 可翻阅之前输入过的内容
+    # 输入历史：跨会话持久化，Up/Down 可翻阅之前输入过的内容。
+    # 数据目录统一走 config.YCODE_DIR（尊重 YCODE_DATA_DIR 覆盖），
+    # 不能硬编码 ~/.ycode，否则多实例/测试隔离场景会把输入史写进真实用户目录。
     try:
-        _hist_dir = os.path.join(os.path.expanduser("~"), ".ycode")
+        _hist_dir = config.YCODE_DIR
         os.makedirs(_hist_dir, exist_ok=True)
         _input_history = FileHistory(os.path.join(_hist_dir, "input_history.txt"))
     except Exception:
@@ -3184,8 +3234,36 @@ def _make_input_app():
 
     layout = Layout(main_container)
 
+    # D5：样式改为 DynamicStyle 按 current_theme 每次渲染时取值，
+    # /theme 切换后 invalidate() 即可让状态栏/边框立即反映新主题
+    # （此前 Style 一次性构建，invalidate 只重绘不换色）。
+    style = DynamicStyle(lambda: _build_cli_style(current_theme))
+
+    app = Application(
+        layout=layout,
+        key_bindings=kb,
+        style=style,
+        full_screen=False,
+        mouse_support=False,
+        erase_when_done=True,
+    )
+
+    return app
+
+
+_CLI_STYLE_CACHE = {}
+
+
+def _build_cli_style(theme_name):
+    """按主题名构建 CLI 的 prompt_toolkit 样式（/theme 运行时切换也走这里）。
+
+    DynamicStyle 每次样式查询都会回调本函数，按主题名缓存避免每帧重建 Style。
+    """
+    cached = _CLI_STYLE_CACHE.get(theme_name)
+    if cached is not None:
+        return cached
     from core.themes import THEMES
-    theme_cfg = THEMES.get(current_theme, THEMES["cyan"])
+    theme_cfg = THEMES.get(theme_name, THEMES["cyan"])
     border_color = theme_cfg.get("border", "#00b4d8")
     label_color = theme_cfg.get("label", "bold #00b4d8")
     status_main = theme_cfg.get("status_main", "bold #00b4d8")
@@ -3229,17 +3307,8 @@ def _make_input_app():
         "completion-menu.meta.completion": "bg:#1a2a3a #718096",
         "completion-menu.meta.completion.current": menu_current_meta,
     })
-
-    app = Application(
-        layout=layout,
-        key_bindings=kb,
-        style=style,
-        full_screen=False,
-        mouse_support=False,
-        erase_when_done=True,
-    )
-
-    return app
+    _CLI_STYLE_CACHE[theme_name] = style
+    return style
 
 
 # 按完整轮次淘汰最早的一段历史（首个非 system 消息起到下一条 user 消息前）。

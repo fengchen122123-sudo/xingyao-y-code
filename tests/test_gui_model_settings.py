@@ -1,4 +1,5 @@
 import json
+import threading
 from types import SimpleNamespace
 
 import config
@@ -10,6 +11,11 @@ from gui_bridge import ApiBridge
 def _bare_bridge():
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._sync_active_model_context = lambda: None
+    # 绕过 __init__ 时补齐会被 get_initial_state 后台线程读取的真实默认值。
+    bridge._turn_start_lock = threading.Lock()
+    bridge._message_queues = {}
+    bridge._lan_server = None
+    bridge._lan_lock = threading.Lock()
     return bridge
 
 
@@ -60,6 +66,38 @@ def test_model_settings_snapshot_is_complete_without_secret(tmp_path, monkeypatc
     assert provider["models"][0]["context_window"] == 200000
     assert provider["models"][0]["supports_vision"] is True
     assert "sk-secret-value" not in json.dumps(snapshot, ensure_ascii=False)
+
+
+def test_model_settings_active_model_follows_session_binding(tmp_path, monkeypatch):
+    """设置快照的 active_model_id 必须是会话生效模型，而非陈旧的全局默认。
+
+    回归：GUI 按会话绑定模型、不更新全局 active_model_id；当全局值属于
+    另一厂商的同名模型时，设置快照若直接返回全局值，前端会把界面选中态
+    打回错误厂商（表现为"选了 A 厂商的模型自动跳到 B 厂商"）。
+    """
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+    bridge._current_session = "sess-kimi"
+    monkeypatch.setattr(
+        "gui_bridge.get_active_model",
+        lambda session=None: {"id": "m-session", "name": "session-model"},
+    )
+
+    snapshot = bridge.get_model_settings()
+
+    assert snapshot["active_model_id"] == "m-session"
+
+
+def test_model_settings_active_model_falls_back_to_global(tmp_path, monkeypatch):
+    """会话尚未绑定任何模型时，active_model_id 回退到全局默认值。"""
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+    bridge._current_session = ""
+    monkeypatch.setattr("gui_bridge.get_active_model", lambda session=None: None)
+
+    snapshot = bridge.get_model_settings()
+
+    assert snapshot["active_model_id"] == "m1"
 
 
 def test_add_preset_provider_returns_refreshed_snapshot(tmp_path, monkeypatch):
@@ -150,6 +188,7 @@ def test_get_initial_state_includes_secondary_model_fields(tmp_path, monkeypatch
     bridge.get_plugins = lambda: []
     bridge._load_session_messages = lambda session: []
     bridge.get_token_usage = lambda: {}
+    bridge._ensure_lan_server = lambda: None
 
     state = bridge.get_initial_state()
 

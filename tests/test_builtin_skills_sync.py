@@ -1,9 +1,8 @@
 """core/skills.py 内置技能释放（sync_builtin_skills）的单元测试。"""
 
-import os
-
 import pytest
 
+import config
 from core import skills
 
 
@@ -18,11 +17,8 @@ def sync_env(tmp_path, monkeypatch):
     monkeypatch.setattr(skills, "_BUILTIN_SYNC_DONE", False)
     monkeypatch.setattr(skills, "_builtin_skills_dir", lambda: str(src))
     monkeypatch.setattr(skills, "ACTIVE_SKILLS_FILE", str(active_file))
-    monkeypatch.setattr(
-        skills, "_builtin_released_file",
-        lambda: str(tmp_path / "user_home" / ".ycode" / "builtin_skills_released.json"),
-    )
-    monkeypatch.setattr(os.path, "expanduser", lambda p: str(tmp_path / "user_home") if p == "~" else p)
+    # 技能释放目录/发布标记统一读 config.YCODE_DIR（D4 修复后不再硬编码 ~/.ycode）
+    monkeypatch.setattr(config, "YCODE_DIR", str(tmp_path / "user_home" / ".ycode"))
     return src, user_base, active_file
 
 

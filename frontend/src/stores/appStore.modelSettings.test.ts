@@ -88,4 +88,33 @@ describe('model settings store', () => {
     expect(result?.ok).toBe(true);
     expect(store.models[0].name).toBe('model-two');
   });
+
+  it('keeps the session-bound active model when the snapshot global id differs', () => {
+    // 回归：GUI 按会话绑定模型，快照里的 active_model_id 是全局默认值，
+    // 可能属于另一厂商的同名模型；直接覆盖会让界面选中态跳厂商
+    const store = useAppStore();
+    const twoProviderSnapshot = {
+      ...structuredClone(snapshot),
+      models: [
+        { id: 'm-openai', name: 'k3', provider_id: 'p1', provider_name: '厂商A(OpenAI)', context_window: 1000000, supports_vision: true },
+        { id: 'm-anthropic', name: 'k3', provider_id: 'p2', provider_name: '厂商B(Anthropic)', context_window: 1000000, supports_vision: true },
+      ],
+      active_model_id: 'm-openai',
+    };
+    store.activeModelId = 'm-anthropic';
+
+    store.applyModelSettings(twoProviderSnapshot as any);
+
+    expect(store.activeModelId).toBe('m-anthropic');
+  });
+
+  it('falls back to the snapshot active model when the current one no longer exists', () => {
+    // 当前模型已被删除（或尚未选择）时，仍用快照的全局默认值兜底
+    const store = useAppStore();
+    store.activeModelId = 'm-deleted';
+
+    store.applyModelSettings(structuredClone(snapshot) as any);
+
+    expect(store.activeModelId).toBe('m1');
+  });
 });

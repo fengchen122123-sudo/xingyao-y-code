@@ -26,6 +26,9 @@ VALID_STAGES = frozenset({"plan", "build", "review"})
 VALID_KINDS = frozenset({"execution", "input_preparation"})
 VALID_VERIFICATION_TYPES = frozenset({"result", "command"})
 TERMINAL_STATUSES = frozenset({"completed", "failed", "blocked", "cancelled"})
+# 计划项执行租约：delegated=子代理执行中，main_takeover=主 Agent 接管执行中，
+# takeover_queued=超时后排队等待主 Agent 接管（FIFO）
+VALID_EXECUTION_MODES = frozenset({"", "delegated", "main_takeover", "takeover_queued"})
 PlanEventCallback = Callable[[str, dict[str, Any]], None]
 
 
@@ -130,6 +133,7 @@ class PlanManager:
         stage: str | None = None,
         kind: str | None = None,
         expected_status: str | set[str] | frozenset[str] | None = None,
+        expected_mode: str | set[str] | frozenset[str] | None = None,
         result: str | None = None,
         error: str | None = None,
         attempts: int | None = None,
@@ -145,6 +149,14 @@ class PlanManager:
                     else set(expected_status)
                 )
                 if item["status"] not in expected:
+                    return False
+            if expected_mode is not None:
+                expected_modes = (
+                    {expected_mode}
+                    if isinstance(expected_mode, str)
+                    else set(expected_mode)
+                )
+                if str(item.get("execution_mode", "")) not in expected_modes:
                     return False
             # 先完成全部校验，再一次应用变更，避免部分生效后返回 False 造成内存/磁盘状态分裂
             if attempts is not None and int(attempts) < 0:
@@ -236,12 +248,120 @@ class PlanManager:
             expected_status={"pending", "in_progress", "blocked"},
         )
 
+    def transition_execution(
+        self,
+        item_id: str,
+        *,
+        status: str | None = None,
+        expected_status: str | set[str] | frozenset[str] | None = None,
+        expected_mode: str | set[str] | frozenset[str] | None = None,
+        expected_owner: str | None = None,
+        expected_handoff_task_id: str | None = None,
+        expected_takeover_turn_id: str | None = None,
+        expected_takeover_required: bool | None = None,
+        execution_mode: str | None = None,
+        owner: str | None = None,
+        attempts: int | None = None,
+        delegation_count: int | None = None,
+        handoff_task_id: str | None = None,
+        handoff_reason: str | None = None,
+        takeover_turn_id: str | None = None,
+        takeover_sequence: int | None = None,
+        takeover_required: bool | None = None,
+        error: str | None = None,
+        result: str | None = None,
+    ) -> dict[str, Any] | None:
+        """在 PlanManager 自身锁内按 expected status/mode 做 CAS，一次提交全部执行租约字段。
+
+        execution_mode / handoff_task_id / handoff_reason / takeover_turn_id /
+        takeover_sequence / delegation_count 只能经此方法批量变更：
+        调度器（TaskScheduler）用它原子完成委派、超时移交与 FIFO 提升，
+        避免连续调用普通 update() 时向观察者暴露半状态；
+        模型可见的 plan_update 工具不暴露这些字段，无法伪造接管状态。
+        校验失败或 CAS 不匹配返回 None，且不产生任何部分写入。
+        """
+        with self._lock:
+            item = next((item for item in self._items if item["id"] == item_id), None)
+            if item is None:
+                return None
+            if expected_status is not None:
+                expected = (
+                    {expected_status}
+                    if isinstance(expected_status, str)
+                    else set(expected_status)
+                )
+                if item["status"] not in expected:
+                    return None
+            if expected_mode is not None:
+                expected_modes = (
+                    {expected_mode}
+                    if isinstance(expected_mode, str)
+                    else set(expected_mode)
+                )
+                if str(item.get("execution_mode", "")) not in expected_modes:
+                    return None
+            if expected_owner is not None and str(item.get("owner", "")) != str(expected_owner):
+                return None
+            if (
+                expected_handoff_task_id is not None
+                and str(item.get("handoff_task_id", "")) != str(expected_handoff_task_id)
+            ):
+                return None
+            if (
+                expected_takeover_turn_id is not None
+                and str(item.get("takeover_turn_id", "")) != str(expected_takeover_turn_id)
+            ):
+                return None
+            if (
+                expected_takeover_required is not None
+                and bool(item.get("takeover_required", False)) is not bool(expected_takeover_required)
+            ):
+                return None
+            if execution_mode is not None and execution_mode not in VALID_EXECUTION_MODES:
+                return None
+            if status is not None and status not in VALID_STATUSES:
+                return None
+            if status in {"in_progress", "completed"} and not self._dependencies_completed_locked(item):
+                return None
+            if attempts is not None and int(attempts) < 0:
+                return None
+            if delegation_count is not None and int(delegation_count) < 0:
+                return None
+            # 校验全部通过后一次性应用，最后统一持久化
+            if status is not None:
+                item["status"] = status
+            if execution_mode is not None:
+                item["execution_mode"] = execution_mode
+            if owner is not None:
+                item["owner"] = str(owner).strip()
+            if attempts is not None:
+                item["attempts"] = int(attempts)
+            if delegation_count is not None:
+                item["delegation_count"] = int(delegation_count)
+            if handoff_task_id is not None:
+                item["handoff_task_id"] = str(handoff_task_id).strip()
+            if handoff_reason is not None:
+                item["handoff_reason"] = str(handoff_reason)
+            if takeover_turn_id is not None:
+                item["takeover_turn_id"] = str(takeover_turn_id).strip()
+            if takeover_sequence is not None:
+                item["takeover_sequence"] = int(takeover_sequence)
+            if takeover_required is not None:
+                item["takeover_required"] = bool(takeover_required)
+            if error is not None:
+                item["error"] = str(error)
+            if result is not None:
+                item["result"] = str(result)
+            self._commit_locked()
+            return deepcopy(item)
+
     def ready_items(self) -> list[dict[str, Any]]:
         with self._lock:
             return deepcopy([
                 item
                 for item in self._items
                 if item["status"] == "pending"
+                and not bool(item.get("takeover_required", False))
                 and self._dependencies_completed_locked(item)
             ])
 
@@ -304,6 +424,15 @@ class PlanManager:
         depends_on = [str(value).strip() for value in raw.get("depends_on", []) if str(value).strip()]
         if item_id in depends_on:
             raise ValueError(f"plan item cycle: {item_id}")
+        execution_mode = str(raw.get("execution_mode", "") or "").strip()
+        if execution_mode not in VALID_EXECUTION_MODES:
+            execution_mode = ""
+        # 兼容旧计划文件：历史版本没有 takeover_required 时，只有
+        # 明确的接管模式能证明发生过超时移交。handoff_task_id 在所有
+        # 普通 delegated 执行中也会写入，不能单独作为接管事实。
+        takeover_required = bool(raw.get("takeover_required", False)) or (
+            execution_mode in {"main_takeover", "takeover_queued"}
+        )
         return {
             "id": item_id,
             "subject": subject,
@@ -318,6 +447,13 @@ class PlanManager:
             "attempts": max(0, int(raw.get("attempts", 0) or 0)),
             "result": str(raw.get("result", "")),
             "error": str(raw.get("error", "")),
+            "execution_mode": execution_mode,
+            "delegation_count": max(0, int(raw.get("delegation_count", 0) or 0)),
+            "handoff_task_id": str(raw.get("handoff_task_id", "") or "").strip(),
+            "handoff_reason": str(raw.get("handoff_reason", "") or ""),
+            "takeover_turn_id": str(raw.get("takeover_turn_id", "") or "").strip(),
+            "takeover_sequence": max(0, int(raw.get("takeover_sequence", 0) or 0)),
+            "takeover_required": takeover_required,
         }
 
     @staticmethod
@@ -411,9 +547,25 @@ class PlanManager:
             )
             return
         for item in normalized:
-            if item["status"] == "in_progress":
+            was_in_progress = item["status"] == "in_progress"
+            if was_in_progress:
                 item["status"] = "pending"
                 item["error"] = "进程重启后已恢复为待执行"
+            # 崩溃恢复：遗留的 main_takeover 租约绑定的是已死亡回合的 turn id，
+            # 降级为 queued 并清空 turn id，下一真实主回合通过
+            # promote_next_takeover(new_turn_id) 重新认领，禁止旧 turn id 永久占锁
+            if item["execution_mode"] == "main_takeover":
+                item["execution_mode"] = "takeover_queued"
+                item["takeover_turn_id"] = ""
+            elif was_in_progress and item["execution_mode"] == "delegated":
+                # 普通子 Agent 随进程退出后，原 task id/owner 已是死亡租约。
+                # 与 TaskScheduler._reset_orphaned_in_progress 保持同一恢复语义。
+                item["execution_mode"] = ""
+                item["owner"] = ""
+                item["handoff_task_id"] = ""
+                item["handoff_reason"] = ""
+                item["takeover_turn_id"] = ""
+                item["takeover_sequence"] = 0
         self._items = normalized
 
 
@@ -485,9 +637,10 @@ def plan_state_fingerprint(session_id: str | None = None) -> str:
     """计划 canonical 快照指纹（SHA-256），供 TurnProgressGuard 判定真实进展。
 
     只纳入影响调度的确定性字段：plan session id、每个计划项的
-    id/status/attempts/depends_on、当前 in-progress 项、auto-continue
-    suppression 状态。展示文案（subject/result/error 等）与时间戳不参与，
-    避免无业务变化却不断重置停滞计数。
+    id/status/depends_on/execution_mode、当前 in-progress 项、
+    auto-continue suppression 状态。展示文案（subject/result/error 等）、
+    动态 handoff task id / reason / takeover turn id / sequence 与时间戳
+    不参与，避免无业务变化却不断重置停滞计数。
     显式 session_id 只 peek 注册表已有条目，绝不惰性创建（与
     maybe_clear_completed_plan 的早退防护同理）。
     """
@@ -521,8 +674,8 @@ def plan_state_fingerprint(session_id: str | None = None) -> str:
                 [
                     str(item.get("id", "")),
                     str(item.get("status", "")),
-                    int(item.get("attempts", 0)),
                     list(item.get("depends_on", [])),
+                    str(item.get("execution_mode", "")),
                 ]
                 for item in items
             ),
@@ -635,6 +788,24 @@ def plan_write(items: list[dict[str, Any]] | None = None) -> str:
     return "计划已更新。"
 
 
+def _requested_runtime_fields(*, status, owner, result, error, attempts) -> list[str]:
+    values = {
+        "status": status,
+        "owner": owner,
+        "result": result,
+        "error": error,
+        "attempts": attempts,
+    }
+    return [name for name, value in values.items() if value is not None]
+
+
+def _plan_item_execution_locked(item: dict) -> bool:
+    return (
+        item.get("status") == "in_progress"
+        or item.get("execution_mode") == "takeover_queued"
+    )
+
+
 def plan_update(
     item_id: str,
     status: str | None = None,
@@ -650,44 +821,67 @@ def plan_update(
     attempts: int | None = None,
     verification_type: str | None = None,
 ) -> str:
-    if status in {"in_progress", "completed"}:
-        # LLM 经常尝试通过 plan_update 设置受管状态来标记进度。
-        # 返回明确的引导消息，告知正确的方式是通过 run_subagent 执行计划项。
+    manager = get_default_plan_manager()
+    item = next(
+        (entry for entry in manager.snapshot() if entry["id"] == item_id), None
+    )
+    if item is None:
+        return f"计划项 '{item_id}' 不存在。"
+    runtime_fields = _requested_runtime_fields(
+        status=status, owner=owner, result=result, error=error, attempts=attempts
+    )
+    if runtime_fields:
+        # status/owner/result/error/attempts 是调度器拥有的运行字段，
+        # 模型侧 plan_update 永远不得写入（含 status="pending" 绕过恢复入口）。
+        fields = ", ".join(runtime_fields)
+        if item.get("takeover_required") or item.get("execution_mode") in {
+            "main_takeover",
+            "takeover_queued",
+        }:
+            guidance = (
+                f"超时接管项请用 plan_resume_takeover(item_id='{item_id}') 恢复，"
+                f"接管收尾用 plan_finish(item_id='{item_id}', ...)。"
+            )
+        elif item.get("status") in {"failed", "blocked", "cancelled"}:
+            guidance = f"如需重试，请使用 plan_retry(item_id='{item_id}')。"
+        elif item.get("status") == "completed":
+            guidance = f"接管收尾请使用 plan_finish(item_id='{item_id}', ...)。"
+        else:
+            guidance = f"要执行计划项，请使用 run_subagent(plan_item_id='{item_id}')。"
         return (
-            f"状态变更由调度器自动管理，不能通过 plan_update 手动设置。"
-            f"要执行计划项，请使用 run_subagent(plan_item_id='{item_id}')，"
-            f"调度器会自动将状态从 pending 推进到 in_progress。"
+            f"状态变更由调度器自动管理，不能通过 plan_update 写入运行字段：{fields}。"
+            + guidance
         )
-    if status in {"failed", "blocked", "cancelled"}:
+    if _plan_item_execution_locked(item):
+        # in_progress / takeover_queued 处于执行租约保护期，元数据冻结
         return (
-            f"不能通过 plan_update 将计划项置为 {status}。"
-            f"状态为 failed/blocked/cancelled 的项如需重试，"
-            f"请使用 plan_retry(item_id='{item_id}') 重置为 pending。"
+            f"计划项 '{item_id}' 正在执行租约保护期"
+            f"（status={item.get('status')}, "
+            f"execution_mode={item.get('execution_mode') or 'none'}），"
+            "执行租约期间不可修改 subject、depends_on、files、verification、"
+            "stage 或 kind；待项结束后再调整。"
         )
-    # status == "pending" 是 LLM 重置失败项的自然操作，允许从 terminal 状态恢复
-    updated = get_default_plan_manager().update(
+    # 其余状态只允许修改元数据字段
+    updated = manager.update(
         item_id,
-        status=status,
         subject=subject,
         depends_on=depends_on,
-        owner=owner,
         files=files,
         verification=verification,
         verification_type=verification_type,
         stage=stage,
         kind=kind,
-        result=result,
-        error=error,
-        attempts=attempts,
+        expected_status=str(item.get("status", "")),
+        expected_mode=str(item.get("execution_mode", "")),
     )
     return "计划项已更新。" if updated else f"无法更新计划项: {item_id}"
 
 
-def plan_retry(item_id: str) -> str:
+def plan_retry(item_id: str, force: bool = False) -> str:
     """将失败/阻塞/取消的计划项重置为 pending，允许重新调度执行。
 
-    防盲目重试：当 attempts >= 2 且上次失败原因仍然存在时，提示主 Agent
-    先分析根因并修改任务描述/工具选择，不要原样重试导致重复失败。
+    防盲目重试：当 attempts >= 2 且上次失败原因仍然存在时，调用方必须
+    显式传 force=True，确认已经分析根因后才能重试。
     """
     from core.task_scheduler import get_default_scheduler
 
@@ -696,27 +890,32 @@ def plan_retry(item_id: str) -> str:
     item = next((i for i in snapshot if i["id"] == item_id), None)
     if item is None:
         return f"计划项 '{item_id}' 不存在。"
+    if bool(item.get("takeover_required", False)):
+        return (
+            f"计划项 '{item_id}' 已发生过子 Agent 超时接管，不能通过 plan_retry"
+            " 重置或重新委派。请分析并修正现场后调用 "
+            f"plan_resume_takeover(item_id='{item_id}')，由当前主 Agent 回合继续原尝试。"
+        )
 
     attempts = int(item.get("attempts", 0))
     last_error = str(item.get("error", "")).strip()
 
     # 盲目重试防护：已失败 2 次以上时，要求主 Agent 先分析根因
-    if attempts >= 2 and last_error:
+    if attempts >= 2 and last_error and not force:
         return (
             f"⚠️ 计划项 '{item_id}' 已失败 {attempts} 次，上次失败原因：\n"
             f"  {last_error}\n"
-            f"盲目重试大概率会再次失败。请主 Agent 先分析根因：\n"
+            f"拒绝盲目重试。请主 Agent 先分析根因：\n"
             f"  1. 用 plan_read(item_id='{item_id}') 查看详情\n"
             f"  2. 根据失败原因修改任务描述（如换工具、换方法、拆分子任务）\n"
             f"  3. 用 plan_update(item_id='{item_id}', subject='修改后的任务描述') 更新\n"
-            f"  4. 确认修改后再调用 plan_retry(item_id='{item_id}')\n"
-            f"如确信根因已排除（如网络恢复、模型可用），可再次调用 plan_retry 强制重试。"
+            f"  4. 确认修改后再调用 plan_retry(item_id='{item_id}', force=True) 强制重试。"
         )
 
     if scheduler.retry(item_id):
         if attempts >= 1:
             return (
-                f"计划项 '{item_id}' 已重置为 pending（第 {attempts + 1} 次尝试），"
+                f"计划项 '{item_id}' 已重置为 pending；下一次真实执行将是第 {attempts + 1} 次尝试，"
                 f"可重新调用 run_subagent(plan_item_id='{item_id}') 执行。"
                 f"提示：上次失败原因是「{last_error or '未知'}」，请确保本次执行方式已调整。"
             )
@@ -725,6 +924,164 @@ def plan_retry(item_id: str) -> str:
         f"无法重置计划项 '{item_id}'。"
         f"当前状态为 '{item.get('status', 'unknown')}'，"
         f"只有 failed/blocked/cancelled 状态可以重试。"
+    )
+
+
+def plan_resume_takeover(
+    item_id: str,
+    *,
+    parent_turn_id: str | None = None,
+    event_callback: PlanEventCallback | None = None,
+) -> str:
+    """恢复验证失败/阻塞/取消后的超时接管项，继续原尝试而非重新委派。"""
+    from core.task_scheduler import get_default_scheduler, takeover_handoff_payload
+
+    turn_id = str(parent_turn_id or "").strip()
+    if not turn_id:
+        return "🚨 plan_resume_takeover 缺少运行上下文，无法绑定主 Agent 回合。"
+    scheduler = get_default_scheduler()
+    item_key = str(item_id or "").strip()
+    item = next(
+        (candidate for candidate in scheduler.plan.snapshot() if candidate["id"] == item_key),
+        None,
+    )
+    if item is None:
+        return f"🚨 计划项 '{item_key}' 不存在，无法恢复接管。"
+    if not bool(item.get("takeover_required", False)):
+        return (
+            f"🚨 计划项 '{item_key}' 不是超时接管项，不能使用 plan_resume_takeover。"
+            "普通失败项请分析原因后使用 plan_retry。"
+        )
+    if (
+        item.get("status") == "in_progress"
+        and item.get("execution_mode") == "main_takeover"
+        and str(item.get("takeover_turn_id", "")) == turn_id
+    ):
+        return f"计划项 '{item_key}' 已由当前主 Agent 回合接管，无需重复恢复。"
+    if item.get("status") not in {"failed", "blocked", "cancelled", "pending"}:
+        return (
+            f"🚨 计划项 '{item_key}' 当前状态为 {item.get('status')}，"
+            "不允许恢复接管。"
+        )
+
+    resumed = scheduler.resume_takeover(item_key, turn_id)
+    if resumed is None:
+        active = scheduler.active_takeover(turn_id)
+        if active is not None:
+            return (
+                f"🚨 当前主 Agent 回合已在接管计划项 '{active['id']}'，"
+                f"暂不能同时恢复 '{item_key}'。请先完成当前项。"
+            )
+        return (
+            f"🚨 计划项 '{item_key}' 暂无法恢复接管；请用 plan_read 检查"
+            "依赖、队列和当前接管租约。"
+        )
+    if event_callback is not None:
+        event_callback("plan_item_handoff", takeover_handoff_payload(resumed))
+        event_callback("plan_updated", {
+            "items": scheduler.plan.snapshot(),
+            "live_only": True,
+        })
+    return (
+        f"计划项 '{item_key}' 已恢复为当前主 Agent 接管；"
+        "请直接检查并修正现场，完成后调用 plan_finish 收尾。"
+    )
+
+
+def plan_finish(
+    item_id: str,
+    result: str,
+    *,
+    parent_turn_id: str | None = None,
+    permission_owner: str | None = None,
+    event_callback: PlanEventCallback | None = None,
+    cancel_event: threading.Event | None = None,
+) -> str:
+    """显式完成主 Agent 正在接管的计划项（超时接管收尾专用）。
+
+    只有 active takeover（status=in_progress + execution_mode=main_takeover +
+    takeover_turn_id 与当前回合一致）允许收尾：验证通过 → completed 并自动
+    FIFO 提升下一排队接管项；验证失败 → failed，不重新委派子代理。
+    queued/普通/终态项一律拒绝——模型不能用本工具伪造完成。
+    运行上下文（parent_turn_id/permission_owner/cancel_event/event_callback）
+    由 ToolAdapterSet.execute_plan_finish 注入，不暴露给模型 schema。
+    """
+    from core.task_scheduler import get_default_scheduler, takeover_handoff_payload
+
+    if not str(parent_turn_id or "").strip():
+        return (
+            "🚨 plan_finish 缺少运行上下文（parent_turn_id），"
+            "无法核对接管租约。"
+        )
+    scheduler = get_default_scheduler()
+    item = next(
+        (i for i in scheduler.plan.snapshot() if i["id"] == str(item_id).strip()),
+        None,
+    )
+    if item is None:
+        return f"🚨 计划项 '{item_id}' 不存在，无法 plan_finish。"
+    if (
+        item.get("status") != "in_progress"
+        or item.get("execution_mode") != "main_takeover"
+        or str(item.get("takeover_turn_id", "")) != str(parent_turn_id)
+    ):
+        return (
+            f"🚨 计划项 '{item_id}' 不是本回合的 active 接管项"
+            f"（status={item.get('status')}, "
+            f"execution_mode={item.get('execution_mode') or '""'}）。"
+            "plan_finish 只能完成主 Agent 正在接管的计划项；"
+            "普通计划项由子代理执行完成，queued 项需先被提升接管。"
+        )
+    subject = str(item.get("subject") or item_id)
+
+    def verification_runner(command):
+        from core.tools import make_authorized_verification_runner
+
+        return make_authorized_verification_runner(
+            permission_owner=permission_owner,
+            parent_turn_id=str(parent_turn_id),
+            permission_source=f"计划收尾验证：{subject}",
+            cancel_event=cancel_event,
+            event_callback=event_callback,
+        )(command)
+
+    completed = scheduler.complete(
+        item_id,
+        str(result or ""),
+        verification_runner=verification_runner,
+        cancel_event=cancel_event,
+    )
+    promoted = scheduler.promote_next_takeover(str(parent_turn_id))
+    if event_callback is not None:
+        if promoted is not None:
+            event_callback(
+                "plan_item_handoff", takeover_handoff_payload(promoted)
+            )
+        event_callback("plan_updated", {
+            "items": scheduler.plan.snapshot(),
+            "live_only": True,
+        })
+    if completed:
+        if promoted is not None:
+            return (
+                f"计划项 '{item_id}' 已完成。排队接管项 '{promoted['id']}' "
+                f"（{promoted.get('subject', '')}）已提升为主 Agent 接管，"
+                "请先只读核查现场再继续执行，完成后 plan_finish。"
+            )
+        return f"计划项 '{item_id}' 已完成，接管流程结束。"
+    failed_item = next(
+        (i for i in scheduler.plan.snapshot() if i["id"] == item_id), None
+    )
+    detail = str((failed_item or {}).get("error") or "验证未通过").strip()
+    if promoted is not None:
+        return (
+            f"🚨 计划项 '{item_id}' 收尾验证未通过，已标记为 failed：{detail}。"
+            f"排队接管项 '{promoted['id']}' 已提升为主 Agent 接管，"
+            "请核查后继续。"
+        )
+    return (
+        f"🚨 计划项 '{item_id}' 收尾验证未通过，已标记为 failed：{detail}。"
+        "不要重新委派子代理；请分析失败原因、修正现场后重新接管收尾。"
     )
 
 

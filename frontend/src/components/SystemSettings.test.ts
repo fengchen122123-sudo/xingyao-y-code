@@ -6,6 +6,13 @@ import SystemSettings from './SystemSettings.vue';
 import { useAppStore } from '../stores/appStore';
 
 
+const turnStepLimitFields = {
+  agent_turn_step_limit: 100,
+  agent_turn_step_limit_min: 10,
+  agent_turn_step_limit_max: 1000,
+};
+
+
 describe('SystemSettings', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
@@ -18,6 +25,7 @@ describe('SystemSettings', () => {
       command_shell_available: true,
       command_shell_error: '',
       remote_token_ttl: 86400,
+      ...turnStepLimitFields,
       command_shell_options: [
         {
           id: 'pwsh', label: 'PowerShell 7+', description: '现代 PowerShell',
@@ -47,6 +55,7 @@ describe('SystemSettings', () => {
       command_shell_available: true,
       command_shell_error: '',
       remote_token_ttl: 86400,
+      ...turnStepLimitFields,
       command_shell_options: [
         {
           id: 'auto', label: '自动（系统默认）', description: '兼容旧行为',
@@ -73,6 +82,7 @@ describe('SystemSettings', () => {
       command_shell_available: true,
       command_shell_error: '',
       remote_token_ttl: 86400,
+      ...turnStepLimitFields,
       command_shell_options: [],
     };
     const save = vi.spyOn(store, 'setRemoteTokenTtl').mockResolvedValue(true);
@@ -84,5 +94,44 @@ describe('SystemSettings', () => {
     await select.setValue('604800');
 
     expect(save).toHaveBeenCalledWith(604800);
+  });
+
+  it('saves a valid custom turn step limit', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setAgentTurnStepLimit').mockResolvedValue(true);
+    const wrapper = mount(SystemSettings);
+
+    await wrapper.get('[data-test="turn-step-limit-input"]').setValue('300');
+    await wrapper.get('[data-test="save-turn-step-limit"]').trigger('click');
+
+    expect(save).toHaveBeenCalledWith(300);
+  });
+
+  it('does not call the backend for an out-of-range value', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setAgentTurnStepLimit').mockResolvedValue(true);
+    const wrapper = mount(SystemSettings);
+
+    await wrapper.get('[data-test="turn-step-limit-input"]').setValue('1001');
+
+    expect(wrapper.get('[data-test="turn-step-limit-error"]').text()).toContain('10–1000');
+    expect(wrapper.get('[data-test="save-turn-step-limit"]').attributes('disabled')).toBeDefined();
+    expect(save).not.toHaveBeenCalled();
   });
 });

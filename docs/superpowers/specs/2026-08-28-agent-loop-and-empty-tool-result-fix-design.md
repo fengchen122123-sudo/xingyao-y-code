@@ -460,3 +460,70 @@ venv\Scripts\python.exe -m py_compile core/llm.py core/tools.py core/tool_regist
 - “执行成功但没有输出”的等待命令显著下降；
 - 真正停滞的 Turn 在 6 个无进展 Step 后明确失败；
 - 正常执行和长任务成功率不下降。
+
+---
+
+## 14. 后续增补（2026-08-28 超时接管修复）
+
+本 spec 发布后，审查发现"后台任务 revision/wait"实现存在确定性缺陷，且出现了一类
+本 spec 未覆盖的独立故障：计划项子代理前台超时后走 failed → plan_retry → 新
+run_subagent 的重派链，形成 30/40 分钟级重复等待循环。超时循环属于独立故障类型，
+不是无进展循环的子情形，已由独立实施计划修复：
+
+- 实施计划：`docs/superpowers/plans/2026-08-28-agent-loop-hardening-and-subagent-timeout-takeover.md`
+- 修复内容：后台任务终态持久化与容量、wait 参数严格校验与任务指纹同步、
+  attempts 语义修正（单次真实执行只计一次 + 显式 force 重试）、计划项级接管状态机
+  （delegated/main_takeover/takeover_queued + FIFO 队列）、子 Agent 首次超时原子移交
+  （旧执行者先取消再移交 + 执行租约 fencing）、主 Agent scoped 执行权与显式
+  `plan_finish` 收尾、TurnProgressGuard 接管读取预算与动态结果去噪、
+  子 Agent 时间预算上限与任务描述体积上限、GUI/CLI 接管状态展示。
+- 与本 spec 的关系：本 spec 的"无进展熔断（NoProgressError）"继续负责普通
+  无进展循环；超时接管不消耗重试次数、不重新委派，两者正交。本 spec 的
+  历史问题陈述与验收标准保持原样，未因增补改写。
+
+### 14.1 审查加固后的规范（2026-08-29）
+
+后续严格审查发现，只有 `execution_mode` 不足以表达“该计划项已经发生过超时、
+永远不得重新委派”的不可逆业务事实。最终加固方案与执行记录见：
+`docs/superpowers/plans/2026-08-28-agent-loop-hardening-review-remediation.md`。
+以下规则覆盖早期实现说明中与之冲突的部分：
+
+1. 计划项以持久字段 `takeover_required=true` 记录首次超时事实。验证失败、进程重启、
+   普通 retry 或临时 execution mode 变化都不得清除此字段；普通 `plan_retry` 与
+   `run_subagent(plan_item_id=同一项)` 必须拒绝该项。
+2. 主 Agent 每个真实回合在第一次 Provider 请求前，从本会话 FIFO 队列认领一个接管项；
+   回合正常结束但未 `plan_finish` 时释放并重新排队，用户主动取消则落 `cancelled`，
+   不自动恢复。子 Agent 回合不得认领主 Agent 接管项。
+3. `plan_finish` 验证失败后只能由 `plan_resume_takeover(item_id=...)` 显式恢复同一次尝试，
+   不增加 `attempts`/`delegation_count`，也不得创建第二个子 Agent task。
+4. 子 Agent 终态 callback 必须 exactly-once；callback 完成、状态回写与通知完成以前，
+   `done_event`、idle、drain 和容量淘汰均不得提前宣告终态完成。
+5. 执行租约 fencing 只接受严格的 `subagent-[0-9a-f]{8}` task id；租约查询异常 fail-closed。
+   接管文件范围使用 canonical real path 比较，权限模式与沙盒边界继续生效。
+6. 计划指纹只包含稳定调度字段，不含 attempts、task id、耗时或错误文案。计划绑定的
+   `run_subagent` 由计划快照判定进展；无计划委派使用 canonical arguments 与稳定
+   status/result 信号，动态 task id 不得续命。
+7. 模型工具 adapter 不接受隐藏的 `timeout_seconds`；角色默认预算由系统选择。内部
+   Python 调用仍受前台 600 秒、后台 3600 秒硬上限。
+8. `plan_updated` 完整快照是 GUI 可恢复事实源；initial/claimed/promoted/resumed 均使用
+   `plan_item_handoff(item/source_task_id/mode/queue_position)`，队列位置在调度器锁内计算。
+   CLI 同状态去重，旧子 Agent 卡片保持 `timed_out`。
+
+### 14.2 提交前任务闭环稳定性增补（2026-08-30）
+
+提交前审查动态复现了终态屏障、计划写入边界与文件租约的残余缺陷，最终不变量如下
+（实施与验证记录见
+`docs/superpowers/plans/2026-08-30-precommit-task-closure-stability-remediation.md`）：
+
+1. 前台结果只能在 `done_event` 设置后可见：`SubagentManager.run()` 不得以
+   终态 status 为由提前返回；父取消与超时路径经 `_terminate()` 返回前已设置
+   `done_event`，其余路径一律等待该屏障。
+2. 模型不能写调度器运行字段：`plan_update` 拒绝 status/owner/result/error/attempts
+   的一切写入（含用 `status="pending"` 绕过恢复入口）；`in_progress` 与
+   `takeover_queued` 项处于执行租约保护期，计划元数据冻结。
+3. 文件租约按 item id 保存认领快照（`_in_flight_files_by_item`），并从同一快照
+   释放；释放绝不读取可能已变化的计划字段。
+4. 崩溃恢复的 queued takeover 晋升 `main_takeover` 前必须重新成功 claim 文件租约；
+   冲突时保持 queued，绝不无锁运行。
+5. persistence 测试直接 patch `core.app_context.get_manager` 边界，禁止依赖
+   main/gui 入口的导入副作用。

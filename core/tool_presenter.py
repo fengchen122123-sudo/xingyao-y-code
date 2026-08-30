@@ -156,6 +156,13 @@ def build_tool_display(
         error_content = str(result_data.get("content", "") or "").lstrip("🚨").strip()
         error_summary = sanitize_tool_display_text(error_content, 160)
 
+    # D8：后台语义来自工具入参，不从可变的人类文案反向推断。
+    background = (
+        name == "execute_command"
+        and ok is True
+        and arguments.get("run_in_background") is True
+    )
+
     return {
         "category": category,
         "action": sanitize_tool_display_text(
@@ -166,6 +173,7 @@ def build_tool_display(
         "metrics": metrics,
         "error_summary": error_summary,
         "is_skill": bool(skill_name),
+        "background": background,
     }
 
 

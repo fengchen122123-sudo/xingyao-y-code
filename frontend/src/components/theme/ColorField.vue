@@ -103,4 +103,11 @@ watch(
 .color-field.invalid .color-hex { border-color: var(--red); }
 .field-error { font-size: 11px; color: var(--red); }
 .mono { font-family: var(--mono); }
+
+/* 手机端（≤480px）：标签/文本框允许收缩，错误信息换行显示，避免一行撑破卡片 */
+@media (max-width: 480px) {
+  .color-label { min-width: 0; flex: none; }
+  .color-hex { flex: 1 1 auto; width: auto; min-width: 0; }
+  .field-error { flex: 1 1 100%; }
+}
 </style>

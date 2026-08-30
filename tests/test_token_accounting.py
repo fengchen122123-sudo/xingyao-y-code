@@ -494,3 +494,80 @@ def test_non_main_usage_increases_process_cost_without_overwriting_main(monkeypa
     assert after_snapshot["cache"] == before_snapshot["cache"]
     with llm.token_usage_lock:
         assert llm.session_token_usage["cumulative_total"] == before_process_total + 550
+
+
+def test_account_server_usage_notifies_listener_after_successful_accounting(monkeypatch):
+    """每次记账成功后必须通知 UI 监听器（GUI 据此实时推送 token_usage 事件），
+    让统计栏与上下文圆圈在回合进行中逐请求刷新，而非等整个回合结束。"""
+    import core.llm as llm
+
+    monkeypatch.setattr(llm, "_persist_token_usage", lambda *args, **kwargs: None)
+    notified = []
+
+    listener = lambda: notified.append(1)  # noqa: E731
+    llm.set_token_usage_listener(listener)
+    llm._account_server_usage(
+        {
+            "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+            "prompt_cache_hit_tokens": 50, "prompt_cache_miss_tokens": 50,
+        },
+        model_name="openai/deepseek-v4",
+        api_base="https://listener.example/v1",
+        session_id="accounting-listener",
+        cache_scope="main",
+        invalidation_reason="",
+    )
+    llm.set_token_usage_listener(None)
+    llm._account_server_usage(
+        {
+            "prompt_tokens": 10, "completion_tokens": 2, "total_tokens": 12,
+            "prompt_cache_hit_tokens": 5, "prompt_cache_miss_tokens": 5,
+        },
+        model_name="openai/deepseek-v4",
+        api_base="https://listener.example/v1",
+        session_id="accounting-listener",
+        cache_scope="main",
+        invalidation_reason="",
+    )
+
+    # 主 scope 记账后通知一次；注销后不再通知
+    assert notified == [1]
+
+
+def test_account_server_usage_swallows_listener_errors(monkeypatch, caplog):
+    """监听器抛异常不得影响记账主流程：计数器与持久化都必须照常完成。"""
+    import logging
+
+    import core.llm as llm
+
+    persisted = []
+    monkeypatch.setattr(
+        llm, "_persist_token_usage",
+        lambda *args, **kwargs: persisted.append(kwargs),
+    )
+
+    def _boom():
+        raise RuntimeError("listener crashed")
+
+    llm.set_token_usage_listener(_boom)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="core.llm"):
+            result = llm._account_server_usage(
+                {
+                    "prompt_tokens": 100, "completion_tokens": 20,
+                    "total_tokens": 120, "prompt_cache_hit_tokens": 50,
+                    "prompt_cache_miss_tokens": 50,
+                },
+                model_name="openai/deepseek-v4",
+                api_base="https://listener-crash.example/v1",
+                session_id="accounting-listener-crash",
+                cache_scope="main",
+                invalidation_reason="",
+            )
+    finally:
+        llm.set_token_usage_listener(None)
+
+    assert result["valid"] is True
+    assert persisted and persisted[0]["prompt_tokens"] == 100
+    with llm.token_usage_lock:
+        assert llm.session_token_usage["latest_prompt"] == 100

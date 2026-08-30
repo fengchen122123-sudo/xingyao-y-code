@@ -30,17 +30,15 @@ def test_registry_exposes_fetch_url_and_weather_as_read_only_network_tools():
         assert spec.parallel_safe is True
 
 
-def test_subagent_schema_defaults_to_foreground_with_bounded_timeout():
+def test_subagent_schema_defaults_to_foreground_and_hides_timeout():
     schema = build_default_registry().get("run_subagent").api_schema()
     properties = schema["function"]["parameters"]["properties"]
 
     assert properties["run_in_background"]["default"] is False
-    # 超时不再有统一 default：未传时由 run_subagent 按角色解析
-    # （explore 240 / review 300 / test 480 / 其他 600），schema 只约束范围
-    assert "default" not in properties["timeout_seconds"]
-    assert properties["timeout_seconds"]["minimum"] == 30
-    assert properties["timeout_seconds"]["maximum"] == 3600
-    assert "explore 240" in properties["timeout_seconds"]["description"]
+    # 时间预算由系统内部管理（Task 8）：模型可见 schema 不再暴露
+    # timeout_seconds；内部默认值仍为 explore 240 / review 300 /
+    # test 480 / implement、general 600，前台硬上限 600 秒
+    assert "timeout_seconds" not in properties
 
 
 def test_subagent_schema_exposes_role_and_plan_item():
@@ -99,6 +97,24 @@ def test_plan_schema_exposes_orchestration_fields():
 
     update_properties = registry.get("plan_update").api_schema()["function"]["parameters"]["properties"]
     assert {"depends_on", "owner", "files", "verification", "verification_type", "stage", "kind"} <= set(update_properties)
+
+
+def test_plan_retry_schema_exposes_optional_explicit_force():
+    parameters = build_default_registry().get("plan_retry").api_schema()["function"]["parameters"]
+
+    assert parameters["required"] == ["item_id"]
+    assert parameters["properties"]["force"]["type"] == "boolean"
+
+
+def test_plan_resume_takeover_schema_only_exposes_item_id():
+    parameters = (
+        build_default_registry()
+        .get("plan_resume_takeover")
+        .api_schema()["function"]["parameters"]
+    )
+
+    assert parameters["required"] == ["item_id"]
+    assert set(parameters["properties"]) == {"item_id"}
 
 
 def test_weather_schema_requires_a_city_instead_of_guessing():
@@ -185,3 +201,15 @@ def test_manage_task_schema_exposes_wait_parameters():
     assert properties["timeout_seconds"]["minimum"] == 1
     assert properties["timeout_seconds"]["maximum"] == 60
     assert properties["timeout_seconds"]["default"] == 30
+
+
+def test_run_subagent_schema_does_not_expose_timeout_seconds():
+    """模型可见 schema 不再暴露 timeout_seconds：时间预算由系统内部管理。"""
+    from core.tool_registry import build_default_registry
+
+    schema = (
+        build_default_registry()
+        .get("run_subagent")
+        .api_schema()["function"]["parameters"]
+    )
+    assert "timeout_seconds" not in schema["properties"]

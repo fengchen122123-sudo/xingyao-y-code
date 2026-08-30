@@ -11,6 +11,7 @@
     <div class="trace-main">
       <div class="trace-title">
         <span>{{ title }}</span>
+        <span v-if="takeoverBadge" class="trace-takeover-badge">{{ takeoverBadge }}</span>
         <span v-if="durationText" class="trace-duration">{{ durationText }}</span>
       </div>
       <div v-if="row.command || row.detail || row.errorSummary" class="trace-detail">
@@ -183,6 +184,27 @@ function subagentStageClass(task: SubagentTaskSnapshot) {
   return 'run';
 }
 
+// 子 Agent 超时接管标记：结果 JSON 带 handoff 字段时展示固定徽标，
+// 卡片状态保持 timed_out，不与 completed 合并
+const takeoverBadge = computed(() => {
+  for (const call of props.row.calls) {
+    const text = call.result?.result ?? '';
+    if (!text) continue;
+    try {
+      const payload = JSON.parse(text);
+      if (payload?.status === 'timed_out' && payload?.handoff === 'main_takeover') {
+        return '主 Agent 已接管';
+      }
+      if (payload?.status === 'timed_out' && payload?.handoff === 'takeover_queued') {
+        return '等待主 Agent 接管';
+      }
+    } catch {
+      // 非 JSON 结果（普通失败文本等）不展示徽标，继续检查其他调用
+    }
+  }
+  return '';
+});
+
 // 结果文本：只拼接有实际内容的调用结果，全部为空则不显示展开按钮
 const resultText = computed(() =>
   props.row.calls
@@ -263,6 +285,16 @@ function diffLineClass(line: string) {
   gap: 8px;
   font-weight: 600;
   color: var(--text);
+}
+.trace-takeover-badge {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--warning, #d97706);
+  border: 1px solid currentColor;
+  border-radius: 999px;
+  padding: 0 8px;
+  line-height: 18px;
 }
 .trace-duration {
   margin-left: auto;

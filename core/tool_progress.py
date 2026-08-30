@@ -29,6 +29,7 @@ class ToolDisplayEvent:
     is_skill: bool
     ok: bool | None
     duration_ms: int | None
+    background: bool = False
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, object]) -> "ToolDisplayEvent":
@@ -72,6 +73,7 @@ class ToolDisplayEvent:
             is_skill=bool(display.get("is_skill")),
             ok=ok_value if isinstance(ok_value, bool) else None,
             duration_ms=duration_ms,
+            background=bool(display.get("background")),
         )
 
 
@@ -220,7 +222,15 @@ class ToolProgressAggregator:
 
     @staticmethod
     def _success_lines(event: ToolDisplayEvent) -> list[str]:
-        summary = "命令执行完成" if event.category == "command" else f"已{event.action}"
+        if event.category == "command":
+            # D8：后台任务只表示"已启动"，不能显示"命令执行完成"误导用户
+            summary = (
+                "后台任务已启动（用 /tasks 管理）"
+                if event.background
+                else "命令执行完成"
+            )
+        else:
+            summary = f"已{event.action}"
         target = f" {event.target}" if event.target and event.category != "command" else ""
         lines = [
             f"{ANSI_GREEN}✓{ANSI_RESET} {summary}{target} · {_format_duration(event.duration_ms or 0)}\n"

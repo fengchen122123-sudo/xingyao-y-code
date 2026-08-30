@@ -153,6 +153,40 @@ def test_plan_managers_isolated_between_parallel_sessions(tmp_path):
     assert plan_file_b.exists()
 
 
+def test_undo_state_routes_to_parallel_gui_thread_sessions(tmp_path):
+    """GUI 回合只绑定 app_context 时，undo 记录仍须按线程会话隔离。"""
+    from core import memory as memory_module
+
+    dir_a, dir_b = tmp_path / "undo-a", tmp_path / "undo-b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    barrier = threading.Barrier(2)
+    results = {}
+
+    def _record(path, old_content):
+        def _fn():
+            memory_module.clear_undo_session()
+            memory_module.set_undo_state(str(path), old_content)
+            barrier.wait(timeout=30)
+            return memory_module.get_undo_state()
+        return _fn
+
+    run_a = start_session_worker(
+        "gui-undo-A", dir_a, _record(dir_a / "a.txt", "old-a"), results, "A"
+    )
+    run_b = start_session_worker(
+        "gui-undo-B", dir_b, _record(dir_b / "b.txt", "old-b"), results, "B"
+    )
+    join_workers(run_a, run_b)
+
+    assert results["A"][0] == "ok", results["A"]
+    assert results["B"][0] == "ok", results["B"]
+    assert results["A"][1]["old_content"] == "old-a"
+    assert results["B"][1]["old_content"] == "old-b"
+    assert memory_module.get_undo_state("gui-undo-A")["old_content"] == "old-a"
+    assert memory_module.get_undo_state("gui-undo-B")["old_content"] == "old-b"
+
+
 def test_plan_isolated_between_sessions_in_same_directory(tmp_path):
     """同一目录下的两个会话（GUI 多会话打开同一项目）计划互不可见。
 
@@ -626,3 +660,62 @@ def test_unbound_thread_falls_back_to_default_singletons(tmp_path):
     tools_module.set_session_sandbox_bypass(True)
     assert tools_module.is_session_sandbox_bypass_enabled() is True
     tools_module.set_session_sandbox_bypass(False)
+
+
+def test_takeover_queue_is_isolated_between_session_schedulers(tmp_path):
+    """接管租约按会话调度器隔离：同名计划项/同 turn 查询不得跨会话命中。
+
+    接管状态只允许存放在会话自己的 PlanManager/TaskScheduler 实例内；
+    任何进程级全局 active-id 都会造成跨会话串扰。
+    """
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan_a = PlanManager(storage_dir=tmp_path / "plans-a", session_id="iso-a")
+    plan_b = PlanManager(storage_dir=tmp_path / "plans-b", session_id="iso-b")
+    plan_a.replace([
+        {"id": "item", "subject": "work-a"},
+        {"id": "item-a2", "subject": "work-a2"},
+    ])
+    plan_b.replace([
+        {"id": "item", "subject": "work-b"},
+        {"id": "item-b2", "subject": "work-b2"},
+    ])
+    scheduler_a = TaskScheduler(plan_a, max_workers=2)
+    scheduler_b = TaskScheduler(plan_b, max_workers=2)
+
+    for scheduler, source, turn in (
+        (scheduler_a, "subagent-a", "turn-a"),
+        (scheduler_b, "subagent-b", "turn-b"),
+    ):
+        for item_id in ("item", "item-a2" if scheduler is scheduler_a else "item-b2"):
+            assert scheduler.start_delegated_item(
+                item_id, f"{source}-{item_id}", "subagent:implement", None
+            ) is True
+        assert scheduler.handoff_to_main(
+            "item", f"{source}-item", turn, "timeout"
+        ) is not None
+        assert scheduler.handoff_to_main(
+            "item-a2" if scheduler is scheduler_a else "item-b2",
+            f"{source}-{'item-a2' if scheduler is scheduler_a else 'item-b2'}",
+            turn,
+            "timeout",
+        ) is not None
+
+    # 各会话的 active 接管项只归属自己的 turn
+    assert scheduler_a.active_takeover("turn-a")["id"] == "item"
+    assert scheduler_b.active_takeover("turn-b")["id"] == "item"
+    assert scheduler_a.active_takeover("turn-b") is None
+    assert scheduler_b.active_takeover("turn-a") is None
+
+    # 会话 A 完成并清空自己的队列后，不得跨会话认领会话 B 的排队项
+    assert scheduler_a.complete("item", "done") is True
+    assert scheduler_a.promote_next_takeover("turn-a")["id"] == "item-a2"
+    assert scheduler_a.complete("item-a2", "done") is True
+    assert scheduler_a.promote_next_takeover("turn-a") is None
+
+    # 会话 B 的队列不受会话 A 影响
+    assert scheduler_b.complete("item", "done") is True
+    promoted_b = scheduler_b.promote_next_takeover("turn-b")
+    assert promoted_b is not None
+    assert promoted_b["id"] == "item-b2"

@@ -224,7 +224,7 @@ const hasLocalChanges = computed(() => {
 const initialDraft = store.guiThemeDraft ?? store.savedGuiTheme;
 const draft = ref<GuiTheme | null>(initialDraft ? clone(initialDraft) : null);
 
-const selectedRegion = ref<'global' | ThemeRegionId | 'native_titlebar'>('workspace');
+const selectedRegion = ref<'global' | ThemeRegionId | 'native_titlebar'>('global');
 const fieldsValid = ref(true);
 const busy = ref(false);
 const actionError = ref('');
@@ -645,11 +645,11 @@ async function clearGlobalInherit() {
 </script>
 
 <style scoped>
-.gui-theme-settings { display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 20px; align-items: start; }
-.theme-list { border: 1px solid var(--border); border-radius: 14px; background: var(--bg1); padding: 14px; display: flex; flex-direction: column; gap: 6px; }
+.gui-theme-settings { width: 100%; min-width: 0; display: grid; grid-template-columns: 250px minmax(0, 1fr); gap: 20px; align-items: start; }
+.theme-list { min-width: 0; max-width: 100%; border: 1px solid var(--border); border-radius: 14px; background: var(--bg1); padding: 14px; display: flex; flex-direction: column; gap: 6px; }
 .list-title { font-size: 12px; font-weight: 600; color: var(--text-faint); padding: 2px 6px 8px; }
 .theme-list-error { padding: 9px 11px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--red); font-size: 11.5px; line-height: 1.5; margin-bottom: 6px; }
-.theme-item-row { display: flex; align-items: center; gap: 4px; }
+.theme-item-row { min-width: 0; display: flex; align-items: center; gap: 4px; }
 .theme-item { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; padding: 9px 11px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: var(--text-dim); text-align: left; font-size: 13px; }
 .theme-item-delete { width: 26px; height: 26px; flex-shrink: 0; border: 0; border-radius: 7px; background: transparent; color: var(--text-faint); font-size: 15px; line-height: 1; display: flex; align-items: center; justify-content: center; cursor: pointer; opacity: 0; transition: opacity 0.12s, color 0.12s, background 0.12s; }
 .theme-item-row:hover .theme-item-delete { opacity: 1; }
@@ -657,25 +657,25 @@ async function clearGlobalInherit() {
 .theme-item:hover { background: var(--bg2); color: var(--text); }
 .theme-item.active { background: var(--bg3); color: var(--text); border-color: var(--border); }
 .theme-item-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.theme-item-tag { font-size: 10.5px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; }
+.theme-item-tag { flex: none; font-size: 10.5px; color: var(--text-faint); border: 1px solid var(--border); border-radius: 6px; padding: 1px 6px; }
 .theme-item.builtin .theme-item-tag { color: var(--accent); border-color: color-mix(in srgb, var(--accent) 40%, var(--border)); }
 .theme-import { margin-top: 8px; padding: 9px; border: 1px dashed var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); font-size: 12.5px; }
 .theme-import:hover { border-color: var(--accent); color: var(--accent); }
 .list-hint { margin: 10px 4px 0; font-size: 11px; color: var(--text-faint); line-height: 1.6; }
-.theme-editor { border: 1px solid var(--border); border-radius: 14px; background: var(--bg1); padding: 20px 22px; }
-.theme-editor-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; }
-.theme-id-row { display: flex; align-items: center; gap: 10px; }
+.theme-editor { min-width: 0; max-width: 100%; border: 1px solid var(--border); border-radius: 14px; background: var(--bg1); padding: 20px 22px; }
+.theme-editor-head { min-width: 0; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 14px; }
+.theme-id-row { min-width: 0; display: flex; align-items: center; gap: 10px; }
 .head-label { font-size: 12px; color: var(--text-dim); }
 .theme-name-input { min-height: 36px; width: 200px; padding: 0 12px; border: 1px solid var(--border); border-radius: 9px; background: var(--bg2); color: var(--text); font-size: 13px; }
 .theme-id { font-size: 11px; color: var(--text-faint); }
-.theme-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.theme-actions { min-width: 0; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .theme-actions button { min-height: 32px; padding: 0 12px; border: 1px solid var(--border); border-radius: 8px; background: var(--bg3); color: var(--text); font-size: 12px; }
 .theme-actions button.danger { color: var(--red); }
 .theme-actions button.primary-button { background: var(--accent); border-color: var(--accent); color: #ffffff; font-weight: 600; }
 .theme-actions button:disabled { opacity: 0.5; cursor: not-allowed; }
 .builtin-hint { font-size: 11.5px; color: var(--text-faint); }
 .theme-action-error { margin-top: 14px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--red) 45%, var(--border)); border-radius: 9px; background: color-mix(in srgb, var(--red) 8%, var(--bg2)); color: var(--red); font-size: 12px; }
-.region-tabs { display: flex; flex-wrap: wrap; gap: 7px; margin: 18px 0 16px; }
+.region-tabs { max-width: 100%; display: flex; flex-wrap: wrap; gap: 7px; margin: 18px 0 16px; }
 .region-tabs button { padding: 7px 12px; border: 1px solid var(--border); border-radius: 9px; background: transparent; color: var(--text-dim); font-size: 12px; }
 .region-tabs button:hover { color: var(--text); background: var(--bg2); }
 .region-tabs button.active { background: var(--bg3); color: var(--text); border-color: var(--accent); }
@@ -691,5 +691,26 @@ async function clearGlobalInherit() {
 .mono { font-family: var(--mono); }
 @media (max-width: 1100px) {
   .gui-theme-settings { grid-template-columns: 1fr; }
+}
+/* ── 手机端（≤768px）：卡片严格收在内容区内，操作区按触控尺寸重排。 ── */
+@media (max-width: 768px) {
+  .gui-theme-settings { grid-template-columns: minmax(0, 1fr); gap: 12px; }
+  .theme-list { max-height: 40vh; overflow-y: auto; -webkit-overflow-scrolling: touch; padding: 10px; border-radius: 12px; }
+  .theme-item { min-height: 42px; padding: 9px 10px; }
+  .theme-item-delete { width: 32px; height: 32px; opacity: 1; }
+
+  .theme-editor { padding: 14px 12px; border-radius: 12px; }
+
+  .theme-editor-head { flex-direction: column; align-items: stretch; gap: 12px; }
+  .theme-id-row { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 7px 10px; }
+  .theme-name-input { width: 100%; min-width: 0; }
+  .theme-id { grid-column: 1 / -1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  .theme-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; align-items: stretch; }
+  .theme-actions button { width: 100%; min-width: 0; min-height: 38px; padding: 0 8px; }
+  .builtin-hint { grid-column: 1 / -1; }
+
+  .region-tabs { flex-wrap: nowrap; overflow-x: auto; overscroll-behavior-inline: contain; -webkit-overflow-scrolling: touch; margin: 14px 0 12px; padding: 0 0 6px; scrollbar-width: thin; }
+  .region-tabs button { flex: none; min-height: 38px; }
 }
 </style>

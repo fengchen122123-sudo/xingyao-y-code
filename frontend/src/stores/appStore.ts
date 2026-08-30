@@ -298,6 +298,9 @@ export const useAppStore = defineStore('app', {
       command_shell_available: true,
       command_shell_error: '',
       remote_token_ttl: 86400,
+      agent_turn_step_limit: 100,
+      agent_turn_step_limit_min: 10,
+      agent_turn_step_limit_max: 1000,
     } as SystemSettingsSnapshot,
 
     // 当前激活模型的思考能力与选择；未知模型保持隐藏，不在前端猜测能力。
@@ -1424,6 +1427,27 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    async setAgentTurnStepLimit(value: number): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_agent_turn_step_limit(value);
+        if (result && result.ok) {
+          this.systemSettings = result.settings;
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', '单任务最大模型轮次设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', '单任务最大模型轮次设置失败: ' + err);
+        return false;
+      }
+    },
+
     // 选择/清除副模型（传空字符串清除），对齐 CLI 的 set_secondary
     async setSecondaryModel(modelId: string) {
       const api = this._api();
@@ -2361,11 +2385,33 @@ export const useAppStore = defineStore('app', {
         }
       } else if (type === 'plan_updated') {
         if (Array.isArray(data.items)) {
+          const terminalStatuses = new Set(['completed', 'done', 'x', 'failed', 'blocked', 'cancelled']);
+          const queued = data.items
+            .filter((it: any) => it?.execution_mode === 'takeover_queued' && !terminalStatuses.has(String(it?.status || '')))
+            .sort((a: any, b: any) => {
+              const sequenceDiff = Number(a?.takeover_sequence || 0) - Number(b?.takeover_sequence || 0);
+              return sequenceDiff || String(a?.id || '').localeCompare(String(b?.id || ''));
+            });
+          const queuePositions = new Map(
+            queued.map((it: any, index: number) => [String(it?.id || ''), index + 1]),
+          );
           const items = data.items.map((it: any) => ({
             id: it.id || String(Math.random()),
             // 后端计划项的正文字段是 subject（见 core/plan.py snapshot）
             text: it.subject || it.text || it.title || '',
             status: it.status === 'completed' || it.status === 'done' || it.status === 'x' ? 'done' : (it.status === 'in_progress' || it.status === '/' ? 'in_progress' : 'todo'),
+            execution_mode: String(it.execution_mode || ''),
+            owner: String(it.owner || ''),
+            takeover_required: Boolean(it.takeover_required),
+            handoff_reason: String(it.handoff_reason || ''),
+            takeover_sequence: Number(it.takeover_sequence || 0),
+            handoff_note: terminalStatuses.has(String(it.status || ''))
+              ? undefined
+              : it.execution_mode === 'main_takeover'
+                ? '子 Agent 已超时，主 Agent 正在接管并核查现场'
+                : it.execution_mode === 'takeover_queued'
+                  ? `等待主 Agent 接管（队列第 ${queuePositions.get(String(it.id || '')) || 1} 项）`
+                  : undefined,
           }));
           const doneCount = items.filter((i: any) => i.status === 'done').length;
           const progress = items.length > 0 ? Math.round((doneCount / items.length) * 100) : 0;
@@ -2374,6 +2420,43 @@ export const useAppStore = defineStore('app', {
             items,
             progress,
           };
+          this._captureRuntime(targetRuntimeKey);
+        }
+      } else if (type === 'plan_item_handoff') {
+        // 子 Agent 超时接管可见性：只更新本会话计划项的执行模式/owner，
+        // 不改变调度状态（真实状态唯一来源仍是 PlanManager/TaskScheduler）；
+        // 旧子 Agent 卡片保持 timed_out，计划卡片显示 main_takeover，
+        // 两者不得合并成 completed
+        const handoffItem = (data.item || {}) as any;
+        const handoffId = String(handoffItem.id || '');
+        if (handoffId) {
+          const handoffMode = String(data.mode || handoffItem.execution_mode || '');
+          const queuePos = Number(data.queue_position || 0);
+          const handoffNote = handoffMode === 'takeover_queued'
+            ? (queuePos > 0
+              ? `等待主 Agent 接管（队列第 ${queuePos} 项）`
+              : '等待主 Agent 接管')
+            : '子 Agent 已超时，主 Agent 正在接管并核查现场';
+          const items = Array.isArray(this.planData.items) ? this.planData.items : [];
+          const hidx = items.findIndex((i: any) => i.id === handoffId);
+          const patched = {
+            execution_mode: handoffMode,
+            owner: String(handoffItem.owner || ''),
+            takeover_required: Boolean(handoffItem.takeover_required),
+            handoff_reason: String(handoffItem.handoff_reason || ''),
+            takeover_sequence: Number(handoffItem.takeover_sequence || 0),
+            handoff_note: handoffNote,
+          };
+          if (hidx >= 0) {
+            items[hidx] = { ...items[hidx], ...patched };
+          } else {
+            items.push({
+              id: handoffId,
+              text: String(handoffItem.subject || handoffId),
+              status: 'in_progress',
+              ...patched,
+            } as any);
+          }
           this._captureRuntime(targetRuntimeKey);
         }
       } else if (type === 'user_message_images') {
@@ -3123,7 +3206,14 @@ export const useAppStore = defineStore('app', {
       this.modelPresets = snapshot.presets || [];
       this.providers = snapshot.providers || [];
       this.models = snapshot.models || [];
-      this.activeModelId = snapshot.active_model_id || this.activeModelId;
+      // active_model_id 兜底而非覆盖：GUI 的激活模型按会话绑定，快照值即使
+      // 来自旧版后端也只是全局默认，可能属于另一厂商的同名模型；仅当当前
+      // 会话模型为空或已从列表中删除时才采纳，否则界面选中态会跳厂商
+      const stillValid = !!this.activeModelId
+        && this.models.some(m => m.id === this.activeModelId);
+      if (!stillValid) {
+        this.activeModelId = snapshot.active_model_id || this.activeModelId;
+      }
     },
 
     async openModelSettings() {

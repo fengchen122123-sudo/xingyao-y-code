@@ -7,6 +7,65 @@ from core.turn_events import TurnEventFactory
 from rich.text import Text
 
 
+def test_undo_existing_empty_file_does_not_require_delete_confirmation(
+    tmp_path, monkeypatch
+):
+    from core import memory as memory_mod
+
+    session = "cli-empty-file-undo"
+    target = tmp_path / "empty.txt"
+    target.write_bytes(b"")
+    memory_mod.set_undo_state(
+        str(target),
+        "",
+        session_name=session,
+        existed_before=True,
+        old_bytes=b"",
+    )
+    undo_calls = []
+    monkeypatch.setattr(main, "current_session", session)
+    monkeypatch.setattr(
+        main._agent_service,
+        "undo_last_edit",
+        lambda manager, session_name, force=False: (
+            undo_calls.append((manager, session_name, force)) or (True, "restored")
+        ),
+    )
+    monkeypatch.setattr(main, "recalc_token_usage", lambda: None)
+    monkeypatch.setattr(main, "print_formatted_text", lambda *_args, **_kwargs: None)
+
+    main.handle_slash_command("/undo")
+
+    assert undo_calls == [(main.manager, session, False)]
+
+
+def test_checkpoint_restore_preserves_original_non_utf8_bytes(tmp_path, monkeypatch):
+    from core import memory as memory_mod
+
+    session = "cli-checkpoint-bytes"
+    target = tmp_path / "legacy-gbk.txt"
+    original = "旧版内容".encode("gbk")
+    target.write_text("changed", encoding="utf-8")
+    snapshots = [{
+        "file_path": str(target),
+        "old_content": "旧版内容",
+        "existed_before": True,
+        "old_bytes": original,
+    }]
+    monkeypatch.setattr(main, "current_session", session)
+    monkeypatch.setattr(
+        memory_mod,
+        "restore_checkpoint",
+        lambda session_name, turn_id: snapshots,
+    )
+    monkeypatch.setattr(main, "recalc_token_usage", lambda: None)
+    monkeypatch.setattr(main, "print_formatted_text", lambda *_args, **_kwargs: None)
+
+    main.handle_slash_command("/checkpoint restore turn-bytes")
+
+    assert target.read_bytes() == original
+
+
 def test_format_cache_hit_rate_uses_only_reported_cache_prompt():
     assert main._format_cache_hit_rate(90, 100) == "90.0%"
     assert main._format_cache_hit_rate(0, 0) == "--"
@@ -1062,3 +1121,50 @@ def test_turn_finished_clears_completed_plan(tmp_path, monkeypatch):
     main._render_ui_event(factory.emit("turn_finished"))
 
     assert manager.snapshot() == []
+
+
+def test_plan_item_handoff_prints_takeover_notice_once(monkeypatch):
+    """active 接管打印一次固定接管提示；重复 live update 不刷屏；
+    queued 项显示固定队列文案与位置。"""
+    factory = TurnEventFactory("turn-plan-handoff")
+    printed = []
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_print_ui_fragment", printed.append)
+
+    class FakeApp:
+        def invalidate(self):
+            pass
+
+    monkeypatch.setattr(main, "app_instance", FakeApp())
+
+    active_payload = {
+        "item": {
+            "id": "a", "subject": "修改调度器", "status": "in_progress",
+            "execution_mode": "main_takeover", "owner": "main:turn-1",
+        },
+        "source_task_id": "subagent-abcd1234",
+        "mode": "main_takeover",
+        "queue_position": 0,
+    }
+    main._render_ui_event(factory.emit("plan_item_handoff", dict(active_payload)))
+    # 重复 live update（同 item 同 mode）不刷屏
+    main._render_ui_event(factory.emit("plan_item_handoff", dict(active_payload)))
+
+    assert len(printed) == 1
+    active_plain = Text.from_ansi(printed[0]).plain
+    assert "子 Agent 已超时，主 Agent 正在接管并核查现场" in active_plain
+    assert "修改调度器" in active_plain
+
+    printed.clear()
+    main._render_ui_event(factory.emit("plan_item_handoff", {
+        "item": {
+            "id": "b", "subject": "补充测试", "status": "in_progress",
+            "execution_mode": "takeover_queued",
+        },
+        "source_task_id": "subagent-ef012345",
+        "mode": "takeover_queued",
+        "queue_position": 2,
+    }))
+    assert len(printed) == 1
+    queued_plain = Text.from_ansi(printed[0]).plain
+    assert "等待主 Agent 接管（队列第 2 项）" in queued_plain
