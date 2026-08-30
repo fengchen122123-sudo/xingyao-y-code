@@ -30,17 +30,23 @@ function makeTheme(id: string, builtin: boolean): GuiTheme {
       background_app: '#101010',
       background_panel: '#181818',
       background_card: '#202020',
+      background_elevated: '#282828',
       text_primary: '#f0f0f0',
+      text_bright: '#ffffff',
       text_secondary: '#b0b0b0',
       text_faint: '#777777',
       accent: '#7867d9',
+      accent_secondary: '#8f7de8',
       accent_soft: '#332f55',
       border: '#333333',
       success: '#3ca66b',
       warning: '#d39b35',
       danger: '#d95656',
+      orange: '#d98445',
       info: '#4d8bd9',
+      purple: '#9b78d9',
       code_background: '#121212',
+      float_background: '#181818',
       font_sans: 'sans-serif',
       font_mono: 'monospace',
       radius_small: 4,
@@ -131,6 +137,13 @@ beforeEach(() => {
 });
 
 describe('GuiThemeSettings', () => {
+  it('opens the editor on global colors', () => {
+    const wrapper = mountThemeSettings({ active: userTheme() });
+
+    expect(wrapper.get('[data-test="region-global"]').classes()).toContain('active');
+    expect(wrapper.get('[data-test="region-workspace"]').classes()).not.toContain('active');
+  });
+
   it('requires copying a built-in theme before editing', () => {
     const wrapper = mountThemeSettings({ active: builtinLight() });
 
@@ -178,6 +191,7 @@ describe('GuiThemeSettings', () => {
   it('rejects invalid hex locally and does not save', async () => {
     const wrapper = mountThemeSettings({ active: userTheme() });
 
+    await wrapper.get('[data-test="region-workspace"]').trigger('click');
     await wrapper.get('[data-test="background-hex"]').setValue('#xyz');
     await wrapper.get('[data-test="save-theme"]').trigger('click');
 
@@ -199,6 +213,7 @@ describe('GuiThemeSettings', () => {
     const first = new Promise(resolve => { releaseFirst = resolve; });
     const wrapper = mountThemeSettings({ active: userTheme() });
     previewGuiTheme.mockImplementationOnce(() => first);
+    await wrapper.get('[data-test="region-workspace"]').trigger('click');
     const input = wrapper.get('[data-test="background-hex"]');
 
     await input.setValue('#111111');
@@ -217,6 +232,7 @@ describe('GuiThemeSettings', () => {
     const wrapper = mountThemeSettings({ active: userTheme() });
     api.import_gui_theme_image.mockResolvedValue({ ok: true, asset_path: 'assets/workspace.webp' });
 
+    await wrapper.get('[data-test="region-workspace"]').trigger('click');
     await wrapper.get('[data-test="choose-image"]').trigger('click');
     await flushPromises();
 
@@ -255,6 +271,7 @@ describe('GuiThemeSettings', () => {
 
   it('cancels the preview and restores the persisted editor snapshot', async () => {
     const wrapper = mountThemeSettings({ active: userTheme() });
+    await wrapper.get('[data-test="region-workspace"]').trigger('click');
     await wrapper.get('[data-test="background-hex"]').setValue('#112233');
 
     await wrapper.get('[data-test="cancel-theme"]').trigger('click');
@@ -269,6 +286,7 @@ describe('GuiThemeSettings', () => {
     const saving = new Promise(resolve => { releaseSave = resolve; });
     const wrapper = mountThemeSettings({ active: userTheme() });
     saveGuiThemeDraft.mockImplementationOnce(() => saving);
+    await wrapper.get('[data-test="region-workspace"]').trigger('click');
     await wrapper.get('[data-test="background-hex"]').setValue('#111111');
     await wrapper.get('[data-test="save-theme"]').trigger('click');
     expect(saveGuiThemeDraft).toHaveBeenCalledOnce();
@@ -286,6 +304,7 @@ describe('GuiThemeSettings', () => {
   it('removing an image keeps other unsaved region edits in the draft', async () => {
     const wrapper = mountThemeSettings({ active: userTheme() });
     api.import_gui_theme_image.mockResolvedValue({ ok: true, asset_path: 'assets/workspace.webp' });
+    await wrapper.get('[data-test="region-workspace"]').trigger('click');
     await wrapper.get('[data-test="choose-image"]').trigger('click');
     await flushPromises();
     await wrapper.get('[data-test="background-hex"]').setValue('#112233');

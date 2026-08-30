@@ -69,10 +69,17 @@ def _safe_prefix_length(text: str, tags: Iterable[str]) -> int:
     return len(text)
 
 
+_EMPTY_CONTENT_PROTOCOL_MARKER = (
+    "[System: Empty message content sanitised to satisfy protocol]"
+)
+
+
 def sanitize_protocol_text(text: str) -> str:
     """清理输出文本中的内部协议标记、Advisor 调试头及裸露的 XML <tool_call> 标签。"""
     if not text or not isinstance(text, str):
         return text
+    # 空 assistant 正文的协议占位符：精确删除，不用宽泛 [System: ...] 规则
+    text = text.replace(_EMPTY_CONTENT_PROTOCOL_MARKER, "")
     text = re.sub(r'<tool_call[^>]*>.*?</tool_call>', '', text, flags=re.DOTALL)
     text = re.sub(r'</?tool_call[^>]*>', '', text)
     text = re.sub(r'\[Advisor consultation[^\]]*\]', '', text)
@@ -82,6 +89,18 @@ def sanitize_protocol_text(text: str) -> str:
     # 同样需要清理
     text = re.sub(r'\(\s*advisor[^\)]*\)', '', text, flags=re.IGNORECASE)
     return text
+
+
+def sanitize_stream_text(text: str) -> tuple[str, str]:
+    """流式场景清理：返回（可立即发出的已清理文本, 需暂扣等待后续分片的尾部）。
+
+    协议占位符可能横跨两次 delta 分片，逐片直接清理会漏掉跨片标记；
+    尾部若恰好是占位符前缀则暂扣，与下一批拼接后再判定。普通文本零暂扣。
+    """
+    if not text:
+        return "", ""
+    safe = _safe_prefix_length(text, (_EMPTY_CONTENT_PROTOCOL_MARKER,))
+    return sanitize_protocol_text(text[:safe]), text[safe:]
 
 
 class TurnRenderer:

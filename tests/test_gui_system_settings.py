@@ -57,3 +57,35 @@ def test_bridge_rejects_an_unavailable_command_shell_without_changing_config(tmp
     assert result["ok"] is False
     assert "未安装" in result["msg"]
     assert json.loads(cfg.read_text(encoding="utf-8"))["command_shell"] == "cmd"
+
+
+def test_system_settings_snapshot_exposes_turn_step_limit(tmp_path, monkeypatch):
+    _use_tmp_config(tmp_path, monkeypatch, {"agent_turn_step_limit": 240})
+
+    result = _bare_bridge().get_system_settings()
+
+    assert result["agent_turn_step_limit"] == 240
+    assert result["agent_turn_step_limit_min"] == 10
+    assert result["agent_turn_step_limit_max"] == 1000
+
+
+def test_bridge_persists_valid_turn_step_limit(tmp_path, monkeypatch):
+    cfg = _use_tmp_config(tmp_path, monkeypatch, {"agent_turn_step_limit": 100})
+
+    result = _bare_bridge().set_agent_turn_step_limit(300)
+
+    assert result["ok"] is True
+    assert result["settings"]["agent_turn_step_limit"] == 300
+    assert json.loads(cfg.read_text(encoding="utf-8"))["agent_turn_step_limit"] == 300
+
+
+def test_bridge_rejects_invalid_turn_step_limit_without_changing_config(
+    tmp_path, monkeypatch
+):
+    cfg = _use_tmp_config(tmp_path, monkeypatch, {"agent_turn_step_limit": 100})
+
+    result = _bare_bridge().set_agent_turn_step_limit(1001)
+
+    assert result["ok"] is False
+    assert "10" in result["msg"] and "1000" in result["msg"]
+    assert json.loads(cfg.read_text(encoding="utf-8"))["agent_turn_step_limit"] == 100

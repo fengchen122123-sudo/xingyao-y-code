@@ -191,10 +191,10 @@ class LanServer:
         return f"http://{self.lan_ip}:{self.port}/?token={token}"
 
     def _verify_token(self, token) -> bool:
-        """校验配对 token：非空、未过期、常量时间比较。"""
+        """校验配对 token：非空、未过期、常量时间比较；_token_expires 为 None 表示永久有效。"""
         if not token or not self._token:
             return False
-        if time.time() > self._token_expires:
+        if self._token_expires is not None and time.time() > self._token_expires:
             return False
         try:
             return secrets.compare_digest(token.encode(), self._token)
@@ -217,9 +217,14 @@ class LanServer:
                 pass
 
     def _issue_token(self) -> str:
-        """签发新配对 token（旧 token 立即失效，已连接客户端全部断开），持久化后返回明文。"""
+        """签发新配对 token（旧 token 立即失效，已连接客户端全部断开），持久化后返回明文。
+
+        _ttl <= 0 表示永久有效：_token_expires 置为 None，永不过期、永不重签。
+        """
         self._token = secrets.token_urlsafe(24).encode()
-        self._token_expires = time.time() + self._ttl
+        self._token_expires = (
+            None if self._ttl <= 0 else time.time() + self._ttl
+        )
         # 踢掉旧 token 时代的连接：否则已扫码手机在刷新二维码后依然可控
         self._kick_all_clients()
         try:
@@ -244,15 +249,21 @@ class LanServer:
             self._clients.append(ws)
             return True
 
-    def _load_persisted_token(self, token: str, expires_at: float) -> None:
-        """从持久层恢复未过期的配对 token；已过期或为空则忽略。"""
+    def _load_persisted_token(self, token: str, expires_at) -> None:
+        """从持久层恢复配对 token；过期或为空则忽略。
+
+        expires_at 为 None（永久 token，TTL=0 签发）时直接恢复且永不过期。
+        """
         clean = str(token or "").strip()
-        try:
-            expires_at = float(expires_at)
-        except (TypeError, ValueError):
+        if not clean:
             return
-        if not clean or time.time() >= expires_at:
-            return
+        if expires_at is not None:
+            try:
+                expires_at = float(expires_at)
+            except (TypeError, ValueError):
+                return
+            if time.time() >= expires_at:
+                return
         self._token = clean.encode()
         self._token_expires = expires_at
 
@@ -274,7 +285,9 @@ class LanServer:
         已过期自动重签；force_new=True（前端"刷新"按钮）强制重签并使旧
         token 立即失效。expires_in 返回剩余有效秒数（而非完整 TTL）。
         """
-        if force_new or not self._token or time.time() >= self._token_expires:
+        if force_new or not self._token or (
+            self._token_expires is not None and time.time() >= self._token_expires
+        ):
             self._issue_token()
         token = self._token.decode()
         url = self.bind_url(token)
@@ -282,16 +295,21 @@ class LanServer:
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         qr_b64 = base64.b64encode(buf.getvalue()).decode()
+        remaining = (
+            0 if self._token_expires is None
+            else max(0, int(self._token_expires - time.time()))
+        )
         return {
             "ok": True,
             "url": url,
             "token": token,
             "qr": f"data:image/png;base64,{qr_b64}",
-            "expires_in": max(0, int(self._token_expires - time.time())),
+            # expires_in=0 表示永久有效（TTL=0 签发），前端据此跳过倒计时自动刷新
+            "expires_in": remaining,
         }
 
     def set_ttl(self, seconds: int) -> None:
-        """更新配对 token 的有效期（秒）。"""
+        """更新配对 token 的有效期（秒）；<= 0 表示永久有效。"""
         self._ttl = int(seconds)
 
     # ------------------------------------------------------------------ #

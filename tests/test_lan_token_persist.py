@@ -85,3 +85,24 @@ def test_load_persisted_ignores_expired_token(srv):
 def test_load_persisted_ignores_empty_token(srv):
     srv._load_persisted_token("", time.time() + 100)
     assert srv._token is None
+
+
+def test_ttl_zero_means_never_expires(srv):
+    """TTL=0 表示永久有效：token 签发后即可校验通过且不会过期。"""
+    srv.set_ttl(0)
+    info = srv.get_bind_info()
+    assert info["expires_in"] == 0
+    assert srv._verify_token(info["token"]) is True
+    # 时间推进也不会过期：不触发重签，token 保持不变
+    srv._token_expires = None
+    time.sleep(1.1)
+    again = srv.get_bind_info()
+    assert again["token"] == info["token"]
+    assert again["expires_in"] == 0
+
+
+def test_load_persisted_accepts_permanent_token(srv):
+    """持久层的过期时间为 null（永久 token）时正常恢复且永不过期。"""
+    srv._load_persisted_token("forever-token", None)
+    assert srv._token is not None
+    assert srv._verify_token("forever-token") is True

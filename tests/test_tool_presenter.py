@@ -57,6 +57,36 @@ def test_build_tool_display_rejects_non_dict_result(result):
         build_tool_display("read_file", {"file_path": "core/llm.py"}, result, ok=True)
 
 
+def test_build_tool_display_marks_background_start():
+    """D8：background 只认结构化入参，不依赖可变的结果文案。"""
+    background_result = {
+        "content": "后台进程已提交，任务 ID: task_ab12"
+    }
+    display = build_tool_display(
+        "execute_command",
+        {"command": "python app.py", "run_in_background": True},
+        background_result,
+        ok=True,
+    )
+    assert display["background"] is True
+
+    foreground_display = build_tool_display(
+        "execute_command",
+        {"command": "pytest -q", "run_in_background": False},
+        {"content": "异步后台任务已成功启动"},
+        ok=True,
+    )
+    assert foreground_display["background"] is False
+
+    failed_display = build_tool_display(
+        "execute_command",
+        {"command": "python app.py", "run_in_background": True},
+        background_result,
+        ok=False,
+    )
+    assert failed_display["background"] is False
+
+
 def test_build_tool_display_accepts_none_result():
     display = build_tool_display("read_file", {"file_path": "core/llm.py"}, None, ok=True)
 
@@ -79,6 +109,7 @@ def test_build_tool_display_returns_read_metadata():
         "metrics": {"line_count": 3},
         "error_summary": "",
         "is_skill": False,
+        "background": False,
     }
 
 

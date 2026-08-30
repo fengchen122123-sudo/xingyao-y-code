@@ -243,8 +243,18 @@ function beginWindowResize(edge: WindowResizeEdge) {
 }
 
 // 最大化状态从 store 读取（后端通过 window_maximize_state 事件推送），
-// 本地不再维护独立 ref 和事件监听
+// 本地不再维护独立 ref 和事件监听。启动时仍需向宿主查询一次初始状态：
+// window_maximize_state 只覆盖启动后的切换，不能表示窗口以最大化状态启动。
 const windowMaximized = computed(() => store.windowMaximized);
+
+async function syncInitialWindowMaximized() {
+  try {
+    const result = await window.pywebview?.api?.window_is_maximized?.();
+    if (result?.ok) store.windowMaximized = !!result.maximized;
+  } catch {
+    // 浏览器开发态或桥尚未注入时保持默认非最大化，后续宿主事件会同步。
+  }
+}
 
 const store = useAppStore();
 const chatScrollRef = ref<HTMLElement | null>(null);
@@ -483,6 +493,7 @@ function onPywebviewReady() {
 
 onMounted(() => {
   document.addEventListener('click', closeExportMenu);
+  void syncInitialWindowMaximized();
 
   if (pywebviewApiReady()) {
     startInit();

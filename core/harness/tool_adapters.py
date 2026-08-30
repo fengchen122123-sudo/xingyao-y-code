@@ -18,6 +18,7 @@ from core.tools import (
     manage_task as _manage_task,
     read_file as _read_file,
     run_subagent as _run_subagent,
+    _resolve_workspace_path,
     sandbox_bypass as _sandbox_bypass,
     write_file as _write_file,
 )
@@ -469,23 +470,37 @@ class ToolAdapterSet:
         if error:
             return ToolResult(error, is_error=True)
         with bypass if bypass is not None else self.sandbox_bypass():
+            resolved_path = _resolve_workspace_path(file_path)
+            existed_before = resolved_path.is_file()
             old_content = ""
-            if os.path.exists(file_path):
+            if existed_before:
                 try:
-                    old_content = self.read_text(file_path)
+                    old_content = self.read_text(str(resolved_path))
                 except OSError as read_error:
                     logger.warning("读取旧文件内容失败 (%s): %s", file_path, read_error)
+            call_arguments = arguments
+            if self._uses_override(self.write_file, _write_file):
+                call_arguments = dict(arguments)
+                call_arguments["file_path"] = str(resolved_path)
             write_result = self._execute_builtin(
-                resolved_tool, self.write_file, _write_file, arguments
+                resolved_tool, self.write_file, _write_file, call_arguments
             ).to_message_content()
         if isinstance(write_result, str) and write_result.startswith(TOOL_ERROR_PREFIX):
             return ToolResult(write_result, is_error=True)
 
-        from core.memory import set_undo_state
+        # 默认 registry 处理器 core.tools.write_file 已记录解析后的绝对路径、
+        # 文件是否原本存在以及原始字节。这里只为测试/嵌入方显式注入的覆盖处理器
+        # 保留兼容记录，避免把默认处理器刚写入的精确快照覆盖成文本快照。
+        if self._uses_override(self.write_file, _write_file):
+            from core.memory import set_undo_state
 
-        set_undo_state(file_path, old_content)
+            set_undo_state(
+                str(resolved_path),
+                old_content,
+                existed_before=existed_before,
+            )
         self.show_file_diff(
-            file_path,
+            str(resolved_path),
             old_content,
             new_content,
             context.event_callback,
@@ -558,7 +573,9 @@ class ToolAdapterSet:
             subagent_type=arguments.get("subagent_type", "general"),
             plan_item_id=arguments.get("plan_item_id", ""),
             run_in_background=arguments.get("run_in_background", False),
-            timeout_seconds=arguments.get("timeout_seconds"),
+            # 模型可见 schema 不暴露时间预算；即使模型伪造额外字段也不能
+            # 穿透 adapter。None 交由 run_subagent 按角色选择系统默认值。
+            timeout_seconds=None,
             parent_session=context.parent_session,
             parent_turn_id=context.parent_turn_id,
             parent_cancel_event=context.cancel_event,
@@ -649,6 +666,35 @@ class ToolAdapterSet:
                 scheduler.fail(plan_item_id, str(error))
             raise
 
+    def execute_plan_finish(self, resolved_tool, arguments, context) -> ToolResult:
+        """plan_finish 运行上下文注入：接管租约核验只认 adapter 注入的本回合 id。
+
+        parent_turn_id/permission_owner/cancel_event/event_callback 属于运行
+        上下文，绝不暴露给模型 schema。
+        """
+        from core.plan import plan_finish
+
+        result = plan_finish(
+            arguments.get("item_id", ""),
+            arguments.get("result", ""),
+            parent_turn_id=context.parent_turn_id,
+            permission_owner=context.permission_owner,
+            event_callback=context.event_callback,
+            cancel_event=context.cancel_event,
+        )
+        return _as_tool_result(result)
+
+    def execute_plan_resume_takeover(self, resolved_tool, arguments, context) -> ToolResult:
+        """注入当前真实 turn id；模型 schema 只能提供 item_id。"""
+        from core.plan import plan_resume_takeover
+
+        result = plan_resume_takeover(
+            arguments.get("item_id", ""),
+            parent_turn_id=context.parent_turn_id,
+            event_callback=context.event_callback,
+        )
+        return _as_tool_result(result)
+
     def execute_manage_task(self, resolved_tool, arguments, context) -> ToolResult:
         extras = {
             "event_callback": context.event_callback,
@@ -732,6 +778,10 @@ class ToolAdapterSet:
             return self.execute_run_subagent(resolved_tool, arguments, context)
         if name == "ask_user":
             return self.execute_ask_user(resolved_tool, arguments, context)
+        if name == "plan_finish":
+            return self.execute_plan_finish(resolved_tool, arguments, context)
+        if name == "plan_resume_takeover":
+            return self.execute_plan_resume_takeover(resolved_tool, arguments, context)
         if name == "manage_task":
             return self.execute_manage_task(resolved_tool, arguments, context)
         if resolved_tool.source == "mcp":

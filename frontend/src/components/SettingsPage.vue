@@ -1117,7 +1117,8 @@ onMounted(async () => {
 .perm-settings-card { max-width: 860px; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
 
 /* ── 外观与主题分区 ── */
-.appearance-settings-card { max-width: 1120px; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 22px 24px; }
+.appearance-section { width: 100%; min-width: 0; }
+.appearance-settings-card { width: 100%; min-width: 0; max-width: 1120px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 22px 24px; }
 .perm-row { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 20px 0; border-bottom: 1px solid var(--border); }
 .perm-row h3 { margin: 0 0 6px; font-size: 14px; }
 .perm-row p { margin: 0; color: var(--text-faint); font-size: 12.5px; }
@@ -1211,6 +1212,12 @@ onMounted(async () => {
   .settings-page--mobile .whitelist-head { align-items: flex-start; flex-direction: column; }
   .settings-page--mobile .wl-form { align-items: stretch; flex-direction: column; }
   .settings-page--mobile .wl-form select { flex-basis: auto; }
-  .settings-page--mobile .appearance-settings-card { padding: 16px 14px; }
+  .settings-page--mobile .appearance-settings-card {
+    max-width: none;
+    padding: 0;
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+  }
 }
 </style>

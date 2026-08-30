@@ -340,4 +340,15 @@ function commitAppImageSelect(key: 'image_size' | 'image_position', event: Event
 .secondary-button.compact { min-height: 30px; }
 .secondary-button:disabled { opacity: 0.5; cursor: not-allowed; }
 .mono { font-family: var(--mono); }
+
+/* ── 手机端（≤480px）：修复颜色令牌网格与选择框网格溢出 ──
+   auto-fill minmax(240px,1fr) 在 ≤360px 屏上列宽不足会撑破容器，
+   改单列；两个并排的填充方式/位置选择框也收成单列。 */
+@media (max-width: 480px) {
+  .token-grid { grid-template-columns: 1fr; gap: 6px 0; }
+  .select-grid { grid-template-columns: 1fr; gap: 0; }
+  .editor-group { padding: 12px; }
+  .image-row { flex-wrap: wrap; }
+  .image-path { flex: 1 1 auto; min-width: 0; }
+}
 </style>

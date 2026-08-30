@@ -96,6 +96,9 @@ export interface SystemSettingsSnapshot {
   command_shell_available: boolean;
   command_shell_error: string;
   remote_token_ttl: number;
+  agent_turn_step_limit: number;
+  agent_turn_step_limit_min: number;
+  agent_turn_step_limit_max: number;
 }
 
 export interface SkillInfo {
@@ -158,6 +161,13 @@ export interface PlanTaskItem {
   id: string;
   text: string;
   status: 'todo' | 'in_progress' | 'done';
+  // 子 Agent 超时接管可见性；plan_updated 快照是可恢复事实源
+  execution_mode?: string;
+  owner?: string;
+  takeover_required?: boolean;
+  handoff_reason?: string;
+  takeover_sequence?: number;
+  handoff_note?: string;
 }
 
 // get_changelog() 的单条版本条目
@@ -274,6 +284,7 @@ export interface ToolDisplayPayload {
   metrics?: Record<string, number>;
   error_summary?: string;
   is_skill?: boolean;
+  background?: boolean;
 }
 
 export interface TurnStartEventData {
@@ -362,6 +373,7 @@ export interface PyWebViewAPI {
   get_system_settings(): Promise<SystemSettingsSnapshot>;
   set_command_shell(shellId: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   get_permission_rules(): Promise<any>;
   add_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;
   remove_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;

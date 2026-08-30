@@ -30,6 +30,7 @@ import config
 from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.agent_service import strip_context_suffix
+from core.turn_renderer import sanitize_protocol_text, sanitize_stream_text
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
@@ -55,7 +56,7 @@ from core.model_catalog import API_PROTOCOLS, get_preset_providers
 from core.reasoning_capabilities import build_reasoning_snapshot
 from core.permission_broker import permission_broker
 from core.skills import get_active_skill_ids, save_active_skill_ids, scan_all_skills
-from core.task_manager import kill_background_task, list_active_tasks
+from core.task_manager import list_active_tasks
 from core.version import __version__ as YCODE_VERSION
 from core.updater import (
     cleanup_old_installers,
@@ -1805,12 +1806,18 @@ class ApiBridge:
             if now - self._delta_last_flush >= TOKEN_FLUSH_INTERVAL:
                 flush_now = True
         if swapped is not None:
-            self._emit_raw(swapped[0], {"text": swapped[1], "session_name": session_name})
+            swapped_text = swapped[1]
+            if swapped[0] == "token_delta":
+                # 思考流切换为正文的边界：旧缓冲整体废弃，无后续分片可拼，直接整段清理
+                swapped_text = sanitize_protocol_text(swapped_text)
+            if swapped_text:
+                self._emit_raw(swapped[0], {"text": swapped_text, "session_name": session_name})
         self._ensure_delta_flusher()
         if flush_now:
             self._flush_deltas()
 
-    def _flush_deltas(self):
+    def _flush_deltas(self, final: bool = False):
+        """冲刷 delta 缓冲。final=True 时不暂扣尾部（回合收尾，无后续分片）。"""
         with self._delta_lock:
             if not self._delta_buffers:
                 return
@@ -1821,7 +1828,16 @@ class ApiBridge:
                 kind = self._delta_kinds.get(session_name, "token_delta")
                 text = "".join(buf)
                 buf.clear()
-                pending.append((kind, text, session_name))
+                if kind == "token_delta":
+                    if final:
+                        text = sanitize_protocol_text(text)
+                    else:
+                        # 占位符可能横跨两次冲刷，疑似前缀的尾部暂扣拼齐后再判定
+                        text, rest = sanitize_stream_text(text)
+                        if rest:
+                            buf.append(rest)
+                if text:
+                    pending.append((kind, text, session_name))
             self._delta_last_flush = time.monotonic()
         for kind, text, session_name in pending:
             self._emit_raw(kind, {"text": text, "session_name": session_name})
@@ -1836,7 +1852,7 @@ class ApiBridge:
         冲刷的就是个空。任何异常吞掉，绝不阻断回合收尾。
         """
         try:
-            self._flush_deltas()
+            self._flush_deltas(final=True)
         except Exception:
             logger.debug("回合收尾冲刷流式缓冲失败", exc_info=True)
         try:
@@ -1865,6 +1881,8 @@ class ApiBridge:
                     final_text = content if isinstance(content, str) else ""
                     final_reasoning = reasoning if isinstance(reasoning, str) else ""
                     break
+            # 数据库旧消息可能残留上游网关的空正文占位符，补发前精确清理
+            final_text = sanitize_protocol_text(final_text)
             if final_text or final_reasoning:
                 self.emit_event("message_final", {
                     "session_name": session_name,
@@ -1924,6 +1942,9 @@ class ApiBridge:
                         # 历史回放：剥离当轮注入的「当前运行上下文 / 当前时间」后缀，
                         # 那部分是给模型看的运行快照，不该显示在历史气泡里
                         content = strip_context_suffix(content)
+                    elif role == "assistant":
+                        # 数据库旧消息可能残留上游网关的空正文占位符，回放前精确清理
+                        content = sanitize_protocol_text(content)
                     msgs.append({
                         "role": role,
                         "content": content,
@@ -2863,6 +2884,24 @@ class ApiBridge:
         except (CommandShellError, ValueError) as error:
             return {"ok": False, "msg": str(error), "settings": self.get_system_settings()}
 
+    def set_agent_turn_step_limit(self, value: int) -> Dict[str, Any]:
+        """设置单任务最大模型轮次；显式非法值必须拒绝且不写盘。"""
+        from core.harness.turn_limits import TurnStepLimitError, save_turn_step_limit
+
+        try:
+            save_turn_step_limit(value)
+            return {
+                "ok": True,
+                "settings": self.get_system_settings(),
+                "msg": "单任务最大模型轮次已更新",
+            }
+        except TurnStepLimitError as error:
+            return {
+                "ok": False,
+                "msg": str(error),
+                "settings": self.get_system_settings(),
+            }
+
     def get_permission_rules(self) -> Dict[str, Any]:
         """返回当前项目的持久化白名单（含沙盒开关状态），供设置页展示。"""
         try:
@@ -3173,7 +3212,21 @@ class ApiBridge:
                 # 让"选模型立即生效"，不再只在 pending 新会话时绑定
                 if clean_model_id:
                     try:
-                        self._memory.set_session_model_id(target_session, clean_model_id)
+                        # 防线：只接受配置中真实存在的模型 id。显示态一旦被陈旧
+                        # 全局值污染（如设置快照回灌），不能让下一条消息把错误
+                        # 绑定落成真实的会话模型
+                        known_ids = {
+                            str(m.get("id"))
+                            for p in load_config().get("providers", [])
+                            for m in p.get("models", [])
+                        }
+                        if clean_model_id in known_ids:
+                            self._memory.set_session_model_id(target_session, clean_model_id)
+                        else:
+                            logger.warning(
+                                "忽略未知模型绑定: session=%s model_id=%s",
+                                target_session, clean_model_id,
+                            )
                     except Exception:
                         logger.debug("会话模型绑定失败，回合回退默认模型", exc_info=True)
 
@@ -3979,6 +4032,16 @@ class ApiBridge:
                 self.emit_event("plan_updated", {
                     "title": str(data.get("title") or "当前任务计划"),
                     "items": data.get("items") or [],
+                    "session_name": session_name,
+                })
+            elif kind == "plan_item_handoff":
+                # 子 Agent 超时接管可见性：只透传展示字段，不改调度状态；
+                # 旧子 Agent 卡片保持 timed_out，计划卡片显示 main_takeover
+                self.emit_event("plan_item_handoff", {
+                    "item": dict(data.get("item") or {}),
+                    "source_task_id": str(data.get("source_task_id") or ""),
+                    "mode": str(data.get("mode") or ""),
+                    "queue_position": data.get("queue_position") or 0,
                     "session_name": session_name,
                 })
             elif kind == "turn_cancelled":
@@ -4813,8 +4876,22 @@ class ApiBridge:
 
     def kill_task(self, task_id: str) -> Dict[str, Any]:
         try:
-            ok = kill_background_task(task_id)
-            return {"ok": bool(ok)}
+            from core.task_manager import (
+                KILL_RESULT_FAILED, KILL_RESULT_IDENTITY_UNVERIFIABLE,
+                KILL_RESULT_KILLED, KILL_RESULT_NATURAL_DEATH, KILL_RESULT_NOT_FOUND,
+                kill_background_task_detailed,
+            )
+            result = kill_background_task_detailed(str(task_id or ""))
+            if result == KILL_RESULT_KILLED:
+                return {"ok": True, "msg": "已终止后台任务"}
+            if result == KILL_RESULT_NATURAL_DEATH:
+                # 进程在终止前已自行结束：任务已不在运行，目标已达成，不报"终止失败"
+                return {"ok": True, "msg": "任务在终止前已自行结束"}
+            if result == KILL_RESULT_NOT_FOUND:
+                return {"ok": False, "msg": "未找到该后台任务"}
+            if result == KILL_RESULT_IDENTITY_UNVERIFIABLE:
+                return {"ok": False, "msg": "无法校验进程身份，已拒绝终止"}
+            return {"ok": False, "msg": "终止失败，进程可能仍在运行"}
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 
@@ -4931,6 +5008,17 @@ class ApiBridge:
     def get_model_settings(self) -> Dict[str, Any]:
         """返回不含 API Key 明文的完整模型设置快照。"""
         config_data = load_config()
+        # active_model_id 必须返回"当前会话生效模型"而非陈旧的全局默认：
+        # GUI 按会话绑定模型、不回写全局值，全局值可能属于另一厂商的同名
+        # 模型；直接返回会让前端 applyModelSettings 把界面选中态打回错误
+        # 厂商（表现为"选了 A 厂商的模型自动跳到 B 厂商"）。
+        effective_model_id = str(config_data.get("active_model_id") or "")
+        try:
+            active = get_active_model(getattr(self, "_current_session", None))
+            if active and active.get("id"):
+                effective_model_id = str(active["id"])
+        except Exception:
+            logger.debug("解析会话生效模型失败，active_model_id 回退全局默认", exc_info=True)
         providers = []
         models = []
         for provider in config_data.get("providers", []):
@@ -4961,7 +5049,7 @@ class ApiBridge:
             "presets": get_preset_providers(),
             "providers": providers,
             "models": models,
-            "active_model_id": str(config_data.get("active_model_id") or ""),
+            "active_model_id": effective_model_id,
             "secondary_model_id": str(config_data.get("secondary_model_id") or ""),
             "secondary_model_roles": get_secondary_roles(),
         }

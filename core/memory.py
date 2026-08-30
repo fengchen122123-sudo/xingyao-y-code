@@ -174,7 +174,14 @@ def clear_undo_session() -> None:
 
 
 def _current_undo_session(session_name: str | None = None) -> str:
-    return session_name or getattr(_undo_tls, "session_name", None) or "_global_"
+    explicit = session_name or getattr(_undo_tls, "session_name", None)
+    if explicit:
+        return explicit
+    # GUI 回合与子代理线程的权威会话路由在 app_context TLS 中；它不能
+    # 继承 UI 线程调用 set_undo_session 写入的 memory TLS。
+    from core import app_context
+
+    return app_context.get_thread_session() or "_global_"
 
 # 会话级检查点缓存（按 session_name → list of checkpoint dict）
 # 每轮对话开始前自动打一个 checkpoint，记录本轮所有被修改文件的旧内容
@@ -184,21 +191,46 @@ _session_checkpoints_lock = threading.Lock()
 _session_checkpoints: dict[str, list[dict]] = {}
 
 
-def set_undo_state(file_path, old_content, session_name=None):
+def set_undo_state(
+    file_path,
+    old_content,
+    session_name=None,
+    *,
+    existed_before=None,
+    old_bytes=None,
+):
     session = _current_undo_session(session_name)
+    if existed_before is None:
+        # 兼容旧调用方：历史约定 old_content="" 表示新建文件。
+        existed_before = bool(file_path) and old_content != ""
     with _undo_state_lock:
-        LAST_UNDO_STATE[session] = {"file_path": file_path, "old_content": old_content}
+        LAST_UNDO_STATE[session] = {
+            "file_path": file_path,
+            "old_content": old_content,
+            "existed_before": bool(existed_before),
+            "old_bytes": old_bytes,
+        }
     # 同步追加到当前会话的检查点文件快照
     # （由 worker 线程在 begin_turn 时已建好当前 turn 的 checkpoint 上下文）
     if file_path and old_content is not None:
-        record_file_snapshot_for_current_turn(file_path, old_content)
+        record_file_snapshot_for_current_turn(
+            file_path,
+            old_content,
+            existed_before=bool(existed_before),
+            old_bytes=old_bytes,
+        )
 
 
 def get_undo_state(session_name=None):
     session = _current_undo_session(session_name)
     with _undo_state_lock:
         # 返回副本，避免调用方在无锁状态下读写共享 dict 产生竞态
-        return dict(LAST_UNDO_STATE.get(session, {"file_path": None, "old_content": None}))
+        return dict(LAST_UNDO_STATE.get(session, {
+            "file_path": None,
+            "old_content": None,
+            "existed_before": False,
+            "old_bytes": None,
+        }))
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +243,10 @@ def get_undo_state(session_name=None):
 
 # 当前 worker 线程的活动 turn 上下文（thread-local，避免多线程串扰）
 _checkpoint_tls = threading.local()
+# 父回合和子代理分属不同线程：用 (session, turn) 注册活动 checkpoint，
+# 子代理只借用记录权，不拥有提交权。每个 ctx 的锁保护 completed 与快照列表。
+_active_turn_checkpoints_lock = threading.RLock()
+_active_turn_checkpoints: dict[tuple[str, str], tuple[dict, threading.RLock]] = {}
 
 
 def begin_turn_checkpoint(session_name, turn_id, last_msg_id, description=""):
@@ -228,25 +264,82 @@ def begin_turn_checkpoint(session_name, turn_id, last_msg_id, description=""):
         "file_snapshots": [],  # list of {file_path, old_content}
         "completed": False,
     }
+    key = (str(session_name), str(turn_id))
+    ctx_lock = threading.RLock()
+    with _active_turn_checkpoints_lock:
+        existing = _active_turn_checkpoints.get(key)
+        if existing is not None and not existing[0].get("completed"):
+            raise RuntimeError(f"checkpoint already active: {key!r}")
+        _active_turn_checkpoints[key] = (ctx, ctx_lock)
     _checkpoint_tls.current = ctx
+    _checkpoint_tls.current_lock = ctx_lock
+    _checkpoint_tls.owner = True
     return ctx
 
 
-def record_file_snapshot_for_current_turn(file_path, old_content):
+def bind_turn_checkpoint(session_name, turn_id) -> bool:
+    """把子代理线程绑定到父回合的活动 checkpoint；不转移提交所有权。"""
+    key = (str(session_name), str(turn_id))
+    with _active_turn_checkpoints_lock:
+        entry = _active_turn_checkpoints.get(key)
+    if entry is None:
+        _checkpoint_tls.current = None
+        _checkpoint_tls.current_lock = None
+        _checkpoint_tls.owner = False
+        return False
+    ctx, ctx_lock = entry
+    with ctx_lock:
+        if ctx.get("completed"):
+            _checkpoint_tls.current = None
+            _checkpoint_tls.current_lock = None
+            _checkpoint_tls.owner = False
+            return False
+        _checkpoint_tls.current = ctx
+        _checkpoint_tls.current_lock = ctx_lock
+        _checkpoint_tls.owner = False
+    return True
+
+
+def clear_turn_checkpoint_binding() -> None:
+    """清除当前线程借用的 checkpoint 绑定。"""
+    _checkpoint_tls.current = None
+    _checkpoint_tls.current_lock = None
+    _checkpoint_tls.owner = False
+
+
+def record_file_snapshot_for_current_turn(
+    file_path,
+    old_content,
+    *,
+    existed_before=None,
+    old_bytes=None,
+):
     """把当前线程内被修改文件的旧内容追加到当前 turn 的快照列表。"""
     ctx = getattr(_checkpoint_tls, "current", None)
-    if ctx is None or ctx.get("completed"):
+    ctx_lock = getattr(_checkpoint_tls, "current_lock", None)
+    if ctx is None or ctx_lock is None:
         return
-    # 同一文件在一轮内可能被多次修改，只保留最早的旧内容（最原始状态）
-    existing = next(
-        (s for s in ctx["file_snapshots"] if s["file_path"] == file_path),
-        None,
-    )
-    if existing is None:
-        ctx["file_snapshots"].append({
-            "file_path": file_path,
-            "old_content": old_content,
-        })
+    with ctx_lock:
+        if ctx.get("completed"):
+            return
+        # 同一文件在一轮内可能被多次修改，只保留最早的旧内容（最原始状态）
+        path_key = os.path.normcase(os.path.realpath(os.path.abspath(file_path)))
+        existing = next((
+            snapshot
+            for snapshot in ctx["file_snapshots"]
+            if os.path.normcase(
+                os.path.realpath(os.path.abspath(snapshot["file_path"]))
+            ) == path_key
+        ), None)
+        if existing is None:
+            ctx["file_snapshots"].append({
+                "file_path": file_path,
+                "old_content": old_content,
+                "existed_before": (
+                    old_content != "" if existed_before is None else bool(existed_before)
+                ),
+                "old_bytes": old_bytes,
+            })
 
 
 def end_turn_checkpoint():
@@ -254,15 +347,26 @@ def end_turn_checkpoint():
     ctx = getattr(_checkpoint_tls, "current", None)
     if ctx is None:
         return None
-    ctx["completed"] = True
+    if not getattr(_checkpoint_tls, "owner", False):
+        raise RuntimeError("borrowed checkpoint binding cannot be committed")
+    ctx_lock = getattr(_checkpoint_tls, "current_lock", None)
+    if ctx_lock is None:
+        raise RuntimeError("checkpoint lock missing")
     session_name = ctx["session_name"]
-    with _session_checkpoints_lock:
-        bucket = _session_checkpoints.setdefault(session_name, [])
-        bucket.append(ctx)
-        # 限制每个会话最多保留 50 个检查点，防止内存无限增长
-        if len(bucket) > 50:
-            del bucket[: len(bucket) - 50]
-    _checkpoint_tls.current = None
+    key = (str(session_name), str(ctx["turn_id"]))
+    with ctx_lock:
+        ctx["completed"] = True
+        with _active_turn_checkpoints_lock:
+            active = _active_turn_checkpoints.get(key)
+            if active is not None and active[0] is ctx:
+                _active_turn_checkpoints.pop(key, None)
+        with _session_checkpoints_lock:
+            bucket = _session_checkpoints.setdefault(session_name, [])
+            bucket.append(ctx)
+            # 限制每个会话最多保留 50 个检查点，防止内存无限增长
+            if len(bucket) > 50:
+                del bucket[: len(bucket) - 50]
+    clear_turn_checkpoint_binding()
     return ctx
 
 

@@ -155,9 +155,79 @@ def test_sandbox_outside_access_third_option_sets_session_bypass(
 
     # 同会话第二次访问：免询问自动放行
     assert llm.check_permission_and_ask(
-        "sandbox_outside_access", {"path": "D:/other/y.txt", "operation": "write_file"}
+        "sandbox_outside_access", {"path": "D:/other/y.txt", "operation": "read_file"}
     ) is True
     assert asked == ["sandbox_outside_access"]
+
+
+def test_task_sandbox_bypass_does_not_bypass_confirm_write_permission(
+    interactive_env, clean_permission_state, monkeypatch
+):
+    """任务级沙箱放行只解除边界，confirm 模式的写入确认仍须执行。"""
+    import core.tools as tools_mod
+
+    monkeypatch.setattr(llm.app_context, "get_permission_mode", lambda: "confirm")
+    tools_mod.set_session_sandbox_bypass(True)
+    asked, requests = [], []
+    _auto_answer_broker(monkeypatch, 1, asked, requests)  # deny
+
+    assert llm.check_permission_and_ask(
+        "sandbox_outside_access",
+        {"path": "D:/outside/write.txt", "operation": "write_file"},
+    ) is False
+    assert asked == ["sandbox_outside_access"]
+    assert requests[0].arguments["operation"] == "write_file"
+
+
+def test_raw_terminal_credential_request_rejects_always_option(
+    clean_permission_state, monkeypatch
+):
+    """凭据写只下发 allow-once/deny 时，raw terminal 输入 a 必须拒绝。"""
+    import builtins
+    import core.tools as tools_mod
+    from core.permission_broker import PermissionOption, PermissionOptionKey
+
+    monkeypatch.setattr(builtins, "input", lambda _prompt: "a")
+    monkeypatch.setattr(builtins, "print", lambda *_args, **_kwargs: None)
+    tools_mod.set_session_sandbox_bypass(False)
+    options = (
+        PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
+        PermissionOption(PermissionOptionKey.DENY.value, "拒绝"),
+    )
+
+    assert llm.ask_in_raw_terminal(
+        "sandbox_outside_access",
+        {"path": "D:/outside/config.json", "operation": "write_file"},
+        options=options,
+    ) is False
+    assert tools_mod.is_session_sandbox_bypass_enabled() is False
+
+
+def test_raw_terminal_normal_sandbox_request_accepts_task_bypass_option(
+    clean_permission_state, monkeypatch
+):
+    """普通沙箱请求显式提供 allow_task_sandbox 时仍支持 raw terminal 的 a。"""
+    import builtins
+    import core.tools as tools_mod
+    from core.permission_broker import PermissionOption, PermissionOptionKey
+
+    monkeypatch.setattr(builtins, "input", lambda _prompt: "a")
+    monkeypatch.setattr(builtins, "print", lambda *_args, **_kwargs: None)
+    options = (
+        PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
+        PermissionOption(PermissionOptionKey.DENY.value, "拒绝"),
+        PermissionOption(
+            PermissionOptionKey.ALLOW_TASK_SANDBOX.value,
+            "本任务内放行沙箱外访问",
+        ),
+    )
+
+    assert llm.ask_in_raw_terminal(
+        "sandbox_outside_access",
+        {"path": "D:/outside/read.txt", "operation": "read_file"},
+        options=options,
+    ) is True
+    assert tools_mod.is_session_sandbox_bypass_enabled() is True
 
 
 def test_visible_session_switch_preserves_each_task_sandbox_bypass(

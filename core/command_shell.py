@@ -9,6 +9,11 @@ from dataclasses import dataclass
 from typing import Any
 
 import config
+from core.harness.turn_limits import (
+    MAX_TURN_STEP_LIMIT,
+    MIN_TURN_STEP_LIMIT,
+    load_turn_step_limit,
+)
 
 
 COMMAND_SHELL_CONFIG_KEY = "command_shell"
@@ -157,6 +162,9 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         "command_shell_available": selected_available,
         "command_shell_error": error,
         "remote_token_ttl": remote_token_ttl,
+        "agent_turn_step_limit": load_turn_step_limit(),
+        "agent_turn_step_limit_min": MIN_TURN_STEP_LIMIT,
+        "agent_turn_step_limit_max": MAX_TURN_STEP_LIMIT,
     }
 
 

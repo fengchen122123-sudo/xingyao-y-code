@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from concurrent.futures import Future, TimeoutError as FutureTimeoutError
@@ -41,7 +42,9 @@ PATH_VALIDATION_ERROR_MESSAGE = (
 )
 _PLAN_BYPASS_ERROR_PREFIX = "计划已创建：工具"
 _PLAN_ROOT_CONTROL_TOOLS = frozenset({
-    "plan_write", "plan_update", "plan_read", "plan_retry", "run_subagent", "ask_user",
+    "plan_write", "plan_update", "plan_read", "plan_retry", "plan_finish",
+    "plan_resume_takeover",
+    "run_subagent", "ask_user",
 })
 _PLAN_READ_ONLY_TOOLS = frozenset({
     "read_file", "list_directory", "search_code", "find_definition", "glob_files",
@@ -57,6 +60,14 @@ REPEAT_CALL_BLOCKED_TEXT = (
     "请检查已有结果或改变执行方案。"
 )
 
+# 旧子 Agent 执行租约 fencing：超时/取消/失败后，旧子代理的延迟工具调用
+# （permission_owner=其 task_id）必须立即取消，防止已由主 Agent 接管的
+# 计划项被旧执行者继续改写。查询工具同样拦截，不得继续访问外部状态。
+STALE_EXECUTION_LEASE_TEXT = (
+    "🚨 该子代理任务已被终止（超时或取消），执行租约已失效，本次工具调用已取消。"
+    "计划项将由主 Agent 接管，旧子代理不得继续执行任何工具。"
+)
+
 # 计划状态机工具不受重复调用抑制：plan_retry 设计为“首次返回根因分析提示、
 # 再次调用强制重置”，若被 RepeatCallGuard 拦截第二次调用，调度器会把计划项
 # 锁死在 failed 态（retry 被拒 → run_subagent 要求先重置 → 主 Agent 死锁）
@@ -65,6 +76,10 @@ _REPEAT_GUARD_EXEMPT_TOOLS = frozenset({
     "plan_update",
     "plan_read",
     "plan_retry",
+    "plan_resume_takeover",
+    # 收尾可能先失败（验证未过）后成功（修正后再收尾）：豁免重复抑制，
+    # 避免第三次同参数 plan_finish 被拦截导致接管项无法收尾
+    "plan_finish",
 })
 
 
@@ -599,6 +614,60 @@ class ToolPipeline:
         self.plan_turn_checker = plan_turn_checker
         self.pending_plan_checker = pending_plan_checker
 
+    def _active_takeover_item(self, context):
+        """返回当前回合的 active 接管项（经生产调度器核验）；无则 None。"""
+        try:
+            from core.task_scheduler import get_default_scheduler
+
+            scheduler = get_default_scheduler()
+        except Exception:
+            return None
+        takeover = scheduler.active_takeover(context.parent_turn_id)
+        if (
+            takeover is not None
+            and takeover.get("status") == "in_progress"
+            and takeover.get("execution_mode") == "main_takeover"
+            and str(takeover.get("takeover_turn_id", "")) == str(context.parent_turn_id)
+        ):
+            return takeover
+        return None
+
+    @staticmethod
+    def _takeover_files_violation(takeover, decoded):
+        """接管项声明 files 时，写文件只允许命中这些真实路径；未声明不加额外权限。
+
+        execute_command 不受 files 精确列表限制是既有设计取舍：命令仍完整经过
+        命令风险、权限与沙盒策略，不能把任意命令可靠映射成单一文件目标。
+        """
+        name = decoded.name
+        if name not in {"write_file", "edit_file"}:
+            return None
+        declared = [
+            str(value).strip()
+            for value in (takeover.get("files") or [])
+            if str(value).strip()
+        ]
+        if not declared:
+            return None
+        from core.workspace_context import get_workdir
+
+        file_path = str(decoded.arguments.get("file_path", "") or "").strip()
+        if not file_path:
+            return "计划接管约束：写文件必须提供 file_path。"
+        workdir = get_workdir()
+
+        def _normalized(value):
+            candidate = value if os.path.isabs(value) else os.path.join(workdir, value)
+            return os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+
+        allowed = {_normalized(value) for value in declared}
+        if _normalized(file_path) in allowed:
+            return None
+        return (
+            "计划接管约束：接管项只声明了以下文件，写文件仅允许命中这些路径："
+            f"[{', '.join(declared)}]。其他文件请先用 plan_update 调整计划项的 files 字段。"
+        )
+
     def _plan_constraint(self, decoded, context):
         if not context.allow_subagents or not (
             self.plan_turn_checker(context.parent_turn_id)
@@ -631,23 +700,22 @@ class ToolPipeline:
         from core.plan import get_default_plan_manager
 
         plan = get_default_plan_manager()
-        ready = [item for item in plan.ready_items() if item.get("kind") != "input_preparation"]
         snapshot = plan.snapshot()
-        in_progress = any(item.get("status") == "in_progress" for item in snapshot)
-        stalled = [
-            item for item in snapshot
-            if item.get("status") in {"failed", "blocked", "cancelled"}
-        ]
-        retry_exhausted = bool(stalled) and all(
-            int(item.get("attempts", 0)) >= 2 for item in stalled
-        )
         if not snapshot:
             # 计划在同一回合内被清空（plan_write 成功标记了计划回合后又被清空）：
             # 门禁失去意义，必须放行，否则主 Agent 陷入“没有计划项却被要求
             # 提供 plan_item_id”的死锁（execute_command 全被拦截、无任何提示可跟）
             return None
-        if not ready and not in_progress and retry_exhausted:
+        # 主 Agent scoped 接管放行：仅当存在归属当前回合的 active 接管项时，
+        # 才允许主 Agent 直接调用任务工具继续该计划项；旧分支
+        # “所有 stalled 项 attempts>=2 后全局放行”已按计划删除。
+        takeover = self._active_takeover_item(context)
+        if takeover is not None:
+            violation = self._takeover_files_violation(takeover, decoded)
+            if violation is not None:
+                return violation
             return None
+        ready = [item for item in plan.ready_items() if item.get("kind") != "input_preparation"]
         ready_hints = ""
         if ready:
             hints = ", ".join(f"'{item['id']}'({item['subject']})" for item in ready[:5])
@@ -655,7 +723,7 @@ class ToolPipeline:
         return (
             f"{_PLAN_BYPASS_ERROR_PREFIX} {name} 必须通过 run_subagent(plan_item_id=...) 执行，"
             f"不能由主 Agent 直接绕过计划调用。{ready_hints}"
-            "（若计划项多次失败（attempts>=2）全部停滞后，主 Agent 可直接调用工具修复。）"
+            "（若计划项子代理超时，主 Agent 接管后即可直接调用工具修复。）"
         )
 
     def _permission_decision(self, resolved, decoded, context):
@@ -669,10 +737,20 @@ class ToolPipeline:
             except Exception:
                 return None, PATH_VALIDATION_ERROR_MESSAGE
             outside_workspace = path_access in {"outside", "credential_write"}
+        permission_name = name
+        permission_arguments = arguments
+        if outside_workspace:
+            # 外部路径边界必须先以独立权限名暴露给兼容注入点，避免替身/
+            # 嵌入方在 adapter 的存在性探测前只看到普通 edit/write 权限。
+            permission_name = "sandbox_outside_access"
+            permission_arguments = {
+                "path": str(path_value or ""),
+                "operation": name,
+            }
         try:
             authorization = context.permission_checker(
-                name,
-                arguments,
+                permission_name,
+                permission_arguments,
                 tool_spec=resolved.spec,
                 outside_workspace=outside_workspace,
                 event_callback=context.event_callback,
@@ -708,8 +786,33 @@ class ToolPipeline:
             ),
         }
 
+    def _stale_execution_lease(self, context):
+        """旧子 Agent 延迟工具调用 fencing（在权限询问与 adapter 之前）。
+
+        permission_owner 形如 subagent-xxxx 的调用来自子代理 LLM 链路：
+        若该执行租约已失效（任务终态或不存在），返回取消错误；
+        主代理（owner 为空/turn id）与计划验证 runner（subagent:角色）不受影响。
+        """
+        owner = str(getattr(context, "permission_owner", "") or "")
+        from core.tools import is_subagent_task_id
+
+        if not is_subagent_task_id(owner):
+            return None
+        try:
+            from core.tools import subagent_manager
+            if subagent_manager.is_execution_lease_active(owner):
+                return None
+        except Exception:
+            # 执行租约真实性无法确认时必须 fail-closed；否则注册表短暂异常
+            # 会把已经超时/取消的旧子 Agent 重新放回工具与权限执行链。
+            return STALE_EXECUTION_LEASE_TEXT
+        return STALE_EXECUTION_LEASE_TEXT
+
     def execute_decoded(self, decoded: DecodedToolCall, context) -> dict:
         _raise_if_cancelled(context.cancel_event)
+        fenced = self._stale_execution_lease(context)
+        if fenced is not None:
+            return _tool_message(decoded, fenced)
         constrained = self._plan_constraint(decoded, context)
         if constrained is not None:
             return _tool_message(decoded, constrained)
@@ -736,7 +839,19 @@ class ToolPipeline:
                 return _tool_message(decoded, denied)
             _raise_if_cancelled(context.cancel_event)
 
+            legacy_boolean_authorization = isinstance(authorization, bool)
             bypass = bool(getattr(authorization, "sandbox_bypass", False))
+            if (
+                legacy_boolean_authorization
+                and not bypass
+                and decoded.name in {"read_file", "write_file", "edit_file"}
+            ):
+                # 兼容只返回 bool 的旧权限替身：外部边界既已批准，adapter
+                # 必须在同一次临时 bypass 中执行，不能再次询问或提前探测路径。
+                path_access = self.adapters.classify_path_access(
+                    decoded.name, decoded.arguments.get("file_path")
+                )
+                bypass = path_access in {"outside", "credential_write"}
             with self.adapters.sandbox_bypass() if bypass else nullcontext():
                 result = self.adapters.for_call(decoded.call_id).execute(
                     resolved, decoded.arguments, context

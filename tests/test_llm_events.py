@@ -118,6 +118,199 @@ def test_tool_event_payload_rejects_unparseable_arguments():
         })
 
 
+def _takeover_scheduler_for_turn_tests(mocker):
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{"id": "item", "subject": "跨回合接管"}])
+    scheduler = TaskScheduler(plan)
+    assert scheduler.start_delegated_item(
+        "item", "subagent-1234abcd", "subagent:implement", None
+    )
+    assert scheduler.handoff_to_main(
+        "item", "subagent-1234abcd", "old-turn", "foreground timeout"
+    ) is not None
+    assert scheduler.release_takeover_for_turn(
+        "old-turn", cancelled=False, reason="派发回合已结束"
+    ) is not None
+    mocker.patch("core.task_scheduler.get_default_scheduler", return_value=scheduler)
+    return plan, scheduler
+
+
+def test_main_turn_claims_takeover_before_provider_and_requeues_on_normal_end(mocker):
+    plan, _scheduler = _takeover_scheduler_for_turn_tests(mocker)
+    state_at_request = []
+
+    def completion(**_kwargs):
+        state_at_request.append(deepcopy(plan.snapshot()[0]))
+        return iter([_chunk("done")])
+
+    mocker.patch("core.llm.completion", side_effect=completion)
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "继续接手"}],
+        persist=False,
+        turn_id="new-turn",
+        parent_session="session",
+        parent_turn_id="new-turn",
+    ))
+
+    assert state_at_request[0]["status"] == "in_progress"
+    assert state_at_request[0]["execution_mode"] == "main_takeover"
+    assert state_at_request[0]["takeover_turn_id"] == "new-turn"
+    released = plan.snapshot()[0]
+    assert released["status"] == "pending"
+    assert released["execution_mode"] == "takeover_queued"
+    assert released["takeover_turn_id"] == ""
+    kinds = [event.kind for event in events]
+    assert kinds.index("plan_item_handoff") < kinds.index("turn_finished")
+    assert kinds.count("plan_updated") >= 2
+    handoff = next(event for event in events if event.kind == "plan_item_handoff")
+    assert handoff.payload["item"]["id"] == "item"
+    assert handoff.payload["mode"] == "main_takeover"
+    assert handoff.payload["queue_position"] == 0
+    assert handoff.payload["source_task_id"] == "subagent-1234abcd"
+
+
+def test_cancelled_main_turn_cancels_claimed_takeover(mocker):
+    plan, _scheduler = _takeover_scheduler_for_turn_tests(mocker)
+    cancel_event = threading.Event()
+    cancel_event.set()
+
+    with pytest.raises(KeyboardInterrupt):
+        list(chat_with_model_events(
+            "fake-model",
+            "fake-key",
+            [{"role": "user", "content": "取消接手"}],
+            persist=False,
+            turn_id="cancel-turn",
+            parent_session="session",
+            parent_turn_id="cancel-turn",
+            cancel_event=cancel_event,
+        ))
+
+    cancelled = plan.snapshot()[0]
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["execution_mode"] == ""
+    assert cancelled["takeover_required"] is True
+
+
+def _install_mid_turn_takeover(mocker, *, cancel=False):
+    """让子 Agent 在当前主回合已开始后才超时移交。"""
+    from core.plan import PlanManager
+    from core.task_scheduler import TaskScheduler
+
+    plan = PlanManager()
+    plan.replace([{"id": "item", "subject": "回合中途移交"}])
+    scheduler = TaskScheduler(plan)
+    mocker.patch("core.task_scheduler.get_default_scheduler", return_value=scheduler)
+
+    def fake_generator(*_args, **_kwargs):
+        assert scheduler.start_delegated_item(
+            "item", "subagent-1234abcd", "subagent:implement", None
+        )
+        assert scheduler.handoff_to_main(
+            "item", "subagent-1234abcd", "mid-turn", "foreground timeout"
+        ) is not None
+        if cancel:
+            raise KeyboardInterrupt("用户取消")
+        yield "done"
+
+    mocker.patch("core.llm._chat_with_model_generator", side_effect=fake_generator)
+    return plan
+
+
+def test_normal_end_requeues_takeover_created_mid_turn(mocker):
+    """回合中途产生的接管租约也必须在自然结束时释放。"""
+    plan = _install_mid_turn_takeover(mocker)
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "执行并结束"}],
+        persist=False,
+        turn_id="mid-turn",
+        parent_session="session",
+        parent_turn_id="mid-turn",
+    ))
+
+    released = plan.snapshot()[0]
+    assert released["status"] == "pending"
+    assert released["execution_mode"] == "takeover_queued"
+    assert released["takeover_turn_id"] == ""
+
+
+def test_cancelled_turn_cancels_takeover_created_mid_turn(mocker):
+    """用户取消不得遗留 active 接管项给下一回合自动复活。"""
+    plan = _install_mid_turn_takeover(mocker, cancel=True)
+
+    with pytest.raises(KeyboardInterrupt):
+        list(chat_with_model_events(
+            "fake-model",
+            "fake-key",
+            [{"role": "user", "content": "执行后取消"}],
+            persist=False,
+            turn_id="mid-turn",
+            parent_session="session",
+            parent_turn_id="mid-turn",
+        ))
+
+    cancelled = plan.snapshot()[0]
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["execution_mode"] == ""
+    assert cancelled["takeover_required"] is True
+
+
+def test_subagent_turn_never_claims_main_takeover(mocker):
+    plan, _scheduler = _takeover_scheduler_for_turn_tests(mocker)
+    mocker.patch("core.llm.completion", return_value=iter([_chunk("done")]))
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "子代理自己的回合"}],
+        persist=False,
+        turn_id="child-turn",
+        parent_session="session",
+        parent_turn_id="child-turn",
+        allow_subagents=False,
+    ))
+
+    item = plan.snapshot()[0]
+    assert item["status"] == "pending"
+    assert item["execution_mode"] == "takeover_queued"
+
+
+def test_completed_takeover_is_not_released_back_to_queue(mocker):
+    plan, scheduler = _takeover_scheduler_for_turn_tests(mocker)
+
+    def completion(**_kwargs):
+        active = scheduler.active_takeover("finish-turn")
+        assert active is not None
+        assert scheduler.complete(active["id"], "verified") is True
+        return iter([_chunk("done")])
+
+    mocker.patch("core.llm.completion", side_effect=completion)
+
+    list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "完成接手"}],
+        persist=False,
+        turn_id="finish-turn",
+        parent_session="session",
+        parent_turn_id="finish-turn",
+    ))
+
+    item = plan.snapshot()[0]
+    assert item["status"] == "completed"
+    assert item["execution_mode"] == "main_takeover"
+    assert item["takeover_required"] is True
+
+
 def test_parallel_tool_finished_events_keep_each_call_duration(mocker):
     first_response = iter([_chunk(tool_calls=[
         _tool_call(0, "call-slow", "glob_files", '{"pattern":"*.py"}'),
@@ -1147,9 +1340,7 @@ def test_persistence_uses_captured_parent_session_not_current_session(mocker, mo
     ]
 
 
-def test_completed_tool_turn_persists_one_ordered_batch(mocker, monkeypatch):
-    import main
-
+def test_completed_tool_turn_persists_one_ordered_batch(mocker):
     persisted = []
 
     class Manager:
@@ -1164,7 +1355,8 @@ def test_completed_tool_turn_persists_one_ordered_batch(mocker, monkeypatch):
                 for role, message in messages
             )
 
-    monkeypatch.setattr(main, "manager", Manager())
+    # 直接 patch 生产持久化依赖边界，绝不依赖 main/gui 入口的导入副作用
+    mocker.patch("core.app_context.get_manager", return_value=Manager())
     mocker.patch("core.llm.completion", side_effect=[
         iter([_chunk(tool_calls=[
             _tool_call(0, "read", "read_file", '{"file_path":"x.py"}'),
@@ -1189,11 +1381,9 @@ def test_completed_tool_turn_persists_one_ordered_batch(mocker, monkeypatch):
     ]
 
 
-def test_cancelled_tool_turn_salvages_completed_messages(mocker, monkeypatch):
+def test_cancelled_tool_turn_salvages_completed_messages(mocker):
     """取消回合时，已产生的 assistant 消息必须打捞落库，悬空的 tool_calls
     组补取消占位结果（否则重开会话看不到终止前进度，且下一轮 API 会 400）。"""
-    import main
-
     persisted = []
     cancel_event = threading.Event()
 
@@ -1210,7 +1400,8 @@ def test_cancelled_tool_turn_salvages_completed_messages(mocker, monkeypatch):
         cancel_event.set()
         raise KeyboardInterrupt("cancel tool")
 
-    monkeypatch.setattr(main, "manager", Manager())
+    # 直接 patch 生产持久化依赖边界，绝不依赖 main/gui 入口的导入副作用
+    mocker.patch("core.app_context.get_manager", return_value=Manager())
     mocker.patch("core.llm._execute_single_tool_call", side_effect=cancel_during_tool)
     mocker.patch("core.llm.completion", return_value=iter([
         _chunk(tool_calls=[
@@ -1274,8 +1465,8 @@ def test_edit_file_on_missing_file_gives_clear_error(mocker):
 
 
 def test_stalled_plan_after_repeated_failures_allows_direct_fix(mocker):
-    """回归：计划项多次失败（attempts>=2）全部停滞后，主 Agent 可直接调用
-    工具修复，不再被计划锁逼入死局。"""
+    """回归：计划项多次失败全部停滞后，只读/查询类诊断命令仍可直接执行，
+    主 Agent 不被计划锁逼入死局（修改类工具改由超时接管状态机放行）。"""
     from core.plan import bind_default_plan_session, get_default_plan_manager
     from core.task_scheduler import get_default_scheduler
     import core.llm as llm
@@ -1517,13 +1708,17 @@ def test_no_progress_abort_emits_fixed_user_visible_error(mocker):
     error_events = [event for event in events if event.kind == "error"]
     assert error_events, "无进展熔断必须产生用户可见 error 事件"
     assert error_events[0].payload["message"] == _NO_PROGRESS_MESSAGE
+    # 去重回归：终止文案只走 error/turn_error 事件通道（GUI 横幅 / CLI 红行），
+    # 不得再以 assistant_delta 正文形式渲染，否则对话流出现两遍相同文案。
     public_text = "".join(
         str(event.payload.get("text", ""))
         for event in events
         if event.kind == "assistant_delta"
     )
-    assert _NO_PROGRESS_MESSAGE in public_text
-    assert request_count == 6
+    assert _NO_PROGRESS_MESSAGE not in public_text
+    # 有界读取进展预算：首次 manage_task 新读取签名算一次进展，此后同一签名
+    # 重复调用不再算，熔断由第 6 次请求推迟到第 7 次（6 步停滞 + 1 步读取进展）
+    assert request_count == 7
 
 
 def test_no_progress_abort_works_without_harness_runtime(mocker):
@@ -1560,7 +1755,8 @@ def test_no_progress_abort_works_without_harness_runtime(mocker):
     reply = chat_with_model("fake-model", "fake-key", messages)
 
     assert reply == _NO_PROGRESS_MESSAGE
-    assert request_count == 6
+    # 同上：首次新读取签名消耗一格读取预算，熔断推迟到第 7 次请求
+    assert request_count == 7
     assert messages[-1] == {"role": "assistant", "content": _NO_PROGRESS_MESSAGE}
 
 
@@ -1662,3 +1858,114 @@ def test_step_progress_observation_mutation_rules():
         mutation_calls,
     )
     assert obs_mutation.mutation_committed is True
+
+
+def test_different_subagent_task_ids_do_not_reset_stall():
+    """子代理动态 task_id 不得把超时移交结果当成业务进展。"""
+    import json
+
+    from core.llm import _step_progress_observation
+
+    first = _step_progress_observation([
+        _progress_record("c1", "run_subagent", json.dumps({
+            "status": "timed_out", "handoff": "main_takeover",
+            "task_id": "subagent-a", "plan_item_id": "item",
+        }))
+    ])
+    second = _step_progress_observation([
+        _progress_record("c2", "run_subagent", json.dumps({
+            "status": "timed_out", "handoff": "main_takeover",
+            "task_id": "subagent-b", "plan_item_id": "item",
+        }))
+    ])
+    assert first.tool_results_sha256 == second.tool_results_sha256
+
+
+def test_unplanned_subagent_progress_uses_arguments_but_ignores_dynamic_task_id():
+    """无计划子代理的不同工作算进展；同一工作只换 task_id 不算。"""
+    import json
+
+    from core.llm import _step_progress_observation
+
+    def observe(call_id, task_description, task_id):
+        calls = {
+            call_id: {
+                "id": call_id,
+                "function": {
+                    "name": "run_subagent",
+                    "arguments": json.dumps({
+                        "task_description": task_description,
+                        "subagent_type": "explore",
+                    }),
+                },
+            },
+        }
+        return _step_progress_observation([
+            _progress_record(call_id, "run_subagent", json.dumps({
+                "status": "completed",
+                "task_id": task_id,
+                "result": "核查完成",
+                "execution_elapsed": 1.25,
+            }, ensure_ascii=False))
+        ], calls)
+
+    first = observe("c1", "核查模块 A", "subagent-11111111")
+    same_work = observe("c2", "核查模块 A", "subagent-22222222")
+    different_work = observe("c3", "核查模块 B", "subagent-33333333")
+
+    assert first.tool_results_sha256 == same_work.tool_results_sha256
+    assert first.tool_results_sha256 != different_work.tool_results_sha256
+
+
+def test_plan_bound_subagent_result_is_delegated_to_plan_fingerprint():
+    """计划绑定子代理的参数和动态结果都不绕过计划状态指纹。"""
+    import json
+
+    from core.llm import _step_progress_observation
+
+    def observe(call_id, description, task_id):
+        calls = {
+            call_id: {
+                "id": call_id,
+                "function": {
+                    "name": "run_subagent",
+                    "arguments": json.dumps({
+                        "task_description": description,
+                        "plan_item_id": "item",
+                    }),
+                },
+            },
+        }
+        return _step_progress_observation([
+            _progress_record(call_id, "run_subagent", json.dumps({
+                "status": "timed_out",
+                "task_id": task_id,
+                "plan_item_id": "item",
+                "handoff": "main_takeover",
+            }))
+        ], calls)
+
+    first = observe("c1", "第一次描述", "subagent-11111111")
+    second = observe("c2", "第二次描述", "subagent-22222222")
+    assert first.tool_results_sha256 == second.tool_results_sha256
+
+
+def test_plan_state_tools_do_not_contribute_result_progress():
+    """plan_retry/plan_read 只依据计划快照实质转换计进展，正文不算。"""
+    from core.llm import _step_progress_observation
+
+    baseline = _step_progress_observation([
+        _progress_record("c1", "plan_retry", "已重置为 pending；提示 A")
+    ])
+    changed_text = _step_progress_observation([
+        _progress_record("c2", "plan_retry", "已重置为 pending；提示 B（文案不同）")
+    ])
+    read_a = _step_progress_observation([
+        _progress_record("c3", "plan_read", "计划共 1 项:\n  [pending] x")
+    ])
+    read_b = _step_progress_observation([
+        _progress_record("c4", "plan_read", "计划共 1 项:\n  [pending] x（新格式）")
+    ])
+
+    assert baseline.tool_results_sha256 == changed_text.tool_results_sha256
+    assert read_a.tool_results_sha256 == read_b.tool_results_sha256

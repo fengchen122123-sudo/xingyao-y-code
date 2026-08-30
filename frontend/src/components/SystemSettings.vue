@@ -53,6 +53,36 @@
           <option :value="604800">7 天</option>
         </select>
       </div>
+      <div class="setting-row">
+        <div class="setting-copy">
+          <h2>单任务最大模型轮次</h2>
+          <p>一次用户任务最多发起多少次模型请求；工具调用数可能高于该值。修改后仅影响新任务。</p>
+        </div>
+        <div class="setting-number-group">
+          <input
+            data-test="turn-step-limit-input"
+            v-model="turnStepLimitDraft"
+            class="setting-number"
+            type="number"
+            step="1"
+            :min="store.systemSettings.agent_turn_step_limit_min"
+            :max="store.systemSettings.agent_turn_step_limit_max"
+            :disabled="saving"
+          />
+          <button
+            data-test="save-turn-step-limit"
+            class="setting-save"
+            type="button"
+            :disabled="saving || !!turnStepLimitError || !turnStepLimitChanged"
+            @click="saveTurnStepLimit"
+          >
+            保存
+          </button>
+        </div>
+      </div>
+      <p v-if="turnStepLimitError" data-test="turn-step-limit-error" class="setting-error">
+        {{ turnStepLimitError }}
+      </p>
       <p v-if="store.systemSettings.command_shell_error" class="setting-error">
         {{ store.systemSettings.command_shell_error }}
       </p>
@@ -64,13 +94,52 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { computed, ref, watch } from 'vue';
 
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 
 const store = useAppStore();
 const saving = ref(false);
+
+const turnStepLimitDraft = ref(String(store.systemSettings.agent_turn_step_limit));
+
+watch(
+  () => store.systemSettings.agent_turn_step_limit,
+  value => { turnStepLimitDraft.value = String(value); },
+);
+
+const parsedTurnStepLimit = computed(() => Number(turnStepLimitDraft.value));
+const turnStepLimitError = computed(() => {
+  const value = parsedTurnStepLimit.value;
+  const min = store.systemSettings.agent_turn_step_limit_min;
+  const max = store.systemSettings.agent_turn_step_limit_max;
+  // type="number" 的 v-model 会自动把草稿转为 number，这里统一按字符串校验
+  if (!String(turnStepLimitDraft.value).trim() || !Number.isInteger(value)) {
+    return '请输入整数';
+  }
+  if (value < min || value > max) {
+    return `请输入 ${min}–${max} 之间的整数`;
+  }
+  return '';
+});
+const turnStepLimitChanged = computed(
+  () => !turnStepLimitError.value
+    && parsedTurnStepLimit.value !== store.systemSettings.agent_turn_step_limit,
+);
+
+async function saveTurnStepLimit() {
+  if (saving.value || turnStepLimitError.value || !turnStepLimitChanged.value) return;
+  saving.value = true;
+  try {
+    const saved = await store.setAgentTurnStepLimit(parsedTurnStepLimit.value);
+    if (!saved) {
+      turnStepLimitDraft.value = String(store.systemSettings.agent_turn_step_limit);
+    }
+  } finally {
+    saving.value = false;
+  }
+}
 
 async function selectShell(shellId: string) {
   if (shellId === store.systemSettings.command_shell || saving.value) return;
@@ -109,6 +178,13 @@ async function selectTokenTtl(value: string) {
 .setting-select { flex: 0 0 240px; max-width: 45%; height: 38px; padding: 0 34px 0 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
 .setting-select:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
 .setting-select:disabled { cursor: wait; opacity: .7; }
+.setting-number-group { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+.setting-number { width: 120px; height: 38px; padding: 0 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
+.setting-number:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
+.setting-number:disabled { cursor: wait; opacity: .7; }
+.setting-save { height: 38px; padding: 0 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
+.setting-save:hover:not(:disabled) { background: var(--bg3); }
+.setting-save:disabled { cursor: not-allowed; opacity: .6; }
 .setting-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
 .setting-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
 @media (max-width: 620px) {

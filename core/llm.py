@@ -429,9 +429,12 @@ _PLAN_READ_ONLY_TOOLS = frozenset({
     "fetch_url",
     "search_news",
     "get_weather",
-    # 后台任务监控必须放行：模型用 run_subagent(run_in_background=True) 启动
-    # 子代理后需要 manage_task(list/status) 轮询进度，拦截会让主 Agent 对自己
-    # 启动的后台任务完全失明（kill 操作有独立的用户确认，不受此白名单影响）
+    # 后台任务监控必须放行：manage_task 统一管理两类后台任务（shell 后台命令与
+    # subagent-* 子代理任务，子代理注册表已桥接）。模型用 run_subagent(
+    # run_in_background=True) 启动子代理后，可在回合内用 manage_task(list/status/wait)
+    # 查询进度或等待终态；子代理结果的正规回流是回合结束后的自动汇总注入，
+    # manage_task 用于回合内主动收割，拦截会让主 Agent 对自己启动的后台任务完全失明
+    # （kill 操作有独立的用户确认，不受此白名单影响）
     "manage_task",
 })
 _PLAN_BOUND_ORCHESTRATORS = frozenset({"run_subagent", "ask_user"})
@@ -504,7 +507,7 @@ def safe_print(formatted_text):
         except Exception:
             pass
 
-def ask_in_raw_terminal(function_name, arguments):
+def ask_in_raw_terminal(function_name, arguments, *, options=()):
     """
     纯文本原始终端兜底：只在确实没有活动 CLI App 时才被调用（例如管道重定向或早期初始化时）。
     不使用任何 ANSI 转义序列或 msvcrt 菜单，直接用 print/input 避免污染 CLI 屏幕。
@@ -516,6 +519,11 @@ def ask_in_raw_terminal(function_name, arguments):
         "full": "完全访问",
     }
     mode_tip = mode_display.get(app_context.get_permission_mode(), "确认")
+    option_keys = {str(option.key) for option in options}
+    allow_task = PermissionOptionKey.ALLOW_TASK.value in option_keys
+    allow_task_sandbox = (
+        PermissionOptionKey.ALLOW_TASK_SANDBOX.value in option_keys
+    )
     
     print("")  # 空行分隔
     if function_name == "write_file":
@@ -553,13 +561,19 @@ def ask_in_raw_terminal(function_name, arguments):
         if shell_override:
             print("请输入 [y]es 同意本次, [n]o 拒绝（解释器覆盖不支持加入白名单）")
             res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
-        elif function_name == "sandbox_outside_access":
+        elif function_name == "sandbox_outside_access" and allow_task_sandbox:
             # 沙盒外路径访问可任务级放行，但不做持久化落盘
             print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 本任务内放行沙盒外访问")
             res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
-        else:
+        elif function_name == "sandbox_outside_access":
+            print("请输入 [y]es 同意本次, [n]o 拒绝")
+            res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
+        elif allow_task:
             print("请输入 [y]es 同意本次, [n]o 拒绝, [a]lways 允许此类操作 (仅当前任务放行)")
             res = input(f"批准该操作？(y/n/a, 模式:{mode_tip}, 默认 y): ").strip().lower()
+        else:
+            print("请输入 [y]es 同意本次, [n]o 拒绝")
+            res = input(f"批准该操作？(y/n, 模式:{mode_tip}, 默认 y): ").strip().lower()
         
         if shell_override:
             return res in ("", "y", "yes")
@@ -568,6 +582,10 @@ def ask_in_raw_terminal(function_name, arguments):
             return False
             
         if res in ("a", "always", "y*"):
+            # 严格服从本次请求实际下发的 option keys；凭据写等只允许
+            # allow_once/deny 的请求不能借 raw terminal 额外创建长期授权。
+            if not (allow_task or allow_task_sandbox):
+                return False
             if function_name == "execute_command":
                 cmd = arguments.get("command", "")
                 prefix = _session_prefix_for_command(cmd)
@@ -604,6 +622,7 @@ _PLAN_INTERNAL_PERMISSION_TOOLS = frozenset({
     "plan_read",
     "plan_update",
     "plan_retry",
+    "plan_finish",
     "ask_user",
 })
 _KNOWN_QUERY_TOOLS = frozenset({
@@ -692,7 +711,14 @@ def _permission_rule_facts(function_name, arguments):
     return task_hit, project_hit, task_grant, project_rule
 
 
-def _permission_options(*, sandbox_request, task_grant, project_rule):
+def _permission_options(*, sandbox_request, credential_write, task_grant, project_rule):
+    if credential_write:
+        # ~/.ycode 顶层凭据/配置写入必须逐次确认，不能生成任务级或项目级
+        # 持久放行选项，否则后续写入会绕过安全边界。
+        return (
+            PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
+            PermissionOption(PermissionOptionKey.DENY.value, "拒绝"),
+        )
     if sandbox_request:
         return (
             PermissionOption(PermissionOptionKey.ALLOW_ONCE.value, "允许本次"),
@@ -753,7 +779,7 @@ def _wait_permission_option(
             with _raw_permission_lock:
                 return (
                     PermissionOptionKey.ALLOW_ONCE.value
-                    if ask_in_raw_terminal(function_name, arguments)
+                    if ask_in_raw_terminal(function_name, arguments, options=options)
                     else PermissionOptionKey.DENY.value
                 )
 
@@ -805,29 +831,47 @@ def authorize_tool_call(
     cancel_event=None,
 ):
     check_session_reset()
-    path_access = "outside" if outside_workspace else "inside"
-    path_value = arguments.get("file_path")
-    if path_value and function_name in {"read_file", "write_file", "edit_file"}:
+    sandbox_access_request = function_name == "sandbox_outside_access"
+    effective_function_name = function_name
+    effective_arguments = arguments
+    if sandbox_access_request:
+        effective_function_name = str(arguments.get("operation") or "").strip()
+        if effective_function_name not in {"read_file", "write_file", "edit_file"}:
+            raise PermissionSystemError("沙箱外访问缺少有效的原始文件操作类型")
+        path_value = arguments.get("path")
+        effective_arguments = dict(arguments)
+        effective_arguments["file_path"] = path_value
+    else:
+        path_value = arguments.get("file_path")
+
+    outside_hint = bool(outside_workspace or sandbox_access_request)
+    path_access = "outside" if outside_hint else "inside"
+    if (
+        path_value
+        and effective_function_name in {"read_file", "write_file", "edit_file"}
+    ):
         try:
             from core.harness.tool_adapters import classify_path_access
 
             path_access = classify_path_access(
-                function_name,
+                effective_function_name,
                 path_value,
-                is_outside_workspace=is_outside_workspace,
+                # Pipeline 已在任何文件存在性探测前完成路径边界分类；这里
+                # 只复用该结论，并继续识别 ~/.ycode 顶层 credential_write。
+                is_outside_workspace=lambda _path: outside_hint,
             )
         except Exception as exc:
             raise PermissionSystemError(f"路径权限分类失败: {exc}") from exc
-        if outside_workspace and path_access == "inside":
+        if outside_hint and path_access == "inside":
             path_access = "outside"
-    if function_name == "sandbox_outside_access":
-        path_access = "outside"
 
-    risk = _permission_risk(function_name, arguments, tool_spec, path_access)
-    plan_internal = function_name in _PLAN_INTERNAL_PERMISSION_TOOLS
+    risk = _permission_risk(
+        effective_function_name, effective_arguments, tool_spec, path_access
+    )
+    plan_internal = effective_function_name in _PLAN_INTERNAL_PERMISSION_TOOLS
     task_hit, project_hit, task_grant, project_rule = _permission_rule_facts(
-        function_name,
-        arguments,
+        effective_function_name,
+        effective_arguments,
     )
 
     outside = path_access in {"outside", "credential_write"}
@@ -843,7 +887,10 @@ def authorize_tool_call(
         sandbox_restricted = True
     from core.tools import is_session_sandbox_bypass_enabled
 
-    task_sandbox_bypass = is_session_sandbox_bypass_enabled()
+    credential_write = path_access == "credential_write"
+    task_sandbox_bypass = (
+        False if credential_write else is_session_sandbox_bypass_enabled()
+    )
     decision = decide_permission(PermissionFacts(
         mode=app_context.get_permission_mode(),
         risk=risk,
@@ -868,15 +915,20 @@ def authorize_tool_call(
     sandbox_request = decision.reason == "sandbox_boundary_requires_confirmation"
     options = _permission_options(
         sandbox_request=sandbox_request,
+        credential_write=credential_write,
         task_grant=task_grant,
         project_rule=project_rule,
     )
+    prompt_as_sandbox = sandbox_access_request or sandbox_request
     try:
         option_key = _wait_permission_option(
-            "sandbox_outside_access" if sandbox_request else function_name,
+            "sandbox_outside_access" if prompt_as_sandbox else function_name,
             (
-                {"path": str(path_value or arguments.get("path", "")), "operation": function_name}
-                if sandbox_request
+                {
+                    "path": str(path_value or ""),
+                    "operation": effective_function_name,
+                }
+                if prompt_as_sandbox
                 else arguments
             ),
             options,
@@ -2083,6 +2135,29 @@ def chat_with_model(
         return ""
 
 
+def _claim_takeover_at_turn_start(
+    parent_session,
+    parent_turn_id,
+    event_callback=None,
+):
+    """在主 Agent 首次 Provider 请求前认领该会话最早的接管项。"""
+    session_id = str(parent_session or "").strip()
+    turn_id = str(parent_turn_id or "").strip()
+    if not session_id or not turn_id:
+        return None, None
+    from core.task_scheduler import get_default_scheduler, takeover_handoff_payload
+
+    scheduler = get_default_scheduler()
+    claimed = scheduler.claim_takeover_for_turn(turn_id)
+    if claimed is not None and event_callback is not None:
+        event_callback("plan_item_handoff", takeover_handoff_payload(claimed))
+        event_callback("plan_updated", {
+            "title": "当前任务计划",
+            "items": scheduler.plan.snapshot(),
+        })
+    return scheduler, claimed
+
+
 def chat_with_model_events(
     model_name,
     api_key,
@@ -2171,32 +2246,69 @@ def chat_with_model_events(
                 ready.append(factory.emit("assistant_delta", {"text": part.text}))
         return ready
 
-    generator = _chat_with_model_generator(
-        model_name,
-        api_key,
-        messages,
-        api_base=api_base,
-        stream=persist,
-        event_callback=emit,
-        cancel_event=cancel_event,
-        allow_subagents=allow_subagents,
-        allowed_tools=allowed_tools,
-        consume_background_notifications=consume_background_notifications,
-        parent_session=parent_session,
-        parent_turn_id=resolved_parent_turn_id,
-        permission_owner=permission_owner or resolved_parent_turn_id,
-        permission_source=permission_source,
-        cache_scope=cache_scope,
-        cache_session_id=cache_session_id or parent_session,
-        model_id=model_id,
-        harness_runtime=harness_runtime,
-    )
+    takeover_scheduler = None
+    takeover_claimed = None
+    takeover_released = False
+
+    def release_claimed_takeover(*, cancelled, reason):
+        nonlocal takeover_released
+        if takeover_released or takeover_scheduler is None:
+            return None
+        released = takeover_scheduler.release_takeover_for_turn(
+            resolved_parent_turn_id,
+            cancelled=bool(cancelled),
+            reason=str(reason),
+        )
+        if released is not None:
+            # 只有真实释放后才标记幂等：子 Agent 可能在回合开始
+            # 认领之后、收尾之前才超时移交，finally 必须仍能捕获。
+            takeover_released = True
+            emit("plan_updated", {
+                "title": "当前任务计划",
+                "items": takeover_scheduler.plan.snapshot(),
+            })
+        return released
+
     try:
+        # 只有真实主 Agent 回合允许认领；子 Agent 自身使用 allow_subagents=False，
+        # 即使共享 parent_session 也不能窃取主回合的接管租约。认领与生成器构造
+        # 都属于 Harness 准备阶段，必须位于异常收口范围内。
+        if allow_subagents:
+            takeover_scheduler, takeover_claimed = _claim_takeover_at_turn_start(
+                parent_session,
+                resolved_parent_turn_id,
+                emit,
+            )
+
+        generator = _chat_with_model_generator(
+            model_name,
+            api_key,
+            messages,
+            api_base=api_base,
+            stream=persist,
+            event_callback=emit,
+            cancel_event=cancel_event,
+            allow_subagents=allow_subagents,
+            allowed_tools=allowed_tools,
+            consume_background_notifications=consume_background_notifications,
+            parent_session=parent_session,
+            parent_turn_id=resolved_parent_turn_id,
+            permission_owner=permission_owner or resolved_parent_turn_id,
+            permission_source=permission_source,
+            cache_scope=cache_scope,
+            cache_session_id=cache_session_id or parent_session,
+            model_id=model_id,
+            harness_runtime=harness_runtime,
+        )
         for chunk in generator:
             yield from drain_public_events()
             if chunk:
                 yield from events_for_parts(parser.feed(chunk))
 
+        release_claimed_takeover(
+            cancelled=False,
+            reason="主回合结束前未完成接管项，已等待下一回合继续",
+        )
         yield from drain_public_events()
         yield from events_for_parts(parser.finish())
         if thinking_open:
@@ -2208,6 +2320,10 @@ def chat_with_model_events(
     except KeyboardInterrupt:
         if harness_runtime is not None:
             harness_runtime.cancel()
+        release_claimed_takeover(
+            cancelled=True,
+            reason="用户取消了主 Agent 接管回合",
+        )
         yield from drain_public_events()
         yield factory.emit("turn_cancelled", {})
         raise
@@ -2216,9 +2332,28 @@ def chat_with_model_events(
         # try 直接传播到这里：补发 turn_error，保证调用方能感知回合失败
         if harness_runtime is not None:
             harness_runtime.fail(type(exc).__name__)
+        release_claimed_takeover(
+            cancelled=bool(cancel_event is not None and cancel_event.is_set()),
+            reason=(
+                "用户取消了主 Agent 接管回合"
+                if cancel_event is not None and cancel_event.is_set()
+                else f"主回合异常结束：{type(exc).__name__}"
+            ),
+        )
         yield from drain_public_events()
         yield factory.emit("turn_error", {"message": _sanitize_error_text(exc)})
         raise
+    finally:
+        # 消费端主动 close 会以 GeneratorExit 跳过上面的两个异常分支；这里
+        # 只做幂等状态收尾。此时无法再向已关闭的消费者发送展示事件。
+        release_claimed_takeover(
+            cancelled=bool(cancel_event is not None and cancel_event.is_set()),
+            reason=(
+                "用户取消了主 Agent 接管回合"
+                if cancel_event is not None and cancel_event.is_set()
+                else "主回合在完成接管项前结束，已等待下一回合继续"
+            ),
+        )
 
 # 支持原生推理字段回传的 provider 白名单（按 litellm model 前缀匹配）
 _REASONING_FIELD_PROVIDERS = ("anthropic", "deepseek", "moonshot")
@@ -3393,11 +3528,78 @@ def _tool_result_ok(function_name, result):
     ))
 
 
+# 计划状态机工具的结果正文不作为进展信号：真实状态转换已由计划 canonical
+# 快照指纹单独捕获。run_subagent 需要区分计划绑定与无计划调用，不能在这里
+# 全局忽略，详见 _unplanned_subagent_progress_part。
+_PLAN_STATE_RESULT_TOOLS = frozenset({"plan_retry", "plan_read"})
+
+
+def _canonical_arguments_signature(name, tool_call):
+    """读取签名 = tool name + canonical arguments 的 SHA-256（仅存 Turn 内存）。"""
+    raw = ""
+    if tool_call:
+        raw = str((tool_call.get("function") or {}).get("arguments") or "")
+    try:
+        canonical = json.dumps(
+            json.loads(raw or "{}"),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        canonical = raw
+    return hashlib.sha256(f"{name}:{canonical}".encode("utf-8")).hexdigest()
+
+
+def _unplanned_subagent_progress_part(message, tool_call):
+    """返回无计划子任务的稳定进展材料；计划绑定调用返回 None。
+
+    参数签名区分模型实际派发的不同工作。结果只保留稳定的 status/result，
+    明确排除 task_id、耗时与 error 等运行噪声；计划绑定调用则完全交给计划
+    快照指纹判定，不能靠改描述或动态任务 id 重置停滞计数。
+    """
+    raw_arguments = ""
+    if tool_call:
+        raw_arguments = str(
+            (tool_call.get("function") or {}).get("arguments") or ""
+        )
+    try:
+        arguments = json.loads(raw_arguments or "{}")
+    except (TypeError, ValueError):
+        arguments = {}
+    if isinstance(arguments, dict) and str(
+        arguments.get("plan_item_id", "") or ""
+    ).strip():
+        return None
+    if not _tool_result_ok("run_subagent", message):
+        return None
+
+    content = str(message.get("content", "") or "")
+    try:
+        payload = json.loads(content)
+    except (TypeError, ValueError):
+        payload = None
+    if isinstance(payload, dict):
+        stable_result = {"status": str(payload.get("status", "") or "")}
+        if "result" in payload:
+            stable_result["result"] = payload.get("result")
+    else:
+        # 前台 completed 路径直接返回子代理正文；正文就是实际成果信号。
+        stable_result = {"status": "completed", "result": content}
+    return [
+        "run_subagent",
+        _canonical_arguments_signature("run_subagent", tool_call),
+        stable_result,
+    ]
+
+
 def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
     """构造本 Step 的确定性进展观察（供 TurnProgressGuard 判定）。
 
     只聚合确定性状态：后台任务指纹、计划 canonical 快照指纹、
     非观察类工具结果哈希、修改类提交标记；不读取模型自然语言。
+    附加本步只读工具签名，供 guard 做有界（MAX_UNIQUE_READS）读取进展
+    判定（所有会话通用，普通只读调查链不再被误判停滞）；签名不写 Journal。
     """
     from core.harness.progress_guard import ProgressObservation
     from core.harness.tool_pipeline import (
@@ -3409,6 +3611,7 @@ def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
 
     result_parts = []
     mutation_committed = False
+    read_signatures = []
     for record in records or ():
         message = getattr(record, "message", None) or {}
         name = str(message.get("name", "") or "")
@@ -3435,7 +3638,21 @@ def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
 
                 if classify_command_risk(command) is not PermissionRisk.QUERY:
                     mutation_committed = True
-        if name not in _PLAN_READ_ONLY_TOOLS:
+        if ok and name in _PLAN_READ_ONLY_TOOLS and tool_calls_by_id is not None:
+            read_signatures.append(
+                _canonical_arguments_signature(
+                    name, tool_calls_by_id.get(message.get("tool_call_id"))
+                )
+            )
+        if name == "run_subagent":
+            progress_part = _unplanned_subagent_progress_part(
+                message,
+                (tool_calls_by_id or {}).get(message.get("tool_call_id")),
+            )
+            if progress_part is not None:
+                result_parts.append(progress_part)
+            continue
+        if name not in _PLAN_READ_ONLY_TOOLS and name not in _PLAN_STATE_RESULT_TOOLS:
             result_parts.append([name, content])
 
     canonical = json.dumps(
@@ -3446,6 +3663,7 @@ def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
         plan_snapshot_sha256=plan_state_fingerprint(session_id),
         tool_results_sha256=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
         mutation_committed=mutation_committed,
+        read_signatures=tuple(read_signatures),
     )
 
 
@@ -4231,9 +4449,13 @@ def _chat_with_model_generator(
 
     response_stream = None
     try:
+        # 每个 Turn 只在首次 Provider 请求前读取一次上限并冻结到局部变量；
+        # 运行中修改系统设置只影响后续 Turn
+        from core.harness.turn_limits import load_turn_step_limit
+
+        max_turns = load_turn_step_limit()
         if harness_runtime is not None:
             harness_runtime.mark_running()
-        max_turns = 100
         for turn in range(max_turns):
             raise_if_cancelled()
             # 无进展熔断：连续 MAX_STALLED_STEPS 步无确定性状态变化时，
@@ -4253,7 +4475,12 @@ def _chat_with_model_generator(
                 if harness_runtime is not None:
                     harness_runtime.fail("NoProgressError")
                 _notify_event(event_callback, "error", {"message": msg})
-                yield from _yield_content(msg)
+                # Harness 已进入 failed 终态，事件层必须同步发出
+                # turn_error；否则外层会把正常 return 误判为 turn_finished。
+                _notify_event(event_callback, "turn_error", {"message": msg})
+                # 消息只走事件通道展示（GUI error 横幅 / CLI turn_error 红行），
+                # 不再 yield 正文，避免同一文案在对话流里渲染两遍；
+                # 持久化副本保证会话重载时仍可见。
                 return
             if harness_runtime is not None:
                 current_step = harness_runtime.begin_step()
@@ -4957,8 +5184,14 @@ def _chat_with_model_generator(
                 )
             )
 
-        # 超过轮次上限：提示消息写入历史并与正常结束一样落库，避免下一轮丢失上下文
-        msg = f"{TOOL_ERROR_PREFIX} 任务轮次超过上限（100 轮），请把任务拆小一点再试！"
+        # 达到轮次上限但模型尚未正常文本收尾：提示消息写入历史并在当前 Step 上
+        # 原子提交，最后一个已完整提交的 Step 保持 completed，Turn 显式失败为
+        # StepLimitExceeded——不回滚副作用、不自动续跑、不发 turn_finished
+        msg = (
+            f"{TOOL_ERROR_PREFIX} 单任务已达到模型轮次上限（{max_turns} 轮），任务未完成。"
+            "已保留本轮代码、工具结果和测试记录；请发送“继续”开启新回合，"
+            "或在系统设置中调整上限。"
+        )
         limit_message = {"role": "assistant", "content": msg}
         messages.append(limit_message)
         if stream:
@@ -4971,8 +5204,12 @@ def _chat_with_model_generator(
         if current_step is not None:
             current_step.complete()
         if harness_runtime is not None:
-            harness_runtime.complete()
-        yield from _yield_content(msg)
+            harness_runtime.fail("StepLimitExceeded")
+        _notify_event(event_callback, "error", {"message": msg})
+        # Harness 已进入 failed 终态，事件层必须同步发出
+        # turn_error；否则外层会把正常 return 误判为 turn_finished。
+        _notify_event(event_callback, "turn_error", {"message": msg})
+        # 同无进展熔断：只走事件通道展示，不 yield 正文避免对话流重复渲染。
         return
 
     except KeyboardInterrupt:

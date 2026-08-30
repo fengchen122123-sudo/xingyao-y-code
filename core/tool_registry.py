@@ -90,7 +90,14 @@ def build_default_registry() -> ToolRegistry:
     from core import tools
     from core import lsp as _lsp
     from core.ask_user import ask_user
-    from core.plan import plan_read, plan_retry, plan_update, plan_write
+    from core.plan import (
+        plan_finish,
+        plan_read,
+        plan_resume_takeover,
+        plan_retry,
+        plan_update,
+        plan_write,
+    )
 
     read_specs = [
         ToolSpec(
@@ -293,12 +300,43 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="plan_retry",
-            description="将 failed/blocked/cancelled 状态的计划项重置为 pending，以便重新通过 run_subagent 执行。",
+            description="将 failed/blocked/cancelled 状态的计划项重置为 pending，以便重新通过 run_subagent 执行。已失败至少两次且保留错误时，必须显式传 force=true 以确认强制重试。",
             input_schema=_schema({
                 "item_id": {"type": "string", "description": "要重置的计划项 id"},
+                "force": {"type": "boolean", "description": "失败至少两次且仍有错误时，确认已分析根因并强制重试"},
             }, ["item_id"]),
             execute=plan_retry,
             activity_description="重试计划项",
+        ),
+        ToolSpec(
+            name="plan_resume_takeover",
+            description=(
+                "恢复一个曾经因子 Agent 超时而移交主 Agent、随后验证失败/阻塞/取消的计划项。"
+                "恢复属于原尝试的延续，不增加 attempts，也绝不会重新创建子 Agent。"
+                "恢复后由当前主 Agent 直接继续，完成时调用 plan_finish。"
+            ),
+            input_schema=_schema({
+                "item_id": {"type": "string", "description": "要恢复的超时接管计划项 id"},
+            }, ["item_id"]),
+            execute=plan_resume_takeover,
+            activity_description="恢复主 Agent 接管",
+        ),
+        ToolSpec(
+            name="plan_finish",
+            description=(
+                "完成主 Agent 正在接管的计划项（子代理超时接管收尾专用）。"
+                "接管项的直接工具工作全部完成后必须调用本工具显式收尾："
+                "verification_type=command 的计划项会真实执行 verification 命令验证，"
+                "通过则标记 completed 并自动提升下一个排队接管项；"
+                "验证失败则标记 failed，不重新委派子代理。"
+                "只有当前回合 active 接管中的计划项允许收尾。"
+            ),
+            input_schema=_schema({
+                "item_id": {"type": "string", "description": "要完成的接管计划项 id"},
+                "result": {"type": "string", "description": "工作成果摘要/完成说明"},
+            }, ["item_id", "result"]),
+            execute=plan_finish,
+            activity_description="完成接管计划项",
         ),
         ToolSpec(
             name="write_file",
@@ -375,14 +413,26 @@ def build_default_registry() -> ToolRegistry:
         ToolSpec(
             name="manage_task",
             description=(
-                "查看、等待或终止后台任务。list/status/wait 为只读操作不弹确认；"
-                "仅 kill 操作会请求用户确认。等待后台任务进展优先用 wait："
-                "传入上次快照的 revision，任务状态或输出变化时立即返回。"
+                "查看、等待或终止后台任务，同时管理两类任务：shell 后台命令与子代理任务"
+                "（task_id 形如 subagent-xxxxxxxx）。list/status/wait 为只读操作不弹确认；"
+                "仅 kill 操作会请求用户确认。"
+                "shell 任务用 wait 条件等待：传入上次快照的 revision（缺省视为 0，即首次等待），"
+                "任务状态或输出变化时立即返回。"
+                "子代理任务用 wait 等待其进入终态（忽略 after_revision），"
+                "终态返回含 result 摘要，可在回合内直接收割后台子代理结果；"
+                "子代理结果也会在回合结束后的下一回合自动汇总注入，无需为收结果而拖延回合。"
             ),
             input_schema=_schema({
                 "action": {"type": "string", "enum": ["list", "status", "wait", "kill"]},
-                "task_id": {"type": "string"},
-                "after_revision": {"type": "integer", "minimum": 0},
+                "task_id": {
+                    "type": "string",
+                    "description": "目标任务 ID：shell 任务为 8 位十六进制，子代理任务形如 subagent-xxxxxxxx。",
+                },
+                "after_revision": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "description": "仅 shell 任务生效，缺省视为 0（首次等待）；子代理任务忽略此参数。",
+                },
                 "timeout_seconds": {"type": "integer", "minimum": 1, "maximum": 60, "default": 30},
             }, ["action"]),
             execute=tools.manage_task,
@@ -391,7 +441,13 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="run_subagent",
-            description="启动辅助 Agent；默认前台等待结果，仅独立任务使用后台模式。",
+            description=(
+                "启动辅助 Agent；默认前台等待结果，仅独立任务使用后台模式。"
+                "后台模式（run_in_background=true）立即返回 task_id，结果有两条回流路径："
+                "回合结束后的下一回合自动注入「📦 后台子代理任务结果汇总」；"
+                "回合内可用 manage_task(status/wait, task_id=\"subagent-…\") 主动查询进度或等待终态，"
+                "不要拖延回合空等。"
+            ),
             input_schema=_schema({
                 "task_description": {"type": "string"},
                 "subagent_type": {
@@ -410,15 +466,6 @@ def build_default_registry() -> ToolRegistry:
                     "description": "与当前计划项关联的 ID；有计划时必须填写。",
                 },
                 "run_in_background": {"type": "boolean", "default": False},
-                "timeout_seconds": {
-                    "type": "integer",
-                    "minimum": 30,
-                    "maximum": 3600,
-                    "description": (
-                        "不传时按类型自动选择：explore 240 / review 300 / "
-                        "test 480 / 其他 600 秒。复杂多步任务可显式调大。"
-                    ),
-                },
             }, ["task_description"]),
             execute=tools.run_subagent,
             requires_permission=False,

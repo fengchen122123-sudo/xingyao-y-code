@@ -7,6 +7,11 @@ from copy import deepcopy
 
 from core.credentials import DPAPI_PREFIX, KEYRING_PREFIX, protect_secret, unprotect_secret
 
+try:
+    import tomllib
+except ImportError:  # Python < 3.11 时优雅降级为忽略 TOML
+    tomllib = None
+
 # 进程内配置写锁：防止并发写 config.json 互相截断
 _CONFIG_LOCK = threading.RLock()
 
@@ -102,9 +107,13 @@ def _read_json_with_backup(path, default=None):
     """读取 JSON；使用 mtime 缓存，仅在磁盘文件真正改变时才重新读取磁盘，极大提升多窗口/高频刷新性能。"""
     try:
         current_mtime = os.path.getmtime(path)
-        cache_entry = _CONFIG_CACHE.setdefault(path, {"mtime": 0, "data": None})
-        if cache_entry["data"] is not None and cache_entry["mtime"] == current_mtime:
-            return _copy_cached(cache_entry["data"])
+        # 缓存探测/提交必须在 _CONFIG_LOCK 内完成：mtime 与 data 两个字段的
+        # 写入不是原子的，无锁并发下检查-写入交错会让读方拿到 mtime 与
+        # 内容不配套的缓存条目
+        with _CONFIG_LOCK:
+            cache_entry = _CONFIG_CACHE.setdefault(path, {"mtime": 0, "data": None})
+            if cache_entry["data"] is not None and cache_entry["mtime"] == current_mtime:
+                return _copy_cached(cache_entry["data"])
         with open(path, "r", encoding="utf-8") as f:
             raw_data = json.load(f)
             data = _restore_after_read(path, raw_data)
@@ -119,8 +128,9 @@ def _read_json_with_backup(path, default=None):
             ):
                 with _CONFIG_LOCK:
                     _atomic_write_json(path, data)
-            cache_entry["mtime"] = current_mtime
-            cache_entry["data"] = data
+            with _CONFIG_LOCK:
+                cache_entry["mtime"] = current_mtime
+                cache_entry["data"] = data
             return _copy_cached(data)
     except FileNotFoundError:
         return default
@@ -153,6 +163,9 @@ DB_FILE = os.path.join(YCODE_DIR, "ycode.db")
 GUI_DB_FILE = os.path.join(YCODE_DIR, "ycode_gui.db")
 ACTIVE_SKILLS_FILE = os.path.join(YCODE_DIR, "active_skills.json")
 MCP_FILE = os.path.join(YCODE_DIR, "mcp.json")
+# 只读 TOML 兼容层：config.toml 仅作为可选读取源覆盖 config.json，写回永远落 JSON
+_TOML_CONFIG_FILE = os.path.join(YCODE_DIR, "config.toml")
+_TOML_CACHE: dict[str, dict] = {}
 
 # 局域网手机远程控制的配对 token 过期时间（秒）
 REMOTE_TOKEN_TTL_KEY = "remote_token_ttl"
@@ -208,9 +221,81 @@ if not os.path.exists(_CONFIG_FILE):
         except Exception:
             pass
 
+def _deep_merge(base, overlay):
+    """深合并：overlay 优先。dict 递归合并，list/标量整体替换；返回新对象，不污染入参。"""
+    if isinstance(base, dict) and isinstance(overlay, dict):
+        merged = dict(base)
+        for key, value in overlay.items():
+            merged[key] = _deep_merge(merged[key], value) if key in merged else value
+        return merged
+    return overlay
+
+
+def _read_toml_overlay(path):
+    """只读 TOML overlay；文件不存在或解析失败一律返回 None，绝不影响主流程。"""
+    if tomllib is None:
+        return None
+    try:
+        current_mtime = os.path.getmtime(path)
+    except OSError:
+        with _CONFIG_LOCK:
+            _TOML_CACHE.pop(path, None)
+        return None
+    # 缓存探测/提交必须持锁：mtime 与 data 两字段分两次写入，无锁并发下
+    # 检查-写入交错会让读方拿到 mtime 与内容不配套的条目
+    with _CONFIG_LOCK:
+        cache_entry = _TOML_CACHE.setdefault(path, {"mtime": 0, "data": None})
+        if cache_entry["data"] is not None and cache_entry["mtime"] == current_mtime:
+            return _copy_cached(cache_entry["data"])
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except (tomllib.TOMLDecodeError, OSError) as error:
+        _log_warning("config.toml 读取/解析失败（%s），本次忽略 TOML 配置，回退纯 JSON", error)
+        with _CONFIG_LOCK:
+            _TOML_CACHE.pop(path, None)
+        return None
+    if not isinstance(data, dict):
+        _log_warning("config.toml 顶层不是 TOML 表，忽略该文件")
+        with _CONFIG_LOCK:
+            _TOML_CACHE.pop(path, None)
+        return None
+    with _CONFIG_LOCK:
+        cache_entry["mtime"] = current_mtime
+        cache_entry["data"] = data
+    return _copy_cached(data)
+
+
+def _warn_toml_overridden_keys(keys):
+    """config.toml 是只读覆盖层且读取时后合并（overlay 优先）：JSON 写入成功后，
+    若被改键同时也在 TOML 中定义，实际生效值仍是 TOML——保存"成功却不生效"
+    必须告警留痕，绝不静默。"""
+    try:
+        candidates = list(keys)
+        if not candidates:
+            return
+        overlay = _read_toml_overlay(_TOML_CONFIG_FILE)
+        if not overlay:
+            return
+        overridden = sorted(str(key) for key in candidates if key in overlay)
+        if overridden:
+            _log_warning(
+                "config.toml 中定义了键 [%s]，刚写入 config.json 的同名值在下次读取时仍会被 "
+                "TOML 覆盖而不生效；如需修改生效值请编辑或删除 config.toml 中的对应键",
+                ", ".join(overridden),
+            )
+    except Exception:
+        # 告警只是提示性诊断，绝不能反过来影响保存主流程
+        pass
+
+
 def _load():
     data = _read_json_with_backup(_CONFIG_FILE, default=None)
-    return data if isinstance(data, dict) else {}
+    result = data if isinstance(data, dict) else {}
+    overlay = _read_toml_overlay(_TOML_CONFIG_FILE)
+    if overlay:
+        result = _deep_merge(result, overlay)
+    return result
 
 
 # 动态配置常量：MY_MODEL / MY_KEY / MY_BASE_URL / MY_CONTEXT_WINDOW / MY_THEME / MY_PERMISSION_MODE
@@ -270,24 +355,37 @@ def update_config(mutator):
     """在进程内锁中执行 load→mutate→原子写，消除读-改-写竞态（TOCTOU 丢失更新）。
 
     mutator 接收当前配置 dict：原地修改后返回 None，或返回一个全新的 dict 作为写入内容。
-    返回值为实际写入的配置 dict。
+    返回值为实际写入的配置 dict。mutator 改动了同时被 config.toml 覆盖的键时，
+    写入运行时告警（TOML 读取时后合并，实际生效值仍以 TOML 为准）。
     """
     with _CONFIG_LOCK:
         data = _load()
+        before = deepcopy(data)
         result = mutator(data)
         if result is not None:
             data = result
         _atomic_write_json(_CONFIG_FILE, data)
+    changed_keys = {
+        key
+        for key in set(before) | set(data)
+        if key not in before or key not in data or before[key] != data[key]
+    }
+    _warn_toml_overridden_keys(changed_keys)
     return data
 
 
 def save_config_value(key, value):
-    """保存配置项并持久化写入 config.json（原子写 + 进程内锁）"""
+    """保存配置项并持久化写入 config.json（原子写 + 进程内锁）。
+
+    该键同时被 config.toml 覆盖时写入运行时告警：TOML 读取时后合并，
+    保存"成功"但实际生效值仍以 TOML 为准。
+    """
     try:
         with _CONFIG_LOCK:
             data = _load()
             data[key] = value
             _atomic_write_json(_CONFIG_FILE, data)
+        _warn_toml_overridden_keys([key])
         return True
     except Exception as e:
         # 调用方普遍不检查返回值，失败必须留下诊断痕迹而不是静默丢配置

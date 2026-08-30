@@ -139,3 +139,33 @@ it('点击刷新按钮以 force_new 重新获取 token', async () => {
   const modal = wrapper.find('[data-test="remote-bind-modal"]');
   expect(modal.find('img').attributes('src')).toBe('data:image/png;base64,NEW');
 });
+
+it('永久有效（expires_in=0）时不做倒计时自动刷新', async () => {
+  vi.useFakeTimers();
+  try {
+    const get_remote_bind_qr = vi.fn(async () => ({
+      ok: true,
+      url: 'http://192.168.1.5:8765/?token=forever',
+      token: 'forever',
+      qr: 'data:image/png;base64,FOREVER',
+      expires_in: 0,
+    }));
+    (window as any).pywebview = { api: { get_remote_bind_qr } };
+
+    const pinia = createPinia();
+    setActivePinia(pinia);
+    const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+    await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+    await vi.advanceTimersByTimeAsync(0);
+
+    // 文案显示“永久有效”
+    expect(wrapper.find('[data-test="remote-bind-hint"]').text()).toContain('永久有效');
+
+    // 推进 3 秒：永久 token 不应触发自动刷新（调用次数保持 1）
+    await vi.advanceTimersByTimeAsync(3000);
+    expect(get_remote_bind_qr).toHaveBeenCalledTimes(1);
+  } finally {
+    vi.useRealTimers();
+  }
+});

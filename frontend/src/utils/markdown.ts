@@ -54,8 +54,11 @@ export function renderMarkdown(md: string): string {
   });
 
   // 2. 行内代码：反引号内若是本地文件路径则渲染为可点击链接，否则保持 <code>
+  // 关键约束：[^`\n] 禁止跨行匹配。行内代码语义上属于单行；若允许跨行，
+  // 某行的孤立/空反引号（如上游占位符被清理后残留的 ``）会与数行之后的
+  // 反引号错误配对，把中间的整张表格/列表吞进一个 <code> 里（2026-08-30 事故）。
   const inlineCodes: string[] = [];
-  text = text.replace(/`([^`]+)`/g, (_, code) => {
+  text = text.replace(/`([^`\n]+)`/g, (_, code) => {
     if (isLocalFileLink(code, { allowBareFilename: false })) {
       const idx = fileLinks.length;
       fileLinks.push(fileLinkHtml(code));
