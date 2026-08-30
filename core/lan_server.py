@@ -498,15 +498,17 @@ class LanServer:
         """启动单端口 HTTP + WebSocket 服务（阻塞 serve 放到 daemon 线程）。"""
         # 启动时恢复上次的配对 token：保证应用重启后二维码 token 保持固定
         self._load_token_from_config()
-        self._server = serve(
-            self._handle_ws,
-            host="0.0.0.0",
-            port=self.port,
-            process_request=self._serve_http,
-            max_size=70 * 1024 * 1024,  # 支持手机上传 ≤50MB 文件（base64 约 67MB）
-        )
+        # 端口同样固定：优先复用上次持久化的端口，避免每次启动换端口导致
+        # 手机端需重新扫码；端口被占用时回退内核动态分配并回填持久化
+        preferred = self.port or self._load_persisted_port()
+        try:
+            self._server = self._serve(preferred)
+        except OSError:
+            # 持久化端口被其他进程占用：回退动态分配，下方回填新的持久化端口
+            self._server = self._serve(0)
         # port=0 时内核动态分配，真实端口回填
         self.port = self._server.socket.getsockname()[1]
+        self._persist_port()
         self._thread = threading.Thread(
             target=self._server.serve_forever,
             daemon=True,
@@ -514,6 +516,30 @@ class LanServer:
         )
         self._thread.start()
         return {"ok": True, "host": "0.0.0.0", "port": self.port, "lan_ip": self.lan_ip}
+
+    def _serve(self, port: int):
+        return serve(
+            self._handle_ws,
+            host="0.0.0.0",
+            port=port,
+            process_request=self._serve_http,
+            max_size=70 * 1024 * 1024,  # 支持手机上传 ≤50MB 文件（base64 约 67MB）
+        )
+
+    def _load_persisted_port(self) -> int:
+        """从 config.json 读取上次持久化的端口（无效/不存在返回 0=动态分配）。"""
+        try:
+            port = int(config._load().get(config.REMOTE_PAIR_PORT_KEY) or 0)
+        except Exception:
+            return 0
+        return port if 1024 <= port <= 65535 else 0
+
+    def _persist_port(self) -> None:
+        """把实际绑定端口写回 config.json，供下次启动复用。"""
+        try:
+            _save_config_value(config.REMOTE_PAIR_PORT_KEY, self.port)
+        except Exception:
+            pass
 
     def stop(self) -> None:
         """关闭服务（关闭监听 socket 让 serve_forever 退出）。"""

@@ -149,6 +149,29 @@ it('新建会话沿用当前会话正在使用的模型', async () => {
   expect(store.draftModelId).toBe('m-deepseek');
 });
 
+it('未落库新会话切到已有会话后再次新建会恢复文字和附件草稿', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-a';
+  store.activeModelId = 'm-deepseek';
+  store.activeModelName = '模型-m-deepseek';
+
+  await store.createGlobalSession();
+  const pendingRuntime = store._getSessionRuntime();
+  pendingRuntime.composerText = '尚未发送的汉字';
+  pendingRuntime.composerAttachments = [
+    { path: 'C:/tmp/draft.png', name: 'draft.png', ext: '.png', size: 12 },
+  ];
+
+  await store.switchSession('session-a', '会话 A', 'GLOBAL');
+  expect(store._getSessionRuntime().composerText || '').toBe('');
+
+  await store.createGlobalSession();
+  expect(store._getSessionRuntime().composerText).toBe('尚未发送的汉字');
+  expect(store._getSessionRuntime().composerAttachments?.map(a => a.path)).toEqual([
+    'C:/tmp/draft.png',
+  ]);
+});
+
 it('项目新会话首条消息把当前窗口模型提交给后端', async () => {
   const send = vi.fn(async (..._args: unknown[]) => ({ ok: true }));
   mockBridgeApi({ send_user_message: send });

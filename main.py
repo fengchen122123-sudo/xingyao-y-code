@@ -962,6 +962,47 @@ def _render_public_answer_block(turn_id: str, text: str) -> None:
     except MarkdownRenderError:
         rendered = block
     _print_ui_fragment(rendered)
+    _maybe_export_mermaid_block(block)
+
+
+def _maybe_export_mermaid_block(block: str) -> None:
+    """正文块内含完整 mermaid 代码时生成本地网页（终端画不了图，浏览器来画）。
+
+    不自动弹浏览器：长回合连续出图会反复抢焦点，默认只在块尾提示文件路径，
+    由用户输入 /diagram open 打开；config.mermaid_auto_open=true 才自动拉起。
+    """
+    try:
+        from core.diagram_export import export_diagram_html, open_diagram
+
+        export_result = export_diagram_html(block)
+    except Exception as export_error:
+        # 导出失败必须可见：静默吞掉会让"没有提示"变得无法诊断
+        print_formatted_text(HTML(
+            f"<ansigray>⚠️ Mermaid 图表导出失败: {_esc(str(export_error))}</ansigray>"
+        ))
+        return
+    if export_result is None:
+        return
+    diagram_path, diagram_count = export_result
+    auto_open = False
+    try:
+        from core.model_manager import load_config
+
+        auto_open = bool(load_config().get("mermaid_auto_open", False))
+    except Exception:
+        auto_open = False
+    if auto_open:
+        open_diagram(diagram_path)
+        notice = (
+            f"🌐 检测到 {diagram_count} 张 Mermaid 图，已在浏览器打开: "
+            f"{diagram_path.name}（可设 config.mermaid_auto_open=false 关闭自动打开）"
+        )
+    else:
+        notice = (
+            f"ℹ️ 检测到 {diagram_count} 张 Mermaid 图，已生成网页: {diagram_path.name}"
+            " —— 输入 /diagram open 在浏览器查看"
+        )
+    print_formatted_text(HTML(f"<ansigray>{_esc(notice)}</ansigray>"))
 
 
 def _find_paragraph_boundary(buffer: str) -> int:
@@ -1537,6 +1578,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/undo [y]</ansicyan>                               : 撤销星瑶上一次修改的代码，并同步抹除模型记忆 (撤销新建文件时需追加 y 确认删除)"))
         print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
         print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
+        print_formatted_text(HTML("  <ansicyan>/diagram [open 序号|list]</ansicyan>               : 打开/列出已生成的 Mermaid 流程图网页（星瑶输出 mermaid 代码块时自动生成）"))
         print_formatted_text(HTML("  <ansicyan>/worktree</ansicyan>                              : Git worktree 管理 (list/create/remove/prune)"))
         print_formatted_text(HTML("  <ansicyan>/clear</ansicyan>                                  : 清理终端当前屏幕"))
         print_formatted_text(HTML(""))
@@ -2250,6 +2292,14 @@ def handle_slash_command(command_text):
             result = f"🚨 未知格式: {fmt}。支持: md / html / json"
         print_formatted_text(HTML(f"<ansigray>{_esc(result)}</ansigray>"))
 
+    elif cmd == "/diagram" or cmd.startswith("/diagram "):
+        # Mermaid 流程图网页管理：星瑶输出 mermaid 代码块时 CLI 自动生成
+        # 本地 HTML，这里负责打开/列出（终端画不了图形，浏览器即渲染器）
+        # 用法: /diagram [open [序号] | list]
+        from core.diagram_export import handle_diagram_command
+
+        print_formatted_text(HTML(f"<ansigray>{_esc(handle_diagram_command(command_text))}</ansigray>"))
+
     elif cmd == "/worktree" or cmd.startswith("/worktree "):
         # Git worktree 管理（参考 OpenCode 的 worktree 模块）
         # 用法: /worktree list / /worktree create <branch> <path> / /worktree remove <path>
@@ -2677,6 +2727,7 @@ def _make_input_app():
         ("/undo", "撤销星瑶上一次修改的代码"),
         ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
         ("/share", "导出会话为 Markdown/HTML/JSON"),
+        ("/diagram", "打开/列出星瑶生成的 Mermaid 流程图网页 (open 序号/list)"),
         ("/compress", "手动触发会话记忆压缩 (force 强制保留更少条)"),
         ("/remember", "手动追加一条规则/偏好/事实到记忆日志"),
         ("/dream", "后台触发梦境总结，提炼归纳记忆日志"),

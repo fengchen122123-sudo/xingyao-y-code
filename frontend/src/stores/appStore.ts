@@ -26,6 +26,7 @@ import type {
   SubagentProgressEventData,
   QueuedMessage,
 } from '../types/pywebview';
+import type { MediaItem } from '../types/media';
 import { formatPermMode } from '../utils/markdown';
 import {
   reduceExecutionState,
@@ -148,6 +149,8 @@ export interface ChatMessage {
   // 本条助手消息生成时所用的模型快照（后端历史回放透传；旧消息可能缺省）
   model_id?: string;
   model_name?: string;
+  // 助手消息媒体清单（media_v1，桥接层已拼好带令牌 URL；旧消息缺省）
+  media?: MediaItem[];
 }
 
 const TOOL_CATEGORIES = new Set(['read', 'search', 'command', 'mutation', 'skill', 'other']);
@@ -1068,16 +1071,53 @@ export const useAppStore = defineStore('app', {
       this.subpage.show = false;
     },
 
-    // 对话类提示：写入当前会话消息流（notice 角色），不自动消失。
-    // 回合进行中必须插到 running assistant 之前：push 到末尾会破坏
-    // "回合中最后一条是 assistant" 的事件契约（后续 tool_finish 会失配）
+    // 对话类提示：写入消息流（notice 角色），不自动消失，双端同步可见。
+    // 经桥 post_notice 广播到全部客户端（桌面 GUI + 局域网手机端），各端
+    // （含发起端）收到 notice 桥事件后统一回环插入，本地不直插、无重复；
+    // 桥不可用（离线预览）或调用失败时降级为本地插入。
     notifyChat(msg: string) {
-      const last = this.messages[this.messages.length - 1];
-      if (last && last.role === 'assistant' && last.execution_state === 'running') {
-        this.messages.splice(this.messages.length - 1, 0, { role: 'notice', content: msg });
+      this.broadcastChatNotice(msg, 'notice');
+    },
+
+    // 仅本端可见的本地插入：后端桥事件（notice 等）的落点与离线兜底路径。
+    // 桥事件处理器必须走这里，不能再调 notifyChat/broadcastChatNotice，
+    // 否则会把已广播的事件回环再广播，造成各端重复插入。
+    // sessionName 缺省为当前会话；目标会话不是当前会话时写入其 runtime，
+    // 但该会话 runtime 为空（本端从未加载）时直接丢弃——否则 length>0 会
+    // 阻断打开会话时的数据库历史回填，只剩一条提示。
+    // 回合进行中 notice 必须插到 running assistant 之前：push 到末尾会破坏
+    // "回合中最后一条是 assistant" 的事件契约（后续 tool_finish 会失配）。
+    notifyChatLocal(msg: string, kind: 'notice' | 'error' = 'notice', sessionName?: string) {
+      const target = sessionName || this.currentSessionName;
+      let msgs: ChatMessage[];
+      if (target === this.currentSessionName) {
+        msgs = this.messages;
       } else {
-        this.messages.push({ role: 'notice', content: msg });
+        const runtime = this._getSessionRuntime(target);
+        if (runtime.messages.length === 0) return;
+        msgs = runtime.messages;
       }
+      const last = msgs[msgs.length - 1];
+      if (kind === 'notice' && last && last.role === 'assistant' && last.execution_state === 'running') {
+        msgs.splice(msgs.length - 1, 0, { role: 'notice', content: msg });
+      } else {
+        msgs.push({ role: kind, content: msg });
+      }
+    },
+
+    // 双端同步的对话提示：经桥 post_notice 广播到全部客户端（桌面 GUI + 手机端），
+    // 各端（含发起端）收到 notice 桥事件后统一回环插入，本地不再直插，避免重复。
+    // 桥不可用（离线预览）或调用失败时降级为本地插入。
+    broadcastChatNotice(msg: string, kind: 'notice' | 'error' = 'notice', sessionName?: string) {
+      const target = sessionName || this.currentSessionName;
+      const api = this._api();
+      if (!api || typeof api.post_notice !== 'function') {
+        this.notifyChatLocal(msg, kind, target);
+        return;
+      }
+      Promise.resolve(api.post_notice(msg, target, kind)).catch(() => {
+        this.notifyChatLocal(msg, kind, target);
+      });
     },
 
     // 非对话类提示：模态提示框，用户点击"确定"才关闭。
@@ -1897,14 +1937,14 @@ export const useAppStore = defineStore('app', {
         const res = await api.stop_current_turn(sessionName);
         if (!res || !res.ok) {
           clearTimeout(stopFallbackTimer);
-          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '中断请求未成功送达' });
+          this.broadcastChatNotice('中断请求未成功送达', 'error', sessionName);
         } else {
           this.notifyChat('已中断当前回合');
         }
       } catch (err) {
         clearTimeout(stopFallbackTimer);
         this.connected = false;
-        this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '中断请求失败: ' + err });
+        this.broadcastChatNotice('中断请求失败: ' + err, 'error', sessionName);
       }
     },
 
@@ -2046,11 +2086,16 @@ export const useAppStore = defineStore('app', {
           // willQueue 时该会话原有回合仍在跑（入队失败不影响它），
           // 不能清除运行态，否则停止按钮消失、重复发送不再入队
           if (!willQueue) this._setSessionRunning(sessionName, false);
-          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '消息发送失败: ' + (res && res.msg ? res.msg : '未知错误') });
           if (pendingDir) {
+            // 先回退幽灵会话再广播：runtime 已迁回草稿 key，
+            // notice 事件回环插入才能落到草稿视图（否则目标会话 runtime 为空被丢弃）
             revertGhostSession();
-          } else if (this.currentSessionName === sessionName) {
-            this._bindSessionRuntime(sessionName);
+            this.broadcastChatNotice('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'error');
+          } else {
+            this.broadcastChatNotice('消息发送失败: ' + (res && res.msg ? res.msg : '未知错误'), 'error', sessionName);
+            if (this.currentSessionName === sessionName) {
+              this._bindSessionRuntime(sessionName);
+            }
           }
         }
         // 成功时不主动改 running，由后续 turn_start/turn_finish/turn_cancelled 等事件驱动
@@ -2059,11 +2104,15 @@ export const useAppStore = defineStore('app', {
         // 仅用户仍在该会话时才恢复绑定（willQueue 时原有回合仍在跑，不清运行态）
         if (!willQueue) this._setSessionRunning(sessionName, false);
         this.connected = false;
-        this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '消息发送失败: ' + err });
         if (pendingDir) {
+          // 同上：幽灵会话先回退再广播，保证回环插入落到草稿视图
           revertGhostSession();
-        } else if (this.currentSessionName === sessionName) {
-          this._bindSessionRuntime(sessionName);
+          this.broadcastChatNotice('消息发送失败: ' + err, 'error');
+        } else {
+          this.broadcastChatNotice('消息发送失败: ' + err, 'error', sessionName);
+          if (this.currentSessionName === sessionName) {
+            this._bindSessionRuntime(sessionName);
+          }
         }
       }
     },
@@ -2234,7 +2283,7 @@ export const useAppStore = defineStore('app', {
           });
         }
         if (data.internal === 'bg_summary') {
-          this.notifyChat('后台子代理任务已全部结束，正在自动汇总结果');
+          this.notifyChatLocal('后台子代理任务已全部结束，正在自动汇总结果');
         }
       }
 
@@ -2302,6 +2351,11 @@ export const useAppStore = defineStore('app', {
           if (finalReasoning.length > (last.reasoning_content || '').length) {
             last.reasoning_content = finalReasoning;
             this.currentThinkingText = finalReasoning;
+          }
+          // 媒体清单独立于文本长度门控：非空即挂（流式回合的媒体画廊在收尾补齐）
+          const finalMedia = (data as { media?: MediaItem[] }).media;
+          if (finalMedia && finalMedia.length) {
+            last.media = finalMedia;
           }
         }
       } else if (type === 'tool_start') {
@@ -2529,8 +2583,13 @@ export const useAppStore = defineStore('app', {
           }
         }
       } else if (type === 'notice') {
-        // 后端桥事件 notice：与当前会话相关，写入对话流
-        if (data.message) this.notifyChat(String(data.message));
+        // 后端桥事件 notice：写入对应会话的对话流（双端同步的统一回环落点）。
+        // 注意必须走本地插入，不能再调 broadcastChatNotice，否则会回环再广播。
+        if (data.message) {
+          const kind = data.kind === 'error' ? 'error' : 'notice';
+          const sessionName = data.session_name ? String(data.session_name) : undefined;
+          this.notifyChatLocal(String(data.message), kind, sessionName);
+        }
       } else if (type === 'session_renamed') {
         if (this.currentSessionName === data.old) {
           this.currentSessionName = data.new;
@@ -2688,13 +2747,13 @@ export const useAppStore = defineStore('app', {
         const label = statusLabel[data.status] || data.status;
         const desc = data.description ? `：${data.description}` : '';
         if (data.status === 'completed') {
-          this.notifyChat(`后台子代理${label}${desc}`);
+          this.notifyChatLocal(`后台子代理${label}${desc}`);
         } else {
           // 与 error 事件一致：回合进行中不插队，挂在当前助手消息上展示
           const last = this.messages[this.messages.length - 1];
           if (last && last.role === 'assistant') {
             last.error_note = `后台子代理${label}${desc}`;
-            this.notifyChat(`后台子代理${label}${desc}`);
+            this.notifyChatLocal(`后台子代理${label}${desc}`);
           } else {
             this.messages.push({ role: 'error', content: `后台子代理${label}${desc}` });
           }
@@ -2704,7 +2763,7 @@ export const useAppStore = defineStore('app', {
         const code = Number(data.returncode);
         const tid = String(data.task_id || '');
         const statusText = code === 0 ? '已完成' : `已结束（退出码 ${code}）`;
-        this.notifyChat(`后台任务 ${tid} ${statusText}`);
+        this.notifyChatLocal(`后台任务 ${tid} ${statusText}`);
       } else if (type === 'terminal_output') {
         this.terminalOutput += data.text || '';
         // 输出上限 200K 字符：超出后从头部截断，避免长任务把内存拖爆
@@ -2738,7 +2797,7 @@ export const useAppStore = defineStore('app', {
         if (last && last.role === 'assistant') {
           // Low 修复：多条错误累计展示，不再被最后一条覆盖
           last.error_note = last.error_note ? last.error_note + '\n' + msgText : msgText;
-          this.notifyChat(msgText);
+          this.notifyChatLocal(msgText);
         } else {
           this.messages.push({ role: 'error', content: msgText });
         }
@@ -2770,11 +2829,11 @@ export const useAppStore = defineStore('app', {
         const res = await api.respond_permission(reqId, allowed, always);
         if (!res || !res.ok) {
           const detail = res && res.msg ? `: ${res.msg}` : '';
-          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '权限响应发送失败' + detail });
+          this.broadcastChatNotice('权限响应发送失败' + detail, 'error', sessionName);
         }
       } catch (err) {
         this.connected = false;
-        this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '权限响应发送失败: ' + err });
+        this.broadcastChatNotice('权限响应发送失败: ' + err, 'error', sessionName);
       } finally {
         // 应答过的请求立即作废本地 reqId（保留新到的请求）：否则 switchSession 的
         // 重显逻辑会把已应答的卡片复活，再次点击必然报“已失效或已被处理”
@@ -2825,11 +2884,11 @@ export const useAppStore = defineStore('app', {
         const res = await api.respond_permission_choice(reqId, choiceIndex, customText);
         if (!res || !res.ok) {
           const detail = res && res.msg ? `: ${res.msg}` : '';
-          this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '选项响应发送失败' + detail });
+          this.broadcastChatNotice('选项响应发送失败' + detail, 'error', sessionName);
         }
       } catch (err) {
         this.connected = false;
-        this._getSessionRuntime(sessionName).messages.push({ role: 'error', content: '选项响应发送失败: ' + err });
+        this.broadcastChatNotice('选项响应发送失败: ' + err, 'error', sessionName);
       } finally {
         // 与 respondPermission 同理：应答后作废本地 reqId，防止死卡片被重显
         if (this.permRequest.reqId === reqId) {

@@ -198,3 +198,35 @@ it('双击手柄恢复默认高度并清除记忆', async () => {
   expect(localStorage.getItem(COMPOSER_HEIGHT_KEY)).toBeNull();
   wrapper.unmount();
 });
+
+it('切换会话时分别显示各自尚未发送的文字草稿', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-a';
+
+  const wrapper = mount(InputArea);
+  const textarea = wrapper.get('textarea');
+  await textarea.setValue('会话 A 草稿');
+
+  store.currentSessionName = 'session-b';
+  await nextTick();
+  expect(wrapper.get('textarea').element.value).toBe('');
+
+  await wrapper.get('textarea').setValue('会话 B 草稿');
+  store.currentSessionName = 'session-a';
+  await nextTick();
+  expect(wrapper.get('textarea').element.value).toBe('会话 A 草稿');
+  wrapper.unmount();
+});
+
+it('输入组件因设置页卸载后重新挂载仍恢复当前会话草稿', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'session-a';
+
+  let wrapper = mount(InputArea);
+  await wrapper.get('textarea').setValue('设置往返后仍保留');
+  wrapper.unmount();
+
+  wrapper = mount(InputArea);
+  expect(wrapper.get('textarea').element.value).toBe('设置往返后仍保留');
+  wrapper.unmount();
+});
