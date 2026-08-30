@@ -53,6 +53,13 @@ function isLocalMediaPath(path: string): boolean {
   return true;
 }
 
+// 复制原图按钮的内联 SVG（与 iconPaths.ts 的 copy/check 图标同源，lucide 风格；
+// v-html 里不能用 Vue 组件，只能内联）。导出供 MessageBubble 点击反馈时切换。
+export const COPY_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
+export const CHECK_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+
 function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): string {
   if (item.kind === 'error') {
     const label = item.error_label || '媒体不可用';
@@ -68,7 +75,12 @@ function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): strin
     return `<video class="md-video" controls preload="metadata" playsinline src="${escapeHtml(src)}"></video>`;
   }
   const alt = caption || item.caption || item.source_name || '图片';
-  return `<img class="md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" data-media-ordinal="${ordinal}" loading="lazy">`;
+  // 悬停浮现"复制原图"按钮：src 放 data 属性，点击经 MessageBubble 事件委托
+  // fetch 原图写入剪贴板（媒体服务已带 CORS 头）
+  return `<span class="md-media-wrap">`
+    + `<img class="md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" data-media-ordinal="${ordinal}" loading="lazy">`
+    + `<button class="md-img-copy" type="button" title="复制原图" aria-label="复制原图" data-copy-src="${escapeHtml(src)}">${COPY_ICON_SVG}<span class="md-img-copy-text">复制</span></button>`
+    + `</span>`;
 }
 
 // mermaid 块的渲染缓存 key：源码的 FNV-1a 哈希 + 长度。只用于缓存去重，
