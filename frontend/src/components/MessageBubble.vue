@@ -617,7 +617,8 @@ async function copyUserMessage() {
   cursor: zoom-in;
   object-fit: contain;
 }
-/* 悬停浮现的"复制原图"按钮：图片右上角，触屏无 hover 时保持可点 */
+/* 悬停浮现的"复制原图"按钮：图片右上角。配色固定为深色底白字（不随主题变
+   量走），保证压在任意明暗的图片内容上都有足够对比度 */
 .md-body :deep(.md-img-copy) {
   position: absolute;
   top: 14px;
@@ -626,10 +627,10 @@ async function copyUserMessage() {
   align-items: center;
   gap: 4px;
   padding: 4px 8px;
-  border: 1px solid var(--border);
+  border: 1px solid rgba(255, 255, 255, 0.28);
   border-radius: 6px;
-  background: color-mix(in srgb, var(--bg-app, #1a1a1a) 82%, transparent);
-  color: var(--text);
+  background: rgba(15, 15, 15, 0.72);
+  color: #fff;
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
@@ -648,14 +649,15 @@ async function copyUserMessage() {
   opacity: 1;
 }
 .md-body :deep(.md-img-copy:hover) {
-  border-color: var(--accent);
-  color: var(--accent);
+  background: rgba(15, 15, 15, 0.9);
+  border-color: rgba(255, 255, 255, 0.55);
+  color: #fff;
 }
 .md-body :deep(.md-img-copy.copied) {
-  color: #34c77b;
+  color: #4ade80;
 }
 .md-body :deep(.md-img-copy.copy-failed) {
-  color: #e5615c;
+  color: #f87171;
 }
 .md-body :deep(video.md-video) {
   display: block;
