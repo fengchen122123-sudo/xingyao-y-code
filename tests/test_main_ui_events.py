@@ -1168,3 +1168,73 @@ def test_plan_item_handoff_prints_takeover_notice_once(monkeypatch):
     assert len(printed) == 1
     queued_plain = Text.from_ansi(printed[0]).plain
     assert "等待主 Agent 接管（队列第 2 项）" in queued_plain
+
+
+# ---------------------------------------------------------------------------
+# /turns 命令：CLI 设置单任务最大模型轮次（与 GUI 系统设置共用同一份配置）
+# ---------------------------------------------------------------------------
+
+def _turns_env(tmp_path, monkeypatch, data):
+    """隔离 config.json 到 tmp_path 并捕获终端输出；返回 (config 路径, 输出行列表)。"""
+    import json as _json
+
+    import config
+
+    cfg_path = tmp_path / "config.json"
+    cfg_path.write_text(_json.dumps(data), encoding="utf-8")
+    monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg_path))
+    config._CONFIG_CACHE.clear()
+
+    printed = []
+    monkeypatch.setattr(
+        main,
+        "print_formatted_text",
+        lambda *args, **kwargs: printed.append(" ".join(str(a) for a in args)),
+    )
+    return cfg_path, printed
+
+
+def test_turns_command_sets_limit(tmp_path, monkeypatch):
+    import json as _json
+
+    cfg_path, printed = _turns_env(tmp_path, monkeypatch, {})
+
+    main.handle_slash_command("/turns 300")
+
+    saved = _json.loads(cfg_path.read_text(encoding="utf-8"))
+    assert saved["agent_turn_step_limit"] == 300
+    rendered = Text.from_ansi("\n".join(printed)).plain
+    assert "300" in rendered
+    assert "✔" in rendered
+
+
+def test_turns_command_rejects_non_integer(tmp_path, monkeypatch):
+    cfg_path, printed = _turns_env(tmp_path, monkeypatch, {})
+
+    main.handle_slash_command("/turns abc")
+
+    saved = cfg_path.read_text(encoding="utf-8")
+    assert "agent_turn_step_limit" not in saved
+    rendered = Text.from_ansi("\n".join(printed)).plain
+    assert "整数" in rendered
+
+
+def test_turns_command_rejects_out_of_range(tmp_path, monkeypatch):
+    cfg_path, printed = _turns_env(tmp_path, monkeypatch, {})
+
+    main.handle_slash_command("/turns 5")
+
+    saved = cfg_path.read_text(encoding="utf-8")
+    assert "agent_turn_step_limit" not in saved
+    rendered = Text.from_ansi("\n".join(printed)).plain
+    assert "10" in rendered and "1000" in rendered
+
+
+def test_turns_command_without_args_shows_current_and_usage(tmp_path, monkeypatch):
+    _, printed = _turns_env(tmp_path, monkeypatch, {"agent_turn_step_limit": 240})
+
+    main.handle_slash_command("/turns")
+
+    rendered = Text.from_ansi("\n".join(printed)).plain
+    assert "240" in rendered
+    assert "/turns" in rendered

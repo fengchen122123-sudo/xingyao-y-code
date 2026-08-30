@@ -1546,6 +1546,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
+        print_formatted_text(HTML("  <ansicyan>/turns &lt;轮次&gt;</ansicyan>                         : 设置单任务最大模型轮次 (10-1000，仅影响新任务；无参数查看当前值)"))
         print_formatted_text(HTML("  <ansicyan>/sandbox &lt;on|off&gt;</ansicyan>                     : 沙盒开关 (on:工作目录外读写直接放行 | off:仅限工作目录内)"))
         print_formatted_text(HTML("  <ansicyan>/whitelist list|add|remove|clear</ansicyan>        : 管理当前项目白名单 (command/write/edit)"))
         print_formatted_text(HTML("  <ansicyan>/usage</ansicyan>                                : 查看 Token 用量统计 (按模型区分: 今日/近7天/近30天，精确数值)"))
@@ -1701,6 +1702,34 @@ def handle_slash_command(command_text):
             for line in PERMISSION_HELP_LINES:
                 print_formatted_text(HTML(line))
             print_formatted_text(HTML("用法: <ansiyellow>/permission &lt;confirm|accept_edits|plan|full&gt;</ansiyellow>"))
+
+    elif cmd == "/turns":
+        # 与 GUI 系统设置「单任务最大模型轮次」共用同一配置键与校验逻辑；
+        # 请求链路（core/llm.py）每个任务新鲜读取，修改仅影响后续新任务
+        from core.harness.turn_limits import (
+            MAX_TURN_STEP_LIMIT,
+            MIN_TURN_STEP_LIMIT,
+            TurnStepLimitError,
+            load_turn_step_limit,
+            save_turn_step_limit,
+        )
+        if len(parts) > 1:
+            raw = parts[1].strip("<>\"'")
+            try:
+                value = int(raw)
+            except ValueError:
+                print_formatted_text(HTML(f"<ansired>❌ 轮次必须是整数（{MIN_TURN_STEP_LIMIT}–{MAX_TURN_STEP_LIMIT}），收到「{_esc(raw)}」。</ansired>"))
+            else:
+                try:
+                    resolved = save_turn_step_limit(value)
+                except TurnStepLimitError as error:
+                    print_formatted_text(HTML(f"<ansired>❌ {_esc(str(error))}</ansired>"))
+                else:
+                    print_formatted_text(HTML(f"<ansigreen>✔ 单任务最大模型轮次已更新为: <b>{resolved}</b>（仅影响新任务）</ansigreen>"))
+        else:
+            current = load_turn_step_limit()
+            print_formatted_text(HTML(f"当前单任务最大模型轮次: <b>{current}</b>（可选范围 {MIN_TURN_STEP_LIMIT}–{MAX_TURN_STEP_LIMIT}）"))
+            print_formatted_text(HTML("用法: <ansiyellow>/turns &lt;轮次&gt;</ansiyellow>"))
 
     elif cmd == "/effort":
         # 推理强度按模型持久化；请求链路（core/llm.py）每轮新鲜读 config.json，改完下轮即生效
@@ -2649,12 +2678,16 @@ def _make_input_app():
         ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
         ("/share", "导出会话为 Markdown/HTML/JSON"),
         ("/compress", "手动触发会话记忆压缩 (force 强制保留更少条)"),
+        ("/remember", "手动追加一条规则/偏好/事实到记忆日志"),
+        ("/dream", "后台触发梦境总结，提炼归纳记忆日志"),
+        ("/memory", "查阅长期记忆索引 (MEMORY.md) 内容"),
         ("/worktree", "Git worktree 管理 (list/create/remove)"),
         ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
         ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
         ("/skills", "查看或安装/开启/禁用技能插件"),
         ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
         ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
+        ("/turns", "设置单任务最大模型轮次 (10-1000)"),
         ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
         ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
         ("/clear", "清理当前屏幕"),
