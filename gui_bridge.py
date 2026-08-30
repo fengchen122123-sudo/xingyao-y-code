@@ -31,6 +31,8 @@ from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.agent_service import strip_context_suffix
 from core.turn_renderer import sanitize_protocol_text, sanitize_stream_text
+from core.media_refs import MEDIA_DISPLAY_ERROR_LABELS
+from core.media_server import media_server
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
@@ -1874,21 +1876,30 @@ class ApiBridge:
             history = self._memory.get_history(session_name)
             final_text = ""
             final_reasoning = ""
+            final_media: list = []
             for msg in reversed(history):
                 if msg.get("role") == "assistant":
                     content = msg.get("content")
                     reasoning = msg.get("reasoning_content")
                     final_text = content if isinstance(content, str) else ""
                     final_reasoning = reasoning if isinstance(reasoning, str) else ""
+                    # 媒体清单随全文补发：流式气泡的媒体画廊在回合收尾统一补挂
+                    #（独立于文本自愈的长度门控，media 非空即携带）
+                    final_media = self._media_items_for_frontend(msg.get("_display"))
                     break
             # 数据库旧消息可能残留上游网关的空正文占位符，补发前精确清理
             final_text = sanitize_protocol_text(final_text)
-            if final_text or final_reasoning:
-                self.emit_event("message_final", {
+            if final_text or final_reasoning or final_media:
+                payload = {
                     "session_name": session_name,
                     "content": final_text,
                     "reasoning_content": final_reasoning,
-                })
+                }
+                if final_media:
+                    # 无媒体时保持旧事件形状（历史测试断言精确载荷），
+                    # 有媒体才补 media 键，前端非空即挂
+                    payload["media"] = final_media
+                self.emit_event("message_final", payload)
         except Exception:
             logger.debug("补发 message_final 失败", exc_info=True)
 
@@ -1918,6 +1929,14 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 初始状态
     # ------------------------------------------------------------------
+    def _run_media_migration_once(self) -> None:
+        """历史消息 media_v1 清单迁移（幂等，失败只记日志，绝不影响启动）。"""
+        try:
+            from core.media_migration import run_media_migration_once
+            run_media_migration_once(self._memory)
+        except Exception:
+            logger.debug("媒体清单迁移执行异常", exc_info=True)
+
     def _find_latest_session(self) -> str:
         """查找最近一次活跃的非空会话（按 updated_at 排序），没有则返回空串。"""
         try:
@@ -1929,6 +1948,41 @@ class ApiBridge:
         except Exception:
             logger.debug("查找最近会话失败", exc_info=True)
             return ""
+
+    def _media_items_for_frontend(self, display) -> list:
+        """把 _display.media_v1 清单转成前端可用的 media 列表。
+
+        非 error 项补拼受控媒体服务的带令牌 URL；服务不可用降级为
+        service_unavailable 错误项。任何异常返回空列表（媒体是增强能力，
+        绝不能阻断消息加载）。
+        """
+        try:
+            items = ((display or {}).get("media_v1") or {}).get("items") or []
+            if not items:
+                return []
+            out = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                entry = dict(item)
+                if item.get("kind") == "error":
+                    entry.setdefault(
+                        "error_label",
+                        MEDIA_DISPLAY_ERROR_LABELS.get(item.get("error_code") or "", "媒体不可用"),
+                    )
+                else:
+                    url = media_server.public_url(item.get("digest") or "", item.get("ext") or "")
+                    if not url:
+                        entry["kind"] = "error"
+                        entry["error_code"] = "service_unavailable"
+                        entry["error_label"] = MEDIA_DISPLAY_ERROR_LABELS["service_unavailable"]
+                    else:
+                        entry["url"] = url
+                out.append(entry)
+            return out
+        except Exception:
+            logger.debug("组装前端媒体清单失败", exc_info=True)
+            return []
 
     def _load_session_messages(self, session_name: str) -> List[Dict[str, Any]]:
         """读取会话历史并转成前端气泡结构（与 switch_session 同一套映射）。"""
@@ -1955,6 +2009,8 @@ class ApiBridge:
                         # 透传生成该消息时所用模型的显示元数据（旧消息无 _display 时为空串）
                         "model_id": (msg.get("_display") or {}).get("model_id") or "",
                         "model_name": (msg.get("_display") or {}).get("model_name") or "",
+                        # media_v1 媒体清单（已拼好带令牌 URL）；旧消息为空列表
+                        "media": self._media_items_for_frontend(msg.get("_display")),
                     })
         except Exception:
             logger.debug("加载会话消息失败", exc_info=True)
@@ -1974,6 +2030,15 @@ class ApiBridge:
             ).start()
         except Exception:
             logger.debug("局域网远程控制服务启动线程创建失败", exc_info=True)
+        # 历史消息媒体清单迁移：一次性、幂等，后台执行不阻塞初始化
+        try:
+            threading.Thread(
+                target=self._run_media_migration_once,
+                daemon=True,
+                name="media-migration",
+            ).start()
+        except Exception:
+            logger.debug("媒体清单迁移线程创建失败", exc_info=True)
         gui_theme_state = _load_initial_gui_theme_state()
         active_gui_theme = gui_theme_state["gui_theme"]
         gui_themes = gui_theme_state["gui_themes"]
@@ -2849,6 +2914,31 @@ class ApiBridge:
             return {"ok": True, "permission_mode": canonical}
         except Exception as e:
             logger.exception("set_permission_mode 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def post_notice(self, message: str, session_name: str = "", kind: str = "notice") -> Dict[str, Any]:
+        """把客户端本地产生的对话提示（notice/error 卡片）广播到全部客户端。
+
+        前端本地提示（如"已切换活动模型"）原来只插入本端消息流，桌面 GUI 与
+        局域网手机端互不可见。改为统一调用本方法：emit_event 会把 notice 事件
+        同时派发到桌面 webview 与手机端（_emit_raw 自带 LAN 广播），各端（含
+        发起端）收到事件后回环插入，天然同步且不重复。提示仍是瞬态的，
+        不写入会话历史、不影响模型上下文。
+        """
+        try:
+            text = str(message or "").strip()
+            if not text:
+                return {"ok": False, "msg": "空提示内容"}
+            if kind not in ("notice", "error"):
+                kind = "notice"
+            self.emit_event("notice", {
+                "message": text,
+                "session_name": str(session_name or ""),
+                "kind": kind,
+            })
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("post_notice 失败")
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------

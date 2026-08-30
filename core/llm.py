@@ -4885,6 +4885,13 @@ def _chat_with_model_generator(
                 persisted_message["tool_calls"] = tool_calls_list
             # 落库副本补充生成所用模型的显示元数据（仅持久化，不发给 LLM）
             persisted_message.update(_model_display_snapshot())
+            # 落库副本提取媒体清单（![..](..) / [video:..](..) 语法归档进内容寻址
+            # 仓库）。只改落库副本：message_to_append 不动，Provider 请求字节零变化；
+            # 基础设施错误（仓库不可写等）按契约直接向持久化路径传播，显式失败。
+            if stream:
+                from core.media_refs import attach_media_manifest
+                from core.workspace_context import get_workdir
+                attach_media_manifest(persisted_message, get_workdir())
 
             # 用"促升前"的原始正文判断：思考内容被促升为正文后不能算作有效结论，
             # 否则模型纯思考收尾时会跳过最终总结重试，用户什么都看不到。

@@ -146,7 +146,10 @@ import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
 
 const store = useAppStore();
-const inputVal = ref('');
+const inputVal = computed<string>({
+  get: () => store._getSessionRuntime().composerText || '',
+  set: value => { store._getSessionRuntime().composerText = value; },
+});
 const textareaRef = ref<HTMLTextAreaElement | null>(null);
 
 const showModelCascader = ref(false);

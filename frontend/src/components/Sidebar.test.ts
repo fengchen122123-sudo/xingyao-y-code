@@ -169,3 +169,40 @@ it('永久有效（expires_in=0）时不做倒计时自动刷新', async () => {
     vi.useRealTimers();
   }
 });
+
+it('子页面打开时点击新会话会立即返回对话页面', async () => {
+  delete (window as any).pywebview;
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.openSubpage('skills');
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.findAll('.menu-item')[0].trigger('click');
+
+  expect(store.subpage.show).toBe(false);
+  expect(store.pendingWorkdir).toBe('GLOBAL');
+  wrapper.unmount();
+});
+
+it('子页面打开时点击历史会话会立即返回对话页面', async () => {
+  delete (window as any).pywebview;
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.sessionGroups = [{
+    folder_path: 'GLOBAL',
+    folder_name: '对话',
+    is_global: true,
+    is_current: true,
+    sessions: [{ name: 'session-a', display_name: '历史会话 A', updated_at: '' }],
+  }] as any;
+  store.openSubpage('plugins');
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.get('.session-item').trigger('click');
+
+  expect(store.subpage.show).toBe(false);
+  expect(store.currentSessionName).toBe('session-a');
+  wrapper.unmount();
+});

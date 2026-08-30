@@ -1,4 +1,5 @@
 import json
+import socket
 import threading
 import time
 
@@ -186,6 +187,70 @@ def test_ensure_lan_server_concurrent_single_instance(monkeypatch):
     assert len(created) == 1
     assert all(r is bridge._lan_server for r in results)
     assert bridge._lan_server.port == 8765
+
+
+def _fake_config(monkeypatch, data):
+    """把 config._load / lan_server._save_config_value 替换为内存字典。"""
+    import config as config_mod
+    import core.lan_server as lan_mod
+
+    monkeypatch.setattr(config_mod, "_load", lambda: dict(data))
+    monkeypatch.setattr(
+        lan_mod, "_save_config_value", lambda k, v: data.__setitem__(k, v) or True
+    )
+    return data
+
+
+def _free_port() -> int:
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def test_load_persisted_port_validates_range(monkeypatch):
+    data = _fake_config(monkeypatch, {"remote_pair_port": 49939})
+    assert LanServer(bridge=None)._load_persisted_port() == 49939
+
+    for bad in (0, 80, 1023, 70000, "abc", None):
+        _fake_config(monkeypatch, {"remote_pair_port": bad})
+        assert LanServer(bridge=None)._load_persisted_port() == 0
+    _fake_config(monkeypatch, {})
+    assert LanServer(bridge=None)._load_persisted_port() == 0
+
+
+def test_start_reuses_persisted_port(monkeypatch):
+    """重启后复用上次持久化的端口：二维码 URL 不变，手机无需重新扫码。"""
+    port = _free_port()
+    data = _fake_config(monkeypatch, {"remote_pair_port": port})
+    srv = LanServer(bridge=None)
+    try:
+        res = srv.start()
+        assert res["ok"]
+        assert srv.port == port
+        assert data["remote_pair_port"] == port
+    finally:
+        srv.stop()
+
+
+def test_start_falls_back_when_persisted_port_occupied(monkeypatch):
+    """持久化端口被其他进程占用时回退动态分配，并把新端口回填持久化。"""
+    blocker = socket.socket()
+    blocker.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
+    blocker.bind(("0.0.0.0", 0))
+    blocker.listen(1)
+    occupied = blocker.getsockname()[1]
+    data = _fake_config(monkeypatch, {"remote_pair_port": occupied})
+    srv = LanServer(bridge=None)
+    try:
+        res = srv.start()
+        assert res["ok"]
+        assert srv.port != occupied
+        assert data["remote_pair_port"] == srv.port
+    finally:
+        srv.stop()
+        blocker.close()
 
 
 class _FakeClient:

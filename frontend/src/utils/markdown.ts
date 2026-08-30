@@ -6,6 +6,7 @@
 // 不会被 v-html 当作可执行的 HTML/JS 处理。
 
 import { isLocalFileLink } from './localPath';
+import type { MediaContext, MediaItem } from '../types/media';
 
 function escapeHtml(text: string): string {
   return text
@@ -33,7 +34,56 @@ function fileLinkHtml(path: string): string {
   return `<a href="#" data-file-link="${escapeHtml(path)}" data-file-local="1">${escapeHtml(path)}</a>`;
 }
 
-export function renderMarkdown(md: string): string {
+// ---------------------------------------------------------------------------
+// 媒体语法（图片/视频）：与 core/media_refs.py 保持同构，前后端 ordinal 对齐
+// 图片 ![caption](path)；视频 [video: caption](path) / [视频：caption](path)。
+// 组 1/2 = 图片 caption/path；组 3/4 = 视频 caption/path。
+// ---------------------------------------------------------------------------
+const MEDIA_SYNTAX_RE = /!\[([^\]]*)\]\(([^)\s]+)\)|\[(?:video|视频)[ \t]*[:：][ \t]*([^\]]*)\]\(([^)\s]+)\)/gi;
+
+const REMOTE_LINK_RE = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//;
+
+// 本地媒体路径判定：与后端 media_refs._is_local_media_path 同规则。
+// 远程 URL 不是媒体项、不占 ordinal（渲染为普通链接，防 SSRF）。
+function isLocalMediaPath(path: string): boolean {
+  const s = (path || '').trim();
+  if (!s || /[\s<>"'`]/.test(s)) return false;
+  if (s.toLowerCase().startsWith('file://')) return true;
+  if (REMOTE_LINK_RE.test(s) || s.toLowerCase().startsWith('data:')) return false;
+  return true;
+}
+
+function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): string {
+  if (item.kind === 'error') {
+    const label = item.error_label || '媒体不可用';
+    const name = caption || item.source_name || '媒体';
+    return `<span class="md-media-error">⚠ ${escapeHtml(name)}：${escapeHtml(label)}</span>`;
+  }
+  const src = item.url || '';
+  if (!src) {
+    const name = caption || item.source_name || '媒体';
+    return `<span class="md-media-error">⚠ ${escapeHtml(name)}：媒体服务不可用</span>`;
+  }
+  if (item.kind === 'video') {
+    return `<video class="md-video" controls preload="metadata" playsinline src="${escapeHtml(src)}"></video>`;
+  }
+  const alt = caption || item.caption || item.source_name || '图片';
+  return `<img class="md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" data-media-ordinal="${ordinal}" loading="lazy">`;
+}
+
+// mermaid 块的渲染缓存 key：源码的 FNV-1a 哈希 + 长度。只用于缓存去重，
+// 不是安全边界（源码在展示前仍会转义）。流式期间同一段源码的 key 保持
+// 稳定，v-html 整体重建 DOM 后可凭 key 直接命中已渲染的 SVG。
+export function mermaidCacheKey(code: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < code.length; i++) {
+    hash ^= code.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193) >>> 0;
+  }
+  return `${hash.toString(16)}-${code.length}`;
+}
+
+export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
   if (!md) return '';
   let text = md;
 
@@ -48,6 +98,20 @@ export function renderMarkdown(md: string): string {
   const links: string[] = [];
   text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
     const idx = codeBlocks.length;
+    // mermaid 块：renderMarkdown 保持纯同步——这里只产出带缓存 key 的占位
+    // 容器 + 隐藏源码（均已转义），SVG 渲染由 mermaidRenderer 在 DOM 挂载后
+    // 异步完成（与文件链接后置校验同一模式）。渲染失败时降级显示源码。
+    if ((lang || '').toLowerCase() === 'mermaid') {
+      const key = mermaidCacheKey(code);
+      codeBlocks.push(
+        `<div class="mermaid-block" data-mermaid-key="${escapeHtml(key)}" data-state="pending">`
+        + '<div class="mermaid-head"><span class="mermaid-tag">mermaid</span>'
+        + '<button class="mermaid-copy" type="button">复制源码</button></div>'
+        + `<pre class="mermaid-src">${escapeHtml(code)}</pre>`
+        + '</div>'
+      );
+      return `${PH}CB${idx}${PH}`;
+    }
     const escaped = escapeHtml(code);
     codeBlocks.push(`<div class="code-block"><button class="code-copy" type="button">复制</button><pre><code class="language-${escapeHtml(lang || '')}">${escaped}</code></pre></div>`);
     return `${PH}CB${idx}${PH}`;
@@ -67,6 +131,28 @@ export function renderMarkdown(md: string): string {
     const idx = inlineCodes.length;
     inlineCodes.push(`<code>${escapeHtml(code)}</code>`);
     return `${PH}IC${idx}${PH}`;
+  });
+
+  // 2.5 媒体语法（图片/视频）：必须先于普通链接解析，否则 ![alt](path) 会命中
+  // 第 3 步被渲染成蓝色链接（图片显示不出来一直就是这个根因）。按出现顺序维护
+  // ordinal 与 mediaCtx.items 对齐；无清单（旧消息/迁移前）或 ordinal 越界时退回
+  // 文件链接渲染。远程 URL 不是媒体项，原样返回走普通链接管线。
+  const mediaItems: string[] = [];
+  let mediaOrdinal = 0;
+  text = text.replace(MEDIA_SYNTAX_RE, (_m, imgCaption, imgPath, vidCaption, vidPath) => {
+    const caption = String(imgCaption ?? vidCaption ?? '').trim();
+    const path = String(imgPath ?? vidPath ?? '').trim();
+    if (!isLocalMediaPath(path)) return _m;
+    const ordinal = mediaOrdinal++;
+    const item = mediaCtx?.items[ordinal];
+    if (!item) {
+      const idx = fileLinks.length;
+      fileLinks.push(fileLinkHtml(path));
+      return `${PH}FL${idx}${PH}`;
+    }
+    const idx = mediaItems.length;
+    mediaItems.push(mediaItemHtml(item, caption, ordinal));
+    return `${PH}MD${idx}${PH}`;
   });
 
   // 3. 显式链接 [label](url)：本地文件路径 → 可点击预览；否则走 http/https/mailto 白名单
@@ -208,6 +294,9 @@ export function renderMarkdown(md: string): string {
   });
   links.forEach((l, idx) => {
     html = html.replace(`${PH}L${idx}${PH}`, () => l);
+  });
+  mediaItems.forEach((mi, idx) => {
+    html = html.replace(`${PH}MD${idx}${PH}`, () => mi);
   });
 
   return html;

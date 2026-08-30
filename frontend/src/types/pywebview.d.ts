@@ -383,6 +383,9 @@ export interface PyWebViewAPI {
   respond_permission_choice(requestId: string, choiceIndex: number, customText?: string): Promise<any>;
 
   send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string, modelId?: string): Promise<any>;
+  // 客户端本地提示（notice/error 卡片）经桥广播到全部客户端（桌面 + 手机端）；
+  // 各端收到 notice 桥事件后统一回环插入，提示为瞬态、不落历史
+  post_notice(message: string, sessionName?: string, kind?: 'notice' | 'error'): Promise<any>;
   stop_current_turn(sessionName?: string): Promise<any>;
   // 会话消息排队：查询 / 取消排队 / 插队发送（停止当前回合优先补发该消息）
   get_message_queue(sessionName?: string): Promise<{ ok: boolean; session_name: string; queue: QueuedMessage[] }>;
