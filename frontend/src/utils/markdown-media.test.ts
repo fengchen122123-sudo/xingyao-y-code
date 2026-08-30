@@ -33,6 +33,16 @@ describe('renderMarkdown 媒体语法', () => {
     expect(html).not.toContain('data-file-link');
   });
 
+  it('图片带悬停"复制原图"按钮：data-copy-src 与图标，错误项/视频没有按钮', () => {
+    const html = renderMarkdown('![图](a.png)\n[video: v](b.mp4)', { items: [img(0), video(1)] });
+    expect(html).toContain('class="md-media-wrap"');
+    expect((html.match(/md-img-copy"/g) || []).length).toBe(1);
+    expect(html).toContain(`data-copy-src="${img(0).url}"`);
+    expect(html).toContain('<svg');
+    // 复制按钮在 wrap 内、img 之后（事件委托按 button 命中，不触发灯箱）
+    expect(html.indexOf('md-img-copy')).toBeGreaterThan(html.indexOf('md-img'));
+  });
+
   it('视频语法 [video: x](path) 渲染为 <video controls>', () => {
     const html = renderMarkdown('[video: 演示](demo.mp4)', { items: [video(0)] });
     expect(html).toContain('<video class="md-video"');

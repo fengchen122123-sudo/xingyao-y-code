@@ -50,6 +50,8 @@ def test_200_serves_blob_with_immutable_cache(server, blob):
     assert headers["Content-Type"] == "image/png"
     assert "immutable" in headers.get("Cache-Control", "")
     assert headers.get("Accept-Ranges") == "bytes"
+    # 前端"复制原图"fetch Blob 依赖 CORS 头（令牌才是访问控制边界）
+    assert headers.get("Access-Control-Allow-Origin") == "*"
 
 
 def test_wrong_token_returns_404(server, blob):

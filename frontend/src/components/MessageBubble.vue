@@ -117,7 +117,7 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
-import { renderMarkdown } from '../utils/markdown';
+import { renderMarkdown, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
 import { renderMermaidBlocks } from '../utils/mermaidRenderer';
 import { toAbsoluteLocalPath } from '../utils/localPath';
 import AppIcon from './AppIcon.vue';
@@ -195,8 +195,17 @@ async function copyToClipboard(text: string): Promise<void> {
 }
 
 // Markdown 内容点击事件委托：本地文件链接走内嵌预览，代码块复制按钮走复制；
-// 媒体图片点击进灯箱（与本条消息内其他图片共用导航序列）
+// 媒体图片点击进灯箱（与本条消息内其他图片共用导航序列），
+// 悬停的"复制原图"按钮把原图写入系统剪贴板
 function onMdBodyClick(e: MouseEvent) {
+  const copyBtn = (e.target as HTMLElement).closest('button.md-img-copy');
+  if (copyBtn) {
+    e.preventDefault();
+    const src = copyBtn.getAttribute('data-copy-src') || '';
+    if (src) copyMdImageToClipboard(src, copyBtn as HTMLButtonElement);
+    return;
+  }
+
   const mdImg = (e.target as HTMLElement).closest('img.md-img');
   if (mdImg) {
     const urls = (props.msg.media || [])
@@ -247,6 +256,51 @@ function onMdBodyClick(e: MouseEvent) {
     .catch(() => {
       // 复制失败保持原样，不额外提示
     });
+}
+
+// ---- 媒体图片"复制原图" ----
+// 剪贴板写入用 image/png（ClipboardItem 的通用兼容格式）：PNG 原样写入，
+// 其余格式经 canvas 转码；GIF 会复制为静态首帧。媒体服务已带 CORS 头，
+// fetch 跨端口取图可行；页面是 127.0.0.1 安全上下文，clipboard.write 可用。
+async function blobToPngBlob(blob: Blob): Promise<Blob> {
+  const bitmap = await createImageBitmap(blob);
+  try {
+    const canvas = document.createElement('canvas');
+    canvas.width = bitmap.width;
+    canvas.height = bitmap.height;
+    canvas.getContext('2d')!.drawImage(bitmap, 0, 0);
+    return await new Promise<Blob>((resolve, reject) => {
+      canvas.toBlob(
+        b => (b ? resolve(b) : reject(new Error('canvas toBlob 失败'))),
+        'image/png',
+      );
+    });
+  } finally {
+    bitmap.close();
+  }
+}
+
+async function copyMdImageToClipboard(src: string, btn: HTMLButtonElement) {
+  const setFeedback = (ok: boolean) => {
+    const label = ok ? '已复制' : '复制失败';
+    btn.classList.toggle('copied', ok);
+    btn.classList.toggle('copy-failed', !ok);
+    btn.innerHTML = (ok ? CHECK_ICON_SVG : COPY_ICON_SVG) + `<span class="md-img-copy-text">${label}</span>`;
+    window.setTimeout(() => {
+      btn.classList.remove('copied', 'copy-failed');
+      btn.innerHTML = COPY_ICON_SVG + '<span class="md-img-copy-text">复制</span>';
+    }, 1500);
+  };
+  try {
+    const resp = await fetch(src);
+    if (!resp.ok) throw new Error(`媒体服务返回 ${resp.status}`);
+    const blob = await resp.blob();
+    const png = blob.type === 'image/png' ? blob : await blobToPngBlob(blob);
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': png })]);
+    setFeedback(true);
+  } catch {
+    setFeedback(false);
+  }
 }
 
 // mermaid 块复制源码：渲染成功与否都可从隐藏/展示的 pre.mermaid-src 取原文
@@ -548,6 +602,11 @@ async function copyUserMessage() {
 }
 
 /* ---- 媒体语法渲染：图片网格 / 视频播放器 / 明确失败态 ---- */
+.md-body :deep(.md-media-wrap) {
+  position: relative;
+  display: block;
+  width: fit-content;
+}
 .md-body :deep(img.md-img) {
   display: block;
   max-width: min(420px, 100%);
@@ -557,6 +616,46 @@ async function copyUserMessage() {
   margin: 6px 0;
   cursor: zoom-in;
   object-fit: contain;
+}
+/* 悬停浮现的"复制原图"按钮：图片右上角，触屏无 hover 时保持可点 */
+.md-body :deep(.md-img-copy) {
+  position: absolute;
+  top: 14px;
+  right: 14px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-app, #1a1a1a) 82%, transparent);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  backdrop-filter: blur(4px);
+}
+.md-body :deep(.md-img-copy svg) {
+  width: 13px;
+  height: 13px;
+}
+.md-body :deep(.md-media-wrap:hover .md-img-copy),
+.md-body :deep(.md-img-copy:focus-visible),
+.md-body :deep(.md-img-copy.copied),
+.md-body :deep(.md-img-copy.copy-failed) {
+  opacity: 1;
+}
+.md-body :deep(.md-img-copy:hover) {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.md-body :deep(.md-img-copy.copied) {
+  color: #34c77b;
+}
+.md-body :deep(.md-img-copy.copy-failed) {
+  color: #e5615c;
 }
 .md-body :deep(video.md-video) {
   display: block;
