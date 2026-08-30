@@ -9,7 +9,7 @@ const settings = {
   command_shell_available: true,
   command_shell_error: '',
   remote_token_ttl: 86400,
-  agent_turn_step_limit: 100,
+  agent_turn_step_limit: 200,
   agent_turn_step_limit_min: 10,
   agent_turn_step_limit_max: 1000,
   command_shell_options: [
@@ -88,6 +88,6 @@ describe('system settings store', () => {
     const ok = await store.setAgentTurnStepLimit(1001);
 
     expect(ok).toBe(false);
-    expect(store.systemSettings.agent_turn_step_limit).toBe(100);
+    expect(store.systemSettings.agent_turn_step_limit).toBe(200);
   });
 });
