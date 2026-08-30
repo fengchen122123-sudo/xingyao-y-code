@@ -7,7 +7,7 @@ import { useAppStore } from '../stores/appStore';
 
 
 const turnStepLimitFields = {
-  agent_turn_step_limit: 100,
+  agent_turn_step_limit: 200,
   agent_turn_step_limit_min: 10,
   agent_turn_step_limit_max: 1000,
 };

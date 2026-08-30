@@ -23,7 +23,7 @@ def _use_tmp_config(tmp_path, monkeypatch, data):
 
 def test_missing_turn_step_limit_uses_legacy_default(tmp_path, monkeypatch):
     _use_tmp_config(tmp_path, monkeypatch, {})
-    assert load_turn_step_limit() == DEFAULT_TURN_STEP_LIMIT == 100
+    assert load_turn_step_limit() == DEFAULT_TURN_STEP_LIMIT == 200
 
 
 @pytest.mark.parametrize("value", [MIN_TURN_STEP_LIMIT, 100, MAX_TURN_STEP_LIMIT])
