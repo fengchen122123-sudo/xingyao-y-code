@@ -608,6 +608,29 @@ xingyao-y-code/
 | `skill_search_paths` | 技能搜索路径（项目级） |
 | `prompt_cache_keepalive_seconds` | DeepSeek/Kimi 前缀缓存保活间隔（默认 120；0 关闭；最小 60） |
 
+### config.toml 只读覆盖层（可选）
+
+除 `config.json` 外，星瑶还支持读取 `~/.ycode/config.toml` 作为**只读覆盖层**，
+方便沿用 Codex / Kimi CLI 等工具的 TOML 配置习惯或迁移部分配置片段：
+
+- **读取生效**：`config.toml` 与 `config.json` 深合并后生效，TOML 键优先级高于 JSON
+  （最终优先级：命令行参数 > config.toml > config.json > 内置默认）。
+- **写回永远落 JSON**：GUI / `/config` 等保存路径只写 `config.json`，绝不生成或改写 TOML；
+  若保存的键同时被 TOML 覆盖，会提示"保存成功但实际生效值仍以 TOML 为准"。
+- **容错**：TOML 语法错误或读取失败仅警告并回退纯 JSON，绝不影响启动；Python < 3.11 自动忽略。
+- **注意取舍**：TOML 值经一次写操作会固化进 `config.json`，此后删除 TOML 不会回退
+  （可手动改回 JSON 或删除对应键后重新设置）。
+
+示例 `config.toml`：
+
+```toml
+theme = "nord"
+permission_mode = "accept_edits"
+
+[memory_compression]
+retain_count = 12
+```
+
 图片附件最大允许 20MiB，解码后最多 4000 万像素。PNG（含透明通道）保持 PNG，
 JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视觉模型时使用与实际编码
 一致的 Base64 Data URL。GUI 中的处理结果会固定显示在对应用户消息下方。
@@ -619,6 +642,7 @@ JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视
 | 路径 | 用途 |
 |------|------|
 | `config.json` | 用户级配置 |
+| `config.toml` | 可选只读覆盖层（优先级高于 config.json，见「配置详解」） |
 | `ycode.db` | CLI 会话数据库 |
 | `ycode_gui.db` | GUI 会话数据库（与 CLI 互不可见） |
 | `active_skills.json` | 已启用技能列表 |
