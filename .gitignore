@@ -90,3 +90,14 @@ output/
 
 # pytest ��ʱ����Ŀ¼
 tmp/
+
+# 临时产物：图片生成脚本（内含密钥，严禁入库）与本地测试生成的图片/图表
+gen_images.py
+img1_*.png
+img2_*.png
+img3_*.png
+img4_*.png
+flowchart.mmd
+flowchart.png
+docs/harness_execution_flow.html
+docs/harness_execution_flow.md
