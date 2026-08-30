@@ -143,6 +143,10 @@ class _MediaRequestHandler(BaseHTTPRequestHandler):
             "Accept-Ranges": "bytes",
             "Cache-Control": "private, max-age=31536000, immutable",
             "X-Content-Type-Options": "nosniff",
+            # 前端"复制原图"需要 fetch Blob 再写入剪贴板，跨端口请求依赖 CORS。
+            # 访问控制已由随机令牌承担（错令牌 404），CORS 在此不是安全边界；
+            # <img>/<video> 嵌入本就不受同源策略限制，放行读请求不扩大暴露面。
+            "Access-Control-Allow-Origin": "*",
         }
 
         range_header = self.headers.get("Range") or ""
