@@ -445,6 +445,9 @@ def main():
                         help="不创建 Release，只向已存在的 Release 补传缺失附件（断点续传）")
     parser.add_argument("--verify", action="store_true",
                         help="只回读校验当前版本 Release 的远端附件与本地分卷是否一致，不上传")
+    parser.add_argument("--cleanup", action="store_true",
+                        help="发布成功后清理旧 Release（保留最近 2 个版本）。默认不清理，"
+                             "旧版本由维护者手动在网页端删除")
     args = parser.parse_args()
 
     token, source = resolve_token()
@@ -628,9 +631,9 @@ def main():
     print(f"👉 Release 页面: https://gitee.com/{GITEE_REPO}/releases/tag/{tag}")
     print("ℹ 老版本应用内『检查更新』即可自动下载分卷拼接并校验安装。")
 
-    # 发布成功后自动清理旧版本附件（保留最近 2 个版本：当前 + 上一个）
-    # 避免 Gitee 仓库附件总容量超限（免费版约 500MB）
-    if not args.dry_run and releases:
+    # 发布成功后按需清理旧版本附件（仅 --cleanup 显式开启）：
+    # 默认不清理，旧版本由维护者手动在网页端删除
+    if args.cleanup and not args.dry_run and releases:
         try:
             # 重新拉取最新 Release 列表（包含刚发布的）
             updated_releases = list_releases(token)
