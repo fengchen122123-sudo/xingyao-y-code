@@ -405,3 +405,85 @@ def test_toggle_enable_untrusted_plugin_refused(plugin_env, monkeypatch, tmp_pat
     assert ok is False
     assert "信任" in msg
     assert registry.execute("demo_tool").is_error
+
+
+# ── trust_plugin：显式信任接口（供 GUI 桥接层调用，等效 CLI 首次加载答 y）──
+
+def test_trust_plugin_untrusted_then_loads_without_confirm(plugin_env, monkeypatch):
+    """显式信任后指纹持久化：即使确认回调拒绝也能直接加载"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
+
+    registry = ToolRegistry()
+    assert plugin_loader.load_and_register(registry) == []
+    assert plugin_loader.get_plugin_infos()[0]["status"] == "untrusted"
+
+    ok, msg = plugin_loader.trust_plugin("demo")
+    assert ok is True
+    assert msg  # 有可展示的中文提示
+
+    # 下次加载（模拟重启后）：指纹已持久化，确认回调返回 False 也不弹确认
+    registry2 = ToolRegistry()
+    assert plugin_loader.load_and_register(registry2) == ["demo"]
+    assert plugin_loader.get_plugin_infos()[0]["status"] == "loaded"
+    assert plugin_loader.get_plugin_infos()[0]["tools"] == ["demo_tool"]
+    assert registry2.execute("demo_tool", x="hi").content == "hello hi"
+
+
+def test_trust_plugin_unknown_name_rejected(plugin_env):
+    """未知插件名：返回失败，错误信息含"未找到" """
+    ok, msg = plugin_loader.trust_plugin("no_such_plugin")
+    assert ok is False
+    assert "未找到" in msg
+
+
+def test_trust_plugin_builtin_ok_idempotent(plugin_env):
+    """内置插件可直接信任（幂等：指纹本就自动记录，重复信任仍成功）"""
+    _, builtin_dir = plugin_env
+    _make_plugin(builtin_dir / "bi", "bi", _GOOD_PLUGIN)
+
+    ok, _ = plugin_loader.trust_plugin("bi")
+    assert ok is True
+    ok2, _ = plugin_loader.trust_plugin("bi")
+    assert ok2 is True
+
+
+def test_trust_plugin_disabled_only_persists_trust(plugin_env, monkeypatch):
+    """禁用插件：只持久化信任，不改变 enabled、不注册工具"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "off", "off", _GOOD_PLUGIN, enabled=False)
+    registry = ToolRegistry()
+    plugin_loader.load_and_register(registry)
+    assert plugin_loader.get_plugin_infos()[0]["status"] == "disabled"
+
+    ok, _ = plugin_loader.trust_plugin("off")
+    assert ok is True
+
+    meta = json.loads((user_dir / "off" / "plugin.json").read_text(encoding="utf-8"))
+    assert meta["enabled"] is False
+    assert plugin_loader.get_plugin_infos()[0]["status"] == "disabled"
+    assert registry.execute("demo_tool").is_error
+
+    # 信任已持久化：之后热启用时确认回调拒绝也无需再确认即可加载
+    # （trust_plugin 不改 enabled，禁用插件在 load_and_register 中仍按 disabled 跳过）
+    monkeypatch.setattr(plugin_loader, "_confirm_plugin_trust", lambda *a, **k: False)
+    monkeypatch.setattr(plugin_loader, "_live_registry", lambda: registry)
+    ok2, msg2 = plugin_loader.toggle_plugin("off", True)
+    assert ok2 is True
+    assert registry.execute("demo_tool", x="go").content == "hello go"
+
+
+def test_trust_plugin_persists_fingerprint_entry(plugin_env, tmp_path):
+    """信任后 plugin_trust.json 出现 {resolve 后路径: 当前指纹} 条目"""
+    user_dir, _ = plugin_env
+    _make_plugin(user_dir / "demo", "demo", _GOOD_PLUGIN)
+
+    ok, _ = plugin_loader.trust_plugin("demo")
+    assert ok is True
+
+    trust = json.loads((tmp_path / "plugin_trust.json").read_text(encoding="utf-8"))
+    assert trust == {
+        str((user_dir / "demo").resolve()):
+            plugin_loader._plugin_fingerprint(user_dir / "demo")
+    }

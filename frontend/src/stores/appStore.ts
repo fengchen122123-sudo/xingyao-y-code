@@ -2980,6 +2980,23 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    async trustPlugin(name: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.trust_plugin(name);
+        if (res && res.ok) {
+          this.plugins = res.plugins || this.plugins;
+          this.notifyModal('插件', res.msg || '插件已信任');
+        } else {
+          this.notifyModal('插件', '插件信任失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('插件', '插件信任失败: ' + err);
+      }
+    },
+
     async reconnectMcp() {
       const api = this._api();
       if (!api) return;
