@@ -81,6 +81,7 @@
           <div class="sc-desc">{{ p.description || '无描述' }}</div>
           <div class="sc-id">
             {{ pluginStatusText(p) }}<template v-if="p.tools.length"> · 工具: {{ p.tools.join(', ') }}</template>
+            <button v-if="p.status === 'untrusted'" class="btn primary sc-trust-btn" title="确认插件内容后加载" @click.stop="store.trustPlugin(p.name)">信任并加载</button>
           </div>
         </div>
       </div>
@@ -237,6 +238,7 @@ function pluginStatusText(p: PluginInfo) {
     case 'overridden': return '已被同名用户插件覆盖';
     case 'pending_enable': return '已启用（重启后生效）';
     case 'pending_disable': return '已禁用（重启后生效）';
+    case 'untrusted': return '未信任 —— 首次安装或内容已变化，需确认后加载';
     default: return p.status || '';
   }
 }
@@ -428,6 +430,12 @@ async function testModelRow(m: ModelInfo) {
   color: var(--text-faint);
   font-family: var(--mono);
   margin-top: 4px;
+}
+.sub-card .sc-trust-btn {
+  margin-left: 8px;
+  padding: 1px 8px;
+  font-size: 10px;
+  vertical-align: middle;
 }
 
 /* MCP 添加服务表单 */

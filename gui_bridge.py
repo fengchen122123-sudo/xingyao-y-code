@@ -4522,6 +4522,15 @@ class ApiBridge:
             logger.exception("toggle_plugin 失败")
             return {"ok": False, "msg": str(e)}
 
+    def trust_plugin(self, name: str) -> Dict[str, Any]:
+        try:
+            from core.plugin_loader import trust_plugin as _trust
+            ok, msg = _trust(name)
+            return {"ok": ok, "msg": msg, "plugins": self.get_plugins()}
+        except Exception as e:
+            logger.exception("trust_plugin 失败")
+            return {"ok": False, "msg": str(e)}
+
     # ------------------------------------------------------------------
     # MCP
     # ------------------------------------------------------------------

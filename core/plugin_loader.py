@@ -90,7 +90,13 @@ def _save_trust_store(store: dict) -> None:
 
 
 def _plugin_fingerprint(plugin_dir: Path) -> str:
-    """计算插件目录内容指纹：所有文件（跳过 __pycache__/.pyc）的路径+内容哈希。"""
+    """计算插件目录内容指纹：所有文件（跳过 __pycache__/.pyc）的路径+内容哈希。
+
+    plugin.json 例外：解析后剔除 "enabled" 字段、按键名排序再序列化后哈希。
+    原因：enabled 开关翻转由 toggle_plugin 回写 plugin.json，属于用户正常操作
+    而非内容篡改；指纹必须对它不敏感，否则"禁用状态下信任的插件，一开开关
+    就被误判为已变更"。解析失败时回退为原始字节哈希。
+    """
     digest = hashlib.sha256()
     for path in sorted(plugin_dir.rglob("*")):
         if not path.is_file():
@@ -100,6 +106,16 @@ def _plugin_fingerprint(plugin_dir: Path) -> str:
             continue
         digest.update(rel.encode("utf-8"))
         digest.update(b"\0")
+        if rel == "plugin.json":
+            try:
+                meta = json.loads(path.read_bytes().decode("utf-8"))
+                if isinstance(meta, dict):
+                    meta.pop("enabled", None)
+                canon = json.dumps(meta, ensure_ascii=False, sort_keys=True)
+                digest.update(canon.encode("utf-8"))
+                continue
+            except Exception:
+                pass  # 非 JSON 内容回退为原始字节哈希
         digest.update(hashlib.sha256(path.read_bytes()).digest())
     return digest.hexdigest()
 
@@ -279,6 +295,53 @@ def toggle_plugin(name: str, enabled: bool) -> tuple[bool, str]:
 
     action = "启用" if enabled else "禁用"
     return True, f"已{action}插件 {name}{hot_note}"
+
+
+def trust_plugin(name: str) -> tuple[bool, str]:
+    """显式信任指定插件：计算其内容指纹并写入信任持久化存储。
+
+    供 GUI 桥接层调用，等效于 CLI 首次加载插件时在信任确认中回答 y。
+    背景：GUI 进程通常非交互终端（stdin 非 tty），默认确认函数恒返回
+    False，用户永远无法在 GUI 里信任插件；本接口让上层可以显式放行。
+
+    行为：
+    - 只按指纹持久化信任，不改动 plugin.json 的 enabled 状态、不注册工具；
+    - 信任后（内容不变的前提下）下次 load_and_register / toggle 启用可直接
+      加载，无需再弹确认；
+    - 对已信任插件重复调用是幂等的（重写相同指纹，仍返回成功）。
+
+    返回 (ok, msg)：成功时 msg 为可展示的中文提示；找不到插件或写入失败时
+    返回 (False, 错误描述)。
+    """
+    target: Path | None = None
+    for info in _PLUGIN_INFOS:
+        if info.get("name") == name:
+            target = Path(info["path"])
+            break
+    # 兜底：内存记录里没找到就扫一遍目录（与 toggle_plugin 同款）
+    if target is None:
+        for base in plugin_dirs():
+            child = base / name
+            if (child / "plugin.json").is_file():
+                target = child
+                break
+    if target is None or not (target / "plugin.json").is_file():
+        return False, f"未找到插件 {name}"
+
+    try:
+        fingerprint = _plugin_fingerprint(target)
+    except OSError as exc:
+        return False, f"计算插件 {name} 指纹失败: {exc}"
+
+    try:
+        store = _load_trust_store()
+        store[str(target.resolve())] = fingerprint
+        _save_trust_store(store)
+    except Exception as exc:
+        return False, f"写入插件信任记录失败: {exc}"
+
+    _logger.info("插件 %s 已被显式信任并记录指纹: %s", name, target)
+    return True, f"已信任插件 {name}，下次启动自动加载"
 
 
 def plugin_dirs() -> list[Path]:
