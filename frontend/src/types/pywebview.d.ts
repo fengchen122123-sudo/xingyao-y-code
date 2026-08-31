@@ -121,7 +121,7 @@ export interface PluginInfo {
   version: string;
   description: string;
   source: string;      // user | builtin
-  status: string;      // loaded | disabled | failed | overridden | pending_enable | pending_disable
+  status: string;      // loaded | disabled | failed | overridden | pending_enable | pending_disable | untrusted
   enabled: boolean;
   tools: string[];
   error?: string;
@@ -398,6 +398,7 @@ export interface PyWebViewAPI {
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
+  trust_plugin(name: string): Promise<any>;
   get_mcp_servers(): Promise<McpInfo[]>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
   add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;
