@@ -118,7 +118,7 @@
 import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdown, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
-import { renderMermaidBlocks } from '../utils/mermaidRenderer';
+import { renderMermaidBlocks, svgToDataUrl } from '../utils/mermaidRenderer';
 import { toAbsoluteLocalPath } from '../utils/localPath';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
@@ -203,6 +203,16 @@ function onMdBodyClick(e: MouseEvent) {
     e.preventDefault();
     const src = copyBtn.getAttribute('data-copy-src') || '';
     if (src) copyMdImageToClipboard(src, copyBtn as HTMLButtonElement);
+    return;
+  }
+
+  // mermaid 图点击放大进灯箱（须先于 img 分支判断：图内不含 md-img，
+  // 两者天然互斥）。取的是当前 DOM 里 injectSvg 注入的已净化 SVG 字符串，
+  // 无新增注入面；流式重建 DOM 后点到的总是最新缓存内容，天然安全。
+  const mermaidSvg = (e.target as HTMLElement).closest('.mermaid-svg');
+  if (mermaidSvg) {
+    const svg = mermaidSvg.innerHTML;
+    if (svg.trim()) store.openLightbox([svgToDataUrl(svg)], 0);
     return;
   }
 
@@ -715,6 +725,10 @@ async function copyUserMessage() {
 .md-body :deep(.mermaid-block svg) {
   max-width: 100%;
   height: auto;
+}
+/* mermaid 图可点击放大进灯箱（见 onMdBodyClick 的 .mermaid-svg 分支） */
+.md-body :deep(.mermaid-svg) {
+  cursor: zoom-in;
 }
 /* 渲染中占位 */
 .md-body :deep(.mermaid-block[data-state='pending'])::after,
