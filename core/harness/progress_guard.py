@@ -16,7 +16,7 @@ class ProgressObservation:
 
 
 class TurnProgressGuard:
-    MAX_STALLED_STEPS = 6
+    MAX_STALLED_STEPS = 12
     # 每回合允许计为进展的新读取目标上限：超过后不再自动重置停滞计数，
     # 防止模型通过无限更换读取路径绕过熔断。真实进展（修改提交或状态哈希
     # 变化）会重置预算为满额。取值按真实调查回合校准：大型代码库的纯只读

@@ -1464,7 +1464,7 @@ def test_edit_file_on_missing_file_gives_clear_error(mocker):
     assert "JSON 修复后不完整" not in result["content"]
 
 
-def test_stalled_plan_after_repeated_failures_allows_direct_fix(mocker):
+def test_stalled_plan_after_repeated_failures_allows_direct_diagnosis(mocker):
     """回归：计划项多次失败全部停滞后，只读/查询类诊断命令仍可直接执行，
     主 Agent 不被计划锁逼入死局（修改类工具改由超时接管状态机放行）。"""
     from core.plan import bind_default_plan_session, get_default_plan_manager
@@ -1495,7 +1495,7 @@ def test_stalled_plan_after_repeated_failures_allows_direct_fix(mocker):
             "id": "exec-direct",
             "function": {
                 "name": "execute_command",
-                "arguments": '{"command": "echo hi"}',
+                "arguments": '{"command": "git status"}',
             },
         },
         event_callback=lambda *args, **kwargs: None,
@@ -1545,6 +1545,99 @@ def test_cleared_plan_turn_releases_tool_gate(mocker):
 
         assert "必须通过 run_subagent" not in result["content"]
         execute.assert_called_once()
+    finally:
+        bind_default_plan_session(previous_session)
+
+
+def test_completed_plan_turn_releases_tool_gate(mocker):
+    """回归：计划项全部 completed 后，主 Agent 必须能直接接手执行。
+
+    子代理可能在产物未落盘时错误结束计划项；如果终态计划仍维持工具门禁，
+    主 Agent 会被锁在无法重试、无法重建、也无法直接修复的死循环里。
+    """
+    from core.plan import bind_default_plan_session, get_default_plan_manager
+    import core.llm as llm
+
+    plan = get_default_plan_manager()
+    previous_session = plan.session_id
+    bind_default_plan_session("terminal-plan-gate-test")
+    plan.replace([{
+        "id": "impl",
+        "subject": "实现功能",
+        "status": "completed",
+    }])
+    llm._mark_plan_turn("turn-terminal-gate")
+    mocker.patch("core.llm.check_permission_and_ask", return_value=True)
+    execute = mocker.patch.object(
+        llm.tool_registry, "execute", return_value=mocker.Mock(
+            to_message_content=lambda: "执行成功"
+        )
+    )
+    try:
+        result = llm._execute_single_tool_call(
+            {
+                "id": "exec-direct",
+                "function": {
+                    "name": "execute_command",
+                    "arguments": '{"command": "echo hi"}',
+                },
+            },
+            event_callback=lambda *args, **kwargs: None,
+            parent_session="terminal-plan-gate-test",
+            parent_turn_id="turn-terminal-gate",
+        )
+
+        assert "必须通过 run_subagent" not in result["content"]
+        execute.assert_called_once()
+    finally:
+        bind_default_plan_session(previous_session)
+
+
+@pytest.mark.parametrize("statuses", [
+    ["failed"],
+    ["blocked"],
+    ["cancelled"],
+    ["completed", "failed"],
+])
+def test_unresolved_plan_keeps_tool_gate_across_turns(mocker, statuses):
+    """回归：新回合仍须恢复未解决计划，不能直接绕过失败类终态。"""
+    from core.plan import bind_default_plan_session, get_default_plan_manager
+    import core.llm as llm
+
+    session = "unresolved-plan-gate-" + "-".join(statuses)
+    plan = get_default_plan_manager()
+    previous_session = plan.session_id
+    bind_default_plan_session(session)
+    plan.replace([
+        {
+            "id": f"item-{index}",
+            "subject": f"任务 {index}",
+            "status": status,
+        }
+        for index, status in enumerate(statuses)
+    ])
+    mocker.patch("core.llm.check_permission_and_ask", return_value=True)
+    execute = mocker.patch.object(
+        llm.tool_registry, "execute", return_value=mocker.Mock(
+            to_message_content=lambda: "不应执行"
+        )
+    )
+    try:
+        result = llm._execute_single_tool_call(
+            {
+                "id": "exec-direct",
+                "function": {
+                    "name": "execute_command",
+                    "arguments": '{"command": "echo hi"}',
+                },
+            },
+            event_callback=lambda *args, **kwargs: None,
+            parent_session=session,
+            parent_turn_id="turn-new-unmarked",
+        )
+
+        assert "必须通过 run_subagent" in result["content"]
+        execute.assert_not_called()
     finally:
         bind_default_plan_session(previous_session)
 
@@ -1651,7 +1744,7 @@ def test_summarize_execute_command_started_truncates_long_command():
 
 
 _NO_PROGRESS_MESSAGE = (
-    "🚨 连续 6 轮没有检测到后台任务、计划或工具结果状态变化，"
+    "🚨 连续 12 轮没有检测到后台任务、计划或工具结果状态变化，"
     "回合已终止，避免继续循环消耗。"
 )
 
@@ -1717,8 +1810,8 @@ def test_no_progress_abort_emits_fixed_user_visible_error(mocker):
     )
     assert _NO_PROGRESS_MESSAGE not in public_text
     # 有界读取进展预算：首次 manage_task 新读取签名算一次进展，此后同一签名
-    # 重复调用不再算，熔断由第 6 次请求推迟到第 7 次（6 步停滞 + 1 步读取进展）
-    assert request_count == 7
+    # 重复调用不再算，熔断由第 12 次请求推迟到第 13 次（12 步停滞 + 1 步读取进展）
+    assert request_count == 13
 
 
 def test_no_progress_abort_works_without_harness_runtime(mocker):
@@ -1755,8 +1848,8 @@ def test_no_progress_abort_works_without_harness_runtime(mocker):
     reply = chat_with_model("fake-model", "fake-key", messages)
 
     assert reply == _NO_PROGRESS_MESSAGE
-    # 同上：首次新读取签名消耗一格读取预算，熔断推迟到第 7 次请求
-    assert request_count == 7
+    # 同上：首次新读取签名消耗一格读取预算，熔断推迟到第 13 次请求
+    assert request_count == 13
     assert messages[-1] == {"role": "assistant", "content": _NO_PROGRESS_MESSAGE}
 
 
@@ -1951,21 +2044,48 @@ def test_plan_bound_subagent_result_is_delegated_to_plan_fingerprint():
 
 
 def test_plan_state_tools_do_not_contribute_result_progress():
-    """plan_retry/plan_read 只依据计划快照实质转换计进展，正文不算。"""
+    """所有计划控制工具只依据 canonical 计划快照计进展，正文不算。"""
     from core.llm import _step_progress_observation
 
-    baseline = _step_progress_observation([
-        _progress_record("c1", "plan_retry", "已重置为 pending；提示 A")
-    ])
-    changed_text = _step_progress_observation([
-        _progress_record("c2", "plan_retry", "已重置为 pending；提示 B（文案不同）")
-    ])
-    read_a = _step_progress_observation([
-        _progress_record("c3", "plan_read", "计划共 1 项:\n  [pending] x")
-    ])
-    read_b = _step_progress_observation([
-        _progress_record("c4", "plan_read", "计划共 1 项:\n  [pending] x（新格式）")
-    ])
+    observations = [
+        _step_progress_observation([
+            _progress_record(f"c{index}", name, content)
+        ])
+        for index, (name, content) in enumerate([
+            ("plan_retry", "无法重置 completed 项"),
+            ("plan_read", "计划共 1 项: completed"),
+            ("plan_update", "计划项已更新"),
+            ("plan_write", "不能重建已有执行记录"),
+            ("plan_resume_takeover", "不是超时接管项"),
+            ("plan_finish", "不是当前回合接管项"),
+            ("ask_user", '{"selected": ["继续执行"], "cancelled": false}'),
+        ], start=1)
+    ]
 
-    assert baseline.tool_results_sha256 == changed_text.tool_results_sha256
-    assert read_a.tool_results_sha256 == read_b.tool_results_sha256
+    assert len({item.tool_results_sha256 for item in observations}) == 1
+
+
+def test_alternating_plan_control_failures_abort_after_twelve_stalled_steps():
+    """回归：切换计划工具和返回文案不能伪造进展、绕过无进展熔断。"""
+    from core.harness.progress_guard import TurnProgressGuard
+    from core.llm import _step_progress_observation
+
+    guard = TurnProgressGuard()
+    cycle = (
+        ("plan_update", "计划项已更新"),
+        ("plan_retry", "无法重置 completed 项"),
+        ("plan_finish", "不是当前回合接管项"),
+    )
+    for index in range(11):
+        name, content = cycle[index % len(cycle)]
+        progressed = guard.observe(_step_progress_observation([
+            _progress_record(f"cycle-{index}", name, content)
+        ]))
+        assert progressed is False
+        assert guard.should_abort() is False
+
+    name, content = cycle[11 % len(cycle)]
+    assert guard.observe(_step_progress_observation([
+        _progress_record("cycle-11", name, content)
+    ])) is False
+    assert guard.should_abort() is True
