@@ -1,0 +1,3 @@
+# 混元内置 Key 出库脱敏：clean 提交时占位符化，smudge 检出时用本机密钥还原
+# 详见 scripts/secret_filter.py 头部说明；真实 Key 存 ~/.ycode/secrets/（不入库）
+core/hunyuan_image.py filter=ycode-secret
