@@ -306,9 +306,9 @@ def _status_tool_result(tool_call, **_kwargs):
     }
 
 
-def test_no_progress_guard_aborts_turn_before_seventh_request(tmp_path, mocker):
+def test_no_progress_guard_aborts_turn_before_fourteenth_request(tmp_path, mocker):
     # 模型连续返回同一 manage_task(status) 观察类调用：任务指纹/计划占位/结果哈希
-    # 全部不变、无 mutation，第 6 个无进展 Step 后熔断，第 7 次 Provider 请求不得发送。
+    # 全部不变、无 mutation，第 12 个无进展 Step 后熔断，第 14 次 Provider 请求不得发送。
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     mocker.patch("core.app_context.get_manager", return_value=manager)
@@ -332,12 +332,12 @@ def test_no_progress_guard_aborts_turn_before_seventh_request(tmp_path, mocker):
     assert turn["status"] == "failed"
     assert turn["error_code"] == "NoProgressError"
     # 有界读取进展预算：首次 manage_task 新读取签名算一次进展，此后同一签名
-    # 重复调用不再算，熔断由第 6 次请求推迟到第 7 次（6 步停滞 + 1 步读取进展）
-    assert request_count == 7
+    # 重复调用不再算，熔断由第 12 次请求推迟到第 13 次（12 步停滞 + 1 步读取进展）
+    assert request_count == 13
     # 用户可见错误：固定文案经 error 事件推送（GUI 据此展示 NoProgressError）
     error_events = [event for event in events if event.kind == "error"]
     assert any(
-        "连续 6 轮没有检测到后台任务、计划或工具结果状态变化"
+        "连续 12 轮没有检测到后台任务、计划或工具结果状态变化"
         in str(event.payload.get("message", ""))
         for event in error_events
     )
@@ -347,11 +347,11 @@ def test_no_progress_guard_aborts_turn_before_seventh_request(tmp_path, mocker):
     assert kinds.count("turn_error") == 1
     assert "turn_finished" not in kinds
     steps = _steps(manager, "turn-runtime")
-    assert len(steps) == 7
+    assert len(steps) == 13
     assert all(step["status"] == "completed" for step in steps)
     history = manager.get_history("session")
     assert history[-1]["role"] == "assistant"
-    assert "连续 6 轮没有检测到" in str(history[-1]["content"])
+    assert "连续 12 轮没有检测到" in str(history[-1]["content"])
 
 
 def test_no_progress_guard_resets_when_mutation_committed(tmp_path, mocker):
@@ -450,7 +450,7 @@ def _plan_read_tool_result(tool_call, **_kwargs):
 
 def test_plan_read_loop_without_state_change_aborts(tmp_path, mocker):
     # 计划快照不变时反复 plan_read：结果文本相同、计划指纹不变、无 mutation，
-    # 第 6 个无进展 Step 后熔断（spec 测试矩阵：计划 read/retry/subagent 循环）。
+    # 第 12 个无进展 Step 后熔断（计划 read/retry/subagent 循环）。
     manager = MemoryManager(str(tmp_path / "runtime.db"))
     manager.create_session_explicit("session")
     mocker.patch("core.app_context.get_manager", return_value=manager)
@@ -471,7 +471,7 @@ def test_plan_read_loop_without_state_change_aborts(tmp_path, mocker):
     turn = manager.get_harness_turn("turn-runtime")
     assert turn["status"] == "failed"
     assert turn["error_code"] == "NoProgressError"
-    assert request_count == 6
+    assert request_count == 12
 
 
 

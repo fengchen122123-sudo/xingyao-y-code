@@ -467,10 +467,9 @@ def _has_pending_plan(session_id):
     plan = get_default_plan_manager()
     if plan.session_id != str(session_id):
         return False
-    return any(
-        item.get("status") in {"pending", "in_progress"}
-        for item in plan.snapshot()
-    )
+    # Keep the gate active until every plan item is completed.  Failed,
+    # blocked, and cancelled items still require an explicit plan_retry.
+    return any(item.get("status") != "completed" for item in plan.snapshot())
 
 def check_session_reset():
     global _last_tracked_session
@@ -3528,10 +3527,20 @@ def _tool_result_ok(function_name, result):
     ))
 
 
-# 计划状态机工具的结果正文不作为进展信号：真实状态转换已由计划 canonical
-# 快照指纹单独捕获。run_subagent 需要区分计划绑定与无计划调用，不能在这里
-# 全局忽略，详见 _unplanned_subagent_progress_part。
-_PLAN_STATE_RESULT_TOOLS = frozenset({"plan_retry", "plan_read"})
+# 计划控制工具的结果正文不作为进展信号：真实状态转换已由计划 canonical
+# 快照指纹单独捕获。否则模型只需在 plan_update/plan_retry/plan_finish 等返回
+# 文案之间来回切换，就会令 tool_results_sha256 每步变化并永久绕过无进展熔断。
+# run_subagent 需要区分计划绑定与无计划调用，不能在这里全局忽略，详见
+# _unplanned_subagent_progress_part。
+_PLAN_STATE_RESULT_TOOLS = frozenset({
+    "plan_write",
+    "plan_update",
+    "plan_read",
+    "plan_retry",
+    "plan_resume_takeover",
+    "plan_finish",
+    "ask_user",
+})
 
 
 def _canonical_arguments_signature(name, tool_call):
@@ -4462,7 +4471,8 @@ def _chat_with_model_generator(
             # 在创建新 Step（即发送下一次 Provider 请求）之前终止回合
             if progress_guard.should_abort():
                 msg = (
-                    f"{TOOL_ERROR_PREFIX} 连续 6 轮没有检测到后台任务、计划或工具结果"
+                    f"{TOOL_ERROR_PREFIX} 连续 {progress_guard.MAX_STALLED_STEPS} 轮"
+                    "没有检测到后台任务、计划或工具结果"
                     "状态变化，回合已终止，避免继续循环消耗。"
                 )
                 no_progress_message = {"role": "assistant", "content": msg}
