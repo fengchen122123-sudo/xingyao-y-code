@@ -87,14 +87,6 @@ export function sanitizeSvg(svg: string): string {
   }
 }
 
-// 净化后的 SVG → data URL：供灯箱以 <img> 展示。mermaid SVG 已是矢量图，
-// 经 img 渲染后灯箱缩放依旧清晰；且 img 上下文不执行脚本，叠加 sanitizeSvg
-// 已剥离 on* 事件与 javascript: 链接，无新增注入面。用 encodeURIComponent
-// 而非 base64：btoa 只接受 Latin-1，含中文标签的图会直接抛异常。
-export function svgToDataUrl(svg: string): string {
-  return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
-}
-
 function injectSvg(block: HTMLElement, svg: string): void {
   block.setAttribute('data-state', 'done');
   const holder = document.createElement('div');

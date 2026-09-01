@@ -17,9 +17,25 @@
       title="上一张 (←)"
       @click.stop="store.lightboxNav(-1)"
     ><AppIcon name="chevron-left" :size="22" :stroke-width="2" /></button>
+    <!-- mermaid 图放大：SVG 字符串直接 v-html 注入（与气泡内 injectSvg 同一条
+         渲染路径，字符串已过 sanitizeSvg 净化）；普通图片仍走 img src。
+         此前绕道 data URL 经 img 二次解析 SVG，真实环境会因序列化差异裂图 -->
+    <div
+      v-if="isCurrentSvg"
+      class="lb-svg"
+      :style="imgStyle"
+      v-html="currentImage"
+      @click.stop
+      @dblclick.stop="resetView"
+      @pointerdown="onPointerDown"
+      @pointermove="onPointerMove"
+      @pointerup="onPointerUp"
+      @pointercancel="onPointerUp"
+    ></div>
     <img
+      v-else
       class="lb-img"
-      :src="store.lightbox.images[store.lightbox.index]"
+      :src="currentImage"
       :style="imgStyle"
       alt="查看图片"
       @click.stop
@@ -48,6 +64,11 @@ import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 
 const store = useAppStore();
+
+// 当前展示项：普通图片是媒体服务 URL；mermaid 图点击放大时传的是
+// 净化后的 SVG 字符串（trim 后以 <svg 开头），走 v-html 直注分支
+const currentImage = computed(() => store.lightbox.images[store.lightbox.index] ?? '');
+const isCurrentSvg = computed(() => currentImage.value.trimStart().startsWith('<svg'));
 
 // 缩放/平移是组件本地视图状态：不进 store，换图或重新打开即复位
 const zoom = ref(1);
@@ -146,6 +167,22 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown));
   /* 放大后允许溢出视口，配合拖动查看局部 */
   user-select: none;
   -webkit-user-drag: none;
+}
+/* mermaid SVG 直注分支：与 .lb-img 同一缩放/拖动行为；
+   v-html 内容不受 scoped 属性选择器约束，需 :deep 穿透 */
+.lb-svg {
+  max-width: 90vw;
+  max-height: 88vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  user-select: none;
+}
+.lb-svg :deep(svg) {
+  max-width: 90vw;
+  max-height: 88vh;
+  border-radius: 8px;
+  box-shadow: 0 20px 80px rgba(0, 0, 0, 0.6);
 }
 .lb-close {
   position: absolute;

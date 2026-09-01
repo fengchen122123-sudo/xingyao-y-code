@@ -100,4 +100,22 @@ describe('ImageLightbox 缩放与拖动', () => {
     expect(wrapper.find('.lightbox-mask').exists()).toBe(false);
     wrapper.unmount();
   });
+
+  it('mermaid SVG 字符串走 v-html 直注分支（不绕 data URL + img）', async () => {
+    // 灯箱裂图修复回归：SVG 必须直注 DOM（与气泡同渲染路径），
+    // 任何把它再包成 data URL 喂 img 的改动都应被本用例拦下
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="10"><text>节点</text></svg>';
+    const store = useAppStore();
+    store.openLightbox([svg], 0);
+    const wrapper = mount(ImageLightbox);
+
+    const holder = wrapper.get('.lb-svg');
+    expect(wrapper.find('.lb-img').exists()).toBe(false);
+    expect(holder.html()).toContain('<text>节点</text>');
+
+    // 缩放/平移对 SVG 分支同样生效
+    await wrapper.get('.lightbox-mask').trigger('wheel', { deltaY: -100 });
+    expect(holder.attributes('style')).toContain('scale(1.2)');
+    wrapper.unmount();
+  });
 });
