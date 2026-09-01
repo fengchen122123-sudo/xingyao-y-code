@@ -3,7 +3,6 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import MessageBubble from './MessageBubble.vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
-import { svgToDataUrl } from '../utils/mermaidRenderer';
 import type { ToolExecutionCall } from '../utils/toolTrace';
 
 
@@ -238,8 +237,9 @@ describe('MessageBubble', () => {
     const [images, index] = open.mock.calls[0];
     expect(index).toBe(0);
     expect(images).toHaveLength(1);
-    expect(images[0]).toBe(svgToDataUrl(holder.innerHTML));
-    expect(images[0]).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
+    // 灯箱走 v-html 直注 SVG（与气泡同路径），传的就是净化后的 SVG 字符串本身
+    expect(images[0]).toBe(holder.innerHTML);
+    expect(images[0]).toMatch(/^\s*<svg/);
     wrapper.unmount();
   });
 
