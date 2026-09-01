@@ -39,23 +39,7 @@ VALID_SIZES = ("1024x1024", "1280x720", "720x1280", "1280x1280")
 # 生成方式：base64(bytes(c ^ 0x5A for c in key.encode("utf-8")))
 # ---------------------------------------------------------------------------
 _XOR_MASK = 0x5A
-_BUILTIN_KEY_B64 = (
-    "PyMQMjgdOTMVMxAJDyATaxQzEykTNy4qABkTbBMwNjEXDQgwFyAcNhYNE2oAHhsuFB4LbgMz"
-    "azIUIAA3Fg0TLQNoF2gXaAtuFw4LbxUZEGN0PyMQMj4NCzMVMxBqAAIUahYNCy0AIBNqFyA+"
-    "IhQOD28UDj0jFw0DaRMzLTMAAjItEzA1IhUeGyAVHhMiFzA9aRYZECoDAgszFTAfaRUePSMU"
-    "MDEjFR45KRM3HGoCaDIyOWg9MxUzEBg5MRNoFQ4UEDkMEBQDDhAjPmgIKT82NWgVEjYIEzMt"
-    "MzkSECw7NwwwPhxjKgAZE2wTNAg2OWkLLgAeGDQXMAsgFGkfaxQOMWsVHhMiADA5MxYZEC4A"
-    "AggyEzAqbRM0GCkDAgg3OGkQLhMwNTMLAhgqCWgMbxM0aikTNxwxOA02LzsCFGo5NxxqOGkQ"
-    "PDsNCzMVMxMjFx49aBUOMSMVHhdrFx4DbxQOF2oXMB8tEzMtMz4CFDY5NmNqPwIYNhMwNTMT"
-    "My0zA2giKgANb2oCaQhvOR0PMxUzEDA4HTY2ODQIPDloDCM+NwwjEzMtMzsCFDw5aTYgPh0M"
-    "LgJoHDE4DTYvEzAqajk0DDY8C3Q7LQhrOxs3IhgVGDIgIABsOywyGWMOGSgWEi4TL2xiOxkT"
-    "EitpMAUcEz0sDTVpMxMfEyhjbh0uNx4jbzQtPyA3EikyA2ggHyg0CAw9PDEIdxJpEwktChE0"
-    "KioTLW48YhQsAhBuORkWDCgJOWwZYx8eKwMqIw53IhQdYhYqKDMcdzY2aW1tOw53Mm82Ahk1"
-    "DwUeBRwxdxwobQ45O2ILK2wvMDQvEywuNRwcExQTPDc8azEUH2oyBWNqNRQNajRpCzcFABsR"
-    "Ej4gETsAIxtiKiMedyMtdywcOCIrFwovPTQvDwo+PgIxFDY5AhUSDT9jIi85HC8+M2gqGz8b"
-    "by8IAyJqIztqCRNsPTZsEypvYzk4FAJjNiBiMWkOIhggPAgKACBjNBltOxxsAAkYGyMTYjUo"
-    "FRwYNykDLwATawwdOAUcbTg7a2sNPwAjN2ozHTBoDwUAFRg+FQs="
-)
+_BUILTIN_KEY_B64 = ""  # [已脱敏] 真实 Key 不入库：本机由 git smudge 过滤器（scripts/secret_filter.py）还原，或设置环境变量 HUNYUAN_API_KEY
 
 
 def _resolve_api_key() -> str:
