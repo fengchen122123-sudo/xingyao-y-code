@@ -51,6 +51,9 @@ common_datas = [
     ('frontend/mobile-shim.js', 'frontend'),
     # 内置技能（plugin-creator 等）：首次启动释放到 ~/.ycode/skills，用户可自由开关
     ('skills', 'skills'),
+    # 内置插件（hunyuan_image 等）：core/plugin_loader.py 打包后从
+    # _MEIPASS/plugins 扫描加载，内置插件自动信任、无需用户确认
+    ('plugins', 'plugins'),
     # GUI 运行时用 WM_SETICON 设置窗口/任务栏图标，需随包携带 ico 文件
     ('assets/ycode.ico', 'assets'),
     # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）
@@ -59,7 +62,12 @@ common_datas = [
 
 common_binaries = litellm_binaries + tiktoken_ext_binaries
 
-common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken_ext_hiddenimports
+common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken_ext_hiddenimports + [
+    # core.hunyuan_image 只被内置插件 plugins/hunyuan_image 在运行时动态 import，
+    # PyInstaller 静态分析不可达，必须显式声明，否则打包后插件调用直接
+    # ModuleNotFoundError。
+    'core.hunyuan_image',
+]
 
 # tkinter/matplotlib/IPython/notebook 均未被本项目使用；PyQt5/PyQt6 是
 # pywebview 的可选 Qt 后端（本项目在 Windows 上固定走 edgechromium/winforms
