@@ -177,12 +177,21 @@ onUnmounted(() => document.removeEventListener('keydown', onKeydown));
   align-items: center;
   justify-content: center;
   user-select: none;
+  /* 底板修复：mermaid 渲染主题跟随界面主题（见 mermaidRenderer 的
+     isDarkTheme），浅色主题下边线等元素是深色描边且 SVG 背景透明，
+     直接贴纯黑遮罩会隐形（节点有浅色填充所以仍可见）。垫主题卡片
+     底色 + 细边框恢复对比度；暗色主题下为近黑卡片，视觉无突兀 */
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 24px;
+  box-shadow: 0 20px 80px rgba(0, 0, 0, 0.6);
 }
 .lb-svg :deep(svg) {
-  max-width: 90vw;
-  max-height: 88vh;
-  border-radius: 8px;
-  box-shadow: 0 20px 80px rgba(0, 0, 0, 0.6);
+  /* 底板自带 24px 内边距（box-sizing: border-box 已含在 90vw/88vh 内），
+     SVG 自身不再超视口；阴影上移到 .lb-svg，卡片成为完整视觉单元 */
+  max-width: 100%;
+  max-height: calc(88vh - 48px);
 }
 .lb-close {
   position: absolute;

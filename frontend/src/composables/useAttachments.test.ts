@@ -49,6 +49,7 @@ describe('useAttachments.uploadFiles', () => {
     vi.spyOn(store, 'getFilesInfo').mockResolvedValue([
       { path: 'C:/tmp/upload_a.jpg', name: 'a.jpg', ext: '.jpg', size: 3, ok: true },
     ]);
+    vi.spyOn(store, 'fetchAttachmentThumbnails').mockResolvedValue(new Map());
     const { uploadFiles, attachments } = useAttachments();
     await uploadFiles([makeFile('a.jpg', 3)]);
     expect(attachments.value.map(a => a.path)).toContain('C:/tmp/upload_a.jpg');
@@ -206,5 +207,42 @@ describe('useAttachments 会话草稿归属', () => {
     expect(report).toHaveBeenCalledTimes(1);
     draftA.unbindDrop();
     draftB.unbindDrop();
+  });
+});
+
+describe('useAttachments 图片附件缩略图', () => {
+  beforeEach(() => {
+    setActivePinia(createPinia());
+  });
+
+  it('addPaths 后图片路径被写入 thumb，并可通过 openAttachmentImage 打开灯箱', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'getFilesInfo').mockImplementation(async paths =>
+      paths.map(path => ({ path, name: path.split('/').pop()!, ext: '.png', size: 1, ok: true })));
+    vi.spyOn(store, 'fetchAttachmentThumbnails').mockResolvedValue(
+      new Map([['C:/tmp/a.png', 'http://x/u']]));
+    const { addPaths, attachments, openAttachmentImage } = useAttachments();
+
+    await addPaths(['C:/tmp/a.png', 'C:/tmp/b.txt']);
+    expect(attachments.value[0].thumb).toBe('http://x/u');
+    expect(attachments.value.find(a => a.path === 'C:/tmp/b.txt')?.thumb).toBeUndefined();
+
+    openAttachmentImage('C:/tmp/a.png');
+    expect(store.lightbox.show).toBe(true);
+    expect(store.lightbox.images).toEqual(['http://x/u']);
+    expect(store.lightbox.index).toBe(0);
+  });
+
+  it('fetchAttachmentThumbnails 抛错时附件仍正常加入（thumb 为 undefined，不抛出）', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'getFilesInfo').mockImplementation(async paths =>
+      paths.map(path => ({ path, name: path.split('/').pop()!, ext: '.png', size: 1, ok: true })));
+    vi.spyOn(store, 'fetchAttachmentThumbnails').mockRejectedValue(new Error('boom'));
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const { addPaths, attachments } = useAttachments();
+
+    await expect(addPaths(['C:/tmp/a.png'])).resolves.not.toThrow();
+    expect(attachments.value.map(a => a.path)).toEqual(['C:/tmp/a.png']);
+    expect(attachments.value[0].thumb).toBeUndefined();
   });
 });

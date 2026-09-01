@@ -55,3 +55,65 @@ def test_check_paths_kind_classifies_file_dir_missing():
         bridge = _make_bridge_with_workdir(tmp)
         res = bridge.check_paths_kind([f, d, os.path.join(tmp, "nope.md")])
         assert [r["kind"] for r in res] == ["file", "dir", "missing"]
+
+
+# ---------------------------------------------------------------------------
+# 预览工作区限制放宽：GLOBAL 放行 + 沙盒开关跟随 + 凭据文件永久拒绝
+# 通过 core.gui_path_policy 的注入口控制状态，绝不触碰用户真实 ~/.ycode
+# ---------------------------------------------------------------------------
+import core.gui_path_policy as gpp
+
+
+def _inject_ycode_data_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(gpp, "_ycode_dir_override", str(tmp_path / "ydata"))
+
+
+def test_preview_global_session_allows_file(tmp_path, monkeypatch):
+    _inject_ycode_data_dir(monkeypatch, tmp_path)
+    f = tmp_path / "hello.txt"
+    f.write_text("hello", encoding="utf-8")
+    bridge = _make_bridge_with_workdir("GLOBAL")
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is True
+    assert "hello" in res["content"]
+
+
+def test_preview_outside_workspace_allowed_when_sandbox_on(tmp_path, monkeypatch):
+    _inject_ycode_data_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(gpp, "_allow_outside_workspace", lambda: True)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    f = elsewhere / "note.txt"
+    f.write_text("outside", encoding="utf-8")
+    bridge = _make_bridge_with_workdir(str(workspace))
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is True
+
+
+def test_preview_outside_workspace_denied_when_sandbox_off(tmp_path, monkeypatch):
+    _inject_ycode_data_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(gpp, "_allow_outside_workspace", lambda: False)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    elsewhere = tmp_path / "elsewhere"
+    elsewhere.mkdir()
+    f = elsewhere / "note.txt"
+    f.write_text("outside", encoding="utf-8")
+    bridge = _make_bridge_with_workdir(str(workspace))
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is False
+    assert "工作区" in res["msg"]
+
+
+def test_preview_credential_config_always_denied(tmp_path, monkeypatch):
+    ydata = tmp_path / "ydata"
+    ydata.mkdir()
+    monkeypatch.setattr(gpp, "_ycode_dir_override", str(ydata))
+    monkeypatch.setattr(gpp, "_allow_outside_workspace", lambda: True)
+    f = ydata / "config.json"
+    f.write_text('{"api_key": "secret"}', encoding="utf-8")
+    bridge = _make_bridge_with_workdir("GLOBAL")
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is False

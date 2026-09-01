@@ -414,6 +414,7 @@ export interface PyWebViewAPI {
   open_folder_in_explorer(path: string): Promise<any>;
   pick_files(): Promise<any>;
   get_files_info(paths: string[]): Promise<any>;   save_clipboard_image(dataUrl: string): Promise<any>;
+  get_attachment_thumbnails(paths: string[]): Promise<any>;
    // 手机/平板端文件上传（WS RPC）
    upload_file(name: string, dataB64: string): Promise<any>;// 拖拽 drop 桥接：取回 Python 侧已存储的拖拽文件完整路径
   report_dropped_files(event: any): Promise<{ ok: boolean; paths?: string[] }>;

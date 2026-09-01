@@ -1,0 +1,87 @@
+%% Y-code Harness 执行流程图（Mermaid 源码，强制浅色主题）
+%% 基于 core/harness/*（状态机内核）+ core/llm.py（驱动循环）绘制。
+%% 共三张子图：① 主流程 ② Turn 状态机 ③ Step 状态机
+%% 每张图头部带 %%{init}%% 指令：无论宿主页面是深色还是浅色主题，
+%% 均强制 neutral 浅色配色与白色背景，避免深色预览环境下"黑底"。
+
+%% ============ ① 主流程：Turn/Step 驱动循环 ============
+%%{init: {"theme":"neutral","themeVariables":{"background":"#ffffff","primaryColor":"#e8f0fe","primaryTextColor":"#1f2328","primaryBorderColor":"#5b7aa8","lineColor":"#5b6470","secondaryColor":"#fff7dd","tertiaryColor":"#eef7ee","fontFamily":"Segoe UI, Microsoft YaHei, sans-serif","fontSize":"14px"}}}%%
+flowchart TD
+    A["入口 chat_with_model_events()<br/>core/llm.py:2161"] --> B["_chat_with_model_generator()<br/>core/llm.py:4104 驱动循环"]
+    B --> C{"persist 且 manager<br/>支持 Journal 存储?"}
+    C -- "否" --> C1["harness_runtime = None<br/>退回 legacy 持久化路径"] --> L
+    C -- "是" --> D["TurnRuntime.start()<br/>Turn: created → preparing<br/>Journal: create_turn + turn_created"]
+    D --> E["mark_running()<br/>Turn: preparing → running<br/>读取并冻结 max_turns（turn_limits）"]
+    E --> L["Step 循环<br/>for turn in range(max_turns)"]
+
+    L --> F["raise_if_cancelled()<br/>heartbeat + cancel_event 检查"]
+    F -- "已取消" --> X1["KeyboardInterrupt 路径"]
+    F --> G{"progress_guard<br/>should_abort()?<br/>连续 6 步无进展"}
+    G -- "是" --> G1["turn.fail('NoProgressError')<br/>Turn → failed<br/>发 turn_error，return"]
+    G -- "否" --> H["begin_step()<br/>Step: created → requesting<br/>Journal: create_step + step_created"]
+
+    H --> I["API 重试循环 attempt&lt;5 指数退避<br/>清洗消息 / DeepSeek 账本 /<br/>缓存指纹分类 / _apply_cache_control"]
+    I --> J["capture_request(envelope)<br/>REQUEST_CAPTURED 事件<br/>请求哈希+字节数落库 harness_steps"]
+    J --> K["线程池发起 Provider 流式请求"]
+    K --> M["mark_streaming()<br/>Step: requesting → streaming"]
+    M --> N["StreamAssembler 组装流<br/>thinking / 正文 / tool_calls"]
+    N --> O["mark_assistant_ready()<br/>Step: streaming → assistant_ready"]
+    O --> P{"有 tool_calls?"}
+
+    P -- "否（纯文本收尾）" --> Q["step.complete() → completed<br/>turn.complete() → completed<br/>commit_messages 落库，return"]
+
+    P -- "是" --> R["mark_tools_running()<br/>Step → tools_running"]
+    R --> S["ToolBatchExecutor<br/>tool_pipeline.py<br/>prepare → begin_batch → execute_batch<br/>RepeatCallGuard 抑制重复调用"]
+    S --> T["工具结果按 call_ordinal 排序<br/>拼 tool 消息，flush 落库"]
+    T --> U["mark_tools_committed()<br/>Step → tools_committed<br/>step.complete() → completed"]
+    U --> V["progress_guard.observe(记录)<br/>判定是否有真实进展"]
+    V --> L
+
+    L -.->|"循环耗尽 max_turns"| W["turn.fail('StepLimitExceeded')<br/>Turn → failed<br/>发 turn_error，return"]
+
+    X1 --> Y["salvage_persistence_on_cancel()<br/>打捞落库 + 回滚内存残影"]
+    Y --> Z["turn.cancel()<br/>Turn: running → cancelling → cancelled"]
+    N -.->|"任意异常"| AA["rollback_turn_messages()<br/>turn.fail(异常类名)<br/>Turn → failed"]
+
+    classDef failNode fill:#fde8e8,stroke:#b3423a,color:#7a2620;
+    classDef doneNode fill:#eef7ee,stroke:#3f7d44,color:#1e4620;
+    classDef loopNode fill:#fff7dd,stroke:#a8892f,color:#5c4a12;
+    classDef cancelNode fill:#f3e8fd,stroke:#7a4fa8,color:#3f2560;
+    class G1,W,AA failNode;
+    class Q doneNode;
+    class L loopNode;
+    class Y,Z cancelNode;
+
+%% ============ ② Turn 状态机 ============
+%%{init: {"theme":"neutral","themeVariables":{"background":"#ffffff","primaryColor":"#e8f0fe","primaryTextColor":"#1f2328","primaryBorderColor":"#5b7aa8","lineColor":"#5b6470","fontFamily":"Segoe UI, Microsoft YaHei, sans-serif","fontSize":"14px"}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> created: TurnRuntime.start()
+    created --> preparing
+    preparing --> running: mark_running()
+    preparing --> cancelling: cancel()
+    preparing --> failed: fail(code)
+    preparing --> interrupted: interrupt()
+    running --> completed: complete()
+    running --> cancelling: cancel()
+    running --> failed: fail(code)
+    running --> interrupted: interrupt()
+    cancelling --> cancelled
+    completed --> [*]
+    cancelled --> [*]
+    failed --> [*]
+    interrupted --> [*]
+
+%% ============ ③ Step 状态机 ============
+%%{init: {"theme":"neutral","themeVariables":{"background":"#ffffff","primaryColor":"#e8f0fe","primaryTextColor":"#1f2328","primaryBorderColor":"#5b7aa8","lineColor":"#5b6470","fontFamily":"Segoe UI, Microsoft YaHei, sans-serif","fontSize":"14px"}}}%%
+stateDiagram-v2
+    direction LR
+    [*] --> created: begin_step()
+    created --> requesting
+    requesting --> streaming: mark_streaming()
+    streaming --> assistant_ready: mark_assistant_ready()
+    assistant_ready --> tools_running: mark_tools_running()
+    assistant_ready --> completed: 纯文本收尾
+    tools_running --> tools_committed: mark_tools_committed()
+    tools_committed --> completed: step.complete()
+    requesting --> failed: fail(code)

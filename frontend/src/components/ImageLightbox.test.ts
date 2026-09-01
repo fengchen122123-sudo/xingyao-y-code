@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it } from 'vitest';
@@ -99,6 +100,28 @@ describe('ImageLightbox 缩放与拖动', () => {
     expect(store.lightbox.show).toBe(false);
     expect(wrapper.find('.lightbox-mask').exists()).toBe(false);
     wrapper.unmount();
+  });
+
+  it('SVG 分支垫主题底板（浅色主题边线在纯黑遮罩上隐形的修复）', async () => {
+    // 根因：mermaid 浅色主题边线为深色描边且 SVG 背景透明，气泡里有卡片
+    // 底色承托，灯箱里直接贴黑色遮罩导致边线隐形。底板样式被删除时本用例失败
+    const svg = '<svg xmlns="http://www.w3.org/2000/svg" width="10"><text>x</text></svg>';
+    const store = useAppStore();
+    store.openLightbox([svg], 0);
+    const wrapper = mount(ImageLightbox);
+
+    // 运行时断言：渲染出的 .lb-svg 容器存在（底板类挂在它身上）
+    expect(wrapper.find('.lb-svg').exists()).toBe(true);
+    wrapper.unmount();
+
+    // 样式断言：底板 background/border 必须存在于组件样式
+    //（jsdom 不做 CSSOM 计算，读 SFC 源码兜底防止样式被静默移除；
+    // vitest 默认以 frontend 为工作目录，import.meta.url 在 jsdom 下非
+    // file 协议，不能走 new URL 拼路径）
+    const source = readFileSync('src/components/ImageLightbox.vue', 'utf-8');
+    const css = source.slice(source.indexOf('<style'));
+    expect(css).toMatch(/\.lb-svg\s*{[^}]*background:\s*var\(--bg2\)/);
+    expect(css).toMatch(/\.lb-svg\s*{[^}]*border:\s*1px solid var\(--border\)/);
   });
 
   it('mermaid SVG 字符串走 v-html 直注分支（不绕 data URL + img）', async () => {
