@@ -40,7 +40,12 @@ from typing import Any
 _logger = logging.getLogger("ycode.plugins")
 
 # 内置插件目录（随 ycode 仓库发布）与用户插件目录（可覆盖内置同名插件）
-_BUILTIN_PLUGIN_DIR = Path(__file__).resolve().parent.parent / "plugins"
+def _builtin_plugin_dir() -> Path:
+    """内置插件源目录：打包后位于 _MEIPASS/plugins，开发态为仓库根 plugins/。"""
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        return Path(meipass) / "plugins"
+    return Path(__file__).resolve().parent.parent / "plugins"
 
 # 最近一次 load_and_register 的扫描结果（含禁用/失败/被覆盖的插件），
 # 供 /plugins 命令与诊断查询；每次扫描开头会整体重建。
@@ -346,7 +351,7 @@ def trust_plugin(name: str) -> tuple[bool, str]:
 
 def plugin_dirs() -> list[Path]:
     """返回插件扫描目录列表。用户目录在前，使其同名插件优先于内置。"""
-    return [_user_plugin_dir(), _BUILTIN_PLUGIN_DIR]
+    return [_user_plugin_dir(), _builtin_plugin_dir()]
 
 
 def import_sibling(plugin_file: str, module_name: str) -> Any:
