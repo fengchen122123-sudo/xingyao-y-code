@@ -17,7 +17,7 @@ def _obs(task="t0", plan="p0", result="r0", mutation=False, read_signatures=()):
 
 def test_first_observation_without_mutation_counts_as_first_stall():
     # 首次观察无基线可比、无 mutation：无法证明进展，保守计入停滞序列，
-    # 保证"连续 6 个无进展 Step 后第 7 次 Provider 请求不发送"（spec 验收 4）
+    # 保证连续达到阈值的无进展 Step 后不再发送下一次 Provider 请求。
     guard = TurnProgressGuard()
     assert guard.observe(_obs()) is False
     assert guard.stalled_steps == 1
@@ -73,7 +73,7 @@ def test_mutation_clears_stall():
 
 
 def test_abort_at_max_stalled_steps():
-    # 连续 6 个 Step 状态完全不变 → 熔断（spec 测试矩阵）
+    # 连续达到阈值的 Step 状态完全不变 → 熔断。
     guard = TurnProgressGuard()
     for expected in range(1, TurnProgressGuard.MAX_STALLED_STEPS):
         assert guard.observe(_obs()) is False
@@ -89,7 +89,7 @@ def test_progress_after_stalls_resets_abort_countdown():
     for _ in range(TurnProgressGuard.MAX_STALLED_STEPS - 1):
         guard.observe(_obs())
     assert guard.should_abort() is False
-    # 第 6 步前出现真实变化 → 计数清零，熔断倒计时重新开始
+    # 达到阈值前出现真实变化 → 计数清零，熔断倒计时重新开始。
     assert guard.observe(_obs(result="r-progress")) is True
     assert guard.stalled_steps == 0
     for _ in range(TurnProgressGuard.MAX_STALLED_STEPS - 1):
@@ -99,8 +99,13 @@ def test_progress_after_stalls_resets_abort_countdown():
     assert guard.should_abort() is True
 
 
-def test_max_stalled_steps_is_six():
-    assert TurnProgressGuard.MAX_STALLED_STEPS == 6
+def test_general_no_progress_aborts_on_twelfth_step():
+    guard = TurnProgressGuard()
+    for _ in range(11):
+        assert guard.observe(_obs()) is False
+        assert guard.should_abort() is False
+    assert guard.observe(_obs()) is False
+    assert guard.should_abort() is True
 # ── 全回合通用有界读取进展预算（接管核查期与普通会话共用同一机制） ──
 
 

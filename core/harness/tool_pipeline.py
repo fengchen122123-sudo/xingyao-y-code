@@ -483,10 +483,9 @@ def has_pending_plan(session_id):
     plan = get_default_plan_manager()
     if plan.session_id != str(session_id):
         return False
-    return any(
-        item.get("status") in {"pending", "in_progress"}
-        for item in plan.snapshot()
-    )
+    # Keep the gate active until every plan item is completed.  Failed,
+    # blocked, and cancelled items still require an explicit plan_retry.
+    return any(item.get("status") != "completed" for item in plan.snapshot())
 
 
 def _escape_control_chars_in_json_strings(text):
@@ -701,10 +700,12 @@ class ToolPipeline:
 
         plan = get_default_plan_manager()
         snapshot = plan.snapshot()
-        if not snapshot:
-            # 计划在同一回合内被清空（plan_write 成功标记了计划回合后又被清空）：
-            # 门禁失去意义，必须放行，否则主 Agent 陷入“没有计划项却被要求
-            # 提供 plan_item_id”的死锁（execute_command 全被拦截、无任何提示可跟）
+        if not snapshot or all(
+            item.get("status") == "completed" for item in snapshot
+        ):
+            # 计划在同一回合内被清空，或所有项都已完成时，门禁失去意义。
+            # completed 项不能 plan_retry，必须放行主 Agent 核查/补救错误完成；
+            # failed/blocked/cancelled 项仍保持门禁，通过 plan_retry 正规恢复。
             return None
         # 主 Agent scoped 接管放行：仅当存在归属当前回合的 active 接管项时，
         # 才允许主 Agent 直接调用任务工具继续该计划项；旧分支
