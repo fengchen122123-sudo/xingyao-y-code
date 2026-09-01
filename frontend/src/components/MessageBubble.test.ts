@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import MessageBubble from './MessageBubble.vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
+import { svgToDataUrl } from '../utils/mermaidRenderer';
 import type { ToolExecutionCall } from '../utils/toolTrace';
 
 
@@ -213,6 +214,50 @@ describe('MessageBubble', () => {
     await flushPromises();
 
     expect(wrapper.findAll('a[data-file-link]').length).toBe(1);
+    wrapper.unmount();
+  });
+
+  it('点击 mermaid 图打开灯箱：参数为单元素 data URL 数组', async () => {
+    const store = useAppStore();
+    const open = vi.spyOn(store, 'openLightbox');
+    const wrapper = mount(MessageBubble, {
+      props: { msg: assistantMessage({ content: '下面是流程图' }) },
+    });
+
+    // 模拟 mermaidRenderer.injectSvg 注入的净化后 SVG 容器（v-html 异步注入，
+    // 测试直接补 DOM，走同一个点击委托入口）
+    const holder = document.createElement('div');
+    holder.className = 'mermaid-svg';
+    holder.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="10"><text>节点</text></svg>';
+    wrapper.get('.md-body').element.appendChild(holder);
+
+    holder.querySelector('text')!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await wrapper.vm.$nextTick();
+
+    expect(open).toHaveBeenCalledTimes(1);
+    const [images, index] = open.mock.calls[0];
+    expect(index).toBe(0);
+    expect(images).toHaveLength(1);
+    expect(images[0]).toBe(svgToDataUrl(holder.innerHTML));
+    expect(images[0]).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
+    wrapper.unmount();
+  });
+
+  it('点击空的 mermaid 容器不进灯箱', async () => {
+    const store = useAppStore();
+    const open = vi.spyOn(store, 'openLightbox');
+    const wrapper = mount(MessageBubble, {
+      props: { msg: assistantMessage({ content: '下面是流程图' }) },
+    });
+
+    const holder = document.createElement('div');
+    holder.className = 'mermaid-svg';
+    wrapper.get('.md-body').element.appendChild(holder);
+
+    holder.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    await wrapper.vm.$nextTick();
+
+    expect(open).not.toHaveBeenCalled();
     wrapper.unmount();
   });
 });

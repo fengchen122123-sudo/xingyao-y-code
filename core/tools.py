@@ -1176,6 +1176,90 @@ def fetch_url(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
         return f"🚨 FetchURL 请求发生异常：{exc}"
 
 
+# fetch_image 专用：图片下载体积上限 10MB，分块累计超限立即中止，
+# 防止把内存/磁盘打爆
+IMAGE_MAX_BYTES = 10 * 1024 * 1024
+# Content-Type 白名单 → 文件扩展名。
+# 明确排除 image/svg+xml：SVG 可内嵌 <script>，GUI 渲染时有脚本注入风险
+_IMAGE_CONTENT_TYPES = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+}
+
+
+def fetch_image(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
+    """下载网页中的图片到本地并返回本地绝对路径。"""
+    try:
+        normalized_url = _validate_http_url(url)
+        # SSRF 防护与 fetch_url 一致：发起请求前校验主机与解析后的 IP
+        _check_ssrf_url(normalized_url)
+        timeout = float(timeout_seconds)
+        if not 1 <= timeout <= 60:
+            raise ValueError("timeout_seconds 必须在 1 到 60 秒之间")
+        # urlopen 本身不可中断，至少在发起请求前后检查取消
+        _raise_if_cancelled(cancel_event)
+        request = Request(
+            normalized_url,
+            headers=_build_browser_like_headers(),
+        )
+        with urlopen(request, timeout=timeout) as response:
+            headers = getattr(response, "headers", {})
+            get_header = getattr(headers, "get", None)
+            content_type = ""
+            if get_header is not None:
+                content_type = get_header("Content-Type", "") or get_header("content-type", "")
+            # 去掉 ; 后的参数（如 image/png; charset=binary）再匹配白名单
+            content_type = str(content_type).split(";", 1)[0].strip().lower()
+            extension = _IMAGE_CONTENT_TYPES.get(content_type)
+            if extension is None:
+                raise ValueError(
+                    f"不支持的内容类型 {content_type or '未知'}"
+                    "（仅支持 png/jpg/jpeg/gif/webp；svg 有脚本注入风险，已拒绝）"
+                )
+            status = int(getattr(response, "status", getattr(response, "code", 200)))
+            # 分块读取并累计体积，超过 10MB 立即中止（不落盘半成品文件）
+            data = bytearray()
+            while True:
+                _raise_if_cancelled(cancel_event)
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > IMAGE_MAX_BYTES:
+                    raise _ResponseTooLargeError(
+                        f"图片体积超过 {IMAGE_MAX_BYTES // (1024 * 1024)}MB 限制，已中止下载"
+                    )
+            _raise_if_cancelled(cancel_event)
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        filename = f"download_{timestamp}.{extension}"
+        target = Path.cwd() / filename
+        # 同秒重复/并发下载时避免互相覆盖
+        counter = 2
+        while target.exists():
+            filename = f"download_{timestamp}_{counter}.{extension}"
+            target = Path.cwd() / filename
+            counter += 1
+        target.write_bytes(bytes(data))
+        return (
+            f"HTTP {status} ({content_type})\n"
+            f"图片已下载到本地：{target}（{len(data)} 字节）\n"
+            f"GUI 会话中用 Markdown 图片语法 ![]({target}) 内嵌展示；CLI 终端直接给出该路径即可。"
+        )
+    except _ToolCancelledError:
+        return "🛑 操作已被用户取消。"
+    except SSRFBlockedError as exc:
+        return f"🚨 {exc}"
+    except _ResponseTooLargeError as exc:
+        return f"🚨 {exc}"
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        return f"🚨 FetchImage 请求失败：{_format_http_error(exc)}"
+    except Exception as exc:
+        return f"🚨 FetchImage 请求发生异常：{exc}"
+
+
 def _weather_value(value, default="未知"):
     if isinstance(value, list):
         value = value[0] if value else None
