@@ -118,7 +118,7 @@
 import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdown, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
-import { renderMermaidBlocks, svgToDataUrl } from '../utils/mermaidRenderer';
+import { renderMermaidBlocks } from '../utils/mermaidRenderer';
 import { toAbsoluteLocalPath } from '../utils/localPath';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
@@ -207,12 +207,13 @@ function onMdBodyClick(e: MouseEvent) {
   }
 
   // mermaid 图点击放大进灯箱（须先于 img 分支判断：图内不含 md-img，
-  // 两者天然互斥）。取的是当前 DOM 里 injectSvg 注入的已净化 SVG 字符串，
-  // 无新增注入面；流式重建 DOM 后点到的总是最新缓存内容，天然安全。
+  // 两者天然互斥）。传的是当前 DOM 里 injectSvg 注入的已净化 SVG 字符串，
+  // 灯箱用 v-html 直注（与气泡同一条渲染路径），不绕 data URL 二次解析；
+  // 流式重建 DOM 后点到的总是最新缓存内容，天然安全。
   const mermaidSvg = (e.target as HTMLElement).closest('.mermaid-svg');
   if (mermaidSvg) {
     const svg = mermaidSvg.innerHTML;
-    if (svg.trim()) store.openLightbox([svgToDataUrl(svg)], 0);
+    if (svg.trim()) store.openLightbox([svg], 0);
     return;
   }
 

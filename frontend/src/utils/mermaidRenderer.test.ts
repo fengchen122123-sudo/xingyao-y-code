@@ -2,7 +2,6 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import {
   renderMermaidBlocks,
   sanitizeSvg,
-  svgToDataUrl,
   __resetMermaidRendererForTest,
 } from './mermaidRenderer';
 
@@ -167,23 +166,5 @@ describe('sanitizeSvg', () => {
   it('解析失败或非 SVG 输入返回空串（走 error 降级）', () => {
     expect(sanitizeSvg('')).toBe('');
     expect(sanitizeSvg('not an svg')).toBe('');
-  });
-});
-
-describe('svgToDataUrl', () => {
-  it('输出 svg+xml data URL 前缀', () => {
-    expect(svgToDataUrl('<svg></svg>')).toMatch(/^data:image\/svg\+xml;charset=utf-8,/);
-  });
-
-  it('特殊字符经 encodeURIComponent 编码（引号、尖括号、空白）', () => {
-    const url = svgToDataUrl('<svg width="10"><text>a b</text></svg>');
-    expect(url).not.toContain('<');
-    expect(url).toContain(encodeURIComponent('<svg width="10">'));
-  });
-
-  it('含中文标签不抛异常且可解码还原（base64/btoa 的 Latin-1 陷阱回归）', () => {
-    const svg = '<svg><text>流程图节点</text></svg>';
-    const url = svgToDataUrl(svg);
-    expect(decodeURIComponent(url.slice('data:image/svg+xml;charset=utf-8,'.length))).toBe(svg);
   });
 });
