@@ -5,6 +5,10 @@ import type { AttachmentItem } from '../types/composer';
 
 export type { AttachmentItem } from '../types/composer';
 
+// 图片附件缩略图：可归档为受控媒体 URL 的扩展名白名单（与后端 MIME 白名单对齐）
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'webp', 'gif', 'bmp', 'avif']);
+function isImagePath(p: string): boolean { return IMAGE_EXTS.has(fileExt(p)); }
+
 // ------------------------------------------------------------------
 // 拖拽路径的等待者注册表（模块级，两个输入区共用）：
 // Python 侧 dom.on('drop') 收到完整路径后通过 window.__ycode_on_drop_paths 推送，
@@ -172,8 +176,20 @@ export function useAttachments() {
         size: info?.size ?? null,
       });
     }
+    // 图片附件缩略图：批量归档取受控媒体 URL 后补挂到已有附件项；
+    // 仅写 thumb 字段，其余逻辑不动（缩略图是增强能力，失败静默）
+    const imagePaths = paths.filter(isImagePath);
+    if (imagePaths.length) {
+      try {
+        const thumbs = await store.fetchAttachmentThumbnails(imagePaths);
+        if (thumbs.size) {
+          for (const a of target) {
+            if (!a.thumb && thumbs.has(a.path)) a.thumb = thumbs.get(a.path);
+          }
+        }
+      } catch { /* 缩略图失败静默，不影响附件 */ }
+    }
   }
-
   // 输入框粘贴事件：剪贴板中的图片落盘为临时文件后加入附件列表；
   // 没有图片时不拦截，走默认文本粘贴
   function handlePaste(e: ClipboardEvent) {
@@ -214,6 +230,14 @@ export function useAttachments() {
     target.splice(0, target.length);
   }
 
+  // 点击图片附件 chip：用现有灯箱打开当前附件中所有带缩略图的大图，定位到点击项
+  function openAttachmentImage(path: string) {
+    const urls = currentAttachments().map(a => a.thumb).filter((u): u is string => !!u);
+    if (!urls.length) return;
+    const target = currentAttachments();
+    const idx = target.filter(a => a.thumb).findIndex(a => a.path === path);
+    store.openLightbox(urls, Math.max(0, idx));
+  }
   // ------------------------------------------------------------------
   // 拖拽文件到输入框：复用 pywebview 的 DOM drop 桥拿到完整本地路径
   // ------------------------------------------------------------------
@@ -342,6 +366,6 @@ export function useAttachments() {
 
   return {
     attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste,
-    dragging, bindDrop, unbindDrop, addPaths, uploadFiles,
+    dragging, bindDrop, unbindDrop, addPaths, uploadFiles, openAttachmentImage,
   };
 }

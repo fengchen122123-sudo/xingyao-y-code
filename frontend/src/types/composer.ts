@@ -5,4 +5,6 @@ export interface AttachmentItem {
   size: number | null;
   // 拖拽后立即上屏的加载态：路径尚未从 Python 侧取回。
   loading?: boolean;
+  // 图片附件的受控媒体缩略图 URL，归档失败时缺省
+  thumb?: string;
 }

@@ -171,7 +171,6 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
-import hljs from 'highlight.js/lib/common';
 import { renderMarkdown } from '../utils/markdown';
 
 type TabType = 'plan' | 'tasks' | 'term' | 'files';
@@ -258,18 +257,47 @@ const renderedMarkdown = computed(() =>
   renderMarkdown((store.filePreview.content || '').replace(/\r\n/g, '\n'))
 );
 
+// highlight.js 体积大（lib/common 约 180 kB min）：懒加载，首次预览文件时才
+// 拉取独立 chunk，避免拖慢首屏主包。模块加载完成前/加载失败时先回退纯文本
+// 转义展示；hljs 模块 promise 永不 reject（失败归一为 null），加载完成后
+// content 变化会重算本 computed 补上高亮。
+type HljsModule = {
+  getLanguage: (name: string) => unknown;
+  highlight: (code: string, opts: { language: string; ignoreIllegals?: boolean }) => { value: string };
+};
+let hljsPromise: Promise<HljsModule | null> | null = null;
+function loadHljs(): Promise<HljsModule | null> {
+  if (!hljsPromise) {
+    hljsPromise = import('highlight.js/lib/common')
+      .then((mod) => ((mod as Record<string, unknown>).default ?? mod) as HljsModule)
+      .catch(() => null);
+  }
+  return hljsPromise;
+}
+// 加载完成后写入 ref：highlightedPreview computed 依赖它，加载完成自动重算补上高亮
+const hljsResolved = ref<HljsModule | null>(null);
+watch(() => [store.filePreview.path, store.filePreview.content], ([, content]) => {
+  if (!content) return;
+  void loadHljs().then((mod) => {
+    if (mod && hljsResolved.value !== mod) hljsResolved.value = mod;
+  });
+});
+
 const highlightedPreview = computed(() => {
   const content = store.filePreview.content || '';
   if (!content) return '';
-  let lang = previewExt.value;
-  if (lang && !hljs.getLanguage(lang)) {
-    lang = HLJS_EXT_ALIAS[lang] || '';
-  }
-  if (lang && hljs.getLanguage(lang)) {
-    try {
-      return hljs.highlight(content, { language: lang, ignoreIllegals: true }).value;
-    } catch {
-      // 高亮失败则退化为纯文本
+  const hljs = hljsResolved.value;
+  if (hljs) {
+    let lang = previewExt.value;
+    if (lang && !hljs.getLanguage(lang)) {
+      lang = HLJS_EXT_ALIAS[lang] || '';
+    }
+    if (lang && hljs.getLanguage(lang)) {
+      try {
+        return hljs.highlight(content, { language: lang, ignoreIllegals: true }).value;
+      } catch {
+        // 高亮失败则退化为纯文本
+      }
     }
   }
   return escapeHtml(content);
