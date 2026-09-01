@@ -380,6 +380,25 @@ def build_default_registry() -> ToolRegistry:
             activity_description="修改文件",
         ),
         ToolSpec(
+            name="fetch_image",
+            description="下载网页中的图片到本地并返回本地路径。仅当 fetch_url / search_news 结果中含与主题直接相关的图片、需要图文并茂展示时使用；广告/图标/头像等无关图片不要下载。成功后按界面形态展示：GUI 会话用 Markdown 图片语法 ![](本地路径) 内嵌（远程 URL 前端不渲染，必须下载成本地路径）；CLI 终端直接给出本地路径。仅支持 http/https，仅 png/jpg/jpeg/gif/webp，上限 10MB。",
+            input_schema=_schema({
+                "url": {"type": "string", "description": "完整的 http 或 https 图片地址"},
+                "timeout_seconds": {
+                    "type": "integer",
+                    "default": 20,
+                    "minimum": 1,
+                    "maximum": 60,
+                },
+            }, ["url"]),
+            execute=tools.fetch_image,
+            read_only=False,
+            mutates_files=True,
+            requires_permission=False,
+            cancellable=True,
+            activity_description="下载图片",
+        ),
+        ToolSpec(
             name="execute_command",
             description=(
                 "执行本地命令。前台执行默认 30 秒超时，可用 timeout_seconds 调整（上限 600 秒）。"
