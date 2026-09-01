@@ -3168,6 +3168,24 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 附件缩略图：批量归档图片并取受控媒体 URL；失败静默返回空 Map（增强能力）
+    async fetchAttachmentThumbnails(paths: string[]): Promise<Map<string, string>> {
+      const result = new Map<string, string>();
+      const api = this._api();
+      if (!api || !paths.length) return result;
+      try {
+        const res = await api.get_attachment_thumbnails(paths);
+        if (res && res.ok && Array.isArray(res.items)) {
+          for (const it of res.items) {
+            if (it && it.path && it.url) result.set(String(it.path), String(it.url));
+          }
+        }
+      } catch (err) {
+        console.error('获取附件缩略图失败:', err);
+      }
+      return result;
+    },
+
     // 保存剪贴板粘贴的图片，返回落盘后的文件路径（失败返回空串并 toast）
     async saveClipboardImage(dataUrl: string): Promise<string> {
       const api = this._api();

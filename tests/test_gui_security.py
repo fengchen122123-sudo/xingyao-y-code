@@ -132,3 +132,44 @@ def test_shutdown_blocks_new_background_summary_turns():
 
     assert bridge._active_turns == {}
     assert bridge._cancel_events == {}
+
+
+# ---------------------------------------------------------------------------
+# open_path 工作区限制放宽：GLOBAL 放行 + 凭据文件永久拒绝（沙盒开关跟随同
+# read_file_preview，由 core.gui_path_policy 统一裁决）
+# ---------------------------------------------------------------------------
+import core.gui_path_policy as gpp
+
+
+def test_open_path_global_session_allows_text_file(tmp_path, monkeypatch):
+    f = tmp_path / "note.txt"
+    f.write_text("hi", encoding="utf-8")
+    opened = []
+    monkeypatch.setattr("os.startfile", lambda path: opened.append(path), raising=False)
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._session_workdir = lambda session: "GLOBAL"
+
+    res = bridge.open_path(str(f))
+
+    assert res["ok"] is True
+    assert opened == [str(f.resolve())]
+
+
+def test_open_path_credential_config_denied(tmp_path, monkeypatch):
+    ydata = tmp_path / "ydata"
+    ydata.mkdir()
+    monkeypatch.setattr(gpp, "_ycode_dir_override", str(ydata))
+    monkeypatch.setattr(gpp, "_allow_outside_workspace", lambda: True)
+    f = ydata / "config.json"
+    f.write_text("{}", encoding="utf-8")
+    opened = []
+    monkeypatch.setattr("os.startfile", lambda path: opened.append(path), raising=False)
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._current_session = "session"
+    bridge._session_workdir = lambda session: "GLOBAL"
+
+    res = bridge.open_path(str(f))
+
+    assert res["ok"] is False
+    assert opened == []

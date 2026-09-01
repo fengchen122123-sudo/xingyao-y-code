@@ -1,7 +1,8 @@
 <template>
   <div v-if="items.length" class="attach-chips">
-    <div v-for="a in items" :key="a.path" class="attach-chip" :class="{ loading: a.loading }" :title="a.loading ? a.name + '（路径加载中…）' : a.path">
-      <span class="ac-icon">{{ extIcon(a.name) }}</span>
+    <div v-for="a in items" :key="a.path" class="attach-chip" :class="{ loading: a.loading, clickable: !!a.thumb }" :title="a.loading ? a.name + '（路径加载中…）' : a.path" @click="a.thumb && $emit('open', a.path)">
+      <img v-if="!a.loading && a.thumb" class="ac-thumb" :src="a.thumb" alt="" @error="onThumbError(a)" />
+      <span v-else class="ac-icon">{{ extIcon(a.name) }}</span>
       <span class="ac-text">
         <span class="ac-name">{{ a.name }}</span>
         <span class="ac-meta">{{ a.loading ? '加载中…' : (a.ext || 'file').toUpperCase() }}<template v-if="!a.loading && formatFileSize(a.size)"> {{ formatFileSize(a.size) }}</template></span>
@@ -20,7 +21,12 @@ import type { AttachmentItem } from '../composables/useAttachments';
 import { extIcon, formatFileSize } from '../utils/fileIcon';
 
 defineProps<{ items: AttachmentItem[] }>();
-defineEmits<{ (e: 'remove', path: string): void }>();
+defineEmits<{ (e: 'remove', path: string): void; (e: 'open', path: string): void }>();
+
+// 缩略图 URL 加载失败：回退显示 emoji 图标（thumb 清空后模板走 v-else 分支）
+function onThumbError(a: AttachmentItem) {
+  a.thumb = undefined;
+}
 </script>
 
 <style scoped>
@@ -44,6 +50,20 @@ defineEmits<{ (e: 'remove', path: string): void }>();
 }
 .attach-chip:hover {
   border-color: var(--text-faint);
+}
+.ac-thumb {
+  width: 40px;
+  height: 40px;
+  border-radius: 6px;
+  object-fit: cover;
+  flex-shrink: 0;
+  background: var(--bg3);
+}
+.attach-chip.clickable {
+  cursor: pointer;
+}
+.attach-chip.clickable:hover {
+  border-color: var(--accent);
 }
 .ac-icon {
   font-size: 17px;

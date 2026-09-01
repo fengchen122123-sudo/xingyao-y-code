@@ -44,7 +44,7 @@
 
     <div id="input-wrap">
       <div id="input-box" ref="inputBoxRef" :class="{ 'drop-hover': dragging }">
-        <AttachmentChips :items="attachments" @remove="removeAttachment" />
+        <AttachmentChips :items="attachments" @remove="removeAttachment" @open="openAttachmentImage" />
         <!-- / 斜杠命令 与 @ 文件引用的自动补全面板 -->
         <InputSuggest
           :items="suggestItems"
@@ -237,7 +237,7 @@ const ctxTooltip = computed(() => {
   return `${ctxPctLabel.value}（${formatTokenCount(used)} / ${formatTokenCount(win)}）· 剩余约 ${formatTokenCount(remain)}`;
 });
 
-const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths, uploadFiles } = useAttachments();
+const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths, uploadFiles, openAttachmentImage } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown: suggestKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
 // 输入框高度拖拽：最小=默认渲染高度，向上拖抬高、松手记忆，双击恢复
 const { textareaHeight, isResizing, onHandlePointerdown, resetHeight } = useComposerResize(() => textareaRef.value);

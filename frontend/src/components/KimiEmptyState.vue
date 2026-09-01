@@ -8,7 +8,7 @@
     </div>
 
     <div class="kimi-card" ref="kimiCardRef" :class="{ 'drop-hover': dragging }">
-      <AttachmentChips :items="attachments" @remove="removeAttachment" />
+      <AttachmentChips :items="attachments" @remove="removeAttachment" @open="openAttachmentImage" />
       <!-- / 斜杠命令 与 @ 文件引用的自动补全面板 -->
       <InputSuggest
         :items="suggestItems"
@@ -226,7 +226,7 @@ function closeComposerMenus() {
   showWorkdirDropdown.value = false;
 }
 
-const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, uploadFiles } = useAttachments();
+const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, uploadFiles, openAttachmentImage } = useAttachments();
 const { suggestItems, suggestIndex, detectToken, applySuggest, onKeydown, clearSuggest } = useSuggest(inputVal, textareaRef);
 
 // 输入卡片容器：拖拽文件进入时高亮提示，drop 由原生事件桥（pywebview）提供完整路径

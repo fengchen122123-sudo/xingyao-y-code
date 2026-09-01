@@ -384,7 +384,7 @@
             <div class="contact-qr-wrap" @click="enlargedQr = { src: qrcodeWechat, alt: '微信群二维码' }">
               <img :src="qrcodeWechat" alt="微信群二维码" class="contact-qr" data-test="contact-wechat-qr" />
             </div>
-            <p class="contact-expiry">该二维码 7 天内（9月1日前）有效</p>
+            <p class="contact-expiry">该二维码 7 天内（9月8日前）有效，过期后请重新获取</p>
           </section>
 
           <section class="contact-card">

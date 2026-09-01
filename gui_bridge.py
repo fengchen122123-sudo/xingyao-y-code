@@ -33,6 +33,7 @@ from core.agent_service import strip_context_suffix
 from core.turn_renderer import sanitize_protocol_text, sanitize_stream_text
 from core.media_refs import MEDIA_DISPLAY_ERROR_LABELS
 from core.media_server import media_server
+from core.media_store import archive_media_file
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
@@ -4747,10 +4748,13 @@ class ApiBridge:
 
     def read_file_preview(self, path: str) -> Dict[str, Any]:
         try:
+            from core.gui_path_policy import gui_path_access_allowed
+
             real_path = _resolve_real_path(path)
             workspace = self._session_workdir(self._current_session)
-            if workspace == "GLOBAL" or not _path_is_within(real_path, workspace):
-                return {"ok": False, "msg": "文件不在当前工作区内"}
+            allowed, deny_msg = gui_path_access_allowed(real_path, workspace, action="preview")
+            if not allowed:
+                return {"ok": False, "msg": deny_msg}
             if not os.path.isfile(real_path):
                 # 目录路径（模型常在回复中输出文件夹路径，点击预览属常见操作）
                 if os.path.isdir(real_path):
@@ -4777,10 +4781,13 @@ class ApiBridge:
 
     def open_path(self, path: str) -> Dict[str, Any]:
         try:
+            from core.gui_path_policy import gui_path_access_allowed
+
             real_path = _resolve_real_path(path)
             workspace = self._session_workdir(self._current_session)
-            if workspace == "GLOBAL" or not _path_is_within(real_path, workspace):
-                return {"ok": False, "msg": "路径不在当前工作区内"}
+            allowed, deny_msg = gui_path_access_allowed(real_path, workspace, action="open")
+            if not allowed:
+                return {"ok": False, "msg": deny_msg}
             if not os.path.exists(real_path):
                 return {"ok": False, "msg": "路径不存在"}
             if os.path.isfile(real_path) and os.path.splitext(real_path)[1].lower() in {
@@ -4881,6 +4888,37 @@ class ApiBridge:
         except Exception as e:
             logger.exception("save_clipboard_image 失败")
             return {"ok": False, "msg": str(e)}
+
+    def get_attachment_thumbnails(self, paths: List[str]) -> Dict[str, Any]:
+        """为输入框图片附件生成缩略图 URL（内容寻址媒体仓库归档）。
+
+        缩略图是增强能力：单项失败（文件不存在 / 非白名单格式 / 仓库异常 /
+        media 服务不可用）只影响该项，整体永远 ok=True 且不抛异常阻断前端。
+        """
+        out: List[Dict[str, Any]] = []
+        try:
+            clean = [p for p in (paths or []) if isinstance(p, str) and p.strip()]
+            for p in clean:
+                try:
+                    real = _resolve_real_path(str(p))
+                    item = archive_media_file(real)
+                    # media_server 未启动时 public_url 返回空串，跳过该项即可
+                    url = media_server.public_url(item["digest"], item["ext"])
+                    if url:
+                        out.append({
+                            "path": str(p),
+                            "url": url,
+                            "width": item.get("width"),
+                            "height": item.get("height"),
+                        })
+                except Exception:
+                    # 单项失败不冒泡：非图片格式、文件消失等都属正常场景
+                    logger.debug("附件缩略图归档失败: %s", p, exc_info=True)
+                    continue
+        except Exception:
+            # 兜底：任何意外都不允许缩略图逻辑影响发送主流程
+            logger.debug("get_attachment_thumbnails 整体异常", exc_info=True)
+        return {"ok": True, "items": out}
 
     def store_dropped_paths(self, paths: List[str]) -> None:
         """pywebview 原生 drop 事件回调存储的完整路径，供前端 drop 时查询。"""
