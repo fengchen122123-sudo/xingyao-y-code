@@ -17,6 +17,12 @@
   git config filter.ycode-secret.smudge "python scripts/secret_filter.py smudge"
   git add --renormalize core/hunyuan_image.py  # 用 clean 后的内容刷新暂存区
 
+Key 轮换（在 CloudBase 控制台重签并作废旧 Key 后执行；无需强推，历史里的
+旧 Key 随作废失效）——新 Key 不进入 git、不进入聊天记录，只落本机：
+
+  type 新key.txt | python scripts/secret_filter.py set-key
+  python scripts/secret_filter.py set-key --file 新key.txt
+
 安全边界（如实说明）：
 - 本方案只保证"今后的提交/推送"不含 Key；历史提交中已存在混淆形式的 Key。
   彻底清除须二选一：① 轮换 Key（推荐，CloudBase 控制台重签后运行 extract
@@ -25,11 +31,14 @@
 - 新克隆者 checkout 时会看到占位符版本；git 会提示 filter 未配置，属预期。
   需要 Key 时由项目所有者私发，或自行设置 HUNYUAN_API_KEY。
 """
+import base64
 import os
 import re
 import sys
 
 TARGET_NAME = "_BUILTIN_KEY_B64"
+# 与 core/hunyuan_image.py 保持一致：Key 以 XOR 0x5A + Base64 混淆存储
+_XOR_MASK = 0x5A
 SOURCE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            "core", "hunyuan_image.py")
 SECRET_FILE = os.path.join(os.path.expanduser("~"), ".ycode", "secrets",
@@ -79,6 +88,66 @@ def cmd_clean():
     return 0
 
 
+def _write_block_into_source(block):
+    """把（新）Key 块写入工作区 core/hunyuan_image.py（替换现有块或占位符）。"""
+    with open(SOURCE_FILE, "r", encoding="utf-8") as f:
+        text = f.read()
+    new_text, replaced = BLOCK_RE.subn(lambda _m: block, text, count=1)
+    if not replaced:
+        new_text, replaced = PLACEHOLDER_RE.subn(lambda _m: block, text, count=1)
+    if not replaced:
+        print("错误：源文件中未找到 Key 块或占位符。", file=sys.stderr)
+        return 1
+    with open(SOURCE_FILE, "w", encoding="utf-8") as f:
+        f.write(new_text)
+    return 0
+
+
+def cmd_set_key():
+    """轮换 Key：从 stdin 或 --file 读新 Key，更新本机密钥文件与工作区源文件。"""
+    args = sys.argv[2:]
+    if args:
+        if args[0] != "--file" or len(args) < 2:
+            print("用法: python scripts/secret_filter.py set-key [--file 路径]",
+                  file=sys.stderr)
+            return 2
+        try:
+            with open(args[1], "r", encoding="utf-8") as f:
+                key = "".join(f.read().split())
+        except OSError as exc:
+            print("错误：无法读取文件 %s：%s" % (args[1], exc), file=sys.stderr)
+            return 1
+    else:
+        key = "".join(sys.stdin.read().split())  # 粘贴常带换行/空格，全部去除
+    if not key:
+        print("错误：Key 为空。", file=sys.stderr)
+        return 1
+    try:
+        key.encode("ascii")
+    except UnicodeEncodeError:
+        print("错误：Key 含非 ASCII 字符。", file=sys.stderr)
+        return 1
+    encoded = base64.b64encode(
+        bytes(c ^ _XOR_MASK for c in key.encode("utf-8"))
+    ).decode("ascii")
+    lines = [encoded[i:i + 76] for i in range(0, len(encoded), 76)]
+    if len(lines) == 1:
+        block = '_BUILTIN_KEY_B64 = "%s"' % lines[0]
+    else:
+        block = "_BUILTIN_KEY_B64 = (\n%s\n)" % "\n".join(
+            '    "%s"' % ln for ln in lines
+        )
+    os.makedirs(os.path.dirname(SECRET_FILE), exist_ok=True)
+    with open(SECRET_FILE, "w", encoding="utf-8") as f:
+        f.write(block + "\n")
+    rc = _write_block_into_source(block)
+    if rc == 0:
+        print("已更新本机密钥文件:", SECRET_FILE)
+        print("已更新 core/hunyuan_image.py（本地完整；提交时 clean 过滤器仍自动脱敏）。")
+        print("请确认已在 CloudBase 控制台作废旧 Key。")
+    return rc
+
+
 def cmd_smudge():
     """仓库 → 工作区：占位符还原为真实 Key 块。幂等；无密钥文件时原样通过。"""
     text = sys.stdin.read()
@@ -97,10 +166,16 @@ def main():
     except AttributeError:
         pass
     action = sys.argv[1] if len(sys.argv) > 1 else ""
-    handlers = {"extract": cmd_extract, "clean": cmd_clean, "smudge": cmd_smudge}
+    handlers = {
+        "extract": cmd_extract,
+        "clean": cmd_clean,
+        "smudge": cmd_smudge,
+        "set-key": cmd_set_key,
+    }
     handler = handlers.get(action)
     if handler is None:
-        print("用法: python scripts/secret_filter.py extract|clean|smudge", file=sys.stderr)
+        print("用法: python scripts/secret_filter.py extract|clean|smudge|set-key",
+              file=sys.stderr)
         return 2
     return handler()
 
