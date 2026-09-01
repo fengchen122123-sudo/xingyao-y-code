@@ -101,3 +101,6 @@ flowchart.mmd
 flowchart.png
 docs/harness_execution_flow.html
 docs/harness_execution_flow.md
+
+# Node dependencies
+node_modules/
