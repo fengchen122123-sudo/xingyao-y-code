@@ -257,7 +257,14 @@ def test_invalid_startup_theme_keeps_config_bytes(tmp_path, monkeypatch):
     assert config_file.read_bytes() == before
 
 
-def test_startup_fragment_marks_only_active_theme_error():
+def test_startup_fragment_marks_only_active_theme_error(monkeypatch):
+    # fragment 是否带 os=win10 取决于系统版本，固定 Win11 保证跨 OS 可重复
+    monkeypatch.setattr(
+        gui_main.sys,
+        "getwindowsversion",
+        lambda: SimpleNamespace(build=22631),
+        raising=False,
+    )
     assert gui_main._build_gui_theme_fragment({
         "appearance": "light", "background": "#f4f4f1",
     }) == "theme=light&bg=f4f4f1"
@@ -266,6 +273,31 @@ def test_startup_fragment_marks_only_active_theme_error():
         "background": "#1a1a18",
         "error": {"code": "theme_not_found", "path": "gui_theme_id", "message": "missing"},
     }) == "theme=dark&bg=1a1a18&gui_theme_error=1"
+
+
+def test_startup_fragment_marks_win10_for_frontend_border(monkeypatch):
+    """Win10 无 DWMWA_BORDER_COLOR 可隐藏外框，前端据 os=win10 补 1px CSS 边框。"""
+    monkeypatch.setattr(
+        gui_main.sys,
+        "getwindowsversion",
+        lambda: SimpleNamespace(build=19045),
+        raising=False,
+    )
+    assert gui_main._build_gui_theme_fragment({
+        "appearance": "light", "background": "#f4f4f1",
+    }) == "theme=light&bg=f4f4f1&os=win10"
+
+
+def test_startup_fragment_has_no_os_marker_on_win11(monkeypatch):
+    monkeypatch.setattr(
+        gui_main.sys,
+        "getwindowsversion",
+        lambda: SimpleNamespace(build=22631),
+        raising=False,
+    )
+    assert gui_main._build_gui_theme_fragment({
+        "appearance": "light", "background": "#f4f4f1",
+    }) == "theme=light&bg=f4f4f1"
 
 
 def test_set_active_persist_failure_restores_native_titlebar(monkeypatch):
