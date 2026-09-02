@@ -266,7 +266,9 @@ def parse_user_input(text):
                     "type": "image_url",
                     "image_url": {
                         "url": f"data:{compressed.mime_type};base64,{encoded_string}"
-                    }
+                    },
+                    # 折叠占位符引用的原图来源路径；发往模型前由 _strip_media_and_merge 剥离
+                    "source_path": os.path.abspath(file_path),
                 })
             except Exception as e:
                 attached_msgs.append(f"⚠️ 读取图片失败 {file_path}: {e}")

@@ -48,6 +48,30 @@ import type {
   NativeTitlebarColorCapability,
   ThemeRegionId,
 } from '../themes/types';
+import {
+  RIGHT_PANEL_DEFAULT_WIDTH,
+  RIGHT_PANEL_MAX_WIDTH,
+  RIGHT_PANEL_MIN_WIDTH,
+  RIGHT_PANEL_WIDTH_KEY,
+  SIDEBAR_DEFAULT_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+  SIDEBAR_WIDTH_KEY,
+  computeRestoredWidth,
+} from '../composables/usePanelResize';
+
+/**
+ * 面板宽度启动恢复：读取 localStorage 中上次拖拽记忆的宽度，
+ * 非法/越界值经 computeRestoredWidth 夹取或回默认；存储不可用（隐私模式）
+ * 时静默回默认。视口上限夹取只在拖拽时发生，启动保持用户上次拖出的值。
+ */
+function storedPanelWidth(key: string, def: number, min: number, max: number): number {
+  try {
+    return computeRestoredWidth(localStorage.getItem(key), min, max) ?? def;
+  } catch {
+    return def;
+  }
+}
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
   // Pinia exposes state through Vue proxies, which structuredClone rejects.
@@ -397,6 +421,10 @@ export const useAppStore = defineStore('app', {
       typeof window.matchMedia === 'function' &&
       window.matchMedia('(max-width: 768px)').matches,
     rightPanelCollapsed: false,
+    // 桌面端左右面板宽度（px）：拖拽手柄实时更新，启动时从 localStorage 恢复；
+    // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
+    sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
+    rightPanelWidth: storedPanelWidth(RIGHT_PANEL_WIDTH_KEY, RIGHT_PANEL_DEFAULT_WIDTH, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
     themeLight: false,
     guiTheme: null as GuiTheme | null,
     savedGuiTheme: null as GuiTheme | null,
@@ -468,10 +496,13 @@ export const useAppStore = defineStore('app', {
     subpage: { show: false, type: 'skills' as SubpageType },
 
     // 文件预览弹窗（RightPanel 文件树点击文件时使用）
+    // kind=image 时正文渲染 dataUrl（base64 图片），否则渲染 content 文本
     filePreview: {
       show: false,
       path: '',
+      kind: 'text' as 'text' | 'image',
       content: '',
+      dataUrl: '',
       truncated: false,
       loading: false,
     },
@@ -3227,7 +3258,7 @@ export const useAppStore = defineStore('app', {
     },
 
     async openFilePreview(path: string) {
-      this.filePreview = { show: true, path, content: '', truncated: false, loading: true };
+      this.filePreview = { show: true, path, kind: 'text', content: '', dataUrl: '', truncated: false, loading: true };
       const api = this._api();
       if (!api) {
         this.filePreview.show = false;
@@ -3240,8 +3271,14 @@ export const useAppStore = defineStore('app', {
         const res = await api.read_file_preview(path);
         if (seq !== this.filePreviewReqSeq) return; // 期间又打开/关闭了预览，丢弃过期响应
         if (res && res.ok) {
-          this.filePreview.content = res.content || '';
-          this.filePreview.truncated = !!res.truncated;
+          if (res.kind === 'image') {
+            // 图片：base64 data URL 直接交 <img> 渲染
+            this.filePreview.kind = 'image';
+            this.filePreview.dataUrl = res.data_url || '';
+          } else {
+            this.filePreview.content = res.content || '';
+            this.filePreview.truncated = !!res.truncated;
+          }
           this.filePreview.loading = false;
         } else {
           this.filePreview.show = false;
@@ -3257,6 +3294,8 @@ export const useAppStore = defineStore('app', {
 
     closeFilePreview() {
       this.filePreview.show = false;
+      // 释放图片 base64（大图可达数 MB 字符串）
+      this.filePreview.dataUrl = '';
       // M27：关闭也使进行中的旧请求作废，响应返回时不再写回已关闭的弹窗
       this.filePreviewReqSeq++;
     },

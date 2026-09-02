@@ -1,5 +1,5 @@
 <template>
-  <div id="sidebar" data-theme-region="sidebar" :class="{ collapsed: store.sidebarCollapsed }">
+  <div id="sidebar" data-theme-region="sidebar" :class="{ collapsed: store.sidebarCollapsed }" :style="panelStyle">
     <div class="side-menu">
       <div class="menu-item" @click="newSession()">
         <span class="mi-ico">✎</span>
@@ -167,8 +167,19 @@ import { ref, computed } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import type { SessionGroup } from '../types/pywebview';
+import { useIsMobile } from '../composables/useViewport';
 
 const store = useAppStore();
+
+// 桌面端宽度由拖拽手柄写入 store，此处内联生效；折叠负 margin 跟随实际
+// 宽度。移动端（<=768px）不输出内联样式，布局交给 style.css 媒体查询。
+const isMobile = useIsMobile();
+const panelStyle = computed(() => {
+  if (isMobile.value) return {};
+  const style: Record<string, string> = { width: `${store.sidebarWidth}px` };
+  if (store.sidebarCollapsed) style.marginLeft = `-${store.sidebarWidth}px`;
+  return style;
+});
 
 const collapsedGroups = ref<Record<string, boolean>>({});
 const expandedGroups = ref<Record<string, boolean>>({});
