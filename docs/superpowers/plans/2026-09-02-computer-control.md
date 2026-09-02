@@ -16,20 +16,20 @@
 - `browser_control_enabled`、`computer_control_enabled` 默认均为 `false`；`computer_browser` 默认 `edge`，只接受 `edge|chrome`。
 - 开关与浏览器选择只在 GUI 系统设置页改变；CLI 不提供永久开关命令。
 - 开启前必须通过对应 preflight；失败不得写入 `true`。关闭必须先持久化 `false` 并递增 generation，再停止活动 run。
-- 用户开启后 Y-CODE 不逐动作询问权限；OpenAI Provider 强制 safety check 仍必须由用户明确继续或停止，禁止伪造确认。
+- 用户开启后 Y-CODE 不逐动作询问权限；OpenAI Provider 强制 safety check 不得绕过。只有当前官方 GA schema/SDK 明确提供确认字段且已有 byte-golden 时才允许“继续”，否则只允许显示状态和停止。
 - 浏览器始终使用 `%YCODE_DATA_DIR%/browser-profiles/{edge|chrome}` 的专用持久 profile；不得读取、复制或复用用户日常浏览器 profile。
-- Playwright 只启动系统 `msedge` 或 `chrome` channel，窗口可见，viewport 固定 `1440×900`，`device_scale_factor=1`；不得下载或静默改用 Playwright Chromium。
+- Playwright 只启动系统 `msedge` 或 `chrome` channel，窗口可见，viewport 固定 `1440×900`，`device_scale_factor=1`；不得下载或静默改用 Playwright Chromium。同步 Playwright、context 和 page 必须始终由同一个专用 worker 线程持有，所有调用经有界队列 marshal。
 - Windows backend 只支持交互式 Windows Default desktop，必须确认 Per-Monitor V2 DPI awareness；锁屏、UAC secure desktop、截图失败或 `SendInput` 拒绝均立即失败。
 - 模型能力必须显式配置：generic 要求 `supports_vision=true`、`supports_function_calling=true`、`computer_protocol=generic`；native 要求官方 OpenAI API、Responses 协议和 `computer_protocol=native_openai`。禁止按模型名猜测。
 - LAN 发起的 Turn 永远不获得电脑操控能力；LAN 只能查看状态和紧急停止，不能开启、暂停、恢复或启动。
 - 一个进程只有一个 `ComputerControlService` 活动租约；一个 run 固定一个 target；generic assistant Step 只允许一个电脑动作且不得与其他工具混用。OpenAI GA native 的 `actions[]` 按 Task 11 的可中断串行规则处理。
-- 全局停止键固定为 `Ctrl+Alt+Esc`；注册失败时两个能力都不可开启。停止必须释放所有按下的键和鼠标键。
+- 全局停止键固定为 `Ctrl+Alt+Esc`；任一开关开启期间持续注册，两个都关闭或进程退出才注销。注册失败时两个能力都不可用。停止必须释放所有按下的键和鼠标键。
 - 截图失败不得返回旧截图；浏览器失败不得改走桌面；native 解析失败不得改走 generic；非法配置不得自动纠正。
 - `computer_action` 是固定 Harness 保留工具，不进入普通 `ToolRegistry`，插件/MCP 同名必须明确拒绝。
 - 默认关闭时以下测试不得修改任何 expected/hash：`tests/test_prompt_byte_stability.py`、`tests/test_provider_payload_golden.py`、DeepSeek Prompt Ledger、Kimi/GLM 缓存/推理参数、token 统计。
 - `messages` 仍是正文唯一事实源；Harness Journal 只保存 ID、序号、时间、耗时、状态和哈希，不保存截图、输入文字、URL、Provider response id 或 safety 原文。
 - `evaluate_js` 仍只允许 `gui-js-dispatcher` 单消费者线程调用；backend/hotkey 线程只入现有事件队列。
-- 每个 Task 必须真实执行 RED → GREEN → 相关回归 → `git diff --check`；不得先写实现后补测试。
+- 每个 Task 必须真实执行 RED → GREEN → 相关回归 → `git diff --check` → `git status --short`；不得先写实现后补测试。新建未跟踪文件还必须执行本计划“新增文件空白检查”，不能把 `git diff --check` 当成对未跟踪文件的覆盖。
 - 本计划不授权 K3 执行 `git commit`、push、merge、发布或修改现有 golden；每个 Task 末尾只给出建议提交信息。
 
 ## File Map
@@ -43,7 +43,7 @@
 - `core/computer/capability.py`：Turn 起点的显式能力决策。
 - `core/computer/hotkey.py`：可注入的 `Ctrl+Alt+Esc` 注册与注销。
 - `core/computer/preview_server.py`：loopback 令牌预览服务与最近三图清理。
-- `core/computer/browser_backend.py`：Playwright persistent Edge/Chrome backend。
+- `core/computer/browser_backend.py`：专用 worker 线程独占 Playwright persistent Edge/Chrome backend。
 - `core/computer/win32_adapter.py`：DPI、desktop 检查、`SendInput` 和 foreground 摘要。
 - `core/computer/windows_backend.py`：Pillow 截图、缩放和物理坐标映射。
 - `core/computer/controller.py`：单租约状态机、串行动作、暂停/恢复/停止、事件与无进展判断。
@@ -67,6 +67,7 @@
 - `tests/test_computer_provider_openai.py`
 - `tests/test_computer_cli.py`
 - `tests/test_computer_privacy.py`
+- `tests/computer_fakes.py`：所有电脑控制测试共用的 fake hotkey、Playwright、Win32、截图和 Provider fixture；测试正文不得引用未定义 helper。
 - `frontend/src/components/ComputerControlBar.test.ts`
 - `frontend/src/components/ComputerControlPane.test.ts`
 
@@ -81,7 +82,8 @@
 - `core/harness/tool_pipeline.py`、`core/harness/request_envelope.py`、`core/harness/stream_assembler.py`：follow-up 消息、受控 built-in computer、原生事件。
 - `core/llm.py`：Turn 冻结 capability、双协议接缝、continuation、取消和持久化投影。
 - `core/command_shell.py`：扩展 system settings 聚合快照。
-- `core/command_handler.py`、`core/ui.py`：CLI 运行控制命令与主线程安全事件显示。
+- `main.py`：沿用现有斜杠命令分派、帮助表、CLI 状态显示和 prompt_toolkit 主线程事件入口；不得创建平行 command handler。
+- `core/memory.py`：让媒体检测/折叠同时支持 content 列表与带 `_computer_v1` 的完整消息 dict，并保持折叠幂等。
 - `gui_bridge.py`、`gui_main.py`：严格 setters、controller API、生命周期与小型事件转发。
 - `core/lan_server.py`：RPC 禁止列表和 `turn_source=lan` 后端标记。
 - `frontend/src/types/pywebview.d.ts`、`frontend/src/stores/appStore.ts`：设置、run、trace 类型和 reducer。
@@ -98,6 +100,7 @@ resolve_computer_capability(model: dict, provider: dict, settings: ComputerSetti
 parse_computer_action(payload: Mapping[str, object]) -> ComputerAction
 ComputerControlService.start_run(owner: ComputerOwner, capability: ComputerCapability, target: ComputerTarget | None = None) -> ComputerRunSnapshot
 ComputerControlService.execute(run_id: str, owner: ComputerOwner, action: ComputerAction) -> ComputerObservation
+ComputerControlService.complete_run(run_id: str, owner: ComputerOwner, retain_browser_session: bool = True) -> ComputerRunSnapshot
 ComputerControlService.pause(run_id: str, reason: str) -> ComputerRunSnapshot
 ComputerControlService.resume(run_id: str) -> ComputerRunSnapshot
 ComputerControlService.stop(run_id: str, reason: str) -> ComputerRunSnapshot
@@ -105,7 +108,11 @@ ComputerControlService.snapshot() -> ComputerRunSnapshot
 get_computer_control_service() -> ComputerControlService
 ```
 
-所有事件使用小 JSON；`computer_observation` 只带 tokenized URL 和摘要。所有时间只存在 UI snapshot/event，不进入 Provider 投影。
+所有事件使用小 JSON，并含 run 内严格递增 `event_seq`；`action_ordinal` 只表示动作顺序。`computer_observation` 只带 tokenized URL 和摘要。所有时间只存在 UI snapshot/event，不进入 Provider 投影。
+
+### 共享测试 fixture 契约
+
+`tests/computer_fakes.py` 必须在首次引用前创建，并由各测试显式 import。它统一导出 `FakeHotkeyApi`、`FakePlaywrightRuntime`、`FakeWin32Adapter`、`FakeComputerBackend`、`FakeController`、`fake_png_bytes(seed)`、`http_status(url)`、`use_temp_config(tmp_path, monkeypatch, values)`、`capture_responses_request(...)` 和 `read_text_surfaces(...)`。fixture 只能实现对应 Protocol 的最小确定性行为，禁止访问真实键鼠、真实浏览器、网络 Provider 或用户配置。后文旧式 `_png_bytes`、`_http_status`、`_use_config` 名称一律视为上述公开 helper 的笔误并在实现时不得出现；测试收集阶段必须证明没有 `NameError` 或缺失 fixture。
 
 ---
 
@@ -388,14 +395,14 @@ def test_explicit_invalid_config_is_rejected(tmp_path, monkeypatch, key, value):
 
 
 def test_enable_does_not_persist_when_preflight_fails(tmp_path, monkeypatch):
-    path = _use_config(tmp_path, monkeypatch, {})
+    path = use_temp_config(tmp_path, monkeypatch, {})
     with pytest.raises(ComputerControlError, match="热键"):
         set_browser_control_enabled(True, preflight=lambda: (_ for _ in ()).throw(RuntimeError("热键不可用")))
     assert "browser_control_enabled" not in json.loads(path.read_text(encoding="utf-8"))
 
 
 def test_disable_persists_and_increments_generation_before_stop(tmp_path, monkeypatch):
-    _use_config(tmp_path, monkeypatch, {"computer_control_enabled": True})
+    use_temp_config(tmp_path, monkeypatch, {"computer_control_enabled": True})
     before = get_settings_generation()
     snapshot = set_computer_control_enabled(False, preflight=lambda: None)
     assert snapshot.computer_control_enabled is False
@@ -419,7 +426,7 @@ COMPUTER_BROWSER_CONFIG_KEY = "computer_browser"
 DEFAULT_COMPUTER_BROWSER = "edge"
 ```
 
-使用 `shutil.which()` 和 Windows 明确安装路径探测 `msedge.exe`/`chrome.exe`，返回每个选项自己的 `available/executable/unavailable_reason`；禁止选择的浏览器不可用时切换到另一个。profile 路径通过 `config.YCODE_DIR / "browser-profiles" / browser` 计算并 `resolve()` 后确认仍在 `browser-profiles` 下。
+使用 `shutil.which()` 和 Windows 明确安装路径探测 `msedge.exe`/`chrome.exe`，返回每个选项自己的 `available/executable/unavailable_reason`；所选浏览器不可用时禁止切换到另一个。profile 路径通过 `Path(config.YCODE_DIR) / "browser-profiles" / browser` 计算并 `resolve()` 后确认仍在 `browser-profiles` 下。
 
 布尔读取逻辑必须精确：
 
@@ -441,6 +448,8 @@ def _read_bool(data: dict, key: str) -> bool:
 
 ```python
 computer = load_computer_settings()
+hotkey = get_emergency_hotkey_snapshot()  # core.computer.hotkey，惰性导入
+run = get_computer_control_service().snapshot()  # core.computer.controller，惰性导入
 return {
     # 保留全部现有键和值
     "browser_control_enabled": computer.browser_control_enabled,
@@ -449,13 +458,13 @@ return {
     "computer_browser_options": [option.to_dict() for option in computer.browser_options],
     "computer_profile_path": computer.profile_display_path,
     "computer_platform_supported": computer.platform_supported,
-    "computer_hotkey_available": computer.hotkey_available,
+    "computer_hotkey_available": hotkey.available,
     "computer_hotkey": "Ctrl+Alt+Esc",
-    "computer_run": computer.run_summary,
+    "computer_run": run.to_public_dict(),
 }
 ```
 
-不要把 browser profile 文件列表或真实 Cookie 状态放进快照。
+`ComputerSettingsSnapshot` 本身不得包含 `hotkey_available` 或 `run_summary`，`settings.py` 不导入 controller/hotkey。不要把 browser profile 文件列表或真实 Cookie 状态放进快照。
 
 - [ ] **Step 5: GREEN 与现有设置回归**
 
@@ -517,7 +526,7 @@ def test_lan_turn_is_always_disabled(enabled_settings):
 
 def test_native_requires_official_openai_responses(enabled_settings):
     model = {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "native_openai"}
-    provider = {"api_protocol": "openai", "base_url": "https://proxy.example/v1"}
+    provider = {"protocol": "openai", "base_url": "https://proxy.example/v1"}
     capability = resolve_computer_capability(model, provider, enabled_settings, "local")
     assert capability.error_code == "computer_protocol_mismatch"
 ```
@@ -617,10 +626,10 @@ def test_preview_server_requires_token_and_keeps_only_three(tmp_path):
     server = ComputerPreviewServer(tmp_path)
     base = server.start()
     try:
-        urls = [server.publish("run-a", _png_bytes(i)) for i in range(4)]
-        assert _http_status(urls[-1]) == 200
-        assert _http_status(urls[-1].replace(server.token, "wrong")) == 404
-        assert _http_status(urls[0]) == 404
+        urls = [server.publish("run-a", fake_png_bytes(i)) for i in range(4)]
+        assert http_status(urls[-1]) == 200
+        assert http_status(urls[-1].replace(server.token, "wrong")) == 404
+        assert http_status(urls[0]) == 404
         assert len(list(tmp_path.rglob("*.png"))) == 3
     finally:
         server.stop()
@@ -635,7 +644,7 @@ Expected: 两个模块不存在。
 
 - [ ] **Step 3: 实现热键生命周期**
 
-Windows 实现使用独立消息线程注册 `MOD_CONTROL|MOD_ALT` + `VK_ESCAPE`，只在收到对应 `WM_HOTKEY` 后调用 `on_stop`。`close()` 发送退出消息并 `UnregisterHotKey`，允许重复调用。回调只发 stop 请求，不直接碰 GUI、prompt_toolkit 或 Provider 流。
+Windows 实现使用独立消息线程注册 `MOD_CONTROL|MOD_ALT` + `VK_ESCAPE`，只在收到对应 `WM_HOTKEY` 后调用 `on_stop`。任一设置开关为 true 时由应用生命周期持续持有该实例；两个开关均为 false 或应用退出时才 `close()`。应用启动读到已开启配置时立即注册，失败则 capability preflight 返回 `computer_hotkey_unavailable`，但不静默改写配置。`close()` 发送退出消息并 `UnregisterHotKey`，允许重复调用。回调只发 stop 请求，不直接碰 GUI、prompt_toolkit 或 Provider 流。
 
 必须提供可注入 API；默认 API 只在 `sys.platform == "win32"` 构造，其他平台抛 `computer_unsupported_os`。
 
@@ -675,7 +684,7 @@ Suggested commit after explicit authorization: `feat(computer): add emergency st
 
 **Interfaces:**
 - Consumes: `ComputerAction`, `ComputerObservation`, `get_browser_profile_dir()`
-- Produces: `BrowserComputerBackend(browser: str, profile_dir: Path, playwright_factory=sync_playwright)`
+- Produces: `BrowserComputerBackend(browser: str, profile_dir: Path, playwright_factory=sync_playwright)`，内部专用 worker 线程和有界命令队列
 - Produces: active page lease and browser-only action execution
 
 - [ ] **Step 1: 写 fake Playwright 合约测试**
@@ -712,7 +721,7 @@ def test_closed_active_page_fails_instead_of_reopening(backend):
     assert raised.value.code == "computer_browser_closed"
 ```
 
-另测 popup 成为 active page、PNG bytes/viewport、navigate 只接受已校验 URL、back/forward/reload、坐标边界和 `close()` 幂等。
+另测所有 fake Playwright 调用的 thread id 与创建 runtime 的 thread id 完全相同、并发调用仍由 worker 串行、worker 启动失败/命令超时明确失败、零 page 时只创建一个 `about:blank`、popup 成为 active page、PNG bytes/viewport、navigate 只接受已校验 URL、back/forward/reload、坐标边界和 `close()` 幂等。
 
 - [ ] **Step 2: 运行确认 RED**
 
@@ -722,13 +731,13 @@ Expected: backend 模块不存在。
 
 - [ ] **Step 3: 实现懒加载、profile 锁与页面生命周期**
 
-构造函数不得导入或启动 Playwright；`start()` 时创建 profile，获取进程内 profile 锁，再 `launch_persistent_context`。browser/channel 映射固定：
+构造函数不得导入或启动 Playwright；`start()` 创建专用 worker 线程，worker 内创建 profile、获取进程内 profile 锁并调用 `sync_playwright().start()` 与 `launch_persistent_context`。外部 start/observe/execute/complete/close 全部向有界队列提交命令，只有 worker 接触 runtime/context/page。browser/channel 映射固定：
 
 ```python
 _CHANNELS = {"edge": "msedge", "chrome": "chrome"}
 ```
 
-context 的 `page` 事件把最后获得焦点的可见 page 设为 active；context/page close 立即把 backend 标记 closed，后续动作抛 `computer_browser_closed`。profile 锁冲突抛 `computer_profile_locked`，不杀其他进程。
+context 的 `page` 事件也在 worker 内处理，把最后获得焦点的可见 page 设为 active；初始 pages 为空时只创建一个 `about:blank`。context/page close 立即把 backend 标记 closed，后续动作抛 `computer_browser_closed`。profile 锁冲突抛 `computer_profile_locked`，不杀其他进程。任何调用线程都不得直接重建或关闭 Playwright 对象。
 
 - [ ] **Step 4: 实现动作与稳定观察**
 

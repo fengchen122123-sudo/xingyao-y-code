@@ -150,14 +150,15 @@ DeepSeek、Kimi、GLM 不会自动理解 OpenAI 的私有原生事件。伪造�
 core/computer/
   models.py              值对象、枚举、状态转换、错误码
   settings.py            配置键、严格校验、浏览器探测、设置快照
-  capabilities.py        模型能力契约与协议选择
+  capability.py          模型能力契约与协议选择
   actions.py             模型动作解析、坐标和参数校验
   controller.py          进程级唯一会话、租约、暂停、停止、事件
-  browser_backend.py     Playwright persistent context 与页面级动作
+  browser_backend.py     专用 worker 线程持有 Playwright persistent context 与页面级动作
   windows_backend.py     Windows 截屏、坐标转换、SendInput
   preview_server.py      本机令牌化最新截图预览服务
   hotkey.py              Ctrl+Alt+Esc 注册、消息循环、注销
-  protocol.py            原生/通用 Provider 投影，不发请求
+  provider_generic.py    通用 function tool、观察消息与动态提示投影
+  provider_openai.py     原生 Responses computer 事件、续传与持久化投影
   tool_adapter.py        computer_action 的固定 Harness 适配器
 ```
 
@@ -166,8 +167,8 @@ core/computer/
 1. `models.py` 不导入 GUI、CLI、LiteLLM、Playwright 或全局配置。
 2. 两个 backend 只实现 `ComputerBackend` 接口，不接触 Provider 消息。
 3. `controller.py` 只接收规范化动作并返回规范化观察，不读取模型名称。
-4. `capabilities.py` 只读取显式模型配置并返回协议决策，不探测 API 行为。
-5. `protocol.py` 只负责 Provider 消息和统一动作/观察之间的转换，不执行鼠标或键盘。
+4. `capability.py` 只读取显式模型配置并返回协议决策，不探测 API 行为。
+5. `provider_generic.py` 和 `provider_openai.py` 只负责 Provider 消息和统一动作/观察之间的转换，不执行鼠标或键盘。
 6. GUI/CLI 只调用 controller 的公开方法并消费事件，不直接引用 Playwright 或 Win32。
 7. `core/llm.py` 保留兼容入口，只在请求构造、流事件标准化、工具执行接缝和持久化投影处调用新模块。
 8. 插件和 MCP 不能注册同名 `computer_action`；该名称由固定 Harness 保留。
@@ -182,11 +183,13 @@ ComputerTarget = Literal["browser", "desktop"]
 BrowserKind = Literal["edge", "chrome"]
 ComputerRunStatus = Literal[
     "idle", "starting", "running", "paused", "waiting_for_user",
-    "provider_safety_required", "stopping", "stopped", "failed"
+    "provider_safety_required", "completing", "completed",
+    "stopping", "stopped", "failed"
 ]
 ComputerActionKind = Literal[
     "observe", "click", "double_click", "move", "drag", "scroll",
-    "type_text", "keypress", "wait", "navigate", "back", "forward", "reload"
+    "type_text", "keypress", "wait", "navigate", "back", "forward", "reload",
+    "request_user_takeover"
 ]
 ```
 
@@ -197,11 +200,11 @@ ComputerActionKind = Literal[
 - `kind`；
 - `target`；
 - 可选截图坐标 `x`、`y`；
-- 可选拖拽终点 `end_x`、`end_y`；
+- 可选拖拽路径 `path`，由至少 2 个、至多 256 个整数坐标点组成；generic 兼容输入可使用起点和终点，解析后必须立即规范化为 `path`；
 - 鼠标键 `left | right | middle`；
 - 滚动量 `delta_x`、`delta_y`；
 - 输入文本 `text`；
-- 组合键数组 `keys`；
+- 组合键数组 `keys`，既可用于键盘组合键，也可作为受支持鼠标动作的 modifier；
 - 导航地址 `url`；
 - 等待毫秒 `duration_ms`。
 
@@ -209,12 +212,13 @@ ComputerActionKind = Literal[
 
 - `observe` 不接受额外动作字段；
 - 点击、移动必须同时提供整数 `x/y`；
-- 拖拽必须同时提供起点和终点；
+- 拖拽必须提供合法 `path`，相邻重复点可保留但路径不得为空；
 - 文本最大 8000 个 Unicode code point；
 - `wait` 范围为 100–10000 ms；
 - 组合键最多 8 个键，只允许登记过的键名；
 - URL 只接受 `http://` 或 `https://`；
 - `navigate/back/forward/reload` 只允许浏览器 target；
+- `request_user_takeover` 只接受稳定 `reason_code`，不得携带凭据、验证码或输入框正文；
 - 任何未知字段、缺失字段、布尔值伪装整数、NaN 或越界值均明确拒绝。
 
 ### 7.3 `ComputerObservation`
@@ -275,12 +279,13 @@ UI/CLI 快照包含：
 - `computer_browser` 只接受 `edge` 或 `chrome`；缺失时为 `edge`。
 - 浏览器选择在活动会话中不可修改，必须先停止当前操控。
 - 开启开关前执行对应 preflight；失败则不写入 `true`。
+- 只要任一开关为 `true`，`Ctrl+Alt+Esc` hotkey 必须由进程持续持有；设置保存时“注册成功后立即注销”只能作为探测，不能满足运行期安全要求。应用启动读取到已开启配置时先注册热键，注册失败则电脑能力不可用并显示明确错误，但不得静默改写用户配置。两个开关都关闭或应用退出时才注销。
 - 关闭开关先原子写入 `false` 并递增内存设置 generation，再通知 controller 停止；因此即使 backend 清理较慢，也不会接受新动作。
 - 运行中的 Turn 冻结启用能力和浏览器选择。开启只影响后续 Turn；关闭是例外，必须立即取消当前 Turn 的操控。
 
 ### 8.2 系统设置快照
 
-现有 `get_system_settings()` 增加：
+现有 `get_system_settings()` 作为聚合边界增加：
 
 - 三个配置值；
 - `computer_platform_supported`；
@@ -290,6 +295,8 @@ UI/CLI 快照包含：
 - 当前控制器状态摘要。
 
 快照不得包含 profile 文件清单、Cookie 或凭据。
+
+`core/computer/settings.py` 只能返回静态 `ComputerSettingsSnapshot`（配置值、generation、浏览器探测和 profile 展示路径），不得导入 controller 或 hotkey。`core/command_shell.py:get_system_settings()` 通过惰性导入聚合静态设置、hotkey snapshot 和 controller snapshot，避免设置模块与运行时模块形成循环依赖。
 
 ### 8.3 设置页布局
 
@@ -399,7 +406,7 @@ UI/CLI 快照包含：
 
 随后追加一条自动生成的 user 多模态消息：一段固定格式观察说明 + 最新 `image_url` PNG。该消息进入正常消息和媒体维护链路，使 Chat Completions、Anthropic 和 Responses function calling 路由都能在下一 Step 看见画面。
 
-旧截图由现有 DB 媒体折叠事务处理；请求路径不得临时改写历史。电脑观察私有字段在发 Provider 前剥离。
+旧截图由现有 DB 媒体折叠事务处理；请求路径不得临时改写历史。为保留 `_computer_v1` 元数据，`core/memory.py` 的媒体检测和折叠必须同时识别 content 列表与包含 `content` 列表的完整消息 dict；折叠只替换媒体块，不删除私有元数据。必须用幂等测试证明旧截图不会无限累积。电脑观察私有字段在发 Provider 前剥离。
 
 ### 10.3 动态提示词
 
@@ -423,14 +430,13 @@ Responses 事件标准化层增加对以下语义的严格支持：
 - `computer_call` output item；
 - 完整、非空的 `actions[]`；
 - call id；
-- pending safety checks；
 - completed / incomplete / failed。
 
 缺少 response id、call id、`actions[]`，或任一动作字段冲突时，当前 Step 以 Provider 协议错误失败。不得改走通用协议。GA `screenshot` action 映射为统一 `observe`。
 
-GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是 generic“一次一个 function call”规则的显式例外。Y-CODE 必须按原顺序串行执行；每个动作前重新检查暂停、停止、owner、settings generation 和安全桌面，每个动作均产生脱敏 trace。任一动作失败或用户停止后，后续动作全部不执行；整批成功后只捕获一次新截图并发送 `computer_call_output`。不得并行动作，也不得把整批当成不可中断的单次 backend 调用。
+GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是 generic“一次一个 function call”规则的显式例外。Y-CODE 必须按原顺序串行执行；每个动作前重新检查暂停、停止、owner、settings generation 和安全桌面，每个动作均捕获本地 after observation、执行无进展判断并产生脱敏 trace。任一动作失败或用户停止后，后续动作全部不执行；整批成功后只把最后一次 observation 的截图发送为一个 `computer_call_output`。这里“只发送最后一图”不等于“中间动作不观察”。不得并行动作，也不得把整批当成不可中断的单次 backend 调用。
 
-当两个 target 同时可用但尚未通过 `computer_select_target` 建立租约时，原生 computer call 不得执行；这属于明确的动作前置条件错误，不使用提示词关键词猜测用户想控制哪个 backend。
+当两个 target 同时可用时，原生请求固定设置 `parallel_tool_calls=false`。`computer_select_target` 必须由固定 adapter 在独立 Step 中执行并建立 target 租约；同一个 Provider response 同时出现 selector 和 `computer_call` 时以 `provider_protocol_error` 失败，绝不按 output 数组顺序猜测。尚未建立租约时，原生 computer call 不得执行。
 
 ### 11.3 续传
 
@@ -439,7 +445,7 @@ GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是
 1. 首次请求发送正常 Y-CODE 会话历史和 computer tool。
 2. Provider 返回含有序 `actions[]` 的 computer call 和 response id。
 3. 本地逐个串行执行统一动作，整批成功后生成截图。
-4. 下一 Step 只用上一 response id 和新的 `computer_call_output` 继续。
+4. 下一 Step 不重发完整消息历史，但必须重新发送同一 model、同序 tools、必要 instructions/options、上一 response id 和新的 `computer_call_output`；`instructions` 不依赖 `previous_response_id` 自动继承。
 5. Provider 返回最终文本后结束原生 continuation。
 
 如果 Provider 未返回可用 response id，立即失败；禁止退回“重发全部截图历史”或通用 function tool。
@@ -458,13 +464,13 @@ GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是
 
 ### 11.5 Provider 强制安全检查
 
-“开启后无需逐动作授权”只取消 Y-CODE 自身的逐动作权限询问，不能伪造或绕过 Provider 强制 safety check。若 OpenAI 返回必须由用户确认的 pending safety checks：
+“开启后无需逐动作授权”只取消 Y-CODE 自身的逐动作权限询问，不能伪造或绕过 Provider 强制 safety check。截至本设计复核时，GA Computer use 指南没有定义 `acknowledged_checks` 请求契约，而 beta Responses 类型仍暴露 `pending_safety_checks`。因此实现不得凭旧 preview 示例发明字段：
 
-- controller 进入 `provider_safety_required`；
-- 不执行对应动作；
-- GUI/CLI 显示 Provider 原因；
-- 用户只能明确继续或停止；
-- 未确认不得发送虚假的 acknowledged safety checks。
+- 原生解析器可以保存 Provider 返回的稳定 check id/code，但不得保存原文到 Journal；
+- 只有在当前官方 GA 请求 schema 或所用 SDK 类型明确提供确认字段时，才允许构造对应确认 payload，并为该精确形状增加 byte-golden；
+- 若 Provider 返回强制检查但当前客户端没有已验证的确认契约，controller 进入 `provider_safety_required`，不执行动作，并明确提示用户停止或升级客户端；
+- GUI 和 CLI 都必须提供查看状态与停止入口；只有在确认 payload 已有官方契约并实现 byte-golden 后，才显示“继续”入口；
+- 未确认不得发送虚假的 acknowledged safety checks，也不得回退 generic 绕过。
 
 这是外部协议强制边界，不得以“完全访问”配置绕过。
 
@@ -473,6 +479,8 @@ GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是
 ### 12.1 技术选型
 
 使用 Python Playwright 的 headed persistent context，并直接调用系统安装的 Edge/Chrome channel。不得下载或启动 Playwright 自带 Chromium 作为静默替代。
+
+同步 Playwright 对象具有线程归属。`BrowserComputerBackend` 必须创建一个专用 worker 线程，该线程独占 `sync_playwright`、browser context、page 和 popup 事件；start、observe、execute、complete、close 全部通过有界命令队列 marshal 到该线程。外部 RLock 只用于保护 backend 状态，不能代替线程归属。worker 未就绪、超时或退出时明确失败，不在调用线程重建 Playwright 对象。
 
 原因：
 
@@ -490,7 +498,7 @@ GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是
 %YCODE_DATA_DIR%/browser-profiles/chrome/
 ```
 
-未设置 `YCODE_DATA_DIR` 时沿用 `config.YCODE_DIR`。规则：
+未设置 `YCODE_DATA_DIR` 时沿用 `config.YCODE_DIR`。实现必须使用 `Path(config.YCODE_DIR) / "browser-profiles" / browser`；当前 `config.YCODE_DIR` 是字符串，禁止直接对字符串使用 `/`。规则：
 
 - 目录只由当前用户创建和使用；
 - 不从默认浏览器目录复制文件；
@@ -509,13 +517,14 @@ GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是
 - URL 导航、前进、后退和刷新由显式 browser action 完成。
 - 新 popup/page 出现时，以最后获得焦点的可见 page 作为 active page，并发出页面变化事件。
 - 页面或 context 被用户关闭时，当前动作失败并停止会话，不自动重开。
+- persistent context 启动后若没有 page，创建且只创建一个 `about:blank`；多个 page 时按最后获得焦点的可见 page 选择 active page。
 
 ### 12.4 登录与用户接管
 
 遇到登录、验证码或凭据输入时：
 
-1. 模型通过正常回复请求用户在专用浏览器中操作；
-2. controller 进入 `waiting_for_user` 或 paused；
+1. 模型调用固定 `request_user_takeover(reason_code=login_required|captcha_required|credential_required)` 动作；普通助手文字不得触发状态转换；
+2. controller 进入 `waiting_for_user`，保留 run 和专用浏览器，但释放当前动作执行权；
 3. 用户完成后从 GUI/CLI 选择恢复；
 4. 恢复后先 `observe`，不得直接继续旧坐标动作。
 
@@ -525,7 +534,7 @@ Y-CODE 不读取输入框内容、浏览器密码库或 Cookie 值，也不把 p
 
 ### 13.1 截图
 
-使用 Pillow `ImageGrab.grab(all_screens=True)` 捕获虚拟桌面。观察必须记录：
+使用 Pillow `ImageGrab.grab(all_screens=True)` 捕获虚拟桌面，并由 Win32 adapter 使用 `GetSystemMetrics(SM_XVIRTUALSCREEN/SM_YVIRTUALSCREEN/SM_CXVIRTUALSCREEN/SM_CYVIRTUALSCREEN)` 取得真实虚拟屏幕矩形。Pillow 图像尺寸必须与 Win32 宽高一致，否则 preflight/observe 失败。观察必须记录：
 
 - 虚拟桌面原点，允许多显示器负坐标；
 - 原始物理像素宽高；
@@ -579,7 +588,7 @@ Y-CODE 不读取输入框内容、浏览器密码库或 Cookie 值，也不把 p
 ### 14.2 状态转换
 
 ```text
-idle -> starting -> running -> stopping -> stopped
+idle -> starting -> running -> completing -> completed
                     |  |  |
                     |  |  `-> failed
                     |  `-> waiting_for_user -> running
@@ -589,7 +598,9 @@ running/paused/waiting/provider_safety_required -> stopping -> stopped
 starting -> failed
 ```
 
-非法状态转换抛出领域不变量错误。`stop()` 幂等；重复停止不得重复释放租约或重复关闭 backend。
+非法状态转换抛出领域不变量错误。`complete_run()` 和 `stop()` 都必须幂等；重复调用不得重复释放租约或重复关闭 backend。
+
+Provider 返回最终文本且当前没有未完成 computer call 时，Turn 终结路径必须调用 `complete_run(run_id, owner, retain_browser_session=True)`：把 run 标记为 completed、释放 owner/活动租约并发出最终事件。浏览器 worker/context 可以作为不具备活动执行权的 retained session 保留可见，下一 run 显式复用；桌面 backend 立即释放输入和运行态。`stop()` 专用于取消、故障和用户紧急停止，会关闭 backend。任何 Turn 终态都必须在 `finally` 中二选一调用 complete 或 stop，不能遗留 running lease。
 
 ### 14.3 动作执行顺序
 
@@ -648,6 +659,8 @@ starting -> failed
 
 不关闭 LiteLLM 共享连接池，不重放动作，不注入“自动接手完成”。
 
+关闭 Provider 流必须先设置 `owner.cancel_event`，再调用现有 `core.llm.abort_inflight_streams(owner.cancel_event)`；不得按 turn id 发明第二套取消注册表。
+
 ### 15.3 暂停
 
 - 暂停只阻止下一动作开始，不伪造当前动作回滚。
@@ -659,7 +672,7 @@ starting -> failed
 
 ### 16.1 顶部安全控制条
 
-插入在现有对话标题栏下方，只在 run 非 idle/stopped 时显示。包含：
+插入在现有对话标题栏下方，只在 run 非 idle/stopped/completed 时显示。包含：
 
 - 状态点和“正在操控 / 已暂停 / 等待用户 / 正在停止”；
 - Edge、Chrome 或桌面；
@@ -705,7 +718,7 @@ GUI 事件线程只向现有 `_js_queue` 投递小型 JSON；仍由 `gui-js-disp
 - `computer_action_finished`；
 - `computer_observation`。
 
-前端 Store 使用纯 reducer 更新 `computerRun` 和 `computerTrace`。事件乱序时按 run id + 单调 action ordinal 拒绝旧事件；旧 run 的迟到事件不能覆盖新 run。
+前端 Store 使用纯 reducer 更新 `computerRun` 和 `computerTrace`。每个 run 拥有独立、严格递增的 `event_seq`；action ordinal 只表示动作顺序，不承担 pause/resume/stop 等状态事件排序。事件乱序时按 run id + `event_seq` 拒绝旧事件；旧 run 的迟到事件不能覆盖新 run。由于 GUI `_js_queue` 满时允许丢新事件，每次 Bridge 控制操作的返回值必须用完整 snapshot 校准 Store，并在窗口重新聚焦、切换到操控页签时调用 `get_computer_control_status()`，确保终态不会永久丢失。
 
 ### 16.5 GUI Bridge API
 
@@ -731,6 +744,8 @@ CLI 只提供运行控制，不改变永久开关：
 /computer resume
 /computer stop
 ```
+
+`/computer resume` 同时用于 `waiting_for_user` 的用户接管恢复；恢复实现必须强制下一动作是 observe。`provider_safety_required` 在没有经官方 schema 和 byte-golden 验证的确认 payload 时不可 resume，只允许 status/stop。
 
 如果设置未开启，`status` 显示关闭；模型任务无法获得 computer 能力，并提示用户到 GUI 系统设置页开启。CLI 不提供 `/computer on` 或 `/computer off`。
 
@@ -883,6 +898,7 @@ ToolSpec 语义：
 - 继续使用 Pillow 截图；
 - Windows 输入使用标准库 `ctypes`，不引入 pyautogui；
 - 预览服务使用标准库 HTTP server 或复用现有受控服务模式。
+- `ycode.spec` 使用 `PyInstaller.utils.hooks.collect_all("playwright")` 收集 Python 子模块、driver 数据和所需二进制，再合并到项目现有 `datas/binaries/hiddenimports`；构建产物扫描不得包含 Playwright `.local-browsers`、Chromium、Firefox 或 WebKit 浏览器缓存。
 
 实施任务必须先做独立 dependency spike，证明：
 
