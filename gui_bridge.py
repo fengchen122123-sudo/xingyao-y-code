@@ -258,6 +258,19 @@ PERMISSION_TIMEOUT_SECONDS = 300
 
 # 文件预览上限：256KB
 FILE_PREVIEW_MAX_BYTES = 256 * 1024
+# 图片预览上限：20MB（base64 传输体积再膨胀约 33%）
+IMAGE_PREVIEW_MAX_BYTES = 20 * 1024 * 1024
+# 可应用内预览的图片扩展名 → MIME（<img> 加载 data URL 时 SVG 脚本不执行，无 XSS 风险）
+IMAGE_PREVIEW_MIME = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".bmp": "image/bmp",
+    ".ico": "image/x-icon",
+    ".svg": "image/svg+xml",
+}
 
 # 文件树扫描限制
 FILE_TREE_MAX_DEPTH = 4
@@ -4761,11 +4774,28 @@ class ApiBridge:
                     return {"ok": False, "msg": "这是一个文件夹，不支持文本预览（可在侧栏文件树中浏览其内容）"}
                 return {"ok": False, "msg": "文件不存在或不是普通文件"}
             size = os.path.getsize(real_path)
+            ext = os.path.splitext(real_path)[1].lower()
+            if ext in IMAGE_PREVIEW_MIME:
+                # 图片走 base64 data URL，前端预览弹窗用 <img> 直接渲染
+                if size > IMAGE_PREVIEW_MAX_BYTES:
+                    return {"ok": False, "msg": (
+                        f"图片过大（{size / 1024 / 1024:.1f} MB，"
+                        f"上限 {IMAGE_PREVIEW_MAX_BYTES // 1024 // 1024} MB），请使用「在系统中打开」"
+                    )}
+                import base64
+                with open(real_path, "rb") as f:
+                    b64 = base64.b64encode(f.read()).decode("ascii")
+                return {
+                    "ok": True,
+                    "kind": "image",
+                    "data_url": f"data:{IMAGE_PREVIEW_MIME[ext]};base64,{b64}",
+                    "path": real_path,
+                }
             truncated = size > FILE_PREVIEW_MAX_BYTES
             with open(real_path, "rb") as f:
                 raw = f.read(FILE_PREVIEW_MAX_BYTES)
             if b"\x00" in raw:
-                return {"ok": False, "msg": "二进制文件不支持预览"}
+                return {"ok": False, "msg": "二进制文件不支持预览，可在系统中打开"}
             for encoding in ("utf-8", "gbk"):
                 try:
                     content = raw.decode(encoding)

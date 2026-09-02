@@ -2822,8 +2822,13 @@ def _strip_media_and_merge(messages, model_name=None, api_base=""):
 
         if isinstance(content, list):
             if idx == last_media_idx:
-                # 多模态负载原样保留，模型按 image_url 接收图片
-                cleaned_msg = {"role": role, "content": content}
+                # 多模态负载保留，模型按 image_url 接收图片；
+                # 剥离本地私有的 source_path 字段，避免严格校验的 provider 报 400
+                cleaned_msg = {"role": role, "content": [
+                    {k: v for k, v in item.items() if k != "source_path"}
+                    if isinstance(item, dict) else item
+                    for item in content
+                ]}
             else:
                 cleaned_msg = {"role": role, "content": _flatten_media_content(content)}
                 folded_count += sum(

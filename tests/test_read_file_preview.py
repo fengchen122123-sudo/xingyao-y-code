@@ -117,3 +117,71 @@ def test_preview_credential_config_always_denied(tmp_path, monkeypatch):
     bridge = _make_bridge_with_workdir("GLOBAL")
     res = bridge.read_file_preview(str(f))
     assert res["ok"] is False
+
+
+# ---------------------------------------------------------------------------
+# 图片文件应用内预览：按扩展名走 base64 data URL 分支
+# ---------------------------------------------------------------------------
+
+# 最小 PNG 头（后端不校验图片内容，只要二进制字节即可）
+_PNG_BYTES = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+
+
+def _make_global_bridge(tmp_path, monkeypatch):
+    _inject_ycode_data_dir(monkeypatch, tmp_path)
+    monkeypatch.setattr(gpp, "_allow_outside_workspace", lambda: True)
+    return _make_bridge_with_workdir("GLOBAL")
+
+
+def test_preview_png_returns_image_data_url(tmp_path, monkeypatch):
+    f = tmp_path / "pic.png"
+    f.write_bytes(_PNG_BYTES)
+    bridge = _make_global_bridge(tmp_path, monkeypatch)
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is True
+    assert res["kind"] == "image"
+    assert res["data_url"].startswith("data:image/png;base64,")
+    # data URL 可逆解码回原始字节
+    import base64
+    decoded = base64.b64decode(res["data_url"].split(",", 1)[1])
+    assert decoded == _PNG_BYTES
+
+
+def test_preview_jpg_uses_jpeg_mime(tmp_path, monkeypatch):
+    f = tmp_path / "photo.jpg"
+    f.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 16)
+    bridge = _make_global_bridge(tmp_path, monkeypatch)
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is True
+    assert res["data_url"].startswith("data:image/jpeg;base64,")
+
+
+def test_preview_svg_rendered_as_image(tmp_path, monkeypatch):
+    f = tmp_path / "icon.svg"
+    f.write_text('<svg xmlns="http://www.w3.org/2000/svg"></svg>', encoding="utf-8")
+    bridge = _make_global_bridge(tmp_path, monkeypatch)
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is True
+    assert res["kind"] == "image"
+    assert res["data_url"].startswith("data:image/svg+xml;base64,")
+
+
+def test_preview_oversized_image_rejected(tmp_path, monkeypatch):
+    import gui_bridge as gb
+    f = tmp_path / "big.png"
+    f.write_bytes(_PNG_BYTES)
+    # 把图片上限压到 1 字节，避免真的写 20MB 文件
+    monkeypatch.setattr(gb, "IMAGE_PREVIEW_MAX_BYTES", 1)
+    bridge = _make_global_bridge(tmp_path, monkeypatch)
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is False
+    assert "过大" in res["msg"]
+
+
+def test_preview_non_image_binary_still_rejected(tmp_path, monkeypatch):
+    f = tmp_path / "app.exe"
+    f.write_bytes(b"MZ\x90\x00" + b"\x00" * 16)
+    bridge = _make_global_bridge(tmp_path, monkeypatch)
+    res = bridge.read_file_preview(str(f))
+    assert res["ok"] is False
+    assert "系统中打开" in res["msg"]

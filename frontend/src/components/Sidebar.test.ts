@@ -1,6 +1,7 @@
 import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 import { expect, it, vi } from 'vitest';
+import { nextTick } from 'vue';
 import Sidebar from './Sidebar.vue';
 import { useAppStore } from '../stores/appStore';
 
@@ -204,5 +205,23 @@ it('子页面打开时点击历史会话会立即返回对话页面', async () =
 
   expect(store.subpage.show).toBe(false);
   expect(store.currentSessionName).toBe('session-a');
+  wrapper.unmount();
+});
+
+it('桌面端根元素内联宽度跟随 store.sidebarWidth，折叠时负 margin 跟随实际宽度', async () => {
+  delete (window as any).pywebview;
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.sidebarWidth = 300;
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  const root = wrapper.find('#sidebar');
+  expect(root.attributes('style')).toContain('width: 300px');
+  expect(root.attributes('style')).not.toContain('margin-left');
+
+  store.sidebarCollapsed = true;
+  await nextTick();
+  expect(root.attributes('style')).toContain('margin-left: -300px');
   wrapper.unmount();
 });
