@@ -68,6 +68,15 @@ _register(
         "enable_thinking_effort",
     ),
 )
+# qwen38-27b 是 qwen3.8-27b 的同模型别名，两者档位一致。
+_register(
+    ("qwen3.8-27b", "qwen38-27b"),
+    ReasoningCapability(
+        "effort",
+        ("default", "off", "low", "medium", "xhigh"),
+        "enable_thinking_effort",
+    ),
+)
 _register(
     ("glm-5.2",),
     ReasoningCapability(
@@ -94,6 +103,16 @@ _register(
     ("mimo-v2.5-pro",),
     ReasoningCapability(
         "effort", ("default", "off", "high"), "effort_switch"
+    ),
+)
+# 商汤 sensenova-6.8-flash-lite：官方文档 reasoning_effort 取值 low/medium/high/none
+#（none=关闭思考），缺省默认 medium，与 mimo 同为 effort_switch 策略。
+_register(
+    ("sensenova-6.8-flash-lite",),
+    ReasoningCapability(
+        "effort",
+        ("default", "off", "low", "medium", "high"),
+        "effort_switch",
     ),
 )
 _register(
