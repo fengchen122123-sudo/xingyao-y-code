@@ -52,7 +52,8 @@ WS_MAXIMIZEBOX = 0x00010000
 # FormBorderStyle.None 把它剥掉了。加回后 DWM 同时恢复窗口阴影（无边框窗口
 # 常配）；DefWindowProc 的默认命中测试也会在边缘返回边框码，与子类化叠加无害。
 # 副作用：THICKFRAME 会让系统恢复原生外框；suppress_frame_border 用
-# DWMWA_COLOR_NONE 禁止绘制外框，但不移除样式位。
+# DWMWA_COLOR_NONE 禁止绘制外框，但不移除样式位（Win10 无此 API，
+# 改为保留 1px 玻璃框延伸换 DWM 阴影）。
 WS_THICKFRAME = 0x00040000
 
 # DWM 窗口外观属性（Windows 11 22000+）
@@ -186,15 +187,20 @@ def suppress_frame_border(hwnd: int) -> bool | None:
     """禁止 DWM 绘制 WS_THICKFRAME 外框，并保留 Windows 11 标准圆角。
 
     返回 True 表示成功，False 表示 Windows 11 调用失败，None 表示系统版本
-    早于 Windows 11 22000、公开 DWM API 不支持该能力。
+    早于 Windows 11 22000、公开 DWM API 不支持该能力（此时保留 1px 玻璃框
+    延伸换取 Win10 DWM 系统阴影）。
     """
     global _border_suppression_unsupported_logged
     if not hwnd:
         return False
+    win11_or_later = sys.getwindowsversion().build >= 22000
     # pywebview 在 shadow=True 时会先把 DWM frame 向客户区延伸 1px；即使
-    # DWMWA_BORDER_COLOR=NONE，这层 glass margin 仍会形成固定灰线。先把
+    # DWMWA_BORDER_COLOR=NONE，这层 glass margin 仍会形成固定灰线。Win11 先把
     # 四边 margin 清零，再关闭 THICKFRAME 的 DWM 外框绘制。
-    margins = _DWM_MARGINS(0, 0, 0, 0)
+    # Win10 没有 DWMWA_BORDER_COLOR 可隐藏边线，且 DWM 只给带玻璃框延伸的
+    # 窗口画阴影：保留 1px 延伸换系统阴影（视觉边线由前端 os-win10 CSS 覆盖）。
+    margin = 0 if win11_or_later else 1
+    margins = _DWM_MARGINS(margin, margin, margin, margin)
     extend_frame = ctypes.windll.dwmapi.DwmExtendFrameIntoClientArea
     extend_frame.argtypes = [wintypes.HWND, ctypes.POINTER(_DWM_MARGINS)]
     extend_frame.restype = ctypes.c_long
@@ -202,7 +208,7 @@ def suppress_frame_border(hwnd: int) -> bool | None:
     if hr != 0:
         logger.warning("撤销 pywebview DWM frame 延伸失败 hr=0x%08X", hr & 0xFFFFFFFF)
         return False
-    if sys.getwindowsversion().build < 22000:
+    if not win11_or_later:
         if not _border_suppression_unsupported_logged:
             logger.warning("当前 Windows 版本不支持隐藏 DWM 窗口外框")
             _border_suppression_unsupported_logged = True

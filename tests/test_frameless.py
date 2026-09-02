@@ -24,6 +24,13 @@ def test_suppress_frame_border_passes_dwm_color_none(monkeypatch):
         "windll",
         SimpleNamespace(dwmapi=fake_dwm),
     )
+    # 版本判断影响 Win10/Win11 分支（margins 不同），固定 Win11 保证跨 OS 可重复
+    monkeypatch.setattr(
+        frameless,
+        "sys",
+        SimpleNamespace(getwindowsversion=lambda: SimpleNamespace(build=22631)),
+        raising=False,
+    )
 
     suppress = getattr(frameless, "suppress_frame_border", None)
 
@@ -85,6 +92,13 @@ def test_suppress_frame_border_clears_pywebview_extended_glass_margin(monkeypatc
         "windll",
         SimpleNamespace(dwmapi=fake_dwm),
     )
+    # 版本判断影响 Win10/Win11 分支（margins 不同），固定 Win11 保证跨 OS 可重复
+    monkeypatch.setattr(
+        frameless,
+        "sys",
+        SimpleNamespace(getwindowsversion=lambda: SimpleNamespace(build=22631)),
+        raising=False,
+    )
 
     assert frameless.suppress_frame_border(123) is True
     call = fake_dwm.DwmExtendFrameIntoClientArea.call_args
@@ -135,6 +149,20 @@ def test_suppress_frame_border_reports_unsupported_before_windows_11(monkeypatch
 
     assert frameless.suppress_frame_border(123) is None
     fake_dwm.DwmSetWindowAttribute.assert_not_called()
+    # Win10 无 DWMWA_BORDER_COLOR 可隐藏边线：保留 1px 玻璃框延伸换 DWM 系统阴影
+    call = fake_dwm.DwmExtendFrameIntoClientArea.call_args
+    assert call is not None
+    assert call.args[0] == 123
+    margins = ctypes.cast(
+        call.args[1],
+        ctypes.POINTER(frameless._DWM_MARGINS),
+    ).contents
+    assert (
+        margins.cxLeftWidth,
+        margins.cxRightWidth,
+        margins.cyTopHeight,
+        margins.cyBottomHeight,
+    ) == (1, 1, 1, 1)
 
 
 def test_frameless_frame_reapply_hides_border_instead_of_repainting_it(monkeypatch):
