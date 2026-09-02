@@ -39,7 +39,7 @@ PRESET_PROVIDERS = (
         "base_url": "https://api.moonshot.cn/v1",
         "protocol": "openai",
         "models": [
-            {"name": "kimi-k3", "context_window": 262144, "supports_vision": False},
+            {"name": "kimi-k3", "context_window": 1000000, "supports_vision": True},
             {"name": "kimi-k2.7-code", "context_window": 262144, "supports_vision": False},
             {"name": "kimi-k2.6", "context_window": 262144, "supports_vision": False},
         ],
@@ -72,8 +72,6 @@ PRESET_PROVIDERS = (
         "protocol": "openai",
         "models": [
             {"name": "deepseek-v4-flash-0731", "context_window": 1000000, "supports_vision": False},
-            {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
-            {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
             {"name": "deepseek-v4-pro-0813", "context_window": 1000000, "supports_vision": False},
             {"name": "minimax-m2.5", "context_window": 200000, "supports_vision": False},
             {"name": "minimax-m2.7", "context_window": 200000, "supports_vision": False},
@@ -83,6 +81,7 @@ PRESET_PROVIDERS = (
             {"name": "kimi-k2.7-code", "context_window": 256000, "supports_vision": True},
             {"name": "qwen3.7-max", "context_window": 1000000, "supports_vision": False},
             {"name": "qwen3.8-max", "context_window": 1000000, "supports_vision": True},
+            {"name": "qwen3.8-27b", "context_window": 1000000, "supports_vision": True},
             {"name": "glm-5", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.1", "context_window": 200000, "supports_vision": False},
             {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
@@ -107,7 +106,11 @@ PRESET_PROVIDERS = (
         "base_url": "https://token.sensenova.cn/v1",
         "protocol": "openai",
         "models": [
-            {"name": "sensenova-6.7-flash-lite", "context_window": 256000, "supports_vision": True},
+            {"name": "sensenova-6.8-flash-lite", "context_window": 256000, "supports_vision": True},
+            {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
+            {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
+            {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
+            {"name": "kimi-k3", "context_window": 1000000, "supports_vision": True},
         ],
     },
     {
