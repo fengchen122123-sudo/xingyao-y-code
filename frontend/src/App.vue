@@ -41,11 +41,22 @@
     ></div>
 
     <!-- 主体区域 -->
-    <div id="main">
+    <div id="main" :class="{ 'panel-resizing': anyPanelResizing }">
       <SettingsPage v-if="store.settingsOpen" />
       <template v-else>
       <!-- 左侧边栏 -->
       <Sidebar />
+
+      <!-- 左栏宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
+      <div
+        v-if="!isMobile && !store.sidebarCollapsed"
+        class="panel-resizer"
+        :class="{ resizing: sidebarResizing }"
+        title="拖拽调整侧栏宽度，双击恢复默认"
+        data-test="sidebar-resizer"
+        @pointerdown="onSidebarResizerDown"
+        @dblclick="resetSidebarWidth"
+      ></div>
 
       <!-- 中间主对话与聊天区域 -->
       <div id="center">
@@ -132,6 +143,17 @@
         <InputArea v-if="store.messages && store.messages.length > 0" />
       </div>
 
+      <!-- 右面板宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
+      <div
+        v-if="!isMobile && !store.rightPanelCollapsed"
+        class="panel-resizer"
+        :class="{ resizing: rightPanelResizing }"
+        title="拖拽调整面板宽度，双击恢复默认"
+        data-test="right-panel-resizer"
+        @pointerdown="onRightPanelResizerDown"
+        @dblclick="resetRightPanelWidth"
+      ></div>
+
       <!-- 右侧控制面板 -->
       <RightPanel />
       </template>
@@ -212,6 +234,18 @@ import { useAppStore } from './stores/appStore';
 import { formatPermMode } from './utils/markdown';
 import { buildMessageGroups, msgKey, type TurnGroupInfo } from './utils/turnGroups';
 import { useChatScroll } from './composables/useChatScroll';
+import { useIsMobile } from './composables/useViewport';
+import {
+  RIGHT_PANEL_DEFAULT_WIDTH,
+  RIGHT_PANEL_MAX_WIDTH,
+  RIGHT_PANEL_MIN_WIDTH,
+  RIGHT_PANEL_WIDTH_KEY,
+  SIDEBAR_DEFAULT_WIDTH,
+  SIDEBAR_MAX_WIDTH,
+  SIDEBAR_MIN_WIDTH,
+  SIDEBAR_WIDTH_KEY,
+  usePanelResize,
+} from './composables/usePanelResize';
 
 import Topbar from './components/Topbar.vue';
 import AppIcon from './components/AppIcon.vue';
@@ -257,6 +291,39 @@ async function syncInitialWindowMaximized() {
 }
 
 const store = useAppStore();
+
+// 左右面板宽度拖拽（桌面端）：宽度存 store 实时生效，松手持久化到
+// localStorage，双击手柄恢复默认；移动端布局由 CSS 媒体查询接管，手柄不渲染
+const isMobile = useIsMobile();
+const {
+  isResizing: sidebarResizing,
+  onHandlePointerdown: onSidebarResizerDown,
+  resetWidth: resetSidebarWidth,
+} = usePanelResize({
+  direction: 'left',
+  storageKey: SIDEBAR_WIDTH_KEY,
+  minWidth: SIDEBAR_MIN_WIDTH,
+  maxWidth: SIDEBAR_MAX_WIDTH,
+  defaultWidth: SIDEBAR_DEFAULT_WIDTH,
+  getWidth: () => store.sidebarWidth,
+  setWidth: (w) => { store.sidebarWidth = w; },
+});
+const {
+  isResizing: rightPanelResizing,
+  onHandlePointerdown: onRightPanelResizerDown,
+  resetWidth: resetRightPanelWidth,
+} = usePanelResize({
+  direction: 'right',
+  storageKey: RIGHT_PANEL_WIDTH_KEY,
+  minWidth: RIGHT_PANEL_MIN_WIDTH,
+  maxWidth: RIGHT_PANEL_MAX_WIDTH,
+  defaultWidth: RIGHT_PANEL_DEFAULT_WIDTH,
+  getWidth: () => store.rightPanelWidth,
+  setWidth: (w) => { store.rightPanelWidth = w; },
+});
+// 拖拽期间给 #main 加 class：全局禁文本选择并强制 col-resize 光标
+const anyPanelResizing = computed(() => sidebarResizing.value || rightPanelResizing.value);
+
 const chatScrollRef = ref<HTMLElement | null>(null);
 
 // 主题预览：从真实首页返回设置页继续编辑（退出预览模式、重开设置并落到外观与主题）
@@ -800,6 +867,36 @@ onUnmounted(() => {
   flex: 1;
   display: flex;
   min-height: 0;
+}
+
+/* 面板宽度拖拽手柄：5px 隐形热区压在分界线上（负 margin 向两侧各溢出
+   2px 便于抓取），悬停/拖拽时显示 accent 高亮中线；移动端由 v-if 不渲染 */
+.panel-resizer {
+  width: 5px;
+  margin: 0 -2px;
+  flex-shrink: 0;
+  cursor: col-resize;
+  position: relative;
+  z-index: 30;
+}
+.panel-resizer::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+  background: transparent;
+  transition: background 0.15s;
+}
+.panel-resizer:hover::after,
+.panel-resizer.resizing::after {
+  background: var(--accent);
+}
+/* 拖拽期间禁止选中界面文本、强制列宽光标（指针移出手柄也保持） */
+#main.panel-resizing {
+  user-select: none;
+  cursor: col-resize;
 }
 
 .window-resize-handle {

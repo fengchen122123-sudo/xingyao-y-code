@@ -79,6 +79,14 @@ def _try_parse_json(text):
 _FOLDED_MEDIA_TEXT = "[图片/媒体内容已折叠以节省 Token；如需再次查看请重新提供]"
 
 
+def _folded_media_text(block):
+    """折叠占位文本：带来源路径（如有），便于用户按路径找回原图。"""
+    src = block.get("source_path") if isinstance(block, dict) else None
+    if src:
+        return f"[图片已折叠以节省 Token；原图路径: {src}]"
+    return _FOLDED_MEDIA_TEXT
+
+
 def _content_has_media(content):
     return (
         isinstance(content, list)
@@ -1722,7 +1730,7 @@ class MemoryManager:
         folded = 0
         for msg_id, blocks in media_rows[:-1]:  # 最新一条保留原样
             new_blocks = [
-                {"type": "text", "text": _FOLDED_MEDIA_TEXT}
+                {"type": "text", "text": _folded_media_text(b)}
                 if isinstance(b, dict) and b.get("type") in ("image", "image_url")
                 else b
                 for b in blocks

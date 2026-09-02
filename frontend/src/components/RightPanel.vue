@@ -1,5 +1,5 @@
 <template>
-  <div id="rightbar" data-theme-region="right_panel" :class="{ collapsed: store.rightPanelCollapsed }">
+  <div id="rightbar" data-theme-region="right_panel" :class="{ collapsed: store.rightPanelCollapsed }" :style="panelStyle">
     <div id="right-tabs">
       <button
         v-for="tab in tabs"
@@ -156,6 +156,9 @@
           </div>
           <div class="fp-body">
             <div v-if="store.filePreview.loading" class="fp-loading">加载中…</div>
+            <div v-else-if="store.filePreview.kind === 'image'" class="fp-image-wrap">
+              <img class="fp-image" :src="store.filePreview.dataUrl" :alt="fileBaseName(store.filePreview.path)" />
+            </div>
             <div v-else-if="isMarkdownPreview" class="fp-md md-body" v-html="renderedMarkdown"></div>
             <pre v-else class="fp-pre"><code class="hljs" v-html="highlightedPreview"></code></pre>
             <div v-if="store.filePreview.truncated" class="fp-truncated"><AppIcon name="triangle-alert" :size="12" /> 文件内容过长，已截断显示</div>
@@ -172,10 +175,21 @@ import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
 import { renderMarkdown } from '../utils/markdown';
+import { useIsMobile } from '../composables/useViewport';
 
 type TabType = 'plan' | 'tasks' | 'term' | 'files';
 
 const store = useAppStore();
+
+// 桌面端宽度由拖拽手柄写入 store，此处内联生效；折叠负 margin 跟随实际
+// 宽度。移动端（<=768px）整体隐藏右面板，不输出内联样式。
+const isMobile = useIsMobile();
+const panelStyle = computed(() => {
+  if (isMobile.value) return {};
+  const style: Record<string, string> = { width: `${store.rightPanelWidth}px` };
+  if (store.rightPanelCollapsed) style.marginRight = `-${store.rightPanelWidth}px`;
+  return style;
+});
 const activeTab = ref<TabType>('plan');
 
 const tabs: Array<{ id: TabType; label: string }> = [
@@ -690,6 +704,24 @@ onUnmounted(() => {
   text-align: center;
   color: var(--text-faint);
   font-size: 13px;
+}
+/* 图片预览：居中适配弹窗，超大图限高可滚动 */
+.fp-image-wrap {
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding: 16px;
+  max-height: 70vh;
+  overflow: auto;
+  /* 浅色棋盘格背景，透明 PNG 也能看清轮廓 */
+  background:
+    repeating-conic-gradient(var(--bg2) 0% 25%, var(--code-bg) 0% 50%)
+    0 0 / 16px 16px;
+}
+.fp-image {
+  max-width: 100%;
+  height: auto;
+  object-fit: contain;
 }
 .fp-pre {
   margin: 0;
