@@ -317,6 +317,8 @@ Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工
 | `execute_command` | 执行本地命令（默认 30s 超时，支持后台执行） |
 | `fetch_image` | 把网页图片安全下载到本地（仅 http/https、png/jpg/gif/webp 白名单，10MB 上限） |
 | `hunyuan_generate_image` | 腾讯混元文生图：根据文字描述生成图片并保存到本地（支持多种尺寸与自定义水印，10~60 秒） |
+| `tokenrhythm_generate_image` | 基元律动（TokenRhythm）文生图：qwen-image-2.0 / wan2.7-image 模型，生成后立即下载到本地（需在插件页启用并配置该提供商 Key，默认关闭） |
+| `tokenrhythm_edit_image` | 基元律动图生图：上传 1 张原图（≤10MB）+ 文字指令改图（同一前置条件） |
 | `ask_user` | 向用户提出澄清问题（1-3 个选项） |
 | `manage_task` | 查看或终止后台任务 |
 | `run_subagent` | 启动辅助 Agent（5 种内置类型 + 自定义） |

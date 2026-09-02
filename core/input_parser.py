@@ -261,6 +261,10 @@ def parse_user_input(text):
                 else:
                     attached_msgs.append(f"🖼️ 已附加图片: {os.path.basename(file_path)}")
 
+                # 图片成功附加（压缩/未压缩分支均覆盖）：把原图路径写进文本，
+                # 供模型需要改图/垫图时把该路径传给生图插件的 image 参数
+                text_content += f"\n\n[附带图片文件: {os.path.basename(file_path)}]\n完整路径: {os.path.abspath(file_path)}（需要改图/垫图时，把此路径传给生图插件的 image 参数）\n"
+
                 encoded_string = base64.b64encode(compressed.data).decode('utf-8')
                 final_content.append({
                     "type": "image_url",
