@@ -214,6 +214,12 @@ def _build_gui_theme_fragment(gui_theme: dict) -> str:
         f"theme={gui_theme['appearance']}"
         f"&bg={gui_theme['background'].lstrip('#')}"
     )
+    # Win10 无 DWMWA_BORDER_COLOR 可隐藏 frameless 外框（core/frameless.py），
+    # 前端据 os=win10 补 1px CSS 内边框勾勒窗口边界；Win11 由 DWM 阴影+圆角
+    # 勾勒边界，无需标记。getattr 防御：getwindowsversion 仅 Windows 存在。
+    get_win_ver = getattr(sys, "getwindowsversion", None)
+    if get_win_ver is not None and get_win_ver().build < 22000:
+        fragment += "&os=win10"
     if gui_theme.get("error") is not None:
         fragment += "&gui_theme_error=1"
     return fragment
