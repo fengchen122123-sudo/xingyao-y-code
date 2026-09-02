@@ -294,6 +294,13 @@ body {
   /* 不强制 antialiased：细体渲染会让小字发虚，用系统默认次像素渲染字形更饱满 */
 }
 
+/* Win10 frameless 窗口：系统无 API 隐藏 THICKFRAME 外框（core/frameless.py 只能
+   保留 1px 玻璃框延伸换 DWM 阴影），用 1px 内阴影勾勒窗口边界、跟随主题边框色。
+   inset box-shadow 不占布局空间，避免 border 引入 1px 溢出滚动条。 */
+.os-win10 body {
+  box-shadow: inset 0 0 0 1px var(--border);
+}
+
 /* 全局背景图：最底层，垫在所有分区之下。fixed 视口定位、负 z-index、
    pointer-events 关闭，分区有自己的背景图时盖在它上面，无图分区透出它。 */
 body::before {

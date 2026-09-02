@@ -278,4 +278,19 @@ describe('applyBootTheme', () => {
     expect(document.body.classList.contains('light')).toBe(true);
     expect(document.body.style.backgroundColor).toBe('rgb(1, 2, 3)');
   });
+
+  it('marks os-win10 class on documentElement for win10 fragment', () => {
+    applyBootTheme('#theme=light&bg=f4f4f1&os=win10', document.body);
+
+    expect(document.documentElement.classList.contains('os-win10')).toBe(true);
+    document.documentElement.classList.remove('os-win10');
+  });
+
+  it('does not mark os-win10 without the fragment flag', () => {
+    document.documentElement.classList.remove('os-win10');
+
+    applyBootTheme('#theme=light&bg=f4f4f1', document.body);
+
+    expect(document.documentElement.classList.contains('os-win10')).toBe(false);
+  });
 });
