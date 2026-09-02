@@ -51,8 +51,7 @@ common_datas = [
     ('frontend/mobile-shim.js', 'frontend'),
     # 内置技能（plugin-creator 等）：首次启动释放到 ~/.ycode/skills，用户可自由开关
     ('skills', 'skills'),
-    # 内置插件（hunyuan_image 等）：core/plugin_loader.py 打包后从
-    # _MEIPASS/plugins 扫描加载，内置插件自动信任、无需用户确认
+    # 内置插件目录（随包发布）：core/plugin_loader.py 自动扫描并默认信任
     ('plugins', 'plugins'),
     # GUI 运行时用 WM_SETICON 设置窗口/任务栏图标，需随包携带 ico 文件
     ('assets/ycode.ico', 'assets'),

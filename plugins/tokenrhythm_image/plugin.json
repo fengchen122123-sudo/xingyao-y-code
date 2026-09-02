@@ -1,0 +1,7 @@
+{
+  "name": "tokenrhythm_image",
+  "version": "1.0.0",
+  "description": "基元律动（TokenRhythm）生图插件：文生图与图生图（垫图改图）。密钥从 ~/.ycode/config.json 的 providers 中 base_url 含 tokenrhythm.studio 的条目读取（DPAPI 解密），未配置时工具返回配置指引错误。",
+  "entry": "plugin.py",
+  "enabled": false
+}
