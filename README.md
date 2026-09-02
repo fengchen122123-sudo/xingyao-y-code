@@ -14,7 +14,8 @@
 - **终端交互界面**：基于 `prompt_toolkit` 的 Claude Code 风格输入框，支持斜杠命令、Tab 补全、`@文件` 快速挂载、多行粘贴
 - **GUI 窗口版**：基于 `pywebview` + Vue 3 + TypeScript 的图形界面，与 CLI 共享同一套核心引擎
 - **GUI 拖拽附件**：拖入文件即上屏占位并自动补全真实路径，PDF 等二进制文件注入路径提示供模型用工具解析
-- **文件树面板**：懒加载子目录，支持手动刷新与页签激活/窗口聚焦自动刷新，展开状态可恢复
+- **文件树面板**：懒加载子目录，支持手动刷新与页签激活/窗口聚焦自动刷新，展开状态可恢复；点击图片（png/jpg/gif/webp/bmp/ico/svg）可直接弹窗预览
+- **GUI 面板宽度自定义**：侧栏 / 右面板分界线可拖拽调整宽度（双击恢复默认），宽度记忆到本地重启仍生效
 - **9 种终端主题**：cyan / matrix / nord / cyberpunk / dracula / lava / sunset / amber / white，`/theme` 一键切换
 - **终端 Markdown 渲染**：代码块语法高亮、表格、列表等富文本展示
 - **思考流显示**：实时呈现模型推理过程（`<thinking>` 标签解析 + 句子边界缓冲）
@@ -23,7 +24,7 @@
 
 - **多模型管理**：通过 `/models` 打开全屏模型选择器，支持 OpenAI / Anthropic / DeepSeek / Agnes 等多种协议，由 `LiteLLM` 统一调用
 - **副模型机制**：可配置副模型承担视觉识别、记忆压缩、子代理调用等任务，主副分工
-- **22 个内置工具**：文件读写、代码搜索、命令执行、网页抓取、天气查询、LSP 符号查找等
+- **29 个内置工具**：文件读写、代码搜索、命令执行、网页抓取、图片下载与生图、天气查询、LSP 符号查找、计划编排、智能路由等
 - **工具结果缓存**：相同搜索/读取自动走本地缓存，节省 token 与时间
 
 ### 核心内核（Harness）
@@ -52,7 +53,7 @@
 ### 扩展生态
 
 - **技能系统（Skills）**：扫描 `SKILL.md` 并动态注入系统提示词，支持项目级与用户级
-- **插件系统（Plugins）**：进程内插件扩展工具能力，零核心侵入，单插件异常不影响启动
+- **插件系统（Plugins）**：进程内插件扩展工具能力，零核心侵入，单插件异常不影响启动；内置混元文生图插件，支持用户级插件热加载
 - **MCP 客户端**：全屏 CLI 配置器 + 10+ 预设模板（飞书 / 高德 / B 站 / SQLite / Postgres 等），AI 可自配置 MCP
 - **Git Worktree**：`/worktree` 管理多分支并行工作区
 
@@ -225,6 +226,8 @@ venv\Scripts\python build_release.py --setup-only
 | 命令 | 说明 |
 |------|------|
 | `/models` | 打开全屏模型管理器 |
+| `/effort` | 切换当前模型推理强度（low / high / max / default） |
+| `/usage [日期 [截止日期]]` | Token 用量统计（按模型：今日 / 近7天 / 近30天，支持指定日期或区间） |
 | `/theme [主题名]` | 列出 / 切换终端配色主题（9 种） |
 
 ### 工具与扩展
@@ -235,7 +238,9 @@ venv\Scripts\python build_release.py --setup-only
 | `/skills list` | 终端列出所有技能及启用状态 |
 | `/skills enable <短ID>` | 启用指定技能 |
 | `/skills disable <短ID>` | 禁用指定技能 |
+| `/<短ID> [提问内容]` | 主动且强制调用指定技能执行任务 |
 | `/plugins` | 查看已安装的进程内插件 |
+| `/plugins enable\|disable <name>` / `reload` | 启用 / 禁用指定插件，重新扫描插件目录 |
 | `/mcp` | MCP 服务管理（open / status / tools / enable / disable / reconnect / edit） |
 
 ### 任务与计划
@@ -250,12 +255,23 @@ venv\Scripts\python build_release.py --setup-only
 | `/plan retry <ID>` | 重试指定计划项 |
 | `/worktree [list\|create\|remove\|prune]` | Git worktree 管理 |
 
+### 记忆与绘制
+
+| 命令 | 说明 |
+|------|------|
+| `/remember` | 手动追加一条规则 / 偏好 / 事实到记忆日志 |
+| `/dream` | 后台触发梦境总结，提炼归纳记忆日志 |
+| `/memory` | 查阅长期记忆索引（MEMORY.md）内容 |
+| `/compress [force]` | 手动触发会话记忆压缩（force 强制保留更少条） |
+| `/diagram open <序号>\|list` | 在浏览器打开 / 列出导出的 Mermaid 流程图网页 |
+
 ### 系统控制
 
 | 命令 | 说明 |
 |------|------|
 | `/permission <confirm\|accept_edits\|plan\|full>` | 切换权限级别 |
 | `/sandbox <on\|off>` | 沙盒开关（on=允许访问工作目录外文件） |
+| `/turns <10-1000>` | 设置单任务最大模型轮次（默认 100） |
 | `/clear` | 清屏 |
 | `/exit` | 退出程序 |
 
@@ -277,7 +293,7 @@ venv\Scripts\python build_release.py --setup-only
 
 ## 🛠️ 内置工具
 
-Y-code 内置 22 个工具，分为只读与变更两组：
+Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工具），分为只读与变更两组：
 
 ### 只读工具
 
@@ -299,6 +315,8 @@ Y-code 内置 22 个工具，分为只读与变更两组：
 | `write_file` | 创建新文件或完整重写小文件（拒绝覆盖 >500 行的已有文件） |
 | `edit_file` | 局部修改已有文件（字符串匹配 / 行号两条路径，含智能相似度兜底） |
 | `execute_command` | 执行本地命令（默认 30s 超时，支持后台执行） |
+| `fetch_image` | 把网页图片安全下载到本地（仅 http/https、png/jpg/gif/webp 白名单，10MB 上限） |
+| `hunyuan_generate_image` | 腾讯混元文生图：根据文字描述生成图片并保存到本地（支持多种尺寸与自定义水印，10~60 秒） |
 | `ask_user` | 向用户提出澄清问题（1-3 个选项） |
 | `manage_task` | 查看或终止后台任务 |
 | `run_subagent` | 启动辅助 Agent（5 种内置类型 + 自定义） |
@@ -306,10 +324,19 @@ Y-code 内置 22 个工具，分为只读与变更两组：
 | `plan_read` | 读取计划状态 |
 | `plan_update` | 更新计划项元数据 |
 | `plan_retry` | 重置失败项为 pending |
+| `plan_finish` | 完成主 Agent 接管的计划项（并执行验证命令） |
+| `plan_resume_takeover` | 恢复因超时移交主 Agent 的计划项 |
+| `smart_router_status` | 查看智能路由当前状态与统计 |
+| `smart_router_config` | 配置智能路由（模型分层 / 开关） |
+| `smart_router_toggle` | 快速开关智能路由 |
 | `mcp_add_server` | 新增 MCP server 配置 |
 | `mcp_remove_server` | 删除 MCP server 配置 |
 | `mcp_set_enabled` | 启用 / 禁用 MCP server |
 | `mcp_list_servers` | 列出所有 MCP server（API Key 掩码处理） |
+
+> 内置「iMOM 智能制造系统定位」插件另行提供 `imom_register_project` / `imom_list_projects` /
+> `imom_use_project` / `imom_build_index` / `imom_locate` 五个工具，用于 iMOM/MES 项目代码的
+> 页面→Controller→SqlMapping 四层定位，适合在 iMOM 相关项目中使用。
 
 ## 🧠 子代理与计划系统
 
@@ -470,6 +497,16 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 - 插件工具通过 `ToolSpec` 元数据自动获得权限拦截、schema 参数过滤与结果截断
 - `/plugins` 命令查看已安装插件
 
+**已内置 / 随附插件**：
+
+| 插件 | 位置 | 功能 |
+|------|------|------|
+| 混元文生图 | 仓库 `plugins/hunyuan_image/` | 腾讯混元文本生图，数据随包编译进 PYZ，内置 Key 混淆保护，可被 `HUNYUAN_API_KEY` 环境变量覆盖 |
+| 智能路由 | `~/.ycode/plugins/smart_router/` | 按任务复杂度自动选择合适模型，省 token 且保质量，关闭后不影响原有行为 |
+| iMOM 定位器 | `~/.ycode/plugins/imom_locator/` | iMOM/MES 多项目代码定位：动态发现 publish、系统识别、页面索引构建与毫秒级定位 |
+
+> 用户级插件放在 `~/.ycode/plugins/<插件名>/`，同名插件会覆盖内置/仓库版本。
+
 ## 📁 项目结构
 
 ```
@@ -527,7 +564,8 @@ xingyao-y-code/
 │   └── app_context.py       # 应用上下文
 ├── frontend/               # GUI 前端（Vue 3 + TypeScript + Vite）
 │   ├── src/
-│   │   ├── components/      # 25 个 Vue 组件
+│   │   ├── components/      # 29 个 Vue 组件
+│   │   ├── composables/     # 组合式函数（面板拖拽、视口判断等）
 │   │   ├── stores/          # Pinia 状态管理
 │   │   └── utils/
 │   ├── package.json
@@ -536,7 +574,7 @@ xingyao-y-code/
 ├── plugins/                # 内置插件目录
 ├── vendor/ripgrep/         # 内置 ripgrep
 ├── packaging/              # 打包辅助
-├── tests/                  # pytest 测试用例（90 个文件）
+├── tests/                  # pytest 测试用例（117 个文件）
 ├── docs/                   # 文档
 │   ├── BUILD.md            # 构建文档
 │   ├── all_features.md     # 全功能文档
@@ -659,7 +697,7 @@ JPEG/WebP 在必要时逐级降低质量，GIF 保持原始动画；发送给视
 pytest
 ```
 
-测试覆盖 90 个模块，包括 agent_turn_e2e、harness（models/journal/runtime/请求指纹/工具管线）、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
+测试覆盖 117 个模块，包括 agent_turn_e2e、harness（models/journal/runtime/请求指纹/工具管线）、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
 
 ## 🔒 安全与隐私
 
