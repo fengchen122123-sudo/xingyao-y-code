@@ -23,6 +23,7 @@
 - 新增 `qwen3.8-27b` 思考程度适配：默认/关闭/低/中/超高（enable_thinking + reasoning_effort，与 qwen3.8-max 同策略），`qwen38-27b` 登记为同模型别名、共享同一档位
 - 预置厂商「商汤日日新」模型扩容：新增 `deepseek-v4-pro` / `deepseek-v4-flash` / `glm-5.2` / `kimi-k3`（均 100 万上下文）；`sensenova-6.7-flash-lite` 升级为 `sensenova-6.8-flash-lite`并适配思考档位（官方 reasoning_effort 取值 low/medium/high/none，选择器提供 默认/关闭/低/中/高，关闭映射为 none，缺省由厂商默认 medium 接管）
 - 修正预置 `kimi-k3` 元数据：月之暗面与商汤日日新两处均更正为 100 万上下文 + 支持多模态（与 kimi-for-coding 的 k3 能力对齐）
+- 修复 Windows 10 下 GUI 主窗口无边框无阴影、与背景窗口融为一体难辨边界：Win10 的 DWM 只给带标题栏的窗口画阴影，且没有 Win11 的 DWMWA_BORDER_COLOR 接口可隐藏外框，frameless 窗口此前两边都不沾；现在 Win10 下保留 1px 玻璃框延伸换回 DWM 系统阴影，同时启动参数注入系统标记、前端叠加 1px 主题色内边框勾勒边界（inset 投影不占布局、不会引出滚动条）；Windows 11 的阴影圆角与无边框线表现保持不变
 
 ## 1.2.19 (2026-08-30)
 
