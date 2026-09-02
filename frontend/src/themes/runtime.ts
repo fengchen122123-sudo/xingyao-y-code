@@ -203,4 +203,10 @@ export function applyBootTheme(hash: string, body: HTMLElement): void {
   if (background !== null && /^[0-9a-fA-F]{6}$/.test(background)) {
     body.style.backgroundColor = `#${background}`;
   }
+
+  // Win10 frameless 窗口无 DWM 阴影边线（gui_main fragment 注入 os=win10）：
+  // 加 class 让 style.css 的 1px 主题内边框生效，勾勒窗口边界
+  if (literalFragmentValue(fragment, 'os') === 'win10') {
+    body.ownerDocument.documentElement.classList.add('os-win10');
+  }
 }
