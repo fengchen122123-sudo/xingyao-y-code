@@ -407,9 +407,11 @@ UI/CLI 快照包含：
 
 ## 11. OpenAI 原生 Computer Use 协议
 
+本节已按 2026-09-02 的 OpenAI 官方 Computer use 指南复核。新实现使用 GA Responses 形状 `tools: [{"type": "computer"}]`；`computer_use_preview`、单个 `action` 和 `truncation: "auto"` 属于旧 preview 集成，本项目不为新实现采用该旧路径。官方指南：<https://developers.openai.com/api/docs/guides/tools-computer-use>。
+
 ### 11.1 请求
 
-当能力为 `native_openai` 时，Responses 请求 tools 在现有 function tools 之后追加精确的原生 computer tool 定义；如果 browser 和 desktop 同时可用，还要追加固定 function tool `computer_select_target`。默认关闭或非原生模型不得出现这些定义。
+当能力为 `native_openai` 时，Responses 请求 tools 在现有 function tools 之后追加精确的 GA 原生定义 `{"type":"computer"}`；如果 browser 和 desktop 同时可用，还要追加固定 function tool `computer_select_target`。默认关闭或非原生模型不得出现这些定义。
 
 `_responses_tools_from_chat_tools()` 不能被改成接受任意未知 built-in tool；只允许经过 capability 决策注入的受控 computer 定义。
 
@@ -419,12 +421,14 @@ Responses 事件标准化层增加对以下语义的严格支持：
 
 - response id；
 - `computer_call` output item；
-- 完整 action；
+- 完整、非空的 `actions[]`；
 - call id；
 - pending safety checks；
 - completed / incomplete / failed。
 
-缺少 response id、call id、action 或动作字段冲突时，当前 Step 以 Provider 协议错误失败。不得改走通用协议。
+缺少 response id、call id、`actions[]`，或任一动作字段冲突时，当前 Step 以 Provider 协议错误失败。不得改走通用协议。GA `screenshot` action 映射为统一 `observe`。
+
+GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是 generic“一次一个 function call”规则的显式例外。Y-CODE 必须按原顺序串行执行；每个动作前重新检查暂停、停止、owner、settings generation 和安全桌面，每个动作均产生脱敏 trace。任一动作失败或用户停止后，后续动作全部不执行；整批成功后只捕获一次新截图并发送 `computer_call_output`。不得并行动作，也不得把整批当成不可中断的单次 backend 调用。
 
 当两个 target 同时可用但尚未通过 `computer_select_target` 建立租约时，原生 computer call 不得执行；这属于明确的动作前置条件错误，不使用提示词关键词猜测用户想控制哪个 backend。
 
@@ -433,8 +437,8 @@ Responses 事件标准化层增加对以下语义的严格支持：
 原生电脑操控活动 Turn 使用 Responses `previous_response_id` 续传：
 
 1. 首次请求发送正常 Y-CODE 会话历史和 computer tool。
-2. Provider 返回 computer call 和 response id。
-3. 本地执行统一动作，生成截图。
+2. Provider 返回含有序 `actions[]` 的 computer call 和 response id。
+3. 本地逐个串行执行统一动作，整批成功后生成截图。
 4. 下一 Step 只用上一 response id 和新的 `computer_call_output` 继续。
 5. Provider 返回最终文本后结束原生 continuation。
 
