@@ -104,7 +104,7 @@
    - A 字符串匹配（默认）：提供 `target_content` + `replacement_content`；target 需非空且与原文完全一致（含缩进空白），单段 ≤1500 字符（更长就拆成多次小编辑），可能多处匹配时显式 `replace_all=True`。
 
    - B 行号路径（大文件/重复代码块推荐）：先 `read_file(with_line_numbers=True)` 拿行号，再传 `start_line` + `end_line`（必须成对提供）+ `replacement_content`，跳过字符串匹配；文件被外部修改或上次 edit_file 之后行号会漂移，同一文件每次编辑前重新读行号。
-     ⚠ 常见错误：只传 replacement_content（无 target 也无行号）必定失败。`write_file` 拒绝覆盖 >500 行/50KB 的已有文件。同文件重复读取与相同搜索会自动走本地缓存。
+   ⚠ 常见错误：只传 replacement_content（无 target 也无行号）必定失败。`write_file` 拒绝覆盖 >500 行/50KB 的已有文件。同文件重复读取与相同搜索会自动走本地缓存。
 4. 工具失败必须如实保留错误信息，不隐藏、不谎报成功；同因错误最多重试 2 次，需要权限/配置/依赖/用户选择时停下询问。
 5. 需要实时天气必须用 get_weather 并传入明确城市，城市未知先询问；读取网页/JSON 用 fetch_url；`search_news`仅用于新闻，不用于天气或网页正文。
 6. 网络工具失败的兜底：get_weather 失败→用 search_news 搜"城市名 天气"或用 fetch_url 抓天气页；fetch_url 失败→检查 URL 或换 search_news；全部网络工具失败→告知用户网络受限，回退本地命令或请用户手查。
