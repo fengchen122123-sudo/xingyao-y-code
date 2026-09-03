@@ -125,6 +125,36 @@ def test_responses_stream_normalizes_text_reasoning_tools_and_usage():
     assert chunks[-1].usage.prompt_tokens_details.cached_tokens == 80
 
 
+def test_responses_bridge_enum_typed_events_are_normalized():
+    """litellm chat→responses 桥接（DeepSeek 等 chat-only provider）合成事件的
+    type 是 ResponsesAPIStreamEvents 枚举成员而非字符串，必须按 .value 归一化。"""
+    try:
+        from litellm.types.llms.openai import ResponsesAPIStreamEvents
+    except ImportError:  # pragma: no cover - litellm 缺失时跳过
+        pytest.skip("litellm types 不可用")
+
+    completed = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+    )
+    events = [
+        _event(ResponsesAPIStreamEvents.RESPONSE_CREATED, response=SimpleNamespace(id="r1")),
+        _event(ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA, delta="你好"),
+        _event(ResponsesAPIStreamEvents.RESPONSE_COMPLETED, response=completed),
+    ]
+
+    chunks = list(llm._responses_stream_as_chat_chunks(events))
+
+    texts = "".join(c.choices[0].delta.content for c in chunks)
+    assert texts == "你好"
+    assert chunks[-1].choices[0].finish_reason == "stop"
+    assert chunks[-1].usage.total_tokens == 15
+
+
 def test_responses_failed_event_does_not_fall_back():
     failed = SimpleNamespace(error=SimpleNamespace(message="bad request"))
 
