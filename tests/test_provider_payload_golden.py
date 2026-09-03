@@ -243,6 +243,41 @@ def test_kimi_anthropic_max_reasoning_provider_kwargs_are_byte_golden(monkeypatc
     assert_exact_provider_kwargs(captured, expected)
 
 
+def test_stepfun_anthropic_provider_kwargs_map_effort_to_output_config(monkeypatch):
+    """阶跃 Anthropic 路由：思考档位必须编码为官方 output_config.effort。"""
+    import core.llm as llm
+
+    captured = _capture(
+        monkeypatch,
+        model="anthropic/step-3.7-flash",
+        api_base="https://api.stepfun.com/step_plan",
+        protocol="anthropic",
+        model_cfg={"reasoning_choice": "high", "enable_thinking": True, "reasoning_effort": "high"},
+        cache_session_id="golden-stepfun-anthropic",
+        messages=[{"role": "system", "content": "stable"}, {"role": "user", "content": "inspect"}],
+    )
+    expected = {
+        "model": "anthropic/step-3.7-flash",
+        "api_key": "<redacted>",
+        "messages": [
+            {"role": "system", "content": "stable", "cache_control": {"type": "ephemeral"}},
+            {"role": "user", "content": "inspect"},
+        ],
+        "tools": [ZETA_TOOL, ALPHA_TOOL],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "num_retries": 2,
+        "output_config": {"effort": "high"},
+        "allowed_openai_params": ["output_config"],
+        "tool_choice": "auto",
+        "max_tokens": 8192,
+        "api_base": "https://api.stepfun.com/step_plan",
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
+
+    assert_exact_provider_kwargs(captured, expected)
+
+
 def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
     import core.llm as llm
 
