@@ -503,7 +503,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
 
 | 插件 | 位置 | 功能 |
 |------|------|------|
-| 混元文生图 | 仓库 `plugins/hunyuan_image/` | 腾讯混元文本生图，数据随包编译进 PYZ，内置 Key 混淆保护，可被 `HUNYUAN_API_KEY` 环境变量覆盖 |
+| 混元文生图 | 仓库 `plugins/hunyuan_image/` | 腾讯混元文本生图，数据随包编译进 PYZ；Key 仅从环境变量 `HUNYUAN_API_KEY` 读取，代码中不存储 Key，未配置时工具明确报错 |
 | 智能路由 | `~/.ycode/plugins/smart_router/` | 按任务复杂度自动选择合适模型，省 token 且保质量，关闭后不影响原有行为 |
 | iMOM 定位器 | `~/.ycode/plugins/imom_locator/` | iMOM/MES 多项目代码定位：动态发现 publish、系统识别、页面索引构建与毫秒级定位 |
 
