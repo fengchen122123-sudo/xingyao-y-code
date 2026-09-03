@@ -1,8 +1,8 @@
 """腾讯混元生图核心实现（CloudBase 网关接口）。
 
-本模块位于 core 包内。Server API Key 优先从本机环境变量 HUNYUAN_API_KEY
-读取（便于本机换 Key / 轮换密钥）；未设置时回退到包内混淆存储的内置 Key，
-保证分发安装包开箱即用。请求仍通过 CloudBase 生图网关完成。
+本模块位于 core 包内。Server API Key 仅从本机环境变量 HUNYUAN_API_KEY
+读取，代码中不存储任何 Key；未配置环境变量时工具返回明确报错提示，
+不再有内置回退。请求仍通过 CloudBase 生图网关完成。
 
 接口约定（2026-08-31 实测可用）：
 - POST 请求体参数必须放顶层（{"prompt": ..., "size": ...}，不要包 {"data": ...}）；
@@ -31,27 +31,9 @@ _API_URL = (
 # Server API Key 仅从本机环境变量读取，不写入发布包。
 VALID_SIZES = ("1024x1024", "1280x720", "720x1280", "1280x1280")
 
-# ---------------------------------------------------------------------------
-# 内置 Key（混淆存储，非加密）：环境变量 HUNYUAN_API_KEY 优先；未设置时回退到
-# 此值，保证分发安装包开箱即用。混淆仅防明文 grep/解包直读，无法对抗刻意逆向
-# （PyInstaller 包可被解包还原）。Key 轮换时重新生成 _BUILTIN_KEY_B64 并同步
-# 更新测试 tests/test_hunyuan_image_auth.py。
-# 生成方式：base64(bytes(c ^ 0x5A for c in key.encode("utf-8")))
-# ---------------------------------------------------------------------------
-_XOR_MASK = 0x5A
-_BUILTIN_KEY_B64 = ""  # [已脱敏] 真实 Key 不入库：本机由 git smudge 过滤器（scripts/secret_filter.py）还原，或设置环境变量 HUNYUAN_API_KEY
-
-
 def _resolve_api_key() -> str:
-    """解析生图 Server API Key：环境变量优先，未设置时回退包内混淆内置 Key。"""
-    env_key = os.environ.get("HUNYUAN_API_KEY", "").strip()
-    if env_key:
-        return env_key
-    try:
-        decoded = bytes(c ^ _XOR_MASK for c in base64.b64decode(_BUILTIN_KEY_B64))
-        return decoded.decode("utf-8").strip()
-    except Exception:
-        return ""
+    """解析生图 Server API Key：仅从环境变量 HUNYUAN_API_KEY 读取。"""
+    return os.environ.get("HUNYUAN_API_KEY", "").strip()
 
 # 图生图（垫图）模式使用的模型；传入 image 参数时自动切换，文生图不指定模型
 _I2I_MODEL = "HY-Image-v3.0-I2I-ToB-v1.0.1"
@@ -125,7 +107,7 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", fo
             detail = ""
         hint = ""
         if exc.code == 401:
-            hint = "（鉴权失败：请检查 HUNYUAN_API_KEY 是否有效——环境变量优先，未设置时使用包内内置 Key）"
+            hint = "（鉴权失败：请检查环境变量 HUNYUAN_API_KEY 是否已设置且有效）"
         elif "prompt" in detail:
             hint = "（参数错误：prompt 需放在请求体顶层）"
         return ToolResult(

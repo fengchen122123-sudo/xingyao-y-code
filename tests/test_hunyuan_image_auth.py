@@ -54,38 +54,11 @@ class GenerateImageAuthTest(TestCase):
         with mock.patch.dict(os.environ, {"HUNYUAN_API_KEY": "  env-key  "}):
             self.assertEqual(hunyuan_image._resolve_api_key(), "env-key")
 
-    def test_resolve_api_key_falls_back_to_builtin(self):
-        """环境变量未设置时回退到包内混淆内置 Key（非空，且能成功解码）。"""
+    def test_generate_image_errors_without_environment(self):
+        """未配置环境变量时直接明确报错，不再回退内置 Key。"""
         env = {k: v for k, v in os.environ.items() if k != "HUNYUAN_API_KEY"}
         with mock.patch.dict(os.environ, env, clear=True):
-            fallback = hunyuan_image._resolve_api_key()
-        self.assertTrue(fallback)
-        self.assertNotIn("env-key", fallback)
+            result = hunyuan_image.generate_image("一只猫")
 
-    def test_generate_image_uses_builtin_key_without_environment(self):
-        """未配置环境变量时，内置 Key 作为回退参与网关鉴权（开箱即用）。"""
-        captured = {}
-
-        def fake_urlopen(request, timeout):
-            captured["authorization"] = request.get_header("Authorization")
-            return _Response({"imageUrl": "https://example.invalid/generated.jpg"})
-
-        def fake_urlretrieve(url, target):
-            with open(target, "wb") as image_file:
-                image_file.write(b"\xff\xd8\xff\xe0")
-
-        env = {k: v for k, v in os.environ.items() if k != "HUNYUAN_API_KEY"}
-        with tempfile.TemporaryDirectory() as save_dir:
-            with mock.patch.dict(
-                os.environ, env, clear=True
-            ), mock.patch.object(
-                hunyuan_image.urllib.request, "urlopen", fake_urlopen
-            ), mock.patch.object(
-                hunyuan_image.urllib.request, "urlretrieve", fake_urlretrieve
-            ):
-                result = hunyuan_image.generate_image("一只猫", save_dir=save_dir)
-
-        self.assertFalse(result.is_error)
-        self.assertEqual(
-            captured["authorization"], "Bearer " + hunyuan_image._resolve_api_key()
-        )
+        self.assertTrue(result.is_error)
+        self.assertIn("HUNYUAN_API_KEY", result.content)
