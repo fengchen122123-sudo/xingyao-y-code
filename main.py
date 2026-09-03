@@ -1791,7 +1791,7 @@ def handle_slash_command(command_text):
                         if m.get("id") == active_id:
                             litellm_model = str(m.get("litellm_model") or "")
                 if litellm_model.split("/")[0].lower() == "anthropic":
-                    print_formatted_text(HTML("<ansiyellow>ℹ 当前模型走 Anthropic 路由，reasoning_effort 不会注入请求（该路由请在配置中设置 thinking_budget）。</ansiyellow>"))
+                    print_formatted_text(HTML("<ansiyellow>ℹ 当前模型走 Anthropic 路由：推理强度会按模型协议自动转换（Kimi K3 → thinking budget，阶跃 → output_config.effort）。</ansiyellow>"))
                 if app_instance:
                     app_instance.invalidate()
             else:
