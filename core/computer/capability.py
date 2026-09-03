@@ -4,14 +4,35 @@ resolve_computer_capability 是纯函数：不读全局 config、不做网络探
 分支。判定只依赖显式传入的模型元数据（supports_vision / supports_function_calling /
 computer_protocol）、provider 的 protocol/base_url、设置快照与 turn_source。
 官方 OpenAI base 只允许规范化 host api.openai.com。
+
+Turn capability handoff（Task 11a F1 收敛）：入口层 worker 线程按
+prepare_turn_messages → chat_with_model_events 顺序串行完成一个生产 Turn；
+prepare 侧（agent_service.build_runtime_context）解析一次后把快照存进本线程
+handoff，模型事件入口取出复用，避免同一 Turn 解析两次。handoff 取出即清空
+（一次性），只在同线程内可见，绝不是跨回合/跨线程的全局状态。
 """
 
+import threading
 from urllib.parse import urlsplit
 
 from core.computer.models import ComputerCapability, ComputerProtocol, ComputerTarget
 from core.computer.settings import ComputerSettingsSnapshot
 
 _OFFICIAL_OPENAI_HOST = "api.openai.com"
+
+_TURN_CAPABILITY_HANDOFF = threading.local()
+
+
+def set_turn_computer_capability(capability) -> None:
+    """记录本线程 Turn 准备阶段解析出的电脑操控能力快照。"""
+    _TURN_CAPABILITY_HANDOFF.capability = capability
+
+
+def take_turn_computer_capability():
+    """一次性取出本线程的准备阶段能力快照；从未存入或已取出时返回 None。"""
+    capability = getattr(_TURN_CAPABILITY_HANDOFF, "capability", None)
+    _TURN_CAPABILITY_HANDOFF.capability = None
+    return capability
 
 
 def _rejected(settings: ComputerSettingsSnapshot, code: str, reason: str) -> ComputerCapability:

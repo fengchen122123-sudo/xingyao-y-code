@@ -102,9 +102,20 @@ def prepare_stream_request(
     protocol: str,
     chat_kwargs: dict,
     timeout: int,
+    *,
+    native_computer_tools: tuple | list = (),
 ) -> PreparedStreamRequest:
-    """Build the one kwargs mapping that will be submitted to the provider."""
+    """Build the one kwargs mapping that will be submitted to the provider.
+
+    native_computer_tools（Task 11a，设计 11.1）是 capability 分支直接传入的
+    精确 Responses 原生 computer 工具定义（computer_select_target function
+    schema 与/或 {"type":"computer"} built-in）：只追加在 flattened function
+    tools 之后，不经 _responses_tools_from_chat_tools（它仍拒绝任意 built-in）。
+    非 responses 协议携带非空原生工具是接线错误，显式失败绝不静默丢弃。
+    """
     if protocol != "responses":
+        if native_computer_tools:
+            raise ValueError("native computer tools 仅支持 responses 协议")
         provider_kwargs = dict(chat_kwargs)
         provider_kwargs["timeout"] = timeout
         return PreparedStreamRequest(protocol=protocol, kwargs=provider_kwargs)
@@ -113,7 +124,10 @@ def prepare_stream_request(
         "model": chat_kwargs["model"],
         "api_key": chat_kwargs.get("api_key"),
         "input": _responses_input_from_messages(chat_kwargs.get("messages") or []),
-        "tools": _responses_tools_from_chat_tools(chat_kwargs.get("tools") or []),
+        "tools": [
+            *_responses_tools_from_chat_tools(chat_kwargs.get("tools") or []),
+            *(native_computer_tools or ()),
+        ],
         "stream": True,
         "timeout": timeout,
     }
@@ -123,6 +137,7 @@ def prepare_stream_request(
         ("tool_choice", "tool_choice"),
         ("num_retries", "num_retries"),
         ("extra_body", "extra_body"),
+        ("parallel_tool_calls", "parallel_tool_calls"),
     ):
         if source in chat_kwargs:
             provider_kwargs[target] = chat_kwargs[source]

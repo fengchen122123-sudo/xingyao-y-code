@@ -1270,7 +1270,7 @@ Suggested commit after explicit authorization: `feat(harness): add generic compu
 - Produces: one immutable capability snapshot per Turn, reused by every Step
 - Produces: default-off request bytes identical to pre-feature baseline
 
-- [ ] **Step 1: 写 Turn 冻结和默认关闭字节测试**
+- [x] **Step 1: 写 Turn 冻结和默认关闭字节测试**
 
 ```python
 def test_computer_capability_is_resolved_once_per_turn(monkeypatch, generic_model):
@@ -1322,19 +1322,19 @@ def test_old_computer_screenshots_do_not_accumulate(store, session):
     assert count_unfolded_media_rows(store, session) <= 1  # 只有最新一条保留图片
 ```
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_llm_generic.py tests/test_memory_maintenance.py tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q`
 
 Expected: 新 capability 上下文和工具注入不存在；原有 golden 测试仍应单独通过。
 
-- [ ] **Step 3: 在 Turn 起点解析一次能力**
+- [x] **Step 3: 在 Turn 起点解析一次能力**
 
 在 `core/agent_service.py` 已确定当前 model/provider、turn source、settings 和 turn id 后立即解析，存入本次调用的局部不可变 `ComputerCapability`，并传给 `core.llm.chat_with_model_events(...)` 和 `ToolExecutionContext`。不要写模块级“当前 capability”。
 
 来源必须由入口层给出受控值 `local|lan`；不得从用户消息或模型参数读取。关闭设置时通过 generation/controller cancel 终止活动动作，不重算该 Turn 的 request contract。
 
-- [ ] **Step 4: 只向动态 prompt 追加电脑说明**
+- [x] **Step 4: 只向动态 prompt 追加电脑说明**
 
 扩展 `RuntimeContext` 默认字段：
 
@@ -1344,7 +1344,7 @@ computer_capability: ComputerCapability | None = None
 
 `build_dynamic_prompt()` 末尾仅在 `capability and capability.enabled` 时追加 `build_generic_dynamic_prompt()` 或原生短说明。`build_stable_prompt()`、`build_stable_system_message()` 和 `_DECISION_POLICY` 一字不改。默认 `None/disabled` 返回值必须与修改前完全相同，包括换行。
 
-- [ ] **Step 5: 在 route tool selection 后追加 generic tool**
+- [x] **Step 5: 在 route tool selection 后追加 generic tool**
 
 在现有 tools 已按 provider/权限/plan 路由完成之后复制列表：
 
@@ -1357,7 +1357,7 @@ if computer_tool is not None:
 
 然后才交给 RequestEnvelope 指纹和 Provider 转换。不得缓存到全局 `get_tools_schema()`。DeepSeek Ledger 看到新 contract 时走现有切代；不要专门改 Ledger。Kimi/GLM metadata、cache-control、reasoning、`extra_body` 保持原逻辑。
 
-- [ ] **Step 6: 提交工具结果和观察消息的同 Step 边界，扩展媒体折叠**
+- [x] **Step 6: 提交工具结果和观察消息的同 Step 边界，扩展媒体折叠**
 
 现有 `ToolBatchExecutor` 返回 records 后：
 
@@ -1374,7 +1374,7 @@ persist_messages(followups)
 
 带 `_computer_v1` 的 follow-up 观察消息以完整 dict 持久化时，`core/memory.py` 的 `_content_has_media()` 和 `_fold_stale_media_locked()` 必须同时识别两种形态：content 列表，以及含 `content` 列表的完整消息 dict。折叠只替换媒体块为文本占位符，不删除或改写 `_computer_v1` 私有元数据；折叠后字节永久冻结（幂等）。该改动不得改变现有非电脑消息的折叠行为——普通用户图片消息的折叠结果字节必须与改动前完全一致。
 
-- [ ] **Step 7: GREEN 与缓存/ledger 回归**
+- [x] **Step 7: GREEN 与缓存/ledger 回归**
 
 Run:
 
@@ -1387,6 +1387,21 @@ git diff --check -- core/context_builder.py core/agent_service.py core/llm.py co
 Expected: 现有 hash/expected 文件内容无变化；enabled generic 只在 tools 尾部多一个 schema；同 Turn 多 Step schema 稳定；旧电脑截图按现有媒体折叠收敛、折叠幂等。
 
 Suggested commit after explicit authorization: `feat(llm): route generic computer turns`
+
+#### Execution Record — Task 10
+
+**Execution Record (2026-09-03, implementer subagent, no commit per K3):**
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_llm_generic.py tests/test_memory_maintenance.py -q` → exit 1 | 22 failed / 8 passed in 0.66s | test_computer_llm_generic 17 条收集失败或断言失败：15 条 AttributeError（`core.llm` 无 `resolve_computer_capability` 属性——接线点不存在）、2 条 TypeError（`chat_with_model_events() got an unexpected keyword argument 'computer_turn_source'`、`RuntimeContext.__init__() got an unexpected keyword argument 'computer_capability'`）；test_memory_maintenance 新增 5 条中 3 条真失败（`_content_has_media` 对完整消息 dict 返回 False、dict 形态行不折叠导致 base64 残留）+ 2 条 RED 期平凡通过（`test_old_computer_screenshots_do_not_accumulate` 在折叠缺失时 count==0 同样满足 ≤1，GREEN 后才具备真实区分度）——失败原因全部是目标能力缺失。另按 brief Step 2 期望单独验证原 golden：`venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` → 17 passed / 2.54s / exit 0（改动前基线完好）。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_llm_generic.py tests/test_memory_maintenance.py -q` → 30 passed / 0.68s / exit 0（test_computer_llm_generic 20 条：resolve 一次冻结×多 Step、tools 尾部追加不重排、默认关闭逐字节等于 pre-feature 真实捕获基线 `EXISTING_DEFAULT_REQUEST_BYTES`、capability=None 同基线、中途开启不改本 Turn、中途关闭 contract 不换 schema+9 键 computer_disabled、动态 prompt enabled 追加/None==disabled 逐字节、native 短说明不含 generic 文本、stable prompt 不含电脑段、tool result→followup 同序提交+`_computer_v1` 不进 Provider 请求、followup 完整 dict 落库、混用批次拒绝 computer 且其他工具照常、多 computer call 双拒、取消打捞 computer_cancelled+stop 收尾、正常收尾 complete_run、无 computer 调用不建 run、busy 时精确稳定错误、turn_source 透传、非法 turn_source ValueError、子代理回合不解析不注入；test_memory_maintenance 10 条：原 5 条 + dict 形态媒体识别 + 纯列表/纯文本拒绝 + 折叠保留 _computer_v1 且幂等 + 19 条旧截图收敛到 1 + 普通图与电脑观察混排折叠且普通行仍为列表形态）。
+- Regression: brief Step 7 三条命令 → `venv\Scripts\python.exe -m pytest tests/test_computer_llm_generic.py tests/test_computer_provider_generic.py tests/test_memory_maintenance.py tests/test_memory.py tests/test_llm_responses.py tests/test_llm_events_fixes.py -q` → 143 passed / 113.67s / exit 0；`venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py tests/test_deepseek_prompt_ledger.py tests/test_cache_keepalive.py tests/test_token_accounting.py -q` → 64 passed / 3.10s / exit 0；`venv\Scripts\python.exe -m pytest tests/ -q -k "computer" --tb=no` → 474 passed / 1893 deselected / 12.54s / exit 0（≥450 达标）。额外扩散回归：test_llm_events + test_cancellation + test_agent_turn_e2e + test_harness_runtime + test_gui_tool_events + test_session_parallel_isolation → 135 passed / 70.79s；test_tools + test_context_builder → 215 passed / 13.39s；test_agent_service + test_gui_tool_events → 58 passed / 1.40s（stub_llm 桩补 resolve_turn_computer_capability，见偏差 7）；全量 `venv\Scripts\python.exe -m pytest tests/ -q --tb=no` → **2365 passed / 2 skipped / 0 failed** in 242.81s（Task 9 时预存失败的 test_tokenrhythm_image 本轮通过，并发会话已还原 plugin.json）。
+- Compile: `venv\Scripts\python.exe -m py_compile core/llm.py core/agent_service.py core/context_builder.py core/memory.py core/computer/provider_generic.py` → exit 0。
+- Diff check: `git add -N tests/test_computer_llm_generic.py` + `git diff --check -- core/context_builder.py core/agent_service.py core/llm.py core/harness/request_envelope.py core/memory.py tests` → exit 0（仅 LF→CRLF 警告，与 Task 9 一致）。
+- Files touched: `core/context_builder.py`（RuntimeContext 增默认 None 的 computer_capability 字段 + build_dynamic_prompt 末尾仅在 enabled 时追加 `_build_computer_prompt_section`：generic 走 build_generic_dynamic_prompt、native 给短说明；默认 None/disabled 逐字节不变；build_stable_prompt/_DECISION_POLICY 一字未改）、`core/agent_service.py`（build_runtime_context 惰性 import core.llm.resolve_turn_computer_capability 解析一次并注入 RuntimeContext，turn_source 固定受控值 local）、`core/llm.py`（顶层轻量 computer 导入 + `resolve_turn_computer_capability` 公共组合解析（get_model_config_by_litellm_model/get_model_protocol + load_computer_settings + 纯函数，设置读取失败 fail-closed 为 computer_invalid_config 拒绝快照）+ chat_with_model_events 增 computer_turn_source 参数（仅 local|lan，非法 ValueError）并在 Turn 起点解析一次传给 generator（allow_subagents=False 的子代理回合不解析）+ Step 5 在 `_select_request_tools_for_route` 之后复制列表尾部追加 build_generic_computer_tool 副本（不进 get_tools_schema 缓存）+ 接线点② 收到 tool_calls 后执行前 validate_computer_tool_batch，被拒 computer call 在 execute_decoded 拦截合成 computer_error_tool_message 稳定 9 键错误（其余工具照常，零 run 建立）+ 接线点① 惰性 lease：模型首次真正调用 computer_action 时 get_computer_control_service().start_run(owner, capability) 取 run_id 构造 ComputerTurnLease 注入 ToolExecutionContext.computer_lease（start_run 失败时以带错误码的禁用 lease 继续，contract 不重算）+ 接线点③ records 排序后先 messages/pending_persistence 全部 tool results、再按相同 ordinal 追加 followup user 观察（同一 flush 单事务提交）+ salvage 对悬空 computer_action call 生成 computer_cancelled 9 键 JSON + 生成器 finally `_finalize_computer_run`：正常文本收尾 complete_run(retain_browser_session=True)，取消/异常/无进展/Step 上限一律 stop，controller 已终态时幂等跳过 + `_build_tool_pipeline_and_context` 增 computer_lease 透传）、`core/memory.py`（`_content_has_media` 同时识别 content 列表与含 content 列表的完整消息 dict；`_fold_stale_media_locked` dict 形态只折叠 content 内媒体块、`_computer_v1` 等其余键原样保留，列表形态折叠字节与改动前完全一致，幂等不变）、`core/computer/provider_generic.py`（新增公共 `computer_error_tool_message(tool_call, error)`：批处理拒绝与取消打捞共用的 9 键 JSON 合成，参数解析失败 target/kind 空串占位）、`tests/computer_fakes.py`（FakeController 增 start_run/complete_run/stop 最小生命周期记录与 start_error/complete_error/stop_error/run_status，向后兼容 Task 9 用法）、`tests/test_computer_llm_generic.py`（新建 20 条，helper 全部模块内定义）、`tests/test_memory_maintenance.py`（+5 条与 store/session fixture、add_observation_message/raw_content_of/count_unfolded_media_rows 模块内 helper）、`tests/test_agent_service.py`（stub_llm 桩补 resolve_turn_computer_capability→None，见偏差 7）、本计划文件（checkbox 与本记录）。
+- spec: PASS（capability 每 Turn 在 chat_with_model_events 起点解析一次、局部不可变快照贯穿全部 Step，无模块级状态；generic tool 只在 enabled+generic 且主代理回合时复制列表尾部追加，绝不缓存进 get_tools_schema；DeepSeek Ledger/Kimi/GLM metadata/cache-control/reasoning/extra_body 原逻辑零改动（64 条 golden 原样通过）；收到 tool_calls 后执行前整批校验，多个/混用 computer call 本 Step 零副作用、其余工具照常；followup 在同 Step 既有提交边界按 ordinal 追加在全部 tool results 之后；取消打捞 computer_cancelled；Turn 终态 finally 二选一 complete/stop 不留 running 租约；媒体折叠双形态识别、dict 折叠保留 _computer_v1、幂等、普通消息折叠字节不变）。
+- privacy: PASS（follow-up user 消息以完整 dict 持久化，`_computer_v1` 只存在于 DB 与内存消息；Provider 请求经 _strip_media_and_merge 只保留 role/content/tool 字段——专项断言第二请求 messages 无 `_computer_v1` 且 data URL 保留；Journal event 只哈希剥离后的 tool content，followup user 消息不产生 Journal 事件；computer_error_tool_message/cancelled 均为 9 键 JSON，无截图/输入正文/旧图；OWNER cancel_event 语义未被触碰）。
+- default-byte: PASS（默认关闭：resolve 走真实配置（本机 config 无 computer 键、模型无 computer_protocol）返回 disabled，build_generic_computer_tool 返回 None，tools/prompt/请求字节零变化；新测试以未改动代码真实捕获的 `EXISTING_DEFAULT_REQUEST_BYTES` 常量逐字节比对，DISABLED 与 capability=None 两种路径均等于基线；test_prompt_byte_stability 5 条 + test_provider_payload_golden 12 条 + DeepSeek ledger/cache keepalive/token accounting 共 64 条原样通过，未改任何现有 expected/hash）。
+- unresolved/deviations: (1) `core/harness/request_envelope.py` 在 Task 10 Files 清单但零改动——generic 路径的 tools 指纹与消息清洗已被现有 `RequestEnvelope.capture` + `_strip_media_and_merge` 完整覆盖（`_computer_v1` 在请求构造前被剥离，tools_sha256 随尾部追加自然变化），native continuation 的 envelope 改动归 Task 11b；(2) `core/computer/provider_generic.py` 不在 Files 清单，新增公共 `computer_error_tool_message`（最小扩展，复用 Task 9 `_error_result`，避免在 llm.py 平行实现 9 键 JSON 合成）；(3) lease/start_run 为惰性建立（模型首次真正调用 computer_action 时）而非 Turn 起点立即建立——brief 接线点①的"解析 capability"确实在 Turn 起点一次完成，start_run 推迟到首个 computer call：普通对话回合不占用进程级排他租约（设计 14.1 busy 语义 + 16.1 安全条"只在 run 非 idle 时显示"支持该读法），Turn 终态 finally complete/stop 语义不变；start_run 失败（如 computer_session_busy）以带错误码的禁用 lease 继续、contract 不重算，模型收到精确稳定错误（非降级：不换浏览器/协议/旧图）；(4) 子代理回合（allow_subagents=False）不解析也不注入电脑操控（入口层 turn_source 语义 + 单租约 owner 归属主 Turn），有专项测试；(5) brief 的 golden 相关 Modify 文件（test_prompt_byte_stability/test_provider_payload_golden/test_deepseek_prompt_ledger/test_cache_keepalive）零改动——默认关闭字节断言（pre-feature 真实捕获常量）已在新测试文件内，现有 expected 全部原样通过；(6) `computer_turn_source` 参数默认 "local"，入口层 main.py/gui_bridge.py 不在 Files 清单未改，LAN 的 turn_source=lan 标记为后续 Task 范围；(7) `tests/test_agent_service.py` 不在 Files 清单，stub_llm 桩（把 core.llm 换成轻量 ModuleType 避免 litellm）缺 `resolve_turn_computer_capability` 导致 13 条 ImportError——按"最小调整"纪律补一行 `stub.resolve_turn_computer_capability = lambda *args, **kwargs: None`；(8) 会话中途出现并发会话改动：tests/test_llm_responses.py +30 行（responses 桥接枚举归一化测试）与 core/llm.py 内 `_normalize_responses_event_type` 2 个 hunk（+18/-1，非本 Task 作者），以及未跟踪目录 `待开发/`——全部未触碰，共存后全量回归 0 失败；(9) 中途关闭设置的 controller 侧自动 stop 由真实 controller 的 generation 检查在 execute 内完成（设计 8.1，Task 8 已交付），generator 侧只保证 contract 冻结与收尾幂等。
 
 ---
 
