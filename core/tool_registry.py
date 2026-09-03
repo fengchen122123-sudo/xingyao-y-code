@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Iterable
 
+from core.computer.tool_adapter import RESERVED_COMPUTER_TOOL_NAMES
 from core.tool_protocol import ToolResult, ToolSpec
+
+_LOGGER = logging.getLogger(__name__)
 
 # 调度层（core/llm.py）会向 arguments 注入 schema 之外的内部上下文参数，
 # 过滤未知参数时必须放行这些键，否则会破坏取消/权限链路
@@ -26,6 +30,11 @@ class ToolRegistry:
     def register(self, spec: ToolSpec) -> None:
         if not spec.name:
             raise ValueError("tool name must not be empty")
+        if spec.name in RESERVED_COMPUTER_TOOL_NAMES:
+            # Harness 保留名（设计第 6 节规则 8）：computer_action /
+            # computer_select_target 由固定适配器执行，插件注册同名工具
+            # 直接拒绝；插件加载器会把该异常记为插件 failed 状态。
+            raise ValueError(f"reserved computer tool name: {spec.name}")
         if spec.name in self._specs:
             raise ValueError(f"duplicate tool: {spec.name}")
         self._specs[spec.name] = spec
@@ -84,6 +93,29 @@ def _schema(properties: dict[str, Any], required: list[str] | None = None, **ext
         if value is not None:
             result[key] = value
     return result
+
+
+def filter_reserved_tool_schemas(schemas: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
+    """MCP schema 合并时的保留名过滤（设计 19.2）。
+
+    MCP server 暴露 computer_action / computer_select_target 同名工具时，
+    明确跳过该扩展并记录失败状态（warning 日志）；无保留名时返回与输入
+    逐项相同的列表，tools 字节保持不变。
+    """
+    blocked: list[str] = []
+    allowed: list[dict[str, Any]] = []
+    for schema in schemas:
+        name = str(schema.get("function", {}).get("name", "") or "")
+        if name in RESERVED_COMPUTER_TOOL_NAMES:
+            blocked.append(name)
+        else:
+            allowed.append(schema)
+    if blocked:
+        _LOGGER.warning(
+            "MCP 提供了电脑操控保留名工具，已拒绝合并: %s",
+            ", ".join(sorted(set(blocked))),
+        )
+    return allowed
 
 
 def build_default_registry() -> ToolRegistry:

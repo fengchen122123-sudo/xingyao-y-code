@@ -18,8 +18,10 @@ PRESET_PROVIDERS = (
         "protocol": "anthropic",
         "models": [
             {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": True},
-            {"name": "k3", "context_window": 1000000, "supports_vision": True},
-            {"name": "k3-256k", "context_window": 256000, "supports_vision": True},
+            {"name": "k3", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
+            {"name": "k3-256k", "context_window": 256000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
         ],
     },
     {
@@ -29,8 +31,10 @@ PRESET_PROVIDERS = (
         "protocol": "openai",
         "models": [
             {"name": "kimi-for-coding", "context_window": 262144, "supports_vision": True},
-            {"name": "k3", "context_window": 1000000, "supports_vision": True},
-            {"name": "k3-256k", "context_window": 256000, "supports_vision": True},
+            {"name": "k3", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
+            {"name": "k3-256k", "context_window": 256000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
         ],
     },
     {
@@ -39,7 +43,8 @@ PRESET_PROVIDERS = (
         "base_url": "https://api.moonshot.cn/v1",
         "protocol": "openai",
         "models": [
-            {"name": "kimi-k3", "context_window": 1000000, "supports_vision": True},
+            {"name": "kimi-k3", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
             {"name": "kimi-k2.7-code", "context_window": 262144, "supports_vision": False},
             {"name": "kimi-k2.6", "context_window": 262144, "supports_vision": False},
         ],
@@ -52,7 +57,8 @@ PRESET_PROVIDERS = (
         "models": [
             {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
             {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
-            {"name": "deepseek-v4-flash-vision-exp", "context_window": 1000000, "supports_vision": True},
+            {"name": "deepseek-v4-flash-vision-exp", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
         ],
     },
     {
@@ -86,7 +92,8 @@ PRESET_PROVIDERS = (
             {"name": "glm-5.1", "context_window": 200000, "supports_vision": False},
             {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
-            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},
+            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
             {"name": "seed-2.1-turbo", "context_window": 262144, "supports_vision": True},
             {"name": "seed-2.1-pro", "context_window": 262144, "supports_vision": True},
         ],
@@ -110,7 +117,8 @@ PRESET_PROVIDERS = (
             {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
             {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
-            {"name": "kimi-k3", "context_window": 1000000, "supports_vision": True},
+            {"name": "kimi-k3", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
         ],
     },
     {
@@ -183,7 +191,8 @@ PRESET_PROVIDERS = (
         "protocol": "openai",
         "models": [
             {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
-            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},
+            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
             {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
         ],
@@ -195,7 +204,8 @@ PRESET_PROVIDERS = (
         "protocol": "openai",
         "models": [
             {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
-            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},
+            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
             {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
         ],
@@ -207,7 +217,8 @@ PRESET_PROVIDERS = (
         "protocol": "anthropic",
         "models": [
             {"name": "glm-5.3", "context_window": 1000000, "supports_vision": False},
-            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True},
+            {"name": "glm-5.3-flash", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True, "computer_protocol": "generic"},
             {"name": "glm-5.2", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
         ],

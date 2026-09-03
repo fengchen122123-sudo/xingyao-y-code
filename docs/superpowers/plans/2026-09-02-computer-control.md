@@ -148,7 +148,7 @@ fixture 只能实现对应 Protocol 的最小确定性行为，禁止访问真�
 - Produces: `scripts/smoke_computer_control.py --probe-browser edge|chrome`
 - Does not produce: 浏览器下载、真实键鼠输入或默认工具 schema 变化
 
-- [ ] **Step 1: 记录干净基线与用户已有变更**
+- [x] **Step 1: 记录干净基线与用户已有变更**
 
 Run:
 
@@ -162,7 +162,7 @@ npm --prefix frontend run build
 
 Expected: branch 为 `dev`；现有用户修改被记录但不清理；所有门禁退出码为 0。若基线失败，停止实施并用 `superpowers:systematic-debugging` 定位，不能把既有失败算作本功能 RED。
 
-- [ ] **Step 2: 写依赖与探测失败测试**
+- [x] **Step 2: 写依赖与探测失败测试**
 
 创建 `tests/test_computer_dependency.py`：
 
@@ -182,13 +182,13 @@ def test_playwright_python_api_is_importable():
     assert callable(sync_playwright)
 ```
 
-- [ ] **Step 3: 运行并确认 RED**
+- [x] **Step 3: 运行并确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_dependency.py -q`
 
 Expected: 至少因 `requirements.txt` 尚未声明 Playwright 或模块未安装而失败。
 
-- [ ] **Step 4: 声明并安装 Python 依赖，不下载浏览器**
+- [x] **Step 4: 声明并安装 Python 依赖，不下载浏览器**
 
 在 `requirements.txt` 增加一行：
 
@@ -200,7 +200,7 @@ Run: `venv\Scripts\python.exe -m pip install "playwright>=1.55,<2"`
 
 禁止运行 `playwright install`。若安装需要网络授权，按运行环境正常申请；不得改用 Selenium 或 CDP 临时代替。
 
-- [ ] **Step 5: 写只读系统 channel 探针**
+- [x] **Step 5: 写只读系统 channel 探针**
 
 `scripts/smoke_computer_control.py` 的探测入口必须要求显式参数并只打开 `about:blank`：
 
@@ -222,7 +222,7 @@ def probe_browser(browser: str) -> int:
 
 `argparse` 只接受 `--probe-browser edge|chrome` 或后续 Task 增加的显式烟测模式；无参数时打印帮助并退出 2。
 
-- [ ] **Step 6: 确认 GREEN 与默认字节不变**
+- [x] **Step 6: 确认 GREEN 与默认字节不变**
 
 Run:
 
@@ -234,6 +234,21 @@ git diff --check -- requirements.txt tests/test_computer_dependency.py scripts/s
 Expected: 全部通过；golden 文件本身无 diff。系统 channel GUI 探针只在用户明确允许弹出浏览器时人工运行，不计入自动 pytest。
 
 Suggested commit after explicit authorization: `build: declare system-browser Playwright dependency`
+
+#### Execution Record — Task 1
+
+- Baseline: `venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py tests/test_deepseek_prompt_ledger.py tests/test_token_accounting.py -q` | exit 0 | 54 passed in 8.00s（墙钟约 10s）。分支 `dev`；工作树仅含用户已有修改 `frontend/src/components/Sidebar.vue`，未触碰。前端 vitest（490 passed）与 frontend build（exit 0）采用用户提供的冻结基线结论，本 Task 未重跑。
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_dependency.py -q` | exit code 1 | 失败测试 `test_playwright_is_declared_without_browser_download_hook`、`test_playwright_python_api_is_importable` | 目标失败原因：`requirements.txt` 尚未声明 playwright（`AssertionError: 'playwright>=' not in requirements`）且模块未安装（`ModuleNotFoundError: No module named 'playwright'`）| 2 failed in 1.38s（墙钟约 3s）。
+- Dependency install: `venv\Scripts\python.exe -m pip install "playwright>=1.55,<2"` | exit 0 | 安装 playwright-1.62.0、pyee-13.0.1（greenlet/typing-extensions 已满足）。未运行 `playwright install`，未下载浏览器。前两次调用因 shell 300s 前台超时在 wheel 下载阶段被中断，第三次（`-v`）在 90s 内完成，属环境性下载耗时，非代码问题。`venv\Scripts\python.exe -c "from playwright.sync_api import sync_playwright"` exit 0。
+- Probe gate: `venv\Scripts\python.exe -m py_compile scripts/smoke_computer_control.py tests/test_computer_dependency.py` exit 0；`venv\Scripts\python.exe scripts/smoke_computer_control.py`（无参数）exit 2 且打印帮助，未启动任何浏览器。`--probe-browser` 人工探针按计划留待用户执行。
+- GREEN / Regression: `venv\Scripts\python.exe -m pytest tests/test_computer_dependency.py tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` | exit 0 | 19 passed in 8.52s（墙钟约 11s）。
+- Default-byte: `git diff --stat -- tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py` | exit 0 | 输出为空，golden 零改动。
+- Diff check: `git add -N tests/test_computer_dependency.py scripts/smoke_computer_control.py && git diff --check` | exit 0；`git diff --check -- requirements.txt tests/test_computer_dependency.py scripts/smoke_computer_control.py` | exit 0；`git status --porcelain` 仅含 `M frontend/src/components/Sidebar.vue`（用户原有）、`M requirements.txt`、`A scripts/smoke_computer_control.py`、`A tests/test_computer_dependency.py`，无计划外文件。
+- Files touched: `requirements.txt`（追加 `playwright>=1.55,<2`）、`tests/test_computer_dependency.py`（新建）、`scripts/smoke_computer_control.py`（新建）、本计划文件（本记录与 checkbox）。
+- Review — spec: 符合。requirements 声明 `playwright>=1.55,<2` 且无 `playwright install` hook；`probe_browser` 逐字采用 brief 给定实现（`msedge`/`chrome` channel、`headless=False`、viewport `1440×900`、仅 `about:blank`）；argparse 仅接受 `--probe-browser edge|chrome`，无参数打印帮助并退出 2（实测）。
+- Review — privacy: 符合。不读取/复制用户浏览器 profile，不下载浏览器，不发送真实键鼠，probe 仅打开 `about:blank`。
+- Review — default-byte: 符合。byte-stability 与 payload golden 全部通过且文件零 diff；默认工具 schema 无变化。
+- Review — unresolved: `--probe-browser edge|chrome` 人工 GUI 探针未执行（按计划由用户在允许弹出浏览器时运行）；前端 vitest/build 基线未在本 Task 重跑。
 
 ---
 
@@ -252,7 +267,7 @@ Suggested commit after explicit authorization: `build: declare system-browser Pl
 - Produces: `ComputerBackend` Protocol
 - Produces: `COMPUTER_ACTION_TOOL_SCHEMA`, `parse_computer_action()`, `observation_provider_projection()`
 
-- [ ] **Step 1: 写严格解析失败测试**
+- [x] **Step 1: 写严格解析失败测试**
 
 创建覆盖合法动作、未知字段、`bool` 坐标、字段互斥、8000 字符、100–10000 ms、最多 8 键、URL scheme、browser-only 导航、拖拽路径和用户接管的参数化测试：
 
@@ -303,13 +318,13 @@ def test_parse_action_rejects_invalid_payload(payload):
 
 `drag` 必须恰好提供 `path`（2–256 个整数坐标点）或起终点 `x/y/end_x/end_y` 之一，同时提供二者或都不提供均拒绝；起终点输入解析后立即规范化为两点 `path`。`request_user_takeover` 只接受 `login_required|captcha_required|credential_required`。
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_models.py -q`
 
 Expected: collection 因 `core.computer` 不存在而失败。
 
-- [ ] **Step 3: 实现不可变值对象和 backend Protocol**
+- [x] **Step 3: 实现不可变值对象和 backend Protocol**
 
 `models.py` 使用 `str, Enum` 和 `@dataclass(frozen=True)`；核心形状固定为：
 
@@ -350,7 +365,7 @@ class ComputerBackend(Protocol):
 
 `keys` 既用于 `keypress` 组合键，也作为受支持鼠标动作（click/double_click/drag）的 modifier；`path` 是拖拽的唯一规范表示（起终点输入解析后立即规范化）。`ComputerControlError.__str__` 返回中文 message，`code` 保持设计规格的稳定英文错误码。快照和观察的 `repr` 不得暴露 `text` 或本地截图绝对路径。
 
-- [ ] **Step 4: 实现白名单动作解析**
+- [x] **Step 4: 实现白名单动作解析**
 
 `actions.py` 必须使用每种动作的允许字段集合，不得通过删除未知字段继续：
 
@@ -376,7 +391,7 @@ _ALLOWED = {
 
 `drag` 的互斥规则：`path` 与 `x/y/end_x/end_y` 恰好提供其一，起终点输入解析后立即规范化为两点 `path`，存储层不再保留 `end_x/end_y` 字段。实现 `_strict_int()` 显式拒绝 `bool`；`urllib.parse.urlsplit` 只允许 `http|https` 且必须有 hostname；组合键只允许 `CTRL, ALT, SHIFT, META, ENTER, TAB, ESC, SPACE, BACKSPACE, DELETE, HOME, END, PAGEUP, PAGEDOWN, UP, DOWN, LEFT, RIGHT, A-Z, 0-9, F1-F12`；`reason_code` 只允许 `login_required|captcha_required|credential_required`。
 
-- [ ] **Step 5: GREEN、序列化与隐私回归**
+- [x] **Step 5: GREEN、序列化与隐私回归**
 
 Run:
 
@@ -389,6 +404,19 @@ git diff --check -- core/computer tests/test_computer_models.py
 Expected: 所有输入边界通过；Provider 投影不含 `png_path`、时间戳、完整 URL query、输入正文。
 
 Suggested commit after explicit authorization: `feat(computer): add strict action domain`
+
+#### Execution Record — Task 2
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_models.py -q` | exit 2 | collection 中断（1 error during collection）| 目标失败原因：`ModuleNotFoundError: No module named 'core.computer'`（导入 `core.computer.actions` / `core.computer.models` 失败）| 1 error in 0.53s。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_models.py -q` | exit 0 | 163 passed in 1.71s（墙钟约 4s）。注：首次 GREEN 运行 161 passed + 4 error，4 个 error 均为 Windows 环境变量 32767 字符上限导致 `PYTEST_CURRENT_TEST` 写入失败（8000/8001 个 CJK 字符的参数化 ID 过长），非断言失败；为相关参数化加短 `ids` 后全绿。
+- Compile: `venv\Scripts\python.exe -m py_compile core/computer/models.py core/computer/actions.py core/computer/__init__.py tests/test_computer_models.py` | exit 0。
+- Regression: `venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` | exit 0 | 17 passed in 9.59s。`git diff --stat -- tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py` 输出为空，golden 零改动。
+- Diff check: `git add -N core/computer/__init__.py core/computer/models.py core/computer/actions.py tests/test_computer_models.py && git diff --check` | exit 0；`git diff --check -- core/computer tests/test_computer_models.py` | exit 0。`git status --porcelain` 仅含 Task 1 已有文件（requirements.txt、scripts/smoke_computer_control.py、tests/test_computer_dependency.py）、用户原有 `M frontend/src/components/Sidebar.vue`、本计划文件与本 Task 四个新文件，无计划外文件。
+- Files touched: `core/computer/__init__.py`（新建）、`core/computer/models.py`（新建）、`core/computer/actions.py`（新建）、`tests/test_computer_models.py`（新建）、本计划文件（checkbox 与本记录）。未修改任何现有代码文件。
+- Review — spec: 符合。枚举为 str+Enum 且取值与设计 7.1 逐字一致；ComputerOwner/ComputerAction 采用 brief 固定形状（ComputerAction 额外保留恒为 None 的 end_x/end_y 以满足 brief 样例断言，path 为拖拽唯一规范表示）；_ALLOWED 白名单逐字采用 brief；`_strict_int` 以 `type(value) is not int` 拒绝 bool/float/NaN/字符串；urlsplit 只放行 http/https 且必须有 hostname；键白名单为 CTRL/ALT/SHIFT/META/ENTER/TAB/ESC/SPACE/BACKSPACE/DELETE/HOME/END/PAGEUP/PAGEDOWN/UP/DOWN/LEFT/RIGHT + A-Z + 0-9 + F1-F12，最多 8 个；reason_code 只接受 login_required|captcha_required|credential_required；navigate/back/forward/reload 仅限 browser target；text 上限 8000 code point；wait 100-10000；drag path 2-256 点且与起终点严格互斥、起终点解析后立即规范化为两点 path。
+- Review — privacy: 符合。ComputerAction.text 与 ComputerObservation.png_path 均为 field(repr=False)，repr 测试验证不泄露正文与本地截图绝对路径；observation_provider_projection 只含 ok/target/action/screen_sha256/width/height/origin_or_window/error_code/error_message 九个键，browser 用 page_origin（无 path/query/fragment）、desktop 用窗口摘要，不含 png_path、时间戳或输入正文；ComputerRunSnapshot.to_public_dict() 无 text/png/api_key/cookie 字段。
+- Review — default-byte: 符合。prompt byte-stability 与 provider payload golden 17 passed 且文件零 diff；本 Task 不触碰任何请求构造路径。
+- Review — unresolved: ~~keypress 键名大小写归一~~（已在审查修复中改为严格模式：键名必须逐字匹配大写白名单，小写直接 computer_invalid_action）；COMPUTER_ACTION_TOOL_SCHEMA 的 description 文案为自撰（设计只规定语义要点），后续 Task 若需 byte-golden 可冻结。
 
 ---
 
@@ -411,7 +439,7 @@ Suggested commit after explicit authorization: `feat(computer): add strict actio
 - Produces: `get_browser_profile_dir(browser: str) -> Path`
 - Produces: `get_settings_generation() -> int`
 
-- [ ] **Step 1: 写默认值、损坏配置、preflight 和关闭顺序测试**
+- [x] **Step 1: 写默认值、损坏配置、preflight 和关闭顺序测试**
 
 ```python
 def test_missing_computer_settings_are_safe_defaults(tmp_path, monkeypatch):
@@ -448,13 +476,13 @@ def test_disable_persists_and_increments_generation_before_stop(tmp_path, monkey
     assert get_settings_generation() == before + 1
 ```
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_settings.py tests/test_gui_system_settings.py -q`
 
 Expected: 新模块或新增快照字段不存在。
 
-- [ ] **Step 3: 实现严格设置与显式浏览器发现**
+- [x] **Step 3: 实现严格设置与显式浏览器发现**
 
 固定常量：
 
@@ -481,7 +509,7 @@ def _read_bool(data: dict, key: str) -> bool:
 
 三个 setter 使用现有 `config.save_config_value()`；任何返回 `False` 都抛 `computer_invalid_config`。活动 run 时修改 browser 抛 `computer_session_busy`。
 
-- [ ] **Step 4: 扩展统一系统设置快照**
+- [x] **Step 4: 扩展统一系统设置快照**
 
 `core.command_shell.get_system_settings()` 合并：
 
@@ -505,7 +533,7 @@ return {
 
 `ComputerSettingsSnapshot` 本身不得包含 `hotkey_available` 或 `run_summary`，`settings.py` 不导入 controller/hotkey。不要把 browser profile 文件列表或真实 Cookie 状态放进快照。
 
-- [ ] **Step 5: GREEN 与现有设置回归**
+- [x] **Step 5: GREEN 与现有设置回归**
 
 Run:
 
@@ -517,6 +545,19 @@ git diff --check -- core/computer/settings.py core/command_shell.py tests/test_c
 Expected: 缺失键安全关闭，显式损坏值失败，preflight 失败不落盘，关闭 generation 先变化。
 
 Suggested commit after explicit authorization: `feat(computer): add strict control settings`
+
+#### Execution Record — Task 3
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_settings.py tests/test_gui_system_settings.py -q` | exit 2 | collection 中断（1 error during collection）| 目标失败原因：`ModuleNotFoundError: No module named 'core.computer.settings'`（tests/test_computer_settings.py 导入失败）| 1 error in 1.97s。单独运行 `tests/test_gui_system_settings.py` | exit 1 | 2 failed（`test_system_settings_snapshot_exposes_computer_control_settings`、`test_system_settings_snapshot_reflects_persisted_computer_values`，`KeyError: 'browser_control_enabled'`）, 6 passed in 2.85s。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_settings.py tests/test_gui_system_settings.py -q` | exit 0 | 54 passed in 4.74s。注：首轮 GREEN 出现 1 个 `NameError: name 'sys' is not defined`（两个并行 StrReplaceFile 编辑同一文件相互覆盖导致 import sys 丢失），补回 import 后全绿，非实现逻辑问题。
+- Compile: `venv\Scripts\python.exe -m py_compile core/computer/settings.py core/command_shell.py tests/computer_fakes.py tests/test_computer_settings.py tests/test_gui_system_settings.py` | exit 0。
+- Regression: `venv\Scripts\python.exe -m pytest tests/test_computer_settings.py tests/test_gui_system_settings.py tests/test_config.py tests/test_config_toml_overlay.py -q` | exit 0 | 95 passed in 9.94s；`venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` | exit 0 | 17 passed in 7.88s；邻近消费者 `tests/test_computer_models.py tests/test_command_shell.py` | 197 passed in 2.98s；`tests/test_context_builder.py tests/test_gui_model_settings.py` | 19 passed in 2.47s。
+- Diff check: `git add -N core/computer/settings.py tests/computer_fakes.py tests/test_computer_settings.py && git diff --check -- core/computer/settings.py core/command_shell.py tests/computer_fakes.py tests/test_computer_settings.py tests/test_gui_system_settings.py` | exit 0。`git status --porcelain` 无计划外新增；`.gitattributes`/`README.md`/`assets/CHANGELOG.md`/`core/hunyuan_image.py`/`scripts/secret_filter.py`/`tests/test_hunyuan_image_auth.py`/`frontend/src/components/Sidebar.vue` 为用户/其他会话已有改动，未触碰。
+- Files touched: `core/computer/settings.py`（新建）、`tests/computer_fakes.py`（新建，仅 use_temp_config）、`tests/test_computer_settings.py`（新建）、`core/command_shell.py`（get_system_settings 聚合 6 个静态键 + import）、`tests/test_gui_system_settings.py`（新增 2 个快照断言测试 + import sys）、本计划文件（checkbox 与本记录）。
+- Review — spec: 符合（含 dispatch 授权的两处最小偏差，见下）。四个固定常量逐字；`_read_bool` 逐字采用 brief（缺失=false、`type(value) is not bool` 拒绝 truthy 转换）；浏览器探测 = shutil.which + ProgramFiles/ProgramFiles(x86) 明确安装路径，每选项独立 available/executable/unavailable_reason，绝不 fallback（有测试证明所选 edge 不可用时 chrome 可用但快照仍选 edge）；profile 路径 `Path(config.YCODE_DIR) / "browser-profiles" / browser`，resolve 后 `is_relative_to` 根校验；活动 run 改 browser 抛 `computer_session_busy`；save_config_value 返回 False 抛 `computer_invalid_config`；开启先 preflight 失败不落盘（错误码 `computer_preflight_failed`，message 含原始原因）；关闭顺序固定为 持久化 false → 递增内存 generation → 返回快照。
+- Review — privacy: 符合。快照只含配置值、generation、浏览器探测结果与 profile 展示路径；无 profile 文件清单、Cookie、凭据；`ComputerSettingsSnapshot` 无 hotkey_available/run_summary；settings.py 只 import os/shutil/sys/threading/dataclasses/pathlib/typing/config/models，已确认不 import controller/hotkey。
+- Review — default-byte: 符合。prompt byte-stability 与 provider payload golden 17 passed，未触碰任何请求构造路径。
+- Review — unresolved / dispatch 授权的偏差（已记入 ledger）：(1) `computer_hotkey_available`/`computer_hotkey`/`computer_run` 三个键依赖 Task 5 hotkey.py 与 Task 8 controller.py，本 Task 未聚合、未建 stub、无 try/except 兜底，待后续 Task 惰性导入接入；(2) `tests/computer_fakes.py` 只实现 `use_temp_config`（额外 monkeypatch `_TOML_CONFIG_FILE` 隔离真实 config.toml overlay），FakeHotkeyApi 等其余契约导出由后续 Task 按需扩展；(3) `load_computer_settings`/`list_browser_options` 增加 keyword-only `platform` 参数（与 command_shell 现有风格一致）以便非 win32 分支可测；(4) 显式安装路径仅覆盖 Program Files/Program Files (x86)（按 dispatch 指示），未覆盖 LocalAppData 绿色安装。
 
 ---
 
@@ -537,7 +578,7 @@ Suggested commit after explicit authorization: `feat(computer): add strict contr
 - Produces: `resolve_computer_capability(model, provider, settings, turn_source) -> ComputerCapability`
 - Produces model fields: `supports_function_calling: bool`, `computer_protocol: "none"|"generic"|"native_openai"`
 
-- [ ] **Step 1: 写能力矩阵失败测试**
+- [x] **Step 1: 写能力矩阵失败测试**
 
 ```python
 @pytest.mark.parametrize("model", [
@@ -570,13 +611,13 @@ def test_native_requires_official_openai_responses(enabled_settings):
     assert capability.error_code == "computer_protocol_mismatch"
 ```
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_capability.py tests/test_model_catalog.py tests/test_model_selector.py -q`
 
 Expected: resolver 和新配置字段不存在。
 
-- [ ] **Step 3: 实现纯函数 resolver**
+- [x] **Step 3: 实现纯函数 resolver**
 
 resolver 不读全局 config、不做网络探测、不按模型名称分支。官方 OpenAI base 只允许规范化 host `api.openai.com`；协议字段必须用 `core/model_manager.py` 的真实字段名 `protocol`（取值如 `"openai"`、`"responses"`），native 判定精确为 `provider.get("protocol") == "responses"` 加规范化官方 base URL，不得发明 `api_protocol` 之类的新字段或按 base URL 字符串猜测。目标按两个设置开关组成固定 tuple。返回对象至少含：
 
@@ -594,7 +635,7 @@ ComputerCapability(
 
 未开启任何 target 返回 `computer_disabled`；非 Windows 返回 `computer_unsupported_os`；LAN 返回 `computer_remote_forbidden`。
 
-- [ ] **Step 4: 严格持久化与预置元数据**
+- [x] **Step 4: 严格持久化与预置元数据**
 
 `model_manager` 的 add/update/export/import 路径都显式保存两个新字段。规则：`type(value) is bool`；protocol 必须在固定集合内；`generic` 不满足视觉与工具能力时保存即拒绝，不能保存一个运行时才失败的半有效组合。
 
@@ -609,7 +650,7 @@ ComputerCapability(
 
 截至 2026-09-02，官方模型目录/单模型页已明确列出 Computer use 的首批 GA 预置至少包括 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.4`、`gpt-5.4-mini`；这些条目可显式标记 `native_openai`。`computer-use-preview` 是仅限 Responses 的旧 preview 模型，但官方新实现指南要求使用 GA `computer` tool，因此本计划不实现 preview 请求变体，也不把该旧模型标为首版可用。实施当天仍需逐个打开官方模型页复核，不能从此清单推断其他型号。官方来源：<https://developers.openai.com/api/docs/models>、<https://developers.openai.com/api/docs/models/gpt-5.4>、<https://developers.openai.com/api/docs/models/gpt-5.4-mini>、<https://developers.openai.com/api/docs/guides/tools-computer-use>。
 
-- [ ] **Step 5: GREEN 与旧配置兼容**
+- [x] **Step 5: GREEN 与旧配置兼容**
 
 Run:
 
@@ -621,6 +662,19 @@ git diff --check -- core/computer/capability.py core/model_catalog.py core/model
 Expected: 旧模型缺字段仍可普通对话和普通工具，但 computer capability 明确 disabled；无 substring 猜测。
 
 Suggested commit after explicit authorization: `feat(models): declare explicit computer capabilities`
+
+#### Execution Record — Task 4
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_capability.py tests/test_model_catalog.py tests/test_model_selector.py -q` | exit 2 | collection 中断（1 error during collection）| 目标失败原因：`ModuleNotFoundError: No module named 'core.computer.capability'` | 1 error in 1.43s。补充运行 `tests/test_model_catalog.py tests/test_model_selector.py tests/test_config.py -q` | exit 1 | 14 failed, 43 passed in 7.54s | 失败原因全部指向目标缺失：catalog 断言 `AssertionError: assert set() == {...}`（目录无能力元数据）、selector 路径 `KeyError: 'computer_protocol'`、config 持久化 `TypeError: add_model_to_provider() got an unexpected keyword argument 'supports_function_calling'` 等。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_capability.py tests/test_model_catalog.py tests/test_model_selector.py tests/test_config.py tests/test_gui_model_settings.py -q` | exit 0 | 89 passed in 7.08s。注：首轮 88 passed + 1 failed，唯一失败是 `test_catalog_preserves_cli_model_metadata` 对 deepseek 条目做精确 dict 相等断言——本 Task 计划内修改（Modify: tests/test_model_catalog.py），已把 `deepseek-v4-flash-vision-exp` 的预期更新为含新元数据后全绿，非实现逻辑问题。
+- Compile: `venv\Scripts\python.exe -m py_compile core/computer/capability.py core/model_manager.py core/model_catalog.py core/model_selector.py tests/computer_fakes.py tests/test_computer_capability.py` | exit 0。
+- Regression: `venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` | exit 0 | 17 passed in 6.98s，golden 文件 `git diff --stat` 输出为空；`tests/test_computer_settings.py tests/test_computer_models.py tests/test_gui_system_settings.py tests/test_config_toml_overlay.py -q` | exit 0 | 246 passed in 3.70s。
+- Diff check: `git add -N core/computer/capability.py tests/test_computer_capability.py && git diff --check` | exit 0（仅既有 LF/CRLF warning）。`git status --porcelain` 无计划外新增；`.gitattributes`/`README.md`/`assets/CHANGELOG.md`/`core/hunyuan_image.py`/`scripts/secret_filter.py`/`tests/test_hunyuan_image_auth.py`/`frontend/src/components/Sidebar.vue` 等为用户/其他会话已有改动，未触碰。
+- Files touched: `core/computer/capability.py`（新建）、`tests/test_computer_capability.py`（新建）、`tests/computer_fakes.py`（追加 enabled_settings fixture / openai_compatible_provider() / 三个 capability 常量）、`core/model_manager.py`（COMPUTER_PROTOCOLS 常量 + 三个校验 helper；add_model_to_provider/update_model/update_provider_and_model/add_preset_provider_with_models/sync_preset_provider_models 显式保存两新字段；get_active_model/get_secondary_model 导出两新字段）、`core/model_catalog.py`（11 个已确认条目加字面量元数据）、`tests/test_model_catalog.py`（更新 deepseek 精确断言 + 新增 2 个元数据测试）、`tests/test_model_selector.py`（新增预置添加路径透传测试）、`tests/test_config.py`（新增 6 个持久化/校验测试 + import pytest）、本计划文件（checkbox 与本记录）。`core/model_selector.py` 未修改：CLI 向导不采集能力字段，add/update 传 None 走“保留既有值”语义，预置路径经 add_preset_provider_with_models 自动透传，无需改动（dispatch 条件“如需透传则做最小修改”判定为不需要）。
+- Review — spec: 符合。resolver 为纯函数（只 import urllib.parse/models/settings，不读 config、不网络探测、无模型名分支，有 `test_missing_or_unknown_protocol_is_never_capable` 证明 gpt-5.4/deepseek 等名字不获得资格）；判定顺序 turn_source→platform→开关→模型协议；LAN/移动（非 "local"）一律 `computer_remote_forbidden`；非 Windows 经 `settings.platform_supported` 判 `computer_unsupported_os`（platform 由 Task 3 快照的 platform 注入参数覆盖，无需 monkeypatch）；无 target 判 `computer_disabled`；generic 三字段缺一判 `computer_model_not_capable`；native 精确为 `provider.get("protocol") == "responses"` + urlsplit 规范化 hostname 恰为 `api.openai.com`（仿冒子域 `api.openai.com.evil.example`、非 responses、缺 base、非法 URL 均判 `computer_protocol_mismatch`）；启用结果含 enabled/protocol/targets 固定 tuple/browser=settings.computer_browser/settings_generation，brief 样例逐字包含。持久化：`type(value) is bool` 严格校验、protocol 限定 none|generic|native_openai、generic 缺视觉或工具能力保存即 ValueError 且不落盘（`cfg.read_bytes() == before` 断言）；update 路径传 None 保留既有值且组合校验针对生效后最终值；预置 add/sync 路径透传目录元数据。catalog 只标记 brief/设计 9.2 点名且真实存在的条目：deepseek-v4-flash-vision-exp、k3/k3-256k（kimi-coding 两个协议各一对）、kimi-k3（moonshot+sensenova）、glm-5.3-flash（token-rhythm/zhipu/zhipu-coding-openai/zhipu-coding-anthropic）共 11 条 generic；gpt-5.6-sol/gpt-5.6-terra/gpt-5.6-luna/gpt-5.4/gpt-5.4-mini 在目录中不存在（无 OpenAI 预置厂商），按 dispatch 指示未发明新条目，故目录暂无任何 native_openai 条目。
+- Review — privacy: 符合。capability.py 不接触凭据/profile/截图；禁用结果 reason 为固定中文短语，不回显 base_url 或模型配置原文；model_manager 新字段与 api_key 写路径无交集（test_config 既有 dpapi 断言全绿）。
+- Review — default-byte: 符合。byte-stability 与 payload golden 17 passed 且文件零 diff；未触碰任何请求构造路径。
+- Review — unresolved / 与计划文字差异：(1) brief 说 "model_manager 的 add/update/export/import 路径"，真实代码无独立 export/import 函数，已映射到全部真实路径——写入侧 add_model_to_provider/update_model/update_provider_and_model/add_preset_provider_with_models/sync_preset_provider_models，导出侧 get_active_model/get_secondary_model；(2) provider 协议字段名确认为 `protocol`（与计划声称一致，无偏差）；(3) `core/model_selector.py` 零修改（见 Files touched）；(4) 官方 OpenAI 模型页复核未在本环境执行（无网络授权动作），native 预置因此保持为空而非按 brief 清单发明条目；(5) gui_bridge.get_model_settings 快照暂不暴露新字段，GUI 模型设置页展示属后续前端 Task。
 
 ---
 
@@ -637,7 +691,7 @@ Suggested commit after explicit authorization: `feat(models): declare explicit c
 - Produces: `ComputerPreviewServer(root: Path)` with `start() -> str`, `publish(run_id: str, png: bytes) -> str`, `stop() -> None`
 - Produces invariant: only `127.0.0.1`, random per-process token, newest three PNG per current run
 
-- [ ] **Step 1: 写热键和预览边界失败测试**
+- [x] **Step 1: 写热键和预览边界失败测试**
 
 热键用 fake Win32 API，不得在 pytest 注册真实系统热键：
 
@@ -675,19 +729,19 @@ def test_preview_server_requires_token_and_keeps_only_three(tmp_path):
     assert not list(tmp_path.rglob("*.png"))
 ```
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_hotkey.py tests/test_computer_preview_server.py -q`
 
 Expected: 两个模块不存在。
 
-- [ ] **Step 3: 实现热键生命周期**
+- [x] **Step 3: 实现热键生命周期**
 
 Windows 实现使用独立消息线程注册 `MOD_CONTROL|MOD_ALT` + `VK_ESCAPE`，只在收到对应 `WM_HOTKEY` 后调用 `on_stop`。任一设置开关为 true 时由应用生命周期持续持有该实例；两个开关均为 false 或应用退出时才 `close()`。应用启动读到已开启配置时立即注册，失败则 capability preflight 返回 `computer_hotkey_unavailable`，但不静默改写配置。`close()` 发送退出消息并 `UnregisterHotKey`，允许重复调用。回调只发 stop 请求，不直接碰 GUI、prompt_toolkit 或 Provider 流。
 
 必须提供可注入 API；默认 API 只在 `sys.platform == "win32"` 构造，其他平台抛 `computer_unsupported_os`。
 
-- [ ] **Step 4: 实现 preview HTTP 服务**
+- [x] **Step 4: 实现 preview HTTP 服务**
 
 使用标准库 `ThreadingHTTPServer`：
 
@@ -698,7 +752,7 @@ self._server = ThreadingHTTPServer(("127.0.0.1", 0), handler_type)
 
 请求路径格式固定为 `/computer-preview/{token}/{run_id}/{ordinal}.png`。`run_id` 只允许 `^[a-zA-Z0-9_-]{1,80}$`，文件名由服务内部生成；handler 不接受 `..`、反斜线、URL 编码路径穿越或目录索引。响应设置 `Cache-Control: no-store` 和 `Content-Type: image/png`。publish 使用临时文件 + `os.replace()`，切换 run 立即删除旧 run 图片；启动时删除 24 小时前目录，停止时删除本进程目录。
 
-- [ ] **Step 5: GREEN 与资源释放回归**
+- [x] **Step 5: GREEN 与资源释放回归**
 
 Run:
 
@@ -711,6 +765,19 @@ git diff --check -- core/computer/hotkey.py core/computer/preview_server.py test
 Expected: 端口在 stop 后可释放；错误 token、旧 run、第四旧图和路径穿越均为 404。
 
 Suggested commit after explicit authorization: `feat(computer): add emergency stop and preview server`
+
+#### Execution Record — Task 5
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_hotkey.py tests/test_computer_preview_server.py -q` | exit 2 | collection 中断（2 errors during collection）| 目标失败原因：`ModuleNotFoundError: No module named 'core.computer.hotkey'` 与 `No module named 'core.computer.preview_server'` | 2 errors in 1.09s。command_shell 聚合接入同样先 RED：`tests/test_gui_system_settings.py` 新增两条断言后单独运行 | exit 1 | 2 failed, 8 passed | `KeyError: 'computer_hotkey_available'`（两键未聚合），实现后转绿。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_hotkey.py tests/test_computer_preview_server.py -q` | exit 0 | 28 passed in 10.73s。注：首轮 27 passed + 1 failed，唯一失败是测试自身用空格拼接 URL（`run a`）被 http.client 客户端侧 CVE-2019-9740 校验拒绝（InvalidURL），根本到不了服务端；改为 `%20` 编码空格（仍要求服务端 404）后全绿，非实现逻辑问题。
+- Compile: `venv\Scripts\python.exe -m py_compile core/computer/hotkey.py core/computer/preview_server.py tests/computer_fakes.py tests/test_computer_hotkey.py tests/test_computer_preview_server.py core/command_shell.py tests/test_gui_system_settings.py` | exit 0。
+- Regression: `venv\Scripts\python.exe -m pytest tests/test_gui_system_settings.py tests/test_computer_settings.py tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` | exit 0 | 73 passed in 11.11s，golden 文件零改动；邻近消费者 `tests/test_command_shell.py tests/test_computer_capability.py tests/test_computer_models.py -q` | exit 0 | 222 passed in 2.53s。
+- Diff check: `git add -N core/computer/hotkey.py core/computer/preview_server.py tests/test_computer_hotkey.py tests/test_computer_preview_server.py && git diff --check -- <本 Task 全部触碰文件>` | exit 0（仅既有 LF/CRLF warning）。`git status --porcelain` 无计划外新增；`.gitattributes`/`README.md`/`assets/CHANGELOG.md`/`core/hunyuan_image.py`/`scripts/secret_filter.py`/`tests/test_hunyuan_image_auth.py`/`frontend/src/components/Sidebar.vue`/`generated_images/` 为用户/其他会话已有改动，未触碰。
+- Files touched: `core/computer/hotkey.py`（新建）、`core/computer/preview_server.py`（新建）、`tests/test_computer_hotkey.py`（新建，11 条）、`tests/test_computer_preview_server.py`（新建，17 条）、`tests/computer_fakes.py`（追加 FakeHotkeyApi / fake_png_bytes(seed) / http_status(url)，原有导出原样保留）、`core/command_shell.py`（get_system_settings 函数内惰性导入 get_emergency_hotkey_snapshot，聚合 computer_hotkey_available/computer_hotkey 两键；computer_run 仍留待 Task 8）、`tests/test_gui_system_settings.py`（新增 2 条快照断言测试）、本计划文件（checkbox 与本记录）。
+- Review — spec: 符合。brief 两个热键样例与预览样例逐字包含；HotkeyApi 依赖注入，默认 WindowsHotkeyApi 只在 sys.platform=="win32" 构造（非 win32 抛 computer_unsupported_os），独立消息线程注册 MOD_CONTROL|MOD_ALT（含 MOD_NOREPEAT）+ VK_ESCAPE，仅 WM_HOTKEY 且 wParam==HOTKEY_ID 时回调；close() 幂等（PostThreadMessage 退出消息 + 消息线程内 UnregisterHotKey）；注册失败抛 computer_hotkey_unavailable 且 available=False；回调只调 on_stop。预览服务逐字采用 brief 的 secrets.token_urlsafe(32) + ThreadingHTTPServer(("127.0.0.1", 0))；URL 固定 /computer-preview/{token}/{run_id}/{ordinal}.png；run_id 严格 ^[a-zA-Z0-9_-]{1,80}$；文件名 ^[0-9]+\.png$ 由服务内部生成；`..`、反斜杠、%2e%2e/%20 编码穿越、目录索引、错 token、旧 run、第四旧图一律 404（不区分原因，另加 resolve 后 is_relative_to 进程目录兜底）；响应 Cache-Control: no-store + Content-Type: image/png；publish 临时文件 + os.replace；只留当前 run 最近 3 张，切 run 立即删旧 run 目录；start 清理 24 小时前残留目录；stop 幂等，删除本进程目录且端口可重新绑定（有测试）。
+- Review — privacy: 符合。token 每进程随机且不出现在日志/快照；预览服务只绑 127.0.0.1；get_emergency_hotkey_snapshot 只暴露 available 布尔；command_shell 聚合不含 token/路径/凭据。
+- Review — default-byte: 符合。prompt byte-stability 与 provider payload golden 全部通过且文件零 diff；未触碰任何请求构造路径。
+- Review — unresolved / 与计划文字差异：(1) publish 的非法 run_id 抛 ValueError（内部契约违约），设计第 21 节无 preview 专用错误码，未发明 computer_* 新码；(2) 进程目录名 preview-{pid}-{hex4}、序号从 1 起始为自择实现细节；(3) handler 非 GET 方法走 BaseHTTPRequestHandler 默认 501（brief 只规定 GET 路径 404 语义）；(4) 真实 WindowsHotkeyApi 消息线程不经 pytest 注册（遵守禁令），仅经 FakeHotkeyApi 与 sys.platform monkeypatch 覆盖。
 
 ---
 
@@ -726,7 +793,7 @@ Suggested commit after explicit authorization: `feat(computer): add emergency st
 - Produces: `BrowserComputerBackend(browser: str, profile_dir: Path, playwright_factory=sync_playwright)`，内部专用 worker 线程和有界命令队列
 - Produces: active page lease and browser-only action execution
 
-- [ ] **Step 1: 写 fake Playwright 合约测试**
+- [x] **Step 1: 写 fake Playwright 合约测试**
 
 fake 需要记录 launch 参数和 page 调用，不启动真实浏览器：
 
@@ -762,13 +829,13 @@ def test_closed_active_page_fails_instead_of_reopening(backend):
 
 另测所有 fake Playwright 调用的 thread id 与创建 runtime 的 thread id 完全相同、并发调用仍由 worker 串行、worker 启动失败/命令超时明确失败、零 page 时只创建一个 `about:blank`、popup 成为 active page、PNG bytes/viewport、navigate 只接受已校验 URL、back/forward/reload、坐标边界和 `close()` 幂等。
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_browser_backend.py -q`
 
 Expected: backend 模块不存在。
 
-- [ ] **Step 3: 实现懒加载、profile 锁与页面生命周期**
+- [x] **Step 3: 实现懒加载、profile 锁与页面生命周期**
 
 构造函数不得导入或启动 Playwright；`start()` 创建专用 worker 线程，worker 内创建 profile、获取进程内 profile 锁并调用 `sync_playwright().start()` 与 `launch_persistent_context`。外部 start/observe/execute/complete/close 全部向有界队列提交命令，只有 worker 接触 runtime/context/page。browser/channel 映射固定：
 
@@ -778,13 +845,13 @@ _CHANNELS = {"edge": "msedge", "chrome": "chrome"}
 
 context 的 `page` 事件也在 worker 内处理，把最后获得焦点的可见 page 设为 active；初始 pages 为空时只创建一个 `about:blank`。context/page close 立即把 backend 标记 closed，后续动作抛 `computer_browser_closed`。profile 锁冲突抛 `computer_profile_locked`，不杀其他进程。任何调用线程都不得直接重建或关闭 Playwright 对象。
 
-- [ ] **Step 4: 实现动作与稳定观察**
+- [x] **Step 4: 实现动作与稳定观察**
 
 浏览器坐标只落在 `0 <= x < 1440`、`0 <= y < 900`。动作映射：`mouse.click/dblclick/move/down/up/wheel`、`keyboard.insert_text`、`keyboard.press`、`page.goto/go_back/go_forward/reload`。拖拽用 `try/finally` 确保 mouse up。
 
 观察调用 `page.screenshot(type="png")`，SHA-256 对 PNG bytes；Provider 只见 `urlsplit(page.url).scheme + "://" + netloc` 与截断 200 字符 title，不见 path/query/fragment。不得读取 DOM 输入值、Cookie、localStorage 或密码库。
 
-- [ ] **Step 5: GREEN 与受控人工探针**
+- [x] **Step 5: GREEN 与受控人工探针**
 
 Run:
 
@@ -804,6 +871,21 @@ venv\Scripts\python.exe scripts/smoke_computer_control.py --probe-browser chrome
 
 Suggested commit after explicit authorization: `feat(computer): add dedicated browser backend`
 
+#### Execution Record — Task 6
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_browser_backend.py -q` | exit code 1 | collection error（0 测试运行）| 目标失败原因：`ModuleNotFoundError: No module named 'core.computer.browser_backend'`（backend 模块尚不存在）| 1 error in 0.50s。
+- Fix round（实现期自查）: 首轮实现 `close()` 未启动时消耗生命周期导致 `test_close_is_idempotent_and_safe_without_start` 失败（1 failed, 37 passed in 2.29s）；修为未启动时 no-op 后全绿，非需求偏差。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_browser_backend.py tests/test_computer_models.py -q` | exit 0 | 217 passed in 2.32s。
+- Regression: `venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` | exit 0 | 17 passed in 5.01s（golden 零 diff）；邻近套件 `pytest tests/test_computer_browser_backend.py tests/test_computer_models.py tests/test_computer_settings.py tests/test_computer_capability.py tests/test_computer_hotkey.py tests/test_computer_preview_server.py tests/test_computer_dependency.py -q` | exit 0 | 321 passed in 13.56s。
+- Compile: `venv\Scripts\python.exe -m py_compile core/computer/browser_backend.py scripts/smoke_computer_control.py tests/test_computer_browser_backend.py tests/computer_fakes.py` | exit 0。
+- Smoke gate: `venv\Scripts\python.exe scripts/smoke_computer_control.py`（无参数）exit 2 且打印帮助，未启动浏览器；`--probe-browser` / `--browser-observe` 人工探针按计划留待用户执行。
+- Diff check: `git add -N core/computer/browser_backend.py tests/test_computer_browser_backend.py && git diff --check -- core/computer/browser_backend.py tests/test_computer_browser_backend.py tests/computer_fakes.py scripts/smoke_computer_control.py` | exit 0（仅既有 LF/CRLF warning）；`git status --porcelain` 无计划外文件；未 commit。
+- Files touched: `core/computer/browser_backend.py`（新建）、`tests/test_computer_browser_backend.py`（新建，38 条）、`tests/computer_fakes.py`（扩展 FakePlaywrightRuntime 家族，保留全部已有导出）、`scripts/smoke_computer_control.py`（新增 `--browser-observe` 模式）、本计划文件（本记录与 checkbox）。
+- Review — spec: 符合。`_CHANNELS = {"edge": "msedge", "chrome": "chrome"}` 逐字；persistent context 参数精确（user_data_dir=resolve 后字符串、headless=False、viewport 1440×900、device_scale_factor=1）；构造函数不导入/启动 Playwright（默认 factory=None，worker 内惰性 import）；worker 独占 runtime/context/page，外部调用全经有界队列 marshal（thread id 测试证明）；零 page 只创建一个 about:blank；popup 成为 active 并发页面变化事件；坐标半开区间 0<=x<1440、0<=y<900；拖拽 try/finally 保证 mouse.up；navigate 复用 parse 层 `_parse_url`。
+- Review — privacy: 符合。观察只暴露 `scheme://netloc` origin 与截断 200 字符 title（projection 测试断言 query/fragment 不泄漏）；不读 DOM 输入值/Cookie/localStorage；截图临时文件只在进程临时目录保留最近 3 张，close 时删除。
+- Review — default-byte: 符合。byte-stability 与 payload golden 全部通过且零 diff；未触碰请求构造路径。
+- Review — unresolved: `--probe-browser` / `--browser-observe` 人工探针未执行（留待用户允许弹出浏览器时运行）；新增稳定错误码 `computer_action_failed`（设计 21“至少包括”允许扩展）用于截图/动作运行时失败；`active_page` 为测试只读 seam；profile 锁的跨进程判定依赖 Playwright 报错文案启发式（ProcessSingleton/already in use 等）。
+
 ---
 
 ### Task 7: Windows 截图、DPI、坐标映射与 SendInput backend
@@ -820,7 +902,7 @@ Suggested commit after explicit authorization: `feat(computer): add dedicated br
 - Produces: `WindowsComputerBackend(image_grab, win32_adapter)`
 - Produces: exact `screenshot_to_physical(x, y, observation) -> tuple[int, int]`
 
-- [ ] **Step 1: 写纯 fake 的截图和输入测试**
+- [x] **Step 1: 写纯 fake 的截图和输入测试**
 
 ```python
 def test_virtual_desktop_is_scaled_to_1920_and_coordinates_round_trip():
@@ -850,19 +932,19 @@ def test_pressed_keys_are_released_when_keypress_fails():
 
 另测负坐标、多屏边界、`bool` 不透传、secure desktop、无 foreground、截图异常、wheel/hwheel、Unicode、double click 和 drag finally release。
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_windows_backend.py -q`
 
 Expected: Windows 模块不存在。
 
-- [ ] **Step 3: 实现 Win32 adapter 的 fail-closed preflight**
+- [x] **Step 3: 实现 Win32 adapter 的 fail-closed preflight**
 
 `preflight()` 顺序固定：平台为 win32；设置/确认 Per-Monitor V2；input desktop 名称为 `Default`；存在 foreground window；热键已可注册。任何失败映射到稳定错误码，不请求管理员、不重启应用。
 
 `SendInput` 返回值必须等于事件数量；组合键和 drag 在 `finally` 中释放已按下状态。鼠标绝对坐标使用虚拟桌面 metrics 和 `MOUSEEVENTF_VIRTUALDESK|MOUSEEVENTF_ABSOLUTE`，Unicode 使用 `KEYEVENTF_UNICODE`。
 
-- [ ] **Step 4: 实现截图和坐标换算**
+- [x] **Step 4: 实现截图和坐标换算**
 
 使用 `ImageGrab.grab(all_screens=True)`；测试通过构造注入替代。最长边大于 1920 时按同一比例缩小，PNG 使用确定参数编码。坐标换算只依赖最新 observation：
 
@@ -873,7 +955,7 @@ physical_y = origin_y + round(y * original_height / model_height)
 
 换算后再次检查虚拟桌面半开区间边界。动作开始前重新检查 interactive desktop；截图失败抛 `computer_backend_start_failed` 或 `computer_secure_desktop`，绝不复用 `_last_observation`。
 
-- [ ] **Step 5: GREEN 与禁止真实输入验证**
+- [x] **Step 5: GREEN 与禁止真实输入验证**
 
 Run:
 
@@ -886,6 +968,17 @@ git diff --check -- core/computer/win32_adapter.py core/computer/windows_backend
 Expected: pytest 全程只使用 fake adapter，测试运行时真实鼠标和键盘完全不动。`scripts/smoke_computer_control.py --desktop-input` 必须额外要求 `--confirm-real-input I_UNDERSTAND`，否则退出 2。
 
 Suggested commit after explicit authorization: `feat(computer): add fail-closed Windows backend`
+
+**Execution Record (2026-09-03, implementer subagent, no commit per K3):**
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_windows_backend.py -q` → collection error `ModuleNotFoundError: No module named 'core.computer.win32_adapter'`（1 error / 0.42s，符合预期）。
+- GREEN: 同上命令 → **43 passed / ~1.4-2.1s / exit 0**。全程只使用 FakeImage/FakeWin32Adapter 或全 seam 注入的 Win32InputAdapter；真实鼠标/键盘/截屏零触碰（send_input、metrics、desktop、foreground、DPI、hotkey 全部注入）。
+- 回归门禁: `pytest tests/test_computer_models.py tests/test_computer_browser_backend.py -q` → 217 passed / 2.78s；全部 computer 套件（models/settings/capability/hotkey/preview_server/browser_backend/windows_backend）→ 362 passed / 13.84s；`tests/test_prompt_byte_stability.py` → 5 passed（零 diff）。
+- `venv\Scripts\python.exe -m py_compile core/computer/win32_adapter.py core/computer/windows_backend.py scripts/smoke_computer_control.py` → exit 0。
+- 新文件已 `git add -N`；`git diff --check -- core/computer/win32_adapter.py core/computer/windows_backend.py tests/test_computer_windows_backend.py tests/computer_fakes.py scripts/smoke_computer_control.py` → 干净（仅 Windows LF→CRLF 提示）。
+- Smoke: `--desktop-input` 缺确认 / `--confirm-real-input WRONG` 均 exit 2 且在导入 backend 前返回；`--desktop-observe` / `--desktop-input --confirm-real-input I_UNDERSTAND` 真实模式未执行（留待用户受控环境）。
+- 接口落定: `Win32InputAdapter.preflight()/send_mouse()/send_text()/send_keys()/release_all()/virtual_screen_rect()/ensure_interactive()/foreground_window_title()`；`WindowsComputerBackend(image_grab, win32_adapter)` + `create_default()` + 模块级纯函数 `screenshot_to_physical(x, y, observation)`；computer_fakes 新增 `FakeImage`/`FakeWin32Adapter`（保留全部已有导出）。
+- 决策备注: preflight 第 2 步 DPI 失败映射 `computer_backend_start_failed`（不在错误坐标系继续）；无前台窗口与 input desktop 非 Default 均映射 `computer_secure_desktop`（设计 21 无更细码）；无 foreground/非交互 desktop 打开失败区分 `computer_noninteractive_session`；截图失败一律 `computer_backend_start_failed`；SendInput 部分成功按已生效前缀补发 up 后抛 `computer_input_rejected`；`_key_up_quietly` 失败保留按下标记供 `release_all` 重试（与 browser backend drag 语义一致）。
 
 ---
 
@@ -901,7 +994,7 @@ Suggested commit after explicit authorization: `feat(computer): add fail-closed 
 - Produces: `get_computer_control_service()` 惰性单例
 - Produces events: `computer_state`, `computer_action_started`, `computer_action_finished`, `computer_observation`
 
-- [ ] **Step 1: 写状态机和租约失败测试**
+- [x] **Step 1: 写状态机和租约失败测试**
 
 ```python
 def test_second_owner_cannot_take_active_lease(service, owner_a, owner_b, capability):
@@ -958,13 +1051,13 @@ def test_stop_is_idempotent_and_releases_inputs_once(service, running_run):
 
 另测非法状态转换（含 running→completing→completed 与跳过 completing 直接 completed 的拒绝）、owner/cancel/generation 检查、动作串行、错误时不发成功、三次无变化、observe/wait 不计 no-progress、停止事件只发一次、Turn 终态 finally 二选一调用 complete/stop 后不遗留 running 租约。
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_controller.py -q`
 
 Expected: controller 模块不存在。
 
-- [ ] **Step 3: 实现显式转移表和锁**
+- [x] **Step 3: 实现显式转移表和锁**
 
 ```python
 _TRANSITIONS = {
@@ -984,7 +1077,7 @@ _TRANSITIONS = {
 
 租约和状态由 `threading.RLock` 保护；backend I/O 不在持锁期间长时间执行，但每个动作由单一 `action_lock` 串行。动作前后用 run id + generation 二次确认，防止关闭设置后旧动作提交成功。
 
-- [ ] **Step 4: 实现固定动作与停止语义**
+- [x] **Step 4: 实现固定动作与停止语义**
 
 动作顺序严格为 owner/state/cancel/generation → before → execute → fresh after → no-progress → events → Provider observation。预期改变界面的动作只有在 `screen_sha256` 和 active fingerprint 都连续三次相同才失败为 `computer_no_progress`。
 
@@ -992,7 +1085,7 @@ _TRANSITIONS = {
 
 `stop()` 顺序：controller flag → `owner.cancel_event.set()` → 调用现有 `core.llm.abort_inflight_streams(owner.cancel_event)` 关闭在飞 Provider 流（先 set 事件再 abort，让被关闭一侧归一为用户取消；不得按 turn id 发明第二套取消注册表）→ 禁止新动作 → backend cancel/`release_inputs()` → backend `close()` → 状态终结 → 租约释放 → final event。每步用 `try/finally` 保证后续安全释放，但不把清理错误伪装成 stopped success；首个清理错误记录为 run failure。
 
-- [ ] **Step 5: GREEN 与并发回归**
+- [x] **Step 5: GREEN 与并发回归**
 
 Run:
 
@@ -1006,6 +1099,32 @@ Expected: 同时提交的第二动作在第一动作结束前不进入 backend�
 Suggested commit after explicit authorization: `feat(computer): add exclusive control state machine`
 
 ---
+
+#### Execution Record — Task 8
+
+**Execution Record (2026-09-03, implementer subagent, no commit per K3):**
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_controller.py -q` → exit 2（collection error：`ModuleNotFoundError: No module named 'core.computer.controller'`，0.41s），目标失败原因即 controller 模块缺失，符合预期。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_controller.py tests/test_computer_browser_backend.py tests/test_computer_windows_backend.py -q` → 114 passed / 2.53s / exit 0（其中 test_computer_controller.py 33 条：brief 6 样例逐字 + 非法状态转换（含跳过 completing）/owner/cancel/generation 三类检查/动作串行/错误不发成功/三次无变化停止/observe+wait 不计 no-progress/停止事件只发一次/Turn 终态 finally 二选一不留 running 租约/provider_safety_required 不可 resume/清理错误记 failed/单例）。
+- Regression: `venv\Scripts\python.exe -m pytest tests/test_gui_system_settings.py tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` → 28 passed / 8.97s / exit 0；`venv\Scripts\python.exe -m pytest tests/ -q -k "computer"` → 415 passed / 21.73s / exit 0。
+- Diff check: `git add -N core/computer/controller.py tests/test_computer_controller.py` + `git diff --check -- core/computer/controller.py tests/test_computer_controller.py core/command_shell.py tests/test_gui_system_settings.py tests/computer_fakes.py` → exit 0（仅 LF→CRLF 警告）。
+- Files touched: `core/computer/controller.py`（新建：_TRANSITIONS 逐字转移表、ComputerControlService 全部 Cross-Task 公共方法 + enter_provider_safety_required、RLock+action_lock、retained browser session 复用、listener 事件机制、get_computer_control_service 惰性单例）、`tests/test_computer_controller.py`（新建，33 条）、`tests/computer_fakes.py`（追加 FakeComputerBackend，docstring 同步）、`core/command_shell.py`（get_system_settings 函数内惰性导入 controller 单例，聚合 computer_run 键）、`tests/test_gui_system_settings.py`（新增 1 条 computer_run 快照断言）、本计划文件（checkbox 与本记录）。
+- spec: PASS（_TRANSITIONS 逐字；动作顺序 owner/state/cancel/generation → before → execute → fresh after → no-progress → events → observation；stop 顺序 flag→cancel_event→abort_inflight_streams→release_inputs→close→终结→释放租约→final event；generation 失配重读有效设置仅削弱/撤销才停、损坏配置按关闭处理；generic 首次 observe 建租约）。
+- privacy: PASS（事件小 JSON 无输入正文/截图 base64/绝对路径；session_busy details 只含会话显示名；快照走 ComputerRunSnapshot.to_public_dict）。
+- default-byte: PASS（默认关闭路径不实例化 backend；computer_run 为 idle 快照；prompt byte-stability 与 provider payload golden 全绿）。
+- unresolved: (1) backend 执行中错误（如 computer_browser_closed）当前只发 action_finished(ok=False) 并传播，run 保持 running，不自动 stop（设计 15.1 把浏览器关闭列为停止入口，自动停止策略留给 Turn 接线 Task 裁决）；(2) controller 未接 preview_server.publish（preview_url 透传 backend 值，GUI 预览接线归后续 Task）；(3) complete_run 的 retained browser 由下一同 target run 显式复用，应用退出时 retained 清理归 Task 16 生命周期。
+
+**Execution Record — Task 8 审查修复轮（2026-09-03，controller reviewer 发现，未 commit）：**
+
+- Review findings: 1 Important（claim 竞态孤儿 backend：start_run 赋值窗口与 execute establishing 二次确认失败/stop_for_settings 分支均不关闭刚启动的 backend，遗留浏览器进程 + 被锁 profile）+ 2 Minor + 2 Info（M2 持锁读设置文件、M3 停止竞态悬空 action_started 事件、M4 wait 取消打断无控制器级实现、I5 `_fail_run` 转移失败直改 status、I6 complete_run 幂等仅覆盖 completed 终态）。Minor/Info 按 SDD 惯例 defer 并记入 ledger。
+- 关联发现并一并修复：未绑定 target 的 run 在 generation 失配时用"任一开关开启"语义判定（`_generation_allowed_locked` else 分支），browser 开关已关闭仍能绑定 browser 租约并截图，违反设计 8.1"关闭后新动作从此立即拒绝"。修复为 `_generation_allowed_locked(run, effective_target=None)`，execute 首查传 `run.target or action.target`、建租约二查传 `action.target`。
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_controller.py -q` | exit 1 | 4 failed（test_start_run_closes_backend_when_stopped_during_claim、test_start_run_orphan_close_failure_does_not_mask_error 均断言 computer_cancelled 实得 computer_invalid_state；test_execute_establishing_closes_backend_when_run_stopped_during_claim close_count 0==1 失败；test_execute_establishing_closes_backend_when_settings_revoked_during_claim DID NOT RAISE）| 目标失败原因均为孤儿 backend 不关闭/未绑定 target 语义错误，4 failed 33 passed in 4.31s。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_controller.py -q` | exit 0 | 37 passed in 2.44s。
+- Regression: `venv\Scripts\python.exe -m pytest tests/test_computer_controller.py tests/test_computer_browser_backend.py tests/test_computer_windows_backend.py -q` | exit 0 | 118 passed in 4.20s；`tests/test_gui_system_settings.py tests/test_cancellation.py tests/test_llm_inflight_abort.py tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` | exit 0 | 42 passed in 24.35s；`tests/ -q -k "computer"` | exit 0 | 419 passed, 1885 deselected in 35.01s。
+- Compile/Diff: `py_compile core/computer/controller.py tests/test_computer_controller.py` exit 0；`git diff --check -- core/computer/controller.py tests/test_computer_controller.py` exit 0（仅 LF→CRLF 警告）。
+- Files touched: `core/computer/controller.py`（新增 `_close_backend_quietly`；start_run 孤儿分支；execute establishing 孤儿分支；`_generation_allowed_locked` effective_target 参数）、`tests/test_computer_controller.py`（新增 4 条审查修复测试）、本计划文件（本记录）。
+- Re-review: RE-REVIEW PASS（核验项 1-5 全 PASS；实测 37/118/419 与自报一致；新增 Minor 覆盖缺口一条：未绑定 run 首查路径的 browser 关闭场景无直接测试，与二查共用同一代码，记入 ledger defer）。
+
 
 ### Task 9: 固定 generic 工具、follow-up 多模态消息与批处理约束
 
@@ -1028,7 +1147,7 @@ Suggested commit after explicit authorization: `feat(computer): add exclusive co
 - Produces: `validate_computer_tool_batch(tool_calls) -> None`
 - Produces: `execute_reserved_computer_tool(decoded, context) -> ToolResult | None`
 
-- [ ] **Step 1: 写默认兼容和电脑 follow-up 失败测试**
+- [x] **Step 1: 写默认兼容和电脑 follow-up 失败测试**
 
 ```python
 def test_existing_tool_result_default_is_byte_compatible():
@@ -1063,13 +1182,13 @@ def test_computer_action_cannot_be_batched_or_mixed(calls):
     assert raised.value.code == "computer_invalid_action"
 ```
 
-- [ ] **Step 2: 运行确认 RED**
+- [x] **Step 2: 运行确认 RED**
 
 Run: `venv\Scripts\python.exe -m pytest tests/test_computer_tool_adapter.py tests/test_computer_provider_generic.py tests/test_tool_pipeline.py tests/test_tool_registry.py -q`
 
 Expected: `followup_messages` 和固定工具适配不存在。
 
-- [ ] **Step 3: 扩展 ToolResult 和 ToolExecutionRecord，不污染 tool message**
+- [x] **Step 3: 扩展 ToolResult 和 ToolExecutionRecord，不污染 tool message**
 
 `core/tool_protocol.py`：
 
@@ -1088,19 +1207,19 @@ class ToolResult:
 
 在 `core/llm.py` 现有提交点，先按 ordinal 持久化全部 tool results，再按相同 ordinal 追加 follow-up user messages，然后才创建下一 Provider Step。Journal event 继续只哈希 tool content，不哈希/保存图片正文。
 
-- [ ] **Step 4: 实现保留名与 capability token 校验**
+- [x] **Step 4: 实现保留名与 capability token 校验**
 
 `ToolPipeline.execute_decoded()` 在 `resolve_tool()` 之前调用固定适配：只有 `decoded.name == "computer_action"` 才进入；context 必须携带 Turn 冻结的 capability token、owner 和 run id。设置关闭、owner 不符或伪造名称分别返回稳定错误。
 
 `ToolRegistry.register()`、插件加载和 MCP schema 合并发现 `computer_action` 或 `computer_select_target` 时明确拒绝/跳过该扩展并记录失败状态；默认 `build_default_registry().schemas()` 完全不含这两个名字。
 
-- [ ] **Step 5: 实现 generic schema、提示和观察消息**
+- [x] **Step 5: 实现 generic schema、提示和观察消息**
 
 generic tool 只在 capability protocol 为 `generic` 时追加到现有 tools 尾部。说明文本必须逐字包含：首次 observe、一次一个动作、动作后看新截图、坐标原点、登录/验证码用户接管、完成后停止调用。
 
 Provider tool result 使用 `json.dumps(..., ensure_ascii=False, sort_keys=True, separators=(",", ":"))`，字段只含 `ok,target,action,screen_sha256,width,height,origin_or_window,error_code,error_message`。PNG 转 `data:image/png;base64,...` 只存在 follow-up 多模态消息；输入正文不进入 JSON/metadata/log。
 
-- [ ] **Step 6: GREEN、顺序和现有工具回归**
+- [x] **Step 6: GREEN、顺序和现有工具回归**
 
 Run:
 
@@ -1113,6 +1232,20 @@ git diff --check -- core/tool_protocol.py core/harness/tool_pipeline.py core/too
 Expected: 默认工具序列和 golden 不变；电脑 call 的 tool result 总在观察 user message 前；混合批次零副作用。
 
 Suggested commit after explicit authorization: `feat(harness): add generic computer tool observations`
+
+#### Execution Record — Task 9
+
+**Execution Record (2026-09-03, implementer subagent, no commit per K3):**
+
+- RED: `venv\Scripts\python.exe -m pytest tests/test_computer_tool_adapter.py tests/test_computer_provider_generic.py tests/test_tool_pipeline.py tests/test_tool_registry.py -q` → exit 2（collection error：`ModuleNotFoundError: No module named 'core.computer.provider_generic'`，两个新测试文件即目标能力缺失，2 errors in 2.55s；collection 中断使另两个文件未跑）。补跑 `venv\Scripts\python.exe -m pytest tests/test_tool_pipeline.py tests/test_tool_registry.py -q` → exit 1，8 failed / 80 passed in 6.31s：test_tool_pipeline 4 failed（`ToolExecutionRecord` 无 followup_messages / `ToolExecutionContext` 无 computer_lease / 私有暂存键不剥离），test_tool_registry 4 failed（保留名不拒绝 DID NOT RAISE / 插件 loaded≠failed / `filter_reserved_tool_schemas` 不存在 / MCP 保留名未过滤）。失败原因全部是目标能力缺失，符合预期。
+- GREEN: `venv\Scripts\python.exe -m pytest tests/test_computer_tool_adapter.py tests/test_computer_provider_generic.py tests/test_tool_pipeline.py tests/test_tool_registry.py -q` → 116 passed / 6.62s / exit 0（test_computer_tool_adapter 19 条：brief 3 样例逐字 + 权限链不询问/9 键 JSON 逐字节/type_text 输入不入 JSON 与 followup/无 lease 关闭/能力冻结错误/owner 不符/非法动作/控制器错误/缺 PNG 无旧图/伪造名走普通解析/ToolSpec 四语义/ordinal 递增；test_computer_provider_generic 9 条：schema 副本与 None/七条说明语义/批处理通过与拒绝；test_tool_pipeline +4：record 默认空/lease 默认 None/暂存转 record/execute_one 剥离；test_tool_registry +5：保留名拒绝/默认 schema 排除/插件 failed 记录/filter 函数/MCP 合并过滤）。
+- Regression: `venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q` → 17 passed / 11.97s / exit 0；`venv\Scripts\python.exe -m pytest tests/ -q -k "computer"` → 450 passed / 23.73s / exit 0；全量 `venv\Scripts\python.exe -m pytest tests/ -q --tb=no` → 2338 passed / 2 skipped / 1 failed / 484.80s——唯一 failed 为 `tests/test_tokenrhythm_image.py::PluginMetadataTest::test_plugin_json_disabled_by_default`（断言 plugin.json enabled=False，实际 True），系并发会话对 `plugins/tokenrhythm_image/plugin.json` 的既有工作区改动（Task 9 禁触文件，git diff 显示 1 行 enabled 翻转在本次开始前已存在），与 Task 9 无关，单跑复现相同失败。
+- Diff check: `git add -N core/computer/tool_adapter.py core/computer/provider_generic.py tests/test_computer_tool_adapter.py tests/test_computer_provider_generic.py` + `git diff --check -- core/tool_protocol.py core/harness/tool_pipeline.py core/tool_registry.py core/computer tests` → exit 0（仅 LF→CRLF 警告）。
+- Files touched: `core/tool_protocol.py`（ToolResult 增默认空不可变 followup_messages）、`core/harness/tool_pipeline.py`（ToolExecutionRecord 增 followup_messages、ToolExecutionContext 增 computer_lease、execute_decoded 在 resolve_tool 前接固定适配、execute_batch 构造 record 时剥离 `_ycode_followup_messages` 暂存、execute_one 剥离旧单调用路径暂存）、`core/computer/tool_adapter.py`（新建：保留名常量、ComputerTurnLease、computer_action_tool_spec 四语义、lease_from_context、computer_turn_context_error 稳定错误）、`core/computer/provider_generic.py`（新建：build_generic_computer_tool/build_generic_dynamic_prompt/validate_computer_tool_batch/execute_reserved_computer_tool、OBSERVATION_FOLLOWUP_TEXT、9 键 JSON 投影、follow-up 多模态消息）、`core/tool_registry.py`（register 拒绝保留名 + filter_reserved_tool_schemas）、`core/llm.py`（get_tools_schema 的 MCP 合并处套用 filter_reserved_tool_schemas，2 行最小改动，见下方偏差说明）、`tests/computer_fakes.py`（新增 FakeController）、`tests/test_computer_tool_adapter.py`（新建 19 条）、`tests/test_computer_provider_generic.py`（新建 9 条）、`tests/test_tool_pipeline.py`（+4）、`tests/test_tool_registry.py`（+5）、本计划文件（checkbox 与本记录）。
+- spec: PASS（保留名在 resolve_tool 之前识别且仅 computer_action 进入；context 校验 capability token/owner lease/run id，设置关闭、owner 不符、伪造名称分别稳定错误；register/插件/MCP 三处保留名拒绝并记录失败状态；generic schema 仅 enabled+generic 返回且为 tools 尾部追加提供副本；tool result 恰好 9 键 compact JSON；PNG data URL 只在 follow-up user 消息；批次多个 computer call 或混用 → computer_invalid_action 整批拒绝零副作用；follow-up 暂存 record、不污染 tool message；RepeatCallGuard 不为电脑动作豁免）。
+- privacy: PASS（输入正文不进 JSON/metadata/log，type_text 正文有专项测试；截图 base64 只存在于 follow-up 多模态消息；错误结果不含截图/凭据/URL query；Journal event 继续只哈希 tool content——build_tool_result_event_draft 消费剥离后的 message）。
+- default-byte: PASS（默认关闭：registry 无 computer_action/computer_select_target；get_tools_schema 过滤为直通（无保留名时逐项相同）；prompt byte-stability 与 provider payload golden 17 条原样通过；ToolExecutionContext.computer_lease 默认 None，普通回合行为与序列化不变）。
+- unresolved: (1) `core/llm.py` 的 MCP 合并点在 get_tools_schema（工具 schema 合并唯一现场），Task 9 Files 清单未列 llm.py——按"最小调整并写进报告"纪律做了 2 行过滤接线，无保留名时字节完全不变；(2) `_computer_v1.ordinal` 取 controller.snapshot().action_count（execute 返回后即本次动作序号，依赖 controller 单动作锁串行语义），未改 ComputerObservation 模型；(3) follow-up user messages 的持久化与按 ordinal 追加、`_content_has_media` 折叠兼容、以及 validate_computer_tool_batch 在调度层的接线点均为 Task 10 范围，本 Task 只交付函数与 record 通道；(4) execute_one 旧单调用入口无 follow-up 通道，剥离后丢弃（生产 computer 调用走 ToolBatchExecutor 路径）。
 
 ---
 

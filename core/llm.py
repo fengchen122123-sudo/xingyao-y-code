@@ -1741,7 +1741,7 @@ def _account_server_usage(
     return record
 
 # The registry is the canonical capability metadata source.
-from core.tool_registry import build_default_registry
+from core.tool_registry import build_default_registry, filter_reserved_tool_schemas
 tool_registry = build_default_registry()
 
 
@@ -1773,7 +1773,12 @@ def get_tools_schema():
             _get_mcp_manager()._ensure_connected()
         except Exception:
             pass
-    return tool_registry.api_schemas() + _get_mcp_manager().get_schemas()
+    # MCP schema 合并时过滤电脑操控保留名（设计 19.2）：
+    # computer_action / computer_select_target 由固定 Harness 适配器提供，
+    # MCP 不得占用同名工具；无保留名时 tools 字节与过滤前完全一致。
+    return tool_registry.api_schemas() + filter_reserved_tool_schemas(
+        _get_mcp_manager().get_schemas()
+    )
 
 
 def completion(**kwargs):

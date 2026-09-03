@@ -19,3 +19,6 @@ qrcode>=7.4
 # Development / test dependencies
 pytest>=7.0.0
 pytest-mock>=3.0.0
+
+# Computer control dependencies (system Edge/Chrome channel; browsers are NOT downloaded)
+playwright>=1.55,<2
