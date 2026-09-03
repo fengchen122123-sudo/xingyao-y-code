@@ -197,3 +197,34 @@ def execute_reserved_computer_tool(decoded, context) -> ToolResult | None:
         **_PROVIDER_JSON_KWARGS,
     )
     return ToolResult(content=content, followup_messages=(followup,))
+
+
+def computer_error_tool_message(tool_call: dict, error: ComputerControlError) -> dict:
+    """从原始 tool_call dict 合成稳定 9 键 JSON 错误 tool result 消息。
+
+    供调度层两处共用（Task 10）：批处理约束拒绝（混用/多个 computer call，
+    本 Step 不执行任何电脑动作）与取消打捞（悬空 computer call 生成
+    computer_cancelled 结果）。参数解析失败时 target/kind 以空串占位，
+    绝不携带截图、输入正文或旧图。
+    """
+    arguments = {}
+    raw_arguments = str((tool_call.get("function") or {}).get("arguments") or "")
+    if raw_arguments:
+        try:
+            parsed = json.loads(raw_arguments)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            arguments = parsed
+
+    def _attempted(key: str) -> str:
+        value = arguments.get(key)
+        return value if isinstance(value, str) else ""
+
+    result = _error_result(_attempted("target"), _attempted("kind"), error)
+    return {
+        "role": "tool",
+        "tool_call_id": tool_call.get("id"),
+        "name": (tool_call.get("function") or {}).get("name"),
+        "content": result.to_message_content(),
+    }

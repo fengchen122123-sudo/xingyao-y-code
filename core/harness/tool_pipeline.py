@@ -119,6 +119,9 @@ class ToolExecutionContext:
     # 设计 19.2）。默认 None：普通回合行为与序列化完全不变；固定 computer
     # 适配器只在携带 lease 时执行动作，否则返回稳定关闭错误。
     computer_lease: object | None = None
+    # 原生双 target 的 selector 状态（Task 11a，设计 11.2）：computer_select_target
+    # 固定 adapter 凭它写入 target 租约；不进普通 ToolRegistry。默认 None。
+    computer_native_selection: object | None = None
 
 
 @dataclass(frozen=True)
@@ -890,13 +893,32 @@ class ToolPipeline:
         return _tool_message(decoded, self.truncate_result(decoded.name, content))
 
     def _execute_reserved_computer(self, decoded: DecodedToolCall, context) -> dict | None:
-        """computer_action 固定适配（设计 19.2）：仅保留名进入，非保留名返回 None。
+        """保留名固定适配（设计 19.2 + Task 11a）：非保留名返回 None。
 
-        requires_permission=False（设置开关即用户授权边界）、cancellable=True、
-        parallel_safe=False、mutates_files=False 的语义由固定适配器保证；
-        领域错误返回稳定 9 键 JSON，follow-up 私有载荷暂存在 message 内部键上，
-        由 ToolBatchExecutor 构造 record 时剥离。
+        computer_action：requires_permission=False（设置开关即用户授权边界）、
+        cancellable=True、parallel_safe=False、mutates_files=False 的语义由固定
+        适配器保证；领域错误返回稳定 9 键 JSON，follow-up 私有载荷暂存在
+        message 内部键上，由 ToolBatchExecutor 构造 record 时剥离。
+        computer_select_target（Task 11a）：原生双 target selector 经
+        provider_openai 的固定 adapter 写入 target 租约，不进普通 ToolRegistry。
         """
+        if decoded.name == "computer_select_target":
+            from core.computer.provider_openai import execute_reserved_computer_selector
+
+            selection = getattr(context, "computer_native_selection", None)
+            try:
+                result = execute_reserved_computer_selector(decoded, selection)
+            except Exception as tool_err:
+                return _tool_message(
+                    decoded,
+                    f"{TOOL_ERROR_PREFIX} 调用工具 {decoded.name} 时发生系统内部错误：{tool_err}",
+                )
+            if result is None:
+                return None
+            return _tool_message(
+                decoded,
+                self.truncate_result(decoded.name, result.to_message_content()),
+            )
         if decoded.name != "computer_action":
             return None
         from core.computer.provider_generic import execute_reserved_computer_tool

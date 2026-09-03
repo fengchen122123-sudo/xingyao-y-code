@@ -87,6 +87,15 @@ NATIVE_BROWSER_CAPABILITY = ComputerCapability(
     settings_generation=1,
 )
 
+# Task 11a：browser 与 desktop 双 target 同时开启的原生能力快照。
+NATIVE_DUAL_TARGET_CAPABILITY = ComputerCapability(
+    enabled=True,
+    protocol="native_openai",
+    targets=("browser", "desktop"),
+    browser="edge",
+    settings_generation=1,
+)
+
 DISABLED_CAPABILITY = ComputerCapability(
     enabled=False,
     error_code="computer_disabled",
@@ -668,9 +677,13 @@ class FakeController:
       （镜像真实 controller 的租约语义）；
     - ``observations`` 按序注入 ComputerObservation（用尽后用默认观察），
       默认观察的 png_path 取 ``png_path``（由测试用 tmp_path 写入虚拟字节）；
-    - ``execute_errors`` 按序注入 ComputerControlError（用尽后正常执行）；
+    - ``execute_errors`` 按序注入异常（用尽后正常执行）；
     - ``snapshot()`` 返回真实 ComputerRunSnapshot，action_count 随动作递增，
       供固定适配器读取动作 ordinal；
+    - Task 10 补充最小 run 生命周期：``start_calls``/``start_error``、
+      ``complete_calls``/``completed_run_ids``/``complete_error``、
+      ``stop_calls``/``stop_reasons``/``stop_error``；生命周期方法只记录调用，
+      ``run_status`` 随 complete/stop 变化供 Turn 收尾判定；
     - 绝不触碰真实键鼠、浏览器或截屏。
     """
 
@@ -684,6 +697,43 @@ class FakeController:
         self.action_count = 0
         self._observations = list(observations)
         self.execute_errors = list(execute_errors)
+        # Task 10：Turn 接线的最小生命周期记录
+        self.start_calls = 0
+        self.start_targets = []  # Task 11a：记录 start_run 传入的 target
+        self.start_error = None
+        self.complete_calls = 0
+        self.completed_run_ids = []
+        self.complete_error = None
+        self.stop_calls = 0
+        self.stop_reasons = []
+        self.stop_error = None
+        self.run_status = "running"
+
+    def start_run(self, owner, capability, target=None):
+        self.start_calls += 1
+        self.start_targets.append(target)
+        if self.start_error is not None:
+            raise self.start_error
+        self.owner = owner
+        self.capability = capability
+        self.run_status = "running"
+        return self.snapshot()
+
+    def complete_run(self, run_id, owner, retain_browser_session=True):
+        self.complete_calls += 1
+        if self.complete_error is not None:
+            raise self.complete_error
+        self.completed_run_ids.append(run_id)
+        self.run_status = "completed"
+        return self.snapshot()
+
+    def stop(self, run_id, reason):
+        self.stop_calls += 1
+        self.stop_reasons.append((run_id, reason))
+        if self.stop_error is not None:
+            raise self.stop_error
+        self.run_status = "stopped"
+        return self.snapshot()
 
     def _default_observation(self, run_id, action):
         return ComputerObservation(
@@ -725,6 +775,6 @@ class FakeController:
             run_id=self.run_id,
             owner_session_id=self.owner.session_id,
             owner_turn_id=self.owner.turn_id,
-            status="running",
+            status=self.run_status,
             action_count=self.action_count,
         )

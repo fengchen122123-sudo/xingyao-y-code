@@ -231,14 +231,23 @@ def get_session_token_baseline(manager, session_name: str, model_name: str,
 
 
 def build_runtime_context(model_name: str, permission_mode: str):
-    """组装本轮的运行上下文（时间 / 计划快照 / 工作目录）。
+    """组装本轮的运行上下文（时间 / 计划快照 / 工作目录 / 电脑操控能力）。
 
     长期记忆、技能目录、自定义子 Agent 清单已并入稳定系统提示词
     （build_stable_system_message，跨轮不变的大段静态内容），
     这里不再重复注入，避免动态块膨胀与重复消耗 token。
+
+    电脑操控能力（Task 10，设计 9.3）在 Turn 准备起点解析一次并传入
+    RuntimeContext：capability 关闭时动态块字节与历史版本完全一致。
+    turn_source 是入口层受控值（CLI/GUI 本地回合固定 local；LAN 标记由
+    后续 Task 接入），绝不从用户消息或模型参数读取。
+    Task 11a F1 收敛：解析结果同时存入线程级 Turn handoff，同一回合的
+    chat_with_model_events 取出复用，capability 每 Turn 只解析一次。
     """
+    from core.computer.capability import set_turn_computer_capability
     from core.context_builder import RuntimeContext
     from core.command_shell import describe_selected_command_shell
+    from core.llm import resolve_turn_computer_capability
     from core.plan import get_default_plan_manager
     from core.workspace_context import get_workdir
 
@@ -247,6 +256,10 @@ def build_runtime_context(model_name: str, permission_mode: str):
     active_plan = "\n".join(
         f"{item.get('stage', 'build')}/{item['status']}: {item['subject']}" for item in plan_items
     ) or "无"
+    computer_capability = resolve_turn_computer_capability(
+        model_name, turn_source="local"
+    )
+    set_turn_computer_capability(computer_capability)
     return RuntimeContext(
         model_name=model_name,
         permission_mode=permission_mode,
@@ -254,6 +267,7 @@ def build_runtime_context(model_name: str, permission_mode: str):
         current_time=now.strftime("%Y-%m-%d %H:%M:%S"),
         active_plan=active_plan,
         command_shell=describe_selected_command_shell(),
+        computer_capability=computer_capability,
     )
 
 
