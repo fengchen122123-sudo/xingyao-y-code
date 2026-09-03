@@ -1830,6 +1830,23 @@ def _responses_stream_as_chat_chunks(events):
         _close_stream_quietly(events)
 
 
+def _normalize_responses_event_type(event_type) -> str:
+    """Responses 事件 type 统一归一化为 'response.*' 字符串。
+
+    原生 OpenAI 流事件的 type 是裸字符串；而 litellm 对无原生 Responses API
+    的 provider（DeepSeek 等 chat-only 模型）走 chat→responses 桥接，合成事件
+    的 type 直接填 ResponsesAPIStreamEvents 枚举成员，str() 得到的是成员名
+    （如 'ResponsesAPIStreamEvents.RESPONSE_COMPLETED'）而非事件值，必须用
+    .value 还原，否则映射器全部失配。
+    """
+    if isinstance(event_type, str):
+        return event_type
+    value = getattr(event_type, "value", None)
+    if isinstance(value, str):
+        return value
+    return str(event_type or "")
+
+
 def _responses_events_as_chat_chunks(events):
     """将 Responses SSE 事件严格映射成现有工具循环消费的 chat chunks。"""
     saw_tool_calls = False
@@ -1848,7 +1865,7 @@ def _responses_events_as_chat_chunks(events):
         "response.reasoning_summary_part.done",
     }
     for event in events:
-        event_type = str(_obj_value(event, "type", ""))
+        event_type = _normalize_responses_event_type(_obj_value(event, "type", ""))
         if event_type == "response.output_text.delta":
             yield _chat_chunk(content=str(_obj_value(event, "delta", "")))
         elif event_type == "response.reasoning_summary_text.delta":
