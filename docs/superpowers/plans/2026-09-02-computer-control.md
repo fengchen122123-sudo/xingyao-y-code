@@ -22,15 +22,25 @@
 - Windows backend 只支持交互式 Windows Default desktop，必须确认 Per-Monitor V2 DPI awareness；锁屏、UAC secure desktop、截图失败或 `SendInput` 拒绝均立即失败。
 - 模型能力必须显式配置：generic 要求 `supports_vision=true`、`supports_function_calling=true`、`computer_protocol=generic`；native 要求官方 OpenAI API、Responses 协议和 `computer_protocol=native_openai`。禁止按模型名猜测。
 - LAN 发起的 Turn 永远不获得电脑操控能力；LAN 只能查看状态和紧急停止，不能开启、暂停、恢复或启动。
-- 一个进程只有一个 `ComputerControlService` 活动租约；一个 run 固定一个 target；generic assistant Step 只允许一个电脑动作且不得与其他工具混用。OpenAI GA native 的 `actions[]` 按 Task 11 的可中断串行规则处理。
+- 一个进程只有一个 `ComputerControlService` 活动租约；一个 run 固定一个 target；generic assistant Step 只允许一个电脑动作且不得与其他工具混用。OpenAI GA native 的 `actions[]` 按 Task 11a 的可中断串行规则处理。
 - 全局停止键固定为 `Ctrl+Alt+Esc`；任一开关开启期间持续注册，两个都关闭或进程退出才注销。注册失败时两个能力都不可用。停止必须释放所有按下的键和鼠标键。
 - 截图失败不得返回旧截图；浏览器失败不得改走桌面；native 解析失败不得改走 generic；非法配置不得自动纠正。
 - `computer_action` 是固定 Harness 保留工具，不进入普通 `ToolRegistry`，插件/MCP 同名必须明确拒绝。
 - 默认关闭时以下测试不得修改任何 expected/hash：`tests/test_prompt_byte_stability.py`、`tests/test_provider_payload_golden.py`、DeepSeek Prompt Ledger、Kimi/GLM 缓存/推理参数、token 统计。
 - `messages` 仍是正文唯一事实源；Harness Journal 只保存 ID、序号、时间、耗时、状态和哈希，不保存截图、输入文字、URL、Provider response id 或 safety 原文。
 - `evaluate_js` 仍只允许 `gui-js-dispatcher` 单消费者线程调用；backend/hotkey 线程只入现有事件队列。
-- 每个 Task 必须真实执行 RED → GREEN → 相关回归 → `git diff --check` → `git status --short`；不得先写实现后补测试。新建未跟踪文件还必须执行本计划“新增文件空白检查”，不能把 `git diff --check` 当成对未跟踪文件的覆盖。
+- 每个 Task 必须真实执行 RED → GREEN → 相关回归 → `git diff --check` → `git status --short`；不得先写实现后补测试。`git diff --check` 不覆盖未跟踪的新文件，因此每个 Task 创建新文件后必须执行下面的“新增文件空白检查”，不能把它当成可选步骤。
 - 本计划不授权 K3 执行 `git commit`、push、merge、发布或修改现有 golden；每个 Task 末尾只给出建议提交信息。
+
+**新增文件空白检查（每个 Task 含新建文件时必做）：**
+
+```powershell
+git add -N <本 Task 全部新建文件路径>
+git diff --check
+git status --porcelain
+```
+
+`git add -N`（intent-to-add）让 `git diff --check` 能覆盖未跟踪文件，检查尾随空白、冲突标记和缩进问题；`git status --porcelain` 用于确认没有计划外的新文件悄悄出现。intent-to-add 不改变文件内容，也不是 `git commit` 授权的一部分。
 
 ## File Map
 
@@ -112,7 +122,15 @@ get_computer_control_service() -> ComputerControlService
 
 ### 共享测试 fixture 契约
 
-`tests/computer_fakes.py` 必须在首次引用前创建，并由各测试显式 import。它统一导出 `FakeHotkeyApi`、`FakePlaywrightRuntime`、`FakeWin32Adapter`、`FakeComputerBackend`、`FakeController`、`fake_png_bytes(seed)`、`http_status(url)`、`use_temp_config(tmp_path, monkeypatch, values)`、`capture_responses_request(...)` 和 `read_text_surfaces(...)`。fixture 只能实现对应 Protocol 的最小确定性行为，禁止访问真实键鼠、真实浏览器、网络 Provider 或用户配置。后文旧式 `_png_bytes`、`_http_status`、`_use_config` 名称一律视为上述公开 helper 的笔误并在实现时不得出现；测试收集阶段必须证明没有 `NameError` 或缺失 fixture。
+`tests/computer_fakes.py` 必须在首次引用前创建，并由各测试显式 import。它统一导出：
+
+- fake 实现：`FakeHotkeyApi`、`FakePlaywrightRuntime`、`FakeWin32Adapter`、`FakeComputerBackend`、`FakeController`；
+- pytest fixture：`enabled_settings`（返回两个开关均开启的 `ComputerSettingsSnapshot`）；
+- 数据 helper：`fake_png_bytes(seed)`、`sample_computer_actions()`（返回 MOVE/CLICK/TYPE_TEXT 等合法样例动作）、`SafetyCheck`、`openai_compatible_provider()`；
+- capability 常量：`GENERIC_CAPABILITY`、`NATIVE_BROWSER_CAPABILITY`、`DISABLED_CAPABILITY`；
+- 请求捕获 helper：`http_status(url)`、`capture_responses_request(...)`、`capture_continuation_request(...)`、`use_temp_config(tmp_path, monkeypatch, values)`、`read_text_surfaces(...)`。
+
+fixture 只能实现对应 Protocol 的最小确定性行为，禁止访问真实键鼠、真实浏览器、网络 Provider 或用户配置。除上述导出外，测试正文引用的其他 helper（如 Task 9 的 `_call`、Task 10 的 `run_two_step_tool_turn`/`canonical_bytes`、Task 11a 的 `NATIVE_MODEL_NAME` 等）必须定义在同一个测试模块内；测试收集阶段必须证明没有 `NameError` 或缺失 fixture。后文旧式 `_png_bytes`、`_http_status`、`_use_config` 名称一律视为上述公开 helper 的笔误并在实现时不得出现。
 
 ---
 
@@ -236,7 +254,7 @@ Suggested commit after explicit authorization: `build: declare system-browser Pl
 
 - [ ] **Step 1: 写严格解析失败测试**
 
-创建覆盖合法动作、未知字段、`bool` 坐标、字段互斥、8000 字符、100–10000 ms、最多 8 键、URL scheme 和 browser-only 导航的参数化测试：
+创建覆盖合法动作、未知字段、`bool` 坐标、字段互斥、8000 字符、100–10000 ms、最多 8 键、URL scheme、browser-only 导航、拖拽路径和用户接管的参数化测试：
 
 ```python
 import pytest
@@ -250,6 +268,21 @@ def test_parse_click_requires_strict_integer_coordinates():
     assert (action.kind, action.target, action.x, action.y) == ("click", "desktop", 12, 34)
 
 
+def test_parse_drag_normalizes_start_end_to_path():
+    action = parse_computer_action(
+        {"kind": "drag", "target": "desktop", "x": 1, "y": 2, "end_x": 3, "end_y": 4}
+    )
+    assert action.path == ((1, 2), (3, 4))
+    assert action.end_x is None and action.end_y is None
+
+
+def test_parse_takeover_requires_stable_reason_code():
+    action = parse_computer_action(
+        {"kind": "request_user_takeover", "target": "browser", "reason_code": "login_required"}
+    )
+    assert action.reason_code == "login_required"
+
+
 @pytest.mark.parametrize("payload", [
     {"kind": "click", "target": "desktop", "x": True, "y": 2},
     {"kind": "observe", "target": "browser", "x": 1},
@@ -258,12 +291,17 @@ def test_parse_click_requires_strict_integer_coordinates():
     {"kind": "navigate", "target": "desktop", "url": "https://example.com"},
     {"kind": "navigate", "target": "browser", "url": "file:///c:/secret"},
     {"kind": "click", "target": "desktop", "x": 1, "y": 2, "mystery": 3},
+    {"kind": "drag", "target": "desktop", "path": [(1, 2)], "x": 1, "y": 2},
+    {"kind": "drag", "target": "desktop"},
+    {"kind": "request_user_takeover", "target": "browser", "reason_code": "just_because"},
 ])
 def test_parse_action_rejects_invalid_payload(payload):
     with pytest.raises(ComputerControlError) as raised:
         parse_computer_action(payload)
     assert raised.value.code == "computer_invalid_action"
 ```
+
+`drag` 必须恰好提供 `path`（2–256 个整数坐标点）或起终点 `x/y/end_x/end_y` 之一，同时提供二者或都不提供均拒绝；起终点输入解析后立即规范化为两点 `path`。`request_user_takeover` 只接受 `login_required|captcha_required|credential_required`。
 
 - [ ] **Step 2: 运行确认 RED**
 
@@ -290,8 +328,7 @@ class ComputerAction:
     target: str
     x: int | None = None
     y: int | None = None
-    end_x: int | None = None
-    end_y: int | None = None
+    path: tuple[tuple[int, int], ...] = ()
     button: str = "left"
     delta_x: int = 0
     delta_y: int = 0
@@ -299,6 +336,7 @@ class ComputerAction:
     keys: tuple[str, ...] = ()
     url: str | None = None
     duration_ms: int | None = None
+    reason_code: str | None = None
 
 
 class ComputerBackend(Protocol):
@@ -310,7 +348,7 @@ class ComputerBackend(Protocol):
     def close(self) -> None: ...
 ```
 
-`ComputerControlError.__str__` 返回中文 message，`code` 保持设计规格的稳定英文错误码。快照和观察的 `repr` 不得暴露 `text` 或本地截图绝对路径。
+`keys` 既用于 `keypress` 组合键，也作为受支持鼠标动作（click/double_click/drag）的 modifier；`path` 是拖拽的唯一规范表示（起终点输入解析后立即规范化）。`ComputerControlError.__str__` 返回中文 message，`code` 保持设计规格的稳定英文错误码。快照和观察的 `repr` 不得暴露 `text` 或本地截图绝对路径。
 
 - [ ] **Step 4: 实现白名单动作解析**
 
@@ -320,10 +358,10 @@ class ComputerBackend(Protocol):
 _COMMON = {"kind", "target"}
 _ALLOWED = {
     "observe": _COMMON,
-    "click": _COMMON | {"x", "y", "button"},
-    "double_click": _COMMON | {"x", "y", "button"},
+    "click": _COMMON | {"x", "y", "button", "keys"},
+    "double_click": _COMMON | {"x", "y", "button", "keys"},
     "move": _COMMON | {"x", "y"},
-    "drag": _COMMON | {"x", "y", "end_x", "end_y", "button"},
+    "drag": _COMMON | {"path", "x", "y", "end_x", "end_y", "button", "keys"},
     "scroll": _COMMON | {"x", "y", "delta_x", "delta_y"},
     "type_text": _COMMON | {"text"},
     "keypress": _COMMON | {"keys"},
@@ -332,10 +370,11 @@ _ALLOWED = {
     "back": _COMMON,
     "forward": _COMMON,
     "reload": _COMMON,
+    "request_user_takeover": _COMMON | {"reason_code"},
 }
 ```
 
-实现 `_strict_int()` 显式拒绝 `bool`；`urllib.parse.urlsplit` 只允许 `http|https` 且必须有 hostname；组合键只允许 `CTRL, ALT, SHIFT, META, ENTER, TAB, ESC, SPACE, BACKSPACE, DELETE, HOME, END, PAGEUP, PAGEDOWN, UP, DOWN, LEFT, RIGHT, A-Z, 0-9, F1-F12`。
+`drag` 的互斥规则：`path` 与 `x/y/end_x/end_y` 恰好提供其一，起终点输入解析后立即规范化为两点 `path`，存储层不再保留 `end_x/end_y` 字段。实现 `_strict_int()` 显式拒绝 `bool`；`urllib.parse.urlsplit` 只允许 `http|https` 且必须有 hostname；组合键只允许 `CTRL, ALT, SHIFT, META, ENTER, TAB, ESC, SPACE, BACKSPACE, DELETE, HOME, END, PAGEUP, PAGEDOWN, UP, DOWN, LEFT, RIGHT, A-Z, 0-9, F1-F12`；`reason_code` 只允许 `login_required|captcha_required|credential_required`。
 
 - [ ] **Step 5: GREEN、序列化与隐私回归**
 
@@ -376,7 +415,7 @@ Suggested commit after explicit authorization: `feat(computer): add strict actio
 
 ```python
 def test_missing_computer_settings_are_safe_defaults(tmp_path, monkeypatch):
-    _use_config(tmp_path, monkeypatch, {})
+    use_temp_config(tmp_path, monkeypatch, {})
     snapshot = load_computer_settings()
     assert snapshot.browser_control_enabled is False
     assert snapshot.computer_control_enabled is False
@@ -389,7 +428,7 @@ def test_missing_computer_settings_are_safe_defaults(tmp_path, monkeypatch):
     ("computer_browser", "chromium"),
 ])
 def test_explicit_invalid_config_is_rejected(tmp_path, monkeypatch, key, value):
-    _use_config(tmp_path, monkeypatch, {key: value})
+    use_temp_config(tmp_path, monkeypatch, {key: value})
     with pytest.raises(ComputerControlError):
         load_computer_settings()
 
@@ -507,14 +546,14 @@ Suggested commit after explicit authorization: `feat(computer): add strict contr
     {"supports_vision": True, "supports_function_calling": True},
 ])
 def test_generic_requires_three_explicit_capability_fields(model, enabled_settings):
-    capability = resolve_computer_capability(model, _openai_compatible_provider(), enabled_settings, "local")
+    capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is False
     assert capability.error_code == "computer_model_not_capable"
 
 
 def test_generic_capable_model_receives_enabled_targets(enabled_settings):
     model = {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "generic"}
-    capability = resolve_computer_capability(model, _openai_compatible_provider(), enabled_settings, "local")
+    capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is True
     assert capability.targets == ("browser", "desktop")
 
@@ -539,7 +578,7 @@ Expected: resolver 和新配置字段不存在。
 
 - [ ] **Step 3: 实现纯函数 resolver**
 
-resolver 不读全局 config、不做网络探测、不按模型名称分支。官方 OpenAI base 只允许规范化 host `api.openai.com`，协议必须是项目现有 Responses 标识；目标按两个设置开关组成固定 tuple。返回对象至少含：
+resolver 不读全局 config、不做网络探测、不按模型名称分支。官方 OpenAI base 只允许规范化 host `api.openai.com`；协议字段必须用 `core/model_manager.py` 的真实字段名 `protocol`（取值如 `"openai"`、`"responses"`），native 判定精确为 `provider.get("protocol") == "responses"` 加规范化官方 base URL，不得发明 `api_protocol` 之类的新字段或按 base URL 字符串猜测。目标按两个设置开关组成固定 tuple。返回对象至少含：
 
 ```python
 ComputerCapability(
@@ -888,6 +927,27 @@ def test_resume_requires_fresh_observation_before_action(service, running_run, o
         service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="desktop", x=1, y=1))
 
 
+def test_request_user_takeover_pauses_for_user_then_requires_observe(service, running_run, owner_a):
+    service.execute(
+        running_run.run_id, owner_a,
+        ComputerAction(kind="request_user_takeover", target="browser", reason_code="login_required"),
+    )
+    assert service.snapshot().status == "waiting_for_user"
+    service.resume(running_run.run_id)
+    with pytest.raises(ComputerControlError, match="先观察"):
+        service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+
+
+def test_complete_run_releases_lease_but_retains_browser_session(service, running_run, owner_a, owner_b, capability):
+    first = service.complete_run(running_run.run_id, owner_a, retain_browser_session=True)
+    second = service.complete_run(running_run.run_id, owner_a, retain_browser_session=True)
+    assert first.status == second.status == "completed"
+    assert service.backend.release_count == 0
+    assert service.backend.close_count == 0  # stop 才关闭 backend
+    new_run = service.start_run(owner_b, capability, target="browser")  # 租约已释放，可开新 run
+    assert new_run.run_id != running_run.run_id
+
+
 def test_stop_is_idempotent_and_releases_inputs_once(service, running_run):
     first = service.stop(running_run.run_id, "hotkey")
     second = service.stop(running_run.run_id, "hotkey")
@@ -896,7 +956,7 @@ def test_stop_is_idempotent_and_releases_inputs_once(service, running_run):
     assert service.backend.close_count == 1
 ```
 
-另测非法状态转换、owner/cancel/generation 检查、动作串行、错误时不发成功、三次无变化、observe/wait 不计 no-progress、停止事件只发一次。
+另测非法状态转换（含 running→completing→completed 与跳过 completing 直接 completed 的拒绝）、owner/cancel/generation 检查、动作串行、错误时不发成功、三次无变化、observe/wait 不计 no-progress、停止事件只发一次、Turn 终态 finally 二选一调用 complete/stop 后不遗留 running 租约。
 
 - [ ] **Step 2: 运行确认 RED**
 
@@ -910,10 +970,12 @@ Expected: controller 模块不存在。
 _TRANSITIONS = {
     "idle": {"starting"},
     "starting": {"running", "failed", "stopping"},
-    "running": {"paused", "waiting_for_user", "provider_safety_required", "stopping", "failed"},
+    "running": {"paused", "waiting_for_user", "provider_safety_required", "completing", "stopping", "failed"},
     "paused": {"running", "stopping", "failed"},
     "waiting_for_user": {"running", "stopping", "failed"},
     "provider_safety_required": {"running", "stopping", "failed"},
+    "completing": {"completed", "stopping", "failed"},
+    "completed": {"starting"},
     "stopping": {"stopped", "failed"},
     "stopped": {"starting"},
     "failed": {"starting"},
@@ -926,7 +988,9 @@ _TRANSITIONS = {
 
 动作顺序严格为 owner/state/cancel/generation → before → execute → fresh after → no-progress → events → Provider observation。预期改变界面的动作只有在 `screen_sha256` 和 active fingerprint 都连续三次相同才失败为 `computer_no_progress`。
 
-`stop()` 顺序：controller flag → owner cancel event → 注入的 `abort_provider(owner.turn_id)` → 禁止新动作 → backend cancel/`release_inputs()` → backend `close()` → 状态终结 → 租约释放 → final event。每步用 `try/finally` 保证后续安全释放，但不把清理错误伪装成 stopped success；首个清理错误记录为 run failure。
+`complete_run(run_id, owner, retain_browser_session=True)`：run 进入 `completing` → `completed`，释放 owner/活动租约并发出最终事件；浏览器 backend 在 retain 时不 `close()`，作为无执行权的 retained session 留给下一 run 显式复用；desktop backend 立即释放输入和运行态。`stop()` 专用于取消、故障和紧急停止，会关闭 backend。二者幂等；任何 Turn 终态必须在 `finally` 中二选一调用，不能遗留 running 租约。
+
+`stop()` 顺序：controller flag → `owner.cancel_event.set()` → 调用现有 `core.llm.abort_inflight_streams(owner.cancel_event)` 关闭在飞 Provider 流（先 set 事件再 abort，让被关闭一侧归一为用户取消；不得按 turn id 发明第二套取消注册表）→ 禁止新动作 → backend cancel/`release_inputs()` → backend `close()` → 状态终结 → 租约释放 → final event。每步用 `try/finally` 保证后续安全释放，但不把清理错误伪装成 stopped success；首个清理错误记录为 run failure。
 
 - [ ] **Step 5: GREEN 与并发回归**
 
@@ -1041,7 +1105,7 @@ Provider tool result 使用 `json.dumps(..., ensure_ascii=False, sort_keys=True,
 Run:
 
 ```powershell
-venv\Scripts\python.exe -m pytest tests/test_computer_tool_adapter.py tests/test_computer_provider_generic.py tests/test_tool_pipeline.py tests/test_tool_registry.py tests/test_tool_adapters.py -q
+venv\Scripts\python.exe -m pytest tests/test_computer_tool_adapter.py tests/test_computer_provider_generic.py tests/test_tool_pipeline.py tests/test_tool_registry.py -q
 venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q
 git diff --check -- core/tool_protocol.py core/harness/tool_pipeline.py core/tool_registry.py core/computer tests
 ```
@@ -1059,7 +1123,9 @@ Suggested commit after explicit authorization: `feat(harness): add generic compu
 - Modify: `core/agent_service.py`
 - Modify: `core/llm.py`
 - Modify: `core/harness/request_envelope.py`
+- Modify: `core/memory.py`
 - Create: `tests/test_computer_llm_generic.py`
+- Modify: `tests/test_memory_maintenance.py`
 - Modify: `tests/test_prompt_byte_stability.py`
 - Modify: `tests/test_provider_payload_golden.py`
 - Modify: `tests/test_deepseek_prompt_ledger.py`
@@ -1095,9 +1161,37 @@ def test_default_off_request_matches_existing_golden(monkeypatch):
 
 另测 capability 在中途开启时当前 Turn 不变；中途关闭时 controller 取消但 tools contract 不被换成另一个 schema；动态 prompt 只在 enabled 时出现；generic 图片经过现有媒体折叠链。
 
+`core/memory.py` 媒体折叠兼容（写入 `tests/test_memory_maintenance.py`；`add_observation_message` 等测试内 helper 在同一模块定义）：
+
+```python
+def test_content_has_media_accepts_full_message_dict_with_computer_meta():
+    message = {
+        "role": "user",
+        "content": [{"type": "text", "text": "观察"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}],
+        "_computer_v1": {"run_id": "run-a", "ordinal": 3, "target": "browser"},
+    }
+    assert _content_has_media(message) is True
+
+
+def test_fold_keeps_computer_meta_and_is_idempotent(store, session):
+    ids = [add_observation_message(store, session, ordinal) for ordinal in range(1, 4)]
+    add_observation_message(store, session, 4)  # 最新一条不折叠
+    folded_first = raw_content_of(store, session, ids[0])
+    assert '"_computer_v1"' in folded_first
+    assert "data:image/png;base64" not in folded_first
+    add_observation_message(store, session, 5)  # 再次触发折叠
+    assert raw_content_of(store, session, ids[0]) == folded_first  # 幂等，字节不再变化
+
+
+def test_old_computer_screenshots_do_not_accumulate(store, session):
+    for ordinal in range(1, 20):
+        add_observation_message(store, session, ordinal)
+    assert count_unfolded_media_rows(store, session) <= 1  # 只有最新一条保留图片
+```
+
 - [ ] **Step 2: 运行确认 RED**
 
-Run: `venv\Scripts\python.exe -m pytest tests/test_computer_llm_generic.py tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q`
+Run: `venv\Scripts\python.exe -m pytest tests/test_computer_llm_generic.py tests/test_memory_maintenance.py tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py -q`
 
 Expected: 新 capability 上下文和工具注入不存在；原有 golden 测试仍应单独通过。
 
@@ -1130,7 +1224,7 @@ if computer_tool is not None:
 
 然后才交给 RequestEnvelope 指纹和 Provider 转换。不得缓存到全局 `get_tools_schema()`。DeepSeek Ledger 看到新 contract 时走现有切代；不要专门改 Ledger。Kimi/GLM metadata、cache-control、reasoning、`extra_body` 保持原逻辑。
 
-- [ ] **Step 6: 提交工具结果和观察消息的同 Step 边界**
+- [ ] **Step 6: 提交工具结果和观察消息的同 Step 边界，扩展媒体折叠**
 
 现有 `ToolBatchExecutor` 返回 records 后：
 
@@ -1145,43 +1239,41 @@ persist_messages(followups)
 
 实际代码必须复用现有单事务/持久化 API，不新增独立 SQLite 连接。若观察构造失败，当前工具 result 为 error 且不得附旧图；取消打捞为悬空 computer call 生成 `computer_cancelled` tool result。
 
+带 `_computer_v1` 的 follow-up 观察消息以完整 dict 持久化时，`core/memory.py` 的 `_content_has_media()` 和 `_fold_stale_media_locked()` 必须同时识别两种形态：content 列表，以及含 `content` 列表的完整消息 dict。折叠只替换媒体块为文本占位符，不删除或改写 `_computer_v1` 私有元数据；折叠后字节永久冻结（幂等）。该改动不得改变现有非电脑消息的折叠行为——普通用户图片消息的折叠结果字节必须与改动前完全一致。
+
 - [ ] **Step 7: GREEN 与缓存/ledger 回归**
 
 Run:
 
 ```powershell
-venv\Scripts\python.exe -m pytest tests/test_computer_llm_generic.py tests/test_computer_provider_generic.py tests/test_llm_responses.py tests/test_llm_events_fixes.py -q
+venv\Scripts\python.exe -m pytest tests/test_computer_llm_generic.py tests/test_computer_provider_generic.py tests/test_memory_maintenance.py tests/test_memory.py tests/test_llm_responses.py tests/test_llm_events_fixes.py -q
 venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py tests/test_deepseek_prompt_ledger.py tests/test_cache_keepalive.py tests/test_token_accounting.py -q
-git diff --check -- core/context_builder.py core/agent_service.py core/llm.py core/harness/request_envelope.py tests
+git diff --check -- core/context_builder.py core/agent_service.py core/llm.py core/harness/request_envelope.py core/memory.py tests
 ```
 
-Expected: 现有 hash/expected 文件内容无变化；enabled generic 只在 tools 尾部多一个 schema；同 Turn 多 Step schema 稳定。
+Expected: 现有 hash/expected 文件内容无变化；enabled generic 只在 tools 尾部多一个 schema；同 Turn 多 Step schema 稳定；旧电脑截图按现有媒体折叠收敛、折叠幂等。
 
 Suggested commit after explicit authorization: `feat(llm): route generic computer turns`
 
 ---
 
-### Task 11: OpenAI Responses 原生 Computer Use 与 continuation
+### Task 11a: OpenAI Responses 原生事件解析、target selector 与串行动作执行
 
 **Files:**
 - Create: `core/computer/provider_openai.py`
 - Create: `tests/test_computer_provider_openai.py`
-- Modify: `core/harness/request_envelope.py`
 - Modify: `core/harness/stream_assembler.py`
-- Modify: `core/llm.py`
 - Modify: `tests/test_llm_responses.py`
-- Modify: `tests/test_provider_payload_golden.py`
-- Modify: `tests/test_harness_runtime.py`
 
 **Interfaces:**
 - Consumes: native `ComputerCapability`, controller and target selector
 - Produces: `build_openai_computer_tools(capability, target_selected) -> tuple[dict, ...]`
 - Produces: `NativeComputerCall(response_id, call_id, actions, pending_safety_checks)`
 - Produces: `parse_openai_computer_events(events) -> NativeComputerCall | NativeFinalText`
-- Produces: `build_computer_call_output(call, observation, acknowledged_checks=()) -> dict`
-- Produces: deterministic `_computer_v1` persistence projection
+- Produces: `execute_native_computer_call(call, controller) -> NativeCallResult`
+- Produces: selector tool `computer_select_target` 的固定 schema 与租约建立
 
-- [ ] **Step 1: 写受控 built-in、事件完整性和 continuation 失败测试**
+- [ ] **Step 1: 写受控 built-in、事件完整性和 selector 失败测试**
 
 ```python
 def test_native_first_request_appends_controlled_computer_tool():
@@ -1190,13 +1282,18 @@ def test_native_first_request_appends_controlled_computer_tool():
     assert "previous_response_id" not in request
 
 
-def test_native_continuation_sends_only_previous_id_and_call_output():
-    request = capture_continuation_request(response_id="resp_1", call_id="call_1", png=b"png")
-    assert request["previous_response_id"] == "resp_1"
-    assert request["input"][0]["type"] == "computer_call_output"
-    assert request["input"][0]["call_id"] == "call_1"
-    assert request["input"][0]["output"]["type"] == "computer_screenshot"
-    assert "messages" not in request
+def test_native_dual_target_disables_parallel_tool_calls_and_includes_selector():
+    request = capture_responses_request(capability=NATIVE_DUAL_TARGET_CAPABILITY)
+    names = [tool.get("name") or tool.get("type") for tool in request["tools"]]
+    assert "computer_select_target" in names and "computer" in names
+    assert request["parallel_tool_calls"] is False
+
+
+def test_selector_and_computer_call_in_same_response_is_protocol_error(controller):
+    events = [SELECTOR_DONE_EVENT, COMPUTER_CALL_EVENT]
+    with pytest.raises(ComputerControlError) as raised:
+        parse_openai_computer_events(events)
+    assert raised.value.code == "computer_provider_protocol_error"
 
 
 @pytest.mark.parametrize("event", [
@@ -1211,21 +1308,22 @@ def test_missing_response_or_call_id_is_protocol_error(event):
 
 def test_pending_safety_blocks_before_execution(controller):
     call = NativeComputerCall("resp_1", "call_1", (CLICK,), (SafetyCheck("sc_1", "reason"),))
-    result = handle_native_call(call, controller)
+    result = execute_native_computer_call(call, controller)
     assert result.status == "provider_safety_required"
     assert controller.execute_count == 0
 
 
 def test_native_actions_are_serial_and_stop_after_first_failure(controller):
-    controller.fail_on_ordinal = 2
+    controller.fail_on_ordinal = 2  # 第二个动作（CLICK）执行时失败
     call = NativeComputerCall("resp_1", "call_1", (MOVE, CLICK, TYPE_TEXT), ())
     with pytest.raises(ComputerControlError):
-        handle_native_call(call, controller)
-    assert controller.executed_actions == [MOVE, CLICK]
+        execute_native_computer_call(call, controller)
+    assert controller.attempted_actions == [MOVE, CLICK]  # 失败后 TYPE_TEXT 不再执行
     assert controller.max_concurrent_actions == 1
+    assert controller.observation_count == 2  # 每个动作都有本地 after observation
 ```
 
-另测 native 双 target 时 `computer_select_target` 从首请求存在；未选 target 的 computer call 被拒；response failed/incomplete；unknown built-in 仍拒绝；final text 退出 continuation。
+另测 native 双 target 时 `computer_select_target` 从首请求存在；未选 target 的 computer call 被拒；selector 必须单独完成一个 Step（`parallel_tool_calls=false`），不依赖 output 数组顺序；response failed/incomplete；unknown built-in 仍拒绝；final text 结束原生分支。`SELECTOR_DONE_EVENT`、`COMPUTER_CALL_EVENT`、`NATIVE_DUAL_TARGET_CAPABILITY` 等在 `tests/computer_fakes.py` 或本测试模块内定义。
 
 - [ ] **Step 2: 运行确认 RED**
 
@@ -1237,7 +1335,7 @@ Expected: 原生 computer built-in 和事件类型不被当前转换器支持。
 
 built-in 使用当前官方 GA 定义 `{"type":"computer"}`。官方 migration 表明确 `computer_use_preview` 是旧路径，新实现不得采用或自动回退。实施时再次打开官方指南复核；若官方 GA 形状未来变化，先更新设计附录并说明证据。`_responses_tools_from_chat_tools()` 仍拒绝任意 built-in，只允许 capability 分支直接传入的精确 computer definition。
 
-两个 target 同时启用时，首请求在现有 function tools 后依次追加 `computer_select_target` 和 native computer tool。selector schema：
+两个 target 同时启用时，首请求在现有 function tools 后依次追加 `computer_select_target` 和 native computer tool，并固定设置 `parallel_tool_calls=false`，强制 selector 单独完成一个 Step。selector schema：
 
 ```python
 {
@@ -1253,23 +1351,99 @@ built-in 使用当前官方 GA 定义 `{"type":"computer"}`。官方 migration �
 }
 ```
 
-重复选择、未开启 target、选择后变更均明确失败。
+`computer_select_target` 由固定 adapter（Task 9 的保留名机制）执行并写入 target 租约，不进入普通 ToolRegistry。同一个 Provider response 同时出现 selector 和 `computer_call` 时以 `computer_provider_protocol_error` 失败，绝不按 output 数组顺序猜测。重复选择、未开启 target、选择后变更均明确失败。
 
 - [ ] **Step 4: 严格标准化 Responses 事件**
 
-`NativeComputerCall` 只有 response id、call id、非空完整 `actions[]` 和 safety checks 解析成功才构造。流式 delta 先由 assembler 合并，禁止基于半截 JSON 执行动作。provider 的每个 computer action 映射到 Task 2 统一动作后再次校验坐标/字段；官方 `screenshot` 映射为 `observe`。
+`NativeComputerCall` 只有 response id、call id、非空完整 `actions[]` 和 safety checks 解析成功才构造。流式 delta 先由 assembler 合并，禁止基于半截 JSON 执行动作。provider 的每个 computer action 映射到 Task 2 统一动作后再次校验坐标/字段；官方 `screenshot` 映射为 `observe`；官方 `drag` 的 `path` 与鼠标 modifier `keys` 直接映射到统一动作的 `path`/`keys`。
 
-GA 原生 `actions[]` 是 generic 单动作规则的明确例外：按原序逐个调用 controller，每个动作前都检查 cancel/pause/owner/generation，每个动作都发 trace；失败或停止后不执行余项。整批成功后只捕获一次截图并构造一个 `computer_call_output`。禁止并行、禁止忽略中间失败、禁止在后台把整批做成不可中断操作。
+GA 原生 `actions[]` 是 generic 单动作规则的明确例外：按原序逐个调用 controller，每个动作前都检查 cancel/pause/owner/generation，每个动作都捕获本地 after observation、执行无进展判断并发 trace；失败或停止后不执行余项。整批成功后只把最后一次 observation 的截图构造为一个 `computer_call_output` 回传 Provider——“只回传最后一图”不等于“中间动作不观察”。禁止并行、禁止忽略中间失败、禁止在后台把整批做成不可中断操作。
 
 completed/incomplete/failed 三种终态显式区分。缺字段、重复冲突字段或未知动作抛 `computer_provider_protocol_error`，当前 Step/Turn 失败，绝不进入 generic 分支。
 
-- [ ] **Step 5: 实现 continuation 和 Provider safety 确认**
+- [ ] **Step 5: GREEN 与 Responses 回归**
 
-活动 native continuation 的下一 Step 请求仅携带 `previous_response_id` 与一个 `computer_call_output`。`previous_response_id` 仅存 Turn 内存对象，不写 message、Journal、event、runtime log。
+Run:
 
-pending safety check 时 controller 进入 `provider_safety_required`，UI/CLI 的继续 API 必须传当前 run id 和精确 check ids；只有用户操作调用后才把这些 ids 放入官方要求的 acknowledged 字段。普通聊天文本、“完全访问”模式或自动重试不能确认。
+```powershell
+venv\Scripts\python.exe -m pytest tests/test_computer_provider_openai.py tests/test_llm_responses.py -q
+git diff --check -- core/computer/provider_openai.py core/harness/stream_assembler.py tests
+```
 
-- [ ] **Step 6: 实现脱敏持久化投影与崩溃语义**
+Expected: 事件解析、selector 租约和串行执行全绿；现有 Responses 测试原样通过。
+
+Suggested commit after explicit authorization: `feat(openai): parse native computer events`
+
+---
+
+### Task 11b: 原生 continuation、Provider safety 契约与脱敏持久化投影
+
+**Files:**
+- Modify: `core/computer/provider_openai.py`
+- Modify: `core/llm.py`
+- Modify: `core/harness/request_envelope.py`
+- Modify: `tests/test_computer_provider_openai.py`
+- Modify: `tests/test_provider_payload_golden.py`
+- Modify: `tests/test_harness_runtime.py`
+
+**Interfaces:**
+- Consumes: Task 11a 的 `NativeComputerCall`/`execute_native_computer_call`
+- Produces: `build_continuation_request(turn_state, call_output) -> dict`
+- Produces: `build_computer_call_output(call, observation) -> dict`（不含任何确认字段）
+- Produces: deterministic `_computer_v1` persistence projection
+- Produces: `previous_response_id` 的 Turn 内存生命周期
+
+- [ ] **Step 1: 写 continuation 与投影失败测试**
+
+```python
+def test_native_continuation_resends_model_tools_and_previous_id():
+    request = capture_continuation_request(response_id="resp_1", call_id="call_1", png=b"png")
+    assert request["model"] == NATIVE_MODEL_NAME  # 重新发送同一 model
+    assert {"type": "computer"} in request["tools"]  # 重新发送同序 tools
+    assert request["previous_response_id"] == "resp_1"
+    assert request["instructions"] == NATIVE_TURN_INSTRUCTIONS  # instructions 不自动继承，必须重发
+    assert request["input"] == [{
+        "type": "computer_call_output",
+        "call_id": "call_1",
+        "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,cG5n"},
+    }]  # 不重发完整历史，input 只有本批 call output
+    assert "messages" not in request
+
+
+def test_provider_returns_no_response_id_fails_without_fallback():
+    with pytest.raises(ComputerControlError) as raised:
+        build_continuation_request(turn_state_without_response_id(), ANY_CALL_OUTPUT)
+    assert raised.value.code == "computer_provider_protocol_error"
+
+
+def test_call_output_never_invents_safety_acknowledgement_fields():
+    output = build_computer_call_output(ANY_CALL, ANY_OBSERVATION)
+    assert "acknowledged_safety_checks" not in output  # GA schema 未确认前不得出现
+```
+
+另测 safety required 时 controller 停在 `provider_safety_required` 且后续 Step 不发起；`_computer_v1` 投影脱敏；崩溃恢复只标 interrupted。
+
+- [ ] **Step 2: 运行确认 RED**
+
+Run: `venv\Scripts\python.exe -m pytest tests/test_computer_provider_openai.py tests/test_harness_runtime.py -q`
+
+Expected: continuation 构造和投影不存在。
+
+- [ ] **Step 3: 实现 continuation 请求形状**
+
+活动 native continuation 的下一 Step 请求：不重发完整消息历史，但必须重新发送同一 model、同序 tools（含 computer tool 和必要时的 selector）、必要 instructions/options、上一 response id，`input` 只携带一个新的 `computer_call_output`（整批动作的最后一张截图）。官方 Responses API 明确上一响应的 instructions 不会经 `previous_response_id` 自动继承，漏发会导致 system prompt 语义漂移。`previous_response_id` 仅存 Turn 内存对象，不写 message、Journal、event、runtime log。Provider 未返回可用 response id 时立即以 `computer_provider_protocol_error` 失败；禁止退回“重发全部截图历史”或通用 function tool。
+
+- [ ] **Step 4: 实现 Provider safety 确认的条件契约**
+
+pending safety check 时 controller 进入 `provider_safety_required`，不执行动作。截至本计划编写，GA Computer use 指南未定义 `acknowledged_safety_checks` 请求契约，该字段只出现在 beta 类型参考中，因此 `build_computer_call_output()` 首版不产出任何确认字段。只有满足以下全部条件才允许增加确认路径并显示“继续”入口：
+
+1. 实施当天官方 GA 请求 schema 或所用 SDK 类型明确提供确认字段；
+2. 为该精确请求形状新增 byte-golden 测试并通过；
+3. 用户通过 GUI/CLI 显式操作传入当前 run id 和精确 check ids。
+
+不满足时 UI/CLI 只显示状态与停止。普通聊天文本、“完全访问”模式或自动重试不能确认；未确认不得发送虚假 acknowledged safety checks，也不得回退 generic 绕过。
+
+- [ ] **Step 5: 实现脱敏持久化投影与崩溃语义**
 
 原生中间行写 `messages` 时使用：
 
@@ -1288,17 +1462,17 @@ pending safety check 时 controller 进入 `provider_safety_required`，UI/CLI �
 
 输入文字只保存 code point 数和 SHA-256；截图只保存 screen hash/尺寸；不保存 base64、profile path、完整 URL、response id。后续普通 Provider 请求确定性过滤 `_computer_v1` 中间行，但最终 assistant 文本正常保留。崩溃恢复只标 interrupted，不自动继续旧 response id 或重放动作。
 
-- [ ] **Step 7: GREEN 与默认/原生 golden 门禁**
+- [ ] **Step 6: GREEN 与默认/原生 golden 门禁**
 
 Run:
 
 ```powershell
 venv\Scripts\python.exe -m pytest tests/test_computer_provider_openai.py tests/test_llm_responses.py tests/test_harness_runtime.py -q
 venv\Scripts\python.exe -m pytest tests/test_provider_payload_golden.py tests/test_prompt_byte_stability.py tests/test_deepseek_prompt_ledger.py tests/test_cache_keepalive.py tests/test_token_accounting.py -q
-git diff --check -- core/computer/provider_openai.py core/harness/request_envelope.py core/harness/stream_assembler.py core/llm.py tests
+git diff --check -- core/computer/provider_openai.py core/harness/request_envelope.py core/llm.py tests
 ```
 
-Expected: 默认所有现有 golden 原样通过；新 native fixture 精确断言 first request 和 continuation bytes；日志/DB/Journals 无 response id 与图片 base64。
+Expected: 默认所有现有 golden 原样通过；新 native fixture 精确断言 first request 和 continuation bytes（含重发的 model/tools/instructions）；日志/DB/Journals 无 response id 与图片 base64。
 
 Suggested commit after explicit authorization: `feat(openai): add native computer continuation`
 
@@ -1358,10 +1532,10 @@ Run:
 
 ```powershell
 venv\Scripts\python.exe -m pytest tests/test_gui_system_settings.py tests/test_gui_model_settings.py -q
-npm --prefix frontend test -- --run frontend/src/components/SystemSettings.test.ts frontend/src/components/SettingsPage.test.ts frontend/src/stores/appStore.systemSettings.test.ts frontend/src/stores/appStore.modelSettings.test.ts
+npm --prefix frontend test -- --run src/components/SystemSettings.test.ts src/components/SettingsPage.test.ts src/stores/appStore.systemSettings.test.ts src/stores/appStore.modelSettings.test.ts
 ```
 
-Expected: 新 Bridge、类型和控件不存在。
+Expected: 新 Bridge、类型和控件不存在。注意 `npm --prefix frontend` 已把工作目录设为 `frontend`，vitest 定向路径使用 `src/...`，不带 `frontend/` 前缀。
 
 - [ ] **Step 3: 实现 Bridge 严格 API**
 
@@ -1406,7 +1580,7 @@ Run:
 
 ```powershell
 venv\Scripts\python.exe -m pytest tests/test_gui_system_settings.py tests/test_gui_model_settings.py tests/test_computer_settings.py tests/test_computer_capability.py -q
-npm --prefix frontend test -- --run frontend/src/components/SystemSettings.test.ts frontend/src/components/SettingsPage.test.ts frontend/src/stores/appStore.systemSettings.test.ts frontend/src/stores/appStore.modelSettings.test.ts
+npm --prefix frontend test -- --run src/components/SystemSettings.test.ts src/components/SettingsPage.test.ts src/stores/appStore.systemSettings.test.ts src/stores/appStore.modelSettings.test.ts
 npm --prefix frontend run build
 git diff --check -- gui_bridge.py frontend/src tests/test_gui_system_settings.py tests/test_gui_model_settings.py
 ```
@@ -1417,7 +1591,71 @@ Suggested commit after explicit authorization: `feat(gui): add explicit computer
 
 ---
 
-### Task 13: GUI 顶部安全条、操控页签、事件 reducer 与 Provider safety 操作
+### Task 13a: GUI Bridge 电脑操控事件桥与控制 API
+
+**Files:**
+- Modify: `gui_bridge.py`
+- Modify: `tests/test_gui_tool_events.py`
+- Modify: `tests/test_gui_message_queue.py`
+
+**Interfaces:**
+- Consumes: controller snapshots/events（含 run 内严格递增 `event_seq`）
+- Produces bridge: `get_computer_control_status()`, `pause_computer_control(run_id)`, `resume_computer_control(run_id)`, `stop_computer_control(run_id)`, `acknowledge_computer_safety(run_id, check_ids)`（后者按 Task 11b 的条件契约预留，未验证官方确认字段前拒绝调用并返回不可用）
+- Produces: controller listener 到现有 `_js_queue` 的小 JSON 事件转发
+
+- [ ] **Step 1: 写 Bridge 事件转发和控制失败测试**
+
+```python
+def test_bridge_forwards_only_small_json_events_to_js_queue(fake_controller, bridge):
+    fake_controller.emit_observation(run_id="run-a", event_seq=3)
+    payload = bridge.drain_js_queue()
+    assert payload["type"] == "computer_observation"
+    assert payload["run_id"] == "run-a"
+    assert payload["event_seq"] == 3
+    assert "data:image/png;base64" not in json.dumps(payload)
+
+
+def test_bridge_mutation_requires_current_run_id(fake_controller, bridge):
+    fake_controller.start_run(run_id="run-a")
+    result = bridge.stop_computer_control("run-b")  # 旧 UI 事件的 run id
+    assert result["ok"] is False
+    assert fake_controller.snapshot().run_id == "run-a"
+
+
+def test_safety_acknowledge_unavailable_without_verified_contract(fake_controller, bridge):
+    result = bridge.acknowledge_computer_safety("run-a", ["sc_1"])
+    assert result["ok"] is False
+    assert result["error_code"] == "computer_provider_safety_required"
+```
+
+另测 pause/resume 透传 controller、事件线程不直接 `evaluate_js`、队列满丢新事件不改写旧事件、每次控制操作返回完整 snapshot（供前端校准，见设计 16.4）。
+
+- [ ] **Step 2: 运行确认 RED**
+
+Run: `venv\Scripts\python.exe -m pytest tests/test_gui_tool_events.py tests/test_gui_message_queue.py -q`
+
+Expected: Bridge 新方法与事件转发不存在。
+
+- [ ] **Step 3: 实现 Bridge 控制与事件桥**
+
+每个 mutation 都要求当前 run id，防止旧 UI 事件停止新 run，返回值携带完整 controller snapshot。controller listener 只把小 JSON `put_nowait` 到 `_js_queue`；队列满按现有策略丢新事件，不在 backend/action/delta lock 内调用 `evaluate_js`。`acknowledge_computer_safety` 在官方确认契约与 byte-golden 验证完成前固定返回不可用错误（Task 11b Step 4 的条件），Bridge 不自行发明确认 payload。
+
+- [ ] **Step 4: GREEN 与现有 GUI 事件回归**
+
+Run:
+
+```powershell
+venv\Scripts\python.exe -m pytest tests/test_gui_tool_events.py tests/test_gui_message_queue.py tests/test_computer_controller.py -q
+git diff --check -- gui_bridge.py tests/test_gui_tool_events.py tests/test_gui_message_queue.py
+```
+
+Expected: 现有 GUI 事件/队列测试原样通过；事件线程测试断言没有直接 `evaluate_js`。
+
+Suggested commit after explicit authorization: `feat(gui): bridge computer control events`
+
+---
+
+### Task 13b: 前端安全条、操控页签与事件 reducer
 
 **Files:**
 - Create: `frontend/src/components/ComputerControlBar.vue`
@@ -1428,23 +1666,21 @@ Suggested commit after explicit authorization: `feat(gui): add explicit computer
 - Modify: `frontend/src/stores/appStore.ts`
 - Modify: `frontend/src/components/RightPanel.vue`
 - Modify: `frontend/src/App.vue`
-- Modify: `gui_bridge.py`
-- Modify: `tests/test_gui_bridge_events.py`
 - Modify: relevant existing `RightPanel` and `App` Vitest files
 
 **Interfaces:**
-- Consumes: controller snapshots/events and preview URL
+- Consumes: Task 13a 的 Bridge API 与事件形状
 - Produces Store: `computerRun`, `computerTrace`, `computerLastAutoOpenedRunId`
-- Produces actions: `pauseComputerControl()`, `resumeComputerControl()`, `stopComputerControl()`, `acknowledgeComputerSafety(checkIds)`
+- Produces actions: `pauseComputerControl()`, `resumeComputerControl()`, `stopComputerControl()`
 - Produces UI: persistent top bar and dynamic right tab with max 200 trace records
 
 - [ ] **Step 1: 写 reducer 顺序和安全按钮失败测试**
 
 ```ts
-it('rejects late events from old runs and older ordinals', () => {
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', ordinal: 1, status: 'running' });
-  store.reduceComputerEvent({ type: 'computer_observation', run_id: 'run-1', ordinal: 99, preview_url: '/old' });
-  store.reduceComputerEvent({ type: 'computer_observation', run_id: 'run-2', ordinal: 0, preview_url: '/stale' });
+it('rejects late events from old runs and older event_seq', () => {
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'running' });
+  store.reduceComputerEvent({ type: 'computer_observation', run_id: 'run-1', event_seq: 99, preview_url: '/old' });
+  store.reduceComputerEvent({ type: 'computer_observation', run_id: 'run-2', event_seq: 0, preview_url: '/stale' });
   expect(store.computerRun.run_id).toBe('run-2');
   expect(store.computerRun.preview_url).not.toBe('/old');
   expect(store.computerRun.preview_url).not.toBe('/stale');
@@ -1453,10 +1689,18 @@ it('rejects late events from old runs and older ordinals', () => {
 
 it('keeps only the newest 200 sanitized trace rows', () => {
   for (let ordinal = 1; ordinal <= 205; ordinal++) {
-    store.reduceComputerEvent({ type: 'computer_action_finished', run_id: 'run-1', ordinal, summary: `输入 ${ordinal} 个字符` });
+    store.reduceComputerEvent({ type: 'computer_action_finished', run_id: 'run-1', event_seq: ordinal, action_ordinal: ordinal, summary: `输入 ${ordinal} 个字符` });
   }
   expect(store.computerTrace).toHaveLength(200);
   expect(JSON.stringify(store.computerTrace)).not.toContain('secret text');
+});
+
+
+it('recalibrates from bridge snapshot after queue drops events', async () => {
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'running' });
+  api.get_computer_control_status.mockResolvedValue({ run_id: 'run-2', status: 'stopped', stop_reason: 'hotkey' });
+  await store.refreshComputerRun();  // 窗口重新聚焦/切到操控页签时也调用
+  expect(store.computerRun.status).toBe('stopped');
 });
 
 
@@ -1467,25 +1711,25 @@ it('always shows stop and pause controls on the compact bar', () => {
 });
 ```
 
-另测 run 首次开始自动开操控 tab 一次、用户切走后不抢回、结束保留 trace、下一 run 清空、provider safety 只显示继续/停止。
+另测 run 首次开始自动开操控 tab 一次、用户切走后不抢回、结束保留 trace、下一 run 清空、provider safety 未验证契约前只显示状态与停止（无“继续”按钮）。
 
 - [ ] **Step 2: 运行确认 RED**
 
 Run:
 
 ```powershell
-npm --prefix frontend test -- --run frontend/src/components/ComputerControlBar.test.ts frontend/src/components/ComputerControlPane.test.ts
-venv\Scripts\python.exe -m pytest tests/test_gui_bridge_events.py -q
+npm --prefix frontend test -- --run src/components/ComputerControlBar.test.ts src/components/ComputerControlPane.test.ts
 ```
 
-Expected: 组件、Store 字段和 Bridge 方法不存在。
+Expected: 组件和 Store 字段不存在。vitest 定向路径使用 `src/...`（`npm --prefix frontend` 已在 frontend 目录内）。
 
 - [ ] **Step 3: 实现纯事件 reducer**
 
 事件共同类型：
 
 ```ts
-interface ComputerEventBase { run_id: string; ordinal: number; type: string }
+interface ComputerEventBase { run_id: string; event_seq: number; type: string }
+interface ComputerActionTrace { action_ordinal: number; summary: string; status: string; duration_ms: number; error_code: string }
 interface ComputerRunSnapshot {
   run_id: string; status: ComputerRunStatus; target: 'browser'|'desktop'|'';
   browser: 'edge'|'chrome'|''; model_name: string; protocol: ComputerProtocol;
@@ -1495,7 +1739,7 @@ interface ComputerRunSnapshot {
 }
 ```
 
-reducer 只接受当前 run 且 ordinal 不小于已记录值；新 run 的 `computer_state/starting` 清 trace 并设置一次自动开页签标志。trace 行只含 ordinal、动作脱敏摘要、状态、耗时、错误码；`type_text` 显示长度，不存正文。
+`event_seq` 是 run 内独立单调递增序号，pause/resume/safety/stop 等状态事件同样递增；`action_ordinal` 只表示动作顺序，不承担状态事件排序。reducer 只接受当前 run 且 `event_seq` 严格大于已记录值；新 run 的 `computer_state/starting` 清 trace 并设置一次自动开页签标志。trace 行只含 `action_ordinal`、动作脱敏摘要、状态、耗时、错误码；`type_text` 显示长度，不存正文。由于 `_js_queue` 满时允许丢新事件，每次 Bridge 控制操作返回值、窗口重新聚焦和切换到操控页签时都调用 `get_computer_control_status()` 用完整 snapshot 校准 Store，确保终态不会永久丢失。
 
 - [ ] **Step 4: 实现顶部条和右侧页签**
 
@@ -1503,32 +1747,18 @@ reducer 只接受当前 run 且 ordinal 不小于已记录值；新 run 的 `com
 
 `RightPanel.tabs` 动态追加 `{ id: 'computer', label: '操控' }`；`ComputerControlPane` 显示 `<img :src="preview_url">`、run 摘要、最多 200 行新到旧 trace。不要通过 `evaluate_js` 传 base64。
 
-- [ ] **Step 5: Bridge 只转发小事件和领域控制**
-
-Bridge API：
-
-```python
-get_computer_control_status()
-pause_computer_control(run_id)
-resume_computer_control(run_id)
-stop_computer_control(run_id)
-acknowledge_computer_safety(run_id, check_ids)
-```
-
-每个 mutation 都要求当前 run id，防止旧 UI 事件停止新 run。controller listener 只把小 JSON `put_nowait` 到 `_js_queue`；队列满按现有策略丢新事件，不在 backend/action/delta lock 内调用 `evaluate_js`。
-
-- [ ] **Step 6: GREEN、构建和 GUI 线程边界**
+- [ ] **Step 5: GREEN、构建和 GUI 线程边界**
 
 Run:
 
 ```powershell
-npm --prefix frontend test -- --run frontend/src/components/ComputerControlBar.test.ts frontend/src/components/ComputerControlPane.test.ts frontend/src/components/RightPanel.test.ts frontend/src/stores/appStore.systemSettings.test.ts
+npm --prefix frontend test -- --run src/components/ComputerControlBar.test.ts src/components/ComputerControlPane.test.ts src/components/RightPanel.test.ts src/stores/appStore.systemSettings.test.ts
 npm --prefix frontend run build
-venv\Scripts\python.exe -m pytest tests/test_gui_bridge_events.py tests/test_computer_controller.py -q
-git diff --check -- frontend/src gui_bridge.py tests/test_gui_bridge_events.py
+venv\Scripts\python.exe -m pytest tests/test_gui_tool_events.py tests/test_gui_message_queue.py tests/test_computer_controller.py -q
+git diff --check -- frontend/src gui_bridge.py tests/test_gui_tool_events.py tests/test_gui_message_queue.py
 ```
 
-Expected: event thread 测试断言没有直接 `evaluate_js`；preview src 为 loopback token URL；旧事件不能覆盖新 run。
+Expected: preview src 为 loopback token URL；旧事件不能覆盖新 run；snapshot 校准让丢弃的事件不导致永久错误终态。
 
 Suggested commit after explicit authorization: `feat(gui): show controllable computer runtime`
 
@@ -1539,9 +1769,10 @@ Suggested commit after explicit authorization: `feat(gui): show controllable com
 **Files:**
 - Create: `core/computer/cli.py`
 - Create: `tests/test_computer_cli.py`
-- Modify: `core/command_handler.py`
-- Modify: `core/ui.py`
-- Modify: relevant CLI command tests
+- Modify: `main.py`（现有斜杠命令分派 `handle_slash_command`、帮助表、状态显示；本项目不存在 `core/command_handler.py` 或 `core/ui.py`，不得创建平行模块）
+- Test: `tests/test_cancellation.py`
+- Test: `tests/test_llm_inflight_abort.py`
+- Test: `tests/test_main_ui_events.py`
 
 **Interfaces:**
 - Consumes: controller public API
@@ -1574,7 +1805,7 @@ def test_cli_trace_never_prints_typed_text():
 
 - [ ] **Step 2: 运行确认 RED**
 
-Run: `venv\Scripts\python.exe -m pytest tests/test_computer_cli.py tests/test_command_handler.py -q`
+Run: `venv\Scripts\python.exe -m pytest tests/test_computer_cli.py -q`
 
 Expected: CLI computer handler 不存在。
 
@@ -1586,20 +1817,20 @@ _COMMANDS = {"status", "pause", "resume", "stop"}
 
 使用 `shlex.split` 后必须恰好两个 token；不接受别名或额外参数。status 不开启能力；其他命令要求活动 run。显示格式固定为 `电脑操控: 运行中 · Edge · 12 步`，动作一行，输入只显示长度，URL 只显示 host。
 
-- [ ] **Step 4: 接入主线程安全事件和取消顺序**
+- [ ] **Step 4: 接入 main.py 斜杠分派、主线程安全事件和取消顺序**
 
-hotkey/backend/controller listener 不直接 `print_formatted_text` 或改 layout；通过现有事件队列，最终用 `app_instance.loop.call_soon_threadsafe(callback)` 更新。CLI Ctrl+C 检测到 active run 时先 `controller.stop(run_id, "cli_ctrl_c")`，其内部触发 owner cancel/Provider stream abort，再复用现有 KeyboardInterrupt 收尾。
+`/computer` 接入 `main.py` 现有 `handle_slash_command()` 分派和帮助表，不创建平行 command handler。hotkey/backend/controller listener 不直接 `print_formatted_text` 或改 layout；通过现有事件队列，最终用 `app_instance.loop.call_soon_threadsafe(callback)` 更新。CLI Ctrl+C 检测到 active run 时先 `controller.stop(run_id, "cli_ctrl_c")`，其内部触发 owner cancel/Provider stream abort，再复用现有 KeyboardInterrupt 收尾。
 
 - [ ] **Step 5: GREEN 与 CLI 回归**
 
 Run:
 
 ```powershell
-venv\Scripts\python.exe -m pytest tests/test_computer_cli.py tests/test_command_handler.py tests/test_ui.py tests/test_llm_cancellation.py -q
-git diff --check -- core/computer/cli.py core/command_handler.py core/ui.py tests/test_computer_cli.py
+venv\Scripts\python.exe -m pytest tests/test_computer_cli.py tests/test_cancellation.py tests/test_llm_inflight_abort.py tests/test_main_ui_events.py -q
+git diff --check -- core/computer/cli.py main.py tests/test_computer_cli.py
 ```
 
-Expected: 原始终端无 Markdown 强调；任何 CLI 命令都不能改三个永久配置键。
+Expected: 原始终端无 Markdown 强调；任何 CLI 命令都不能改三个永久配置键；现有取消/在飞中断路径回归通过。
 
 Suggested commit after explicit authorization: `feat(cli): add safe computer run controls`
 
@@ -1681,7 +1912,7 @@ Suggested commit after explicit authorization: `fix(lan): prevent remote compute
 - Modify: `requirements.txt`
 - Modify: `scripts/smoke_computer_control.py`
 - Create: `tests/test_computer_privacy.py`
-- Modify: application lifecycle/package tests
+- Test: `tests/test_gui_lifecycle.py`
 - Modify: `README.md` only if the current user-owned README changes can be preserved with a non-overlapping minimal section
 
 **Interfaces:**
@@ -1716,7 +1947,7 @@ def test_persisted_and_logged_computer_records_exclude_secrets(tmp_path):
 
 - [ ] **Step 2: 运行确认 RED**
 
-Run: `venv\Scripts\python.exe -m pytest tests/test_computer_privacy.py tests/test_app_lifecycle.py -q`
+Run: `venv\Scripts\python.exe -m pytest tests/test_computer_privacy.py tests/test_gui_lifecycle.py -q`
 
 Expected: lifecycle glue 和隐私 fixture 未完成。
 
@@ -1724,11 +1955,11 @@ Expected: lifecycle glue 和隐私 fixture 未完成。
 
 启动只创建轻量 runtime 容器；开关默认 false 时不得导入 Playwright、启动浏览器、启动截图或注册 computer tools。全局热键 preflight 可在用户开启设置时首次注册；活动能力存在时保持注册。
 
-GUI close、CLI 退出和异常 finally 统一调用：active run stop → Provider stream abort 由 controller 执行 → backend inputs release/close → preview stop/delete → hotkey close。不得终止 LiteLLM 共享连接池，不自动恢复 interrupted run。
+GUI close、CLI 退出和异常 finally 统一调用：active run stop → Provider stream abort 由 controller 执行 → backend inputs release/close → preview stop/delete → hotkey close。不得终止 LiteLLM 共享连接池，不自动恢复 interrupted run。退出顺序断言补充到 `tests/test_gui_lifecycle.py`。
 
 - [ ] **Step 4: 更新 PyInstaller 打包但不打包浏览器**
 
-`ycode.spec` 只收集 Playwright Python 包需要的模块/driver 资源；不得运行或包含 Playwright Chromium 下载目录。打包 smoke 需要验证系统 Edge/Chrome channel 能被找到，缺失时设置页显示 unavailable。
+`ycode.spec` 按 `PyInstaller.utils.hooks.collect_all("playwright")` 收集 Playwright 的 Python 子模块、driver 数据和所需二进制，把返回的 `datas/binaries/hiddenimports` 合并到项目现有收集项；不得运行或包含 Playwright Chromium 下载目录。构建产物必须扫描确认不含 `.local-browsers`、Chromium、Firefox 或 WebKit 缓存。打包 smoke 需要验证系统 Edge/Chrome channel 能被找到，缺失时设置页显示 unavailable。
 
 Run:
 
@@ -1758,7 +1989,7 @@ observe 模式只截图，不输入。真实输入模式固定执行可见测试
 Run:
 
 ```powershell
-venv\Scripts\python.exe -m pytest tests/test_computer_privacy.py tests/test_app_lifecycle.py tests/test_computer_preview_server.py tests/test_computer_hotkey.py -q
+venv\Scripts\python.exe -m pytest tests/test_computer_privacy.py tests/test_gui_lifecycle.py tests/test_computer_preview_server.py tests/test_computer_hotkey.py -q
 venv\Scripts\python.exe -m py_compile main.py gui_main.py scripts/smoke_computer_control.py
 venv\Scripts\python.exe -m compileall -q core/computer
 git diff --check -- gui_main.py main.py ycode.spec requirements.txt scripts/smoke_computer_control.py tests/test_computer_privacy.py
@@ -1786,7 +2017,7 @@ Run:
 
 ```powershell
 venv\Scripts\python.exe -m pytest tests/test_computer_dependency.py tests/test_computer_models.py tests/test_computer_settings.py tests/test_computer_capability.py tests/test_computer_hotkey.py tests/test_computer_preview_server.py tests/test_computer_browser_backend.py tests/test_computer_windows_backend.py tests/test_computer_controller.py tests/test_computer_tool_adapter.py tests/test_computer_provider_generic.py tests/test_computer_provider_openai.py tests/test_computer_llm_generic.py tests/test_computer_cli.py tests/test_computer_privacy.py -q
-npm --prefix frontend test -- --run frontend/src/components/ComputerControlBar.test.ts frontend/src/components/ComputerControlPane.test.ts frontend/src/components/SystemSettings.test.ts frontend/src/components/SettingsPage.test.ts frontend/src/stores/appStore.systemSettings.test.ts frontend/src/stores/appStore.modelSettings.test.ts
+npm --prefix frontend test -- --run src/components/ComputerControlBar.test.ts src/components/ComputerControlPane.test.ts src/components/SystemSettings.test.ts src/components/SettingsPage.test.ts src/stores/appStore.systemSettings.test.ts src/stores/appStore.modelSettings.test.ts
 ```
 
 Expected: 全部退出码 0，无 skipped 的核心安全测试；平台特定真实 I/O 由 fake 单测 + Task 16 人工烟测覆盖。
@@ -1796,7 +2027,7 @@ Expected: 全部退出码 0，无 skipped 的核心安全测试；平台特定�
 Run:
 
 ```powershell
-venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py tests/test_deepseek_prompt_ledger.py tests/test_llm_responses.py tests/test_harness_runtime.py tests/test_tool_pipeline.py tests/test_tool_adapters.py tests/test_tool_registry.py tests/test_cache_keepalive.py tests/test_token_accounting.py tests/test_llm_cancellation.py tests/test_llm_events_fixes.py -q
+venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py tests/test_deepseek_prompt_ledger.py tests/test_llm_responses.py tests/test_harness_runtime.py tests/test_tool_pipeline.py tests/test_tool_registry.py tests/test_cache_keepalive.py tests/test_token_accounting.py tests/test_cancellation.py tests/test_llm_inflight_abort.py tests/test_llm_events_fixes.py tests/test_memory_maintenance.py -q
 ```
 
 Expected: 所有现有 expected/hash 原样通过；若失败，定位实现导致的字节漂移，禁止更新 golden。
@@ -1811,10 +2042,12 @@ venv\Scripts\python.exe -m compileall -q core/computer
 venv\Scripts\python.exe -m pytest -q
 npm --prefix frontend test -- --run
 npm --prefix frontend run build
+git add -N .
 git diff --check
+git status --porcelain
 ```
 
-Expected: 全部退出码 0；记录每条命令实际测试数、持续时间、exit code 和失败重跑原因。
+Expected: 全部退出码 0；记录每条命令实际测试数、持续时间、exit code 和失败重跑原因。最终 `git diff --check` 必须在 `git add -N .` 之后执行，覆盖全部新建文件。
 
 - [ ] **Step 4: 做规格覆盖和敏感信息审计**
 
@@ -1838,7 +2071,7 @@ git status --short --branch
 报告必须包含：
 
 - 变更摘要和完整文件列表；
-- Tasks 1–16 每个 Task 的真实 RED 命令/失败原因、GREEN 命令/测试数量/时长/exit code；
+- Tasks 1–16（含 11a/11b、13a/13b）每个 Task 的真实 RED 命令/失败原因、GREEN 命令/测试数量/时长/exit code；
 - generic 与 native 的真实请求形状证据；
 - 默认关闭 golden/hash 未改且通过的证据；
 - Edge/Chrome/desktop、pause/resume/stop/hotkey、LAN、Provider safety、隐私和退出清理证据；
@@ -1858,17 +2091,17 @@ Suggested final commit after separate explicit authorization: `feat: add control
 
 - 设计 7、10、21（领域模型、统一动作、错误码）：Tasks 2、8、9。
 - 设计 8（设置、默认关闭、独立开关）：Tasks 3、12、15。
-- 设计 9（显式模型能力）：Tasks 4、10、11、12。
-- 设计 11（OpenAI native、continuation、safety、投影）：Task 11，Task 13 提供用户确认 UI。
+- 设计 9（显式模型能力）：Tasks 4、10、11a、11b、12。
+- 设计 11（OpenAI native、continuation、safety、投影）：Tasks 11a、11b；Task 13a 预留用户确认 API。
 - 设计 12（Edge/Chrome 专用 profile）：Tasks 1、3、6、16。
 - 设计 13（Windows 截图/DPI/SendInput/secure desktop）：Tasks 7、16。
-- 设计 14–15（单租约、状态机、暂停/停止/取消/退出）：Tasks 8、13、14、16。
-- 设计 16（顶部条、右栏、预览、Store/Bridge）：Tasks 5、12、13。
+- 设计 14–15（单租约、状态机、暂停/停止/取消/退出）：Tasks 8、13a、14、16。
+- 设计 16（顶部条、右栏、预览、Store/Bridge）：Tasks 5、12、13a、13b。
 - 设计 17（CLI）：Task 14。
 - 设计 18（LAN）：Tasks 4、15。
-- 设计 19（Harness/tool follow-up/消息边界）：Tasks 9、10、11。
-- 设计 20（默认字节、Ledger、Kimi/GLM 缓存）：Tasks 1、10、11、17。
-- 设计 22（隐私与数据处理）：Tasks 2、5、6、7、9、11、13、14、16、17。
+- 设计 19（Harness/tool follow-up/消息边界）：Tasks 9、10、11a、11b。
+- 设计 20（默认字节、Ledger、Kimi/GLM 缓存）：Tasks 1、10、11b、17。
+- 设计 22（隐私与数据处理）：Tasks 2、5、6、7、9、11a、11b、13a、13b、14、16、17。
 - 设计 23（依赖、打包、生命周期）：Tasks 1、16。
 - 设计 24、27–29（测试、验收、风险、K3 约束）：贯穿每个 Task，并由 Task 17 和 companion K3 prompt 收口。
 
@@ -1876,7 +2109,7 @@ Suggested final commit after separate explicit authorization: `feat: add control
 
 只有同时满足以下条件才可报告“当前可以提交”：
 
-1. Tasks 1–16 全部有真实 RED → GREEN 证据；
+1. Tasks 1–16（含 11a/11b、13a/13b）全部有真实 RED → GREEN 证据；
 2. Edge 和 Chrome 至少完成可见系统 channel observe 探针，未安装选项明确显示 unavailable；
 3. desktop 自动测试全 fake，真实输入烟测只在用户明确确认后运行且成功释放输入；
 4. generic 模型能在每个动作后看到新截图；native OpenAI 能使用 response id continuation，且二者没有互相 fallback；

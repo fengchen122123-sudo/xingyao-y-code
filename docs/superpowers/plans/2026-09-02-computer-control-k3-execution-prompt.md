@@ -1,6 +1,6 @@
 # Y-CODE Browser and Windows Computer Control — K3 Execution Prompt
 
-你现在是本项目的实施工程师。请在 `E:\fch\Y-code_tui` 中完整实现“浏览器与 Windows 电脑操控”，不要只给建议、伪代码或局部示例。
+你现在是本项目的实施工程师。请在当前 Y-CODE 仓库根目录（运行 `git rev-parse --show-toplevel` 确认，下文所有相对路径均以该目录为基准）中完整实现“浏览器与 Windows 电脑操控”，不要只给建议、伪代码或局部示例。
 
 必须先完整阅读以下文件，读完再修改代码：
 
@@ -30,7 +30,7 @@
 1. 优先使用 `superpowers:subagent-driven-development` 按 Task 逐项执行并在每项后做两阶段审查；如果当前环境不支持子代理，使用 `superpowers:executing-plans` 顺序执行。
 2. 实现任何 feature/fix 前使用 `superpowers:test-driven-development`；出现失败或代码与计划不一致时使用 `superpowers:systematic-debugging`；最终宣称完成前使用 `superpowers:verification-before-completion`。
 3. 严格按计划 Task 1 → Task 17 顺序推进。不要并行修改共享的 `core/llm.py`、Harness、GUI Store 或 Bridge。
-4. 每个 Task 都必须执行：先写失败测试 → 运行并确认是目标缺失导致 RED → 最小实现 → 定向 GREEN → 相关回归 → `git diff --check` → 回填真实 Execution Record。
+4. 每个 Task 都必须执行：先写失败测试 → 运行并确认是目标缺失导致 RED → 最小实现 → 定向 GREEN → 相关回归 → `git diff --check` → 回填真实 Execution Record。Task 含新建文件时，`git diff --check` 前必须先 `git add -N <新建文件>`，否则未跟踪文件不在检查范围内。
 5. 一个 Task 的定向和回归测试没有全部通过，不得进入下一个 Task。测试失败时先定位根因，不允许添加 fallback、吞异常、放宽断言或改 expected 让它变绿。
 6. 任务可以长时间执行。每完成一个 Task 给用户一条简短进度更新；不要因为任务长而省略测试，也不要未经证据宣布完成。
 
@@ -72,7 +72,8 @@
 - native 必须同时满足显式 native 元数据、项目 Responses 协议和官方 `api.openai.com` route。
 - 禁止按模型名、厂商名或字符串包含 `glm/kimi/deepseek/openai` 猜能力。
 - 当前官方 GA 形状是 `tools: [{"type":"computer"}]`、`computer_call.actions[]`、`computer_call_output` 和 `previous_response_id`；`computer_use_preview` 是旧集成，本项目首版不得采用或 fallback。当前官方明确支持 Computer use 的预置至少包括 `gpt-5.6-sol`、`gpt-5.6-terra`、`gpt-5.6-luna`、`gpt-5.4`、`gpt-5.4-mini`。实施前仍需逐个打开当日 OpenAI 官方模型页和 Computer use guide 复核准确型号、tool 字段、call/output 和可能返回的 safety 结构；只依据官方 primary source，不按家族推断。
-- GA native 可以在一个 `computer_call.actions[]` 中返回多个动作。它是 generic 单动作规则的显式例外：必须按原序逐个串行执行，每个动作前检查 cancel/pause/owner/generation 并发 trace，失败或停止后不执行余项；整批成功后捕获一次截图并回传。禁止并行或把整批做成不可中断 backend 调用。
+- continuation 不重发完整消息历史，但必须重新发送同一 model、同序 tools、必要 instructions/options、`previous_response_id` 和一个新的 `computer_call_output`；上一响应的 instructions 不会经 `previous_response_id` 自动继承，漏发即协议错误。GA 指南未定义 `acknowledged_safety_checks` 确认契约，未在实施当天经官方 schema 验证并为该形状补 byte-golden 前，不得构造任何确认 payload。
+- GA native 可以在一个 `computer_call.actions[]` 中返回多个动作。它是 generic 单动作规则的显式例外：必须按原序逐个串行执行，每个动作前检查 cancel/pause/owner/generation、每个动作都捕获本地 after observation 并做无进展判断、发 trace，失败或停止后不执行余项；整批成功后只把最后一次 observation 的截图回传为一个 `computer_call_output`——“只回传最后一图”不等于“中间动作不观察”。禁止并行或把整批做成不可中断 backend 调用。两个 target 同时可用时原生请求固定 `parallel_tool_calls=false`，`computer_select_target` 必须在独立 Step 完成并建立租约；selector 与 computer call 出现在同一 response 是协议错误。
 - native 解析失败立即以 `computer_provider_protocol_error` 失败，不能改走 generic。
 
 ### Controller 和安全
@@ -143,12 +144,13 @@ Tasks 1–16 全部完成后，严格执行 Task 17 的所有命令，至少包�
 
 ```powershell
 venv\Scripts\python.exe -m pytest tests/test_computer_dependency.py tests/test_computer_models.py tests/test_computer_settings.py tests/test_computer_capability.py tests/test_computer_hotkey.py tests/test_computer_preview_server.py tests/test_computer_browser_backend.py tests/test_computer_windows_backend.py tests/test_computer_controller.py tests/test_computer_tool_adapter.py tests/test_computer_provider_generic.py tests/test_computer_provider_openai.py tests/test_computer_llm_generic.py tests/test_computer_cli.py tests/test_computer_privacy.py -q
-venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py tests/test_deepseek_prompt_ledger.py tests/test_llm_responses.py tests/test_harness_runtime.py tests/test_tool_pipeline.py tests/test_tool_adapters.py tests/test_tool_registry.py tests/test_cache_keepalive.py tests/test_token_accounting.py tests/test_llm_cancellation.py tests/test_llm_events_fixes.py -q
+venv\Scripts\python.exe -m pytest tests/test_prompt_byte_stability.py tests/test_provider_payload_golden.py tests/test_deepseek_prompt_ledger.py tests/test_llm_responses.py tests/test_harness_runtime.py tests/test_tool_pipeline.py tests/test_tool_registry.py tests/test_cache_keepalive.py tests/test_token_accounting.py tests/test_cancellation.py tests/test_llm_inflight_abort.py tests/test_llm_events_fixes.py tests/test_memory_maintenance.py -q
 venv\Scripts\python.exe -m py_compile main.py core/llm.py core/memory.py core/memory_compressor.py core/themes.py
 venv\Scripts\python.exe -m compileall -q core/computer
 venv\Scripts\python.exe -m pytest -q
 npm --prefix frontend test -- --run
 npm --prefix frontend run build
+git add -N .
 git diff --check
 git status --short --branch
 ```
@@ -173,7 +175,7 @@ git status --short --branch
 
 只有同时满足以下条件，才能说“实现完成，当前可以提交”：
 
-1. 实施计划 Tasks 1–16 每项都有真实 RED → GREEN → regression 证据；
+1. 实施计划 Tasks 1–16（含 11a/11b、13a/13b）每项都有真实 RED → GREEN → regression 证据；
 2. 完整 pytest、完整 Vitest、frontend production build、`git diff --check` 全部 exit 0；
 3. 现有 Provider/prompt golden/hash 未改并全部通过；
 4. generic 和 native 协议分别有严格 request/event/continuation 测试，且无互相 fallback；
