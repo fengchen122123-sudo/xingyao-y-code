@@ -183,3 +183,27 @@ def test_update_provider_and_model_persists_supports_vision(monkeypatch, tmp_pat
     cfg = load_config()
     model = next(m for p in cfg["providers"] for m in p["models"] if m["id"] == mid)
     assert model["supports_vision"] is True
+
+
+def test_preset_add_via_selector_path_keeps_computer_metadata(monkeypatch, tmp_path):
+    """selector 的预置厂商添加入口必须透传目录中的电脑操控能力元数据。"""
+    import config as config_mod
+    from core.model_manager import add_preset_provider_with_models, load_config
+
+    config_file = tmp_path / "cap.json"
+    monkeypatch.setattr(config_mod, "_CONFIG_FILE", str(config_file))
+    monkeypatch.setattr("core.model_manager._CONFIG_FILE", str(config_file))
+
+    preset = next(p for p in model_selector.PRESET_PROVIDERS if p["id"] == "deepseek")
+    pid = add_preset_provider_with_models(
+        preset["name"], preset["base_url"], "key", preset["protocol"],
+        preset["models"], preset_id=preset["id"],
+    )
+
+    cfg = load_config()
+    model = next(
+        m for p in cfg["providers"] if p["id"] == pid
+        for m in p["models"] if m["name"] == "deepseek-v4-flash-vision-exp"
+    )
+    assert model["computer_protocol"] == "generic"
+    assert model["supports_function_calling"] is True

@@ -1933,3 +1933,80 @@ def test_plan_resume_takeover_rejects_ordinary_item(monkeypatch):
 
     assert "不是超时接管项" in result["content"]
     assert plan.snapshot()[0]["status"] == "failed"
+
+
+# ── Task 9：follow-up 私有载荷的 record 承载与剥离 ──────────────────
+
+
+def test_tool_execution_record_default_followup_is_empty():
+    from core.harness.tool_pipeline import ToolExecutionRecord
+
+    record = ToolExecutionRecord(0, _batch_tool_message("call-1"), 12)
+
+    assert record.followup_messages == ()
+
+
+def test_tool_execution_context_computer_lease_defaults_to_none():
+    assert _batch_context().computer_lease is None
+
+
+def test_batch_executor_moves_private_followup_stash_into_record():
+    """execute_decoded 暂存在 message 内部键上的 follow-up 必须转入 record。"""
+    import core.harness.tool_pipeline as tool_pipeline
+
+    followup = {
+        "role": "user",
+        "content": [{"type": "text", "text": "观察"}],
+        "_computer_v1": {"run_id": "run-a", "ordinal": 1, "target": "browser"},
+    }
+
+    def execute(decoded, _context):
+        message = _batch_tool_message(decoded.call_id)
+        message["_ycode_followup_messages"] = (followup,)
+        return message
+
+    executor = tool_pipeline.ToolBatchExecutor(
+        tool_pipeline.ToolPipeline(),
+        execute_decoded=execute,
+        event_payload=lambda decoded: {"id": decoded.call_id},
+        finished_event_payload=lambda decoded, message, duration_ms: {
+            "id": decoded.call_id,
+            "duration_ms": duration_ms,
+        },
+    )
+
+    records = executor.execute([_batch_call("c1", "read_file")], _batch_context(), None)
+
+    assert records[0].followup_messages == (followup,)
+    assert records[0].message == {
+        "role": "tool",
+        "tool_call_id": "c1",
+        "name": "read_file",
+        "content": "ok",
+    }
+
+
+def test_execute_one_strips_private_followup_stash(monkeypatch):
+    """旧单调用入口没有 follow-up 通道：私有暂存必须剥离，绝不泄漏进普通 message。"""
+    import core.harness.tool_pipeline as tool_pipeline
+
+    pipeline = tool_pipeline.ToolPipeline()
+
+    def stashed(_decoded, _context):
+        message = _batch_tool_message("call-x")
+        message["_ycode_followup_messages"] = ({"role": "user", "content": []},)
+        return message
+
+    monkeypatch.setattr(pipeline, "execute_decoded", stashed)
+
+    result = pipeline.execute_one(
+        {"id": "call-x", "function": {"name": "read_file", "arguments": "{}"}},
+        _batch_context(),
+    )
+
+    assert result == {
+        "role": "tool",
+        "tool_call_id": "call-x",
+        "name": "read_file",
+        "content": "ok",
+    }

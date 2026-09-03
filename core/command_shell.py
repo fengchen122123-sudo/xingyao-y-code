@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import config
+from core.computer.settings import load_computer_settings
 from core.harness.turn_limits import (
     MAX_TURN_STEP_LIMIT,
     MIN_TURN_STEP_LIMIT,
@@ -156,6 +157,14 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         )
     except (TypeError, ValueError):
         remote_token_ttl = config.REMOTE_TOKEN_TTL_DEFAULT
+    # 电脑操控静态设置（core.computer.settings，无运行时依赖）；
+    # hotkey 运行态键（Task 5）与 controller run 键（Task 8）经函数内惰性导入接入。
+    computer = load_computer_settings(platform=platform)
+    from core.computer.hotkey import get_emergency_hotkey_snapshot
+    from core.computer.controller import get_computer_control_service
+
+    hotkey = get_emergency_hotkey_snapshot()
+    computer_run = get_computer_control_service().snapshot()
     return {
         "command_shell": selected,
         "command_shell_options": options,
@@ -165,6 +174,15 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         "agent_turn_step_limit": load_turn_step_limit(),
         "agent_turn_step_limit_min": MIN_TURN_STEP_LIMIT,
         "agent_turn_step_limit_max": MAX_TURN_STEP_LIMIT,
+        "browser_control_enabled": computer.browser_control_enabled,
+        "computer_control_enabled": computer.computer_control_enabled,
+        "computer_browser": computer.computer_browser,
+        "computer_browser_options": [option.to_dict() for option in computer.browser_options],
+        "computer_profile_path": computer.profile_display_path,
+        "computer_platform_supported": computer.platform_supported,
+        "computer_hotkey_available": hotkey.available,
+        "computer_hotkey": "Ctrl+Alt+Esc",
+        "computer_run": computer_run.to_public_dict(),
     }
 
 
