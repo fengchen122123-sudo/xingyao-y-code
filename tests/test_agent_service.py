@@ -34,6 +34,9 @@ def stub_llm(monkeypatch):
         "max_window": 128000,
     }
     stub.token_usage_lock = threading.Lock()
+    # Task 10：build_runtime_context 从 core.llm 导入 Turn 能力解析；
+    # 桩返回 None（capability 关闭）保持动态上下文字节与历史版本一致。
+    stub.resolve_turn_computer_capability = lambda *args, **kwargs: None
     monkeypatch.setitem(sys.modules, "core.llm", stub)
     return stub
 
