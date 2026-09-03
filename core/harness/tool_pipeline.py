@@ -88,6 +88,11 @@ _REPEAT_GUARD_EXEMPT_TOOLS = frozenset({
 # kill/stop/terminate/cancel 与未知 action 按保守策略不豁免。
 _REPEAT_GUARD_EXEMPT_MANAGE_TASK_ACTIONS = frozenset({"status", "list", "wait"})
 
+# follow-up 私有载荷在 message dict 上的内部暂存键（设计 19.3）：仅存在于
+# execute_decoded 返回值与 ToolBatchExecutor 构造 record 之间；构造 record 时
+# 剥离到 ToolExecutionRecord.followup_messages，绝不进入 Provider/tool message。
+_FOLLOWUP_MESSAGES_KEY = "_ycode_followup_messages"
+
 
 def repeat_guard_exempt(name: str, arguments: dict) -> bool:
     if name in _REPEAT_GUARD_EXEMPT_TOOLS:
@@ -110,6 +115,10 @@ class ToolExecutionContext:
     permission_checker: Callable
     registry: ToolRegistry
     mcp_manager: object
+    # Turn 冻结的电脑操控执行上下文（capability token + owner lease + run id，
+    # 设计 19.2）。默认 None：普通回合行为与序列化完全不变；固定 computer
+    # 适配器只在携带 lease 时执行动作，否则返回稳定关闭错误。
+    computer_lease: object | None = None
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,9 @@ class ToolExecutionRecord:
     call_ordinal: int
     message: dict
     duration_ms: int
+    # follow-up 私有消息载荷（设计 19.3）：ToolBatchExecutor 构造 record 时从
+    # 普通 message 剥离暂存；默认空，现有工具的 record 完全不变。
+    followup_messages: tuple[dict, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -424,10 +436,17 @@ class ToolBatchExecutor:
 
         records = []
         for prepared_call, (message, duration_ms) in zip(batch.calls, results):
+            # 构造 record 时把 follow-up 私有载荷从普通 message 完全剥离：
+            # record.message 只含 role/tool_call_id/name/content，
+            # follow-up user 观察消息转由 record.followup_messages 承载。
+            followup_messages = tuple(
+                message.pop(_FOLLOWUP_MESSAGES_KEY, ()) or ()
+            )
             record = ToolExecutionRecord(
                 prepared_call.call_ordinal,
                 message,
                 duration_ms,
+                followup_messages=followup_messages,
             )
             records.append(record)
             self._emit(
@@ -818,6 +837,12 @@ class ToolPipeline:
         if constrained is not None:
             return _tool_message(decoded, constrained)
 
+        # 固定 computer 适配（设计 19.2）：保留名 computer_action 在 resolve_tool
+        # 之前识别，不经过注册表与权限链（设置开关即用户授权边界）。
+        reserved = self._execute_reserved_computer(decoded, context)
+        if reserved is not None:
+            return reserved
+
         # 契约解析（严格注册表 + MCP 回退）：invariant 异常（如损坏的注册表）
         # 必须显式传播，不得吞成工具错误；仅"未找到"转为友好提示。
         try:
@@ -864,9 +889,42 @@ class ToolPipeline:
             )
         return _tool_message(decoded, self.truncate_result(decoded.name, content))
 
+    def _execute_reserved_computer(self, decoded: DecodedToolCall, context) -> dict | None:
+        """computer_action 固定适配（设计 19.2）：仅保留名进入，非保留名返回 None。
+
+        requires_permission=False（设置开关即用户授权边界）、cancellable=True、
+        parallel_safe=False、mutates_files=False 的语义由固定适配器保证；
+        领域错误返回稳定 9 键 JSON，follow-up 私有载荷暂存在 message 内部键上，
+        由 ToolBatchExecutor 构造 record 时剥离。
+        """
+        if decoded.name != "computer_action":
+            return None
+        from core.computer.provider_generic import execute_reserved_computer_tool
+
+        try:
+            result = execute_reserved_computer_tool(decoded, context)
+        except Exception as tool_err:
+            return _tool_message(
+                decoded,
+                f"{TOOL_ERROR_PREFIX} 调用工具 {decoded.name} 时发生系统内部错误：{tool_err}",
+            )
+        if result is None:
+            return None
+        message = _tool_message(
+            decoded,
+            self.truncate_result(decoded.name, result.to_message_content()),
+        )
+        if result.followup_messages:
+            message[_FOLLOWUP_MESSAGES_KEY] = tuple(result.followup_messages)
+        return message
+
     def execute_one(self, tool_call, context) -> dict:
         try:
             decoded = decode_tool_call(tool_call)
         except ValueError as parse_error:
             return self._decode_error_message(tool_call, parse_error)
-        return self.execute_decoded(decoded, context)
+        message = self.execute_decoded(decoded, context)
+        # 旧单调用入口没有 follow-up 持久化通道：剥离私有暂存，
+        # 绝不让 _ycode_followup_messages 泄漏进普通 tool message。
+        message.pop(_FOLLOWUP_MESSAGES_KEY, None)
+        return message

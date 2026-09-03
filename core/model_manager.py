@@ -16,6 +16,37 @@ from core.model_catalog import (
 from core.reasoning_capabilities import get_reasoning_capability
 _CONFIG_FILE = config._CONFIG_FILE
 
+# 电脑操控能力元数据（设计 9.1）：只接受严格 bool 与固定协议集合；
+# generic 组合缺视觉或工具能力时保存即拒绝，不允许落盘半有效配置。
+COMPUTER_PROTOCOLS = ("none", "generic", "native_openai")
+
+
+def _normalize_capability_bool(name: str, value):
+    """可选布尔字段：None 表示调用方未指定；其余必须 type(value) is bool。"""
+    if value is None:
+        return None
+    if type(value) is not bool:
+        raise ValueError(f"{name} 必须是布尔值")
+    return value
+
+
+def _normalize_computer_protocol(value):
+    if value is None:
+        return None
+    if type(value) is not str or value not in COMPUTER_PROTOCOLS:
+        raise ValueError(
+            f"computer_protocol 只支持 {'/'.join(COMPUTER_PROTOCOLS)}"
+        )
+    return value
+
+
+def _validate_computer_combination(supports_vision, supports_function_calling, computer_protocol):
+    """generic 必须同时具备视觉与工具调用能力，否则保存即拒绝。"""
+    if computer_protocol == "generic" and not (supports_vision and supports_function_calling):
+        raise ValueError(
+            "computer_protocol=generic 要求同时声明 supports_vision 与 supports_function_calling"
+        )
+
 
 def load_config() -> dict:
     """加载完整配置，如果是旧格式则自动迁移。主文件损坏时优先从 .bak 备份恢复。"""
@@ -154,6 +185,8 @@ def get_active_model(session_name: str | None = None) -> dict | None:
         "base_url":         provider["base_url"],
         "context_window":  model.get("context_window", 128000),
         "supports_vision": model.get("supports_vision"),
+        "supports_function_calling": model.get("supports_function_calling"),
+        "computer_protocol": model.get("computer_protocol"),
         "name":            model["name"],
         "protocol":        provider.get("protocol", "openai"),
         "provider_name":   provider["name"],
@@ -347,6 +380,8 @@ def get_secondary_model() -> dict | None:
                     "base_url":         provider["base_url"],
                     "context_window":  model.get("context_window", 128000),
                     "supports_vision": model.get("supports_vision"),
+                    "supports_function_calling": model.get("supports_function_calling"),
+                    "computer_protocol": model.get("computer_protocol"),
                     "name":            model["name"],
                     "protocol":        provider.get("protocol", "openai"),
                     "provider_name":   provider["name"],
@@ -408,7 +443,14 @@ def add_provider(name: str, base_url: str, api_key: str, protocol: str) -> str:
     return pid
 
 
-def add_model_to_provider(provider_id: str, name: str, context_window: int, supports_vision: bool | None = None) -> str:
+def add_model_to_provider(
+    provider_id: str,
+    name: str,
+    context_window: int,
+    supports_vision: bool | None = None,
+    supports_function_calling: bool | None = None,
+    computer_protocol: str | None = None,
+) -> str:
     """
     给指定厂商追加一个模型，litellm_model 格式为 {protocol}/{name}。
     返回新模型的 model_id。若当前无激活模型，自动激活该模型。
@@ -419,6 +461,15 @@ def add_model_to_provider(provider_id: str, name: str, context_window: int, supp
         raise ValueError("模型名称不能为空")
     if context_window <= 0:
         raise ValueError("上下文窗口必须大于 0")
+    supports_function_calling = _normalize_capability_bool(
+        "supports_function_calling", supports_function_calling
+    )
+    computer_protocol = _normalize_computer_protocol(computer_protocol)
+    _validate_computer_combination(
+        supports_vision if type(supports_vision) is bool else False,
+        supports_function_calling,
+        computer_protocol,
+    )
     mid = str(uuid.uuid4())[:8]
     found = False
 
@@ -436,6 +487,10 @@ def add_model_to_provider(provider_id: str, name: str, context_window: int, supp
                 }
                 if supports_vision is not None:
                     model_entry["supports_vision"] = bool(supports_vision)
+                if supports_function_calling is not None:
+                    model_entry["supports_function_calling"] = supports_function_calling
+                if computer_protocol is not None:
+                    model_entry["computer_protocol"] = computer_protocol
                 provider["models"].append(model_entry)
                 break
         # 若当前尚未选择激活任何模型，自动激活新添加的模型
@@ -542,14 +597,20 @@ def update_model(
     name: str,
     context_window: int,
     supports_vision: bool,
+    supports_function_calling: bool | None = None,
+    computer_protocol: str | None = None,
 ):
-    """更新单个模型的公开配置字段。"""
+    """更新单个模型的公开配置字段；新能力字段传 None 表示保留既有值。"""
     name = str(name or "").strip()
     context_window = int(context_window)
     if not name:
         raise ValueError("模型名称不能为空")
     if context_window <= 0:
         raise ValueError("上下文窗口必须大于 0")
+    supports_function_calling = _normalize_capability_bool(
+        "supports_function_calling", supports_function_calling
+    )
+    computer_protocol = _normalize_computer_protocol(computer_protocol)
 
     def _mutate(data):
         provider = next(
@@ -564,16 +625,35 @@ def update_model(
         )
         if model is None:
             raise ValueError(f"模型不存在: {model_id}")
+        # 组合校验针对生效后的最终值，拒绝降级出半有效 generic 配置
+        effective_fc = (
+            supports_function_calling
+            if supports_function_calling is not None
+            else model.get("supports_function_calling")
+        )
+        effective_protocol = (
+            computer_protocol if computer_protocol is not None else model.get("computer_protocol")
+        )
+        _validate_computer_combination(bool(supports_vision), effective_fc, effective_protocol)
         model["name"] = name
         model["litellm_model"] = litellm_model_name(provider.get("protocol", "openai"), name)
         model["context_window"] = context_window
         model["supports_vision"] = bool(supports_vision)
+        if supports_function_calling is not None:
+            model["supports_function_calling"] = supports_function_calling
+        if computer_protocol is not None:
+            model["computer_protocol"] = computer_protocol
 
     config.update_config(_mutate)
 
 
-def update_provider_and_model(provider_id: str, model_id: str, base_url: str, api_key: str, model_name: str, context_window: int, supports_vision: bool | None = None):
+def update_provider_and_model(provider_id: str, model_id: str, base_url: str, api_key: str, model_name: str, context_window: int, supports_vision: bool | None = None, supports_function_calling: bool | None = None, computer_protocol: str | None = None):
     """更新厂商的 Base URL、API Key 以及旗下特定模型的名字、上下文窗口和视觉支持标志。"""
+    supports_function_calling = _normalize_capability_bool(
+        "supports_function_calling", supports_function_calling
+    )
+    computer_protocol = _normalize_computer_protocol(computer_protocol)
+
     def _mutate(data):
         for provider in data.get("providers", []):
             if provider["id"] == provider_id:
@@ -587,6 +667,23 @@ def update_provider_and_model(provider_id: str, model_id: str, base_url: str, ap
                         model["context_window"] = context_window
                         if supports_vision is not None:
                             model["supports_vision"] = bool(supports_vision)
+                        effective_fc = (
+                            supports_function_calling
+                            if supports_function_calling is not None
+                            else model.get("supports_function_calling")
+                        )
+                        effective_protocol = (
+                            computer_protocol
+                            if computer_protocol is not None
+                            else model.get("computer_protocol")
+                        )
+                        _validate_computer_combination(
+                            model.get("supports_vision"), effective_fc, effective_protocol
+                        )
+                        if supports_function_calling is not None:
+                            model["supports_function_calling"] = supports_function_calling
+                        if computer_protocol is not None:
+                            model["computer_protocol"] = computer_protocol
                         break
                 break
     config.update_config(_mutate)
@@ -617,6 +714,19 @@ def add_preset_provider_with_models(
             }
             if "supports_vision" in m:
                 model_entry["supports_vision"] = bool(m["supports_vision"])
+            if "supports_function_calling" in m:
+                model_entry["supports_function_calling"] = _normalize_capability_bool(
+                    "supports_function_calling", m["supports_function_calling"]
+                )
+            if "computer_protocol" in m:
+                model_entry["computer_protocol"] = _normalize_computer_protocol(
+                    m["computer_protocol"]
+                )
+            _validate_computer_combination(
+                model_entry.get("supports_vision"),
+                model_entry.get("supports_function_calling"),
+                model_entry.get("computer_protocol"),
+            )
             provider_models.append(model_entry)
 
         provider_entry = {
@@ -686,6 +796,19 @@ def sync_preset_provider_models(preset_id: str) -> int:
             }
             if "supports_vision" in m:
                 entry["supports_vision"] = bool(m["supports_vision"])
+            if "supports_function_calling" in m:
+                entry["supports_function_calling"] = _normalize_capability_bool(
+                    "supports_function_calling", m["supports_function_calling"]
+                )
+            if "computer_protocol" in m:
+                entry["computer_protocol"] = _normalize_computer_protocol(
+                    m["computer_protocol"]
+                )
+            _validate_computer_combination(
+                entry.get("supports_vision"),
+                entry.get("supports_function_calling"),
+                entry.get("computer_protocol"),
+            )
             provider.setdefault("models", []).append(entry)
             added_count += 1
 

@@ -2,6 +2,8 @@ import json
 import threading
 from pathlib import Path
 
+import pytest
+
 import config
 import core.model_manager as model_manager
 
@@ -502,3 +504,136 @@ def test_update_model_rejects_invalid_public_fields(tmp_path, monkeypatch):
             pass
         else:
             raise AssertionError("无效模型公开字段必须立即失败")
+
+
+def test_add_model_persists_explicit_computer_capability(tmp_path, monkeypatch):
+    """add_model_to_provider 显式保存 supports_function_calling 与 computer_protocol。"""
+    _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+
+    mid = model_manager.add_model_to_provider(
+        "p1", "cap-model", 128000,
+        supports_vision=True, supports_function_calling=True, computer_protocol="generic",
+    )
+
+    model = next(
+        m for m in model_manager.load_config()["providers"][0]["models"] if m["id"] == mid
+    )
+    assert model["supports_function_calling"] is True
+    assert model["computer_protocol"] == "generic"
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"supports_function_calling": 1},
+    {"supports_function_calling": "yes"},
+    {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "auto"},
+    {"supports_vision": True, "supports_function_calling": True, "computer_protocol": 1},
+    {"supports_vision": True, "supports_function_calling": False, "computer_protocol": "generic"},
+    {"supports_vision": True, "computer_protocol": "generic"},
+    {"supports_function_calling": True, "computer_protocol": "generic"},
+], ids=[
+    "fc-int", "fc-str", "proto-unknown", "proto-non-str",
+    "generic-no-fc", "generic-missing-fc", "generic-missing-vision",
+])
+def test_add_model_rejects_invalid_computer_capability(tmp_path, monkeypatch, kwargs):
+    """非严格 bool、集合外协议值、缺能力的 generic 组合保存即拒绝且不落盘。"""
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+    before = cfg.read_bytes()
+
+    with pytest.raises(ValueError):
+        model_manager.add_model_to_provider("p1", "bad-model", 128000, **kwargs)
+
+    assert cfg.read_bytes() == before
+    models = model_manager.load_config()["providers"][0]["models"]
+    assert all(m["name"] != "bad-model" for m in models)
+
+
+def test_update_model_preserves_computer_capability_when_not_passed(tmp_path, monkeypatch):
+    """update_model 不传新字段时保留既有值，传入时严格校验后覆盖。"""
+    _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+    model_manager.update_model(
+        "p1", "m1", name="gpt-4o", context_window=128000, supports_vision=True,
+        supports_function_calling=True, computer_protocol="generic",
+    )
+    model = model_manager.load_config()["providers"][0]["models"][0]
+    assert model["supports_function_calling"] is True
+    assert model["computer_protocol"] == "generic"
+
+    # 不传新字段的普通编辑不得丢失能力元数据
+    model_manager.update_model(
+        "p1", "m1", name="gpt-4o", context_window=64000, supports_vision=True,
+    )
+    model = model_manager.load_config()["providers"][0]["models"][0]
+    assert model["context_window"] == 64000
+    assert model["supports_function_calling"] is True
+    assert model["computer_protocol"] == "generic"
+
+
+def test_update_model_rejects_half_valid_generic_combination(tmp_path, monkeypatch):
+    """update_model 把 generic 降级为缺能力组合时保存即拒绝。"""
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+    model_manager.update_model(
+        "p1", "m1", name="gpt-4o", context_window=128000, supports_vision=True,
+        supports_function_calling=True, computer_protocol="generic",
+    )
+    before = cfg.read_bytes()
+
+    with pytest.raises(ValueError):
+        model_manager.update_model(
+            "p1", "m1", name="gpt-4o", context_window=128000, supports_vision=True,
+            supports_function_calling=False,
+        )
+
+    assert cfg.read_bytes() == before
+
+
+def test_preset_add_and_sync_paths_carry_computer_metadata(tmp_path, monkeypatch):
+    """预置目录写入路径（add_preset_provider_with_models / sync）保留能力元数据。"""
+    catalog = _preset_catalog()
+    catalog["models"][1]["supports_function_calling"] = True
+    catalog["models"][1]["computer_protocol"] = "generic"
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: catalog)
+
+    _use_tmp_config(tmp_path, monkeypatch, {"providers": [], "active_model_id": None})
+    pid = model_manager.add_preset_provider("fake-preset", "sk-x")
+    added = next(
+        m for m in model_manager.load_config()["providers"][0]["models"]
+        if m["name"] == "model-b"
+    )
+    assert added["supports_function_calling"] is True
+    assert added["computer_protocol"] == "generic"
+
+    # sync 增量路径同样透传
+    _use_tmp_config(tmp_path, monkeypatch, _preset_provider_config())
+    synced = model_manager.sync_preset_provider_models("fake-preset")
+    assert synced == 2
+    synced_model = next(
+        m for m in model_manager.load_config()["providers"][0]["models"]
+        if m["name"] == "model-b"
+    )
+    assert synced_model["supports_function_calling"] is True
+    assert synced_model["computer_protocol"] == "generic"
+
+
+def test_active_model_export_includes_computer_capability(tmp_path, monkeypatch):
+    """get_active_model/get_secondary_model 导出新字段；旧配置缺字段导出为 None。"""
+    data = _provider_config()
+    model = data["providers"][0]["models"][0]
+    model["supports_vision"] = True
+    model["supports_function_calling"] = True
+    model["computer_protocol"] = "generic"
+    data["secondary_model_id"] = "m1"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    active = model_manager.get_active_model()
+    assert active["supports_function_calling"] is True
+    assert active["computer_protocol"] == "generic"
+    secondary = model_manager.get_secondary_model()
+    assert secondary["supports_function_calling"] is True
+    assert secondary["computer_protocol"] == "generic"
+
+    legacy_dir = tmp_path / "legacy"
+    legacy_dir.mkdir()
+    _use_tmp_config(legacy_dir, monkeypatch, _provider_config())
+    legacy = model_manager.get_active_model()
+    assert legacy["supports_function_calling"] is None
+    assert legacy["computer_protocol"] is None
