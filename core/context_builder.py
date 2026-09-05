@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from core.computer.models import ComputerCapability
 
 
 _DECISION_POLICY = """【决策与行动规则】
@@ -31,6 +34,9 @@ class RuntimeContext:
     memory: str = "无"
     skills: str = "无"
     custom_subagents: str = "无"
+    # Turn 起点冻结的电脑操控能力（Task 10，设计 9.3）：默认 None，
+    # disabled/None 时动态块字节与历史版本完全一致。
+    computer_capability: "ComputerCapability | None" = None
 
 
 def build_stable_prompt(base_prompt: str) -> str:
@@ -59,6 +65,9 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
     注意：长期记忆 / 技能目录 / 自定义子 Agent 清单等跨轮基本不变的静态内容
     已并入稳定系统提示词（core.agent_service.build_stable_system_message），
     本块只承载会话内可能变化的字段（模型 / 权限模式 / 工作目录 / 计划快照）。
+
+    电脑操控说明（Task 10，设计 10.1）：只在 Turn 冻结的 capability 开启时
+    追加到块末尾；默认 None / disabled 时返回值与历史版本逐字节一致。
     """
     plan_instruction = ""
     if runtime.permission_mode == "plan":
@@ -67,7 +76,7 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
             "不得修改或删除工作区文件。最终回答必须输出可执行计划，并说明需要"
             "切换到变更前确认、自动编辑或完全访问模式后再实施。\n"
         )
-    return (
+    prompt = (
         f"{DYNAMIC_CONTEXT_PREFIX}\n"
         f"当前模型：{runtime.model_name}\n"
         f"当前权限模式：{runtime.permission_mode}\n"
@@ -79,6 +88,29 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
         f"{plan_instruction}"
         "（若上下文中存在多份本块，以最新一份为准）"
     )
+    computer_section = _build_computer_prompt_section(runtime.computer_capability)
+    if computer_section:
+        prompt = prompt + "\n\n" + computer_section
+    return prompt
+
+
+def _build_computer_prompt_section(capability) -> str:
+    """电脑操控动态说明：capability 关闭时返回空串（动态块字节不变）。"""
+    if capability is None or not capability.enabled:
+        return ""
+    from core.computer.models import ComputerProtocol
+    from core.computer.provider_generic import build_generic_dynamic_prompt
+
+    generic_section = build_generic_dynamic_prompt(capability)
+    if generic_section:
+        return generic_section
+    if capability.protocol == ComputerProtocol.NATIVE_OPENAI.value:
+        return (
+            "电脑操控使用说明（OpenAI 原生协议）：请先单独调用 "
+            "computer_select_target 选择唯一操控目标，之后再执行原生电脑动作；"
+            "每次动作后依据返回的最新截图决定下一步。"
+        )
+    return ""
 
 
 def build_time_note(runtime: RuntimeContext) -> str:

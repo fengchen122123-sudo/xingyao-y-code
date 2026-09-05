@@ -656,7 +656,7 @@ GA 原生协议允许一个 `computer_call` 返回有序的 `actions[]`，这是
 
 - 新 popup/page 出现时，以最后获得焦点的可见 page 作为 active page，并发出页面变化事件。
 
-- 页面或 context 被用户关闭时，当前动作失败并停止会话，不自动重开。
+- 当前活动页面被用户关闭但仍有其他可见页面时，active page 切换到最后一个可见页面，会话继续，不自动重开；所有页面或整个 context 被用户关闭时，当前动作失败并停止会话，不自动重开（2026-09-03 用户裁决，原措辞为任一页面关闭即停止会话）。
 
 - persistent context 启动后若没有 page，创建且只创建一个 `about:blank`；多个 page 时按最后获得焦点的可见 page 选择 active page。
 

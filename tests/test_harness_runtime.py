@@ -1,11 +1,17 @@
+import hashlib
 import json
 import threading
+import time
+from copy import deepcopy
 from types import SimpleNamespace
 
 import pytest
 
+from core.computer.models import ComputerOwner
 from core.llm import chat_with_model_events
 from core.memory import MemoryManager
+from tests.computer_fakes import NATIVE_BROWSER_CAPABILITY, FakeController
+from tests.request_payload_snapshot import ALPHA_TOOL, ZETA_TOOL
 
 
 def _chunk(content="", tool_calls=None):
@@ -564,3 +570,230 @@ def test_timeout_handoff_takeover_completes_without_redelegation(
     assert item["execution_mode"] == "main_takeover"
     assert out_file.read_text(encoding="utf-8") == "taken over"
     assert not [event for event in events if event.kind == "error"]
+
+
+# ---------------------------------------------------------------------------
+# Task 11b：原生 computer continuation 的脱敏持久化投影与崩溃语义
+# ---------------------------------------------------------------------------
+
+NATIVE_MODEL = "openai/gpt-native-fake"
+NATIVE_BASE = "https://api.openai.com/v1"
+NATIVE_SYSTEM = "稳定系统提示"
+
+_NATIVE_FINAL_TEXT_EVENTS = [
+    {"type": "response.output_text.delta", "delta": "操作完成"},
+    {"type": "response.completed", "response": {"id": "resp_final", "output": []}},
+]
+
+
+def _native_call_events(*, response_id="resp_1", call_id="call_1"):
+    return [
+        {"type": "response.created", "response": {"id": response_id}},
+        {"type": "response.output_item.done", "item": {
+            "type": "computer_call",
+            "id": "cc_1",
+            "call_id": call_id,
+            "status": "completed",
+            "actions": [{"type": "type", "text": "秘密输入"}],
+        }},
+        {"type": "response.completed", "response": {"id": response_id, "output": []}},
+    ]
+
+
+def _native_controller(tmp_path):
+    png_path = tmp_path / "native-obs.png"
+    png_path.write_bytes(b"png")
+    owner = ComputerOwner(
+        session_id="session",
+        turn_id="turn-native",
+        session_label="session",
+        cancel_event=threading.Event(),
+    )
+    return FakeController(
+        owner=owner,
+        capability=NATIVE_BROWSER_CAPABILITY,
+        run_id="run-native",
+        png_path=str(png_path),
+    )
+
+
+def _patch_native_responses(mocker, controller, responses):
+    captured = []
+
+    def fake_responses(**kwargs):
+        captured.append(deepcopy(kwargs))
+        return iter(responses[len(captured) - 1])
+
+    mocker.patch("core.model_manager.get_model_protocol", lambda *_a, **_k: "responses")
+    mocker.patch("core.llm.get_tools_schema", lambda: [ZETA_TOOL, ALPHA_TOOL])
+    mocker.patch("core.memory_kairos.build_memory_system_section", lambda: "")
+    mocker.patch("core.llm._describe_images_with_secondary", lambda *_a, **_k: None)
+    mocker.patch("core.llm.estimate_tokens", lambda *_a, **_k: 0)
+    mocker.patch("core.llm.get_computer_control_service", lambda: controller)
+    mocker.patch("core.llm._litellm_responses", fake_responses)
+    return captured
+
+
+def _dump_harness_tables(manager):
+    rows = []
+    for table in ("harness_turns", "harness_steps", "harness_events"):
+        rows.extend(manager.conn.execute(f"SELECT * FROM {table}").fetchall())
+    return str(rows)
+
+
+def test_native_computer_turn_persists_sanitized_intermediate_row(tmp_path, mocker):
+    """原生中间行以 _computer_v1 脱敏投影落库；最终 assistant 文本正常保留；
+    response id 与截图 base64 绝不进 messages 或 Harness Journal。"""
+    manager = MemoryManager(str(tmp_path / "runtime.db"))
+    manager.create_session_explicit("session")
+    manager.add_message("session", "user", "操作电脑")
+    mocker.patch("core.app_context.get_manager", return_value=manager)
+    controller = _native_controller(tmp_path)
+    captured = _patch_native_responses(
+        mocker, controller, [_native_call_events(), _NATIVE_FINAL_TEXT_EVENTS]
+    )
+
+    list(chat_with_model_events(
+        NATIVE_MODEL,
+        "fake-key",
+        [
+            {"role": "system", "content": NATIVE_SYSTEM},
+            {"role": "user", "content": "操作电脑"},
+        ],
+        NATIVE_BASE,
+        persist=True,
+        parent_session="session",
+        turn_id="turn-native",
+        computer_capability=NATIVE_BROWSER_CAPABILITY,
+        consume_background_notifications=False,
+    ))
+
+    assert len(captured) == 2
+    history = manager.get_history("session")
+    # user / 原生中间行（脱敏投影）/ 最终 assistant 文本
+    assert [message["role"] for message in history] == ["user", "assistant", "assistant"]
+    projection_row = history[1]
+    assert projection_row["content"] == ""
+    projection = projection_row["_computer_v1"]
+    assert projection["kind"] == "native_call"
+    assert projection["run_id"] == "run-native"
+    assert projection["call_id_hash"] == hashlib.sha256(b"call_1").hexdigest()
+    # 输入文字只保存 code point 数和 SHA-256（"秘密输入"=4 个 code point）
+    type_summary = projection["action"][0]
+    assert type_summary["kind"] == "type_text"
+    assert type_summary["text_code_points"] == 4
+    assert type_summary["text_sha256"] == hashlib.sha256("秘密输入".encode("utf-8")).hexdigest()
+    # 截图只保存 screen hash/尺寸（最后动作摘要携带）
+    screen_summary = projection["action"][-1]
+    assert screen_summary["screen_sha256"]
+    assert isinstance(screen_summary["screen_width"], int)
+    assert isinstance(screen_summary["screen_height"], int)
+    assert history[2]["content"] == "操作完成"
+
+    serialized_history = json.dumps(history, ensure_ascii=False, default=str)
+    assert "秘密输入" not in serialized_history  # 输入正文不落库
+    assert "resp_1" not in serialized_history  # response id 不落库
+    assert "resp_final" not in serialized_history
+    assert "cG5n" not in serialized_history  # 截图 base64 不落库
+    assert "resp_1" not in _dump_harness_tables(manager)  # response id 不进 Journal
+
+    turn = manager.get_harness_turn("turn-native")
+    assert turn["status"] == "completed"
+    steps = _steps(manager, "turn-native")
+    assert [(step["ordinal"], step["status"]) for step in steps] == [
+        (1, "completed"),
+        (2, "completed"),
+    ]
+    # run 正常收尾：complete_run 且不留 running 租约
+    assert controller.complete_calls == 1
+    assert controller.stop_calls == 0
+    assert controller.execute_calls == [("run-native", "type_text", "browser")]
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestUnraisableExceptionWarning")
+def test_native_crash_recovery_marks_interrupted_and_never_continues(tmp_path, mocker):
+    """崩溃恢复只标 interrupted：previous_response_id 只存 Turn 内存，
+    DB 无任何可继续状态；新回合首请求绝不携带旧 response id，动作零重放。"""
+    manager = MemoryManager(str(tmp_path / "runtime.db"))
+    manager.create_session_explicit("session")
+    manager.add_message("session", "user", "操作电脑")
+    mocker.patch("core.app_context.get_manager", return_value=manager)
+    controller = _native_controller(tmp_path)
+    # 第二个响应先吐一段文本：生成器在续传 Step 的流消费中途挂起 = 进程崩溃
+    partial_text_events = [
+        {"type": "response.output_text.delta", "delta": "部分输出"},
+        {"type": "response.completed", "response": {"id": "resp_2", "output": []}},
+    ]
+    captured = _patch_native_responses(
+        mocker,
+        controller,
+        [_native_call_events(), partial_text_events, _NATIVE_FINAL_TEXT_EVENTS],
+    )
+
+    generator = chat_with_model_events(
+        NATIVE_MODEL,
+        "fake-key",
+        [
+            {"role": "system", "content": NATIVE_SYSTEM},
+            {"role": "user", "content": "操作电脑"},
+        ],
+        NATIVE_BASE,
+        persist=True,
+        parent_session="session",
+        turn_id="turn-native",
+        computer_capability=NATIVE_BROWSER_CAPABILITY,
+        consume_background_notifications=False,
+    )
+    # 消费到第一个 assistant_delta 为止：computer call 已执行、续传请求已发出，
+    # 续传状态（response id）只存在于生成器局部变量（Turn 内存）
+    for event in generator:
+        if event.kind == "assistant_delta":
+            break
+    assert len(captured) == 2
+
+    # 崩溃后 DB 里没有 response id（投影行已脱敏），没有可继续状态
+    serialized_history = json.dumps(
+        manager.get_history("session"), ensure_ascii=False, default=str
+    )
+    assert "resp_1" not in serialized_history
+    assert "resp_2" not in serialized_history
+    assert "resp_1" not in _dump_harness_tables(manager)
+
+    # 崩溃恢复（既有 harness 语义）只把未完成 Turn/Step 标记 interrupted
+    interrupted = manager.interrupt_stale_harness_runs(int(time.time() * 1000) + 10_000)
+    assert interrupted >= 1
+    assert manager.get_harness_turn("turn-native")["status"] == "interrupted"
+
+    # 同会话新回合：重建历史（_computer_v1 中间行被确定性过滤），首请求
+    # 绝不携带 previous_response_id，也不重放任何动作
+    messages = [
+        {"role": "system", "content": NATIVE_SYSTEM},
+        *manager.get_history("session"),
+    ]
+    list(chat_with_model_events(
+        NATIVE_MODEL,
+        "fake-key",
+        messages,
+        NATIVE_BASE,
+        persist=True,
+        parent_session="session",
+        turn_id="turn-next",
+        computer_capability=NATIVE_BROWSER_CAPABILITY,
+        consume_background_notifications=False,
+    ))
+    assert len(captured) == 3
+    fresh_request = captured[2]
+    assert "previous_response_id" not in fresh_request
+    assert fresh_request["input"] == [
+        {"role": "system", "content": NATIVE_SYSTEM},
+        {"role": "user", "content": "操作电脑"},
+    ]  # _computer_v1 中间行不进后续普通 Provider 请求
+    # 动作只执行过一次（悬停的旧 Turn 不重放）
+    assert controller.execute_calls == [("run-native", "type_text", "browser")]
+
+    # 清理悬停生成器：崩溃模拟后 close 可能触发非法状态转换（interrupted 无
+    # 出边），失败属预期，与断言无关
+    try:
+        generator.close()
+    except Exception:
+        pass

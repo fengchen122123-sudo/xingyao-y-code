@@ -90,6 +90,98 @@
         命令失败时错误会原样返回给大模型，由模型调整语法或通过命令工具显式指定其他已安装解释器；系统不会静默降级。
       </p>
     </section>
+
+    <section class="computer-settings" data-test="computer-settings-section">
+      <header class="computer-header">
+        <h2 class="computer-title"><AppIcon name="zap" :size="14" /> 电脑操控</h2>
+        <p>浏览器操控与完整电脑操控是两个独立开关，默认关闭；开启后 Y-CODE 不再逐动作询问授权。</p>
+        <p>电脑操控要求模型支持视觉（识图）与工具调用：两项能力都开启的模型在开关开启后自动可用，无需逐个配置。</p>
+      </header>
+
+      <div class="setting-row">
+        <div class="setting-copy">
+          <h2>浏览器操控</h2>
+          <p>模型可在专用 Edge/Chrome 页面中观察、点击、输入、滚动和导航；只控制网页内容区。</p>
+        </div>
+        <button
+          v-if="!isMobile"
+          type="button"
+          class="setting-switch"
+          role="switch"
+          data-test="browser-control-switch"
+          :aria-checked="store.systemSettings.browser_control_enabled ? 'true' : 'false'"
+          :disabled="saving"
+          @click="toggleBrowserControl"
+        >
+          <span class="switch-knob" />
+        </button>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-copy">
+          <h2>默认浏览器</h2>
+          <p>操控使用的浏览器与各自专用配置目录绑定{{ activeComputerRun ? '；当前有操控会话进行中，需先停止才能切换' : '' }}。</p>
+        </div>
+        <select
+          v-if="!isMobile"
+          data-test="computer-browser-select"
+          class="setting-select"
+          :value="store.systemSettings.computer_browser"
+          :disabled="saving || activeComputerRun"
+          @change="selectComputerBrowser(($event.target as HTMLSelectElement).value)"
+        >
+          <option
+            v-for="option in store.systemSettings.computer_browser_options"
+            :key="option.browser"
+            :data-test="`browser-option-${option.browser}`"
+            :value="option.browser"
+            :disabled="!option.available"
+          >
+            {{ option.label }}{{ option.available ? '' : `（${option.unavailable_reason || '未安装'}）` }}
+          </option>
+        </select>
+      </div>
+
+      <div class="setting-row">
+        <div class="setting-copy">
+          <h2>完整电脑操控</h2>
+          <p>模型可操作整个 Windows 桌面（鼠标、键盘与任意可见应用窗口）；开启前要求紧急停止热键可用。</p>
+        </div>
+        <button
+          v-if="!isMobile"
+          type="button"
+          class="setting-switch"
+          role="switch"
+          data-test="computer-control-switch"
+          :aria-checked="store.systemSettings.computer_control_enabled ? 'true' : 'false'"
+          :disabled="saving"
+          @click="toggleComputerControl"
+        >
+          <span class="switch-knob" />
+        </button>
+      </div>
+
+      <p v-if="isMobile" class="computer-mobile-note" data-test="computer-mobile-note">
+        电脑操控开关与默认浏览器请在桌面端开启或修改；手机端仅可查看状态与紧急停止。
+      </p>
+
+      <div class="computer-info-row">
+        <div class="setting-copy">
+          <h2>专用配置目录</h2>
+          <p class="mono profile-path" data-test="computer-profile-path">{{ store.systemSettings.computer_profile_path }}</p>
+          <p>登录态与浏览器数据保存在本机该目录中，不读取日常浏览器的配置、Cookie 或扩展。</p>
+        </div>
+      </div>
+
+      <p class="computer-privacy" data-test="computer-privacy-notice"><AppIcon name="triangle-alert" :size="13" />开启后，当前页面或桌面截图会发送给当前模型 Provider；Y-CODE 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。</p>
+
+      <ul class="computer-preflight" data-test="computer-preflight-list">
+        <li v-for="item in preflightItems" :key="item.label" :class="{ ok: item.ok }">
+          <AppIcon :name="item.ok ? 'check' : 'x'" :size="12" :stroke-width="2.25" />
+          <span>{{ item.label }}</span>
+        </li>
+      </ul>
+    </section>
   </div>
 </template>
 
@@ -97,10 +189,14 @@
 import { computed, ref, watch } from 'vue';
 
 import { useAppStore } from '../stores/appStore';
+import { useIsMobile } from '../composables/useViewport';
 import AppIcon from './AppIcon.vue';
 
 const store = useAppStore();
 const saving = ref(false);
+
+// 手机 viewport 不显示可点击启用控件（呈现层约束；后端边界由 Task 15 实施）
+const isMobile = useIsMobile();
 
 const turnStepLimitDraft = ref(String(store.systemSettings.agent_turn_step_limit));
 
@@ -161,6 +257,72 @@ async function selectTokenTtl(value: string) {
     saving.value = false;
   }
 }
+
+// ── 电脑操控区（Task 12）：开关状态一律以后端快照渲染，失败自动回滚 ──
+
+// 活动 run：浏览器选择在活动会话中不可修改（设计 8.1）
+const activeComputerRun = computed(() => {
+  const run = store.systemSettings.computer_run;
+  if (!run || !run.run_id) return false;
+  return !['idle', 'completed', 'stopped', 'failed'].includes(run.status);
+});
+
+// 平台/浏览器/热键 preflight 结果（mini-list 摘要，不塞整表）
+const preflightItems = computed(() => {
+  const items = [
+    {
+      label: store.systemSettings.computer_platform_supported
+        ? '平台：当前 Windows 平台受支持'
+        : '平台：当前平台不受支持（电脑操控仅支持 Windows）',
+      ok: store.systemSettings.computer_platform_supported,
+    },
+  ];
+  for (const option of store.systemSettings.computer_browser_options) {
+    items.push({
+      label: option.available
+        ? `浏览器：${option.label} 可用`
+        : `浏览器：${option.label} 不可用（${option.unavailable_reason || '未安装'}）`,
+      ok: option.available,
+    });
+  }
+  items.push({
+    label: store.systemSettings.computer_hotkey_available
+      ? `热键：紧急停止热键 ${store.systemSettings.computer_hotkey} 可注册`
+      : `热键：无法注册紧急停止热键 ${store.systemSettings.computer_hotkey}，开关无法开启`,
+    ok: store.systemSettings.computer_hotkey_available,
+  });
+  return items;
+});
+
+async function toggleBrowserControl() {
+  if (saving.value) return;
+  saving.value = true;
+  try {
+    await store.setBrowserControlEnabled(!store.systemSettings.browser_control_enabled);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function toggleComputerControl() {
+  if (saving.value) return;
+  saving.value = true;
+  try {
+    await store.setComputerControlEnabled(!store.systemSettings.computer_control_enabled);
+  } finally {
+    saving.value = false;
+  }
+}
+
+async function selectComputerBrowser(browser: string) {
+  if (browser === store.systemSettings.computer_browser || saving.value) return;
+  saving.value = true;
+  try {
+    await store.setComputerBrowser(browser);
+  } finally {
+    saving.value = false;
+  }
+}
 </script>
 
 <style scoped>
@@ -187,6 +349,28 @@ async function selectTokenTtl(value: string) {
 .setting-save:disabled { cursor: not-allowed; opacity: .6; }
 .setting-error { margin: 12px 0 0; color: var(--danger); font-size: 12px; }
 .setting-note { margin: 14px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.7; }
+
+/* ── 电脑操控区（Task 12）── */
+.computer-settings { margin-top: 34px; }
+.computer-header { margin-bottom: 6px; }
+.computer-title { display: flex; align-items: center; gap: 7px; margin: 0 0 7px; font-size: 16px; color: var(--text-bright); }
+.computer-header p { margin: 0; color: var(--text-faint); font-size: 12.5px; line-height: 1.6; }
+.setting-switch { position: relative; flex: 0 0 auto; width: 44px; height: 24px; border: 1px solid var(--border); border-radius: 999px; background: var(--bg3); cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+.setting-switch[aria-checked='true'] { background: var(--accent); border-color: var(--accent); }
+.setting-switch .switch-knob { position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 999px; background: var(--text-bright); transition: transform .15s ease; }
+.setting-switch[aria-checked='true'] .switch-knob { transform: translateX(20px); }
+.setting-switch:disabled { cursor: wait; opacity: .7; }
+.computer-mobile-note { margin: 10px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.6; }
+.computer-info-row { border-bottom: 1px solid var(--border); padding: 18px 0; }
+.profile-path { margin: 4px 0 6px; color: var(--text-dim); font-size: 12px; word-break: break-all; }
+.computer-privacy { display: flex; align-items: flex-start; gap: 8px; margin: 14px 0 0; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent); border-radius: var(--theme-radius-medium); background: color-mix(in srgb, var(--warning) 8%, transparent); color: var(--text-dim); font-size: 12px; line-height: 1.7; }
+.computer-privacy svg { flex-shrink: 0; margin-top: 3px; color: var(--warning); }
+.computer-preflight { margin: 14px 0 0; padding: 0; list-style: none; }
+.computer-preflight li { display: flex; align-items: center; gap: 7px; margin: 0 0 6px; color: var(--text-faint); font-size: 12px; }
+.computer-preflight li.ok { color: var(--text-dim); }
+.computer-preflight li:not(.ok) svg { color: var(--danger); }
+.computer-preflight li.ok svg { color: var(--green); }
+
 @media (max-width: 620px) {
   .setting-row { align-items: stretch; flex-direction: column; gap: 12px; padding: 16px 0; }
   .setting-select { flex-basis: auto; max-width: none; width: 100%; }

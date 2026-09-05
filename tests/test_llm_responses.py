@@ -125,6 +125,36 @@ def test_responses_stream_normalizes_text_reasoning_tools_and_usage():
     assert chunks[-1].usage.prompt_tokens_details.cached_tokens == 80
 
 
+def test_responses_bridge_enum_typed_events_are_normalized():
+    """litellm chat→responses 桥接（DeepSeek 等 chat-only provider）合成事件的
+    type 是 ResponsesAPIStreamEvents 枚举成员而非字符串，必须按 .value 归一化。"""
+    try:
+        from litellm.types.llms.openai import ResponsesAPIStreamEvents
+    except ImportError:  # pragma: no cover - litellm 缺失时跳过
+        pytest.skip("litellm types 不可用")
+
+    completed = SimpleNamespace(
+        usage=SimpleNamespace(
+            input_tokens=10,
+            output_tokens=5,
+            total_tokens=15,
+            input_tokens_details=SimpleNamespace(cached_tokens=0),
+        )
+    )
+    events = [
+        _event(ResponsesAPIStreamEvents.RESPONSE_CREATED, response=SimpleNamespace(id="r1")),
+        _event(ResponsesAPIStreamEvents.OUTPUT_TEXT_DELTA, delta="你好"),
+        _event(ResponsesAPIStreamEvents.RESPONSE_COMPLETED, response=completed),
+    ]
+
+    chunks = list(llm._responses_stream_as_chat_chunks(events))
+
+    texts = "".join(c.choices[0].delta.content for c in chunks)
+    assert texts == "你好"
+    assert chunks[-1].choices[0].finish_reason == "stop"
+    assert chunks[-1].usage.total_tokens == 15
+
+
 def test_responses_failed_event_does_not_fall_back():
     failed = SimpleNamespace(error=SimpleNamespace(message="bad request"))
 
@@ -222,3 +252,156 @@ def test_chat_event_gateway_uses_configured_responses_protocol(monkeypatch):
     )
     assert captured
     assert captured[0]["input"][-1] == {"role": "user", "content": "ping"}
+
+
+# ---------------------------------------------------------------------------
+# Task 11a：原生 computer_call 流事件（终态合并，禁止半截 JSON 执行）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tool", [
+    {"type": "computer"},
+    {"type": "web_search"},
+    {"type": "code_interpreter"},
+    {"type": "computer", "environment": "browser"},
+], ids=["computer", "web-search", "code-interpreter", "computer-with-fields"])
+def test_responses_tools_reject_builtin_tool_definitions(tool):
+    """_responses_tools_from_chat_tools 仍拒绝任意 built-in：只允许 capability
+    分支直接传入的精确 computer definition（Task 11a Step 3）。"""
+    with pytest.raises(ValueError):
+        llm._responses_tools_from_chat_tools([tool])
+
+
+def _computer_call_chunks(chunks):
+    return [
+        chunk for chunk in chunks
+        if getattr(chunk.choices[0].delta, "computer_call", None) is not None
+    ]
+
+
+def test_responses_stream_forwards_terminal_computer_call():
+    """output_item.done 的 computer_call 是终态完整载荷：转发给 assembler 合并，
+    finish_reason 为 tool_calls（回合必须继续，不能当最终文本结束）。"""
+    events = [
+        _event("response.created", response=SimpleNamespace(id="resp_1")),
+        _event("response.output_item.done", item=SimpleNamespace(
+            type="computer_call",
+            call_id="call_1",
+            status="completed",
+            actions=[{"type": "click", "x": 1, "y": 1}],
+        )),
+        _event("response.completed", response=SimpleNamespace(id="resp_1", output=[])),
+    ]
+
+    chunks = list(llm._responses_stream_as_chat_chunks(events))
+
+    payloads = _computer_call_chunks(chunks)
+    assert len(payloads) == 1
+    payload = payloads[0].choices[0].delta.computer_call
+    assert payload["response_id"] == "resp_1"
+    assert payload["item"]["type"] == "computer_call"
+    assert payload["item"]["call_id"] == "call_1"
+    assert payload["item"]["actions"] == [{"type": "click", "x": 1, "y": 1}]
+    assert chunks[-1].choices[0].finish_reason == "tool_calls"
+
+
+def test_responses_stream_ignores_partial_computer_call_added_events():
+    """output_item.added 携带的是半截 computer_call：绝不产生 computer_call 载荷，
+    禁止基于半截 JSON 触发执行。"""
+    events = [
+        _event("response.created", response=SimpleNamespace(id="resp_1")),
+        _event("response.output_item.added", output_index=0, item=SimpleNamespace(
+            type="computer_call",
+            call_id="call_1",
+            actions=[{"type": "click", "x": 1, "y": 1}],
+        )),
+        _event("response.completed", response=SimpleNamespace(id="resp_1", output=[])),
+    ]
+
+    chunks = list(llm._responses_stream_as_chat_chunks(events))
+
+    assert _computer_call_chunks(chunks) == []
+    assert chunks[-1].choices[0].finish_reason == "stop"
+
+
+def test_responses_stream_completed_output_carries_computer_call():
+    """非流式桥接只在 response.completed 的 output[] 里给出 computer_call：
+    同样作为终态完整载荷转发，response id 取自 completed。"""
+    events = [
+        _event("response.output_text.delta", delta="先看图"),
+        _event("response.completed", response=SimpleNamespace(
+            id="resp_2",
+            output=[{
+                "type": "computer_call",
+                "call_id": "call_9",
+                "status": "completed",
+                "actions": [{"type": "screenshot"}],
+            }],
+        )),
+    ]
+
+    chunks = list(llm._responses_stream_as_chat_chunks(events))
+
+    payloads = _computer_call_chunks(chunks)
+    assert len(payloads) == 1
+    payload = payloads[0].choices[0].delta.computer_call
+    assert payload["response_id"] == "resp_2"
+    assert payload["item"]["call_id"] == "call_9"
+    assert chunks[-1].choices[0].finish_reason == "tool_calls"
+
+
+def test_responses_stream_rejects_conflicting_response_ids():
+    events = [
+        _event("response.created", response=SimpleNamespace(id="resp_1")),
+        _event("response.completed", response=SimpleNamespace(id="resp_2", output=[])),
+    ]
+
+    with pytest.raises(RuntimeError, match="response id"):
+        list(llm._responses_stream_as_chat_chunks(events))
+
+
+def test_stream_assembler_merges_computer_call_chunks():
+    """StreamAssembler 合并 computer_call 流事件：终态 payload 在 finish 时暴露，
+    普通（默认关闭）回合保持 None，AssembledResponse 形状不变。"""
+    from core.harness.stream_assembler import StreamAssembler
+
+    payload = {
+        "response_id": "resp_1",
+        "item": {
+            "type": "computer_call",
+            "call_id": "call_1",
+            "status": "completed",
+            "actions": [{"type": "click", "x": 1, "y": 1}],
+        },
+    }
+
+    def _computer_chunk(call_payload):
+        delta = SimpleNamespace(
+            content="",
+            reasoning_content=None,
+            tool_calls=[],
+            computer_call=call_payload,
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+            usage=None,
+        )
+
+    assembler = StreamAssembler()
+    assembler.consume(_computer_chunk(payload))
+    # done 与 completed 重复携带同一 call：合并为一个（后者覆盖前者）
+    assembler.consume(_computer_chunk(payload))
+    assembled = assembler.finish()
+    assert assembled.computer_call == payload
+
+    plain = StreamAssembler()
+    plain.consume(
+        SimpleNamespace(
+            choices=[SimpleNamespace(
+                delta=SimpleNamespace(content="文本", reasoning_content=None, tool_calls=[]),
+                finish_reason="stop",
+            )],
+            usage=None,
+        )
+    )
+    assert plain.finish().computer_call is None
