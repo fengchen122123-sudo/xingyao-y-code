@@ -88,6 +88,14 @@ def _folded_media_text(block):
 
 
 def _content_has_media(content):
+    """判断消息内容是否含图片/视频块；同时识别两种持久化形态（Task 10）。
+
+    1. content 列表（普通多模态消息）；
+    2. 含 content 列表的完整消息 dict（带 _computer_v1 私有元数据的
+       follow-up 观察消息，以完整 dict 入库）。
+    """
+    if isinstance(content, dict):
+        content = content.get("content")
     return (
         isinstance(content, list)
         and any(
@@ -1716,6 +1724,12 @@ class MemoryManager:
 
         在含媒体的新 user 消息写入的同一事务内调用，替代请求时改写历史的旧路径；
         折叠后字节永久冻结（占位符是 text block，不再匹配媒体折叠条件）。
+
+        含媒体的行有两种持久化形态（Task 10）：content 列表（普通多模态消息）
+        与含 content 列表的完整消息 dict（带 _computer_v1 的 follow-up 观察）。
+        折叠只把媒体块替换为文本占位符：dict 形态的其余键（_computer_v1 私有
+        元数据）原样保留，不删除不改写；普通列表形态的折叠结果字节与历史
+        版本完全一致。
         """
         cursor.execute(
             "SELECT id, content FROM messages WHERE session_id = ? AND role = 'user' "
@@ -1728,16 +1742,30 @@ class MemoryManager:
             if ok and _content_has_media(parsed):
                 media_rows.append((msg_id, parsed))
         folded = 0
-        for msg_id, blocks in media_rows[:-1]:  # 最新一条保留原样
-            new_blocks = [
-                {"type": "text", "text": _folded_media_text(b)}
-                if isinstance(b, dict) and b.get("type") in ("image", "image_url")
-                else b
-                for b in blocks
-            ]
+        for msg_id, payload in media_rows[:-1]:  # 最新一条保留原样
+            if isinstance(payload, dict):
+                # 完整消息 dict：只折叠 content 内的媒体块，保留 _computer_v1 等键
+                blocks = payload.get("content")
+                if not isinstance(blocks, list):
+                    continue
+                payload["content"] = [
+                    {"type": "text", "text": _folded_media_text(b)}
+                    if isinstance(b, dict) and b.get("type") in ("image", "image_url")
+                    else b
+                    for b in blocks
+                ]
+                new_raw = json.dumps(payload, ensure_ascii=False)
+            else:
+                new_blocks = [
+                    {"type": "text", "text": _folded_media_text(b)}
+                    if isinstance(b, dict) and b.get("type") in ("image", "image_url")
+                    else b
+                    for b in payload
+                ]
+                new_raw = json.dumps(new_blocks, ensure_ascii=False)
             cursor.execute(
                 'UPDATE messages SET content = ? WHERE id = ?',
-                (json.dumps(new_blocks, ensure_ascii=False), msg_id),
+                (new_raw, msg_id),
             )
             folded += 1
         return folded

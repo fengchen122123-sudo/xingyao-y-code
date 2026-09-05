@@ -138,6 +138,11 @@
           <FileTreeNode v-for="node in store.fileTree" :key="node.n" :node="node" :parent-path="store.workdir" />
         </div>
       </div>
+
+      <!-- 电脑操控面板（设计 16.2）：出现过 run 后动态追加的“操控”页签内容 -->
+      <div v-show="activeTab === 'computer'" class="rpane active" data-test="computer-pane">
+        <ComputerControlPane />
+      </div>
     </div>
 
     <!-- 文件预览弹窗：Teleport 到 body——右栏分区带 isolation 分层，
@@ -174,10 +179,11 @@ import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
+import ComputerControlPane from './ComputerControlPane.vue';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
 
-type TabType = 'plan' | 'tasks' | 'term' | 'files';
+type TabType = 'plan' | 'tasks' | 'term' | 'files' | 'computer';
 
 const store = useAppStore();
 
@@ -192,12 +198,29 @@ const panelStyle = computed(() => {
 });
 const activeTab = ref<TabType>('plan');
 
-const tabs: Array<{ id: TabType; label: string }> = [
+// 既有四个页签静态定义；“操控”页签只在出现过电脑操控 run 后动态追加
+// （设计 16.2），避免给从未使用操控的用户增加常驻页签
+const baseTabs: Array<{ id: TabType; label: string }> = [
   { id: 'plan', label: '计划' },
   { id: 'tasks', label: '任务' },
   { id: 'term', label: '终端' },
   { id: 'files', label: '文件' }
 ];
+const tabs = computed<Array<{ id: TabType; label: string }>>(() => (
+  store.computerRun.run_id ? [...baseTabs, { id: 'computer', label: '操控' }] : baseTabs
+));
+
+// run 开始时首次自动切到操控页签（设计 16.2）：每个 run 只开一次（记录到
+// computerLastAutoOpenedRunId），用户随后手动切走不抢回，新 run 再开一次；
+// 挂载补跑覆盖“run 启动时右面板尚未挂载（如设置页打开中）”的场景
+function autoOpenComputerTabOnce() {
+  const runId = store.computerRun.run_id;
+  if (!runId || runId === store.computerLastAutoOpenedRunId) return;
+  if (!store.computerControlBarVisible) return;
+  store.computerLastAutoOpenedRunId = runId;
+  activeTab.value = 'computer';
+}
+watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
 
 // ---------------- 内嵌终端 ----------------
 const termInput = ref('');
@@ -353,11 +376,18 @@ function maybeAutoRefreshFileTree() {
   lastFileTreeAutoRefresh = now;
   if (store.workdir) void store.refreshFileTree();
 }
-watch(activeTab, t => { if (t === 'files') maybeAutoRefreshFileTree(); });
+// 切到操控页签时校准 run 快照（设计 16.4）：_js_queue 满时允许丢新事件，
+// 进入页签即用 get_computer_control_status() 复核终态
+watch(activeTab, (t) => {
+  if (t === 'files') maybeAutoRefreshFileTree();
+  if (t === 'computer' && store.computerRun.run_id) void store.refreshComputerRun();
+});
 const onWindowFocus = () => { if (activeTab.value === 'files') maybeAutoRefreshFileTree(); };
 
 onMounted(() => {
   refreshTasks();
+  // 挂载补跑一次自动开页签（run 启动时右面板可能尚未挂载，见函数注释）
+  autoOpenComputerTabOnce();
   window.addEventListener('focus', onWindowFocus);
 });
 

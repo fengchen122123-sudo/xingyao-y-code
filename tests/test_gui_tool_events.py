@@ -1,4 +1,6 @@
+import json
 import os
+import queue
 import threading
 
 import pytest
@@ -6,9 +8,11 @@ import pytest
 from core.turn_events import TurnEventFactory
 from gui_bridge import (
     ApiBridge,
+    JS_QUEUE_MAXSIZE,
     _ensure_session_model_binding,
     _session_from_turn_id,
 )
+from tests.computer_fakes import FakeBridgeController
 
 
 def make_events(items):
@@ -886,3 +890,147 @@ def test_turn_finish_survives_plan_clear_failure(tmp_path, monkeypatch):
     assert "turn_finish" in kinds
     finishes = [data for kind, data in emitted if kind == "turn_finish"]
     assert finishes == [{"session_name": "检查项目"}]
+
+
+# ---------------- Task 13a：电脑操控事件桥（controller listener → _js_queue） ----------------
+
+
+def _make_computer_bridge(js_queue_maxsize=None):
+    """构造仅含电脑操控桥接所需内部状态的裸桥实例。
+
+    _js_dispatcher 指向主线程（恒 alive）：阻止 _ensure_js_dispatcher 在测试内
+    启动真实派发线程抢空队列，drain_js_queue 断言才稳定；事件桥由控制方法
+    惰性建立（生产路径），事件只进 _js_queue、绝不直接 evaluate_js。
+    """
+    instance = ApiBridge.__new__(ApiBridge)
+    instance._shutting_down = False
+    instance._window = None
+    instance._js_queue = queue.Queue(
+        maxsize=JS_QUEUE_MAXSIZE if js_queue_maxsize is None else js_queue_maxsize
+    )
+    instance._js_dispatcher = threading.current_thread()
+    instance._js_dispatcher_lock = threading.Lock()
+    instance._js_dropped = 0
+    instance._computer_event_listener = None
+    return instance
+
+
+def _inject_fake_controller(monkeypatch, fake_controller):
+    monkeypatch.setattr(
+        "core.computer.controller.get_computer_control_service",
+        lambda: fake_controller,
+    )
+
+
+@pytest.fixture
+def fake_controller():
+    return FakeBridgeController()
+
+
+@pytest.fixture
+def bridge(fake_controller, monkeypatch):
+    _inject_fake_controller(monkeypatch, fake_controller)
+    instance = _make_computer_bridge()
+    instance.get_computer_control_status()  # 控制方法惰性建立事件桥（生产路径）
+    return instance
+
+
+class _RecordingWindow:
+    """记录 evaluate_js 调用的窗口 fake：断言事件源线程绝不直接 evaluate_js。"""
+
+    def __init__(self):
+        self.evaluate_js_calls = []
+
+    def evaluate_js(self, script):
+        self.evaluate_js_calls.append(script)
+
+
+def test_bridge_forwards_only_small_json_events_to_js_queue(fake_controller, bridge):
+    fake_controller.emit_observation(run_id="run-a", event_seq=3)
+    payload = bridge.drain_js_queue()
+    assert payload["type"] == "computer_observation"
+    assert payload["run_id"] == "run-a"
+    assert payload["event_seq"] == 3
+    assert "data:image/png;base64" not in json.dumps(payload)
+
+
+def test_bridge_forwards_all_four_computer_event_types(fake_controller, bridge):
+    """controller 四类事件全部经 listener 进 _js_queue，形状原样保留。"""
+    fake_controller.emit_state(run_id="run-a", event_seq=1, status="running")
+    assert bridge.drain_js_queue()["type"] == "computer_state"
+
+    fake_controller.emit_action_started(run_id="run-a", event_seq=2, action_ordinal=1)
+    payload = bridge.drain_js_queue()
+    assert payload["type"] == "computer_action_started"
+    assert payload["action_kind"] == "click"
+
+    fake_controller.emit_action_finished(run_id="run-a", event_seq=3, action_ordinal=1)
+    payload = bridge.drain_js_queue()
+    assert payload["type"] == "computer_action_finished"
+    assert payload["ok"] is True
+
+    fake_controller.emit_observation(run_id="run-a", event_seq=4)
+    payload = bridge.drain_js_queue()
+    assert payload["type"] == "computer_observation"
+    assert payload["preview_url"].startswith("/computer-preview/")  # 只带短 URL
+
+
+def test_computer_event_listener_never_calls_evaluate_js(fake_controller, monkeypatch):
+    """事件源线程绝不直接 evaluate_js（gui-js-dispatcher 单消费者铁律）。"""
+    _inject_fake_controller(monkeypatch, fake_controller)
+    instance = _make_computer_bridge()
+    window = _RecordingWindow()
+    instance._window = window
+    instance.get_computer_control_status()
+
+    fake_controller.emit_state(run_id="run-a", event_seq=1)
+    fake_controller.emit_observation(run_id="run-a", event_seq=2)
+
+    assert window.evaluate_js_calls == []
+    payload = instance.drain_js_queue()
+    assert payload["type"] == "computer_observation"
+    assert payload["event_seq"] == 2
+
+
+def test_computer_event_queue_full_drops_new_events_keeps_old(fake_controller, monkeypatch):
+    """队列满按现有策略丢弃新事件：旧事件不被改写，生产者不阻塞。"""
+    _inject_fake_controller(monkeypatch, fake_controller)
+    instance = _make_computer_bridge(js_queue_maxsize=2)
+    instance.get_computer_control_status()
+
+    fake_controller.emit_observation(run_id="run-a", event_seq=1)
+    fake_controller.emit_observation(run_id="run-a", event_seq=2)
+    fake_controller.emit_observation(run_id="run-a", event_seq=3)  # 队列已满：丢弃
+
+    payload = instance.drain_js_queue()
+    assert payload["event_seq"] == 2  # 旧事件原样保留，未被新事件改写
+    assert payload["run_id"] == "run-a"
+    assert instance._js_dropped == 1
+
+
+def test_computer_event_bridge_established_once_idempotent(fake_controller, monkeypatch):
+    """进程内桥接建立一次：重复调用控制方法不重复注册 listener。"""
+    _inject_fake_controller(monkeypatch, fake_controller)
+    instance = _make_computer_bridge()
+    assert fake_controller.listener_count == 0
+
+    instance.get_computer_control_status()
+    instance.get_computer_control_status()
+    instance.pause_computer_control("run-a")  # 不存在的 run：仍不重复注册
+
+    assert fake_controller.listener_count == 1
+    fake_controller.emit_observation(run_id="run-a", event_seq=1)
+    assert instance.drain_js_queue()["type"] == "computer_observation"
+
+
+def test_bridge_pause_emits_state_event_to_js_queue(fake_controller, bridge):
+    """控制 mutation 触发的 controller 状态事件同样经事件桥进 _js_queue。"""
+    fake_controller.start_run(run_id="run-a")
+
+    result = bridge.pause_computer_control("run-a")
+
+    assert result["ok"] is True
+    payload = bridge.drain_js_queue()
+    assert payload["type"] == "computer_state"
+    assert payload["status"] == "paused"
+    assert payload["run_id"] == "run-a"

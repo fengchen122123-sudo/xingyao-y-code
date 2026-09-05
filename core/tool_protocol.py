@@ -38,6 +38,9 @@ class ToolResult:
     changed_files: list[str] = field(default_factory=list)
     diff: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
+    # follow-up 私有消息载荷（设计 19.3）：仅固定 computer 适配器使用，
+    # 默认空且不可变；现有工具不传该字段时行为与序列化完全不变。
+    followup_messages: tuple[dict[str, Any], ...] = ()
 
     def to_message_content(self) -> str:
         """Return the compact content that belongs in model conversation history."""

@@ -102,9 +102,20 @@ def prepare_stream_request(
     protocol: str,
     chat_kwargs: dict,
     timeout: int,
+    *,
+    native_computer_tools: tuple | list = (),
 ) -> PreparedStreamRequest:
-    """Build the one kwargs mapping that will be submitted to the provider."""
+    """Build the one kwargs mapping that will be submitted to the provider.
+
+    native_computer_tools（Task 11a，设计 11.1）是 capability 分支直接传入的
+    精确 Responses 原生 computer 工具定义（computer_select_target function
+    schema 与/或 {"type":"computer"} built-in）：只追加在 flattened function
+    tools 之后，不经 _responses_tools_from_chat_tools（它仍拒绝任意 built-in）。
+    非 responses 协议携带非空原生工具是接线错误，显式失败绝不静默丢弃。
+    """
     if protocol != "responses":
+        if native_computer_tools:
+            raise ValueError("native computer tools 仅支持 responses 协议")
         provider_kwargs = dict(chat_kwargs)
         provider_kwargs["timeout"] = timeout
         return PreparedStreamRequest(protocol=protocol, kwargs=provider_kwargs)
@@ -113,7 +124,10 @@ def prepare_stream_request(
         "model": chat_kwargs["model"],
         "api_key": chat_kwargs.get("api_key"),
         "input": _responses_input_from_messages(chat_kwargs.get("messages") or []),
-        "tools": _responses_tools_from_chat_tools(chat_kwargs.get("tools") or []),
+        "tools": [
+            *_responses_tools_from_chat_tools(chat_kwargs.get("tools") or []),
+            *(native_computer_tools or ()),
+        ],
         "stream": True,
         "timeout": timeout,
     }
@@ -123,12 +137,34 @@ def prepare_stream_request(
         ("tool_choice", "tool_choice"),
         ("num_retries", "num_retries"),
         ("extra_body", "extra_body"),
+        ("parallel_tool_calls", "parallel_tool_calls"),
     ):
         if source in chat_kwargs:
             provider_kwargs[target] = chat_kwargs[source]
     if chat_kwargs.get("reasoning_effort"):
         provider_kwargs["reasoning"] = {"effort": chat_kwargs["reasoning_effort"]}
     return PreparedStreamRequest(protocol=protocol, kwargs=provider_kwargs)
+
+
+def prepare_native_continuation_request(turn_state, call_output, *, timeout):
+    """Build the PreparedStreamRequest for one native computer continuation Step.
+
+    Task 11b（设计 11.3）：原生电脑操控活动 continuation 的下一 Step 不重发
+    完整消息历史——input 只有 computer_call_output，model/tools/instructions/
+    options 经 turn_state 字节级重发，previous_response_id 指向上一响应。
+    协议形状由 core.computer.provider_openai.build_continuation_request 构造
+    （协议层职责），本函数只负责把 timeout 按当前 Step 注入并包装成与
+    prepare_stream_request 同一的请求准备接缝，使 RequestEnvelope.capture
+    记录续传请求的真实最终字节。timeout 必须显式提供（与
+    prepare_stream_request 的必填语义一致）。
+    """
+    from core.computer.provider_openai import build_continuation_request
+
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("native continuation request requires a numeric timeout")
+    provider_kwargs = build_continuation_request(turn_state, call_output)
+    provider_kwargs["timeout"] = timeout
+    return PreparedStreamRequest(protocol="responses", kwargs=provider_kwargs)
 
 
 def _json_bytes(value) -> bytes:

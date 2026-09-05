@@ -31,6 +31,12 @@ pyfiglet_datas, pyfiglet_binaries, pyfiglet_hiddenimports = collect_all('pyfigle
 # 否则打包后会报 "Unknown encoding cl100k_base. Plugins found: []"。
 tiktoken_ext_datas, tiktoken_ext_binaries, tiktoken_ext_hiddenimports = collect_all('tiktoken_ext')
 
+# Playwright（电脑操控，Task 16 / 设计 23.1）：collect_all 收集 Python 子模块、
+# node driver 脚本与所需二进制资源。运行时只使用系统 Edge/Chrome channel
+# （channel="msedge"/"chrome"），绝不下载或打包 Playwright 的 .local-browsers
+# 浏览器缓存（Chromium/Firefox/WebKit 均不在 wheel 内，collect_all 不会带入）。
+playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all('playwright')
+
 # CLI 与 GUI 都会用到的数据文件：默认配置模板、系统提示词模板、内置 ripgrep
 # （core.tools 的 search_code 工具依赖，两个入口共享同一套工具注册表）、前端
 # 编译产物（GUI 加载的静态资源；CLI 虽然用不到，但沿用原 spec 已生效的打包
@@ -57,11 +63,11 @@ common_datas = [
     ('assets/ycode.ico', 'assets'),
     # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）
     ('assets/CHANGELOG.md', 'assets'),
-] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas
+] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas + playwright_datas
 
-common_binaries = litellm_binaries + tiktoken_ext_binaries
+common_binaries = litellm_binaries + tiktoken_ext_binaries + playwright_binaries
 
-common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken_ext_hiddenimports + [
+common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken_ext_hiddenimports + playwright_hiddenimports + [
     # core.hunyuan_image 只被内置插件 plugins/hunyuan_image 在运行时动态 import，
     # PyInstaller 静态分析不可达，必须显式声明，否则打包后插件调用直接
     # ModuleNotFoundError。
