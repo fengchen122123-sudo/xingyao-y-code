@@ -8,6 +8,8 @@ ComputerControlError("computer_invalid_action", ...)，绝不通过删除字段�
 from collections.abc import Mapping
 from urllib.parse import urlsplit
 
+import hashlib
+
 from core.computer.models import (
     ComputerAction,
     ComputerControlError,
@@ -270,6 +272,44 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
         kwargs["reason_code"] = reason_code
 
     return ComputerAction(**kwargs)
+
+
+def sanitized_action_summary(action: ComputerAction) -> dict:
+    """统一动作 → 脱敏摘要（设计 22.4，Task 16 隐私审计）。
+
+    输入正文/组合键/URL 只留 code point 数与 SHA-256；坐标、滚轮量、等待
+    时长等非敏感参数原样保留。generic 工具参数投影与 native 持久化投影
+    共用同一语义；投影是纯函数，同一动作两次构造完全一致。
+    """
+    summary: dict = {"kind": action.kind, "target": action.target}
+    if action.x is not None:
+        summary["x"] = action.x
+    if action.y is not None:
+        summary["y"] = action.y
+    if action.path:
+        summary["path_points"] = len(action.path)
+    if action.button and action.button != "left":
+        summary["button"] = action.button
+    if action.delta_x or action.delta_y:
+        summary["delta_x"] = action.delta_x
+        summary["delta_y"] = action.delta_y
+    if action.duration_ms is not None:
+        summary["duration_ms"] = action.duration_ms
+    if action.text is not None:
+        summary["text_code_points"] = len(action.text)
+        summary["text_sha256"] = hashlib.sha256(
+            action.text.encode("utf-8")
+        ).hexdigest()
+    if action.keys:
+        summary["keys_count"] = len(action.keys)
+        summary["keys_sha256"] = hashlib.sha256(
+            "+".join(action.keys).encode("utf-8")
+        ).hexdigest()
+    if action.url:
+        summary["url_sha256"] = hashlib.sha256(
+            action.url.encode("utf-8")
+        ).hexdigest()
+    return summary
 
 
 def observation_provider_projection(observation: ComputerObservation) -> dict:

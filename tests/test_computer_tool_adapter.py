@@ -312,14 +312,17 @@ def test_missing_png_returns_error_without_stale_image(fake_controller, context)
 
 
 def test_forged_non_computer_name_stays_on_normal_resolution_path(context):
-    message = _computer_pipeline().execute_one(
-        _call("computer_select_target"), context
-    )
+    # Task 11a 起 computer_select_target 由固定 adapter 拦截（无原生双 target
+    # 上下文时返回 computer_disabled，见 test_computer_provider_openai 的
+    # test_selector_without_selection_context_fails）；本测试的意图是"非保留名
+    # 走普通解析路径"，故改用真正非保留的伪造名。
+    forged = "computer_select_browser"
+    message = _computer_pipeline().execute_one(_call(forged), context)
     assert message == {
         "role": "tool",
         "tool_call_id": "call-1",
-        "name": "computer_select_target",
-        "content": "🚨 未找到名为 computer_select_target 的工具！",
+        "name": forged,
+        "content": f"🚨 未找到名为 {forged} 的工具！",
     }
 
 

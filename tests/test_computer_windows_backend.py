@@ -507,6 +507,128 @@ def test_preflight_fails_when_dpi_awareness_cannot_be_confirmed():
     assert calls == ["dpi"]  # 顺序固定：DPI 失败后不再触碰 desktop
 
 
+# ---------------------------------------------------------------------------
+# _ctypes_ensure_dpi_awareness 降级语义（GUI 进程 System aware 放行）
+# ---------------------------------------------------------------------------
+
+
+_DPI_CONTEXT_VALUES = {"unaware": -1, "system": -2, "pmv1": -3, "pmv2": -4}
+
+
+def _dpi_user32(current: str, set_succeeds: bool):
+    """DPI fake：current 为当前感知模式；SetProcessDpiAwarenessContext 成功时
+    状态切换为 pmv2（模拟真实 API 的设置后生效语义）。"""
+    state = {"current": current}
+    set_calls = []
+
+    def get_thread_ctx(*_args):
+        return _DPI_CONTEXT_VALUES[state["current"]]
+
+    def contexts_equal(left, right, *_args):
+        # c_void_p(-4).value 是 64 位无符号补码（2^64-4）；归一化后再比较
+        def _norm(value):
+            value = getattr(value, "value", value)
+            if isinstance(value, int) and value < 0:
+                value += 1 << 64
+            return value
+
+        return bool(_norm(left) == _norm(right))
+
+    def set_ctx(pmv2, *_args):
+        value = getattr(pmv2, "value", pmv2)
+        if isinstance(value, int) and value < 0:
+            value += 1 << 64
+        set_calls.append(value)
+        if set_succeeds:
+            state["current"] = "pmv2"
+            return 1
+        return 0
+
+    return type(
+        "DpiUser32",
+        (),
+        {
+            "GetThreadDpiAwarenessContext": _FakeWin32Function(return_value=0),
+            "AreDpiAwarenessContextsEqual": _FakeWin32Function(return_value=0),
+            "SetProcessDpiAwarenessContext": _FakeWin32Function(return_value=0),
+        },
+    )(), {
+        "get": get_thread_ctx,
+        "equal": contexts_equal,
+        "set": set_ctx,
+        "state": state,
+        "set_calls": set_calls,
+    }
+
+
+def _dpi_fake_windll(monkeypatch, current, set_succeeds):
+    """安装 DPI fake 到 ctypes.windll；返回 (user32, helpers)。"""
+    import ctypes
+    from types import SimpleNamespace
+
+    from core.computer import win32_adapter
+
+    user32, helpers = _dpi_user32(current, set_succeeds)
+    # _FakeWin32Function 只支持固定返回值；DPI 需要真实比较逻辑，逐个替换实现
+    user32.GetThreadDpiAwarenessContext = _DpiFn(helpers["get"])
+    user32.AreDpiAwarenessContextsEqual = _DpiFn(helpers["equal"])
+    user32.SetProcessDpiAwarenessContext = _DpiFn(helpers["set"])
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=user32))
+    return user32, helpers
+
+
+class _DpiFn:
+    """可比较/可配置实现的 user32 函数替身（支持 restype/argtypes 赋值）。"""
+
+    def __init__(self, impl):
+        self.restype = None
+        self.argtypes = None
+        self._impl = impl
+
+    def __call__(self, *args, **kwargs):
+        return self._impl(*args, **kwargs)
+
+
+def test_dpi_ensure_accepts_pmv2_without_set_call(monkeypatch):
+    """已是 PMv2：只验证不设置（Set 不得被调用）。"""
+    from core.computer import win32_adapter
+
+    _, helpers = _dpi_fake_windll(monkeypatch, "pmv2", set_succeeds=False)
+    assert win32_adapter._ctypes_ensure_dpi_awareness() is True
+    assert helpers["set_calls"] == []
+
+
+def test_dpi_ensure_sets_pmv2_from_unaware_when_allowed(monkeypatch):
+    """UNAWARE 且允许设置：切换到 PMv2 并验证通过（CLI 独立进程路径）。"""
+    from core.computer import win32_adapter
+
+    _, helpers = _dpi_fake_windll(monkeypatch, "unaware", set_succeeds=True)
+    assert win32_adapter._ctypes_ensure_dpi_awareness() is True
+    assert helpers["set_calls"] == [(1 << 64) - 4]  # 只尝试 PMv2（64 位补码）
+
+
+def test_dpi_ensure_accepts_system_aware_when_set_is_locked(monkeypatch):
+    """GUI 场景（pywebview WinForms 启动即 SetProcessDPIAware 锁死进程）：
+    SetProcessDpiAwarenessContext 失败但当前已是 System DPI aware 时放行——
+    System aware 下桌面坐标系（GetSystemMetrics/截图 DC/SendInput 归一化）
+    全部为物理像素，操控链路自洽（2026-09-05 修复，用户 GUI 开关死锁）。"""
+    from core.computer import win32_adapter
+
+    _, helpers = _dpi_fake_windll(monkeypatch, "system", set_succeeds=False)
+    assert win32_adapter._ctypes_ensure_dpi_awareness() is True
+    assert helpers["set_calls"] == [(1 << 64) - 4]  # 尝试升级 PMv2 失败后按 System aware 放行
+
+
+@pytest.mark.parametrize("current", ["unaware", "pmv1"])
+def test_dpi_ensure_rejects_other_states_when_set_is_locked(monkeypatch, current):
+    """设置失败且非 PMv2/System（UNAWARE 会被 DPI 虚拟化、PMv1 语义陈旧）：
+    必须拒绝（fail-closed 保持）。"""
+    from core.computer import win32_adapter
+
+    _, _helpers = _dpi_fake_windll(monkeypatch, current, set_succeeds=False)
+    assert win32_adapter._ctypes_ensure_dpi_awareness() is False
+
+
 def test_preflight_fails_without_interactive_input_desktop():
     adapter = Win32InputAdapter(
         ensure_dpi_awareness=lambda: True,
@@ -574,3 +696,70 @@ def test_backend_start_runs_adapter_preflight(tmp_path):
         backend.start()
     assert raised.value.code == "computer_secure_desktop"
     assert adapter.preflight_calls == 1
+
+
+# ---------------------------------------------------------------------------
+# Task 16：64 位句柄截断防护（OpenInputDesktop / GetForegroundWindow restype）
+# ---------------------------------------------------------------------------
+
+
+class _FakeWin32Function:
+    """记录 restype/argtypes 声明的 ctypes 函数替身。"""
+
+    def __init__(self, return_value=0):
+        self.restype = None
+        self.argtypes = None
+        self._return_value = return_value
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self._return_value
+
+
+def _fake_windll(monkeypatch, user32):
+    """把 ctypes.windll 换成只暴露 user32 fake 的替身（绝不触碰真实 OS）。"""
+    import ctypes
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(ctypes, "windll", SimpleNamespace(user32=user32))
+
+
+def test_input_desktop_name_declares_pointer_restype(monkeypatch):
+    """OpenInputDesktop 必须声明 c_void_p restype：默认 c_int 会把 64 位
+    HDESK 截断成 32 位，CloseDesktop 拿到无效句柄（Task 16 修复）。"""
+    import ctypes
+
+    from core.computer import win32_adapter
+
+    user32 = type(
+        "User32",
+        (),
+        {
+            "OpenInputDesktop": _FakeWin32Function(return_value=0),
+            "GetUserObjectInformationW": _FakeWin32Function(return_value=0),
+            "CloseDesktop": _FakeWin32Function(return_value=0),
+        },
+    )()
+    _fake_windll(monkeypatch, user32)
+
+    assert win32_adapter._ctypes_input_desktop_name() is None  # NULL 句柄
+    assert user32.OpenInputDesktop.restype == ctypes.c_void_p
+    assert user32.CloseDesktop.argtypes == [ctypes.c_void_p]
+
+
+def test_foreground_window_declares_pointer_restype(monkeypatch):
+    """GetForegroundWindow 必须声明 c_void_p restype：64 位 HWND 不得截断。"""
+    import ctypes
+
+    from core.computer import win32_adapter
+
+    user32 = type(
+        "User32",
+        (),
+        {"GetForegroundWindow": _FakeWin32Function(return_value=0x1AB2CD3EF456)},
+    )()
+    _fake_windll(monkeypatch, user32)
+
+    assert win32_adapter._ctypes_foreground_window() == 0x1AB2CD3EF456  # 64 位不截断
+    assert user32.GetForegroundWindow.restype == ctypes.c_void_p

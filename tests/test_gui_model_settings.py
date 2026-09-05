@@ -198,3 +198,218 @@ def test_get_initial_state_includes_secondary_model_fields(tmp_path, monkeypatch
     }
     assert state["system_settings"]["command_shell"] == "auto"
     assert state["system_settings"]["command_shell_available"] is True
+
+
+# ---------------------------------------------------------------------------
+# 模型能力字段（Task 12：supports_function_calling / computer_protocol）
+# ---------------------------------------------------------------------------
+
+
+def test_model_settings_snapshot_includes_capability_fields(tmp_path, monkeypatch):
+    data = _configured_data()
+    data["providers"][0]["models"][0]["supports_function_calling"] = True
+    data["providers"][0]["models"][0]["computer_protocol"] = "generic"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+
+    snapshot = _bare_bridge().get_model_settings()
+
+    model = snapshot["models"][0]
+    assert model["supports_function_calling"] is True
+    assert model["computer_protocol"] == "generic"
+    provider_model = snapshot["providers"][0]["models"][0]
+    assert provider_model["supports_function_calling"] is True
+    assert provider_model["computer_protocol"] == "generic"
+
+
+def test_legacy_model_defaults_to_auto_protocol(tmp_path, monkeypatch):
+    """旧模型配置（缺 supports_function_calling 与 computer_protocol 键）：
+    展示层 fc 缺省 false、协议缺省 ""（自动）。由于 fc 为 false，自动判定
+    不会赋予电脑操控资格（设计 9.1 的能力门槛不变，只是协议不再误导性显示
+    为显式关闭）。"""
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+
+    snapshot = _bare_bridge().get_model_settings()
+
+    assert snapshot["models"][0]["supports_function_calling"] is False
+    assert snapshot["models"][0]["computer_protocol"] == ""
+
+
+def test_add_and_update_model_persist_capability_fields(tmp_path, monkeypatch):
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+
+    added = bridge.add_model("p1", "model-two", 300000, True, True, "generic")
+    assert added["ok"] is True
+    added_model = next(
+        model for provider in added["settings"]["providers"]
+        for model in provider["models"] if model["id"] == added["model_id"]
+    )
+    assert added_model["supports_function_calling"] is True
+    assert added_model["computer_protocol"] == "generic"
+
+    updated = bridge.update_model(
+        "p1", added["model_id"], "model-two-v2", 400000, True, True, "generic"
+    )
+    assert updated["ok"] is True
+    updated_model = next(
+        model for provider in updated["settings"]["providers"]
+        for model in provider["models"] if model["id"] == added["model_id"]
+    )
+    assert updated_model["computer_protocol"] == "generic"
+
+    cleared = bridge.update_model(
+        "p1", added["model_id"], "model-two-v2", 400000, True, False, "none"
+    )
+    assert cleared["ok"] is True
+    cleared_model = next(
+        model for provider in cleared["settings"]["providers"]
+        for model in provider["models"] if model["id"] == added["model_id"]
+    )
+    assert cleared_model["supports_function_calling"] is False
+    assert cleared_model["computer_protocol"] == "none"
+    stored = json.loads(cfg.read_text(encoding="utf-8"))
+    stored_model = next(
+        model for provider in stored["providers"]
+        for model in provider["models"] if model["id"] == added["model_id"]
+    )
+    assert stored_model["computer_protocol"] == "none"
+
+
+def test_generic_protocol_requires_vision_and_function_calling(tmp_path, monkeypatch):
+    """model generic 的三字段校验：generic 但视觉未开 → 后端拒绝保存且不落盘。"""
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+
+    result = bridge.update_model("p1", "m1", "model-one", 200000, False, True, "generic")
+
+    assert result["ok"] is False
+    assert result["msg"] == (
+        "computer_protocol=generic 要求同时声明 supports_vision 与 supports_function_calling"
+    )
+    stored = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "computer_protocol" not in stored["providers"][0]["models"][0]
+    assert "supports_function_calling" not in stored["providers"][0]["models"][0]
+
+
+def test_add_model_rejects_generic_without_required_capabilities(tmp_path, monkeypatch):
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+
+    result = bridge.add_model("p1", "model-bad", 100000, False, True, "generic")
+
+    assert result["ok"] is False
+    assert "computer_protocol=generic" in result["msg"]
+    stored_names = [
+        model["name"]
+        for provider in json.loads(cfg.read_text(encoding="utf-8"))["providers"]
+        for model in provider["models"]
+    ]
+    assert "model-bad" not in stored_names
+
+
+# ---------------- 缺省协议自动判定（自动激活视觉模型） ----------------
+
+
+def test_add_model_default_protocol_stays_unset_for_auto(tmp_path, monkeypatch):
+    """add_model 缺省/传空：不落 computer_protocol 键，由能力元数据自动判定。
+
+    用户裁决（2026-09-05）：新添加的视觉+工具调用模型无需逐个配置协议，
+    开关开启后即可电脑操控。旧实现把缺省强转为 "none"（显式关闭）导致
+    新模型永不自动激活——本测试钉死修复。
+    """
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+
+    added = bridge.add_model("p1", "model-auto", 200000, True, True)
+    assert added["ok"] is True
+    stored_model = next(
+        model
+        for provider in json.loads(cfg.read_text(encoding="utf-8"))["providers"]
+        for model in provider["models"]
+        if model["id"] == added["model_id"]
+    )
+    assert "computer_protocol" not in stored_model
+
+    # 能力解析：视觉+工具调用双勾 ⇒ 自动 generic 启用
+    # （enabled_settings 是 pytest fixture 不能直接调用，此处内联构造同等快照）
+    from core.computer.capability import resolve_computer_capability
+    from core.computer.settings import ComputerSettingsSnapshot
+    from tests.computer_fakes import openai_compatible_provider
+
+    capability = resolve_computer_capability(
+        stored_model,
+        openai_compatible_provider(),
+        ComputerSettingsSnapshot(
+            browser_control_enabled=True,
+            computer_control_enabled=True,
+            computer_browser="edge",
+            browser_options=(),
+            profile_display_path="",
+            platform_supported=True,
+            generation=1,
+        ),
+        "local",
+    )
+    assert capability.enabled is True
+    assert capability.protocol == "generic"
+
+
+def test_add_model_empty_string_protocol_means_auto(tmp_path, monkeypatch):
+    """前端「自动」选项传 ""：同样不落键（与缺省一致），不得强转为 "none"。"""
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+
+    added = bridge.add_model("p1", "model-auto2", 200000, True, True, "")
+    assert added["ok"] is True
+    stored_model = next(
+        model
+        for provider in json.loads(cfg.read_text(encoding="utf-8"))["providers"]
+        for model in provider["models"]
+        if model["id"] == added["model_id"]
+    )
+    assert "computer_protocol" not in stored_model
+
+
+def test_update_model_empty_string_protocol_clears_to_auto(tmp_path, monkeypatch):
+    """update_model 传 ""：把已存的显式协议清回自动（删除键）；None 仍表示保留。"""
+    cfg = _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+
+    added = bridge.add_model("p1", "model-flip", 200000, True, True, "generic")
+    assert added["ok"] is True
+
+    cleared = bridge.update_model(
+        "p1", added["model_id"], "model-flip", 200000, True, True, ""
+    )
+    assert cleared["ok"] is True
+    stored_model = next(
+        model
+        for provider in json.loads(cfg.read_text(encoding="utf-8"))["providers"]
+        for model in provider["models"]
+        if model["id"] == added["model_id"]
+    )
+    assert "computer_protocol" not in stored_model
+
+    # None = 保留既有值（不触碰）
+    kept = bridge.update_model(
+        "p1", added["model_id"], "model-flip", 200000, True, True, None
+    )
+    assert kept["ok"] is True
+    stored_model = next(
+        model
+        for provider in json.loads(cfg.read_text(encoding="utf-8"))["providers"]
+        for model in provider["models"]
+        if model["id"] == added["model_id"]
+    )
+    assert "computer_protocol" not in stored_model
+
+
+def test_all_models_reports_unset_protocol_as_empty_string(tmp_path, monkeypatch):
+    """展示层（_all_models）：缺键模型的 computer_protocol 返回 ""（自动），
+    前端编辑表单据此回填「自动」选项，而非误导性的 "none"。"""
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+
+    models = bridge.get_model_settings()["models"]
+    model_one = next(model for model in models if model["name"] == "model-one")
+    assert model_one["computer_protocol"] == ""

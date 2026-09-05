@@ -17,6 +17,11 @@ start/observe/execute/release_inputs/close 调用计数与线程，支持注入�
 Task 9 补充 FakeController（ComputerControlService 最小 fake：固定 run/owner、
 记录动作、按序注入观察或错误、snapshot 暴露 action_count，供固定适配器测试；
 绝不触碰真实键鼠/浏览器/截屏）。
+Task 13a 补充 FakeBridgeController（ComputerControlService 的 GUI Bridge fake：
+listener 注册/事件发射 + start_run(run_id=)/pause/resume/stop 透传记录与
+run_id 拒绝语义，供 Bridge 事件桥与控制 API 测试；绝不触碰真实键鼠/浏览器/截屏）。
+Task 16 给 FakeComputerBackend 增补 png_path（观察携带的虚拟截图路径，不读
+真实文件，供预览发布接线与隐私审计测试）。
 其余请求捕获 helper 由后续 Task 按需在本文件扩展，禁止平行实现。
 """
 
@@ -577,12 +582,14 @@ class FakeComputerBackend:
     - ``observe_error`` / ``execute_error`` / ``close_error`` 注入失败；
     - ``execute_gate``（threading.Event）：设置后 execute 阻塞等待，用于
       验证 controller 的 action_lock 串行语义；
-    - ``release_count`` / ``close_count`` 计数，验证幂等停止只释放一次。
+    - ``release_count`` / ``close_count`` 计数，验证幂等停止只释放一次；
+    - ``png_path``（Task 16）：观察携带的虚拟截图路径（不读真实文件），
+      供 controller 预览发布等接线测试使用。
     """
 
     def __init__(self, target="browser", *, screen_hashes=(), fingerprint="fake-surface",
                  observe_error=None, execute_error=None, close_error=None,
-                 execute_gate=None):
+                 execute_gate=None, png_path=""):
         self.target = target
         self.start_calls = 0
         self.execute_calls = []
@@ -596,6 +603,7 @@ class FakeComputerBackend:
         self.execute_error = execute_error
         self.close_error = close_error
         self.execute_gate = execute_gate
+        self.png_path = png_path
         self.closed = False
         self._screen_hashes = list(screen_hashes)
         self._last_hash = f"sha-{target}-0"
@@ -625,7 +633,8 @@ class FakeComputerBackend:
         if error is not None:
             raise error
         fields = {"run_id": run_id, "target": self.target, "action": "observe",
-                  "screen_sha256": sha, "width": 1280, "height": 720}
+                  "screen_sha256": sha, "width": 1280, "height": 720,
+                  "png_path": self.png_path}
         if self.target == "browser":
             fields["page_origin"] = "https://fake.example"
             fields["page_title"] = fingerprint
@@ -664,6 +673,149 @@ class FakeComputerBackend:
             self.closed = True
         if self.close_error is not None:
             raise self.close_error
+
+
+# ---------------- Task 13a 导出：GUI Bridge 电脑操控 Controller fake ----------------
+
+
+class FakeBridgeController:
+    """ComputerControlService 的 GUI Bridge fake（Task 13a 事件桥与控制 API）。
+
+    - ``add_listener``/``remove_listener`` 镜像真实 controller（listener 异常
+      吞掉留痕）；``listener_count`` 暴露当前注册数，供“桥接建立一次”断言；
+    - ``emit_state``/``emit_action_started``/``emit_action_finished``/
+      ``emit_observation`` 按真实事件形状（type/run_id/event_seq + 各自字段）
+      发给已注册 listener；``emit_observation`` 的 run_id/event_seq 可覆盖
+      （Task 13a brief 样例逐字使用）；
+    - ``start_run(run_id=...)`` 建立活动 run；pause/resume/stop 记录透传调用
+      并发出 computer_state 事件；run_id 与当前活动 run 不匹配抛
+      computer_invalid_state（旧 UI 事件的 run id 拒绝语义，镜像
+      _require_active_run_locked）；
+    - ``snapshot()`` 返回真实 ComputerRunSnapshot（终态保留 run_id，
+      镜像 _last_snapshot 语义）；
+    - 绝不触碰真实键鼠、浏览器或截屏。
+    """
+
+    def __init__(self):
+        self._listeners = []
+        self.run_id = ""
+        self.status = "idle"
+        self.action_count = 0
+        self.pause_calls = []
+        self.resume_calls = []
+        self.stop_calls = []
+
+    @property
+    def listener_count(self):
+        return len(self._listeners)
+
+    def add_listener(self, listener):
+        if listener not in self._listeners:
+            self._listeners.append(listener)
+
+    def remove_listener(self, listener):
+        try:
+            self._listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def _emit(self, event):
+        for listener in list(self._listeners):
+            try:
+                listener(event)
+            except Exception:
+                pass  # 镜像真实 controller：listener 异常只留痕不传播
+
+    def emit_state(self, run_id="run-a", event_seq=1, status="running", reason=""):
+        self._emit({
+            "type": "computer_state",
+            "run_id": run_id,
+            "event_seq": event_seq,
+            "status": status,
+            "target": "browser",
+            "reason": reason,
+        })
+
+    def emit_action_started(self, run_id="run-a", event_seq=1, action_ordinal=1,
+                            kind="click"):
+        self._emit({
+            "type": "computer_action_started",
+            "run_id": run_id,
+            "event_seq": event_seq,
+            "action_ordinal": action_ordinal,
+            "action_kind": kind,
+            "target": "browser",
+        })
+
+    def emit_action_finished(self, run_id="run-a", event_seq=1, action_ordinal=1,
+                             kind="click", ok=True, error_code=""):
+        self._emit({
+            "type": "computer_action_finished",
+            "run_id": run_id,
+            "event_seq": event_seq,
+            "action_ordinal": action_ordinal,
+            "action_kind": kind,
+            "ok": ok,
+            "error_code": error_code,
+        })
+
+    def emit_observation(self, run_id="run-a", event_seq=1, action_ordinal=1,
+                         screen_sha256="sha-fake-1",
+                         preview_url="/computer-preview/tok/1.png"):
+        self._emit({
+            "type": "computer_observation",
+            "run_id": run_id,
+            "event_seq": event_seq,
+            "action_ordinal": action_ordinal,
+            "target": "browser",
+            "screen_sha256": screen_sha256,
+            "width": 1280,
+            "height": 720,
+            "origin_or_window": "https://fake.example",
+            "preview_url": preview_url,
+        })
+
+    def start_run(self, run_id="run-a"):
+        self.run_id = run_id
+        self.status = "running"
+        self.action_count = 0
+        self.emit_state(run_id=run_id, event_seq=1, status="running", reason="start")
+        return self.snapshot()
+
+    def _require_active_run(self, run_id):
+        if not self.run_id or run_id != self.run_id:
+            raise ComputerControlError(
+                "computer_invalid_state", f"未知的电脑操控 run：{run_id}"
+            )
+
+    def pause(self, run_id, reason):
+        self._require_active_run(run_id)
+        self.pause_calls.append((run_id, reason))
+        self.status = "paused"
+        self.emit_state(run_id=run_id, event_seq=2, status="paused", reason=reason)
+        return self.snapshot()
+
+    def resume(self, run_id):
+        self._require_active_run(run_id)
+        self.resume_calls.append(run_id)
+        self.status = "running"
+        self.emit_state(run_id=run_id, event_seq=3, status="running", reason="resume")
+        return self.snapshot()
+
+    def stop(self, run_id, reason):
+        self._require_active_run(run_id)
+        self.stop_calls.append((run_id, reason))
+        self.status = "stopped"
+        self.emit_state(run_id=run_id, event_seq=4, status="stopped", reason=reason)
+        return self.snapshot()
+
+    def snapshot(self):
+        return ComputerRunSnapshot(
+            run_id=self.run_id,
+            status=self.status,
+            target="browser" if self.run_id else "",
+            action_count=self.action_count,
+        )
 
 
 # ---------------- Task 9 导出：固定适配器 Controller fake ----------------

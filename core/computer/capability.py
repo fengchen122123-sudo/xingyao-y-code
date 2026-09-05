@@ -89,6 +89,26 @@ def resolve_computer_capability(
         return _rejected(settings, "computer_disabled", "电脑操控未开启")
 
     protocol = model.get("computer_protocol")
+    if protocol in (None, ""):
+        # 缺省协议自动判定（用户裁决 2026-09-05）：视觉+工具调用双勾的模型
+        # 无需逐个配置 computer_protocol 即自动按 generic 启用；仍只从显式
+        # 能力元数据推导，绝不按模型名猜测。
+        if (
+            model.get("supports_vision") is True
+            and model.get("supports_function_calling") is True
+        ):
+            return ComputerCapability(
+                enabled=True,
+                protocol=ComputerProtocol.GENERIC.value,
+                targets=tuple(targets),
+                browser=settings.computer_browser,
+                settings_generation=settings.generation,
+            )
+        return _rejected(
+            settings,
+            "computer_model_not_capable",
+            "模型未声明视觉与工具调用能力（电脑操控要求两者齐备）",
+        )
     if protocol == ComputerProtocol.GENERIC.value:
         if (
             model.get("supports_vision") is not True

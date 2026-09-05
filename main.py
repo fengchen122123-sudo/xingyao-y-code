@@ -101,6 +101,8 @@ from core.ui_markers import ANSI_GRAY, ANSI_RESET, plan_color, plan_html_color, 
 from core.plan import bind_default_plan_session, get_default_plan_manager
 from core.model_manager import get_active_model
 from core.version import __version__ as YCODE_VERSION
+# 电脑操控 CLI 运行控制（Task 14）：cli 模块只依赖纯模型层，import 无副作用
+from core.computer.cli import ComputerCliEvent
 # 警告：from-import 会在 import 时冻结常量值。新增调用方禁止 from-import 这些常量，
 # 应 import config 后动态读取（如 config.MY_MODEL），以便配置热更新生效。
 # config.py 已通过模块级 __getattr__ 动态解析 MY_* 常量，必须走模块属性访问。
@@ -742,10 +744,137 @@ def _reset_turn_state():
         app_instance.invalidate()
 
 
+def _stop_active_computer_run_for_cancel() -> None:
+    """Ctrl+C 先停止活动电脑操控 run，再走 Turn 级取消（Task 14）。
+
+    controller.stop(run_id, "cli_ctrl_c") 内部按固定顺序触发 owner cancel
+    与 Provider 在飞流中断；无活动 run 时是空操作。Task 14 审查裁决④：
+    与 Bridge 的 _stop_computer_runs_for_disabled_switch 对齐加兜底
+    except——取消路径绝不因电脑操控清理异常而中断 Turn 级取消。
+    """
+    try:
+        from core.computer.cli import stop_active_run_for_cancel
+        from core.computer.controller import get_computer_control_service
+
+        stop_active_run_for_cancel(get_computer_control_service())
+    except Exception:
+        logging.getLogger("main.computer").exception(
+            "Ctrl+C 停止活动电脑操控 run 失败（已忽略，继续 Turn 级取消）"
+        )
+
+
+def _computer_status_bar_segment() -> str:
+    """CLI 底部状态栏的电脑操控段（设计 17.2，Task 14 审查裁决①）。
+
+    活动 run 时为 ``电脑操控: 运行中 · Edge · N 步``；否则空串（状态栏
+    布局不变）。读取失败一律返回空串——状态栏渲染绝不因电脑操控异常抖动。
+    """
+    try:
+        from core.computer.cli import render_computer_status_bar
+        from core.computer.controller import get_computer_control_service
+
+        return render_computer_status_bar(get_computer_control_service().snapshot())
+    except Exception:
+        return ""
+
+
+def _startup_computer_runtime_for_cli() -> None:
+    """启动轻量电脑操控运行时（Task 16）：开关开启时注册全局紧急停止热键。
+
+    默认关闭路径零额外导入（不触碰 Playwright/浏览器/截图）；失败只留痕。
+    """
+    try:
+        from core.computer.runtime import start_computer_runtime
+
+        start_computer_runtime()
+    except Exception:
+        logging.getLogger("main.computer").exception(
+            "启动电脑操控运行时失败（已忽略）"
+        )
+
+
+def _shutdown_computer_runtime_for_cli() -> None:
+    """CLI 退出统一收尾（Task 16）：controller（活动 run+retained）→ preview → hotkey。"""
+    try:
+        from core.computer.runtime import shutdown_process_computer_runtime
+
+        shutdown_process_computer_runtime("cli_exit")
+    except Exception:
+        logging.getLogger("main.computer").exception(
+            "CLI 退出时关闭电脑操控运行时失败（已忽略）"
+        )
+
+
+def _require_interactive_console() -> None:
+    """交互式 CLI 前置检查：stdin/stdout 必须是真实终端（TTY），否则快速失败。
+
+    管道/重定向运行（如 ycode | tee、CI、IDE 非终端任务）下 prompt_toolkit
+    的 Win32Output 拿不到控制台句柄，首绘 print_logo 即抛
+    NoConsoleScreenBufferError 裸 traceback 退出；此处 fail-fast 并引导
+    headless 模式（-p）。GUI（gui_main）与 headless 路径不受影响。
+    """
+    stdout_tty = sys.stdout.isatty()
+    stdin_tty = sys.stdin.isatty()
+    if stdout_tty and stdin_tty:
+        return
+    missing = "与".join(
+        name
+        for name, tty in (("标准输出", stdout_tty), ("标准输入", stdin_tty))
+        if not tty
+    )
+    print(
+        f"无法启动交互式界面：检测到{missing}不是终端（TTY），"
+        "当前可能通过管道或重定向运行。",
+        file=sys.stderr,
+    )
+    print("如需在脚本/管道中执行一次性任务，请改用 headless 模式：", file=sys.stderr)
+    print('  ycode -p "你的任务"', file=sys.stderr)
+    print('  echo "问题" | ycode --prompt -', file=sys.stderr)
+    raise SystemExit(2)
+
+
+# 斜杠命令输入补全表（Task 14 审查裁决③：补 /computer；从 _make_input_app
+# 提取到模块层供测试断言，SlashCommandCompleter 经局部别名引用不变）。
+COMMAND_COMPLETIONS = [
+    ("/help", "查看系统指令说明"),
+    ("/session", "切换或创建新的记忆会话"),
+    ("/new", "创建并切换到全新会话"),
+    ("/models", "打开模型管理器"),
+    ("/effort", "切换当前模型推理强度 (low/high/max/default)"),
+    ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
+    ("/tasks", "查看或托管后台长周期进程"),
+    ("/plan", "查看或控制当前任务计划"),
+    ("/undo", "撤销星瑶上一次修改的代码"),
+    ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
+    ("/share", "导出会话为 Markdown/HTML/JSON"),
+    ("/diagram", "打开/列出星瑶生成的 Mermaid 流程图网页 (open 序号/list)"),
+    ("/compress", "手动触发会话记忆压缩 (force 强制保留更少条)"),
+    ("/remember", "手动追加一条规则/偏好/事实到记忆日志"),
+    ("/dream", "后台触发梦境总结，提炼归纳记忆日志"),
+    ("/memory", "查阅长期记忆索引 (MEMORY.md) 内容"),
+    ("/worktree", "Git worktree 管理 (list/create/remove)"),
+    ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
+    ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
+    ("/skills", "查看或安装/开启/禁用技能插件"),
+    ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
+    ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
+    ("/turns", "设置单任务最大模型轮次 (10-1000)"),
+    ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
+    ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
+    ("/computer", "电脑操控运行控制 (status/pause/resume/stop)"),
+    ("/clear", "清理当前屏幕"),
+    ("/exit", "退出 Y-code"),
+]
+
+
 def _cancel_active_turn() -> None:
     from core.tools import subagent_manager
     from core.task_scheduler import get_default_scheduler
     from core.plan import suppress_plan_auto_continue
+
+    # Ctrl+C：先停止活动电脑操控 run（owner cancel + Provider 流中断在其
+    # 内部按固定顺序触发），再走 Turn 级取消收尾（Task 14）
+    _stop_active_computer_run_for_cancel()
 
     # 取消完全由每 turn 的 cancel_event 驱动（core.llm 已不再读取模块级 cancel_requested）
     if active_cancel_event is not None:
@@ -1058,6 +1187,13 @@ def _render_ui_event(event):
     global active_thinking_text, active_thinking_turn_id, _active_tool_status
     global _thinking_panel_linger
     global _last_printed_plan_state
+    if isinstance(event, ComputerCliEvent):
+        # 电脑操控动作摘要（Task 14）：listener 在 worker 线程只入队，
+        # 这里在 UI 线程单行打印已脱敏的纯文本
+        text = str(event.payload.get("text", ""))
+        if text:
+            _print_ui_fragment(f"{text}\n")
+        return
     renderer = ui_renderers.get(event.turn_id)
     if renderer is None:
         # 简短模式：只显示"星瑶正在干活"汇总行 + 收尾统计行，不显示具体工具调用细节。
@@ -1611,6 +1747,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;任务ID&gt;</ansicyan>              : 查看任务最新 30 行日志 (子代理任务显示运行状态)"))
         print_formatted_text(HTML("  <ansicyan>/plan</ansicyan>                                : 查看当前任务计划与逐项状态"))
         print_formatted_text(HTML("  <ansicyan>/plan &lt;pause|resume|retry ID|cancel&gt;</ansicyan>       : 暂停、恢复、重试或取消计划"))
+        print_formatted_text(HTML("  <ansicyan>/computer &lt;status|pause|resume|stop&gt;</ansicyan>   : 电脑操控运行控制 (永久开关请在 GUI 系统设置页修改)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【5. KAIROS 长期记忆系统】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/remember &lt;内容&gt;</ansicyan>                     : 手动追加一条规则、偏好或事实到今日的记忆日志"))
@@ -2140,6 +2277,16 @@ def handle_slash_command(command_text):
                 print_formatted_text(HTML(f"<ansiyellow>⏹ 已取消 {count} 个未完成计划项。</ansiyellow>"))
             else:
                 print_formatted_text(HTML("<ansired>❌ 用法：/plan、/plan pause、/plan resume、/plan retry &lt;id&gt;、/plan cancel</ansired>"))
+
+    elif cmd == "/computer":
+        # 电脑操控运行控制（设计 17.1）：CLI 只 status/pause/resume/stop，
+        # 永久开关只能在 GUI 系统设置页修改（与 GUI 共用同一 controller 单例）
+        from core.computer.cli import handle_computer_command
+        from core.computer.controller import get_computer_control_service
+
+        result = handle_computer_command(command_text, get_computer_control_service())
+        color = "ansicyan" if result.ok else "ansiyellow"
+        print_formatted_text(HTML(f"<{color}>{_esc(result.text)}</{color}>"))
 
     elif cmd == "/undo":
         # 撤销的实际逻辑在 core/agent_service.undo_last_edit（与 GUI 共用），
@@ -2715,35 +2862,9 @@ def _make_input_app():
     └──────────────────────────────────────┘
      model · session · dir     快捷键提示
     """
-    COMMAND_COMPLETIONS = [
-        ("/help", "查看系统指令说明"),
-        ("/session", "切换或创建新的记忆会话"),
-        ("/new", "创建并切换到全新会话"),
-        ("/models", "打开模型管理器"),
-        ("/effort", "切换当前模型推理强度 (low/high/max/default)"),
-        ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
-        ("/tasks", "查看或托管后台长周期进程"),
-        ("/plan", "查看或控制当前任务计划"),
-        ("/undo", "撤销星瑶上一次修改的代码"),
-        ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
-        ("/share", "导出会话为 Markdown/HTML/JSON"),
-        ("/diagram", "打开/列出星瑶生成的 Mermaid 流程图网页 (open 序号/list)"),
-        ("/compress", "手动触发会话记忆压缩 (force 强制保留更少条)"),
-        ("/remember", "手动追加一条规则/偏好/事实到记忆日志"),
-        ("/dream", "后台触发梦境总结，提炼归纳记忆日志"),
-        ("/memory", "查阅长期记忆索引 (MEMORY.md) 内容"),
-        ("/worktree", "Git worktree 管理 (list/create/remove)"),
-        ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
-        ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
-        ("/skills", "查看或安装/开启/禁用技能插件"),
-        ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
-        ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
-        ("/turns", "设置单任务最大模型轮次 (10-1000)"),
-        ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
-        ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
-        ("/clear", "清理当前屏幕"),
-        ("/exit", "退出 Y-code"),
-    ]
+    # COMMAND_COMPLETIONS 已提取为模块级常量（Task 14 审查裁决③：补
+    # /computer；模块层定义供测试断言，SlashCommandCompleter 引用不变）。
+    command_completions = COMMAND_COMPLETIONS
 
     class SlashCommandCompleter(Completer):
         def get_completions(self, document, complete_event):
@@ -2752,7 +2873,7 @@ def _make_input_app():
             # 1. 尝试匹配斜杠命令
             if text.startswith('/'):
                 word = document.get_word_before_cursor(WORD=True)
-                for cmd, desc in COMMAND_COMPLETIONS:
+                for cmd, desc in command_completions:
                     if cmd.startswith(word):
                         yield Completion(
                             cmd, 
@@ -3117,7 +3238,9 @@ def _make_input_app():
             perm_label = " 完全访问 "
             perm_style = "class:status.permission_full"
 
-        return [
+        # 电脑操控段（设计 17.2，Task 14 审查裁决①）：活动 run 才显示
+        # 「电脑操控: 运行中 · Edge · N 步」，否则状态栏保持既有布局。
+        segments = [
             ("class:status.model",   f" {model_display} "),
             ("class:status.sep",     "  |  "),
             (perm_style,             perm_label),
@@ -3126,6 +3249,11 @@ def _make_input_app():
             ("class:status.sep",     "  |  "),
             (task_style,             task_info),
         ]
+        computer_segment = _computer_status_bar_segment()
+        if computer_segment:
+            segments.append(("class:status.sep", "  |  "))
+            segments.append(("class:status.token", f" {computer_segment} "))
+        return segments
 
     def get_activity_text():
         """渲染独立区域的执行中状态。"""
@@ -3924,6 +4052,10 @@ def run_cli():
     global app_instance, pending_action, current_session
     global current_model, current_key, current_url, current_ctx_win, current_model_name
 
+    # 交互式前置检查：非 TTY（管道/重定向）快速失败并引导 headless -p，
+    # 必须先于下方一切初始化副作用（模型选择器/后台线程/MCP 预热/首绘）
+    _require_interactive_console()
+
     # 运行时初始化副作用集中在入口执行（而非模块 import 时），保证 main.py 可被安全 import
     _app_ctx.set_ui_flavor("cli")
     bind_default_plan_session(current_session)
@@ -4124,6 +4256,19 @@ def run_cli():
 
     threading.Thread(target=_ui_refresher_loop, daemon=True).start()
 
+    # 电脑操控事件桥（Task 14）：controller listener 在 worker 线程触发，
+    # 只向现有 UI 事件队列投递（post_ui_event → schedule_ui 回 UI 线程），
+    # 由 _render_ui_event 打印一行脱敏摘要；绝不直接 print / 改 layout。
+    from core.computer.cli import make_cli_event_listener
+    from core.computer.controller import get_computer_control_service as _get_computer_service
+
+    _get_computer_service().add_listener(make_cli_event_listener(post_ui_event))
+
+    # 电脑操控运行时（Task 16，设计 23.2）：轻量容器——任一开关开启时注册
+    # 全局紧急停止热键；默认关闭路径零额外导入（不触碰 Playwright/浏览器/
+    # 截图）。CLI 不接预览发布器（无预览 UI）。
+    _startup_computer_runtime_for_cli()
+
     # 主循环：支持 /models 弹出选择器并重启主 App
     while True:
         pending_action = None
@@ -4317,8 +4462,16 @@ if __name__ == "__main__":
     args, _ = parser.parse_known_args()
 
     if args.prompt is not None:
-        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码
-        sys.exit(run_headless(prompt=args.prompt, session_name=args.session))
+        # Headless 模式：统一在此退出，方便测试/包装器捕获状态码；
+        # finally 统一关闭电脑操控运行时（Task 16：controller→preview→hotkey）
+        try:
+            exit_code = run_headless(prompt=args.prompt, session_name=args.session)
+        finally:
+            _shutdown_computer_runtime_for_cli()
+        sys.exit(exit_code)
     else:
-        # 交互式模式（默认）
-        run_cli()
+        # 交互式模式（默认）；finally 覆盖正常退出与异常退出两条路径
+        try:
+            run_cli()
+        finally:
+            _shutdown_computer_runtime_for_cli()
