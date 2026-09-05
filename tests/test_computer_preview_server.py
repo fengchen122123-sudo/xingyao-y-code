@@ -202,3 +202,63 @@ def test_publish_requires_started_server(tmp_path):
     server = ComputerPreviewServer(tmp_path)
     with pytest.raises(RuntimeError):
         server.publish("run-a", fake_png_bytes(1))
+
+
+# ---------------- token 比较加固（常量时间 + 非 ASCII 候选） ----------------
+
+
+def test_preview_server_compares_token_in_constant_time(tmp_path, monkeypatch):
+    """token 校验必须走 hmac.compare_digest（常量时间），而非 != 短路比较。
+
+    预览服务绑定 loopback，时序侧信道风险低，但 token 是唯一鉴权材料，
+    比较方式按加固基线钉死：用 spy 包裹 hmac.compare_digest 断言被调用。
+    """
+    import hmac as hmac_mod
+
+    calls = []
+    original = hmac_mod.compare_digest
+
+    def _spy(left, right):
+        calls.append((left, right))
+        return original(left, right)
+
+    monkeypatch.setattr(hmac_mod, "compare_digest", _spy)
+    server = ComputerPreviewServer(tmp_path)
+    server.start()
+    try:
+        url = server.publish("run-a", fake_png_bytes(1))
+        assert http_status(url.replace(server.token, "wrong-token")) == 404
+        assert http_status(url) == 200
+    finally:
+        server.stop()
+    assert (server.token, "wrong-token") in calls
+
+
+def test_preview_server_rejects_non_ascii_token_with_clean_404(tmp_path):
+    """原始非 ASCII 字节 token（请求行按 latin-1 解码后为非 ASCII str）必须干净 404。
+
+    hmac.compare_digest 对非 ASCII str 抛 TypeError（会变成 500/断连），
+    此测试钉住 isascii 前置守卫：坏 token 永远只表现为 404，不区分原因。
+    """
+    server = ComputerPreviewServer(tmp_path)
+    base = server.start()
+    port = int(base.rsplit(":", 1)[1])
+    try:
+        url = server.publish("run-a", fake_png_bytes(1))
+        assert http_status(url) == 200
+        request = (
+            b"GET /computer-preview/\xe4\xf6/run-a/1.png HTTP/1.0\r\n"
+            b"Host: 127.0.0.1\r\n\r\n"
+        )
+        with socket.create_connection(("127.0.0.1", port), timeout=10) as sock:
+            sock.sendall(request)
+            data = b""
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                data += chunk
+        first_line = data.split(b"\r\n", 1)[0]
+        assert b" 404 " in first_line
+    finally:
+        server.stop()

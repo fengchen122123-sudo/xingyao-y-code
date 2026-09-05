@@ -2,8 +2,8 @@
 
 This script is NEVER run by automated tests. It must only be executed by a
 human who explicitly allows a visible system browser window to open or a real
-desktop screenshot / mouse move. It does not download browsers and only
-navigates to about:blank.
+desktop screenshot / mouse move / click / typing. It does not download
+browsers and only navigates to about:blank.
 
 Modes:
 - --probe-browser edge|chrome: raw Playwright channel probe on about:blank.
@@ -12,13 +12,34 @@ Modes:
   summary (origin / truncated title / sha256), then close.
 - --desktop-observe: start the real WindowsComputerBackend (preflight +
   exactly one desktop screenshot, no input), print the redacted summary, close.
-- --desktop-input --confirm-real-input I_UNDERSTAND: additionally move the
-  real mouse once to the screenshot center. Missing or wrong confirmation
-  exits 2 without touching anything.
+- --desktop-input --confirm-real-input I_UNDERSTAND: perform exactly one
+  move + one click + one fixed harmless type in the visible test area.
+  Before EVERY step the script prints the redacted action it is about to
+  perform and waits for a single Enter; any other input aborts immediately.
+  The user must first open a non-sensitive test window (e.g. an empty editor
+  or blank page) in the foreground. Missing or wrong confirmation exits 2
+  without touching anything. release/stop is called after the test.
 """
 
 import argparse
 import sys
+
+# --desktop-input 固定敲入的无敏感测试文本（可见测试区域）。
+SMOKE_TYPE_TEXT = "ycode smoke"
+
+
+def _confirm_step(step_number: int, description: str) -> bool:
+    """单步确认：打印脱敏动作描述，等待单次 Enter；非空输入立即中止。"""
+    print(f"\n[步骤 {step_number}] 即将执行：{description}")
+    try:
+        answer = input("确认执行请按一次 Enter（输入其他内容并回车 = 立即中止）：")
+    except (EOFError, KeyboardInterrupt):
+        print("\n已中止：未获得单步确认。")
+        return False
+    if answer.strip() != "":
+        print("已中止：单步确认要求单次 Enter。")
+        return False
+    return True
 
 
 def probe_browser(browser: str) -> int:
@@ -101,13 +122,20 @@ def desktop_observe() -> int:
 
 
 def desktop_input(confirm: str | None) -> int:
-    """Real-input probe: moves the real mouse once; requires explicit confirmation."""
+    """Real-input probe: one move + one click + one fixed type in the visible
+    test area; every step requires a single Enter after a redacted preview."""
     if confirm != "I_UNDERSTAND":
         print(
-            "--desktop-input 会移动真实鼠标，必须显式附加 "
+            "--desktop-input 会移动/点击真实鼠标并敲入固定测试文本，必须显式附加 "
             "--confirm-real-input I_UNDERSTAND",
             file=sys.stderr,
         )
+        return 2
+    print(
+        "前置要求：请先打开一个无敏感数据的测试窗口（如空白记事本/空白页）\n"
+        "并保持在前台；后续 move/click 会作用于屏幕中心的可见测试区域。"
+    )
+    if not _confirm_step(0, "先截取一次桌面观察（只截图，不输入）"):
         return 2
     _repo_root_on_path()
     from core.computer.models import ComputerAction, ComputerControlError
@@ -118,15 +146,32 @@ def desktop_input(confirm: str | None) -> int:
         backend.start()
         try:
             observation = backend.observe("smoke-desktop-input")
-            backend.execute(
-                "smoke-desktop-input",
-                ComputerAction(
-                    kind="move",
-                    target="desktop",
-                    x=observation.width // 2,
-                    y=observation.height // 2,
+            center_x = observation.width // 2
+            center_y = observation.height // 2
+            steps = [
+                (
+                    1,
+                    f"移动鼠标到屏幕中心（截图坐标 {center_x}x{center_y}）",
+                    ComputerAction(kind="move", target="desktop", x=center_x, y=center_y),
                 ),
-            )
+                (
+                    2,
+                    "在屏幕中心点击一次（左键单击）",
+                    ComputerAction(kind="click", target="desktop", x=center_x, y=center_y),
+                ),
+                (
+                    3,
+                    f"敲入固定测试文本（长度 {len(SMOKE_TYPE_TEXT)} 字符，内容已脱敏）",
+                    ComputerAction(
+                        kind="type_text", target="desktop", text=SMOKE_TYPE_TEXT
+                    ),
+                ),
+            ]
+            for step_number, description, action in steps:
+                if not _confirm_step(step_number, description):
+                    return 2
+                backend.execute("smoke-desktop-input", action)
+            # 测试后必须释放按下的键鼠并停止 backend（brief Step 5）
             backend.release_inputs()
         finally:
             backend.close()
@@ -134,8 +179,8 @@ def desktop_input(confirm: str | None) -> int:
         print(f"[{error.code}] {error.message}", file=sys.stderr)
         return 1
     print(
-        "input ok: moved mouse to screenshot center "
-        f"({observation.width // 2}, {observation.height // 2})"
+        "input ok: move/click/type 已在可见测试区域完成，输入状态已释放，"
+        "backend 已关闭。"
     )
     return 0
 
@@ -162,7 +207,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--desktop-input",
         action="store_true",
-        help="Move the REAL mouse once to the screenshot center. Requires --confirm-real-input I_UNDERSTAND.",
+        help=(
+            "Perform one REAL move + click + fixed-harmless type in the visible test "
+            "area; every step prints a redacted preview and waits for a single Enter. "
+            "Requires --confirm-real-input I_UNDERSTAND."
+        ),
     )
     parser.add_argument(
         "--confirm-real-input",

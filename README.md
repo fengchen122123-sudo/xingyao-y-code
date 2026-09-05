@@ -701,6 +701,25 @@ pytest
 
 测试覆盖 117 个模块，包括 agent_turn_e2e、harness（models/journal/runtime/请求指纹/工具管线）、cancellation、config、memory_kairos、permission_broker、plan、task_scheduler、subagent_registry、tools、setup_engine、uninstall_engine 等。
 
+### 电脑操控人工烟测（绝不进 pytest）
+
+`scripts/smoke_computer_control.py` 只由人工显式运行（会打开可见系统浏览器窗口或产生真实键鼠/截屏动作），自动化测试只验证其代码路径（fake 注入）：
+
+```powershell
+# 浏览器通道探针（系统 Edge / Chrome，about:blank，不下载浏览器）
+venv\Scripts\python.exe scripts\smoke_computer_control.py --probe-browser edge
+venv\Scripts\python.exe scripts\smoke_computer_control.py --browser-observe chrome
+
+# 桌面观察（预检 + 截图一次，不输入）
+venv\Scripts\python.exe scripts\smoke_computer_control.py --desktop-observe
+
+# 真实键鼠（固定一次 move/click/type，每步打印脱敏动作并要求单次 Enter 确认；
+# 需先打开无敏感数据的测试窗口）
+venv\Scripts\python.exe scripts\smoke_computer_control.py --desktop-input --confirm-real-input I_UNDERSTAND
+```
+
+人工验收矩阵：Edge/Chrome 专用 profile 首次登录与重启保留、浏览器关闭明确失败、多屏/缩放、pause 后无新动作、resume 首动作 observe、GUI stop / CLI `/computer stop` / Ctrl+C / Ctrl+Alt+Esc 紧急停止、锁屏与 UAC fail-closed、退出后无残留 Playwright 子进程与临时 PNG。
+
 ## 🔒 安全与隐私
 
 - `config.json`、`ycode.db`、`active_skills.json`、`mcp.json` 已加入 `.gitignore`，不会被提交

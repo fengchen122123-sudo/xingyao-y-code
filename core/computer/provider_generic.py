@@ -15,10 +15,12 @@ from core.computer.actions import (
     COMPUTER_ACTION_TOOL_SCHEMA,
     observation_provider_projection,
     parse_computer_action,
+    sanitized_action_summary,
 )
 from core.computer.models import ComputerControlError, ComputerProtocol
 from core.computer.tool_adapter import (
     COMPUTER_ACTION_TOOL_NAME,
+    COMPUTER_SELECT_TARGET_TOOL_NAME,
     computer_turn_context_error,
     lease_from_context,
 )
@@ -97,6 +99,45 @@ def validate_computer_tool_batch(tool_calls) -> None:
             "computer_action 一次只能调用一个电脑动作，不得批量调用或与其他工具混用；"
             "请只保留一个电脑动作，其余工作等看到新截图后再继续。",
         )
+
+
+def computer_tool_arguments_projection(name: str, arguments) -> dict | None:
+    """computer 保留名工具参数的脱敏投影（设计 22.3/22.4，Task 16 隐私审计）。
+
+    - computer_action：经 parse_computer_action 严格解析后只保留
+      actions.sanitized_action_summary 摘要（输入正文/组合键/URL 只留
+      code point 数与 SHA-256）；解析失败回稳定错误形状，绝不回显原文；
+    - computer_select_target：只含 target 枚举，原样保留；
+    - 其他工具名返回 None（调用方保持原样，绝不触碰普通工具参数）。
+
+    ``arguments`` 可为已解析 dict 或原始 JSON 字符串；非法形态按解析失败
+    处理。投影是纯函数，供事件载荷与落库 tool_calls 两处共用。
+    """
+    if name == COMPUTER_SELECT_TARGET_TOOL_NAME:
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except ValueError:
+                arguments = None
+        target = arguments.get("target") if isinstance(arguments, dict) else None
+        return {"target": target} if isinstance(target, str) else {}
+    if name != COMPUTER_ACTION_TOOL_NAME:
+        return None
+    if isinstance(arguments, str):
+        try:
+            arguments = json.loads(arguments)
+        except ValueError:
+            arguments = None
+    if not isinstance(arguments, dict):
+        arguments = None
+    try:
+        action = parse_computer_action(arguments)
+    except ComputerControlError:
+        return {
+            "error_code": "computer_invalid_action",
+            "error_message": "computer_action 参数无法解析，原文已脱敏省略",
+        }
+    return sanitized_action_summary(action)
 
 
 def _attempted_value(decoded, key: str) -> str:

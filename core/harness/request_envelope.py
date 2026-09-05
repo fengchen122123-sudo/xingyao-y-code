@@ -146,6 +146,27 @@ def prepare_stream_request(
     return PreparedStreamRequest(protocol=protocol, kwargs=provider_kwargs)
 
 
+def prepare_native_continuation_request(turn_state, call_output, *, timeout):
+    """Build the PreparedStreamRequest for one native computer continuation Step.
+
+    Task 11b（设计 11.3）：原生电脑操控活动 continuation 的下一 Step 不重发
+    完整消息历史——input 只有 computer_call_output，model/tools/instructions/
+    options 经 turn_state 字节级重发，previous_response_id 指向上一响应。
+    协议形状由 core.computer.provider_openai.build_continuation_request 构造
+    （协议层职责），本函数只负责把 timeout 按当前 Step 注入并包装成与
+    prepare_stream_request 同一的请求准备接缝，使 RequestEnvelope.capture
+    记录续传请求的真实最终字节。timeout 必须显式提供（与
+    prepare_stream_request 的必填语义一致）。
+    """
+    from core.computer.provider_openai import build_continuation_request
+
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
+        raise ValueError("native continuation request requires a numeric timeout")
+    provider_kwargs = build_continuation_request(turn_state, call_output)
+    provider_kwargs["timeout"] = timeout
+    return PreparedStreamRequest(protocol="responses", kwargs=provider_kwargs)
+
+
 def _json_bytes(value) -> bytes:
     return json.dumps(
         value,

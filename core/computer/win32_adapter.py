@@ -59,6 +59,7 @@ SM_CYVIRTUALSCREEN = 79
 _UOI_NAME = 2
 _GENERIC_READ = 0x80000000
 _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
+_DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
 _ABSOLUTE_RANGE = 65535
 
 # 统一动作键名 → 虚拟键码（登记制；与 core/computer/actions.py 的键名白名单对齐）。
@@ -185,7 +186,16 @@ def _ctypes_send_input(events: list) -> int:
 
 
 def _ctypes_ensure_dpi_awareness() -> bool:
-    """确认进程为 Per-Monitor V2；已是则只验证，否则显式设置后再验证。"""
+    """确认进程为 Per-Monitor V2；已是则只验证，否则显式设置后再验证。
+
+    设置失败时降级评估 System DPI aware（2026-09-05 GUI 开关死锁修复）：
+    pywebview WinForms 后端启动即 SetProcessDPIAware()，把 GUI 进程锁死在
+    System aware——进程 DPI 感知只能设置一次，此处再切 PMv2 必然失败。
+    System aware 下桌面操控坐标链路依然自洽：GetSystemMetrics/截图 DC/
+    SendInput 0-65535 归一化全部工作在物理像素桌面坐标系（DPI 虚拟化只
+    影响 UNAWARE 进程与窗口呈现，不影响这些 API），因此放行。UNAWARE
+    （系统缩放≠100% 时 metrics 被虚拟化）与 PMv1 仍拒绝（fail-closed）。
+    """
     user32 = ctypes.windll.user32
     user32.GetThreadDpiAwarenessContext.restype = ctypes.c_void_p
     user32.AreDpiAwarenessContextsEqual.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
@@ -193,16 +203,28 @@ def _ctypes_ensure_dpi_awareness() -> bool:
     pmv2 = ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2)
     if user32.AreDpiAwarenessContextsEqual(user32.GetThreadDpiAwarenessContext(), pmv2):
         return True
-    if not user32.SetProcessDpiAwarenessContext(pmv2):
-        return False
+    if user32.SetProcessDpiAwarenessContext(pmv2):
+        if user32.AreDpiAwarenessContextsEqual(
+            user32.GetThreadDpiAwarenessContext(), pmv2
+        ):
+            return True
+    # PMv2 设置失败（GUI 进程已被 pywebview 锁死）：System aware 坐标自洽，放行
+    system = ctypes.c_void_p(_DPI_AWARENESS_CONTEXT_SYSTEM_AWARE)
     return bool(
-        user32.AreDpiAwarenessContextsEqual(user32.GetThreadDpiAwarenessContext(), pmv2)
+        user32.AreDpiAwarenessContextsEqual(
+            user32.GetThreadDpiAwarenessContext(), system
+        )
     )
 
 
 def _ctypes_input_desktop_name() -> str | None:
     """当前 input desktop 名称；打不开（非交互式会话）返回 None。"""
     user32 = ctypes.windll.user32
+    # 64 位句柄防御（Task 16）：ctypes 默认 restype 是 c_int，会把 64 位
+    # HDESK 截断成 32 位——CloseDesktop 随即拿到无效句柄（句柄泄漏）。
+    # 显式声明 c_void_p，CloseDesktop 的参数同样按指针宽度传递。
+    user32.OpenInputDesktop.restype = ctypes.c_void_p
+    user32.CloseDesktop.argtypes = [ctypes.c_void_p]
     handle = user32.OpenInputDesktop(0, False, _GENERIC_READ)
     if not handle:
         return None
@@ -222,7 +244,10 @@ def _ctypes_input_desktop_name() -> str | None:
 
 
 def _ctypes_foreground_window() -> int:
-    return int(ctypes.windll.user32.GetForegroundWindow())
+    user32 = ctypes.windll.user32
+    # 64 位窗口句柄防御（Task 16）：默认 c_int restype 会截断 HWND。
+    user32.GetForegroundWindow.restype = ctypes.c_void_p
+    return int(user32.GetForegroundWindow() or 0)
 
 
 def _ctypes_window_title(hwnd: int) -> str:

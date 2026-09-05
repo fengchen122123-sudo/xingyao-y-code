@@ -1,15 +1,22 @@
 """会话消息排队（FIFO）核心逻辑回归。
 
 覆盖：回合运行中入队、回合结束 FIFO 补发、取消排队、插队发送。
+Task 13a 追加：GUI Bridge 电脑操控控制 API（run_id 校验、pause/resume/stop
+透传、完整 snapshot 返回、safety acknowledge 固定不可用）。
 全部用裸实例 + 桩函数构造，不依赖真实 LLM / DB / 前端。
 """
 import json
+import queue
 import threading
+
+import pytest
 
 import config
 import core.model_manager as model_manager
+from core.computer.models import ComputerRunSnapshot
 
-from gui_bridge import ApiBridge
+from gui_bridge import ApiBridge, JS_QUEUE_MAXSIZE
+from tests.computer_fakes import FakeBridgeController
 
 
 def _use_tmp_config(tmp_path, monkeypatch, data):
@@ -240,3 +247,117 @@ def test_get_message_queue_returns_snapshot():
     assert res["queue"] == [
         {"id": "q1", "text": "完整", "attachments": ["d:/a.txt"]},
     ]
+
+
+# ---------------- Task 13a：电脑操控控制 API（设计 16.4/16.5） ----------------
+
+
+def _make_computer_bridge():
+    """构造仅含电脑操控控制 API 所需内部状态的裸桥实例。
+
+    fake controller 的生命周期方法会经 listener 向 _js_queue 投递状态事件，
+    队列与派发标记必须齐备；_js_dispatcher 指向主线程（恒 alive）阻止测试内
+    启动真实派发线程。
+    """
+    instance = ApiBridge.__new__(ApiBridge)
+    instance._shutting_down = False
+    instance._window = None
+    instance._js_queue = queue.Queue(maxsize=JS_QUEUE_MAXSIZE)
+    instance._js_dispatcher = threading.current_thread()
+    instance._js_dispatcher_lock = threading.Lock()
+    instance._js_dropped = 0
+    instance._computer_event_listener = None
+    return instance
+
+
+@pytest.fixture
+def fake_controller():
+    return FakeBridgeController()
+
+
+@pytest.fixture
+def bridge(fake_controller, monkeypatch):
+    monkeypatch.setattr(
+        "core.computer.controller.get_computer_control_service",
+        lambda: fake_controller,
+    )
+    instance = _make_computer_bridge()
+    instance.get_computer_control_status()  # 控制方法惰性建立事件桥（生产路径）
+    return instance
+
+
+def test_bridge_mutation_requires_current_run_id(fake_controller, bridge):
+    fake_controller.start_run(run_id="run-a")
+    result = bridge.stop_computer_control("run-b")  # 旧 UI 事件的 run id
+    assert result["ok"] is False
+    assert fake_controller.snapshot().run_id == "run-a"
+
+
+def test_safety_acknowledge_unavailable_without_verified_contract(fake_controller, bridge):
+    result = bridge.acknowledge_computer_safety("run-a", ["sc_1"])
+    assert result["ok"] is False
+    assert result["error_code"] == "computer_provider_safety_required"
+
+
+def test_bridge_pause_resume_pass_through_to_controller(fake_controller, bridge):
+    fake_controller.start_run(run_id="run-a")
+
+    paused = bridge.pause_computer_control("run-a")
+    assert paused["ok"] is True
+    assert paused["status"] == "paused"
+    assert fake_controller.pause_calls == [("run-a", "user_pause")]
+
+    resumed = bridge.resume_computer_control("run-a")
+    assert resumed["ok"] is True
+    assert resumed["status"] == "running"
+    assert fake_controller.resume_calls == ["run-a"]
+
+
+def test_bridge_stop_with_current_run_id_stops_run(fake_controller, bridge):
+    fake_controller.start_run(run_id="run-a")
+
+    result = bridge.stop_computer_control("run-a")
+
+    assert result["ok"] is True
+    assert result["status"] == "stopped"
+    assert fake_controller.stop_calls == [("run-a", "user_stop")]
+    # 终态快照仍可见（镜像 controller _last_snapshot 语义）
+    assert fake_controller.snapshot().run_id == "run-a"
+
+
+def test_every_control_operation_returns_full_snapshot(fake_controller, bridge):
+    """设计 16.4：每次控制操作返回完整 snapshot，供前端在事件丢弃后校准 Store。"""
+    fake_controller.start_run(run_id="run-a")
+    fake_controller.action_count = 12
+    snapshot_keys = set(ComputerRunSnapshot().to_public_dict())
+
+    results = [
+        bridge.get_computer_control_status(),
+        bridge.pause_computer_control("run-a"),
+        bridge.resume_computer_control("run-a"),
+        bridge.stop_computer_control("run-a"),
+    ]
+    assert [result["status"] for result in results] == [
+        "running", "paused", "running", "stopped",
+    ]
+    for result in results:
+        assert result["ok"] is True
+        # 完整快照字段全部在场且与 controller 当前值一致
+        assert snapshot_keys <= set(result)
+        assert result["run_id"] == "run-a"
+        assert result["action_count"] == 12
+        assert result["target"] == "browser"
+
+
+def test_failed_mutation_returns_current_snapshot_for_recalibration(fake_controller, bridge):
+    """run_id 不匹配被拒时，失败返回值带当前活动 run 的完整快照供前端校准。"""
+    fake_controller.start_run(run_id="run-a")
+
+    result = bridge.stop_computer_control("run-b")
+
+    assert result["ok"] is False
+    assert result["error_code"] == "computer_invalid_state"
+    # 返回的是当前活动 run（run-a），不是请求里被拒绝的旧 run id
+    assert result["run_id"] == "run-a"
+    assert result["status"] == "running"
+    assert fake_controller.stop_calls == []  # 新 run 未被旧事件停止
