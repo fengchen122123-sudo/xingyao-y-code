@@ -9,6 +9,7 @@ URL 路径固定 /computer-preview/{token}/{run_id}/{ordinal}.png；错 token、
 
 from __future__ import annotations
 
+import hmac
 import os
 import re
 import secrets
@@ -135,7 +136,14 @@ class ComputerPreviewServer:
         if len(segments) != 5 or segments[0] != "" or segments[1] != _URL_PREFIX:
             return None
         token, run_id, filename = segments[2], segments[3], segments[4]
-        if not self.token or token != self.token:
+        # 常量时间比较（时序侧信道加固）：候选 token 可能携带非 ASCII 字符
+        # （请求行按 latin-1 解码），compare_digest 对非 ASCII str 会抛
+        # TypeError，先拒之；服务未启动（token 为空）同样直接拒绝。
+        if (
+            not self.token
+            or not token.isascii()
+            or not hmac.compare_digest(self.token, token)
+        ):
             return None
         if not _RUN_ID_RE.fullmatch(run_id):
             return None

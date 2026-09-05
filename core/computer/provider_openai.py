@@ -13,12 +13,14 @@ computer_provider_protocol_error，绝不改走 generic 协议。
 
 from __future__ import annotations
 
+import base64
 import copy
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
 
-from core.computer.actions import parse_computer_action
+from core.computer.actions import parse_computer_action, sanitized_action_summary
 from core.computer.models import (
     ComputerAction,
     ComputerControlError,
@@ -167,7 +169,9 @@ def _merge_response_id(current: str, seen) -> str:
     if not seen:
         return current
     if current and current != seen:
-        raise _protocol_error(f"Responses response id 冲突: {current!r} 与 {seen!r}")
+        # 11b 用户裁决（Task 16 隐私审计）：冲突错误消息绝不内嵌任一
+        # response id 原文——该错误可经 turn_error 外泄到 UI/持久化面。
+        raise _protocol_error("Responses response id 冲突（两个不同的 id，原文不回显）")
     return seen
 
 
@@ -465,14 +469,19 @@ def native_computer_call_from_stream(payload, target=None) -> NativeComputerCall
 def execute_native_computer_call(call, controller) -> NativeCallResult:
     """按原序串行执行一批原生动作（设计 11.2，GA actions[] 例外规则）。
 
-    每个动作经 controller.execute(action)：真实 ComputerControlService 在
-    单动作内完成 cancel/pause/owner/generation 检查、backend 执行、本地
-    fresh after observation 与无进展判断；任一动作失败或被停止即向上传播
-    领域错误，余项绝不执行。整批成功后 observation 为最后一个动作的本地
-    观察（"只回传最后一图"不等于"中间动作不观察"）。pending safety checks
-    非空时零执行，controller 进入 provider_safety_required（设计 11.5：
-    无已验证确认契约，绝不伪造 acknowledged safety checks，也不回退
-    generic 绕过）。
+    controller 是本函数的窄执行协议，不是 ComputerControlService 本体：
+    - execute(action)：必须在单动作内完成 cancel/pause/owner/generation
+      检查、backend 执行、本地 fresh after observation 与无进展判断；
+    - enter_provider_safety_required()：pending safety 时被调用。
+    真实服务签名是 execute(run_id, owner, action) /
+    enter_provider_safety_required(run_id)（core/computer/controller.py），
+    Task 11b 接线时必须由调用方构造绑定 run_id/owner 的适配器传入，
+    不得把真实服务直接传给本函数（审查修复轮 I-2 契约声明）。
+    任一动作失败或被停止即向上传播领域错误，余项绝不执行。整批成功后
+    observation 为最后一个动作的本地观察（"只回传最后一图"不等于
+    "中间动作不观察"）。pending safety checks 非空时零执行，controller
+    进入 provider_safety_required（设计 11.5：无已验证确认契约，绝不
+    伪造 acknowledged safety checks，也不回退 generic 绕过）。
     """
     if call.pending_safety_checks:
         controller.enter_provider_safety_required()
@@ -485,6 +494,165 @@ def execute_native_computer_call(call, controller) -> NativeCallResult:
     return NativeCallResult(
         status="ok", observation=observation, executed_actions=executed
     )
+
+
+# ---------------- Task 11b：原生 continuation 与脱敏持久化投影 ----------------
+
+
+# 续传请求必须重发的请求级 options（不含 model/input/tools/instructions/
+# previous_response_id/stream/timeout——前五者由结构化字段承载，timeout 由
+# prepare_native_continuation_request 按当前 Step 注入）。
+NATIVE_CONTINUATION_OPTION_KEYS = (
+    "api_key",
+    "api_base",
+    "max_output_tokens",
+    "tool_choice",
+    "num_retries",
+    "extra_body",
+    "parallel_tool_calls",
+    "reasoning",
+)
+
+
+@dataclass(frozen=True)
+class NativeContinuationState:
+    """原生续传的 Turn 内存状态（设计 11.3，brief Step 3）。
+
+    只存活于当前模型回合生成器的局部变量：model/tools/instructions/options
+    取自产生 computer_call 的那个 Step 的真实 Provider 请求 kwargs（字节级
+    同序重发），response_id 取自该 computer_call。previous_response_id 的
+    生命周期到此对象为止——绝不写入 message、Journal、event 或 runtime log。
+    """
+
+    model: str
+    tools: tuple
+    instructions: str
+    options: dict
+    response_id: str = ""
+
+
+def build_continuation_request(turn_state, call_output) -> dict:
+    """构造原生续传 Step 的 Provider 请求 kwargs（设计 11.3 第 4 步）。
+
+    重发同一 model、同序 tools（含 computer built-in；selector 已选后本就不
+    在产生 computer_call 的 Step 请求里）、必要 instructions/options 与上一
+    response id；input 只有一个 computer_call_output，绝不重发完整消息历史
+    （产物无 "messages" 键）。官方 Responses API 明确上一响应的 instructions
+    不会经 previous_response_id 自动继承，漏发会导致 system prompt 语义漂移，
+    因此 instructions 必须显式重发。Provider 未返回可用 response id 时立即以
+    computer_provider_protocol_error 失败；禁止退回"重发全部截图历史"或
+    通用 function tool。键序固定，供 byte-golden 精确断言。
+    """
+    response_id = str(getattr(turn_state, "response_id", "") or "")
+    if not response_id:
+        raise _protocol_error("Provider 未返回可用 response id，无法构造原生续传请求")
+    request = {
+        "model": turn_state.model,
+        "api_key": turn_state.options.get("api_key"),
+        "input": [call_output],
+        "tools": [copy.deepcopy(tool) for tool in turn_state.tools],
+        "stream": True,
+        "previous_response_id": response_id,
+        "instructions": turn_state.instructions,
+    }
+    for key in NATIVE_CONTINUATION_OPTION_KEYS:
+        if key != "api_key" and key in turn_state.options:
+            request[key] = copy.deepcopy(turn_state.options[key])
+    return request
+
+
+def _read_png_bytes(observation) -> bytes:
+    png_path = str(getattr(observation, "png_path", "") or "")
+    if not png_path:
+        raise ComputerControlError("computer_backend_error", "观察缺少截图文件")
+    try:
+        with open(png_path, "rb") as handle:
+            return handle.read()
+    except OSError as error:
+        raise ComputerControlError(
+            "computer_backend_error", f"读取最新观察截图失败：{error}"
+        ) from error
+
+
+def build_computer_call_output(call, observation) -> dict:
+    """整批动作成功后的 computer_call_output 输入条目（设计 11.3 第 3-4 步）。
+
+    只携带整批动作最后一张截图（"只回传最后一图"）；data URL 只存在于本
+    条目并发给 Provider，绝不持久化。不含任何确认字段（设计 11.5：GA
+    Computer use 请求 schema 未定义 acknowledged_safety_checks 契约前绝不
+    产出——pending safety 时 execute_native_computer_call 已先行返回
+    provider_safety_required，本函数只服务已执行成功的批次）。
+    """
+    png_bytes = _read_png_bytes(observation)
+    data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
+    return {
+        "type": "computer_call_output",
+        "call_id": call.call_id,
+        "output": {"type": "computer_screenshot", "image_url": data_url},
+    }
+
+
+def _sha256_hex(value: str) -> str:
+    return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def _sanitized_native_action(action) -> dict:
+    """统一动作 → 脱敏摘要：输入正文/组合键/URL 只留 code point 数与 SHA-256。
+
+    坐标、滚轮量、等待时长等非敏感参数原样保留；截图相关信息（screen
+    hash/尺寸）由 build_native_call_persistence_row 附在最后一个动作上。
+    Task 16 起与 generic 工具参数投影共用 actions.sanitized_action_summary。
+    """
+    return sanitized_action_summary(action)
+
+
+def build_native_call_persistence_row(run_id, call, observation) -> dict:
+    """原生中间行的脱敏持久化投影（设计 11.4，brief Step 5 逐字形状）。
+
+    输入文字只保存 code point 数和 SHA-256；截图只保存 screen hash/尺寸
+    （附在整批最后一个动作的摘要上——该动作的 post observation 即回传
+    Provider 的那张截图）；不保存 base64、profile path、完整 URL、response
+    id。投影是确定性的：同一 call 与 observation 两次构造完全一致。
+    """
+    summaries = [_sanitized_native_action(action) for action in call.actions]
+    if observation is not None and summaries:
+        summaries[-1]["screen_sha256"] = str(
+            getattr(observation, "screen_sha256", "") or ""
+        )
+        summaries[-1]["screen_width"] = int(getattr(observation, "width", 0) or 0)
+        summaries[-1]["screen_height"] = int(getattr(observation, "height", 0) or 0)
+    return {
+        "role": "assistant",
+        "content": "",
+        "_computer_v1": {
+            "kind": "native_call",
+            "run_id": str(run_id),
+            "call_id_hash": _sha256_hex(call.call_id),
+            "action": summaries,
+        },
+    }
+
+
+class BoundNativeController:
+    """把真实 ComputerControlService 绑定 run_id/owner 的窄执行协议适配器。
+
+    execute_native_computer_call 只认 execute(action) /
+    enter_provider_safety_required()（11a 窄协议）；真实服务签名是
+    execute(run_id, owner, action) / enter_provider_safety_required(run_id)
+    （审查修复轮 I-2 契约）。调用方（core/llm.py 原生分支）必须经本适配器
+    绑定后传入，不得把真实服务直接交给协议层。
+    """
+
+    def __init__(self, controller, run_id, owner) -> None:
+        self._controller = controller
+        self._run_id = str(run_id)
+        self._owner = owner
+
+    def execute(self, action):
+        return self._controller.execute(self._run_id, self._owner, action)
+
+    def enter_provider_safety_required(self):
+        return self._controller.enter_provider_safety_required(self._run_id)
 
 
 # ---------------- target selector 固定适配（Task 9 保留名机制） ----------------

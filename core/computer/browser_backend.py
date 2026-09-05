@@ -184,6 +184,14 @@ class BrowserComputerBackend:
         if not self._ready.wait(timeout=self._start_timeout):
             with self._state_lock:
                 self._closed = True
+            # 超时后 worker 可能仍在 _boot（慢浏览器启动）：投递关闭哨兵，
+            # 让 boot 无论成败都能立即收尾（成功→命令循环取到哨兵退出并
+            # teardown；失败→boot 异常路径自带 teardown）——绝不遗留浏览器
+            # 进程、profile 注册表锁与临时截图目录（Task 6 M1 复核，Task 16）。
+            try:
+                self._queue.put(_Command(None), timeout=5)
+            except queue.Full:
+                _LOGGER.warning("浏览器启动超时，关闭哨兵投递失败（worker 可能残留）")
             raise ComputerControlError(
                 "computer_backend_start_failed",
                 f"{self._browser} 浏览器启动超时",

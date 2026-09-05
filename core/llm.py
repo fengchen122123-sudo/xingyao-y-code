@@ -23,6 +23,7 @@ from core.harness.request_envelope import (
     RequestEnvelope,
     _responses_input_from_messages,
     _responses_tools_from_chat_tools,
+    prepare_native_continuation_request,
     prepare_stream_request,
 )
 from core.harness.journal import journal_storage_supported
@@ -46,16 +47,25 @@ from core.computer.models import (
 from core.computer.provider_generic import (
     build_generic_computer_tool,
     computer_error_tool_message,
+    computer_tool_arguments_projection,
     validate_computer_tool_batch,
 )
 from core.computer.provider_openai import (
+    NATIVE_CONTINUATION_OPTION_KEYS,
+    BoundNativeController,
+    NativeContinuationState,
     NativeTargetSelection,
+    build_computer_call_output,
+    build_native_call_persistence_row,
     build_openai_computer_tools,
+    execute_native_computer_call,
+    native_computer_call_from_stream,
     native_has_dual_targets,
 )
 from core.computer.settings import load_computer_settings
 from core.computer.tool_adapter import (
     COMPUTER_ACTION_TOOL_NAME,
+    RESERVED_COMPUTER_TOOL_NAMES,
     ComputerTurnLease,
 )
 
@@ -1843,12 +1853,18 @@ def _chat_chunk(*, content="", reasoning="", tool_calls=None, finish_reason=None
 
 
 def _merge_stream_response_id(current, seen):
-    """合并流中出现的 response id；不同 id 显式冲突失败。"""
+    """合并流中出现的 response id；不同 id 显式冲突失败。
+
+    冲突错误消息绝不内嵌任一 response id 原文（11b 用户裁决，Task 16
+    隐私审计）——该 RuntimeError 可经 turn_error 外泄到 UI/持久化面。
+    """
     seen = str(seen or "")
     if not seen:
         return current
     if current and current != seen:
-        raise RuntimeError(f"Responses 流的 response id 冲突: {current!r} 与 {seen!r}")
+        raise RuntimeError(
+            "Responses 流的 response id 冲突（两个不同的 id，原文不回显）"
+        )
     return seen
 
 
@@ -2015,6 +2031,36 @@ def _responses_events_as_chat_chunks(events):
             continue
         else:
             raise RuntimeError(f"未支持的 Responses 流事件: {event_type or '<empty>'}")
+
+
+def _native_continuation_instructions(request_kwargs) -> str:
+    """从产生 computer_call 的 Step 请求中提取续传必须重发的 instructions。
+
+    首请求的系统上下文位于 input 的 system/developer 条目（prepare_stream_request
+    语义）；continuation 请求已有 instructions 键则直接复用。多个 system 条目按
+    出现顺序以空行连接。设计 11.3：官方 Responses 的 instructions 不会经
+    previous_response_id 自动继承，漏发会导致 system prompt 语义漂移。
+    """
+    instructions = request_kwargs.get("instructions")
+    if isinstance(instructions, str):
+        return instructions
+    parts = []
+    for item in request_kwargs.get("input") or ():
+        if not isinstance(item, dict) or item.get("role") not in ("system", "developer"):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            if content:
+                parts.append(content)
+        elif isinstance(content, list):
+            text = "".join(
+                str(block.get("text") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") in ("text", "input_text")
+            )
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
 
 
 def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_event=None):
@@ -3609,6 +3655,62 @@ def _tool_call_arguments(tc):
     return arguments
 
 
+def _tool_call_name(tool_call) -> str:
+    """dict / 属性两种 tool_call 形态统一取 function.name。"""
+    if isinstance(tool_call, dict):
+        return str(((tool_call.get("function") or {}).get("name")) or "")
+    function = getattr(tool_call, "function", None)
+    return str(getattr(function, "name", "") or "")
+
+
+def _persisted_tool_calls(tool_calls):
+    """落库 tool_calls 的脱敏副本（设计 22.3/22.4，Task 16 隐私审计）。
+
+    computer 保留名的参数只留 computer_tool_arguments_projection 摘要
+    （输入正文/组合键/URL 只存 code point 数与 SHA-256），其余工具原样。
+    Provider 请求侧的 message_to_append 不经本函数——assistant tool_calls
+    与 tool 结果必须原样配对重发（协议要求），脱敏只作用于持久化副本。
+    """
+    projected = []
+    for tool_call in tool_calls:
+        name = _tool_call_name(tool_call)
+        if name not in RESERVED_COMPUTER_TOOL_NAMES:
+            projected.append(tool_call)
+            continue
+        sanitized = computer_tool_arguments_projection(
+            name, _raw_tool_call_arguments(tool_call)
+        )
+        if isinstance(tool_call, dict):
+            copy_of_call = dict(tool_call)
+            function = dict(copy_of_call.get("function") or {})
+            function["arguments"] = json.dumps(
+                sanitized, ensure_ascii=False, sort_keys=True
+            )
+            copy_of_call["function"] = function
+            projected.append(copy_of_call)
+        else:
+            # 属性形态（桥接层透传）：绝不让原始参数落库
+            projected.append({
+                "id": getattr(tool_call, "id", None),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(
+                        sanitized, ensure_ascii=False, sort_keys=True
+                    ),
+                },
+            })
+    return projected
+
+
+def _raw_tool_call_arguments(tool_call):
+    """取 tool_call 的原始 arguments（JSON 字符串或已解析 dict），绝不解析失败。"""
+    if isinstance(tool_call, dict):
+        return (tool_call.get("function") or {}).get("arguments", "")
+    function = getattr(tool_call, "function", None)
+    return getattr(function, "arguments", "")
+
+
 def _tool_event_parts(tool_call):
     if isinstance(tool_call, dict):
         return (
@@ -3620,6 +3722,20 @@ def _tool_event_parts(tool_call):
 
 
 def _tool_event_payload_from_parts(call_id, function_name, arguments):
+    if function_name in RESERVED_COMPUTER_TOOL_NAMES:
+        # 设计 22.3（Task 16 隐私审计）：输入动作正文不进 GUI/CLI trace——
+        # computer 保留名工具的事件参数只携带脱敏投影（kind/target + 长度/
+        # 哈希），preview 恒空；summary/display 用空参数生成，绝不拼接原文。
+        return {
+            "id": call_id,
+            "name": function_name,
+            "preview": "",
+            "arguments": computer_tool_arguments_projection(
+                function_name, arguments
+            ),
+            "summary": summarize_tool_started(function_name, {}),
+            "display": build_tool_display(function_name, {}),
+        }
     preview = ""
     if function_name in ("read_file", "write_file", "edit_file"):
         preview = arguments.get("file_path", "")
@@ -4421,6 +4537,15 @@ def _chat_with_model_generator(
                 and snapshot.status in _COMPUTER_RUN_TERMINAL_STATUSES
             ):
                 return
+            if (
+                snapshot is not None
+                and snapshot.run_id == computer_run_id
+                and snapshot.status == ComputerRunStatus.PROVIDER_SAFETY_REQUIRED.value
+            ):
+                # Task 11b（设计 11.5）：provider_safety_required 留给用户显式
+                # 停止或升级客户端——未确认前不可 resume，Turn 收尾既不
+                # complete 也不 stop。
+                return
             if computer_exit_kind == "completed":
                 computer_controller.complete_run(
                     computer_run_id, computer_owner, retain_browser_session=True
@@ -4663,6 +4788,12 @@ def _chat_with_model_generator(
             ),
             get_computer_control_service(),
         )
+    # Task 11b（设计 11.3）：原生续传状态——只存活于本生成器的局部变量
+    # （Turn 内存）。computer_call 响应更新 state/output，最终文本或空响应
+    # 清空（previous_response_id 不得跨响应复用）；绝不写入 message、
+    # Journal、event 或 runtime log。
+    native_continuation_state = None
+    native_continuation_output = None
     request_tool_contract = _tool_contract_fingerprint(request_tools)
     telemetry_session_id = _resolve_cache_session_identity(cache_session_id)
     deepseek_ledger_enabled = _uses_deepseek_prompt_ledger(
@@ -4887,24 +5018,35 @@ def _chat_with_model_generator(
                     # 原生 native tools（Task 11a）：每个 Step 按当前 selector
                     # 状态重算（选择后 selector 从请求消失，computer 保留）；
                     # 双 target 能力固定 parallel_tool_calls=false。
-                    step_native_tools = ()
-                    if native_computer_capability is not None:
-                        selected_target = (
-                            native_selection.target
-                            if native_selection is not None
-                            else None
+                    if native_continuation_state is not None:
+                        # Task 11b（设计 11.3）：原生续传 Step——input 只有
+                        # computer_call_output，不重发消息历史；model/tools/
+                        # instructions/options 经 turn_state 字节级重发，
+                        # timeout 按本 Step 注入。
+                        prepared_request = prepare_native_continuation_request(
+                            native_continuation_state,
+                            native_continuation_output,
+                            timeout=attempt_timeout,
                         )
-                        step_native_tools = build_openai_computer_tools(
-                            native_computer_capability, selected_target
+                    else:
+                        step_native_tools = ()
+                        if native_computer_capability is not None:
+                            selected_target = (
+                                native_selection.target
+                                if native_selection is not None
+                                else None
+                            )
+                            step_native_tools = build_openai_computer_tools(
+                                native_computer_capability, selected_target
+                            )
+                            if native_has_dual_targets(native_computer_capability):
+                                kwargs["parallel_tool_calls"] = False
+                        prepared_request = prepare_stream_request(
+                            request_protocol,
+                            kwargs,
+                            attempt_timeout,
+                            native_computer_tools=step_native_tools,
                         )
-                        if native_has_dual_targets(native_computer_capability):
-                            kwargs["parallel_tool_calls"] = False
-                    prepared_request = prepare_stream_request(
-                        request_protocol,
-                        kwargs,
-                        attempt_timeout,
-                        native_computer_tools=step_native_tools,
-                    )
                     request_envelope = RequestEnvelope.capture(
                         prepared_request,
                         cache_scope=cache_scope,
@@ -5148,6 +5290,125 @@ def _chat_with_model_generator(
                     invalidation_reason=request_cache_reason,
                 )
 
+            # Task 11b（设计 11.2/11.3）：原生 computer_call 消费——一个 Step
+            # 对应一次模型决定 + 一次本地动作批次；执行后以 computer_call_output
+            # 续传下一 Step。assembler 合并的重复终态载荷是"后者覆盖"，消费侧
+            # 统一经 native_computer_call_from_stream 严格校验（parse 层拒绝
+            # 冲突载荷）。最终文本或空响应则清空续传状态（previous_response_id
+            # 不得跨响应复用），走下方普通收尾路径。
+            if native_computer_capability is not None:
+                if assembled_response.computer_call is None:
+                    native_continuation_state = None
+                    native_continuation_output = None
+                else:
+                    if assembled_response.tool_calls:
+                        # computer_call 与普通 function call 混用：静默丢弃
+                        # function call 会造成不可审计的副作用缺口，整批拒绝。
+                        raise ComputerControlError(
+                            "computer_provider_protocol_error",
+                            "同一个 Provider response 同时出现 computer_call 与 "
+                            "function call，混用批次拒绝执行",
+                        )
+                    native_target = (
+                        native_selection.target
+                        if native_selection is not None
+                        else (
+                            native_computer_capability.targets[0]
+                            if len(native_computer_capability.targets) == 1
+                            else None
+                        )
+                    )
+                    native_call = native_computer_call_from_stream(
+                        assembled_response.computer_call, target=native_target
+                    )
+                    # 惰性建立 run（与 generic 语义一致）：首个原生 computer
+                    # call 执行前建立；selector 已建立的租约直接复用。
+                    if (
+                        native_selection is not None
+                        and native_selection.run_id
+                        and not computer_run_id
+                    ):
+                        computer_controller = native_selection.controller
+                        computer_owner = native_selection.owner
+                        computer_run_id = native_selection.run_id
+                    if not computer_run_id:
+                        computer_controller = get_computer_control_service()
+                        computer_owner = ComputerOwner(
+                            session_id=str(parent_session or ""),
+                            turn_id=str(parent_turn_id or ""),
+                            session_label=str(parent_session or parent_turn_id or ""),
+                            cancel_event=(
+                                cancel_event
+                                if cancel_event is not None
+                                else threading.Event()
+                            ),
+                        )
+                        computer_run_id = str(
+                            computer_controller.start_run(
+                                computer_owner,
+                                native_computer_capability,
+                                target=native_target,
+                            ).run_id
+                        )
+                    native_result = execute_native_computer_call(
+                        native_call,
+                        BoundNativeController(
+                            computer_controller, computer_run_id, computer_owner
+                        ),
+                    )
+                    if native_result.status == "provider_safety_required":
+                        # 设计 11.5：无已验证确认契约——不执行动作、不发起
+                        # 后续 Step，run 留在 provider_safety_required 等用户
+                        # 显式停止；绝不伪造 acknowledged safety checks，也
+                        # 不回退 generic 绕过。check 原文不进入错误消息。
+                        check_ids = ", ".join(
+                            check.id for check in native_call.pending_safety_checks
+                        )
+                        raise ComputerControlError(
+                            "computer_provider_safety_required",
+                            "Provider 返回强制安全检查"
+                            + (f"（check ids: {check_ids}）" if check_ids else "")
+                            + "，未确认前不执行任何动作；请查看状态并停止",
+                        )
+                    if current_step is not None:
+                        current_step.mark_assistant_ready()
+                        current_step.mark_tools_running()
+                    # 脱敏中间行投影（brief Step 5 逐字形状）：输入文字只存
+                    # code point 数与 SHA-256，截图只存 screen hash/尺寸。
+                    native_row = build_native_call_persistence_row(
+                        computer_run_id, native_call, native_result.observation
+                    )
+                    if stream:
+                        pending_persistence.append(("assistant", native_row))
+                    flush_persistence()
+                    if current_step is not None:
+                        current_step.mark_tools_committed()
+                        if turn + 1 < max_turns:
+                            current_step.complete()
+                    # 续传材料只存 Turn 内存（NativeContinuationState 从产生
+                    # computer_call 的真实请求 kwargs 捕获，字节级同序重发）。
+                    native_continuation_state = NativeContinuationState(
+                        model=str(
+                            prepared_request.kwargs.get("model") or model_name
+                        ),
+                        tools=tuple(
+                            deepcopy(prepared_request.kwargs.get("tools") or ())
+                        ),
+                        instructions=_native_continuation_instructions(
+                            prepared_request.kwargs
+                        ),
+                        options=deepcopy({
+                            key: prepared_request.kwargs[key]
+                            for key in NATIVE_CONTINUATION_OPTION_KEYS
+                            if key in prepared_request.kwargs
+                        }),
+                        response_id=native_call.response_id,
+                    )
+                    native_continuation_output = build_computer_call_output(
+                        native_call, native_result.observation
+                    )
+                    continue
+
             reasoning_content = stream_assembler.raw_reasoning_content
             public_content = assembled_response.content
             from core.turn_renderer import sanitize_protocol_text
@@ -5213,7 +5474,13 @@ def _chat_with_model_generator(
             if provider_thinking_blocks is not None:
                 persisted_message["thinking_blocks"] = provider_thinking_blocks
             if tool_calls_list:
-                persisted_message["tool_calls"] = tool_calls_list
+                # 设计 22.3/22.4（Task 16 隐私审计）：computer 工具调用的输入
+                # 正文绝不落库——持久化副本换脱敏投影；Provider 请求侧的
+                # message_to_append 保持原始参数（assistant tool_calls 与 tool
+                # 结果必须配对原样重发），下一轮历史回放读到的是脱敏参数。
+                persisted_message["tool_calls"] = _persisted_tool_calls(
+                    tool_calls_list
+                )
             # 落库副本补充生成所用模型的显示元数据（仅持久化，不发给 LLM）
             persisted_message.update(_model_display_snapshot())
             # 落库副本提取媒体清单（![..](..) / [video:..](..) 语法归档进内容寻址

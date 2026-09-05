@@ -217,3 +217,25 @@ def test_close_after_exit_started_passes_native_close_through():
 
     # 退出序列进行中再次触发 closing：放行原生关闭，避免拦住销毁
     assert lifecycle.on_closing() is True
+
+
+def test_gui_exit_finalizes_turn_shutdown_before_computer_runtime(monkeypatch):
+    """GUI 退出顺序（Task 16）：回合级 shutdown 先于电脑操控运行时统一关闭。"""
+    import gui_main
+
+    calls = []
+    monkeypatch.setattr(
+        "core.computer.runtime.shutdown_process_computer_runtime",
+        lambda reason="application_exit": calls.append("computer_runtime"),
+    )
+    window = FakeWindow()
+    lifecycle = ApplicationLifecycle(
+        window,
+        lambda: calls.append("turn_shutdown"),
+        tray_factory=lambda *args: FakeTray(),
+    )
+    assert lifecycle.start_tray() is True
+
+    gui_main._finalize_gui_exit(lifecycle)
+
+    assert calls == ["turn_shutdown", "computer_runtime"]

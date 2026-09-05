@@ -31,8 +31,9 @@ def _normalize_capability_bool(name: str, value):
 
 
 def _normalize_computer_protocol(value):
-    if value is None:
-        return None
+    """None = 调用方不触碰（保留既有值）；"" = 自动（缺省协议，由能力元数据判定）。"""
+    if value is None or value == "":
+        return value
     if type(value) is not str or value not in COMPUTER_PROTOCOLS:
         raise ValueError(
             f"computer_protocol 只支持 {'/'.join(COMPUTER_PROTOCOLS)}"
@@ -489,7 +490,8 @@ def add_model_to_provider(
                     model_entry["supports_vision"] = bool(supports_vision)
                 if supports_function_calling is not None:
                     model_entry["supports_function_calling"] = supports_function_calling
-                if computer_protocol is not None:
+                # ""（自动）不落键：缺省协议由 capability 按视觉+工具调用元数据判定
+                if computer_protocol:
                     model_entry["computer_protocol"] = computer_protocol
                 provider["models"].append(model_entry)
                 break
@@ -641,7 +643,10 @@ def update_model(
         model["supports_vision"] = bool(supports_vision)
         if supports_function_calling is not None:
             model["supports_function_calling"] = supports_function_calling
-        if computer_protocol is not None:
+        if computer_protocol == "":
+            # ""（自动）：删除已存显式协议，回到缺省判定（视觉+工具调用）
+            model.pop("computer_protocol", None)
+        elif computer_protocol is not None:
             model["computer_protocol"] = computer_protocol
 
     config.update_config(_mutate)

@@ -493,6 +493,9 @@ class ApiBridge:
         self._lan_server = None
         # 保护 _lan_server 惰性创建的双检锁：并发（启动后台线程 + 用户点二维码）时不得创建两个实例
         self._lan_lock = threading.Lock()
+        # 电脑操控事件桥：controller listener 注册标记（进程内建立一次、幂等，
+        # 见 _ensure_computer_event_bridge；set_window 与各控制方法都会触发）
+        self._computer_event_listener = None
 
         # JS 事件派发队列：evaluate_js 是同步调用（无超时），渲染进程挂起时
         # 永不返回。若事件源线程（回合 worker / delta 冲刷 / 终端泵）直接调用，
@@ -583,6 +586,12 @@ class ApiBridge:
             window.events.restored += self._on_window_frame_event
         except Exception:
             logger.debug("订阅窗口事件失败", exc_info=True)
+        # 电脑操控事件桥在窗口就绪时建立（进程内一次、幂等）：所有电脑操控 run
+        # 都发生在窗口就绪之后，保证 listener 不会迟到丢事件；失败只留痕。
+        try:
+            self._ensure_computer_event_bridge()
+        except Exception:
+            logger.exception("建立电脑操控事件桥失败")
 
     def has_active_turns(self) -> bool:
         """是否有任一会话的回合线程仍在运行（关窗退出确认的判断依据）。
@@ -1738,6 +1747,14 @@ class ApiBridge:
         except Exception as e:
             logger.warning("序列化事件 %s 失败: %s", event_type, e)
             return
+        self._queue_js_payload(payload)
+        # 广播到局域网手机客户端（broadcast 内部已吞异常，不影响桌面 JS 派发）
+        lan = getattr(self, "_lan_server", None)
+        if lan is not None:
+            lan.broadcast(payload)
+
+    def _queue_js_payload(self, payload: str) -> None:
+        """唯一入队点：保证派发线程存在后 put_nowait；队列满丢弃新事件并计数。"""
         self._ensure_js_dispatcher()
         try:
             self._js_queue.put_nowait(payload)
@@ -1750,10 +1767,6 @@ class ApiBridge:
                     "JS 事件队列已满，丢弃事件（累计 %d）：渲染进程可能已挂起",
                     self._js_dropped,
                 )
-        # 广播到局域网手机客户端（broadcast 内部已吞异常，不影响桌面 JS 派发）
-        lan = getattr(self, "_lan_server", None)
-        if lan is not None:
-            lan.broadcast(payload)
 
     def _ensure_js_dispatcher(self):
         """惰性启动 JS 事件派发线程：单消费者保证事件顺序，evaluate_js 只在此线程调用。"""
@@ -1800,6 +1813,26 @@ class ApiBridge:
                     )
                 else:
                     logger.debug("evaluate_js 失败: %s", e)
+
+    def drain_js_queue(self):
+        """测试 seam：排空 _js_queue 并返回最后一条已解析事件（空队列返回 None）。
+
+        生产路径由 gui-js-dispatcher 单消费者线程消费，本方法仅供测试断言
+        事件桥投递内容，不在运行时调用。
+        """
+        payload = None
+        while True:
+            try:
+                raw = self._js_queue.get_nowait()
+            except queue.Empty:
+                break
+            if raw is None:
+                continue  # 关闭哨兵不是事件
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                payload = raw
+        return payload
 
     # -- 流式增量的批量推送 ------------------------------------------------
     def _emit_delta(self, kind: str, text: str, session_name: str = ""):
@@ -3006,6 +3039,261 @@ class ApiBridge:
                 "settings": self.get_system_settings(),
             }
 
+    # ------------------------------------------------------------------
+    # 电脑操控系统设置（设计 8.1/8.4：严格 setter；开启前组合 preflight，
+    # 失败不落盘；关闭先落盘 false + 递增 generation，再通知 controller 停止）
+    # ------------------------------------------------------------------
+
+    def _browser_control_preflight(self) -> None:
+        """浏览器操控开启 preflight：所选浏览器可用 + 全局热键可注册。"""
+        from core.computer.models import ComputerControlError
+        from core.computer.settings import load_computer_settings
+        from core.computer.win32_adapter import _default_hotkey_probe
+
+        snapshot = load_computer_settings()
+        if not snapshot.platform_supported:
+            raise ComputerControlError(
+                "computer_unsupported_os", "浏览器操控目前仅支持 Windows"
+            )
+        selected = next(
+            (
+                option
+                for option in snapshot.browser_options
+                if option.browser == snapshot.computer_browser
+            ),
+            None,
+        )
+        if selected is None or not selected.available:
+            label = selected.label if selected is not None else snapshot.computer_browser
+            reason = (
+                selected.unavailable_reason
+                if selected is not None
+                else "未知浏览器"
+            )
+            raise ComputerControlError(
+                "computer_browser_unavailable", f"{label} 不可用：{reason}"
+            )
+        if not _default_hotkey_probe():
+            raise ComputerControlError(
+                "computer_hotkey_unavailable",
+                "无法注册全局紧急停止热键 Ctrl+Alt+Esc",
+            )
+
+    def _computer_control_preflight(self) -> None:
+        """完整电脑操控开启 preflight：Windows backend 检查（平台/DPI/交互桌面/热键）。"""
+        from core.computer.win32_adapter import Win32InputAdapter
+
+        Win32InputAdapter().preflight()
+
+    def _stop_computer_runs_for_disabled_switch(self, switch_target: str) -> None:
+        """开关关闭后通知 controller 停止对应 target 的活动 run（设计 8.1/8.4）。
+
+        config 已先落盘 false 且 generation 已递增：即使本通知失败或清理
+        尚在进行，新动作也会被 generation 检查拒绝，此处只加速取消当前 Turn；
+        未绑定 target 的 run 由 controller 的 effective_target 检查拒绝越权动作。
+        """
+        try:
+            from core.computer.controller import get_computer_control_service
+
+            snapshot = get_computer_control_service().snapshot()
+            if not snapshot.run_id:
+                return
+            if snapshot.status in ("completed", "stopped", "failed"):
+                return
+            if snapshot.target != switch_target:
+                return
+            get_computer_control_service().stop(snapshot.run_id, "settings_disabled")
+        except Exception:
+            logger.exception("关闭电脑操控开关后停止活动 run 失败")
+
+    def _refresh_computer_hotkey(self) -> None:
+        """开关切换成功后按当前设置同步全局紧急停止热键（Task 16 生命周期）。
+
+        注册/注销失败只留痕：配置已落盘，开关结果不受影响，热键能力单独
+        降级（设置页可见 unavailable）；语义（首次注册/活动保持/全关注销）
+        由 core.computer.runtime.refresh_computer_runtime_hotkey 统一实现。
+        """
+        try:
+            from core.computer.runtime import refresh_computer_runtime_hotkey
+
+            refresh_computer_runtime_hotkey()
+        except Exception:
+            logger.exception("同步全局紧急停止热键失败")
+
+    def _has_active_computer_run(self) -> bool:
+        """是否存在活动电脑操控 run；读取失败按活动处理（fail-closed 拒绝切换）。"""
+        try:
+            from core.computer.controller import get_computer_control_service
+
+            snapshot = get_computer_control_service().snapshot()
+            return bool(snapshot.run_id) and snapshot.status not in (
+                "completed",
+                "stopped",
+                "failed",
+            )
+        except Exception:
+            logger.exception("读取电脑操控 run 状态失败")
+            return True
+
+    def set_browser_control_enabled(self, value: bool) -> Dict[str, Any]:
+        """浏览器操控开关：严格 setter；开启 preflight 失败不落盘。"""
+        from core.computer.models import ComputerControlError
+        from core.computer.settings import set_browser_control_enabled
+
+        try:
+            set_browser_control_enabled(
+                value, preflight=self._browser_control_preflight
+            )
+        except ComputerControlError as error:
+            return {
+                "ok": False,
+                "error_code": error.code,
+                "msg": str(error),
+                "settings": self.get_system_settings(),
+            }
+        if value is False:
+            self._stop_computer_runs_for_disabled_switch("browser")
+        # 开关切换成功后同步紧急停止热键（Task 16：开启首次注册/全关注销）
+        self._refresh_computer_hotkey()
+        return {"ok": True, "settings": self.get_system_settings()}
+
+    def set_computer_control_enabled(self, value: bool) -> Dict[str, Any]:
+        """完整电脑操控开关：严格 setter；开启前 Windows backend + 热键 preflight。"""
+        from core.computer.models import ComputerControlError
+        from core.computer.settings import set_computer_control_enabled
+
+        try:
+            set_computer_control_enabled(
+                value, preflight=self._computer_control_preflight
+            )
+        except ComputerControlError as error:
+            return {
+                "ok": False,
+                "error_code": error.code,
+                "msg": str(error),
+                "settings": self.get_system_settings(),
+            }
+        if value is False:
+            self._stop_computer_runs_for_disabled_switch("desktop")
+        # 开关切换成功后同步紧急停止热键（Task 16：开启首次注册/全关注销）
+        self._refresh_computer_hotkey()
+        return {"ok": True, "settings": self.get_system_settings()}
+
+    def set_computer_browser(self, value: str) -> Dict[str, Any]:
+        """默认浏览器选择：活动会话中不可修改（设计 8.1），必须先停止操控。"""
+        from core.computer.models import ComputerControlError
+        from core.computer.settings import set_computer_browser
+
+        try:
+            set_computer_browser(value, active_run=self._has_active_computer_run())
+        except ComputerControlError as error:
+            return {
+                "ok": False,
+                "error_code": error.code,
+                "msg": str(error),
+                "settings": self.get_system_settings(),
+            }
+        return {"ok": True, "settings": self.get_system_settings()}
+
+    # ------------------------------------------------------------------
+    # 电脑操控运行控制与事件桥（设计 16.4/16.5）：控制 API 只调领域服务并
+    # 返回完整 snapshot（前端用快照校准 Store）；controller 四类事件经
+    # listener 以小 JSON 进入 _js_queue，evaluate_js 仍只在
+    # gui-js-dispatcher 单消费者线程执行
+    # ------------------------------------------------------------------
+
+    def _ensure_computer_event_bridge(self):
+        """建立进程内电脑操控事件桥：controller 惰性单例 + 一次性 listener。
+
+        重复调用幂等（add_listener 按相等性去重）；set_window 与每个控制方法
+        都会触发，保证任何 run 的事件都不会因桥接未建立而丢失。
+        """
+        from core.computer.controller import get_computer_control_service
+
+        controller = get_computer_control_service()
+        if getattr(self, "_computer_event_listener", None) is None:
+            listener = self._on_computer_control_event
+            controller.add_listener(listener)
+            self._computer_event_listener = listener
+        return controller
+
+    def _on_computer_control_event(self, event: dict) -> None:
+        """controller 事件 listener：小 JSON 序列化后 put_nowait 进 _js_queue。
+
+        事件源线程（回合 worker / backend 线程）绝不直接调用 evaluate_js；
+        队列满按现有策略丢弃新事件，生产者永不阻塞。
+        """
+        if self._shutting_down:
+            return
+        try:
+            payload = json.dumps(event, ensure_ascii=False)
+            payload = payload.replace("\u2028", "\\u2028").replace("\u2029", "\\u2029")
+        except Exception as e:
+            logger.warning("序列化电脑操控事件失败: %s", e)
+            return
+        self._queue_js_payload(payload)
+
+    def _run_computer_mutation(self, operation) -> Dict[str, Any]:
+        """执行一次电脑操控 mutation 并返回完整快照。
+
+        run_id 由 controller 校验（必须匹配当前活动 run，旧 UI 事件的 run id
+        拒绝，防旧事件停新 run）；失败同样携带当前快照供前端校准（设计 16.4）。
+        """
+        from core.computer.models import ComputerControlError
+
+        controller = self._ensure_computer_event_bridge()
+        try:
+            snapshot = operation(controller)
+        except ComputerControlError as error:
+            snapshot = controller.snapshot()
+            return {
+                "ok": False,
+                **snapshot.to_public_dict(),
+                "error_code": error.code,
+                "msg": str(error),
+            }
+        return {"ok": True, **snapshot.to_public_dict()}
+
+    def get_computer_control_status(self) -> Dict[str, Any]:
+        """当前电脑操控 run 完整快照；前端校准 Store 的唯一真值源（设计 16.4）。"""
+        controller = self._ensure_computer_event_bridge()
+        return {"ok": True, **controller.snapshot().to_public_dict()}
+
+    def pause_computer_control(self, run_id: str) -> Dict[str, Any]:
+        """暂停当前 run：只阻止下一动作开始，不回滚当前动作（设计 15.3）。"""
+        return self._run_computer_mutation(
+            lambda controller: controller.pause(str(run_id or ""), "user_pause")
+        )
+
+    def resume_computer_control(self, run_id: str) -> Dict[str, Any]:
+        """恢复当前 run；provider_safety_required 未验证契约前 controller 拒绝。"""
+        return self._run_computer_mutation(
+            lambda controller: controller.resume(str(run_id or ""))
+        )
+
+    def stop_computer_control(self, run_id: str) -> Dict[str, Any]:
+        """用户紧急停止当前 run；固定停止顺序由 controller.stop 执行（设计 15.2）。"""
+        return self._run_computer_mutation(
+            lambda controller: controller.stop(str(run_id or ""), "user_stop")
+        )
+
+    def acknowledge_computer_safety(self, run_id: str, check_ids=None) -> Dict[str, Any]:
+        """Provider 强制安全检查确认：官方契约验证完成前固定不可用。
+
+        Task 11b Step 4 的三条件（官方 GA schema 提供确认字段 / 该精确形状
+        byte-golden 通过 / 用户显式传入当前 run id 与精确 check ids）未全部
+        满足前，Bridge 绝不构造确认 payload，固定返回
+        computer_provider_safety_required；UI 只显示状态与停止。
+        """
+        controller = self._ensure_computer_event_bridge()
+        snapshot = controller.snapshot()
+        return {
+            "ok": False,
+            **snapshot.to_public_dict(),
+            "error_code": "computer_provider_safety_required",
+            "msg": "Provider 强制安全检查的确认通道未开放：官方确认契约验证前只允许查看状态与停止",
+        }
+
     def get_permission_rules(self) -> Dict[str, Any]:
         """返回当前项目的持久化白名单（含沙盒开关状态），供设置页展示。"""
         try:
@@ -3260,7 +3548,12 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
-    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None) -> Dict[str, Any]:
+    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
+        # turn_source 是入口层受控回合来源（设计 18）：LAN dispatch 由服务器注入
+        # "lan"，本地 GUI/CLI 固定 "local"；只接受这两个受控值，模型/用户正文
+        # 无法设置，非法值直接拒绝（不启动回合）。
+        if turn_source not in ("local", "lan"):
+            return {"ok": False, "msg": "无效的回合来源"}
         try:
             if self._shutting_down:
                 return {"ok": False, "msg": "应用正在退出"}
@@ -3286,6 +3579,8 @@ class ApiBridge:
                         "display_text": clean_text,
                         "attachments": attach_list,
                         "queued_at": time.time(),
+                        # LAN 排队消息补发时保持来源（不得降级为 local）
+                        "turn_source": turn_source,
                     })
                     # 快照在锁内发：保证与补发/取消等后续变更的顺序一致
                     self._emit_message_queue_snapshot(target_session)
@@ -3343,6 +3638,7 @@ class ApiBridge:
                     target_session,
                     display_text=clean_text,
                     pending_workdir=str(workdir) if workdir else "",
+                    turn_source=turn_source,
                 )
             return {"ok": True}
         except Exception as e:
@@ -3350,13 +3646,15 @@ class ApiBridge:
             return {"ok": False, "msg": str(e)}
 
     def _spawn_turn_worker(self, full_text: str, target_session: str,
-                           display_text: str = "", pending_workdir: str = "") -> None:
+                           display_text: str = "", pending_workdir: str = "",
+                           turn_source: str = "local") -> None:
         """启动一个新回合线程。调用方必须已持有 _turn_start_lock 且确认
         _is_turn_active(target_session) 为 False（检查+启动原子）。
 
         send_user_message 与排队补发（_drain_message_queue）共用本路径：
         后台汇总标志重置与"用户取消"解除对两者语义一致——排队消息也是
-        用户主动发的新消息。
+        用户主动发的新消息。turn_source 是入口层受控回合来源（local|lan），
+        随消息透传到回合 worker（设计 18）。
         """
         with self._bg_summary_lock:
             self._bg_summary_triggered.discard(target_session)
@@ -3370,6 +3668,7 @@ class ApiBridge:
             # 懒创建会话：前端 pending 新会话在首条消息时才落库，
             # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
             turn_kwargs["pending_workdir"] = str(pending_workdir)
+        turn_kwargs["turn_source"] = turn_source
         worker = threading.Thread(
             target=self._run_turn_worker_serialized,
             args=(full_text, target_session),
@@ -3424,6 +3723,8 @@ class ApiBridge:
                         str(entry.get("text") or ""),
                         session_name,
                         display_text=str(entry.get("display_text") or ""),
+                        # 排队消息补发保持原回合来源：LAN 消息不得降级为 local
+                        turn_source=str(entry.get("turn_source") or "local"),
                     )
                 except Exception:
                     logger.exception("补发排队消息失败")
@@ -3548,12 +3849,15 @@ class ApiBridge:
         保留函数名避免改动所有调用点，实现直接转发到 _run_turn_worker。"""
         return self._run_turn_worker(user_text, session_name, *args, **kwargs)
 
-    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = ""):
+    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local"):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
 
         internal_kind 非空表示这是系统自动发起的内部回合（如后台任务汇总），
         turn_start 事件会带上 internal / display_text，让前端用系统提示样式
         展示而不是把内部指令原文当成用户气泡。
+        turn_source 是入口层受控回合来源（local|lan，设计 18）：用户消息回合
+        由 send_user_message 传入（LAN dispatch 注入 "lan"），内部回合固定
+        local；透传到 prepare_turn_messages 与模型事件入口决定电脑操控能力。
         """
         api_key = ""
         turn_finished = False
@@ -3723,6 +4027,7 @@ class ApiBridge:
                 api_key=api_key,
                 api_base=api_base,
                 is_gui=True,
+                turn_source=turn_source,
             )
 
             # 压缩（四级水位线阶梯）可能发生在 prepare_turn_messages 内部，会改写
@@ -3760,6 +4065,7 @@ class ApiBridge:
                     turn_id,
                     model_id=active_model.get("id"),
                     error_state=error_state,
+                    turn_source=turn_source,
                 )
             finally:
                 poller_stop.set()
@@ -4044,8 +4350,14 @@ class ApiBridge:
         *,
         model_id=None,
         error_state=None,
+        turn_source="local",
     ) -> bool:
-        """迭代模型事件并翻译为前端事件；返回本轮是否被取消。"""
+        """迭代模型事件并翻译为前端事件；返回本轮是否被取消。
+
+        turn_source 是入口层受控回合来源（local|lan，设计 18），透传给
+        chat_with_model_events 的 computer_turn_source：LAN 回合即使本机
+        开关开启也拿不到 computer tool / native built-in。
+        """
         from core.llm import chat_with_model_events
 
         cancelled = False
@@ -4070,6 +4382,7 @@ class ApiBridge:
             permission_owner=turn_id,
             permission_source="主代理",
             model_id=model_id,
+            computer_turn_source=turn_source,
         ):
             if (self._cancel_events.get(session_name) or self._get_cancel_event(session_name)).is_set():
                 cancelled = True
@@ -5198,6 +5511,13 @@ class ApiBridge:
                     "provider_name": str(provider.get("name", "")),
                     "context_window": int(model.get("context_window", 128000) or 128000),
                     "supports_vision": bool(model.get("supports_vision", False)),
+                    # 电脑操控能力契约（设计 9.1）：supports_* 缺省 false；
+                    # computer_protocol 缺省返回 ""（自动：视觉+工具调用即启用），
+                    # 前端编辑表单据此回填「自动」，显式 none 仍为主动关闭。
+                    "supports_function_calling": bool(
+                        model.get("supports_function_calling", False)
+                    ),
+                    "computer_protocol": str(model.get("computer_protocol") or ""),
                 }
                 provider_models.append(item)
                 models.append(dict(item))
@@ -5340,6 +5660,8 @@ class ApiBridge:
         model_name: str,
         context_window: int = 128000,
         supports_vision: bool = False,
+        supports_function_calling: bool = False,
+        computer_protocol: str = "",
     ) -> Dict[str, Any]:
         try:
             if not str(model_name or "").strip():
@@ -5352,11 +5674,15 @@ class ApiBridge:
             except (TypeError, ValueError):
                 window = 128000
             # LiteLLM 传输前缀与厂商作用域模型 ID 的拼接规则由 model_manager 统一处理。
+            # computer_protocol 缺省/"" = 自动（不落键，视觉+工具调用即启用），
+            # 不得强转 "none"（旧实现导致新视觉模型永不自动激活）。
             model_id = add_model_to_provider(
                 real_provider_id,
                 str(model_name).strip(),
                 window,
                 supports_vision=bool(supports_vision),
+                supports_function_calling=bool(supports_function_calling),
+                computer_protocol=str(computer_protocol or ""),
             )
             self._sync_active_model_context()
             return {
@@ -5377,6 +5703,8 @@ class ApiBridge:
         model_name: str,
         context_window: int,
         supports_vision: bool,
+        supports_function_calling: bool | None = None,
+        computer_protocol: str | None = None,
     ) -> Dict[str, Any]:
         try:
             mm_update_model(
@@ -5385,6 +5713,9 @@ class ApiBridge:
                 name=str(model_name or "").strip(),
                 context_window=int(context_window),
                 supports_vision=bool(supports_vision),
+                # None 表示保留既有值（model_manager 语义），旧前端调用不受影响
+                supports_function_calling=supports_function_calling,
+                computer_protocol=computer_protocol,
             )
             self._sync_active_model_context()
             return {"ok": True, "settings": self.get_model_settings(), "msg": "模型已更新"}

@@ -423,3 +423,41 @@ def test_request_user_takeover_is_not_a_backend_action(backend):
             ComputerAction(kind="request_user_takeover", target="browser", reason_code="login_required"),
         )
     assert raised.value.code == "computer_invalid_action"
+
+
+# ---------------------------------------------------------------------------
+# Task 16（Task 6 M1 复核）：启动超时后的 worker 泄漏
+# ---------------------------------------------------------------------------
+
+
+def test_start_timeout_posts_sentinel_so_late_boot_worker_exits(tmp_path):
+    """启动超时后 worker 仍完成慢启动：关闭哨兵让 worker 立即收尾。
+
+    修复前：超时只置 _closed 就抛错，慢启动最终成功的 worker 会带着真实
+    浏览器 context 进入命令循环（queue.get 永久阻塞）——线程、浏览器进程、
+    profile 注册表锁与临时截图目录全部泄漏（close() 因 not started 而 no-op）。
+    """
+    release = threading.Event()
+
+    class SlowRuntime(FakePlaywrightRuntime):
+        def start(self):
+            release.wait(timeout=10)  # 模拟慢浏览器启动：超过 start_timeout
+            return super().start()
+
+    runtime = SlowRuntime()
+    backend = BrowserComputerBackend(
+        "edge",
+        tmp_path / "edge",
+        playwright_factory=lambda: runtime,
+        start_timeout=0.2,
+    )
+    with pytest.raises(ComputerControlError) as raised:
+        backend.start()
+    assert raised.value.code == "computer_backend_start_failed"
+
+    release.set()
+    worker = backend._worker
+    worker.join(timeout=10)
+    assert not worker.is_alive()  # worker 必须退出，绝不滞留命令循环
+    assert runtime.stopped  # Playwright runtime 已 stop
+    assert runtime.last_context.closed  # context 已 close（浏览器进程退出）

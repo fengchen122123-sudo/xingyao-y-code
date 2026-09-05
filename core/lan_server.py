@@ -126,7 +126,11 @@ class LanServer:
     # 手机端复用整个前端，需要调用几乎所有 bridge 方法（除桌面专属/危险方法）。
     # 因此用「黑名单」而非「白名单」：默认放行，只封禁 FORBIDDEN_METHODS 里的方法，
     # 避免白名单遗漏前端方法导致 "method not allowed"（如 get_background_tasks）。
-    # 黑名单覆盖：窗口控制、桌面文件/系统交互、更新安装等桌面专属或危险方法。
+    # 黑名单覆盖：窗口控制、桌面文件/系统交互、更新安装等桌面专属或危险方法，
+    # 以及电脑操控权限扩张方法（Task 15，设计 18：手机只可查看状态与紧急停止，
+    # 不得远程开启/暂停/恢复/确认安全检查）与 drain_js_queue（Task 13a 审查
+    # Minor 1 的 fail-closed 默认裁决：LAN 排空 _js_queue 会偷走桌面事件并
+    # 可能消费关停哨兵）。
     FORBIDDEN_METHODS = frozenset({
         # 窗口控制（桌面专属，手机无意义）
         "window_minimize", "window_toggle_maximize", "window_native_maximize",
@@ -137,7 +141,24 @@ class LanServer:
         "pick_files", "report_dropped_files", "save_clipboard_image",
         # 更新/安装（危险，桌面专属）
         "download_update", "cancel_download_update", "launch_installer", "check_update",
+        # 电脑操控权限扩张（Task 15，设计 18：LAN 只放行 status/stop）
+        "set_browser_control_enabled", "set_computer_control_enabled",
+        "set_computer_browser", "pause_computer_control",
+        "resume_computer_control", "acknowledge_computer_safety",
+        # GUI 事件桥内部测试 seam（等价于窃听/阻断桌面事件流）
+        "drain_js_queue",
     })
+
+    # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
+    # 内部注入 turn_source="lan" 并覆盖客户端 payload 同名字段，模型/用户
+    # 正文无法伪造回合来源；本地 GUI/CLI 调用不经本层，固定 local。
+    MESSAGE_ENTRY_METHODS = frozenset({"send_user_message"})
+
+    # send_user_message(text, session_name, attachments, workdir, model_id,
+    # turn_source)——turn_source 前共 5 个位置参数（gui_bridge.py 真实签名）。
+    # LAN 分发把客户端位置参数裁剪至前 5 个：第 6 位（turn_source 所在位置）
+    # 起的绑定通道全部剥离，turn_source 只能由服务器以 keyword 唯一注入。
+    MESSAGE_ENTRY_POSITIONAL_LIMIT = 5
 
     def __init__(self, bridge=None, port=0):
         self.bridge = bridge
@@ -369,13 +390,75 @@ class LanServer:
         method = msg.get("method")
         args = msg.get("args") or {}
         msg_id = msg.get("id")
-        if method in self.FORBIDDEN_METHODS:
+        result = self.dispatch_rpc(method, args)
+        # 禁止方法的错误形状 {"error": {"code": "method_not_allowed"}} 翻译为
+        # 既有 wire 格式（字符串 error），保持手机端 shim 兼容
+        error = result.get("error") if isinstance(result, dict) else None
+        if isinstance(error, dict) and error.get("code") == "method_not_allowed":
             ws.send(json.dumps({"id": msg_id, "error": "method not allowed"}))
             return
-        result = self._call_bridge(method, args)
         ws.send(json.dumps({"id": msg_id, "result": result}))
 
-    def _call_bridge(self, method, args) -> Dict[str, Any]:
+    def dispatch_rpc(self, method, args) -> Dict[str, Any]:
+        """单次 RPC 分发核心（WebSocket 路由与直调测试共用同一边界）。
+
+        禁止方法统一返回 ``{"error": {"code": "method_not_allowed"}}``；
+        下划线前缀的私有方法（如 ``_queue_js_payload``）同样拒绝——内部
+        seam 可向桌面 WebView 注入任意 JS，绕过全部 LAN 边界（Task 15
+        审查 Important-1，fail-closed 默认裁决：设计 18「后端必须实施
+        同一边界」）。消息入口方法由服务器内部注入 ``turn_source="lan"``
+        并剥离客户端一切同名绑定通道（设计 18：LAN 回合不可伪装成本地
+        回合获取电脑操控）。
+
+        非字符串 method（Task 16 累积小修）统一回 method_not_allowed：
+        修复前 unhashable 值在 FORBIDDEN_METHODS 判定处抛 TypeError、
+        int/None 在 getattr 分发处抛 TypeError，WebSocket 路由未捕获直接
+        断连——恶意/畸形载荷不得以异常打断服务。
+        """
+        if not isinstance(method, str):
+            return {"error": {"code": "method_not_allowed"}}
+        if method in self.FORBIDDEN_METHODS:
+            return {"error": {"code": "method_not_allowed"}}
+        if method.startswith("_"):
+            return {"error": {"code": "method_not_allowed"}}
+        extra_kwargs = None
+        if method in self.MESSAGE_ENTRY_METHODS:
+            normalized = self._force_lan_turn_source(args)
+            if normalized is None:
+                return {"ok": False, "msg": "消息参数无法规范化，已拒绝"}
+            args, extra_kwargs = normalized
+        return self._call_bridge(method, args, extra_kwargs)
+
+    def _force_lan_turn_source(self, args):
+        """消息入口参数规范化：剥离客户端一切 turn_source 绑定通道。
+
+        真实 bridge 签名 send_user_message(text, session_name, attachments,
+        workdir, model_id, turn_source)——turn_source 是第 6 个位置参数，
+        客户端可经位置参数数组第 6 位、kwargs dict 或首参 payload dict
+        绑定同名通道（Task 15 审查 Critical-1 两条绕过向量）。统一规范化
+        （返回 ``(args, extra_kwargs)``；无法规范化返回 ``None`` 由调用方
+        fail-closed 拒绝）：
+        - list：裁剪位置参数至前 5 个（text..model_id），第 6 位起丢弃；
+        - 首参为 dict（payload 形态）：删除其 turn_source 键（防夹带）；
+        - dict（kwargs 形态）：删除 turn_source 键后以 lan 覆盖。
+        最终 turn_source 只能由服务器经 _call_bridge 的 keyword 通道
+        注入 "lan"，客户端不存在任何可达的绑定通道。
+        """
+        if isinstance(args, dict):
+            merged = dict(args)
+            merged.pop("turn_source", None)
+            merged["turn_source"] = "lan"
+            return merged, None
+        if isinstance(args, list):
+            items = list(args[: self.MESSAGE_ENTRY_POSITIONAL_LIMIT])
+            if items and isinstance(items[0], dict):
+                payload = dict(items[0])
+                payload.pop("turn_source", None)
+                items[0] = payload
+            return items, {"turn_source": "lan"}
+        return None
+
+    def _call_bridge(self, method, args, extra_kwargs=None) -> Dict[str, Any]:
         """调用 bridge 方法（支持位置参数与关键字参数），异常统一吞掉回包。"""
         if self.bridge is None:
             return {"ok": False, "msg": "bridge 未初始化"}
@@ -384,10 +467,13 @@ class LanServer:
             return {"ok": False, "msg": "未知方法"}
         try:
             if isinstance(args, list):
-                return fn(*args)
+                return fn(*args, **(extra_kwargs or {}))
             if isinstance(args, dict):
-                return fn(**args)
-            return fn()
+                merged = dict(args)
+                if extra_kwargs:
+                    merged.update(extra_kwargs)
+                return fn(**merged)
+            return fn(**(extra_kwargs or {}))
         except Exception as e:
             return {"ok": False, "msg": str(e)}
 

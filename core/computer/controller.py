@@ -17,6 +17,9 @@
   import core.llm）→ backend release_inputs → backend close → 状态终结 →
   租约释放 → final event。每步独立 try/except 保证后续释放；首个清理错误记为
   run failure（failed），绝不伪装成 stopped success。
+- Task 16：stop(run_id=None) 是进程退出统一入口——先停活动 run 再关闭全部
+  retained backend；set_preview_publisher 注册观察截图发布器（GUI 预览路径，
+  发布失败只留痕不影响主链路）。
 - complete_run 与 stop 幂等；Turn 终态 finally 必须二选一调用，不留 running 租约。
 - 浏览器 backend 在 retain 时不 close，作为无执行权的 retained session 供下一
   run 显式复用；desktop backend 在 complete 时立即 release_inputs + close。
@@ -170,6 +173,7 @@ class ComputerControlService:
         self._retained: dict[str, ComputerBackend] = {}
         self._listeners: list[Callable[[dict], None]] = []
         self._last_snapshot: ComputerRunSnapshot | None = None
+        self._preview_publisher: Callable[[str, str], str] | None = None
 
     # ---------------- 事件 ----------------
 
@@ -185,6 +189,18 @@ class ComputerControlService:
                 self._listeners.remove(listener)
             except ValueError:
                 pass
+
+    def set_preview_publisher(
+        self, publisher: Callable[[str, str], str] | None
+    ) -> None:
+        """注册/清除观察截图预览发布器（GUI 预览路径，Task 16）。
+
+        publisher(run_id, png_path) 返回预览 URL；发布失败由发布器自行留痕
+        返回空串，绝不影响操控主链路。仅 GUI 路径接线（CLI 无预览 UI）；
+        注册幂等，传 None 清除。
+        """
+        with self._lock:
+            self._preview_publisher = publisher
 
     def _emit(self, run: _Run, event_type: str, **fields) -> None:
         with self._lock:
@@ -559,6 +575,17 @@ class ComputerControlService:
                 before_fingerprint=before_fingerprint,
                 after_fingerprint=after_fingerprint,
             )
+            publisher = self._preview_publisher
+            if publisher is not None and observation.png_path:
+                # Task 16：observation 产生时发布 PNG 到惰性预览服务（GUI
+                # 路径）；发布失败只留痕返回空串，绝不影响动作主链路。
+                try:
+                    published_url = publisher(run.run_id, observation.png_path)
+                except Exception:
+                    _LOGGER.exception("发布电脑操控观察截图到预览服务失败")
+                    published_url = ""
+                if published_url:
+                    observation = replace(observation, preview_url=published_url)
             no_progress_hit = False
             with self._lock:
                 # 动作后二次确认：关闭设置后旧动作不得提交成功
@@ -737,14 +764,41 @@ class ComputerControlService:
         )
         return self.snapshot()
 
-    def stop(self, run_id: str, reason: str) -> ComputerRunSnapshot:
+    def stop(
+        self,
+        run_id: str | None = None,
+        reason: str = "application_exit",
+    ) -> ComputerRunSnapshot:
         """取消/故障/紧急停止终态：固定顺序清理并关闭 backend；幂等。
 
         顺序：状态置 stopping → owner.cancel_event.set() → abort 在飞 Provider 流
         → backend release_inputs → backend close → 状态终结 → 租约释放 →
         final event。每步独立 try/except 保证后续释放；首个清理错误记为 failed，
         绝不伪装成 stopped success。
+
+        run_id 为 None（Task 16 进程退出统一入口）：先按上表停止当前活动
+        run（若有），再关闭全部 retained browser session；无活动 run 时幂等
+        返回当前快照。活动 run 停止竞态失败（已在收尾）只留痕，retained
+        清理照常执行。
         """
+        if run_id is None:
+            with self._lock:
+                active = self._run
+                active_run_id = active.run_id if active is not None else ""
+            if active_run_id:
+                try:
+                    self.stop(active_run_id, reason)
+                except ComputerControlError:
+                    _LOGGER.warning(
+                        "退出时停止活动电脑操控 run 失败（已在收尾，忽略）",
+                        exc_info=True,
+                    )
+            with self._lock:
+                retained = list(self._retained.values())
+                self._retained.clear()
+            for backend in retained:
+                _close_backend_quietly(backend)
+            return self.snapshot()
         with self._lock:
             run = self._run
             if run is None or run.run_id != run_id:
