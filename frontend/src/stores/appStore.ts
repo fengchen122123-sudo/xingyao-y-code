@@ -19,6 +19,10 @@ import type {
   ReasoningChoice,
   ReasoningSnapshot,
   SystemSettingsSnapshot,
+  ComputerProtocolChoice,
+  ComputerActionTrace,
+  ComputerControlEvent,
+  ComputerRunSnapshot,
   PyWebViewAPI,
   ToolStartEventData,
   ToolFinishEventData,
@@ -147,6 +151,91 @@ export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
 };
 
 const emptyTokenUsage = (): TokenUsage => normalizeTokenUsage();
+
+// ── 电脑操控运行态（Task 13b，设计 16.4）：纯 reducer + 快照校准 ──
+
+// 四类平铺信封事件（top-level run_id + 严格递增 event_seq）
+const COMPUTER_EVENT_TYPES = new Set([
+  'computer_state',
+  'computer_action_started',
+  'computer_action_finished',
+  'computer_observation',
+]);
+
+// ComputerRunSnapshot 的公开字段（Task 12 已有类型，17 字段复用不重复定义）
+const COMPUTER_SNAPSHOT_FIELDS = [
+  'run_id', 'owner_session_id', 'owner_turn_id', 'status', 'target', 'browser',
+  'model_name', 'protocol', 'started_at', 'action_count', 'current_action',
+  'current_surface', 'preview_url', 'pause_reason', 'stop_reason', 'error_code',
+  'hotkey_available',
+] as const;
+
+// 顶部安全条只在 run 活动期显示（brief 逐字）：idle/stopped/completed/completing 不显示
+const COMPUTER_BAR_STATUSES = [
+  'starting', 'running', 'paused', 'waiting_for_user',
+  'provider_safety_required', 'stopping', 'failed',
+];
+
+// 内存轨迹上限（设计 16.2）：只保留最新 200 条
+const COMPUTER_TRACE_MAX = 200;
+
+// 动作脱敏摘要：type_text 只显示长度（事件不带正文），其余按动作类型命名
+const COMPUTER_ACTION_KIND_LABELS: Record<string, string> = {
+  observe: '观察画面',
+  click: '点击',
+  double_click: '双击',
+  move: '移动鼠标',
+  drag: '拖拽',
+  scroll: '滚动',
+  type_text: '输入文本',
+  keypress: '按键',
+  wait: '等待',
+  navigate: '导航',
+  back: '后退',
+  forward: '前进',
+  reload: '刷新',
+  request_user_takeover: '请求用户接管',
+};
+
+const emptyComputerRun = (): ComputerRunSnapshot => ({
+  run_id: '',
+  owner_session_id: '',
+  owner_turn_id: '',
+  status: 'idle',
+  target: '',
+  browser: '',
+  model_name: '',
+  protocol: 'none',
+  started_at: 0,
+  action_count: 0,
+  current_action: '',
+  current_surface: '',
+  preview_url: '',
+  pause_reason: '',
+  stop_reason: '',
+  error_code: '',
+  hotkey_available: false,
+});
+
+// 平铺信封识别：既有事件是 {"type","data"}（无顶层 run_id），电脑操控事件带顶层
+// run_id——按 type 集合 + run_id 存在性分流，绝不误伤普通事件
+function isComputerFlatEvent(event: BridgeEvent | undefined): boolean {
+  return !!event
+    && COMPUTER_EVENT_TYPES.has(String(event.type || ''))
+    && typeof event.run_id === 'string';
+}
+
+// 轨迹行脱敏摘要：只信任契约提供的 summary / text_length，其余字段一律不透传
+function computerTraceSummary(event: Record<string, unknown>): string {
+  const explicit = event.summary;
+  if (typeof explicit === 'string' && explicit.trim()) return explicit;
+  const kind = String(event.action_kind || '');
+  if (kind === 'type_text') {
+    const length = event.text_length;
+    return typeof length === 'number' && length >= 0 ? `输入 ${length} 个字符` : '输入文本';
+  }
+  return COMPUTER_ACTION_KIND_LABELS[kind] || (kind ? `动作 ${kind}` : '电脑动作');
+}
 
 export interface ChatMessage {
   id?: string;
@@ -328,7 +417,35 @@ export const useAppStore = defineStore('app', {
       agent_turn_step_limit: 200,
       agent_turn_step_limit_min: 10,
       agent_turn_step_limit_max: 1000,
+      // 电脑操控默认关闭（设计 8.1）：真实值一律以后端快照覆盖
+      browser_control_enabled: false,
+      computer_control_enabled: false,
+      computer_browser: 'edge',
+      computer_browser_options: [],
+      computer_profile_path: '',
+      computer_platform_supported: true,
+      computer_hotkey_available: false,
+      computer_hotkey: 'Ctrl+Alt+Esc',
+      computer_run: {
+        run_id: '', owner_session_id: '', owner_turn_id: '', status: 'idle',
+        target: '', browser: '', model_name: '', protocol: 'none', started_at: 0,
+        action_count: 0, current_action: '', current_surface: '', preview_url: '',
+        pause_reason: '', stop_reason: '', error_code: '', hotkey_available: false,
+      },
     } as SystemSettingsSnapshot,
+
+    // 电脑操控运行态（Task 13b，设计 16.4）：reduceComputerEvent 纯 reducer 维护的
+    // 当前 run 快照（事件 + Bridge 快照校准），与 systemSettings.computer_run
+    // （设置读取快照）相互独立；轨迹为内存态，run 结束保留到下一个 run
+    computerRun: emptyComputerRun(),
+    computerTrace: [] as ComputerActionTrace[],
+    // 操控页签自动打开标志：run 开始时首次自动切到操控页签一次，
+    // 用户手动切走后不抢回（设计 16.2），新 run 再开一次
+    computerLastAutoOpenedRunId: '',
+    // reducer 记账（不参与渲染）：当前 run 已接受的最大 event_seq（严格递增门闩）
+    // 与动作起始毫秒（finished 事件缺 duration_ms 时计算耗时）
+    _computerEventSeq: 0,
+    _computerActionStartMs: {} as Record<number, number>,
 
     // 当前激活模型的思考能力与选择；未知模型保持隐藏，不在前端猜测能力。
     reasoning: {
@@ -537,6 +654,19 @@ export const useAppStore = defineStore('app', {
     // 当前会话排队中的消息（输入框上方排队条渲染源）
     currentMessageQueue(state): QueuedMessage[] {
       return (state.currentSessionName && state.messageQueues[state.currentSessionName]) || [];
+    },
+
+    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示
+    computerControlBarVisible(state): boolean {
+      return COMPUTER_BAR_STATUSES.includes(state.computerRun.status);
+    },
+
+    // 暂停/恢复按钮语义（设计 16.1）：starting/running 显示“暂停”，paused 显示“恢复”，
+    // waiting_for_user / provider_safety_required / stopping / failed 只保留停止
+    computerControlPausable(state): 'pause' | 'resume' | 'none' {
+      if (state.computerRun.status === 'paused') return 'resume';
+      if (state.computerRun.status === 'starting' || state.computerRun.status === 'running') return 'pause';
+      return 'none';
     },
 
     // 按供应商分组的模型列表，ModelCascader 与 Subpage(models) 共用
@@ -1519,6 +1649,250 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // ── 电脑操控系统设置（Task 12）：只以后端返回的 settings 快照覆盖本地
+    //    状态，不做乐观持久值；失败时后端快照本身就是回滚值 ──
+
+    async setBrowserControlEnabled(enabled: boolean): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_browser_control_enabled(enabled);
+        if (result && result.settings) this.systemSettings = result.settings;
+        if (!result || !result.ok) {
+          this.notifyModal('电脑操控', '浏览器操控设置失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('电脑操控', '浏览器操控设置失败: ' + err);
+        return false;
+      }
+    },
+
+    async setComputerControlEnabled(enabled: boolean): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_computer_control_enabled(enabled);
+        if (result && result.settings) this.systemSettings = result.settings;
+        if (!result || !result.ok) {
+          this.notifyModal('电脑操控', '完整电脑操控设置失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('电脑操控', '完整电脑操控设置失败: ' + err);
+        return false;
+      }
+    },
+
+    async setComputerBrowser(browser: string): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_computer_browser(browser);
+        if (result && result.settings) this.systemSettings = result.settings;
+        if (!result || !result.ok) {
+          this.notifyModal('电脑操控', '默认浏览器设置失败: ' + (result?.msg || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('电脑操控', '默认浏览器设置失败: ' + err);
+        return false;
+      }
+    },
+
+    // ── 电脑操控运行态（Task 13b，设计 16.4）：
+    //    纯事件 reducer + Bridge 快照校准 + 暂停/恢复/停止控制 ──
+
+    // 四类平铺信封事件的纯 reducer：只接受当前 run 且 event_seq 严格大于已记录值；
+    // 旧 run 的迟到事件按 run_id 拒绝。run 归属两路建立：Store 尚无 run 时首个
+    // 事件直接认领（brief 样例：无 starting 前导的 action 事件流也能建 run），
+    // 已有 run 时只有 computer_state/starting 开启新 run 并清空轨迹。
+    // action_ordinal 只表示动作顺序，不承担状态事件排序
+    reduceComputerEvent(event: ComputerControlEvent) {
+      const raw = event as unknown as Record<string, unknown>;
+      const type = String(raw.type || '');
+      if (!COMPUTER_EVENT_TYPES.has(type)) return;
+      const runId = String(raw.run_id || '');
+      const seq = Number(raw.event_seq) || 0;
+      if (!runId) return;
+      const currentRunId = this.computerRun.run_id;
+      const isNewRun = runId !== currentRunId && (
+        currentRunId === ''
+        || (type === 'computer_state' && String(raw.status || '') === 'starting')
+      );
+      if (!isNewRun) {
+        if (runId !== currentRunId) return;
+        if (seq <= this._computerEventSeq) return;
+      }
+      this._computerEventSeq = seq;
+      if (isNewRun) {
+        this.computerRun = {
+          ...emptyComputerRun(),
+          run_id: runId,
+          status: type === 'computer_state' ? String(raw.status || '') || 'starting' : 'starting',
+        };
+        this.computerTrace = [];
+        this._computerActionStartMs = {};
+      }
+      if (type === 'computer_state') {
+        const status = String(raw.status || '');
+        const target = String(raw.target || '');
+        this.computerRun = {
+          ...this.computerRun,
+          status: status || this.computerRun.status,
+          target: target || this.computerRun.target,
+        };
+        return;
+      }
+      if (type === 'computer_observation') {
+        // observation 只带 loopback token URL 与当前窗口/页面摘要，无截图内容
+        const previewUrl = String(raw.preview_url || '');
+        const surface = String(raw.origin_or_window || '');
+        this.computerRun = {
+          ...this.computerRun,
+          ...(previewUrl ? { preview_url: previewUrl } : {}),
+          ...(surface ? { current_surface: surface } : {}),
+        };
+        return;
+      }
+      // computer_action_started / computer_action_finished：轨迹行 upsert
+      const ordinal = Number(raw.action_ordinal) || 0;
+      if (ordinal <= 0) return;
+      if (type === 'computer_action_started') {
+        this._computerActionStartMs[ordinal] = Date.now();
+        this.computerRun = {
+          ...this.computerRun,
+          current_action: String(raw.action_kind || ''),
+          action_count: Math.max(this.computerRun.action_count, ordinal),
+        };
+        this._upsertComputerTrace(ordinal, computerTraceSummary(raw), 'running', 0, '');
+        return;
+      }
+      const ok = raw.ok !== false;
+      const startedAt = this._computerActionStartMs[ordinal];
+      delete this._computerActionStartMs[ordinal];
+      const durationMs = typeof raw.duration_ms === 'number' && raw.duration_ms >= 0
+        ? raw.duration_ms
+        : (startedAt ? Math.max(0, Date.now() - startedAt) : 0);
+      this._upsertComputerTrace(
+        ordinal,
+        computerTraceSummary(raw),
+        ok ? 'done' : 'failed',
+        durationMs,
+        String(raw.error_code || ''),
+      );
+    },
+
+    // 轨迹行 upsert：行内只有五个契约字段（绝不透传事件原始字段），新行插到
+    // 最前（新到旧），超过 200 条时丢弃最旧（尾部）
+    _upsertComputerTrace(
+      ordinal: number,
+      summary: string,
+      status: string,
+      durationMs: number,
+      errorCode: string,
+    ) {
+      const row: ComputerActionTrace = {
+        action_ordinal: ordinal,
+        summary,
+        status,
+        duration_ms: durationMs,
+        error_code: errorCode,
+      };
+      const idx = this.computerTrace.findIndex(r => r.action_ordinal === ordinal);
+      if (idx >= 0) {
+        this.computerTrace.splice(idx, 1, row);
+      } else {
+        this.computerTrace.unshift(row);
+      }
+      if (this.computerTrace.length > COMPUTER_TRACE_MAX) {
+        this.computerTrace.length = COMPUTER_TRACE_MAX;
+      }
+    },
+
+    // Bridge 快照校准（设计 16.4）：_js_queue 满时允许丢新事件，终态不能只依赖
+    // 事件推送——控制操作返回值、窗口重新聚焦、切到操控页签都走这里复核。
+    // 快照发现不同 run_id 时按新 run 重置轨迹与记账；同一 run 只合并已知字段，
+    // 已记录的 event_seq 门闩不下调（迟到旧事件仍被拒绝）
+    _applyComputerSnapshot(raw: Record<string, unknown>) {
+      const runId = String(raw.run_id || '');
+      if (!runId) return;
+      if (runId !== this.computerRun.run_id) {
+        this.computerRun = { ...emptyComputerRun(), run_id: runId };
+        this.computerTrace = [];
+        this._computerActionStartMs = {};
+        this._computerEventSeq = 0;
+      }
+      const patch: Partial<ComputerRunSnapshot> = {};
+      for (const field of COMPUTER_SNAPSHOT_FIELDS) {
+        if (raw[field] !== undefined) {
+          (patch as Record<string, unknown>)[field] = raw[field];
+        }
+      }
+      this.computerRun = { ...this.computerRun, ...patch };
+    },
+
+    // 拉取当前 run 完整快照校准 Store：窗口重新聚焦 / 切到操控页签时调用
+    async refreshComputerRun(): Promise<ComputerRunSnapshot | null> {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const res = await api.get_computer_control_status();
+        if (res && res.run_id) this._applyComputerSnapshot(res as unknown as Record<string, unknown>);
+        return this.computerRun;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('电脑操控', '操控状态刷新失败: ' + err);
+        return null;
+      }
+    },
+
+    async pauseComputerControl(): Promise<boolean> {
+      return this._computerControlMutation('pause_computer_control', '暂停操控');
+    },
+
+    async resumeComputerControl(): Promise<boolean> {
+      return this._computerControlMutation('resume_computer_control', '恢复操控');
+    },
+
+    async stopComputerControl(): Promise<boolean> {
+      return this._computerControlMutation('stop_computer_control', '停止操控');
+    },
+
+    // 三个控制的统一入口：run_id 取当前 Store（旧 UI 事件的 run id 由后端拒绝），
+    // 成功与失败的返回值都携带完整快照，直接校准 Store 防终态永久丢失
+    async _computerControlMutation(
+      method: 'pause_computer_control' | 'resume_computer_control' | 'stop_computer_control',
+      label: string,
+    ): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      const runId = this.computerRun.run_id;
+      if (!runId) {
+        this.notifyModal('电脑操控', label + '失败：当前没有进行中的操控会话');
+        return false;
+      }
+      try {
+        const res = await api[method](runId);
+        if (res && res.run_id) this._applyComputerSnapshot(res as unknown as Record<string, unknown>);
+        if (!res || !res.ok) {
+          this.notifyModal('电脑操控', label + '失败: ' + (res?.msg || res?.error_code || '未知错误'));
+          return false;
+        }
+        return true;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('电脑操控', label + '失败: ' + err);
+        return false;
+      }
+    },
+
     // 选择/清除副模型（传空字符串清除），对齐 CLI 的 set_secondary
     async setSecondaryModel(modelId: string) {
       const api = this._api();
@@ -2209,6 +2583,14 @@ export const useAppStore = defineStore('app', {
       const data = event.data || {};
       // 只要有事件推送过来，说明桥接链路是通的
       this.connected = true;
+
+      // 电脑操控事件是平铺信封（top-level run_id + event_seq，Task 13a 契约），
+      // 与既有 {"type","data"} 信封不同：先识别分流给纯 reducer，
+      // 不参与会话 runtime 归属，处理完直接返回
+      if (isComputerFlatEvent(event)) {
+        this.reduceComputerEvent(event as ComputerControlEvent);
+        return;
+      }
 
       const currentRuntimeKey = this._runtimeKey();
       // 拖放文件路径推送（GUI 线程死锁修复后改走 _js_queue 事件管线）：
@@ -3482,11 +3864,11 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false) {
+    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '') {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision);
+        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol);
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
           else if (res.models) this.models = res.models;
@@ -3503,11 +3885,11 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean) {
+    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '') {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision);
+        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
           this.notifyModal('模型', res.msg || '模型已更新');

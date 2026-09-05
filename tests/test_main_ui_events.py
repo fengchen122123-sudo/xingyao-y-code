@@ -1,5 +1,7 @@
 from concurrent.futures import Future
 
+import pytest
+
 import main
 from core.permission_broker import PermissionBroker, PermissionOption
 from core.tool_progress import ActiveToolStatus
@@ -1238,3 +1240,79 @@ def test_turns_command_without_args_shows_current_and_usage(tmp_path, monkeypatc
     rendered = Text.from_ansi("\n".join(printed)).plain
     assert "240" in rendered
     assert "/turns" in rendered
+
+
+# ---------------- 交互式控制台守卫（非 TTY 环境快速失败） ----------------
+
+
+class _FakeTTYStream:
+    """最小流替身：只为守卫提供 isatty()。"""
+
+    def __init__(self, tty: bool) -> None:
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def test_require_interactive_console_passes_when_both_streams_are_tty(monkeypatch):
+    monkeypatch.setattr(main.sys, "stdout", _FakeTTYStream(True), raising=False)
+    monkeypatch.setattr(main.sys, "stdin", _FakeTTYStream(True), raising=False)
+    assert main._require_interactive_console() is None
+
+
+def test_require_interactive_console_exits_with_headless_guidance_when_stdout_piped(
+    monkeypatch, capsys
+):
+    monkeypatch.setattr(main.sys, "stdout", _FakeTTYStream(False), raising=False)
+    monkeypatch.setattr(main.sys, "stdin", _FakeTTYStream(True), raising=False)
+    with pytest.raises(SystemExit) as exc_info:
+        main._require_interactive_console()
+    assert exc_info.value.code == 2
+    rendered = capsys.readouterr().err
+    assert "标准输出" in rendered
+    assert "TTY" in rendered
+    assert "-p" in rendered  # headless 模式引导
+
+
+def test_require_interactive_console_exits_when_only_stdin_piped(monkeypatch, capsys):
+    monkeypatch.setattr(main.sys, "stdout", _FakeTTYStream(True), raising=False)
+    monkeypatch.setattr(main.sys, "stdin", _FakeTTYStream(False), raising=False)
+    with pytest.raises(SystemExit) as exc_info:
+        main._require_interactive_console()
+    assert exc_info.value.code == 2
+    rendered = capsys.readouterr().err
+    assert "标准输入" in rendered
+    assert "-p" in rendered
+
+
+def test_run_cli_checks_console_before_any_initialization():
+    """接线断言：run_cli 首个可执行语句（跳过 docstring/global 声明）必须是控制台守卫。
+
+    非 TTY 管道下若守卫不在一切初始化副作用（模型选择器/后台线程/MCP 预热/
+    首绘 print_logo）之前，prompt_toolkit Win32Output 仍会裸崩溃
+    （NoConsoleScreenBufferError）。与 test_computer_cli.py 的 __main__
+    AST 测试同一模式。
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(main.__file__).read_text(encoding="utf-8")
+    function = next(
+        node
+        for node in ast.parse(source).body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_cli"
+    )
+    statements = [
+        stmt
+        for stmt in function.body
+        if not (isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Constant))
+        and not isinstance(stmt, ast.Global)
+    ]
+    first = statements[0]
+    assert isinstance(first, ast.Expr) and isinstance(first.value, ast.Call)
+    callee = first.value.func
+    callee_name = (
+        callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", "")
+    )
+    assert callee_name == "_require_interactive_console"

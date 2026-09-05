@@ -42,6 +42,8 @@ describe('SettingsPage', () => {
               provider_name: '测试厂商',
               context_window: 200000,
               supports_vision: true,
+              supports_function_calling: false,
+              computer_protocol: '',
             },
           ],
         },
@@ -110,6 +112,90 @@ describe('SettingsPage', () => {
     expect(wrapper.get('[data-test="model-modal"]').isVisible()).toBe(true);
     expect(wrapper.get('[data-test="model-supports-vision"]').attributes('type')).toBe('checkbox');
     expect(wrapper.text()).toContain('是否支持多模态');
+  });
+
+  it('opens a model editor with function calling and computer protocol fields', async () => {
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+
+    expect(wrapper.get('[data-test="model-supports-function-calling"]').attributes('type')).toBe('checkbox');
+    const protocol = wrapper.get<HTMLSelectElement>('[data-test="model-computer-protocol"]');
+    // 自动（缺省）：视觉+工具调用双勾的模型无需逐个配置协议即可电脑操控
+    expect(protocol.element.value).toBe('');
+    const optionValues = Array.from(protocol.element.options).map(option => option.value);
+    expect(optionValues).toEqual(['', 'none', 'generic', 'native_openai']);
+    expect(wrapper.text()).toContain('自动');
+  });
+
+  it('defaults legacy models to the auto protocol in the editor', async () => {
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const editButton = wrapper.findAll('.configured-model-row .row-actions button')
+      .find(button => button.text() === '编辑');
+    expect(editButton).toBeDefined();
+    await editButton!.trigger('click');
+
+    expect(wrapper.get<HTMLInputElement>('[data-test="model-supports-vision"]').element.checked).toBe(true);
+    expect(wrapper.get<HTMLInputElement>('[data-test="model-supports-function-calling"]').element.checked).toBe(false);
+    // 后端对缺键模型返回 ''（自动）；该模型 fc=false，自动判定不会赋予操控资格
+    expect(wrapper.get<HTMLSelectElement>('[data-test="model-computer-protocol"]').element.value).toBe('');
+  });
+
+  it('saves a new model with the auto protocol as an empty string', async () => {
+    const store = useAppStore();
+    const addModel = vi.spyOn(store, 'addModel').mockResolvedValue({ ok: true } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+    await wrapper.get('[data-test="model-modal"] input[placeholder="模型 ID"]').setValue('model-auto');
+    // 视觉+工具调用双勾 + 协议保持「自动」
+    await wrapper.get('[data-test="model-supports-vision"]').setValue(true);
+    await wrapper.get('[data-test="model-supports-function-calling"]').setValue(true);
+    await wrapper.get('[data-test="model-modal"]').trigger('submit');
+
+    expect(addModel).toHaveBeenCalledWith('p1', 'model-auto', 128000, true, true, '');
+  });
+
+  it('blocks saving generic protocol without vision and function calling', async () => {
+    const store = useAppStore();
+    const addModel = vi.spyOn(store, 'addModel').mockResolvedValue({ ok: true } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+    await wrapper.get('[data-test="model-modal"] input[placeholder="模型 ID"]').setValue('bad-generic');
+    // 视觉与工具调用均未开启，直接选 generic
+    await wrapper.get('[data-test="model-computer-protocol"]').setValue('generic');
+
+    expect(wrapper.get('[data-test="model-computer-protocol-error"]').text()).toBe(
+      'computer_protocol=generic 要求同时声明 supports_vision 与 supports_function_calling',
+    );
+    await wrapper.get('[data-test="model-modal"]').trigger('submit');
+
+    expect(addModel).not.toHaveBeenCalled();
+    // 前端阻止保存，modal 保持打开
+    expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(true);
+  });
+
+  it('saves a generic model with vision and function calling enabled', async () => {
+    const store = useAppStore();
+    const addModel = vi.spyOn(store, 'addModel').mockResolvedValue({ ok: true } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="add-model"]').trigger('click');
+    await wrapper.get('[data-test="model-modal"] input[placeholder="模型 ID"]').setValue('vision-model');
+    await wrapper.get('[data-test="model-supports-vision"]').setValue(true);
+    await wrapper.get('[data-test="model-supports-function-calling"]').setValue(true);
+    await wrapper.get('[data-test="model-computer-protocol"]').setValue('generic');
+
+    expect(wrapper.find('[data-test="model-computer-protocol-error"]').exists()).toBe(false);
+    await wrapper.get('[data-test="model-modal"]').trigger('submit');
+
+    expect(addModel).toHaveBeenCalledWith('p1', 'vision-model', 128000, true, true, 'generic');
+    expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(false);
   });
 
   it('keeps the model editor open when the backdrop is clicked', async () => {

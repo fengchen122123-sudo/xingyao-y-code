@@ -3,7 +3,10 @@ import socket
 import threading
 import time
 
+import pytest
+
 from core.lan_server import LanServer
+from gui_bridge import ApiBridge
 
 
 def test_detect_lan_ip_non_loopback():
@@ -316,3 +319,270 @@ def test_register_rejects_old_token_after_rotation():
     fresh = _FakeClient()
     assert srv._authenticate_and_register(fresh, srv._token.decode()) is True
     assert srv._clients == [fresh]
+
+
+# ---------------------------------------------------------------------------
+# Task 15：LAN 后端权限边界与不可伪造 Turn source（设计 18）
+# 手机可查看/停止本机已有 run，但不得远程开启权限；LAN 消息回合来源由
+# 服务器注入 turn_source="lan"，客户端 payload 同名字段无法伪造。
+# ---------------------------------------------------------------------------
+
+class _RecordingBridge:
+    """LAN 边界测试用的 bridge 替身：记录消息入口实际收到的 turn_source。
+
+    与真实 ApiBridge.send_user_message 签名同形（turn_source 是第 6 个位置
+    参数，gui_bridge.py:send_user_message）：*args 桩会从首参 dict 里"读出"
+    注入的 turn_source，掩盖位置参数绑定绕过（Task 15 审查 Critical-1 根因）。
+    """
+
+    def __init__(self):
+        self.last_turn_source = "unset"
+        self.message_calls = []
+
+    def send_user_message(self, text, session_name=None, attachments=None,
+                          workdir=None, model_id=None, turn_source="local"):
+        self.last_turn_source = turn_source
+        self.message_calls.append((text, turn_source))
+        return {"ok": True}
+
+    def get_computer_control_status(self):
+        return {"ok": True}
+
+    def stop_computer_control(self, run_id):
+        return {"ok": True}
+
+
+@pytest.fixture
+def bridge():
+    return _RecordingBridge()
+
+
+@pytest.fixture
+def server(bridge):
+    return LanServer(bridge=bridge)
+
+
+@pytest.mark.parametrize("method", [
+    "set_browser_control_enabled",
+    "set_computer_control_enabled",
+    "set_computer_browser",
+    "pause_computer_control",
+    "resume_computer_control",
+    "acknowledge_computer_safety",
+])
+def test_lan_forbids_computer_permission_expansion(server, method):
+    response = server.dispatch_rpc(method, [])
+    assert response["error"]["code"] == "method_not_allowed"
+
+
+def test_lan_forbids_drain_js_queue(server):
+    """计划外默认裁决（Task 13a 审查 Minor 1，fail-closed）：LAN 不得排空桌面事件队列。"""
+    response = server.dispatch_rpc("drain_js_queue", [])
+    assert response["error"]["code"] == "method_not_allowed"
+
+
+@pytest.mark.parametrize("method", ["get_computer_control_status", "stop_computer_control"])
+def test_lan_allows_status_and_emergency_stop(server, method):
+    assert server.dispatch_rpc(method, ["run-a"] if method.startswith("stop") else [])["ok"] is True
+
+
+def test_lan_user_message_cannot_override_turn_source(server, bridge):
+    server.dispatch_rpc("send_user_message", [{"text": "use computer", "turn_source": "local"}])
+    assert bridge.last_turn_source == "lan"
+
+
+def test_lan_user_message_kwargs_payload_turn_source_overridden(server, bridge):
+    """关键字式 payload 的 turn_source 同样被服务器覆盖为 lan。"""
+    result = server.dispatch_rpc(
+        "send_user_message", {"text": "use computer", "turn_source": "local"}
+    )
+    assert result["ok"] is True
+    assert bridge.last_turn_source == "lan"
+
+
+def test_lan_plain_text_message_gets_lan_turn_source(server, bridge):
+    """移动端 shim 的位置参数调用（纯文本）同样注入 turn_source="lan"。"""
+    result = server.dispatch_rpc("send_user_message", ["use computer"])
+    assert result["ok"] is True
+    assert bridge.last_turn_source == "lan"
+
+
+def test_lan_payload_dict_args_without_turn_source_binds_lan(server, bridge):
+    """对抗回归（Task 15 审查 Critical-1 向量 1）：首参 dict 不带 turn_source。
+
+    旧实现把注入的 "lan" 只写进首参 payload dict，真实签名桥桩的 turn_source
+    走默认值 "local"——LAN 回合伪装成本地回合。规范化后桥桩必须收到 "lan"。"""
+    result = server.dispatch_rpc("send_user_message", [{"text": "use computer"}])
+    assert result["ok"] is True
+    assert bridge.last_turn_source == "lan"
+
+
+def test_lan_payload_dict_with_positional_turn_source_stripped(server, bridge):
+    """对抗回归（Task 15 审查 Critical-1 向量 2）：首参 dict + 第 6 位置参数。
+
+    客户端在第 6 个位置参数直接绑定 "local"：旧实现只改写首参 payload，
+    位置绑定原样到达 bridge。规范化裁剪后桥桩必须收到 "lan"。"""
+    result = server.dispatch_rpc(
+        "send_user_message",
+        [{"text": "use computer"}, None, None, None, None, "local"],
+    )
+    assert result["ok"] is True
+    assert bridge.last_turn_source == "lan"
+
+
+def test_lan_positional_turn_source_cannot_reach_bridge():
+    """客户端把 turn_source 塞进第 6 个位置参数：规范化裁剪剥掉该绑定通道，
+    服务器以 keyword 唯一注入——桥桩只可能收到 "lan"，绝不收到客户端的 "local"。"""
+    calls = []
+
+    class StrictBridge:
+        # 与真实 ApiBridge.send_user_message 同形：第 6 个位置参数即 turn_source
+        def send_user_message(self, text, session_name=None, attachments=None,
+                              workdir=None, model_id=None, turn_source="local"):
+            calls.append(turn_source)
+            return {"ok": True}
+
+    srv = LanServer(bridge=StrictBridge())
+    result = srv.dispatch_rpc(
+        "send_user_message", ["hi", None, None, None, None, "local"]
+    )
+    assert result["ok"] is True
+    assert calls == ["lan"]
+
+
+def test_lan_forbids_private_underscore_methods():
+    """对抗回归（Task 15 审查 Important-1）：下划线私有方法一律拒绝。
+
+    _queue_js_payload 是桌面 JS 事件桥的内部 seam，dispatcher 拼接
+    evaluate_js 无转义——放行等价于远程向桌面 WebView 注入任意 JS，
+    可调用被禁 setter 绕过全部 LAN 边界（fail-closed 默认裁决）。"""
+    calls = []
+
+    class PrivateSeamBridge:
+        def _queue_js_payload(self, payload):
+            calls.append(payload)
+            return {"ok": True}
+
+        def _rebind(self):
+            calls.append("rebind")
+            return {"ok": True}
+
+    srv = LanServer(bridge=PrivateSeamBridge())
+    assert srv.dispatch_rpc("_queue_js_payload", ["evil js"]) == {
+        "error": {"code": "method_not_allowed"}
+    }
+    assert srv.dispatch_rpc("_rebind", []) == {
+        "error": {"code": "method_not_allowed"}
+    }
+    assert calls == []
+
+
+def test_route_rejects_private_underscore_method():
+    """WebSocket 路径与 dispatch_rpc 共用同一边界：私有方法走 wire 也被拒。"""
+    srv = LanServer(bridge=None)
+    fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    srv._route_message(
+        fake,
+        json.dumps({"method": "_queue_js_payload", "args": ["evil js"], "id": 11}),
+    )
+    assert "method not allowed" in fake.sent[0]
+
+
+def test_route_rejects_computer_permission_mutation():
+    """WebSocket 路径与 dispatch_rpc 共用同一边界：电脑操控 mutation 走 wire 也被拒。"""
+    srv = LanServer(bridge=None)
+    fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    srv._route_message(
+        fake, json.dumps({"method": "set_computer_control_enabled", "args": [True], "id": 7})
+    )
+    assert "method not allowed" in fake.sent[0]
+
+
+def test_route_injects_lan_turn_source_on_user_message():
+    """WS 路径的用户消息同样由服务器注入 turn_source="lan"（客户端 local 被覆盖）。"""
+    calls = []
+
+    class B:
+        def send_user_message(self, text, **kw):
+            calls.append((text, kw.get("turn_source")))
+            return {"ok": True}
+
+    srv = LanServer(bridge=B())
+    fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    srv._route_message(
+        fake,
+        json.dumps({"method": "send_user_message", "args": {"text": "hi", "turn_source": "local"}, "id": 1}),
+    )
+    resp = json.loads(fake.sent[0])
+    assert resp["result"]["ok"] is True
+    assert calls == [("hi", "lan")]
+
+
+def _make_bare_message_bridge(is_turn_active):
+    """构造仅含消息入口所需内部状态的裸桥（沿用 test_gui_message_queue 的桩模式）。
+
+    返回 (bridge, spawned, events)：spawned 记录回合启动调用的 (args, kwargs)。
+    """
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._shutting_down = False
+    bridge._current_session = "s1"
+    bridge._turn_start_lock = threading.Lock()
+    bridge._message_queues = {}
+    bridge._active_turns = {}
+    bridge._cancel_events = {}
+    bridge._is_turn_active = is_turn_active
+    spawned = []
+    bridge._spawn_turn_worker = lambda *a, **k: spawned.append((a, k))
+    events = []
+    bridge.emit_event = lambda etype, payload: events.append((etype, payload))
+    return bridge, spawned, events
+
+
+def test_bridge_rejects_uncontrolled_turn_source():
+    """消息入口只接受受控值 local|lan：非法来源直接拒绝，不启动回合。"""
+    bridge, spawned, _ = _make_bare_message_bridge(lambda s: False)
+    res = bridge.send_user_message("hi", turn_source="remote")
+    assert res["ok"] is False
+    assert spawned == []
+
+
+def test_bridge_local_call_keeps_default_local_turn_source():
+    """本地 GUI/CLI 调用不传 turn_source：默认 local，既有行为不变。"""
+    bridge, spawned, _ = _make_bare_message_bridge(lambda s: False)
+    assert bridge.send_user_message("hi") == {"ok": True}
+    assert spawned[0][1]["turn_source"] == "local"
+
+
+def test_bridge_passes_lan_turn_source_to_turn_worker():
+    """服务器注入的 turn_source="lan" 原样透传到回合 worker。"""
+    bridge, spawned, _ = _make_bare_message_bridge(lambda s: False)
+    assert bridge.send_user_message("hi", turn_source="lan") == {"ok": True}
+    assert spawned[0][1]["turn_source"] == "lan"
+
+
+def test_bridge_queued_message_preserves_lan_turn_source():
+    """回合运行中入队的 LAN 消息保留 turn_source：补发回合不得降级为 local。"""
+    bridge, _, _ = _make_bare_message_bridge(lambda s: True)
+    assert bridge.send_user_message("hi", turn_source="lan") == {"ok": True, "queued": True}
+    assert bridge._message_queues["s1"][0]["turn_source"] == "lan"
+
+
+# ---------------------------------------------------------------------------
+# Task 16 累积小修：非字符串 method 的 fail-closed 分发守卫
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("method", [
+    ["send_user_message"],
+    123,
+    {"method": "send_user_message"},
+    None,
+])
+def test_dispatch_rpc_rejects_non_string_method_without_type_error(server, method):
+    """非字符串 method（list/int/dict/None）统一回 method_not_allowed。
+
+    修复前：unhashable method 在 FORBIDDEN_METHODS 判定或 getattr 分发处抛
+    TypeError，WebSocket 路由未捕获直接断连；int/None 则在 getattr 处 TypeError。
+    """
+    response = server.dispatch_rpc(method, [])
+    assert response == {"error": {"code": "method_not_allowed"}}

@@ -23,10 +23,58 @@ from core.harness.request_envelope import (
     RequestEnvelope,
     _responses_input_from_messages,
     _responses_tools_from_chat_tools,
+    prepare_native_continuation_request,
     prepare_stream_request,
 )
 from core.harness.journal import journal_storage_supported
 from core.harness.runtime import TurnRuntime
+
+# 电脑操控（Task 10，设计 9.3/19）：包级轻量依赖，绝不触碰键鼠/浏览器；
+# controller 顶层也不 import core.llm，无循环导入。测试通过 monkeypatch
+# llm.resolve_computer_capability / llm.get_computer_control_service 注入 fake。
+from core.computer.capability import (
+    resolve_computer_capability,
+    take_turn_computer_capability,
+)
+from core.computer.controller import get_computer_control_service
+from core.computer.models import (
+    ComputerCapability,
+    ComputerControlError,
+    ComputerOwner,
+    ComputerProtocol,
+    ComputerRunStatus,
+)
+from core.computer.provider_generic import (
+    build_generic_computer_tool,
+    computer_error_tool_message,
+    computer_tool_arguments_projection,
+    validate_computer_tool_batch,
+)
+from core.computer.provider_openai import (
+    NATIVE_CONTINUATION_OPTION_KEYS,
+    BoundNativeController,
+    NativeContinuationState,
+    NativeTargetSelection,
+    build_computer_call_output,
+    build_native_call_persistence_row,
+    build_openai_computer_tools,
+    execute_native_computer_call,
+    native_computer_call_from_stream,
+    native_has_dual_targets,
+)
+from core.computer.settings import load_computer_settings
+from core.computer.tool_adapter import (
+    COMPUTER_ACTION_TOOL_NAME,
+    RESERVED_COMPUTER_TOOL_NAMES,
+    ComputerTurnLease,
+)
+
+# run 已终态的快照状态集合：Turn 收尾时据此跳过重复 complete/stop（幂等）。
+_COMPUTER_RUN_TERMINAL_STATUSES = frozenset({
+    ComputerRunStatus.COMPLETED.value,
+    ComputerRunStatus.STOPPED.value,
+    ComputerRunStatus.FAILED.value,
+})
 
 # 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
 # （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
@@ -1741,7 +1789,7 @@ def _account_server_usage(
     return record
 
 # The registry is the canonical capability metadata source.
-from core.tool_registry import build_default_registry
+from core.tool_registry import build_default_registry, filter_reserved_tool_schemas
 tool_registry = build_default_registry()
 
 
@@ -1773,7 +1821,12 @@ def get_tools_schema():
             _get_mcp_manager()._ensure_connected()
         except Exception:
             pass
-    return tool_registry.api_schemas() + _get_mcp_manager().get_schemas()
+    # MCP schema 合并时过滤电脑操控保留名（设计 19.2）：
+    # computer_action / computer_select_target 由固定 Harness 适配器提供，
+    # MCP 不得占用同名工具；无保留名时 tools 字节与过滤前完全一致。
+    return tool_registry.api_schemas() + filter_reserved_tool_schemas(
+        _get_mcp_manager().get_schemas()
+    )
 
 
 def completion(**kwargs):
@@ -1787,14 +1840,43 @@ def _obj_value(value, key, default=None):
     return getattr(value, key, default)
 
 
-def _chat_chunk(*, content="", reasoning="", tool_calls=None, finish_reason=None, usage=None):
+def _chat_chunk(*, content="", reasoning="", tool_calls=None, finish_reason=None,
+                usage=None, computer_call=None):
     delta = SimpleNamespace(
         content=content,
         reasoning_content=reasoning,
         tool_calls=tool_calls or [],
+        computer_call=computer_call,
     )
     choice = SimpleNamespace(delta=delta, finish_reason=finish_reason)
     return SimpleNamespace(choices=[choice], usage=usage)
+
+
+def _merge_stream_response_id(current, seen):
+    """合并流中出现的 response id；不同 id 显式冲突失败。
+
+    冲突错误消息绝不内嵌任一 response id 原文（11b 用户裁决，Task 16
+    隐私审计）——该 RuntimeError 可经 turn_error 外泄到 UI/持久化面。
+    """
+    seen = str(seen or "")
+    if not seen:
+        return current
+    if current and current != seen:
+        raise RuntimeError(
+            "Responses 流的 response id 冲突（两个不同的 id，原文不回显）"
+        )
+    return seen
+
+
+def _plain_value(value):
+    """把 litellm 事件对象树规范化为纯 dict/list/标量（computer_call 载荷用）。"""
+    if isinstance(value, dict):
+        return {key: _plain_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain_value(item) for item in value]
+    if isinstance(value, SimpleNamespace):
+        return {key: _plain_value(item) for key, item in vars(value).items()}
+    return value
 
 
 def _responses_usage_as_chat_usage(response):
@@ -1845,10 +1927,9 @@ def _normalize_responses_event_type(event_type) -> str:
 def _responses_events_as_chat_chunks(events):
     """将 Responses SSE 事件严格映射成现有工具循环消费的 chat chunks。"""
     saw_tool_calls = False
+    response_id = ""
     ignored = {
-        "response.created",
         "response.in_progress",
-        "response.output_item.done",
         "response.content_part.added",
         "response.content_part.done",
         "response.output_text.done",
@@ -1867,9 +1948,17 @@ def _responses_events_as_chat_chunks(events):
             yield _chat_chunk(reasoning=str(_obj_value(event, "delta", "")))
         elif event_type == "response.refusal.delta":
             yield _chat_chunk(content=str(_obj_value(event, "delta", "")))
+        elif event_type == "response.created":
+            # Task 11a：记录 response id，供 computer_call 载荷与原生续传使用
+            response_id = _merge_stream_response_id(
+                response_id,
+                _obj_value(_obj_value(event, "response"), "id", ""),
+            )
         elif event_type == "response.output_item.added":
             item = _obj_value(event, "item")
             if _obj_value(item, "type") != "function_call":
+                # 半截 computer_call（added 事件）绝不转发：禁止基于半截 JSON
+                # 触发执行，终态载荷只来自 output_item.done / completed。
                 continue
             saw_tool_calls = True
             output_index = int(_obj_value(event, "output_index", 0) or 0)
@@ -1894,8 +1983,30 @@ def _responses_events_as_chat_chunks(events):
                 ),
             )
             yield _chat_chunk(tool_calls=[tool_call])
+        elif event_type == "response.output_item.done":
+            item = _obj_value(event, "item")
+            if _obj_value(item, "type") == "computer_call":
+                # Task 11a：终态完整 computer_call 载荷，转发给 assembler 合并
+                saw_tool_calls = True
+                yield _chat_chunk(computer_call={
+                    "response_id": response_id,
+                    "item": _plain_value(item),
+                })
+            # 其余 item 类型维持忽略（function_call 已由 added+delta 事件覆盖）
+            continue
         elif event_type == "response.completed":
             response = _obj_value(event, "response")
+            response_id = _merge_stream_response_id(
+                response_id, _obj_value(response, "id", "")
+            )
+            # 非流式桥接可能只在 completed 的 output[] 里给出 computer_call
+            for output_item in (_obj_value(response, "output", None) or ()):
+                if _obj_value(output_item, "type") == "computer_call":
+                    saw_tool_calls = True
+                    yield _chat_chunk(computer_call={
+                        "response_id": response_id,
+                        "item": _plain_value(output_item),
+                    })
             yield _chat_chunk(
                 finish_reason="tool_calls" if saw_tool_calls else "stop",
                 usage=_responses_usage_as_chat_usage(response),
@@ -1920,6 +2031,36 @@ def _responses_events_as_chat_chunks(events):
             continue
         else:
             raise RuntimeError(f"未支持的 Responses 流事件: {event_type or '<empty>'}")
+
+
+def _native_continuation_instructions(request_kwargs) -> str:
+    """从产生 computer_call 的 Step 请求中提取续传必须重发的 instructions。
+
+    首请求的系统上下文位于 input 的 system/developer 条目（prepare_stream_request
+    语义）；continuation 请求已有 instructions 键则直接复用。多个 system 条目按
+    出现顺序以空行连接。设计 11.3：官方 Responses 的 instructions 不会经
+    previous_response_id 自动继承，漏发会导致 system prompt 语义漂移。
+    """
+    instructions = request_kwargs.get("instructions")
+    if isinstance(instructions, str):
+        return instructions
+    parts = []
+    for item in request_kwargs.get("input") or ():
+        if not isinstance(item, dict) or item.get("role") not in ("system", "developer"):
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            if content:
+                parts.append(content)
+        elif isinstance(content, list):
+            text = "".join(
+                str(block.get("text") or "")
+                for block in content
+                if isinstance(block, dict) and block.get("type") in ("text", "input_text")
+            )
+            if text:
+                parts.append(text)
+    return "\n\n".join(parts)
 
 
 def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_event=None):
@@ -2174,6 +2315,38 @@ def _claim_takeover_at_turn_start(
     return scheduler, claimed
 
 
+def resolve_turn_computer_capability(
+    model_name,
+    api_base=None,
+    model_id=None,
+    turn_source="local",
+):
+    """Turn 起点组合解析电脑操控能力（Task 10 Step 3，设计 9.3）。
+
+    按请求路由在 config 中查找模型条目，与请求实际使用的 base_url/protocol
+    一起交给纯函数 resolve_computer_capability 冻结为不可变快照；同一 Turn
+    的每个 Step 复用该快照，不做二次决策。turn_source 只接受入口层受控值
+    local|lan（不得来自用户消息或模型参数）。设置快照读取失败按
+    computer_invalid_config 拒绝（fail-closed），绝不中断普通对话。
+    """
+    from core.model_manager import get_model_config_by_litellm_model, get_model_protocol
+
+    model = get_model_config_by_litellm_model(model_name, api_base)
+    provider = {
+        "protocol": get_model_protocol(model_name, api_base),
+        "base_url": api_base,
+    }
+    try:
+        settings = load_computer_settings()
+    except ComputerControlError as error:
+        return ComputerCapability(
+            enabled=False,
+            error_code=error.code,
+            reason=error.message,
+        )
+    return resolve_computer_capability(model, provider, settings, turn_source)
+
+
 def chat_with_model_events(
     model_name,
     api_key,
@@ -2192,15 +2365,43 @@ def chat_with_model_events(
     cache_scope="main",
     cache_session_id=None,
     model_id=None,
+    computer_turn_source="local",
+    computer_capability=None,
 ):
     """Yield ordered :class:`TurnEvent` snapshots for one model turn.
 
     The legacy ``chat_with_model`` API remains text-oriented. This adapter is
     the event-oriented entry point used by the CLI and is deliberately kept
     separate while the existing tool loop is migrated incrementally.
+
+    computer_turn_source 是入口层给出的受控回合来源（local|lan）：LAN/mobile
+    发起的 Turn 在 resolve_computer_capability 内固定禁用电脑操控。
+
+    computer_capability（Task 11a F1 收敛）是调用方显式传入的 Turn 能力快照；
+    未传时优先取同线程 prepare 阶段（agent_service.build_runtime_context）存入
+    的 handoff，仍无才自行解析（兼容旧调用方）。三条路径合起来保证同一生产
+    Turn 的 capability 只解析一次；子代理回合（allow_subagents=False）始终为
+    None，不解析也不注入电脑操控。
     """
+    if computer_turn_source not in ("local", "lan"):
+        raise ValueError("computer_turn_source 只允许受控值 local 或 lan")
     resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
     resolved_parent_turn_id = parent_turn_id or resolved_turn_id
+    # Turn 起点解析一次电脑操控能力（Task 10 接线点①，设计 9.3）：局部不可变
+    # 快照贯穿全部 Step，绝不写模块级状态；子代理回合（allow_subagents=False）
+    # 不是入口层回合，不解析也不注入电脑操控。handoff 总是取出（一次性），
+    # 即使显式传参也清空，避免跨回合/跨测试泄漏旧快照。
+    if allow_subagents:
+        handoff_capability = take_turn_computer_capability()
+        if computer_capability is None:
+            computer_capability = handoff_capability
+        if computer_capability is None:
+            computer_capability = resolve_turn_computer_capability(
+                model_name, api_base, model_id, computer_turn_source
+            )
+    else:
+        computer_capability = None
+    computer_turn_capability = computer_capability
     # Duck-type 管理器（未实现 Journal 存储接口的旧测试替身/外部调用方）
     # 不进入 Harness Journal，退回 legacy add_messages 持久化路径；
     # 真实 MemoryManager 始终具备完整接口，照常走 Journal。
@@ -2315,6 +2516,7 @@ def chat_with_model_events(
             cache_session_id=cache_session_id or parent_session,
             model_id=model_id,
             harness_runtime=harness_runtime,
+            computer_capability=computer_turn_capability,
         )
         for chunk in generator:
             yield from drain_public_events()
@@ -2982,6 +3184,12 @@ _REASONING_EFFORT_LEVELS = ("low", "high", "max")
 _K3_REASONING_MODEL_NAMES = frozenset(
     {"k3", "k3-256k", "kimi-k3", "kimi-k3-256k"}
 )
+# 阶跃星辰 Anthropic 兼容端点（/step_plan/v1/messages）不接受 Anthropic 原生
+# thinking/budget_tokens，推理深度由官方扩展字段 output_config.effort 控制
+# （step-3.7-flash 取 low/medium/high）。litellm ≥1.92 原生透传该字段。
+_STEPFUN_ANTHROPIC_EFFORT_MODELS = frozenset(
+    {"step-3.7-flash", "step-router-v1"}
+)
 _ANTHROPIC_REASONING_BUDGETS = {
     "low": 1024,
     "high": 4096,
@@ -3084,7 +3292,14 @@ def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=Fa
     strategy = capability.request_strategy
     if strategy == "always_on_effort":
         if anthropic_route:
-            if normalize_reasoning_model_name(model_name) not in _K3_REASONING_MODEL_NAMES:
+            normalized_model = normalize_reasoning_model_name(model_name)
+            if normalized_model in _STEPFUN_ANTHROPIC_EFFORT_MODELS:
+                # 阶跃 Anthropic 兼容路由：思考深度用官方 output_config.effort 表达，
+                # 不接受 K3 那套 thinking.budget_tokens（服务端按未列字段拒绝）。
+                result["output_config"] = {"effort": choice}
+                result["allowed_openai_params"] = ["output_config"]
+                return capability
+            if normalized_model not in _K3_REASONING_MODEL_NAMES:
                 raise ValueError("Anthropic 路由不支持该模型的 reasoning_effort 参数")
             budget_tokens = _ANTHROPIC_REASONING_BUDGETS[choice]
             result["thinking"] = {
@@ -3440,6 +3655,62 @@ def _tool_call_arguments(tc):
     return arguments
 
 
+def _tool_call_name(tool_call) -> str:
+    """dict / 属性两种 tool_call 形态统一取 function.name。"""
+    if isinstance(tool_call, dict):
+        return str(((tool_call.get("function") or {}).get("name")) or "")
+    function = getattr(tool_call, "function", None)
+    return str(getattr(function, "name", "") or "")
+
+
+def _persisted_tool_calls(tool_calls):
+    """落库 tool_calls 的脱敏副本（设计 22.3/22.4，Task 16 隐私审计）。
+
+    computer 保留名的参数只留 computer_tool_arguments_projection 摘要
+    （输入正文/组合键/URL 只存 code point 数与 SHA-256），其余工具原样。
+    Provider 请求侧的 message_to_append 不经本函数——assistant tool_calls
+    与 tool 结果必须原样配对重发（协议要求），脱敏只作用于持久化副本。
+    """
+    projected = []
+    for tool_call in tool_calls:
+        name = _tool_call_name(tool_call)
+        if name not in RESERVED_COMPUTER_TOOL_NAMES:
+            projected.append(tool_call)
+            continue
+        sanitized = computer_tool_arguments_projection(
+            name, _raw_tool_call_arguments(tool_call)
+        )
+        if isinstance(tool_call, dict):
+            copy_of_call = dict(tool_call)
+            function = dict(copy_of_call.get("function") or {})
+            function["arguments"] = json.dumps(
+                sanitized, ensure_ascii=False, sort_keys=True
+            )
+            copy_of_call["function"] = function
+            projected.append(copy_of_call)
+        else:
+            # 属性形态（桥接层透传）：绝不让原始参数落库
+            projected.append({
+                "id": getattr(tool_call, "id", None),
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": json.dumps(
+                        sanitized, ensure_ascii=False, sort_keys=True
+                    ),
+                },
+            })
+    return projected
+
+
+def _raw_tool_call_arguments(tool_call):
+    """取 tool_call 的原始 arguments（JSON 字符串或已解析 dict），绝不解析失败。"""
+    if isinstance(tool_call, dict):
+        return (tool_call.get("function") or {}).get("arguments", "")
+    function = getattr(tool_call, "function", None)
+    return getattr(function, "arguments", "")
+
+
 def _tool_event_parts(tool_call):
     if isinstance(tool_call, dict):
         return (
@@ -3451,6 +3722,20 @@ def _tool_event_parts(tool_call):
 
 
 def _tool_event_payload_from_parts(call_id, function_name, arguments):
+    if function_name in RESERVED_COMPUTER_TOOL_NAMES:
+        # 设计 22.3（Task 16 隐私审计）：输入动作正文不进 GUI/CLI trace——
+        # computer 保留名工具的事件参数只携带脱敏投影（kind/target + 长度/
+        # 哈希），preview 恒空；summary/display 用空参数生成，绝不拼接原文。
+        return {
+            "id": call_id,
+            "name": function_name,
+            "preview": "",
+            "arguments": computer_tool_arguments_projection(
+                function_name, arguments
+            ),
+            "summary": summarize_tool_started(function_name, {}),
+            "display": build_tool_display(function_name, {}),
+        }
     preview = ""
     if function_name in ("read_file", "write_file", "edit_file"):
         preview = arguments.get("file_path", "")
@@ -3863,6 +4148,8 @@ def _build_tool_pipeline_and_context(
     allow_subagents=True,
     permission_owner=None,
     permission_source="主代理",
+    computer_lease=None,
+    computer_native_selection=None,
 ):
     from core.harness.tool_adapters import ToolAdapterSet
     from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
@@ -3902,6 +4189,8 @@ def _build_tool_pipeline_and_context(
         permission_checker=_pipeline_permission_checker,
         registry=tool_registry,
         mcp_manager=_get_mcp_manager(),
+        computer_lease=computer_lease,
+        computer_native_selection=computer_native_selection,
     )
     pipeline = ToolPipeline(
         adapters,
@@ -4152,9 +4441,13 @@ def _chat_with_model_generator(
     model_id=None,
     *,
     harness_runtime=None,
+    computer_capability=None,
 ):
     """
     内部大模型驱动生成器：一律开启流式传输以对思考标签和工具链参数进行动态清洗和处理。
+
+    computer_capability 是 Turn 起点冻结的电脑操控能力快照（Task 10）：
+    同一 Turn 的每个 Step 复用，tools contract 不随设置中途变化漂移。
     """
     from core.model_manager import get_model_protocol
 
@@ -4206,6 +4499,67 @@ def _chat_with_model_generator(
     from core.harness.progress_guard import TurnProgressGuard
 
     progress_guard = TurnProgressGuard()
+    # 电脑操控 Turn 状态（Task 10 接线点①）：capability 由入口层冻结传入；
+    # lease/run 在模型首次真正调用 computer_action 时才建立（惰性 start_run，
+    # 不让普通对话回合白白占用进程级排他租约），Turn 终态统一收尾。
+    computer_controller = None
+    computer_owner = None
+    computer_run_id = ""
+    computer_lease = None
+    # Turn 收尾方式：completed=正常文本收尾（complete_run），cancelled/failed/
+    # stopped（无进展熔断、Step 上限等）一律 stop，不留 running 租约。
+    computer_exit_kind = "stopped"
+
+    def _finalize_computer_run():
+        """Turn 终态收尾（设计 14.2）：complete_run 或 stop 二选一，幂等。
+
+        run 已被 controller 自行终结（如设置关闭触发 generation stop）时跳过；
+        领域错误只留痕不掩盖回合的原始结局，也不让收尾异常打断调用方。
+        Task 11a：原生 selector 建立的 target 租约同样在此收尾（native 与
+        generic 的 capability 互斥，不会覆盖 generic 惰性 lease）。
+        """
+        nonlocal computer_controller, computer_owner, computer_run_id
+        if (
+            native_selection is not None
+            and native_selection.run_id
+            and not computer_run_id
+        ):
+            computer_controller = native_selection.controller
+            computer_owner = native_selection.owner
+            computer_run_id = native_selection.run_id
+        if computer_controller is None or not computer_run_id:
+            return
+        try:
+            snapshot = computer_controller.snapshot()
+            if (
+                snapshot is not None
+                and snapshot.run_id == computer_run_id
+                and snapshot.status in _COMPUTER_RUN_TERMINAL_STATUSES
+            ):
+                return
+            if (
+                snapshot is not None
+                and snapshot.run_id == computer_run_id
+                and snapshot.status == ComputerRunStatus.PROVIDER_SAFETY_REQUIRED.value
+            ):
+                # Task 11b（设计 11.5）：provider_safety_required 留给用户显式
+                # 停止或升级客户端——未确认前不可 resume，Turn 收尾既不
+                # complete 也不 stop。
+                return
+            if computer_exit_kind == "completed":
+                computer_controller.complete_run(
+                    computer_run_id, computer_owner, retain_browser_session=True
+                )
+            else:
+                computer_controller.stop(
+                    computer_run_id,
+                    "turn_cancelled" if computer_exit_kind == "cancelled" else "turn_stopped",
+                )
+        except ComputerControlError as error:
+            logger.warning(
+                "电脑操控 run 收尾失败（run=%s kind=%s）：%s",
+                computer_run_id, computer_exit_kind, error,
+            )
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
     pending_persistence = []
@@ -4311,7 +4665,9 @@ def _chat_with_model_generator(
         """取消时打捞待写队列：带 tool_calls 的 assistant 消息若缺对应 tool
         结果（工具未跑完就被终止），为每个缺失的 tool_call_id 合成取消占位
         结果。保证落库历史对下一轮 API 合法（悬空 tool_calls 会 400），
-        同时保住终止前已完成的助手输出与工具结果，重开会话能看到进度。"""
+        同时保住终止前已完成的助手输出与工具结果，重开会话能看到进度。
+        悬空 computer_action call 生成稳定 9 键 JSON 的 computer_cancelled
+        结果（Task 10，设计 19.4），其余工具沿用通用取消占位文本。"""
         answered = {
             content.get("tool_call_id")
             for role, content in pending_persistence
@@ -4324,11 +4680,22 @@ def _chat_with_model_generator(
                 tcid = tc.get("id")
                 if tcid and tcid not in answered:
                     answered.add(tcid)
+                    name = (tc.get("function") or {}).get("name")
+                    if name == COMPUTER_ACTION_TOOL_NAME:
+                        cancelled_content = computer_error_tool_message(
+                            tc,
+                            ComputerControlError(
+                                "computer_cancelled",
+                                "用户取消了本回合，该电脑动作未执行完成",
+                            ),
+                        )["content"]
+                    else:
+                        cancelled_content = "[用户终止了对话，该工具未执行完成]"
                     pending_persistence.append(("tool", {
                         "role": "tool",
                         "tool_call_id": tcid,
-                        "name": (tc.get("function") or {}).get("name"),
-                        "content": "[用户终止了对话，该工具未执行完成]",
+                        "name": name,
+                        "content": cancelled_content,
                     }))
 
     # 2. 注入后台子 Agent 回报数据 (XML task-notification)
@@ -4380,6 +4747,53 @@ def _chat_with_model_generator(
     request_tools = _select_request_tools_for_route(
         model_name, api_base, request_tools
     )
+    # generic 电脑操控工具只在 Turn 冻结 capability 为 enabled+generic 且主代理
+    # 回合时追加到路由结果尾部（Task 10 Step 5，设计 19.1）：复制列表追加，
+    # 绝不缓存进全局 get_tools_schema()；capability 关闭时 tools 字节与
+    # pre-feature 基线完全一致（deepcopy 副本，不污染模块级 schema 常量）。
+    if computer_capability is not None and allow_subagents:
+        computer_tool = build_generic_computer_tool(computer_capability)
+        if computer_tool is not None:
+            request_tools = [*request_tools, computer_tool]
+    # 原生 OpenAI 协议（Task 11a，设计 11.1/11.2）：native tools 不进
+    # request_tools（chat 格式），而是经 prepare_stream_request 的
+    # native_computer_tools 参数追加在 flattened function tools 之后；
+    # 双 target 尚未选择时固定 parallel_tool_calls=false，强制 selector
+    # 单独完成一个 Step。selector 状态由固定 adapter 写入 target 租约。
+    native_computer_capability = (
+        computer_capability
+        if (
+            computer_capability is not None
+            and allow_subagents
+            and computer_capability.enabled
+            and computer_capability.protocol == ComputerProtocol.NATIVE_OPENAI.value
+        )
+        else None
+    )
+    native_selection = None
+    if native_computer_capability is not None and native_has_dual_targets(
+        native_computer_capability
+    ):
+        native_selection = NativeTargetSelection(
+            native_computer_capability,
+            ComputerOwner(
+                session_id=str(parent_session or ""),
+                turn_id=str(parent_turn_id or ""),
+                session_label=str(parent_session or parent_turn_id or ""),
+                cancel_event=(
+                    cancel_event
+                    if cancel_event is not None
+                    else threading.Event()
+                ),
+            ),
+            get_computer_control_service(),
+        )
+    # Task 11b（设计 11.3）：原生续传状态——只存活于本生成器的局部变量
+    # （Turn 内存）。computer_call 响应更新 state/output，最终文本或空响应
+    # 清空（previous_response_id 不得跨响应复用）；绝不写入 message、
+    # Journal、event 或 runtime log。
+    native_continuation_state = None
+    native_continuation_output = None
     request_tool_contract = _tool_contract_fingerprint(request_tools)
     telemetry_session_id = _resolve_cache_session_identity(cache_session_id)
     deepseek_ledger_enabled = _uses_deepseek_prompt_ledger(
@@ -4601,11 +5015,38 @@ def _chat_with_model_generator(
                         API_REQUEST_MAX_TIMEOUT_SECONDS,
                         API_REQUEST_TIMEOUT_SECONDS + max(0, _est_prompt_tokens) // 1500,
                     )
-                    prepared_request = prepare_stream_request(
-                        request_protocol,
-                        kwargs,
-                        attempt_timeout,
-                    )
+                    # 原生 native tools（Task 11a）：每个 Step 按当前 selector
+                    # 状态重算（选择后 selector 从请求消失，computer 保留）；
+                    # 双 target 能力固定 parallel_tool_calls=false。
+                    if native_continuation_state is not None:
+                        # Task 11b（设计 11.3）：原生续传 Step——input 只有
+                        # computer_call_output，不重发消息历史；model/tools/
+                        # instructions/options 经 turn_state 字节级重发，
+                        # timeout 按本 Step 注入。
+                        prepared_request = prepare_native_continuation_request(
+                            native_continuation_state,
+                            native_continuation_output,
+                            timeout=attempt_timeout,
+                        )
+                    else:
+                        step_native_tools = ()
+                        if native_computer_capability is not None:
+                            selected_target = (
+                                native_selection.target
+                                if native_selection is not None
+                                else None
+                            )
+                            step_native_tools = build_openai_computer_tools(
+                                native_computer_capability, selected_target
+                            )
+                            if native_has_dual_targets(native_computer_capability):
+                                kwargs["parallel_tool_calls"] = False
+                        prepared_request = prepare_stream_request(
+                            request_protocol,
+                            kwargs,
+                            attempt_timeout,
+                            native_computer_tools=step_native_tools,
+                        )
                     request_envelope = RequestEnvelope.capture(
                         prepared_request,
                         cache_scope=cache_scope,
@@ -4849,6 +5290,125 @@ def _chat_with_model_generator(
                     invalidation_reason=request_cache_reason,
                 )
 
+            # Task 11b（设计 11.2/11.3）：原生 computer_call 消费——一个 Step
+            # 对应一次模型决定 + 一次本地动作批次；执行后以 computer_call_output
+            # 续传下一 Step。assembler 合并的重复终态载荷是"后者覆盖"，消费侧
+            # 统一经 native_computer_call_from_stream 严格校验（parse 层拒绝
+            # 冲突载荷）。最终文本或空响应则清空续传状态（previous_response_id
+            # 不得跨响应复用），走下方普通收尾路径。
+            if native_computer_capability is not None:
+                if assembled_response.computer_call is None:
+                    native_continuation_state = None
+                    native_continuation_output = None
+                else:
+                    if assembled_response.tool_calls:
+                        # computer_call 与普通 function call 混用：静默丢弃
+                        # function call 会造成不可审计的副作用缺口，整批拒绝。
+                        raise ComputerControlError(
+                            "computer_provider_protocol_error",
+                            "同一个 Provider response 同时出现 computer_call 与 "
+                            "function call，混用批次拒绝执行",
+                        )
+                    native_target = (
+                        native_selection.target
+                        if native_selection is not None
+                        else (
+                            native_computer_capability.targets[0]
+                            if len(native_computer_capability.targets) == 1
+                            else None
+                        )
+                    )
+                    native_call = native_computer_call_from_stream(
+                        assembled_response.computer_call, target=native_target
+                    )
+                    # 惰性建立 run（与 generic 语义一致）：首个原生 computer
+                    # call 执行前建立；selector 已建立的租约直接复用。
+                    if (
+                        native_selection is not None
+                        and native_selection.run_id
+                        and not computer_run_id
+                    ):
+                        computer_controller = native_selection.controller
+                        computer_owner = native_selection.owner
+                        computer_run_id = native_selection.run_id
+                    if not computer_run_id:
+                        computer_controller = get_computer_control_service()
+                        computer_owner = ComputerOwner(
+                            session_id=str(parent_session or ""),
+                            turn_id=str(parent_turn_id or ""),
+                            session_label=str(parent_session or parent_turn_id or ""),
+                            cancel_event=(
+                                cancel_event
+                                if cancel_event is not None
+                                else threading.Event()
+                            ),
+                        )
+                        computer_run_id = str(
+                            computer_controller.start_run(
+                                computer_owner,
+                                native_computer_capability,
+                                target=native_target,
+                            ).run_id
+                        )
+                    native_result = execute_native_computer_call(
+                        native_call,
+                        BoundNativeController(
+                            computer_controller, computer_run_id, computer_owner
+                        ),
+                    )
+                    if native_result.status == "provider_safety_required":
+                        # 设计 11.5：无已验证确认契约——不执行动作、不发起
+                        # 后续 Step，run 留在 provider_safety_required 等用户
+                        # 显式停止；绝不伪造 acknowledged safety checks，也
+                        # 不回退 generic 绕过。check 原文不进入错误消息。
+                        check_ids = ", ".join(
+                            check.id for check in native_call.pending_safety_checks
+                        )
+                        raise ComputerControlError(
+                            "computer_provider_safety_required",
+                            "Provider 返回强制安全检查"
+                            + (f"（check ids: {check_ids}）" if check_ids else "")
+                            + "，未确认前不执行任何动作；请查看状态并停止",
+                        )
+                    if current_step is not None:
+                        current_step.mark_assistant_ready()
+                        current_step.mark_tools_running()
+                    # 脱敏中间行投影（brief Step 5 逐字形状）：输入文字只存
+                    # code point 数与 SHA-256，截图只存 screen hash/尺寸。
+                    native_row = build_native_call_persistence_row(
+                        computer_run_id, native_call, native_result.observation
+                    )
+                    if stream:
+                        pending_persistence.append(("assistant", native_row))
+                    flush_persistence()
+                    if current_step is not None:
+                        current_step.mark_tools_committed()
+                        if turn + 1 < max_turns:
+                            current_step.complete()
+                    # 续传材料只存 Turn 内存（NativeContinuationState 从产生
+                    # computer_call 的真实请求 kwargs 捕获，字节级同序重发）。
+                    native_continuation_state = NativeContinuationState(
+                        model=str(
+                            prepared_request.kwargs.get("model") or model_name
+                        ),
+                        tools=tuple(
+                            deepcopy(prepared_request.kwargs.get("tools") or ())
+                        ),
+                        instructions=_native_continuation_instructions(
+                            prepared_request.kwargs
+                        ),
+                        options=deepcopy({
+                            key: prepared_request.kwargs[key]
+                            for key in NATIVE_CONTINUATION_OPTION_KEYS
+                            if key in prepared_request.kwargs
+                        }),
+                        response_id=native_call.response_id,
+                    )
+                    native_continuation_output = build_computer_call_output(
+                        native_call, native_result.observation
+                    )
+                    continue
+
             reasoning_content = stream_assembler.raw_reasoning_content
             public_content = assembled_response.content
             from core.turn_renderer import sanitize_protocol_text
@@ -4914,7 +5474,13 @@ def _chat_with_model_generator(
             if provider_thinking_blocks is not None:
                 persisted_message["thinking_blocks"] = provider_thinking_blocks
             if tool_calls_list:
-                persisted_message["tool_calls"] = tool_calls_list
+                # 设计 22.3/22.4（Task 16 隐私审计）：computer 工具调用的输入
+                # 正文绝不落库——持久化副本换脱敏投影；Provider 请求侧的
+                # message_to_append 保持原始参数（assistant tool_calls 与 tool
+                # 结果必须配对原样重发），下一轮历史回放读到的是脱敏参数。
+                persisted_message["tool_calls"] = _persisted_tool_calls(
+                    tool_calls_list
+                )
             # 落库副本补充生成所用模型的显示元数据（仅持久化，不发给 LLM）
             persisted_message.update(_model_display_snapshot())
             # 落库副本提取媒体清单（![..](..) / [video:..](..) 语法归档进内容寻址
@@ -5088,6 +5654,8 @@ def _chat_with_model_generator(
                     current_step.complete()
                 if harness_runtime is not None:
                     harness_runtime.complete()
+                # 正常文本收尾：电脑操控 run 走 complete_run（Task 10，设计 14.2）
+                computer_exit_kind = "completed"
                 return
 
             if current_step is not None:
@@ -5133,6 +5701,76 @@ def _chat_with_model_generator(
             else:
                 _notify_event(event_callback, "status", {"state": "executing"})
 
+            # 电脑操控批处理约束（Task 10 接线点②，设计 10.1）：收到 tool_calls
+            # 之后、执行之前整批校验；多个 computer call 或与其他工具混用时本
+            # Step 不执行任何电脑动作（零副作用），被拒 call 在 execute_decoded
+            # 里合成稳定 9 键 JSON 错误结果，其余工具照常执行。
+            computer_batch_error = None
+            try:
+                validate_computer_tool_batch(tool_calls_list)
+            except ComputerControlError as batch_error:
+                computer_batch_error = batch_error
+            rejected_computer_calls = {}
+            if computer_batch_error is not None:
+                rejected_computer_calls = {
+                    tool_call["id"]: tool_call
+                    for tool_call in tool_calls_list
+                    if (tool_call.get("function") or {}).get("name")
+                    == COMPUTER_ACTION_TOOL_NAME
+                }
+            if (
+                computer_lease is None
+                and allow_subagents
+                and computer_capability is not None
+                and computer_capability.enabled
+                and computer_capability.protocol == ComputerProtocol.GENERIC.value
+                and not rejected_computer_calls
+                and any(
+                    (tool_call.get("function") or {}).get("name")
+                    == COMPUTER_ACTION_TOOL_NAME
+                    for tool_call in tool_calls_list
+                )
+            ):
+                # 惰性建立 Turn 电脑操控 lease（Task 10 接线点①）：模型首次真正
+                # 调用 computer_action 时 start_run 取 run_id；失败（如被其他
+                # 会话占用）时以带错误码的禁用 lease 继续本 Turn，tools contract
+                # 不重算——模型调用 computer_action 会收到该稳定错误。
+                computer_controller = get_computer_control_service()
+                computer_owner = ComputerOwner(
+                    session_id=str(parent_session or ""),
+                    turn_id=str(parent_turn_id or ""),
+                    session_label=str(parent_session or parent_turn_id or ""),
+                    cancel_event=(
+                        cancel_event
+                        if cancel_event is not None
+                        else threading.Event()
+                    ),
+                )
+                try:
+                    computer_run_id = str(
+                        computer_controller.start_run(
+                            computer_owner, computer_capability
+                        ).run_id
+                    )
+                    lease_capability = computer_capability
+                except ComputerControlError as start_error:
+                    computer_run_id = ""
+                    lease_capability = ComputerCapability(
+                        enabled=False,
+                        protocol=ComputerProtocol.NONE.value,
+                        targets=(),
+                        browser="",
+                        settings_generation=computer_capability.settings_generation,
+                        error_code=start_error.code,
+                        reason=start_error.message,
+                    )
+                computer_lease = ComputerTurnLease(
+                    lease_capability,
+                    computer_owner,
+                    computer_controller,
+                    computer_run_id,
+                )
+
             from core.harness.tool_pipeline import ToolBatchExecutor
 
             tool_pipeline, tool_context = _build_tool_pipeline_and_context(
@@ -5143,12 +5781,19 @@ def _chat_with_model_generator(
                 allow_subagents=allow_subagents,
                 permission_owner=permission_owner,
                 permission_source=permission_source,
+                computer_lease=computer_lease,
+                computer_native_selection=native_selection,
             )
             tool_calls_by_id = {
                 tool_call["id"]: tool_call for tool_call in tool_calls_list
             }
 
             def execute_decoded(decoded, context):
+                if decoded.call_id in rejected_computer_calls:
+                    return computer_error_tool_message(
+                        rejected_computer_calls[decoded.call_id],
+                        computer_batch_error,
+                    )
                 if _execute_single_tool_call is not _ORIGINAL_EXECUTE_SINGLE_TOOL_CALL:
                     return _execute_single_tool_call(
                         tool_calls_by_id[decoded.call_id],
@@ -5196,13 +5841,27 @@ def _chat_with_model_generator(
             ))
 
             results = [record.message for record in records]
+            # follow-up 观察 user 消息按 call ordinal 追加在全部 tool results
+            # 之后（Task 10 接线点③，设计 19.3/19.4）：同一 Step 的既有提交
+            # 边界内按序进入内存与持久化队列，不新增独立 SQLite 连接。
+            followup_messages = [
+                message
+                for record in records
+                for message in record.followup_messages
+            ]
             messages.extend(results)
             pending_tool_records = {
                 record.message.get("tool_call_id"): record for record in records
             }
+            if followup_messages:
+                messages.extend(followup_messages)
             if stream:
                 pending_persistence.extend(("tool", result) for result in results)
-            
+                if followup_messages:
+                    pending_persistence.extend(
+                        ("user", followup) for followup in followup_messages
+                    )
+
             if event_callback is None:
                 app_context.set_task_status('executing')
                 app_context.invalidate_ui()
@@ -5252,6 +5911,7 @@ def _chat_with_model_generator(
         return
 
     except KeyboardInterrupt:
+        computer_exit_kind = "cancelled"
         if cancel_event is not None:
             cancel_event.set()
             abort_inflight_streams(cancel_event)
@@ -5279,6 +5939,7 @@ def _chat_with_model_generator(
     except GeneratorExit:
         # GUI 消费端检测到取消后 break，生成器在 yield 点被 close：这条路径
         # 会绕过上面的 KeyboardInterrupt 分支，必须同样打捞落库再退出。
+        computer_exit_kind = "cancelled"
         try:
             response_stream.close()
         except Exception:
@@ -5297,6 +5958,7 @@ def _chat_with_model_generator(
             harness_runtime.cancel()
         raise
     except Exception as e:
+        computer_exit_kind = "failed"
         try:
             response_stream.close()
         except Exception:
@@ -5321,3 +5983,7 @@ def _chat_with_model_generator(
 
             safe_print(HTML("<ansiyellow>星瑶暂未完成当前步骤</ansiyellow>"))
         return
+    finally:
+        # 电脑操控 run 收尾（Task 10，设计 14.2）：任何 Turn 终态二选一调用
+        # complete_run/stop，不留 running 租约；无 run 时是幂等 no-op。
+        _finalize_computer_run()
