@@ -13,6 +13,7 @@ import type {
 
 export type PermissionMode = 'confirm' | 'accept_edits' | 'plan' | 'full';
 export type ReasoningChoice = 'default' | 'off' | 'on' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+export type ComputerProtocolChoice = '' | 'none' | 'generic' | 'native_openai';
 
 export interface ReasoningOption {
   value: ReasoningChoice;
@@ -35,6 +36,9 @@ export interface ModelInfo {
   provider_name: string;
   context_window: number;
   supports_vision: boolean;
+  // 电脑操控能力契约（设计 9.1）：旧模型缺省 false / 'none'，不自动获得资格
+  supports_function_calling: boolean;
+  computer_protocol: ComputerProtocolChoice;
 }
 
 export interface ProviderInfo {
@@ -90,6 +94,36 @@ export interface CommandShellOption {
   unavailable_reason: string;
 }
 
+// core.computer.settings.BrowserOption.to_dict()：单个受支持浏览器的独立探测结果
+export interface ComputerBrowserOption {
+  browser: string;
+  label: string;
+  available: boolean;
+  executable: string;
+  unavailable_reason: string;
+}
+
+// core.computer.models.ComputerRunSnapshot.to_public_dict()：脱敏后的公开字段
+export interface ComputerRunSnapshot {
+  run_id: string;
+  owner_session_id: string;
+  owner_turn_id: string;
+  status: string;
+  target: string;
+  browser: string;
+  model_name: string;
+  protocol: string;
+  started_at: number;
+  action_count: number;
+  current_action: string;
+  current_surface: string;
+  preview_url: string;
+  pause_reason: string;
+  stop_reason: string;
+  error_code: string;
+  hotkey_available: boolean;
+}
+
 export interface SystemSettingsSnapshot {
   command_shell: string;
   command_shell_options: CommandShellOption[];
@@ -99,6 +133,105 @@ export interface SystemSettingsSnapshot {
   agent_turn_step_limit: number;
   agent_turn_step_limit_min: number;
   agent_turn_step_limit_max: number;
+  // 电脑操控设置（设计 8.1/8.2）：两个开关默认关闭，浏览器选项独立探测
+  browser_control_enabled: boolean;
+  computer_control_enabled: boolean;
+  computer_browser: string;
+  computer_browser_options: ComputerBrowserOption[];
+  computer_profile_path: string;
+  computer_platform_supported: boolean;
+  computer_hotkey_available: boolean;
+  computer_hotkey: string;
+  computer_run: ComputerRunSnapshot;
+}
+
+// 电脑操控三个严格 setter 的统一返回形状（Task 12）：
+// 失败时携带稳定 error_code + 后端真实 settings 快照供前端回滚
+export interface SystemSettingsMutationResult {
+  ok: boolean;
+  error_code?: string;
+  msg?: string;
+  settings: SystemSettingsSnapshot;
+}
+
+// 电脑操控控制 API 统一返回（Task 13a）：快照字段平铺 + ok/msg，
+// 失败时 error_code/msg 覆盖快照同名字段（与 gui_bridge._run_computer_mutation 一致），
+// 前端用完整快照校准 Store（设计 16.4）
+export interface ComputerControlResult extends ComputerRunSnapshot {
+  ok: boolean;
+  msg?: string;
+}
+
+// 电脑操控四类事件（Task 13a）：平铺信封——run_id 与严格递增的 event_seq 都在
+// 顶层，与既有 {"type","data"} 信封不同；事件体只含脱敏小 JSON，绝不携带截图
+// base64 或输入正文。载荷字段按防御性解析声明为可选并容忍未知扩展字段
+export type ComputerEventType =
+  | 'computer_state'
+  | 'computer_action_started'
+  | 'computer_action_finished'
+  | 'computer_observation';
+
+export interface ComputerEventBase {
+  run_id: string;
+  event_seq: number;
+  type: string;
+}
+
+export interface ComputerStateEvent extends ComputerEventBase {
+  type: 'computer_state';
+  status?: string;
+  target?: string;
+  reason?: string;
+  [key: string]: unknown;
+}
+
+export interface ComputerActionStartedEvent extends ComputerEventBase {
+  type: 'computer_action_started';
+  action_ordinal?: number;
+  action_kind?: string;
+  target?: string;
+  [key: string]: unknown;
+}
+
+export interface ComputerActionFinishedEvent extends ComputerEventBase {
+  type: 'computer_action_finished';
+  action_ordinal?: number;
+  action_kind?: string;
+  ok?: boolean;
+  error_code?: string;
+  // 契约扩展位：后端可能补发脱敏摘要/耗时（brief ComputerActionTrace 字段）
+  summary?: string;
+  duration_ms?: number;
+  [key: string]: unknown;
+}
+
+export interface ComputerObservationEvent extends ComputerEventBase {
+  type: 'computer_observation';
+  action_ordinal?: number;
+  target?: string;
+  screen_sha256?: string;
+  width?: number;
+  height?: number;
+  origin_or_window?: string;
+  // 只带 "/computer-preview/" 开头的 loopback token URL，无截图内容
+  preview_url?: string;
+  [key: string]: unknown;
+}
+
+export type ComputerControlEvent =
+  | ComputerStateEvent
+  | ComputerActionStartedEvent
+  | ComputerActionFinishedEvent
+  | ComputerObservationEvent;
+
+// 前端内存操作轨迹行（脱敏）：只含五个契约字段；type_text 只显示长度，
+// 绝不存输入正文（设计 16.2 / 22）
+export interface ComputerActionTrace {
+  action_ordinal: number;
+  summary: string;
+  status: string;
+  duration_ms: number;
+  error_code: string;
 }
 
 export interface SkillInfo {
@@ -346,7 +479,11 @@ export interface SubagentProgressEventData {
 
 export interface BridgeEvent {
   type: string;
-  data: any;
+  // 既有事件信封为 {"type","data"}；电脑操控事件（Task 13a）为平铺信封，
+  // data 缺省、run_id/event_seq 直接在顶层，识别规则见 appStore
+  data?: any;
+  run_id?: string;
+  event_seq?: number;
 }
 
 // 后端所有方法均返回 Promise<纯 JSON 对象>；大多数写操作的返回值形状
@@ -374,6 +511,17 @@ export interface PyWebViewAPI {
   set_command_shell(shellId: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // 电脑操控三个严格 setter（Task 12）：失败返回 error_code + 后端真实快照
+  set_browser_control_enabled(value: boolean): Promise<SystemSettingsMutationResult>;
+  set_computer_control_enabled(value: boolean): Promise<SystemSettingsMutationResult>;
+  set_computer_browser(value: string): Promise<SystemSettingsMutationResult>;
+  // 电脑操控运行控制（Task 13a）：快照字段平铺返回（含失败），前端校准 Store
+  get_computer_control_status(): Promise<ComputerControlResult>;
+  pause_computer_control(runId: string): Promise<ComputerControlResult>;
+  resume_computer_control(runId: string): Promise<ComputerControlResult>;
+  stop_computer_control(runId: string): Promise<ComputerControlResult>;
+  // Provider 强制安全检查确认：官方契约验证完成前固定不可用（Task 11b 条件）
+  acknowledge_computer_safety(runId: string, checkIds?: string[]): Promise<ComputerControlResult>;
   get_permission_rules(): Promise<any>;
   add_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;
   remove_permission_rule(ruleType: 'command' | 'write' | 'edit', value: string): Promise<any>;
@@ -484,8 +632,8 @@ export interface PyWebViewAPI {
   update_provider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_provider_api_key(providerId: string): Promise<{ ok: boolean; api_key?: string; msg?: string }>;
   delete_provider(providerId: string): Promise<any>;
-  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean): Promise<any>;
-  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean): Promise<any>;
+  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice): Promise<any>;
+  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice): Promise<any>;
   delete_model(modelId: string): Promise<any>;
   test_model(modelId: string): Promise<any>;
   set_secondary_model(modelId: string): Promise<any>;

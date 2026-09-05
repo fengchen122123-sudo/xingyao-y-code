@@ -483,6 +483,21 @@
           <input v-model="modelModal.supports_vision" data-test="model-supports-vision" type="checkbox" />
           <span><b>是否支持多模态</b><small>启用后允许向该模型发送图片内容</small></span>
         </label>
+        <label class="vision-choice">
+          <input v-model="modelModal.supports_function_calling" data-test="model-supports-function-calling" type="checkbox" />
+          <span><b>是否支持工具调用</b><small>启用后模型可调用函数工具；电脑操控要求同时开启多模态（视觉识图）与本项</small></span>
+        </label>
+        <label class="field-label">电脑操控协议</label>
+        <select v-model="modelModal.computer_protocol" data-test="model-computer-protocol" class="text-field">
+          <option value="">自动（多模态与工具调用都开启即可操控）</option>
+          <option value="none">无（不具备电脑操控）</option>
+          <option value="generic">通用视觉工具协议（generic）</option>
+          <option value="native_openai">OpenAI 原生 Computer Use（native_openai）</option>
+        </select>
+        <p class="modal-field-hint">电脑操控要求模型支持视觉（识图）与工具调用；选「自动」时，两项能力都勾选的模型在开关开启后即可直接操控。</p>
+        <p v-if="computerProtocolError" data-test="model-computer-protocol-error" class="modal-field-error">
+          {{ computerProtocolError }}
+        </p>
         <div class="modal-actions">
           <button type="button" class="secondary-button" @click="closeModelModal">取消</button>
           <button type="submit" class="primary-button" :disabled="saving">保存</button>
@@ -519,7 +534,7 @@ import { computed, onMounted, reactive, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
-import type { ChangelogEntry, ModelInfo } from '../types/pywebview';
+import type { ChangelogEntry, ComputerProtocolChoice, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
 import SystemSettings from './SystemSettings.vue';
@@ -572,7 +587,21 @@ const modelModal = reactive({
   name: '',
   context_window: 128000,
   supports_vision: false,
+  // 电脑操控能力契约（设计 9.1）：generic 必须同时具备视觉与工具调用；
+  // 缺省 ''（自动）= 视觉+工具调用双勾即可操控，无需逐个配置协议
+  supports_function_calling: false,
+  computer_protocol: '' as ComputerProtocolChoice,
 });
+
+// 与后端 model_manager._validate_computer_combination 同一校验原因（Task 12）
+const COMPUTER_PROTOCOL_GENERIC_REASON = 'computer_protocol=generic 要求同时声明 supports_vision 与 supports_function_calling';
+
+const computerProtocolError = computed(() => (
+  modelModal.computer_protocol === 'generic'
+  && !(modelModal.supports_vision && modelModal.supports_function_calling)
+)
+  ? COMPUTER_PROTOCOL_GENERIC_REASON
+  : '');
 
 // 外观与主题编辑器（常驻挂载，通过 defineExpose 暴露脏检查）
 const themeEditorRef = ref<InstanceType<typeof GuiThemeSettings> | null>(null);
@@ -755,6 +784,10 @@ function openModelModal(model?: ModelInfo) {
   modelModal.name = model?.name || '';
   modelModal.context_window = model?.context_window || 128000;
   modelModal.supports_vision = model?.supports_vision || false;
+  // 旧模型缺省 false/'none'，不自动获得电脑操控资格（设计 9.1）
+  modelModal.supports_function_calling = model?.supports_function_calling || false;
+  // 后端缺键模型返回 ''（自动）；显式 none/generic/native_openai 原样回填
+  modelModal.computer_protocol = model?.computer_protocol || '';
 }
 
 function closeModelModal() {
@@ -767,16 +800,23 @@ async function saveModel() {
     store.notifyModal('表单校验', '请填写有效的模型 ID 和上下文窗口');
     return;
   }
+  // 前端先阻止半有效 generic 保存并显示校验原因；后端仍会再次校验
+  if (computerProtocolError.value) {
+    store.notifyModal('表单校验', computerProtocolError.value);
+    return;
+  }
   saving.value = true;
   let result;
   if (modelModal.model_id) {
     result = await store.updateModel(
       provider.id, modelModal.model_id, modelModal.name.trim(),
       Number(modelModal.context_window), modelModal.supports_vision,
+      modelModal.supports_function_calling, modelModal.computer_protocol,
     );
   } else {
     result = await store.addModel(
       provider.id, modelModal.name.trim(), Number(modelModal.context_window), modelModal.supports_vision,
+      modelModal.supports_function_calling, modelModal.computer_protocol,
     );
   }
   saving.value = false;
@@ -1111,6 +1151,7 @@ onMounted(async () => {
 .role-choice { display: flex; align-items: flex-start; gap: 9px; padding: 11px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg1); color: var(--text); }
 .role-choice span { display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
 .role-choice small { color: var(--text-faint); }
+.modal-field-error { margin: 8px 0 0; color: var(--danger); font-size: 12px; line-height: 1.6; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 
 /* ── 权限与沙盒分区 ── */

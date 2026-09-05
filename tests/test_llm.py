@@ -484,18 +484,50 @@ def test_k3_reasoning_choice_maps_to_anthropic_thinking_budget(
     assert "reasoning_effort" not in opts.get("extra_body", {})
 
 
-def test_anthropic_thinking_budget_conversion_is_limited_to_k3(monkeypatch):
-    """复用 effort 策略的非 K3 模型不能误套 K3 的 token 预算。"""
+@pytest.mark.parametrize(
+    ("choice", "effort"),
+    [("low", "low"), ("medium", "medium"), ("high", "high")],
+)
+def test_stepfun_anthropic_route_maps_effort_to_output_config(
+    monkeypatch, choice, effort
+):
+    """阶跃 Anthropic 兼容路由：档位映射为官方 output_config.effort，而非 K3 的 budget。"""
     from core.llm import _provider_request_options
 
-    _patch_model_cfg(monkeypatch, {"reasoning_choice": "medium"})
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": choice})
+
+    opts = _provider_request_options(
+        "anthropic/step-3.7-flash", "https://api.stepfun.com/step_plan"
+    )
+
+    assert opts["output_config"] == {"effort": effort}
+    assert opts["allowed_openai_params"] == ["output_config"]
+    assert "thinking" not in opts
+    assert "reasoning_effort" not in opts
+    assert "reasoning_effort" not in opts.get("extra_body", {})
+
+
+def test_unknown_always_on_effort_model_fails_on_anthropic_route(monkeypatch):
+    """未适配 Anthropic 协议的 always_on_effort 模型必须显式失败，不得伪造参数。"""
+    from core.llm import _provider_request_options
+    from core.reasoning_capabilities import (
+        REASONING_CAPABILITIES,
+        ReasoningCapability,
+    )
+
+    monkeypatch.setitem(
+        REASONING_CAPABILITIES,
+        "future-model",
+        ReasoningCapability("effort", ("default", "high"), "always_on_effort"),
+    )
+    _patch_model_cfg(monkeypatch, {"reasoning_choice": "high"})
 
     with pytest.raises(
         ValueError,
         match="Anthropic 路由不支持该模型的 reasoning_effort 参数",
     ):
         _provider_request_options(
-            "anthropic/step-3.7-flash", "https://api.stepfun.com/step_plan"
+            "anthropic/future-model", "https://gateway.example/v1"
         )
 
 

@@ -1,0 +1,932 @@
+"""电脑操控测试共享 fixture 契约（计划 Cross-Task Interface Contract）。
+
+Task 3 已提供 use_temp_config；Task 4 补充 enabled_settings fixture、
+openai_compatible_provider() 数据 helper 与 capability 常量
+GENERIC_CAPABILITY / NATIVE_BROWSER_CAPABILITY / DISABLED_CAPABILITY；
+Task 5 补充 FakeHotkeyApi、fake_png_bytes(seed) 与 http_status(url)；
+Task 6 补充 FakePlaywrightRuntime / FakeBrowserContext / FakePage /
+FakeMouse / FakeKeyboard（记录 launch 参数、page 调用与每个调用的 thread id，
+可注入 error，绝不启动真实浏览器）；
+本 Task（Task 7）补充 FakeImage / FakeWin32Adapter（虚拟桌面截图与 SendInput
+的纯 fake：记录点击/移动/滚轮/文本/组合键，支持 fail_after 注入失败与
+secure desktop/无前台窗口/尺寸不一致场景，绝不触碰真实截屏、鼠标或键盘）。
+Task 8 补充 FakeComputerBackend（ComputerBackend 协议纯 fake：记录
+start/observe/execute/release_inputs/close 调用计数与线程，支持注入截图 hash
+序列控制 no-progress、注入 observe/execute/close 错误、execute_gate 阻塞验证
+动作串行，绝不触碰真实键鼠/浏览器）。
+Task 9 补充 FakeController（ComputerControlService 最小 fake：固定 run/owner、
+记录动作、按序注入观察或错误、snapshot 暴露 action_count，供固定适配器测试；
+绝不触碰真实键鼠/浏览器/截屏）。
+Task 13a 补充 FakeBridgeController（ComputerControlService 的 GUI Bridge fake：
+listener 注册/事件发射 + start_run(run_id=)/pause/resume/stop 透传记录与
+run_id 拒绝语义，供 Bridge 事件桥与控制 API 测试；绝不触碰真实键鼠/浏览器/截屏）。
+Task 16 给 FakeComputerBackend 增补 png_path（观察携带的虚拟截图路径，不读
+真实文件，供预览发布接线与隐私审计测试）。
+其余请求捕获 helper 由后续 Task 按需在本文件扩展，禁止平行实现。
+"""
+
+import json
+import threading
+import time
+import urllib.error
+import urllib.request
+from dataclasses import replace
+
+import pytest
+
+import config
+from core.computer.models import (
+    ComputerCapability,
+    ComputerControlError,
+    ComputerObservation,
+    ComputerRunSnapshot,
+)
+from core.computer.settings import ComputerSettingsSnapshot
+
+
+def use_temp_config(tmp_path, monkeypatch, values):
+    """把 values 写入临时 config.json 并 monkeypatch 指向它，返回 config 路径（Path）。
+
+    同时把 TOML overlay 指向同目录下不存在的 config.toml，隔离真实
+    ~/.ycode/config.toml 对读取结果的只读覆盖。
+    """
+    cfg = tmp_path / "config.json"
+    cfg.write_text(json.dumps(values, ensure_ascii=False), encoding="utf-8")
+    monkeypatch.setattr(config, "_CONFIG_FILE", str(cfg))
+    monkeypatch.setattr(config, "_TOML_CONFIG_FILE", str(tmp_path / "config.toml"))
+    return cfg
+
+
+@pytest.fixture
+def enabled_settings():
+    """两个开关均开启、Windows 平台、edge 浏览器的设置快照。"""
+    return ComputerSettingsSnapshot(
+        browser_control_enabled=True,
+        computer_control_enabled=True,
+        computer_browser="edge",
+        browser_options=(),
+        profile_display_path="",
+        platform_supported=True,
+        generation=1,
+    )
+
+
+def openai_compatible_provider() -> dict:
+    """OpenAI 兼容（非官方）provider dict；generic 路径不校验 provider 字段。"""
+    return {"protocol": "openai", "base_url": "https://api.deepseek.com"}
+
+
+GENERIC_CAPABILITY = ComputerCapability(
+    enabled=True,
+    protocol="generic",
+    targets=("browser", "desktop"),
+    browser="edge",
+    settings_generation=1,
+)
+
+NATIVE_BROWSER_CAPABILITY = ComputerCapability(
+    enabled=True,
+    protocol="native_openai",
+    targets=("browser",),
+    browser="edge",
+    settings_generation=1,
+)
+
+# Task 11a：browser 与 desktop 双 target 同时开启的原生能力快照。
+NATIVE_DUAL_TARGET_CAPABILITY = ComputerCapability(
+    enabled=True,
+    protocol="native_openai",
+    targets=("browser", "desktop"),
+    browser="edge",
+    settings_generation=1,
+)
+
+DISABLED_CAPABILITY = ComputerCapability(
+    enabled=False,
+    error_code="computer_disabled",
+    reason="电脑操控未开启",
+)
+
+
+# ---------------- Task 5 导出：热键 fake 与预览服务 helper ----------------
+
+
+class FakeHotkeyApi:
+    """最小确定性 HotkeyApi fake：只记录注册/注销，绝不触碰真实系统热键。"""
+
+    def __init__(self, register_result: bool = True):
+        self._register_result = register_result
+        self.register_calls = 0
+        self.unregister_calls = 0
+        self.on_hotkey = None
+
+    def register(self, on_hotkey):
+        self.register_calls += 1
+        if self._register_result:
+            self.on_hotkey = on_hotkey
+        return self._register_result
+
+    def unregister(self):
+        self.unregister_calls += 1
+        self.on_hotkey = None
+
+
+def fake_png_bytes(seed: int) -> bytes:
+    """确定性伪 PNG 字节：合法 PNG 魔数 + seed 派生内容；仅供预览服务测试。"""
+    return b"\x89PNG\r\n\x1a\n" + b"fake" + int(seed).to_bytes(4, "big", signed=False)
+
+
+def http_status(url: str) -> int:
+    """GET 一次并返回 HTTP 状态码；HTTPError（如 404）返回其 code。"""
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return int(response.status)
+    except urllib.error.HTTPError as error:
+        return int(error.code)
+
+
+# ---------------- Task 6 导出：Playwright fake（绝不启动真实浏览器） ----------------
+
+
+class FakeMouse:
+    """page.mouse fake：按调用顺序记录 (name, *args)，可注入 move/up 失败。"""
+
+    def __init__(self, runtime):
+        self._runtime = runtime
+        self.calls = []
+        self.move_fail_after = None  # 第 N+1 次 move 起抛 RuntimeError
+        self.up_error = None
+        self._move_count = 0
+
+    def click(self, x, y, button="left", **kwargs):
+        self._runtime._record_call("mouse.click")
+        self.calls.append(("click", x, y, button))
+
+    def dblclick(self, x, y, button="left", **kwargs):
+        self._runtime._record_call("mouse.dblclick")
+        self.calls.append(("dblclick", x, y, button))
+
+    def move(self, x, y, **kwargs):
+        self._runtime._record_call("mouse.move")
+        self._move_count += 1
+        self.calls.append(("move", x, y))
+        if self.move_fail_after is not None and self._move_count > self.move_fail_after:
+            raise RuntimeError("injected mouse.move failure")
+
+    def down(self, button="left", **kwargs):
+        self._runtime._record_call("mouse.down")
+        self.calls.append(("down", button))
+
+    def up(self, button="left", **kwargs):
+        self._runtime._record_call("mouse.up")
+        self.calls.append(("up", button))
+        if self.up_error is not None:
+            raise self.up_error
+
+    def wheel(self, delta_x, delta_y, **kwargs):
+        self._runtime._record_call("mouse.wheel")
+        self.calls.append(("wheel", delta_x, delta_y))
+
+
+class FakeKeyboard:
+    """page.keyboard fake：记录 press/insert_text。"""
+
+    def __init__(self, runtime):
+        self._runtime = runtime
+        self.calls = []
+
+    def press(self, key, **kwargs):
+        self._runtime._record_call("keyboard.press")
+        self.calls.append(("press", key))
+
+    def insert_text(self, text, **kwargs):
+        self._runtime._record_call("keyboard.insert_text")
+        self.calls.append(("insert_text", text))
+
+
+class FakePage:
+    """page fake：记录 goto/导航/截图调用，支持 closed 标记与错误/阻塞注入。"""
+
+    def __init__(self, runtime, url="about:blank", title="", screenshot_bytes=None):
+        self._runtime = runtime
+        self._context = None
+        self.url = url
+        self.page_title = title
+        self.closed = False
+        self.mouse = FakeMouse(runtime)
+        self.keyboard = FakeKeyboard(runtime)
+        self.goto_calls = []
+        self.navigation_calls = []
+        self.screenshot_calls = []
+        self.screenshot_bytes = screenshot_bytes  # None 时回落到 runtime.screenshot_bytes
+        self.screenshot_error = None
+        self.screenshot_gate = None  # threading.Event：设置后 screenshot 阻塞等待
+        self.screenshot_delay = 0.0
+        self.concurrency_violations = 0
+        self._inside_screenshot = False
+
+    def is_closed(self):
+        self._runtime._record_call("page.is_closed")
+        return self.closed
+
+    def title(self):
+        self._runtime._record_call("page.title")
+        return self.page_title
+
+    def goto(self, url, **kwargs):
+        self._runtime._record_call("page.goto")
+        self.goto_calls.append(url)
+        self.url = url
+
+    def go_back(self, **kwargs):
+        self._runtime._record_call("page.go_back")
+        self.navigation_calls.append("go_back")
+
+    def go_forward(self, **kwargs):
+        self._runtime._record_call("page.go_forward")
+        self.navigation_calls.append("go_forward")
+
+    def reload(self, **kwargs):
+        self._runtime._record_call("page.reload")
+        self.navigation_calls.append("reload")
+
+    def screenshot(self, type=None, **kwargs):  # noqa: A002 - playwright kwarg 名
+        self._runtime._record_call("page.screenshot")
+        if self._inside_screenshot:
+            self.concurrency_violations += 1
+        self._inside_screenshot = True
+        try:
+            if self.screenshot_gate is not None:
+                self.screenshot_gate.wait(timeout=10)
+            if self.screenshot_delay:
+                time.sleep(self.screenshot_delay)
+            if self.screenshot_error is not None:
+                raise self.screenshot_error
+            self.screenshot_calls.append({"type": type, **kwargs})
+            if self.screenshot_bytes is not None:
+                return self.screenshot_bytes
+            return self._runtime.screenshot_bytes
+        finally:
+            self._inside_screenshot = False
+
+    def close(self):
+        self.closed = True
+
+
+class FakeBrowserContext:
+    """persistent context fake：pages 列表、page/close 事件、new_page 计数。"""
+
+    def __init__(self, runtime, pages=()):
+        self._runtime = runtime
+        self.pages = list(pages)
+        for page in self.pages:
+            page._context = self
+        self.new_page_calls = 0
+        self.closed = False
+        self._handlers = {"page": [], "close": []}
+
+    def on(self, event, handler):
+        self._runtime._record_call("context.on")
+        self._handlers.setdefault(event, []).append(handler)
+
+    def new_page(self):
+        self._runtime._record_call("context.new_page")
+        self.new_page_calls += 1
+        page = FakePage(self._runtime)
+        page._context = self
+        self.pages.append(page)
+        self._emit("page", page)
+        return page
+
+    def simulate_popup(self, url="https://popup.example/", title="Popup"):
+        """测试专用：模拟用户/脚本打开的 popup，触发 context 的 page 事件。"""
+        page = FakePage(self._runtime, url=url, title=title)
+        page._context = self
+        self.pages.append(page)
+        self._emit("page", page)
+        return page
+
+    def close(self):
+        self._runtime._record_call("context.close")
+        self.closed = True
+        for page in self.pages:
+            page.closed = True
+        self._emit("close")
+
+    def _emit(self, event, *args):
+        for handler in list(self._handlers.get(event, [])):
+            handler(*args)
+
+
+class FakeChromium:
+    """runtime.chromium fake：记录 launch_persistent_context 参数与 channel。"""
+
+    def __init__(self, runtime):
+        self._runtime = runtime
+        self.launch_persistent_context_calls = []
+
+    def launch_persistent_context(self, **kwargs):
+        self._runtime._record_call("chromium.launch_persistent_context")
+        self.launch_persistent_context_calls.append(dict(kwargs))
+        self._runtime.requested_channels.append(kwargs.get("channel"))
+        if self._runtime.error is not None:
+            raise self._runtime.error
+        context = FakeBrowserContext(self._runtime, pages=self._runtime.initial_pages)
+        self._runtime.contexts.append(context)
+        return context
+
+
+class FakePlaywrightRuntime:
+    """sync_playwright() 上下文管理器 fake。
+
+    - ``error``：launch_persistent_context 时抛出（记录 channel 后再抛）；
+    - ``start_error``：runtime.start() 时抛出；
+    - ``start_thread_id`` 记录 runtime 启动线程；``call_thread_ids`` 按序记录
+      每个 fake Playwright 调用的 thread id，用于断言 worker 线程独占；
+    - 绝不启动真实浏览器、绝不导入 playwright。
+    """
+
+    def __init__(self, error=None, initial_pages=(), screenshot_bytes=None, start_error=None):
+        self.error = error
+        self.start_error = start_error
+        self.initial_pages = list(initial_pages)
+        for page in self.initial_pages:
+            page._runtime = self
+        self.screenshot_bytes = screenshot_bytes if screenshot_bytes is not None else fake_png_bytes(0)
+        self.requested_channels = []
+        self.chromium = FakeChromium(self)
+        self.contexts = []
+        self.started = False
+        self.stopped = False
+        self.start_thread_id = None
+        self.call_thread_ids = []
+
+    @property
+    def last_context(self):
+        return self.contexts[-1] if self.contexts else None
+
+    def _record_call(self, label):
+        self.call_thread_ids.append(threading.get_ident())
+
+    def start(self):
+        self._record_call("runtime.start")
+        if self.start_error is not None:
+            raise self.start_error
+        self.started = True
+        self.start_thread_id = threading.get_ident()
+        return self
+
+    def stop(self):
+        self._record_call("runtime.stop")
+        self.started = False
+        self.stopped = True
+
+
+# ---------------- Task 7 导出：Windows 桌面截图与 SendInput fake ----------------
+
+
+class FakeImage:
+    """Pillow Image 的纯 fake：只携带尺寸与虚拟桌面原点，绝不真实截屏。
+
+    - ``size``/``resize()``/``save()`` 与 Pillow 最小接口对齐；
+    - ``save()`` 写入由 (width, height, origin_x, origin_y) 决定的确定性字节，
+      并把调用参数记录到 ``saved_with`` 供断言确定参数编码；
+    - 默认 origin 为 (0, 0)；brief 样例使用的 3840x2160 @ (-1920, 0) 模拟
+      主屏右侧 + 左侧扩展屏的多显示器虚拟桌面。
+    """
+
+    def __init__(self, width, height, origin_x=0, origin_y=0):
+        self.width = width
+        self.height = height
+        self.origin_x = origin_x
+        self.origin_y = origin_y
+        self.resize_calls = []
+        self.saved_with = []
+
+    @property
+    def size(self):
+        return (self.width, self.height)
+
+    def resize(self, size, resample=None):
+        self.resize_calls.append((tuple(size), resample))
+        return FakeImage(size[0], size[1], self.origin_x, self.origin_y)
+
+    def save(self, buffer, format=None, **params):
+        self.saved_with.append((format, dict(params)))
+        buffer.write(
+            b"\x89PNG\r\n\x1a\n"
+            + b"fake"
+            + int(self.width).to_bytes(4, "big", signed=False)
+            + int(self.height).to_bytes(4, "big", signed=False)
+            + int(self.origin_x).to_bytes(4, "big", signed=True)
+            + int(self.origin_y).to_bytes(4, "big", signed=True)
+        )
+
+
+class FakeWin32Adapter:
+    """Win32InputAdapter 的纯 fake：记录全部输入，绝不触碰真实 SendInput/截屏。
+
+    - ``virtual_rect`` 默认 (-1920, 0, 3840, 2160)，与 brief 样例的
+      FakeImage(3840, 2160, origin_x=-1920) 多屏虚拟桌面一致；
+    - ``fail_after``：第 fail_after+1 个底层输入事件起抛
+      computer_input_rejected（模拟 SendInput 部分失败/UIPI 拒绝）；
+    - ``desktop_name``/``has_foreground`` 用于构造 secure desktop 与
+      无前台窗口场景；``preflight_error`` 直接注入 preflight 失败；
+    - ``keys_down``/``buttons_down`` 暴露按下状态，验证 finally 释放。
+    """
+
+    def __init__(self, *, virtual_rect=(-1920, 0, 3840, 2160), desktop_name="Default",
+                 has_foreground=True, foreground_title="Fake Window",
+                 preflight_error=None, fail_after=None):
+        self.virtual_rect = virtual_rect
+        self.desktop_name = desktop_name
+        self.has_foreground = has_foreground
+        self.foreground_title = foreground_title
+        self.preflight_error = preflight_error
+        self.fail_after = fail_after
+        self.preflight_calls = 0
+        self.interactive_checks = 0
+        self.clicks = []
+        self.double_clicks = []
+        self.moves = []
+        self.wheels = []
+        self.hwheels = []
+        self.drags = []
+        self.texts = []
+        self.keys_sent = []
+        self.mouse_calls = []
+        self.keys_down = set()
+        self.buttons_down = set()
+        self.release_all_calls = 0
+        self._events_sent = 0
+
+    def preflight(self):
+        self.preflight_calls += 1
+        if self.preflight_error is not None:
+            raise self.preflight_error
+
+    def ensure_interactive(self):
+        self.interactive_checks += 1
+        if self.desktop_name != "Default":
+            raise ComputerControlError(
+                "computer_secure_desktop",
+                f"当前 input desktop 为 {self.desktop_name!r}，不是交互式 Default 桌面",
+            )
+        if not self.has_foreground:
+            raise ComputerControlError(
+                "computer_secure_desktop",
+                "当前没有前台窗口，桌面不可操控",
+            )
+
+    def virtual_screen_rect(self):
+        return self.virtual_rect
+
+    def foreground_window_title(self):
+        return self.foreground_title
+
+    def _emit(self):
+        """模拟一个底层输入事件送达；超过 fail_after 后按 SendInput 部分失败处理。"""
+        self._events_sent += 1
+        if self.fail_after is not None and self._events_sent > self.fail_after:
+            raise ComputerControlError(
+                "computer_input_rejected",
+                "fake SendInput 注入的部分失败",
+            )
+
+    def send_mouse(self, *, action, x=None, y=None, button="left", delta=0, path=(), modifiers=()):
+        self.mouse_calls.append((action, x, y, button, delta, tuple(path), tuple(modifiers)))
+        for name in modifiers:
+            self._emit()
+            self.keys_down.add(name)
+        try:
+            if action == "move":
+                self._emit()
+                self.moves.append((x, y))
+            elif action == "click":
+                self._emit()
+                self.clicks.append((x, y, button))
+            elif action == "double_click":
+                self._emit()
+                self.double_clicks.append((x, y, button))
+            elif action == "down":
+                self._emit()
+                self.buttons_down.add(button)
+            elif action == "up":
+                self._emit()
+                self.buttons_down.discard(button)
+            elif action == "wheel":
+                self._emit()
+                self.wheels.append(delta)
+            elif action == "hwheel":
+                self._emit()
+                self.hwheels.append(delta)
+            elif action == "drag":
+                points = tuple(path)
+                self.drags.append((points, button))
+                self._emit()  # 移动到起点
+                self._emit()  # 按下
+                self.buttons_down.add(button)
+                try:
+                    for _point in points[1:]:
+                        self._emit()  # 路径移动
+                finally:
+                    # try/finally 保证释放，与真实 adapter 的 drag 收尾语义一致。
+                    self.buttons_down.discard(button)
+            else:
+                raise ComputerControlError(
+                    "computer_invalid_action",
+                    f"未知鼠标动作: {action!r}",
+                )
+        finally:
+            for name in reversed(list(modifiers)):
+                self.keys_down.discard(name)
+
+    def send_text(self, text):
+        for _char in text:
+            self._emit()  # Unicode down
+            self._emit()  # Unicode up
+        self.texts.append(text)
+
+    def send_keys(self, keys):
+        keys = tuple(keys)
+        self.keys_sent.append(keys)
+        try:
+            for name in keys:
+                self._emit()
+                self.keys_down.add(name)
+            for name in reversed(keys):
+                self.keys_down.discard(name)
+        finally:
+            # 任何失败路径都必须清空本组合键的按下状态。
+            self.keys_down.difference_update(keys)
+
+    def release_all(self):
+        self.release_all_calls += 1
+        self.keys_down.clear()
+        self.buttons_down.clear()
+
+
+# ---------------- Task 8 导出：ComputerBackend 协议 fake ----------------
+
+
+class FakeComputerBackend:
+    """ComputerBackend 协议的纯 fake：绝不触碰真实键鼠、浏览器或截屏。
+
+    - ``execute_calls`` 按序记录 ``(run_id, kind, target)``；``execute_log``
+      按序记录 ``("enter"|"exit", kind)``，用于断言动作串行；
+      ``concurrent_execute_violations`` 记录并发进入 execute 的次数；
+    - ``screen_hashes``：注入的截图 hash 序列，observe 依次消费、用尽后重复
+      最后一个，用于精确控制 no-progress 计数；``set_fingerprint()`` 切换
+      活动指纹（browser 体现为 page_title，desktop 体现为 window_title）；
+    - ``observe_error`` / ``execute_error`` / ``close_error`` 注入失败；
+    - ``execute_gate``（threading.Event）：设置后 execute 阻塞等待，用于
+      验证 controller 的 action_lock 串行语义；
+    - ``release_count`` / ``close_count`` 计数，验证幂等停止只释放一次；
+    - ``png_path``（Task 16）：观察携带的虚拟截图路径（不读真实文件），
+      供 controller 预览发布等接线测试使用。
+    """
+
+    def __init__(self, target="browser", *, screen_hashes=(), fingerprint="fake-surface",
+                 observe_error=None, execute_error=None, close_error=None,
+                 execute_gate=None, png_path=""):
+        self.target = target
+        self.start_calls = 0
+        self.execute_calls = []
+        self.execute_log = []
+        self.execute_thread_ids = []
+        self.observe_calls = 0
+        self.release_count = 0
+        self.close_count = 0
+        self.concurrent_execute_violations = 0
+        self.observe_error = observe_error
+        self.execute_error = execute_error
+        self.close_error = close_error
+        self.execute_gate = execute_gate
+        self.png_path = png_path
+        self.closed = False
+        self._screen_hashes = list(screen_hashes)
+        self._last_hash = f"sha-{target}-0"
+        self._fingerprint = fingerprint
+        self._lock = threading.Lock()
+        self._inside_execute = False
+
+    def set_fingerprint(self, value):
+        with self._lock:
+            self._fingerprint = value
+
+    def start(self):
+        with self._lock:
+            self.start_calls += 1
+
+    def observe(self, run_id):
+        from core.computer.models import ComputerObservation
+
+        with self._lock:
+            self.observe_calls += 1
+            error = self.observe_error
+            if error is None:
+                if self._screen_hashes:
+                    self._last_hash = self._screen_hashes.pop(0)
+                sha = self._last_hash
+                fingerprint = self._fingerprint
+        if error is not None:
+            raise error
+        fields = {"run_id": run_id, "target": self.target, "action": "observe",
+                  "screen_sha256": sha, "width": 1280, "height": 720,
+                  "png_path": self.png_path}
+        if self.target == "browser":
+            fields["page_origin"] = "https://fake.example"
+            fields["page_title"] = fingerprint
+        else:
+            fields["window_title"] = fingerprint
+        return ComputerObservation(**fields)
+
+    def execute(self, run_id, action):
+        with self._lock:
+            if self._inside_execute:
+                self.concurrent_execute_violations += 1
+            self._inside_execute = True
+            self.execute_log.append(("enter", action.kind))
+        try:
+            with self._lock:
+                self.execute_calls.append((run_id, action.kind, action.target))
+                self.execute_thread_ids.append(threading.get_ident())
+            if self.execute_gate is not None:
+                self.execute_gate.wait(timeout=10)
+            with self._lock:
+                error = self.execute_error
+            if error is not None:
+                raise error
+        finally:
+            with self._lock:
+                self._inside_execute = False
+                self.execute_log.append(("exit", action.kind))
+
+    def release_inputs(self):
+        with self._lock:
+            self.release_count += 1
+
+    def close(self):
+        with self._lock:
+            self.close_count += 1
+            self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
+
+
+# ---------------- Task 13a 导出：GUI Bridge 电脑操控 Controller fake ----------------
+
+
+class FakeBridgeController:
+    """ComputerControlService 的 GUI Bridge fake（Task 13a 事件桥与控制 API）。
+
+    - ``add_listener``/``remove_listener`` 镜像真实 controller（listener 异常
+      吞掉留痕）；``listener_count`` 暴露当前注册数，供“桥接建立一次”断言；
+    - ``emit_state``/``emit_action_started``/``emit_action_finished``/
+      ``emit_observation`` 按真实事件形状（type/run_id/event_seq + 各自字段）
+      发给已注册 listener；``emit_observation`` 的 run_id/event_seq 可覆盖
+      （Task 13a brief 样例逐字使用）；
+    - ``start_run(run_id=...)`` 建立活动 run；pause/resume/stop 记录透传调用
+      并发出 computer_state 事件；run_id 与当前活动 run 不匹配抛
+      computer_invalid_state（旧 UI 事件的 run id 拒绝语义，镜像
+      _require_active_run_locked）；
+    - ``snapshot()`` 返回真实 ComputerRunSnapshot（终态保留 run_id，
+      镜像 _last_snapshot 语义）；
+    - 绝不触碰真实键鼠、浏览器或截屏。
+    """
+
+    def __init__(self):
+        self._listeners = []
+        self.run_id = ""
+        self.status = "idle"
+        self.action_count = 0
+        self.pause_calls = []
+        self.resume_calls = []
+        self.stop_calls = []
+
+    @property
+    def listener_count(self):
+        return len(self._listeners)
+
+    def add_listener(self, listener):
+        if listener not in self._listeners:
+            self._listeners.append(listener)
+
+    def remove_listener(self, listener):
+        try:
+            self._listeners.remove(listener)
+        except ValueError:
+            pass
+
+    def _emit(self, event):
+        for listener in list(self._listeners):
+            try:
+                listener(event)
+            except Exception:
+                pass  # 镜像真实 controller：listener 异常只留痕不传播
+
+    def emit_state(self, run_id="run-a", event_seq=1, status="running", reason=""):
+        self._emit({
+            "type": "computer_state",
+            "run_id": run_id,
+            "event_seq": event_seq,
+            "status": status,
+            "target": "browser",
+            "reason": reason,
+        })
+
+    def emit_action_started(self, run_id="run-a", event_seq=1, action_ordinal=1,
+                            kind="click"):
+        self._emit({
+            "type": "computer_action_started",
+            "run_id": run_id,
+            "event_seq": event_seq,
+            "action_ordinal": action_ordinal,
+            "action_kind": kind,
+            "target": "browser",
+        })
+
+    def emit_action_finished(self, run_id="run-a", event_seq=1, action_ordinal=1,
+                             kind="click", ok=True, error_code=""):
+        self._emit({
+            "type": "computer_action_finished",
+            "run_id": run_id,
+            "event_seq": event_seq,
+            "action_ordinal": action_ordinal,
+            "action_kind": kind,
+            "ok": ok,
+            "error_code": error_code,
+        })
+
+    def emit_observation(self, run_id="run-a", event_seq=1, action_ordinal=1,
+                         screen_sha256="sha-fake-1",
+                         preview_url="/computer-preview/tok/1.png"):
+        self._emit({
+            "type": "computer_observation",
+            "run_id": run_id,
+            "event_seq": event_seq,
+            "action_ordinal": action_ordinal,
+            "target": "browser",
+            "screen_sha256": screen_sha256,
+            "width": 1280,
+            "height": 720,
+            "origin_or_window": "https://fake.example",
+            "preview_url": preview_url,
+        })
+
+    def start_run(self, run_id="run-a"):
+        self.run_id = run_id
+        self.status = "running"
+        self.action_count = 0
+        self.emit_state(run_id=run_id, event_seq=1, status="running", reason="start")
+        return self.snapshot()
+
+    def _require_active_run(self, run_id):
+        if not self.run_id or run_id != self.run_id:
+            raise ComputerControlError(
+                "computer_invalid_state", f"未知的电脑操控 run：{run_id}"
+            )
+
+    def pause(self, run_id, reason):
+        self._require_active_run(run_id)
+        self.pause_calls.append((run_id, reason))
+        self.status = "paused"
+        self.emit_state(run_id=run_id, event_seq=2, status="paused", reason=reason)
+        return self.snapshot()
+
+    def resume(self, run_id):
+        self._require_active_run(run_id)
+        self.resume_calls.append(run_id)
+        self.status = "running"
+        self.emit_state(run_id=run_id, event_seq=3, status="running", reason="resume")
+        return self.snapshot()
+
+    def stop(self, run_id, reason):
+        self._require_active_run(run_id)
+        self.stop_calls.append((run_id, reason))
+        self.status = "stopped"
+        self.emit_state(run_id=run_id, event_seq=4, status="stopped", reason=reason)
+        return self.snapshot()
+
+    def snapshot(self):
+        return ComputerRunSnapshot(
+            run_id=self.run_id,
+            status=self.status,
+            target="browser" if self.run_id else "",
+            action_count=self.action_count,
+        )
+
+
+# ---------------- Task 9 导出：固定适配器 Controller fake ----------------
+
+
+class FakeController:
+    """ComputerControlService 的最小 fake（Task 9 固定适配器测试）。
+
+    - 固定 run_id/owner/capability；``execute_calls`` 按序记录 (run_id, kind, target)；
+    - 未知 run_id 抛 computer_invalid_state、owner 不一致抛 computer_owner_mismatch
+      （镜像真实 controller 的租约语义）；
+    - ``observations`` 按序注入 ComputerObservation（用尽后用默认观察），
+      默认观察的 png_path 取 ``png_path``（由测试用 tmp_path 写入虚拟字节）；
+    - ``execute_errors`` 按序注入异常（用尽后正常执行）；
+    - ``snapshot()`` 返回真实 ComputerRunSnapshot，action_count 随动作递增，
+      供固定适配器读取动作 ordinal；
+    - Task 10 补充最小 run 生命周期：``start_calls``/``start_error``、
+      ``complete_calls``/``completed_run_ids``/``complete_error``、
+      ``stop_calls``/``stop_reasons``/``stop_error``；生命周期方法只记录调用，
+      ``run_status`` 随 complete/stop 变化供 Turn 收尾判定；
+    - 绝不触碰真实键鼠、浏览器或截屏。
+    """
+
+    def __init__(self, *, owner, capability=GENERIC_CAPABILITY, run_id="run-a",
+                 png_path="", observations=(), execute_errors=()):
+        self.owner = owner
+        self.capability = capability
+        self.run_id = run_id
+        self.png_path = png_path
+        self.execute_calls = []
+        self.action_count = 0
+        self._observations = list(observations)
+        self.execute_errors = list(execute_errors)
+        # Task 10：Turn 接线的最小生命周期记录
+        self.start_calls = 0
+        self.start_targets = []  # Task 11a：记录 start_run 传入的 target
+        self.start_error = None
+        self.complete_calls = 0
+        self.completed_run_ids = []
+        self.complete_error = None
+        self.stop_calls = 0
+        self.stop_reasons = []
+        self.stop_error = None
+        self.run_status = "running"
+
+    def start_run(self, owner, capability, target=None):
+        self.start_calls += 1
+        self.start_targets.append(target)
+        if self.start_error is not None:
+            raise self.start_error
+        self.owner = owner
+        self.capability = capability
+        self.run_status = "running"
+        return self.snapshot()
+
+    def complete_run(self, run_id, owner, retain_browser_session=True):
+        self.complete_calls += 1
+        if self.complete_error is not None:
+            raise self.complete_error
+        self.completed_run_ids.append(run_id)
+        self.run_status = "completed"
+        return self.snapshot()
+
+    def stop(self, run_id, reason):
+        self.stop_calls += 1
+        self.stop_reasons.append((run_id, reason))
+        if self.stop_error is not None:
+            raise self.stop_error
+        self.run_status = "stopped"
+        return self.snapshot()
+
+    def _default_observation(self, run_id, action):
+        return ComputerObservation(
+            run_id=run_id,
+            target=action.target,
+            screen_sha256=f"fake-sha-{self.action_count}",
+            width=1280,
+            height=720,
+            page_origin="https://fake.example" if action.target == "browser" else "",
+            window_title="" if action.target == "browser" else "Fake Window",
+        )
+
+    def execute(self, run_id, owner, action):
+        if run_id != self.run_id:
+            raise ComputerControlError(
+                "computer_invalid_state", f"未知的电脑操控 run：{run_id}"
+            )
+        if owner != self.owner:
+            raise ComputerControlError(
+                "computer_owner_mismatch", "当前电脑操控 run 属于其他会话/Turn，拒绝操作"
+            )
+        self.action_count += 1
+        self.execute_calls.append((run_id, action.kind, action.target))
+        if self.execute_errors:
+            raise self.execute_errors.pop(0)
+        base = self._observations.pop(0) if self._observations else (
+            self._default_observation(run_id, action)
+        )
+        return replace(
+            base,
+            run_id=run_id,
+            target=action.target,
+            action=action.kind,
+            png_path=base.png_path or self.png_path,
+        )
+
+    def snapshot(self):
+        return ComputerRunSnapshot(
+            run_id=self.run_id,
+            owner_session_id=self.owner.session_id,
+            owner_turn_id=self.owner.turn_id,
+            status=self.run_status,
+            action_count=self.action_count,
+        )

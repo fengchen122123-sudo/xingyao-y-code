@@ -1,6 +1,6 @@
 import pytest
 
-from core.memory import MemoryManager
+from core.memory import MemoryManager, _content_has_media, _try_parse_json
 from core.tool_result_maintenance import ELIDED_PREFIX, SNIPPED_PREFIX
 
 
@@ -106,3 +106,122 @@ def test_add_media_message_single_media_stays_untouched(manager_tmp):
     users = [m for m in history if m.get("role") == "user"]
     # 只有一张媒体图且最新 user 是纯文本：图片仍保留（折叠只发生在新媒体入库时）
     assert any(b.get("type") == "image_url" for b in users[0]["content"])
+
+
+# ---------------------------------------------------------------------------
+# Task 10：带 _computer_v1 的 follow-up 观察消息走同一媒体折叠链
+# （helper 与 fixture 定义在本模块内，brief 规定不进 computer_fakes.py）
+# ---------------------------------------------------------------------------
+
+
+def _observation_message(ordinal, *, run_id="run-a", target="browser"):
+    return {
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "【电脑观察】请只依据这张最新截图决定下一步。"},
+            {"type": "image_url", "image_url": {
+                "url": f"data:image/png;base64,Q09NUFVURVI7e3VyZGluYWx9fQ=={ordinal}",
+            }},
+        ],
+        "_computer_v1": {"run_id": run_id, "ordinal": ordinal, "target": target},
+    }
+
+
+@pytest.fixture
+def store():
+    manager = MemoryManager(":memory:")
+    yield manager
+    manager.close()
+
+
+@pytest.fixture
+def session(store):
+    name = "computer-media-fold"
+    store.add_message(name, "user", "开始电脑操控")
+    return name
+
+
+def _session_user_rows(store, session_name):
+    with store._lock:
+        rows = store.conn.execute(
+            "SELECT id, content FROM messages "
+            "WHERE session_id = (SELECT id FROM sessions WHERE session_name = ?) "
+            "AND role = 'user' ORDER BY id ASC",
+            (session_name,),
+        ).fetchall()
+    return rows
+
+
+def add_observation_message(store, session_name, ordinal):
+    store.add_message(session_name, "user", _observation_message(ordinal))
+    rows = _session_user_rows(store, session_name)
+    return rows[-1][0]
+
+
+def raw_content_of(store, session_name, message_id):
+    with store._lock:
+        row = store.conn.execute(
+            "SELECT content FROM messages WHERE id = ?", (message_id,),
+        ).fetchone()
+    assert row is not None
+    return row[0]
+
+
+def count_unfolded_media_rows(store, session_name):
+    count = 0
+    for _msg_id, raw in _session_user_rows(store, session_name):
+        parsed, ok = _try_parse_json(raw)
+        if ok and _content_has_media(parsed):
+            count += 1
+    return count
+
+
+def test_content_has_media_accepts_full_message_dict_with_computer_meta():
+    message = {
+        "role": "user",
+        "content": [{"type": "text", "text": "观察"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,..."}}],
+        "_computer_v1": {"run_id": "run-a", "ordinal": 3, "target": "browser"},
+    }
+    assert _content_has_media(message) is True
+
+
+def test_content_has_media_still_accepts_plain_list_and_rejects_text():
+    assert _content_has_media([
+        {"type": "text", "text": "纯文本"},
+    ]) is False
+    assert _content_has_media("纯文本消息") is False
+    assert _content_has_media({"role": "user", "content": "纯文本"}) is False
+
+
+def test_fold_keeps_computer_meta_and_is_idempotent(store, session):
+    ids = [add_observation_message(store, session, ordinal) for ordinal in range(1, 4)]
+    add_observation_message(store, session, 4)  # 最新一条不折叠
+    folded_first = raw_content_of(store, session, ids[0])
+    assert '"_computer_v1"' in folded_first
+    assert "data:image/png;base64" not in folded_first
+    add_observation_message(store, session, 5)  # 再次触发折叠
+    assert raw_content_of(store, session, ids[0]) == folded_first  # 幂等，字节不再变化
+
+
+def test_old_computer_screenshots_do_not_accumulate(store, session):
+    for ordinal in range(1, 20):
+        add_observation_message(store, session, ordinal)
+    assert count_unfolded_media_rows(store, session) <= 1  # 只有最新一条保留图片
+
+
+def test_fold_handles_mixed_normal_and_computer_media_rows(store, session):
+    normal_img = [
+        {"type": "text", "text": "看这张图"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+    ]
+    store.add_message(session, "user", normal_img)
+    add_observation_message(store, session, 1)
+    add_observation_message(store, session, 2)  # 触发折叠：普通图与电脑观察 1 都被折叠
+    assert count_unfolded_media_rows(store, session) == 1
+    # 普通消息折叠后仍是纯 content 列表形态（不带 _computer_v1 字段）
+    rows = _session_user_rows(store, session)
+    normal_row = rows[1]  # rows[0] 是 "开始电脑操控" 纯文本
+    parsed, ok = _try_parse_json(normal_row[1])
+    assert ok and isinstance(parsed, list)
+    assert all(block.get("type") == "text" for block in parsed)
+    assert "data:image/png;base64" not in normal_row[1]

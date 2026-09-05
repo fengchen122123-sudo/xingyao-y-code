@@ -75,6 +75,11 @@
           <button class="chip-btn" title="清空当前会话历史" @click="store.clearSessionHistory()">清空</button>
         </div>
 
+        <!-- 电脑操控安全条（设计 16.1）：聊天标题栏下方、滚动区外——对话滚动时保持可见；
+             仅 run 活动期（starting/running/paused/waiting_for_user/
+             provider_safety_required/stopping/failed）渲染 -->
+        <ComputerControlBar />
+
         <!-- 对话主体滚动区：.chat-viewport 是不滚动的定位外壳，
              红点轨道与"回到底部"按钮放在它里面、#chat-scroll 外面——
              若放进 overflow 滚动的 #chat-scroll 内，position:absolute 会相对
@@ -255,6 +260,7 @@ import KimiEmptyState from './components/KimiEmptyState.vue';
 import TurnGroup from './components/TurnGroup.vue';
 import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
+import ComputerControlBar from './components/ComputerControlBar.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
 import PermCard from './components/PermCard.vue';
@@ -288,6 +294,11 @@ async function syncInitialWindowMaximized() {
   } catch {
     // 浏览器开发态或桥尚未注入时保持默认非最大化，后续宿主事件会同步。
   }
+}
+
+// 窗口重新聚焦：存在已知的电脑操控 run 时拉取完整快照校准 Store（设计 16.4）
+function onWindowFocusRecalibrateComputer() {
+  if (store.computerRun.run_id) void store.refreshComputerRun();
 }
 
 const store = useAppStore();
@@ -562,6 +573,10 @@ onMounted(() => {
   document.addEventListener('click', closeExportMenu);
   void syncInitialWindowMaximized();
 
+  // 窗口重新聚焦时校准电脑操控快照（设计 16.4）：_js_queue 满时允许丢新事件，
+  // 终态不能只依赖事件推送，聚焦即用 get_computer_control_status() 复核
+  window.addEventListener('focus', onWindowFocusRecalibrateComputer);
+
   if (pywebviewApiReady()) {
     startInit();
   } else {
@@ -588,6 +603,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   document.removeEventListener('click', closeExportMenu);
+  window.removeEventListener('focus', onWindowFocusRecalibrateComputer);
   window.removeEventListener('pywebviewready', onPywebviewReady);
   if (initPollTimer !== undefined) {
     clearInterval(initPollTimer);

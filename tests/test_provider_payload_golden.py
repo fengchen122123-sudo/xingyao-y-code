@@ -243,6 +243,41 @@ def test_kimi_anthropic_max_reasoning_provider_kwargs_are_byte_golden(monkeypatc
     assert_exact_provider_kwargs(captured, expected)
 
 
+def test_stepfun_anthropic_provider_kwargs_map_effort_to_output_config(monkeypatch):
+    """阶跃 Anthropic 路由：思考档位必须编码为官方 output_config.effort。"""
+    import core.llm as llm
+
+    captured = _capture(
+        monkeypatch,
+        model="anthropic/step-3.7-flash",
+        api_base="https://api.stepfun.com/step_plan",
+        protocol="anthropic",
+        model_cfg={"reasoning_choice": "high", "enable_thinking": True, "reasoning_effort": "high"},
+        cache_session_id="golden-stepfun-anthropic",
+        messages=[{"role": "system", "content": "stable"}, {"role": "user", "content": "inspect"}],
+    )
+    expected = {
+        "model": "anthropic/step-3.7-flash",
+        "api_key": "<redacted>",
+        "messages": [
+            {"role": "system", "content": "stable", "cache_control": {"type": "ephemeral"}},
+            {"role": "user", "content": "inspect"},
+        ],
+        "tools": [ZETA_TOOL, ALPHA_TOOL],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "num_retries": 2,
+        "output_config": {"effort": "high"},
+        "allowed_openai_params": ["output_config"],
+        "tool_choice": "auto",
+        "max_tokens": 8192,
+        "api_base": "https://api.stepfun.com/step_plan",
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
+
+    assert_exact_provider_kwargs(captured, expected)
+
+
 def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
     import core.llm as llm
 
@@ -368,6 +403,132 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
     }
 
     assert_exact_provider_kwargs(captured, expected)
+
+
+def test_native_computer_first_and_continuation_requests_are_byte_golden(
+    monkeypatch, tmp_path
+):
+    """Task 11b：原生 computer 首请求与 continuation 请求的 provider 字节精确。
+
+    首请求：正常会话历史 input + 尾部 computer built-in，无 previous_response_id。
+    continuation：重发同一 model、同序 tools、必要 instructions/options 与上一
+    response id；input 只有本批 computer_call_output，无 messages 键。
+    """
+    import threading
+
+    import core.llm as llm
+    from core.computer.models import ComputerOwner
+    from tests.computer_fakes import NATIVE_BROWSER_CAPABILITY, FakeController
+
+    png_path = tmp_path / "native-obs.png"
+    png_path.write_bytes(b"png")
+    owner = ComputerOwner(
+        session_id="golden-native",
+        turn_id="turn-golden",
+        session_label="golden-native",
+        cancel_event=threading.Event(),
+    )
+    controller = FakeController(
+        owner=owner,
+        capability=NATIVE_BROWSER_CAPABILITY,
+        run_id="run-native",
+        png_path=str(png_path),
+    )
+    captured = []
+
+    def fake_responses(**kwargs):
+        captured.append(deepcopy(kwargs))
+        if len(captured) == 1:
+            return iter([
+                {"type": "response.created", "response": {"id": "resp_1"}},
+                {"type": "response.output_item.done", "item": {
+                    "type": "computer_call",
+                    "id": "cc_1",
+                    "call_id": "call_1",
+                    "status": "completed",
+                    "actions": [{"type": "click", "x": 1, "y": 1, "button": "left"}],
+                }},
+                {"type": "response.completed", "response": {"id": "resp_1", "output": []}},
+            ])
+        return iter([
+            {"type": "response.output_text.delta", "delta": "完成"},
+            {"type": "response.completed", "response": {"id": "resp_2", "output": []}},
+        ])
+
+    monkeypatch.setattr(llm, "estimate_tokens", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(llm, "get_tools_schema", lambda: [ZETA_TOOL, ALPHA_TOOL])
+    monkeypatch.setattr(
+        "core.model_manager.get_model_protocol",
+        lambda *_args, **_kwargs: "responses",
+    )
+    monkeypatch.setattr(
+        "core.model_manager.get_model_config_by_litellm_model",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(
+        "core.memory_kairos.build_memory_system_section",
+        lambda: "",
+    )
+    monkeypatch.setattr(llm, "_describe_images_with_secondary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(llm, "get_computer_control_service", lambda: controller)
+    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    list(llm.chat_with_model_events(
+        "openai/gpt-native-golden",
+        "golden-secret",
+        [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "inspect"},
+        ],
+        "https://api.openai.com/v1",
+        persist=False,
+        consume_background_notifications=False,
+        computer_capability=NATIVE_BROWSER_CAPABILITY,
+    ))
+
+    assert len(captured) == 2
+    first_expected = {
+        "model": "openai/gpt-native-golden",
+        "api_key": "<redacted>",
+        "input": [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "inspect"},
+        ],
+        "tools": [
+            {"type": "function", "name": "zeta", "description": "zeta", "parameters": {"type": "object", "properties": {}}},
+            {"type": "function", "name": "alpha", "description": "alpha", "parameters": {"type": "object", "properties": {}}},
+            {"type": "computer"},
+        ],
+        "stream": True,
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+        "api_base": "https://api.openai.com/v1",
+        "max_output_tokens": 8192,
+        "tool_choice": "auto",
+        "num_retries": 2,
+    }
+    assert_exact_provider_kwargs(captured[:1], first_expected)
+    continuation_expected = {
+        "model": "openai/gpt-native-golden",
+        "api_key": "<redacted>",
+        "input": [{
+            "type": "computer_call_output",
+            "call_id": "call_1",
+            "output": {"type": "computer_screenshot", "image_url": "data:image/png;base64,cG5n"},
+        }],
+        "tools": [
+            {"type": "function", "name": "zeta", "description": "zeta", "parameters": {"type": "object", "properties": {}}},
+            {"type": "function", "name": "alpha", "description": "alpha", "parameters": {"type": "object", "properties": {}}},
+            {"type": "computer"},
+        ],
+        "stream": True,
+        "previous_response_id": "resp_1",
+        "instructions": "stable",
+        "api_base": "https://api.openai.com/v1",
+        "max_output_tokens": 8192,
+        "tool_choice": "auto",
+        "num_retries": 2,
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
+    assert_exact_provider_kwargs(captured[1:], continuation_expected)
 
 
 def test_exact_model_id_reaches_final_provider_payload(monkeypatch):
