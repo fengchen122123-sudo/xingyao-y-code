@@ -230,15 +230,27 @@ def get_session_token_baseline(manager, session_name: str, model_name: str,
     return estimated
 
 
-def build_runtime_context(model_name: str, permission_mode: str):
-    """组装本轮的运行上下文（时间 / 计划快照 / 工作目录）。
+def build_runtime_context(model_name: str, permission_mode: str, api_base: str = "", turn_source: str = "local"):
+    """组装本轮的运行上下文（时间 / 计划快照 / 工作目录 / 电脑操控能力）。
 
     长期记忆、技能目录、自定义子 Agent 清单已并入稳定系统提示词
     （build_stable_system_message，跨轮不变的大段静态内容），
     这里不再重复注入，避免动态块膨胀与重复消耗 token。
+
+    电脑操控能力（Task 10，设计 9.3）在 Turn 准备起点解析一次并传入
+    RuntimeContext：capability 关闭时动态块字节与历史版本完全一致。
+    turn_source 是入口层受控值（CLI/GUI 本地回合固定 local；LAN 标记由
+    LanServer dispatch 注入，Task 15 接入），绝不从用户消息或模型参数读取。
+    Task 11a F1 收敛：解析结果同时存入线程级 Turn handoff，同一回合的
+    chat_with_model_events 取出复用，capability 每 Turn 只解析一次。
+    api_base 必须与 chat_with_model_events 实际使用的 base 一致（入口层
+    同一来源传入）：native_openai 官方路由判定依赖它，漏传会让原生能力
+    在生产入口永远以 computer_protocol_mismatch 拒绝（审查修复轮 I-1）。
     """
+    from core.computer.capability import set_turn_computer_capability
     from core.context_builder import RuntimeContext
     from core.command_shell import describe_selected_command_shell
+    from core.llm import resolve_turn_computer_capability
     from core.plan import get_default_plan_manager
     from core.workspace_context import get_workdir
 
@@ -247,6 +259,10 @@ def build_runtime_context(model_name: str, permission_mode: str):
     active_plan = "\n".join(
         f"{item.get('stage', 'build')}/{item['status']}: {item['subject']}" for item in plan_items
     ) or "无"
+    computer_capability = resolve_turn_computer_capability(
+        model_name, api_base=api_base or None, turn_source=turn_source
+    )
+    set_turn_computer_capability(computer_capability)
     return RuntimeContext(
         model_name=model_name,
         permission_mode=permission_mode,
@@ -254,6 +270,7 @@ def build_runtime_context(model_name: str, permission_mode: str):
         current_time=now.strftime("%Y-%m-%d %H:%M:%S"),
         active_plan=active_plan,
         command_shell=describe_selected_command_shell(),
+        computer_capability=computer_capability,
     )
 
 
@@ -419,6 +436,7 @@ def prepare_turn_messages(
     api_base: str = "",
     compress_threshold: float = DEFAULT_COMPRESS_THRESHOLD,
     is_gui: bool = False,
+    turn_source: str = "local",
 ) -> list:
     """组装一轮对话真正发给大模型的完整消息列表。
 
@@ -435,6 +453,9 @@ def prepare_turn_messages(
     参数：
       notify: 可选的 notify(kind, message) 回调，用于把压缩进度等提示交回界面层，
               本模块自身绝不打印任何内容。
+      turn_source: 入口层受控回合来源（local|lan，设计 18）。LAN 消息回合由
+              LanServer dispatch 注入 "lan"，本地 GUI/CLI 固定 local；决定
+              本轮电脑操控能力解析（lan 固定禁用）。
     """
     from core.llm import estimate_tokens, session_token_usage, token_usage_lock
 
@@ -547,7 +568,7 @@ def prepare_turn_messages(
     #    现已内联到 user 消息，稳定提示词每轮现组插到首位，历史里不应再有 system 块
     history = _drop_legacy_context_systems(history)
 
-    runtime = build_runtime_context(model_name, permission_mode)
+    runtime = build_runtime_context(model_name, permission_mode, api_base=api_base, turn_source=turn_source)
     dynamic_prompt = build_dynamic_prompt(runtime)
     history.insert(0, system_message)
 

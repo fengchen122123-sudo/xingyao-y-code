@@ -426,6 +426,42 @@ def _create_main_window(api, url: str, gui_theme: dict):
     )
 
 
+def _startup_computer_runtime() -> None:
+    """启动轻量电脑操控运行时（Task 16，设计 23.2）。
+
+    任一开关开启时按已开启配置注册全局紧急停止热键 Ctrl+Alt+Esc（注册
+    失败能力不可用但不改写配置）；两开关全关零副作用（不导入 Playwright、
+    不启动浏览器/截图、不注册 computer tools）。观察截图的预览发布器接到
+    controller（惰性启动 loopback 预览服务，GUI 专属）。任何失败只留痕，
+    电脑操控保持不可用，绝不影响 GUI 启动。
+    """
+    try:
+        from core.computer.runtime import (
+            attach_preview_publisher,
+            start_computer_runtime,
+        )
+
+        attach_preview_publisher(start_computer_runtime())
+    except Exception:
+        logger.exception("启动电脑操控运行时失败（电脑操控保持不可用）")
+
+
+def _shutdown_computer_runtime() -> None:
+    """统一关闭电脑操控运行时：controller（活动 run + retained）→ preview → hotkey。"""
+    try:
+        from core.computer.runtime import shutdown_process_computer_runtime
+
+        shutdown_process_computer_runtime("gui_exit")
+    except Exception:
+        logger.exception("退出时关闭电脑操控运行时失败")
+
+
+def _finalize_gui_exit(lifecycle) -> None:
+    """GUI 退出收尾固定顺序（Task 16）：回合级 shutdown 先于电脑操控运行时。"""
+    lifecycle.finalize()
+    _shutdown_computer_runtime()
+
+
 def main():
     _configure_runtime_logging()
     # 无条件记录本进程身份：诊断"venv 与系统 Python / 安装版双进程共存"
@@ -465,6 +501,10 @@ def main():
     api._exit_application = lifecycle.exit_application
     lifecycle.start_tray()
     window.events.closing += lifecycle.on_closing
+
+    # 电脑操控运行时（Task 16，设计 23.2）：轻量容器——开关开启时注册全局
+    # 紧急停止热键，观察截图预览发布器接到 controller（惰性启动）。
+    _startup_computer_runtime()
 
     # pywebview 桥注入看门狗：NavigationCompleted → inject_pywebview 在独立
     # 线程执行，且首行 run_js 位于 try 之外——快速重启（上一个实例的 WebView2
@@ -564,7 +604,9 @@ def main():
         webview.start(debug=_debug_enabled())
         logger.info("webview.start 已返回（窗口/消息循环结束）")
     finally:
-        lifecycle.finalize()
+        # 退出收尾固定顺序（Task 16）：回合级 shutdown（含取消/线程 drain）
+        # 先于电脑操控运行时统一关闭；异常路径同样经过本 finally。
+        _finalize_gui_exit(lifecycle)
         _remove_instance_info()
 
 if __name__ == "__main__":

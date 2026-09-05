@@ -1,0 +1,119 @@
+%% 星瑶 (Y-code) 项目整体流程图 —— 从用户输入到一轮对话完成
+flowchart TB
+    %% ============ 入口层 ============
+    subgraph ENTRY["① 入口层（双形态）"]
+        direction LR
+        CLI["main.py<br/>TUI 终端版<br/>prompt_toolkit"]
+        GUI["gui_main.py<br/>GUI 窗口版<br/>pywebview + Vue3"]
+        HEADLESS["无界面模式<br/>-p / --prompt"]
+    end
+
+    CLI --> PARSER
+    GUI --> BRIDGE["gui_bridge.py<br/>GUI↔核心桥接层"]
+    HEADLESS --> PARSER
+    BRIDGE --> PARSER
+
+    PARSER["input_parser.py<br/>输入解析：斜杠命令 / @文件挂载 /<br/>粘贴占位符 / 多行处理"]
+
+    %% ============ 共享服务层 ============
+    PARSER --> ISCMD{"斜杠命令?"}
+    ISCMD -- "是" --> CMD["命令分发<br/>/models /session /undo /plan<br/>/tasks /skills /mcp /theme ..."]
+    CMD --> LOCAL["本地执行后刷新界面<br/>（不进入模型回合）"]
+    ISCMD -- "否（普通提问）" --> PREP
+
+    subgraph PREP["② 一轮对话准备（CLI/GUI 共用 core/agent_service.py）"]
+        direction TB
+        CTX["context_builder<br/>运行上下文 + 动态提示词"]
+        MEM["MemoryManager<br/>长期记忆检索 + 四级水位压缩<br/>(60% snip / 80% elide / 95% LLM摘要)"]
+        SKILL["skills.py<br/>SKILL.md 扫描 → 注入系统提示词"]
+        PLG["plugin_loader<br/>进程内插件工具"]
+        MCPS["MCPManager<br/>MCP 外部工具（惰性连接+预热）"]
+        HIST["历史消息组装<br/>checkpoint 打点 / 后台子代理结果注入"]
+    end
+
+    PREP --> PERMCHK
+    PERMCHK["permission_broker<br/>权限判定：confirm / accept_edits<br/>/ plan / full 四种模式"]
+
+    %% ============ Harness 内核 ============
+    PERMCHK --> LLM["core/llm.py<br/>chat_with_model_events()<br/>最终 Provider 请求出口"]
+
+    subgraph HARNESS["③ Harness 固定内核（严格状态机，不可替换）"]
+        direction TB
+        TURN["TurnRuntime<br/>Turn 8 态 + Step 10 态<br/>非法转移显式失败"]
+        JOURNAL["HarnessJournal (SQLite)<br/>owner 租约 + 心跳防多进程冲突<br/>事件序列单调分配"]
+        FINGER["RequestEnvelope<br/>请求指纹 + byte-golden 回归"]
+    end
+
+    LLM --> TURN
+    TURN <--> JOURNAL
+    TURN --> FINGER
+
+    STEPLOOP["Step 循环<br/>最多 max_turns 步"]
+    TURN --> STEPLOOP
+
+    STEPLOOP --> GUARD{"progress_guard<br/>连续无进展?"}
+    GUARD -- "是 → NoProgressError" --> FAIL["turn.fail() → FAILED<br/>turn_error 事件落库"]
+    GUARD -- "否" --> RETRY["API 重试 ×5 指数退避<br/>消息清洗 / 缓存指纹分类"]
+
+    RETRY --> STREAM["线程池发起流式请求<br/>LiteLLM 多协议统一<br/>(OpenAI/Anthropic/DeepSeek/Agnes...)"]
+
+    STREAM --> ASSEMBLE["StreamAssembler<br/>thinking 流 + 正文 + tool_calls"]
+    ASSEMBLE --> HASTOOL{"模型返回<br/>tool_calls?"}
+
+    %% ============ 工具执行 ============
+    HASTOOL -- "无 → 纯文本收尾" --> DONE["assistant 提交落库<br/>turn.complete() → COMPLETED<br/>渲染到 TUI / GUI"]
+    HASTOOL -- "有" --> PIPE["ToolBatchExecutor (tool_pipeline)<br/>RepeatCallGuard 同签名重复抑制<br/>相邻只读工具并发批量执行"]
+
+    subgraph TOOLS["④ 工具执行层（29 个内置工具 + 扩展）"]
+        direction LR
+        FS["文件系统<br/>读/写/编辑/搜索"]
+        SHELL["命令执行<br/>后台任务 TaskManager"]
+        SUB["SubagentManager<br/>5 种内置子代理<br/>依赖感知并行，嵌套≤3层"]
+        PLAN["PlanManager + TaskScheduler<br/>plan_write 建计划 → 依赖图派发<br/>暂停/恢复/重试/取消"]
+        WEB["网络工具<br/>网页抓取/图片下载/生图"]
+        EXTT["外部扩展<br/>MCP 工具 / 插件工具 / LSP"]
+    end
+
+    PIPE --> FS
+    PIPE --> SHELL
+    PIPE --> SUB
+    PIPE --> PLAN
+    PIPE --> WEB
+    PIPE --> EXTT
+
+    PLAN -.->|"计划项派发"| SUB
+    SUB -.->|"子代理内部再走<br/>准备→模型→工具 小循环"| STREAM
+    PLAN -.->|"主代理接管 takeover"| STEPLOOP
+
+    PIPE --> RESULT["结果按 call_ordinal 排序<br/>拼 tool 消息 + flush 落库"]
+    RESULT -->|"工具结果回填消息，进入下一步 Step"| STEPLOOP
+
+    %% ============ 异常与恢复 ============
+    STREAM -.->|"任意异常"| ROLLBACK["rollback_turn_messages()<br/>turn.fail(异常类名) → FAILED"]
+    STEPLOOP -.->|"用户 Ctrl+C / 取消"| CANCEL["salvage_persistence_on_cancel()<br/>打捞落库 + 回滚内存残影<br/>turn.cancel() → CANCELLED"]
+    STEPLOOP -.->|"崩溃 / 进程退出"| RECOVER["下次启动标记 interrupted<br/>绝不自动重放副作用"]
+
+    FAIL --> RENDER
+    CANCEL --> RENDER
+    ROLLBACK --> RENDER
+    DONE --> RENDER
+
+    RENDER["turn_renderer / history_renderer<br/>终端 Markdown 渲染 / 思考流显示"]
+    RENDER --> PERSIST["MemoryManager SQLite<br/>会话记忆 / /undo 撤销同步抹除<br/>/checkpoint 整轮回滚 / /share 导出"]
+
+    %% ============ 样式 ============
+    classDef entry fill:#ede7f6,stroke:#5e35b1,color:#311b92
+    classDef prep fill:#e3f2fd,stroke:#1e88e5,color:#0d47a1
+    classDef kernel fill:#fff3e0,stroke:#fb8c00,color:#e65100
+    classDef tools fill:#e8f5e9,stroke:#43a047,color:#1b5e20
+    classDef decision fill:#fff8e1,stroke:#f9a825,color:#e65100
+    classDef danger fill:#ffebee,stroke:#e53935,color:#b71c1c
+    classDef done fill:#e0f2f1,stroke:#00897b,color:#004d40
+
+    class CLI,GUI,HEADLESS,BRIDGE entry
+    class PARSER,CTX,MEM,SKILL,PLG,MCPS,HIST,PERMCHK prep
+    class TURN,JOURNAL,FINGER,STEPLOOP kernel
+    class FS,SHELL,SUB,PLAN,WEB,EXTT,PIPE,RESULT tools
+    class ISCMD,GUARD,HASTOOL decision
+    class FAIL,CANCEL,ROLLBACK,RECOVER danger
+    class DONE,RENDER,PERSIST,LOCAL done

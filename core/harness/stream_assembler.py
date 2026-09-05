@@ -27,6 +27,11 @@ class AssembledResponse:
     thinking_blocks: list[dict] | None
     finish_reason: str | None
     usage: Any
+    # 原生 computer_call 的终态合并载荷（Task 11a，设计 11.2）：
+    # {"response_id": ..., "item": {...}}。只有 output_item.done /
+    # response.completed 终态事件才会携带（Responses 事件桥保证半截 JSON
+    # 永远到不了这里），普通回合恒为 None，默认关闭路径形状不变。
+    computer_call: dict | None = None
 
 
 def complete_thinking_blocks(delta):
@@ -69,6 +74,7 @@ class StreamAssembler:
         self._thinking_blocks = None
         self._finish_reason = None
         self._usage = None
+        self._computer_call = None
         self._finish_public_text = ""
         self._raw_reasoning_content = ""
         self._finished = False
@@ -158,6 +164,13 @@ class StreamAssembler:
             if arguments:
                 assembled["function"]["arguments"] += arguments
 
+        # computer_call 流事件合并（Task 11a）：载荷只由终态事件
+        # （output_item.done / response.completed）携带，重复载荷后者覆盖
+        # 前者；finish 时才暴露，半截 JSON 永远不会进入执行路径。
+        computer_call = getattr(delta, "computer_call", None)
+        if computer_call is not None:
+            self._computer_call = computer_call
+
         return StreamUpdate("".join(emitted), reasoning)
 
     def finish(self) -> AssembledResponse:
@@ -204,4 +217,5 @@ class StreamAssembler:
             thinking_blocks=thinking_blocks,
             finish_reason=self._finish_reason,
             usage=self._usage,
+            computer_call=self._computer_call,
         )
