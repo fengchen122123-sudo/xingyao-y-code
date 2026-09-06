@@ -2671,6 +2671,27 @@ def _is_glm_family(model_name, api_base=""):
     return "glm" in model or _is_official_zhipu_route(api_base)
 
 
+def _litellm_rejects_tool_choice(model_name):
+    """litellm 是否会在客户端拒绝该模型的 tool_choice 参数。
+
+    litellm 的 OpenAIGPT5Config 对名字含 gpt-5 的模型按 supports_tool_choice
+    查内置模型清单，中转站/聚合网关的自定义名（如 gpt-5.6-sol）查不到即按
+    False 保守回退，把 tool_choice 从支持列表剔除，请求未发出就抛
+    UnsupportedParamsError。已知模型（官方 gpt-5 等）返回 True 不触发；
+    非 gpt-5 名字走通用 OpenAIGPTConfig，其支持列表固定含 tool_choice。
+    与 litellm 触发条件逐项对齐，避免给其他路由附加额外请求字段。
+    """
+    model = str(model_name or "").split("/")[-1].lower()
+    if "gpt-5" not in model:
+        return False
+    try:
+        from litellm.utils import supports_tool_choice
+
+        return not supports_tool_choice(model=model)
+    except Exception:
+        return False
+
+
 def _glm_keepalive_thinking_locked(model_name):
     """GLM 强制思考模型判定：思考没有关闭档，保活不得翻转成 disabled。
 
@@ -4862,6 +4883,14 @@ def _chat_with_model_generator(
     )
     if not deepseek_thinking_request:
         kwargs["tool_choice"] = "auto"
+        # 中转站的未知 gpt-5* 模型会被 litellm 客户端直接拒绝 tool_choice
+        #（见 _litellm_rejects_tool_choice），按参数追加放行；不能用全局
+        # drop_params——那会把 reasoning_effort 等推理强度静默吞掉。
+        if _litellm_rejects_tool_choice(model_name):
+            kwargs["allowed_openai_params"] = list(dict.fromkeys([
+                *(kwargs.get("allowed_openai_params") or []),
+                "tool_choice",
+            ]))
 
     # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小
     # 导致长回复被静默截断。若 provider 已显式配置则尊重其值。

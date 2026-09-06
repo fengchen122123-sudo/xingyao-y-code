@@ -405,6 +405,88 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
     assert_exact_provider_kwargs(captured, expected)
 
 
+@pytest.fixture
+def _fake_supports_tool_choice(monkeypatch):
+    """固定 litellm 模型清单查询结果，避免用例随 litellm 版本漂移。"""
+    import litellm.utils as litellm_utils
+
+    holder = {"supports": True}
+    monkeypatch.setattr(
+        litellm_utils, "supports_tool_choice",
+        lambda *, model, custom_llm_provider=None: holder["supports"],
+    )
+    return holder
+
+
+def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
+    monkeypatch, _fake_supports_tool_choice
+):
+    """中转站未知 gpt-5* 模型：litellm 客户端会直接拒 tool_choice，请求必须
+    追加 allowed_openai_params 放行；其余字节与普通 openai 路由完全一致。"""
+    import core.llm as llm
+
+    _fake_supports_tool_choice["supports"] = False
+    messages = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "inspect"},
+    ]
+    expected_messages = deepcopy(messages)
+    captured = _capture(
+        monkeypatch, model="openai/gpt-5.6-sol",
+        api_base="https://relay.example/v1", protocol="openai",
+        model_cfg={}, messages=messages,
+    )
+    expected = {
+        "model": "openai/gpt-5.6-sol",
+        "api_key": "<redacted>",
+        "messages": expected_messages,
+        "tools": [ZETA_TOOL, ALPHA_TOOL],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "num_retries": 2,
+        "tool_choice": "auto",
+        "allowed_openai_params": ["tool_choice"],
+        "max_tokens": 8192,
+        "api_base": "https://relay.example/v1",
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
+    assert_exact_provider_kwargs(captured, expected)
+
+
+def test_known_gpt5_model_request_stays_free_of_tool_choice_allowlist(
+    monkeypatch, _fake_supports_tool_choice
+):
+    """litellm 已收录的 gpt-5 模型（官方路由）不触发放行，请求不新增字段。"""
+    import core.llm as llm
+
+    _fake_supports_tool_choice["supports"] = True
+    captured = _capture(
+        monkeypatch, model="openai/gpt-5.6-sol",
+        api_base="https://relay.example/v1", protocol="openai",
+        model_cfg={},
+        messages=[{"role": "system", "content": "stable"}, {"role": "user", "content": "inspect"}],
+    )
+    assert len(captured) == 1
+    assert "allowed_openai_params" not in captured[0]
+    assert captured[0]["tool_choice"] == "auto"
+
+
+def test_tool_choice_rejection_probe_short_circuits_non_gpt5_names(monkeypatch):
+    """非 gpt-5 名字必须短路返回 False，不得触碰 litellm 清单查询。"""
+    import core.llm as llm
+
+    def _explode(*_args, **_kwargs):
+        raise AssertionError("非 gpt-5 模型不应查询 litellm 清单")
+
+    monkeypatch.setattr(
+        "litellm.utils.supports_tool_choice", _explode, raising=False
+    )
+    assert llm._litellm_rejects_tool_choice("openai/deepseek-v4-pro") is False
+    assert llm._litellm_rejects_tool_choice("openai/glm-5.3-flash") is False
+    assert llm._litellm_rejects_tool_choice("anthropic/step-3.7-flash") is False
+    assert llm._litellm_rejects_tool_choice("") is False
+
+
 def test_native_computer_first_and_continuation_requests_are_byte_golden(
     monkeypatch, tmp_path
 ):
