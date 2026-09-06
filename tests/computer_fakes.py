@@ -514,6 +514,31 @@ class FakeWin32Adapter:
         self.buttons_down = set()
         self.release_all_calls = 0
         self._events_sent = 0
+        # 通用化重构 Task C：输入前置激活的记录版 seam。
+        self.window_from_point_calls = []
+        self.set_foreground_calls = []
+        # 统一时间线（"window_from_point"/"set_foreground"/"send_mouse"/...）：
+        # 断言激活发生在真实输入之前。
+        self.call_order = []
+        # 目标点所属窗口；None 表示与当前前台一致（默认不触发激活）。
+        self.window_at_point_id = None
+        # 置 False 模拟 SetForegroundWindow 失败（含 Alt 键技巧重试后仍失败）。
+        self.set_foreground_result = True
+
+    def window_from_point(self, x, y):
+        self.window_from_point_calls.append((x, y))
+        self.call_order.append(("window_from_point", x, y))
+        if self.window_at_point_id is not None:
+            return self.window_at_point_id
+        return self.foreground_id
+
+    def set_foreground_window(self, hwnd):
+        self.set_foreground_calls.append(hwnd)
+        self.call_order.append(("set_foreground", hwnd))
+        if self.set_foreground_result:
+            self.foreground_id = hwnd  # 激活成功：前台身份随之切换（与真实语义一致）
+            return True
+        return False
 
     def preflight(self):
         self.preflight_calls += 1
@@ -552,6 +577,7 @@ class FakeWin32Adapter:
             )
 
     def send_mouse(self, *, action, x=None, y=None, button="left", delta=0, path=(), modifiers=()):
+        self.call_order.append(("send_mouse", action))
         self.mouse_calls.append((action, x, y, button, delta, tuple(path), tuple(modifiers)))
         for name in modifiers:
             self._emit()
@@ -600,6 +626,7 @@ class FakeWin32Adapter:
                 self.keys_down.discard(name)
 
     def send_text(self, text):
+        self.call_order.append(("send_text", text))
         for _char in text:
             self._emit()  # Unicode down
             self._emit()  # Unicode up
@@ -607,10 +634,12 @@ class FakeWin32Adapter:
 
     def set_clipboard_text(self, text):
         # 2026-09-06：type_text 非 ASCII 剪贴板路径的记录点（提速计划 Task 4）。
+        self.call_order.append(("set_clipboard", text))
         self.clipboard_writes.append(text)
 
     def send_keys(self, keys):
         keys = tuple(keys)
+        self.call_order.append(("send_keys", keys))
         self.keys_sent.append(keys)
         try:
             for name in keys:

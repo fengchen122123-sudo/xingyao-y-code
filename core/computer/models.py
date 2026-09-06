@@ -175,6 +175,9 @@ class ComputerObservation:
     # 阶段二：list_elements 观察携带的控件元素列表（dict：ref/kind/name/
     # bounds/enabled）；与 surface_candidates 同一生命周期语义，普通观察恒空。
     elements: tuple = ()
+    # 通用化重构 Task C：本动作是否发生了前台切换（输入前置激活），仅本地
+    # 自愈判定使用；绝不加入 observation_provider_projection 投影（投影字节不变）。
+    input_activated: bool = False
 
 
 @dataclass(frozen=True)

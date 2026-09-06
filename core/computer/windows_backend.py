@@ -48,6 +48,8 @@ _MAX_TITLE_CHARS = 200
 _KEEP_SCREENSHOTS = 3
 # 剪贴板写入到 Ctrl+V 粘贴之间的小间隔：给目标窗口焦点线程让路（2026-09-06）。
 _CLIPBOARD_PASTE_DELAY_S = 0.05
+# Task C（P3 输入前置激活）：SetForegroundWindow 成功后的激活沉降等待。
+_ACTIVATION_SETTLE_S = 0.15
 _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
 # 阶段二（2026-09-06）：UIA 元素观察与元素引用动作（desktop only）。
 _ELEMENT_KINDS = frozenset({"list_elements", "click_element", "set_value_element"})
@@ -173,6 +175,9 @@ class WindowsComputerBackend:
         # 输入前复核不一致即拒绝（旧坐标失效）。
         self._surface_signature: tuple | None = None
         self._surface_generation = 0
+        # Task C（P3）：本动作是否发生了前台切换；observe 构造观察时消费
+        # （写入 input_activated 并清零），输入动作分发前重置。
+        self._last_activation_changed = False
 
     @classmethod
     def create_default(cls) -> "WindowsComputerBackend":
@@ -293,6 +298,11 @@ class WindowsComputerBackend:
             if pending_region is not None:
                 # 区域观察建立区域基线（候选 ref/代数/边界），供输入前失效复核。
                 self._region_baseline = pending_region
+            # Task C：消费本动作的前置激活结果（仅本地字段，绝不进入投影）。
+            observation = replace(
+                observation, input_activated=self._last_activation_changed
+            )
+            self._last_activation_changed = False
             self._last_observation = observation
             return observation
 
@@ -320,6 +330,8 @@ class WindowsComputerBackend:
                 )
             # 每次桌面动作前重新检查 interactive desktop（锁屏/安全桌面即失败）。
             self._adapter.ensure_interactive()
+            # Task C：激活标记只反映本动作——分发前重置（异常路径不留陈旧标记）。
+            self._last_activation_changed = False
             if kind == "wait":
                 duration = action.duration_ms
                 if type(duration) is not int or not MIN_WAIT_MS <= duration <= MAX_WAIT_MS:
@@ -335,6 +347,13 @@ class WindowsComputerBackend:
                 self._dispatch_semantic_locked(action)
                 return
             else:
+                if kind in ("type_text", "keypress"):
+                    # Task C（P3）键盘前置激活：目标窗口取最近观察的受控窗口
+                    # （surface_id=hwnd:N）。必须先于 R5 复核——激活成功恰好让
+                    # 复核通过（把观察过的窗口带回前台而不是拒绝输入）；失败则
+                    # 维持既有 fail-closed 拒绝路径。
+                    if self._ensure_target_window_active_locked(None):
+                        self._last_activation_changed = True
                 self._require_current_surface_locked()
                 self._dispatch_locked(action)
                 return
@@ -370,6 +389,49 @@ class WindowsComputerBackend:
                 "computer_invalid_action", "set_value_element 需要非空 text"
             )
         locator.set_value(action.element_ref, action.text)
+
+    # ---------------- Task C：输入前置激活（best-effort，绝不阻断输入） ----------------
+
+    def _keyboard_target_hwnd_locked(self) -> int:
+        """键盘动作的目标窗口：最近观察的受控 surface 身份（hwnd:N）。
+
+        无观察或身份解析失败返回 0（调用方按无目标跳过激活）。
+        """
+        observation = self._last_observation
+        if observation is None:
+            return 0
+        surface_id = observation.surface_id or ""
+        if not surface_id.startswith("hwnd:"):
+            return 0
+        try:
+            return int(surface_id.split(":", 1)[1])
+        except ValueError:
+            return 0
+
+    def _ensure_target_window_active_locked(self, point: tuple[int, int] | None) -> bool:
+        """把输入目标窗口提到前台并等激活沉降；返回是否发生了前台切换。
+
+        - point 非 None（pointer 动作）：目标 = 输入点所属顶层窗口
+          （WindowFromPoint，64 位安全经 adapter）；
+        - point 为 None（键盘动作）：目标 = 最近观察的受控窗口
+          （surface_id=hwnd:N）；
+        - 已是前台/查询失败/无目标：不切换，返回 False；
+        - SetForegroundWindow 失败：返回 False，输入照常发送（best-effort）。
+        """
+        try:
+            if point is not None:
+                hwnd = self._adapter.window_from_point(int(point[0]), int(point[1]))
+            else:
+                hwnd = self._keyboard_target_hwnd_locked()
+            if not hwnd or hwnd == self._adapter.foreground_window_id():
+                return False
+            if not self._adapter.set_foreground_window(hwnd):
+                return False
+            time.sleep(_ACTIVATION_SETTLE_S)
+            return True
+        except Exception:
+            _LOGGER.exception("输入前置激活失败（继续原输入路径）")
+            return False
 
     # ---------------- Task B：SoM 编号标注（best-effort，绝不阻断观察） ----------------
 
@@ -692,6 +754,10 @@ class WindowsComputerBackend:
         kind = action.kind
         if kind in ("click", "double_click", "move"):
             x, y = self._physical_point(action)
+            if kind != "move":
+                # Task C（P3）指针前置激活：目标点所属窗口非前台时先激活再输入。
+                if self._ensure_target_window_active_locked((x, y)):
+                    self._last_activation_changed = True
             self._adapter.send_mouse(
                 action=kind, x=x, y=y, button=action.button, modifiers=tuple(action.keys)
             )
@@ -725,9 +791,12 @@ class WindowsComputerBackend:
             if action.delta_x:
                 self._adapter.send_mouse(action="hwheel", delta=action.delta_x)
         elif kind == "drag":
+            path = self._physical_path(action)
+            if self._ensure_target_window_active_locked(path[0]):
+                self._last_activation_changed = True
             self._adapter.send_mouse(
                 action="drag",
-                path=self._physical_path(action),
+                path=path,
                 button=action.button,
                 modifiers=tuple(action.keys),
             )
