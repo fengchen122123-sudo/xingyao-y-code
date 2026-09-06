@@ -100,10 +100,49 @@ def _default_preview_root() -> Path:
     return Path(tempfile.gettempdir()) / _PREVIEW_ROOT_DIRNAME
 
 
-def _default_hotkey_factory():
-    from core.computer.hotkey import WindowsHotkeyApi
+# 临时目录清扫（2026-09-06 提速计划 Task 7）：崩溃/断电可能残留 backend 截图
+# 目录与预览目录。mtime 超过 24h 才删——时间窗防止多实例场景误删正在使用的目录。
+_STALE_TEMP_DIR_PREFIXES = (
+    "ycode-computer-desktop-",
+    "ycode-computer-browser-",
+    "ycode-computer-preview",
+)
+_STALE_TEMP_MAX_AGE_S = 24 * 3600
 
-    return WindowsHotkeyApi()
+
+def sweep_stale_computer_temp_dirs(
+    *, root=None, max_age_s: int = _STALE_TEMP_MAX_AGE_S, now: float | None = None
+) -> int:
+    """清扫崩溃残留的电脑操控临时目录；失败只留痕，绝不影响启动。"""
+    import shutil
+    import time as _time
+
+    root = Path(root) if root is not None else Path(tempfile.gettempdir())
+    now = _time.time() if now is None else now
+    removed = 0
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        return 0
+    for entry in entries:
+        try:
+            if not entry.is_dir() or not any(
+                entry.name.startswith(prefix) for prefix in _STALE_TEMP_DIR_PREFIXES
+            ):
+                continue
+            if now - entry.stat().st_mtime < max_age_s:
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+        except OSError:
+            _LOGGER.exception("清扫电脑操控临时目录失败：%s", entry)
+    return removed
+
+
+def _default_hotkey_factory():
+    from core.computer.platforms import get_platform_adapter
+
+    return get_platform_adapter().create_hotkey_api()
 
 
 def _default_controller_provider():
@@ -203,6 +242,7 @@ def start_computer_runtime(
 ) -> ComputerRuntime:
     """进程级轻量容器（幂等单例）：开关开启时注册热键，默认关闭零副作用。"""
     global _RUNTIME
+    sweep_stale_computer_temp_dirs()
     with _RUNTIME_LOCK:
         if _RUNTIME is not None:
             return _RUNTIME
