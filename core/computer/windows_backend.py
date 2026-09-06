@@ -162,6 +162,11 @@ class WindowsComputerBackend:
         self._pending_surface_candidates: tuple = ()
         # 阶段二：list_elements 待发布的控件元素列表（与候选同一取用-清空模式）。
         self._pending_elements: tuple = ()
+        # Task B（SoM）：最近一次有效元素表与其观察代数——list_elements 后
+        # 紧邻 observe 记录；后续 observe 在代数未变时复用（观察继续标注），
+        # 代数变化即清空并失效 locator 的 ref 全集。
+        self._last_elements: tuple = ()
+        self._elements_surface_generation: int = -1
         self._pending_region: tuple | None = None
         self._region_baseline: tuple | None = None
         # R5：桌面 surface 签名 = (前台窗口身份, 虚拟桌面几何)；变化时代数递增，
@@ -203,12 +208,24 @@ class WindowsComputerBackend:
             self._pending_elements = ()
             pending_region = self._pending_region
             self._pending_region = None
+            # 本次观察最终附加的元素集：pending 优先，其次代数未变的上代元素表。
+            effective_elements = pending_elements
+            # R5/Task B：代数先于观察构造更新——元素表有效性按最新代数判定。
+            signature = self._surface_signature_current_locked(
+                origin_x, origin_y, original_width, original_height
+            )
+            if signature != self._surface_signature:
+                self._surface_generation += 1
+                self._surface_signature = signature
             if pending_region is not None:
                 # R10 局部观察：从原始分辨率整屏裁剪候选区域，区域原点/尺寸
                 # 进入观察的 origin/original_*，坐标反算沿用既有公式结构。
                 observation = self._build_region_observation_locked(
                     run_id, image, (origin_x, origin_y), pending_region
                 )
+                if pending_elements:
+                    self._last_elements = pending_elements
+                    self._elements_surface_generation = self._surface_generation
             else:
                 model_width, model_height = _scaled_dimensions(
                     original_width, original_height
@@ -216,6 +233,37 @@ class WindowsComputerBackend:
                 if (model_width, model_height) != (original_width, original_height):
                     image = image.resize((model_width, model_height), _RESAMPLE)
                 png = self._encode_png(image)
+                elements = pending_elements
+                if elements:
+                    self._last_elements = elements
+                    self._elements_surface_generation = self._surface_generation
+                elif (
+                    self._last_elements
+                    and self._elements_surface_generation == self._surface_generation
+                ):
+                    # Task B：上代元素表在代数未变时仍有效——观察继续标注。
+                    elements = self._last_elements
+                else:
+                    elements = ()
+                    if self._last_elements:
+                        # 代数变化：旧元素表作废，locator 的 ref 全集同时失效。
+                        self._last_elements = ()
+                        self._elements_surface_generation = -1
+                        if self._element_locator is not None:
+                            try:
+                                self._element_locator.invalidate()
+                            except Exception:
+                                _LOGGER.exception("失效旧元素引用失败")
+                effective_elements = elements
+                if elements:
+                    png = self._annotate_elements_locked(
+                        png,
+                        elements,
+                        original_width / model_width,
+                        original_height / model_height,
+                        origin_x,
+                        origin_y,
+                    )
                 path = self._store_screenshot_locked(png)
                 observation = ComputerObservation(
                     run_id=run_id,
@@ -235,18 +283,12 @@ class WindowsComputerBackend:
                     window_title=self._window_title_summary(),
                 )
                 self._region_baseline = None
-            signature = self._surface_signature_current_locked(
-                origin_x, origin_y, original_width, original_height
-            )
-            if signature != self._surface_signature:
-                self._surface_generation += 1
-                self._surface_signature = signature
             observation = replace(
                 observation,
                 surface_id=f"hwnd:{signature[0]}",
                 surface_generation=self._surface_generation,
                 surface_candidates=pending_candidates,
-                elements=pending_elements,
+                elements=effective_elements,
             )
             if pending_region is not None:
                 # 区域观察建立区域基线（候选 ref/代数/边界），供输入前失效复核。
@@ -315,6 +357,8 @@ class WindowsComputerBackend:
         if kind == "list_elements":
             hwnd = self._adapter.foreground_window_id()
             self._pending_elements = tuple(locator.collect(hwnd))
+            # Task B：记录收集时刻的观察代数，供后续 observe 判定元素表有效性。
+            self._elements_surface_generation = self._surface_generation
             return
         self._require_current_surface_locked()
         if kind == "click_element":
@@ -326,6 +370,33 @@ class WindowsComputerBackend:
                 "computer_invalid_action", "set_value_element 需要非空 text"
             )
         locator.set_value(action.element_ref, action.text)
+
+    # ---------------- Task B：SoM 编号标注（best-effort，绝不阻断观察） ----------------
+
+    def _annotate_elements_locked(
+        self,
+        png: bytes,
+        elements: tuple,
+        scale_x: float,
+        scale_y: float,
+        origin_x: int,
+        origin_y: int,
+    ) -> bytes:
+        """把元素 ref 编号画到观察 PNG 上；标注失败退回普通截图并留痕。"""
+        from core.computer.som_annotator import annotate_screenshot
+
+        try:
+            return annotate_screenshot(
+                png,
+                elements,
+                scale_x,
+                scale_y,
+                origin_x=float(origin_x),
+                origin_y=float(origin_y),
+            )
+        except Exception:
+            _LOGGER.exception("SoM 编号标注失败，观察退回普通截图")
+            return png
 
     # ---------------- R10：语义定位与局部观察 ----------------
 

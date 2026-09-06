@@ -67,17 +67,33 @@ class WindowsElementLocator:
             self._elements = elements
             return listing
 
+    def invalidate(self) -> None:
+        """清空元素 ref 全集（通用化重构 Task B）：画面代数变化时由 backend 调用，
+        全部旧 ref 立即过期，后续 click/set_value 抛 computer_element_stale。"""
+        with self._lock:
+            self._elements = {}
+
     def click(self, ref: str) -> None:
         with self._lock:
             self._require_open()
+            self._require_ref_locked(ref)
             self._ensure_real_locked()
             self._click_fn(ref)
 
     def set_value(self, ref: str, text: str) -> None:
         with self._lock:
             self._require_open()
+            self._require_ref_locked(ref)
             self._ensure_real_locked()
             self._set_value_fn(ref, text)
+
+    def _require_ref_locked(self, ref: str) -> None:
+        """ref 有效性门禁：不在最近一次 collect 全集内即过期（宿主映射无法
+        跨线程直清，locator 层先拦一道保证 invalidate 语义真实生效）。"""
+        if ref not in self._elements:
+            raise ComputerControlError(
+                "computer_element_stale", "元素引用已失效，请重新 list_elements"
+            )
 
     def close(self) -> None:
         with self._lock:
