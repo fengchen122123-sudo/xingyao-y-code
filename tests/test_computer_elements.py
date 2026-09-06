@@ -353,3 +353,104 @@ def test_backend_close_releases_element_locator():
     assert locator.close_calls == 1
     backend.close()  # backend 关闭幂等：不重复释放定位器
     assert locator.close_calls == 1
+
+
+# ---------------- Task B：SoM 编号标注截图与元素表代数 ----------------
+
+
+def test_invalidate_clears_ref_mapping():
+    locator, _host = _locator_with_fake()
+    locator.collect(hwnd=0)
+    locator.click("el-2")
+    locator.invalidate()
+    with pytest.raises(ComputerControlError) as exc:
+        locator.click("el-2")
+    assert exc.value.code == "computer_element_stale"
+
+
+def _pil_backend(locator, adapter=None):
+    """真实 PIL 白屏 grab：让 SoM 标注真实执行（FakeImage 字节无法被 PIL 打开）。"""
+    from PIL import Image as PILImage
+
+    from core.computer.windows_backend import WindowsComputerBackend
+    from tests.computer_fakes import FakeWin32Adapter
+
+    def grab():
+        return PILImage.new("RGB", (3840, 2160), "white")
+
+    return WindowsComputerBackend(
+        image_grab=grab,
+        win32_adapter=adapter or FakeWin32Adapter(),
+        element_locator=locator,
+    )
+
+
+def test_list_elements_observe_is_annotated_and_differs_from_plain():
+    """list_elements 后紧邻 observe：观察附带元素表且 PNG 与普通观察不同。"""
+    from pathlib import Path
+
+    locator, _host = _locator_with_fake()
+    backend = _pil_backend(locator)
+    backend.start()
+    run_id = "run-som"
+    try:
+        plain = backend.observe(run_id)
+        plain_bytes = Path(plain.png_path).read_bytes()
+        backend.execute(run_id, ComputerAction(kind="list_elements", target="desktop"))
+        annotated = backend.observe(run_id)
+        annotated_bytes = Path(annotated.png_path).read_bytes()
+        assert annotated.elements and annotated.elements[0]["ref"] == "el-1"
+        assert annotated.screen_sha256 != plain.screen_sha256
+        assert annotated_bytes != plain_bytes
+    finally:
+        backend.close()
+
+
+def test_elements_reused_while_generation_stable():
+    """后续 observe（无新 list_elements）：代数未变时元素表仍附加且继续标注。"""
+    from pathlib import Path
+
+    locator, _host = _locator_with_fake()
+    backend = _pil_backend(locator)
+    backend.start()
+    run_id = "run-som2"
+    try:
+        backend.execute(run_id, ComputerAction(kind="list_elements", target="desktop"))
+        first = backend.observe(run_id)
+        assert first.elements
+        first_bytes = Path(first.png_path).read_bytes()
+        second = backend.observe(run_id)
+        assert second.elements and second.elements[0]["ref"] == "el-1"
+        assert Path(second.png_path).read_bytes() == first_bytes
+    finally:
+        backend.close()
+
+
+def test_generation_change_clears_elements_and_refs():
+    """画面代数变化：元素表清空、locator ref 失效、观察退回普通截图。"""
+    from pathlib import Path
+
+    from tests.computer_fakes import FakeWin32Adapter
+
+    locator, _host = _locator_with_fake()
+    adapter = FakeWin32Adapter()
+    backend = _pil_backend(locator, adapter=adapter)
+    backend.start()
+    run_id = "run-som3"
+    try:
+        plain = backend.observe(run_id)
+        plain_bytes = Path(plain.png_path).read_bytes()
+        backend.execute(run_id, ComputerAction(kind="list_elements", target="desktop"))
+        annotated = backend.observe(run_id)
+        assert annotated.elements
+        # 用户切走窗口：前台身份变化 → 代数递增
+        adapter.foreground_id = 2002
+        switched = backend.observe(run_id)
+        assert switched.elements == ()
+        assert switched.surface_generation == annotated.surface_generation + 1
+        assert Path(switched.png_path).read_bytes() == plain_bytes
+        with pytest.raises(ComputerControlError) as exc:
+            locator.click("el-1")
+        assert exc.value.code == "computer_element_stale"
+    finally:
+        backend.close()
