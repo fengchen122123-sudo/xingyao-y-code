@@ -347,13 +347,11 @@ class WindowsComputerBackend:
                 self._dispatch_semantic_locked(action)
                 return
             else:
-                if kind in ("type_text", "keypress"):
-                    # Task C（P3）键盘前置激活：目标窗口取最近观察的受控窗口
-                    # （surface_id=hwnd:N）。必须先于 R5 复核——激活成功恰好让
-                    # 复核通过（把观察过的窗口带回前台而不是拒绝输入）；失败则
-                    # 维持既有 fail-closed 拒绝路径。
-                    if self._ensure_target_window_active_locked(None):
-                        self._last_activation_changed = True
+                # 真机验收修正（2026-09-06）：键盘动作不做事前激活——键盘没有
+                # 目标点，"目标=上次观察的窗口"在按键打开新窗口（如 Win+R 运行
+                # 对话框）的场景会把旧窗口抢回前台，真机实测 3 条文本被误发进
+                # 微信群聊。键盘输入的焦点漂移维持 R5 fail-closed：前台与最近
+                # 观察不一致即拒绝，强制重新 observe 后再输入。
                 self._require_current_surface_locked()
                 self._dispatch_locked(action)
                 return
@@ -392,37 +390,19 @@ class WindowsComputerBackend:
 
     # ---------------- Task C：输入前置激活（best-effort，绝不阻断输入） ----------------
 
-    def _keyboard_target_hwnd_locked(self) -> int:
-        """键盘动作的目标窗口：最近观察的受控 surface 身份（hwnd:N）。
+    def _ensure_target_window_active_locked(self, point: tuple[int, int]) -> bool:
+        """把输入目标点所属顶层窗口提到前台并等激活沉降；返回是否发生了前台切换。
 
-        无观察或身份解析失败返回 0（调用方按无目标跳过激活）。
-        """
-        observation = self._last_observation
-        if observation is None:
-            return 0
-        surface_id = observation.surface_id or ""
-        if not surface_id.startswith("hwnd:"):
-            return 0
-        try:
-            return int(surface_id.split(":", 1)[1])
-        except ValueError:
-            return 0
-
-    def _ensure_target_window_active_locked(self, point: tuple[int, int] | None) -> bool:
-        """把输入目标窗口提到前台并等激活沉降；返回是否发生了前台切换。
-
-        - point 非 None（pointer 动作）：目标 = 输入点所属顶层窗口
-          （WindowFromPoint，64 位安全经 adapter）；
-        - point 为 None（键盘动作）：目标 = 最近观察的受控窗口
-          （surface_id=hwnd:N）；
+        - 目标 = 输入点所属顶层窗口（WindowFromPoint，64 位安全经 adapter）：
+          点击命中点所在窗口是权威目标，激活它不改变动作语义；
         - 已是前台/查询失败/无目标：不切换，返回 False；
         - SetForegroundWindow 失败：返回 False，输入照常发送（best-effort）。
+
+        仅用于 pointer 类动作（click/double_click/drag）；键盘动作没有目标点，
+        不做前置激活（真机验收修正：键盘激活会把旧观察窗口抢回前台）。
         """
         try:
-            if point is not None:
-                hwnd = self._adapter.window_from_point(int(point[0]), int(point[1]))
-            else:
-                hwnd = self._keyboard_target_hwnd_locked()
+            hwnd = self._adapter.window_from_point(int(point[0]), int(point[1]))
             if not hwnd or hwnd == self._adapter.foreground_window_id():
                 return False
             if not self._adapter.set_foreground_window(hwnd):

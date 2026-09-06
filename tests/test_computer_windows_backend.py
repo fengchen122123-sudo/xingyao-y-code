@@ -799,33 +799,11 @@ def test_desktop_foreground_change_between_actions_rejects_stale_input():
         backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=10, y=10))
     assert raised.value.code == "computer_surface_changed"
     assert adapter.clicks == []
-    # 键盘输入（通用化重构 Task C 新语义）：目标取最近观察的受控窗口，
-    # 前置激活把它带回前台后正常发送，而不是拒绝输入。
-    keyboard_adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720), foreground_id=1001)
-    keyboard_backend = WindowsComputerBackend(
-        image_grab=lambda: FakeImage(width=1280, height=720), win32_adapter=keyboard_adapter
-    )
-    keyboard_backend.observe("run-k")
-    keyboard_adapter.foreground_id = 2002  # 用户切到另一个前台窗口
-    keyboard_backend.execute(
-        "run-k", ComputerAction(kind="keypress", target="desktop", keys=("ENTER",))
-    )
-    assert keyboard_adapter.set_foreground_calls == [1001]
-    assert keyboard_adapter.keys_sent == [("ENTER",)]
-    # 激活失败（best-effort）时维持 fail-closed：R5 复核拒绝，零输入。
-    failed_adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720), foreground_id=1001)
-    failed_backend = WindowsComputerBackend(
-        image_grab=lambda: FakeImage(width=1280, height=720), win32_adapter=failed_adapter
-    )
-    failed_backend.observe("run-f")
-    failed_adapter.foreground_id = 2002
-    failed_adapter.set_foreground_result = False
-    with pytest.raises(ComputerControlError) as raised_failed:
-        failed_backend.execute(
-            "run-f", ComputerAction(kind="keypress", target="desktop", keys=("ENTER",))
-        )
-    assert raised_failed.value.code == "computer_surface_changed"
-    assert failed_adapter.keys_sent == []
+    # 键盘输入同样被拒绝（前台身份不一致；真机验收修正后键盘不做事前激活）。
+    with pytest.raises(ComputerControlError) as raised_keys:
+        backend.execute("run-a", ComputerAction(kind="keypress", target="desktop", keys=("ENTER",)))
+    assert raised_keys.value.code == "computer_surface_changed"
+    assert adapter.keys_sent == []
     # 重新观察后基线刷新，输入恢复。
     refreshed = backend.observe("run-a")
     assert refreshed.surface_id == "hwnd:2002"
@@ -993,22 +971,24 @@ def test_drag_activates_window_of_first_path_point():
         backend.close()
 
 
-def test_type_text_activates_window_from_last_observation_surface():
-    """键盘动作：目标 = 最近观察的受控窗口（hwnd:N）；先于 R5 复核激活。"""
+def test_type_text_after_window_switch_is_rejected_without_focus_steal():
+    """真机验收修正：键盘动作不做事前激活——前台切走后 R5 fail-closed 拒绝，
+    绝不把旧观察窗口抢回前台（防误发消息）。"""
     adapter = FakeWin32Adapter(foreground_id=2002)
     backend = _activation_backend(adapter)
     backend.start()
     try:
         observation = backend.observe("run-c")
         assert observation.surface_id == "hwnd:2002"
-        adapter.foreground_id = 1001  # 用户切走窗口（R5 复核本会拒绝）
-        backend.execute(
-            "run-c", ComputerAction(kind="type_text", target="desktop", text="hello")
-        )
-        assert adapter.set_foreground_calls == [2002]
-        assert adapter.texts == ["hello"]
-        labels = [entry[0] for entry in adapter.call_order]
-        assert labels.index("set_foreground") < labels.index("send_text")
+        adapter.foreground_id = 1001  # 用户/新窗口切走（如 Win+R 打开运行对话框）
+        with pytest.raises(ComputerControlError) as exc:
+            backend.execute(
+                "run-c", ComputerAction(kind="type_text", target="desktop", text="hello")
+            )
+        assert exc.value.code == "computer_surface_changed"
+        assert adapter.set_foreground_calls == []  # 未发生任何抢焦点
+        assert adapter.texts == []
+        assert adapter.keys_sent == []
     finally:
         backend.close()
 
