@@ -190,11 +190,20 @@ class FakeMouse:
 
 
 class FakeKeyboard:
-    """page.keyboard fake：记录 press/insert_text。"""
+    """page.keyboard fake：记录 press/insert_text/down/up。
+
+    - ``down_fail_after``：第 N+1 次 down 起抛 ``down_error``（默认
+      RuntimeError），用于验证部分按下后的逆序释放；
+    - ``up_error``：up 时抛出，用于验证释放失败保留按下记录。
+    """
 
     def __init__(self, runtime):
         self._runtime = runtime
         self.calls = []
+        self.down_fail_after = None
+        self.down_error = None
+        self.up_error = None
+        self._down_count = 0
 
     def press(self, key, **kwargs):
         self._runtime._record_call("keyboard.press")
@@ -203,6 +212,19 @@ class FakeKeyboard:
     def insert_text(self, text, **kwargs):
         self._runtime._record_call("keyboard.insert_text")
         self.calls.append(("insert_text", text))
+
+    def down(self, key, **kwargs):
+        self._runtime._record_call("keyboard.down")
+        self._down_count += 1
+        if self.down_fail_after is not None and self._down_count > self.down_fail_after:
+            raise self.down_error or RuntimeError("injected keyboard.down failure")
+        self.calls.append(("down", key))
+
+    def up(self, key, **kwargs):
+        self._runtime._record_call("keyboard.up")
+        self.calls.append(("up", key))
+        if self.up_error is not None:
+            raise self.up_error
 
 
 class FakePage:
@@ -214,11 +236,16 @@ class FakePage:
         self.url = url
         self.page_title = title
         self.closed = False
+        # R5 可见性探针字段：document.visibilityState / document.hasFocus()
+        self.visibility_state = "visible"
+        self.focused = True
         self.mouse = FakeMouse(runtime)
         self.keyboard = FakeKeyboard(runtime)
         self.goto_calls = []
         self.navigation_calls = []
+        self.navigation_kwargs = []
         self.screenshot_calls = []
+        self.evaluate_calls = []
         self.screenshot_bytes = screenshot_bytes  # None 时回落到 runtime.screenshot_bytes
         self.screenshot_error = None
         self.screenshot_gate = None  # threading.Event：设置后 screenshot 阻塞等待
@@ -230,6 +257,14 @@ class FakePage:
         self._runtime._record_call("page.is_closed")
         return self.closed
 
+    def evaluate(self, expression, *args, **kwargs):
+        """仅支持 R5 可见性探针表达式；其他表达式一律拒绝（隐私边界）。"""
+        self._runtime._record_call("page.evaluate")
+        self.evaluate_calls.append(expression)
+        if "visibilityState" in str(expression) and "hasFocus" in str(expression):
+            return [self.visibility_state, self.focused]
+        raise AssertionError(f"fake page 只允许可见性探针，拒绝 evaluate: {expression!r}")
+
     def title(self):
         self._runtime._record_call("page.title")
         return self.page_title
@@ -237,19 +272,23 @@ class FakePage:
     def goto(self, url, **kwargs):
         self._runtime._record_call("page.goto")
         self.goto_calls.append(url)
+        self.navigation_kwargs.append(("goto", dict(kwargs)))
         self.url = url
 
     def go_back(self, **kwargs):
         self._runtime._record_call("page.go_back")
         self.navigation_calls.append("go_back")
+        self.navigation_kwargs.append(("go_back", dict(kwargs)))
 
     def go_forward(self, **kwargs):
         self._runtime._record_call("page.go_forward")
         self.navigation_calls.append("go_forward")
+        self.navigation_kwargs.append(("go_forward", dict(kwargs)))
 
     def reload(self, **kwargs):
         self._runtime._record_call("page.reload")
         self.navigation_calls.append("reload")
+        self.navigation_kwargs.append(("reload", dict(kwargs)))
 
     def screenshot(self, type=None, **kwargs):  # noqa: A002 - playwright kwarg 名
         self._runtime._record_call("page.screenshot")
@@ -300,7 +339,14 @@ class FakeBrowserContext:
         return page
 
     def simulate_popup(self, url="https://popup.example/", title="Popup"):
-        """测试专用：模拟用户/脚本打开的 popup，触发 context 的 page 事件。"""
+        """测试专用：模拟用户/脚本打开的 popup，触发 context 的 page 事件。
+
+        模拟真实焦点转移（R5）：既有页转为 hidden/失焦，新 popup 可见且聚焦。
+        """
+        for page in self.pages:
+            if not page.closed:
+                page.visibility_state = "hidden"
+                page.focused = False
         page = FakePage(self._runtime, url=url, title=title)
         page._context = self
         self.pages.append(page)
@@ -402,6 +448,7 @@ class FakeImage:
         self.origin_x = origin_x
         self.origin_y = origin_y
         self.resize_calls = []
+        self.crop_calls = []
         self.saved_with = []
 
     @property
@@ -411,6 +458,11 @@ class FakeImage:
     def resize(self, size, resample=None):
         self.resize_calls.append((tuple(size), resample))
         return FakeImage(size[0], size[1], self.origin_x, self.origin_y)
+
+    def crop(self, box):
+        """R10：区域裁剪 fake；只记录并返回区域尺寸的确定性 FakeImage。"""
+        self.crop_calls.append(tuple(box))
+        return FakeImage(box[2] - box[0], box[3] - box[1], self.origin_x, self.origin_y)
 
     def save(self, buffer, format=None, **params):
         self.saved_with.append((format, dict(params)))
@@ -437,12 +489,13 @@ class FakeWin32Adapter:
     """
 
     def __init__(self, *, virtual_rect=(-1920, 0, 3840, 2160), desktop_name="Default",
-                 has_foreground=True, foreground_title="Fake Window",
+                 has_foreground=True, foreground_title="Fake Window", foreground_id=1001,
                  preflight_error=None, fail_after=None):
         self.virtual_rect = virtual_rect
         self.desktop_name = desktop_name
         self.has_foreground = has_foreground
         self.foreground_title = foreground_title
+        self.foreground_id = foreground_id  # R5：前台窗口本地身份，测试可改写模拟切窗
         self.preflight_error = preflight_error
         self.fail_after = fail_after
         self.preflight_calls = 0
@@ -455,6 +508,7 @@ class FakeWin32Adapter:
         self.drags = []
         self.texts = []
         self.keys_sent = []
+        self.clipboard_writes = []
         self.mouse_calls = []
         self.keys_down = set()
         self.buttons_down = set()
@@ -484,6 +538,9 @@ class FakeWin32Adapter:
 
     def foreground_window_title(self):
         return self.foreground_title
+
+    def foreground_window_id(self):
+        return self.foreground_id
 
     def _emit(self):
         """模拟一个底层输入事件送达；超过 fail_after 后按 SendInput 部分失败处理。"""
@@ -548,6 +605,10 @@ class FakeWin32Adapter:
             self._emit()  # Unicode up
         self.texts.append(text)
 
+    def set_clipboard_text(self, text):
+        # 2026-09-06：type_text 非 ASCII 剪贴板路径的记录点（提速计划 Task 4）。
+        self.clipboard_writes.append(text)
+
     def send_keys(self, keys):
         keys = tuple(keys)
         self.keys_sent.append(keys)
@@ -605,6 +666,7 @@ class FakeComputerBackend:
         self.execute_gate = execute_gate
         self.png_path = png_path
         self.closed = False
+        self.reusable = True
         self._screen_hashes = list(screen_hashes)
         self._last_hash = f"sha-{target}-0"
         self._fingerprint = fingerprint
@@ -673,6 +735,11 @@ class FakeComputerBackend:
             self.closed = True
         if self.close_error is not None:
             raise self.close_error
+
+    def is_reusable(self):
+        """retained 领取裁决 fake（R4）：``reusable=False`` 模拟不健康实例。"""
+        with self._lock:
+            return self.reusable and not self.closed
 
 
 # ---------------- Task 13a 导出：GUI Bridge 电脑操控 Controller fake ----------------
@@ -930,3 +997,109 @@ class FakeController:
             status=self.run_status,
             action_count=self.action_count,
         )
+
+
+# ---------------- R10 导出：语义定位 fake（绝不触碰真实窗口/UIA） ----------------
+
+
+class FakeSurfaceLocator:
+    """SurfaceLocator 协议的纯 fake：候选由测试配置，记录 activate/invoke 调用。
+
+    - ``windows``/``tray_icons``：SurfaceCandidate 数据字典列表（label/bounds/
+      operations）；每次 list_* 调用递增代数并重发候选（旧 ref 随即失效）；
+    - ``activate_error``/``invoke_error``：注入失败；``activate_calls``/
+      ``invoke_calls`` 按序记录 (ref, generation)；
+    - ``bounds_override``：ref → 当前边界，模拟候选移动/消失（None）。
+    """
+
+    def __init__(self, *, windows=(), tray_icons=(), activate_error=None, invoke_error=None):
+        from core.computer.surfaces import SurfaceCandidate
+
+        self._window_specs = list(windows)
+        self._tray_specs = list(tray_icons)
+        self.activate_error = activate_error
+        self.invoke_error = invoke_error
+        self.activate_calls = []
+        self.invoke_calls = []
+        self.bounds_override = {}
+        self.close_calls = 0
+        self._generation = 0
+        self._candidates = {}
+        self._closed = False
+        self._candidate_cls = SurfaceCandidate
+
+    def _reissue(self, kind, specs):
+        self._generation += 1
+        self._candidates = {
+            ref: c for ref, c in self._candidates.items() if c.kind != kind
+        }
+        issued = []
+        for index, spec in enumerate(specs, start=1):
+            ref = f"fake-{self._generation}-{kind}-{index}"
+            candidate = self._candidate_cls(
+                ref=ref,
+                kind=kind,
+                label=str(spec.get("label", "")),
+                surface_generation=self._generation,
+                supported_operations=tuple(spec.get("operations", ("activate", "click_point"))),
+                bounds=tuple(spec.get("bounds", (0, 0, 32, 32))),
+            )
+            self._candidates[ref] = candidate
+            issued.append(candidate)
+        return tuple(issued)
+
+    def _check_open(self):
+        if self._closed:
+            raise ComputerControlError("computer_surfaces_unavailable", "语义定位器已关闭")
+
+    def list_windows(self):
+        self._check_open()
+        return self._reissue("window", self._window_specs)
+
+    def list_tray_icons(self):
+        self._check_open()
+        return self._reissue("tray_icon", self._tray_specs)
+
+    def _resolve(self, ref, generation):
+        self._check_open()
+        candidate = self._candidates.get(ref)
+        if candidate is None or candidate.surface_generation != generation:
+            raise ComputerControlError(
+                "computer_surface_unknown", "语义定位候选不存在或观察代数已过期"
+            )
+        return candidate
+
+    def resolve_candidate(self, ref, generation):
+        candidate = self._candidates.get(ref)
+        if candidate is None or candidate.surface_generation != generation:
+            return None
+        return candidate
+
+    def current_candidate_bounds(self, ref, generation):
+        candidate = self.resolve_candidate(ref, generation)
+        if candidate is None:
+            return None
+        if ref in self.bounds_override:
+            return self.bounds_override[ref]
+        return candidate.bounds
+
+    def activate_window(self, ref, generation):
+        candidate = self._resolve(ref, generation)
+        if "activate" not in candidate.supported_operations:
+            raise ComputerControlError("computer_invalid_action", "候选不支持 activate")
+        self.activate_calls.append((ref, generation))
+        if self.activate_error is not None:
+            raise self.activate_error
+
+    def invoke_element(self, ref, generation):
+        candidate = self._resolve(ref, generation)
+        if "invoke" not in candidate.supported_operations:
+            raise ComputerControlError("computer_invalid_action", "候选不支持 invoke")
+        self.invoke_calls.append((ref, generation))
+        if self.invoke_error is not None:
+            raise self.invoke_error
+
+    def close(self):
+        self.close_calls += 1
+        self._closed = True
+        self._candidates = {}
