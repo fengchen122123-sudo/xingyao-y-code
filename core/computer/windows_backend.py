@@ -171,14 +171,16 @@ class WindowsComputerBackend:
 
     @classmethod
     def create_default(cls) -> "WindowsComputerBackend":
-        """生产构造：真实 ImageGrab + 真实 Win32InputAdapter + 语义定位器（惰性导入）。"""
+        """生产构造：真实 ImageGrab + 真实 Win32InputAdapter + 语义/元素定位器（惰性导入）。"""
         from core.computer.win32_adapter import Win32InputAdapter
         from core.computer.platforms.windows_surfaces import WindowsSurfaceLocator
+        from core.computer.platforms.windows_elements import WindowsElementLocator
 
         return cls(
             image_grab=default_image_grab,
             win32_adapter=Win32InputAdapter(),
             surface_locator=WindowsSurfaceLocator(),
+            element_locator=WindowsElementLocator(),
         )
 
     # ---------------- ComputerBackend 协议 ----------------
@@ -511,6 +513,13 @@ class WindowsComputerBackend:
                 locator.close()
             except Exception:
                 _LOGGER.exception("关闭桌面语义定位器失败")
+        # Task A：释放 UIA 元素定位器（惰性 COM 线程）；失败只留痕不阻断收尾。
+        element_locator = self._element_locator
+        if element_locator is not None:
+            try:
+                element_locator.close()
+            except Exception:
+                _LOGGER.exception("关闭桌面元素定位器失败")
         if owns and screenshot_dir is not None:
             shutil.rmtree(screenshot_dir, ignore_errors=True)
 

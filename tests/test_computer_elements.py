@@ -275,3 +275,81 @@ def test_generic_prompt_mentions_elements():
     prompt = build_generic_dynamic_prompt(cap)
     assert "list_elements" in prompt
     assert "set_value_element" in prompt
+
+
+# ---------------- Task A：元素能力生产接线（惰性启动） ----------------
+
+
+def test_locator_lazy_start_defers_com_thread(monkeypatch):
+    """生产路径构造绝不创建 RealUIAHost（不起 COM 线程），close 前也未构造。"""
+    import core.computer.platforms.windows_elements_uia as uia_module
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("RealUIAHost 在惰性启动前被构造")
+
+    monkeypatch.setattr(uia_module, "RealUIAHost", _boom)
+    locator = WindowsElementLocator()
+    locator.close()  # 未使用即关闭：全程未触碰 COM
+
+
+def test_locator_lazy_start_constructs_on_first_collect(monkeypatch):
+    """首次 collect 才惰性构造 RealUIAHost（专用 COM 线程）。"""
+    import core.computer.platforms.windows_elements_uia as uia_module
+
+    constructed = []
+
+    class _StubRealUIAHost:
+        def __init__(self):
+            constructed.append(1)
+
+        def collect(self, hwnd):
+            return [], {}
+
+        def click(self, ref):
+            raise AssertionError("本测试不点击")
+
+        def set_value(self, ref, text):
+            raise AssertionError("本测试不写值")
+
+    monkeypatch.setattr(uia_module, "RealUIAHost", _StubRealUIAHost)
+    locator = WindowsElementLocator()
+    assert constructed == []
+    locator.collect(1001)
+    assert constructed == [1]
+    locator.close()
+
+
+def test_create_default_wires_element_locator():
+    """create_default 生产构造挂接元素定位器；backend 关闭时释放定位器。"""
+    from core.computer.windows_backend import WindowsComputerBackend
+
+    backend = WindowsComputerBackend.create_default()
+    try:
+        assert backend._element_locator is not None
+    finally:
+        backend.close()
+    assert backend._element_locator._closed
+
+
+def test_backend_close_releases_element_locator():
+    """backend.close() 在 release_inputs 之后调用元素定位器 close（幂等留痕）。"""
+    from core.computer.windows_backend import WindowsComputerBackend
+    from tests.computer_fakes import FakeImage, FakeWin32Adapter
+
+    class _RecordingLocator:
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    locator = _RecordingLocator()
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(width=3840, height=2160, origin_x=-1920, origin_y=0),
+        win32_adapter=FakeWin32Adapter(),
+        element_locator=locator,
+    )
+    backend.close()
+    assert locator.close_calls == 1
+    backend.close()  # backend 关闭幂等：不重复释放定位器
+    assert locator.close_calls == 1
