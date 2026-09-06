@@ -66,6 +66,13 @@ class ComputerActionKind(str, Enum):
     FORWARD = "forward"
     RELOAD = "reload"
     REQUEST_USER_TAKEOVER = "request_user_takeover"
+    # R10 语义定位与局部观察（desktop only，协议扩展）。
+    LIST_SURFACES = "list_surfaces"
+    ACTIVATE_SURFACE = "activate_surface"
+    INVOKE_SURFACE = "invoke_surface"
+    OBSERVE_REGION = "observe_region"
+    # 批量微动作（2026-09-06 协议扩展）：一次调用串行执行多个基本输入动作。
+    SEQUENCE = "sequence"
 
 
 class ComputerControlError(Exception):
@@ -99,14 +106,24 @@ class ComputerAction:
     button: str = "left"
     delta_x: int = 0
     delta_y: int = 0
+    # R7 滚动单位契约：css_pixel（browser，每轴 ±4000）/ wheel_step（desktop，
+    # 每轴 ±10）；None 表示按 target 默认单位。正方向统一为向右/向下。
+    unit: str | None = None
     text: str | None = field(default=None, repr=False)
     keys: tuple[str, ...] = ()
     url: str | None = None
     duration_ms: int | None = None
     reason_code: str | None = None
+    # R10 语义定位动作（activate_surface/observe_region）引用 list_surfaces
+    # 观察给出的候选 ref 与代数；普通坐标动作为 None。
+    surface_ref: str | None = None
+    surface_generation: int | None = None
     # 起终点输入在 parse_computer_action 解析时立即规范化为 path，存储层恒为 None。
     end_x: int | None = None
     end_y: int | None = None
+    # sequence 批量动作的子步骤（仅 kind="sequence" 非空；子项本身也是
+    # 不可变 ComputerAction，kind 限定为无副作用定位的八种基本输入动作）。
+    steps: tuple["ComputerAction", ...] = ()
 
 
 @dataclass(frozen=True)
@@ -139,6 +156,30 @@ class ComputerObservation:
     before_fingerprint: str = ""
     after_fingerprint: str = ""
     preview_url: str = ""
+    # R5：受控画面身份（仅本地使用，绝不进入 Provider 投影）。
+    # browser 为本地 page 序号（"page-N"），desktop 为前台窗口本地标识
+    # （"hwnd:<句柄>"）；surface_generation 在页切换/前台窗口/几何变化时递增。
+    surface_id: str = ""
+    surface_generation: int = 0
+    # R10：list_surfaces 观察给出的语义定位候选（SurfaceCandidate 的字典
+    # 形状：ref/kind/label/bounds/operations/surface_generation）；仅本次
+    # 观察有效，普通观察恒为空 tuple。
+    surface_candidates: tuple = ()
+
+
+@dataclass(frozen=True)
+class BackendIdentity:
+    """一次 run 请求的 backend 不可变身份（R4）：只在本地执行层存在。
+
+    browser/profile_path 取自 Turn 冻结能力快照与领取时解析的规范绝对路径；
+    desktop 的 browser/profile_path 恒为空串。身份绝不进入 Provider 消息或
+    Journal。
+    """
+
+    platform: str
+    target: str
+    browser: str = ""
+    profile_path: str = ""
 
 
 @dataclass(frozen=True)
@@ -197,3 +238,10 @@ class ComputerBackend(Protocol):
     def release_inputs(self) -> None: ...
 
     def close(self) -> None: ...
+
+    def is_reusable(self) -> bool:
+        """retained 领取前裁决（R4）：healthy、未关闭、无 pending/running 命令。
+
+        返回 False 的留存实例不得复用；有未结束 worker 的实例不得进入 retained。
+        """
+        ...

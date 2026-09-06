@@ -13,6 +13,7 @@ from core.computer.actions import (
     COMPUTER_ACTION_TOOL_SCHEMA,
     observation_provider_projection,
     parse_computer_action,
+    sanitized_action_summary,
 )
 from core.computer.models import (
     BrowserKind,
@@ -88,8 +89,10 @@ def test_parse_action_rejects_invalid_payload(payload):
     {"kind": "drag", "target": "desktop", "path": [(1, 2), (3, 4), (5, 6)]},
     {"kind": "drag", "target": "desktop", "x": 1, "y": 2, "end_x": 3, "end_y": 4,
      "button": "left", "keys": ["SHIFT"]},
-    {"kind": "scroll", "target": "desktop", "x": 10, "y": 20, "delta_x": 0, "delta_y": -240},
+    {"kind": "scroll", "target": "desktop", "x": 10, "y": 20, "delta_x": 0, "delta_y": -3},
     {"kind": "scroll", "target": "browser", "delta_y": 240},
+    {"kind": "scroll", "target": "browser", "delta_y": -4000, "unit": "css_pixel"},
+    {"kind": "scroll", "target": "desktop", "delta_y": 10, "unit": "wheel_step"},
     {"kind": "type_text", "target": "desktop", "text": "你好"},
     {"kind": "type_text", "target": "browser", "text": "hello"},
     {"kind": "keypress", "target": "desktop", "keys": ["CTRL", "A"]},
@@ -562,6 +565,10 @@ def test_capability_and_enums_have_design_values():
         "observe", "click", "double_click", "move", "drag", "scroll",
         "type_text", "keypress", "wait", "navigate", "back", "forward", "reload",
         "request_user_takeover",
+        # R10 协议扩展（2026-09-05）：desktop 语义定位与局部观察。
+        "list_surfaces", "activate_surface", "invoke_surface", "observe_region",
+        # 2026-09-06 协议扩展：sequence 批量微动作（提速计划 Task 1）。
+        "sequence",
     }
     capability = ComputerCapability(
         enabled=True, protocol="generic", targets=("browser", "desktop"),
@@ -589,6 +596,9 @@ def test_computer_backend_is_runtime_checkable_protocol():
         def close(self):
             return None
 
+        def is_reusable(self):
+            return False
+
     assert isinstance(_FakeBackend(), ComputerBackend)
 
 
@@ -613,3 +623,45 @@ def test_computer_action_tool_schema_shape():
     assert set(reason_enum) == {"login_required", "captcha_required", "credential_required"}
     description = function["description"]
     assert "完成任务后输出正常最终结论，不继续无意义观察" in description
+
+
+# ---------------------------------------------------------------------------
+# R7：滚动单位/方向契约（css_pixel vs wheel_step，正方向向右/向下）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("payload", [
+    {"kind": "scroll", "target": "browser", "delta_x": 4001},                 # 超像素上限
+    {"kind": "scroll", "target": "browser", "delta_y": -4001},
+    {"kind": "scroll", "target": "desktop", "delta_y": 11},                   # 超步进上限
+    {"kind": "scroll", "target": "desktop", "delta_x": -11},
+    {"kind": "scroll", "target": "browser"},                                  # 两轴为零
+    {"kind": "scroll", "target": "desktop", "delta_x": 0, "delta_y": 0},
+    {"kind": "scroll", "target": "browser", "delta_y": 100, "unit": "wheel_step"},  # 单位与 target 不匹配
+    {"kind": "scroll", "target": "desktop", "delta_y": 1, "unit": "css_pixel"},
+    {"kind": "scroll", "target": "browser", "delta_y": 100, "unit": "pixel"},        # 未知单位
+    {"kind": "scroll", "target": "browser", "delta_y": 100, "unit": True},
+    {"kind": "scroll", "target": "desktop", "delta_y": -240},                 # 旧像素值在桌面超限
+])
+def test_parse_rejects_scroll_unit_range_and_zero_violations(payload):
+    with pytest.raises(ComputerControlError) as raised:
+        parse_computer_action(payload)
+    assert raised.value.code == "computer_invalid_action"
+
+
+def test_scroll_unit_defaults_follow_target():
+    browser = parse_computer_action({"kind": "scroll", "target": "browser", "delta_y": 500})
+    desktop = parse_computer_action({"kind": "scroll", "target": "desktop", "delta_y": -2})
+    assert browser.unit == "css_pixel"
+    assert desktop.unit == "wheel_step"
+
+
+def test_scroll_schema_declares_unit_enum():
+    properties = COMPUTER_ACTION_TOOL_SCHEMA["function"]["parameters"]["properties"]
+    assert properties["unit"]["enum"] == ["css_pixel", "wheel_step"]
+    assert "scroll" in COMPUTER_ACTION_TOOL_SCHEMA["function"]["parameters"]["properties"]["kind"]["enum"]
+
+
+def test_sanitized_summary_includes_scroll_unit():
+    action = parse_computer_action({"kind": "scroll", "target": "browser", "delta_y": 120})
+    assert sanitized_action_summary(action)["unit"] == "css_pixel"
