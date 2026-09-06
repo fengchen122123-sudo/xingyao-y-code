@@ -72,6 +72,12 @@ common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken
     # PyInstaller 静态分析不可达，必须显式声明，否则打包后插件调用直接
     # ModuleNotFoundError。
     'core.hunyuan_image',
+    # comtypes 在运行时从系统 UIAutomationCore.dll 生成 comtypes.gen.* 绑定，
+    # PyInstaller 静态扫描不可达（仅 Windows 桌面语义定位路径使用）。
+    'comtypes',
+    'comtypes.client',
+    'comtypes.gen',
+    'comtypes.gen.UIAutomationClient',
 ]
 
 # tkinter/matplotlib/IPython/notebook 均未被本项目使用；PyQt5/PyQt6 是

@@ -3066,12 +3066,13 @@ class ApiBridge:
         """浏览器操控开启 preflight：所选浏览器可用 + 全局热键可注册。"""
         from core.computer.models import ComputerControlError
         from core.computer.settings import load_computer_settings
-        from core.computer.win32_adapter import _default_hotkey_probe
+        from core.computer.platforms import get_platform_adapter
 
         snapshot = load_computer_settings()
+        adapter = get_platform_adapter()
         if not snapshot.platform_supported:
             raise ComputerControlError(
-                "computer_unsupported_os", "浏览器操控目前仅支持 Windows"
+                "computer_unsupported_os", adapter.unavailable_reason
             )
         selected = next(
             (
@@ -3091,17 +3092,17 @@ class ApiBridge:
             raise ComputerControlError(
                 "computer_browser_unavailable", f"{label} 不可用：{reason}"
             )
-        if not _default_hotkey_probe():
+        if not adapter.probe_hotkey():
             raise ComputerControlError(
                 "computer_hotkey_unavailable",
                 "无法注册全局紧急停止热键 Ctrl+Alt+Esc",
             )
 
     def _computer_control_preflight(self) -> None:
-        """完整电脑操控开启 preflight：Windows backend 检查（平台/DPI/交互桌面/热键）。"""
-        from core.computer.win32_adapter import Win32InputAdapter
+        """完整电脑操控开启 preflight：由平台层校验授权、坐标环境与紧急停止。"""
+        from core.computer.platforms import get_platform_adapter
 
-        Win32InputAdapter().preflight()
+        get_platform_adapter().preflight_desktop()
 
     def _stop_computer_runs_for_disabled_switch(self, switch_target: str) -> None:
         """开关关闭后通知 controller 停止对应 target 的活动 run（设计 8.1/8.4）。

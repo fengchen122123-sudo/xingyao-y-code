@@ -7,8 +7,6 @@ profile 展示路径。不得导入 controller 或 hotkey，不得执行任何�
 
 from __future__ import annotations
 
-import os
-import shutil
 import sys
 import threading
 from dataclasses import dataclass
@@ -16,6 +14,7 @@ from pathlib import Path
 from typing import Callable
 
 import config
+from core.computer import platforms
 from core.computer.models import ComputerControlError
 
 BROWSER_CONTROL_CONFIG_KEY = "browser_control_enabled"
@@ -29,11 +28,10 @@ DEFAULT_COMPUTER_BROWSER = "edge"
 _GENERATION_LOCK = threading.Lock()
 _settings_generation = 0
 
-# 受支持浏览器的固定定义：(显示名, 可执行文件名, Windows Program Files 相对路径)。
-# 每个选项独立探测，绝不互相 fallback（设计第 21 节禁止行为）。
-_BROWSER_DEFINITIONS: dict[str, tuple[str, str, str]] = {
-    "edge": ("Microsoft Edge", "msedge.exe", os.path.join("Microsoft", "Edge", "Application", "msedge.exe")),
-    "chrome": ("Google Chrome", "chrome.exe", os.path.join("Google", "Chrome", "Application", "chrome.exe")),
+# 公共设置只保存浏览器身份；可执行文件名与安装位置由平台层负责。
+_BROWSER_DEFINITIONS = {
+    "edge": "Microsoft Edge",
+    "chrome": "Google Chrome",
 }
 
 
@@ -103,34 +101,21 @@ def _read_browser(data: dict) -> str:
 
 
 def _is_platform_supported(platform: str) -> bool:
-    return platform == "win32"
-
-
-def _windows_install_candidates(relative_path: str) -> list[str]:
-    candidates = []
-    for env_name in ("ProgramFiles", "ProgramFiles(x86)"):
-        root = os.environ.get(env_name)
-        if root:
-            candidates.append(os.path.join(root, relative_path))
-    return candidates
+    return platforms.get_platform_adapter(platform).supported
 
 
 def _detect_browser(browser: str, platform: str) -> BrowserOption:
-    """shutil.which + Windows 明确安装路径；单个浏览器独立判定，绝不 fallback。"""
-    label, executable_name, relative_path = _BROWSER_DEFINITIONS[browser]
-    executable = shutil.which(executable_name) or ""
-    if not executable and platform == "win32":
-        for candidate in _windows_install_candidates(relative_path):
-            if os.path.isfile(candidate):
-                executable = candidate
-                break
+    """平台内单独探测所选浏览器，不可用平台不检查其他系统的安装路径。"""
+    adapter = platforms.get_platform_adapter(platform)
+    label = _BROWSER_DEFINITIONS[browser]
+    executable = adapter.find_browser_executable(browser)
     available = bool(executable)
     return BrowserOption(
         browser=browser,
         label=label,
         available=available,
         executable=executable,
-        unavailable_reason="" if available else "未安装或不在 Y-CODE 的 PATH 中",
+        unavailable_reason="" if available else (adapter.unavailable_reason or "未安装或不在 Y-CODE 的 PATH 中"),
     )
 
 
