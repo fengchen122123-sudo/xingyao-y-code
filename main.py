@@ -3,6 +3,20 @@ import shutil
 import sys
 import io
 
+
+def _dispatch_browser_worker_argv() -> bool:
+    from core.computer.browser_backend import WORKER_ARGV_FLAG
+
+    if WORKER_ARGV_FLAG not in sys.argv:
+        return False
+    sys.argv.remove(WORKER_ARGV_FLAG)
+    from core.computer.browser_worker import main as worker_main
+
+    raise SystemExit(worker_main())
+
+
+_dispatch_browser_worker_argv()
+
 # Windows GBK 终端在输出 emoji/非 BMP 字符时会触发 UnicodeEncodeError 崩溃。
 # 强制 stdout/stderr 使用 UTF-8 + replace 错误策略：无法显示的字符会变成 �，
 # 保证程序不崩溃；现代 Windows Terminal 已支持 UTF-8，旧版 conhost 最多显示乱码。

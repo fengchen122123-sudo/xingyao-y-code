@@ -19,9 +19,12 @@ context/page 被用户关闭后后续动作抛 ``computer_browser_closed``，不
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import queue
 import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -39,6 +42,7 @@ from core.computer.models import (
 _LOGGER = logging.getLogger(__name__)
 
 _CHANNELS = {"edge": "msedge", "chrome": "chrome"}
+WORKER_ARGV_FLAG = "--ycode-browser-worker"
 _VIEWPORT_WIDTH = 1440
 _VIEWPORT_HEIGHT = 900
 _MAX_TITLE_CHARS = 200
@@ -46,6 +50,14 @@ _COMMAND_QUEUE_SIZE = 8
 _DEFAULT_COMMAND_TIMEOUT = 30.0
 _DEFAULT_START_TIMEOUT = 30.0
 _KEEP_SCREENSHOTS = 3
+# R2 第二段：受管执行进程的父进程守卫超时（须大于子进程内部命令超时，
+# 让子进程自己的超时错误先于父进程守卫返回）与硬停止预算。
+_PROCESS_GUARD_SLACK = 5.0
+# R5：窗口标题落后于页面标题（Edge/Chrome 异步更新）的有界收敛等待；
+# 每轮重新取窗口提示并重新匹配，超时仍 fail-closed。
+_WINDOW_HINT_SETTLE_SECONDS = 1.0
+_PROCESS_CLOSE_GRACEFUL = 2.0
+_PROCESS_HARD_EXIT = 2.0
 
 # 进程内 profile 锁注册表：同一 browser profile 只允许一个 Y-CODE context 持有
 # （设计 12.2）。键为 resolve 后的 profile 目录字符串，值为持有者 id。
@@ -77,6 +89,10 @@ _KEY_NAME_MAP = {
     "RIGHT": "ArrowRight",
 }
 
+# R5 受控页可见性探针：只读取 visibilityState/hasFocus 两个状态，绝不读取
+# 表单值、凭据或其他 DOM 内容（隐私边界，设计 22）。
+_VISIBILITY_PROBE = "() => [document.visibilityState, document.hasFocus()]"
+
 
 def _map_playwright_key(name: str) -> str:
     """统一动作键名 → Playwright key；字母在组合键中必须小写（Control+a）。"""
@@ -92,15 +108,389 @@ def _map_playwright_key(name: str) -> str:
 
 
 class _Command:
-    """投递到 worker 的一条命令；fn 为 None 表示关闭哨兵。"""
+    """投递到 worker 的一条命令；fn 为 None 表示关闭哨兵。
 
-    __slots__ = ("fn", "done", "result", "error")
+    生命周期（状态迁移只发生在 ``lock`` 内，worker 领取与调用方撤销原子互斥）：
 
-    def __init__(self, fn: Callable | None) -> None:
+    - ``queued``：尚未取得执行权，可撤销，撤销后零副作用；
+    - ``running``：worker 原子领取后进入，此后不得假称“尚未执行”；
+    - ``succeeded`` / ``failed``：正常终态；``cancelled``：排队阶段已撤销。
+
+    ``deadline`` 为 monotonic 绝对截止时间，提交锁等待、入队与执行等待共用
+    同一预算；到期仍未被领取的命令由 worker 的 ``try_start`` 直接判 cancelled，
+    绝不执行。
+    """
+
+    __slots__ = ("command_id", "fn", "deadline", "lock", "done", "state", "result", "error")
+
+    def __init__(self, command_id: int, fn: Callable | None, deadline: float) -> None:
+        self.command_id = command_id
         self.fn = fn
+        self.deadline = deadline
+        self.lock = threading.Lock()
         self.done = threading.Event()
+        self.state = "queued"
         self.result = None
         self.error: BaseException | None = None
+
+    def try_start(self, now: float) -> bool:
+        """worker 原子领取：仅 queued 且未到期才可进入 running。"""
+        with self.lock:
+            if self.state != "queued":
+                return False
+            if now >= self.deadline:
+                self.state = "cancelled"
+                self.error = ComputerControlError(
+                    "computer_action_timeout", "浏览器命令已过截止时间，排队阶段即取消"
+                )
+                self.done.set()
+                return False
+            self.state = "running"
+            return True
+
+    def cancel_if_queued(self, code: str, message: str) -> bool:
+        """调用方/close 撤销排队命令；已被 worker 领取则返回 False（不得谎报）。"""
+        with self.lock:
+            if self.state != "queued":
+                return False
+            self.state = "cancelled"
+            self.error = ComputerControlError(code, message)
+            self.done.set()
+            return True
+
+    def finish(self) -> None:
+        """worker 写入终态并唤醒调用方。"""
+        with self.lock:
+            self.state = "failed" if self.error is not None else "succeeded"
+            self.done.set()
+
+
+class _PendingCommand:
+    """父进程侧一个在飞请求的等待点。"""
+
+    __slots__ = ("done", "response", "error")
+
+    def __init__(self) -> None:
+        self.done = threading.Event()
+        self.response: dict | None = None
+        self.error: BaseException | None = None
+
+
+class _WorkerProcessTransport:
+    """受管浏览器执行进程的父进程侧传输（R2 第二段）。
+
+    - 只发送结构化 JSON 请求（协议白名单），不传 Callable/eval/shell；
+    - Windows 上子进程加入专属 Job Object（KILL_ON_JOB_CLOSE）：父进程退出
+      时执行进程与它拉起的浏览器进程树一并终止；close 无法优雅收尾时按
+      ``TerminateJobObject`` 硬终止，等待真实退出后才返回；
+    - stdout 读线程按 id 派发响应；EOF/崩溃把所有在飞请求归一为
+      computer_browser_closed，绝不悬挂调用线程。
+    """
+
+    def __init__(
+        self,
+        worker_command: list[str],
+        *,
+        start_timeout: float,
+        guard_timeout: float,
+    ) -> None:
+        self._worker_command = list(worker_command)
+        self._start_timeout = float(start_timeout)
+        self._guard_timeout = float(guard_timeout)
+        self._proc: subprocess.Popen | None = None
+        self._job = None
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._pending: dict[int, _PendingCommand] = {}
+        self._ready = threading.Event()
+        self._boot_error: tuple[str, str] | None = None
+        self._dead = threading.Event()
+        self.browser_pid: int | None = None
+        self.screenshot_dir: str = ""
+
+    # ---------------- 启动 ----------------
+
+    def start(self) -> None:
+        if sys.platform == "win32":
+            self._job = _create_kill_on_close_job()
+        try:
+            self._proc = subprocess.Popen(
+                self._worker_command,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError as error:
+            self._close_job()
+            raise ComputerControlError(
+                "computer_backend_start_failed",
+                f"无法启动受管浏览器执行进程：{error}",
+            ) from error
+        if self._job is not None:
+            _assign_process_to_job(self._job, int(self._proc._handle))  # noqa: SLF001
+        reader = threading.Thread(
+            target=self._read_loop, name="computer-browser-worker-reader", daemon=True
+        )
+        reader.start()
+        if not self._ready.wait(timeout=self._start_timeout):
+            self.close(graceful_timeout=0.5)
+            raise ComputerControlError(
+                "computer_backend_start_failed",
+                "受管浏览器执行进程启动超时",
+            )
+        if self._boot_error is not None:
+            self.close(graceful_timeout=0.5)
+            code, message = self._boot_error
+            raise ComputerControlError(code, message)
+        if self._dead.is_set():
+            self.close(graceful_timeout=0.5)
+            raise ComputerControlError(
+                "computer_backend_start_failed",
+                "受管浏览器执行进程启动后立即退出",
+            )
+
+    # ---------------- 请求 ----------------
+
+    def request(self, op: str, payload: dict, timeout: float) -> dict | None:
+        """发送一个请求并等待响应；超时返回 None（由调用方决定封闭语义）。"""
+        if self._dead.is_set():
+            raise ComputerControlError(
+                "computer_browser_closed", "受管浏览器执行进程已退出"
+            )
+        with self._lock:
+            self._seq += 1
+            command_id = self._seq
+            pending = _PendingCommand()
+            self._pending[command_id] = pending
+        try:
+            line = _encode_worker_request(command_id, op, **payload)
+            assert self._proc is not None and self._proc.stdin is not None
+            self._proc.stdin.write((line + "\n").encode("utf-8"))
+            self._proc.stdin.flush()
+        except (OSError, ValueError) as error:
+            self._fail_pending_closed()
+            raise ComputerControlError(
+                "computer_browser_closed",
+                f"受管浏览器执行进程管道不可用：{type(error).__name__}",
+            ) from error
+        if not pending.done.wait(timeout):
+            with self._lock:
+                self._pending.pop(command_id, None)
+            return None
+        if pending.error is not None:
+            raise pending.error
+        return pending.response
+
+    def pending_count(self) -> int:
+        with self._lock:
+            return len(self._pending)
+
+    def is_alive(self) -> bool:
+        proc = self._proc
+        return (
+            not self._dead.is_set()
+            and proc is not None
+            and proc.poll() is None
+        )
+
+    # ---------------- 读线程与终止 ----------------
+
+    def _read_loop(self) -> None:
+        proc = self._proc
+        assert proc is not None and proc.stdout is not None
+        try:
+            for raw in proc.stdout:
+                try:
+                    message = _decode_worker_message(raw)
+                except (ValueError, json.JSONDecodeError):
+                    _LOGGER.warning("受管执行进程返回不合法消息（已忽略）")
+                    continue
+                if "event" in message:
+                    self._handle_event(message)
+                    continue
+                command_id = message.get("id")
+                with self._lock:
+                    pending = self._pending.pop(command_id, None)
+                if pending is not None:
+                    pending.response = message
+                    pending.done.set()
+        finally:
+            self._dead.set()
+            self._ready.set()  # 崩溃在 ready 之前也要唤醒 start
+            self._fail_pending_closed()
+
+    def _handle_event(self, message: dict) -> None:
+        event = message.get("event")
+        if event == "ready":
+            self.browser_pid = int(message.get("browser_pid") or 0) or None
+            self.screenshot_dir = str(message.get("screenshot_dir") or "")
+            self._ready.set()
+        elif event == "boot_failed":
+            self._boot_error = (
+                str(message.get("error_code") or "computer_backend_start_failed"),
+                str(message.get("error_message") or "受管执行进程启动失败"),
+            )
+            self._ready.set()
+
+    def _fail_pending_closed(self) -> None:
+        with self._lock:
+            pending_list = list(self._pending.values())
+            self._pending.clear()
+        for pending in pending_list:
+            pending.error = ComputerControlError(
+                "computer_browser_closed", "受管浏览器执行进程已退出"
+            )
+            pending.done.set()
+
+    def close(self, graceful_timeout: float = _PROCESS_CLOSE_GRACEFUL) -> dict:
+        """有界关闭：优雅 close → EOF → 硬终止 Job → 等待真实退出。
+
+        返回诊断信息（是否硬终止、终止到退出的耗时）；绝不因子进程卡死而
+        悬挂，也绝不在确认退出前释放调用方资源语义（调用方负责在其之后
+        释放 profile/租约）。
+        """
+        stats = {"terminated": False, "exit_after_kill_ms": None}
+        proc = self._proc
+        if proc is None:
+            self._close_job()
+            return stats
+        deadline = time.monotonic() + graceful_timeout
+        if proc.poll() is None:
+            try:
+                self.request("close", {}, timeout=max(0.05, graceful_timeout))
+            except ComputerControlError:
+                pass
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()  # EOF：让子进程退出命令循环并自行收尾
+            except OSError:
+                pass
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    proc.wait(timeout=remaining)
+                except subprocess.TimeoutExpired:
+                    pass
+        if proc.poll() is None and self._job is not None:
+            # 无法优雅收尾：终止本次专用执行进程与能确认归属的浏览器进程树。
+            stats["terminated"] = True
+            kill_started = time.perf_counter()
+            _terminate_job(self._job)
+            try:
+                proc.wait(timeout=_PROCESS_HARD_EXIT)
+            except subprocess.TimeoutExpired:
+                _LOGGER.error("受管执行进程在硬终止后仍未退出（%s）", proc.pid)
+            stats["exit_after_kill_ms"] = round(
+                (time.perf_counter() - kill_started) * 1000, 1
+            )
+        self._dead.set()
+        self._ready.set()
+        self._fail_pending_closed()
+        for stream in (proc.stdin, proc.stdout):
+            try:
+                if stream is not None:
+                    stream.close()
+            except OSError:
+                pass
+        self._close_job()
+        return stats
+
+    def _close_job(self) -> None:
+        job, self._job = self._job, None
+        if job is not None:
+            _close_job_handle(job)
+
+
+# ---------------- Windows Job Object（ctypes，不新增依赖） ----------------
+
+_JOB_HANDLE = None
+
+
+def _create_kill_on_close_job():
+    """创建 KILL_ON_JOB_CLOSE 的 Job Object；父进程退出时进程树随之终止。"""
+    if sys.platform != "win32":
+        return None
+    import ctypes
+    from ctypes import wintypes
+
+    kernel32 = ctypes.windll.kernel32
+
+    class _IO_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_ulonglong),
+            ("WriteOperationCount", ctypes.c_ulonglong),
+            ("OtherOperationCount", ctypes.c_ulonglong),
+            ("ReadTransferCount", ctypes.c_ulonglong),
+            ("WriteTransferCount", ctypes.c_ulonglong),
+            ("OtherTransferCount", ctypes.c_ulonglong),
+        ]
+
+    class _BASIC_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class _EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", _BASIC_LIMIT_INFORMATION),
+            ("IoInfo", _IO_COUNTERS),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    job = kernel32.CreateJobObjectW(None, None)
+    if not job:
+        return None
+    limits = _EXTENDED_LIMIT_INFORMATION()
+    limits.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+    if not kernel32.SetInformationJobObject(
+        job, 9, ctypes.byref(limits), ctypes.sizeof(limits)  # JobObjectExtendedLimitInformation
+    ):
+        _close_job_handle(job)
+        return None
+    return job
+
+
+def _assign_process_to_job(job, process_handle: int) -> bool:
+    import ctypes
+
+    return bool(ctypes.windll.kernel32.AssignProcessToJobObject(job, process_handle))
+
+
+def _terminate_job(job) -> None:
+    import ctypes
+
+    ctypes.windll.kernel32.TerminateJobObject(job, 1)
+
+
+def _close_job_handle(job) -> None:
+    import ctypes
+
+    ctypes.windll.kernel32.CloseHandle(job)
+
+
+def _encode_worker_request(command_id: int, op: str, **payload) -> str:
+    from core.computer.browser_worker_protocol import encode_request
+
+    return encode_request(command_id, op, **payload)
+
+
+def _decode_worker_message(raw) -> dict:
+    from core.computer.browser_worker_protocol import decode_response
+
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8")
+    return decode_response(raw)
 
 
 class BrowserComputerBackend:
@@ -117,6 +507,10 @@ class BrowserComputerBackend:
         command_timeout: float = _DEFAULT_COMMAND_TIMEOUT,
         start_timeout: float = _DEFAULT_START_TIMEOUT,
         on_page_change: Callable[[], None] | None = None,
+        window_hint_provider: Callable | None = None,
+        use_process_worker: bool = False,
+        worker_command: list[str] | None = None,
+        process_guard_slack: float = _PROCESS_GUARD_SLACK,
     ) -> None:
         # 构造函数只校验参数，绝不导入或启动 Playwright。
         if type(browser) is not str or browser not in _CHANNELS:
@@ -132,13 +526,29 @@ class BrowserComputerBackend:
         self._command_timeout = float(command_timeout)
         self._start_timeout = float(start_timeout)
         self._on_page_change = on_page_change
+        # R5：系统侧窗口标题提示（平台层提供）；None 时退化为 DOM 可见性裁决。
+        self._window_hint_provider = window_hint_provider
+        self._browser_pid: int | None = None
+        # R2 第二段：执行器隔离边界。进程模式把 Playwright 全部对象移入受管
+        # 子进程（父进程卡死命令可在有界时间内硬终止）；线程模式保留给
+        # 注入 fake 的测试与非冻结环境的降级路径。
+        self._use_process_worker = bool(use_process_worker)
+        self._worker_command_override = worker_command
+        self._process_guard_slack = float(process_guard_slack)
+        self._transport: _WorkerProcessTransport | None = None
         self._queue: queue.Queue = queue.Queue(maxsize=_COMMAND_QUEUE_SIZE)
         self._state_lock = threading.Lock()
         self._submit_lock = threading.Lock()
         self._ready = threading.Event()
+        # R8：worker 停止事件（close 时置位，显式 wait 可中断）与当前命令
+        # 截止时间（worker 内导航 timeout 共用 R2 的同一预算）。
+        self._worker_stop = threading.Event()
+        self._current_deadline: float | None = None
         self._worker: threading.Thread | None = None
         self._started = False
         self._closed = False
+        self._failed = False  # running 命令超时后实例永久封闭，禁止后续输入
+        self._command_seq = 0
         self._boot_error: ComputerControlError | None = None
         # 以下字段只由 worker 线程读写（_active_page 同时作为测试只读 seam）。
         self._runtime = None
@@ -146,7 +556,16 @@ class BrowserComputerBackend:
         self._context = None
         self._active_page = None
         self._context_closed = False
+        # R5 受控页身份：id(page) → 本地稳定序号；_observed_page_token 是最近
+        # 一次观察锁定的页面，surface_generation 在受控页切换时递增。
+        self._page_tokens: dict[int, int] = {}
+        self._page_serial = 0
+        self._observed_page_token: int | None = None
+        self._surface_generation = 0
         self._pressed_buttons: set[str] = set()
+        # 修饰键按下记录绑定按下时的 page（R3）：popup 切换 active page 后
+        # 仍回到原页面释放；条目为 (page, playwright_key)，按按下顺序排列。
+        self._pressed_keys: list = []
         self._profile_lock_key: str | None = None
         self._screenshot_dir: Path | None = None
         self._screenshot_counter = 0
@@ -163,9 +582,92 @@ class BrowserComputerBackend:
         """
         return self._active_page
 
+    def is_reusable(self) -> bool:
+        """retained 领取裁决（R4）：未封闭、worker 存活、无 pending 命令、窗口未被关闭。"""
+        with self._state_lock:
+            transport = self._transport
+            if transport is not None:
+                worker = transport  # 进程模式：worker 即受管执行进程
+                alive = transport.is_alive() and transport.pending_count() == 0
+            else:
+                worker = self._worker
+                alive = worker is not None and worker.is_alive()
+            if (
+                not self._started
+                or self._closed
+                or self._failed
+                or not alive
+            ):
+                return False
+        if transport is None and self._context_closed:
+            return False
+        if transport is None:
+            return self._queue.empty()
+        return True
+
     # ---------------- 外部 API（全部 marshal 到 worker） ----------------
 
     def start(self) -> None:
+        if self._use_process_worker:
+            self._start_process_worker()
+            return
+        self._start_thread_worker()
+
+    def _default_worker_command(self) -> list[str]:
+        if self._worker_command_override is not None:
+            return list(self._worker_command_override)
+        if getattr(sys, "frozen", False):
+            return [
+                sys.executable,
+                WORKER_ARGV_FLAG,
+                "--browser",
+                self._browser,
+                "--profile",
+                str(self._profile_dir),
+                "--command-timeout",
+                str(self._command_timeout),
+            ]
+        return [
+            sys.executable,
+            "-m",
+            "core.computer.browser_worker",
+            "--browser",
+            self._browser,
+            "--profile",
+            str(self._profile_dir),
+            "--command-timeout",
+            str(self._command_timeout),
+        ]
+
+    def _start_process_worker(self) -> None:
+        with self._state_lock:
+            if self._started:
+                return
+            if self._closed:
+                raise ComputerControlError(
+                    "computer_browser_closed",
+                    "浏览器 backend 已关闭，请创建新实例",
+                )
+        # 父进程侧进程内 profile 注册表先行占位（同父进程双实例快速失败）；
+        # 真实 Chromium profile 锁仍由子进程的 launch 兜底。
+        resolved = str(self._profile_dir.resolve())
+        self._acquire_profile_lock(resolved)
+        transport = _WorkerProcessTransport(
+            self._default_worker_command(),
+            start_timeout=self._start_timeout,
+            guard_timeout=self._command_timeout + self._process_guard_slack,
+        )
+        try:
+            transport.start()
+        except Exception:
+            self._release_profile_lock(resolved)
+            raise
+        with self._state_lock:
+            self._transport = transport
+            self._started = True
+            self._browser_pid = transport.browser_pid
+
+    def _start_thread_worker(self) -> None:
         with self._state_lock:
             if self._started:
                 return
@@ -189,7 +691,9 @@ class BrowserComputerBackend:
             # teardown；失败→boot 异常路径自带 teardown）——绝不遗留浏览器
             # 进程、profile 注册表锁与临时截图目录（Task 6 M1 复核，Task 16）。
             try:
-                self._queue.put(_Command(None), timeout=5)
+                self._queue.put(
+                    _Command(self._next_command_id(), None, float("inf")), timeout=5
+                )
             except queue.Full:
                 _LOGGER.warning("浏览器启动超时，关闭哨兵投递失败（worker 可能残留）")
             raise ComputerControlError(
@@ -205,39 +709,142 @@ class BrowserComputerBackend:
             self._started = True
 
     def observe(self, run_id: str) -> ComputerObservation:
+        if self._transport is not None:
+            response = self._remote_call("observe", {"run_id": run_id}, "observe")
+            return ComputerObservation(**response["observation"])
         return self._call("observe", lambda: self._cmd_observe(run_id))
 
     def execute(self, run_id: str, action: ComputerAction) -> None:
+        if self._transport is not None:
+            from dataclasses import asdict
+
+            from core.computer.browser_worker_protocol import normalize_action_payload
+
+            self._remote_call(
+                "execute",
+                {
+                    "run_id": run_id,
+                    "action": normalize_action_payload(asdict(action)),
+                },
+                f"execute:{action.kind}",
+            )
+            return
         self._call(f"execute:{action.kind}", lambda: self._cmd_execute(run_id, action))
+
+    def _remote_call(self, op: str, payload: dict, description: str) -> dict:
+        """进程模式请求：admission 检查 + 守卫超时 + 超时即封闭。"""
+        with self._state_lock:
+            admission = self._admission_error()
+            transport = self._transport
+        if admission is not None:
+            raise admission
+        if transport is None:
+            raise ComputerControlError(
+                "computer_browser_unavailable", "受管浏览器执行进程尚未启动"
+            )
+        response = transport.request(
+            op, payload, timeout=self._command_timeout + self._process_guard_slack
+        )
+        if response is None:
+            # 受管进程在守卫超时内无响应：结果未知，实例永久封闭；调用方
+            # 停止（close）将按有界流程硬终止执行进程与浏览器进程树。
+            with self._state_lock:
+                self._failed = True
+            raise ComputerControlError(
+                "computer_action_timeout",
+                f"受管浏览器执行进程命令超时且结果未知（{description}）；"
+                "该实例已封闭，拒绝后续输入，停止后可收回执行权",
+            )
+        if response.get("ok") is False:
+            raise ComputerControlError(
+                str(response.get("error_code") or "computer_backend_error"),
+                str(response.get("error_message") or "受管执行进程返回错误"),
+            )
+        return response
 
     def release_inputs(self) -> None:
         """尽力释放 worker 内跟踪的按下状态；backend 不可用时静默 no-op。"""
+        if self._transport is not None:
+            with self._state_lock:
+                transport = self._transport
+            if transport is None or not transport.is_alive():
+                return
+            try:
+                # 停止路径上的尽力清理：有界短预算，卡死的进程由 close 硬终止。
+                transport.request(
+                    "release", {}, timeout=min(self._command_timeout, 2.0)
+                )
+            except ComputerControlError:
+                _LOGGER.warning("释放浏览器输入状态失败", exc_info=True)
+            return
         with self._state_lock:
             worker = self._worker
             available = (
                 self._started
                 and not self._closed
+                and not self._failed
                 and worker is not None
                 and worker.is_alive()
             )
         if not available:
             return
         try:
-            self._call("release_inputs", self._cmd_release_inputs)
+            # 释放是停止路径上的尽力清理：使用有界短预算，绝不在卡死的
+            # worker 后面排队一整个命令超时周期。
+            self._call(
+                "release_inputs",
+                self._cmd_release_inputs,
+                timeout=min(self._command_timeout, 5.0),
+            )
         except ComputerControlError:
             _LOGGER.warning("释放浏览器输入状态失败", exc_info=True)
 
     def close(self) -> None:
+        if self._transport is not None:
+            with self._state_lock:
+                if self._closed or not self._started:
+                    return
+                # 先关闭 admission（100ms 量级内新命令一律拒绝）。
+                self._closed = True
+                transport = self._transport
+                self._transport = None
+            screenshot_dir = transport.screenshot_dir
+            stats = transport.close(graceful_timeout=_PROCESS_CLOSE_GRACEFUL)
+            if stats.get("terminated"):
+                _LOGGER.info(
+                    "受管浏览器执行进程经硬终止收尾（终止到退出 %sms）",
+                    stats.get("exit_after_kill_ms"),
+                )
+            if screenshot_dir:
+                shutil.rmtree(screenshot_dir, ignore_errors=True)
+            self._release_profile_lock(str(self._profile_dir.resolve()))
+            return
         with self._state_lock:
             if self._closed or not self._started:
                 # 幂等；未启动时 no-op，不消耗生命周期。
                 return
+            # 先关闭 admission：此后 _call 一律拒绝新命令。
             self._closed = True
             worker = self._worker
-        try:
-            self._queue.put(_Command(None), timeout=5)
-        except queue.Full:
-            _LOGGER.warning("浏览器 worker 命令队列已满，关闭哨兵投递失败")
+        # R8：先中断 worker 内可中断等待（显式 wait 立即以取消收尾）。
+        self._worker_stop.set()
+        # 再撤销全部排队命令（零副作用终态通知，调用线程不悬挂），最后才
+        # 投递关闭哨兵——哨兵绝不能排在待执行输入之后任其照常执行。
+        with self._submit_lock:
+            with self._queue.mutex:
+                pending = list(self._queue.queue)
+                self._queue.queue.clear()
+            for command in pending:
+                command.cancel_if_queued(
+                    "computer_browser_closed", "浏览器 backend 已关闭，排队命令已撤销"
+                )
+                self._queue.task_done()
+            try:
+                self._queue.put_nowait(
+                    _Command(self._next_command_id(), None, float("inf"))
+                )
+            except queue.Full:
+                _LOGGER.warning("浏览器 worker 命令队列已满，关闭哨兵投递失败")
         if worker.is_alive():
             worker.join(timeout=10)
             if worker.is_alive():
@@ -315,6 +922,42 @@ class BrowserComputerBackend:
         # 初始 page 落定后再挂事件，避免启动过程误报页面变化。
         context.on("page", self._on_new_page)
         context.on("close", self._on_context_close)
+        # R5：解析受控浏览器主进程 PID（系统窗口标题提示的前提）；失败仅降级
+        # 为 DOM 可见性裁决，绝不影响启动。
+        try:
+            self._browser_pid = self._resolve_browser_pid()
+        except Exception:
+            _LOGGER.warning("解析受控浏览器进程 PID 失败，退化为 DOM 可见性裁决", exc_info=True)
+            self._browser_pid = None
+
+    def _resolve_browser_pid(self) -> int | None:
+        """按 profile 目录从进程命令行识别受控浏览器主进程（不读取用户浏览器）。"""
+        import psutil
+
+        exe_name = {"edge": "msedge.exe", "chrome": "chrome.exe"}[self._browser]
+        profile_key = str(self._profile_dir.resolve()).lower().replace("/", "\\")
+        matches = []
+        for proc in psutil.process_iter(["pid", "name", "cmdline"]):
+            try:
+                name = str(proc.info.get("name") or "").lower()
+                if name != exe_name:
+                    continue
+                cmdline = [str(arg) for arg in (proc.info.get("cmdline") or [])]
+                if any(arg.startswith("--type=") for arg in cmdline):
+                    continue  # renderer/gpu 等子进程
+                if any(
+                    arg.startswith("--user-data-dir=")
+                    and profile_key in arg.lower().replace("/", "\\")
+                    for arg in cmdline
+                ):
+                    matches.append(int(proc.info["pid"]))
+            except Exception:
+                continue
+        if len(matches) == 1:
+            return matches[0]
+        if matches:
+            _LOGGER.warning("受控浏览器主进程不唯一（%s），窗口提示不可用", matches)
+        return None
 
     def _map_launch_error(self, error: Exception) -> ComputerControlError:
         message = str(error).lower()
@@ -332,14 +975,24 @@ class BrowserComputerBackend:
     def _command_loop(self) -> None:
         while True:
             command = self._queue.get()
-            if command.fn is None:
-                return
             try:
-                command.result = command.fn()
-            except BaseException as error:
-                command.error = error
+                if command.fn is None:
+                    return
+                # 领取即原子检查：已撤销或过截止时间的排队命令零执行。
+                if not command.try_start(time.monotonic()):
+                    continue
+                # R8：worker 内导航/等待共用该命令剩余预算，不另起独立超时。
+                self._current_deadline = command.deadline
+                try:
+                    command.result = command.fn()
+                except BaseException as error:
+                    command.error = error
+                finally:
+                    self._current_deadline = None
+                    command.finish()
             finally:
-                command.done.set()
+                # 与 close 的队列抽空配对记账，让测试可用 queue.join 做确定屏障。
+                self._queue.task_done()
 
     def _teardown(self) -> None:
         context = self._context
@@ -364,13 +1017,20 @@ class BrowserComputerBackend:
             shutil.rmtree(self._screenshot_dir, ignore_errors=True)
             self._screenshot_dir = None
         self._pressed_buttons = set()
+        self._pressed_keys = []
+        self._page_tokens = {}
+        self._observed_page_token = None
         self._active_page = None
 
     # ---------------- worker 内：页面事件 ----------------
 
     def _on_new_page(self, page) -> None:
-        """context page 事件：最后获得焦点的可见 page 成为 active，并发出页面变化事件。"""
-        self._active_page = page
+        """context page 事件（R5）：新 page 只登记本地身份，不无条件设为 active。
+
+        是否成为受控页由下一次解析按可观测可见性/焦点决定；每次切换都会
+        令旧坐标失效（surface_generation 递增 + 输入前身份复核）。
+        """
+        self._page_token(page)
         callback = self._on_page_change
         if callback is not None:
             try:
@@ -381,29 +1041,176 @@ class BrowserComputerBackend:
     def _on_context_close(self, *args) -> None:
         self._context_closed = True
 
-    # ---------------- worker 内：命令实现 ----------------
+    # ---------------- worker 内：受控页解析（R5） ----------------
 
-    def _ensure_usable(self):
+    def _page_token(self, page) -> int:
+        """为 page 分配本地稳定身份（独立于 title/url；同标题同域也不同）。"""
+        token = self._page_tokens.get(id(page))
+        if token is None:
+            self._page_serial += 1
+            token = self._page_serial
+            self._page_tokens[id(page)] = token
+        return token
+
+    def _probe_page_visibility(self, page) -> tuple[bool, bool]:
+        """读取 (visible, focused)；探针失败的页按不可见/无焦点保守处理。"""
+        try:
+            result = page.evaluate(_VISIBILITY_PROBE)
+        except Exception:
+            return False, False
+        if not isinstance(result, (list, tuple)) or len(result) != 2:
+            return False, False
+        return result[0] == "visible", bool(result[1])
+
+    def _resolve_active_page(self):
+        """跟随用户当前可辨认的可见受控页；无法唯一确定时明确报错。
+
+        裁决顺序：单页直选 → DOM 可见性快路径（恰好一个 visible+focused 且
+        有页明确 hidden，信号可区分时可信）→ 系统侧窗口标题提示（R5：实测
+        Playwright 默认启动参数下 visibilityState/hasFocus 对标签切换不生效，
+        必须交叉验证）。全部 hidden/窗口不可见（最小化）回落既有约定：当前
+        active 仍打开则保持，否则最后打开的页。
+        """
         if self._context_closed or self._context is None:
             raise ComputerControlError(
                 "computer_browser_closed",
                 "浏览器窗口已被用户关闭，不会自动重开",
             )
-        page = self._active_page
-        if page is not None and not page.is_closed():
-            return page
-        # active page 被关闭但仍有其他可见 page：切换到最后一个，绝不自动重开新 page。
-        for candidate in reversed(list(self._context.pages)):
-            if not candidate.is_closed():
-                self._active_page = candidate
-                return candidate
-        raise ComputerControlError(
-            "computer_browser_closed",
-            "浏览器页面已全部关闭，不会自动重开",
-        )
+        open_pages = []
+        alive_ids = set()
+        for candidate in list(self._context.pages):
+            try:
+                if not candidate.is_closed():
+                    open_pages.append(candidate)
+                    alive_ids.add(id(candidate))
+            except Exception:
+                continue
+        # 清理已消失 page 的身份映射，避免 id 复用串号。
+        for stale in [key for key in self._page_tokens if key not in alive_ids]:
+            del self._page_tokens[stale]
+        if not open_pages:
+            raise ComputerControlError(
+                "computer_browser_closed",
+                "浏览器页面已全部关闭，不会自动重开",
+            )
+        if len(open_pages) == 1:
+            self._active_page = open_pages[0]
+            return open_pages[0]
+        probed = [(page, *self._probe_page_visibility(page)) for page in open_pages]
+        any_hidden = any(not visible for _page, visible, _f in probed)
+        focused = [page for page, visible, is_focused in probed if visible and is_focused]
+        if len(focused) == 1:
+            # 恰好一个可见焦点页（其余明确 unfocused/hidden）：信号可区分，可信。
+            self._active_page = focused[0]
+            return focused[0]
+        if not focused and any_hidden:
+            visible = [page for page, is_visible, _f in probed if is_visible]
+            if len(visible) == 1:
+                self._active_page = visible[0]
+                return visible[0]
+        # DOM 信号不可区分（实测 Playwright 默认启动参数下标签切换后全部页
+        # 仍报 visible+focused）或存在矛盾：用系统侧窗口标题提示交叉裁决。
+        chosen = self._resolve_via_window_hints(open_pages)
+        self._active_page = chosen
+        return chosen
+
+    def _resolve_via_window_hints(self, open_pages):
+        """系统侧裁决：受控浏览器进程可见窗口标题前缀匹配页面标题。
+
+        前台窗口属于受控浏览器 → 其标题对应的页面即前台页；前台属于其他
+        应用且本浏览器仅一个可见窗口 → 该窗口页面。标题缺失/多页同标题/
+        多窗口均可见 → computer_surface_ambiguous，绝不任意选页继续。
+        """
+        provider = self._window_hint_provider
+        pid = self._browser_pid
+        if provider is None or not pid:
+            raise ComputerControlError(
+                "computer_surface_ambiguous",
+                "多个受控页面无法由页面可见性唯一确定前台页"
+                "（系统侧窗口提示不可用），请重新观察",
+            )
+
+        def fetch_hints():
+            try:
+                return provider(pid)
+            except ComputerControlError:
+                raise
+            except Exception as error:
+                raise ComputerControlError(
+                    "computer_surface_ambiguous",
+                    f"读取受控浏览器窗口提示失败：{type(error).__name__}",
+                ) from error
+
+        deadline = time.monotonic() + _WINDOW_HINT_SETTLE_SECONDS
+        while True:
+            hints = fetch_hints()
+            if not hints:
+                # 浏览器窗口不可见（最小化等）：回落既有约定。
+                current = self._active_page
+                if current is not None and any(current is page for page in open_pages):
+                    return current
+                return open_pages[-1]
+            titles = {}
+            for page in open_pages:
+                try:
+                    title = page.title()
+                except Exception:
+                    title = ""
+                titles[id(page)] = title if isinstance(title, str) else ""
+            matched_by_hwnd = {}
+            for hwnd, window_title, _is_foreground in hints:
+                matched = [
+                    page
+                    for page in open_pages
+                    if titles[id(page)] and window_title.startswith(titles[id(page)])
+                ]
+                if not matched:
+                    untitled = [page for page in open_pages if not titles[id(page)]]
+                    if len(untitled) == 1:
+                        matched = untitled
+                matched_by_hwnd[hwnd] = matched
+            foreground = [entry[0] for entry in hints if entry[2]]
+            if foreground:
+                matched = matched_by_hwnd[foreground[0]]
+                if len(matched) == 1:
+                    return matched[0]
+                if matched:
+                    # 同标题多页：等待无法解决，立即 fail-closed。
+                    raise ComputerControlError(
+                        "computer_surface_ambiguous",
+                        "前台浏览器窗口无法唯一匹配受控页面（同标题多页或标题缺失），请重新观察",
+                    )
+                # matched 为空：窗口标题落后于页面标题的短暂过渡态 → 有界收敛。
+            elif len(hints) == 1:
+                matched = matched_by_hwnd[hints[0][0]]
+                if len(matched) == 1:
+                    return matched[0]
+            if time.monotonic() >= deadline:
+                raise ComputerControlError(
+                    "computer_surface_ambiguous",
+                    "多个浏览器窗口均可见且无法确定前台页，无法唯一确定操作目标",
+                )
+            time.sleep(0.05)
+
+    def _require_observed_surface(self, page) -> None:
+        """输入前复核：当前受控页必须与最近一次观察锁定的是同一页。
+
+        观察后用户切页/新前台页 → 旧坐标全部失效，零输入并显式报错；
+        controller 据此要求重新 observe。
+        """
+        if self._observed_page_token is None:
+            return
+        if self._page_token(page) != self._observed_page_token:
+            raise ComputerControlError(
+                "computer_surface_changed",
+                "受控页面已切换，旧坐标已失效，必须重新观察（observe）后再操作",
+            )
+
+    # ---------------- worker 内：命令实现 ----------------
 
     def _cmd_observe(self, run_id: str) -> ComputerObservation:
-        page = self._ensure_usable()
+        page = self._resolve_active_page()
+        page_token = self._page_token(page)
         try:
             png = page.screenshot(type="png")
         except ComputerControlError:
@@ -416,6 +1223,12 @@ class BrowserComputerBackend:
         if not isinstance(png, (bytes, bytearray)) or not bytes(png):
             raise ComputerControlError("computer_action_failed", "浏览器截图未返回 PNG bytes")
         png_bytes = bytes(png)
+        # 截图后再验证仍是同一受控页：期间切换则本次观察作废（R5）。
+        if self._page_token(self._resolve_active_page()) != page_token:
+            raise ComputerControlError(
+                "computer_surface_changed",
+                "观察期间受控页面已切换，本次观察作废，请重新观察",
+            )
         try:
             title = page.title()
         except Exception as error:
@@ -429,6 +1242,9 @@ class BrowserComputerBackend:
         parts = urlsplit(url)
         origin = f"{parts.scheme}://{parts.netloc}"
         path = self._store_screenshot(png_bytes)
+        if self._observed_page_token != page_token:
+            self._surface_generation += 1
+            self._observed_page_token = page_token
         return ComputerObservation(
             run_id=run_id,
             target="browser",
@@ -446,6 +1262,8 @@ class BrowserComputerBackend:
             scale_y=1.0,
             page_origin=origin,
             page_title=title[:_MAX_TITLE_CHARS],
+            surface_id=f"page-{page_token}",
+            surface_generation=self._surface_generation,
         )
 
     def _cmd_execute(self, run_id: str, action: ComputerAction) -> None:
@@ -469,9 +1287,10 @@ class BrowserComputerBackend:
                     "computer_invalid_action",
                     f"duration_ms 必须在 {MIN_WAIT_MS}-{MAX_WAIT_MS} 毫秒之间",
                 )
-            time.sleep(duration / 1000)
+            self._wait_interruptible(duration)
             return
-        page = self._ensure_usable()
+        page = self._resolve_active_page()
+        self._require_observed_surface(page)
         try:
             self._dispatch_action(page, action)
         except ComputerControlError:
@@ -485,8 +1304,17 @@ class BrowserComputerBackend:
     def _cmd_release_inputs(self) -> None:
         buttons = list(self._pressed_buttons)
         self._pressed_buttons = set()
+        keys = list(self._pressed_keys)
+        self._pressed_keys = []
         if self._context_closed or self._context is None:
             return
+        # 修饰键回到按下时的原 page 释放（popup 切换 active page 后也不串页）。
+        for recorded_page, mapped in reversed(keys):
+            try:
+                if not recorded_page.is_closed():
+                    recorded_page.keyboard.up(mapped)
+            except Exception:
+                _LOGGER.exception("释放浏览器修饰键失败")
         page = self._active_page
         if page is None or page.is_closed():
             return
@@ -496,14 +1324,87 @@ class BrowserComputerBackend:
             except Exception:
                 _LOGGER.exception("释放鼠标按键失败")
 
+    # ---------------- worker 内：可中断等待与导航预算（R8） ----------------
+
+    def _remaining_budget_ms(self) -> int:
+        """当前命令的剩余预算（毫秒）；与 R2 的 deadline 共用，不另起独立超时。"""
+        deadline = self._current_deadline
+        if deadline is None or deadline == float("inf"):
+            return int(self._command_timeout * 1000)
+        return max(1, int((deadline - time.monotonic()) * 1000))
+
+    def _wait_interruptible(self, duration_ms: int) -> None:
+        """显式 wait：服务取消/页面事件，stop 时立即中断（不用整段 sleep 伪装就绪）。"""
+        end = time.monotonic() + duration_ms / 1000
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return
+            if self._worker_stop.wait(min(remaining, 0.05)):
+                raise ComputerControlError(
+                    "computer_cancelled", "显式等待被停止中断"
+                )
+
+    # ---------------- worker 内：修饰键生命周期（R3） ----------------
+    def _press_keys(self, page, keys) -> list:
+        """按输入顺序按下修饰键；只有 down 成功的键进入按下记录。
+
+        第 N 个 down 失败：逆序释放已按下的键后原样传播，绝不留半截组合。
+        """
+        pressed = []
+        for name in keys:
+            mapped = _map_playwright_key(name)
+            try:
+                page.keyboard.down(mapped)
+            except Exception:
+                self._release_keys(pressed)
+                raise
+            entry = (page, mapped)
+            pressed.append(entry)
+            self._pressed_keys.append(entry)
+        return pressed
+
+    def _release_keys(self, pressed) -> None:
+        """逆序释放；up 失败保留记录供 release_inputs 重试，错误向上传播。"""
+        first_error = None
+        for entry in reversed(pressed):
+            recorded_page, mapped = entry
+            try:
+                recorded_page.keyboard.up(mapped)
+            except Exception as error:
+                _LOGGER.exception("释放浏览器修饰键失败")
+                first_error = first_error or error
+            else:
+                try:
+                    self._pressed_keys.remove(entry)
+                except ValueError:
+                    pass
+        if first_error is not None:
+            raise first_error
+
+    def _with_pressed_keys(self, page, action: ComputerAction, invoke) -> None:
+        """click/double_click/drag 的修饰键生命周期：down → 动作 → 逆序 up。"""
+        if not action.keys:
+            invoke()
+            return
+        pressed = self._press_keys(page, action.keys)
+        try:
+            invoke()
+        finally:
+            self._release_keys(pressed)
+
     def _dispatch_action(self, page, action: ComputerAction) -> None:
         kind = action.kind
         if kind == "click":
             x, y = self._checked_point(action)
-            page.mouse.click(x, y, button=action.button)
+            self._with_pressed_keys(
+                page, action, lambda: page.mouse.click(x, y, button=action.button)
+            )
         elif kind == "double_click":
             x, y = self._checked_point(action)
-            page.mouse.dblclick(x, y, button=action.button)
+            self._with_pressed_keys(
+                page, action, lambda: page.mouse.dblclick(x, y, button=action.button)
+            )
         elif kind == "move":
             x, y = self._checked_point(action)
             page.mouse.move(x, y)
@@ -511,9 +1412,29 @@ class BrowserComputerBackend:
             if action.x is not None or action.y is not None:
                 x, y = self._checked_point(action)
                 page.mouse.move(x, y)
+            # R7：浏览器滚动只接受 css_pixel（正值向下/向右）；像素语义与
+            # Playwright mouse.wheel 一致，单位/范围在 parse 层已严格校验，
+            # 此处防御性复核直接构造的 ComputerAction。
+            unit = action.unit or "css_pixel"
+            if unit != "css_pixel":
+                raise ComputerControlError(
+                    "computer_invalid_action",
+                    f"浏览器滚动仅支持 css_pixel 单位，收到 {unit!r}",
+                )
+            if (
+                type(action.delta_x) is not int
+                or type(action.delta_y) is not int
+                or abs(action.delta_x) > 4000
+                or abs(action.delta_y) > 4000
+                or (not action.delta_x and not action.delta_y)
+            ):
+                raise ComputerControlError(
+                    "computer_invalid_action",
+                    "浏览器滚动每轴范围 ±4000 CSS 像素且两轴不得同时为零",
+                )
             page.mouse.wheel(action.delta_x, action.delta_y)
         elif kind == "drag":
-            self._exec_drag(page, action)
+            self._with_pressed_keys(page, action, lambda: self._exec_drag(page, action))
         elif kind == "type_text":
             if not isinstance(action.text, str) or not action.text:
                 raise ComputerControlError("computer_invalid_action", "type_text 需要非空 text")
@@ -524,13 +1445,25 @@ class BrowserComputerBackend:
             page.keyboard.press("+".join(_map_playwright_key(key) for key in action.keys))
         elif kind == "navigate":
             # 复用 parse 层校验：只接受带主机名的 http/https URL。
-            page.goto(_parse_url(action.url))
+            # R8：导航以 DOMContentLoaded 为文档基线，超时取命令剩余预算；
+            # 慢子资源不再拖住整步；SPA 业务目标是否就绪由后续观察判定。
+            page.goto(
+                _parse_url(action.url),
+                wait_until="domcontentloaded",
+                timeout=self._remaining_budget_ms(),
+            )
         elif kind == "back":
-            page.go_back()
+            page.go_back(
+                wait_until="domcontentloaded", timeout=self._remaining_budget_ms()
+            )
         elif kind == "forward":
-            page.go_forward()
+            page.go_forward(
+                wait_until="domcontentloaded", timeout=self._remaining_budget_ms()
+            )
         elif kind == "reload":
-            page.reload()
+            page.reload(
+                wait_until="domcontentloaded", timeout=self._remaining_budget_ms()
+            )
         else:
             raise ComputerControlError(
                 "computer_invalid_action",
@@ -592,40 +1525,117 @@ class BrowserComputerBackend:
 
     # ---------------- 命令 marshal 与进程内 profile 锁 ----------------
 
-    def _call(self, description: str, fn: Callable):
+    def _next_command_id(self) -> int:
         with self._state_lock:
-            worker = self._worker
-            started = self._started
-            closed = self._closed
-        if closed:
-            raise ComputerControlError("computer_browser_closed", "浏览器 backend 已关闭")
-        if not started or worker is None:
-            raise ComputerControlError(
+            self._command_seq += 1
+            return self._command_seq
+
+    def _admission_error(self) -> ComputerControlError | None:
+        """admission 检查（调用方须持有 _state_lock）；不可投递时返回错误。"""
+        if self._closed:
+            return ComputerControlError("computer_browser_closed", "浏览器 backend 已关闭")
+        if self._failed:
+            return ComputerControlError(
+                "computer_backend_error",
+                "浏览器 backend 已封闭：先前命令执行超时且结果未知，拒绝后续输入",
+            )
+        if not self._started:
+            return ComputerControlError(
                 "computer_browser_unavailable",
                 "浏览器 backend 尚未启动",
             )
-        if not worker.is_alive():
+        if self._transport is None:
+            # 线程模式：worker 线程存活即 admission；进程模式由 transport 判断。
+            if self._worker is None or not self._worker.is_alive():
+                return ComputerControlError(
+                    "computer_browser_closed",
+                    "浏览器 worker 已退出，浏览器不可用",
+                )
+        return None
+
+    def _call(self, description: str, fn: Callable, timeout: float | None = None):
+        budget = self._command_timeout if timeout is None else float(timeout)
+        deadline = time.monotonic() + budget
+        with self._state_lock:
+            admission = self._admission_error()
+        if admission is not None:
+            raise admission
+        command = _Command(self._next_command_id(), fn, deadline)
+        # 提交锁等待、入队共用同一 deadline 预算；锁只在「复核 admission + 入队
+        # + 入队后复核 close」的短临界区持有，绝不在执行等待期间持有——否则
+        # close() 会被一个等待中的调用者挡住整个命令超时周期。
+        remaining = deadline - time.monotonic()
+        if not self._submit_lock.acquire(timeout=max(0.0, remaining)):
             raise ComputerControlError(
-                "computer_browser_closed",
-                "浏览器 worker 已退出，浏览器不可用",
+                "computer_action_timeout",
+                f"浏览器命令提交等待超时：{description}",
             )
-        command = _Command(fn)
-        with self._submit_lock:
+        try:
+            with self._state_lock:
+                admission = self._admission_error()
+            if admission is not None:
+                raise admission
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ComputerControlError(
+                    "computer_action_timeout",
+                    f"浏览器命令排队超时：{description}",
+                )
             try:
-                self._queue.put(command, timeout=self._command_timeout)
+                self._queue.put(command, timeout=remaining)
             except queue.Full as error:
                 raise ComputerControlError(
                     "computer_action_timeout",
                     f"浏览器命令排队超时：{description}",
                 ) from error
-            if not command.done.wait(timeout=self._command_timeout):
-                raise ComputerControlError(
+            with self._state_lock:
+                closed_after_put = self._closed
+            if closed_after_put:
+                # close 已抽空队列：本条若在抽空后入队，worker 不会再来取；
+                # 立即按已关闭撤销，不让调用方悬挂到超时。
+                if command.cancel_if_queued(
+                    "computer_browser_closed", "浏览器 backend 已关闭，排队命令已撤销"
+                ):
+                    raise command.error
+        finally:
+            self._submit_lock.release()
+        remaining = deadline - time.monotonic()
+        if not command.done.wait(timeout=max(0.0, remaining)):
+            self._command_timed_out(command, description)
+        with command.lock:
+            state = command.state
+            result = command.result
+            error = command.error
+        if state == "cancelled":
+            raise error
+        if error is not None:
+            raise error
+        return result
+
+    def _command_timed_out(self, command: _Command, description: str) -> None:
+        """done.wait 超时后的终态裁决：排队未执行可撤销；执行中结果未知即封闭。"""
+        with command.lock:
+            if command.state == "queued":
+                command.state = "cancelled"
+                command.error = ComputerControlError(
                     "computer_action_timeout",
-                    f"浏览器命令执行超时：{description}",
+                    f"浏览器命令排队超时：{description}",
                 )
-        if command.error is not None:
-            raise command.error
-        return command.result
+                command.done.set()
+                raise command.error
+            if command.state in ("succeeded", "failed"):
+                # 恰在超时边界完成：回落到正常终态分支返回结果或错误。
+                return
+        # state == "running"：已开始的执行无法假称未发生，也无法在本线程
+        # 打断同步 Playwright 调用；实例永久封闭，禁止后续输入，profile
+        # 执行权在 worker 真实退出前绝不释放给新实例。
+        with self._state_lock:
+            self._failed = True
+        raise ComputerControlError(
+            "computer_action_timeout",
+            f"浏览器命令执行超时且结果未知（{description}）；"
+            "该实例已封闭，拒绝后续输入，请停止后重新开始",
+        )
 
     def _acquire_profile_lock(self, resolved: str) -> None:
         with _PROFILE_REGISTRY_GUARD:

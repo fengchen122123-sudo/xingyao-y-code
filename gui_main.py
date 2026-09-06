@@ -12,6 +12,21 @@ import threading
 import time
 from pathlib import Path
 from typing import Optional
+
+
+def _dispatch_browser_worker_argv() -> bool:
+    """PyInstaller 子进程入口；命中后不导入或启动 GUI。"""
+    from core.computer.browser_backend import WORKER_ARGV_FLAG
+
+    if WORKER_ARGV_FLAG not in sys.argv:
+        return False
+    sys.argv.remove(WORKER_ARGV_FLAG)
+    from core.computer.browser_worker import main as worker_main
+
+    raise SystemExit(worker_main())
+
+
+_dispatch_browser_worker_argv()
 import webview
 from gui_bridge import ApiBridge
 from core.gui_lifecycle import ApplicationLifecycle

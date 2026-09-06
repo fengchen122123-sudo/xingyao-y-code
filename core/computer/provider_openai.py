@@ -247,6 +247,14 @@ def _map_official_action(action, target: str) -> ComputerAction:
         if keys is not None:
             payload["keys"] = keys
     elif action_type == "scroll":
+        if target == "desktop":
+            # R7：官方原生滚动为像素语义（参考集成直接喂 mouse.wheel）；
+            # 桌面实现只能发滚轮步进，缺少可验证的像素滚动实现前明确
+            # 拒绝该 target 的原生滚动——整批零执行，绝不静默近似换算。
+            raise _protocol_error(
+                "官方原生滚动为像素语义，桌面 target 暂不支持像素滚动"
+                "（桌面仅支持显式 wheel_step 单位）；本批动作零执行"
+            )
         payload = {
             "kind": "scroll",
             "target": target,
@@ -254,6 +262,7 @@ def _map_official_action(action, target: str) -> ComputerAction:
             "y": action.get("y"),
             "delta_x": action.get("scroll_x"),
             "delta_y": action.get("scroll_y"),
+            "unit": "css_pixel",
         }
         keys = _map_keys(action.get("keys"))
         if keys is not None:
