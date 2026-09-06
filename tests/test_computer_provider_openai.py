@@ -579,7 +579,7 @@ def test_parse_valid_computer_call_maps_actions_to_unified():
      ComputerAction(kind="double_click", target="browser", x=1, y=2)),
     ({"type": "move", "x": 3, "y": 4}, ComputerAction(kind="move", target="browser", x=3, y=4)),
     ({"type": "scroll", "x": 1, "y": 2, "scroll_x": 0, "scroll_y": -3},
-     ComputerAction(kind="scroll", target="browser", x=1, y=2, delta_y=-3)),
+     ComputerAction(kind="scroll", target="browser", x=1, y=2, delta_y=-3, unit="css_pixel")),
     ({"type": "type", "text": "hi"}, ComputerAction(kind="type_text", target="browser", text="hi")),
     ({"type": "keypress", "keys": ["CTRL", "A"]},
      ComputerAction(kind="keypress", target="browser", keys=("CTRL", "A"))),
@@ -1329,3 +1329,16 @@ def test_bound_native_controller_binds_run_and_owner(tmp_path):
     bound.enter_provider_safety_required()
     assert controller.safety_entries == 1
     assert controller.run_status == "provider_safety_required"
+
+
+def test_native_scroll_on_desktop_target_is_explicitly_rejected():
+    """R7：原生像素滚动在桌面 target 明确拒绝（协议错误），绝不静默近似为滚轮步进。"""
+    with pytest.raises(ComputerControlError) as raised:
+        parse_openai_computer_events(
+            _computer_call_events(
+                [{"type": "scroll", "x": 1, "y": 2, "scroll_x": 0, "scroll_y": 300}]
+            ),
+            target="desktop",
+        )
+    assert raised.value.code == "computer_provider_protocol_error"
+    assert "像素" in raised.value.message

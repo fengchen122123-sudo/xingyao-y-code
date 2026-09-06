@@ -11,6 +11,7 @@ observe/wait 不计 no-progress、停止事件只发一次、Turn 终态 finally
 import json
 import threading
 import time
+from dataclasses import replace
 
 import pytest
 
@@ -76,7 +77,7 @@ def service(settings_state):
     abort_calls = []
     loader_calls = []
 
-    def factory(target):
+    def factory(target, identity):
         backend = FakeComputerBackend(target=target)
         created.setdefault(target, []).append(backend)
         return backend
@@ -179,7 +180,9 @@ def test_complete_run_releases_lease_but_retains_browser_session(service, runnin
     first = service.complete_run(running_run.run_id, owner_a, retain_browser_session=True)
     second = service.complete_run(running_run.run_id, owner_a, retain_browser_session=True)
     assert first.status == second.status == "completed"
-    assert service.backend.release_count == 0
+    # R3：retain 前必须释放按下状态（修饰键/鼠标键不带入下一 run）；
+    # backend 本身不 close，作为 retained session 供下一 run 显式复用。
+    assert service.backend.release_count == 1
     assert service.backend.close_count == 0  # stop 才关闭 backend
     new_run = service.start_run(owner_b, capability, target="browser")  # 租约已释放，可开新 run
     assert new_run.run_id != running_run.run_id
@@ -369,10 +372,14 @@ def test_observe_failure_propagates_without_stale_screenshot(service, running_ru
 
 
 def test_three_identical_screens_stop_with_no_progress(service, running_run, owner_a):
+    """连续 3 次无进展停止（R6 语义：变化后计数归零，再连续 3 次不变才停止）。"""
     backend = service.backend
-    backend._screen_hashes = ["h1", "h1", "h1"]
-    service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
-    service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    backend._screen_hashes = ["h1", "h1", "h1", "h1"]
+    # 第 1 击相对观察基线有变化（计数 0），第 2/3 击不变（计数 1/2），仍继续。
+    for _ in range(3):
+        service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    assert service.snapshot().status == "running"
+    # 第 4 击仍不变：计数达到 3，停止。
     with pytest.raises(ComputerControlError) as raised:
         service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
     assert raised.value.code == "computer_no_progress"
@@ -543,7 +550,7 @@ def test_start_run_orphan_close_failure_does_not_mask_error(owner_a, capability)
     """孤儿 backend 关闭自身失败只留痕，不得掩盖 computer_cancelled。"""
     backend = FakeComputerBackend(target="desktop", close_error=RuntimeError("close boom"))
     service = ComputerControlService(
-        backend_factory=lambda target: backend,
+        backend_factory=lambda target, identity: backend,
         abort_streams=lambda event: None,
     )
     stopped = []
@@ -570,7 +577,7 @@ def test_execute_establishing_closes_backend_when_run_stopped_during_claim(
     created = []
     holder = {}
 
-    def factory(target):
+    def factory(target, identity):
         backend = FakeComputerBackend(target=target)
         created.append(backend)
         if holder.get("armed"):
@@ -600,7 +607,7 @@ def test_execute_establishing_closes_backend_when_settings_revoked_during_claim(
     created = []
     state = {"generation": 1}
 
-    def factory(target):
+    def factory(target, identity):
         backend = FakeComputerBackend(target=target)
         created.append(backend)
         state["generation"] += 1  # claim 期间设置被改写（关闭 browser 开关）
@@ -633,6 +640,193 @@ def test_execute_establishing_closes_backend_when_settings_revoked_during_claim(
     assert service.snapshot().status == "stopped"
 
 
+# ---------------- R1：取消提交点（取消期间不得发布成功结果） ----------------
+
+
+def test_cancel_during_action_must_not_publish_success(owner_a, capability):
+    """backend.execute 期间 owner 取消：动作不得提交成功，恰好一条 finished(ok=False)。
+
+    审计复现迁移（tests/audits/computer_control_cases.py 同名用例）。
+    """
+    backend = FakeComputerBackend(target="browser")
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 1,
+        abort_streams=lambda event: None,
+    )
+    run = service.start_run(owner_a, capability, target="browser")
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+    events = []
+    service.add_listener(events.append)
+    backend.execute = lambda run_id, action: owner_a.cancel_event.set()
+    try:
+        with pytest.raises(ComputerControlError, match="取消|停止"):
+            service.execute(
+                run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=10, y=10)
+            )
+        finished = [
+            event for event in events if event["type"] == "computer_action_finished"
+        ]
+        assert not any(event.get("ok") is True for event in events)
+        # 已 action_started 的动作恰好产生一条 finished，取消时 ok=False。
+        assert len(finished) == 1 and finished[0]["ok"] is False
+        assert finished[0]["error_code"] == "computer_cancelled"
+        # 取消后不得发布新观察事件。
+        assert not any(event["type"] == "computer_observation" for event in events)
+    finally:
+        service.stop()
+
+
+def test_cancel_during_observe_must_not_publish_success(service, running_run, owner_a):
+    """backend.observe 期间取消：观察结果不得提交为成功。"""
+    backend = service.backend
+    original_observe = backend.observe
+
+    def cancelling_observe(run_id):
+        owner_a.cancel_event.set()
+        return original_observe(run_id)
+
+    backend.observe = cancelling_observe
+    events = []
+    service.add_listener(events.append)
+    try:
+        with pytest.raises(ComputerControlError, match="取消|停止"):
+            service.execute(
+                running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=10, y=10)
+            )
+        assert not any(event.get("ok") is True for event in events)
+    finally:
+        service.stop()
+
+
+def test_cancel_during_preview_publish_must_not_commit_success(owner_a, capability):
+    """预览发布期间取消：发布发生在提交点之前，取消后不得提交成功。"""
+    backend = FakeComputerBackend(target="browser", png_path="virtual-shot.png")
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 1,
+        abort_streams=lambda event: None,
+    )
+    run = service.start_run(owner_a, capability, target="browser")
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+    events = []
+    service.add_listener(events.append)
+
+    def cancelling_publisher(run_id, png_path):
+        owner_a.cancel_event.set()
+        return "/computer-preview/tok/1.png"
+
+    service.set_preview_publisher(cancelling_publisher)
+    try:
+        with pytest.raises(ComputerControlError, match="取消|停止"):
+            service.execute(
+                run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=10, y=10)
+            )
+        assert not any(event.get("ok") is True for event in events)
+        assert not any(event["type"] == "computer_observation" for event in events)
+    finally:
+        service.stop()
+
+
+def test_settings_revoked_during_action_does_not_commit_success(
+    service, running_run, owner_a, settings_state
+):
+    """动作执行期间设置关闭（generation 失配且能力撤销）：不提交成功，run 停止。"""
+    backend = service.backend
+
+    def revoke_during_execute(run_id, action):
+        settings_state["browser"] = False
+        settings_state["generation"] += 1
+
+    backend.execute = revoke_during_execute
+    events = []
+    service.add_listener(events.append)
+    try:
+        with pytest.raises(ComputerControlError) as raised:
+            service.execute(
+                running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=10, y=10)
+            )
+        assert raised.value.code == "computer_disabled"
+        assert not any(event.get("ok") is True for event in events)
+        assert service.snapshot().status == "stopped"
+    finally:
+        service.stop()
+
+
+def test_pause_during_action_still_commits_current_input(service, running_run, owner_a):
+    """暂停只阻止下一动作：暂停在动作中途到达时，当前输入完成并提交成功。"""
+    backend = service.backend
+
+    def pause_during_execute(run_id, action):
+        service.pause(running_run.run_id, "user_request")
+
+    backend.execute = pause_during_execute
+    events = []
+    service.add_listener(events.append)
+    try:
+        observation = service.execute(
+            running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=10, y=10)
+        )
+        assert observation.ok
+        finished = [
+            event for event in events if event["type"] == "computer_action_finished"
+        ]
+        assert len(finished) == 1 and finished[0]["ok"] is True
+        assert service.snapshot().status == "paused"
+        # 暂停后下一动作被拒绝，恢复后必须先 observe。
+        with pytest.raises(ComputerControlError, match="暂停"):
+            service.execute(
+                running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=20, y=20)
+            )
+    finally:
+        service.stop()
+
+
+def test_native_batch_cancel_before_second_action_executes_nothing_further(
+    owner_a,
+):
+    """native 批次：第一项成功后取消，第二项起零执行且不再发模型续推。"""
+    from core.computer.provider_openai import (
+        BoundNativeController,
+        NativeComputerCall,
+        execute_native_computer_call,
+    )
+
+    capability = NATIVE_BROWSER_CAPABILITY
+    backend = FakeComputerBackend(target="browser")
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 1,
+        abort_streams=lambda event: None,
+    )
+    run = service.start_run(owner_a, capability, target="browser")
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+
+    def cancel_on_first_observation(event):
+        if event["type"] == "computer_observation":
+            owner_a.cancel_event.set()
+
+    service.add_listener(cancel_on_first_observation)
+    call = NativeComputerCall(
+        response_id="resp-a",
+        call_id="call-a",
+        actions=(
+            ComputerAction(kind="click", target="browser", x=10, y=10),
+            ComputerAction(kind="click", target="browser", x=20, y=20),
+            ComputerAction(kind="click", target="browser", x=30, y=30),
+        ),
+    )
+    bound = BoundNativeController(service, run.run_id, owner_a)
+    try:
+        with pytest.raises(ComputerControlError) as raised:
+            execute_native_computer_call(call, bound)
+        assert raised.value.code == "computer_cancelled"
+        # 只有第一项真实执行；第二项在动作前检查即被拒绝，余项零执行。
+        assert [entry[1] for entry in backend.execute_calls] == ["click"]
+    finally:
+        service.stop()
+
+
 # ---------------- 单例 ----------------
 
 
@@ -642,3 +836,369 @@ def test_get_computer_control_service_lazy_singleton(monkeypatch):
     monkeypatch.setattr(controller, "_SERVICE", None)
     first = get_computer_control_service()
     assert first is get_computer_control_service()
+
+
+# ---------------- R4：留存 backend 身份匹配 ----------------
+
+
+def test_browser_change_does_not_reuse_previous_channel(owner_a, owner_b):
+    """审计复现迁移（tests/audits 同名用例）：Edge → Chrome 后不得复用留存实例。"""
+    state = {"generation": 1, "browser": "edge"}
+    created = []
+
+    def factory(target, identity):
+        backend = FakeComputerBackend(target=target)
+        backend.browser = identity.browser
+        created.append(backend)
+        return backend
+
+    service = ComputerControlService(
+        backend_factory=factory,
+        generation_provider=lambda: state["generation"],
+        abort_streams=lambda event: None,
+    )
+    first = service.start_run(owner_a, GENERIC_CAPABILITY, target="browser")
+    service.complete_run(first.run_id, owner_a)
+    state.update(generation=2, browser="chrome")
+    try:
+        second = service.start_run(
+            owner_b,
+            replace(GENERIC_CAPABILITY, browser="chrome", settings_generation=2),
+            target="browser",
+        )
+        assert service._run.backend.browser == "chrome"
+        # 旧 Edge 实例被显式关闭，新实例按新身份创建。
+        assert created[0].close_count == 1
+        assert created[1] is service._run.backend
+        assert second.run_id != first.run_id
+    finally:
+        service.stop()
+
+
+def test_same_identity_retained_session_is_reused(service, running_run, owner_a, owner_b, capability):
+    """相同身份：留存实例正常复用（同一 backend 对象），不重复创建。"""
+    backend = service.backend
+    service.complete_run(running_run.run_id, owner_a)
+    second = service.start_run(owner_b, capability, target="browser")
+    try:
+        assert service.backend is backend
+        assert backend.close_count == 0
+        assert second.run_id != running_run.run_id
+    finally:
+        service.stop()
+
+
+def test_retained_close_failure_fails_claim(service, running_run, owner_a, owner_b):
+    """身份不匹配且旧实例 close 失败：本次启动显式失败，不静默丢弃旧对象。"""
+    backend = service.backend
+    service.complete_run(running_run.run_id, owner_a)
+    backend.close_error = ComputerControlError("computer_cleanup_failed", "注入关闭失败")
+    chrome_capability = replace(GENERIC_CAPABILITY, browser="chrome", settings_generation=2)
+    with pytest.raises(ComputerControlError) as raised:
+        service.start_run(owner_b, chrome_capability, target="browser")
+    assert raised.value.code == "computer_cleanup_failed"
+    assert service.snapshot().status == "failed"
+
+
+def test_unusable_retained_session_fails_explicitly(service, running_run, owner_a, owner_b, capability):
+    """身份相同但实例不可复用（用户已关闭窗口/不健康）：明确失败，不暗中复活。"""
+    backend = service.backend
+    service.complete_run(running_run.run_id, owner_a)
+    backend.reusable = False
+    with pytest.raises(ComputerControlError) as raised:
+        service.start_run(owner_b, capability, target="browser")
+    assert raised.value.code == "computer_browser_closed"
+    assert backend.close_count == 1  # 旧实例已清理；下一轮可显式新建
+    assert service.snapshot().status == "failed"
+    third_owner = ComputerOwner(
+        session_id="session-c", turn_id="turn-c", session_label="会话C",
+        cancel_event=threading.Event(),
+    )
+    third = service.start_run(third_owner, capability, target="browser")
+    assert third.status == "running"
+    service.stop()
+
+
+def test_factory_receives_frozen_identity_not_current_settings(service, running_run, owner_a, owner_b, settings_state, capability):
+    """配置在 Turn 冻结后改变：工厂消费 run 冻结身份，不重读“当前选中浏览器”。"""
+    seen_identities = []
+    original_factory = service._backend_factory
+
+    def recording_factory(target, identity):
+        seen_identities.append(identity)
+        return original_factory(target, identity)
+
+    service._backend_factory = recording_factory
+    service.complete_run(running_run.run_id, owner_a)
+    # 留存身份匹配时复用，不调用工厂；改 profile 后身份失配，工厂收到新身份。
+    assert seen_identities == []
+    with pytest.raises(ComputerControlError):
+        service._resolve_backend_identity("browser", replace(GENERIC_CAPABILITY, browser=""))
+    second = service.start_run(owner_b, capability, target="browser")
+    assert service.backend is service.created["browser"][0]  # 复用留存，未新建
+    service.stop()
+
+
+def test_complete_run_does_not_retain_unusable_backend(service, running_run, owner_a):
+    """有未结束工作/不健康的实例不得进入 retained：complete 时按不留存关闭。"""
+    backend = service.backend
+    backend.reusable = False
+    snapshot = service.complete_run(running_run.run_id, owner_a)
+    assert snapshot.status == "completed"
+    assert backend.close_count == 1
+    assert service._retained == {}
+
+
+# ---------------- R5：surface 身份变化接线 ----------------
+
+
+def test_surface_changed_sets_require_observe_and_blocks_old_coordinates(service, running_run, owner_a):
+    """backend 报 surface_changed：controller 立即使旧坐标作废，恢复必须先 observe。"""
+    backend = service.backend
+    backend.execute_error = ComputerControlError(
+        "computer_surface_changed", "受控页面已切换"
+    )
+    with pytest.raises(ComputerControlError) as raised:
+        service.execute(
+            running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1)
+        )
+    assert raised.value.code == "computer_surface_changed"
+    backend.execute_error = None
+    # 不观察直接再点：被拒绝（旧坐标已作废）。
+    with pytest.raises(ComputerControlError) as blocked:
+        service.execute(
+            running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1)
+        )
+    assert blocked.value.code == "computer_invalid_action"
+    assert [entry[1] for entry in backend.execute_calls] == ["click"]
+    # observe 后恢复可输入。
+    service.execute(running_run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+    service.execute(
+        running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1)
+    )
+    assert [entry[1] for entry in backend.execute_calls] == ["click", "click"]
+    service.stop()
+
+
+def test_observation_event_carries_surface_identity(service, running_run, owner_a):
+    """computer_observation 事件携带本地 surface_id/generation（GUI 区分受控页）。"""
+    events = []
+    service.add_listener(events.append)
+    try:
+        service.execute(
+            running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=5, y=5)
+        )
+        observations = [
+            event for event in events if event["type"] == "computer_observation"
+        ]
+        assert len(observations) == 1
+        assert "surface_id" in observations[0]
+        assert "surface_generation" in observations[0]
+    finally:
+        service.stop()
+
+
+def test_native_batch_surface_change_aborts_remaining_actions(owner_a):
+    """native 批次中途切页：第一项后即中断，余项零执行。"""
+    from core.computer.provider_openai import (
+        BoundNativeController,
+        NativeComputerCall,
+        execute_native_computer_call,
+    )
+
+    backend = FakeComputerBackend(target="browser")
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 1,
+        abort_streams=lambda event: None,
+    )
+    run = service.start_run(owner_a, NATIVE_BROWSER_CAPABILITY, target="browser")
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+    backend.execute_error = None
+
+    original_execute = backend.execute
+    state = {"calls": 0}
+
+    def fail_from_second(run_id, action):
+        state["calls"] += 1
+        if state["calls"] >= 2:
+            raise ComputerControlError("computer_surface_changed", "受控页面已切换")
+        return original_execute(run_id, action)
+
+    backend.execute = fail_from_second
+
+    call = NativeComputerCall(
+        response_id="resp-s",
+        call_id="call-s",
+        actions=(
+            ComputerAction(kind="click", target="browser", x=10, y=10),
+            ComputerAction(kind="click", target="browser", x=20, y=20),
+            ComputerAction(kind="click", target="browser", x=30, y=30),
+        ),
+    )
+    bound = BoundNativeController(service, run.run_id, owner_a)
+    try:
+        with pytest.raises(ComputerControlError) as raised:
+            execute_native_computer_call(call, bound)
+        assert raised.value.code == "computer_surface_changed"
+        assert state["calls"] == 2  # 第二项被拒（零输入），第三项绝不执行
+    finally:
+        service.stop()
+
+
+# ---------------- R6：无进展计数 ----------------
+
+
+def test_three_valid_mouse_moves_do_not_stop_desktop(owner_a):
+    """审计复现迁移（tests/audits 同名用例）：move 不进入无进展计数。"""
+    backend = FakeComputerBackend(target="desktop")
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 1,
+        abort_streams=lambda event: None,
+    )
+    run = service.start_run(owner_a, GENERIC_CAPABILITY, target="desktop")
+    service.execute(run.run_id, owner_a, ComputerAction(kind="observe", target="desktop"))
+    try:
+        for x in (10, 20, 30):
+            service.execute(
+                run.run_id, owner_a, ComputerAction(kind="move", target="desktop", x=x, y=10)
+            )
+        assert service.snapshot().status == "running"
+        assert [entry[1] for entry in backend.execute_calls] == ["move"] * 3
+    finally:
+        service.stop()
+
+
+def test_changed_frame_resets_no_progress_count_to_zero(service, running_run, owner_a):
+    """审计复现迁移（tests/audits 同名用例）：有进展后计数归零而非从 1 起算。"""
+    backend = service.backend
+    backend._screen_hashes = ["changed", "changed", "changed"]
+    # 第一击已产生进展，随后只有两击无变化，不得按三次无进展停止。
+    for x in (10, 20, 30):
+        service.execute(
+            running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=x, y=10)
+        )
+    assert service.snapshot().status == "running"
+    service.stop()
+
+
+def test_two_unchanged_clicks_remain_allowed(service, running_run, owner_a):
+    """对照（审计保留）：仅两次不变点击允许继续。"""
+    for x in (10, 20):
+        service.execute(
+            running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=x, y=10)
+        )
+    assert service.snapshot().status == "running"
+    service.stop()
+
+
+def test_progress_then_zero_one_two_three_stops(service, running_run, owner_a):
+    """进展后计数序列 0→1→2→3：变化一击 + 三击不变才停止。
+
+    每次动作后 controller 都会取新观察：p1 之后首个 s 仍是变化（计 0），
+    随后三次 s 不变依次计 1/2/3，第 5 击停止。
+    """
+    backend = service.backend
+    backend._screen_hashes = ["p1", "s", "s", "s", "s"]
+    for _ in range(4):
+        service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    assert service.snapshot().status == "running"
+    with pytest.raises(ComputerControlError) as raised:
+        service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    assert raised.value.code == "computer_no_progress"
+    service.stop()
+
+
+def test_observe_with_real_change_resets_count_and_baseline(service, running_run, owner_a):
+    """豁免动作（observe）观察到真实变化：计数归零且基线更新，后续重新累计。"""
+    backend = service.backend
+    backend._screen_hashes = ["a", "a", "b", "b", "b", "b"]
+    # 两击不变（计数 1、2）。
+    service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    # observe 看到变化 b：计数归零、基线更新（不留过期基线）。
+    service.execute(running_run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+    # 三击不变才停止（1、2、3）。
+    service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    assert service.snapshot().status == "running"
+    with pytest.raises(ComputerControlError) as raised:
+        service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    assert raised.value.code == "computer_no_progress"
+    service.stop()
+
+
+def test_unchanged_observe_does_not_mask_existing_failures(service, running_run, owner_a):
+    """豁免动作且画面不变：保留既有失败次数，不得靠插入 observe 掩盖重复失败。"""
+    backend = service.backend
+    backend._screen_hashes = ["same"] * 8
+    # 首击相对基线有变化计 0，第 2/3 击不变计 1/2。
+    for _ in range(3):
+        service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    # 插入不变 observe：计数保留（2），下一击不变即达 3 停止。
+    service.execute(running_run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+    with pytest.raises(ComputerControlError) as raised:
+        service.execute(running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1))
+    assert raised.value.code == "computer_no_progress"
+    service.stop()
+
+
+# ---------------- R9：动作耗时测量 ----------------
+
+
+def test_action_finished_supplies_measured_duration(service, running_run, owner_a):
+    """审计复现迁移（tests/audits 同名用例）：finished 事件携带真实耗时字段。"""
+    events = []
+    service.add_listener(events.append)
+    try:
+        service.execute(running_run.run_id, owner_a, ComputerAction(kind="observe", target="browser"))
+        finished = next(
+            event for event in events if event["type"] == "computer_action_finished"
+        )
+        assert isinstance(finished.get("duration_ms"), (int, float))
+        assert finished["duration_ms"] >= 0
+        assert isinstance(finished.get("queue_ms"), (int, float))
+        assert isinstance(finished.get("observe_ms"), (int, float))
+        # observe 动作没有输入阶段：字段缺省（“未测量”），绝不默认 0ms。
+        assert "input_ms" not in finished
+        assert "wait_ms" not in finished
+    finally:
+        service.stop()
+
+
+def test_action_finished_reports_input_and_wait_segments(service, running_run, owner_a):
+    """输入/显式等待/观察分段真实出现；失败与取消同样携带耗时。"""
+    events = []
+    service.add_listener(events.append)
+    try:
+        service.execute(
+            running_run.run_id, owner_a,
+            ComputerAction(kind="wait", target="browser", duration_ms=100),
+        )
+        service.execute(
+            running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=1, y=1)
+        )
+        finished = [
+            event for event in events if event["type"] == "computer_action_finished"
+        ]
+        wait_event, click_event = finished
+        assert wait_event["wait_ms"] >= 0 and wait_event["input_ms"] == wait_event["wait_ms"]
+        assert "observe_ms" in wait_event
+        assert click_event["input_ms"] >= 0 and click_event["observe_ms"] >= 0
+        assert "wait_ms" not in click_event
+        # 失败路径同样携带耗时。
+        service.backend.observe_error = ComputerControlError(
+            "computer_action_failed", "注入观察失败"
+        )
+        with pytest.raises(ComputerControlError):
+            service.execute(
+                running_run.run_id, owner_a, ComputerAction(kind="click", target="browser", x=2, y=2)
+            )
+        failed = [
+            event for event in events
+            if event["type"] == "computer_action_finished" and event["ok"] is False
+        ]
+        assert failed and isinstance(failed[-1].get("duration_ms"), (int, float))
+    finally:
+        service.stop()

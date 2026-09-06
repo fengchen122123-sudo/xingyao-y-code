@@ -466,7 +466,7 @@ def _service_with_backends(backends):
     from core.computer.controller import ComputerControlService
 
     return ComputerControlService(
-        backend_factory=lambda target: backends[target],
+        backend_factory=lambda target, identity: backends[target],
         generation_provider=lambda: 1,
         abort_streams=_noop_abort,
     )
@@ -500,7 +500,7 @@ def test_shutdown_stops_active_run_and_closes_retained_browser(tmp_path):
     browser_backend = FakeComputerBackend("browser")
     desktop_backend = FakeComputerBackend("desktop")
     service = ComputerControlService(
-        backend_factory=lambda target: (
+        backend_factory=lambda target, identity: (
             browser_backend if target == "browser" else desktop_backend
         ),
         generation_provider=lambda: 1,
