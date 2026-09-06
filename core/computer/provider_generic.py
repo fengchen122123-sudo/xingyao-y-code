@@ -42,7 +42,9 @@ _GENERIC_DYNAMIC_PROMPT = (
     "3. 每个动作后必须依据返回的最新截图决定下一步，不得猜测动作成功。\n"
     "4. 坐标以最新截图左上角为 (0,0)。\n"
     "5. 遇到登录、验证码或需要输入凭据时，改用 request_user_takeover 请求用户手动接管。\n"
-    "6. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。"
+    "6. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。\n"
+    "7. 原生应用优先用 list_elements 拿控件列表，再以 click_element/set_value_element"
+    "按元素引用操作（中文写值不过输入法）；坐标点击只用于元素不可达的场景。"
 )
 
 # Provider tool result 的稳定 JSON 序列化参数（设计 10.2）。
@@ -179,12 +181,41 @@ def _read_observation_png(png_path: str) -> bytes:
         ) from error
 
 
-def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> dict:
-    """最新截图的 follow-up user 多模态消息（设计 10.2）。
+# 元素列表观察的 follow-up 说明文本（阶段二 a11y-first，2026-09-06）。
+_OBSERVATION_ELEMENTS_TEXT_PREFIX = (
+    "【电脑观察·控件列表】请优先用元素引用动作操作"
+    "（click_element 点击 / set_value_element 写值，目标输入框优先"
+    " set_value_element）；元素都不可用时再用截图坐标。元素列表："
+)
 
-    PNG 转 data:image/png;base64 只存在于此消息；tool result JSON、metadata
-    与日志绝不携带截图字节。_computer_v1 为私有元数据（run_id/ordinal/target）。
+
+def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> dict:
+    """观察的 follow-up user 消息（设计 10.2 + 阶段二双路径）。
+
+    有 elements 时为纯文本控件列表（a11y-first，请求不含截图字节）；
+    否则维持既有路径：PNG 转 data:image/png;base64 只存在于此消息。
+    tool result JSON、metadata 与日志绝不携带截图字节。_computer_v1 为
+    私有元数据（run_id/ordinal/target），两种路径一致。
     """
+    meta = {
+        "run_id": run_id,
+        "ordinal": int(ordinal),
+        "target": observation.target,
+    }
+    if observation.elements:
+        lines = [
+            f"- {e.get('ref', '')} {e.get('kind', '')} name={e.get('name', '')!r} "
+            f"bounds={tuple(e.get('bounds', ()))} enabled={bool(e.get('enabled', True))}"
+            for e in observation.elements
+        ]
+        return {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": _OBSERVATION_ELEMENTS_TEXT_PREFIX},
+                {"type": "text", "text": "\n".join(lines)},
+            ],
+            "_computer_v1": meta,
+        }
     png_bytes = _read_observation_png(observation.png_path)
     data_url = "data:image/png;base64," + base64.b64encode(png_bytes).decode("ascii")
     return {
@@ -193,11 +224,7 @@ def _observation_followup_message(observation, *, run_id: str, ordinal: int) -> 
             {"type": "text", "text": OBSERVATION_FOLLOWUP_TEXT},
             {"type": "image_url", "image_url": {"url": data_url}},
         ],
-        "_computer_v1": {
-            "run_id": run_id,
-            "ordinal": int(ordinal),
-            "target": observation.target,
-        },
+        "_computer_v1": meta,
     }
 
 
