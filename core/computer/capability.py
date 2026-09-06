@@ -90,13 +90,11 @@ def resolve_computer_capability(
 
     protocol = model.get("computer_protocol")
     if protocol in (None, ""):
-        # 缺省协议自动判定（用户裁决 2026-09-05）：视觉+工具调用双勾的模型
-        # 无需逐个配置 computer_protocol 即自动按 generic 启用；仍只从显式
-        # 能力元数据推导，绝不按模型名猜测。
-        if (
-            model.get("supports_vision") is True
-            and model.get("supports_function_calling") is True
-        ):
+        # 缺省协议自动判定（用户裁决 2026-09-05，同日修订）：视觉必须显式声明
+        # （文本模型是常态，不能推定）；工具调用未声明（None）视为支持——能进
+        # Agent 模型列表的模型本身就要靠 function calling 驱动普通工具，这不是
+        # 按模型名猜测；显式 False 是用户主动排除该模型的逃生门，始终拒绝。
+        if model.get("supports_vision") is True and model.get("supports_function_calling") is not False:
             return ComputerCapability(
                 enabled=True,
                 protocol=ComputerProtocol.GENERIC.value,
@@ -107,17 +105,14 @@ def resolve_computer_capability(
         return _rejected(
             settings,
             "computer_model_not_capable",
-            "模型未声明视觉与工具调用能力（电脑操控要求两者齐备）",
+            "模型未声明视觉能力，或已显式关闭工具调用（电脑操控要求两者齐备）",
         )
     if protocol == ComputerProtocol.GENERIC.value:
-        if (
-            model.get("supports_vision") is not True
-            or model.get("supports_function_calling") is not True
-        ):
+        if model.get("supports_vision") is not True or model.get("supports_function_calling") is False:
             return _rejected(
                 settings,
                 "computer_model_not_capable",
-                "模型未显式声明视觉与工具调用能力，不能使用 generic 电脑操控",
+                "模型未显式声明视觉能力或已关闭工具调用，不能使用 generic 电脑操控",
             )
         return ComputerCapability(
             enabled=True,

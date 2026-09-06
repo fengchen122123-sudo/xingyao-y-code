@@ -138,6 +138,57 @@ def get_selected_command_shell() -> str:
     return value or DEFAULT_COMMAND_SHELL
 
 
+def _computer_active_model_capability(computer) -> dict[str, Any]:
+    """当前活动模型的电脑操控资格摘要（设置面板展示用，只读）。
+
+    与 Turn 起点走同一个判定函数（resolve_computer_capability，local 来源），
+    保证设置页提示与真实执行门槛一致；模型未配置/读取失败时不影响设置页。
+    """
+    try:
+        from core.computer.capability import resolve_computer_capability
+
+        # 经 config._load() 读取（与设置读取同一路径，可被测试隔离）；
+        # 不走 model_manager.load_config（其模块级 _CONFIG_FILE 快照与设置
+        # 路径可能不一致）。
+        data = config._load()
+        active_id = str(data.get("active_model_id") or "")
+        model = None
+        provider = {}
+        for candidate in data.get("providers", []):
+            for entry in candidate.get("models", []):
+                if entry.get("id") == active_id:
+                    model = dict(entry)
+                    provider = {
+                        "protocol": candidate.get("protocol", "openai"),
+                        "base_url": candidate.get("base_url", ""),
+                    }
+                    break
+            if model is not None:
+                break
+        if not model:
+            return {
+                "model": "",
+                "eligible": False,
+                "error_code": "computer_model_not_capable",
+                "reason": "当前未选择模型",
+            }
+        capability = resolve_computer_capability(model, provider, computer, "local")
+        return {
+            "model": str(model.get("name") or model.get("litellm_model") or ""),
+            "eligible": bool(capability.enabled),
+            "protocol": capability.protocol,
+            "error_code": capability.error_code,
+            "reason": capability.reason,
+        }
+    except Exception:  # 设置页展示失败绝不拖垮系统设置
+        return {
+            "model": "",
+            "eligible": False,
+            "error_code": "computer_model_not_capable",
+            "reason": "活动模型资格判定失败（详见日志）",
+        }
+
+
 def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
     selected = get_selected_command_shell()
     options = list_command_shell_options(platform=platform)
@@ -183,6 +234,7 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         "computer_hotkey_available": hotkey.available,
         "computer_hotkey": "Ctrl+Alt+Esc",
         "computer_run": computer_run.to_public_dict(),
+        "computer_active_model_capability": _computer_active_model_capability(computer),
     }
 
 
