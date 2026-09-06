@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="9" skipped="0" tests="10" time="0.713" timestamp="2026-09-05T14:19:47.918542+08:00" hostname="fengchenhao"><testcase classname="tests.audits.computer_control_cases" name="test_browser_mouse_action_preserves_ctrl[click]" time="0.411"><failure message="AssertionError: assert [] == [('down', 'Co...', 'Control')]&#10;  &#10;  Right contains 2 more items, first extra item: ('down', 'Control')&#10;  Use -v to get more diff">tests\audits\computer_control_cases.py:38: in test_browser_mouse_action_preserves_ctrl
+    assert keyboard.calls == [("down", "Control"), ("up", "Control")]
+E   AssertionError: assert [] == [('down', 'Co...', 'Control')]
+E     
+E     Right contains 2 more items, first extra item: ('down', 'Control')
+E     Use -v to get more diff</failure></testcase><testcase classname="tests.audits.computer_control_cases" name="test_browser_mouse_action_preserves_ctrl[double_click]" time="0.003"><failure message="AssertionError: assert [] == [('down', 'Co...', 'Control')]&#10;  &#10;  Right contains 2 more items, first extra item: ('down', 'Control')&#10;  Use -v to get more diff">tests\audits\computer_control_cases.py:38: in test_browser_mouse_action_preserves_ctrl
+    assert keyboard.calls == [("down", "Control"), ("up", "Control")]
+E   AssertionError: assert [] == [('down', 'Co...', 'Control')]
+E     
+E     Right contains 2 more items, first extra item: ('down', 'Control')
+E     Use -v to get more diff</failure></testcase><testcase classname="tests.audits.computer_control_cases" name="test_browser_mouse_action_preserves_ctrl[drag]" time="0.002"><failure message="AssertionError: assert [] == [('down', 'Co...', 'Control')]&#10;  &#10;  Right contains 2 more items, first extra item: ('down', 'Control')&#10;  Use -v to get more diff">tests\audits\computer_control_cases.py:38: in test_browser_mouse_action_preserves_ctrl
+    assert keyboard.calls == [("down", "Control"), ("up", "Control")]
+E   AssertionError: assert [] == [('down', 'Co...', 'Control')]
+E     
+E     Right contains 2 more items, first extra item: ('down', 'Control')
+E     Use -v to get more diff</failure></testcase><testcase classname="tests.audits.computer_control_cases" name="test_three_valid_mouse_moves_do_not_stop_desktop" time="0.002"><failure message="core.computer.models.ComputerControlError: 连续 3 次动作后截图与活动指纹完全不变，已停止电脑操控">tests\audits\computer_control_cases.py:58: in test_three_valid_mouse_moves_do_not_stop_desktop
+    service.execute(run.run_id, owner, ComputerAction(kind="move", target="desktop", x=x, y=10))
+core\computer\controller.py:636: in execute
+    raise ComputerControlError(
+E   core.computer.models.ComputerControlError: 连续 3 次动作后截图与活动指纹完全不变，已停止电脑操控</failure></testcase><testcase classname="tests.audits.computer_control_cases" name="test_changed_frame_resets_no_progress_count_to_zero" time="0.001"><failure message="core.computer.models.ComputerControlError: 连续 3 次动作后截图与活动指纹完全不变，已停止电脑操控">tests\audits\computer_control_cases.py:70: in test_changed_frame_resets_no_progress_count_to_zero
+    service.execute(run.run_id, owner, ComputerAction(kind="click", target="browser", x=x, y=10))
+core\computer\controller.py:636: in execute
+    raise ComputerControlError(
+E   core.computer.models.ComputerControlError: 连续 3 次动作后截图与活动指纹完全不变，已停止电脑操控</failure></testcase><testcase classname="tests.audits.computer_control_cases" name="test_cancel_during_action_must_not_publish_success" time="0.001"><failure message="Failed: DID NOT RAISE ComputerControlError">tests\audits\computer_control_cases.py:83: in test_cancel_during_action_must_not_publish_success
+    with pytest.raises(ComputerControlError, match="取消|停止"):
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+E   Failed: DID NOT RAISE ComputerControlError</failure></testcase><testcase classname="tests.audits.computer_control_cases" name="test_timed_out_queued_command_never_executes_later" time="0.126"><failure message="AssertionError: 已经返回超时的排队输入仍被 worker 执行&#10;assert not True&#10; +  where True = is_set()&#10; +    where is_set = &lt;threading.Event at 0x21ca38b1250: set&gt;.is_set">tests\audits\computer_control_cases.py:103: in test_timed_out_queued_command_never_executes_later
+    assert not side_effect.is_set(), "已经返回超时的排队输入仍被 worker 执行"
+E   AssertionError: 已经返回超时的排队输入仍被 worker 执行
+E   assert not True
+E    +  where True = is_set()
+E    +    where is_set = &lt;threading.Event at 0x21ca38b1250: set&gt;.is_set</failure></testcase><testcase classname="tests.audits.computer_control_cases" name="test_action_finished_supplies_measured_duration" time="0.001"><failure message="AssertionError: assert False&#10; +  where False = isinstance(None, (&lt;class 'int'&gt;, &lt;class 'float'&gt;))&#10; +    where None = &lt;built-in method get of dict object at 0x0000021CA38D0AC0&gt;('duration_ms')&#10; +      where &lt;built-in method get of dict object at 0x0000021CA38D0AC0&gt; = {'type': 'computer_action_finished', 'run_id': 'computer-run-f1a35c6a921a', 'event_seq': 7, 'action_ordinal': 2, ...}.get">tests\audits\computer_control_cases.py:117: in test_action_finished_supplies_measured_duration
+    assert isinstance(finished.get("duration_ms"), (int, float))
+E   AssertionError: assert False
+E    +  where False = isinstance(None, (&lt;class 'int'&gt;, &lt;class 'float'&gt;))
+E    +    where None = &lt;built-in method get of dict object at 0x0000021CA38D0AC0&gt;('duration_ms')
+E    +      where &lt;built-in method get of dict object at 0x0000021CA38D0AC0&gt; = {'type': 'computer_action_finished', 'run_id': 'computer-run-f1a35c6a921a', 'event_seq': 7, 'action_ordinal': 2, ...}.get</failure></testcase><testcase classname="tests.audits.computer_control_cases" name="test_two_unchanged_clicks_remain_allowed" time="0.000" /><testcase classname="tests.audits.computer_control_cases" name="test_browser_change_does_not_reuse_previous_channel" time="0.001"><failure message="AssertionError: assert 'edge' == 'chrome'&#10;  &#10;  - chrome&#10;  + edge">tests\audits\computer_control_cases.py:151: in test_browser_change_does_not_reuse_previous_channel
+    assert service._run.backend.browser == "chrome"
+E   AssertionError: assert 'edge' == 'chrome'
+E     
+E     - chrome
+E     + edge</failure></testcase></testsuite></testsuites>

@@ -1,0 +1,106 @@
+[
+  {
+    "case": "start",
+    "ms": 466.9,
+    "ok": true
+  },
+  {
+    "case": "navigate_local",
+    "ms": 23.7,
+    "ok": true
+  },
+  {
+    "case": "observe",
+    "ms": 265.4,
+    "ok": true
+  },
+  {
+    "case": "plain_click",
+    "ms": 5.3,
+    "ok": true,
+    "actual": 1
+  },
+  {
+    "case": "ctrl_click",
+    "ms": 2.1,
+    "ok": false,
+    "actual": false
+  },
+  {
+    "case": "shift_click",
+    "ms": 1.9,
+    "ok": false,
+    "actual": false
+  },
+  {
+    "case": "double_click",
+    "ms": 2.5,
+    "ok": true,
+    "actual": 1
+  },
+  {
+    "case": "unicode_text",
+    "ms": 16.3,
+    "ok": true,
+    "actual": "中文🙂 audit"
+  },
+  {
+    "case": "ctrl_a_replace",
+    "ms": 4.2,
+    "ok": true,
+    "actual": "replaced"
+  },
+  {
+    "case": "drag",
+    "ms": 49.9,
+    "ok": true,
+    "actual": 1
+  },
+  {
+    "case": "scroll_dispatch",
+    "ms": 8.2,
+    "ok": true
+  },
+  {
+    "case": "scroll_result",
+    "ms": 1.2,
+    "ok": true,
+    "actual": 500
+  },
+  {
+    "case": "navigate_second",
+    "ms": 14.5,
+    "ok": true
+  },
+  {
+    "case": "back",
+    "ms": 17.5,
+    "ok": true,
+    "actual": "/"
+  },
+  {
+    "case": "forward",
+    "ms": 14.4,
+    "ok": true,
+    "actual": "/second"
+  },
+  {
+    "case": "reload",
+    "ms": 14.6,
+    "ok": true,
+    "actual": 0
+  },
+  {
+    "case": "navigate_slow_subresource",
+    "ms": 1510.4,
+    "ok": true
+  },
+  {
+    "case": "manual_tab_focus_tracking",
+    "ms": 51.5,
+    "ok": false,
+    "actual": {
+      "active_is_visible_first": false
+    }
+  }
+]

@@ -1,0 +1,47 @@
+[
+  {
+    "case": "desktop_move",
+    "ok": true,
+    "ms_including_150ms_event_pump": 153.0
+  },
+  {
+    "case": "desktop_click",
+    "ok": true,
+    "ms_including_150ms_event_pump": 156.7
+  },
+  {
+    "case": "desktop_right_click",
+    "ok": true,
+    "ms_including_150ms_event_pump": 151.1
+  },
+  {
+    "case": "desktop_double_click",
+    "ok": true,
+    "ms_including_150ms_event_pump": 152.0
+  },
+  {
+    "case": "desktop_unicode_text",
+    "ok": true,
+    "ms_including_150ms_event_pump": 154.8
+  },
+  {
+    "case": "desktop_backspace",
+    "ok": true,
+    "ms_including_150ms_event_pump": 151.7
+  },
+  {
+    "case": "desktop_drag",
+    "ok": true,
+    "ms_including_150ms_event_pump": 154.4
+  },
+  {
+    "case": "positive_scroll_matches_browser_down_direction",
+    "ok": true,
+    "ms_including_150ms_event_pump": 154.7
+  },
+  {
+    "case": "desktop_wait",
+    "ok": true,
+    "ms_including_150ms_event_pump": 263.1
+  }
+]

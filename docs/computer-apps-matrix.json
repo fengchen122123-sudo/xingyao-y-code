@@ -1,0 +1,42 @@
+[
+  {
+    "matched": 1,
+    "ok": true,
+    "marker": "ycode-apps-audit-4600.txt",
+    "application": "notepad"
+  },
+  {
+    "ok": true,
+    "foreground_title": "ycode-apps-audit-4600.txt - Notepad",
+    "local_size": [
+      1920,
+      1025
+    ],
+    "screen_changed": true,
+    "duration_ms": 444.7,
+    "application": "notepad"
+  },
+  {
+    "closed": true,
+    "ok": true,
+    "application": "notepad"
+  },
+  {
+    "ok": false,
+    "error_code": "computer_action_failed",
+    "error": "激活窗口失败：系统拒绝将目标窗口置前台（SetForegroundWindow 受限）",
+    "application": "explorer"
+  },
+  {
+    "ok": true,
+    "skipped": true,
+    "reason": "not_running",
+    "application": "calculator"
+  },
+  {
+    "ok": false,
+    "error_code": "computer_action_failed",
+    "error": "激活窗口失败：系统拒绝将目标窗口置前台（SetForegroundWindow 受限）",
+    "application": "electron"
+  }
+]

@@ -1,0 +1,1786 @@
+{
+  "date": "2026-09-05",
+  "rounds": 10,
+  "browser": "edge",
+  "probes": {
+    "desktop_input": {
+      "runs": [
+        {
+          "round": 1,
+          "ok": true,
+          "duration_ms": 3186.6,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.4
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 152.4
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.3
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.7
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.7
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.3
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.1
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.1
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 260.4
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "ok": true,
+          "duration_ms": 3156.7,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.5
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.5
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 150.6
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.2
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 157.7
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.3
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.1
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.8
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 266.6
+            }
+          ]
+        },
+        {
+          "round": 3,
+          "ok": true,
+          "duration_ms": 3152.5,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.2
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 156.9
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.0
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.3
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 152.7
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 152.4
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.7
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.9
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 265.5
+            }
+          ]
+        },
+        {
+          "round": 4,
+          "ok": true,
+          "duration_ms": 3168.1,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 150.7
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 157.1
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.6
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.0
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 157.5
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 152.4
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.6
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.2
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 270.5
+            }
+          ]
+        },
+        {
+          "round": 5,
+          "ok": true,
+          "duration_ms": 3143.8,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.9
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 156.0
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 156.5
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.2
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.9
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.8
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.8
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.1
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 252.9
+            }
+          ]
+        },
+        {
+          "round": 6,
+          "ok": true,
+          "duration_ms": 3153.2,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.2
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 160.5
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.1
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 156.0
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.7
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.8
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.8
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 150.6
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 250.4
+            }
+          ]
+        },
+        {
+          "round": 7,
+          "ok": true,
+          "duration_ms": 3173.9,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.1
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 156.2
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.1
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.7
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 159.5
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.7
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.9
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 152.6
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 263.8
+            }
+          ]
+        },
+        {
+          "round": 8,
+          "ok": true,
+          "duration_ms": 3168.8,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.9
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 162.5
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.6
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.7
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 157.6
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.4
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.3
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.3
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 261.0
+            }
+          ]
+        },
+        {
+          "round": 9,
+          "ok": true,
+          "duration_ms": 3149.2,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.2
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 152.0
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.0
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.3
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.8
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 152.5
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 152.1
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.8
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 258.9
+            }
+          ]
+        },
+        {
+          "round": 10,
+          "ok": true,
+          "duration_ms": 3164.0,
+          "failures": [],
+          "cases": [
+            {
+              "case": "desktop_move",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.2
+            },
+            {
+              "case": "desktop_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 155.8
+            },
+            {
+              "case": "desktop_right_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 150.4
+            },
+            {
+              "case": "desktop_double_click",
+              "ok": true,
+              "ms_including_150ms_event_pump": 153.5
+            },
+            {
+              "case": "desktop_unicode_text",
+              "ok": true,
+              "ms_including_150ms_event_pump": 158.3
+            },
+            {
+              "case": "desktop_backspace",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.4
+            },
+            {
+              "case": "desktop_drag",
+              "ok": true,
+              "ms_including_150ms_event_pump": 151.7
+            },
+            {
+              "case": "positive_scroll_matches_browser_down_direction",
+              "ok": true,
+              "ms_including_150ms_event_pump": 154.6
+            },
+            {
+              "case": "desktop_wait",
+              "ok": true,
+              "ms_including_150ms_event_pump": 271.8
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "samples": 10,
+        "success": 10,
+        "success_rate": 1.0,
+        "p50_ms": 3160.35,
+        "p95_ms": 3173.9,
+        "min_ms": 3143.8,
+        "max_ms": 3186.6
+      }
+    },
+    "desktop_surfaces": {
+      "runs": [
+        {
+          "round": 1,
+          "ok": true,
+          "duration_ms": 3086.4,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-36",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "ok": true,
+          "duration_ms": 2994.3,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 3,
+          "ok": true,
+          "duration_ms": 2995.0,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 4,
+          "ok": true,
+          "duration_ms": 3015.4,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 5,
+          "ok": true,
+          "duration_ms": 3001.2,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 6,
+          "ok": true,
+          "duration_ms": 2982.8,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 7,
+          "ok": true,
+          "duration_ms": 2981.7,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 8,
+          "ok": true,
+          "duration_ms": 2986.3,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 9,
+          "ok": true,
+          "duration_ms": 2975.2,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        },
+        {
+          "round": 10,
+          "ok": true,
+          "duration_ms": 3002.0,
+          "failures": [],
+          "cases": [
+            {
+              "case": "list_surfaces_returns_candidates",
+              "ok": true,
+              "actual": {
+                "windows": 14,
+                "tray_icons": 23
+              }
+            },
+            {
+              "case": "wechat_candidate_found",
+              "ok": true,
+              "actual": [
+                "微信（Weixin.exe）",
+                "微信 - 1 个运行窗口",
+                " 微信"
+              ]
+            },
+            {
+              "case": "activate_wechat_window",
+              "ok": true,
+              "ref": "surface-5-window-24",
+              "attempts_last_error": "",
+              "actual": true
+            },
+            {
+              "case": "wechat_window_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            },
+            {
+              "case": "wechat_window_hidden_to_tray",
+              "ok": true,
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_enumerated",
+              "ok": true,
+              "actual": 10
+            },
+            {
+              "case": "wechat_tray_candidate_selected",
+              "ok": true,
+              "actual": {
+                "source": "shell_tray_promoted",
+                "label": " 微信"
+              }
+            },
+            {
+              "case": "hidden_overflow_wechat_window_opened",
+              "ok": true,
+              "source": "shell_tray_promoted",
+              "actual": true
+            },
+            {
+              "case": "hidden_overflow_foreground_title",
+              "ok": true,
+              "actual": "微信"
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "samples": 10,
+        "success": 10,
+        "success_rate": 1.0,
+        "p50_ms": 2994.65,
+        "p95_ms": 3015.4,
+        "min_ms": 2975.2,
+        "max_ms": 3086.4
+      }
+    },
+    "browser_process": {
+      "runs": [
+        {
+          "round": 1,
+          "ok": true,
+          "duration_ms": 6650.1,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 576.1,
+              "browser_pid": 33652
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 263.2,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 36.6,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 42.8,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 181.9,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2010.3,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 2,
+          "ok": true,
+          "duration_ms": 6596.7,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 567.8,
+              "browser_pid": 25656
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 254.7,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 36.6,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 42.6,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 187.1,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2019.7,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 3,
+          "ok": true,
+          "duration_ms": 8666.7,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 581.3,
+              "browser_pid": 39096
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 256.8,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 36.8,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 43.9,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 197.3,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2014.4,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 4,
+          "ok": true,
+          "duration_ms": 6675.7,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 569.8,
+              "browser_pid": 8316
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 273.8,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 36.7,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 43.2,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 187.5,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2006.8,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 5,
+          "ok": true,
+          "duration_ms": 6623.9,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 566.8,
+              "browser_pid": 7000
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 266.5,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 36.5,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 42.6,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 179.1,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2017.7,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 6,
+          "ok": true,
+          "duration_ms": 6678.7,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 570.2,
+              "browser_pid": 32380
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 264.3,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 36.7,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 42.9,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 214.4,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2008.6,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 7,
+          "ok": true,
+          "duration_ms": 8656.8,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 558.9,
+              "browser_pid": 37968
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 253.1,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 35.2,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 45.7,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 179.1,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2009.0,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 8,
+          "ok": true,
+          "duration_ms": 6628.9,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 569.1,
+              "browser_pid": 3000
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 248.5,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 36.6,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 43.7,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 201.9,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2007.3,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 9,
+          "ok": true,
+          "duration_ms": 6638.2,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 566.0,
+              "browser_pid": 30476
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 247.3,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 36.8,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 43.8,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 192.3,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2005.2,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        },
+        {
+          "round": 10,
+          "ok": true,
+          "duration_ms": 6653.6,
+          "failures": [],
+          "cases": [
+            {
+              "case": "process_start",
+              "ok": true,
+              "ms": 580.5,
+              "browser_pid": 31636
+            },
+            {
+              "case": "process_navigate_observe",
+              "ok": true,
+              "ms": 254.3,
+              "title": "YCODE LOCAL AUDIT",
+              "surface_id": "page-1"
+            },
+            {
+              "case": "process_click_title_oracle",
+              "ok": true,
+              "ms": 33.8,
+              "title": "YCODE CLICKED 1"
+            },
+            {
+              "case": "process_unicode_title_oracle",
+              "ok": true,
+              "ms": 42.0,
+              "title": "YCODE INPUT 10"
+            },
+            {
+              "case": "process_navigation_title_oracle",
+              "ok": true,
+              "title": "YCODE SECOND"
+            },
+            {
+              "case": "process_clean_close_no_orphans",
+              "ok": true,
+              "close_ms": 189.4,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "stop_during_action_hard_stop",
+              "ok": true,
+              "close_ms": 2011.8,
+              "admission_reject_under_200ms": true,
+              "orphan_browser_processes": 0
+            },
+            {
+              "case": "profile_reusable_after_hard_stop",
+              "ok": true
+            }
+          ]
+        }
+      ],
+      "summary": {
+        "samples": 10,
+        "success": 10,
+        "success_rate": 1.0,
+        "p50_ms": 6651.85,
+        "p95_ms": 8656.8,
+        "min_ms": 6596.7,
+        "max_ms": 8666.7
+      }
+    }
+  }
+}

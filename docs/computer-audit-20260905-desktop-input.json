@@ -1,0 +1,8 @@
+[
+  {
+    "ok": false,
+    "error_type": "RuntimeError",
+    "error_code": "",
+    "error": "Test window lost foreground; refusing desktop input"
+  }
+]

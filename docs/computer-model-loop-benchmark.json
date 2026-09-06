@@ -1,0 +1,92 @@
+{
+  "steps": [
+    {
+      "model": "step-3.7-flash",
+      "action": "observe",
+      "error_code": "",
+      "error_message": "",
+      "attempted": "",
+      "provider_ms": 1265.3,
+      "duration_ms": 36.763,
+      "queue_ms": 0.001,
+      "input_ms": null,
+      "observe_ms": 36.706,
+      "screenshot_bytes": 8589
+    },
+    {
+      "model": "step-3.7-flash",
+      "action": "click",
+      "error_code": "",
+      "error_message": "",
+      "attempted": "",
+      "provider_ms": 2032.7,
+      "duration_ms": 37.445,
+      "queue_ms": 0.001,
+      "input_ms": 3.088,
+      "observe_ms": 34.299,
+      "screenshot_bytes": 10016
+    },
+    {
+      "model": "step-3.7-flash",
+      "action": "click",
+      "error_code": "",
+      "error_message": "",
+      "attempted": "",
+      "provider_ms": 1645.6,
+      "duration_ms": 29.944,
+      "queue_ms": 0.001,
+      "input_ms": 1.774,
+      "observe_ms": 28.119,
+      "screenshot_bytes": 10248
+    },
+    {
+      "model": "step-3.7-flash",
+      "action": "click",
+      "error_code": "",
+      "error_message": "",
+      "attempted": "",
+      "provider_ms": 2234.3,
+      "duration_ms": 32.995,
+      "queue_ms": 0.001,
+      "input_ms": 1.764,
+      "observe_ms": 31.183,
+      "screenshot_bytes": 10343
+    },
+    {
+      "model": "step-3.7-flash",
+      "action": "click",
+      "error_code": "",
+      "error_message": "",
+      "attempted": "",
+      "provider_ms": 2004.8,
+      "duration_ms": 34.501,
+      "queue_ms": 0.001,
+      "input_ms": 2.909,
+      "observe_ms": 31.538,
+      "screenshot_bytes": 10777
+    },
+    {
+      "model": "step-3.7-flash",
+      "action": "type_text",
+      "error_code": "",
+      "error_message": "",
+      "attempted": "",
+      "provider_ms": 2070.6,
+      "duration_ms": 38.089,
+      "queue_ms": 0.001,
+      "input_ms": 2.145,
+      "observe_ms": 35.874,
+      "screenshot_bytes": 11912
+    }
+  ],
+  "summary": {
+    "step_count": 6,
+    "total_ms": 14428.1,
+    "provider_ms": 14193.9,
+    "local_action_ms": 209.9,
+    "provider_share_percent": 98.5,
+    "final_text": "任务完成",
+    "task_done": true
+  },
+  "candidate_errors": []
+}

@@ -1,0 +1,26 @@
+[
+  {
+    "case": "matrix_setup",
+    "ok": true
+  },
+  {
+    "case": "multi_window_focus_follows_popup",
+    "ok": true,
+    "title": "YCODE MATRIX POPUP"
+  },
+  {
+    "case": "multi_window_focus_returns_to_main",
+    "ok": true,
+    "title": "YCODE MATRIX MAIN"
+  },
+  {
+    "case": "multi_window_click_lands_on_main",
+    "ok": true
+  },
+  {
+    "case": "background_tab_zero_misoperation",
+    "ok": true,
+    "observed_title": "YCODE CLICKED 1",
+    "background_tab_clicks": 0
+  }
+]

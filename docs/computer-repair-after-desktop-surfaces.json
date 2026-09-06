@@ -1,0 +1,63 @@
+[
+  {
+    "case": "list_surfaces_returns_candidates",
+    "ok": true,
+    "actual": {
+      "windows": 14,
+      "tray_icons": 32
+    }
+  },
+  {
+    "case": "wechat_candidate_found",
+    "ok": true,
+    "actual": [
+      " 微信",
+      " 微信游戏"
+    ]
+  },
+  {
+    "case": "restore_wechat_window_for_matrix",
+    "ok": true,
+    "actual": true
+  },
+  {
+    "case": "activate_wechat_window",
+    "ok": true,
+    "ref": "surface-6-window-24",
+    "actual": true
+  },
+  {
+    "case": "wechat_window_foreground_title",
+    "ok": true,
+    "actual": "微信"
+  },
+  {
+    "case": "wechat_window_hidden_to_tray",
+    "ok": true,
+    "actual": true
+  },
+  {
+    "case": "hidden_overflow_enumerated",
+    "ok": true,
+    "actual": 10
+  },
+  {
+    "case": "wechat_tray_candidate_selected",
+    "ok": true,
+    "actual": {
+      "source": "shell_tray_promoted",
+      "label": " 微信"
+    }
+  },
+  {
+    "case": "hidden_overflow_wechat_window_opened",
+    "ok": true,
+    "source": "shell_tray_promoted",
+    "actual": true
+  },
+  {
+    "case": "hidden_overflow_foreground_title",
+    "ok": true,
+    "actual": "微信"
+  }
+]
