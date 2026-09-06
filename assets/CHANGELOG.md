@@ -1,5 +1,10 @@
 # Y-CODE 更新日志
 
+## 1.2.22 (2026-09-06)
+
+- 修复中转站自定义 GPT-5 系模型一开聊就报「openai does not support parameters: ['tool_choice']」：litellm 对名字含 gpt-5 的未知 OpenAI 兼容模型（中转站/聚合网关自定义名，如 gpt-5.6-sol）在内置清单查不到 tool_choice 支持标记时按"不支持"保守回退，请求未发出即被客户端拒绝；现按 litellm 的真实触发条件精确识别（名字含 gpt-5 且不在其内置清单），仅对这类请求追加 allowed_openai_params 放行 tool_choice——不用全局 drop_params（那会把 reasoning_effort 等推理强度静默吞掉），官方 gpt-5、DeepSeek/GLM/Kimi 等其他路由的请求字节零变化（字节级 golden 回归锁定）
+- 修复检查更新误报「已是最新版本」：Gitee 在 API 创建 Release 后 /releases/latest 指针长期滞留旧版本（v1.2.21 发布后仍返回 v1.2.20，存量客户端全部判为无更新），更新检查改用 Release 列表接口取首位非预发布条目（列表接口始终准确，默认排序为旧在前、显式按创建时间倒序）；发布脚本在发布成功与补传附件后自动 PATCH 触碰 Release 刷新 latest 指针（必须携带 tag_name 否则 400），双保险确保新版本能被存量客户端发现
+
 ## 1.2.21 (2026-09-06)
 
 - 全新「电脑操控」能力（浏览器 + Windows 桌面）：在系统设置开启并选择具备资格的模型后，星瑶可以看屏幕、动鼠标键盘、操作真实应用——受控浏览器使用独立 profile（系统 Edge/Chrome 任选，登录态保留，绝不读取或干扰日常浏览器数据），桌面目标可对真实窗口注入输入；每步动作以真实截图为依据（截图仅短期本地存放、回合收尾自动折叠，绝不进日志），观察探针只读页面可见性/焦点状态、不读表单值与凭据；登录、验证码、支付类操作请在受控浏览器中手动完成；全局紧急停止热键 Ctrl+Alt+Esc 随时切断；支持通用视觉工具协议（generic）与 OpenAI 原生 Computer Use 协议（native_openai）两类模型
