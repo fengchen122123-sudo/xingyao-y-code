@@ -4560,6 +4560,21 @@ def _chat_with_model_generator(
                 "电脑操控 run 收尾失败（run=%s kind=%s）：%s",
                 computer_run_id, computer_exit_kind, error,
             )
+        # 截图清除（2026-09-06 提速计划 Task 6）：回合终结后该会话所有电脑操控
+        # 观察图立即折叠为占位符。provider_safety_required 的提前 return 不会
+        # 走到这里（run 仍存活，模型恢复后还需要最后一张图）。
+        try:
+            manager = app_context.get_manager()
+            fold_session = parent_session or app_context.get_current_session()
+            if manager is not None and fold_session:
+                folded = manager.fold_session_computer_media(str(fold_session))
+                if folded:
+                    logger.info(
+                        "已折叠会话 %s 的 %d 张电脑操控观察截图",
+                        fold_session, folded,
+                    )
+        except Exception:
+            logger.warning("折叠电脑操控观察截图失败（已忽略）", exc_info=True)
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
     pending_persistence = []
