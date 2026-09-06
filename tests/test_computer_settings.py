@@ -210,18 +210,18 @@ def test_snapshot_profile_path_uses_ycode_dir_string_safely(tmp_path, monkeypatc
 
 
 def _patch_no_explicit_installs(monkeypatch):
-    monkeypatch.setattr("core.computer.settings.os.path.isfile", lambda _p: False)
+    monkeypatch.setattr("core.computer.platforms.windows.os.path.isfile", lambda _p: False)
 
 
 def test_browser_detection_uses_which_and_explicit_paths(monkeypatch):
     edge_exe = r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
     chrome_exe = r"C:\tools\chrome\chrome.exe"
     monkeypatch.setattr(
-        "core.computer.settings.shutil.which",
+        "core.computer.platforms.windows.shutil.which",
         lambda name: chrome_exe if name == "chrome.exe" else None,
     )
     monkeypatch.setattr(
-        "core.computer.settings.os.path.isfile",
+        "core.computer.platforms.windows.os.path.isfile",
         lambda p: p == edge_exe,
     )
     options = {option.browser: option for option in list_browser_options(platform="win32")}
@@ -236,7 +236,7 @@ def test_browser_options_are_independent_and_never_fallback(tmp_path, monkeypatc
     use_temp_config(tmp_path, monkeypatch, {"computer_browser": "edge"})
     chrome_exe = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
     monkeypatch.setattr(
-        "core.computer.settings.shutil.which",
+        "core.computer.platforms.windows.shutil.which",
         lambda name: chrome_exe if name == "chrome.exe" else None,
     )
     _patch_no_explicit_installs(monkeypatch)
@@ -257,7 +257,7 @@ def test_browser_options_are_independent_and_never_fallback(tmp_path, monkeypatc
 
 def test_browser_option_to_dict_shape(monkeypatch):
     _patch_no_explicit_installs(monkeypatch)
-    monkeypatch.setattr("core.computer.settings.shutil.which", lambda _name: None)
+    monkeypatch.setattr("core.computer.platforms.windows.shutil.which", lambda _name: None)
     option = list_browser_options(platform="win32")[0].to_dict()
     assert set(option) == {"browser", "label", "available", "executable", "unavailable_reason"}
     assert option["available"] is False
