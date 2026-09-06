@@ -98,7 +98,7 @@ _FOLLOWUP_MESSAGES_KEY = "_ycode_followup_messages"
 # 一轮模型往返）。点击/输入/sequence 等有副作用动作不豁免：同参数重复点击可能
 # 造成重复发送；真死循环由 controller 的 no-progress 熔断（3 次画面不变停止）兜底。
 _REPEAT_GUARD_EXEMPT_COMPUTER_KINDS = frozenset(
-    {"observe", "scroll", "wait", "move", "list_surfaces"}
+    {"observe", "scroll", "wait", "move", "list_surfaces", "list_elements"}
 )
 
 
