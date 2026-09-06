@@ -31,20 +31,24 @@ _LOGGER = logging.getLogger(__name__)
 # follow-up 观察 user message 的固定说明文本（Task 9 brief 样例逐字）。
 OBSERVATION_FOLLOWUP_TEXT = "【电脑观察】请只依据这张最新截图决定下一步。"
 
-# 动态运行上下文里的电脑操控说明（设计 10.1 的七条语义；只在 capability
-# 决策为 enabled 时加入，绝不进 build_stable_system_message）。
+# 动态运行上下文里的电脑操控说明（通用化重构 Task E 的元素优先学说；只在
+# capability 决策为 enabled 时加入，绝不进 build_stable_system_message）。
 _GENERIC_DYNAMIC_PROMPT = (
     "电脑操控使用说明（generic 协议）：\n"
     "1. 第一次必须先调用 computer_action 的 observe 建立观察基线。\n"
-    "2. 每次只调用一个 computer_action，不得与其他工具混用；有把握的连续微动作"
-    "（点击→输入→按键等）用 kind=sequence 打包一次执行（中途不截图，完成后只返回"
-    "最终截图）；没把握时单独执行动作并逐次验证。\n"
-    "3. 每个动作后必须依据返回的最新截图决定下一步，不得猜测动作成功。\n"
-    "4. 坐标以最新截图左上角为 (0,0)。\n"
-    "5. 遇到登录、验证码或需要输入凭据时，改用 request_user_takeover 请求用户手动接管。\n"
-    "6. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。\n"
-    "7. 原生应用优先用 list_elements 拿控件列表，再以 click_element/set_value_element"
-    "按元素引用操作（中文写值不过输入法）；坐标点击只用于元素不可达的场景。"
+    "2. 原生应用窗口优先用 list_elements 拿控件列表：用 click_element 点击、"
+    "set_value_element 写输入框（中文直接写值不过输入法）；标注截图里的"
+    "编号（el-N）就是元素引用；只有元素不可达（自绘界面/远程/游戏）才退回"
+    "截图坐标点击。\n"
+    "3. 每次只调用一个 computer_action，不得与其他工具混用；有把握的连续微动作"
+    "（点击→输入→按键）用 kind=sequence 打包一次执行（中途不截图，完成后返回"
+    "标注截图）；没把握时单独执行并逐次验证。\n"
+    "4. 每个动作后依据最新观察决定下一步，不得猜测成功；观察里的"
+    "surface_generation 变化表示画面已切换，旧坐标与旧元素引用立即作废。\n"
+    "5. 出现焦点被抢、会话失活、窗口挪位时：先 list_elements 或 activate_surface"
+    "重建基线，严禁按记忆里的旧坐标连续重试。\n"
+    "6. 遇到登录、验证码或需要凭据时，改用 request_user_takeover 请求用户接管。\n"
+    "7. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。"
 )
 
 # Provider tool result 的稳定 JSON 序列化参数（设计 10.2）。
