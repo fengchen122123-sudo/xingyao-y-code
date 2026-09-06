@@ -1770,6 +1770,51 @@ class MemoryManager:
             folded += 1
         return folded
 
+    def fold_session_computer_media(self, session_id):
+        """回合收尾后折叠本会话全部电脑操控观察图（含最新一条）；幂等。
+
+        与 _fold_stale_media_locked 的区别：只处理带 _computer_v1 私有元数据的
+        user 消息 dict 形态，折叠其 content 内全部图片块（普通多模态消息与
+        _fold_stale_media_locked 的「保留最新一条」语义均不触碰——两者职责
+        互斥：前者保运行中滚动上下文，后者清回合结束后的全部截图）。
+        铁律：一次性、幂等、DB 层完成，改写后字节永久冻结。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT id, content FROM messages WHERE session_id = ? AND role = 'user' "
+                    "ORDER BY id ASC",
+                    (session_id,),
+                )
+                folded = 0
+                for msg_id, raw in cursor.fetchall():
+                    parsed, ok = _try_parse_json(raw)
+                    if not ok or not isinstance(parsed, dict) or "_computer_v1" not in parsed:
+                        continue
+                    blocks = parsed.get("content")
+                    if not isinstance(blocks, list) or not any(
+                        isinstance(b, dict) and b.get("type") in ("image", "image_url")
+                        for b in blocks
+                    ):
+                        continue  # 已折叠或本就无图：幂等跳过
+                    parsed["content"] = [
+                        {"type": "text", "text": _folded_media_text(b)}
+                        if isinstance(b, dict) and b.get("type") in ("image", "image_url")
+                        else b
+                        for b in blocks
+                    ]
+                    cursor.execute(
+                        "UPDATE messages SET content = ? WHERE id = ?",
+                        (json.dumps(parsed, ensure_ascii=False), msg_id),
+                    )
+                    folded += 1
+                self.conn.commit()
+                return folded
+            except Exception:
+                self.conn.rollback()
+                raise
+
     def iter_assistant_media_migration_rows(self):
         """媒体清单迁移候选行：无 media_v1 的 JSON dict 形态 assistant 消息。
 
