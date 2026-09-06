@@ -40,12 +40,17 @@ _ALLOWED = {
     # 批量微动作（2026-09-06 协议扩展）：一次调用串行执行多个基本输入动作，
     # 中途不截图，完成后只返回最终截图。
     "sequence": _COMMON | {"steps"},
+    # 阶段二（2026-09-06 协议扩展；desktop only）：UIA 元素观察与元素引用动作。
+    "list_elements": _COMMON,
+    "click_element": _COMMON | {"element_ref"},
+    "set_value_element": _COMMON | {"element_ref", "text"},
 }
 
 _TARGETS = ("browser", "desktop")
 _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
 _DESKTOP_ONLY_KINDS = frozenset(
-    {"list_surfaces", "activate_surface", "invoke_surface", "observe_region"}
+    {"list_surfaces", "activate_surface", "invoke_surface", "observe_region",
+     "list_elements", "click_element", "set_value_element"}
 )
 _BUTTONS = frozenset({"left", "right", "middle"})
 _REASON_CODES = frozenset({"login_required", "captcha_required", "credential_required"})
@@ -150,6 +155,11 @@ COMPUTER_ACTION_TOOL_SCHEMA = {
                 "reason_code": {"type": "string", "enum": sorted(_REASON_CODES)},
                 "surface_ref": {"type": "string"},
                 "surface_generation": {"type": "integer", "minimum": 0},
+                "element_ref": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "元素引用（来自最近一次 list_elements 返回的 ref）",
+                },
                 "steps": {
                     "type": "array",
                     "minItems": 1,
@@ -329,7 +339,7 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
         if "keys" in payload:
             kwargs["keys"] = _parse_keys(payload["keys"])
 
-    if kind == "type_text":
+    if kind in ("type_text", "set_value_element"):
         text = payload.get("text")
         if not isinstance(text, str) or not 1 <= len(text) <= MAX_TEXT_CODEPOINTS:
             raise _invalid(f"text 需要 1-{MAX_TEXT_CODEPOINTS} 个字符")
@@ -391,6 +401,12 @@ def parse_computer_action(payload: Mapping[str, object]) -> ComputerAction:
             steps.append(parse_computer_action(dict(item)))
         kwargs["steps"] = tuple(steps)
 
+    if kind in ("click_element", "set_value_element"):
+        ref = payload.get("element_ref")
+        if not isinstance(ref, str) or not ref:
+            raise _invalid(f"{kind} 需要非空 element_ref（来自最近一次 list_elements）")
+        kwargs["element_ref"] = ref
+
     return ComputerAction(**kwargs)
 
 
@@ -434,6 +450,8 @@ def sanitized_action_summary(action: ComputerAction) -> dict:
     if action.steps:
         summary["steps_count"] = len(action.steps)
         summary["steps"] = [sanitized_action_summary(step) for step in action.steps]
+    if action.element_ref:
+        summary["element_ref"] = action.element_ref
     return summary
 
 

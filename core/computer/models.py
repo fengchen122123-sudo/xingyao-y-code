@@ -73,6 +73,10 @@ class ComputerActionKind(str, Enum):
     OBSERVE_REGION = "observe_region"
     # 批量微动作（2026-09-06 协议扩展）：一次调用串行执行多个基本输入动作。
     SEQUENCE = "sequence"
+    # 阶段二（2026-09-06 协议扩展，desktop only）：UIA 元素观察与元素引用动作。
+    LIST_ELEMENTS = "list_elements"
+    CLICK_ELEMENT = "click_element"
+    SET_VALUE_ELEMENT = "set_value_element"
 
 
 class ComputerControlError(Exception):
@@ -124,6 +128,9 @@ class ComputerAction:
     # sequence 批量动作的子步骤（仅 kind="sequence" 非空；子项本身也是
     # 不可变 ComputerAction，kind 限定为无副作用定位的八种基本输入动作）。
     steps: tuple["ComputerAction", ...] = ()
+    # 阶段二元素引用动作（click_element/set_value_element）引用的控件 ref；
+    # 仅在最近一次 list_elements 后有效，普通动作恒为 None。
+    element_ref: str | None = None
 
 
 @dataclass(frozen=True)
@@ -165,6 +172,9 @@ class ComputerObservation:
     # 形状：ref/kind/label/bounds/operations/surface_generation）；仅本次
     # 观察有效，普通观察恒为空 tuple。
     surface_candidates: tuple = ()
+    # 阶段二：list_elements 观察携带的控件元素列表（dict：ref/kind/name/
+    # bounds/enabled）；与 surface_candidates 同一生命周期语义，普通观察恒空。
+    elements: tuple = ()
 
 
 @dataclass(frozen=True)

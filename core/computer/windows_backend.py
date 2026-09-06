@@ -49,6 +49,8 @@ _KEEP_SCREENSHOTS = 3
 # 剪贴板写入到 Ctrl+V 粘贴之间的小间隔：给目标窗口焦点线程让路（2026-09-06）。
 _CLIPBOARD_PASTE_DELAY_S = 0.05
 _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
+# 阶段二（2026-09-06）：UIA 元素观察与元素引用动作（desktop only）。
+_ELEMENT_KINDS = frozenset({"list_elements", "click_element", "set_value_element"})
 # R10：语义定位与局部观察动作（不做 surface 输入复核——它们自带 ref+代数校验）。
 _SEMANTIC_DESKTOP_KINDS = frozenset(
     {"list_surfaces", "activate_surface", "invoke_surface", "observe_region"}
@@ -131,6 +133,7 @@ class WindowsComputerBackend:
         *,
         screenshot_dir: Path | None = None,
         surface_locator=None,
+        element_locator=None,
     ) -> None:
         # 构造函数只校验参数，绝不截屏或触碰 Win32。
         if not callable(image_grab):
@@ -144,6 +147,7 @@ class WindowsComputerBackend:
         self._image_grab = image_grab
         self._adapter = win32_adapter
         self._surface_locator = surface_locator
+        self._element_locator = element_locator
         self._screenshot_dir = Path(screenshot_dir) if screenshot_dir is not None else None
         self._owns_screenshot_dir = screenshot_dir is None
         self._screenshot_counter = 0
@@ -156,6 +160,8 @@ class WindowsComputerBackend:
         self._last_observation: ComputerObservation | None = None
         # R10：语义定位的待发布候选/待观察区域与区域基线（ref, generation, bounds）。
         self._pending_surface_candidates: tuple = ()
+        # 阶段二：list_elements 待发布的控件元素列表（与候选同一取用-清空模式）。
+        self._pending_elements: tuple = ()
         self._pending_region: tuple | None = None
         self._region_baseline: tuple | None = None
         # R5：桌面 surface 签名 = (前台窗口身份, 虚拟桌面几何)；变化时代数递增，
@@ -191,6 +197,8 @@ class WindowsComputerBackend:
             )
             pending_candidates = self._pending_surface_candidates
             self._pending_surface_candidates = ()
+            pending_elements = self._pending_elements
+            self._pending_elements = ()
             pending_region = self._pending_region
             self._pending_region = None
             if pending_region is not None:
@@ -236,6 +244,7 @@ class WindowsComputerBackend:
                 surface_id=f"hwnd:{signature[0]}",
                 surface_generation=self._surface_generation,
                 surface_candidates=pending_candidates,
+                elements=pending_elements,
             )
             if pending_region is not None:
                 # 区域观察建立区域基线（候选 ref/代数/边界），供输入前失效复核。
@@ -275,6 +284,9 @@ class WindowsComputerBackend:
                         f"duration_ms 必须在 {MIN_WAIT_MS}-{MAX_WAIT_MS} 毫秒之间",
                     )
                 wait_duration = duration
+            elif kind in _ELEMENT_KINDS:
+                self._dispatch_element_locked(action)
+                return
             elif kind in _SEMANTIC_DESKTOP_KINDS:
                 self._dispatch_semantic_locked(action)
                 return
@@ -285,6 +297,33 @@ class WindowsComputerBackend:
         # R8：wait 在锁外分片等待，close 可收尾、停止可中断。
         if wait_duration is not None:
             self._wait_interruptible(wait_duration)
+
+    # ---------------- 阶段二：UIA 元素观察与元素引用动作 ----------------
+
+    def _dispatch_element_locked(self, action: ComputerAction) -> None:
+        """元素动作分发（调用方持有锁）：list_elements 纯观察不要求画面基线；
+        click_element/set_value_element 与普通输入动作一样要求当前画面基线（R5）。"""
+        locator = self._element_locator
+        if locator is None:
+            raise ComputerControlError(
+                "computer_elements_unavailable",
+                "当前桌面 backend 未提供 UIA 元素定位能力",
+            )
+        kind = action.kind
+        if kind == "list_elements":
+            hwnd = self._adapter.foreground_window_id()
+            self._pending_elements = tuple(locator.collect(hwnd))
+            return
+        self._require_current_surface_locked()
+        if kind == "click_element":
+            locator.click(action.element_ref)
+            return
+        # set_value_element
+        if not isinstance(action.text, str) or not action.text:
+            raise ComputerControlError(
+                "computer_invalid_action", "set_value_element 需要非空 text"
+            )
+        locator.set_value(action.element_ref, action.text)
 
     # ---------------- R10：语义定位与局部观察 ----------------
 
