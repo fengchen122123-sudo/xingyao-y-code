@@ -1322,15 +1322,16 @@ def test_repeat_blocked_record_is_model_visible_and_not_executed():
         None,
     )
 
+    from core.harness.tool_pipeline import REPEAT_CALL_BLOCKED_TEXT
+
+    assert executions == []
+
     assert executions == []
     assert records[0].message == {
         "role": "tool",
         "tool_call_id": "third",
         "name": "read_file",
-        "content": (
-            "🚨 相同工具调用已经成功执行过 2 次，本次调用未执行。"
-            "请检查已有结果或改变执行方案。"
-        ),
+        "content": REPEAT_CALL_BLOCKED_TEXT,
     }
 
 
@@ -1401,6 +1402,8 @@ def test_repeat_blocked_text_exact_and_no_result_comparison_claim():
     assert REPEAT_CALL_BLOCKED_TEXT == (
         "🚨 相同工具调用已经成功执行过 2 次，本次调用未执行。"
         "请检查已有结果或改变执行方案。"
+        "若该工具是 computer_action，窗口可能已移动，"
+        "请先 list_elements 或 observe 重建状态再操作。"
     )
     assert "结果未发生变化" not in REPEAT_CALL_BLOCKED_TEXT
 

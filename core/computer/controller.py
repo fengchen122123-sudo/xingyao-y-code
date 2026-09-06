@@ -691,6 +691,8 @@ class ComputerControlService:
 
             with self._lock:
                 before_fingerprint = run.last_fingerprint
+                # Task D：本步进入前的画面指纹基线（激活吞击判定用）。
+                previous_screen_sha256 = run.last_screen_sha256
                 run.action_count += 1
                 ordinal = run.action_count
                 run.current_action = action.kind
@@ -737,6 +739,29 @@ class ComputerControlService:
                 with self._lock:
                     # observe 返回后、预览发布与成功提交前复核取消。
                     self._raise_if_action_aborted_locked(run)
+                if (
+                    action.kind == "click"
+                    and observation.input_activated
+                    and previous_screen_sha256 == observation.screen_sha256
+                ):
+                    # Task D（P5）激活吞击自愈：click 提交后画面与点击前完全
+                    # 一致、且本步发生了前台切换——判定第一击被焦点切换吞掉。
+                    # 同一动作原样补击一次并重新观察，以第二次观察为准；仍计
+                    # 1 个 ordinal，补击前后同样复核取消（最多补击一次）。
+                    with self._lock:
+                        self._raise_if_action_aborted_locked(run)
+                    backend.execute(run_id, action)
+                    with self._lock:
+                        self._raise_if_action_aborted_locked(run)
+                    reobserve_started = time.perf_counter()
+                    try:
+                        observation = backend.observe(run_id)
+                    finally:
+                        observe_ms = (observe_ms or 0) + round(
+                            (time.perf_counter() - reobserve_started) * 1000, 3
+                        )
+                    with self._lock:
+                        self._raise_if_action_aborted_locked(run)
             except ComputerControlError as error:
                 if error.code in _SURFACE_ERROR_CODES:
                     # 受控画面已切换/无法唯一确定：旧坐标作废（R5），
