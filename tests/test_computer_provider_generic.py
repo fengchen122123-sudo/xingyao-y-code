@@ -51,7 +51,9 @@ def test_build_generic_dynamic_prompt_enabled_covers_all_seven_rules():
     text = build_generic_dynamic_prompt(GENERIC_CAPABILITY)
     # 设计 10.1 七条说明语义必须逐字可见
     assert "observe" in text
-    assert "只调用一个电脑动作" in text
+    # 2026-09-06 sequence 协议扩展：第 2 条改为"单个 computer_action + sequence 打包"
+    assert "kind=sequence" in text
+    assert "不得与其他工具混用" in text
     assert "最新截图" in text
     assert "(0,0)" in text
     assert "不得猜测动作成功" in text

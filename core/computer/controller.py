@@ -28,13 +28,16 @@
 from __future__ import annotations
 
 import logging
+import sys
 import threading
 import time
 import uuid
 from dataclasses import replace
+from pathlib import Path
 from typing import Callable
 
 from core.computer.models import (
+    BackendIdentity,
     ComputerBackend,
     ComputerCapability,
     ComputerControlError,
@@ -70,10 +73,43 @@ _TERMINAL_STATUSES = frozenset(
     }
 )
 
-# observe/wait 不预期改变界面，不计入无进展；request_user_takeover 由 controller
-# 处理、不进入 backend，也不计数（设计 14.4）。
-_NO_PROGRESS_EXEMPT_KINDS = frozenset({"observe", "wait", "request_user_takeover"})
+# R6 无进展规则：move/observe/wait 不预期改变界面，不计入无进展；
+# request_user_takeover 由 controller 处理、不进入 backend，也不计数（设计 14.4）。
+# R10：list_surfaces/observe_region 是观察类动作，同样不计数；
+# activate_surface 预期改变前台（参与计数，变化即归零）。
+_NO_PROGRESS_EXEMPT_KINDS = frozenset(
+    {"move", "observe", "wait", "request_user_takeover", "list_surfaces", "observe_region"}
+)
 _NO_PROGRESS_LIMIT = 3
+
+# R5：受控画面身份错误——出现后旧坐标作废，必须重新 observe 才能继续输入。
+_SURFACE_ERROR_CODES = frozenset(
+    {"computer_surface_changed", "computer_surface_ambiguous"}
+)
+
+
+def next_progress_state(
+    previous_key: tuple[str, str] | None,
+    current_key: tuple[str, str],
+    count: int,
+    kind: str,
+) -> tuple[tuple[str, str], int]:
+    """无进展计数纯函数（R6）。
+
+    1. 画面/有效目标状态改变：计数归零（不设为 1）并更新基线；
+    2. move/observe/wait/request_user_takeover 不增加失败计数；
+    3. 豁免动作观察到真实变化同样归零并更新基线（不留过期基线）；
+    4. 豁免动作且画面不变：保留既有失败次数（不得靠插入 observe 掩盖
+       重复失败）。
+
+    该机制只作“重复不变”限制，不宣称等价于任务语义成功；光标闪烁/时钟
+    造成的像素变化只更新基线，不声称业务完成。
+    """
+    if current_key != previous_key:
+        return current_key, 0
+    if kind in _NO_PROGRESS_EXEMPT_KINDS:
+        return current_key, count
+    return current_key, count + 1
 
 
 class _Run:
@@ -86,6 +122,7 @@ class _Run:
         self.requested_target = requested_target
         self.target: str | None = requested_target  # generic run 首次 observe 后绑定
         self.backend: ComputerBackend | None = None
+        self.backend_identity: BackendIdentity | None = None
         self.status = ComputerRunStatus.IDLE.value
         self.generation = capability.settings_generation
         self.started_at = time.time()
@@ -111,18 +148,34 @@ def _surface_fingerprint(observation: ComputerObservation) -> str:
     return observation.window_title
 
 
-def _default_backend_factory(target: str) -> ComputerBackend:
-    """生产 backend 构造：惰性导入，模块顶层不触碰 Playwright/PIL/Win32。"""
+def _default_backend_factory(target: str, identity: BackendIdentity) -> ComputerBackend:
+    """生产 backend 构造：惰性导入，模块顶层不触碰 Playwright/PIL/Win32。
+
+    browser/profile 一律取自 run 冻结的 ``identity``（R4），不再独立重读
+    全局设置——避免与 Turn 冻结能力中的 browser 不一致。
+    """
+    from core.computer.platforms import get_platform_adapter
+
+    if target not in ("browser", "desktop"):
+        raise ComputerControlError("computer_invalid_action", f"未知电脑操控目标：{target!r}")
+    adapter = get_platform_adapter()
+    if not adapter.supported:
+        raise ComputerControlError("computer_unsupported_os", adapter.unavailable_reason)
     if target == "browser":
         from core.computer.browser_backend import BrowserComputerBackend
-        from core.computer.settings import get_browser_profile_dir
 
-        settings = load_computer_settings()
-        profile_dir = get_browser_profile_dir(settings.computer_browser)
-        return BrowserComputerBackend(settings.computer_browser, profile_dir)
-    from core.computer.windows_backend import WindowsComputerBackend
-
-    return WindowsComputerBackend.create_default()
+        # R5：系统侧受控页裁决信号（窗口标题提示）由平台层提供；
+        # 平台未实现时 getattr 回落 None，backend 退化为 DOM 可见性裁决。
+        hint_provider = getattr(adapter, "browser_window_hints", None)
+        if hint_provider is not None and not callable(hint_provider):
+            hint_provider = None
+        return BrowserComputerBackend(
+            identity.browser,
+            Path(identity.profile_path),
+            window_hint_provider=hint_provider,
+            use_process_worker=True,
+        )
+    return adapter.create_desktop_backend()
 
 
 def _default_abort_streams(cancel_event) -> None:
@@ -158,7 +211,7 @@ class ComputerControlService:
     def __init__(
         self,
         *,
-        backend_factory: Callable[[str], ComputerBackend] | None = None,
+        backend_factory: Callable[[str, BackendIdentity], ComputerBackend] | None = None,
         settings_loader: Callable[[], object] | None = None,
         generation_provider: Callable[[], int] | None = None,
         abort_streams: Callable[[threading.Event], None] | None = None,
@@ -170,7 +223,7 @@ class ComputerControlService:
         self._lock = threading.RLock()
         self._action_lock = threading.Lock()
         self._run: _Run | None = None
-        self._retained: dict[str, ComputerBackend] = {}
+        self._retained: dict[str, tuple[BackendIdentity, ComputerBackend]] = {}
         self._listeners: list[Callable[[dict], None]] = []
         self._last_snapshot: ComputerRunSnapshot | None = None
         self._preview_publisher: Callable[[str, str], str] | None = None
@@ -202,21 +255,30 @@ class ComputerControlService:
         with self._lock:
             self._preview_publisher = publisher
 
-    def _emit(self, run: _Run, event_type: str, **fields) -> None:
+    def _build_event_locked(self, run: _Run, event_type: str, **fields) -> dict:
+        """状态锁内分配事件序号并构造事件（调用方必须持有状态锁）。"""
+        run.event_seq += 1
+        return {
+            "type": event_type,
+            "run_id": run.run_id,
+            "event_seq": run.event_seq,
+            **fields,
+        }
+
+    def _dispatch(self, event: dict) -> None:
+        """向 listener 派发事件；绝不在 Controller 状态锁内调用外部 listener。"""
         with self._lock:
-            run.event_seq += 1
-            event = {
-                "type": event_type,
-                "run_id": run.run_id,
-                "event_seq": run.event_seq,
-                **fields,
-            }
             listeners = list(self._listeners)
         for listener in listeners:
             try:
                 listener(event)
             except Exception:
                 _LOGGER.exception("电脑操控事件 listener 异常（已忽略）")
+
+    def _emit(self, run: _Run, event_type: str, **fields) -> None:
+        with self._lock:
+            event = self._build_event_locked(run, event_type, **fields)
+        self._dispatch(event)
 
     def _emit_state(self, run: _Run, reason: str = "") -> None:
         self._emit(
@@ -226,6 +288,27 @@ class ComputerControlService:
             target=run.target or "",
             reason=reason,
         )
+
+    @staticmethod
+    def _timing_fields(
+        received_at: float,
+        queue_ms: float,
+        input_ms: float | None,
+        wait_ms: float | None,
+        observe_ms: float | None,
+    ) -> dict:
+        """动作耗时字段（R9）：未发生的阶段不出现，绝不默认 0ms 伪装已测量。"""
+        fields: dict = {
+            "duration_ms": round((time.perf_counter() - received_at) * 1000, 3),
+            "queue_ms": queue_ms,
+        }
+        if input_ms is not None:
+            fields["input_ms"] = input_ms
+        if wait_ms is not None:
+            fields["wait_ms"] = wait_ms
+        if observe_ms is not None:
+            fields["observe_ms"] = observe_ms
+        return fields
 
     # ---------------- 状态机 ----------------
 
@@ -317,6 +400,25 @@ class ComputerControlService:
                 "暂停/接管恢复后旧坐标已作废，必须先观察（observe）刷新画面",
             )
 
+    def _raise_if_action_aborted_locked(self, run: _Run) -> None:
+        """动作执行中段/提交点复核（调用方必须持有状态锁）。
+
+        取消（owner.cancel_event）或失去执行权（run 被停止/终结）立即抛
+        computer_cancelled；暂停不撤销已开始的动作（设计 15.3：暂停只阻止
+        下一动作开始），PAUSED 仍允许当前动作完成并提交。
+        """
+        if run.owner.cancel_event.is_set():
+            raise ComputerControlError(
+                "computer_cancelled", "操控回合已取消"
+            )
+        if self._run is not run or run.status not in (
+            ComputerRunStatus.RUNNING.value,
+            ComputerRunStatus.PAUSED.value,
+        ):
+            raise ComputerControlError(
+                "computer_cancelled", "run 在动作执行期间已停止"
+            )
+
     def _generation_allowed_locked(
         self, run: _Run, effective_target: str | None = None
     ) -> tuple[bool, int]:
@@ -350,13 +452,63 @@ class ComputerControlService:
 
     # ---------------- backend 获取（含 retained 复用） ----------------
 
-    def _claim_backend(self, target: str) -> ComputerBackend:
+    def _resolve_backend_identity(
+        self, target: str, capability: ComputerCapability
+    ) -> BackendIdentity:
+        """按 run 冻结能力构造 backend 请求身份；profile 在本次领取时解析为规范绝对路径。"""
+        from core.computer.platforms import get_platform_adapter
+
+        if target == "browser":
+            from core.computer.settings import get_browser_profile_dir
+
+            browser = capability.browser
+            if browser not in ("edge", "chrome"):
+                raise ComputerControlError(
+                    "computer_invalid_config",
+                    f"能力快照缺少有效浏览器选择：{browser!r}",
+                )
+            profile_path = str(get_browser_profile_dir(browser))
+        else:
+            browser = ""
+            profile_path = ""
+        return BackendIdentity(
+            platform=get_platform_adapter().name,
+            target=target,
+            browser=browser,
+            profile_path=profile_path,
+        )
+
+    def _claim_backend(self, target: str, identity: BackendIdentity) -> ComputerBackend:
+        """领取 backend：留存实例必须身份完全相同且可复用，否则显式处理。
+
+        - 身份不匹配（配置变更生命周期）：显式关闭旧实例，确认清理后才创建
+          新配置指定实例；清理失败则本次启动失败，绝不静默丢弃旧对象；
+        - 身份相同但实例已不可复用（窗口被关闭/实例不健康/有未结束命令）：
+          明确失败，不暗中自动复活——重新打开是新一轮显式启动行为。
+        """
         with self._lock:
-            retained = self._retained.pop(target, None)
-        if retained is not None:
-            return retained
+            retained_entry = self._retained.pop(target, None)
+        if retained_entry is not None:
+            retained_identity, retained = retained_entry
+            if retained_identity != identity:
+                try:
+                    retained.close()
+                except Exception as error:
+                    raise ComputerControlError(
+                        "computer_cleanup_failed",
+                        f"关闭旧配置电脑操控实例失败：{error}",
+                    ) from error
+            elif retained.is_reusable():
+                return retained
+            else:
+                _close_backend_quietly(retained)
+                raise ComputerControlError(
+                    "computer_browser_closed",
+                    "留存的浏览器会话已不可复用（窗口已关闭或实例不健康），"
+                    "请停止后重新开始",
+                )
         try:
-            backend = self._backend_factory(target)
+            backend = self._backend_factory(target, identity)
             backend.start()
         except ComputerControlError:
             raise
@@ -413,7 +565,8 @@ class ComputerControlService:
         self._emit_state(run, reason="start")
         if target is not None:
             try:
-                backend = self._claim_backend(target)
+                identity = self._resolve_backend_identity(target, capability)
+                backend = self._claim_backend(target, identity)
             except Exception as error:
                 self._fail_run(run, error, "backend_start_failed")
                 raise
@@ -424,6 +577,7 @@ class ComputerControlService:
                 )
                 if run_alive:
                     run.backend = backend
+                    run.backend_identity = identity
                     self._transition(run, ComputerRunStatus.RUNNING.value)
             if not run_alive:
                 # run 在 backend 启动期间被停止：backend 从未挂到活动 run 上，
@@ -441,8 +595,15 @@ class ComputerControlService:
     def execute(
         self, run_id: str, owner: ComputerOwner, action
     ) -> ComputerObservation:
-        """执行一个动作并返回全新 observation；每个动作由单一 action_lock 串行。"""
+        """执行一个动作并返回全新 observation；每个动作由单一 action_lock 串行。
+
+        R9：动作计时全部为本地事件数据（monotonic/perf_counter），成功、失败、
+        取消都携带 duration_ms；queue/input/wait/observe 分段只在该阶段真实
+        发生时才出现（绝不默认 0ms 暗示瞬间完成），不进入 Provider 观察投影。
+        """
+        received_at = time.perf_counter()
         with self._action_lock:
+            queue_ms = round((time.perf_counter() - received_at) * 1000, 3)
             stop_for_settings = False
             with self._lock:
                 run = self._require_active_run_locked(run_id)
@@ -488,7 +649,10 @@ class ComputerControlService:
                     )
             if establishing:
                 try:
-                    backend = self._claim_backend(action.target)
+                    identity = self._resolve_backend_identity(
+                        action.target, run.capability
+                    )
+                    backend = self._claim_backend(action.target, identity)
                 except Exception as error:
                     self._fail_run(run, error, "backend_start_failed")
                     raise
@@ -508,6 +672,7 @@ class ComputerControlService:
                         else:
                             run.generation = current
                             run.backend = backend
+                            run.backend_identity = identity
                             run.target = action.target
                             backend_attached = True
                 if not backend_attached:
@@ -537,15 +702,48 @@ class ComputerControlService:
                 target=action.target,
             )
 
+            input_ms: float | None = None
+            wait_ms: float | None = None
+            observe_ms: float | None = None
             try:
                 if action.kind in ("observe", "request_user_takeover"):
                     # observe 的 fresh observation 即动作本身；
                     # request_user_takeover 由 controller 处理，不进入 backend。
                     pass
                 else:
-                    backend.execute(run_id, action)
-                observation = backend.observe(run_id)
+                    input_started = time.perf_counter()
+                    try:
+                        # sequence（2026-09-06 协议扩展）：子步骤串行执行，每步前
+                        # 复核取消；中途绝不 observe（模型只拿最终一张截图），
+                        # 整体计 1 个 ordinal 并参与无进展计数。
+                        steps = action.steps if action.kind == "sequence" else (action,)
+                        for step in steps:
+                            with self._lock:
+                                self._raise_if_action_aborted_locked(run)
+                            backend.execute(run_id, step)
+                    finally:
+                        input_ms = round((time.perf_counter() - input_started) * 1000, 3)
+                        if action.kind == "wait":
+                            # 显式等待阶段单列；不把条件等待混进输入耗时。
+                            wait_ms = input_ms
+                with self._lock:
+                    # backend 输入返回后、开始可能耗时的 observe 前复核取消。
+                    self._raise_if_action_aborted_locked(run)
+                observe_started = time.perf_counter()
+                try:
+                    observation = backend.observe(run_id)
+                finally:
+                    observe_ms = round((time.perf_counter() - observe_started) * 1000, 3)
+                with self._lock:
+                    # observe 返回后、预览发布与成功提交前复核取消。
+                    self._raise_if_action_aborted_locked(run)
             except ComputerControlError as error:
+                if error.code in _SURFACE_ERROR_CODES:
+                    # 受控画面已切换/无法唯一确定：旧坐标作废（R5），
+                    # 后续动作必须先 observe，不得继续按旧坐标输入。
+                    with self._lock:
+                        if self._run is run:
+                            run.require_observe = True
                 self._emit(
                     run,
                     "computer_action_finished",
@@ -553,6 +751,9 @@ class ComputerControlService:
                     action_kind=action.kind,
                     ok=False,
                     error_code=error.code,
+                    **self._timing_fields(
+                        received_at, queue_ms, input_ms, wait_ms, observe_ms
+                    ),
                 )
                 raise
             except Exception as error:
@@ -563,6 +764,9 @@ class ComputerControlService:
                     action_kind=action.kind,
                     ok=False,
                     error_code="computer_backend_error",
+                    **self._timing_fields(
+                        received_at, queue_ms, input_ms, wait_ms, observe_ms
+                    ),
                 )
                 raise ComputerControlError(
                     "computer_backend_error", f"电脑操控 backend 异常：{error}"
@@ -587,78 +791,106 @@ class ComputerControlService:
                 if published_url:
                     observation = replace(observation, preview_url=published_url)
             no_progress_hit = False
+            commit_failure: ComputerControlError | None = None
+            finished_event: dict | None = None
+            observation_event: dict | None = None
             with self._lock:
-                # 动作后二次确认：关闭设置后旧动作不得提交成功
-                if self._run is not run or run.status != ComputerRunStatus.RUNNING.value:
-                    raise ComputerControlError(
-                        "computer_cancelled", "run 在动作执行期间已停止"
+                # 成功提交点（R1）：取消/run 执行权/状态/generation 复核、状态
+                # 更新与成功事件序号分配在同一临界区完成。取消先于提交则不发布
+                # 任何成功结果；提交先完成、随后取消则保留此前已成功动作。
+                try:
+                    self._raise_if_action_aborted_locked(run)
+                except ComputerControlError as error:
+                    commit_failure = error
+                if commit_failure is None:
+                    allowed, current = self._generation_allowed_locked(run)
+                    if allowed:
+                        run.generation = current
+                    else:
+                        stop_for_settings = True
+                if commit_failure is None and not stop_for_settings:
+                    run.last_fingerprint = after_fingerprint
+                    run.last_screen_sha256 = observation.screen_sha256
+                    run.current_surface = (
+                        observation.page_origin or observation.window_title
                     )
-                allowed, current = self._generation_allowed_locked(run)
-                if allowed:
-                    run.generation = current
-                else:
-                    stop_for_settings = True
-            if stop_for_settings:
-                self.stop(run_id, "settings_disabled")
-                raise ComputerControlError(
-                    "computer_disabled", "电脑操控开关已关闭，run 已停止"
-                )
-            with self._lock:
-                run.last_fingerprint = after_fingerprint
-                run.last_screen_sha256 = observation.screen_sha256
-                run.current_surface = (
-                    observation.page_origin or observation.window_title
-                )
-                run.preview_url = observation.preview_url
-                run.require_observe = False
-                key = (observation.screen_sha256, after_fingerprint)
-                if action.kind in _NO_PROGRESS_EXEMPT_KINDS:
-                    if run.last_progress_key is None:
-                        run.last_progress_key = key
-                elif key == run.last_progress_key:
-                    run.no_progress_count += 1
-                    run.last_progress_key = key
-                else:
-                    run.no_progress_count = 1
-                    run.last_progress_key = key
-                no_progress_hit = run.no_progress_count >= _NO_PROGRESS_LIMIT
+                    run.preview_url = observation.preview_url
+                    run.require_observe = False
+                    key = (observation.screen_sha256, after_fingerprint)
+                    run.last_progress_key, run.no_progress_count = next_progress_state(
+                        run.last_progress_key, key, run.no_progress_count, action.kind
+                    )
+                    no_progress_hit = run.no_progress_count >= _NO_PROGRESS_LIMIT
+                    if no_progress_hit:
+                        finished_event = self._build_event_locked(
+                            run,
+                            "computer_action_finished",
+                            action_ordinal=ordinal,
+                            action_kind=action.kind,
+                            ok=False,
+                            error_code="computer_no_progress",
+                            **self._timing_fields(
+                                received_at, queue_ms, input_ms, wait_ms, observe_ms
+                            ),
+                        )
+                    else:
+                        finished_event = self._build_event_locked(
+                            run,
+                            "computer_action_finished",
+                            action_ordinal=ordinal,
+                            action_kind=action.kind,
+                            ok=True,
+                            error_code="",
+                            **self._timing_fields(
+                                received_at, queue_ms, input_ms, wait_ms, observe_ms
+                            ),
+                        )
+                        observation_event = self._build_event_locked(
+                            run,
+                            "computer_observation",
+                            action_ordinal=ordinal,
+                            target=observation.target,
+                            screen_sha256=observation.screen_sha256,
+                            width=observation.width,
+                            height=observation.height,
+                            origin_or_window=(
+                                observation.page_origin or observation.window_title
+                            ),
+                            preview_url=observation.preview_url,
+                            surface_id=observation.surface_id,
+                            surface_generation=observation.surface_generation,
+                        )
 
-            if no_progress_hit:
+            if commit_failure is not None:
+                # 取消先于提交：恰好一条 finished(ok=False)，零成功事件、
+                # 零新观察 follow-up（generic 结果回填走既有稳定错误结构）。
                 self._emit(
                     run,
                     "computer_action_finished",
                     action_ordinal=ordinal,
                     action_kind=action.kind,
                     ok=False,
-                    error_code="computer_no_progress",
+                    error_code=commit_failure.code,
+                    **self._timing_fields(
+                        received_at, queue_ms, input_ms, wait_ms, observe_ms
+                    ),
                 )
+                raise commit_failure
+            if stop_for_settings:
+                self.stop(run_id, "settings_disabled")
+                raise ComputerControlError(
+                    "computer_disabled", "电脑操控开关已关闭，run 已停止"
+                )
+            if no_progress_hit:
+                self._dispatch(finished_event)
                 self.stop(run_id, "no_progress")
                 raise ComputerControlError(
                     "computer_no_progress",
                     f"连续 {_NO_PROGRESS_LIMIT} 次动作后截图与活动指纹完全不变，已停止电脑操控",
                 )
 
-            self._emit(
-                run,
-                "computer_action_finished",
-                action_ordinal=ordinal,
-                action_kind=action.kind,
-                ok=True,
-                error_code="",
-            )
-            self._emit(
-                run,
-                "computer_observation",
-                action_ordinal=ordinal,
-                target=observation.target,
-                screen_sha256=observation.screen_sha256,
-                width=observation.width,
-                height=observation.height,
-                origin_or_window=(
-                    observation.page_origin or observation.window_title
-                ),
-                preview_url=observation.preview_url,
-            )
+            self._dispatch(finished_event)
+            self._dispatch(observation_event)
 
             if action.kind == "request_user_takeover":
                 with self._lock:
@@ -735,18 +967,25 @@ class ComputerControlService:
         retain = (
             retain_browser_session and run.target == "browser" and backend is not None
         )
+        # 有未结束 worker/不健康/已封闭的实例不得进入 retained（R2/R4）：
+        # 不可复用时按不留存路径关闭。
+        if retain and not backend.is_reusable():
+            retain = False
         first_error = None
-        if backend is not None and not retain:
+        if backend is not None:
+            # 留存复用也必须先释放按下状态（R3）：retain 不等于残留修饰键/
+            # 鼠标键进入下一 run；仅 desktop/不留存路径额外 close。
             try:
                 backend.release_inputs()
             except Exception as error:
                 first_error = first_error or error
                 _LOGGER.exception("complete_run 释放电脑操控输入失败")
-            try:
-                backend.close()
-            except Exception as error:
-                first_error = first_error or error
-                _LOGGER.exception("complete_run 关闭电脑操控 backend 失败")
+            if not retain:
+                try:
+                    backend.close()
+                except Exception as error:
+                    first_error = first_error or error
+                    _LOGGER.exception("complete_run 关闭电脑操控 backend 失败")
         with self._lock:
             if self._run is run:
                 if first_error is not None:
@@ -757,7 +996,7 @@ class ComputerControlService:
                 else:
                     self._transition(run, ComputerRunStatus.COMPLETED.value)
                     if retain:
-                        self._retained[run.target] = backend
+                        self._retained[run.target] = (run.backend_identity, backend)
                 self._finalize_locked(run)
         self._emit_state(
             run, reason="complete" if first_error is None else "cleanup_failed"
@@ -794,7 +1033,7 @@ class ComputerControlService:
                         exc_info=True,
                     )
             with self._lock:
-                retained = list(self._retained.values())
+                retained = [entry[1] for entry in self._retained.values()]
                 self._retained.clear()
             for backend in retained:
                 _close_backend_quietly(backend)
