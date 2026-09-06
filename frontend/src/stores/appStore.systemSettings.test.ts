@@ -35,6 +35,7 @@ const settings = {
   computer_platform_supported: true,
   computer_hotkey_available: true,
   computer_hotkey: 'Ctrl+Alt+Esc',
+  computer_active_model_capability: { model: '', eligible: false },
   computer_run: {
     run_id: '',
     owner_session_id: '',

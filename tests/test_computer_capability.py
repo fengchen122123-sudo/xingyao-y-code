@@ -47,15 +47,24 @@ def test_unset_protocol_auto_enables_generic_for_vision_function_models(enabled_
 
 
 @pytest.mark.parametrize("model", [
-    {"supports_vision": True},
-    {"supports_function_calling": True},
+    {"supports_function_calling": True},                     # 缺视觉声明 → 拒绝
+    {"supports_function_calling": False, "supports_vision": True},  # 工具调用显式关闭 → 拒绝（逃生门）
     {},
 ])
-def test_unset_protocol_auto_still_requires_vision_and_function_calling(model, enabled_settings):
-    """缺省协议自动判定同样要求视觉与工具调用双勾，缺任一即拒绝。"""
+def test_unset_protocol_auto_requires_vision_declared(model, enabled_settings):
+    """缺省协议自动判定（2026-09-05 修订）：视觉必须显式声明；工具调用未声明
+    视为支持（Agent 模型本就靠工具调用驱动），显式 False 才是拒绝理由。"""
     capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is False
     assert capability.error_code == "computer_model_not_capable"
+
+
+def test_unset_protocol_auto_enables_with_vision_and_undeclared_tools(enabled_settings):
+    """视觉已声明、工具调用未声明（None/缺键）→ 自动启用 generic。"""
+    for model in ({"supports_vision": True}, {"supports_vision": True, "supports_function_calling": None}):
+        capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
+        assert capability.enabled is True
+        assert capability.protocol == "generic"
 
 
 def test_explicit_none_stays_disabled_even_with_vision_and_function_calling(enabled_settings):
@@ -104,24 +113,30 @@ def test_non_windows_platform_is_rejected(enabled_settings):
     assert capability.error_code == "computer_unsupported_os"
 
 
-def test_legacy_model_without_function_calling_field_stays_disabled(enabled_settings):
-    """旧配置缺 supports_function_calling：普通对话/工具不受影响，但不得获得电脑操控资格。"""
+def test_legacy_model_without_function_calling_field_gets_capability(enabled_settings):
+    """旧配置缺 supports_function_calling（2026-09-05 修订）：未声明视为支持，
+    视觉已声明的旧模型获得 generic 资格；显式 False 才被拒绝。"""
     model = {"supports_vision": True, "computer_protocol": "generic"}
     capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
-    assert capability.enabled is False
-    assert capability.error_code == "computer_model_not_capable"
+    assert capability.enabled is True
+    assert capability.protocol == "generic"
+    rejected = resolve_computer_capability(
+        {"supports_vision": True, "supports_function_calling": False, "computer_protocol": "generic"},
+        openai_compatible_provider(), enabled_settings, "local",
+    )
+    assert rejected.enabled is False
+    assert rejected.error_code == "computer_model_not_capable"
 
 
 @pytest.mark.parametrize("model", [
     {},
-    {"name": "deepseek-v4-flash-vision-exp", "supports_vision": True},
     {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "none"},
     {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "auto"},
 ])
 def test_missing_or_unknown_protocol_is_never_capable(model, enabled_settings):
     """未知 computer_protocol 字符串一律不获得资格；缺省键的自动判定见上方
-    test_unset_protocol_auto_* 组（用户裁决：视觉+工具调用双勾即自动 generic）。
-    resolver 绝不按模型名猜测。"""
+    test_unset_protocol_auto_* 组（用户裁决 2026-09-05 修订：视觉声明 +
+    工具调用默认支持即自动 generic）。resolver 绝不按模型名猜测。"""
     capability = resolve_computer_capability(model, openai_compatible_provider(), enabled_settings, "local")
     assert capability.enabled is False
     assert capability.error_code == "computer_model_not_capable"

@@ -143,6 +143,14 @@ export interface SystemSettingsSnapshot {
   computer_hotkey_available: boolean;
   computer_hotkey: string;
   computer_run: ComputerRunSnapshot;
+  // 当前活动模型的电脑操控资格（与 Turn 起点同一判定函数的只读展示）
+  computer_active_model_capability: {
+    model: string;
+    eligible: boolean;
+    protocol?: string;
+    error_code?: string;
+    reason?: string;
+  };
 }
 
 // 电脑操控三个严格 setter 的统一返回形状（Task 12）：
@@ -202,6 +210,12 @@ export interface ComputerActionFinishedEvent extends ComputerEventBase {
   // 契约扩展位：后端可能补发脱敏摘要/耗时（brief ComputerActionTrace 字段）
   summary?: string;
   duration_ms?: number;
+  // R9 生产实测分段（仅本地事件数据）：queue/input/wait/observe 缺省表示
+  // 该阶段未发生（“未测量”），绝不以 0ms 伪装瞬间完成
+  queue_ms?: number;
+  input_ms?: number;
+  wait_ms?: number;
+  observe_ms?: number;
   [key: string]: unknown;
 }
 
@@ -215,6 +229,10 @@ export interface ComputerObservationEvent extends ComputerEventBase {
   origin_or_window?: string;
   // 只带 "/computer-preview/" 开头的 loopback token URL，无截图内容
   preview_url?: string;
+  // R5 受控画面本地身份：browser 为 "page-N"，desktop 为 "hwnd:<句柄>"；
+  // generation 在受控页/前台窗口/几何变化时递增（仅本地展示用）
+  surface_id?: string;
+  surface_generation?: number;
   [key: string]: unknown;
 }
 

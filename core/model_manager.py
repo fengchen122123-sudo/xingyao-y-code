@@ -42,10 +42,12 @@ def _normalize_computer_protocol(value):
 
 
 def _validate_computer_combination(supports_vision, supports_function_calling, computer_protocol):
-    """generic 必须同时具备视觉与工具调用能力，否则保存即拒绝。"""
-    if computer_protocol == "generic" and not (supports_vision and supports_function_calling):
+    """generic 要求视觉显式声明且工具调用未被显式关闭（同日修订 2026-09-05：
+    工具调用未声明视为支持——Agent 里的模型本就靠 function calling 驱动；
+    False 是用户主动排除的逃生门），否则保存即拒绝。"""
+    if computer_protocol == "generic" and not (supports_vision and supports_function_calling is not False):
         raise ValueError(
-            "computer_protocol=generic 要求同时声明 supports_vision 与 supports_function_calling"
+            "computer_protocol=generic 要求声明 supports_vision，且 supports_function_calling 未被显式关闭"
         )
 
 
