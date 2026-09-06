@@ -1430,6 +1430,8 @@ git commit -m "test(computer): 阶段二元素动作协议重基线 prompt 黄�
 
 ## 阶段三：微信高级插件（仿 wxauto-mcp）
 
+> **⚠️ 2026-09-06 用户裁决：本阶段取消，不实施。** 原因：微信自动化有账号风险，用户决定不做微信插件。原 Task 14 作废；微信场景的提速完全依赖阶段一（sequence 批量 + 中文剪贴板输入）与阶段二（list_elements / click_element / set_value_element 内核协议能力）——这两者是通用电脑操控能力，无插件分发与目标应用绑定的额外风险。以下原始设计仅存档，不执行。
+
 ### Task 14: plugins/wechat_tool 插件
 
 **Files:**

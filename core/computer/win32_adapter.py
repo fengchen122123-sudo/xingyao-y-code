@@ -164,6 +164,49 @@ class _INPUT(ctypes.Structure):
 
 # ---------------- 默认 seam 实现（只在生产路径惰性触碰 windll） ----------------
 
+_CF_UNICODETEXT = 13
+_GMEM_MOVEABLE = 0x0002
+
+
+def _ctypes_set_clipboard_text(text: str) -> None:
+    """默认剪贴板写入：CF_UNICODETEXT；剪贴板被占用时短暂重试后失败。
+
+    只在 type_text 非 ASCII 路径惰性触碰 windll；不恢复用户原剪贴板内容
+    （恢复无可靠事务语义，与业界 RPA 实现一致）。
+    """
+    import time as _time
+
+    user32 = ctypes.windll.user32
+    kernel32 = ctypes.windll.kernel32
+    data = text.encode("utf-16-le") + b"\x00\x00"
+    for _attempt in range(10):
+        if user32.OpenClipboard(0):
+            try:
+                kernel32.EmptyClipboard()
+                handle = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
+                if not handle:
+                    raise OSError("GlobalAlloc 失败")
+                pointer = kernel32.GlobalLock(handle)
+                if not pointer:
+                    raise OSError("GlobalLock 失败")
+                try:
+                    ctypes.memmove(pointer, data, len(data))
+                finally:
+                    kernel32.GlobalUnlock(handle)
+                if not kernel32.SetClipboardData(_CF_UNICODETEXT, handle):
+                    raise OSError("SetClipboardData 失败")
+                return
+            except OSError as error:
+                raise ComputerControlError(
+                    "computer_backend_error", f"写入剪贴板失败：{error}"
+                )
+            finally:
+                user32.CloseClipboard()
+        _time.sleep(0.03)
+    raise ComputerControlError(
+        "computer_backend_error", "打开剪贴板失败（被其他进程长期占用）"
+    )
+
 
 def _ctypes_send_input(events: list) -> int:
     """默认 SendInput：把事件描述符转换为 INPUT 数组，返回成功注入的数量。"""
@@ -302,6 +345,7 @@ class Win32InputAdapter:
         get_window_title: Callable[[int], str] | None = None,
         get_system_metrics: Callable[[int], int] | None = None,
         hotkey_check: Callable[[], bool] | None = None,
+        set_clipboard_text: Callable[[str], None] | None = None,
     ) -> None:
         self._send_input = send_input if send_input is not None else _ctypes_send_input
         if platform is None:
@@ -331,6 +375,9 @@ class Win32InputAdapter:
         )
         self._hotkey_check = (
             hotkey_check if hotkey_check is not None else _default_hotkey_probe
+        )
+        self._set_clipboard = (
+            set_clipboard_text if set_clipboard_text is not None else _ctypes_set_clipboard_text
         )
         self._pressed_keys: list[str] = []
         self._pressed_buttons: set[str] = set()
@@ -398,6 +445,14 @@ class Win32InputAdapter:
             return ""
         title = self._get_window_title(hwnd)
         return title if isinstance(title, str) else ""
+
+    def foreground_window_id(self) -> int:
+        """前台窗口本地稳定标识（HWND 整数值）；无前台窗口返回 0。
+
+        只用于本地 surface 身份比对（R5），不进入 Provider 消息或 Journal。
+        """
+        hwnd = self._get_foreground_window()
+        return int(hwnd) if hwnd else 0
 
     # ---------------- 底层发送与部分失败恢复 ----------------
 
@@ -515,6 +570,19 @@ class Win32InputAdapter:
                     ]
                 )
 
+    def set_clipboard_text(self, text: str) -> None:
+        """把 Unicode 文本写入系统剪贴板，供 type_text 中文剪贴板路径使用。"""
+        if not isinstance(text, str) or not text:
+            raise ComputerControlError("computer_invalid_action", "剪贴板文本必须非空")
+        try:
+            self._set_clipboard(text)
+        except ComputerControlError:
+            raise
+        except OSError as error:
+            raise ComputerControlError(
+                "computer_backend_error", f"写入剪贴板失败：{error}"
+            ) from error
+
     def send_mouse(
         self,
         *,
@@ -579,10 +647,13 @@ class Win32InputAdapter:
         elif action == "wheel":
             if type(delta) is not int:
                 raise ComputerControlError("computer_invalid_action", "wheel delta 必须是整数")
-            self._deliver([MouseEventDescriptor(0, 0, MOUSEEVENTF_WHEEL, delta * WHEEL_DELTA)])
+            # R7 统一契约：delta 为逻辑滚轮步进，正值向下；Win32
+            # MOUSEEVENTF_WHEEL 正值表示滚轮远离用户（内容向上），故取反。
+            self._deliver([MouseEventDescriptor(0, 0, MOUSEEVENTF_WHEEL, -delta * WHEEL_DELTA)])
         elif action == "hwheel":
             if type(delta) is not int:
                 raise ComputerControlError("computer_invalid_action", "hwheel delta 必须是整数")
+            # R7：逻辑步进正值向右，与 Win32 MOUSEEVENTF_HWHEEL 正方向一致。
             self._deliver([MouseEventDescriptor(0, 0, MOUSEEVENTF_HWHEEL, delta * WHEEL_DELTA)])
         elif action == "drag":
             self._drag(path, button, down_flag, up_flag)
