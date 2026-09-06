@@ -232,6 +232,24 @@ def _session_from_turn_id(turn_id: str) -> str:
     return value.rsplit(":", 1)[0] if ":" in value else ""
 
 
+def _gui_may_raise_window() -> bool:
+    """电脑操控焦点礼让守卫（通用化重构 Task F'）。
+
+    任何会把 ycode 主窗口提到前台/置顶的调用点都必须先经过本守卫：电脑操控
+    run 处于 running/paused/waiting_for_user 时返回 False（礼让被控窗口，
+    防止操控期间抢焦点），其余状态返回 True。controller 不可用时按可提升
+    处理（fail-open：操控关闭时 GUI 行为完全不变）。惰性导入铁律：
+    core.computer 只在函数内导入。
+    """
+    try:
+        from core.computer.controller import get_computer_control_service
+
+        status = str(get_computer_control_service().snapshot().status or "")
+    except Exception:
+        return True
+    return status not in ("running", "paused", "waiting_for_user")
+
+
 def _ensure_session_model_binding(memory, session_name: str, model_id, workdir: str) -> None:
     """先创建会话，仅初始化空绑定；已有值可能是用户刚做的新选择。"""
     memory.ensure_session(session_name, workdir=workdir, source="GUI")
