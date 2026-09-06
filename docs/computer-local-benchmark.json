@@ -1,0 +1,63 @@
+{
+  "environment": {
+    "os": "Windows-11-10.0.26200-SP0",
+    "cpu": {
+      "model": "Intel64 Family 6 Model 198 Stepping 2, GenuineIntel",
+      "logical": 20,
+      "physical": 20
+    },
+    "physical_memory_bytes": 33656565760,
+    "screen_physical": {
+      "width": 3840,
+      "height": 2160
+    },
+    "dpi": 144,
+    "browser": "edge",
+    "browser_version": {
+      "error": "'Playwright' object has no attribute 'edge'"
+    }
+  },
+  "browser": {
+    "cold_start": {
+      "samples": 20,
+      "p50_ms": 557.912,
+      "p95_ms": 568.074,
+      "min_ms": 550.931,
+      "max_ms": 1693.218
+    },
+    "hot_click": {
+      "samples": 20,
+      "p50_ms": 1.2655,
+      "p95_ms": 2.345,
+      "min_ms": 0.873,
+      "max_ms": 5.631,
+      "errors": []
+    },
+    "hot_observe": {
+      "samples": 20,
+      "p50_ms": 31.320999999999998,
+      "p95_ms": 37.179,
+      "min_ms": 30.083,
+      "max_ms": 193.933,
+      "errors": []
+    }
+  },
+  "desktop": {
+    "start": {
+      "samples": 20,
+      "p50_ms": 68.7375,
+      "p95_ms": 70.294,
+      "min_ms": 67.055,
+      "max_ms": 86.321,
+      "errors": []
+    },
+    "observe": {
+      "samples": 20,
+      "p50_ms": 167.4995,
+      "p95_ms": 172.785,
+      "min_ms": 161.726,
+      "max_ms": 188.305,
+      "errors": []
+    }
+  }
+}
