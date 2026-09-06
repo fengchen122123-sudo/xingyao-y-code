@@ -256,10 +256,12 @@ class EditImageTest(unittest.TestCase):
 class PluginMetadataTest(unittest.TestCase):
     """插件默认关闭 + 注册的两个工具权限元数据正确。"""
 
-    def test_plugin_json_disabled_by_default(self):
+    def test_plugin_json_enabled_by_deliberate_enable(self):
+        # 初始提交为默认关闭（40f2d7d），随后 135877e 明确"启用 tokenrhythm_image
+        # 插件"——启用是主动决策，本测试随之更新期望，而不是反过来改插件。
         with open(os.path.join(_PLUGIN_DIR, "plugin.json"), "r", encoding="utf-8") as f:
             meta = json.load(f)
-        self.assertIs(meta.get("enabled"), False)
+        self.assertIs(meta.get("enabled"), True)
         self.assertEqual(meta.get("name"), "tokenrhythm_image")
 
     def test_register_two_tools_with_permission(self):
