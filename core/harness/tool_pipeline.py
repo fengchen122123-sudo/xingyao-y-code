@@ -58,6 +58,7 @@ _plan_turn_started_at: dict[str, float] = {}
 REPEAT_CALL_BLOCKED_TEXT = (
     "🚨 相同工具调用已经成功执行过 2 次，本次调用未执行。"
     "请检查已有结果或改变执行方案。"
+    "若该工具是 computer_action，窗口可能已移动，请先 list_elements 或 observe 重建状态再操作。"
 )
 
 # 旧子 Agent 执行租约 fencing：超时/取消/失败后，旧子代理的延迟工具调用
