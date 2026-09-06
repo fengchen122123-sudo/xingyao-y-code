@@ -178,11 +178,27 @@ def _ctypes_set_clipboard_text(text: str) -> None:
 
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
+    # 64 位下 windll 默认 restype 是 32 位 int，会把 GlobalAlloc/SetClipboardData
+    # 返回的指针宽度句柄截断（会话 156 实测 GlobalLock 失败），必须显式签名。
+    kernel32.GlobalAlloc.restype = ctypes.c_void_p
+    kernel32.GlobalAlloc.argtypes = (wintypes.UINT, ctypes.c_size_t)
+    kernel32.GlobalLock.restype = ctypes.c_void_p
+    kernel32.GlobalLock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalUnlock.argtypes = (ctypes.c_void_p,)
+    kernel32.GlobalFree.argtypes = (ctypes.c_void_p,)
+    # SetClipboardData 与 OpenClipboard/EmptyClipboard/CloseClipboard 一样
+    # 属于 user32；kernel32 只承担 Global* 内存管理。
+    user32.SetClipboardData.restype = ctypes.c_void_p
+    user32.SetClipboardData.argtypes = (wintypes.UINT, ctypes.c_void_p)
+    user32.OpenClipboard.argtypes = (wintypes.HWND,)
     data = text.encode("utf-16-le") + b"\x00\x00"
     for _attempt in range(10):
         if user32.OpenClipboard(0):
+            handle = None
             try:
-                kernel32.EmptyClipboard()
+                # EmptyClipboard 属于 user32（winuser.h）；kernel32 只有
+                # GlobalAlloc/GlobalLock/GlobalUnlock/SetClipboardData。
+                user32.EmptyClipboard()
                 handle = kernel32.GlobalAlloc(_GMEM_MOVEABLE, len(data))
                 if not handle:
                     raise OSError("GlobalAlloc 失败")
@@ -193,10 +209,17 @@ def _ctypes_set_clipboard_text(text: str) -> None:
                     ctypes.memmove(pointer, data, len(data))
                 finally:
                     kernel32.GlobalUnlock(handle)
-                if not kernel32.SetClipboardData(_CF_UNICODETEXT, handle):
+                if not user32.SetClipboardData(_CF_UNICODETEXT, handle):
                     raise OSError("SetClipboardData 失败")
-                return
-            except OSError as error:
+                return  # 成功后句柄归系统所有，不得 GlobalFree
+            except Exception as error:
+                # ctypes 函数查找失败抛 AttributeError 而非 OSError
+                #（会话 156 实测），统一归一为稳定领域错误。
+                if handle:
+                    try:
+                        kernel32.GlobalFree(handle)
+                    except Exception:
+                        pass
                 raise ComputerControlError(
                     "computer_backend_error", f"写入剪贴板失败：{error}"
                 )
