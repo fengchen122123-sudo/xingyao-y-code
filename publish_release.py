@@ -270,6 +270,19 @@ def delete_release(token, release_id):
     )
 
 
+def touch_release(token, release_id, tag, name, body):
+    """PATCH 触碰 Release，触发 Gitee 重算 /releases/latest 指针。
+
+    实测 Gitee 在 API 创建 Release 后该指针会滞留在旧版本，而存量客户端
+    的更新器恰好只请求该接口。PATCH 必须携带 tag_name，否则 400；body
+    追加换行形成真实变更（SHA256 行解析不受影响）。
+    """
+    return _api_request(
+        f"/repos/{GITEE_REPO}/releases/{release_id}", token, method="PATCH",
+        data={"tag_name": tag, "name": name, "body": body + "\n"},
+    )
+
+
 def upload_attachment(token, release_id, filepath, retries=3):
     """上传单个附件；Gitee 附件接口字段名为 file，失败时回退 files。
 
@@ -584,6 +597,11 @@ def main():
                 print(f"   - {name}: {err}")
             sys.exit(1)
         print(f"🎉 补传完成，Release {tag} 附件齐全。")
+        try:
+            touch_release(token, release_id, tag, f"Y-CODE v{version}", body)
+            print("✔ 已触碰 Release，latest 指针已刷新")
+        except Exception as e:
+            print(f"⚠ 触碰 Release 失败（latest 指针可能滞留旧版，可网页端手动编辑一次）：{e}")
         print(f"👉 https://gitee.com/{GITEE_REPO}/releases/tag/{tag}")
         return
 
@@ -630,6 +648,14 @@ def main():
     print(f"🎉 发布成功！{ok}/{total} 个附件全部上传。")
     print(f"👉 Release 页面: https://gitee.com/{GITEE_REPO}/releases/tag/{tag}")
     print("ℹ 老版本应用内『检查更新』即可自动下载分卷拼接并校验安装。")
+
+    # Gitee latest 指针不会因 API 创建 Release 而自动刷新，存量客户端的
+    # 更新检查会因此看不到新版本：发布成功后触碰一次触发重算。
+    try:
+        touch_release(token, release_id, tag, f"Y-CODE v{version}", body)
+        print("✔ 已触碰 Release，latest 指针已刷新")
+    except Exception as e:
+        print(f"⚠ 触碰 Release 失败（latest 指针可能滞留旧版，可网页端手动编辑一次）：{e}")
 
     # 发布成功后按需清理旧版本附件（仅 --cleanup 显式开启）：
     # 默认不清理，旧版本由维护者手动在网页端删除

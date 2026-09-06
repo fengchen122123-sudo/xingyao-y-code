@@ -201,11 +201,14 @@ def cleanup_old_installers() -> int:
 def fetch_latest_release(
     repo: str = GITEE_REPO, timeout: float = 8.0
 ) -> Dict[str, Any]:
-    """查询 Gitee Releases 最新版本信息。
+    """查询 Gitee Releases 最新版本信息（列表接口取首位非预发布条目）。
 
-    若 Gitee 尚未创建 Release 或返回 404，安全返回 has_update: False。
+    不用 /releases/latest：实测 Gitee 在 API 创建 Release 后该指针可能
+    长期滞留旧版本（PATCH 触碰 Release 才重算），而列表首位始终是最新
+    创建的条目。若 Gitee 尚无 Release（空列表或 404），安全返回
+    has_update: False。
     """
-    url = f"https://gitee.com/api/v5/repos/{repo}/releases/latest"
+    url = f"https://gitee.com/api/v5/repos/{repo}/releases?per_page=5&direction=desc"
     req = urllib.request.Request(
         url,
         headers={
@@ -244,6 +247,37 @@ def fetch_latest_release(
             "current_version": YCODE_VERSION,
             "msg": f"网络连接超时或失败: {e}",
         }
+
+    if not isinstance(data, list):
+        logger.warning("Gitee Releases 列表返回非数组: %s", type(data).__name__)
+        return {
+            "ok": False,
+            "has_update": False,
+            "latest_version": YCODE_VERSION,
+            "current_version": YCODE_VERSION,
+            "msg": "检查更新失败: 响应格式异常",
+        }
+    # 跳过预发布条目；tag 为空的脏数据同样忽略
+    entry = next(
+        (
+            item
+            for item in data
+            if isinstance(item, dict)
+            and str(item.get("tag_name") or "").strip()
+            and not item.get("prerelease")
+        ),
+        None,
+    )
+    if entry is None:
+        # 空列表（仓库尚无 Release）与 404 同语义
+        return {
+            "ok": True,
+            "has_update": False,
+            "latest_version": YCODE_VERSION,
+            "current_version": YCODE_VERSION,
+            "msg": "当前已是最新版本（暂无更新发布）",
+        }
+    data = entry
 
     raw_tag = data.get("tag_name") or ""
     # 清洗 tag 中的版本号（如 'v1.2.6' -> '1.2.6'）
