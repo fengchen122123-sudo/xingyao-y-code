@@ -32,24 +32,37 @@ class WindowsElementLocator:
         self._lock = threading.Lock()
         self._elements: dict[str, object] = {}
         self._closed = False
+        self._real = None
         if collect_fn is not None:
             # 测试注入路径：com_host 仅为兼容签名占位。
             self._collect_fn = collect_fn
             self._click_fn = click_fn
             self._set_value_fn = set_value_fn
-            self._real = None
+            self._needs_real = False
         else:
-            from core.computer.platforms.windows_elements_uia import RealUIAHost
+            # 生产路径惰性启动（通用化重构 Task A）：构造绝不触碰 COM——
+            # 首次 collect/click/set_value 才创建 RealUIAHost（专用 COM 线程）。
+            self._collect_fn = None
+            self._click_fn = None
+            self._set_value_fn = None
+            self._needs_real = True
 
-            self._real = RealUIAHost()
-            self._collect_fn = self._real.collect
-            self._click_fn = self._real.click
-            self._set_value_fn = self._real.set_value
+    def _ensure_real_locked(self) -> None:
+        """首次真实调用时惰性构造 RealUIAHost（调用方必须持有锁）。"""
+        if not self._needs_real or self._real is not None:
+            return
+        from core.computer.platforms.windows_elements_uia import RealUIAHost
+
+        self._real = RealUIAHost()
+        self._collect_fn = self._real.collect
+        self._click_fn = self._real.click
+        self._set_value_fn = self._real.set_value
 
     def collect(self, hwnd: int) -> list[dict]:
         """收集前台窗口可交互控件列表，并替换既有 ref 全集（旧 ref 即刻过期）。"""
         with self._lock:
             self._require_open()
+            self._ensure_real_locked()
             listing, elements = self._collect_fn(int(hwnd))
             self._elements = elements
             return listing
@@ -57,11 +70,13 @@ class WindowsElementLocator:
     def click(self, ref: str) -> None:
         with self._lock:
             self._require_open()
+            self._ensure_real_locked()
             self._click_fn(ref)
 
     def set_value(self, ref: str, text: str) -> None:
         with self._lock:
             self._require_open()
+            self._ensure_real_locked()
             self._set_value_fn(ref, text)
 
     def close(self) -> None:
