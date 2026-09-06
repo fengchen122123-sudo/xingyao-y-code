@@ -257,14 +257,17 @@ def test_scroll_uses_wheel_and_hwheel():
     assert adapter.hwheels == [2]
 
 
-def test_type_text_routes_unicode_text_to_adapter():
+def test_type_text_routes_unicode_text_to_clipboard():
+    # 2026-09-06 行为变更：非 ASCII 文本改走剪贴板 + Ctrl+V（提速计划 Task 4）。
     adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1920, 1080))
     backend = WindowsComputerBackend(
         image_grab=lambda: FakeImage(1920, 1080), win32_adapter=adapter
     )
     backend.observe("run-a")
     backend.execute("run-a", ComputerAction(kind="type_text", target="desktop", text="你好"))
-    assert adapter.texts == ["你好"]
+    assert adapter.clipboard_writes == ["你好"]
+    assert ("CTRL", "V") in [tuple(k) for k in adapter.keys_sent]
+    assert adapter.texts == []
 
 
 def test_double_click_sends_distinct_double_click():
@@ -389,13 +392,26 @@ def test_mouse_move_rechecks_virtual_desktop_bounds_before_sendinput():
 
 
 def test_wheel_and_hwheel_use_wheel_delta_units():
+    """R7：逻辑步进正值向下/向右；Win32 垂直滚轮正值=远离用户（向上），取反。"""
     captured = []
     adapter = Win32InputAdapter(send_input=_capture_send_input(captured))
     adapter.send_mouse(action="wheel", delta=-3)
     adapter.send_mouse(action="hwheel", delta=2)
     assert captured == [
-        MouseEventDescriptor(x=0, y=0, flags=MOUSEEVENTF_WHEEL, data=-360),
+        MouseEventDescriptor(x=0, y=0, flags=MOUSEEVENTF_WHEEL, data=360),
         MouseEventDescriptor(x=0, y=0, flags=MOUSEEVENTF_HWHEEL, data=240),
+    ]
+
+
+def test_wheel_positive_delta_maps_to_negative_wheel_data():
+    """R7 方向对照：+1 步进（向下）→ Win32 垂直 wheelData -120；水平 +1 → +120。"""
+    captured = []
+    adapter = Win32InputAdapter(send_input=_capture_send_input(captured))
+    adapter.send_mouse(action="wheel", delta=1)
+    adapter.send_mouse(action="hwheel", delta=1)
+    assert captured == [
+        MouseEventDescriptor(x=0, y=0, flags=MOUSEEVENTF_WHEEL, data=-120),
+        MouseEventDescriptor(x=0, y=0, flags=MOUSEEVENTF_HWHEEL, data=120),
     ]
 
 
@@ -763,3 +779,108 @@ def test_foreground_window_declares_pointer_restype(monkeypatch):
 
     assert win32_adapter._ctypes_foreground_window() == 0x1AB2CD3EF456  # 64 位不截断
     assert user32.GetForegroundWindow.restype == ctypes.c_void_p
+
+
+# ---------------------------------------------------------------------------
+# R5：桌面前台窗口身份与几何代数（旧坐标失效）
+# ---------------------------------------------------------------------------
+
+
+def test_desktop_foreground_change_between_actions_rejects_stale_input():
+    """观察后用户切到其他软件：输入前身份复核失败，零输入并显式报错。"""
+    image = FakeImage(width=1280, height=720)
+    adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720), foreground_id=1001)
+    backend = WindowsComputerBackend(image_grab=lambda: image, win32_adapter=adapter)
+    observation = backend.observe("run-a")
+    assert observation.surface_id == "hwnd:1001"
+    adapter.foreground_id = 2002  # 用户切到另一个前台窗口
+    adapter.foreground_title = "Other App"
+    with pytest.raises(ComputerControlError) as raised:
+        backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=10, y=10))
+    assert raised.value.code == "computer_surface_changed"
+    assert adapter.clicks == []
+    # 键盘输入同样被拒绝（前台身份不一致）。
+    with pytest.raises(ComputerControlError) as raised_keys:
+        backend.execute("run-a", ComputerAction(kind="keypress", target="desktop", keys=("ENTER",)))
+    assert raised_keys.value.code == "computer_surface_changed"
+    assert adapter.keys_sent == []
+    # 重新观察后基线刷新，输入恢复。
+    refreshed = backend.observe("run-a")
+    assert refreshed.surface_id == "hwnd:2002"
+    assert refreshed.surface_generation > observation.surface_generation
+    backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=10, y=10))
+    assert adapter.clicks == [(10, 10, "left")]
+
+
+def test_desktop_geometry_change_invalidates_stale_coordinates():
+    """分辨率/多屏几何变化：surface 代数递增，旧坐标输入被拒绝。"""
+    image = FakeImage(width=1280, height=720)
+    adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(image_grab=lambda: image, win32_adapter=adapter)
+    observation = backend.observe("run-a")
+    adapter.virtual_rect = (-1920, 0, 3840, 2160)  # 显示器配置改变
+    with pytest.raises(ComputerControlError) as raised:
+        backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=10, y=10))
+    assert raised.value.code == "computer_surface_changed"
+    assert adapter.clicks == []
+
+
+def test_desktop_same_surface_input_allowed_and_wait_unchecked():
+    """签名一致时输入正常；wait 不做 surface 复核。"""
+    image = FakeImage(width=1280, height=720)
+    adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(image_grab=lambda: image, win32_adapter=adapter)
+    backend.observe("run-a")
+    backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=100, y=100))
+    backend.execute("run-a", ComputerAction(kind="type_text", target="desktop", text="你好"))
+    assert adapter.clicks == [(100, 100, "left")]
+    assert adapter.clipboard_writes == ["你好"]  # 2026-09-06：非 ASCII 走剪贴板
+
+
+def test_desktop_scroll_rejects_pixel_unit_and_out_of_range():
+    """R7：桌面滚动仅 wheel_step；像素单位、超限、两轴为零全部零执行拒绝。"""
+    adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1920, 1080))
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1920, 1080), win32_adapter=adapter
+    )
+    backend.observe("run-a")
+    for action in (
+        ComputerAction(kind="scroll", target="desktop", delta_y=1, unit="css_pixel"),
+        ComputerAction(kind="scroll", target="desktop", delta_y=11),
+        ComputerAction(kind="scroll", target="desktop", delta_x=0, delta_y=0),
+    ):
+        with pytest.raises(ComputerControlError) as raised:
+            backend.execute("run-a", action)
+        assert raised.value.code == "computer_invalid_action"
+    assert adapter.wheels == [] and adapter.hwheels == []
+
+
+def test_desktop_wait_is_interruptible_and_close_not_blocked():
+    """R8：桌面 wait 不持大锁睡满时长；close 可收尾且等待以取消收尾。"""
+    import threading
+    import time
+
+    image = FakeImage(width=1280, height=720)
+    adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(image_grab=lambda: image, win32_adapter=adapter)
+    backend.observe("run-a")
+    outcome = []
+
+    def wait_action():
+        try:
+            backend.execute(
+                "run-a", ComputerAction(kind="wait", target="desktop", duration_ms=10_000)
+            )
+            outcome.append("completed")
+        except ComputerControlError as error:
+            outcome.append(error.code)
+
+    waiter = threading.Thread(target=wait_action, daemon=True)
+    waiter.start()
+    time.sleep(0.1)  # 让 waiter 进入分片等待
+    started = time.monotonic()
+    backend.close()  # 不得被进行中的 wait 阻塞
+    assert time.monotonic() - started < 3
+    waiter.join(timeout=3)
+    assert not waiter.is_alive(), "close 后桌面显式等待仍悬挂"
+    assert outcome == ["computer_cancelled"]
