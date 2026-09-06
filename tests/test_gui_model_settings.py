@@ -284,7 +284,7 @@ def test_generic_protocol_requires_vision_and_function_calling(tmp_path, monkeyp
 
     assert result["ok"] is False
     assert result["msg"] == (
-        "computer_protocol=generic 要求同时声明 supports_vision 与 supports_function_calling"
+        "computer_protocol=generic 要求声明 supports_vision，且 supports_function_calling 未被显式关闭"
     )
     stored = json.loads(cfg.read_text(encoding="utf-8"))
     assert "computer_protocol" not in stored["providers"][0]["models"][0]
