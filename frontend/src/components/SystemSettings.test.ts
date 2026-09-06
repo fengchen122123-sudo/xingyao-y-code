@@ -31,6 +31,9 @@ const computerSettings = {
   computer_platform_supported: true,
   computer_hotkey_available: true,
   computer_hotkey: 'Ctrl+Alt+Esc',
+  computer_active_model_capability: {
+    model: 'glm-5.3-flash', eligible: true, protocol: 'generic', error_code: '', reason: '',
+  },
   computer_run: {
     run_id: '', owner_session_id: '', owner_turn_id: '', status: 'idle', target: '',
     browser: '', model_name: '', protocol: 'none', started_at: 0, action_count: 0,
@@ -283,5 +286,50 @@ describe('SystemSettings', () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+describe('computer active model capability hint', () => {
+  function mountWith(overrides: Record<string, unknown>) {
+    setActivePinia(createPinia());
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...computerSettings,
+      ...overrides,
+    } as typeof store.systemSettings;
+    return mount(SystemSettings);
+  }
+
+  it('shows actionable hint when switches on but model ineligible', () => {
+    const wrapper = mountWith({
+      browser_control_enabled: true,
+      computer_active_model_capability: {
+        model: 'glm-5.3-flash', eligible: false,
+        error_code: 'computer_model_not_capable',
+        reason: '模型未声明视觉与工具调用能力（电脑操控要求两者齐备）',
+      },
+    });
+    const hint = wrapper.get('[data-test="computer-model-capability-hint"]');
+    expect(hint.text()).toContain('glm-5.3-flash');
+    expect(hint.text()).toContain('不具备电脑操控资格');
+    expect(hint.text()).toContain('视觉');
+    expect(hint.classes()).toContain('blocked');
+  });
+
+  it('shows eligible summary when switches on and model qualifies', () => {
+    const wrapper = mountWith({ browser_control_enabled: true });
+    const hint = wrapper.get('[data-test="computer-model-capability-hint"]');
+    expect(hint.text()).toContain('已具备电脑操控资格');
+    expect(hint.classes()).not.toContain('blocked');
+  });
+
+  it('hides the hint when both switches are off', () => {
+    const wrapper = mountWith({});
+    expect(wrapper.find('[data-test="computer-model-capability-hint"]').exists()).toBe(false);
   });
 });

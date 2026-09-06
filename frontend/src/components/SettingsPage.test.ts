@@ -171,7 +171,7 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="model-computer-protocol"]').setValue('generic');
 
     expect(wrapper.get('[data-test="model-computer-protocol-error"]').text()).toBe(
-      'computer_protocol=generic 要求同时声明 supports_vision 与 supports_function_calling',
+      'computer_protocol=generic 要求声明 supports_vision，且 supports_function_calling 未被显式关闭',
     );
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 

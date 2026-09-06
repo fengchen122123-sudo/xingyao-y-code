@@ -528,14 +528,15 @@ def test_add_model_persists_explicit_computer_capability(tmp_path, monkeypatch):
     {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "auto"},
     {"supports_vision": True, "supports_function_calling": True, "computer_protocol": 1},
     {"supports_vision": True, "supports_function_calling": False, "computer_protocol": "generic"},
-    {"supports_vision": True, "computer_protocol": "generic"},
     {"supports_function_calling": True, "computer_protocol": "generic"},
 ], ids=[
     "fc-int", "fc-str", "proto-unknown", "proto-non-str",
-    "generic-no-fc", "generic-missing-fc", "generic-missing-vision",
+    "generic-no-fc", "generic-missing-vision",
 ])
 def test_add_model_rejects_invalid_computer_capability(tmp_path, monkeypatch, kwargs):
-    """非严格 bool、集合外协议值、缺能力的 generic 组合保存即拒绝且不落盘。"""
+    """非严格 bool、集合外协议值、缺能力的 generic 组合保存即拒绝且不落盘。
+    2026-09-05 修订：generic 缺 supports_function_calling 不再拒绝
+    （未声明视为支持；显式 False 才拒绝——见 generic-no-fc）。"""
     cfg = _use_tmp_config(tmp_path, monkeypatch, _provider_config())
     before = cfg.read_bytes()
 
@@ -545,6 +546,20 @@ def test_add_model_rejects_invalid_computer_capability(tmp_path, monkeypatch, kw
     assert cfg.read_bytes() == before
     models = model_manager.load_config()["providers"][0]["models"]
     assert all(m["name"] != "bad-model" for m in models)
+
+
+def test_add_model_generic_accepts_vision_with_undeclared_function_calling(tmp_path, monkeypatch):
+    """2026-09-05 修订：视觉声明 + 工具调用未声明的 generic 组合可保存。"""
+    _use_tmp_config(tmp_path, monkeypatch, _provider_config())
+    model_manager.add_model_to_provider(
+        "p1", "vision-undeclared-fc", 128000,
+        supports_vision=True, computer_protocol="generic",
+    )
+    model = next(
+        m for m in model_manager.load_config()["providers"][0]["models"]
+        if m["name"] == "vision-undeclared-fc"
+    )
+    assert model["computer_protocol"] == "generic"
 
 
 def test_update_model_preserves_computer_capability_when_not_passed(tmp_path, monkeypatch):

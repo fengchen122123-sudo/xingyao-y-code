@@ -430,3 +430,72 @@ def test_embedded_terminal_uses_the_selected_interpreter(tmp_path, monkeypatch):
     assert calls[0][0][0] == "echo hi"
     assert calls[0][1]["shell"] is True
     assert calls[0][1]["executable"] == executable
+
+
+def test_system_settings_include_active_model_computer_capability(monkeypatch, tmp_path):
+    """设置负载携带活动模型电脑操控资格（与 Turn 起点同一判定函数）。"""
+    from tests.computer_fakes import use_temp_config
+    import core.computer.settings as computer_settings
+    from core.computer.capability import resolve_computer_capability
+
+    use_temp_config(tmp_path, monkeypatch, {
+        "active_model_id": "m1",
+        "providers": [{
+            "protocol": "openai", "base_url": "https://example.test/v1",
+            "api_key": "k",
+            "models": [{
+                "id": "m1", "name": "test-vision-model", "litellm_model": "openai/t-v",
+                "supports_vision": True, "supports_function_calling": True,
+            }],
+        }],
+    })
+    monkeypatch.setattr(
+        computer_settings, "list_browser_options", lambda platform=None: ()
+    )
+
+    from core import command_shell
+
+    payload = command_shell.get_system_settings()
+    hint = payload["computer_active_model_capability"]
+    assert hint["model"] == "test-vision-model"
+    # 开关默认关闭 → 不合格原因是未开启开关，而不是模型缺能力
+    assert hint["eligible"] is False
+    assert hint["error_code"] == "computer_disabled"
+
+    # 打开开关后模型合格
+    config_data = {
+        "active_model_id": "m1",
+        "browser_control_enabled": True,
+        "computer_control_enabled": True,
+        "computer_browser": "edge",
+        "providers": [{
+            "protocol": "openai", "base_url": "https://example.test/v1",
+            "api_key": "k",
+            "models": [{
+                "id": "m1", "name": "test-vision-model", "litellm_model": "openai/t-v",
+                "supports_vision": True, "supports_function_calling": True,
+            }],
+        }],
+    }
+    (tmp_path / "b").mkdir()
+    use_temp_config(tmp_path / "b", monkeypatch, config_data)
+    payload = command_shell.get_system_settings()
+    hint = payload["computer_active_model_capability"]
+    assert hint["eligible"] is True
+    assert hint["protocol"] == "generic"
+
+
+def test_system_settings_capability_hint_fail_closed_when_model_missing(monkeypatch, tmp_path):
+    """未选择模型/模型缺能力：提示不合格且不拖垮设置页。"""
+    from tests.computer_fakes import use_temp_config
+    import core.computer.settings as computer_settings
+
+    use_temp_config(tmp_path, monkeypatch, {"providers": []})
+    monkeypatch.setattr(
+        computer_settings, "list_browser_options", lambda platform=None: ()
+    )
+    from core import command_shell
+
+    hint = command_shell.get_system_settings()["computer_active_model_capability"]
+    assert hint["eligible"] is False
+    assert hint["reason"]

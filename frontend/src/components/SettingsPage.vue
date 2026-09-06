@@ -485,7 +485,7 @@
         </label>
         <label class="vision-choice">
           <input v-model="modelModal.supports_function_calling" data-test="model-supports-function-calling" type="checkbox" />
-          <span><b>是否支持工具调用</b><small>启用后模型可调用函数工具；电脑操控要求同时开启多模态（视觉识图）与本项</small></span>
+          <span><b>是否支持工具调用</b><small>默认视为支持（Agent 模型本就以工具调用驱动）；显式关闭会把该模型排除在电脑操控之外。电脑操控还要求开启多模态（视觉识图）</small></span>
         </label>
         <label class="field-label">电脑操控协议</label>
         <select v-model="modelModal.computer_protocol" data-test="model-computer-protocol" class="text-field">
@@ -494,7 +494,7 @@
           <option value="generic">通用视觉工具协议（generic）</option>
           <option value="native_openai">OpenAI 原生 Computer Use（native_openai）</option>
         </select>
-        <p class="modal-field-hint">电脑操控要求模型支持视觉（识图）与工具调用；选「自动」时，两项能力都勾选的模型在开关开启后即可直接操控。</p>
+        <p class="modal-field-hint">电脑操控要求模型支持视觉（识图）；工具调用默认视为支持（显式关闭的模型除外）。选「自动」时，视觉已勾选的模型在开关开启后即可直接操控。</p>
         <p v-if="computerProtocolError" data-test="model-computer-protocol-error" class="modal-field-error">
           {{ computerProtocolError }}
         </p>
@@ -593,12 +593,13 @@ const modelModal = reactive({
   computer_protocol: '' as ComputerProtocolChoice,
 });
 
-// 与后端 model_manager._validate_computer_combination 同一校验原因（Task 12）
-const COMPUTER_PROTOCOL_GENERIC_REASON = 'computer_protocol=generic 要求同时声明 supports_vision 与 supports_function_calling';
+// 与后端 model_manager._validate_computer_combination 同一校验原因（Task 12，
+// 2026-09-05 修订：工具调用未声明视为支持，显式关闭才是拒绝理由）
+const COMPUTER_PROTOCOL_GENERIC_REASON = 'computer_protocol=generic 要求声明 supports_vision，且 supports_function_calling 未被显式关闭';
 
 const computerProtocolError = computed(() => (
   modelModal.computer_protocol === 'generic'
-  && !(modelModal.supports_vision && modelModal.supports_function_calling)
+  && !(modelModal.supports_vision && modelModal.supports_function_calling !== false)
 )
   ? COMPUTER_PROTOCOL_GENERIC_REASON
   : '');

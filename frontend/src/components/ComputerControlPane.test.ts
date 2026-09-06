@@ -69,6 +69,25 @@ it('renders trace rows newest first without raw input text', () => {
   wrapper.unmount();
 });
 
+it('renders production-shaped finished events with measured segments', () => {
+  // R9：生产事件由 controller 实测 duration_ms 与分段字段；reducer 直接使用
+  // 实测耗时而非前端自算；分段字段仅本地事件数据，不进 Provider 投影。
+  const store = useAppStore();
+  seedRun(store);
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
+  store.reduceComputerEvent({ type: 'computer_action_started', run_id: 'run-1', event_seq: 2, action_ordinal: 1, action_kind: 'click', target: 'browser' });
+  store.reduceComputerEvent({
+    type: 'computer_action_finished', run_id: 'run-1', event_seq: 3, action_ordinal: 1,
+    action_kind: 'click', ok: true, error_code: '',
+    duration_ms: 268.5, queue_ms: 0.4, input_ms: 4.5, observe_ms: 263.6,
+  });
+  const wrapper = mountPane();
+  const row = wrapper.get('[data-test="computer-trace-row"]');
+  expect(row.text()).toContain('268.5');
+  expect(store.computerTrace[0].duration_ms).toBe(268.5);
+  wrapper.unmount();
+});
+
 it('shows run status target model and failure reasons', () => {
   const store = useAppStore();
   seedRun(store, { status: 'failed', error_code: 'computer_no_progress' });

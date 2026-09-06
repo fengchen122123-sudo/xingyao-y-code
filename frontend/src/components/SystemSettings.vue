@@ -175,6 +175,13 @@
 
       <p class="computer-privacy" data-test="computer-privacy-notice"><AppIcon name="triangle-alert" :size="13" />开启后，当前页面或桌面截图会发送给当前模型 Provider；Y-CODE 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。</p>
 
+      <p
+        v-if="computerModelCapabilityHint"
+        class="computer-model-hint"
+        :class="{ blocked: computerModelCapabilityBlocked }"
+        data-test="computer-model-capability-hint"
+      >{{ computerModelCapabilityHint }}</p>
+
       <ul class="computer-preflight" data-test="computer-preflight-list">
         <li v-for="item in preflightItems" :key="item.label" :class="{ ok: item.ok }">
           <AppIcon :name="item.ok ? 'check' : 'x'" :size="12" :stroke-width="2.25" />
@@ -206,6 +213,25 @@ watch(
 );
 
 const parsedTurnStepLimit = computed(() => Number(turnStepLimitDraft.value));
+
+// 活动模型电脑操控资格：开关已开但模型不合格时给出可操作的原因提示
+const computerModelCapability = computed(() => store.systemSettings.computer_active_model_capability);
+const computerModelCapabilityBlocked = computed(() => {
+  const capability = computerModelCapability.value;
+  const anySwitchOn = store.systemSettings.browser_control_enabled || store.systemSettings.computer_control_enabled;
+  return Boolean(anySwitchOn && capability && !capability.eligible);
+});
+const computerModelCapabilityHint = computed(() => {
+  const capability = computerModelCapability.value;
+  if (!capability || !capability.model) return '';
+  if (computerModelCapabilityBlocked.value) {
+    return `当前模型 ${capability.model} 不具备电脑操控资格：${capability.reason || '未声明所需能力'}。可在「模型」设置中勾选“多模态（视觉）”（工具调用默认视为支持）。`;
+  }
+  if (capability.eligible && (store.systemSettings.browser_control_enabled || store.systemSettings.computer_control_enabled)) {
+    return `当前模型 ${capability.model} 已具备电脑操控资格（${capability.protocol === 'native_openai' ? '原生协议' : 'generic'}）。`;
+  }
+  return '';
+});
 const turnStepLimitError = computed(() => {
   const value = parsedTurnStepLimit.value;
   const min = store.systemSettings.agent_turn_step_limit_min;
@@ -363,6 +389,16 @@ async function selectComputerBrowser(browser: string) {
 .computer-mobile-note { margin: 10px 0 0; color: var(--text-faint); font-size: 12px; line-height: 1.6; }
 .computer-info-row { border-bottom: 1px solid var(--border); padding: 18px 0; }
 .profile-path { margin: 4px 0 6px; color: var(--text-dim); font-size: 12px; word-break: break-all; }
+.computer-model-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--text-secondary, #666);
+}
+
+.computer-model-hint.blocked {
+  color: var(--danger, #c62828);
+}
+
 .computer-privacy { display: flex; align-items: flex-start; gap: 8px; margin: 14px 0 0; padding: 12px 14px; border: 1px solid color-mix(in srgb, var(--warning) 40%, transparent); border-radius: var(--theme-radius-medium); background: color-mix(in srgb, var(--warning) 8%, transparent); color: var(--text-dim); font-size: 12px; line-height: 1.7; }
 .computer-privacy svg { flex-shrink: 0; margin-top: 3px; color: var(--warning); }
 .computer-preflight { margin: 14px 0 0; padding: 0; list-style: none; }
