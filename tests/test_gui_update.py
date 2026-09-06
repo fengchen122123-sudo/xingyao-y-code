@@ -81,7 +81,7 @@ def test_fetch_latest_release_with_update():
     }
 
     mock_resp = MagicMock()
-    mock_resp.read.return_value = json.dumps(fake_release).encode("utf-8")
+    mock_resp.read.return_value = json.dumps([fake_release]).encode("utf-8")
     mock_resp.__enter__.return_value = mock_resp
 
     with patch("urllib.request.urlopen", return_value=mock_resp):
@@ -105,7 +105,7 @@ def test_fetch_latest_release_same_version():
     }
 
     mock_resp = MagicMock()
-    mock_resp.read.return_value = json.dumps(fake_release).encode("utf-8")
+    mock_resp.read.return_value = json.dumps([fake_release]).encode("utf-8")
     mock_resp.__enter__.return_value = mock_resp
 
     with patch("urllib.request.urlopen", return_value=mock_resp):
@@ -355,7 +355,7 @@ def test_fetch_latest_release_with_split_parts():
         ],
     }
     mock_resp = MagicMock()
-    mock_resp.read.return_value = json.dumps(fake_release).encode("utf-8")
+    mock_resp.read.return_value = json.dumps([fake_release]).encode("utf-8")
     mock_resp.__enter__.return_value = mock_resp
 
     with patch("urllib.request.urlopen", return_value=mock_resp):
@@ -385,7 +385,7 @@ def test_fetch_latest_release_single_exe_prefers_main_over_cli():
         ],
     }
     mock_resp = MagicMock()
-    mock_resp.read.return_value = json.dumps(fake_release).encode("utf-8")
+    mock_resp.read.return_value = json.dumps([fake_release]).encode("utf-8")
     mock_resp.__enter__.return_value = mock_resp
 
     with patch("urllib.request.urlopen", return_value=mock_resp):
@@ -408,7 +408,7 @@ def test_fetch_latest_release_single_exe_keeps_compat():
         ],
     }
     mock_resp = MagicMock()
-    mock_resp.read.return_value = json.dumps(fake_release).encode("utf-8")
+    mock_resp.read.return_value = json.dumps([fake_release]).encode("utf-8")
     mock_resp.__enter__.return_value = mock_resp
 
     with patch("urllib.request.urlopen", return_value=mock_resp):
@@ -418,6 +418,53 @@ def test_fetch_latest_release_single_exe_keeps_compat():
     assert res["part_urls"] == []
     assert res["download_url"] == "https://gitee.com/dl"
     assert res["sha256"] == ""
+
+
+def test_fetch_latest_release_skips_prerelease_entry():
+    """列表首位是预发布条目时跳过，取第一条非预发布 Release。"""
+    fake_releases = [
+        {
+            "tag_name": "v99.1.0",
+            "name": "Y-CODE v99.1.0 预览",
+            "body": "- 预发布",
+            "prerelease": True,
+            "assets": [],
+        },
+        {
+            "tag_name": "v99.0.0",
+            "name": "Y-CODE v99.0.0",
+            "body": "- 正式版",
+            "prerelease": False,
+            "assets": [
+                {"name": "Y-code-99.0.0.exe", "browser_download_url": "https://gitee.com/dl", "size": 40},
+            ],
+        },
+    ]
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps(fake_releases).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = fetch_latest_release(repo="mock/repo")
+
+    assert res["ok"] is True
+    assert res["has_update"] is True
+    assert res["latest_version"] == "99.0.0"
+    assert res["download_url"] == "https://gitee.com/dl"
+
+
+def test_fetch_latest_release_empty_list():
+    """列表为空（仓库尚无 Release）时与 404 同语义，安全返回无更新。"""
+    mock_resp = MagicMock()
+    mock_resp.read.return_value = json.dumps([]).encode("utf-8")
+    mock_resp.__enter__.return_value = mock_resp
+
+    with patch("urllib.request.urlopen", return_value=mock_resp):
+        res = fetch_latest_release(repo="mock/repo")
+
+    assert res["ok"] is True
+    assert res["has_update"] is False
+    assert "暂无更新" in res["msg"]
 
 
 class _FakePartResp:
