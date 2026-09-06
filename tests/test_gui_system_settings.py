@@ -236,12 +236,12 @@ def test_browser_enable_preflight_combines_selected_browser_and_hotkey(tmp_path,
     cfg = _use_isolated_config(tmp_path, monkeypatch, {})
     bridge = _bare_bridge()
     monkeypatch.setattr(
-        "core.computer.settings.shutil.which",
+        "core.computer.platforms.windows.shutil.which",
         lambda name: r"C:\Program Files\Microsoft\Edge\Application\msedge.exe"
         if name == "msedge.exe"
         else None,
     )
-    monkeypatch.setattr("core.computer.settings.os.path.isfile", lambda _p: False)
+    monkeypatch.setattr("core.computer.platforms.windows.os.path.isfile", lambda _p: False)
     monkeypatch.setattr("core.computer.win32_adapter._default_hotkey_probe", lambda: False)
 
     result = bridge.set_browser_control_enabled(True)
@@ -254,8 +254,8 @@ def test_browser_enable_preflight_combines_selected_browser_and_hotkey(tmp_path,
 def test_browser_enable_preflight_rejects_unavailable_selected_browser(tmp_path, monkeypatch):
     cfg = _use_isolated_config(tmp_path, monkeypatch, {})
     bridge = _bare_bridge()
-    monkeypatch.setattr("core.computer.settings.shutil.which", lambda _name: None)
-    monkeypatch.setattr("core.computer.settings.os.path.isfile", lambda _p: False)
+    monkeypatch.setattr("core.computer.platforms.windows.shutil.which", lambda _name: None)
+    monkeypatch.setattr("core.computer.platforms.windows.os.path.isfile", lambda _p: False)
 
     result = bridge.set_browser_control_enabled(True)
 

@@ -22,3 +22,6 @@ pytest-mock>=3.0.0
 
 # Computer control dependencies (system Edge/Chrome channel; browsers are NOT downloaded)
 playwright>=1.55,<2
+# UI Automation（comtypes 运行时生成 UIAutomationCore 绑定）仅 Windows 桌面
+# 语义定位（窗口/托盘候选）使用；其他平台不安装。
+comtypes>=1.4,<2; sys_platform == "win32"
