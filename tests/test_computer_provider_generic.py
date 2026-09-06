@@ -49,16 +49,29 @@ def test_build_generic_computer_tool_off_or_native_returns_none(capability):
 
 def test_build_generic_dynamic_prompt_enabled_covers_all_seven_rules():
     text = build_generic_dynamic_prompt(GENERIC_CAPABILITY)
-    # 设计 10.1 七条说明语义必须逐字可见
+    # 通用化重构 Task E 元素优先学说：七条要点语义必须逐字可见
     assert "observe" in text
-    # 2026-09-06 sequence 协议扩展：第 2 条改为"单个 computer_action + sequence 打包"
+    # 第 2 条：元素优先（list_elements → click_element/set_value_element）
+    assert "list_elements" in text
+    assert "click_element" in text
+    assert "set_value_element" in text
+    assert "el-N" in text
+    assert "截图坐标点击" in text
+    # 第 3 条：单动作 + sequence 打包
     assert "kind=sequence" in text
     assert "不得与其他工具混用" in text
-    assert "最新截图" in text
-    assert "(0,0)" in text
-    assert "不得猜测动作成功" in text
-    assert "登录" in text and "验证码" in text
+    assert "标注截图" in text
+    # 第 4 条：依据观察推进 + 代数失效语义
+    assert "不得猜测成功" in text
+    assert "surface_generation" in text
+    assert "旧坐标与旧元素引用立即作废" in text
+    # 第 5 条：焦点恢复指引
+    assert "焦点被抢" in text
+    assert "activate_surface" in text
+    assert "严禁按记忆里的旧坐标连续重试" in text
+    # 第 6/7 条：接管与收尾
     assert "request_user_takeover" in text
+    assert "验证码" in text
     assert "完成" in text and "不继续无意义观察" in text
 
 
