@@ -93,6 +93,14 @@ _REPEAT_GUARD_EXEMPT_MANAGE_TASK_ACTIONS = frozenset({"status", "list", "wait"})
 # 剥离到 ToolExecutionRecord.followup_messages，绝不进入 Provider/tool message。
 _FOLLOWUP_MESSAGES_KEY = "_ycode_followup_messages"
 
+# 电脑操控无副作用/纯观察类 action 不消耗重复额度（2026-09-06 提速计划 Task 5）：
+# 逐屏滚动阅读、重新观察与等待是合法重复（会话 147 实测被误拦 10 次，每次白烧
+# 一轮模型往返）。点击/输入/sequence 等有副作用动作不豁免：同参数重复点击可能
+# 造成重复发送；真死循环由 controller 的 no-progress 熔断（3 次画面不变停止）兜底。
+_REPEAT_GUARD_EXEMPT_COMPUTER_KINDS = frozenset(
+    {"observe", "scroll", "wait", "move", "list_surfaces"}
+)
+
 
 def repeat_guard_exempt(name: str, arguments: dict) -> bool:
     if name in _REPEAT_GUARD_EXEMPT_TOOLS:
@@ -100,6 +108,9 @@ def repeat_guard_exempt(name: str, arguments: dict) -> bool:
     if name == "manage_task":
         action = str((arguments or {}).get("action", "")).strip().lower()
         return action in _REPEAT_GUARD_EXEMPT_MANAGE_TASK_ACTIONS
+    if name == "computer_action":
+        kind = str((arguments or {}).get("kind", "") or "").strip().lower()
+        return kind in _REPEAT_GUARD_EXEMPT_COMPUTER_KINDS
     return False
 
 
