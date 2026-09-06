@@ -61,6 +61,8 @@ _GENERIC_READ = 0x80000000
 _DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2 = -4
 _DPI_AWARENESS_CONTEXT_SYSTEM_AWARE = -2
 _ABSOLUTE_RANGE = 65535
+_GA_ROOT = 2
+_VK_MENU = 0x12
 
 # 统一动作键名 → 虚拟键码（登记制；与 core/computer/actions.py 的键名白名单对齐）。
 KEY_NAME_TO_VK = {
@@ -316,6 +318,44 @@ def _ctypes_foreground_window() -> int:
     return int(user32.GetForegroundWindow() or 0)
 
 
+def _ctypes_window_from_point(x: int, y: int) -> int:
+    """默认 WindowFromPoint：物理坐标点所属窗口的**顶层** HWND（无窗口返回 0）。
+
+    64 位句柄防御（Task 16 教训）：restype 显式 c_void_p，避免 HWND 截断；
+    WindowFromPoint 可能返回子窗口（如 Edit 控件），SetForegroundWindow 需要
+    顶层窗口，故经 GetAncestor(GA_ROOT) 上溯（上溯失败回落原句柄）。
+    """
+    user32 = ctypes.windll.user32
+    user32.WindowFromPoint.restype = ctypes.c_void_p
+    user32.WindowFromPoint.argtypes = (wintypes.POINT,)
+    user32.GetAncestor.restype = ctypes.c_void_p
+    user32.GetAncestor.argtypes = (ctypes.c_void_p, wintypes.UINT)
+    point = wintypes.POINT(int(x), int(y))
+    hwnd = int(user32.WindowFromPoint(point) or 0)
+    if not hwnd:
+        return 0
+    root = int(user32.GetAncestor(hwnd, _GA_ROOT) or 0)
+    return root or hwnd
+
+
+def _ctypes_set_foreground_window(hwnd: int) -> bool:
+    """默认 SetForegroundWindow：失败用经典 Alt 键技巧（VK_MENU down+up）
+    解除系统前台锁后重试一次，仍失败返回 False。
+
+    best-effort（通用化重构 Task C）：调用方适配器方法吞异常归一为 False，
+    绝不抛错阻断输入。
+    """
+    user32 = ctypes.windll.user32
+    user32.SetForegroundWindow.argtypes = (wintypes.HWND,)
+    if user32.SetForegroundWindow(int(hwnd)):
+        return True
+    user32.keybd_event(_VK_MENU, 0, 0, 0)
+    try:
+        return bool(user32.SetForegroundWindow(int(hwnd)))
+    finally:
+        user32.keybd_event(_VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+
+
 def _ctypes_window_title(hwnd: int) -> str:
     user32 = ctypes.windll.user32
     length = user32.GetWindowTextLengthW(hwnd)
@@ -369,6 +409,8 @@ class Win32InputAdapter:
         get_system_metrics: Callable[[int], int] | None = None,
         hotkey_check: Callable[[], bool] | None = None,
         set_clipboard_text: Callable[[str], None] | None = None,
+        window_from_point: Callable[[int, int], int] | None = None,
+        set_foreground_window: Callable[[int], bool] | None = None,
     ) -> None:
         self._send_input = send_input if send_input is not None else _ctypes_send_input
         if platform is None:
@@ -401,6 +443,12 @@ class Win32InputAdapter:
         )
         self._set_clipboard = (
             set_clipboard_text if set_clipboard_text is not None else _ctypes_set_clipboard_text
+        )
+        self._window_from_point = (
+            window_from_point if window_from_point is not None else _ctypes_window_from_point
+        )
+        self._set_foreground = (
+            set_foreground_window if set_foreground_window is not None else _ctypes_set_foreground_window
         )
         self._pressed_keys: list[str] = []
         self._pressed_buttons: set[str] = set()
@@ -476,6 +524,29 @@ class Win32InputAdapter:
         """
         hwnd = self._get_foreground_window()
         return int(hwnd) if hwnd else 0
+
+    def window_from_point(self, x: int, y: int) -> int:
+        """物理坐标点所属顶层窗口 HWND（通用化重构 Task C 输入前置激活）。
+
+        best-effort：查询失败返回 0 并留痕，绝不抛错阻断输入。
+        """
+        try:
+            return int(self._window_from_point(int(x), int(y)) or 0)
+        except Exception:
+            _LOGGER.exception("WindowFromPoint 查询失败")
+            return 0
+
+    def set_foreground_window(self, hwnd: int) -> bool:
+        """把目标窗口提到前台（通用化重构 Task C 输入前置激活）。
+
+        best-effort：失败（含 Alt 键技巧重试后仍失败）归一为 False 并留痕，
+        绝不抛错阻断输入。
+        """
+        try:
+            return bool(self._set_foreground(int(hwnd)))
+        except Exception:
+            _LOGGER.exception("SetForegroundWindow 激活失败")
+            return False
 
     # ---------------- 底层发送与部分失败恢复 ----------------
 

@@ -799,11 +799,33 @@ def test_desktop_foreground_change_between_actions_rejects_stale_input():
         backend.execute("run-a", ComputerAction(kind="click", target="desktop", x=10, y=10))
     assert raised.value.code == "computer_surface_changed"
     assert adapter.clicks == []
-    # 键盘输入同样被拒绝（前台身份不一致）。
-    with pytest.raises(ComputerControlError) as raised_keys:
-        backend.execute("run-a", ComputerAction(kind="keypress", target="desktop", keys=("ENTER",)))
-    assert raised_keys.value.code == "computer_surface_changed"
-    assert adapter.keys_sent == []
+    # 键盘输入（通用化重构 Task C 新语义）：目标取最近观察的受控窗口，
+    # 前置激活把它带回前台后正常发送，而不是拒绝输入。
+    keyboard_adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720), foreground_id=1001)
+    keyboard_backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(width=1280, height=720), win32_adapter=keyboard_adapter
+    )
+    keyboard_backend.observe("run-k")
+    keyboard_adapter.foreground_id = 2002  # 用户切到另一个前台窗口
+    keyboard_backend.execute(
+        "run-k", ComputerAction(kind="keypress", target="desktop", keys=("ENTER",))
+    )
+    assert keyboard_adapter.set_foreground_calls == [1001]
+    assert keyboard_adapter.keys_sent == [("ENTER",)]
+    # 激活失败（best-effort）时维持 fail-closed：R5 复核拒绝，零输入。
+    failed_adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720), foreground_id=1001)
+    failed_backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(width=1280, height=720), win32_adapter=failed_adapter
+    )
+    failed_backend.observe("run-f")
+    failed_adapter.foreground_id = 2002
+    failed_adapter.set_foreground_result = False
+    with pytest.raises(ComputerControlError) as raised_failed:
+        failed_backend.execute(
+            "run-f", ComputerAction(kind="keypress", target="desktop", keys=("ENTER",))
+        )
+    assert raised_failed.value.code == "computer_surface_changed"
+    assert failed_adapter.keys_sent == []
     # 重新观察后基线刷新，输入恢复。
     refreshed = backend.observe("run-a")
     assert refreshed.surface_id == "hwnd:2002"
@@ -884,3 +906,148 @@ def test_desktop_wait_is_interruptible_and_close_not_blocked():
     waiter.join(timeout=3)
     assert not waiter.is_alive(), "close 后桌面显式等待仍悬挂"
     assert outcome == ["computer_cancelled"]
+
+
+# ---------------- 通用化重构 Task C：输入前置激活 ----------------
+
+
+def _activation_backend(adapter):
+    return WindowsComputerBackend(
+        image_grab=lambda: FakeImage(width=3840, height=2160, origin_x=-1920, origin_y=0),
+        win32_adapter=adapter,
+    )
+
+
+def test_click_activates_non_foreground_window_before_send_mouse():
+    """目标点所属窗口非前台：先 set_foreground_window 再 send_mouse。"""
+    adapter = FakeWin32Adapter()
+    adapter.window_at_point_id = 2002
+    backend = _activation_backend(adapter)
+    backend.start()
+    try:
+        backend.observe("run-c")
+        backend.execute(
+            "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
+        )
+        assert adapter.window_from_point_calls == [(-1720, 200)]
+        assert adapter.set_foreground_calls == [2002]
+        labels = [entry[0] for entry in adapter.call_order]
+        assert labels.index("set_foreground") < labels.index("send_mouse")
+        assert adapter.clicks == [(-1720, 200, "left")]
+    finally:
+        backend.close()
+
+
+def test_click_skips_activation_when_already_foreground():
+    """目标点所属窗口已是前台：不调用 set_foreground_window。"""
+    adapter = FakeWin32Adapter()
+    backend = _activation_backend(adapter)
+    backend.start()
+    try:
+        backend.observe("run-c")
+        backend.execute(
+            "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
+        )
+        assert adapter.set_foreground_calls == []
+        assert adapter.clicks
+    finally:
+        backend.close()
+
+
+def test_activation_failure_does_not_block_input():
+    """SetForegroundWindow 失败（含 Alt 键技巧重试后）：输入照常发送。"""
+    adapter = FakeWin32Adapter()
+    adapter.window_at_point_id = 2002
+    adapter.set_foreground_result = False
+    backend = _activation_backend(adapter)
+    backend.start()
+    try:
+        backend.observe("run-c")
+        backend.execute(
+            "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
+        )
+        assert adapter.set_foreground_calls == [2002]
+        assert adapter.clicks == [(-1720, 200, "left")]
+    finally:
+        backend.close()
+
+
+def test_drag_activates_window_of_first_path_point():
+    adapter = FakeWin32Adapter()
+    adapter.window_at_point_id = 2002
+    backend = _activation_backend(adapter)
+    backend.start()
+    try:
+        backend.observe("run-c")
+        backend.execute(
+            "run-c",
+            ComputerAction(
+                kind="drag",
+                target="desktop",
+                path=((100, 100), (150, 150)),  # 模型坐标 → 物理 (-1720,200)/(-1620,300)
+            ),
+        )
+        assert adapter.set_foreground_calls == [2002]
+        assert adapter.window_from_point_calls == [(-1720, 200)]
+    finally:
+        backend.close()
+
+
+def test_type_text_activates_window_from_last_observation_surface():
+    """键盘动作：目标 = 最近观察的受控窗口（hwnd:N）；先于 R5 复核激活。"""
+    adapter = FakeWin32Adapter(foreground_id=2002)
+    backend = _activation_backend(adapter)
+    backend.start()
+    try:
+        observation = backend.observe("run-c")
+        assert observation.surface_id == "hwnd:2002"
+        adapter.foreground_id = 1001  # 用户切走窗口（R5 复核本会拒绝）
+        backend.execute(
+            "run-c", ComputerAction(kind="type_text", target="desktop", text="hello")
+        )
+        assert adapter.set_foreground_calls == [2002]
+        assert adapter.texts == ["hello"]
+        labels = [entry[0] for entry in adapter.call_order]
+        assert labels.index("set_foreground") < labels.index("send_text")
+    finally:
+        backend.close()
+
+
+def test_input_activated_reflects_activation_once():
+    """input_activated 只在发生激活后的那次观察为 True，消费后清零。"""
+    adapter = FakeWin32Adapter()
+    adapter.window_at_point_id = 2002
+    backend = _activation_backend(adapter)
+    backend.start()
+    try:
+        assert backend.observe("run-c").input_activated is False
+        backend.execute(
+            "run-c", ComputerAction(kind="click", target="desktop", x=100, y=100)
+        )
+        assert backend.observe("run-c").input_activated is True
+        assert backend.observe("run-c").input_activated is False
+    finally:
+        backend.close()
+
+
+def test_projection_excludes_input_activated():
+    """投影字节稳定：input_activated 绝不进入 observation_provider_projection。"""
+    from core.computer.actions import observation_provider_projection
+
+    observation = ComputerObservation(
+        run_id="r", target="desktop", input_activated=True
+    )
+    assert "input_activated" not in observation_provider_projection(observation)
+
+
+def test_adapter_activation_seams_swallow_errors():
+    """seam 抛错归一为安全返回值：window_from_point→0，set_foreground→False。"""
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("injected failure")
+
+    adapter = Win32InputAdapter(
+        window_from_point=_boom, set_foreground_window=_boom
+    )
+    assert adapter.window_from_point(1, 2) == 0
+    assert adapter.set_foreground_window(123) is False
