@@ -4758,14 +4758,21 @@ class ApiBridge:
             logger.debug("重算 token 用量失败", exc_info=True)
 
     def _ensure_fits_active_window(self, session_name: str):
-        """切换模型后兜底：当前会话占用超过新激活模型窗口阈值时立即压缩历史。
+        """切换模型后兜底：当前会话占用超过新激活模型窗口阈值时后台异步压缩历史。
 
         从大窗口（如 100 万）切到小窗口（如 25.6 万）模型时，若占用超出新窗口
-        的压缩阈值（0.95），直接调用 prepare_turn_messages 触发同一套四级水位线
-        压缩（snip/elide/摘要/滑窗淘汰），让小窗口模型可用而非发消息报错。
-        压缩后重算窗口占用并推送，前端红圈随之回落。无需压缩时静默跳过。
+        的压缩阈值（0.95），在后台守护线程触发四级水位线压缩（snip/elide/摘要/滑窗淘汰），
+        避免阻塞切换模型接口的快速响应。压缩后自动重算窗口占用并推送给前端。
         """
         try:
+            # 并发保护：若当前会话正在运行回合，或后台已有记忆压缩在执行，跳过触发
+            from core.memory_compressor import is_session_compressing
+            if self._is_turn_active(session_name) or is_session_compressing(self._memory, session_name):
+                logger.info(
+                    "会话 %s 正在运行回合或后台压缩进行中，跳过切模型异步压缩", session_name
+                )
+                return
+
             # 按会话取模型：切到小窗口模型后是否需要立即压缩，
             # 必须按该会话绑定模型的窗口判断，全局模型与此无关
             active = get_active_model(session_name) or {}
@@ -4779,28 +4786,40 @@ class ApiBridge:
             )
             if total <= window * SUMMARIZE_RATIO:
                 return
-            from core.agent_service import prepare_turn_messages
-            logger.info(
-                "切换模型后会话占用 %d 超新窗口 %d 阈值，触发自动压缩", total, window
-            )
-            prepare_turn_messages(
-                self._memory,
-                session_name,
-                active.get("litellm_model", ""),
-                window,
-                permission_mode=self._current_permission_mode,
-                notify=lambda kind, message: self.emit_event(
-                    "notice", {"message": _strip_ansi_markup(message)}
-                ),
-                api_key=active.get("api_key", ""),
-                api_base=active.get("base_url", ""),
-                is_gui=True,
-            )
-            self._recalc_token_usage(session_name)
-            self._emit_token_usage()
+
+            def _bg_compress():
+                try:
+                    if self._is_turn_active(session_name) or is_session_compressing(self._memory, session_name):
+                        return
+                    from core.agent_service import prepare_turn_messages
+                    logger.info(
+                        "切换模型后会话占用 %d 超新窗口 %d 阈值，后台触发自动压缩", total, window
+                    )
+                    prepare_turn_messages(
+                        self._memory,
+                        session_name,
+                        active.get("litellm_model", ""),
+                        window,
+                        permission_mode=self._current_permission_mode,
+                        notify=lambda kind, message: self.emit_event(
+                            "notice", {"message": _strip_ansi_markup(message)}
+                        ),
+                        api_key=active.get("api_key", ""),
+                        api_base=active.get("base_url", ""),
+                        is_gui=True,
+                    )
+                    self._recalc_token_usage(session_name)
+                    self._emit_token_usage()
+                except Exception:
+                    logger.exception("切换模型后后台自动压缩失败")
+
+            threading.Thread(
+                target=_bg_compress,
+                name=f"gui-model-switch-compress-{session_name}",
+                daemon=True,
+            ).start()
         except Exception:
-            # 压缩失败不阻断模型切换本身，发消息时 prepare 还会再兜底
-            logger.exception("切换模型后自动压缩失败")
+            logger.exception("切换模型后检查压缩失败")
 
     # ------------------------------------------------------------------
     # 技能

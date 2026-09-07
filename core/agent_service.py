@@ -38,6 +38,9 @@ SNIP_RATIO = 0.60
 ELIDE_RATIO = 0.80
 SUMMARIZE_RATIO = 0.95
 
+# 单次请求准备允许滑窗淘汰的最大轮次数（微调淘汰，严禁无节制清空会话）
+MAX_EVICT_TURNS = 2
+
 # 兜底系统提示词：提示词文件全部缺失时也不能让整轮对话失败
 FALLBACK_SYSTEM_PROMPT = "你叫星瑶，是一位顶尖的代码编程助手。"
 
@@ -423,6 +426,39 @@ def build_background_task_summary(session_name: str) -> str:
     return "\n".join(summary_lines)
 
 
+def _prune_history_in_memory_to_fit_window(history: list, window: int, model_name: str, system_message: dict) -> int:
+    """请求侧内存级轮次裁剪：仅在待发请求内存列表中按完整轮次剔除最早历史，
+    保证发给小窗口模型的载荷处于 window * SUMMARIZE_RATIO 之内。
+    绝不触碰 DB，绝不推进水位，保留数据库历史完整性。
+    返回裁剪掉的轮次数。
+    """
+    from core.llm import estimate_tokens
+    pruned_turns = 0
+    while True:
+        current_tokens = estimate_tokens(model_name, [system_message] + history)
+        if current_tokens <= window * SUMMARIZE_RATIO:
+            break
+        start_idx = None
+        for i, m in enumerate(history):
+            if m.get("role") == "user":
+                content = str(m.get("content") or "")
+                if not content.startswith("[历史对话记忆摘要"):
+                    start_idx = i
+                    break
+        if start_idx is None:
+            break
+        end_idx = None
+        for j in range(start_idx + 1, len(history)):
+            if history[j].get("role") == "user":
+                end_idx = j
+                break
+        if end_idx is None:
+            break
+        del history[start_idx:end_idx]
+        pruned_turns += 1
+    return pruned_turns
+
+
 def prepare_turn_messages(
     manager,
     session_name: str,
@@ -522,20 +558,25 @@ def prepare_turn_messages(
     # Tier 3 (≥95%)：压缩经济学——本地维护已把压力拉回线下则跳过付费摘要
     if estimated_tokens > window * SUMMARIZE_RATIO and not _cancelled():
         # 超过 0.95 水位才触发智能记忆压缩提炼。
-        # 注意：compress_session_memory 在调用线程内同步执行且暂不支持取消参数，
-        # 压缩期间的取消信号要等压缩返回后才会生效（接口约束，暂不透传取消）。
-        from core.memory_compressor import compress_session_memory
-        compress_session_memory(
+        from core.memory_compressor import (
+            compress_session_memory,
+            is_session_compressing,
+            CompressionOutcome,
+        )
+        outcome = compress_session_memory(
             manager,
             session_name,
             model_name,
             api_key,
             api_base,
             output_callback=lambda message: _notify("compress", message),
+            cancel_event=cancel_event,
+            return_outcome=True,
         )
+        if not isinstance(outcome, CompressionOutcome):
+            outcome = CompressionOutcome("compressed" if outcome else "failed")
+
         history = manager.get_history_for_llm(session_name)
-        # 压缩/裁剪改变了历史，此后的真实用量基线已失效，
-        # 退化到含系统提示词的估算来指导后续的折叠与滑窗淘汰
         estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
         # 兜底：如果总结归纳后依然超限，触发物理大文件折叠机制
@@ -544,20 +585,49 @@ def prepare_turn_messages(
             history = manager.get_history_for_llm(session_name)
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
-        # 智能滑窗淘汰：如果仍超限，按完整轮次（user 开头到下一个 user 之前）
-        # 为单位淘汰最早的旧消息，直到满足 Token 安全阈值。
-        # 淘汰必须在 DB 层推进 summarized_until_msg_id 持久化（一次性水位推进，
-        # 不改写消息字节）：纯内存淘汰下一轮 prepare 会从 DB 读回全部历史，淘汰失效。
-        while len(history) > 2 and estimated_tokens > window * SUMMARIZE_RATIO:
-            if not manager.evict_oldest_turn_persistent(session_name):
-                break
-            history = manager.get_history_for_llm(session_name)
-            estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+        # 智能滑窗淘汰（带熔断保护、并发保护与最大轮次约束）：
+        # 1. 若记忆压缩明确失败且严重超限（> 1.2 * window），停止推 DB 水位，保护未摘要对话；
+        # 2. 若当前后台正有该会话的压缩在跑（或命中 already_running），严禁推 DB 水位，
+        #    避免裸 UPDATE 把后台长压缩的 CAS 乐观锁打翻导致前功尽弃；
+        # 3. 其余情况最多允许淘汰 MAX_EVICT_TURNS 轮做微调。
+        compress_failed = (outcome.status == "failed")
+        compress_running = (
+            is_session_compressing(manager, session_name)
+            or outcome.reason == "already_running"
+        )
 
-        # 淘汰到底（仅剩最后轮次）仍超窗口：剩下的单条消息本身就超限。
-        # 明确告知用户，而不是裸发一个几乎必然被 provider 拒绝的超限请求。
+        if compress_failed and estimated_tokens > window * 1.2:
+            _notify("compress", "<ansired>⚠️ 历史记忆压缩未能成功（可能由于服务商速率限制），当前上下文仍严重超出当前模型窗口。为保护您的历史对话完整，系统已停止自动淘汰历史；本轮请求将在内存中临时按轮次裁剪以保证正常回复。</ansired>")
+        elif compress_running:
+            _notify("compress", "<ansiyellow>ℹ 后台记忆压缩仍在进行中，本轮请求将在内存中临时按轮次裁剪以适配当前模型窗口。</ansiyellow>")
+        else:
+            evict_count = 0
+            while (
+                evict_count < MAX_EVICT_TURNS
+                and len(history) > 2
+                and estimated_tokens > window * SUMMARIZE_RATIO
+            ):
+                if not manager.evict_oldest_turn_persistent(session_name):
+                    break
+                evict_count += 1
+                history = manager.get_history_for_llm(session_name)
+                estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+
+        # 【I4 请求侧内存级轮次裁剪】：
+        # 无论是因为熔断、后台压缩进行中还是淘汰微调后仍超窗，
+        # 绝不把超窗的载荷裸发给模型导致 400 报错。
+        # 在内存中临时按完整轮次安全剔除最早历史，保证本轮请求正常发出且 DB 零破坏。
+        if estimated_tokens > window * SUMMARIZE_RATIO:
+            from core.memory import _sanitize_tool_call_pairing
+            pruned_count = _prune_history_in_memory_to_fit_window(
+                history, window, model_name, system_message
+            )
+            if pruned_count > 0:
+                history = _sanitize_tool_call_pairing(history)
+                estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+
         if estimated_tokens > window and not _cancelled():
-            _notify("compress", "<ansired>⚠️ 当前上下文在压缩与淘汰后仍超过模型窗口，本轮请求可能被 provider 拒绝；建议精简输入、拆分任务或开启新会话。</ansired>")
+            _notify("compress", "<ansired>⚠️ 当前上下文单条消息本身已超过模型窗口，本轮请求可能被 provider 拒绝；建议精简输入或开启新会话。</ansired>")
 
     # 更新最新 Token 数供界面显示（与 UI 线程并发读写，必须持锁）
     with token_usage_lock:

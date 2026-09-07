@@ -58,6 +58,7 @@ def _no_secondary(monkeypatch):
         lambda *a, **kw: {},
     )
     monkeypatch.setattr(mc, "_get_encoding", lambda *a, **kw: None)
+    monkeypatch.setattr(mc, "COMPRESSION_INTER_CHUNK_DELAY_SECONDS", 0)
 
 
 def test_long_history_is_compressed_in_window_sized_chunks(manager, monkeypatch):
@@ -210,3 +211,103 @@ def test_chinese_long_message_truncated_by_token_not_chars(manager, monkeypatch)
     for p in prompts:
         # 每段 prompt 估算 token 必须在预算内（含指令与累积摘要的固定开销 ~1200）
         assert mc._estimate_tokens(p) <= budget + 1200
+
+
+def test_compression_budget_capped_at_max_chunk_budget():
+    """超大窗口（如 256k / 1M）的预算必须受上限 24000 约束，避免打爆 TPM。"""
+    # 256k * 0.25 = 64k -> 应被截断为 24000
+    assert mc._compression_chunk_budget(256000) == 24000
+    # 1M * 0.25 = 262k -> 应被截断为 24000
+    assert mc._compression_chunk_budget(1048576) == 24000
+    # 小窗口（4096 * 0.25 = 1024）保持真实 25%
+    assert mc._compression_chunk_budget(4096) == 1024
+
+
+def test_chunk_rate_limit_backoff_retry(manager, monkeypatch):
+    """测试当单段遭遇 429 RateLimit 时能够指数退避重试并成功。"""
+    _seed_history(manager, 12, filler=3)
+    attempts = 0
+    sleeps = []
+
+    def fake_cancellable_sleep(duration, cancel_event=None):
+        sleeps.append(duration)
+        return True
+
+    monkeypatch.setattr(mc, "_cancellable_sleep", fake_cancellable_sleep)
+
+    def fake_completion(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise Exception("RateLimitError: 429 Too Many Requests - 请求过于频繁")
+        return _Resp("重试成功摘要")
+
+    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+
+    notices = []
+    assert compress_session_memory(
+        manager, "chunk-session", "fake/compress-model", "k", "",
+        output_callback=lambda m: notices.append(m),
+    ) is True
+
+    assert attempts == 2
+    assert len(sleeps) >= 1
+    assert any("429" in n or "速率限制" in n for n in notices)
+
+
+def test_chunk_rate_limit_respects_retry_after(manager, monkeypatch):
+    """测试当 RateLimit 异常包含 Retry-After 时优先使用指定休眠时间。"""
+    _seed_history(manager, 12, filler=3)
+    attempts = 0
+    sleeps = []
+
+    def fake_cancellable_sleep(duration, cancel_event=None):
+        sleeps.append(duration)
+        return True
+
+    monkeypatch.setattr(mc, "_cancellable_sleep", fake_cancellable_sleep)
+
+    class RateLimitWithHeader(Exception):
+        def __init__(self):
+            super().__init__("RateLimit 429")
+            class _Resp:
+                headers = {"retry-after": "12.5"}
+            self.response = _Resp()
+            self.status_code = 429
+
+    def fake_completion(**kwargs):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RateLimitWithHeader()
+        return _Resp("重试成功摘要")
+
+    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+
+    assert compress_session_memory(
+        manager, "chunk-session", "fake/compress-model", "k", "",
+        output_callback=lambda m: None,
+    ) is True
+
+    assert attempts == 2
+    assert len(sleeps) == 1
+    assert sleeps[0] == 12.5
+
+
+def test_cancellable_sleep_interrupts_on_cancel_event():
+    """测试 _cancellable_sleep 在 cancel_event 触发时立即提前退出。"""
+    import threading
+    import time
+    cancel_event = threading.Event()
+
+    # 预设在 0.05 秒后触发取消
+    threading.Timer(0.05, cancel_event.set).start()
+
+    start_t = time.monotonic()
+    # 期望休眠 10 秒，但应在 ~0.05 秒被打断并返回 False
+    result = mc._cancellable_sleep(10.0, cancel_event)
+    duration = time.monotonic() - start_t
+
+    assert result is False
+    assert duration < 1.0
+
