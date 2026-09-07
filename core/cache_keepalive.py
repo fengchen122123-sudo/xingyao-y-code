@@ -75,6 +75,8 @@ def build_keepalive_request(request):
         keepalive["tool_choice"] = "none"
     if request.get("metadata") is not None:
         keepalive["metadata"] = deepcopy(request["metadata"])
+    if request.get("extra_headers") is not None:
+        keepalive["extra_headers"] = deepcopy(request["extra_headers"])
     if request.get("extra_body") is not None:
         extra_body = deepcopy(request["extra_body"])
         # 推理强度与保活无关；移除后避免输出上限与推理预算冲突。
@@ -84,6 +86,8 @@ def build_keepalive_request(request):
             and extra_body.get("thinking", {}).get("type") == "enabled"
         ):
             extra_body["thinking"] = {"type": "disabled"}
+        if not thinking_locked and extra_body.get("enable_thinking") is True:
+            extra_body["enable_thinking"] = False
         if extra_body:
             keepalive["extra_body"] = extra_body
     return keepalive

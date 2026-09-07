@@ -138,7 +138,7 @@ def _run_one_request(*, model, api_base, api_key, messages, tools, cache_session
         "model": model,
         "api_key": api_key,
         "api_base": api_base,
-        "messages": _apply_cache_control(cleaned, model),
+        "messages": _apply_cache_control(cleaned, model, api_base),
         "tools": tools,
         "stream": True,
         "stream_options": {"include_usage": True},

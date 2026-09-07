@@ -188,6 +188,9 @@ def _cache_lane_sha256(kwargs: dict) -> str:
     metadata = kwargs.get("metadata")
     if isinstance(metadata, dict) and "user_id" in metadata:
         return _sha256(str(metadata["user_id"]).encode("utf-8"))
+    extra_headers = kwargs.get("extra_headers")
+    if isinstance(extra_headers, dict) and "x-dashscope-session-cache" in extra_headers:
+        return _sha256(str(extra_headers["x-dashscope-session-cache"]).encode("utf-8"))
     return ""
 
 
