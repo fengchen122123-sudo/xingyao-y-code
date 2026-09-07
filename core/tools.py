@@ -282,6 +282,65 @@ def is_session_sandbox_bypass_enabled():
         return _session_sandbox_bypass
 
 
+# ── 用户主动挂载/粘贴受托路径管理 ────────────────────────────────────
+_session_user_attached_paths_by_session: dict[str, set[str]] = {}
+_session_user_attached_paths_lock = threading.Lock()
+
+
+def is_trusted_paste_path(path) -> bool:
+    """判定路径是否属于系统临时目录中的剪贴板/移动端粘贴落盘目录（ycode_paste）。"""
+    if not path:
+        return False
+    try:
+        import tempfile
+        paste_dir = os.path.realpath(os.path.join(tempfile.gettempdir(), "ycode_paste"))
+        target = os.path.realpath(os.path.expanduser(str(path)))
+        return target == paste_dir or target.startswith(paste_dir + os.sep)
+    except Exception:
+        return False
+
+
+def register_session_user_attached_paths(paths, session_id: str | None = None) -> None:
+    """登记用户主动在 UI 中提供/挂载的附件绝对路径（代表用户显式授权）。"""
+    if not paths:
+        return
+    sid = str(session_id or "").strip() or _sandbox_session_id()
+    resolved = set()
+    for p in paths:
+        if not p:
+            continue
+        try:
+            resolved.add(os.path.realpath(os.path.expanduser(str(p))))
+        except Exception:
+            pass
+    if not resolved:
+        return
+    with _session_user_attached_paths_lock:
+        bucket = _session_user_attached_paths_by_session.setdefault(sid, set())
+        bucket.update(resolved)
+
+
+def is_session_user_attached_path(path, session_id: str | None = None) -> bool:
+    """判断给定路径是否已由用户显式作为附件挂载。"""
+    if not path:
+        return False
+    try:
+        target = os.path.realpath(os.path.expanduser(str(path)))
+    except Exception:
+        return False
+    sid = str(session_id or "").strip() or _sandbox_session_id()
+    with _session_user_attached_paths_lock:
+        bucket = _session_user_attached_paths_by_session.get(sid)
+        if bucket and target in bucket:
+            return True
+        default_bucket = _session_user_attached_paths_by_session.get("__default__")
+        if default_bucket and target in default_bucket:
+            return True
+        if session_id is None and any(target in b for b in _session_user_attached_paths_by_session.values()):
+            return True
+    return False
+
+
 def _outside_workspace_allowed():
     """读取运行时状态：是否允许访问工作目录外的文件。
 
@@ -322,6 +381,13 @@ def _resolve_workspace_path(file_path, *, allow_trusted_read=False):
         try:
             from core.memory_kairos import is_ycode_data_path
             if is_ycode_data_path(str(candidate)):
+                return candidate
+        except Exception:
+            pass
+        # 剪贴板粘贴落盘目录与用户显式挂载附件豁免：
+        # 用户在输入框粘贴的截图或显式选取的附件属于用户的主动授权，允许直读挂载与模型读取。
+        try:
+            if is_trusted_paste_path(candidate) or is_session_user_attached_path(candidate):
                 return candidate
         except Exception:
             pass

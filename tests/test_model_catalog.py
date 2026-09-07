@@ -78,3 +78,13 @@ def test_preset_computer_metadata_never_forms_half_valid_combination():
             if protocol == "generic":
                 assert model.get("supports_vision") is True
                 assert model.get("supports_function_calling") is True
+
+
+def test_token_rhythm_preset_contains_qwen38_flash():
+    providers = get_preset_providers()
+    token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
+    model = next(m for m in token_rhythm["models"] if m["name"] == "qwen3.8-flash")
+
+    assert model["context_window"] == 1000000
+    assert model["supports_vision"] is True
+    assert model["supports_function_calling"] is True

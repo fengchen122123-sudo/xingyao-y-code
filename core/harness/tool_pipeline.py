@@ -764,9 +764,9 @@ class ToolPipeline:
     def _permission_decision(self, resolved, decoded, context):
         name = decoded.name
         arguments = decoded.arguments
-        path_value = arguments.get("file_path")
+        path_value = arguments.get("file_path") or arguments.get("dir_path") or arguments.get("path")
         outside_workspace = False
-        if path_value and name in {"read_file", "write_file", "edit_file"}:
+        if path_value:
             try:
                 path_access = self.adapters.classify_path_access(name, path_value)
             except Exception:

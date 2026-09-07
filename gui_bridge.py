@@ -3658,6 +3658,7 @@ class ApiBridge:
                     display_text=clean_text,
                     pending_workdir=str(workdir) if workdir else "",
                     turn_source=turn_source,
+                    attachments=attach_list,
                 )
             return {"ok": True}
         except Exception as e:
@@ -3666,7 +3667,8 @@ class ApiBridge:
 
     def _spawn_turn_worker(self, full_text: str, target_session: str,
                            display_text: str = "", pending_workdir: str = "",
-                           turn_source: str = "local") -> None:
+                           turn_source: str = "local",
+                           attachments: Optional[List[str]] = None) -> None:
         """启动一个新回合线程。调用方必须已持有 _turn_start_lock 且确认
         _is_turn_active(target_session) 为 False（检查+启动原子）。
 
@@ -3688,6 +3690,8 @@ class ApiBridge:
             # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
             turn_kwargs["pending_workdir"] = str(pending_workdir)
         turn_kwargs["turn_source"] = turn_source
+        if attachments:
+            turn_kwargs["attachments"] = attachments
         worker = threading.Thread(
             target=self._run_turn_worker_serialized,
             args=(full_text, target_session),
@@ -3744,6 +3748,7 @@ class ApiBridge:
                         display_text=str(entry.get("display_text") or ""),
                         # 排队消息补发保持原回合来源：LAN 消息不得降级为 local
                         turn_source=str(entry.get("turn_source") or "local"),
+                        attachments=[str(p) for p in (entry.get("attachments") or [])],
                     )
                 except Exception:
                     logger.exception("补发排队消息失败")
@@ -3868,7 +3873,7 @@ class ApiBridge:
         保留函数名避免改动所有调用点，实现直接转发到 _run_turn_worker。"""
         return self._run_turn_worker(user_text, session_name, *args, **kwargs)
 
-    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local"):
+    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
 
         internal_kind 非空表示这是系统自动发起的内部回合（如后台任务汇总），
@@ -3997,7 +4002,9 @@ class ApiBridge:
                     # 盘符路径（如 dist\Y-code-1.2.2.exe）误当成附件挂载
                     parsed_content, attached_msgs = user_text, []
                 else:
-                    parsed_content, attached_msgs = parse_user_input(user_text)
+                    parsed_content, attached_msgs = parse_user_input(
+                        user_text, explicit_paths=attachments, session_id=session_name
+                    )
             except Exception:
                 logger.debug("解析用户输入失败，退回纯文本", exc_info=True)
                 parsed_content, attached_msgs = user_text, []
@@ -5097,7 +5104,9 @@ class ApiBridge:
 
             real_path = _resolve_real_path(path)
             workspace = self._session_workdir(self._current_session)
-            allowed, deny_msg = gui_path_access_allowed(real_path, workspace, action="preview")
+            allowed, deny_msg = gui_path_access_allowed(
+                real_path, workspace, action="preview", session_id=self._current_session
+            )
             if not allowed:
                 return {"ok": False, "msg": deny_msg}
             if not os.path.isfile(real_path):
@@ -5147,7 +5156,9 @@ class ApiBridge:
 
             real_path = _resolve_real_path(path)
             workspace = self._session_workdir(self._current_session)
-            allowed, deny_msg = gui_path_access_allowed(real_path, workspace, action="open")
+            allowed, deny_msg = gui_path_access_allowed(
+                real_path, workspace, action="open", session_id=self._current_session
+            )
             if not allowed:
                 return {"ok": False, "msg": deny_msg}
             if not os.path.exists(real_path):

@@ -87,6 +87,8 @@ PRESET_PROVIDERS = (
             {"name": "kimi-k2.7-code", "context_window": 256000, "supports_vision": True},
             {"name": "qwen3.7-max", "context_window": 1000000, "supports_vision": False},
             {"name": "qwen3.8-max", "context_window": 1000000, "supports_vision": True},
+            {"name": "qwen3.8-flash", "context_window": 1000000, "supports_vision": True,
+             "supports_function_calling": True},
             {"name": "qwen3.8-27b", "context_window": 1000000, "supports_vision": True},
             {"name": "glm-5", "context_window": 1000000, "supports_vision": False},
             {"name": "glm-5.1", "context_window": 200000, "supports_vision": False},
