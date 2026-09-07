@@ -77,6 +77,15 @@ _register(
         "enable_thinking_effort",
     ),
 )
+# qwen38-flash / qwen3.8-falsh 是同模型别名及拼写容错，档位与 qwen3.8-max 一致。
+_register(
+    ("qwen3.8-flash", "qwen38-flash", "qwen3.8-falsh", "qwen38-falsh"),
+    ReasoningCapability(
+        "effort",
+        ("default", "off", "low", "medium", "xhigh"),
+        "enable_thinking_effort",
+    ),
+)
 _register(
     ("glm-5.2",),
     ReasoningCapability(
@@ -179,6 +188,8 @@ def normalize_reasoning_model_name(model_name: str) -> str:
         normalized = suffix
     if normalized == "zai-org/glm-5.2":
         return "glm-5.2"
+    if normalized in {"qwen3.8-falsh", "qwen38-falsh", "qwen38-flash"}:
+        return "qwen3.8-flash"
     return normalized
 
 

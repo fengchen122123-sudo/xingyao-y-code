@@ -10,6 +10,8 @@ def test_transport_prefix_case_and_glm_alias_resolve_to_same_model_capability():
     assert normalize_reasoning_model_name("openai/K3-256K") == "k3-256k"
     assert normalize_reasoning_model_name("anthropic/kimi-for-coding") == "kimi-for-coding"
     assert normalize_reasoning_model_name("zai-org/GLM-5.2") == "glm-5.2"
+    assert normalize_reasoning_model_name("openai/qwen3.8-falsh") == "qwen3.8-flash"
+    assert normalize_reasoning_model_name("qwen38-flash") == "qwen3.8-flash"
 
 
 def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
@@ -23,6 +25,9 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "deepseek-v4-pro": ("default", "off", "high", "max"),
         "deepseek-v4-pro-0813": ("default", "off", "low", "high", "max"),
         "qwen3.8-max": ("default", "off", "low", "medium", "xhigh"),
+        "qwen3.8-flash": ("default", "off", "low", "medium", "xhigh"),
+        "qwen38-flash": ("default", "off", "low", "medium", "xhigh"),
+        "qwen3.8-falsh": ("default", "off", "low", "medium", "xhigh"),
         "qwen3.8-27b": ("default", "off", "low", "medium", "xhigh"),
         "qwen38-27b": ("default", "off", "low", "medium", "xhigh"),
         "glm-5.2": ("default", "off", "high", "max"),
