@@ -213,11 +213,18 @@ def classify_path_access(
             return "credential_write"
         return "trusted_read"
 
-    if function_name == "read_file":
+    if function_name in {"read_file", "list_directory", "directory_tree", "search_code", "find_definition", "glob_files", "view_file_outline"}:
         try:
             from core.skills import is_trusted_read_path
 
             if is_trusted_read_path(str(path_value)):
+                return "trusted_read"
+        except Exception:
+            pass
+        try:
+            from core.tools import is_trusted_paste_path, is_session_user_attached_path
+
+            if is_trusted_paste_path(str(path_value)) or is_session_user_attached_path(str(path_value)):
                 return "trusted_read"
         except Exception:
             pass
@@ -308,6 +315,13 @@ def _sandbox_outside_guard(
 
             if is_trusted_read_path(str(path_value)):
                 return None, None
+        except Exception:
+            pass
+        try:
+            from core.tools import is_trusted_paste_path, is_session_user_attached_path
+
+            if is_trusted_paste_path(str(path_value)) or is_session_user_attached_path(str(path_value)):
+                return sandbox_bypass(), None
         except Exception:
             pass
     if getattr(tools_module._sandbox_tls, "depth", 0) > 0:
@@ -432,8 +446,9 @@ class ToolAdapterSet:
             )
 
     def _guard(self, name, path, context):
-        if self.sandbox_guard is None:
-            return _sandbox_outside_guard(
+        guard_fn = self.sandbox_guard or _sandbox_outside_guard
+        try:
+            return guard_fn(
                 name,
                 path,
                 context.event_callback,
@@ -446,15 +461,16 @@ class ToolAdapterSet:
                 sandbox_bypass=self.sandbox_bypass,
                 permission_error_type=self.permission_error_type,
             )
-        return self.sandbox_guard(
-            name,
-            path,
-            context.event_callback,
-            context.permission_owner,
-            context.parent_turn_id,
-            context.permission_source,
-            context.cancel_event,
-        )
+        except TypeError:
+            return guard_fn(
+                name,
+                path,
+                context.event_callback,
+                context.permission_owner,
+                context.parent_turn_id,
+                context.permission_source,
+                context.cancel_event,
+            )
 
     def execute_read_file(self, resolved_tool, arguments, context) -> ToolResult:
         bypass, error = self._guard("read_file", arguments.get("file_path"), context)
@@ -723,6 +739,12 @@ class ToolAdapterSet:
             guard_path = arguments.get("hint_path") or arguments.get("publish_root") or ""
         elif name.startswith("imom_"):
             guard_path = self.get_imom_active_publish_root()
+        elif isinstance(arguments.get("dir_path"), (str, os.PathLike)):
+            guard_path = arguments.get("dir_path")
+        elif isinstance(arguments.get("file_path"), (str, os.PathLike)):
+            guard_path = arguments.get("file_path")
+        elif isinstance(arguments.get("path"), (str, os.PathLike)):
+            guard_path = arguments.get("path")
 
         bypass, error = self._guard(name, guard_path, context)
         if error:

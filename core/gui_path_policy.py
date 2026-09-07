@@ -78,13 +78,14 @@ def _path_within(path: str, root: str) -> bool:
         return False
 
 
-def gui_path_access_allowed(real_path: str, workspace: str, *, action: str = "preview") -> "tuple[bool, str]":
+def gui_path_access_allowed(real_path: str, workspace: str, *, action: str = "preview", session_id: str = None) -> "tuple[bool, str]":
     """判断 GUI 预览 / 打开路径是否放行。
 
     参数:
         real_path: 已解析的绝对路径（调用方先过 _resolve_real_path）
         workspace: 当前会话工作目录；GLOBAL 自由对话会话传 "GLOBAL"
         action: "preview" 或 "open"，仅影响拒绝文案
+        session_id: 可选当前会话名，用于校验会话主动挂载附件
     返回:
         (是否放行, 拒绝原因)；放行时第二项为空字符串。
     """
@@ -98,7 +99,15 @@ def gui_path_access_allowed(real_path: str, workspace: str, *, action: str = "pr
     # 3) 会话工作区内：放行
     if _path_within(real_path, workspace):
         return True, ""
-    # 4) 工作区外：跟随沙盒开关
+    # 4) 用户显式粘贴的图片或选取的会话附件：放行
+    try:
+        from core.tools import is_trusted_paste_path, is_session_user_attached_path
+        if is_trusted_paste_path(real_path) or is_session_user_attached_path(real_path, session_id):
+            return True, ""
+    except Exception:
+        pass
+    # 5) 工作区外：跟随沙盒开关
     if _allow_outside_workspace():
         return True, ""
     return False, f"文件不在当前工作区内（沙盒开启后可{noun}工作区外文件）"
+

@@ -883,20 +883,29 @@ def authorize_tool_call(
     effective_arguments = arguments
     if sandbox_access_request:
         effective_function_name = str(arguments.get("operation") or "").strip()
-        if effective_function_name not in {"read_file", "write_file", "edit_file"}:
-            raise PermissionSystemError("沙箱外访问缺少有效的原始文件操作类型")
+        if not effective_function_name:
+            raise PermissionSystemError("沙箱外访问缺少有效的原始操作类型")
         path_value = arguments.get("path")
         effective_arguments = dict(arguments)
-        effective_arguments["file_path"] = path_value
+        if effective_function_name in {"read_file", "write_file", "edit_file"}:
+            effective_arguments["file_path"] = path_value
+        elif effective_function_name in {"list_directory", "directory_tree", "search_code", "find_definition", "glob_files"}:
+            effective_arguments["dir_path"] = path_value
+        else:
+            effective_arguments.setdefault("path", path_value)
+        try:
+            from core.tool_registry import tool_registry
+            effective_spec = tool_registry.get(effective_function_name)
+            if effective_spec is not None:
+                tool_spec = effective_spec
+        except Exception:
+            pass
     else:
-        path_value = arguments.get("file_path")
+        path_value = arguments.get("file_path") or arguments.get("dir_path") or arguments.get("path")
 
     outside_hint = bool(outside_workspace or sandbox_access_request)
     path_access = "outside" if outside_hint else "inside"
-    if (
-        path_value
-        and effective_function_name in {"read_file", "write_file", "edit_file"}
-    ):
+    if path_value:
         try:
             from core.harness.tool_adapters import classify_path_access
 
@@ -4142,6 +4151,7 @@ def _sandbox_outside_guard(
     parent_turn_id,
     permission_source,
     cancel_event,
+    **kwargs,
 ):
     """Compatibility wrapper for the extracted sandbox adapter."""
     from core.harness.tool_adapters import _sandbox_outside_guard as _guard
@@ -4154,10 +4164,10 @@ def _sandbox_outside_guard(
         parent_turn_id,
         permission_source,
         cancel_event,
-        permission_checker=check_permission_and_ask,
-        is_outside_workspace=is_outside_workspace,
-        sandbox_bypass=sandbox_bypass,
-        permission_error_type=PermissionSystemError,
+        permission_checker=kwargs.get("permission_checker", check_permission_and_ask),
+        is_outside_workspace=kwargs.get("is_outside_workspace", is_outside_workspace),
+        sandbox_bypass=kwargs.get("sandbox_bypass", sandbox_bypass),
+        permission_error_type=kwargs.get("permission_error_type", PermissionSystemError),
     )
 
 def _build_tool_pipeline_and_context(
