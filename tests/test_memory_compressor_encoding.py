@@ -54,8 +54,9 @@ def test_failed_encoding_load_retries_after_cooldown(monkeypatch):
 
 
 def test_compression_budget_uses_quarter_of_secondary_window():
-    """副模型分段必须留出足够处理余量，不能继续发送约 40% 窗口的大请求。"""
-    assert mc._compression_chunk_budget(256000) == 64000
+    """副模型分段必须留出足够处理余量（25%），且受单段 24000 token 上限约束避免打爆 TPM。"""
+    assert mc._compression_chunk_budget(256000) == 24000
+    assert mc._compression_chunk_budget(64000) == 16000
     assert mc._compression_chunk_budget(4096) == 1024
     assert mc._compression_chunk_budget(1000) == 512
 

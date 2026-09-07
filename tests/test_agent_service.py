@@ -831,3 +831,184 @@ def test_bg_summary_cancelled_task_not_takeover(monkeypatch):
 
     failed_section = summary.split("【任务 t-failed")[1]
     assert "请用自身工具" in failed_section
+
+
+def test_failed_compression_severe_overflow_trips_circuit_breaker(tmp_path, monkeypatch, stub_llm):
+    """当记忆压缩失败且历史严重超出模型窗口时，熔断停止滑窗淘汰，保护原始历史完整。"""
+    from core.agent_service import prepare_turn_messages
+    from core.memory import MemoryManager
+
+    db = tmp_path / "cb.db"
+    manager = MemoryManager(str(db))
+    session = "s_cb"
+    manager.create_session_explicit(session, workdir="GLOBAL", source="GUI")
+
+    # 写入 10 轮对话（20 条消息）
+    for i in range(10):
+        manager.add_message(session, "user", f"用户提问第 {i} 轮 " + "内容 " * 50)
+        manager.add_message(session, "assistant", f"模型回答第 {i} 轮 " + "细节 " * 50)
+
+    notices = []
+    # 模拟记忆压缩失败（返回 False）
+    monkeypatch.setattr(
+        "core.memory_compressor.compress_session_memory",
+        lambda *a, **kw: False,
+    )
+    # 模拟 estimate_tokens 返回一个远超窗口的 token 数（如窗口 1000，当前 5000）
+    monkeypatch.setattr(
+        "core.llm.estimate_tokens",
+        lambda model, msgs: 5000,
+    )
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline",
+        lambda *a, **kw: 5000,
+    )
+
+    prepare_turn_messages(
+        manager,
+        session,
+        "openai/test-small",
+        1000,
+        permission_mode="confirm",
+        notify=lambda k, msg: notices.append(msg),
+    )
+
+    # 验证触发了熔断提示
+    assert any("停止自动淘汰历史" in n or "保护您的历史对话完整" in n for n in notices)
+    # 验证历史消息没有被全部清空（仍然保留了全部消息）
+    active_history = manager.get_history_for_llm(session)
+    assert len(active_history) >= 20
+
+
+def test_compress_already_running_no_rate_limit_error(tmp_path, monkeypatch, stub_llm):
+    """当后台已有压缩正在执行（already_running）时，绝不误报服务商速率限制，保护 DB 水位，走内存裁剪。"""
+    from core.agent_service import prepare_turn_messages
+    from core.memory import MemoryManager
+    from core.memory_compressor import CompressionOutcome
+
+    db = tmp_path / "running.db"
+    manager = MemoryManager(str(db))
+    session = "s_run"
+    manager.create_session_explicit(session, workdir="GLOBAL", source="GUI")
+
+    for i in range(10):
+        manager.add_message(session, "user", f"用户提问第 {i} 轮 " + "内容 " * 50)
+        manager.add_message(session, "assistant", f"模型回答第 {i} 轮 " + "细节 " * 50)
+
+    notices = []
+    # 模拟防重入返回 already_running
+    monkeypatch.setattr(
+        "core.memory_compressor.compress_session_memory",
+        lambda *a, **kw: CompressionOutcome("skipped", "already_running"),
+    )
+    monkeypatch.setattr(
+        "core.llm.estimate_tokens",
+        lambda model, msgs: 5000,
+    )
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline",
+        lambda *a, **kw: 5000,
+    )
+
+    prepare_turn_messages(
+        manager,
+        session,
+        "openai/test-small",
+        1000,
+        permission_mode="confirm",
+        notify=lambda k, msg: notices.append(msg),
+    )
+
+    # 验证：绝不误报速率限制/失败
+    assert not any("未能成功" in n or "速率限制" in n for n in notices)
+    # 验证：提示后台正在进行中
+    assert any("后台记忆压缩仍在进行中" in n for n in notices)
+    # 验证：DB 历史完整保留
+    active_history = manager.get_history_for_llm(session)
+    assert len(active_history) >= 20
+
+
+def test_evict_max_turns_constraint(tmp_path, monkeypatch, stub_llm):
+    """滑窗淘汰受 MAX_EVICT_TURNS 约束，单次最多淘汰 2 轮，严禁无节制清空会话。"""
+    from core.agent_service import prepare_turn_messages, MAX_EVICT_TURNS
+    from core.memory import MemoryManager
+    from core.memory_compressor import CompressionOutcome
+
+    db = tmp_path / "evict.db"
+    manager = MemoryManager(str(db))
+    session = "s_evict"
+    manager.create_session_explicit(session, workdir="GLOBAL", source="GUI")
+
+    for i in range(10):
+        manager.add_message(session, "user", f"用户第 {i} 轮 " + "A" * 50)
+        manager.add_message(session, "assistant", f"助手第 {i} 轮 " + "B" * 50)
+
+    evict_calls = []
+    orig_evict = manager.evict_oldest_turn_persistent
+    def tracking_evict(s):
+        evict_calls.append(s)
+        return orig_evict(s)
+
+    manager.evict_oldest_turn_persistent = tracking_evict
+
+    monkeypatch.setattr(
+        "core.memory_compressor.compress_session_memory",
+        lambda *a, **kw: CompressionOutcome("compressed", "ok"),
+    )
+    monkeypatch.setattr(
+        "core.llm.estimate_tokens",
+        lambda model, msgs: 5000,
+    )
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline",
+        lambda *a, **kw: 5000,
+    )
+
+    prepare_turn_messages(
+        manager,
+        session,
+        "openai/test-small",
+        1000,
+        permission_mode="confirm",
+    )
+
+    assert len(evict_calls) == MAX_EVICT_TURNS
+
+
+def test_prune_history_in_memory_preserves_summary_and_last_turn():
+    """内存级裁剪：保留历史记忆摘要和最新一轮，裁剪最早轮次直到 Token 满足阈值。"""
+    from core.agent_service import _prune_history_in_memory_to_fit_window
+
+    history = [
+        {"role": "user", "content": "[历史对话记忆摘要 (以下是前段长对话的归纳记忆...)]\n这是重要背景摘要"},
+        {"role": "user", "content": "最早的问题 1"},
+        {"role": "assistant", "content": "最早的回答 1"},
+        {"role": "user", "content": "中间的问题 2"},
+        {"role": "assistant", "content": "中间的回答 2"},
+        {"role": "user", "content": "最新的问题 3"},
+    ]
+    system_msg = {"role": "system", "content": "system prompt"}
+
+    def mock_estimate(model, msgs):
+        return len(msgs) * 100
+
+    import core.llm
+    orig_estimate = core.llm.estimate_tokens
+    try:
+        core.llm.estimate_tokens = mock_estimate
+        # window=400, SUMMARIZE_RATIO=0.95 -> limit = 380 tokens
+        # [system] + 6 msgs = 700 tokens > 380
+        # 裁剪 1 轮（最早的问题1 + 回答1）后 -> 5 msgs = 500 tokens > 380
+        # 裁剪 2 轮（中间的问题2 + 回答2）后 -> 3 msgs (system + 摘要 + 最新问题3) = 300 <= 380 -> 结束
+        pruned = _prune_history_in_memory_to_fit_window(history, window=400, model_name="test", system_message=system_msg)
+        assert pruned == 2
+        # 摘要必须保留在开头
+        assert history[0]["content"].startswith("[历史对话记忆摘要")
+        # 最新问题必须保留在末尾
+        assert history[-1]["content"] == "最新的问题 3"
+        # 最早和中间的轮次被剔除
+        assert not any(m["content"] == "最早的问题 1" for m in history)
+        assert not any(m["content"] == "中间的问题 2" for m in history)
+    finally:
+        core.llm.estimate_tokens = orig_estimate
+

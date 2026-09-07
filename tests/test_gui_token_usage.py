@@ -189,3 +189,110 @@ def test_gui_registers_realtime_listener_on_init(monkeypatch):
     assert len(usage_events) == 1
     assert usage_events[0]["used"] == 36800
     assert usage_events[0]["total_prompt"] == 480000
+
+
+def test_ensure_fits_active_window_runs_asynchronously(tmp_path, monkeypatch):
+    """验证 _ensure_fits_active_window 触发压缩时派发到后台线程，不阻塞调用方（门闩机制消除假阳性）。"""
+    bridge = _bridge_without_init("async-session")
+    db = tmp_path / "async.db"
+    bridge._memory = MemoryManager(str(db))
+    bridge._current_permission_mode = "confirm"
+    bridge._window = None
+    bridge._shutting_down = False
+    bridge.emit_event = lambda *a, **kw: None
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda session: {
+        "litellm_model": "openai/small",
+        "context_window": 1000,
+        "api_key": "k",
+        "base_url": "",
+    })
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline",
+        lambda *a, **kw: 5000,
+    )
+
+    bg_started = threading.Event()
+    bg_finished = threading.Event()
+    latch = threading.Event()
+
+    def fake_prepare(*args, **kwargs):
+        bg_started.set()
+        latch.wait(timeout=3.0)
+        bg_finished.set()
+
+    monkeypatch.setattr("core.agent_service.prepare_turn_messages", fake_prepare)
+
+    bridge._ensure_fits_active_window("async-session")
+
+    # 核心断言：主线程返回瞬间，后台线程已启动但被 latch 门闩阻断（同步实现必在此前已 set finished）
+    assert bg_started.wait(timeout=1.0) is True
+    assert bg_finished.is_set() is False
+
+    # 释放门闩，后台平稳退出
+    latch.set()
+    assert bg_finished.wait(timeout=1.0) is True
+
+
+def test_ensure_fits_active_window_skips_when_turn_active(tmp_path, monkeypatch):
+    """当会话已有活跃回合时，跳过切模型异步压缩。"""
+    bridge = _bridge_without_init("active-session")
+    db = tmp_path / "active.db"
+    bridge._memory = MemoryManager(str(db))
+    bridge._current_permission_mode = "confirm"
+    bridge._window = None
+    bridge._shutting_down = False
+    bridge.emit_event = lambda *a, **kw: None
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda session: {
+        "litellm_model": "openai/small",
+        "context_window": 1000,
+    })
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline",
+        lambda *a, **kw: 5000,
+    )
+    monkeypatch.setattr(bridge, "_is_turn_active", lambda session: True)
+
+    bg_started = threading.Event()
+    monkeypatch.setattr(
+        "core.agent_service.prepare_turn_messages",
+        lambda *a, **kw: bg_started.set(),
+    )
+
+    bridge._ensure_fits_active_window("active-session")
+    assert bg_started.wait(timeout=0.1) is False
+
+
+def test_ensure_fits_active_window_skips_when_compressing(tmp_path, monkeypatch):
+    """当会话后台已在进行记忆压缩时，跳过切模型异步压缩。"""
+    bridge = _bridge_without_init("comp-session")
+    db = tmp_path / "comp.db"
+    bridge._memory = MemoryManager(str(db))
+    bridge._current_permission_mode = "confirm"
+    bridge._window = None
+    bridge._shutting_down = False
+    bridge.emit_event = lambda *a, **kw: None
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda session: {
+        "litellm_model": "openai/small",
+        "context_window": 1000,
+    })
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline",
+        lambda *a, **kw: 5000,
+    )
+    monkeypatch.setattr(
+        "core.memory_compressor.is_session_compressing",
+        lambda mgr, s: True,
+    )
+
+    bg_started = threading.Event()
+    monkeypatch.setattr(
+        "core.agent_service.prepare_turn_messages",
+        lambda *a, **kw: bg_started.set(),
+    )
+
+    bridge._ensure_fits_active_window("comp-session")
+    assert bg_started.wait(timeout=0.1) is False
+
