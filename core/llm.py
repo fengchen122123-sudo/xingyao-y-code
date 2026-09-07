@@ -308,6 +308,54 @@ def _litellm_context_overflow_error():
     return _get_litellm().ContextWindowExceededError
 
 
+def is_rate_limit_error(exc: Exception) -> tuple[bool, float | None]:
+    """判断异常是否属于速率限制（429 / RateLimit / TooManyRequests）。
+    返回 (is_rate_limit, retry_after_seconds)。
+    """
+    if exc is None:
+        return False, None
+    retry_after = None
+    # 1. 尝试从 response headers 读取 retry-after
+    try:
+        resp = getattr(exc, "response", None)
+        if resp is not None and hasattr(resp, "headers"):
+            raw_ra = resp.headers.get("retry-after") or resp.headers.get("Retry-After")
+            if raw_ra:
+                val = float(raw_ra)
+                if 0 < val <= 60.0:
+                    retry_after = val
+    except Exception:
+        pass
+
+    # 2. 检查 status_code
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 429:
+        return True, retry_after
+
+    # 3. 检查异常类型
+    exc_type = type(exc).__name__.lower()
+    if "ratelimit" in exc_type:
+        return True, retry_after
+
+    try:
+        litellm_rate_err = _get_litellm().exceptions.RateLimitError
+        if isinstance(exc, litellm_rate_err):
+            return True, retry_after
+    except Exception:
+        pass
+
+    # 4. 字符串内容匹配（不区分大小写，包含常见中文/英文关键词与无空格形式）
+    err_str = str(exc).lower()
+    if any(k in err_str for k in (
+        "rate limit", "ratelimit", "too many requests",
+        "too frequent", "请求过于频繁", "accountratelimitexceeded",
+        "throttl",
+    )):
+        return True, retry_after
+
+    return False, None
+
+
 # 单次 API 请求超时（秒）：长思考模型的首个 token 可能较慢，不宜过紧
 API_REQUEST_TIMEOUT_SECONDS = 90
 
@@ -2680,6 +2728,136 @@ def _is_glm_family(model_name, api_base=""):
     return "glm" in model or _is_official_zhipu_route(api_base)
 
 
+def _is_official_dashscope_route(api_base=""):
+    """只识别阿里云百炼/灵积官方端点（dashscope.aliyuncs.com、maas.aliyuncs.com 等）。"""
+    try:
+        parsed = urlsplit(str(api_base or ""))
+        host = str(parsed.hostname or "").lower()
+        port = parsed.port
+    except Exception:
+        return False
+    if (
+        str(parsed.scheme or "").lower() != "https"
+        or parsed.username is not None
+        or parsed.password is not None
+        or port not in (None, 443)
+        or parsed.query
+        or parsed.fragment
+    ):
+        return False
+    if host in {"dashscope.aliyuncs.com", "dashscope-intl.aliyuncs.com"}:
+        return True
+    if host.endswith(".aliyuncs.com") and "dashscope" in host:
+        return True
+    if host.endswith(".maas.aliyuncs.com"):
+        return True
+    return False
+
+
+def _is_qwen_family(model_name, api_base=""):
+    """判断是否 Qwen/通义千问系模型（模型名优先，api_base 兜底）。"""
+    model = str(model_name or "").split("/")[-1].lower()
+    if "qwen" in model or "dashscope" in model:
+        return True
+    b = str(api_base or "").lower()
+    return "dashscope" in b or _is_official_dashscope_route(api_base)
+
+
+_QWEN_CACHE_CONFIG_KEYS = (
+    "enable_prompt_cache",
+    "prompt_cache",
+    "enable_cache_control",
+    "cache_control",
+)
+
+# 缓存开关判定在一轮对话里会被反复触发（_qwen_cache_enabled / _supports_cache_control /
+# _supports_cache_keepalive / tools 规范化），而 load_config 每次都要读盘并解析整个
+# config.json。这里按 (模型, 路由) 记忆解析结果，并用「配置指纹」做失效：
+# 指纹 = load_config 函数身份（热重载/测试替换）+ 配置文件 mtime（用户真实编辑），
+# 再叠加短 TTL 兜底，保证配置变更最迟 _QWEN_CACHE_CFG_TTL_SECONDS 秒后被看到。
+_qwen_cache_cfg_cache = {}
+_qwen_cache_cfg_lock = threading.RLock()
+_QWEN_CACHE_CFG_TTL_SECONDS = 10.0
+
+
+def _qwen_cache_config_stamp():
+    """返回配置来源指纹；拿不到时返回 None，此时宁可不缓存也不给出过期结论。"""
+    try:
+        import config as config_module
+        from core.model_manager import load_config as loader
+    except Exception:
+        return None
+    try:
+        mtime = os.stat(str(config_module._CONFIG_FILE)).st_mtime_ns
+    except Exception:
+        mtime = 0
+    # 连同 loader 引用一起返回：持有引用可防止该对象被回收后 id 被新函数复用
+    return (id(loader), loader, mtime)
+
+
+def _resolve_model_config(model_name, api_base="", model_cfg=None):
+    """获取模型/厂商配置（优先使用传入的 model_cfg，否则从 config.json 读取并继承 provider 缓存配置）。"""
+    cfg = dict(model_cfg) if isinstance(model_cfg, dict) and model_cfg else None
+    if cfg is not None and any(k in cfg for k in _QWEN_CACHE_CONFIG_KEYS):
+        return cfg
+
+    # 显式传入 model_cfg 时不缓存：它的字段要参与本次合并，缓存会丢掉调用方上下文
+    stamp = None if cfg else _qwen_cache_config_stamp()
+    key = (str(model_name or "").strip(), str(api_base or "").rstrip("/").lower())
+    now = time.monotonic()
+    if stamp is not None:
+        with _qwen_cache_cfg_lock:
+            cached = _qwen_cache_cfg_cache.get(key)
+            if cached and cached[0] > now and cached[1] == stamp:
+                return cached[2]
+
+    resolved = None
+    try:
+        from core.model_manager import load_config
+
+        data = load_config()
+        m_str = str(model_name or "").strip()
+        base_url = str(api_base or "").rstrip("/").lower()
+        for provider in data.get("providers", []):
+            p_base = str(provider.get("base_url") or "").rstrip("/").lower()
+            for model in provider.get("models", []):
+                if model.get("litellm_model") != m_str:
+                    continue
+                if base_url and p_base and p_base != base_url:
+                    continue
+                merged = {}
+                for k in _QWEN_CACHE_CONFIG_KEYS:
+                    if k in provider:
+                        merged[k] = provider[k]
+                merged.update(model)
+                if cfg:
+                    merged.update(cfg)
+                resolved = merged
+                break
+            if resolved is not None:
+                break
+    except Exception:
+        pass
+    if resolved is None:
+        resolved = cfg or {}
+    if stamp is not None:
+        with _qwen_cache_cfg_lock:
+            _qwen_cache_cfg_cache[key] = (
+                now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, resolved,
+            )
+    return resolved
+
+
+def _qwen_cache_enabled(model_name, api_base="", model_cfg=None):
+    """判断当前 Qwen 模型路由是否开启了缓存加速（官方百炼或配置显式开启）。"""
+    if not _is_qwen_family(model_name, api_base):
+        return False
+    if _is_official_dashscope_route(api_base):
+        return True
+    cfg = _resolve_model_config(model_name, api_base, model_cfg)
+    return bool(cfg.get("enable_prompt_cache") or cfg.get("prompt_cache"))
+
+
 def _litellm_rejects_tool_choice(model_name):
     """litellm 是否会在客户端拒绝该模型的 tool_choice 参数。
 
@@ -2732,12 +2910,13 @@ def _uses_deepseek_prompt_ledger(
     )
 
 
-def _select_request_tools_for_route(model_name, api_base, tools):
-    """Canonicalize only DeepSeek tools; preserve every other provider payload."""
-    if not (
+def _select_request_tools_for_route(model_name, api_base, tools, model_cfg=None):
+    """Canonicalize tools for official DeepSeek and Qwen routes (official DashScope or config-enabled); preserve every other provider payload."""
+    canonicalize = (
         _is_deepseek_family(model_name, api_base)
         and _is_official_deepseek_route(api_base)
-    ):
+    ) or _qwen_cache_enabled(model_name, api_base, model_cfg)
+    if not canonicalize:
         return tools
     selected = deepcopy(list(tools or []))
     return sorted(
@@ -2860,8 +3039,8 @@ def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
     return "v4" in model or "reasoner" in model
 
 
-def _supports_cache_keepalive(model_name, api_base=""):
-    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi/智谱官方路由。"""
+def _supports_cache_keepalive(model_name, api_base="", model_cfg=None):
+    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi/智谱/百炼官方路由（或 Qwen 显式配置开启缓存）。"""
     return (
         _is_kimi_family(model_name, api_base)
         and _is_official_kimi_route(api_base)
@@ -2871,17 +3050,19 @@ def _supports_cache_keepalive(model_name, api_base=""):
     ) or (
         _is_glm_family(model_name, api_base)
         and _is_official_zhipu_route(api_base)
-    )
+    ) or _qwen_cache_enabled(model_name, api_base, model_cfg)
 
 
 def _supports_reasoning_fields(model_name, api_base=""):
     prefix = str(model_name or "").split("/")[0].lower()
     if prefix in _REASONING_FIELD_PROVIDERS:
         return True
-    # Kimi 推理模型（含经销商 openai/ 路由）：多轮工具调用要求 assistant
-    # 消息保留 reasoning_content，剥掉会导致 400 或推理链断裂
-    return _is_kimi_family(model_name, api_base) or _is_deepseek_family(
-        model_name, api_base
+    # Kimi / DeepSeek / Qwen 推理模型（含各类经销商 openai/ 路由）：多轮工具调用要求 assistant
+    # 消息保留 reasoning_content，剥掉会导致 400、推理链断裂或 KV cache 前缀断层失效
+    return (
+        _is_kimi_family(model_name, api_base)
+        or _is_deepseek_family(model_name, api_base)
+        or _is_qwen_family(model_name, api_base)
     )
 
 
@@ -2895,22 +3076,96 @@ def _requires_tool_call_reasoning(model_name, api_base=""):
     return _deepseek_thinking_enabled(model_name, api_base, model_cfg)
 
 
-# 支持 prompt caching 的 provider 白名单（按 litellm model 前缀匹配）
-# 仅 Anthropic 需要显式 cache_control 标记：
-#   - anthropic: 需显式标记，命中后缓存 token 按 1/10 计费
-#   - deepseek/openai: 自动缓存命中，无需标记；显式标记反而可能被某些严格校验的
-#     OpenAI 兼容网关（如部分国产中转）拒绝为 400。保守起见不启用。
+# 需要显式 cache_control 标记才启用 prompt caching 的 provider 白名单（按 litellm 前缀）：
+#   - anthropic: 必须显式标记，命中后缓存 token 按 1/10 计费
+# Qwen 不在此白名单里，但走官方百炼路由或 config.json 显式声明
+# enable_cache_control / cache_control 时同样启用（见 _supports_cache_control）；
+# 其余 OpenAI 兼容网关默认不标记——隐式缓存本就命中，而显式标记可能被严格校验的
+# 网关拒绝为 400（真被拒绝时由 _disable_cache_control_route 临时降级兜底）。
 _CACHE_CONTROL_PROVIDERS = ("anthropic",)
 
+# 被上游以 400 明确拒绝过 cache_control 的路由 -> 恢复时间戳（monotonic）。
+# 只临时拉黑：一次误判（例如中转站偶发的参数校验抖动）不该把该路由的优化
+# 永久关掉直到进程重启，到期后自动再给一次机会。
+_cache_control_disabled_routes = {}
+_cache_control_disabled_lock = threading.RLock()
+_CACHE_CONTROL_REJECTION_TTL_SECONDS = 900.0
 
-def _supports_cache_control(model_name):
+
+def _cache_control_route_key(model_name, api_base):
+    return (str(model_name or ""), str(api_base or "").rstrip("/").lower())
+
+
+def _disable_cache_control_route(model_name, api_base, ttl_seconds=None):
+    """临时禁用某路由的 cache_control 标记，返回被拉黑的路由 key。"""
+    ttl = (
+        _CACHE_CONTROL_REJECTION_TTL_SECONDS
+        if ttl_seconds is None else float(ttl_seconds)
+    )
+    key = _cache_control_route_key(model_name, api_base)
+    with _cache_control_disabled_lock:
+        _cache_control_disabled_routes[key] = time.monotonic() + ttl
+    return key
+
+
+def _cache_control_route_disabled(model_name, api_base):
+    """该路由是否仍在 cache_control 拉黑期内（过期条目顺手清理）。"""
+    key = _cache_control_route_key(model_name, api_base)
+    now = time.monotonic()
+    with _cache_control_disabled_lock:
+        expire_at = _cache_control_disabled_routes.get(key)
+        if expire_at is None:
+            return False
+        if expire_at <= now:
+            _cache_control_disabled_routes.pop(key, None)
+            return False
+        return True
+
+
+def _is_cache_control_rejection(api_err):
+    """判定上游是否以 400/bad request 明确拒绝了 cache_control 字段。
+
+    必须同时满足两个条件，缺一不判：
+    1. 状态码确为 400（或类型是 litellm 的 BadRequestError）；
+    2. 错误文本点名 cache_control / ephemeral 这类缓存断点字段。
+    只按文案关键词（"400"/"invalid"/"schema"）宽泛匹配的话，一次无关故障
+    （网络抖动文案里带字节数、上游 5xx）就会把该路由的优化整体关掉。
+    """
+    if api_err is None:
+        return False
+    is_bad_request = (
+        getattr(api_err, "status_code", None) == 400
+        or type(api_err).__name__ == "BadRequestError"
+    )
+    if not is_bad_request:
+        return False
+    text = str(api_err).lower()
+    return "cache_control" in text or "cache control" in text or "ephemeral" in text
+
+
+def _supports_cache_control(model_name, api_base="", model_cfg=None):
     """判断 provider 是否支持 cache_control 字段。
 
-    保守策略：仅对 Anthropic 启用。其他 provider（含 OpenAI 兼容端点）自动缓存命中，
-    无需显式标记；显式标记反而可能被严格校验的网关拒绝为 400。
+    保守策略：
+    - Anthropic：始终支持
+    - Qwen 家族：官方百炼路由默认启用；第三方网关若配置了 enable_cache_control / cache_control 则启用
+    - 若先前已被上游 400 拒绝，降级一段时间（TTL 到期后自动恢复）
     """
+    if _cache_control_route_disabled(model_name, api_base):
+        return False
+
     prefix = str(model_name or "").split("/")[0].lower()
-    return prefix in _CACHE_CONTROL_PROVIDERS
+    if prefix in _CACHE_CONTROL_PROVIDERS:
+        return True
+
+    if not _is_qwen_family(model_name, api_base):
+        return False
+
+    if _is_official_dashscope_route(api_base):
+        return True
+
+    cfg = _resolve_model_config(model_name, api_base, model_cfg)
+    return bool(cfg.get("enable_cache_control") or cfg.get("cache_control"))
 
 
 def _tool_contract_fingerprint(tools):
@@ -2924,7 +3179,7 @@ def _tool_contract_fingerprint(tools):
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
-def _apply_cache_control(messages, model_name):
+def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disabled=False):
     """给消息列表加 cache_control 标记，启用 provider 侧 prompt caching。
 
     标记策略：
@@ -2934,35 +3189,84 @@ def _apply_cache_control(messages, model_name):
       而非稳定前缀（多 tool 结果会让断点每轮移动，二级缓存几乎永远 miss）。
       最后一条 assistant 消息是上一轮的回复，在当前轮 tool 调用期间保持稳定，
       provider 可以缓存到该位置，下一轮 tool 结果追加时前缀稳定命中。
+    - 尾部 user 消息（Qwen 分支）：把本轮新增内容当场写入缓存，省掉一个轮次的
+      miss 窗口。详见下方第 3 步注释。
 
-    Anthropic 限制：单次请求最多 4 个 cache_control 标记。
-    本策略仅用 2 个，远低于上限，安全。
+    Anthropic / DashScope 限制：单次请求最多 4 个 cache_control 标记。
+    本策略最多用 3 个（system + 上一条 assistant + 尾部 user），留 1 个余量。
+
+    对于 DashScope / Qwen 兼容模式：格式为 content 文本块内的 cache_control: {"type": "ephemeral"}；
+    对于 Anthropic 协议：格式为消息顶层 cache_control: {"type": "ephemeral"}，由 LiteLLM 处理。
 
     本函数原地修改并返回 messages；调用方已通过 _strip_media_and_merge 处理过副本，
     不会污染 messages 列表本身。
     """
-    if not _supports_cache_control(model_name):
+    if disabled:
+        return messages
+    if not _supports_cache_control(model_name, api_base, model_cfg):
         return messages
     if not messages:
         return messages
+
+    is_qwen = _is_qwen_family(model_name, api_base)
 
     # 清除已有标记，避免累积（_strip_media_and_merge 不传 cache_control，但兜底防御）
     for msg in messages:
         if isinstance(msg, dict):
             msg.pop("cache_control", None)
+            content = msg.get("content")
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, dict):
+                        item.pop("cache_control", None)
+
+    def _mark_message(msg):
+        if is_qwen:
+            content = msg.get("content")
+            if isinstance(content, str) and content:
+                msg["content"] = [
+                    {
+                        "type": "text",
+                        "text": content,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            elif isinstance(content, list) and content:
+                for item in reversed(content):
+                    if isinstance(item, dict) and item.get("type") in ("text", "input_text"):
+                        item["cache_control"] = {"type": "ephemeral"}
+                        break
+        else:
+            msg["cache_control"] = {"type": "ephemeral"}
 
     # 1. 标记 system 消息（如果有）
     if messages[0].get("role") == "system":
-        messages[0]["cache_control"] = {"type": "ephemeral"}
+        _mark_message(messages[0])
 
     # 2. 标记最后一条 assistant 消息（缓存边界）
     #    遍历从后往前找第一条 role=="assistant" 的消息。
     #    如果最后一条已经是 assistant（无 tool 调用），就标它；
     #    如果末尾是 tool 结果，就标它们之前的 assistant（更稳定）。
+    last_assistant_idx = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
-            messages[i]["cache_control"] = {"type": "ephemeral"}
+            _mark_message(messages[i])
+            last_assistant_idx = i
             break
+
+    # 3. 尾部断点（仅 Qwen content 块形态）：把本轮新增内容立刻写进缓存，
+    #    下一轮的前缀就能覆盖到它——稳态 miss 从「上一轮 + 本轮新增」降到
+    #    「仅本轮新增」。基元律动实测：热轮 miss 105 → 52 token，hot_rate +0.43pp。
+    #    约束：
+    #    - 只标 user 尾部。tool 消息在 OpenAI 兼容协议里 content 必须是字符串，
+    #      改成 content 块会被上游判非法载荷；工具轮次里新增的 tool 结果本来就在
+    #      下一个 assistant 断点之前，会随断点前移被写入缓存，无需额外标记。
+    #    - 尾部已是刚标过的 assistant 时不重复标记（省断点配额）。
+    #    - 与 system、上一条 assistant 合计 3 个，仍低于 provider 的 4 个上限。
+    if is_qwen and len(messages) - 1 != last_assistant_idx:
+        tail = messages[-1]
+        if isinstance(tail, dict) and tail.get("role") == "user":
+            _mark_message(tail)
 
     return messages
 
@@ -3259,6 +3563,30 @@ def _attach_kimi_request_extras(
             result.setdefault("extra_body", {})["prompt_cache_key"] = session_id
 
 
+def _attach_qwen_request_extras(
+    result,
+    model_name,
+    model_cfg,
+    *,
+    api_base="",
+    cache_scope="main",
+    cache_session_id=None,
+    tool_contract="",
+):
+    """给 Qwen 系模型的请求参数附加缓存优化配置（原地修改 result）。
+
+    - 官方路由（dashscope.aliyuncs.com 等）或配置显式开启缓存：
+      主会话、基准测试及子代理请求（main, benchmark:main, subagent:*）
+      附加 extra_headers={"x-dashscope-session-cache": "enable"}
+      开启服务端多轮会话自动上下文缓存。
+    """
+    scope_str = str(cache_scope or "main")
+    scope_eligible = scope_str in {"main", "benchmark:main"} or scope_str.startswith("subagent")
+    if scope_eligible and _qwen_cache_enabled(model_name, api_base, model_cfg):
+        if not isinstance(result.get("extra_headers"), dict):
+            result["extra_headers"] = {}
+        result["extra_headers"]["x-dashscope-session-cache"] = "enable"
+
 
 def _configured_reasoning_choice(model_cfg, capability):
     """把新选择字段和历史配置统一成能力表中的一个合法选择。"""
@@ -3416,18 +3744,27 @@ def _provider_cache_affinity_options(
     tool_contract="",
 ):
     """仅返回 provider 缓存亲和参数，不改变输出长度或推理配置。"""
-    if not _is_kimi_family(model_name, api_base):
-        return {}
     result = {}
-    _attach_kimi_request_extras(
-        result,
-        model_name,
-        {},
-        api_base=api_base,
-        cache_scope=cache_scope,
-        cache_session_id=cache_session_id,
-        tool_contract=tool_contract,
-    )
+    if _is_kimi_family(model_name, api_base):
+        _attach_kimi_request_extras(
+            result,
+            model_name,
+            {},
+            api_base=api_base,
+            cache_scope=cache_scope,
+            cache_session_id=cache_session_id,
+            tool_contract=tool_contract,
+        )
+    elif _is_qwen_family(model_name, api_base):
+        _attach_qwen_request_extras(
+            result,
+            model_name,
+            {},
+            api_base=api_base,
+            cache_scope=cache_scope,
+            cache_session_id=cache_session_id,
+            tool_contract=tool_contract,
+        )
     return result
 
 
@@ -3570,6 +3907,16 @@ def _provider_request_options(
 
     if kimi_family:
         _attach_kimi_request_extras(
+            result,
+            model_name,
+            model_cfg,
+            api_base=api_base,
+            cache_scope=cache_scope,
+            cache_session_id=cache_session_id,
+            tool_contract=tool_contract,
+        )
+    if _is_qwen_family(model_name, api_base):
+        _attach_qwen_request_extras(
             result,
             model_name,
             model_cfg,
@@ -4790,17 +5137,18 @@ def _chat_with_model_generator(
         or schema.get("function", {}).get("name") not in _MCP_ADMIN_TOOLS
     ]
 
-    request_tools = _select_request_tools_for_route(
-        model_name, api_base, request_tools
-    )
     # generic 电脑操控工具只在 Turn 冻结 capability 为 enabled+generic 且主代理
-    # 回合时追加到路由结果尾部（Task 10 Step 5，设计 19.1）：复制列表追加，
+    # 回合时参与请求（Task 10 Step 5，设计 19.1）：复制列表追加，
     # 绝不缓存进全局 get_tools_schema()；capability 关闭时 tools 字节与
     # pre-feature 基线完全一致（deepcopy 副本，不污染模块级 schema 常量）。
     if computer_capability is not None and allow_subagents:
         computer_tool = build_generic_computer_tool(computer_capability)
         if computer_tool is not None:
             request_tools = [*request_tools, computer_tool]
+
+    request_tools = _select_request_tools_for_route(
+        model_name, api_base, request_tools
+    )
     # 原生 OpenAI 协议（Task 11a，设计 11.1/11.2）：native tools 不进
     # request_tools（chat 格式），而是经 prepare_stream_request 的
     # native_computer_tools 参数追加在 flattened function tools 之后；
@@ -5003,6 +5351,7 @@ def _chat_with_model_generator(
             request_diagnostic = None
             active_deepseek_generation_id = None
             active_deepseek_message_count = None
+            cache_control_downgraded = False
 
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
@@ -5057,7 +5406,12 @@ def _chat_with_model_generator(
                         )
                         request_cache_reason = request_diagnostic["request_reason"]
                         classified_message_shape = current_message_shape
-                    kwargs["messages"] = _apply_cache_control(cleaned_messages, model_name)
+                    kwargs["messages"] = _apply_cache_control(
+                        cleaned_messages,
+                        model_name,
+                        api_base,
+                        disabled=cache_control_downgraded,
+                    )
                     # 历史图片折叠属于正常节省行为，不再向用户弹提示打扰
                     # 超时随载荷放大：超大上下文 + 深度思考的首个 token 可能要几分钟，
                     # 90s 一刀切会让大载荷反复超时重发（每次重发输入都全额计费）
@@ -5238,18 +5592,32 @@ def _chat_with_model_generator(
                                     "message": str(compress_err),
                                 })
 
+                    # 上游以 400 明确拒绝 cache_control：本轮剥离标记立即重发，
+                    # 并按路由临时拉黑（TTL 到期自愈），避免整轮 5 次重试全部撞墙
+                    if not cache_control_downgraded and _is_cache_control_rejection(api_err):
+                        cache_control_downgraded = True
+                        _disable_cache_control_route(model_name, api_base)
+                        warn_msg = (
+                            "上游拒绝 cache_control 参数 (400)，已剥离标记并降级重试；"
+                            f"该路由的显式断点在 {int(_CACHE_CONTROL_REJECTION_TTL_SECONDS // 60)} 分钟内不再启用。"
+                        )
+                        if event_callback is None:
+                            print(f"\n[⚠️ {warn_msg}]")
+                        else:
+                            _notify_event(event_callback, "status", {"message": warn_msg})
+                        if attempt < max_api_retries - 1:
+                            continue
+
                     if attempt < max_api_retries - 1:
                         # 速率限制（429 / TooManyRequests / RateLimitError）需要更长退避，
-                        # 普通网络抖动用短退避即可。
-                        is_rate_limit = (
-                            "rate limit" in err_str
-                            or "too many requests" in err_str
-                            or "too frequent" in err_str
-                            or "AccountRateLimitExceeded" in str(api_err)
-                        )
+                        # 普通网络抖动用短退避即可。优先遵守上游 retry-after 头。
+                        is_rate_limit, retry_after = is_rate_limit_error(api_err)
                         if is_rate_limit:
-                            rate_limit_base_delay = 5.0
-                            sleep_time = (rate_limit_base_delay * (2 ** attempt)) + (random.random() * 1.0)
+                            if retry_after is not None and retry_after > 0:
+                                sleep_time = retry_after + (random.random() * 0.5)
+                            else:
+                                rate_limit_base_delay = 5.0
+                                sleep_time = (rate_limit_base_delay * (2 ** attempt)) + (random.random() * 1.0)
                             retry_message = (
                                 f"触发 API 速率限制，正在进行第 {attempt+1}/{max_api_retries} 次重试，"
                                 f"等待 {sleep_time:.1f} 秒"
