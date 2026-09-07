@@ -32,6 +32,38 @@ DEFAULT_SUMMARY_LENGTH_MERGE = 350
 COMPRESSION_CHUNK_WINDOW_RATIO = 0.25
 COMPRESSION_TIMEOUT_TOKENS_PER_SECOND = 1500
 
+# 单段 Chunk 预算上限：即使模型窗口高达 256k/1M，单段载荷也不超过 24000 token。
+# 避免过大 Prompt 一次性打满服务商的 TPM (Tokens Per Minute) 突发限制触发 429，
+# 同时中小载荷能显著提升模型对事实细节的提取质量。
+DEFAULT_MAX_CHUNK_TOKEN_BUDGET = 24000
+
+# 多段压缩时的段间平滑延时（秒），给服务商滑动窗口令牌桶恢复时间
+COMPRESSION_INTER_CHUNK_DELAY_SECONDS = 1.5
+
+# 压缩请求触发 429 RateLimitError 时的基础退避秒数与最大重试次数
+COMPRESSION_RATE_LIMIT_BASE_DELAY_SECONDS = 5.0
+COMPRESSION_MAX_RETRIES = 3
+
+
+class CompressionOutcome:
+    """记忆压缩执行结果三态封装（compressed / skipped / failed）。"""
+    def __init__(self, status: str, reason: str = ""):
+        self.status = status  # "compressed", "skipped", "failed"
+        self.reason = reason
+
+    def __bool__(self):
+        return self.status == "compressed"
+
+    def __repr__(self):
+        return f"CompressionOutcome(status={self.status!r}, reason={self.reason!r})"
+
+
+def is_session_compressing(manager, session_name: str) -> bool:
+    """检查指定会话当前是否已有记忆压缩任务在后台执行。"""
+    guard_key = (id(manager), session_name)
+    with _compress_guard:
+        return guard_key in _compressing_sessions
+
 
 def _load_compression_config():
     """读取 config.json 中的记忆压缩配置，失败时返回默认值。"""
@@ -119,8 +151,9 @@ def _get_encoding(timeout=10.0):
 
 
 def _compression_chunk_budget(context_window):
-    """压缩正文预算：窗口的 25%，极小窗口也至少保留 512 token。"""
-    return max(512, int(int(context_window) * COMPRESSION_CHUNK_WINDOW_RATIO))
+    """压缩正文预算：窗口的 25%，极小窗口至少保留 512 token，同时设置绝对上限 24000 token。"""
+    raw_budget = max(512, int(int(context_window) * COMPRESSION_CHUNK_WINDOW_RATIO))
+    return min(DEFAULT_MAX_CHUNK_TOKEN_BUDGET, raw_budget)
 
 
 def _compression_request_timeout(prompt_tokens):
@@ -243,6 +276,20 @@ def _build_summary_prompt(old_summary, chat_log, summary_limit):
     )
 
 
+def _cancellable_sleep(duration, cancel_event=None):
+    """支持被 cancel_event 打断的切片休眠。"""
+    if duration <= 0:
+        return True
+    import time as _time
+    deadline = _time.monotonic() + duration
+    while _time.monotonic() < deadline:
+        if cancel_event is not None and cancel_event.is_set():
+            return False
+        rem = deadline - _time.monotonic()
+        _time.sleep(min(0.2, rem) if rem > 0 else 0.2)
+    return True
+
+
 def compress_session_memory(
     manager,
     session_name,
@@ -251,6 +298,9 @@ def compress_session_memory(
     api_url,
     force=False,
     output_callback=None,
+    cancel_event=None,
+    max_timeout_seconds=180.0,
+    return_outcome=False,
 ):
     """
     智能归纳压缩会话记忆：
@@ -274,20 +324,26 @@ def compress_session_memory(
     with _compress_guard:
         if guard_key in _compressing_sessions:
             emit("<ansiyellow>ℹ 记忆压缩已在进行中，本次请求已跳过。</ansiyellow>")
+            if return_outcome:
+                return CompressionOutcome("skipped", "already_running")
             return False
         _compressing_sessions.add(guard_key)
 
     try:
-        return _do_compress(
+        outcome = _do_compress(
             manager, session_name, api_model, api_key, api_url,
-            force=force, emit=emit,
+            force=force, emit=emit, cancel_event=cancel_event,
+            max_timeout_seconds=max_timeout_seconds,
         )
+        if return_outcome:
+            return outcome
+        return outcome.status == "compressed"
     finally:
         with _compress_guard:
             _compressing_sessions.discard(guard_key)
 
 
-def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit):
+def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit, cancel_event=None, max_timeout_seconds=180.0):
     config = _load_compression_config()
     try:
         # 多步读写期间持有 manager 的可重入锁，与 add_messages 等写路径互斥
@@ -299,7 +355,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             cursor.execute('SELECT id, memory_summary, summarized_until_msg_id FROM sessions WHERE session_name = ?', (session_name,))
             row = cursor.fetchone()
             if not row:
-                return False
+                return CompressionOutcome("skipped", "session_not_found")
 
             session_id = row[0]
             old_summary = row[1]
@@ -326,7 +382,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             if len(all_active_messages) <= retain_count + 2:
                 if force:
                     emit(f"<ansiyellow>ℹ 当前会话活跃对话过少（少于 {retain_count + 2} 条），无需进行记忆压缩。</ansiyellow>")
-                return False
+                return CompressionOutcome("skipped", "too_few_messages")
 
             messages_to_summarize = all_active_messages[:-retain_count]
             # 截断点绝不能落在工具调用组中间：若保留区的第一条消息是 tool 结果，
@@ -342,7 +398,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 # 全部归入待压缩区后保留区清空：本次压缩没有可安全推进边界的
                 # 锚点，强行压缩会让孤儿 tool 进入摘要且活跃区无消息，直接拒绝。
                 emit("<ansiyellow>ℹ 保留区均为工具结果且配对助手消息在待压缩区，本次压缩已跳过（等待更多对话后再压缩）。</ansiyellow>")
-                return False
+                return CompressionOutcome("skipped", "pairing_protect")
             if extra:
                 messages_to_summarize = all_active_messages[:len(all_active_messages) - retain_count + extra]
             # 获取被压缩的最大消息 id，以此作为下次截断的起点
@@ -373,7 +429,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                     total_chars += len(clean_content)
 
             if not prepared_messages:
-                return False
+                return CompressionOutcome("skipped", "no_content")
 
         # LLM 调用耗时较长，在锁外执行，避免阻塞其它线程的正常读写
         emit("\n<ansigray>🧠 正在后台智能压缩并整合长对话记忆...</ansigray>")
@@ -393,8 +449,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         except Exception:
             pass
         if compress_window <= 0:
-            # 压缩模型是主模型时取主模型窗口（按会话解析：GUI 会话绑定的模型
-            # 可能与全局默认不同，取错窗口会让分段预算失真），仍取不到按 128k 兜底
             try:
                 from core.model_manager import get_active_model
                 active = get_active_model(session_name)
@@ -405,11 +459,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         if compress_window <= 0:
             compress_window = 128000
 
-        # 历史一次性塞进单个 prompt 会在长会话下超过压缩模型窗口
-        # （如 88 万 token 历史 vs 26 万窗口），压缩请求本身超窗失败并反复重试。
-        # 按窗口的安全预算切成多段，逐段与累积摘要合并，全部完成后一次性写库。
-        # 预算取窗口 25%：其余留给指令、累积摘要、输出、Provider 处理延迟
-        # 与估算偏差（tiktoken 对非 OpenAI 分词器的估算普遍偏低）。
         chunk_token_budget = _compression_chunk_budget(compress_window)
 
         chunks = []
@@ -418,8 +467,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         for role_display, content in prepared_messages:
             token_count = _estimate_tokens(content)
             if token_count > chunk_token_budget:
-                # 单条消息即超预算（如超长助手文本）：按 token 截断而非按字符，
-                # 中文 1 字符 ≈ 1~1.5 token，按字符截会严重超窗
                 content, token_count = _truncate_to_token_budget(
                     content, chunk_token_budget
                 )
@@ -433,12 +480,33 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         total_chunks = len(chunks)
 
         # 懒加载 litellm.completion（首次调用触发 import，约 1.4s）
-        from core.llm import _litellm_completion, _provider_cache_affinity_options
+        from core.llm import _litellm_completion, _provider_cache_affinity_options, is_rate_limit_error
 
         new_summary = old_summary
+        import time as _time
+        import random as _random
+        start_monotonic = _time.monotonic()
+
+        # 动态放宽合并摘要字数上限：避免多段串行合并导致早期关键决策被完全抹除
+        # 每增加一段放宽 30 字，上限 1200 字
+        dynamic_merge_limit = min(1200, config["summary_length_merge"] + 30 * max(0, total_chunks - 1))
+        if total_chunks > 12:
+            emit("\n<ansiyellow>ℹ 待压缩历史过长（分段 > 12 段），建议在新会话中继续复杂任务以维持最佳上下文记忆。</ansiyellow>")
+
         for chunk_index, chunk in enumerate(chunks):
+            if cancel_event is not None and cancel_event.is_set():
+                emit("<ansiyellow>ℹ 记忆压缩已被用户取消。</ansiyellow>")
+                return CompressionOutcome("skipped", "cancelled")
+            if _time.monotonic() - start_monotonic > max_timeout_seconds:
+                emit("<ansiyellow>ℹ 记忆压缩耗时超出预算，本次已中止。</ansiyellow>")
+                return CompressionOutcome("skipped", "timeout")
+
+            if chunk_index > 0:
+                if not _cancellable_sleep(COMPRESSION_INTER_CHUNK_DELAY_SECONDS, cancel_event):
+                    return CompressionOutcome("skipped", "cancelled")
+
             chat_log = "".join(f"{role_display}: {content}\n" for role_display, content in chunk)
-            summary_limit = config["summary_length_merge"] if new_summary else config["summary_length_first"]
+            summary_limit = dynamic_merge_limit if new_summary else config["summary_length_first"]
             prompt = _build_summary_prompt(new_summary, chat_log, summary_limit)
             prompt_tokens = _estimate_tokens(prompt)
             request_timeout = _compression_request_timeout(prompt_tokens)
@@ -455,8 +523,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 "api_key": compress_key,
                 "api_base": compress_url,
                 "messages": [{"role": "user", "content": prompt}],
-                # 分段载荷仍可能有数万 token，按实际 prompt 大小放大超时；
-                # 固定 60 秒会让 64K～100K token 的摘要请求稳定超时。
                 "timeout": request_timeout,
             }
             request_kwargs.update(_provider_cache_affinity_options(
@@ -466,24 +532,42 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 cache_session_id=session_name,
                 tool_contract="no-tools",
             ))
-            response = _litellm_completion(
-                **request_kwargs
-            )
-            candidate = (response.choices[0].message.content or "").strip()
-            # 清除多余的 markdown 格式或引导词
-            candidate = re.sub(r"^记忆摘要[：:]\s*", "", candidate)
-            candidate = candidate.replace("```", "").strip()
+
+            candidate = None
+            for attempt in range(COMPRESSION_MAX_RETRIES):
+                if cancel_event is not None and cancel_event.is_set():
+                    return CompressionOutcome("skipped", "cancelled")
+                try:
+                    response = _litellm_completion(**request_kwargs)
+                    raw_text = (response.choices[0].message.content or "").strip()
+                    raw_text = re.sub(r"^记忆摘要[：:]\s*", "", raw_text)
+                    raw_text = raw_text.replace("```", "").strip()
+                    if raw_text:
+                        candidate = raw_text
+                        break
+                    else:
+                        break
+                except Exception as api_err:
+                    is_rate_limit, retry_after = is_rate_limit_error(api_err)
+                    if is_rate_limit and attempt < COMPRESSION_MAX_RETRIES - 1:
+                        if retry_after is not None and retry_after > 0:
+                            backoff = retry_after
+                        else:
+                            backoff = COMPRESSION_RATE_LIMIT_BASE_DELAY_SECONDS * (2 ** attempt) + _random.uniform(0.5, 2.0)
+                        emit(
+                            f"\n<ansiyellow>ℹ 压缩请求触发服务商速率限制（429），正在等待 {backoff:.1f} 秒后重试（第 {attempt + 1}/{COMPRESSION_MAX_RETRIES} 次）...</ansiyellow>"
+                        )
+                        if not _cancellable_sleep(backoff, cancel_event):
+                            return CompressionOutcome("skipped", "cancelled")
+                        continue
+                    raise api_err
+
             if not candidate:
-                # 某一段返回空结果：继续合并后续段会丢失该段事实，直接失败，
-                # 边界不推进，下轮压缩从头重试
                 emit("<ansiyellow>ℹ 记忆压缩中途返回空摘要，本次已中止（未改变任何数据）。</ansiyellow>")
-                return False
+                return CompressionOutcome("failed", "empty_summary")
             new_summary = candidate
 
         if new_summary:
-            # 6. 将合并后的记忆摘要和截止 id 存回数据库。
-            # 乐观校验：仅当 summarized_until_msg_id 仍为读取时的旧值才更新，
-            # 防止压缩期间并发写入/压缩导致边界错乱、新消息被静默跳过。
             with manager.acquire_lock() if hasattr(manager, 'acquire_lock') else contextlib.nullcontext():
                 cursor = manager.conn.cursor()
                 cursor.execute('''
@@ -494,15 +578,13 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 if cursor.rowcount == 0:
                     manager.conn.rollback()
                     emit("<ansiyellow>ℹ 记忆摘要已过期（期间有新压缩写入），本次结果已丢弃。</ansiyellow>")
-                    return False
+                    return CompressionOutcome("skipped", "conflict_stale")
                 manager.conn.commit()
 
             emit(f"<ansigreen>✔ 记忆压缩整合成功！腾出了约 {total_chars//2} 字的历史对话空间。</ansigreen>")
-            return True
+            return CompressionOutcome("compressed", "ok")
 
     except Exception as e:
-        # 异常路径必须回滚，否则未提交的事务会使 SQLite 连接进入锁定状态，
-        # 导致后续所有写操作报 "database is locked"。
         try:
             if hasattr(manager, 'conn') and manager.conn:
                 manager.conn.rollback()
@@ -510,5 +592,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             pass
         safe_e = str(e).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         emit(f"<ansired>⚠️ 后台记忆压缩失败: {safe_e}</ansired>")
+        return CompressionOutcome("failed", str(e))
 
-    return False
+    return CompressionOutcome("skipped", "unknown")
