@@ -52,9 +52,9 @@ def clean_permission_state():
 
     permission_grants._clear_all_for_tests()
     llm._last_tracked_session = None
-    tools_mod.set_session_sandbox_bypass(False)
+    tools_mod._clear_sandbox_state_for_tests()
     yield
-    tools_mod.set_session_sandbox_bypass(False)
+    tools_mod._clear_sandbox_state_for_tests()
     permission_grants._clear_all_for_tests()
 
 

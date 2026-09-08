@@ -29,6 +29,10 @@ def _boot_failed(code: str, message: str) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdin, "reconfigure"):
+        sys.stdin.reconfigure(encoding="utf-8", errors="replace")
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--browser", required=True, choices=("edge", "chrome"))
     parser.add_argument("--profile", required=True)
