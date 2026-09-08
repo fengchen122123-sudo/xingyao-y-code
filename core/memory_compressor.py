@@ -290,6 +290,36 @@ def _cancellable_sleep(duration, cancel_event=None):
     return True
 
 
+def _commit_summary_progress(manager, session_id, summary, boundary_id, expect_boundary_raw):
+    """把「已完成段」的摘要与水位 CAS 写库。
+
+    仅当库里水位仍等于本次读取时的旧值才更新：期间若有淘汰或并发压缩推进过水位，
+    这段进度已不可信（可能重复摘要或静默跳过消息），放弃本次提交。
+    返回 True 表示已提交，调用方须把 CAS 基准前移到 boundary_id。
+    """
+    lock = manager.acquire_lock() if hasattr(manager, "acquire_lock") else contextlib.nullcontext()
+    with lock:
+        cursor = manager.conn.cursor()
+        cursor.execute(
+            "UPDATE sessions SET memory_summary = ?, summarized_until_msg_id = ? "
+            "WHERE id = ? AND summarized_until_msg_id IS ?",
+            (summary, boundary_id, session_id, expect_boundary_raw),
+        )
+        if cursor.rowcount == 0:
+            manager.conn.rollback()
+            return False
+        manager.conn.commit()
+    return True
+
+
+def _finish_with_progress(committed, reason):
+    """中止收尾：只要有段落已落库就算 compressed（下游淘汰有摘要兜底），
+    否则才是 skipped（下游必须禁止推水位，见 agent_service 的淘汰禁区）。"""
+    if committed:
+        return CompressionOutcome("compressed", "partial_" + reason)
+    return CompressionOutcome("skipped", reason)
+
+
 def compress_session_memory(
     manager,
     session_name,
@@ -401,8 +431,6 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 return CompressionOutcome("skipped", "pairing_protect")
             if extra:
                 messages_to_summarize = all_active_messages[:len(all_active_messages) - retain_count + extra]
-            # 获取被压缩的最大消息 id，以此作为下次截断的起点
-            max_summarized_id = messages_to_summarize[-1]["id"]
 
             # 4. 组装待总结对话文本日志（清洗思考标签 + 预截断工具结果）
             prepared_messages = []
@@ -425,7 +453,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 if role == "tool" and clean_content:
                     clean_content = _truncate_long_tool_result(clean_content, config)
                 if clean_content:
-                    prepared_messages.append((role_display, clean_content))
+                    prepared_messages.append((msg["id"], role_display, clean_content))
                     total_chars += len(clean_content)
 
             if not prepared_messages:
@@ -464,16 +492,18 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         chunks = []
         current_chunk = []
         current_tokens = 0
-        for role_display, content in prepared_messages:
+        for msg_id, role_display, content in prepared_messages:
             token_count = _estimate_tokens(content)
             if token_count > chunk_token_budget:
+                # 单条消息即超预算（如超长助手文本）：按 token 截断而非按字符，
+                # 中文 1 字符 ≈ 1~1.5 token，按字符截会严重超窗
                 content, token_count = _truncate_to_token_budget(
                     content, chunk_token_budget
                 )
             if current_chunk and current_tokens + token_count > chunk_token_budget:
                 chunks.append(current_chunk)
                 current_chunk, current_tokens = [], 0
-            current_chunk.append((role_display, content))
+            current_chunk.append((msg_id, role_display, content))
             current_tokens += token_count
         if current_chunk:
             chunks.append(current_chunk)
@@ -483,6 +513,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         from core.llm import _litellm_completion, _provider_cache_affinity_options, is_rate_limit_error
 
         new_summary = old_summary
+        committed = False
         import time as _time
         import random as _random
         start_monotonic = _time.monotonic()
@@ -494,18 +525,26 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             emit("\n<ansiyellow>ℹ 待压缩历史过长（分段 > 12 段），建议在新会话中继续复杂任务以维持最佳上下文记忆。</ansiyellow>")
 
         for chunk_index, chunk in enumerate(chunks):
+            # 预算至少容得下 3 段：单段超时可达 106s，只给 180s 会退化到
+            # 「刚完成一段就爆预算」，永远压不完。
+            per_chunk_seconds = (_compression_request_timeout(chunk_token_budget)
+                                 + COMPRESSION_INTER_CHUNK_DELAY_SECONDS)
+            budget_seconds = max(max_timeout_seconds, 3 * per_chunk_seconds)
+
             if cancel_event is not None and cancel_event.is_set():
                 emit("<ansiyellow>ℹ 记忆压缩已被用户取消。</ansiyellow>")
-                return CompressionOutcome("skipped", "cancelled")
-            if _time.monotonic() - start_monotonic > max_timeout_seconds:
-                emit("<ansiyellow>ℹ 记忆压缩耗时超出预算，本次已中止。</ansiyellow>")
-                return CompressionOutcome("skipped", "timeout")
+                return _finish_with_progress(committed, "cancelled")
+            if _time.monotonic() - start_monotonic > budget_seconds:
+                emit("<ansiyellow>ℹ 记忆压缩耗时超出预算，本次已中止（已完成段落进度已保存）。</ansiyellow>")
+                return _finish_with_progress(committed, "timeout")
 
             if chunk_index > 0:
                 if not _cancellable_sleep(COMPRESSION_INTER_CHUNK_DELAY_SECONDS, cancel_event):
-                    return CompressionOutcome("skipped", "cancelled")
+                    return _finish_with_progress(committed, "cancelled")
 
-            chat_log = "".join(f"{role_display}: {content}\n" for role_display, content in chunk)
+            chat_log = "".join(
+                "%s: %s\n" % (role_display, content) for _mid, role_display, content in chunk
+            )
             summary_limit = dynamic_merge_limit if new_summary else config["summary_length_first"]
             prompt = _build_summary_prompt(new_summary, chat_log, summary_limit)
             prompt_tokens = _estimate_tokens(prompt)
@@ -536,7 +575,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             candidate = None
             for attempt in range(COMPRESSION_MAX_RETRIES):
                 if cancel_event is not None and cancel_event.is_set():
-                    return CompressionOutcome("skipped", "cancelled")
+                    return _finish_with_progress(committed, "cancelled")
                 try:
                     response = _litellm_completion(**request_kwargs)
                     raw_text = (response.choices[0].message.content or "").strip()
@@ -558,31 +597,34 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                             f"\n<ansiyellow>ℹ 压缩请求触发服务商速率限制（429），正在等待 {backoff:.1f} 秒后重试（第 {attempt + 1}/{COMPRESSION_MAX_RETRIES} 次）...</ansiyellow>"
                         )
                         if not _cancellable_sleep(backoff, cancel_event):
-                            return CompressionOutcome("skipped", "cancelled")
+                            return _finish_with_progress(committed, "cancelled")
                         continue
                     raise api_err
 
             if not candidate:
-                emit("<ansiyellow>ℹ 记忆压缩中途返回空摘要，本次已中止（未改变任何数据）。</ansiyellow>")
-                return CompressionOutcome("failed", "empty_summary")
+                # 某一段返回空结果：继续合并后续段会丢失该段事实，就此中止；
+                # 已完成段落的进度已在上一轮循环提交，不回滚、不白烧。
+                emit("<ansiyellow>ℹ 记忆压缩中途返回空摘要，本次已中止（已完成段落进度已保存）。</ansiyellow>")
+                return _finish_with_progress(committed, "empty_summary")
             new_summary = candidate
 
-        if new_summary:
-            with manager.acquire_lock() if hasattr(manager, 'acquire_lock') else contextlib.nullcontext():
-                cursor = manager.conn.cursor()
-                cursor.execute('''
-                    UPDATE sessions
-                    SET memory_summary = ?, summarized_until_msg_id = ?
-                    WHERE id = ? AND summarized_until_msg_id IS ?
-                ''', (new_summary, max_summarized_id, session_id, old_boundary_raw))
-                if cursor.rowcount == 0:
-                    manager.conn.rollback()
-                    emit("<ansiyellow>ℹ 记忆摘要已过期（期间有新压缩写入），本次结果已丢弃。</ansiyellow>")
-                    return CompressionOutcome("skipped", "conflict_stale")
-                manager.conn.commit()
+            # 每段完成即落库：任何后续中止（429 用尽 / 超预算 / 取消 / 异常）
+            # 最多损失当前段，不会把已付费的摘要一起作废。
+            if _commit_summary_progress(
+                manager, session_id, new_summary,
+                chunk[-1][0], old_boundary_raw,
+            ):
+                committed = True
+                old_boundary_raw = chunk[-1][0]        # CAS 基准随进度前移
+                emit("<ansigray>💾 已保存第 %d/%d 段压缩进度。</ansigray>"
+                     % (chunk_index + 1, total_chunks))
+            else:
+                emit("<ansiyellow>ℹ 压缩进度与库内水位冲突（期间有淘汰或并发压缩），已停止后续提交。</ansiyellow>")
+                return _finish_with_progress(committed, "conflict_stale")
 
-            emit(f"<ansigreen>✔ 记忆压缩整合成功！腾出了约 {total_chars//2} 字的历史对话空间。</ansigreen>")
-            return CompressionOutcome("compressed", "ok")
+        emit("<ansigreen>✔ 记忆压缩整合成功！腾出了约 %d 字的历史对话空间。</ansigreen>"
+             % (total_chars // 2))
+        return CompressionOutcome("compressed", "ok")
 
     except Exception as e:
         try:

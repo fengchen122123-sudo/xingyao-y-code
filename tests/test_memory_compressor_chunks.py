@@ -156,7 +156,7 @@ def test_compression_request_uses_token_adaptive_timeout(manager, monkeypatch):
 
 
 def test_empty_chunk_result_aborts_without_touching_db(manager, monkeypatch):
-    """某段返回空摘要时中止且不推进边界，避免静默丢失该段事实。"""
+    """某段返回空摘要时中止：空段不推进水位，已完成段落进度保留（不白烧）。"""
     _seed_history(manager, 60)
     cursor = manager.conn.cursor()
     cursor.execute(
@@ -171,15 +171,31 @@ def test_empty_chunk_result_aborts_without_touching_db(manager, monkeypatch):
         return _Resp(next(replies))
 
     monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
-    assert compress_session_memory(
-        manager, "chunk-session", "fake/compress-model", "k", "", output_callback=lambda m: None
-    ) is False
+    outcome = compress_session_memory(
+        manager, "chunk-session", "fake/compress-model", "k", "",
+        output_callback=lambda m: None, return_outcome=True,
+    )
+
+    # 中止于空段但已有部分进度落库 → compressed（下游淘汰有摘要兜底）
+    assert outcome.status == "compressed"
+    assert outcome.reason == "partial_empty_summary"
 
     cursor.execute(
-        "SELECT summarized_until_msg_id FROM sessions WHERE session_name = ?",
+        "SELECT summarized_until_msg_id, memory_summary FROM sessions WHERE session_name = ?",
         ("chunk-session",),
     )
-    assert cursor.fetchone()[0] == boundary_before
+    boundary_after, summary = cursor.fetchone()
+    # 第一段进度已落库
+    assert boundary_after > (boundary_before or 0)
+    assert summary == "第一段摘要"
+    # 空段不推进水位：只推进到第一条消息（filler=200 时单段单条）
+    first_two_ids = [
+        row[0] for row in manager.conn.execute(
+            "SELECT m.id FROM messages m JOIN sessions s ON m.session_id = s.id "
+            "WHERE s.session_name = 'chunk-session' ORDER BY m.id LIMIT 2"
+        )
+    ]
+    assert boundary_after == first_two_ids[0]
 
 
 def test_chinese_long_message_truncated_by_token_not_chars(manager, monkeypatch):
@@ -310,4 +326,39 @@ def test_cancellable_sleep_interrupts_on_cancel_event():
 
     assert result is False
     assert duration < 1.0
+
+
+def test_partial_progress_is_committed_when_budget_exceeded(manager, monkeypatch):
+    """预算耗尽中止时，已完成段落的摘要与水位必须已落库（不白烧）。"""
+    import time as real_time
+    _seed_history(manager, 40, filler=60)          # 造出多段
+
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(real_time, "monotonic", lambda: clock["t"])
+
+    calls = {"n": 0}
+    def fake_completion(**kwargs):
+        calls["n"] += 1
+        clock["t"] += 90.0                          # 每段假装耗时 90s
+        return _Resp("第 %d 段摘要内容" % calls["n"])
+    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr(mc, "_cancellable_sleep", lambda *a, **kw: True)
+
+    def read():
+        row = manager.conn.execute(
+            "SELECT summarized_until_msg_id, memory_summary FROM sessions WHERE session_name='chunk-session'"
+        ).fetchone()
+        return row[0] or 0, row[1]
+
+    boundary_before, _ = read()
+    outcome = compress_session_memory(
+        manager, "chunk-session", "fake/compress-model", "k", "",
+        output_callback=lambda m: None, max_timeout_seconds=180.0, return_outcome=True,
+    )
+    boundary_after, summary = read()
+
+    assert calls["n"] < 40                          # 确实中途停了
+    assert boundary_after > boundary_before         # 已完成段落水位已推进
+    assert summary                                   # 摘要已落库
+    assert outcome.status == "compressed"            # 有兜底 → 下游可正常微调淘汰
 
