@@ -1012,3 +1012,34 @@ def test_prune_history_in_memory_preserves_summary_and_last_turn():
     finally:
         core.llm.estimate_tokens = orig_estimate
 
+
+@pytest.mark.parametrize("reason", ["timeout", "cancelled"])
+def test_zero_summary_skipped_forbids_db_eviction(tmp_path, monkeypatch, stub_llm, reason):
+    """skipped(timeout/cancelled) 意味着零新增摘要，等同 failed：严禁推 DB 水位。"""
+    from core.agent_service import prepare_turn_messages
+    from core.memory import MemoryManager
+    from core.memory_compressor import CompressionOutcome
+
+    manager = MemoryManager(str(tmp_path / (reason + ".db")))
+    session = "s_" + reason
+    manager.create_session_explicit(session, workdir="GLOBAL", source="GUI")
+    for i in range(10):
+        manager.add_message(session, "user", "提问 %d " % i + "内容 " * 50)
+        manager.add_message(session, "assistant", "回答 %d " % i + "细节 " * 50)
+
+    evict_calls = []
+    monkeypatch.setattr(manager, "evict_oldest_turn_persistent",
+                        lambda s: evict_calls.append(s) or False)
+    monkeypatch.setattr("core.memory_compressor.compress_session_memory",
+                        lambda *a, **kw: CompressionOutcome("skipped", reason))
+    monkeypatch.setattr("core.llm.estimate_tokens",
+                        lambda model, msgs: 5000)
+    monkeypatch.setattr("core.agent_service.get_session_token_baseline",
+                        lambda *a, **kw: 5000)
+
+    prepare_turn_messages(manager, session, "openai/test-small", 1000,
+                          permission_mode="confirm", notify=lambda k, m: None)
+
+    assert evict_calls == []          # 一次都不许推 DB 水位
+    assert len(manager.get_history_for_llm(session)) >= 20
+
