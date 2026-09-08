@@ -131,8 +131,8 @@ def test_kimi_openai_route_sends_prompt_cache_key(monkeypatch):
         "openai/kimi-k3", "https://api.moonshot.cn/v1"
     )["extra_body"]["prompt_cache_key"] == cache_key
     assert "metadata" not in opts
-    # 内置默认表行为保持不变
-    assert opts["max_tokens"] == 32000
+    # 内置默认表：k3 → 131072
+    assert opts["max_tokens"] == 131072
 
 
 def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
@@ -146,7 +146,7 @@ def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
         "openai/kimi-k2.6", "https://tokenrhythm.studio/v1"
     )
 
-    assert opts["max_tokens"] == 16384
+    assert opts["max_tokens"] == 128000
     assert "prompt_cache_key" not in opts.get("extra_body", {})
 
 
@@ -196,7 +196,7 @@ def test_non_kimi_model_gets_no_cache_affinity(monkeypatch):
 
     opts = _provider_request_options("openai/gpt-4o", "https://api.openai.com/v1")
 
-    assert opts == {}
+    assert opts == {"max_tokens": 32000}
 
 
 def test_official_deepseek_v4_uses_explicit_thinking_contract(monkeypatch):
@@ -218,7 +218,7 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
     _patch_model_cfg(monkeypatch, None)
     assert _provider_request_options(
         "openai/deepseek-v4-pro", "https://aggregator.example/v1"
-    ) == {}
+    ) == {"max_tokens": 384000}
 
     _patch_model_cfg(monkeypatch, {
         "enable_thinking": False,
@@ -237,12 +237,13 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
         (
             "openai/kimi-k3",
             "high",
-            {"max_tokens": 32000, "extra_body": {"reasoning_effort": "high"}},
+            {"max_tokens": 131072, "extra_body": {"reasoning_effort": "high"}},
         ),
         (
             "openai/deepseek-v4-flash",
             "high",
             {
+                "max_tokens": 384000,
                 "extra_body": {"thinking": {"type": "enabled"}},
                 "reasoning_effort": "high",
                 "allowed_openai_params": ["reasoning_effort"],
@@ -251,12 +252,13 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
         (
             "openai/qwen3.8-max",
             "medium",
-            {"extra_body": {"enable_thinking": True, "reasoning_effort": "medium"}},
+            {"max_tokens": 131000, "extra_body": {"enable_thinking": True, "reasoning_effort": "medium"}},
         ),
         (
             "openai/glm-5.2",
             "max",
             {
+                "max_tokens": 128000,
                 "extra_body": {"thinking": {"type": "enabled"}},
                 "reasoning_effort": "max",
                 "allowed_openai_params": ["reasoning_effort"],
@@ -265,17 +267,18 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
         (
             "openai/kimi-k2.6",
             "off",
-            {"max_tokens": 16384, "extra_body": {"thinking": {"type": "disabled"}}},
+            {"max_tokens": 128000, "extra_body": {"thinking": {"type": "disabled"}}},
         ),
         (
             "openai/LongCat-2.0",
             "on",
-            {"extra_body": {"thinking": {"type": "enabled"}}},
+            {"max_tokens": 128000, "extra_body": {"thinking": {"type": "enabled"}}},
         ),
         (
             "openai/mimo-v2.5-pro",
             "off",
             {
+                "max_tokens": 256000,
                 "reasoning_effort": "none",
                 "allowed_openai_params": ["reasoning_effort"],
             },
@@ -283,12 +286,13 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
         (
             "openai/qwen3.7-max",
             "off",
-            {"extra_body": {"enable_thinking": False}},
+            {"max_tokens": 131000, "extra_body": {"enable_thinking": False}},
         ),
         (
             "openai/seed-2.1-pro",
             "low",
             {
+                "max_tokens": 131000,
                 "extra_body": {"thinking": {"type": "enabled"}},
                 "reasoning_effort": "low",
                 "allowed_openai_params": ["reasoning_effort"],
@@ -315,12 +319,12 @@ def test_model_reasoning_choice_uses_its_exact_request_contract(
         (
             "openai/kimi-k2.6",
             "off",
-            {"max_tokens": 16384, "extra_body": {"thinking": {"type": "disabled"}}},
+            {"max_tokens": 128000, "extra_body": {"thinking": {"type": "disabled"}}},
         ),
         (
             "openai/qwen3.7-max",
             "off",
-            {"extra_body": {"enable_thinking": False}},
+            {"max_tokens": 131000, "extra_body": {"enable_thinking": False}},
         ),
         (
             "openai/kimi-k3",
@@ -355,17 +359,17 @@ def test_new_reasoning_choice_owns_the_request_contract_over_legacy_fields(
         (
             "openai/qwen3.7-max",
             {"enable_thinking": True},
-            {"extra_body": {"enable_thinking": True}},
+            {"max_tokens": 131000, "extra_body": {"enable_thinking": True}},
         ),
         (
             "openai/kimi-k3",
             {"enable_thinking": True, "reasoning_effort": "high"},
-            {"max_tokens": 32000, "extra_body": {"reasoning_effort": "high"}},
+            {"max_tokens": 131072, "extra_body": {"reasoning_effort": "high"}},
         ),
         (
             "openai/qwen3.7-max",
             {"thinking_budget": 4096},
-            {},
+            {"max_tokens": 131000},
         ),
     ],
 )
@@ -400,7 +404,7 @@ def test_provider_options_use_exact_model_id_when_routes_are_duplicated(monkeypa
         model_id="second",
     )
 
-    assert result == {"extra_body": {"thinking": {"type": "disabled"}}}
+    assert result == {"max_tokens": 384000, "extra_body": {"thinking": {"type": "disabled"}}}
 
 
 def test_default_reasoning_choice_adds_no_user_override(monkeypatch):
@@ -411,7 +415,7 @@ def test_default_reasoning_choice_adds_no_user_override(monkeypatch):
 
     assert _provider_request_options(
         "openai/qwen3.8-max", "https://gateway.example/v1"
-    ) == {}
+    ) == {"max_tokens": 131000}
 
 
 def test_effort_without_enabled_thinking_fails_before_transport():
@@ -479,7 +483,7 @@ def test_k3_reasoning_choice_maps_to_anthropic_thinking_budget(
         "type": "enabled",
         "budget_tokens": budget_tokens,
     }
-    assert opts["max_tokens"] == 32000
+    assert opts["max_tokens"] == 131072
     assert "reasoning_effort" not in opts
     assert "reasoning_effort" not in opts.get("extra_body", {})
 
@@ -647,3 +651,152 @@ def test_cache_usage_separates_latest_hot_and_session_cumulative():
     assert hot["hot_turns"] == 1
     assert hot["cumulative_rate"] == 49.5
     assert hot["invalidation_reason"] == ""
+
+
+def test_overflow_refill_uses_compressed_history_and_keeps_system_prefix():
+    """溢出强制压缩后的历史回填必须走 get_history_for_llm 并保留系统提示词。
+
+    修复前误用全量 get_history：刚被摘要排除的消息被原样塞回（重试载荷
+    不降反升，兜底路径必然再次超限并报出误导性错误）、记忆摘要不挂载、
+    首部系统提示词（每轮现组、不落库）整条丢失。
+    """
+    from core.llm import _refill_messages_after_compression
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(":memory:")
+    manager.create_session_explicit("overflow-refill-session", workdir="GLOBAL", source="GUI")
+    for i in range(8):
+        manager.add_message(
+            "overflow-refill-session",
+            "user" if i % 2 == 0 else "assistant",
+            f"消息 {i}",
+        )
+
+    # 模拟强制压缩已完成：前 5 条被摘要排除（水位推进），摘要落库
+    session_row = manager.conn.execute(
+        "SELECT id FROM sessions WHERE session_name = ?", ("overflow-refill-session",)
+    ).fetchone()
+    session_id = session_row[0]
+    ids = [
+        row[0]
+        for row in manager.conn.execute(
+            "SELECT id FROM messages WHERE session_id = ? ORDER BY id ASC",
+            (session_id,),
+        ).fetchall()
+    ]
+    manager.conn.execute(
+        "UPDATE sessions SET memory_summary = ?, summarized_until_msg_id = ? WHERE id = ?",
+        ("这是压缩后的记忆摘要", ids[4], session_id),
+    )
+    manager.conn.commit()
+
+    # 溢出时刻的内存列表：系统提示词 + 全量历史（含已被摘要排除的消息）
+    messages = [{"role": "system", "content": "stable system prompt"}]
+    messages.extend(manager.get_history("overflow-refill-session"))
+    assert len(messages) == 9
+
+    _refill_messages_after_compression(messages, manager, "overflow-refill-session")
+
+    # 1. 系统提示词保留在首位（每轮现组、不落库，DB 重读拿不回它）
+    assert messages[0] == {"role": "system", "content": "stable system prompt"}
+    # 2. 记忆摘要作为首条 user 伪消息挂载
+    assert messages[1]["role"] == "user"
+    assert messages[1]["content"].startswith("[历史对话记忆摘要")
+    assert "这是压缩后的记忆摘要" in messages[1]["content"]
+    # 3. 已被摘要排除的消息不得回流
+    contents = [str(m.get("content")) for m in messages]
+    for summarized in (f"消息 {i}" for i in range(5)):
+        assert summarized not in contents
+    # 4. 活跃区消息（水位之后）完整保留
+    for active in (f"消息 {i}" for i in range(5, 8)):
+        assert active in contents
+
+
+def test_overflow_refill_preserves_extra_system_blocks_and_drops_legacy_db_systems():
+    """回填须保留内存列表中的全部 system 块（含会话内注入块），并丢弃 DB 旧格式
+    遗留的 system 上下文块（与 prepare_turn_messages 的清理口径一致）。"""
+    from core.llm import _refill_messages_after_compression
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(":memory:")
+    manager.create_session_explicit("overflow-refill-legacy", workdir="GLOBAL", source="GUI")
+    manager.add_message("overflow-refill-legacy", "user", "最新问题")
+    # 模拟 DB 中遗留的旧格式 system 上下文块
+    session_row = manager.conn.execute(
+        "SELECT id FROM sessions WHERE session_name = ?", ("overflow-refill-legacy",)
+    ).fetchone()
+    manager.conn.execute(
+        "INSERT INTO messages (session_id, role, content) VALUES (?, 'system', 'legacy context block')",
+        (session_row[0],),
+    )
+    manager.conn.commit()
+
+    messages = [
+        {"role": "system", "content": "stable system prompt"},
+        {"role": "system", "content": "# Auto Memory\n注入块"},
+        {"role": "user", "content": "最新问题"},
+    ]
+    _refill_messages_after_compression(messages, manager, "overflow-refill-legacy")
+
+    assert [m["role"] for m in messages] == ["system", "system", "user"]
+    assert messages[0]["content"] == "stable system prompt"
+    assert messages[1]["content"] == "# Auto Memory\n注入块"
+    # DB 遗留 system 块不回流（否则违反 system 必须在开头的协议约束）
+    assert all("legacy context block" != str(m.get("content")) for m in messages)
+
+
+@pytest.mark.parametrize(
+    ("model_name", "api_base", "expected_max_tokens"),
+    [
+        ("openai/deepseek-v4-pro", "https://api.deepseek.com", 384000),
+        ("openai/glm-5", "https://gateway.example/v1", 128000),
+        ("openai/glm-5.1", "https://gateway.example/v1", 128000),
+        ("openai/glm-5.2", "https://gateway.example/v1", 128000),
+        ("openai/glm-5.3", "https://gateway.example/v1", 131000),
+        ("openai/glm-5.3-flash", "https://gateway.example/v1", 131000),
+        ("openai/qwen3.8-max", "https://gateway.example/v1", 131000),
+        ("openai/qwen38-27b", "https://gateway.example/v1", 131000),
+        ("openai/kimi-k2.5", "https://tokenrhythm.studio/v1", 64000),
+        ("openai/kimi-k2.6", "https://tokenrhythm.studio/v1", 128000),
+        ("openai/kimi-k2.7-code", "https://tokenrhythm.studio/v1", 16000),
+        ("openai/kimi-k2.7-code", "https://gateway.example/v1", 128000),
+        ("openai/k3", "https://api.moonshot.cn/v1", 131072),
+        ("anthropic/k3-256k", "https://api.kimi.com/coding", 131072),
+        ("openai/kimi-k3", "https://gateway.example/v1", 131072),
+        ("openai/LongCat-2.0", "https://gateway.example/v1", 128000),
+        ("openai/seed-2.1-pro", "https://gateway.example/v1", 131000),
+        ("openai/seed-2.1-turbo", "https://gateway.example/v1", 131000),
+        ("openai/mimo-v2.5-pro", "https://gateway.example/v1", 256000),
+        ("openai/minimax-m2.5", "https://gateway.example/v1", 200000),
+        ("openai/minimax-m2.7", "https://gateway.example/v1", 192000),
+        ("openai/gpt-4o", "https://gateway.example/v1", 32000),
+        ("openai/step-3.7-flash", "https://gateway.example/v1", 32000),
+        ("openai/kimi-for-coding", "https://gateway.example/v1", 32000),
+    ],
+)
+def test_builtin_default_max_tokens_table(
+    monkeypatch, model_name, api_base, expected_max_tokens
+):
+    """未显式配置 max_tokens 时，按内置默认表给出各模型的输出上限。"""
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(monkeypatch, None)
+
+    opts = _provider_request_options(model_name, api_base)
+
+    assert opts["max_tokens"] == expected_max_tokens
+
+
+def test_explicit_config_max_tokens_wins_over_builtin_table(monkeypatch):
+    """config.json 显式 max_tokens 优先于内置默认表。"""
+    from core.llm import _provider_request_options
+
+    _patch_session(monkeypatch, "session_abc123")
+    _patch_model_cfg(monkeypatch, {"max_tokens": 8192})
+
+    opts = _provider_request_options(
+        "openai/deepseek-v4-pro", "https://api.deepseek.com"
+    )
+
+    assert opts["max_tokens"] == 8192

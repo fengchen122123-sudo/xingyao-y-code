@@ -523,7 +523,7 @@ def test_kimi_k3_request_uses_anthropic_high_thinking_budget(mocker):
     ))
 
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 4096}
-    assert captured["max_tokens"] == 32000
+    assert captured["max_tokens"] == 131072
     # litellm 客户端参数校验只把 Claude 系列识别为支持 thinking 的 anthropic 模型，
     # 对 "K3" 这类陌生模型名会直接抛 UnsupportedParamsError（请求根本发不出去），
     # 必须显式声明 allowed_openai_params 豁免校验。
@@ -584,7 +584,7 @@ def test_kimi_k3_generic_anthropic_route_also_bypasses_litellm_param_check(mocke
     ))
 
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 2048}
-    assert captured["max_tokens"] == 16000
+    assert captured["max_tokens"] == 131072
     assert captured["allowed_openai_params"] == ["thinking"]
 
 

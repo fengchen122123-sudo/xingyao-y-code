@@ -2299,14 +2299,33 @@ class ApiBridge:
     }
     _FILE_SUGGEST_CACHE_TTL = 5.0
 
+    def _suggest_scan_root(self) -> str:
+        """@ 补全的扫描根目录：当前会话登记的 workdir，GLOBAL/无效时兜底进程 cwd。
+
+        不能直接 os.walk(".")：GUI 多会话架构已用线程本地 workdir 绑定替代
+        进程级 os.chdir，进程 cwd 永远停在启动目录，walk(".") 会列出启动目录
+        的文件而非当前项目文件夹的文件。
+        """
+        try:
+            wdir = self._session_workdir(self._current_session)
+        except Exception:
+            wdir = ""
+        if wdir and wdir != "GLOBAL" and os.path.isdir(wdir):
+            return _resolve_real_path(wdir)
+        return _resolve_real_path(os.getcwd())
+
     def _list_workspace_files_for_suggest(self) -> List[str]:
-        """递归扫描当前工作区文件（/ 分隔相对路径），TTL 缓存避免输入时反复 walk。"""
+        """递归扫描当前会话工作区文件（/ 分隔相对路径），TTL 缓存避免输入时反复 walk。
+
+        缓存必须按扫描根目录键控：切换会话/项目后不能命中旧目录的清单。
+        """
+        scan_root = self._suggest_scan_root()
         now = time.time()
         cache = getattr(self, "_file_suggest_cache", None)
-        if cache and now - cache[0] < self._FILE_SUGGEST_CACHE_TTL:
+        if cache and len(cache) >= 3 and cache[2] == scan_root and now - cache[0] < self._FILE_SUGGEST_CACHE_TTL:
             return cache[1]
         results: List[str] = []
-        for root, dirs, files in os.walk("."):
+        for root, dirs, files in os.walk(scan_root):
             dirs[:] = [
                 d for d in dirs
                 if d not in self._FILE_SUGGEST_IGNORE_DIRS and not d.startswith(".")
@@ -2314,9 +2333,9 @@ class ApiBridge:
             for f in files:
                 if f.startswith("."):
                     continue
-                rel = os.path.relpath(os.path.join(root, f), ".").replace("\\", "/")
+                rel = os.path.relpath(os.path.join(root, f), scan_root).replace("\\", "/")
                 results.append(rel)
-        self._file_suggest_cache = (now, results)
+        self._file_suggest_cache = (now, results, scan_root)
         return results
 
     def search_workspace_files(self, query: str = "", limit: int = 50) -> Dict[str, Any]:
@@ -5276,6 +5295,10 @@ class ApiBridge:
             )
             with open(path, "wb") as f:
                 f.write(raw)
+            # 登记为本进程粘贴落盘文件：后续 read_file 等只读工具访问
+            # 该文件时按受托路径免沙盒确认（见 core.tools.is_trusted_paste_path）
+            from core.tools import register_paste_file
+            register_paste_file(path)
             return {"ok": True, "path": path}
         except Exception as e:
             logger.exception("save_clipboard_image 失败")
@@ -5332,6 +5355,8 @@ class ApiBridge:
         )
         with open(path, "wb") as f:
             f.write(raw)
+        from core.tools import register_paste_file
+        register_paste_file(path)
         return path
 
     def upload_file(self, name: str, data_b64: str) -> Dict[str, Any]:

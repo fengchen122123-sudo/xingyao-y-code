@@ -333,7 +333,15 @@ def _commit_summary_progress(manager, session_id, summary, boundary_id, expect_b
 
 def _finish_with_progress(committed, reason):
     """中止收尾：只要有段落已落库就算 compressed（下游淘汰有摘要兜底），
-    否则才是 skipped（下游必须禁止推水位，见 agent_service 的淘汰禁区）。"""
+    否则才是 skipped（下游必须禁止推水位，见 agent_service 的淘汰禁区）。
+
+    注意：partial_timeout / partial_cancelled 等部分提交中止时，下游微调
+    淘汰从已提交水位起吃的是「未提交段」的轮次——这些轮次没有摘要兜底
+    （已提交摘要只覆盖水位之前的历史）。这是有意识的权衡：淘汰受
+    MAX_EVICT_TURNS 硬上限约束，超窗请求由 agent_service 的 I4 内存级
+    轮次裁剪兜底保证不 400；下一轮压缩从已提交水位续推，未提交段仍有
+    机会被补上摘要。
+    """
     if committed:
         return CompressionOutcome("compressed", "partial_" + reason)
     return CompressionOutcome("skipped", reason)

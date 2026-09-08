@@ -22,6 +22,8 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "kimi-k3": ("default", "low", "high", "max"),
         "deepseek-v4-flash": ("default", "off", "low", "high", "max"),
         "deepseek-v4-flash-0731": ("default", "off", "low", "high", "max"),
+        "deepseek-v4-flash-vision-exp": ("default", "off", "low", "high", "max"),
+        "deepseek-v4.1-flash-expires-on-0910": ("default", "off", "low", "high", "max"),
         "deepseek-v4-pro": ("default", "off", "high", "max"),
         "deepseek-v4-pro-0813": ("default", "off", "low", "high", "max"),
         "qwen3.8-max": ("default", "off", "low", "medium", "xhigh"),
@@ -74,7 +76,6 @@ def test_fixed_models_are_visible_locked_on_and_unknown_models_are_hidden():
         }
 
     for model_name in (
-        "deepseek-v4-flash-vision-exp",
         "sensenova-6.7-flash-lite",
         "step-explore",
         "doubao-seed-evolving",
