@@ -5437,6 +5437,7 @@ def _chat_with_model_generator(
             active_deepseek_generation_id = None
             active_deepseek_message_count = None
             cache_control_downgraded = False
+            wait_started_at = None
 
             for attempt in range(max_api_retries):
                 raise_if_cancelled()
@@ -5737,7 +5738,6 @@ def _chat_with_model_generator(
                     model_name, api_base
                 ),
             )
-            stream_start_time = time.monotonic()
             first_token_time = None
             for chunk in _stream_chunks_with_idle_notice(
                 response_stream, event_callback, raise_if_cancelled,
@@ -5784,22 +5784,52 @@ def _chat_with_model_generator(
                 except Exception:
                     comp_tokens = 0
 
-            duration_s = max(round(stream_end_time - stream_start_time, 2), 0.01)
-            output_duration_s = (
-                max(round(stream_end_time - first_token_time, 2), 0.01)
-                if first_token_time is not None
-                else duration_s
+            # 步骤总耗时：自该次请求发出（wait_started_at）至最后一个 chunk 接收完成
+            step_start_time = (
+                wait_started_at
+                if wait_started_at is not None
+                else (first_token_time or stream_end_time)
             )
+            duration_s = max(round(stream_end_time - step_start_time, 2), 0.01)
+
+            # 首字延迟（TTFT）：自发起请求至首个 token 到达
             ttft_ms = (
-                max(0, int(round((first_token_time - stream_start_time) * 1000)))
+                max(0, int(round((first_token_time - step_start_time) * 1000)))
                 if first_token_time is not None
                 else None
             )
-            token_speed = (
-                round(comp_tokens / output_duration_s, 1)
-                if comp_tokens > 0 and output_duration_s > 0
+
+            # 输出耗时与流速判定：
+            # 1) 真实逐 chunk 流式：首 token 到末 chunk 之间的实际流式输出时长；
+            # 2) 假流式/批式投递（如 LiteLLM MockResponsesAPIStreamingIterator 或网关整包缓冲）：
+            #    首 token 与末 chunk 在 Python 内存中迭代仅耗费毫秒级（如 0.01s~0.03s），
+            #    此时若直接除以 raw_output_duration 会算出几万 t/s 的荒谬除零毛刺。
+            #    当流式输出时长极短（< 0.15s 且 token 较多）或速度算出来超出物理极限（> 1000 t/s）时，
+            #    判定为批式投递，输出耗时自动取总耗时 duration_s，真实反映吞吐。
+            raw_output_duration = (
+                (stream_end_time - first_token_time)
+                if first_token_time is not None
                 else 0.0
             )
+            is_batch_delivery = (
+                raw_output_duration < 0.15 and comp_tokens > 10
+            ) or (
+                raw_output_duration > 0 and (comp_tokens / raw_output_duration) > 1000.0
+            )
+
+            if is_batch_delivery or first_token_time is None:
+                output_duration_s = duration_s
+            else:
+                output_duration_s = max(round(raw_output_duration, 2), 0.01)
+
+            raw_speed = (
+                (comp_tokens / output_duration_s)
+                if (comp_tokens > 0 and output_duration_s > 0)
+                else 0.0
+            )
+            # 物理上限防毛刺：真实大模型推理（即便是 Groq/Cerebras）极限不超过 ~1000 tok/s；
+            # 若因极短网络抖动或单元测试 mock 导致除算溢出，平滑限幅至 1000.0 t/s，杜绝几万 t/s 异常显示
+            token_speed = round(min(raw_speed, 1000.0), 1)
 
             latest_step_metrics = {
                 "duration_s": duration_s,

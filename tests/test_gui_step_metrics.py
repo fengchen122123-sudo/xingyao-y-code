@@ -89,3 +89,42 @@ def test_step_metrics_event_dispatch(monkeypatch):
         },
     )]
 
+
+def test_step_metrics_handles_mock_stream_gracefully(monkeypatch):
+    import core.llm as llm
+    import core.model_manager as model_manager
+    from types import SimpleNamespace
+
+    def _event(event_type, **kwargs):
+        return SimpleNamespace(type=event_type, **kwargs)
+
+    def fake_responses(**kwargs):
+        # 模拟 500 tokens 瞬时在内存返回（如 MockResponsesAPIStreamingIterator 模式）
+        response = SimpleNamespace(
+            usage=SimpleNamespace(input_tokens=50, output_tokens=500, total_tokens=550)
+        )
+        return [
+            _event("response.output_text.delta", delta="快速批式输出的一段文本"),
+            _event("response.completed", response=response),
+        ]
+
+    monkeypatch.setattr(model_manager, "get_model_protocol", lambda *_: "responses")
+    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+
+    events = list(
+        llm.chat_with_model_events(
+            "openai/test-model",
+            "sk-test",
+            [{"role": "user", "content": "ping"}],
+            "https://api.example.com",
+            persist=False,
+        )
+    )
+
+    metrics_events = [e for e in events if e.kind == "step_metrics"]
+    assert len(metrics_events) == 1
+    m = metrics_events[0].payload
+    assert m["completion_tokens"] == 500
+    # 速度绝不能因为内存迭代耗时极短而飙升至几万 t/s
+    assert m["token_speed"] <= 1000.0
+    assert m["output_duration_s"] == m["duration_s"]
