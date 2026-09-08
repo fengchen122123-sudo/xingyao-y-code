@@ -260,4 +260,56 @@ describe('MessageBubble', () => {
     expect(open).not.toHaveBeenCalled();
     wrapper.unmount();
   });
+
+  it('渲染完成后的指标栏及悬停提示', () => {
+    const msg = assistantMessage({
+      content: '回答内容',
+      metrics: {
+        duration_s: 2.34,
+        ttft_ms: 120,
+        output_duration_s: 2.22,
+        token_speed: 58.2,
+        completion_tokens: 142,
+      },
+      execution_state: 'completed',
+    });
+    const wrapper = mount(MessageBubble, { props: { msg } });
+
+    const metricsBar = wrapper.find('.msg-metrics-bar');
+    expect(metricsBar.exists()).toBe(true);
+    expect(metricsBar.text()).toContain('2.3s');
+    expect(metricsBar.text()).toContain('58.2 t/s');
+    expect(metricsBar.text()).toContain('142 tokens');
+
+    const title = metricsBar.attributes('title');
+    expect(title).toContain('首字延迟: 120ms');
+    expect(title).toContain('生成耗时: 2.22s');
+    expect(title).toContain('平均速度: 58.2 t/s');
+    expect(title).toContain('输出: 142 tokens');
+    wrapper.unmount();
+  });
+
+  it('流式生成中显示实时速度胶囊', async () => {
+    const store = useAppStore();
+    store.running = true;
+    store.streamingSpeed = 45.6;
+
+    const msg = assistantMessage({
+      content: '生成中...',
+      execution_state: 'running',
+    });
+    store.messages.push(msg);
+    const wrapper = mount(MessageBubble, { props: { msg } });
+
+    const pill = wrapper.find('.streaming-speed-pill');
+    expect(pill.exists()).toBe(true);
+    expect(pill.text()).toContain('45.6 t/s');
+
+    store.running = false;
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('.streaming-speed-pill').exists()).toBe(false);
+    wrapper.unmount();
+  });
 });
+
+

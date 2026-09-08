@@ -42,6 +42,7 @@ import {
   type ToolExecutionResult,
 } from '../utils/toolTrace';
 import { createSessionRuntime, type SessionRuntimeState } from './sessionRuntime';
+import { StreamingSpeedTracker } from '../utils/tokenSpeed';
 import { applyGuiTheme, type AppliedTheme } from '../themes/runtime';
 import type {
   GuiTheme,
@@ -237,6 +238,14 @@ function computerTraceSummary(event: Record<string, unknown>): string {
   return COMPUTER_ACTION_KIND_LABELS[kind] || (kind ? `动作 ${kind}` : '电脑动作');
 }
 
+export interface MessageMetrics {
+  duration_s?: number;
+  output_duration_s?: number;
+  ttft_ms?: number;
+  completion_tokens?: number;
+  token_speed?: number;
+}
+
 export interface ChatMessage {
   id?: string;
   // notice：对话流内的系统提示（取代原 Toast，不自动消失）
@@ -264,6 +273,8 @@ export interface ChatMessage {
   model_name?: string;
   // 助手消息媒体清单（media_v1，桥接层已拼好带令牌 URL；旧消息缺省）
   media?: MediaItem[];
+  // 生成耗时与速率指标（后端权威结算或历史持久化透传）
+  metrics?: MessageMetrics;
 }
 
 const TOOL_CATEGORIES = new Set(['read', 'search', 'command', 'mutation', 'skill', 'other']);
@@ -388,6 +399,8 @@ export interface PermReqState {
 
 export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models';
 
+const speedTracker = new StreamingSpeedTracker();
+
 export const useAppStore = defineStore('app', {
   state: () => ({
     // 模型 / 供应商
@@ -505,6 +518,8 @@ export const useAppStore = defineStore('app', {
     running: false,
     // 当前会话本轮回合开始时间戳（毫秒）："已工作 xx秒"计时用，随会话切换恢复
     turnStartedAt: 0,
+    // 当前流式生成瞬时速度（t/s）：随会话切换恢复
+    streamingSpeed: 0,
     // 正在执行回合的会话集合（支持多会话并行）
     runningSessions: [] as string[],
     // 批次D：回合已提交但在等 _turn_workdir_lock 的会话（turn_queued 事件）。
@@ -725,6 +740,7 @@ export const useAppStore = defineStore('app', {
       runtime.planData = this.planData;
       runtime.tokenUsage = this.tokenUsage;
       runtime.turnStartedAt = this.turnStartedAt;
+      runtime.streamingSpeed = this.streamingSpeed;
       // 模型选择随会话保存：切换会话时各会话恢复各自的模型，互不覆盖
       runtime.modelId = this.activeModelId;
       runtime.modelName = this.activeModelName;
@@ -753,6 +769,7 @@ export const useAppStore = defineStore('app', {
       this.currentStreamingText = runtime.streamingText;
       this.currentThinkingText = runtime.thinkingText;
       this.running = runtime.running;
+      this.streamingSpeed = runtime.streamingSpeed || 0;
       this.subagentTasks = runtime.subagentTasks;
       this.planData = runtime.planData || { title: '', items: [], progress: 0 };
       // 窗口口径 token 用量随会话切换：先恢复该会话上次快照避免闪烁，
@@ -2666,6 +2683,8 @@ export const useAppStore = defineStore('app', {
         this.running = true;
         // 本回合技能收集重置：从这一刻起的 is_skill 工具调用归入本回合
         this.usedSkills = [];
+        this.streamingSpeed = 0;
+        speedTracker.reset();
         // 记录本轮回合开始时间戳，供"已工作 xx秒"计时（随会话切换恢复，不重置）
         if (!this.turnStartedAt) this.turnStartedAt = Date.now();
         this.currentStreamingText = '';
@@ -2728,6 +2747,8 @@ export const useAppStore = defineStore('app', {
           last.execution_state = 'completed';
           this.currentStreamingText = '';
           this.currentThinkingText = '';
+          this.streamingSpeed = 0;
+          speedTracker.reset();
           this.messages.push({
             role: 'assistant',
             content: '',
@@ -2740,12 +2761,14 @@ export const useAppStore = defineStore('app', {
       } else if (type === 'thinking_delta') {
         // 后端约 60ms 批量推送，data.text 可能包含多字符/多行，直接拼接即可
         this.currentThinkingText += data.text || '';
+        this.streamingSpeed = speedTracker.addChunk(data.text || '');
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
           last.reasoning_content = this.currentThinkingText;
         }
       } else if (type === 'token_delta') {
         this.currentStreamingText += data.text || '';
+        this.streamingSpeed = speedTracker.addChunk(data.text || '');
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
           last.content = this.currentStreamingText;
@@ -2771,6 +2794,17 @@ export const useAppStore = defineStore('app', {
           if (finalMedia && finalMedia.length) {
             last.media = finalMedia;
           }
+        }
+      } else if (type === 'step_metrics') {
+        const last = this.messages[this.messages.length - 1];
+        if (last && last.role === 'assistant') {
+          last.metrics = {
+            duration_s: Number(data.duration_s || 0),
+            output_duration_s: Number(data.output_duration_s || 0),
+            ttft_ms: data.ttft_ms != null ? Number(data.ttft_ms) : undefined,
+            completion_tokens: Number(data.completion_tokens || 0),
+            token_speed: Number(data.token_speed || 0),
+          };
         }
       } else if (type === 'tool_start') {
         const d = data as ToolStartEventData;
@@ -3034,6 +3068,8 @@ export const useAppStore = defineStore('app', {
         });
       } else if (type === 'turn_finish' || type === 'turn_idle') {
         this.running = false;
+        this.streamingSpeed = 0;
+        speedTracker.reset();
         // turn_finish 只在仍处于 running 时置为 completed；已取消/出错的状态不被覆盖
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
@@ -3049,6 +3085,8 @@ export const useAppStore = defineStore('app', {
         this._setSessionStatusDot(eventSession, 'green');
       } else if (type === 'turn_cancelled') {
         this.running = false;
+        this.streamingSpeed = 0;
+        speedTracker.reset();
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
           last.cancelled = true;
@@ -3062,6 +3100,8 @@ export const useAppStore = defineStore('app', {
       } else if (type === 'turn_error') {
         // 终态错误（toast 由随后的 error 事件负责展示）
         this.running = false;
+        this.streamingSpeed = 0;
+        speedTracker.reset();
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
           last.execution_state = reduceExecutionState(last.execution_state, 'turn_error');

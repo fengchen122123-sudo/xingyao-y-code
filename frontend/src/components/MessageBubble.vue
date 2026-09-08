@@ -91,6 +91,31 @@
           <span class="wl-text">星瑶正在干活<span class="wl-dots"><i>.</i><i>.</i><i>.</i></span></span>
           <span v-if="elapsed >= 3" class="wl-elapsed">已等待 {{ elapsed }}s</span>
         </div>
+
+        <!-- 流式生成中的实时速度指示胶囊 -->
+        <div v-else-if="isStreamingSpeedVisible" class="streaming-speed-pill" data-test="streaming-speed">
+          <AppIcon name="zap" :size="12" class="zap-pulse" />
+          <span>{{ liveSpeedText }}</span>
+        </div>
+
+        <!-- 助手消息底部性能指标结算栏（生成完毕后展示） -->
+        <div
+          v-else-if="msg.metrics && (msg.metrics.token_speed || msg.metrics.duration_s)"
+          class="msg-metrics-bar"
+          :title="metricsTooltip"
+          data-test="msg-metrics"
+        >
+          <span v-if="msg.metrics.token_speed" class="metric-item">
+            <AppIcon name="zap" :size="12" class="metric-icon" />
+            <span class="metric-val">{{ msg.metrics.token_speed }}</span> t/s
+          </span>
+          <span v-if="msg.metrics.token_speed && msg.metrics.duration_s" class="metric-sep">·</span>
+          <span v-if="msg.metrics.duration_s" class="metric-item">{{ formatDuration(msg.metrics.duration_s) }}</span>
+          <template v-if="msg.metrics.completion_tokens">
+            <span class="metric-sep">·</span>
+            <span class="metric-item">{{ msg.metrics.completion_tokens }} tokens</span>
+          </template>
+        </div>
       </div>
     </div>
 
@@ -120,6 +145,7 @@ import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdown, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
 import { renderMermaidBlocks } from '../utils/mermaidRenderer';
 import { toAbsoluteLocalPath } from '../utils/localPath';
+import { formatTokenSpeed, formatDuration } from '../utils/tokenSpeed';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
@@ -143,6 +169,48 @@ const showWorking = computed(() => {
   if (m.reasoning_content && m.reasoning_content.trim()) return false;
   if (m.tool_calls && m.tool_calls.length) return false;
   return true;
+});
+
+const isLatestAssistant = computed(() => {
+  const msgs = store.messages;
+  return msgs.length > 0 && msgs[msgs.length - 1] === props.msg;
+});
+
+// 流式实时速度胶囊可见性：正在运行、是当前最新助手消息、非纯等待中且已有流式文本
+const isStreamingSpeedVisible = computed(() => {
+  if (props.msg.role !== 'assistant' || !store.running) return false;
+  if (!isLatestAssistant.value) return false;
+  if (showWorking.value) return false;
+  const m = props.msg;
+  const hasContent = !!(m.content && m.content.trim()) || !!(m.reasoning_content && m.reasoning_content.trim());
+  return hasContent;
+});
+
+const liveSpeedText = computed(() => {
+  const speed = store.streamingSpeed || 0;
+  return speed > 0 ? formatTokenSpeed(speed) : '正在输出...';
+});
+
+// 结算后性能指标 Tooltip 详细说明
+const metricsTooltip = computed(() => {
+  const m = props.msg.metrics;
+  if (!m) return '';
+  const parts: string[] = [];
+  if (m.ttft_ms != null && m.ttft_ms > 0) {
+    parts.push(`首字延迟: ${m.ttft_ms}ms`);
+  }
+  if (m.output_duration_s != null && m.output_duration_s > 0) {
+    parts.push(`生成耗时: ${m.output_duration_s}s`);
+  } else if (m.duration_s != null && m.duration_s > 0) {
+    parts.push(`总耗时: ${m.duration_s}s`);
+  }
+  if (m.completion_tokens) {
+    parts.push(`输出: ${m.completion_tokens} tokens`);
+  }
+  if (m.token_speed) {
+    parts.push(`平均速度: ${m.token_speed} t/s`);
+  }
+  return parts.join(' · ');
 });
 
 // 等待时长计时：等待超过 3 秒后显示秒数，让用户明确知道仍在处理而不是卡死
@@ -598,6 +666,62 @@ async function copyUserMessage() {
 .wl-elapsed {
   color: var(--text-faint);
   font-size: 11.5px;
+}
+
+/* 流式生成实时速度胶囊 */
+.streaming-speed-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 6px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-family: var(--mono);
+  color: var(--accent);
+  background: var(--bg-surface-2);
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  user-select: none;
+}
+.streaming-speed-pill .zap-pulse {
+  animation: zap-pulse-anim 1.2s ease-in-out infinite;
+}
+@keyframes zap-pulse-anim {
+  0%, 100% { opacity: 0.5; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.15); }
+}
+
+/* 生成完毕指标结算栏 */
+.msg-metrics-bar {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 6px;
+  padding: 2px 6px;
+  font-size: 11px;
+  color: var(--text-faint);
+  user-select: none;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+}
+.msg-metrics-bar:hover {
+  color: var(--text-dim);
+  background: var(--bg-hover, rgba(255, 255, 255, 0.04));
+}
+.msg-metrics-bar .metric-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+}
+.msg-metrics-bar .metric-icon {
+  color: var(--accent);
+}
+.msg-metrics-bar .metric-sep {
+  opacity: 0.4;
+}
+.msg-metrics-bar .metric-val {
+  font-weight: 500;
+  font-family: var(--mono);
 }
 
 .md-body {

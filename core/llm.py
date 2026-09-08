@@ -5043,11 +5043,12 @@ def _chat_with_model_generator(
     current_tool_calls = []
     pending_tool_records = {}
 
-    def _model_display_snapshot():
-        """为落库的 assistant 消息附加"生成所用模型"的显示元数据。
+    def _model_display_snapshot(metrics=None):
+        """为落库的 assistant 消息附加"生成所用模型"及性能指标的显示元数据。
         从 config 的 providers[].models[] 反查 model_name（litellm_model）对应的
         显示名 name；查不到或读取异常时静默回退为 model_name 本身，绝不抛错
         （此处位于持久化热路径，任何异常都不能影响消息落库）。"""
+        disp = {"model_id": model_name, "model_name": model_name}
         try:
             from core.model_manager import load_config
             for provider in load_config().get("providers", []):
@@ -5056,13 +5057,13 @@ def _chat_with_model_generator(
                         model.get("litellm_model") == model_name
                         or model.get("id") == model_name
                     ):
-                        return {"_display": {
-                            "model_id": model_name,
-                            "model_name": model.get("name") or model_name,
-                        }}
+                        disp["model_name"] = model.get("name") or model_name
+                        break
         except Exception:
             pass
-        return {"_display": {"model_id": model_name, "model_name": model_name}}
+        if metrics:
+            disp["metrics"] = metrics
+        return {"_display": disp}
 
     def flush_persistence():
         """把本轮已确认的助手/工具消息按序落库（与正常结束路径一致）。"""
@@ -5386,6 +5387,7 @@ def _chat_with_model_generator(
         max_turns = load_turn_step_limit()
         if harness_runtime is not None:
             harness_runtime.mark_running()
+        latest_step_metrics = None
         for turn in range(max_turns):
             raise_if_cancelled()
             # 无进展熔断：连续 MAX_STALLED_STEPS 步无确定性状态变化时，
@@ -5735,11 +5737,15 @@ def _chat_with_model_generator(
                     model_name, api_base
                 ),
             )
+            stream_start_time = time.monotonic()
+            first_token_time = None
             for chunk in _stream_chunks_with_idle_notice(
                 response_stream, event_callback, raise_if_cancelled,
                 inflight_holder=inflight_holder, cancel_event=cancel_event,
             ):
                 raise_if_cancelled()
+                if first_token_time is None:
+                    first_token_time = time.monotonic()
                 update = stream_assembler.consume(chunk)
                 if update.public_text:
                     yield update.public_text
@@ -5762,6 +5768,47 @@ def _chat_with_model_generator(
 
             finish_reason = assembled_response.finish_reason
             stream_usage = assembled_response.usage
+
+            stream_end_time = time.monotonic()
+            comp_tokens = 0
+            if stream_usage is not None:
+                try:
+                    norm = _normalize_server_usage(stream_usage)
+                    comp_tokens = int(norm.get("completion_tokens") or 0)
+                except Exception:
+                    comp_tokens = 0
+            if comp_tokens == 0 and (assembled_response.content or assembled_response.reasoning_content):
+                try:
+                    full_len = len(assembled_response.content or "") + len(assembled_response.reasoning_content or "")
+                    comp_tokens = max(1, int(full_len / 2))
+                except Exception:
+                    comp_tokens = 0
+
+            duration_s = max(round(stream_end_time - stream_start_time, 2), 0.01)
+            output_duration_s = (
+                max(round(stream_end_time - first_token_time, 2), 0.01)
+                if first_token_time is not None
+                else duration_s
+            )
+            ttft_ms = (
+                max(0, int(round((first_token_time - stream_start_time) * 1000)))
+                if first_token_time is not None
+                else None
+            )
+            token_speed = (
+                round(comp_tokens / output_duration_s, 1)
+                if comp_tokens > 0 and output_duration_s > 0
+                else 0.0
+            )
+
+            latest_step_metrics = {
+                "duration_s": duration_s,
+                "output_duration_s": output_duration_s,
+                "ttft_ms": ttft_ms,
+                "completion_tokens": comp_tokens,
+                "token_speed": token_speed,
+            }
+            _notify_event(event_callback, "step_metrics", latest_step_metrics)
 
             # 输出被模型长度限制截断：给出明确提示，避免用户以为任务已完成。
             if finish_reason == "length":
@@ -5986,8 +6033,8 @@ def _chat_with_model_generator(
                 persisted_message["tool_calls"] = _persisted_tool_calls(
                     tool_calls_list
                 )
-            # 落库副本补充生成所用模型的显示元数据（仅持久化，不发给 LLM）
-            persisted_message.update(_model_display_snapshot())
+            # 落库副本补充生成所用模型的显示元数据及性能指标（仅持久化，不发给 LLM）
+            persisted_message.update(_model_display_snapshot(latest_step_metrics))
             # 落库副本提取媒体清单（![..](..) / [video:..](..) 语法归档进内容寻址
             # 仓库）。只改落库副本：message_to_append 不动，Provider 请求字节零变化；
             # 基础设施错误（仓库不可写等）按契约直接向持久化路径传播，显式失败。
