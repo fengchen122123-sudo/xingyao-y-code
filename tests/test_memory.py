@@ -311,3 +311,114 @@ def test_replace_latest_user_content_is_compare_and_swap():
     assert manager.get_history(session)[-1]["content"] == (
         "分析图片\n\n[图片分析结果]\n界面截图"
     )
+
+
+def test_evict_uses_cas_and_rejects_stale_boundary(tmp_path):
+    """水位在读取后被他线程推进时，淘汰必须放弃，不得覆盖别人的进度。"""
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(str(tmp_path / "cas.db"))
+    manager.create_session_explicit("s_cas", workdir="GLOBAL", source="GUI")
+    for i in range(6):
+        manager.add_message("s_cas", "user", "问题 %d" % i)
+        manager.add_message("s_cas", "assistant", "回答 %d" % i)
+    assert manager.evict_oldest_turn_persistent("s_cas") is True
+
+    sid = manager.conn.execute(
+        "SELECT id FROM sessions WHERE session_name='s_cas'").fetchone()[0]
+    live = manager.conn.execute(
+        "SELECT summarized_until_msg_id FROM sessions WHERE id=?", (sid,)).fetchone()[0]
+
+    # 模拟「evict 读到旧值之后、写回之前」被别人把水位推得很远：
+    # 用 conn 间谍在 evict 取完消息行之后（UPDATE 执行之前）注入推进。
+    # 注意注入必须放在 fetchall 之后——execute 会重置语句，提前注入会让
+    # fetchall 拿到空结果、evict 在空行检查提前退出，竞态根本没被触发。
+    class _CursorSpy:
+        def __init__(self, real):
+            self._real = real
+            self._last_sql = ""
+            self._pushed = False
+
+        def execute(self, sql, params=()):
+            self._last_sql = sql
+            return self._real.execute(sql, params)
+
+        def fetchone(self):
+            return self._real.fetchone()
+
+        def fetchall(self):
+            rows = self._real.fetchall()
+            if "FROM messages" in self._last_sql and not self._pushed:
+                self._pushed = True
+                self._real.execute(
+                    "UPDATE sessions SET summarized_until_msg_id=? WHERE id=?",
+                    (live + 100000, sid))
+                self._real.connection.commit()
+            return rows
+
+        @property
+        def rowcount(self):
+            return self._real.rowcount
+
+    class _ConnSpy:
+        def __init__(self, real):
+            self._real = real
+
+        def cursor(self):
+            return _CursorSpy(self._real.cursor())
+
+        def commit(self):
+            self._real.commit()
+
+        def rollback(self):
+            self._real.rollback()
+
+        def execute(self, sql, params=()):
+            return self._real.execute(sql, params)
+
+    real_conn = manager.conn
+    manager.conn = _ConnSpy(real_conn)
+    try:
+        assert manager.evict_oldest_turn_persistent("s_cas") is False
+    finally:
+        manager.conn = real_conn
+    now = manager.conn.execute(
+        "SELECT summarized_until_msg_id FROM sessions WHERE id=?", (sid,)).fetchone()[0]
+    assert now == live + 100000          # 未被覆盖
+
+
+def test_memory_and_db_turn_boundary_agree(tmp_path):
+    """同一份历史：DB 滑窗淘汰与内存轮次裁剪的轮次边界口径必须一致。
+
+    DB 侧 evict 一次淘汰一轮、内存侧一次裁到放得下为止，比较口径必须让
+    两边都淘汰到尽头：被裁掉的条数与保留下来的消息都必须完全相同。
+    """
+    from core.memory import MemoryManager
+    import core.agent_service as ag
+    import core.llm as llm
+
+    manager = MemoryManager(str(tmp_path / "agree.db"))
+    manager.create_session_explicit("s_ag", workdir="GLOBAL", source="GUI")
+    manager.add_message("s_ag", "assistant", "开场白")          # 故意让首条非 user
+    for i in range(5):
+        manager.add_message("s_ag", "user", "问题 %d" % i)
+        manager.add_message("s_ag", "assistant", "回答 %d" % i)
+
+    before = manager.get_history_for_llm("s_ag")
+    assert manager.evict_oldest_turn_persistent("s_ag") is True
+    while manager.evict_oldest_turn_persistent("s_ag"):
+        pass
+    db_dropped = len(before) - len(manager.get_history_for_llm("s_ag"))
+    assert db_dropped >= 1
+
+    mem = list(before)
+    orig = llm.estimate_tokens
+    llm.estimate_tokens = lambda model, msgs: len(msgs) * 100000
+    try:
+        pruned, _ = ag._prune_history_in_memory_to_fit_window(
+            mem, 100, "test/model", {"role": "system", "content": "s"}, 10 ** 9)
+    finally:
+        llm.estimate_tokens = orig
+    assert pruned >= 1
+    assert len(before) - len(mem) == db_dropped      # 口径必须一致
+    assert manager.get_history_for_llm("s_ag") == mem   # 保留的消息逐条相同
