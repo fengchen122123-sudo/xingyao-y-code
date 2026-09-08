@@ -478,6 +478,8 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             pass
         if compress_window <= 0:
             try:
+                # 压缩模型是主模型时取主模型窗口（按会话解析：GUI 会话绑定的模型
+                # 可能与全局默认不同，取错窗口会让分段预算失真），仍取不到按 128k 兜底
                 from core.model_manager import get_active_model
                 active = get_active_model(session_name)
                 if active and active.get("litellm_model") == compress_model:
@@ -487,6 +489,11 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         if compress_window <= 0:
             compress_window = 128000
 
+        # 历史一次性塞进单个 prompt 会在长会话下超过压缩模型窗口
+        # （如 88 万 token 历史 vs 26 万窗口），压缩请求本身超窗失败并反复重试。
+        # 按窗口的安全预算切成多段，逐段合并摘要，每段完成即增量写库（中止不白烧）。
+        # 预算取窗口 25%：其余留给指令、累积摘要、输出、Provider 处理延迟
+        # 与估算偏差（tiktoken 对非 OpenAI 分词器的估算普遍偏低）。
         chunk_token_budget = _compression_chunk_budget(compress_window)
 
         chunks = []
@@ -562,6 +569,8 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 "api_key": compress_key,
                 "api_base": compress_url,
                 "messages": [{"role": "user", "content": prompt}],
+                # 分段载荷仍可能有数万 token，按实际 prompt 大小放大超时；
+                # 固定 60 秒会让 64K～100K token 的摘要请求稳定超时。
                 "timeout": request_timeout,
             }
             request_kwargs.update(_provider_cache_affinity_options(
@@ -627,6 +636,8 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         return CompressionOutcome("compressed", "ok")
 
     except Exception as e:
+        # 异常路径必须回滚，否则未提交的事务会使 SQLite 连接进入锁定状态，
+        # 导致后续所有写操作报 "database is locked"。
         try:
             if hasattr(manager, 'conn') and manager.conn:
                 manager.conn.rollback()
