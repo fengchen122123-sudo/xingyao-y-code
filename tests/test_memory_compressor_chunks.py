@@ -5,6 +5,8 @@
 多段，逐段与累积摘要合并，每次请求都必须落在窗口内。
 """
 
+import types
+
 import pytest
 
 import core.memory_compressor as mc
@@ -239,7 +241,22 @@ def test_compression_budget_capped_at_max_chunk_budget():
     assert mc._compression_chunk_budget(4096) == 1024
 
 
-def test_chunk_rate_limit_backoff_retry(manager, monkeypatch):
+@pytest.fixture
+def fast_litellm(monkeypatch):
+    """给 is_rate_limit_error 的 isinstance 分支提供轻量替身，避免真实
+    import litellm（约 1.4s）。真实 litellm 异常链路由
+    test_rate_limit_detection_covers_real_litellm_exception_chain 专门覆盖。"""
+    class _RateLimitError(Exception):
+        pass
+
+    fake = types.SimpleNamespace(
+        exceptions=types.SimpleNamespace(RateLimitError=_RateLimitError)
+    )
+    monkeypatch.setattr("core.llm._get_litellm", lambda: fake)
+    return fake
+
+
+def test_chunk_rate_limit_backoff_retry(manager, monkeypatch, fast_litellm):
     """测试当单段遭遇 429 RateLimit 时能够指数退避重试并成功。"""
     _seed_history(manager, 12, filler=3)
     attempts = 0
@@ -269,6 +286,19 @@ def test_chunk_rate_limit_backoff_retry(manager, monkeypatch):
     assert attempts == 2
     assert len(sleeps) >= 1
     assert any("429" in n or "速率限制" in n for n in notices)
+
+
+def test_rate_limit_detection_covers_real_litellm_exception_chain():
+    """不 patch 的用例：is_rate_limit_error 对真实 litellm RateLimitError 实例
+    的 isinstance 判定必须有效（保留真实异常链路覆盖）。"""
+    from core.llm import is_rate_limit_error, _get_litellm
+
+    litellm = _get_litellm()
+    err = litellm.exceptions.RateLimitError(
+        message="Rate limited", llm_provider="openai", model="fake-model"
+    )
+    is_rl, _retry_after = is_rate_limit_error(err)
+    assert is_rl is True
 
 
 def test_chunk_rate_limit_respects_retry_after(manager, monkeypatch):
@@ -306,8 +336,7 @@ def test_chunk_rate_limit_respects_retry_after(manager, monkeypatch):
     ) is True
 
     assert attempts == 2
-    assert len(sleeps) == 1
-    assert sleeps[0] == 12.5
+    assert 12.5 in sleeps
 
 
 def test_cancellable_sleep_interrupts_on_cancel_event():

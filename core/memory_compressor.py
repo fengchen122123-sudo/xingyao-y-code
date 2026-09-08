@@ -40,6 +40,9 @@ DEFAULT_MAX_CHUNK_TOKEN_BUDGET = 24000
 # 多段压缩时的段间平滑延时（秒），给服务商滑动窗口令牌桶恢复时间
 COMPRESSION_INTER_CHUNK_DELAY_SECONDS = 1.5
 
+# 单次压缩的总预算秒数上限（可经 config.json memory_compression.max_total_seconds 调优）
+DEFAULT_MAX_TOTAL_SECONDS = 180.0
+
 # 压缩请求触发 429 RateLimitError 时的基础退避秒数与最大重试次数
 COMPRESSION_RATE_LIMIT_BASE_DELAY_SECONDS = 5.0
 COMPRESSION_MAX_RETRIES = 3
@@ -81,11 +84,18 @@ def _load_compression_config():
             "tool_result_preview_limit_chars": int(
                 comp_cfg.get("tool_result_preview_limit_chars", DEFAULT_TOOL_RESULT_PREVIEW_LIMIT_CHARS)
             ),
-            "tool_result_token_limit": int(
-                comp_cfg.get("tool_result_token_limit", DEFAULT_TOOL_RESULT_TOKEN_LIMIT)
-            ),
+            "tool_result_token_limit": int(comp_cfg.get("tool_result_token_limit", DEFAULT_TOOL_RESULT_TOKEN_LIMIT)),
             "summary_length_first": int(comp_cfg.get("summary_length_first", DEFAULT_SUMMARY_LENGTH_FIRST)),
             "summary_length_merge": int(comp_cfg.get("summary_length_merge", DEFAULT_SUMMARY_LENGTH_MERGE)),
+            "max_chunk_token_budget": int(
+                comp_cfg.get("max_chunk_token_budget", DEFAULT_MAX_CHUNK_TOKEN_BUDGET)
+            ),
+            "inter_chunk_delay_seconds": float(
+                comp_cfg.get("inter_chunk_delay_seconds", COMPRESSION_INTER_CHUNK_DELAY_SECONDS)
+            ),
+            "max_total_seconds": float(
+                comp_cfg.get("max_total_seconds", DEFAULT_MAX_TOTAL_SECONDS)
+            ),
         }
     except Exception:
         return {
@@ -96,6 +106,9 @@ def _load_compression_config():
             "tool_result_token_limit": DEFAULT_TOOL_RESULT_TOKEN_LIMIT,
             "summary_length_first": DEFAULT_SUMMARY_LENGTH_FIRST,
             "summary_length_merge": DEFAULT_SUMMARY_LENGTH_MERGE,
+            "max_chunk_token_budget": DEFAULT_MAX_CHUNK_TOKEN_BUDGET,
+            "inter_chunk_delay_seconds": COMPRESSION_INTER_CHUNK_DELAY_SECONDS,
+            "max_total_seconds": DEFAULT_MAX_TOTAL_SECONDS,
         }
 
 
@@ -150,10 +163,16 @@ def _get_encoding(timeout=10.0):
     return state["enc"] if state["status"] == "ready" else None
 
 
-def _compression_chunk_budget(context_window):
-    """压缩正文预算：窗口的 25%，极小窗口至少保留 512 token，同时设置绝对上限 24000 token。"""
+def _compression_chunk_budget(context_window, max_budget=None):
+    """压缩正文预算：窗口的 25%，极小窗口至少保留 512 token，同时设置绝对上限。
+
+    max_budget 缺省回落 DEFAULT_MAX_CHUNK_TOKEN_BUDGET；调用方可传入配置值，
+    避免把默认上限写死成第二处真相。
+    """
+    if max_budget is None:
+        max_budget = DEFAULT_MAX_CHUNK_TOKEN_BUDGET
     raw_budget = max(512, int(int(context_window) * COMPRESSION_CHUNK_WINDOW_RATIO))
-    return min(DEFAULT_MAX_CHUNK_TOKEN_BUDGET, raw_budget)
+    return min(max_budget, raw_budget)
 
 
 def _compression_request_timeout(prompt_tokens):
@@ -329,7 +348,7 @@ def compress_session_memory(
     force=False,
     output_callback=None,
     cancel_event=None,
-    max_timeout_seconds=180.0,
+    max_timeout_seconds=None,
     return_outcome=False,
 ):
     """
@@ -373,8 +392,12 @@ def compress_session_memory(
             _compressing_sessions.discard(guard_key)
 
 
-def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit, cancel_event=None, max_timeout_seconds=180.0):
+def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit, cancel_event=None, max_timeout_seconds=None):
     config = _load_compression_config()
+    if max_timeout_seconds is None:
+        # 默认回落到配置值（config.json memory_compression.max_total_seconds），
+        # 限流调优不必改代码
+        max_timeout_seconds = config["max_total_seconds"]
     try:
         # 多步读写期间持有 manager 的可重入锁，与 add_messages 等写路径互斥
         lock = manager.acquire_lock() if hasattr(manager, 'acquire_lock') else contextlib.nullcontext()
@@ -494,7 +517,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         # 按窗口的安全预算切成多段，逐段合并摘要，每段完成即增量写库（中止不白烧）。
         # 预算取窗口 25%：其余留给指令、累积摘要、输出、Provider 处理延迟
         # 与估算偏差（tiktoken 对非 OpenAI 分词器的估算普遍偏低）。
-        chunk_token_budget = _compression_chunk_budget(compress_window)
+        chunk_token_budget = _compression_chunk_budget(compress_window, config["max_chunk_token_budget"])
 
         chunks = []
         current_chunk = []
@@ -525,9 +548,12 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         import random as _random
         start_monotonic = _time.monotonic()
 
-        # 动态放宽合并摘要字数上限：避免多段串行合并导致早期关键决策被完全抹除
-        # 每增加一段放宽 30 字，上限 1200 字
-        dynamic_merge_limit = min(1200, config["summary_length_merge"] + 30 * max(0, total_chunks - 1))
+        # 每多一段放宽 30 字，缓解串行累积合并的信息衰减；上限 1200，
+        # 但绝不低于用户显式配置值本身。
+        dynamic_merge_limit = max(
+            config["summary_length_merge"],
+            min(1200, config["summary_length_merge"] + 30 * max(0, total_chunks - 1)),
+        )
         if total_chunks > 12:
             emit("\n<ansiyellow>ℹ 待压缩历史过长（分段 > 12 段），建议在新会话中继续复杂任务以维持最佳上下文记忆。</ansiyellow>")
 
@@ -535,7 +561,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             # 预算至少容得下 3 段：单段超时可达 106s，只给 180s 会退化到
             # 「刚完成一段就爆预算」，永远压不完。
             per_chunk_seconds = (_compression_request_timeout(chunk_token_budget)
-                                 + COMPRESSION_INTER_CHUNK_DELAY_SECONDS)
+                                 + config["inter_chunk_delay_seconds"])
             budget_seconds = max(max_timeout_seconds, 3 * per_chunk_seconds)
 
             if cancel_event is not None and cancel_event.is_set():
@@ -546,7 +572,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 return _finish_with_progress(committed, "timeout")
 
             if chunk_index > 0:
-                if not _cancellable_sleep(COMPRESSION_INTER_CHUNK_DELAY_SECONDS, cancel_event):
+                if not _cancellable_sleep(config["inter_chunk_delay_seconds"], cancel_event):
                     return _finish_with_progress(committed, "cancelled")
 
             chat_log = "".join(

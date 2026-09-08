@@ -234,6 +234,60 @@ def test_ensure_fits_active_window_runs_asynchronously(tmp_path, monkeypatch):
     assert bg_finished.wait(timeout=1.0) is True
 
 
+def test_gui_compress_test_latch_catches_sync_regression(tmp_path, monkeypatch):
+    """守门：若 _ensure_fits_active_window 退化为同步实现，门闩断言必须失败。
+
+    用 start() 即同步执行 target 的 Thread 替身替换 gui_bridge.threading：
+    替身生效时 bg_finished 在 _ensure_fits_active_window 返回前必然已置位
+    （同步特征），证明 runs_asynchronously 用例的「返回瞬间未完成」断言不是
+    假阳性——两条用例合起来才封死同步回退。
+    """
+    bridge = _bridge_without_init("sync-guard-session")
+    db = tmp_path / "sync-guard.db"
+    bridge._memory = MemoryManager(str(db))
+    bridge._current_permission_mode = "confirm"
+    bridge._window = None
+    bridge._shutting_down = False
+    bridge.emit_event = lambda *a, **kw: None
+    monkeypatch.setattr(bridge, "_recalc_token_usage", lambda *a, **kw: None)
+    monkeypatch.setattr(bridge, "_emit_token_usage", lambda *a, **kw: None)
+
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda session: {
+        "litellm_model": "openai/small",
+        "context_window": 1000,
+        "api_key": "k",
+        "base_url": "",
+    })
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline",
+        lambda *a, **kw: 5000,
+    )
+
+    bg_finished = threading.Event()
+    monkeypatch.setattr(
+        "core.agent_service.prepare_turn_messages",
+        lambda *a, **kw: bg_finished.set(),
+    )
+
+    class _SyncThread:
+        def __init__(self, target=None, name=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _SyncThreadingModule:
+        Thread = _SyncThread
+
+    monkeypatch.setattr(gui_bridge, "threading", _SyncThreadingModule)
+
+    bridge._ensure_fits_active_window("sync-guard-session")
+
+    # 同步替身下：调用返回时后台任务已执行完（证明替身确实生效且被路由）；
+    # 真实异步实现下此处应为 False——与 runs_asynchronously 用例互补。
+    assert bg_finished.is_set() is True
+
+
 def test_ensure_fits_active_window_skips_when_turn_active(tmp_path, monkeypatch):
     """当会话已有活跃回合时，跳过切模型异步压缩。"""
     bridge = _bridge_without_init("active-session")
