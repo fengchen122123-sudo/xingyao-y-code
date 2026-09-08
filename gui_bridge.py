@@ -2074,6 +2074,7 @@ class ApiBridge:
                         # 透传生成该消息时所用模型的显示元数据（旧消息无 _display 时为空串）
                         "model_id": (msg.get("_display") or {}).get("model_id") or "",
                         "model_name": (msg.get("_display") or {}).get("model_name") or "",
+                        "metrics": (msg.get("_display") or {}).get("metrics") or None,
                         # media_v1 媒体清单（已拼好带令牌 URL）；旧消息为空列表
                         "media": self._media_items_for_frontend(msg.get("_display")),
                     })
@@ -4449,6 +4450,8 @@ class ApiBridge:
                 self._emit_delta("thinking_delta", str(data.get("text", "")), session_name=session_name)
             elif kind in ("assistant_delta", "token_delta", "answer_delta"):
                 self._emit_delta("token_delta", str(data.get("text", "")), session_name=session_name)
+            elif kind == "step_metrics":
+                self.emit_event("step_metrics", {**data, "session_name": session_name})
             elif kind in ("tool_requested", "tool_started"):
                 tool_id = str(data.get("id") or "")
                 name = str(data.get("name") or "tool")

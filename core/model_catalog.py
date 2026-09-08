@@ -79,7 +79,7 @@ PRESET_PROVIDERS = (
         "base_url": "https://tokenrhythm.studio/v1",
         "protocol": "openai",
         "models": [
-            {"name": "deepseek-v4.1-flash-expires-on-0910", "context_window": 1000000, "supports_vision": False,
+            {"name": "deepseek-v4.1-flash-expires-on-0910", "context_window": 1000000, "supports_vision": True,
              "supports_function_calling": True, "max_tokens": 384000},
             {"name": "deepseek-v4-flash-0731", "context_window": 1000000, "supports_vision": False},
             {"name": "deepseek-v4-pro-0813", "context_window": 1000000, "supports_vision": False},

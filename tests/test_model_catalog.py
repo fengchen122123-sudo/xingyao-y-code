@@ -102,5 +102,5 @@ def test_token_rhythm_preset_contains_deepseek_v4_1_flash_expires_on_0910():
     )
 
     assert model["context_window"] == 1000000
-    assert model["supports_vision"] is False
+    assert model["supports_vision"] is True
     assert model["supports_function_calling"] is True

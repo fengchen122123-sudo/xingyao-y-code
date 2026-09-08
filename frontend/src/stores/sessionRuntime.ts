@@ -29,6 +29,8 @@ export interface SessionRuntimeState {
   // 本回合实际用到的技能名（从 is_skill 工具调用收集）：随会话保存/恢复，
   // 状态栏"技能"项据此显示；回合开始时清空，回合结束后固化为本回合结果
   usedSkills?: string[];
+  // 当前流式生成瞬时速度（t/s）：切回会话时恢复
+  streamingSpeed?: number;
 }
 
 export function createSessionRuntime(): SessionRuntimeState {
