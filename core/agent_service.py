@@ -585,19 +585,26 @@ def prepare_turn_messages(
             history = manager.get_history_for_llm(session_name)
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
-        # 智能滑窗淘汰（带熔断保护、并发保护与最大轮次约束）：
-        # 1. 若记忆压缩明确失败且严重超限（> 1.2 * window），停止推 DB 水位，保护未摘要对话；
-        # 2. 若当前后台正有该会话的压缩在跑（或命中 already_running），严禁推 DB 水位，
-        #    避免裸 UPDATE 把后台长压缩的 CAS 乐观锁打翻导致前功尽弃；
-        # 3. 其余情况最多允许淘汰 MAX_EVICT_TURNS 轮做微调。
-        compress_failed = (outcome.status == "failed")
+        # 智能滑窗淘汰（熔断 + 并发 + 最大轮次约束）：
+        # 1. 压缩失败，或中止于「一段都没落库」的 timeout / cancelled —— 二者语义等价，
+        #    DB 里没有新摘要覆盖待淘汰历史，一律禁止推水位（否则用户按「停止」后
+        #    下一轮就会偷偷抹掉 2 轮未摘要的原始对话）。
+        # 2. 后台正有该会话压缩在跑（或命中 already_running）时严禁推水位：
+        #    evict 是无 CAS 的裸 UPDATE，会打翻后台压缩的乐观锁、令成果全废。
+        # 3. conflict_stale 属于「别的线程已摘要成功」，有兜底，允许正常微调淘汰。
+        # 4. 其余情况最多淘汰 MAX_EVICT_TURNS 轮做微调。
+        # 注：熔断阈值保持 1.2*window 是有意的——轻微超窗（0.95~1.2）时留着 2 轮微调
+        # 换可用性，比整轮拒绝服务更划算，别顺手收紧成 0.95。
+        compress_unprotected = outcome.status == "failed" or outcome.reason in {
+            "timeout", "cancelled",
+        }
         compress_running = (
             is_session_compressing(manager, session_name)
             or outcome.reason == "already_running"
         )
 
-        if compress_failed and estimated_tokens > window * 1.2:
-            _notify("compress", "<ansired>⚠️ 历史记忆压缩未能成功（可能由于服务商速率限制），当前上下文仍严重超出当前模型窗口。为保护您的历史对话完整，系统已停止自动淘汰历史；本轮请求将在内存中临时按轮次裁剪以保证正常回复。</ansired>")
+        if compress_unprotected and estimated_tokens > window * 1.2:
+            _notify("compress", "<ansired>⚠️ 历史记忆压缩未能完成（服务商限流或已被取消），当前上下文仍严重超出当前模型窗口。为保护您的历史对话完整，系统已停止自动淘汰历史；本轮请求将在内存中临时按轮次裁剪以保证正常回复。</ansired>")
         elif compress_running:
             _notify("compress", "<ansiyellow>ℹ 后台记忆压缩仍在进行中，本轮请求将在内存中临时按轮次裁剪以适配当前模型窗口。</ansiyellow>")
         else:
