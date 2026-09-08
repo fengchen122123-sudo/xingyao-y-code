@@ -749,6 +749,11 @@ def test_overflow_refill_preserves_extra_system_blocks_and_drops_legacy_db_syste
     ("model_name", "api_base", "expected_max_tokens"),
     [
         ("openai/deepseek-v4-pro", "https://api.deepseek.com", 384000),
+        (
+            "openai/deepseek-v4.1-flash-expires-on-0910",
+            "https://tokenrhythm.studio/v1",
+            384000,
+        ),
         ("openai/glm-5", "https://gateway.example/v1", 128000),
         ("openai/glm-5.1", "https://gateway.example/v1", 128000),
         ("openai/glm-5.2", "https://gateway.example/v1", 128000),
