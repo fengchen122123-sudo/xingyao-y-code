@@ -168,7 +168,7 @@ def test_compression_replaces_messages_in_place(mocker, monkeypatch):
     compressed = [{"role": "user", "content": "压缩后的历史"}]
 
     class FakeManager:
-        def get_history(self, session):
+        def get_history_for_llm(self, session):
             assert session == "compress-session"
             return list(compressed)
 
@@ -199,7 +199,9 @@ def test_compression_replaces_messages_in_place(mocker, monkeypatch):
     ))
 
     assert id(messages) == original_id
-    assert messages[0] == {"role": "user", "content": "压缩后的历史"}
+    # 压缩后的历史已生效；会话内注入的 system 块（不落库）随原地替换保留
+    assert {"role": "user", "content": "压缩后的历史"} in messages
+    assert all(m.get("content") != "原始问题" for m in messages)
     assert messages[-1]["role"] == "assistant"
     assert events[-1].kind == "turn_finished"
 
@@ -434,8 +436,8 @@ def test_compression_uses_parent_session_not_main_session(mocker, monkeypatch):
     compressed = [{"role": "user", "content": "压缩后的子代理历史"}]
 
     class FakeManager:
-        def get_history(self, session):
-            calls.append(("history", session))
+        def get_history_for_llm(self, session):
+            calls.append(("history_for_llm", session))
             return list(compressed)
 
     fake_manager = FakeManager()
@@ -463,9 +465,10 @@ def test_compression_uses_parent_session_not_main_session(mocker, monkeypatch):
 
     assert calls == [
         ("compress", "child-session"),
-        ("history", "child-session"),
+        ("history_for_llm", "child-session"),
     ]
-    assert messages[0] == {"role": "user", "content": "压缩后的子代理历史"}
+    assert {"role": "user", "content": "压缩后的子代理历史"} in messages
+    assert all(m.get("content") != "子代理原始问题" for m in messages)
     assert events[-1].kind == "turn_finished"
 
 
@@ -477,7 +480,7 @@ def test_rollback_after_successful_compression_keeps_compressed_history(mocker, 
     compressed = [{"role": "user", "content": "压缩后的历史"}]
 
     class FakeManager:
-        def get_history(self, session):
+        def get_history_for_llm(self, session):
             return list(compressed)
 
     monkeypatch.setattr(app_context, "get_manager", lambda: FakeManager())
@@ -504,7 +507,9 @@ def test_rollback_after_successful_compression_keeps_compressed_history(mocker, 
 
     assert "turn_error" in [event.kind for event in events]
     # 回滚后的内存历史仍是压缩后的版本，与 DB 保持一致
-    assert messages == [{"role": "user", "content": "压缩后的历史"}]
+    # （未被回滚成原始快照；会话内注入的 system 块不落库、随回填保留）
+    assert {"role": "user", "content": "压缩后的历史"} in messages
+    assert all(m.get("content") != "原始问题" for m in messages)
 
 
 def test_edit_file_dispatch_passes_replace_all(mocker, tmp_path):

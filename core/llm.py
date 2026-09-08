@@ -2755,12 +2755,17 @@ def _is_official_dashscope_route(api_base=""):
 
 
 def _is_qwen_family(model_name, api_base=""):
-    """判断是否 Qwen/通义千问系模型（模型名优先，api_base 兜底）。"""
+    """判断是否 Qwen/通义千问系模型（模型名优先，api_base 兜底）。
+
+    api_base 只认官方百炼/灵积端点（_is_official_dashscope_route 严格校验
+    https + 域名），不做 "dashscope" 子串宽匹配——否则 base_url 恰含该
+    子串的第三方中转会把其上的非 Qwen 模型误判进 Qwen 家族，导致
+    _supports_reasoning_fields 等按 Qwen 语义处理消息。
+    """
     model = str(model_name or "").split("/")[-1].lower()
     if "qwen" in model or "dashscope" in model:
         return True
-    b = str(api_base or "").lower()
-    return "dashscope" in b or _is_official_dashscope_route(api_base)
+    return _is_official_dashscope_route(api_base)
 
 
 _QWEN_CACHE_CONFIG_KEYS = (
@@ -2858,6 +2863,20 @@ def _qwen_cache_enabled(model_name, api_base="", model_cfg=None):
     return bool(cfg.get("enable_prompt_cache") or cfg.get("prompt_cache"))
 
 
+def _qwen_cache_control_configured(model_name, api_base="", model_cfg=None):
+    """Qwen 路由是否启用了显式 cache_control 断点（官方百炼或配置显式开启）。
+
+    不含运行期 400 黑名单降级：黑名单只关掉标记本身，tools 规范化等请求
+    形状稳定措施不随 TTL 黑名单来回翻转（形状抖动比标记更伤缓存前缀）。
+    """
+    if not _is_qwen_family(model_name, api_base):
+        return False
+    if _is_official_dashscope_route(api_base):
+        return True
+    cfg = _resolve_model_config(model_name, api_base, model_cfg)
+    return bool(cfg.get("enable_cache_control") or cfg.get("cache_control"))
+
+
 def _litellm_rejects_tool_choice(model_name):
     """litellm 是否会在客户端拒绝该模型的 tool_choice 参数。
 
@@ -2911,11 +2930,19 @@ def _uses_deepseek_prompt_ledger(
 
 
 def _select_request_tools_for_route(model_name, api_base, tools, model_cfg=None):
-    """Canonicalize tools for official DeepSeek and Qwen routes (official DashScope or config-enabled); preserve every other provider payload."""
+    """Canonicalize tools for cache-optimized routes; preserve every other provider payload.
+
+    覆盖官方 DeepSeek 路由、Qwen session-cache 路由（官方百炼或
+    enable_prompt_cache 配置）以及仅配置 enable_cache_control 的 Qwen
+    第三方网关——tools 字母序是缓存前缀字节稳定的前提，任何开启缓存
+    优化的路由都必须排序，否则 MCP 工具顺序一抖动前缀整体失效。
+    """
     canonicalize = (
         _is_deepseek_family(model_name, api_base)
         and _is_official_deepseek_route(api_base)
-    ) or _qwen_cache_enabled(model_name, api_base, model_cfg)
+    ) or _qwen_cache_enabled(model_name, api_base, model_cfg) or (
+        _qwen_cache_control_configured(model_name, api_base, model_cfg)
+    )
     if not canonicalize:
         return tools
     selected = deepcopy(list(tools or []))
@@ -3158,14 +3185,7 @@ def _supports_cache_control(model_name, api_base="", model_cfg=None):
     if prefix in _CACHE_CONTROL_PROVIDERS:
         return True
 
-    if not _is_qwen_family(model_name, api_base):
-        return False
-
-    if _is_official_dashscope_route(api_base):
-        return True
-
-    cfg = _resolve_model_config(model_name, api_base, model_cfg)
-    return bool(cfg.get("enable_cache_control") or cfg.get("cache_control"))
+    return _qwen_cache_control_configured(model_name, api_base, model_cfg)
 
 
 def _tool_contract_fingerprint(tools):
@@ -3221,6 +3241,7 @@ def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disa
                         item.pop("cache_control", None)
 
     def _mark_message(msg):
+        """打缓存断点；返回是否实际标上（Qwen 空文本 content 打不上块标记）。"""
         if is_qwen:
             content = msg.get("content")
             if isinstance(content, str) and content:
@@ -3231,13 +3252,16 @@ def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disa
                         "cache_control": {"type": "ephemeral"},
                     }
                 ]
-            elif isinstance(content, list) and content:
+                return True
+            if isinstance(content, list) and content:
                 for item in reversed(content):
                     if isinstance(item, dict) and item.get("type") in ("text", "input_text"):
                         item["cache_control"] = {"type": "ephemeral"}
-                        break
-        else:
-            msg["cache_control"] = {"type": "ephemeral"}
+                        return True
+                return False
+            return False
+        msg["cache_control"] = {"type": "ephemeral"}
+        return True
 
     # 1. 标记 system 消息（如果有）
     if messages[0].get("role") == "system":
@@ -3247,12 +3271,18 @@ def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disa
     #    遍历从后往前找第一条 role=="assistant" 的消息。
     #    如果最后一条已经是 assistant（无 tool 调用），就标它；
     #    如果末尾是 tool 结果，就标它们之前的 assistant（更稳定）。
+    #    Qwen 空文本 assistant（纯工具调用轮的典型形态）打不上 content 块
+    #    断点，且 tool 消息受协议约束不可标记：继续向前找最近一条可标记的
+    #    assistant。否则工具循环内的各 Step 只剩 system 断点，循环新增内容
+    #    （用户问题 + 全部工具结果）每步全额 miss；把边界推进到循环前最后
+    #    一条文本 assistant，至少让前缀覆盖到循环起点，且与上一轮请求字节
+    #    （该 assistant 当时已带标记）保持一致。
     last_assistant_idx = None
     for i in range(len(messages) - 1, -1, -1):
         if messages[i].get("role") == "assistant":
-            _mark_message(messages[i])
             last_assistant_idx = i
-            break
+            if _mark_message(messages[i]):
+                break
 
     # 3. 尾部断点（仅 Qwen content 块形态）：把本轮新增内容立刻写进缓存，
     #    下一轮的前缀就能覆盖到它——稳态 miss 从「上一轮 + 本轮新增」降到
@@ -3768,6 +3798,49 @@ def _provider_cache_affinity_options(
     return result
 
 
+_BUILTIN_DEFAULT_MAX_TOKENS = 32000
+
+
+def _builtin_default_max_tokens(model_name, api_base=""):
+    """返回内置默认输出上限（config.json 未显式配置 max_tokens 时使用）。
+
+    规则按序匹配，先命中先返回；仅看模型名与路由，不读取用户配置。
+    """
+    model = str(model_name or "").split("/")[-1].lower()
+    base = str(api_base or "").lower()
+    if "kimi-k2.7-code" in model and "tokenrhythm.studio" in base:
+        return 16000
+    if _is_deepseek_family(model_name, api_base):
+        return 384000
+    if _is_glm_family(model_name, api_base):
+        if "glm-5.3" in model:
+            return 131000
+        if "glm-5" in model:
+            return 128000
+        return _BUILTIN_DEFAULT_MAX_TOKENS
+    if _is_qwen_family(model_name, api_base):
+        return 131000
+    if "kimi-k2.5" in model:
+        return 64000
+    if "kimi-k2.6" in model:
+        return 128000
+    if "kimi-k2.7-code" in model:
+        return 128000
+    if "k3" in model:
+        return 131072
+    if "longcat" in model:
+        return 128000
+    if "seed-2.1-pro" in model or "seed-2.1-turbo" in model:
+        return 131000
+    if "mimo-v2.5-pro" in model:
+        return 256000
+    if "minimax-m2.5" in model:
+        return 200000
+    if "minimax-m2.7" in model:
+        return 192000
+    return _BUILTIN_DEFAULT_MAX_TOKENS
+
+
 def _provider_request_options(
     model_name,
     api_base,
@@ -3781,8 +3854,8 @@ def _provider_request_options(
 
     优先级：
     1. config.json 中模型条目的显式 thinking_budget / max_tokens / enable_thinking
-    2. 内置的 Kimi/Moonshot 模型默认表
-    3. 空字典（由调用方兜底 max_tokens=8192）
+    2. 内置模型默认输出上限表
+    3. 其他模型兜底 max_tokens=32000
 
     无论走哪个分支，Kimi 系模型都会附加缓存亲和配置。思考参数随后按模型能力表编码。
     """
@@ -3833,10 +3906,10 @@ def _provider_request_options(
 
     if cfg_max_tokens is not None:
         result["max_tokens"] = int(cfg_max_tokens)
+    else:
+        result["max_tokens"] = _builtin_default_max_tokens(model_name, api_base)
 
     if deepseek_family:
-        if cfg_max_tokens is not None:
-            result["max_tokens"] = int(cfg_max_tokens)
         if not has_reasoning_choice and (
             not has_registered_reasoning or not has_legacy_reasoning_choice
         ):
@@ -3861,9 +3934,6 @@ def _provider_request_options(
         or cfg_thinking_budget is not None
         or (cfg_enable_thinking is not None and not has_reasoning_choice)
     ):
-        # 用户显式配置优先
-        if cfg_max_tokens is not None:
-            result["max_tokens"] = int(cfg_max_tokens)
         # thinking 仅在显式启用或配置了 budget 时注入
         if cfg_enable_thinking is True or cfg_thinking_budget is not None:
             budget = int(cfg_thinking_budget) if cfg_thinking_budget is not None else 2048
@@ -3888,22 +3958,13 @@ def _provider_request_options(
                 result.setdefault("thinking", {
                     "type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048,
                 })
-                result.setdefault("max_tokens", 32000 if is_kimi_coding else 16000)
-                result.setdefault("allowed_openai_params", ["thinking"])
             else:
                 result.setdefault("thinking", {"type": "enabled", "budget_tokens": 2048})
-                result.setdefault("max_tokens", 16000)
-                result.setdefault("allowed_openai_params", ["thinking"])
-        else:
-            # OpenAI 兼容路由（api.moonshot.cn/v1 及各类经销商）：
-            # 绝不发送 Anthropic 形状的 thinking 参数——Moonshot 的
-            # /v1/chat/completions 不认这个键，发了会直接 400。
-            # Kimi 推理模型（k2.5/k2.6/k2.7/k3 等）在该路由上会原生输出
-            # reasoning_content，无需显式开启，只需给足输出上限。
-            if is_k3:
-                result.setdefault("max_tokens", 32000)
-            else:
-                result.setdefault("max_tokens", 16384)
+            result.setdefault("allowed_openai_params", ["thinking"])
+        # OpenAI 兼容路由（api.moonshot.cn/v1 及各类经销商）：绝不发送 Anthropic
+        # 形状的 thinking 参数——Moonshot 的 /v1/chat/completions 不认这个键，
+        # 发了会直接 400。Kimi 推理模型（k2.5/k2.6/k2.7/k3 等）在该路由上会原生
+        # 输出 reasoning_content，无需显式开启；输出上限由内置默认表统一给出。
 
     if kimi_family:
         _attach_kimi_request_extras(
@@ -4799,6 +4860,27 @@ def _describe_images_with_secondary(messages, main_model_name, event_callback=No
         target_msg["content"] = _vision_fallback_text(user_text)
 
 
+def _refill_messages_after_compression(messages, manager, session):
+    """上下文超限强制压缩后，原地用压缩后的 DB 历史重建请求消息列表。
+
+    历史必须走 get_history_for_llm：剔除刚被摘要排除的消息（水位之后才是
+    活跃区）、挂载记忆摘要并修复 tool_call 配对。此前误用全量 get_history
+    ——刚被压缩排除的消息被原样塞回，重试载荷不降反升，兜底路径必然再次
+    超限并报出误导性的「压缩后仍超窗」错误，且记忆摘要挂载整条丢失。
+    首部系统提示词（稳定前缀 + 会话内注入块）每轮现组、不落库，从原
+    列表完整保留并前置；DB 中旧格式遗留的 system 上下文块与
+    prepare_turn_messages 的清理口径一致，重读时整体丢弃。
+    """
+    system_blocks = [
+        m for m in messages if isinstance(m, dict) and m.get("role") == "system"
+    ]
+    refreshed = manager.get_history_for_llm(session)
+    refreshed = [
+        m for m in refreshed if not (isinstance(m, dict) and m.get("role") == "system")
+    ]
+    messages[:] = system_blocks + refreshed
+
+
 def _chat_with_model_generator(
     model_name,
     api_key,
@@ -5251,9 +5333,10 @@ def _chat_with_model_generator(
             ]))
 
     # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小
-    # 导致长回复被静默截断。若 provider 已显式配置则尊重其值。
+    # 导致长回复被静默截断。若 provider 已显式配置则尊重其值；内置默认表未覆盖的
+    # 模型在这里兜底 32000。
     if "max_tokens" not in kwargs and "max_completion_tokens" not in kwargs:
-        kwargs["max_tokens"] = 8192
+        kwargs["max_tokens"] = 32000
 
     if api_base:
         kwargs["api_base"] = api_base
@@ -5571,7 +5654,7 @@ def _chat_with_model_generator(
                             )
                             # 原地替换为压缩后历史：禁止重新绑定局部名，
                             # 否则调用方持有的旧列表会失联、取消回滚也会作用错对象
-                            messages[:] = manager.get_history(session)
+                            _refill_messages_after_compression(messages, manager, session)
                             if deepseek_ledger_enabled:
                                 rotate_deepseek_generation = True
                             # 压缩已成功落库：同步回合快照，避免后续异常回滚把

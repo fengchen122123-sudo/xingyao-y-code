@@ -159,7 +159,7 @@ def _run_one_request(*, model, api_base, api_key, messages, tools, cache_session
     if not deepseek_thinking_request:
         request["tool_choice"] = "auto"
     if "max_tokens" not in request and "max_completion_tokens" not in request:
-        request["max_tokens"] = 8192
+        request["max_tokens"] = 32000
 
     response_stream = completion(**request)
     usage = None

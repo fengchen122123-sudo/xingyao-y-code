@@ -190,7 +190,21 @@ def _cache_lane_sha256(kwargs: dict) -> str:
         return _sha256(str(metadata["user_id"]).encode("utf-8"))
     extra_headers = kwargs.get("extra_headers")
     if isinstance(extra_headers, dict) and "x-dashscope-session-cache" in extra_headers:
-        return _sha256(str(extra_headers["x-dashscope-session-cache"]).encode("utf-8"))
+        # header 值恒为 "enable"，只哈希它会让所有 Qwen 请求挤进同一条
+        # lane，journal 诊断无法区分缓存通道；并入模型与路由后同参数请求
+        # 仍字节稳定（保活请求与主请求落同一条 lane）。会话身份不随请求
+        # 发送（DashScope 按前缀/密钥侧建缓存），故不参与哈希。
+        lane_material = json.dumps(
+            {
+                "session_cache": extra_headers["x-dashscope-session-cache"],
+                "model": str(kwargs.get("model") or ""),
+                "api_base": str(kwargs.get("api_base") or ""),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return _sha256(lane_material.encode("utf-8"))
     return ""
 
 

@@ -39,6 +39,19 @@ PATH_VALIDATION_ERROR_MESSAGE = (
 # 前端 diffView.ts 会自行裁剪上下文，这里只兜底超大文件全量重写之类的极端场景。
 _EVENT_DIFF_MAX_LINES = 2000
 
+# 受托只读工具集合：这些工具访问受托路径（用户显式挂载的附件、粘贴落盘文件、
+# 受信只读路径）时免沙盒确认。classify_path_access 与 _sandbox_outside_guard
+# 必须共用同一份名单，否则权限层免问、执行层又弹确认（两层门禁不一致）。
+_TRUSTED_READONLY_TOOLS = frozenset({
+    "read_file",
+    "list_directory",
+    "directory_tree",
+    "search_code",
+    "find_definition",
+    "glob_files",
+    "view_file_outline",
+})
+
 
 def _as_tool_result(value) -> ToolResult:
     if isinstance(value, ToolResult):
@@ -213,7 +226,7 @@ def classify_path_access(
             return "credential_write"
         return "trusted_read"
 
-    if function_name in {"read_file", "list_directory", "directory_tree", "search_code", "find_definition", "glob_files", "view_file_outline"}:
+    if function_name in _TRUSTED_READONLY_TOOLS:
         try:
             from core.skills import is_trusted_read_path
 
@@ -309,7 +322,7 @@ def _sandbox_outside_guard(
                 return sandbox_bypass(), None
         except Exception:
             pass
-    if function_name == "read_file":
+    if function_name in _TRUSTED_READONLY_TOOLS:
         try:
             from core.skills import is_trusted_read_path
 
@@ -387,6 +400,8 @@ class ToolAdapterSet:
         self.safe_print = safe_print
         self.tool_call_id = tool_call_id
         self.permission_error_type = permission_error_type
+        # guard 签名探测缓存：None=未探测；for_call 的浅拷贝会带上已探测结果
+        self._guard_accepts_extras = None
 
     def for_call(self, tool_call_id):
         adapter = copy(self)
@@ -447,7 +462,20 @@ class ToolAdapterSet:
 
     def _guard(self, name, path, context):
         guard_fn = self.sandbox_guard or _sandbox_outside_guard
-        try:
+        if self._guard_accepts_extras is None:
+            # 静态探测签名而不是捕 TypeError 重试：guard 内部（如 permission_checker）
+            # 抛出的真实 TypeError 会触发二次调用，导致权限询问执行两次。
+            try:
+                params = set(inspect.signature(guard_fn).parameters)
+                self._guard_accepts_extras = {
+                    "permission_checker",
+                    "is_outside_workspace",
+                    "sandbox_bypass",
+                    "permission_error_type",
+                } <= params
+            except (TypeError, ValueError):
+                self._guard_accepts_extras = False
+        if self._guard_accepts_extras:
             return guard_fn(
                 name,
                 path,
@@ -461,16 +489,15 @@ class ToolAdapterSet:
                 sandbox_bypass=self.sandbox_bypass,
                 permission_error_type=self.permission_error_type,
             )
-        except TypeError:
-            return guard_fn(
-                name,
-                path,
-                context.event_callback,
-                context.permission_owner,
-                context.parent_turn_id,
-                context.permission_source,
-                context.cancel_event,
-            )
+        return guard_fn(
+            name,
+            path,
+            context.event_callback,
+            context.permission_owner,
+            context.parent_turn_id,
+            context.permission_source,
+            context.cancel_event,
+        )
 
     def execute_read_file(self, resolved_tool, arguments, context) -> ToolResult:
         bypass, error = self._guard("read_file", arguments.get("file_path"), context)
