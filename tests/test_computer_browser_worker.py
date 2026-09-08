@@ -30,9 +30,19 @@ def _command(mode: str, tmp_path: Path) -> list[str]:
     ]
 
 
-def _pid_alive(pid: int) -> bool:
+def _pid_alive(pid: int, timeout: float = 1.0) -> bool:
     import psutil
 
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            if not psutil.Process(pid).is_running():
+                return False
+        except psutil.NoSuchProcess:
+            return False
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(0.05)
     try:
         return psutil.Process(pid).is_running()
     except psutil.NoSuchProcess:

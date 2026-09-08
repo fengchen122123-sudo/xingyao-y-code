@@ -21,6 +21,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import queue
 import shutil
 import subprocess
@@ -213,12 +214,16 @@ class _WorkerProcessTransport:
     def start(self) -> None:
         if sys.platform == "win32":
             self._job = _create_kill_on_close_job()
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
         try:
             self._proc = subprocess.Popen(
                 self._worker_command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
+                env=env,
             )
         except OSError as error:
             self._close_job()
@@ -302,8 +307,8 @@ class _WorkerProcessTransport:
             for raw in proc.stdout:
                 try:
                     message = _decode_worker_message(raw)
-                except (ValueError, json.JSONDecodeError):
-                    _LOGGER.warning("受管执行进程返回不合法消息（已忽略）")
+                except (ValueError, json.JSONDecodeError) as error:
+                    _LOGGER.warning("受管执行进程返回不合法消息（已忽略）: %s", error)
                     continue
                 if "event" in message:
                     self._handle_event(message)
@@ -371,15 +376,22 @@ class _WorkerProcessTransport:
                     proc.wait(timeout=remaining)
                 except subprocess.TimeoutExpired:
                     pass
-        if proc.poll() is None and self._job is not None:
+        if proc.poll() is None:
             # 无法优雅收尾：终止本次专用执行进程与能确认归属的浏览器进程树。
             stats["terminated"] = True
             kill_started = time.perf_counter()
-            _terminate_job(self._job)
+            if self._job is not None:
+                _terminate_job(self._job)
             try:
                 proc.wait(timeout=_PROCESS_HARD_EXIT)
             except subprocess.TimeoutExpired:
                 _LOGGER.error("受管执行进程在硬终止后仍未退出（%s）", proc.pid)
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=1.0)
+                except OSError:
+                    pass
             stats["exit_after_kill_ms"] = round(
                 (time.perf_counter() - kill_started) * 1000, 1
             )
@@ -489,7 +501,7 @@ def _decode_worker_message(raw) -> dict:
     from core.computer.browser_worker_protocol import decode_response
 
     if isinstance(raw, bytes):
-        raw = raw.decode("utf-8")
+        raw = raw.decode("utf-8", errors="replace")
     return decode_response(raw)
 
 
