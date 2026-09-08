@@ -90,3 +90,17 @@ def test_token_rhythm_preset_contains_qwen38_flash():
     assert model["context_window"] == 1000000
     assert model["supports_vision"] is True
     assert model["supports_function_calling"] is True
+
+
+def test_token_rhythm_preset_contains_deepseek_v4_1_flash_expires_on_0910():
+    providers = get_preset_providers()
+    token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
+    model = next(
+        m
+        for m in token_rhythm["models"]
+        if m["name"] == "deepseek-v4.1-flash-expires-on-0910"
+    )
+
+    assert model["context_window"] == 1000000
+    assert model["supports_vision"] is False
+    assert model["supports_function_calling"] is True
