@@ -453,6 +453,7 @@ def add_model_to_provider(
     supports_vision: bool | None = None,
     supports_function_calling: bool | None = None,
     computer_protocol: str | None = None,
+    max_tokens: int | None = None,
 ) -> str:
     """
     给指定厂商追加一个模型，litellm_model 格式为 {protocol}/{name}。
@@ -488,6 +489,8 @@ def add_model_to_provider(
                     "litellm_model": litellm_model_name(protocol, name),
                     "context_window": context_window,
                 }
+                if max_tokens is not None:
+                    model_entry["max_tokens"] = int(max_tokens)
                 if supports_vision is not None:
                     model_entry["supports_vision"] = bool(supports_vision)
                 if supports_function_calling is not None:
@@ -719,6 +722,8 @@ def add_preset_provider_with_models(
                 "litellm_model": litellm_model_name(protocol, mname),
                 "context_window": m.get("context_window", 128000),
             }
+            if "max_tokens" in m:
+                model_entry["max_tokens"] = int(m["max_tokens"])
             if "supports_vision" in m:
                 model_entry["supports_vision"] = bool(m["supports_vision"])
             if "supports_function_calling" in m:
