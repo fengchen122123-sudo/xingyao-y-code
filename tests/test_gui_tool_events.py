@@ -385,7 +385,7 @@ def test_worker_emits_attachment_notes_inline_and_finishes_with_renamed_session(
     })
     monkeypatch.setattr(
         "core.input_parser.parse_user_input",
-        lambda text: (text, ["🖼️ 已附加图片: sample.png（压缩后 320KB）"]),
+        lambda text, *args, **kwargs: (text, ["🖼️ 已附加图片: sample.png（压缩后 320KB）"]),
     )
     monkeypatch.setattr(
         "core.agent_service.prepare_turn_messages", lambda *args, **kwargs: []

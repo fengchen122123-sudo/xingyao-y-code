@@ -360,6 +360,20 @@ def is_session_user_attached_path(path, session_id: str | None = None) -> bool:
         return bool(bucket and target in bucket)
 
 
+def _clear_sandbox_state_for_tests() -> None:
+    """测试隔离辅助：清空所有会话级沙盒放行、附件登记与粘贴文件登记。"""
+    global _session_sandbox_bypass
+    with _session_sandbox_lock:
+        _session_sandbox_bypass = False
+        _session_sandbox_bypass_by_session.clear()
+    with _session_user_attached_paths_lock:
+        _session_user_attached_paths_by_session.clear()
+    with _paste_file_registry_lock:
+        _paste_file_registry.clear()
+    if hasattr(_sandbox_tls, "depth"):
+        _sandbox_tls.depth = 0
+
+
 def _outside_workspace_allowed():
     """读取运行时状态：是否允许访问工作目录外的文件。
 

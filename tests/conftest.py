@@ -80,6 +80,12 @@ def _restore_entry_layer_globals():
     mcp_client.set_status_logger(status_logger)
     subagent_manager.set_on_terminal(subagent_terminal)
     task_manager.set_task_finished_callback(task_finished)
+    try:
+        from core.tools import _clear_sandbox_state_for_tests
+
+        _clear_sandbox_state_for_tests()
+    except Exception:
+        pass
 
 
 def pytest_sessionfinish(session, exitstatus):
