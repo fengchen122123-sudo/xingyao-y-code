@@ -1000,8 +1000,12 @@ def test_prune_history_in_memory_preserves_summary_and_last_turn():
         # [system] + 6 msgs = 700 tokens > 380
         # 裁剪 1 轮（最早的问题1 + 回答1）后 -> 5 msgs = 500 tokens > 380
         # 裁剪 2 轮（中间的问题2 + 回答2）后 -> 3 msgs (system + 摘要 + 最新问题3) = 300 <= 380 -> 结束
-        pruned = _prune_history_in_memory_to_fit_window(history, window=400, model_name="test", system_message=system_msg)
+        pruned, remaining = _prune_history_in_memory_to_fit_window(
+            history, window=400, model_name="test", system_message=system_msg,
+            estimated_tokens=700,
+        )
         assert pruned == 2
+        assert remaining == 300
         # 摘要必须保留在开头
         assert history[0]["content"].startswith("[历史对话记忆摘要")
         # 最新问题必须保留在末尾
@@ -1042,4 +1046,36 @@ def test_zero_summary_skipped_forbids_db_eviction(tmp_path, monkeypatch, stub_ll
 
     assert evict_calls == []          # 一次都不许推 DB 水位
     assert len(manager.get_history_for_llm(session)) >= 20
+
+
+def test_prune_history_in_memory_estimates_incrementally():
+    """裁剪过程不得对全量历史反复重扫：全量估算次数必须与裁剪轮数解耦。"""
+    import core.agent_service as ag
+    import core.llm as llm
+
+    history = [{"role": "user", "content": "[历史对话记忆摘要 (背景)]\n摘要保留"}]
+    for i in range(12):
+        history.append({"role": "user", "content": "问题 %d " % i + "内容 " * 400})
+        history.append({"role": "assistant", "content": "回答 %d " % i + "细节 " * 400})
+
+    full_scans = {"n": 0}
+    def counting_estimate(model, msgs):
+        if len(msgs) > 4:
+            full_scans["n"] += 1
+        return len(msgs) * 800
+
+    orig = llm.estimate_tokens
+    llm.estimate_tokens = counting_estimate
+    try:
+        pruned, remaining = ag._prune_history_in_memory_to_fit_window(
+            history, 4000, "test/model", {"role": "system", "content": "s"},
+            len(history) * 800,
+        )
+    finally:
+        llm.estimate_tokens = orig
+
+    assert pruned >= 5
+    assert full_scans["n"] <= 2          # 只允许收尾校验，不许每轮全量重扫
+    assert remaining <= 4000 * 0.95       # SUMMARIZE_RATIO
+    assert history[0]["content"].startswith("[历史对话记忆摘要")
 

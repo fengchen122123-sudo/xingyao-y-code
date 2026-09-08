@@ -426,25 +426,37 @@ def build_background_task_summary(session_name: str) -> str:
     return "\n".join(summary_lines)
 
 
-def _prune_history_in_memory_to_fit_window(history: list, window: int, model_name: str, system_message: dict) -> int:
+def _prune_history_in_memory_to_fit_window(
+    history: list, window: int, model_name: str, system_message: dict,
+    estimated_tokens: int,
+) -> tuple:
     """请求侧内存级轮次裁剪：仅在待发请求内存列表中按完整轮次剔除最早历史，
     保证发给小窗口模型的载荷处于 window * SUMMARIZE_RATIO 之内。
     绝不触碰 DB，绝不推进水位，保留数据库历史完整性。
-    返回裁剪掉的轮次数。
+
+    估算成本：每轮只对被剔除片段做一次局部估算并做减法，不对全量历史反复重扫
+    （80 万 token 全量重扫可达数十秒，且这条路正跑在用户等回复的同步路径上）。
+    返回 (裁剪掉的轮次数, 剩余估算 token)。
     """
     from core.llm import estimate_tokens
+
+    limit = window * SUMMARIZE_RATIO
+    remaining = int(estimated_tokens)
     pruned_turns = 0
-    while True:
-        current_tokens = estimate_tokens(model_name, [system_message] + history)
-        if current_tokens <= window * SUMMARIZE_RATIO:
-            break
+    while remaining > limit:
+        # 轮次起点口径与 memory.evict_oldest_turn_persistent 保持一致：
+        # 第一条非 system 消息即轮次开头。摘要行是 get_history_for_llm 现插的
+        # role=user 伪消息（DB 侧不存在），故此处显式跳过。改这里必须同步改那边，
+        # tests/test_memory.py::test_memory_and_db_turn_boundary_agree 会把关。
         start_idx = None
         for i, m in enumerate(history):
-            if m.get("role") == "user":
-                content = str(m.get("content") or "")
-                if not content.startswith("[历史对话记忆摘要"):
-                    start_idx = i
-                    break
+            role = m.get("role")
+            if role == "system":
+                continue
+            if role == "user" and str(m.get("content") or "").startswith("[历史对话记忆摘要"):
+                continue
+            start_idx = i
+            break
         if start_idx is None:
             break
         end_idx = None
@@ -454,9 +466,11 @@ def _prune_history_in_memory_to_fit_window(history: list, window: int, model_nam
                 break
         if end_idx is None:
             break
+        removed = history[start_idx:end_idx]
+        remaining -= estimate_tokens(model_name, removed)
         del history[start_idx:end_idx]
         pruned_turns += 1
-    return pruned_turns
+    return pruned_turns, remaining
 
 
 def prepare_turn_messages(
@@ -626,8 +640,8 @@ def prepare_turn_messages(
         # 在内存中临时按完整轮次安全剔除最早历史，保证本轮请求正常发出且 DB 零破坏。
         if estimated_tokens > window * SUMMARIZE_RATIO:
             from core.memory import _sanitize_tool_call_pairing
-            pruned_count = _prune_history_in_memory_to_fit_window(
-                history, window, model_name, system_message
+            pruned_count, estimated_tokens = _prune_history_in_memory_to_fit_window(
+                history, window, model_name, system_message, estimated_tokens
             )
             if pruned_count > 0:
                 history = _sanitize_tool_call_pairing(history)
