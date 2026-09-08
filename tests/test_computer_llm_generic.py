@@ -26,7 +26,10 @@ from tests.request_payload_snapshot import ALPHA_TOOL, ZETA_TOOL
 SESSION = "comp-session"
 TURN = "comp-turn"
 
-# pre-feature 基线请求字节（2026-09-03 用未改动代码真实捕获）：
+# pre-feature 基线请求字节（2026-09-03 用未改动代码真实捕获；
+# 2026-09-08 因内置默认输出上限表变更同步更新基线：max_tokens 8192→32000，
+# 且 max_tokens 改由 provider options 提前注入，字段顺序随之为 max_tokens 在
+# tool_choice 之前）：
 # capability 关闭时整份 Provider 请求必须逐字节复现该常量。
 EXISTING_DEFAULT_REQUEST_BYTES = (
     '{"model":"openai/generic-vision","api_key":"<redacted>",'
@@ -37,7 +40,7 @@ EXISTING_DEFAULT_REQUEST_BYTES = (
     '{"type":"function","function":{"name":"alpha","description":"alpha",'
     '"parameters":{"type":"object","properties":{}}}}],'
     '"stream":true,"stream_options":{"include_usage":true},"num_retries":2,'
-    '"tool_choice":"auto","max_tokens":8192,"timeout":90'
+    '"max_tokens":32000,"tool_choice":"auto","timeout":90'
     '}'
 ).encode("utf-8")
 

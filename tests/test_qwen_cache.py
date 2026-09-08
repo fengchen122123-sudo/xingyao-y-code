@@ -206,6 +206,59 @@ def test_qwen_keepalive_support_and_request_building():
     assert keepalive_req["tool_choice"] == "none"
 
 
+def test_qwen_keepalive_default_thinking_tier_disables_thinking():
+    """Qwen 默认思考档（用户未显式配置思考）的保活快照必须补 enable_thinking=False。
+
+    Qwen3.x 未显式配置时默认开启思考，保活 max_tokens=1 会因思考输出受限被
+    provider 拒绝，首次保活报错即令保活服务自我停用。"""
+    official_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+    # 1. extra_body 缺失（default 档未注入任何思考参数）：补 enable_thinking=False
+    no_extra_req = {
+        "model": "openai/qwen3.8-flash",
+        "api_key": "sk-test",
+        "api_base": official_base,
+        "messages": [{"role": "system", "content": "stable"}],
+        "extra_headers": {"x-dashscope-session-cache": "enable"},
+    }
+    keepalive_req = build_keepalive_request(no_extra_req)
+    assert keepalive_req["max_tokens"] == 1
+    assert keepalive_req["extra_body"]["enable_thinking"] is False
+
+    # 2. extra_body 存在但无思考键（仅携带其他参数）：同样补关思考
+    other_extra_req = {
+        "model": "openai/qwen3.8-flash",
+        "api_key": "sk-test",
+        "api_base": official_base,
+        "messages": [{"role": "system", "content": "stable"}],
+        "extra_body": {"some_flag": True},
+    }
+    keepalive_req2 = build_keepalive_request(other_extra_req)
+    assert keepalive_req2["extra_body"]["enable_thinking"] is False
+    assert keepalive_req2["extra_body"]["some_flag"] is True
+
+    # 3. 用户显式关闭思考（enable_thinking=False）：保持原样不覆盖
+    disabled_req = {
+        "model": "openai/qwen3.8-flash",
+        "api_key": "sk-test",
+        "api_base": official_base,
+        "messages": [{"role": "system", "content": "stable"}],
+        "extra_body": {"enable_thinking": False},
+    }
+    keepalive_req3 = build_keepalive_request(disabled_req)
+    assert keepalive_req3["extra_body"]["enable_thinking"] is False
+
+    # 4. 非 Qwen 模型且无思考配置：不注入任何键，保活快照保持既有字节
+    non_qwen_req = {
+        "model": "openai/some-model",
+        "api_key": "sk-test",
+        "api_base": "https://gateway.example/v1",
+        "messages": [{"role": "system", "content": "stable"}],
+    }
+    keepalive_req4 = build_keepalive_request(non_qwen_req)
+    assert "extra_body" not in keepalive_req4
+
+
 def test_request_envelope_lane_sha_captures_dashscope_session_cache():
     kwargs = {
         "extra_headers": {"x-dashscope-session-cache": "enable"},
@@ -213,6 +266,42 @@ def test_request_envelope_lane_sha_captures_dashscope_session_cache():
     sha = _cache_lane_sha256(kwargs)
     assert len(sha) == 64
     assert _cache_lane_sha256({}) == ""
+
+
+def test_request_envelope_lane_sha_distinguishes_qwen_lanes():
+    """Qwen lane 指纹必须随模型/路由变化。
+
+    只哈希 header 值（恒为 "enable"）会让所有 Qwen 请求挤进同一条缓存
+    通道，journal 诊断无法区分模型或路由；并入模型与路由后同参数请求
+    仍字节稳定。会话身份不随请求发送（DashScope 按前缀/密钥侧建缓存），
+    故不参与哈希。"""
+    common = {"extra_headers": {"x-dashscope-session-cache": "enable"}}
+    sha_max = _cache_lane_sha256({
+        "model": "openai/qwen3.8-max",
+        "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        **common,
+    })
+    sha_flash = _cache_lane_sha256({
+        "model": "openai/qwen3.8-flash",
+        "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        **common,
+    })
+    sha_gateway = _cache_lane_sha256({
+        "model": "openai/qwen3.8-max",
+        "api_base": "https://gateway.example/v1",
+        **common,
+    })
+    assert len(sha_max) == 64
+    assert sha_max != sha_flash  # 不同模型不同 lane
+    assert sha_max != sha_gateway  # 不同路由不同 lane
+    # 同参数稳定复现（保活请求与主请求落同一条 lane）
+    assert sha_max == _cache_lane_sha256({
+        "model": "openai/qwen3.8-max",
+        "api_base": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        **common,
+    })
+    # 无 session-cache header 的请求不受影响
+    assert _cache_lane_sha256({"model": "openai/qwen3.8-max"}) == ""
 
 
 def test_qwen_config_driven_cache_enablement(monkeypatch):
@@ -338,6 +427,38 @@ def test_qwen_tools_canonicalization_includes_computer_tool():
     assert [t["function"]["name"] for t in sorted_tools] == ["alpha_tool", "computer", "zeta_tool"]
 
 
+def test_qwen_tools_canonicalized_when_only_cache_control_configured(monkeypatch):
+    """仅配置 enable_cache_control 的第三方网关也必须排序 tools。
+
+    tools 字母序是缓存前缀字节稳定的前提：只开断点标记而不排序，MCP
+    工具顺序一抖动，断点打得再对前缀也会整体失效。session-cache header
+    与 keepalive 仍由 enable_prompt_cache 单独控制，不随此开关放开。"""
+    gateway_base = "https://tokenrhythm.studio/v1"
+    model = "openai/qwen3.8-flash"
+
+    monkeypatch.setattr("core.model_manager.load_config", lambda: {
+        "providers": [{
+            "name": "TokenRhythm",
+            "base_url": gateway_base,
+            "models": [{
+                "litellm_model": model,
+                "name": "qwen3.8-flash",
+                "enable_cache_control": True,
+            }],
+        }]
+    })
+    from core.llm import _qwen_cache_enabled, _select_request_tools_for_route
+
+    tools = [
+        {"type": "function", "function": {"name": "zeta_tool", "description": "z"}},
+        {"type": "function", "function": {"name": "alpha_tool", "description": "a"}},
+    ]
+    sorted_tools = _select_request_tools_for_route(model, gateway_base, tools)
+    assert [t["function"]["name"] for t in sorted_tools] == ["alpha_tool", "zeta_tool"]
+    # session-cache header 语义不变：仅 enable_prompt_cache 开启时注入
+    assert not _qwen_cache_enabled(model, gateway_base)
+
+
 def test_cache_benchmark_qwen_parameters():
     """验证 cache_benchmark 中 Qwen 请求参数构造能够正确生成断点与 Session 缓存。"""
 
@@ -415,6 +536,39 @@ def test_qwen_tail_breakpoint_skips_tool_message():
     marked = _apply_cache_control(deepcopy(messages), _QWEN, _OFFICIAL)
     assert marked[-1]["content"] == "file body"
     assert _marker_count(marked) == 1  # 仅 system；末尾无 assistant 文本可标
+
+
+def test_qwen_tool_loop_boundary_falls_back_to_text_assistant():
+    """工具循环内空文本 assistant 打不上 content 块断点：回退标记循环前
+    最后一条文本 assistant。
+
+    修复前循环各 Step 只剩 system 断点，本轮新增内容（用户问题 + 全部
+    工具结果）每步全额 miss；修复后边界至少推进到循环起点，且与上一轮
+    请求字节（该 assistant 当时已带标记）保持一致。"""
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "q1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "user", "content": "q2"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "read_file", "arguments": "{}"}}
+            ],
+        },
+        {"role": "tool", "tool_call_id": "c1", "name": "read_file", "content": "file body"},
+    ]
+    marked = _apply_cache_control(deepcopy(messages), _QWEN, _OFFICIAL)
+    # system + 循环前最后一条文本 assistant（a1）共 2 个断点
+    assert _marker_count(marked) == 2
+    a1 = marked[2]
+    assert isinstance(a1["content"], list)
+    assert a1["content"][0]["cache_control"] == {"type": "ephemeral"}
+    assert a1["content"][0]["text"] == "a1"
+    # 空文本 assistant 与 tool 尾部保持原样（协议约束不允许标记）
+    assert marked[4]["content"] == ""
+    assert marked[-1]["content"] == "file body"
 
 
 def test_qwen_tail_breakpoint_not_duplicated_on_last_assistant():

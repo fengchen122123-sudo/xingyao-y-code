@@ -609,7 +609,11 @@ def prepare_turn_messages(
         # 2. 后台正有该会话压缩在跑（或命中 already_running）时严禁推水位：
         #    evict 是无 CAS 的裸 UPDATE，会打翻后台压缩的乐观锁、令成果全废。
         # 3. conflict_stale 属于「别的线程已摘要成功」，有兜底，允许正常微调淘汰。
-        # 4. 其余情况最多淘汰 MAX_EVICT_TURNS 轮做微调。
+        # 4. 其余情况（含 partial_timeout / partial_cancelled 等部分提交中止）最多
+        #    淘汰 MAX_EVICT_TURNS 轮做微调。注意部分提交中止时，从已提交水位起
+        #    淘汰的是未提交段轮次（无摘要兜底）——受硬上限约束的有损微调，属
+        #    有意权衡；超窗兜底由下方 I4 内存级轮次裁剪保证，下一轮压缩会从
+        #    已提交水位续推补摘要。
         # 注：熔断阈值保持 1.2*window 是有意的——轻微超窗（0.95~1.2）时留着 2 轮微调
         # 换可用性，比整轮拒绝服务更划算，别顺手收紧成 0.95。
         compress_unprotected = outcome.status == "failed" or outcome.reason in {

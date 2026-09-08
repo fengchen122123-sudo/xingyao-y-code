@@ -192,9 +192,9 @@ def test_one_request_matches_deepseek_and_regular_tool_choice_contract(monkeypat
 
     assert "tool_choice" not in captured[0]
     assert captured[0]["extra_body"]["thinking"] == {"type": "enabled"}
-    assert captured[0]["max_tokens"] == 8192
+    assert captured[0]["max_tokens"] == 384000
     assert captured[1]["tool_choice"] == "auto"
-    assert captured[1]["max_tokens"] == 8192
+    assert captured[1]["max_tokens"] == 32000
 
 
 def test_benchmark_rejects_usage_that_fails_production_invariants(monkeypatch):

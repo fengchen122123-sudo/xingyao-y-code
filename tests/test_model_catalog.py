@@ -21,6 +21,8 @@ def test_catalog_preserves_cli_model_metadata():
         {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
         {"name": "deepseek-v4-flash-vision-exp", "context_window": 1000000, "supports_vision": True,
          "supports_function_calling": True, "computer_protocol": "generic"},
+        {"name": "deepseek-v4.1-flash-expires-on-0910", "context_window": 1000000, "supports_vision": True,
+         "supports_function_calling": True},
     ]
 
 

@@ -286,18 +286,39 @@ def is_session_sandbox_bypass_enabled():
 _session_user_attached_paths_by_session: dict[str, set[str]] = {}
 _session_user_attached_paths_lock = threading.Lock()
 
+# 本进程落盘登记过的粘贴/上传文件（绝对路径）。%TEMP% 全用户可写，
+# 只按"目录在 ycode_paste 下"放行会让其他进程投放的文件也免沙盒确认，
+# 因此 is_trusted_paste_path 要求目录 + 本进程登记双条件命中。
+_paste_file_registry: set[str] = set()
+_paste_file_registry_lock = threading.Lock()
+
+
+def register_paste_file(path) -> None:
+    """登记本进程落盘的粘贴/上传文件路径（落盘入口调用一次）。"""
+    if not path:
+        return
+    try:
+        target = os.path.realpath(os.path.expanduser(str(path)))
+    except Exception:
+        return
+    with _paste_file_registry_lock:
+        _paste_file_registry.add(target)
+
 
 def is_trusted_paste_path(path) -> bool:
-    """判定路径是否属于系统临时目录中的剪贴板/移动端粘贴落盘目录（ycode_paste）。"""
+    """判定路径是否为本进程落盘登记过的粘贴/上传文件（ycode_paste 目录内）。"""
     if not path:
         return False
     try:
         import tempfile
         paste_dir = os.path.realpath(os.path.join(tempfile.gettempdir(), "ycode_paste"))
         target = os.path.realpath(os.path.expanduser(str(path)))
-        return target == paste_dir or target.startswith(paste_dir + os.sep)
+        if target != paste_dir and not target.startswith(paste_dir + os.sep):
+            return False
     except Exception:
         return False
+    with _paste_file_registry_lock:
+        return target in _paste_file_registry
 
 
 def register_session_user_attached_paths(paths, session_id: str | None = None) -> None:
@@ -321,7 +342,12 @@ def register_session_user_attached_paths(paths, session_id: str | None = None) -
 
 
 def is_session_user_attached_path(path, session_id: str | None = None) -> bool:
-    """判断给定路径是否已由用户显式作为附件挂载。"""
+    """判断给定路径是否已由用户显式作为附件挂载。
+
+    仅匹配当前会话（显式传入 session_id 或线程绑定的会话）的登记，
+    绝不跨会话兜底：其他会话挂载过的路径不代表本会话用户已授权，
+    否则并行会话里 A 挂载的文件会被 B 免确认读取（跨会话数据泄漏）。
+    """
     if not path:
         return False
     try:
@@ -331,14 +357,7 @@ def is_session_user_attached_path(path, session_id: str | None = None) -> bool:
     sid = str(session_id or "").strip() or _sandbox_session_id()
     with _session_user_attached_paths_lock:
         bucket = _session_user_attached_paths_by_session.get(sid)
-        if bucket and target in bucket:
-            return True
-        default_bucket = _session_user_attached_paths_by_session.get("__default__")
-        if default_bucket and target in default_bucket:
-            return True
-        if session_id is None and any(target in b for b in _session_user_attached_paths_by_session.values()):
-            return True
-    return False
+        return bool(bucket and target in bucket)
 
 
 def _outside_workspace_allowed():

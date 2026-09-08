@@ -39,7 +39,12 @@ _register(
     ),
 )
 _register(
-    ("deepseek-v4-flash", "deepseek-v4-flash-0731"),
+    (
+        "deepseek-v4-flash",
+        "deepseek-v4-flash-0731",
+        "deepseek-v4-flash-vision-exp",
+        "deepseek-v4.1-flash-expires-on-0910",
+    ),
     ReasoningCapability(
         "effort",
         ("default", "off", "low", "high", "max"),
@@ -170,7 +175,6 @@ _register(
 )
 _register(
     (
-        "deepseek-v4-flash-vision-exp",
         "sensenova-6.7-flash-lite",
         "step-explore",
         "doubao-seed-evolving",
