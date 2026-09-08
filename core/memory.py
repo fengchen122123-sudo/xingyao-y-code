@@ -2449,10 +2449,16 @@ class MemoryManager:
                 new_boundary = rows[end - 1][0]
                 if new_boundary <= boundary:
                     return False
+                # CAS：仅当库里水位仍等于本次读到的旧值才推进。无 CAS 时会与
+                # 后台压缩的每段提交互相覆盖（谁后写谁赢），令对方进度全废。
                 cursor.execute(
-                    'UPDATE sessions SET summarized_until_msg_id = ? WHERE id = ?',
-                    (new_boundary, session_id),
+                    'UPDATE sessions SET summarized_until_msg_id = ? '
+                    'WHERE id = ? AND summarized_until_msg_id IS ?',
+                    (new_boundary, session_id, row[1]),
                 )
+                if cursor.rowcount == 0:
+                    self.conn.rollback()
+                    return False        # 期间有人推进过水位，本轮放弃，下轮重读
                 self.conn.commit()
                 return True
             except Exception:
