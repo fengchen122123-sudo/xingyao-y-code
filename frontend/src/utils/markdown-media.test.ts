@@ -43,6 +43,16 @@ describe('renderMarkdown 媒体语法', () => {
     expect(html.indexOf('md-img-copy')).toBeGreaterThan(html.indexOf('md-img'));
   });
 
+  it('图片带悬停"另存为"按钮：data-save-src 与建议文件名，视频没有按钮', () => {
+    const html = renderMarkdown('![微信群二维码](a.png)\n[video: v](b.mp4)', { items: [img(0), video(1)] });
+    expect((html.match(/md-img-save"/g) || []).length).toBe(1);
+    expect(html).toContain(`data-save-src="${img(0).url}"`);
+    expect(html).toContain('data-save-name="微信群二维码"');
+    // 两个按钮同处一个操作区容器：各自绝对定位会互相重叠
+    expect(html).toContain('class="md-img-actions"');
+    expect(html.indexOf('md-img-actions')).toBeLessThan(html.indexOf('md-img-copy'));
+  });
+
   it('视频语法 [video: x](path) 渲染为 <video controls>', () => {
     const html = renderMarkdown('[video: 演示](demo.mp4)', { items: [video(0)] });
     expect(html).toContain('<video class="md-video"');

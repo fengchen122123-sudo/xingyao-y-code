@@ -59,6 +59,9 @@ export const COPY_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
 export const CHECK_ICON_SVG =
   '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 6 9 17l-5-5"/></svg>';
+// "另存为"按钮的下载图标（同上，v-html 内联）
+export const SAVE_ICON_SVG =
+  '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>';
 
 function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): string {
   if (item.kind === 'error') {
@@ -75,11 +78,15 @@ function mediaItemHtml(item: MediaItem, caption: string, ordinal: number): strin
     return `<video class="md-video" controls preload="metadata" playsinline src="${escapeHtml(src)}"></video>`;
   }
   const alt = caption || item.caption || item.source_name || '图片';
-  // 悬停浮现"复制原图"按钮：src 放 data 属性，点击经 MessageBubble 事件委托
-  // fetch 原图写入剪贴板（媒体服务已带 CORS 头）
+  // 悬停浮现操作区：src 放 data 属性，点击经 MessageBubble 事件委托处理。
+  // 两个按钮共用 .md-img-actions 容器（各自绝对定位会互相重叠）；
+  // data-save-name 是另存为的默认文件名建议（后端会清理并补真实扩展名）。
   return `<span class="md-media-wrap">`
     + `<img class="md-img" src="${escapeHtml(src)}" alt="${escapeHtml(alt)}" data-media-ordinal="${ordinal}" loading="lazy">`
+    + `<span class="md-img-actions">`
     + `<button class="md-img-copy" type="button" title="复制原图" aria-label="复制原图" data-copy-src="${escapeHtml(src)}">${COPY_ICON_SVG}<span class="md-img-copy-text">复制</span></button>`
+    + `<button class="md-img-save" type="button" title="另存为" aria-label="另存为" data-save-src="${escapeHtml(src)}" data-save-name="${escapeHtml(alt)}">${SAVE_ICON_SVG}<span class="md-img-save-text">另存为</span></button>`
+    + `</span>`
     + `</span>`;
 }
 

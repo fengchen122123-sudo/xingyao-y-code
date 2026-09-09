@@ -274,6 +274,14 @@ function onMdBodyClick(e: MouseEvent) {
     return;
   }
 
+  const saveBtn = (e.target as HTMLElement).closest('button.md-img-save');
+  if (saveBtn) {
+    e.preventDefault();
+    const src = saveBtn.getAttribute('data-save-src') || '';
+    if (src) saveMdImageAs(src, saveBtn.getAttribute('data-save-name') || '', saveBtn as HTMLButtonElement);
+    return;
+  }
+
   // mermaid 图点击放大进灯箱（须先于 img 分支判断：图内不含 md-img，
   // 两者天然互斥）。传的是当前 DOM 里 injectSvg 注入的已净化 SVG 字符串，
   // 灯箱用 v-html 直注（与气泡同一条渲染路径），不绕 data URL 二次解析；
@@ -379,6 +387,34 @@ async function copyMdImageToClipboard(src: string, btn: HTMLButtonElement) {
     setFeedback(true);
   } catch {
     setFeedback(false);
+  }
+}
+
+// "另存为"：后端弹原生保存对话框，把仓库里的原文件复制到用户选择的位置。
+// 用户取消不提示失败；成功/失败都在按钮上短暂反馈，不打断阅读。
+async function saveMdImageAs(src: string, suggestedName: string, btn: HTMLButtonElement) {
+  const label = btn.querySelector('.md-img-save-text');
+  const restore = () => {
+    btn.classList.remove('saved', 'save-failed');
+    if (label) label.textContent = '另存为';
+  };
+  const feedback = (text: string, cls: string) => {
+    btn.classList.add(cls);
+    if (label) label.textContent = text;
+    window.setTimeout(restore, 1500);
+  };
+  btn.disabled = true;
+  try {
+    const res = await store.saveMediaImage(src, suggestedName);
+    if (res && res.ok) {
+      feedback('已保存', 'saved');
+    } else if (!res || !res.cancelled) {
+      // 取消对话框不是错误，静默复原；其余失败给出可见提示
+      feedback('保存失败', 'save-failed');
+      if (res && res.msg) store.notifyChat(`另存图片失败：${res.msg}`);
+    }
+  } finally {
+    btn.disabled = false;
   }
 }
 
@@ -752,12 +788,29 @@ async function copyUserMessage() {
   cursor: zoom-in;
   object-fit: contain;
 }
-/* 悬停浮现的"复制原图"按钮：图片右上角。配色固定为深色底白字（不随主题变
-   量走），保证压在任意明暗的图片内容上都有足够对比度 */
-.md-body :deep(.md-img-copy) {
+/* 悬停浮现的图片操作区（复制原图 / 另存为）：图片右上角，两按钮横向排列。
+   配色固定为深色底白字（不随主题变量走），保证压在任意明暗的图片内容上
+   都有足够对比度 */
+.md-body :deep(.md-img-actions) {
   position: absolute;
   top: 14px;
   right: 14px;
+  display: flex;
+  gap: 6px;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+}
+.md-body :deep(.md-media-wrap:hover .md-img-actions),
+.md-body :deep(.md-img-actions:focus-within),
+/* 按钮自身处于反馈态时（点击后鼠标移开）操作区继续保持可见 */
+.md-body :deep(.md-img-actions:has(.copied)),
+.md-body :deep(.md-img-actions:has(.saved)),
+.md-body :deep(.md-img-actions:has(.copy-failed)),
+.md-body :deep(.md-img-actions:has(.save-failed)) {
+  opacity: 1;
+}
+.md-body :deep(.md-img-copy),
+.md-body :deep(.md-img-save) {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -769,29 +822,31 @@ async function copyUserMessage() {
   font-size: 12px;
   line-height: 1;
   cursor: pointer;
-  opacity: 0;
-  transition: opacity 0.15s ease;
+  transition: background 0.15s ease, border-color 0.15s ease;
   backdrop-filter: blur(4px);
 }
-.md-body :deep(.md-img-copy svg) {
+.md-body :deep(.md-img-copy svg),
+.md-body :deep(.md-img-save svg) {
   width: 13px;
   height: 13px;
 }
-.md-body :deep(.md-media-wrap:hover .md-img-copy),
-.md-body :deep(.md-img-copy:focus-visible),
-.md-body :deep(.md-img-copy.copied),
-.md-body :deep(.md-img-copy.copy-failed) {
-  opacity: 1;
+.md-body :deep(.md-img-copy:disabled),
+.md-body :deep(.md-img-save:disabled) {
+  cursor: default;
+  opacity: 0.75;
 }
-.md-body :deep(.md-img-copy:hover) {
+.md-body :deep(.md-img-copy:hover),
+.md-body :deep(.md-img-save:hover) {
   background: rgba(15, 15, 15, 0.9);
   border-color: rgba(255, 255, 255, 0.55);
   color: #fff;
 }
-.md-body :deep(.md-img-copy.copied) {
+.md-body :deep(.md-img-copy.copied),
+.md-body :deep(.md-img-save.saved) {
   color: #4ade80;
 }
-.md-body :deep(.md-img-copy.copy-failed) {
+.md-body :deep(.md-img-copy.copy-failed),
+.md-body :deep(.md-img-save.save-failed) {
   color: #f87171;
 }
 .md-body :deep(video.md-video) {

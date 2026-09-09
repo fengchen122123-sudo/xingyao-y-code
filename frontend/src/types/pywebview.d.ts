@@ -619,6 +619,13 @@ export interface PyWebViewAPI {
   delete_gui_theme(themeId: string): Promise<GuiThemeResult>;
   import_gui_theme(): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
   export_gui_theme(themeId: string): Promise<GuiThemeResult<{ path: string }>>;
+  // 图片另存为：url 必须是本进程媒体服务签发的地址；cancelled 表示用户取消
+  save_media_image(url: string, suggestedName?: string): Promise<{
+    ok: boolean;
+    path?: string;
+    msg?: string;
+    cancelled?: boolean;
+  }>;
   import_gui_theme_image(themeId: string, region: ThemeRegionId): Promise<GuiThemeResult<{ asset_path: string }>>;
   remove_gui_theme_image(themeId: string, region: ThemeRegionId): Promise<GuiThemeResult<{ theme: GuiTheme }>>;
   read_gui_theme_asset(themeId: string, assetPath: string): Promise<GuiThemeResult<{
