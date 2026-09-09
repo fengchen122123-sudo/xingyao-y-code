@@ -4171,7 +4171,9 @@ class ApiBridge:
             # 时执行失败此前只记 debug），前端消息纯靠 delta 累加、尾部一丢就永久
             # 缺失。turn_finish 前补发 message_final 携带最后一条助手消息全文，
             # 前端仅在全文更长时覆盖——正常路径是无害 no-op，丢包路径自我修复。
-
+            # 必须带回合边界 turn_start_msg_id：异常/取消回滚后 history 末尾会
+            # 退化成上一轮的助手消息，不过滤就会把上一轮全文补发进本轮气泡。
+            self._emit_message_final(event_session_name, after_msg_id=turn_start_msg_id)
             self.emit_event("turn_finish", {"session_name": event_session_name})
             self._emit_token_usage()
             self._clear_session_last_error(session_name)
