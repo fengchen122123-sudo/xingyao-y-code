@@ -42,7 +42,7 @@ SUMMARIZE_RATIO = 0.95
 MAX_EVICT_TURNS = 2
 
 # 兜底系统提示词：提示词文件全部缺失时也不能让整轮对话失败
-FALLBACK_SYSTEM_PROMPT = "你叫星瑶，是一位顶尖的代码编程助手。"
+FALLBACK_SYSTEM_PROMPT = "你叫{agent_name}，是一位顶尖的代码编程助手。"
 
 # 通用编码规范（并入稳定系统提示词前缀，跨轮不变，对任何编码项目适用）。
 # 作为稳定前缀的扩充块，同时帮助 DeepSeek 磁盘缓存跨越更多完整缓存块。
@@ -150,7 +150,11 @@ def load_system_prompt(is_gui: bool = False) -> str:
         system_prompt = ""
     if not system_prompt:
         # 最后一道兜底，确保任何情况下都不会因为提示词文件缺失而整轮失败
-        system_prompt = FALLBACK_SYSTEM_PROMPT
+        try:
+            from core.persona_settings import get_agent_display_name
+            system_prompt = FALLBACK_SYSTEM_PROMPT.format(agent_name=get_agent_display_name())
+        except Exception:
+            system_prompt = FALLBACK_SYSTEM_PROMPT.format(agent_name="星瑶")
     return system_prompt
 
 
@@ -169,6 +173,16 @@ def build_stable_system_message(is_gui: bool = False) -> dict:
     from core.context_builder import build_stable_prompt
 
     parts = [build_stable_prompt(load_system_prompt(is_gui))]
+    # 人设设置块：仅当用户在设置页自定义了名称/称呼/人设时非空；
+    # 默认配置返回空串，不影响 byte-stability。跨轮不变，归入稳定前缀。
+    try:
+        from core.persona_settings import build_persona_prompt_block
+
+        persona_block = build_persona_prompt_block()
+        if persona_block:
+            parts.append(persona_block)
+    except Exception:
+        pass
     parts.append(_GENERAL_CODING_STANDARDS)
     try:
         import core.memory_kairos as memory_kairos
@@ -736,17 +750,22 @@ def undo_last_edit(manager, session_name: str, force: bool = False) -> tuple[boo
         return False, "撤销失败：缺少文件原始内容记录，无法安全恢复。"
 
     # 删除新建文件是高危操作：要求显式确认，避免跨会话/误操作导致用户数据丢失
+    try:
+        from core.persona_settings import get_agent_display_name
+        _agent = get_agent_display_name()
+    except Exception:
+        _agent = "星瑶"
     if existed_before is None:
         existed_before = old_content != ""
     will_delete = not bool(existed_before)
     if will_delete and not force:
-        return False, f"该操作将删除星瑶新建的文件 {file_path}，需要显式确认后才能执行。"
+        return False, f"该操作将删除{_agent}新建的文件 {file_path}，需要显式确认后才能执行。"
 
     try:
         if will_delete:
             if os.path.exists(file_path):
                 os.remove(file_path)
-            message = f"撤销成功！已删除星瑶新建的文件: {file_path}"
+            message = f"撤销成功！已删除{_agent}新建的文件: {file_path}"
         else:
             # 撤销是用户显式发起的恢复操作：沙盒外路径也直接放行，
             # 避免之前单次批准写出的沙盒外文件无法撤销

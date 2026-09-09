@@ -107,13 +107,13 @@
                  等待线负责，两条不重叠）；结束后保留一行静态工作时间 -->
             <div v-if="showFlowWorking" class="working-indicator">
               <span class="wi-ring"></span>
-              <span class="wi-text">星瑶正在干活</span>
+              <span class="wi-text">{{ store.agentName }}正在干活</span>
               <span class="wi-dots"><i>.</i><i>.</i><i>.</i></span>
               <span v-if="workElapsed >= 1" class="wi-elapsed">已工作 {{ fmtWorkTime(workElapsed) }}</span>
             </div>
             <div v-else-if="finalWorkTime !== null" class="working-indicator done">
               <span class="wi-check"><AppIcon name="check" :size="13" :stroke-width="2.25" /></span>
-              <span class="wi-text">星瑶本轮工作 {{ fmtWorkTime(finalWorkTime) }}</span>
+              <span class="wi-text">{{ store.agentName }}本轮工作 {{ fmtWorkTime(finalWorkTime) }}</span>
             </div>
           </div>
           </div>
@@ -208,7 +208,7 @@
       <div v-if="!store.initialized" id="splash">
         <img class="sp-logo" :src="'/icon.png'" alt="Y-CODE">
         <div class="sp-title">Y-CODE</div>
-        <div class="sp-sub">星瑶·编码助手</div>
+        <div class="sp-sub">{{ store.agentName }}·编码助手</div>
         <div class="sp-bar"><i></i></div>
       </div>
     </Transition>

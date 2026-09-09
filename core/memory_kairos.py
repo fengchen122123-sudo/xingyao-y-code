@@ -287,8 +287,14 @@ def run_dream_consolidation_sync(api_model, api_key, api_base=None):
     # 统一经过 core.llm 的懒加载包装，确保补丁、日志和测试替换点一致。
     from core.llm import completion
     
+    try:
+        from core.persona_settings import get_agent_display_name
+        _agent = get_agent_display_name()
+    except Exception:
+        _agent = "星瑶"
+
     prompt = f"""
-你正在为星瑶 (Y-code) 整理长期记忆文件。你的任务是将最近的每日日志 (Daily Logs) 里的新事实、反馈和规则整理进分类记忆文件中，并更新索引 MEMORY.md。
+你正在为{_agent} (Y-code) 整理长期记忆文件。你的任务是将最近的每日日志 (Daily Logs) 里的新事实、反馈和规则整理进分类记忆文件中，并更新索引 MEMORY.md。
 
 目前记忆目录的物理路径在 `{MEMORY_DIR.as_posix()}/` 目录下。
 已有的记忆索引 (MEMORY.md) 内容为：

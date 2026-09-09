@@ -418,28 +418,34 @@ class ToolAdapterSet:
     def announce(self, name, arguments, event_callback):
         if event_callback is not None:
             return
-        friendly = f"⚙️ 星瑶正在后台悄悄使用工具: {name} 哒～"
+        try:
+            from core.persona_settings import get_agent_display_name
+
+            agent = get_agent_display_name()
+        except Exception:
+            agent = "星瑶"
+        friendly = f"⚙️ {agent}正在后台悄悄使用工具: {name} 哒～"
         if name == "read_file":
-            friendly = f"🔍 星瑶正在读取文件：{arguments.get('file_path', '未知文件')}"
+            friendly = f"🔍 {agent}正在读取文件：{arguments.get('file_path', '未知文件')}"
         elif name == "write_file":
-            friendly = f"✍️ 星瑶正在写入文件：{arguments.get('file_path', '未知文件')}"
+            friendly = f"✍️ {agent}正在写入文件：{arguments.get('file_path', '未知文件')}"
         elif name == "list_directory":
-            friendly = f"📂 星瑶正在查看目录：{arguments.get('dir_path', '当前目录')}"
+            friendly = f"📂 {agent}正在查看目录：{arguments.get('dir_path', '当前目录')}"
         elif name == "execute_command":
             command = arguments.get("command", "...")
             if len(command) > 20:
                 command = command[:20] + "..."
-            friendly = f"💻 星瑶正在执行命令：{command}"
+            friendly = f"💻 {agent}正在执行命令：{command}"
         elif name == "search_code":
-            friendly = f"🔍 星瑶正在全局查找: {arguments.get('query', '')}"
+            friendly = f"🔍 {agent}正在全局查找: {arguments.get('query', '')}"
         elif name == "find_definition":
-            friendly = f"🔍 星瑶正在查找符号定义: {arguments.get('symbol', '')}"
+            friendly = f"🔍 {agent}正在查找符号定义: {arguments.get('symbol', '')}"
         elif name == "search_news":
-            friendly = f"🌐 星瑶正在联网搜索：{arguments.get('query', '')}"
+            friendly = f"🌐 {agent}正在联网搜索：{arguments.get('query', '')}"
         elif name == "fetch_url":
-            friendly = f"🌐 星瑶正在访问网址：{arguments.get('url', '')}"
+            friendly = f"🌐 {agent}正在访问网址：{arguments.get('url', '')}"
         elif name == "get_weather":
-            friendly = f"🌤 星瑶正在查询天气：{arguments.get('city', '') or '自动定位'}"
+            friendly = f"🌤 {agent}正在查询天气：{arguments.get('city', '') or '自动定位'}"
         from prompt_toolkit.formatted_text import HTML
 
         safe = friendly.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")

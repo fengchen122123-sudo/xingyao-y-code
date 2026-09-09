@@ -11,6 +11,16 @@ from typing import Callable
 logger = logging.getLogger(__name__)
 
 
+def _app_title() -> str:
+    """窗口/托盘标题：含设置页自定义的智能体显示名。"""
+    try:
+        from core.persona_settings import get_agent_display_name
+
+        return f"Y-CODE · {get_agent_display_name()}"
+    except Exception:
+        return "Y-CODE · 星瑶"
+
+
 class ApplicationLifecycle:
     def __init__(
         self,
@@ -48,7 +58,7 @@ class ApplicationLifecycle:
         return pystray.Icon(
             "ycode",
             image,
-            "Y-CODE · 星瑶",
+            _app_title(),
             menu=pystray.Menu(
                 pystray.MenuItem("显示主窗口", show_window, default=True),
                 pystray.MenuItem("退出", exit_application),
@@ -149,7 +159,7 @@ class ApplicationLifecycle:
                     "【取消】返回窗口"
                 )
                 ret = ctypes.windll.user32.MessageBoxW(
-                    None, text, "Y-CODE · 星瑶",
+                    None, text, _app_title(),
                     MB_YESNOCANCEL | MB_ICONQUESTION | MB_TOPMOST,
                 )
                 if ret == IDYES:
@@ -163,7 +173,7 @@ class ApplicationLifecycle:
                 "【否】返回窗口"
             )
             ret = ctypes.windll.user32.MessageBoxW(
-                None, text, "Y-CODE · 星瑶",
+                None, text, _app_title(),
                 MB_YESNO | MB_ICONQUESTION | MB_TOPMOST,
             )
             return "exit" if ret == IDYES else "cancel"

@@ -6,7 +6,7 @@
       <div class="pc-title">
         <b>权限请求</b>
         <span class="pc-src">
-          星瑶请求执行以下操作{{ store.permRequest.source ? '（来源: ' + store.permRequest.source + '）' : '' }}
+          {{ store.agentName }}请求执行以下操作{{ store.permRequest.source ? '（来源: ' + store.permRequest.source + '）' : '' }}
         </span>
       </div>
     </div>

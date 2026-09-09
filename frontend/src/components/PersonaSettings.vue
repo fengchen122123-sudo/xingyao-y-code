@@ -43,7 +43,7 @@
         class="persona-textarea"
         :maxlength="20000"
         rows="9"
-        placeholder="描述智能体的身份、性格与说话风格；留空使用内置默认人设。"
+        placeholder="描述智能体的身份、性格与说话风格；填写后取代内置默认人设（安全规范保留），清空后自动恢复默认。"
         :disabled="loading || saving"
       ></textarea>
       <div class="persona-meta">
@@ -70,7 +70,7 @@
 
       <p v-if="errorMsg" data-test="persona-error" class="persona-error">{{ errorMsg }}</p>
       <p v-else-if="savedTip" data-test="persona-saved" class="persona-saved">{{ savedTip }}</p>
-      <p class="persona-note">当前版本仅保存配置；人设应用到会话提示词的功能将在后续版本接入。</p>
+      <p class="persona-note">人设内容与称呼会随名称一起注入会话提示词：填写后取代内置默认人设中的身份与性格设定（安全红线与工具规范保留），清空后自动恢复内置默认人设，不会丢失。</p>
     </section>
   </div>
 </template>
@@ -167,6 +167,8 @@ async function savePersona() {
         String(res.persona ?? personaDraft.value),
         String(res.user_title ?? userTitleDraft.value.trim()),
       );
+      // 名称/称呼即时同步全局：界面文案、执行过程、思考提示立刻切换，无需重启
+      store.applyPersonaSettings({ agent_name: res.agent_name, user_title: res.user_title });
       savedTip.value = res.msg || '已保存';
       if (savedTipTimer) clearTimeout(savedTipTimer);
       savedTipTimer = setTimeout(() => { savedTip.value = ''; }, 2500);
@@ -179,9 +181,6 @@ async function savePersona() {
     saving.value = false;
   }
 }
-
-// store 目前未消费人设设置；保留引入以维持与其他设置分区一致的写法
-void store;
 
 onMounted(loadPersona);
 </script>

@@ -125,7 +125,12 @@ def render_session_history(
                 # 与上一块之间补一个空行（紧跟在 user 提问后时不需要）
                 if prev_block not in (None, "user"):
                     output.append("\n")
-                output.append(f"{ANSI_MAGENTA}🤖 星瑶 >{ANSI_RESET}\n")
+                try:
+                    from core.persona_settings import get_agent_display_name
+                    _agent_label = get_agent_display_name()
+                except Exception:
+                    _agent_label = "星瑶"
+                output.append(f"{ANSI_MAGENTA}🤖 {_agent_label} >{ANSI_RESET}\n")
                 output.append(render_markdown_to_ansi(content, width))
                 prev_block = "assistant"
             continue
