@@ -166,6 +166,7 @@ class LanServer:
         self.lan_ip = self._detect_lan_ip()
         self._clients = []
         self._clients_lock = threading.Lock()
+        self._client_locks: Dict[Any, threading.Lock] = {}
         self._token = None
         self._token_expires = 0.0
         self._ttl = 86400
@@ -231,6 +232,7 @@ class LanServer:
         with self._clients_lock:
             clients = self._clients
             self._clients = []
+            self._client_locks.clear()
         for client in clients:
             try:
                 client.close(code=4401, reason="token rotated")
@@ -268,6 +270,7 @@ class LanServer:
             if not self._verify_token(token):
                 return False
             self._clients.append(ws)
+            self._client_locks[ws] = threading.Lock()
             return True
 
     def _load_persisted_token(self, token: str, expires_at) -> None:
@@ -333,19 +336,33 @@ class LanServer:
         """更新配对 token 的有效期（秒）；<= 0 表示永久有效。"""
         self._ttl = int(seconds)
 
+    def _safe_send(self, ws, payload: str) -> bool:
+        """线程安全地向单个客户端发送 payload。"""
+        with self._clients_lock:
+            lock = self._client_locks.get(ws)
+        if lock is None:
+            try:
+                ws.send(payload)
+                return True
+            except Exception:
+                return False
+        with lock:
+            try:
+                ws.send(payload)
+                return True
+            except Exception:
+                return False
+
     # ------------------------------------------------------------------ #
     # 事件广播
     # ------------------------------------------------------------------ #
 
     def broadcast(self, payload: str) -> None:
-        """向所有已连接客户端发送事件 payload，异常吞掉。"""
+        """向所有已连接客户端发送事件 payload，线程安全且异常吞掉。"""
         with self._clients_lock:
             clients = list(self._clients)
         for client in clients:
-            try:
-                client.send(payload)
-            except Exception:
-                pass
+            self._safe_send(client, payload)
 
     # ------------------------------------------------------------------ #
     # WebSocket RPC
@@ -378,6 +395,7 @@ class LanServer:
                     self._clients.remove(ws)
                 except ValueError:
                     pass
+                self._client_locks.pop(ws, None)
 
     def _route_message(self, ws, raw: str) -> None:
         """解析单条 RPC 消息并回包 ``{"id", "result"}`` 或 ``{"id", "error"}``。"""
@@ -395,9 +413,9 @@ class LanServer:
         # 既有 wire 格式（字符串 error），保持手机端 shim 兼容
         error = result.get("error") if isinstance(result, dict) else None
         if isinstance(error, dict) and error.get("code") == "method_not_allowed":
-            ws.send(json.dumps({"id": msg_id, "error": "method not allowed"}))
+            self._safe_send(ws, json.dumps({"id": msg_id, "error": "method not allowed"}))
             return
-        ws.send(json.dumps({"id": msg_id, "result": result}))
+        self._safe_send(ws, json.dumps({"id": msg_id, "result": result}))
 
     def dispatch_rpc(self, method, args) -> Dict[str, Any]:
         """单次 RPC 分发核心（WebSocket 路由与直调测试共用同一边界）。

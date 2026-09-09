@@ -822,13 +822,106 @@ export const useAppStore = defineStore('app', {
     },
 
     // 回合级事件（tool_start / tool_finish / diff_ready）必须落在当前助手消息上；
-    // 缺失说明后端事件序列违反契约，直接抛出显式错误而不是静默丢弃。
+    // 缺失时：若当前会话处于运行态（如中途扫码接入），自愈补齐 running 占位卡片避免崩溃；
+    // 若非运行态到达则严格抛出契约错误。
     activeAssistantOrThrow(): ChatMessage {
-      const last = this.messages[this.messages.length - 1];
+      let last = this.messages[this.messages.length - 1];
       if (!last || last.role !== 'assistant') {
-        throw new Error('桥接契约错误：回合级事件到达时不存在活动助手消息');
+        const isRunning = this.running || this.runningSessions.includes(this.currentSessionName);
+        if (isRunning) {
+          console.warn('[Harness] 活跃会话收到回合级事件时不存在活动助手消息，自动补齐 running 占位卡片');
+          const placeholder: ChatMessage = {
+            role: 'assistant',
+            content: this.currentStreamingText,
+            reasoning_content: this.currentThinkingText,
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          };
+          this.messages.push(placeholder);
+          last = placeholder;
+        } else {
+          throw new Error('桥接契约错误：回合级事件到达时不存在活动助手消息');
+        }
       }
       return last;
+    },
+
+    // 恢复运行中回合的快照（中途扫码连入手机或切换到正在执行的会话）
+    _restoreActiveTurnSnapshot(snap: any, targetSessionName: string = '') {
+      if (!snap || typeof snap !== 'object') return;
+      const sess = targetSessionName || snap.session_name || this.currentSessionName;
+      const isCurrent = this.currentSessionName === sess;
+      const runtime = this._getSessionRuntime(sess);
+      const msgs = isCurrent ? this.messages : runtime.messages;
+
+      // 1. 用户消息去重与补齐
+      const userText = String(snap.display_text || snap.user_text || '').trim();
+      if (userText) {
+        const hasUser = msgs.some(m => m.role === 'user' && m.content === userText);
+        if (!hasUser) {
+          msgs.push({ role: 'user', content: userText });
+        }
+      }
+
+      // 2. 助手卡片还原/补齐
+      let assistantMsg = msgs[msgs.length - 1];
+      const needsNewAssistant = !assistantMsg || assistantMsg.role !== 'assistant';
+      const streamingText = String(snap.streaming_text || '');
+      const thinkingText = String(snap.thinking_text || '');
+      const toolCalls = Array.isArray(snap.tool_calls)
+        ? snap.tool_calls.map((tc: any): ToolExecutionCall => ({
+            id: String(tc.id || ''),
+            name: String(tc.name || 'tool'),
+            label: String(tc.label || tc.name || 'tool'),
+            started_at_ms: tc.started_at_ms || Date.now(),
+            display: normalizeToolDisplay(tc.display),
+            result: (tc.summary || tc.result || tc.error) ? {
+              ok: !!tc.ok,
+              summary: String(tc.summary || ''),
+              result: String(tc.result || tc.error || ''),
+              duration_ms: tc.duration_ms !== undefined && tc.duration_ms !== null ? Number(tc.duration_ms) : undefined,
+            } : undefined,
+            diff: tc.diff,
+          }))
+        : [];
+
+      if (needsNewAssistant) {
+        assistantMsg = {
+          role: 'assistant',
+          content: streamingText,
+          reasoning_content: thinkingText,
+          tool_calls: toolCalls,
+          legacy_diffs: [],
+          execution_state: 'running',
+        };
+        msgs.push(assistantMsg);
+      } else {
+        assistantMsg.execution_state = 'running';
+        if (streamingText && (!assistantMsg.content || streamingText.length > assistantMsg.content.length)) {
+          assistantMsg.content = streamingText;
+        }
+        if (thinkingText && (!assistantMsg.reasoning_content || thinkingText.length > assistantMsg.reasoning_content.length)) {
+          assistantMsg.reasoning_content = thinkingText;
+        }
+        if (toolCalls.length > 0 && (!assistantMsg.tool_calls || assistantMsg.tool_calls.length === 0)) {
+          assistantMsg.tool_calls = toolCalls;
+        }
+      }
+
+      // 3. 恢复运行态与流式变量
+      runtime.running = true;
+      if (!this.runningSessions.includes(sess)) {
+        this.runningSessions.push(sess);
+      }
+      if (isCurrent) {
+        this.running = true;
+        this.currentStreamingText = assistantMsg.content || streamingText;
+        this.currentThinkingText = assistantMsg.reasoning_content || thinkingText;
+        if (snap.started_at_ms) {
+          this.turnStartedAt = Number(snap.started_at_ms);
+        }
+      }
     },
 
     // 把消息里的图片另存到用户选择的位置（后端弹原生"另存为"对话框，
@@ -1442,6 +1535,18 @@ export const useAppStore = defineStore('app', {
         }
         this.running = !!this.currentSessionName && activeSessions.includes(this.currentSessionName);
         this._captureCurrentRuntime();
+        // 活跃回合快照还原：手机扫码接入或前端重载时，还原当前及后台会话正在执行的思考、流式正文与工具卡片
+        const snapshots = (init as any).active_turn_snapshots || {};
+        const curSnap = (init as any).active_turn_snapshot || snapshots[this.currentSessionName];
+        if (curSnap) {
+          this._restoreActiveTurnSnapshot(curSnap, this.currentSessionName);
+        }
+        for (const [sName, snap] of Object.entries(snapshots)) {
+          if (sName !== this.currentSessionName) {
+            this._restoreActiveTurnSnapshot(snap, sName);
+          }
+        }
+        this._captureCurrentRuntime();
         for (const g of this.sessionGroups) {
           const hit = (g.sessions || []).find((s: any) => s.name === this.currentSessionName);
           if (hit) {
@@ -2015,14 +2120,21 @@ export const useAppStore = defineStore('app', {
         if (!runtime.running && runtime.messages.length === 0) {
           runtime.messages = pairHistoryToolMessages(res.messages || []);
           this._bindSessionRuntime(sessionName);
+        } else if (!runtime.running && res.messages && res.messages.length > 0) {
+          // 同步最新的 error_note 与 execution_state（如后台会话已落库或附带了错误标注）
+          const lastRes = res.messages[res.messages.length - 1];
+          const lastLocal = runtime.messages[runtime.messages.length - 1];
+          if (lastRes && lastRes.error_note && lastLocal && lastLocal.role === 'assistant') {
+            lastLocal.error_note = lastRes.error_note;
+            lastLocal.execution_state = 'error';
+          }
         }
 
-        // 多会话并行：切到正在运行回合的会话时，历史最后一条往往不是
-        // assistant（本轮 assistant 消息尚未落库，历史停留在 user 或
-        // 上一轮 completed）。此时该回合后续的 tool_start/tool_finish/
-        // diff_ready 需要挂在活动助手消息上，缺失会触发桥接契约错误，
-        // 因此按 running 状态补一条占位消息，让后续回合级事件有处可挂。
-        if (this.runningSessions.includes(sessionName)) {
+        // 目标会话运行态恢复：优先用后端下发的实时流式快照完整还原（正文/思考/工具卡片），
+        // 若后端无快照但处于 runningSessions，则回退构造空 running 占位防止事件挂载报错。
+        if (res.active_turn_snapshot) {
+          this._restoreActiveTurnSnapshot(res.active_turn_snapshot, sessionName);
+        } else if (this.runningSessions.includes(sessionName)) {
           const last = this.messages[this.messages.length - 1];
           const needsPlaceholder = !last ||
             last.role !== 'assistant' ||
@@ -2801,15 +2913,37 @@ export const useAppStore = defineStore('app', {
         // 后端约 60ms 批量推送，data.text 可能包含多字符/多行，直接拼接即可
         this.currentThinkingText += data.text || '';
         this.streamingSpeed = speedTracker.addChunk(data.text || '');
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
+        let last = this.messages[this.messages.length - 1];
+        if (!last || last.role !== 'assistant') {
+          const placeholder: ChatMessage = {
+            role: 'assistant',
+            content: this.currentStreamingText,
+            reasoning_content: this.currentThinkingText,
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          };
+          this.messages.push(placeholder);
+          last = placeholder;
+        } else {
           last.reasoning_content = this.currentThinkingText;
         }
       } else if (type === 'token_delta') {
         this.currentStreamingText += data.text || '';
         this.streamingSpeed = speedTracker.addChunk(data.text || '');
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
+        let last = this.messages[this.messages.length - 1];
+        if (!last || last.role !== 'assistant') {
+          const placeholder: ChatMessage = {
+            role: 'assistant',
+            content: this.currentStreamingText,
+            reasoning_content: this.currentThinkingText,
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'running',
+          };
+          this.messages.push(placeholder);
+          last = placeholder;
+        } else {
           last.content = this.currentStreamingText;
         }
       } else if (type === 'message_final') {
@@ -3077,6 +3211,12 @@ export const useAppStore = defineStore('app', {
           const sessionName = data.session_name ? String(data.session_name) : undefined;
           this.notifyChatLocal(String(data.message), kind, sessionName);
         }
+      } else if (type === 'active_session_changed') {
+        // 多端会话同步：电脑端切换了活动会话，手机端若处于非该会话，点亮提醒点以提示用户
+        const remoteSession = String(data.session_name || '');
+        if (remoteSession && remoteSession !== this.currentSessionName) {
+          this._setSessionStatusDot(remoteSession, 'yellow');
+        }
       } else if (type === 'session_renamed') {
         if (this.currentSessionName === data.old) {
           this.currentSessionName = data.new;
@@ -3137,13 +3277,32 @@ export const useAppStore = defineStore('app', {
         this.refreshTokenUsage();
         this.refreshSessions();
       } else if (type === 'turn_error') {
-        // 终态错误（toast 由随后的 error 事件负责展示）
+        const errorMsg = String(data.message || data.error || '');
         this.running = false;
         this.streamingSpeed = 0;
         speedTracker.reset();
-        const last = this.messages[this.messages.length - 1];
-        if (last && last.role === 'assistant') {
+        let last = this.messages[this.messages.length - 1];
+        if (!last || last.role !== 'assistant') {
+          // 末尾不是 assistant 时（如中途接入、缺少占位或提问后立即报错），
+          // 补齐带 execution_state='error' 与 error_note 的助手卡片，确保各端必能看到报错
+          const placeholder: ChatMessage = {
+            role: 'assistant',
+            content: this.currentStreamingText,
+            reasoning_content: this.currentThinkingText,
+            tool_calls: [],
+            legacy_diffs: [],
+            execution_state: 'error',
+            error_note: errorMsg,
+          };
+          this.messages.push(placeholder);
+          last = placeholder;
+        } else {
           last.execution_state = reduceExecutionState(last.execution_state, 'turn_error');
+          if (errorMsg) {
+            if (!last.error_note || !last.error_note.split('\n').includes(errorMsg)) {
+              last.error_note = last.error_note ? last.error_note + '\n' + errorMsg : errorMsg;
+            }
+          }
         }
         this.currentStreamingText = '';
         this.currentThinkingText = '';
@@ -3283,14 +3442,13 @@ export const useAppStore = defineStore('app', {
         this.notifyModal('更新下载失败', `下载安装包时出错：${data.message || '未知错误'}`);
       } else if (type === 'error') {
         const msgText = String(data.message || '运行错误');
-        // 回合进行中：错误挂在当前助手消息上展示，避免插队成独立 error 消息
-        // 破坏"最后一条是 assistant"的事件契约（否则后续 tool_finish 会抛错、
-        // "正在干活"指示器卡死）。回合结束/空闲时的错误仍写入对话流。
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
-          // Low 修复：多条错误累计展示，不再被最后一条覆盖
-          last.error_note = last.error_note ? last.error_note + '\n' + msgText : msgText;
-          this.notifyChatLocal(msgText);
+          // 避免与 turn_error 重复追加完全相同的错误文本
+          if (!last.error_note || !last.error_note.split('\n').includes(msgText)) {
+            last.error_note = last.error_note ? last.error_note + '\n' + msgText : msgText;
+          }
+          this.notifyChatLocal(msgText, 'notice', eventSession);
         } else {
           this.messages.push({ role: 'error', content: msgText });
         }
