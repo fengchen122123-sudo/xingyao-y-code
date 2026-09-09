@@ -57,7 +57,7 @@
           v-model="inputVal"
           rows="2"
           :style="textareaHeight != null ? { height: textareaHeight + 'px' } : undefined"
-          placeholder="向星瑶提问… / 调用技能与 MCP，@ 引用文件"
+          :placeholder="`向${store.agentName}提问… / 调用技能与 MCP，@ 引用文件`"
           @keydown="onKeydown"
           @input="detectToken"
           @click="detectToken"

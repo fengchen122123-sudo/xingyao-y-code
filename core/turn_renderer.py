@@ -307,7 +307,12 @@ class TurnRenderer:
         if not message or message in self._errors:
             return
         self._errors.add(message)
-        self._append_line(f"{ANSI_YELLOW}  ! 星瑶暂未完成当前步骤{ANSI_RESET}")
+        try:
+            from core.persona_settings import get_agent_display_name
+            _agent = get_agent_display_name()
+        except Exception:
+            _agent = "星瑶"
+        self._append_line(f"{ANSI_YELLOW}  ! {_agent}暂未完成当前步骤{ANSI_RESET}")
 
     def finish(self) -> str:
         if not self._finished:

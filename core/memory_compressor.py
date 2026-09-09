@@ -477,7 +477,11 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 elif role == "tool":
                     role_display = "工具结果"
                 else:
-                    role_display = "星瑶"
+                    try:
+                        from core.persona_settings import get_agent_display_name
+                        role_display = get_agent_display_name()
+                    except Exception:
+                        role_display = "星瑶"
                 # 过滤内容里的思考标签以缩减 Token 负担
                 clean_content = re.sub(r"<(?:think|thinking)>.*?</(?:think|thinking)>", "", msg["content"], flags=re.DOTALL | re.IGNORECASE).strip()
                 # 工具结果（role=tool）超长时预截断

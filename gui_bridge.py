@@ -2161,6 +2161,7 @@ class ApiBridge:
                 # 沙盒开关（是否允许访问工作目录外文件）：与 CLI /sandbox 共享同一配置键
                 "allow_outside_workspace": bool(config_data.get("allow_outside_workspace", False)),
                 "system_settings": self.get_system_settings(),
+                "persona_settings": self.get_persona_settings(),
                 "sessions": self.get_sessions(),
                 "skills": self._build_skill_list(),
                 "mcps": self._build_mcp_list(),

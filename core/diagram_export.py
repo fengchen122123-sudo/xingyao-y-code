@@ -165,7 +165,12 @@ def handle_diagram_command(command_text: str) -> str:
     if sub == "open":
         files = get_recent_diagrams()
         if not files:
-            return "🚨 还没有生成过流程图。星瑶输出 Mermaid 代码块后会自动生成网页文件。"
+            try:
+                from core.persona_settings import get_agent_display_name
+                _agent = get_agent_display_name()
+            except Exception:
+                _agent = "星瑶"
+            return f"🚨 还没有生成过流程图。{_agent}输出 Mermaid 代码块后会自动生成网页文件。"
         index = 1
         if len(parts) > 2:
             if not parts[2].isdigit() or int(parts[2]) < 1:

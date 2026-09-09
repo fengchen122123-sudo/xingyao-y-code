@@ -88,6 +88,16 @@ logging.getLogger("litellm").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
+def _agent_display_name() -> str:
+    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
+    try:
+        from core.persona_settings import get_agent_display_name
+
+        return get_agent_display_name()
+    except Exception:
+        return "星瑶"
+
+
 def _submit_daemon_call(function, *args, **kwargs):
     """Run a blocking call without adding a non-daemon interpreter-exit hook."""
     future = Future()
@@ -624,7 +634,7 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
     if function_name == "write_file":
         file_path = arguments.get("file_path", "未知文件")
         content = arguments.get("content", "")
-        print(f"[写入文件] 星瑶申请写入文件: {file_path}")
+        print(f"[写入文件] {_agent_display_name()}申请写入文件: {file_path}")
         lines = content.splitlines()
         if lines:
             preview = "\n".join(lines[:5])
@@ -635,7 +645,7 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
         file_path = arguments.get("file_path", "未知文件")
         target = arguments.get("target_content", "")
         repl = arguments.get("replacement_content", "")
-        print(f"[修改文件] 星瑶申请修改文件: {file_path}")
+        print(f"[修改文件] {_agent_display_name()}申请修改文件: {file_path}")
         print(f"   [-] 计划删除: {target.strip()[:100]}")
         print(f"   [+] 计划替换: {repl.strip()[:100]}")
     elif function_name == "execute_command":
@@ -643,7 +653,7 @@ def ask_in_raw_terminal(function_name, arguments, *, options=()):
         shell_id = str(arguments.get("shell_id") or "").strip()
         bg = arguments.get("run_in_background", False)
         bg_str = " (后台运行)" if bg else ""
-        print(f"[执行命令] 星瑶申请执行命令{bg_str}: {cmd}")
+        print(f"[执行命令] {_agent_display_name()}申请执行命令{bg_str}: {cmd}")
         if shell_id:
             print(f"   [解释器显式覆盖]: {shell_id}")
     
@@ -6563,7 +6573,7 @@ def _chat_with_model_generator(
         else:
             from prompt_toolkit.formatted_text import HTML
 
-            safe_print(HTML("<ansiyellow>星瑶暂未完成当前步骤</ansiyellow>"))
+            safe_print(HTML(f"<ansiyellow>{_agent_display_name()}暂未完成当前步骤</ansiyellow>"))
         return
     finally:
         # 电脑操控 run 收尾（Task 10，设计 14.2）：任何 Turn 终态二选一调用
