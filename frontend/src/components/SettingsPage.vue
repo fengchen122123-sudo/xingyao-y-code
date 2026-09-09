@@ -262,7 +262,7 @@
       </section>
       </template>
       <template v-else-if="activeSection === 'permissions'">
-        <header class="settings-header">
+        <header class="settings-header settings-header--narrow">
           <div>
             <h1>权限与沙盒</h1>
             <p>与 CLI 的 /sandbox、/whitelist 共享同一份配置与存储。</p>
@@ -385,7 +385,7 @@
             <div class="contact-qr-wrap" @click="enlargedQr = { src: qrcodeWechat, alt: '微信群二维码' }">
               <img :src="qrcodeWechat" alt="微信群二维码" class="contact-qr" data-test="contact-wechat-qr" />
             </div>
-            <p class="contact-expiry">该二维码 7 天内（9月8日前）有效，过期后请重新获取</p>
+            <p class="contact-expiry">该二维码 7 天内（9月16日前）有效，过期后请重新获取</p>
           </section>
 
           <section class="contact-card">
@@ -402,7 +402,7 @@
         </div>
       </template>
       <template v-else-if="activeSection === 'about'">
-        <header class="settings-header">
+        <header class="settings-header settings-header--narrow">
           <div>
             <h1>关于</h1>
             <p>Y-CODE · {{ store.agentName }} —— 你的 AI 编程搭档。</p>
@@ -1024,6 +1024,8 @@ onMounted(async () => {
 .avatar { width: 30px; height: 30px; display: grid; place-items: center; border-radius: 50%; background: var(--bg3); color: var(--text); }
 .settings-main { flex: 1; min-width: 0; overflow: auto; padding: 46px 5vw; }
 .settings-header { max-width: 1120px; margin: 0 auto 26px; display: flex; align-items: flex-end; justify-content: space-between; }
+/* 权限与沙盒 / 关于：正文卡片宽度 860px，标题栏收窄到同宽，保证左边缘对齐且整体居中 */
+.settings-header--narrow { max-width: 860px; }
 .settings-header h1 { margin: 0 0 10px; font-size: 32px; letter-spacing: -1px; }
 .settings-header p, .detail-title-row p { margin: 0; color: var(--text-faint); font-size: 13px; }
 .icon-button { background: transparent; color: var(--text-dim); border: 0; font-size: 20px; }
@@ -1159,7 +1161,7 @@ onMounted(async () => {
 .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
 
 /* ── 权限与沙盒分区 ── */
-.perm-settings-card { max-width: 860px; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
+.perm-settings-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
 
 /* ── 外观与主题分区 ── */
 .appearance-section { width: 100%; min-width: 0; }

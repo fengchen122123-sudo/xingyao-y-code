@@ -352,7 +352,7 @@ async function selectComputerBrowser(browser: string) {
 </script>
 
 <style scoped>
-.system-settings { max-width: 920px; }
+.system-settings { max-width: 920px; margin: 0 auto; }
 .system-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 22px; }
 .system-header h1 { margin: 0 0 7px; font-size: 25px; }
 .system-header p { margin: 0; color: var(--text-faint); font-size: 13px; }

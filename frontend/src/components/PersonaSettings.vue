@@ -186,7 +186,7 @@ onMounted(loadPersona);
 </script>
 
 <style scoped>
-.persona-settings { max-width: 920px; }
+.persona-settings { max-width: 920px; margin: 0 auto; }
 .persona-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; margin-bottom: 22px; }
 .persona-header h1 { margin: 0 0 7px; font-size: 25px; }
 .persona-header p { margin: 0; color: var(--text-faint); font-size: 13px; }
