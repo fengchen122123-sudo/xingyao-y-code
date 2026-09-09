@@ -3078,6 +3078,29 @@ class ApiBridge:
             }
 
     # ------------------------------------------------------------------
+    # 人设设置
+    # ------------------------------------------------------------------
+    def get_persona_settings(self) -> Dict[str, Any]:
+        """返回智能体人设设置快照（名称 + 人设文本）。"""
+        from core.persona_settings import get_persona_settings
+
+        return {"ok": True, **get_persona_settings()}
+
+    def set_persona_settings(self, agent_name: str, persona: str = "", user_title: str = "") -> Dict[str, Any]:
+        """保存智能体人设设置；校验失败拒绝写盘并返回原因。"""
+        from core.persona_settings import PersonaSettingsError, save_persona_settings
+
+        try:
+            snapshot = save_persona_settings(agent_name, persona or "", user_title or "")
+            return {"ok": True, **snapshot, "msg": "人设设置已保存"}
+        except PersonaSettingsError as error:
+            return {"ok": False, "msg": str(error)}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("set_persona_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+
+    # ------------------------------------------------------------------
     # 电脑操控系统设置（设计 8.1/8.4：严格 setter；开启前组合 preflight，
     # 失败不落盘；关闭先落盘 false + 递增 generation，再通知 controller 停止）
     # ------------------------------------------------------------------
