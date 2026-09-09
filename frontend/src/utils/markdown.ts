@@ -17,6 +17,22 @@ function escapeHtml(text: string): string {
     .replace(/'/g, '&#39;');
 }
 
+// 代码块模式：renderMarkdown 提取与 findCodeBlockRanges 共用同一 pattern，
+// 保证切分器与渲染器对「代码块范围」的判定完全一致。
+const CODE_BLOCK_PATTERN = '```(\\w*)\\n([\\s\\S]*?)```';
+
+/** 返回所有已闭合代码块的 [start, end) 字符范围。 */
+export function findCodeBlockRanges(source: string): Array<[number, number]> {
+  if (!source) return [];
+  const ranges: Array<[number, number]> = [];
+  const re = new RegExp(CODE_BLOCK_PATTERN, 'g');
+  let match: RegExpExecArray | null;
+  while ((match = re.exec(source)) !== null) {
+    ranges.push([match.index, match.index + match[0].length]);
+  }
+  return ranges;
+}
+
 // 仅允许 http / https / mailto 协议的链接，其余一律拦截为 #，防止 javascript: 等注入
 export function sanitizeHref(href: string): string {
   if (!href) return '#';
@@ -103,7 +119,15 @@ export function mermaidCacheKey(code: string): string {
 }
 
 export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
-  if (!md) return '';
+  return renderMarkdownDetailed(md, mediaCtx).html;
+}
+
+export function renderMarkdownDetailed(
+  md: string,
+  mediaCtx?: MediaContext,
+  startMediaOrdinal = 0,
+): { html: string; mediaCount: number } {
+  if (!md) return { html: '', mediaCount: 0 };
   let text = md;
 
   // 占位符用 Unicode 私有区字符包裹：早期版本用 ___CODE_BLOCK_0___ 这种
@@ -115,7 +139,7 @@ export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
   const codeBlocks: string[] = [];
   const fileLinks: string[] = [];
   const links: string[] = [];
-  text = text.replace(/```(\w*)\n([\s\S]*?)```/g, (_, lang, code) => {
+  text = text.replace(new RegExp(CODE_BLOCK_PATTERN, 'g'), (_, lang, code) => {
     const idx = codeBlocks.length;
     // mermaid 块：renderMarkdown 保持纯同步——这里只产出带缓存 key 的占位
     // 容器 + 隐藏源码（均已转义），SVG 渲染由 mermaidRenderer 在 DOM 挂载后
@@ -157,7 +181,7 @@ export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
   // ordinal 与 mediaCtx.items 对齐；无清单（旧消息/迁移前）或 ordinal 越界时退回
   // 文件链接渲染。远程 URL 不是媒体项，原样返回走普通链接管线。
   const mediaItems: string[] = [];
-  let mediaOrdinal = 0;
+  let mediaOrdinal = startMediaOrdinal;
   text = text.replace(MEDIA_SYNTAX_RE, (_m, imgCaption, imgPath, vidCaption, vidPath) => {
     const caption = String(imgCaption ?? vidCaption ?? '').trim();
     const path = String(imgPath ?? vidPath ?? '').trim();
@@ -318,7 +342,7 @@ export function renderMarkdown(md: string, mediaCtx?: MediaContext): string {
     html = html.replace(`${PH}MD${idx}${PH}`, () => mi);
   });
 
-  return html;
+  return { html, mediaCount: mediaOrdinal - startMediaOrdinal };
 }
 
 // 权限模式：规范值(canonical) -> 中文展示文案。store 内一律保存规范值，
