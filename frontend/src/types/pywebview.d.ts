@@ -416,6 +416,9 @@ export interface InitialState {
   version: string;
   // 仍有活跃回合的会话名（窗口重载时恢复运行态）
   active_sessions?: string[];
+  // 进行中回合快照（供中途扫码或切换会话时还原正在运行的消息）
+  active_turn_snapshots?: Record<string, ActiveTurnSnapshot>;
+  active_turn_snapshot?: ActiveTurnSnapshot | null;
   // 各会话排队中的消息（窗口重载时恢复排队条目）
   message_queues?: Record<string, QueuedMessage[]>;
   theme_light?: boolean;
@@ -424,6 +427,29 @@ export interface InitialState {
   gui_theme_error: import('../themes/types').GuiThemeError | null;
   gui_theme_list_error: import('../themes/types').GuiThemeError | null;
   native_titlebar_color_capability: NativeTitlebarColorCapability;
+}
+
+export interface ActiveTurnSnapshot {
+  session_name: string;
+  user_text: string;
+  display_text: string;
+  started_at_ms: number;
+  thinking_text: string;
+  streaming_text: string;
+  tool_calls: Array<{
+    id: string;
+    name: string;
+    label: string;
+    display?: ToolDisplayPayload;
+    started_at_ms?: number;
+    ok?: boolean;
+    summary?: string;
+    result?: string;
+    error?: string;
+    duration_ms?: number;
+    diff?: LegacyDiff;
+  }>;
+  internal_kind?: string;
 }
 
 // 工具事件 display dict：后端原样透传，字段可缺省
