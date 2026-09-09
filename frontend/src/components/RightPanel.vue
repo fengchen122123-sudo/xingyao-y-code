@@ -23,7 +23,7 @@
         <div class="progress-bar"><i :style="{ width: store.planData.progress + '%' }"></i></div>
 
         <div v-if="!store.planData.items || store.planData.items.length === 0" style="color:var(--text-faint);font-size:12px;padding:12px 0">
-          暂无活动计划。当星瑶编排复杂大任务时，计划全景会自动在此呈现。
+          暂无活动计划。当{{ store.agentName }}编排复杂大任务时，计划全景会自动在此呈现。
         </div>
 
         <div v-else class="plan-list">

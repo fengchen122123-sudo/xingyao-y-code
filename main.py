@@ -4,6 +4,16 @@ import sys
 import io
 
 
+def _agent_name() -> str:
+    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
+    try:
+        from core.persona_settings import get_agent_display_name
+
+        return get_agent_display_name()
+    except Exception:
+        return "星瑶"
+
+
 def _dispatch_browser_worker_argv() -> bool:
     from core.computer.browser_backend import WORKER_ARGV_FLAG
 
@@ -66,7 +76,7 @@ if (
     and sys.stdout.isatty()
     and not _is_headless_invocation()
 ):
-    print("  星瑶正在启动，请稍候...", flush=True)
+    print(f"  {_agent_name()}正在启动，请稍候...", flush=True)
 
 from core.runtime_warnings import configure_runtime_warnings
 configure_runtime_warnings()
@@ -652,11 +662,11 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
             cmd_display = cmd
         if len(cmd_display) > 250:
             cmd_display = cmd_display[:247] + "..."
-        text += f"💻  星瑶申请执行命令: {_esc(cmd_display)}\n"
+        text += f"💻  {_agent_name()}申请执行命令: {_esc(cmd_display)}\n"
     elif func == "write_file":
-        text += f"✍️  星瑶申请写入文件: {_esc(args.get('file_path', ''))}\n"
+        text += f"✍️  {_agent_name()}申请写入文件: {_esc(args.get('file_path', ''))}\n"
     elif func == "edit_file":
-        text += f"📝  星瑶申请修改文件: {_esc(args.get('file_path', ''))}\n"
+        text += f"📝  {_agent_name()}申请修改文件: {_esc(args.get('file_path', ''))}\n"
     elif func == "ask_user":
         q = str(args.get("question", ""))
         q_lines = q.splitlines()
@@ -666,16 +676,16 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
             q_display = q
         if len(q_display) > 200:
             q_display = q_display[:197] + "..."
-        text += f"❓  星瑶需要你的选择: {_esc(q_display)}\n"
+        text += f"❓  {_agent_name()}需要你的选择: {_esc(q_display)}\n"
     elif func == "sandbox_outside_access":
-        text += f"🛡  星瑶申请访问工作目录之外的路径: {_esc(args.get('path', ''))}\n"
+        text += f"🛡  {_agent_name()}申请访问工作目录之外的路径: {_esc(args.get('path', ''))}\n"
         text += "    （沙盒模式下默认仅限工作目录内；可选择在本任务内放行，或用 /sandbox on 长期开放）\n"
     else:
         # 默认分支：其余工具（含 MCP 工具）展示函数名与参数摘要，不再显示空白
         summary = ", ".join(
             f"{key}={str(value)[:80]}" for key, value in list(args.items())[:3]
         )
-        text += f"🔧  星瑶申请调用工具: {_esc(func)}({_esc(summary)})\n"
+        text += f"🔧  {_agent_name()}申请调用工具: {_esc(func)}({_esc(summary)})\n"
 
     if func == "ask_user":
         text += "👉 请选择确认操作（↑/↓ 选择后 Enter；或直接输入内容后 Enter 自定义回答）:\n"
@@ -858,10 +868,10 @@ COMMAND_COMPLETIONS = [
     ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
-    ("/undo", "撤销星瑶上一次修改的代码"),
+    ("/undo", "撤销上一次修改的代码"),
     ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
     ("/share", "导出会话为 Markdown/HTML/JSON"),
-    ("/diagram", "打开/列出星瑶生成的 Mermaid 流程图网页 (open 序号/list)"),
+    ("/diagram", "打开/列出 Mermaid 流程图网页 (open 序号/list)"),
     ("/compress", "手动触发会话记忆压缩 (force 强制保留更少条)"),
     ("/remember", "手动追加一条规则/偏好/事实到记忆日志"),
     ("/dream", "后台触发梦境总结，提炼归纳记忆日志"),
@@ -1002,33 +1012,37 @@ def _format_live_plan_items(items):
     return "\n".join(lines)
 
 
-# 工具名 → 状态行具体活动文案（与 tool_presenter._TOOL_COPY 的动作名保持一致）
+# 工具名 → 状态行具体活动文案（{agent} 占位符在 _turn_activity_label 渲染时填充；
+# 与 tool_presenter._TOOL_COPY 的动作名保持一致）
 _TOOL_ACTIVITY_LABELS = {
-    "read_file": "星瑶正在查看文件...",
-    "write_file": "星瑶正在写入文件...",
-    "edit_file": "星瑶正在修改文件...",
-    "execute_command": "星瑶正在执行命令...",
-    "list_directory": "星瑶正在查看目录...",
-    "glob_files": "星瑶正在查找文件...",
-    "search_code": "星瑶正在搜索代码...",
-    "search_news": "星瑶正在搜索资料...",
-    "fetch_url": "星瑶正在访问网址...",
-    "get_weather": "星瑶正在查询天气...",
-    "run_subagent": "星瑶正在调度子代理...",
-    "manage_task": "星瑶正在管理后台任务...",
-    "ask_user": "星瑶等待你的回答...",
-    "plan_write": "星瑶正在更新任务计划...",
-    "plan_update": "星瑶正在更新计划项...",
+    "read_file": "{agent}正在查看文件...",
+    "write_file": "{agent}正在写入文件...",
+    "edit_file": "{agent}正在修改文件...",
+    "execute_command": "{agent}正在执行命令...",
+    "list_directory": "{agent}正在查看目录...",
+    "glob_files": "{agent}正在查找文件...",
+    "search_code": "{agent}正在搜索代码...",
+    "search_news": "{agent}正在搜索资料...",
+    "fetch_url": "{agent}正在访问网址...",
+    "get_weather": "{agent}正在查询天气...",
+    "run_subagent": "{agent}正在调度子代理...",
+    "manage_task": "{agent}正在管理后台任务...",
+    "ask_user": "{agent}等待你的回答...",
+    "plan_write": "{agent}正在更新任务计划...",
+    "plan_update": "{agent}正在更新计划项...",
 }
 
 
 def _turn_activity_label(status, current_tool=""):
+    agent = _agent_name()
     if status == "executing" and current_tool:
-        return _TOOL_ACTIVITY_LABELS.get(current_tool, "星瑶正在干活...")
+        label = _TOOL_ACTIVITY_LABELS.get(current_tool)
+        # 兼容历史：万一外部塞入未带占位符的旧文案，format 缺占位符时原样返回
+        return label.format(agent=agent) if label else f"{agent}正在干活..."
     labels = {
-        "thinking": "星瑶正在思考...",
-        "executing": "星瑶正在干活...",
-        "waiting": "星瑶等待你的确认...",
+        "thinking": f"{agent}正在思考...",
+        "executing": f"{agent}正在干活...",
+        "waiting": f"{agent}等待你的确认...",
     }
     return labels.get(status, "")
 
@@ -1098,7 +1112,7 @@ def _render_public_answer_block(turn_id: str, text: str) -> None:
     # 第一个事件（可能只是一次工具调用）到来时就打印。同一回合只打印一次。
     if not _answer_header_printed.get(turn_id):
         _answer_header_printed[turn_id] = True
-        print_formatted_text(HTML("\n<b><magenta>🤖 星瑶 &gt;</magenta></b> "))
+        print_formatted_text(HTML(f"\n<b><magenta>🤖 {_agent_name()} &gt;</magenta></b> "))
     try:
         from core.terminal_markdown import MarkdownRenderError, render_markdown_to_ansi
         rendered = render_markdown_to_ansi(block, _terminal_width())
@@ -1648,7 +1662,7 @@ def print_logo(clear_screen=True):
         return make_box_line(f"{label}<ansigray>{escaped_val}</ansigray>")
 
     avatar_row1 = f"  <style fg='{theme_color}'>▄▄    ▄▄</style>    <b>Welcome to Y-CODE CLI!</b>"
-    avatar_row2 = f" <style fg='{theme_color}'>██████████</style>   星瑶 (Hacker Girl) 为您服务"
+    avatar_row2 = f" <style fg='{theme_color}'>██████████</style>   {_agent_name()} (Hacker Girl) 为您服务"
     avatar_row3 = f" <style fg='{theme_color}'>██ █  █ ██</style>   输入 /help 获取帮助"
     avatar_row4 = f"  <style fg='{theme_color}'>▀██████▀</style>    "
     
@@ -1665,7 +1679,7 @@ def print_logo(clear_screen=True):
         + make_data_line("   Theme     : ", current_theme)
         + make_data_line("   Version   : ", f"v{YCODE_VERSION}")
         + make_box_line("")
-        + make_box_line("   提示: 星瑶是您的编程伙伴，使用 <ansigreen>@文件</ansigreen> 可附带上下文。")
+        + make_box_line(f"   提示: {_agent_name()}是您的编程伙伴，使用 <ansigreen>@文件</ansigreen> 可附带上下文。")
         + f"<style fg='{theme_color}'>└────────────────────────────────────────────────────────┘</style>\n"
     )
     
@@ -1725,10 +1739,10 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
         print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
         print_formatted_text(HTML("  <ansicyan>/new</ansicyan>                                    : 创建并切换到全新会话（历史会话保留，/session 可切回）"))
-        print_formatted_text(HTML("  <ansicyan>/undo [y]</ansicyan>                               : 撤销星瑶上一次修改的代码，并同步抹除模型记忆 (撤销新建文件时需追加 y 确认删除)"))
+        print_formatted_text(HTML(f"  <ansicyan>/undo [y]</ansicyan>                               : 撤销{_agent_name()}上一次修改的代码，并同步抹除模型记忆 (撤销新建文件时需追加 y 确认删除)"))
         print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
         print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
-        print_formatted_text(HTML("  <ansicyan>/diagram [open 序号|list]</ansicyan>               : 打开/列出已生成的 Mermaid 流程图网页（星瑶输出 mermaid 代码块时自动生成）"))
+        print_formatted_text(HTML(f"  <ansicyan>/diagram [open 序号|list]</ansicyan>               : 打开/列出已生成的 Mermaid 流程图网页（{_agent_name()}输出 mermaid 代码块时自动生成）"))
         print_formatted_text(HTML("  <ansicyan>/worktree</ansicyan>                              : Git worktree 管理 (list/create/remove/prune)"))
         print_formatted_text(HTML("  <ansicyan>/clear</ansicyan>                                  : 清理终端当前屏幕"))
         print_formatted_text(HTML(""))
@@ -1749,7 +1763,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/skills list</ansicyan>                         : 在终端列出所有扫描到的技能，展示启用状态与短 ID"))
         print_formatted_text(HTML("  <ansicyan>/skills enable &lt;短ID&gt;</ansicyan>             : 启用指定短 ID 对应的技能"))
         print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan>            : 禁用指定短 ID 对应的技能"))
-        print_formatted_text(HTML("  <ansicyan>/&lt;短ID&gt; [提问内容]</ansicyan>                   : <b>主动且强制调用指定技能</b>让星瑶为您执行任务"))
+        print_formatted_text(HTML(f"  <ansicyan>/&lt;短ID&gt; [提问内容]</ansicyan>                   : <b>主动且强制调用指定技能</b>让{_agent_name()}为您执行任务"))
         print_formatted_text(HTML("  <ansicyan>/plugins</ansicyan>                             : 查看已安装的进程内插件 (名称/版本/来源/加载状态/提供的工具)"))
         print_formatted_text(HTML("  <ansicyan>/plugins enable|disable &lt;name&gt;</ansicyan>        : 启用/禁用指定插件 (写回 plugin.json，重启后生效)"))
         print_formatted_text(HTML("  <ansicyan>/plugins reload</ansicyan>                       : 重新扫描插件目录刷新清单 (不重启)"))
@@ -1771,9 +1785,9 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【6. 终端常用快捷操作】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>@文件名</ansicyan>                               : <b>在提问中挂载本地文件</b> (例如: <ansigray>这行代码怎么改 @main.py</ansigray>)"))
-        print_formatted_text(HTML("  <ansicyan>Enter</ansicyan>                                 : 提交当前文本给星瑶（闲置立即执行，繁忙则自动排队等待）"))
+        print_formatted_text(HTML(f"  <ansicyan>Enter</ansicyan>                                 : 提交当前文本给{_agent_name()}（闲置立即执行，繁忙则自动排队等待）"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+N</ansicyan>                                    : 在输入框内输入新的一行换行符"))
-        print_formatted_text(HTML("  <ansicyan>Ctrl+C</ansicyan>                                : <b>星瑶思考中时立即发送强行中断信号</b>；闲置时清空输入框"))
+        print_formatted_text(HTML(f"  <ansicyan>Ctrl+C</ansicyan>                                : <b>{_agent_name()}思考中时立即发送强行中断信号</b>；闲置时清空输入框"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+T</ansicyan>                                : <b>切换展开/收起底部浮窗显示当前会话的背景记忆摘要</b>"))
         print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 Y-CODE 权限模式</b> (变更前确认 ➡️ 自动编辑 ➡️ 计划模式 ➡️ 完全访问)"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+D / /exit</ansicyan>                        : 安全退出 Y-code CLI"))
@@ -2320,7 +2334,7 @@ def handle_slash_command(command_text):
         forced = len(confirm) >= 2 and confirm[1].lower() in ("y", "yes", "--force")
         if will_delete and not forced:
             print_formatted_text(
-                HTML(f"<ansiyellow>⚠️ 该操作将删除星瑶新建的文件 {_esc(file_path)}，"
+                HTML(f"<ansiyellow>⚠️ 该操作将删除{_agent_name()}新建的文件 {_esc(file_path)}，"
                      f"请在命令后追加 y/yes/--force 确认，例如：/undo y</ansiyellow>")
             )
             return
@@ -2329,7 +2343,7 @@ def handle_slash_command(command_text):
         if ok:
             print_formatted_text(HTML(f"<ansigreen>↩️ {_esc(message)}</ansigreen>"))
             recalc_token_usage()  # 撤销后重新计算 token
-            print_formatted_text(HTML("<ansigreen>🧠 已同步抹除星瑶对刚才操作的记忆，防止幻觉复发。</ansigreen>"))
+            print_formatted_text(HTML(f"<ansigreen>🧠 已同步抹除{_agent_name()}对刚才操作的记忆，防止幻觉复发。</ansigreen>"))
         else:
             print_formatted_text(HTML(f"<ansired>⚠️ {_esc(message)}</ansired>"))
 
@@ -2783,7 +2797,7 @@ def handle_slash_command(command_text):
         print_logo()
 
     elif cmd == "/dream":
-        print_formatted_text(HTML("<ansiyellow>✨ 星瑶正在闭上眼睛，在后台慢慢提炼归纳咱们的长期记忆... 梦境整理中... 🛌</ansiyellow>"))
+        print_formatted_text(HTML(f"<ansiyellow>✨ {_agent_name()}正在闭上眼睛，在后台慢慢提炼归纳咱们的长期记忆... 梦境整理中... 🛌</ansiyellow>"))
         def run_dream_bg():
             try:
                 from core.tools import dream_consolidation
@@ -2859,7 +2873,7 @@ def handle_slash_command(command_text):
 
     elif cmd == "/exit":
         # 使用 print_formatted_text 避免 rich 在 prompt_toolkit patch_stdout 下出现 ANSI 乱码
-        print_formatted_text(HTML("<ansigreen>👋 星瑶去休息啦，下次见！</ansigreen>"))
+        print_formatted_text(HTML(f"<ansigreen>👋 {_agent_name()}去休息啦，下次见！</ansigreen>"))
         if app_instance:
             app_instance.exit()
     else:
@@ -3088,10 +3102,10 @@ def _make_input_app():
                 pass
             if drained:
                 print_formatted_text(HTML(
-                    f"\n<ansired>🛑 收到中断信号，正在终止星瑶的执行...（已丢弃 {drained} 条排队消息）</ansired>"
+                    f"\n<ansired>🛑 收到中断信号，正在终止{_agent_name()}的执行...（已丢弃 {drained} 条排队消息）</ansired>"
                 ))
             else:
-                print_formatted_text(HTML("\n<ansired>🛑 收到中断信号，正在终止星瑶的执行...</ansired>"))
+                print_formatted_text(HTML(f"\n<ansired>🛑 收到中断信号，正在终止{_agent_name()}的执行...</ansired>"))
             if confirm_prompt is not None and not confirm_prompt.get("request_id"):
                 # future 型确认框（非 broker）：显式以最后一个选项表达“取消/停止”，
                 # 不再硬编码索引 1
@@ -3280,7 +3294,7 @@ def _make_input_app():
             # 首轮对话赶在后台预热完成前发出时，litellm/tiktoken 的首次
             # import 需要数秒——如实显示“启动模型引擎”，避免看似卡死。
             if not _llm_engine_ready and _active_tool_status is None:
-                return f"  {frame} 星瑶正在启动模型引擎 · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"
+                return f"  {frame} {_agent_name()}正在启动模型引擎 · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"
             return _format_activity_text(task_status, _active_tool_status, elapsed, frame)
         return ""
 
@@ -3399,7 +3413,7 @@ def _make_input_app():
                     always_hide_cursor=True,
                     style="class:status.thinking-content",
                 ),
-                title="星瑶正在思考",
+                title=f"{_agent_name()}正在思考",
                 style="class:status.thinking-frame",
             ),
             filter=is_live_thinking_cond,
@@ -4240,7 +4254,7 @@ def run_cli():
         while any(_t.is_alive() for _t in _preload_threads):
             if _tty:
                 _frame = _spin_frames[int((time.monotonic() - _preload_t0) * 10) % len(_spin_frames)]
-                print(f"\r  {_frame} 星瑶正在预热模型引擎 · {time.monotonic() - _preload_t0:.1f}s   ", end="", flush=True)
+                print(f"\r  {_frame} {_agent_name()}正在预热模型引擎 · {time.monotonic() - _preload_t0:.1f}s   ", end="", flush=True)
             for _t in _preload_threads:
                 _t.join(timeout=0.1)
     except KeyboardInterrupt:
@@ -4314,7 +4328,7 @@ def run_cli():
                     except queue.Empty:
                         pass
                     print_formatted_text(HTML(
-                        "\n<ansired>🛑 收到中断信号，已终止星瑶的执行。</ansired>\n"
+                        f"\n<ansired>🛑 收到中断信号，已终止{_agent_name()}的执行。</ansired>\n"
                     ))
                 else:
                     print_formatted_text(HTML(

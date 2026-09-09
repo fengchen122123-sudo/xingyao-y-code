@@ -56,6 +56,16 @@ def _raise_if_cancelled(cancel_event):
         raise _ToolCancelledError()
 
 
+def _agent_display_name() -> str:
+    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
+    try:
+        from core.persona_settings import get_agent_display_name
+
+        return get_agent_display_name()
+    except Exception:
+        return "星瑶"
+
+
 # 敏感信息脱敏：后台任务命令回显/日志前屏蔽内联凭据，
 # 避免 export TOKEN=sk-... 这类命令把密钥明文喂回模型或写入持久化记录。
 # 实现集中在 command_policy，供 task_manager 等持久化方复用
@@ -3690,7 +3700,7 @@ class SubagentManager:
             {
                 "role": "system",
                 "content": (
-                    f"你是星瑶子代理({task.task_id})，角色是 {role}。"
+                    f"你是{_agent_display_name()}子代理({task.task_id})，角色是 {role}。"
                     f"{instruction_text}"
                     "你只执行主 Agent 已分配的单一子任务，不得拆解、创建或修改主任务计划；"
                     "如实使用可用工具；结束时只输出供主 Agent 汇总的公开结论。"
@@ -3796,7 +3806,7 @@ class SubagentManager:
                 {
                     "role": "system",
                     "content": (
-                        f"你是星瑶子代理({task.task_id})，角色是 {role}。"
+                        f"你是{_agent_display_name()}子代理({task.task_id})，角色是 {role}。"
                         f"{instruction_text}"
                         "你只执行主 Agent 已分配的单一子任务；"
                         "结束时只输出供主 Agent 汇总的公开结论。"

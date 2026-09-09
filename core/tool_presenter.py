@@ -5,6 +5,16 @@ import re
 from typing import Any
 
 
+def _agent_display_name() -> str:
+    """设置页自定义的智能体显示名；读取失败回落默认"星瑶"。"""
+    try:
+        from core.persona_settings import get_agent_display_name
+
+        return get_agent_display_name()
+    except Exception:
+        return "星瑶"
+
+
 _TOOL_COPY = {
     "read_file": ("查看文件", "已查看文件", "file_path"),
     "write_file": ("写入文件", "已写入文件", "file_path"),
@@ -178,10 +188,11 @@ def build_tool_display(
 
 
 def summarize_tool_started(name: str, arguments: dict) -> str:
+    agent = _agent_display_name()
     if name == "read_file":
         skill_name = _skill_name_from_path(str(arguments.get("file_path", "")))
         if skill_name:
-            return f"星瑶正在使用skill：{skill_name}"
+            return f"{agent}正在使用skill：{skill_name}"
     action = _TOOL_COPY.get(name, (f"使用工具 {name}", "工具执行完成", ""))[0]
     target = tool_target(name, arguments)
     # 执行命令的预览需要截断，避免长命令（尤其 python -c / PowerShell）刷屏
@@ -189,7 +200,7 @@ def summarize_tool_started(name: str, arguments: dict) -> str:
         target = target.strip()
         if len(target) > 30:
             target = target[:27] + "..."
-    return f"星瑶正在{action}：{target}" if target else f"星瑶正在{action}"
+    return f"{agent}正在{action}：{target}" if target else f"{agent}正在{action}"
 
 
 def summarize_tool_finished(
@@ -241,12 +252,12 @@ def summarize_tool_finished(
     if name == "read_file":
         skill_name = _skill_name_from_path(str(arguments.get("file_path", "")))
         if skill_name:
-            return f"星瑶已使用skill：{skill_name}"
+            return f"{_agent_display_name()}已使用skill：{skill_name}"
         content = str(result.get("content", "") or "")
         line_count = len(content.splitlines()) if content else 0
-        return f"星瑶已查看文件：{target}（{line_count} 行）"
+        return f"{_agent_display_name()}已查看文件：{target}（{line_count} 行）"
 
     success = _TOOL_COPY.get(name, ("使用工具", "工具执行完成", ""))[1]
     if name == "execute_command" or not target:
         return success
-    return f"星瑶{success}：{target}"
+    return f"{_agent_display_name()}{success}：{target}"

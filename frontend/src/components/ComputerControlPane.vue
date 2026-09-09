@@ -80,7 +80,7 @@
     </template>
 
     <p v-else class="cp-empty" data-test="computer-empty-state">
-      暂无电脑操控会话。星瑶开始操控浏览器或桌面时，这里会实时显示截图预览与操作轨迹。
+      暂无电脑操控会话。{{ store.agentName }}开始操控浏览器或桌面时，这里会实时显示截图预览与操作轨迹。
     </p>
   </div>
 </template>

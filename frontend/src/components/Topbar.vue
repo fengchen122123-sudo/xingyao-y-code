@@ -3,7 +3,7 @@
     <button class="icon-btn no-drag" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">
       <AppIcon name="menu" :size="17" />
     </button>
-    <div class="logo no-drag" :title="store.version ? ('Y-CODE 星瑶 v' + store.version) : 'Y-CODE 星瑶'">
+    <div class="logo no-drag" :title="store.version ? ('Y-CODE ' + store.agentName + ' v' + store.version) : ('Y-CODE ' + store.agentName)">
       <img class="mark" :src="'/icon.png'" alt="Y-CODE">
       <div><span class="name">Y-CODE</span></div>
     </div>

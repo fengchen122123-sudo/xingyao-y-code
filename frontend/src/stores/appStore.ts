@@ -583,6 +583,10 @@ export const useAppStore = defineStore('app', {
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
     settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact',
+    // 智能体显示名：设置页「人设设置」自定义后全局生效（界面文案/执行过程/思考提示）
+    agentName: '星瑶',
+    // 智能体对用户的称呼；空串表示不使用特定称呼
+    userTitle: '',
     // 主题预览模式：设置页"预览效果"收起设置、直接看真实首页（草稿已实时渲染），
     // 顶部浮条提供返回编辑；保存/取消/切主题时退出该模式
     themePreviewMode: false,
@@ -1386,6 +1390,13 @@ export const useAppStore = defineStore('app', {
         if (init.system_settings) {
           this.systemSettings = init.system_settings;
         }
+        // 人设设置：智能体显示名与对用户的称呼（启动快照随 init 一起下发）
+        const personaInit = (init as any).persona_settings;
+        if (personaInit && typeof personaInit === 'object') {
+          this.agentName = String(personaInit.agent_name || '星瑶');
+          this.userTitle = String(personaInit.user_title || '');
+          this.syncDocumentTitle();
+        }
         if (init.reasoning) this.reasoning = init.reasoning;
         this.sessionGroups = init.sessions || [];
         this.skills = init.skills || [];
@@ -1602,6 +1613,20 @@ export const useAppStore = defineStore('app', {
         this.notifyModal('系统设置', '加载系统设置失败: ' + err);
         return null;
       }
+    },
+
+    // 人设设置（名称/称呼）保存后即时同步全局显示；快照由 PersonaSettings 页传入
+    applyPersonaSettings(snapshot: { agent_name?: string; user_title?: string }) {
+      if (!snapshot || typeof snapshot !== 'object') return;
+      if (snapshot.agent_name) this.agentName = String(snapshot.agent_name);
+      this.userTitle = String(snapshot.user_title || '');
+      this.syncDocumentTitle();
+    },
+
+    // 页面标题跟随智能体显示名（webview/浏览器预览均可见；默认名时保持 Y-CODE 简洁形态）
+    syncDocumentTitle() {
+      const name = this.agentName || '星瑶';
+      document.title = name === '星瑶' ? 'Y-CODE' : `Y-CODE · ${name}`;
     },
 
     async setCommandShell(shellId: string): Promise<boolean> {
@@ -3574,8 +3599,8 @@ export const useAppStore = defineStore('app', {
     async undoLastEdit() {
       const ok = await this.askConfirm(
         '撤销文件修改',
-        '此操作将撤销星瑶最近一次的文件改动',
-        '撤销星瑶上一次的文件修改？',
+        `此操作将撤销${this.agentName}最近一次的文件改动`,
+        `撤销${this.agentName}上一次的文件修改？`,
         '确定撤销 ⏎'
       );
       if (!ok) return;

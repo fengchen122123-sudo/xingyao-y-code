@@ -30,6 +30,7 @@ import { computed, ref } from 'vue';
 import ChangedFilesPanel from './ChangedFilesPanel.vue';
 import FoldCard from './FoldCard.vue';
 import MessageBubble from './MessageBubble.vue';
+import { useAppStore } from '../stores/appStore';
 import {
   collectFileChanges,
   groupStats,
@@ -59,10 +60,11 @@ const fileChanges = computed(() => collectFileChanges(props.group));
 const title = computed(() => {
   const { rounds, toolCount } = stats.value;
   const stateLabel = STATE_LABELS[props.group.state];
+  const agentName = useAppStore().agentName;
   if (toolCount > 0) {
-    return `星瑶执行过程 · ${toolCount} 个工具调用 · ${stateLabel}`;
+    return `${agentName}执行过程 · ${toolCount} 个工具调用 · ${stateLabel}`;
   }
-  return `星瑶执行过程 · ${rounds} 轮 · ${stateLabel}`;
+  return `${agentName}执行过程 · ${rounds} 轮 · ${stateLabel}`;
 });
 </script>
 

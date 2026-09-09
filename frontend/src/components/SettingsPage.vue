@@ -405,7 +405,7 @@
         <header class="settings-header">
           <div>
             <h1>关于</h1>
-            <p>Y-CODE · 星瑶 —— 你的 AI 编程搭档。</p>
+            <p>Y-CODE · {{ store.agentName }} —— 你的 AI 编程搭档。</p>
           </div>
         </header>
 

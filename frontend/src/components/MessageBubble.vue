@@ -48,7 +48,7 @@
     <div v-else-if="msg.role === 'assistant'" class="avatar-row">
       <div class="assistant-body">
         <div class="assistant-name">
-          <b>星瑶</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
+          <b>{{ store.agentName }}</b> · <span style="font-size:11px;color:var(--text-faint)">{{ msg.model_name || store.activeModelName || '模型' }}</span>
           <span v-if="msg.cancelled" class="cancel-badge">已取消</span>
         </div>
 
@@ -85,10 +85,10 @@
           <AppIcon name="triangle-alert" :size="13" /> {{ msg.error_note }}
         </div>
 
-        <!-- 等待模型响应期间的动态反馈（对齐 CLI 的“星瑶正在干活”） -->
+        <!-- 等待模型响应期间的动态反馈（对齐 CLI 的"正在干活"） -->
         <div v-if="showWorking" class="working-line">
           <span class="spin"></span>
-          <span class="wl-text">星瑶正在干活<span class="wl-dots"><i>.</i><i>.</i><i>.</i></span></span>
+          <span class="wl-text">{{ store.agentName }}正在干活<span class="wl-dots"><i>.</i><i>.</i><i>.</i></span></span>
           <span v-if="elapsed >= 3" class="wl-elapsed">已等待 {{ elapsed }}s</span>
         </div>
 
