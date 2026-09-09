@@ -4,7 +4,10 @@
       <div class="menu-item" @click="newSession()">
         <span class="mi-ico">✎</span>
         <span class="mi-label">新会话</span>
-        <span class="mi-count">{{ store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</span>
+        <span
+          class="mi-count"
+          :title="store.currentWorkdirLabel"
+        >{{ store.currentWorkdirLabel === '对话' ? '对话' : store.currentWorkdirLabel }}</span>
         <span class="mi-arrow">＋</span>
       </div>
       <div class="menu-item" @click="openSkills()">
@@ -449,6 +452,8 @@ function getFolderTitle(g: SessionGroup) {
 .menu-item .mi-label {
   font-size: 13px;
   font-weight: 500;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 .menu-item .mi-count {
   margin-left: auto;
@@ -457,6 +462,11 @@ function getFolderTitle(g: SessionGroup) {
   background: var(--bg3);
   border-radius: 8px;
   padding: 1px 7px;
+  /* 目录名过长时单行显示并省略，不换行撑高菜单项 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 .menu-item .mi-arrow {
   color: var(--text-faint);
