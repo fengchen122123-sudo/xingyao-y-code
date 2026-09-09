@@ -68,9 +68,10 @@
           v-if="msg.content && msg.content.trim()"
           ref="mdBodyRef"
           class="md-body"
-          v-html="renderMarkdown(msg.content, mediaCtx)"
           @click="onMdBodyClick"
-        ></div>
+        >
+          <div v-for="b in mdBlocks" :key="b.key" class="md-block" v-html="b.html"></div>
+        </div>
 
         <!-- 工具执行时间线（含绑定/未绑定的文件变更 Diff） -->
         <ToolExecutionTrace
@@ -142,7 +143,8 @@
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onUnmounted } from 'vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
-import { renderMarkdown, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
+import { renderMarkdownDetailed, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
+import { splitStableBlocks } from '../utils/markdownBlocks';
 import { renderMermaidBlocks } from '../utils/mermaidRenderer';
 import { toAbsoluteLocalPath } from '../utils/localPath';
 import { formatTokenSpeed, formatDuration } from '../utils/tokenSpeed';
@@ -245,6 +247,39 @@ const thinkingOpen = computed({
 const mediaCtx = computed(() =>
   props.msg.media && props.msg.media.length ? { items: props.msg.media } : undefined
 );
+
+// 块级增量渲染：已完成块的 HTML 按「起始媒体序号 + 块源码」缓存，
+// 流式期间只重渲染尾部块。缓存是组件级的，随组件销毁回收，不跨消息串味。
+const blockCache = new Map<string, { html: string; mediaCount: number }>();
+
+interface MdBlock {
+  key: string;
+  html: string;
+}
+
+const mdBlocks = computed<MdBlock[]>(() => {
+  const src = props.msg.content || '';
+  if (!src.trim()) return [];
+  const { blocks, tail } = splitStableBlocks(src);
+  const out: MdBlock[] = [];
+  let ordinal = 0;
+  for (const block of blocks) {
+    const key = `${ordinal}|${block}`;
+    let cached = blockCache.get(key);
+    if (!cached) {
+      const rendered = renderMarkdownDetailed(block, mediaCtx.value, ordinal);
+      cached = { html: rendered.html, mediaCount: rendered.mediaCount };
+      blockCache.set(key, cached);
+    }
+    ordinal += cached.mediaCount;
+    out.push({ key, html: cached.html });
+  }
+  out.push({
+    key: 'tail',
+    html: renderMarkdownDetailed(tail, mediaCtx.value, ordinal).html,
+  });
+  return out;
+});
 
 // 复制文本到剪贴板：优先 Clipboard API，失败回退 execCommand（pywebview/旧内核兼容）
 async function copyToClipboard(text: string): Promise<void> {
