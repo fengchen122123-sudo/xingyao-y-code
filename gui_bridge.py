@@ -455,6 +455,11 @@ def _media_save_filename(suggested_name: str, ext: str) -> str:
 
 
 class ApiBridge:
+    _active_turn_lock = threading.Lock()
+    _active_turn_snapshots: dict[str, dict] = {}
+    _session_last_errors: dict[str, dict] = {}
+    _session_last_errors_lock = threading.Lock()
+
     def __init__(self, mcp_manager=None):
         # 内部状态变量使用下划线开头，防止 PyWebView 在 Windows .NET 检查中产生属性递归问题
         self._window = None
@@ -479,6 +484,9 @@ class ApiBridge:
         # 多会话并行：按 session 隔离回合线程和取消事件
         self._active_turns: dict[str, threading.Thread] = {}
         self._cancel_events: dict[str, threading.Event] = {}
+        # 进行中回合快照（会话名 -> 正在执行的思考、文本、工具列表等，供手机中途扫码或切换会话拉取）
+        self._active_turn_snapshots: dict[str, dict] = {}
+        self._active_turn_lock = threading.Lock()
         # 每会话当前回合的 turn_id（session:xxx 复合 ID）：权限请求的 owner
         # 是 turn_id 而非会话名，stop_current_turn 要按它精确取消权限等待
         self._active_turn_ids: dict[str, str] = {}
@@ -632,6 +640,85 @@ class ApiBridge:
         再用 is_alive 过滤刚登记尚未启动/已结束未清理的极窄竞态窗口。
         """
         return any(t.is_alive() for t in self._active_turns.values())
+
+    def get_active_turn_snapshot(self, session_name: str) -> Optional[Dict[str, Any]]:
+        """获取指定会话当前进行中的回合快照（若无活跃回合返回 None）。"""
+        if not session_name:
+            return None
+        with self._active_turn_lock:
+            snap = self._active_turn_snapshots.get(session_name)
+            if not snap:
+                return None
+            copied = dict(snap)
+            copied["tool_calls"] = [dict(c) for c in snap.get("tool_calls", [])]
+            return copied
+
+    def get_all_active_turn_snapshots(self) -> Dict[str, Dict[str, Any]]:
+        """获取所有会话当前进行中的回合快照字典。"""
+        with self._active_turn_lock:
+            res = {}
+            for s, snap in self._active_turn_snapshots.items():
+                copied = dict(snap)
+                copied["tool_calls"] = [dict(c) for c in snap.get("tool_calls", [])]
+                res[s] = copied
+            return res
+
+    def _record_session_last_error(self, session_name: str, message: str, model_name: str = "", model_id: str = ""):
+        """记录会话最后一次终态错误，供多端与重载恢复。"""
+        if not session_name:
+            return
+        payload = {
+            "message": str(message),
+            "timestamp": time.time(),
+            "model_name": model_name or "",
+            "model_id": model_id or "",
+        }
+        lock = getattr(self, "_session_last_errors_lock", None)
+        if lock is not None:
+            with lock:
+                getattr(self, "_session_last_errors", {})[session_name] = payload
+        else:
+            getattr(self, "_session_last_errors", {})[session_name] = payload
+        try:
+            if hasattr(self, "_memory") and hasattr(self._memory, "set_session_last_error"):
+                self._memory.set_session_last_error(session_name, payload)
+        except Exception:
+            logger.debug("持久化会话最后错误失败", exc_info=True)
+
+    def _get_session_last_error(self, session_name: str) -> Optional[Dict[str, Any]]:
+        """获取会话最后一次终态错误。"""
+        if not session_name:
+            return None
+        lock = getattr(self, "_session_last_errors_lock", None)
+        if lock is not None:
+            with lock:
+                res = getattr(self, "_session_last_errors", {}).get(session_name)
+        else:
+            res = getattr(self, "_session_last_errors", {}).get(session_name)
+        if res is not None:
+            return copy.deepcopy(res)
+        try:
+            if hasattr(self, "_memory") and hasattr(self._memory, "get_session_last_error"):
+                return self._memory.get_session_last_error(session_name)
+        except Exception:
+            pass
+        return None
+
+    def _clear_session_last_error(self, session_name: str):
+        """清除会话的最后一次终态错误。"""
+        if not session_name:
+            return
+        lock = getattr(self, "_session_last_errors_lock", None)
+        if lock is not None:
+            with lock:
+                getattr(self, "_session_last_errors", {}).pop(session_name, None)
+        else:
+            getattr(self, "_session_last_errors", {}).pop(session_name, None)
+        try:
+            if hasattr(self, "_memory") and hasattr(self._memory, "clear_session_last_error"):
+                self._memory.clear_session_last_error(session_name)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # 自绘标题栏窗口控制（frameless 模式）：最小化 / 最大化还原 / 关闭
@@ -1886,6 +1973,14 @@ class ApiBridge:
             now = time.monotonic()
             if now - self._delta_last_flush >= TOKEN_FLUSH_INTERVAL:
                 flush_now = True
+        if session_name:
+            with self._active_turn_lock:
+                snap = self._active_turn_snapshots.get(session_name)
+                if snap is not None:
+                    if kind == "thinking_delta":
+                        snap["thinking_text"] = snap.get("thinking_text", "") + text
+                    else:
+                        snap["streaming_text"] = snap.get("streaming_text", "") + text
         if swapped is not None:
             swapped_text = swapped[1]
             if swapped[0] == "token_delta":
@@ -1943,16 +2038,33 @@ class ApiBridge:
         except Exception:
             logger.debug("回合收尾清理流式缓冲失败", exc_info=True)
 
-    def _emit_message_final(self, session_name: str) -> None:
+    def _emit_message_final(self, session_name: str, after_msg_id: Optional[int] = None) -> None:
         """补发最后一条助手消息的全文（message_final 事件），供前端自愈校正。
 
         前端气泡内容完全靠 token_delta 累加，delta 在 evaluate_js 投递环节丢失
         后没有任何校正手段（表现为「回复尾部缺一段」）。回合结束时从数据库读取
         已落库的全文补发，前端仅在全文更长时覆盖，正常路径是无害 no-op。
         任何异常都吞掉：本事件是兜底增强，绝不能阻断 turn_finish。
+
+        after_msg_id 是回合边界（本回合开始前会话的最后一条消息 id）：
+        - None（默认）：不过滤，取全库最后一条 assistant 消息，行为与历史完全
+          一致（既有调用点与测试依赖此语义）。
+        - int：只在 _msg_id 大于该边界的消息里反向找最后一条 assistant 消息。
+          这个坑必须堵住——回合异常/取消时 core/llm.rollback_turn_messages()
+          回滚了本轮内存消息，本轮若尚未落库任何助手消息，不过滤就会取到
+          **上一轮**的助手全文；前端「全文更长就覆盖」（appStore.ts）会把上一轮
+          结果灌进本轮气泡。过滤后若没有助手消息则不发事件（与原有
+          final_text/final_reasoning/final_media 全空则不发的事件语义一致）。
         """
         try:
-            history = self._memory.get_history(session_name)
+            if after_msg_id is None:
+                history = self._memory.get_history(session_name)
+            else:
+                history = [
+                    msg
+                    for msg in self._memory.get_history_with_ids(session_name)
+                    if int(msg.get("_msg_id") or 0) > after_msg_id
+                ]
             final_text = ""
             final_reasoning = ""
             final_media: list = []
@@ -2127,8 +2239,36 @@ class ApiBridge:
                         "model_id": (msg.get("_display") or {}).get("model_id") or "",
                         "model_name": (msg.get("_display") or {}).get("model_name") or "",
                         "metrics": (msg.get("_display") or {}).get("metrics") or None,
+                        "error_note": (msg.get("_display") or {}).get("error_note") or "",
+                        "execution_state": (msg.get("_display") or {}).get("execution_state") or "",
                         # media_v1 媒体清单（已拼好带令牌 URL）；旧消息为空列表
                         "media": self._media_items_for_frontend(msg.get("_display")),
+                    })
+            err_info = self._get_session_last_error(session_name)
+            if err_info and err_info.get("message"):
+                err_msg = str(err_info["message"])
+                if msgs and msgs[-1].get("role") == "assistant":
+                    msgs[-1]["error_note"] = err_msg
+                    msgs[-1]["execution_state"] = "error"
+                    if err_info.get("model_name") and not msgs[-1].get("model_name"):
+                        msgs[-1]["model_name"] = err_info["model_name"]
+                elif msgs and msgs[-1].get("role") == "user":
+                    msgs.append({
+                        "role": "assistant",
+                        "content": "",
+                        "reasoning_content": "",
+                        "tool_calls": [],
+                        "execution_state": "error",
+                        "error_note": err_msg,
+                        "model_name": err_info.get("model_name", ""),
+                        "model_id": err_info.get("model_id", ""),
+                        "metrics": None,
+                        "media": [],
+                    })
+                elif not msgs:
+                    msgs.append({
+                        "role": "error",
+                        "content": err_msg,
                     })
         except Exception:
             logger.debug("加载会话消息失败", exc_info=True)
@@ -2229,6 +2369,9 @@ class ApiBridge:
                     name for name, t in getattr(self, "_active_turns", {}).items()
                     if t.is_alive()
                 ],
+                # 活跃回合快照：供手机扫码连接或重载时恢复正在执行的思考、流式文本与工具状态
+                "active_turn_snapshots": self.get_all_active_turn_snapshots(),
+                "active_turn_snapshot": self.get_active_turn_snapshot(self._current_session),
                 # 排队消息随初始状态返回：重载期间 message_queue 事件丢失，
                 # 前端据此恢复各会话的排队条目展示
                 "message_queues": {
@@ -2764,6 +2907,8 @@ class ApiBridge:
                 "reasoning": _reasoning_snapshot_for_model(session_model),
                 # 排队中的用户消息随切换返回：前端免额外往返即可渲染排队条目
                 "message_queue": self._message_queue_snapshot(session_name),
+                # 目标会话若正在运行，返回其实时流式快照供前端恢复
+                "active_turn_snapshot": self.get_active_turn_snapshot(session_name),
             }
             if is_global:
                 result.update({"workdir": "GLOBAL", "is_global": True})
@@ -2773,6 +2918,7 @@ class ApiBridge:
             # 文件树不再随切换响应同步扫描（大目录要数秒，拖慢切换）；
             # 前端切换成功后调 get_file_tree 后台异步加载。
             self._emit_token_usage()
+            self.emit_event("active_session_changed", {"session_name": session_name})
             return result
         except Exception as e:
             logger.exception("switch_session 失败")
@@ -2866,6 +3012,7 @@ class ApiBridge:
     def clear_session_history(self, session_name: Optional[str] = None) -> Dict[str, Any]:
         try:
             target = session_name or self._current_session
+            self._clear_session_last_error(target)
             deleted = self._memory.clear_session_messages(target)
             from core.llm import session_token_usage, token_usage_lock
             with token_usage_lock:
@@ -3984,6 +4131,10 @@ class ApiBridge:
         event_session_name = session_name
         cancelled = False
         turn_id = ""
+        # 本回合起点消息 id（turn_start 事件后记录）：异常/取消回滚后 history
+        # 末尾会退化成上一轮的助手消息，补发全文必须按此边界过滤。必须在
+        # finish_once 定义之前初始化，闭包才能读到；取值失败退回 None（旧行为）。
+        turn_start_msg_id: Optional[int] = None
         # 线程本地 workdir 作用域：绑定后必须在本回合 finally 中退出恢复，
         # 防止主线程直调（测试）或未来线程复用场景下 workdir 泄漏到下一回合
         _workdir_scope = None
@@ -4020,15 +4171,17 @@ class ApiBridge:
             # 时执行失败此前只记 debug），前端消息纯靠 delta 累加、尾部一丢就永久
             # 缺失。turn_finish 前补发 message_final 携带最后一条助手消息全文，
             # 前端仅在全文更长时覆盖——正常路径是无害 no-op，丢包路径自我修复。
-            self._emit_message_final(event_session_name)
+
             self.emit_event("turn_finish", {"session_name": event_session_name})
             self._emit_token_usage()
+            self._clear_session_last_error(session_name)
 
         # 多会话并行：不再用全局 _task_status 表示"执行中"——它会被另一会话回合结束时的
         # idle 覆盖，也会让仍在跑的会话状态错乱。各会话的活跃状态由 self._active_turns
         # 字典承载（线程已在 send_user_message 中存入）。_task_status 仅在全部回合结束
         # 时恢复 idle，保持 _GuiContext.task_status 兼容。
         # self._task_status = "executing"
+        self._clear_session_last_error(session_name)
         turn_start_data = {"user_text": user_text, "session_name": session_name}
         if display_text and display_text != user_text:
             turn_start_data["display_text"] = display_text
@@ -4039,7 +4192,27 @@ class ApiBridge:
                 if internal_kind == "bg_command_summary"
                 else _BG_SUMMARY_DISPLAY_TEXT
             )
+        with self._active_turn_lock:
+            self._active_turn_snapshots[session_name] = {
+                "session_name": session_name,
+                "user_text": user_text,
+                "display_text": display_text or user_text,
+                "started_at_ms": int(time.time() * 1000),
+                "thinking_text": "",
+                "streaming_text": "",
+                "tool_calls": [],
+                "internal_kind": internal_kind,
+            }
         self.emit_event("turn_start", turn_start_data)
+        # 记录本回合起点消息 id：此处刚推完 turn_start、本轮任何消息都还没落库。
+        # 回合异常/取消时 core/llm.rollback_turn_messages() 会回滚本轮内存消息，
+        # history 末尾退化成上一轮的助手消息，收尾补发全文必须按此边界过滤，
+        # 否则会把上一轮结果灌进本轮气泡。取不到就置 None，退回旧的不过滤行为。
+        try:
+            turn_start_msg_id = self._memory.get_last_message_id(session_name)
+        except Exception:
+            logger.debug("读取回合起点消息 id 失败，message_final 退回不过滤", exc_info=True)
+            turn_start_msg_id = None
 
         try:
             active_model = get_active_model(session_name)
@@ -4224,6 +4397,8 @@ class ApiBridge:
             # 从活跃回合字典中移除本会话
             self._active_turns.pop(session_name, None)
             self._active_turn_ids.pop(session_name, None)
+            with self._active_turn_lock:
+                self._active_turn_snapshots.pop(session_name, None)
             self._finalize_session_deltas(session_name)
             # 仅当没有其他活跃回合时才恢复 idle，避免会话 A 结束时把仍在跑的会话 B
             # 的全局状态错置成 idle
@@ -4454,6 +4629,15 @@ class ApiBridge:
         if terminal and error_state["terminal_message"] is None:
             error_state["terminal_message"] = sanitized
             self.emit_event("turn_error", {"message": sanitized, **session_payload})
+            if session_name:
+                active_model = {}
+                try:
+                    active_model = get_active_model(session_name) or {}
+                except Exception:
+                    pass
+                m_name = active_model.get("model_name") or active_model.get("display_name") or ""
+                m_id = active_model.get("model_id") or ""
+                self._record_session_last_error(session_name, sanitized, model_name=m_name, model_id=m_id)
 
         toast_messages = error_state["toast_messages"]
         if sanitized in toast_messages:
@@ -4535,14 +4719,24 @@ class ApiBridge:
                 tool_labels[tool_id] = label
                 if tool_id not in started_tool_ids:
                     started_tool_ids.add(tool_id)
-                    self.emit_event("tool_start", {
+                    tool_item = {
                         "id": tool_id,
                         "name": name,
                         "label": label,
                         "display": dict(data.get("display") or {}),
                         "started_at_ms": int(time.time() * 1000),
                         "session_name": session_name,
-                    })
+                    }
+                    self.emit_event("tool_start", tool_item)
+                    with self._active_turn_lock:
+                        snap = self._active_turn_snapshots.get(session_name)
+                        if snap is not None:
+                            calls = snap.setdefault("tool_calls", [])
+                            idx = next((i for i, c in enumerate(calls) if c.get("id") == tool_id), -1)
+                            if idx >= 0:
+                                calls[idx].update(tool_item)
+                            else:
+                                calls.append(dict(tool_item))
             elif kind == "tool_finished":
                 tool_id = str(data.get("id") or "")
                 name = str(data.get("name") or "tool")
@@ -4559,6 +4753,20 @@ class ApiBridge:
                     "display": dict(data.get("display") or {}),
                     "session_name": session_name,
                 })
+                with self._active_turn_lock:
+                    snap = self._active_turn_snapshots.get(session_name)
+                    if snap is not None:
+                        calls = snap.get("tool_calls") or []
+                        hit = next((c for c in calls if c.get("id") == tool_id), None)
+                        if hit is not None:
+                            hit.update({
+                                "ok": bool(data.get("ok", True)),
+                                "summary": str(data.get("summary") or ""),
+                                "result": str(data.get("result") or ""),
+                                "error": str(data.get("error") or ""),
+                                "duration_ms": data.get("duration_ms"),
+                                "display": dict(data.get("display") or {}),
+                            })
             elif kind == "diff_ready":
                 # 优先取纯文本 unified diff；缺失时才退回终端版本（含 ANSI 颜色）
                 self.emit_event("diff_ready", {
@@ -4569,6 +4777,19 @@ class ApiBridge:
                     "removed": data.get("removed"),
                     "session_name": session_name,
                 })
+                with self._active_turn_lock:
+                    snap = self._active_turn_snapshots.get(session_name)
+                    if snap is not None:
+                        t_id = str(data.get("tool_call_id") or "")
+                        calls = snap.get("tool_calls") or []
+                        hit = next((c for c in calls if c.get("id") == t_id), None)
+                        if hit is not None:
+                            hit["diff"] = {
+                                "file_path": str(data.get("file_path") or ""),
+                                "diff_text": str(data.get("diff_text") or data.get("text") or ""),
+                                "added": data.get("added"),
+                                "removed": data.get("removed"),
+                            }
             elif kind in ("plan_updated", "plan_change"):
                 self.emit_event("plan_updated", {
                     "title": str(data.get("title") or "当前任务计划"),

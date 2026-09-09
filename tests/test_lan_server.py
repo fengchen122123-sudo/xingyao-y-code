@@ -586,3 +586,42 @@ def test_dispatch_rpc_rejects_non_string_method_without_type_error(server, metho
     """
     response = server.dispatch_rpc(method, [])
     assert response == {"error": {"code": "method_not_allowed"}}
+
+
+def test_broadcast_concurrent_thread_safety():
+    """并发多线程调用 broadcast 和 _route_message 向同一个客户端发送消息，确保 _client_locks 保护下无竞争丢失。"""
+    srv = LanServer(bridge=None)
+    sent_messages = []
+    lock = threading.Lock()
+
+    class FakeClient:
+        def send(self, data):
+            # 模拟网络发送耗时
+            time.sleep(0.0005)
+            with lock:
+                sent_messages.append(data)
+
+    fake = FakeClient()
+    token = srv._issue_token()
+    assert srv._authenticate_and_register(fake, token) is True
+
+    def worker_broadcast(wid):
+        for i in range(10):
+            srv.broadcast(json.dumps({"type": "token_delta", "data": {"text": f"t_{wid}_{i}"}}))
+
+    def worker_route(wid):
+        for i in range(10):
+            srv._route_message(fake, json.dumps({"method": "get_initial_state", "args": [], "id": wid * 100 + i}))
+
+    threads = []
+    for wid in range(4):
+        threads.append(threading.Thread(target=worker_broadcast, args=(wid,)))
+        threads.append(threading.Thread(target=worker_route, args=(wid,)))
+
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # 4 个 worker_broadcast 发送 4*10=40 条，4 个 worker_route 发送 4*10=40 条，共 80 条全部收到
+    assert len(sent_messages) == 80

@@ -509,6 +509,9 @@ class MemoryManager:
                 # 会话级主模型绑定：不继承全局 active_model_id，不同会话/不同界面互不干扰
                 if "active_model_id" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN active_model_id TEXT")
+                # 会话最后一次终态错误（如余额不足/接口超时），供 UI 多端与重载恢复
+                if "last_error" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN last_error TEXT")
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -1943,6 +1946,51 @@ class MemoryManager:
             row = cursor.fetchone()
             return str(row[0]).strip() if row and row[0] else None
 
+    def set_session_last_error(self, session_name: str, error_payload: str | dict) -> None:
+        """记录会话最后一次终态错误（如余额不足/接口超时），供 UI 多端与重载恢复。"""
+        serialized = (
+            json.dumps(error_payload, ensure_ascii=False)
+            if isinstance(error_payload, dict)
+            else str(error_payload)
+        )
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE sessions SET last_error = ? WHERE session_name = ?",
+                (serialized, session_name),
+            )
+            self.conn.commit()
+
+    def get_session_last_error(self, session_name: str) -> dict | None:
+        """获取会话最后一次终态错误。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT last_error FROM sessions WHERE session_name = ?",
+                (session_name,),
+            )
+            row = cursor.fetchone()
+            if not row or not row[0]:
+                return None
+            raw = row[0]
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return parsed
+                return {"message": str(parsed)}
+            except Exception:
+                return {"message": str(raw)}
+
+    def clear_session_last_error(self, session_name: str) -> None:
+        """清除会话的最后一次终态错误。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "UPDATE sessions SET last_error = NULL WHERE session_name = ?",
+                (session_name,),
+            )
+            self.conn.commit()
+
     def clear_session_messages(self, session_name):
         """清空指定会话的全部消息，但保留会话本身（供 GUI "清空历史" 使用）。
 
@@ -1966,7 +2014,7 @@ class MemoryManager:
                 now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 cursor.execute('''
                     UPDATE sessions
-                    SET memory_summary = NULL, summarized_until_msg_id = 0, updated_at = ?
+                    SET memory_summary = NULL, summarized_until_msg_id = 0, last_error = NULL, updated_at = ?
                     WHERE id = ?
                 ''', (now, session_id))
                 self.conn.commit()
@@ -1994,6 +2042,39 @@ class MemoryManager:
                 raise
 
 
+    @staticmethod
+    def _parse_message_rows(rows, with_ids=False):
+        """把数据库行元组解析成消息字典列表（get_history / get_history_with_ids 共用）。
+
+        with_ids=False 时 rows 每项为 (role, content)，返回的 dict 不新增任何键；
+        with_ids=True 时 rows 每项为 (id, role, content)，返回的 dict 额外带 _msg_id。
+        """
+        history = []
+        for record in rows:
+            if with_ids:
+                msg_id = record[0]
+                role = record[1]
+                raw_content = record[2]
+            else:
+                msg_id = None
+                role = record[0]
+                raw_content = record[1]
+            parsed, ok = _try_parse_json(raw_content)
+            if not ok:
+                msg = {"role": role, "content": raw_content}
+            elif isinstance(parsed, dict):
+                msg = {"role": role}
+                msg.update(parsed)
+                # 数据库列中的 role 是权威值：防止消息正文恰好是含 "role" 键的
+                # JSON 时覆盖真实角色（历史损坏 + 注入向量）
+                msg["role"] = role
+            else:
+                msg = {"role": role, "content": parsed}
+            if with_ids:
+                msg["_msg_id"] = msg_id
+            history.append(msg)
+        return history
+
     def get_history(self, session_name):
         """翻旧账技能：根据会话名字，把历史记录全拿出来"""
         with self._lock:
@@ -2017,26 +2098,41 @@ class MemoryManager:
             ''', (session_id,))
 
             # 3. 把查出来的数据，打包成 Python 认识的格式（字典列表）
-            history = []
-            for record in cursor.fetchall():
-                role = record[0]
-                raw_content = record[1]
-                parsed, ok = _try_parse_json(raw_content)
-                if not ok:
-                    history.append({"role": role, "content": raw_content})
-                elif isinstance(parsed, dict):
-                    msg = {"role": role}
-                    msg.update(parsed)
-                    # 数据库列中的 role 是权威值：防止消息正文恰好是含 "role" 键的
-                    # JSON 时覆盖真实角色（历史损坏 + 注入向量）
-                    msg["role"] = role
-                    history.append(msg)
-                else:
-                    history.append({"role": role, "content": parsed})
+            return self._parse_message_rows(cursor.fetchall())
 
+    def get_last_message_id(self, session_name):
+        """返回该会话最后一条消息的 id；会话不存在或没有任何消息时返回 0。"""
+        with self._lock:
+            cursor = self.conn.cursor()
 
-            return history
-            return history
+            cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
+            row = cursor.fetchone()
+            if row is None:
+                return 0
+
+            session_id = row[0]
+            cursor.execute('SELECT MAX(id) FROM messages WHERE session_id = ?', (session_id,))
+            row = cursor.fetchone()
+            return int(row[0]) if row and row[0] is not None else 0
+
+    def get_history_with_ids(self, session_name):
+        """与 get_history 相同，但每条消息额外带 _msg_id，供 GUI 做回合边界过滤。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+
+            cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
+            row = cursor.fetchone()
+            if row is None:
+                return []
+
+            session_id = row[0]
+            cursor.execute('''
+                SELECT id, role, content FROM messages
+                WHERE session_id = ?
+                ORDER BY id ASC
+            ''', (session_id,))
+
+            return self._parse_message_rows(cursor.fetchall(), with_ids=True)
 
     def get_history_for_llm(self, session_name):
         """获取专门供给大模型的历史，剔除已被总结的段落，并在最前面附带记忆摘要"""
