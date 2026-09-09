@@ -68,6 +68,18 @@ afterEach(() => {
 });
 
 describe('applyGuiTheme', () => {
+  it('清除 body 上启动期写入的 inline 背景色，避免旧主题实色残留在面板缝隙', async () => {
+    // 启动时 applyBootTheme 会把首屏主题的背景实色写进 body.style（防白闪）；
+    // 运行期切换主题后若不清除，深色主题下 body 仍是旧浅色，面板之间 1px
+    // 的缝隙会露出这层旧色，看上去像两条亮线。
+    document.body.style.backgroundColor = 'rgb(244, 244, 241)';
+
+    const applied = await applyGuiTheme(theme(), fakeApi());
+
+    expect(document.body.style.backgroundColor).toBe('');
+    applied.dispose();
+  });
+
   it('maps semantic and region tokens without injecting a style element', async () => {
     const applied = await applyGuiTheme(theme(), fakeApi());
 
