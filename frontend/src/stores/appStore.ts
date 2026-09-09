@@ -831,6 +831,20 @@ export const useAppStore = defineStore('app', {
       return last;
     },
 
+    // 把消息里的图片另存到用户选择的位置（后端弹原生"另存为"对话框，
+    // 只接受本地媒体仓库 URL；取消不算错误，用 cancelled 标记区分）
+    async saveMediaImage(url: string, suggestedName = '') {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '后端连接失败，无法另存' };
+      try {
+        const res = await api.save_media_image(url, suggestedName);
+        return res || { ok: false, msg: '另存失败：桥接无返回' };
+      } catch (err) {
+        this.connected = false;
+        return { ok: false, msg: `另存失败：${err}` };
+      }
+    },
+
     openLightbox(images: string[], index: number) {
       if (!images || !images.length) return;
       this.lightbox = { show: true, images, index: Math.max(0, Math.min(index, images.length - 1)) };

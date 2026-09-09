@@ -20,6 +20,7 @@ import os
 import queue
 import pathlib
 import re
+import shutil
 import sys
 import threading
 import time
@@ -438,6 +439,19 @@ def _reasoning_snapshot_for_model(model: dict | None) -> dict:
     if model_id and snapshot["kind"] not in {"fixed", "hidden"}:
         snapshot["choice"] = get_model_reasoning_choice(model_id)
     return snapshot
+
+
+def _media_save_filename(suggested_name: str, ext: str) -> str:
+    """把建议文件名清理成安全的单段文件名，并强制使用 Blob 的真实扩展名。
+
+    建议名来自图片 alt / 原始文件名，可能带路径成分、Windows 非法字符，
+    或与实际内容不符的扩展名（如 alt 写成 xxx.jpg 而 Blob 是 png）。
+    """
+    name = re.split(r"[\\/]", (suggested_name or "").strip())[-1]
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", name).strip(" .")
+    if "." in name:
+        name = name.rsplit(".", 1)[0].strip(" .")
+    return (name or "ycode-image") + ext
 
 
 class ApiBridge:
@@ -2048,6 +2062,44 @@ class ApiBridge:
         except Exception:
             logger.debug("组装前端媒体清单失败", exc_info=True)
             return []
+
+    def save_media_image(self, url: str, suggested_name: str = "") -> Dict[str, Any]:
+        """把消息里的媒体图片另存到用户选择的位置（原生"另存为"对话框）。
+
+        只接受本进程媒体服务签发的 URL：反解回仓库 Blob 后原样复制字节，
+        不重新编码，保证另存结果与原图完全一致。用户取消不算错误，返回
+        cancelled 标记供前端静默处理。
+        """
+        try:
+            source = media_server.local_path_for_url(url or "")
+        except Exception:
+            logger.debug("媒体 URL 反解失败", exc_info=True)
+            source = None
+        if not source:
+            return {"ok": False, "msg": "该图片不在本地媒体仓库中，无法另存"}
+        if self._window is None:
+            return {"ok": False, "msg": "窗口尚未就绪，无法打开保存对话框"}
+
+        ext = os.path.splitext(source)[1].lower() or ".png"
+        try:
+            import webview
+
+            result = self._window.create_file_dialog(
+                webview.SAVE_DIALOG,
+                save_filename=_media_save_filename(suggested_name, ext),
+                file_types=("图片文件 (*.png;*.jpg;*.jpeg;*.webp;*.gif;*.avif)",),
+            )
+            destination = self._dialog_path(result)
+            if destination is None:
+                return {"ok": False, "cancelled": True, "msg": "已取消保存"}
+            shutil.copyfile(source, destination)
+            return {"ok": True, "path": str(destination)}
+        except (OSError, IOError) as error:
+            logger.warning("另存图片失败: %s", error)
+            return {"ok": False, "msg": f"保存失败：{error}"}
+        except Exception:
+            logger.exception("另存图片发生未预期错误")
+            return {"ok": False, "msg": "保存失败，请重试"}
 
     def _load_session_messages(self, session_name: str) -> List[Dict[str, Any]]:
         """读取会话历史并转成前端气泡结构（与 switch_session 同一套映射）。"""

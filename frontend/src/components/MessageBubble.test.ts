@@ -310,6 +310,69 @@ describe('MessageBubble', () => {
     expect(wrapper.find('.streaming-speed-pill').exists()).toBe(false);
     wrapper.unmount();
   });
+
+  it('点击图片"另存为"按钮调用桥接，成功后按钮显示已保存', async () => {
+    const store = useAppStore();
+    const saveMediaImage = vi
+      .spyOn(store, 'saveMediaImage')
+      .mockResolvedValue({ ok: true, path: 'D:/tmp/qr.png' });
+    const msg = assistantMessage({
+      content: '![微信群二维码](a.png)',
+      media: [{ ordinal: 0, kind: 'image', url: 'http://127.0.0.1:1/m/a.png?t=k', caption: '微信群二维码' }],
+    });
+    const wrapper = mount(MessageBubble, { props: { msg } });
+    await flushPromises();
+
+    const btn = wrapper.get('button.md-img-save');
+    await btn.trigger('click');
+    await flushPromises();
+
+    expect(saveMediaImage).toHaveBeenCalledWith('http://127.0.0.1:1/m/a.png?t=k', '微信群二维码');
+    expect(btn.classes()).toContain('saved');
+    expect(btn.text()).toContain('已保存');
+    wrapper.unmount();
+  });
+
+  it('用户取消另存为时不报错也不提示失败', async () => {
+    const store = useAppStore();
+    const notifyChat = vi.spyOn(store, 'notifyChat').mockImplementation(() => {});
+    vi.spyOn(store, 'saveMediaImage').mockResolvedValue({ ok: false, cancelled: true, msg: '已取消保存' });
+    const msg = assistantMessage({
+      content: '![图](a.png)',
+      media: [{ ordinal: 0, kind: 'image', url: 'http://127.0.0.1:1/m/a.png?t=k', caption: '图' }],
+    });
+    const wrapper = mount(MessageBubble, { props: { msg } });
+    await flushPromises();
+
+    const btn = wrapper.get('button.md-img-save');
+    await btn.trigger('click');
+    await flushPromises();
+
+    expect(btn.classes()).not.toContain('save-failed');
+    expect(btn.text()).toContain('另存为');
+    expect(notifyChat).not.toHaveBeenCalled();
+    wrapper.unmount();
+  });
+
+  it('另存为失败时按钮提示失败并弹出说明', async () => {
+    const store = useAppStore();
+    const notifyChat = vi.spyOn(store, 'notifyChat').mockImplementation(() => {});
+    vi.spyOn(store, 'saveMediaImage').mockResolvedValue({ ok: false, msg: '该图片不在本地媒体仓库中，无法另存' });
+    const msg = assistantMessage({
+      content: '![图](a.png)',
+      media: [{ ordinal: 0, kind: 'image', url: 'http://127.0.0.1:1/m/a.png?t=k', caption: '图' }],
+    });
+    const wrapper = mount(MessageBubble, { props: { msg } });
+    await flushPromises();
+
+    const btn = wrapper.get('button.md-img-save');
+    await btn.trigger('click');
+    await flushPromises();
+
+    expect(btn.classes()).toContain('save-failed');
+    expect(notifyChat).toHaveBeenCalled();
+    wrapper.unmount();
+  });
 });
 
 

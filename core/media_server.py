@@ -32,6 +32,11 @@ from core.media_store import (
 logger = logging.getLogger(__name__)
 
 
+def _mime_for_ext(ext: str) -> str | None:
+    """扩展名（不含点）反查白名单 MIME；未登记返回 None。"""
+    return next((m for m, e in SUPPORTED_MIME.items() if e.lstrip(".") == ext), None)
+
+
 class MediaServer:
     """127.0.0.1 单端口媒体只读服务；线程安全，进程内共享一个实例。"""
 
@@ -83,6 +88,40 @@ class MediaServer:
             return ""
         return f"{self.base_url()}/m/{digest}.{ext}?t={self._token}"
 
+    def local_path_for_url(self, url: str) -> str | None:
+        """把本服务签发的媒体 URL 反解回本地 Blob 绝对路径。
+
+        "另存为"需要把原文件复制给用户，因此必须先确认 URL 确实指向本进程
+        仓库里的 Blob：只接受 127.0.0.1/localhost、端口与本服务一致、令牌
+        校验通过、文件名过白名单且 Blob 实际存在的地址；其余一律返回 None
+        （不抛异常，由调用方给出可读提示）。
+        """
+        if not url or self._server is None:
+            return None
+        try:
+            parsed = urlparse(url)
+            port = parsed.port
+        except ValueError:
+            return None
+        if parsed.scheme != "http" or parsed.hostname not in ("127.0.0.1", "localhost"):
+            return None
+        if port != self._server.server_address[1]:
+            return None
+        if not self.check_token((parse_qs(parsed.query).get("t") or [""])[0]):
+            return None
+        parts = parsed.path.split("/")
+        if len(parts) != 3 or parts[1] != "m" or not blob_name_is_safe(parts[2]):
+            return None
+        digest, _, ext = parts[2].partition(".")
+        mime = _mime_for_ext(ext)
+        if mime is None:
+            return None
+        try:
+            path = blob_path_for(digest, mime)
+        except MediaStoreError:
+            return None
+        return path if os.path.isfile(path) else None
+
 
 # 进程内单例；gui_bridge 直接复用，保证令牌与端口全进程一致
 media_server = MediaServer()
@@ -125,9 +164,7 @@ class _MediaRequestHandler(BaseHTTPRequestHandler):
             return
         blob_name = parts[2]
         digest, _, ext = blob_name.partition(".")
-        mime = next(
-            (m for m, e in SUPPORTED_MIME.items() if e.lstrip(".") == ext), None
-        )
+        mime = _mime_for_ext(ext)
         if mime is None:
             self._not_found()
             return
