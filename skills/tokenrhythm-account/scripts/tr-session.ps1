@@ -152,7 +152,7 @@ function Test-TrModel {
         探针式单次调用，不要用来循环压测。
 
     .PARAMETER Model
-        模型 ID，例如 deepseek-v4.1-flash-expires-on-0910。用 GET /api/models 查准确 ID。
+        模型 ID，例如 deepseek-v4.1-flash。用 GET /api/models 查准确 ID。
 
     .PARAMETER Prompt
         探针提示词，默认让模型回四个字，便于肉眼确认返回是否正常。

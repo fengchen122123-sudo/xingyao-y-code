@@ -56,7 +56,7 @@ Remove-TrSession -Session $s
 ```powershell
 . <技能目录>\scripts\tr-session.ps1
 $s = New-TrSession -Account <账号> -Password <密码>
-Test-TrModel -Session $s -Model 'deepseek-v4.1-flash-expires-on-0910' -Stream
+Test-TrModel -Session $s -Model 'deepseek-v4.1-flash' -Stream
 Remove-TrSession -Session $s
 ```
 
@@ -65,7 +65,7 @@ Remove-TrSession -Session $s
 **四步流程：**
 
 1. **对齐模型 ID** —— 先 `GET /api/models`。用户给的多半是简称（"deepseek-v4.1"），必须映射到准确 ID
-   （`deepseek-v4.1-flash-expires-on-0910`），并记下 `status`（online / testing）。
+   （`deepseek-v4.1-flash`），并记下 `status`（online / testing）。
 2. **跑探针** —— `Test-TrModel`；模型支持流式时加 `-Stream` 一并验证。
 3. **汇报** —— 模型 ID、状态、耗时、返回内容、Token、单次花费、traceId，缺一不可。
 4. **可选核对** —— 想证明真的走了计费链路，再拉 `/api/call-logs/page?page=1&pageSize=5`
