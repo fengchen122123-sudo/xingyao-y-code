@@ -1,5 +1,12 @@
 <template>
-  <div id="rightbar" data-theme-region="right_panel" :class="{ collapsed: store.rightPanelCollapsed }" :style="panelStyle">
+  <div
+    id="rightbar"
+    data-theme-region="right_panel"
+    :class="{ collapsed: store.rightPanelCollapsed }"
+    :style="panelStyle"
+    @mouseenter="computerPanelHovered = true"
+    @mouseleave="computerPanelHovered = false"
+  >
     <div id="right-tabs">
       <button
         v-for="tab in tabs"
@@ -10,6 +17,16 @@
       >
         {{ tab.label }}
         <span v-if="tab.id === 'plan' && store.planData.items.length > 0" class="badge-dot"></span>
+        <span
+          v-if="tab.closable"
+          class="rtab-close"
+          data-test="computer-tab-close"
+          title="关闭操控面板"
+          aria-label="关闭操控面板"
+          @click.stop="dismissComputerPane()"
+        >
+          <AppIcon name="x" :size="11" :stroke-width="2.5" />
+        </span>
       </button>
     </div>
 
@@ -206,8 +223,10 @@ const baseTabs: Array<{ id: TabType; label: string }> = [
   { id: 'term', label: '终端' },
   { id: 'files', label: '文件' }
 ];
-const tabs = computed<Array<{ id: TabType; label: string }>>(() => (
-  store.computerRun.run_id ? [...baseTabs, { id: 'computer', label: '操控' }] : baseTabs
+const tabs = computed<Array<{ id: TabType; label: string; closable?: boolean }>>(() => (
+  store.computerRun.run_id
+    ? [...baseTabs, { id: 'computer', label: '操控', closable: store.computerRunTerminal }]
+    : baseTabs
 ));
 
 // run 开始时首次自动切到操控页签（设计 16.2）：每个 run 只开一次（记录到
@@ -221,6 +240,51 @@ function autoOpenComputerTabOnce() {
   activeTab.value = 'computer';
 }
 watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
+
+// ── 操控页签关闭（2026-09-10 设计）──
+// 手动关闭与终态自动关闭共用同一出口：清计时器 → 清空运行态 → 页签回退
+const COMPUTER_AUTO_DISMISS_MS = 60000;
+let computerDismissTimer: ReturnType<typeof setTimeout> | null = null;
+const computerPanelHovered = ref(false);
+
+function clearComputerDismissTimer() {
+  if (computerDismissTimer !== null) {
+    clearTimeout(computerDismissTimer);
+    computerDismissTimer = null;
+  }
+}
+
+function dismissComputerPane() {
+  clearComputerDismissTimer();
+  if (!store.computerRun.run_id) return;
+  store.clearComputerRun();
+  // 面板折叠时 activeTab 可能仍停在 computer，页签消失后必须回退
+  if (activeTab.value === 'computer') activeTab.value = 'plan';
+}
+
+// 终态起算 60 秒：到点若用户仍在看（停在操控页签且未折叠，或鼠标悬停在面板内）
+// 则顺延一个周期，否则关闭。「在看就不关」是唯一规则
+function scheduleComputerAutoDismiss() {
+  clearComputerDismissTimer();
+  if (!store.computerRun.run_id || !store.computerRunTerminal) return;
+  computerDismissTimer = setTimeout(() => {
+    computerDismissTimer = null;
+    const stillWatching = (activeTab.value === 'computer' && !store.rightPanelCollapsed)
+      || computerPanelHovered.value;
+    if (stillWatching) {
+      scheduleComputerAutoDismiss();
+      return;
+    }
+    dismissComputerPane();
+  }, COMPUTER_AUTO_DISMISS_MS);
+}
+
+// run_id / 状态变化都重排计时：新 run 会先清掉旧计时器
+watch(
+  () => [store.computerRun.run_id, store.computerRun.status],
+  () => scheduleComputerAutoDismiss(),
+  { immediate: true },
+);
 
 // ---------------- 内嵌终端 ----------------
 const termInput = ref('');
@@ -393,6 +457,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   window.removeEventListener('focus', onWindowFocus);
+  clearComputerDismissTimer();
 });
 </script>
 
@@ -443,6 +508,22 @@ onUnmounted(() => {
   position: absolute;
   top: 5px;
   right: 7px;
+}
+.rtab-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  margin-left: 5px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: 0.15s;
+}
+.rtab-close:hover {
+  background: var(--bg3);
+  color: var(--text);
 }
 .icon-spin {
   animation: rp-icon-spin 0.9s linear infinite;
