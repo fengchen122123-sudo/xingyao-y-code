@@ -177,6 +177,9 @@ const COMPUTER_BAR_STATUSES = [
   'provider_safety_required', 'stopping', 'failed',
 ];
 
+// run 终态（2026-09-10 设计）：页签关闭入口与自动关闭计时的共同判据
+const COMPUTER_TERMINAL_STATUSES = ['completed', 'stopped', 'failed'];
+
 // 内存轨迹上限（设计 16.2）：只保留最新 200 条
 const COMPUTER_TRACE_MAX = 200;
 
@@ -460,6 +463,9 @@ export const useAppStore = defineStore('app', {
     // 与动作起始毫秒（finished 事件缺 duration_ms 时计算耗时）
     _computerEventSeq: 0,
     _computerActionStartMs: {} as Record<number, number>,
+    // 已关闭 run 黑名单（不参与渲染）：清空运行态后拒绝该 run 的迟到事件与快照，
+    // 防止「操控」页签被旧事件复活
+    _computerClosedRunId: '',
 
     // 当前激活模型的思考能力与选择；未知模型保持隐藏，不在前端猜测能力。
     reasoning: {
@@ -679,6 +685,11 @@ export const useAppStore = defineStore('app', {
     // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示
     computerControlBarVisible(state): boolean {
       return COMPUTER_BAR_STATUSES.includes(state.computerRun.status);
+    },
+
+    // run 是否处于终态：驱动页签关闭入口与终态自动关闭计时
+    computerRunTerminal(state): boolean {
+      return COMPUTER_TERMINAL_STATUSES.includes(state.computerRun.status);
     },
 
     // 暂停/恢复按钮语义（设计 16.1）：starting/running 显示“暂停”，paused 显示“恢复”，
@@ -1883,6 +1894,9 @@ export const useAppStore = defineStore('app', {
       const runId = String(raw.run_id || '');
       const seq = Number(raw.event_seq) || 0;
       if (!runId) return;
+      // 已关闭 run 的迟到事件一律丢弃：清空后 Store 无 run，若无此门闩
+      // reducer 的「首个事件直接认领」分支会把旧事件当成新 run
+      if (runId === this._computerClosedRunId) return;
       const currentRunId = this.computerRun.run_id;
       const isNewRun = runId !== currentRunId && (
         currentRunId === ''
@@ -1978,6 +1992,18 @@ export const useAppStore = defineStore('app', {
       }
     },
 
+    // 关闭「操控」面板（用户点 × 或终态自动关闭共用）：
+    // 先把当前 run_id 记入黑名单，再清空运行态与内存轨迹
+    clearComputerRun() {
+      const runId = this.computerRun.run_id;
+      if (!runId) return;
+      this._computerClosedRunId = runId;
+      this.computerRun = emptyComputerRun();
+      this.computerTrace = [];
+      this._computerActionStartMs = {};
+      this._computerEventSeq = 0;
+    },
+
     // Bridge 快照校准（设计 16.4）：_js_queue 满时允许丢新事件，终态不能只依赖
     // 事件推送——控制操作返回值、窗口重新聚焦、切到操控页签都走这里复核。
     // 快照发现不同 run_id 时按新 run 重置轨迹与记账；同一 run 只合并已知字段，
@@ -1985,6 +2011,8 @@ export const useAppStore = defineStore('app', {
     _applyComputerSnapshot(raw: Record<string, unknown>) {
       const runId = String(raw.run_id || '');
       if (!runId) return;
+      // 已关闭 run 的快照不得复活运行态（新 run_id 不受影响）
+      if (runId === this._computerClosedRunId) return;
       if (runId !== this.computerRun.run_id) {
         this.computerRun = { ...emptyComputerRun(), run_id: runId };
         this.computerTrace = [];
