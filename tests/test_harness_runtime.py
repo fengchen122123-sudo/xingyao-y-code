@@ -139,9 +139,13 @@ def test_nonpersistent_turn_uses_no_database_journal(mocker):
         )
     )
 
-    assert [event.kind for event in events] == ["assistant_delta"] * 6 + [
-        "turn_finished"
-    ]
+    kinds = [event.kind for event in events]
+    # 只锁事件契约，不锁完整快照：指标类事件（如 step_metrics）会随生产实现
+    # 演进而追加，硬编码整个序列会把新事件误判成回归，故按语义分别断言。
+    assert kinds.count("assistant_delta") == 6
+    assert "step_metrics" in kinds
+    assert kinds[-1] == "turn_finished"
+    assert "turn_error" not in kinds
     assert manager.get_harness_turn("turn-ephemeral") is None
 
 
