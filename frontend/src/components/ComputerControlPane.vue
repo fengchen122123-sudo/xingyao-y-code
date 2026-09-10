@@ -17,7 +17,7 @@
           {{ store.computerControlPausable === 'pause' ? '暂停' : '恢复' }}
         </button>
         <button
-          v-if="store.computerRun.run_id"
+          v-if="store.computerRun.run_id && !store.computerRunTerminal"
           class="chip-btn danger"
           data-test="computer-stop"
           title="立即停止当前操控（快捷键 Ctrl+Alt+Esc）"
