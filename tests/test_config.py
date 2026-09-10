@@ -108,7 +108,7 @@ def test_default_deepseek_v4_models_use_explicit_thinking_contract(
         provider for provider in data["providers"]
         if provider["base_url"] == "https://api.deepseek.com"
     )
-    assert deepseek_provider["protocol"] == "responses"
+    assert deepseek_provider["protocol"] == "openai"
     assert deepseek_provider["preset_id"] == "deepseek"
     assert all(model["enable_thinking"] is True for model in deepseek_models)
     assert all(model["reasoning_effort"] == "max" for model in deepseek_models)
@@ -313,11 +313,11 @@ def test_add_preset_provider_uses_shared_catalog_metadata(tmp_path, monkeypatch)
     data = model_manager.load_config()
     provider = next(item for item in data["providers"] if item["id"] == pid)
     assert provider["preset_id"] == "deepseek"
-    assert provider["protocol"] == "responses"
+    assert provider["protocol"] == "openai"
     assert provider["api_key"] == "sk-deepseek"
     assert "sk-deepseek" not in cfg.read_text(encoding="utf-8")
-    assert provider["models"][0]["litellm_model"] == "openai/deepseek-v4-pro"
-    assert provider["models"][0]["supports_vision"] is False
+    assert provider["models"][0]["litellm_model"] == "openai/deepseek-flash"
+    assert provider["models"][0]["supports_vision"] is True
 
 
 def _preset_catalog():

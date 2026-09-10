@@ -110,9 +110,11 @@ def test_add_preset_provider_returns_refreshed_snapshot(tmp_path, monkeypatch):
         provider for provider in result["settings"]["providers"]
         if provider.get("preset_id") == "deepseek"
     )
-    assert deepseek["protocol"] == "responses"
+    assert deepseek["protocol"] == "openai"
     assert deepseek["has_api_key"] is True
-    assert deepseek["models"][0]["supports_vision"] is False
+    # deepseek-flash 已在预置目录登记为多模态模型，断言按名字定位以免受顺序影响
+    flash = next(m for m in deepseek["models"] if m["name"] == "deepseek-flash")
+    assert flash["supports_vision"] is True
 
 
 def test_add_and_update_model_persist_multimodal_flag(tmp_path, monkeypatch):
