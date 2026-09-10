@@ -137,7 +137,7 @@ Key 状态值：`enabled` / `disabled` / `deleted`（删除后列表不再返回
 
 ```json
 POST /api/playground/send
-{"model": "deepseek-v4.1-flash-expires-on-0910",
+{"model": "deepseek-v4.1-flash",
  "messages": [{"role": "user", "content": "只回复四个字：连通正常"}],
  "stream": false,
  "reasoning": false}
