@@ -614,7 +614,8 @@ class LanServer:
         self.port = self._server.socket.getsockname()[1]
         self._persist_port()
         self._thread = threading.Thread(
-            target=self._server.serve_forever,
+            target=self._serve_forever_quiet,
+            args=(self._server,),
             daemon=True,
             name="lan-remote-server",
         )
@@ -629,6 +630,23 @@ class LanServer:
             process_request=self._serve_http,
             max_size=70 * 1024 * 1024,  # 支持手机上传 ≤50MB 文件（base64 约 67MB）
         )
+
+    @staticmethod
+    def _serve_forever_quiet(server) -> None:
+        """守护线程入口：跑 serve_forever 并收口 Windows 上的关闭竞态。
+
+        websockets 的 shutdown() 直接 close 监听 socket：非 Windows 平台靠
+        shutdown_notifier 唤醒阻塞在 select() 上的循环，Windows 平台没有这条通路，
+        select() 会以 WSAENOTSOCK(10038) 抛错。该异常未被库内 accept 层的
+        except OSError 覆盖，会作为未处理线程异常外泄（日志噪音 / pytest 告警）。
+        它属于关闭路径的正常终止，此处静默收口；其余 OSError 原样抛出。
+        """
+        try:
+            server.serve_forever()
+        except OSError as exc:
+            if getattr(exc, "winerror", None) == 10038 or getattr(exc, "errno", None) == 10038:
+                return
+            raise
 
     def _load_persisted_port(self) -> int:
         """从 config.json 读取上次持久化的端口（无效/不存在返回 0=动态分配）。"""
