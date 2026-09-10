@@ -698,6 +698,85 @@ def test_split_download_rejects_sha256_mismatch():
     assert not os.path.exists(tmp_path)    # 临时拼接文件已清理
 
 
+class _ChunkedPartResp:
+    """模拟不带 Content-Length 的分卷响应（chunked 传输形态）。
+
+    与 _FakePartResp 的唯一差别：headers 里没有 Content-Length。下载器
+    这时既拿不到片长度、也没有 Release 元数据提供的总大小，进度分母
+    只能按「片数比例」混算。
+    """
+
+    def __init__(self, payload: bytes, content_type: str = "application/octet-stream"):
+        self.headers = {"Content-Type": content_type}
+        self._payload = payload
+        self._pos = 0
+
+    def read(self, n):
+        chunk = self._payload[self._pos : self._pos + n]
+        self._pos += len(chunk)
+        return chunk
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_split_download_survives_missing_content_length():
+    """分卷 + 无总大小元数据 + 响应不带 Content-Length 时，下载必须正常完成。
+
+    Gitee 公开 API 不返回附件 size（total_size_hint 恒为 0），进度分母平时
+    靠首片 Content-Length 兜底。本用例覆盖「连 Content-Length 也没有」的
+    chunked 形态：应退化为按片数比例混算进度，绝不能因进度回调抛异常
+    （NameError/作用域问题）而让整次更新失败。
+    """
+    from core.updater import UpdateDownloader
+    import hashlib
+    import threading
+
+    part1 = b"A" * (1024 * 1024 + 100)
+    part2 = b"B" * (1024 * 1024 + 50)
+    full = part1 + part2
+    good_sha = hashlib.sha256(full).hexdigest()
+
+    cache_dir = get_update_cache_dir()
+    dest_path = os.path.join(cache_dir, "Y-CODE-Setup-v4.4.4.exe")
+    tmp_path = os.path.join(cache_dir, "Y-CODE-Setup-v4.4.4.exe.downloading")
+    for p in (dest_path, tmp_path):
+        if os.path.exists(p):
+            os.remove(p)
+
+    responses = [_ChunkedPartResp(part1), _ChunkedPartResp(part2)]
+    progress_events = []
+    done = threading.Event()
+    result = {}
+
+    downloader = UpdateDownloader()
+    with patch("urllib.request.urlopen", side_effect=lambda req, timeout=None: responses.pop(0)):
+        started = downloader.start_download(
+            download_url="",
+            target_version="4.4.4",
+            on_progress=lambda d: progress_events.append(dict(d)),
+            on_complete=lambda p: (result.update(ok=p), done.set()),
+            on_error=lambda m: (result.update(err=m), done.set()),
+            part_urls=["https://gitee.com/p1", "https://gitee.com/p2"],
+            expected_sha256=good_sha,
+            total_size_hint=0,
+        )
+        assert started is True
+        assert done.wait(timeout=10)
+
+    assert "ok" in result and "err" not in result, result
+    with open(result["ok"], "rb") as f:
+        assert f.read() == full
+    # 没有 Content-Length 也要有按片数推进的进度，且收尾必须报 100%
+    assert progress_events
+    assert progress_events[-1]["percent"] == 100
+    assert progress_events[-1]["downloaded"] == len(full)
+    os.remove(result["ok"])
+
+
 def test_split_download_reports_part_progress():
     """分卷进度：part_index/part_count 上报正确，percent 按累计字节单调推进。"""
     from core.updater import UpdateDownloader
