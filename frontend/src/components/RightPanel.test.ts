@@ -148,3 +148,120 @@ it('手动切到操控页签时拉取快照校准 run 状态', async () => {
   expect(store.computerRun.pause_reason).toBe('user_pause');
   wrapper.unmount();
 });
+
+// ── 操控页签关闭（2026-09-10 设计） ──
+
+function goFilesTab(wrapper: ReturnType<typeof mount>) {
+  return wrapper.findAll('.rtab').find(t => t.text().trim() === '文件')!;
+}
+
+it('终态 60 秒且用户不在操控页签时自动关闭页签', async () => {
+  vi.useFakeTimers();
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+  // run 开始：自动切到操控页签
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
+  await nextTick();
+  // 用户切到「文件」页签
+  await goFilesTab(wrapper).trigger('click');
+  // run 进入终态
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'completed' });
+  await nextTick();
+  expect(computerTab(wrapper)).toBeTruthy();
+
+  vi.advanceTimersByTime(59999);
+  await nextTick();
+  expect(computerTab(wrapper)).toBeTruthy();
+
+  vi.advanceTimersByTime(1);
+  await nextTick();
+  expect(computerTab(wrapper)).toBeUndefined();
+  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件']);
+
+  wrapper.unmount();
+  vi.useRealTimers();
+});
+
+it('用户停留在操控页签时到点顺延，不被自动关闭', async () => {
+  vi.useFakeTimers();
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
+  await nextTick();
+  expect(computerTab(wrapper).classes()).toContain('active');
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'stopped' });
+  await nextTick();
+
+  vi.advanceTimersByTime(60000);
+  await nextTick();
+  expect(computerTab(wrapper)).toBeTruthy();
+  vi.advanceTimersByTime(60000);
+  await nextTick();
+  expect(computerTab(wrapper)).toBeTruthy();
+
+  wrapper.unmount();
+  vi.useRealTimers();
+});
+
+it('鼠标悬停在右面板内时到点顺延，移开后下一个周期关闭', async () => {
+  vi.useFakeTimers();
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
+  await nextTick();
+  await goFilesTab(wrapper).trigger('click');
+  await wrapper.find('#rightbar').trigger('mouseenter');
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'failed' });
+  await nextTick();
+
+  vi.advanceTimersByTime(60000);
+  await nextTick();
+  expect(computerTab(wrapper)).toBeTruthy();
+
+  await wrapper.find('#rightbar').trigger('mouseleave');
+  vi.advanceTimersByTime(60000);
+  await nextTick();
+  expect(computerTab(wrapper)).toBeUndefined();
+
+  wrapper.unmount();
+  vi.useRealTimers();
+});
+
+it('点击页签 × 立即关闭操控面板并切回计划页签', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
+  await nextTick();
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'completed' });
+  await nextTick();
+
+  const closeEl = wrapper.find('[data-test="computer-tab-close"]');
+  expect(closeEl.exists()).toBe(true);
+  await closeEl.trigger('click');
+  await nextTick();
+
+  expect(computerTab(wrapper)).toBeUndefined();
+  expect(wrapper.findAll('.rtab')[0].classes()).toContain('active');
+  expect(store.computerRun.run_id).toBe('');
+  wrapper.unmount();
+});
+
+it('运行中不渲染关闭入口，关闭后新 run 重新开页签', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
+  await nextTick();
+  expect(wrapper.find('[data-test="computer-tab-close"]').exists()).toBe(false);
+
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'stopped' });
+  await nextTick();
+  await wrapper.find('[data-test="computer-tab-close"]').trigger('click');
+  await nextTick();
+  expect(computerTab(wrapper)).toBeUndefined();
+
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'starting' });
+  await nextTick();
+  expect(computerTab(wrapper)).toBeTruthy();
+  expect(computerTab(wrapper).classes()).toContain('active');
+  wrapper.unmount();
+});
