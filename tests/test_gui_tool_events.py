@@ -597,6 +597,89 @@ def test_bridge_forwards_round_started_event(monkeypatch):
     assert any(kind == "round_started" and data.get("round") == 2 for kind, data in emitted)
 
 
+def _bare_bridge_with_snapshots(session_name, snapshots):
+    """构造只够驱动 _consume_turn_events 的桥接裸实例（与 consume_bridge_events 同套路），
+    区别是额外注入进行中回合快照，供断言按轮清零行为。"""
+    bridge = ApiBridge.__new__(ApiBridge)
+    bridge._cancel_events = {session_name: threading.Event()}
+    bridge._active_turns = {}
+    bridge._delta_buffers = {}
+    bridge._delta_kinds = {}
+    bridge._delta_lock = threading.Lock()
+    bridge._delta_last_flush = 0.0
+    bridge._delta_flusher = None
+    bridge._active_turn_snapshots = dict(snapshots)
+    bridge._active_turn_lock = threading.Lock()
+    return bridge
+
+
+def _consume_events_with_bridge(bridge, monkeypatch, events, session_name="session"):
+    """在给定裸实例上消费事件，返回 (kind, data) 列表。"""
+    monkeypatch.setattr(
+        "core.llm.chat_with_model_events",
+        lambda *args, **kwargs: iter(events),
+    )
+    emitted = []
+    bridge.emit_event = lambda kind, data: emitted.append((kind, data))
+    bridge._consume_turn_events(
+        [], "model", "key", None, session_name, "turn-gui-tools"
+    )
+    return emitted
+
+
+def test_round_started_clears_turn_snapshot_streaming_thinking_and_tool_calls(monkeypatch):
+    """round_started 必须按轮清零快照的流式/思考文本与工具列表。
+
+    快照若只累加不清零，中途接入或切换运行中会话时整回合文本会被灌进最后一个气泡。
+    """
+    bridge = _bare_bridge_with_snapshots("session", {
+        "session": {
+            "session_name": "session",
+            "thinking_text": "第一轮思考",
+            "streaming_text": "第一轮正文",
+            "tool_calls": [{"id": "cmd-1", "name": "execute_command"}],
+        },
+    })
+
+    _consume_events_with_bridge(
+        bridge, monkeypatch, make_events([("round_started", {"round": 2})])
+    )
+
+    snapshot = bridge._active_turn_snapshots["session"]
+    assert snapshot["streaming_text"] == ""
+    assert snapshot["thinking_text"] == ""
+    assert snapshot["tool_calls"] == []
+
+
+def test_round_started_clears_only_target_session_snapshot_and_still_forwards(monkeypatch):
+    """清零只作用于本会话：其他会话快照保持原值，且 round_started 仍照常透传。"""
+    bridge = _bare_bridge_with_snapshots("session", {
+        "session": {
+            "session_name": "session",
+            "thinking_text": "旧思考",
+            "streaming_text": "旧正文",
+            "tool_calls": [{"id": "cmd-1"}],
+        },
+        "other-session": {
+            "session_name": "other-session",
+            "thinking_text": "别人的思考",
+            "streaming_text": "别人的正文",
+            "tool_calls": [{"id": "cmd-2"}],
+        },
+    })
+
+    emitted = _consume_events_with_bridge(
+        bridge, monkeypatch, make_events([("round_started", {"round": 2})])
+    )
+
+    assert [kind for kind, _ in emitted] == ["round_started"]
+    assert emitted[0][1] == {"round": 2, "session_name": "session"}
+    other = bridge._active_turn_snapshots["other-session"]
+    assert other["streaming_text"] == "别人的正文"
+    assert other["thinking_text"] == "别人的思考"
+    assert other["tool_calls"] == [{"id": "cmd-2"}]
+
+
 class _AliveThread:
     """模拟存活的回合线程（is_alive 恒真）。"""
 
