@@ -14,16 +14,44 @@ def test_transport_prefix_case_and_glm_alias_resolve_to_same_model_capability():
     assert normalize_reasoning_model_name("qwen38-flash") == "qwen3.8-flash"
 
 
+def test_deepseek_prefixed_names_resolve_to_official_thinking_capability():
+    """任意厂商的 deepseek 前缀模型（不区分大小写）都按官方思考模式文档适配。
+
+    依据 https://api-docs.deepseek.com/zh-cn/guides/thinking_mode：
+    thinking.type 控制开关、reasoning_effort 控制强度，档位 默认/关闭/低/高/最高。
+    """
+    for name in (
+        "deepseek-flash",
+        "openai/DEEPSEEK-Flash",
+        "DeepSeek-v9-future-model",
+        "anthropic/deepseek-r3-agent",
+        "https://gateway.example/v1/deepseek-custom",
+    ):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == ("default", "off", "low", "high", "max"), name
+        assert capability.request_strategy == "thinking_object_effort", name
+
+
+def test_non_deepseek_unknown_models_stay_hidden():
+    """deepseek 前缀规则不得外溢：其他未登记模型仍按未适配处理。"""
+    for name in (
+        "some-future-model",
+        "my-deepseek-clone",
+        "qwen3.9-max",
+    ):
+        assert get_reasoning_capability(name).kind == "hidden", name
+
+
 def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
     """模型切换不能继续显示旧的通用 low/high/max 档位。"""
     expected = {
         "k3": ("default", "low", "high", "max"),
         "k3-256k": ("default", "low", "high", "max"),
         "kimi-k3": ("default", "low", "high", "max"),
-        "deepseek-v4-flash": ("default", "off", "low", "high", "max"),
+        "deepseek-flash": ("default", "off", "low", "high", "max"),
         "deepseek-v4-flash-0731": ("default", "off", "low", "high", "max"),
-        "deepseek-v4-flash-vision-exp": ("default", "off", "low", "high", "max"),
-        "deepseek-v4.1-flash-expires-on-0910": ("default", "off", "low", "high", "max"),
+        "deepseek-v4.1-flash": ("default", "off", "low", "high", "max"),
         "deepseek-v4-pro": ("default", "off", "high", "max"),
         "deepseek-v4-pro-0813": ("default", "off", "low", "high", "max"),
         "qwen3.8-max": ("default", "off", "low", "medium", "xhigh"),

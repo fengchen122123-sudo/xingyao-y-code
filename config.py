@@ -198,7 +198,7 @@ if not os.path.exists(_CONFIG_FILE):
                             "name": "深度求索",
                             "base_url": "https://api.deepseek.com",
                             "api_key": "",
-                            "protocol": "responses",
+                            "protocol": "openai",
                             "preset_id": "deepseek",
                             "models": [
                                 {
@@ -209,11 +209,11 @@ if not os.path.exists(_CONFIG_FILE):
                                     "supports_vision": False
                                 },
                                 {
-                                    "id": "ds-v4-flash",
-                                    "name": "deepseek-v4-flash",
-                                    "litellm_model": "openai/deepseek-v4-flash",
+                                    "id": "ds-flash",
+                                    "name": "deepseek-flash",
+                                    "litellm_model": "openai/deepseek-flash",
                                     "context_window": 1000000,
-                                    "supports_vision": False
+                                    "supports_vision": True
                                 }
                             ]
                         }

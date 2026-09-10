@@ -62,7 +62,7 @@
       "name": "深度求索",
       "base_url": "https://api.deepseek.com",
       "api_key": "sk-your-deepseek-api-key-here",
-      "protocol": "responses",
+      "protocol": "openai",
       "preset_id": "deepseek",
       "models": [
         {
@@ -76,21 +76,11 @@
           "reasoning_effort": "max"
         },
         {
-          "id": "deepseek_v4_flash",
-          "name": "deepseek-v4-flash",
-          "litellm_model": "openai/deepseek-v4-flash",
+          "id": "deepseek_flash",
+          "name": "deepseek-flash",
+          "litellm_model": "openai/deepseek-flash",
           "context_window": 1000000,
           "supports_vision": false,
-          "max_tokens": 8192,
-          "enable_thinking": true,
-          "reasoning_effort": "max"
-        },
-        {
-          "id": "deepseek_v4_flash_vision_exp",
-          "name": "deepseek-v4-flash-vision-exp",
-          "litellm_model": "openai/deepseek-v4-flash-vision-exp",
-          "context_window": 1000000,
-          "supports_vision": true,
           "max_tokens": 8192,
           "enable_thinking": true,
           "reasoning_effort": "max"

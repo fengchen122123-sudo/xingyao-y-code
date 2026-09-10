@@ -1,4 +1,5 @@
 from core.model_catalog import API_PROTOCOLS, get_preset_providers, litellm_model_name
+from core.reasoning_capabilities import get_reasoning_capability
 
 
 def test_catalog_exposes_all_real_api_protocols():
@@ -14,15 +15,12 @@ def test_catalog_preserves_cli_model_metadata():
     deepseek = next(item for item in providers if item["id"] == "deepseek")
 
     assert deepseek["name"] == "深度求索"
-    assert deepseek["protocol"] == "responses"
+    assert deepseek["protocol"] == "openai"
     assert deepseek["base_url"] == "https://api.deepseek.com"
     assert deepseek["models"] == [
+        {"name": "deepseek-flash", "context_window": 1000000, "supports_vision": True,
+         "supports_function_calling": True, "max_tokens": 384000},
         {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
-        {"name": "deepseek-v4-flash", "context_window": 1000000, "supports_vision": False},
-        {"name": "deepseek-v4-flash-vision-exp", "context_window": 1000000, "supports_vision": True,
-         "supports_function_calling": True, "computer_protocol": "generic"},
-        {"name": "deepseek-v4.1-flash-expires-on-0910", "context_window": 1000000, "supports_vision": True,
-         "supports_function_calling": True},
     ]
 
 
@@ -57,7 +55,6 @@ def test_confirmed_preset_models_carry_literal_computer_metadata():
         if model.get("computer_protocol") == "generic"
     }
     assert generic == {
-        ("deepseek", "deepseek-v4-flash-vision-exp"),
         ("kimi-coding-anthropic", "k3"),
         ("kimi-coding-anthropic", "k3-256k"),
         ("kimi-coding-openai", "k3"),
@@ -92,15 +89,39 @@ def test_token_rhythm_preset_contains_qwen38_flash():
     assert model["supports_function_calling"] is True
 
 
-def test_token_rhythm_preset_contains_deepseek_v4_1_flash_expires_on_0910():
+def test_token_rhythm_preset_contains_deepseek_flash():
     providers = get_preset_providers()
     token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
     model = next(
         m
         for m in token_rhythm["models"]
-        if m["name"] == "deepseek-v4.1-flash-expires-on-0910"
+        if m["name"] == "deepseek-flash"
     )
 
     assert model["context_window"] == 1000000
+    assert model["max_tokens"] == 384000
     assert model["supports_vision"] is True
     assert model["supports_function_calling"] is True
+
+
+def test_preset_models_all_have_confirmed_reasoning_capability():
+    """预置模型必须登记思考能力（刻意隐藏档位的实验模型除外）。
+
+    目录新增模型漏配思考能力时，请求侧已按默认档静默回落、不报错；
+    该断言用于在添加模型时主动提醒补登记，而不是放任遗漏。
+    """
+    confirmed_hidden = {
+        "ark-code-latest",
+        "doubao-seed-evolving",
+        "step-explore",
+    }
+    unregistered = sorted(
+        {
+            model["name"]
+            for provider in get_preset_providers()
+            for model in provider["models"]
+            if get_reasoning_capability(model["name"]).kind == "hidden"
+        }
+        - confirmed_hidden
+    )
+    assert unregistered == []
