@@ -112,7 +112,7 @@ def load_config() -> dict:
                         "name": "深度求索",
                         "base_url": "https://api.deepseek.com",
                         "api_key": "",
-                        "protocol": "responses",
+                        "protocol": "openai",
                         "preset_id": "deepseek",
                         "models": [
                             {
@@ -125,11 +125,11 @@ def load_config() -> dict:
                                 "reasoning_effort": "max"
                             },
                             {
-                                "id": "ds-v4-flash",
-                                "name": "deepseek-v4-flash",
-                                "litellm_model": "openai/deepseek-v4-flash",
+                                "id": "ds-flash",
+                                "name": "deepseek-flash",
+                                "litellm_model": "openai/deepseek-flash",
                                 "context_window": 1000000,
-                                "supports_vision": False,
+                                "supports_vision": True,
                                 "enable_thinking": True,
                                 "reasoning_effort": "max"
                             }

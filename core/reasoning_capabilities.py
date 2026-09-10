@@ -40,10 +40,10 @@ _register(
 )
 _register(
     (
+        "deepseek-flash",
         "deepseek-v4-flash",
         "deepseek-v4-flash-0731",
-        "deepseek-v4-flash-vision-exp",
-        "deepseek-v4.1-flash-expires-on-0910",
+        "deepseek-v4.1-flash",
     ),
     ReasoningCapability(
         "effort",
@@ -184,6 +184,22 @@ _register(
 )
 
 
+# DeepSeek 官方思考模式（https://api-docs.deepseek.com/zh-cn/guides/thinking_mode）：
+# thinking.type 控制开关，reasoning_effort 控制强度（low/high/max），默认开启、
+# effort 默认 high。任何厂商中以 deepseek 开头（不区分大小写）的模型统一按此
+# 适配，无需逐个登记；能力表中的显式登记仅用于别名折叠等特例。
+_DEEPSEEK_PREFIX_CAPABILITY = ReasoningCapability(
+    "effort", ("default", "off", "low", "high", "max"), "thinking_object_effort"
+)
+
+
+def _model_leaf_name(normalized: str) -> str:
+    """取传输前缀或网关 URL 之后的裸模型名。"""
+    scheme, separator, suffix = normalized.partition("://")
+    name = suffix if separator else normalized
+    return name.split("/")[-1]
+
+
 def normalize_reasoning_model_name(model_name: str) -> str:
     """移除传输协议前缀并折叠已确认的同模型别名。"""
     normalized = str(model_name or "").strip().lower()
@@ -198,10 +214,13 @@ def normalize_reasoning_model_name(model_name: str) -> str:
 
 
 def get_reasoning_capability(model_name: str) -> ReasoningCapability:
-    return REASONING_CAPABILITIES.get(
-        normalize_reasoning_model_name(model_name),
-        HIDDEN_REASONING_CAPABILITY,
-    )
+    normalized = normalize_reasoning_model_name(model_name)
+    registered = REASONING_CAPABILITIES.get(normalized)
+    if registered is not None:
+        return registered
+    if _model_leaf_name(normalized).startswith("deepseek"):
+        return _DEEPSEEK_PREFIX_CAPABILITY
+    return HIDDEN_REASONING_CAPABILITY
 
 
 def build_reasoning_snapshot(model: dict | None, choice: str = "default") -> dict:

@@ -1977,9 +1977,10 @@ def _responses_stream_as_chat_chunks(events):
 def _normalize_responses_event_type(event_type) -> str:
     """Responses 事件 type 统一归一化为 'response.*' 字符串。
 
-    原生 OpenAI 流事件的 type 是裸字符串；而 litellm 对无原生 Responses API
-    的 provider（DeepSeek 等 chat-only 模型）走 chat→responses 桥接，合成事件
-    的 type 直接填 ResponsesAPIStreamEvents 枚举成员，str() 得到的是成员名
+    上游原生流事件的 type 是裸字符串；而 litellm 在需要自己合成事件流的路径上
+    （如 fake_stream：模型未登记原生流式能力时，改发非流式请求再由
+    MockResponsesAPIStreamingIterator 合成），合成事件的 type 直接填
+    ResponsesAPIStreamEvents 枚举成员，str() 得到的是成员名
     （如 'ResponsesAPIStreamEvents.RESPONSE_COMPLETED'）而非事件值，必须用
     .value 还原，否则映射器全部失配。
     """
@@ -1995,6 +1996,10 @@ def _responses_events_as_chat_chunks(events):
     """将 Responses SSE 事件严格映射成现有工具循环消费的 chat chunks。"""
     saw_tool_calls = False
     response_id = ""
+    # 已由 output_item.added 产出过的 function_call call_id：真流式路径
+    # completed.output[] 会再次携带同一调用，用于去重（fake_stream 非流式合成
+    # 路径相反，没有 added/delta 事件，依赖 completed 兜底产出）。
+    emitted_call_ids = set()
     ignored = {
         "response.in_progress",
         "response.content_part.added",
@@ -2033,6 +2038,7 @@ def _responses_events_as_chat_chunks(events):
             name = _obj_value(item, "name")
             if not call_id or not name:
                 raise RuntimeError("Responses function_call 缺少 call_id 或 name")
+            emitted_call_ids.add(str(call_id))
             tool_call = SimpleNamespace(
                 index=output_index,
                 id=str(call_id),
@@ -2066,14 +2072,39 @@ def _responses_events_as_chat_chunks(events):
             response_id = _merge_stream_response_id(
                 response_id, _obj_value(response, "id", "")
             )
-            # 非流式桥接可能只在 completed 的 output[] 里给出 computer_call
+            # fake_stream 合成路径（litellm 认为模型无原生流式能力时改发非流式
+            # 请求再合成事件，如 openai/deepseek-flash）只在 completed 的 output[]
+            # 里给出完整工具调用，没有 added/delta 事件，必须在此兜底提取；
+            # 真流式路径 output[] 与 added 事件重复，按 call_id 去重。
             for output_item in (_obj_value(response, "output", None) or ()):
-                if _obj_value(output_item, "type") == "computer_call":
+                item_type = _obj_value(output_item, "type")
+                if item_type == "computer_call":
                     saw_tool_calls = True
                     yield _chat_chunk(computer_call={
                         "response_id": response_id,
                         "item": _plain_value(output_item),
                     })
+                elif item_type == "function_call":
+                    call_id = str(
+                        _obj_value(output_item, "call_id")
+                        or _obj_value(output_item, "id")
+                        or ""
+                    )
+                    if call_id and call_id in emitted_call_ids:
+                        continue
+                    name = _obj_value(output_item, "name")
+                    if not call_id or not name:
+                        raise RuntimeError("Responses function_call 缺少 call_id 或 name")
+                    emitted_call_ids.add(call_id)
+                    saw_tool_calls = True
+                    yield _chat_chunk(tool_calls=[SimpleNamespace(
+                        index=len(emitted_call_ids) - 1,
+                        id=call_id,
+                        function=SimpleNamespace(
+                            name=str(name),
+                            arguments=str(_obj_value(output_item, "arguments") or ""),
+                        ),
+                    )])
             yield _chat_chunk(
                 finish_reason="tool_calls" if saw_tool_calls else "stop",
                 usage=_responses_usage_as_chat_usage(response),
@@ -3674,8 +3705,8 @@ def _apply_reasoning_choice(result, model_name, model_cfg, *, anthropic_route=Fa
         return capability
 
     if capability.kind == "hidden":
-        if has_explicit_choice:
-            raise ValueError(f"模型 {model_name!r} 没有已确认的思考参数能力")
+        # 未登记能力表的模型（厂商改名、新增未适配模型）：一律静默回落
+        # 默认档，不注入任何思考参数，也不因残留的历史思考选择打断请求。
         return capability
     if capability.kind == "fixed":
         if has_explicit_choice:
@@ -3820,7 +3851,9 @@ def _builtin_default_max_tokens(model_name, api_base=""):
     base = str(api_base or "").lower()
     if "kimi-k2.7-code" in model and "tokenrhythm.studio" in base:
         return 16000
-    if _is_deepseek_family(model_name, api_base):
+    if model.startswith("deepseek") or _is_deepseek_family(model_name, api_base):
+        # DeepSeek 官方最大输出 384K；不限定官方路由，任意厂商挂载的
+        # deepseek 前缀模型（不区分大小写）统一按此给足输出预算。
         return 384000
     if _is_glm_family(model_name, api_base):
         if "glm-5.3" in model:
