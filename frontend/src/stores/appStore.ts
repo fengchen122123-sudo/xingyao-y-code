@@ -876,8 +876,13 @@ export const useAppStore = defineStore('app', {
       }
 
       // 2. 助手卡片还原/补齐
-      let assistantMsg = msgs[msgs.length - 1];
-      const needsNewAssistant = !assistantMsg || assistantMsg.role !== 'assistant';
+      // 快照是「整回合」粒度：只有末尾气泡确实是当前正在执行的轮次（running）时才允许
+      // 就地补齐；末尾是已完成气泡 / 非 assistant / 无消息时必须新建 running 气泡，
+      // 否则整回合文本会被灌进已完成的旧气泡，后续 token_delta 继续往同一气泡堆。
+      const lastMsg = msgs[msgs.length - 1];
+      const runningMsg: ChatMessage | null =
+        lastMsg && lastMsg.role === 'assistant' && lastMsg.execution_state === 'running' ? lastMsg : null;
+      let assistantMsg: ChatMessage;
       const streamingText = String(snap.streaming_text || '');
       const thinkingText = String(snap.thinking_text || '');
       const toolCalls = Array.isArray(snap.tool_calls)
@@ -897,7 +902,7 @@ export const useAppStore = defineStore('app', {
           }))
         : [];
 
-      if (needsNewAssistant) {
+      if (!runningMsg) {
         assistantMsg = {
           role: 'assistant',
           content: streamingText,
@@ -908,6 +913,7 @@ export const useAppStore = defineStore('app', {
         };
         msgs.push(assistantMsg);
       } else {
+        assistantMsg = runningMsg;
         assistantMsg.execution_state = 'running';
         if (streamingText && (!assistantMsg.content || streamingText.length > assistantMsg.content.length)) {
           assistantMsg.content = streamingText;
@@ -2918,16 +2924,18 @@ export const useAppStore = defineStore('app', {
       if (type === 'round_started') {
         // 每个 LLM 轮次一条 assistant 消息：与历史重放的分段结构对齐（分段思考）。
         // 若当前 assistant 气泡还是空的（回合第一轮），幂等跳过。
+        // 轮次边界一律清零流式累积变量：即使尾部混入 error/notice 等非 assistant 消息，
+        // 新气泡也不能继承上一轮正文（否则整回合正文会被塞进同一个气泡）。
+        this.currentStreamingText = '';
+        this.currentThinkingText = '';
+        this.streamingSpeed = 0;
+        speedTracker.reset();
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant' &&
             ((last.reasoning_content && last.reasoning_content.trim()) ||
              (last.content && last.content.trim()) ||
              (last.tool_calls && last.tool_calls.length))) {
           last.execution_state = 'completed';
-          this.currentStreamingText = '';
-          this.currentThinkingText = '';
-          this.streamingSpeed = 0;
-          speedTracker.reset();
           this.messages.push({
             role: 'assistant',
             content: '',
