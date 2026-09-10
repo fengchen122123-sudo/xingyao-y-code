@@ -4708,6 +4708,15 @@ class ApiBridge:
                 # 轮次边界透传：前端据此把每个 LLM 轮次拆成独立消息块（分段思考）
                 # emit_event 内部会先 flush 累积的 delta，顺序天然正确
                 self.emit_event("round_started", {"round": data.get("round"), "session_name": session_name})
+                # 快照必须按轮清零：前端是"一轮一条 assistant 消息"的粒度，
+                # 否则中途接入/切换运行中会话会把整回合文本灌进最后一个气泡（输出粘成一块）。
+                # 只在锁内改快照，绝不在持锁时触碰 JS 桥。
+                with self._active_turn_lock:
+                    snap = self._active_turn_snapshots.get(session_name)
+                    if snap is not None:
+                        snap["streaming_text"] = ""
+                        snap["thinking_text"] = ""
+                        snap["tool_calls"] = []
             elif kind == "thinking_delta":
                 self._emit_delta("thinking_delta", str(data.get("text", "")), session_name=session_name)
             elif kind in ("assistant_delta", "token_delta", "answer_delta"):

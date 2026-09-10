@@ -227,4 +227,137 @@ describe('Active turn snapshot restore and streaming continuation', () => {
     expect(last.execution_state).toBe('error');
     expect(last.error_note).toBe('APIError: OpenAIException - 余额不足');
   });
+
+  it('切回运行中会话时，快照文本不得覆盖末尾已完成气泡', async () => {
+    const store = useAppStore();
+    const fakeApi = {
+      switch_session: async (sessionName: string) => ({
+        ok: true,
+        session_name: sessionName,
+        messages: [
+          { role: 'user', content: '第一问' },
+          { role: 'assistant', content: '轮1', execution_state: 'completed' },
+          { role: 'assistant', content: '', reasoning_content: '', tool_calls: [], execution_state: 'running' },
+        ],
+        workdir: 'GLOBAL',
+        is_global: true,
+        active_turn_snapshot: {
+          session_name: sessionName,
+          user_text: '第一问',
+          display_text: '第一问',
+          started_at_ms: 1700000009000,
+          thinking_text: '',
+          streaming_text: '轮2',
+          tool_calls: [
+            { id: 'call_2', name: 'read_file', label: '读取代码', started_at_ms: 1700000009500 },
+          ],
+        },
+      }),
+      get_file_tree: async () => [],
+    };
+    (window as any).pywebview = { api: fakeApi };
+
+    await store.switchSession('session_snapshot_running');
+
+    // 已完成的轮1气泡必须原样保留
+    expect(store.messages[1].role).toBe('assistant');
+    expect(store.messages[1].content).toBe('轮1');
+    // 气泡数组里不得出现「轮1轮2」这类整回合拼接
+    expect(store.messages.some(m => (m.content || '').includes('轮1轮2'))).toBe(false);
+
+    // 快照文本只落在运行中气泡上
+    const running = store.messages.at(-1)!;
+    expect(running.role).toBe('assistant');
+    expect(running.execution_state).toBe('running');
+    expect(running.content).toBe('轮2');
+    expect(running.tool_calls).toHaveLength(1);
+    expect(running.tool_calls![0].id).toBe('call_2');
+    expect(store.currentStreamingText).toBe('轮2');
+
+    // 后续 token_delta 继续写进运行中气泡，不会回填到轮1
+    store.handleBridgeEvent(event('token_delta', {
+      session_name: 'session_snapshot_running',
+      text: '续写',
+    }));
+    expect(store.messages[1].content).toBe('轮1');
+    expect(store.messages.at(-1)!.content).toBe('轮2续写');
+  });
+
+  it('轮次边界一律清零：尾部混入非 assistant 消息时新气泡不继承上一轮正文', () => {
+    const store = useAppStore();
+    store.currentSessionName = 'session_round_boundary';
+    store.messages = [
+      { role: 'user', content: '第一问' },
+      { role: 'assistant', content: '轮1正文', execution_state: 'completed' },
+    ];
+    // 上一轮残留的流式累积文本（真实场景里由快照恢复/流式吐字留下）
+    store.currentStreamingText = '轮1正文';
+    store.currentThinkingText = '轮1思考';
+    // 轮次之间尾部混入非 assistant 消息：末尾不再是 assistant 气泡
+    store.messages.push({ role: 'error', content: 'boom' });
+
+    store.handleBridgeEvent(event('round_started', {
+      session_name: 'session_round_boundary',
+    }));
+    expect(store.currentStreamingText).toBe('');
+    expect(store.currentThinkingText).toBe('');
+
+    store.handleBridgeEvent(event('token_delta', {
+      session_name: 'session_round_boundary',
+      text: '轮2',
+    }));
+
+    const lastAssistant = store.messages.filter(m => m.role === 'assistant').at(-1)!;
+    expect(lastAssistant.content).toBe('轮2');
+    expect(store.messages[1].content).toBe('轮1正文');
+  });
+
+  it('末尾是已完成气泡时，整回合快照必须新建 running 气泡承载', async () => {
+    const store = useAppStore();
+    const fakeApi = {
+      switch_session: async (sessionName: string) => ({
+        ok: true,
+        session_name: sessionName,
+        // 库里只有上一轮的已完成气泡（当前进行中轮次还没有本地气泡）
+        messages: [
+          { role: 'user', content: '第一问' },
+          { role: 'assistant', content: '轮1', execution_state: 'completed' },
+        ],
+        workdir: 'GLOBAL',
+        is_global: true,
+        active_turn_snapshot: {
+          session_name: sessionName,
+          user_text: '第一问',
+          display_text: '第一问',
+          started_at_ms: 1700000011000,
+          thinking_text: '整回合思考',
+          streaming_text: '轮1轮2整回合文本',
+          tool_calls: [{ id: 'call_3', name: 'read_file', label: '读取代码', started_at_ms: 1700000011500 }],
+        },
+      }),
+      get_file_tree: async () => [],
+    };
+    (window as any).pywebview = { api: fakeApi };
+
+    await store.switchSession('session_snapshot_completed_tail');
+
+    // 已完成的轮1气泡绝不能被整回合快照覆盖
+    expect(store.messages[1].content).toBe('轮1');
+    // 快照内容落在新建的 running 气泡上
+    expect(store.messages).toHaveLength(3);
+    const running = store.messages.at(-1)!;
+    expect(running.role).toBe('assistant');
+    expect(running.execution_state).toBe('running');
+    expect(running.content).toBe('轮1轮2整回合文本');
+    expect(running.reasoning_content).toBe('整回合思考');
+    expect(running.tool_calls).toHaveLength(1);
+
+    // 后续流式吐字继续写进新建气泡，不回填到已完成气泡
+    store.handleBridgeEvent(event('token_delta', {
+      session_name: 'session_snapshot_completed_tail',
+      text: '追加',
+    }));
+    expect(store.messages[1].content).toBe('轮1');
+    expect(store.messages.at(-1)!.content).toBe('轮1轮2整回合文本追加');
+  });
 });
