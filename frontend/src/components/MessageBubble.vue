@@ -248,6 +248,17 @@ const mediaCtx = computed(() =>
   props.msg.media && props.msg.media.length ? { items: props.msg.media } : undefined
 );
 
+// 媒体清单指纹。清单是回合收尾（message_final）才补挂到消息上的，而流式期间图片
+// 语法已经先按「无清单」退化渲染成文件链接并写进 blockCache；缓存 key 只含「起始
+// 媒体序号 + 块源码」，清单后补时 key 不变，旧 HTML 会被直接命中，图片永远不显示
+// （切走再回来才恢复）。因此指纹一变必须整体失效已完成块缓存。
+const mediaSignature = computed(() =>
+  (props.msg.media || [])
+    .map((m) => `${m.kind}:${m.url || m.error_code || m.digest || ''}`)
+    .join('|')
+);
+let lastMediaSig: string | null = null;
+
 // 块级增量渲染：已完成块的 HTML 按「起始媒体序号 + 块源码」缓存，
 // 流式期间只重渲染尾部块。缓存是组件级的，随组件销毁回收，不跨消息串味。
 const blockCache = new Map<string, { html: string; mediaCount: number }>();
@@ -258,6 +269,11 @@ interface MdBlock {
 }
 
 const mdBlocks = computed<MdBlock[]>(() => {
+  // media 清单指纹变化即整体失效已完成块缓存（原因见 mediaSignature 注释）
+  if (mediaSignature.value !== lastMediaSig) {
+    lastMediaSig = mediaSignature.value;
+    blockCache.clear();
+  }
   const src = props.msg.content || '';
   if (!src.trim()) return [];
   const { blocks, tail } = splitStableBlocks(src);

@@ -3,6 +3,7 @@ import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import MessageBubble from './MessageBubble.vue';
 import { useAppStore, type ChatMessage } from '../stores/appStore';
+import type { MediaItem } from '../types/media';
 
 function assistantMessage(overrides: Partial<ChatMessage> = {}): ChatMessage {
   return {
@@ -63,5 +64,35 @@ describe('MessageBubble 块级渲染', () => {
     });
     await flushPromises();
     expect(wrapper.find('.md-body').exists()).toBe(false);
+  });
+
+  it('回合收尾补挂媒体清单时，已完成块里的图片要重渲染为 <img>', async () => {
+    // 流式期间清单还没下发（它在 message_final 才挂上），此时图片语法只能
+    // 退化成文件链接，并被写进已完成块的渲染缓存
+    const msg = assistantMessage({
+      content: '![图](D:/tmp/shot.png)\n\n第一段\n\n第二段',
+      execution_state: 'running',
+    });
+    const wrapper = mount(MessageBubble, { props: { msg } });
+    await flushPromises();
+    expect(wrapper.findAll('.md-block')).toHaveLength(2); // 图片段落在稳定块里
+    expect(wrapper.find('img.md-img').exists()).toBe(false);
+    expect(wrapper.html()).toContain('data-file-link="D:/tmp/shot.png"');
+
+    // 回合收尾补挂清单：缓存必须失效，图片要真正渲染出来
+    const media: MediaItem[] = [
+      {
+        ordinal: 0,
+        kind: 'image',
+        url: 'http://127.0.0.1:65238/m/abc.png?t=tok',
+        source_name: 'shot.png',
+      },
+    ];
+    await wrapper.setProps({ msg: { ...msg, media } });
+    await flushPromises();
+
+    const img = wrapper.find('img.md-img');
+    expect(img.exists()).toBe(true);
+    expect(img.attributes('src')).toBe('http://127.0.0.1:65238/m/abc.png?t=tok');
   });
 });
