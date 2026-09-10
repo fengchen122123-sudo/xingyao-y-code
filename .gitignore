@@ -104,3 +104,7 @@ docs/harness_execution_flow.md
 
 # Node dependencies
 node_modules/
+
+# SQLite WAL sidecar files - runtime state
+*.db-shm
+*.db-wal
