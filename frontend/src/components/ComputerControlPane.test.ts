@@ -151,3 +151,21 @@ it('shows an empty state before any run has been seen', () => {
   expect(wrapper.text()).toContain('暂无');
   wrapper.unmount();
 });
+
+// ── 终态按钮可见性（2026-09-10 设计） ──
+
+it('终态不渲染「立即停止」按钮', () => {
+  const store = useAppStore();
+  store.computerRun = { ...store.computerRun, run_id: 'run-1', status: 'completed' };
+  const wrapper = mountPane();
+  expect(wrapper.find('[data-test="computer-stop"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('活动期仍渲染「立即停止」按钮', () => {
+  const store = useAppStore();
+  store.computerRun = { ...store.computerRun, run_id: 'run-1', status: 'running' };
+  const wrapper = mountPane();
+  expect(wrapper.find('[data-test="computer-stop"]').exists()).toBe(true);
+  wrapper.unmount();
+});
