@@ -458,14 +458,21 @@ class UpdateDownloader:
                 last_percent = -1
                 part_index = 0
 
-                def _report_progress(force: bool = False):
+                def _report_progress(
+                    force: bool = False, part_done: int = 0, part_size: int = 0
+                ):
+                    # part_done / part_size 必须由调用方显式传入：它们本是
+                    # _download_one_part 的局部变量，而本闭包的外层作用域是
+                    # _worker（并未绑定这两个名字），直接引用会 NameError
+                    # ——响应用 chunked 传输、拿不到 Content-Length 时即触发，
+                    # 会让整次更新以"下载失败"收场。
                     nonlocal last_emit_time, last_percent
                     now = time.monotonic()
                     if len(urls) > 1 and grand_total <= 0:
                         # 分卷且无总大小元数据（Gitee 公开 API 附件不带 size）：
                         # 按片数比例混算（片完成度 + 当前片内进度），避免末片
                         # 偏小导致"估总分母"进度漂移（如 77% 直接跳 100%）
-                        part_frac = part_downloaded / part_total if part_total > 0 else 0
+                        part_frac = part_done / part_size if part_size > 0 else 0
                         percent = int(min(99, ((part_index - 1 + part_frac) / len(urls)) * 100))
                     else:
                         percent = (
@@ -567,7 +574,10 @@ class UpdateDownloader:
                                         f.write(chunk)
                                         part_downloaded += len(chunk)
                                         downloaded_total += len(chunk)
-                                        _report_progress()
+                                        _report_progress(
+                                            part_done=part_downloaded,
+                                            part_size=part_total,
+                                        )
                         except (urllib.error.URLError, OSError) as error:
                             last_reason = f"网络错误 ({error})"
                             continue
