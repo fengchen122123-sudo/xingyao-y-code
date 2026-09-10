@@ -66,7 +66,7 @@ def sync_builtin_skills():
 
 # 内置技能默认不启用名单：文件照常释放（released 记录 + copytree 均执行），
 # 但首次释放后不自动写入 active_skills.json（默认关闭），用户可在技能页手动开启。
-_BUILTIN_SKILLS_DEFAULT_DISABLED = {"tokenrhythm-image"}
+_BUILTIN_SKILLS_DEFAULT_DISABLED = {"tokenrhythm-image", "tokenrhythm-account", "tokenrhythm-image-api"}
 
 def _sync_builtin_skills_impl():
     """sync_builtin_skills 的实际执行体（调用方已持 _builtin_sync_lock）。"""
@@ -120,7 +120,7 @@ def _sync_builtin_skills_impl():
             _log_warning("保存内置技能释放记录失败: %s", e)
     if newly_installed:
         # 新释放的技能默认启用；只在 active_skills.json 里追加，不动用户既有选择
-        # 默认关闭名单内的技能（如 tokenrhythm-image）不追加，仅文件已释放
+        # 默认关闭名单内的技能（tokenrhythm-image / -account / -image-api）不追加，仅文件已释放
         newly_installed = [
             p for p in newly_installed
             if os.path.basename(os.path.dirname(p)) not in _BUILTIN_SKILLS_DEFAULT_DISABLED
