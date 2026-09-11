@@ -918,7 +918,7 @@ COMMAND_COMPLETIONS = [
     ("/session", "切换或创建新的记忆会话"),
     ("/new", "创建并切换到全新会话"),
     ("/models", "打开模型管理器"),
-    ("/effort", "切换当前模型推理强度 (low/high/max/default)"),
+    ("/effort", "切换当前模型思考模式 (档位随模型, 无参查看可选档位)"),
     ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
@@ -943,6 +943,57 @@ COMMAND_COMPLETIONS = [
     ("/clear", "清理当前屏幕"),
     ("/exit", "退出 Y-code"),
 ]
+
+
+def _active_reasoning_snapshot():
+    """返回 (active_model_id, model_dict, 思考能力快照)；无激活模型时前两者为 None。
+
+    快照与 GUI 思考选择器共用 build_reasoning_snapshot：kind 区分
+    effort 强度型 / toggle 开关型 / fixed 强制思考 / hidden 不支持，
+    options 为该模型真实可用的档位（value + 中文 label）。
+    """
+    from core.model_manager import load_config, get_model_reasoning_choice
+    from core.reasoning_capabilities import build_reasoning_snapshot
+
+    cfg = load_config()
+    active_id = cfg.get("active_model_id")
+    if not active_id:
+        return None, None, None
+    model = None
+    for provider in cfg.get("providers", []):
+        for m in provider.get("models", []):
+            if str(m.get("id")) == str(active_id):
+                model = m
+                break
+        if model is not None:
+            break
+    return active_id, model, build_reasoning_snapshot(model, get_model_reasoning_choice(active_id))
+
+
+_REASONING_COMPLETION_CACHE = {"key": None, "ts": 0.0, "rows": ()}
+
+
+def _reasoning_options_for_completion(ttl: float = 5.0):
+    """当前激活模型的思考档位 (value, label, 是否当前)，供 /effort 参数补全。
+
+    补全随按键高频触发，按激活模型 id 做短 TTL 缓存避免反复读盘；
+    任何异常（无模型/配置损坏）静默返回空，不影响正常命令补全。
+    """
+    try:
+        active_id, _model, snapshot = _active_reasoning_snapshot()
+        key = str(active_id)
+        now = time.monotonic()
+        cached = _REASONING_COMPLETION_CACHE
+        if cached["key"] == key and now - cached["ts"] < ttl:
+            return cached["rows"]
+        rows = tuple(
+            (o["value"], o["label"], o["value"] == snapshot["choice"])
+            for o in snapshot.get("options", [])
+        ) if (active_id and snapshot) else ()
+        cached.update(key=key, ts=now, rows=rows)
+        return rows
+    except Exception:
+        return ()
 
 
 def _cancel_active_turn() -> None:
@@ -1802,7 +1853,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【2. 模型与样式配置】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/models</ansicyan>                              : 打开全屏模型管理器 UI (切换模型、API 密钥、API 地址)"))
-        print_formatted_text(HTML("  <ansicyan>/effort &lt;low|high|max|default&gt;</ansicyan>      : 切换当前模型的推理强度档位 (按模型保存，下轮请求生效)"))
+        print_formatted_text(HTML("  <ansicyan>/effort &lt;档位&gt;</ansicyan>      : 切换当前模型思考模式 (档位随模型，无参查看可选档位；按模型保存，下轮请求生效)"))
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
@@ -1994,32 +2045,48 @@ def handle_slash_command(command_text):
             print_formatted_text(HTML("用法: <ansiyellow>/turns &lt;轮次&gt;</ansiyellow>"))
 
     elif cmd == "/effort":
-        # 推理强度按模型持久化；请求链路（core/llm.py）每轮新鲜读 config.json，改完下轮即生效
-        from core.model_manager import load_config, get_model_reasoning_effort, set_model_reasoning_effort
-        cfg = load_config()
-        active_id = cfg.get("active_model_id")
+        # 思考模式按模型持久化；请求链路（core/llm.py）每轮新鲜读 config.json，改完下轮即生效。
+        # 档位来自 core/reasoning_capabilities 能力表，与 GUI 思考选择器共用同一份快照；
+        # effort 强度型 / toggle 开关型模型档位不同，以无参展示的实际列表为准。
+        from core.model_manager import set_model_reasoning_choice
+        active_id, model, snapshot = None, None, None
+        snapshot_error = ""
+        try:
+            active_id, model, snapshot = _active_reasoning_snapshot()
+        except ValueError as exc:
+            # 配置里可能残留该模型已不支持的档位：只影响展示，设置路径仍可覆盖修复
+            snapshot_error = str(exc)
         if not active_id:
             print_formatted_text(HTML("<ansired>❌ 当前没有激活模型，请先用 /models 配置模型。</ansired>"))
         elif len(parts) > 1:
             level = parts[1].lower().strip("<>\"'")
-            ok, message = set_model_reasoning_effort(active_id, level)
+            ok, message = set_model_reasoning_choice(active_id, level)
             if ok:
                 print_formatted_text(HTML(f"<ansigreen>✔ {_esc(message)}（下一轮请求生效）</ansigreen>"))
-                litellm_model = ""
-                for provider in cfg.get("providers", []):
-                    for m in provider.get("models", []):
-                        if m.get("id") == active_id:
-                            litellm_model = str(m.get("litellm_model") or "")
+                litellm_model = str((model or {}).get("litellm_model") or "")
                 if litellm_model.split("/")[0].lower() == "anthropic":
-                    print_formatted_text(HTML("<ansiyellow>ℹ 当前模型走 Anthropic 路由：推理强度会按模型协议自动转换（Kimi K3 → thinking budget，阶跃 → output_config.effort）。</ansiyellow>"))
+                    print_formatted_text(HTML("<ansiyellow>ℹ 当前模型走 Anthropic 路由：思考档位会按模型协议自动转换（Kimi K3 → thinking budget，阶跃 → output_config.effort）。</ansiyellow>"))
                 if app_instance:
                     app_instance.invalidate()
             else:
                 print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
+        elif snapshot_error:
+            print_formatted_text(HTML(f"<ansired>❌ {_esc(snapshot_error)}</ansired>"))
+        elif not snapshot["visible"]:
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前模型未声明思考模式调节能力。</ansiyellow>"))
+        elif snapshot["disabled"]:
+            reason = snapshot.get("disabled_reason") or "该模型始终开启思考"
+            print_formatted_text(HTML(f"<ansiyellow>ℹ 当前模型始终开启思考（{_esc(reason)}），无需也无法切换档位。</ansiyellow>"))
         else:
-            current = get_model_reasoning_effort(active_id) or "default"
-            print_formatted_text(HTML(f"<b><ansicyan>当前模型推理强度: {current}</ansicyan></b> (low 最快 / max 最深思考)"))
-            print_formatted_text(HTML("用法: <ansiyellow>/effort &lt;low|high|max|default&gt;</ansiyellow>  (default = 恢复内置默认)"))
+            current = snapshot["choice"]
+            current_label = next((o["label"] for o in snapshot["options"] if o["value"] == current), current)
+            marks = "  ".join(
+                f"{'●' if o['value'] == current else '○'} {o['value']}({o['label']})"
+                for o in snapshot["options"]
+            )
+            print_formatted_text(HTML(f"<b><ansicyan>当前模型思考模式: {current_label} ({_esc(current)})</ansicyan></b>"))
+            print_formatted_text(HTML(f"  可选档位: {marks}"))
+            print_formatted_text(HTML("用法: <ansiyellow>/effort &lt;档位&gt;</ansiyellow>  (default = 恢复模型默认，下一轮请求生效)"))
 
     elif cmd == "/sandbox":
         # 沙盒开关：控制文件工具是否可访问当前工作目录之外的路径
@@ -2955,6 +3022,19 @@ def _make_input_app():
             
             # 1. 尝试匹配斜杠命令
             if text.startswith('/'):
+                # /effort 参数动态补全：按当前激活模型的能力表给出真实思考档位，
+                # 命中后跳过通用命令列表（"/effort " 时 word 为空会列出全部命令，纯噪音）
+                effort_arg = re.match(r'^/effort\s+(\S*)$', text)
+                if effort_arg is not None:
+                    typed = effort_arg.group(1)
+                    for value, label, is_current in _reasoning_options_for_completion():
+                        if value.startswith(typed.lower()):
+                            yield Completion(
+                                value,
+                                start_position=-len(typed),
+                                display_meta="思考档位: " + label + (" (当前)" if is_current else ""),
+                            )
+                    return
                 word = document.get_word_before_cursor(WORD=True)
                 for cmd, desc in command_completions:
                     if cmd.startswith(word):
