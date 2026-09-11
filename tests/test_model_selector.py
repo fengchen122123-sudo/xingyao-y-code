@@ -24,7 +24,7 @@ def test_connection_uses_shared_protocol_request_path(monkeypatch):
     assert captured["timeout"] == 15
 
 
-def test_kimi_for_coding_has_parallel_openai_and_anthropic_presets():
+def test_kimi_for_coding_preset_is_openai_format():
     from core.model_selector import PRESET_PROVIDERS
 
     kimi_coding = [
@@ -33,7 +33,6 @@ def test_kimi_for_coding_has_parallel_openai_and_anthropic_presets():
     ]
 
     assert {(preset["protocol"], preset["base_url"]) for preset in kimi_coding} == {
-        ("anthropic", "https://api.kimi.com/coding"),
         ("openai", "https://api.kimi.com/coding/v1"),
     }
     openai_preset = next(preset for preset in kimi_coding if preset["protocol"] == "openai")
@@ -194,7 +193,7 @@ def test_preset_add_via_selector_path_keeps_computer_metadata(monkeypatch, tmp_p
     monkeypatch.setattr(config_mod, "_CONFIG_FILE", str(config_file))
     monkeypatch.setattr("core.model_manager._CONFIG_FILE", str(config_file))
 
-    preset = next(p for p in model_selector.PRESET_PROVIDERS if p["id"] == "token-rhythm")
+    preset = next(p for p in model_selector.PRESET_PROVIDERS if p["id"] == "kimi-coding-openai")
     pid = add_preset_provider_with_models(
         preset["name"], preset["base_url"], "key", preset["protocol"],
         preset["models"], preset_id=preset["id"],
@@ -203,7 +202,7 @@ def test_preset_add_via_selector_path_keeps_computer_metadata(monkeypatch, tmp_p
     cfg = load_config()
     model = next(
         m for p in cfg["providers"] if p["id"] == pid
-        for m in p["models"] if m["name"] == "glm-5.3-flash"
+        for m in p["models"] if m["name"] == "k3"
     )
     assert model["computer_protocol"] == "generic"
     assert model["supports_function_calling"] is True

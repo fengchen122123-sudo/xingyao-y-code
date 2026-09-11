@@ -308,15 +308,17 @@ def test_provider_protocol_must_be_registered(tmp_path, monkeypatch):
 def test_add_preset_provider_uses_shared_catalog_metadata(tmp_path, monkeypatch):
     cfg = _use_tmp_config(tmp_path, monkeypatch, {"providers": [], "active_model_id": None})
 
-    pid = model_manager.add_preset_provider("deepseek", "sk-deepseek")
+    pid = model_manager.add_preset_provider("kimi-coding-openai", "sk-deepseek")
 
     data = model_manager.load_config()
     provider = next(item for item in data["providers"] if item["id"] == pid)
-    assert provider["preset_id"] == "deepseek"
+    assert provider["preset_id"] == "kimi-coding-openai"
+    assert provider["name"] == "月之暗面kimi-for-coding（OpenAI格式）"
     assert provider["protocol"] == "openai"
     assert provider["api_key"] == "sk-deepseek"
     assert "sk-deepseek" not in cfg.read_text(encoding="utf-8")
-    assert provider["models"][0]["litellm_model"] == "openai/deepseek-flash"
+    assert len(provider["models"]) == 3
+    assert provider["models"][0]["litellm_model"] == "openai/kimi-for-coding"
     assert provider["models"][0]["supports_vision"] is True
 
 
