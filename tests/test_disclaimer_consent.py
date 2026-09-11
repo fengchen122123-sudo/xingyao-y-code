@@ -19,6 +19,7 @@ from core.disclaimer_consent import (
     DISCLAIMER_VERSION,
     accept_disclaimer,
     get_disclaimer_consent,
+    is_disclaimer_version_accepted,
     needs_acceptance,
 )
 
@@ -75,6 +76,24 @@ def test_version_bump_requires_reacceptance(monkeypatch):
 
     monkeypatch.setattr("core.disclaimer_consent.DISCLAIMER_VERSION", "v1.1")
     assert needs_acceptance() is True
+    snapshot = get_disclaimer_consent()
+    assert snapshot["accepted"] is False
+    assert snapshot["needs_acceptance"] is True
+    assert snapshot["accepted_version"] == "v1.0"
+    assert snapshot["disclaimer_version"] == "v1.1"
+
+
+def test_is_disclaimer_version_accepted_semantics():
+    """测试条款版本比对：同版本通过，旧版本不通过，新版本通过，无效值拦截。"""
+    assert is_disclaimer_version_accepted("v1.0", "v1.0") is True
+    assert is_disclaimer_version_accepted("1.0", "v1.0") is True
+    assert is_disclaimer_version_accepted("v1.0", "1.0") is True
+    assert is_disclaimer_version_accepted("v1.1", "v1.0") is True
+    assert is_disclaimer_version_accepted("v1.0", "v1.1") is False
+    assert is_disclaimer_version_accepted("v1.0.1", "v1.0") is True
+    assert is_disclaimer_version_accepted("v1.0", "v2.0") is False
+    assert is_disclaimer_version_accepted("", "v1.0") is False
+    assert is_disclaimer_version_accepted(None, "v1.0") is False
 
 
 def test_accept_records_server_side_version(monkeypatch):

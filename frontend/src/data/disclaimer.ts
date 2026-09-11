@@ -18,6 +18,40 @@
 export const DISCLAIMER_VERSION = 'v1.0';
 export const DISCLAIMER_UPDATED_AT = '2026-09-11';
 
+/**
+ * 校验已同意的版本是否满足当前条款版本要求。
+ *
+ * 只有已同意版本有效且不低于当前要求版本时返回 true。
+ * 一旦条款版本升级（或已同意版本落后），返回 false 触发再次确认。
+ */
+export function isDisclaimerVersionAccepted(
+  acceptedVersion: string | null | undefined,
+  requiredVersion: string = DISCLAIMER_VERSION
+): boolean {
+  if (!acceptedVersion || typeof acceptedVersion !== 'string') return false;
+  const acc = acceptedVersion.trim();
+  const req = requiredVersion.trim();
+  if (!acc || !req) return false;
+  if (acc === req) return true;
+  const accNorm = acc.replace(/^[vV]/, '');
+  const reqNorm = req.replace(/^[vV]/, '');
+  if (accNorm === reqNorm) return true;
+  try {
+    const accParts = accNorm.split('.').map((p) => parseInt(p, 10));
+    const reqParts = reqNorm.split('.').map((p) => parseInt(p, 10));
+    if (accParts.some(isNaN) || reqParts.some(isNaN)) return accNorm === reqNorm;
+    for (let i = 0; i < Math.max(accParts.length, reqParts.length); i++) {
+      const a = accParts[i] || 0;
+      const r = reqParts[i] || 0;
+      if (a > r) return true;
+      if (a < r) return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export interface DisclaimerClause {
   title: string;
   items: string[];

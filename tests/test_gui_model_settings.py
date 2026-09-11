@@ -127,23 +127,23 @@ def test_sync_preset_models_for_removed_preset_returns_readable_message(tmp_path
             "providers": [
                 {
                     "id": "p1",
-                    "name": "智谱API",
-                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "name": "火山CodingPlan",
+                    "base_url": "https://ark.cn-beijing.volces.com/api/coding",
                     "api_key": "sk-old",
-                    "protocol": "openai",
-                    "preset_id": "zhipu",
+                    "protocol": "anthropic",
+                    "preset_id": "volcengine-coding-plan",
                     "models": [],
                 }
             ],
         },
     )
 
-    result = _bare_bridge().sync_preset_models("zhipu")
+    result = _bare_bridge().sync_preset_models("volcengine-coding-plan")
 
     assert result["ok"] is False
     assert "预置目录" in result["msg"]
     assert "KeyError" not in result["msg"]
-    assert result["msg"] != "'zhipu'"
+    assert result["msg"] != "'volcengine-coding-plan'"
 
 
 def test_sync_preset_models_for_known_preset_still_reports_success(tmp_path, monkeypatch):

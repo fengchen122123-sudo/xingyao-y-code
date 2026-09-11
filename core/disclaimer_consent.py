@@ -49,6 +49,38 @@ def _store_path():
         return os.path.join(data_dir, "disclaimer_consent.json")
 
 
+def is_disclaimer_version_accepted(
+    accepted_version: Any,
+    required_version: str = DISCLAIMER_VERSION,
+) -> bool:
+    """严格比对已同意的版本号与当前生效的条款版本号。
+
+    规则：
+    1. accepted_version 必须是非空字符串；
+    2. 规范化去除空白与首个 'v'/'V' 前缀；
+    3. 支持语义化数值比对（已同意版本必须 >= 要求版本）；
+    4. 若任一方非纯数值版本（如自定义后缀），退化为字符串严格一致比较。
+    """
+    if not isinstance(accepted_version, str):
+        return False
+    acc = accepted_version.strip()
+    req = required_version.strip()
+    if not acc or not req:
+        return False
+    if acc == req:
+        return True
+    acc_norm = acc[1:] if acc.startswith(("v", "V")) else acc
+    req_norm = req[1:] if req.startswith(("v", "V")) else req
+    if acc_norm == req_norm:
+        return True
+    try:
+        acc_parts = [int(p) for p in acc_norm.split(".")]
+        req_parts = [int(p) for p in req_norm.split(".")]
+        return acc_parts >= req_parts
+    except (ValueError, AttributeError):
+        return acc == req
+
+
 def _defaults() -> dict[str, Any]:
     """未同意（或缺记录）时的快照：accepted=False 会触发确认弹窗。"""
     return {
@@ -58,14 +90,15 @@ def _defaults() -> dict[str, Any]:
         "accepted": False,
         "accepted_version": "",
         "accepted_at": "",
+        "needs_acceptance": True,
     }
 
 
 def get_disclaimer_consent() -> dict[str, Any]:
     """读取同意状态快照；任何读取异常回落默认值（未同意）。
 
-    只认「accepted_version 非空」这一判据：手改文件写个 accepted=true
-    但没有版本号，不视为有效同意。
+    进行免责条款版本判断：只有当已同意的版本号存在且不低于当前生效条款版本时，
+    accepted 才为 True；若条款版本更新，accepted 自动为 False，needs_acceptance 为 True。
     """
     try:
         import config
@@ -77,20 +110,22 @@ def get_disclaimer_consent() -> dict[str, Any]:
         return _defaults()
     accepted_version = data.get("accepted_version")
     accepted_at = data.get("accepted_at")
-    accepted = isinstance(accepted_version, str) and bool(accepted_version.strip())
+    accepted = is_disclaimer_version_accepted(accepted_version, DISCLAIMER_VERSION)
+    needs_accept = not accepted
     return {
         "version": _STORE_VERSION,
         "disclaimer_version": DISCLAIMER_VERSION,
         "disclaimer_updated_at": DISCLAIMER_UPDATED_AT,
         "accepted": accepted,
-        "accepted_version": accepted_version.strip() if accepted else "",
+        "accepted_version": accepted_version.strip() if isinstance(accepted_version, str) else "",
         "accepted_at": accepted_at.strip() if isinstance(accepted_at, str) else "",
+        "needs_acceptance": needs_accept,
     }
 
 
 def needs_acceptance() -> bool:
     """当前条款版本是否尚未被接受（覆盖首次使用与条款升级两种情况）。"""
-    return str(get_disclaimer_consent().get("accepted_version") or "") != DISCLAIMER_VERSION
+    return bool(get_disclaimer_consent().get("needs_acceptance", True))
 
 
 def accept_disclaimer() -> dict[str, Any]:
@@ -108,6 +143,7 @@ def accept_disclaimer() -> dict[str, Any]:
         "accepted": True,
         "accepted_version": DISCLAIMER_VERSION,
         "accepted_at": accepted_at,
+        "needs_acceptance": False,
     }
     with _STORE_LOCK:
         try:

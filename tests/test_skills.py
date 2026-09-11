@@ -349,3 +349,27 @@ def test_skill_source_label_normalizes_unknown_to_user():
     # 大小写敏感：后端契约只产出小写 "builtin"，其余取值不算内置
     assert skills.skill_source_label({"source": "BUILTIN"}) == "用户"
     assert skills.skill_source_label(None) == "用户"
+
+
+def test_gui_bridge_refresh_skills(tmp_path, monkeypatch):
+    """GUI ApiBridge.refresh_skills 必须能重新扫描并返回最新技能列表。"""
+    import gui_bridge
+    from gui_bridge import ApiBridge
+
+    skill_path = tmp_path / "skills" / "refreshed_demo" / "SKILL.md"
+    parsed = _skill(skill_path, "refreshed_demo", "Refreshed demo", "BODY")
+    monkeypatch.setattr(gui_bridge, "get_active_skill_ids", lambda: [str(skill_path)])
+    monkeypatch.setattr(gui_bridge, "scan_all_skills", lambda: [parsed])
+
+    bridge = ApiBridge.__new__(ApiBridge)
+    res = bridge.refresh_skills()
+
+    assert res["ok"] is True
+    assert len(res["skills"]) == 1
+    assert res["skills"][0]["name"] == "refreshed_demo"
+    assert res["skills"][0]["enabled"] is True
+
+    direct = bridge.get_skills()
+    assert len(direct) == 1
+    assert direct[0]["name"] == "refreshed_demo"
+
