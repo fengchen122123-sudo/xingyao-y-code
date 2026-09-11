@@ -4,7 +4,11 @@ import { createPinia, setActivePinia } from 'pinia';
 
 import DisclaimerGate from './DisclaimerGate.vue';
 import { useAppStore } from '../stores/appStore';
-import { DISCLAIMER_CLAUSES, DISCLAIMER_VERSION } from '../data/disclaimer';
+import {
+  DISCLAIMER_CLAUSES,
+  DISCLAIMER_VERSION,
+  isDisclaimerVersionAccepted,
+} from '../data/disclaimer';
 
 function mountGate(api: Record<string, unknown> = {}) {
   (window as any).pywebview = { api };
@@ -80,5 +84,31 @@ describe('DisclaimerGate', () => {
     await flushPromises();
 
     expect(confirmClose).toHaveBeenCalledWith('exit');
+  });
+
+  it('re-triggers the gate when disclaimer version is bumped', () => {
+    const store = useAppStore();
+    // 假设用户之前同意过 v1.0
+    store.disclaimerAcceptedVersion = 'v1.0';
+    store.disclaimerRequiredVersion = 'v1.0';
+    expect(store.disclaimerNeedsAccept).toBe(false);
+
+    // 随后条款升级为 v1.1
+    store.disclaimerRequiredVersion = 'v1.1';
+    expect(store.disclaimerNeedsAccept).toBe(true);
+
+    // 重新同意 v1.1 后恢复通过
+    store.disclaimerAcceptedVersion = 'v1.1';
+    expect(store.disclaimerNeedsAccept).toBe(false);
+  });
+
+  it('correctly compares disclaimer versions', () => {
+    expect(isDisclaimerVersionAccepted('v1.0', 'v1.0')).toBe(true);
+    expect(isDisclaimerVersionAccepted('1.0', 'v1.0')).toBe(true);
+    expect(isDisclaimerVersionAccepted('v1.0', '1.0')).toBe(true);
+    expect(isDisclaimerVersionAccepted('v1.1', 'v1.0')).toBe(true);
+    expect(isDisclaimerVersionAccepted('v1.0', 'v1.1')).toBe(false);
+    expect(isDisclaimerVersionAccepted('', 'v1.0')).toBe(false);
+    expect(isDisclaimerVersionAccepted(null, 'v1.0')).toBe(false);
   });
 });

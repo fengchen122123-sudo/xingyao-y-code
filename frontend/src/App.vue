@@ -195,9 +195,8 @@
     <!-- 软件更新弹窗 -->
     <UpdateModal />
 
-    <!-- 免责条款首次使用确认：未同意或条款版本升级后强制弹出，
-         同意后 store.disclaimerAcceptedVersion 更新，弹窗自动卸载 -->
-    <DisclaimerGate v-if="store.disclaimerNeedsAccept" />
+    <!-- 免责条款首次使用确认：正常启动校验完成后，未同意或条款版本升级后才弹出；已同意过则不弹出 -->
+    <DisclaimerGate v-if="store.initialized && store.disclaimerNeedsAccept" />
 
     <!-- 图片大图查看 -->
     <ImageLightbox />

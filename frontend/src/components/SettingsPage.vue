@@ -183,27 +183,79 @@
             </div>
             <div v-if="!selectedProvider.models?.length" class="empty-models">该厂商暂无模型</div>
             <div v-else class="configured-models">
-              <div v-for="model in selectedProvider.models" :key="model.id" class="configured-model-row">
-                <div class="model-main">
-                  <span class="mono model-id">{{ model.name }}</span>
-                  <span>{{ formatContext(model.context_window) }}</span>
-                  <span :class="['vision-tag', { on: model.supports_vision }]">
-                    {{ model.supports_vision ? '多模态' : '纯文本' }}
+              <div v-for="model in selectedProvider.models" :key="model.id" class="configured-model-item">
+                <div class="configured-model-row">
+                  <div class="model-main">
+                    <span class="mono model-id" :title="model.name">{{ model.name }}</span>
+                    <span class="model-meta-ctx">{{ formatContext(model.context_window) }}</span>
+                    <span :class="['vision-tag', { on: model.supports_vision }]">
+                      {{ model.supports_vision ? '多模态' : '纯文本' }}
+                    </span>
+                  </div>
+                  <span
+                    v-if="testResults[model.id] && testResults[model.id].status !== 'fail'"
+                    class="test-result"
+                    :class="testResults[model.id].status"
+                  >
+                    <AppIcon
+                      v-if="testResults[model.id].status === 'ok'"
+                      name="check"
+                      :size="12"
+                      :stroke-width="2.25"
+                    />
+                    <AppIcon
+                      v-else-if="testResults[model.id].status === 'testing'"
+                      name="loader"
+                      :size="12"
+                      class="icon-spin"
+                    />
+                    {{ testResults[model.id].msg }}
                   </span>
+                  <div class="row-actions">
+                    <button :disabled="testingId === model.id" @click="testModel(model)">
+                      {{ testingId === model.id ? '测试中…' : '测试' }}
+                    </button>
+                    <button @click="openModelModal(model)">编辑</button>
+                    <button class="danger" @click="store.deleteModel(model)">删除</button>
+                  </div>
                 </div>
-                <span v-if="testResults[model.id]" class="test-result" :class="testResults[model.id].status">
-                  <AppIcon
-                    v-if="testResults[model.id].status !== 'testing'"
-                    :name="testResults[model.id].status === 'ok' ? 'check' : 'x'"
-                    :size="12"
-                    :stroke-width="2.25"
-                  />
-                  {{ testResults[model.id].msg }}
-                </span>
-                <div class="row-actions">
-                  <button :disabled="testingId === model.id" @click="testModel(model)">测试</button>
-                  <button @click="openModelModal(model)">编辑</button>
-                  <button class="danger" @click="store.deleteModel(model)">删除</button>
+
+                <!-- 方案 B：行内展开微型警告条 -->
+                <div
+                  v-if="testResults[model.id]?.status === 'fail'"
+                  class="model-error-banner"
+                  data-test="model-error-banner"
+                >
+                  <div class="error-banner-content">
+                    <AppIcon name="triangle-alert" :size="13" class="error-banner-icon" />
+                    <span class="error-banner-title">{{ testResults[model.id].friendly?.title || '连接失败' }}</span>
+                    <span
+                      v-if="testResults[model.id].friendly?.detail"
+                      class="error-banner-desc"
+                      :title="testResults[model.id].friendly?.detail"
+                    >
+                      — {{ testResults[model.id].friendly?.detail }}
+                    </span>
+                  </div>
+                  <div class="error-banner-actions">
+                    <button
+                      class="banner-action-btn"
+                      data-test="copy-test-error"
+                      title="复制完整报错信息"
+                      @click="copyTestError(model.id)"
+                    >
+                      <AppIcon :name="copiedErrorId === model.id ? 'check' : 'copy'" :size="11" />
+                      <span>{{ copiedErrorId === model.id ? '已复制' : '复制报错' }}</span>
+                    </button>
+                    <button
+                      class="banner-action-btn close-btn"
+                      data-test="dismiss-test-error"
+                      title="关闭此条提示"
+                      @click="dismissTestResult(model.id)"
+                    >
+                      <AppIcon name="x" :size="12" />
+                    </button>
+                  </div>
                 </div>
               </div>
             </div>
@@ -465,6 +517,12 @@
             <span class="mono" data-test="disclaimer-version">{{ disclaimerVersion }}</span>
             <span>更新日期 {{ disclaimerUpdatedAt }}</span>
             <span>适用于本软件全部发行版本</span>
+            <span
+              class="disclaimer-status"
+              :class="isDisclaimerVersionAccepted(store.disclaimerAcceptedVersion, disclaimerVersion) ? 'disclaimer-status--accepted' : 'disclaimer-status--pending'"
+            >
+              {{ isDisclaimerVersionAccepted(store.disclaimerAcceptedVersion, disclaimerVersion) ? `已同意本版本 (${store.disclaimerAcceptedVersion})` : '待确认最新条款' }}
+            </span>
           </div>
 
           <article v-for="(clause, i) in disclaimerClauses" :key="i" class="disclaimer-clause">
@@ -579,7 +637,9 @@ import {
   DISCLAIMER_CLAUSES as disclaimerClauses,
   DISCLAIMER_UPDATED_AT as disclaimerUpdatedAt,
   DISCLAIMER_VERSION as disclaimerVersion,
+  isDisclaimerVersionAccepted,
 } from '../data/disclaimer';
+import { parseModelTestError, type ParsedModelError } from '../utils/errorParser';
 
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
@@ -604,7 +664,14 @@ const keyCopied = ref(false);
 let keyCopyTimer: ReturnType<typeof setTimeout> | null = null;
 const saving = ref(false);
 const testingId = ref('');
-const testResults = reactive<Record<string, { status: 'testing' | 'ok' | 'fail'; msg: string }>>({});
+interface TestResultState {
+  status: 'testing' | 'ok' | 'fail';
+  msg: string;
+  friendly?: ParsedModelError;
+}
+const testResults = reactive<Record<string, TestResultState>>({});
+const copiedErrorId = ref('');
+let copiedErrorTimer: ReturnType<typeof setTimeout> | null = null;
 
 const providerForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
 const customForm = reactive({ name: '', base_url: '', api_key: '', protocol: 'openai' });
@@ -867,10 +934,37 @@ async function testModel(model: ModelInfo) {
   testingId.value = model.id;
   testResults[model.id] = { status: 'testing', msg: '测试中…' };
   const result = await store.testModel(model.id);
-  testResults[model.id] = result.ok
-    ? { status: 'ok', msg: '连接成功' }
-    : { status: 'fail', msg: result.msg };
+  if (result.ok) {
+    testResults[model.id] = { status: 'ok', msg: '连接成功' };
+  } else {
+    const friendly = parseModelTestError(result.msg);
+    testResults[model.id] = {
+      status: 'fail',
+      msg: friendly.title,
+      friendly,
+    };
+  }
   testingId.value = '';
+}
+
+function dismissTestResult(modelId: string) {
+  delete testResults[modelId];
+}
+
+async function copyTestError(modelId: string) {
+  const item = testResults[modelId];
+  const text = item?.friendly?.raw || item?.msg || '';
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // 剪贴板不可用时降级
+  }
+  copiedErrorId.value = modelId;
+  if (copiedErrorTimer) clearTimeout(copiedErrorTimer);
+  copiedErrorTimer = setTimeout(() => {
+    if (copiedErrorId.value === modelId) copiedErrorId.value = '';
+  }, 2000);
 }
 
 async function onSecondaryModelChange() {
@@ -1129,11 +1223,15 @@ onMounted(async () => {
 .mono { font-family: var(--mono); }
 .model-preview-title { margin: 24px 0 9px; color: var(--text-dim); font-size: 12px; }
 .preset-models, .configured-models { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
-.preset-model-row, .configured-model-row { min-height: 48px; display: flex; align-items: center; gap: 14px; padding: 0 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
-.preset-model-row:last-child, .configured-model-row:last-child { border-bottom: 0; }
+.configured-model-item { border-bottom: 1px solid var(--border); }
+.configured-model-item:last-child { border-bottom: 0; }
+.preset-model-row, .configured-model-row { min-height: 48px; display: flex; align-items: center; gap: 14px; padding: 0 14px; font-size: 12px; }
+.preset-model-row { border-bottom: 1px solid var(--border); }
+.preset-model-row:last-child { border-bottom: 0; }
 .preset-model-row .mono { flex: 1; color: var(--text); }
-.vision-tag { padding: 2px 7px; }
+.vision-tag { padding: 2px 7px; flex-shrink: 0; white-space: nowrap; }
 .vision-tag.on { color: var(--green); border-color: color-mix(in srgb, var(--green) 35%, var(--border)); }
+.model-meta-ctx { flex-shrink: 0; white-space: nowrap; color: var(--text-dim); }
 .primary-button, .secondary-button { min-height: 38px; margin-top: 20px; padding: 0 16px; border-radius: 9px; border: 1px solid var(--border); font-weight: 600; }
 .primary-button { background: var(--text); color: var(--bg0); }
 .secondary-button { background: var(--bg3); color: var(--text); }
@@ -1144,18 +1242,97 @@ onMounted(async () => {
 .model-list-header h3 { margin: 0 0 4px; font-size: 14px; }
 .model-list-header span { color: var(--text-faint); font-size: 11px; }
 .model-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; }
-.model-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.model-id { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .test-result {
   color: var(--text-faint);
   font-size: 11px;
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 5px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .test-result.ok { color: var(--green); }
-.test-result.fail { color: var(--red); }
-.row-actions { display: flex; gap: 7px; }
+.test-result.testing { color: var(--accent); }
+.row-actions { display: flex; gap: 7px; flex-shrink: 0; white-space: nowrap; }
+.row-actions button { flex-shrink: 0; white-space: nowrap; }
 .row-actions button:hover { color: var(--accent); }
+
+/* ---------- 方案 B：模型测试失败行内微型警告条 ---------- */
+.model-error-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 8px 14px;
+  background: color-mix(in srgb, var(--red) 7%, var(--bg1));
+  border-top: 1px dashed color-mix(in srgb, var(--red) 25%, var(--border));
+  font-size: 11.5px;
+  animation: banner-slide-down 0.18s ease-out;
+}
+@keyframes banner-slide-down {
+  from { opacity: 0; transform: translateY(-3px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.error-banner-content {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.error-banner-icon {
+  color: var(--red);
+  flex-shrink: 0;
+}
+.error-banner-title {
+  color: var(--red);
+  font-weight: 600;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.error-banner-desc {
+  color: var(--text-dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.error-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.banner-action-btn {
+  border: 1px solid color-mix(in srgb, var(--red) 28%, var(--border));
+  background: color-mix(in srgb, var(--bg2) 80%, transparent);
+  color: var(--text-dim);
+  border-radius: 5px;
+  padding: 2px 7px;
+  font-size: 11px;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+  transition: all 0.15s;
+  white-space: nowrap;
+}
+.banner-action-btn:hover {
+  background: var(--bg2);
+  color: var(--text);
+  border-color: var(--text-faint);
+}
+.banner-action-btn.close-btn {
+  padding: 2px 4px;
+  border-color: transparent;
+  background: transparent;
+  color: var(--text-faint);
+}
+.banner-action-btn.close-btn:hover {
+  color: var(--red);
+  background: color-mix(in srgb, var(--red) 12%, transparent);
+}
 .empty-models, .empty-detail { padding: 48px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
 .modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; background: rgba(0, 0, 0, .68); backdrop-filter: blur(8px); }
 .model-modal { width: min(560px, calc(100vw - 40px)); padding: 24px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 15px; background: var(--bg2); box-shadow: 0 24px 80px rgba(0, 0, 0, .55); }
@@ -1209,8 +1386,11 @@ onMounted(async () => {
 
 /* ── 免责条款分区（法律声明）── */
 .disclaimer-card { padding: 6px 32px 30px; }
-.disclaimer-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 18px 0 2px; color: var(--text-faint); font-size: 12px; }
+.disclaimer-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding: 18px 0 2px; color: var(--text-faint); font-size: 12px; }
 .disclaimer-meta .mono { color: var(--text-dim); }
+.disclaimer-status { padding: 1px 8px; border-radius: 999px; font-size: 11px; line-height: 1.6; }
+.disclaimer-status--accepted { background: rgba(34, 197, 94, 0.12); color: #22c55e; border: 1px solid rgba(34, 197, 94, 0.28); }
+.disclaimer-status--pending { background: rgba(234, 179, 8, 0.12); color: #eab308; border: 1px solid rgba(234, 179, 8, 0.28); }
 .disclaimer-clause { padding-top: 22px; }
 .disclaimer-clause h3 { margin: 0 0 10px; font-size: 14px; }
 .disclaimer-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; }

@@ -612,6 +612,8 @@ export interface PyWebViewAPI {
   get_token_usage_statistics(days: 1 | 7 | 30): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
 
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
+  refresh_skills(): Promise<{ ok: boolean; skills?: SkillInfo[]; msg?: string }>;
+  get_skills(): Promise<SkillInfo[]>;
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
   trust_plugin(name: string): Promise<any>;

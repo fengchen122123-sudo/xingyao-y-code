@@ -5253,6 +5253,18 @@ class ApiBridge:
             logger.exception("toggle_skill 失败")
             return {"ok": False, "msg": str(e)}
 
+    def refresh_skills(self) -> Dict[str, Any]:
+        """重新扫描并返回所有技能列表（供前端技能页刷新按钮调用）。"""
+        try:
+            return {"ok": True, "skills": self._build_skill_list()}
+        except Exception as e:
+            logger.exception("refresh_skills 失败")
+            return {"ok": False, "msg": str(e), "skills": []}
+
+    def get_skills(self) -> List[Dict[str, Any]]:
+        """返回所有技能列表。"""
+        return self._build_skill_list()
+
     # ------------------------------------------------------------------
     # 插件（与 CLI 共用 core.plugin_loader 的扫描与开关持久化，天然同步）
     # ------------------------------------------------------------------
