@@ -60,7 +60,37 @@ def test_confirmed_preset_models_carry_literal_computer_metadata():
     assert generic == {
         ("kimi-coding-openai", "k3"),
         ("kimi-coding-openai", "k3-256k"),
+        ("moonshot", "kimi-k3"),
+        ("sensenova", "kimi-k3"),
+        ("token-rhythm", "glm-5.3-flash"),
+        ("zhipu", "glm-5.3-flash"),
+        ("zhipu-coding-openai", "glm-5.3-flash"),
     }
+
+
+def test_token_rhythm_preset_contains_qwen38_flash():
+    providers = get_preset_providers()
+    token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
+    model = next(m for m in token_rhythm["models"] if m["name"] == "qwen3.8-flash")
+
+    assert model["context_window"] == 1000000
+    assert model["supports_vision"] is True
+    assert model["supports_function_calling"] is True
+
+
+def test_token_rhythm_preset_contains_deepseek_flash():
+    providers = get_preset_providers()
+    token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
+    model = next(
+        m
+        for m in token_rhythm["models"]
+        if m["name"] == "deepseek-flash"
+    )
+
+    assert model["context_window"] == 1000000
+    assert model["max_tokens"] == 384000
+    assert model["supports_vision"] is True
+    assert model["supports_function_calling"] is True
 
 
 def test_preset_computer_metadata_never_forms_half_valid_combination():

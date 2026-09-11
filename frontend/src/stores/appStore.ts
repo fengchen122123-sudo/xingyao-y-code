@@ -64,6 +64,10 @@ import {
   SIDEBAR_WIDTH_KEY,
   computeRestoredWidth,
 } from '../composables/usePanelResize';
+import {
+  DISCLAIMER_VERSION,
+  isDisclaimerVersionAccepted,
+} from '../data/disclaimer';
 
 /**
  * 面板宽度启动恢复：读取 localStorage 中上次拖拽记忆的宽度，
@@ -669,11 +673,11 @@ export const useAppStore = defineStore('app', {
 
   getters: {
     // 是否需要弹免责条款确认框：未同意过，或已同意的版本落后于当前条款版本
-    // （条款升级后须重新确认）。requiredVersion 为空视为后端未下发状态，
-    // 此时不弹——不能因为拿不到状态就把用户挡在门外。
+    // （条款版本升级后须重新确认）。
+    // requiredVersion 为空表示后端初始状态校验尚未完成，启动期间绝不提前弹窗。
     disclaimerNeedsAccept(state): boolean {
-      return !!state.disclaimerRequiredVersion
-        && state.disclaimerAcceptedVersion !== state.disclaimerRequiredVersion;
+      if (!state.disclaimerRequiredVersion) return false;
+      return !isDisclaimerVersionAccepted(state.disclaimerAcceptedVersion, state.disclaimerRequiredVersion);
     },
 
     currentSessionRunning(state): boolean {
@@ -1552,12 +1556,15 @@ export const useAppStore = defineStore('app', {
           this.userTitle = String(personaInit.user_title || '');
           this.syncDocumentTitle();
         }
-        // 免责条款同意状态：未同意过（或同意的版本落后）时弹确认框，
+        // 免责条款同意状态：未同意过（或已同意版本落后）时弹确认框，
         // 同意后由 acceptDisclaimer 就地更新状态，弹窗随之卸载
         const disclaimerInit = (init as any).disclaimer;
         if (disclaimerInit && typeof disclaimerInit === 'object') {
-          this.disclaimerRequiredVersion = String(disclaimerInit.disclaimer_version || '');
+          const backendVer = String(disclaimerInit.disclaimer_version || '');
+          this.disclaimerRequiredVersion = backendVer || DISCLAIMER_VERSION;
           this.disclaimerAcceptedVersion = String(disclaimerInit.accepted_version || '');
+        } else {
+          this.disclaimerRequiredVersion = DISCLAIMER_VERSION;
         }
         if (init.reasoning) this.reasoning = init.reasoning;
         this.sessionGroups = init.sessions || [];
@@ -3636,6 +3643,31 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.notifyModal('技能', '切换技能状态失败: ' + err);
+      }
+    },
+
+    async refreshSkills(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        if (api.refresh_skills) {
+          const res = await api.refresh_skills();
+          if (res && res.ok && Array.isArray(res.skills)) {
+            this.skills = res.skills;
+            return true;
+          }
+        }
+        if (api.get_skills) {
+          const skills = await api.get_skills();
+          if (Array.isArray(skills)) {
+            this.skills = skills;
+            return true;
+          }
+        }
+        return false;
+      } catch (err) {
+        this.notifyModal('技能', '刷新技能列表失败: ' + err);
+        return false;
       }
     },
 

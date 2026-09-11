@@ -359,4 +359,48 @@ describe('SettingsPage', () => {
     expect(text).toContain('法律允许的最大范围内');
     expect(text).toContain('按「现状」提供');
   });
+
+  it('displays the micro error banner (Option B) when model test fails and allows copying/dismissing', async () => {
+    const store = useAppStore();
+    const rawError = 'litellm.AuthenticationError: AuthenticationError: OpenAIException - Invalid Authentication';
+    vi.spyOn(store, 'testModel').mockResolvedValue({ ok: false, msg: rawError } as never);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.assign(navigator, { clipboard: { writeText } });
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const testBtn = wrapper.findAll('.row-actions button').find(b => b.text().includes('测试'));
+    expect(testBtn).toBeDefined();
+    await testBtn!.trigger('click');
+    await flushPromises();
+
+    // 方案 B：微型警告条展开
+    const banner = wrapper.find('[data-test="model-error-banner"]');
+    expect(banner.exists()).toBe(true);
+    expect(banner.text()).toContain('API Key 无效或未授权');
+    expect(banner.text()).toContain('请检查该厂商配置的 API Key');
+
+    // 点击复制报错
+    await wrapper.get('[data-test="copy-test-error"]').trigger('click');
+    expect(writeText).toHaveBeenCalledWith(rawError);
+
+    // 点击关闭警告条
+    await wrapper.get('[data-test="dismiss-test-error"]').trigger('click');
+    expect(wrapper.find('[data-test="model-error-banner"]').exists()).toBe(false);
+  });
+
+  it('displays inline success indicator when model test succeeds without error banner', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'testModel').mockResolvedValue({ ok: true, msg: '连接成功' } as never);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="provider-p1"]').trigger('click');
+    const testBtn = wrapper.findAll('.row-actions button').find(b => b.text().includes('测试'));
+    await testBtn!.trigger('click');
+    await flushPromises();
+
+    expect(wrapper.find('[data-test="model-error-banner"]').exists()).toBe(false);
+    expect(wrapper.find('.test-result.ok').exists()).toBe(true);
+    expect(wrapper.get('.test-result.ok').text()).toContain('连接成功');
+  });
 });

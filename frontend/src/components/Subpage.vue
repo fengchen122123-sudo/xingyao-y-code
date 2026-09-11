@@ -8,22 +8,36 @@
 
     <div class="sub-body">
       <!-- 技能页 -->
-      <div v-if="subType === 'skills'" class="sub-grid">
-        <div v-if="store.skills.length === 0" class="sub-empty">暂无可用技能</div>
-        <div v-for="s in store.skills" :key="s.id" class="sub-card">
-          <div class="sc-top">
-            <div class="sc-ico"><AppIcon name="gem" :size="16" /></div>
-            <div class="sc-name">
-              {{ s.name || s.id }}
-              <span class="pl-src" :class="s.source === 'builtin' ? 'builtin' : 'user'">{{ s.source === 'builtin' ? '内置' : '用户' }}</span>
+      <div v-if="subType === 'skills'">
+        <div class="sub-toolbar">
+          <button
+            class="chip-btn"
+            data-test="refresh-skills-btn"
+            title="重新扫描所有技能"
+            :disabled="refreshingSkills"
+            @click="onRefreshSkills"
+          >
+            <AppIcon name="refresh" :size="12" :class="{ 'icon-spin': refreshingSkills }" />
+            {{ refreshingSkills ? '刷新中…' : '刷新技能' }}
+          </button>
+        </div>
+        <div class="sub-grid">
+          <div v-if="store.skills.length === 0" class="sub-empty">暂无可用技能</div>
+          <div v-for="s in store.skills" :key="s.id" class="sub-card">
+            <div class="sc-top">
+              <div class="sc-ico"><AppIcon name="gem" :size="16" /></div>
+              <div class="sc-name">
+                {{ s.name || s.id }}
+                <span class="pl-src" :class="s.source === 'builtin' ? 'builtin' : 'user'">{{ s.source === 'builtin' ? '内置' : '用户' }}</span>
+              </div>
+              <label class="switch" title="启用/禁用该技能" @click.stop>
+                <input type="checkbox" :checked="s.enabled" @change="onToggleSkill(s, ($event.target as HTMLInputElement).checked)" />
+                <span class="switch-track"></span>
+              </label>
             </div>
-            <label class="switch" title="启用/禁用该技能" @click.stop>
-              <input type="checkbox" :checked="s.enabled" @change="onToggleSkill(s, ($event.target as HTMLInputElement).checked)" />
-              <span class="switch-track"></span>
-            </label>
+            <div class="sc-desc">{{ s.description || '项目/用户自定义扩展技能' }}</div>
+            <div class="sc-id">{{ s.short_id || s.id }}</div>
           </div>
-          <div class="sc-desc">{{ s.description || '项目/用户自定义扩展技能' }}</div>
-          <div class="sc-id">{{ s.short_id || s.id }}</div>
         </div>
       </div>
 
@@ -126,12 +140,29 @@
             <div v-for="m in list" :key="m.id" class="model-row">
               <span class="m-name">{{ m.name }}</span>
               <span v-if="m.id === store.activeModelId" class="m-active"><i class="m-active-dot"></i>使用中</span>
-              <span v-if="testResults[m.id]" class="m-test-result" :class="testResults[m.id].status">
+              <span
+                v-if="testResults[m.id]"
+                class="m-test-result"
+                :class="testResults[m.id].status"
+                :title="testResults[m.id].msg"
+              >
                 <AppIcon
-                  v-if="testResults[m.id].status !== 'testing'"
-                  :name="testResults[m.id].status === 'ok' ? 'check' : 'x'"
+                  v-if="testResults[m.id].status === 'ok'"
+                  name="check"
                   :size="11"
                   :stroke-width="2.25"
+                />
+                <AppIcon
+                  v-else-if="testResults[m.id].status === 'fail'"
+                  name="x"
+                  :size="11"
+                  :stroke-width="2.25"
+                />
+                <AppIcon
+                  v-else-if="testResults[m.id].status === 'testing'"
+                  name="loader"
+                  :size="11"
+                  class="icon-spin"
                 />
                 {{ testResults[m.id].msg }}
               </span>
@@ -156,6 +187,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore, type SubpageType } from '../stores/appStore';
 import type { SkillInfo, McpInfo, ModelInfo, PluginInfo } from '../types/pywebview';
+import { parseModelTestError } from '../utils/errorParser';
 
 const props = defineProps<{
   visible: boolean;
@@ -177,6 +209,18 @@ const desc = computed(() => {
   if (props.subType === 'plugins') return '与 CLI 共用同一份 plugin.json 配置，开关状态两端同步';
   return '管理模型供应商与可用模型列表';
 });
+
+const refreshingSkills = ref(false);
+
+async function onRefreshSkills() {
+  if (refreshingSkills.value) return;
+  refreshingSkills.value = true;
+  try {
+    await store.refreshSkills();
+  } finally {
+    refreshingSkills.value = false;
+  }
+}
 
 function onToggleSkill(s: SkillInfo, checked: boolean) {
   store.toggleSkill(s.id, checked);
@@ -312,7 +356,11 @@ async function testModelRow(m: ModelInfo) {
   testingModelId.value = m.id;
   testResults.value[m.id] = { status: 'testing', msg: '测试中…' };
   const res = await store.testModel(m.id);
-  testResults.value[m.id] = { status: res.ok ? 'ok' : 'fail', msg: res.msg };
+  const friendly = res.ok ? null : parseModelTestError(res.msg);
+  testResults.value[m.id] = {
+    status: res.ok ? 'ok' : 'fail',
+    msg: res.ok ? '连接成功' : (friendly?.title || res.msg),
+  };
   testingModelId.value = null;
 }
 </script>
@@ -733,6 +781,8 @@ async function testModelRow(m: ModelInfo) {
   display: inline-flex;
   align-items: center;
   gap: 4px;
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 .model-row .m-test-result.ok { color: var(--green); }
 .model-row .m-test-result.fail { color: var(--red); }
@@ -740,5 +790,11 @@ async function testModelRow(m: ModelInfo) {
   margin-left: auto;
   display: flex;
   gap: 6px;
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+.model-row-actions .chip-btn {
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 </style>
