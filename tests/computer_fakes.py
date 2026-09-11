@@ -114,8 +114,11 @@ DISABLED_CAPABILITY = ComputerCapability(
 class FakeHotkeyApi:
     """最小确定性 HotkeyApi fake：只记录注册/注销，绝不触碰真实系统热键。"""
 
-    def __init__(self, register_result: bool = True):
+    def __init__(self, register_result: bool = True, last_error_code: int = 0):
         self._register_result = register_result
+        # 与 WindowsHotkeyApi 对齐的可选诊断字段：注册失败时携带 Win32 错误码，
+        # 供 EmergencyStopHotkey 生成可读原因（如 1409 = 热键已被占用）。
+        self.last_error_code = last_error_code
         self.register_calls = 0
         self.unregister_calls = 0
         self.on_hotkey = None

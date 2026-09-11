@@ -342,6 +342,72 @@ def launch_gui_app(install_dir, startupinfo):
     return True
 
 
+# 允许自清理的安装包文件名白名单：
+#   * Y-CODE-Setup-v{版本}.exe —— 「关于」页检查更新下载到缓存目录的更新包；
+#   * ycode_cli_setup*.exe     —— 内嵌/独立分发的 CLI 安装向导（补装用）。
+# 只有这两种文件才可能是"本向导自身"，其余一律不动，避免误删用户文件。
+_SELF_INSTALLER_NAME_RE = re.compile(
+    r"^(?:Y-CODE-Setup-v[^\\/]+\.exe|ycode_cli_setup[^\\/]*\.exe)$",
+    re.IGNORECASE,
+)
+
+
+def _cleanup_log(msg):
+    """自清理相关日志：输出失败（如控制台编码不支持、stdout 已关闭）绝不允许冒泡。"""
+    try:
+        print(f"[setup] {msg}")
+    except Exception:
+        pass
+
+
+def schedule_installer_self_cleanup(installer_path: str, startupinfo=None) -> bool:
+    """【仅安装成功时调用】安排延时删除安装包自身，返回是否成功调度。
+
+    设计意图与约束：
+      * 为什么必须延时：Windows 上正在运行的 exe 被系统锁定，进程自己删不掉
+        自己，只能另起一个脱离本进程的命令解释器，等本向导退出、文件解锁之后
+        再删。这里用 `ping -n 3 127.0.0.1` 充当约 2 秒延时（比 `timeout` 可靠：
+        timeout 在无控制台的 detached 进程里会以"输入重定向错误"直接失败）。
+      * 为什么不能在非 frozen 下调：开发态 `python ycode_setup.py` 时
+        sys.executable 是 python.exe，删掉它会破坏用户的 Python 环境。只有
+        PyInstaller 打包（frozen）后 sys.executable 才真正指向安装包自身，
+        所以本函数只做安全校验，由调用点（SetupWizard）负责判断 frozen。
+      * 为什么绝不能无条件删：用户中途关掉向导、或安装失败时，安装包必须保留，
+        让用户能直接重跑，而不是重新下载几十 MB。因此清理只在"安装成功 +
+        向导退出"这一条路径上由 _maybe_schedule_installer_cleanup 调度。
+
+    安全前置：路径必须非空、必须已是存在的文件，且文件名命中
+    _SELF_INSTALLER_NAME_RE。任何不满足前置或启动失败的情况都只打印日志并
+    返回 False，绝不抛异常、绝不影响安装流程。
+    """
+    try:
+        if not installer_path or not os.path.isfile(installer_path):
+            return False
+        if not _SELF_INSTALLER_NAME_RE.match(os.path.basename(installer_path)):
+            _cleanup_log(f"安装包文件名不在自清理白名单内，跳过清理: {installer_path}")
+            return False
+        # 路径要拼进 cmd 字符串，含引号会破坏命令结构，宁可放弃清理
+        if '"' in installer_path:
+            _cleanup_log(f"安装包路径含非法字符，跳过自清理: {installer_path}")
+            return False
+
+        # ping 约 2 秒延时 → 等本向导进程退出、exe 解锁后再删；>nul 屏蔽 ping 输出
+        cmd = f'cmd /c ping -n 3 127.0.0.1 >nul & del /f /q "{installer_path}"'
+        creationflags = (getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+                         | getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000))
+        # detached：脱离本进程，本向导退出后它继续存活完成删除；
+        # startupinfo 由调用方传入（复用向导里隐藏黑框的那个），避免闪窗
+        subprocess.Popen(
+            cmd, shell=True, creationflags=creationflags,
+            close_fds=True, startupinfo=startupinfo,
+        )
+        _cleanup_log(f"安装成功，已安排向导退出后清理安装包: {installer_path}")
+        return True
+    except Exception as e:
+        _cleanup_log(f"调度安装包自清理失败（忽略，不影响安装结果）: {e}")
+        return False
+
+
 # ============================================================================
 # 用户配置播种
 # ============================================================================
@@ -929,6 +995,59 @@ FONT_TEXT_BOLD = ("Microsoft YaHei UI", 10, "bold")
 FONT_DIM = ("Microsoft YaHei UI", 9)
 FONT_VERSION = ("Microsoft YaHei UI", 8)
 
+# ---------------------------------------------------------------------------
+# 安装向导展示的许可协议（摘要版）
+#
+# 安装向导每次安装都展示本页并要求主动勾选（默认不勾选），不落盘任何状态；
+# 软件内的完整条款（8 章）在「设置 → 法律 → 免责条款」，运行时首次使用由
+# 应用内确认弹窗记录同意（~/.ycode/disclaimer_consent.json）。
+# 版本号需与 core/disclaimer_consent.py 的 DISCLAIMER_VERSION 保持同步。
+# ---------------------------------------------------------------------------
+LICENSE_VERSION = "v1.0"
+LICENSE_UPDATED_AT = "2026-09-11"
+LICENSE_AGREEMENT_TEXT = """\
+星瑶（Y-CODE）许可协议与免责条款（摘要）
+
+一、软件性质与许可
+1. 本软件是在你本地设备运行的 AI 编程辅助工具，自身不提供、不运营任何生成式人工智能
+   模型服务；模型服务由你自行选择、配置并直接与其通信。
+2. 本软件基于 MIT 许可证开源发布，你可依该许可证自由使用、修改与分发。
+
+二、AI 生成内容
+3. 大语言模型基于概率机制生成内容，可能不准确、不完整或已过时。本软件不对生成内容的
+   真实性、准确性、完整性、合法性或适用性作任何保证。
+4. 生成内容不构成法律、医疗、财务、税务等任何专业领域意见，不应作为相关决策的唯一依据。
+
+三、你的责任
+5. 在采纳、执行或分发任何生成内容前，你应自行审查、验证与测试，并对最终结果负全部责任。
+6. 本软件具备文件读写、命令执行、网页操作与电脑操控能力，此类操作可能修改或删除本机
+   文件、改变系统状态或产生外部影响；请在执行前确认操作意图与影响范围，并自行做好
+   重要数据的备份。
+
+四、数据与隐私
+7. 配置、会话记录与记忆数据默认存储于你的本地设备，本软件不主动向开发者上传上述数据。
+8. 使用过程中，会话内容、代码与附件将按你的配置直接发送至你所选的模型服务提供者，
+   其收集、存储、使用与跨境传输行为适用该服务提供者的隐私政策；请自行评估是否适宜
+   通过所选服务处理敏感信息、商业秘密或个人数据。
+
+五、合规使用
+9. 你不得利用本软件从事违反法律法规的活动，不得生成、传播违法有害信息，不得侵害他人
+   合法权益，不得规避、攻击或破坏计算机信息系统。
+
+六、责任限制（与你有重大利害关系的条款，请特别注意）
+10. 在法律允许的最大范围内，本软件的著作权人及贡献者不对因使用或无法使用本软件而
+    造成的任何损失承担责任，包括但不限于数据丢失、设备损坏、业务中断、利润损失及
+    第三方索赔等直接或间接损失。
+11. 本软件按「现状」提供，不作任何明示或默示的担保，包括但不限于适销性、特定用途
+    适用性及不侵权的担保。
+
+七、条款变更
+12. 本条款可能随软件版本更新而调整，更新后的条款随新版本一并发布。
+
+完整条款（共 8 章）可在安装完成后于软件内「设置 → 法律 → 免责条款」查看。
+"""
+
+
 
 class SetupWizard(tk.Tk):
     """经典 Windows 安装向导：欢迎 → 安装用户 → 路径与选项 → 安装中 → 完成。
@@ -953,6 +1072,9 @@ class SetupWizard(tk.Tk):
         self.title("Y-code 安装")
         self.resizable(False, False)
         self.configure(bg=COLOR_CONTENT)
+        # 右上角 X 关闭也必须走「安装成功才清理安装包」的统一出口，
+        # 否则用户用 X 关掉向导就漏掉了清理调度（安装包会一直留在缓存目录）。
+        self.protocol("WM_DELETE_WINDOW", self._on_window_close)
         self._center_window()
         self._set_icon()
         # 现代扁平化样式：clam 主题 + 品牌色按钮/进度条
@@ -977,13 +1099,21 @@ class SetupWizard(tk.Tk):
         # 完成页「立即运行」复选框（仅 full 模式展示）；安装结果状态供
         # 「完成」按钮判断是否需要在退出前启动程序
         self.var_launch = tk.BooleanVar(value=True)
+        # 许可协议勾选：默认不勾选——默认勾选的"同意"在司法实践中证明力弱，
+        # 也不符合《民法典》第 496 条对显著提示的要求
+        self.var_license_agree = tk.BooleanVar(value=False)
         self._install_success = False
         self._install_dir = None
+        # 安装包自清理只调度一次（安装成功 + 向导退出时触发，见
+        # _maybe_schedule_installer_cleanup）；幂等标志避免用户连点"完成"
+        # 或"完成"与窗口关闭协议叠加时启动多个删除进程
+        self._installer_cleanup_scheduled = False
 
         # 页面导航流程：cli 模式没有“安装用户”页（CLI 始终按当前用户安装）
-        self._flow = (["welcome", "scope", "options", "installing", "finish"]
+        # 许可协议页紧跟欢迎页：每次安装都展示，须主动勾选才能继续
+        self._flow = (["welcome", "license", "scope", "options", "installing", "finish"]
                       if mode == "full" else
-                      ["welcome", "options", "installing", "finish"])
+                      ["welcome", "license", "options", "installing", "finish"])
 
         self._build_chrome()
 
@@ -1160,6 +1290,7 @@ class SetupWizard(tk.Tk):
 
     def _build_pages(self):
         self._build_welcome_page()
+        self._build_license_page()
         if self.mode == "full":
             self._build_scope_page()
         self._build_options_page()
@@ -1168,6 +1299,7 @@ class SetupWizard(tk.Tk):
 
     _BANNERS = {
         "welcome": ("欢迎使用 Y-code 安装向导", "本向导将引导您完成 Y-code 的安装"),
+        "license": ("许可协议与免责条款", "请阅读以下条款，勾选同意后继续安装"),
         "scope": ("选择安装用户", "选择要为哪些用户安装 Y-code"),
         "options": ("选择安装位置与选项", "选择 Y-code 的安装文件夹与附加选项"),
         "installing": ("正在安装", "Y-code 正在安装，请等候。"),
@@ -1211,6 +1343,9 @@ class SetupWizard(tk.Tk):
             back.configure(state="normal" if self._flow.index(name) > 0 else "disabled")
             nxt.configure(state="normal",
                           text="安装" if name == "options" else "下一步")
+            # 许可协议页：未勾选同意不得继续（默认不勾选，须用户主动确认）
+            if name == "license" and not self.var_license_agree.get():
+                nxt.configure(state="disabled")
 
     def _go_next(self):
         name = self._current_page
@@ -1252,6 +1387,42 @@ class SetupWizard(tk.Tk):
         if self.previous_install:
             self._label(page, f"检测到已安装的 Y-code：{self.previous_install}，本次将覆盖安装。",
                         FONT_TEXT, "#8a6d1a").place(relx=0.5, y=305, anchor="center")
+
+    def _build_license_page(self):
+        """许可协议页：每次安装都展示，默认不勾选，未勾选不得进入下一步。
+
+        只做展示与确认，不落盘任何状态——运行时的同意记录由软件内
+        「免责条款」确认弹窗写入 ~/.ycode/disclaimer_consent.json。
+        """
+        page = self._page("license")
+        self._label(
+            page,
+            f"继续安装即表示你已阅读并同意以下条款"
+            f"（摘要版 {LICENSE_VERSION}，更新日期 {LICENSE_UPDATED_AT}）。",
+            FONT_PAGE_SUB, COLOR_TEXT_DIM,
+        ).place(x=40, y=6)
+
+        text = tk.Text(
+            page, font=FONT_DIM, bg="#FFFFFF", fg=COLOR_TEXT,
+            bd=1, relief="solid", highlightthickness=0,
+            wrap="word", padx=10, pady=8, state="normal",
+        )
+        text.insert("1.0", LICENSE_AGREEMENT_TEXT)
+        text.configure(state="disabled")
+        text.place(x=40, y=36, width=516, height=196)
+
+        scroll = tk.Scrollbar(page, orient="vertical", command=text.yview)
+        text.configure(yscrollcommand=scroll.set)
+        scroll.place(x=558, y=36, height=196)
+
+        tk.Checkbutton(
+            page, text="我已阅读并同意上述许可协议与免责条款",
+            variable=self.var_license_agree, command=self._update_nav_buttons,
+            bg=COLOR_CONTENT, fg=COLOR_TEXT, font=FONT_TEXT_BOLD,
+            selectcolor=COLOR_CONTENT, activebackground=COLOR_CONTENT,
+            activeforeground=COLOR_TEXT, cursor="hand2",
+            highlightthickness=0, bd=0,
+        ).place(x=40, y=246)
 
     def _build_scope_page(self):
         page = self._page("scope")
@@ -1488,12 +1659,39 @@ class SetupWizard(tk.Tk):
         self._finish_hint.configure(text="您可以关闭向导后重试，或更换安装位置。")
         self.show_page("finish")
 
+    def _maybe_schedule_installer_cleanup(self):
+        """安装成功且向导即将退出时，调度删除本次运行的安装包（幂等）。
+
+        只在"安装成功"这一条路径上清理：
+          * self._install_success 为 False（用户中途取消、安装失败）→ 直接返回，
+            安装包原样保留，用户可再次运行，无需重新下载；
+          * 非 frozen（开发态 `python ycode_setup.py`）→ 不清理，因为
+            sys.executable 是 python.exe，删掉会破坏用户的 Python 环境；
+          * 已调度过 → 不重复调度。
+        调度失败只影响"安装包能不能自动删掉"，绝不影响安装流程本身。
+        """
+        if self._installer_cleanup_scheduled:
+            return
+        if not self._install_success:
+            return
+        if not getattr(sys, "frozen", False):
+            return
+        self._installer_cleanup_scheduled = True
+        schedule_installer_self_cleanup(sys.executable, self.startupinfo)
+
+    def _on_window_close(self):
+        """右上角 X 关闭：与底部按钮走同一套「安装成功才清理安装包」逻辑。"""
+        self._maybe_schedule_installer_cleanup()
+        self.destroy()
+
     def _on_cancel_or_finish(self):
         """底部「取消/完成」按钮：安装成功且勾选「立即运行」时先启动程序再退出。"""
         if (self._current_page == "finish" and self._install_success
                 and self.mode == "full" and self.var_launch.get()
                 and self._install_dir):
             launch_gui_app(self._install_dir, self.startupinfo)
+        # 安装成功才清理安装包（失败/取消时保留，供用户重跑）
+        self._maybe_schedule_installer_cleanup()
         self.destroy()
 
 

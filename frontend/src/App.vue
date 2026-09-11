@@ -195,6 +195,10 @@
     <!-- 软件更新弹窗 -->
     <UpdateModal />
 
+    <!-- 免责条款首次使用确认：未同意或条款版本升级后强制弹出，
+         同意后 store.disclaimerAcceptedVersion 更新，弹窗自动卸载 -->
+    <DisclaimerGate v-if="store.disclaimerNeedsAccept" />
+
     <!-- 图片大图查看 -->
     <ImageLightbox />
 
@@ -263,6 +267,8 @@ import RightPanel from './components/RightPanel.vue';
 import ComputerControlBar from './components/ComputerControlBar.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
+// 免责条款首次使用确认（合规链路）：未同意或条款升级后强制弹出，不同意则退出
+import DisclaimerGate from './components/DisclaimerGate.vue';
 import PermCard from './components/PermCard.vue';
 import ImageLightbox from './components/ImageLightbox.vue';
 import RemoteDirBrowser from './components/RemoteDirBrowser.vue';

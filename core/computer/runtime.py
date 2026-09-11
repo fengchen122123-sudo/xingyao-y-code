@@ -213,10 +213,13 @@ def _make_hotkey(hotkey_factory, controller_provider):
         )
         hotkey.start()
         return hotkey
-    except ComputerControlError:
-        _LOGGER.warning(
-            "全局紧急停止热键注册失败，紧急停止能力不可用", exc_info=True
-        )
+    except ComputerControlError as error:
+        # 注册失败是可预期降级（热键被别的进程占用 / 平台不支持），不是故障。
+        # 只在 INFO 留痕、堆栈只在 DEBUG：CLI 没有自定义 handler，WARNING 及以上
+        # 会经 logging.lastResort 直打控制台，启动界面必须保持零提示
+        # （能力状态另有快照供设置页展示，信息不会丢）。
+        _LOGGER.info("全局紧急停止热键不可用：%s", error)
+        _LOGGER.debug("紧急停止热键注册失败详情", exc_info=True)
     except Exception:
         _LOGGER.exception("全局紧急停止热键注册异常，紧急停止能力不可用")
     return None
