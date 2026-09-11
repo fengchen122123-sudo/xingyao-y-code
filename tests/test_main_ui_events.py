@@ -1059,12 +1059,60 @@ def test_effort_command_shows_current_level(monkeypatch):
 
     printed = []
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
-    monkeypatch.setattr(mm, "load_config", lambda: {"active_model_id": "m1", "providers": []})
-    monkeypatch.setattr(mm, "get_model_reasoning_effort", lambda model_id: "low")
+    cfg = {
+        "active_model_id": "m1",
+        "providers": [
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/kimi-k3"}]}
+        ],
+    }
+    monkeypatch.setattr(mm, "load_config", lambda: cfg)
+    monkeypatch.setattr(mm, "get_model_reasoning_choice", lambda model_id: "low")
 
     main.handle_slash_command("/effort")
 
     assert any("low" in line for line in printed)
+    assert any("可选档位" in line for line in printed)
+
+
+def test_effort_command_shows_toggle_off_choice(monkeypatch):
+    # toggle 型模型（如 kimi-k2.6）选"关闭"后，无参查看必须显示 off/关闭，
+    # 而不是兼容接口 get_model_reasoning_effort 返回 None 导致的错误 "default"
+    import core.model_manager as mm
+
+    printed = []
+    cfg = {
+        "active_model_id": "m1",
+        "providers": [
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/kimi-k2.6"}]}
+        ],
+    }
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
+    monkeypatch.setattr(mm, "load_config", lambda: cfg)
+    monkeypatch.setattr(mm, "get_model_reasoning_choice", lambda model_id: "off")
+
+    main.handle_slash_command("/effort")
+
+    assert any("off" in line for line in printed)
+    assert any("关闭" in line for line in printed)
+
+
+def test_effort_command_fixed_model_hint(monkeypatch):
+    # fixed 型模型（如 kimi-k2.7-code）始终开启思考，应给提示而非档位列表
+    import core.model_manager as mm
+
+    printed = []
+    cfg = {
+        "active_model_id": "m1",
+        "providers": [
+            {"id": "p1", "models": [{"id": "m1", "litellm_model": "openai/kimi-k2.7-code"}]}
+        ],
+    }
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: printed.append(str(args[0])))
+    monkeypatch.setattr(mm, "load_config", lambda: cfg)
+
+    main.handle_slash_command("/effort")
+
+    assert any("始终开启思考" in line for line in printed)
 
 
 def test_effort_command_sets_level_and_warns_anthropic_route(monkeypatch):
@@ -1083,8 +1131,8 @@ def test_effort_command_sets_level_and_warns_anthropic_route(monkeypatch):
     monkeypatch.setattr(mm, "load_config", lambda: cfg)
     monkeypatch.setattr(
         mm,
-        "set_model_reasoning_effort",
-        lambda model_id, level: calls.append((model_id, level)) or (True, "模型 m1 推理强度已设为 high"),
+        "set_model_reasoning_choice",
+        lambda model_id, level: calls.append((model_id, level)) or (True, "模型 m1 思考设置已设为 high"),
     )
 
     main.handle_slash_command("/effort high")
