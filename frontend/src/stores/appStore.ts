@@ -588,11 +588,16 @@ export const useAppStore = defineStore('app', {
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact',
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer',
     // 智能体显示名：设置页「人设设置」自定义后全局生效（界面文案/执行过程/思考提示）
     agentName: '星瑶',
     // 智能体对用户的称呼；空串表示不使用特定称呼
     userTitle: '',
+    // 免责条款同意状态：requiredVersion 为当前生效的条款版本，acceptedVersion
+    // 为空或与之不一致时弹首次使用确认框。两者均由后端落盘到
+    // ~/.ycode/disclaimer_consent.json，前端只负责展示判定与触发确认。
+    disclaimerRequiredVersion: '',
+    disclaimerAcceptedVersion: '',
     // 主题预览模式：设置页"预览效果"收起设置、直接看真实首页（草稿已实时渲染），
     // 顶部浮条提供返回编辑；保存/取消/切主题时退出该模式
     themePreviewMode: false,
@@ -663,6 +668,14 @@ export const useAppStore = defineStore('app', {
   }),
 
   getters: {
+    // 是否需要弹免责条款确认框：未同意过，或已同意的版本落后于当前条款版本
+    // （条款升级后须重新确认）。requiredVersion 为空视为后端未下发状态，
+    // 此时不弹——不能因为拿不到状态就把用户挡在门外。
+    disclaimerNeedsAccept(state): boolean {
+      return !!state.disclaimerRequiredVersion
+        && state.disclaimerAcceptedVersion !== state.disclaimerRequiredVersion;
+    },
+
     currentSessionRunning(state): boolean {
       // M30 修复：判定源统一为 runningSessions（与 sendMessage 的拦截判定一致），
       // 避免此前 sessionRuntimeByName[key].running 与 runningSessions 不同步时
@@ -729,6 +742,24 @@ export const useAppStore = defineStore('app', {
   },
 
   actions: {
+    /** 记录用户已接受免责条款；返回空串表示成功，否则为错误提示文案。 */
+    async acceptDisclaimer(this: any): Promise<string> {
+      const api = this._api();
+      if (!api?.accept_disclaimer) return '无法连接本地服务，请重启软件后重试。';
+      try {
+        const res = await api.accept_disclaimer();
+        if (res?.ok) {
+          // 版本号以服务端回执为准：前端缓存旧版本时不得据此跳过再次确认
+          this.disclaimerRequiredVersion = String(res.disclaimer_version || this.disclaimerRequiredVersion);
+          this.disclaimerAcceptedVersion = String(res.accepted_version || '');
+          return '';
+        }
+        return String(res?.msg || '保存同意记录失败，请重试。');
+      } catch {
+        return '保存同意记录失败，请重试。';
+      }
+    },
+
     _pendingRuntimeKey(this: any): string {
       return `__pending__:${this.pendingWorkdir || 'GLOBAL'}`;
     },
@@ -1520,6 +1551,13 @@ export const useAppStore = defineStore('app', {
           this.agentName = String(personaInit.agent_name || '星瑶');
           this.userTitle = String(personaInit.user_title || '');
           this.syncDocumentTitle();
+        }
+        // 免责条款同意状态：未同意过（或同意的版本落后）时弹确认框，
+        // 同意后由 acceptDisclaimer 就地更新状态，弹窗随之卸载
+        const disclaimerInit = (init as any).disclaimer;
+        if (disclaimerInit && typeof disclaimerInit === 'object') {
+          this.disclaimerRequiredVersion = String(disclaimerInit.disclaimer_version || '');
+          this.disclaimerAcceptedVersion = String(disclaimerInit.accepted_version || '');
         }
         if (init.reasoning) this.reasoning = init.reasoning;
         this.sessionGroups = init.sessions || [];
@@ -4217,6 +4255,10 @@ export const useAppStore = defineStore('app', {
     // ============================================================================
     openUpdateModal() {
       this.updateState.showUpdateModal = true;
+      // 打开弹窗时刷新一次更新信息：后端会顺带探测本地缓存安装包，
+      // 已下载过的包直接呈现为"已就绪"。复用静默检查（沿用其冷却窗口
+      // 与在途去重），不会重复请求、也不会再次打开弹窗。
+      void this.checkUpdate(false);
     },
 
     closeUpdateModal() {
@@ -4237,6 +4279,9 @@ export const useAppStore = defineStore('app', {
       // 反复请求 Gitee API 触发限流；手动检查不受限制
       const UPDATE_CHECK_COOLDOWN_MS = 3600 * 1000;
       if (!manual) {
+        // 在途去重：已有静默/手动检查正在跑时不重复发请求（如启动静默检查
+        // 与打开更新弹窗几乎同时触发）
+        if (this.updateState.status === 'checking') return;
         try {
           const last = Number(localStorage.getItem('ycode-last-update-check') || '0');
           if (last && Date.now() - last < UPDATE_CHECK_COOLDOWN_MS) {
@@ -4262,6 +4307,17 @@ export const useAppStore = defineStore('app', {
           this.updateState.partUrls = Array.isArray(res.part_urls) ? res.part_urls.map(String) : [];
           this.updateState.sha256 = String(res.sha256 || '');
           this.updateState.status = res.has_update ? 'available' : 'idle';
+
+          // 缓存命中：后端在更新缓存目录里找到了目标版本安装包且校验通过，
+          // 直接进入"已就绪"态（不触发下载），"立即安装并重启"即安装该包
+          const cachedInstaller = String(res.cached_installer || '');
+          if (res.has_update && cachedInstaller) {
+            this.updateState.status = 'downloaded';
+            this.updateState.installerPath = cachedInstaller;
+            this.updateState.downloadProgress = 100;
+            this.updateState.downloadedBytes = this.updateState.assetSize;
+            this.updateState.totalBytes = this.updateState.assetSize;
+          }
 
           if (res.has_update && manual) {
             this.openUpdateModal();

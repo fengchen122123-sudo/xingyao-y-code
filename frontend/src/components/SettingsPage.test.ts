@@ -340,4 +340,23 @@ describe('SettingsPage', () => {
     // 复制后输入框仍为掩码态，仅剪贴板拿到明文
     expect(wrapper.get('[data-test="provider-api-key"]').attributes('type')).toBe('password');
   });
+
+  it('renders the disclaimer document with all clauses intact', async () => {
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="disclaimer-nav"]').trigger('click');
+
+    expect(wrapper.get('.settings-header h1').text()).toBe('免责条款');
+    const doc = wrapper.get('[data-test="disclaimer-doc"]');
+    // 8 个条款章节完整渲染
+    expect(wrapper.findAll('.disclaimer-clause').length).toBe(8);
+    // 条款版本与更新日期可见（修改条款正文后需同步更新）
+    expect(wrapper.get('[data-test="disclaimer-version"]').text()).toBe('v1.0');
+    // 关键法定免责边界必须存在，防止后续编辑误删
+    const text = doc.text();
+    expect(text).toContain('不提供、不运营任何生成式人工智能模型服务');
+    expect(text).toContain('责任限制');
+    expect(text).toContain('法律允许的最大范围内');
+    expect(text).toContain('按「现状」提供');
+  });
 });

@@ -829,6 +829,60 @@ def _shutdown_computer_runtime_for_cli() -> None:
         )
 
 
+def _ensure_cli_disclaimer_consent() -> None:
+    """CLI 首次使用（及条款版本升级后）的免责条款确认。
+
+    与 GUI 共用同一份同意记录（~/.ycode/disclaimer_consent.json）：任一形态
+    下同意过，另一形态不再重复询问。只在交互式终端询问——非 TTY 已由
+    _require_interactive_console 提前拦截；headless（-p）用于 CI/脚本，
+    不做交互拦截以免破坏自动化。
+    """
+    from core.disclaimer_consent import (
+        DISCLAIMER_VERSION,
+        accept_disclaimer,
+        needs_acceptance,
+    )
+
+    try:
+        if not needs_acceptance():
+            return
+    except Exception:
+        # 状态不可读时不阻断启动（与 GUI 侧同一降级口径）
+        return
+
+    width = 66
+    print()
+    print("=" * width)
+    print(f"  免责条款确认（{DISCLAIMER_VERSION}）")
+    print("=" * width)
+    print("  本软件是本地 AI 编程辅助工具，自身不提供、不运营任何生成式")
+    print("  人工智能模型服务；模型服务由你自行配置。")
+    print()
+    print("  · AI 生成内容可能不准确、不完整或已过时，需你自行审查验证；")
+    print("  · 软件可读写文件、执行命令，请确认影响范围并自行备份数据；")
+    print("  · 会话内容将按你的配置发送至所选模型服务提供者；")
+    print("  · 不得利用本软件从事违反法律法规的活动。")
+    print()
+    print("  在法律允许的最大范围内，作者不对使用本软件造成的任何损失")
+    print("  承担责任；本软件按「现状」提供，不作任何明示或默示担保。")
+    print()
+    print("  完整条款（共 8 章）：GUI「设置 → 法律 → 免责条款」")
+    print("=" * width)
+    print()
+    try:
+        answer = input("  输入 y 并回车表示已阅读并同意，其它输入将退出软件：").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer in ("y", "yes"):
+        try:
+            accept_disclaimer()
+        except Exception:
+            print("  提示：同意记录保存失败，请检查 ~/.ycode 目录是否可写。", file=sys.stderr)
+        return
+    print("  未接受免责条款，已退出。", file=sys.stderr)
+    sys.exit(0)
+
+
 def _require_interactive_console() -> None:
     """交互式 CLI 前置检查：stdin/stdout 必须是真实终端（TTY），否则快速失败。
 
@@ -1802,7 +1856,7 @@ def handle_slash_command(command_text):
             app_instance.exit()
 
     elif cmd in ("/skills", "/skill"):
-        from core.skills import scan_all_skills, get_active_skill_ids, save_active_skill_ids
+        from core.skills import scan_all_skills, get_active_skill_ids, save_active_skill_ids, skill_source_label
         
         if len(parts) > 1:
             sub = parts[1].lower()
@@ -1817,7 +1871,8 @@ def handle_slash_command(command_text):
                         short_id = os.path.basename(os.path.dirname(s["id"]))
                         is_active = s["id"] in active_ids
                         check = "<ansigreen>[✓]</ansigreen>" if is_active else "<ansigray>[ ]</ansigray>"
-                        print_formatted_text(HTML(f"  {check} 短ID: <b><ansiyellow>{_esc(short_id)}</ansiyellow></b> | 名称: {_esc(s['name'])} - <ansigray>{_esc(s['description'])}</ansigray>"))
+                        src_label = skill_source_label(s)
+                        print_formatted_text(HTML(f"  {check} 短ID: <b><ansiyellow>{_esc(short_id)}</ansiyellow></b> | 名称: {_esc(s['name'])} - <ansigray>{_esc(s['description'])}</ansigray> <ansigray>| 来源: {_esc(src_label)}</ansigray>"))
             elif sub == "enable" and len(parts) > 2:
                 target = parts[2].lower()
                 skills = scan_all_skills()
@@ -2911,7 +2966,7 @@ def _make_input_app():
                         
                 # 额外动态补充已开启的技能插件到下拉菜单供主动调用
                 try:
-                    from core.skills import get_active_skills_list
+                    from core.skills import get_active_skills_list, skill_source_label
                     active_skills = get_active_skills_list()
                     for short_id, s in active_skills.items():
                         cmd = f"/{short_id}"
@@ -2919,7 +2974,7 @@ def _make_input_app():
                             yield Completion(
                                 cmd,
                                 start_position=-len(word),
-                                display_meta=f"⚡ 技能: {s['description']}"
+                                display_meta=f"⚡ {skill_source_label(s)}技能: {s['description']}"
                             )
                 except Exception:
                     pass
@@ -4083,6 +4138,9 @@ def run_cli():
     # 交互式前置检查：非 TTY（管道/重定向）快速失败并引导 headless -p，
     # 必须先于下方一切初始化副作用（模型选择器/后台线程/MCP 预热/首绘）
     _require_interactive_console()
+
+    # 免责条款确认：同样先于一切初始化副作用，不同意则直接退出
+    _ensure_cli_disclaimer_consent()
 
     # 运行时初始化副作用集中在入口执行（而非模块 import 时），保证 main.py 可被安全 import
     _app_ctx.set_ui_flavor("cli")

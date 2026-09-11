@@ -15,7 +15,7 @@ import threading
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from core import updater
-from core.updater import UpdateDownloader, fetch_latest_release, launch_installer_and_cleanup
+from core.updater import UpdateDownloader, fetch_latest_release, launch_installer
 
 PASS = []
 FAIL = []

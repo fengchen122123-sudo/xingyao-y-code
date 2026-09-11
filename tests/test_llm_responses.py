@@ -165,6 +165,7 @@ def test_responses_completed_output_function_call_is_emitted():
         id="fc-1",
         call_id="call-1",
         name="get_user_keys",
+        # 脱敏占位符：此处禁止填入真实手机号/账号，避免个人信息进入公开仓库
         arguments='{"account": "13800000000"}',
     )
     completed = SimpleNamespace(

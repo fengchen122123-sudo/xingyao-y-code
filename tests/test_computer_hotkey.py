@@ -38,6 +38,16 @@ def test_hotkey_registration_failure_is_not_reported_available():
     assert hotkey.available is False
 
 
+def test_registration_failure_message_names_hotkey_as_occupied():
+    """注册失败异常消息必须点名热键并说明"已被占用"（Win32 1409 语义）。"""
+    api = FakeHotkeyApi(register_result=False, last_error_code=1409)
+    hotkey = EmergencyStopHotkey(api, on_stop=lambda: None)
+    with pytest.raises(ComputerControlError) as raised:
+        hotkey.start()
+    assert "Ctrl+Alt+Esc" in raised.value.message
+    assert "占用" in raised.value.message
+
+
 def test_hotkey_callback_only_requests_controller_stop():
     requested = []
     hotkey = EmergencyStopHotkey(FakeHotkeyApi(), on_stop=lambda: requested.append("stop"))

@@ -4,7 +4,9 @@ EmergencyStopHotkey 依赖注入 HotkeyApi：回调只调用 on_stop，绝不直
 GUI、prompt_toolkit 或 Provider 流。默认 Windows 实现（WindowsHotkeyApi）用
 独立消息线程注册 MOD_CONTROL|MOD_ALT + VK_ESCAPE，只在收到对应 WM_HOTKEY
 时回调；其他平台构造即抛 computer_unsupported_os。注册失败抛
-computer_hotkey_unavailable 且 available=False。
+computer_hotkey_unavailable 且 available=False：失败原因由
+_hotkey_unavailable_message 生成用户可读文案，带上 Win32 错误码语义
+（1409 = 热键已被其他进程占用），便于用户自助定位是哪个程序抢了热键。
 
 get_emergency_hotkey_snapshot() 提供含 available 字段的保守快照，供
 core.command_shell.get_system_settings() 惰性导入聚合；无活动实例时
@@ -25,6 +27,10 @@ _LOGGER = logging.getLogger(__name__)
 
 EMERGENCY_HOTKEY_LABEL = "Ctrl+Alt+Esc"
 
+# Win32 RegisterHotKey 失败码：Windows 不暴露热键占用者，只能靠错误码分辨
+# "被别的程序占了"（1409）与"参数非法"（87）这类原因。
+_ERROR_HOTKEY_ALREADY_REGISTERED = 1409
+
 # Win32 常量（仅默认 WindowsHotkeyApi 使用）
 _MOD_ALT = 0x0001
 _MOD_CONTROL = 0x0002
@@ -33,6 +39,19 @@ _VK_ESCAPE = 0x1B
 _WM_HOTKEY = 0x0312
 _WM_APP_QUIT = 0x8001  # WM_APP + 1，close() 发给消息线程的退出消息
 _HOTKEY_ID = 1
+
+
+def _hotkey_unavailable_message(error_code: int = 0) -> str:
+    """注册失败的用户可读原因：点名热键、区分占用与其它错误码并附诊断码。"""
+    base = f"无法注册全局紧急停止热键 {EMERGENCY_HOTKEY_LABEL}"
+    if error_code == _ERROR_HOTKEY_ALREADY_REGISTERED:
+        return (
+            f"{base}：该热键已被其他程序占用（常见于另一个 Y-CODE 实例或第三方工具），"
+            "紧急停止能力不可用；关闭占用程序后重启本程序即可恢复"
+        )
+    if error_code:
+        return f"{base}（Win32 错误码 {error_code}）"
+    return base
 
 
 @runtime_checkable
@@ -92,7 +111,9 @@ class EmergencyStopHotkey:
                 self._available = False
                 raise ComputerControlError(
                     "computer_hotkey_unavailable",
-                    "无法注册全局紧急停止热键 Ctrl+Alt+Esc",
+                    _hotkey_unavailable_message(
+                        getattr(self._api, "last_error_code", 0)
+                    ),
                 )
             self._started = True
             self._available = True
@@ -132,8 +153,15 @@ class WindowsHotkeyApi:
         self._thread: threading.Thread | None = None
         self._thread_id = 0
         self._registered = False
+        self._last_error_code = 0
         self._ready = threading.Event()
         self._on_hotkey: Callable[[], None] | None = None
+
+    @property
+    def last_error_code(self) -> int:
+        """最近一次 RegisterHotKey 失败的 Win32 错误码；成功或未注册为 0。"""
+        with self._state_lock:
+            return self._last_error_code
 
     def register(self, on_hotkey: Callable[[], None]) -> bool:
         with self._state_lock:
@@ -142,6 +170,7 @@ class WindowsHotkeyApi:
             self._on_hotkey = on_hotkey
             self._registered = False
             self._thread_id = 0
+            self._last_error_code = 0
             self._ready.clear()
             thread = threading.Thread(
                 target=self._message_loop,
@@ -184,15 +213,19 @@ class WindowsHotkeyApi:
         import ctypes
         from ctypes import wintypes
 
-        user32 = ctypes.windll.user32
-        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
         thread_id = kernel32.GetCurrentThreadId()
         ok = user32.RegisterHotKey(
             None, _HOTKEY_ID, _MOD_CONTROL | _MOD_ALT | _MOD_NOREPEAT, _VK_ESCAPE
         )
+        # 默认 windll 不保留 last error；改用 use_last_error=True 才能取回
+        # 失败原因，否则日志里只剩"注册失败"四个字，无从排障。
+        error_code = 0 if ok else ctypes.get_last_error()
         with self._state_lock:
             self._thread_id = thread_id
             self._registered = bool(ok)
+            self._last_error_code = error_code
         self._ready.set()
         if not ok:
             return

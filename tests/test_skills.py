@@ -172,3 +172,180 @@ def test_scan_skills_rejects_symlink_outside_search_root(tmp_path, monkeypatch):
     monkeypatch.setattr(skills, "get_skill_dirs", lambda: [str(root)])
 
     assert skills.scan_all_skills() == []
+
+
+def _source_env(tmp_path, monkeypatch):
+    """隔离内置技能源目录、用户技能目录、索引与释放记录，避免触碰真实 ~/.ycode。
+
+    返回 (内置源目录, 用户技能目录 base, config.YCODE_DIR)。
+    """
+    src = tmp_path / "builtin_src"
+    src.mkdir()
+    ycode_dir = tmp_path / "user_home" / ".ycode"
+    ycode_dir.mkdir(parents=True)
+    monkeypatch.setattr(skills, "_BUILTIN_SYNC_DONE", False)
+    monkeypatch.setattr(skills, "_builtin_skills_dir", lambda: str(src))
+    monkeypatch.setattr(config, "YCODE_DIR", str(ycode_dir))
+    monkeypatch.setattr(skills, "ACTIVE_SKILLS_FILE", str(tmp_path / "active_skills.json"))
+    return src, ycode_dir / "skills", ycode_dir
+
+
+def _write_skill(skill_dir: Path, name: str, body: str = "BODY") -> Path:
+    """在 skill_dir 下写一个最小可用 SKILL.md，返回该文件路径。"""
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    path = skill_dir / "SKILL.md"
+    path.write_text(
+        f"---\nname: {name}\ndescription: {name} skill\n---\n{body}\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_classify_skill_source_builtin_when_fingerprint_matches_index(tmp_path, monkeypatch):
+    """场景 a：目录名命中索引且当前指纹与索引记录一致 → 判为内置。"""
+    src, _user, _yc = _source_env(tmp_path, monkeypatch)
+    skill_dir = tmp_path / "skills" / "demo"
+    _write_skill(skill_dir, "demo")
+    fingerprint = skills._skill_dir_fingerprint(str(skill_dir))
+    assert fingerprint
+
+    index = {"demo": fingerprint}
+
+    assert skills.classify_skill_source(str(skill_dir), index) == "builtin"
+
+
+def test_classify_skill_source_user_when_indexed_but_content_modified(tmp_path, monkeypatch):
+    """场景 b：目录名命中索引，但内容被用户改动（指纹不符）→ 判为用户。"""
+    src, _user, _yc = _source_env(tmp_path, monkeypatch)
+    skill_dir = tmp_path / "skills" / "demo"
+    _write_skill(skill_dir, "demo")
+    recorded = skills._skill_dir_fingerprint(str(skill_dir))
+
+    # 用户改动技能内容
+    (skill_dir / "SKILL.md").write_text("用户改写内容", encoding="utf-8")
+
+    assert skills.classify_skill_source(str(skill_dir), {"demo": recorded}) == "user"
+
+
+def test_classify_skill_source_user_when_name_absent_from_index(tmp_path, monkeypatch):
+    """场景 c：目录名不在索引中（用户自建技能）→ 判为用户。"""
+    src, _user, _yc = _source_env(tmp_path, monkeypatch)
+    skill_dir = tmp_path / "skills" / "mine"
+    _write_skill(skill_dir, "mine")
+
+    assert skills.classify_skill_source(str(skill_dir), {}) == "user"
+    assert skills.classify_skill_source(str(skill_dir), {"other": "x"}) == "user"
+
+
+def test_classify_skill_source_builtin_when_under_builtin_dir(tmp_path, monkeypatch):
+    """场景 d：技能目录直接位于 _builtin_skills_dir() 之下 → 判为内置（无需索引）。"""
+    src, _user, _yc = _source_env(tmp_path, monkeypatch)
+    skill_dir = src / "demo"
+    _write_skill(skill_dir, "demo")
+
+    assert skills.classify_skill_source(str(skill_dir), {}) == "builtin"
+
+
+def test_scan_all_skills_each_item_exposes_valid_source(tmp_path, monkeypatch):
+    """场景 e：scan_all_skills 每个技能字典都带 source 键，取值只能是 builtin/user。"""
+    src, _user, _yc = _source_env(tmp_path, monkeypatch)
+    skills_root = tmp_path / "skills"
+    builtin_dir = skills_root / "demo"
+    user_dir = skills_root / "mine"
+    _write_skill(builtin_dir, "demo")
+    _write_skill(user_dir, "mine")
+
+    # 只把 "demo" 记为内置索引且指纹一致；"mine" 用户自建不入索引
+    config._atomic_write_json(
+        skills._builtin_skills_index_file(),
+        {"demo": skills._skill_dir_fingerprint(str(builtin_dir))},
+        indent=None,
+    )
+    monkeypatch.setattr(skills, "get_skill_dirs", lambda: [str(skills_root)])
+
+    found = skills.scan_all_skills()
+
+    assert len(found) == 2
+    for info in found:
+        assert "source" in info
+        assert info["source"] in {"builtin", "user"}
+    sources = {info["name"]: info["source"] for info in found}
+    assert sources["demo"] == "builtin"
+    assert sources["mine"] == "user"
+
+
+def test_sync_indexes_only_unmodified_released_skills(tmp_path, monkeypatch):
+    """场景 f：sync 后为「真正释放且内容未改」的技能补索引；同名不同内容不补。"""
+    src, user_skills, _yc = _source_env(tmp_path, monkeypatch)
+    # 内置源：plugin-creator（将被释放）、user-mod（用户已有同名不同内容）
+    _write_skill(src / "plugin-creator", "plugin-creator", body="内置正文")
+    _write_skill(src / "user-mod", "user-mod", body="内置正文")
+    # 用户事先已存在同名技能，且内容与内置源不同
+    _write_skill(user_skills / "user-mod", "user-mod", body="用户自建内容")
+
+    skills.sync_builtin_skills()
+
+    index = skills.load_builtin_skill_index()
+    # 全新释放且内容未改的 plugin-creator 被写入索引
+    assert "plugin-creator" in index
+    assert index["plugin-creator"] == skills._skill_dir_fingerprint(
+        str(user_skills / "plugin-creator")
+    )
+    # 用户已有同名且内容不同的 user-mod 不写入索引
+    assert "user-mod" not in index
+
+    # 来源判定：释放的技能判为内置，用户技能判为用户
+    assert skills.classify_skill_source(str(user_skills / "plugin-creator")) == "builtin"
+    assert skills.classify_skill_source(str(user_skills / "user-mod")) == "user"
+
+def test_scan_all_skills_classifies_builtin_on_first_scan_before_index_exists(
+    tmp_path, monkeypatch
+):
+    """进程内首扫即触发 sync 补齐索引：已释放的内置技能必须判为 builtin（回归）。
+
+    复现缺陷：scan_all_skills 若先 load 索引再调 get_skill_dirs()，首扫会读到空索引，
+    把已释放的内置技能误标为用户。修复后顺序为 get_skill_dirs() -> load 索引 -> 遍历。
+
+    隔离方式说明：不直接替换 get_skill_dirs（那会绕过其内部触发的 sync_builtin_skills()），
+    而是保留真实 get_skill_dirs 链路，仅替换更内层的目录来源——让 config.YCODE_DIR/skills
+    恰好等于被扫描的用户技能目录 dest，并屏蔽自定义搜索路径与 $HOME/.agents，使
+    get_skill_dirs() 只返回 [dest]，且首次调用仍会触发 sync 并补齐索引。
+    """
+    import os
+    import shutil
+
+    src, dest, _ycode_dir = _source_env(tmp_path, monkeypatch)
+    skill_name = "plugin-creator"
+    _write_skill(src / skill_name, skill_name, body="builtin body")
+
+    # 模拟"已释放"：把内置技能目录内容原样复制到用户技能目录
+    dest.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src / skill_name, dest / skill_name)
+    # released 记录该技能名；索引文件故意不存在
+    config._atomic_write_json(skills._builtin_released_file(), [skill_name], indent=None)
+    index_file = skills._builtin_skills_index_file()
+    assert not os.path.exists(index_file)
+
+    # 屏蔽真实目录来源，保证扫描目录仅为 dest，同时保留 get_skill_dirs 内部的 sync 链路
+    monkeypatch.setattr(skills, "get_user_skill_search_paths", lambda: [])
+    monkeypatch.setattr(skills.os.path, "expanduser", lambda _value: str(tmp_path / "fake_home"))
+
+    found = skills.scan_all_skills()
+
+    by_name = {info["name"]: info for info in found}
+    assert skill_name in skills.load_builtin_skill_index()
+
+
+def test_skill_source_label_normalizes_unknown_to_user():
+    """来源标签归一：仅 source == "builtin" 显示"内置"，缺失/非法/非字典一律回落"用户"。
+
+    该函数供 CLI 三处展示入口共用（/skills list、技能快捷指令下拉、全屏选择器），
+    保守回落保证未知来源不会被误标为内置。
+    """
+    assert skills.skill_source_label({"source": "builtin"}) == "内置"
+    assert skills.skill_source_label({"source": "user"}) == "用户"
+    assert skills.skill_source_label({}) == "用户"
+    assert skills.skill_source_label({"source": None}) == "用户"
+    # 大小写敏感：后端契约只产出小写 "builtin"，其余取值不算内置
+    assert skills.skill_source_label({"source": "BUILTIN"}) == "用户"
+    assert skills.skill_source_label(None) == "用户"

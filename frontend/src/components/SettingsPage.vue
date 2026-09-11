@@ -12,6 +12,8 @@
       <div class="nav-section">关于</div>
       <button data-test="about-nav" class="nav-item" :class="{ active: activeSection === 'about' }" @click="activeSection = 'about'"><span class="nav-ico"><AppIcon name="info" :size="14" /></span>关于</button>
       <button data-test="contact-nav" class="nav-item" :class="{ active: activeSection === 'contact' }" @click="activeSection = 'contact'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>联系我们</button>
+      <div class="nav-section">法律</div>
+      <button data-test="disclaimer-nav" class="nav-item" :class="{ active: activeSection === 'disclaimer' }" @click="activeSection = 'disclaimer'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>免责条款</button>
       <div class="nav-spacer"></div>
       <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><AppIcon name="settings" :size="13" /></div>
     </aside>
@@ -450,6 +452,34 @@
           <p v-else class="changelog-empty">更新内容加载中…</p>
         </section>
       </template>
+      <template v-else-if="activeSection === 'disclaimer'">
+        <header class="settings-header settings-header--narrow">
+          <div>
+            <h1>免责条款</h1>
+            <p>使用本软件前，请阅读并理解以下条款。继续使用本软件，即视为你已阅读并接受本条款。</p>
+          </div>
+        </header>
+
+        <section class="perm-settings-card disclaimer-card" data-test="disclaimer-doc">
+          <div class="disclaimer-meta">
+            <span class="mono" data-test="disclaimer-version">{{ disclaimerVersion }}</span>
+            <span>更新日期 {{ disclaimerUpdatedAt }}</span>
+            <span>适用于本软件全部发行版本</span>
+          </div>
+
+          <article v-for="(clause, i) in disclaimerClauses" :key="i" class="disclaimer-clause">
+            <h3>{{ clause.title }}</h3>
+            <ol class="disclaimer-list">
+              <li v-for="(item, j) in clause.items" :key="j">{{ item }}</li>
+            </ol>
+          </article>
+
+          <footer class="disclaimer-foot">
+            <p>本条款是软件使用条款的组成部分。若你不同意其中任何内容，请停止使用本软件。</p>
+            <p>如对条款有疑问，可通过「联系我们」中的邮箱与我们沟通。</p>
+          </footer>
+        </section>
+      </template>
       <TokenUsageSettings v-else-if="activeSection === 'tokens'" />
       <SystemSettings v-else-if="activeSection === 'system'" />
       <PersonaSettings v-else-if="activeSection === 'persona'" />
@@ -544,11 +574,17 @@ import PersonaSettings from './PersonaSettings.vue';
 import { useIsMobile } from '../composables/useViewport';
 import qrcodeWechat from '../assets/qrcode-wechat.png';
 import qrcodeFeishu from '../assets/qrcode-feishu.png';
+// 免责条款正文与版本号：设置页展示与首次使用确认弹窗共用同一事实源
+import {
+  DISCLAIMER_CLAUSES as disclaimerClauses,
+  DISCLAIMER_UPDATED_AT as disclaimerUpdatedAt,
+  DISCLAIMER_VERSION as disclaimerVersion,
+} from '../data/disclaimer';
 
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 // ── 手机端钻取式布局（≤768px）────────────────────────────────
 // 桌面：分区侧栏 + 厂商列表 + 详情三栏并排（isMobile=false，模板不变）。
@@ -973,6 +1009,14 @@ const currentEntry = computed<ChangelogEntry | null>(() => {
 });
 
 // ------------------------------------------------------------------
+// 免责条款页（法律声明）
+// ------------------------------------------------------------------
+// 条款正文与版本号统一维护在 ../data/disclaimer.ts，设置页与首次使用
+// 确认弹窗共用同一事实源。修改条款只需改该文件，并同步递增后端
+// core/disclaimer_consent.py 的 DISCLAIMER_VERSION（否则已同意旧版本的
+// 用户不会重新看到确认弹窗）。
+
+// ------------------------------------------------------------------
 // 联系我们页
 // ------------------------------------------------------------------
 const contactEmail = 'contact@example.com';
@@ -1162,6 +1206,17 @@ onMounted(async () => {
 
 /* ── 权限与沙盒分区 ── */
 .perm-settings-card { max-width: 860px; margin: 0 auto; border: 1px solid var(--border); border-radius: 16px; background: var(--bg1); padding: 10px 28px 28px; }
+
+/* ── 免责条款分区（法律声明）── */
+.disclaimer-card { padding: 6px 32px 30px; }
+.disclaimer-meta { display: flex; flex-wrap: wrap; gap: 8px 16px; padding: 18px 0 2px; color: var(--text-faint); font-size: 12px; }
+.disclaimer-meta .mono { color: var(--text-dim); }
+.disclaimer-clause { padding-top: 22px; }
+.disclaimer-clause h3 { margin: 0 0 10px; font-size: 14px; }
+.disclaimer-list { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 8px; }
+.disclaimer-list li { color: var(--text-dim); font-size: 12.5px; line-height: 1.85; }
+.disclaimer-foot { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); }
+.disclaimer-foot p { margin: 0 0 6px; color: var(--text-faint); font-size: 12px; line-height: 1.8; }
 
 /* ── 外观与主题分区 ── */
 .appearance-section { width: 100%; min-width: 0; }

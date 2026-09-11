@@ -7,6 +7,7 @@ tests/test_gui_update.py
 import json
 import os
 import tempfile
+import time
 import urllib.error
 from unittest.mock import MagicMock, patch
 
@@ -17,7 +18,7 @@ from core.updater import (
     cleanup_old_installers,
     fetch_latest_release,
     get_update_cache_dir,
-    launch_installer_and_cleanup,
+    launch_installer,
     parse_version,
     parse_release_sha256,
     _collect_split_parts,
@@ -115,28 +116,50 @@ def test_fetch_latest_release_same_version():
         assert res["latest_version"] == YCODE_VERSION
 
 
-def test_cleanup_old_installers():
-    """测试旧安装包与临时文件清理。"""
-    cache_dir = get_update_cache_dir()
-    os.makedirs(cache_dir, exist_ok=True)
-    dummy_exe = os.path.join(cache_dir, "test_old_setup.exe")
-    dummy_tmp = os.path.join(cache_dir, "test_download.tmp")
+def test_cleanup_old_installers(tmp_path, monkeypatch):
+    """更新缓存清理策略：老化残留与下载残片被清掉，且完全隔离到 tmp_path。"""
+    monkeypatch.setattr("core.updater.get_update_cache_dir", lambda: str(tmp_path))
+    dummy_exe = os.path.join(str(tmp_path), "test_old_setup.exe")
+    dummy_tmp = os.path.join(str(tmp_path), "Y-CODE-Setup-v9.9.9.exe.downloading")
     with open(dummy_exe, "w") as f:
         f.write("dummy")
     with open(dummy_tmp, "w") as f:
         f.write("dummy")
+    # 把非标准命名残留的时间拨到 30 天前，命中 keep_days 老化分支
+    old_ts = time.time() - 30 * 24 * 3600
+    os.utime(dummy_exe, (old_ts, old_ts))
 
     assert os.path.exists(dummy_exe)
     assert os.path.exists(dummy_tmp)
 
-    cleaned = cleanup_old_installers()
-    assert cleaned >= 2
+    cleaned = cleanup_old_installers(current_version="1.2.5", keep_days=7)
+    assert cleaned == 2
     assert not os.path.exists(dummy_exe)
     assert not os.path.exists(dummy_tmp)
 
 
 def test_launch_installer_missing_file():
-    assert launch_installer_and_cleanup("C:/non_existent_path_123.exe") is False
+    assert launch_installer("C:/non_existent_path_123.exe") is False
+
+
+def test_launch_installer_starts_wizard_without_deleting_package(tmp_path):
+    """启动命令必须是 start /wait "" "<路径>"，且不能带 & del
+    —— 否则用户一关掉安装向导包就被删了，必须重新下载。"""
+    installer = os.path.join(str(tmp_path), "Y-CODE-Setup-v1.2.6.exe")
+    with open(installer, "wb") as f:
+        f.write(b"MZ" + b"\x00" * 64)
+
+    norm_path = os.path.normpath(installer)
+    with patch("subprocess.Popen") as mock_popen:
+        assert launch_installer(installer) is True
+
+    assert mock_popen.call_count == 1
+    cmd = mock_popen.call_args[0][0]
+    assert cmd == f'start /wait "" "{norm_path}"'
+    assert "del" not in cmd
+    assert "&" not in cmd
+    # 启动后安装包必须仍在（清理责任已移交向导 / 启动时策略清理）
+    assert os.path.exists(installer)
 
 
 def test_gui_bridge_update_api():
@@ -610,7 +633,7 @@ def test_launch_installer_rejects_non_pe_file():
         f.write(b"<!DOCTYPE html><html><body>not an exe</body></html>")
 
     try:
-        assert launch_installer_and_cleanup(fake_exe) is False
+        assert launch_installer(fake_exe) is False
     finally:
         os.remove(fake_exe)
 

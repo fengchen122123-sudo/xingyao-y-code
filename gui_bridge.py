@@ -65,8 +65,9 @@ from core.version import __version__ as YCODE_VERSION
 from core.updater import (
     cleanup_old_installers,
     fetch_latest_release,
+    find_cached_installer,
     updater_downloader,
-    launch_installer_and_cleanup,
+    launch_installer,
 )
 
 logger = logging.getLogger(__name__)
@@ -591,7 +592,8 @@ class ApiBridge:
         except Exception:
             logger.warning("注册后台命令任务完成回调失败", exc_info=True)
 
-        # 启动时后台清理历史残留安装包与临时文件
+        # 启动时后台策略化清理更新缓存：删除版本 ≤ 当前运行版本的安装包、
+        # 下载残片与超期残留，保留版本高于当前的包（用户可能还要安装）
         threading.Thread(
             target=cleanup_old_installers,
             daemon=True,
@@ -1718,12 +1720,45 @@ class ApiBridge:
             return {"ok": False, "entries": [], "msg": str(e)}
 
     def check_update(self, manual: bool = False) -> Dict[str, Any]:
-        """检查 Gitee Releases 是否有新版本。"""
+        """检查 Gitee Releases 是否有新版本。
+
+        在既有返回结构上新增 cached_installer（纯加法）：当更新缓存目录里
+        已有目标版本的安装包（按 Release 发布的官方 SHA256 / 大小校验通过）
+        时给出其绝对路径，前端据此直接进入"已就绪、可安装"，无需重新下载。
+        缓存探测属增强能力，任何异常一律兜底为 ""，绝不影响更新检查本身。
+        """
         try:
-            return fetch_latest_release()
+            info = fetch_latest_release()
+            info["cached_installer"] = self._probe_cached_installer(info)
+            return info
         except Exception as e:
             logger.exception("检查更新失败")
-            return {"ok": False, "has_update": False, "msg": f"检查更新失败: {e}"}
+            return {
+                "ok": False,
+                "has_update": False,
+                "cached_installer": "",
+                "msg": f"检查更新失败: {e}",
+            }
+
+    @staticmethod
+    def _probe_cached_installer(info: Dict[str, Any]) -> str:
+        """探测可复用的缓存安装包，返回绝对路径；不可复用时返回空串。
+
+        仅在"确实有更新"时才做探测：无更新时目标版本等于当前运行版本，
+        缓存里的包只可能是启动清理未及处理的旧包，复用无意义，同时也能
+        避免每次静默检查都去哈希几百 MB 的安装包。
+        """
+        try:
+            if not isinstance(info, dict) or not info.get("has_update"):
+                return ""
+            return find_cached_installer(
+                str(info.get("latest_version") or ""),
+                str(info.get("sha256") or ""),
+                int(info.get("asset_size") or 0),
+            ) or ""
+        except Exception:
+            logger.warning("探测缓存安装包失败，按未命中处理", exc_info=True)
+            return ""
 
     def download_update(
         self,
@@ -1794,9 +1829,14 @@ class ApiBridge:
             return {"ok": False, "busy": True, "msg": str(e)}
 
     def launch_installer(self, file_path: str) -> Dict[str, Any]:
-        """唤起外部安装向导并安全退出当前程序（带安装后自清理）。"""
+        """唤起外部安装向导并安全退出当前程序。
+
+        安装包清理由安装向导（安装成功时自清理）与启动时的
+        cleanup_old_installers（未安装成功的残留）负责，
+        这里调用的是 core.updater 模块级函数 launch_installer。
+        """
         try:
-            ok = launch_installer_and_cleanup(file_path)
+            ok = launch_installer(file_path)
             if ok:
                 threading.Thread(target=self._delayed_exit, daemon=True).start()
                 return {"ok": True}
@@ -2354,6 +2394,8 @@ class ApiBridge:
                 "allow_outside_workspace": bool(config_data.get("allow_outside_workspace", False)),
                 "system_settings": self.get_system_settings(),
                 "persona_settings": self.get_persona_settings(),
+                # 免责条款同意状态：前端据此判断是否需要弹"首次使用确认"框
+                "disclaimer": self.get_disclaimer_consent(),
                 "sessions": self.get_sessions(),
                 "skills": self._build_skill_list(),
                 "mcps": self._build_mcp_list(),
@@ -3297,6 +3339,30 @@ class ApiBridge:
             return {"ok": False, "msg": str(error)}
         except Exception as e:  # pragma: no cover - 防御性兜底
             logger.exception("set_persona_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
+    # 免责条款同意（合规链路：首次使用与条款版本升级后必须显式确认，
+    # 不同意则退出软件；记录写入 ~/.ycode/disclaimer_consent.json）
+    # ------------------------------------------------------------------
+
+    def get_disclaimer_consent(self) -> Dict[str, Any]:
+        """返回免责条款同意状态快照（当前版本 + 已同意版本 + 同意时间）。"""
+        from core.disclaimer_consent import get_disclaimer_consent
+
+        return {"ok": True, **get_disclaimer_consent()}
+
+    def accept_disclaimer(self) -> Dict[str, Any]:
+        """记录用户已接受当前免责条款版本（版本号以服务端为准，防前端旧缓存绕过）。"""
+        from core.disclaimer_consent import DisclaimerConsentError, accept_disclaimer
+
+        try:
+            snapshot = accept_disclaimer()
+            return {"ok": True, **snapshot, "msg": "已记录条款同意"}
+        except DisclaimerConsentError as error:
+            return {"ok": False, "msg": str(error)}
+        except Exception as e:  # pragma: no cover - 防御性兜底
+            logger.exception("accept_disclaimer 失败")
             return {"ok": False, "msg": str(e)}
 
 
@@ -5166,6 +5232,7 @@ class ApiBridge:
                     "name": str(s.get("name", "")),
                     "description": str(s.get("description", "")),
                     "enabled": skill_id in active_ids,
+                    "source": str(s.get("source") or "user"),
                 })
             return skills
         except Exception:
