@@ -59,7 +59,7 @@ def test_model_settings_snapshot_is_complete_without_secret(tmp_path, monkeypatc
     assert [item["id"] for item in snapshot["protocols"]] == [
         "anthropic", "openai", "responses"
     ]
-    assert any(item["id"] == "deepseek" for item in snapshot["presets"])
+    assert any(item["id"] == "kimi-coding-openai" for item in snapshot["presets"])
     provider = snapshot["providers"][0]
     assert provider["has_api_key"] is True
     assert "api_key" not in provider
@@ -103,18 +103,18 @@ def test_model_settings_active_model_falls_back_to_global(tmp_path, monkeypatch)
 def test_add_preset_provider_returns_refreshed_snapshot(tmp_path, monkeypatch):
     _use_tmp_config(tmp_path, monkeypatch, {"active_model_id": None, "providers": []})
 
-    result = _bare_bridge().add_preset_provider("deepseek", "sk-new")
+    result = _bare_bridge().add_preset_provider("kimi-coding-openai", "sk-new")
 
     assert result["ok"] is True
-    deepseek = next(
+    kimi = next(
         provider for provider in result["settings"]["providers"]
-        if provider.get("preset_id") == "deepseek"
+        if provider.get("preset_id") == "kimi-coding-openai"
     )
-    assert deepseek["protocol"] == "openai"
-    assert deepseek["has_api_key"] is True
-    # deepseek-flash 已在预置目录登记为多模态模型，断言按名字定位以免受顺序影响
-    flash = next(m for m in deepseek["models"] if m["name"] == "deepseek-flash")
-    assert flash["supports_vision"] is True
+    assert kimi["protocol"] == "openai"
+    assert kimi["has_api_key"] is True
+    # kimi-for-coding 已在预置目录登记为多模态模型，断言按名字定位以免受顺序影响
+    model = next(m for m in kimi["models"] if m["name"] == "kimi-for-coding")
+    assert model["supports_vision"] is True
 
 
 def test_add_and_update_model_persist_multimodal_flag(tmp_path, monkeypatch):
