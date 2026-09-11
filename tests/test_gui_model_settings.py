@@ -117,6 +117,48 @@ def test_add_preset_provider_returns_refreshed_snapshot(tmp_path, monkeypatch):
     assert model["supports_vision"] is True
 
 
+def test_sync_preset_models_for_removed_preset_returns_readable_message(tmp_path, monkeypatch):
+    """预置厂商已从目录移除时，GUI 必须给出可读提示，而不是裸 KeyError 文本。"""
+    _use_tmp_config(
+        tmp_path,
+        monkeypatch,
+        {
+            "active_model_id": None,
+            "providers": [
+                {
+                    "id": "p1",
+                    "name": "智谱API",
+                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "api_key": "sk-old",
+                    "protocol": "openai",
+                    "preset_id": "zhipu",
+                    "models": [],
+                }
+            ],
+        },
+    )
+
+    result = _bare_bridge().sync_preset_models("zhipu")
+
+    assert result["ok"] is False
+    assert "预置目录" in result["msg"]
+    assert "KeyError" not in result["msg"]
+    assert result["msg"] != "'zhipu'"
+
+
+def test_sync_preset_models_for_known_preset_still_reports_success(tmp_path, monkeypatch):
+    """兜底不得误伤正常同步：仍在预置目录中的厂商照常返回成功。"""
+    _use_tmp_config(tmp_path, monkeypatch, {"active_model_id": None, "providers": []})
+    bridge = _bare_bridge()
+    bridge.add_preset_provider("kimi-coding-openai", "sk-new")
+
+    result = bridge.sync_preset_models("kimi-coding-openai")
+
+    assert result["ok"] is True
+    assert result["added"] == 0
+    assert result["msg"] == "预置模型已是最新"
+
+
 def test_add_and_update_model_persist_multimodal_flag(tmp_path, monkeypatch):
     _use_tmp_config(tmp_path, monkeypatch, _configured_data())
     bridge = _bare_bridge()

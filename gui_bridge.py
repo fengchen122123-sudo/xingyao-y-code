@@ -6037,6 +6037,14 @@ class ApiBridge:
                 "settings": self.get_model_settings(),
                 "msg": f"已同步 {added} 个新模型" if added else "预置模型已是最新",
             }
+        except KeyError:
+            # 预置目录随版本更新会下架厂商，旧 config 中的 preset_id 于是成为未知厂商。
+            # 这是可预期状态：给前端可读提示，不按异常记录堆栈。
+            logger.info("预置厂商 %s 不在当前预置目录中，跳过同步", preset_id)
+            return {
+                "ok": False,
+                "msg": "该厂商已不在预置目录中，无法自动同步；可在该厂商下手动添加模型",
+            }
         except Exception as e:
             logger.exception("sync_preset_models 失败")
             return {"ok": False, "msg": str(e)}
