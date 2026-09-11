@@ -4,9 +4,10 @@ import sys
 import json
 import glob
 import shutil
+import pathlib
+import hashlib
 import logging
 import threading
-
 import config
 from core.workspace_context import get_workdir
 # 使用一个独立的文件来记录当前启用的技能列表
@@ -43,6 +44,144 @@ def _builtin_released_file():
     """记录已释放过的内置技能名：区分"从未释放"与"用户已删除"，防止重启后复活。"""
     return os.path.join(config.YCODE_DIR, "builtin_skills_released.json")
 
+
+def _builtin_skills_index_file():
+    """内置技能内容索引文件路径：{"技能目录名": "内容指纹"}。
+
+    内置技能释放后与用户自建技能物理同居 ~/.ycode/skills，无法靠路径区分来源，
+    因此额外记录"真正由内置释放、且内容未被用户改动"的技能指纹，供 GUI/CLI 标注
+    来源（内置 / 用户）。索引只增不改：已有记录不重算、不覆盖。
+    """
+    return os.path.join(config.YCODE_DIR, "builtin_skills_index.json")
+
+
+def _skill_dir_fingerprint(skill_dir):
+    """计算技能目录的内容指纹（sha256）：所有文件的相对路径 posix 形式 + 内容哈希。
+
+    跳过路径中含 __pycache__ 的片段与 .pyc 文件（编译缓存不属于技能内容）。
+    单个文件读取失败只告警并跳过，不抛异常：该函数运行在启动扫描路径上，
+    不能因为个别文件权限问题中断整个技能扫描。失败时返回 ""（调用方按不匹配处理）。
+    """
+    digest = hashlib.sha256()
+    try:
+        paths = sorted(pathlib.Path(skill_dir).rglob("*"))
+    except OSError as e:
+        _log_warning("遍历技能目录失败 %s: %s", skill_dir, e)
+        return ""
+    for path in paths:
+        try:
+            if not path.is_file():
+                continue
+            rel = path.relative_to(skill_dir).as_posix()
+        except (OSError, ValueError) as e:
+            _log_warning("读取技能条目信息失败 %s: %s", path, e)
+            continue
+        if "__pycache__" in rel.split("/") or rel.endswith(".pyc"):
+            continue
+        try:
+            data = path.read_bytes()
+        except OSError as e:
+            _log_warning("读取技能文件失败 %s: %s", path, e)
+            continue
+        digest.update(rel.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(data).digest())
+    return digest.hexdigest()
+
+
+def load_builtin_skill_index():
+    """读取内置技能内容索引为 dict[str, str]。
+
+    文件不存在 / 解析失败 / 内容不是对象 / 值类型不符，一律返回 {}，绝不抛异常
+    （来源标注属于展示信息，不应影响技能扫描主流程）。
+    """
+    try:
+        data = config._read_json_with_backup(_builtin_skills_index_file(), default=None)
+    except Exception as e:
+        _log_warning("读取内置技能索引失败: %s", e)
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    index = {}
+    for name, fingerprint in data.items():
+        if isinstance(name, str) and isinstance(fingerprint, str):
+            index[name] = fingerprint
+    return index
+
+
+def classify_skill_source(skill_dir, index=None):
+    """判定技能来源：返回 "builtin"（内置）或 "user"（用户）。
+
+    判据为"内容指纹精确口径"，与内置插件 source 字段约定（"user" | "builtin"）一致：
+      1. 目录直接位于内置源目录（_builtin_skills_dir()）之下 → builtin
+         （直接扫描随包发布的 skills/ 目录的场景）；
+      2. 否则取目录名命中索引，且该目录当前指纹与索引记录完全一致 → builtin
+         （内置技能已被释放到用户目录且内容未被改动）；
+      3. 其它情况（含目录名命中但内容已被用户改动）→ user。
+    index 为 None 时自行加载索引；显式传入便于测试注入，避免重复读盘。
+    """
+    if not skill_dir:
+        return "user"
+    try:
+        target = os.path.normcase(os.path.abspath(skill_dir))
+    except OSError as e:
+        _log_warning("规范化技能目录失败 %s: %s", skill_dir, e)
+        return "user"
+    try:
+        builtin_root = os.path.normcase(os.path.abspath(_builtin_skills_dir()))
+    except OSError as e:
+        _log_warning("规范化内置技能目录失败: %s", e)
+        builtin_root = ""
+    if builtin_root and (target == builtin_root or target.startswith(builtin_root + os.sep)):
+        return "builtin"
+    if index is None:
+        index = load_builtin_skill_index()
+    if not isinstance(index, dict):
+        return "user"
+    recorded = index.get(os.path.basename(os.path.normpath(str(skill_dir))))
+    if not recorded:
+        return "user"
+    current = _skill_dir_fingerprint(skill_dir)
+    return "builtin" if current and current == recorded else "user"
+
+
+def skill_source_label(skill):
+    """把技能字典归一为中文来源标签（"内置" / "用户"），供 CLI 各展示入口复用。
+
+    调用方：/skills list、技能快捷指令下拉、全屏技能选择器。
+    source 缺失或取值非 "builtin" 一律回落"用户"：宁可保守，也不能把
+    未知来源误标为内置。
+    """
+    if not isinstance(skill, dict):
+        return "用户"
+    return "内置" if skill.get("source") == "builtin" else "用户"
+
+
+def _update_builtin_skill_index(src, dest_base, released):
+    """为已释放的内置技能补齐内容索引（只补缺失项，不重算、不覆盖已有记录）。
+
+    覆盖两类情况：本次全新释放的技能；老用户此前已释放、但索引文件尚不存在的技能。
+    仅当用户目录中的技能内容与内置源目录指纹完全一致时才打标，用户改动过的技能
+    保持 user 来源。写入失败只告警，不影响释放主流程。
+    """
+    try:
+        index = load_builtin_skill_index()
+        changed = False
+        for name in released:
+            if not isinstance(name, str) or not name or name in index:
+                continue
+            src_dir = os.path.join(src, name)
+            dest_dir = os.path.join(dest_base, name)
+            if not os.path.isdir(src_dir) or not os.path.isdir(dest_dir):
+                continue
+            src_fp = _skill_dir_fingerprint(src_dir)
+            if src_fp and src_fp == _skill_dir_fingerprint(dest_dir):
+                index[name] = src_fp
+                changed = True
+        if changed:
+            config._atomic_write_json(_builtin_skills_index_file(), index, indent=None)
+    except Exception as e:
+        _log_warning("补齐内置技能索引失败: %s", e)
 
 def sync_builtin_skills():
     """把内置技能释放到用户级技能目录（仅缺失时拷贝，绝不覆盖用户改动）。
@@ -118,6 +257,8 @@ def _sync_builtin_skills_impl():
             config._atomic_write_json(_builtin_released_file(), released, indent=None)
         except Exception as e:
             _log_warning("保存内置技能释放记录失败: %s", e)
+    # 补齐内置技能内容索引：覆盖本次新释放的技能，以及老用户已释放但索引缺失的技能
+    _update_builtin_skill_index(src, dest_base, released)
     if newly_installed:
         # 新释放的技能默认启用；只在 active_skills.json 里追加，不动用户既有选择
         # 默认关闭名单内的技能（tokenrhythm-image / -account / -image-api）不追加，仅文件已释放
@@ -349,8 +490,13 @@ def scan_all_skills():
     """
     skills = []
     seen_ids = set()  # 按绝对路径去重，防止多个扫描目录指向同一物理位置时重复加载
+    # 先取基础目录：get_skill_dirs() 首次调用会释放内置技能并补齐内容索引，
+    # 索引读取必须在其之后，否则进程内首扫会读到空索引而把内置技能误标为用户。
+    base_dirs = get_skill_dirs()
+    # 内置技能内容索引只读一次，避免逐个技能重复读盘
+    builtin_index = load_builtin_skill_index()
 
-    for base_dir in get_skill_dirs():
+    for base_dir in base_dirs:
         if not os.path.exists(base_dir):
             continue
         base_real = os.path.normcase(os.path.realpath(os.path.abspath(base_dir)))
@@ -384,6 +530,8 @@ def scan_all_skills():
                     seen_ids.add(norm_id)
                     skill_info = parse_skill_md(file_path)
                     if skill_info:
+                        # 来源标注：内置（内容未被改动）或用户自建/已改动
+                        skill_info["source"] = classify_skill_source(skill_dir, builtin_index)
                         skills.append(skill_info)
                     break  # 找到一个就不再找 skill.md
 

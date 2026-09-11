@@ -258,6 +258,7 @@ export interface SkillInfo {
   name: string;
   description: string;
   enabled: boolean;
+  source?: string;     // user | builtin（旧版本后端可能不返回）
 }
 
 export interface McpInfo {
@@ -530,6 +531,29 @@ export interface BridgeEvent {
   event_seq?: number;
 }
 
+// check_update() 的返回结构。cached_installer 为后端探测到的本地可复用
+// 安装包绝对路径（缓存命中且通过官方 SHA256 / 大小校验），空串表示需下载；
+// 旧后端不返回该字段时视为空串（向后兼容）。
+export interface UpdateCheckResult {
+  ok: boolean;
+  has_update: boolean;
+  cached_installer?: string;
+  latest_version?: string;
+  current_version?: string;
+  release_title?: string;
+  release_notes?: string;
+  download_url?: string;
+  asset_name?: string;
+  asset_size?: number;
+  // 分卷下载（Gitee 单附件 100MB 限制）：非空时 download_url 不再是直链
+  part_urls?: string[];
+  part_count?: number;
+  is_split?: boolean;
+  // 官方 SHA256（来自 Release 描述），下载完成后后端强制校验
+  sha256?: string;
+  msg?: string;
+}
+
 // 后端所有方法均返回 Promise<纯 JSON 对象>；大多数写操作的返回值形状
 // 为 { ok: boolean, msg?: string, ...其余按方法而定 }，此处以 any 承接，
 // 具体字段读取处自行按契约文档取用，避免过度约束导致类型摩擦。
@@ -690,7 +714,7 @@ export interface PyWebViewAPI {
   set_secondary_model(modelId: string): Promise<any>;
   set_secondary_roles(roles: { vision: boolean; compression: boolean; subagent: boolean }): Promise<any>;
 
-  check_update(manual?: boolean): Promise<any>;
+  check_update(manual?: boolean): Promise<UpdateCheckResult>;
   // 分卷模式：partUrls 为 .part1..partN 直链序列（Gitee 单附件 100MB 限制），
   // 下载器顺序下载拼接还原 exe；sha256 为 Release 描述里发布的官方校验和，
   // 非空时强制校验，不匹配即拒绝安装；totalSize 为各分卷字节数之和（进度分母）

@@ -131,4 +131,34 @@ describe('appStore update functionality', () => {
     expect(store.confirmModal.title).toContain('任务进行中警告');
     expect(store.confirmModal.message).toContain('中断正在执行的任务');
   });
+  it('reuses cached installer returned by check_update without downloading', async () => {
+    const store = useAppStore();
+    const api = (window as any).pywebview.api;
+    store.version = '1.2.5';
+    api.check_update.mockResolvedValue({
+      ok: true,
+      has_update: true,
+      latest_version: '1.2.6',
+      current_version: '1.2.5',
+      release_title: 'Y-CODE v1.2.6',
+      download_url: 'https://gitee.com/download/setup.exe',
+      asset_name: 'Y-CODE-Setup-v1.2.6.exe',
+      asset_size: 52428800,
+      cached_installer: 'C:/temp/ycode_updates/Y-CODE-Setup-v1.2.6.exe',
+    });
+
+    await store.checkUpdate(true);
+
+    // 缓存命中：后端已校验通过本地安装包，前端直接进入"已就绪"态
+    expect(store.updateState.status).toBe('downloaded');
+    expect(store.updateState.installerPath).toBe(
+      'C:/temp/ycode_updates/Y-CODE-Setup-v1.2.6.exe',
+    );
+    expect(store.updateState.downloadProgress).toBe(100);
+    expect(store.updateState.totalBytes).toBe(52428800);
+    // 不得再触发下载接口
+    expect(api.download_update).not.toHaveBeenCalled();
+    expect(store.updateState.showUpdateModal).toBe(true);
+  });
+
 });

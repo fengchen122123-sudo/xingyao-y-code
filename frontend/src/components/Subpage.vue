@@ -13,7 +13,10 @@
         <div v-for="s in store.skills" :key="s.id" class="sub-card">
           <div class="sc-top">
             <div class="sc-ico"><AppIcon name="gem" :size="16" /></div>
-            <div class="sc-name">{{ s.name || s.id }}</div>
+            <div class="sc-name">
+              {{ s.name || s.id }}
+              <span class="pl-src" :class="s.source === 'builtin' ? 'builtin' : 'user'">{{ s.source === 'builtin' ? '内置' : '用户' }}</span>
+            </div>
             <label class="switch" title="启用/禁用该技能" @click.stop>
               <input type="checkbox" :checked="s.enabled" @change="onToggleSkill(s, ($event.target as HTMLInputElement).checked)" />
               <span class="switch-track"></span>

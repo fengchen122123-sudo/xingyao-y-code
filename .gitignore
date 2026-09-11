@@ -108,3 +108,9 @@ node_modules/
 # SQLite WAL sidecar files - runtime state
 *.db-shm
 *.db-wal
+
+# 内部合规材料：含系统弱点与风险分析，仅本地留存，禁止入库/推送
+# 覆盖合规审查报告、整改方案、PII 处置报告（含后续新增版本）
+docs/合规审查报告*
+docs/合规整改方案*
+docs/PII*

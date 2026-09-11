@@ -644,6 +644,48 @@ def test_hotkey_registration_failure_keeps_config_untouched(tmp_path, monkeypatc
     assert config["browser_control_enabled"] is True
 
 
+def test_hotkey_registration_failure_logs_without_traceback(caplog):
+    """注册失败属预期降级：INFO 留痕必须单行、绝不携带 traceback。"""
+    from core.computer.runtime import start_computer_runtime
+
+    api = FakeHotkeyApi(register_result=False, last_error_code=1409)
+    with caplog.at_level(logging.DEBUG, logger="core.computer.runtime"):
+        runtime = start_computer_runtime(
+            settings_loader=lambda: _enabled_settings(),
+            hotkey_factory=lambda: api,
+        )
+    assert runtime.hotkey is None
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "core.computer.runtime"
+        and record.levelno == logging.INFO
+    ]
+    assert records, "注册失败必须留痕"
+    assert all(record.exc_info is None for record in records)
+
+
+def test_hotkey_registration_failure_never_reaches_console(caplog):
+    """注册失败不得产生 WARNING 及以上日志：CLI 无自定义 handler，WARNING 会
+    经 logging.lastResort 直打控制台，启动界面必须保持零提示。"""
+    from core.computer.runtime import start_computer_runtime
+
+    api = FakeHotkeyApi(register_result=False, last_error_code=1409)
+    with caplog.at_level(logging.DEBUG, logger="core.computer.runtime"):
+        runtime = start_computer_runtime(
+            settings_loader=lambda: _enabled_settings(),
+            hotkey_factory=lambda: api,
+        )
+    assert runtime.hotkey is None
+    records = [
+        record
+        for record in caplog.records
+        if record.name == "core.computer.runtime"
+    ]
+    assert records, "注册失败必须留痕"
+    assert all(record.levelno < logging.WARNING for record in records)
+
+
 def test_emergency_hotkey_stops_active_run(tmp_path):
     """Ctrl+Alt+Esc 回调：停止活动 run（reason=emergency_hotkey）。"""
     from core.computer.runtime import start_computer_runtime
