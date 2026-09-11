@@ -12,15 +12,18 @@ def test_catalog_exposes_all_real_api_protocols():
 
 def test_catalog_preserves_cli_model_metadata():
     providers = get_preset_providers()
-    deepseek = next(item for item in providers if item["id"] == "deepseek")
+    kimi = next(item for item in providers if item["id"] == "kimi-coding-openai")
 
-    assert deepseek["name"] == "深度求索"
-    assert deepseek["protocol"] == "openai"
-    assert deepseek["base_url"] == "https://api.deepseek.com"
-    assert deepseek["models"] == [
-        {"name": "deepseek-flash", "context_window": 1000000, "supports_vision": True,
-         "supports_function_calling": True, "max_tokens": 384000},
-        {"name": "deepseek-v4-pro", "context_window": 1000000, "supports_vision": False},
+    assert kimi["name"] == "月之暗面kimi-for-coding（OpenAI格式）"
+    assert kimi["protocol"] == "openai"
+    assert kimi["base_url"] == "https://api.kimi.com/coding/v1"
+    assert kimi["models"] == [
+        {"name": "kimi-for-coding", "context_window": 1000000, "supports_vision": True,
+         "supports_function_calling": True, "max_tokens": 131072},
+        {"name": "k3", "context_window": 1000000, "supports_vision": True,
+         "supports_function_calling": True, "computer_protocol": "generic"},
+        {"name": "k3-256k", "context_window": 256000, "supports_vision": True,
+         "supports_function_calling": True, "computer_protocol": "generic"},
     ]
 
 
@@ -55,16 +58,8 @@ def test_confirmed_preset_models_carry_literal_computer_metadata():
         if model.get("computer_protocol") == "generic"
     }
     assert generic == {
-        ("kimi-coding-anthropic", "k3"),
-        ("kimi-coding-anthropic", "k3-256k"),
         ("kimi-coding-openai", "k3"),
         ("kimi-coding-openai", "k3-256k"),
-        ("moonshot", "kimi-k3"),
-        ("sensenova", "kimi-k3"),
-        ("token-rhythm", "glm-5.3-flash"),
-        ("zhipu", "glm-5.3-flash"),
-        ("zhipu-coding-openai", "glm-5.3-flash"),
-        ("zhipu-coding-anthropic", "glm-5.3-flash"),
     }
 
 
@@ -77,31 +72,6 @@ def test_preset_computer_metadata_never_forms_half_valid_combination():
             if protocol == "generic":
                 assert model.get("supports_vision") is True
                 assert model.get("supports_function_calling") is True
-
-
-def test_token_rhythm_preset_contains_qwen38_flash():
-    providers = get_preset_providers()
-    token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
-    model = next(m for m in token_rhythm["models"] if m["name"] == "qwen3.8-flash")
-
-    assert model["context_window"] == 1000000
-    assert model["supports_vision"] is True
-    assert model["supports_function_calling"] is True
-
-
-def test_token_rhythm_preset_contains_deepseek_flash():
-    providers = get_preset_providers()
-    token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
-    model = next(
-        m
-        for m in token_rhythm["models"]
-        if m["name"] == "deepseek-flash"
-    )
-
-    assert model["context_window"] == 1000000
-    assert model["max_tokens"] == 384000
-    assert model["supports_vision"] is True
-    assert model["supports_function_calling"] is True
 
 
 def test_preset_models_all_have_confirmed_reasoning_capability():

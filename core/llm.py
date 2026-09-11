@@ -3586,8 +3586,10 @@ def _cache_affinity_session_id(
 _process_cache_key_fallback = None
 
 _REASONING_EFFORT_LEVELS = ("low", "high", "max")
+# Kimi Code / Moonshot Anthropic 兼容端点：档位翻译为原生 thinking.budget_tokens；
+# kimi-for-coding（K2.8 Preview）与 K3 同为 low/high/max 三档。
 _K3_REASONING_MODEL_NAMES = frozenset(
-    {"k3", "k3-256k", "kimi-k3", "kimi-k3-256k"}
+    {"k3", "k3-256k", "kimi-k3", "kimi-k3-256k", "kimi-for-coding"}
 )
 # 阶跃星辰 Anthropic 兼容端点（/step_plan/v1/messages）不接受 Anthropic 原生
 # thinking/budget_tokens，推理深度由官方扩展字段 output_config.effort 控制

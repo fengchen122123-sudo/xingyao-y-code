@@ -148,8 +148,16 @@ _register(
         "toggle", ("default", "off", "on"), "enable_thinking_toggle"
     ),
 )
+# kimi-for-coding 现指向 K2.8 Preview：与 K3 一致支持 reasoning_effort 的 low/high/max
+# 三档（默认 max），思考不可关闭（无 off/on 档）。
 _register(
-    ("kimi-for-coding", "kimi-k2.7-code", "minimax-m2.5", "minimax-m2.7"),
+    ("kimi-for-coding",),
+    ReasoningCapability(
+        "effort", ("default", "low", "high", "max"), "always_on_effort"
+    ),
+)
+_register(
+    ("kimi-k2.7-code", "minimax-m2.5", "minimax-m2.7"),
     ReasoningCapability("fixed", (), "always_on", "该模型始终开启思考"),
 )
 # 阶跃星辰：推理模型始终输出 reasoning，用 reasoning_effort 控制深度（low/medium/high），无 off 开关。

@@ -49,6 +49,7 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "k3": ("default", "low", "high", "max"),
         "k3-256k": ("default", "low", "high", "max"),
         "kimi-k3": ("default", "low", "high", "max"),
+        "kimi-for-coding": ("default", "low", "high", "max"),
         "deepseek-flash": ("default", "off", "low", "high", "max"),
         "deepseek-v4-flash-0731": ("default", "off", "low", "high", "max"),
         "deepseek-v4.1-flash": ("default", "off", "low", "high", "max"),
@@ -88,7 +89,6 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
 def test_fixed_models_are_visible_locked_on_and_unknown_models_are_hidden():
     """固定思考必须显示为禁用的开启；未知或动态模型不能获得猜测档位。"""
     for model_name in (
-        "kimi-for-coding",
         "kimi-k2.7-code",
         "minimax-m2.5",
         "minimax-m2.7",
