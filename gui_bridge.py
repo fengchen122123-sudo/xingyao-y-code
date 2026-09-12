@@ -622,6 +622,20 @@ class ApiBridge:
         except Exception:
             logger.warning("注册后台命令任务完成回调失败", exc_info=True)
 
+        # 星轨自动化任务（待开发/星轨自动化任务/01-完整设计规格.md）：
+        # 存储与调度引擎挂到桥上；引擎不在 __init__ 启动——gui_main 窗口就绪后
+        # 调 start_automation_engine()，测试可裸构造桥而不起调度线程
+        from core.automation.engine import AutomationEngine
+        from core.automation.storage import AutomationStorage
+        self._automation_storage = AutomationStorage(self._memory)
+        self._automation_storage.on_run_updated = self._on_automation_run_updated
+        self._automation_engine = AutomationEngine(
+            self._automation_storage, self._dispatch_automation_run
+        )
+        # 正在运行的自动化回合：turn_id → {"run_id", "task_name"}。
+        # 无人值守权限自动拒绝的判定依据（规格 5.5）
+        self._automation_turn_labels: Dict[str, Dict[str, str]] = {}
+
         # 启动时后台策略化清理更新缓存：删除版本 ≤ 当前运行版本的安装包、
         # 下载残片与超期残留，保留版本高于当前的包（用户可能还要安装）
         threading.Thread(
@@ -1000,6 +1014,12 @@ class ApiBridge:
             if self._shutting_down:
                 return
             self._shutting_down = True
+
+        # 星轨自动化：先停调度引擎（不再产生新触发），再走既有取消/收尾链
+        try:
+            self._automation_engine.stop()
+        except Exception:
+            logger.exception("退出时停止自动化调度引擎失败")
 
         for event in list(self._cancel_events.values()):
             event.set()
@@ -3746,6 +3766,14 @@ class ApiBridge:
 
     def _activate_permission_request(self, request):
         """broker 激活某个请求 → 推送到前端对话流内联卡片，并挂一个"超时即拒绝"的定时器。"""
+        # 星轨自动化（规格 5.5）：无人值守回合的权限请求立即自动拒绝——
+        # 不弹卡、不等待。这与人工回合"绝不因用户暂时离开而自动拒绝"刻意
+        # 不同：自动化回合没有"用户回来"的时刻，等待只会永久挂死回合。
+        # getattr 防御：裸实例测试桥可能未初始化该映射（同 _user_cancelled_sessions 先例）
+        automation_label = getattr(self, "_automation_turn_labels", {}).get(request.parent_turn_id)
+        if automation_label:
+            self._auto_deny_automation_permission(request, automation_label)
+            return
         try:
             from core.tool_presenter import describe_permission_request
             options = list(request.options or ())
@@ -3802,6 +3830,43 @@ class ApiBridge:
         with self._perm_lock:
             self._perm_timers[request.request_id] = timer
         timer.start()
+
+    def _auto_deny_automation_permission(self, request, label: Dict[str, str]) -> None:
+        """自动化回合的权限请求自动拒绝：定位拒绝项，找不到则按取消收尾。"""
+        task_name = str(label.get("task_name") or "自动化任务")
+        try:
+            deny_key = next(
+                (
+                    key
+                    for key in (request.option_keys or ())
+                    if str(key).lower() in {"deny", "reject", "no", "cancel", "disallow"}
+                ),
+                None,
+            )
+            if deny_key is not None:
+                permission_broker.resolve_by_key(request.request_id, deny_key)
+            elif len(request.options or ()) >= 2:
+                # 旧式三选项请求的 option_keys 是 choice_0/1/2：索引 1 即"拒绝"，
+                # 与 respond_permission 里用户点拒绝的语义完全一致
+                permission_broker.resolve(request.request_id, 1)
+            else:
+                from core.permission_broker import CANCELLED_RESULT
+
+                permission_broker.resolve(request.request_id, CANCELLED_RESULT)
+            logger.info(
+                "自动化任务「%s」无人值守已自动拒绝权限请求：%s",
+                task_name,
+                request.function_name,
+            )
+            self.emit_event("notice", {
+                "message": (
+                    f"自动化任务「{task_name}」无人值守已自动拒绝权限请求："
+                    f"{request.function_name}。如需放行，请在任务设置中选择"
+                    "accept_edits/full 档位。"
+                ),
+            })
+        except Exception:
+            logger.exception("自动化权限自动拒绝失败")
 
     def _dismiss_permission_prompt(self):
         """broker 队列清空：通知前端收起弹窗。"""
@@ -4030,7 +4095,9 @@ class ApiBridge:
     def _spawn_turn_worker(self, full_text: str, target_session: str,
                            display_text: str = "", pending_workdir: str = "",
                            turn_source: str = "local",
-                           attachments: Optional[List[str]] = None) -> None:
+                           attachments: Optional[List[str]] = None,
+                           internal_kind: str = "",
+                           automation_context: Optional[Dict[str, str]] = None) -> None:
         """启动一个新回合线程。调用方必须已持有 _turn_start_lock 且确认
         _is_turn_active(target_session) 为 False（检查+启动原子）。
 
@@ -4038,6 +4105,9 @@ class ApiBridge:
         后台汇总标志重置与"用户取消"解除对两者语义一致——排队消息也是
         用户主动发的新消息。turn_source 是入口层受控回合来源（local|lan），
         随消息透传到回合 worker（设计 18）。
+        internal_kind 非空表示系统内部回合（自动化任务/后台汇总）。
+        automation_context 为星轨自动化回合上下文（run_id/task_name/
+        permission_mode），见待开发/星轨自动化任务/01-完整设计规格.md 5.4。
         """
         with self._bg_summary_lock:
             self._bg_summary_triggered.discard(target_session)
@@ -4054,6 +4124,10 @@ class ApiBridge:
         turn_kwargs["turn_source"] = turn_source
         if attachments:
             turn_kwargs["attachments"] = attachments
+        if internal_kind:
+            turn_kwargs["internal_kind"] = internal_kind
+        if automation_context:
+            turn_kwargs["automation_context"] = automation_context
         worker = threading.Thread(
             target=self._run_turn_worker_serialized,
             args=(full_text, target_session),
@@ -4103,6 +4177,9 @@ class ApiBridge:
                 if not queue:
                     return
                 entry = queue.pop(0)
+                # 星轨自动化：排队条目可能是自动化触发（忙时入队），补发时把
+                # 自动化上下文透传回 worker；旧用户消息条目无这些键，零影响
+                automation_run_id = str(entry.get("automation_run_id") or "")
                 try:
                     self._spawn_turn_worker(
                         str(entry.get("text") or ""),
@@ -4111,14 +4188,201 @@ class ApiBridge:
                         # 排队消息补发保持原回合来源：LAN 消息不得降级为 local
                         turn_source=str(entry.get("turn_source") or "local"),
                         attachments=[str(p) for p in (entry.get("attachments") or [])],
+                        internal_kind="automation" if automation_run_id else "",
+                        automation_context={
+                            "run_id": automation_run_id,
+                            "task_name": str(entry.get("automation_task_name") or ""),
+                            "permission_mode": str(entry.get("automation_permission_mode") or ""),
+                        } if automation_run_id else None,
                     )
                 except Exception:
                     logger.exception("补发排队消息失败")
                     queue.insert(0, entry)
                     return
+                if automation_run_id:
+                    try:
+                        self._automation_storage.mark_run_running(automation_run_id)
+                    except Exception:
+                        logger.exception("补发自动化运行置 running 失败")
                 self._emit_message_queue_snapshot(session_name)
         except Exception:
             logger.exception("排队消息补发流程异常")
+
+    # ------------------------------------------------------------------
+    # 星轨自动化任务（设计规格：待开发/星轨自动化任务/01-完整设计规格.md）
+    # ------------------------------------------------------------------
+    def start_automation_engine(self) -> None:
+        """gui_main 窗口就绪后调用：恢复遗留运行 → 启动调度线程 → 推送任务快照。"""
+        if self._shutting_down:
+            return
+        try:
+            recovered = self._automation_storage.recover_stale_runs()
+            if recovered:
+                logger.info("自动化任务启动恢复：%s 条遗留运行标记为 interrupted", recovered)
+        except Exception:
+            logger.exception("自动化任务启动恢复失败")
+        self._automation_engine.start()
+        self._emit_automation_tasks_changed()
+
+    def _dispatch_automation_run(self, task: dict, run_id: str, trigger_kind: str) -> None:
+        """引擎/手动触发共用：把任务提示词投递为目标会话的一次真实回合。
+
+        会话忙时进入既有消息排队（FIFO，回合结束自动补发）；空闲时立即启动
+        内部回合（internal_kind="automation"，turn_start 带 internal 标记）。
+        全程持 _turn_start_lock，与 send_user_message 的"检查+启动"原子语义一致。
+        本方法在引擎线程或 js_api 线程执行，只做判定与登记，不做模型请求。
+        """
+        if self._shutting_down:
+            return
+        target_session = str(task.get("target_session") or "").strip() or "自动化任务"
+        display_text = f"自动化任务「{task.get('name')}」"
+        automation_context = {
+            "run_id": run_id,
+            "task_name": str(task.get("name") or ""),
+            "permission_mode": str(task.get("permission_mode") or "confirm"),
+        }
+        with self._turn_start_lock:
+            if self._is_turn_active(target_session):
+                self._message_queues.setdefault(target_session, []).append({
+                    "id": f"q_{uuid.uuid4().hex[:8]}",
+                    "text": str(task.get("prompt") or ""),
+                    "display_text": display_text,
+                    "attachments": [],
+                    "queued_at": time.time(),
+                    # 自动化排队条目：补发时透传回 worker（运行状态 queued→running）
+                    "turn_source": "local",
+                    "automation_run_id": run_id,
+                    "automation_task_name": automation_context["task_name"],
+                    "automation_permission_mode": automation_context["permission_mode"],
+                })
+                # 快照在锁内发：与 send_user_message 排队路径同序
+                self._emit_message_queue_snapshot(target_session)
+                return
+            try:
+                self._automation_storage.mark_run_running(run_id)
+            except Exception:
+                logger.exception("自动化运行置 running 失败")
+            self._spawn_turn_worker(
+                str(task.get("prompt") or ""),
+                target_session,
+                display_text=display_text,
+                turn_source="local",
+                internal_kind="automation",
+                automation_context=automation_context,
+            )
+
+    def _on_automation_run_updated(self, run: dict) -> None:
+        """存储认领路径产生的运行行（queued/skipped）→ 推事件与跳过通知。"""
+        try:
+            self.emit_event("automation_run_updated", {"run": run})
+            if run.get("status") == "skipped":
+                self.emit_event("notice", {
+                    "message": (
+                        f"自动化任务「{run.get('task_name')}」本次触发已跳过："
+                        f"{run.get('error') or '上一次运行尚未结束'}"
+                    ),
+                })
+        except Exception:
+            logger.debug("推送自动化运行事件失败", exc_info=True)
+
+    def _emit_automation_tasks_changed(self) -> None:
+        """推送自动化任务全量快照（前端幂等替换渲染）。"""
+        try:
+            self.emit_event("automation_tasks_changed", {"tasks": self._automation_task_dtos()})
+        except Exception:
+            logger.debug("推送自动化任务快照失败", exc_info=True)
+
+    def _automation_task_dtos(self) -> List[Dict[str, Any]]:
+        from core.automation.models import trigger_summary
+
+        dtos: List[Dict[str, Any]] = []
+        for task in self._automation_storage.list_tasks():
+            dto = dict(task)
+            dto["trigger_summary"] = trigger_summary(task["trigger_type"], task["trigger_config"])
+            dtos.append(dto)
+        return dtos
+
+    def get_automation_tasks(self) -> Dict[str, Any]:
+        try:
+            return {"ok": True, "tasks": self._automation_task_dtos()}
+        except Exception as e:
+            logger.exception("读取自动化任务失败")
+            return {"ok": False, "msg": str(e)}
+
+    def save_automation_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            if self._shutting_down:
+                return {"ok": False, "msg": "应用正在退出"}
+            from core.automation.models import MAX_TASKS, validate_task
+
+            raw = dict(task or {})
+            errors = validate_task(raw)
+            if errors:
+                return {"ok": False, "errors": errors}
+            existing_id = str(raw.get("id") or "").strip()
+            if not existing_id and self._automation_storage.count_tasks() >= MAX_TASKS:
+                return {"ok": False, "errors": [f"自动化任务最多 {MAX_TASKS} 个，请先删除部分任务"]}
+            task_id = self._automation_storage.save_task(raw)
+            self._emit_automation_tasks_changed()
+            self._automation_engine.notify_changed()
+            return {"ok": True, "id": task_id}
+        except Exception as e:
+            logger.exception("保存自动化任务失败")
+            return {"ok": False, "msg": str(e)}
+
+    def delete_automation_task(self, task_id: str) -> Dict[str, Any]:
+        try:
+            deleted = self._automation_storage.delete_task(str(task_id or ""))
+            self._emit_automation_tasks_changed()
+            self._automation_engine.notify_changed()
+            return {"ok": True, "deleted": bool(deleted)}
+        except Exception as e:
+            logger.exception("删除自动化任务失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_automation_task_enabled(self, task_id: str, enabled: bool) -> Dict[str, Any]:
+        try:
+            updated = self._automation_storage.set_enabled(str(task_id or ""), bool(enabled))
+            self._emit_automation_tasks_changed()
+            self._automation_engine.notify_changed()
+            return {"ok": bool(updated), "msg": "" if updated else "任务不存在"}
+        except Exception as e:
+            logger.exception("启停自动化任务失败")
+            return {"ok": False, "msg": str(e)}
+
+    def run_automation_task_now(self, task_id: str) -> Dict[str, Any]:
+        try:
+            if self._shutting_down:
+                return {"ok": False, "msg": "应用正在退出"}
+            task = self._automation_storage.get_task(str(task_id or ""))
+            if task is None:
+                return {"ok": False, "msg": "任务不存在"}
+            if self._automation_storage.has_active_run(task["id"]):
+                return {"ok": False, "msg": "上一次运行尚未结束，请稍后再试"}
+            run = self._automation_storage.create_run(task, trigger_kind="manual")
+            self._dispatch_automation_run(task, run["id"], "manual")
+            return {"ok": True, "run_id": run["id"]}
+        except Exception as e:
+            logger.exception("手动执行自动化任务失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_automation_runs(self, task_id: str = "", limit: int = 50) -> Dict[str, Any]:
+        try:
+            runs = self._automation_storage.list_runs(
+                str(task_id or "") or None, limit=max(1, min(int(limit or 50), 200))
+            )
+            return {"ok": True, "runs": runs}
+        except Exception as e:
+            logger.exception("读取自动化运行历史失败")
+            return {"ok": False, "msg": str(e)}
+
+    def clear_automation_runs(self, task_id: str) -> Dict[str, Any]:
+        try:
+            self._automation_storage.clear_runs(str(task_id or ""))
+            return {"ok": True}
+        except Exception as e:
+            logger.exception("清空自动化运行历史失败")
+            return {"ok": False, "msg": str(e)}
 
     def stop_current_turn(self, session_name: str = "") -> Dict[str, Any]:
         try:
@@ -4235,21 +4499,28 @@ class ApiBridge:
         保留函数名避免改动所有调用点，实现直接转发到 _run_turn_worker。"""
         return self._run_turn_worker(user_text, session_name, *args, **kwargs)
 
-    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None):
+    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None, automation_context: Optional[Dict[str, str]] = None):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
 
-        internal_kind 非空表示这是系统自动发起的内部回合（如后台任务汇总），
-        turn_start 事件会带上 internal / display_text，让前端用系统提示样式
-        展示而不是把内部指令原文当成用户气泡。
+        internal_kind 非空表示这是系统自动发起的内部回合（后台任务汇总 /
+        星轨自动化任务），turn_start 事件会带上 internal / display_text，
+        让前端用系统提示样式展示而不是把内部指令原文当成用户气泡。
         turn_source 是入口层受控回合来源（local|lan，设计 18）：用户消息回合
         由 send_user_message 传入（LAN dispatch 注入 "lan"），内部回合固定
         local；透传到 prepare_turn_messages 与模型事件入口决定电脑操控能力。
+        automation_context 非空表示星轨自动化回合：运行终态回写 automation_runs
+        表（completed/cancelled/error），无人值守权限档位按任务配置覆盖
+        （规格 5.4/5.5）。
         """
         api_key = ""
         turn_finished = False
         event_session_name = session_name
         cancelled = False
         turn_id = ""
+        automation_run_id = str((automation_context or {}).get("run_id") or "")
+        automation_task_name = str((automation_context or {}).get("task_name") or "")
+        automation_permission_mode = str((automation_context or {}).get("permission_mode") or "")
+        automation_error: Optional[str] = None
         # 本回合起点消息 id（turn_start 事件后记录）：异常/取消回滚后 history
         # 末尾会退化成上一轮的助手消息，补发全文必须按此边界过滤。必须在
         # finish_once 定义之前初始化，闭包才能读到；取值失败退回 None（旧行为）。
@@ -4308,11 +4579,13 @@ class ApiBridge:
             turn_start_data["display_text"] = display_text
         if internal_kind:
             turn_start_data["internal"] = internal_kind
-            turn_start_data["display_text"] = (
-                _BG_COMMAND_SUMMARY_DISPLAY_TEXT
-                if internal_kind == "bg_command_summary"
-                else _BG_SUMMARY_DISPLAY_TEXT
-            )
+            if internal_kind == "automation":
+                # 星轨自动化：展示名随任务传入（"自动化任务「X」"）
+                turn_start_data["display_text"] = display_text or "自动化任务"
+            elif internal_kind == "bg_command_summary":
+                turn_start_data["display_text"] = _BG_COMMAND_SUMMARY_DISPLAY_TEXT
+            else:
+                turn_start_data["display_text"] = _BG_SUMMARY_DISPLAY_TEXT
         with self._active_turn_lock:
             self._active_turn_snapshots[session_name] = {
                 "session_name": session_name,
@@ -4340,6 +4613,8 @@ class ApiBridge:
             active_model = get_active_model(session_name)
             if not active_model or not active_model.get("litellm_model"):
                 # 关键修复：没有激活模型时也必须让前端解锁输入框
+                if automation_run_id:
+                    automation_error = "当前未激活任何 LLM 模型"
                 self.emit_event("error", {"message": "当前未激活任何 LLM 模型，请先在模型管理中配置并激活模型。", "session_name": session_name})
                 self.emit_event("turn_cancelled", {"session_name": session_name})
                 finish_once()
@@ -4405,6 +4680,17 @@ class ApiBridge:
             self._active_turn_ids[session_name] = turn_id
             with self._turn_owner_lock:
                 self._turn_owner_sessions[turn_id] = session_name
+            # 星轨自动化：登记 turn_id → 任务名（无人值守权限自动拒绝依据），
+            # 并把 turn_id 回填到运行记录供追踪
+            if automation_run_id:
+                self._automation_turn_labels[turn_id] = {
+                    "run_id": automation_run_id,
+                    "task_name": automation_task_name,
+                }
+                try:
+                    self._automation_storage.set_run_turn_id(automation_run_id, turn_id)
+                except Exception:
+                    logger.debug("回填自动化运行 turn_id 失败", exc_info=True)
             # 2) 创建持久化检查点（失败则本轮不落任何消息、不发 turn_start）
             from core.turn_undo import service as _tu_service
 
@@ -4457,7 +4743,8 @@ class ApiBridge:
                 session_name,
                 model_name,
                 ctx_win,
-                permission_mode=self._current_permission_mode,
+                # 星轨自动化：无人值守档位按任务配置覆盖（规格 5.5）；人工回合零改动
+                permission_mode=automation_permission_mode or self._current_permission_mode,
                 cancel_event=cancel_event,
                 notify=lambda kind, message: self.emit_event("notice", {"message": _strip_ansi_markup(message)}),
                 api_key=api_key,
@@ -4520,6 +4807,8 @@ class ApiBridge:
                 event_session_name = self._maybe_auto_rename(session_name) or session_name
         except Exception as e:
             logger.exception("GUI 对话回合失败")
+            if automation_run_id:
+                automation_error = str(e)
             self._emit_owned_error(str(e), api_key, error_state, terminal=True, session_name=session_name)
         finally:
             # 先解绑本回合的会话路由与线程本地 workdir（workspace_scope 退出语义），
@@ -4560,6 +4849,22 @@ class ApiBridge:
                 except Exception:
                     pass
             finish_once()
+            # 星轨自动化：回写运行终态。cancelled（用户停止）→ cancelled，
+            # 回合异常 → error，否则 completed。exactly-once 由 storage 的
+            # queued/running 状态守卫兜底（规格 5.4；取消绝不自动重放）
+            if automation_run_id:
+                final_status = (
+                    "cancelled" if cancelled
+                    else ("error" if automation_error else "completed")
+                )
+                try:
+                    self._automation_storage.finish_run(
+                        automation_run_id, final_status, (automation_error or "")[:500]
+                    )
+                except Exception:
+                    logger.exception("自动化运行 %s 终态回写失败", automation_run_id)
+                if turn_id:
+                    self._automation_turn_labels.pop(turn_id, None)
             # 回合运行期间若有后台子代理进入终态（当时不能并发起新回合），
             # 此时按会话取出自己的 pending 补触发自动汇总检查（set 分桶，
             # 多会话并行互不覆盖）

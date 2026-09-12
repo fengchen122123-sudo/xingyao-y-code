@@ -368,6 +368,15 @@ class AutomationStorage:
             self.conn.commit()
         return recovered
 
+    def create_run(self, task: dict, *, trigger_kind: str, status: str = "queued", error: str = "") -> dict:
+        """公开创建运行行（手动触发等桥层入口使用），触发 on_run_updated。"""
+        with self._manager._lock:
+            cursor = self.conn.cursor()
+            run = self._insert_run_locked(cursor, task, status, trigger_kind=trigger_kind, error=error)
+            self.conn.commit()
+        self._fire_run_updated(run)
+        return run
+
     def _insert_run_raw(self, run_id: str, task_id: str, session_name: str, status: str) -> None:
         """测试辅助：直接插入一条最小运行行。"""
         with self._manager._lock:

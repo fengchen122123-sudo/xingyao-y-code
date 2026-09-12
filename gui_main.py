@@ -517,6 +517,12 @@ def main():
     lifecycle.start_tray()
     window.events.closing += lifecycle.on_closing
 
+    # 星轨自动化任务：窗口/托盘就绪后启动调度引擎（恢复遗留运行 + 常驻调度）
+    try:
+        api.start_automation_engine()
+    except Exception:
+        logging.getLogger(__name__).exception("启动自动化调度引擎失败")
+
     # 电脑操控运行时（Task 16，设计 23.2）：轻量容器——开关开启时注册全局
     # 紧急停止热键，观察截图预览发布器接到 controller（惰性启动）。
     _startup_computer_runtime()
