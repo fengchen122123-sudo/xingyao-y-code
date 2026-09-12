@@ -279,6 +279,41 @@ export interface PluginInfo {
   error?: string;
 }
 
+// 星轨自动化任务（待开发/星轨自动化任务/01-完整设计规格.md 11.3）
+export interface AutomationTaskInfo {
+  id: string;
+  name: string;
+  enabled: boolean;
+  trigger_type: 'interval' | 'daily' | 'weekly' | 'startup';
+  trigger_config: Record<string, any>;
+  target_session: string;
+  prompt: string;
+  permission_mode: 'confirm' | 'accept_edits' | 'full';
+  missed_run_policy: 'skip' | 'run_once';
+  notify_on_success: boolean;
+  created_at: string;
+  updated_at: string;
+  last_run_at?: string | null;
+  // unix 秒；startup 类型恒 null
+  next_run_at?: number | null;
+  // 后端生成的面向用户触发器摘要（如「每天 09:30」）
+  trigger_summary?: string;
+}
+
+export interface AutomationRunInfo {
+  id: string;
+  task_id: string;
+  task_name: string;
+  trigger_kind: 'scheduled' | 'startup' | 'manual' | 'catchup';
+  status: 'queued' | 'running' | 'completed' | 'cancelled' | 'error' | 'skipped' | 'interrupted';
+  session_name: string;
+  turn_id?: string | null;
+  error?: string | null;
+  queued_at: string;
+  started_at?: string | null;
+  finished_at?: string | null;
+}
+
 export interface SessionInfo {
   name: string;
   // 不可变主键 sessions.id（按回合撤销的稳定归属标识；旧后端缺省为 undefined）
@@ -790,6 +825,14 @@ export interface PyWebViewAPI {
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
   refresh_skills(): Promise<{ ok: boolean; skills?: SkillInfo[]; msg?: string }>;
   get_skills(): Promise<SkillInfo[]>;
+  // 星轨自动化任务
+  get_automation_tasks(): Promise<{ ok: boolean; tasks?: AutomationTaskInfo[]; msg?: string }>;
+  save_automation_task(task: Record<string, any>): Promise<{ ok: boolean; id?: string; errors?: string[]; msg?: string }>;
+  delete_automation_task(taskId: string): Promise<{ ok: boolean; deleted?: boolean; msg?: string }>;
+  set_automation_task_enabled(taskId: string, enabled: boolean): Promise<{ ok: boolean; msg?: string }>;
+  run_automation_task_now(taskId: string): Promise<{ ok: boolean; run_id?: string; msg?: string }>;
+  get_automation_runs(taskId?: string, limit?: number): Promise<{ ok: boolean; runs?: AutomationRunInfo[]; msg?: string }>;
+  clear_automation_runs(taskId: string): Promise<{ ok: boolean; msg?: string }>;
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
   trust_plugin(name: string): Promise<any>;
