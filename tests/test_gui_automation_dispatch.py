@@ -147,6 +147,7 @@ def test_drain_message_queue_passes_automation_context(manager, tmp_path):
         "run_id": run["id"],
         "task_name": "每日摘要",
         "permission_mode": "accept_edits",
+        "notify_on_success": "",
     }
     run_row = bridge._automation_storage.list_runs(task["id"])[0]
     assert run_row["status"] == "running"
