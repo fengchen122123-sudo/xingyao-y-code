@@ -40,6 +40,8 @@ export interface TurnGroupInfo {
   running: boolean;
   /** 回合终态（running 时不定），用于折叠头文案 */
   state: 'completed' | 'cancelled' | 'error';
+  /** 按回合撤销：权威回合身份（message_turn_links 持久化，旧消息为空串） */
+  turnId: string;
 }
 
 export function buildMessageGroups(messages: ChatMessage[]): TurnGroupInfo[] {
@@ -48,13 +50,16 @@ export function buildMessageGroups(messages: ChatMessage[]): TurnGroupInfo[] {
 
   for (const msg of messages) {
     if (msg.role === 'user') {
-      current = { userMsg: msg, middle: [], tail: [], running: false, state: 'completed' };
+      current = {
+        userMsg: msg, middle: [], tail: [], running: false, state: 'completed',
+        turnId: msg.turnId || '',
+      };
       groups.push(current);
       continue;
     }
     if (!current) {
       // 会话开头没有用户消息的孤儿段（异常数据 / 旧会话残留），同样聚合
-      current = { userMsg: null, middle: [], tail: [], running: false, state: 'completed' };
+      current = { userMsg: null, middle: [], tail: [], running: false, state: 'completed', turnId: '' };
       groups.push(current);
     }
     if (msg.role === 'assistant') {

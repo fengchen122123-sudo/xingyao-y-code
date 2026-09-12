@@ -33,6 +33,7 @@ function finishedGroup(): TurnGroupInfo {
     tail: [assistant({ content: '修复完成' })],
     running: false,
     state: 'completed',
+    turnId: '',
   };
 }
 
@@ -72,6 +73,7 @@ describe('TurnGroup', () => {
       tail: [assistant({ content: '', execution_state: 'running' })],
       running: true,
       state: 'completed',
+      turnId: '',
     };
     const wrapper = mount(TurnGroup, { props: { group } });
 
@@ -86,6 +88,7 @@ describe('TurnGroup', () => {
       tail: [assistant({ content: '你好！' })],
       running: false,
       state: 'completed',
+      turnId: '',
     };
     const wrapper = mount(TurnGroup, { props: { group } });
 

@@ -17,11 +17,14 @@
   <!-- 组尾：总结轮 assistant + 其后的 error 消息，始终可见 -->
   <MessageBubble v-for="m in group.tail" :key="msgKey(m)" :msg="m" />
 
-  <!-- 回合结束且有文件改动时：底部展示可折叠的"文件更改"面板 -->
+  <!-- 回合结束且有文件改动时：底部展示可折叠的"文件更改"面板
+       （含按回合撤销按钮：按权威 turnId 绑定状态） -->
   <ChangedFilesPanel
     v-if="!group.running && fileChanges.length"
     class="turn-changes"
     :changes="fileChanges"
+    :undo-state="undoState"
+    :turn-id="group.turnId"
   />
 </template>
 
@@ -56,6 +59,13 @@ const stats = computed(() => groupStats(props.group));
 
 // 回合文件更改摘要（无改动则空数组，面板不渲染）
 const fileChanges = computed(() => collectFileChanges(props.group));
+
+// 按回合撤销：本回合的权威检查点状态（按 turnId 绑定；无关联回合为 null）
+const store = useAppStore();
+const undoState = computed(() => {
+  const turnId = props.group.turnId;
+  return turnId ? (store.turnUndoStates[turnId] ?? null) : null;
+});
 
 const title = computed(() => {
   const { rounds, toolCount } = stats.value;

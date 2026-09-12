@@ -281,6 +281,8 @@ export interface PluginInfo {
 
 export interface SessionInfo {
   name: string;
+  // 不可变主键 sessions.id（按回合撤销的稳定归属标识；旧后端缺省为 undefined）
+  session_id?: number;
   display_name: string;
   count: number;
   workdir: string;
@@ -470,6 +472,22 @@ export interface TurnStartEventData {
   display_text?: string;
   session_name?: string;
   internal?: string;
+  // 按回合撤销：权威回合身份（新协议为 32 位随机 UUID），与 session_id 一起
+  // 构成撤销定位键；旧后端/内部回合可能缺省
+  turn_id?: string;
+  session_id?: number;
+}
+
+export interface TurnUndoUpdatedEventData {
+  session_id: number;
+  session_name: string;
+  turn_id: string;
+  operation_id: string;
+  status: string;
+  file_count: number;
+  reverted_at: number;
+  owner_kind?: string;
+  message: string;
 }
 
 export interface UserAttachmentNotesEventData {
@@ -530,6 +548,164 @@ export interface BridgeEvent {
   run_id?: string;
   event_seq?: number;
 }
+
+// ---------------------------------------------------------------------------
+// 按回合撤销 DTO（规格 19；与后端 core/turn_undo 状态值严格对应）
+// ---------------------------------------------------------------------------
+
+export type TurnUndoStatusValue =
+  | 'recording' | 'ready' | 'no_changes' | 'unavailable' | 'conflicted'
+  | 'reverting' | 'reverted' | 'interrupted' | 'recovering' | 'failed';
+
+export type SnapshotAvailabilityValue =
+  | 'available' | 'expired' | 'missing' | 'corrupt' | 'not_required';
+
+export interface TurnUndoFileSummary {
+  file_id: string;
+  display_path: string;
+  before_kind: string;
+  after_kind: string | null;
+  net_added: number;
+  net_removed: number;
+  diff_kind: string | null;
+}
+
+export interface TurnUndoStateSummary {
+  checkpoint_id: string;
+  turn_id: string;
+  status: TurnUndoStatusValue;
+  snapshot_availability: SnapshotAvailabilityValue;
+  record_version: number;
+  owner_kind: string;
+  parent_checkpoint_id: string | null;
+  description: string;
+  started_at_ms: number;
+  completed_at_ms: number | null;
+  reverted_at_ms: number | null;
+  has_uncovered_command_effects: number | boolean;
+  unavailable_code: string | null;
+  file_count: number;
+  net_added: number;
+  net_removed: number;
+}
+
+export interface TurnUndoNodeState {
+  kind: string;
+  exists: boolean;
+  size: number | null;
+  sha256: string | null;
+  identity: string | null;
+  link_count: number | null;
+  symlink_target: string | null;
+}
+
+export interface TurnUndoFileConflict {
+  file_id: string;
+  display_path: string;
+  expected: TurnUndoNodeState;
+  actual: TurnUndoNodeState;
+  reasons: string[];
+}
+
+export interface TurnUndoPreviewPayload {
+  checkpoint_id: string;
+  turn_id: string;
+  status: TurnUndoStatusValue;
+  snapshot_availability: SnapshotAvailabilityValue;
+  record_version: number;
+  file_count: number;
+  restore_content_count: number;
+  delete_created_count: number;
+  restore_deleted_count: number;
+  restore_path_state_count: number;
+  created_files: string[];
+  conflicts: TurnUndoFileConflict[];
+  has_uncovered_command_effects: boolean;
+  subsequent_completed_turns: number;
+  workspace_root: string;
+}
+
+export interface TurnUndoExecutePayload {
+  checkpoint_id: string;
+  turn_id: string;
+  status: string;
+  operation_id: string;
+  reverted_at_ms: number;
+  restored_files: string[];
+  deleted_created_files: string[];
+  restored_deleted_files: string[];
+  idempotent: boolean;
+  original_reverted_at_ms: number | null;
+}
+
+export interface TurnUndoRecoveryPreviewPayload {
+  operation_id: string;
+  checkpoint_id: string;
+  action: 'continue_revert' | 'cancel_revert';
+  processed_files: string[];
+  remaining_files: string[];
+  unknown_files: string[];
+  recovery_required: boolean;
+  child_operation_id?: string | null;
+}
+
+export interface TurnUndoRecoveryExecutePayload {
+  operation_id: string;
+  parent_operation_id: string | null;
+  action: 'continue_revert' | 'cancel_revert';
+  status: string;
+  checkpoint_status: string;
+  affected_files: string[];
+}
+
+export interface TurnUndoErrorResponse {
+  ok: false;
+  code: string;
+  msg: string;
+  detail?: Record<string, any>;
+}
+
+export type TurnUndoStatesResponse =
+  | { ok: true; states: TurnUndoStateSummary[] }
+  | TurnUndoErrorResponse;
+
+export type TurnUndoStatusResponse =
+  | { ok: true; status: (TurnUndoStateSummary & { files: TurnUndoFileSummary[]; last_operation_id?: string | null }) | null }
+  | TurnUndoErrorResponse;
+
+export type TurnUndoFileDiffResponse =
+  | {
+      ok: true;
+      diff: {
+        file_id: string;
+        display_path: string;
+        diff_kind: string;
+        diff_text: string | null;
+        net_added: number;
+        net_removed: number;
+        before_size: number | null;
+        after_size: number | null;
+        truncated: boolean;
+        undo_result: string | null;
+      };
+    }
+  | TurnUndoErrorResponse;
+
+export type TurnUndoPreviewResponse =
+  | { ok: true; preview: TurnUndoPreviewPayload; preview_token: string }
+  | TurnUndoErrorResponse;
+
+export type TurnUndoExecuteResponse =
+  | { ok: true; result: TurnUndoExecutePayload }
+  | TurnUndoErrorResponse;
+
+export type TurnUndoRecoveryPreviewResponse =
+  | { ok: true; preview: TurnUndoRecoveryPreviewPayload; preview_token: string }
+  | TurnUndoErrorResponse;
+
+export type TurnUndoRecoveryExecuteResponse =
+  | { ok: true; result: TurnUndoRecoveryExecutePayload }
+  | TurnUndoErrorResponse;
 
 // check_update() 的返回结构。cached_installer 为后端探测到的本地可复用
 // 安装包绝对路径（缓存命中且通过官方 SHA256 / 大小校验），空串表示需下载；
@@ -624,7 +800,17 @@ export interface PyWebViewAPI {
 
   export_session(fmt: 'md' | 'html' | 'json'): Promise<any>;
   clear_session_history(sessionName: string): Promise<any>;
-  undo_last_edit(): Promise<any>;
+
+  // ------------------------------------------------------------------
+  // 按回合撤销（规格 19.1 窄桥接）：会话名由后端解析为 sessions.id
+  // ------------------------------------------------------------------
+  list_turn_undo_states(sessionName: string): Promise<TurnUndoStatesResponse>;
+  get_turn_undo_status(sessionName: string, turnId: string): Promise<TurnUndoStatusResponse>;
+  get_turn_undo_file_diff(sessionName: string, turnId: string, fileId: string): Promise<TurnUndoFileDiffResponse>;
+  preview_turn_undo(sessionName: string, turnId: string): Promise<TurnUndoPreviewResponse>;
+  execute_turn_undo(sessionName: string, turnId: string, previewToken: string): Promise<TurnUndoExecuteResponse>;
+  preview_turn_undo_recovery(sessionName: string, operationId: string, action: 'continue_revert' | 'cancel_revert'): Promise<TurnUndoRecoveryPreviewResponse>;
+  execute_turn_undo_recovery(sessionName: string, operationId: string, action: 'continue_revert' | 'cancel_revert', previewToken: string): Promise<TurnUndoRecoveryExecuteResponse>;
 
   read_file_preview(path: string): Promise<any>;
   check_paths_kind(paths: string[]): Promise<Array<{ path: string; kind: 'file' | 'dir' | 'missing' }>>;
