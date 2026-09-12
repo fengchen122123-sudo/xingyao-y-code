@@ -398,3 +398,217 @@ def test_paste_image_without_image_reports_empty(monkeypatch):
 
     assert main.msg_queue.qsize() == 0
     assert any("剪贴板中没有图片" in line for line in printed)
+
+
+# ---------------------------------------------------------------------------
+# /update
+# ---------------------------------------------------------------------------
+
+class _FakeDownloader:
+    def __init__(self, downloading=False, started=True):
+        self._downloading = downloading
+        self._started = started
+        self.calls = []
+        self.cancelled = False
+
+    def is_downloading(self):
+        return self._downloading
+
+    def start_download(self, **kwargs):
+        self.calls.append(kwargs)
+        return self._started
+
+    def cancel(self):
+        self.cancelled = True
+
+
+def test_update_check_latest_and_new_version(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+
+    import core.updater as upd
+    monkeypatch.setattr(upd, "fetch_latest_release", lambda: {
+        "ok": True, "has_update": False, "current_version": "1.2.26",
+    })
+    main.handle_slash_command("/update")
+    assert any("已是最新版本" in line for line in printed)
+
+    printed.clear()
+    monkeypatch.setattr(upd, "fetch_latest_release", lambda: {
+        "ok": True, "has_update": True, "latest_version": "1.3.0",
+        "current_version": "1.2.26", "release_notes": "修复若干问题",
+        "asset_size": 120 * 1024 * 1024, "sha256": "abc", "part_urls": [],
+        "is_split": False, "part_count": 0, "download_url": "https://x/y.exe",
+    })
+    monkeypatch.setattr(upd, "find_cached_installer", lambda *a: "")
+    main.handle_slash_command("/update check")
+    assert any("发现新版本 v1.3.0" in line for line in printed)
+    assert any("修复若干问题" in line for line in printed)
+    assert any("/update download" in line for line in printed)
+
+
+def test_update_download_starts_with_release_params(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    downloader = _FakeDownloader()
+    monkeypatch.setattr(main, "_get_update_downloader", lambda: downloader)
+
+    import core.updater as upd
+    monkeypatch.setattr(upd, "fetch_latest_release", lambda: {
+        "ok": True, "has_update": True, "latest_version": "1.3.0",
+        "current_version": "1.2.26", "release_notes": "", "asset_size": 1000,
+        "sha256": "ABC", "part_urls": ["https://x/y.part1"], "is_split": True,
+        "part_count": 1, "download_url": "https://x/tag",
+    })
+
+    main.handle_slash_command("/update download")
+
+    assert len(downloader.calls) == 1
+    call = downloader.calls[0]
+    assert call["target_version"] == "1.3.0"
+    assert call["part_urls"] == ["https://x/y.part1"]
+    assert call["expected_sha256"] == "abc"  # 小写归一
+    assert any("已开始下载 v1.3.0" in line for line in printed)
+
+
+def test_update_download_rejects_when_busy(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    downloader = _FakeDownloader(downloading=True)
+    monkeypatch.setattr(main, "_get_update_downloader", lambda: downloader)
+
+    main.handle_slash_command("/update download")
+
+    assert downloader.calls == []
+    assert any("已有下载任务" in line for line in printed)
+
+
+def test_update_cancel_calls_downloader(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    downloader = _FakeDownloader()
+    monkeypatch.setattr(main, "_get_update_downloader", lambda: downloader)
+
+    main.handle_slash_command("/update cancel")
+
+    assert downloader.cancelled is True
+
+
+def test_update_install_gates_on_turn_and_tasks(monkeypatch, tmp_path):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"x")
+    launched = []
+    import core.updater as upd
+    monkeypatch.setattr(upd, "launch_installer", lambda path: launched.append(path) or True)
+
+    # 回合进行中：拒绝启动安装
+    monkeypatch.setattr(main, "is_thinking", True)
+    main.handle_slash_command(f"/update install {installer} y")
+    assert launched == []
+    assert any("正在执行的回合" in line for line in printed)
+
+    # 后台任务运行中：拒绝启动安装
+    monkeypatch.setattr(main, "is_thinking", False)
+    import core.task_manager as tm
+    monkeypatch.setattr(tm, "list_active_tasks", lambda: [{"id": "t1"}])
+    main.handle_slash_command(f"/update install {installer} y")
+    assert launched == []
+    assert any("后台任务" in line for line in printed)
+
+    # 门禁通过：启动安装且退出线程被捕获（不真正 os._exit）
+    monkeypatch.setattr(tm, "list_active_tasks", lambda: [])
+
+    class _NoopThread:
+        def __init__(self, **kwargs):
+            _NoopThread.last_kwargs = kwargs
+
+        def start(self):
+            pass
+
+    _NoopThread.last_kwargs = None
+    monkeypatch.setattr(main.threading, "Thread", lambda *a, **kw: _NoopThread(**kw))
+    main.handle_slash_command(f"/update install {installer} y")
+
+    assert launched == [str(installer)]
+    assert _NoopThread.last_kwargs is not None  # 退出线程已安排（测试内不执行）
+    assert any("安装向导已启动" in line for line in printed)
+
+
+def test_update_install_requires_confirmation(monkeypatch, tmp_path):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    installer = tmp_path / "setup.exe"
+    installer.write_bytes(b"x")
+    launched = []
+    import core.updater as upd
+    monkeypatch.setattr(upd, "launch_installer", lambda path: launched.append(path) or True)
+
+    main.handle_slash_command(f"/update install {installer}")
+
+    assert launched == []
+    assert any("确认请输入" in line for line in printed)
+
+
+# ---------------------------------------------------------------------------
+# /changes
+# ---------------------------------------------------------------------------
+
+class _FakeTurnUndoService:
+    def __init__(self, states, details=None):
+        self._states = states
+        self._details = details or {}
+
+    def list_turn_undo_states(self, session_id, limit=100):
+        return self._states
+
+    def get_turn_undo_status(self, session_id, turn_id):
+        return self._details.get(turn_id)
+
+
+def test_changes_lists_recent_turns_with_file_rows(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    monkeypatch.setattr(main, "current_session", "s1")
+    monkeypatch.setattr(main, "_undo_session_id", lambda session: 1)
+    service = _FakeTurnUndoService(
+        states=[
+            {"turn_id": "turn-111122223333", "status": "ready",
+             "snapshot_availability": "available", "file_count": 2,
+             "net_added": 10, "net_removed": 3},
+            {"turn_id": "turn-444455556666", "status": "reverted",
+             "snapshot_availability": "available", "file_count": 1,
+             "net_added": 2, "net_removed": 2},
+        ],
+        details={
+            "turn-111122223333": {"files": [
+                {"display_path": "a.py", "net_added": 6, "net_removed": 2},
+                {"display_path": "b.py", "net_added": 4, "net_removed": 1},
+            ]},
+            "turn-444455556666": {"files": [
+                {"display_path": "c.py", "net_added": 2, "net_removed": 2},
+            ]},
+        },
+    )
+    monkeypatch.setattr(main, "_undo_service", lambda: service)
+
+    main.handle_slash_command("/changes 2")
+
+    assert any("turn-111" in line for line in printed)
+    assert any("可撤销" in line for line in printed)
+    assert any("a.py" in line and "+6" in line for line in printed)
+    assert any("c.py" in line for line in printed)
+    assert any("/undo" in line for line in printed)
+
+
+def test_changes_empty_session_reports(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    monkeypatch.setattr(main, "current_session", "s1")
+    monkeypatch.setattr(main, "_undo_session_id", lambda session: 1)
+    monkeypatch.setattr(main, "_undo_service", lambda: _FakeTurnUndoService(states=[]))
+
+    main.handle_slash_command("/changes")
+
+    assert any("还没有文件修改记录" in line for line in printed)
