@@ -29,6 +29,11 @@ import type {
   DiffReadyEventData,
   SubagentProgressEventData,
   QueuedMessage,
+  TurnUndoStateSummary,
+  TurnUndoPreviewPayload,
+  TurnUndoExecutePayload,
+  TurnUndoRecoveryPreviewPayload,
+  TurnUndoRecoveryExecutePayload,
 } from '../types/pywebview';
 import type { MediaItem } from '../types/media';
 import { formatPermMode } from '../utils/markdown';
@@ -282,6 +287,10 @@ export interface ChatMessage {
   media?: MediaItem[];
   // 生成耗时与速率指标（后端权威结算或历史持久化透传）
   metrics?: MessageMetrics;
+  // 按回合撤销：权威回合归属（message_turn_links 持久化元数据，旧消息缺省为空串）。
+  // turnId 是撤销定位键；positionKind 标识本条消息在回合中的位置种类
+  turnId?: string;
+  positionKind?: string;
 }
 
 const TOOL_CATEGORIES = new Set(['read', 'search', 'command', 'mutation', 'skill', 'other']);
@@ -359,7 +368,17 @@ export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] 
     if (m.role === 'tool' && m.tool_call_id) toolMessages.set(m.tool_call_id, m);
   }
   const paired: ChatMessage[] = [];
-  for (const m of messages) {
+  for (const raw of messages) {
+    // 按回合撤销：后端消息携带 snake_case 的回合关联元数据，统一映射
+    const m: ChatMessage = (() => {
+      const anyRaw = raw as any;
+      if (anyRaw.turn_id === undefined && anyRaw.position_kind === undefined) return raw;
+      return {
+        ...raw,
+        turnId: anyRaw.turn_id || '',
+        positionKind: anyRaw.position_kind || '',
+      } as ChatMessage;
+    })();
     if (m.role === 'tool' && m.tool_call_id && toolMessages.has(m.tool_call_id)) continue;
     if (m.role === 'assistant') {
       paired.push({
@@ -402,6 +421,8 @@ export interface PermReqState {
   permissionOptions: Array<{ key: string; label: string }>;
   // 请求来源工具名：'ask_user' 时为澄清问题，否则为标准权限请求
   functionName: string;
+  // 按回合撤销：undo_turn 权限卡附带的服务预检影响摘要（其余工具为 null）
+  undoImpact?: Record<string, any> | null;
 }
 
 export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models';
@@ -509,6 +530,10 @@ export const useAppStore = defineStore('app', {
     // 本回合实际用到的技能名（从 is_skill 工具调用收集）：turn_start 时清空，
     // 回合结束后固化为本回合结果，状态栏"技能"项据此显示；随会话 runtime 保存/恢复
     usedSkills: [] as string[],
+    // 按回合撤销：turn_id → 检查点状态摘要（批量查询 + turn_undo_updated 事件维护）。
+    // 卡片按权威 turnId 绑定状态；页面刷新/切换会话后由批量查询重建
+    turnUndoStates: {} as Record<string, TurnUndoStateSummary>,
+    turnUndoReqSeq: 0,
     // M31 修复：各类异步刷新的请求序号，响应返回时序号已过期则丢弃，
     // 避免并发/重复刷新时旧快照覆盖新快照
     sessionsReqSeq: 0,
@@ -1581,6 +1606,8 @@ export const useAppStore = defineStore('app', {
           : '对话';
         // 启动时后端自动恢复最近一次对话：同步消息列表与标题
         this.messages = pairHistoryToolMessages((init as any).messages || []);
+        // 按回合撤销：启动批量拉取当前会话的检查点状态（重建撤销卡片）
+        void this.refreshTurnUndoStates();
         // 批次D：窗口重载/崩溃重建期间终态事件已丢失，后端通过 active_sessions
         // 告知仍有活跃回合的会话名列表。据此恢复各会话 running 态与顶层标记，
         // 让运行中的会话正确显示运行中（含发送拦截/停止按钮）而不是看似空闲。
@@ -2198,6 +2225,8 @@ export const useAppStore = defineStore('app', {
         if (this.currentSessionName !== sessionName) return;
         if (!runtime.running && runtime.messages.length === 0) {
           runtime.messages = pairHistoryToolMessages(res.messages || []);
+          // 按回合撤销：切换会话后批量拉取该会话的检查点状态（卡片随会话重建）
+          void this.refreshTurnUndoStates();
           this._bindSessionRuntime(sessionName);
         } else if (!runtime.running && res.messages && res.messages.length > 0) {
           // 同步最新的 error_note 与 execution_state（如后台会话已落库或附带了错误标注）
@@ -2859,6 +2888,18 @@ export const useAppStore = defineStore('app', {
         this.windowMaximized = !!data.maximized;
         return;
       }
+      // 按回合撤销：撤销/恢复事务状态变更（数据库提交成功后后端才发）。
+      // 只更新对应会话和回合，不串到当前正在查看的其他会话（规格 16/25.5）
+      if (type === 'turn_undo_updated') {
+        const undoSession = String(data.session_name || '');
+        if (undoSession === this.currentSessionName && data.turn_id) {
+          void this.refreshTurnUndoStates();
+        }
+        if (data.message) {
+          this.notifyChatLocal(String(data.message));
+        }
+        return;
+      }
       // H2 修复：终态事件缺失 session_name 时，不能落到当前显示会话
       // （可能覆盖无关会话的运行态，且 runningSessions 残留导致发送被永久拦截）。
       // 兜底策略：仅当 runningSessions 恰有唯一会话时采纳该会话（此时归属无歧义），
@@ -2929,6 +2970,17 @@ export const useAppStore = defineStore('app', {
         );
         if (!alreadyHasUser) {
           this.messages.push({ role: 'user', content: turnUserText });
+        }
+        // 按回合撤销：权威 turn_id 绑定到本轮用户消息（撤销卡片定位键）。
+        // 乐观渲染的消息在 turn_start 到达时补上权威 turnId
+        if (data.turn_id) {
+          for (let i = this.messages.length - 1; i >= 0; i--) {
+            const m = this.messages[i] as ChatMessage;
+            if (m.role === 'user' && m.content === turnUserText && !m.turnId) {
+              m.turnId = String(data.turn_id);
+              break;
+            }
+          }
         }
         // 占位 assistant：仅当末尾不是空 running 占位时才补（乐观渲染已加则复用）
         const tail = this.messages[this.messages.length - 1];
@@ -3256,6 +3308,9 @@ export const useAppStore = defineStore('app', {
             })).filter((option: { key: string; label: string }) => option.key && option.label)
             : [],
           functionName: String(data.function_name || ''),
+          undoImpact: (data.undo_impact && typeof data.undo_impact === 'object')
+            ? data.undo_impact
+            : null,
         };
         this.permRequest.show = this.permRequest.sessionName === this.currentSessionName;
         // 非当前窗口等待用户确认 → 黄点
@@ -3264,7 +3319,7 @@ export const useAppStore = defineStore('app', {
         // 后端权限队列已清空（请求被超时拒绝/取消）：收起内联权限卡片，避免死请求残留。
         // 必须整体重置：仅 show=false 会残留 reqId/sessionName，
         // switchSession 重显逻辑会把已失效的卡片复活，点击后报“权限响应发送失败”
-        this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '' };
+        this.permRequest = { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '', undoImpact: null };
       } else if (type === 'message_queue') {
         // 排队消息全量快照：幂等替换该会话队列。后端在入队/取消/插队/补发
         // 后都会推送，前端不做增量合并，天然免疫事件乱序与丢失漂移
@@ -3330,6 +3385,9 @@ export const useAppStore = defineStore('app', {
         this.running = false;
         this.streamingSpeed = 0;
         speedTracker.reset();
+        // 回合封闭后检查点进入 ready/no_changes：刷新批量撤销状态，
+        // 让本轮文件卡片切到权威净 diff 与撤销按钮
+        void this.refreshTurnUndoStates();
         // turn_finish 只在仍处于 running 时置为 completed；已取消/出错的状态不被覆盖
         const last = this.messages[this.messages.length - 1];
         if (last && last.role === 'assistant') {
@@ -3874,27 +3932,119 @@ export const useAppStore = defineStore('app', {
       }
     },
 
-    async undoLastEdit() {
-      const ok = await this.askConfirm(
-        '撤销文件修改',
-        `此操作将撤销${this.agentName}最近一次的文件改动`,
-        `撤销${this.agentName}上一次的文件修改？`,
-        '确定撤销 ⏎'
-      );
-      if (!ok) return;
+    // ------------------------------------------------------------------
+    // 按回合撤销（规格 16）：批量状态、预检/执行、惰性 diff、中断恢复
+    // ------------------------------------------------------------------
 
+    async refreshTurnUndoStates() {
       const api = this._api();
-      if (!api) return;
+      const session = this.currentSessionName;
+      if (!api || !session || !api.list_turn_undo_states) return;
+      const seq = ++this.turnUndoReqSeq;
       try {
-        const res = await api.undo_last_edit();
-        if (res && res.ok) {
-          this.notifyChat(res.msg || '已撤销上一次文件修改');
-        } else {
-          this.notifyChat('撤销失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        const res = await api.list_turn_undo_states(session);
+        if (seq !== this.turnUndoReqSeq || !res || !res.ok) return;
+        const map: Record<string, TurnUndoStateSummary> = {};
+        for (const state of res.states || []) {
+          map[state.turn_id] = state;
         }
+        this.turnUndoStates = map;
+      } catch {
+        // 批量状态查询失败不打断会话；卡片退回旧展示
+      }
+    },
+
+    async previewTurnUndo(turnId: string):
+        Promise<{ preview: TurnUndoPreviewPayload; token: string } | null> {
+      const api = this._api();
+      if (!api || !api.preview_turn_undo) return null;
+      try {
+        const res = await api.preview_turn_undo(this.currentSessionName, turnId);
+        if (res && res.ok) {
+          return { preview: res.preview, token: res.preview_token || '' };
+        }
+        this.notifyChat(res.msg || '预检失败');
+        return null;
       } catch (err) {
-        this.connected = false;
+        this.notifyChat('预检失败: ' + err);
+        return null;
+      }
+    },
+
+    async executeTurnUndo(turnId: string, previewToken: string): Promise<TurnUndoExecutePayload | null> {
+      const api = this._api();
+      if (!api || !api.execute_turn_undo) return null;
+      try {
+        const res = await api.execute_turn_undo(this.currentSessionName, turnId, previewToken);
+        if (res && res.ok) {
+          await this.refreshTurnUndoStates();
+          return res.result;
+        }
+        this.notifyChat(res.msg || '撤销失败');
+        await this.refreshTurnUndoStates();
+        return null;
+      } catch (err) {
         this.notifyChat('撤销失败: ' + err);
+        return null;
+      }
+    },
+
+    async fetchTurnUndoStatus(turnId: string) {
+      const api = this._api();
+      if (!api || !api.get_turn_undo_status) return null;
+      try {
+        const res = await api.get_turn_undo_status(this.currentSessionName, turnId);
+        return res && res.ok ? res.status : null;
+      } catch {
+        return null;
+      }
+    },
+
+    async fetchTurnUndoFileDiff(turnId: string, fileId: string) {
+      const api = this._api();
+      if (!api || !api.get_turn_undo_file_diff) return null;
+      try {
+        const res = await api.get_turn_undo_file_diff(this.currentSessionName, turnId, fileId);
+        return res && res.ok ? res.diff : null;
+      } catch {
+        return null;
+      }
+    },
+
+    async previewTurnUndoRecovery(operationId: string, action: 'continue_revert' | 'cancel_revert'):
+        Promise<{ preview: TurnUndoRecoveryPreviewPayload; token: string } | null> {
+      const api = this._api();
+      if (!api || !api.preview_turn_undo_recovery) return null;
+      try {
+        const res = await api.preview_turn_undo_recovery(this.currentSessionName, operationId, action);
+        if (res && res.ok) {
+          return { preview: res.preview, token: res.preview_token || '' };
+        }
+        return null;
+      } catch {
+        return null;
+      }
+    },
+
+    async executeTurnUndoRecovery(
+      operationId: string, action: 'continue_revert' | 'cancel_revert', previewToken: string,
+    ): Promise<TurnUndoRecoveryExecutePayload | null> {
+      const api = this._api();
+      if (!api || !api.execute_turn_undo_recovery) return null;
+      try {
+        const res = await api.execute_turn_undo_recovery(
+          this.currentSessionName, operationId, action, previewToken,
+        );
+        if (res && res.ok) {
+          await this.refreshTurnUndoStates();
+          return res.result;
+        }
+        this.notifyChat(res.msg || '恢复操作失败');
+        await this.refreshTurnUndoStates();
+        return null;
+      } catch (err) {
+        this.notifyChat('恢复操作失败: ' + err);
+        return null;
       }
     },
 
