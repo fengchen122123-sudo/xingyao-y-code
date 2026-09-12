@@ -977,6 +977,8 @@ COMMAND_COMPLETIONS = [
     ("/open", "在系统中打开文件/目录 (无参=当前工作区)"),
     ("/queue", "排队消息管理 (list/cancel 序号/clear)"),
     ("/paste-image", "发送剪贴板图片 (可附说明文字)"),
+    ("/update", "更新检查与安装 (check/download/cancel/install)"),
+    ("/changes", "查看最近 N 个回合的文件变更汇总 (默认 3)"),
     ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
@@ -2336,6 +2338,189 @@ def print_turn_file_summary_if_ready(session_name: str, turn_id: str) -> None:
         )
 
 
+# ---------------------------------------------------------------------------
+# /update 更新器 CLI 接入层（core/updater 的流程与 GUI 桥接对齐：
+# check → download（后台线程 + 主线程代理打印）→ install（门禁 + 确认 + 退出））
+# ---------------------------------------------------------------------------
+
+_update_downloader = None
+_last_update_installer = {"path": ""}
+
+
+def _get_update_downloader():
+    global _update_downloader
+    if _update_downloader is None:
+        from core.updater import UpdateDownloader
+        _update_downloader = UpdateDownloader()
+    return _update_downloader
+
+
+def _print_threadsafe(html_text: str) -> None:
+    """后台线程打印代理：有 UI 循环时把打印调度回主线程（AGENTS.md 线程铁律）；
+    无循环（测试/特殊环境）时按当前线程直接打印。"""
+    app = app_instance
+    loop = getattr(app, "loop", None) if app is not None else None
+    if loop is not None:
+        loop.call_soon_threadsafe(print_formatted_text, HTML(html_text))
+    else:
+        print_formatted_text(HTML(html_text))
+
+
+def _update_cmd_check() -> None:
+    from core.updater import fetch_latest_release, find_cached_installer
+    try:
+        info = fetch_latest_release()
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 检查更新失败：{_esc(str(exc))}</ansired>"))
+        return
+    if not info.get("ok"):
+        print_formatted_text(HTML(f"<ansired>❌ {_esc(str(info.get('msg') or '检查更新失败'))}</ansired>"))
+        return
+    current = str(info.get("current_version") or "")
+    if not info.get("has_update"):
+        print_formatted_text(HTML(f"<ansigreen>✔ 已是最新版本（当前 v{_esc(current)}）。</ansigreen>"))
+        return
+    latest = str(info.get("latest_version") or "")
+    size_mb = int(info.get("asset_size") or 0) / (1024 * 1024)
+    split_mark = f" · 分卷 x{info.get('part_count')}" if info.get("is_split") else ""
+    print_formatted_text(HTML(
+        f"<b><ansicyan>发现新版本 v{_esc(latest)}</ansicyan></b>（当前 v{_esc(current)}）"
+        f" · 包大小约 {size_mb:.1f} MB{split_mark}"
+    ))
+    notes = str(info.get("release_notes") or "").strip()
+    if notes:
+        print_formatted_text(HTML("<ansigray>更新日志（节选）：</ansigray>"))
+        for line in notes.splitlines()[:40]:
+            print_formatted_text(HTML(f"  {_esc(line)}"))
+    cached = ""
+    try:
+        cached = find_cached_installer(
+            latest, str(info.get("sha256") or ""), int(info.get("asset_size") or 0)
+        ) or ""
+    except Exception:
+        cached = ""
+    if cached:
+        print_formatted_text(HTML(f"<ansigreen>✔ 检测到已下载的安装包，可直接安装：</ansigreen> {_esc(cached)}"))
+        print_formatted_text(HTML("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 Y-CODE）。"))
+    else:
+        print_formatted_text(HTML("  输入 <ansicyan>/update download</ansicyan> 开始下载。"))
+
+
+def _update_cmd_download() -> None:
+    from core.updater import fetch_latest_release
+    downloader = _get_update_downloader()
+    if downloader.is_downloading():
+        print_formatted_text(HTML("<ansiyellow>ℹ 已有下载任务进行中，/update cancel 可取消。</ansiyellow>"))
+        return
+    try:
+        info = fetch_latest_release()
+    except Exception as exc:
+        print_formatted_text(HTML(f"<ansired>❌ 检查更新失败：{_esc(str(exc))}</ansired>"))
+        return
+    if not info.get("ok") or not info.get("has_update"):
+        print_formatted_text(HTML(f"<ansigreen>✔ 已是最新版本（当前 v{_esc(str(info.get('current_version') or ''))}），无需下载。</ansigreen>"))
+        return
+    version = str(info.get("latest_version") or "")
+    part_urls = [str(u) for u in (info.get("part_urls") or []) if str(u).strip()]
+    progress_bucket = {"last": -1}
+
+    def _on_progress(data):
+        # downloader 工作线程：只经 _print_threadsafe 回主线程，按 10% 步进防刷屏
+        try:
+            percent = int(data.get("percent") or 0)
+        except Exception:
+            percent = 0
+        bucket = percent // 10
+        if bucket > progress_bucket["last"]:
+            progress_bucket["last"] = bucket
+            _print_threadsafe(f"<ansigray>  下载进度 {min(percent, 100)}%</ansigray>")
+
+    def _on_complete(dest_path):
+        _last_update_installer["path"] = str(dest_path)
+        _print_threadsafe(f"<ansigreen>✔ 安装包下载完成：{_esc(str(dest_path))}</ansigreen>")
+        _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 Y-CODE）。")
+
+    def _on_error(message):
+        _print_threadsafe(f"<ansired>❌ 下载失败：{_esc(str(message))}</ansired>")
+
+    started = downloader.start_download(
+        download_url=str(info.get("download_url") or ""),
+        target_version=version,
+        on_progress=_on_progress,
+        on_complete=_on_complete,
+        on_error=_on_error,
+        part_urls=part_urls,
+        expected_sha256=str(info.get("sha256") or "").strip().lower(),
+        total_size_hint=int(info.get("asset_size") or 0),
+    )
+    if started:
+        print_formatted_text(HTML(
+            f"<ansicyan>⬇ 已开始下载 v{_esc(version)}"
+            "（进度按 10% 步进打印，/update cancel 可取消）。</ansicyan>"
+        ))
+    else:
+        print_formatted_text(HTML("<ansired>❌ 未能启动下载（可能已有任务在进行中）。</ansired>"))
+
+
+def _update_cmd_install(args: list) -> None:
+    from core.updater import fetch_latest_release, find_cached_installer, launch_installer
+    # 支持两种顺序：/update install y（默认路径确认）与 /update install <路径> y
+    tokens = [str(t or "").strip() for t in args if str(t or "").strip()]
+    confirmed = any(t.lower() in ("y", "yes", "--force") for t in tokens)
+    path = " ".join(t for t in tokens if t.lower() not in ("y", "yes", "--force")).strip()
+    if not path:
+        path = _last_update_installer["path"]
+    if not path:
+        # 无最近下载：按线上 Release 探测本地缓存安装包
+        try:
+            info = fetch_latest_release()
+        except Exception:
+            info = {}
+        if info.get("has_update"):
+            try:
+                path = find_cached_installer(
+                    str(info.get("latest_version") or ""),
+                    str(info.get("sha256") or ""),
+                    int(info.get("asset_size") or 0),
+                ) or ""
+            except Exception:
+                path = ""
+    if not confirmed:
+        if path and os.path.isfile(path):
+            print_formatted_text(HTML(f"即将安装: {_esc(path)}"))
+            print_formatted_text(HTML("确认请输入: <ansicyan>/update install y</ansicyan>（安装会退出 Y-CODE）"))
+        else:
+            print_formatted_text(HTML("<ansiyellow>ℹ 未找到可安装的安装包。先 /update download，或指定路径: /update install &lt;路径&gt; y</ansiyellow>"))
+        return
+    if not path or not os.path.isfile(path):
+        print_formatted_text(HTML("<ansired>❌ 安装包不存在，请先 /update download。</ansired>"))
+        return
+    # 门禁：回合进行中 / 后台任务运行中一律拒绝（安装会退出进程）
+    if is_thinking:
+        print_formatted_text(HTML("<ansired>❌ 当前有正在执行的回合，请先 Ctrl+C 结束后再安装。</ansired>"))
+        return
+    try:
+        from core.task_manager import list_active_tasks
+        active_tasks = list_active_tasks()
+    except Exception:
+        active_tasks = []
+    if active_tasks:
+        print_formatted_text(HTML(
+            f"<ansired>❌ 还有 {len(active_tasks)} 个后台任务未结束（/tasks 查看），请先处理再安装。</ansired>"
+        ))
+        return
+    if launch_installer(path):
+        print_formatted_text(HTML("<ansigreen>✔ 安装向导已启动，Y-CODE 即将退出…</ansigreen>"))
+
+        def _exit_soon():
+            time.sleep(0.8)
+            os._exit(0)
+
+        threading.Thread(target=_exit_soon, daemon=True).start()
+    else:
+        print_formatted_text(HTML("<ansired>❌ 唤起安装包失败，请手动运行安装包。</ansired>"))
+
+
 def handle_slash_command(command_text):
     """斜杠指令路由器"""
     global current_session, current_model, _turn_separator_needed
@@ -2370,6 +2555,8 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/clear-history [y]</ansicyan>                   : 清空当前会话全部历史消息 (输入 /clear-history y 确认，不影响任务计划与长期记忆)"))
         print_formatted_text(HTML("  <ansicyan>/queue [list|cancel 序号|clear]</ansicyan>      : 管理排队中的消息 (AI 忙碌时新消息会排队)"))
         print_formatted_text(HTML("  <ansicyan>/paste-image [说明]</ansicyan>                  : 发送剪贴板图片给模型 (可附说明文字)"))
+        print_formatted_text(HTML("  <ansicyan>/update [check|download|cancel|install]</ansicyan> : 检查/下载/安装新版本 (安装会退出 Y-CODE)"))
+        print_formatted_text(HTML("  <ansicyan>/changes [N]</ansicyan>                          : 查看最近 N 个回合的文件变更汇总 (默认 3)"))
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
@@ -2827,6 +3014,68 @@ def handle_slash_command(command_text):
                 "was_queued": was_queued,
                 "session": current_session,
             })
+
+    elif cmd == "/update":
+        # 更新检查与安装（core/updater 此前仅 GUI 接入）；
+        # 下载回调经 _print_threadsafe 调度回主线程，遵守线程纪律
+        sub = parts[1].lower() if len(parts) > 1 else "check"
+        if sub == "check":
+            _update_cmd_check()
+        elif sub == "download":
+            _update_cmd_download()
+        elif sub == "cancel":
+            _get_update_downloader().cancel()
+            print_formatted_text(HTML("<ansigreen>✔ 已请求取消下载。</ansigreen>"))
+        elif sub == "install":
+            rest_match = re.match(r"^/update\s+install\s+(.*)$", command_text, re.S)
+            rest = rest_match.group(1).strip() if rest_match else ""
+            _update_cmd_install(rest.split())
+        else:
+            print_formatted_text(HTML("<ansired>❌ 用法: /update [check|download|cancel|install [路径] [y]]</ansired>"))
+
+    elif cmd == "/changes":
+        # 会话文件变更历史回看（数据源：turn_undo 检查点，只读消费）。
+        # 与每轮结束后的自动摘要互补：/changes 面向任意时刻的跨回合回看。
+        try:
+            limit_n = int(parts[1]) if len(parts) > 1 else 3
+        except ValueError:
+            limit_n = 3
+        limit_n = max(1, min(limit_n, 50))
+        tu = _undo_service()
+        session_id = _undo_session_id(current_session)
+        try:
+            states = tu.list_turn_undo_states(session_id, limit=50)
+        except Exception as exc:
+            print_formatted_text(HTML(f"<ansired>❌ 读取变更记录失败：{_esc(str(exc))}</ansired>"))
+            return
+        with_changes = [s for s in states if (s.get("file_count") or 0) > 0]
+        if not with_changes:
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前会话还没有文件修改记录。</ansiyellow>"))
+            return
+        print_formatted_text(HTML(f"<b><ansicyan>最近文件变更（{min(limit_n, len(with_changes))} 个回合）：</ansicyan></b>"))
+        for s in with_changes[:limit_n]:
+            print_formatted_text(HTML(
+                f"  回合 <b>{_esc(_undo_short_id(s['turn_id']))}</b> · {_esc(_undo_status_label(s))}"
+                f" · {s.get('file_count') or 0} 文件"
+                f" <ansigreen>+{s.get('net_added') or 0}</ansigreen>"
+                f" <ansired>-{s.get('net_removed') or 0}</ansired>"
+            ))
+            try:
+                detail = tu.get_turn_undo_status(session_id, s["turn_id"])
+            except Exception:
+                detail = None
+            files = (detail or {}).get("files") or []
+            for f in files[:8]:
+                print_formatted_text(HTML(
+                    f"      {_esc(str(f.get('display_path') or ''))}"
+                    f"  <ansigreen>+{f.get('net_added') or 0}</ansigreen>"
+                    f" <ansired>-{f.get('net_removed') or 0}</ansired>"
+                ))
+            if len(files) > 8:
+                print_formatted_text(HTML(
+                    f"      <ansigray>还有 {len(files) - 8} 个文件（/undo status {_esc(_undo_short_id(s['turn_id']))} 查看全部）</ansigray>"
+                ))
+        print_formatted_text(HTML("<ansigray>  回滚某轮：/undo &lt;短ID&gt; 或 /checkpoint restore &lt;turn_id&gt;</ansigray>"))
 
     elif cmd == "/sandbox":
         # 沙盒开关：控制文件工具是否可访问当前工作目录之外的路径
