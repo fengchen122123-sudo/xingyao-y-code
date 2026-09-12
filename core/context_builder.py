@@ -37,6 +37,8 @@ class RuntimeContext:
     # Turn 起点冻结的电脑操控能力（Task 10，设计 9.3）：默认 None，
     # disabled/None 时动态块字节与历史版本完全一致。
     computer_capability: "ComputerCapability | None" = None
+    # 按回合撤销纠正动态块（规格 15.3）：无纠正时为空串，动态块字节不变。
+    workspace_corrections: str = ""
 
 
 def build_stable_prompt(base_prompt: str) -> str:
@@ -91,6 +93,9 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
     computer_section = _build_computer_prompt_section(runtime.computer_capability)
     if computer_section:
         prompt = prompt + "\n\n" + computer_section
+    corrections = getattr(runtime, "workspace_corrections", "") or ""
+    if corrections:
+        prompt = prompt + "\n\n" + corrections
     return prompt
 
 

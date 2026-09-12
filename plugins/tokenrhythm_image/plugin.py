@@ -85,8 +85,12 @@ def _detect_ext(head: bytes) -> str:
     return ".img"
 
 
-def _download_image(url: str, save_dir: str, prefix: str) -> str:
-    """立即下载图片到本地：先写 .part 再按文件头确定扩展名 os.replace。"""
+def _download_image(url: str, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image") -> str:
+    """立即下载图片到本地：先写 .part 再按文件头确定扩展名 os.replace。
+
+    按回合撤销：落盘前先持久化计划 after 快照（插件声明的受控文件修改
+    同样接入 FileMutationRecorder，规格 9.5）。
+    """
     save_dir = os.path.abspath(save_dir or ".")
     os.makedirs(save_dir, exist_ok=True)
     base = os.path.join(save_dir, "%s_%s" % (prefix, time.strftime("%Y%m%d_%H%M%S")))
@@ -96,7 +100,30 @@ def _download_image(url: str, save_dir: str, prefix: str) -> str:
         with open(tmp, "rb") as f:
             head = f.read(8)
         path = base + _detect_ext(head)
-        os.replace(tmp, path)
+        with open(tmp, "rb") as f:
+            payload = f.read()
+        from core.turn_undo import coordinator as _tu_coordinator
+        from core.turn_undo import recorder as _tu_recorder
+        from core.turn_undo.models import NodeKind, TurnUndoError
+
+        handle = None
+        with _tu_coordinator.get_coordinator().workspace_lock(_tu_coordinator.thread_workspace_root()):
+            try:
+                handle = _tu_recorder.prepare_mutation(
+                    display_path=path,
+                    after_kind=NodeKind.REGULAR_FILE,
+                    after_content=payload,
+                    tool_name=tool_name,
+                    tool_call_id="",
+                )
+            except TurnUndoError as error:
+                if error.code != "no_active_checkpoint":
+                    # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
+                    raise
+                handle = None
+            os.replace(tmp, path)
+            if handle is not None:
+                _tu_recorder.verify_after_mutation(handle)
         return path
     except Exception:
         try:
@@ -303,7 +330,7 @@ def edit_image(
         )
 
     try:
-        path = _download_image(image_url, save_dir, "tokenrhythm_edit")
+        path = _download_image(image_url, save_dir, "tokenrhythm_edit", tool_name="tokenrhythm_edit_image")
     except Exception as exc:
         return ToolResult(
             "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, image_url),

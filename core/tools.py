@@ -597,6 +597,27 @@ def write_file(file_path, content):
     """
     resolved = _resolve_workspace_path(file_path)
 
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.turn_undo import recorder as _tu_recorder
+    from core.turn_undo.models import NodeKind, TurnUndoError
+
+    coordinator = _tu_coordinator.get_coordinator()
+    # 中断撤销事务冻结的路径：文件工具显式拒绝（规格 13/21）
+    if coordinator.is_path_frozen_any(str(resolved)):
+        return (
+            f"🚨 目标路径处于撤销中断事务的冻结范围，已拒绝修改：{file_path}\n"
+            f"请先在 GUI 或 /undo recover 中选择继续撤销或取消撤销。"
+        )
+    # 规格锁序（H1）：与撤销事务同一把锁键——线程规范化工作区根，
+    # 子目录文件的 prepare → 写入 → verify 全区间与撤销互斥
+    with coordinator.workspace_lock(_tu_coordinator.thread_workspace_root()):
+        return _write_file_locked(resolved, file_path, content,
+                                  _tu_recorder, _tu_coordinator, NodeKind, TurnUndoError)
+
+
+def _write_file_locked(resolved, file_path, content, _tu_recorder, coordinator, NodeKind, TurnUndoError):
+    """write_file 主体；调用方已持工作区协调锁。"""
+
     # 并发防护：同一文件的 检查→写入 全过程串行化，写前做 mtime 乐观校验
     with _edit_file_lock(resolved):
         # 大文件覆盖保护：强制使用 edit_file 做片段修改。
@@ -651,6 +672,30 @@ def write_file(file_path, content):
                 f"请检查路径是否正确，或权限是否充足。"
             )
 
+        # 按回合撤销：prepare（捕获 before + 持久化计划 after）成功后才允许触盘。
+        # 快照失败 → 放弃写入；无活动回合检查点 → 退化为普通写入。
+        new_bytes = content.encode("utf-8")
+        handle = None
+        try:
+            handle = _tu_recorder.prepare_mutation(
+                display_path=str(resolved),
+                after_kind=NodeKind.REGULAR_FILE,
+                after_content=new_bytes,
+                tool_name="write_file",
+                tool_call_id="",
+            )
+        except TurnUndoError as error:
+            if error.code == "no_active_checkpoint":
+                # 回合外调用（无检查点上下文）：保持既有行为，不做可撤销记录
+                handle = None
+            else:
+                # 检查点已封闭（迟到写入）：必须在触盘前失败（规格 9.2）
+                return (
+                    f"🚨 该回合的撤销检查点已封闭，迟到的写入已被拒绝（{file_path}）：\n"
+                    f"{error.message}\n"
+                    f"请重新发起新回合后再试，避免产生不可撤销的文件修改。"
+                )
+
         fd, temp_name = tempfile.mkstemp(
             prefix=resolved.name + ".", suffix=".ycode-tmp", dir=str(resolved.parent)
         )
@@ -663,6 +708,8 @@ def write_file(file_path, content):
                     os.unlink(temp_name)
                 except OSError:
                     pass
+                if handle is not None:
+                    _tu_recorder.rollback_prepared_mutation(handle)
                 return conflict
             os.replace(temp_name, resolved)
         except BaseException:
@@ -672,15 +719,20 @@ def write_file(file_path, content):
                 os.unlink(temp_name)
             except OSError:
                 pass
+            if handle is not None:
+                try:
+                    _tu_recorder.rollback_prepared_mutation(handle)
+                except Exception:
+                    pass
             raise
-        # 与 edit_file 对齐：仅在写入成功后入撤销栈。
-        from core.memory import set_undo_state
-        set_undo_state(
-            str(resolved),
-            old_content,
-            existed_before=existed_before,
-            old_bytes=old_bytes,
-        )
+        if handle is not None:
+            try:
+                _tu_recorder.verify_after_mutation(handle)
+            except TurnUndoError as error:
+                return (
+                    f"🚨 文件已写入但未能通过可撤销性验证，本轮撤销保证失效"
+                    f"（{file_path}）：\n{error.message}"
+                )
     return f"✔ 文件 {file_path} 写入成功！"
 
 # --- 下面是给星瑶装配的两个新神装 ---
@@ -780,8 +832,25 @@ def execute_command(
     from core.command_policy import is_dangerous_command
     from core.workspace_context import get_workdir
 
+    # 撤销中断期间冻结该工作区的一切星瑶侧写入（命令可绕过文件工具冻结，规格 21）
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.workspace_context import get_workdir as _get_workdir
+
+    if _tu_coordinator.get_coordinator().any_frozen_paths(get_workdir() or os.getcwd()):
+        return (
+            "🚨 当前工作区存在未完成的撤销中断事务，已拒绝执行命令。\n"
+            "请先在 GUI 或 /undo recover 中选择继续撤销或取消撤销。"
+        )
+
     if is_dangerous_command(command):
         return "🚨 危险命令已被安全策略拒绝。请改用范围明确、可恢复的操作。"
+
+    # 按回合撤销边界（M6）：仅在实际放行执行的命令上持久化"未覆盖副作用"
+    # 事实——被冻结/危险策略拒绝的命令零副作用，不打虚假标记（规格 10）。
+    from core.turn_undo import recorder as _tu_recorder
+
+    _tu_recorder.mark_uncovered_command_effects("execute_command")
+
     try:
         timeout_seconds = int(timeout_seconds)
     except (TypeError, ValueError):
@@ -1351,10 +1420,43 @@ def fetch_image(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
             filename = f"download_{timestamp}_{counter}.{extension}"
             target = Path.cwd() / filename
             counter += 1
-        target.write_bytes(bytes(data))
+        payload = bytes(data)
+        # 按回合撤销：下载图片也是受控文件修改（fetch_image 注册 mutates_files）。
+        # prepare（持久化计划 after）失败 → 放弃写盘；无回合检查点 → 普通写入。
+        from core.turn_undo import coordinator as _tu_coordinator
+        from core.turn_undo import recorder as _tu_recorder
+        from core.turn_undo.models import NodeKind, TurnUndoError
+
+        coordinator = _tu_coordinator.get_coordinator()
+        handle = None
+        with coordinator.workspace_lock(_tu_coordinator.thread_workspace_root()):
+            try:
+                handle = _tu_recorder.prepare_mutation(
+                    display_path=str(target),
+                    after_kind=NodeKind.REGULAR_FILE,
+                    after_content=payload,
+                    tool_name="fetch_image",
+                    tool_call_id="",
+                )
+            except TurnUndoError as error:
+                if error.code == "no_active_checkpoint":
+                    handle = None
+                else:
+                    return (
+                        f"🚨 该回合的撤销检查点已封闭，迟到的图片写入已被拒绝（{target}）：\n"
+                        f"{error.message}"
+                    )
+            target.write_bytes(payload)
+            if handle is not None:
+                try:
+                    _tu_recorder.verify_after_mutation(handle)
+                except TurnUndoError as error:
+                    return (
+                        f"🚨 图片已下载但未能通过可撤销性验证（{target}）：\n{error.message}"
+                    )
         return (
             f"HTTP {status} ({content_type})\n"
-            f"图片已下载到本地：{target}（{len(data)} 字节）\n"
+            f"图片已下载到本地：{target}（{len(payload)} 字节）\n"
             f"GUI 会话中用 Markdown 图片语法 ![]({target}) 内嵌展示；CLI 终端直接给出该路径即可。"
         )
     except _ToolCancelledError:
@@ -2115,15 +2217,13 @@ def _edit_file_by_lines(
             f"未发生实际修改（{file_path}）。"
         )
 
-    # 原子写入（含 mtime 乐观校验），成功后才写入撤销栈，避免失败编辑污染撤销历史
-    write_err = _atomic_write_edit_file(
+    # 按回合撤销记录写入：prepare → 原子写 → verify（无回合检查点时退化为普通写入）
+    write_err = _recorded_atomic_write(
         resolved, encoding, new_content,
         file_path=file_path, expected_mtime_ns=expected_mtime_ns,
     )
     if write_err:
         return write_err
-    from core.memory import set_undo_state
-    set_undo_state(file_path, content)
 
     # 构建预览：被替换的原文前 3 行 + 后 2 行（超过 5 行时省略中间）
     replaced_preview_lines = replaced_block.splitlines()
@@ -2181,6 +2281,80 @@ def _atomic_write_edit_file(resolved, encoding, new_content, file_path=None, exp
         except OSError:
             pass
         return f"🚨 精准修改发生异常: {str(e)}"
+    return None
+
+
+def _recorded_atomic_write(resolved, encoding, new_content, *, file_path=None,
+                           expected_mtime_ns=None, tool_name="edit_file"):
+    """edit_file 三条写入路径统一的"按回合撤销"记录写入口。
+
+    契约：
+    - prepare（捕获 before + 持久化计划 after）成功后才允许触盘；
+      快照失败 → 返回错误、文件不变。
+    - 写入后立即 verify；实际状态与计划不一致 → 检查点标记不可撤销并报错，
+      工具不得声称成功。
+    - 无活动回合检查点（CHECKPOINT_CLOSED）时退化为普通原子写入——严格
+      撤销保证只覆盖回合作用域内的受控修改。
+    - mtime 乐观冲突是正常拒绝路径，先检查再 prepare，避免污染检查点。
+    """
+    # 1. 先做乐观校验（正常拒绝路径，不产生任何记录）
+    if expected_mtime_ns is not None:
+        conflict = _mtime_conflict_error(
+            file_path or str(resolved), resolved, expected_mtime_ns
+        )
+        if conflict:
+            return conflict
+
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.turn_undo import recorder as _tu_recorder
+    from core.turn_undo.models import NodeKind, TurnUndoError
+
+    coordinator = _tu_coordinator.get_coordinator()
+    # 中断撤销事务冻结的路径：文件工具显式拒绝（规格 13/21）
+    if coordinator.is_path_frozen_any(str(resolved)):
+        return (
+            f"🚨 目标路径处于撤销中断事务的冻结范围，已拒绝修改"
+            f"（{file_path or resolved}）：\n请先完成撤销恢复（GUI 或 /undo recover）。"
+        )
+    new_bytes = new_content.encode(encoding)
+
+    # 2. prepare → 写入 → verify 全程持工作区锁（规格 21；锁键=线程工作区根）
+    with coordinator.workspace_lock(_tu_coordinator.thread_workspace_root()):
+        handle = None
+        try:
+            handle = _tu_recorder.prepare_mutation(
+                display_path=str(resolved),
+                after_kind=NodeKind.REGULAR_FILE,
+                after_content=new_bytes,
+                tool_name=tool_name,
+                tool_call_id="",
+            )
+        except TurnUndoError as error:
+            if error.code == "no_active_checkpoint":
+                # 回合外调用：保持既有行为，不做可撤销记录
+                return _atomic_write_edit_file(
+                    resolved, encoding, new_content,
+                    file_path=file_path, expected_mtime_ns=None,
+                )
+            # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
+            return (
+                f"🚨 该回合的撤销检查点已封闭，迟到的修改已被拒绝"
+                f"（{file_path or resolved}）：\n{error.message}"
+            )
+        try:
+            write_err = _atomic_write_edit_file(
+                resolved, encoding, new_content,
+                file_path=file_path, expected_mtime_ns=None,
+            )
+            if write_err:
+                _tu_recorder.rollback_prepared_mutation(handle)
+                return write_err
+            _tu_recorder.verify_after_mutation(handle)
+        except TurnUndoError as error:
+            return (
+                f"🚨 本次修改未能通过可撤销性验证，请重读文件后重试"
+                f"（{file_path or resolved}）：\n{error.message}"
+            )
     return None
 
 
@@ -2420,15 +2594,13 @@ def edit_file(
                     f"🚨 edit_file 智能替换失败：在 {file_path} 中未找到与 replacement_content "
                     f"足够相似的代码段（建议显式提供 target_content 或 start_line/end_line）。"
                 )
-            # 原子写入（含 mtime 校验），成功后才写入撤销栈，避免失败编辑污染撤销历史
-            write_err = _atomic_write_edit_file(
+            # 按回合撤销记录写入：prepare → 原子写 → verify
+            write_err = _recorded_atomic_write(
                 resolved, encoding, new_content,
                 file_path=file_path, expected_mtime_ns=expected_mtime_ns,
             )
             if write_err:
                 return write_err
-            from core.memory import set_undo_state
-            set_undo_state(file_path, content)
             return (
                 f"✔ 智能修改 {file_path}（自动定位最相似代码段，共 {occurrences} 处替换）\n"
                 f"被替换的原文（前 5 行）：\n{replaced_preview}"
@@ -2465,15 +2637,13 @@ def edit_file(
         if new_content == content:
             return f"🚨 精准修改失败！定位成功但替换后的内容与原文相同，未发生实际修改（{file_path}）。"
 
-        # 原子写入（含 mtime 校验），成功后才写入撤销栈，避免失败的编辑污染撤销历史
-        write_err = _atomic_write_edit_file(
+        # 按回合撤销记录写入：prepare → 原子写 → verify
+        write_err = _recorded_atomic_write(
             resolved, encoding, new_content,
             file_path=file_path, expected_mtime_ns=expected_mtime_ns,
         )
         if write_err:
             return write_err
-        from core.memory import set_undo_state
-        set_undo_state(file_path, content)
         return f"✔ 已修改文件：{file_path}"
 
 _SUBAGENT_TERMINAL_STATUSES = {
@@ -3007,6 +3177,7 @@ class SubagentManager:
                 )
                 return
         task.slot_acquired = True
+        _own_undo_turn = None  # 按回合撤销：后台任务拥有的独立检查点 (checkpoint, ctx)
         try:
             with self._lock:
                 if task.status != "pending":
@@ -3030,9 +3201,21 @@ class SubagentManager:
             from core.plan import set_current_plan_session as _bind_plan_route
 
             _bind_plan_route(task.parent_session)
-            from core.memory import bind_turn_checkpoint as _bind_turn_checkpoint
+            # 按回合撤销归属（规格 9.2）：
+            # - 前台同步子代理共享父回合检查点（只借记录权）；
+            # - 可能迟于父回合结束的后台任务从启动时拥有独立检查点，
+            #   并以 parent_checkpoint_id 关联来源回合。
+            from core.turn_undo import recorder as _tu_recorder
+            from core.turn_undo import service as _tu_service
 
-            _bind_turn_checkpoint(task.parent_session, task.parent_turn_id)
+            _own_undo_turn = None
+            if task.run_in_background:
+                _own_undo_turn = _tu_service.begin_background_task_turn(
+                    parent_turn_id=task.parent_turn_id,
+                    description=f"后台子代理 {task.task_id}: {task.description[:60]}",
+                )
+            else:
+                _tu_recorder.bind_thread_for_turn(task.parent_turn_id, owner=False)
             try:
                 result = _strip_advisor_tags(str(self._runner(task) or "").strip())
             except BaseException as error:
@@ -3041,6 +3224,13 @@ class SubagentManager:
                 else:
                     self._terminate(task.task_id, "failed", str(error))
                 _tool_cache.set_current_session(None)
+                if _own_undo_turn is not None:
+                    try:
+                        _tu_service.finish_background_task_turn(
+                            _own_undo_turn[1], reason="后台任务异常终止"
+                        )
+                    except Exception:
+                        pass
                 return
 
             try:
@@ -3058,9 +3248,21 @@ class SubagentManager:
             finally:
                 _tool_cache.set_current_session(None)
         finally:
-            from core.memory import clear_turn_checkpoint_binding
+            if _own_undo_turn is not None:
+                try:
+                    from core.turn_undo import service as _tu_service
 
-            clear_turn_checkpoint_binding()
+                    _tu_service.finish_background_task_turn(_own_undo_turn[1])
+                except Exception:
+                    pass
+            # H2：子代理线程的检查点绑定必须解除，避免下一任务复用线程时
+            # TLS 残留旧 ctx 触发"检查点已封闭"误拒或跨回合串记录
+            try:
+                from core.turn_undo import recorder as _tu_recorder
+
+                _tu_recorder.unbind_thread()
+            except Exception:
+                pass
             self._release_slot(task)
 
     def _complete(self, task_id: str, result: str) -> bool:
@@ -4315,3 +4517,77 @@ def glob_files(pattern, dir_path=".", cancel_event=None):
         return result_text
     except Exception as e:
         return f"🚨 快速匹配工具发生异常: {str(e)}"
+
+
+def undo_turn(turn_id=""):
+    """按回合撤销工具（规格 18）：撤销指定回合（缺省为最近可撤销回合）的
+    全部受控文件修改。
+
+    只接受回合标识；不接收文件路径、force 或任意撤销参数。权限由管线在
+    执行前经权限中介卡片确认（卡片内展示服务预检的影响摘要）；一次性
+    确认令牌在服务内部消费，绝不返回给模型或进入消息历史。
+    """
+    from core.turn_undo import service as tu_service
+    from core.turn_undo.models import TurnUndoError, TurnUndoStatus
+
+    from core import app_context
+
+    session_name = app_context.get_thread_session() or ""
+    if not session_name:
+        return "🚨 无法确定当前会话，撤销工具不可用。"
+    session_id = None
+    resolved = None
+    try:
+        session_id = tu_service.resolve_session_id(session_name)
+        resolved = tu_service.resolve_turn_id_in_session(session_id, turn_id)
+        preview, token = tu_service.preview_turn_undo(session_id, resolved)
+    except TurnUndoError as error:
+        # 已撤销回合重复调用：幂等成功摘要，不再修改文件（规格 17.3）
+        try:
+            checkpoint = tu_service.get_default_storage().get_checkpoint_by_turn(
+                session_id, resolved
+            )
+        except Exception:
+            checkpoint = None
+        if checkpoint is not None and checkpoint.status_enum is TurnUndoStatus.REVERTED:
+            return "ℹ 该回合此前已撤销过，本次未修改任何文件（聊天历史保留）。"
+        return f"🚨 无法撤销：{error.message}"
+    except RuntimeError as error:
+        return f"🚨 无法撤销：{error}"
+
+    if preview.conflicts:
+        lines = ["🚨 预检发现文件冲突，本次没有修改任何文件："]
+        for conflict in preview.conflicts:
+            reasons = "；".join(conflict.reasons) or "状态不一致"
+            lines.append(f"- {conflict.display_path}: {reasons}")
+        lines.append("提示：磁盘文件与回合结束时状态不一致，已拒绝整轮撤销。")
+        return "\n".join(lines)
+
+    if preview.status is not TurnUndoStatus.READY:
+        return f"🚨 无法撤销：回合当前状态为 {preview.status.value}，本次没有修改任何文件。"
+
+    try:
+        result = tu_service.execute_turn_undo(session_id, resolved, token)
+    except TurnUndoError as error:
+        if error.code in ("revert_interrupted", "recovery_required"):
+            return (
+                f"🚨 撤销事务中断：{error.message}\n"
+                "文件可能处于部分恢复状态，受影响路径已冻结；"
+                "请通过 GUI 恢复选项或 /undo recover 显式继续或取消。"
+            )
+        return f"🚨 撤销失败：{error.message}"
+
+    if result.idempotent:
+        return "ℹ 该回合此前已撤销过，本次未修改任何文件（聊天历史保留）。"
+
+    total = (len(result.restored_files) + len(result.deleted_created_files)
+             + len(result.restored_deleted_files))
+    lines = [
+        f"✔ 已撤销回合 {result.turn_id[:8]} 的 {total} 个文件修改"
+        f"（恢复原内容 {len(result.restored_files)}，"
+        f"删除本轮新建 {len(result.deleted_created_files)}，"
+        f"恢复本轮删除 {len(result.restored_deleted_files)}）。",
+        "聊天历史保留；终端命令与外部副作用未随文件恢复。",
+        "后续继续相关工作前必须重新读取磁盘文件。",
+    ]
+    return "\n".join(lines)

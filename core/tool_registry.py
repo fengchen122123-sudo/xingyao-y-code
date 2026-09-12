@@ -431,6 +431,26 @@ def build_default_registry() -> ToolRegistry:
             activity_description="下载图片",
         ),
         ToolSpec(
+            name="undo_turn",
+            description=(
+                "撤销某一次回合的全部受控文件修改（用户明确要求“撤销/回滚这轮文件改动”时使用）。"
+                "撤销前会先预检每个文件的实际状态：任一文件在回合结束后被修改过，整轮拒绝、零文件写入。"
+                "聊天历史保留，模型会通过上下文得知该回合的文件结果已失效。"
+                "终端命令等其他副作用不在撤销范围内。"
+            ),
+            input_schema=_schema({
+                "turn_id": {
+                    "type": "string",
+                    "description": (
+                        "要撤销的回合 ID（可使用 8 位短 ID）。省略时撤销最近一个可撤销回合。"
+                        "不接受文件路径或其他参数。"
+                    ),
+                },
+            }),
+            execute=tools.undo_turn,
+            activity_description="撤销回合文件修改",
+        ),
+        ToolSpec(
             name="execute_command",
             description=(
                 "执行本地命令。前台执行默认 30 秒超时，可用 timeout_seconds 调整（上限 600 秒）。"

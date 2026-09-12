@@ -280,6 +280,11 @@ def build_runtime_context(model_name: str, permission_mode: str, api_base: str =
         model_name, api_base=api_base or None, turn_source=turn_source
     )
     set_turn_computer_capability(computer_capability)
+    # 按回合撤销纠正块（规格 15.3）：无纠正记录/服务未配置时为空串，
+    # 动态块字节与历史版本一致；有纠正时按规范化工作区跨会话生效。
+    from core.turn_undo.prompt_context import build_workspace_correction_section
+
+    workspace_corrections = build_workspace_correction_section(get_workdir())
     return RuntimeContext(
         model_name=model_name,
         permission_mode=permission_mode,
@@ -288,6 +293,7 @@ def build_runtime_context(model_name: str, permission_mode: str, api_base: str =
         active_plan=active_plan,
         command_shell=describe_selected_command_shell(),
         computer_capability=computer_capability,
+        workspace_corrections=workspace_corrections,
     )
 
 
@@ -700,94 +706,3 @@ def prepare_turn_messages(
     return history
 
 
-# ---------------------------------------------------------------------------
-# /undo 的可复用非界面部分：CLI 与 GUI 共用
-# ---------------------------------------------------------------------------
-
-def _restore_file_bytes(file_path: str, content: bytes) -> None:
-    """把撤销/检查点中的原始字节原子写回。"""
-    from core.tools import _resolve_workspace_path
-
-    resolved = _resolve_workspace_path(file_path)
-    resolved.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(
-        prefix=resolved.name + ".",
-        suffix=".ycode-undo-tmp",
-        dir=str(resolved.parent),
-    )
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(content)
-        os.replace(temp_name, resolved)
-    except BaseException:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
-
-
-def undo_last_edit(manager, session_name: str, force: bool = False) -> tuple[bool, str]:
-    """撤销星瑶在本会话最近一次的文件修改，并同步抹除对应的模型记忆。
-
-    返回 (ok, message)：
-      - ok=False 时 message 为失败原因（界面层直接展示即可）
-      - 删除"星瑶新建文件"属于高危操作，未传 force=True 时会拒绝并给出提示
-    """
-    from core.memory import get_undo_state, set_undo_state
-    from core.tools import write_file, _resolve_workspace_path, _atomic_write_edit_file, sandbox_bypass
-
-    state = get_undo_state(session_name)
-    file_path = state.get("file_path")
-    old_content = state.get("old_content")
-    existed_before = state.get("existed_before")
-    old_bytes = state.get("old_bytes")
-
-    if not file_path:
-        return False, "当前会话没有可以撤销的操作记录。"
-    if old_content is None and old_bytes is None and existed_before is not False:
-        # old_content 为 None 表示缺少原始内容快照，直接写 None 会损坏文件
-        return False, "撤销失败：缺少文件原始内容记录，无法安全恢复。"
-
-    # 删除新建文件是高危操作：要求显式确认，避免跨会话/误操作导致用户数据丢失
-    try:
-        from core.persona_settings import get_agent_display_name
-        _agent = get_agent_display_name()
-    except Exception:
-        _agent = "星瑶"
-    if existed_before is None:
-        existed_before = old_content != ""
-    will_delete = not bool(existed_before)
-    if will_delete and not force:
-        return False, f"该操作将删除{_agent}新建的文件 {file_path}，需要显式确认后才能执行。"
-
-    try:
-        if will_delete:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            message = f"撤销成功！已删除{_agent}新建的文件: {file_path}"
-        else:
-            # 撤销是用户显式发起的恢复操作：沙盒外路径也直接放行，
-            # 避免之前单次批准写出的沙盒外文件无法撤销
-            with sandbox_bypass():
-                if isinstance(old_bytes, bytes):
-                    _restore_file_bytes(file_path, old_bytes)
-                else:
-                    result = write_file(file_path, old_content)
-                    if isinstance(result, str) and result.startswith("🚨"):
-                        # write_file 的大文件覆盖保护会拒绝恢复超过 500 行/50KB 的已有文件，
-                        # 但撤销本来就是刻意的整文件回滚：绕过该保护改走原子直写，
-                        # 仍通过 _resolve_workspace_path 保留工作区沙箱校验。
-                        resolved = _resolve_workspace_path(file_path)
-                        write_err = _atomic_write_edit_file(resolved, "utf-8", old_content)
-                        if write_err:
-                            return False, f"撤销失败：{write_err}"
-            message = f"撤销成功！已将 {file_path} 恢复到上一个版本。"
-
-        # 清理大模型的错误记忆，防止幻觉
-        manager.undo_last_interaction(session_name)
-        # 清空状态防止重复撤销
-        set_undo_state(None, None, session_name=session_name)
-        return True, message
-    except Exception as e:
-        return False, f"撤销失败: {e}"
