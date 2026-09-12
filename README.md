@@ -1,7 +1,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.2.25](https://img.shields.io/badge/Version-1.2.25-green.svg)](core/version.py)
+[![Version 1.2.26](https://img.shields.io/badge/Version-1.2.26-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
@@ -46,8 +46,8 @@
 
 ### 记忆与上下文
 
-- **SQLite 会话记忆**：多会话切换、`/undo` 撤销文件修改并同步抹除模型记忆
-- **会话级检查点**：每轮对话前自动打 checkpoint，`/checkpoint restore` 整轮回滚
+- **SQLite 会话记忆**：多会话切换；撤销不改写历史，聊天完整保留
+- **按回合撤销**：每个回合的受控文件修改持久化快照，`/undo` 整轮预检后一键撤销；冲突零写入、崩溃可恢复，模型通过上下文得知文件结果已失效
 - **长期记忆系统**：四类记忆（user / feedback / project / reference）+ 每日日志 + Dream 整理线程，支持「记住 XXX」指令
 - **智能记忆压缩**：历史 token 占用达 70% 自动压缩，工具结果预截断，tiktoken 精确估算
 - **会话导出**：`/share` 一键导出为 Markdown / HTML / JSON
@@ -219,7 +219,7 @@ venv\Scripts\python build_release.py --setup-only
 | `/session rename <新名称>` | 重命名当前会话 |
 | `/session delete <名称>` | 物理删除指定会话 |
 | `/new` | 创建并切换到全新会话 |
-| `/undo` | 撤销上一次文件修改（同步抹除模型记忆） |
+| `/undo` | 按回合撤销文件修改（`list` / `preview` / `status` / `recover <操作ID>`；默认确认 N） |
 | `/checkpoint` | 检查点管理（`list` 查看 / `restore <turn_id>` 整轮回滚） |
 | `/share [md\|html\|json]` | 导出当前会话（默认 md） |
 
@@ -416,8 +416,8 @@ CLI 与 GUI 共用 `permissions.json` 中的项目白名单。设置页可手动
 
 ### 短期记忆
 - **SQLite 持久化**：聊天记录按会话隔离存储
-- **`/undo` 撤销**：按会话隔离，多 worker 线程安全
-- **会话级检查点**：每轮对话前自动打 checkpoint，`/checkpoint restore <turn_id>` 整轮回滚
+- **按回合撤销**：回合内 write/edit/download 的原始字节在写入前快照到内容寻址仓库；`/undo` 预检（指纹冲突零写入）→ 一次性令牌 → 逐文件原子恢复；中断事务冻结影响路径并支持继续/取消恢复
+- **会话级检查点**：每轮对话前自动创建持久化检查点，`/checkpoint restore <turn_id>` 整轮回滚
 
 ### 长期记忆（`~/.ycode/memory/`）
 
