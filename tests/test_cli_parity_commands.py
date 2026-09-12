@@ -259,3 +259,142 @@ def test_skills_refresh_reports_counts(monkeypatch):
 
     assert any("共 3 个技能" in line for line in printed)
     assert any("已启用 2 个" in line for line in printed)
+
+
+# ---------------------------------------------------------------------------
+# /queue
+# ---------------------------------------------------------------------------
+
+def _drain_main_queue():
+    import queue as queue_mod
+
+    items = []
+    while True:
+        try:
+            items.append(main.msg_queue.get_nowait())
+        except queue_mod.Empty:
+            break
+    return items
+
+
+def test_queue_list_preserves_order(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _drain_main_queue()
+    for text, session in [("first", "s1"), ("second", "s1"), ("third", "s2")]:
+        main.msg_queue.put({"text": text, "was_queued": True, "session": session})
+
+    main.handle_slash_command("/queue")
+
+    # list 之后必须原序回填
+    assert main.msg_queue.qsize() == 3
+    assert [i["text"] for i in _drain_main_queue()] == ["first", "second", "third"]
+    assert any("first" in line for line in printed)
+    assert any("3 条" in line for line in printed)
+
+
+def test_queue_cancel_removes_by_index(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _drain_main_queue()
+    for text in ["first", "second", "third"]:
+        main.msg_queue.put({"text": text, "was_queued": True, "session": "s1"})
+
+    main.handle_slash_command("/queue cancel 2")
+
+    assert [i["text"] for i in _drain_main_queue()] == ["first", "third"]
+    assert any("已取消排队消息 2" in line for line in printed)
+
+
+def test_queue_cancel_out_of_range_keeps_queue(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _drain_main_queue()
+    main.msg_queue.put({"text": "only", "was_queued": True, "session": "s1"})
+
+    main.handle_slash_command("/queue cancel 5")
+
+    assert [i["text"] for i in _drain_main_queue()] == ["only"]
+    assert any("超出范围" in line for line in printed)
+
+
+def test_queue_clear_discards_all(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _drain_main_queue()
+    main.msg_queue.put({"text": "a", "was_queued": True, "session": "s1"})
+    main.msg_queue.put({"text": "b", "was_queued": True, "session": "s1"})
+
+    main.handle_slash_command("/queue clear")
+
+    assert main.msg_queue.qsize() == 0
+    assert any("已清空 2 条" in line for line in printed)
+
+
+# ---------------------------------------------------------------------------
+# /paste-image
+# ---------------------------------------------------------------------------
+
+class _FakeClipboardImage:
+    def __init__(self):
+        self.saved_path = ""
+
+    def save(self, path, fmt):
+        self.saved_path = path
+        with open(path, "wb") as fh:
+            fh.write(b"\x89PNG fake")
+
+
+def _patch_image_grab(monkeypatch, grab_result):
+    from PIL import ImageGrab
+
+    monkeypatch.setattr(ImageGrab, "grabclipboard", lambda: grab_result)
+
+
+def test_paste_image_saves_temp_and_enqueues(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    monkeypatch.setattr(main, "is_thinking", False)
+    monkeypatch.setattr(main, "current_session", "s1")
+    _drain_main_queue()
+    image = _FakeClipboardImage()
+    _patch_image_grab(monkeypatch, image)
+
+    main.handle_slash_command("/paste-image 这里有个bug")
+
+    item = main.msg_queue.get_nowait()
+    assert main.msg_queue.qsize() == 0
+    assert "这里有个bug" in item["text"]
+    assert "ycode_clip_" in item["text"] and item["text"].endswith(".png")
+    assert item["session"] == "s1"
+    assert image.saved_path  # 临时文件确实被写出
+    assert any("[剪贴板图片]" in line for line in printed)
+
+
+def test_paste_image_with_file_path_list_uses_paths_directly(monkeypatch, tmp_path):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    monkeypatch.setattr(main, "is_thinking", False)
+    monkeypatch.setattr(main, "current_session", "s1")
+    _drain_main_queue()
+    source = tmp_path / "shot.png"
+    source.write_bytes(b"\x89PNG fake")
+    _patch_image_grab(monkeypatch, [str(source)])
+
+    main.handle_slash_command("/paste-image")
+
+    item = main.msg_queue.get_nowait()
+    assert str(source) in item["text"]
+    assert "ycode_clip_" not in item["text"]
+
+
+def test_paste_image_without_image_reports_empty(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _drain_main_queue()
+    _patch_image_grab(monkeypatch, None)
+
+    main.handle_slash_command("/paste-image")
+
+    assert main.msg_queue.qsize() == 0
+    assert any("剪贴板中没有图片" in line for line in printed)
