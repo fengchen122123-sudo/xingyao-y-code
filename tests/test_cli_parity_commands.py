@@ -277,6 +277,23 @@ def _drain_main_queue():
     return items
 
 
+def _run_threads_inline(monkeypatch):
+    """把 threading.Thread 换成同步执行 target 的假线程。
+
+    /update check/download 已异步化；单测里内联执行 worker，保证断言确定性。
+    """
+
+    class _InlineThread:
+        def __init__(self, target=None, daemon=None, args=None, kwargs=None):
+            self._target = target
+
+        def start(self):
+            if self._target is not None:
+                self._target()
+
+    monkeypatch.setattr(main.threading, "Thread", _InlineThread)
+
+
 def test_queue_list_preserves_order(monkeypatch):
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
@@ -364,8 +381,10 @@ def test_paste_image_saves_temp_and_enqueues(monkeypatch):
 
     item = main.msg_queue.get_nowait()
     assert main.msg_queue.qsize() == 0
-    assert "这里有个bug" in item["text"]
-    assert "ycode_clip_" in item["text"] and item["text"].endswith(".png")
+    # 修复后路径经 explicit_paths 通道传递，不再嵌进文本
+    assert item["text"] == "这里有个bug"
+    assert len(item["explicit_paths"]) == 1
+    assert "ycode_clip_" in item["explicit_paths"][0] and item["explicit_paths"][0].endswith(".png")
     assert item["session"] == "s1"
     assert image.saved_path  # 临时文件确实被写出
     assert any("[剪贴板图片]" in line for line in printed)
@@ -377,15 +396,17 @@ def test_paste_image_with_file_path_list_uses_paths_directly(monkeypatch, tmp_pa
     monkeypatch.setattr(main, "is_thinking", False)
     monkeypatch.setattr(main, "current_session", "s1")
     _drain_main_queue()
-    source = tmp_path / "shot.png"
+    # 含空格路径：回归（代码审查 Important #4），explicit_paths 通道不得丢
+    source = tmp_path / "新建 文件夹 (2)" / "shot.png"
+    source.parent.mkdir(parents=True)
     source.write_bytes(b"\x89PNG fake")
     _patch_image_grab(monkeypatch, [str(source)])
 
     main.handle_slash_command("/paste-image")
 
     item = main.msg_queue.get_nowait()
-    assert str(source) in item["text"]
-    assert "ycode_clip_" not in item["text"]
+    assert item["explicit_paths"] == [str(source)]
+    assert str(source) not in item["text"]
 
 
 def test_paste_image_without_image_reports_empty(monkeypatch):
@@ -425,6 +446,7 @@ class _FakeDownloader:
 def test_update_check_latest_and_new_version(monkeypatch):
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
+    _run_threads_inline(monkeypatch)
 
     import core.updater as upd
     monkeypatch.setattr(upd, "fetch_latest_release", lambda: {
@@ -447,9 +469,27 @@ def test_update_check_latest_and_new_version(monkeypatch):
     assert any("/update download" in line for line in printed)
 
 
+def test_update_check_fetch_error_is_not_reported_as_latest(monkeypatch):
+    # 回归（代码审查 Important #1）：ok=False 必须报错，不得并入"已是最新版本"
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _run_threads_inline(monkeypatch)
+
+    import core.updater as upd
+    monkeypatch.setattr(upd, "fetch_latest_release", lambda: {
+        "ok": False, "has_update": False, "msg": "网络连接失败",
+    })
+
+    main.handle_slash_command("/update check")
+
+    assert any("网络连接失败" in line for line in printed)
+    assert not any("已是最新版本" in line for line in printed)
+
+
 def test_update_download_starts_with_release_params(monkeypatch):
     printed = _capture_print(monkeypatch)
     _quiet_ui(monkeypatch)
+    _run_threads_inline(monkeypatch)
     downloader = _FakeDownloader()
     monkeypatch.setattr(main, "_get_update_downloader", lambda: downloader)
 
@@ -469,6 +509,26 @@ def test_update_download_starts_with_release_params(monkeypatch):
     assert call["part_urls"] == ["https://x/y.part1"]
     assert call["expected_sha256"] == "abc"  # 小写归一
     assert any("已开始下载 v1.3.0" in line for line in printed)
+
+
+def test_update_download_fetch_error_reports_failure(monkeypatch):
+    # 回归（代码审查 Important #1）：download 路径网络失败显式报错且不启动下载
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _run_threads_inline(monkeypatch)
+    downloader = _FakeDownloader()
+    monkeypatch.setattr(main, "_get_update_downloader", lambda: downloader)
+
+    import core.updater as upd
+    monkeypatch.setattr(upd, "fetch_latest_release", lambda: {
+        "ok": False, "has_update": False, "msg": "Gitee 连接超时",
+    })
+
+    main.handle_slash_command("/update download")
+
+    assert downloader.calls == []
+    assert any("Gitee 连接超时" in line for line in printed)
+    assert not any("已是最新版本" in line for line in printed)
 
 
 def test_update_download_rejects_when_busy(monkeypatch):
@@ -612,3 +672,102 @@ def test_changes_empty_session_reports(monkeypatch):
     main.handle_slash_command("/changes")
 
     assert any("还没有文件修改记录" in line for line in printed)
+
+
+# ---------------------------------------------------------------------------
+# 代码审查修复回归
+# ---------------------------------------------------------------------------
+
+def test_persona_title_dash_clears_title(monkeypatch):
+    # Minor：/persona title - 表示清除称呼
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    calls = []
+
+    import core.persona_settings as ps
+    monkeypatch.setattr(
+        ps,
+        "get_persona_settings",
+        lambda: {"agent_name": "星瑶", "persona": "p", "user_title": "老板"},
+    )
+    monkeypatch.setattr(ps, "save_persona_settings", lambda *args: calls.append(args))
+
+    main.handle_slash_command("/persona title -")
+
+    assert calls == [("星瑶", "p", "")]
+
+
+def test_print_threadsafe_closed_loop_protection(monkeypatch):
+    # Important #2：loop 已关闭时静默丢弃；call_soon_threadsafe 抛 RuntimeError 时吞掉
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+
+    class _ClosedLoop:
+        def is_closed(self):
+            return True
+
+        def call_soon_threadsafe(self, *args, **kwargs):
+            raise AssertionError("closed loop 不应被调度")
+
+    class _RacyLoop:
+        def is_closed(self):
+            return False
+
+        def call_soon_threadsafe(self, *args, **kwargs):
+            raise RuntimeError("loop closed during schedule")
+
+    monkeypatch.setattr(main, "app_instance", type("App", (), {"loop": _ClosedLoop()})())
+    main._print_threadsafe("<b>x</b>")  # 不应抛异常
+
+    monkeypatch.setattr(main, "app_instance", type("App", (), {"loop": _RacyLoop()})())
+    main._print_threadsafe("<b>x</b>")  # RuntimeError 被吞掉
+
+
+def test_queue_internal_messages_are_preserved_and_hidden(monkeypatch):
+    # Important #3：is_internal 条目不参与序号/清空，cancel/clear 不得丢弃
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _drain_main_queue()
+    internal = {"text": "__ycode_internal__:summarize_background_tasks",
+                "was_queued": False, "is_internal": True, "session": "s1"}
+    main.msg_queue.put({"text": "用户一", "was_queued": True, "session": "s1"})
+    main.msg_queue.put(internal)
+    main.msg_queue.put({"text": "用户二", "was_queued": True, "session": "s1"})
+
+    # list：只编排用户消息，内部消息原位回填
+    main.handle_slash_command("/queue")
+    all_items = _drain_main_queue()
+    assert [i["text"] for i in all_items] == ["用户一", "__ycode_internal__:summarize_background_tasks", "用户二"]
+    assert any("排队中的消息（2 条）" in line for line in printed)
+    assert not any("__ycode_internal__" in line for line in printed)
+    for i in all_items:
+        main.msg_queue.put(i)
+
+    # cancel 1：移除"用户一"，内部消息与"用户二"保留
+    printed.clear()
+    main.handle_slash_command("/queue cancel 1")
+    remaining = _drain_main_queue()
+    assert [i["text"] for i in remaining] == ["__ycode_internal__:summarize_background_tasks", "用户二"]
+    for i in remaining:
+        main.msg_queue.put(i)
+
+    # clear：只清用户消息，内部消息保留
+    printed.clear()
+    main.handle_slash_command("/queue clear")
+    leftover = _drain_main_queue()
+    assert [i["text"] for i in leftover] == ["__ycode_internal__:summarize_background_tasks"]
+    assert any("已清空 1 条" in line for line in printed)
+    assert any("系统内部消息已保留" in line for line in printed)
+
+
+def test_effort_missing_model_reports_not_found(monkeypatch):
+    # Minor #7：激活模型 id 残留但配置中无此模型，提示"未找到"而非"未声明思考能力"
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+
+    import core.model_manager as mm
+    monkeypatch.setattr(mm, "load_config", lambda: {"active_model_id": "ghost", "providers": []})
+
+    main.handle_slash_command("/effort")
+
+    assert any("未在配置中找到激活模型" in line for line in printed)
