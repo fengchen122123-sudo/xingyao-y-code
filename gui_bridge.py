@@ -4193,6 +4193,7 @@ class ApiBridge:
                             "run_id": automation_run_id,
                             "task_name": str(entry.get("automation_task_name") or ""),
                             "permission_mode": str(entry.get("automation_permission_mode") or ""),
+                            "notify_on_success": str(entry.get("automation_notify_success") or ""),
                         } if automation_run_id else None,
                     )
                 except Exception:
@@ -4240,6 +4241,7 @@ class ApiBridge:
             "run_id": run_id,
             "task_name": str(task.get("name") or ""),
             "permission_mode": str(task.get("permission_mode") or "confirm"),
+            "notify_on_success": "1" if task.get("notify_on_success") else "",
         }
         with self._turn_start_lock:
             if self._is_turn_active(target_session):
@@ -4254,6 +4256,7 @@ class ApiBridge:
                     "automation_run_id": run_id,
                     "automation_task_name": automation_context["task_name"],
                     "automation_permission_mode": automation_context["permission_mode"],
+                    "automation_notify_success": automation_context["notify_on_success"],
                 })
                 # 快照在锁内发：与 send_user_message 排队路径同序
                 self._emit_message_queue_snapshot(target_session)
@@ -4608,6 +4611,7 @@ class ApiBridge:
             turn_start_msg_id = None
         turn_id = ""
         undo_ctx = None
+        undo_finished = False
 
         try:
             active_model = get_active_model(session_name)
@@ -4798,6 +4802,7 @@ class ApiBridge:
                         aborted=bool(cancelled),
                         reason="回合被用户取消" if cancelled else "",
                     )
+                    undo_finished = True
                 except Exception:
                     logger.exception("封闭按回合撤销检查点失败")
 
@@ -4809,6 +4814,17 @@ class ApiBridge:
             logger.exception("GUI 对话回合失败")
             if automation_run_id:
                 automation_error = str(e)
+            # 星轨修复：begin_turn 之后、poller 内层 finally 之前抛出的异常
+            # （消息落库/上下文组装等）原本永远不会走 finish_turn，活动检查点
+            # 泄漏会把该工作区永久阻塞为 workspace_busy。此处兜底按异常终止封闭。
+            if undo_ctx is not None and not undo_finished:
+                try:
+                    from core.turn_undo import service as _tu_service
+
+                    _tu_service.finish_turn(undo_ctx, aborted=True, reason="回合启动阶段异常终止")
+                    undo_finished = True
+                except Exception:
+                    logger.exception("异常路径封闭按回合撤销检查点失败")
             self._emit_owned_error(str(e), api_key, error_state, terminal=True, session_name=session_name)
         finally:
             # 先解绑本回合的会话路由与线程本地 workdir（workspace_scope 退出语义），
@@ -4863,6 +4879,28 @@ class ApiBridge:
                     )
                 except Exception:
                     logger.exception("自动化运行 %s 终态回写失败", automation_run_id)
+                # 终态通知（规格 5.7）：失败/取消恒提示，完成仅在任务开启时提示
+                try:
+                    notify_success = (
+                        str((automation_context or {}).get("notify_on_success") or "") == "1"
+                    )
+                    if final_status == "error":
+                        self.emit_event("notice", {
+                            "message": (
+                                f"自动化任务「{automation_task_name}」运行失败："
+                                f"{(automation_error or '未知错误')[:120]}"
+                            ),
+                        })
+                    elif final_status == "cancelled":
+                        self.emit_event("notice", {
+                            "message": f"自动化任务「{automation_task_name}」运行已取消。",
+                        })
+                    elif final_status == "completed" and notify_success:
+                        self.emit_event("notice", {
+                            "message": f"自动化任务「{automation_task_name}」运行完成。",
+                        })
+                except Exception:
+                    logger.debug("自动化终态通知推送失败", exc_info=True)
                 if turn_id:
                     self._automation_turn_labels.pop(turn_id, None)
             # 回合运行期间若有后台子代理进入终态（当时不能并发起新回合），
