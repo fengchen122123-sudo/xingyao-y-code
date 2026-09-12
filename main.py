@@ -134,6 +134,21 @@ import config
 
 manager = MemoryManager(db_path=config.DB_FILE)
 
+# 按回合撤销：注册进程级存储并执行启动恢复扫描（收敛中断事务、重建路径
+# 冻结、清理跨 boot 失效令牌；不自动重放任何文件写入）
+from core.turn_undo import service as _turn_undo_service
+
+_turn_undo_service.configure_default_manager(manager)
+try:
+    _interrupted_ops = _turn_undo_service.startup_recovery_scan()
+    if _interrupted_ops:
+        _TURN_UNDO_SCAN_LOGGER = logging.getLogger("py.warnings")
+        _TURN_UNDO_SCAN_LOGGER.warning(
+            "按回合撤销：启动恢复收敛了 %d 个未终态操作", len(_interrupted_ops)
+        )
+except Exception:  # 启动扫描失败不阻断主流程；下次启动重试
+    pass
+
 # ---------------------------------------------------------------------------
 # 全局状态所有权约定（为后续 AppState 结构化重构铺路）：
 #   1. 以下可变全局原则上只能由 UI 主线程直接写入；后台 worker / 辅助线程
@@ -647,6 +662,16 @@ def _permission_source_line(prompt: dict) -> str:
     return f"请求来源：{_esc(source)}\n"
 
 
+def _undo_turn_impact_for_card(args: dict) -> dict:
+    """undo_turn 权限卡富化：服务预检的影响摘要（只读）。"""
+    try:
+        from core.turn_undo import service as tu_service
+
+        return tu_service.undo_turn_permission_impact(dict(args or {}))
+    except Exception as exc:  # 预检失败时卡片显示退化信息
+        return {"available": False, "message": str(exc)}
+
+
 def _confirm_prompt_text(prompt: dict | None) -> str:
     if not prompt:
         return ""
@@ -680,6 +705,33 @@ def _confirm_prompt_text(prompt: dict | None) -> str:
     elif func == "sandbox_outside_access":
         text += f"🛡  {_agent_name()}申请访问工作目录之外的路径: {_esc(args.get('path', ''))}\n"
         text += "    （沙盒模式下默认仅限工作目录内；可选择在本任务内放行，或用 /sandbox on 长期开放）\n"
+    elif func == "undo_turn":
+        # 按回合撤销权限卡：预检影响摘要 + 未覆盖副作用 + 后续回合语义依赖警告
+        text += f"↩️  {_agent_name()}申请撤销一整轮的文件修改: {_esc(str(args.get('turn_id') or '最近可撤销回合'))}\n"
+        impact = _undo_turn_impact_for_card(args)
+        if impact.get("available"):
+            lines = [
+                f"    回合 {_esc(impact['short_id'])}：共 {impact['file_count']} 个文件 — "
+                f"恢复原内容 {impact['restore_content_count']}，"
+                f"删除本轮新建 {impact['delete_created_count']}，"
+                f"恢复本轮删除 {impact['restore_deleted_count']}",
+            ]
+            if impact.get("created_files"):
+                lines.append(f"    将删除的新建文件: {_esc('、'.join(impact['created_files']))}")
+            lines.append("    聊天历史保留，星瑶将记住文件结果已失效。")
+            if impact.get("has_uncovered_command_effects"):
+                lines.append("    ⚠️ 本轮执行过通用命令：仅恢复受控文件，命令的其他副作用不撤销。")
+            if impact.get("subsequent_completed_turns", 0) > 0:
+                lines.append(
+                    f"    ⚠️ 目标回合之后还有 {impact['subsequent_completed_turns']} 个已完成回合，"
+                    "可能存在语义依赖，撤销后请重新检查或测试。"
+                )
+            if impact.get("conflicts"):
+                lines.append("    ⚠️ 预检发现冲突文件，批准后将拒绝整轮撤销、零文件写入。")
+            text += "\n".join(lines) + "\n"
+        else:
+            msg = impact.get("message") or "预检不可用"
+            text += f"    ⚠️ 预检未通过：{_esc(msg)}（批准后执行会拒绝写入）\n"
     else:
         # 默认分支：其余工具（含 MCP 工具）展示函数名与参数摘要，不再显示空白
         summary = ", ".join(
@@ -922,7 +974,7 @@ COMMAND_COMPLETIONS = [
     ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
-    ("/undo", "撤销上一次修改的代码"),
+    ("/undo", "按回合撤销文件修改 (list/preview/status/recover)"),
     ("/checkpoint", "会话级检查点 (list/restore 整轮回滚)"),
     ("/share", "导出会话为 Markdown/HTML/JSON"),
     ("/diagram", "打开/列出 Mermaid 流程图网页 (open 序号/list)"),
@@ -1826,6 +1878,433 @@ def show_session_history(session_name):
     print_formatted_text(HTML("<ansicyan><b>--------------------------------------</b></ansicyan>\n"))
 
 
+# ---------------------------------------------------------------------------
+# 按回合撤销（CLI）：/undo 系列、/checkpoint 迁移与回合结束摘要（规格 17）
+# ---------------------------------------------------------------------------
+
+def _undo_service():
+    from core.turn_undo import service as tu_service
+
+    return tu_service
+
+
+def _undo_session_id(session_name: str) -> int:
+    tu = _undo_service()
+    manager.ensure_session(session_name)
+    return tu.resolve_session_id(session_name)
+
+
+def _undo_workdir_root() -> str:
+    from core.turn_undo.coordinator import canonicalize_workspace_root
+    from core.workspace_context import get_workdir
+
+    return canonicalize_workspace_root(get_workdir() or os.getcwd())
+
+
+def _undo_status_label(s: dict) -> str:
+    """状态 + 快照保留状态的组合展示标签（规格 16.3 一致的 CLI 文案）。"""
+    status = s.get("status")
+    availability = s.get("snapshot_availability")
+    labels = {
+        "recording": "记录中",
+        "ready": "可撤销",
+        "no_changes": "无文件修改",
+        "unavailable": "不可撤销",
+        "conflicted": "撤销受阻（文件已变化）",
+        "reverting": "正在撤销",
+        "reverted": "已撤销",
+        "interrupted": "撤销中断",
+        "recovering": "正在恢复撤销事务",
+        "failed": "撤销失败",
+    }
+    label = labels.get(status, status)
+    if status == "reverted" and availability == "expired":
+        label = "已撤销（原 diff 已过期）"
+    elif status == "ready" and availability == "expired":
+        label = "撤销记录已过期"
+    elif status not in ("reverted", "ready") and availability == "expired":
+        label += "（快照已过期）"
+    return label
+
+
+def _undo_short_id(turn_id: str) -> str:
+    return turn_id[:8]
+
+
+def _undo_resolve_turn_id(session_name: str, value: str) -> str:
+    """短 ID 只在当前会话唯一匹配时接受；歧义显式要求完整 ID（规格 17.2）。"""
+    tu = _undo_service()
+    value = str(value or "").strip()
+    states = tu.list_turn_undo_states(_undo_session_id(session_name), limit=200)
+    exact = [s for s in states if s["turn_id"] == value]
+    if exact:
+        return value
+    prefix = [s for s in states if s["turn_id"].startswith(value)]
+    if len(prefix) == 1:
+        return prefix[0]["turn_id"]
+    if len(prefix) > 1:
+        raise ValueError(
+            f"回合 ID 前缀 {value} 匹配到 {len(prefix)} 个回合，请使用完整 ID"
+        )
+    raise ValueError(f"当前会话不存在回合: {value}")
+
+
+def _undo_print_preview(preview) -> None:
+    from core.turn_undo.models import TurnUndoStatus
+
+    if preview.status is TurnUndoStatus.CONFLICTED and preview.conflicts:
+        print_formatted_text(HTML("<ansired>⚠️ 撤销受阻：以下文件与回合结束时的状态不一致，本次没有修改任何文件：</ansired>"))
+        for c in preview.conflicts:
+            print_formatted_text(HTML(
+                f"  <ansired>✗</ansired> {_esc(c.display_path)}  "
+                f"<ansigray>预期 {_esc(node_kind_label(c.expected.kind))}，"
+                f"当前 {_esc(node_kind_label(c.actual.kind))}</ansigray>"
+            ))
+        print_formatted_text(HTML("<ansigray>  处理磁盘文件后可重新预检；不存在强制覆盖。</ansigray>"))
+        return
+    print_formatted_text(HTML(
+        f"<ansicyan>🔍 撤销影响：共 {preview.file_count} 个文件 — "
+        f"恢复原内容 {preview.restore_content_count}，"
+        f"删除本轮新建 {preview.delete_created_count}，"
+        f"恢复本轮删除 {preview.restore_deleted_count}</ansicyan>"
+    ))
+    if preview.created_files:
+        for path in preview.created_files:
+            print_formatted_text(HTML(f"  <ansiyellow>将删除新建文件: {_esc(path)}</ansiyellow>"))
+    print_formatted_text(HTML("<ansigray>  聊天历史保留，星瑶将记住文件结果已失效。</ansigray>"))
+    if preview.has_uncovered_command_effects:
+        print_formatted_text(HTML(
+            "<ansiyellow>⚠️ 本轮执行过通用命令：仅恢复列出的受控文件，"
+            "命令的其他副作用（进程/网络/数据库等）不撤销。</ansiyellow>"
+        ))
+    if preview.subsequent_completed_turns > 0:
+        print_formatted_text(HTML(
+            f"<ansiyellow>⚠️ 目标回合之后还有 {preview.subsequent_completed_turns} 个已完成回合，"
+            "可能存在语义依赖，撤销后请重新检查或运行测试。</ansiyellow>"
+        ))
+
+
+def node_kind_label(kind: str) -> str:
+    return {
+        "missing": "不存在",
+        "regular_file": "普通文件",
+        "symlink": "符号链接",
+        "directory": "目录",
+        "special": "特殊文件",
+    }.get(str(kind), str(kind))
+
+
+def _undo_print_result(result) -> None:
+    from core.turn_undo.models import TurnUndoStatus
+
+    if result.idempotent:
+        print_formatted_text(HTML(
+            f"<ansiyellow>ℹ 该回合此前已撤销过（{_esc(str(result.original_reverted_at_ms))}），"
+            "本次未修改任何文件。</ansiyellow>"
+        ))
+        return
+    total = (len(result.restored_files) + len(result.deleted_created_files)
+             + len(result.restored_deleted_files))
+    print_formatted_text(HTML(
+        f"<ansigreen>✅ 撤销完成：共 {total} 个文件 — "
+        f"恢复原内容 {len(result.restored_files)}，"
+        f"删除本轮新建 {len(result.deleted_created_files)}，"
+        f"恢复本轮删除 {len(result.restored_deleted_files)}。</ansigreen>"
+    ))
+    print_formatted_text(HTML("<ansigray>  聊天历史保留；通用命令与外部副作用未随文件恢复。</ansigray>"))
+
+
+def _undo_confirm(question: str) -> bool:
+    """工作区锁外的交互确认；默认 N（直接回车不执行）。"""
+    def _ask() -> bool:
+        try:
+            answer = input(f"{question} [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            return False
+        return answer in ("y", "yes")
+    try:
+        return bool(run_in_terminal(_ask))
+    except Exception:
+        return _ask()
+
+
+def _undo_interactive_revert(session_name: str, turn_id: str) -> None:
+    tu = _undo_service()
+    session_id = _undo_session_id(session_name)
+    preview, token = tu.preview_turn_undo(session_id, turn_id)
+    _undo_print_preview(preview)
+    from core.turn_undo.models import TurnUndoStatus
+
+    if preview.status is TurnUndoStatus.CONFLICTED and preview.conflicts:
+        return
+    if not _undo_confirm(f"确认撤销回合 {_undo_short_id(turn_id)} 的全部文件修改?"):
+        print_formatted_text(HTML("<ansigray>已取消（默认 N），本次没有修改任何文件。</ansigray>"))
+        return
+    # 确认后重新预检拿新令牌（确认期间文件/版本可能已变化）
+    preview2, token2 = tu.preview_turn_undo(session_id, turn_id)
+    if preview2.status is TurnUndoStatus.CONFLICTED and preview2.conflicts:
+        _undo_print_preview(preview2)
+        return
+    try:
+        result = tu.execute_turn_undo(session_id, turn_id, token2)
+        _undo_print_result(result)
+    except Exception as e:
+        code = getattr(e, "code", "")
+        if code == "revert_interrupted":
+            print_formatted_text(HTML(
+                f"<ansired>⚠️ 撤销事务中断：{_esc(str(e))}</ansired>"
+            ))
+            _undo_print_recover_hint(session_id, turn_id)
+        elif code == "file_conflict":
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+        else:
+            print_formatted_text(HTML(f"<ansired>⚠️ 撤销失败：{_esc(str(e))}</ansired>"))
+
+
+def _undo_print_recover_hint(session_id: int, turn_id: str) -> None:
+    status = _undo_service().get_turn_undo_status(session_id, turn_id)
+    if status and status.get("last_operation_id"):
+        print_formatted_text(HTML(
+            f"  <ansiyellow>使用 /undo recover {_esc(status['last_operation_id'])} "
+            "查看恢复选项（继续撤销或取消撤销）。</ansiyellow>"
+        ))
+
+
+def handle_undo_command(command_text: str, current_session: str) -> None:
+    """CLI /undo：按回合撤销（规格 17.2）。默认确认 N，无 --force。"""
+    tu = _undo_service()
+    parts = command_text.strip().split(maxsplit=2)
+    sub = parts[1] if len(parts) > 1 else ""
+
+    if sub == "list":
+        states = tu.list_turn_undo_states(_undo_session_id(current_session))
+        if not states:
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前会话没有按回合撤销记录。</ansiyellow>"))
+            return
+        print_formatted_text(HTML(f"<ansicyan>📋 当前会话共 {len(states)} 个回合检查点:</ansicyan>"))
+        for s in states:
+            desc = s.get("description") or ""
+            if len(desc) > 40:
+                desc = desc[:37] + "..."
+            owner = " [后台任务]" if s.get("owner_kind") == "background_task" else ""
+            print_formatted_text(HTML(
+                f"  <ansigreen>{_esc(_undo_short_id(s['turn_id']))}</ansigreen> "
+                f"{_esc(_undo_status_label(s))}  "
+                f"文件: {s['file_count']}  <ansigray>+{s['net_added']} -{s['net_removed']} "
+                f"{_esc(desc)}{_esc(owner)}</ansigray>"
+            ))
+        return
+
+    if sub == "preview":
+        if len(parts) < 3:
+            print_formatted_text(HTML("<ansired>⚠️ 用法: /undo preview &lt;turn_id&gt;</ansired>"))
+            return
+        try:
+            turn_id = _undo_resolve_turn_id(current_session, parts[2])
+            preview, _ = tu.preview_turn_undo(_undo_session_id(current_session), turn_id)
+            _undo_print_preview(preview)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+        return
+
+    if sub == "status":
+        if len(parts) < 3:
+            print_formatted_text(HTML("<ansired>⚠️ 用法: /undo status &lt;turn_id&gt;</ansired>"))
+            return
+        try:
+            turn_id = _undo_resolve_turn_id(current_session, parts[2])
+            status = tu.get_turn_undo_status(_undo_session_id(current_session), turn_id)
+            if status is None:
+                print_formatted_text(HTML(f"<ansired>⚠️ 未找到回合: {_esc(turn_id)}</ansired>"))
+                return
+            print_formatted_text(HTML(
+                f"<ansicyan>回合 {_esc(_undo_short_id(status['turn_id']))} "
+                f"({_esc(status['status'])})，快照: {_esc(status['snapshot_availability'])}，"
+                f"文件 {len(status.get('files', []))} 个</ansicyan>"
+            ))
+            for f in status.get("files", []):
+                print_formatted_text(HTML(
+                    f"  {_esc(f['display_path'])}  "
+                    f"<ansigray>+{f['net_added']} -{f['net_removed']} {_esc(f.get('diff_kind') or '')}</ansigray>"
+                ))
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+        return
+
+    if sub == "recover":
+        if len(parts) < 3:
+            print_formatted_text(HTML("<ansired>⚠️ 用法: /undo recover &lt;operation_id&gt;</ansired>"))
+            return
+        _undo_interactive_recovery(current_session, parts[2].strip())
+        return
+
+    if sub and sub not in ("list", "preview", "status", "recover"):
+        # /undo <turn_id>：指定回合
+        try:
+            turn_id = _undo_resolve_turn_id(current_session, sub)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+            return
+        _undo_interactive_revert(current_session, turn_id)
+        return
+
+    # /undo 无参数：最近一个 ready 前台回合
+    session_id = _undo_session_id(current_session)
+    candidates = tu.get_default_storage().list_workdir_ready_checkpoints(
+        session_id, _undo_workdir_root()
+    )
+    candidates = [c for c in candidates if c.status_enum.value == "ready"]
+    if not candidates:
+        print_formatted_text(HTML(
+            "<ansiyellow>ℹ 当前会话/工作区没有可撤销的回合。</ansiyellow>\n"
+            "<ansigray>  使用 /undo list 查看全部检查点状态。</ansigray>"
+        ))
+        return
+    _undo_interactive_revert(current_session, candidates[0].turn_id)
+
+
+def _undo_interactive_recovery(session_name: str, operation_id: str) -> None:
+    tu = _undo_service()
+    session_id = _undo_session_id(session_name)
+    try:
+        preview, token = tu.preview_turn_undo_recovery(session_id, operation_id, "continue_revert")
+    except Exception as e:
+        print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+        return
+    print_formatted_text(HTML("<ansicyan>🔍 撤销中断恢复选项：</ansicyan>"))
+    if preview.processed_files:
+        print_formatted_text(HTML(f"  已恢复: {_esc('、'.join(preview.processed_files))}"))
+    if preview.remaining_files:
+        print_formatted_text(HTML(f"  未处理: {_esc('、'.join(preview.remaining_files))}"))
+    if preview.unknown_files:
+        print_formatted_text(HTML(
+            f"  <ansired>状态未知（需人工核对，已拒绝自动写入）: "
+            f"{_esc('、'.join(preview.unknown_files))}</ansired>"
+        ))
+        return
+    print_formatted_text(HTML("  1. 继续撤销 — 使用本轮开始前快照完成剩余撤销"))
+    print_formatted_text(HTML("  2. 取消撤销 — 把已处理路径恢复到点击撤销之前"))
+    choice = ""
+    try:
+        choice = run_in_terminal(lambda: input("选择恢复方向 [1=继续撤销 / 2=取消撤销 / 回车取消]: ").strip()) or ""
+    except Exception:
+        choice = ""
+    if choice not in ("1", "2"):
+        print_formatted_text(HTML("<ansigray>已取消，本次没有修改任何文件。</ansigray>"))
+        return
+    action = "continue_revert" if choice == "1" else "cancel_revert"
+    # 执行方向可能与预览方向不同：重新按所选方向预检拿令牌
+    try:
+        _, token = tu.preview_turn_undo_recovery(session_id, operation_id, action)
+        question = (
+            f"确认继续撤销（完成剩余 {len(preview.remaining_files)} 个文件）?"
+            if action == "continue_revert"
+            else "确认取消撤销（恢复已处理文件到点击撤销前的状态）?"
+        )
+        if not _undo_confirm(question):
+            print_formatted_text(HTML("<ansigray>已取消，本次没有修改任何文件。</ansigray>"))
+            return
+        result = tu.execute_turn_undo_recovery(session_id, operation_id, action, token)
+        if result.action.value == "continue_revert":
+            print_formatted_text(HTML(
+                f"<ansigreen>✅ 撤销已继续完成：{len(result.affected_files)} 个文件恢复。</ansigreen>"
+            ))
+        else:
+            print_formatted_text(HTML(
+                "<ansigreen>✅ 撤销事务已取消：文件恢复到点击撤销之前的状态，回合重新可撤销。</ansigreen>"
+            ))
+    except Exception as e:
+        print_formatted_text(HTML(f"<ansired>⚠️ 恢复失败：{_esc(str(e))}</ansired>"))
+
+
+def handle_checkpoint_command(command_text: str, current_session: str) -> None:
+    """/checkpoint：list 查看、restore 迁移为 TurnUndoService 兼容入口（规格 23.1）。"""
+    parts = command_text.strip().split(maxsplit=2)
+    sub = parts[1] if len(parts) > 1 else "list"
+
+    if sub == "list":
+        tu = _undo_service()
+        states = tu.list_turn_undo_states(_undo_session_id(current_session))
+        if not states:
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前会话没有检查点记录。</ansiyellow>"))
+            print_formatted_text(HTML("<ansigray>  每轮对话开始前会自动创建持久化检查点，记录本轮受控文件修改。</ansigray>"))
+            print_formatted_text(HTML("<ansigray>  使用 /checkpoint restore &lt;turn_id&gt; 或 /undo 可整体回滚该轮文件修改。</ansigray>"))
+            return
+        print_formatted_text(HTML(f"<ansicyan>📋 当前会话共有 {len(states)} 个检查点:</ansicyan>"))
+        for s in states:
+            desc = s.get("description") or "(无描述)"
+            if len(desc) > 50:
+                desc = desc[:47] + "..."
+            print_formatted_text(HTML(
+                f"  <ansigreen>{_esc(_undo_short_id(s['turn_id']))}</ansigreen> "
+                f"{_esc(_undo_status_label(s))}  文件修改: {s['file_count']}  "
+                f"<ansigray>{_esc(desc)}</ansigray>"
+            ))
+        print_formatted_text(HTML(
+            "<ansigray>\n  使用 /checkpoint restore &lt;turn_id&gt; 或 /undo 整体回滚该轮所有文件修改</ansigray>"
+        ))
+        return
+
+    if sub == "restore":
+        if len(parts) < 3:
+            print_formatted_text(HTML("<ansired>⚠️ 用法: /checkpoint restore &lt;turn_id&gt;</ansired>"))
+            return
+        # 迁移：恢复动作统一走 TurnUndoService（预检 + 一次性令牌 + 多文件事务）
+        try:
+            turn_id = _undo_resolve_turn_id(current_session, parts[2].strip())
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
+            print_formatted_text(HTML("<ansigray>  使用 /checkpoint list 查看所有可用的检查点 ID</ansigray>"))
+            return
+        _undo_interactive_revert(current_session, turn_id)
+        return
+
+    print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /checkpoint [list|restore &lt;turn_id&gt;]</ansired>"))
+
+
+def print_turn_file_summary_if_ready(session_name: str, turn_id: str) -> None:
+    """回合封闭后（worker 线程调用，经 schedule_ui 切回主线程）：检查点进入
+    ready 时在最终回答后显示文件修改摘要与 /undo 指引（规格 17.1）。"""
+    try:
+        tu = _undo_service()
+        session_id = tu.resolve_session_id(session_name)
+        status = tu.get_turn_undo_status(session_id, turn_id)
+        if status is None or status.get("status") != "ready":
+            return
+        files = status.get("files") or []
+        if not files:
+            return
+        net_added = sum(f.get("net_added") or 0 for f in files)
+        net_removed = sum(f.get("net_removed") or 0 for f in files)
+        print_formatted_text(HTML(""))
+        print_formatted_text(HTML("<ansicyan>文件修改</ansicyan>"))
+        print_formatted_text(HTML(
+            f"<ansigray>{len(files)} 个文件已编辑  </ansigray>"
+            f"<ansigreen>+{net_added}</ansigreen> <ansired>-{net_removed}</ansired>"
+        ))
+        shown = files[:5]
+        for f in shown:
+            print_formatted_text(HTML(
+                f"  {_esc(f.get('display_path') or '')}  "
+                f"<ansigreen>+{f.get('net_added') or 0}</ansigreen> "
+                f"<ansired>-{f.get('net_removed') or 0}</ansired>"
+            ))
+        if len(files) > 5:
+            print_formatted_text(HTML(f"  <ansigray>还有 {len(files) - 5} 个文件（/undo status 查看全部）</ansigray>"))
+        if status.get("has_uncovered_command_effects"):
+            print_formatted_text(HTML(
+                "<ansiyellow>⚠️ 本轮执行过通用命令：命令的其他副作用不在撤销范围内。</ansiyellow>"
+            ))
+        print_formatted_text(HTML(
+            f"可撤销本轮修改：<ansicyan>/undo {_esc(_undo_short_id(status['turn_id']))}</ansicyan>"
+        ))
+        print_formatted_text(HTML(""))
+    except Exception:
+        logging.getLogger("py.warnings").debug(
+            "回合文件摘要展示失败", exc_info=True
+        )
+
+
 def handle_slash_command(command_text):
     """斜杠指令路由器"""
     global current_session, current_model, _turn_separator_needed
@@ -1844,7 +2323,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/session rename &lt;新名称&gt;</ansicyan>          : 重命名当前活动会话"))
         print_formatted_text(HTML("  <ansicyan>/session delete &lt;会话名称&gt;</ansicyan>          : 物理删除指定会话（安全切回防御）"))
         print_formatted_text(HTML("  <ansicyan>/new</ansicyan>                                    : 创建并切换到全新会话（历史会话保留，/session 可切回）"))
-        print_formatted_text(HTML(f"  <ansicyan>/undo [y]</ansicyan>                               : 撤销{_agent_name()}上一次修改的代码，并同步抹除模型记忆 (撤销新建文件时需追加 y 确认删除)"))
+        print_formatted_text(HTML(f"  <ansicyan>/undo [turn_id]</ansicyan>                      : 按回合撤销文件修改（整轮预检+确认；list 列表 / status 状态 / recover 恢复中断事务，默认确认 N，无 --force）"))
         print_formatted_text(HTML("  <ansicyan>/checkpoint</ansicyan>                             : 会话级检查点管理 (list 查看 / restore &lt;turn_id&gt; 整轮回滚)"))
         print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
         print_formatted_text(HTML(f"  <ansicyan>/diagram [open 序号|list]</ansicyan>               : 打开/列出已生成的 Mermaid 流程图网页（{_agent_name()}输出 mermaid 代码块时自动生成）"))
@@ -2439,139 +2918,20 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML(f"<{color}>{_esc(result.text)}</{color}>"))
 
     elif cmd == "/undo":
-        # 撤销的实际逻辑在 core/agent_service.undo_last_edit（与 GUI 共用），
-        # 这里只负责"删除新建文件"的二次确认与终端提示。
-        from core.memory import get_undo_state
-
-        state = get_undo_state(current_session)
-        file_path = state.get("file_path")
-        old_content = state.get("old_content")
-        # 删除新建文件是高危操作：要求显式确认，避免跨会话/误操作导致用户数据丢失
-        existed_before = state.get("existed_before")
-        if existed_before is None:
-            # 兼容旧版本只保存 old_content 的撤销记录。
-            existed_before = old_content != ""
-        will_delete = bool(file_path) and not bool(existed_before)
-        confirm = command_text.strip().split()
-        forced = len(confirm) >= 2 and confirm[1].lower() in ("y", "yes", "--force")
-        if will_delete and not forced:
-            print_formatted_text(
-                HTML(f"<ansiyellow>⚠️ 该操作将删除{_agent_name()}新建的文件 {_esc(file_path)}，"
-                     f"请在命令后追加 y/yes/--force 确认，例如：/undo y</ansiyellow>")
-            )
-            return
-
-        ok, message = _agent_service.undo_last_edit(manager, current_session, force=forced)
-        if ok:
-            print_formatted_text(HTML(f"<ansigreen>↩️ {_esc(message)}</ansigreen>"))
-            recalc_token_usage()  # 撤销后重新计算 token
-            print_formatted_text(HTML(f"<ansigreen>🧠 已同步抹除{_agent_name()}对刚才操作的记忆，防止幻觉复发。</ansigreen>"))
-        else:
-            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(message)}</ansired>"))
+        # 按回合撤销（规格 17）：/undo、/undo <turn_id>、list、preview、status、recover。
+        # 预检 + 一次性令牌 + 多文件事务；默认确认 N，无 --force。
+        try:
+            handle_undo_command(command_text, current_session)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
 
     elif cmd == "/checkpoint" or cmd.startswith("/checkpoint "):
-        # 会话级检查点管理：list 查看、restore <turn_id> 回滚整轮所有文件修改
-        # 设计参考 Grok Build 的 workspace 级 checkpoint
-        from core.memory import list_checkpoints, restore_checkpoint
-        parts = command_text.strip().split(maxsplit=3)
-        sub = parts[1] if len(parts) > 1 else "list"
-
-        if sub == "list":
-            checkpoints = list_checkpoints(current_session)
-            if not checkpoints:
-                print_formatted_text(HTML("<ansiyellow>ℹ 当前会话没有检查点记录。</ansiyellow>"))
-                print_formatted_text(HTML("<ansigray>  每轮对话开始前会自动打一个检查点，记录本轮所有文件修改的旧内容。</ansigray>"))
-                print_formatted_text(HTML("<ansigray>  使用 /checkpoint restore &lt;turn_id&gt; 可整体回滚到该检查点。</ansigray>"))
-            else:
-                print_formatted_text(HTML(f"<ansicyan>📋 当前会话共有 {len(checkpoints)} 个检查点:</ansicyan>"))
-                for cp in checkpoints:
-                    desc = cp.get("description", "") or "(无描述)"
-                    if len(desc) > 50:
-                        desc = desc[:47] + "..."
-                    n_files = len(cp.get("file_snapshots", []))
-                    print_formatted_text(HTML(
-                        f"  <ansigreen>{_esc(cp['turn_id'])}</ansigreen> "
-                        f"<ansigray>{_esc(cp['created_at'])}</ansigray> "
-                        f"文件修改: {n_files}  "
-                        f"<ansigray>{_esc(desc)}</ansigray>"
-                    ))
-                print_formatted_text(HTML("<ansigray>\n  使用 /checkpoint restore &lt;turn_id&gt; 整体回滚该轮所有文件修改</ansigray>"))
-
-        elif sub == "restore":
-            if len(parts) < 3:
-                print_formatted_text(HTML("<ansired>⚠️ 用法: /checkpoint restore &lt;turn_id&gt;</ansired>"))
-            else:
-                target_turn_id = parts[2].strip()
-                snapshots = restore_checkpoint(current_session, target_turn_id)
-                if snapshots is None:
-                    print_formatted_text(HTML(f"<ansired>⚠️ 未找到检查点: {_esc(target_turn_id)}</ansired>"))
-                    print_formatted_text(HTML("<ansigray>  使用 /checkpoint list 查看所有可用的检查点 ID</ansigray>"))
-                elif not snapshots:
-                    print_formatted_text(HTML(f"<ansiyellow>ℹ 检查点 {_esc(target_turn_id)} 没有文件修改记录（该轮没有写/编辑操作）。</ansiyellow>"))
-                else:
-                    # 旧记录用 old_content == "" 表示新建文件；新记录显式保存
-                    # existed_before，避免把原本存在的空文件误判为新建文件。
-                    # 若用户之后重建/修改了同名文件，静默删除会造成数据丢失——
-                    # 与 /undo 的删除确认保持一致，要求显式追加 y/yes/--force。
-                    confirm_flag = parts[3].strip().lower() if len(parts) > 3 else ""
-                    forced = confirm_flag in ("y", "yes", "--force")
-                    pending_deletes = [
-                        s for s in snapshots
-                        if not bool(
-                            s.get("existed_before")
-                            if s.get("existed_before") is not None
-                            else s.get("old_content") != ""
-                        )
-                        and os.path.exists(s.get("file_path") or "")
-                    ]
-                    if pending_deletes and not forced:
-                        print_formatted_text(HTML(
-                            f"<ansiyellow>⚠️ 回滚将删除 {len(pending_deletes)} 个检查点后新建的文件；"
-                            f"若这些文件之后被你重建或修改过，内容将一并丢失。"
-                            f"确认请追加 y/yes/--force，例如：/checkpoint restore {_esc(target_turn_id)} --force</ansiyellow>"
-                        ))
-                        for s in pending_deletes:
-                            print_formatted_text(HTML(f"  <ansigray>将删除: {_esc(s.get('file_path', '?'))}</ansigray>"))
-                        return
-                    print_formatted_text(HTML(f"<ansicyan>🔄 正在回滚检查点 {_esc(target_turn_id)}，共 {len(snapshots)} 个文件...</ansicyan>"))
-                    from core.agent_service import _restore_file_bytes
-                    from core.tools import sandbox_bypass
-                    success = 0
-                    failed = 0
-                    for snap in snapshots:
-                        try:
-                            file_path = snap["file_path"]
-                            old_content = snap["old_content"]
-                            existed_before = snap.get("existed_before")
-                            if existed_before is None:
-                                existed_before = old_content != ""
-                            if not existed_before:
-                                # 原本不存在该文件，删除
-                                if os.path.exists(file_path):
-                                    os.remove(file_path)
-                                print_formatted_text(HTML(f"  <ansigreen>✔ 删除新建文件: {_esc(file_path)}</ansigreen>"))
-                            else:
-                                # 回滚是用户显式发起的恢复操作：沙盒外路径也直接放行，
-                                # 避免之前单次批准写出的沙盒外文件无法回滚。新记录
-                                # 优先写回原始字节；旧记录按 UTF-8 文本兼容恢复。
-                                old_bytes = snap.get("old_bytes")
-                                if not isinstance(old_bytes, bytes):
-                                    old_bytes = str(old_content).encode("utf-8")
-                                with sandbox_bypass():
-                                    _restore_file_bytes(file_path, old_bytes)
-                                print_formatted_text(HTML(f"  <ansigreen>✔ 恢复文件: {_esc(file_path)}</ansigreen>"))
-                            success += 1
-                        except Exception as e:
-                            print_formatted_text(HTML(f"  <ansired>✗ 恢复失败 {_esc(snap.get('file_path', '?'))}: {_esc(e)}</ansired>"))
-                            failed += 1
-                    print_formatted_text(HTML(
-                        f"<ansigreen>✅ 检查点回滚完成：成功 {success} 个，失败 {failed} 个。</ansigreen>"
-                    ))
-                    if success > 0:
-                        recalc_token_usage()
-
-        else:
-            print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /checkpoint [list|restore &lt;turn_id&gt;]</ansired>"))
+        # 会话级检查点管理：list 查看、restore <turn_id> 整轮回滚。
+        # 恢复动作已迁移为 TurnUndoService 兼容入口（预检 + 令牌 + 多文件事务）
+        try:
+            handle_checkpoint_command(command_text, current_session)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ {_esc(str(e))}</ansired>"))
 
     elif cmd == "/share" or cmd.startswith("/share "):
         # 会话导出（参考 OpenCode 的 share 模块）
@@ -3850,8 +4210,44 @@ def _background_worker():
                         HTML(f"  <ansigreen>{message}</ansigreen>")
                     ))
 
-            # 将用户最新输入存入数据库
-            manager.add_message(task_session, "user", parsed_content)
+            # --- 按回合撤销生命周期重排（规格 9.1）---
+            # 先确保会话行、生成全局唯一 turn_id（128 位随机 UUID）并创建
+            # 持久化检查点，再原子落库用户消息（+ message_turn_links）。
+            # 检查点创建失败则本轮不落任何消息（不留无法归组的孤儿消息）。
+            from core.turn_undo import service as _tu_service
+            from core.workspace_context import get_workdir
+
+            turn_id = uuid.uuid4().hex
+            try:
+                manager.ensure_session(task_session)
+                _tu_checkpoint, _tu_undo_ctx = _tu_service.begin_turn(
+                    session_id=_tu_service.resolve_session_id(task_session),
+                    turn_id=turn_id,
+                    workspace_root=get_workdir(),
+                    description=str(user_input)[:80],
+                )
+            except Exception:
+                import logging as _logging_mod
+
+                _logging_mod.getLogger("py.warnings").exception(
+                    "创建按回合撤销检查点失败，回合中止 session=%s", task_session
+                )
+                _report_task_result(task_data, False, "回合检查点创建失败，本轮未开始")
+                continue
+            try:
+                manager.add_message(
+                    task_session, "user", parsed_content,
+                    turn_checkpoint_id=_tu_checkpoint.checkpoint_id,
+                    turn_position_kind="user",
+                )
+            except Exception:
+                from core.turn_undo import service as _tu_service_inner
+
+                try:
+                    _tu_service_inner.finish_turn(_tu_undo_ctx, aborted=True, reason="用户消息落库失败")
+                except Exception:
+                    pass
+                raise
 
             # 组装本轮发给大模型的完整上下文：记忆压缩、系统提示词、运行上下文、
             # 后台子代理结果注入等步骤已下沉到 core/agent_service.py，与 GUI 共用同一套逻辑。
@@ -3876,7 +4272,6 @@ def _background_worker():
             # 后台线程只切换 UI 状态，不直接触碰 prompt_toolkit 布局。
             # turn 状态的建立（active_* 赋值）与清理在同一个 try/finally 作用域内，
             # 中途任何异常都不会留下永不清空的 cancel_event / executing 状态。
-            turn_id = f"{task_session}:{uuid.uuid4().hex[:8]}"
             turn_controller = TurnController(history)
             turn_controller.begin_turn()
             history = turn_controller.messages
@@ -3890,19 +4285,6 @@ def _background_worker():
             from core import tool_cache as _tool_cache
             _tool_cache.set_current_session(task_session)
             # 将 undo 状态绑定到当前会话，防止切会话后 /undo 误操作其他会话的文件
-            from core.memory import set_undo_session
-            set_undo_session(task_session)
-
-            # 会话级检查点：本轮所有 write_file/edit_file 的旧内容会被自动记录
-            # 用户可通过 /checkpoint restore <turn_id> 整体回滚（含文件 + 对话上下文）
-            from core.memory import begin_turn_checkpoint, end_turn_checkpoint
-            begin_turn_checkpoint(
-                session_name=task_session,
-                turn_id=turn_id,
-                last_msg_id=len(history),
-                description=str(user_input)[:80],
-            )
-
             def mark_turn_started():
                 global is_thinking, think_start_time, task_status, activity_start_time
                 _clear_active_thinking()
@@ -3939,20 +4321,28 @@ def _background_worker():
                     # 消息已由 generator 在生成迭代中实时持久化入库，此处不再重复写入
                     _forward_response_events(response_gen)
                     turn_controller.complete()
-                    # 提交本轮检查点到全局缓存（即使本轮没有文件修改也要记录，
-                    # 用户可借此回滚到"本轮对话开始前"的状态）
-                    end_turn_checkpoint()
+                    # 回合正常结束：标记最后一条 assistant 关联并封闭检查点
+                    # （即使本轮没有文件修改也封闭——no_changes 是正常终态）
+                    try:
+                        manager.mark_turn_final_assistant(_tu_checkpoint.checkpoint_id)
+                    except Exception:
+                        pass
+                    closed_status = _tu_service.finish_turn(_tu_undo_ctx)
+                    # 检查点进入 ready：在最终回答后显示文件修改摘要与 /undo 指引
+                    if closed_status and closed_status.value == "ready":
+                        schedule_ui(lambda s=task_session, t=turn_id:
+                                    print_turn_file_summary_if_ready(s, t))
                     schedule_ui(_reset_turn_state)
                 except KeyboardInterrupt:
                     # The queued turn_cancelled event renders the cancellation line.
                     turn_controller.cancel()
-                    end_turn_checkpoint()  # 取消也提交检查点（已记录的快照仍可用）
+                    _tu_service.finish_turn(_tu_undo_ctx, aborted=True, reason="回合被用户取消")
                     schedule_ui(_reset_turn_state)
                     turn_interrupted = True
                     turn_error = "已被用户取消"
                 except Exception as e:
                     turn_controller.cancel()
-                    end_turn_checkpoint()
+                    _tu_service.finish_turn(_tu_undo_ctx, aborted=True, reason=f"回合异常: {type(e).__name__}")
                     # 必须记录到 runtime-warnings.log，否则异常被静默吞掉，
                     # 用户消息已入库但 assistant 回复缺失，无法排查（session 97 类问题）
                     import logging as _logging_mod
@@ -3988,9 +4378,7 @@ def _background_worker():
                 task_status = "idle"
                 _clear_active_thinking()
                 from core import tool_cache as _tool_cache
-                from core.memory import clear_undo_session
                 _tool_cache.set_current_session(None)
-                clear_undo_session()
                 # 清理卡在 in_progress 的计划项：子 agent 异常退出（超时/崩溃/未调用 terminal_callback）
                 # 会导致计划项永久卡在 in_progress，turn 结束后仍显示在状态栏。
                 # 但必须跳过"后台子代理仍在运行"的 in_progress 项——否则会误杀正常后台任务
@@ -4300,6 +4688,32 @@ def run_cli():
     # 启动后台处理线程
     worker_thread = threading.Thread(target=_background_worker, daemon=True)
     worker_thread.start()
+
+    # 按回合撤销：进入主交互前显示一次中断事务摘要（规格 24；扫描已在模块
+    # 加载时执行，这里只读展示受影响回合与恢复指引，不自动重放任何写入）
+    try:
+        from core.turn_undo import service as _tu_service_cli
+        from core.turn_undo.models import TurnUndoStatus as _TUS
+
+        _interrupted_cps = _tu_service_cli.get_default_storage().list_checkpoints_by_status(
+            (_TUS.INTERRUPTED, _TUS.RECOVERING)
+        )
+        if _interrupted_cps:
+            print_formatted_text(HTML(
+                "<ansiyellow>⚠️ 检测到未完成的撤销事务：相关文件已被冻结保护"
+                "（星瑶的文件工具与命令在这些路径上暂不可用）。</ansiyellow>"
+            ))
+            for _cp in _interrupted_cps:
+                print_formatted_text(HTML(
+                    f"  回合 {_esc(_cp.turn_id[:8])}  "
+                    f"<ansigray>{_esc(_cp.last_error_message or '撤销中断')}</ansigray>"
+                ))
+            print_formatted_text(HTML(
+                "  处理方式：/undo list 查看状态，/undo recover &lt;操作ID&gt; 选择"
+                "继续撤销或取消撤销。\n"
+            ))
+    except Exception:
+        pass
 
     # ── 启动预热（同步阶段，CLI 出现前完成）──────────────────────────────
     # 设计取向：启动慢一点没关系，但进入界面后必须立即可用、输入不卡。

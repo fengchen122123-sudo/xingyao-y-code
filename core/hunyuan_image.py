@@ -21,6 +21,8 @@ import time
 import urllib.error
 import urllib.request
 
+from pathlib import Path
+
 from core.tool_protocol import ToolResult
 
 _API_URL = (
@@ -135,7 +137,34 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", fo
         with open(tmp, "rb") as f:
             head = f.read(8)
         path = base + _detect_ext(head)
-        os.replace(tmp, path)
+        # 按回合撤销：插件声明的受控文件修改同样先快照后落盘（规格 9.5）
+        from core.turn_undo import coordinator as _tu_coordinator
+        from core.turn_undo import recorder as _tu_recorder
+        from core.turn_undo.models import NodeKind, TurnUndoError
+
+        with open(tmp, "rb") as f:
+            payload = f.read()
+        handle = None
+        with _tu_coordinator.get_coordinator().workspace_lock(_tu_coordinator.thread_workspace_root()):
+            try:
+                handle = _tu_recorder.prepare_mutation(
+                    display_path=path,
+                    after_kind=NodeKind.REGULAR_FILE,
+                    after_content=payload,
+                    tool_name="hunyuan_generate_image",
+                    tool_call_id="",
+                )
+            except TurnUndoError as error:
+                if error.code == "no_active_checkpoint":
+                    handle = None
+                else:
+                    return ToolResult(
+                        f"🚨 撤销检查点已封闭，迟到的图片写入已被拒绝：{error.message}",
+                        is_error=True,
+                    )
+            os.replace(tmp, path)
+            if handle is not None:
+                _tu_recorder.verify_after_mutation(handle)
     except Exception as exc:
         try:
             if os.path.exists(tmp):

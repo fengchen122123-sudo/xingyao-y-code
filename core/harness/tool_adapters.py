@@ -537,17 +537,9 @@ class ToolAdapterSet:
         if isinstance(write_result, str) and write_result.startswith(TOOL_ERROR_PREFIX):
             return ToolResult(write_result, is_error=True)
 
-        # 默认 registry 处理器 core.tools.write_file 已记录解析后的绝对路径、
-        # 文件是否原本存在以及原始字节。这里只为测试/嵌入方显式注入的覆盖处理器
-        # 保留兼容记录，避免把默认处理器刚写入的精确快照覆盖成文本快照。
-        if self._uses_override(self.write_file, _write_file):
-            from core.memory import set_undo_state
-
-            set_undo_state(
-                str(resolved_path),
-                old_content,
-                existed_before=existed_before,
-            )
+        # 旧 set_undo_state 兼容记录已删除（规格 23.2）：默认处理器经
+        # FileMutationRecorder 记录按回合撤销快照；注入的覆盖处理器不接入
+        # 记录器，也不伪造快照。
         self.show_file_diff(
             str(resolved_path),
             old_content,
@@ -823,6 +815,24 @@ class ToolAdapterSet:
 
     def execute(self, resolved_tool, arguments, context) -> ToolResult:
         name = resolved_tool.spec.name
+        # 按回合撤销：登记当前工具名与 call_id（TLS），记录器采集修改来源
+        try:
+            from core.turn_undo import recorder as _tu_recorder
+
+            _tu_recorder.set_tool_context(name, self.tool_call_id)
+        except Exception:
+            pass
+        try:
+            return self._execute_dispatch(name, resolved_tool, arguments, context)
+        finally:
+            try:
+                from core.turn_undo import recorder as _tu_recorder
+
+                _tu_recorder.clear_tool_context()
+            except Exception:
+                pass
+
+    def _execute_dispatch(self, name, resolved_tool, arguments, context) -> ToolResult:
         if name == "read_file":
             return self.execute_read_file(resolved_tool, arguments, context)
         if name == "write_file":

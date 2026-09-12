@@ -234,6 +234,18 @@ def _session_from_turn_id(turn_id: str) -> str:
     return value.rsplit(":", 1)[0] if ":" in value else ""
 
 
+def _undo_node_state_dict(state) -> Dict[str, Any]:
+    """NodeState → 前端冲突展示 DTO。"""
+    return {
+        "kind": state.kind.value,
+        "exists": bool(state.exists),
+        "size": state.size,
+        "sha256": state.sha256,
+        "identity": state.identity,
+        "link_count": state.link_count,
+        "symlink_target": state.symlink_target,
+    }
+
 def _gui_may_raise_window() -> bool:
     """电脑操控焦点礼让守卫（通用化重构 Task F'）。
 
@@ -470,6 +482,20 @@ class ApiBridge:
         # 修复：形参曾经遮蔽模块级单例，导致 self._mcp 永远是 None
         self._mcp = mcp_manager if mcp_manager is not None else _mcp_manager_singleton
 
+        # 按回合撤销：注册进程级存储并执行启动恢复扫描（收敛中断事务、
+        # 重建路径冻结、清理跨 boot 失效令牌；不自动重放任何文件写入）
+        try:
+            from core.turn_undo import service as _tu_service
+
+            _tu_service.configure_default_manager(self._memory)
+            interrupted = _tu_service.startup_recovery_scan()
+            if interrupted:
+                logger.warning(
+                    "按回合撤销：启动恢复收敛了 %d 个未终态操作", len(interrupted)
+                )
+        except Exception:
+            logger.warning("按回合撤销服务初始化失败", exc_info=True)
+
         # 启动时恢复最近一次对话（按最后活跃时间）；没有历史会话才新建空对话
         latest = self._find_latest_session()
         self._current_session = latest or f"session_{uuid.uuid4().hex[:6]}"
@@ -491,6 +517,10 @@ class ApiBridge:
         # 每会话当前回合的 turn_id（session:xxx 复合 ID）：权限请求的 owner
         # 是 turn_id 而非会话名，stop_current_turn 要按它精确取消权限等待
         self._active_turn_ids: dict[str, str] = {}
+        # 按回合撤销：turn_id（新协议为全局随机 UUID）→ 会话名 的归属映射。
+        # 权限请求事件按它路由会话，不再从 turn_id 字符串前缀推导（规格 20.1）
+        self._turn_owner_sessions: dict[str, str] = {}
+        self._turn_owner_lock = threading.Lock()
         # 回合启动互斥：send_user_message 与后台自动汇总都可能启动 turn 线程，
         # "检查 is_alive + 启动"必须原子，否则两边同时通过检查会并发跑两个回合
         self._turn_start_lock = threading.Lock()
@@ -2257,7 +2287,12 @@ class ApiBridge:
         """读取会话历史并转成前端气泡结构（与 switch_session 同一套映射）。"""
         msgs: List[Dict[str, Any]] = []
         try:
-            for msg in self._memory.get_history(session_name):
+            # 按回合撤销：消息 → 回合关联（纯界面元数据，Provider 请求不读取）
+            try:
+                turn_links = self._memory.load_session_turn_links(session_name)
+            except Exception:
+                turn_links = {}
+            for msg in self._memory.get_history_with_ids(session_name):
                 role = msg.get("role")
                 if role in ("user", "assistant", "tool"):
                     content = msg.get("content") or ""
@@ -2268,6 +2303,7 @@ class ApiBridge:
                     elif role == "assistant":
                         # 数据库旧消息可能残留上游网关的空正文占位符，回放前精确清理
                         content = sanitize_protocol_text(content)
+                    link = turn_links.get(msg.get("_msg_id"))
                     msgs.append({
                         "role": role,
                         "content": content,
@@ -2283,6 +2319,9 @@ class ApiBridge:
                         "execution_state": (msg.get("_display") or {}).get("execution_state") or "",
                         # media_v1 媒体清单（已拼好带令牌 URL）；旧消息为空列表
                         "media": self._media_items_for_frontend(msg.get("_display")),
+                        # 权威回合归属（旧消息无关联时为空串，前端回退启发式分组）
+                        "turn_id": (link or {}).get("turn_id") or "",
+                        "position_kind": (link or {}).get("position_kind") or "",
                     })
             err_info = self._get_session_last_error(session_name)
             if err_info and err_info.get("message"):
@@ -2810,6 +2849,7 @@ class ApiBridge:
                 if not wdir or wdir == "GLOBAL":
                     global_group["sessions"].append({
                         "name": name,
+                        "session_id": s.get("id"),
                         "display_name": display,
                         "count": msg_count,
                         "workdir": "GLOBAL",
@@ -2821,6 +2861,7 @@ class ApiBridge:
                 wdir_norm = _resolve_real_path(wdir)
                 s_info = {
                     "name": name,
+                    "session_id": s.get("id"),
                     "display_name": display,
                     "count": msg_count,
                     "workdir": wdir_norm,
@@ -2903,11 +2944,6 @@ class ApiBridge:
             tool_cache.set_current_session(session_name)
         except Exception:
             logger.debug("绑定工具缓存会话失败", exc_info=True)
-        try:
-            from core.memory import set_undo_session
-            set_undo_session(session_name)
-        except Exception:
-            logger.debug("绑定撤销会话失败", exc_info=True)
 
     def switch_session(self, session_name: str, target_workdir: Optional[str] = None) -> Dict[str, Any]:
         try:
@@ -3695,6 +3731,19 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 权限确认：统一走 core.permission_broker（与 CLI 同一套串行化机制）
     # ------------------------------------------------------------------
+    def _undo_turn_impact_for_event(self, request) -> Dict[str, Any]:
+        """undo_turn 权限事件的预检富化；其余工具返回空 dict。"""
+        try:
+            if request.function_name != "undo_turn":
+                return {}
+            from core.turn_undo import service as _tu_service
+
+            return _tu_service.undo_turn_permission_impact(
+                dict(request.arguments or {})
+            )
+        except Exception:
+            return {}
+
     def _activate_permission_request(self, request):
         """broker 激活某个请求 → 推送到前端对话流内联卡片，并挂一个"超时即拒绝"的定时器。"""
         try:
@@ -3705,7 +3754,8 @@ class ApiBridge:
                 for key, label in zip(request.option_keys, options)
             ]
             self.emit_event("permission_request", {
-                "session_name": _session_from_turn_id(request.parent_turn_id),
+                "session_name": self._turn_owner_sessions.get(request.parent_turn_id)
+                or _session_from_turn_id(request.parent_turn_id),
                 "request_id": request.request_id,
                 "function_name": request.function_name,
                 # 兼容字段：部分旧界面读 tool_name / details
@@ -3719,6 +3769,8 @@ class ApiBridge:
                 "source": request.source,
                 "options": options,
                 "permission_options": permission_options,
+                # 按回合撤销：undo_turn 权限卡附带服务预检的影响摘要（只读）
+                "undo_impact": self._undo_turn_impact_for_event(request),
                 # 沙盒外访问等场景只给 同意/拒绝 两项，不渲染"总是允许"
                 "allow_always": len(options) >= 3,
             })
@@ -3738,7 +3790,8 @@ class ApiBridge:
                     from core.permission_broker import CANCELLED_RESULT
                     permission_broker.resolve(request.request_id, CANCELLED_RESULT)
                     self.emit_event("error", {
-                        "session_name": _session_from_turn_id(request.parent_turn_id),
+                        "session_name": self._turn_owner_sessions.get(request.parent_turn_id)
+                        or _session_from_turn_id(request.parent_turn_id),
                         "message": "问题确认超时，已自动取消。",
                     })
             except Exception:
@@ -4271,16 +4324,17 @@ class ApiBridge:
                 "tool_calls": [],
                 "internal_kind": internal_kind,
             }
-        self.emit_event("turn_start", turn_start_data)
-        # 记录本回合起点消息 id：此处刚推完 turn_start、本轮任何消息都还没落库。
-        # 回合异常/取消时 core/llm.rollback_turn_messages() 会回滚本轮内存消息，
-        # history 末尾退化成上一轮的助手消息，收尾补发全文必须按此边界过滤，
-        # 否则会把上一轮结果灌进本轮气泡。取不到就置 None，退回旧的不过滤行为。
+        # 按回合撤销生命周期（规格 9.1）：turn_start 事件与用户消息落库都
+        # 推迟到持久化检查点创建之后；回合边界消息 id 在 worker 起点读取
+        # （早于本回合任何落库行为），保证检查点创建前的异常路径也能正确过滤补发。
+        turn_start_msg_id = None
         try:
             turn_start_msg_id = self._memory.get_last_message_id(session_name)
         except Exception:
             logger.debug("读取回合起点消息 id 失败，message_final 退回不过滤", exc_info=True)
             turn_start_msg_id = None
+        turn_id = ""
+        undo_ctx = None
 
         try:
             active_model = get_active_model(session_name)
@@ -4345,12 +4399,36 @@ class ApiBridge:
             except Exception:
                 logger.debug("解析用户输入失败，退回纯文本", exc_info=True)
                 parsed_content, attached_msgs = user_text, []
+            # --- 按回合撤销生命周期重排（规格 9.1）---
+            # 1) 生成全局唯一不透明 turn_id（完整 128 位随机 UUID，不再嵌会话名）
+            turn_id = uuid.uuid4().hex
+            self._active_turn_ids[session_name] = turn_id
+            with self._turn_owner_lock:
+                self._turn_owner_sessions[turn_id] = session_name
+            # 2) 创建持久化检查点（失败则本轮不落任何消息、不发 turn_start）
+            from core.turn_undo import service as _tu_service
+
+            _tu_checkpoint, undo_ctx = _tu_service.begin_turn(
+                session_id=_tu_service.resolve_session_id(session_name),
+                turn_id=turn_id,
+                workspace_root=turn_workdir,
+                description=str(user_text)[:80],
+            )
+            # 3) 用户消息与 message_turn_links 原子落库
+            self._memory.add_message(
+                session_name, "user", parsed_content,
+                turn_checkpoint_id=_tu_checkpoint.checkpoint_id,
+                turn_position_kind="user",
+            )
+            # 4) 发出携带稳定身份的 turn_start（session_id + turn_id）
+            turn_start_data["turn_id"] = turn_id
+            turn_start_data["session_id"] = _tu_checkpoint.session_id
+            self.emit_event("turn_start", turn_start_data)
             if attached_msgs:
                 self.emit_event("user_attachment_notes", {
                     "session_name": session_name,
                     "notes": [str(note) for note in attached_msgs],
                 })
-            self._memory.add_message(session_name, "user", parsed_content)
             # 提取用户消息中的图片（base64 dataURL）补发给前端渲染气泡缩略图；
             # turn_start 已先行发出保证气泡即时出现，图片随后补挂到该气泡上
             if isinstance(parsed_content, list):
@@ -4365,11 +4443,6 @@ class ApiBridge:
                         "session_name": session_name,
                         "images": _images,
                     })
-
-            turn_id = f"{session_name}:{uuid.uuid4().hex[:8]}"
-            # 记录会话 → turn_id 映射：stop_current_turn 按 turn_id 精确取消
-            # 权限等待（broker 的 owner 是 turn_id）与前台子代理
-            self._active_turn_ids[session_name] = turn_id
             # 多会话并行：不再强制切换全局 _current_session。_set_current_session 会
             # 同步 tool_cache/undo/plan/app_context 等全局绑定，会话 B 的回合启动会
             # 把这些改成 B，从而影响会话 A 正在进行的后台子代理回调。本回合所需的会话
@@ -4393,21 +4466,10 @@ class ApiBridge:
                 turn_source=turn_source,
             )
 
-            # 压缩（四级水位线阶梯）可能发生在 prepare_turn_messages 内部，会改写
-            # 历史使上下文变小。压缩后 latest_prompt 仍是压缩前的上一轮真实用量，
-            # 前端据此算占比会停在红圈不更新。这里立即重算窗口占用并推送，
-            # 让上下文圆圈在压缩后及时回落。
+            # 按回合撤销检查点已在用户消息落库前创建（undo_ctx）；
+            # 历史压缩后重算窗口占用并推送，让上下文圆圈及时回落。
             self._recalc_token_usage(session_name)
             self._emit_token_usage()
-
-            # 会话级检查点：本轮所有 write_file/edit_file 的旧内容会被自动记录
-            from core.memory import begin_turn_checkpoint, end_turn_checkpoint
-            begin_turn_checkpoint(
-                session_name=session_name,
-                turn_id=turn_id,
-                last_msg_id=len(history),
-                description=str(user_text)[:80],
-            )
 
             # 子代理进度轮询：让前端"运行中"的子代理卡片能实时展开查看进度
             poller_stop = threading.Event()
@@ -4433,9 +4495,24 @@ class ApiBridge:
             finally:
                 poller_stop.set()
                 try:
-                    end_turn_checkpoint()
+                    from core.turn_undo import service as _tu_service
+
+                    if not cancelled:
+                        self._memory.mark_turn_final_assistant(
+                            _tu_checkpoint.checkpoint_id
+                        )
                 except Exception:
-                    logger.debug("提交检查点失败", exc_info=True)
+                    logger.debug("更新回合最终 assistant 关联失败", exc_info=True)
+                try:
+                    from core.turn_undo import service as _tu_service
+
+                    _tu_service.finish_turn(
+                        undo_ctx,
+                        aborted=bool(cancelled),
+                        reason="回合被用户取消" if cancelled else "",
+                    )
+                except Exception:
+                    logger.exception("封闭按回合撤销检查点失败")
 
             if cancelled:
                 self.emit_event("turn_cancelled", {"session_name": session_name})
@@ -4465,6 +4542,9 @@ class ApiBridge:
             # 从活跃回合字典中移除本会话
             self._active_turns.pop(session_name, None)
             self._active_turn_ids.pop(session_name, None)
+            if turn_id:
+                with self._turn_owner_lock:
+                    self._turn_owner_sessions.pop(turn_id, None)
             with self._active_turn_lock:
                 self._active_turn_snapshots.pop(session_name, None)
             self._finalize_session_deltas(session_name)
@@ -5494,18 +5574,169 @@ class ApiBridge:
             logger.exception("export_session 失败")
             return {"ok": False, "msg": str(e)}
 
-    def undo_last_edit(self) -> Dict[str, Any]:
+    # ------------------------------------------------------------------
+    # 按回合撤销：窄桥接（规格 19.1）。桥只做会话归属校验与会话名 →
+    # sessions.id 解析，不复制文件检查和事务逻辑。
+    # ------------------------------------------------------------------
+
+    def _undo_resolve_session_id(self, session_name: str) -> int:
+        from core.turn_undo import service as _tu_service
+        from core.turn_undo.models import TurnUndoError
+
         try:
-            from core.agent_service import undo_last_edit as _undo
-            # 前端已经做过二次确认，这里按已确认处理
-            ok, message = _undo(self._memory, self._current_session, force=True)
-            if ok:
-                self._recalc_token_usage(self._current_session)
-                self._emit_token_usage()
-            return {"ok": bool(ok), "msg": message}
+            return _tu_service.resolve_session_id(session_name)
+        except TurnUndoError:
+            raise ValueError(f"会话不存在: {session_name}")
+
+    def _undo_error_payload(self, error) -> Dict[str, Any]:
+        from core.turn_undo.models import TurnUndoError
+
+        if isinstance(error, TurnUndoError):
+            return {"ok": False, "code": error.code, "msg": error.message,
+                    "detail": error.detail or {}}
+        logger.exception("按回合撤销操作失败")
+        return {"ok": False, "code": "internal_error", "msg": str(error), "detail": {}}
+
+    def list_turn_undo_states(self, session_name: str) -> Dict[str, Any]:
+        try:
+            from core.turn_undo import service as _tu_service
+
+            session_id = self._undo_resolve_session_id(session_name)
+            states = _tu_service.list_turn_undo_states(session_id)
+            return {"ok": True, "states": states}
         except Exception as e:
-            logger.exception("undo_last_edit 失败")
-            return {"ok": False, "msg": str(e)}
+            return self._undo_error_payload(e)
+
+    def get_turn_undo_status(self, session_name: str, turn_id: str) -> Dict[str, Any]:
+        try:
+            from core.turn_undo import service as _tu_service
+
+            session_id = self._undo_resolve_session_id(session_name)
+            status = _tu_service.get_turn_undo_status(session_id, turn_id)
+            return {"ok": True, "status": status}
+        except Exception as e:
+            return self._undo_error_payload(e)
+
+    def get_turn_undo_file_diff(self, session_name: str, turn_id: str,
+                                file_id: str) -> Dict[str, Any]:
+        try:
+            from core.turn_undo import service as _tu_service
+
+            session_id = self._undo_resolve_session_id(session_name)
+            diff = _tu_service.get_turn_undo_file_diff(session_id, turn_id, file_id)
+            return {"ok": True, "diff": diff}
+        except Exception as e:
+            return self._undo_error_payload(e)
+
+    def preview_turn_undo(self, session_name: str, turn_id: str) -> Dict[str, Any]:
+        try:
+            from core.turn_undo import service as _tu_service
+
+            session_id = self._undo_resolve_session_id(session_name)
+            preview, token = _tu_service.preview_turn_undo(session_id, turn_id)
+            from dataclasses import asdict
+
+            payload = asdict(preview)
+            for key, value in list(payload.items()):
+                if hasattr(value, "value"):
+                    payload[key] = value.value
+            payload["conflicts"] = [
+                {
+                    "file_id": c.file_id,
+                    "display_path": c.display_path,
+                    "expected": _undo_node_state_dict(c.expected),
+                    "actual": _undo_node_state_dict(c.actual),
+                    "reasons": list(c.reasons),
+                }
+                for c in preview.conflicts
+            ]
+            return {"ok": True, "preview": payload, "preview_token": token}
+        except Exception as e:
+            return self._undo_error_payload(e)
+
+    def execute_turn_undo(self, session_name: str, turn_id: str,
+                          preview_token: str) -> Dict[str, Any]:
+        try:
+            from core.turn_undo import service as _tu_service
+            from dataclasses import asdict
+
+            session_id = self._undo_resolve_session_id(session_name)
+            result = _tu_service.execute_turn_undo(session_id, turn_id, preview_token)
+            payload = asdict(result)
+            if hasattr(payload.get("status"), "value"):
+                payload["status"] = result.status.value
+            # 数据库提交成功后才发送事件（规格 20.2）
+            self.emit_event("turn_undo_updated", {
+                "session_id": session_id,
+                "session_name": session_name,
+                "turn_id": turn_id,
+                "operation_id": result.operation_id,
+                "status": payload["status"],
+                "file_count": (len(result.restored_files)
+                               + len(result.deleted_created_files)
+                               + len(result.restored_deleted_files)),
+                "reverted_at": result.reverted_at_ms,
+                "owner_kind": "foreground_turn",
+                "message": "本轮文件修改已撤销，聊天历史保留" if not result.idempotent
+                else "该回合此前已撤销过",
+            })
+            return {"ok": True, "result": payload}
+        except Exception as e:
+            return self._undo_error_payload(e)
+
+    def preview_turn_undo_recovery(self, session_name: str, operation_id: str,
+                                   action: str) -> Dict[str, Any]:
+        try:
+            from core.turn_undo import service as _tu_service
+            from dataclasses import asdict
+
+            session_id = self._undo_resolve_session_id(session_name)
+            preview, token = _tu_service.preview_turn_undo_recovery(
+                session_id, operation_id, action
+            )
+            payload = asdict(preview)
+            if hasattr(payload.get("action"), "value"):
+                payload["action"] = preview.action.value
+            return {"ok": True, "preview": payload, "preview_token": token}
+        except Exception as e:
+            return self._undo_error_payload(e)
+
+    def execute_turn_undo_recovery(self, session_name: str, operation_id: str,
+                                   action: str, preview_token: str) -> Dict[str, Any]:
+        try:
+            from core.turn_undo import service as _tu_service
+            from dataclasses import asdict
+
+            session_id = self._undo_resolve_session_id(session_name)
+            result = _tu_service.execute_turn_undo_recovery(
+                session_id, operation_id, action, preview_token
+            )
+            payload = asdict(result)
+            for key in ("status", "checkpoint_status", "action"):
+                if hasattr(payload.get(key), "value"):
+                    payload[key] = getattr(result, key).value
+            # L5：恢复事件必须携带权威 turn_id，否则前端 reducer 不会刷新卡片
+            operation_row = _tu_service.get_default_storage().get_operation(operation_id)
+            checkpoint_row = _tu_service.get_default_storage().get_checkpoint(
+                operation_row.checkpoint_id
+            )
+            self.emit_event("turn_undo_updated", {
+                "session_id": session_id,
+                "session_name": session_name,
+                "turn_id": checkpoint_row.turn_id,
+                "operation_id": result.operation_id,
+                "status": payload["checkpoint_status"],
+                "file_count": len(result.affected_files),
+                "reverted_at": 0,
+                "owner_kind": "foreground_turn",
+                "message": (
+                    "撤销事务已继续完成" if result.action.value == "continue_revert"
+                    else "撤销事务已取消，文件恢复到点击撤销前的状态"
+                ),
+            })
+            return {"ok": True, "result": payload}
+        except Exception as e:
+            return self._undo_error_payload(e)
 
     def check_paths_kind(self, paths: List[str]) -> List[Dict[str, Any]]:
         """批量返回路径类型（file / dir / missing），供前端把目录与不存在的
