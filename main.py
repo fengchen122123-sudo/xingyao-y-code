@@ -975,6 +975,8 @@ COMMAND_COMPLETIONS = [
     ("/persona", "人设设置 (name/title/text/reset)"),
     ("/shell", "选择默认命令解释器 (无参查看列表)"),
     ("/open", "在系统中打开文件/目录 (无参=当前工作区)"),
+    ("/queue", "排队消息管理 (list/cancel 序号/clear)"),
+    ("/paste-image", "发送剪贴板图片 (可附说明文字)"),
     ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
@@ -995,7 +997,7 @@ COMMAND_COMPLETIONS = [
     ("/turns", "设置单任务最大模型轮次 (10-1000)"),
     ("/sandbox", "沙盒开关 (on:工作目录外直接放行/off:仅限目录内)"),
     ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
-    ("/computer", "电脑操控运行控制 (status/pause/resume/stop)"),
+    ("/computer", "电脑操控运行控制 (status/pause/resume/stop, browser 切默认浏览器)"),
     ("/clear", "清理当前屏幕"),
     ("/exit", "退出 Y-code"),
 ]
@@ -2366,6 +2368,8 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/shell [id]</ansicyan>                         : 选择默认命令解释器 (AI 命令/后台任务统一使用；无参查看列表)"))
         print_formatted_text(HTML("  <ansicyan>/open [path]</ansicyan>                          : 在系统中打开文件/目录 (无参=当前工作区)"))
         print_formatted_text(HTML("  <ansicyan>/clear-history [y]</ansicyan>                   : 清空当前会话全部历史消息 (输入 /clear-history y 确认，不影响任务计划与长期记忆)"))
+        print_formatted_text(HTML("  <ansicyan>/queue [list|cancel 序号|clear]</ansicyan>      : 管理排队中的消息 (AI 忙碌时新消息会排队)"))
+        print_formatted_text(HTML("  <ansicyan>/paste-image [说明]</ansicyan>                  : 发送剪贴板图片给模型 (可附说明文字)"))
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
@@ -2393,7 +2397,8 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/tasks tail &lt;任务ID&gt;</ansicyan>              : 查看任务最新 30 行日志 (子代理任务显示运行状态)"))
         print_formatted_text(HTML("  <ansicyan>/plan</ansicyan>                                : 查看当前任务计划与逐项状态"))
         print_formatted_text(HTML("  <ansicyan>/plan &lt;pause|resume|retry ID|cancel&gt;</ansicyan>       : 暂停、恢复、重试或取消计划"))
-        print_formatted_text(HTML("  <ansicyan>/computer &lt;status|pause|resume|stop&gt;</ansicyan>   : 电脑操控运行控制 (永久开关请在 GUI 系统设置页修改)"))
+        print_formatted_text(HTML("  <ansicyan>/computer &lt;status|pause|resume|stop&gt;</ansicyan>   : 电脑操控运行控制"))
+        print_formatted_text(HTML("  <ansicyan>/computer browser [edge|chrome]</ansicyan>    : 查看/切换操控默认浏览器 (活动任务内禁止切换；操控开关请在 GUI 系统设置页修改)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【5. KAIROS 长期记忆系统】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/remember &lt;内容&gt;</ansicyan>                     : 手动追加一条规则、偏好或事实到今日的记忆日志"))
@@ -2729,6 +2734,99 @@ def handle_slash_command(command_text):
                 os.startfile(target_path)  # noqa: S606 - 用户显式请求打开本地路径
             except OSError as exc:
                 print_formatted_text(HTML(f"<ansired>❌ 打开失败：{_esc(str(exc))}</ansired>"))
+
+    elif cmd == "/queue":
+        # 排队消息管理（对齐 GUI 排队条的 list/cancel/clear；插队依赖完整取消链路，
+        # 按实施计划列为后续）。queue.Queue 不可遍历：UI 线程内 get_nowait 全量取出
+        # → 处理 → 按原序回填；Enter 处理器是唯一 put 方且命令在 UI 线程同步执行，
+        # 无并发窗口。
+        queued = []
+        while True:
+            try:
+                queued.append(msg_queue.get_nowait())
+            except queue.Empty:
+                break
+        sub = parts[1].lower() if len(parts) > 1 else "list"
+        if sub == "list":
+            for item in queued:
+                msg_queue.put(item)
+            if not queued:
+                print_formatted_text(HTML("<ansiyellow>ℹ 当前没有排队中的消息。</ansiyellow>"))
+            else:
+                print_formatted_text(HTML(f"<b><ansicyan>排队中的消息（{len(queued)} 条）：</ansicyan></b>"))
+                for idx, item in enumerate(queued, 1):
+                    preview = str(item.get("text", "")).replace("\n", " ")[:60]
+                    kind = "技能" if item.get("is_skill_call") else "消息"
+                    session_mark = str(item.get("session") or "?")
+                    print_formatted_text(HTML(f"  {idx}. [{kind} → {_esc(session_mark)}] {_esc(preview)}"))
+        elif sub == "cancel" and len(parts) > 2:
+            try:
+                target_idx = int(parts[2])
+            except ValueError:
+                target_idx = 0
+            if not queued:
+                print_formatted_text(HTML("<ansiyellow>ℹ 当前没有排队中的消息。</ansiyellow>"))
+            elif 1 <= target_idx <= len(queued):
+                removed = queued.pop(target_idx - 1)
+                for item in queued:
+                    msg_queue.put(item)
+                preview = str(removed.get("text", "")).replace("\n", " ")[:60]
+                print_formatted_text(HTML(f"<ansigreen>✔ 已取消排队消息 {target_idx}：{_esc(preview)}</ansigreen>"))
+            else:
+                for item in queued:
+                    msg_queue.put(item)
+                print_formatted_text(HTML(f"<ansired>❌ 序号超出范围（当前共 {len(queued)} 条），用 /queue list 查看。</ansired>"))
+        elif sub == "clear":
+            print_formatted_text(HTML(f"<ansigreen>✔ 已清空 {len(queued)} 条排队消息。</ansigreen>"))
+        else:
+            for item in queued:
+                msg_queue.put(item)
+            print_formatted_text(HTML("<ansired>❌ 用法: /queue [list|cancel &lt;序号&gt;|clear]</ansired>"))
+
+    elif cmd == "/paste-image":
+        # 剪贴板图片发送（对齐 GUI 粘贴图片）：抓取剪贴板 → 存临时 png →
+        # 把绝对路径嵌进消息文本按普通消息入队；parse_user_input 第 2 步会自动
+        # 提取盘符绝对路径并走压缩/视觉管线（core/input_parser.py），零管线改动。
+        # headless 模式不经过 handle_slash_command，无需专门拦截。
+        note = command_text[len("/paste-image"):].strip()
+        composed = ""
+        try:
+            from PIL import ImageGrab
+        except Exception:
+            print_formatted_text(HTML("<ansired>❌ 剪贴板图片需要 Pillow 支持，请检查依赖安装。</ansired>"))
+        else:
+            try:
+                grabbed = ImageGrab.grabclipboard()
+            except Exception as exc:
+                print_formatted_text(HTML(f"<ansired>❌ 读取剪贴板失败：{_esc(str(exc))}</ansired>"))
+            else:
+                import tempfile
+                if isinstance(grabbed, list) and grabbed:
+                    # 剪贴板里是文件路径列表（复制文件场景）：直接作为附件路径
+                    composed = (note + "\n" + "\n".join(str(p) for p in grabbed)).strip()
+                elif grabbed is not None:
+                    try:
+                        fd, tmp_path = tempfile.mkstemp(prefix="ycode_clip_", suffix=".png")
+                        os.close(fd)
+                        grabbed.save(tmp_path, "PNG")
+                    except Exception as exc:
+                        print_formatted_text(HTML(f"<ansired>❌ 剪贴板图片保存失败：{_esc(str(exc))}</ansired>"))
+                    else:
+                        composed = (note + "\n" + tmp_path).strip()
+                else:
+                    print_formatted_text(HTML("<ansiyellow>ℹ 剪贴板中没有图片。</ansiyellow>"))
+        if composed:
+            was_queued = is_thinking
+            safe_note = _esc(note.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+            if was_queued:
+                _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) [剪贴板图片] {safe_note}</ansigray>")
+            else:
+                _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> [剪贴板图片] {safe_note}")
+            msg_queue.put({
+                "text": composed,
+                "was_queued": was_queued,
+                "session": current_session,
+            })
 
     elif cmd == "/sandbox":
         # 沙盒开关：控制文件工具是否可访问当前工作目录之外的路径
@@ -3071,8 +3169,9 @@ def handle_slash_command(command_text):
                 print_formatted_text(HTML("<ansired>❌ 用法：/plan、/plan pause、/plan resume、/plan retry &lt;id&gt;、/plan cancel</ansired>"))
 
     elif cmd == "/computer":
-        # 电脑操控运行控制（设计 17.1）：CLI 只 status/pause/resume/stop，
-        # 永久开关只能在 GUI 系统设置页修改（与 GUI 共用同一 controller 单例）
+        # 电脑操控运行控制（设计 17.1）：CLI 只 status/pause/resume/stop；
+        # browser 子命令可查看/切换默认浏览器（CLI 唯一可改的永久设置项），
+        # 操控开关本身仍只能在 GUI 系统设置页修改（与 GUI 共用同一 controller 单例）
         from core.computer.cli import handle_computer_command
         from core.computer.controller import get_computer_control_service
 

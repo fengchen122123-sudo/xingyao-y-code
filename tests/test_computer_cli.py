@@ -120,11 +120,116 @@ class FakeController(_SharedFakeController):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("command", ["/computer on", "/computer off", "/computer browser chrome", "/computer"])
+@pytest.mark.parametrize("command", ["/computer on", "/computer off", "/computer"])
 def test_cli_rejects_permanent_or_incomplete_computer_commands(command):
     result = handle_computer_command(command, FakeController())
     assert result.ok is False
     assert "设置页" in result.text or "用法" in result.text
+
+
+# ---------------------------------------------------------------------------
+# browser 子命令（查看/切换默认浏览器；settings 均经 monkeypatch，绝不碰真实配置）
+# ---------------------------------------------------------------------------
+
+
+def _browser_settings_snapshot(browser="edge", options=()):
+    from core.computer.settings import BrowserOption, ComputerSettingsSnapshot
+
+    if not options:
+        options = (
+            BrowserOption(browser="edge", label="Microsoft Edge", available=True),
+            BrowserOption(browser="chrome", label="Google Chrome", available=False,
+                          unavailable_reason="未安装"),
+        )
+    return ComputerSettingsSnapshot(
+        browser_control_enabled=True,
+        computer_control_enabled=True,
+        computer_browser=browser,
+        browser_options=tuple(options),
+        profile_display_path="C:/profile",
+        platform_supported=True,
+        generation=1,
+    )
+
+
+def test_cli_browser_without_value_lists_options(monkeypatch):
+    from core.computer import settings as settings_mod
+
+    monkeypatch.setattr(
+        settings_mod, "load_computer_settings", lambda: _browser_settings_snapshot()
+    )
+    result = handle_computer_command("/computer browser", FakeController())
+
+    assert result.ok is True
+    assert "默认浏览器 edge" in result.text
+    assert "chrome" in result.text
+    assert "未安装" in result.text
+    assert "用法" in result.text
+    assert "**" not in result.text
+
+
+def test_cli_browser_switches_when_no_active_run(monkeypatch):
+    from core.computer import settings as settings_mod
+
+    calls = []
+
+    def fake_set(value, active_run):
+        calls.append((value, active_run))
+        return _browser_settings_snapshot(browser="chrome")
+
+    monkeypatch.setattr(settings_mod, "set_computer_browser", fake_set)
+    # run_id 为空 = 无活动 run，active_run 必须为 False
+    result = handle_computer_command(
+        "/computer browser chrome", FakeController(run_id="", status="idle")
+    )
+
+    assert calls == [("chrome", False)]
+    assert result.ok is True
+    assert "已切换为 chrome" in result.text
+
+
+def test_cli_browser_rejected_during_active_run(monkeypatch):
+    from core.computer import settings as settings_mod
+
+    def fake_set(value, active_run):
+        assert active_run is True
+        raise ComputerControlError(
+            "computer_session_busy", "当前有进行中的电脑操控会话，请先停止后再切换浏览器"
+        )
+
+    monkeypatch.setattr(settings_mod, "set_computer_browser", fake_set)
+    # 默认 FakeController 即 running 活动态
+    result = handle_computer_command("/computer browser edge", FakeController())
+
+    assert result.ok is False
+    assert "电脑操控会话" in result.text
+    assert "错误码" in result.text
+
+
+def test_cli_browser_invalid_value_reports_error_code(monkeypatch):
+    from core.computer import settings as settings_mod
+
+    def fake_set(value, active_run):
+        raise ComputerControlError(
+            "computer_invalid_config", "computer_browser 只支持 edge 或 chrome"
+        )
+
+    monkeypatch.setattr(settings_mod, "set_computer_browser", fake_set)
+    result = handle_computer_command(
+        "/computer browser firefox", FakeController(run_id="", status="idle")
+    )
+
+    assert result.ok is False
+    assert "错误码" in result.text
+
+
+def test_cli_browser_rejects_extra_arguments():
+    result = handle_computer_command(
+        "/computer browser edge chrome", FakeController(run_id="", status="idle")
+    )
+
+    assert result.ok is False
+    assert "用法" in result.text
 
 
 def test_cli_status_when_disabled_is_plain_text():
@@ -371,16 +476,52 @@ def test_cli_commands_never_touch_permanent_settings(tmp_path, monkeypatch):
         "/computer stop",
         "/computer on",
         "/computer off",
-        "/computer browser chrome",
         "/computer",
     ):
         handle_computer_command(command, controller)
 
+    # 运行控制命令必须一个字节都不落盘；browser 子命令是唯一例外，单独测
     assert cfg.read_text(encoding="utf-8") == before
     saved = json.loads(before)
     assert saved["browser_control_enabled"] is True
     assert saved["computer_control_enabled"] is False
     assert saved["computer_browser"] == "chrome"
+
+
+def test_cli_browser_switch_updates_only_browser_key(tmp_path, monkeypatch):
+    """browser 子命令是 CLI 唯一允许修改的永久设置，且只允许改 computer_browser。"""
+    values = {
+        "browser_control_enabled": True,
+        "computer_control_enabled": False,
+        "computer_browser": "chrome",
+    }
+    cfg = use_temp_config(tmp_path, monkeypatch, values)
+
+    controller = FakeController(status="idle", run_id="")
+    result = handle_computer_command("/computer browser edge", controller)
+
+    assert result.ok is True
+    saved = json.loads(cfg.read_text(encoding="utf-8"))
+    assert saved["computer_browser"] == "edge"
+    assert saved["browser_control_enabled"] is True
+    assert saved["computer_control_enabled"] is False
+
+
+def test_cli_browser_no_write_during_active_run(tmp_path, monkeypatch):
+    values = {
+        "browser_control_enabled": True,
+        "computer_control_enabled": False,
+        "computer_browser": "chrome",
+    }
+    cfg = use_temp_config(tmp_path, monkeypatch, values)
+    before = cfg.read_text(encoding="utf-8")
+
+    controller = FakeController(status="paused")
+    result = handle_computer_command("/computer browser chrome", controller)
+
+    assert result.ok is False
+    assert "错误码" in result.text
+    assert cfg.read_text(encoding="utf-8") == before
 
 
 # ---------------------------------------------------------------------------

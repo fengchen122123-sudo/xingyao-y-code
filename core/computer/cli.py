@@ -1,9 +1,10 @@
 """CLI 电脑操控运行控制与脱敏显示（设计第 17 节）。
 
-命令固定为 /computer status|pause|resume|stop：只做运行控制，绝不修改
-永久设置开关（GUI 系统设置页专属）；shlex.split 后必须恰好两个 token，
-不接受别名或额外参数。显示全部为纯文本（无 Markdown 强调符号），动作
-摘要脱敏：输入文本只显示长度、URL 只显示 host。
+命令为 /computer status|pause|resume|stop|browser：前者只做运行控制，
+绝不修改永久设置开关（GUI 系统设置页专属）；browser 是唯一例外——查看/
+切换默认浏览器（CLI 侧没有系统设置页）。status/shlex.split 后运行控制
+必须恰好两个 token，不接受别名或额外参数。显示全部为纯文本（无 Markdown
+强调符号），动作摘要脱敏：输入文本只显示长度、URL 只显示 host。
 
 本模块不导入 main/GUI/Provider/Playwright，只依赖 controller 公开 API
 与 ComputerRunSnapshot 公开字段；controller listener 侧只产生待投递
@@ -34,7 +35,11 @@ _ACTIVE_RUN_STATUSES = frozenset(
     }
 )
 
-_USAGE_TEXT = "用法：/computer status|pause|resume|stop；永久开关请在 GUI 系统设置页修改"
+_USAGE_TEXT = (
+    "用法：/computer status|pause|resume|stop；"
+    "/computer browser [edge|chrome] 查看或切换默认浏览器；"
+    "操控开关请在 GUI 系统设置页修改"
+)
 _NO_ACTIVE_RUN_TEXT = "电脑操控: 当前没有进行中的操控任务（可先 /computer status 查看状态）"
 # Task 14 审查裁决：stopping 窗口内 pause/resume/stop 的 computer_invalid_state
 # 内部文案（"非法状态转换：stopping → stopping"）改为友好提示。
@@ -185,21 +190,24 @@ def render_computer_cli_event(event: dict) -> str | None:
 
 
 def handle_computer_command(command: str, controller) -> ComputerCommandResult:
-    """严格解析并执行 /computer 命令（设计 17.1）。
+    """严格解析并执行 /computer 命令（设计 17.1，扩展 browser 子命令）。
 
-    shlex.split 后必须恰好两个 token 且子命令在白名单内；status 只读快照，
-    pause/resume/stop 要求活动 run 并把 controller.snapshot() 的当前 run id
-    传给 controller（run_id 校验语义与 GUI Bridge 一致）。任何路径都不修改
-    永久设置键。
+    status/pause/resume/stop 固定两个 token：status 只读快照，其余要求活动
+    run 并把 controller.snapshot() 的当前 run id 传给 controller（run_id 校验
+    语义与 GUI Bridge 一致）。browser 是唯一允许修改的永久设置（默认浏览器：
+    无值=查看，带值=edge|chrome），活动 run 内禁止切换，口径与 GUI 一致。
+    任何其他路径都不修改永久设置键。
     """
     try:
         tokens = shlex.split(command)
     except ValueError:
         return ComputerCommandResult(ok=False, text=_USAGE_TEXT)
-    if len(tokens) != 2 or tokens[0].lower() != "/computer":
+    if not tokens or tokens[0].lower() != "/computer":
         return ComputerCommandResult(ok=False, text=_USAGE_TEXT)
-    sub = tokens[1].lower()
-    if sub not in _COMMANDS:
+    sub = tokens[1].lower() if len(tokens) > 1 else ""
+    if sub == "browser":
+        return _handle_browser_subcommand(tokens[2:], controller)
+    if len(tokens) != 2 or sub not in _COMMANDS:
         return ComputerCommandResult(ok=False, text=_USAGE_TEXT)
 
     snapshot = controller.snapshot()
@@ -225,6 +233,50 @@ def handle_computer_command(command: str, controller) -> ComputerCommandResult:
             ok=False, text=f"电脑操控: {error.message}（错误码 {error.code}）"
         )
     return ComputerCommandResult(ok=True, text=render_computer_snapshot(next_snapshot))
+
+
+def _handle_browser_subcommand(args: list, controller) -> ComputerCommandResult:
+    """/computer browser：查看或切换默认浏览器（CLI 唯一可改的永久设置项）。
+
+    settings 导入保持函数内惰性：本模块保持轻量导入，且便于测试替换。
+    active_run 判定与 pause/resume/stop 同源（_ACTIVE_RUN_STATUSES），语义
+    与 GUI Bridge 的 set_computer_browser 一致。
+    """
+    from core.computer.settings import load_computer_settings, set_computer_browser
+
+    snapshot = controller.snapshot()
+    active_run = bool(snapshot.run_id and snapshot.status in _ACTIVE_RUN_STATUSES)
+    if not args:
+        try:
+            settings_snapshot = load_computer_settings()
+        except ComputerControlError as error:
+            return ComputerCommandResult(
+                ok=False, text=f"电脑操控: {error.message}（错误码 {error.code}）"
+            )
+        current = settings_snapshot.computer_browser
+        lines = [f"电脑操控: 默认浏览器 {current}"]
+        for option in settings_snapshot.browser_options:
+            mark = "●" if option.browser == current else "○"
+            reason = " [未安装]" if not option.available else ""
+            lines.append(f"  {mark} {option.browser}({option.label}){reason}")
+        lines.append("用法：/computer browser edge|chrome；活动 run 内禁止切换")
+        return ComputerCommandResult(ok=True, text="\n".join(lines))
+    if len(args) > 1:
+        return ComputerCommandResult(ok=False, text="用法：/computer browser [edge|chrome]")
+    value = args[0].strip().lower()
+    try:
+        next_settings = set_computer_browser(value, active_run=active_run)
+    except ComputerControlError as error:
+        return ComputerCommandResult(
+            ok=False, text=f"电脑操控: {error.message}（错误码 {error.code}）"
+        )
+    return ComputerCommandResult(
+        ok=True,
+        text=(
+            f"电脑操控: 默认浏览器已切换为 {next_settings.computer_browser}，"
+            "下次操控 run 生效"
+        ),
+    )
 
 
 def stop_active_run_for_cancel(controller) -> bool:
