@@ -1,5 +1,7 @@
 import { defineStore } from 'pinia';
 import type {
+  AutomationRunInfo,
+  AutomationTaskInfo,
   ModelInfo,
   ProviderInfo,
   ApiProtocolInfo,
@@ -425,7 +427,7 @@ export interface PermReqState {
   undoImpact?: Record<string, any> | null;
 }
 
-export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models';
+export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations';
 
 const speedTracker = new StreamingSpeedTracker();
 
@@ -547,6 +549,10 @@ export const useAppStore = defineStore('app', {
     skills: [] as SkillInfo[],
     mcps: [] as McpInfo[],
     plugins: [] as PluginInfo[],
+
+    // 星轨自动化任务：任务列表 + 每任务运行历史（事件幂等替换）
+    automationTasks: [] as AutomationTaskInfo[],
+    automationRuns: {} as Record<string, AutomationRunInfo[]>,
 
     // 对话消息流
     messages: [] as ChatMessage[],
@@ -1543,6 +1549,8 @@ export const useAppStore = defineStore('app', {
         await finishSplash();
         return;
       }
+      // 星轨自动化：启动时主动拉一次任务快照（引擎启动推送可能早于页面就绪被丢弃）
+      void this.refreshAutomations();
       this.themeLight = document.body.classList.contains('light');
       try {
         const init = await api.get_initial_state();
@@ -3339,6 +3347,19 @@ export const useAppStore = defineStore('app', {
             delete this.messageQueues[qSession];
           }
         }
+      } else if (type === 'automation_tasks_changed') {
+        // 星轨自动化：任务全量快照，幂等替换（与 message_queue 快照同模式）
+        const tasks = Array.isArray(data.tasks) ? (data.tasks as AutomationTaskInfo[]) : [];
+        this.automationTasks = tasks;
+      } else if (type === 'automation_run_updated') {
+        // 星轨自动化：单条运行行更新——按 id 幂等替换或插入历史头部，上限 50 条
+        const run = data.run as AutomationRunInfo | undefined;
+        if (run && run.task_id) {
+          const list = this.automationRuns[run.task_id] || [];
+          const idx = list.findIndex(r => r.id === run.id);
+          const next = idx >= 0 ? list.map(r => (r.id === run.id ? run : r)) : [run, ...list];
+          this.automationRuns = { ...this.automationRuns, [run.task_id]: next.slice(0, 50) };
+        }
       } else if (type === 'notice') {
         // 后端桥事件 notice：写入对应会话的对话流（双端同步的统一回环落点）。
         // 注意必须走本地插入，不能再调 broadcastChatNotice，否则会回环再广播。
@@ -3809,6 +3830,109 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.notifyModal('插件', '插件信任失败: ' + err);
+      }
+    },
+
+    // ---- 星轨自动化任务 ----
+    async refreshAutomations(): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const res = await api.get_automation_tasks();
+        if (res && res.ok && Array.isArray(res.tasks)) {
+          this.automationTasks = res.tasks;
+          return true;
+        }
+        return false;
+      } catch (err) {
+        this.notifyModal('自动化任务', '读取自动化任务失败: ' + err);
+        return false;
+      }
+    },
+
+    async saveAutomationTask(task: Record<string, any>): Promise<{ ok: boolean; errors?: string[]; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.save_automation_task(task);
+        // 字段校验错误原样透传给表单逐条展示
+        if (res && !res.ok && Array.isArray(res.errors)) return res;
+        if (res && res.ok) await this.refreshAutomations();
+        return res || { ok: false, msg: '未知错误' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async toggleAutomationTask(taskId: string, enabled: boolean) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.set_automation_task_enabled(taskId, enabled);
+        if (!res || !res.ok) {
+          this.notifyModal('自动化任务', '启停失败: ' + ((res && res.msg) || '未知错误'));
+        }
+      } catch (err) {
+        this.notifyModal('自动化任务', '启停失败: ' + err);
+      }
+    },
+
+    async deleteAutomationTask(taskId: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.delete_automation_task(taskId);
+        if (res && res.ok) {
+          const runs = { ...this.automationRuns };
+          delete runs[taskId];
+          this.automationRuns = runs;
+          await this.refreshAutomations();
+        } else {
+          this.notifyModal('自动化任务', '删除失败: ' + ((res && res.msg) || '未知错误'));
+        }
+      } catch (err) {
+        this.notifyModal('自动化任务', '删除失败: ' + err);
+      }
+    },
+
+    async runAutomationTaskNow(taskId: string): Promise<{ ok: boolean; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.run_automation_task_now(taskId);
+        if (res && !res.ok && res.msg) {
+          this.notifyModal('自动化任务', res.msg);
+        }
+        return res || { ok: false, msg: '未知错误' };
+      } catch (err) {
+        this.notifyModal('自动化任务', '执行失败: ' + err);
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async loadAutomationRuns(taskId: string, limit = 50) {
+      const api = this._api();
+      if (!api || !taskId) return;
+      try {
+        const res = await api.get_automation_runs(taskId, limit);
+        if (res && res.ok && Array.isArray(res.runs)) {
+          this.automationRuns = { ...this.automationRuns, [taskId]: res.runs };
+        }
+      } catch {
+        // 历史加载失败不打断页面，重开抽屉会重试
+      }
+    },
+
+    async clearAutomationRuns(taskId: string) {
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.clear_automation_runs(taskId);
+        if (res && res.ok) {
+          this.automationRuns = { ...this.automationRuns, [taskId]: [] };
+        }
+      } catch {
+        // 同上：静默重试路径
       }
     },
 

@@ -103,6 +103,11 @@
         </div>
       </div>
 
+      <!-- 自动化任务页 -->
+      <div v-else-if="subType === 'automations'" class="automations-page">
+        <AutomationPane />
+      </div>
+
       <!-- 模型管理页 -->
       <div v-else class="models-page">
         <div class="model-section-title">添加供应商</div>
@@ -185,6 +190,7 @@
 <script setup lang="ts">
 import { computed, reactive, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
+import AutomationPane from './AutomationPane.vue';
 import { useAppStore, type SubpageType } from '../stores/appStore';
 import type { SkillInfo, McpInfo, ModelInfo, PluginInfo } from '../types/pywebview';
 import { parseModelTestError } from '../utils/errorParser';
@@ -201,12 +207,14 @@ const title = computed(() => {
   if (props.subType === 'skills') return '技能 Skills';
   if (props.subType === 'mcp') return 'MCP 服务';
   if (props.subType === 'plugins') return '插件 Plugins';
+  if (props.subType === 'automations') return '自动化任务';
   return '模型管理';
 });
 const desc = computed(() => {
   if (props.subType === 'skills') return '已扫描的项目技能与用户扩展技能';
   if (props.subType === 'mcp') return '来自 mcp.json 的服务接口';
   if (props.subType === 'plugins') return '与 CLI 共用同一份 plugin.json 配置，开关状态两端同步';
+  if (props.subType === 'automations') return '定时触发的自动化回合，仅星瑶运行期间生效';
   return '管理模型供应商与可用模型列表';
 });
 
@@ -290,7 +298,7 @@ function pluginStatusText(p: PluginInfo) {
   }
 }
 
-// 打开 MCP / 插件页时刷新一次最新状态
+// 打开 MCP / 插件 / 自动化页时刷新一次最新状态
 watch(
   () => [props.visible, props.subType] as const,
   ([visible, type]) => {
@@ -298,6 +306,8 @@ watch(
       store.refreshMcpServers();
     } else if (visible && type === 'plugins') {
       store.refreshPlugins();
+    } else if (visible && type === 'automations') {
+      store.refreshAutomations();
     }
   }
 );

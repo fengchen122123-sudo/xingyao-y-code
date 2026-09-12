@@ -28,6 +28,12 @@
         <span class="mi-count">{{ enabledPluginCount }} / {{ store.plugins.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
+      <div class="menu-item" @click="openAutomations()">
+        <span class="mi-ico">⏱</span>
+        <span class="mi-label">自动化</span>
+        <span class="mi-count">{{ enabledAutomationCount }} / {{ store.automationTasks.length }}</span>
+        <span class="mi-arrow">›</span>
+      </div>
     </div>
 
     <div class="side-section">
@@ -261,6 +267,10 @@ function openPlugins() {
   store.openSubpage('plugins');
   collapseSidebarIfMobile();
 }
+function openAutomations() {
+  store.openSubpage('automations');
+  collapseSidebarIfMobile();
+}
 
 // 一个目录下超过 5 条会话时默认折叠，点“显示更多”再展开全部
 function visibleSessions(group: SessionGroup) {
@@ -292,6 +302,7 @@ function relativeTime(updatedAt?: string) {
 }
 const connectedMcpCount = computed(() => store.mcps.filter(m => m.connected).length);
 const enabledPluginCount = computed(() => store.plugins.filter(p => p.enabled).length);
+const enabledAutomationCount = computed(() => store.automationTasks.filter(t => t.enabled).length);
 
 function toggleGroupCollapsed(path: string) {
   // 处于确认删除状态时，点击分组头其它区域视为取消，不折叠
