@@ -971,6 +971,10 @@ COMMAND_COMPLETIONS = [
     ("/new", "创建并切换到全新会话"),
     ("/models", "打开模型管理器"),
     ("/effort", "切换当前模型思考模式 (档位随模型, 无参查看可选档位)"),
+    ("/clear-history", "清空当前会话全部历史消息 (y 确认)"),
+    ("/persona", "人设设置 (name/title/text/reset)"),
+    ("/shell", "选择默认命令解释器 (无参查看列表)"),
+    ("/open", "在系统中打开文件/目录 (无参=当前工作区)"),
     ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
@@ -985,7 +989,7 @@ COMMAND_COMPLETIONS = [
     ("/worktree", "Git worktree 管理 (list/create/remove)"),
     ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
     ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
-    ("/skills", "查看或安装/开启/禁用技能插件"),
+    ("/skills", "技能管理 (list/refresh/enable/disable 或开选择器)"),
     ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
     ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
     ("/turns", "设置单任务最大模型轮次 (10-1000)"),
@@ -1043,6 +1047,31 @@ def _reasoning_options_for_completion(ttl: float = 5.0):
             for o in snapshot.get("options", [])
         ) if (active_id and snapshot) else ()
         cached.update(key=key, ts=now, rows=rows)
+        return rows
+    except Exception:
+        return ()
+
+
+_COMMAND_SHELL_COMPLETION_CACHE = {"ts": 0.0, "rows": ()}
+
+
+def _command_shell_options_for_completion(ttl: float = 5.0):
+    """可选命令解释器 (id, label, available)，供 /shell 参数补全。
+
+    list_command_shell_options 每次调用都做可执行文件探测，补全随按键高频
+    触发，按短 TTL 缓存；异常静默返回空，不影响正常命令补全。
+    """
+    try:
+        now = time.monotonic()
+        cached = _COMMAND_SHELL_COMPLETION_CACHE
+        if now - cached["ts"] < ttl:
+            return cached["rows"]
+        from core.command_shell import list_command_shell_options
+        rows = tuple(
+            (o["id"], o["label"], bool(o["available"]))
+            for o in list_command_shell_options()
+        )
+        cached.update(ts=now, rows=rows)
         return rows
     except Exception:
         return ()
@@ -2333,6 +2362,10 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("<b><ansiyellow>【2. 模型与样式配置】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/models</ansicyan>                              : 打开全屏模型管理器 UI (切换模型、API 密钥、API 地址)"))
         print_formatted_text(HTML("  <ansicyan>/effort &lt;档位&gt;</ansicyan>      : 切换当前模型思考模式 (档位随模型，无参查看可选档位；按模型保存，下轮请求生效)"))
+        print_formatted_text(HTML("  <ansicyan>/persona [name|title|text|reset]</ansicyan>   : 人设设置 (智能体名称/对你的称呼/人设文本，保存即全局生效)"))
+        print_formatted_text(HTML("  <ansicyan>/shell [id]</ansicyan>                         : 选择默认命令解释器 (AI 命令/后台任务统一使用；无参查看列表)"))
+        print_formatted_text(HTML("  <ansicyan>/open [path]</ansicyan>                          : 在系统中打开文件/目录 (无参=当前工作区)"))
+        print_formatted_text(HTML("  <ansicyan>/clear-history [y]</ansicyan>                   : 清空当前会话全部历史消息 (输入 /clear-history y 确认，不影响任务计划与长期记忆)"))
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
         print_formatted_text(HTML("  <ansicyan>/permission &lt;confirm|accept_edits|plan|full&gt;</ansicyan> : 切换安全权限级别 (confirm:变更前确认 | accept_edits:自动编辑 | plan:计划模式 | full:完全访问)"))
@@ -2345,6 +2378,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("<b><ansiyellow>【3. 技能插件管理】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/skills</ansicyan>                              : 打开全屏技能选择器 UI (空格勾选开启/关闭)"))
         print_formatted_text(HTML("  <ansicyan>/skills list</ansicyan>                         : 在终端列出所有扫描到的技能，展示启用状态与短 ID"))
+        print_formatted_text(HTML("  <ansicyan>/skills refresh</ansicyan>                      : 重新扫描技能目录 (新装技能免重启生效)"))
         print_formatted_text(HTML("  <ansicyan>/skills enable &lt;短ID&gt;</ansicyan>             : 启用指定短 ID 对应的技能"))
         print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan>            : 禁用指定短 ID 对应的技能"))
         print_formatted_text(HTML(f"  <ansicyan>/&lt;短ID&gt; [提问内容]</ansicyan>                   : <b>主动且强制调用指定技能</b>让{_agent_name()}为您执行任务"))
@@ -2390,7 +2424,14 @@ def handle_slash_command(command_text):
         
         if len(parts) > 1:
             sub = parts[1].lower()
-            if sub == "list":
+            if sub == "refresh":
+                # 显式重扫技能目录（新装技能无需重启即可被 /skills 与补全菜单看到）
+                skills = scan_all_skills()
+                active_ids = set(get_active_skill_ids())
+                active_count = sum(1 for s in skills if s["id"] in active_ids)
+                print_formatted_text(HTML(f"<ansigreen>✔ 技能目录已重新扫描：共 {len(skills)} 个技能，已启用 {active_count} 个。</ansigreen>"))
+                print_formatted_text(HTML("  输入 <ansicyan>/skills list</ansicyan> 查看清单，新增技能的 /补全 与 /短ID 调用立即生效。"))
+            elif sub == "list":
                 skills = scan_all_skills()
                 active_ids = set(get_active_skill_ids())
                 if not skills:
@@ -2432,6 +2473,7 @@ def handle_slash_command(command_text):
             else:
                 print_formatted_text(HTML("<ansired>❌ 用法错误。可选指令：</ansired>"))
                 print_formatted_text(HTML("  <ansicyan>/skills list</ansicyan>             : 列出所有技能"))
+                print_formatted_text(HTML("  <ansicyan>/skills refresh</ansicyan>          : 重新扫描技能目录"))
                 print_formatted_text(HTML("  <ansicyan>/skills enable &lt;短ID&gt;</ansicyan>  : 启用指定技能"))
                 print_formatted_text(HTML("  <ansicyan>/skills disable &lt;短ID&gt;</ansicyan> : 禁用指定技能"))
         else:
@@ -2566,6 +2608,127 @@ def handle_slash_command(command_text):
             print_formatted_text(HTML(f"<b><ansicyan>当前模型思考模式: {current_label} ({_esc(current)})</ansicyan></b>"))
             print_formatted_text(HTML(f"  可选档位: {marks}"))
             print_formatted_text(HTML("用法: <ansiyellow>/effort &lt;档位&gt;</ansiyellow>  (default = 恢复模型默认，下一轮请求生效)"))
+
+    elif cmd == "/clear-history":
+        # 清空当前会话全部消息历史（保留会话本身；任务计划与长期记忆不受影响），
+        # 对齐 GUI 会话工具栏「清空」按钮（gui_bridge.clear_session_history 的 CLI 等价物）
+        from core.llm import session_token_usage, token_usage_lock
+        confirm = parts[1].lower() if len(parts) > 1 else ""
+        if confirm not in ("y", "yes", "--force"):
+            print_formatted_text(HTML(f"<ansiyellow>⚠️ 即将清空当前会话 <b>{_esc(current_session)}</b> 的全部历史消息，清空后无法恢复。</ansiyellow>"))
+            print_formatted_text(HTML("确认请输入: <ansicyan>/clear-history y</ansicyan>"))
+        else:
+            try:
+                deleted = manager.clear_session_messages(current_session)
+            except Exception as exc:
+                print_formatted_text(HTML(f"<ansired>❌ 清空失败：{_esc(str(exc))}</ansired>"))
+            else:
+                with token_usage_lock:
+                    session_token_usage["latest_total"] = 0
+                    session_token_usage["latest_prompt"] = 0
+                    session_token_usage["latest_cached"] = 0
+                print_formatted_text(HTML(f"<ansigreen>✔ 已清空 {deleted} 条历史记录，上下文用量已重置（下一轮请求生效）。</ansigreen>"))
+                if app_instance:
+                    app_instance.invalidate()
+
+    elif cmd == "/persona":
+        # 人设设置（对齐 GUI 人设页）：智能体名称 / 对用户的称呼 / 人设文本；
+        # save_persona_settings 校验并持久化，保存即全局生效（下一轮请求读取）
+        from core.persona_settings import DEFAULT_AGENT_NAME, get_persona_settings, save_persona_settings, PersonaSettingsError
+        try:
+            persona_snapshot = get_persona_settings()
+        except Exception:
+            persona_snapshot = {"agent_name": DEFAULT_AGENT_NAME, "persona": "", "user_title": ""}
+        if len(parts) > 1:
+            sub = parts[1].lower()
+            # 值取原始文本剩余部分（保留大小写/空格/换行），避免 split 丢格式
+            value_match = re.match(r"^/persona\s+\S+\s?(.*)$", command_text, re.S)
+            value = (value_match.group(1) if value_match else "").strip()
+            try:
+                if sub == "name":
+                    if not value:
+                        print_formatted_text(HTML("<ansired>❌ 用法: /persona name &lt;新名称&gt;</ansired>"))
+                    else:
+                        save_persona_settings(value, persona_snapshot.get("persona", ""), persona_snapshot.get("user_title", ""))
+                        print_formatted_text(HTML(f"<ansigreen>✔ 智能体名称已改为 {_esc(value)}（下一轮请求生效）。</ansigreen>"))
+                elif sub == "title":
+                    if not value:
+                        print_formatted_text(HTML("<ansired>❌ 用法: /persona title &lt;对你的称呼&gt; （/persona title - 表示清除称呼）</ansired>"))
+                    else:
+                        new_title = "" if value == "-" else value
+                        save_persona_settings(persona_snapshot.get("agent_name", DEFAULT_AGENT_NAME), persona_snapshot.get("persona", ""), new_title)
+                        print_formatted_text(HTML("<ansigreen>✔ 称呼已更新（下一轮请求生效）。</ansigreen>"))
+                elif sub == "text":
+                    if not value:
+                        print_formatted_text(HTML("<ansired>❌ 用法: /persona text &lt;人设全文&gt;</ansired>"))
+                    else:
+                        save_persona_settings(persona_snapshot.get("agent_name", DEFAULT_AGENT_NAME), value, persona_snapshot.get("user_title", ""))
+                        print_formatted_text(HTML(f"<ansigreen>✔ 人设文本已保存（共 {len(value)} 字，下一轮请求生效，取代内置人设但保留安全规范）。</ansigreen>"))
+                elif sub == "reset":
+                    save_persona_settings(DEFAULT_AGENT_NAME, "", "")
+                    print_formatted_text(HTML("<ansigreen>✔ 人设已恢复默认。</ansigreen>"))
+                else:
+                    print_formatted_text(HTML("<ansired>❌ 未知子命令。用法: /persona [name|title|text|reset] [值]</ansired>"))
+            except PersonaSettingsError as exc:
+                print_formatted_text(HTML(f"<ansired>❌ {_esc(str(exc))}</ansired>"))
+        else:
+            persona_text = str(persona_snapshot.get("persona") or "")
+            if len(persona_text) > 400:
+                persona_display = persona_text[:200] + "\n    ……（中间省略）……\n    " + persona_text[-200:]
+            else:
+                persona_display = persona_text or "（未设置，使用内置人设）"
+            print_formatted_text(HTML("<b><ansicyan>当前人设设置：</ansicyan></b>"))
+            print_formatted_text(HTML(f"  智能体名称: {_esc(persona_snapshot.get('agent_name') or DEFAULT_AGENT_NAME)}"))
+            print_formatted_text(HTML(f"  对你的称呼: {_esc(persona_snapshot.get('user_title') or '（不使用特定称呼）')}"))
+            print_formatted_text(HTML(f"  人设文本（{len(persona_text)} 字）:\n    {_esc(persona_display)}"))
+            print_formatted_text(HTML("用法: <ansicyan>/persona name|title|text|reset</ansicyan>  例: /persona text &lt;人设全文&gt;"))
+
+    elif cmd == "/shell":
+        # 默认命令解释器选择（对齐 GUI 系统设置页），AI 命令/后台任务/内嵌终端统一生效
+        from core.command_shell import CommandShellError, list_command_shell_options, set_selected_command_shell
+        options = list_command_shell_options()
+        if len(parts) > 1:
+            shell_id = parts[1].strip()
+            matched = next((o for o in options if o["id"] == shell_id), None)
+            if matched is None:
+                allowed = "/".join(o["id"] for o in options)
+                print_formatted_text(HTML(f"<ansired>❌ 不支持的命令解释器: {_esc(shell_id)}（可选 {allowed}）</ansired>"))
+            elif not matched["available"]:
+                print_formatted_text(HTML(f"<ansired>❌ {matched['label']} 未安装或不在 Y-CODE 的 PATH 中，无法选择。</ansired>"))
+            else:
+                try:
+                    set_selected_command_shell(shell_id)
+                except CommandShellError as exc:
+                    print_formatted_text(HTML(f"<ansired>❌ {_esc(str(exc))}</ansired>"))
+                else:
+                    print_formatted_text(HTML(f"<ansigreen>✔ 默认命令解释器已切换为 {matched['label']}（{_esc(matched['id'])}），下一轮请求生效。</ansigreen>"))
+        else:
+            from core.command_shell import describe_selected_command_shell, get_selected_command_shell
+            current_shell_id = get_selected_command_shell()
+            print_formatted_text(HTML("<b><ansicyan>可选命令解释器：</ansicyan></b>"))
+            for o in options:
+                mark = "●" if o["available"] else "○"
+                current_mark = "<ansigreen>（当前）</ansigreen>" if o["id"] == current_shell_id else ""
+                reason = f" <ansigray>[{_esc(o['unavailable_reason'])}]</ansigray>" if not o["available"] else ""
+                print_formatted_text(HTML(f"  {mark} {_esc(o['id']):<12} {_esc(o['label'])} <ansigray>- {_esc(o['description'])}</ansigray>{reason} {current_mark}"))
+            print_formatted_text(HTML("用法: <ansicyan>/shell &lt;id&gt;</ansicyan>"))
+
+    elif cmd == "/open":
+        # 在系统中打开文件/目录（对齐 GUI open_path / open_folder_in_explorer）
+        raw = " ".join(parts[1:]).strip().strip('"').strip("'") if len(parts) > 1 else "."
+        from core.workspace_context import get_workdir
+        base_dir = get_workdir() or os.getcwd()
+        target_path = raw if os.path.isabs(raw) else os.path.join(base_dir, raw)
+        target_path = os.path.abspath(target_path)
+        if not os.path.exists(target_path):
+            print_formatted_text(HTML(f"<ansired>❌ 路径不存在: {_esc(target_path)}</ansired>"))
+        elif not hasattr(os, "startfile"):
+            print_formatted_text(HTML("<ansiyellow>ℹ 当前平台不支持在系统中打开（仅支持 Windows）。</ansiyellow>"))
+        else:
+            try:
+                os.startfile(target_path)  # noqa: S606 - 用户显式请求打开本地路径
+            except OSError as exc:
+                print_formatted_text(HTML(f"<ansired>❌ 打开失败：{_esc(str(exc))}</ansired>"))
 
     elif cmd == "/sandbox":
         # 沙盒开关：控制文件工具是否可访问当前工作目录之外的路径
@@ -3393,6 +3556,18 @@ def _make_input_app():
                                 value,
                                 start_position=-len(typed),
                                 display_meta="思考档位: " + label + (" (当前)" if is_current else ""),
+                            )
+                    return
+                # /shell 参数动态补全：列出探测到的命令解释器（未安装的带标记）
+                shell_arg = re.match(r'^/shell\s+(\S*)$', text)
+                if shell_arg is not None:
+                    typed = shell_arg.group(1)
+                    for opt_id, label, available in _command_shell_options_for_completion():
+                        if opt_id.startswith(typed.lower()):
+                            yield Completion(
+                                opt_id,
+                                start_position=-len(typed),
+                                display_meta="解释器: " + label + ("" if available else " (未安装)"),
                             )
                     return
                 word = document.get_word_before_cursor(WORD=True)
