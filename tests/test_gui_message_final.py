@@ -119,10 +119,20 @@ def _bare_turn_bridge(db=":memory:"):
     bridge._bg_summary_pending_sessions = set()
     bridge._bg_summary_lock = threading.Lock()
     bridge._turn_start_lock = threading.Lock()
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
     bridge._message_queues = {}
     bridge._delta_flusher = None
     bridge._current_permission_mode = "confirm"
     bridge._emit_token_usage = lambda: None
+    # 按回合撤销：worker 生命周期依赖真实服务；服务必须与 bridge._memory
+    # 共用同一连接（message_turn_links 的 FK 校验在同一个数据库里）
+    from core.turn_undo import service as _tu_service
+    import tempfile as _tempfile
+
+    _tu_service.configure_default_manager(
+        bridge._memory, blob_root=_tempfile.mkdtemp()
+    )
     return bridge
 
 
@@ -208,8 +218,6 @@ def test_worker_emits_message_final_for_current_turn_message(monkeypatch, tmp_pa
         "core.input_parser.parse_user_input", lambda text, **_kwargs: (text, [])
     )
     monkeypatch.setattr("core.agent_service.prepare_turn_messages", lambda *_a, **_k: [])
-    monkeypatch.setattr("core.memory.begin_turn_checkpoint", lambda *_a, **_k: None)
-    monkeypatch.setattr("core.memory.end_turn_checkpoint", lambda *_a, **_k: None)
     bridge._session_workdir = lambda _name: str(tmp_path)
     bridge._sync_active_model_context = lambda *_a: None
     bridge._recalc_token_usage = lambda *_a: None

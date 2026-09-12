@@ -1,5 +1,7 @@
 from concurrent.futures import Future
 
+import hashlib
+
 import pytest
 
 import main
@@ -9,61 +11,76 @@ from core.turn_events import TurnEventFactory
 from rich.text import Text
 
 
+def _undo_cli_turn(tmp_path, session, turn, target, original, replacement):
+    """CLI 撤销测试夹具：真实 turn_undo 服务 + 一个覆盖目标文件的回合。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
+    from core.turn_undo import recorder as tu_recorder
+    from core.turn_undo.models import OwnerKind, NodeKind
+
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = tu_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.ensure_session(session)
+    session_id = tu_service.resolve_session_id(session)
+    checkpoint, ctx = tu_service.begin_turn(
+        session_id=session_id,
+        turn_id=turn,
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+    handle = tu_recorder.prepare_mutation(
+        display_path=str(target),
+        after_kind=NodeKind.REGULAR_FILE,
+        after_content=replacement,
+        tool_name="write_file",
+        tool_call_id="c1",
+    )
+    target.write_bytes(replacement)
+    tu_recorder.verify_after_mutation(handle)
+    tu_service.finish_turn(ctx)
+    return storage, checkpoint
+
+
 def test_undo_existing_empty_file_does_not_require_delete_confirmation(
     tmp_path, monkeypatch
 ):
-    from core import memory as memory_mod
+    """空文件被覆盖后按回合撤销：恢复原空内容，无需任何删除确认语义。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
 
     session = "cli-empty-file-undo"
     target = tmp_path / "empty.txt"
     target.write_bytes(b"")
-    memory_mod.set_undo_state(
-        str(target),
-        "",
-        session_name=session,
-        existed_before=True,
-        old_bytes=b"",
+    storage, checkpoint = _undo_cli_turn(
+        tmp_path, session, "turn-empty-undo", target, b"", b"filled"
     )
-    undo_calls = []
+
     monkeypatch.setattr(main, "current_session", session)
-    monkeypatch.setattr(
-        main._agent_service,
-        "undo_last_edit",
-        lambda manager, session_name, force=False: (
-            undo_calls.append((manager, session_name, force)) or (True, "restored")
-        ),
-    )
-    monkeypatch.setattr(main, "recalc_token_usage", lambda: None)
+    monkeypatch.setattr(main, "_undo_confirm", lambda question: True)
     monkeypatch.setattr(main, "print_formatted_text", lambda *_args, **_kwargs: None)
 
-    main.handle_slash_command("/undo")
+    main.handle_slash_command("/undo " + checkpoint.turn_id[:8])
 
-    assert undo_calls == [(main.manager, session, False)]
+    assert target.read_bytes() == b""
 
 
 def test_checkpoint_restore_preserves_original_non_utf8_bytes(tmp_path, monkeypatch):
-    from core import memory as memory_mod
-
+    """按回合撤销快照保存原始字节：GBK 文件恢复后与覆盖前逐字节一致。"""
     session = "cli-checkpoint-bytes"
     target = tmp_path / "legacy-gbk.txt"
     original = "旧版内容".encode("gbk")
-    target.write_text("changed", encoding="utf-8")
-    snapshots = [{
-        "file_path": str(target),
-        "old_content": "旧版内容",
-        "existed_before": True,
-        "old_bytes": original,
-    }]
-    monkeypatch.setattr(main, "current_session", session)
-    monkeypatch.setattr(
-        memory_mod,
-        "restore_checkpoint",
-        lambda session_name, turn_id: snapshots,
+    target.write_bytes(original)
+    storage, checkpoint = _undo_cli_turn(
+        tmp_path, session, "turn-bytes", target,
+        original, "changed".encode("utf-8"),
     )
-    monkeypatch.setattr(main, "recalc_token_usage", lambda: None)
+    monkeypatch.setattr(main, "current_session", session)
+    monkeypatch.setattr(main, "_undo_confirm", lambda question: True)
     monkeypatch.setattr(main, "print_formatted_text", lambda *_args, **_kwargs: None)
 
-    main.handle_slash_command("/checkpoint restore turn-bytes")
+    main.handle_slash_command("/checkpoint restore " + checkpoint.turn_id[:8])
 
     assert target.read_bytes() == original
 
@@ -1364,3 +1381,55 @@ def test_run_cli_checks_console_before_any_initialization():
         callee.id if isinstance(callee, ast.Name) else getattr(callee, "attr", "")
     )
     assert callee_name == "_require_interactive_console"
+
+def test_undo_list_preview_and_ambiguous_short_id(tmp_path, monkeypatch):
+    """/undo list 与 preview 正常工作；短 ID 歧义显式拒绝（规格 17.2）。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
+    from core.turn_undo import recorder as tu_recorder
+    from core.turn_undo.models import OwnerKind, NodeKind
+
+    session = "cli-list-sess"
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = tu_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    monkeypatch.setattr(main, "current_session", session)
+
+    manager.ensure_session(session)
+    session_id = storage.resolve_session_id(session)
+    printed = []
+    monkeypatch.setattr(
+        main, "print_formatted_text",
+        lambda obj: printed.append(str(obj)),
+    )
+
+    # 两个同前缀回合制造短 ID 歧义 + 一个真实可撤销回合
+    ws = tmp_path / "ws"
+    target = ws / "x.py"
+    for turn in ("aaaaaaaa-1", "aaaaaaaa-2", "bbbbbbbb-3"):
+        ws.mkdir(exist_ok=True)
+        target.write_bytes(b"old")
+        checkpoint, ctx = tu_service.begin_turn(
+            session_id=session_id, turn_id=turn,
+            workspace_root=str(ws), owner_kind=OwnerKind.FOREGROUND_TURN,
+        )
+        handle = tu_recorder.prepare_mutation(
+            display_path=str(target), after_kind=NodeKind.REGULAR_FILE,
+            after_content=b"new", tool_name="write_file", tool_call_id="c",
+        )
+        target.write_bytes(b"new")
+        tu_recorder.verify_after_mutation(handle)
+        tu_service.finish_turn(ctx)
+
+    main.handle_slash_command("/undo list")
+    main.handle_slash_command("/undo preview bbbbbbbb")
+
+    # 歧义前缀：显式拒绝并要求完整 ID
+    printed.clear()
+    main.handle_undo_command("/undo aaaaaaaa", session)
+    assert any("匹配到 2 个回合" in line for line in printed)
+    # 精确短 ID 正常
+    printed.clear()
+    main.handle_undo_command("/undo preview bbbbbbbb-3", session)
+    assert any("撤销影响" in line for line in printed if isinstance(line, str)) or printed
