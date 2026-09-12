@@ -190,17 +190,18 @@ try:
     )
     main.handle_slash_command("/paste-image 功能测试说明")
     _q = drain_queue()
-    check("T8.1 剪贴板文件入队（含说明与路径）",
-          bool(_q) and "功能测试说明" in _q[0]["text"] and _png in _q[0]["text"],
-          _q[0]["text"][:80] if _q else "队列为空")
+    # 修复后：路径经队列条目 explicit_paths 通道传递，text 只保留说明
+    check("T8.1 剪贴板文件入队（explicit_paths 通道）",
+          bool(_q) and _q[0].get("text") == "功能测试说明" and _q[0].get("explicit_paths") == [_png],
+          str(_q[0])[:100] if _q else "队列为空")
 
     from core.input_parser import parse_user_input
     if _q:
-        _content, _notes = parse_user_input(_q[0]["text"])
+        _content, _notes = parse_user_input(_q[0]["text"], explicit_paths=_q[0]["explicit_paths"])
         _is_image = isinstance(_content, list) and any(
             isinstance(_p, dict) and _p.get("type") == "image_url" for _p in _content
         )
-        check("T8.2 端到端：组合文本产出视觉消息", _is_image,
+        check("T8.2 端到端：explicit_paths 产出视觉消息", _is_image,
               f"content 类型={type(_content).__name__}")
 except Exception as _exc:  # 剪贴板依赖桌面会话，失败不算功能缺陷，单测已覆盖
     check("T8 剪贴板链路（环境受限跳过）", True, f"{type(_exc).__name__}: {str(_exc)[:80]}")
@@ -269,10 +270,18 @@ else:
 clear_out()
 
 # ---------------------------------------------------------------------------
-# T11 /update（真实 Gitee 网络 check + install 无包路径；绝不执行 install y）
+# T11 /update（真实 Gitee 网络 check 异步 + install 无包路径；绝不执行 install y）
 # ---------------------------------------------------------------------------
+import time as _time  # noqa: E402
+
 main.handle_slash_command("/update")
-check("T11.1 check 真实网络请求", ("已是最新版本" in out()) or ("发现新版本" in out()) or ("检查更新失败" in out()),
+# 修复后 check 异步执行：轮询等待结果回填（最长 25 秒）
+_deadline = _time.time() + 25
+while _time.time() < _deadline:
+    if ("已是最新版本" in out()) or ("发现新版本" in out()) or ("检查更新失败" in out()):
+        break
+    _time.sleep(0.2)
+check("T11.1 check 真实网络请求（异步回填）", ("已是最新版本" in out()) or ("发现新版本" in out()) or ("检查更新失败" in out()),
       out()[:80])
 
 main.handle_slash_command("/update install")

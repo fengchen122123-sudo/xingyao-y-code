@@ -2360,38 +2360,60 @@ def _print_threadsafe(html_text: str) -> None:
     无循环（测试/特殊环境）时按当前线程直接打印。"""
     app = app_instance
     loop = getattr(app, "loop", None) if app is not None else None
-    if loop is not None:
-        loop.call_soon_threadsafe(print_formatted_text, HTML(html_text))
-    else:
+    if loop is None:
         print_formatted_text(HTML(html_text))
+        return
+    # 与 schedule_ui 同源的 closed-loop 防护：/models 等全屏选择器期间主 loop
+    # 已 close，此时调度会抛 RuntimeError 并从工作线程一路炸掉回调链（如下载线程），
+    # 静默丢弃即可——主界面恢复后下一帧进度会自然续上。
+    is_closed = getattr(loop, "is_closed", None)
+    if callable(is_closed) and is_closed():
+        return
+    try:
+        loop.call_soon_threadsafe(print_formatted_text, HTML(html_text))
+    except RuntimeError:
+        pass
 
 
 def _update_cmd_check() -> None:
-    from core.updater import fetch_latest_release, find_cached_installer
-    try:
-        info = fetch_latest_release()
-    except Exception as exc:
-        print_formatted_text(HTML(f"<ansired>❌ 检查更新失败：{_esc(str(exc))}</ansired>"))
-        return
+    # fetch_latest_release 网络超时最长 8 秒，必须放后台线程，否则冻结 UI；
+    # 结果统一经 _print_threadsafe 回主线程
+    from core.updater import fetch_latest_release
+    print_formatted_text(HTML("<ansigray>⏳ 正在检查更新…</ansigray>"))
+
+    def _worker():
+        try:
+            info = fetch_latest_release()
+        except Exception as exc:
+            _print_threadsafe(f"<ansired>❌ 检查更新失败：{_esc(str(exc))}</ansired>")
+            return
+        _print_threadsafe_update_check(info)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+def _print_threadsafe_update_check(info: dict) -> None:
+    """渲染检查结果（逐行经 _print_threadsafe 回主线程；测试可同步直调）。"""
     if not info.get("ok"):
-        print_formatted_text(HTML(f"<ansired>❌ {_esc(str(info.get('msg') or '检查更新失败'))}</ansired>"))
+        _print_threadsafe(f"<ansired>❌ {_esc(str(info.get('msg') or '检查更新失败'))}</ansired>")
         return
     current = str(info.get("current_version") or "")
     if not info.get("has_update"):
-        print_formatted_text(HTML(f"<ansigreen>✔ 已是最新版本（当前 v{_esc(current)}）。</ansigreen>"))
+        _print_threadsafe(f"<ansigreen>✔ 已是最新版本（当前 v{_esc(current)}）。</ansigreen>")
         return
+    from core.updater import find_cached_installer
     latest = str(info.get("latest_version") or "")
     size_mb = int(info.get("asset_size") or 0) / (1024 * 1024)
     split_mark = f" · 分卷 x{info.get('part_count')}" if info.get("is_split") else ""
-    print_formatted_text(HTML(
+    _print_threadsafe(
         f"<b><ansicyan>发现新版本 v{_esc(latest)}</ansicyan></b>（当前 v{_esc(current)}）"
         f" · 包大小约 {size_mb:.1f} MB{split_mark}"
-    ))
+    )
     notes = str(info.get("release_notes") or "").strip()
     if notes:
-        print_formatted_text(HTML("<ansigray>更新日志（节选）：</ansigray>"))
+        _print_threadsafe("<ansigray>更新日志（节选）：</ansigray>")
         for line in notes.splitlines()[:40]:
-            print_formatted_text(HTML(f"  {_esc(line)}"))
+            _print_threadsafe(f"  {_esc(line)}")
     cached = ""
     try:
         cached = find_cached_installer(
@@ -2400,74 +2422,86 @@ def _update_cmd_check() -> None:
     except Exception:
         cached = ""
     if cached:
-        print_formatted_text(HTML(f"<ansigreen>✔ 检测到已下载的安装包，可直接安装：</ansigreen> {_esc(cached)}"))
-        print_formatted_text(HTML("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 Y-CODE）。"))
+        _print_threadsafe(f"<ansigreen>✔ 检测到已下载的安装包，可直接安装：</ansigreen> {_esc(cached)}")
+        _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 Y-CODE）。")
     else:
-        print_formatted_text(HTML("  输入 <ansicyan>/update download</ansicyan> 开始下载。"))
+        _print_threadsafe("  输入 <ansicyan>/update download</ansicyan> 开始下载。")
 
 
 def _update_cmd_download() -> None:
-    from core.updater import fetch_latest_release
     downloader = _get_update_downloader()
     if downloader.is_downloading():
         print_formatted_text(HTML("<ansiyellow>ℹ 已有下载任务进行中，/update cancel 可取消。</ansiyellow>"))
         return
-    try:
-        info = fetch_latest_release()
-    except Exception as exc:
-        print_formatted_text(HTML(f"<ansired>❌ 检查更新失败：{_esc(str(exc))}</ansired>"))
-        return
-    if not info.get("ok") or not info.get("has_update"):
-        print_formatted_text(HTML(f"<ansigreen>✔ 已是最新版本（当前 v{_esc(str(info.get('current_version') or ''))}），无需下载。</ansigreen>"))
-        return
-    version = str(info.get("latest_version") or "")
-    part_urls = [str(u) for u in (info.get("part_urls") or []) if str(u).strip()]
-    progress_bucket = {"last": -1}
+    from core.updater import fetch_latest_release
+    print_formatted_text(HTML("<ansigray>⏳ 正在获取版本信息…</ansigray>"))
 
-    def _on_progress(data):
-        # downloader 工作线程：只经 _print_threadsafe 回主线程，按 10% 步进防刷屏
+    def _worker():
         try:
-            percent = int(data.get("percent") or 0)
-        except Exception:
-            percent = 0
-        bucket = percent // 10
-        if bucket > progress_bucket["last"]:
-            progress_bucket["last"] = bucket
-            _print_threadsafe(f"<ansigray>  下载进度 {min(percent, 100)}%</ansigray>")
+            info = fetch_latest_release()
+        except Exception as exc:
+            _print_threadsafe(f"<ansired>❌ 检查更新失败：{_esc(str(exc))}</ansired>")
+            return
+        if not info.get("ok"):
+            # 网络失败必须显式报错，不得并入"已是最新版本"（代码审查 Important #1）
+            _print_threadsafe(f"<ansired>❌ {_esc(str(info.get('msg') or '检查更新失败'))}</ansired>")
+            return
+        if not info.get("has_update"):
+            _print_threadsafe(f"<ansigreen>✔ 已是最新版本（当前 v{_esc(str(info.get('current_version') or ''))}），无需下载。</ansigreen>")
+            return
+        version = str(info.get("latest_version") or "")
+        part_urls = [str(u) for u in (info.get("part_urls") or []) if str(u).strip()]
+        progress_bucket = {"last": -1}
 
-    def _on_complete(dest_path):
-        _last_update_installer["path"] = str(dest_path)
-        _print_threadsafe(f"<ansigreen>✔ 安装包下载完成：{_esc(str(dest_path))}</ansigreen>")
-        _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 Y-CODE）。")
+        def _on_progress(data):
+            # downloader 工作线程：只经 _print_threadsafe 回主线程，按 10% 步进防刷屏
+            try:
+                percent = int(data.get("percent") or 0)
+            except Exception:
+                percent = 0
+            bucket = percent // 10
+            if bucket > progress_bucket["last"]:
+                progress_bucket["last"] = bucket
+                _print_threadsafe(f"<ansigray>  下载进度 {min(percent, 100)}%</ansigray>")
 
-    def _on_error(message):
-        _print_threadsafe(f"<ansired>❌ 下载失败：{_esc(str(message))}</ansired>")
+        def _on_complete(dest_path):
+            _last_update_installer["path"] = str(dest_path)
+            _print_threadsafe(f"<ansigreen>✔ 安装包下载完成：{_esc(str(dest_path))}</ansigreen>")
+            _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 Y-CODE）。")
 
-    started = downloader.start_download(
-        download_url=str(info.get("download_url") or ""),
-        target_version=version,
-        on_progress=_on_progress,
-        on_complete=_on_complete,
-        on_error=_on_error,
-        part_urls=part_urls,
-        expected_sha256=str(info.get("sha256") or "").strip().lower(),
-        total_size_hint=int(info.get("asset_size") or 0),
-    )
-    if started:
-        print_formatted_text(HTML(
-            f"<ansicyan>⬇ 已开始下载 v{_esc(version)}"
-            "（进度按 10% 步进打印，/update cancel 可取消）。</ansicyan>"
-        ))
-    else:
-        print_formatted_text(HTML("<ansired>❌ 未能启动下载（可能已有任务在进行中）。</ansired>"))
+        def _on_error(message):
+            _print_threadsafe(f"<ansired>❌ 下载失败：{_esc(str(message))}</ansired>")
+
+        started = downloader.start_download(
+            download_url=str(info.get("download_url") or ""),
+            target_version=version,
+            on_progress=_on_progress,
+            on_complete=_on_complete,
+            on_error=_on_error,
+            part_urls=part_urls,
+            expected_sha256=str(info.get("sha256") or "").strip().lower(),
+            total_size_hint=int(info.get("asset_size") or 0),
+        )
+        if started:
+            _print_threadsafe(
+                f"<ansicyan>⬇ 已开始下载 v{_esc(version)}"
+                "（进度按 10% 步进打印，/update cancel 可取消）。</ansicyan>"
+            )
+        else:
+            _print_threadsafe("<ansired>❌ 未能启动下载（可能已有任务在进行中）。</ansired>")
+
+    threading.Thread(target=_worker, daemon=True).start()
 
 
 def _update_cmd_install(args: list) -> None:
     from core.updater import fetch_latest_release, find_cached_installer, launch_installer
-    # 支持两种顺序：/update install y（默认路径确认）与 /update install <路径> y
+    # 支持两种顺序：/update install y（默认路径确认）与 /update install <路径> y；
+    # 路径支持引号包裹（含空格路径），与 /open 同口径
     tokens = [str(t or "").strip() for t in args if str(t or "").strip()]
     confirmed = any(t.lower() in ("y", "yes", "--force") for t in tokens)
-    path = " ".join(t for t in tokens if t.lower() not in ("y", "yes", "--force")).strip()
+    path = " ".join(
+        t.strip('"').strip("'") for t in tokens if t.lower() not in ("y", "yes", "--force")
+    ).strip()
     if not path:
         path = _last_update_installer["path"]
     if not path:
@@ -2514,6 +2548,14 @@ def _update_cmd_install(args: list) -> None:
 
         def _exit_soon():
             time.sleep(0.8)
+            # 先优雅退出 prompt_toolkit 事件循环恢复终端状态，再兜底硬退出
+            #（对齐 GUI _delayed_exit 的收尾顺序）
+            try:
+                app = app_instance
+                if app is not None:
+                    app.exit()
+            except Exception:
+                pass
             os._exit(0)
 
         threading.Thread(target=_exit_soon, daemon=True).start()
@@ -2785,6 +2827,10 @@ def handle_slash_command(command_text):
                 print_formatted_text(HTML(f"<ansired>❌ {_esc(message)}</ansired>"))
         elif snapshot_error:
             print_formatted_text(HTML(f"<ansired>❌ {_esc(snapshot_error)}</ansired>"))
+        elif model is None:
+            # 激活模型 id 残留但配置里已删该模型：按"未找到模型"提示而非笼统的
+            # "未声明思考能力"（代码审查 Minor #7）
+            print_formatted_text(HTML(f"<ansired>❌ 未在配置中找到激活模型（id: {_esc(str(active_id))}），请用 /models 重新选择。</ansired>"))
         elif not snapshot["visible"]:
             print_formatted_text(HTML("<ansiyellow>ℹ 当前模型未声明思考模式调节能力。</ansiyellow>"))
         elif snapshot["disabled"]:
@@ -2794,10 +2840,10 @@ def handle_slash_command(command_text):
             current = snapshot["choice"]
             current_label = next((o["label"] for o in snapshot["options"] if o["value"] == current), current)
             marks = "  ".join(
-                f"{'●' if o['value'] == current else '○'} {o['value']}({o['label']})"
+                f"{'●' if o['value'] == current else '○'} {_esc(o['value'])}({_esc(o['label'])})"
                 for o in snapshot["options"]
             )
-            print_formatted_text(HTML(f"<b><ansicyan>当前模型思考模式: {current_label} ({_esc(current)})</ansicyan></b>"))
+            print_formatted_text(HTML(f"<b><ansicyan>当前模型思考模式: {_esc(current_label)} ({_esc(current)})</ansicyan></b>"))
             print_formatted_text(HTML(f"  可选档位: {marks}"))
             print_formatted_text(HTML("用法: <ansiyellow>/effort &lt;档位&gt;</ansiyellow>  (default = 恢复模型默认，下一轮请求生效)"))
 
@@ -2883,17 +2929,17 @@ def handle_slash_command(command_text):
             shell_id = parts[1].strip()
             matched = next((o for o in options if o["id"] == shell_id), None)
             if matched is None:
-                allowed = "/".join(o["id"] for o in options)
+                allowed = _esc("/".join(o["id"] for o in options))
                 print_formatted_text(HTML(f"<ansired>❌ 不支持的命令解释器: {_esc(shell_id)}（可选 {allowed}）</ansired>"))
             elif not matched["available"]:
-                print_formatted_text(HTML(f"<ansired>❌ {matched['label']} 未安装或不在 Y-CODE 的 PATH 中，无法选择。</ansired>"))
+                print_formatted_text(HTML(f"<ansired>❌ {_esc(matched['label'])} 未安装或不在 Y-CODE 的 PATH 中，无法选择。</ansired>"))
             else:
                 try:
                     set_selected_command_shell(shell_id)
                 except CommandShellError as exc:
                     print_formatted_text(HTML(f"<ansired>❌ {_esc(str(exc))}</ansired>"))
                 else:
-                    print_formatted_text(HTML(f"<ansigreen>✔ 默认命令解释器已切换为 {matched['label']}（{_esc(matched['id'])}），下一轮请求生效。</ansigreen>"))
+                    print_formatted_text(HTML(f"<ansigreen>✔ 默认命令解释器已切换为 {_esc(matched['label'])}（{_esc(matched['id'])}），下一轮请求生效。</ansigreen>"))
         else:
             from core.command_shell import describe_selected_command_shell, get_selected_command_shell
             current_shell_id = get_selected_command_shell()
@@ -2925,23 +2971,26 @@ def handle_slash_command(command_text):
     elif cmd == "/queue":
         # 排队消息管理（对齐 GUI 排队条的 list/cancel/clear；插队依赖完整取消链路，
         # 按实施计划列为后续）。queue.Queue 不可遍历：UI 线程内 get_nowait 全量取出
-        # → 处理 → 按原序回填；Enter 处理器是唯一 put 方且命令在 UI 线程同步执行，
-        # 无并发窗口。
+        # → 处理 → 按原序回填。put 方有两个（代码审查 Important #3 修正）：
+        # Enter 处理器的用户消息 + _deferred_summary_check 守护线程的
+        # __ycode_internal__ 自动汇总指令（is_internal: True）——后者不参与序号
+        # 编排与 cancel/clear，回填时原位保留，避免后台任务汇总被静默丢弃。
         queued = []
         while True:
             try:
                 queued.append(msg_queue.get_nowait())
             except queue.Empty:
                 break
+        user_queued = [item for item in queued if not item.get("is_internal")]
         sub = parts[1].lower() if len(parts) > 1 else "list"
         if sub == "list":
             for item in queued:
                 msg_queue.put(item)
-            if not queued:
+            if not user_queued:
                 print_formatted_text(HTML("<ansiyellow>ℹ 当前没有排队中的消息。</ansiyellow>"))
             else:
-                print_formatted_text(HTML(f"<b><ansicyan>排队中的消息（{len(queued)} 条）：</ansicyan></b>"))
-                for idx, item in enumerate(queued, 1):
+                print_formatted_text(HTML(f"<b><ansicyan>排队中的消息（{len(user_queued)} 条）：</ansicyan></b>"))
+                for idx, item in enumerate(user_queued, 1):
                     preview = str(item.get("text", "")).replace("\n", " ")[:60]
                     kind = "技能" if item.get("is_skill_call") else "消息"
                     session_mark = str(item.get("session") or "?")
@@ -2951,32 +3000,50 @@ def handle_slash_command(command_text):
                 target_idx = int(parts[2])
             except ValueError:
                 target_idx = 0
-            if not queued:
-                print_formatted_text(HTML("<ansiyellow>ℹ 当前没有排队中的消息。</ansiyellow>"))
-            elif 1 <= target_idx <= len(queued):
-                removed = queued.pop(target_idx - 1)
+            if not user_queued:
                 for item in queued:
+                    msg_queue.put(item)
+                print_formatted_text(HTML("<ansiyellow>ℹ 当前没有排队中的消息。</ansiyellow>"))
+            elif 1 <= target_idx <= len(user_queued):
+                kept = []
+                user_seen = 0
+                removed = None
+                for item in queued:
+                    if not item.get("is_internal"):
+                        user_seen += 1
+                        if user_seen == target_idx:
+                            removed = item
+                            continue
+                    kept.append(item)
+                for item in kept:
                     msg_queue.put(item)
                 preview = str(removed.get("text", "")).replace("\n", " ")[:60]
                 print_formatted_text(HTML(f"<ansigreen>✔ 已取消排队消息 {target_idx}：{_esc(preview)}</ansigreen>"))
             else:
                 for item in queued:
                     msg_queue.put(item)
-                print_formatted_text(HTML(f"<ansired>❌ 序号超出范围（当前共 {len(queued)} 条），用 /queue list 查看。</ansired>"))
+                print_formatted_text(HTML(f"<ansired>❌ 序号超出范围（当前共 {len(user_queued)} 条），用 /queue list 查看。</ansired>"))
         elif sub == "clear":
-            print_formatted_text(HTML(f"<ansigreen>✔ 已清空 {len(queued)} 条排队消息。</ansigreen>"))
+            # 只清用户消息；内部汇总指令原位保留（丢弃会让后台任务汇总无声丢失）
+            for item in queued:
+                if item.get("is_internal"):
+                    msg_queue.put(item)
+            note = f"（另有 {len(queued) - len(user_queued)} 条系统内部消息已保留）" if len(queued) > len(user_queued) else ""
+            print_formatted_text(HTML(f"<ansigreen>✔ 已清空 {len(user_queued)} 条排队消息。{note}</ansigreen>"))
         else:
             for item in queued:
                 msg_queue.put(item)
             print_formatted_text(HTML("<ansired>❌ 用法: /queue [list|cancel &lt;序号&gt;|clear]</ansired>"))
 
     elif cmd == "/paste-image":
-        # 剪贴板图片发送（对齐 GUI 粘贴图片）：抓取剪贴板 → 存临时 png →
-        # 把绝对路径嵌进消息文本按普通消息入队；parse_user_input 第 2 步会自动
-        # 提取盘符绝对路径并走压缩/视觉管线（core/input_parser.py），零管线改动。
-        # headless 模式不经过 handle_slash_command，无需专门拦截。
-        note = command_text[len("/paste-image"):].strip()
-        composed = ""
+        # 剪贴板图片发送（对齐 GUI 粘贴图片）：抓取剪贴板 → 图片存临时 png（或
+        # 直接取文件路径列表）→ 经队列条目 explicit_paths 字段挂载，worker 侧走
+        # parse_user_input 的显式附件通道（压缩/视觉管线不变）。
+        # 不再把路径嵌进消息文本：input_parser 的文本路径提取不认含空格路径，
+        # 用户名带空格的机器上会静默丢图（审查 Important #4）。
+        # 临时文件不主动清理，交由系统临时目录自管（已知取舍，见实施计划第 8 节）。
+        note = command_text[len("/paste-image"):].strip() or "（剪贴板图片）"
+        explicit_paths = []
         try:
             from PIL import ImageGrab
         except Exception:
@@ -2990,7 +3057,7 @@ def handle_slash_command(command_text):
                 import tempfile
                 if isinstance(grabbed, list) and grabbed:
                     # 剪贴板里是文件路径列表（复制文件场景）：直接作为附件路径
-                    composed = (note + "\n" + "\n".join(str(p) for p in grabbed)).strip()
+                    explicit_paths = [str(p) for p in grabbed if str(p).strip()]
                 elif grabbed is not None:
                     try:
                         fd, tmp_path = tempfile.mkstemp(prefix="ycode_clip_", suffix=".png")
@@ -2999,20 +3066,21 @@ def handle_slash_command(command_text):
                     except Exception as exc:
                         print_formatted_text(HTML(f"<ansired>❌ 剪贴板图片保存失败：{_esc(str(exc))}</ansired>"))
                     else:
-                        composed = (note + "\n" + tmp_path).strip()
+                        explicit_paths = [tmp_path]
                 else:
                     print_formatted_text(HTML("<ansiyellow>ℹ 剪贴板中没有图片。</ansiyellow>"))
-        if composed:
+        if explicit_paths:
             was_queued = is_thinking
-            safe_note = _esc(note.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
+            safe_note = _esc(note)
             if was_queued:
                 _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> <ansigray>(排队等待中...) [剪贴板图片] {safe_note}</ansigray>")
             else:
                 _echo_user_input(f"✨ <b><cyan>You &gt;</cyan></b> [剪贴板图片] {safe_note}")
             msg_queue.put({
-                "text": composed,
+                "text": note,
                 "was_queued": was_queued,
                 "session": current_session,
+                "explicit_paths": explicit_paths,
             })
 
     elif cmd == "/update":
@@ -4726,7 +4794,11 @@ def _background_worker():
                 else:
                     parsed_content = instruction + parsed_content
             else:
-                parsed_content, attached_msgs = parse_user_input(user_input)
+                # /paste-image 等来源会在队列条目携带显式附件路径（用户明确授权，
+                # 不受沙盒越界限制），经 parse_user_input 的 explicit_paths 通道
+                # 挂载——不依赖文本内路径提取，含空格路径也不会丢（审查 Important #4）
+                explicit_paths = task_data.get("explicit_paths") or None
+                parsed_content, attached_msgs = parse_user_input(user_input, explicit_paths=explicit_paths)
                 # 在终端打印挂载的文件提示
                 for msg in attached_msgs:
                     schedule_ui(lambda message=_esc(msg): print_formatted_text(
