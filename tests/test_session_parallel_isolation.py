@@ -153,40 +153,6 @@ def test_plan_managers_isolated_between_parallel_sessions(tmp_path):
     assert plan_file_b.exists()
 
 
-def test_undo_state_routes_to_parallel_gui_thread_sessions(tmp_path):
-    """GUI 回合只绑定 app_context 时，undo 记录仍须按线程会话隔离。"""
-    from core import memory as memory_module
-
-    dir_a, dir_b = tmp_path / "undo-a", tmp_path / "undo-b"
-    dir_a.mkdir()
-    dir_b.mkdir()
-    barrier = threading.Barrier(2)
-    results = {}
-
-    def _record(path, old_content):
-        def _fn():
-            memory_module.clear_undo_session()
-            memory_module.set_undo_state(str(path), old_content)
-            barrier.wait(timeout=30)
-            return memory_module.get_undo_state()
-        return _fn
-
-    run_a = start_session_worker(
-        "gui-undo-A", dir_a, _record(dir_a / "a.txt", "old-a"), results, "A"
-    )
-    run_b = start_session_worker(
-        "gui-undo-B", dir_b, _record(dir_b / "b.txt", "old-b"), results, "B"
-    )
-    join_workers(run_a, run_b)
-
-    assert results["A"][0] == "ok", results["A"]
-    assert results["B"][0] == "ok", results["B"]
-    assert results["A"][1]["old_content"] == "old-a"
-    assert results["B"][1]["old_content"] == "old-b"
-    assert memory_module.get_undo_state("gui-undo-A")["old_content"] == "old-a"
-    assert memory_module.get_undo_state("gui-undo-B")["old_content"] == "old-b"
-
-
 def test_plan_isolated_between_sessions_in_same_directory(tmp_path):
     """同一目录下的两个会话（GUI 多会话打开同一项目）计划互不可见。
 

@@ -1,4 +1,5 @@
 import pytest
+import hashlib
 import json
 import threading
 import time
@@ -361,12 +362,30 @@ def test_foreground_subagent_waits_and_returns_public_result():
 
 
 def test_subagent_write_is_recorded_in_parent_turn_checkpoint(tmp_path, monkeypatch):
-    from core.memory import begin_turn_checkpoint, end_turn_checkpoint
+    """前台子代理的文件写入应归入父回合的持久化撤销检查点（规格 9.2）。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as turn_undo_service
+    from core.turn_undo import recorder as turn_undo_recorder
+    from core.turn_undo.models import OwnerKind, NodeKind
 
     monkeypatch.chdir(tmp_path)
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    turn_undo_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.add_messages("checkpoint-session", [("user", "hi")])
+    session_id = turn_undo_service.get_default_storage().resolve_session_id(
+        "checkpoint-session"
+    )
+    checkpoint, ctx = turn_undo_service.begin_turn(
+        session_id=session_id,
+        turn_id="checkpoint-turn",
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+
     target = tmp_path / "subagent-owned.txt"
     target.write_bytes(b"before")
-    begin_turn_checkpoint("checkpoint-session", "checkpoint-turn", 0)
 
     def runner(_record):
         assert "写入成功" in write_file(str(target), "after")
@@ -380,54 +399,19 @@ def test_subagent_write_is_recorded_in_parent_turn_checkpoint(tmp_path, monkeypa
             timeout_seconds=30,
         )
     finally:
-        checkpoint = end_turn_checkpoint()
+        status = turn_undo_service.finish_turn(ctx)
 
     assert result == "子代理写入完成"
-    assert checkpoint["file_snapshots"] == [{
-        "file_path": str(target),
-        "old_content": "before",
-        "existed_before": True,
-        "old_bytes": b"before",
-    }]
-
-
-def test_completed_parent_checkpoint_rejects_late_subagent_snapshot(tmp_path):
-    from core.memory import (
-        begin_turn_checkpoint,
-        bind_turn_checkpoint,
-        clear_turn_checkpoint_binding,
-        end_turn_checkpoint,
-        record_file_snapshot_for_current_turn,
-    )
-
-    bound = threading.Event()
-    continue_after_parent_commit = threading.Event()
-    begin_turn_checkpoint("late-session", "late-turn", 0)
-
-    def late_subagent():
-        try:
-            assert bind_turn_checkpoint("late-session", "late-turn") is True
-            bound.set()
-            assert continue_after_parent_commit.wait(timeout=10)
-            record_file_snapshot_for_current_turn(
-                str(tmp_path / "late.txt"),
-                "before",
-                existed_before=True,
-                old_bytes=b"before",
-            )
-        finally:
-            clear_turn_checkpoint_binding()
-
-    thread = threading.Thread(target=late_subagent, daemon=True)
-    thread.start()
-    assert bound.wait(timeout=10)
-    checkpoint = end_turn_checkpoint()
-    continue_after_parent_commit.set()
-    thread.join(timeout=10)
-
-    assert not thread.is_alive()
-    assert checkpoint["file_snapshots"] == []
-
+    assert status.value == "ready"
+    files = turn_undo_service.get_default_storage().list_files(checkpoint.checkpoint_id)
+    assert len(files) == 1
+    row = files[0]
+    assert row.display_path == "subagent-owned.txt"
+    assert row.before_sha256 == hashlib.sha256(b"before").hexdigest()
+    assert row.after_sha256 == hashlib.sha256(b"after").hexdigest()
+    assert row.verified_at_ms is not None
+    # 子代理（借记录权线程）的写入必须严格标记为 subagent 来源（规格 5.4）
+    assert row.last_source_kind == "subagent"
 
 def test_subagent_records_role_and_plan_item():
     manager = SubagentManager(runner=lambda record: "完成")
@@ -1579,23 +1563,17 @@ def test_edit_file_rejects_non_unique_target(tmp_path, monkeypatch):
 
 
 def test_edit_file_failure_does_not_pollute_undo_stack(tmp_path, monkeypatch):
-    import core.memory as memory_module
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "undo.py"
     target.write_text("alpha\n", encoding="utf-8")
-    captured = []
-    monkeypatch.setattr(
-        memory_module,
-        "set_undo_state",
-        lambda file_path, content: captured.append((file_path, content)),
-    )
 
     result = edit_file("undo.py", "不存在的片段", "beta")
 
     assert result.startswith("🚨")
-    assert captured == []
+    # 失败编辑不得改动文件（因此也不产生任何可撤销记录）
+    assert target.read_text(encoding="utf-8") == "alpha\n"
 
 
 def test_edit_file_preserves_gbk_encoding_and_crlf(tmp_path, monkeypatch):
@@ -2891,50 +2869,60 @@ def test_edit_file_by_lines_no_change_returns_error(tmp_path, monkeypatch):
 
 
 def test_edit_file_by_lines_writes_undo_stack(tmp_path, monkeypatch):
-    """行号路径成功时应写入撤销栈（与字符串路径行为一致）。"""
-    import core.memory as memory_module
+    """行号路径成功时应写入按回合撤销记录（与字符串路径行为一致）。"""
+    import hashlib
+
+    from core.memory import MemoryManager
     from core.tools import edit_file
+    from core.turn_undo import service as turn_undo_service
+    from core.turn_undo.models import OwnerKind
 
     monkeypatch.chdir(tmp_path)
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = turn_undo_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.add_messages("undo-sess", [("user", "hi")])
+    session_id = storage.resolve_session_id("undo-sess")
+    checkpoint, ctx = turn_undo_service.begin_turn(
+        session_id=session_id,
+        turn_id="undo-turn-lines",
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+
     target = tmp_path / "undo.py"
     # 用 write_bytes 确保 LF 换行，避免 Windows write_text 默认转 CRLF
     target.write_bytes(b"original\n")
-    captured = []
-    monkeypatch.setattr(
-        memory_module,
-        "set_undo_state",
-        lambda file_path, content: captured.append((file_path, content)),
-    )
 
-    result = edit_file("undo.py", replacement_content="modified", start_line=1, end_line=1)
+    try:
+        result = edit_file(
+            "undo.py", replacement_content="modified", start_line=1, end_line=1
+        )
+    finally:
+        turn_undo_service.finish_turn(ctx)
 
     assert result.startswith("✔")
-    assert len(captured) == 1
-    undo_file, undo_content = captured[0]
-    assert undo_file == "undo.py"
-    assert undo_content == "original\n"  # 撤销栈保存的是修改前的内容
+    files = storage.list_files(checkpoint.checkpoint_id)
+    assert len(files) == 1
+    row = files[0]
+    assert row.before_sha256 == hashlib.sha256(b"original\n").hexdigest()
+    assert row.after_sha256 == hashlib.sha256(b"modified\n").hexdigest()
+    assert row.verified_at_ms is not None
 
 
 def test_edit_file_by_lines_failed_validation_does_not_pollute_undo_stack(tmp_path, monkeypatch):
-    """行号路径校验失败时不应写入撤销栈。"""
-    import core.memory as memory_module
+    """行号路径校验失败时不应产生任何可撤销记录或文件改动。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "safe.txt"
     target.write_text("a\nb\n", encoding="utf-8")
-    captured = []
-    monkeypatch.setattr(
-        memory_module,
-        "set_undo_state",
-        lambda file_path, content: captured.append((file_path, content)),
-    )
 
     # start_line 越界，应失败且不写撤销栈
     result = edit_file("safe.txt", replacement_content="new", start_line=100, end_line=200)
 
     assert result.startswith("🚨")
-    assert captured == []
     assert target.read_text(encoding="utf-8") == "a\nb\n"  # 文件未被修改
 
 
@@ -3413,19 +3401,12 @@ def test_smart_replace_rejects_low_similarity_candidate(tmp_path, monkeypatch):
 
 
 def test_edit_file_write_failure_does_not_pollute_undo_stack(tmp_path, monkeypatch):
-    """Low：写入失败（os.replace 异常）时撤销栈不被提前污染。"""
-    import core.memory as memory_module
+    """Low：写入失败（os.replace 异常）时计划记录被回滚，文件不变。"""
     from core.tools import edit_file
 
     monkeypatch.chdir(tmp_path)
     target = tmp_path / "undo2.py"
     target.write_text("alpha\n", encoding="utf-8")
-    captured = []
-    monkeypatch.setattr(
-        memory_module,
-        "set_undo_state",
-        lambda file_path, content: captured.append((file_path, content)),
-    )
 
     def failing_replace(*args, **kwargs):
         raise OSError("disk full")
@@ -3435,7 +3416,6 @@ def test_edit_file_write_failure_does_not_pollute_undo_stack(tmp_path, monkeypat
     result = edit_file("undo2.py", "alpha", "beta")
 
     assert result.startswith("🚨")
-    assert captured == []
     assert target.read_text(encoding="utf-8") == "alpha\n"
 
 

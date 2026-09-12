@@ -1,3 +1,4 @@
+import hashlib
 import json
 import threading
 from dataclasses import FrozenInstanceError
@@ -241,9 +242,25 @@ def test_denied_write_file_returns_exact_message_without_mutating(tmp_path, monk
 
 
 def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
-    from core.memory import get_undo_state, set_undo_session
+    """批准的 write_file 在活动回合内产生按回合撤销记录并推送 diff 事件。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as turn_undo_service
+    from core.turn_undo.models import OwnerKind
 
     monkeypatch.chdir(tmp_path)
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = turn_undo_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.add_messages("tool-pipeline-write", [("user", "hi")])
+    session_id = storage.resolve_session_id("tool-pipeline-write")
+    checkpoint, ctx = turn_undo_service.begin_turn(
+        session_id=session_id,
+        turn_id="turn-pipeline-write",
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+
     target = tmp_path / "approved.txt"
     target.write_bytes(b"old\n")
     events = []
@@ -252,16 +269,16 @@ def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
         "authorize_tool_call",
         lambda *_args, **_kwargs: _authorization(True),
     )
-    set_undo_session("tool-pipeline-write")
     try:
         result = _call(
             "write_file",
             {"file_path": str(target), "content": "new\n"},
             event_callback=lambda kind, payload: events.append((kind, payload)),
         )
-        undo = get_undo_state("tool-pipeline-write")
     finally:
-        set_undo_session(None)
+        from core.turn_undo.models import TurnUndoStatus
+
+        assert turn_undo_service.finish_turn(ctx) is TurnUndoStatus.READY
 
     assert result == {
         "role": "tool",
@@ -270,12 +287,12 @@ def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
         "content": f"已成功将内容写入文件：{target}，并已向用户展示 Diff。",
     }
     assert target.read_bytes() == b"new\n"
-    assert undo == {
-        "file_path": str(target),
-        "old_content": "old\n",
-        "existed_before": True,
-        "old_bytes": b"old\n",
-    }
+    files = storage.list_files(checkpoint.checkpoint_id)
+    assert len(files) == 1
+    row = files[0]
+    assert row.before_sha256 == hashlib.sha256(b"old\n").hexdigest()
+    assert row.after_sha256 == hashlib.sha256(b"new\n").hexdigest()
+    assert row.verified_at_ms is not None
     assert len(events) == 1
     assert events[0][0] == "diff_ready"
     assert events[0][1]["tool_call_id"] == "call-1"
@@ -286,73 +303,11 @@ def test_approved_write_file_records_undo_and_emits_diff(tmp_path, monkeypatch):
     assert events[0][1]["removed"] == 1
 
 
-def test_injected_write_file_adapter_records_new_file_as_not_preexisting(
-    tmp_path, monkeypatch
-):
-    from core.harness.tool_adapters import ToolAdapterSet
-    from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
-    from core.memory import get_undo_state, set_undo_session
-
-    monkeypatch.chdir(tmp_path)
-    target = tmp_path / "created-by-override.txt"
-
-    def fake_write(file_path, content):
-        Path(file_path).write_text(content, encoding="utf-8")
-        return "ok"
-
-    registry = ToolRegistry([ToolSpec(
-        name="write_file",
-        description="write",
-        input_schema={"type": "object"},
-        execute=lambda **_kwargs: ToolResult("must-not-run"),
-        mutates_files=True,
-    )])
-    context = ToolExecutionContext(
-        event_callback=None,
-        parent_session=None,
-        parent_turn_id=None,
-        cancel_event=None,
-        allow_subagents=True,
-        permission_owner=None,
-        permission_source="主代理",
-        permission_checker=lambda *_args, **_kwargs: True,
-        registry=registry,
-        mcp_manager=object(),
-    )
-    pipeline = ToolPipeline(
-        adapters=ToolAdapterSet(
-            write_file=fake_write,
-            show_file_diff=lambda *_args, **_kwargs: None,
-        ),
-        plan_turn_checker=lambda _turn_id: False,
-        pending_plan_checker=lambda _session_id: False,
-    )
-    set_undo_session("adapter-override-new-file")
-    try:
-        pipeline.execute_one({
-            "id": "call-override",
-            "function": {
-                "name": "write_file",
-                "arguments": json.dumps({
-                    "file_path": str(target),
-                    "content": "new",
-                }),
-            },
-        }, context)
-        undo = get_undo_state("adapter-override-new-file")
-    finally:
-        set_undo_session(None)
-
-    assert target.exists()
-    assert undo["existed_before"] is False
-
-
 def test_injected_write_file_adapter_resolves_relative_path_from_workspace(
     tmp_path, monkeypatch
 ):
     from core.harness.tool_adapters import ToolAdapterSet
     from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
-    from core.memory import get_undo_state, set_undo_session
     from core.workspace_context import workspace_scope
 
     process_cwd = tmp_path / "process-cwd"
@@ -394,27 +349,20 @@ def test_injected_write_file_adapter_resolves_relative_path_from_workspace(
         plan_turn_checker=lambda _turn_id: False,
         pending_plan_checker=lambda _session_id: False,
     )
-    set_undo_session("adapter-relative-workspace")
-    try:
-        with workspace_scope(str(workspace)):
-            pipeline.execute_one({
-                "id": "call-relative",
-                "function": {
-                    "name": "write_file",
-                    "arguments": json.dumps({
-                        "file_path": "existing-empty.txt",
-                        "content": "updated",
-                    }),
-                },
-            }, context)
-        undo = get_undo_state("adapter-relative-workspace")
-    finally:
-        set_undo_session(None)
+    with workspace_scope(str(workspace)):
+        pipeline.execute_one({
+            "id": "call-relative",
+            "function": {
+                "name": "write_file",
+                "arguments": json.dumps({
+                    "file_path": "existing-empty.txt",
+                    "content": "updated",
+                }),
+            },
+        }, context)
 
     assert target.read_text(encoding="utf-8") == "updated"
     assert not (process_cwd / "existing-empty.txt").exists()
-    assert undo["file_path"] == str(target)
-    assert undo["existed_before"] is True
 
 
 def test_large_diff_keeps_full_counts_when_display_is_truncated(tmp_path, monkeypatch):
