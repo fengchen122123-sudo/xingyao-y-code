@@ -171,254 +171,30 @@ def _sanitize_tool_call_pairing(history):
 
     return sanitized
 
-# 按会话隔离的撤销状态。
-# _undo_state_lock 保护并发写：多 worker 线程（含并行工具批次）同时写文件时
-# 防止 LAST_UNDO_STATE 被竞态覆盖导致 /undo 回滚到错误文件/错误内容。
-# 每个会话独立维护自己的最后一次 undo 记录，避免切会话后误删/误改其他会话的文件。
-_undo_state_lock = threading.Lock()
-_undo_tls = threading.local()
-LAST_UNDO_STATE: dict[str, dict] = {}
 
+def _position_kind_for_role(role: str) -> str:
+    """消息角色 → message_turn_links 位置种类的显式映射（规格 7.7）。
 
-def set_undo_session(session_name: str | None) -> None:
-    """标记当前线程的 undo 会话，供 set_undo_state / get_undo_state 隐式使用。"""
-    _undo_tls.session_name = session_name
-
-
-def clear_undo_session() -> None:
-    _undo_tls.session_name = None
-
-
-def _current_undo_session(session_name: str | None = None) -> str:
-    explicit = session_name or getattr(_undo_tls, "session_name", None)
-    if explicit:
-        return explicit
-    # GUI 回合与子代理线程的权威会话路由在 app_context TLS 中；它不能
-    # 继承 UI 线程调用 set_undo_session 写入的 memory TLS。
-    from core import app_context
-
-    return app_context.get_thread_session() or "_global_"
-
-# 会话级检查点缓存（按 session_name → list of checkpoint dict）
-# 每轮对话开始前自动打一个 checkpoint，记录本轮所有被修改文件的旧内容
-# /checkpoint list 查看，/checkpoint restore <id> 回滚到该检查点
-# 设计参考 Grok Build 的 workspace 级 checkpoint
-_session_checkpoints_lock = threading.Lock()
-_session_checkpoints: dict[str, list[dict]] = {}
-
-
-def set_undo_state(
-    file_path,
-    old_content,
-    session_name=None,
-    *,
-    existed_before=None,
-    old_bytes=None,
-):
-    session = _current_undo_session(session_name)
-    if existed_before is None:
-        # 兼容旧调用方：历史约定 old_content="" 表示新建文件。
-        existed_before = bool(file_path) and old_content != ""
-    with _undo_state_lock:
-        LAST_UNDO_STATE[session] = {
-            "file_path": file_path,
-            "old_content": old_content,
-            "existed_before": bool(existed_before),
-            "old_bytes": old_bytes,
-        }
-    # 同步追加到当前会话的检查点文件快照
-    # （由 worker 线程在 begin_turn 时已建好当前 turn 的 checkpoint 上下文）
-    if file_path and old_content is not None:
-        record_file_snapshot_for_current_turn(
-            file_path,
-            old_content,
-            existed_before=bool(existed_before),
-            old_bytes=old_bytes,
-        )
-
-
-def get_undo_state(session_name=None):
-    session = _current_undo_session(session_name)
-    with _undo_state_lock:
-        # 返回副本，避免调用方在无锁状态下读写共享 dict 产生竞态
-        return dict(LAST_UNDO_STATE.get(session, {
-            "file_path": None,
-            "old_content": None,
-            "existed_before": False,
-            "old_bytes": None,
-        }))
-
-
-# ---------------------------------------------------------------------------
-# 会话级检查点 API
-# ---------------------------------------------------------------------------
-# 设计：每轮对话开始前由 main._background_worker 调用 begin_turn_checkpoint，
-# 把 turn_id + last_msg_id 记下来；之后 write_file/edit_file 调用 set_undo_state
-# 时同步把旧内容追加到该 turn 的快照列表里。
-# 用户 /checkpoint restore <turn_id> 时，把所有快照按反序回写文件。
-
-# 当前 worker 线程的活动 turn 上下文（thread-local，避免多线程串扰）
-_checkpoint_tls = threading.local()
-# 父回合和子代理分属不同线程：用 (session, turn) 注册活动 checkpoint，
-# 子代理只借用记录权，不拥有提交权。每个 ctx 的锁保护 completed 与快照列表。
-_active_turn_checkpoints_lock = threading.RLock()
-_active_turn_checkpoints: dict[tuple[str, str], tuple[dict, threading.RLock]] = {}
-
-
-def begin_turn_checkpoint(session_name, turn_id, last_msg_id, description=""):
-    """每轮对话开始前调用：建立当前 turn 的检查点上下文。
-
-    此后该线程内的 write_file/edit_file 调用会通过 set_undo_state 自动把旧内容
-    追加到本 turn 的快照列表。turn 结束后调用 end_turn_checkpoint 提交到全局缓存。
+    回合内持久化的 user 角色消息（压缩摘要请求、接管通知等系统注入内容）
+    归类为 notice；回合的发起用户消息由调用方显式传 'user'。
+    未知角色显式失败，不塞默认值。
     """
-    ctx = {
-        "session_name": session_name,
-        "turn_id": turn_id,
-        "last_msg_id": last_msg_id,
-        "description": description,
-        "created_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "file_snapshots": [],  # list of {file_path, old_content}
-        "completed": False,
+    mapping = {
+        "assistant": "assistant_intermediate",
+        "tool": "tool",
+        "user": "notice",
     }
-    key = (str(session_name), str(turn_id))
-    ctx_lock = threading.RLock()
-    with _active_turn_checkpoints_lock:
-        existing = _active_turn_checkpoints.get(key)
-        if existing is not None and not existing[0].get("completed"):
-            raise RuntimeError(f"checkpoint already active: {key!r}")
-        _active_turn_checkpoints[key] = (ctx, ctx_lock)
-    _checkpoint_tls.current = ctx
-    _checkpoint_tls.current_lock = ctx_lock
-    _checkpoint_tls.owner = True
-    return ctx
+    value = mapping.get(str(role))
+    if value is None:
+        from core.turn_undo.models import TurnUndoError, UndoErrorCode
 
+        raise TurnUndoError(
+            UndoErrorCode.INVALID_INPUT,
+            f"回合内持久化了无法分类的消息角色: {role!r}，"
+            "必须先扩展 _position_kind_for_role 映射",
+        )
+    return value
 
-def bind_turn_checkpoint(session_name, turn_id) -> bool:
-    """把子代理线程绑定到父回合的活动 checkpoint；不转移提交所有权。"""
-    key = (str(session_name), str(turn_id))
-    with _active_turn_checkpoints_lock:
-        entry = _active_turn_checkpoints.get(key)
-    if entry is None:
-        _checkpoint_tls.current = None
-        _checkpoint_tls.current_lock = None
-        _checkpoint_tls.owner = False
-        return False
-    ctx, ctx_lock = entry
-    with ctx_lock:
-        if ctx.get("completed"):
-            _checkpoint_tls.current = None
-            _checkpoint_tls.current_lock = None
-            _checkpoint_tls.owner = False
-            return False
-        _checkpoint_tls.current = ctx
-        _checkpoint_tls.current_lock = ctx_lock
-        _checkpoint_tls.owner = False
-    return True
-
-
-def clear_turn_checkpoint_binding() -> None:
-    """清除当前线程借用的 checkpoint 绑定。"""
-    _checkpoint_tls.current = None
-    _checkpoint_tls.current_lock = None
-    _checkpoint_tls.owner = False
-
-
-def record_file_snapshot_for_current_turn(
-    file_path,
-    old_content,
-    *,
-    existed_before=None,
-    old_bytes=None,
-):
-    """把当前线程内被修改文件的旧内容追加到当前 turn 的快照列表。"""
-    ctx = getattr(_checkpoint_tls, "current", None)
-    ctx_lock = getattr(_checkpoint_tls, "current_lock", None)
-    if ctx is None or ctx_lock is None:
-        return
-    with ctx_lock:
-        if ctx.get("completed"):
-            return
-        # 同一文件在一轮内可能被多次修改，只保留最早的旧内容（最原始状态）
-        path_key = os.path.normcase(os.path.realpath(os.path.abspath(file_path)))
-        existing = next((
-            snapshot
-            for snapshot in ctx["file_snapshots"]
-            if os.path.normcase(
-                os.path.realpath(os.path.abspath(snapshot["file_path"]))
-            ) == path_key
-        ), None)
-        if existing is None:
-            ctx["file_snapshots"].append({
-                "file_path": file_path,
-                "old_content": old_content,
-                "existed_before": (
-                    old_content != "" if existed_before is None else bool(existed_before)
-                ),
-                "old_bytes": old_bytes,
-            })
-
-
-def end_turn_checkpoint():
-    """turn 结束时把当前上下文提交到全局缓存，便于后续 /checkpoint 查询和回滚。"""
-    ctx = getattr(_checkpoint_tls, "current", None)
-    if ctx is None:
-        return None
-    if not getattr(_checkpoint_tls, "owner", False):
-        raise RuntimeError("borrowed checkpoint binding cannot be committed")
-    ctx_lock = getattr(_checkpoint_tls, "current_lock", None)
-    if ctx_lock is None:
-        raise RuntimeError("checkpoint lock missing")
-    session_name = ctx["session_name"]
-    key = (str(session_name), str(ctx["turn_id"]))
-    with ctx_lock:
-        ctx["completed"] = True
-        with _active_turn_checkpoints_lock:
-            active = _active_turn_checkpoints.get(key)
-            if active is not None and active[0] is ctx:
-                _active_turn_checkpoints.pop(key, None)
-        with _session_checkpoints_lock:
-            bucket = _session_checkpoints.setdefault(session_name, [])
-            bucket.append(ctx)
-            # 限制每个会话最多保留 50 个检查点，防止内存无限增长
-            if len(bucket) > 50:
-                del bucket[: len(bucket) - 50]
-    clear_turn_checkpoint_binding()
-    return ctx
-
-
-def list_checkpoints(session_name):
-    """返回指定会话的所有检查点（按时间正序）。"""
-    with _session_checkpoints_lock:
-        return list(_session_checkpoints.get(session_name, []))
-
-
-def get_checkpoint(session_name, turn_id):
-    """按 turn_id 查找单个检查点。"""
-    with _session_checkpoints_lock:
-        for cp in _session_checkpoints.get(session_name, []):
-            if cp["turn_id"] == turn_id:
-                return cp
-    return None
-
-
-def restore_checkpoint(session_name, turn_id):
-    """回滚到指定检查点：返回该检查点记录的所有文件快照（按反序，便于逐个回写）。
-
-    调用方负责把 old_content 写回文件。本函数只返回快照列表，不直接写文件，
-    避免在 memory 模块引入文件写入副作用。
-    """
-    cp = get_checkpoint(session_name, turn_id)
-    if cp is None:
-        return None
-    # 反序返回：最后修改的文件先回写，最早修改的文件最后回写
-    # 这样即使有依赖关系也能正确恢复
-    return list(reversed(cp["file_snapshots"]))
-
-
-def clear_checkpoints(session_name):
-    """清空指定会话的所有检查点（切换会话或主动清理时调用）。"""
-    with _session_checkpoints_lock:
-        _session_checkpoints.pop(session_name, None)
 
 class MemoryManager:
     def __init__(self, db_path="ycode.db"):
@@ -713,6 +489,11 @@ class MemoryManager:
                     "CREATE INDEX IF NOT EXISTS idx_cache_diag_ts "
                     "ON cache_request_diagnostics(ts)"
                 )
+                # 星瑶按回合撤销：持久化检查点/文件/操作/令牌/纠正与消息回合关联。
+                # DDL 集中在 core/turn_undo/storage.py，此处保持幂等迁移规范。
+                from core.turn_undo.storage import create_turn_undo_tables
+
+                create_turn_undo_tables(cursor)
                 # 保存修改
                 self.conn.commit()
             except Exception:
@@ -1465,9 +1246,15 @@ class MemoryManager:
                 except Exception:
                     pass
 
-    def add_message(self, session_name, role, content):
-        """记笔记技能：把聊天内容存进数据库"""
-        self.add_messages(session_name, [(role, content)])
+    def add_message(self, session_name, role, content, *,
+                    turn_checkpoint_id=None, turn_position_kind=None):
+        """记笔记技能：把聊天内容存进数据库；关联参数透传 add_messages。"""
+        position_kinds = (turn_position_kind,) if turn_position_kind else None
+        self.add_messages(
+            session_name, [(role, content)],
+            turn_checkpoint_id=turn_checkpoint_id,
+            turn_position_kinds=position_kinds,
+        )
         if str(role) == "user":
             try:
                 self.prune_history_files(
@@ -1597,11 +1384,34 @@ class MemoryManager:
             )
             message_ids.append(int(cursor.lastrowid))
         return tuple(message_ids)
-    def add_messages(self, session_name, messages):
-        """Atomically append one ordered batch of conversation messages."""
+    def add_messages(self, session_name, messages, *, turn_checkpoint_id=None,
+                     turn_position_kinds=None):
+        """Atomically append one ordered batch of conversation messages.
+
+        turn_checkpoint_id/turn_position_kinds：按回合撤销的消息关联（规格 7.7）。
+        传入时消息正文与 message_turn_links 在同一事务提交或回滚；position_kind
+        未知值显式失败。未显式传入时，若当前线程绑定了活动回合检查点上下文
+        （回合内非 Harness 持久化路径，如压缩摘要回写），同样自动关联。
+        """
         serialized, has_new_media = self._serialize_message_batch(messages)
         if not serialized:
             return
+
+        if turn_checkpoint_id is None:
+            try:
+                from core.turn_undo import recorder as _tu_recorder
+
+                ctx = _tu_recorder.current_context()
+                # 只信任仍处于活动注册中的上下文：陈旧绑定（回合已封闭）
+                # 不参与消息关联，避免把消息挂到已封闭检查点上
+                if ctx is not None and _tu_recorder.is_context_active(ctx):
+                    turn_checkpoint_id = ctx.checkpoint_id
+            except Exception:
+                turn_checkpoint_id = None
+        if turn_position_kinds is None and turn_checkpoint_id is not None:
+            turn_position_kinds = tuple(
+                _position_kind_for_role(role) for role, _ in serialized
+            )
 
         with self._lock:
             cursor = self.conn.cursor()
@@ -1625,7 +1435,18 @@ class MemoryManager:
                     if row is None:
                         raise RuntimeError(f"会话档案创建失败: {session_name!r}")
                     session_id = row[0]
-                self._insert_message_batch_locked(cursor, session_name, serialized)
+                message_ids = self._insert_message_batch_locked(cursor, session_name, serialized)
+                if turn_checkpoint_id is not None:
+                    from core.turn_undo.storage import insert_message_turn_links_locked
+
+                    links = []
+                    for index, message_id in enumerate(message_ids):
+                        kind = turn_position_kinds[index] \
+                            if turn_position_kinds and index < len(turn_position_kinds) else None
+                        if kind:
+                            links.append((message_id, turn_checkpoint_id, kind))
+                    if links:
+                        insert_message_turn_links_locked(cursor, links)
                 # 新媒体入库的同一事务内折叠旧媒体：请求路径不再改写历史中间字节
                 if has_new_media:
                     self._fold_stale_media_locked(cursor, session_id)
@@ -1645,6 +1466,8 @@ class MemoryManager:
         step_id,
         events,
         _created_at_ms=None,
+        turn_checkpoint_id=None,
+        turn_position_kinds=None,
     ) -> tuple[int, ...]:
         """Commit messages and their Harness event references atomically."""
         serialized, has_new_media = self._serialize_message_batch(messages)
@@ -1652,6 +1475,37 @@ class MemoryManager:
         self._validate_harness_message_events(events, len(serialized), step_id)
         if not serialized:
             return ()
+
+        # message_turn_links（规格 7.7）：Harness 原子提交路径同事务写入关联。
+        # checkpoint 解析顺序：显式参数 → 回合线程 TLS 上下文 → 按 harness turn_id
+        # （与回合 turn_id 同值，全局唯一）查库兜底（取消打捞等异线程路径）。
+        link_checkpoint_id = turn_checkpoint_id
+        if link_checkpoint_id is None:
+            try:
+                from core.turn_undo import recorder as _tu_recorder
+
+                ctx = _tu_recorder.current_context()
+                if ctx is not None:
+                    link_checkpoint_id = ctx.checkpoint_id
+            except Exception:
+                link_checkpoint_id = None
+        if link_checkpoint_id is None:
+            try:
+                from core.turn_undo.storage import _parse_status  # noqa: F401
+
+                with self._lock:
+                    cursor = self.conn.cursor()
+                    cursor.execute(
+                        "SELECT checkpoint_id FROM turn_undo_checkpoints WHERE turn_id = ?",
+                        (str(turn_id),),
+                    )
+                    row = cursor.fetchone()
+                link_checkpoint_id = row[0] if row else None
+            except Exception:
+                link_checkpoint_id = None
+        link_kinds = turn_position_kinds or tuple(
+            _position_kind_for_role(role) for role, _ in serialized
+        )
 
         with self._lock:
             cursor = self.conn.cursor()
@@ -1667,6 +1521,16 @@ class MemoryManager:
                     session_name,
                     serialized,
                 )
+                if link_checkpoint_id is not None:
+                    from core.turn_undo.storage import insert_message_turn_links_locked
+
+                    links = []
+                    for index, message_id in enumerate(message_ids):
+                        kind = link_kinds[index] if index < len(link_kinds) else None
+                        if kind:
+                            links.append((message_id, link_checkpoint_id, kind))
+                    if links:
+                        insert_message_turn_links_locked(cursor, links)
                 if has_new_media:
                     self._fold_stale_media_locked(cursor, session_id)
 
@@ -2075,6 +1939,61 @@ class MemoryManager:
             history.append(msg)
         return history
 
+    def mark_turn_final_assistant(self, checkpoint_id: str) -> None:
+        """回合封闭时把该检查点最后一条 assistant 关联更新为 assistant_final。
+
+        显式按 message_id 更新（检查点内最后一条 assistant），不属于按时间
+        范围回填；无 assistant 消息（异常回合）时静默跳过。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT l.message_id FROM message_turn_links l "
+                    "JOIN messages m ON m.id = l.message_id "
+                    "WHERE l.checkpoint_id = ? AND m.role = 'assistant' "
+                    "ORDER BY l.message_id DESC LIMIT 1",
+                    (checkpoint_id,),
+                )
+                row = cursor.fetchone()
+                if row is None:
+                    return
+                from core.turn_undo.storage import update_message_link_position_locked
+
+                update_message_link_position_locked(
+                    cursor, message_id=int(row[0]),
+                    position_kind="assistant_final",
+                )
+                self.conn.commit()
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def load_session_turn_links(self, session_name: str) -> dict[int, dict]:
+        """GUI 历史加载用：message_id -> {turn_id, checkpoint_id, position_kind}。
+
+        仅返回属于当前会话检查点的关联；界面元数据，Provider 请求构造不得读取。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                "SELECT l.message_id, l.checkpoint_id, l.position_kind, c.turn_id "
+                "FROM message_turn_links l "
+                "JOIN turn_undo_checkpoints c ON c.checkpoint_id = l.checkpoint_id "
+                "JOIN sessions s ON s.id = c.session_id "
+                "WHERE s.session_name = ?",
+                (session_name,),
+            )
+            rows = cursor.fetchall()
+        return {
+            int(message_id): {
+                "checkpoint_id": checkpoint_id,
+                "position_kind": position_kind,
+                "turn_id": turn_id,
+            }
+            for message_id, checkpoint_id, position_kind, turn_id in rows
+        }
+
     def get_history(self, session_name):
         """翻旧账技能：根据会话名字，把历史记录全拿出来"""
         with self._lock:
@@ -2243,7 +2162,7 @@ class MemoryManager:
             if source:
                 cursor.execute('''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
-                           s.workdir, s.updated_at, s.created_at, s.source
+                           s.workdir, s.updated_at, s.created_at, s.source, s.id
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
                     WHERE s.source = ? OR s.source IS NULL
@@ -2253,7 +2172,7 @@ class MemoryManager:
             else:
                 cursor.execute('''
                     SELECT s.session_name, COUNT(m.id) as msg_count,
-                           s.workdir, s.updated_at, s.created_at, s.source
+                           s.workdir, s.updated_at, s.created_at, s.source, s.id
                     FROM sessions s
                     LEFT JOIN messages m ON s.id = m.session_id
                     GROUP BY s.id
@@ -2278,7 +2197,9 @@ class MemoryManager:
                 "workdir": row[2],
                 "updated_at": row[3],
                 "created_at": row[4],
-                "source": row[5] or "GUI"
+                "source": row[5] or "GUI",
+                # 不可变主键 sessions.id（按回合撤销等功能的稳定归属标识）
+                "id": row[6],
             }
             for row in filtered
         ]
