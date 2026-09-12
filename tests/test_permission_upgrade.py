@@ -494,6 +494,9 @@ def _bare_bridge():
     bridge = ApiBridge.__new__(ApiBridge)
     bridge._perm_lock = threading.Lock()
     bridge._perm_timers = {}
+    # 按回合撤销：权限事件按 turn_id 归属映射路由会话
+    bridge._turn_owner_sessions = {}
+    bridge._turn_owner_lock = threading.Lock()
     bridge.emit_event = lambda *args, **kwargs: None
     return bridge
 

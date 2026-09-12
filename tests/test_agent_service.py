@@ -7,6 +7,8 @@ import os
 import sys
 import types
 
+import hashlib
+
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -225,78 +227,41 @@ def test_ensure_session_is_idempotent():
     assert sessions["gui_boot"]["workdir"] == "GLOBAL"
 
 
-def test_undo_last_edit_restores_previous_content(tmp_path, monkeypatch):
-    """撤销：把文件恢复为旧内容并抹掉上一轮对话记忆。"""
-    from core import memory as memory_mod
-    from core.agent_service import undo_last_edit
+def _begin_undo_turn(tmp_path, session, turn):
+    """新按回合撤销：配置服务并开始一个绑定当前线程的回合检查点。"""
+    from core.memory import MemoryManager
+    from core.turn_undo import service as turn_undo_service
+    from core.turn_undo.models import OwnerKind
 
-    manager = _make_manager()
-    session = "test_undo"
-    manager.add_message(session, "user", "改个文件")
-    manager.add_message(session, "assistant", "改好了")
-
-    target = tmp_path / "demo.txt"
-    target.write_text("新内容", encoding="utf-8")
-
-    memory_mod.set_undo_session(session)
-    memory_mod.set_undo_state(str(target), "旧内容", session_name=session)
-
-    # write_file 受工作目录沙盒限制，这里直接打桩验证撤销流程
-    import core.tools as tools_mod
-    written = {}
-
-    def _fake_write(path, content):
-        written["path"] = path
-        written["content"] = content
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(content)
-        return "ok"
-
-    monkeypatch.setattr(tools_mod, "write_file", _fake_write, raising=True)
-
-    ok, msg = undo_last_edit(manager, session)
-    assert ok is True, msg
-    assert target.read_text(encoding="utf-8") == "旧内容"
-    # 撤销后不可重复撤销
-    ok2, msg2 = undo_last_edit(manager, session)
-    assert ok2 is False
-    assert "没有可以撤销" in msg2
+    manager = MemoryManager(str(tmp_path / f"ycode-{turn}.db"))
+    storage = turn_undo_service.configure_default_manager(
+        manager, blob_root=tmp_path / f"undo_blobs-{turn}"
+    )
+    manager.add_messages(session, [("user", "hi")])
+    session_id = storage.resolve_session_id(session)
+    checkpoint, ctx = turn_undo_service.begin_turn(
+        session_id=session_id,
+        turn_id=turn,
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
+    return storage, checkpoint, ctx
 
 
-def test_undo_last_edit_requires_force_to_delete_new_file(tmp_path):
-    """删除星瑶新建的文件属于高危操作，未确认时必须拒绝。"""
-    from core import memory as memory_mod
-    from core.agent_service import undo_last_edit
+def turn_undo_service_finish(storage, ctx):
+    from core.turn_undo import service as turn_undo_service
 
-    manager = _make_manager()
-    session = "test_undo_force"
-    target = tmp_path / "created.txt"
-    target.write_text("星瑶新建的内容", encoding="utf-8")
-
-    memory_mod.set_undo_session(session)
-    memory_mod.set_undo_state(str(target), "", session_name=session)
-
-    ok, msg = undo_last_edit(manager, session, force=False)
-    assert ok is False
-    assert "需要显式确认" in msg
-    assert target.exists()
-
-    ok, msg = undo_last_edit(manager, session, force=True)
-    assert ok is True, msg
-    assert not target.exists()
+    return turn_undo_service.finish_turn(ctx)
 
 
 def test_write_file_records_undo_state(tmp_path, monkeypatch):
-    """D3：write_file 也必须记录撤销状态。
+    """D3：write_file 也必须记录按回合撤销状态。
 
-    新建文件走 force 删除确认（而不是报"没有可以撤销的操作记录"），
-    覆盖已有文件时无需 force 即可还原旧内容。
+    新建文件与覆盖已有文件都要产生精确的 before/after 记录；
+    删除新建文件的确认语义由多文件事务与预检承担（见 turn_undo 事务测试）。
     """
-    from core import memory as memory_mod
-    from core.agent_service import undo_last_edit
     from core.tools import write_file
 
-    manager = _make_manager()
     session = "test_write_file_undo"
     monkeypatch.chdir(tmp_path)
 
@@ -304,74 +269,82 @@ def test_write_file_records_undo_state(tmp_path, monkeypatch):
     old_file = tmp_path / "existing.txt"
     old_file.write_text("旧内容v1", encoding="utf-8")
 
-    memory_mod.set_undo_session(session)
+    storage, checkpoint, ctx = _begin_undo_turn(tmp_path, session, "turn-write-1")
+    try:
+        # 1) 新建文件：记录 before=missing
+        result = write_file(str(new_file), "新内容")
+        assert "写入成功" in result
+        # 2) 覆盖已有文件：记录最初 before 字节
+        result = write_file(str(old_file), "旧内容v1\n追加新内容")
+        assert "写入成功" in result
+    finally:
+        from core.turn_undo.models import TurnUndoStatus
 
-    # 1) 新建文件：write_file 后 /undo（无 force）必须要求显式确认删除
-    result = write_file(str(new_file), "新内容")
-    assert "写入成功" in result
-    ok, msg = undo_last_edit(manager, session, force=False)
-    assert ok is False
-    assert "需要显式确认" in msg, f"新建文件应要求 force 确认，实际: {msg}"
-    assert new_file.exists()
+        assert turn_undo_service_finish(storage, ctx) is TurnUndoStatus.READY
 
-    # force 确认后删除新建文件
-    ok, msg = undo_last_edit(manager, session, force=True)
-    assert ok is True, msg
-    assert not new_file.exists()
+    files = {row.display_path: row for row in storage.list_files(checkpoint.checkpoint_id)}
+    assert set(files) == {"created-by-write.txt", "existing.txt"}
+    created = files["created-by-write.txt"]
+    assert created.before_kind == "missing"
+    assert created.after_sha256 == hashlib.sha256("新内容".encode("utf-8")).hexdigest()
+    existing = files["existing.txt"]
+    assert existing.before_sha256 == hashlib.sha256("旧内容v1".encode("utf-8")).hexdigest()
+    assert existing.after_sha256 == hashlib.sha256(
+        "旧内容v1\n追加新内容".encode("utf-8")
+    ).hexdigest()
+    assert existing.verified_at_ms is not None
 
-    # 2) 覆盖已有文件：无需 force 即可还原旧内容
-    memory_mod.set_undo_session(session)
-    result = write_file(str(old_file), "旧内容v1\n追加新内容")
-    assert "写入成功" in result
-    ok, msg = undo_last_edit(manager, session, force=False)
-    assert ok is True, msg
-    assert old_file.read_text(encoding="utf-8") == "旧内容v1"
+
+def turn_undo_service_finish(storage, ctx):
+    from core.turn_undo import service as turn_undo_service
+
+    return turn_undo_service.finish_turn(ctx)
 
 
 def test_write_file_undo_preserves_preexisting_empty_file(tmp_path, monkeypatch):
-    """覆盖前已存在的空文件不是“新建文件”，撤销不得要求删除确认。"""
-    from core import memory as memory_mod
-    from core.agent_service import undo_last_edit
+    """覆盖前已存在的空文件必须以“存在但为空”的精确 before 状态入记录。"""
     from core.tools import write_file
+    from core.turn_undo.models import TurnUndoStatus
 
-    manager = _make_manager()
     session = "test_write_file_empty_undo"
     target = tmp_path / "empty.txt"
     target.write_bytes(b"")
     monkeypatch.chdir(tmp_path)
-    memory_mod.set_undo_session(session)
+    storage, checkpoint, ctx = _begin_undo_turn(tmp_path, session, "turn-empty-1")
     try:
         assert "写入成功" in write_file(str(target), "new content")
-        ok, message = undo_last_edit(manager, session, force=False)
     finally:
-        memory_mod.set_undo_session(None)
+        assert turn_undo_service_finish(storage, ctx) is TurnUndoStatus.READY
 
-    assert ok is True, message
-    assert target.exists()
-    assert target.read_bytes() == b""
+    row = storage.list_files(checkpoint.checkpoint_id)[0]
+    assert row.before_kind == "regular_file"
+    assert row.before_exists == 1
+    assert row.before_size == 0
+    assert row.before_sha256 == hashlib.sha256(b"").hexdigest()
+    assert target.read_bytes() == b"new content"
 
 
 def test_write_file_undo_restores_original_non_utf8_bytes(tmp_path, monkeypatch):
-    """撤销必须还原覆盖前的原始字节，不得把解码替换字符写回文件。"""
-    from core import memory as memory_mod
-    from core.agent_service import undo_last_edit
+    """撤销记录必须保存覆盖前的原始字节，不得把解码替换字符写入快照。"""
     from core.tools import write_file
+    from core.turn_undo.models import TurnUndoStatus
 
-    manager = _make_manager()
     session = "test_write_file_gbk_undo"
     target = tmp_path / "legacy-gbk.txt"
     original = "旧版中文内容".encode("gbk")
     target.write_bytes(original)
     monkeypatch.chdir(tmp_path)
-    memory_mod.set_undo_session(session)
+    storage, checkpoint, ctx = _begin_undo_turn(tmp_path, session, "turn-gbk-1")
     try:
         assert "写入成功" in write_file(str(target), "replacement")
-        ok, message = undo_last_edit(manager, session, force=False)
     finally:
-        memory_mod.set_undo_session(None)
+        assert turn_undo_service_finish(storage, ctx) is TurnUndoStatus.READY
 
-    assert ok is True, message
-    assert target.read_bytes() == original
+    row = storage.list_files(checkpoint.checkpoint_id)[0]
+    assert row.before_sha256 == hashlib.sha256(original).hexdigest()
+    # 快照内容是原始 GBK 字节，而非 UTF-8 解码替换后的文本
+    assert storage.blob_store.read_bytes(row.before_blob_sha256) == original
+    assert target.read_bytes() == b"replacement"
 
 
 def test_compression_summary_survives_as_user_message(stub_llm, quiet_extras):

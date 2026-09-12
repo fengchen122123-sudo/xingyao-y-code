@@ -554,22 +554,34 @@ def test_edit_file_dispatch_passes_replace_all(mocker, tmp_path):
 
 
 def test_write_file_old_content_falls_back_to_gbk(mocker, tmp_path):
-    """GBK 文件被 write_file 覆写时，旧内容读取回退 GBK，undo 快照不退化为空串。"""
+    """GBK 文件被 write_file 覆写时，按回合撤销快照保存原始 GBK 字节，
+    不得把解码替换字符写入快照（新记录器契约，替代旧 set_undo_state）。"""
+    import hashlib
+
     import core.llm as llm
+    from core.memory import MemoryManager
+    from core.turn_undo import service as tu_service
+    from core.turn_undo import recorder as tu_recorder
+    from core.turn_undo.models import OwnerKind
 
     target = tmp_path / "gbk-file.txt"
-    target.write_bytes("中文内容".encode("gbk"))
-    snapshots = {}
+    original = "中文内容".encode("gbk")
+    target.write_bytes(original)
+
+    manager = MemoryManager(str(tmp_path / "ycode.db"))
+    storage = tu_service.configure_default_manager(
+        manager, blob_root=tmp_path / "undo_blobs"
+    )
+    manager.add_messages("gbk-sess", [("user", "hi")])
+    session_id = storage.resolve_session_id("gbk-sess")
+    checkpoint, ctx = tu_service.begin_turn(
+        session_id=session_id,
+        turn_id="turn-gbk-write",
+        workspace_root=str(tmp_path),
+        owner_kind=OwnerKind.FOREGROUND_TURN,
+    )
 
     mocker.patch.object(llm, "check_permission_and_ask", return_value=True)
-    mocker.patch(
-        "core.memory.set_undo_state",
-        side_effect=lambda path, old, **metadata: snapshots.update(
-            path=path,
-            old=old,
-            **metadata,
-        ),
-    )
 
     tool_call = {
         "id": "call-gbk-write",
@@ -578,12 +590,19 @@ def test_write_file_old_content_falls_back_to_gbk(mocker, tmp_path):
             "arguments": '{"file_path": "%s", "content": "new"}' % str(target).replace("\\", "\\\\"),
         },
     }
-    result = llm._execute_single_tool_call(
-        tool_call,
-        event_callback=lambda *args, **kwargs: None,
-    )
+    try:
+        result = llm._execute_single_tool_call(
+            tool_call,
+            event_callback=lambda *args, **kwargs: None,
+        )
+    finally:
+        tu_service.finish_turn(ctx)
 
-    assert snapshots["old"] == "中文内容"
+    files = storage.list_files(checkpoint.checkpoint_id)
+    assert len(files) == 1
+    row = files[0]
+    assert row.before_sha256 == hashlib.sha256(original).hexdigest()
+    assert storage.blob_store.read_bytes(row.before_blob_sha256) == original
     assert result["content"].startswith("已成功将内容写入文件")
 
 

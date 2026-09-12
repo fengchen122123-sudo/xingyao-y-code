@@ -90,8 +90,8 @@ def test_session_last_error_and_message_loading():
 
     # 2. 模拟 _load_session_messages 将错误附加到末尾
     class FakeMemory:
-        def get_history(self, s):
-            return [{"role": "user", "content": "你好", "_display": {}}]
+        def get_history_with_ids(self, s):
+            return [{"role": "user", "content": "你好", "_display": {}, "_msg_id": 1}]
         def set_session_last_error(self, *args, **kwargs):
             pass
         def get_session_last_error(self, *args, **kwargs):
