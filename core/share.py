@@ -23,6 +23,18 @@ from pathlib import Path
 import core.app_context as app_context
 
 
+def default_export_dir():
+    """导出目录跟随 YCODE_DATA_DIR（与 permissions.json / 记忆文件一致），
+    未设置时回落 ~/.ycode/exports，保持既有默认位置不变。/diagram 图表
+    目录也建立在这一约定之上。"""
+    try:
+        import config
+
+        return Path(config.YCODE_DIR) / "exports"
+    except Exception:
+        return Path.home() / ".ycode" / "exports"
+
+
 def _redact_export_text(value):
     text = str(value or "")
     try:
@@ -139,7 +151,7 @@ def export_session_markdown(session_name, manager=None, output_path=None):
 
     # 写文件
     if output_path is None:
-        export_dir = Path.home() / '.ycode' / 'exports'
+        export_dir = default_export_dir()
         export_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = ''.join(c if c.isalnum() or c in '-_' else '_' for c in session_name)
@@ -245,7 +257,7 @@ def export_session_html(session_name, manager=None, output_path=None):
 </html>"""
 
     if output_path is None:
-        export_dir = Path.home() / '.ycode' / 'exports'
+        export_dir = default_export_dir()
         export_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = ''.join(c if c.isalnum() or c in '-_' else '_' for c in session_name)
@@ -286,7 +298,7 @@ def export_session_json(session_name, manager=None, output_path=None):
     json_content = _redact_export_text(json_content)
 
     if output_path is None:
-        export_dir = Path.home() / '.ycode' / 'exports'
+        export_dir = default_export_dir()
         export_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
         safe_name = ''.join(c if c.isalnum() or c in '-_' else '_' for c in session_name)

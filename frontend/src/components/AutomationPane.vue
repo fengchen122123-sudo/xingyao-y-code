@@ -28,6 +28,13 @@
         </div>
         <div class="ap-meta">
           <span class="ap-meta-item" :title="`目标会话：${t.target_session}`">💬 {{ t.target_session }}</span>
+          <span
+            v-if="t.workdir === 'GLOBAL'"
+            class="ap-meta-item"
+            title="目标会话不存在时创建为自由对话，不绑定项目目录"
+          >🗨 自由对话</span>
+          <span v-else-if="t.workdir" class="ap-meta-item" :title="`工作目录：${t.workdir}`">📁 {{ dirLabel(t.workdir) }}</span>
+          <span v-if="modelLabel(t.model_id)" class="ap-meta-item" :title="`执行模型：${modelLabel(t.model_id)}`">🧠 {{ modelLabel(t.model_id) }}</span>
           <span class="ap-meta-item">
             {{ t.enabled ? `下次：${formatNextRun(t.next_run_at)}` : '已停用' }}
           </span>
@@ -84,6 +91,28 @@
         />
       </div>
 
+      <!-- 新会话工作目录：目标会话不存在时由任务代为创建，归属目录必须在这里指定 -->
+      <div v-if="form.sessionMode === '__new__'" class="ap-row" data-test="automation-workdir-row">
+        <span class="ap-unit">工作目录</span>
+        <select v-model="form.workdirMode" data-test="automation-workdir-mode" title="新会话归属">
+          <option value="global">自由对话（不绑定项目）</option>
+          <option value="folder">指定项目文件夹</option>
+        </select>
+        <template v-if="form.workdirMode === 'folder'">
+          <input
+            v-model="form.workdir"
+            data-test="automation-workdir-input"
+            placeholder="点击「浏览…」选择项目文件夹"
+            readonly
+            style="flex:1; min-width:220px"
+          />
+          <button class="ap-btn" data-test="automation-workdir-pick" @click="pickWorkdir">浏览…</button>
+        </template>
+      </div>
+      <div v-else-if="existingSessionWorkdir" class="ap-unit ap-workdir-hint">
+        该会话归属项目目录：{{ existingSessionWorkdir }}
+      </div>
+
       <div class="ap-row">
         <select v-model="form.triggerType" data-test="automation-trigger-type" title="触发方式">
           <option value="interval">固定间隔</option>
@@ -114,11 +143,21 @@
       ></textarea>
       <div class="ap-char-count">{{ form.prompt.length }} / 6000</div>
 
+      <!-- 执行模型：与对话页模型同源，留空跟随会话绑定/全局默认 -->
       <div class="ap-row">
-        <select v-model="form.permissionMode" data-test="automation-permission" title="无人值守权限档位">
-          <option value="confirm">confirm —— 需要确认的操作自动拒绝</option>
-          <option value="accept_edits">accept_edits —— 允许修改文件</option>
-          <option value="full">full —— 允许修改文件与执行命令</option>
+        <span class="ap-unit">执行模型</span>
+        <select v-model="form.modelId" data-test="automation-model" title="自动化回合使用的模型">
+          <option value="">跟随会话 / 全局默认</option>
+          <optgroup v-for="(models, provider) in store.modelsByProvider" :key="provider" :label="provider">
+            <option v-for="m in models" :key="m.id" :value="m.id">{{ m.name }}</option>
+          </optgroup>
+        </select>
+        <span v-if="store.models.length === 0" class="ap-unit">暂无模型，请先在模型管理中添加并激活</span>
+      </div>
+
+      <div class="ap-row">
+        <select v-model="form.permissionMode" data-test="automation-permission" title="无人值守权限档位（与对话页权限档位同源）">
+          <option v-for="m in permissionModes" :key="m.v" :value="m.v" :title="m.desc">{{ formatPermMode(m.v) }}</option>
         </select>
         <select v-model="form.missedPolicy" title="应用未运行错过触发时">
           <option value="skip">错过则跳过</option>
@@ -126,7 +165,7 @@
         </select>
         <label class="ap-weekday"><input type="checkbox" v-model="form.notifyOnSuccess" /> 成功也通知</label>
       </div>
-      <div v-if="form.permissionMode !== 'confirm'" class="ap-risk" data-test="automation-risk-note">
+      <div v-if="form.permissionMode === 'accept_edits' || form.permissionMode === 'full'" class="ap-risk" data-test="automation-risk-note">
         ⚠ 无人值守档位：该任务的自动化回合可以不经确认{{ form.permissionMode === 'full' ? '修改文件并执行命令' : '修改文件' }}，
         每次触发都会在目标会话留下完整过程，可按回合撤销。
       </div>
@@ -144,9 +183,20 @@
 <script setup lang="ts">
 import { computed, reactive } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import { formatPermMode } from '../utils/markdown';
 import type { AutomationTaskInfo } from '../types/pywebview';
 
 const store = useAppStore();
+
+// 无人值守权限档位：文案复用对话页 formatPermMode（变更前确认/自动编辑/
+// 计划模式/完全访问），说明按无人值守语义改写——升级到确认弹窗的请求
+// 一律自动拒绝，不会挂死回合
+const permissionModes: Array<{ v: AutomationTaskInfo['permission_mode']; desc: string }> = [
+  { v: 'confirm', desc: '变更前确认：查询自动放行；任何变更请求自动拒绝' },
+  { v: 'accept_edits', desc: '自动编辑：普通编辑和构建自动放行；删除、提交、推送等敏感操作自动拒绝' },
+  { v: 'plan', desc: '计划模式：允许读取、查询和制定计划；禁止修改或删除任务文件' },
+  { v: 'full', desc: '完全访问：沙盒内放行所有非灾难性操作；工作区外由沙盒开关控制' },
+];
 
 const weekdayOptions = [
   { value: 1, label: '周一' },
@@ -167,6 +217,9 @@ const form = reactive({
   name: '',
   sessionMode: '',
   newSession: '',
+  workdirMode: 'global' as 'global' | 'folder',
+  workdir: '',
+  modelId: '',
   triggerType: 'daily' as AutomationTaskInfo['trigger_type'],
   intervalMinutes: 30,
   time: '09:30',
@@ -188,11 +241,25 @@ const sessionOptions = computed(() => {
   return names;
 });
 
+// 已有会话目标的归属目录提示（只读信息：派发时始终以会话自身归属为准）
+const existingSessionWorkdir = computed(() => {
+  if (!form.sessionMode || form.sessionMode === '__new__') return '';
+  for (const group of store.sessionGroups || []) {
+    for (const s of group.sessions || []) {
+      if (s.name === form.sessionMode) return s.workdir || '';
+    }
+  }
+  return '';
+});
+
 function openCreate() {
   form.id = '';
   form.name = '';
   form.sessionMode = sessionOptions.value[0] || '__new__';
   form.newSession = '';
+  form.workdirMode = 'global';
+  form.workdir = '';
+  form.modelId = '';
   form.triggerType = 'daily';
   form.intervalMinutes = 30;
   form.time = '09:30';
@@ -210,6 +277,16 @@ function openEdit(t: AutomationTaskInfo) {
   form.name = t.name;
   form.sessionMode = sessionOptions.value.includes(t.target_session) ? t.target_session : '__new__';
   form.newSession = sessionOptions.value.includes(t.target_session) ? '' : t.target_session;
+  // 旧任务 workdir 为空（跟随会话归属）：编辑新建会话目标时默认给自由对话，
+  // 需要项目目录的由用户显式选择
+  if (t.workdir && t.workdir !== 'GLOBAL') {
+    form.workdirMode = 'folder';
+    form.workdir = t.workdir;
+  } else {
+    form.workdirMode = 'global';
+    form.workdir = '';
+  }
+  form.modelId = t.model_id || '';
   form.triggerType = t.trigger_type;
   const cfg = t.trigger_config || {};
   form.intervalMinutes = Number(cfg.interval_minutes) || 30;
@@ -223,11 +300,29 @@ function openEdit(t: AutomationTaskInfo) {
   form.show = true;
 }
 
+function pickWorkdir() {
+  void store.pickFolderPlain((path: string) => { form.workdir = path; });
+}
+
 async function onSave() {
   const targetSession = form.sessionMode === '__new__' ? form.newSession.trim() : form.sessionMode;
   if (!form.name.trim() || !form.prompt.trim() || !targetSession) {
     form.errors = ['任务名称、目标会话与提示词均不能为空'];
     return;
+  }
+  // 工作目录只在新建会话时指定：自由对话存 GLOBAL，项目任务存所选目录；
+  // 已有会话目标留空，运行时跟随会话自身归属
+  let workdir = '';
+  if (form.sessionMode === '__new__') {
+    if (form.workdirMode === 'folder') {
+      workdir = form.workdir.trim();
+      if (!workdir) {
+        form.errors = ['请为新会话选择项目文件夹，或改用自由对话'];
+        return;
+      }
+    } else {
+      workdir = 'GLOBAL';
+    }
   }
   const config: Record<string, any> = {};
   if (form.triggerType === 'interval') config.interval_minutes = form.intervalMinutes;
@@ -241,6 +336,8 @@ async function onSave() {
       trigger_type: form.triggerType,
       trigger_config: config,
       target_session: targetSession,
+      workdir,
+      model_id: form.modelId,
       prompt: form.prompt,
       permission_mode: form.permissionMode,
       missed_run_policy: form.missedPolicy,
@@ -295,6 +392,19 @@ function formatNextRun(ts?: number | null): string {
   const date = new Date(ts * 1000);
   if (Number.isNaN(date.getTime())) return '—';
   return date.toLocaleString();
+}
+
+function dirLabel(path: string): string {
+  const norm = path.replace(/[\\/]+$/, '');
+  const idx = Math.max(norm.lastIndexOf('\\'), norm.lastIndexOf('/'));
+  return idx >= 0 ? norm.slice(idx + 1) : norm;
+}
+
+function modelLabel(id?: string): string {
+  const mid = String(id || '').trim();
+  if (!mid) return '';
+  const m = store.models.find(x => x.id === mid);
+  return m ? `${m.name}（${m.provider_name}）` : mid;
 }
 
 function kindLabel(kind: string): string {
@@ -457,9 +567,10 @@ function durationText(r: { started_at?: string | null; finished_at?: string | nu
 .ap-wrap textarea {
   width: 100%; box-sizing: border-box; resize: vertical; line-height: 1.6;
 }
-.ap-row input:first-child { flex: 1; min-width: 180px; }
+.ap-row > input:first-child { flex: 1; min-width: 180px; }
 .ap-row select { min-width: 150px; }
 .ap-unit { font-size: 11.5px; color: var(--text-faint); }
+.ap-workdir-hint { margin: -4px 0 10px; }
 .ap-weekday {
   font-size: 12px; color: var(--text-dim);
   display: inline-flex; align-items: center; gap: 4px; margin-right: 4px;

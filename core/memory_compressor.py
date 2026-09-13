@@ -465,8 +465,9 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             # 3. 统计需要保留的最近活跃消息
             retain_count = config["retain_count_force"] if force else config["retain_count"]
             if len(all_active_messages) <= retain_count + 2:
-                if force:
-                    emit(f"<ansiyellow>ℹ 当前会话活跃对话过少（少于 {retain_count + 2} 条），无需进行记忆压缩。</ansiyellow>")
+                # force 与常规路径同样提示：静默跳过会让用户看到"正在后台压缩"
+                # 之后永远没有下文
+                emit(f"<ansiyellow>ℹ 当前会话活跃对话过少（少于 {retain_count + 2} 条），无需进行记忆压缩。</ansiyellow>")
                 return CompressionOutcome("skipped", "too_few_messages")
 
             messages_to_summarize = all_active_messages[:-retain_count]

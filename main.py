@@ -5153,6 +5153,22 @@ def run_headless(prompt, session_name=None) -> int:
         # 给事件队列一点时间排空
         time.sleep(0.5)
 
+        # headless 没有 UI 消费者：回合失败只以 turn_error 事件留在
+        # ui_event_queue 里（交互模式由 UI 线程 drain 后打印），而 worker 侧
+        # 回合已"完整走完"会上报成功。必须在投递方这里排空队列检出失败，
+        # 否则失败任务也返回退出码 0，CI/脚本无法判败。
+        stream_error = None
+        while True:
+            try:
+                _queued_event = ui_event_queue.get_nowait()
+            except queue.Empty:
+                break
+            if _queued_event.kind == "turn_error" and stream_error is None:
+                stream_error = str((_queued_event.payload or {}).get("message") or "未知错误")
+        if stream_error is not None:
+            print(f"\n[headless 任务失败: {stream_error}]", file=sys.stderr)
+            return 1
+
         # High 8：失败与成功在队列层无法区分（task_done 在 finally 无条件调用），
         # 必须看 worker 通过共享 result 对象上报的成败；失败返回 1 让 CI 流水线判败。
         task_result = task_data.get("result") or {}

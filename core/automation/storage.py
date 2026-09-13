@@ -47,6 +47,8 @@ _TASK_COLUMNS = (
     "updated_at",
     "last_run_at",
     "next_run_at",
+    "workdir",
+    "model_id",
 )
 
 _RUN_COLUMNS = (
@@ -79,7 +81,9 @@ AUTOMATION_TABLE_DDL = (
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         last_run_at TEXT,
-        next_run_at REAL
+        next_run_at REAL,
+        workdir TEXT NOT NULL DEFAULT '',
+        model_id TEXT NOT NULL DEFAULT ''
     )
     """,
     """
@@ -152,6 +156,17 @@ class AutomationStorage:
             cursor = self.conn.cursor()
             for ddl in AUTOMATION_TABLE_DDL:
                 cursor.execute(ddl)
+            # 旧库迁移：workdir/model_id 列后加（v1.2.x 前的任务表没有这些列），幂等
+            cursor.execute("PRAGMA table_info(automation_tasks)")
+            existing_cols = {row[1] for row in cursor.fetchall()}
+            if "workdir" not in existing_cols:
+                cursor.execute(
+                    "ALTER TABLE automation_tasks ADD COLUMN workdir TEXT NOT NULL DEFAULT ''"
+                )
+            if "model_id" not in existing_cols:
+                cursor.execute(
+                    "ALTER TABLE automation_tasks ADD COLUMN model_id TEXT NOT NULL DEFAULT ''"
+                )
             self.conn.commit()
 
     # -- 任务 CRUD --
@@ -209,6 +224,8 @@ class AutomationStorage:
                 str(task.get("permission_mode") or "confirm"),
                 str(task.get("missed_run_policy") or "skip"),
                 1 if task.get("notify_on_success") else 0,
+                str(task.get("workdir") or "").strip(),
+                str(task.get("model_id") or "").strip(),
             )
             if exists:
                 cursor.execute(
@@ -216,8 +233,8 @@ class AutomationStorage:
                     UPDATE automation_tasks
                     SET name = ?, enabled = ?, trigger_type = ?, trigger_config = ?,
                         target_session = ?, prompt = ?, permission_mode = ?,
-                        missed_run_policy = ?, notify_on_success = ?,
-                        updated_at = ?, next_run_at = ?
+                        missed_run_policy = ?, notify_on_success = ?, workdir = ?,
+                        model_id = ?, updated_at = ?, next_run_at = ?
                     WHERE id = ?
                     """,
                     (*fields, now, next_run, task_id),
@@ -228,8 +245,9 @@ class AutomationStorage:
                     INSERT INTO automation_tasks (
                         id, name, enabled, trigger_type, trigger_config,
                         target_session, prompt, permission_mode, missed_run_policy,
-                        notify_on_success, created_at, updated_at, last_run_at, next_run_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+                        notify_on_success, workdir, model_id, created_at, updated_at,
+                        last_run_at, next_run_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
                     """,
                     (task_id, *fields, now, now, next_run),
                 )
