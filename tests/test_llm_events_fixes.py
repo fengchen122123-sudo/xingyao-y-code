@@ -1767,6 +1767,87 @@ def test_wait_notice_emitted_during_slow_request(mocker, monkeypatch):
     assert "超时上限" in str(notices[0].payload["message"])
 
 
+def test_wait_notice_flushed_realtime_not_batched_after_first_chunk(mocker, monkeypatch):
+    """等待提示必须实时到达消费端，而不是积压到首个正文 chunk 之后一次性冲刷。
+
+    status 事件经回调进 pending_events，若等待期不 yield 空心跳，外层适配层
+    只会在拿到首个正文 chunk 时才 drain——GUI 上表现为“通了之后扎堆弹出”。
+    以 completion 返回时刻为界：至少一条提示必须在其之前到达。
+    """
+    import time as _time
+
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_THRESHOLD_SECONDS", 0.05)
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_INTERVAL_SECONDS", 0.05)
+
+    completion_returned_at = []
+
+    def slow_completion(**kwargs):
+        _time.sleep(0.4)
+        completion_returned_at.append(_time.monotonic())
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=slow_completion)
+
+    notice_times = []
+    for event in chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "慢请求"}],
+        persist=False,
+        turn_id="turn-wait-notice-realtime",
+        consume_background_notifications=False,
+    ):
+        if (
+            event.kind == "status"
+            and "模型响应中" in str(event.payload.get("message", ""))
+        ):
+            notice_times.append(_time.monotonic())
+
+    assert notice_times, "慢请求期间必须上报“模型响应中”状态事件"
+    assert completion_returned_at, "slow_completion 必须真实返回过"
+    assert min(notice_times) < completion_returned_at[0], (
+        "等待提示必须在 completion 返回（首个正文可用）之前实时到达，"
+        "而不是积压到首个正文 chunk 之后一次性冲刷"
+    )
+
+
+def test_request_wait_give_up_ends_turn_at_hard_cap_without_retry(mocker, monkeypatch):
+    """等待达到硬上限必须结束本轮并发出 turn_error，且绝不进入 API 重试循环
+    （重试只会再等一个上限时长）。"""
+    import time as _time
+
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_THRESHOLD_SECONDS", 0.05)
+    monkeypatch.setattr("core.llm.WAIT_NOTICE_INTERVAL_SECONDS", 0.05)
+    monkeypatch.setattr("core.llm.REQUEST_WAIT_GIVE_UP_SECONDS", 0.25)
+
+    def hanging_completion(**kwargs):
+        # 永不返回流：等待硬上限必须先于任何响应触发
+        _time.sleep(5)
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=hanging_completion)
+
+    events = list(chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "挂起请求"}],
+        persist=False,
+        turn_id="turn-wait-give-up",
+        consume_background_notifications=False,
+    ))
+
+    give_up_errors = [
+        e for e in events
+        if e.kind == "turn_error" and "仍未收到首字节" in str(e.payload.get("message", ""))
+    ]
+    assert give_up_errors, "等待硬上限必须以 turn_error 结束本轮"
+    retry_notices = [
+        e for e in events
+        if e.kind == "status" and "重试" in str(e.payload.get("message", ""))
+    ]
+    assert not retry_notices, "等待硬上限绝不允许进入 API 重试循环"
+
+
 def test_fold_old_media_for_estimate_keeps_only_latest_image():
     """token 估算时历史图片必须折叠为占位符（与请求时的折叠规则一致），
     仅最近一条带图用户消息保留原样，避免 base64 字符量虚高误触发压缩。"""

@@ -167,13 +167,6 @@ _register(
         "effort", ("default", "low", "medium", "high"), "always_on_effort"
     ),
 )
-# Agnes AI：OpenAI 兼容接口用 chat_template_kwargs.enable_thinking 开关思考，无强度档位。
-_register(
-    ("agnes-2.0-flash", "agnes-2.5-flash"),
-    ReasoningCapability(
-        "toggle", ("default", "off", "on"), "agnes_enable_thinking"
-    ),
-)
 # 腾讯混元（hy3，经 CloudBase AI 网关 OpenAI 兼容接口）：顶层 enable_thinking 开关，无强度档位。
 _register(
     ("hy3",),
@@ -198,6 +191,13 @@ _register(
 # 适配，无需逐个登记；能力表中的显式登记仅用于别名折叠等特例。
 _DEEPSEEK_PREFIX_CAPABILITY = ReasoningCapability(
     "effort", ("default", "off", "low", "high", "max"), "thinking_object_effort"
+)
+
+# Agnes AI：OpenAI 兼容接口用 chat_template_kwargs.enable_thinking 开关思考，
+# 无强度档位。任何 agnes 前缀模型（不区分大小写，含未来新版本）统一按此
+# 适配，无需逐个登记。
+_AGNES_PREFIX_CAPABILITY = ReasoningCapability(
+    "toggle", ("default", "off", "on"), "agnes_enable_thinking"
 )
 
 
@@ -228,6 +228,8 @@ def get_reasoning_capability(model_name: str) -> ReasoningCapability:
         return registered
     if _model_leaf_name(normalized).startswith("deepseek"):
         return _DEEPSEEK_PREFIX_CAPABILITY
+    if _model_leaf_name(normalized).startswith("agnes"):
+        return _AGNES_PREFIX_CAPABILITY
     return HIDDEN_REASONING_CAPABILITY
 
 

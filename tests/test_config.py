@@ -362,9 +362,9 @@ def test_sync_preset_models_appends_only_missing(tmp_path, monkeypatch):
     _use_tmp_config(tmp_path, monkeypatch, _preset_provider_config())
     monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
 
-    added = model_manager.sync_preset_provider_models("fake-preset")
+    counts = model_manager.sync_preset_provider_models("fake-preset")
 
-    assert added == 2  # model-b 与 model-new
+    assert counts["added"] == 2  # model-b 与 model-new
     data = model_manager.load_config()
     names = [m["name"] for m in data["providers"][0]["models"]]
     assert set(names) == {"model-a", "custom-x", "model-b", "model-new"}
@@ -376,6 +376,74 @@ def test_sync_preset_models_appends_only_missing(tmp_path, monkeypatch):
     assert vision["supports_vision"] is True
 
 
+def test_sync_preset_models_refreshes_existing_catalog_models(tmp_path, monkeypatch):
+    """目录调参（上下文/输出上限/多模态）须刷新到已存在的预置模型；
+    已从目录下架的模型与自定义模型保持原样。"""
+    cfg_data = _preset_provider_config()
+    # 老快照：model-a 的上下文是旧值且缺 max_tokens；delisted-model 已下架
+    cfg_data["providers"][0]["models"][0]["context_window"] = 1000000
+    cfg_data["providers"][0]["models"].append(
+        {"id": "m9", "name": "delisted-model", "litellm_model": "openai/delisted-model",
+         "context_window": 64000}
+    )
+    _use_tmp_config(tmp_path, monkeypatch, cfg_data)
+    catalog = _preset_catalog()
+    catalog["models"][0] = {
+        "name": "model-a", "context_window": 512000, "max_tokens": 65535,
+        "supports_vision": True, "supports_function_calling": True,
+    }
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: catalog)
+
+    counts = model_manager.sync_preset_provider_models("fake-preset")
+
+    assert counts == {"added": 2, "updated": 1}  # 追加 model-b/model-new；刷新 model-a
+    data = model_manager.load_config()
+    models = {m["name"]: m for m in data["providers"][0]["models"]}
+    refreshed = models["model-a"]
+    assert refreshed["context_window"] == 512000
+    assert refreshed["max_tokens"] == 65535
+    assert refreshed["supports_vision"] is True
+    assert refreshed["supports_function_calling"] is True
+    # 下架模型不被删除；自定义模型字段不被触碰
+    assert models["delisted-model"]["context_window"] == 64000
+    assert models["custom-x"]["context_window"] == 64000
+
+
+def test_sync_preset_models_claims_unlinked_provider_by_name_or_base_url(tmp_path, monkeypatch):
+    """手动添加、未落 preset_id 链接的同名/同址厂商也能被同步认领。"""
+    cfg_data = _preset_provider_config()
+    del cfg_data["providers"][0]["preset_id"]
+    _use_tmp_config(tmp_path, monkeypatch, cfg_data)
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
+
+    counts = model_manager.sync_preset_provider_models("fake-preset")
+
+    assert counts["added"] == 2
+    names = [m["name"] for m in model_manager.load_config()["providers"][0]["models"]]
+    assert "model-new" in names
+
+
+def test_sync_preset_models_ignores_unrelated_unlinked_provider(tmp_path, monkeypatch):
+    """名称与 Base URL 都对不上的无链接厂商不被误认领，配置保持原样。"""
+    cfg_data = _preset_provider_config()
+    provider = dict(cfg_data["providers"][0])
+    del provider["preset_id"]
+    provider["name"] = "别家中转"
+    provider["base_url"] = "https://other.example.com/v1"
+    cfg_data["providers"][0] = provider
+    _use_tmp_config(tmp_path, monkeypatch, cfg_data)
+    monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
+
+    assert model_manager.sync_preset_provider_models("fake-preset") == {"added": 0, "updated": 0}
+    data = model_manager.load_config()
+    assert len(data["providers"]) == 1
+    untouched = data["providers"][0]
+    assert untouched["name"] == "别家中转"
+    assert untouched["base_url"] == "https://other.example.com/v1"
+    assert [m["name"] for m in untouched["models"]] == ["model-a", "custom-x"]
+    assert untouched["models"][0]["context_window"] == 128000
+
+
 def test_sync_preset_models_skips_manually_removed(tmp_path, monkeypatch):
     """用户手动删除的预置模型不得因同步复活（delete_model 已记录删除痕迹）。"""
     cfg_data = _preset_provider_config()
@@ -383,9 +451,9 @@ def test_sync_preset_models_skips_manually_removed(tmp_path, monkeypatch):
     _use_tmp_config(tmp_path, monkeypatch, cfg_data)
     monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
 
-    added = model_manager.sync_preset_provider_models("fake-preset")
+    counts = model_manager.sync_preset_provider_models("fake-preset")
 
-    assert added == 1  # 只有 model-new；model-b 被删除痕迹挡住
+    assert counts["added"] == 1  # 只有 model-new；model-b 被删除痕迹挡住
     data = model_manager.load_config()
     names = [m["name"] for m in data["providers"][0]["models"]]
     assert "model-b" not in names
@@ -438,7 +506,7 @@ def test_sync_preset_models_missing_provider_returns_zero(tmp_path, monkeypatch)
     cfg = _use_tmp_config(tmp_path, monkeypatch, {"providers": [], "active_model_id": None})
     monkeypatch.setattr(model_manager, "get_preset_provider", lambda _pid: _preset_catalog())
 
-    assert model_manager.sync_preset_provider_models("fake-preset") == 0
+    assert model_manager.sync_preset_provider_models("fake-preset") == {"added": 0, "updated": 0}
     assert json.loads(cfg.read_text(encoding="utf-8")) == {"providers": [], "active_model_id": None}
 
 
@@ -622,7 +690,7 @@ def test_preset_add_and_sync_paths_carry_computer_metadata(tmp_path, monkeypatch
     # sync 增量路径同样透传
     _use_tmp_config(tmp_path, monkeypatch, _preset_provider_config())
     synced = model_manager.sync_preset_provider_models("fake-preset")
-    assert synced == 2
+    assert synced["added"] == 2
     synced_model = next(
         m for m in model_manager.load_config()["providers"][0]["models"]
         if m["name"] == "model-b"

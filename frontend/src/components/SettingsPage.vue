@@ -179,7 +179,17 @@
                 <h3>模型列表</h3>
                 <span>{{ selectedProvider.models?.length || 0 }} 个模型</span>
               </div>
-              <button data-test="add-model" class="secondary-button compact" @click="openModelModal()"><AppIcon name="plus" :size="12" /> 添加模型</button>
+              <div class="model-list-actions">
+                <button
+                  v-if="selectedProviderPresetId"
+                  data-test="sync-preset-models"
+                  class="secondary-button compact"
+                  :disabled="saving"
+                  title="按当前版本的预置目录补齐新增模型并刷新模型参数"
+                  @click="syncPresetModels"
+                ><AppIcon name="refresh" :size="12" /> 同步预置模型</button>
+                <button data-test="add-model" class="secondary-button compact" @click="openModelModal()"><AppIcon name="plus" :size="12" /> 添加模型</button>
+              </div>
             </div>
             <div v-if="!selectedProvider.models?.length" class="empty-models">该厂商暂无模型</div>
             <div v-else class="configured-models">
@@ -729,6 +739,17 @@ const selectedPreset = computed(() => selectedKind.value === 'preset'
 const selectedProvider = computed(() => selectedKind.value === 'provider'
   ? store.providers.find(item => item.id === selectedId.value)
   : undefined);
+// 手动添加的老厂商可能没落 preset_id 链接：按厂商名或 Base URL 认领预置目录，
+// 让「同步预置模型」对这类配置同样可用
+const selectedProviderPresetId = computed(() => {
+  const provider = selectedProvider.value;
+  if (!provider) return '';
+  if (provider.preset_id) return provider.preset_id;
+  const matched = store.modelPresets.find(
+    item => item.name === provider.name || item.base_url === provider.base_url,
+  );
+  return matched?.id || '';
+});
 const configuredPresetIds = computed(() => new Set(
   store.providers.map(item => item.preset_id).filter(Boolean) as string[],
 ));
@@ -882,6 +903,14 @@ async function saveProvider() {
   );
   providerForm.api_key = '';
   showProviderKey.value = false;
+  saving.value = false;
+}
+
+async function syncPresetModels() {
+  const presetId = selectedProviderPresetId.value;
+  if (!presetId) return;
+  saving.value = true;
+  await store.syncPresetModels(presetId);
   saving.value = false;
 }
 
@@ -1239,6 +1268,7 @@ onMounted(async () => {
 .danger-icon { border: 0; background: transparent; color: var(--text-faint); font-size: 18px; }
 .danger-icon:hover, .row-actions .danger:hover { color: var(--red); }
 .model-list-header { display: flex; align-items: center; justify-content: space-between; margin: 34px 0 10px; }
+.model-list-actions { display: flex; align-items: center; gap: 8px; }
 .model-list-header h3 { margin: 0 0 4px; font-size: 14px; }
 .model-list-header span { color: var(--text-faint); font-size: 11px; }
 .model-main { flex: 1; min-width: 0; display: flex; align-items: center; gap: 12px; }

@@ -110,9 +110,12 @@ cp config.example.json config.json
       "models": [
         {
           "id": "model_1",
-          "name": "agnes-2.0-flash",
-          "litellm_model": "openai/agnes-2.0-flash",
-          "context_window": 128000
+          "name": "agnes-3.0-flash",
+          "litellm_model": "openai/agnes-3.0-flash",
+          "context_window": 512000,
+          "supports_vision": true,
+          "supports_function_calling": true,
+          "max_tokens": 65535
         },
         {
           "id": "model_2",
