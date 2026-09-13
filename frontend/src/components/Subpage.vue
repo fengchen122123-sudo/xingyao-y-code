@@ -10,6 +10,12 @@
       <!-- 技能页 -->
       <div v-if="subType === 'skills'">
         <div class="sub-toolbar">
+          <div class="src-filter" data-test="source-filter">
+            <button class="seg-btn" :class="{ active: sourceFilter === 'all' }" data-test="src-filter-all" @click="sourceFilter = 'all'">全部</button>
+            <button class="seg-btn" :class="{ active: sourceFilter === 'builtin' }" data-test="src-filter-builtin" @click="sourceFilter = 'builtin'">内置</button>
+            <button class="seg-btn" :class="{ active: sourceFilter === 'user' }" data-test="src-filter-user" @click="sourceFilter = 'user'">用户</button>
+          </div>
+          <span class="toolbar-spacer"></span>
           <button
             class="chip-btn"
             data-test="refresh-skills-btn"
@@ -23,7 +29,8 @@
         </div>
         <div class="sub-grid">
           <div v-if="store.skills.length === 0" class="sub-empty">暂无可用技能</div>
-          <div v-for="s in store.skills" :key="s.id" class="sub-card">
+          <div v-else-if="filteredSkills.length === 0" class="sub-empty">没有符合筛选条件的技能</div>
+          <div v-for="s in filteredSkills" :key="s.id" class="sub-card">
             <div class="sc-top">
               <div class="sc-ico"><AppIcon name="gem" :size="16" /></div>
               <div class="sc-name">
@@ -36,7 +43,18 @@
               </label>
             </div>
             <div class="sc-desc">{{ s.description || '项目/用户自定义扩展技能' }}</div>
-            <div class="sc-id">{{ s.short_id || s.id }}</div>
+            <div class="sc-id">
+              {{ s.short_id || s.id }}
+              <!-- 已偏离内置版本（曾由内置释放但当前 source 非 builtin）才提供恢复入口：
+                   内置技能本身无需恢复，被用户改过或老索引缺失导致误判为用户的才需要 -->
+              <button
+                v-if="s.from_builtin === true && s.source !== 'builtin'"
+                class="btn primary sc-restore-btn"
+                data-test="restore-skill-btn"
+                title="用内置源覆盖当前技能文件中的用户改动"
+                @click.stop="onRestoreSkill(s)"
+              >恢复内置版本</button>
+            </div>
           </div>
         </div>
       </div>
@@ -80,25 +98,35 @@
       </div>
 
       <!-- 插件页 -->
-      <div v-else-if="subType === 'plugins'" class="sub-grid">
-        <div v-if="store.plugins.length === 0" class="sub-empty">暂无已安装的插件</div>
-        <div v-for="p in store.plugins" :key="p.name" class="sub-card">
-          <div class="sc-top">
-            <div class="sc-ico">⬡</div>
-            <div class="sc-name">
-              {{ p.name }}
-              <span class="pl-ver">v{{ p.version }}</span>
-              <span class="pl-src" :class="p.source">{{ p.source === 'user' ? '用户' : '内置' }}</span>
-            </div>
-            <label class="switch" title="启用/禁用该插件（重启后完全生效）" @click.stop>
-              <input type="checkbox" :checked="p.enabled" @change="store.togglePlugin(p.name, ($event.target as HTMLInputElement).checked)" />
-              <span class="switch-track"></span>
-            </label>
+      <div v-else-if="subType === 'plugins'">
+        <div class="sub-toolbar">
+          <div class="src-filter" data-test="source-filter">
+            <button class="seg-btn" :class="{ active: sourceFilter === 'all' }" data-test="src-filter-all" @click="sourceFilter = 'all'">全部</button>
+            <button class="seg-btn" :class="{ active: sourceFilter === 'builtin' }" data-test="src-filter-builtin" @click="sourceFilter = 'builtin'">内置</button>
+            <button class="seg-btn" :class="{ active: sourceFilter === 'user' }" data-test="src-filter-user" @click="sourceFilter = 'user'">用户</button>
           </div>
-          <div class="sc-desc">{{ p.description || '无描述' }}</div>
-          <div class="sc-id">
-            {{ pluginStatusText(p) }}<template v-if="p.tools.length"> · 工具: {{ p.tools.join(', ') }}</template>
-            <button v-if="p.status === 'untrusted'" class="btn primary sc-trust-btn" title="确认插件内容后加载" @click.stop="store.trustPlugin(p.name)">信任并加载</button>
+        </div>
+        <div class="sub-grid">
+          <div v-if="store.plugins.length === 0" class="sub-empty">暂无已安装的插件</div>
+          <div v-else-if="filteredPlugins.length === 0" class="sub-empty">没有符合筛选条件的插件</div>
+          <div v-for="p in filteredPlugins" :key="p.name" class="sub-card">
+            <div class="sc-top">
+              <div class="sc-ico">⬡</div>
+              <div class="sc-name">
+                {{ p.name }}
+                <span class="pl-ver">v{{ p.version }}</span>
+                <span class="pl-src" :class="p.source">{{ p.source === 'user' ? '用户' : '内置' }}</span>
+              </div>
+              <label class="switch" title="启用/禁用该插件（重启后完全生效）" @click.stop>
+                <input type="checkbox" :checked="p.enabled" @change="store.togglePlugin(p.name, ($event.target as HTMLInputElement).checked)" />
+                <span class="switch-track"></span>
+              </label>
+            </div>
+            <div class="sc-desc">{{ p.description || '无描述' }}</div>
+            <div class="sc-id">
+              {{ pluginStatusText(p) }}<template v-if="p.tools.length"> · 工具: {{ p.tools.join(', ') }}</template>
+              <button v-if="p.status === 'untrusted'" class="btn primary sc-trust-btn" title="确认插件内容后加载" @click.stop="store.trustPlugin(p.name)">信任并加载</button>
+            </div>
           </div>
         </div>
       </div>
@@ -220,6 +248,21 @@ const desc = computed(() => {
 
 const refreshingSkills = ref(false);
 
+// 来源筛选：全部 / 内置 / 用户，口径与卡片角标一致——
+// 技能缺 source（旧版后端）按用户算，插件非 'user' 按内置算
+type SourceFilterValue = 'all' | 'builtin' | 'user';
+const sourceFilter = ref<SourceFilterValue>('all');
+watch(() => props.subType, () => { sourceFilter.value = 'all'; });
+
+const filteredSkills = computed(() => {
+  if (sourceFilter.value === 'all') return store.skills;
+  return store.skills.filter(s => (s.source === 'builtin' ? 'builtin' : 'user') === sourceFilter.value);
+});
+const filteredPlugins = computed(() => {
+  if (sourceFilter.value === 'all') return store.plugins;
+  return store.plugins.filter(p => (p.source === 'user' ? 'user' : 'builtin') === sourceFilter.value);
+});
+
 async function onRefreshSkills() {
   if (refreshingSkills.value) return;
   refreshingSkills.value = true;
@@ -232,6 +275,19 @@ async function onRefreshSkills() {
 
 function onToggleSkill(s: SkillInfo, checked: boolean) {
   store.toggleSkill(s.id, checked);
+}
+
+// 恢复内置版本会用内置源覆盖用户改动（破坏性），先复用项目统一的 askConfirm
+// 二次确认（与删除模型/撤销回合同一机制，底层是全局 ConfirmModal），
+// 确认后再调 store action；失败提示由 store.restoreSkill 内部统一处理
+async function onRestoreSkill(s: SkillInfo) {
+  const ok = await store.askConfirm(
+    '恢复内置版本',
+    s.name || s.id,
+    `将用内置源覆盖技能「${s.name || s.id}」，你在该技能文件里的改动会丢失。`,
+    '恢复内置版本 ⏎',
+  );
+  if (ok) await store.restoreSkill(s.id);
 }
 
 function onToggleMcp(m: McpInfo, checked: boolean) {
@@ -435,7 +491,42 @@ async function testModelRow(m: ModelInfo) {
   max-width: 960px;
   margin: 0 auto 14px;
   display: flex;
+  align-items: center;
   justify-content: flex-end;
+  gap: 10px;
+}
+.toolbar-spacer {
+  flex: 1;
+}
+/* 来源分段筛选：全部 / 内置 / 用户 */
+.src-filter {
+  display: inline-flex;
+  align-items: center;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 2px;
+  gap: 2px;
+}
+.src-filter .seg-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-dim);
+  font-size: 12px;
+  line-height: 1;
+  padding: 5px 12px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: 0.15s;
+  font-family: inherit;
+}
+.src-filter .seg-btn:hover {
+  color: var(--text);
+}
+.src-filter .seg-btn.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
 }
 .sub-empty {
   color: var(--text-faint);
@@ -496,6 +587,14 @@ async function testModelRow(m: ModelInfo) {
   margin-left: 8px;
   padding: 1px 8px;
   font-size: 10px;
+  vertical-align: middle;
+}
+/* 技能卡片「恢复内置版本」按钮：与信任按钮同量级的次级操作外观 */
+.sub-card .sc-restore-btn {
+  margin-left: 8px;
+  padding: 1px 10px;
+  font-size: 10px;
+  line-height: 1.6;
   vertical-align: middle;
 }
 

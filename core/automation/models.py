@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import os
+
 from core.automation.scheduling import TRIGGER_TYPES, validate_trigger
 
-# 无人值守权限档位（语义完全复用 core/permission_policy.py，不另造判定）。
-PERMISSION_MODES = ("confirm", "accept_edits", "full")
+# 无人值守权限档位（语义完全复用 core/permission_policy.py，不另造判定）；
+# plan=计划模式（只读查询与规划）与人工回合同源，升级到确认弹窗的请求
+# 依然按无人值守语义立即自动拒绝（_activate_permission_request）。
+PERMISSION_MODES = ("confirm", "accept_edits", "plan", "full")
 
 # 错过触发（应用未运行）的处理策略。
 MISSED_RUN_POLICIES = ("skip", "run_once")
@@ -32,6 +36,8 @@ MAX_TASKS = 64
 MAX_NAME_CHARS = 50
 MAX_PROMPT_CHARS = 6000
 MAX_SESSION_CHARS = 100
+MAX_WORKDIR_CHARS = 500
+MAX_MODEL_ID_CHARS = 100
 
 WEEKDAY_NAMES = {1: "一", 2: "二", 3: "三", 4: "四", 5: "五", 6: "六", 7: "日"}
 
@@ -59,6 +65,27 @@ def validate_task(task: dict) -> list[str]:
         errors.append("目标会话不能为空")
     elif len(target_session.strip()) > MAX_SESSION_CHARS:
         errors.append(f"目标会话名不能超过 {MAX_SESSION_CHARS} 个字符")
+
+    # 工作目录可选：空 = 跟随目标会话归属（已有会话以其登记目录为权威）；
+    # "GLOBAL" = 目标会话不存在时挂到自由对话分组；其余必须是真实存在的
+    # 目录（回合 worker 对不存在的目录会直接报错，保存时就拦住更友好）。
+    workdir = str(task.get("workdir") or "").strip()
+    if workdir:
+        if len(workdir) > MAX_WORKDIR_CHARS:
+            errors.append(f"工作目录路径不能超过 {MAX_WORKDIR_CHARS} 个字符")
+        elif workdir != "GLOBAL" and not os.path.isdir(workdir):
+            errors.append("工作目录不存在，请重新选择")
+
+    # 指定模型可选：空 = 跟随会话绑定/全局默认；非空必须是配置中的模型 id
+    # （存在性由桥层对照 load_config 校验，这里只做类型与长度防御）
+    model_id = task.get("model_id")
+    if model_id not in (None, ""):
+        if not isinstance(model_id, str):
+            errors.append("指定模型必须是字符串 id")
+        elif not model_id.strip():
+            pass
+        elif len(model_id.strip()) > MAX_MODEL_ID_CHARS:
+            errors.append(f"模型 id 不能超过 {MAX_MODEL_ID_CHARS} 个字符")
 
     if task.get("permission_mode") not in PERMISSION_MODES:
         errors.append(f"无人值守权限档位必须是 {'/'.join(PERMISSION_MODES)} 之一")

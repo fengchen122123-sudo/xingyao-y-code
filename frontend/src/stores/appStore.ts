@@ -620,6 +620,9 @@ export const useAppStore = defineStore('app', {
       isRoot: true,
       selected: '',
       dirs: [] as Array<{ name: string; path: string }>,
+      // 纯选目录模式：非空时确认只把所选路径交给该回调（不登记工作区、
+      // 不迁移会话归属），供自动化任务表单等场景使用
+      plainPick: null as null | ((path: string) => void),
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
@@ -825,6 +828,8 @@ export const useAppStore = defineStore('app', {
       // 模型选择随会话保存：切换会话时各会话恢复各自的模型，互不覆盖
       runtime.modelId = this.activeModelId;
       runtime.modelName = this.activeModelName;
+      // 权限档位随会话保存：选择只影响当前会话，不再全局生效
+      runtime.permMode = this.permissionMode;
       // 本回合用到的技能随会话保存
       runtime.usedSkills = this.usedSkills;
     },
@@ -868,6 +873,11 @@ export const useAppStore = defineStore('app', {
           this.activeModelId = runtime.modelId;
           this.activeModelName = runtime.modelName || this.activeModelName;
         }
+      }
+      // 权限档位随会话即时恢复（不等后端 switch_session 响应）：
+      // 该会话选过档位才恢复，否则保持当前值由后端响应校正
+      if (runtime.permMode) {
+        this.permissionMode = runtime.permMode as PermissionMode;
       }
     },
 
@@ -1772,10 +1782,16 @@ export const useAppStore = defineStore('app', {
       const prev = this.permissionMode;
       const api = this._api();
       if (!api) return;
+      // 权限选择是会话级的：只绑定当前会话，不再全局生效
+      const sessionName = this.currentSessionName;
       try {
-        const res = await api.set_permission_mode(mode);
+        const res = await api.set_permission_mode(mode, sessionName || undefined);
         if (res && res.ok) {
           this.permissionMode = res.permission_mode || mode;
+          // pending 草稿会话后端绑不上（还没落库），先存运行时，
+          // 首条消息发送时随 send_user_message 带给后端补绑定
+          const runtime = this._getSessionRuntime(sessionName);
+          runtime.permMode = this.permissionMode;
           // 空会话插提示会让欢迎页消失（表现为页面跳转），仅会话已有真实对话时才提示
           if (this.messages.some(m => m.role === 'user' || m.role === 'assistant')) {
             this.notifyChat('权限模式已调整: ' + formatPermMode(this.permissionMode));
@@ -2209,7 +2225,10 @@ export const useAppStore = defineStore('app', {
     },
 
     async switchSession(sessionName: string, displayName?: string, targetWorkdir?: string) {
-      // 切换到已有会话时丢弃未发送的空白 pending 会话
+      // 切换到已有会话时丢弃未发送的空白 pending 会话；
+      // 同时收起子页面：切会话即要看该会话的聊天视图（删除会话后的
+      // 自动切换、通知路由等非侧栏入口同样生效）
+      this.subpage.show = false;
       this._captureCurrentRuntime();
       this.pendingWorkdir = null;
       this.currentSessionName = sessionName;
@@ -2303,6 +2322,14 @@ export const useAppStore = defineStore('app', {
           runtime2.modelId = this.activeModelId;
           runtime2.modelName = this.activeModelName;
         }
+
+        // 会话级权限档位：以后端落库绑定（或全局兜底）校正本地显示，
+        // 避免 A 会话选的档位串到 B 会话
+        if (res.permission_mode) {
+          this.permissionMode = res.permission_mode;
+          const runtimePerm = this._getSessionRuntime(sessionName);
+          runtimePerm.permMode = res.permission_mode;
+        }
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
@@ -2373,6 +2400,9 @@ export const useAppStore = defineStore('app', {
 
     async createGlobalSession() {
       // 懒创建：只切换到空白自由对话状态，首条消息发出时才真正落库
+      // 新会话意味着回到聊天视图：Skills/MCP/插件/自动化等子页面打开时
+      // 点侧栏"+"也要收起子页面，否则状态已切换但界面停在子页（像没反应）
+      this.subpage.show = false;
       const inheritedModelId = this.activeModelId;
       const inheritedModelName = this.activeModelName;
       this._captureCurrentRuntime();
@@ -2415,7 +2445,8 @@ export const useAppStore = defineStore('app', {
     async createSessionInGroup(targetWorkdir: string) {
       // 秒开：前端已有工作区上下文（新会话首条消息发出时才懒落库），
       // 不再同步等后端 get_workspace_state 扫文件树（大目录要数秒，
-      // 表现为“点新会话特别慢”）。
+      // 表现为“点新会话特别慢”）。同 createGlobalSession：收起子页面回聊天视图
+      this.subpage.show = false;
       const treeMatches = this.workdir === targetWorkdir;
       const inheritedModelId = this.activeModelId;
       const inheritedModelName = this.activeModelName;
@@ -2580,6 +2611,26 @@ export const useAppStore = defineStore('app', {
 
     closeRemoteDirBrowser() {
       this.remoteDirBrowser.show = false;
+      this.remoteDirBrowser.plainPick = null;
+    },
+
+    // ---- 纯选目录（自动化任务表单等）：桌面走原生对话框，失败回退内置浏览器 ----
+    async pickFolderPlain(cb: (path: string) => void) {
+      const api = this._api();
+      if (!api) return;
+      if (!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches)) {
+        try {
+          const res = await (api as any).pick_folder_dialog();
+          if (res && res.ok && res.path) {
+            cb(String(res.path));
+            return;
+          }
+          // 用户主动取消原生对话框：静默返回，不弹内置浏览器
+          if (res && !res.ok && res.msg === '已取消选择') return;
+        } catch { /* 原生对话框不可用时回退内置浏览器 */ }
+      }
+      this.remoteDirBrowser.plainPick = cb;
+      await this.openRemoteDirBrowser();
     },
 
     async confirmRemoteWorkspace(useCurrent = false) {
@@ -2588,6 +2639,14 @@ export const useAppStore = defineStore('app', {
       // 未勾选时允许直接把当前浏览目录作为工作区（"使用当前目录"按钮）
       const path = this.remoteDirBrowser.selected
         || (useCurrent ? this.remoteDirBrowser.current : '');
+      // 纯选目录模式：只把路径交给回调，不登记工作区、不迁移会话归属
+      if (this.remoteDirBrowser.plainPick) {
+        if (!path) return;
+        const picked = this.remoteDirBrowser.plainPick;
+        this.closeRemoteDirBrowser();
+        picked(path);
+        return;
+      }
       if (!path) return;
       try {
         const res = await (api as any).select_workspace_by_path(path);
@@ -2756,6 +2815,8 @@ export const useAppStore = defineStore('app', {
           attachList,
           pendingDir,
           pendingDir ? (this.draftModelId || undefined) : (this.activeModelId || undefined),
+          // pending 草稿会话选过的权限档位随首条消息带给后端补绑定
+          this._getSessionRuntime(sessionName).permMode || undefined,
         );
         if (res && res.ok) {
           // 草稿模型已随后端落库（或本就不存在），不再保留待重发状态
@@ -3749,6 +3810,27 @@ export const useAppStore = defineStore('app', {
         return false;
       } catch (err) {
         this.notifyModal('技能', '刷新技能列表失败: ' + err);
+        return false;
+      }
+    },
+
+    // 恢复内置版本：用内置源覆盖用户改动后的技能副本。
+    // 与 refreshSkills 同风格——成功时直接用后端回传的 skills 覆盖列表，
+    // 失败统一走 notifyModal 提示 msg，不静默吞掉错误。
+    async restoreSkill(skillId: string): Promise<boolean> {
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const res = await api.restore_skill(skillId);
+        if (res && res.ok && Array.isArray(res.skills)) {
+          this.skills = res.skills;
+          return true;
+        }
+        this.notifyModal('技能', '恢复内置版本失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        return false;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('技能', '恢复内置版本失败: ' + err);
         return false;
       }
     },

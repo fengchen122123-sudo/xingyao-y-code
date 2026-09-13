@@ -26,6 +26,9 @@ export interface SessionRuntimeState {
   // 由后端 switch_session 响应校正为该会话落库的绑定模型
   modelId?: string;
   modelName?: string;
+  // 该会话的权限档位（含未落库的 pending 草稿会话）：权限选择只影响当前会话，
+  // 切换会话时即时恢复；后端 switch_session 响应按会话落库绑定校正
+  permMode?: string;
   // 本回合实际用到的技能名（从 is_skill 工具调用收集）：随会话保存/恢复，
   // 状态栏"技能"项据此显示；回合开始时清空，回合结束后固化为本回合结果
   usedSkills?: string[];

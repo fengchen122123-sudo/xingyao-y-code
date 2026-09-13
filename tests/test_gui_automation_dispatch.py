@@ -164,6 +164,182 @@ def test_drain_message_queue_passes_automation_context(manager, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# 任务工作目录（workdir）：新会话懒创建归属
+# ---------------------------------------------------------------------------
+
+def test_dispatch_new_session_carries_task_workdir(manager, tmp_path):
+    """任务指定 workdir 且目标会话未落库：spawn 带 pending_workdir 供懒创建绑定。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    task, run = _create_task_with_run(bridge, workdir=str(project_dir))
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    assert len(spawned) == 1
+    assert spawned[0][1]["pending_workdir"] == str(project_dir)
+
+
+def test_dispatch_global_workdir_for_new_session(manager, tmp_path):
+    """GLOBAL：新会话挂自由对话分组，原样透传给 worker。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    task, run = _create_task_with_run(bridge, workdir="GLOBAL")
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    assert spawned[0][1]["pending_workdir"] == "GLOBAL"
+
+
+def test_dispatch_existing_session_keeps_own_workdir(manager, tmp_path):
+    """目标会话已存在：会话自身归属是权威，任务 workdir 不改写。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    manager.ensure_session("自动化任务", workdir=str(tmp_path / "other"), source="GUI")
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    task, run = _create_task_with_run(bridge, workdir=str(project_dir))
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    assert spawned[0][1].get("pending_workdir", "") == ""
+
+
+def test_dispatch_no_workdir_keeps_legacy_behavior(manager, tmp_path):
+    """旧任务（无 workdir）：不传 pending_workdir，行为与引入前一致。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    task, run = _create_task_with_run(bridge)
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    assert spawned[0][1].get("pending_workdir", "") == ""
+
+
+def test_dispatch_busy_queues_workdir_and_drain_rechecks(manager, tmp_path):
+    """忙时入队携带 pending_workdir；补发时会话已被创建则放弃改绑。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path, is_turn_active=True)
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    task, run = _create_task_with_run(bridge, workdir=str(project_dir))
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+    entry = bridge._message_queues["自动化任务"][0]
+    assert entry["pending_workdir"] == str(project_dir)
+
+    # 会话在排队期间被其他回合创建 → 补发时以会话自身归属为准
+    manager.ensure_session("自动化任务", workdir=str(tmp_path / "other"), source="GUI")
+    bridge._is_turn_active = lambda s: False
+    bridge._drain_message_queue("自动化任务")
+    assert len(spawned) == 1
+    assert spawned[0][1].get("pending_workdir", "") == ""
+
+
+def test_save_automation_task_validates_workdir(manager, tmp_path):
+    """桥层保存校验：目录不存在拒绝，GLOBAL 与真实目录放行。"""
+    bridge, _, _ = _make_bridge(manager, tmp_path)
+
+    bad = bridge.save_automation_task(_task_dict(workdir=str(tmp_path / "no-such-dir")))
+    assert bad["ok"] is False
+    assert any("工作目录" in e for e in bad["errors"])
+
+    assert bridge.save_automation_task(_task_dict(workdir="GLOBAL"))["ok"] is True
+    real_dir = tmp_path / "proj"
+    real_dir.mkdir()
+    ok = bridge.save_automation_task(_task_dict(name="t2", workdir=str(real_dir)))
+    assert ok["ok"] is True
+
+
+# ---------------------------------------------------------------------------
+# 任务指定模型（model_id）：回合用该模型执行
+# ---------------------------------------------------------------------------
+
+def test_dispatch_passes_task_model(manager, tmp_path):
+    """任务指定模型：直发 spawn 带 pending_model_id。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    task, run = _create_task_with_run(bridge, model_id="m-task")
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    assert len(spawned) == 1
+    assert spawned[0][1]["pending_model_id"] == "m-task"
+
+
+def test_dispatch_no_model_keeps_legacy_behavior(manager, tmp_path):
+    """旧任务（无 model_id）：不传 pending_model_id。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path)
+    task, run = _create_task_with_run(bridge)
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+
+    assert spawned[0][1].get("pending_model_id", "") == ""
+
+
+def test_dispatch_busy_queues_model_and_drain_forwards(manager, tmp_path):
+    """忙时入队携带任务模型；补发回合同样透传给 worker。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path, is_turn_active=True)
+    task, run = _create_task_with_run(bridge, model_id="m-task")
+
+    bridge._dispatch_automation_run(task, run["id"], "scheduled")
+    entry = bridge._message_queues["自动化任务"][0]
+    assert entry["automation_model_id"] == "m-task"
+
+    bridge._is_turn_active = lambda s: False
+    bridge._drain_message_queue("自动化任务")
+    assert len(spawned) == 1
+    assert spawned[0][1]["pending_model_id"] == "m-task"
+
+
+def test_worker_binds_pending_model_for_new_session(manager, tmp_path):
+    """pending_model_id：worker 落库会话并绑定任务模型（ GLOBAL 兜底归属）。"""
+    bridge, _, _ = _make_bridge(manager, tmp_path)
+    task_obj, run = _create_task_with_run(bridge)
+    bridge._automation_storage.mark_run_running(run["id"])
+
+    with _WorkerHarness(bridge, manager, tmp_path, consume_return=False):
+        bridge._run_turn_worker(
+            "汇总昨日进展", "自动化任务",
+            internal_kind="automation",
+            automation_context={"run_id": run["id"], "task_name": "每日摘要",
+                                "permission_mode": "confirm"},
+            pending_model_id="m-task",
+        )
+
+    assert manager.get_session_model_id("自动化任务") == "m-task"
+    # 会话已按 GLOBAL 兜底落库（任务未指定 workdir 的旧数据场景）
+    names = [s.get("name") for s in manager.get_all_sessions(workdir=None, include_empty=True)]
+    assert "自动化任务" in names
+
+
+def test_worker_without_pending_model_keeps_binding_untouched(manager, tmp_path):
+    """未指定模型：worker 不改写会话既有模型绑定。"""
+    bridge, _, _ = _make_bridge(manager, tmp_path)
+    manager.ensure_session("自动化任务", workdir="GLOBAL", source="GUI")
+    manager.set_session_model_id("自动化任务", "m-original")
+
+    with _WorkerHarness(bridge, manager, tmp_path, consume_return=False):
+        bridge._run_turn_worker("你好", "自动化任务")
+
+    assert manager.get_session_model_id("自动化任务") == "m-original"
+
+
+def test_save_automation_task_validates_model_id(manager, tmp_path, monkeypatch):
+    """桥层保存校验：模型必须存在于配置；保存后回读一致。"""
+    import gui_bridge as gb
+
+    monkeypatch.setattr(
+        "gui_bridge.load_config",
+        lambda: {"providers": [{"models": [{"id": "m-ok"}]}]},
+    )
+    bridge, _, _ = _make_bridge(manager, tmp_path)
+
+    bad = bridge.save_automation_task(_task_dict(model_id="m-gone"))
+    assert bad["ok"] is False
+    assert any("模型" in e for e in bad["errors"])
+
+    ok = bridge.save_automation_task(_task_dict(model_id="m-ok"))
+    assert ok["ok"] is True
+    assert bridge.get_automation_tasks()["tasks"][0]["model_id"] == "m-ok"
+
+
+# ---------------------------------------------------------------------------
 # _run_turn_worker 终态回写（真实 worker + 桩模型入口）
 # ---------------------------------------------------------------------------
 

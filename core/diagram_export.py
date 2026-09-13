@@ -36,8 +36,10 @@ _LAST_EXPORT: Path | None = None
 
 
 def get_diagrams_dir() -> Path:
-    """图表 HTML 的落盘目录：与 /share 导出共用 ~/.ycode/exports 约定。"""
-    return Path.home() / ".ycode" / "exports" / "diagrams"
+    """图表 HTML 的落盘目录：与 /share 导出共用目录约定（跟随 YCODE_DATA_DIR）。"""
+    from core.share import default_export_dir
+
+    return default_export_dir() / "diagrams"
 
 
 def get_mermaid_js_path() -> Path | None:
