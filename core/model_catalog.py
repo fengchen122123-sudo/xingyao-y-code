@@ -56,10 +56,12 @@ PRESET_PROVIDERS = (
         "base_url": "https://apihub.agnes-ai.cn/v1",
         "protocol": "openai",
         "models": [
-            {"name": "agnes-2.0-flash", "context_window": 1000000,
-             "supports_vision": True},
-            {"name": "agnes-2.5-flash", "context_window": 1000000,
-             "supports_vision": True},
+            {"name": "agnes-3.0-flash", "context_window": 512000,
+             "supports_vision": True, "supports_function_calling": True,
+             "max_tokens": 65535},
+            {"name": "agnes-2.5-flash", "context_window": 512000,
+             "supports_vision": True, "supports_function_calling": True,
+             "max_tokens": 65535},
         ],
     },
     {

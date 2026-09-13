@@ -38,9 +38,25 @@ def test_non_deepseek_unknown_models_stay_hidden():
     for name in (
         "some-future-model",
         "my-deepseek-clone",
+        "my-agnes-clone",
         "qwen3.9-max",
     ):
         assert get_reasoning_capability(name).kind == "hidden", name
+
+
+def test_agnes_prefixed_names_resolve_to_toggle_capability():
+    """任何 agnes 前缀模型（不区分大小写，含未来新版本）统一按
+    chat_template_kwargs.enable_thinking 开关适配，无需逐个登记。"""
+    for name in (
+        "agnes-3.0-flash",
+        "openai/AGNES-4.0-future",
+        "agnes-9",
+        "https://gateway.example/v1/agnes-custom",
+    ):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "toggle", name
+        assert capability.options == ("default", "off", "on"), name
+        assert capability.request_strategy == "agnes_enable_thinking", name
 
 
 def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
@@ -77,8 +93,8 @@ def test_each_adjustable_model_exposes_only_its_real_reasoning_choices():
         "LongCat-2.0": ("default", "off", "on"),
         "step-3.7-flash": ("default", "low", "medium", "high"),
         "step-router-v1": ("default", "low", "medium", "high"),
-        "agnes-2.0-flash": ("default", "off", "on"),
         "agnes-2.5-flash": ("default", "off", "on"),
+        "agnes-3.0-flash": ("default", "off", "on"),
         "hy3": ("default", "off", "on"),
     }
 

@@ -1966,10 +1966,11 @@ class ApiBridge:
             logger.warning("序列化事件 %s 失败: %s", event_type, e)
             return
         self._queue_js_payload(payload)
-        # 广播到局域网手机客户端（broadcast 内部已吞异常，不影响桌面 JS 派发）
+        # 广播到局域网手机客户端（broadcast 内部已吞异常，不影响桌面 JS 派发）；
+        # event_type 供 LAN 层判定断线补发白名单（丢事件类别不参与补发）
         lan = getattr(self, "_lan_server", None)
         if lan is not None:
-            lan.broadcast(payload)
+            lan.broadcast(payload, event_type=event_type)
 
     def _queue_js_payload(self, payload: str) -> None:
         """唯一入队点：保证派发线程存在后 put_nowait；队列满丢弃新事件并计数。"""
@@ -6984,15 +6985,24 @@ class ApiBridge:
             return {"ok": False, "msg": str(e)}
 
     def sync_preset_models(self, preset_id: str) -> Dict[str, Any]:
-        """把预置目录中该厂商新增的模型增量合并进用户配置（只追加不删除）。"""
+        """把预置目录中该厂商的模型合并进用户配置（追加缺失+刷新目录元数据）。"""
         try:
-            added = mm_sync_preset_provider_models(str(preset_id))
+            counts = mm_sync_preset_provider_models(str(preset_id))
+            added = int(counts.get("added", 0))
+            updated = int(counts.get("updated", 0))
             self._sync_active_model_context()
+            parts = []
+            if added:
+                parts.append(f"新增 {added} 个模型")
+            if updated:
+                parts.append(f"更新 {updated} 个模型参数")
+            msg = "，".join(parts) if parts else "预置模型已是最新"
             return {
                 "ok": True,
                 "added": added,
+                "updated": updated,
                 "settings": self.get_model_settings(),
-                "msg": f"已同步 {added} 个新模型" if added else "预置模型已是最新",
+                "msg": msg,
             }
         except KeyError:
             # 预置目录随版本更新会下架厂商，旧 config 中的 preset_id 于是成为未知厂商。

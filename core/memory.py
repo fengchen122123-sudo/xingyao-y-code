@@ -122,21 +122,58 @@ def message_content_to_text(raw_content):
     return str(parsed)
 
 
+def _tool_call_is_replayable(tc) -> bool:
+    """判定历史里的 assistant tool call 是否可原样回放给 provider。
+
+    严格网关（如 Agnes AI）对 name 为空或 arguments 不是合法 JSON 的
+    tool call 直接 400 整个请求，坏记录落库后该会话每轮复现。此判定
+    只读不改：不可回放的调用连同其 tool 结果在回放历史中剔除，
+    DB 原文不动，会话即可自愈。
+    """
+    if not isinstance(tc, dict):
+        return False
+    function = tc.get("function") or {}
+    if not str(function.get("name") or "").strip():
+        return False
+    # 缺 arguments 键按无参调用处理（与执行层 _tool_call_arguments 的
+    # 默认值一致）；键存在但为空串/非字符串/非法 JSON 才判不可回放
+    raw = function.get("arguments", "{}")
+    if not isinstance(raw, str) or not raw.strip():
+        return False
+    try:
+        json.loads(raw)
+    except ValueError:
+        return False
+    return True
+
+
 def _sanitize_tool_call_pairing(history):
     """修复 tool_call 配对，避免坏历史导致 API 报错后整个会话无法继续使用。
 
-    两种损坏形态（典型成因：记忆压缩边界切在 assistant(tool_calls) 与其 tool 结果之间）：
+    三种损坏形态：
     1. 孤儿 tool 消息：tool_call_id 未在前面任何 assistant.tool_calls 中声明，
        API 会报 "tool_call_id is not found" → 直接丢弃该 tool 消息。
     2. assistant 声明了 tool_calls 但历史中缺少对应 tool 结果，
        API 会报 "assistant message with tool_calls must be followed by tool messages"
        → 移除该 assistant 的 tool_calls 字段（保留文本内容）。
+    3. tool call 本身不可回放（函数名为空 / arguments 非法 JSON，
+       典型成因：上游网关流式吐出残缺调用被原样落库）→ 从回放历史
+       中剔除该调用，其 tool 结果按形态 1 连带丢弃。
     """
     announced = set()
     for msg in history:
         if msg.get("role") != "assistant":
             continue
-        for tc in msg.get("tool_calls") or []:
+        tool_calls = msg.get("tool_calls") or []
+        if not tool_calls:
+            continue
+        replayable = [tc for tc in tool_calls if _tool_call_is_replayable(tc)]
+        if len(replayable) != len(tool_calls):
+            if replayable:
+                msg["tool_calls"] = replayable
+            else:
+                msg.pop("tool_calls", None)
+        for tc in replayable:
             if isinstance(tc, dict) and tc.get("id"):
                 announced.add(tc["id"])
 

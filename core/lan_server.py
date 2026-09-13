@@ -16,6 +16,7 @@ import secrets
 import socket
 import threading
 import time
+from collections import deque
 
 import qrcode
 from http import HTTPStatus
@@ -26,6 +27,27 @@ from websockets.sync.server import serve
 
 import config
 from config import save_config_value as _save_config_value
+
+# 手机端断线补发事件白名单：低频、状态关键、前端幂等（或自带去重）的事件。
+# 手机锁屏/切后台时 WebSocket 静默断开，断线窗口内的广播会永久丢失（表现为
+# 「电脑端报错了手机端没有任何提示」）；重连后按 last_seq 从补发缓冲回放
+# 白名单事件即可追平状态。高频/大体积事件（token_delta、thinking_delta、
+# step_metrics、subagent_progress、terminal_output、tool_start/finish 等）
+# 不进缓冲——流式缺失由 message_final 终态全文自愈校正，工具卡片状态由
+# turn 终态事件收敛。
+REPLAYABLE_EVENT_TYPES = frozenset({
+    "notice", "error",
+    "turn_start", "turn_finish", "turn_cancelled", "turn_error",
+    "message_final", "message_queue",
+    "permission_request", "permission_dismiss",
+    "model_changed", "session_renamed", "active_session_changed",
+    "plan_updated", "plan_item_handoff", "turn_undo_updated",
+    "background_task_finished", "background_subagent_terminal",
+    "automation_tasks_changed", "automation_run_updated",
+})
+
+# 补发缓冲上限：白名单事件均为低频事件，128 条足够覆盖一次长断线窗口
+_REPLAY_BUFFER_MAX = 128
 
 # 手机端传输 shim 的内嵌快照：_serve_shim() 优先读磁盘上的
 # frontend/mobile-shim.js（随包分发、可独立更新）；磁盘文件读不到时
@@ -40,9 +62,12 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
  * 复用全部组件与主题。
  *
  * 约定（与 core/lan_server.py 对齐）：
- * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验。
+ * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验；断线重连时附带
+ *   {"token", "last_seq"}，服务器按补发缓冲回放缺失的关键事件
+ *   （turn_error/notice/permission_request 等，见 REPLAYABLE_EVENT_TYPES）。
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
- * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串）。
+ * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
+ *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
  */
 (function () {
   if (window.pywebview) return; // 桌面环境不注入，防御性
@@ -52,6 +77,8 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
 
   var ws = null;
   var seq = 0;
+  var lastSeq = 0;        // 最后收到的补发事件 seq（服务器侧单调递增）
+  var hadConnection = false; // 是否发生过连接：区分全新页面与断线重连
   var pending = new Map(); // id -> {resolve, reject}
 
   function rpc(method, args) {
@@ -69,7 +96,13 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
   function connect() {
     ws = new WebSocket(wsUrl);
     ws.onopen = function () {
-      ws.send(JSON.stringify({ token: token }));
+      var auth = { token: token };
+      if (hadConnection) {
+        // 断线重连：携带水位请求补发，锁屏/切后台期间的关键事件不丢
+        auth.last_seq = lastSeq;
+      }
+      hadConnection = true;
+      ws.send(JSON.stringify(auth));
       // 就绪后才注入 api，并触发前端等待的 pywebviewready 事件
       window.pywebview = {
         api: new Proxy({}, {
@@ -101,9 +134,14 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
             p.resolve(msg.result);
           }
         }
-      } else if (msg && msg.type && window.onBridgeEvent) {
-        // 事件广播（对象 {type, data}）
-        window.onBridgeEvent(msg);
+      } else if (msg && msg.type) {
+        if (typeof msg.seq === 'number' && msg.seq > lastSeq) {
+          lastSeq = msg.seq; // 先记录水位再派发，避免处理器抛错丢水位
+        }
+        if (window.onBridgeEvent) {
+          // 事件广播（对象 {type, data, seq?}）
+          window.onBridgeEvent(msg);
+        }
       }
     };
     ws.onclose = function () {
@@ -173,6 +211,9 @@ class LanServer:
         self._ttl = 86400
         self._server = None
         self._thread: Optional[threading.Thread] = None
+        # 断线补发：单调事件序号 + 白名单事件环形缓冲（见 REPLAYABLE_EVENT_TYPES）
+        self._event_seq = 0
+        self._replay_buffer: deque = deque(maxlen=_REPLAY_BUFFER_MAX)
 
     # ------------------------------------------------------------------ #
     # 网络探测 / URL / token
@@ -267,12 +308,46 @@ class LanServer:
         校验与注册在同一把锁内完成，避免与 _issue_token 的轮换竞态：
         旧 token 校验通过的瞬间不会被并发重签钻空子。
         """
+        registered, _ = self._register_and_collect_replay(ws, token, None)
+        return registered
+
+    def _register_and_collect_replay(self, ws, token, last_seq):
+        """校验 token 并原子注册客户端，同时取出该客户端缺失的补发快照。
+
+        返回 ``(registered, replay_items)``。校验、注册与补发快照在同一把
+        _clients_lock 内完成：快照之后广播的事件必然已包含新客户端
+        （broadcast 在同一把锁内拷贝客户端列表），补发 ∪ 实时不重不漏。
+        ``last_seq`` 为 None 表示全新页面（非断线重连），不补发。
+        """
         with self._clients_lock:
             if not self._verify_token(token):
-                return False
+                return False, []
             self._clients.append(ws)
             self._client_locks[ws] = threading.Lock()
-            return True
+            if last_seq is None:
+                return True, []
+            replay = [
+                payload for seq, payload in self._replay_buffer
+                if seq > last_seq
+            ]
+            return True, replay
+
+    def _send_replay(self, ws, replay_items) -> None:
+        """按序补发缺失事件；与实时广播共用每客户端发送锁保证顺序。
+
+        补发期间实时广播对该客户端的 _safe_send 会阻塞在同一把锁上，
+        事件到达顺序与全局 seq 序一致；发送中断（客户端再断）即放弃。
+        """
+        with self._clients_lock:
+            lock = self._client_locks.get(ws)
+        if lock is None or not replay_items:
+            return
+        with lock:
+            for payload in replay_items:
+                try:
+                    ws.send(payload)
+                except Exception:
+                    return
 
     def _load_persisted_token(self, token: str, expires_at) -> None:
         """从持久层恢复配对 token；过期或为空则忽略。
@@ -358,10 +433,39 @@ class LanServer:
     # 事件广播
     # ------------------------------------------------------------------ #
 
-    def broadcast(self, payload: str) -> None:
-        """向所有已连接客户端发送事件 payload，线程安全且异常吞掉。"""
+    def _stamp_and_buffer_locked(self, payload: str) -> str:
+        """白名单事件打序号并进补发缓冲；必须在 _clients_lock 内调用。
+
+        wire 消息追加 ``seq`` 字段（shim 据此记录接收水位）；解析/序列化
+        失败时原样返回不打标——该事件只是不参与补发，不影响实时投递。
+        """
+        try:
+            parsed = json.loads(payload)
+        except Exception:
+            return payload
+        if not isinstance(parsed, dict) or "type" not in parsed:
+            return payload
+        self._event_seq += 1
+        parsed["seq"] = self._event_seq
+        try:
+            stamped = json.dumps(parsed, ensure_ascii=False)
+        except Exception:
+            self._event_seq -= 1
+            return payload
+        self._replay_buffer.append((self._event_seq, stamped))
+        return stamped
+
+    def broadcast(self, payload: str, event_type: str = "") -> None:
+        """向所有已连接客户端发送事件 payload，线程安全且异常吞掉。
+
+        event_type 命中 REPLAYABLE_EVENT_TYPES 时打 seq 并入补发缓冲；
+        客户端断线重连后按各自 last_seq 补发缺失（见 _handle_ws）。
+        未传 event_type（历史调用方/测试）原样发送、不进缓冲。
+        """
         with self._clients_lock:
             clients = list(self._clients)
+            if event_type in REPLAYABLE_EVENT_TYPES:
+                payload = self._stamp_and_buffer_locked(payload)
         for client in clients:
             self._safe_send(client, payload)
 
@@ -370,7 +474,12 @@ class LanServer:
     # ------------------------------------------------------------------ #
 
     def _handle_ws(self, ws) -> None:
-        """WebSocket 连接处理：首消息校验 token → 循环路由 RPC。"""
+        """WebSocket 连接处理：首消息校验 token → 断线补发 → 循环路由 RPC。
+
+        首消息 ``{"token": ...}`` 为全新页面，不补发；带 ``last_seq`` 的
+        首消息为断线重连（shim 记录了最后收到的 seq），按补发缓冲回放
+        缺失的白名单事件后再进入正常循环。
+        """
         try:
             raw = ws.recv(timeout=10)
         except Exception:
@@ -379,14 +488,24 @@ class LanServer:
             msg = json.loads(raw) if isinstance(raw, (str, bytes)) else None
         except Exception:
             msg = None
-        if not isinstance(msg, dict) or not self._authenticate_and_register(
-            ws, msg.get("token")
-        ):
+        last_seq = None
+        if isinstance(msg, dict) and msg.get("last_seq") is not None:
+            try:
+                last_seq = int(msg["last_seq"])
+            except (TypeError, ValueError):
+                last_seq = None
+        token = msg.get("token") if isinstance(msg, dict) else None
+        registered, replay_items = self._register_and_collect_replay(
+            ws, token, last_seq
+        )
+        if not registered:
             try:
                 ws.close(code=4401, reason="invalid token")
             except Exception:
                 pass
             return
+        if replay_items:
+            self._send_replay(ws, replay_items)
         try:
             for raw in ws:
                 self._route_message(ws, raw)
@@ -525,13 +644,18 @@ class LanServer:
             "dist",
         )
 
-    def _http_response(self, status_code: int, body, content_type: str) -> Response:
+    def _http_response(
+        self, status_code: int, body, content_type: str,
+        cache_control: Optional[str] = None,
+    ) -> Response:
         """构造一个带 Content-Type / Content-Length 的 HTTP 响应。"""
         if isinstance(body, str):
             body = body.encode("utf-8")
         headers = Headers()
         headers["Content-Type"] = content_type
         headers["Content-Length"] = str(len(body))
+        if cache_control:
+            headers["Cache-Control"] = cache_control
         return Response(status_code, HTTPStatus(status_code).phrase, headers, body)
 
     def _http_404(self) -> Response:
@@ -548,7 +672,11 @@ class LanServer:
         html = html.replace(
             "</head>", '<script src="/mobile-shim.js"></script></head>', 1
         )
-        return self._http_response(200, html, "text/html; charset=utf-8")
+        # index 内嵌 shim 引用且路径固定：禁缓存保证手机端总能拿到最新 shim
+        # （补发协议升级后旧缓存的 shim 会让断线补发静默失效）
+        return self._http_response(
+            200, html, "text/html; charset=utf-8", cache_control="no-store"
+        )
 
     def _serve_shim(self) -> Response:
         """返回 mobile-shim.js：优先磁盘文件，缺失时回退内嵌快照。
@@ -567,8 +695,10 @@ class LanServer:
         except OSError:
             # 回退：旧安装包未携带磁盘版时使用代码内嵌快照，保证手机可用
             data = _MOBILE_SHIM_FALLBACK_JS.encode("utf-8")
+        # shim 路径固定且会被独立升级：禁缓存，防止手机端拿到旧版协议
         return self._http_response(
-            200, data, "application/javascript; charset=utf-8"
+            200, data, "application/javascript; charset=utf-8",
+            cache_control="no-store",
         )
 
     def _serve_theme(self) -> Response:

@@ -37,11 +37,12 @@
       "models": [
         {
           "id": "model_1",
-          "name": "agnes-2.0-flash",
-          "litellm_model": "openai/agnes-2.0-flash",
-          "context_window": 128000,
-          "supports_vision": false,
-          "max_tokens": 8192,
+          "name": "agnes-3.0-flash",
+          "litellm_model": "openai/agnes-3.0-flash",
+          "context_window": 512000,
+          "supports_vision": true,
+          "supports_function_calling": true,
+          "max_tokens": 65535,
           "thinking_budget": null,
           "enable_thinking": null,
           "reasoning_effort": null
