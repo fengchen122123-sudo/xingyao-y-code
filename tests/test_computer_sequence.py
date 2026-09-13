@@ -109,7 +109,13 @@ def test_controller_sequence_executes_all_steps_then_single_observe():
     from core.computer.controller import ComputerControlService
 
     backend = _RecordingBackend()
-    service = ComputerControlService(backend_factory=lambda target, identity: backend)
+    # 注入固定 generation provider：用例与全局电脑操控设置状态解耦，
+    # 否则同套件内更早的设置写入（如 /computer browser）会让 capability 的
+    # settings_generation=0 失配而被误判 settings_disabled
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 0,
+    )
     owner = ComputerOwner(
         session_id="s1", turn_id="t1", session_label="测试",
         cancel_event=threading.Event(),
@@ -138,7 +144,11 @@ def test_controller_sequence_stops_on_cancel():
     from core.computer.controller import ComputerControlService
 
     backend = _RecordingBackend()
-    service = ComputerControlService(backend_factory=lambda target, identity: backend)
+    # 同上：固定 generation provider，隔离全局设置写入（既有顺序性失败修复）
+    service = ComputerControlService(
+        backend_factory=lambda target, identity: backend,
+        generation_provider=lambda: 0,
+    )
     cancel_event = threading.Event()
     owner = ComputerOwner(
         session_id="s1", turn_id="t1", session_label="测试", cancel_event=cancel_event,
