@@ -183,6 +183,120 @@ def _update_builtin_skill_index(src, dest_base, released):
     except Exception as e:
         _log_warning("补齐内置技能索引失败: %s", e)
 
+
+def get_released_builtin_names():
+    """读取"已释放过的内置技能名"集合。
+
+    文件缺失 / 解析失败 / 内容不是列表，一律返回空集合，绝不抛异常
+    （调用方多为展示或恢复流程，不应因记录文件异常而中断）。
+    只保留非空字符串名，过滤脏数据。
+    """
+    try:
+        data = config._read_json_with_backup(_builtin_released_file(), default=None)
+    except Exception as e:
+        _log_warning("读取内置技能释放记录失败: %s", e)
+        return set()
+    if not isinstance(data, list):
+        return set()
+    return {name for name in data if isinstance(name, str) and name}
+
+
+def _replace_skill_dir(src_dir, dest_dir):
+    """把 src_dir 整目录以"临时目录 + 原子替换"覆盖到 dest_dir。
+
+    先 copytree 到 dest_dir + ".replacing"，再删旧目录并改名 —— 任一环节失败都不会
+    留下半成品技能目录（最坏情况是保留 dest_dir 原有内容）。失败时清理临时目录并返回
+    False，绝不抛出：跟随升级与恢复内置版本两条路径都不应因此中断。
+
+    "跟随升级"与"恢复内置版本"共用此函数，避免两份替换实现分叉。
+    dest_dir 不存在时会连同其父目录一起创建（恢复被删除的技能时需要）。
+    """
+    tmp_dir = dest_dir + ".replacing"
+    try:
+        parent = os.path.dirname(dest_dir)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        shutil.copytree(src_dir, tmp_dir)
+        if os.path.isdir(dest_dir):
+            shutil.rmtree(dest_dir)
+        os.replace(tmp_dir, dest_dir)
+    except Exception as e:
+        _log_warning("替换技能目录失败 %s -> %s: %s", src_dir, dest_dir, e)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        return False
+    return True
+
+
+def _upgrade_released_builtin_skill(src_dir, dest_base, name, index):
+    """已释放的内置技能：内容未被用户改动过时，跟随新版内置内容升级。
+
+    三个条件同时成立才覆盖，缺一不动作：
+      1. 用户目录仍存在 —— 用户主动删除的技能不复活（保持既有语义）；
+      2. 索引里记录了该技能释放时的内容指纹，且与用户目录当前指纹一致
+         —— 等价于"用户从未改动过这个内置技能"，改动过的一律保留；
+      3. 内置源指纹与用户目录指纹不同 —— 新版本确实有内容变化，避免无谓重写。
+
+    覆盖复用 _replace_skill_dir（"临时目录 + 原子替换"），与"恢复内置版本"共用同一实现，
+    任一环节失败都不会留下半成品技能目录（最坏情况是保留用户原有内容）。
+
+    升级成功后把新指纹写回 index（内存），由调用方统一落盘。
+    返回是否真的执行了升级。
+    """
+    dest_dir = os.path.join(dest_base, name)
+    if not os.path.isdir(dest_dir):
+        return False
+    recorded = index.get(name)
+    if not recorded:
+        # 无释放时指纹（升级机制上线前释放的老技能）：无从判断是否被改动过，保守不动
+        return False
+    dest_fp = _skill_dir_fingerprint(dest_dir)
+    if not dest_fp or dest_fp != recorded:
+        # 内容与释放时不一致（用户改过）或指纹计算失败：绝不覆盖
+        return False
+    src_fp = _skill_dir_fingerprint(src_dir)
+    if not src_fp or src_fp == dest_fp:
+        # 内置内容没有变化，或读取失败：无需升级
+        return False
+    if not _replace_skill_dir(src_dir, dest_dir):
+        return False
+    index[name] = src_fp
+    return True
+
+
+def restore_builtin_skill(name):
+    """把用户目录里的内置技能覆盖回随包发布的内容（技能页"恢复内置版本"按钮）。
+
+    与"跟随升级"不同，这是用户显式发起的覆盖动作，不做"用户是否改过该技能"的判断：
+    用户点恢复就是明确想要内置版本，因此目标目录被删过（用户之前删掉）也重新创建。
+
+    步骤：
+      1. 内置源目录下不存在该技能 → 直接失败（无源可恢复）；
+      2. 以"临时目录 + 原子替换"整目录覆盖用户目录；
+      3. 覆盖成功后把索引里该技能的指纹更新为内置源新指纹（无 key 则新增）并落盘，
+         使来源标注重新回到"内置"。
+    返回 {"ok": bool, "msg": str}，不抛异常（供 GUI 直接展示结果）。
+    """
+    if not isinstance(name, str) or not name:
+        return {"ok": False, "msg": "内置源中不存在该技能"}
+    src_dir = os.path.join(_builtin_skills_dir(), name)
+    if not os.path.isdir(src_dir):
+        return {"ok": False, "msg": "内置源中不存在该技能"}
+    dest_dir = os.path.join(config.YCODE_DIR, "skills", name)
+    if not _replace_skill_dir(src_dir, dest_dir):
+        return {"ok": False, "msg": "恢复内置版本失败"}
+    try:
+        index = load_builtin_skill_index()
+        src_fp = _skill_dir_fingerprint(src_dir)
+        if src_fp:
+            index[name] = src_fp
+            config._atomic_write_json(_builtin_skills_index_file(), index, indent=None)
+    except Exception as e:
+        # 索引只影响来源标注，写失败不影响已完成的覆盖，只告警
+        _log_warning("更新内置技能索引失败 %s: %s", name, e)
+    return {"ok": True, "msg": "已恢复内置版本"}
+
+
 def sync_builtin_skills():
     """把内置技能释放到用户级技能目录（仅缺失时拷贝，绝不覆盖用户改动）。
 
@@ -220,13 +334,19 @@ def _sync_builtin_skills_impl():
     if not isinstance(released, list):
         released = []
     newly_installed = []
+    upgraded = []
     released_changed = False
+    # 升级判据要读"释放时的内容指纹"，读取一次供整个循环复用
+    index = load_builtin_skill_index()
     try:
         for entry in sorted(os.listdir(src)):
-            if entry in released:
-                continue  # 释放过（含已被用户删除的），跳过
             src_dir = os.path.join(src, entry)
             if not os.path.isdir(src_dir):
+                continue
+            if entry in released:
+                # 释放过（含已被用户删除的）：内容未被用户改动时跟随新版升级
+                if _upgrade_released_builtin_skill(src_dir, dest_base, entry, index):
+                    upgraded.append(entry)
                 continue
             skill_md = None
             for fname in ("SKILL.md", "skill.md"):
@@ -257,6 +377,12 @@ def _sync_builtin_skills_impl():
             config._atomic_write_json(_builtin_released_file(), released, indent=None)
         except Exception as e:
             _log_warning("保存内置技能释放记录失败: %s", e)
+    if upgraded:
+        # 先把升级后的新指纹落盘，再走"只补缺失"的索引补齐，避免旧指纹被写回
+        try:
+            config._atomic_write_json(_builtin_skills_index_file(), index, indent=None)
+        except Exception as e:
+            _log_warning("更新内置技能索引失败: %s", e)
     # 补齐内置技能内容索引：覆盖本次新释放的技能，以及老用户已释放但索引缺失的技能
     _update_builtin_skill_index(src, dest_base, released)
     if newly_installed:
