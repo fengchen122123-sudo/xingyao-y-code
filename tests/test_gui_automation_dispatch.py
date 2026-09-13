@@ -454,6 +454,27 @@ def test_worker_turn_error_marks_run_error(manager, tmp_path):
     assert "API 调用失败" in run_row["error"]
     notices = [e for e in events if e[0] == "notice"]
     assert any("运行失败" in e[1]["message"] for e in notices)
+    # 终态通知必须带归属会话：前端按 session_name 路由，缺省会串到当前查看的会话
+    assert all(e[1]["session_name"] == "自动化任务" for e in notices)
+
+
+def test_worker_finish_completed_notice_carries_session(manager, tmp_path):
+    """notify_on_success 开启时完成提示必须带 session_name（按归属会话路由）。"""
+    bridge, _, events = _make_bridge(manager, tmp_path)
+    task_obj, run = _create_task_with_run(bridge)
+    bridge._automation_storage.mark_run_running(run["id"])
+
+    with _WorkerHarness(bridge, manager, tmp_path, consume_return=False):
+        bridge._run_turn_worker(
+            "汇总昨日进展", "自动化任务",
+            internal_kind="automation",
+            automation_context={"run_id": run["id"], "task_name": "每日摘要",
+                                 "permission_mode": "confirm", "notify_on_success": "1"},
+        )
+
+    notices = [e for e in events if e[0] == "notice"]
+    assert any("运行完成" in e[1]["message"] for e in notices)
+    assert all(e[1]["session_name"] == "自动化任务" for e in notices)
 
 
 def test_dispatch_spawn_failure_marks_error_run(manager, tmp_path):
