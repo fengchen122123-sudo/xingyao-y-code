@@ -41,6 +41,17 @@ SUMMARIZE_RATIO = 0.95
 # 单次请求准备允许滑窗淘汰的最大轮次数（微调淘汰，严禁无节制清空会话）
 MAX_EVICT_TURNS = 2
 
+# 【预压缩】会话占用达到 PRECOMPRESS_RATIO（默认 0.85，config
+# memory_compression.precompress_ratio 可调，0 关闭）时，在后台守护线程
+# 提前触发与 0.95 关键水位完全相同的记忆压缩入口。目的：把压缩从回合的
+# 关键路径挪到聊天间隙——0.95 到点时摘要通常已落库，用户不再等待。
+# 压缩内容、分段、增量落库、CAS 水位推进与同步触发完全一致，只改时机。
+# 防抖：同会话两次预压缩尝试之间至少间隔 _PRECOMPRESS_COOLDOWN_SECONDS，
+# 避免压缩失败（限流/超时）时每条消息都重启一次注定失败的压缩。
+_PRECOMPRESS_LAST_START: dict = {}
+_PRECOMPRESS_LAST_LOCK = threading.Lock()
+_PRECOMPRESS_COOLDOWN_SECONDS = 120.0
+
 # 兜底系统提示词：提示词文件全部缺失时也不能让整轮对话失败
 FALLBACK_SYSTEM_PROMPT = "你叫{agent_name}，是一位顶尖的代码编程助手。"
 
@@ -218,7 +229,8 @@ def estimate_history_tokens_with_system(model_name: str, history: list, is_gui: 
 
 
 def get_session_token_baseline(manager, session_name: str, model_name: str,
-                               history: list | None = None) -> int:
+                               history: list | None = None,
+                               api_base: str = "") -> int:
     """会话上下文占用基线：真实 API 用量与本地估算取较小值。
 
     下一轮请求的 prompt 必然包含上一轮的 prompt + completion（回复会进入历史），
@@ -226,6 +238,11 @@ def get_session_token_baseline(manager, session_name: str, model_name: str,
     但从大窗口模型切到小窗口模型后，上一轮真实用量仍是大窗口下的旧值，会虚高于
     当前历史的实际占用；此时含系统提示词的本地估算更贴近真实，取较小值可避免
     对着过期的大基线误判"无需压缩"。无真实记录时退化为纯本地估算。
+
+    DeepSeek 账本路由例外：实际请求字节来自不可变 Prompt Ledger，压缩改写只落在
+    工作副本（DB 历史）上，本地估算会系统性偏低——摘要压缩后尤其严重（工作副本
+    骤减而账本字节不变）。此时真实用量才是实际请求占用的唯一准确口径，直接采信；
+    否则水位线被低估、压缩被延迟，直到 provider 报超限才走被动的爆窗兜底。
     """
     try:
         last = manager.get_last_token_usage(session_name)
@@ -243,6 +260,13 @@ def get_session_token_baseline(manager, session_name: str, model_name: str,
             return estimated
         real = int(last.get("prompt_tokens") or 0) + int(last.get("completion_tokens") or 0)
         if real > 0:
+            if api_base:
+                try:
+                    from core.llm import is_deepseek_ledger_route
+                    if is_deepseek_ledger_route(model_name, api_base):
+                        return real
+                except Exception:
+                    logger.debug("账本路由判定失败，回落 min 基线", exc_info=True)
             return min(real, estimated)
     return estimated
 
@@ -490,6 +514,87 @@ def _prune_history_in_memory_to_fit_window(
     return pruned_turns, remaining
 
 
+def _get_precompress_ratio() -> float:
+    """预压缩水位（0~1）。0 表示关闭；异常时回落 0（禁用，行为等同旧版）。"""
+    try:
+        from core.memory_compressor import get_precompress_ratio
+        return max(0.0, min(SUMMARIZE_RATIO, float(get_precompress_ratio())))
+    except Exception:
+        logger.debug("读取预压缩水位失败，预压缩保持关闭", exc_info=True)
+        return 0.0
+
+
+def _trigger_background_precompress(
+    manager,
+    session_name: str,
+    model_name: str,
+    api_key: str,
+    api_base: str,
+    cancel_event: Optional[threading.Event],
+    notify: Optional[Callable[[str, str], None]],
+) -> bool:
+    """在后台守护线程提前触发记忆压缩（与 0.95 同步路径同一入口）。
+
+    返回是否真正启动了线程。防抖 + 防重入：后台已有压缩在跑或距上次
+    尝试不足冷却时间时直接跳过，绝不影响当前回合的组装流程。
+    """
+    import time as _time
+
+    try:
+        from core.memory_compressor import (
+            compress_session_memory,
+            is_session_compressing,
+        )
+    except Exception:
+        logger.debug("预压缩依赖导入失败", exc_info=True)
+        return False
+
+    if is_session_compressing(manager, session_name):
+        return False
+    now = _time.monotonic()
+    with _PRECOMPRESS_LAST_LOCK:
+        last = _PRECOMPRESS_LAST_START.get(session_name)
+        if last is not None and now - last < _PRECOMPRESS_COOLDOWN_SECONDS:
+            return False
+        _PRECOMPRESS_LAST_START[session_name] = now
+
+    def _notify_precompress(kind: str, message: str) -> None:
+        if notify is None:
+            return
+        try:
+            notify(kind, message)
+        except Exception:
+            logger.debug("预压缩 notify 回调异常，已忽略", exc_info=True)
+
+    def _run():
+        try:
+            outcome = compress_session_memory(
+                manager,
+                session_name,
+                model_name,
+                api_key,
+                api_base,
+                output_callback=lambda message: _notify_precompress("compress", message),
+                cancel_event=cancel_event,
+                return_outcome=True,
+            )
+            status = getattr(outcome, "status", "unknown")
+            reason = getattr(outcome, "reason", "")
+            logger.info(
+                "会话 %s 预压缩结束：status=%s reason=%s", session_name, status, reason
+            )
+        except Exception:
+            # 预压缩是锦上添花：任何异常只记日志，绝不影响对话主流程
+            logger.exception("会话 %s 后台预压缩异常", session_name)
+
+    threading.Thread(
+        target=_run,
+        name=f"memory-precompress-{session_name}",
+        daemon=True,
+    ).start()
+    return True
+
+
 def prepare_turn_messages(
     manager,
     session_name: str,
@@ -567,7 +672,7 @@ def prepare_turn_messages(
     # 大窗口下的旧值，会虚高于当前历史的实际占用——此时取估算能让压缩对新
     # 窗口真正生效，而不是对着过期的大基线误判"无需压缩"。
     estimated_tokens = get_session_token_baseline(
-        manager, session_name, model_name, history=history
+        manager, session_name, model_name, history=history, api_base=api_base
     )
 
     # Tier 1 (≥60%)：本地 snip 旧工具结果（一次性改写并冻结，不重排、不重写前缀主体）
@@ -585,6 +690,21 @@ def prepare_turn_messages(
             _notify("compress", f"<ansiyellow>ℹ 已归档 {elided} 条旧工具结果。</ansiyellow>")
             history = manager.get_history_for_llm(session_name)
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+
+    # 【预压缩】(≥precompress_ratio 且 <95%)：后台守护线程提前触发记忆压缩，
+    # 让 0.95 关键水位到来时摘要通常已落库，回合不再被压缩阻塞。
+    # 与同步路径共用同一 compress_session_memory（防重入 + CAS 增量落库），
+    # 只改触发时机；失败有冷却防抖，绝不影响本轮组装流程。
+    _precompress_ratio = _get_precompress_ratio()
+    if (
+        _precompress_ratio > 0
+        and window * _precompress_ratio <= estimated_tokens <= window * SUMMARIZE_RATIO
+        and not _cancelled()
+    ):
+        _trigger_background_precompress(
+            manager, session_name, model_name, api_key, api_base,
+            cancel_event, notify,
+        )
 
     # Tier 3 (≥95%)：压缩经济学——本地维护已把压力拉回线下则跳过付费摘要
     if estimated_tokens > window * SUMMARIZE_RATIO and not _cancelled():
@@ -654,6 +774,32 @@ def prepare_turn_messages(
                 evict_count += 1
                 history = manager.get_history_for_llm(session_name)
                 estimated_tokens = estimate_tokens(model_name, [system_message] + history)
+
+        # 【主动账本轮换】DeepSeek 账本路由：实际请求字节来自不可变账本，
+        # 本轮水位线压缩（snip/elide/摘要）对线上请求是"隐身"的——工作副本
+        # 可能已缩回窗口内，但实际发出的仍是压缩前的胖字节，会被 provider
+        # 以超限拒绝，进而触发"失败请求排队 + force 压缩 + 全价重发"的
+        # 三段被动等待。这里仅在压缩成果安全落库（非熔断、无并发压缩）
+        # 且占用已回到窗口内（无需内存裁剪、没有未摘要轮次会被挤出）时，
+        # 登记一次主动轮换：下一笔账本请求直接以压缩后历史 force_new 重建，
+        # 把被动爆窗升级为计划内维护。只记会话名，不写任何正文。
+        if (
+            api_base
+            and estimated_tokens <= window * SUMMARIZE_RATIO
+            and not compress_unprotected
+            and not compress_running
+            and not _cancelled()
+        ):
+            try:
+                from core.llm import (
+                    is_deepseek_ledger_route,
+                    mark_deepseek_generation_rotation,
+                )
+                if is_deepseek_ledger_route(model_name, api_base):
+                    mark_deepseek_generation_rotation(session_name)
+                    _notify("compress", "<ansiyellow>ℹ 上下文已压缩：下一轮请求将以压缩后历史重建发送队列（前缀缓存会重建一次）。</ansiyellow>")
+            except Exception:
+                logger.debug("主动账本轮换登记失败", exc_info=True)
 
         # 【I4 请求侧内存级轮次裁剪】：
         # 无论是因为熔断、后台压缩进行中还是淘汰微调后仍超窗，

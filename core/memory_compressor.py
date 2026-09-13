@@ -37,8 +37,20 @@ COMPRESSION_TIMEOUT_TOKENS_PER_SECOND = 1500
 # 同时中小载荷能显著提升模型对事实细节的提取质量。
 DEFAULT_MAX_CHUNK_TOKEN_BUDGET = 24000
 
-# 多段压缩时的段间平滑延时（秒），给服务商滑动窗口令牌桶恢复时间
-COMPRESSION_INTER_CHUNK_DELAY_SECONDS = 1.5
+# 多段压缩时的段间平滑延时（秒）。默认 0：429 限流本就有独立的指数退避
+# 重试兜底，无条件延时只白白拉长压缩耗时。段间延时改为自适应——仅当本次
+# 压缩已经触发过 429 时，才在后续段间插入该延时给令牌桶恢复时间；
+# 用户在 config.json 显式配置了非 0 值时仍按配置无条件生效。
+COMPRESSION_INTER_CHUNK_DELAY_SECONDS = 0.0
+
+# 429 触发后的段间自适应冷却延时（秒）：仅在本次压缩已发生限流后生效
+COMPRESSION_ADAPTIVE_INTER_CHUNK_DELAY_SECONDS = 2.0
+
+# 预压缩水位：占用达到窗口该比例时在后台提前触发记忆压缩（0 关闭），
+# 使 0.95 关键水位到来时摘要通常已就绪，回合不再被压缩阻塞。
+# 必须显著低于 SUMMARIZE_RATIO 且与 keep/活跃区保持足量间距，
+# 避免压缩完成后立即再次触发（对应 OpenCode 的防抖教训）。
+DEFAULT_PRECOMPRESS_RATIO = 0.85
 
 # 单次压缩的总预算秒数上限（可经 config.json memory_compression.max_total_seconds 调优）
 DEFAULT_MAX_TOTAL_SECONDS = 180.0
@@ -96,6 +108,9 @@ def _load_compression_config():
             "max_total_seconds": float(
                 comp_cfg.get("max_total_seconds", DEFAULT_MAX_TOTAL_SECONDS)
             ),
+            "precompress_ratio": float(
+                comp_cfg.get("precompress_ratio", DEFAULT_PRECOMPRESS_RATIO)
+            ),
         }
     except Exception:
         return {
@@ -109,7 +124,16 @@ def _load_compression_config():
             "max_chunk_token_budget": DEFAULT_MAX_CHUNK_TOKEN_BUDGET,
             "inter_chunk_delay_seconds": COMPRESSION_INTER_CHUNK_DELAY_SECONDS,
             "max_total_seconds": DEFAULT_MAX_TOTAL_SECONDS,
+            "precompress_ratio": DEFAULT_PRECOMPRESS_RATIO,
         }
+
+
+def get_precompress_ratio() -> float:
+    """预压缩水位（0~1，0 关闭）。读 config 失败时回落默认值。"""
+    try:
+        return float(_load_compression_config()["precompress_ratio"])
+    except Exception:
+        return DEFAULT_PRECOMPRESS_RATIO
 
 
 def _get_encoding(timeout=10.0):
@@ -559,6 +583,9 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
         import time as _time
         import random as _random
         start_monotonic = _time.monotonic()
+        # 段间延时自适应：仅当本次压缩触发过 429 限流后，才对后续段间
+        # 插入平滑延时；未触限流时 0 延时直通，显著缩短多段串行总耗时。
+        rate_limited = False
 
         # 每多一段放宽 30 字，缓解串行累积合并的信息衰减；上限 1200，
         # 但绝不低于用户显式配置值本身。
@@ -584,7 +611,15 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 return _finish_with_progress(committed, "timeout")
 
             if chunk_index > 0:
-                if not _cancellable_sleep(config["inter_chunk_delay_seconds"], cancel_event):
+                # 用户显式配置非 0 延时 → 按配置无条件生效；否则仅在本次
+                # 压缩已触发过 429 时插入自适应冷却延时（默认 0 直通）。
+                if config["inter_chunk_delay_seconds"] > 0:
+                    adaptive_delay = config["inter_chunk_delay_seconds"]
+                elif rate_limited:
+                    adaptive_delay = COMPRESSION_ADAPTIVE_INTER_CHUNK_DELAY_SECONDS
+                else:
+                    adaptive_delay = 0.0
+                if adaptive_delay > 0 and not _cancellable_sleep(adaptive_delay, cancel_event):
                     return _finish_with_progress(committed, "cancelled")
 
             chat_log = "".join(
@@ -636,6 +671,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 except Exception as api_err:
                     is_rate_limit, retry_after = is_rate_limit_error(api_err)
                     if is_rate_limit and attempt < COMPRESSION_MAX_RETRIES - 1:
+                        rate_limited = True
                         if retry_after is not None and retry_after > 0:
                             backoff = retry_after
                         else:
