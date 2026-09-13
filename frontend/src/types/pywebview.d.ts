@@ -259,6 +259,9 @@ export interface SkillInfo {
   description: string;
   enabled: boolean;
   source?: string;     // user | builtin（旧版本后端可能不返回）
+  // 该技能曾由内置释放、且内置源里仍有同名技能——用于判断能否「恢复内置版本」。
+  // 旧后端不返回时按 undefined（不显示恢复入口）处理，避免误导用户
+  from_builtin?: boolean;
 }
 
 export interface McpInfo {
@@ -287,8 +290,13 @@ export interface AutomationTaskInfo {
   trigger_type: 'interval' | 'daily' | 'weekly' | 'startup';
   trigger_config: Record<string, any>;
   target_session: string;
+  // 任务指定的工作目录：'' = 跟随目标会话归属；'GLOBAL' = 新会话挂自由对话；
+  // 其余为懒创建新会话时绑定的项目目录路径
+  workdir?: string;
+  // 任务指定的执行模型 id：'' = 跟随会话绑定/全局默认
+  model_id?: string;
   prompt: string;
-  permission_mode: 'confirm' | 'accept_edits' | 'full';
+  permission_mode: 'confirm' | 'accept_edits' | 'plan' | 'full';
   missed_run_policy: 'skip' | 'run_once';
   notify_on_success: boolean;
   created_at: string;
@@ -772,6 +780,8 @@ export interface PyWebViewAPI {
   get_initial_state(): Promise<InitialState>;
   get_changelog(): Promise<{ ok: boolean; entries: ChangelogEntry[]; msg?: string }>;
   select_workspace_folder(): Promise<any>;
+  // 纯选目录：弹原生文件夹对话框只返回路径，不切换工作区（自动化任务表单用）
+  pick_folder_dialog(): Promise<{ ok: boolean; path?: string; msg?: string }>;
   get_workspace_state(workdir: string): Promise<any>;
   get_sessions(): Promise<SessionGroup[]>;
   create_session(title?: string, workdir?: string): Promise<any>;
@@ -784,7 +794,8 @@ export interface PyWebViewAPI {
   set_model(modelId: string, sessionName?: string): Promise<any>;
   get_reasoning_snapshot(modelId: string): Promise<any>;
   set_reasoning_choice(modelId: string, choice: ReasoningChoice): Promise<any>;
-  set_permission_mode(mode: PermissionMode): Promise<any>;
+  // 权限档位是会话级的：传 sessionName 只绑定该会话；不传则改全局默认
+  set_permission_mode(mode: PermissionMode, sessionName?: string): Promise<any>;
   set_sandbox_enabled(enabled: boolean): Promise<any>;
   get_system_settings(): Promise<SystemSettingsSnapshot>;
   set_command_shell(shellId: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
@@ -809,7 +820,7 @@ export interface PyWebViewAPI {
   respond_permission_option(requestId: string, optionKey: string): Promise<any>;
   respond_permission_choice(requestId: string, choiceIndex: number, customText?: string): Promise<any>;
 
-  send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string, modelId?: string): Promise<any>;
+  send_user_message(text: string, sessionName?: string, attachments?: string[], workdir?: string, modelId?: string, permissionMode?: string): Promise<any>;
   // 客户端本地提示（notice/error 卡片）经桥广播到全部客户端（桌面 + 手机端）；
   // 各端收到 notice 桥事件后统一回环插入，提示为瞬态、不落历史
   post_notice(message: string, sessionName?: string, kind?: 'notice' | 'error'): Promise<any>;
@@ -824,6 +835,8 @@ export interface PyWebViewAPI {
 
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
   refresh_skills(): Promise<{ ok: boolean; skills?: SkillInfo[]; msg?: string }>;
+  // 用内置源覆盖用户改动后的技能副本；成功时回传最新技能列表
+  restore_skill(skill_id: string): Promise<{ ok: boolean; msg?: string; skills?: SkillInfo[] }>;
   get_skills(): Promise<SkillInfo[]>;
   // 星轨自动化任务
   get_automation_tasks(): Promise<{ ok: boolean; tasks?: AutomationTaskInfo[]; msg?: string }>;

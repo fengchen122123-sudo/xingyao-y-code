@@ -59,7 +59,16 @@ from core.model_manager import (
 from core.model_catalog import API_PROTOCOLS, get_preset_providers
 from core.reasoning_capabilities import build_reasoning_snapshot
 from core.permission_broker import permission_broker
-from core.skills import get_active_skill_ids, save_active_skill_ids, scan_all_skills
+from core.skills import (
+    get_active_skill_ids,
+    save_active_skill_ids,
+    scan_all_skills,
+    restore_builtin_skill,
+    get_released_builtin_names,
+    # 私有助手：core.skills 未提供公开的内置源目录访问器，技能列表要判断
+    # "恢复内置版本"是否可用，只能直接取该目录路径
+    _builtin_skills_dir,
+)
 from core.task_manager import list_active_tasks
 from core.version import __version__ as YCODE_VERSION
 from core.updater import (
@@ -2468,7 +2477,8 @@ class ApiBridge:
                 # 副模型配置：启动时同步给前端，避免设置页显示"无/全勾选"假象
                 "secondary_model_id": str(config_data.get("secondary_model_id") or ""),
                 "secondary_model_roles": get_secondary_roles(),
-                "permission_mode": self._current_permission_mode,
+                # 当前会话生效的权限档位（会话绑定优先，回退全局默认）
+                "permission_mode": self._effective_permission_mode(self._current_session),
                 # 沙盒开关（是否允许访问工作目录外文件）：与 CLI /sandbox 共享同一配置键
                 "allow_outside_workspace": bool(config_data.get("allow_outside_workspace", False)),
                 "system_settings": self.get_system_settings(),
@@ -2783,6 +2793,30 @@ class ApiBridge:
             logger.exception("select_workspace_folder 失败")
             return {"ok": False, "msg": str(e)}
 
+    def pick_folder_dialog(self) -> Dict[str, Any]:
+        """弹出原生文件夹对话框，仅返回所选路径，不改当前工作区。
+
+        与 select_workspace_folder 的区别：不登记工作区、不迁移 GLOBAL 会话
+        归属，供自动化任务表单这类"纯选目录"的场景使用。
+        """
+        try:
+            import webview
+            if not self._window:
+                return {"ok": False, "msg": "窗口尚未就绪"}
+            result = self._window.create_file_dialog(
+                webview.FOLDER_DIALOG,
+                directory=os.getcwd(),
+            )
+            if not result:
+                return {"ok": False, "msg": "已取消选择"}
+            selected_path = _resolve_real_path(result[0])
+            if not os.path.isdir(selected_path):
+                return {"ok": False, "msg": "选择的路径不是文件夹"}
+            return {"ok": True, "path": selected_path}
+        except Exception as e:
+            logger.exception("pick_folder_dialog 失败")
+            return {"ok": False, "msg": str(e)}
+
     def _async_load_file_tree(self, workdir: str):
         """异步加载文件树：后台扫描完成后通过事件推送到前端刷新文件面板。
 
@@ -3023,6 +3057,8 @@ class ApiBridge:
                 "active_model_id": str(session_model.get("id") or ""),
                 "active_model_name": str(session_model.get("name") or "未激活模型"),
                 "reasoning": _reasoning_snapshot_for_model(session_model),
+                # 会话级权限档位随切换返回：前端权限按钮按会话恢复显示
+                "permission_mode": self._effective_permission_mode(session_name),
                 # 排队中的用户消息随切换返回：前端免额外往返即可渲染排队条目
                 "message_queue": self._message_queue_snapshot(session_name),
                 # 目标会话若正在运行，返回其实时流式快照供前端恢复
@@ -3296,7 +3332,23 @@ class ApiBridge:
             logger.exception("set_secondary_roles 失败")
             return {"ok": False, "msg": str(e)}
 
-    def set_permission_mode(self, mode: str) -> Dict[str, Any]:
+    def _effective_permission_mode(self, session_name: str) -> str:
+        """会话生效的权限档位：会话绑定优先，未绑定回退全局默认。
+
+        权限选择是会话级的（sessions.permission_mode）；全局值只作未绑定
+        会话与新会话的兜底，改动不再互相覆盖。getattr 防御裸实例测试桥
+        可能未初始化全局档位（同 _automation_turn_labels 先例）。
+        """
+        if session_name:
+            try:
+                bound = self._memory.get_session_permission_mode(session_name)
+                if bound:
+                    return bound
+            except Exception:
+                logger.debug("读取会话权限档位失败", exc_info=True)
+        return getattr(self, "_current_permission_mode", "confirm") or "confirm"
+
+    def set_permission_mode(self, mode: str, session_name: str = "") -> Dict[str, Any]:
         try:
             # 规范化会把无法识别的值兜底成 confirm；这里要明确告诉前端"没识别出来"，
             # 而不是让界面显示成一次成功的切换。
@@ -3307,6 +3359,13 @@ class ApiBridge:
                     "permission_mode": self._current_permission_mode,
                 }
             canonical = app_context.normalize_permission_mode(mode)
+            target_session = str(session_name or "").strip()
+            if target_session:
+                # 会话级绑定：只影响该会话，不改全局默认/配置文件。会话尚未
+                # 落库（前端 pending 草稿）时绑不上，前端把选择随首条消息带
+                # 给 worker 落绑定（pending_permission_mode）
+                bound = self._memory.set_session_permission_mode(target_session, canonical)
+                return {"ok": True, "permission_mode": canonical, "bound": bound}
             self._current_permission_mode = canonical
             app_context.set_permission_mode(canonical)
             try:
@@ -4053,10 +4112,14 @@ class ApiBridge:
     # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
-    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
+    def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, permission_mode: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
         # turn_source 是入口层受控回合来源（设计 18）：LAN dispatch 由服务器注入
         # "lan"，本地 GUI/CLI 固定 "local"；只接受这两个受控值，模型/用户正文
         # 无法设置，非法值直接拒绝（不启动回合）。
+        # 注意参数顺序：permission_mode 在 turn_source 之前——桌面 GUI 经
+        # pywebview 按位置传参，第 6 位必须是会话级权限档位；LAN 分发只放行
+        # 前 5 个位置参数（MESSAGE_ENTRY_POSITIONAL_LIMIT），客户端同样无法
+        # 经位置通道注入档位。
         if turn_source not in ("local", "lan"):
             return {"ok": False, "msg": "无效的回合来源"}
         try:
@@ -4074,6 +4137,14 @@ class ApiBridge:
                 full_text = f"{clean_text} {joined}" if clean_text else joined
             target_session = session_name or self._current_session
             clean_model_id = str(model_id or "").strip()
+            # 会话级权限档位：pending 草稿会话在落库前无法绑定，用户的选择随
+            # 首条消息带给 worker 补绑定；未知值直接拒绝（宁可不发也不误放权）
+            pending_permission_mode = ""
+            raw_permission = str(permission_mode or "").strip()
+            if raw_permission:
+                if not app_context.is_known_permission_mode(raw_permission):
+                    return {"ok": False, "msg": f"未知权限模式: {raw_permission}"}
+                pending_permission_mode = app_context.normalize_permission_mode(raw_permission)
             with self._turn_start_lock:
                 if self._is_turn_active(target_session):
                     # 回合运行中：消息进入排队（FIFO），回合结束由
@@ -4145,6 +4216,7 @@ class ApiBridge:
                     pending_workdir=str(workdir) if workdir else "",
                     turn_source=turn_source,
                     attachments=attach_list,
+                    pending_permission_mode=pending_permission_mode,
                 )
             return {"ok": True}
         except Exception as e:
@@ -4156,7 +4228,9 @@ class ApiBridge:
                            turn_source: str = "local",
                            attachments: Optional[List[str]] = None,
                            internal_kind: str = "",
-                           automation_context: Optional[Dict[str, str]] = None) -> None:
+                           automation_context: Optional[Dict[str, str]] = None,
+                           pending_model_id: str = "",
+                           pending_permission_mode: str = "") -> None:
         """启动一个新回合线程。调用方必须已持有 _turn_start_lock 且确认
         _is_turn_active(target_session) 为 False（检查+启动原子）。
 
@@ -4180,6 +4254,12 @@ class ApiBridge:
             # 懒创建会话：前端 pending 新会话在首条消息时才落库，
             # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
             turn_kwargs["pending_workdir"] = str(pending_workdir)
+        if pending_model_id:
+            # 自动化任务指定模型：worker 在读取激活模型前落会话绑定
+            turn_kwargs["pending_model_id"] = str(pending_model_id)
+        if pending_permission_mode:
+            # 会话级权限档位（pending 草稿会话首条消息携带）：worker 落库后绑定
+            turn_kwargs["pending_permission_mode"] = str(pending_permission_mode)
         turn_kwargs["turn_source"] = turn_source
         if attachments:
             turn_kwargs["attachments"] = attachments
@@ -4247,6 +4327,13 @@ class ApiBridge:
                         # 排队消息补发保持原回合来源：LAN 消息不得降级为 local
                         turn_source=str(entry.get("turn_source") or "local"),
                         attachments=[str(p) for p in (entry.get("attachments") or [])],
+                        # 自动化任务指定的工作目录：补发时重判会话是否仍不存在，
+                        # 已被其他回合创建的会话以自身归属为准
+                        pending_workdir=self._automation_pending_workdir(
+                            str(entry.get("pending_workdir") or ""), session_name
+                        ),
+                        # 任务指定模型随排队条目透传，补发回合同样生效
+                        pending_model_id=str(entry.get("automation_model_id") or ""),
                         internal_kind="automation" if automation_run_id else "",
                         automation_context={
                             "run_id": automation_run_id,
@@ -4284,6 +4371,26 @@ class ApiBridge:
         self._automation_engine.start()
         self._emit_automation_tasks_changed()
 
+    def _automation_pending_workdir(self, task_workdir: str, session_name: str) -> str:
+        """自动化任务的待建会话工作目录。
+
+        仅当目标会话尚未落库时返回任务配置的 workdir（含 "GLOBAL" 自由对话），
+        让回合 worker 懒创建会话时绑定到该目录；已有会话一律返回空串——
+        会话自身登记的 workdir 是权威归属，派发绝不改写（与 send_user_message
+        的 pending_workdir 语义一致，后者也只服务懒创建）。
+        """
+        raw = str(task_workdir or "").strip()
+        if not raw:
+            return ""
+        try:
+            for s in self._memory.get_all_sessions(workdir=None, include_empty=True):
+                if s.get("name") == session_name:
+                    return ""
+        except Exception:
+            logger.debug("查询自动化目标会话归属失败", exc_info=True)
+            return ""
+        return raw
+
     def _dispatch_automation_run(self, task: dict, run_id: str, trigger_kind: str) -> None:
         """引擎/手动触发共用：把任务提示词投递为目标会话的一次真实回合。
 
@@ -4296,6 +4403,13 @@ class ApiBridge:
             return
         target_session = str(task.get("target_session") or "").strip() or "自动化任务"
         display_text = f"自动化任务「{task.get('name')}」"
+        # 任务指定的工作目录只对"懒创建的新会话"生效；已有会话沿用自身归属
+        pending_workdir = self._automation_pending_workdir(
+            str(task.get("workdir") or ""), target_session
+        )
+        # 任务指定的执行模型：worker 在读取激活模型前落会话绑定，本回合即用
+        # 该模型执行；模型已被删除时 get_active_model 自动回退全局默认
+        task_model_id = str(task.get("model_id") or "").strip()
         automation_context = {
             "run_id": run_id,
             "task_name": str(task.get("name") or ""),
@@ -4316,6 +4430,10 @@ class ApiBridge:
                     "automation_task_name": automation_context["task_name"],
                     "automation_permission_mode": automation_context["permission_mode"],
                     "automation_notify_success": automation_context["notify_on_success"],
+                    # 补发时目标会话可能已被别的回合创建，drain 侧会重判
+                    "pending_workdir": pending_workdir,
+                    # 任务指定模型随排队条目透传，补发回合同样生效
+                    "automation_model_id": task_model_id,
                 })
                 # 快照在锁内发：与 send_user_message 排队路径同序
                 self._emit_message_queue_snapshot(target_session)
@@ -4329,6 +4447,8 @@ class ApiBridge:
                     str(task.get("prompt") or ""),
                     target_session,
                     display_text=display_text,
+                    pending_workdir=pending_workdir,
+                    pending_model_id=task_model_id,
                     turn_source="local",
                     internal_kind="automation",
                     automation_context=automation_context,
@@ -4399,6 +4519,18 @@ class ApiBridge:
             errors = validate_task(raw)
             if errors:
                 return {"ok": False, "errors": errors}
+            # 指定模型必须真实存在于配置（与 send_user_message 的 known_ids 防线同源）；
+            # 保存后模型被删除的场景由派发端兜底：绑定陈旧 id 时 get_active_model
+            # 自动回退全局默认，任务不会被卡死
+            task_model_id = str(raw.get("model_id") or "").strip()
+            if task_model_id:
+                known_ids = {
+                    str(m.get("id"))
+                    for p in load_config().get("providers", [])
+                    for m in p.get("models", [])
+                }
+                if task_model_id not in known_ids:
+                    return {"ok": False, "errors": ["指定模型不存在或已被删除，请重新选择"]}
             existing_id = str(raw.get("id") or "").strip()
             if not existing_id and self._automation_storage.count_tasks() >= MAX_TASKS:
                 return {"ok": False, "errors": [f"自动化任务最多 {MAX_TASKS} 个，请先删除部分任务"]}
@@ -4590,7 +4722,7 @@ class ApiBridge:
         保留函数名避免改动所有调用点，实现直接转发到 _run_turn_worker。"""
         return self._run_turn_worker(user_text, session_name, *args, **kwargs)
 
-    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None, automation_context: Optional[Dict[str, str]] = None):
+    def _run_turn_worker(self, user_text: str, session_name: str, internal_kind: str = "", display_text: str = "", pending_workdir: str = "", turn_source: str = "local", attachments: Optional[List[str]] = None, automation_context: Optional[Dict[str, str]] = None, pending_model_id: str = "", pending_permission_mode: str = ""):
         """后台线程：组装上下文 → 调用模型 → 翻译事件推送给前端。
 
         internal_kind 非空表示这是系统自动发起的内部回合（后台任务汇总 /
@@ -4766,6 +4898,19 @@ class ApiBridge:
         undo_finished = False
 
         try:
+            # 自动化任务指定模型：在读取激活模型前落会话与模型绑定，本回合即用
+            # 该模型执行。新会话按任务 workdir 同步落库（无则挂 GLOBAL），否则
+            # set_session_model_id 无行可更；指定模型已被删除时 get_active_model
+            # 按陈旧绑定自动回退全局默认，任务不被卡死。绑定与聊天页"选模型后
+            # 发消息"语义一致：持久落在会话上，会话后续回合沿用
+            if pending_model_id:
+                try:
+                    self._memory.ensure_session(
+                        session_name, workdir=pending_workdir or "GLOBAL", source="GUI"
+                    )
+                    self._memory.set_session_model_id(session_name, pending_model_id)
+                except Exception:
+                    logger.debug("预绑定自动化任务模型失败", exc_info=True)
             active_model = get_active_model(session_name)
             if not active_model or not active_model.get("litellm_model"):
                 # 关键修复：没有激活模型时也必须让前端解锁输入框
@@ -4785,6 +4930,13 @@ class ApiBridge:
             _ensure_session_model_binding(
                 self._memory, session_name, active_model.get("id"), session_workdir
             )
+            # 首条消息携带的会话级权限档位：pending 草稿期无法落库绑定，此刻
+            # 会话行已确保存在，补绑定让本回合即用该档位（后续回合沿用）
+            if pending_permission_mode:
+                try:
+                    self._memory.set_session_permission_mode(session_name, pending_permission_mode)
+                except Exception:
+                    logger.debug("绑定会话权限档位失败", exc_info=True)
             # 显式传会话名：此刻线程 TLS 尚未绑定本会话（set_thread_session 在
             # 下文才调用），不传会把全局模型同步给子代理继承链
             self._sync_active_model_context(session_name)
@@ -4899,8 +5051,9 @@ class ApiBridge:
                 session_name,
                 model_name,
                 ctx_win,
-                # 星轨自动化：无人值守档位按任务配置覆盖（规格 5.5）；人工回合零改动
-                permission_mode=automation_permission_mode or self._current_permission_mode,
+                # 星轨自动化：无人值守档位按任务配置覆盖（规格 5.5）；其余回合
+                # 用会话级绑定档位，未绑定回退全局默认；人工回合零改动
+                permission_mode=automation_permission_mode or self._effective_permission_mode(session_name),
                 cancel_event=cancel_event,
                 notify=lambda kind, message: self.emit_event("notice", {"message": _strip_ansi_markup(message)}),
                 api_key=api_key,
@@ -5791,7 +5944,7 @@ class ApiBridge:
                         session_name,
                         active.get("litellm_model", ""),
                         window,
-                        permission_mode=self._current_permission_mode,
+                        permission_mode=self._effective_permission_mode(session_name),
                         notify=lambda kind, message: self.emit_event(
                             "notice", {"message": _strip_ansi_markup(message)}
                         ),
@@ -5818,16 +5971,40 @@ class ApiBridge:
     def _build_skill_list(self) -> List[Dict[str, Any]]:
         try:
             active_ids = set(get_active_skill_ids())
+            # 释放名单与内置源目录对所有技能是同一份数据，只在开头各读一次：
+            # 放进循环会让技能页随技能数量线性增加读盘次数
+            try:
+                released_builtin = get_released_builtin_names()
+            except Exception:
+                # 保守原则：名单读不到就整体不标"可恢复内置版本"，绝不能让
+                # 这一个展示字段把整张技能列表拖垮
+                logger.debug("读取内置技能释放名单失败", exc_info=True)
+                released_builtin = set()
+            try:
+                builtin_root = _builtin_skills_dir()
+            except Exception:
+                logger.debug("读取内置技能源目录失败", exc_info=True)
+                builtin_root = ""
             skills = []
             for s in (scan_all_skills() or []):
                 skill_id = str(s.get("id", ""))
+                short_id = os.path.basename(os.path.dirname(skill_id)) if skill_id else ""
+                # "可恢复内置版本"需同时满足：曾由内置释放过 + 内置源里确有同名目录。
+                # 后者不成立时点恢复必然失败，据此让前端隐藏/禁用按钮更贴合实际。
+                from_builtin = bool(
+                    builtin_root
+                    and short_id
+                    and short_id in released_builtin
+                    and os.path.isdir(os.path.join(builtin_root, short_id))
+                )
                 skills.append({
                     "id": skill_id,
-                    "short_id": os.path.basename(os.path.dirname(skill_id)) if skill_id else "",
+                    "short_id": short_id,
                     "name": str(s.get("name", "")),
                     "description": str(s.get("description", "")),
                     "enabled": skill_id in active_ids,
                     "source": str(s.get("source") or "user"),
+                    "from_builtin": from_builtin,
                 })
             return skills
         except Exception:
@@ -5846,6 +6023,28 @@ class ApiBridge:
             return {"ok": True, "skills": self._build_skill_list()}
         except Exception as e:
             logger.exception("toggle_skill 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def restore_skill(self, skill_id: str) -> Dict[str, Any]:
+        """把指定技能恢复为随包内置版本（技能页"恢复内置版本"按钮）。
+
+        与"跟随升级"不同，这是用户显式发起的动作，所以不做"是否被改过"的判断，
+        直接以内置内容覆盖用户目录里的同名技能；真正的覆盖逻辑留在 core.skills，
+        这里只负责把 GUI 的 skill_id（SKILL.md 绝对路径）换算成技能目录名。
+        """
+        try:
+            # 内置技能以目录名（即列表里的 short_id）为唯一标识
+            name = os.path.basename(os.path.dirname(str(skill_id or "")))
+            if not name:
+                # skill_id 为空或路径非法时说明原因即可，不必走到 core 层
+                return {"ok": False, "msg": "技能标识无效，无法定位技能目录"}
+            result = restore_builtin_skill(name)
+            if not result.get("ok"):
+                return {"ok": False, "msg": str(result.get("msg") or "恢复内置版本失败")}
+            # 与 toggle_skill 一致：一次回传刷新后的完整列表，前端无需再调接口
+            return {"ok": True, "skills": self._build_skill_list()}
+        except Exception as e:
+            logger.exception("restore_skill 失败")
             return {"ok": False, "msg": str(e)}
 
     def refresh_skills(self) -> Dict[str, Any]:

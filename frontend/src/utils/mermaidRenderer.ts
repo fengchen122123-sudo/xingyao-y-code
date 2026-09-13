@@ -89,6 +89,9 @@ export function sanitizeSvg(svg: string): string {
 
 function injectSvg(block: HTMLElement, svg: string): void {
   block.setAttribute('data-state', 'done');
+  // 幂等兜底：气泡重挂载等场景下同一块可能被并发 watcher 重复注入，
+  // 先清掉旧 SVG 再挂新的，杜绝一卡双图
+  block.querySelectorAll(':scope > .mermaid-svg').forEach((n) => n.remove());
   const holder = document.createElement('div');
   holder.className = 'mermaid-svg';
   holder.innerHTML = svg;
@@ -130,7 +133,12 @@ export async function renderMermaidBlocks(root: HTMLElement | null): Promise<voi
     }
     const cached = svgCache.get(key);
     if (cached) {
-      injectSvg(block, cached);
+      // 缓存路径必须复核状态：气泡 DOM 重建（设置页往返/会话切回/回合折叠切换）
+      // 会带着已预热的缓存触发两次以上收集，若不复核，每次收集都注入一份 SVG，
+      // 图就会重复两遍（渲染路径的 state==='rendering' 守卫只护得住未命中缓存的并发）。
+      if (block.dataset.state === 'pending') {
+        injectSvg(block, cached);
+      }
       continue;
     }
     if (!mermaid) {

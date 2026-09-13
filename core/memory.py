@@ -288,6 +288,10 @@ class MemoryManager:
                 # 会话最后一次终态错误（如余额不足/接口超时），供 UI 多端与重载恢复
                 if "last_error" not in columns:
                     cursor.execute("ALTER TABLE sessions ADD COLUMN last_error TEXT")
+                # 会话级权限档位（confirm/accept_edits/plan/full）：NULL = 跟随全局默认，
+                # 权限选择只影响当前会话，不再全局生效
+                if "permission_mode" not in columns:
+                    cursor.execute("ALTER TABLE sessions ADD COLUMN permission_mode TEXT")
 
                 # 创建一个叫 messages 的表
                 cursor.execute('''
@@ -1806,6 +1810,36 @@ class MemoryManager:
             cursor = self.conn.cursor()
             cursor.execute('''
                 SELECT active_model_id FROM sessions WHERE session_name = ?
+            ''', (session_name,))
+            row = cursor.fetchone()
+            return str(row[0]).strip() if row and row[0] else None
+
+    def set_session_permission_mode(self, session_name, permission_mode) -> bool:
+        """绑定会话级权限档位。传 None/空字符串则清除绑定，回退到全局默认。
+
+        调用方负责传入规范值（confirm/accept_edits/plan/full）。
+        """
+        mode = str(permission_mode or "").strip() or None
+        with self._lock:
+            cursor = self.conn.cursor()
+            now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                cursor.execute('''
+                    UPDATE sessions SET permission_mode = ?, updated_at = ?
+                    WHERE session_name = ?
+                ''', (mode, now, session_name))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def get_session_permission_mode(self, session_name: str) -> str | None:
+        """取会话级权限档位；未设置返回 None，调用方应回退到全局默认。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute('''
+                SELECT permission_mode FROM sessions WHERE session_name = ?
             ''', (session_name,))
             row = cursor.fetchone()
             return str(row[0]).strip() if row and row[0] else None

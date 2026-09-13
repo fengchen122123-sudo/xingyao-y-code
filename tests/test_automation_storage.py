@@ -68,6 +68,91 @@ def test_save_task_updates_existing(storage):
     assert storage.get_task(task_id)["name"] == "改名"
 
 
+def test_workdir_roundtrip(storage):
+    # 缺省任务 workdir 为空（跟随目标会话归属，兼容旧数据）
+    task_id = storage.save_task(_task())
+    assert storage.get_task(task_id)["workdir"] == ""
+    # GLOBAL（自由对话）与具体目录路径都要原样存取
+    global_id = storage.save_task(_task(name="g", workdir="GLOBAL"))
+    assert storage.get_task(global_id)["workdir"] == "GLOBAL"
+    path_id = storage.save_task(_task(name="p", workdir="E:\\proj"))
+    assert storage.get_task(path_id)["workdir"] == "E:\\proj"
+    # 编辑可改写 workdir
+    storage.save_task({**storage.get_task(path_id), "workdir": ""})
+    assert storage.get_task(path_id)["workdir"] == ""
+
+
+def test_model_id_roundtrip(storage):
+    # 缺省任务 model_id 为空（跟随会话绑定/全局默认，兼容旧数据）
+    task_id = storage.save_task(_task())
+    assert storage.get_task(task_id)["model_id"] == ""
+    mid = storage.save_task(_task(name="m", model_id="m-task"))
+    assert storage.get_task(mid)["model_id"] == "m-task"
+    # 编辑可改写 model_id
+    storage.save_task({**storage.get_task(mid), "model_id": ""})
+    assert storage.get_task(mid)["model_id"] == ""
+
+
+def test_validate_task_rejects_non_string_model_id(storage):
+    from core.automation.models import validate_task
+
+    errors = validate_task(_task(model_id=123))
+    assert any("模型" in e for e in errors)
+    assert validate_task(_task(model_id="m-task")) == []
+
+
+def test_validate_task_accepts_plan_permission_mode(storage):
+    """计划模式与人工回合同源合法：只读查询与规划，无人值守不挂死。"""
+    from core.automation.models import validate_task
+
+    assert validate_task(_task(permission_mode="plan")) == []
+    assert validate_task(_task(permission_mode="bogus")) != []
+
+
+def test_migration_adds_workdir_column_to_legacy_table(manager):
+    """旧版本任务表（无 workdir 列）打开时自动补列，旧任务读到空串且可编辑。"""
+    with manager._lock:
+        cursor = manager.conn.cursor()
+        cursor.execute("DROP TABLE IF EXISTS automation_tasks")
+        cursor.execute("""
+            CREATE TABLE automation_tasks (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                trigger_type TEXT NOT NULL,
+                trigger_config TEXT NOT NULL DEFAULT '{}',
+                target_session TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                permission_mode TEXT NOT NULL DEFAULT 'confirm',
+                missed_run_policy TEXT NOT NULL DEFAULT 'skip',
+                notify_on_success INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                last_run_at TEXT,
+                next_run_at REAL
+            )
+        """)
+        cursor.execute(
+            """
+            INSERT INTO automation_tasks (
+                id, name, trigger_type, trigger_config, target_session, prompt,
+                created_at, updated_at
+            ) VALUES (
+                't1', '旧任务', 'daily', '{"time": "09:30"}', '自动化任务', 'p',
+                '2026-01-01 00:00:00', '2026-01-01 00:00:00'
+            )
+            """
+        )
+        manager.conn.commit()
+    storage = AutomationStorage(manager)
+    loaded = storage.get_task("t1")
+    assert loaded is not None and loaded["workdir"] == "" and loaded["model_id"] == ""
+    storage.save_task({**loaded, "workdir": "GLOBAL", "model_id": "m1"})
+    reloaded = storage.get_task("t1")
+    assert reloaded["workdir"] == "GLOBAL"
+    assert reloaded["model_id"] == "m1"
+
+
 def test_list_tasks(storage):
     storage.save_task(_task(name="A"))
     storage.save_task(_task(name="B"))

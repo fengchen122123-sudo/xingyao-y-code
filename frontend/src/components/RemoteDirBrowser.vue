@@ -2,7 +2,7 @@
   <div v-if="store.remoteDirBrowser.show" class="rdb-mask" data-test="remote-dir-browser" @click.self="store.closeRemoteDirBrowser()">
     <div class="rdb-card">
       <div class="rdb-head">
-        <span class="rdb-title">选择项目文件夹</span>
+        <span class="rdb-title">{{ store.remoteDirBrowser.plainPick ? '选择工作目录' : '选择项目文件夹' }}</span>
         <button class="rdb-close" data-test="rdb-close" @click="store.closeRemoteDirBrowser()">✕</button>
       </div>
 
@@ -45,7 +45,9 @@
           data-test="rdb-confirm"
           :disabled="store.remoteDirBrowser.loading"
           @click="onConfirm"
-        >{{ store.remoteDirBrowser.selected ? '打开选中的文件夹' : '使用当前目录' }}</button>
+        >{{ store.remoteDirBrowser.selected
+            ? (store.remoteDirBrowser.plainPick ? '选定该文件夹' : '打开选中的文件夹')
+            : '使用当前目录' }}</button>
       </div>
     </div>
   </div>

@@ -155,9 +155,10 @@ class LanServer:
     MESSAGE_ENTRY_METHODS = frozenset({"send_user_message"})
 
     # send_user_message(text, session_name, attachments, workdir, model_id,
-    # turn_source)——turn_source 前共 5 个位置参数（gui_bridge.py 真实签名）。
-    # LAN 分发把客户端位置参数裁剪至前 5 个：第 6 位（turn_source 所在位置）
-    # 起的绑定通道全部剥离，turn_source 只能由服务器以 keyword 唯一注入。
+    # permission_mode, turn_source)——turn_source 前共 6 个位置参数
+    # （gui_bridge.py 真实签名；第 6 位是会话级权限档位，同样不允许客户端
+    # 经位置通道注入）。LAN 分发把客户端位置参数裁剪至前 5 个：第 6 位起
+    # 的绑定通道全部剥离，turn_source 只能由服务器以 keyword 唯一注入。
     MESSAGE_ENTRY_POSITIONAL_LIMIT = 5
 
     def __init__(self, bridge=None, port=0):
@@ -451,9 +452,10 @@ class LanServer:
         """消息入口参数规范化：剥离客户端一切 turn_source 绑定通道。
 
         真实 bridge 签名 send_user_message(text, session_name, attachments,
-        workdir, model_id, turn_source)——turn_source 是第 6 个位置参数，
-        客户端可经位置参数数组第 6 位、kwargs dict 或首参 payload dict
-        绑定同名通道（Task 15 审查 Critical-1 两条绕过向量）。统一规范化
+        workdir, model_id, permission_mode, turn_source)——turn_source 在
+        第 6 个位置参数（permission_mode）之后，客户端可经位置参数数组
+        第 6 位起、kwargs dict 或首参 payload dict 绑定同名通道（Task 15
+        审查 Critical-1 两条绕过向量）。统一规范化
         （返回 ``(args, extra_kwargs)``；无法规范化返回 ``None`` 由调用方
         fail-closed 拒绝）：
         - list：裁剪位置参数至前 5 个（text..model_id），第 6 位起丢弃；
