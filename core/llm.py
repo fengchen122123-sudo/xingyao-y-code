@@ -2957,6 +2957,16 @@ def _glm_keepalive_thinking_locked(model_name):
     return not ({"off", "on"} & set(capability.options))
 
 
+def is_deepseek_ledger_route(model_name, api_base):
+    """官方 DeepSeek 家族路由判定：主会话不可变 Prompt Ledger 的核心条件。
+
+    供 agent_service 的水位线基线与主动轮换判定复用（账本启用还需
+    persist / parent_session / cache_scope=main 等会话层条件，见
+    _uses_deepseek_prompt_ledger）。
+    """
+    return _is_deepseek_family(model_name, api_base) and _is_official_deepseek_route(api_base)
+
+
 def _uses_deepseek_prompt_ledger(
     model_name, api_base, cache_scope, persist, parent_session
 ):
@@ -2965,8 +2975,7 @@ def _uses_deepseek_prompt_ledger(
         persist
         and parent_session
         and str(cache_scope or "main") == "main"
-        and _is_deepseek_family(model_name, api_base)
-        and _is_official_deepseek_route(api_base)
+        and is_deepseek_ledger_route(model_name, api_base)
     )
 
 
@@ -3031,11 +3040,39 @@ def _new_tail_after_ledger_prefix(ledger_messages, current_messages):
     return deepcopy(current_messages[matches[0] + 1:])
 
 
+# 会话级待轮换代登记表：agent_service 的水位线压缩成功后，若实际请求
+# （账本字节）仍超出窗口，可在此登记一次主动轮换——下一次账本请求以
+# 压缩后的历史 force_new 重建，避免"等 provider 报超限错误才被动轮换"
+# 的三段等待（失败请求排队 + 强制压缩 + 全价重发）。只记会话名不记正文。
+_pending_ledger_rotations = {}
+_pending_ledger_rotations_lock = threading.Lock()
+
+
+def mark_deepseek_generation_rotation(session_name):
+    """登记指定会话在下一次账本请求时主动轮换代（幂等，一次消费）。"""
+    key = str(session_name or "").strip()
+    if not key:
+        return
+    with _pending_ledger_rotations_lock:
+        _pending_ledger_rotations[key] = True
+
+
+def consume_deepseek_generation_rotation(session_name) -> bool:
+    """取走并清除待轮换代标记（一次登记只生效一次）。"""
+    key = str(session_name or "").strip()
+    if not key:
+        return False
+    with _pending_ledger_rotations_lock:
+        return bool(_pending_ledger_rotations.pop(key, False))
+
+
 def _prepare_deepseek_ledger_request(
     manager, session_name, model_name, api_base, cache_scope, messages, tools,
     *, force_new=False
 ):
     """Build and persist the immutable request view for one DeepSeek call."""
+    if not force_new and consume_deepseek_generation_rotation(session_name):
+        force_new = True
     generation = manager.get_or_create_deepseek_prompt_generation(
         session_name,
         model_name,
