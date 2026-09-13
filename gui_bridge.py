@@ -5048,20 +5048,25 @@ class ApiBridge:
                     notify_success = (
                         str((automation_context or {}).get("notify_on_success") or "") == "1"
                     )
+                    # session_name 必带：前端按归属会话路由 notice，
+                    # 缺省会落到用户正在查看的会话（跨会话串扰）
                     if final_status == "error":
                         self.emit_event("notice", {
                             "message": (
                                 f"自动化任务「{automation_task_name}」运行失败："
                                 f"{automation_error[:120]}"
                             ),
+                            "session_name": session_name,
                         })
                     elif final_status == "cancelled":
                         self.emit_event("notice", {
                             "message": f"自动化任务「{automation_task_name}」运行已取消。",
+                            "session_name": session_name,
                         })
                     elif final_status == "completed" and notify_success:
                         self.emit_event("notice", {
                             "message": f"自动化任务「{automation_task_name}」运行完成。",
+                            "session_name": session_name,
                         })
                 except Exception:
                     logger.debug("自动化终态通知推送失败", exc_info=True)
@@ -5095,10 +5100,13 @@ class ApiBridge:
             return
         try:
             from core.command_policy import redact_sensitive_text
+            # session_name 取回调的 session_id（实为发起任务的会话名，见
+            # core/tools.py run_in_background 归属解析）；缺省时前端才回退当前会话
             self.emit_event("background_task_finished", {
                 "task_id": task_id,
                 "command": redact_sensitive_text(command or ""),
                 "returncode": int(returncode or 0),
+                "session_name": str(session_id or ""),
             })
         except Exception:
             logger.debug("推送后台命令任务完成通知失败", exc_info=True)
