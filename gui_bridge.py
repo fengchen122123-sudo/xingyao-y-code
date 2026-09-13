@@ -3791,6 +3791,10 @@ class ApiBridge:
         # 不同：自动化回合没有"用户回来"的时刻，等待只会永久挂死回合。
         # getattr 防御：裸实例测试桥可能未初始化该映射（同 _user_cancelled_sessions 先例）
         automation_label = getattr(self, "_automation_turn_labels", {}).get(request.parent_turn_id)
+        if automation_label is None:
+            # 子代理派生的权限请求 owner 是 task_id（非主回合 turn_id），
+            # 按归属链判定其父回合是否自动化回合（P1-2：否则无人值守会挂死）
+            automation_label = self._automation_subagent_owner_label(request.parent_turn_id)
         if automation_label:
             self._auto_deny_automation_permission(request, automation_label)
             return
@@ -3851,10 +3855,45 @@ class ApiBridge:
             self._perm_timers[request.request_id] = timer
         timer.start()
 
+    def _automation_subagent_owner_label(self, owner_id: str) -> Optional[Dict[str, str]]:
+        """子代理权限请求归属判定：owner 是子代理 task_id 时，查其父回合是否
+        星轨自动化回合（P1-2）。非子代理 owner 或父回合非自动化时返回 None，
+        人工回合路径零影响。"""
+        owner = str(owner_id or "").strip()
+        if not owner or not getattr(self, "_automation_turn_labels", {}):
+            return None
+        try:
+            from core.tools import subagent_manager
+
+            for task in subagent_manager.snapshot():
+                if str(getattr(task, "task_id", "")) != owner:
+                    continue
+                parent_turn = str(getattr(task, "parent_turn_id", "") or "")
+                return self._automation_turn_labels.get(parent_turn)
+        except Exception:
+            logger.debug("子代理权限归属判定失败", exc_info=True)
+        return None
+
     def _auto_deny_automation_permission(self, request, label: Dict[str, str]) -> None:
         """自动化回合的权限请求自动拒绝：定位拒绝项，找不到则按取消收尾。"""
         task_name = str(label.get("task_name") or "自动化任务")
         try:
+            if request.function_name == "ask_user":
+                # 提问类没有"拒绝项"概念：与人工回合超时语义一致走取消，
+                # 绝不能把任意回答项当成"自动作答第 2 项"（P2-4）
+                from core.permission_broker import CANCELLED_RESULT
+
+                permission_broker.resolve(request.request_id, CANCELLED_RESULT)
+                logger.info(
+                    "自动化任务「%s」无人值守已自动取消 ask_user 提问", task_name
+                )
+                self.emit_event("notice", {
+                    "message": (
+                        f"自动化任务「{task_name}」无人值守已自动取消提问："
+                        "模型可在无人应答时自行继续。"
+                    ),
+                })
+                return
             deny_key = next(
                 (
                     key
@@ -4285,19 +4324,34 @@ class ApiBridge:
                 self._automation_storage.mark_run_running(run_id)
             except Exception:
                 logger.exception("自动化运行置 running 失败")
-            self._spawn_turn_worker(
-                str(task.get("prompt") or ""),
-                target_session,
-                display_text=display_text,
-                turn_source="local",
-                internal_kind="automation",
-                automation_context=automation_context,
-            )
+            try:
+                self._spawn_turn_worker(
+                    str(task.get("prompt") or ""),
+                    target_session,
+                    display_text=display_text,
+                    turn_source="local",
+                    internal_kind="automation",
+                    automation_context=automation_context,
+                )
+            except Exception as exc:
+                # spawn 失败（线程创建异常等）：立刻置 error 终态，避免运行行
+                # 永久停在 running 导致后续触发全部被单飞跳过（P2-6）
+                logger.exception("自动化回合 spawn 失败")
+                try:
+                    self._automation_storage.finish_run(
+                        run_id, "error", f"回合线程启动失败: {exc}"[:500]
+                    )
+                except Exception:
+                    logger.exception("自动化运行错误终态写入失败")
 
     def _on_automation_run_updated(self, run: dict) -> None:
-        """存储认领路径产生的运行行（queued/skipped）→ 推事件与跳过通知。"""
+        """运行行任何状态变化（存储层统一回调）→ 推事件与跳过通知。"""
         try:
             self.emit_event("automation_run_updated", {"run": run})
+            if run.get("status") in ("queued", "skipped"):
+                # 认领推进了 next_run_at/last_run_at，同步刷新任务快照
+                # （规格 11.2；P2-3），否则列表倒计时到下一次编辑才更新
+                self._emit_automation_tasks_changed()
             if run.get("status") == "skipped":
                 self.emit_event("notice", {
                     "message": (
@@ -4322,6 +4376,9 @@ class ApiBridge:
         for task in self._automation_storage.list_tasks():
             dto = dict(task)
             dto["trigger_summary"] = trigger_summary(task["trigger_type"], task["trigger_config"])
+            # SQLite 行直出 0/1，归一为布尔（P2-7：与 pywebview.d.ts 声明一致）
+            dto["enabled"] = bool(dto.get("enabled"))
+            dto["notify_on_success"] = bool(dto.get("notify_on_success"))
             dtos.append(dto)
         return dtos
 
@@ -4380,10 +4437,21 @@ class ApiBridge:
             task = self._automation_storage.get_task(str(task_id or ""))
             if task is None:
                 return {"ok": False, "msg": "任务不存在"}
-            if self._automation_storage.has_active_run(task["id"]):
+            # 原子单飞：锁内 check+insert（P2-1），并发双击只会有一个成功创建
+            run = self._automation_storage.create_manual_run_if_idle(task)
+            if run is None:
                 return {"ok": False, "msg": "上一次运行尚未结束，请稍后再试"}
-            run = self._automation_storage.create_run(task, trigger_kind="manual")
-            self._dispatch_automation_run(task, run["id"], "manual")
+            try:
+                self._dispatch_automation_run(task, run["id"], "manual")
+            except Exception as exc:
+                # 分发异常同样不留 stuck 行（P2-6）
+                try:
+                    self._automation_storage.finish_run(
+                        run["id"], "error", f"分发失败: {exc}"[:500]
+                    )
+                except Exception:
+                    logger.exception("自动化运行错误终态写入失败")
+                raise
             return {"ok": True, "run_id": run["id"]}
         except Exception as e:
             logger.exception("手动执行自动化任务失败")
@@ -4958,9 +5026,14 @@ class ApiBridge:
             _phase_mark("finally 清理完成（finish_once 前）")
             finish_once()
             # 星轨自动化：回写运行终态。cancelled（用户停止）→ cancelled，
-            # 回合异常 → error，否则 completed。exactly-once 由 storage 的
-            # queued/running 状态守卫兜底（规格 5.4；取消绝不自动重放）
+            # 回合异常或模型侧 turn_error（内层生成器把常见失败吞为事件，worker
+            # 只能经 error_state["terminal_message"] 感知）→ error，否则 completed。
+            # exactly-once 由 storage 的 queued/running 状态守卫兜底（规格 5.4；
+            # 取消绝不自动重放）
             if automation_run_id:
+                automation_error = (
+                    automation_error or str(error_state.get("terminal_message") or "")
+                )
                 final_status = (
                     "cancelled" if cancelled
                     else ("error" if automation_error else "completed")
@@ -4980,7 +5053,7 @@ class ApiBridge:
                         self.emit_event("notice", {
                             "message": (
                                 f"自动化任务「{automation_task_name}」运行失败："
-                                f"{(automation_error or '未知错误')[:120]}"
+                                f"{automation_error[:120]}"
                             ),
                         })
                     elif final_status == "cancelled":

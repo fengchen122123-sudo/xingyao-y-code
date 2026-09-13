@@ -135,3 +135,84 @@ def test_automation_label_cleaned_after_turn(manager, tmp_path):
     bridge._automation_turn_labels["turn-x"] = {"run_id": "run-x", "task_name": "t"}
     bridge._automation_turn_labels.pop("turn-x", None)
     assert bridge._automation_turn_labels == {}
+
+
+# ---------------------------------------------------------------------------
+# 评审修复回归：P1-2 子代理权限归属自动拒绝 / P2-4 ask_user 取消
+# ---------------------------------------------------------------------------
+
+def test_subagent_of_automation_turn_auto_denied(manager, _clean_broker, monkeypatch):
+    """P1-2：自动化回合派生的子代理权限请求（owner=task_id）同样自动拒绝。"""
+    from core.tools import SubagentTask, subagent_manager
+
+    bridge = _make_bridge(manager)
+    automation_turn = "turn-automation-parent"
+    bridge._automation_turn_labels[automation_turn] = {
+        "run_id": "run-1", "task_name": "每日摘要",
+    }
+    monkeypatch.setattr(
+        subagent_manager, "snapshot",
+        lambda: [SubagentTask(task_id="sub-1", parent_session="自动化任务",
+                              parent_turn_id=automation_turn, description="子任务")],
+    )
+
+    request = _enqueue_request("sub-1")  # 子代理请求的 parent_turn_id 是 task_id
+    broker_module.permission_broker.set_prompt_handlers(
+        bridge._activate_permission_request, bridge._dismiss_permission_prompt
+    )
+    bridge._activate_permission_request(request)
+
+    assert request.future.done()
+    assert request.future.result(timeout=0) == 1
+    assert all(e[0] != "permission_request" for e in bridge._events)
+    assert any("无人值守已自动拒绝" in e[1]["message"] for e in bridge._events if e[0] == "notice")
+
+
+def test_subagent_of_human_turn_not_denied(manager, _clean_broker, monkeypatch):
+    """人工回合派生的子代理不受影响：正常弹卡等待用户。"""
+    from core.tools import SubagentTask, subagent_manager
+
+    bridge = _make_bridge(manager)
+    monkeypatch.setattr(
+        subagent_manager, "snapshot",
+        lambda: [SubagentTask(task_id="sub-2", parent_session="人工会话",
+                              parent_turn_id="turn-human-parent", description="子任务")],
+    )
+
+    request = _enqueue_request("sub-2")
+    broker_module.permission_broker.set_prompt_handlers(
+        bridge._activate_permission_request, bridge._dismiss_permission_prompt
+    )
+    bridge._activate_permission_request(request)
+
+    assert any(e[0] == "permission_request" for e in bridge._events)
+    assert not request.future.done()
+    assert broker_module.permission_broker.resolve(request.request_id, 1)
+
+
+def test_ask_user_cancelled_not_auto_answered(manager, _clean_broker):
+    """P2-4：自动化回合的 ask_user 走取消语义，绝不自动选第 2 个回答项。"""
+    bridge = _make_bridge(manager)
+    turn_id = "turn-automation-ask"
+    bridge._automation_turn_labels[turn_id] = {"run_id": "run-9", "task_name": "调研任务"}
+
+    request = _enqueue_request(turn_id)
+    # 伪造 ask_user：任意回答项字符串
+    request = broker_module.permission_broker.enqueue(
+        "ask_user",
+        {"question": "选哪个方案？"},
+        owner_id=turn_id,
+        parent_turn_id=turn_id,
+        source="主代理",
+        options=("方案A", "方案B"),
+    )
+    broker_module.permission_broker.set_prompt_handlers(
+        bridge._activate_permission_request, bridge._dismiss_permission_prompt
+    )
+    bridge._activate_permission_request(request)
+
+    from core.permission_broker import CANCELLED_RESULT
+
+    assert request.future.done()
+    assert request.future.result(timeout=0) == CANCELLED_RESULT
+    assert any("已自动取消提问" in e[1]["message"] for e in bridge._events if e[0] == "notice")
