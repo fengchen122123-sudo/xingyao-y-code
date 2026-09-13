@@ -625,3 +625,115 @@ def test_broadcast_concurrent_thread_safety():
 
     # 4 个 worker_broadcast 发送 4*10=40 条，4 个 worker_route 发送 4*10=40 条，共 80 条全部收到
     assert len(sent_messages) == 80
+
+
+def test_replay_buffer_only_stores_whitelisted_events():
+    """白名单事件打 seq 进补发缓冲；高频事件原样发送不入缓冲。"""
+    srv = LanServer(bridge=None)
+    fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    srv._clients = [fake]
+
+    srv.broadcast('{"type": "token_delta", "data": {"text": "x"}}', event_type="token_delta")
+    srv.broadcast('{"type": "turn_error", "data": {"message": "boom"}}', event_type="turn_error")
+
+    # 高频事件原样透传，无 seq
+    assert fake.sent[0] == '{"type": "token_delta", "data": {"text": "x"}}'
+    # 白名单事件带单调 seq 并入缓冲
+    stamped = json.loads(fake.sent[1])
+    assert stamped["seq"] == 1
+    assert [(seq, payload) for seq, payload in srv._replay_buffer] == [(1, fake.sent[1])]
+
+
+def test_register_without_last_seq_never_replays():
+    """全新页面（无 last_seq）不补发：避免新客户端收到陈旧事件。"""
+    srv = LanServer(bridge=None)
+    srv._issue_token()
+    srv.broadcast('{"type": "turn_error", "data": {"message": "old"}}', event_type="turn_error")
+
+    registered, replay = srv._register_and_collect_replay(object(), srv._token.decode(), None)
+    assert registered is True
+    assert replay == []
+
+
+def test_register_with_last_seq_replays_missed_events_in_order():
+    """断线重连按 last_seq 水位补发缺失白名单事件，顺序与全局 seq 一致。"""
+    srv = LanServer(bridge=None)
+    srv._issue_token()
+    live = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    srv._clients = [live]
+    srv.broadcast('{"type": "notice", "data": {"message": "n1"}}', event_type="notice")
+    srv.broadcast('{"type": "token_delta", "data": {}}', event_type="token_delta")
+    srv.broadcast('{"type": "turn_error", "data": {"message": "boom"}}', event_type="turn_error")
+
+    reconnect = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    registered, replay = srv._register_and_collect_replay(reconnect, srv._token.decode(), 1)
+    assert registered is True
+    assert len(replay) == 1
+    assert json.loads(replay[0])["data"]["message"] == "boom"
+
+    # 补发经每客户端发送锁按序写出
+    srv._send_replay(reconnect, replay)
+    assert reconnect.sent == replay
+
+    # 已追平水位（last_seq >= 最新 seq）则无补发
+    registered2, replay2 = srv._register_and_collect_replay(
+        type("W", (), {"send": lambda self, p: None})(), srv._token.decode(), 2
+    )
+    assert registered2 is True
+    assert replay2 == []
+
+
+class _FakeResumeWS:
+    """模拟断线重连的 ws：首条消息带 last_seq，随后立即结束。"""
+
+    def __init__(self, first_message):
+        self._first = first_message
+        self.sent = []
+
+    def recv(self, timeout=None):
+        if self._first is None:
+            raise RuntimeError("no more messages")
+        msg, self._first = self._first, None
+        return msg
+
+    def __iter__(self):
+        return iter(())
+
+    def send(self, payload):
+        self.sent.append(payload)
+
+    def close(self, code=None, reason=None):
+        pass
+
+
+def test_handle_ws_replays_missed_events_on_resume():
+    """_handle_ws 全链路：带 last_seq 的重连在进入 RPC 循环前收到补发。"""
+    srv = LanServer(bridge=None)
+    token = srv._issue_token()
+    srv.broadcast(json.dumps({"type": "turn_error", "data": {"message": "boom"}}), event_type="turn_error")
+
+    ws = _FakeResumeWS(json.dumps({"token": token, "last_seq": 0}))
+    srv._handle_ws(ws)
+
+    assert len(ws.sent) == 1
+    assert json.loads(ws.sent[0])["data"]["message"] == "boom"
+
+
+def test_handle_ws_rejects_invalid_token_without_replay():
+    srv = LanServer(bridge=None)
+    srv._issue_token()
+    srv.broadcast(json.dumps({"type": "notice", "data": {"message": "n"}}), event_type="notice")
+
+    class _CloseRecorder(_FakeResumeWS):
+        def __init__(self, first_message):
+            super().__init__(first_message)
+            self.closed = None
+
+        def close(self, code=None, reason=None):
+            self.closed = (code, reason)
+
+    ws = _CloseRecorder(json.dumps({"token": "wrong", "last_seq": 0}))
+    srv._handle_ws(ws)
+
+    assert ws.sent == []
+    assert ws.closed is not None and ws.closed[0] == 4401

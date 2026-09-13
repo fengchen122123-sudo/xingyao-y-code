@@ -6,9 +6,12 @@
  * 复用全部组件与主题。
  *
  * 约定（与 core/lan_server.py 对齐）：
- * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验。
+ * - WebSocket 首条消息发送 {"token": "..."} 完成配对校验；断线重连时附带
+ *   {"token", "last_seq"}，服务器按补发缓冲回放缺失的关键事件
+ *   （turn_error/notice/permission_request 等，见 REPLAYABLE_EVENT_TYPES）。
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
- * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串）。
+ * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
+ *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
  */
 (function () {
   if (window.pywebview) return; // 桌面环境不注入，防御性
@@ -18,6 +21,8 @@
 
   var ws = null;
   var seq = 0;
+  var lastSeq = 0;        // 最后收到的补发事件 seq（服务器侧单调递增）
+  var hadConnection = false; // 是否发生过连接：区分全新页面与断线重连
   var pending = new Map(); // id -> {resolve, reject}
 
   function rpc(method, args) {
@@ -35,7 +40,13 @@
   function connect() {
     ws = new WebSocket(wsUrl);
     ws.onopen = function () {
-      ws.send(JSON.stringify({ token: token }));
+      var auth = { token: token };
+      if (hadConnection) {
+        // 断线重连：携带水位请求补发，锁屏/切后台期间的关键事件不丢
+        auth.last_seq = lastSeq;
+      }
+      hadConnection = true;
+      ws.send(JSON.stringify(auth));
       // 就绪后才注入 api，并触发前端等待的 pywebviewready 事件
       window.pywebview = {
         api: new Proxy({}, {
@@ -67,9 +78,14 @@
             p.resolve(msg.result);
           }
         }
-      } else if (msg && msg.type && window.onBridgeEvent) {
-        // 事件广播（对象 {type, data}）
-        window.onBridgeEvent(msg);
+      } else if (msg && msg.type) {
+        if (typeof msg.seq === 'number' && msg.seq > lastSeq) {
+          lastSeq = msg.seq; // 先记录水位再派发，避免处理器抛错丢水位
+        }
+        if (window.onBridgeEvent) {
+          // 事件广播（对象 {type, data, seq?}）
+          window.onBridgeEvent(msg);
+        }
       }
     };
     ws.onclose = function () {

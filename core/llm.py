@@ -375,8 +375,23 @@ API_REQUEST_MAX_TIMEOUT_SECONDS = 600
 
 # 单次请求等待反馈：超过阈值后按间隔向 UI 报一次“模型响应中”，
 # 避免大载荷请求长时间无反馈被误判为卡死
-WAIT_NOTICE_THRESHOLD_SECONDS = 60.0
-WAIT_NOTICE_INTERVAL_SECONDS = 15.0
+WAIT_NOTICE_THRESHOLD_SECONDS = 120.0
+WAIT_NOTICE_INTERVAL_SECONDS = 30.0
+
+# 等待硬上限（秒）：首字节等待或流中段连续空闲达到该值即放弃本轮请求并结束回合。
+# litellm num_retries 会把单次超时在同一个 Step 内放大数倍（重试留在同 Step），
+# 等待提示里的“超时上限”不等于客户端真实等待上限；与其无限等，不如到点主动
+# 结束回合让用户决定重试。
+REQUEST_WAIT_GIVE_UP_SECONDS = 600.0
+
+
+class RequestWaitGiveUpError(RuntimeError):
+    """等待模型响应达到硬上限（REQUEST_WAIT_GIVE_UP_SECONDS）：结束本轮而非重试。
+
+    继承 RuntimeError 以落入轮次级 except Exception 的统一失败收口
+    （回滚 + error/turn_error 事件）；API 重试处理器对其直接 re-raise，
+    绝不进入重试循环（重试只会再等一个上限时长）。
+    """
 
 # 工具结果中的错误哨兵前缀（统一在此定义，供结果判断与构造处引用）
 TOOL_ERROR_PREFIX = "🚨"
@@ -3894,6 +3909,10 @@ def _builtin_default_max_tokens(model_name, api_base=""):
         # DeepSeek 官方最大输出 384K；不限定官方路由，任意厂商挂载的
         # deepseek 前缀模型（不区分大小写）统一按此给足输出预算。
         return 384000
+    if model.startswith("agnes"):
+        # Agnes AI 前缀模型（含未来新版本）统一默认 65535 输出预算；
+        # config.json 显式配置的 max_tokens 仍优先生效。
+        return 65535
     if _is_glm_family(model_name, api_base):
         if "glm-5.3" in model:
             return 131000
@@ -4122,6 +4141,13 @@ def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_ca
                 ok, item = chunks_queue.get(timeout=0.5)
             except queue.Empty:
                 idle = time.monotonic() - idle_started_at
+                if idle >= REQUEST_WAIT_GIVE_UP_SECONDS:
+                    # 连续空闲硬上限：连接已死透，继续等只会拖满整轮
+                    raise RequestWaitGiveUpError(
+                        f"模型流式响应已连续 {int(idle)} 秒"
+                        f"（约 {int(REQUEST_WAIT_GIVE_UP_SECONDS // 60)} 分钟上限）"
+                        "无新数据，本轮已自动结束；可重试或检查模型服务状态"
+                    )
                 if (
                     idle >= WAIT_NOTICE_THRESHOLD_SECONDS
                     and time.monotonic() - last_notice_at >= WAIT_NOTICE_INTERVAL_SECONDS
@@ -4135,6 +4161,8 @@ def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_ca
                         print(f"\n[⏳ {wait_message}]")
                     else:
                         _notify_event(event_callback, "status", {"message": wait_message})
+                        # None 哨兵：消费侧转成空心跳 yield，实时冲刷积压的 status 事件
+                        yield None
                 continue
             idle_started_at = time.monotonic()
             last_notice_at = idle_started_at
@@ -5654,6 +5682,16 @@ def _chat_with_model_generator(
                             # 等待超过阈值后按间隔报一次等待状态，避免大载荷请求
                             # 长时间无反馈被误判为“卡死”（重试提示只在异常后才有）
                             waited = time.monotonic() - wait_started_at
+                            if waited >= REQUEST_WAIT_GIVE_UP_SECONDS:
+                                # 等待硬上限：litellm num_retries 会把单次超时在
+                                # 同一 Step 内放大数倍，这里按客户端真实等待时长兜底，
+                                # 到点结束本轮而非无限等
+                                raise RequestWaitGiveUpError(
+                                    f"等待模型响应已达 {int(waited)} 秒"
+                                    f"（约 {int(REQUEST_WAIT_GIVE_UP_SECONDS // 60)} 分钟上限）"
+                                    "仍未收到首字节，本轮已自动结束；"
+                                    "可重试、缩小上下文或检查模型服务状态"
+                                )
                             if (
                                 waited >= WAIT_NOTICE_THRESHOLD_SECONDS
                                 and time.monotonic() - last_wait_notice_at >= WAIT_NOTICE_INTERVAL_SECONDS
@@ -5668,6 +5706,10 @@ def _chat_with_model_generator(
                                     print(f"\n[⏳ {wait_message}]")
                                 else:
                                     _notify_event(event_callback, "status", {"message": wait_message})
+                                    # 空心跳唤醒外层适配层的 drain_public_events()：
+                                    # status 事件只进 pending_events，若等待期不 yield，
+                                    # 会积压到首个正文 chunk 才一次性冲刷（提示扎堆弹出）
+                                    yield ""
                         if future.cancelled():
                             raise KeyboardInterrupt("用户终止了对话。")
                         exc = future.exception()
@@ -5684,6 +5726,10 @@ def _chat_with_model_generator(
                     # 硬中断（用户取消关闭在飞流）会让请求线程抛连接错误；
                     # 先走取消判定，确保不误入下面的网络错误重试
                     raise_if_cancelled()
+                    if isinstance(api_err, RequestWaitGiveUpError):
+                        # 等待硬上限不是可重试错误：已等满上限时长，
+                        # 重试只会再等一个上限，直接结束本轮
+                        raise
                     err_str = str(api_err).lower()
                     # 上下文窗口超限自动压缩历史记录并重试：
                     # 优先按异常类型判断，字符串匹配作为兜底且要求上下文相关关键词组合，
@@ -5826,6 +5872,11 @@ def _chat_with_model_generator(
                 inflight_holder=inflight_holder, cancel_event=cancel_event,
             ):
                 raise_if_cancelled()
+                if chunk is None:
+                    # 流中段等待心跳：空正文让外层适配层 drain_public_events()
+                    # 实时冲刷积压的 status 事件（流挂起期间提示不再扎堆延迟）
+                    yield ""
+                    continue
                 if first_token_time is None:
                     first_token_time = time.monotonic()
                 update = stream_assembler.consume(chunk)

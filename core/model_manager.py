@@ -60,11 +60,11 @@ def load_config() -> dict:
     # 检测旧格式（只有 model/api_key/base_url 的扁平结构），自动迁移
     if "model" in data and "providers" not in data:
         try:
-            old_model = data.get("model", "openai/agnes-2.0-flash")
+            old_model = data.get("model", "openai/agnes-3.0-flash")
             if isinstance(old_model, dict):
-                old_model = old_model.get("litellm_model") or old_model.get("name") or "openai/agnes-2.0-flash"
+                old_model = old_model.get("litellm_model") or old_model.get("name") or "openai/agnes-3.0-flash"
             elif not isinstance(old_model, str):
-                old_model = str(old_model) if old_model else "openai/agnes-2.0-flash"
+                old_model = str(old_model) if old_model else "openai/agnes-3.0-flash"
             
             model_name = old_model.split("/")[-1]
             mid = str(uuid.uuid4())[:8]
@@ -773,24 +773,48 @@ def add_preset_provider(preset_id: str, api_key: str) -> str:
     )
 
 
-def sync_preset_provider_models(preset_id: str) -> int:
-    """把预置目录中该厂商新增的模型增量合并进用户配置，返回本次新增数量。
+def sync_preset_provider_models(preset_id: str) -> dict:
+    """把预置目录中该厂商的模型合并进用户配置，返回 {"added", "updated"} 计数。
 
     预置目录（model_catalog.py）更新不会自动同步到已添加过该厂商的旧
-    config.json（添加时是快照拷贝）。按 preset_id 定位厂商，只追加用户
-    配置中缺少的模型（按模型 name 比对），绝不删除：用户手动删掉的
-    预置模型（delete_model 时记录于 removed_preset_models）与自定义
-    模型都保持原样。厂商不存在（未添加过或已删除）时静默返回 0。
+    config.json（添加时是快照拷贝）。厂商定位先按 preset_id 链接，未带
+    链接的手动厂商按厂商名或 Base URL 认领（GUI 同步按钮因此对这类
+    老配置同样可用）。定位后：
+    - 用户配置中缺少的预置模型按目录条目追加；
+    - 已存在且仍在目录中的预置模型，把 context_window / max_tokens /
+      supports_vision / supports_function_calling / computer_protocol 刷新为
+      目录值（目录调参——如上下文与输出上限扩容——能落到老配置）。
+    绝不删除：用户手动删掉的预置模型（delete_model 时记录于
+    removed_preset_models）、已从目录下架的模型与自定义模型都保持原样。
+    厂商不存在（未添加过或已删除）时静默返回 0/0，不写任何配置。
     """
     preset = get_preset_provider(preset_id)
+    catalog_by_name = {m["name"]: m for m in preset["models"]}
     added_count = 0
+    updated_count = 0
 
-    def _mutate(data):
-        nonlocal added_count
-        provider = next(
+    def _locate_provider(data):
+        # 先按 preset_id 链接定位；手动添加、未带链接的老厂商按厂商名或
+        # Base URL 认领，否则「同步预置模型」对这类配置永远无处落地。
+        linked = next(
             (p for p in data.get("providers", []) if p.get("preset_id") == preset_id),
             None,
         )
+        if linked is not None:
+            return linked
+        base = str(preset["base_url"] or "").rstrip("/").lower()
+        return next(
+            (
+                p for p in data.get("providers", [])
+                if p.get("name") == preset["name"]
+                or str(p.get("base_url") or "").rstrip("/").lower() == base
+            ),
+            None,
+        )
+
+    def _mutate(data):
+        nonlocal added_count, updated_count
+        provider = _locate_provider(data)
         if provider is None:
             return
         existing_names = {m.get("name") for m in provider.get("models", [])}
@@ -806,16 +830,7 @@ def sync_preset_provider_models(preset_id: str) -> int:
                 ),
                 "context_window": m.get("context_window", 128000),
             }
-            if "supports_vision" in m:
-                entry["supports_vision"] = bool(m["supports_vision"])
-            if "supports_function_calling" in m:
-                entry["supports_function_calling"] = _normalize_capability_bool(
-                    "supports_function_calling", m["supports_function_calling"]
-                )
-            if "computer_protocol" in m:
-                entry["computer_protocol"] = _normalize_computer_protocol(
-                    m["computer_protocol"]
-                )
+            _apply_preset_capability_fields(entry, m)
             _validate_computer_combination(
                 entry.get("supports_vision"),
                 entry.get("supports_function_calling"),
@@ -823,6 +838,65 @@ def sync_preset_provider_models(preset_id: str) -> int:
             )
             provider.setdefault("models", []).append(entry)
             added_count += 1
+        # 已存在模型的目录元数据刷新：只覆盖目录声明的字段，目录未
+        # 声明的字段（如旧条目的 max_tokens）保留用户现值。
+        for model in provider.get("models", []):
+            catalog_entry = catalog_by_name.get(model.get("name"))
+            if catalog_entry is None:
+                continue
+            if _refresh_preset_capability_fields(model, catalog_entry):
+                updated_count += 1
 
     config.update_config(_mutate)
-    return added_count
+    return {"added": added_count, "updated": updated_count}
+
+
+def _apply_preset_capability_fields(entry: dict, catalog_model: dict) -> None:
+    """把目录条目的可选能力字段落进新建模型条目。"""
+    if "max_tokens" in catalog_model:
+        entry["max_tokens"] = int(catalog_model["max_tokens"])
+    if "supports_vision" in catalog_model:
+        entry["supports_vision"] = bool(catalog_model["supports_vision"])
+    if "supports_function_calling" in catalog_model:
+        entry["supports_function_calling"] = _normalize_capability_bool(
+            "supports_function_calling", catalog_model["supports_function_calling"]
+        )
+    if "computer_protocol" in catalog_model:
+        entry["computer_protocol"] = _normalize_computer_protocol(
+            catalog_model["computer_protocol"]
+        )
+
+
+def _refresh_preset_capability_fields(model: dict, catalog_model: dict) -> bool:
+    """按目录刷新已有预置模型条目的元数据，返回是否有实际变化。"""
+    changed = False
+    if "context_window" in catalog_model:
+        window = int(catalog_model["context_window"])
+        if model.get("context_window") != window:
+            model["context_window"] = window
+            changed = True
+    field_updaters = (
+        ("max_tokens", lambda v: int(v)),
+        ("supports_vision", bool),
+        (
+            "supports_function_calling",
+            lambda v: _normalize_capability_bool(
+                "supports_function_calling", v
+            ),
+        ),
+        ("computer_protocol", _normalize_computer_protocol),
+    )
+    for field, cast in field_updaters:
+        if field not in catalog_model:
+            continue
+        value = cast(catalog_model[field])
+        if model.get(field) != value:
+            model[field] = value
+            changed = True
+    if changed:
+        _validate_computer_combination(
+            model.get("supports_vision"),
+            model.get("supports_function_calling"),
+            model.get("computer_protocol"),
+        )
+    return changed
