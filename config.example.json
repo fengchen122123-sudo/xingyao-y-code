@@ -23,7 +23,9 @@
     "tool_result_preview_limit_chars": 800,
     "tool_result_token_limit": 600,
     "summary_length_first": 250,
-    "summary_length_merge": 350
+    "summary_length_merge": 350,
+    "inter_chunk_delay_seconds": 0,
+    "precompress_ratio": 0.85
   },
   "providers": [
     {
