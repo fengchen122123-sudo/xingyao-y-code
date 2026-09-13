@@ -54,3 +54,30 @@ def test_post_notice_supports_error_kind_and_rejects_invalid_values():
     res = bridge.post_notice("   ", "s1")
     assert res["ok"] is False
     assert len(emitted) == 2
+
+
+def test_background_task_finished_event_carries_owning_session():
+    """后台命令任务完成通知必须带归属会话（session_name）。
+
+    前端据此把提示路由进任务所属会话；缺省时提示会落到用户正在查看的
+    会话，表现为跨会话串扰（提示卡片出现在无关对话中间）。
+    """
+    bridge = gui_bridge.ApiBridge.__new__(gui_bridge.ApiBridge)
+    bridge._shutting_down = False
+    emitted = []
+    bridge.emit_event = lambda t, d: emitted.append((t, d))
+
+    # session_id 为空：只验证事件负载，不触达总结回合路径
+    bridge._on_background_task_finished("e0c2c3be", "npm run build", 129, "", "")
+
+    assert len(emitted) == 1
+    event_type, payload = emitted[0]
+    assert event_type == "background_task_finished"
+    assert payload["task_id"] == "e0c2c3be"
+    assert payload["returncode"] == 129
+    assert payload["session_name"] == ""
+
+    # 带归属会话时透传（回调参数名 session_id，值实为会话名）
+    bridge._start_bg_command_summary = lambda *args, **kwargs: None
+    bridge._on_background_task_finished("t2", "pip install x", 0, "会话一", "tail")
+    assert emitted[1][1]["session_name"] == "会话一"

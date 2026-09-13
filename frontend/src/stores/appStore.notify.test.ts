@@ -161,3 +161,50 @@ it('notice 桥事件写入已加载的非当前会话 runtime，切回可见', (
   expect(s2Msgs[s2Msgs.length - 1].role).toBe('notice');
   expect(s2Msgs[s2Msgs.length - 1].content).toBe('切换模型失败: x');
 });
+
+it('background_task_finished 按归属会话路由，不串到当前查看的会话', () => {
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+  store._getSessionRuntime('s2').messages.push({ role: 'user', content: '旧消息' } as never);
+
+  store.handleBridgeEvent({
+    type: 'background_task_finished',
+    data: { task_id: 'e0c2c3be', command: 'npm run build', returncode: 129, session_name: 's2' },
+  } as any);
+
+  expect(store.messages).toHaveLength(0);
+  const s2Msgs = store._getSessionRuntime('s2').messages;
+  expect(s2Msgs[s2Msgs.length - 1].role).toBe('notice');
+  expect(s2Msgs[s2Msgs.length - 1].content).toBe('后台任务 e0c2c3be 已结束（退出码 129）');
+});
+
+it('background_task_finished 缺 session_name（旧后端）回落当前会话', () => {
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+  store.messages.push({ role: 'user', content: '你好' } as never);
+
+  store.handleBridgeEvent({
+    type: 'background_task_finished',
+    data: { task_id: 't1', command: 'x', returncode: 0 },
+  } as any);
+
+  const last = store.messages[store.messages.length - 1];
+  expect(last.role).toBe('notice');
+  expect(last.content).toBe('后台任务 t1 已完成');
+});
+
+it('background_subagent_terminal 按归属会话路由，不串到当前查看的会话', () => {
+  const store = useAppStore();
+  store.currentSessionName = 's1';
+  store._getSessionRuntime('s2').messages.push({ role: 'user', content: '旧消息' } as never);
+
+  store.handleBridgeEvent({
+    type: 'background_subagent_terminal',
+    data: { task_id: 'sub-1', session_name: 's2', status: 'completed', description: '调研', summary: '' },
+  } as any);
+
+  expect(store.messages).toHaveLength(0);
+  const s2Msgs = store._getSessionRuntime('s2').messages;
+  expect(s2Msgs[s2Msgs.length - 1].role).toBe('notice');
+  expect(s2Msgs[s2Msgs.length - 1].content).toBe('后台子代理已完成：调研');
+});

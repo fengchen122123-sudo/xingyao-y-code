@@ -2904,7 +2904,7 @@ export const useAppStore = defineStore('app', {
           void this.refreshTurnUndoStates();
         }
         if (data.message) {
-          this.notifyChatLocal(String(data.message));
+          this.notifyChatLocal(String(data.message), 'notice', undoSession || undefined);
         }
         return;
       }
@@ -3558,24 +3558,27 @@ export const useAppStore = defineStore('app', {
         };
         const label = statusLabel[data.status] || data.status;
         const desc = data.description ? `：${data.description}` : '';
+        // 按归属会话路由（eventSession 来自 data.session_name）：提示落在
+        // 任务所属会话，不串到用户正在查看的其他会话
         if (data.status === 'completed') {
-          this.notifyChatLocal(`后台子代理${label}${desc}`);
+          this.notifyChatLocal(`后台子代理${label}${desc}`, 'notice', eventSession);
         } else {
           // 与 error 事件一致：回合进行中不插队，挂在当前助手消息上展示
           const last = this.messages[this.messages.length - 1];
           if (last && last.role === 'assistant') {
             last.error_note = `后台子代理${label}${desc}`;
-            this.notifyChatLocal(`后台子代理${label}${desc}`);
+            this.notifyChatLocal(`后台子代理${label}${desc}`, 'notice', eventSession);
           } else {
             this.messages.push({ role: 'error', content: `后台子代理${label}${desc}` });
           }
         }
       } else if (type === 'background_task_finished') {
-        // 后台命令任务（execute_command 的 run_in_background，如打包）完成通知
+        // 后台命令任务（execute_command 的 run_in_background，如打包）完成通知；
+        // 按归属会话路由，缺省（旧后端）才落到当前会话
         const code = Number(data.returncode);
         const tid = String(data.task_id || '');
         const statusText = code === 0 ? '已完成' : `已结束（退出码 ${code}）`;
-        this.notifyChatLocal(`后台任务 ${tid} ${statusText}`);
+        this.notifyChatLocal(`后台任务 ${tid} ${statusText}`, 'notice', String(data.session_name || '') || undefined);
       } else if (type === 'terminal_output') {
         this.terminalOutput += data.text || '';
         // 输出上限 200K 字符：超出后从头部截断，避免长任务把内存拖爆
