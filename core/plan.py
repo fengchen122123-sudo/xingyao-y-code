@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from copy import deepcopy
 from pathlib import Path
@@ -70,6 +71,35 @@ def _starts_with_cjk(text: str) -> bool:
 def _contains_cjk(text: str) -> bool:
     """检查文本是否包含任何 CJK 统一表意文字（中日韩汉字）。"""
     return any("\u4e00" <= ch <= "\u9fff" or "\u3400" <= ch <= "\u4dbf" for ch in str(text or ""))
+
+
+# 会话 ID 由用户消息派生（首行截断），可能含 `/` `\` `:` `*` 等 Windows 非法
+# 文件名字符。直接拿会话 ID 当计划文件名会让持久化抛 WinError 123，而计划落盘
+# 失败会连带卡死计划门禁（主 Agent 工具被锁、连计划都清不掉），因此统一清洗。
+_UNSAFE_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_FILENAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)}
+)
+SAFE_SESSION_FILENAME_MAX_CHARS = 100
+
+
+def safe_session_filename(session_id: str) -> str:
+    """把会话 ID 转成合法且稳定的计划文件名（不含扩展名）。
+
+    非法字符替换为下划线；去掉首尾空白与结尾的点（Windows 不允许）；命中 Windows
+    保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9）时加前缀；清洗后为空回落 "session"；
+    超长按 100 字符截断。合法会话名（如 "session-1"）清洗后不变，保证既有计划
+    文件仍能正常加载。
+    """
+    name = _UNSAFE_FILENAME_CHARS.sub("_", str(session_id or "")).strip().rstrip(".")
+    name = name[:SAFE_SESSION_FILENAME_MAX_CHARS].rstrip(". ")
+    if not name:
+        return "session"
+    if name.upper() in _WINDOWS_RESERVED_FILENAMES:
+        return f"_{name}"
+    return name
 
 
 class PlanManager:
@@ -398,7 +428,9 @@ class PlanManager:
     def storage_path(self) -> Path | None:
         if not self._session_id:
             return None
-        return self._storage_dir / f"{self._session_id}.json"
+        # 会话 ID 可能派生自用户消息（含非法文件名字符），落盘前统一清洗；
+        # 合法会话名清洗后不变，既有计划文件照常命中。
+        return self._storage_dir / f"{safe_session_filename(self._session_id)}.json"
 
     def _normalize_item(self, raw: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(raw, dict):
