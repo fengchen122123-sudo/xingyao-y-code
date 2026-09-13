@@ -4940,7 +4940,6 @@ class ApiBridge:
                 _phase_mark("模型回合结束（_consume_turn_events 返回）")
                 _start_finish_watchdog()
                 poller_stop.set()
-                poller_stop.set()
                 try:
                     from core.turn_undo import service as _tu_service
 
