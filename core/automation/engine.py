@@ -61,6 +61,11 @@ class AutomationEngine:
         thread = self._thread
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout)
+            if thread.is_alive():
+                # join 超时：保留线程引用，start() 据此拒绝另起新线程（避免
+                # 短暂双引擎）；旧线程观察到 _stop 后会自行退出（P2-5）
+                logger.warning("自动化引擎线程 %s 退出超时，保留引用等待自然结束", thread.name)
+                return
         self._thread = None
 
     def notify_changed(self) -> None:

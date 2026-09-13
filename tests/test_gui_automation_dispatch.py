@@ -170,7 +170,8 @@ def test_drain_message_queue_passes_automation_context(manager, tmp_path):
 class _WorkerHarness:
     """为 _run_turn_worker 桩掉模型入口与事件出口，保留真实存储/turn_undo。"""
 
-    def __init__(self, bridge, manager, tmp_path, consume_return=False, model_error=False):
+    def __init__(self, bridge, manager, tmp_path, consume_return=False, model_error=False,
+                 terminal_error=None):
         self.bridge = bridge
         self.manager = manager
         self.tmp_path = tmp_path
@@ -184,7 +185,18 @@ class _WorkerHarness:
         bridge._emit_message_final = lambda *a, **k: None
         bridge._clear_session_last_error = lambda *a, **k: None
         bridge._emit_owned_error = lambda *a, **k: None
-        bridge._consume_turn_events = lambda *a, **k: consume_return
+        self.terminal_error = terminal_error
+        self.consume_return = consume_return
+
+        def _fake_consume(history, model_name, api_key, api_base, session_name, turn_id,
+                          model_id=None, error_state=None, turn_source="local"):
+            # 模拟 core/llm.py 内层生成器把模型失败转为 turn_error 事件的真实路径：
+            # 经 _emit_owned_error(terminal=True) 落入 error_state，worker 据此感知
+            if self.terminal_error and error_state is not None:
+                error_state["terminal_message"] = self.terminal_error
+            return self.consume_return
+
+        bridge._consume_turn_events = _fake_consume
         if model_error:
             self.model = None
         else:
@@ -416,3 +428,93 @@ def _insert_due_with_active_run(bridge):
         bridge._automation_storage.list_runs(task_id)[0]["id"]
     )
     return task
+
+
+# ---------------------------------------------------------------------------
+# 评审修复回归：P1-1 turn_error 终态 / P2-1 原子单飞 / P2-2 事件 / P2-6 自愈 / P2-7 DTO
+# ---------------------------------------------------------------------------
+
+def test_worker_turn_error_marks_run_error(manager, tmp_path):
+    """P1-1：模型侧 turn_error（terminal_message）必须记 error，不得误记 completed。"""
+    bridge, _, events = _make_bridge(manager, tmp_path)
+    task_obj, run = _create_task_with_run(bridge)
+    bridge._automation_storage.mark_run_running(run["id"])
+
+    with _WorkerHarness(bridge, manager, tmp_path, consume_return=False,
+                        terminal_error="API 调用失败：重试 5 次后仍超时"):
+        bridge._run_turn_worker(
+            "汇总昨日进展", "自动化任务",
+            internal_kind="automation",
+            automation_context={"run_id": run["id"], "task_name": "每日摘要",
+                                 "permission_mode": "confirm", "notify_on_success": ""},
+        )
+
+    run_row = bridge._automation_storage.list_runs(task_obj["id"])[0]
+    assert run_row["status"] == "error"
+    assert "API 调用失败" in run_row["error"]
+    notices = [e for e in events if e[0] == "notice"]
+    assert any("运行失败" in e[1]["message"] for e in notices)
+
+
+def test_dispatch_spawn_failure_marks_error_run(manager, tmp_path):
+    """P2-6：spawn 抛异常时运行行立即置 error，不留 stuck 行阻塞单飞。"""
+    bridge, _, _ = _make_bridge(manager, tmp_path)
+    task_obj, run = _create_task_with_run(bridge)
+
+    def _boom(*a, **k):
+        raise RuntimeError("线程创建失败")
+
+    bridge._spawn_turn_worker = _boom
+    bridge._dispatch_automation_run(task_obj, run["id"], "scheduled")
+
+    run_row = bridge._automation_storage.list_runs(task_obj["id"])[0]
+    assert run_row["status"] == "error"
+    assert "线程创建失败" in run_row["error"]
+
+
+def test_run_row_transitions_push_events(manager, tmp_path):
+    """P2-2/P2-3：queued→running→completed 全程推 automation_run_updated，
+    认领（queued）时同步推任务快照。"""
+    bridge, _, events = _make_bridge(manager, tmp_path)
+    bridge._automation_storage.on_run_updated = bridge._on_automation_run_updated
+    task_obj, run = _create_task_with_run(bridge)  # create_run 即触发 queued
+
+    bridge._dispatch_automation_run(task_obj, run["id"], "scheduled")  # → running
+    bridge._automation_storage.finish_run(run["id"], "completed")
+
+    statuses = [e[1]["run"]["status"] for e in events if e[0] == "automation_run_updated"]
+    assert statuses == ["queued", "running", "completed"]
+    task_events = [e for e in events if e[0] == "automation_tasks_changed"]
+    assert len(task_events) == 1  # 仅 queued（认领）时刷新快照
+
+
+def test_manual_run_if_idle_atomic(manager, tmp_path):
+    """P2-1：锁内 check+insert，活动运行存在时返回 None。"""
+    task_obj, run = _create_task_with_run(bridge := _make_bridge(manager, tmp_path)[0])
+
+    bridge._automation_storage.mark_run_running(run["id"])
+    assert bridge._automation_storage.create_manual_run_if_idle(task_obj) is None
+    bridge._automation_storage.finish_run(run["id"], "completed")
+    second = bridge._automation_storage.create_manual_run_if_idle(task_obj)
+    assert second is not None and second["status"] == "queued"
+
+
+def test_task_dto_bools_normalized(manager, tmp_path):
+    """P2-7：enabled/notify_on_success 归一为布尔，与类型声明一致。"""
+    bridge, _, _ = _make_bridge(manager, tmp_path)
+    bridge._automation_storage.save_task(_task_dict(notify_on_success=1))
+    dto = bridge.get_automation_tasks()["tasks"][0]
+    assert dto["enabled"] is True
+    assert dto["notify_on_success"] is True
+
+
+def test_run_now_single_flight_after_fix(manager, tmp_path):
+    """P2-1 桥层语义保持：原子单飞拒绝第二个并发手动触发。"""
+    bridge, spawned, _ = _make_bridge(manager, tmp_path, is_turn_active=True)
+    task_id = bridge.save_automation_task(_task_dict())["id"]
+
+    first = bridge.run_automation_task_now(task_id)
+    second = bridge.run_automation_task_now(task_id)
+    assert first["ok"] is True
+    assert second["ok"] is False and "尚未结束" in second["msg"]
+    assert len(bridge._message_queues["自动化任务"]) == 1

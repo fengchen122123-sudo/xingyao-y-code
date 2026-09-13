@@ -6,8 +6,8 @@
   （``WHERE next_run_at IS ?``），跨线程/跨进程重复触发天然被排除。
 - 单飞判定（同任务存在 queued/running 运行时写 skipped 不派发）与启动恢复
   （遗留 queued/running → interrupted，绝不自动重跑）也在这里实现。
-- ``on_run_updated`` 回调：认领路径产生的运行行（含 skipped）提交后回调给桥层
-  推送事件；桥自己管理的运行行（running/finish）由桥自行 emit，避免双发。
+- ``on_run_updated`` 回调：所有运行行变化（认领 queued/skipped、running、
+  终态、手动创建）提交后回调给桥层统一推送 ``automation_run_updated`` 事件。
 """
 
 from __future__ import annotations
@@ -321,7 +321,10 @@ class AutomationStorage:
                 (iso_now(), run_id),
             )
             updated = cursor.rowcount > 0
+            run = self._get_run_locked(cursor, run_id) if updated else None
             self.conn.commit()
+        if run is not None:
+            self._fire_run_updated(run)
         return updated
 
     def set_run_turn_id(self, run_id: str, turn_id: str) -> None:
@@ -348,8 +351,23 @@ class AutomationStorage:
                 (status, error or "", iso_now(), run_id, *ACTIVE_RUN_STATUSES),
             )
             updated = cursor.rowcount > 0
+            run = self._get_run_locked(cursor, run_id) if updated else None
             self.conn.commit()
+        if run is not None:
+            self._fire_run_updated(run)
         return updated
+
+    def get_run(self, run_id: str) -> Optional[dict]:
+        with self._manager._lock:
+            cursor = self.conn.cursor()
+            return self._get_run_locked(cursor, run_id)
+
+    def _get_run_locked(self, cursor, run_id: str) -> Optional[dict]:
+        row = cursor.execute(
+            f"SELECT {', '.join(_RUN_COLUMNS)} FROM automation_runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        return _row_to_run(row) if row is not None else None
 
     def recover_stale_runs(self) -> int:
         """启动恢复：上个进程遗留的 queued/running 一律标 interrupted，绝不重跑。"""
@@ -369,10 +387,25 @@ class AutomationStorage:
         return recovered
 
     def create_run(self, task: dict, *, trigger_kind: str, status: str = "queued", error: str = "") -> dict:
-        """公开创建运行行（手动触发等桥层入口使用），触发 on_run_updated。"""
+        """公开创建运行行（桥层入口使用），触发 on_run_updated。"""
         with self._manager._lock:
             cursor = self.conn.cursor()
             run = self._insert_run_locked(cursor, task, status, trigger_kind=trigger_kind, error=error)
+            self.conn.commit()
+        self._fire_run_updated(run)
+        return run
+
+    def create_manual_run_if_idle(self, task: dict, *, trigger_kind: str = "manual") -> Optional[dict]:
+        """原子创建手动运行行：锁内 check+insert（P2-1）。
+
+        同任务已有 queued/running 运行时返回 None（单飞），否则创建 queued 行。
+        消除桥层 has_active_run + create_run 两步之间的并发窗口。
+        """
+        with self._manager._lock:
+            cursor = self.conn.cursor()
+            if self._has_active_run_locked(cursor, task["id"]):
+                return None
+            run = self._insert_run_locked(cursor, task, "queued", trigger_kind=trigger_kind)
             self.conn.commit()
         self._fire_run_updated(run)
         return run
