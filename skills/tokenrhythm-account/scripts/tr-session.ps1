@@ -1,4 +1,6 @@
-#Requires -Version 7.0
+﻿#Requires -Version 5.1
+# 兼容 Windows PowerShell 5.1 与 PowerShell 7+：脚本内所有读写都显式指定 UTF-8，
+# 不依赖 PS7 的默认编码行为。
 <#
 .SYNOPSIS
     基元律动（TokenRhythm）控制台 API 会话助手。
@@ -51,8 +53,10 @@ function Invoke-TrApi {
 
     $tmp = [System.IO.Path]::GetTempPath()
     $outFile = Join-Path $tmp ('tr_out_{0}.json' -f [guid]::NewGuid().ToString('N'))
+    # --ssl-no-revoke：部分环境（代理 / 无法访问吊销服务器）会让 schannel 直接报
+    # CRYPT_E_REVOCATION_OFFLINE 而中断请求，加该开关跳过吊销状态检查（证书链仍会校验）。
     $curlArgs = @(
-        '-s', '-o', $outFile, '-w', '%{http_code}',
+        '-s', '--ssl-no-revoke', '-o', $outFile, '-w', '%{http_code}',
         '-b', $Session.Jar, '-c', $Session.Jar,
         '-H', "Origin: $($Session.BaseUrl)",
         '-H', "Referer: $($Session.BaseUrl)/account"
@@ -116,7 +120,7 @@ function New-TrSession {
     $payload = @{ account = $Account; password = $Password } | ConvertTo-Json -Compress
     [System.IO.File]::WriteAllBytes($bodyFile, [System.Text.Encoding]::UTF8.GetBytes($payload))
 
-    $null = & curl.exe -s -o $outFile -c $jar `
+    $null = & curl.exe -s --ssl-no-revoke -o $outFile -c $jar `
         -H 'Content-Type: application/json' `
         -H "Origin: $BaseUrl" -H "Referer: $BaseUrl/login" `
         --data-binary "@$bodyFile" "$BaseUrl/api/auth/login"

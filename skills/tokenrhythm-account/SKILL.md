@@ -1,13 +1,22 @@
 ---
 name: tokenrhythm-account
-description: Use when 用户要求查询或管理基元律动（TokenRhythm / tokenrhythm.studio）账号数据——余额、Token 用量、调用日志、API Key、个人信息、模型价格——或要求登录该站点执行操作时
+description: Use when 用户要求查询或管理基元律动（TokenRhythm）账号数据——余额、钱包流水、Token 用量、调用日志、对话记录、API Key、个人信息、邀请奖励、模型与文档——或要求登录 tokenrhythm.studio 控制台（官网为 tokenrhythm.cn）执行操作时
 ---
 
 # 基元律动（TokenRhythm）账号操作
 
+## 先理清域名（省得白跑）
+
+- `tokenrhythm.cn` = **纯静态官网**（Astro 构建 + 阿里云 OSS 托管）。`/api/*` 一律命中 OSS `NoSuchKey`，
+  **没有任何后端接口**；它只负责产品介绍、客户端下载和控制台跳转。
+- `tokenrhythm.studio` = **控制台 SPA + 全部 API**。`/api/*` 走会话 cookie，`/v1/*` 走 API Key。
+
+用户说「上官网查一下」时，能查数据的只有 `.studio`；`.cn` 上能拿到的就是下载链接和跳转入口。
+
 ## 适用范围与红线
 
-**只做站内既有功能**：查余额 / 用量 / 调用日志 / 模型价格、管理自己的 API Key、查看个人信息、调用站内开放 API。
+**只做站内既有功能**：查余额 / 钱包流水 / 用量 / 调用日志 / 对话记录 / 邀请奖励 / 模型与文档 / 发票、
+管理自己的 API Key、查看个人信息、调用站内开放 API。
 
 **禁止**（发现即明确拒绝，不做任何变通）：
 - 攻击、扫描、压测、爆破、绕过限流或鉴权
@@ -39,6 +48,10 @@ Remove-TrSession -Session $s
 ```
 
 `Invoke-TrApi` 已封装 cookie、CSRF 头与 UTF-8 解码，返回解析后的对象。
+
+脚本兼容 **Windows PowerShell 5.1 与 PowerShell 7+**（脚本文件带 UTF-8 BOM，内部读写一律显式 UTF-8），
+**没有 pwsh 也能直接跑**；所有 curl 调用自带 `--ssl-no-revoke`，
+避免代理环境下 schannel 因吊销服务器不可达而报 `CRYPT_E_REVOCATION_OFFLINE`。
 
 ### CSRF 陷阱（务必先知道）
 
@@ -92,7 +105,18 @@ Remove-TrSession -Session $s
 | 建一个 Key | `POST /api/api-keys`，body `{name}` —— **先确认** |
 | 删 / 停用 Key | `POST /api/api-keys/{id}/delete` 或 `/disable` —— **先确认** |
 | 我的个人信息 | `GET /api/me` |
-| 有哪些模型 | `GET /api/models` |
+| 我的钱包流水（每笔扣费） | `GET /api/wallet/transactions` —— **无参调用**，带 `range/page/pageSize/limit` 会 `400 请求包含未知字段` |
+| 额度什么时候过期 | `GET /api/wallet/expiring-credits?page=1&pageSize=20` |
+| 账号有没有被限制 | `GET /api/me/restriction`（无限制时 `data: null`） |
+| 我这个账号能不能注销 | `GET /api/me/deletion/eligibility`（**只读**，不会真的注销） |
+| 有哪些模型 | `GET /api/models`（**公开免登录**） |
+| 单个模型详情 / 支不支持某协议 | `GET /api/models/{id}`（支持模糊 ID，看 `capabilities` / `protocolCapabilities`） |
+| 站内文档 | `GET /api/docs`（全量）或 `GET /api/docs/{slug}`（单篇），**公开免登录** |
+| 全局搜索模型 / 文档 / 日志 | `GET /api/search?keyword=xx&scope=all`（公开内容免登录可搜） |
+| 用户协议 / 隐私政策 | `GET /api/legal-documents/current`（公开） |
+| 我的对话记录 | `GET /api/conversations/page?page=1&pageSize=20` |
+| 某次站内体验的历史消息 | `GET /api/playground/messages?conversationId=<id>` |
+| 我的邀请码 / 邀请奖励 | `GET /api/referrals/me`、`GET /api/referrals/records?page=1&pageSize=20` |
 | **测某个模型能不能用** | `POST /api/playground/send`，body `{model, messages:[{role,content}], stream}` —— 会话鉴权，**不用建 Key** |
 | 生成一张图 | `POST /v1/images/generations`（用 API Key 鉴权，不是会话） |
 | 垫图改图 | `POST /v1/images/edits`，multipart：`model` + `prompt` + `image`（用 API Key） |
@@ -112,6 +136,11 @@ Remove-TrSession -Session $s
 - **垫图改图报 `BAILIAN_IMAGE_ERROR ... Failed to download image` 时，先怀疑图片体积** ——
   实测 1.4MB 大图失败、1.7KB 小图同样参数一次通过。压缩后重试，别反复调参数。
 - 模型 ID 里带 `expires on MMDD` 的是限时模型，查模型相关任务时顺手看一眼到期日。
+- **金额字段全是字符串**（`"298.09757398"`），要算先转 decimal，别直接当 number 用。
+- 部分接口走**严格 schema**：多传一个它不认识的查询参数就 `400 请求包含未知字段`
+  （`/api/wallet/transactions` 实测如此）—— 见到这个错误先删参数，别去猜参数名。
+- `/api/*` 统一返回 `{"code":0,"message":"ok","data":...}`；`/v1/*` 是 OpenAI 风格 `{"error":{...}}`
+  并以 HTTP 状态码表意 —— 两套错误格式别混着判断。
 
 ## 常见错误
 
@@ -123,3 +152,6 @@ Remove-TrSession -Session $s
 | 输出中文乱码 | 控制台编码 | 写入文件后按 UTF-8 读取 |
 | 400 `messages.0.content 类型错误` | 给 Playground 传了图片数组 | 该端点只吃字符串；视觉测试必须走 `/v1/chat/completions` |
 | 400 `MODEL_NOT_AVAILABLE` | 模型 ID 写错或未上线 | 用 `GET /api/models` 核对准确 ID |
+| 400 `请求包含未知字段` | 该接口用严格 schema，多传了它不认的查询参数 | 删掉多余参数（如 `/api/wallet/transactions` 要无参调用） |
+| 在 tokenrhythm.cn 上请求 `/api/...` 返回 OSS `NoSuchKey` | `.cn` 是静态官网，没有后端 | 控制台与全部接口都在 `tokenrhythm.studio` |
+| curl 报 `schannel: CRYPT_E_REVOCATION_OFFLINE` | 本机代理 / 证书吊销检查不可达 | curl 加 `--ssl-no-revoke`（仅本机环境问题，与站点无关） |
