@@ -2006,6 +2006,7 @@ class ApiBridge:
             # 新事件入队（生产者被标志位挡住），所以不存在“销毁后 dispatcher
             # 仍持续调 evaluate_js”的窗口期漏洞；最坏情况是 dispatcher 阻塞在
             # 空队列的 get() 上，守护线程随进程退出。
+            _js_t0 = time.monotonic()
             try:
                 self._window.evaluate_js(
                     f"window.onBridgeEvent && window.onBridgeEvent({payload})"
@@ -2022,6 +2023,25 @@ class ApiBridge:
                     )
                 else:
                     logger.debug("evaluate_js 失败: %s", e)
+            else:
+                # 渲染进程繁忙时 evaluate_js 会阻塞在 IPC 上：单条投递变慢会让排
+                # 在队尾的 turn_finish 迟迟到不了前端（表现为「输出完了仍显示生成中」）。
+                # 慢投递限频告警，附带事件类型与队列积压量，便于直接定位。
+                _js_elapsed = time.monotonic() - _js_t0
+                if _js_elapsed >= 0.5:
+                    _js_now = time.monotonic()
+                    if _js_now - getattr(self, "_js_slow_warned_at", 0.0) >= 5.0:
+                        self._js_slow_warned_at = _js_now
+                        try:
+                            _js_etype = json.loads(payload).get("type", "?")
+                        except Exception:
+                            _js_etype = "?"
+                        logger.warning(
+                            "JS 事件投递缓慢：单条 %.0fms，队列剩余 %d 条，事件=%s",
+                            _js_elapsed * 1000.0,
+                            self._js_queue.qsize(),
+                            _js_etype,
+                        )
 
     def drain_js_queue(self):
         """测试 seam：排空 _js_queue 并返回最后一条已解析事件（空队列返回 None）。
@@ -4537,6 +4557,60 @@ class ApiBridge:
         }
         cancel_event = self._cancel_events.get(session_name) or self._get_cancel_event(session_name)
 
+        # —— 回合收尾诊断（定位「内容已输出完但前端一直显示生成中」）——
+        # 收尾链任一环（撤销封闭/落库/delta 冲刷/finish_once/JS 投递）耗时过长，
+        # 前端 running 都会一直为真。_phase_mark 输出各步耗时；看门狗在模型流
+        # 结束、进入收尾链后启动，超时仍未发出 turn_finish 就 dump 全部线程栈。
+        _phase_t0 = time.monotonic()
+        _phase_last = _phase_t0
+        _turn_watchdog_stop: Optional[threading.Event] = None
+        _FINISH_WATCHDOG_SECONDS = 5.0
+
+        def _phase_mark(label: str) -> None:
+            nonlocal _phase_last
+            _now = time.monotonic()
+            logger.info(
+                "回合计时 [%s] %s：本步 %.0fms，累计 %.0fms",
+                session_name, label,
+                (_now - _phase_last) * 1000.0,
+                (_now - _phase_t0) * 1000.0,
+            )
+            _phase_last = _now
+
+        def _start_finish_watchdog() -> None:
+            """模型流已结束、进入收尾链后启动：收尾超时则 dump 全部线程栈。
+
+            正常收尾应在毫秒级完成；超过阈值说明收尾链被 IO/锁/JS 投递拖住，
+            线程栈能直接指出卡在哪一行，无需事后猜测。
+            """
+            nonlocal _turn_watchdog_stop
+            if _turn_watchdog_stop is not None:
+                return
+            _turn_watchdog_stop = threading.Event()
+            _stop = _turn_watchdog_stop
+
+            def _watch() -> None:
+                if _stop.wait(_FINISH_WATCHDOG_SECONDS):
+                    return
+                try:
+                    import sys as _sys
+                    import traceback as _tb
+
+                    logger.warning(
+                        "回合收尾看门狗 [%s]：turn_finish 超过 %.0f 秒未发出，抓取线程栈",
+                        session_name, _FINISH_WATCHDOG_SECONDS,
+                    )
+                    for _tid, _frame in _sys._current_frames().items():
+                        logger.warning(
+                            "线程栈 tid=%s：\n%s", _tid, "".join(_tb.format_stack(_frame))
+                        )
+                except Exception:
+                    logger.exception("回合收尾看门狗抓取线程栈失败")
+
+            threading.Thread(
+                target=_watch, daemon=True, name="gui-turn-finish-watchdog"
+            ).start()
+
         def finish_once():
             """turn_finish 只允许发出一次（历史实现在 end + finally 各发一次）。"""
             nonlocal turn_finished
@@ -4566,8 +4640,18 @@ class ApiBridge:
             # 前端仅在全文更长时覆盖——正常路径是无害 no-op，丢包路径自我修复。
             # 必须带回合边界 turn_start_msg_id：异常/取消回滚后 history 末尾会
             # 退化成上一轮的助手消息，不过滤就会把上一轮全文补发进本轮气泡。
+            _finish_t0 = time.monotonic()
             self._emit_message_final(event_session_name, after_msg_id=turn_start_msg_id)
             self.emit_event("turn_finish", {"session_name": event_session_name})
+            if _turn_watchdog_stop is not None:
+                _turn_watchdog_stop.set()
+            _js_queue = getattr(self, "_js_queue", None)
+            logger.info(
+                "回合计时 [%s] turn_finish 已入队：finish_once 内 %.0fms（JS 队列剩余 %d 条）",
+                event_session_name,
+                (time.monotonic() - _finish_t0) * 1000.0,
+                _js_queue.qsize() if _js_queue is not None else -1,
+            )
             self._emit_token_usage()
             self._clear_session_last_error(session_name)
 
@@ -4784,6 +4868,10 @@ class ApiBridge:
                     turn_source=turn_source,
                 )
             finally:
+                # 模型流已结束、进入收尾链：打点并启动看门狗（正常/异常路径都覆盖）
+                _phase_mark("模型回合结束（_consume_turn_events 返回）")
+                _start_finish_watchdog()
+                poller_stop.set()
                 poller_stop.set()
                 try:
                     from core.turn_undo import service as _tu_service
@@ -4806,10 +4894,12 @@ class ApiBridge:
                 except Exception:
                     logger.exception("封闭按回合撤销检查点失败")
 
+            _phase_mark("模型流结束、撤销检查点已封闭")
             if cancelled:
                 self.emit_event("turn_cancelled", {"session_name": session_name})
             else:
                 event_session_name = self._maybe_auto_rename(session_name) or session_name
+            _phase_mark("取消事件/自动重命名完成")
         except Exception as e:
             logger.exception("GUI 对话回合失败")
             if automation_run_id:
@@ -4853,6 +4943,7 @@ class ApiBridge:
             with self._active_turn_lock:
                 self._active_turn_snapshots.pop(session_name, None)
             self._finalize_session_deltas(session_name)
+            _phase_mark("delta 缓冲收尾完成")
             # 仅当没有其他活跃回合时才恢复 idle，避免会话 A 结束时把仍在跑的会话 B
             # 的全局状态错置成 idle
             if not any(t.is_alive() for t in self._active_turns.values()):
@@ -4864,6 +4955,7 @@ class ApiBridge:
                     permission_broker.cancel_owner(turn_id)
                 except Exception:
                     pass
+            _phase_mark("finally 清理完成（finish_once 前）")
             finish_once()
             # 星轨自动化：回写运行终态。cancelled（用户停止）→ cancelled，
             # 回合异常 → error，否则 completed。exactly-once 由 storage 的
