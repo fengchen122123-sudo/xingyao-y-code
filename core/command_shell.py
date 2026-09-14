@@ -197,7 +197,7 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         error = f"未知的命令解释器配置：{selected}"
         selected_available = False
     elif not selected_option["available"]:
-        error = f"{selected_option['label']} 未安装或不在 Y-CODE 的 PATH 中"
+        error = f"{selected_option['label']} 未安装或不在 星瑶Code 的 PATH 中"
         selected_available = False
     else:
         error = ""
@@ -245,7 +245,7 @@ def set_selected_command_shell(shell_id: str, *, platform: str | None = None) ->
     if selected is None:
         raise ValueError(f"不支持的命令解释器：{shell_id or '空值'}")
     if not selected["available"]:
-        raise CommandShellUnavailableError(f"{selected['label']} 未安装或不在 Y-CODE 的 PATH 中")
+        raise CommandShellUnavailableError(f"{selected['label']} 未安装或不在 星瑶Code 的 PATH 中")
     if not config.save_config_value(COMMAND_SHELL_CONFIG_KEY, shell_id):
         raise CommandShellError("命令解释器配置保存失败")
     return get_system_settings(platform=platform)
@@ -259,7 +259,7 @@ def _selected_option(platform: str, shell_id: str | None = None) -> dict[str, An
         raise CommandShellError(f"未知的命令解释器配置：{selected_id}")
     if not selected["available"]:
         raise CommandShellUnavailableError(
-            f"{selected['label']} 未安装或不在 Y-CODE 的 PATH 中，请在系统设置中重新选择"
+            f"{selected['label']} 未安装或不在 星瑶Code 的 PATH 中，请在系统设置中重新选择"
         )
     return selected
 

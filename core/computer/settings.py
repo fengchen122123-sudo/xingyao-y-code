@@ -115,7 +115,7 @@ def _detect_browser(browser: str, platform: str) -> BrowserOption:
         label=label,
         available=available,
         executable=executable,
-        unavailable_reason="" if available else (adapter.unavailable_reason or "未安装或不在 Y-CODE 的 PATH 中"),
+        unavailable_reason="" if available else (adapter.unavailable_reason or "未安装或不在 星瑶Code 的 PATH 中"),
     )
 
 

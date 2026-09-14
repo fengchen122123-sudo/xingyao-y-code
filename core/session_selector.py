@@ -64,7 +64,7 @@ def open_session_selector(on_closed=None, on_switch=None, on_rename=None,
 
     def render_list():
         out = []
-        out += [_t("class:header", "  Y-code 历史会话管家 (Sessions)\n")]
+        out += [_t("class:header", "  星瑶Code 历史会话管家 (Sessions)\n")]
         out += [_t("class:footer", f"  当前目录: {os.getcwd()}\n")]
         out += [_t("", "  -----------------------------------------\n")]
 

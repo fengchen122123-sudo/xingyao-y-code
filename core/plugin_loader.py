@@ -163,7 +163,7 @@ def _confirm_plugin_trust(plugin_dir: Path, name: str, fingerprint: str) -> bool
             and sys.stdin.isatty() and sys.stdout.isatty():
         try:
             print(f"\n[插件安全确认] 插件 {name} 首次加载或内容已变化: {plugin_dir}")
-            print("  插件代码将以 ycode 进程的全部权限执行，请确认来源可信。")
+            print("  插件代码将以 星瑶Code 进程的全部权限执行，请确认来源可信。")
             answer = input("  信任并加载该插件？[y/N] ").strip().lower()
             return answer in ("y", "yes")
         except (EOFError, OSError, KeyboardInterrupt):

@@ -3,7 +3,7 @@
     <header class="system-header">
       <div>
         <h1>系统设置</h1>
-        <p>管理 Y-CODE 的系统级运行行为；后续系统选项将在此集中提供。</p>
+        <p>管理 星瑶Code 的系统级运行行为；后续系统选项将在此集中提供。</p>
       </div>
       <button class="refresh-button" type="button" title="刷新检测结果" @click="store.refreshSystemSettings()">
         <AppIcon name="refresh" :size="14" />
@@ -94,7 +94,7 @@
     <section class="computer-settings" data-test="computer-settings-section">
       <header class="computer-header">
         <h2 class="computer-title"><AppIcon name="zap" :size="14" /> 电脑操控</h2>
-        <p>浏览器操控与完整电脑操控是两个独立开关，默认关闭；开启后 Y-CODE 不再逐动作询问授权。</p>
+        <p>浏览器操控与完整电脑操控是两个独立开关，默认关闭；开启后 星瑶Code 不再逐动作询问授权。</p>
         <p>电脑操控要求模型支持视觉（识图）与工具调用：两项能力都开启的模型在开关开启后自动可用，无需逐个配置。</p>
       </header>
 
@@ -173,7 +173,7 @@
         </div>
       </div>
 
-      <p class="computer-privacy" data-test="computer-privacy-notice"><AppIcon name="triangle-alert" :size="13" />开启后，当前页面或桌面截图会发送给当前模型 Provider；Y-CODE 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。</p>
+      <p class="computer-privacy" data-test="computer-privacy-notice"><AppIcon name="triangle-alert" :size="13" />开启后，当前页面或桌面截图会发送给当前模型 Provider；星瑶Code 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。</p>
 
       <p
         v-if="computerModelCapabilityHint"

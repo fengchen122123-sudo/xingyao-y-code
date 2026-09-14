@@ -24,7 +24,7 @@ const computerSettings = {
     },
     {
       browser: 'chrome', label: 'Google Chrome', available: false,
-      executable: '', unavailable_reason: '未安装或不在 Y-CODE 的 PATH 中',
+      executable: '', unavailable_reason: '未安装或不在 星瑶Code 的 PATH 中',
     },
   ],
   computer_profile_path: 'C:\\ycode-data\\browser-profiles\\edge',
@@ -193,7 +193,7 @@ describe('SystemSettings', () => {
     expect(wrapper.get('[data-test="computer-control-switch"]').attributes('aria-checked')).toBe('false');
     const chromeOption = wrapper.get('[data-test="browser-option-chrome"]');
     expect(chromeOption.attributes('disabled')).toBeDefined();
-    expect(chromeOption.text()).toContain('未安装或不在 Y-CODE 的 PATH 中');
+    expect(chromeOption.text()).toContain('未安装或不在 星瑶Code 的 PATH 中');
     expect(wrapper.get('[data-test="browser-option-edge"]').attributes('disabled')).toBeUndefined();
   });
 
@@ -251,7 +251,7 @@ describe('SystemSettings', () => {
 
     expect(wrapper.get('[data-test="computer-profile-path"]').text()).toContain('browser-profiles\\edge');
     expect(wrapper.get('[data-test="computer-privacy-notice"]').text()).toBe(
-      '开启后，当前页面或桌面截图会发送给当前模型 Provider；Y-CODE 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。',
+      '开启后，当前页面或桌面截图会发送给当前模型 Provider；星瑶Code 不会逐动作询问。登录、验证码和凭据请在专用浏览器中由你手动完成。紧急停止：Ctrl+Alt+Esc。',
     );
   });
 
@@ -263,7 +263,7 @@ describe('SystemSettings', () => {
     expect(preflight).toContain('Microsoft Edge');
     expect(preflight).toContain('Ctrl+Alt+Esc');
     // 浏览器不可用必须显示原因，绝不静默换浏览器
-    expect(preflight).toContain('未安装或不在 Y-CODE 的 PATH 中');
+    expect(preflight).toContain('未安装或不在 星瑶Code 的 PATH 中');
   });
 
   it('hides the clickable enable controls on the mobile viewport', async () => {

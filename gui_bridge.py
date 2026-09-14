@@ -1628,7 +1628,7 @@ class ApiBridge:
             result = self._require_theme_window().create_file_dialog(
                 webview.OPEN_DIALOG,
                 allow_multiple=False,
-                file_types=("Y-CODE GUI Theme (*.zip)",),
+                file_types=("星瑶Code GUI Theme (*.zip)",),
             )
             source = self._dialog_path(result)
             if source is None:
@@ -1645,7 +1645,7 @@ class ApiBridge:
             result = self._require_theme_window().create_file_dialog(
                 webview.SAVE_DIALOG,
                 save_filename=f"{theme_id}.zip",
-                file_types=("Y-CODE GUI Theme (*.zip)",),
+                file_types=("星瑶Code GUI Theme (*.zip)",),
             )
             destination = self._dialog_path(result)
             if destination is None:

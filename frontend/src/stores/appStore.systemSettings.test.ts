@@ -28,7 +28,7 @@ const settings = {
       label: 'Google Chrome',
       available: false,
       executable: '',
-      unavailable_reason: '未安装或不在 Y-CODE 的 PATH 中',
+      unavailable_reason: '未安装或不在 星瑶Code 的 PATH 中',
     },
   ],
   computer_profile_path: 'C:\\ycode-data\\browser-profiles\\edge',

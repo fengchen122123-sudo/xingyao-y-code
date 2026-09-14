@@ -348,7 +348,7 @@ def open_mcp_selector(on_closed=None):
 
     def render_header():
         out = []
-        out += [_t("class:header", "  Y-code MCP 服务管理器\n")]
+        out += [_t("class:header", "  星瑶Code MCP 服务管理器\n")]
         out += [_t("", "  -----------------------------------------\n")]
         out += [_t("class:footer", f"  配置文件: {mcp_manager.config_file}\n")]
         out += [_t("", "\n")]
