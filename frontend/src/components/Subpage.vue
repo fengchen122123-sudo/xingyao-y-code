@@ -28,7 +28,11 @@
           </button>
         </div>
         <div class="sub-grid">
-          <div v-if="store.skills.length === 0" class="sub-empty">暂无可用技能</div>
+          <!-- 首屏技能改为后端后台扫描 + skills_loaded 事件推送：空列表可能是
+               "还没扫完"而非"真没有技能"，据此区分文案，避免误导用户 -->
+          <div v-if="store.skills.length === 0" class="sub-empty">
+            {{ store.skillsLoading ? '技能加载中…' : '暂无可用技能' }}
+          </div>
           <div v-else-if="filteredSkills.length === 0" class="sub-empty">没有符合筛选条件的技能</div>
           <div v-for="s in filteredSkills" :key="s.id" class="sub-card">
             <div class="sc-top">

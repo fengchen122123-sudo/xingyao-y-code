@@ -336,6 +336,64 @@ def test_scan_all_skills_classifies_builtin_on_first_scan_before_index_exists(
     assert skill_name in skills.load_builtin_skill_index()
 
 
+def test_fingerprint_ignores_dependency_directories(tmp_path):
+    """依赖 / 构建目录不属于技能内容：改动其中文件不得改变指纹。
+
+    回归背景：baoyu-post-to-wechat 自带 scripts/node_modules（6000+ 文件，是技能本体
+    的两百多倍），旧实现全量 read_bytes 让 GUI 首次启动扫描阻塞数十秒，因此这些目录
+    被整棵剪枝。
+    """
+    skill_dir = tmp_path / "skills" / "demo"
+    _write_skill(skill_dir, "demo")
+    vendor = skill_dir / "scripts" / "node_modules" / "pkg"
+    vendor.mkdir(parents=True)
+    (vendor / "index.js").write_text("module.exports = 1;\n", encoding="utf-8")
+    (skill_dir / "dist").mkdir()
+    (skill_dir / "dist" / "bundle.js").write_text("bundle\n", encoding="utf-8")
+
+    before = skills._skill_dir_fingerprint(str(skill_dir))
+    assert before
+
+    # 改动 / 新增 / 删除依赖与构建产物内的文件：指纹必须完全不变
+    (vendor / "index.js").write_text("module.exports = 2;\n", encoding="utf-8")
+    (vendor / "extra.js").write_text("extra\n", encoding="utf-8")
+    (skill_dir / "dist" / "bundle.js").unlink()
+    assert skills._skill_dir_fingerprint(str(skill_dir)) == before
+
+    # 技能本体内容改动必须改变指纹：剪枝没有误伤正常文件
+    (skill_dir / "SKILL.md").write_text("本体改动", encoding="utf-8")
+    assert skills._skill_dir_fingerprint(str(skill_dir)) != before
+
+
+def test_fingerprint_cache_hit_and_invalidation(tmp_path, monkeypatch):
+    """同一目录重复调用走进程内缓存；内容变化（含嵌套子目录）后缓存必须失效重算。"""
+    skill_dir = tmp_path / "skills" / "demo"
+    _write_skill(skill_dir, "demo")
+    (skill_dir / "sub").mkdir()
+    (skill_dir / "sub" / "note.md").write_text("note\n", encoding="utf-8")
+
+    calls = []
+    real_uncached = skills._skill_dir_fingerprint_uncached
+
+    def counting(skill_dir_arg):
+        calls.append(skill_dir_arg)
+        return real_uncached(skill_dir_arg)
+
+    # 计数只包住"真正算指纹"的函数：缓存命中时它根本不会被调用，断言不依赖计时
+    monkeypatch.setattr(skills, "_skill_dir_fingerprint_uncached", counting)
+
+    first = skills._skill_dir_fingerprint(str(skill_dir))
+    second = skills._skill_dir_fingerprint(str(skill_dir))
+    assert first and first == second
+    assert len(calls) == 1
+
+    # 嵌套子目录里的文件被改动：失效签名必须随之变化（只盯顶层目录 mtime 会漏判）
+    (skill_dir / "sub" / "note.md").write_text("note changed\n", encoding="utf-8")
+    third = skills._skill_dir_fingerprint(str(skill_dir))
+    assert len(calls) == 2
+    assert third != first
+
+
 def test_skill_source_label_normalizes_unknown_to_user():
     """来源标签归一：仅 source == "builtin" 显示"内置"，缺失/非法/非字典一律回落"用户"。
 

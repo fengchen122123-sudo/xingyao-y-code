@@ -1,5 +1,7 @@
 """core/skills.py 内置技能释放（sync_builtin_skills）的单元测试。"""
 
+import os
+
 import pytest
 
 import config
@@ -169,6 +171,56 @@ def test_sync_upgrade_keeps_builtin_source_label(sync_env):
 # ------------------------------------------------------------------
 # 恢复内置版本（restore_builtin_skill）：用户显式发起的覆盖，不做"是否改过"判断
 # ------------------------------------------------------------------
+
+# ------------------------------------------------------------------
+# 指纹口径迁移：口径版本变化时按当前算法一次性重建索引（保守）
+# ------------------------------------------------------------------
+
+def _write_stale_index_and_drop_version(recorded):
+    """模拟"老安装"：索引里是旧口径的记录值，且没有口径版本文件。"""
+    config._atomic_write_json(
+        skills._builtin_skills_index_file(), {"plugin-creator": recorded}, indent=None
+    )
+    version_file = skills._builtin_skills_index_version_file()
+    if os.path.exists(version_file):
+        os.remove(version_file)
+    return version_file
+
+
+def test_sync_rebuilds_index_when_algo_version_missing(sync_env):
+    """口径迁移：版本文件缺失时按当前算法重建索引，未改动过的技能重新入库为 builtin。"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 内置正文")
+    skills.sync_builtin_skills()
+    user_dir = user_base / "plugin-creator"
+    real_fp = skills._skill_dir_fingerprint(str(user_dir))
+    version_file = _write_stale_index_and_drop_version("old-algo")
+
+    _resync()
+
+    assert skills.load_builtin_skill_index()["plugin-creator"] == real_fp
+    assert skills.classify_skill_source(str(user_dir)) == "builtin"
+    # 迁移完成后必须落脚版本文件，避免每次启动全量重算
+    assert os.path.exists(version_file)
+
+
+def test_sync_migration_keeps_user_modified_skill_out_of_index(sync_env):
+    """口径迁移必须保守：用户改动过的技能不得被写回索引（否则会被误标内置且失去升级保护）。"""
+    src, user_base, _ = sync_env
+    _make_builtin_skill(src, "plugin-creator", body="# 内置正文")
+    skills.sync_builtin_skills()
+    user_dir = user_base / "plugin-creator"
+    (user_dir / "SKILL.md").write_text("用户自定义内容", encoding="utf-8")
+    _write_stale_index_and_drop_version("old-algo")
+
+    _resync()
+
+    assert skills.classify_skill_source(
+        str(user_dir), skills.load_builtin_skill_index()
+    ) == "user"
+    assert (user_dir / "SKILL.md").read_text(encoding="utf-8") == "用户自定义内容"
+    assert os.path.exists(skills._builtin_skills_index_version_file())
+
 
 def test_get_released_builtin_names_without_file(sync_env):
     """没有任何释放记录时返回空集合，且不抛异常"""
