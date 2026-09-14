@@ -3,14 +3,13 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>YCode · 星瑶 — 你的本地 AI 编程伙伴</title>
-<meta name="description" content="YCode（星瑶）：一位真正能执行任务、理解项目并长期记忆的本地 AI 编程伙伴。从一个想法，到可以运行的作品。">
-<meta name="keywords" content="YCode,星瑶,AI编程,本地AI,编程助手">
-<meta property="og:title" content="YCode · 星瑶">
+<title>星瑶Code — 你的本地 AI 编程伙伴</title>
+<meta name="description" content="星瑶Code：一位真正能执行任务、理解项目并长期记忆的本地 AI 编程伙伴。从一个想法，到可以运行的作品。">
+<meta name="keywords" content="星瑶Code,星瑶,AI编程,本地AI,编程助手">
+<meta property="og:title" content="星瑶Code">
 <meta property="og:description" content="能执行任务、理解项目并长期记忆的本地 AI 编程伙伴">
-<!-- 部署到正式域名后，请把 og:image 改为绝对 URL -->
-<meta property="og:image" content="assets/ycode.png">
-<link rel="icon" type="image/png" href="assets/ycode_rounded.png">
+<meta property="og:image" content="https://xingyaocode.cn/assets/xingyaocode.png">
+<link rel="icon" type="image/png" href="assets/xingyaocode_rounded.png">
 <style>
 /* ============ 基础与变量 ============ */
 :root {
@@ -93,7 +92,7 @@ section { position: relative; }
   max-width: 1120px; margin: 0 auto; padding: 14px 24px;
   display: flex; align-items: center; gap: 32px;
 }
-.nav-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .12em; color: var(--text); }
+.nav-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .05em; color: var(--text); }
 .nav-brand img { width: 30px; height: 30px; border-radius: 8px; }
 .nav-links { display: flex; gap: 26px; margin-left: auto; }
 .nav-links a { color: var(--dim); font-size: 14px; transition: color .2s; }
@@ -243,7 +242,7 @@ section { position: relative; }
   display: flex; flex-wrap: wrap; gap: 28px;
   align-items: center; justify-content: space-between;
 }
-.footer-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .1em; }
+.footer-brand { display: flex; align-items: center; gap: 10px; font-weight: 700; letter-spacing: .05em; }
 .footer-brand img { width: 26px; height: 26px; border-radius: 7px; }
 .footer-brand span { color: var(--dim); font-weight: 400; }
 .footer-links { display: flex; gap: 24px; font-size: 14px; }
@@ -295,9 +294,9 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 <!-- ============ 导航 ============ -->
 <nav class="nav" aria-label="主导航">
   <div class="nav-inner">
-    <a class="nav-brand" href="#top" aria-label="YCode 首页">
-      <img src="assets/ycode_rounded.png" alt="YCode 标志">
-      YCODE
+    <a class="nav-brand" href="#top" aria-label="星瑶Code 首页">
+      <img src="assets/xingyaocode_rounded.png" alt="星瑶Code 标志">
+      星瑶Code
     </a>
     <div class="nav-links">
       <a href="#features">能力</a>
@@ -311,8 +310,8 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 <!-- ============ Hero 海报屏 ============ -->
 <header class="hero" id="top">
   <div class="hero-content">
-    <img class="hero-logo" src="assets/ycode.png" alt="YCode 像素机器人标志">
-    <div class="hero-tagline">星瑶已上线 · YCode <span class="js-version">1.2.3</span></div>
+    <img class="hero-logo" src="assets/xingyaocode.png" alt="星瑶Code 像素机器人标志">
+    <div class="hero-tagline">星瑶Code 已上线 · v<span class="js-version">1.2.3</span></div>
     <h1>让代码，回应你的想象。</h1>
     <p class="hero-desc">
       一位真正能执行任务、理解项目并长期记忆的本地 AI 编程伙伴。<br>
@@ -364,17 +363,17 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
       <div class="eyebrow" style="text-align:left">Meet Xingyao</div>
       <h2 class="persona-quote">你负责想象，<br>剩下的交给<em>我们</em>。</h2>
       <p class="persona-text">
-        星瑶不是装饰性吉祥物，而是 YCode 的人格化界面：
+        星瑶不是装饰性吉祥物，而是星瑶Code 的人格化界面：
         沉静、敏锐、可信，陪你穿过复杂代码，把想法落到能运行的作品上。
       </p>
     </div>
-    <div class="terminal" role="img" aria-label="终端演示：启动 ycode 后星瑶回应已理解项目">
+    <div class="terminal" role="img" aria-label="终端演示：启动 xingyaocode 后星瑶回应已理解项目">
       <div class="terminal-bar">
         <span class="dot r"></span><span class="dot y"></span><span class="dot g"></span>
-        <span class="terminal-title">ycode — 终端</span>
+        <span class="terminal-title">xingyaocode — 终端</span>
       </div>
       <div class="terminal-body">
-        <div><span class="prompt">❯</span> ycode</div>
+        <div><span class="prompt">❯</span> xingyaocode</div>
         <div class="reply">星瑶：已理解项目。我们从最关键的问题开始。<span class="cursor" aria-hidden="true"></span></div>
       </div>
     </div>
@@ -413,8 +412,8 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 <footer class="footer">
   <div class="wrap footer-inner">
     <div class="footer-brand">
-      <img src="assets/ycode_rounded.png" alt="YCode 标志">
-      YCODE <span>· 星瑶</span>
+      <img src="assets/xingyaocode_rounded.png" alt="星瑶Code 标志">
+      星瑶Code <span>· 编程搭档</span>
     </div>
     <div class="footer-links">
       <a href="#features">能力</a>
@@ -423,7 +422,7 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
       <a href="https://gitee.com/feng-chenhao/xingyao-y-code" target="_blank" rel="noopener">Gitee</a>
       <a class="disabled" aria-disabled="true" title="GitHub 仓库即将上线">GitHub</a>
     </div>
-    <div class="footer-copy">© 2026 YCode · 让代码，回应你的想象。</div>
+    <div class="footer-copy">© 2026 星瑶Code · 让代码，回应你的想象。</div>
   </div>
 </footer>
 
@@ -456,7 +455,7 @@ function onDownloadClick() {
   if (DOWNLOAD_CONFIG.mode === "live") {
     var url = (DOWNLOAD_CONFIG.windowsUrl || "").trim();
     if (!/^https:\/\/\S+$/.test(url)) {
-      console.error("[YCode 官网] live 模式下 windowsUrl 必须是非空 https:// 地址，当前值无效。");
+      console.error("[星瑶Code 官网] live 模式下 windowsUrl 必须是非空 https:// 地址，当前值无效。");
       alert("下载配置无效，请稍后再试。");
       return;
     }
