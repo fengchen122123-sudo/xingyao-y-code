@@ -46,7 +46,7 @@ def _hotkey_unavailable_message(error_code: int = 0) -> str:
     base = f"无法注册全局紧急停止热键 {EMERGENCY_HOTKEY_LABEL}"
     if error_code == _ERROR_HOTKEY_ALREADY_REGISTERED:
         return (
-            f"{base}：该热键已被其他程序占用（常见于另一个 Y-CODE 实例或第三方工具），"
+            f"{base}：该热键已被其他程序占用（常见于另一个 星瑶Code 实例或第三方工具），"
             "紧急停止能力不可用；关闭占用程序后重启本程序即可恢复"
         )
     if error_code:

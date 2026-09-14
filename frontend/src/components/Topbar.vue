@@ -3,9 +3,9 @@
     <button class="icon-btn no-drag" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">
       <AppIcon name="menu" :size="17" />
     </button>
-    <div class="logo no-drag" :title="store.version ? ('Y-CODE ' + store.agentName + ' v' + store.version) : ('Y-CODE ' + store.agentName)">
-      <img class="mark" :src="'/icon.png'" alt="Y-CODE">
-      <div><span class="name">Y-CODE</span></div>
+    <div class="logo no-drag" :title="store.version ? ('星瑶Code ' + store.agentName + ' v' + store.version) : ('星瑶Code ' + store.agentName)">
+      <img class="mark" :src="'/icon.png'" alt="星瑶Code">
+      <div><span class="name">星瑶Code</span></div>
     </div>
 
     <!-- 标题栏拖拽区：mousedown 延迟进原生移动循环（SC_MOVE+HTCAPTION），

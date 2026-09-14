@@ -41,7 +41,7 @@ def open_skill_selector(on_closed=None):
     # ── Header（固定在顶部）──────────────────────────────────────────────
     def render_header():
         out = []
-        out += [_t("class:header", "  Y-code 技能插件管理器 (通用 SKILL.md)\n")]
+        out += [_t("class:header", "  星瑶Code 技能插件管理器 (通用 SKILL.md)\n")]
         out += [_t("", "  -----------------------------------------\n")]
         active_dirs = get_skill_dirs()
         if active_dirs:

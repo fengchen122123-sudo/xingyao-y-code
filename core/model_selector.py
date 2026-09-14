@@ -436,7 +436,7 @@ def open_model_selector(on_model_selected=None):
 
     def render_list():
         out = []
-        out += [_t("class:header", "  Y-code 模型管理器\n")]
+        out += [_t("class:header", "  星瑶Code 模型管理器\n")]
         out += [_t("class:footer", "  " + "─" * 44 + "\n")]
 
         cfg = load_config()

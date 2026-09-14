@@ -209,8 +209,8 @@
     <!-- 启动画面：初始化期间全屏展示，加载完成后淡出进入对话 -->
     <Transition name="splash">
       <div v-if="!store.initialized" id="splash">
-        <img class="sp-logo" :src="'/icon.png'" alt="Y-CODE">
-        <div class="sp-title">Y-CODE</div>
+        <img class="sp-logo" :src="'/icon.png'" alt="星瑶Code">
+        <div class="sp-title">星瑶Code</div>
         <div class="sp-sub">{{ store.agentName }}·编码助手</div>
         <div class="sp-bar"><i></i></div>
       </div>

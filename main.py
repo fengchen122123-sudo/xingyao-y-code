@@ -1001,7 +1001,7 @@ COMMAND_COMPLETIONS = [
     ("/whitelist", "管理项目白名单 (list/add/remove/clear)"),
     ("/computer", "电脑操控运行控制 (status/pause/resume/stop, browser 切默认浏览器)"),
     ("/clear", "清理当前屏幕"),
-    ("/exit", "退出 Y-code"),
+    ("/exit", "退出 星瑶Code"),
 ]
 
 
@@ -1795,7 +1795,7 @@ def print_logo(clear_screen=True):
             os.system('cls' if os.name == 'nt' else 'clear')
         
     custom_fig = pyfiglet.Figlet(font='slant')
-    logo_text = custom_fig.renderText('Y-CODE')
+    logo_text = custom_fig.renderText('XINGYAO')
     safe_logo = logo_text.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
     from core.themes import THEMES
     theme_color = THEMES.get(current_theme, {}).get("border", "#00b4d8")
@@ -1851,7 +1851,7 @@ def print_logo(clear_screen=True):
         escaped_val = val_str.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
         return make_box_line(f"{label}<ansigray>{escaped_val}</ansigray>")
 
-    avatar_row1 = f"  <style fg='{theme_color}'>▄▄    ▄▄</style>    <b>Welcome to Y-CODE CLI!</b>"
+    avatar_row1 = f"  <style fg='{theme_color}'>▄▄    ▄▄</style>    <b>欢迎使用 星瑶Code CLI</b>"
     avatar_row2 = f" <style fg='{theme_color}'>██████████</style>   {_agent_name()} (Hacker Girl) 为您服务"
     avatar_row3 = f" <style fg='{theme_color}'>██ █  █ ██</style>   输入 /help 获取帮助"
     avatar_row4 = f"  <style fg='{theme_color}'>▀██████▀</style>    "
@@ -2423,7 +2423,7 @@ def _print_threadsafe_update_check(info: dict) -> None:
         cached = ""
     if cached:
         _print_threadsafe(f"<ansigreen>✔ 检测到已下载的安装包，可直接安装：</ansigreen> {_esc(cached)}")
-        _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 Y-CODE）。")
+        _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 星瑶Code）。")
     else:
         _print_threadsafe("  输入 <ansicyan>/update download</ansicyan> 开始下载。")
 
@@ -2467,7 +2467,7 @@ def _update_cmd_download() -> None:
         def _on_complete(dest_path):
             _last_update_installer["path"] = str(dest_path)
             _print_threadsafe(f"<ansigreen>✔ 安装包下载完成：{_esc(str(dest_path))}</ansigreen>")
-            _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 Y-CODE）。")
+            _print_threadsafe("  输入 <ansicyan>/update install y</ansicyan> 开始安装（安装会退出 星瑶Code）。")
 
         def _on_error(message):
             _print_threadsafe(f"<ansired>❌ 下载失败：{_esc(str(message))}</ansired>")
@@ -2522,7 +2522,7 @@ def _update_cmd_install(args: list) -> None:
     if not confirmed:
         if path and os.path.isfile(path):
             print_formatted_text(HTML(f"即将安装: {_esc(path)}"))
-            print_formatted_text(HTML("确认请输入: <ansicyan>/update install y</ansicyan>（安装会退出 Y-CODE）"))
+            print_formatted_text(HTML("确认请输入: <ansicyan>/update install y</ansicyan>（安装会退出 星瑶Code）"))
         else:
             print_formatted_text(HTML("<ansiyellow>ℹ 未找到可安装的安装包。先 /update download，或指定路径: /update install &lt;路径&gt; y</ansiyellow>"))
         return
@@ -2544,7 +2544,7 @@ def _update_cmd_install(args: list) -> None:
         ))
         return
     if launch_installer(path):
-        print_formatted_text(HTML("<ansigreen>✔ 安装向导已启动，Y-CODE 即将退出…</ansigreen>"))
+        print_formatted_text(HTML("<ansigreen>✔ 安装向导已启动，星瑶Code 即将退出…</ansigreen>"))
 
         def _exit_soon():
             time.sleep(0.8)
@@ -2572,7 +2572,7 @@ def handle_slash_command(command_text):
 
     if cmd == "/help":
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
-        print_formatted_text(HTML("🌟 <b><ansigreen>Y-code CLI 系统指令与操作指南</ansigreen></b>"))
+        print_formatted_text(HTML("🌟 <b><ansigreen>星瑶Code CLI 系统指令与操作指南</ansigreen></b>"))
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
         print_formatted_text(HTML("<b><ansiyellow>【1. 会话与上下文管理】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/session</ansicyan>                             : 打开全屏会话管理器 UI (仅显示当前目录的会话，支持回车切换，Del 删除，R/F2改名)"))
@@ -2597,7 +2597,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/clear-history [y]</ansicyan>                   : 清空当前会话全部历史消息 (输入 /clear-history y 确认，不影响任务计划与长期记忆)"))
         print_formatted_text(HTML("  <ansicyan>/queue [list|cancel 序号|clear]</ansicyan>      : 管理排队中的消息 (AI 忙碌时新消息会排队)"))
         print_formatted_text(HTML("  <ansicyan>/paste-image [说明]</ansicyan>                  : 发送剪贴板图片给模型 (可附说明文字)"))
-        print_formatted_text(HTML("  <ansicyan>/update [check|download|cancel|install]</ansicyan> : 检查/下载/安装新版本 (安装会退出 Y-CODE)"))
+        print_formatted_text(HTML("  <ansicyan>/update [check|download|cancel|install]</ansicyan> : 检查/下载/安装新版本 (安装会退出 星瑶Code)"))
         print_formatted_text(HTML("  <ansicyan>/changes [N]</ansicyan>                          : 查看最近 N 个回合的文件变更汇总 (默认 3)"))
         print_formatted_text(HTML("  <ansicyan>/theme</ansicyan>                               : 列出当前所有可用的终端配色主题"))
         print_formatted_text(HTML("  <ansicyan>/theme &lt;主题名称&gt;</ansicyan>                    : 切换至指定主题 (支持: cyan, matrix, nord, cyberpunk, dracula, lava, sunset, amber, white)"))
@@ -2641,8 +2641,8 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>Ctrl+N</ansicyan>                                    : 在输入框内输入新的一行换行符"))
         print_formatted_text(HTML(f"  <ansicyan>Ctrl+C</ansicyan>                                : <b>{_agent_name()}思考中时立即发送强行中断信号</b>；闲置时清空输入框"))
         print_formatted_text(HTML("  <ansicyan>Ctrl+T</ansicyan>                                : <b>切换展开/收起底部浮窗显示当前会话的背景记忆摘要</b>"))
-        print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 Y-CODE 权限模式</b> (变更前确认 ➡️ 自动编辑 ➡️ 计划模式 ➡️ 完全访问)"))
-        print_formatted_text(HTML("  <ansicyan>Ctrl+D / /exit</ansicyan>                        : 安全退出 Y-code CLI"))
+        print_formatted_text(HTML("  <ansicyan>Shift+Tab</ansicyan>                             : <b>循环切换 星瑶Code 权限模式</b> (变更前确认 ➡️ 自动编辑 ➡️ 计划模式 ➡️ 完全访问)"))
+        print_formatted_text(HTML("  <ansicyan>Ctrl+D / /exit</ansicyan>                        : 安全退出 星瑶Code CLI"))
         print_formatted_text(HTML("<b><ansiyellow>━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━</ansiyellow></b>"))
 
     elif cmd in ("/models", "/model"):
@@ -2932,7 +2932,7 @@ def handle_slash_command(command_text):
                 allowed = _esc("/".join(o["id"] for o in options))
                 print_formatted_text(HTML(f"<ansired>❌ 不支持的命令解释器: {_esc(shell_id)}（可选 {allowed}）</ansired>"))
             elif not matched["available"]:
-                print_formatted_text(HTML(f"<ansired>❌ {_esc(matched['label'])} 未安装或不在 Y-CODE 的 PATH 中，无法选择。</ansired>"))
+                print_formatted_text(HTML(f"<ansired>❌ {_esc(matched['label'])} 未安装或不在 星瑶Code 的 PATH 中，无法选择。</ansired>"))
             else:
                 try:
                     set_selected_command_shell(shell_id)
@@ -4260,7 +4260,7 @@ def _make_input_app():
 
     @kb.add("s-tab")
     def toggle_permission_mode(event):
-        """Shift+Tab 循环切换 Y-CODE 权限模式"""
+        """Shift+Tab 循环切换 星瑶Code 权限模式"""
         global current_permission_mode
         modes = ["confirm", "accept_edits", "plan", "full"]
         try:
@@ -5094,7 +5094,7 @@ def run_headless(prompt, session_name=None) -> int:
         lambda: None,              # 不需要 dismiss
     )
 
-    set_terminal_title("Y-code (headless)")
+    set_terminal_title("星瑶Code (headless)")
 
     # 2. 处理 prompt 输入（支持 stdin）
     if prompt == "-":
@@ -5231,12 +5231,12 @@ def run_cli():
     # MCP 状态打印器的注册移入 _preload_mcp 后台线程（见下文），避免在首绘前
     # 同步 import core.mcp_client（连带 mcp/pydantic/httpx，约 1.1~1.5s）。
 
-    set_terminal_title("Y-code")
+    set_terminal_title("星瑶Code")
 
     # 首次启动/完全无配置模型时，自动引导开启全屏模型配置选择器
     active_info = get_active_model()
     if not active_info:
-        print("\n🔑 欢迎使用 Y-CODE！检测到您尚未配置大模型。")
+        print("\n🔑 欢迎使用 星瑶Code！检测到您尚未配置大模型。")
         print("💡 正在自动为您开启模型管理界面，请选择厂商并配置 API Key...")
         time.sleep(1.2)
         from core.model_selector import open_model_selector
@@ -5640,7 +5640,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(
         prog="ycode",
-        description="Y-code 终端 AI 编程助手",
+        description="星瑶Code 终端 AI 编程助手",
         add_help=False,  # 交互模式下 argparse 的 -h/--help 会干扰；只在显式 -p 时启用
     )
     parser.add_argument("-p", "--prompt", dest="prompt",

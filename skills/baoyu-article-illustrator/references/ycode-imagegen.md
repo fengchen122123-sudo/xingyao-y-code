@@ -1,10 +1,10 @@
-# Y-code 内置生图后端
+# 星瑶 内置生图后端
 
-本文档只服务于一个场景：当前运行时是 **Y-code**，即工具清单（tool inventory）里同时暴露 `hunyuan_generate_image` 与 `tokenrhythm_generate_image`。此时这两个原生工具就是本技能的位图后端，优先级高于任何非原生技能（包括未安装的 `baoyu-image-gen`）。
+本文档只服务于一个场景：当前运行时是 **星瑶**，即工具清单（tool inventory）里同时暴露 `hunyuan_generate_image` 与 `tokenrhythm_generate_image`。此时这两个原生工具就是本技能的位图后端，优先级高于任何非原生技能（包括未安装的 `baoyu-image-gen`）。
 
 ## 1. 适用场景
 
-- 运行时判定：工具清单中出现 `hunyuan_generate_image` 或 `tokenrhythm_generate_image`，即命中 Y-code 分支。
+- 运行时判定：工具清单中出现 `hunyuan_generate_image` 或 `tokenrhythm_generate_image`，即命中 星瑶 分支。
 - **默认用混元**：`hunyuan_generate_image` 是内置免费后端，没有特别理由时一律用它。
 - **改用基元**（`tokenrhythm_generate_image`）的四种情况：
   1. 用户在本次请求里明确点名「基元」/ `tokenrhythm`；
