@@ -547,6 +547,10 @@ export const useAppStore = defineStore('app', {
 
     // 技能 / MCP / 插件
     skills: [] as SkillInfo[],
+    // 技能列表是否仍在后台扫描中：首屏 get_initial_state 不再同步扫盘（改为
+    // skills_loaded 事件推送），初始为空数组并不代表"没有技能"，技能页据此
+    // 显示"加载中"而不是"暂无可用技能"，避免误导用户
+    skillsLoading: false,
     mcps: [] as McpInfo[],
     plugins: [] as PluginInfo[],
 
@@ -1612,6 +1616,9 @@ export const useAppStore = defineStore('app', {
         if (init.reasoning) this.reasoning = init.reasoning;
         this.sessionGroups = init.sessions || [];
         this.skills = init.skills || [];
+        // 初始快照为空即代表后端首屏跳过了同步扫描，正在后台扫：
+        // 置为"加载中"态，等 skills_loaded 事件到达后再切回真实空态
+        this.skillsLoading = this.skills.length === 0;
         this.mcps = init.mcps || [];
         this.plugins = (init as any).plugins || [];
         this.workdir = init.workdir || '';
@@ -3572,6 +3579,16 @@ export const useAppStore = defineStore('app', {
         if (treeWorkdir && treeWorkdir === this.workdir) {
           this.fileTree = Array.isArray(data.file_tree) ? data.file_tree : [];
         }
+      } else if (type === 'skills_loaded') {
+        // 异步技能扫描完成（后端 _async_build_skill_list 推送）：
+        // get_initial_state 不再同步扫盘（冷盘首次可达 25s+，会让已出现的窗口一直转圈），
+        // 改为先返回上次缓存、后台扫完通过此事件推送到前端刷新技能页与 / 补全候选。
+        if (Array.isArray(data.skills)) {
+          this.skills = data.skills;
+          // 事件已到达即代表"扫描结束"，无论结果是否为空：空列表是真实的"无技能"，
+          // 技能页据此从"加载中"切回"暂无可用技能"
+          this.skillsLoading = false;
+        }
       } else if (type === 'mcp_status') {
         if (data.mcps) this.mcps = data.mcps;
       } else if (type === 'diff_ready') {
@@ -3780,6 +3797,8 @@ export const useAppStore = defineStore('app', {
         const res = await api.toggle_skill(skillId, enabled);
         if (res && res.ok) {
           this.skills = res.skills || this.skills;
+          // 同步交互拿到的是最终列表（后端已顺带更新其缓存），结束"加载中"态
+          this.skillsLoading = false;
         } else {
           this.notifyModal('技能', '切换技能状态失败: ' + (res && res.msg ? res.msg : '未知错误'));
         }
@@ -3797,6 +3816,8 @@ export const useAppStore = defineStore('app', {
           const res = await api.refresh_skills();
           if (res && res.ok && Array.isArray(res.skills)) {
             this.skills = res.skills;
+            // 手动刷新拿到的是最终结果，结束"加载中"态
+            this.skillsLoading = false;
             return true;
           }
         }
@@ -3804,6 +3825,7 @@ export const useAppStore = defineStore('app', {
           const skills = await api.get_skills();
           if (Array.isArray(skills)) {
             this.skills = skills;
+            this.skillsLoading = false;
             return true;
           }
         }
@@ -3824,6 +3846,8 @@ export const useAppStore = defineStore('app', {
         const res = await api.restore_skill(skillId);
         if (res && res.ok && Array.isArray(res.skills)) {
           this.skills = res.skills;
+          // 同步交互拿到的是最终列表，结束"加载中"态
+          this.skillsLoading = false;
           return true;
         }
         this.notifyModal('技能', '恢复内置版本失败: ' + (res && res.msg ? res.msg : '未知错误'));

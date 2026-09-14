@@ -576,6 +576,14 @@ class ApiBridge:
         # 电脑操控事件桥：controller listener 注册标记（进程内建立一次、幂等，
         # 见 _ensure_computer_event_bridge；set_window 与各控制方法都会触发）
         self._computer_event_listener = None
+        # 技能列表缓存：首屏扫描已改为后台异步（见 _async_build_skill_list），
+        # get_initial_state 只返回这里保存的上一次结果，冷盘首次扫描（曾达 25s+）
+        # 不再阻塞窗口首帧；None 表示"还没扫过任何一次"。
+        self._skills_cache: Optional[List[Dict[str, Any]]] = None
+        # 技能扫描去重锁：窗口重载/手机扫码连接会再次调用 get_initial_state，
+        # 非阻塞获取失败即说明已有后台扫描在跑，直接复用它稍后推送的结果，
+        # 避免冷盘上叠加出多次全目录扫描。
+        self._skills_scan_lock = threading.Lock()
 
         # JS 事件派发队列：evaluate_js 是同步调用（无超时），渲染进程挂起时
         # 永不返回。若事件源线程（回合 worker / delta 冲刷 / 终端泵）直接调用，
@@ -2469,6 +2477,14 @@ class ApiBridge:
                 daemon=True,
                 name="gui-token-recalc",
             ).start()
+            # 技能扫描同样改为异步：core.skills.scan_all_skills 在冷盘首次扫描
+            # 曾观测到 25s+（大技能目录/杀软扫描），同步调用会让"窗口已出现但
+            # 界面一直转圈"。先返回缓存，扫完由 skills_loaded 事件推送刷新技能页。
+            threading.Thread(
+                target=self._async_build_skill_list,
+                daemon=True,
+                name="gui-skills-loader",
+            ).start()
             return {
                 "models": models,
                 "providers": providers,
@@ -2487,7 +2503,9 @@ class ApiBridge:
                 # 免责条款同意状态：前端据此判断是否需要弹"首次使用确认"框
                 "disclaimer": self.get_disclaimer_consent(),
                 "sessions": self.get_sessions(),
-                "skills": self._build_skill_list(),
+                # 只返回上一次后台扫描的缓存（无缓存时为 []），不再同步扫盘：
+                # 前端拿到空数组后由 skills_loaded 事件补齐，见 _async_build_skill_list
+                "skills": list(getattr(self, "_skills_cache", None) or []),
                 "mcps": self._build_mcp_list(),
                 "plugins": self.get_plugins(),
                 "workdir": workdir,
@@ -2852,6 +2870,47 @@ class ApiBridge:
             logger.info("异步 token 用量重算完成: %s", session_name)
         except Exception:
             logger.debug("异步 token 用量重算失败: %s", session_name, exc_info=True)
+
+    def _async_build_skill_list(self):
+        """异步扫描技能列表：结果写入实例缓存并通过 skills_loaded 事件推送。
+
+        原同步实现在 get_initial_state 中调用 _build_skill_list（内部 scan_all_skills），
+        冷盘首次扫描曾达 25s+，表现为"窗口出来了但界面一直转圈"。改为后台执行：
+        首帧立刻渲染，扫完由前端刷新技能页；下一次 get_initial_state（窗口重载 /
+        手机连接）则直接命中缓存，不再有第二次冷盘等待。
+        """
+        # 同一时刻只允许一个扫描线程（见 _skills_scan_lock 的说明）；
+        # 取不到锁属性（旧实例/测试裸构造）时按"无并发"降级处理
+        lock = getattr(self, "_skills_scan_lock", None)
+        if lock is not None and not lock.acquire(blocking=False):
+            logger.debug("技能扫描已在进行中，跳过重复触发")
+            return
+        try:
+            started = time.time()
+            skills = self._build_skill_list()
+            # _build_skill_list 成功时已顺带写入 _skills_cache；这里再兜一次，
+            # 保证即使被测试桩替换过 _build_skill_list 也能留下可复用的结果
+            self._skills_cache = skills
+            logger.info(
+                "异步技能列表扫描完成（%d 项，耗时 %.2fs）", len(skills), time.time() - started
+            )
+            # _emit_raw 在 _shutting_down 或无窗口时静默丢弃事件（见其实现）：
+            # 启动早期首帧可能尚未就绪，此时事件会丢。这里重试一次兜住该窗口期，
+            # 配合上面的缓存，前端不至于长期停在"技能为空"的状态。
+            for _attempt in range(2):
+                self._emit_raw("skills_loaded", {"skills": skills})
+                if getattr(self, "_window", None):
+                    break
+                time.sleep(0.5)
+        except Exception:
+            # 只告警：技能列表为空不能影响窗口启动与其它功能
+            logger.warning("异步技能列表扫描失败", exc_info=True)
+        finally:
+            if lock is not None:
+                try:
+                    lock.release()
+                except Exception:
+                    logger.debug("释放技能扫描锁失败", exc_info=True)
 
     # ------------------------------------------------------------------
     # 会话持久化：历史会话列表
@@ -6007,6 +6066,10 @@ class ApiBridge:
                     "source": str(s.get("source") or "user"),
                     "from_builtin": from_builtin,
                 })
+            # 顺带更新实例缓存：toggle/restore/refresh/get_skills 以及工作区切换、
+            # 会话切换都会走到这里，缓存随最新结果更新，下次 get_initial_state
+            # 就直接返回这份新数据，不会拿到启动时的旧列表
+            self._skills_cache = skills
             return skills
         except Exception:
             logger.exception("扫描技能失败")

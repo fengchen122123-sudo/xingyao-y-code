@@ -50,43 +50,190 @@ def _builtin_skills_index_file():
 
     内置技能释放后与用户自建技能物理同居 ~/.ycode/skills，无法靠路径区分来源，
     因此额外记录"真正由内置释放、且内容未被用户改动"的技能指纹，供 GUI/CLI 标注
-    来源（内置 / 用户）。索引只增不改：已有记录不重算、不覆盖。
+    来源（内置 / 用户）。索引只增不改：已有记录不重算、不覆盖。唯一的例外是
+    「指纹口径迁移」——口径版本变化时按当前算法对已释放技能做一次性重建
+    （见 _migrate_builtin_index_if_needed），否则旧记录与新指纹永久不一致，
+    会让内置技能被误标 user、跟随升级永不触发。
     """
     return os.path.join(config.YCODE_DIR, "builtin_skills_index.json")
 
 
-def _skill_dir_fingerprint(skill_dir):
-    """计算技能目录的内容指纹（sha256）：所有文件的相对路径 posix 形式 + 内容哈希。
+# 指纹口径版本：算法或跳过规则发生任何变化都必须递增。递增后由
+# _migrate_builtin_index_if_needed 在启动同步里做一次性重建（保守：只有内容与
+# 内置源完全一致才写回索引），避免"旧指纹 vs 新指纹"永久不匹配。
+_FINGERPRINT_ALGO = 2
 
-    跳过路径中含 __pycache__ 的片段与 .pyc 文件（编译缓存不属于技能内容）。
-    单个文件读取失败只告警并跳过，不抛异常：该函数运行在启动扫描路径上，
-    不能因为个别文件权限问题中断整个技能扫描。失败时返回 ""（调用方按不匹配处理）。
-    """
-    digest = hashlib.sha256()
+
+def _builtin_skills_index_version_file():
+    """记录索引当前的指纹口径版本，用于判断是否需要重建（避免每次启动全量重算）。"""
+    return os.path.join(config.YCODE_DIR, "builtin_skills_index.version")
+
+
+# 指纹扫描跳过的目录名（按路径 segment 匹配任意层级）：依赖与构建产物不属于技能
+# 本体内容。baoyu-post-to-wechat 这类技能自带 scripts/node_modules（6000+ 文件，
+# 是技能本体的两百多倍），逐文件 read_bytes 会让 GUI 首次启动扫描阻塞数十秒。
+_SKIP_DIR_SEGMENTS = frozenset({
+    "__pycache__", "node_modules", ".git", ".venv", "venv",
+    "dist", "build", ".next", ".pytest_cache",
+})
+# .pyc 编译产物同样不计入指纹（沿用原有跳过规则）
+_SKIP_FILE_SUFFIXES = (".pyc",)
+
+# 进程内指纹缓存：key = normcase(abspath(skill_dir))，value = (指纹, 失效签名)。
+# 命中要求失效签名完全一致（见 _skill_dir_signature），因此"目录内容被修改 / 新增 /
+# 删除文件"后必然重算。锁只保护字典读写，指纹计算放在锁外。
+_fingerprint_cache = {}
+_fingerprint_cache_lock = threading.Lock()
+
+
+def _read_builtin_index_algo_version():
+    """读取索引口径版本；文件缺失 / 内容不是整数一律按 0（最老口径）处理。"""
     try:
-        paths = sorted(pathlib.Path(skill_dir).rglob("*"))
+        with open(_builtin_skills_index_version_file(), "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def _write_builtin_index_algo_version(version):
+    """写入口径版本文件（内容只是一个整数）。
+
+    直接用普通写而非原子替换：最坏情况是写坏 → 下次启动按 0 处理 → 再重建一次，
+    而重建幂等且保守（只在校验通过时写索引），不值得为此引入额外复杂度。
+    """
+    try:
+        with open(_builtin_skills_index_version_file(), "w", encoding="utf-8") as f:
+            f.write(str(int(version)))
     except OSError as e:
-        _log_warning("遍历技能目录失败 %s: %s", skill_dir, e)
-        return ""
-    for path in paths:
+        _log_warning("写入内置技能索引口径版本失败: %s", e)
+
+
+def _iter_skill_entries(base_dir, rel_prefix=""):
+    """按确定性顺序（每层按名字排序的深度优先）遍历技能目录，产出 (相对 posix 路径, DirEntry, 是否目录)。
+
+    用 os.scandir 递归而非 pathlib.rglob + 事后过滤：scandir 能在进入前剪枝
+    （node_modules 这类依赖目录整棵不进），且 Windows 下目录项自带 stat 信息。
+    遍历异常只告警并跳过该层：函数运行在启动扫描路径上，不能因个别目录权限问题
+    中断整个技能扫描。
+    """
+    try:
+        with os.scandir(base_dir) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name)
+    except OSError as e:
+        _log_warning("遍历技能目录失败 %s: %s", base_dir, e)
+        return
+    for entry in ordered:
+        name = entry.name
         try:
-            if not path.is_file():
-                continue
-            rel = path.relative_to(skill_dir).as_posix()
-        except (OSError, ValueError) as e:
-            _log_warning("读取技能条目信息失败 %s: %s", path, e)
-            continue
-        if "__pycache__" in rel.split("/") or rel.endswith(".pyc"):
-            continue
-        try:
-            data = path.read_bytes()
+            # 跟随符号链接判定类型，与旧实现的 path.is_file() 一致：指向目录的链接
+            # 既不当文件读、也不递归进去（rglob 同样不递归符号链接目录）
+            is_dir = entry.is_dir(follow_symlinks=True)
         except OSError as e:
-            _log_warning("读取技能文件失败 %s: %s", path, e)
+            _log_warning("读取技能条目信息失败 %s: %s", entry.path, e)
+            continue
+        if is_dir:
+            # 依赖 / 构建目录整棵剪枝：性能收益的主体就在这里
+            if name in _SKIP_DIR_SEGMENTS:
+                continue
+        elif name.endswith(_SKIP_FILE_SUFFIXES):
+            continue
+        rel = f"{rel_prefix}/{name}" if rel_prefix else name
+        yield rel, entry, is_dir
+        if is_dir and not entry.is_symlink():
+            yield from _iter_skill_entries(entry.path, rel)
+
+
+def _skill_dir_signature(skill_dir):
+    """技能目录的失效签名：树内每个条目的 相对路径 + is_dir + mtime_ns + size 排序后哈希。
+
+    只 stat 不读文件内容，剪枝规则与指纹完全一致，因此开销远小于内容哈希。
+    比"只看顶层目录 mtime"可靠：嵌套子目录里修改 / 新增 / 删除文件同样会改变签名，
+    这是缓存能在"先算指纹 → 外部改写技能文件 → 再判来源"序列下正确失效的前提。
+    根目录不可读时返回 ""，调用方会因签名不匹配而重算。
+    """
+    if not os.path.isdir(skill_dir):
+        return ""
+    digest = hashlib.sha256()
+    for rel, entry, is_dir in _iter_skill_entries(skill_dir):
+        try:
+            # 跟随符号链接取 stat：指纹读到的是链接目标的内容，签名也应跟踪目标
+            stat = entry.stat(follow_symlinks=True)
+            mtime_ns, size = stat.st_mtime_ns, stat.st_size
+        except OSError as e:
+            _log_warning("读取技能条目信息失败 %s: %s", entry.path, e)
+            mtime_ns, size = -1, -1
+        digest.update(f"{rel}\0{int(is_dir)}\0{mtime_ns}\0{size}\0".encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _invalidate_fingerprint_cache(skill_dir=None):
+    """清空（skill_dir 为 None）或按规范化绝对路径清除进程内指纹缓存。
+
+    整目录"临时目录 + 原子替换"后必须调用：shutil.copytree 会保留源文件 mtime，
+    替换后的失效签名存在与替换前旧签名撞车的可能，届时缓存会返回过期指纹。
+    """
+    with _fingerprint_cache_lock:
+        if skill_dir is None:
+            _fingerprint_cache.clear()
+            return
+        try:
+            key = os.path.normcase(os.path.abspath(skill_dir))
+        except OSError:
+            return
+        _fingerprint_cache.pop(key, None)
+
+
+def _skill_dir_fingerprint_uncached(skill_dir):
+    """真正计算内容指纹（sha256）：文件相对路径 posix 形式 + 内容哈希。
+
+    跳过依赖 / 构建目录与 .pyc（不属于技能内容）。单个文件读取失败只告警并跳过，
+    不抛异常：该函数运行在启动扫描路径上，不能因为个别文件权限问题中断整个技能扫描。
+    目录不存在时返回 ""，调用方按不匹配处理。
+    """
+    if not os.path.isdir(skill_dir):
+        # 原实现用 rglob，不存在的目录会得到"空目录指纹"（一个常量哈希），
+        # 会让两个不同的坏路径被误判为内容一致；显式返回 "" 更保守。
+        return ""
+    digest = hashlib.sha256()
+    for rel, entry, is_dir in _iter_skill_entries(skill_dir):
+        if is_dir:
+            continue
+        try:
+            data = pathlib.Path(entry.path).read_bytes()
+        except OSError as e:
+            _log_warning("读取技能文件失败 %s: %s", entry.path, e)
             continue
         digest.update(rel.encode("utf-8"))
         digest.update(b"\0")
         digest.update(hashlib.sha256(data).digest())
     return digest.hexdigest()
+
+
+def _skill_dir_fingerprint(skill_dir):
+    """计算技能目录的内容指纹（sha256），带进程内缓存。
+
+    缓存有效性由"失效签名"判定（见 _skill_dir_signature）：目录内容被修改 / 新增 /
+    删除文件后签名必然变化并强制重算，因此"先算指纹 → 改动技能 → 再判来源"的调用
+    序列仍然正确。失败返回 ""（调用方按不匹配处理）；"" 不入缓存，避免一次瞬时读
+    失败把目录永久钉成"不可用"。
+    """
+    if not skill_dir:
+        return ""
+    try:
+        cache_key = os.path.normcase(os.path.abspath(skill_dir))
+    except OSError as e:
+        _log_warning("规范化技能目录失败 %s: %s", skill_dir, e)
+        return _skill_dir_fingerprint_uncached(skill_dir)
+    signature = _skill_dir_signature(skill_dir)
+    with _fingerprint_cache_lock:
+        cached = _fingerprint_cache.get(cache_key)
+    if cached is not None and cached[1] and cached[1] == signature:
+        return cached[0]
+    fingerprint = _skill_dir_fingerprint_uncached(skill_dir)
+    if fingerprint:
+        with _fingerprint_cache_lock:
+            _fingerprint_cache[cache_key] = (fingerprint, signature)
+    return fingerprint
 
 
 def load_builtin_skill_index():
@@ -184,6 +331,52 @@ def _update_builtin_skill_index(src, dest_base, released):
         _log_warning("补齐内置技能索引失败: %s", e)
 
 
+def _migrate_builtin_index_if_needed(index, released, src, dest_base):
+    """指纹口径迁移：索引记录的算法版本与当前 _FINGERPRINT_ALGO 不一致时做一次性重建。
+
+    为什么需要：口径一变（例如新增跳过 node_modules），旧记录与新算法算出的指纹
+    必然不一致 —— 内置技能会被误标为 user，且"跟随升级"因 recorded != dest_fp 永久失效。
+
+    重建原则保守（与 classify / 升级使用同一判据）：
+      - 只处理 released 名单里的技能（其余技能从未入库，也无从验证）；
+      - 只有用户目录与内置源当前指纹完全一致（dest_fp == src_fp）才写回索引 ——
+        用户改动过的、目录缺失的、指纹读取失败的一律不写，宁可保持 user；
+      - 未能验证的既有记录保持原样不删除：其旧口径值与新指纹天然不匹配 → 判 user，
+        删除反而会把"内置源已下架但本地内容仍在"的技能额外降级，没有收益。
+
+    迁移完成后写版本文件，避免每次启动重复全量重算；索引落盘失败则不写版本文件，
+    下次启动自动重试（重建幂等，重试无副作用）。返回是否有记录被更新（供测试/诊断用）。
+    """
+    if _read_builtin_index_algo_version() == _FINGERPRINT_ALGO:
+        return False
+    changed = False
+    for name in released:
+        if not isinstance(name, str) or not name:
+            continue
+        src_dir = os.path.join(src, name)
+        dest_dir = os.path.join(dest_base, name)
+        if not os.path.isdir(src_dir) or not os.path.isdir(dest_dir):
+            continue
+        src_fp = _skill_dir_fingerprint(src_dir)
+        if not src_fp:
+            continue
+        dest_fp = _skill_dir_fingerprint(dest_dir)
+        if not dest_fp or dest_fp != src_fp:
+            continue
+        if index.get(name) != src_fp:
+            index[name] = src_fp
+            changed = True
+    try:
+        if changed:
+            # 落盘 + 原子写会清掉 config 的 mtime 读缓存，保证随后读取索引的
+            # _update_builtin_skill_index 看到的是迁移后的数据而不是旧文件
+            config._atomic_write_json(_builtin_skills_index_file(), index, indent=None)
+        _write_builtin_index_algo_version(_FINGERPRINT_ALGO)
+    except Exception as e:
+        _log_warning("重建内置技能索引失败: %s", e)
+    return changed
+
+
 def get_released_builtin_names():
     """读取"已释放过的内置技能名"集合。
 
@@ -225,6 +418,9 @@ def _replace_skill_dir(src_dir, dest_dir):
         _log_warning("替换技能目录失败 %s -> %s: %s", src_dir, dest_dir, e)
         shutil.rmtree(tmp_dir, ignore_errors=True)
         return False
+    # 整目录替换后必须清掉目标目录的指纹缓存：copytree 会保留源文件 mtime，
+    # 替换后的失效签名存在与替换前旧签名撞车的可能，届时缓存会返回过期指纹
+    _invalidate_fingerprint_cache(dest_dir)
     return True
 
 
@@ -274,7 +470,8 @@ def restore_builtin_skill(name):
       1. 内置源目录下不存在该技能 → 直接失败（无源可恢复）；
       2. 以"临时目录 + 原子替换"整目录覆盖用户目录；
       3. 覆盖成功后把索引里该技能的指纹更新为内置源新指纹（无 key 则新增）并落盘，
-         使来源标注重新回到"内置"。
+         并同步刷新口径版本文件，使来源标注重新回到"内置"，且下次启动不会把这份
+         刚写入的当前口径索引误当作旧口径而再重建一次。
     返回 {"ok": bool, "msg": str}，不抛异常（供 GUI 直接展示结果）。
     """
     if not isinstance(name, str) or not name:
@@ -291,6 +488,7 @@ def restore_builtin_skill(name):
         if src_fp:
             index[name] = src_fp
             config._atomic_write_json(_builtin_skills_index_file(), index, indent=None)
+            _write_builtin_index_algo_version(_FINGERPRINT_ALGO)
     except Exception as e:
         # 索引只影响来源标注，写失败不影响已完成的覆盖，只告警
         _log_warning("更新内置技能索引失败 %s: %s", name, e)
@@ -338,6 +536,10 @@ def _sync_builtin_skills_impl():
     released_changed = False
     # 升级判据要读"释放时的内容指纹"，读取一次供整个循环复用
     index = load_builtin_skill_index()
+    # 指纹口径可能已变化（如新增跳过 node_modules）：旧记录与新算法算出的指纹必然
+    # 不一致，会让内置技能被误标 user、跟随升级永久失效。这里对已释放技能做一次性
+    # 重建（保守：只有内容与内置源一致才入库），并把重建结果交给下方循环复用。
+    _migrate_builtin_index_if_needed(index, released, src, dest_base)
     try:
         for entry in sorted(os.listdir(src)):
             src_dir = os.path.join(src, entry)
