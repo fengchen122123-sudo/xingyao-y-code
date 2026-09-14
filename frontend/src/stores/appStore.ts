@@ -588,7 +588,7 @@ export const useAppStore = defineStore('app', {
     // 后端连接状态 / 版本号
     connected: false,
     version: '',
-    // 启动初始化是否完成（控制 Y-CODE 启动画面，完成后淡出进入对话）
+    // 启动初始化是否完成（控制 星瑶Code 启动画面，完成后淡出进入对话）
     initialized: false,
 
     // 侧栏与面板开合状态
@@ -1862,10 +1862,10 @@ export const useAppStore = defineStore('app', {
       this.syncDocumentTitle();
     },
 
-    // 页面标题跟随智能体显示名（webview/浏览器预览均可见；默认名时保持 Y-CODE 简洁形态）
+    // 页面标题跟随智能体显示名（webview/浏览器预览均可见；默认名时保持 星瑶Code 简洁形态）
     syncDocumentTitle() {
       const name = this.agentName || '星瑶';
-      document.title = name === '星瑶' ? 'Y-CODE' : `Y-CODE · ${name}`;
+      document.title = name === '星瑶' ? '星瑶Code' : `星瑶Code · ${name}`;
     },
 
     async setCommandShell(shellId: string): Promise<boolean> {
@@ -4798,7 +4798,7 @@ export const useAppStore = defineStore('app', {
       if (!busy) {
         const ok = await this.askConfirm(
           '新版本已就绪',
-          `Y-CODE v${this.updateState.latestVersion} 安装包下载完成`,
+          `星瑶Code v${this.updateState.latestVersion} 安装包下载完成`,
           '安装包已下载就绪，是否立即启动安装程序并重启软件？',
           '立即安装 ⏎'
         );
@@ -4828,7 +4828,7 @@ export const useAppStore = defineStore('app', {
       } else {
         const ok = await this.askConfirm(
           '启动安装',
-          `准备安装 Y-CODE v${this.updateState.latestVersion}`,
+          `准备安装 星瑶Code v${this.updateState.latestVersion}`,
           '是否立即启动安装向导并退出当前程序？',
           '立即安装 ⏎'
         );

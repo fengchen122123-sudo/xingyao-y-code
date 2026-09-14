@@ -16,9 +16,9 @@ def _app_title() -> str:
     try:
         from core.persona_settings import get_agent_display_name
 
-        return f"Y-CODE · {get_agent_display_name()}"
+        return f"星瑶Code · {get_agent_display_name()}"
     except Exception:
-        return "Y-CODE · 星瑶"
+        return "星瑶Code · 星瑶"
 
 
 class ApplicationLifecycle:
@@ -155,7 +155,7 @@ class ApplicationLifecycle:
                 text = (
                     "有对话回合仍在执行。\n\n"
                     "【是】最小化到托盘继续运行\n"
-                    "【否】停止回合并退出 Y-CODE\n"
+                    "【否】停止回合并退出 星瑶Code\n"
                     "【取消】返回窗口"
                 )
                 ret = ctypes.windll.user32.MessageBoxW(
@@ -169,7 +169,7 @@ class ApplicationLifecycle:
                 return "cancel"
             text = (
                 "有对话回合仍在执行（系统托盘不可用，无法后台驻留）。\n\n"
-                "【是】停止回合并退出 Y-CODE\n"
+                "【是】停止回合并退出 星瑶Code\n"
                 "【否】返回窗口"
             )
             ret = ctypes.windll.user32.MessageBoxW(

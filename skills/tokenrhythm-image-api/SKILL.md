@@ -10,7 +10,7 @@ triggers: 生图,画图,海报,封面,配图,改图,垫图
 目录里给了两套等价实现，按对方环境挑一个，谁都不用装运行时。
 
 **分享方式**：把整个 `tokenrhythm-image-api` 目录发给对方，放进其 skills 目录即可
-（Y-code/Claude Code 为 `~/.ycode/skills/` 或 `~/.claude/skills/`；跨运行时通用位置是 `~/.agents/skills/`）。
+（星瑶/Claude Code 为 `~/.ycode/skills/` 或 `~/.claude/skills/`；跨运行时通用位置是 `~/.agents/skills/`）。
 目录内不含任何凭据，Key 由使用者自己填。
 
 ### 选哪个脚本

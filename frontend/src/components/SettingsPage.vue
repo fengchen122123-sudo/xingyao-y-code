@@ -15,7 +15,7 @@
       <div class="nav-section">法律</div>
       <button data-test="disclaimer-nav" class="nav-item" :class="{ active: activeSection === 'disclaimer' }" @click="activeSection = 'disclaimer'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>免责条款</button>
       <div class="nav-spacer"></div>
-      <div class="settings-user"><span class="avatar">Y</span><span>Y-CODE</span><AppIcon name="settings" :size="13" /></div>
+      <div class="settings-user"><span class="avatar">Y</span><span>星瑶Code</span><AppIcon name="settings" :size="13" /></div>
     </aside>
 
     <main class="settings-main">
@@ -469,7 +469,7 @@
         <header class="settings-header settings-header--narrow">
           <div>
             <h1>关于</h1>
-            <p>Y-CODE · {{ store.agentName }} —— 你的 AI 编程搭档。</p>
+            <p>{{ store.agentName }} —— 你的 AI 编程搭档。</p>
           </div>
         </header>
 

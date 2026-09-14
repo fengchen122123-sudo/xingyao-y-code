@@ -450,7 +450,7 @@ def fetch_latest_release(
     raw_tag = data.get("tag_name") or ""
     # 清洗 tag 中的版本号（如 'v1.2.6' -> '1.2.6'）
     latest_version = raw_tag.lstrip("vV").strip() or raw_tag
-    release_title = data.get("name") or f"Y-CODE v{latest_version}"
+    release_title = data.get("name") or f"星瑶Code v{latest_version}"
     release_notes = data.get("body") or "暂无更新说明。"
     official_sha256 = parse_release_sha256(release_notes)
 

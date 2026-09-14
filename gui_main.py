@@ -354,7 +354,7 @@ def _acquire_single_instance() -> bool:
     # 再按标题精确匹配（与 gui_bridge._find_own_hwnd 同款实现，但跨进程查找）。
     # 同时从互斥体持有者取 PID，而不是盲目枚举所有 Y-code 进程。
     def _find_instance_hwnd():
-        title = "Y-CODE · 星瑶"
+        title = "星瑶Code · 星瑶"
         found = []
 
         @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -410,10 +410,10 @@ def _acquire_single_instance() -> bool:
     logger.warning("检测到已有实例但主窗口始终未创建，弹窗提示用户")
     user32.MessageBoxW(
         0,
-        "检测到 Y-code 已在运行，但主窗口当前不可见。\n\n"
-        "如果右下角托盘已有 Y-code 图标，请右键托盘图标选择“显示主窗口”。\n"
+        "检测到 星瑶Code 已在运行，但主窗口当前不可见。\n\n"
+        "如果右下角托盘已有 星瑶Code 图标，请右键托盘图标选择“显示主窗口”。\n"
         "如果程序卡死在启动页面，请稍后从托盘菜单退出后重新启动。",
-        "Y-code · 星瑶",
+        "星瑶Code · 星瑶",
         0x40,  # MB_ICONINFORMATION
     )
     return True
@@ -424,7 +424,7 @@ def _create_main_window(api, url: str, gui_theme: dict):
     # 启动 PyWebView 无边框桌面窗口（自绘标题栏；背景色与主题一致，加载前不闪反色）
     # easy_drag=False：只有 .pywebview-drag-region 标记的标题栏区域可拖拽移动窗口
     return webview.create_window(
-        title="Y-CODE · 星瑶",
+        title="星瑶Code · 星瑶",
         url=url,
         js_api=api,
         width=1320,

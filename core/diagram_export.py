@@ -96,7 +96,7 @@ def build_diagram_html(sources: list[str]) -> str:
             "</section>"
         )
     generated_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    title = f"Y-code 流程图 · {generated_at}"
+    title = f"星瑶Code 流程图 · {generated_at}"
     if js_uri:
         mermaid_script = (
             f'<script src="{html.escape(js_uri, quote=True)}" '
@@ -258,11 +258,11 @@ _HTML_TEMPLATE = """<!DOCTYPE html>
 <body>
 <header>
   <h1>__TITLE__</h1>
-  <div class="meta">由 Y-code 生成 · 在浏览器本地渲染，不经过任何远程服务</div>
+  <div class="meta">由 星瑶Code 生成 · 在浏览器本地渲染，不经过任何远程服务</div>
 </header>
 <div id="no-mermaid-banner">
   ⚠️ 本地渲染器缺失（vendor/mermaid/mermaid-*.min.js），当前仅显示图表源码。
-  源码可粘贴到任何 Mermaid 渲染工具查看，或重新安装 Y-code 修复。
+  源码可粘贴到任何 Mermaid 渲染工具查看，或重新安装 星瑶Code 修复。
 </div>
 __SECTIONS__
 __MERMAID_SCRIPT__

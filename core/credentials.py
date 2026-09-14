@@ -102,7 +102,7 @@ def unprotect_secret(value: str) -> str:
         account = text[len(KEYRING_PREFIX):]
         secret = keyring.get_password(KEYRING_SERVICE, account)
         if secret is None:
-            raise RuntimeError("系统凭据存储中缺少对应的 Y-CODE API Key")
+            raise RuntimeError("系统凭据存储中缺少对应的 星瑶Code API Key")
         return secret
     if not text or not text.startswith(DPAPI_PREFIX):
         return text

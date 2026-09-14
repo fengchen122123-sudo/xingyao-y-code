@@ -294,7 +294,7 @@ def run_dream_consolidation_sync(api_model, api_key, api_base=None):
         _agent = "星瑶"
 
     prompt = f"""
-你正在为{_agent} (Y-code) 整理长期记忆文件。你的任务是将最近的每日日志 (Daily Logs) 里的新事实、反馈和规则整理进分类记忆文件中，并更新索引 MEMORY.md。
+你正在为{_agent} 整理长期记忆文件。你的任务是将最近的每日日志 (Daily Logs) 里的新事实、反馈和规则整理进分类记忆文件中，并更新索引 MEMORY.md。
 
 目前记忆目录的物理路径在 `{MEMORY_DIR.as_posix()}/` 目录下。
 已有的记忆索引 (MEMORY.md) 内容为：

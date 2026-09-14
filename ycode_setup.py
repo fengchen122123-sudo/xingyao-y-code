@@ -1006,7 +1006,7 @@ FONT_VERSION = ("Microsoft YaHei UI", 8)
 LICENSE_VERSION = "v1.0"
 LICENSE_UPDATED_AT = "2026-09-11"
 LICENSE_AGREEMENT_TEXT = """\
-星瑶（Y-CODE）许可协议与免责条款（摘要）
+星瑶Code 许可协议与免责条款（摘要）
 
 一、软件性质与许可
 1. 本软件是在你本地设备运行的 AI 编程辅助工具，自身不提供、不运营任何生成式人工智能
@@ -1069,7 +1069,7 @@ class SetupWizard(tk.Tk):
         self.previous_install = prev_dir  # None 或原安装路径
         self.elevated_options = elevated_options
 
-        self.title("Y-code 安装")
+        self.title("星瑶Code 安装")
         self.resizable(False, False)
         self.configure(bg=COLOR_CONTENT)
         # 右上角 X 关闭也必须走「安装成功才清理安装包」的统一出口，
@@ -1225,7 +1225,7 @@ class SetupWizard(tk.Tk):
         sidebar.pack(side="left", fill="y")
         sidebar.pack_propagate(False)
 
-        tk.Label(sidebar, text="Y-code 星瑶", font=FONT_BRAND, fg=SIDEBAR_TEXT,
+        tk.Label(sidebar, text="星瑶Code", font=FONT_BRAND, fg=SIDEBAR_TEXT,
                  bg=SIDEBAR_BG).pack(pady=(44, 0))
         tk.Label(sidebar, text="AI 编程助手", font=FONT_DIM, fg="#9CA3AF",
                  bg=SIDEBAR_BG).pack()
@@ -1298,12 +1298,12 @@ class SetupWizard(tk.Tk):
         self._build_finish_page()
 
     _BANNERS = {
-        "welcome": ("欢迎使用 Y-code 安装向导", "本向导将引导您完成 Y-code 的安装"),
+        "welcome": ("欢迎使用 星瑶Code 安装向导", "本向导将引导您完成 星瑶Code 的安装"),
         "license": ("许可协议与免责条款", "请阅读以下条款，勾选同意后继续安装"),
-        "scope": ("选择安装用户", "选择要为哪些用户安装 Y-code"),
-        "options": ("选择安装位置与选项", "选择 Y-code 的安装文件夹与附加选项"),
-        "installing": ("正在安装", "Y-code 正在安装，请等候。"),
-        "finish": ("安装完成", "Y-code 安装向导已结束"),
+        "scope": ("选择安装用户", "选择要为哪些用户安装 星瑶Code"),
+        "options": ("选择安装位置与选项", "选择 星瑶Code 的安装文件夹与附加选项"),
+        "installing": ("正在安装", "星瑶Code 正在安装，请等候。"),
+        "finish": ("安装完成", "星瑶Code 安装向导已结束"),
     }
 
     def show_page(self, name):
@@ -1370,22 +1370,22 @@ class SetupWizard(tk.Tk):
     def _build_welcome_page(self):
         page = self._page("welcome")
         is_full = self.mode == "full"
-        self._label(page, "Y-code 星瑶", FONT_TITLE).place(relx=0.5, y=80, anchor="center")
+        self._label(page, "星瑶Code", FONT_TITLE).place(relx=0.5, y=80, anchor="center")
         self._label(page, f"AI 编程助手   v{self.version}", FONT_PAGE_SUB, COLOR_TEXT_DIM).place(
             relx=0.5, y=112, anchor="center")
         desc = (
-            "本向导将在您的电脑上安装 Y-code 图形界面版 (GUI)，\n"
+            "本向导将在您的电脑上安装 星瑶Code 图形界面版 (GUI)，\n"
             "接下来您可以选择安装用户、安装位置，\n"
             "以及是否附带安装命令行版 (CLI)。"
             if is_full else
-            "本向导将在您的电脑上安装 Y-code 命令行版 (CLI)，\n"
+            "本向导将在您的电脑上安装 星瑶Code 命令行版 (CLI)，\n"
             "安装完成后可在终端中直接使用 ycode 命令。"
         )
         self._label(page, desc, FONT_TEXT, justify="center").place(relx=0.5, y=190, anchor="center")
         self._label(page, "单击“下一步”继续，或单击“取消”退出安装向导。",
                     FONT_TEXT, COLOR_TEXT_DIM).place(relx=0.5, y=265, anchor="center")
         if self.previous_install:
-            self._label(page, f"检测到已安装的 Y-code：{self.previous_install}，本次将覆盖安装。",
+            self._label(page, f"检测到已安装的 星瑶Code：{self.previous_install}，本次将覆盖安装。",
                         FONT_TEXT, "#8a6d1a").place(relx=0.5, y=305, anchor="center")
 
     def _build_license_page(self):
@@ -1447,7 +1447,7 @@ class SetupWizard(tk.Tk):
         if locked:
             rb1.configure(state="disabled")
             rb2.configure(state="disabled")
-            self._label(page, f"检测到已安装的 Y-code：{self.previous_install}\n"
+            self._label(page, f"检测到已安装的 星瑶Code：{self.previous_install}\n"
                               "重装将沿用原安装范围，如需变更请先卸载。",
                         FONT_TEXT, "#8a6d1a", justify="left").place(x=50, y=200)
 
@@ -1475,7 +1475,7 @@ class SetupWizard(tk.Tk):
         # 仅 78px，"浏览..." 显示不下。单独调小 padding 或加宽到 120px
         self._btn_browse.place(x=470, y=78, width=120, height=30)
         if locked:
-            self._label(page, "检测到已安装的 Y-code，将覆盖安装到原位置。",
+            self._label(page, "检测到已安装的 星瑶Code，将覆盖安装到原位置。",
                         FONT_PAGE_SUB, "#8a6d1a").place(x=40, y=108)
 
         if self.mode == "full":
@@ -1525,7 +1525,7 @@ class SetupWizard(tk.Tk):
         self._finish_hint.place(relx=0.5, y=280, anchor="center")
         # 「立即运行」复选框：先建好不摆放，安装成功且为 full 模式时才显示
         self._launch_check = tk.Checkbutton(
-            page, text="立即运行 Y-code",
+            page, text="立即运行 星瑶Code",
             variable=self.var_launch,
             bg=COLOR_CONTENT, fg=COLOR_TEXT, font=FONT_TEXT,
             selectcolor=COLOR_CONTENT, activebackground=COLOR_CONTENT,
@@ -1546,16 +1546,16 @@ class SetupWizard(tk.Tk):
     def _start_install(self):
         install_dir = self.var_dir.get().strip()
         if not install_dir:
-            messagebox.showwarning("Y-code 安装", "请先选择有效的安装位置。", parent=self)
+            messagebox.showwarning("星瑶Code 安装", "请先选择有效的安装位置。", parent=self)
             return
         # 修复 M47：user 范围安装目录无位置约束，可装进任意已有非空目录；
         # 目标非空且不像既有 Y-code 安装时先警告（重装/提权重启前已确认过，跳过）。
         if (not self.elevated_options and not self.previous_install
                 and _is_unrecognized_non_empty_dir(install_dir)):
             if not messagebox.askyesno(
-                "Y-code 安装",
+                "星瑶Code 安装",
                 f"所选目录已存在且不为空：\n{install_dir}\n\n"
-                "继续安装会把 Y-code 文件写入该目录。为安全起见，建议改用空目录。\n\n"
+                "继续安装会把 星瑶Code 文件写入该目录。为安全起见，建议改用空目录。\n\n"
                 "是否继续安装到该目录？",
                 icon="warning",
                 parent=self,
@@ -1575,7 +1575,7 @@ class SetupWizard(tk.Tk):
                 self.destroy()
                 return
             messagebox.showwarning(
-                "Y-code 安装",
+                "星瑶Code 安装",
                 "为所有用户安装需要管理员权限。\n"
                 "您可以在 UAC 弹窗中选择“是”重试，或返回上一步改为“仅为我安装”。",
                 parent=self,

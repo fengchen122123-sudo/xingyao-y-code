@@ -42,7 +42,7 @@ _EDIT_MAX_BYTES = 10 * 1024 * 1024
 _EDIT_ALLOWED_EXTS = (".jpg", ".jpeg", ".png")
 
 _NOT_CONFIGURED_MSG = (
-    "未配置基元律动（TokenRhythm）API Key：请在 Y-code 设置页添加提供商"
+    "未配置基元律动（TokenRhythm）API Key：请在 星瑶Code 设置页添加提供商"
     "（base_url=https://tokenrhythm.studio/v1）并填入 Key，或确认"
     " ~/.ycode/config.json providers 中已有该条目，随后在插件页启用本插件。"
 )

@@ -8,7 +8,7 @@ triggers: 公众号排版,公众号文章,微信排版,gzh,一键排版,文章�
 
 把一篇 Markdown 文章转换为可直接复制粘贴进微信公众号编辑器、且粘贴后样式不丢失的 HTML。
 
-> **路径与环境（Y-code）**：下文 `<SKILL_ROOT>` 一律指本 SKILL.md 所在目录（即本技能目录），脚本一律用它拼接绝对路径调用；脚本只依赖 Python 标准库，Windows 上没有 `python3` 命令时改用 `python` 或当前环境的解释器。Windows 控制台若因 emoji 输出报 `UnicodeEncodeError: 'gbk' codec`，先设 `PYTHONUTF8=1`（或 `PYTHONIOENCODING=utf-8`）再跑脚本。
+> **路径与环境（星瑶）**：下文 `<SKILL_ROOT>` 一律指本 SKILL.md 所在目录（即本技能目录），脚本一律用它拼接绝对路径调用；脚本只依赖 Python 标准库，Windows 上没有 `python3` 命令时改用 `python` 或当前环境的解释器。Windows 控制台若因 emoji 输出报 `UnicodeEncodeError: 'gbk' codec`，先设 `PYTHONUTF8=1`（或 `PYTHONIOENCODING=utf-8`）再跑脚本。
 
 核心资产是 `references/` 下的**主题组件库**（每套一个主题：设计变量 + 各组件完整 HTML + 模板骨架 + 映射规则）外加 1 套**通用增量库**（代码块 / 图片·GIF / 小标签标题，所有主题共用）。主题清单以 `references/theme-index.md` 为单一来源。本 SKILL.md 只负责流程与决策，**具体 HTML 代码一律从组件库取，不要凭记忆手写**。
 
