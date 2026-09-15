@@ -2140,7 +2140,8 @@ class MemoryManager:
                 return [], False
             session_id = row[0]
 
-            max_fetch = max(1, int(limit)) + 30
+            limit = max(1, int(limit))          # 防御 limit<=0，避免 page[-1] IndexError
+            max_fetch = limit + 30
             if before_id is None:
                 cursor.execute(
                     'SELECT id, role, content FROM messages WHERE session_id = ? '
@@ -2153,8 +2154,8 @@ class MemoryManager:
             if not fetched:
                 return [], False
 
-            page = fetched[:int(limit)]
-            extra = list(fetched[int(limit):])   # 倒序的扩展余量
+            page = fetched[:limit]
+            extra = list(fetched[limit:])   # 倒序的扩展余量
             # 回合对齐：本页最旧（page[-1]）非 user 时，沿更早方向吞并 extra 直到 user 或耗尽
             while extra and page[-1][1] != 'user':
                 page.append(extra.pop(0))

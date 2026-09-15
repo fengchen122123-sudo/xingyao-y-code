@@ -230,7 +230,7 @@ def test_get_initial_state_includes_secondary_model_fields(tmp_path, monkeypatch
     bridge._build_skill_list = lambda: []
     bridge._build_mcp_list = lambda: []
     bridge.get_plugins = lambda: []
-    bridge._load_session_messages = lambda session: []
+    bridge._load_session_messages = lambda session: ([], False, None)
     bridge.get_token_usage = lambda: {}
     bridge._ensure_lan_server = lambda: None
 
