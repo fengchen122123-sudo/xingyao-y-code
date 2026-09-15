@@ -880,6 +880,12 @@ export interface PyWebViewAPI {
   report_dropped_files(event: any): Promise<{ ok: boolean; paths?: string[] }>;
   // @ 引用自动补全：工作区文件子串匹配
   search_workspace_files(query: string, limit?: number): Promise<any>;
+  // @ 提及对话自动补全：历史会话子串匹配（排除当前会话）
+  search_sessions(query: string, limit?: number): Promise<{
+    ok: boolean;
+    sessions?: { name: string; count: number; updated_at: string; workdir: string }[];
+    msg?: string;
+  }>;
   get_dir_children(path: string): Promise<any>;
   get_file_tree(workdir: string): Promise<any>;
   set_titlebar_theme(dark: boolean): Promise<any>;
