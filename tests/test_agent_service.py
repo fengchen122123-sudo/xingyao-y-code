@@ -1052,3 +1052,39 @@ def test_prune_history_in_memory_estimates_incrementally():
     assert remaining <= 4000 * 0.95       # SUMMARIZE_RATIO
     assert history[0]["content"].startswith("[历史对话记忆摘要")
 
+
+def test_build_referenced_sessions_block_content():
+    from core.agent_service import build_referenced_sessions_block, REF_SESSIONS_PREFIX
+    mgr = _make_manager()
+    mgr.ensure_session("目标对话")
+    mgr.add_message("目标对话", "user", "登录接口报 500 怎么查")
+    mgr.add_message("目标对话", "assistant", "先看 gateway 日志，再查鉴权中间件")
+    block = build_referenced_sessions_block(mgr, ["目标对话"], current_session="当前对话")
+    assert block.startswith(REF_SESSIONS_PREFIX)
+    assert "目标对话" in block
+    assert "登录接口报 500" in block
+    assert "先看 gateway 日志" in block
+
+
+def test_build_referenced_sessions_block_skip_and_missing():
+    from core.agent_service import build_referenced_sessions_block
+    mgr = _make_manager()
+    mgr.ensure_session("当前对话")
+    block = build_referenced_sessions_block(
+        mgr, ["当前对话", "不存在的对话"], current_session="当前对话"
+    )
+    assert "已跳过" in block  # 自引用与不存在的会话都如实标注，不抛错
+
+
+def test_build_referenced_sessions_block_empty_refs():
+    from core.agent_service import build_referenced_sessions_block
+    assert build_referenced_sessions_block(_make_manager(), []) == ""
+
+
+def test_get_session_memory_summary(tmp_path):
+    from core.memory import MemoryManager
+    mgr = MemoryManager(str(tmp_path / "t.db"))
+    mgr.ensure_session("s1")
+    assert mgr.get_session_memory_summary("s1") == ""
+    assert mgr.get_session_memory_summary("不存在") == ""
+

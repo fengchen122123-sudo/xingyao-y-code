@@ -2327,6 +2327,19 @@ class MemoryManager:
             row = cursor.fetchone()
             return row[0] if row else None
 
+    def get_session_memory_summary(self, session_name):
+        """读取会话的记忆压缩摘要；会话不存在或无摘要返回空串。"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute(
+                'SELECT memory_summary FROM sessions WHERE session_name = ?',
+                (session_name,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return ""
+        return str(row[0] or "").strip()
+
     def delete_session(self, session_name):
         """删除指定会话及其所有消息"""
         deleted = False
