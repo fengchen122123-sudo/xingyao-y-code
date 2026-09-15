@@ -408,7 +408,9 @@ async function maybeLoadOlder() {
   const oldTop = el.scrollTop;
   await store.loadOlderMessages();
   await nextTick();
-  el.scrollTop = el.scrollHeight - oldHeight + oldTop; // 位置补偿
+  // 绝对定位补偿（幂等）：anchoring 生效时此赋值与浏览器结果一致，不会叠加；
+  // anchoring 失效（如锚点元素被移除）时由它兜底保持视口
+  el.scrollTop = el.scrollHeight - oldHeight + oldTop;
 }
 
 // 红点导航点击未加载区域：连续向前翻页直到目标消息进入列表，再交回 rail 定位。
@@ -1033,9 +1035,10 @@ onUnmounted(() => {
   flex: 1;
   overflow-y: auto;
   padding: 20px 28px 10px;
-  /* 历史翻页 prepend 的位置补偿由 JS 精确计算（maybeLoadOlder），
-     禁用浏览器 scroll anchoring 防止与手动补偿双重叠加导致位置跳变 */
-  overflow-anchor: none;
+  /* 保留浏览器 scroll anchoring（默认 auto）：翻页 prepend 与图片/异步内容
+     分批撑高时由渲染引擎持续保持视口锚点，这是"不回退"的主力机制。
+     JS 侧 maybeLoadOlder 的补偿是绝对定位赋值（oldTop + 内容增量），
+     幂等且与 anchoring 同向，仅作兜底，不会双重叠加。 */
 }
 /* 对话内容容器：消息列表的公共父级 */
 #chat-body {
