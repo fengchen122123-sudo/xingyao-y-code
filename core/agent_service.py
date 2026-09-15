@@ -76,6 +76,13 @@ _BG_RESULT_MAX_CHARS = 1500
 
 _BG_SUMMARY_PREFIX = "📦 后台子代理任务结果汇总"
 
+# @ 提及对话：注入到末条 user 消息末尾的引用块前缀（strip_context_suffix 按它剥离）
+REF_SESSIONS_PREFIX = "【引用的对话记录】"
+_REF_SESSION_MAX_CHARS = 6000    # 单会话内容上限
+_REF_TOTAL_MAX_CHARS = 15000     # 全部引用总上限
+_REF_RECENT_MSG_LIMIT = 20       # 无摘要时回溯的近期消息条数
+_REF_MSG_MAX_CHARS = 800         # 单条消息上限
+
 # MCP schema 预热标记：进程内只尝试一次
 _MCP_WARMUP_STARTED = False
 
@@ -468,6 +475,93 @@ def build_background_task_summary(session_name: str) -> str:
     else:
         summary_lines.append("请基于以上结果汇总后回复用户。")
     return "\n".join(summary_lines)
+
+
+def _digest_one_session(manager, name, info):
+    """组装单个被引用会话的紧凑摘要：记忆摘要优先，再补近期 user/assistant 文本消息。
+
+    跳过 tool 角色与多媒体 content；user 文本先 strip_context_suffix 去掉当轮
+    运行上下文，避免把别个会话的模型/时间快照带进来。总长硬限 _REF_SESSION_MAX_CHARS。
+    """
+    lines = []
+    updated = str(info.get("updated_at") or "")[:16]
+    header = f"── 对话「{name}」（{info.get('count', 0)} 条消息，更新于 {updated or '未知'}）──"
+    summary = ""
+    try:
+        summary = manager.get_session_memory_summary(name)
+    except Exception:
+        summary = ""
+    if summary:
+        lines.append("[记忆摘要] " + summary[:2000])
+    try:
+        history = manager.get_history(name) or []
+    except Exception:
+        history = []
+    recent = []
+    for msg in reversed(history):
+        if len(recent) >= _REF_RECENT_MSG_LIMIT:
+            break
+        role = msg.get("role")
+        if role not in ("user", "assistant"):
+            continue
+        content = msg.get("content")
+        if not isinstance(content, str):
+            continue  # 多媒体 content（list）跳过
+        if role == "user":
+            content = strip_context_suffix(content)
+        content = content.strip()
+        if not content:
+            continue
+        label = "用户" if role == "user" else "助手"
+        recent.append(f"{label}: {content[:_REF_MSG_MAX_CHARS]}")
+    if recent:
+        lines.append("[近期对话]")
+        lines.extend(reversed(recent))
+    body = header + "\n" + "\n".join(lines) if lines else header + "\n（无可展示的文本消息）"
+    if len(body) > _REF_SESSION_MAX_CHARS:
+        body = body[:_REF_SESSION_MAX_CHARS] + "\n...（已截断）"
+    return body
+
+
+def build_referenced_sessions_block(manager, ref_names, current_session=None):
+    """把 @{会话名} 引用的对话内容组装为上下文后缀块文本。
+
+    注入发生在 token 估算之后，必须自行限额（_REF_TOTAL_MAX_CHARS）。
+    自引用与不存在的会话如实标注「已跳过」，绝不抛错影响主流程。
+    """
+    if not ref_names:
+        return ""
+    try:
+        existing = {
+            str(s.get("name") or ""): s
+            for s in manager.get_all_sessions(workdir=None, include_empty=True)
+        }
+    except Exception:
+        existing = {}
+    intro = (
+        REF_SESSIONS_PREFIX
+        + "用户通过 @ 引用了以下历史对话供你参考，可将其作为上下文依据，"
+          "但不要声称自己亲历过这些对话："
+    )
+    parts = [intro]
+    total = len(intro)
+    skipped = []
+    for name in ref_names:
+        if current_session and name == current_session:
+            skipped.append(f"「{name}」是当前会话，已跳过")
+            continue
+        info = existing.get(name)
+        if info is None:
+            skipped.append(f"「{name}」不存在或已删除，已跳过")
+            continue
+        digest = _digest_one_session(manager, name, info)
+        if total + len(digest) > _REF_TOTAL_MAX_CHARS:
+            skipped.append(f"「{name}」因总长度超限已省略")
+            continue
+        parts.append(digest)
+        total += len(digest)
+    parts.extend(skipped)
+    return "\n\n".join(parts)
 
 
 def _prune_history_in_memory_to_fit_window(
