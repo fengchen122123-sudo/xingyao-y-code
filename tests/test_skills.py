@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 import config
@@ -201,6 +202,19 @@ def _write_skill(skill_dir: Path, name: str, body: str = "BODY") -> Path:
     return path
 
 
+def _freeze_tree_mtime(root: Path, ts: float = 1_700_000_000.0) -> None:
+    """递归把目录树的 mtime 固定为同一确定时刻。
+
+    Windows 上刚写入/创建的文件，mtime 存在纳秒级一次性抖动窗口（首次 stat
+    与数毫秒后的 stat 返回值不同）。指纹失效签名包含 mtime_ns，断言"缓存命中"
+    的测试若依赖新建文件的 mtime，会因这个抖动出现间歇性"假失效"（uncached
+    被多调一次）。固定为过去的确定值后，签名与环境时序彻底无关。
+    """
+    for entry in root.rglob("*"):
+        os.utime(entry, (ts, ts))
+    os.utime(root, (ts, ts))
+
+
 def test_classify_skill_source_builtin_when_fingerprint_matches_index(tmp_path, monkeypatch):
     """场景 a：目录名命中索引且当前指纹与索引记录一致 → 判为内置。"""
     src, _user, _yc = _source_env(tmp_path, monkeypatch)
@@ -371,6 +385,9 @@ def test_fingerprint_cache_hit_and_invalidation(tmp_path, monkeypatch):
     _write_skill(skill_dir, "demo")
     (skill_dir / "sub").mkdir()
     (skill_dir / "sub" / "note.md").write_text("note\n", encoding="utf-8")
+    # 消除 Windows 新建文件 mtime 纳秒抖动导致的间歇性缓存"假失效"：
+    # 缓存命中断言必须与环境时序无关（见 _freeze_tree_mtime 注释）
+    _freeze_tree_mtime(skill_dir)
 
     calls = []
     real_uncached = skills._skill_dir_fingerprint_uncached
