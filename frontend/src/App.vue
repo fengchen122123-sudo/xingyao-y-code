@@ -89,8 +89,14 @@
           <div id="chat-body">
             <!-- 历史分页加载指示：滚动到顶翻页时显示 -->
             <div v-if="store.historyLoading" class="history-loading" data-test="history-loading">正在加载更早的消息…</div>
-            <!-- Kimi 空状态卡片 -->
-            <KimiEmptyState v-if="!store.messages || store.messages.length === 0" />
+            <!-- Kimi 空状态卡片（仅真正的新对话/空会话；切换加载中由下面的分支接管） -->
+            <!-- 会话切换加载指示：目标会话历史仍在后端返回路上时替代空状态卡片，
+                 避免与“新对话”首屏混淆；数据到达后由消息流或空状态卡片接管 -->
+            <KimiEmptyState v-if="(!store.messages || store.messages.length === 0) && !store.sessionSwitching" />
+            <div v-else-if="store.sessionSwitching" class="session-switching" data-test="session-switching">
+              <span class="ss-ring"></span>
+              <span>正在加载会话…</span>
+            </div>
 
             <!-- 消息流列表：按回合分组渲染——回合结束后中间过程折叠成一块，
                  只突出组尾的最终总结；运行中的回合保持逐条实时显示 -->
@@ -1206,5 +1212,26 @@ onUnmounted(() => {
   color: var(--text-faint);
   padding: 6px 0;
   user-select: none;
+}
+/* 会话切换加载指示：切换期间替换空状态卡片（细条 + 弱化色，与 history-loading 同风格）；
+   旋转动画复用上方 .wi-ring 已定义的 @keyframes wi-spin，避免重复定义冲突的 keyframes */
+.session-switching {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  min-height: 240px;
+  color: var(--text-faint);
+  font-size: 13px;
+  user-select: none;
+}
+.session-switching .ss-ring {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--border);
+  border-top-color: var(--text-faint);
+  border-radius: 50%;
+  animation: wi-spin 0.8s linear infinite;
 }
 </style>

@@ -586,6 +586,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
     sessionStatusDots: {} as Record<string, 'green' | 'yellow' | 'red'>,
     // 每个会话独立保存流式消息和回合状态；切换会话不丢失后台事件
     sessionRuntimeByName: {} as Record<string, SessionRuntimeState>,
+    // 会话切换加载中：切到"已有会话"时，目标会话历史仍在后端返回路上（消息区为空）
+    // 的加载态。用于把"加载中"与"真正的新对话/空会话"区分开，避免切换瞬间
+    // 先渲染空消息区而闪出首屏空状态（新对话欢迎页）卡片。
+    // 仅 switchSession 置位/复位，新建会话（createGlobalSession/createSessionInGroup）直接置 false。
+    sessionSwitching: false,
     showThinking: false,
 
     // 图片大图查看（Lightbox）
@@ -2273,9 +2278,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 优先恢复内存中的实时 runtime；运行中的会话不能被旧数据库快照覆盖
       const runtime = this._getSessionRuntime(sessionName);
       this._bindSessionRuntime(sessionName);
+      // 目标会话还没有内存缓存（无消息且未运行）⇒ 历史还在后端返回路上，消息区暂空：
+      // 置加载态，把"加载中"与"真正的新对话/空会话"区分开
+      this.sessionSwitching = !runtime.running && runtime.messages.length === 0;
 
       const api = this._api();
-      if (!api) return;
+      // 后端不可用时不能残留加载态
+      if (!api) { this.sessionSwitching = false; return; }
       // 模型版本快照：响应在途期间用户若又切了模型（setModel 递增版本），
       // 后端响应携带的是切换前的旧模型快照，不再覆盖本地选择
       const modelVersion = this._sessionModelVersion[sessionName] || 0;
@@ -2373,6 +2382,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
+      } finally {
+        // 加载态复位：仅在仍是当前会话时清除——快速连点不同会话时，
+        // 过期响应返回不得清掉当前会话的加载态
+        if (this.currentSessionName === sessionName) this.sessionSwitching = false;
       }
     },
 
@@ -2509,6 +2522,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.planData = { title: '', items: [], progress: 0 };
       this.tokenUsage = emptyTokenUsage();
       this.running = false;
+      // 新会话/新对话不是"历史加载中"：显式清除切换加载态
+      this.sessionSwitching = false;
       this._captureRuntime('');
       this.currentWorkdirLabel = '对话';
       this.workdir = '';
@@ -2552,6 +2567,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.planData = { title: '', items: [], progress: 0 };
       this.tokenUsage = emptyTokenUsage();
       this.running = false;
+      // 新会话/新对话不是"历史加载中"：显式清除切换加载态
+      this.sessionSwitching = false;
       this._captureRuntime('');
       this.workdir = targetWorkdir;
       this.currentWorkdirLabel = targetWorkdir.split('\\').pop() || targetWorkdir;
