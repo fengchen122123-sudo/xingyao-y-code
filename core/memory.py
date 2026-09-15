@@ -2124,6 +2124,50 @@ class MemoryManager:
 
             return self._parse_message_rows(cursor.fetchall(), with_ids=True)
 
+    def get_history_paged(self, session_name, before_id=None, limit=50):
+        """分页读取会话历史（含 _msg_id），按 id 正序返回本页。
+
+        before_id=None 取最新一页；否则取 id < before_id 的一页。
+        分页边界对齐回合起点：本页最旧一条非 user 且仍有更早消息时，
+        向前扩展至最近一条 user（上限 limit+30）。
+        返回 (messages, has_more)。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
+            row = cursor.fetchone()
+            if row is None:
+                return [], False
+            session_id = row[0]
+
+            max_fetch = max(1, int(limit)) + 30
+            if before_id is None:
+                cursor.execute(
+                    'SELECT id, role, content FROM messages WHERE session_id = ? '
+                    'ORDER BY id DESC LIMIT ?', (session_id, max_fetch))
+            else:
+                cursor.execute(
+                    'SELECT id, role, content FROM messages WHERE session_id = ? AND id < ? '
+                    'ORDER BY id DESC LIMIT ?', (session_id, int(before_id), max_fetch))
+            fetched = cursor.fetchall()          # 倒序：最新在前
+            if not fetched:
+                return [], False
+
+            page = fetched[:int(limit)]
+            extra = list(fetched[int(limit):])   # 倒序的扩展余量
+            # 回合对齐：本页最旧（page[-1]）非 user 时，沿更早方向吞并 extra 直到 user 或耗尽
+            while extra and page[-1][1] != 'user':
+                page.append(extra.pop(0))
+
+            oldest_id = page[-1][0]
+            cursor.execute(
+                'SELECT EXISTS(SELECT 1 FROM messages WHERE session_id = ? AND id < ?)',
+                (session_id, oldest_id))
+            has_more = bool(cursor.fetchone()[0])
+
+            page.reverse()                        # 回到正序
+            return self._parse_message_rows(page, with_ids=True), has_more
+
     def get_history_for_llm(self, session_name):
         """获取专门供给大模型的历史，剔除已被总结的段落，并在最前面附带记忆摘要"""
         with self._lock:
