@@ -118,3 +118,6 @@ docs/PII*
 hunyuan_*.jpg
 tokenrhythm_*.png
 .tmp_skill_src/
+build_*.log
+dryrun_*.log
+publish_*.log
