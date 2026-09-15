@@ -340,9 +340,9 @@ def _drop_legacy_context_systems(history: list) -> list:
 
 
 def strip_context_suffix(content):
-    """移除 user 消息内容末尾内联的上下文后缀（动态块 / 后台汇总 / 时间注记）。
+    """移除 user 消息内容末尾内联的上下文后缀（动态块 / 引用块 / 后台汇总 / 时间注记）。
 
-    上下文后缀按固定顺序追加：动态块 → 后台汇总 → 时间注记。此处反向剥离，
+    上下文后缀按固定顺序追加：动态块 → 引用块 → 后台汇总 → 时间注记。此处反向剥离，
     直到末尾不再有可识别的上下文块标记为止，避免重入/重试时重复堆积。
 
     用途有两处：
@@ -373,6 +373,13 @@ def strip_context_suffix(content):
             text = text[:idx]
             changed = True
             continue
+        # @ 提及对话引用块（追加顺序在后台汇总之前，剥离从末尾反向进行）
+        marker = "\n\n" + REF_SESSIONS_PREFIX
+        idx = text.rfind(marker)
+        if idx != -1:
+            text = text[:idx]
+            changed = True
+            continue
         # 动态运行上下文块
         marker = "\n\n" + DYNAMIC_CONTEXT_PREFIX
         idx = text.rfind(marker)
@@ -384,9 +391,10 @@ def strip_context_suffix(content):
 
 
 def _append_context_suffix_to_last_user(
-    history, dynamic_prompt, summary_msg, time_note, manager, session_name
+    history, dynamic_prompt, summary_msg, time_note, manager, session_name,
+    ref_block="",
 ):
-    """把动态运行上下文 + 后台汇总 + 时间注记内联到最后一条 user 消息末尾并 CAS 持久化。
+    """把动态运行上下文 + 引用对话块 + 后台汇总 + 时间注记内联到最后一条 user 消息末尾并 CAS 持久化。
 
     上下文块不再作为独立 role=system 消息持久化（那会把 system 消息留到
     user 之后，违反 provider 的「system 必须在开头」约束）。改为内联到
@@ -406,7 +414,7 @@ def _append_context_suffix_to_last_user(
         # 非文本 content（如媒体消息），跳过上下文内联
         return
     cleaned = strip_context_suffix(original_content)
-    suffix_parts = [p for p in (dynamic_prompt, summary_msg, time_note) if p]
+    suffix_parts = [p for p in (dynamic_prompt, ref_block, summary_msg, time_note) if p]
     if not suffix_parts:
         return
     new_content = cleaned + "\n\n" + "\n\n".join(suffix_parts)
@@ -417,6 +425,26 @@ def _append_context_suffix_to_last_user(
         )
     except Exception:
         logger.warning("上下文后缀 CAS 持久化失败，仅影响内存副本", exc_info=True)
+
+
+def _extract_refs_from_last_user(history: list) -> list:
+    """从末条 user 消息兜底提取 @{会话名} 引用名列表（只读取，绝不改写消息文本）。
+
+    先 strip_context_suffix 再提取，避免把上一轮内联的上下文后缀误当用户输入；
+    @{...} 标记保留在消息原文里（展示层可见、重入时可重新提取）。
+    """
+    from core.input_parser import extract_session_refs
+
+    for i in range(len(history) - 1, -1, -1):
+        msg = history[i]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            return []
+        _, names = extract_session_refs(strip_context_suffix(content))
+        return names
+    return []
 
 
 def build_background_task_summary(session_name: str) -> str:
@@ -709,6 +737,7 @@ def prepare_turn_messages(
     compress_threshold: float = DEFAULT_COMPRESS_THRESHOLD,
     is_gui: bool = False,
     turn_source: str = "local",
+    referenced_sessions: Optional[list] = None,
 ) -> list:
     """组装一轮对话真正发给大模型的完整消息列表。
 
@@ -728,6 +757,9 @@ def prepare_turn_messages(
       turn_source: 入口层受控回合来源（local|lan，设计 18）。LAN 消息回合由
               LanServer dispatch 注入 "lan"，本地 GUI/CLI 固定 local；决定
               本轮电脑操控能力解析（lan 固定禁用）。
+      referenced_sessions: 本轮 @{会话名} 引用名列表。显式传入（含空列表）时
+              直接使用；为 None 时本地回合（turn_source == "local"）从末条
+              user 消息兜底提取，LAN 回合不解析、视为空列表。
     """
     from core.llm import estimate_tokens, session_token_usage, token_usage_lock
 
@@ -939,8 +971,22 @@ def prepare_turn_messages(
     except Exception:
         logger.warning("后台子代理汇总注入失败，已跳过本轮汇总", exc_info=True)
         summary_msg = ""
+    # @ 提及对话：调用方未显式给出引用列表时，本地回合从末条 user 消息兜底
+    # 提取（LAN 入口按全局约束不解析）；显式传入（含空列表）时直接使用。
+    if referenced_sessions is None:
+        referenced_sessions = (
+            _extract_refs_from_last_user(history) if turn_source == "local" else []
+        )
+    try:
+        ref_block = build_referenced_sessions_block(
+            manager, referenced_sessions or [], session_name
+        )
+    except Exception:
+        logger.warning("引用对话块构建失败，已跳过", exc_info=True)
+        ref_block = ""
     _append_context_suffix_to_last_user(
-        history, dynamic_prompt, summary_msg, time_note, manager, session_name
+        history, dynamic_prompt, summary_msg, time_note, manager, session_name,
+        ref_block=ref_block,
     )
 
     return history

@@ -1088,3 +1088,28 @@ def test_get_session_memory_summary(tmp_path):
     assert mgr.get_session_memory_summary("s1") == ""
     assert mgr.get_session_memory_summary("不存在") == ""
 
+
+def test_strip_context_suffix_strips_ref_block():
+    from core.agent_service import strip_context_suffix, REF_SESSIONS_PREFIX
+    content = "原始问题" + "\n\n" + REF_SESSIONS_PREFIX + "（引用内容……）"
+    assert strip_context_suffix(content) == "原始问题"
+
+
+def test_prepare_turn_messages_injects_ref_block(stub_llm, quiet_extras):
+    from core.agent_service import (
+        prepare_turn_messages, strip_context_suffix, REF_SESSIONS_PREFIX,
+    )
+    mgr = _make_manager()
+    mgr.ensure_session("被引用")
+    mgr.add_message("被引用", "user", "旧结论：根因是鉴权中间件")
+    mgr.ensure_session("当前会话")
+    mgr.add_message("当前会话", "user", "参考 @{被引用} 继续排查")
+    history = prepare_turn_messages(
+        mgr, "当前会话", "test-model", 128000, permission_mode="full",
+    )
+    last_user = [m for m in history if m.get("role") == "user"][-1]
+    assert REF_SESSIONS_PREFIX in last_user["content"]
+    assert "旧结论：根因是鉴权中间件" in last_user["content"]
+    # 展示层剥离后只剩用户原文
+    assert strip_context_suffix(last_user["content"]) == "参考 @{被引用} 继续排查"
+
