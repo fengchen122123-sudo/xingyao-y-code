@@ -2169,6 +2169,40 @@ class MemoryManager:
             page.reverse()                        # 回到正序
             return self._parse_message_rows(page, with_ids=True), has_more
 
+    def get_session_user_nav_items(self, session_name):
+        """红点导航全量索引：该会话全部 user 消息的 [{id, text}]（正序）。
+
+        仅提取纯文本（多模态 blocks 只拼 text 块），不做后缀剥离/截断——
+        预览清洗在 gui_bridge 层完成（strip_context_suffix 位于高层，
+        memory 不反向依赖）。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
+            row = cursor.fetchone()
+            if row is None:
+                return []
+            session_id = row[0]
+            cursor.execute(
+                "SELECT id, content FROM messages WHERE session_id = ? "
+                "AND role = 'user' ORDER BY id ASC", (session_id,))
+            items = []
+            for msg_id, raw in cursor.fetchall():
+                parsed, ok = _try_parse_json(raw)
+                if ok and isinstance(parsed, list):
+                    texts = [
+                        str(b.get("text") or "")
+                        for b in parsed
+                        if isinstance(b, dict) and b.get("type") == "text"
+                    ]
+                    text = " ".join(t for t in texts if t).strip()
+                elif ok and isinstance(parsed, dict):
+                    text = str(parsed.get("content") or "")
+                else:
+                    text = str(raw or "")
+                items.append({"id": msg_id, "text": text})
+            return items
+
     def get_history_for_llm(self, session_name):
         """获取专门供给大模型的历史，剔除已被总结的段落，并在最前面附带记忆摘要"""
         with self._lock:

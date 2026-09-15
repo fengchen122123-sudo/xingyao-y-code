@@ -10,7 +10,7 @@
       :key="i"
       type="button"
       class="rail-dot"
-      :class="{ active: i === activeIndex }"
+      :class="{ active: i === activeIndex, dim: hasNavIndex && i < loadedFirstIndex }"
       :aria-label="`跳转到第 ${i + 1} 条我的消息`"
       data-test="rail-dot"
       @click="jumpTo(i)"
@@ -32,14 +32,32 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 
 const props = defineProps<{
   /** 滚动容器（#chat-scroll），点击红点时执行 scrollTo */
   getScrollEl: () => HTMLElement | null;
   /** 全部「我发的消息」DOM 元素，顺序与对话流一致 */
   getUserMsgElements: () => HTMLElement[];
+  /** 全量 user 消息索引（分页懒加载下红点仍全量）；缺省回退 DOM 驱动 */
+  navItems?: Array<{ id: number; preview: string }>;
+  /** 已加载消息流首条 _msg_id：索引中小于它的红点为未加载（淡化） */
+  loadedFirstId?: number | null;
 }>();
+
+const emit = defineEmits<{
+  /** 点击未加载区域红点：父组件负责跨页翻页后回调 jumpToLoaded */
+  (e: 'jump', payload: { index: number; id: number }): void;
+}>();
+
+const hasNavIndex = computed(() => Array.isArray(props.navItems) && props.navItems.length > 0);
+// 已加载分界：loadedFirstId 在索引中的位置；null/找不到时不淡化（避免误标）
+const loadedFirstIndex = computed(() => {
+  if (!hasNavIndex.value) return 0;
+  if (props.loadedFirstId == null) return 0;
+  const idx = props.navItems!.findIndex(it => it.id === props.loadedFirstId);
+  return idx >= 0 ? idx : 0;
+});
 
 // 红点数量 = 用户消息条数。用户消息在任何形态下都完整渲染（折叠只收中间
 // 过程），因此点数随消息增加而增加，上下文压缩也不会丢点。
@@ -95,9 +113,14 @@ const dotSize = ref(BASE_DOT_SIZE);
 const slotHeight = ref(BASE_SLOT);
 
 function refresh() {
-  const els = props.getUserMsgElements();
-  msgCount.value = els.length;
-  msgTexts.value = els.map(buildPreview);
+  if (hasNavIndex.value) {
+    msgCount.value = props.navItems!.length;
+    msgTexts.value = props.navItems!.map(it => it.preview);
+  } else {
+    const els = props.getUserMsgElements();
+    msgCount.value = els.length;
+    msgTexts.value = els.map(buildPreview);
+  }
   const scrollEl = props.getScrollEl();
   if (!scrollEl || !msgCount.value) {
     dotSize.value = BASE_DOT_SIZE;
@@ -144,14 +167,14 @@ function updateActive() {
   }
   // 点击跳转后高亮被钉住，updateActive 不覆盖，直到用户手动滚动解除
   if (pinnedIndex >= 0) {
-    activeIndex.value = Math.min(pinnedIndex, els.length - 1);
+    activeIndex.value = Math.min(pinnedIndex, msgCount.value - 1);
     return;
   }
   // 已滚到底部：用户在看最新一条，直接高亮最后一条（中线判定在"看最后
   // 一条"这个最常见场景会错判给上一条——最后一条顶部通常没越过中线）
   const distToBottom = scrollEl.scrollHeight - scrollEl.scrollTop - scrollEl.clientHeight;
   if (distToBottom < 80) {
-    activeIndex.value = els.length - 1;
+    activeIndex.value = (hasNavIndex.value ? loadedFirstIndex.value : 0) + els.length - 1;
     return;
   }
   // 浏览历史中：以视口中线为判定线，顶部已越过中线的最后一条算"正在显示"
@@ -162,20 +185,47 @@ function updateActive() {
     if (els[i].getBoundingClientRect().top <= mid) active = i;
     else break;
   }
-  activeIndex.value = active;
+  activeIndex.value = (hasNavIndex.value ? loadedFirstIndex.value : 0) + active;
 }
 
 function jumpTo(i: number) {
-  const scrollEl = props.getScrollEl();
-  const el = props.getUserMsgElements()[i];
-  if (!scrollEl || !el) return;
   pinnedIndex = i;
   activeIndex.value = i;
+  if (hasNavIndex.value) {
+    const item = props.navItems![i];
+    if (!item) return;
+    if (i >= loadedFirstIndex.value) {
+      scrollToLoadedIndex(i);
+    } else {
+      // 未加载区域：父组件跨页翻页后回调 jumpToLoaded
+      emit('jump', { index: i, id: item.id });
+    }
+    return;
+  }
+  scrollToLocalIndex(i);
+}
+
+/** 已加载（含刚翻页加载到）的红点定位：全局索引换算局部 DOM 索引后 scrollTo */
+function scrollToLoadedIndex(globalIdx: number) {
+  scrollToLocalIndex(globalIdx - (hasNavIndex.value ? loadedFirstIndex.value : 0));
+}
+
+function scrollToLocalIndex(localIdx: number) {
+  const scrollEl = props.getScrollEl();
+  const el = props.getUserMsgElements()[localIdx];
+  if (!scrollEl || !el) return;
   const rect = el.getBoundingClientRect();
   const scrollRect = scrollEl.getBoundingClientRect();
   // 让目标消息滚动到距离滚动容器顶部 16px 的位置（留一点呼吸空间）
   const target = rect.top - scrollRect.top + scrollEl.scrollTop - 16;
   scrollEl.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+}
+
+/** 父组件跨页加载完成后回调：目标已进入已加载范围，执行定位 */
+function jumpToLoaded(globalIdx: number) {
+  pinnedIndex = globalIdx;
+  activeIndex.value = globalIdx;
+  scrollToLoadedIndex(globalIdx);
 }
 
 let resizeObserver: ResizeObserver | undefined;
@@ -208,7 +258,10 @@ onUnmounted(() => {
   boundScrollEl?.removeEventListener('touchmove', unpin);
 });
 
-defineExpose({ refresh });
+// 索引刷新（切会话/回合结束）时重算红点与槽位
+watch(() => props.navItems, () => refresh());
+
+defineExpose({ refresh, jumpToLoaded });
 </script>
 
 <style scoped>
@@ -265,6 +318,10 @@ defineExpose({ refresh });
 .rail-dot:hover::before {
   transform: scale(1.4);
   opacity: 1;
+}
+/* 未加载（历史分页未翻到的区域）：更淡，点击会触发跨页加载 */
+.rail-dot.dim::before {
+  opacity: 0.22;
 }
 
 /* 悬停预览浮层：fixed 定位在红点左侧，约 20 字（20em）一行自动换行，

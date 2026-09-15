@@ -564,6 +564,8 @@ export const useAppStore = defineStore('app', {
 historyHasMore: false,
 historyOldestId: null as number | null,
 historyLoading: false,
+// 红点导航全量索引（user 消息 id+预览，不分页）：MessageNavRail 全量渲染数据源
+navItems: [] as Array<{ id: number; preview: string }>,
     running: false,
     // 当前会话本轮回合开始时间戳（毫秒）："已工作 xx秒"计时用，随会话切换恢复
     turnStartedAt: 0,
@@ -720,6 +722,12 @@ historyLoading: false,
     disclaimerNeedsAccept(state): boolean {
       if (!state.disclaimerRequiredVersion) return false;
       return !isDisclaimerVersionAccepted(state.disclaimerAcceptedVersion, state.disclaimerRequiredVersion);
+    },
+
+    // 已加载消息流中首条带 _msg_id 的消息 id（红点导航已加载/未加载分界）
+    firstLoadedMsgId(state): number | null {
+      const m = (state.messages as any[]).find(x => typeof x?._msg_id === 'number');
+      return m ? (m._msg_id as number) : null;
     },
 
     currentSessionRunning(state): boolean {
@@ -1644,6 +1652,7 @@ historyLoading: false,
         this.messages = pairHistoryToolMessages((init as any).messages || []);
       this.historyHasMore = !!(init as any).history_has_more;
       this.historyOldestId = (init as any).history_oldest_id ?? null;
+      void this.refreshNavIndex();
         // 按回合撤销：启动批量拉取当前会话的检查点状态（重建撤销卡片）
         void this.refreshTurnUndoStates();
         // 批次D：窗口重载/崩溃重建期间终态事件已丢失，后端通过 active_sessions
@@ -2277,6 +2286,7 @@ historyLoading: false,
           this.historyOldestId = res.history_oldest_id ?? null;
           runtime.historyHasMore = this.historyHasMore;
           runtime.historyOldestId = this.historyOldestId;
+          void this.refreshNavIndex();
           // 按回合撤销：切换会话后批量拉取该会话的检查点状态（卡片随会话重建）
           void this.refreshTurnUndoStates();
           this._bindSessionRuntime(sessionName);
@@ -2384,6 +2394,18 @@ historyLoading: false,
       } finally {
         if (this.currentSessionName === sessionAtCall) this.historyLoading = false;
       }
+    },
+
+    // 红点导航全量索引：切会话/回合结束/启动后刷新，供 MessageNavRail 全量渲染
+    async refreshNavIndex() {
+      const api = this._api();
+      if (!api || typeof (api as any).get_session_nav_index !== 'function') return;
+      const sessionAtCall = this.currentSessionName;
+      try {
+        const res = await (api as any).get_session_nav_index(sessionAtCall);
+        if (this.currentSessionName !== sessionAtCall) return; // 竞态丢弃
+        if (res?.ok) this.navItems = res.items || [];
+      } catch { /* 导航索引失败静默，不影响主流程 */ }
     },
 
     async loadFileTreeInBackground(sessionName: string, workdir: string) {
@@ -3531,6 +3553,7 @@ historyLoading: false,
         this.refreshTokenUsage();
         // 对话结束后消息数已变化，刷新侧栏会话列表（否则计数停留在启动快照）
         this.refreshSessions();
+        void this.refreshNavIndex();
         // 非当前窗口执行完成 → 绿点
         this._setSessionStatusDot(eventSession, 'green');
       } else if (type === 'turn_cancelled') {
