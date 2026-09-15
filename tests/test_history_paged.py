@@ -132,3 +132,21 @@ def test_get_history_with_ids_unchanged(mgr):
     assert after == before
     assert len(after) == 120
     assert [m["_msg_id"] for m in after] == ids
+
+
+def test_alignment_extension_exhausted_no_user(mgr):
+    """连续 assistant（无 user）：扩展余量耗尽后按上限截断返回，不死循环。
+
+    60 条纯 assistant，limit=10：本页最旧一条始终非 user，
+    吞并 30 条扩展余量后耗尽停止，返回条数恰好 = limit+30。
+    """
+    for i in range(60):
+        mgr.add_message("spam", "assistant", f"a-{i}")
+
+    limit = 10
+    messages, has_more = mgr.get_history_paged("spam", limit=limit)
+
+    assert len(messages) <= limit + 30
+    assert len(messages) == limit + 30      # 余量全部耗尽
+    assert all(m["role"] == "assistant" for m in messages)
+    assert has_more is True                 # 仍有更早的 20 条

@@ -92,7 +92,7 @@ def test_load_session_messages_sanitizes_assistant_content():
     bridge._memory.add_message("会话A", "assistant", f"回答{MARKER}完毕")
     bridge._memory.add_message("会话A", "user", f"用户原文 {MARKER} 保留")
 
-    msgs = bridge._load_session_messages("会话A")
+    msgs, _, _ = bridge._load_session_messages("会话A")
 
     assert msgs[0]["content"] == "回答完毕"
     # 用户消息不做清理，避免误删用户真实输入
