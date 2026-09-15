@@ -438,11 +438,17 @@ function getUserMsgElements(): HTMLElement[] {
 
 // 新用户消息（发送）→ 强制回底并恢复跟随；其余消息变化仅在跟随模式下跟随
 const userMsgCount = computed(() => store.messages.filter((m) => m.role === 'user').length);
+// flush: 'sync' 是关键：默认异步 flush 下，回调执行时 loadOlderMessages 的
+// finally 已把 historyLoading 复位，守卫形同虚设（真实翻页会吸底，实测复现）。
+// 同步 flush 保证回调看到 prepend 发生那一刻的 loading=true。
+// 双保险：仅当消息流「尾部」出现新 user 消息（= 用户刚发送）才强制吸底；
+// 历史翻页 prepend 只动头部、尾部角色不变，绝不触发。
 watch(userMsgCount, (n, o) => {
-  // 历史翻页 prepend 同样推高 user 计数——加载期间不视为「用户发新消息」，
-  // 否则向上翻历史触发懒加载时会被强制吸回底部（位置补偿也被覆盖）
-  if (n > o && !store.historyLoading) scrollToBottom(true);
-});
+  if (n <= o || store.historyLoading) return;
+  const last = store.messages[store.messages.length - 1] as { role?: string } | undefined;
+  if (last?.role !== 'user') return;
+  scrollToBottom(true);
+}, { flush: 'sync' });
 
 // M32 修复：消息列表 key 不用数组索引（插入/删除时组件局部状态会错挂）。
 // 消息对象没有后端 id，按对象身份分配稳定渲染 key（实现移至 utils/turnGroups，
