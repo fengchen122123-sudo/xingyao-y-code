@@ -25,7 +25,7 @@ import sys
 import threading
 import time
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import config
 from config import GUI_DB_FILE, MY_PERMISSION_MODE
@@ -99,6 +99,10 @@ _DWM_UNSUPPORTED_HRESULTS = frozenset({0x80070057, 0x80004001, 0x80070032})
 
 # MonitorFromPoint 的 dwFlags：找不到时回退到最近的显示器
 _MONITOR_DEFAULTTONEAREST = 2
+
+# 会话历史分页懒加载：切会话/启动只加载最近一页，滚动到顶向前翻页。
+# 回合对齐扩展上限为 limit + 30（见 core.memory.get_history_paged）。
+HISTORY_PAGE_SIZE = 50
 
 
 # _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
@@ -2341,16 +2345,33 @@ class ApiBridge:
             logger.exception("另存图片发生未预期错误")
             return {"ok": False, "msg": "保存失败，请重试"}
 
-    def _load_session_messages(self, session_name: str) -> List[Dict[str, Any]]:
-        """读取会话历史并转成前端气泡结构（与 switch_session 同一套映射）。"""
+    def _load_session_messages(
+        self,
+        session_name: str,
+        before_id: Optional[int] = None,
+        limit: int = HISTORY_PAGE_SIZE,
+    ) -> Tuple[List[Dict[str, Any]], bool, Optional[int]]:
+        """分页读取会话历史并转成前端气泡结构（与 switch_session 同一套映射）。
+
+        返回 (msgs, has_more, oldest_id)：oldest_id 取未过滤的本页最旧 DB 行
+        _msg_id 作为翻页游标（role 过滤会丢 system 等消息，取过滤后首条会漏翻）；
+        会话级 last_error 附加仅首页（before_id=None）执行，翻页页不携带。
+        """
         msgs: List[Dict[str, Any]] = []
+        has_more = False
+        oldest_id: Optional[int] = None
         try:
             # 按回合撤销：消息 → 回合关联（纯界面元数据，Provider 请求不读取）
             try:
                 turn_links = self._memory.load_session_turn_links(session_name)
             except Exception:
                 turn_links = {}
-            for msg in self._memory.get_history_with_ids(session_name):
+            rows, has_more = self._memory.get_history_paged(
+                session_name, before_id=before_id, limit=limit
+            )
+            if rows:
+                oldest_id = rows[0].get("_msg_id")
+            for msg in rows:
                 role = msg.get("role")
                 if role in ("user", "assistant", "tool"):
                     content = msg.get("content") or ""
@@ -2381,35 +2402,62 @@ class ApiBridge:
                         "turn_id": (link or {}).get("turn_id") or "",
                         "position_kind": (link or {}).get("position_kind") or "",
                     })
-            err_info = self._get_session_last_error(session_name)
-            if err_info and err_info.get("message"):
-                err_msg = str(err_info["message"])
-                if msgs and msgs[-1].get("role") == "assistant":
-                    msgs[-1]["error_note"] = err_msg
-                    msgs[-1]["execution_state"] = "error"
-                    if err_info.get("model_name") and not msgs[-1].get("model_name"):
-                        msgs[-1]["model_name"] = err_info["model_name"]
-                elif msgs and msgs[-1].get("role") == "user":
-                    msgs.append({
-                        "role": "assistant",
-                        "content": "",
-                        "reasoning_content": "",
-                        "tool_calls": [],
-                        "execution_state": "error",
-                        "error_note": err_msg,
-                        "model_name": err_info.get("model_name", ""),
-                        "model_id": err_info.get("model_id", ""),
-                        "metrics": None,
-                        "media": [],
-                    })
-                elif not msgs:
-                    msgs.append({
-                        "role": "error",
-                        "content": err_msg,
-                    })
+            if before_id is None:
+                err_info = self._get_session_last_error(session_name)
+                if err_info and err_info.get("message"):
+                    err_msg = str(err_info["message"])
+                    if msgs and msgs[-1].get("role") == "assistant":
+                        msgs[-1]["error_note"] = err_msg
+                        msgs[-1]["execution_state"] = "error"
+                        if err_info.get("model_name") and not msgs[-1].get("model_name"):
+                            msgs[-1]["model_name"] = err_info["model_name"]
+                    elif msgs and msgs[-1].get("role") == "user":
+                        msgs.append({
+                            "role": "assistant",
+                            "content": "",
+                            "reasoning_content": "",
+                            "tool_calls": [],
+                            "execution_state": "error",
+                            "error_note": err_msg,
+                            "model_name": err_info.get("model_name", ""),
+                            "model_id": err_info.get("model_id", ""),
+                            "metrics": None,
+                            "media": [],
+                        })
+                    elif not msgs:
+                        msgs.append({
+                            "role": "error",
+                            "content": err_msg,
+                        })
         except Exception:
             logger.debug("加载会话消息失败", exc_info=True)
-        return msgs
+        return msgs, has_more, oldest_id
+
+    def load_older_messages(self, session_name: str, before_id: Any) -> Dict[str, Any]:
+        """向上翻页加载更早历史（前端滚动到顶触发）。
+
+        返回 {ok, messages, has_more, oldest_id}；before_id 非正数视为已到最早
+        （空页 has_more=False），无法解析或会话不存在视为请求错误（ok=False）。
+        """
+        try:
+            before_id = int(before_id)
+        except (TypeError, ValueError):
+            return {"ok": False, "messages": [], "has_more": False, "oldest_id": None}
+        if before_id <= 0:
+            return {"ok": True, "messages": [], "has_more": False, "oldest_id": None}
+        try:
+            names = {
+                s.get("name")
+                for s in self._memory.get_all_sessions(workdir=None, include_empty=True)
+            }
+        except Exception:
+            names = set()
+        if session_name not in names:
+            return {"ok": False, "messages": [], "has_more": False, "oldest_id": None}
+        msgs, has_more, oldest_id = self._load_session_messages(
+            session_name, before_id=before_id
+        )
+        return {"ok": True, "messages": msgs, "has_more": has_more, "oldest_id": oldest_id}
 
     def get_initial_state(self) -> Dict[str, Any]:
         # 启动诊断：前端能调到本方法，说明 JS→Python 桥已打通。
@@ -2485,6 +2533,7 @@ class ApiBridge:
                 daemon=True,
                 name="gui-skills-loader",
             ).start()
+            initial_msgs, _, _ = self._load_session_messages(self._current_session)
             return {
                 "models": models,
                 "providers": providers,
@@ -2512,7 +2561,7 @@ class ApiBridge:
                 "is_global": is_global,
                 "file_tree": file_tree,
                 "current_session": self._current_session,
-                "messages": self._load_session_messages(self._current_session),
+                "messages": initial_msgs,
                 # M23：当前有活跃回合的会话名列表。窗口重载/崩溃后前端重建时
                 # 据此恢复 running 态或解锁输入框（终态事件已在重载期间丢失）
                 "active_sessions": [
@@ -3102,7 +3151,7 @@ class ApiBridge:
                 if candidate_wdir and candidate_wdir != "GLOBAL" and os.path.isdir(candidate_wdir):
                     candidate_wdir = _resolve_real_path(candidate_wdir)
 
-            msgs = self._load_session_messages(session_name)
+            msgs, _, _ = self._load_session_messages(session_name)  # t3 接入分页元信息
 
             self._recalc_token_usage(session_name)
             # 切换会话后把该会话绑定的模型信息一并返回给前端，
