@@ -188,3 +188,33 @@ it('浏览器 anchoring 未生效时兜底补偿内容增量', async () => {
   await vi.waitFor(() => expect(el.scrollTop).toBe(810)); // 10 + 800 兜底补偿
   wrapper.unmount();
 });
+
+it('真实翻页流程（loading 在 finally 复位）不得触发吸底——时序漏洞复现', async () => {
+  const { store, wrapper, el } = mountWithHistory();
+  setMetrics(el, { scrollTop: 10, scrollHeight: 2000 });
+  el.dispatchEvent(new Event('scroll'));
+  await nextTick();
+
+  // 真实 loadOlderMessages 流程：内部会把 loading 置位、prepend、finally 复位。
+  // Vue watcher 异步 flush，回调执行时 loading 已复位——守卫必须不依赖它也能挡住。
+  (window as any).pywebview = {
+    api: {
+      load_older_messages: vi.fn().mockResolvedValue({
+        ok: true,
+        messages: [
+          { role: 'user', content: '更早的提问' },
+          { role: 'assistant', content: '更早的回复' },
+        ],
+        has_more: true,
+        oldest_id: 5,
+      }),
+    },
+  };
+  await store.loadOlderMessages();
+  await nextTick();
+  await new Promise(r => setTimeout(r, 80)); // 等 watcher flush + rAF 吸底窗口
+
+  expect(store.historyLoading).toBe(false);
+  expect(el.scrollTop).not.toBe(el.scrollHeight); // 未被强制吸底
+  wrapper.unmount();
+});
