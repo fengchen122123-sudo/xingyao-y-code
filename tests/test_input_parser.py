@@ -239,6 +239,53 @@ def test_at_removal_replaces_only_first_occurrence(tmp_path, monkeypatch):
     assert "正文提到 f.txt 字符" in content
 
 
+def _get_short_path(path):
+    """取 Windows 8.3 短路径；系统禁用短名或非 Windows 时返回 None（调用方 skip）"""
+    if os.name != "nt":
+        return None
+    import ctypes
+    buf = ctypes.create_unicode_buffer(260)
+    if ctypes.windll.kernel32.GetShortPathNameW(str(path), buf, 260) == 0:
+        return None
+    short = buf.value
+    return short if short != str(path) else None
+
+
+def test_short_path_and_explicit_dual_channel_deduped(tmp_path, monkeypatch):
+    """8.3 短路径场景（手机端 upload_file 落盘 %TEMP% 为短路径的机器）：
+    同一图片经文本通道（短路径原样）+ explicit 通道（resolve 为长路径）进入，
+    必须只附加一次，不得出现两段标记文本与两张图片"""
+    monkeypatch.setattr(input_parser, "_is_within_sandbox", lambda p: True)
+    img = tmp_path / "dup_short.jpg"
+    Image.new("RGB", (32, 32), (255, 0, 0)).save(img, "JPEG")
+    short = _get_short_path(img)
+    if not short:
+        pytest.skip("本机未启用 8.3 短文件名")
+
+    content, msgs = parse_user_input(f"看图 @{short}", explicit_paths=[short])
+
+    assert isinstance(content, list)
+    text_part = content[0]["text"]
+    assert text_part.count("[附带图片文件") == 1
+    assert sum(1 for b in content if isinstance(b, dict) and b.get("type") == "image_url") == 1
+
+
+def test_slash_mixed_dual_channel_deduped(tmp_path, monkeypatch):
+    """同一文件以正斜杠（文本通道）与反斜杠（explicit 通道）两种形态进入，
+    必须只附加一次"""
+    monkeypatch.setattr(input_parser, "_is_within_sandbox", lambda p: True)
+    img = tmp_path / "dup_slash.jpg"
+    Image.new("RGB", (32, 32), (0, 255, 0)).save(img, "JPEG")
+    fwd = str(img).replace("\\", "/")
+
+    content, msgs = parse_user_input(f"看图 {fwd}", explicit_paths=[str(img)])
+
+    assert isinstance(content, list)
+    text_part = content[0]["text"]
+    assert text_part.count("[附带图片文件") == 1
+    assert sum(1 for b in content if isinstance(b, dict) and b.get("type") == "image_url") == 1
+
+
 def test_extract_session_refs_basic():
     from core.input_parser import extract_session_refs
     cleaned, refs = extract_session_refs("参考 @{登录bug排查} 的结论继续")

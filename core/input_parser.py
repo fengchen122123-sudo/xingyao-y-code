@@ -239,8 +239,22 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
             extracted_files.append(trimmed)
             text = text.replace(candidate, "", 1).strip()
 
-    # 保序去重
-    extracted_files = list(dict.fromkeys(extracted_files))
+    # 保序去重（按规范化真实路径判重）：同一文件经文本提取与 explicit 双通道
+    # 进入时字符串形态可能不同（8.3 短路径/长路径、正/反斜杠、大小写），
+    # 直接按原始字符串去重会漏判导致同一附件被处理两遍（图片显示成两张）。
+    # 统一用 realpath（展开 8.3 短路径、归一分隔符）+ normcase（Windows 大小写）
+    # 生成判重键，保留首次出现的原始形态用于后续处理与展示。
+    _seen_keys = set()
+    _unique_files = []
+    for _f in extracted_files:
+        try:
+            _key = os.path.normcase(os.path.realpath(_f))
+        except Exception:
+            _key = os.path.normcase(os.path.abspath(_f))
+        if _key not in _seen_keys:
+            _seen_keys.add(_key)
+            _unique_files.append(_f)
+    extracted_files = _unique_files
 
     final_content = []
     text_content = text if text else "请分析附带的文件。"
