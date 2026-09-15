@@ -2385,6 +2385,7 @@ class ApiBridge:
                     link = turn_links.get(msg.get("_msg_id"))
                     msgs.append({
                         "role": role,
+                        "_msg_id": msg.get("_msg_id"),
                         "content": content,
                         "reasoning_content": msg.get("reasoning_content") or "",
                         "tool_calls": msg.get("tool_calls") or [],
@@ -2458,6 +2459,31 @@ class ApiBridge:
             session_name, before_id=before_id
         )
         return {"ok": True, "messages": msgs, "has_more": has_more, "oldest_id": oldest_id}
+
+    # 红点导航预览上限：与前端 MessageNavRail 的悬停截断口径一致
+    _NAV_PREVIEW_MAX = 100
+
+    def get_session_nav_index(self, session_name: str) -> Dict[str, Any]:
+        """红点导航全量索引：该会话全部 user 消息的 {id, preview}（正序、不分页）。
+
+        preview 剥离运行上下文后缀、折叠空白、截断 100 字；纯图片消息给占位。
+        会话不存在/无消息返回空列表（ok=True），前端无差别渲染零红点。
+        """
+        try:
+            raw_items = self._memory.get_session_user_nav_items(session_name)
+            items = []
+            for it in raw_items:
+                text = strip_context_suffix(str(it.get("text") or ""))
+                text = re.sub(r"\s+", " ", text).strip()
+                if not text:
+                    text = "[图片]"
+                if len(text) > self._NAV_PREVIEW_MAX:
+                    text = text[: self._NAV_PREVIEW_MAX] + "…"
+                items.append({"id": it["id"], "preview": text})
+            return {"ok": True, "items": items, "total": len(items)}
+        except Exception as e:
+            logger.exception("get_session_nav_index 失败")
+            return {"ok": False, "items": [], "total": 0, "msg": str(e)}
 
     def get_initial_state(self) -> Dict[str, Any]:
         # 启动诊断：前端能调到本方法，说明 JS→Python 桥已打通。
