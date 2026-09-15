@@ -47,7 +47,7 @@ export function useSuggest(
     suggestIndex.value = 0;
   }
 
-  function fetchFileItems(query: string) {
+  function fetchAtItems(query: string) {
     window.clearTimeout(fileSuggestTimer);
     fileSuggestTimer = window.setTimeout(async () => {
       const api = window.pywebview && window.pywebview.api;
@@ -56,19 +56,41 @@ export function useSuggest(
         return;
       }
       try {
-        const res = await api.search_workspace_files(query, 8);
+        // 会话候选与文件候选并发拉取；接口缺失（旧版桥）时退化为纯文件补全
+        const sessionPromise =
+          typeof api.search_sessions === 'function'
+            ? api.search_sessions(query, 4)
+            : Promise.resolve(null);
+        const [sessionRes, fileRes] = await Promise.all([
+          sessionPromise,
+          api.search_workspace_files(query, 8),
+        ]);
         // M26 修复：异步返回时不仅要校验仍在 file 模式，还要校验 query 未变，
         // 否则旧查询的响应会覆盖新查询的列表（闭包捕获本次 query 比对）
         if (!suggest.value || suggest.value.mode !== 'file') return;
         if (suggest.value.query !== query) return;
-        const files: string[] = (res && res.files) || [];
-        suggestItems.value = files.map(f => ({
-          key: f,
+        const sessionItems: SuggestItem[] = (
+          (sessionRes && sessionRes.sessions) || []
+        ).map(s => ({
+          key: 'session:' + s.name,
+          icon: '💬',
+          label: s.name,
+          desc: `${s.count} 条消息`,
+          // 会话名内禁止出现花括号，插入时剥离
+          apply: '@{' + s.name.replace(/[{}]/g, '') + '}',
+          group: 'session',
+        }));
+        const files: string[] = (fileRes && fileRes.files) || [];
+        const fileItems: SuggestItem[] = files.map(f => ({
+          // key 加 'file:' 前缀，避免与会话项撞 key
+          key: 'file:' + f,
           icon: '📄',
           label: f,
           desc: '',
           apply: '@' + f,
+          group: 'file',
         }));
+        suggestItems.value = [...sessionItems, ...fileItems].slice(0, 8);
         suggestIndex.value = 0;
       } catch {
         suggestItems.value = [];
@@ -99,7 +121,7 @@ export function useSuggest(
     if (am) {
       const query = am[1];
       suggest.value = { mode: 'file', start: pos - query.length - 1, query };
-      fetchFileItems(query);
+      fetchAtItems(query);
       return;
     }
     suggest.value = null;

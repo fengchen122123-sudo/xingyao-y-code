@@ -2,18 +2,22 @@
   <!-- 输入自动补全面板：/ 斜杠命令 与 @ 文件引用共用 -->
   <div v-if="items.length" class="suggest-panel">
     <div class="sg-list">
-      <div
-        v-for="(it, i) in items"
-        :key="it.key"
-        class="sg-item"
-        :class="{ active: i === activeIndex }"
-        @mousedown.prevent="emit('select', it)"
-        @mouseenter="emit('hover', i)"
-      >
-        <span class="sg-icon">{{ it.icon }}</span>
-        <span class="sg-label">{{ it.label }}</span>
-        <span class="sg-desc">{{ it.desc }}</span>
-      </div>
+      <template v-for="(it, i) in items" :key="it.key">
+        <!-- 分组小标题：仅在 group 非空且与相邻前项不同时渲染（斜杠命令无 group 不渲染） -->
+        <div v-if="it.group && (i === 0 || items[i - 1].group !== it.group)" class="sg-group">
+          {{ it.group === 'session' ? '对话' : '文件' }}
+        </div>
+        <div
+          class="sg-item"
+          :class="{ active: i === activeIndex }"
+          @mousedown.prevent="emit('select', it)"
+          @mouseenter="emit('hover', i)"
+        >
+          <span class="sg-icon">{{ it.icon }}</span>
+          <span class="sg-label">{{ it.label }}</span>
+          <span class="sg-desc">{{ it.desc }}</span>
+        </div>
+      </template>
     </div>
     <div class="sg-hint">↑↓ 选择 · Tab / Enter 确认 · Esc 关闭</div>
   </div>
@@ -27,6 +31,8 @@ export interface SuggestItem {
   desc: string;
   // 选中后写回输入框的完整词（含 / 或 @ 前缀）
   apply: string;
+  // 候选分组：@ 面板下区分「对话」与「文件」候选；斜杠命令无此字段
+  group?: 'session' | 'file';
 }
 
 defineProps<{
@@ -100,6 +106,11 @@ const emit = defineEmits<{
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 55%;
+}
+.sg-group {
+  padding: 4px 10px 2px;
+  font-size: 10.5px;
+  color: var(--text-faint);
 }
 .sg-hint {
   /* 固定最底部：flex 布局下不参与列表滚动，始终贴在面板底端 */
