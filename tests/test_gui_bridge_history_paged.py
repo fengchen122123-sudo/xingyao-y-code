@@ -205,3 +205,20 @@ def test_switch_session_recalcs_token_usage_async(monkeypatch):
     assert res["ok"] is True
     assert calls["async"] == ["s"]
     assert calls["sync"] == []
+
+
+def test_switch_session_response_omits_skills_and_skips_scan(monkeypatch):
+    """switch_session 响应不再携带 skills 字段，且不触发全盘技能目录扫描。"""
+    bridge = _switch_ready_bridge()
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *a, **k: {})
+    bridge._async_recalc_token_usage = lambda session: None
+    # 计数桩：覆盖 _switch_ready_bridge 中的空桩，用于断言未被调用
+    calls = []
+    bridge._build_skill_list = lambda: (calls.append(1), [])[1]
+    _seed(bridge._memory, "s", 3)
+
+    res = bridge.switch_session("s")
+
+    assert res["ok"] is True
+    assert "skills" not in res
+    assert calls == []

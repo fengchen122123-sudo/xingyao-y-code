@@ -3222,7 +3222,10 @@ class ApiBridge:
                 # 历史分页元信息：前端据此判断是否还能向前翻页及翻页游标
                 "history_has_more": has_more,
                 "history_oldest_id": oldest_id,
-                "skills": self._build_skill_list(),
+                # 不再随切换响应返回全量 skills 列表：前端 switchSession 不消费
+                # 该字段，而每次切换都全盘扫描技能目录（实测 43 个技能约 34ms）
+                # 纯属浪费；技能列表由 get_initial_state 读取 _skills_cache 提供，
+                # 并由 refresh_skills / toggle_skill / restore_skill 维护更新。
                 "sessions": self.get_sessions(),
                 "active_model_id": str(session_model.get("id") or ""),
                 "active_model_name": str(session_model.get("name") or "未激活模型"),
