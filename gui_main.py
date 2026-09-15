@@ -27,6 +27,15 @@ def _dispatch_browser_worker_argv() -> bool:
 
 
 _dispatch_browser_worker_argv()
+
+# 兜底：安装版是 console=False 的 GUI 子系统程序，本进程没有控制台。第三方库
+# （mcp SDK 经 anyio 启动 stdio MCP 服务器）启动控制台子进程时无处传
+# creationflags，Windows 会弹出可见的控制台窗口；这里尽早统一兜底，且仅在
+# 无控制台时生效（源码调试/CLI 版行为不变）。
+from core.gui_lifecycle import hide_child_console_windows
+
+hide_child_console_windows()
+
 import webview
 from gui_bridge import ApiBridge
 from core.gui_lifecycle import ApplicationLifecycle
