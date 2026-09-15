@@ -90,8 +90,8 @@ def test_session_last_error_and_message_loading():
 
     # 2. 模拟 _load_session_messages 将错误附加到末尾
     class FakeMemory:
-        def get_history_with_ids(self, s):
-            return [{"role": "user", "content": "你好", "_display": {}, "_msg_id": 1}]
+        def get_history_paged(self, s, before_id=None, limit=50):
+            return ([{"role": "user", "content": "你好", "_display": {}, "_msg_id": 1}], False)
         def set_session_last_error(self, *args, **kwargs):
             pass
         def get_session_last_error(self, *args, **kwargs):
@@ -100,7 +100,8 @@ def test_session_last_error_and_message_loading():
     bridge._memory = FakeMemory()
     bridge._media_items_for_frontend = lambda d: []
 
-    msgs = bridge._load_session_messages("s_err")
+    msgs, has_more, oldest_id = bridge._load_session_messages("s_err")
+    assert has_more is False and oldest_id == 1
     assert len(msgs) == 2
     assert msgs[0]["role"] == "user"
     assert msgs[1]["role"] == "assistant"
