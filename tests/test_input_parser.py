@@ -237,3 +237,36 @@ def test_at_removal_replaces_only_first_occurrence(tmp_path, monkeypatch):
     content, msgs = parse_user_input("@f.txt 正文提到 f.txt 字符")
 
     assert "正文提到 f.txt 字符" in content
+
+
+def test_extract_session_refs_basic():
+    from core.input_parser import extract_session_refs
+    cleaned, refs = extract_session_refs("参考 @{登录bug排查} 的结论继续")
+    assert refs == ["登录bug排查"]
+    assert "@{" not in cleaned
+    assert "参考" in cleaned and "的结论继续" in cleaned
+
+
+def test_extract_session_refs_none_and_unclosed():
+    from core.input_parser import extract_session_refs
+    assert extract_session_refs("没有引用") == ("没有引用", [])
+    # 未闭合 / 空内容 / 跨行都不提取
+    assert extract_session_refs("@{没闭合") == ("@{没闭合", [])
+    assert extract_session_refs("@{}") == ("@{}", [])
+    assert extract_session_refs("@{跨\n行}") == ("@{跨\n行}", [])
+
+
+def test_extract_session_refs_dedup_and_multi():
+    from core.input_parser import extract_session_refs
+    cleaned, refs = extract_session_refs("@{甲} 和 @{乙}，再说 @{甲}")
+    assert refs == ["甲", "乙"]
+
+
+def test_extract_session_refs_coexists_with_at_file(tmp_path):
+    from core.input_parser import extract_session_refs
+    f = tmp_path / "config.py"
+    f.write_text("x=1", encoding="utf-8")
+    text = f"@{{我的对话}} 看一下 @{f.name}"
+    cleaned, refs = extract_session_refs(text)
+    assert refs == ["我的对话"]
+    assert f"@{f.name}" in cleaned  # @文件 标记原样保留给 parse_user_input
