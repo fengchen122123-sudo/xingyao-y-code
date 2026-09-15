@@ -15,6 +15,9 @@ DEFAULT_MAX_IMAGE_EDGE = 1536       # 最大边长（像素）
 DEFAULT_IMAGE_QUALITY = 90          # JPEG/WebP 质量
 DEFAULT_MAX_IMAGE_OUTPUT_BYTES = 1024 * 1024  # 压缩后目标上限（字节）
 
+# @{会话名} 引用标记：} 定界，不允许跨行，标题上限 80 字符
+SESSION_REF_PATTERN = re.compile(r"@\{([^}\n]{1,80})\}")
+
 
 @dataclass(frozen=True)
 class CompressedImage:
@@ -359,3 +362,24 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
     else:
         # 如果只有纯文本文件，直接返回字符串
         return text_content, attached_msgs
+
+
+def extract_session_refs(text):
+    """提取文本中的 @{会话名} 引用标记，返回 (清理后的文本, 会话名列表)。
+
+    会话名去重保序；所有 @{...} 标记均从文本中移除。
+    与 @文件 解析互不干扰：文件正则字符集不含 { }。
+    须在 parse_user_input 之前调用。
+    """
+    if not text:
+        return text, []
+    refs = []
+
+    def _sub(m):
+        name = m.group(1).strip()
+        if name and name not in refs:
+            refs.append(name)
+        return ""
+
+    cleaned = SESSION_REF_PATTERN.sub(_sub, text)
+    return cleaned.strip(), refs
