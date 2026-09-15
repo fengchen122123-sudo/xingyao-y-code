@@ -5121,7 +5121,12 @@ class ApiBridge:
                     parsed_content, attached_msgs = user_text, []
                     session_refs = []
                 else:
-                    _, session_refs = extract_session_refs(user_text)
+                    # LAN 回合按全局约束不解析 @{会话名}（prepare_turn_messages
+                    # 咽喉点还有第二道强制置空）；@文件解析仍正常进行。
+                    if turn_source == "local":
+                        _, session_refs = extract_session_refs(user_text)
+                    else:
+                        session_refs = []
                     parsed_content, attached_msgs = parse_user_input(
                         user_text, explicit_paths=attachments, session_id=session_name
                     )
