@@ -56,10 +56,12 @@ export function useSuggest(
         return;
       }
       try {
-        // 会话候选与文件候选并发拉取；接口缺失（旧版桥）时退化为纯文件补全
+        // 会话候选与文件候选并发拉取；接口缺失（旧版桥）时退化为纯文件补全。
+        // search_sessions 必须永不拒绝：桥异常时 pywebview 会 reject，
+        // 若任其传播，Promise.all 整体进 catch 会把可用的文件候选一并清空
         const sessionPromise =
           typeof api.search_sessions === 'function'
-            ? api.search_sessions(query, 4)
+            ? api.search_sessions(query, 4).catch(() => null)
             : Promise.resolve(null);
         const [sessionRes, fileRes] = await Promise.all([
           sessionPromise,
