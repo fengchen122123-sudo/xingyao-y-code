@@ -851,6 +851,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 历史分页游标随会话保存（loading 为瞬态不保存，bind 时强制复位）
       runtime.historyHasMore = this.historyHasMore;
       runtime.historyOldestId = this.historyOldestId;
+      // 导航索引随会话保存：切回时展示该会话自己的红点
+      runtime.navItems = this.navItems;
     },
 
     _captureCurrentRuntime(this: any) {
@@ -875,6 +877,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.historyHasMore = runtime.historyHasMore ?? false;
       this.historyOldestId = runtime.historyOldestId ?? null;
       this.historyLoading = false;
+      // 导航索引随会话切换：目标会话没拉过索引时立即清空，
+      // 否则会显示上一个会话的红点与悬停预览（跨会话串数据）
+      this.navItems = runtime.navItems ?? [];
       this.currentStreamingText = runtime.streamingText;
       this.currentThinkingText = runtime.thinkingText;
       this.running = runtime.running;
@@ -2403,8 +2408,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
       const sessionAtCall = this.currentSessionName;
       try {
         const res = await (api as any).get_session_nav_index(sessionAtCall);
-        if (this.currentSessionName !== sessionAtCall) return; // 竞态丢弃
-        if (res?.ok) this.navItems = res.items || [];
+        if (this.currentSessionName !== sessionAtCall) {
+          // 竞态：为仍可能切回来的会话补写 runtime，避免切回后暂时空档
+          if (res?.ok) this._getSessionRuntime(sessionAtCall).navItems = res.items || [];
+          return;
+        }
+        if (res?.ok) {
+          this.navItems = res.items || [];
+          this._getSessionRuntime(sessionAtCall).navItems = this.navItems;
+        }
       } catch { /* 导航索引失败静默，不影响主流程 */ }
     },
 

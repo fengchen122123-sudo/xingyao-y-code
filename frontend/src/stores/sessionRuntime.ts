@@ -37,6 +37,8 @@ export interface SessionRuntimeState {
   // 会话历史分页游标（懒加载）：随会话保存/恢复；loading 为瞬态不入 runtime
   historyHasMore?: boolean;
   historyOldestId?: number | null;
+  // 红点导航全量索引：随会话保存/恢复，切会话时绝不残留上一个会话的红点
+  navItems?: Array<{ id: number; preview: string }>;
 }
 
 export function createSessionRuntime(): SessionRuntimeState {

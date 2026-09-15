@@ -71,3 +71,50 @@ it('firstLoadedMsgId 返回消息流中首条带 _msg_id 的消息 id', () => {
   store.messages = [{ role: 'user', content: '全无 id' }] as any;
   expect(store.firstLoadedMsgId).toBeNull();
 });
+
+it('导航索引按会话隔离：切到 B 后再切回 A，navItems 不串（截图 bug 复现）', async () => {
+  const store = useAppStore();
+  const api = {
+    switch_session: vi.fn().mockResolvedValue({ messages: [], is_global: true, workdir: 'GLOBAL' }),
+    get_session_nav_index: vi.fn().mockImplementation(async (name: string) => {
+      if (name === 'A') {
+        return { ok: true, items: [{ id: 1, preview: 'A1' }, { id: 2, preview: 'A2' }, { id: 3, preview: 'A3' }], total: 3 };
+      }
+      return { ok: true, items: [{ id: 9, preview: 'B1' }], total: 1 };
+    }),
+  };
+  (window as any).pywebview = { api };
+
+  await store.switchSession('A');
+  await store.refreshNavIndex();
+  expect(store.navItems).toHaveLength(3);
+
+  await store.switchSession('B');
+  await store.refreshNavIndex();
+  expect(store.navItems).toHaveLength(1);
+  expect(store.navItems[0].preview).toBe('B1');
+
+  await store.switchSession('A');
+  // 切换瞬间必须是 A 自己的索引（或空等待刷新），绝不能残留 B 的 1 条
+  expect(store.navItems.every((it: any) => it.preview.startsWith('A'))).toBe(true);
+  await store.refreshNavIndex();
+  expect(store.navItems).toHaveLength(3);
+});
+
+it('切到从未加载索引的会话时 navItems 立即清空（不显示上个会话的红点）', async () => {
+  const store = useAppStore();
+  const api = {
+    switch_session: vi.fn().mockResolvedValue({ messages: [], is_global: true, workdir: 'GLOBAL' }),
+    get_session_nav_index: vi.fn().mockResolvedValue({ ok: true, items: [{ id: 1, preview: 'A1' }], total: 1 }),
+  };
+  (window as any).pywebview = { api };
+  await store.switchSession('A');
+  await store.refreshNavIndex();
+  expect(store.navItems).toHaveLength(1);
+
+  // B 从未拉过索引（api 永不返回也无关，bind 时就该清空）
+  api.get_session_nav_index = vi.fn().mockImplementation(() => new Promise(() => {}));
+  void store.switchSession('B');
+  await Promise.resolve();
+  expect(store.navItems).toHaveLength(0);
+});

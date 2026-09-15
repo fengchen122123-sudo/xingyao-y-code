@@ -161,3 +161,30 @@ it('非翻页场景发送新消息仍然吸底（回归保护）', async () => {
   expect(el.scrollTop).toBe(el.scrollHeight);
   wrapper.unmount();
 });
+
+it('浏览器 anchoring 已保持位置时不再重复补偿（防双重跳位）', async () => {
+  const { store, wrapper, el } = mountWithHistory();
+  setMetrics(el, { scrollTop: 10, scrollHeight: 2000 });
+  vi.spyOn(store, 'loadOlderMessages').mockImplementation(async () => {
+    // 模拟 Chromium scroll anchoring：prepend 后 scrollTop 自动跟随内容增量
+    Object.defineProperty(el, 'scrollHeight', { value: 2800, configurable: true });
+    el.scrollTop = 810; // 10 + 800（浏览器已自动补偿）
+  });
+  el.dispatchEvent(new Event('scroll'));
+  await vi.waitFor(() => expect(el.scrollTop).toBe(810));
+  await new Promise(r => setTimeout(r, 30));
+  expect(el.scrollTop).toBe(810); // 不得被二次补偿成 1610
+  wrapper.unmount();
+});
+
+it('浏览器 anchoring 未生效时兜底补偿内容增量', async () => {
+  const { store, wrapper, el } = mountWithHistory();
+  setMetrics(el, { scrollTop: 10, scrollHeight: 2000 });
+  vi.spyOn(store, 'loadOlderMessages').mockImplementation(async () => {
+    // 只涨内容、不动 scrollTop（anchoring 未生效）
+    Object.defineProperty(el, 'scrollHeight', { value: 2800, configurable: true });
+  });
+  el.dispatchEvent(new Event('scroll'));
+  await vi.waitFor(() => expect(el.scrollTop).toBe(810)); // 10 + 800 兜底补偿
+  wrapper.unmount();
+});
