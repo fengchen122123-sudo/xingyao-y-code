@@ -152,3 +152,56 @@ def test_cursor_no_holes_with_system_messages():
     expected = [r["content"] for r in rows if r["role"] in ("user", "assistant", "tool")]
     got = [m["content"] for m in res2["messages"]] + [m["content"] for m in msgs1]
     assert got == expected
+
+
+# ---------------------------------------------------------------------------
+# Task 3：switch_session / get_initial_state 接入分页元信息 + token 重算异步化
+# ---------------------------------------------------------------------------
+
+
+def _switch_ready_bridge():
+    """供 switch_session 测试的裸实例：内存 MemoryManager + 外部依赖全部打桩。"""
+    bridge = _bare_bridge()
+    bridge._set_current_session = lambda name: setattr(bridge, "_current_session", name)
+    bridge._build_skill_list = lambda: []
+    bridge.get_sessions = lambda: []
+    bridge._effective_permission_mode = lambda session: "confirm"
+    bridge._message_queue_snapshot = lambda session: []
+    bridge.get_active_turn_snapshot = lambda session: None
+    bridge._emit_token_usage = lambda: None
+    bridge.emit_event = lambda kind, data: None
+    return bridge
+
+
+def test_switch_session_response_has_history_pagination_fields(monkeypatch):
+    """switch_session 响应携带 history_has_more/history_oldest_id；120 条会话只回一页。"""
+    bridge = _switch_ready_bridge()
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *a, **k: {})
+    bridge._async_recalc_token_usage = lambda session: None
+    bridge._recalc_token_usage = lambda session: None
+    _seed(bridge._memory, "s", 120)
+
+    res = bridge.switch_session("s")
+
+    assert res["ok"] is True
+    assert res["history_has_more"] is True
+    page_rows, _ = bridge._memory.get_history_paged("s")
+    assert res["history_oldest_id"] == page_rows[0]["_msg_id"]
+    # 只回首页（50 条 + 回合对齐余量 30），不再全量 120 条
+    assert 1 <= len(res["messages"]) <= 80
+
+
+def test_switch_session_recalcs_token_usage_async(monkeypatch):
+    """switch_session 必须走 _async_recalc_token_usage，不得同步阻塞切换。"""
+    bridge = _switch_ready_bridge()
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *a, **k: {})
+    _seed(bridge._memory, "s", 3)
+    calls = {"async": [], "sync": []}
+    bridge._async_recalc_token_usage = lambda session: calls["async"].append(session)
+    bridge._recalc_token_usage = lambda session: calls["sync"].append(session)
+
+    res = bridge.switch_session("s")
+
+    assert res["ok"] is True
+    assert calls["async"] == ["s"]
+    assert calls["sync"] == []

@@ -2533,7 +2533,8 @@ class ApiBridge:
                 daemon=True,
                 name="gui-skills-loader",
             ).start()
-            initial_msgs, _, _ = self._load_session_messages(self._current_session)
+            initial_msgs, init_has_more, init_oldest_id = \
+                self._load_session_messages(self._current_session)
             return {
                 "models": models,
                 "providers": providers,
@@ -2562,6 +2563,9 @@ class ApiBridge:
                 "file_tree": file_tree,
                 "current_session": self._current_session,
                 "messages": initial_msgs,
+                # 历史分页元信息：前端据此判断是否还能向前翻页及翻页游标
+                "history_has_more": init_has_more,
+                "history_oldest_id": init_oldest_id,
                 # M23：当前有活跃回合的会话名列表。窗口重载/崩溃后前端重建时
                 # 据此恢复 running 态或解锁输入框（终态事件已在重载期间丢失）
                 "active_sessions": [
@@ -3151,9 +3155,11 @@ class ApiBridge:
                 if candidate_wdir and candidate_wdir != "GLOBAL" and os.path.isdir(candidate_wdir):
                     candidate_wdir = _resolve_real_path(candidate_wdir)
 
-            msgs, _, _ = self._load_session_messages(session_name)  # t3 接入分页元信息
+            msgs, has_more, oldest_id = self._load_session_messages(session_name)
 
-            self._recalc_token_usage(session_name)
+            # token 重算走异步实现（内部自 try/except，完成后推送
+            # token_usage_updated），SQLite 锁竞争时不再阻塞会话切换
+            self._async_recalc_token_usage(session_name)
             # 切换会话后把该会话绑定的模型信息一并返回给前端，
             # 让状态栏与模型选择器随会话自动恢复，不再互相覆盖
             session_model = get_active_model(session_name) or {}
@@ -3161,6 +3167,9 @@ class ApiBridge:
                 "ok": True,
                 "session_name": session_name,
                 "messages": msgs,
+                # 历史分页元信息：前端据此判断是否还能向前翻页及翻页游标
+                "history_has_more": has_more,
+                "history_oldest_id": oldest_id,
                 "skills": self._build_skill_list(),
                 "sessions": self.get_sessions(),
                 "active_model_id": str(session_model.get("id") or ""),
