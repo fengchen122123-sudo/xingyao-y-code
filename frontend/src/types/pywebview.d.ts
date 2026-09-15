@@ -787,6 +787,7 @@ export interface PyWebViewAPI {
   create_session(title?: string, workdir?: string): Promise<any>;
   create_global_session(title?: string): Promise<any>;
   switch_session(sessionName: string, targetWorkdir?: string): Promise<any>;
+  load_older_messages(sessionName: string, beforeId: number): Promise<any>;
   delete_session(sessionName: string): Promise<any>;
   delete_folder_group(workdir: string): Promise<any>;
   rename_session(oldName: string, newName: string): Promise<any>;
