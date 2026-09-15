@@ -251,4 +251,86 @@ describe('useSuggest', () => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
+
+  it('@ 输入时合并会话与文件候选，会话在前', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({
+      ok: true,
+      sessions: [{ name: '登录bug排查', count: 3, updated_at: '', workdir: '' }],
+    });
+    const searchFiles = vi.fn().mockResolvedValue({ files: ['core/login.py'] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@登录');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggest, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@登录', 3);
+    detectToken();
+    expect(suggest.value?.mode).toBe('file');
+    await vi.advanceTimersByTimeAsync(200);
+    expect(searchSessions).toHaveBeenCalledWith('登录', 4);
+    expect(searchFiles).toHaveBeenCalledWith('登录', 8);
+    // 会话候选在前、文件候选在后
+    expect(suggestItems.value.length).toBe(2);
+    expect(suggestItems.value[0].group).toBe('session');
+    expect(suggestItems.value[0].label).toBe('登录bug排查');
+    expect(suggestItems.value[0].icon).toBe('💬');
+    expect(suggestItems.value[0].desc).toBe('3 条消息');
+    expect(suggestItems.value[1].group).toBe('file');
+    expect(suggestItems.value[1].label).toBe('core/login.py');
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('选中会话项插入 @{会话名} 并剥离花括号', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({
+      ok: true,
+      sessions: [{ name: '我的{怪}对话', count: 5, updated_at: '', workdir: '' }],
+    });
+    const searchFiles = vi.fn().mockResolvedValue({ files: [] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@我的');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@我的', 3);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(suggestItems.value.length).toBe(1);
+    // 会话名内花括号被剥离，产出 @{...} 标记
+    expect(suggestItems.value[0].apply).toBe('@{我的怪对话}');
+    expect(suggestItems.value[0].key).toBe('session:我的{怪}对话');
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('search_sessions 接口缺失时退化为纯文件补全', async () => {
+    vi.useFakeTimers();
+    const searchFiles = vi.fn().mockResolvedValue({ files: ['core/login.py'] });
+    // api 只实现 search_workspace_files，不提供 search_sessions
+    vi.stubGlobal('pywebview', { api: { search_workspace_files: searchFiles } });
+
+    const inputVal = ref('@login');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@login', 6);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+    // 不抛错，仍返回文件项
+    expect(suggestItems.value.map(it => it.apply)).toEqual(['@core/login.py']);
+    expect(suggestItems.value[0].group).toBe('file');
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
 });
