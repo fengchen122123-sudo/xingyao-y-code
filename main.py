@@ -4772,8 +4772,9 @@ def _background_worker():
             task_url = active_info.get("base_url", "")
             task_ctx_win = active_info.get("context_window", 128000)
 
-            from core.input_parser import parse_user_input
+            from core.input_parser import parse_user_input, extract_session_refs
             if is_skill_call:
+                session_refs = []
                 # 提取短 ID 与实际的提问及挂载文件
                 parts = user_input.split(maxsplit=1)
                 skill_name = parts[0][1:]
@@ -4798,12 +4799,18 @@ def _background_worker():
                 # 不受沙盒越界限制），经 parse_user_input 的 explicit_paths 通道
                 # 挂载——不依赖文本内路径提取，含空格路径也不会丢（审查 Important #4）
                 explicit_paths = task_data.get("explicit_paths") or None
+                _, session_refs = extract_session_refs(user_input)
                 parsed_content, attached_msgs = parse_user_input(user_input, explicit_paths=explicit_paths)
                 # 在终端打印挂载的文件提示
                 for msg in attached_msgs:
                     schedule_ui(lambda message=_esc(msg): print_formatted_text(
                         HTML(f"  <ansigreen>{message}</ansigreen>")
                     ))
+                if session_refs:
+                    for name in session_refs:
+                        schedule_ui(lambda n=_esc(name): print_formatted_text(
+                            HTML(f"  <ansigreen>💬 已引用对话: {n}</ansigreen>")
+                        ))
 
             # --- 按回合撤销生命周期重排（规格 9.1）---
             # 先确保会话行、生成全局唯一 turn_id（128 位随机 UUID）并创建
@@ -4861,6 +4868,7 @@ def _background_worker():
                 api_key=task_key,
                 api_base=task_url,
                 compress_threshold=MEMORY_COMPRESS_THRESHOLD,
+                referenced_sessions=session_refs,
             )
 
 
