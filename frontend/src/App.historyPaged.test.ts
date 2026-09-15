@@ -218,3 +218,24 @@ it('真实翻页流程（loading 在 finally 复位）不得触发吸底——�
   expect(el.scrollTop).not.toBe(el.scrollHeight); // 未被强制吸底
   wrapper.unmount();
 });
+
+it('prepend 后异步内容继续撑高（长对话图片/高亮分批渲染）时视口不得回退', async () => {
+  const { store, wrapper, el } = mountWithHistory();
+  const oldHeight = 2000;
+  const oldTop = 10;
+  vi.spyOn(store, 'loadOlderMessages').mockImplementation(async () => {
+    // 第一帧：prepend 完成（DOM 已插入），高度涨到 2600
+    Object.defineProperty(el, 'scrollHeight', { value: 2600, configurable: true });
+    // 随后异步内容（图片解码 / 代码高亮 / 折叠体撑开）继续撑高到 3200
+    window.setTimeout(() => {
+      Object.defineProperty(el, 'scrollHeight', { value: 3200, configurable: true });
+    }, 30);
+  });
+  setMetrics(el, { scrollTop: oldTop, scrollHeight: oldHeight });
+  el.dispatchEvent(new Event('scroll'));
+
+  await new Promise(r => window.setTimeout(r, 150));
+  // 视口应停在等效位置 oldTop + (3200 - 2000) = 1210；停在 610 即为「回退到下面」
+  expect(el.scrollTop).toBe(1210);
+  wrapper.unmount();
+});
