@@ -333,4 +333,29 @@ describe('useSuggest', () => {
     vi.unstubAllGlobals();
     vi.useRealTimers();
   });
+
+  it('search_sessions reject 时仍返回文件项（会话异常静默退化为纯文件）', async () => {
+    vi.useFakeTimers();
+    // 后端桥抛异常时 pywebview 会 reject，而非返回 {ok:false}
+    const searchSessions = vi.fn().mockRejectedValue(new Error('bridge error'));
+    const searchFiles = vi.fn().mockResolvedValue({ files: ['core/login.py', 'README.md'] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@login');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@login', 6);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(searchSessions).toHaveBeenCalledWith('login', 4);
+    // 会话接口异常不应拖垮文件补全：文件候选仍正常出现
+    expect(suggestItems.value.map(it => it.apply)).toEqual(['@core/login.py', '@README.md']);
+    expect(suggestItems.value.every(it => it.group === 'file')).toBe(true);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
 });
