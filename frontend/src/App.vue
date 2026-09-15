@@ -125,6 +125,9 @@
             ref="railRef"
             :get-scroll-el="() => chatScrollRef"
             :get-user-msg-elements="getUserMsgElements"
+            :nav-items="store.navItems"
+            :loaded-first-id="store.firstLoadedMsgId"
+            @jump="onNavJump"
           />
 
           <!-- 回到底部悬浮按钮：用户上滑浏览历史时出现 -->
@@ -406,6 +409,20 @@ async function maybeLoadOlder() {
   await store.loadOlderMessages();
   await nextTick();
   el.scrollTop = el.scrollHeight - oldHeight + oldTop; // 位置补偿
+}
+
+// 红点导航点击未加载区域：连续向前翻页直到目标消息进入列表，再交回 rail 定位。
+// 本地 SQLite 翻页极快，体感为直接跳转；60 页护栏防异常死循环。
+async function onNavJump(payload: { index: number; id: number }) {
+  let guard = 0;
+  while (guard++ < 60) {
+    const first = store.firstLoadedMsgId;
+    if (first !== null && payload.id >= first) break;
+    if (!store.historyHasMore) break;
+    await store.loadOlderMessages();
+  }
+  await nextTick();
+  railRef.value?.jumpToLoaded?.(payload.index);
 }
 
 // 红点导航轨道：每条「我发的消息」对应一个红点，DOM 变化后重算红点数量
