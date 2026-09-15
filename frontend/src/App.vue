@@ -400,17 +400,54 @@ function onChatScroll() {
   handleScroll();
   void maybeLoadOlder();
 }
+// 翻页补偿的最长持续帧数（≈0.5s）：既覆盖图片解码、代码高亮等异步静默撑高，
+// 又不会长时间霸占滚动控制权
+const LOAD_OLDER_MAX_FRAMES = 30;
+
 async function maybeLoadOlder() {
   const el = chatScrollRef.value;
   if (!el || el.scrollTop >= 120) return;
   if (!store.historyHasMore || store.historyLoading) return;
   const oldHeight = el.scrollHeight;
   const oldTop = el.scrollTop;
-  await store.loadOlderMessages();
-  await nextTick();
-  // 绝对定位补偿（幂等）：anchoring 生效时此赋值与浏览器结果一致，不会叠加；
-  // anchoring 失效（如锚点元素被移除）时由它兜底保持视口
-  el.scrollTop = el.scrollHeight - oldHeight + oldTop;
+  // 用户接管检测：校正期间用户若主动滚动就立即让位。触发翻页那一瞬的惯性
+  // 残留（前 80ms 的输入事件）不算接管，否则刚滚到顶就会立刻放弃校正。
+  const startedAt = performance.now();
+  let userTookOver = false;
+  const markUserTookOver = () => {
+    if (performance.now() - startedAt > 80) userTookOver = true;
+  };
+  el.addEventListener('wheel', markUserTookOver, { passive: true });
+  el.addEventListener('touchmove', markUserTookOver, { passive: true });
+  el.addEventListener('keydown', markUserTookOver);
+  try {
+    await store.loadOlderMessages();
+    // 绝对定位补偿（幂等）：anchoring 生效时此赋值与浏览器结果一致，不会叠加；
+    // anchoring 失效（锚点元素被移除、变化幅度超阈值）时由它兜底保持视口。
+    // 关键：长对话的一页旧消息常含图片/代码高亮等异步内容，高度分多批撑开，
+    // 单帧补偿只会停在「第一批」的中间值上，表现为视口相对内容下移（用户反馈的
+    // "懒加载时回退到下面"）。因此按帧反复补偿，直到高度连续两帧不再变化。
+    let lastHeight = -1;
+    let stableFrames = 0;
+    for (let frame = 0; frame < LOAD_OLDER_MAX_FRAMES; frame++) {
+      await nextTick();
+      if (userTookOver || chatScrollRef.value !== el) return;
+      el.scrollTop = el.scrollHeight - oldHeight + oldTop;
+      if (el.scrollHeight === lastHeight) {
+        if (++stableFrames >= 2) return; // 高度连续两帧不变 = 撑高结束
+      } else {
+        stableFrames = 0;
+        lastHeight = el.scrollHeight;
+      }
+      await new Promise<void>((resolve) => {
+        window.requestAnimationFrame(() => resolve());
+      });
+    }
+  } finally {
+    el.removeEventListener('wheel', markUserTookOver);
+    el.removeEventListener('touchmove', markUserTookOver);
+    el.removeEventListener('keydown', markUserTookOver);
+  }
 }
 
 // 红点导航点击未加载区域：连续向前翻页直到目标消息进入列表，再交回 rail 定位。
