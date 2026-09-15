@@ -39,7 +39,7 @@
 **Interfaces:**
 - Produces: `extract_session_refs(text: str) -> tuple[str, list[str]]`，返回（清理后的文本, 去重保序的会话名列表）。Task 4 的 GUI/CLI 发送链路消费它。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/test_input_parser.py` 末尾追加：
 
@@ -77,12 +77,12 @@ def test_extract_session_refs_coexists_with_at_file(tmp_path):
     assert f"@{f.name}" in cleaned  # @文件 标记原样保留给 parse_user_input
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `python -m pytest tests/test_input_parser.py -q -k session_refs`
 Expected: FAIL（`ImportError: cannot import name 'extract_session_refs'`）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `core/input_parser.py` 头部常量区追加：
 
@@ -115,12 +115,12 @@ def extract_session_refs(text):
     return cleaned.strip(), refs
 ```
 
-- [ ] **Step 4: 运行确认通过**
+- [x] **Step 4: 运行确认通过**
 
 Run: `python -m pytest tests/test_input_parser.py -q`
 Expected: PASS（含既有用例不回归）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add core/input_parser.py tests/test_input_parser.py
@@ -143,7 +143,7 @@ git commit -m "feat: add extract_session_refs for @-mention session tokens"
   - `core.agent_service.REF_SESSIONS_PREFIX`（常量，Task 3 剥离逻辑引用）
   - `build_referenced_sessions_block(manager, ref_names, current_session=None) -> str`（无引用返回 `""`）
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/test_agent_service.py` 末尾追加（复用文件内 `_make_manager()`）：
 
@@ -184,12 +184,12 @@ def test_get_session_memory_summary(tmp_path):
     assert mgr.get_session_memory_summary("不存在") == ""
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `python -m pytest tests/test_agent_service.py -q -k "referenced_sessions_block or session_memory_summary"`
 Expected: FAIL（`ImportError` / `AttributeError: 'MemoryManager' object has no attribute 'get_session_memory_summary'`）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `core/memory.py` 在 `get_all_sessions` 附近新增：
 
@@ -309,12 +309,12 @@ def build_referenced_sessions_block(manager, ref_names, current_session=None):
     return "\n\n".join(parts)
 ```
 
-- [ ] **Step 4: 运行确认通过**
+- [x] **Step 4: 运行确认通过**
 
 Run: `python -m pytest tests/test_agent_service.py -q -k "referenced_sessions_block or session_memory_summary"`
 Expected: PASS
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add core/memory.py core/agent_service.py tests/test_agent_service.py
@@ -333,7 +333,7 @@ git commit -m "feat: build referenced-session digest block with hard caps"
 - Consumes: Task 2 的 `build_referenced_sessions_block`、`REF_SESSIONS_PREFIX`。
 - Produces: `prepare_turn_messages(..., referenced_sessions=None)` 新关键字参数（Task 4 的 GUI/CLI 调用方传入）；后缀顺序固定为 `动态块 → 引用块 → 后台汇总 → 时间注记`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 在 `tests/test_agent_service.py` 末尾追加：
 
@@ -365,12 +365,12 @@ def test_prepare_turn_messages_injects_ref_block():
 
 （注：若 `prepare_turn_messages` 在测试环境因读取配置/模型信息报错，参照本文件既有用例的 monkeypatch 方式补齐最小桩，不改生产代码签名。）
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `python -m pytest tests/test_agent_service.py -q -k "ref_block"`
 Expected: FAIL（`TypeError: prepare_turn_messages() got an unexpected keyword argument 'referenced_sessions'`；strip 用例因前缀未登记而失败）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `strip_context_suffix`（agent_service.py:335）的 while 循环中，在「后台汇总块」分支与「动态运行上下文块」分支之间插入：
 
@@ -427,12 +427,12 @@ def _append_context_suffix_to_last_user(
     )
 ```
 
-- [ ] **Step 4: 运行确认通过**
+- [x] **Step 4: 运行确认通过**
 
 Run: `python -m pytest tests/test_agent_service.py -q`
 Expected: PASS（含既有用例不回归）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add core/agent_service.py tests/test_agent_service.py
@@ -452,7 +452,7 @@ git commit -m "feat: inject referenced-session block into turn context suffix"
 - Consumes: Task 1 `extract_session_refs`；Task 3 `prepare_turn_messages(referenced_sessions=...)`。
 - Produces: `GuiBridge.search_sessions(query: str = "", limit: int = 8) -> {"ok": bool, "sessions": [{"name", "count", "updated_at", "workdir"}]}`（Task 5 前端桥声明与之对应）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 新增 `tests/test_session_mention_bridge.py`：
 
@@ -490,12 +490,12 @@ def test_search_sessions_error_path_returns_empty():
 
 （注：`GuiBridge.__new__` 裸构造的可用属性以 `search_workspace_files` 既有测试的写法为准——参考 `tests/test_workspace_suggest_root.py` 的构造模式，若该文件已有可复用的桥夹具则直接复用。）
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `python -m pytest tests/test_session_mention_bridge.py -q`
 Expected: FAIL（`AttributeError: 'GuiBridge' object has no attribute 'search_sessions'`）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `gui_bridge.py` 在 `search_workspace_files`（:2688）之后新增：
 
@@ -561,12 +561,12 @@ Expected: FAIL（`AttributeError: 'GuiBridge' object has no attribute 'search_se
 
 `main.py` CLI：两处 `parse_user_input` 调用点（:4786、:4801）之前先 `actual_query, session_refs = extract_session_refs(actual_query)`（对应变量名以现场为准），并打印 `💬 已引用对话: ...`（仿 :4802 的 attached_msgs 打印）；`prepare_turn_messages` 调用（:4853 附近）追加 `referenced_sessions=session_refs`。注意 :4776 的 `is_skill_call` 分支与内部回合一样跳过提取（`session_refs = []`）。
 
-- [ ] **Step 4: 运行确认通过**
+- [x] **Step 4: 运行确认通过**
 
 Run: `python -m pytest tests/test_session_mention_bridge.py -q; python -m py_compile gui_bridge.py main.py core/agent_service.py core/input_parser.py`
 Expected: 测试 PASS，编译无输出（退出码 0）
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add gui_bridge.py main.py tests/test_session_mention_bridge.py
@@ -587,7 +587,7 @@ git commit -m "feat: bridge search_sessions and thread refs through GUI/CLI send
 - Consumes: Task 4 的 `GuiBridge.search_sessions`。
 - Produces: `SuggestItem` 新增可选 `group?: 'session' | 'file'`；会话项 `apply` 产出 `@{会话名}`（名内 `{`/`}` 被剥离）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 `useSuggest.test.ts` 既有用例的 `window.pywebview` mock 基础上追加（具体 mock 写法照该文件既有模式）：
 
@@ -608,12 +608,12 @@ it('search_sessions 接口缺失时退化为纯文件补全', async () => {
 });
 ```
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `cd frontend; npm run test -- useSuggest`
 Expected: FAIL（`group` 属性不存在 / 会话项未出现）
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 `pywebview.d.ts` 在 `search_workspace_files` 声明（:882）后追加：
 
@@ -714,12 +714,12 @@ Expected: FAIL（`group` 属性不存在 / 会话项未出现）
 
 （斜杠命令项无 `group` 字段，`i === 0` 时会渲染一个「文件」标题——为避免误标，渲染条件加 `it.group` 非空判断：`<div v-if="it.group && (i === 0 || items[i - 1].group !== it.group)" ...>`。）
 
-- [ ] **Step 4: 运行确认通过**
+- [x] **Step 4: 运行确认通过**
 
 Run: `cd frontend; npm run test; npm run build`
 Expected: vitest 全绿（含既有用例），vue-tsc 类型检查无错、构建成功
 
-- [ ] **Step 5: Commit**
+- [x] **Step 5: Commit**
 
 ```powershell
 git add frontend/src/types/pywebview.d.ts frontend/src/composables/useSuggest.ts frontend/src/components/InputSuggest.vue frontend/src/composables/useSuggest.test.ts
@@ -733,12 +733,12 @@ git commit -m "feat(frontend): session candidates in @ suggest panel"
 **Files:**
 - 无新增/修改（如冒烟发现问题，回到对应 Task 修复）
 
-- [ ] **Step 1: 后端全量测试**
+- [x] **Step 1: 后端全量测试**
 
 Run: `python -m pytest tests/ -q -x`
 Expected: PASS（重点关注 test_input_parser / test_agent_service / test_session_mention_bridge 及 memory 相关用例无回归）
 
-- [ ] **Step 2: 前端全量验证**
+- [x] **Step 2: 前端全量验证**
 
 Run: `cd frontend; npm run test; npm run build`
 Expected: 全绿
@@ -755,7 +755,7 @@ Expected: 全绿
 6. @ 当前会话自身 → 块内标注「是当前会话，已跳过」
 7. CLI（`python main.py`）手动输入 `@{标题}` 同样生效
 
-- [ ] **Step 4: Commit（如有修复）**
+- [x] **Step 4: Commit（如有修复）**
 
 ```powershell
 git add -A
