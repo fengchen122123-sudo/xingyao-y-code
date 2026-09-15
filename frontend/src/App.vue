@@ -85,8 +85,10 @@
              若放进 overflow 滚动的 #chat-scroll 内，position:absolute 会相对
              整个内容区定位，会话一长红点就被推到内容中部、随内容滚出视口 -->
         <div class="chat-viewport">
-          <div ref="chatScrollRef" id="chat-scroll" data-theme-region="workspace" @scroll="handleScroll">
+          <div ref="chatScrollRef" id="chat-scroll" data-theme-region="workspace" @scroll="onChatScroll">
           <div id="chat-body">
+            <!-- 历史分页加载指示：滚动到顶翻页时显示 -->
+            <div v-if="store.historyLoading" class="history-loading" data-test="history-loading">正在加载更早的消息…</div>
             <!-- Kimi 空状态卡片 -->
             <KimiEmptyState v-if="!store.messages || store.messages.length === 0" />
 
@@ -389,6 +391,22 @@ const {
   syncStick,
   showJumpButton,
 } = useChatScroll(() => chatScrollRef.value);
+
+// 历史滚动翻页：滚动近顶部时向前翻一页，加载后按内容增量补偿 scrollTop（视口不跳动）
+function onChatScroll() {
+  handleScroll();
+  void maybeLoadOlder();
+}
+async function maybeLoadOlder() {
+  const el = chatScrollRef.value;
+  if (!el || el.scrollTop >= 120) return;
+  if (!store.historyHasMore || store.historyLoading) return;
+  const oldHeight = el.scrollHeight;
+  const oldTop = el.scrollTop;
+  await store.loadOlderMessages();
+  await nextTick();
+  el.scrollTop = el.scrollHeight - oldHeight + oldTop; // 位置补偿
+}
 
 // 红点导航轨道：每条「我发的消息」对应一个红点，DOM 变化后重算红点数量
 const railRef = ref<InstanceType<typeof MessageNavRail> | null>(null);
@@ -1112,5 +1130,13 @@ onUnmounted(() => {
 }
 .si.tok-red {
   color: var(--red);
+}
+/* 历史分页加载指示：细条、居中、弱化色，与现有轻提示风格一致 */
+.history-loading {
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-faint);
+  padding: 6px 0;
+  user-select: none;
 }
 </style>
