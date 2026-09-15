@@ -1113,3 +1113,47 @@ def test_prepare_turn_messages_injects_ref_block(stub_llm, quiet_extras):
     # 展示层剥离后只剩用户原文
     assert strip_context_suffix(last_user["content"]) == "参考 @{被引用} 继续排查"
 
+
+def test_prepare_turn_messages_lan_never_injects_ref_block(stub_llm, quiet_extras):
+    """LAN 咽喉：turn_source != "local" 时即使显式传入引用列表也强制不注入。"""
+    from core.agent_service import prepare_turn_messages, REF_SESSIONS_PREFIX
+
+    mgr = _make_manager()
+    mgr.ensure_session("被引用")
+    mgr.add_message("被引用", "user", "旧结论：根因是鉴权中间件")
+    mgr.ensure_session("当前会话")
+    mgr.add_message("当前会话", "user", "参考 @{被引用} 继续排查")
+    history = prepare_turn_messages(
+        mgr, "当前会话", "test-model", 128000, permission_mode="full",
+        turn_source="lan", referenced_sessions=["被引用"],
+    )
+    last_user = [m for m in history if m.get("role") == "user"][-1]
+    assert REF_SESSIONS_PREFIX not in last_user["content"]
+    assert "旧结论：根因是鉴权中间件" not in last_user["content"]
+
+
+def test_build_referenced_sessions_block_skips_broken_session(
+    stub_llm, quiet_extras, monkeypatch
+):
+    """单个会话组装异常不得拖垮其余引用：如实标注跳过，正常会话摘要仍保留。"""
+    from core.agent_service import build_referenced_sessions_block
+
+    mgr = _make_manager()
+    mgr.ensure_session("坏会话")
+    mgr.add_message("坏会话", "user", "坏会话内容")
+    mgr.ensure_session("好会话")
+    mgr.add_message("好会话", "user", "好会话关键结论")
+
+    real_get_history = mgr.get_history
+
+    def flaky_get_history(session_name):
+        if session_name == "坏会话":
+            return ["畸形条目"]  # 非 dict 消息会让单会话摘要组装抛异常
+        return real_get_history(session_name)
+
+    monkeypatch.setattr(mgr, "get_history", flaky_get_history)
+
+    block = build_referenced_sessions_block(mgr, ["坏会话", "好会话"], "当前会话")
+    assert "「坏会话」读取失败，已跳过" in block
+    assert "好会话关键结论" in block
+
