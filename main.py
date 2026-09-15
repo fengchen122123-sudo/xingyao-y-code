@@ -4798,9 +4798,18 @@ def _background_worker():
                 # /paste-image 等来源会在队列条目携带显式附件路径（用户明确授权，
                 # 不受沙盒越界限制），经 parse_user_input 的 explicit_paths 通道
                 # 挂载——不依赖文本内路径提取，含空格路径也不会丢（审查 Important #4）
-                explicit_paths = task_data.get("explicit_paths") or None
-                _, session_refs = extract_session_refs(user_input)
-                parsed_content, attached_msgs = parse_user_input(user_input, explicit_paths=explicit_paths)
+                # @{会话名} 提取与 @文件解析同一 try：任一步骤异常都退回纯文本，
+                # 绝不让后台 worker 崩溃（与 GUI 侧解析段的异常兜底对齐）
+                try:
+                    explicit_paths = task_data.get("explicit_paths") or None
+                    _, session_refs = extract_session_refs(user_input)
+                    parsed_content, attached_msgs = parse_user_input(user_input, explicit_paths=explicit_paths)
+                except Exception:
+                    logging.getLogger("py.warnings").exception(
+                        "解析用户输入失败，退回纯文本"
+                    )
+                    session_refs = []
+                    parsed_content, attached_msgs = user_input, []
                 # 在终端打印挂载的文件提示
                 for msg in attached_msgs:
                     schedule_ui(lambda message=_esc(msg): print_formatted_text(

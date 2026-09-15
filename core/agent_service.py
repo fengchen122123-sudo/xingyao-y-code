@@ -582,7 +582,13 @@ def build_referenced_sessions_block(manager, ref_names, current_session=None):
         if info is None:
             skipped.append(f"「{name}」不存在或已删除，已跳过")
             continue
-        digest = _digest_one_session(manager, name, info)
+        try:
+            digest = _digest_one_session(manager, name, info)
+        except Exception:
+            # 单个脏会话（畸形消息/存储异常）不能拖垮全部引用：如实标注后跳过
+            logger.warning("引用会话「%s」摘要组装失败，已跳过", name, exc_info=True)
+            skipped.append(f"「{name}」读取失败，已跳过")
+            continue
         if total + len(digest) > _REF_TOTAL_MAX_CHARS:
             skipped.append(f"「{name}」因总长度超限已省略")
             continue
@@ -971,12 +977,13 @@ def prepare_turn_messages(
     except Exception:
         logger.warning("后台子代理汇总注入失败，已跳过本轮汇总", exc_info=True)
         summary_msg = ""
-    # @ 提及对话：调用方未显式给出引用列表时，本地回合从末条 user 消息兜底
-    # 提取（LAN 入口按全局约束不解析）；显式传入（含空列表）时直接使用。
-    if referenced_sessions is None:
-        referenced_sessions = (
-            _extract_refs_from_last_user(history) if turn_source == "local" else []
-        )
+    # @ 提及对话：LAN 回合（turn_source != "local"）一律强制不解析——无论调用方
+    # 显式传了什么，都按全局约束视为空列表，杜绝 LAN 客户端借 @{会话名} 注入
+    # 其他会话内容；本地回合未显式给出时才从末条 user 消息兜底提取；显式列表照用。
+    if turn_source != "local":
+        referenced_sessions = []
+    elif referenced_sessions is None:
+        referenced_sessions = _extract_refs_from_last_user(history)
     try:
         ref_block = build_referenced_sessions_block(
             manager, referenced_sessions or [], session_name
