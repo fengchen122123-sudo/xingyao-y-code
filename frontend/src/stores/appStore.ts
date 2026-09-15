@@ -560,6 +560,10 @@ export const useAppStore = defineStore('app', {
 
     // 对话消息流
     messages: [] as ChatMessage[],
+// 会话历史分页（懒加载）：当前会话的工作副本，随 _captureRuntime/_bindSessionRuntime 切换保存恢复
+historyHasMore: false,
+historyOldestId: null as number | null,
+historyLoading: false,
     running: false,
     // 当前会话本轮回合开始时间戳（毫秒）："已工作 xx秒"计时用，随会话切换恢复
     turnStartedAt: 0,
@@ -836,6 +840,9 @@ export const useAppStore = defineStore('app', {
       runtime.permMode = this.permissionMode;
       // 本回合用到的技能随会话保存
       runtime.usedSkills = this.usedSkills;
+      // 历史分页游标随会话保存（loading 为瞬态不保存，bind 时强制复位）
+      runtime.historyHasMore = this.historyHasMore;
+      runtime.historyOldestId = this.historyOldestId;
     },
 
     _captureCurrentRuntime(this: any) {
@@ -856,6 +863,10 @@ export const useAppStore = defineStore('app', {
     _bindSessionRuntime(this: any, sessionName = this.currentSessionName) {
       const runtime = this._getSessionRuntime(sessionName);
       this.messages = runtime.messages;
+      // 历史分页游标随会话恢复；loading 为瞬态，切会话强制复位防卡死翻页
+      this.historyHasMore = runtime.historyHasMore ?? false;
+      this.historyOldestId = runtime.historyOldestId ?? null;
+      this.historyLoading = false;
       this.currentStreamingText = runtime.streamingText;
       this.currentThinkingText = runtime.thinkingText;
       this.running = runtime.running;
@@ -1631,6 +1642,8 @@ export const useAppStore = defineStore('app', {
           : '对话';
         // 启动时后端自动恢复最近一次对话：同步消息列表与标题
         this.messages = pairHistoryToolMessages((init as any).messages || []);
+      this.historyHasMore = !!(init as any).history_has_more;
+      this.historyOldestId = (init as any).history_oldest_id ?? null;
         // 按回合撤销：启动批量拉取当前会话的检查点状态（重建撤销卡片）
         void this.refreshTurnUndoStates();
         // 批次D：窗口重载/崩溃重建期间终态事件已丢失，后端通过 active_sessions
@@ -2259,6 +2272,11 @@ export const useAppStore = defineStore('app', {
         if (this.currentSessionName !== sessionName) return;
         if (!runtime.running && runtime.messages.length === 0) {
           runtime.messages = pairHistoryToolMessages(res.messages || []);
+          // 历史分页元信息：后端首页游标写入顶层与 runtime（缓存命中分支靠 bind 恢复）
+          this.historyHasMore = !!res.history_has_more;
+          this.historyOldestId = res.history_oldest_id ?? null;
+          runtime.historyHasMore = this.historyHasMore;
+          runtime.historyOldestId = this.historyOldestId;
           // 按回合撤销：切换会话后批量拉取该会话的检查点状态（卡片随会话重建）
           void this.refreshTurnUndoStates();
           this._bindSessionRuntime(sessionName);
@@ -2340,6 +2358,31 @@ export const useAppStore = defineStore('app', {
       } catch (err) {
         this.connected = false;
         this.notifyChat('切换会话失败: ' + err);
+      }
+    },
+
+    // 历史分页懒加载：滚动到顶触发，向前翻一页并 prepend 到消息流头部。
+    // 守卫（无更多/加载中/无游标/后端不可用）与竞态丢弃（在途切会话）必须保持。
+    async loadOlderMessages() {
+      if (!this.historyHasMore || this.historyLoading || !this.historyOldestId) return;
+      const api = this._api();
+      if (!api || typeof (api as any).load_older_messages !== 'function') return;
+      const sessionAtCall = this.currentSessionName;
+      const oldestAtCall = this.historyOldestId;
+      this.historyLoading = true;
+      try {
+        const res = await (api as any).load_older_messages(sessionAtCall, oldestAtCall);
+        if (this.currentSessionName !== sessionAtCall) return; // 竞态：切会话后丢弃过期响应
+        if (res?.ok) {
+          const older = pairHistoryToolMessages(res.messages || []);
+          this.messages = [...older, ...this.messages];
+          this.historyHasMore = !!res.has_more;
+          this.historyOldestId = res.oldest_id ?? null;
+        }
+      } catch (err) {
+        this.notifyChat('加载更早历史失败: ' + err);
+      } finally {
+        if (this.currentSessionName === sessionAtCall) this.historyLoading = false;
       }
     },
 
