@@ -2750,6 +2750,32 @@ class ApiBridge:
             logger.exception("search_workspace_files 失败")
             return {"ok": False, "msg": str(e), "files": []}
 
+    def search_sessions(self, query: str = "", limit: int = 8) -> Dict[str, Any]:
+        """@ 提及对话自动补全：会话名大小写不敏感子串匹配（排除当前会话）。"""
+        try:
+            if self._memory is None:
+                return {"ok": False, "msg": "后端未就绪", "sessions": []}
+            q = str(query or "").strip().lower()
+            raw = self._memory.get_all_sessions(workdir=None, include_empty=False)
+            items = []
+            for s in raw:
+                name = str(s.get("name") or "")
+                if not name or name == self._current_session:
+                    continue
+                if q and q not in name.lower():
+                    continue
+                items.append({
+                    "name": name,
+                    "count": int(s.get("count") or 0),
+                    "updated_at": str(s.get("updated_at") or ""),
+                    "workdir": str(s.get("workdir") or ""),
+                })
+            items.sort(key=lambda it: it["updated_at"], reverse=True)
+            return {"ok": True, "sessions": items[:max(1, int(limit or 8))]}
+        except Exception as e:
+            logger.exception("search_sessions 失败")
+            return {"ok": False, "msg": str(e), "sessions": []}
+
     def get_workspace_state(self, workdir: str) -> Dict[str, Any]:
         """读取显式项目目录的前端快照，不依赖进程当前工作目录。"""
         try:
@@ -5087,19 +5113,26 @@ class ApiBridge:
 
             # 会话已在模型绑定阶段创建；此处直接解析用户输入并入库。
             try:
-                from core.input_parser import parse_user_input
+                from core.input_parser import parse_user_input, extract_session_refs
                 if internal_kind:
                     # 内部回合（后台汇总/命令总结）：prompt 是系统构造的，不需要
                     # @文件 / 路径挂载；跳过 parse_user_input，避免把日志里的
                     # 盘符路径（如 dist\Y-code-1.2.2.exe）误当成附件挂载
                     parsed_content, attached_msgs = user_text, []
+                    session_refs = []
                 else:
+                    _, session_refs = extract_session_refs(user_text)
                     parsed_content, attached_msgs = parse_user_input(
                         user_text, explicit_paths=attachments, session_id=session_name
                     )
+                    if session_refs:
+                        attached_msgs = list(attached_msgs) + [
+                            f"💬 已引用对话: {name}" for name in session_refs
+                        ]
             except Exception:
                 logger.debug("解析用户输入失败，退回纯文本", exc_info=True)
                 parsed_content, attached_msgs = user_text, []
+                session_refs = []
             # --- 按回合撤销生命周期重排（规格 9.1）---
             # 1) 生成全局唯一不透明 turn_id（完整 128 位随机 UUID，不再嵌会话名）
             turn_id = uuid.uuid4().hex
@@ -5178,6 +5211,7 @@ class ApiBridge:
                 api_base=api_base,
                 is_gui=True,
                 turn_source=turn_source,
+                referenced_sessions=session_refs,
             )
 
             # 按回合撤销检查点已在用户消息落库前创建（undo_ctx）；
