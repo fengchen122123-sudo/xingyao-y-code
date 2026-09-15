@@ -34,6 +34,9 @@ export interface SessionRuntimeState {
   usedSkills?: string[];
   // 当前流式生成瞬时速度（t/s）：切回会话时恢复
   streamingSpeed?: number;
+  // 会话历史分页游标（懒加载）：随会话保存/恢复；loading 为瞬态不入 runtime
+  historyHasMore?: boolean;
+  historyOldestId?: number | null;
 }
 
 export function createSessionRuntime(): SessionRuntimeState {
