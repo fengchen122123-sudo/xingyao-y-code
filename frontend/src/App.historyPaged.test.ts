@@ -1,6 +1,7 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
+import { nextTick } from 'vue';
 
 import App from './App.vue';
 import { useAppStore } from './stores/appStore';
@@ -10,7 +11,7 @@ const stubs = {
   Topbar: true, Sidebar: true, KimiEmptyState: true, TurnGroup: true,
   InputArea: true, RightPanel: true, ConfirmModal: true, UpdateModal: true,
   PermCard: true, ImageLightbox: true, Subpage: true, SettingsPage: true,
-  AppIcon: true, MessageNavRail: true, RemoteDirBrowser: true,
+  AppIcon: true, MessageNavRail: { template: '<div />', methods: { refresh() {}, jumpToLoaded() {} } }, RemoteDirBrowser: true,
 };
 
 /** jsdom 无布局：scrollTop 可直接赋值，scrollHeight 需 defineProperty 模拟 */
@@ -120,5 +121,43 @@ it('historyLoading 时消息流顶部显示加载指示，结束后隐藏', asyn
   store.historyLoading = false;
   await wrapper.vm.$nextTick();
   expect(wrapper.find('[data-test="history-loading"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('翻页 prepend（historyLoading=true）不得强制吸底', async () => {
+  const { store, wrapper, el } = mountWithHistory();
+  // 用户滚到顶部 → stickToBottom=false
+  setMetrics(el, { scrollTop: 0, scrollHeight: 2000 });
+  el.dispatchEvent(new Event('scroll'));
+  await nextTick();
+
+  // 模拟翻页加载中：prepend 一页（user 消息数同步翻倍）
+  store.historyLoading = true;
+  const older = Array.from({ length: 10 }, (_, i) => ({
+    role: i % 2 ? 'assistant' : 'user',
+    content: `更早-${i}`,
+  }));
+  store.messages = [...older, ...store.messages] as any;
+  await nextTick();
+  await new Promise(r => setTimeout(r, 60)); // 等 rAF 合并帧
+
+  // 不得被 force 吸底改写为 scrollHeight
+  expect(el.scrollTop).not.toBe(el.scrollHeight);
+  wrapper.unmount();
+});
+
+it('非翻页场景发送新消息仍然吸底（回归保护）', async () => {
+  const { store, wrapper, el } = mountWithHistory();
+  setMetrics(el, { scrollTop: 500, scrollHeight: 2000 });
+  el.dispatchEvent(new Event('scroll'));
+  await nextTick();
+
+  store.historyLoading = false;
+  store.messages = [...store.messages, { role: 'user', content: '新提问' }] as any;
+  await nextTick();
+  await new Promise(r => setTimeout(r, 60));
+
+  // force 吸底：scrollTop 被改写到底部
+  expect(el.scrollTop).toBe(el.scrollHeight);
   wrapper.unmount();
 });

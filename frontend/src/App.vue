@@ -437,7 +437,9 @@ function getUserMsgElements(): HTMLElement[] {
 // 新用户消息（发送）→ 强制回底并恢复跟随；其余消息变化仅在跟随模式下跟随
 const userMsgCount = computed(() => store.messages.filter((m) => m.role === 'user').length);
 watch(userMsgCount, (n, o) => {
-  if (n > o) scrollToBottom(true);
+  // 历史翻页 prepend 同样推高 user 计数——加载期间不视为「用户发新消息」，
+  // 否则向上翻历史触发懒加载时会被强制吸回底部（位置补偿也被覆盖）
+  if (n > o && !store.historyLoading) scrollToBottom(true);
 });
 
 // M32 修复：消息列表 key 不用数组索引（插入/删除时组件局部状态会错挂）。
@@ -1031,6 +1033,9 @@ onUnmounted(() => {
   flex: 1;
   overflow-y: auto;
   padding: 20px 28px 10px;
+  /* 历史翻页 prepend 的位置补偿由 JS 精确计算（maybeLoadOlder），
+     禁用浏览器 scroll anchoring 防止与手动补偿双重叠加导致位置跳变 */
+  overflow-anchor: none;
 }
 /* 对话内容容器：消息列表的公共父级 */
 #chat-body {
