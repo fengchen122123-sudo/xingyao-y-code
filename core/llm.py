@@ -3458,6 +3458,24 @@ def _flatten_media_content(content_list):
     return " ".join(text_parts)
 
 
+def _requires_single_leading_system(model_name, api_base=""):
+    """neohorse 系列（tokenrhythm 网关）要求 system 消息有且仅有一条、且位于开头：
+    多条或对话中段出现 system 一律 400（"System message must be at the beginning."）。
+    KAIROS 记忆注入会在最后一条 user 前补第二条 system，对此类路由必须在上线路径合并。
+    """
+    return "neohorse" in str(model_name or "").lower()
+
+
+def _merge_system_messages_into_leading(messages):
+    """把所有 system 消息按原顺序合并为开头单条 system，其余消息相对顺序不变。"""
+    systems = [m for m in messages if m.get("role") == "system"]
+    if len(systems) <= 1:
+        return messages
+    merged_content = "\n\n".join(str(m.get("content") or "") for m in systems)
+    rest = [m for m in messages if m.get("role") != "system"]
+    return [{"role": "system", "content": merged_content}] + rest
+
+
 def _strip_media_and_merge(messages, model_name=None, api_base=""):
     """
     1. 视觉输入处理：支持视觉的模型保留最近一条消息中的图片/视频（多模态负载原样透传），
@@ -3578,6 +3596,8 @@ def _strip_media_and_merge(messages, model_name=None, api_base=""):
                 fixed[-1]["content"] = (fixed[-1]["content"] or "") + "\n" + (msg["content"] or "")
             else:
                 fixed.append(msg)
+    if _requires_single_leading_system(model_name, api_base):
+        fixed = _merge_system_messages_into_leading(fixed)
     return fixed, folded_count, keep_media
 
 
@@ -3940,6 +3960,37 @@ def _builtin_default_max_tokens(model_name, api_base=""):
     if "minimax-m2.7" in model:
         return 192000
     return _BUILTIN_DEFAULT_MAX_TOKENS
+
+
+def _model_system_prompt_extra(model_name, api_base="", model_id=None) -> str:
+    """读取模型条目上的可选字段 system_prompt_extra（模型级系统提示扩展，B 方案）。
+
+    只有显式配置了该字段的模型才会拿到非空返回；未配置的模型一律返回空串，
+    调用方据此完全跳过注入，请求字节与既有行为逐字节一致。
+    任何异常（配置损坏、条目缺失等）都静默降级为空串，绝不让扩展字段影响主链路。
+    注意：该字段只用于请求时追加独立 system 消息，不参与稳定前缀构建，
+    build_stable_system_message 的结果与字节金样保持完全不变。
+    """
+    try:
+        from core.model_manager import (
+            get_model_config_by_id,
+            get_model_config_by_litellm_model,
+        )
+
+        config_entry = None
+        if model_id:
+            config_entry = get_model_config_by_id(str(model_id))
+        if not isinstance(config_entry, dict):
+            config_entry = get_model_config_by_litellm_model(model_name, api_base)
+        if not isinstance(config_entry, dict):
+            return ""
+        extra = config_entry.get("system_prompt_extra")
+        if not isinstance(extra, str):
+            return ""
+        # 全空白视为未配置，避免给请求塞入一条纯空白的 system 消息
+        return extra if extra.strip() else ""
+    except Exception:
+        return ""
 
 
 def _provider_request_options(
@@ -4344,6 +4395,111 @@ TOOL_RESULT_EVENT_MAX_CHARS = 4000
 # 模型只输出思考未生成正文时，促升为公开回复的思考预览长度上限（字符数）。
 # 思考原文可能长达数万字，全量展示会把大段内心独白倾倒给用户。
 PROMOTED_REASONING_PREVIEW_CHARS = 600
+
+# 慢步熔断阈值（秒）：单步耗时超过该值且既未产出正文、也未发起工具调用，
+# 判为推理型小模型思考失控/静默空转，先强催促一次、再触发即结束本回合。
+# 阈值取 60s 而非更激进的值：思考型大模型在长上下文中单步思考 30~60s 属正常，
+# 阈值过低会把正常深度思考误判为空转（neohorse-1-9b 实测失控为 46.9s，60s 仍可捕获）。
+SLOW_STEP_ABORT_SECONDS = 60.0
+# 慢步熔断允许的强催促次数上限：达到上限后再次触发直接结束循环、返回已有内容。
+SLOW_STEP_MAX_NUDGES = 1
+
+# ─── D 方案：验证声明检测护栏 ────────────────────────────────────────
+# 触发条件：本回合调用过写入类工具（名称含 write/edit）、却一次命令执行类工具都没
+# 调用（名称含 execute_command/run_command/shell/bash/terminal/exec），而收尾正文却
+# 声称"测试通过/已验证"。此时模型是在口头交付一份从未真实运行过的结论（典型的
+# "谎报验证"），追加一条 user 提醒要求它立刻跑命令并贴出原始输出。
+# 只命中这些强表述：刻意不匹配"已确认/已核对"等弱表述，避免干扰正常收尾。
+VERIFY_CLAIM_MARKERS = (
+    "测试通过",
+    "运行通过",
+    "已通过",
+    "已验证通过",
+    "已验证完成",
+    "跑通了",
+    "全部通过",
+    "all tests passed",
+    "tests passed",
+)
+# 命中否定过滤（评审建议1）：标记前 4 个字符内出现这些词，视为否定/疑问语境，
+# 不算验证声明（例如"没有全部通过""是否已通过""尚未通过"）。
+CLAIM_NEGATION_PREFIXES = ("未", "没", "无", "尚未", "不能", "是否", "并非", "不算")
+# 验证声明护栏允许的提醒次数上限：达到上限后不再介入（避免与模型反复声明打转）。
+VERIFY_CLAIM_MAX_NUDGES = 1
+# 命中时追加的提醒文案（模块级常量便于测试引用，避免文案漂移）。
+VERIFY_CLAIM_NUDGE_TEXT = (
+    "你声称已完成验证，但本回合没有执行任何命令。"
+    "请立即用工具真实运行验证并贴出原始输出；若未验证，请如实说明未验证。"
+)
+# 命令执行类工具名标记：按工具名粗分类，不做精确白名单（新增同类工具自动覆盖）。
+COMMAND_TOOL_NAME_MARKERS = (
+    "execute_command",
+    "run_command",
+    "shell",
+    "bash",
+    "terminal",
+    "exec",
+)
+
+
+def _tool_call_activity_kinds(tool_calls):
+    """按工具名粗分一批工具调用里是否出现写入类/命令执行类工具。
+
+    返回 (used_write_tools, used_command_tools)。纯函数、无副作用：只看名称
+    子串（写入类：write/edit；命令执行类：COMMAND_TOOL_NAME_MARKERS），不解析
+    参数、不看执行结果，因此对既有请求字节与流程零影响。
+    """
+    used_write_tools = False
+    used_command_tools = False
+    for call in tool_calls or ():
+        function = call.get("function") if isinstance(call, dict) else None
+        name = str((function or {}).get("name") or "").lower()
+        if not name:
+            continue
+        if "write" in name or "edit" in name:
+            used_write_tools = True
+        if any(marker in name for marker in COMMAND_TOOL_NAME_MARKERS):
+            used_command_tools = True
+    return used_write_tools, used_command_tools
+
+
+def _claims_verification_without_evidence(
+    final_text, used_write_tools, used_command_tools
+):
+    """收尾正文是否"口头声称已验证、却没有命令执行证据"。
+
+    当且仅当：本回合用过写入类工具、没用过命令执行类工具、且正文命中
+    VERIFY_CLAIM_MARKERS 任一标记时返回 True。文本为空/空白返回 False；
+    只命中强表述（"测试通过/已验证…"），"已确认/已核对"等弱表述刻意不匹配；
+    否定/疑问语境（标记前 4 字内含 CLAIM_NEGATION_PREFIXES）与"通过率"不算命中。
+
+    已知边界（评审记录，属有意的低成本取舍）：本函数只按工具**名称**分类，
+    不检查命令的执行结果，因此模型跑一条无关或失败的命令即可让护栏失效；
+    父回合把验证委托给 run_subagent 时也不算命令证据。护栏只做一次提醒、
+    不做强拦截，故接受该边界。
+    """
+    if not used_write_tools or used_command_tools:
+        return False
+    text = str(final_text or "")
+    if not text.strip():
+        return False
+    lowered = text.lower()
+    for marker in VERIFY_CLAIM_MARKERS:
+        haystack = lowered if marker.isascii() else text
+        needle = marker.lower() if marker.isascii() else marker
+        start = 0
+        while True:
+            idx = haystack.find(needle, start)
+            if idx < 0:
+                break
+            window = text[max(0, idx - 4):idx]
+            following = text[idx + len(marker):idx + len(marker) + 1]
+            # 否定/疑问语境（如"没有全部通过""是否已通过"）与"通过率"这类
+            # 非声明用法不算验证声明。
+            if not any(neg in window for neg in CLAIM_NEGATION_PREFIXES) and following != "率":
+                return True
+            start = idx + 1
+    return False
 
 
 def _tool_result_text(result):
@@ -5060,6 +5216,13 @@ def _chat_with_model_generator(
     # "只思考不产出"时的最终总结重试上限：连续多次欠佳仍尝试补救，
     # 避免长任务中一两轮失败就静默收尾（用户反馈"任务未执行完就结束"）。
     FINAL_SUMMARY_MAX_RETRIES = 2
+    # 慢步熔断已触发的强催促次数（随本轮会话循环生命周期）。
+    slow_step_nudge_count = 0
+    # D 方案：验证声明护栏已触发的提醒次数（随本轮会话循环生命周期）。
+    verify_claim_nudge_count = 0
+    # 本回合是否出现过写入类/命令执行类工具（按工具名累计，只读不写请求）。
+    used_write_tools = False
+    used_command_tools = False
     # 重复工具调用抑制：同一签名成功 2 次后拦截，随本轮会话循环生命周期
     from core.harness.tool_pipeline import RepeatCallGuard
 
@@ -5420,6 +5583,22 @@ def _chat_with_model_generator(
                 request_model_id = str(bound_model.get("id") or "") or None
         except Exception:
             request_model_id = None
+    # 模型级系统提示扩展（system_prompt_extra）：只对显式配置了该字段的模型生效，
+    # 在请求消息最前面插入一条独立 system 消息。必须构造新列表——messages 是调用
+    # 方共享的同一 list，原地 append 会污染调用方与持久化历史；未配置时完全不介入，
+    # 请求字节与既有行为逐字节一致（稳定前缀逻辑因此完全不受影响）。
+    model_system_extra = _model_system_prompt_extra(
+        model_name, api_base, model_id=request_model_id
+    )
+    extra_injected_message = None
+    original_messages = None
+    original_message_ids = frozenset()
+    if model_system_extra:
+        original_messages = messages
+        original_message_ids = frozenset(id(item) for item in messages)
+        extra_injected_message = {"role": "system", "content": model_system_extra}
+        messages = [extra_injected_message] + list(messages)
+        kwargs["messages"] = messages
     kwargs.update(_provider_request_options(
         model_name,
         api_base,
@@ -6167,7 +6346,64 @@ def _chat_with_model_generator(
             current_tool_calls = tool_calls_list
             replay_reasoning_content = assembled_response.reasoning_content
             provider_thinking_blocks = assembled_response.thinking_blocks
-                
+
+            # 慢步熔断（防止推理型小模型思考失控、静默空转、零产出）：
+            # 单步耗时超过 SLOW_STEP_ABORT_SECONDS 且既未产出正文、也未发起工具
+            # 调用时，说明模型在空转烧时间。首次触发先追加一条强催促（要求立即
+            # 输出最终结论、禁止继续自检或复述思考）再进入下一轮；达到上限后再次
+            # 触发则直接结束循环、返回已产出的内容，不再让它继续空转。
+            # 未超过阈值时该分支恒不进入——对既有逻辑与稳定前缀字节零影响。
+            if (
+                duration_s > SLOW_STEP_ABORT_SECONDS
+                and not raw_content_meaningful
+                and not tool_calls_list
+            ):
+                if slow_step_nudge_count < SLOW_STEP_MAX_NUDGES:
+                    slow_step_nudge_count += 1
+                    _notify_event(event_callback, "notice", {
+                        "message": "检测到单步长时间无产出，已要求模型立即收敛输出结论。",
+                    })
+                    slow_step_nudge = {
+                        "role": "user",
+                        "content": (
+                            "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何"
+                            "正文内容，已出现明显的思考空转。请立即停止自检和复述思考过程，"
+                            "直接输出最终结论：任务已完成就给出中文结论，仍需操作就立即"
+                            "调用相应工具。禁止继续只输出思考内容。"
+                        ),
+                    }
+                    # 空的 assistant 消息（content 为 None）不入库也不留内存，只追加
+                    # 强催促；催促使消息同样需要持久化，避免下一轮重建历史时上下文缺失。
+                    messages.append(slow_step_nudge)
+                    pending_persistence.append(("user", slow_step_nudge))
+                    flush_persistence()
+                    # 空转本身无确定性状态变化：计入进展观察（停滞计数 +1）
+                    progress_guard.observe(
+                        _step_progress_observation(None, session_id=parent_session)
+                    )
+                    # Step 状态机要求 STREAMING → ASSISTANT_READY → COMPLETED，
+                    # 此处尚未走常规 mark_assistant_ready 路径，先补迁移再收尾。
+                    if current_step is not None:
+                        current_step.mark_assistant_ready()
+                        if turn + 1 < max_turns:
+                            current_step.complete()
+                    continue
+                # 达到催促上限仍空转：结束循环，返回已产出的内容，避免继续消耗。
+                _notify_event(event_callback, "error", {
+                    "message": "模型连续多步耗时过长且无任何产出，已触发慢步熔断结束本回合。",
+                })
+                if promoted_reasoning and public_content:
+                    yield from _yield_content(public_content)
+                flush_persistence()
+                if current_step is not None:
+                    current_step.mark_assistant_ready()
+                    current_step.complete()
+                if harness_runtime is not None:
+                    harness_runtime.complete()
+                computer_exit_kind = "completed"
+                return
+
+
             message_to_append = {
                 "role": "assistant",
                 "content": public_content or None,
@@ -6294,6 +6530,35 @@ def _chat_with_model_generator(
                     # 内部兜底重试静默进行：底部状态栏已显示"正在干活..."，
                     # 这里不再发 status 通知暴露"模型未生成结论"的内部细节。
                     continue
+                # D 方案：验证声明护栏——模型口头声称"测试通过/已验证"，但本回合
+                # 既用过写入类工具、又完全没执行过命令（无验证证据）时，追加一次
+                # 提醒要求它真实运行并贴出原始输出，避免"看起来有依据"的谎报收尾。
+                # 未命中时该分支恒不进入，对既有请求字节与流程零影响。
+                if (
+                    verify_claim_nudge_count < VERIFY_CLAIM_MAX_NUDGES
+                    and _claims_verification_without_evidence(
+                        public_content, used_write_tools, used_command_tools
+                    )
+                ):
+                    verify_claim_nudge_count += 1
+                    _notify_event(event_callback, "notice", {
+                        "message": "检测到验证声明但本回合未执行任何命令，已要求模型补充真实运行输出。",
+                    })
+                    claim_nudge = {
+                        "role": "user",
+                        "content": VERIFY_CLAIM_NUDGE_TEXT,
+                    }
+                    messages.append(claim_nudge)
+                    # 催促消息同样需要持久化，否则下一轮重建历史时上下文会缺失
+                    pending_persistence.append(("user", claim_nudge))
+                    flush_persistence()
+                    # 催促本身无确定性状态变化：计入进展观察（停滞计数 +1）
+                    progress_guard.observe(
+                        _step_progress_observation(None, session_id=parent_session)
+                    )
+                    if current_step is not None and turn + 1 < max_turns:
+                        current_step.complete()
+                    continue
                 # 计划仍有可执行项时不允许提前收尾：向模型注入续推消息，
                 # 要求继续通过 run_subagent 完成剩余计划项（最多续推 2 次，
                 # 避免模型坚持收尾时与续推消息无限打转）。
@@ -6410,6 +6675,13 @@ def _chat_with_model_generator(
                 continue
 
             tool_activity_seen = True
+            # D 方案：累计本回合的工具类别（写入类/命令执行类），供收尾时的验证
+            # 声明护栏判定；只看本轮已发的 tool_calls，不改动请求或执行流程。
+            step_used_write_tools, step_used_command_tools = _tool_call_activity_kinds(
+                tool_calls_list
+            )
+            used_write_tools = used_write_tools or step_used_write_tools
+            used_command_tools = used_command_tools or step_used_command_tools
             if event_callback is None:
                 app_context.set_task_status('executing')
                 app_context.invalidate_ui()
@@ -6699,6 +6971,17 @@ def _chat_with_model_generator(
             safe_print(HTML(f"<ansiyellow>{_agent_display_name()}暂未完成当前步骤</ansiyellow>"))
         return
     finally:
+        # 注入了 system_prompt_extra 时，messages 是本次请求专用的新列表：循环里
+        # 追加的 assistant/tool 消息仍要按原样回写到调用方共享的原始列表，保持既有
+        # 语义不变（例如非流式 chat_with_model 依赖 messages[-1] 读取最终回复）。
+        # 只回写"新出现的"元素，注入的 system 消息本身绝不写回调用方列表。
+        if original_messages is not None:
+            original_messages.extend(
+                item
+                for item in messages
+                if item is not extra_injected_message
+                and id(item) not in original_message_ids
+            )
         # 电脑操控 run 收尾（Task 10，设计 14.2）：任何 Turn 终态二选一调用
         # complete_run/stop，不留 running 租约；无 run 时是幂等 no-op。
         _finalize_computer_run()

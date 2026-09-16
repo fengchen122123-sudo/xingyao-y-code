@@ -190,6 +190,7 @@ def get_active_model(session_name: str | None = None) -> dict | None:
         "supports_vision": model.get("supports_vision"),
         "supports_function_calling": model.get("supports_function_calling"),
         "computer_protocol": model.get("computer_protocol"),
+        "system_prompt_extra": model.get("system_prompt_extra"),
         "name":            model["name"],
         "protocol":        provider.get("protocol", "openai"),
         "provider_name":   provider["name"],
@@ -385,6 +386,7 @@ def get_secondary_model() -> dict | None:
                     "supports_vision": model.get("supports_vision"),
                     "supports_function_calling": model.get("supports_function_calling"),
                     "computer_protocol": model.get("computer_protocol"),
+                    "system_prompt_extra": model.get("system_prompt_extra"),
                     "name":            model["name"],
                     "protocol":        provider.get("protocol", "openai"),
                     "provider_name":   provider["name"],
@@ -454,10 +456,14 @@ def add_model_to_provider(
     supports_function_calling: bool | None = None,
     computer_protocol: str | None = None,
     max_tokens: int | None = None,
+    system_prompt_extra: str | None = None,
 ) -> str:
     """
     给指定厂商追加一个模型，litellm_model 格式为 {protocol}/{name}。
     返回新模型的 model_id。若当前无激活模型，自动激活该模型。
+
+    system_prompt_extra：模型级系统提示扩展（可选）。None=不落键；""=清除该键；
+    非空=写入，该模型请求时会自动追加这段指令，其他模型完全不受影响。
     """
     name = str(name or "").strip()
     context_window = int(context_window)
@@ -469,6 +475,10 @@ def add_model_to_provider(
         "supports_function_calling", supports_function_calling
     )
     computer_protocol = _normalize_computer_protocol(computer_protocol)
+    # 模型级系统提示扩展：None=保持现状，""=清除键，非空=写入（沿用既有字段风格）
+    normalized_prompt_extra = (
+        None if system_prompt_extra is None else str(system_prompt_extra).strip()
+    )
     _validate_computer_combination(
         supports_vision if type(supports_vision) is bool else False,
         supports_function_calling,
@@ -498,6 +508,10 @@ def add_model_to_provider(
                 # ""（自动）不落键：缺省协议由 capability 按视觉+工具调用元数据判定
                 if computer_protocol:
                     model_entry["computer_protocol"] = computer_protocol
+                if normalized_prompt_extra:
+                    model_entry["system_prompt_extra"] = normalized_prompt_extra
+                elif normalized_prompt_extra == "":
+                    model_entry.pop("system_prompt_extra", None)
                 provider["models"].append(model_entry)
                 break
         # 若当前尚未选择激活任何模型，自动激活新添加的模型
@@ -606,8 +620,12 @@ def update_model(
     supports_vision: bool,
     supports_function_calling: bool | None = None,
     computer_protocol: str | None = None,
+    system_prompt_extra: str | None = None,
 ):
-    """更新单个模型的公开配置字段；新能力字段传 None 表示保留既有值。"""
+    """更新单个模型的公开配置字段；新能力字段传 None 表示保留既有值。
+
+    system_prompt_extra：None=保留既有值，""=清除该键，非空=写入。
+    """
     name = str(name or "").strip()
     context_window = int(context_window)
     if not name:
@@ -618,6 +636,9 @@ def update_model(
         "supports_function_calling", supports_function_calling
     )
     computer_protocol = _normalize_computer_protocol(computer_protocol)
+    normalized_prompt_extra = (
+        None if system_prompt_extra is None else str(system_prompt_extra).strip()
+    )
 
     def _mutate(data):
         provider = next(
@@ -653,6 +674,11 @@ def update_model(
             model.pop("computer_protocol", None)
         elif computer_protocol is not None:
             model["computer_protocol"] = computer_protocol
+        # 模型级系统提示扩展：None=保留既有值，""=清除键，非空=写入
+        if normalized_prompt_extra:
+            model["system_prompt_extra"] = normalized_prompt_extra
+        elif normalized_prompt_extra == "":
+            model.pop("system_prompt_extra", None)
 
     config.update_config(_mutate)
 
@@ -734,6 +760,10 @@ def add_preset_provider_with_models(
                 model_entry["computer_protocol"] = _normalize_computer_protocol(
                     m["computer_protocol"]
                 )
+            if "system_prompt_extra" in m:
+                _preset_prompt_extra = str(m["system_prompt_extra"]).strip()
+                if _preset_prompt_extra:
+                    model_entry["system_prompt_extra"] = _preset_prompt_extra
             _validate_computer_combination(
                 model_entry.get("supports_vision"),
                 model_entry.get("supports_function_calling"),
@@ -865,6 +895,11 @@ def _apply_preset_capability_fields(entry: dict, catalog_model: dict) -> None:
         entry["computer_protocol"] = _normalize_computer_protocol(
             catalog_model["computer_protocol"]
         )
+    # 模型级系统提示扩展（预置护栏）：目录声明了才落键，未声明的模型不受影响。
+    if "system_prompt_extra" in catalog_model:
+        prompt_extra = str(catalog_model["system_prompt_extra"]).strip()
+        if prompt_extra:
+            entry["system_prompt_extra"] = prompt_extra
 
 
 def _refresh_preset_capability_fields(model: dict, catalog_model: dict) -> bool:
@@ -885,6 +920,9 @@ def _refresh_preset_capability_fields(model: dict, catalog_model: dict) -> bool:
             ),
         ),
         ("computer_protocol", _normalize_computer_protocol),
+        # 预置护栏（system_prompt_extra）也按目录刷新到老配置条目；目录未声明的
+        # 模型不会被写这个键，因此其他模型零影响。
+        ("system_prompt_extra", lambda v: str(v).strip()),
     )
     for field, cast in field_updaters:
         if field not in catalog_model:

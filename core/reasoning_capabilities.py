@@ -160,6 +160,13 @@ _register(
     ("kimi-k2.7-code", "minimax-m2.5", "minimax-m2.7"),
     ReasoningCapability("fixed", (), "always_on", "该模型始终开启思考"),
 )
+# neohorse-1-9b（tokenrhythm.studio）：实测为带 reasoning_content 的推理模型，
+# 推理与正文共用 max_tokens 预算，接口未提供关闭/调档参数，故按"始终开启思考"
+# 登记（不注入任何思考参数，GUI 侧只读展示）。
+_register(
+    ("neohorse-1-9b",),
+    ReasoningCapability("fixed", (), "always_on", "该模型始终开启思考"),
+)
 # 阶跃星辰：推理模型始终输出 reasoning，用 reasoning_effort 控制深度（low/medium/high），无 off 开关。
 _register(
     ("step-3.7-flash", "step-router-v1"),
