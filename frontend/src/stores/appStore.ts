@@ -2653,6 +2653,34 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    // 手动重命名会话（侧栏右键菜单入口）。
+    // 成功静默完成：后端撞名会自动加后缀，返回的 sessions 才是最终列表，直接覆盖同步；
+    // 会话名迁移（当前会话/运行态/状态点）主要由后端 session_renamed 事件负责，
+    // 但事件在重连窗口期可能丢失（emit 失败后端也不改判成功），故此处按 res.name 兜底迁移。
+    async renameSession(oldName: string, newName: string) {
+      const target = (newName || '').trim();
+      // 空白名或与原会话名相同视为无改动，不发请求
+      if (!target || target === oldName) return;
+      const api = this._api();
+      if (!api) return;
+      try {
+        const res = await api.rename_session(oldName, target);
+        if (res && res.ok) {
+          if (res.sessions) this.sessionGroups = res.sessions;
+          // 兜底迁移当前会话名：漏掉会导致侧栏高亮消失、后续请求仍用旧名
+          if (res.name && res.name !== oldName && this.currentSessionName === oldName) {
+            this.currentSessionName = res.name;
+            this.currentSessionDisplayName = res.name;
+          }
+        } else {
+          this.notifyModal('会话管理', '重命名失败: ' + (res && res.msg ? res.msg : '未知错误'));
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('会话管理', '重命名失败: ' + err);
+      }
+    },
+
     async openWorkspaceFolder() {
       const api = this._api();
       if (!api) return;

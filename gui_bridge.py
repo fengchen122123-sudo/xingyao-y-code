@@ -3273,7 +3273,24 @@ class ApiBridge:
                 if old_name in self._message_queues:
                     self._message_queues[final_name] = self._message_queues.pop(old_name)
                     self._emit_message_queue_snapshot(final_name)
-            return {"ok": True, "name": final_name, "sessions": self.get_sessions()}
+            # 手动重命名与自动重命名（_rename_session_to_title）共用同一事件负载：
+            # 前端按该负载迁移当前会话名、运行态与分组内条目，避免前端再写一份同步逻辑。
+            # 取列表与推事件都放在保护块内：此时 DB 与授权迁移均已生效，报失败会让前端
+            # 误以为没改名（并且不再刷新列表）；sessions=None 让前端跳过列表覆盖，不清空侧栏
+            try:
+                sessions = self.get_sessions()
+                self.emit_event("session_renamed", {
+                    "old": old_name,
+                    "new": final_name,
+                    # 兼容旧字段名
+                    "old_name": old_name,
+                    "new_name": final_name,
+                    "sessions": sessions,
+                })
+            except Exception:
+                logger.exception("推送 session_renamed 事件失败")
+                sessions = None
+            return {"ok": True, "name": final_name, "sessions": sessions}
         except Exception as e:
             logger.exception("rename_session 失败")
             return {"ok": False, "msg": str(e), "name": old_name}
