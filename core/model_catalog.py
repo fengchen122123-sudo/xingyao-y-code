@@ -188,6 +188,28 @@ PRESET_PROVIDERS = (
             {"name": "glm-5.1", "context_window": 1000000, "supports_vision": False},
         ],
     },
+    {
+        "id": "neohorse",
+        "name": "neoHorse",
+        "base_url": "https://tokenrhythm.studio/v1",
+        "protocol": "openai",
+        "models": [
+            # 预置护栏（实测来源 tmp/neohorse-1-9b-agent-report.md）：该模型是推理型
+            # 小模型且推理与正文共用 max_tokens 预算，遇多约束自检任务会推理失控
+            # （2000 token 烧光、正文为空、单步 46.9s）；加“禁止逐项自检”元指令后
+            # 同题由 0/5 变 5/5、输出 token 2000→223。故作为该模型的默认
+            # system_prompt_extra 下发；其他模型不带该字段，行为与改造前一致。
+            {"name": "neohorse-1-9b", "context_window": 256000,
+             "supports_vision": False, "supports_function_calling": True,
+             "system_prompt_extra": (
+                 "你是执行器：直接给出结果，禁止逐项自检、反复确认或复述思考过程。"
+                 "能用工具就用工具：每一步尽量落到一次工具调用，不要用长段文字描述你打算怎么做。"
+                 "任何验证结论（测试通过、功能正常等）必须附上你实际执行命令的原始输出；"
+                 "没有实际运行就不要声称已通过。"
+                 "最终答复保持简短，先说结论再给必要细节。"
+             )},
+        ],
+    },
 )
 
 
