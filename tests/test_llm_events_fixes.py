@@ -2573,3 +2573,69 @@ def test_protocol_empty_content_marker_is_not_persisted_or_rendered(
     assert persisted_tool_request["content"] is None
     assert persisted_tool_request["tool_calls"][0]["id"] == "read-1"
     assert marker not in str(manager.get_history("session"))
+
+
+# ── neohorse 网关：仅允许一条开头 system 消息（记忆注入兼容性）──
+
+
+def test_neohorse_merges_leading_system_messages():
+    """子代理形态：[system, system(记忆注入), user] 必须合并为一条开头 system。
+
+    neohorse（tokenrhythm 网关）对多条 system 或中段 system 一律 400：
+    "System message must be at the beginning."
+    """
+    import core.llm as llm_mod
+
+    messages = [
+        {"role": "system", "content": "你是子代理。"},
+        {"role": "system", "content": "# Auto Memory\n- 记忆索引"},
+        {"role": "user", "content": "读取文件并总结。"},
+    ]
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/neohorse-1-9b",
+        "https://tokenrhythm.studio/v1",
+    )
+    systems = [m for m in fixed if m["role"] == "system"]
+    assert len(systems) == 1
+    assert fixed[0]["role"] == "system"
+    assert "你是子代理。" in fixed[0]["content"]
+    assert "# Auto Memory" in fixed[0]["content"]
+
+
+def test_neohorse_merges_mid_conversation_system():
+    """主 Agent 长会话形态：对话中间的 system 也必须折叠进开头一条。"""
+    import core.llm as llm_mod
+
+    messages = [
+        {"role": "system", "content": "主提示词"},
+        {"role": "user", "content": "第一问"},
+        {"role": "assistant", "content": "第一答"},
+        {"role": "system", "content": "# Auto Memory 段落"},
+        {"role": "user", "content": "第二问"},
+    ]
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/neohorse-1-9b",
+        "https://tokenrhythm.studio/v1",
+    )
+    assert [m["role"] for m in fixed] == ["system", "user", "assistant", "user"]
+    assert "主提示词" in fixed[0]["content"]
+    assert "# Auto Memory 段落" in fixed[0]["content"]
+
+
+def test_other_providers_keep_separate_system_messages():
+    """非 neohorse 路由行为不变：连续 system 消息保持原样不合并。"""
+    import core.llm as llm_mod
+
+    messages = [
+        {"role": "system", "content": "你是子代理。"},
+        {"role": "system", "content": "# Auto Memory 段落"},
+        {"role": "user", "content": "任务"},
+    ]
+    fixed, _, _ = llm_mod._strip_media_and_merge(
+        messages,
+        "openai/deepseek-flash",
+        "https://api.deepseek.com",
+    )
+    assert [m["role"] for m in fixed] == ["system", "system", "user"]
