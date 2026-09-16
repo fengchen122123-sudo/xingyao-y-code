@@ -1,5 +1,6 @@
 import pytest
 import sqlite3
+import time
 from core.memory import MemoryManager, SessionManager
 
 
@@ -422,3 +423,84 @@ def test_memory_and_db_turn_boundary_agree(tmp_path):
     assert pruned >= 1
     assert len(before) - len(mem) == db_dropped      # 口径必须一致
     assert manager.get_history_for_llm("s_ag") == mem   # 保留的消息逐条相同
+
+
+def _harness_events_index_first_columns(manager):
+    """返回 harness_events 上所有索引的首列名集合。"""
+    cursor = manager.conn.cursor()
+    columns = set()
+    rows = cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='harness_events'"
+    ).fetchall()
+    for (index_name,) in rows:
+        info = cursor.execute(f"PRAGMA index_info({index_name})").fetchall()
+        if info:
+            columns.add(info[0][2])
+    return columns
+
+
+def test_harness_events_foreign_key_columns_are_indexed(tmp_path):
+    """删除会话慢的根因：harness_events 的 step_id / message_id 外键列缺索引。
+
+    缺索引时 SQLite 为每条被删的父行全表扫描 harness_events（ON DELETE
+    CASCADE / SET NULL），实测删除 388 条消息的长会话需要 2.1 秒，补索引后 13 毫秒。
+    """
+    manager = MemoryManager(str(tmp_path / "fk_index.db"))
+
+    columns = _harness_events_index_first_columns(manager)
+
+    assert "turn_id" in columns          # 已有 idx_harness_events_turn_sequence
+    assert "step_id" in columns
+    assert "message_id" in columns
+
+
+def test_delete_session_stays_fast_with_many_harness_events(tmp_path):
+    """长会话删除耗时不得随 harness_events 规模爆炸。
+
+    外键索引缺失时这条链退化成 O(父行数 × harness_events 行数)：本用例规模
+    （300 消息 / 300 step / 40000 事件）实测无索引 823 ms、补索引 127 ms，
+    真实库上 388 条消息的长会话是 2153 ms → 13 ms。
+    """
+    manager = MemoryManager(str(tmp_path / "del_perf.db"))
+    session_name = "长会话"
+    manager.create_session_explicit(session_name, workdir="GLOBAL", source="GUI")
+    cursor = manager.conn.cursor()
+    session_id = cursor.execute(
+        "SELECT id FROM sessions WHERE session_name = ?", (session_name,)
+    ).fetchone()[0]
+
+    # 造一条与真实数据同构的级联链：owner → turn → steps → events，外加 messages
+    cursor.execute(
+        "INSERT INTO harness_owners (owner_id, heartbeat_at_ms) VALUES (?, ?)",
+        ("perf-owner", 0),
+    )
+    cursor.execute(
+        "INSERT INTO harness_turns (turn_id, session_id, owner_id, status, started_at_ms) "
+        "VALUES (?, ?, ?, ?, ?)",
+        ("perf-turn", session_id, "perf-owner", "completed", 0),
+    )
+    cursor.executemany(
+        "INSERT INTO harness_steps (step_id, turn_id, ordinal, status, started_at_ms) "
+        "VALUES (?, ?, ?, ?, ?)",
+        [(f"perf-step-{i}", "perf-turn", i, "completed", 0) for i in range(300)],
+    )
+    cursor.executemany(
+        "INSERT INTO messages (session_id, role, content) VALUES (?, ?, ?)",
+        [(session_id, "user", f"长会话消息 {i}") for i in range(300)],
+    )
+    cursor.executemany(
+        "INSERT INTO harness_events "
+        "(turn_id, step_id, sequence, kind, created_at_ms, message_id) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [
+            ("perf-turn", f"perf-step-{i % 300}", i, "model_request", 0, i % 300 + 1)
+            for i in range(40000)
+        ],
+    )
+    manager.conn.commit()
+
+    started = time.perf_counter()
+    manager.delete_session(session_name)
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.35, f"删除长会话耗时 {elapsed * 1000:.0f} ms，疑似外键索引缺失"

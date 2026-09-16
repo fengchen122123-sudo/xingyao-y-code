@@ -426,6 +426,17 @@ class MemoryManager:
                     "CREATE INDEX IF NOT EXISTS idx_harness_events_turn_sequence "
                     "ON harness_events(turn_id, sequence)"
                 )
+                # 外键列索引：SQLite 执行 ON DELETE CASCADE / SET NULL 时会对子表按外键列
+                # 全表扫描，缺索引时删除会话退化成 O(父行数 × harness_events 行数)。
+                # 实测真实库：388 条消息的长会话删除 2153 ms → 80 ms。
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_harness_events_step_id "
+                    "ON harness_events(step_id)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_harness_events_message_id "
+                    "ON harness_events(message_id)"
+                )
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS deepseek_prompt_generations (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
