@@ -39,6 +39,7 @@ hide_child_console_windows()
 import webview
 from gui_bridge import ApiBridge
 from core.gui_lifecycle import ApplicationLifecycle
+from core.gui_runtime_check import check_webview2_runtime, warn_render_failure
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 
 logger = logging.getLogger("gui_main")
@@ -507,6 +508,14 @@ def main():
         mcp_manager = None
     api = ApiBridge(mcp_manager=mcp_manager)
     _start_preload_thread()
+
+    # 启动前环境体检：Windows GUI 走 pywebview 的 edgechromium 后端，强依赖系统
+    # WebView2 Runtime。该运行时缺失/损坏时 pywebview 的 on_webview_ready 只记一条
+    # 日志就 return——不导航、不弹窗、不回退，而窗口本身已创建，用户只看到一片
+    # 纯色空白（#1a1a18）且毫无线索。这里提前探测并给原生告警（可一键打开官方
+    # 下载页），把"哑巴黑屏"变成可读结论。非 Windows 与已安装两种情况均无副作用。
+    check_webview2_runtime()
+
     url = get_frontend_url()
     gui_theme = _initial_gui_theme()
     url += ("&" if "#" in url else "#") + _build_gui_theme_fragment(gui_theme)
@@ -576,6 +585,11 @@ def main():
                     logger.info("pywebview 桥重新注入成功")
                     return
             logger.error("pywebview 桥重新注入后仍未就绪，前端将提示连接失败")
+            # 原生兜底告警：此刻前端大概率根本没起来（WebView2 初始化失败、
+            # 渲染进程被安全软件拦截等），用户面对的是一片空白窗口。原生弹窗
+            # 不依赖 WebView，黑屏下依然可见，且直接给出日志路径——否则反馈者
+            # 只能提供一张纯色截图（见 2026-09-16 Win10 黑屏反馈）。
+            warn_render_failure(_data_dir() / "logs" / "gui-runtime.log")
 
         threading.Thread(
             target=_watch, daemon=True, name="gui-bridge-watchdog"
@@ -633,6 +647,11 @@ def main():
     try:
         webview.start(debug=_debug_enabled())
         logger.info("webview.start 已返回（窗口/消息循环结束）")
+    except Exception:
+        # 打包版是 console=False 的 GUI 子系统程序，未捕获异常只会让程序
+        # "打开又立刻消失"且无处可看。这里落日志并用原生弹窗告知用户。
+        logger.exception("webview.start 异常退出（GUI 未能启动）")
+        warn_render_failure(_data_dir() / "logs" / "gui-runtime.log")
     finally:
         # 退出收尾固定顺序（Task 16）：回合级 shutdown（含取消/线程 drain）
         # 先于电脑操控运行时统一关闭；异常路径同样经过本 finally。
