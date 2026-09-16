@@ -92,8 +92,22 @@
               class="session-item"
               :class="{ active: s.name === store.currentSessionName, confirming: confirmDeleteName === s.name }"
               @click="onSessionClick(s)"
+              @contextmenu.prevent.stop="openCtxMenu($event, s)"
             >
-              <div class="t">{{ s.display_name || s.name }}</div>
+              <!-- 重命名编辑态：名称位置换成输入框；@click.stop 防止触发会话切换 -->
+              <input
+                v-if="editingName === s.name"
+                :ref="bindRenameInput"
+                v-model="editingValue"
+                class="s-rename-input"
+                data-test="session-rename-input"
+                @click.stop
+                @mousedown.stop
+                @keydown.enter.prevent="commitRename()"
+                @keydown.esc.prevent="cancelRename()"
+                @blur="commitRename()"
+              />
+              <div v-else class="t">{{ s.display_name || s.name }}</div>
               <span
                 v-if="store.sessionStatusDots[s.name]"
                 class="s-dot"
@@ -139,6 +153,20 @@
     </div>
   </div>
 
+  <!-- 会话右键菜单：fixed 浮层，跟随鼠标坐标并做视口边缘收拢 -->
+  <div
+    v-if="ctxMenu.show"
+    ref="ctxMenuEl"
+    class="session-ctx-menu"
+    data-test="session-ctx-menu"
+    :style="{ left: `${ctxMenu.x}px`, top: `${ctxMenu.y}px` }"
+    @contextmenu.prevent
+    @click.stop
+  >
+    <div class="ctx-item" data-test="ctx-rename" @click="startRename()">重命名</div>
+    <div class="ctx-item danger" data-test="ctx-delete" @click="startDeleteFromMenu()">删除</div>
+  </div>
+
   <!-- 移动端侧栏遮罩：侧栏展开时盖住主区，点击收起（桌面端由 CSS 隐藏） -->
   <div
     v-if="!store.sidebarCollapsed"
@@ -172,7 +200,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed } from 'vue';
+import { ref, computed, reactive, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import type { SessionGroup } from '../types/pywebview';
@@ -204,6 +232,117 @@ const remoteBindRefreshing = ref(false);
 // 过期检查定时器：弹窗打开期间每秒检测，过期自动刷新 token
 let remoteBindExpiryTimer: ReturnType<typeof setInterval> | null = null;
 
+// 会话右键菜单：show 为浮层开关，x/y 为鼠标坐标（渲染后按视口边缘收拢）
+const MENU_EDGE = 8;
+const ctxMenu = reactive({ show: false, x: 0, y: 0, name: '', display: '' });
+const ctxMenuEl = ref<HTMLElement | null>(null);
+// 就地重命名态：editingName 为会话名（唯一定位条目），editingValue 为输入框内容
+const editingName = ref('');
+const editingValue = ref('');
+// 进入编辑态时的原始显示名，用于判断"未改动"
+let editingOriginal = '';
+const renameInputEl = ref<HTMLInputElement | null>(null);
+
+function openCtxMenu(e: MouseEvent, s: { name: string; display_name?: string }) {
+  cancelRename();
+  ctxMenu.name = s.name;
+  ctxMenu.display = s.display_name || s.name;
+  ctxMenu.x = e.clientX;
+  ctxMenu.y = e.clientY;
+  ctxMenu.show = true;
+  // 菜单尺寸要等渲染后才知道，故下一帧再收拢到视口内
+  nextTick(clampCtxMenu);
+}
+
+function clampCtxMenu() {
+  const el = ctxMenuEl.value;
+  const width = el ? el.offsetWidth : 0;
+  const height = el ? el.offsetHeight : 0;
+  const maxX = Math.max(MENU_EDGE, window.innerWidth - width - MENU_EDGE);
+  const maxY = Math.max(MENU_EDGE, window.innerHeight - height - MENU_EDGE);
+  ctxMenu.x = Math.min(Math.max(MENU_EDGE, ctxMenu.x), maxX);
+  ctxMenu.y = Math.min(Math.max(MENU_EDGE, ctxMenu.y), maxY);
+}
+
+function closeCtxMenu() {
+  ctxMenu.show = false;
+  ctxMenu.name = '';
+  ctxMenu.display = '';
+}
+
+// 菜单项「重命名」：关菜单、就地进入编辑态，并把输入框聚焦全选
+function startRename() {
+  if (!ctxMenu.name) return;
+  editingName.value = ctxMenu.name;
+  editingValue.value = ctxMenu.display;
+  editingOriginal = ctxMenu.display;
+  closeCtxMenu();
+  nextTick(() => {
+    renameInputEl.value?.focus();
+    renameInputEl.value?.select();
+  });
+}
+
+// 菜单项「删除」：复用现有二次确认流程（进入 confirming 态，仍需点红色确认按钮）
+function startDeleteFromMenu() {
+  const name = ctxMenu.name;
+  cancelRename();
+  closeCtxMenu();
+  if (name) askDelete(name);
+}
+
+// v-for 内若用字符串 ref，Vue 会把值收集成数组；改用函数 ref 拿到唯一输入框
+function bindRenameInput(el: any) {
+  renameInputEl.value = (el as HTMLInputElement) || null;
+}
+
+function cancelRename() {
+  editingName.value = '';
+  editingValue.value = '';
+  editingOriginal = '';
+}
+
+// Enter / 失焦落到同一处：先退出编辑态再发请求，避免后续 blur 重复触发
+function commitRename() {
+  const oldName = editingName.value;
+  if (!oldName) return;
+  const next = editingValue.value.trim();
+  const unchanged = next === editingOriginal;
+  cancelRename();
+  if (!next || unchanged) return;
+  store.renameSession(oldName, next);
+}
+
+// 菜单关闭时机：点击菜单外任意位置（点在菜单内不关，避免抢在 click 之前移除节点）
+function onDocMouseDown(e: MouseEvent) {
+  if (!ctxMenu.show) return;
+  const el = ctxMenuEl.value;
+  if (el && e.target instanceof Node && el.contains(e.target)) return;
+  closeCtxMenu();
+}
+
+function onDocKeyDown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    closeCtxMenu();
+    cancelRename();
+  }
+}
+
+onMounted(() => {
+  // 捕获阶段监听 scroll：侧栏内部滚动也能关闭菜单
+  window.addEventListener('scroll', closeCtxMenu, true);
+  window.addEventListener('resize', closeCtxMenu);
+  document.addEventListener('mousedown', onDocMouseDown);
+  document.addEventListener('keydown', onDocKeyDown);
+});
+
+onUnmounted(() => {
+  window.removeEventListener('scroll', closeCtxMenu, true);
+  window.removeEventListener('resize', closeCtxMenu);
+  document.removeEventListener('mousedown', onDocMouseDown);
+  document.removeEventListener('keydown', onDocKeyDown);
+});
+
 function askDeleteGroup(path: string) {
   confirmDeleteGroupPath.value = path;
 }
@@ -229,6 +368,9 @@ function onSessionClick(s: { name: string; display_name?: string; workdir?: stri
     return;
   }
   confirmDeleteName.value = '';
+  // 切换会话前清理右键菜单与重命名编辑态（两者互斥，且不随会话保留）
+  closeCtxMenu();
+  cancelRename();
   store.closeSubpage();
   store.switchSession(s.name, s.display_name || s.name, s.workdir);
   collapseSidebarIfMobile();
@@ -730,6 +872,47 @@ function getFolderTitle(g: SessionGroup) {
 @keyframes s-confirm-pop {
   from { transform: translateY(-50%) scale(0.85); opacity: 0; }
   to { transform: translateY(-50%) scale(1); opacity: 1; }
+}
+
+/* 就地重命名输入框：占据名称位置，样式与条目文字保持一致 */
+.session-item .s-rename-input {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: inherit;
+  font-family: inherit;
+  padding: 1px 4px;
+  outline: none;
+}
+
+/* 会话右键菜单：fixed 浮层贴在鼠标位置，坐标由内联 style 计算（含视口收拢） */
+.session-ctx-menu {
+  position: fixed;
+  z-index: 3000;
+  min-width: 96px;
+  padding: 4px;
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.35);
+}
+.session-ctx-menu .ctx-item {
+  padding: 6px 10px;
+  border-radius: 5px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.session-ctx-menu .ctx-item:hover {
+  background: var(--bg3);
+}
+.session-ctx-menu .ctx-item.danger:hover {
+  color: var(--red);
+  background: rgba(248, 81, 73, 0.15);
 }
 
 .side-footer {
