@@ -72,7 +72,6 @@
               <div class="export-item" @click="doExport('json')">JSON (.json)</div>
             </div>
           </div>
-          <button class="chip-btn" title="清空当前会话历史" @click="store.clearSessionHistory()">清空</button>
         </div>
 
         <!-- 电脑操控安全条（设计 16.1）：聊天标题栏下方、滚动区外——对话滚动时保持可见；
