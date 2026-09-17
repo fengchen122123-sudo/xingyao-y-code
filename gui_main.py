@@ -57,6 +57,23 @@ def _data_dir() -> Path:
     return Path(os.environ.get("YCODE_DATA_DIR") or (Path.home() / ".ycode"))
 
 
+def _webview_start_options() -> dict:
+    """webview.start 的启动参数。
+
+    private_mode 必须关闭：pywebview 默认 True 时 WebView2 不保留 localStorage，
+    且内置 HTTP 服务退化为随机端口（http.py：``server.port = http_port or
+    _get_random_port()``），每次启动前端 origin 都在变。两者叠加会让所有基于
+    localStorage 的界面偏好（侧栏宽度、输入框高度、会话分组折叠态）重启必丢，
+    表现为"收起的分组重启后又全部展开"。关闭后端口固定为 pywebview 默认值、
+    网站数据落到应用数据目录，偏好才能真正跨重启保持。
+    """
+    return {
+        "debug": _debug_enabled(),
+        "private_mode": False,
+        "storage_path": str(_data_dir() / "webview"),
+    }
+
+
 def _write_instance_info():
     """首个实例落盘自身信息（best-effort，失败不影响启动）。"""
     try:
@@ -645,7 +662,7 @@ def main():
     # 启动 WebView 消息主循环（默认关闭开发者工具，YCODE_GUI_DEBUG=1 时打开）
     logger.info("准备启动 WebView 消息主循环（webview.start）")
     try:
-        webview.start(debug=_debug_enabled())
+        webview.start(**_webview_start_options())
         logger.info("webview.start 已返回（窗口/消息循环结束）")
     except Exception:
         # 打包版是 console=False 的 GUI 子系统程序，未捕获异常只会让程序
