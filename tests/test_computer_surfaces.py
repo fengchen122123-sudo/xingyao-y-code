@@ -4,7 +4,10 @@
 绝不触碰真实窗口、UI Automation、鼠标键盘或截屏。
 """
 
+import sys
 import threading
+import time
+import types
 
 import pytest
 
@@ -409,3 +412,120 @@ def test_semantic_actions_flow_through_controller_and_are_no_progress_exempt():
         assert [entry[1] for entry in backend.execute_calls] == ["list_surfaces"] * 4
     finally:
         service.stop()
+
+
+# ---------------- _ComThread：初始化失败必须立即显式报错 ----------------
+#
+# 缺陷背景：初始化异常逸出 COM 线程后被静默吞掉，start() 白等 10 秒仍不抛错，
+# call() 再把任务投进无人消费的队列、再白等 10 秒，最终对外谎报「调用超时」。
+# 以下测试只注入 sys.modules 里的纯 fake，绝不触碰真实 comtypes / UIA。
+
+# 初始化失败时的最长可接受耗时：远小于旧的 10 秒空等。
+_PROMPT_FAILURE_BUDGET_SECONDS = 2.0
+
+
+def _install_fake_comtypes(monkeypatch):
+    """把纯 fake 的 comtypes 家族塞进 sys.modules，返回 (生命周期记录, 假 UIA 对象)。"""
+    lifecycle = []
+    sentinel_uia = object()
+
+    comtypes = types.ModuleType("comtypes")
+    comtypes.CoInitialize = lambda: lifecycle.append("CoInitialize")
+    comtypes.CoUninitialize = lambda: lifecycle.append("CoUninitialize")
+
+    client = types.ModuleType("comtypes.client")
+    client.GetModule = lambda name: None
+
+    def create_object(clsid, interface=None):
+        return sentinel_uia
+
+    client.CreateObject = create_object
+    comtypes.client = client
+
+    gen = types.ModuleType("comtypes.gen")
+    uia_client = types.ModuleType("comtypes.gen.UIAutomationClient")
+
+    class IUIAutomation:
+        """占位接口类型：仅用于满足 `from ... import IUIAutomation`。"""
+
+    uia_client.IUIAutomation = IUIAutomation
+    gen.UIAutomationClient = uia_client
+    comtypes.gen = gen
+
+    monkeypatch.setitem(sys.modules, "comtypes", comtypes)
+    monkeypatch.setitem(sys.modules, "comtypes.client", client)
+    monkeypatch.setitem(sys.modules, "comtypes.gen", gen)
+    monkeypatch.setitem(sys.modules, "comtypes.gen.UIAutomationClient", uia_client)
+    return lifecycle, sentinel_uia
+
+
+def test_com_thread_start_raises_immediately_when_import_fails(monkeypatch):
+    """comtypes 导入失败：start() 必须立即报真实异常类型，而不是等 10 秒。"""
+    from core.computer.platforms.windows_surfaces import _ComThread
+
+    # sys.modules[name] = None 会让 `import name` 抛 ImportError（纯桩，无真实依赖）。
+    monkeypatch.setitem(sys.modules, "comtypes", None)
+    try:
+        import comtypes  # noqa: F401  仅为取得真实异常类型名
+        expected_type_name = "ImportError"
+    except BaseException as error:  # pragma: no cover - 防御
+        expected_type_name = type(error).__name__
+
+    com = _ComThread()
+    started = time.monotonic()
+    try:
+        with pytest.raises(ComputerControlError) as raised:
+            com.start()
+        elapsed = time.monotonic() - started
+    finally:
+        com.close()
+
+    assert raised.value.code == "computer_surfaces_unavailable"
+    message = str(raised.value)
+    assert expected_type_name in message  # 带真实异常类型，例如 ModuleNotFoundError
+    assert "超时" not in message  # 绝不把初始化失败伪装成调用超时
+    assert elapsed < _PROMPT_FAILURE_BUDGET_SECONDS, (
+        f"初始化失败必须立即返回，实际等待 {elapsed:.2f} 秒"
+    )
+
+
+def test_com_thread_call_fails_immediately_after_init_failure(monkeypatch):
+    """初始化失败后 call() 必须立即失败，不得再空等 10 秒。"""
+    from core.computer.platforms.windows_surfaces import _ComThread
+
+    monkeypatch.setitem(sys.modules, "comtypes", None)
+    com = _ComThread()
+    try:
+        with pytest.raises(ComputerControlError):
+            com.start()
+        executed = []
+        started = time.monotonic()
+        with pytest.raises(ComputerControlError) as raised:
+            com.call(lambda uia: executed.append(uia))
+        elapsed = time.monotonic() - started
+    finally:
+        com.close()
+
+    assert raised.value.code == "computer_surfaces_unavailable"
+    assert "超时" not in str(raised.value)
+    assert executed == []  # 任务根本不应被投递到无人消费的队列
+    assert elapsed < _PROMPT_FAILURE_BUDGET_SECONDS, (
+        f"初始化失败后 call() 必须立即失败，实际等待 {elapsed:.2f} 秒"
+    )
+
+
+def test_com_thread_success_path_and_close_semantics_unchanged(monkeypatch):
+    """正常初始化路径仍可用；call 正常执行、异常透传，close 释放 COM。"""
+    from core.computer.platforms.windows_surfaces import _ComThread
+
+    lifecycle, sentinel_uia = _install_fake_comtypes(monkeypatch)
+    com = _ComThread()
+    com.start()  # 成功路径不得抛错
+    try:
+        assert com.call(lambda uia: uia is sentinel_uia) is True
+        assert com.call(lambda uia: "ok") == "ok"
+        with pytest.raises(ZeroDivisionError):
+            com.call(lambda uia: 1 / 0)
+    finally:
+        com.close()
+    assert lifecycle == ["CoInitialize", "CoUninitialize"]
