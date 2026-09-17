@@ -6,6 +6,8 @@ send_input 等全部底层 seam 的 Win32InputAdapter；pytest 运行期间绝�
 --desktop-observe / --desktop-input 人工探针不在 pytest 中执行。
 """
 
+import logging
+
 import pytest
 
 from core.computer.models import ComputerAction, ComputerControlError, ComputerObservation
@@ -25,7 +27,7 @@ from core.computer.win32_adapter import (
     Win32InputAdapter,
 )
 from core.computer.windows_backend import WindowsComputerBackend, screenshot_to_physical
-from tests.computer_fakes import FakeImage, FakeWin32Adapter
+from tests.computer_fakes import FakeImage, FakeSurfaceLocator, FakeWin32Adapter
 
 
 def _capture_send_input(captured):
@@ -1031,3 +1033,152 @@ def test_adapter_activation_seams_swallow_errors():
     )
     assert adapter.window_from_point(1, 2) == 0
     assert adapter.set_foreground_window(123) is False
+
+
+# ---------------------------------------------------------------------------
+# list_surfaces 解耦：窗口（Win32 快路径）与托盘（UIA 慢路径）不绑成原子动作
+# ---------------------------------------------------------------------------
+
+
+class _SurfaceLocatorStub(FakeSurfaceLocator):
+    """本地 stub：在既有 fake 语义上叠加「某一侧枚举失败」的注入能力。
+
+    继承 tests.computer_fakes.FakeSurfaceLocator 的候选 ref/代数重发语义，只
+    增加 list_windows/list_tray_icons 的异常注入与调用计数；绝不触碰真实窗口、
+    托盘或 UI Automation（也避免改动 tests/computer_fakes.py 的共享契约）。
+    """
+
+    def __init__(self, *, windows=(), tray_icons=(), windows_error=None, tray_error=None):
+        super().__init__(windows=windows, tray_icons=tray_icons)
+        self.windows_error = windows_error
+        self.tray_error = tray_error
+        self.list_windows_calls = 0
+        self.list_tray_calls = 0
+
+    def list_windows(self):
+        self.list_windows_calls += 1
+        if self.windows_error is not None:
+            raise self.windows_error
+        return super().list_windows()
+
+    def list_tray_icons(self):
+        self.list_tray_calls += 1
+        if self.tray_error is not None:
+            raise self.tray_error
+        return super().list_tray_icons()
+
+
+def _surface_backend(locator):
+    """构造注入 stub locator 的桌面 backend 并完成首次观察。"""
+    adapter = FakeWin32Adapter(virtual_rect=(0, 0, 1280, 720))
+    backend = WindowsComputerBackend(
+        image_grab=lambda: FakeImage(1280, 720),
+        win32_adapter=adapter,
+        surface_locator=locator,
+    )
+    backend.observe("run-a")
+    return backend, adapter
+
+
+_WINDOW_SPEC = {"label": "记事本", "bounds": (10, 20, 300, 200)}
+_TRAY_SPEC = {
+    "label": "微信",
+    "bounds": (1180, 680, 24, 24),
+    "operations": ("invoke", "click_point"),
+}
+
+
+def test_list_surfaces_degrades_when_tray_enumeration_times_out(caplog):
+    """托盘（UIA 慢路径）失败只降级为「托盘候选为空」：窗口候选照常产出并可用。"""
+    timeout = ComputerControlError(
+        "computer_surfaces_unavailable", "UI Automation 调用超时"
+    )
+    locator = _SurfaceLocatorStub(
+        windows=[_WINDOW_SPEC], tray_icons=[_TRAY_SPEC], tray_error=timeout
+    )
+    backend, _adapter = _surface_backend(locator)
+    with caplog.at_level(logging.WARNING, logger="core.computer.windows_backend"):
+        backend.execute("run-a", ComputerAction(kind="list_surfaces", target="desktop"))
+    candidates = backend.observe("run-a").surface_candidates
+    assert [candidate["kind"] for candidate in candidates] == ["window"]
+    assert "记事本" in candidates[0]["label"]
+    # 窗口候选仍可驱动 activate_surface（用户能据此把目标窗口调前台）。
+    candidate = candidates[0]
+    backend.execute(
+        "run-a",
+        ComputerAction(
+            kind="activate_surface",
+            target="desktop",
+            surface_ref=candidate["ref"],
+            surface_generation=candidate["surface_generation"],
+        ),
+    )
+    assert locator.activate_calls == [
+        (candidate["ref"], candidate["surface_generation"])
+    ]
+    # 降级必须可诊断：warning 日志带失败原因，不是静默吞错。
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "托盘" in message and "UI Automation 调用超时" in message
+        for message in messages
+    ), messages
+
+
+def test_list_surfaces_degrades_on_unexpected_tray_exception(caplog):
+    """非 ComputerControlError 的托盘异常同样降级，动作不失败。"""
+    locator = _SurfaceLocatorStub(
+        windows=[_WINDOW_SPEC], tray_error=RuntimeError("UIA 元素树读取崩溃")
+    )
+    backend, _adapter = _surface_backend(locator)
+    with caplog.at_level(logging.WARNING, logger="core.computer.windows_backend"):
+        backend.execute("run-a", ComputerAction(kind="list_surfaces", target="desktop"))
+    candidates = backend.observe("run-a").surface_candidates
+    assert [candidate["kind"] for candidate in candidates] == ["window"]
+    assert locator.list_tray_calls == 1
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        "托盘" in message and "UIA 元素树读取崩溃" in message for message in messages
+    ), messages
+
+
+def test_list_surfaces_still_fails_closed_when_window_enumeration_fails():
+    """窗口枚举失败照常抛错（不掩盖真实故障），且不发布任何候选。"""
+    error = ComputerControlError(
+        "computer_surfaces_unavailable", "窗口枚举句柄无效"
+    )
+    locator = _SurfaceLocatorStub(windows_error=error, tray_icons=[_TRAY_SPEC])
+    backend, _adapter = _surface_backend(locator)
+    with pytest.raises(ComputerControlError) as raised:
+        backend.execute("run-a", ComputerAction(kind="list_surfaces", target="desktop"))
+    assert raised.value.code == "computer_surfaces_unavailable"
+    assert raised.value.message == "窗口枚举句柄无效"
+    assert backend._pending_surface_candidates == ()
+    assert backend.observe("run-a").surface_candidates == ()
+
+
+def test_list_surfaces_success_keeps_window_then_tray_order():
+    """成功路径零回归：候选集合与顺序与解耦前完全一致（窗口在前、托盘在后）。"""
+    locator = _SurfaceLocatorStub(
+        windows=[
+            {"label": "记事本", "bounds": (10, 20, 300, 200)},
+            {"label": "浏览器", "bounds": (400, 100, 800, 600)},
+        ],
+        tray_icons=[_TRAY_SPEC],
+    )
+    backend, _adapter = _surface_backend(locator)
+    backend.execute("run-a", ComputerAction(kind="list_surfaces", target="desktop"))
+    candidates = backend.observe("run-a").surface_candidates
+    assert len(candidates) == 3
+    assert [candidate["kind"] for candidate in candidates] == [
+        "window",
+        "window",
+        "tray_icon",
+    ]
+    assert [candidate["label"] for candidate in candidates] == [
+        "记事本",
+        "浏览器",
+        "微信",
+    ]
+    assert candidates[2]["operations"] == ("invoke", "click_point")
+    # 候选一次性消费：普通观察不再携带候选。
+    assert backend.observe("run-a").surface_candidates == ()
