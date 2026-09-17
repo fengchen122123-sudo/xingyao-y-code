@@ -133,6 +133,7 @@
             :nav-items="store.navItems"
             :loaded-first-id="store.firstLoadedMsgId"
             @jump="onNavJump"
+            @locating="onRailLocating"
           />
 
           <!-- 回到底部悬浮按钮：用户上滑浏览历史时出现 -->
@@ -455,9 +456,43 @@ async function maybeLoadOlder() {
   }
 }
 
+// 红点跳转期间的「自动吸底抑制窗口」。
+// 点击红点后 rail 要把视口定位到目标消息，而跳转过程中任何「内容变化 → 自动吸底」
+// 都会把视口拽回底部，与定位相互打断——表现为「点第一个红点定不到、视口闪动乱跳」。
+// 因此在跳转起 600ms 内关闭自动吸底，之后自动恢复跟随。
+// 发送新消息、点「回到底部」等显式 force 吸底不走这里，不受影响。
+const AUTO_STICK_RELEASE_MS = 600;
+const navJumping = ref(false);
+let navJumpReleaseTimer: number | undefined;
+
+/** 关闭自动吸底（跳转开始 / 每次定位动作时调用） */
+function suppressAutoStick() {
+  if (navJumpReleaseTimer !== undefined) {
+    window.clearTimeout(navJumpReleaseTimer);
+    navJumpReleaseTimer = undefined;
+  }
+  navJumping.value = true;
+}
+
+/** 顺延抑制窗口：smooth 定位动画期间保持抑制，到期后恢复跟随 */
+function releaseAutoStickLater() {
+  if (navJumpReleaseTimer !== undefined) window.clearTimeout(navJumpReleaseTimer);
+  navJumpReleaseTimer = window.setTimeout(() => {
+    navJumpReleaseTimer = undefined;
+    navJumping.value = false;
+  }, AUTO_STICK_RELEASE_MS);
+}
+
+/** rail 每次发起定位（点击红点）时同步抑制自动吸底 */
+function onRailLocating() {
+  suppressAutoStick();
+  releaseAutoStickLater();
+}
+
 // 红点导航点击未加载区域：连续向前翻页直到目标消息进入列表，再交回 rail 定位。
 // 本地 SQLite 翻页极快，体感为直接跳转；60 页护栏防异常死循环。
 async function onNavJump(payload: { index: number; id: number }) {
+  suppressAutoStick();
   let guard = 0;
   while (guard++ < 60) {
     const first = store.firstLoadedMsgId;
@@ -467,6 +502,8 @@ async function onNavJump(payload: { index: number; id: number }) {
   }
   await nextTick();
   railRef.value?.jumpToLoaded?.(payload.index);
+  // 定位动画（smooth）还需数百毫秒，此处顺延抑制窗口覆盖整段
+  releaseAutoStickLater();
 }
 
 // 红点导航轨道：每条「我发的消息」对应一个红点，DOM 变化后重算红点数量
@@ -518,8 +555,9 @@ function ensureBodyObserver() {
     bodyObserver?.disconnect();
     observedBody = body;
     bodyObserver = new MutationObserver(() => {
-      // 内容变化（思考流/工具时间线/Diff 展开/工时计时等）：跟随模式下自动吸底
-      scrollToBottom();
+      // 内容变化（思考流/工具时间线/Diff 展开/工时计时等）：跟随模式下自动吸底。
+      // 红点跳转期间抑制，避免把正在定位的视口拽回底部。
+      if (!navJumping.value) scrollToBottom();
       refreshRail();
     });
     bodyObserver.observe(body, { childList: true, subtree: true, characterData: true, attributes: true });
@@ -527,7 +565,9 @@ function ensureBodyObserver() {
 }
 
 watch(() => store.messages.length, () => {
-  scrollToBottom();
+  // 红点跳转（含跨页翻页 prepend）期间不得吸底：那会把视口反复拽回底部，
+  // 与 rail 的定位相互打断
+  if (!navJumping.value) scrollToBottom();
   ensureBodyObserver();
   refreshRail();
 });
