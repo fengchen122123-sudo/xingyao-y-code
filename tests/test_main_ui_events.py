@@ -1237,6 +1237,28 @@ def test_plan_item_handoff_prints_takeover_notice_once(monkeypatch):
     assert "等待主 Agent 接管（队列第 2 项）" in queued_plain
 
 
+def test_writeback_rejected_prints_reason_instead_of_plan_mark(monkeypatch):
+    """回写被拒是调度诊断信息：必须打印原因本身，不能套用计划项的 <mark> 渲染
+    （否则会把计划项显示成它原来的 pending 状态，反而误导用户）。"""
+    factory = TurnEventFactory("turn-writeback-rejected")
+    printed = []
+    monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main, "_print_ui_fragment", printed.append)
+    monkeypatch.setattr(main, "app_instance", None)
+    main.ui_renderers.pop("turn-writeback-rejected", None)
+
+    main._render_ui_event(factory.emit("plan_writeback_rejected", {
+        "item_id": "item",
+        "action": "complete",
+        "reason": "complete 回写被拒绝：计划项当前状态为 'pending'，只有 in_progress 状态才允许回写。",
+    }))
+
+    assert len(printed) == 1
+    plain = Text.from_ansi(printed[0]).plain
+    assert "回写被拒绝" in plain
+    assert "pending" in plain
+
+
 # ---------------------------------------------------------------------------
 # /turns 命令：CLI 设置单任务最大模型轮次（与 GUI 系统设置共用同一份配置）
 # ---------------------------------------------------------------------------

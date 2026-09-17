@@ -29,8 +29,8 @@
         <span class="mi-arrow">›</span>
       </div>
       <div class="menu-item" @click="openAutomations()">
-        <span class="mi-ico">⏱</span>
-        <span class="mi-label">自动化</span>
+        <span class="mi-ico"><AppIcon name="orbit" :size="15" /></span>
+        <span class="mi-label">星轨</span>
         <span class="mi-count">{{ enabledAutomationCount }} / {{ store.automationTasks.length }}</span>
         <span class="mi-arrow">›</span>
       </div>

@@ -1485,6 +1485,16 @@ def _render_ui_event(event):
             app_instance.invalidate()
         return
 
+    if event.kind == "plan_writeback_rejected":
+        # 回写被拒属于调度诊断：打印原因本身，不套用计划项的 <mark> 渲染，
+        # 否则会把计划项显示成它原有的状态，反而看不出"为什么一直没动"
+        message = str(event.payload.get("reason") or "").replace("\x1b", "").strip()
+        if message:
+            _print_ui_fragment(f"{ANSI_RESET}! {message}\n")
+        if app_instance is not None:
+            app_instance.invalidate()
+        return
+
     if event.kind == "plan_updated" or event.kind.startswith("plan_item_"):
         if event.kind.startswith("plan_item_"):
             item = dict(event.payload.get("item") or {})
