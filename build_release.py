@@ -8,8 +8,8 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
       ycode.exe                  CLI 控制台版 (console=True)
       _internal/                 两者共享的运行时依赖与数据文件
   dist/ycode_uninstall.exe     独立卸载向导
-  dist/ycode_cli_setup_v{版本}.exe  独立 CLI 安装向导（供主安装包内嵌，也可单独分发）
-  dist/ycode_setup_v{版本}.exe      主安装向导（默认装 GUI，可选附带装 CLI）
+  dist/Y-code-cli-{版本}.exe   独立 CLI 安装向导（供主安装包内嵌，也可单独分发）
+  dist/XingYaoCode-{版本}.exe  主安装向导（默认装 GUI，可选附带装 CLI）
   dist/release_parts/          Gitee Release 附件（超 100MB 的安装包按 ≤95MB
                                二进制分卷 .part1/.part2/...，附 RELEASE_NOTES.txt
                                上传指引，内含 SHA256 校验行）
@@ -345,11 +345,12 @@ def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_
 def versioned_setup_name(base, version):
     """安装包最终分发文件名（不含扩展名）。
 
-    主安装包用 Y-code-{version}（如 Y-code-1.2.2），CLI 独立安装包用
-    Y-code-cli-{version}。
+    主安装包用 XingYaoCode-{version}（如 XingYaoCode-1.2.28），CLI 独立安装包用
+    Y-code-cli-{version}。注意此处仅决定落到 dist/ 供分发的最终文件名，
+    构建期内部仍用固定名 ycode_setup / ycode_cli_setup。
     """
     if base == "ycode_setup":
-        return f"Y-code-{version}"
+        return f"XingYaoCode-{version}"
     if base == "ycode_cli_setup":
         return f"Y-code-cli-{version}"
     return f"{base}_v{version}"
@@ -373,9 +374,12 @@ def step4b_rename_setups(project_dir, version, cli_only):
         for old in glob.glob(os.path.join(project_dir, "dist", f"{base}_v*.exe")):
             os.remove(old)
         if base == "ycode_setup":
-            # 主安装包新命名 Y-code-{版本}.exe 也清理旧版本残留；
-            # 用 [0-9] 前缀精确匹配，避免误删 Y-code-cli-*.exe（CLI 安装包）
+            # 主安装包新命名 XingYaoCode-{版本}.exe 清理旧版本残留；
+            # 同时清理历史遗留的旧命名 Y-code-{版本}.exe（老版本构建残留）。
+            # 用 [0-9] 前缀精确匹配，避免误删 Y-code-cli-*.exe（CLI 安装包）。
             for old in glob.glob(os.path.join(project_dir, "dist", "Y-code-[0-9]*.exe")):
+                os.remove(old)
+            for old in glob.glob(os.path.join(project_dir, "dist", "XingYaoCode-[0-9]*.exe")):
                 os.remove(old)
         if base == "ycode_cli_setup":
             # CLI 安装包新命名 Y-code-cli-*.exe 也清理旧版本残留

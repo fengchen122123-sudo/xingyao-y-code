@@ -358,6 +358,124 @@ def test_pick_main_installer_exe_prefers_gui_installer():
     assert _pick_main_installer_exe([], "1.2.6") is None
 
 
+def test_pick_main_installer_group_prefers_new_brand_name_either_order():
+    """新命名主安装包 XingYaoCode-{版本}.exe 与 CLI 分卷组共存时，必须选主安装包
+    那组，且结果不依赖分组在字典中的插入顺序（前后两种顺序都测）。"""
+    from core.updater import _pick_main_installer_group
+
+    main_parts = [
+        {"name": "XingYaoCode-1.2.28.exe.part1", "size": 1},
+        {"name": "XingYaoCode-1.2.28.exe.part2", "size": 2},
+        {"name": "XingYaoCode-1.2.28.exe.part3", "size": 3},
+    ]
+    cli_parts = [
+        {"name": "Y-code-cli-1.2.28.exe.part1", "size": 1},
+        {"name": "Y-code-cli-1.2.28.exe.part2", "size": 2},
+        {"name": "Y-code-cli-1.2.28.exe.part3", "size": 3},
+    ]
+
+    # 顺序一：主安装包组在前
+    base, parts = _pick_main_installer_group(
+        {"XingYaoCode-1.2.28.exe": main_parts, "Y-code-cli-1.2.28.exe": cli_parts},
+        "1.2.28",
+    )
+    assert base == "XingYaoCode-1.2.28.exe"
+    assert [p["name"] for p in parts] == [p["name"] for p in main_parts]
+
+    # 顺序二：CLI 组在前（老客户端只按插入顺序取第一组，此处必须靠精确名纠正）
+    base2, parts2 = _pick_main_installer_group(
+        {"Y-code-cli-1.2.28.exe": cli_parts, "XingYaoCode-1.2.28.exe": main_parts},
+        "1.2.28",
+    )
+    assert base2 == "XingYaoCode-1.2.28.exe"
+    assert [p["name"] for p in parts2] == [p["name"] for p in main_parts]
+
+
+def test_pick_main_installer_group_uses_new_brand_prefix_when_version_mismatch():
+    """版本名对不上（精确名未命中）时，前缀兜底仍要选新命名主安装包组而非 CLI 组。"""
+    from core.updater import _pick_main_installer_group
+
+    complete = {
+        "Y-code-cli-9.9.9.exe": [{"name": "Y-code-cli-9.9.9.exe.part1"}],
+        "XingYaoCode-9.9.9.exe": [{"name": "XingYaoCode-9.9.9.exe.part1"}],
+    }
+    base, _ = _pick_main_installer_group(complete, "1.2.28")
+    assert base == "XingYaoCode-9.9.9.exe"
+
+
+def test_pick_main_installer_group_accepts_legacy_ycode_name():
+    """兼容旧命名：assets 只有 Y-code-1.2.28.exe.part1/part2 时仍能挑出该组。"""
+    from core.updater import _pick_main_installer_group
+
+    parts = [{"name": "Y-code-1.2.28.exe.part1", "size": 1},
+             {"name": "Y-code-1.2.28.exe.part2", "size": 2}]
+    base, picked = _pick_main_installer_group({"Y-code-1.2.28.exe": parts}, "1.2.28")
+    assert base == "Y-code-1.2.28.exe"
+    assert picked is parts
+
+
+def test_pick_main_installer_group_keeps_unbranded_fallback():
+    """极端兜底未被破坏：只有一组无品牌前缀的完整分卷时仍返回该组
+    （老客户端依赖此兜底，改造后不得抛错或返回 None）。"""
+    from core.updater import _pick_main_installer_group
+
+    parts = [{"name": "installer.exe.part1"}, {"name": "installer.exe.part2"}]
+    base, picked = _pick_main_installer_group({"installer.exe": parts}, "1.2.28")
+    assert base == "installer.exe"
+    assert picked is parts
+
+
+def test_pick_main_installer_exe_prefers_new_brand_name():
+    """单 exe 场景：新命名主安装包与 CLI 安装包共存时必须挑主安装包，顺序无关。"""
+    from core.updater import _pick_main_installer_exe
+
+    assets = [
+        {"name": "Y-code-cli-1.2.28.exe", "url": "cli"},
+        {"name": "XingYaoCode-1.2.28.exe", "url": "main"},
+    ]
+    assert _pick_main_installer_exe(assets, "1.2.28")["url"] == "main"
+    assert _pick_main_installer_exe(list(reversed(assets)), "1.2.28")["url"] == "main"
+
+
+def test_pick_main_installer_exe_accepts_legacy_ycode_name():
+    """单 exe 场景：只有旧命名 Y-code-1.2.28.exe 时也要能挑到它。"""
+    from core.updater import _pick_main_installer_exe
+
+    assets = [{"name": "Y-code-1.2.28.exe", "url": "legacy"}]
+    assert _pick_main_installer_exe(assets, "1.2.28")["url"] == "legacy"
+
+
+def test_fetch_latest_release_picks_new_brand_split_group_either_order():
+    """端到端：Release 同时挂新命名主安装包分卷与 CLI 分卷时，part_urls 取主安装包组，
+    且与附件先后顺序无关（CLI 组分别排前 / 排后两种情况）。"""
+    main_assets = [
+        {"name": "XingYaoCode-99.0.0.exe.part1", "browser_download_url": "https://gitee.com/m1", "size": 100},
+        {"name": "XingYaoCode-99.0.0.exe.part2", "browser_download_url": "https://gitee.com/m2", "size": 80},
+    ]
+    cli_assets = [
+        {"name": "Y-code-cli-99.0.0.exe.part1", "browser_download_url": "https://gitee.com/c1", "size": 60},
+        {"name": "Y-code-cli-99.0.0.exe.part2", "browser_download_url": "https://gitee.com/c2", "size": 60},
+    ]
+    for assets in (cli_assets + main_assets, main_assets + cli_assets):
+        fake_release = {
+            "tag_name": "v99.0.0",
+            "name": "Y-CODE v99.0.0",
+            "body": "- 分卷发布",
+            "assets": list(assets),
+        }
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = json.dumps([fake_release]).encode("utf-8")
+        mock_resp.__enter__.return_value = mock_resp
+
+        with patch("urllib.request.urlopen", return_value=mock_resp):
+            res = fetch_latest_release(repo="mock/repo")
+
+        assert res["is_split"] is True
+        assert res["asset_name"] == "XingYaoCode-99.0.0.exe"
+        assert res["part_urls"] == ["https://gitee.com/m1", "https://gitee.com/m2"]
+        assert res["asset_size"] == 180
+
+
 def test_fetch_latest_release_with_split_parts():
     """分卷 Release：part_urls 按序返回，asset_size 为各片之和，SHA256 被提取。
 

@@ -219,6 +219,67 @@ def test_create_shortcut_escapes_powershell_single_quotes(monkeypatch):
     assert "Tom's Apps" not in command
 
 
+def test_desktop_shortcut_uses_new_brand_name_and_removes_legacy(tmp_path, patched_env):
+    """桌面快捷方式必须命名为 星瑶code.lnk，且升级时清掉旧版遗留的 Y-code.lnk。"""
+    assert ycode_setup.DESKTOP_SHORTCUT_NAME == "星瑶code.lnk"
+
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    legacy = desktop / "Y-code.lnk"
+    legacy.write_text("old", encoding="utf-8")
+    assert legacy.exists()
+
+    bundle = _fake_bundle(tmp_path)
+    install_dir = str(tmp_path / "installed")
+    res = run_install(
+        "full", str(bundle),
+        InstallOptions(install_dir, install_cli=True, create_desktop_shortcut=True),
+        _startupinfo(), log=lambda m: None,
+    )
+
+    assert res["desktop_shortcut"] is True
+    # 快捷方式落点必须是新品牌名（create_shortcut 第 1 个位置参数是 lnk 路径）
+    assert len(patched_env["shortcut"]) == 1
+    lnk_path = patched_env["shortcut"][0][0]
+    assert lnk_path == os.path.join(str(desktop), "星瑶code.lnk")
+    assert lnk_path.endswith("星瑶code.lnk")
+    # 旧版遗留的 Y-code.lnk 已被清理
+    assert not legacy.exists()
+
+
+def test_desktop_shortcut_legacy_cleanup_failure_does_not_abort(tmp_path, patched_env,
+                                                               monkeypatch):
+    """清理旧 Y-code.lnk 失败（锁定/占用）时只记日志，安装仍要继续完成。"""
+    desktop = tmp_path / "Desktop"
+    desktop.mkdir()
+    legacy = desktop / "Y-code.lnk"
+    legacy.write_text("old", encoding="utf-8")
+
+    real_remove = os.remove
+
+    def _boom(path, *args, **kwargs):
+        if str(path).endswith("Y-code.lnk"):
+            raise PermissionError("locked")
+        return real_remove(path, *args, **kwargs)
+
+    monkeypatch.setattr(ycode_setup.os, "remove", _boom)
+    logs = []
+
+    bundle = _fake_bundle(tmp_path)
+    install_dir = str(tmp_path / "installed")
+    res = run_install(
+        "full", str(bundle),
+        InstallOptions(install_dir, install_cli=True, create_desktop_shortcut=True),
+        _startupinfo(), log=logs.append,
+    )
+
+    # 未因清理失败而中断：仍创建了新品牌快捷方式
+    assert res["desktop_shortcut"] is True
+    lnk_path = patched_env["shortcut"][0][0]
+    assert lnk_path.endswith("星瑶code.lnk")
+    assert any("清理旧版桌面快捷方式失败" in m for m in logs)
+
+
 @pytest.mark.parametrize("func_name", ["add_to_user_path", "add_to_system_path"])
 def test_path_registration_rejects_semicolon_in_install_dir(monkeypatch, func_name):
     create_key_called = []
