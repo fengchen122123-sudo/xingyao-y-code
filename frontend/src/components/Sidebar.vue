@@ -218,8 +218,40 @@ const panelStyle = computed(() => {
   return style;
 });
 
-const collapsedGroups = ref<Record<string, boolean>>({});
-const expandedGroups = ref<Record<string, boolean>>({});
+// 分组折叠态 / 「显示更多」展开态持久化：以 folder_path 为键存 localStorage，
+// 沿用 appStore 与 usePanelResize 的 'ycode-*' 前缀约定。只记录与默认状态
+// 不同的目录，恢复默认即删键，避免项目移除后旧路径在存储里无限残留。
+const COLLAPSED_GROUPS_KEY = 'ycode-sidebar-collapsed-groups';
+const EXPANDED_GROUPS_KEY = 'ycode-sidebar-expanded-groups';
+
+/** 读取一组被标记的路径（[{path}] 形态）；内容缺失/损坏时按空处理 */
+function loadFlagPaths(key: string): Record<string, boolean> {
+  try {
+    const raw = localStorage.getItem(key);
+    if (!raw) return {};
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      parsed.filter((p): p is string => typeof p === 'string').map((p) => [p, true]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+/** 写回被标记的路径；全部恢复默认时删键（存储不可用时仅本次会话生效） */
+function saveFlagPaths(key: string, flags: Record<string, boolean>) {
+  try {
+    const paths = Object.keys(flags).filter((p) => flags[p]);
+    if (paths.length === 0) localStorage.removeItem(key);
+    else localStorage.setItem(key, JSON.stringify(paths));
+  } catch {
+    /* localStorage 不可用（隐私模式/配额满）时静默降级 */
+  }
+}
+
+const collapsedGroups = ref<Record<string, boolean>>(loadFlagPaths(COLLAPSED_GROUPS_KEY));
+const expandedGroups = ref<Record<string, boolean>>(loadFlagPaths(EXPANDED_GROUPS_KEY));
 // 正在等待二次确认删除的会话名（在时间位置显示红色小确认按钮）
 const confirmDeleteName = ref('');
 // 正在等待二次确认删除的项目分组路径
@@ -423,6 +455,7 @@ function visibleSessions(group: SessionGroup) {
 
 function toggleShowMore(path: string) {
   expandedGroups.value[path] = !expandedGroups.value[path];
+  saveFlagPaths(EXPANDED_GROUPS_KEY, expandedGroups.value);
 }
 
 // ZCode 风格的紧凑相对时间：刚刚 / 5分钟 / 3小时 / 13天 / 2个月
@@ -454,6 +487,7 @@ function toggleGroupCollapsed(path: string) {
   }
   confirmDeleteGroupPath.value = '';
   collapsedGroups.value[path] = !collapsedGroups.value[path];
+  saveFlagPaths(COLLAPSED_GROUPS_KEY, collapsedGroups.value);
 }
 
 // 点击分组文件夹图标：在系统资源管理器中打开该目录
