@@ -206,6 +206,9 @@
     <!-- 软件更新弹窗 -->
     <UpdateModal />
 
+    <!-- 会话全局搜索弹窗 (Ctrl+F) -->
+    <SessionSearchModal />
+
     <!-- 免责条款首次使用确认：正常启动校验完成后，未同意或条款版本升级后才弹出；已同意过则不弹出 -->
     <DisclaimerGate v-if="store.initialized && store.disclaimerNeedsAccept" />
 
@@ -277,6 +280,7 @@ import RightPanel from './components/RightPanel.vue';
 import ComputerControlBar from './components/ComputerControlBar.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
+import SessionSearchModal from './components/SessionSearchModal.vue';
 // 免责条款首次使用确认（合规链路）：未同意或条款升级后强制弹出，不同意则退出
 import DisclaimerGate from './components/DisclaimerGate.vue';
 import PermCard from './components/PermCard.vue';
@@ -701,8 +705,21 @@ function onPywebviewReady() {
   startInit();
 }
 
+function onGlobalKeydown(e: KeyboardEvent) {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
+    // 拦截全局 Ctrl+F / Cmd+F 呼出会话多维检索面板
+    e.preventDefault();
+    if (store.sessionSearchModal.show) {
+      store.closeSessionSearchModal();
+    } else {
+      store.openSessionSearchModal();
+    }
+  }
+}
+
 onMounted(() => {
   document.addEventListener('click', closeExportMenu);
+  window.addEventListener('keydown', onGlobalKeydown);
   void syncInitialWindowMaximized();
 
   // 窗口重新聚焦时校准电脑操控快照（设计 16.4）：_js_queue 满时允许丢新事件，
@@ -735,6 +752,7 @@ onMounted(() => {
 });
 onUnmounted(() => {
   document.removeEventListener('click', closeExportMenu);
+  window.removeEventListener('keydown', onGlobalKeydown);
   window.removeEventListener('focus', onWindowFocusRecalibrateComputer);
   window.removeEventListener('pywebviewready', onPywebviewReady);
   if (initPollTimer !== undefined) {

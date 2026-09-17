@@ -56,6 +56,10 @@
   --mono: var(--theme-font-mono);
   --sans: var(--theme-font-sans);
 
+  /* 搜索命中词高亮标记（mark）语义配色（深色默认） */
+  --search-mark-bg: rgba(245, 158, 11, 0.28);
+  --search-mark-text: #fde047;
+
   /* 对话内容列宽度：消息、执行过程折叠卡、文件更改面板、输入框统一占满可用
      宽度，不再固定 880px 居中，收起两侧面板后无大片留白，各元素左对齐线
      一致。属布局变量，非主题 token，不受主题运行时覆盖。 */
@@ -786,6 +790,10 @@ button {
   --theme-code-background: #f0f0ec;
   --theme-float-background: rgba(255, 255, 255, 0.97);
   --theme-shadow-color: rgba(0, 0, 0, 0.18);
+
+  /* 浅色主题下的搜索关键词高亮标记：高对比深琥珀字色与柔和黄色底色 */
+  --search-mark-bg: #fef08a;
+  --search-mark-text: #854d0e;
 }
 body.light .tool-head .tname {
   color: var(--text);

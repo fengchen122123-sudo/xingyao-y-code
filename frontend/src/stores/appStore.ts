@@ -690,6 +690,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 确认弹窗（notice 模式时退化为单按钮提示框，用户点击"确定"才关闭）
     confirmModal: { show: false, title: '', sub: '', message: '', confirmLabel: '确定删除 ⏎', notice: false } as ConfirmState,
 
+    // 会话全局检索模态框（Command Palette）
+    sessionSearchModal: {
+      show: false,
+    },
+
     // 权限请求弹窗
     permRequest: { show: false, sessionName: '', reqId: '', summary: '', source: '', allowAlways: false, options: [], permissionOptions: [], functionName: '' } as PermReqState,
 
@@ -1570,6 +1575,32 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.confirmModal.resolve(ok);
       }
       this.confirmModal.show = false;
+    },
+
+    openSessionSearchModal() {
+      this.sessionSearchModal.show = true;
+    },
+
+    closeSessionSearchModal() {
+      this.sessionSearchModal.show = false;
+    },
+
+    async searchSessionsFull(
+      query: string,
+      scope: 'all' | 'title' | 'content' = 'all',
+      workdir?: string,
+      limit: number = 30,
+    ) {
+      const api = this._api();
+      if (!api || !api.search_sessions_full) {
+        return { ok: false, total: 0, results: [], msg: '后端未就绪' };
+      }
+      try {
+        return await api.search_sessions_full(query, scope, workdir, limit);
+      } catch (err: any) {
+        console.error('search_sessions_full 失败:', err);
+        return { ok: false, total: 0, results: [], msg: String(err) };
+      }
     },
 
     async initFromBackend() {
