@@ -64,6 +64,10 @@ export const ICON_PATHS: Record<string, string> = {
   qr:
     '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/><path d="M14 14h3v3h-3z"/><path d="M21 14v3"/><path d="M14 21h3"/><path d="M18 18h3v3h-3z"/>',
   zap: '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
+  // 星轨：一颗主星 + 轨道上的小卫星（小尺寸下要一眼可辨，避免嵌套椭圆——
+  // 椭圆环套圆心会被看成一个回形针）
+  orbit:
+    '<path d="M11.5 4.5 13.1 9.9 18.5 11.5 13.1 13.1 11.5 18.5 9.9 13.1 4.5 11.5 9.9 9.9Z"/><circle cx="18.8" cy="5.4" r="1.9"/>',
   smartphone:
     '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
 };

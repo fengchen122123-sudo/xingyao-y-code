@@ -653,7 +653,11 @@ class ApiBridge:
         self._automation_engine = AutomationEngine(
             self._automation_storage, self._dispatch_automation_run
         )
-        # 正在运行的自动化回合：turn_id → {"run_id", "task_name"}。
+        # 把桥侧自动化能力注册为 core 层服务句柄，供 Agent 工具在对话里复用：
+        # 工具经 core.automation.service.get() 取句柄后调用同名方法，落到桥侧既有
+        # 实现（参数校验、任务上限检查、事件推送、引擎通知），不在 core 层重复实现。
+        self._register_automation_service()
+        # 正在运行的星轨自动化回合：turn_id → {"run_id", "task_name"}。
         # 无人值守权限自动拒绝的判定依据（规格 5.5）
         self._automation_turn_labels: Dict[str, Dict[str, str]] = {}
 
@@ -1041,6 +1045,16 @@ class ApiBridge:
             self._automation_engine.stop()
         except Exception:
             logger.exception("退出时停止自动化调度引擎失败")
+
+        # 注销服务句柄必须排在 stop() 之后：先停引擎确保不再产生新的触发/回调，
+        # 再注销句柄，避免引擎线程仍持有服务句柄形成悬挂引用。包在 try/except
+        # 内，注销异常不得中断后续收尾链。
+        try:
+            from core.automation import service as automation_service
+
+            automation_service.unregister()
+        except Exception:
+            logger.exception("退出时注销自动化服务句柄失败")
 
         for event in list(self._cancel_events.values()):
             event.set()
@@ -2921,7 +2935,7 @@ class ApiBridge:
         """弹出原生文件夹对话框，仅返回所选路径，不改当前工作区。
 
         与 select_workspace_folder 的区别：不登记工作区、不迁移 GLOBAL 会话
-        归属，供自动化任务表单这类"纯选目录"的场景使用。
+        归属，供星轨自动化任务表单这类"纯选目录"的场景使用。
         """
         try:
             import webview
@@ -4037,12 +4051,12 @@ class ApiBridge:
         """broker 激活某个请求 → 推送到前端对话流内联卡片，并挂一个"超时即拒绝"的定时器。"""
         # 星轨自动化（规格 5.5）：无人值守回合的权限请求立即自动拒绝——
         # 不弹卡、不等待。这与人工回合"绝不因用户暂时离开而自动拒绝"刻意
-        # 不同：自动化回合没有"用户回来"的时刻，等待只会永久挂死回合。
+        # 不同：星轨自动化回合没有"用户回来"的时刻，等待只会永久挂死回合。
         # getattr 防御：裸实例测试桥可能未初始化该映射（同 _user_cancelled_sessions 先例）
         automation_label = getattr(self, "_automation_turn_labels", {}).get(request.parent_turn_id)
         if automation_label is None:
             # 子代理派生的权限请求 owner 是 task_id（非主回合 turn_id），
-            # 按归属链判定其父回合是否自动化回合（P1-2：否则无人值守会挂死）
+            # 按归属链判定其父回合是否星轨自动化回合（P1-2：否则无人值守会挂死）
             automation_label = self._automation_subagent_owner_label(request.parent_turn_id)
         if automation_label:
             self._auto_deny_automation_permission(request, automation_label)
@@ -4124,8 +4138,8 @@ class ApiBridge:
         return None
 
     def _auto_deny_automation_permission(self, request, label: Dict[str, str]) -> None:
-        """自动化回合的权限请求自动拒绝：定位拒绝项，找不到则按取消收尾。"""
-        task_name = str(label.get("task_name") or "自动化任务")
+        """星轨自动化回合的权限请求自动拒绝：定位拒绝项，找不到则按取消收尾。"""
+        task_name = str(label.get("task_name") or "星轨自动化任务")
         try:
             if request.function_name == "ask_user":
                 # 提问类没有"拒绝项"概念：与人工回合超时语义一致走取消，
@@ -4134,11 +4148,11 @@ class ApiBridge:
 
                 permission_broker.resolve(request.request_id, CANCELLED_RESULT)
                 logger.info(
-                    "自动化任务「%s」无人值守已自动取消 ask_user 提问", task_name
+                    "星轨自动化任务「%s」无人值守已自动取消 ask_user 提问", task_name
                 )
                 self.emit_event("notice", {
                     "message": (
-                        f"自动化任务「{task_name}」无人值守已自动取消提问："
+                        f"星轨自动化任务「{task_name}」无人值守已自动取消提问："
                         "模型可在无人应答时自行继续。"
                     ),
                 })
@@ -4162,13 +4176,13 @@ class ApiBridge:
 
                 permission_broker.resolve(request.request_id, CANCELLED_RESULT)
             logger.info(
-                "自动化任务「%s」无人值守已自动拒绝权限请求：%s",
+                "星轨自动化任务「%s」无人值守已自动拒绝权限请求：%s",
                 task_name,
                 request.function_name,
             )
             self.emit_event("notice", {
                 "message": (
-                    f"自动化任务「{task_name}」无人值守已自动拒绝权限请求："
+                    f"星轨自动化任务「{task_name}」无人值守已自动拒绝权限请求："
                     f"{request.function_name}。如需放行，请在任务设置中选择"
                     "accept_edits/full 档位。"
                 ),
@@ -4428,7 +4442,7 @@ class ApiBridge:
         后台汇总标志重置与"用户取消"解除对两者语义一致——排队消息也是
         用户主动发的新消息。turn_source 是入口层受控回合来源（local|lan），
         随消息透传到回合 worker（设计 18）。
-        internal_kind 非空表示系统内部回合（自动化任务/后台汇总）。
+        internal_kind 非空表示系统内部回合（星轨自动化任务/后台汇总）。
         automation_context 为星轨自动化回合上下文（run_id/task_name/
         permission_mode），见待开发/星轨自动化任务/01-完整设计规格.md 5.4。
         """
@@ -4445,7 +4459,7 @@ class ApiBridge:
             # workdir 必须显式透传（进程 cwd 可能是别的项目目录）
             turn_kwargs["pending_workdir"] = str(pending_workdir)
         if pending_model_id:
-            # 自动化任务指定模型：worker 在读取激活模型前落会话绑定
+            # 星轨自动化任务指定模型：worker 在读取激活模型前落会话绑定
             turn_kwargs["pending_model_id"] = str(pending_model_id)
         if pending_permission_mode:
             # 会话级权限档位（pending 草稿会话首条消息携带）：worker 落库后绑定
@@ -4517,7 +4531,7 @@ class ApiBridge:
                         # 排队消息补发保持原回合来源：LAN 消息不得降级为 local
                         turn_source=str(entry.get("turn_source") or "local"),
                         attachments=[str(p) for p in (entry.get("attachments") or [])],
-                        # 自动化任务指定的工作目录：补发时重判会话是否仍不存在，
+                        # 星轨自动化任务指定的工作目录：补发时重判会话是否仍不存在，
                         # 已被其他回合创建的会话以自身归属为准
                         pending_workdir=self._automation_pending_workdir(
                             str(entry.get("pending_workdir") or ""), session_name
@@ -4555,14 +4569,14 @@ class ApiBridge:
         try:
             recovered = self._automation_storage.recover_stale_runs()
             if recovered:
-                logger.info("自动化任务启动恢复：%s 条遗留运行标记为 interrupted", recovered)
+                logger.info("星轨自动化任务启动恢复：%s 条遗留运行标记为 interrupted", recovered)
         except Exception:
-            logger.exception("自动化任务启动恢复失败")
+            logger.exception("星轨自动化任务启动恢复失败")
         self._automation_engine.start()
         self._emit_automation_tasks_changed()
 
     def _automation_pending_workdir(self, task_workdir: str, session_name: str) -> str:
-        """自动化任务的待建会话工作目录。
+        """星轨自动化任务的待建会话工作目录。
 
         仅当目标会话尚未落库时返回任务配置的 workdir（含 "GLOBAL" 自由对话），
         让回合 worker 懒创建会话时绑定到该目录；已有会话一律返回空串——
@@ -4591,8 +4605,8 @@ class ApiBridge:
         """
         if self._shutting_down:
             return
-        target_session = str(task.get("target_session") or "").strip() or "自动化任务"
-        display_text = f"自动化任务「{task.get('name')}」"
+        target_session = str(task.get("target_session") or "").strip() or "星轨自动化任务"
+        display_text = f"星轨自动化任务「{task.get('name')}」"
         # 任务指定的工作目录只对"懒创建的新会话"生效；已有会话沿用自身归属
         pending_workdir = self._automation_pending_workdir(
             str(task.get("workdir") or ""), target_session
@@ -4646,7 +4660,7 @@ class ApiBridge:
             except Exception as exc:
                 # spawn 失败（线程创建异常等）：立刻置 error 终态，避免运行行
                 # 永久停在 running 导致后续触发全部被单飞跳过（P2-6）
-                logger.exception("自动化回合 spawn 失败")
+                logger.exception("星轨自动化回合 spawn 失败")
                 try:
                     self._automation_storage.finish_run(
                         run_id, "error", f"回合线程启动失败: {exc}"[:500]
@@ -4665,7 +4679,7 @@ class ApiBridge:
             if run.get("status") == "skipped":
                 self.emit_event("notice", {
                     "message": (
-                        f"自动化任务「{run.get('task_name')}」本次触发已跳过："
+                        f"星轨自动化任务「{run.get('task_name')}」本次触发已跳过："
                         f"{run.get('error') or '上一次运行尚未结束'}"
                     ),
                 })
@@ -4673,11 +4687,11 @@ class ApiBridge:
             logger.debug("推送自动化运行事件失败", exc_info=True)
 
     def _emit_automation_tasks_changed(self) -> None:
-        """推送自动化任务全量快照（前端幂等替换渲染）。"""
+        """推送星轨自动化任务全量快照（前端幂等替换渲染）。"""
         try:
             self.emit_event("automation_tasks_changed", {"tasks": self._automation_task_dtos()})
         except Exception:
-            logger.debug("推送自动化任务快照失败", exc_info=True)
+            logger.debug("推送星轨自动化任务快照失败", exc_info=True)
 
     def _automation_task_dtos(self) -> List[Dict[str, Any]]:
         from core.automation.models import trigger_summary
@@ -4692,11 +4706,31 @@ class ApiBridge:
             dtos.append(dto)
         return dtos
 
+    def _register_automation_service(self) -> None:
+        """把桥侧自动化能力注册为 core 层服务句柄（Agent 工具的唯一入口）。
+
+        所有回调都指向本桥已有的 js_api/存储实现：Agent 工具经
+        ``core.automation.service.get()`` 取到句柄后调用同名方法，即复用桥侧
+        既有的参数校验、任务上限检查与事件推送（automation_tasks_changed /
+        automation_run_updated），不在 core 层重复实现一遍这些能力。
+        """
+        from core.automation import service as automation_service
+
+        automation_service.register(automation_service.AutomationService(
+            list_tasks=self.get_automation_tasks,
+            get_task=self._automation_storage.get_task,
+            save_task=self.save_automation_task,
+            delete_task=self.delete_automation_task,
+            set_enabled=self.set_automation_task_enabled,
+            run_now=self.run_automation_task_now,
+            get_runs=self.get_automation_runs,
+        ))
+
     def get_automation_tasks(self) -> Dict[str, Any]:
         try:
             return {"ok": True, "tasks": self._automation_task_dtos()}
         except Exception as e:
-            logger.exception("读取自动化任务失败")
+            logger.exception("读取星轨自动化任务失败")
             return {"ok": False, "msg": str(e)}
 
     def save_automation_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
@@ -4723,13 +4757,13 @@ class ApiBridge:
                     return {"ok": False, "errors": ["指定模型不存在或已被删除，请重新选择"]}
             existing_id = str(raw.get("id") or "").strip()
             if not existing_id and self._automation_storage.count_tasks() >= MAX_TASKS:
-                return {"ok": False, "errors": [f"自动化任务最多 {MAX_TASKS} 个，请先删除部分任务"]}
+                return {"ok": False, "errors": [f"星轨自动化任务最多 {MAX_TASKS} 个，请先删除部分任务"]}
             task_id = self._automation_storage.save_task(raw)
             self._emit_automation_tasks_changed()
             self._automation_engine.notify_changed()
             return {"ok": True, "id": task_id}
         except Exception as e:
-            logger.exception("保存自动化任务失败")
+            logger.exception("保存星轨自动化任务失败")
             return {"ok": False, "msg": str(e)}
 
     def delete_automation_task(self, task_id: str) -> Dict[str, Any]:
@@ -4739,7 +4773,7 @@ class ApiBridge:
             self._automation_engine.notify_changed()
             return {"ok": True, "deleted": bool(deleted)}
         except Exception as e:
-            logger.exception("删除自动化任务失败")
+            logger.exception("删除星轨自动化任务失败")
             return {"ok": False, "msg": str(e)}
 
     def set_automation_task_enabled(self, task_id: str, enabled: bool) -> Dict[str, Any]:
@@ -4749,7 +4783,7 @@ class ApiBridge:
             self._automation_engine.notify_changed()
             return {"ok": bool(updated), "msg": "" if updated else "任务不存在"}
         except Exception as e:
-            logger.exception("启停自动化任务失败")
+            logger.exception("启停星轨自动化任务失败")
             return {"ok": False, "msg": str(e)}
 
     def run_automation_task_now(self, task_id: str) -> Dict[str, Any]:
@@ -4776,7 +4810,7 @@ class ApiBridge:
                 raise
             return {"ok": True, "run_id": run["id"]}
         except Exception as e:
-            logger.exception("手动执行自动化任务失败")
+            logger.exception("手动执行星轨自动化任务失败")
             return {"ok": False, "msg": str(e)}
 
     def get_automation_runs(self, task_id: str = "", limit: int = 50) -> Dict[str, Any]:
@@ -5057,8 +5091,8 @@ class ApiBridge:
         if internal_kind:
             turn_start_data["internal"] = internal_kind
             if internal_kind == "automation":
-                # 星轨自动化：展示名随任务传入（"自动化任务「X」"）
-                turn_start_data["display_text"] = display_text or "自动化任务"
+                # 星轨自动化：展示名随任务传入（"星轨自动化任务「X」"）
+                turn_start_data["display_text"] = display_text or "星轨自动化任务"
             elif internal_kind == "bg_command_summary":
                 turn_start_data["display_text"] = _BG_COMMAND_SUMMARY_DISPLAY_TEXT
             else:
@@ -5088,7 +5122,7 @@ class ApiBridge:
         undo_finished = False
 
         try:
-            # 自动化任务指定模型：在读取激活模型前落会话与模型绑定，本回合即用
+            # 星轨自动化任务指定模型：在读取激活模型前落会话与模型绑定，本回合即用
             # 该模型执行。新会话按任务 workdir 同步落库（无则挂 GLOBAL），否则
             # set_session_model_id 无行可更；指定模型已被删除时 get_active_model
             # 按陈旧绑定自动回退全局默认，任务不被卡死。绑定与聊天页"选模型后
@@ -5100,7 +5134,7 @@ class ApiBridge:
                     )
                     self._memory.set_session_model_id(session_name, pending_model_id)
                 except Exception:
-                    logger.debug("预绑定自动化任务模型失败", exc_info=True)
+                    logger.debug("预绑定星轨自动化任务模型失败", exc_info=True)
             active_model = get_active_model(session_name)
             if not active_model or not active_model.get("litellm_model"):
                 # 关键修复：没有激活模型时也必须让前端解锁输入框
@@ -5409,19 +5443,19 @@ class ApiBridge:
                     if final_status == "error":
                         self.emit_event("notice", {
                             "message": (
-                                f"自动化任务「{automation_task_name}」运行失败："
+                                f"星轨自动化任务「{automation_task_name}」运行失败："
                                 f"{automation_error[:120]}"
                             ),
                             "session_name": session_name,
                         })
                     elif final_status == "cancelled":
                         self.emit_event("notice", {
-                            "message": f"自动化任务「{automation_task_name}」运行已取消。",
+                            "message": f"星轨自动化任务「{automation_task_name}」运行已取消。",
                             "session_name": session_name,
                         })
                     elif final_status == "completed" and notify_success:
                         self.emit_event("notice", {
-                            "message": f"自动化任务「{automation_task_name}」运行完成。",
+                            "message": f"星轨自动化任务「{automation_task_name}」运行完成。",
                             "session_name": session_name,
                         })
                 except Exception:
@@ -5824,6 +5858,15 @@ class ApiBridge:
                     "items": data.get("items") or [],
                     "session_name": session_name,
                 })
+            elif kind == "plan_writeback_rejected":
+                # 完成/失败回写被拒：模型侧已有文字反馈，这里补一条用户可见提示，
+                # 避免"任务已干完、状态却一直不动"在界面上没有任何线索
+                message = str(data.get("reason") or "")
+                if message:
+                    self.emit_event("notice", {
+                        "message": _strip_ansi_markup(message),
+                        "session_name": session_name,
+                    })
             elif kind == "plan_item_handoff":
                 # 子 Agent 超时接管可见性：只透传展示字段，不改调度状态；
                 # 旧子 Agent 卡片保持 timed_out，计划卡片显示 main_takeover

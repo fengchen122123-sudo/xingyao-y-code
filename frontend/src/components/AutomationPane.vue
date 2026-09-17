@@ -1,14 +1,14 @@
 <template>
   <div class="ap-wrap">
     <div class="ap-banner">
-      ⏱ 自动化任务仅在星瑶运行期间生效（含最小化到托盘）；关闭应用期间不会触发，
+      <AppIcon name="orbit" :size="13" /> 星轨自动化任务仅在星瑶运行期间生效（含最小化到托盘）；关闭应用期间不会触发，
       重新打开后按任务的「错过策略」处理。
       <button class="ap-btn primary ap-new" data-test="automation-new-btn" @click="openCreate">＋ 新建任务</button>
     </div>
 
     <!-- 任务列表 -->
     <div v-if="store.automationTasks.length === 0 && !form.show" class="ap-empty">
-      还没有自动化任务。点击「新建任务」，把一段提示词绑定到定时器上，
+      还没有星轨自动化任务。点击「新建任务」，把一段提示词绑定到定时器上，
       星瑶会到点自动向指定会话发起一次完整回合。
     </div>
     <div v-else class="ap-list">
@@ -146,7 +146,7 @@
       <!-- 执行模型：与对话页模型同源，留空跟随会话绑定/全局默认 -->
       <div class="ap-row">
         <span class="ap-unit">执行模型</span>
-        <select v-model="form.modelId" data-test="automation-model" title="自动化回合使用的模型">
+        <select v-model="form.modelId" data-test="automation-model" title="星轨自动化回合使用的模型">
           <option value="">跟随会话 / 全局默认</option>
           <optgroup v-for="(models, provider) in store.modelsByProvider" :key="provider" :label="provider">
             <option v-for="m in models" :key="m.id" :value="m.id">{{ m.name }}</option>
@@ -166,7 +166,7 @@
         <label class="ap-weekday"><input type="checkbox" v-model="form.notifyOnSuccess" /> 成功也通知</label>
       </div>
       <div v-if="form.permissionMode === 'accept_edits' || form.permissionMode === 'full'" class="ap-risk" data-test="automation-risk-note">
-        ⚠ 无人值守档位：该任务的自动化回合可以不经确认{{ form.permissionMode === 'full' ? '修改文件并执行命令' : '修改文件' }}，
+        ⚠ 无人值守档位：该任务的星轨自动化回合可以不经确认{{ form.permissionMode === 'full' ? '修改文件并执行命令' : '修改文件' }}，
         每次触发都会在目标会话留下完整过程，可按回合撤销。
       </div>
 
@@ -183,6 +183,7 @@
 <script setup lang="ts">
 import { computed, reactive } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import AppIcon from './AppIcon.vue';
 import { formatPermMode } from '../utils/markdown';
 import type { AutomationTaskInfo } from '../types/pywebview';
 
@@ -371,7 +372,7 @@ async function onRunNow(t: AutomationTaskInfo) {
 
 async function onDelete(t: AutomationTaskInfo) {
   const ok = await store.askConfirm(
-    '删除自动化任务',
+    '删除星轨自动化任务',
     t.name,
     `将删除任务「${t.name}」及其全部运行历史，进行中的运行不受影响。`,
   );

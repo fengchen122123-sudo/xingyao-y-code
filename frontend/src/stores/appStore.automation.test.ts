@@ -10,7 +10,7 @@ const _task = {
   enabled: true,
   trigger_type: 'daily',
   trigger_config: { time: '09:30' },
-  target_session: '自动化任务',
+  target_session: '星轨自动化任务',
   prompt: '汇总',
   permission_mode: 'confirm',
   missed_run_policy: 'skip',
@@ -28,7 +28,7 @@ const _run = (id: string, status: string) => ({
   task_name: '每日摘要',
   trigger_kind: 'manual',
   status,
-  session_name: '自动化任务',
+  session_name: '星轨自动化任务',
   turn_id: null,
   error: '',
   queued_at: '2026-09-12 10:00:00',
@@ -111,7 +111,7 @@ it('runAutomationTaskNow 单飞拒绝时弹提示', async () => {
 
   const res = await store.runAutomationTaskNow('task-1');
   expect(res.ok).toBe(false);
-  expect(notifySpy).toHaveBeenCalledWith('自动化任务', '上一次运行尚未结束，请稍后再试');
+  expect(notifySpy).toHaveBeenCalledWith('星轨自动化任务', '上一次运行尚未结束，请稍后再试');
 });
 
 it('loadAutomationRuns 拉取并写入对应任务历史', async () => {

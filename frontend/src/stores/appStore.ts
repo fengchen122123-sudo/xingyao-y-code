@@ -636,7 +636,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       selected: '',
       dirs: [] as Array<{ name: string; path: string }>,
       // 纯选目录模式：非空时确认只把所选路径交给该回调（不登记工作区、
-      // 不迁移会话归属），供自动化任务表单等场景使用
+      // 不迁移会话归属），供星轨自动化任务表单等场景使用
       plainPick: null as null | ((path: string) => void),
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
@@ -2743,7 +2743,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.remoteDirBrowser.plainPick = null;
     },
 
-    // ---- 纯选目录（自动化任务表单等）：桌面走原生对话框，失败回退内置浏览器 ----
+    // ---- 纯选目录（星轨自动化任务表单等）：桌面走原生对话框，失败回退内置浏览器 ----
     async pickFolderPlain(cb: (path: string) => void) {
       const api = this._api();
       if (!api) return;
@@ -4077,7 +4077,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }
         return false;
       } catch (err) {
-        this.notifyModal('自动化任务', '读取自动化任务失败: ' + err);
+        this.notifyModal('星轨自动化任务', '读取星轨自动化任务失败: ' + err);
         return false;
       }
     },
@@ -4102,10 +4102,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       try {
         const res = await api.set_automation_task_enabled(taskId, enabled);
         if (!res || !res.ok) {
-          this.notifyModal('自动化任务', '启停失败: ' + ((res && res.msg) || '未知错误'));
+          this.notifyModal('星轨自动化任务', '启停失败: ' + ((res && res.msg) || '未知错误'));
         }
       } catch (err) {
-        this.notifyModal('自动化任务', '启停失败: ' + err);
+        this.notifyModal('星轨自动化任务', '启停失败: ' + err);
       }
     },
 
@@ -4120,10 +4120,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.automationRuns = runs;
           await this.refreshAutomations();
         } else {
-          this.notifyModal('自动化任务', '删除失败: ' + ((res && res.msg) || '未知错误'));
+          this.notifyModal('星轨自动化任务', '删除失败: ' + ((res && res.msg) || '未知错误'));
         }
       } catch (err) {
-        this.notifyModal('自动化任务', '删除失败: ' + err);
+        this.notifyModal('星轨自动化任务', '删除失败: ' + err);
       }
     },
 
@@ -4133,11 +4133,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       try {
         const res = await api.run_automation_task_now(taskId);
         if (res && !res.ok && res.msg) {
-          this.notifyModal('自动化任务', res.msg);
+          this.notifyModal('星轨自动化任务', res.msg);
         }
         return res || { ok: false, msg: '未知错误' };
       } catch (err) {
-        this.notifyModal('自动化任务', '执行失败: ' + err);
+        this.notifyModal('星轨自动化任务', '执行失败: ' + err);
         return { ok: false, msg: String(err) };
       }
     },

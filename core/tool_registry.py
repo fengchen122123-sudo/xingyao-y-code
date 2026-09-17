@@ -66,20 +66,25 @@ class ToolRegistry:
             }
         return arguments
 
-    def execute_strict(self, name: str, **arguments: Any) -> ToolResult:
-        """Execute a registered tool while preserving execution exceptions."""
-        spec = self.get(name)
+    def execute_strict(self, tool_name: str, **arguments: Any) -> ToolResult:
+        """Execute a registered tool while preserving execution exceptions.
+
+        首个形参刻意命名为 ``tool_name``：工具自身的参数里可能包含名叫 ``name`` 的
+        字段（如 mcp_add_server / automation_create），若形参叫 ``name`` 会与
+        ``**arguments`` 冲突（TypeError: multiple values for argument 'name'）。
+        """
+        spec = self.get(tool_name)
         result = spec.execute(**self._filtered_arguments(spec, arguments))
         if isinstance(result, ToolResult):
             return result
         return ToolResult(content=str(result) if result is not None else "")
 
-    def execute(self, name: str, **arguments: Any) -> ToolResult:
-        spec = self._specs.get(name)
+    def execute(self, tool_name: str, **arguments: Any) -> ToolResult:
+        spec = self._specs.get(tool_name)
         if spec is None:
-            return ToolResult(content=f"Unknown tool: {name}", is_error=True)
+            return ToolResult(content=f"Unknown tool: {tool_name}", is_error=True)
         try:
-            return self.execute_strict(name, **arguments)
+            return self.execute_strict(tool_name, **arguments)
         except Exception as exc:
             return ToolResult(content=f"Tool execution error: {exc}", is_error=True)
 
@@ -257,6 +262,26 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="匹配文件",
+        ),
+        ToolSpec(
+            name="automation_list",
+            description=(
+                "查看星轨自动化任务：列出全部任务的 id/名称/启用状态/触发器摘要/"
+                "下次触发时间/目标会话/权限档位/上次运行时间；传入 task_id 时查看单个任务"
+                "的完整详情与最近 10 条运行记录（状态/触发方式/起止时间/错误）。"
+                "仅 GUI 运行期间可用（CLI/headless 下会提示不可用）。"
+            ),
+            input_schema=_schema({
+                "task_id": {
+                    "type": "string",
+                    "description": "可选，查看某个星轨自动化任务的详情与最近运行记录",
+                },
+            }),
+            execute=_automation_list_wrapper,
+            read_only=True,
+            requires_permission=False,
+            parallel_safe=True,
+            activity_description="查看星轨自动化任务",
         ),
     ]
 
@@ -612,6 +637,170 @@ def build_default_registry() -> ToolRegistry:
             parallel_safe=True,
             activity_description="查看 MCP 服务列表",
         ),
+        # ── 星轨自动化工具（对话里创建/修改/删除/立即执行定时任务）───────
+        ToolSpec(
+            name="automation_create",
+            description=(
+                "创建一个星轨自动化任务（定时在某个会话里自动执行一段提示词）。"
+                "用户说「每天/每周/每隔多久执行某任务」时用本工具创建。\n"
+                "触发器参数形态（trigger_type）：\n"
+                "1) interval=每隔固定分钟数：必须传 interval_minutes（整数分钟，1..10080，即最多 7 天）；\n"
+                "2) daily=每天定点：必须传 time（零填充 24 小时制 HH:MM，例如 09:05、20:00）；\n"
+                "3) weekly=每周若干天定点：必须传 time 与 weekdays（整数数组，1=周一、2=周二、"
+                "3=周三、4=周四、5=周五、6=周六、7=周日，例如 [1,5] 表示周一和周五）；\n"
+                "4) startup=应用启动时执行一次：不需要任何触发器参数。\n"
+                "permission_mode：无人值守权限档位，只能是 confirm（默认，需要确认）或 "
+                "accept_edits（自动接受文件编辑）；plan/full 等更高档位不允许在对话里设置，"
+                "需要时请让用户在 GUI 星轨自动化面板里手动设置。\n"
+                "target_session 省略时默认使用当前对话所属会话。"
+            ),
+            input_schema=_schema({
+                "name": {"type": "string", "description": "任务名称（不超过 50 字）"},
+                "prompt": {"type": "string", "description": "触发的每个回合要执行的提示词"},
+                "trigger_type": {
+                    "type": "string",
+                    "enum": ["interval", "daily", "weekly", "startup"],
+                    "description": "触发器类型：interval/daily/weekly/startup",
+                },
+                "interval_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10080,
+                    "description": "interval 触发器：间隔分钟数（1..10080）",
+                },
+                "time": {
+                    "type": "string",
+                    "description": "daily/weekly 触发器：零填充 24 小时制 HH:MM，如 09:05、20:00",
+                },
+                "weekdays": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                    "description": "weekly 触发器：星期数组，1=周一 … 7=周日，如 [1,5] 表示周一、周五",
+                },
+                "target_session": {
+                    "type": "string",
+                    "description": "任务运行的目标会话名；省略时默认当前会话",
+                },
+                "permission_mode": {
+                    "type": "string",
+                    "enum": ["confirm", "accept_edits"],
+                    "default": "confirm",
+                    "description": "无人值守权限档位，仅支持 confirm / accept_edits",
+                },
+                "missed_run_policy": {
+                    "type": "string",
+                    "enum": ["skip", "run_once"],
+                    "default": "skip",
+                    "description": "应用未运行而错过触发时的策略：skip=跳过（默认）/ run_once=补跑一次",
+                },
+                "notify_on_success": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "任务成功完成后是否通知用户，默认 false",
+                },
+                "workdir": {
+                    "type": "string",
+                    "description": "可选，任务运行的工作目录；留空则跟随目标会话",
+                },
+                "model_id": {
+                    "type": "string",
+                    "description": "可选，指定模型 id；留空跟随会话绑定/全局默认",
+                },
+            }, ["name", "prompt", "trigger_type"]),
+            execute=_automation_create_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="创建星轨自动化任务",
+        ),
+        ToolSpec(
+            name="automation_update",
+            description=(
+                "修改一个已存在的星轨自动化任务：只传需要改的字段，其余字段保持原值。"
+                "可改 name/prompt/触发器（trigger_type 及 interval_minutes/time/weekdays）、"
+                "target_session/permission_mode/missed_run_policy/notify_on_success/workdir/model_id，"
+                "并可用 enabled=true/false 启用或停用任务。\n"
+                "触发器参数形态同 automation_create：interval 需 interval_minutes（1..10080）；"
+                "daily 需 time（零填充 HH:MM）；weekly 需 time 与 weekdays（1=周一 … 7=周日）；"
+                "startup 无参数。只传 time/weekdays 时会沿用任务原有的触发器类型。\n"
+                "permission_mode：无人值守权限档位只能是 confirm 或 accept_edits，"
+                "plan/full 等更高档位请在 GUI 星轨自动化面板里手动设置。"
+            ),
+            input_schema=_schema({
+                "task_id": {"type": "string", "description": "要修改的任务 id"},
+                "name": {"type": "string", "description": "新的任务名称"},
+                "prompt": {"type": "string", "description": "新的提示词"},
+                "trigger_type": {
+                    "type": "string",
+                    "enum": ["interval", "daily", "weekly", "startup"],
+                    "description": "新的触发器类型",
+                },
+                "interval_minutes": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 10080,
+                    "description": "interval 触发器：间隔分钟数（1..10080）",
+                },
+                "time": {
+                    "type": "string",
+                    "description": "daily/weekly 触发器：零填充 24 小时制 HH:MM",
+                },
+                "weekdays": {
+                    "type": "array",
+                    "items": {"type": "integer", "minimum": 1, "maximum": 7},
+                    "description": "weekly 触发器：星期数组，1=周一 … 7=周日",
+                },
+                "target_session": {"type": "string", "description": "新的目标会话名"},
+                "permission_mode": {
+                    "type": "string",
+                    "enum": ["confirm", "accept_edits"],
+                    "description": "无人值守权限档位，仅支持 confirm / accept_edits",
+                },
+                "missed_run_policy": {
+                    "type": "string",
+                    "enum": ["skip", "run_once"],
+                    "description": "错过触发的处理策略",
+                },
+                "notify_on_success": {
+                    "type": "boolean",
+                    "description": "成功完成后是否通知用户",
+                },
+                "workdir": {"type": "string", "description": "新的工作目录；传空字符串表示跟随目标会话"},
+                "model_id": {"type": "string", "description": "新的模型 id；传空字符串表示跟随默认"},
+                "enabled": {"type": "boolean", "description": "true=启用，false=停用该任务"},
+            }, ["task_id"]),
+            execute=_automation_update_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="修改星轨自动化任务",
+        ),
+        ToolSpec(
+            name="automation_delete",
+            description=(
+                "删除一个星轨自动化任务（连同它的运行记录）。"
+                "删除前应先用 automation_list 确认 task_id 与任务名称。"
+            ),
+            input_schema=_schema({
+                "task_id": {"type": "string", "description": "要删除的任务 id"},
+            }, ["task_id"]),
+            execute=_automation_delete_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="删除星轨自动化任务",
+        ),
+        ToolSpec(
+            name="automation_run_now",
+            description=(
+                "立即手动执行一次某个星轨自动化任务（不影响它原有的定时计划）。"
+                "任务上一次运行尚未结束时会被拒绝。"
+            ),
+            input_schema=_schema({
+                "task_id": {"type": "string", "description": "要立即执行的任务 id"},
+            }, ["task_id"]),
+            execute=_automation_run_now_wrapper,
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="立即执行星轨自动化任务",
+        ),
     ]
     registry = ToolRegistry([*read_specs, *mutating_specs])
     # 加载进程内插件（plugins/ 与 ~/.ycode/plugins/）。插件加载全程隔离，
@@ -646,3 +835,412 @@ def _mcp_set_enabled_wrapper(name, enabled):
 def _mcp_list_servers_wrapper():
     from core.mcp_client import mcp_manager
     return ToolResult(content=mcp_manager.list_servers(), is_error=False)
+
+
+# ── 星轨自动化（automation_*）工具的执行包装函数 ──────────────────────
+#
+# 全部经 core.automation.service 句柄访问桥侧能力：工具层不读写数据库、不
+# 发事件、不唤醒引擎；CLI/headless 未注册句柄时统一提示能力不可用。
+_AUTOMATION_SERVICE_UNAVAILABLE = "星轨自动化仅在 GUI 运行期间可用（当前为 CLI/headless）"
+# 无人值守权限档位：对话创建的星轨自动化任务只允许 confirm / accept_edits，
+# 更高档位必须由用户在 GUI 星轨自动化面板里手动设置（design：无人值守安全边界）。
+_AUTOMATION_ALLOWED_PERMISSION_MODES = ("confirm", "accept_edits")
+_AUTOMATION_PERMISSION_MODE_MESSAGE = (
+    "无人值守权限档位只支持 confirm 或 accept_edits；"
+    "需要更高档位请在 GUI 星轨自动化面板里手动设置"
+)
+
+
+def _automation_service_or_error():
+    """取服务句柄；未注册（CLI/headless）时返回 (None, 错误结果)。"""
+    from core.automation import service as automation_service
+
+    svc = automation_service.get()
+    if svc is None:
+        return None, ToolResult(
+            content=_AUTOMATION_SERVICE_UNAVAILABLE, is_error=True
+        )
+    return svc, None
+
+
+def _automation_permission_mode_error(permission_mode):
+    """校验无人值守权限档位；非法（plan/full/未知）时返回错误结果。"""
+    if permission_mode is None:
+        return None
+    mode = str(permission_mode).strip()
+    if not mode:
+        return None
+    if mode not in _AUTOMATION_ALLOWED_PERMISSION_MODES:
+        return ToolResult(
+            content=_AUTOMATION_PERMISSION_MODE_MESSAGE, is_error=True
+        )
+    return None
+
+
+def _automation_bridge_error_text(resp) -> str:
+    """把桥侧返回值里的 errors/msg 拼成人类可读文本。"""
+    if isinstance(resp, dict):
+        errors = resp.get("errors")
+        if isinstance(errors, (list, tuple)) and errors:
+            return "；".join(str(item) for item in errors)
+        msg = resp.get("msg")
+        if msg:
+            return str(msg)
+        if resp.get("ok"):
+            return ""
+    if resp is None:
+        return "自动化服务未返回结果"
+    return str(resp)
+
+
+def _automation_build_trigger_config(
+    trigger_type, interval_minutes, time, weekdays
+):
+    """按触发器类型组装 trigger_config；返回 (config, 错误文本)。
+
+    只做「参数是否齐备」的检查，取值范围/格式由桥侧 validate_task 兜底并原样
+    透出错误，避免 core 层出现两套校验。
+    """
+    trigger_type = str(trigger_type or "").strip()
+    if trigger_type == "interval":
+        if interval_minutes is None:
+            return None, "interval 触发器必须提供 interval_minutes（整数分钟，1..10080）"
+        return {"interval_minutes": interval_minutes}, None
+    if trigger_type == "daily":
+        if time is None:
+            return None, "daily 触发器必须提供 time（零填充 24 小时制 HH:MM，如 09:05）"
+        return {"time": time}, None
+    if trigger_type == "weekly":
+        if time is None or weekdays is None:
+            return (
+                None,
+                "weekly 触发器必须同时提供 time（HH:MM）与 weekdays（1=周一 … 7=周日）",
+            )
+        return {"time": time, "weekdays": weekdays}, None
+    if trigger_type == "startup":
+        return {}, None
+    return (
+        None,
+        f"未知触发器类型: {trigger_type!r}（可用：interval / daily / weekly / startup）",
+    )
+
+
+def _automation_trigger_summary(task: dict) -> str:
+    """取/算任务的触发器摘要（DTO 可能已带 trigger_summary）。"""
+    summary = task.get("trigger_summary")
+    if summary:
+        return str(summary)
+    try:
+        from core.automation.models import trigger_summary as _summarize
+
+        return _summarize(task.get("trigger_type"), task.get("trigger_config") or {})
+    except Exception:
+        return str(task.get("trigger_type") or "未知触发器")
+
+
+def _automation_format_ts(value) -> str:
+    if value in (None, ""):
+        return "未计划"
+    try:
+        from datetime import datetime
+
+        return datetime.fromtimestamp(float(value)).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError, OSError):
+        return str(value)
+
+
+def _automation_task_line(task: dict) -> str:
+    enabled = "启用" if task.get("enabled") else "停用"
+    return (
+        f"- {task.get('name')}｜id={task.get('id')}｜{enabled}"
+        f"｜{_automation_trigger_summary(task)}"
+        f"｜下次触发={_automation_format_ts(task.get('next_run_at'))}"
+        f"｜上次运行={_automation_format_ts(task.get('last_run_at'))}"
+        f"｜目标会话={task.get('target_session')}"
+        f"｜权限档位={task.get('permission_mode')}"
+    )
+
+
+def _automation_run_line(run: dict) -> str:
+    return (
+        f"- {run.get('id')}｜状态={run.get('status')}"
+        f"｜触发方式={run.get('trigger_kind')}"
+        f"｜开始={run.get('started_at') or run.get('queued_at')}"
+        f"｜结束={run.get('finished_at')}"
+        + (f"｜错误={run.get('error')}" if run.get("error") else "")
+    )
+
+
+def _automation_list_wrapper(task_id=None, **_ignored):
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    task_id = str(task_id or "").strip()
+    if task_id:
+        task = svc.get_task(task_id)
+        if not isinstance(task, dict):
+            return ToolResult(content=f"未找到星轨自动化任务：{task_id}", is_error=True)
+        lines = [f"星轨自动化任务详情：{task.get('name')}", _automation_task_line(task)]
+        if task.get("prompt"):
+            lines.append(f"提示词：{task.get('prompt')}")
+        runs_resp = svc.get_runs(task_id, 10)
+        if isinstance(runs_resp, dict) and runs_resp.get("ok"):
+            runs = runs_resp.get("runs") or []
+            lines.append(f"最近运行记录（最多 10 条，共 {len(runs)} 条）：")
+            if runs:
+                lines.extend(_automation_run_line(run) for run in runs)
+            else:
+                lines.append("（暂无运行记录）")
+        else:
+            lines.append(
+                f"读取运行记录失败：{_automation_bridge_error_text(runs_resp)}"
+            )
+        return ToolResult(content="\n".join(lines))
+
+    resp = svc.list_tasks()
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return ToolResult(
+            content=f"读取星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+            is_error=True,
+        )
+    tasks = resp.get("tasks") or []
+    if not tasks:
+        return ToolResult(content="当前没有任何星轨自动化任务。")
+    lines = [f"共 {len(tasks)} 个星轨自动化任务："]
+    lines.extend(_automation_task_line(task) for task in tasks)
+    return ToolResult(content="\n".join(lines))
+
+
+def _automation_create_wrapper(
+    *,
+    name,
+    prompt,
+    trigger_type,
+    interval_minutes=None,
+    time=None,
+    weekdays=None,
+    target_session=None,
+    permission_mode=None,
+    missed_run_policy=None,
+    notify_on_success=None,
+    workdir=None,
+    model_id=None,
+    **_ignored,
+):
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    perm_err = _automation_permission_mode_error(permission_mode)
+    if perm_err is not None:
+        return perm_err
+
+    config, config_err = _automation_build_trigger_config(
+        trigger_type, interval_minutes, time, weekdays
+    )
+    if config_err:
+        return ToolResult(content=config_err, is_error=True)
+
+    session = str(target_session).strip() if target_session else ""
+    if not session:
+        from core import app_context
+
+        session = str(app_context.get_thread_session() or "").strip()
+    if not session:
+        return ToolResult(
+            content=(
+                "未指定 target_session，且当前回合没有绑定会话；"
+                "请显式指定要运行该任务的会话名（target_session）。"
+            ),
+            is_error=True,
+        )
+
+    task = {
+        "name": name,
+        "prompt": prompt,
+        "trigger_type": str(trigger_type or "").strip(),
+        "trigger_config": config,
+        "target_session": session,
+        "permission_mode": str(permission_mode).strip() if permission_mode else "confirm",
+        "missed_run_policy": (
+            str(missed_run_policy).strip() if missed_run_policy else "skip"
+        ),
+        "notify_on_success": bool(notify_on_success),
+        "enabled": True,
+    }
+    if workdir is not None:
+        task["workdir"] = str(workdir).strip()
+    if model_id is not None:
+        task["model_id"] = str(model_id).strip()
+
+    resp = svc.save_task(task)
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return ToolResult(
+            content=f"创建星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+            is_error=True,
+        )
+    task_id = resp.get("id")
+    return ToolResult(
+        content=(
+            f"已创建星轨自动化任务「{task.get('name')}」：id={task_id}"
+            f"｜{_automation_trigger_summary(task)}"
+            f"｜目标会话={task['target_session']}｜权限档位={task['permission_mode']}"
+        )
+    )
+
+
+def _automation_update_wrapper(
+    *,
+    task_id,
+    name=None,
+    prompt=None,
+    trigger_type=None,
+    interval_minutes=None,
+    time=None,
+    weekdays=None,
+    target_session=None,
+    permission_mode=None,
+    missed_run_policy=None,
+    notify_on_success=None,
+    workdir=None,
+    model_id=None,
+    enabled=None,
+    **_ignored,
+):
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return ToolResult(content="必须提供 task_id。", is_error=True)
+
+    perm_err = _automation_permission_mode_error(permission_mode)
+    if perm_err is not None:
+        return perm_err
+
+    old = svc.get_task(task_id)
+    if not isinstance(old, dict):
+        return ToolResult(content=f"未找到星轨自动化任务：{task_id}", is_error=True)
+
+    # 桥侧 save_task 是整体覆盖：先取旧任务，只把传入（非 None）字段合并进去，
+    # 未传字段必须保持原值，否则会被清空。
+    task = dict(old)
+    changed: list[str] = []
+    if name is not None:
+        task["name"] = name
+        changed.append("名称")
+    if prompt is not None:
+        task["prompt"] = prompt
+        changed.append("提示词")
+    if target_session is not None:
+        task["target_session"] = str(target_session).strip()
+        changed.append("目标会话")
+    if permission_mode is not None:
+        task["permission_mode"] = str(permission_mode).strip()
+        changed.append("权限档位")
+    if missed_run_policy is not None:
+        task["missed_run_policy"] = str(missed_run_policy).strip()
+        changed.append("错过策略")
+    if notify_on_success is not None:
+        task["notify_on_success"] = bool(notify_on_success)
+        changed.append("成功通知")
+    if workdir is not None:
+        task["workdir"] = str(workdir).strip()
+        changed.append("工作目录")
+    if model_id is not None:
+        task["model_id"] = str(model_id).strip()
+        changed.append("指定模型")
+
+    trigger_touched = trigger_type is not None or any(
+        value is not None for value in (interval_minutes, time, weekdays)
+    )
+    if trigger_touched:
+        old_config = task.get("trigger_config")
+        if not isinstance(old_config, dict):
+            old_config = {}
+        effective_type = (
+            trigger_type if trigger_type is not None else task.get("trigger_type")
+        )
+        config, config_err = _automation_build_trigger_config(
+            effective_type,
+            interval_minutes if interval_minutes is not None else old_config.get("interval_minutes"),
+            time if time is not None else old_config.get("time"),
+            weekdays if weekdays is not None else old_config.get("weekdays"),
+        )
+        if config_err:
+            return ToolResult(content=config_err, is_error=True)
+        task["trigger_type"] = str(effective_type or "").strip()
+        task["trigger_config"] = config
+        changed.append("触发器")
+
+    if not changed and enabled is None:
+        return ToolResult(
+            content="请至少提供一个要修改的字段（名称/提示词/触发器/目标会话/权限档位等，或 enabled）。",
+            is_error=True,
+        )
+
+    if changed:
+        resp = svc.save_task(task)
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return ToolResult(
+                content=f"更新星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+                is_error=True,
+            )
+
+    if enabled is not None:
+        # 启停走桥侧专用方法（轻量、并发安全）；已保存的合并结果不覆盖它。
+        resp = svc.set_enabled(task_id, bool(enabled))
+        if not isinstance(resp, dict) or not resp.get("ok"):
+            return ToolResult(
+                content=f"切换星轨自动化任务启停失败：{_automation_bridge_error_text(resp)}",
+                is_error=True,
+            )
+
+    parts = []
+    if changed:
+        parts.append(f"已更新{('、'.join(changed))}")
+    if enabled is not None:
+        parts.append("已" + ("启用" if enabled else "停用"))
+    return ToolResult(content=f"星轨自动化任务 {task_id}：{'，'.join(parts)}。")
+
+
+def _automation_delete_wrapper(*, task_id, **_ignored):
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return ToolResult(content="必须提供 task_id。", is_error=True)
+
+    resp = svc.delete_task(task_id)
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return ToolResult(
+            content=f"删除星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+            is_error=True,
+        )
+    if not resp.get("deleted"):
+        return ToolResult(content=f"未找到星轨自动化任务：{task_id}", is_error=True)
+    return ToolResult(content=f"已删除星轨自动化任务 {task_id}。")
+
+
+def _automation_run_now_wrapper(*, task_id, **_ignored):
+    svc, err = _automation_service_or_error()
+    if err is not None:
+        return err
+
+    task_id = str(task_id or "").strip()
+    if not task_id:
+        return ToolResult(content="必须提供 task_id。", is_error=True)
+
+    resp = svc.run_now(task_id)
+    if not isinstance(resp, dict) or not resp.get("ok"):
+        return ToolResult(
+            content=f"立即执行星轨自动化任务失败：{_automation_bridge_error_text(resp)}",
+            is_error=True,
+        )
+    return ToolResult(
+        content=f"已触发星轨自动化任务 {task_id} 立即执行：run_id={resp.get('run_id')}"
+    )
