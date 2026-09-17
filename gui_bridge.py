@@ -2816,6 +2816,62 @@ class ApiBridge:
             logger.exception("search_sessions 失败")
             return {"ok": False, "msg": str(e), "sessions": []}
 
+    def search_sessions_full(
+        self,
+        query: str = "",
+        scope: str = "all",
+        workdir: str = "",
+        limit: int = 30,
+    ) -> Dict[str, Any]:
+        """会话多维度全局检索（标题模糊匹配 + 对话内容全文检索）。"""
+        try:
+            if self._memory is None:
+                return {"ok": False, "msg": "后端未就绪", "results": [], "total": 0}
+            q = str(query or "").strip()
+            if not q:
+                return {"ok": True, "results": [], "total": 0}
+
+            target_workdir = str(workdir or "").strip() or None
+            raw_results = self._memory.search_sessions_and_messages(
+                query=q,
+                scope=scope,
+                workdir=target_workdir,
+                source="GUI",
+                limit=max(1, min(int(limit or 30), 100)),
+            )
+
+            results = []
+            for item in raw_results:
+                name = str(item.get("session_name") or "")
+                is_default_name = bool(re.match(r"^session_[a-f0-9]{6}$", name))
+                display_name = "新会话" if is_default_name else name
+                item_workdir = str(item.get("workdir") or "")
+                if not item_workdir or item_workdir == "GLOBAL":
+                    workdir_label = "自由对话"
+                    workdir_val = "GLOBAL"
+                else:
+                    norm_w = _resolve_real_path(item_workdir)
+                    workdir_label = os.path.basename(norm_w) or norm_w
+                    workdir_val = norm_w
+
+                results.append({
+                    "type": item.get("type") or "title",
+                    "session_name": name,
+                    "display_name": display_name,
+                    "workdir": workdir_val,
+                    "workdir_label": workdir_label,
+                    "updated_at": str(item.get("updated_at") or ""),
+                    "msg_count": int(item.get("msg_count") or 0),
+                    "role": item.get("role"),
+                    "snippet": item.get("snippet"),
+                })
+
+            return {"ok": True, "results": results, "total": len(results)}
+        except Exception as e:
+            logger.exception("search_sessions_full 失败")
+            return {"ok": False, "msg": str(e), "results": [], "total": 0}
+
+
     def get_workspace_state(self, workdir: str) -> Dict[str, Any]:
         """读取显式项目目录的前端快照，不依赖进程当前工作目录。"""
         try:

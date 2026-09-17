@@ -70,6 +70,7 @@ export const ICON_PATHS: Record<string, string> = {
     '<path d="M11.5 4.5 13.1 9.9 18.5 11.5 13.1 13.1 11.5 18.5 9.9 13.1 4.5 11.5 9.9 9.9Z"/><circle cx="18.8" cy="5.4" r="1.9"/>',
   smartphone:
     '<rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/>',
+  search: '<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/>',
 };
 
 export type IconName = keyof typeof ICON_PATHS;

@@ -2261,6 +2261,16 @@ def _sanitize_error_text(text):
     )
 
 
+def _format_user_facing_error(exc):
+    """将异常转换为用户友好的中文诊断说明，并确保脱敏。"""
+    try:
+        from core.llm_error_mapper import format_user_facing_error
+
+        return format_user_facing_error(exc)
+    except Exception:
+        return _sanitize_error_text(exc)
+
+
 def _fold_old_media_for_estimate(messages):
     """估算前把历史图片折叠为占位符（与请求时 _strip_media_and_merge 的规则一致）。
 
@@ -2672,7 +2682,7 @@ def chat_with_model_events(
             ),
         )
         yield from drain_public_events()
-        yield factory.emit("turn_error", {"message": _sanitize_error_text(exc)})
+        yield factory.emit("turn_error", {"message": _format_user_facing_error(exc)})
         raise
     finally:
         # 消费端主动 close 会以 GeneratorExit 跳过上面的两个异常分支；这里
@@ -6958,12 +6968,13 @@ def _chat_with_model_generator(
         if e is persistence_failure:
             raise
         if event_callback is not None:
+            user_facing_msg = _format_user_facing_error(e)
             _notify_event(event_callback, "error", {
-                "message": _sanitize_error_text(e),
+                "message": user_facing_msg,
             })
             # 专用结束事件：chat_with_model_events 不再为异常回合发 turn_finished
             _notify_event(event_callback, "turn_error", {
-                "message": _sanitize_error_text(e),
+                "message": user_facing_msg,
             })
         else:
             from prompt_toolkit.formatted_text import HTML
