@@ -133,3 +133,48 @@ it('无 navItems 时完全回退 DOM 驱动（旧行为）', async () => {
   expect(wrapper.findAll('[data-test="rail-dot"]')).toHaveLength(2);
   expect(wrapper.findAll('.dim')).toHaveLength(0);
 });
+
+// 首页/翻页的回合对齐有上限（页大小 + 30 条），工具调用密集的回合会撑破上限，
+// 使已加载区首条消息是 assistant/tool——它的 id 不在 user 索引里。此时必须按
+// 「其后第一条 user 消息」定位已加载分界，否则分界退化为 0，红点整体错位
+//（用户反馈：点第 3 个点显示第 4 条内容）。
+it('已加载区首条是 assistant/tool（对齐超限）时：分界落在其后第一条 user 上', async () => {
+  const scrollEl = makeScrollEl();
+  let scrolled = -1;
+  scrollEl.scrollTo = (opts: any) => { scrolled = opts?.top ?? 0; };
+  scrollEl.getBoundingClientRect = () => ({ top: 0, height: 600 } as DOMRect);
+  const els = makeUserMsgEls(4); // DOM 已加载 4 条 user
+  const wrapper = mount(MessageNavRail, {
+    props: {
+      getScrollEl: () => scrollEl,
+      getUserMsgElements: () => els,
+      navItems,          // user 索引：10 / 20 / 30 / 40 / 50
+      loadedFirstId: 15, // 页首是 assistant（id=15），不在 user 索引中
+    },
+  });
+  await nextTick();
+  const dots = wrapper.findAll('[data-test="rail-dot"]');
+  // 已加载区首条 user 是 id=20（索引 1）：第 1 个红点未加载，第 2 个起已加载
+  expect(dots[0].classes()).toContain('dim');
+  expect(dots[1].classes()).not.toContain('dim');
+
+  // 点第 2 个红点（全局索引 1）→ DOM 局部索引 0（top=100），不得错位到第 2 条
+  await dots[1].trigger('click');
+  expect(wrapper.emitted('jump')).toBeUndefined();
+  expect(scrolled).toBe(100 - 16);
+});
+
+it('页首比所有 user 消息都新时：全部红点按未加载处理', async () => {
+  const scrollEl = makeScrollEl();
+  const els = makeUserMsgEls(2);
+  const wrapper = mount(MessageNavRail, {
+    props: {
+      getScrollEl: () => scrollEl,
+      getUserMsgElements: () => els,
+      navItems,
+      loadedFirstId: 999,
+    },
+  });
+  await nextTick();
+  expect(wrapper.findAll('.dim')).toHaveLength(5);
+});
