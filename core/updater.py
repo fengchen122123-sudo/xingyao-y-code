@@ -102,18 +102,19 @@ def _pick_main_installer_group(
 ) -> Optional[Tuple[str, List[Dict[str, Any]]]]:
     """从多组完整分卷里挑主安装包（GUI 版）那组。
 
-    优先精确匹配主安装包分发名 Y-code-{版本}.exe；退而求其次取
-    Y-code 前缀且不含 cli 的基名；都没有时返回第一组（极端兜底，
-    总比拒绝更新好）。找不到任何完整分卷时返回 None。
+    优先精确匹配主安装包分发名 XingYaoCode-{版本}.exe；为兼容旧命名，
+    再匹配 Y-code-{版本}.exe；退而求其次取基名小写以 xingyaocode 或
+    y-code 开头且不含 cli 的组；都没有时返回第一组（极端兜底，总比拒绝
+    更新好）。找不到任何完整分卷时返回 None。
     """
     if not complete:
         return None
-    exact = f"Y-code-{version}.exe"
-    if exact in complete:
-        return exact, complete[exact]
+    for exact in (f"XingYaoCode-{version}.exe", f"Y-code-{version}.exe"):
+        if exact in complete:
+            return exact, complete[exact]
     for stem in complete:
         low = stem.lower()
-        if low.startswith("y-code") and "cli" not in low:
+        if (low.startswith("xingyaocode") or low.startswith("y-code")) and "cli" not in low:
             return stem, complete[stem]
     stem = next(iter(complete))
     return stem, complete[stem]
@@ -125,7 +126,8 @@ def _pick_main_installer_exe(
     """从单 exe 附件里挑主安装包（GUI 版）。
 
     同 Release 可能同时挂主安装包与 CLI 安装包两个 exe，自动更新必须
-    优先选主安装包：精确名 > Y-code 前缀且非 cli > 任意 exe。
+    优先选主安装包：精确名 XingYaoCode-{版本}.exe（兼容旧命名
+    Y-code-{版本}.exe）> xingyaocode / y-code 前缀且非 cli > 任意 exe。
     """
     exe_assets = [
         a for a in (assets or [])
@@ -133,13 +135,13 @@ def _pick_main_installer_exe(
     ]
     if not exe_assets:
         return None
-    exact = f"Y-code-{version}.exe"
-    for asset in exe_assets:
-        if str(asset.get("name")) == exact:
-            return asset
+    for exact in (f"XingYaoCode-{version}.exe", f"Y-code-{version}.exe"):
+        for asset in exe_assets:
+            if str(asset.get("name")) == exact:
+                return asset
     for asset in exe_assets:
         low = str(asset.get("name") or "").lower()
-        if low.startswith("y-code") and "cli" not in low:
+        if (low.startswith("xingyaocode") or low.startswith("y-code")) and "cli" not in low:
             return asset
     return exe_assets[0]
 

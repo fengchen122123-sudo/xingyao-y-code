@@ -49,6 +49,13 @@ def patched_env(tmp_path, monkeypatch):
     return calls
 
 
+def test_shortcut_names_cover_new_brand_and_legacy():
+    """卸载快捷方式清单必须含新品牌名 星瑶code.lnk，并保留旧命名以便清干净老用户桌面。"""
+    assert "星瑶code.lnk" in ycode_uninstall.SHORTCUT_NAMES
+    for legacy in ("Y-code.lnk", "Y-code CLI.lnk", "Y-code TUI.lnk"):
+        assert legacy in ycode_uninstall.SHORTCUT_NAMES
+
+
 def test_user_scope_uninstall_removes_everything(tmp_path, patched_env):
     install_dir = _fake_install_dir(tmp_path)
     (tmp_path / "home" / ".ycode").mkdir(parents=True)
