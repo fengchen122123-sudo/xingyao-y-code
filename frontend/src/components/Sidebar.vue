@@ -39,6 +39,7 @@
     <div class="side-section">
       项目会话
       <span>
+        <button class="add-btn" title="搜索会话 (Ctrl+F)" style="margin-right:4px" data-test="btn-search-sessions" @click="store.openSessionSearchModal()"><AppIcon name="search" :size="13" /></button>
         <button class="add-btn" title="添加/引入项目文件夹" style="margin-right:4px" @click="store.openWorkspaceFolder()"><AppIcon name="folder-plus" :size="13" /></button>
         <button class="add-btn" title="新建自由通用对话(跳出文件夹)" @click="store.createGlobalSession()">＋</button>
       </span>

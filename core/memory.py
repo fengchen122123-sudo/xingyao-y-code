@@ -7,6 +7,7 @@ import re
 import sqlite3
 import threading
 import time
+from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from core.harness.models import JournalEventDraft
@@ -2364,6 +2365,147 @@ class MemoryManager:
             }
             for row in filtered
         ]
+
+    def search_sessions_and_messages(
+        self,
+        query: str,
+        scope: str = "all",
+        workdir: Optional[str] = None,
+        source: Optional[str] = "GUI",
+        limit: int = 30,
+    ) -> List[Dict[str, Any]]:
+        """全文与标题复合检索会话。
+
+        scope:
+          - "all": 既检索标题又检索消息内容
+          - "title": 仅检索会话标题/名称
+          - "content": 仅检索消息正文 (role IN ('user', 'assistant'))
+        workdir:
+          - None: 不限工作区
+          - "GLOBAL": 自由通用会话
+          - path: 指定工作目录
+        source:
+          - 默认 "GUI"，匹配 s.source = 'GUI' OR s.source IS NULL
+        limit:
+          - 最大返回条数
+        """
+        q = str(query or "").strip()
+        if not q:
+            return []
+
+        # 转义 SQL LIKE 通配符
+        escaped_q = q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        pattern = f"%{escaped_q}%"
+
+        norm_workdir = _normalize_workdir(workdir) if (workdir and workdir != "GLOBAL") else workdir
+
+        results: List[Dict[str, Any]] = []
+
+        def _make_snippet(text: str) -> str:
+            clean = re.sub(r"[\r\n\t]+", " ", str(text or "")).strip()
+            lower_clean = clean.lower()
+            lower_kw = q.lower()
+            idx = lower_clean.find(lower_kw)
+            context_len = 35
+            if idx == -1:
+                sub = clean[: context_len * 2]
+                res = sub + ("..." if len(clean) > len(sub) else "")
+            else:
+                start = max(0, idx - context_len)
+                end = min(len(clean), idx + len(q) + context_len)
+                res = ("..." if start > 0 else "") + clean[start:end] + ("..." if end < len(clean) else "")
+            # 凭证脱敏
+            return re.sub(r"sk-[a-zA-Z0-9]{16,}", "sk-***", res)
+
+        with self._lock:
+            cursor = self.conn.cursor()
+
+            # 1. 标题搜索 (scope in ("all", "title"))
+            if scope in ("all", "title"):
+                title_sql = """
+                    SELECT s.id, s.session_name, s.workdir, s.updated_at, s.created_at,
+                           (SELECT COUNT(m.id) FROM messages m WHERE m.session_id = s.id) as msg_count
+                    FROM sessions s
+                    WHERE (s.source = ? OR s.source IS NULL)
+                      AND s.session_name LIKE ? ESCAPE '\\'
+                """
+                params = [source, pattern]
+                if norm_workdir is not None:
+                    if norm_workdir == "GLOBAL":
+                        title_sql += " AND (s.workdir IS NULL OR s.workdir = 'GLOBAL')"
+                    else:
+                        title_sql += " AND s.workdir = ?"
+                        params.append(norm_workdir)
+
+                title_sql += " ORDER BY s.updated_at DESC LIMIT ?"
+                params.append(limit)
+
+                cursor.execute(title_sql, params)
+                for row in cursor.fetchall():
+                    s_id, s_name, s_workdir, s_updated, s_created, msg_count = row
+                    results.append({
+                        "type": "title",
+                        "session_id": s_id,
+                        "session_name": s_name,
+                        "workdir": s_workdir or "GLOBAL",
+                        "updated_at": s_updated or "",
+                        "created_at": s_created or "",
+                        "msg_count": msg_count or 0,
+                        "msg_id": None,
+                        "role": None,
+                        "snippet": None,
+                    })
+
+            # 2. 内容搜索 (scope in ("all", "content"))
+            if scope in ("all", "content"):
+                content_sql = """
+                    SELECT m.id, m.role, m.content, s.id, s.session_name, s.workdir, s.updated_at, s.created_at,
+                           (SELECT COUNT(m2.id) FROM messages m2 WHERE m2.session_id = s.id) as msg_count
+                    FROM messages m
+                    JOIN sessions s ON m.session_id = s.id
+                    WHERE (s.source = ? OR s.source IS NULL)
+                      AND m.role IN ('user', 'assistant')
+                      AND m.content LIKE ? ESCAPE '\\'
+                """
+                params = [source, pattern]
+                if norm_workdir is not None:
+                    if norm_workdir == "GLOBAL":
+                        content_sql += " AND (s.workdir IS NULL OR s.workdir = 'GLOBAL')"
+                    else:
+                        content_sql += " AND s.workdir = ?"
+                        params.append(norm_workdir)
+
+                content_sql += " ORDER BY s.updated_at DESC, m.id DESC LIMIT ?"
+                params.append(limit * 2)
+
+                cursor.execute(content_sql, params)
+                session_content_hits: Dict[int, int] = {}
+                for row in cursor.fetchall():
+                    m_id, m_role, m_content, s_id, s_name, s_workdir, s_updated, s_created, msg_count = row
+                    hits = session_content_hits.get(s_id, 0)
+                    # 同一会话最多提取 2 条命中消息片段，防止被单个长会话刷屏
+                    if hits >= 2:
+                        continue
+                    session_content_hits[s_id] = hits + 1
+
+                    snippet = _make_snippet(m_content)
+                    results.append({
+                        "type": "content",
+                        "session_id": s_id,
+                        "session_name": s_name,
+                        "workdir": s_workdir or "GLOBAL",
+                        "updated_at": s_updated or "",
+                        "created_at": s_created or "",
+                        "msg_count": msg_count or 0,
+                        "msg_id": m_id,
+                        "role": m_role,
+                        "snippet": snippet,
+                    })
+                    if len(results) >= limit:
+                        break
+
+        return results[:limit]
+
 
     def get_memory_summary(self, session_name):
         """获取当前会话的背景记忆摘要"""

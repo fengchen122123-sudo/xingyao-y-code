@@ -888,6 +888,28 @@ export interface PyWebViewAPI {
     sessions?: { name: string; count: number; updated_at: string; workdir: string }[];
     msg?: string;
   }>;
+  // 会话多维度全局检索（标题模糊匹配 + 对话内容全文检索）
+  search_sessions_full(
+    query: string,
+    scope?: 'all' | 'title' | 'content',
+    workdir?: string,
+    limit?: number,
+  ): Promise<{
+    ok: boolean;
+    total: number;
+    results: {
+      type: 'title' | 'content';
+      session_name: string;
+      display_name: string;
+      workdir: string;
+      workdir_label: string;
+      updated_at: string;
+      msg_count: number;
+      role?: 'user' | 'assistant' | null;
+      snippet?: string | null;
+    }[];
+    msg?: string;
+  }>;
   get_dir_children(path: string): Promise<any>;
   get_file_tree(workdir: string): Promise<any>;
   set_titlebar_theme(dark: boolean): Promise<any>;
