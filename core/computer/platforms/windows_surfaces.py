@@ -133,14 +133,26 @@ class _ComThread:
     def start(self) -> None:
         self._thread.start()
         self._ready.wait(timeout=10)
+        self._raise_if_unavailable()
+
+    def _raise_if_unavailable(self) -> None:
+        """线程死亡或初始化失败时立即抛出明确错误，绝不伪装成「调用超时」。"""
         if self._init_error is not None:
             raise ComputerControlError(
                 "computer_surfaces_unavailable",
                 f"UI Automation 不可用：{type(self._init_error).__name__}",
             )
+        if not self._thread.is_alive():
+            # 线程未启动或已退出：队列不会有人消费，任何投递都必然空等。
+            raise ComputerControlError(
+                "computer_surfaces_unavailable",
+                "UI Automation 不可用：COM 线程已退出",
+            )
 
     def call(self, fn):
         """在 COM 线程执行 fn(uia) 并返回结果；UIA 对象绝不离开该线程。"""
+        # 投递前先确认线程可消费任务，避免把初始化失败/线程死亡伪装成超时。
+        self._raise_if_unavailable()
         done = threading.Event()
         holder: dict = {}
 
@@ -154,6 +166,8 @@ class _ComThread:
 
         self._queue.put(job)
         if not done.wait(timeout=10):
+            # 线程可能在等待窗口内死亡：优先报告真实原因。
+            self._raise_if_unavailable()
             raise ComputerControlError(
                 "computer_surfaces_unavailable", "UI Automation 调用超时"
             )
@@ -167,11 +181,11 @@ class _ComThread:
 
     def _main(self) -> None:
         try:
-            import comtypes
-            import comtypes.client
-
-            comtypes.CoInitialize()
             try:
+                import comtypes
+                import comtypes.client
+
+                comtypes.CoInitialize()
                 comtypes.client.GetModule("UIAutomationCore.dll")
                 from comtypes.gen.UIAutomationClient import IUIAutomation
 
@@ -179,10 +193,12 @@ class _ComThread:
                     _CUIAUTOMATION_CLSID, interface=IUIAutomation
                 )
             except BaseException as error:
+                # 初始化失败（comtypes 缺失、CoInitialize 失败等）必须落盘错误并
+                # 唤醒等待方；绝不让异常逸出线程、留下 ready 永不置位的假象。
                 self._init_error = error
-                self._ready.set()
                 return
-            self._ready.set()
+            finally:
+                self._ready.set()
             while True:
                 job = self._queue.get()
                 if job is None:

@@ -452,8 +452,22 @@ class WindowsComputerBackend:
         kind = action.kind
         if kind == "list_surfaces":
             # 枚举经候选落进紧随其后的观察；多候选原样返回，不自动选第一个。
+            # 窗口列表与托盘图标是两条独立路径：窗口走纯 Win32 枚举（快且稳），
+            # 托盘走 UIA 遍历（依赖缺失/调用超时会失败）。两者不得绑成一个原子
+            # 动作——托盘失败只降级为「托盘候选为空」，已经枚举到的窗口候选必须
+            # 照常返回，否则用户拿不到任何候选、无法用 activate_surface 调前台。
             windows = locator.list_windows()
-            tray = locator.list_tray_icons()
+            try:
+                tray = locator.list_tray_icons()
+            except Exception as error:
+                # 降级可诊断：带失败原因留痕，绝不静默吞错。
+                _LOGGER.warning(
+                    "托盘图标枚举失败，list_surfaces 降级为仅窗口候选：%s: %s",
+                    type(error).__name__,
+                    error,
+                    exc_info=True,
+                )
+                tray = ()
             self._pending_surface_candidates = tuple(
                 {
                     "ref": candidate.ref,
@@ -465,6 +479,7 @@ class WindowsComputerBackend:
                 }
                 for candidate in (*windows, *tray)
             )
+            return
             return
         if kind == "activate_surface":
             # 激活窗口并验证实际前台身份（SetForegroundWindow 失败显式报错）。
