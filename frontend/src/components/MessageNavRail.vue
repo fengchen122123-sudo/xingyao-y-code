@@ -48,6 +48,8 @@ const props = defineProps<{
 const emit = defineEmits<{
   /** 点击未加载区域红点：父组件负责跨页翻页后回调 jumpToLoaded */
   (e: 'jump', payload: { index: number; id: number }): void;
+  /** 发起定位（任意红点点击）：父组件据此抑制自动吸底，避免视口被拽回底部 */
+  (e: 'locating'): void;
 }>();
 
 const hasNavIndex = computed(() => Array.isArray(props.navItems) && props.navItems.length > 0);
@@ -189,6 +191,8 @@ function updateActive() {
 }
 
 function jumpTo(i: number) {
+  // 先通知父组件抑制自动吸底：定位期间任何吸底都会把视口拽回底部，破坏跳转
+  emit('locating');
   pinnedIndex = i;
   activeIndex.value = i;
   if (hasNavIndex.value) {
@@ -223,6 +227,7 @@ function scrollToLocalIndex(localIdx: number) {
 
 /** 父组件跨页加载完成后回调：目标已进入已加载范围，执行定位 */
 function jumpToLoaded(globalIdx: number) {
+  emit('locating');
   pinnedIndex = globalIdx;
   activeIndex.value = globalIdx;
   scrollToLoadedIndex(globalIdx);
