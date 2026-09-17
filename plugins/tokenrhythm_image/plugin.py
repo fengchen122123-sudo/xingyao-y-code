@@ -85,54 +85,115 @@ def _detect_ext(head: bytes) -> str:
     return ".img"
 
 
-def _download_image(url: str, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image") -> str:
-    """立即下载图片到本地：先写 .part 再按文件头确定扩展名 os.replace。
+def _response_format_for(model: str) -> str:
+    """wan2.7-image 让服务端直接回 base64；其余模型沿用 url。"""
+    return "b64_json" if model == "wan2.7-image" else "url"
+
+
+def _save_image_bytes(
+    payload: bytes, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+) -> str:
+    """把图片字节写入本地，扩展名按文件头判断。
 
     按回合撤销：落盘前先持久化计划 after 快照（插件声明的受控文件修改
     同样接入 FileMutationRecorder，规格 9.5）。
     """
     save_dir = os.path.abspath(save_dir or ".")
     os.makedirs(save_dir, exist_ok=True)
-    base = os.path.join(save_dir, "%s_%s" % (prefix, time.strftime("%Y%m%d_%H%M%S")))
-    tmp = base + ".part"
+    path = os.path.join(
+        save_dir,
+        "%s_%s%s" % (
+            prefix,
+            time.strftime("%Y%m%d_%H%M%S"),
+            _detect_ext(bytes(payload[:8])),
+        ),
+    )
+    from core.turn_undo import coordinator as _tu_coordinator
+    from core.turn_undo import recorder as _tu_recorder
+    from core.turn_undo.models import NodeKind, TurnUndoError
+
+    handle = None
+    with _tu_coordinator.get_coordinator().workspace_lock(_tu_coordinator.thread_workspace_root()):
+        try:
+            handle = _tu_recorder.prepare_mutation(
+                display_path=path,
+                after_kind=NodeKind.REGULAR_FILE,
+                after_content=payload,
+                tool_name=tool_name,
+                tool_call_id="",
+            )
+        except TurnUndoError as error:
+            if error.code != "no_active_checkpoint":
+                # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
+                raise
+            handle = None
+        with open(path, "wb") as f:
+            f.write(payload)
+        if handle is not None:
+            _tu_recorder.verify_after_mutation(handle)
+    return path
+
+
+def _download_image(url: str, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image") -> str:
+    """下载 URL 内容后落盘：先写 .part，读完即删，再按文件头确定扩展名。"""
+    save_dir = os.path.abspath(save_dir or ".")
+    os.makedirs(save_dir, exist_ok=True)
+    tmp = os.path.join(save_dir, ".tokenrhythm_%s.part" % uuid.uuid4().hex)
     try:
         urllib.request.urlretrieve(url, tmp)
         with open(tmp, "rb") as f:
-            head = f.read(8)
-        path = base + _detect_ext(head)
-        with open(tmp, "rb") as f:
             payload = f.read()
-        from core.turn_undo import coordinator as _tu_coordinator
-        from core.turn_undo import recorder as _tu_recorder
-        from core.turn_undo.models import NodeKind, TurnUndoError
-
-        handle = None
-        with _tu_coordinator.get_coordinator().workspace_lock(_tu_coordinator.thread_workspace_root()):
-            try:
-                handle = _tu_recorder.prepare_mutation(
-                    display_path=path,
-                    after_kind=NodeKind.REGULAR_FILE,
-                    after_content=payload,
-                    tool_name=tool_name,
-                    tool_call_id="",
-                )
-            except TurnUndoError as error:
-                if error.code != "no_active_checkpoint":
-                    # 检查点已封闭（迟到写入）：拒绝触盘（规格 9.2）
-                    raise
-                handle = None
-            os.replace(tmp, path)
-            if handle is not None:
-                _tu_recorder.verify_after_mutation(handle)
-        return path
-    except Exception:
+    finally:
         try:
             if os.path.exists(tmp):
                 os.remove(tmp)
         except Exception:
             pass
-        raise
+    return _save_image_bytes(payload, save_dir, prefix, tool_name)
 
+
+def _save_b64_image(
+    b64: str, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+) -> str:
+    """服务端直接回 base64 时解码落盘（wan2.7-image 走这条路径）。"""
+    import base64
+
+    text = str(b64 or "").strip()
+    if "base64," in text:  # 兼容 data URL 前缀写法
+        text = text.split("base64,", 1)[1]
+    data = base64.b64decode(text)
+    if not data:
+        raise ValueError("base64 解码结果为空")
+    return _save_image_bytes(data, save_dir, prefix, tool_name)
+
+
+def _save_image_from_result(
+    result: dict, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+) -> tuple:
+    """从接口响应取图并落盘：优先 data[0].b64_json，其次 data[0].url。
+
+    返回 (本地路径, 错误信息)，两者必有一为空。
+    """
+    items = result.get("data") or []
+    item = items[0] if items else {}
+    if not isinstance(item, dict):
+        item = {}
+    b64 = str(item.get("b64_json") or "").strip()
+    if b64:
+        try:
+            return _save_b64_image(b64, save_dir, prefix, tool_name), ""
+        except Exception as exc:
+            return "", "接口返回的 base64 图片数据无法解码：%s" % (exc,)
+    url = str(item.get("url") or "").strip()
+    if url:
+        try:
+            return _download_image(url, save_dir, prefix, tool_name), ""
+        except Exception as exc:
+            return "", "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, url)
+    return "", (
+        "接口响应缺少 data[0].b64_json / data[0].url，原始响应：%s"
+        % json.dumps(result, ensure_ascii=False)[:500]
+    )
 
 def _error_from_http(exc: urllib.error.HTTPError) -> ToolResult:
     """把 HTTPError 转成带排查提示的错误结果（detail 截前 500 字符）。"""
@@ -157,7 +218,11 @@ def generate_image(
     n: int = 1,
     save_dir: str = ".",
 ) -> ToolResult:
-    """文生图：POST /v1/images/generations，取 data[0].url 立即下载保存。"""
+    """文生图：POST /v1/images/generations，落盘 data[0].b64_json 或 data[0].url。
+
+    wan2.7-image 请求服务端直接回 base64（response_format=b64_json），
+    其余模型沿用 url；两种形态都能落盘，服务端不按 b64 回时自动兜底下载。
+    """
     prompt = (prompt or "").strip()
     if not prompt:
         return ToolResult("缺少 prompt 参数：请提供图片描述文字。", is_error=True)
@@ -184,7 +249,7 @@ def generate_image(
         "prompt": prompt,
         "n": n,
         "size": size,
-        "response_format": "url",
+        "response_format": _response_format_for(model),
     }
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(
@@ -208,23 +273,11 @@ def generate_image(
     except Exception as exc:
         return ToolResult("生图请求失败：%s" % (exc,), is_error=True)
 
-    items = result.get("data") or []
-    image_url = items[0].get("url") if items else ""
-    if not image_url:
-        return ToolResult(
-            "接口响应缺少 data[0].url，原始响应：%s"
-            % json.dumps(result, ensure_ascii=False)[:500],
-            is_error=True,
-        )
+    path, error = _save_image_from_result(result, save_dir, "tokenrhythm")
+    if error:
+        return ToolResult(error, is_error=True)
 
     cost_cny = 0.20 * n
-    try:
-        path = _download_image(image_url, save_dir, "tokenrhythm")
-    except Exception as exc:
-        return ToolResult(
-            "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, image_url),
-            is_error=True,
-        )
 
     lines = [
         "图片已生成并保存：%s" % path,
@@ -281,6 +334,13 @@ def edit_image(
         lines.append('Content-Disposition: form-data; name="size"')
         lines.append("")
         lines.append(size)
+    response_format = _response_format_for(model)
+    if response_format == "b64_json":
+        # wan2.7-image：让服务端直接回 base64，省掉一次 URL 下载
+        lines.append("--%s" % boundary)
+        lines.append('Content-Disposition: form-data; name="response_format"')
+        lines.append("")
+        lines.append(response_format)
     with open(img_path, "rb") as f:
         image_bytes = f.read()
     lines.append("--%s" % boundary)
@@ -320,22 +380,11 @@ def edit_image(
     except Exception as exc:
         return ToolResult("改图请求失败：%s" % (exc,), is_error=True)
 
-    items = result.get("data") or []
-    image_url = items[0].get("url") if items else ""
-    if not image_url:
-        return ToolResult(
-            "接口响应缺少 data[0].url，原始响应：%s"
-            % json.dumps(result, ensure_ascii=False)[:500],
-            is_error=True,
-        )
-
-    try:
-        path = _download_image(image_url, save_dir, "tokenrhythm_edit", tool_name="tokenrhythm_edit_image")
-    except Exception as exc:
-        return ToolResult(
-            "图片下载失败（URL 请尽快使用）：{}\nimageUrl: {}".format(exc, image_url),
-            is_error=True,
-        )
+    path, error = _save_image_from_result(
+        result, save_dir, "tokenrhythm_edit", tool_name="tokenrhythm_edit_image"
+    )
+    if error:
+        return ToolResult(error, is_error=True)
 
     lines = [
         "图片已改图并保存：%s" % path,
