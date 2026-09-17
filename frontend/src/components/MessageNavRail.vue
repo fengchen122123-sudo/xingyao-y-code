@@ -53,12 +53,21 @@ const emit = defineEmits<{
 }>();
 
 const hasNavIndex = computed(() => Array.isArray(props.navItems) && props.navItems.length > 0);
-// 已加载分界：loadedFirstId 在索引中的位置；null/找不到时不淡化（避免误标）
+// 已加载分界：已加载区首条 user 消息在 navItems 中的索引。
+// 注意后端分页只对页首做「回合对齐」，且吞并上限为页大小 + 30 条——工具调用密集的
+// 回合会撑破上限，此时已加载区首条消息是 assistant/tool，它的 id 不在 user 索引里。
+// 这种情况必须退回到「其后第一条 user 消息」，否则分界会退化成 0：轨道的
+// 已加载/未加载判断、点击定位、（滚动时）高亮反查会整体错位。
+// 用户反馈的「点第 3 个红点显示第 4 条内容」正是这种偏移。
 const loadedFirstIndex = computed(() => {
   if (!hasNavIndex.value) return 0;
-  if (props.loadedFirstId == null) return 0;
-  const idx = props.navItems!.findIndex(it => it.id === props.loadedFirstId);
-  return idx >= 0 ? idx : 0;
+  const first = props.loadedFirstId;
+  if (first == null) return 0;
+  const exact = props.navItems!.findIndex(it => it.id === first);
+  if (exact >= 0) return exact;
+  const nextUser = props.navItems!.findIndex(it => it.id > first);
+  // 没有比页首更新的 user 消息：已加载区不含任何 user，全部按未加载处理
+  return nextUser >= 0 ? nextUser : props.navItems!.length;
 });
 
 // 红点数量 = 用户消息条数。用户消息在任何形态下都完整渲染（折叠只收中间
