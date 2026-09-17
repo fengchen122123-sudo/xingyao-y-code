@@ -21,7 +21,7 @@ const _task = {
   enabled: true,
   trigger_type: 'daily',
   trigger_config: { time: '09:30' },
-  target_session: '自动化任务',
+  target_session: '星轨自动化任务',
   prompt: '汇总昨日进展',
   permission_mode: 'confirm',
   missed_run_policy: 'skip',
@@ -33,7 +33,7 @@ const _task = {
   trigger_summary: '每天 09:30',
 } as any;
 
-describe('Subpage - 自动化任务', () => {
+describe('Subpage - 星轨自动化任务', () => {
   beforeEach(() => {
     setActivePinia(createPinia());
   });
@@ -44,9 +44,9 @@ describe('Subpage - 自动化任务', () => {
 
   it('渲染标题、说明条与空态', () => {
     const wrapper = mountSubpage();
-    expect(wrapper.text()).toContain('自动化任务');
+    expect(wrapper.text()).toContain('星轨自动化任务');
     expect(wrapper.text()).toContain('仅星瑶运行期间生效');
-    expect(wrapper.text()).toContain('还没有自动化任务');
+    expect(wrapper.text()).toContain('还没有星轨自动化任务');
   });
 
   it('打开页面时拉取任务列表并渲染任务卡', async () => {

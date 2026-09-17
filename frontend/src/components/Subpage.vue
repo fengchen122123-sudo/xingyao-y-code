@@ -135,7 +135,7 @@
         </div>
       </div>
 
-      <!-- 自动化任务页 -->
+      <!-- 星轨自动化任务页 -->
       <div v-else-if="subType === 'automations'" class="automations-page">
         <AutomationPane />
       </div>
@@ -239,14 +239,14 @@ const title = computed(() => {
   if (props.subType === 'skills') return '技能 Skills';
   if (props.subType === 'mcp') return 'MCP 服务';
   if (props.subType === 'plugins') return '插件 Plugins';
-  if (props.subType === 'automations') return '自动化任务';
+  if (props.subType === 'automations') return '星轨自动化任务';
   return '模型管理';
 });
 const desc = computed(() => {
   if (props.subType === 'skills') return '已扫描的项目技能与用户扩展技能';
   if (props.subType === 'mcp') return '来自 mcp.json 的服务接口';
   if (props.subType === 'plugins') return '与 CLI 共用同一份 plugin.json 配置，开关状态两端同步';
-  if (props.subType === 'automations') return '定时触发的自动化回合，仅星瑶运行期间生效';
+  if (props.subType === 'automations') return '定时触发的星轨自动化回合，仅星瑶运行期间生效';
   return '管理模型供应商与可用模型列表';
 });
 

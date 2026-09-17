@@ -7,4 +7,11 @@
 - engine.py      调度线程（只做认领与分发，绝不做 LLM 请求、不触碰 JS 桥）。
 
 与 core/task_scheduler.py（计划项依赖调度器）职责无关，互不调用。
+
+- service.py     进程级服务句柄：GUI 注入回调，Agent 工具经 get() 访问自动化能力
+                 （纯依赖注入，不 import gui_bridge，未注册时返回 None）。
 """
+
+from core.automation import service
+
+__all__ = ["service"]

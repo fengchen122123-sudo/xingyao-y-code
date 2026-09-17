@@ -125,6 +125,14 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   执行工具门禁必须解除，不能继续要求 plan_item_id。
   DeepSeek thinking 路由为带 tool_calls 的 assistant 回补空 `reasoning_content` key。
 
+- `core/task_scheduler.py` 接管队列约定：FIFO 只决定优先级，不保证队首一定可执行。
+  `claim_takeover_for_turn` / `promote_next_takeover` 在队首 files 与在途租约冲突时必须
+  顺延到下一个可认领项，绝不让单个占位项堵死整条队列（否则 queued 项会永久停在原状态）。
+  完成/失败回写只认 in_progress；被拒时经 `_report_writeback_rejected` 写日志并发
+  `plan_writeback_rejected` 事件，由 CLI/GUI 提示用户，不再静默 return False。
+  铁律：该诊断事件名不得使用 `plan_item_` 前缀——CLI 把该前缀一律当"计划项状态变化"
+  渲染，复用会把计划项显示成它原有的 pending 状态，反而误导用户。
+
 - `core/llm.py:_stream_chunks_with_idle_notice`：流式 chunk 由守护线程 pump、主线程带超时读队列，
   流中段 stalled 超阈值按间隔上报等待状态（此前首 chunk 后最长静默一整个请求超时）。
 
