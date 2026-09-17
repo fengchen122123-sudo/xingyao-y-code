@@ -30,6 +30,10 @@ import threading
 import winreg
 
 
+# 桌面快捷方式显示名（品牌名）
+DESKTOP_SHORTCUT_NAME = "星瑶code.lnk"
+
+
 # ============================================================================
 # 打包资源读取
 # ============================================================================
@@ -865,11 +869,20 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
                 log(f"⚠️ 复制命令行版补装程序失败: {e}")
         progress(90.0)
 
-        # 3. 桌面快捷方式 "Y-code" → Y-code.exe（按用户勾选；machine 范围放公共桌面）
+        # 3. 桌面快捷方式 "星瑶code" → Y-code.exe（按用户勾选；machine 范围放公共桌面）
         if options.create_desktop_shortcut:
             try:
                 desktop_dir = get_common_desktop_dir() if scope == "machine" else get_desktop_dir()
-                shortcut_path = os.path.join(desktop_dir, "Y-code.lnk")
+                # 升级场景：先清掉旧版本遗留的同桌面 [Y-code.lnk]，
+                # 避免桌面上同时出现「Y-code」和「星瑶code」两个图标。
+                legacy_lnk = os.path.join(desktop_dir, "Y-code.lnk")
+                if os.path.exists(legacy_lnk):
+                    try:
+                        os.remove(legacy_lnk)
+                        log("ℹ 已移除旧版遗留的 [Y-code] 桌面快捷方式，改用新的 [星瑶code]。")
+                    except Exception as e:
+                        log(f"⚠️ 清理旧版桌面快捷方式失败（不影响安装）: {e}")
+                shortcut_path = os.path.join(desktop_dir, DESKTOP_SHORTCUT_NAME)
                 create_shortcut(shortcut_path, gui_exe_path, install_dir, startupinfo)
                 desktop_shortcut = True
                 log(f"✔ 桌面快捷方式创建成功: {shortcut_path}")

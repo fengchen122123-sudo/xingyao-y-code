@@ -503,10 +503,28 @@ def main():
         sys.exit(1)
 
     # 待上传附件 = 目录下除指引外的全部文件（分卷 + 未切分的单 exe）
-    part_files = sorted(
+    raw_files = [
         f for f in os.listdir(parts_dir)
         if f != "RELEASE_NOTES.txt" and os.path.isfile(os.path.join(parts_dir, f))
-    )
+    ]
+
+    def _upload_sort_key(name):
+        # 上传顺序必须保证：主安装包（含其分卷组）整体排在 CLI 安装包组之前。
+        # 原因：旧版客户端（1.2.7~1.2.27）的 _pick_main_installer_group 在认不出
+        # 主安装包前缀时，会直接取分卷组字典里的第一组；而该字典按附件在 Release
+        # 中的先后（即上传顺序）插入。因此主安装包组必须先上传，否则老用户的
+        # 自动更新会挑到 CLI 组（挑错包 / SHA256 校验失败）。
+        stem = re.sub(r"\.part\d+$", "", name)
+        low = stem.lower()
+        is_cli = "cli" in low
+        # 主安装包：新命名 XingYaoCode-{版本}，或旧命名 Y-code-{版本}（均不含 cli）
+        is_main = (low.startswith("xingyaocode") or low.startswith("y-code")) and not is_cli
+        group_rank = 0 if is_main else (1 if is_cli else 2)
+        m = re.search(r"\.part(\d+)$", name)
+        part_no = int(m.group(1)) if m else 0  # 数字升序，避免 part10 排到 part2 前面
+        return (group_rank, low, part_no)
+
+    part_files = sorted(raw_files, key=_upload_sort_key)
     if not part_files:
         print("❌ dist/release_parts/ 下没有可上传的附件")
         sys.exit(1)
