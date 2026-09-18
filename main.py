@@ -854,6 +854,21 @@ def _computer_status_bar_segment() -> str:
         return ""
 
 
+def _git_status_bar_segment() -> str:
+    """CLI 底部状态栏的 Git 段（规格 §12.1）：``⎇ dev* ↑2 ↓1  3 changes``。
+
+    非仓库/异常时为空串（状态栏布局不变）；内部带 1.5 秒 TTL 缓存，
+    保证高频渲染不反复拉起 git 进程。
+    """
+    try:
+        from core.workspace_context import get_workdir
+        from core.git_cli import render_git_status_bar
+
+        return render_git_status_bar(get_workdir() or "")
+    except Exception:
+        return ""
+
+
 def _startup_computer_runtime_for_cli() -> None:
     """启动轻量电脑操控运行时（Task 16）：开关开启时注册全局紧急停止热键。
 
@@ -991,6 +1006,7 @@ COMMAND_COMPLETIONS = [
     ("/dream", "后台触发梦境总结，提炼归纳记忆日志"),
     ("/memory", "查阅长期记忆索引 (MEMORY.md) 内容"),
     ("/worktree", "Git worktree 管理 (list/create/remove)"),
+    ("/git", "Git 工作台 (status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log)"),
     ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
     ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
     ("/skills", "技能管理 (list/refresh/enable/disable 或开选择器)"),
@@ -2596,6 +2612,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
         print_formatted_text(HTML(f"  <ansicyan>/diagram [open 序号|list]</ansicyan>               : 打开/列出已生成的 Mermaid 流程图网页（{_agent_name()}输出 mermaid 代码块时自动生成）"))
         print_formatted_text(HTML("  <ansicyan>/worktree</ansicyan>                              : Git worktree 管理 (list/create/remove/prune)"))
+        print_formatted_text(HTML("  <ansicyan>/git &lt;子命令&gt;</ansicyan>                          : Git 工作台 (status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log，高风险操作需 --confirm)"))
         print_formatted_text(HTML("  <ansicyan>/clear</ansicyan>                                  : 清理终端当前屏幕"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【2. 模型与样式配置】</ansiyellow></b>"))
@@ -3571,6 +3588,12 @@ def handle_slash_command(command_text):
         else:
             print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /worktree [list|create|remove|prune]</ansired>"))
 
+    elif cmd == "/git" or cmd.startswith("/git "):
+        # Git 工作台（规格 §12）：严格子命令解析 → GitApplicationService，
+        # 高风险操作两步确认（--confirm），绝不透传任意参数
+        from core.git_cli import handle_git_command
+        handle_git_command(command_text)
+
     elif cmd == "/mcp" or cmd.startswith("/mcp "):
         # MCP 服务管理：默认打开全屏 CLI 配置器，也支持子命令
         # 用法: /mcp                  -> 打开全屏 CLI 配置器（推荐）
@@ -4377,6 +4400,10 @@ def _make_input_app():
         if computer_segment:
             segments.append(("class:status.sep", "  |  "))
             segments.append(("class:status.token", f" {computer_segment} "))
+        git_segment = _git_status_bar_segment()
+        if git_segment:
+            segments.append(("class:status.sep", "  |  "))
+            segments.append(("class:status.token", f" {git_segment} "))
         return segments
 
     def get_activity_text():
