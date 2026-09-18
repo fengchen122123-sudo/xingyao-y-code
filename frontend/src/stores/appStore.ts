@@ -1,4 +1,6 @@
 import { defineStore } from 'pinia';
+// Git 工作台事件转发（git_state_changed）；gitStore 不反向依赖 appStore，无环
+import { useGitStore } from './gitStore';
 import type {
   AutomationRunInfo,
   AutomationTaskInfo,
@@ -3099,6 +3101,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
 
       const currentRuntimeKey = this._runtimeKey();
+      // Git 工作台事件（规格 §10）：外部变化只触发失效刷新，转发给 gitStore，
+      // 不参与会话 runtime 归属
+      if (type === 'git_state_changed') {
+        useGitStore().onExternalChange(data);
+        return;
+      }
       // 拖放文件路径推送（GUI 线程死锁修复后改走 _js_queue 事件管线）：
       // 转发给 useAttachments 挂在 window 上的匹配逻辑，不参与会话 runtime 归属
       if (type === 'dropped_paths_push') {
