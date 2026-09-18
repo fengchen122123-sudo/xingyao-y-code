@@ -1037,6 +1037,12 @@ export interface PyWebViewAPI {
   git_worktree_add(workdir: string, path: string, branch: string, newBranch: boolean): Promise<GitBridgeResult>;
   git_worktree_remove(workdir: string, path: string, force: boolean): Promise<GitBridgeResult>;
   git_stop_monitoring(workdir: string): Promise<GitBridgeResult>;
+  git_load_conflict(workdir: string, path: string): Promise<GitBridgeResult>;
+  git_resolve_conflict(workdir: string, path: string, resultText?: string, side?: string): Promise<GitBridgeResult>;
+  git_read_rebase_plan(workdir: string): Promise<GitBridgeResult>;
+  git_write_rebase_plan(workdir: string, plan: { action: string; oid: string; summary: string }[]): Promise<GitBridgeResult>;
+  git_recover_branch(workdir: string, oid: string, name: string): Promise<GitBridgeResult>;
+  git_ai_assist(workdir: string, kind: string): Promise<GitBridgeResult>;
 }
 
 // ---------------------------------------------------------------------------
@@ -1058,6 +1064,8 @@ export interface GitBridgeResult {
   lines?: [string, number, string][];
   preview?: GitRiskPreviewDto;
   worktrees?: GitWorktreeDto[];
+  conflict?: GitConflictContentDto;
+  plan?: GitRebasePlanLineDto[];
   level?: 'trusted' | 'allowed_once' | 'untrusted';
   fingerprint?: string;
 }
@@ -1181,6 +1189,22 @@ export interface GitWorktreeDto {
   head_oid: string;
   branch: string | null;
   is_bare: boolean;
+}
+
+export interface GitConflictContentDto {
+  path: string;
+  base: string | null;
+  ours: string | null;
+  theirs: string | null;
+  worktree: string | null;
+}
+
+export interface GitRebasePlanLineDto {
+  action: string;
+  oid: string;
+  summary: string;
+  plan?: GitRebasePlanLineDto[];
+  conflict?: GitConflictContentDto;
 }
 
 declare global {

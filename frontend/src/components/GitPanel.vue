@@ -69,10 +69,28 @@
         </div>
       </div>
 
+      <!-- 视图切换：状态 / 历史（§5.9 提交图入口） -->
+      <div class="git-view-switch">
+        <button data-test="git-view-status" :class="{ active: viewMode === 'status' }" @click="viewMode = 'status'">状态</button>
+        <button data-test="git-view-history" :class="{ active: viewMode === 'history' }" @click="viewMode = 'history'">历史</button>
+        <span class="git-flex"></span>
+        <button v-if="viewMode === 'status'" class="git-mini" data-test="git-ai-commit-msg" title="发送可见对话消息，由 AI 生成提交说明建议" @click="aiAssist('commit_message')">AI 提交说明</button>
+      </div>
+
+      <!-- 历史视图 -->
+      <GitHistory v-if="viewMode === 'history' && store.snapshot" />
+
+      <template v-else-if="store.snapshot && viewMode === 'status'">
       <!-- 冲突组 -->
       <div v-if="store.snapshot!.conflicts.length" class="git-group">
         <div class="git-group-title git-group-conflict">冲突 ({{ store.snapshot!.conflicts.length }})</div>
-        <div v-for="c in store.snapshot!.conflicts" :key="c.path" class="git-file-row git-conflict-row" data-test="git-conflict-row">
+        <div
+          v-for="c in store.snapshot!.conflicts"
+          :key="c.path"
+          class="git-file-row git-conflict-row"
+          data-test="git-conflict-row"
+          @click="store.conflictResolverPath = c.path"
+        >
           <span class="git-file-path" :title="c.path">{{ c.path }}</span>
           <span class="git-file-kind">{{ c.kind }}</span>
         </div>
@@ -113,6 +131,10 @@
 
       <!-- Diff 视图 -->
       <GitDiffView v-if="store.diff" :diff="store.diff" />
+      </template>
+
+      <!-- 三方冲突解决器 -->
+      <GitConflictResolver v-if="store.conflictResolverPath" :path="store.conflictResolverPath" />
 
       <!-- 高风险确认对话框（§13 两段式：服务端 preview + 一次性令牌） -->
       <div v-if="store.pendingConfirm" class="git-confirm-mask" data-test="git-confirm-modal">
@@ -143,13 +165,22 @@
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { useGitStore } from '../stores/gitStore';
 import { useAppStore } from '../stores/appStore';
 import GitDiffView from './GitDiffView.vue';
+import GitHistory from './GitHistory.vue';
+import GitConflictResolver from './GitConflictResolver.vue';
 
 const store = useGitStore();
 const appStore = useAppStore();
+const viewMode = ref<'status' | 'history'>('status');
+
+async function aiAssist(kind: string) {
+  // §5.15：先展示用途，用户确认后发送可见模板消息（不注入隐藏提示）
+  if (!window.confirm('将发送一条可见对话消息，请 AI 基于已暂存 Diff 生成提交说明建议。继续？')) return;
+  await store.aiAssist(kind);
+}
 
 const operationLabel = computed(() => {
   const kind = store.snapshot?.operation_kind || 'idle';
@@ -169,6 +200,8 @@ function openDiff(path: string, staged: boolean) {
   void store.loadDiff(path, staged);
 }
 
+// 移除旧的重复 watch（保留会话切换联动）
+
 async function onCommit() {
   await store.commit();
 }
@@ -185,7 +218,6 @@ onMounted(() => {
 });
 
 // 会话切换 → 跟随工作区重新加载（§17.3 会话切换不串仓库状态）
-import { watch } from 'vue';
 watch(
   () => appStore.workdir,
   (wd) => {
@@ -205,6 +237,12 @@ watch(
 }
 .git-note { color: var(--text-dim, #888); padding: 12px 4px; }
 .git-flex { flex: 1; }
+.git-view-switch { display: flex; gap: 4px; align-items: center; }
+.git-view-switch button {
+  background: transparent; border: 1px solid transparent; color: var(--text-dim, #888);
+  border-radius: 4px; cursor: pointer; padding: 2px 10px; font-size: 12px;
+}
+.git-view-switch button.active { border-color: rgba(100,181,246,.5); color: #64b5f6; }
 .git-head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
 .git-dirty-mark { color: #e5a037; }
 .git-sync { color: #64b5f6; }
