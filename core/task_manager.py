@@ -156,6 +156,13 @@ def _watch_task_completion(task_id, process, command, session_id):
             cb(task_id, command, returncode, session_id, _read_log_tail(task_id))
         except Exception as error:
             _logger.warning("后台任务完成回调失败 %s: %s", task_id, error)
+    # 进程注册表注销（幂等）：任务进入终态后不再阻塞 Git 面板操作
+    try:
+        from core.git import process_registry as _proc_registry
+
+        _proc_registry.unregister_process(task_id)
+    except Exception as error:
+        _logger.warning("后台任务注销进程注册表失败 %s: %s", task_id, error)
 
 
 def _ensure_paths():
@@ -418,6 +425,21 @@ def start_background_task(command: str, session_id: str = "", shell_id: str = ""
                 "last_log_size": 0,
             }
             _save_tasks()
+        # Workspace Process Registry 登记（规格 §9.2）：后台任务为长期监听服务，
+        # 登记失败只记日志，绝不影响任务本身
+        try:
+            from core.git import process_registry as _proc_registry
+
+            _proc_registry.register_process(
+                get_workdir(),
+                handle=task_id,
+                kind="background_task",
+                foreground=False,
+                long_running=True,
+                risk_class=_proc_registry.risk_class_for_command(command),
+            )
+        except Exception as reg_error:
+            _logger.warning("后台任务登记进程注册表失败 %s: %s", task_id, reg_error)
         _prune_old_logs()
         # 启动完成监听线程：进程退出后触发完成回调，向前端推送通知
         _watcher = threading.Thread(
