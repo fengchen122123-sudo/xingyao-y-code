@@ -258,7 +258,9 @@ class GitApplicationService:
             token = self.confirmations.issue(
                 session_id=session_id,
                 repo_digest=self._repo_digest(identity),
-                params_digest=ConfirmationService.params_digest(params),
+                params_digest=ConfirmationService.params_digest(
+                    self._digest_params(params)
+                ),
                 versions=versions,
             )
         return GitRiskPreview(
@@ -286,6 +288,12 @@ class GitApplicationService:
                 + _norm(identity.worktree_root)
             ).encode("utf-8")
         ).hexdigest()
+
+    @staticmethod
+    def _digest_params(params: dict) -> dict:
+        """参与确认摘要的参数：排除 confirm_input（它是验证凭据，不是操作参数），
+        保证 preview（无 confirm_input）与 execute（有 confirm_input）摘要一致。"""
+        return {k: v for k, v in params.items() if k != "confirm_input"}
 
     # ---------------------------------------------------------------- 写执行（§9.3）
 
@@ -351,7 +359,9 @@ class GitApplicationService:
                     token,
                     session_id=session_id,
                     repo_digest=self._repo_digest(identity),
-                    params_digest=ConfirmationService.params_digest(params),
+                    params_digest=ConfirmationService.params_digest(
+                        self._digest_params(params)
+                    ),
                     versions=SnapshotVersions(
                         worktree_version=fresh.worktree_version,
                         refs_version=fresh.refs_version,
