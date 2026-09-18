@@ -38,6 +38,7 @@ from core.media_store import archive_media_file
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
+from gui_git_mixin import GitBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -480,7 +481,7 @@ def _media_save_filename(suggested_name: str, ext: str) -> str:
     return (name or "ycode-image") + ext
 
 
-class ApiBridge:
+class ApiBridge(GitBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
@@ -490,6 +491,12 @@ class ApiBridge:
         # 内部状态变量使用下划线开头，防止 PyWebView 在 Windows .NET 检查中产生属性递归问题
         self._window = None
         self._dropped_paths: list = []
+        # Git 工作台桥接状态（gui_git_mixin.GitBridgeMixin，惰性初始化）
+        self._git_svc = None
+        self._git_monitor = None
+        self._git_subs = {}
+        self._git_versions = {}
+        self._git_serialized = {}
         # GUI 专用会话库：与 CLI 的 ycode.db 分离，两边对话互不同步
         self._memory = MemoryManager(db_path=GUI_DB_FILE)
         # 修复：形参曾经遮蔽模块级单例，导致 self._mcp 永远是 None
@@ -6905,6 +6912,33 @@ class ApiBridge:
             return {"ok": True}
         except Exception as e:
             logger.exception("open_folder_in_explorer 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_ui_layout(self) -> Dict[str, Any]:
+        """读取侧栏排序快照（项目分组顺序 + 分组内会话顺序）。
+
+        权威副本落在数据目录的 ui_layout.json：WebView2 的 localStorage 在
+        「拖完排序立刻重启」时会被 leveldb 恢复过程丢弃（写前日志 checksum
+        mismatch），只靠前端缓存会出现"重启就复原"。前端启动时用本快照校正。
+        """
+        try:
+            from core.ui_layout import get_ui_layout as _get_ui_layout
+
+            return {"ok": True, **_get_ui_layout()}
+        except Exception as e:
+            logger.exception("get_ui_layout 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def save_ui_layout(self, layout: Dict[str, Any]) -> Dict[str, Any]:
+        """全量写入侧栏排序快照，返回落盘后的规范化结果。"""
+        try:
+            from core.ui_layout import save_ui_layout as _save_ui_layout
+
+            if not isinstance(layout, dict):
+                return {"ok": False, "msg": "layout 必须是对象"}
+            return {"ok": True, **_save_ui_layout(layout)}
+        except Exception as e:
+            logger.exception("save_ui_layout 失败")
             return {"ok": False, "msg": str(e)}
 
     def pick_files(self) -> Dict[str, Any]:
