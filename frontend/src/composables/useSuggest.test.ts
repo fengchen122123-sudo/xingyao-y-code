@@ -271,7 +271,7 @@ describe('useSuggest', () => {
     detectToken();
     expect(suggest.value?.mode).toBe('file');
     await vi.advanceTimersByTimeAsync(200);
-    expect(searchSessions).toHaveBeenCalledWith('登录', 4);
+    expect(searchSessions).toHaveBeenCalledWith('登录', 12);
     expect(searchFiles).toHaveBeenCalledWith('登录', 8);
     // 会话候选在前、文件候选在后
     expect(suggestItems.value.length).toBe(2);
@@ -281,6 +281,40 @@ describe('useSuggest', () => {
     expect(suggestItems.value[0].desc).toBe('3 条消息');
     expect(suggestItems.value[1].group).toBe('file');
     expect(suggestItems.value[1].label).toBe('core/login.py');
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('会话候选命中很多时最多占 4 个名额，文件候选不被挤光', async () => {
+    vi.useFakeTimers();
+    // 后端已放宽到 12 条：命中会话很多时不能让会话项独占整个面板
+    const sessions = Array.from({ length: 8 }, (_, i) => ({
+      name: `会话${i}`,
+      count: i,
+      updated_at: '',
+      workdir: '',
+    }));
+    const searchSessions = vi.fn().mockResolvedValue({ ok: true, sessions });
+    const searchFiles = vi.fn().mockResolvedValue({ files: ['core/login.py', 'README.md'] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@', 1);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+
+    const groups = suggestItems.value.map(it => it.group);
+    // 会话最多 4 条，剩余名额留给文件候选
+    expect(groups.filter(g => g === 'session').length).toBe(4);
+    expect(groups.filter(g => g === 'file').length).toBe(2);
+    expect(suggestItems.value[0].label).toBe('会话0');
+    expect(suggestItems.value[4].group).toBe('file');
 
     vi.unstubAllGlobals();
     vi.useRealTimers();
@@ -350,10 +384,129 @@ describe('useSuggest', () => {
     taRef.value = mockTextarea('@login', 6);
     detectToken();
     await vi.advanceTimersByTimeAsync(200);
-    expect(searchSessions).toHaveBeenCalledWith('login', 4);
+    expect(searchSessions).toHaveBeenCalledWith('login', 12);
     // 会话接口异常不应拖垮文件补全：文件候选仍正常出现
     expect(suggestItems.value.map(it => it.apply)).toEqual(['@core/login.py', '@README.md']);
     expect(suggestItems.value.every(it => it.group === 'file')).toBe(true);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('文件扫描慢时，会话候选先渲染即可见（两侧互不阻塞）', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({
+      ok: true,
+      sessions: [{ name: '登录bug排查', count: 3, updated_at: '', workdir: '' }],
+    });
+    // 文件扫描：手工控制 resolve 时机，模拟「很慢的文件接口」一直 pending
+    let resolveFiles!: (v: any) => void;
+    const searchFiles = vi.fn(
+      () => new Promise(resolve => { resolveFiles = resolve; }),
+    );
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@登录');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@登录', 3);
+    detectToken();
+    // 会话请求不防抖、立即发起：冲刷微任务后「对话」候选已经可见，
+    // 而不是等慢文件扫描（旧实现会卡在 Promise.all 上）
+    await vi.advanceTimersByTimeAsync(1);
+    expect(searchSessions).toHaveBeenCalledWith('登录', 12);
+    expect(suggestItems.value.length).toBe(1);
+    expect(suggestItems.value[0].group).toBe('session');
+    expect(suggestItems.value[0].label).toBe('登录bug排查');
+
+    // 文件请求 120ms 后才发起，此刻仍 pending；不得清空已渲染的会话候选
+    await vi.advanceTimersByTimeAsync(130);
+    expect(searchFiles).toHaveBeenCalledWith('登录', 8);
+    expect(suggestItems.value.map(it => it.group)).toEqual(['session']);
+
+    // 文件候选到达后合并为最终列表：会话在前、文件在后
+    resolveFiles({ files: ['core/login.py'] });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(suggestItems.value.map(it => it.group)).toEqual(['session', 'file']);
+    expect(suggestItems.value.map(it => it.apply)).toEqual(['@{登录bug排查}', '@core/login.py']);
+    expect(suggestItems.value.map(it => it.key)).toEqual([
+      'session:登录bug排查',
+      'file:core/login.py',
+    ]);
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('search_workspace_files reject 时保留已渲染的会话候选（不清空）', async () => {
+    vi.useFakeTimers();
+    const searchSessions = vi.fn().mockResolvedValue({
+      ok: true,
+      sessions: [{ name: '登录bug排查', count: 3, updated_at: '', workdir: '' }],
+    });
+    const searchFiles = vi.fn().mockRejectedValue(new Error('scan failed'));
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@登录');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    taRef.value = mockTextarea('@登录', 3);
+    detectToken();
+    // 会话先到并渲染
+    await vi.advanceTimersByTimeAsync(1);
+    expect(suggestItems.value.length).toBe(1);
+
+    // 文件扫描 reject：走 .catch(() => null)，绝不能把会话候选一并清空
+    await vi.advanceTimersByTimeAsync(200);
+    expect(suggestItems.value.length).toBe(1);
+    expect(suggestItems.value[0].group).toBe('session');
+    expect(suggestItems.value[0].label).toBe('登录bug排查');
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('旧 query 的迟到响应不会覆盖新 query 的候选', async () => {
+    vi.useFakeTimers();
+    let resolveOld!: (v: any) => void;
+    const searchSessions = vi
+      .fn()
+      .mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve; }))
+      .mockResolvedValue({
+        ok: true,
+        sessions: [{ name: '新会话', count: 1, updated_at: '', workdir: '' }],
+      });
+    const searchFiles = vi.fn().mockResolvedValue({ files: ['new.ts'] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@旧');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken, suggestItems } = useSuggest(inputVal, taRef);
+
+    // 第一次输入：会话请求挂起不返回
+    taRef.value = mockTextarea('@旧', 2);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(1);
+
+    // 用户继续打字，query 变成 @新
+    inputVal.value = '@新';
+    taRef.value = mockTextarea('@新', 2);
+    detectToken();
+    await vi.advanceTimersByTimeAsync(200);
+    expect(suggestItems.value.map(it => it.label)).toEqual(['新会话', 'new.ts']);
+
+    // 旧 query 的响应迟到：必须被丢弃，不得覆盖新 query 的列表
+    resolveOld({ ok: true, sessions: [{ name: '旧会话', count: 9, updated_at: '', workdir: '' }] });
+    await vi.advanceTimersByTimeAsync(1);
+    expect(suggestItems.value.map(it => it.label)).toEqual(['新会话', 'new.ts']);
 
     vi.unstubAllGlobals();
     vi.useRealTimers();

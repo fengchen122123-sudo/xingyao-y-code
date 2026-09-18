@@ -2790,28 +2790,50 @@ class ApiBridge:
             logger.exception("search_workspace_files 失败")
             return {"ok": False, "msg": str(e), "files": []}
 
-    def search_sessions(self, query: str = "", limit: int = 8) -> Dict[str, Any]:
-        """@ 提及对话自动补全：会话名大小写不敏感子串匹配（排除当前会话）。"""
+    def search_sessions(self, query: str = "", limit: int = 12) -> Dict[str, Any]:
+        """@ 提及对话自动补全：会话名大小写不敏感子串匹配（排除当前会话）。
+
+        取数策略与侧栏 get_sessions() 对齐：
+        - include_empty=True：否则刚新建、还没有任何消息的会话永远进不了 @ 候选；
+        - 空会话（count==0）仅在【人工重命名过】时才补全，即名字不是默认的
+          session_xxxxxx；默认名的空会话属于自动创建的垃圾临时会话，这里与
+          get_sessions() 一样跳过，避免 @ 列表被大量无名空会话淹没。
+        排序：无 query 时按最近活跃倒序；有 query 时前缀命中优先，其次名字更短
+        （越贴近输入越可能是目标），最后才按最近活跃倒序，避免同名兄弟
+        （X / X(2) / X(3)）因时间靠后而被挤出前 N 条。
+        """
         try:
             if self._memory is None:
                 return {"ok": False, "msg": "后端未就绪", "sessions": []}
             q = str(query or "").strip().lower()
-            raw = self._memory.get_all_sessions(workdir=None, include_empty=False)
+            raw = self._memory.get_all_sessions(workdir=None, include_empty=True)
             items = []
             for s in raw:
                 name = str(s.get("name") or "")
                 if not name or name == self._current_session:
                     continue
+                count = int(s.get("count") or 0)
+                # 空会话仅在人工重命名后才补全：默认名空会话是自动创建的
+                # 垃圾临时会话，与 get_sessions() 的跳过策略保持一致
+                if count == 0 and re.match(r"^session_[a-f0-9]{6}$", name):
+                    continue
                 if q and q not in name.lower():
                     continue
                 items.append({
                     "name": name,
-                    "count": int(s.get("count") or 0),
+                    "count": count,
                     "updated_at": str(s.get("updated_at") or ""),
                     "workdir": str(s.get("workdir") or ""),
                 })
+            # 先按最近活跃倒序（稳定排序的基础顺序）
             items.sort(key=lambda it: it["updated_at"], reverse=True)
-            return {"ok": True, "sessions": items[:max(1, int(limit or 8))]}
+            if q:
+                # 稳定排序：前缀命中优先 → 名字长度升序 → 保持上面的 updated_at 倒序
+                items.sort(key=lambda it: (
+                    0 if it["name"].lower().startswith(q) else 1,
+                    len(it["name"]),
+                ))
+            return {"ok": True, "sessions": items[:max(1, int(limit or 12))]}
         except Exception as e:
             logger.exception("search_sessions 失败")
             return {"ok": False, "msg": str(e), "sessions": []}

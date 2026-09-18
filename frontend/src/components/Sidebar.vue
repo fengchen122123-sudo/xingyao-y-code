@@ -104,8 +104,8 @@
                 data-test="session-rename-input"
                 @click.stop
                 @mousedown.stop
-                @keydown.enter.prevent="commitRename()"
-                @keydown.esc.prevent="cancelRename()"
+                @keydown.enter="onRenameEnter($event)"
+                @keydown.esc="onRenameEsc($event)"
                 @blur="commitRename()"
               />
               <div v-else class="t">{{ s.display_name || s.name }}</div>
@@ -335,6 +335,30 @@ function cancelRename() {
   editingOriginal = '';
 }
 
+// IME 组合态守卫：中文/日文输入法下，确认候选词的那次 Enter（或取消候选词的
+// Esc）会先冒泡到 keydown，此刻文字尚未上屏——isComposing 为 true，Chrome 等
+// 浏览器还会退化为 keyCode 229。若在此刻直接提交，editingValue 仍是旧值，会被
+// 「与原名相同」判断静默丢弃，重命名请求根本发不出去。故组合态必须先拦下，
+// 让输入法自己处理上屏 / 取消。
+function isImeComposing(e: KeyboardEvent): boolean {
+  return e.isComposing === true || (e as any).keyCode === 229;
+}
+
+// Enter：组合中不 preventDefault、不提交（交由输入法上屏）；非组合态才阻止
+// 默认换行行为并提交重命名
+function onRenameEnter(e: KeyboardEvent) {
+  if (isImeComposing(e)) return;
+  e.preventDefault();
+  commitRename();
+}
+
+// Esc：组合中是取消候选词，不应退出编辑态；非组合态才取消重命名
+function onRenameEsc(e: KeyboardEvent) {
+  if (isImeComposing(e)) return;
+  e.preventDefault();
+  cancelRename();
+}
+
 // Enter / 失焦落到同一处：先退出编辑态再发请求，避免后续 blur 重复触发
 function commitRename() {
   const oldName = editingName.value;
@@ -355,6 +379,8 @@ function onDocMouseDown(e: MouseEvent) {
 }
 
 function onDocKeyDown(e: KeyboardEvent) {
+  // 组合态 Esc 属于「取消候选词」，冒泡到这里时不能顺带退出编辑态 / 关菜单
+  if (isImeComposing(e)) return;
   if (e.key === 'Escape') {
     closeCtxMenu();
     cancelRename();
