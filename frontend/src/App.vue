@@ -184,6 +184,15 @@
       </span>
       <span class="si status-model" data-test="status-model" data-mobile-status="primary" :title="'当前模型: ' + (store.activeModelName || '未选择')">{{ store.activeModelName || '未选择模型' }}</span>
       <span class="si status-workspace" data-test="status-workspace" data-mobile-status="primary" :title="'当前工作区: ' + (store.workdir || store.currentWorkdirLabel)">{{ store.currentWorkdirLabel }}</span>
+      <span
+        v-if="gitBranchText"
+        class="si status-git-branch"
+        data-test="status-git-branch"
+        data-mobile-status="hidden"
+        :title="'Git 工作台: ' + gitBranchText + '（点击打开源代码管理）'"
+        style="cursor: pointer"
+        @click="openGitPanel"
+      >{{ gitBranchText }}</span>
       <span class="si status-token" data-test="status-token" data-mobile-status="hidden" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
       <span class="si status-permission" data-test="status-permission" data-mobile-status="hidden">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
       <span class="si status-skill" data-test="status-skill" data-mobile-status="hidden" :title="statusSkillTitle">技能: {{ statusSkillText }}</span>
@@ -253,6 +262,7 @@
 <script setup lang="ts">
 import { ref, onMounted, onUnmounted, nextTick, computed, watch } from 'vue';
 import { useAppStore } from './stores/appStore';
+import { useGitStore } from './stores/gitStore';
 import { formatPermMode } from './utils/markdown';
 import { buildMessageGroups, msgKey, type TurnGroupInfo } from './utils/turnGroups';
 import { useChatScroll } from './composables/useChatScroll';
@@ -380,6 +390,28 @@ const statusTokenPct = computed(() => {
   if (!w) return 0;
   return Math.round((store.tokenUsage.used / w) * 100);
 });
+
+// ── Git 状态栏分支项（规格 §11.1：底栏常驻分支 + 同步摘要；非 Git 项目显示占位）──
+const gitStore = useGitStore();
+const gitBranchText = computed(() => {
+  if (!gitStore.snapshot && !gitStore.error) return '';
+  if (gitStore.error) return '';
+  const base = gitStore.statusbarText;
+  return base || '';
+});
+function openGitPanel() {
+  // 非 Git 项目点击不展开（面板内已有"非仓库"提示态），避免空操作困惑
+  gitStore.requestOpenPanel();
+  if (store.rightPanelCollapsed) store.toggleRightPanel();
+}
+watch(
+  () => store.workdir,
+  (wd) => {
+    if (wd) void gitStore.ensureLoaded(wd);
+    else void gitStore.$reset();
+  },
+  { immediate: false }
+);
 const statusTokenClass = computed(() => {
   if (statusTokenPct.value > 90) return 'tok-red';
   if (statusTokenPct.value > 70) return 'tok-orange';

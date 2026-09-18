@@ -1000,6 +1000,187 @@ export interface PyWebViewAPI {
   cancel_download_update(): Promise<any>;
   has_active_tasks(): Promise<any>;
   launch_installer(filePath: string): Promise<any>;
+
+  // ---------------------------------------------------------------------------
+  // Git 工作台（规格 §11/§13；桥接层 gui_git_mixin.GitBridgeMixin）
+  // ---------------------------------------------------------------------------
+  git_get_status(workdir: string): Promise<GitBridgeResult>;
+  git_refresh(workdir: string): Promise<GitBridgeResult>;
+  git_stage(workdir: string, paths: string[]): Promise<GitBridgeResult>;
+  git_stage_all(workdir: string): Promise<GitBridgeResult>;
+  git_unstage(workdir: string, paths: string[]): Promise<GitBridgeResult>;
+  git_commit(workdir: string, title: string, body?: string, amend?: boolean): Promise<GitBridgeResult>;
+  git_undo_last_commit(workdir: string, keepStaged: boolean): Promise<GitBridgeResult>;
+  git_discard_changes(workdir: string, paths: string[]): Promise<GitBridgeResult>;
+  git_list_branches(workdir: string): Promise<GitBridgeResult>;
+  git_switch_branch(workdir: string, target: string): Promise<GitBridgeResult>;
+  git_create_branch(workdir: string, name: string, startPoint?: string, switchAfter?: boolean): Promise<GitBridgeResult>;
+  git_list_remotes(workdir: string): Promise<GitBridgeResult>;
+  git_fetch(workdir: string, remote?: string, prune?: boolean): Promise<GitBridgeResult>;
+  git_pull(workdir: string): Promise<GitBridgeResult>;
+  git_push(workdir: string, remote?: string, refspec?: string, forceWithLease?: boolean, token?: string): Promise<GitBridgeResult>;
+  git_load_history(workdir: string, skip?: number, limit?: number): Promise<GitBridgeResult>;
+  git_load_diff(workdir: string, path?: string, staged?: boolean, left?: string, right?: string): Promise<GitBridgeResult>;
+  git_blame(workdir: string, path: string): Promise<GitBridgeResult>;
+  git_load_reflog(workdir: string, skip?: number, limit?: number): Promise<GitBridgeResult>;
+  git_list_tags(workdir: string): Promise<GitBridgeResult>;
+  git_list_stashes(workdir: string): Promise<GitBridgeResult>;
+  git_stash_create(workdir: string, message: string, includeUntracked: boolean): Promise<GitBridgeResult>;
+  git_stash_apply(workdir: string, index: number): Promise<GitBridgeResult>;
+  git_stash_drop(workdir: string, index: number): Promise<GitBridgeResult>;
+  git_preview_risk(workdir: string, operation: string, params: Record<string, any>): Promise<GitBridgeResult>;
+  git_confirm_operation(workdir: string, operation: string, params: Record<string, any>, token: string): Promise<GitBridgeResult>;
+  git_get_trust(workdir: string): Promise<GitBridgeResult>;
+  git_allow_once(workdir: string): Promise<GitBridgeResult>;
+  git_trust_repository(workdir: string): Promise<GitBridgeResult>;
+  git_worktree_list(workdir: string): Promise<GitBridgeResult>;
+  git_worktree_add(workdir: string, path: string, branch: string, newBranch: boolean): Promise<GitBridgeResult>;
+  git_worktree_remove(workdir: string, path: string, force: boolean): Promise<GitBridgeResult>;
+  git_stop_monitoring(workdir: string): Promise<GitBridgeResult>;
+}
+
+// ---------------------------------------------------------------------------
+// Git 工作台 DTO（与 core/git 桥接层序列化结构对应；字段只含界面所需）
+// ---------------------------------------------------------------------------
+
+export interface GitBridgeResult {
+  ok: boolean;
+  snapshot?: GitSnapshotDto;
+  error?: GitErrorDto;
+  branches?: GitBranchDto[];
+  commits?: GitCommitDto[];
+  has_more?: boolean;
+  diff?: GitDiffDto;
+  entries?: GitReflogDto[];
+  tags?: GitTagDto[];
+  remotes?: GitRemoteDto[];
+  stashes?: GitStashDto[];
+  lines?: [string, number, string][];
+  preview?: GitRiskPreviewDto;
+  worktrees?: GitWorktreeDto[];
+  level?: 'trusted' | 'allowed_once' | 'untrusted';
+  fingerprint?: string;
+}
+
+export interface GitErrorDto {
+  code: string;
+  message: string;
+  retryable: boolean;
+  command: string;
+}
+
+export interface GitFileChangeDto {
+  path: string;
+  index_status: string;
+  worktree_status: string;
+  orig_path: string | null;
+  is_binary: boolean;
+}
+
+export interface GitConflictDto {
+  path: string;
+  kind: string;
+}
+
+export interface GitSnapshotDto {
+  repository: { worktree_root: string; common_git_dir: string; git_version: string; is_linked_worktree: boolean };
+  head_oid: string;
+  branch_name: string | null;
+  head_state: 'normal' | 'detached' | 'unborn';
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  staged: GitFileChangeDto[];
+  unstaged: GitFileChangeDto[];
+  untracked: string[];
+  ignored_count: number;
+  conflicts: GitConflictDto[];
+  stash_count: number;
+  operation_kind: string;
+  operation_phase: string;
+  identity_state: string;
+  worktree_version: string;
+  refs_version: string;
+}
+
+export interface GitBranchDto {
+  name: string;
+  is_remote: boolean;
+  is_current: boolean;
+  upstream: string | null;
+  ahead: number;
+  behind: number;
+  upstream_gone: boolean;
+  oid: string;
+}
+
+export interface GitCommitDto {
+  oid: string;
+  short: string;
+  parents: string[];
+  author_name: string;
+  author_email: string;
+  author_time: number;
+  committer_time: number;
+  summary: string;
+  refs: string[];
+}
+
+export interface GitDiffHunkDto {
+  old_start: number;
+  old_lines: number;
+  new_start: number;
+  new_lines: number;
+  header: string;
+  lines: string[];
+}
+
+export interface GitDiffDto {
+  raw_text: string;
+  is_binary: boolean;
+  hunks: GitDiffHunkDto[];
+}
+
+export interface GitReflogDto {
+  oid: string;
+  selector: string;
+  message: string;
+}
+
+export interface GitTagDto {
+  name: string;
+  oid: string;
+  is_annotated: boolean;
+  message: string;
+}
+
+export interface GitRemoteDto {
+  name: string;
+  fetch_url: string;
+  push_url: string;
+}
+
+export interface GitStashDto {
+  index: number;
+  message: string;
+  oid: string;
+}
+
+export interface GitRiskPreviewDto {
+  operation: string;
+  risk_level: string;
+  confirm_required: boolean;
+  typed_confirm_required: boolean;
+  confirm_text: string;
+  versions: { worktree_version: string | null; refs_version: string | null };
+  token: string | null;
+}
+
+export interface GitWorktreeDto {
+  path: string;
+  head_oid: string;
+  branch: string | null;
+  is_bare: boolean;
 }
 
 declare global {
