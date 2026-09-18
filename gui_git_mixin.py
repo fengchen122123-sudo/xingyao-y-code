@@ -429,6 +429,105 @@ class GitBridgeMixin:
         except Exception as error:
             return self._git_err(error)
 
+    # ---- 阶段 7：冲突 / Rebase 计划 / Reflog 恢复 / AI 辅助（§5.10/§5.15）---
+
+    def git_load_conflict(self, workdir: str, path: str) -> Dict:
+        """三方冲突内容：Base/Ours/Theirs/工作区当前文本。"""
+        try:
+            from core.git.conflict import load_conflict
+
+            svc = self._git()
+            content = load_conflict(svc.runner, svc.resolve(workdir), path)
+            return self._git_ok(conflict=_to_dict(content))
+        except Exception as error:
+            return self._git_err(error)
+
+    def git_resolve_conflict(
+        self, workdir: str, path: str, result_text: str = "", side: str = ""
+    ) -> Dict:
+        """解决冲突：手工编辑的 Result 或接受一侧（current/incoming）。"""
+        try:
+            from core.git.conflict import accept_side, resolve_conflict
+
+            svc = self._git()
+            identity = svc.resolve(workdir)
+            if side:
+                accept_side(svc.runner, identity, path, side)
+            else:
+                resolve_conflict(svc.runner, identity, path, result_text)
+            snapshot = svc.get_snapshot(workdir)
+            self._git_remember_versions(snapshot)
+            return self._git_ok(snapshot=_to_dict(snapshot))
+        except Exception as error:
+            return self._git_err(error)
+
+    def git_read_rebase_plan(self, workdir: str) -> Dict:
+        try:
+            from core.git.rebase_plan import read_rebase_plan
+
+            svc = self._git()
+            lines = read_rebase_plan(svc.runner, svc.resolve(workdir))
+            return self._git_ok(plan=_to_dict(lines))
+        except Exception as error:
+            return self._git_err(error)
+
+    def git_write_rebase_plan(self, workdir: str, plan: list) -> Dict:
+        """plan: [{action, oid, summary}, ...]；仅 rebase 停住时可用。"""
+        try:
+            from core.git.rebase_plan import RebasePlanLine, write_rebase_plan
+
+            svc = self._git()
+            lines = [
+                RebasePlanLine(
+                    action=str(item.get("action", "pick")),
+                    oid=str(item.get("oid", "")),
+                    summary=str(item.get("summary", "")),
+                )
+                for item in plan or []
+            ]
+            write_rebase_plan(svc.runner, svc.resolve(workdir), lines)
+            return self._git_ok()
+        except Exception as error:
+            return self._git_err(error)
+
+    def git_recover_branch(self, workdir: str, oid: str, name: str) -> Dict:
+        """Reflog 恢复：从历史位置创建恢复分支（误删分支找回）。"""
+        try:
+            snap = self._git().execute(
+                workdir, "branch_create",
+                {"name": name, "start_point": oid},
+                versions=self._git_versions_for(workdir),
+                session_id=self._git_session(),
+            )
+            self._git_remember_versions(snap)
+            return self._git_ok(snapshot=_to_dict(snap))
+        except Exception as error:
+            return self._git_err(error)
+
+    _AI_ASSIST_TEMPLATES = {
+        "commit_message": "请查看当前仓库已暂存的修改（git diff --cached），并为我生成一条符合规范的提交说明（标题 + 正文）。只输出建议文本，不要替我提交。",
+        "review_staged": "请审查当前仓库已暂存的修改（git diff --cached），指出潜在问题与改进建议。",
+        "explain_commit": "请解释最近一次提交的改动内容与目的（可用 git show HEAD）。",
+        "summarize_sync": "请总结当前分支相对上游的 incoming/outgoing 提交内容。",
+        "conflict_advice": "当前存在合并冲突。请读取冲突文件内容并给出解决建议；不要直接修改文件，最终结果由我确认。",
+    }
+
+    def git_ai_assist(self, workdir: str, kind: str) -> Dict:
+        """§5.15 AI 辅助按钮：发送**用户可见**的模板消息进入正常对话回合。
+
+        铁律：不注入隐藏 System Message、不修改 Prompt Ledger、不给 AI 额外权限；
+        模型按现有权限用 execute_command 读取限定范围的 Diff，输出只是建议。
+        """
+        try:
+            template = self._AI_ASSIST_TEMPLATES.get(kind)
+            if not template:
+                return self._git_err(
+                    GitError(GitErrorCode.INVALID_STATE, f"未知 AI 辅助类型: {kind}")
+                )
+            return dict(self.send_user_message(template, workdir=workdir, turn_source="git_panel"))
+        except Exception as error:
+            return self._git_err(error)
+
     # ---- Worktree --------------------------------------------------------
 
     def git_worktree_list(self, workdir: str) -> Dict:

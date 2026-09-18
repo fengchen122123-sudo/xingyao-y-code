@@ -56,6 +56,8 @@ export const useGitStore = defineStore('git', {
     pendingConfirm: null as GitConfirmState | null,
     // 状态栏点击请求打开源代码管理页签（App.vue → RightPanel 联动）
     panelOpenNonce: 0,
+    // 冲突解决器当前打开的文件路径（空 = 关闭）
+    conflictResolverPath: '',
   }),
 
   getters: {
@@ -283,6 +285,12 @@ export const useGitStore = defineStore('git', {
 
     requestOpenPanel() {
       this.panelOpenNonce += 1;
+    },
+
+    async aiAssist(kind: string) {
+      const res = await callApi<any>('git_ai_assist', this.workdir, kind);
+      this._applyResult(res);
+      return res;
     },
   },
 });
