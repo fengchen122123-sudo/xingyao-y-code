@@ -15,29 +15,44 @@
 """
 
 import os
-import subprocess
 from pathlib import Path
 
-from core.workspace_context import get_workdir
+from core.git.query_refs import parse_worktree_porcelain
+
+# 迁移到共享安全执行通道（规格 §5.14/§8）：worktree 门面的进程执行统一走
+# core/git/runner.GitRunner（参数数组/白名单/超时杀树），本模块保留面向人的
+# 校验与文本格式兼容层；_run_git/_is_git_repo 仍是测试 seam。
+from core.git.runner import ExecScope, GitRunner
+
+_RUNNER = GitRunner()
+
+
+# 只读子命令 → READ_ONLY 作用域（享受 fsmonitor/外部 diff 加固），其余 WRITE
+_READONLY_VERBS = {'rev-parse', 'status', 'log', 'diff'}
 
 
 def _run_git(args, cwd=None):
-    """运行 git 命令，返回 (returncode, stdout, stderr)。"""
+    """运行 git 命令，返回 (returncode, stdout, stderr)。
+
+    实现委托 GitRunner：只读查询走 READ_ONLY 作用域，其余走 WRITE。
+    保留旧错误码语义（-1 未找到 / -2 超时 / -3 异常）供既有调用方兼容。
+    """
     try:
-        result = subprocess.run(
-            ['git'] + args,
-            cwd=cwd or str(get_workdir()),
-            capture_output=True, text=True,
-            encoding='utf-8', errors='replace',
-            timeout=30,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0,
+        is_readonly = bool(args) and (
+            args[0] in _READONLY_VERBS
+            or (args[0] == 'worktree' and len(args) > 1 and args[1] == 'list')
         )
-        return result.returncode, result.stdout.strip(), result.stderr.strip()
-    except FileNotFoundError:
-        return -1, '', 'git 命令未找到，请确保已安装 Git'
-    except subprocess.TimeoutExpired:
-        return -2, '', 'git 命令执行超时'
+        scope = ExecScope.READ_ONLY if is_readonly else ExecScope.WRITE
+        result = _RUNNER.run(args, cwd=cwd or str(get_workdir()), scope=scope, timeout=30)
+        return result.returncode, result.stdout_text.strip(), result.stderr_text.strip()
     except Exception as e:
+        from core.git.models import GitError, GitErrorCode
+
+        if isinstance(e, GitError):
+            if e.code is GitErrorCode.GIT_NOT_FOUND:
+                return -1, '', 'git 命令未找到，请确保已安装 Git'
+            if e.code is GitErrorCode.TIMEOUT:
+                return -2, '', 'git 命令执行超时'
         return -3, '', f'git 命令执行异常: {e}'
 
 
@@ -120,24 +135,12 @@ def list_worktrees(cwd=None):
     if code != 0:
         return f"🚨 列出 worktree 失败: {stderr or stdout}"
 
-    # 解析 porcelain 格式：worktree <path>\nHEAD <sha>\nbranch <ref>\n\n
-    worktrees = []
-    current = {}
-    for line in stdout.split('\n'):
-        if not line.strip():
-            if current:
-                worktrees.append(current)
-                current = {}
-            continue
-        if line.startswith('worktree '):
-            current['path'] = line[len('worktree '):]
-        elif line.startswith('HEAD '):
-            current['head'] = line[len('HEAD '):][:8]
-        elif line.startswith('branch '):
-            current['branch'] = line[len('branch '):].replace('refs/heads/', '')
-
-    if current:
-        worktrees.append(current)
+    # 解析委托共享纯函数（与 Git 服务层同一实现，规格 §5.14）
+    parsed = parse_worktree_porcelain(stdout)
+    worktrees = [
+        {'path': wt.path, 'head': wt.head_oid[:8], 'branch': wt.branch}
+        for wt in parsed
+    ]
 
     if not worktrees:
         return "当前仓库没有 worktree"

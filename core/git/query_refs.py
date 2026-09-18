@@ -158,29 +158,73 @@ def list_branches(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[Bran
     return tuple(branches)
 
 
-def occupied_branches(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[str, ...]:
-    """被其他 Worktree 占用的分支，用于切换/删除硬规则（§5.6）。"""
+@dataclass(frozen=True)
+class WorktreeInfo:
+    path: str
+    head_oid: str
+    branch: Optional[str]      # None = detached
+    is_bare: bool = False
+
+
+def parse_worktree_porcelain(text: str) -> Tuple[WorktreeInfo, ...]:
+    """`git worktree list --porcelain` 解析（共享纯函数：worktree 门面与
+    Git 服务层共用，避免两套逻辑）。"""
+    worktrees: List[WorktreeInfo] = []
+    current: Dict[str, str] = {}
+    for line in text.splitlines() + [""]:
+        if not line.strip():
+            if current:
+                worktrees.append(
+                    WorktreeInfo(
+                        path=current.get("path", ""),
+                        head_oid=current.get("head", ""),
+                        branch=(
+                            current["branch"].removeprefix("refs/heads/")
+                            if current.get("branch")
+                            else None
+                        ),
+                        is_bare=current.get("bare") == "true",
+                    )
+                )
+                current = {}
+            continue
+        key, _, value = line.partition(" ")
+        if key == "worktree":
+            current["path"] = value
+        elif key == "HEAD":
+            current["head"] = value
+        elif key == "branch":
+            current["branch"] = value
+        elif key == "bare":
+            current["bare"] = value
+    return tuple(worktrees)
+
+
+def list_worktrees(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[WorktreeInfo, ...]:
     result = runner.run_checked(
         ["worktree", "list", "--porcelain"],
         cwd=identity.worktree_root,
         scope=ExecScope.READ_ONLY,
         timeout=30.0,
     )
-    occupied: List[str] = []
-    for block in result.stdout_text.split("\n\n"):
-        branch = None
-        is_current_wt = False
-        for line in block.splitlines():
-            if line.startswith("branch "):
-                branch = line[len("branch "):].strip()
-            elif line.startswith("worktree "):
-                wt = line[len("worktree "):].strip()
-                is_current_wt = normalize_repo_path(wt) == normalize_repo_path(
-                    identity.worktree_root
-                )
-        if branch and not is_current_wt:
-            occupied.append(branch.removeprefix("refs/heads/"))
-    return tuple(occupied)
+    return parse_worktree_porcelain(result.stdout_text)
+
+
+def occupied_branches(runner: GitRunner, identity: RepositoryIdentity) -> Tuple[str, ...]:
+    """被其他 Worktree 占用的分支，用于切换/删除硬规则（§5.6）。"""
+    return tuple(
+        wt.branch
+        for wt in parse_worktree_porcelain(
+            runner.run_checked(
+                ["worktree", "list", "--porcelain"],
+                cwd=identity.worktree_root,
+                scope=ExecScope.READ_ONLY,
+                timeout=30.0,
+            ).stdout_text
+        )
+        if wt.branch
+        and normalize_repo_path(wt.path) != normalize_repo_path(identity.worktree_root)
+    )
 
 
 # ---------------------------------------------------------------- 历史与提交
