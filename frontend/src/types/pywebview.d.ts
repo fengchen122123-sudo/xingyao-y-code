@@ -874,6 +874,10 @@ export interface PyWebViewAPI {
   check_paths_kind(paths: string[]): Promise<Array<{ path: string; kind: 'file' | 'dir' | 'missing' }>>;
   open_path(path: string): Promise<any>;
   open_folder_in_explorer(path: string): Promise<any>;
+  // 侧栏排序快照：权威副本在数据目录 ui_layout.json，localStorage 只是缓存
+  // （WebView2 的 localStorage 在"拖完立刻重启"时会被 leveldb 丢弃）
+  get_ui_layout(): Promise<{ ok: boolean; group_order?: string[]; session_order?: Record<string, string[]>; msg?: string }>;
+  save_ui_layout(layout: { group_order: string[]; session_order: Record<string, string[]> }): Promise<{ ok: boolean; msg?: string }>;
   pick_files(): Promise<any>;
   get_files_info(paths: string[]): Promise<any>;   save_clipboard_image(dataUrl: string): Promise<any>;
   get_attachment_thumbnails(paths: string[]): Promise<any>;
