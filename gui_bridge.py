@@ -6907,6 +6907,33 @@ class ApiBridge:
             logger.exception("open_folder_in_explorer 失败")
             return {"ok": False, "msg": str(e)}
 
+    def get_ui_layout(self) -> Dict[str, Any]:
+        """读取侧栏排序快照（项目分组顺序 + 分组内会话顺序）。
+
+        权威副本落在数据目录的 ui_layout.json：WebView2 的 localStorage 在
+        「拖完排序立刻重启」时会被 leveldb 恢复过程丢弃（写前日志 checksum
+        mismatch），只靠前端缓存会出现"重启就复原"。前端启动时用本快照校正。
+        """
+        try:
+            from core.ui_layout import get_ui_layout as _get_ui_layout
+
+            return {"ok": True, **_get_ui_layout()}
+        except Exception as e:
+            logger.exception("get_ui_layout 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def save_ui_layout(self, layout: Dict[str, Any]) -> Dict[str, Any]:
+        """全量写入侧栏排序快照，返回落盘后的规范化结果。"""
+        try:
+            from core.ui_layout import save_ui_layout as _save_ui_layout
+
+            if not isinstance(layout, dict):
+                return {"ok": False, "msg": "layout 必须是对象"}
+            return {"ok": True, **_save_ui_layout(layout)}
+        except Exception as e:
+            logger.exception("save_ui_layout 失败")
+            return {"ok": False, "msg": str(e)}
+
     def pick_files(self) -> Dict[str, Any]:
         try:
             import webview
