@@ -316,9 +316,11 @@ class GitRunner:
         cmd += ["-c", "protocol.ext.allow=never"]
         if scope is ExecScope.READ_ONLY:
             cmd += ["-c", "core.fsmonitor=false"]
+        # diff/log/show 的禁用外部 diff 选项必须跟在子命令之后（否则是顶层未知选项）
+        cmd.append(argv[0])
         if scope is ExecScope.READ_ONLY and argv[0] in _NO_EXTERNAL_DIFF_COMMANDS:
             cmd += ["--no-ext-diff", "--no-textconv"]
-        cmd += argv
+        cmd += argv[1:]
         return cmd
 
     def _build_env(self, env_extra: Optional[Dict[str, str]]) -> Dict[str, str]:
