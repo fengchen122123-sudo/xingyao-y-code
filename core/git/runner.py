@@ -140,6 +140,7 @@ class GitRunner:
         scope: ExecScope = ExecScope.READ_ONLY,
         timeout: float = 30.0,
         stdin: bool = False,
+        stdin_data: bytes = b"",
         env_extra: Optional[Dict[str, str]] = None,
     ) -> GitProcessResult:
         """白名单内的 Git 调用入口。非零退出返回结果，不抛异常。"""
@@ -148,7 +149,8 @@ class GitRunner:
             raise GitError(GitErrorCode.INVALID_STATE, "git 参数为空")
         self._check_whitelist(argv, scope)
         return self._execute(
-            argv, cwd=cwd, scope=scope, timeout=timeout, stdin=stdin, env_extra=env_extra
+            argv, cwd=cwd, scope=scope, timeout=timeout, stdin=stdin,
+            stdin_data=stdin_data, env_extra=env_extra,
         )
 
     def run_checked(
@@ -159,11 +161,13 @@ class GitRunner:
         scope: ExecScope = ExecScope.READ_ONLY,
         timeout: float = 30.0,
         stdin: bool = False,
+        stdin_data: bytes = b"",
         env_extra: Optional[Dict[str, str]] = None,
     ) -> GitProcessResult:
         """与 run 相同，但非零退出显式失败（规格 §4.3）。"""
         result = self.run(
-            args, cwd=cwd, scope=scope, timeout=timeout, stdin=stdin, env_extra=env_extra
+            args, cwd=cwd, scope=scope, timeout=timeout, stdin=stdin,
+            stdin_data=stdin_data, env_extra=env_extra,
         )
         if result.returncode != 0:
             raise self.map_error(result, [str(a) for a in args])
@@ -339,7 +343,8 @@ class GitRunner:
         scope: Optional[ExecScope],
         timeout: float,
         stdin: bool,
-        env_extra: Optional[Dict[str, str]],
+        stdin_data: bytes = b"",
+        env_extra: Optional[Dict[str, str]] = None,
     ) -> GitProcessResult:
         cmd = self._build_command(argv, scope)
         env = self._build_env(env_extra)
@@ -347,7 +352,7 @@ class GitRunner:
             "cwd": cwd,
             "stdout": subprocess.PIPE,
             "stderr": subprocess.PIPE,
-            "stdin": subprocess.PIPE if stdin else subprocess.DEVNULL,
+            "stdin": subprocess.PIPE if (stdin or stdin_data) else subprocess.DEVNULL,
             "env": env,
             "shell": False,
         }
@@ -368,7 +373,7 @@ class GitRunner:
                 f"git 进程启动超时: {redact_text(' '.join(argv[:4]))}",
             ) from exc
         try:
-            stdout, stderr = proc.communicate(timeout=timeout)
+            stdout, stderr = proc.communicate(input=stdin_data or None, timeout=timeout)
         except subprocess.TimeoutExpired:
             _kill_process_tree(proc)
             try:
