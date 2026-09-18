@@ -264,3 +264,64 @@ it('事件丢失时，重命名当前会话仍按后端返回的最终名迁移�
   expect(store.currentSessionName).toBe('新名字_1');
   expect(store.currentSessionDisplayName).toBe('新名字_1');
 });
+
+// 派发原生 keydown：IME 的 isComposing / keyCode 只能经 KeyboardEventInit 设置，
+// vue-test-utils 的 trigger(..., { isComposing }) 走 Object.assign 会写不进只读属性
+function dispatchKey(el: Element, key: string, init: KeyboardEventInit = {}) {
+  const ev = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true, ...init });
+  el.dispatchEvent(ev);
+  return ev;
+}
+
+it('IME 组合态的 Enter（isComposing:true）→ 不提交、不改名、不调用 rename，且仍留在编辑态', async () => {
+  const rename_session = vi.fn();
+  const { wrapper, store } = setup({ rename_session });
+
+  await openMenu(wrapper);
+  await clickRename(wrapper);
+  const input = wrapper.find('[data-test="session-rename-input"]');
+  // 组合中文字尚未上屏：v-model 里是中间态，若此刻提交会被「与原名相同」静默吞掉
+  await input.setValue('候选词还没上屏');
+  const ev = dispatchKey(input.element, 'Enter', { isComposing: true });
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(rename_session).not.toHaveBeenCalled();
+  expect(store.sessionGroups[0].sessions[0].display_name).toBe('会话 A');
+  // 组合态不 preventDefault，把上屏交给输入法自己处理
+  expect(ev.defaultPrevented).toBe(false);
+  expect(wrapper.find('[data-test="session-rename-input"]').exists()).toBe(true);
+});
+
+it('非组合态的 Enter（isComposing:false）→ 正常提交重命名', async () => {
+  const renamed = sessionGroups();
+  renamed[0].sessions[0].display_name = '新名字';
+  const rename_session = vi.fn(async () => ({ ok: true, name: '新名字', sessions: renamed }));
+  const { wrapper } = setup({ rename_session });
+
+  await openMenu(wrapper);
+  await clickRename(wrapper);
+  const input = wrapper.find('[data-test="session-rename-input"]');
+  await input.setValue('新名字');
+  const ev = dispatchKey(input.element, 'Enter', { isComposing: false });
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(rename_session).toHaveBeenCalledTimes(1);
+  expect(rename_session).toHaveBeenCalledWith('session-a', '新名字');
+  expect(ev.defaultPrevented).toBe(true);
+  expect(wrapper.find('[data-test="session-rename-input"]').exists()).toBe(false);
+});
+
+it('IME 组合态的 Esc（isComposing:true）→ 仅取消候选词，不退出编辑态', async () => {
+  const rename_session = vi.fn();
+  const { wrapper } = setup({ rename_session });
+
+  await openMenu(wrapper);
+  await clickRename(wrapper);
+  const input = wrapper.find('[data-test="session-rename-input"]');
+  const ev = dispatchKey(input.element, 'Escape', { isComposing: true });
+  await new Promise((r) => setTimeout(r, 0));
+
+  expect(ev.defaultPrevented).toBe(false);
+  expect(wrapper.find('[data-test="session-rename-input"]').exists()).toBe(true);
+  expect(rename_session).not.toHaveBeenCalled();
+});
