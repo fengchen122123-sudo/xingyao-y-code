@@ -39,6 +39,8 @@ export interface ModelInfo {
   // 电脑操控能力契约（设计 9.1）：旧模型缺省 false / 'none'，不自动获得资格
   supports_function_calling: boolean;
   computer_protocol: ComputerProtocolChoice;
+  // 最大输出：null = 未设置（请求时走内置默认表）
+  max_tokens?: number | null;
 }
 
 export interface ProviderInfo {
@@ -981,12 +983,12 @@ export interface PyWebViewAPI {
   add_provider(name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_model_settings(): Promise<ModelSettingsSnapshot>;
   add_preset_provider(presetId: string, apiKey: string): Promise<any>;
-  sync_preset_models(presetId: string): Promise<any>;
   update_provider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_provider_api_key(providerId: string): Promise<{ ok: boolean; api_key?: string; msg?: string }>;
   delete_provider(providerId: string): Promise<any>;
-  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice): Promise<any>;
-  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice): Promise<any>;
+  add_model(providerId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null): Promise<any>;
+  fetch_provider_models(providerId: string): Promise<{ ok: boolean; msg?: string; models?: { id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[]; count?: number }>;
+  update_model(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling?: boolean, computerProtocol?: ComputerProtocolChoice, maxTokens?: number | null): Promise<any>;
   delete_model(modelId: string): Promise<any>;
   test_model(modelId: string): Promise<any>;
   set_secondary_model(modelId: string): Promise<any>;

@@ -229,7 +229,7 @@ const baseTabs: Array<{ id: TabType; label: string }> = [
   { id: 'tasks', label: '任务' },
   { id: 'term', label: '终端' },
   { id: 'files', label: '文件' },
-  { id: 'git', label: '源代码管理' }
+  { id: 'git', label: 'Git' }
 ];
 const tabs = computed<Array<{ id: TabType; label: string; closable?: boolean }>>(() => (
   store.computerRun.run_id

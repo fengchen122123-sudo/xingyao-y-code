@@ -1,5 +1,6 @@
 // GitPanel 组件测试（规格 §17.3：源代码管理分组 / 禁用原因 / 确认对话框）
 import { mount } from '@vue/test-utils';
+import { nextTick } from 'vue';
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import GitPanel from './GitPanel.vue';
@@ -102,20 +103,25 @@ describe('GitPanel 源代码管理面板', () => {
       },
       typedInput: '',
     };
-    await Promise.resolve();
+    // 挂载面板（mountWithSnapshot 只种 store 快照），再等 Teleport 渲染到 body
+    mount(GitPanel);
+    await nextTick();
+    // 确认框经 Teleport 渲染在 body 下（逃出右面板层叠上下文），从 document 查询
     const modal = document.body.querySelector('[data-test="git-confirm-modal"]');
-    // 面板用 teleport-free 实现：确认框渲染在面板内
-    void modal;
-    const wrapper = mount(GitPanel);
-    await wrapper.vm.$nextTick();
-    const input = wrapper.find('[data-test="git-confirm-input"]');
-    expect(input.exists()).toBe(true);
-    const okBtn = wrapper.get('[data-test="git-confirm-ok"]');
+    expect(modal).not.toBeNull();
+    const input = modal!.querySelector('[data-test="git-confirm-input"]') as HTMLInputElement;
+    expect(input).not.toBeNull();
+    const okBtn = modal!.querySelector('[data-test="git-confirm-ok"]') as HTMLButtonElement;
     // 未输入确认文本时禁用（不可恢复操作需输入分支名/短 Hash）
-    expect((okBtn.element as HTMLButtonElement).disabled).toBe(true);
-    await input.setValue('HEAD~1');
+    expect(okBtn.disabled).toBe(true);
+    input.value = 'HEAD~1';
+    input.dispatchEvent(new Event('input'));
+    await Promise.resolve();
+    expect(okBtn.disabled).toBe(false);
     const execSpy = vi.spyOn(store, 'executeConfirmed').mockResolvedValue(undefined);
-    await okBtn.trigger('click');
+    okBtn.click();
+    await Promise.resolve();
     expect(execSpy).toHaveBeenCalledWith('reset_hard', { target: 'HEAD~1' }, 'tok-9');
+    modal!.remove();
   });
 });

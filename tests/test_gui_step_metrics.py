@@ -109,7 +109,7 @@ def test_step_metrics_handles_mock_stream_gracefully(monkeypatch):
         ]
 
     monkeypatch.setattr(model_manager, "get_model_protocol", lambda *_: "responses")
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
 
     events = list(
         llm.chat_with_model_events(

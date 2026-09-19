@@ -2,7 +2,7 @@
 """编码 agent 与不同 LLM 模型适配度基准测试脚本。
 
 用途：
-    真实调用 litellm.completion（stream=False）测两个核心指标：
+    真实调用 core.llm.completion（自研引擎，stream=False）测两个核心指标：
       1. 缓存命中率（cached_tokens / prompt_tokens，冷启动 vs 热启动）
       2. token 消耗（prompt / completion / total / cached 的逐轮与汇总统计）
 
@@ -36,19 +36,14 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-# 与 core/llm.py 保持一致：使用本地模型价格表，避免启动时远程拉取超时
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-os.environ.setdefault("LITELLM_TELEMETRY", "False")
-
+# 使用项目包装函数（自研引擎唯一路径，可被测试 mocker.patch 拦截）
 try:
-    # 优先使用项目包装函数（可被测试 mocker.patch 拦截，且已配置懒加载）
     from core.llm import completion as _completion
     _IMPORT_SOURCE = "core.llm.completion"
-except Exception as _import_err:  # 独立环境降级为直接使用 litellm
-    import litellm
-    litellm.suppress_debug_info = True
-    _completion = litellm.completion
-    _IMPORT_SOURCE = "litellm.completion (fallback: %s)" % _import_err
+except Exception as _import_err:
+    raise SystemExit(
+        "无法导入 core.llm.completion，请在项目 venv 下运行：%s" % _import_err
+    )
 
 # 单次请求超时（秒）
 _REQUEST_TIMEOUT = 120
@@ -78,7 +73,7 @@ _TOOL_USER_MSG_TEMPLATE = (
 # 工具结果（模拟）：随轮数变化，避免内容完全一致影响对比
 _TOOL_RESULT_TEMPLATE = (
     "read_file 返回：文件 E:/fch/Y-code_cli/core/llm.py 第 1-120 行，"
-    "包含 litellm 懒加载与 completion 包装函数（模拟结果，第 {n} 轮）。"
+    "包含 LLM 引擎懒加载与 completion 包装函数（模拟结果，第 {n} 轮）。"
 )
 
 # 场景二传给模型的最小工具 schema（read_file），让模型能真实发起工具调用
@@ -123,7 +118,7 @@ def _build_system_prompt(context_chars):
         return base[:context_chars]
     chunk = (
         "module core/agent_service.py: 负责 agent 主循环、任务调度与权限管理；"
-        "module core/llm.py: 封装 litellm 完成大模型调用与 token 估算；"
+        "module core/llm.py: 封装大模型调用与 token 估算；"
         "module core/tools.py: 注册文件读写、目录列举、命令执行等工具；"
         "module core/model_selector.py: 多模型选择、连通性与价格表管理；"
         "module core/mcp_client.py: MCP 客户端，扩展外部工具能力。"
@@ -135,7 +130,7 @@ def _build_system_prompt(context_chars):
 
 
 def _extract_usage(resp):
-    """从 litellm 响应中提取 usage 四元组（prompt/completion/total/cached）。
+    """从模型响应中提取 usage 四元组（prompt/completion/total/cached）。
 
     健壮性：usage 字段缺失或结构不符时全部优雅降级为 0。
     兼容两套字段命名：
@@ -233,7 +228,7 @@ def _extract_reasoning_content(resp):
     thinking_blocks = None
     try:
         # Kimi (anthropic 协议)：thinking 块在 message.thinking_blocks
-        # （litellm 1.91.2 非流式响应已暴露该字段，且必须原样回传）
+        # （上游非流式响应已暴露该字段，且必须原样回传）
         msg = resp.choices[0].message
         blocks = getattr(msg, "thinking_blocks", None)
         if isinstance(blocks, list):
@@ -535,7 +530,7 @@ def main():
     parser = argparse.ArgumentParser(
         description="编码 agent 与不同 LLM 模型的适配度基准测试（缓存命中率与 token 消耗）")
     parser.add_argument("--model", default="openai/deepseek-v4-flash",
-                        help="litellm 模型名（默认 openai/deepseek-v4-flash）")
+                        help="模型路由名（默认 openai/deepseek-v4-flash）")
     parser.add_argument("--api-base", default="https://api.deepseek.com",
                         help="API 基础地址（默认 https://api.deepseek.com）")
     parser.add_argument("--api-key", required=True,

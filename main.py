@@ -193,7 +193,7 @@ active_cancel_event = None
 active_turn_id = None
 app_instance = None
 is_thinking = False
-# LLM 引擎（litellm/tiktoken/模型能力探测）是否已在后台预热完成。
+# LLM 引擎（token 估算/模型能力探测）是否已在后台预热完成。
 # 首轮对话若赶在预热完成前发出，状态行会显示“正在启动模型引擎”而不是
 # 让用户误以为卡死。
 _llm_engine_ready = False
@@ -1768,8 +1768,8 @@ def trigger_session_auto_rename(session_name, user_query, api_model, api_key, ap
                 f"用户提问：\"{query_text}\"\n"
                 "会话标题："
             )
-            from litellm import completion
-            response = completion(
+            from core.llm_native_transport import native_completion
+            response = native_completion(
                 model=api_model,
                 api_key=api_key,
                 api_base=api_url,
@@ -4414,8 +4414,8 @@ def _make_input_app():
             # elapsed），避免两个动画刷新率不一致导致的观感卡顿。
             frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             frame = frames[int(time.time() * 5) % len(frames)]
-            # 首轮对话赶在后台预热完成前发出时，litellm/tiktoken 的首次
-            # import 需要数秒——如实显示“启动模型引擎”，避免看似卡死。
+            # 首轮对话赶在后台预热完成前发出时，模型引擎首次初始化
+            # 需要时间——如实显示“启动模型引擎”，避免看似卡死。
             if not _llm_engine_ready and _active_tool_status is None:
                 return f"  {frame} {_agent_name()}正在启动模型引擎 · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"
             return _format_activity_text(task_status, _active_tool_status, elapsed, frame)
@@ -5382,19 +5382,18 @@ def run_cli():
 
     # ── 启动预热（同步阶段，CLI 出现前完成）──────────────────────────────
     # 设计取向：启动慢一点没关系，但进入界面后必须立即可用、输入不卡。
-    # 若改为后台预热，litellm/mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
+    # 若改为后台预热，mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
     # 抢 GIL，实测会把首帧绘制卡 8 秒、键盘输入无回显。因此三个预热任务在
     # 此处并发执行、主线程显示进度动画并等全部完成后再进入 CLI。
 
-    def _preload_litellm():
-        """预热 LLM 引擎：litellm import、tiktoken 编码加载（token_counter
-        首次调用）、模型视觉能力探测（首个 generator 会调用）。"""
+    def _preload_llm_engine():
+        """预热 LLM 引擎：token 估算器首次调用与模型视觉能力探测
+        （首个 generator 会调用）。"""
         global _llm_engine_ready
         try:
-            from core.llm import _get_litellm, _litellm_token_counter, _supports_vision
-            _get_litellm()
+            from core.llm import _token_counter, _supports_vision
             try:
-                _litellm_token_counter(
+                _token_counter(
                     current_model or "openai/gpt-4o-mini",
                     [{"role": "user", "content": "预热"}],
                 )
@@ -5406,7 +5405,7 @@ def run_cli():
             except Exception:
                 pass
         except Exception as e:
-            logging.getLogger("py.warnings").warning("预加载 litellm 失败: %s", e)
+            logging.getLogger("py.warnings").warning("预加载 LLM 引擎失败: %s", e)
         finally:
             _llm_engine_ready = True
 
@@ -5448,7 +5447,7 @@ def run_cli():
             logging.getLogger("py.warnings").warning("MCP 后台连接失败: %s", e)
 
     def _warm_token_usage():
-        """预热当前 session 的 Token 统计（会连带 tiktoken 首次加载），
+        """预热当前 session 的 Token 统计，
         同步完成后状态栏 token 数在首绘时就是准确值。"""
         try:
             recalc_token_usage()
@@ -5456,7 +5455,7 @@ def run_cli():
             logging.getLogger("py.warnings").warning("启动预热 recalc_token_usage 失败: %s", e)
 
     _preload_threads = [
-        threading.Thread(target=_preload_litellm, daemon=True),
+        threading.Thread(target=_preload_llm_engine, daemon=True),
         threading.Thread(target=_preload_mcp, daemon=True),
         threading.Thread(target=_warm_token_usage, daemon=True),
     ]

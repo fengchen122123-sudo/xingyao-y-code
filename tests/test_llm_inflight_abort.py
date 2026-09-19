@@ -31,7 +31,7 @@ class _FakeStream:
 
 
 class _WrapperWithoutClose:
-    """模拟 litellm CustomStreamWrapper：自身无 close，可关对象藏在里层。"""
+    """模拟流包装对象：自身无 close，可关对象藏在里层。"""
 
     def __init__(self, inner):
         self.completion_stream = inner

@@ -1,6 +1,6 @@
 """core/agent_service.py 与相关解耦改动的单元测试。
 
-沙盒约束：模块顶层不 import litellm；对 estimate_tokens 等重依赖一律打桩。
+沙盒约束：模块顶层不加载 LLM 引擎；对 estimate_tokens 等重依赖一律打桩。
 """
 
 import os
@@ -23,7 +23,7 @@ from core.memory import MemoryManager
 
 @pytest.fixture
 def stub_llm(monkeypatch):
-    """把 core.llm 换成轻量桩，避免测试环境加载 litellm。"""
+    """把 core.llm 换成轻量桩，避免测试环境加载 LLM 引擎。"""
     import threading
 
     stub = types.ModuleType("core.llm")

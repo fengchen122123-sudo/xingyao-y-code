@@ -147,7 +147,7 @@ def _field(value, key, default=None):
 
 
 def _normalized_type(event_type) -> str:
-    """事件 type 归一化为 'response.*' 字符串（litellm 桥接枚举走 .value）。"""
+    """事件 type 归一化为 'response.*' 字符串（桥接枚举走 .value）。"""
     if isinstance(event_type, str):
         return event_type
     value = getattr(event_type, "value", None)

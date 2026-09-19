@@ -276,9 +276,9 @@ def _run_native_responses_turn(
         return iter(responses[len(captured) - 1])
 
     patches = [
-        # 关键接缝：拦截 litellm responses 入口，否则会发起真实 Provider 请求
+        # 关键接缝：拦截 Responses 协议入口，否则会发起真实 Provider 请求
         # （与 tests/test_llm_responses.py 的成熟接缝一致）。
-        mock.patch.object(llm_mod, "_litellm_responses", fake_responses),
+        mock.patch.object(llm_mod, "_dispatch_responses", fake_responses),
         mock.patch.object(llm_mod, "get_tools_schema", lambda: [ZETA_TOOL, ALPHA_TOOL]),
         mock.patch.object(
             model_manager, "get_model_protocol", lambda *_a, **_k: "responses"

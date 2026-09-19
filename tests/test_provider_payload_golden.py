@@ -56,7 +56,7 @@ def _capture(
         return iter([_chunk()])
 
     if protocol == "responses":
-        monkeypatch.setattr(llm, "_litellm_responses", completion)
+        monkeypatch.setattr(llm, "_dispatch_responses", completion)
     else:
         monkeypatch.setattr(llm, "completion", completion)
     list(llm.chat_with_model_events(model, "golden-secret", messages, api_base, persist=False,
@@ -406,26 +406,14 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
 
 
 @pytest.fixture
-def _fake_supports_tool_choice(monkeypatch):
-    """固定 litellm 模型清单查询结果，避免用例随 litellm 版本漂移。"""
-    import litellm.utils as litellm_utils
-
-    holder = {"supports": True}
-    monkeypatch.setattr(
-        litellm_utils, "supports_tool_choice",
-        lambda *, model, custom_llm_provider=None: holder["supports"],
-    )
-    return holder
-
-
 def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
-    monkeypatch, _fake_supports_tool_choice
+    monkeypatch,
 ):
-    """中转站未知 gpt-5* 模型：litellm 客户端会直接拒 tool_choice，请求必须
-    追加 allowed_openai_params 放行；其余字节与普通 openai 路由完全一致。"""
+    """中转站未知 gpt-5* 模型（历史 litellm 时代需放行 allowed_openai_params）：
+    自研引擎无内置清单校验，tool_choice 原样透传，请求不含放行字段，
+    其余字节与普通 openai 路由完全一致。"""
     import core.llm as llm
 
-    _fake_supports_tool_choice["supports"] = False
     messages = [
         {"role": "system", "content": "stable"},
         {"role": "user", "content": "inspect"},
@@ -446,7 +434,6 @@ def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
         "num_retries": 2,
         "max_tokens": 32000,
         "tool_choice": "auto",
-        "allowed_openai_params": ["tool_choice"],
         "api_base": "https://relay.example/v1",
         "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
     }
@@ -454,12 +441,11 @@ def test_relay_unknown_gpt5_model_tool_choice_allowlist_is_byte_golden(
 
 
 def test_known_gpt5_model_request_stays_free_of_tool_choice_allowlist(
-    monkeypatch, _fake_supports_tool_choice
+    monkeypatch,
 ):
-    """litellm 已收录的 gpt-5 模型（官方路由）不触发放行，请求不新增字段。"""
+    """gpt-5* 模型请求不含放行字段（自研引擎透传 tool_choice，无需白名单）。"""
     import core.llm as llm
 
-    _fake_supports_tool_choice["supports"] = True
     captured = _capture(
         monkeypatch, model="openai/gpt-5.6-sol",
         api_base="https://relay.example/v1", protocol="openai",
@@ -470,21 +456,6 @@ def test_known_gpt5_model_request_stays_free_of_tool_choice_allowlist(
     assert "allowed_openai_params" not in captured[0]
     assert captured[0]["tool_choice"] == "auto"
 
-
-def test_tool_choice_rejection_probe_short_circuits_non_gpt5_names(monkeypatch):
-    """非 gpt-5 名字必须短路返回 False，不得触碰 litellm 清单查询。"""
-    import core.llm as llm
-
-    def _explode(*_args, **_kwargs):
-        raise AssertionError("非 gpt-5 模型不应查询 litellm 清单")
-
-    monkeypatch.setattr(
-        "litellm.utils.supports_tool_choice", _explode, raising=False
-    )
-    assert llm._litellm_rejects_tool_choice("openai/deepseek-v4-pro") is False
-    assert llm._litellm_rejects_tool_choice("openai/glm-5.3-flash") is False
-    assert llm._litellm_rejects_tool_choice("anthropic/step-3.7-flash") is False
-    assert llm._litellm_rejects_tool_choice("") is False
 
 
 def test_native_computer_first_and_continuation_requests_are_byte_golden(
@@ -553,7 +524,7 @@ def test_native_computer_first_and_continuation_requests_are_byte_golden(
     )
     monkeypatch.setattr(llm, "_describe_images_with_secondary", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(llm, "get_computer_control_service", lambda: controller)
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
     list(llm.chat_with_model_events(
         "openai/gpt-native-golden",
         "golden-secret",

@@ -1,19 +1,16 @@
-"""LiteLLM transport, inflight request interruption, and retry backoff."""
+"""自研 HTTPX 传输层：请求入口、在飞请求硬中断注册表与重试退避常量。
+
+OpenAI 兼容 chat 路由一律由 core.llm_native_transport.native_completion
+发出，任何异常直接向上抛出（回合循环统一失败收口并即时反馈到 UI），
+不存在静默降级通道。
+"""
 
 from __future__ import annotations
 
 import logging
-import os
 import threading
 from concurrent.futures import Future
 from typing import Dict, List
-
-# 本地内置离线映射，避免每次启动请求 GitHub
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-
-# 屏蔽 LiteLLM 启动时的调试噪音，但保留 WARNING 及以上的有用告警
-logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-logging.getLogger("litellm").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +27,7 @@ WAIT_NOTICE_THRESHOLD_SECONDS = 120.0
 WAIT_NOTICE_INTERVAL_SECONDS = 30.0
 
 # 等待硬上限（秒）：首字节等待或流中段连续空闲达到该值即放弃本轮请求并结束回合。
-# litellm num_retries 会把单次超时在同一个 Step 内放大数倍（重试留在同 Step），
+# 上层重试循环会把单次超时在同一个 Step 内放大数倍（重试留在同 Step），
 # 等待提示里的“超时上限”不等于客户端真实等待上限；与其无限等，不如到点主动
 # 结束回合让用户决定重试。
 REQUEST_WAIT_GIVE_UP_SECONDS = 600.0
@@ -71,9 +68,9 @@ _inflight_streams: Dict["threading.Event", List["_InflightStream"]] = {}
 def _close_stream_quietly(stream):
     """尽力关闭单个流对象（不触碰共享 client/连接池），吞掉一切异常。
 
-    litellm 的 CustomStreamWrapper 没有 close()，真正的可关闭对象藏在
-    .completion_stream（openai SDK Stream，close() 会关底层 httpx response）
-    或 .response（httpx.Response）里，逐层探测。
+    流包装对象自身可能没有 close()，真正的可关闭对象藏在里层
+    （openai SDK Stream，close() 会关底层 httpx response，或 httpx.Response）
+    ，逐层探测。
     """
     seen = set()
     queue = [stream]
@@ -163,75 +160,22 @@ def abort_inflight_streams(cancel_event):
 
 
 # ---------------------------------------------------------------------------
-# litellm 懒加载与补丁
+# native 引擎路由支持范围
 # ---------------------------------------------------------------------------
-_litellm_module = None
-_litellm_lock = threading.Lock()
-_STREAM_USAGE_PATCH_FLAG = "_ycode_stream_usage_patched"
-
-
-def _patch_litellm_stream_usage_details(_litellm):
-    """修复 litellm 1.83.7 流式 usage 丢失 prompt_tokens_details 的问题。"""
-    try:
-        from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
-    except Exception:
-        return
-    if getattr(CustomStreamWrapper, _STREAM_USAGE_PATCH_FLAG, False):
-        return
-    _original = CustomStreamWrapper.handle_openai_chat_completion_chunk
-
-    def _patched(self, chunk):
-        response_obj = _original(self, chunk)
-        if response_obj is None:
-            return response_obj
-        usage = response_obj.get("usage")
-        if isinstance(usage, dict) and (
-            "prompt_tokens_details" in usage or "prompt_cache_hit_tokens" in usage
-        ):
-            try:
-                response_obj["usage"] = _litellm.Usage(**usage)
-            except Exception:
-                pass
-        return response_obj
-
-    CustomStreamWrapper.handle_openai_chat_completion_chunk = _patched
-    setattr(CustomStreamWrapper, _STREAM_USAGE_PATCH_FLAG, True)
-
-
-def _get_litellm():
-    """懒加载 litellm 模块，首次调用时 import 并执行一次性配置，后续调用直接返回缓存。"""
-    global _litellm_module
-    if _litellm_module is not None:
-        return _litellm_module
-    with _litellm_lock:
-        if _litellm_module is not None:
-            return _litellm_module
-        import litellm as _litellm
-        _litellm.suppress_debug_info = True
-        _patch_litellm_stream_usage_details(_litellm)
-        _litellm_module = _litellm
-        return _litellm
-
-
-def _is_native_llm_enabled() -> bool:
-    """检查是否启用原生 HTTPX 传输引擎（可通过环境变量 YCODE_USE_NATIVE_LLM=0 临时回退 LiteLLM）。"""
-    flag = os.environ.get("YCODE_USE_NATIVE_LLM", "1").strip().lower()
-    return flag not in ("0", "false", "no", "off")
-
-
-# native 引擎可正确路由的 provider 前缀（与 _resolve_endpoint_and_headers 的
-# 前缀剥离白名单一致）。azure/ gemini/ vertex_ai/ bedrock/ 等 litellm 专属
-# provider 路由 native 无法表达，继续留在 litellm。
+# native 引擎可正确路由的 provider 前缀（与各协议路由的前缀剥离白名单一致）。
+# anthropic/ 走 _anthropic_completion 的 /v1/messages 协议；azure/ gemini/
+# vertex_ai/ bedrock/ 等厂商专属云路由自研引擎未实现，仍不支持。
 _NATIVE_PROVIDER_PREFIXES = frozenset(
-    ("deepseek", "moonshot", "zhipu", "openai", "dashscope", "minimax")
+    ("deepseek", "moonshot", "zhipu", "openai", "dashscope", "minimax", "anthropic")
 )
 
 
 def _is_native_supported_model(model) -> bool:
-    """判断模型是否属于 native 引擎可接手的 OpenAI 兼容 chat 路由。
+    """判断模型是否属于 native 引擎可接手的路由。
 
+    OpenAI 兼容 chat 路由与 anthropic/ 前缀（Messages 协议）均已支持；
     OpenAI 思考模型（o1/o3 系列）需要 max_completion_tokens 与 developer 角色
-    改写，native 尚未实现，必须留在 litellm。
+    改写，native 尚未实现，不支持。
     """
     name = str(model or "").strip().lower()
     if not name:
@@ -247,57 +191,60 @@ def _is_native_supported_model(model) -> bool:
     return True
 
 
-def _litellm_completion(**kwargs):
-    """主请求 completion 包装。
+def _dispatch_completion(**kwargs):
+    """主请求 completion 入口（自研引擎唯一路径）。
 
-    在启用原生引擎且模型属于 native 支持范围时，优先使用
-    core.llm_native_transport.native_completion；否则走 litellm.completion。
-    native 抛出的非业务未知异常平滑降级至 litellm 重发。
+    OpenAI 兼容 chat 路由一律由 core.llm_native_transport.native_completion
+    发出；任何异常——包括 native 内部的非预期 bug——都直接向上抛出，由回合
+    循环统一失败收口并即时反馈到 UI。绝不静默降级重发：那既会掩盖
+    自研引擎的 bug，也有同一请求对上游双发的风险。
+
+    自研引擎不支持的协议路由（o1/o3 思考模型——需要 max_completion_tokens 与
+    developer 角色改写；azure/gemini 等厂商云路由）显式报错，不支持的暗路径
+    一律关闭。anthropic/ 前缀已由 native 的 Messages 协议适配层接管。
     """
-    if _is_native_llm_enabled() and _is_native_supported_model(kwargs.get("model")):
-        from core.llm_native_transport import native_completion, NativeLLMError
-        try:
-            return native_completion(**kwargs)
-        except NativeLLMError:
-            raise
-        except Exception as exc:
-            logger.warning("原生传输调用失败，降级至 LiteLLM: %s", exc)
-            return _get_litellm().completion(**kwargs)
+    if not _is_native_supported_model(kwargs.get("model")):
+        from core.llm_native_transport import NativeLLMError
 
-    return _get_litellm().completion(**kwargs)
+        raise NativeLLMError(
+            f"模型 {kwargs.get('model')!r} 不在自研引擎支持范围内："
+            "o1/o3 思考模型与厂商云路由（azure/gemini 等）暂未实现，"
+            "请改用 OpenAI 兼容或 anthropic 协议的模型路由。"
+        )
+    from core.llm_native_transport import native_completion
 
-
-def _litellm_responses(**kwargs):
-    """litellm.responses 的懒加载包装。"""
-    return _get_litellm().responses(**kwargs)
+    return native_completion(**kwargs)
 
 
-def _litellm_token_counter(model, messages):
-    """Token 估算包装。支持原生极速估算与 litellm 兜底。"""
-    try:
-        from core.llm_native_transport import fast_token_counter
-        return fast_token_counter(model=model, messages=messages)
-    except Exception:
-        return _get_litellm().token_counter(model=model, messages=messages)
+def _dispatch_responses(**kwargs):
+    """Responses 协议入口。
+
+    自研引擎尚未实现 OpenAI Responses API；配置为 responses 协议的 provider
+    在发起请求时立即显式报错（不支持的路由不走任何暗路径）。
+    """
+    from core.llm_native_transport import NativeLLMError
+
+    raise NativeLLMError(
+        "自研引擎暂不支持 OpenAI Responses 协议："
+        "请将该 provider 的协议改为 openai 兼容（chat completions）。"
+    )
 
 
-def _litellm_supports_vision(model):
-    """litellm.supports_vision 的懒加载包装。"""
-    try:
-        return _get_litellm().supports_vision(model=model)
-    except Exception:
-        return False
+def _token_counter(model, messages):
+    """Token 估算入口：自研启发式估算器（fast_token_counter）。
+
+    纯本地计算、对任意模型可用、永不抛错，无需兜底。
+    """
+    from core.llm_native_transport import fast_token_counter
+
+    return fast_token_counter(model=model, messages=messages)
 
 
-def _litellm_context_overflow_error():
-    """ContextWindowExceededError 异常类包装（同时兼容原生异常与 LiteLLM 异常）。"""
-    try:
-        from core.llm_native_transport import ContextWindowExceededError as NativeOverflowError
-        litellm_cls = _get_litellm().ContextWindowExceededError
-        return (litellm_cls, NativeOverflowError)
-    except Exception:
-        from core.llm_native_transport import ContextWindowExceededError
-        return ContextWindowExceededError
+def _context_overflow_error():
+    """上下文超限异常类：自研引擎异常体系（native 请求只会抛自有异常）。"""
+    from core.llm_native_transport import ContextWindowExceededError
+
+    return ContextWindowExceededError
 
 
 def is_rate_limit_error(exc: Exception) -> tuple[bool, float | None]:
@@ -324,17 +271,10 @@ def is_rate_limit_error(exc: Exception) -> tuple[bool, float | None]:
     if status_code == 429:
         return True, retry_after
 
-    # 3. 检查异常类型
+    # 3. 检查异常类型（自研引擎的 RateLimitError 命中此分支与上面的 429 状态码）
     exc_type = type(exc).__name__.lower()
     if "ratelimit" in exc_type:
         return True, retry_after
-
-    try:
-        litellm_rate_err = _get_litellm().exceptions.RateLimitError
-        if isinstance(exc, litellm_rate_err):
-            return True, retry_after
-    except Exception:
-        pass
 
     # 4. 字符串内容匹配（不区分大小写，包含常见中文/英文关键词与无空格形式）
     err_str = str(exc).lower()

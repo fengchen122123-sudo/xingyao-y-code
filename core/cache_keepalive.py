@@ -84,7 +84,7 @@ def _estimate_text_tokens(text):
     """粗估文本 token（ASCII bytes/4、CJK 按字计，取大者），仅供超时放大。
 
     与 tool_result_maintenance 的估算器同款：允许偏差、必须离线快速，
-    不走 litellm token_counter（那要把大上下文整体 tokenize 一遍，秒级）。
+    走离线快速估算而非全量 tokenize（那要把大上下文整体编码一遍，秒级）。
     """
     if not text:
         return 0
@@ -265,9 +265,9 @@ class CacheKeepaliveService:
         last_error = ""
         for attempt in range(KEEPALIVE_MAX_ATTEMPTS):
             try:
-                from core.llm import _litellm_completion
+                from core.llm import _dispatch_completion
 
-                response = _litellm_completion(**deepcopy(snapshot))
+                response = _dispatch_completion(**deepcopy(snapshot))
                 account_keepalive_response(response, telemetry or {})
                 return ""
             except Exception as exc:
