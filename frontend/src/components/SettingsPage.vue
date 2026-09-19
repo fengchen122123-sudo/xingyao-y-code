@@ -112,16 +112,7 @@
               />
               <button @click="showPresetKey = !showPresetKey">{{ showPresetKey ? '隐藏' : '显示' }}</button>
             </div>
-            <div class="model-preview-title">将添加以下模型</div>
-            <div class="preset-models">
-              <div v-for="model in selectedPreset.models" :key="model.name" class="preset-model-row">
-                <span class="mono">{{ model.name }}</span>
-                <span>{{ formatContext(model.context_window) }}</span>
-                <span :class="['vision-tag', { on: model.supports_vision }]">
-                  {{ model.supports_vision ? '多模态' : '纯文本' }}
-                </span>
-              </div>
-            </div>
+            <p class="modal-field-hint">预置厂商仅预填名称与接口地址；添加后通过「获取模型列表」选择模型并自动填充参数。</p>
             <button class="primary-button" :disabled="saving" @click="savePreset">
               {{ configuredPresetIds.has(selectedPreset.id) ? '更新 API Key' : '保存并添加厂商' }}
             </button>
@@ -180,14 +171,6 @@
                 <span>{{ selectedProvider.models?.length || 0 }} 个模型</span>
               </div>
               <div class="model-list-actions">
-                <button
-                  v-if="selectedProviderPresetId"
-                  data-test="sync-preset-models"
-                  class="secondary-button compact"
-                  :disabled="saving"
-                  title="按当前版本的预置目录补齐新增模型并刷新模型参数"
-                  @click="syncPresetModels"
-                ><AppIcon name="refresh" :size="12" /> 同步预置模型</button>
                 <button data-test="add-model" class="secondary-button compact" @click="openModelModal()"><AppIcon name="plus" :size="12" /> 添加模型</button>
               </div>
             </div>
@@ -577,8 +560,26 @@
         <div class="modal-head"><h3>{{ modelModal.model_id ? '编辑模型' : '添加模型' }}</h3><button type="button" @click="closeModelModal">×</button></div>
         <label class="field-label">模型 ID</label>
         <input v-model="modelModal.name" class="text-field mono" placeholder="模型 ID" />
-        <label class="field-label">上下文窗口</label>
-        <input v-model.number="modelModal.context_window" class="text-field" type="number" min="1" />
+        <button type="button" class="secondary-button" data-test="fetch-models" :disabled="fetchingModels" @click="fetchRemoteModels">
+          {{ fetchingModels ? '获取中…' : (remoteModels && remoteModels.length ? `重新获取（${remoteModels.length} 个）` : '获取模型列表') }}
+        </button>
+        <select v-if="remoteModels && remoteModels.length" class="text-field" data-test="remote-model-select" @change="pickRemoteModel">
+          <option value="">共 {{ remoteModels.length }} 个模型，点选自动填充</option>
+          <option v-for="entry in remoteModels" :key="entry.id" :value="entry.id">
+            {{ entry.id }}{{ entry.model_type ? `（${entry.model_type}）` : '' }}
+          </option>
+        </select>
+        <div class="modal-field-row">
+          <div class="modal-field">
+            <label class="field-label">上下文窗口</label>
+            <input v-model.number="modelModal.context_window" class="text-field" type="number" min="1" />
+          </div>
+          <div class="modal-field">
+            <label class="field-label">最大输出</label>
+            <input v-model.number="modelModal.max_tokens" class="text-field" type="number" min="0" placeholder="留空使用默认" />
+          </div>
+        </div>
+        <p class="modal-field-hint">最大输出留空时使用按模型家族内置的默认输出上限（如 DeepSeek 384K、GLM-5.3 131K、其余 32K）。</p>
         <label class="vision-choice">
           <input v-model="modelModal.supports_vision" data-test="model-supports-vision" type="checkbox" />
           <span><b>是否支持多模态</b><small>启用后允许向该模型发送图片内容</small></span>
@@ -702,12 +703,18 @@ const modelModal = reactive({
   model_id: '',
   name: '',
   context_window: 128000,
+  // 最大输出：'' = 留空（请求时走内置默认表）
+  max_tokens: '' as number | '',
   supports_vision: false,
   // 电脑操控能力契约（设计 9.1）：generic 必须同时具备视觉与工具调用；
-  // 缺省 ''（自动）= 视觉+工具调用双勾即可操控，无需逐个配置协议
-  supports_function_calling: false,
+  // 缺省 ''（自动）= 视觉+工具调用双勾即可操控，无需逐个配置协议。
+  // 工具调用新模型默认勾选（Agent 模型本就以工具调用驱动，用户要求默认支持）
+  supports_function_calling: true,
   computer_protocol: '' as ComputerProtocolChoice,
 });
+// 「获取模型列表」：拉取厂商 /v1/models 的一键填充候选
+const remoteModels = ref<{ id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[] | null>(null);
+const fetchingModels = ref(false);
 
 // 与后端 model_manager._validate_computer_combination 同一校验原因（Task 12，
 // 2026-09-05 修订：工具调用未声明视为支持，显式关闭才是拒绝理由）
@@ -739,17 +746,6 @@ const selectedPreset = computed(() => selectedKind.value === 'preset'
 const selectedProvider = computed(() => selectedKind.value === 'provider'
   ? store.providers.find(item => item.id === selectedId.value)
   : undefined);
-// 手动添加的老厂商可能没落 preset_id 链接：按厂商名或 Base URL 认领预置目录，
-// 让「同步预置模型」对这类配置同样可用
-const selectedProviderPresetId = computed(() => {
-  const provider = selectedProvider.value;
-  if (!provider) return '';
-  if (provider.preset_id) return provider.preset_id;
-  const matched = store.modelPresets.find(
-    item => item.name === provider.name || item.base_url === provider.base_url,
-  );
-  return matched?.id || '';
-});
 const configuredPresetIds = computed(() => new Set(
   store.providers.map(item => item.preset_id).filter(Boolean) as string[],
 ));
@@ -906,24 +902,54 @@ async function saveProvider() {
   saving.value = false;
 }
 
-async function syncPresetModels() {
-  const presetId = selectedProviderPresetId.value;
-  if (!presetId) return;
-  saving.value = true;
-  await store.syncPresetModels(presetId);
-  saving.value = false;
-}
-
 function openModelModal(model?: ModelInfo) {
   modelModal.show = true;
   modelModal.model_id = model?.id || '';
   modelModal.name = model?.name || '';
   modelModal.context_window = model?.context_window || 128000;
+  modelModal.max_tokens = model?.max_tokens || '';
   modelModal.supports_vision = model?.supports_vision || false;
-  // 旧模型缺省 false/'none'，不自动获得电脑操控资格（设计 9.1）
-  modelModal.supports_function_calling = model?.supports_function_calling || false;
+  // 新增模型默认支持工具调用；编辑时保留该模型的既有值（显式关闭仍是关闭）
+  modelModal.supports_function_calling = model ? !!model.supports_function_calling : true;
   // 后端缺键模型返回 ''（自动）；显式 none/generic/native_openai 原样回填
   modelModal.computer_protocol = model?.computer_protocol || '';
+  remoteModels.value = null;
+}
+
+async function fetchRemoteModels() {
+  const provider = selectedProvider.value;
+  if (!provider || fetchingModels.value) return;
+  fetchingModels.value = true;
+  const res = await store.fetchProviderModels(provider.id);
+  fetchingModels.value = false;
+  if (res?.ok) {
+    remoteModels.value = res.models || [];
+    if (!remoteModels.value.length) {
+      store.notifyModal('获取模型列表', '服务端返回了空列表');
+    }
+  } else {
+    store.notifyModal('获取模型列表', res?.msg || '未知错误');
+  }
+}
+
+function pickRemoteModel(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (!value) return;
+  modelModal.name = value;
+  // 厂商元数据 + 本地规格表：能填的都填（未提供的字段保持表单原值）
+  const entry = (remoteModels.value || []).find((m) => m.id === value);
+  if (!entry) return;
+  if (entry.context_window && entry.context_window > 0) {
+    modelModal.context_window = entry.context_window;
+  }
+  if (entry.max_tokens && entry.max_tokens > 0) {
+    modelModal.max_tokens = entry.max_tokens;
+  } else {
+    modelModal.max_tokens = '';
+  }
+  if (entry.supports_vision !== undefined && entry.supports_vision !== null) {
+    modelModal.supports_vision = entry.supports_vision;
+  }
 }
 
 function closeModelModal() {
@@ -942,17 +968,21 @@ async function saveModel() {
     return;
   }
   saving.value = true;
+  // 最大输出：留空 = 0（后端语义：新增不落键 / 编辑清除键，回到内置默认）
+  const maxTokens = modelModal.max_tokens === '' ? 0 : Number(modelModal.max_tokens);
   let result;
   if (modelModal.model_id) {
     result = await store.updateModel(
       provider.id, modelModal.model_id, modelModal.name.trim(),
       Number(modelModal.context_window), modelModal.supports_vision,
       modelModal.supports_function_calling, modelModal.computer_protocol,
+      maxTokens,
     );
   } else {
     result = await store.addModel(
       provider.id, modelModal.name.trim(), Number(modelModal.context_window), modelModal.supports_vision,
       modelModal.supports_function_calling, modelModal.computer_protocol,
+      maxTokens,
     );
   }
   saving.value = false;
@@ -1366,6 +1396,8 @@ onMounted(async () => {
 .empty-models, .empty-detail { padding: 48px 0; text-align: center; color: var(--text-faint); font-size: 12px; }
 .modal-mask { position: fixed; inset: 0; z-index: 5000; display: grid; place-items: center; background: rgba(0, 0, 0, .68); backdrop-filter: blur(8px); }
 .model-modal { width: min(560px, calc(100vw - 40px)); padding: 24px; box-sizing: border-box; border: 1px solid var(--border); border-radius: 15px; background: var(--bg2); box-shadow: 0 24px 80px rgba(0, 0, 0, .55); }
+.modal-field-row { display: flex; gap: 12px; }
+.modal-field-row .modal-field { flex: 1; min-width: 0; }
 .modal-head { display: flex; align-items: center; justify-content: space-between; }
 .modal-head h3 { margin: 0; }
 .modal-head button { border: 0; background: transparent; color: var(--text-dim); font-size: 20px; }

@@ -7,6 +7,7 @@ import os
 import sys
 import json
 import logging
+import shutil
 import socket
 import threading
 import time
@@ -178,6 +179,35 @@ def _configure_runtime_logging():
         pass
 
 
+def _clear_stale_webview_cache():
+    """前端产物更新后清理 WebView2 持久化 HTTP 缓存（自愈「更新后还是旧界面」）。
+
+    private_mode=False 让界面偏好（localStorage）跨重启保留，副作用是 HTTP
+    缓存同样落盘。实测部分 WebView2 版本在 no-store 响应头下仍直接复用缓存
+    的旧 index.html/JS（2026-09-19：「获取模型列表」功能上线后用户打开仍是
+    旧界面）。以 dist/index.html 的 mtime+size 为构建指纹：与上次启动记录
+    不一致即清 Cache/Code Cache/GPUCache——只清缓存目录，Local Storage
+    （界面偏好）原样保留。任何失败都不影响启动。
+    """
+    try:
+        index_path = os.path.join(_get_base_dir(), "frontend", "dist", "index.html")
+        if not os.path.exists(index_path):
+            return
+        stat = os.stat(index_path)
+        fingerprint = f"{int(stat.st_mtime)}:{stat.st_size}"
+        marker = _data_dir() / "webview" / "dist_fingerprint.txt"
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        if marker.exists() and marker.read_text(encoding="utf-8").strip() == fingerprint:
+            return
+        default_root = _data_dir() / "webview" / "EBWebView" / "Default"
+        for cache_name in ("Cache", "Code Cache", "GPUCache"):
+            shutil.rmtree(default_root / cache_name, ignore_errors=True)
+        marker.write_text(fingerprint, encoding="utf-8")
+        logger.info("检测到前端产物更新（%s），已清理 WebView2 缓存", fingerprint)
+    except Exception:
+        logger.debug("清理 WebView2 缓存失败（不影响启动）", exc_info=True)
+
+
 def is_port_open(host="127.0.0.1", port=5173) -> bool:
     """检查 Vite 开发服务器端口 5173 是否处于打开监听状态"""
     try:
@@ -289,19 +319,17 @@ def _debug_enabled() -> bool:
 
 
 def _start_preload_thread():
-    """后台预热 LLM 引擎：litellm import + tiktoken 编码加载 + 视觉能力探测。
+    """后台预热 LLM 引擎：token 估算器首次调用 + 视觉能力探测。
 
     GUI 的界面渲染在独立 WebView 进程，Python 侧后台预热不会卡 UI 首帧
     （与 CLI 必须同步预热不同，见 main.py 启动预热段的注释）。
-    不做预热时，首个回合会在工作线程里现场完成这些 import，
-    表现为“第一条消息要等很久”。线程安全由 core.llm._litellm_lock 保证。
-    """
+    不做预热时，首个回合会在工作线程里现场完成这些初始化，
+    表现为“第一条消息要等很久”。"""
     import threading
 
     def _preload():
         try:
-            from core.llm import _get_litellm, _litellm_token_counter, _supports_vision
-            _get_litellm()
+            from core.llm import _token_counter, _supports_vision
             model = None
             try:
                 from core.model_manager import get_active_model
@@ -309,7 +337,7 @@ def _start_preload_thread():
             except Exception:
                 pass
             try:
-                _litellm_token_counter(
+                _token_counter(
                     model or "openai/gpt-4o-mini",
                     [{"role": "user", "content": "预热"}],
                 )
@@ -549,6 +577,7 @@ def main():
     # 下载页），把"哑巴黑屏"变成可读结论。非 Windows 与已安装两种情况均无副作用。
     check_webview2_runtime()
 
+    _clear_stale_webview_cache()
     url = get_frontend_url()
     gui_theme = _initial_gui_theme()
     url += ("&" if "#" in url else "#") + _build_gui_theme_fragment(gui_theme)

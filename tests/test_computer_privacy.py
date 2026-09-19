@@ -263,7 +263,7 @@ def _run_native_turn(stack, manager, controller, *, secret, response_id):
         return iter(responses[len(requests) - 1])
 
     stack.enter_context(
-        mock.patch.object(llm_mod, "_litellm_responses", fake_responses)
+        mock.patch.object(llm_mod, "_dispatch_responses", fake_responses)
     )
     stack.enter_context(
         mock.patch.object(llm_mod, "get_computer_control_service", lambda: controller)

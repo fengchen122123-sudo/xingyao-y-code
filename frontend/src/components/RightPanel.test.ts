@@ -85,12 +85,12 @@ it('run 出现前不渲染操控页签，出现后动态追加并自动切过去
   const store = useAppStore();
   const wrapper = mount(RightPanel);
 
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件']);
+  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件', 'Git']);
 
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'starting' });
   await nextTick();
 
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件', '操控']);
+  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件', 'Git', '操控']);
   expect(computerTab(wrapper).classes()).toContain('active');
   expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
   expect(store.computerLastAutoOpenedRunId).toBe('run-1');
@@ -176,7 +176,7 @@ it('终态 60 秒且用户不在操控页签时自动关闭页签', async () => 
   vi.advanceTimersByTime(1);
   await nextTick();
   expect(computerTab(wrapper)).toBeUndefined();
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件']);
+  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件', 'Git']);
 
   wrapper.unmount();
   vi.useRealTimers();

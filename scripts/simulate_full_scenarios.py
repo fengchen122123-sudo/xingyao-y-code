@@ -2,7 +2,7 @@
 
 生产路径全部真实（prepare_turn_messages 完整四级水位阶梯 + Tier3 全链路 +
 真实 SQLite / tiktoken / marker 冻结 / 保护区 / I4 / 物理折叠 / 滑窗淘汰），
-唯一替换点仍是 core.llm._litellm_completion 桩，零 API 成本。
+唯一替换点仍是 core.llm._dispatch_completion 桩，零 API 成本。
 
   F  Tier1/Tier2 本地工具结果维护
      F1 60% 水位 → snip（head+tail 截断），冻结后不重写、错误结果不改写；
@@ -155,14 +155,14 @@ def patched(stub):
     """上下文管理式打桩：completion + 压缩配置，退出还原。"""
     class P:
         def __init__(self):
-            self.orig_c = llm._litellm_completion
+            self.orig_c = llm._dispatch_completion
             self.orig_cfg = mc._load_compression_config
         def __enter__(self):
-            llm._litellm_completion = stub
+            llm._dispatch_completion = stub
             mc._load_compression_config = lambda: dict(BASE_CFG)
             return self
         def __exit__(self, *a):
-            llm._litellm_completion = self.orig_c
+            llm._dispatch_completion = self.orig_c
             mc._load_compression_config = self.orig_cfg
     return P()
 

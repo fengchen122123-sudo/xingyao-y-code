@@ -12,7 +12,7 @@
   （brief Step 1 逐字协议），固定顺序 controller.stop（活动 run 停止：owner
   cancel → Provider 流中断 → backend release/close，retained browser 一并
   清理）→ preview.stop（删除临时 PNG）→ hotkey.close（注销热键）。每步独立
-  try/except 留痕，绝不向上传播；不关闭 LiteLLM 共享连接池，不自动恢复
+  try/except 留痕，绝不向上传播；不触碰共享 HTTP 连接池，不自动恢复
   interrupted run。
 - ``shutdown_process_computer_runtime(reason)``：GUI close / CLI 退出 / 异常
   finally 的进程级入口——收集单例后按上述顺序统一关闭。
@@ -351,7 +351,7 @@ def shutdown_computer_runtime(
     固定顺序 controller.stop（活动 run 停止 + Provider 流中断 + backend
     release/close，retained browser 一并清理）→ preview.stop（关闭 loopback
     服务并删除本进程全部临时 PNG）→ hotkey.close（注销全局热键）。每步独立
-    try/except 留痕，绝不向上传播、绝不掩盖后续清理；不关闭 LiteLLM 共享
+    try/except 留痕，绝不向上传播、绝不掩盖后续清理；不触碰共享
     连接池，不自动恢复 interrupted run。
     """
     if controller is not None:

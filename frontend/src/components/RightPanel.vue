@@ -156,6 +156,11 @@
         </div>
       </div>
 
+      <!-- 源代码管理面板（Git 工作台，规格 §11.2） -->
+      <div v-show="activeTab === 'git'" class="rpane active" data-test="git-pane">
+        <GitPanel />
+      </div>
+
       <!-- 电脑操控面板（设计 16.2）：出现过 run 后动态追加的“操控”页签内容 -->
       <div v-show="activeTab === 'computer'" class="rpane active" data-test="computer-pane">
         <ComputerControlPane />
@@ -197,10 +202,12 @@ import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
 import ComputerControlPane from './ComputerControlPane.vue';
+import GitPanel from './GitPanel.vue';
+import { useGitStore } from '../stores/gitStore';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
 
-type TabType = 'plan' | 'tasks' | 'term' | 'files' | 'computer';
+type TabType = 'plan' | 'tasks' | 'term' | 'files' | 'git' | 'computer';
 
 const store = useAppStore();
 
@@ -221,7 +228,8 @@ const baseTabs: Array<{ id: TabType; label: string }> = [
   { id: 'plan', label: '计划' },
   { id: 'tasks', label: '任务' },
   { id: 'term', label: '终端' },
-  { id: 'files', label: '文件' }
+  { id: 'files', label: '文件' },
+  { id: 'git', label: 'Git' }
 ];
 const tabs = computed<Array<{ id: TabType; label: string; closable?: boolean }>>(() => (
   store.computerRun.run_id
@@ -240,6 +248,17 @@ function autoOpenComputerTabOnce() {
   activeTab.value = 'computer';
 }
 watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
+
+// 状态栏分支项点击 → 打开源代码管理页签（gitStore.panelOpenNonce 由 App.vue 触发）
+const gitStore = useGitStore();
+watch(
+  () => gitStore.panelOpenNonce,
+  () => {
+    if (gitStore.panelOpenNonce > 0) {
+      activeTab.value = 'git';
+    }
+  }
+);
 
 // ── 操控页签关闭（2026-09-10 设计）──
 // 手动关闭与终态自动关闭共用同一出口：清计时器 → 清空运行态 → 页签回退
