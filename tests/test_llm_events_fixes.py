@@ -1123,8 +1123,10 @@ def test_external_missing_edit_requests_sandbox_access_before_existence_probe(tm
         "check_permission_and_ask",
         lambda permission, arguments, **kwargs: prompts.append((permission, arguments)) or False,
     )
+    import os as _os
+
     monkeypatch.setattr(
-        llm_mod.os.path,
+        _os.path,
         "isfile",
         lambda path: probes.append(path) or False,
     )
@@ -1389,11 +1391,6 @@ def test_supports_vision_unknown_default_false(monkeypatch):
     import core.llm as llm_mod
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {"providers": []})
-    monkeypatch.setattr(
-        llm_mod.litellm, "supports_vision",
-        lambda model: False,
-        raising=False,
-    )
     assert llm_mod._supports_vision("openai/step-3.7-flash") is False
     assert llm_mod._supports_vision("anthropic/K3") is False
     assert llm_mod._supports_vision("deepseek/deepseek-chat") is False
@@ -1880,7 +1877,7 @@ def test_fold_old_media_for_estimate_keeps_only_latest_image():
 
 
 def test_estimate_tokens_ignores_old_image_base64(mocker):
-    """estimate_tokens 走 litellm 计数时，历史图片必须先折叠，base64 不得参与计数。"""
+    """estimate_tokens 计数时，历史图片必须先折叠，base64 不得参与计数。"""
     import core.llm as llm_module
     from core.llm import estimate_tokens
 
@@ -1903,10 +1900,10 @@ def test_estimate_tokens_ignores_old_image_base64(mocker):
         return 123
 
     llm_module._token_estimate_cache["sig"] = None  # 避免命中签名缓存
-    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+    mocker.patch("core.llm._token_counter", side_effect=fake_counter)
 
     assert estimate_tokens("fake-model", messages) == 123
-    assert counted, "必须调用 litellm 计数"
+    assert counted, "必须调用 _token_counter 计数"
     assert base64_blob not in str(counted[0])
     assert "[图片]" in str(counted[0])
 
@@ -2062,7 +2059,7 @@ def test_estimate_tokens_incremental_counts_only_tail(mocker):
         counted_batches.append(len(msgs))
         return sum(len(str(m.get("content", ""))) for m in msgs) // 10
 
-    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+    mocker.patch("core.llm._token_counter", side_effect=fake_counter)
 
     history = [{"role": "user", "content": "x" * 1000} for _ in range(50)]
     v1 = estimate_tokens("fake-model", history)
@@ -2094,7 +2091,7 @@ def test_estimate_tokens_prefix_changed_falls_back_to_full_count(mocker):
         counted_batches.append(len(msgs))
         return sum(len(str(m.get("content", ""))) for m in msgs) // 10
 
-    mocker.patch("core.llm._litellm_token_counter", side_effect=fake_counter)
+    mocker.patch("core.llm._token_counter", side_effect=fake_counter)
 
     history = [{"role": "user", "content": "x" * 1000} for _ in range(50)]
     estimate_tokens("fake-model", history)
@@ -2131,7 +2128,7 @@ def test_estimate_tokens_cache_snapshot_cannot_mix_concurrent_models(monkeypatch
     )
     monkeypatch.setattr(
         llm_mod,
-        "_litellm_token_counter",
+        "_token_counter",
         lambda model, messages: 100 if model == "model-a" else 200,
     )
     messages = [{"role": "user", "content": "hello"}]
@@ -2154,38 +2151,10 @@ def test_estimate_tokens_cache_snapshot_cannot_mix_concurrent_models(monkeypatch
     assert llm_mod.estimate_tokens("model-b", messages) == 200
 
 
-def test_litellm_patch_preserves_stream_usage_details():
-    """litellm 1.83.7 流式 usage 为 dict 时只取三个字段重建 Usage，
-    prompt_tokens_details.cached_tokens 被丢弃导致命中记账恒为 0。
-    补丁必须将 dict usage 转成 litellm.Usage 并保留缓存明细。"""
-    from types import SimpleNamespace
-
-    import core.llm as llm_mod
-
-    litellm = llm_mod._get_litellm()
-    from litellm.litellm_core_utils.streaming_handler import CustomStreamWrapper
-
-    fake_chunk = SimpleNamespace(
-        choices=[],
-        usage={
-            "prompt_tokens": 673,
-            "completion_tokens": 16,
-            "total_tokens": 689,
-            "prompt_tokens_details": {"cached_tokens": 512},
-            "prompt_cache_hit_tokens": 512,
-            "prompt_cache_miss_tokens": 161,
-        },
-    )
-    result = CustomStreamWrapper.handle_openai_chat_completion_chunk(object(), fake_chunk)
-    usage = result["usage"]
-    assert isinstance(usage, litellm.Usage), "补丁后 usage 必须是 litellm.Usage 实例"
-    assert usage.prompt_tokens_details is not None
-    assert usage.prompt_tokens_details.cached_tokens == 512
-
 
 def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
-    """litellm 流式包装器会把 finish 后的最终 usage chunk 吞进 wrapper.chunks
-    而不再 yield，迭代中拿到的 usage 不含缓存明细（命中记账恒为 0）。
+    """流式包装器会把 finish 后的最终 usage chunk 留在 wrapper.chunks
+    而不再对外 yield，迭代中拿到的 usage 不含缓存明细（命中记账恒为 0）。
     记账必须从 chunks 尾部补取最终 usage。"""
     import core.llm as llm_mod
 
@@ -2196,7 +2165,7 @@ def test_stream_usage_recovered_from_wrapper_chunks(mocker, monkeypatch):
     )
 
     class FakeStream:
-        """模拟 litellm CustomStreamWrapper：迭代只给内容 chunk，
+        """模拟流包装对象：迭代只给内容 chunk，
         真实 usage 留在 chunks 属性里。"""
 
         chunks = [SimpleNamespace(usage=final_usage)]

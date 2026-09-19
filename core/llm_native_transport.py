@@ -118,18 +118,46 @@ class ChunkDelta:
         return getattr(self, key, default)
 
 
+class _ChoiceMessage:
+    """非流式响应的 message 形状（litellm ModelResponse.choices[0].message 兼容）。
+
+    部分调用方（视觉副模型/记忆压缩/Kairos）按 .message.content 消费非流式
+    响应，与流式 delta 形状并存，二者字段同源。
+    """
+
+    __slots__ = ("role", "content", "reasoning_content", "tool_calls")
+
+    def __init__(
+        self,
+        content: str = "",
+        reasoning_content: str = "",
+        tool_calls: Optional[List[ChunkToolCall]] = None,
+        role: str = "assistant",
+    ):
+        self.role = role
+        self.content = content
+        self.reasoning_content = reasoning_content
+        self.tool_calls = tool_calls or []
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return getattr(self, key, default)
+
+
 class ChunkChoice:
-    __slots__ = ("index", "delta", "finish_reason")
+    __slots__ = ("index", "delta", "finish_reason", "message")
 
     def __init__(
         self,
         delta: ChunkDelta,
         finish_reason: Optional[str] = None,
         index: int = 0,
+        message: Optional[_ChoiceMessage] = None,
     ):
         self.delta = delta
         self.finish_reason = finish_reason
         self.index = index
+        # 流式 chunk 无 message 形状；仅 NativeSyncResponse 填充
+        self.message = message
 
     def get(self, key: str, default: Any = None) -> Any:
         return getattr(self, key, default)
@@ -310,6 +338,10 @@ class ChunkNormalizer:
             model=raw.get("model"),
         )
 
+    def finalize_sync(self, raw: dict) -> "NativeSyncResponse":
+        """非流式响应收口：OpenAI 兼容形状原样包装。"""
+        return NativeSyncResponse(raw, self)
+
 
 class NativeStreamResponse:
     """包装原生 HTTP 响应，支持同步流式消费与毫秒级硬中断关闭。"""
@@ -391,6 +423,12 @@ class NativeSyncResponse:
                     ),
                     finish_reason=choice.get("finish_reason"),
                     index=int(choice.get("index", idx)),
+                    message=_ChoiceMessage(
+                        content=content,
+                        reasoning_content=reasoning,
+                        tool_calls=tool_calls_list,
+                        role=str(msg.get("role") or "assistant"),
+                    ),
                 )
             )
         self.choices = choices_list
@@ -425,6 +463,51 @@ def _get_shared_client() -> httpx.Client:
             timeout = httpx.Timeout(connect=15.0, read=None, write=30.0, pool=10.0)
             _client_instance = httpx.Client(limits=limits, timeout=timeout)
         return _client_instance
+
+
+def _dispatch_request(
+    url: str,
+    headers: Dict[str, str],
+    payload: Dict[str, Any],
+    is_stream: bool,
+    timeout_arg: Optional[httpx.Timeout],
+    normalizer: Any,
+):
+    """公共请求派发：发出 POST、映射 HTTP 错误，按流/非流返回统一响应对象。
+
+    OpenAI 兼容与 Anthropic Messages 两条协议路由共用本段——请求级超时必须经
+    build_request 的 timeout 参数写入 request.extensions（httpx 官方按请求
+    超时通道）：Client.send() 的 timeout 形参在 httpx 0.28 已被移除，传入即
+    TypeError，会让每个请求都在发出前崩溃（历史 bug：静默降级 litellm）。
+    """
+    client = _get_shared_client()
+    req = client.build_request(
+        "POST", url, headers=headers, json=payload, timeout=timeout_arg
+    )
+    try:
+        resp = client.send(req, stream=is_stream)
+    except httpx.RequestError as exc:
+        raise APIConnectionError(f"无法建立与模型服务端的连接: {exc}") from exc
+
+    if resp.status_code != 200:
+        try:
+            resp.read()
+        except httpx.HTTPError as exc:
+            # 错误体读取失败必须包成 NativeLLMError：裸 httpx 异常冒泡出去
+            # 会被回合循环按未知错误收口，丢失可诊断的结构化信息。
+            raise APIConnectionError(f"错误响应体读取失败: {exc}") from exc
+        finally:
+            resp.close()
+        raise _map_http_error(resp)
+
+    if is_stream:
+        return NativeStreamResponse(resp, normalizer)
+    try:
+        raw_json = resp.json()
+    except httpx.HTTPError as exc:
+        # 网络层读失败不换通道重发（同请求双发风险），直接按连接错误上抛
+        raise APIConnectionError(f"非流式响应体读取失败: {exc}") from exc
+    return normalizer.finalize_sync(raw_json)
 
 
 def _resolve_endpoint_and_headers(
@@ -564,11 +647,14 @@ _NATIVE_PASSTHROUGH_KEYS = frozenset({
 
 
 def native_completion(**kwargs) -> NativeStreamResponse:
-    """原生 OpenAI 兼容流式请求主入口。
+    """原生流式请求主入口（OpenAI 兼容 + Anthropic Messages 双协议）。
 
-    替代 litellm.completion，保证 100% 原始字段透传与零黑盒干扰。
+    替代 litellm.completion，保证 100% 原始字段透传与零黑盒干扰；
+    anthropic/ 前缀路由由 _anthropic_completion 翻译为 /v1/messages 协议。
     """
     model = kwargs.get("model") or ""
+    if _is_anthropic_route(model):
+        return _anthropic_completion(**kwargs)
     api_key = kwargs.get("api_key")
     api_base = kwargs.get("api_base")
     policy = get_model_policy(model_name=model, api_base=api_base)
@@ -666,37 +752,9 @@ def native_completion(**kwargs) -> NativeStreamResponse:
             pool=10.0,
         )
 
-    # 序列化并发送请求
-    client = _get_shared_client()
-    req = client.build_request("POST", url, headers=headers, json=payload)
-    try:
-        if is_stream:
-            resp = client.send(req, stream=True, timeout=timeout_arg)
-        else:
-            resp = client.send(req, stream=False, timeout=timeout_arg)
-    except httpx.RequestError as exc:
-        raise APIConnectionError(f"无法建立与模型服务端的连接: {exc}") from exc
-
-    if resp.status_code != 200:
-        try:
-            resp.read()
-        except httpx.HTTPError as exc:
-            # 错误体读取失败必须包成 NativeLLMError：裸 httpx 异常冒泡出去
-            # 会命中 _litellm_completion 的降级分支，同一请求对上游双发。
-            raise APIConnectionError(f"错误响应体读取失败: {exc}") from exc
-        finally:
-            resp.close()
-        raise _map_http_error(resp)
-
-    normalizer = ChunkNormalizer(policy)
-    if is_stream:
-        return NativeStreamResponse(resp, normalizer)
-    try:
-        raw_json = resp.json()
-    except httpx.HTTPError as exc:
-        # 同上：网络层读失败不降级双发，直接按连接错误上抛
-        raise APIConnectionError(f"非流式响应体读取失败: {exc}") from exc
-    return NativeSyncResponse(raw_json, normalizer)
+    return _dispatch_request(
+        url, headers, payload, is_stream, timeout_arg, ChunkNormalizer(policy)
+    )
 
 
 # ==============================================================================
@@ -752,3 +810,533 @@ def fast_token_counter(model: str, messages: Any) -> int:
         total_tokens += max(1, tokens)
 
     return max(1, total_tokens)
+
+
+# ==============================================================================
+# 7. Anthropic Messages 协议适配（/v1/messages，anthropic/ 前缀路由）
+# ==============================================================================
+# 覆盖 anthropic 兼容端点（阶跃 step_plan、api.kimi.com/coding 等）。
+# 请求侧把 OpenAI chat 形状（messages/tools/tool_calls/reasoning_content）
+# 翻译为 Messages API 形状；响应侧把 SSE 事件流/完整 JSON 归一化回
+# StreamChunk / NativeSyncResponse，供上层零改动消费。
+
+_ANTHROPIC_VERSION = "2023-06-01"
+_ANTHROPIC_DEFAULT_MAX_TOKENS = 4096
+
+# stop_reason → OpenAI finish_reason
+_ANTHROPIC_STOP_REASON_MAP = {
+    "end_turn": "stop",
+    "stop_sequence": "stop",
+    "max_tokens": "length",
+    "tool_use": "tool_calls",
+    "refusal": "stop",
+    "pause_turn": "stop",
+}
+
+# 流内 error 事件 type → 异常类
+_ANTHROPIC_STREAM_ERROR_MAP = {
+    "rate_limit_error": RateLimitError,
+    "authentication_error": AuthenticationError,
+    "permission_error": AuthenticationError,
+    "invalid_request_error": APIError,
+    "request_too_large": APIError,
+    "overloaded_error": APIConnectionError,
+    "api_error": APIConnectionError,
+    "timeout_error": APIConnectionError,
+}
+
+
+def _is_anthropic_route(model: str) -> bool:
+    """判断模型是否走 Anthropic Messages 协议（litellm 时代的 anthropic/ 前缀约定）。"""
+    return str(model or "").strip().lower().startswith("anthropic/")
+
+
+def _anthropic_resolve_endpoint(
+    api_base: Optional[str],
+    api_key: Optional[str],
+    extra_headers: Optional[Dict[str, str]],
+) -> Tuple[str, Dict[str, str]]:
+    """解析 /v1/messages 端点与请求头（x-api-key + anthropic-version）。"""
+    base = (api_base or "https://api.anthropic.com").rstrip("/")
+    if base.endswith("/v1/messages"):
+        url = base
+    elif base.endswith("/messages"):
+        url = base
+    else:
+        url = f"{base}/v1/messages"
+
+    headers = {
+        "content-type": "application/json",
+        "accept": "text/event-stream",
+        "anthropic-version": _ANTHROPIC_VERSION,
+    }
+    effective_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
+    if effective_key:
+        headers["x-api-key"] = effective_key
+    if extra_headers:
+        headers.update(extra_headers)
+    return url, headers
+
+
+def _anthropic_image_block(url: str) -> Optional[Dict[str, Any]]:
+    """OpenAI image_url → Anthropic image 块（base64 data URI 与 http URL 两种来源）。"""
+    url = str(url or "")
+    if url.startswith("data:"):
+        head, _, b64 = url.partition(",")
+        media_type = head[5:].split(";", 1)[0] or "image/png"
+        if not b64:
+            return None
+        return {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": b64}}
+    if url:
+        return {"type": "image", "source": {"type": "url", "url": url}}
+    return None
+
+
+def _anthropic_content_blocks(content: Any) -> List[Dict[str, Any]]:
+    """OpenAI content（str 或多模态块列表）→ Anthropic 内容块列表。"""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}] if content else []
+    blocks: List[Dict[str, Any]] = []
+    for item in content:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in ("text", "input_text"):
+            block: Dict[str, Any] = {"type": "text", "text": item.get("text") or ""}
+            if item.get("cache_control"):
+                block["cache_control"] = item["cache_control"]
+            blocks.append(block)
+        elif item_type == "image_url":
+            image_block = _anthropic_image_block((item.get("image_url") or {}).get("url"))
+            if image_block is not None:
+                blocks.append(image_block)
+        elif item_type == "image":
+            blocks.append(item)  # 已是 Anthropic 形状，原样保留
+    return blocks
+
+
+def _anthropic_translate_messages(messages: Any) -> Tuple[Optional[Any], List[Dict[str, Any]]]:
+    """OpenAI chat messages → (system, anthropic messages)。
+
+    - system 消息提取为顶层 system（纯文本时用字符串，带 cache_control 时用块列表）
+    - role=tool 翻译为 tool_result 块；连续 tool 结果合并进单条 user 消息，
+      满足 Anthropic 的角色交替约束
+    - assistant.tool_calls → tool_use 块（arguments 解析为 JSON 对象）
+    - assistant.reasoning_content → thinking 块（anthropic 路由历史保真，
+      对应 llm_dialects 对 anthropic 前缀的 keep_thinking_blocks 语义）
+    - 消息级 cache_control（litellm 时代由其翻译）挂到该消息最后一个内容块
+    """
+    system_blocks: List[Dict[str, Any]] = []
+    out: List[Dict[str, Any]] = []
+
+    for msg in messages or []:
+        if not isinstance(msg, dict):
+            continue
+        role = msg.get("role")
+        content = msg.get("content")
+        cache_ctrl = msg.get("cache_control")
+
+        if role == "system":
+            if isinstance(content, list):
+                blocks = _anthropic_content_blocks(content)
+            elif content:
+                blocks = [{"type": "text", "text": str(content)}]
+            else:
+                blocks = []
+            for block in blocks:
+                if cache_ctrl and "cache_control" not in block:
+                    block["cache_control"] = cache_ctrl
+            system_blocks.extend(blocks)
+            continue
+
+        if role == "tool":
+            if isinstance(content, list):
+                result_content: Any = _anthropic_content_blocks(content)
+            else:
+                result_content = str(content or "")
+            tool_result = {
+                "type": "tool_result",
+                "tool_use_id": str(msg.get("tool_call_id") or ""),
+                "content": result_content,
+            }
+            # 连续 tool 结果并入同一条 user 消息（协议要求角色交替）
+            prev = out[-1] if out else None
+            if (
+                isinstance(prev, dict)
+                and prev.get("role") == "user"
+                and isinstance(prev.get("content"), list)
+                and any(b.get("type") == "tool_result" for b in prev["content"])
+            ):
+                prev["content"].append(tool_result)
+            else:
+                out.append({"role": "user", "content": [tool_result]})
+            continue
+
+        if role == "assistant":
+            blocks: List[Dict[str, Any]] = []
+            reasoning = msg.get("reasoning_content")
+            if reasoning:
+                blocks.append({"type": "thinking", "thinking": str(reasoning)})
+            if isinstance(content, list):
+                blocks.extend(_anthropic_content_blocks(content))
+            elif content:
+                blocks.append({"type": "text", "text": str(content)})
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get("function") or {}
+                try:
+                    tool_input = json.loads(fn.get("arguments") or "{}")
+                except (TypeError, ValueError):
+                    tool_input = {}
+                if not isinstance(tool_input, dict):
+                    tool_input = {"value": tool_input}
+                blocks.append({
+                    "type": "tool_use",
+                    "id": str(tc.get("id") or ""),
+                    "name": str(fn.get("name") or ""),
+                    "input": tool_input,
+                })
+            if not blocks:
+                blocks.append({"type": "text", "text": ""})
+            if cache_ctrl:
+                blocks[-1]["cache_control"] = cache_ctrl
+            out.append({"role": "assistant", "content": blocks})
+            continue
+
+        # user（含多模态）及其他角色
+        if isinstance(content, list):
+            blocks = _anthropic_content_blocks(content)
+        elif content:
+            blocks = [{"type": "text", "text": str(content)}]
+        else:
+            blocks = []
+        if not blocks:
+            blocks = [{"type": "text", "text": ""}]
+        if cache_ctrl:
+            blocks[-1]["cache_control"] = cache_ctrl
+        out.append({"role": "user", "content": blocks})
+
+    system: Optional[Any] = None
+    if system_blocks:
+        if len(system_blocks) == 1 and "cache_control" not in system_blocks[0]:
+            system = system_blocks[0]["text"]
+        else:
+            system = system_blocks
+    return system, out
+
+
+def _anthropic_translate_tools(tools: Any) -> List[Dict[str, Any]]:
+    """OpenAI function tools → Anthropic tools（input_schema 形状）。"""
+    anthropic_tools: List[Dict[str, Any]] = []
+    for tool in tools or []:
+        if not isinstance(tool, dict):
+            continue
+        fn = tool.get("function") or tool
+        if not isinstance(fn, dict) or not fn.get("name"):
+            continue
+        schema = fn.get("parameters")
+        if not isinstance(schema, dict):
+            schema = {"type": "object", "properties": {}}
+        anthropic_tools.append({
+            "name": str(fn.get("name")),
+            "description": str(fn.get("description") or ""),
+            "input_schema": schema,
+        })
+    return anthropic_tools
+
+
+def _anthropic_translate_tool_choice(tool_choice: Any) -> Optional[Dict[str, Any]]:
+    """OpenAI tool_choice → Anthropic tool_choice（{"type": auto|any|tool}）。"""
+    if tool_choice is None or tool_choice == "auto":
+        return {"type": "auto"}
+    if tool_choice == "required" or tool_choice == "any":
+        return {"type": "any"}
+    if tool_choice == "none":
+        return None
+    if isinstance(tool_choice, dict):
+        fn = tool_choice.get("function") or {}
+        if fn.get("name"):
+            return {"type": "tool", "name": str(fn["name"])}
+    return {"type": "auto"}
+
+
+def _anthropic_usage_to_openai(usage_raw: Dict[str, Any]) -> Dict[str, Any]:
+    """Anthropic usage → OpenAI usage 字典（缓存读命中映射到 hit 字段）。
+
+    Anthropic 的 input_tokens 不含缓存部分，prompt_tokens 按
+    input + cache_read + cache_creation 汇总，保证界面输入计数与 DeepSeek 语义一致。
+    """
+    input_tokens = int(usage_raw.get("input_tokens") or 0)
+    cache_read = int(usage_raw.get("cache_read_input_tokens") or 0)
+    cache_creation = int(usage_raw.get("cache_creation_input_tokens") or 0)
+    output_tokens = int(usage_raw.get("output_tokens") or 0)
+    prompt_tokens = input_tokens + cache_read + cache_creation
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": output_tokens,
+        "total_tokens": prompt_tokens + output_tokens,
+        "prompt_tokens_details": {"cached_tokens": cache_read} if cache_read else None,
+        "prompt_cache_hit_tokens": cache_read or None,
+        "prompt_cache_miss_tokens": input_tokens or None,
+    }
+
+
+def _anthropic_sync_to_openai(raw: dict) -> dict:
+    """Anthropic 完整响应 JSON → OpenAI chat completion 形状字典。"""
+    content_parts: List[str] = []
+    reasoning_parts: List[str] = []
+    tool_calls: List[Dict[str, Any]] = []
+    for block in raw.get("content") or []:
+        if not isinstance(block, dict):
+            continue
+        block_type = block.get("type")
+        if block_type == "text":
+            content_parts.append(block.get("text") or "")
+        elif block_type == "thinking":
+            reasoning_parts.append(block.get("thinking") or "")
+        elif block_type == "tool_use":
+            tool_calls.append({
+                "index": len(tool_calls),
+                "id": block.get("id"),
+                "type": "function",
+                "function": {
+                    "name": block.get("name"),
+                    "arguments": json.dumps(block.get("input") or {}, ensure_ascii=False),
+                },
+            })
+    return {
+        "id": raw.get("id"),
+        "model": raw.get("model"),
+        "choices": [{
+            "index": 0,
+            "message": {
+                "role": "assistant",
+                "content": "".join(content_parts),
+                "reasoning_content": "".join(reasoning_parts),
+                "tool_calls": tool_calls or None,
+            },
+            "finish_reason": _ANTHROPIC_STOP_REASON_MAP.get(str(raw.get("stop_reason")), "stop"),
+        }],
+        "usage": _anthropic_usage_to_openai(raw.get("usage") or {}),
+    }
+
+
+class AnthropicStreamNormalizer:
+    """Anthropic /v1/messages SSE 事件流 → StreamChunk 的有状态归一化器。
+
+    事件序：message_start（请求 id/输入 usage）→ 若干 content_block_start/
+    content_block_delta/content_block_stop（text/thinking/tool_use）→
+    message_delta（stop_reason + 输出 usage）→ message_stop。
+    归一化输出与 OpenAI chunk 相同形状（content/reasoning_content/tool_calls/
+    finish_reason/usage），上层 chunk 消费方零改动。
+    """
+
+    def __init__(self):
+        self._request_id: Optional[str] = None
+        self._model: Optional[str] = None
+        self._start_usage: Dict[str, Any] = {}
+        self._output_tokens = 0
+        self._tool_index = 0
+
+    def normalize(self, raw: Any) -> Optional[StreamChunk]:
+        if not isinstance(raw, dict):
+            return None
+        event_type = raw.get("type")
+
+        if event_type == "ping":
+            return None
+        if event_type == "error":
+            error = raw.get("error") or {}
+            exc_cls = _ANTHROPIC_STREAM_ERROR_MAP.get(
+                str(error.get("type") or ""), APIError,
+            )
+            raise exc_cls(
+                f"Anthropic 流内错误 ({error.get('type')}): {error.get('message')}"
+            )
+        if event_type == "message_start":
+            message = raw.get("message") or {}
+            self._request_id = message.get("id")
+            self._model = message.get("model")
+            self._start_usage = dict(message.get("usage") or {})
+            return StreamChunk(id=self._request_id, model=self._model, choices=[])
+        if event_type == "content_block_start":
+            block = raw.get("content_block") or {}
+            if block.get("type") == "tool_use":
+                tool_call = ChunkToolCall(
+                    index=self._tool_index,
+                    id=block.get("id"),
+                    function=ToolCallFunction(name=str(block.get("name") or ""), arguments=""),
+                )
+                self._tool_index += 1
+                return StreamChunk(
+                    id=self._request_id,
+                    model=self._model,
+                    choices=[ChunkChoice(delta=ChunkDelta(tool_calls=[tool_call]))],
+                )
+            return None
+        if event_type == "content_block_delta":
+            delta = raw.get("delta") or {}
+            delta_type = delta.get("type")
+            if delta_type == "text_delta":
+                text = delta.get("text") or ""
+                if not text:
+                    return None
+                return StreamChunk(
+                    id=self._request_id,
+                    model=self._model,
+                    choices=[ChunkChoice(delta=ChunkDelta(content=text))],
+                )
+            if delta_type == "thinking_delta":
+                thinking = delta.get("thinking") or ""
+                if not thinking:
+                    return None
+                return StreamChunk(
+                    id=self._request_id,
+                    model=self._model,
+                    choices=[ChunkChoice(delta=ChunkDelta(reasoning_content=thinking))],
+                )
+            if delta_type == "input_json_delta":
+                partial = delta.get("partial_json")
+                if partial is None:
+                    return None
+                tool_call = ChunkToolCall(
+                    index=max(self._tool_index - 1, 0),
+                    function=ToolCallFunction(arguments=str(partial)),
+                )
+                return StreamChunk(
+                    id=self._request_id,
+                    model=self._model,
+                    choices=[ChunkChoice(delta=ChunkDelta(tool_calls=[tool_call]))],
+                )
+            # signature_delta 等未知增量：忽略
+            return None
+        if event_type == "message_delta":
+            delta = raw.get("delta") or {}
+            stop_reason = delta.get("stop_reason")
+            usage_raw = raw.get("usage") or {}
+            if usage_raw.get("output_tokens") is not None:
+                self._output_tokens = int(usage_raw.get("output_tokens") or 0)
+            if stop_reason is not None:
+                self._finish_reason = _ANTHROPIC_STOP_REASON_MAP.get(str(stop_reason), "stop")
+                return StreamChunk(
+                    id=self._request_id,
+                    model=self._model,
+                    choices=[ChunkChoice(delta=ChunkDelta(), finish_reason=self._finish_reason)],
+                )
+            return None
+        if event_type == "message_stop":
+            usage_dict = _anthropic_usage_to_openai(self._start_usage)
+            usage_dict["completion_tokens"] = self._output_tokens
+            usage_dict["total_tokens"] = usage_dict["prompt_tokens"] + self._output_tokens
+            return StreamChunk(
+                id=self._request_id,
+                model=self._model,
+                usage=ChunkUsage(
+                    prompt_tokens=usage_dict["prompt_tokens"],
+                    completion_tokens=usage_dict["completion_tokens"],
+                    total_tokens=usage_dict["total_tokens"],
+                    prompt_tokens_details=usage_dict["prompt_tokens_details"],
+                    prompt_cache_hit_tokens=usage_dict["prompt_cache_hit_tokens"],
+                    prompt_cache_miss_tokens=usage_dict["prompt_cache_miss_tokens"],
+                ),
+            )
+        # content_block_stop / 未知事件：忽略
+        return None
+
+    def finalize_sync(self, raw: dict) -> "NativeSyncResponse":
+        """非流式 Anthropic 响应 JSON → OpenAI 形状 → NativeSyncResponse。"""
+        return NativeSyncResponse(
+            _anthropic_sync_to_openai(raw),
+            ChunkNormalizer(get_model_policy(model_name="openai/standard", api_base="")),
+        )
+
+
+_ANTHROPIC_KNOWN_KWARGS = {
+    "model", "messages", "api_key", "api_base", "timeout", "stream",
+    "max_tokens", "max_completion_tokens", "max_output_tokens",
+    "temperature", "top_p", "top_k", "stop",
+    "tools", "tool_choice", "thinking", "output_config", "metadata",
+    "extra_body", "extra_headers", "stream_options", "user",
+}
+
+
+def _anthropic_completion(**kwargs):
+    """Anthropic Messages 协议请求入口（anthropic/ 前缀路由专用）。"""
+    model = str(kwargs.get("model") or "")
+    clean_model = model.split("/", 1)[1] if "/" in model else model
+    url, headers = _anthropic_resolve_endpoint(
+        api_base=kwargs.get("api_base"),
+        api_key=kwargs.get("api_key"),
+        extra_headers=kwargs.get("extra_headers"),
+    )
+
+    for litellm_meta_key in ("num_retries", "allowed_openai_params"):
+        kwargs.pop(litellm_meta_key, None)
+
+    unknown_keys = sorted(set(kwargs) - _ANTHROPIC_KNOWN_KWARGS)
+    if unknown_keys:
+        logger.warning(
+            "native anthropic 传输忽略未识别的请求参数（不会发送到服务端）: %s",
+            ", ".join(unknown_keys),
+        )
+
+    is_stream = bool(kwargs.get("stream", False))
+    system, anth_messages = _anthropic_translate_messages(kwargs.get("messages"))
+    payload: Dict[str, Any] = {
+        "model": clean_model,
+        "messages": anth_messages,
+        "max_tokens": (
+            kwargs.get("max_tokens")
+            or kwargs.get("max_completion_tokens")
+            or kwargs.get("max_output_tokens")
+            or _ANTHROPIC_DEFAULT_MAX_TOKENS
+        ),
+        "stream": is_stream,
+    }
+    if system is not None:
+        payload["system"] = system
+
+    anthropic_tools = _anthropic_translate_tools(kwargs.get("tools"))
+    if anthropic_tools:
+        payload["tools"] = anthropic_tools
+        tool_choice = _anthropic_translate_tool_choice(kwargs.get("tool_choice"))
+        if tool_choice is not None:
+            payload["tool_choice"] = tool_choice
+
+    if kwargs.get("temperature") is not None:
+        payload["temperature"] = kwargs.get("temperature")
+    if kwargs.get("top_p") is not None:
+        payload["top_p"] = kwargs.get("top_p")
+    if kwargs.get("top_k") is not None:
+        payload["top_k"] = kwargs.get("top_k")
+    if kwargs.get("metadata") is not None:
+        payload["metadata"] = kwargs.get("metadata")
+    # Anthropic 协议原生形状的思考参数与厂商扩展（阶跃 output_config.effort）
+    # 由 llm_dialects 按 anthropic_route 组装，这里原样透传。
+    for anthropic_key in ("thinking", "output_config"):
+        if kwargs.get(anthropic_key) is not None:
+            payload[anthropic_key] = kwargs.get(anthropic_key)
+    stop = kwargs.get("stop")
+    if stop:
+        payload["stop_sequences"] = [stop] if isinstance(stop, str) else list(stop)
+
+    extra_body = kwargs.get("extra_body")
+    if isinstance(extra_body, dict):
+        payload.update(extra_body)
+
+    req_timeout = kwargs.get("timeout")
+    timeout_arg = None
+    if req_timeout is not None:
+        timeout_arg = httpx.Timeout(
+            connect=min(15.0, float(req_timeout)),
+            read=600.0 if is_stream else float(req_timeout),
+            write=30.0,
+            pool=10.0,
+        )
+
+    return _dispatch_request(
+        url, headers, payload, is_stream, timeout_arg, AnthropicStreamNormalizer()
+    )

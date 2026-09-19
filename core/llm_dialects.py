@@ -15,7 +15,6 @@ from typing import Dict, List, Optional
 from urllib.parse import urlsplit
 
 import core.app_context as app_context
-from core.llm_transport import _litellm_supports_vision
 from core.reasoning_capabilities import (
     get_reasoning_capability,
     normalize_reasoning_model_name,
@@ -23,7 +22,7 @@ from core.reasoning_capabilities import (
 
 logger = logging.getLogger(__name__)
 
-# 支持原生推理字段回传的 provider 白名单（按 litellm model 前缀匹配）
+# 支持原生推理字段回传的 provider 白名单（按 provider 路由前缀匹配）
 _REASONING_FIELD_PROVIDERS = ("anthropic", "deepseek", "moonshot")
 
 _KIMI_NAME_RE = re.compile(r"(?:^|[-_/])k(?:2|3)(?:[._-]\d+)?(?:$|[-_])")
@@ -270,27 +269,6 @@ def _qwen_cache_control_configured(model_name, api_base="", model_cfg=None):
     return bool(cfg.get("enable_cache_control") or cfg.get("cache_control"))
 
 
-def _litellm_rejects_tool_choice(model_name):
-    """litellm 是否会在客户端拒绝该模型的 tool_choice 参数。
-
-    litellm 的 OpenAIGPT5Config 对名字含 gpt-5 的模型按 supports_tool_choice
-    查内置模型清单，中转站/聚合网关的自定义名（如 gpt-5.6-sol）查不到即按
-    False 保守回退，把 tool_choice 从支持列表剔除，请求未发出就抛
-    UnsupportedParamsError。已知模型（官方 gpt-5 等）返回 True 不触发；
-    非 gpt-5 名字走通用 OpenAIGPTConfig，其支持列表固定含 tool_choice。
-    与 litellm 触发条件逐项对齐，避免给其他路由附加额外请求字段。
-    """
-    model = str(model_name or "").split("/")[-1].lower()
-    if "gpt-5" not in model:
-        return False
-    try:
-        from litellm.utils import supports_tool_choice
-
-        return not supports_tool_choice(model=model)
-    except Exception:
-        return False
-
-
 def _glm_keepalive_thinking_locked(model_name):
     """GLM 强制思考模型判定：思考没有关闭档，保活不得翻转成 disabled。
 
@@ -533,7 +511,7 @@ def _requires_tool_call_reasoning(model_name, api_base=""):
     return _deepseek_thinking_enabled(model_name, api_base, model_cfg)
 
 
-# 需要显式 cache_control 标记才启用 prompt caching 的 provider 白名单（按 litellm 前缀）：
+# 需要显式 cache_control 标记才启用 prompt caching 的 provider 白名单（按 provider 前缀）：
 #   - anthropic: 必须显式标记，命中后缓存 token 按 1/10 计费
 # Qwen 不在此白名单里，但走官方百炼路由或 config.json 显式声明
 # enable_cache_control / cache_control 时同样启用（见 _supports_cache_control）；
@@ -583,7 +561,7 @@ def _is_cache_control_rejection(api_err):
     """判定上游是否以 400/bad request 明确拒绝了 cache_control 字段。
 
     必须同时满足两个条件，缺一不判：
-    1. 状态码确为 400（或类型是 litellm 的 BadRequestError）；
+    1. 状态码确为 400（或异常类型名为 BadRequestError）；
     2. 错误文本点名 cache_control / ephemeral 这类缓存断点字段。
     只按文案关键词（"400"/"invalid"/"schema"）宽泛匹配的话，一次无关故障
     （网络抖动文案里带字节数、上游 5xx）就会把该路由的优化整体关掉。
@@ -646,7 +624,8 @@ def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disa
     本策略最多用 3 个（system + 上一条 assistant + 尾部 user），留 1 个余量。
 
     对于 DashScope / Qwen 兼容模式：格式为 content 文本块内的 cache_control: {"type": "ephemeral"}；
-    对于 Anthropic 协议：格式为消息顶层 cache_control: {"type": "ephemeral"}，由 LiteLLM 处理。
+    对于 Anthropic 协议：格式为消息顶层 cache_control: {"type": "ephemeral"}，由 native 的
+    Messages 协议适配层翻译。
 
     本函数原地修改并返回 messages；调用方已通过 _strip_media_and_merge 处理过副本，
     不会污染 messages 列表本身。
@@ -732,7 +711,7 @@ def _apply_cache_control(messages, model_name, api_base="", model_cfg=None, disa
 
 
 # _supports_vision 结果缓存（30s TTL）：该函数在工具循环里每轮都会被调用
-# （最多 100 次/用户轮），底层的 litellm.supports_vision 查表并不便宜。
+# （最多 100 次/用户轮），config 扫描与缓存判读不该每轮重做。
 _vision_support_cache = {}
 _vision_support_cache_lock = threading.RLock()
 
@@ -742,8 +721,7 @@ def _supports_vision(model_name):
 
     判定顺序：
     1. 模型配置中的 supports_vision 显式标注（config.json 的 models 条目，可选）
-    2. LiteLLM 内置模型信息（知名模型）
-    3. 未知模型默认按不支持处理，避免把 image_url 负载发给纯文本模型触发
+    2. 未标注的模型默认按不支持处理，避免把 image_url 负载发给纯文本模型触发
        "Model only support text input" 等 400 错误
     """
     if not model_name:
@@ -781,11 +759,6 @@ def _supports_vision_locked(model_name):
                     result = bool(model["supports_vision"])
                     _vision_support_cache[model_name] = (result, time.monotonic() + 30)
                     return result
-    except Exception:
-        pass
-    try:
-        if _litellm_supports_vision(model_name):
-            result = True
     except Exception:
         pass
     _vision_support_cache[model_name] = (result, time.monotonic() + 30)
@@ -835,7 +808,7 @@ def _strip_media_and_merge(messages, model_name=None, api_base=""):
        更早的历史图片一律折叠为占位符，避免每轮重复发送烧 Token；
        不支持视觉的模型把图片折叠为占位符（绝不把 base64 当文本发给模型）。
        文档/文本文件已在 input_parser 中转为普通文本，此处不视为视觉输入。
-    2. 合并连续相同 role 的消息，满足 LiteLLM / Anthropic 对 user/assistant 严格轮流的要求
+    2. 合并连续相同 role 的消息，满足 Anthropic 协议对 user/assistant 严格轮流的要求
     3. reasoning_content / thinking_blocks 仅对支持的 provider 完整回传，避免其他
        provider 报 400，同时保持 Kimi 等模型要求的连续 provider 消息信封
 
@@ -1018,9 +991,16 @@ _K3_REASONING_MODEL_NAMES = frozenset(
 )
 # 阶跃星辰 Anthropic 兼容端点（/step_plan/v1/messages）不接受 Anthropic 原生
 # thinking/budget_tokens，推理深度由官方扩展字段 output_config.effort 控制
-# （step-3.7-flash 取 low/medium/high）。litellm ≥1.92 原生透传该字段。
+# （token plan 全系 LLM 均为 low/medium/high，见官方 /v1/models 的
+# reasoning_effort_support_list）。自研引擎原样透传该字段。
 _STEPFUN_ANTHROPIC_EFFORT_MODELS = frozenset(
-    {"step-3.7-flash", "step-router-v1"}
+    {
+        "step-3.7-flash",
+        "step-router-v1",
+        "step-5-preview",
+        "step-3.5-flash",
+        "step-3.5-flash-2603",
+    }
 )
 _ANTHROPIC_REASONING_BUDGETS = {
     "low": 1024,
@@ -1430,9 +1410,8 @@ def _provider_request_options(
                         f"实际为 {effort!r}"
                     )
                 result["reasoning_effort"] = effort
-                # LiteLLM 对尚未内置识别的 OpenAI 兼容模型会在客户端拒绝
-                # reasoning_effort。这里按参数白名单精确放行，不能用全局
-                # drop_params，否则会静默丢失用户要求的推理强度。
+                # reasoning_effort 属于非标准参数：以白名单随请求显式声明，
+                # 保证支持该参数的网关放行（native 全量透传，不做客户端裁剪）。
                 result["allowed_openai_params"] = ["reasoning_effort"]
     elif not has_reasoning_choice and not has_registered_reasoning and (
         cfg_max_tokens is not None
@@ -1456,9 +1435,9 @@ def _provider_request_options(
         if anthropic_route:
             # Anthropic 协议路由（api.kimi.com/coding 等 anthropic 兼容端点）：
             # 接受 Anthropic 形状的 thinking 参数。
-            # 必须同时声明 allowed_openai_params：litellm 的客户端参数校验只把
-            # Claude 系列识别为支持 thinking 的 anthropic 模型，对 "K3" 这类陌生
-            # 模型名会直接抛 UnsupportedParamsError（请求根本发不出去），需要显式豁免。
+            # 必须同时声明 allowed_openai_params：thinking 对 OpenAI 兼容语义是
+            # 非标准参数，显式声明以保证网关按白名单放行（native 全量透传，
+            # 不做客户端裁剪）。
             if is_k3:
                 result.setdefault("thinking", {
                     "type": "enabled", "budget_tokens": 4096 if is_kimi_coding else 2048,

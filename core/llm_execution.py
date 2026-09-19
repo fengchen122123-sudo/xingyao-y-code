@@ -28,7 +28,7 @@ from core.llm_dialects import (
 )
 from core.llm_transport import (
     API_REQUEST_TIMEOUT_SECONDS,
-    _litellm_completion,
+    _dispatch_completion,
     _submit_daemon_call,
 )
 from core.model_manager import get_secondary_model, get_secondary_roles, load_config
@@ -923,7 +923,7 @@ def _call_vision_model_for_content(secondary, content, cancel_event=None, max_re
 
     for attempt in range(max_retries):
         try:
-            future = _submit_daemon_call(_litellm_completion, **kwargs)
+            future = _submit_daemon_call(_dispatch_completion, **kwargs)
             try:
                 while not future.done():
                     if cancel_event is not None and cancel_event.is_set():

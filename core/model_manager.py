@@ -10,7 +10,7 @@ import config
 import core.app_context as app_context
 from core.model_catalog import (
     get_preset_provider,
-    litellm_model_name,
+    provider_route_name,
     validate_protocol,
 )
 from core.reasoning_capabilities import get_reasoning_capability
@@ -496,7 +496,7 @@ def add_model_to_provider(
                 model_entry = {
                     "id": mid,
                     "name": name,
-                    "litellm_model": litellm_model_name(protocol, name),
+                    "litellm_model": provider_route_name(protocol, name),
                     "context_window": context_window,
                 }
                 if max_tokens is not None:
@@ -530,21 +530,6 @@ def delete_model(model_id: str):
             for model in provider["models"][:]:
                 if model["id"] == model_id:
                     provider["models"].remove(model)
-                    # 预置厂商模型记录删除痕迹：sync_preset_provider_models
-                    # 只追加"用户没见过的新模型"，被手动删掉的不会因同步复活
-                    # （如需找回，删除厂商后重新添加即可）
-                    preset_id = provider.get("preset_id")
-                    if preset_id:
-                        try:
-                            preset = get_preset_provider(preset_id)
-                        except KeyError:
-                            preset = None
-                        if preset and any(
-                            m.get("name") == model.get("name") for m in preset.get("models", [])
-                        ):
-                            removed = provider.setdefault("removed_preset_models", [])
-                            if model.get("name") not in removed:
-                                removed.append(model.get("name"))
         # 如果删掉的是 secondary 模型，一并清除
         if data.get("secondary_model_id") == model_id:
             data.pop("secondary_model_id", None)
@@ -606,7 +591,7 @@ def update_provider(
         if api_key:
             provider["api_key"] = api_key
         for model in provider.get("models", []):
-            model["litellm_model"] = litellm_model_name(protocol, model["name"])
+            model["litellm_model"] = provider_route_name(protocol, model["name"])
 
     config.update_config(_mutate)
 
@@ -621,10 +606,12 @@ def update_model(
     supports_function_calling: bool | None = None,
     computer_protocol: str | None = None,
     system_prompt_extra: str | None = None,
+    max_tokens: int | None = None,
 ):
     """更新单个模型的公开配置字段；新能力字段传 None 表示保留既有值。
 
     system_prompt_extra：None=保留既有值，""=清除该键，非空=写入。
+    max_tokens（最大输出）：None=保留既有值，0=清除该键（回到内置默认），正整数=写入。
     """
     name = str(name or "").strip()
     context_window = int(context_window)
@@ -639,6 +626,19 @@ def update_model(
     normalized_prompt_extra = (
         None if system_prompt_extra is None else str(system_prompt_extra).strip()
     )
+    clear_max_tokens = False
+    normalized_max_tokens: int | None = None
+    if max_tokens is not None:
+        try:
+            mt = int(max_tokens)
+        except (TypeError, ValueError):
+            raise ValueError("最大输出必须为正整数")
+        if mt < 0:
+            raise ValueError("最大输出必须为正整数")
+        if mt == 0:
+            clear_max_tokens = True
+        else:
+            normalized_max_tokens = mt
 
     def _mutate(data):
         provider = next(
@@ -664,7 +664,7 @@ def update_model(
         )
         _validate_computer_combination(bool(supports_vision), effective_fc, effective_protocol)
         model["name"] = name
-        model["litellm_model"] = litellm_model_name(provider.get("protocol", "openai"), name)
+        model["litellm_model"] = provider_route_name(provider.get("protocol", "openai"), name)
         model["context_window"] = context_window
         model["supports_vision"] = bool(supports_vision)
         if supports_function_calling is not None:
@@ -679,6 +679,11 @@ def update_model(
             model["system_prompt_extra"] = normalized_prompt_extra
         elif normalized_prompt_extra == "":
             model.pop("system_prompt_extra", None)
+        # 最大输出：None=保留既有值，0=清除键（回到内置默认），正整数=写入
+        if normalized_max_tokens is not None:
+            model["max_tokens"] = normalized_max_tokens
+        elif clear_max_tokens:
+            model.pop("max_tokens", None)
 
     config.update_config(_mutate)
 
@@ -699,7 +704,7 @@ def update_provider_and_model(provider_id: str, model_id: str, base_url: str, ap
                     if model["id"] == model_id:
                         model["name"] = model_name
                         proto = provider.get("protocol", "openai")
-                        model["litellm_model"] = litellm_model_name(proto, model_name)
+                        model["litellm_model"] = provider_route_name(proto, model_name)
                         model["context_window"] = context_window
                         if supports_vision is not None:
                             model["supports_vision"] = bool(supports_vision)
@@ -745,7 +750,7 @@ def add_preset_provider_with_models(
             model_entry = {
                 "id": mid,
                 "name": mname,
-                "litellm_model": litellm_model_name(protocol, mname),
+                "litellm_model": provider_route_name(protocol, mname),
                 "context_window": m.get("context_window", 128000),
             }
             if "max_tokens" in m:
@@ -791,94 +796,20 @@ def add_preset_provider_with_models(
 
 
 def add_preset_provider(preset_id: str, api_key: str) -> str:
-    """仅接收预置 ID 和 API Key，其余字段从共享目录读取。"""
+    """仅接收预置 ID 和 API Key，其余字段从共享目录读取。
+
+    预置目录只含厂商信息（名称/Base URL/协议），不携带模型——用户添加后
+    通过「获取模型列表」按需拉取并自动填充。
+    """
     preset = get_preset_provider(preset_id)
     return add_preset_provider_with_models(
         preset["name"],
         preset["base_url"],
         api_key,
         preset["protocol"],
-        preset["models"],
+        preset.get("models", []),
         preset_id=preset["id"],
     )
-
-
-def sync_preset_provider_models(preset_id: str) -> dict:
-    """把预置目录中该厂商的模型合并进用户配置，返回 {"added", "updated"} 计数。
-
-    预置目录（model_catalog.py）更新不会自动同步到已添加过该厂商的旧
-    config.json（添加时是快照拷贝）。厂商定位先按 preset_id 链接，未带
-    链接的手动厂商按厂商名或 Base URL 认领（GUI 同步按钮因此对这类
-    老配置同样可用）。定位后：
-    - 用户配置中缺少的预置模型按目录条目追加；
-    - 已存在且仍在目录中的预置模型，把 context_window / max_tokens /
-      supports_vision / supports_function_calling / computer_protocol 刷新为
-      目录值（目录调参——如上下文与输出上限扩容——能落到老配置）。
-    绝不删除：用户手动删掉的预置模型（delete_model 时记录于
-    removed_preset_models）、已从目录下架的模型与自定义模型都保持原样。
-    厂商不存在（未添加过或已删除）时静默返回 0/0，不写任何配置。
-    """
-    preset = get_preset_provider(preset_id)
-    catalog_by_name = {m["name"]: m for m in preset["models"]}
-    added_count = 0
-    updated_count = 0
-
-    def _locate_provider(data):
-        # 先按 preset_id 链接定位；手动添加、未带链接的老厂商按厂商名或
-        # Base URL 认领，否则「同步预置模型」对这类配置永远无处落地。
-        linked = next(
-            (p for p in data.get("providers", []) if p.get("preset_id") == preset_id),
-            None,
-        )
-        if linked is not None:
-            return linked
-        base = str(preset["base_url"] or "").rstrip("/").lower()
-        return next(
-            (
-                p for p in data.get("providers", [])
-                if p.get("name") == preset["name"]
-                or str(p.get("base_url") or "").rstrip("/").lower() == base
-            ),
-            None,
-        )
-
-    def _mutate(data):
-        nonlocal added_count, updated_count
-        provider = _locate_provider(data)
-        if provider is None:
-            return
-        existing_names = {m.get("name") for m in provider.get("models", [])}
-        skipped_names = set(provider.get("removed_preset_models", []))
-        for m in preset["models"]:
-            if m["name"] in existing_names or m["name"] in skipped_names:
-                continue
-            entry = {
-                "id": str(uuid.uuid4())[:8],
-                "name": m["name"],
-                "litellm_model": litellm_model_name(
-                    provider.get("protocol", "openai"), m["name"]
-                ),
-                "context_window": m.get("context_window", 128000),
-            }
-            _apply_preset_capability_fields(entry, m)
-            _validate_computer_combination(
-                entry.get("supports_vision"),
-                entry.get("supports_function_calling"),
-                entry.get("computer_protocol"),
-            )
-            provider.setdefault("models", []).append(entry)
-            added_count += 1
-        # 已存在模型的目录元数据刷新：只覆盖目录声明的字段，目录未
-        # 声明的字段（如旧条目的 max_tokens）保留用户现值。
-        for model in provider.get("models", []):
-            catalog_entry = catalog_by_name.get(model.get("name"))
-            if catalog_entry is None:
-                continue
-            if _refresh_preset_capability_fields(model, catalog_entry):
-                updated_count += 1
-
-    config.update_config(_mutate)
-    return {"added": added_count, "updated": updated_count}
 
 
 def _apply_preset_capability_fields(entry: dict, catalog_model: dict) -> None:
@@ -902,39 +833,3 @@ def _apply_preset_capability_fields(entry: dict, catalog_model: dict) -> None:
             entry["system_prompt_extra"] = prompt_extra
 
 
-def _refresh_preset_capability_fields(model: dict, catalog_model: dict) -> bool:
-    """按目录刷新已有预置模型条目的元数据，返回是否有实际变化。"""
-    changed = False
-    if "context_window" in catalog_model:
-        window = int(catalog_model["context_window"])
-        if model.get("context_window") != window:
-            model["context_window"] = window
-            changed = True
-    field_updaters = (
-        ("max_tokens", lambda v: int(v)),
-        ("supports_vision", bool),
-        (
-            "supports_function_calling",
-            lambda v: _normalize_capability_bool(
-                "supports_function_calling", v
-            ),
-        ),
-        ("computer_protocol", _normalize_computer_protocol),
-        # 预置护栏（system_prompt_extra）也按目录刷新到老配置条目；目录未声明的
-        # 模型不会被写这个键，因此其他模型零影响。
-        ("system_prompt_extra", lambda v: str(v).strip()),
-    )
-    for field, cast in field_updaters:
-        if field not in catalog_model:
-            continue
-        value = cast(catalog_model[field])
-        if model.get(field) != value:
-            model[field] = value
-            changed = True
-    if changed:
-        _validate_computer_combination(
-            model.get("supports_vision"),
-            model.get("supports_function_calling"),
-            model.get("computer_protocol"),
-        )
-    return changed

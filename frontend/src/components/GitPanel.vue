@@ -129,43 +129,65 @@
         </div>
       </div>
 
-      <!-- Diff 视图 -->
-      <GitDiffView v-if="store.diff" :diff="store.diff" />
+      <!-- 三方冲突解决器 -->
+      <GitConflictResolver v-if="store.conflictResolverPath" :path="store.conflictResolverPath" />
+
+      <!-- Diff 审查弹窗：点击变更文件后以大窗口展示改动，替代面板底部内联视图。
+           Teleport 到 body：右面板容器有层叠上下文，fixed 弹窗会被聊天区盖住 -->
+      <Teleport to="body">
+        <div v-if="diffModal" class="git-diff-mask" data-test="git-diff-modal" @click.self="closeDiffModal">
+          <div class="git-diff-modal">
+            <div class="git-diff-modal-head">
+              <span class="git-diff-modal-kind">{{ diffModal.staged ? '已暂存' : '工作区变更' }}</span>
+              <span class="git-diff-modal-path" :title="diffModal.path">{{ diffModal.path }}</span>
+              <button class="git-diff-close" data-test="git-diff-modal-close" title="关闭 (Esc)" @click="closeDiffModal">×</button>
+            </div>
+            <div class="git-diff-modal-body">
+              <div v-if="store.diffLoading" class="git-diff-note">加载 Diff 中…</div>
+              <GitDiffView v-else-if="store.diff" :diff="store.diff" />
+              <div v-else class="git-diff-note">无法加载该文件的 Diff</div>
+            </div>
+          </div>
+        </div>
+      </Teleport>
       </template>
 
       <!-- 三方冲突解决器 -->
       <GitConflictResolver v-if="store.conflictResolverPath" :path="store.conflictResolverPath" />
 
-      <!-- 高风险确认对话框（§13 两段式：服务端 preview + 一次性令牌） -->
-      <div v-if="store.pendingConfirm" class="git-confirm-mask" data-test="git-confirm-modal">
-        <div class="git-confirm">
-          <div class="git-confirm-title">高风险操作确认</div>
-          <div class="git-confirm-text">{{ store.pendingConfirm.preview.confirm_text }}</div>
-          <div class="git-confirm-risk">风险级别: {{ store.pendingConfirm.preview.risk_level }}</div>
-          <input
-            v-if="store.pendingConfirm.preview.typed_confirm_required"
-            v-model="store.pendingConfirm.typedInput"
-            data-test="git-confirm-input"
-            class="git-commit-title"
-            placeholder="输入目标分支名或短 Hash 以确认"
-          />
-          <div class="git-confirm-actions">
-            <button data-test="git-confirm-cancel" @click="store.cancelConfirm()">取消</button>
-            <button
-              data-test="git-confirm-ok"
-              class="git-danger"
-              :disabled="store.pendingConfirm.preview.typed_confirm_required && !store.pendingConfirm.typedInput.trim()"
-              @click="onConfirmOk"
-            >确认执行</button>
+      <!-- 高风险确认对话框（§13 两段式：服务端 preview + 一次性令牌）。
+           同样 Teleport 到 body，避免被聊天区层叠盖住 -->
+      <Teleport to="body">
+        <div v-if="store.pendingConfirm" class="git-confirm-mask" data-test="git-confirm-modal">
+          <div class="git-confirm">
+            <div class="git-confirm-title">高风险操作确认</div>
+            <div class="git-confirm-text">{{ store.pendingConfirm.preview.confirm_text }}</div>
+            <div class="git-confirm-risk">风险级别: {{ store.pendingConfirm.preview.risk_level }}</div>
+            <input
+              v-if="store.pendingConfirm.preview.typed_confirm_required"
+              v-model="store.pendingConfirm.typedInput"
+              data-test="git-confirm-input"
+              class="git-commit-title"
+              placeholder="输入目标分支名或短 Hash 以确认"
+            />
+            <div class="git-confirm-actions">
+              <button data-test="git-confirm-cancel" @click="store.cancelConfirm()">取消</button>
+              <button
+                data-test="git-confirm-ok"
+                class="git-danger"
+                :disabled="store.pendingConfirm.preview.typed_confirm_required && !store.pendingConfirm.typedInput.trim()"
+                @click="onConfirmOk"
+              >确认执行</button>
+            </div>
           </div>
         </div>
-      </div>
+      </Teleport>
     </template>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue';
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { useGitStore } from '../stores/gitStore';
 import { useAppStore } from '../stores/appStore';
 import GitDiffView from './GitDiffView.vue';
@@ -175,6 +197,17 @@ import GitConflictResolver from './GitConflictResolver.vue';
 const store = useGitStore();
 const appStore = useAppStore();
 const viewMode = ref<'status' | 'history'>('status');
+// Diff 审查弹窗：null = 关闭；记录当前查看的文件与暂存侧（供标题展示）
+const diffModal = ref<{ path: string; staged: boolean } | null>(null);
+
+function closeDiffModal() {
+  diffModal.value = null;
+  store.diff = null;
+}
+
+function onDiffModalKeydown(event: KeyboardEvent) {
+  if (event.key === 'Escape' && diffModal.value) closeDiffModal();
+}
 
 async function aiAssist(kind: string) {
   // §5.15：先展示用途，用户确认后发送可见模板消息（不注入隐藏提示）
@@ -197,6 +230,7 @@ const operationLabel = computed(() => {
 });
 
 function openDiff(path: string, staged: boolean) {
+  diffModal.value = { path, staged };
   void store.loadDiff(path, staged);
 }
 
@@ -216,6 +250,13 @@ onMounted(() => {
   const workdir = appStore.workdir || '';
   if (workdir) void store.ensureLoaded(workdir);
 });
+
+// 弹窗打开期间监听 Esc 关闭；关闭与卸载时摘除监听
+watch(diffModal, (open) => {
+  if (open) window.addEventListener('keydown', onDiffModalKeydown);
+  else window.removeEventListener('keydown', onDiffModalKeydown);
+});
+onBeforeUnmount(() => window.removeEventListener('keydown', onDiffModalKeydown));
 
 // 会话切换 → 跟随工作区重新加载（§17.3 会话切换不串仓库状态）
 watch(
@@ -244,9 +285,9 @@ watch(
 }
 .git-view-switch button.active { border-color: rgba(100,181,246,.5); color: #64b5f6; }
 .git-head { display: flex; align-items: center; gap: 8px; font-weight: 600; }
-.git-dirty-mark { color: #e5a037; }
-.git-sync { color: #64b5f6; }
-.git-op { color: #e5a037; font-size: 12px; }
+.git-dirty-mark { color: var(--yellow); }
+.git-sync { color: var(--accent); }
+.git-op { color: var(--yellow); font-size: 12px; }
 .git-upstream { color: var(--text-dim, #888); font-size: 12px; }
 .git-mini {
   background: transparent;
@@ -280,7 +321,7 @@ watch(
 }
 .git-commit-actions button:disabled { opacity: 0.45; cursor: default; }
 .git-group-title { font-size: 12px; color: var(--text-dim, #888); margin: 4px 0 2px; }
-.git-group-title.git-group-conflict { color: #e57373; font-weight: 600; }
+.git-group-title.git-group-conflict { color: var(--red); font-weight: 600; }
 .git-file-row {
   display: flex;
   align-items: center;
@@ -289,7 +330,7 @@ watch(
   border-radius: 4px;
 }
 .git-file-row:hover { background: rgba(127, 127, 127, 0.12); }
-.git-file-status { width: 14px; color: #e5a037; font-family: monospace; }
+.git-file-status { width: 14px; color: var(--yellow); font-family: monospace; }
 .git-file-path {
   flex: 1;
   overflow: hidden;
@@ -300,7 +341,7 @@ watch(
   text-align: left;
 }
 .git-file-kind { color: var(--text-dim, #888); font-size: 11px; }
-.git-conflict-row .git-file-path { color: #e57373; }
+.git-conflict-row .git-file-path { color: var(--red); }
 .git-group-actions { display: flex; justify-content: flex-end; }
 .git-trust {
   border: 1px solid rgba(229, 160, 55, 0.5);
@@ -337,10 +378,11 @@ watch(
   display: flex;
   align-items: center;
   justify-content: center;
-  z-index: 60;
+  /* 已 Teleport 到 body：压过应用层全部面板/抽屉（最高 3000），低于顶层引导 5000 */
+  z-index: 4000;
 }
 .git-confirm {
-  background: var(--panel-bg, #222);
+  background: var(--bg2);
   border: 1px solid rgba(229, 115, 115, 0.6);
   border-radius: 8px;
   padding: 14px 16px;
@@ -349,7 +391,7 @@ watch(
   flex-direction: column;
   gap: 8px;
 }
-.git-confirm-title { font-weight: 700; color: #e57373; }
+.git-confirm-title { font-weight: 700; color: var(--red); }
 .git-confirm-text { font-size: 13px; }
 .git-confirm-risk { font-size: 12px; color: var(--text-dim, #888); }
 .git-confirm-actions { display: flex; justify-content: flex-end; gap: 8px; }
@@ -366,4 +408,68 @@ watch(
   border-color: rgba(229, 115, 115, 0.6);
 }
 .git-confirm-actions button:disabled { opacity: 0.45; cursor: default; }
+/* Diff 审查弹窗：大窗口展示改动，替代面板底部内联视图（点击遮罩/Esc 关闭） */
+.git-diff-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* 已 Teleport 到 body：压过应用层全部面板/抽屉（最高 3000），低于顶层引导 5000 */
+  z-index: 4000;
+}
+.git-diff-modal {
+  background: var(--bg2);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  width: min(1000px, 94vw);
+  height: min(86vh, 920px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.55);
+}
+.git-diff-modal-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.git-diff-modal-kind {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--yellow);
+  border: 1px solid rgba(229, 160, 55, 0.5);
+  border-radius: 4px;
+  padding: 1px 6px;
+}
+.git-diff-modal-path {
+  font-family: Consolas, 'Courier New', monospace;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;
+  text-align: left;
+}
+.git-diff-close {
+  margin-left: auto;
+  flex-shrink: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font-size: 20px;
+  cursor: pointer;
+  line-height: 1;
+}
+.git-diff-close:hover { color: var(--red); }
+.git-diff-modal-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
 </style>

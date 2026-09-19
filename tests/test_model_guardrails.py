@@ -303,38 +303,13 @@ NEOHORSE_GUARDRAIL = (
 )
 
 
-def test_preset_neohorse_model_ships_measured_guardrail():
-    """预置目录中 neohorse-1-9b 的 system_prompt_extra 非空且逐字等于实测护栏。"""
+def test_preset_catalog_carries_no_models():
+    """预置目录只含厂商信息；neohorse 推理护栏等模型级元数据不再随目录下发，
+    已配置用户不受影响（config.json 快照保留既有 system_prompt_extra）。"""
     from core.model_catalog import get_preset_providers
 
-    entry = next(
-        model
-        for provider in get_preset_providers()
-        for model in provider["models"]
-        if model["name"] == "neohorse-1-9b"
-    )
-
-    guardrail = entry.get("system_prompt_extra")
-    assert isinstance(guardrail, str)
-    assert guardrail.strip(), "护栏不得为空"
-    assert guardrail == NEOHORSE_GUARDRAIL
-
-
-def test_no_other_preset_model_carries_system_prompt_extra():
-    """除 neohorse-1-9b 外，预置目录不得有模型带非空 system_prompt_extra。
-
-    这是「其他模型完全不受影响」的目录层证据：字段为空或不存在都算合规。
-    """
-    from core.model_catalog import get_preset_providers
-
-    offenders = [
-        (provider["id"], model["name"], model.get("system_prompt_extra"))
-        for provider in get_preset_providers()
-        for model in provider["models"]
-        if model["name"] != "neohorse-1-9b" and model.get("system_prompt_extra")
-    ]
-
-    assert offenders == []
+    for provider in get_preset_providers():
+        assert "models" not in provider
 
 
 def test_preset_write_paths_carry_guardrail_only_when_declared():
@@ -352,20 +327,12 @@ def test_preset_write_paths_carry_guardrail_only_when_declared():
     model_manager._apply_preset_capability_fields(created, catalog_model)
     assert created["system_prompt_extra"] == NEOHORSE_GUARDRAIL
 
-    # 刷新路径：老配置里已存在的条目也能拿到目录新值
-    existing = {"id": "mid-old", "name": "guard-model", "context_window": 256000}
-    assert model_manager._refresh_preset_capability_fields(existing, catalog_model)
-    assert existing["system_prompt_extra"] == NEOHORSE_GUARDRAIL
-
     # 目录未声明该字段的模型：两条路径都不得凭空写键（其他模型零影响）
     plain_catalog = {"name": "plain-model", "context_window": 128000}
     plain_created = {"id": "mid-plain-1", "name": "plain-model", "context_window": 128000}
     model_manager._apply_preset_capability_fields(plain_created, plain_catalog)
     assert "system_prompt_extra" not in plain_created
 
-    plain_existing = {"id": "mid-plain-2", "name": "plain-model", "context_window": 128000}
-    assert not model_manager._refresh_preset_capability_fields(plain_existing, plain_catalog)
-    assert "system_prompt_extra" not in plain_existing
 
 
 # ---------------------------------------------------------------------------

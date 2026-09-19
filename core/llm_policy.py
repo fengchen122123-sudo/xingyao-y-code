@@ -62,7 +62,7 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
     ),
     # OpenAI 思考模型 (o1, o3-mini)：native 引擎不接手（需 max_completion_tokens /
     # developer 角色改写，见 llm_transport._is_native_supported_model），该策略
-    # 仅作为识别标记与 litellm 路径的方言描述。
+    # 仅作为识别标记与该路由的方言描述。
     "openai_reasoning": ModelPolicy(
         provider_kind="openai_reasoning",
         reasoning_field="reasoning_content",

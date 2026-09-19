@@ -524,9 +524,8 @@ def test_kimi_k3_request_uses_anthropic_high_thinking_budget(mocker):
 
     assert captured["thinking"] == {"type": "enabled", "budget_tokens": 4096}
     assert captured["max_tokens"] == 131072
-    # litellm 客户端参数校验只把 Claude 系列识别为支持 thinking 的 anthropic 模型，
-    # 对 "K3" 这类陌生模型名会直接抛 UnsupportedParamsError（请求根本发不出去），
-    # 必须显式声明 allowed_openai_params 豁免校验。
+    # thinking 对 OpenAI 兼容语义是非标准参数，必须显式声明
+    # allowed_openai_params，保证网关按白名单放行。
     assert captured["allowed_openai_params"] == ["thinking"]
     assert "reasoning_effort" not in captured
 
@@ -564,7 +563,7 @@ def test_chat_request_uses_explicit_cache_scope_and_actual_tool_contract(mocker)
     assert captured["extra_body"]["prompt_cache_key"] == expected
 
 
-def test_kimi_k3_generic_anthropic_route_also_bypasses_litellm_param_check(mocker):
+def test_kimi_k3_generic_anthropic_route_also_bypasses_param_check(mocker):
     """非 kimi coding 的 anthropic 兼容端点（经销商网关等）同样必须带豁免参数。"""
     captured = {}
 

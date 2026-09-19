@@ -28,7 +28,6 @@ setup(
     install_requires=[
         # 下限为已验证兼容版本，上限锁到下一个大版本，避免上游 breaking change 静默破坏安装
         'rich>=13.0.0,<16',
-        'litellm>=1.0.0,<2',
         'prompt_toolkit>=3.0.0,<4',
         'pyfiglet>=0.8.0,<2',
         'ddgs>=9.0.0,<10',

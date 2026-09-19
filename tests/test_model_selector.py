@@ -36,7 +36,8 @@ def test_kimi_for_coding_preset_is_openai_format():
         ("openai", "https://api.kimi.com/coding/v1"),
     }
     openai_preset = next(preset for preset in kimi_coding if preset["protocol"] == "openai")
-    assert openai_preset["models"][0]["name"] == "kimi-for-coding"
+    # 预置厂商只含厂商信息，不携带模型
+    assert "models" not in openai_preset
 from core.model_selector import _latest_total_tokens
 
 
@@ -184,8 +185,8 @@ def test_update_provider_and_model_persists_supports_vision(monkeypatch, tmp_pat
     assert model["supports_vision"] is True
 
 
-def test_preset_add_via_selector_path_keeps_computer_metadata(monkeypatch, tmp_path):
-    """selector 的预置厂商添加入口必须透传目录中的电脑操控能力元数据。"""
+def test_preset_add_via_selector_path_adds_provider_without_models(monkeypatch, tmp_path):
+    """selector 的预置厂商添加入口只建厂商条目（模型由用户经「获取模型列表」添加）。"""
     import config as config_mod
     from core.model_manager import add_preset_provider_with_models, load_config
 
@@ -196,13 +197,10 @@ def test_preset_add_via_selector_path_keeps_computer_metadata(monkeypatch, tmp_p
     preset = next(p for p in model_selector.PRESET_PROVIDERS if p["id"] == "kimi-coding-openai")
     pid = add_preset_provider_with_models(
         preset["name"], preset["base_url"], "key", preset["protocol"],
-        preset["models"], preset_id=preset["id"],
+        preset.get("models", []), preset_id=preset["id"],
     )
 
     cfg = load_config()
-    model = next(
-        m for p in cfg["providers"] if p["id"] == pid
-        for m in p["models"] if m["name"] == "k3"
-    )
-    assert model["computer_protocol"] == "generic"
-    assert model["supports_function_calling"] is True
+    provider = next(p for p in cfg["providers"] if p["id"] == pid)
+    assert provider["preset_id"] == "kimi-coding-openai"
+    assert provider["models"] == []

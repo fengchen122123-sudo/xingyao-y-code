@@ -88,8 +88,9 @@ describe('model settings store', () => {
 
     const result = await store.addModel('p1', 'model-two', 300000, true);
 
-    // 缺省协议 = ''（自动）：视觉+工具调用双勾的模型无需显式配置即可操控
-    expect(addModel).toHaveBeenCalledWith('p1', 'model-two', 300000, true, false, '');
+    // 缺省协议 = ''（自动）：视觉+工具调用双勾的模型无需显式配置即可操控；
+    // 工具调用未显式传参时默认支持（Agent 模型本就以工具调用驱动）
+    expect(addModel).toHaveBeenCalledWith('p1', 'model-two', 300000, true, true, '', null);
     expect(result?.ok).toBe(true);
     expect(store.models[0].name).toBe('model-two');
   });
@@ -108,7 +109,7 @@ describe('model settings store', () => {
 
     const result = await store.addModel('p1', 'model-generic', 300000, true, true, 'generic');
 
-    expect(addModel).toHaveBeenCalledWith('p1', 'model-generic', 300000, true, true, 'generic');
+    expect(addModel).toHaveBeenCalledWith('p1', 'model-generic', 300000, true, true, 'generic', null);
     expect(result?.ok).toBe(true);
     expect(store.models[0].computer_protocol).toBe('generic');
     expect(store.models[0].supports_function_calling).toBe(true);
@@ -124,7 +125,7 @@ describe('model settings store', () => {
 
     const result = await store.updateModel('p1', 'm1', 'model-one', 200000, true, true, 'none');
 
-    expect(updateModel).toHaveBeenCalledWith('p1', 'm1', 'model-one', 200000, true, true, 'none');
+    expect(updateModel).toHaveBeenCalledWith('p1', 'm1', 'model-one', 200000, true, true, 'none', null);
     expect(result?.ok).toBe(true);
     expect(store.models[0].computer_protocol).toBe('none');
   });

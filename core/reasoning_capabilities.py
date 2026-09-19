@@ -98,9 +98,10 @@ _register(
     ),
 )
 # GLM-5.3/5.3-flash 强制思考：不支持关闭（thinking.type 传 disabled 会报错），
-# reasoning_effort 仅支持 low/high/max。
+# reasoning_effort 仅支持 low/high/max。glm-5.3-free 为同系免费变体
+# （tokenrouter 等网关挂载名 z-ai/glm-5.3-free，经别名折叠归一）。
 _register(
-    ("glm-5.3", "glm-5.3-flash"),
+    ("glm-5.3", "glm-5.3-flash", "glm-5.3-free"),
     ReasoningCapability(
         "effort", ("default", "low", "high", "max"), "thinking_object_effort"
     ),
@@ -162,14 +163,39 @@ _register(
 )
 # neohorse-1-9b（tokenrhythm.studio）：实测为带 reasoning_content 的推理模型，
 # 推理与正文共用 max_tokens 预算，接口未提供关闭/调档参数，故按"始终开启思考"
-# 登记（不注入任何思考参数，GUI 侧只读展示）。
+# 登记（不注入任何思考参数，GUI 侧只读展示）。同系 1-4b（含 LM Studio 量化名）
+# 按同系列推断登记为同款。
 _register(
-    ("neohorse-1-9b",),
+    ("neohorse-1-9b", "neohorse-1-4b", "neohorse-1-4b@q4_k_m"),
     ReasoningCapability("fixed", (), "always_on", "该模型始终开启思考"),
 )
-# 阶跃星辰：推理模型始终输出 reasoning，用 reasoning_effort 控制深度（low/medium/high），无 off 开关。
+# 中转站 GPT 系（网关自定义名）：实测接受 OpenAI 风格 reasoning_effort。
+# gpt-5.6-sol 接受 "none"（可关思考）；gpt-6-astra 明确拒绝 "none"
+# （HTTP 400 Unsupported value），不提供 off 档。
 _register(
-    ("step-3.7-flash", "step-router-v1"),
+    ("gpt-5.6-sol",),
+    ReasoningCapability(
+        "effort", ("default", "off", "low", "medium", "high"), "effort_switch"
+    ),
+)
+_register(
+    ("gpt-6-astra",),
+    ReasoningCapability(
+        "effort", ("default", "low", "medium", "high"), "effort_switch"
+    ),
+)
+# 阶跃星辰：推理模型始终输出 reasoning，用 reasoning_effort 控制深度（low/medium/high），无 off 开关。
+# token plan 全系 LLM（step-3.7-flash / step-router-v1 / step-5-preview /
+# step-3.5-flash / step-3.5-flash-2603）统一按此适配（官方 /v1/models 的
+# reasoning_effort_support_list 均为 low/medium/high）。
+_register(
+    (
+        "step-3.7-flash",
+        "step-router-v1",
+        "step-5-preview",
+        "step-3.5-flash",
+        "step-3.5-flash-2603",
+    ),
     ReasoningCapability(
         "effort", ("default", "low", "medium", "high"), "always_on_effort"
     ),
@@ -223,6 +249,8 @@ def normalize_reasoning_model_name(model_name: str) -> str:
         normalized = suffix
     if normalized == "zai-org/glm-5.2":
         return "glm-5.2"
+    if normalized == "z-ai/glm-5.3-free":
+        return "glm-5.3-free"
     if normalized in {"qwen3.8-falsh", "qwen38-falsh", "qwen38-flash"}:
         return "qwen3.8-flash"
     return normalized

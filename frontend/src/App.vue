@@ -189,7 +189,7 @@
         class="si status-git-branch"
         data-test="status-git-branch"
         data-mobile-status="hidden"
-        :title="'Git 工作台: ' + gitBranchText + '（点击打开源代码管理）'"
+        :title="'Git 工作台: ' + gitBranchText + '（点击打开 Git 面板）'"
         style="cursor: pointer"
         @click="openGitPanel"
       >{{ gitBranchText }}</span>
