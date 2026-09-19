@@ -57,6 +57,21 @@ def _data_dir() -> Path:
     return Path(os.environ.get("YCODE_DATA_DIR") or (Path.home() / ".ycode"))
 
 
+# 前端 HTTP 端口按启动形态固定：安装版沿用 pywebview 默认 42001（终端用户的
+# localStorage 偏好保持同一 origin），源码开发版独占 42002。背景（2026-09-19）：
+# 两个形态共用同一数据目录的 WebView2 缓存且 origin 相同，安装版在输入了
+# no-cache 头的版本更新后，其 index.html 会被启发式缓存数天——开发版随后在同
+# 一 origin 启动时命中过期入口，轻则加载到安装版的旧前端 bundle（表现为新功能
+# "消失"），重则旧哈希资产 404 整窗白屏。端口隔离后两形态互不可见对方的缓存。
+_HTTP_PORT_FROZEN = 42001
+_HTTP_PORT_SOURCE = 42002
+
+
+def _frontend_http_port() -> int:
+    """按启动形态选择前端 HTTP 端口（安装版 / 源码版 origin 隔离）。"""
+    return _HTTP_PORT_FROZEN if getattr(sys, "frozen", False) else _HTTP_PORT_SOURCE
+
+
 def _webview_start_options() -> dict:
     """webview.start 的启动参数。
 
@@ -64,13 +79,14 @@ def _webview_start_options() -> dict:
     且内置 HTTP 服务退化为随机端口（http.py：``server.port = http_port or
     _get_random_port()``），每次启动前端 origin 都在变。两者叠加会让所有基于
     localStorage 的界面偏好（侧栏宽度、输入框高度、会话分组折叠态）重启必丢，
-    表现为"收起的分组重启后又全部展开"。关闭后端口固定为 pywebview 默认值、
+    表现为"收起的分组重启后又全部展开"。关闭后端口按启动形态固定、
     网站数据落到应用数据目录，偏好才能真正跨重启保持。
     """
     return {
         "debug": _debug_enabled(),
         "private_mode": False,
         "storage_path": str(_data_dir() / "webview"),
+        "http_port": _frontend_http_port(),
     }
 
 
@@ -658,6 +674,14 @@ def main():
             pass
 
     threading.Thread(target=_register_dnd, daemon=True, name="gui-dnd-register").start()
+
+    # pywebview 的 asset 路由先 set_header 再 return static_file(...)，bottle
+    # 会丢弃前者——no-cache 从未真正发出，WebView2 启发式缓存 index.html 后，
+    # 端口复用 + dist 更新会让启动加载过期入口资产直接白屏。必须在服务器开始
+    # 服务前补上真正的缓存控制头。
+    from core.webview_no_cache import apply as apply_webview_no_cache
+
+    apply_webview_no_cache()
 
     # 启动 WebView 消息主循环（默认关闭开发者工具，YCODE_GUI_DEBUG=1 时打开）
     logger.info("准备启动 WebView 消息主循环（webview.start）")
