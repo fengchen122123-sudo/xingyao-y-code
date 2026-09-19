@@ -4681,25 +4681,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async syncPresetModels(presetId: string) {
-      const api = this._api();
-      if (!api) return null;
-      try {
-        const res = await api.sync_preset_models(presetId);
-        if (res?.ok && res.settings) {
-          this.applyModelSettings(res.settings);
-          this.notifyModal('供应商', res.msg || '预置模型已同步');
-          return res;
-        }
-        this.notifyModal('供应商', '同步预置模型失败: ' + (res?.msg || '未知错误'));
-        return null;
-      } catch (err) {
-        this.connected = false;
-        this.notifyModal('供应商', '同步预置模型失败: ' + err);
-        return null;
-      }
-    },
-
     async updateProvider(providerId: string, name: string, baseUrl: string, apiKey: string, protocol: string) {
       const api = this._api();
       if (!api) return null;
@@ -4753,11 +4734,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '') {
+    async addModel(providerId: string, modelName: string, contextWindow: number, supportsVision = false, supportsFunctionCalling = true, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol);
+        const res = await api.add_model(providerId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens);
         if (res && res.ok) {
           if (res.settings) this.applyModelSettings(res.settings);
           else if (res.models) this.models = res.models;
@@ -4774,11 +4755,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '') {
+    async updateModel(providerId: string, modelId: string, modelName: string, contextWindow: number, supportsVision: boolean, supportsFunctionCalling = false, computerProtocol: ComputerProtocolChoice = '', maxTokens: number | null = null) {
       const api = this._api();
       if (!api) return null;
       try {
-        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol);
+        const res = await api.update_model(providerId, modelId, modelName, contextWindow, supportsVision, supportsFunctionCalling, computerProtocol, maxTokens);
         if (res?.ok && res.settings) {
           this.applyModelSettings(res.settings);
           this.notifyModal('模型', res.msg || '模型已更新');
@@ -4789,6 +4770,18 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('模型', '更新模型失败: ' + err);
+        return null;
+      }
+    },
+
+    async fetchProviderModels(providerId: string): Promise<{ ok: boolean; msg?: string; models?: { id: string; model_type?: string }[]; count?: number } | null> {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        return await api.fetch_provider_models(providerId);
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('获取模型列表', '获取失败: ' + err);
         return null;
       }
     },

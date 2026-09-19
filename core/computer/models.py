@@ -1,6 +1,6 @@
 """电脑操控领域的不可变值对象、枚举、错误类型与 backend 协议。
 
-本模块不导入 GUI、CLI、LiteLLM、Playwright 或全局配置（设计第 6 节规则 1）。
+本模块不导入 GUI、CLI、LLM 传输层、Playwright 或全局配置（设计第 6 节规则 1）。
 枚举取值、错误码与字段形状以 docs/superpowers/specs/2026-09-02-computer-control-design.md
 第 7、9.3、21 节为准。
 """

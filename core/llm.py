@@ -1,7 +1,6 @@
 import json
 import hashlib
 import logging
-import os
 import queue
 import random
 import re
@@ -121,15 +120,6 @@ _COMPUTER_RUN_TERMINAL_STATUSES = frozenset({
     ComputerRunStatus.FAILED.value,
 })
 
-# 使用 LiteLLM 本地模型价格表，跳过启动时的远程拉取
-# （raw.githubusercontent.com 国内常超时，本地副本无功能影响，且启动更快）
-# 必须在 import litellm 之前设置该环境变量才生效
-os.environ.setdefault("LITELLM_LOCAL_MODEL_COST_MAP", "True")
-
-# 屏蔽 LiteLLM 启动时的调试噪音，但保留 WARNING 及以上的有用告警
-logging.getLogger("LiteLLM").setLevel(logging.WARNING)
-logging.getLogger("litellm").setLevel(logging.WARNING)
-
 logger = logging.getLogger(__name__)
 
 
@@ -142,17 +132,14 @@ from core.llm_transport import (
     RequestWaitGiveUpError,
     _InflightStream,
     _close_stream_quietly,
-    _get_litellm,
     _inflight_lock,
     _inflight_streams,
-    _litellm_completion,
-    _litellm_context_overflow_error,
-    _litellm_responses,
-    _litellm_supports_vision,
-    _litellm_token_counter,
-    _patch_litellm_stream_usage_details,
+    _context_overflow_error,
+    _dispatch_completion,
+    _dispatch_responses,
     _register_inflight_stream,
     _submit_daemon_call,
+    _token_counter,
     _unregister_inflight_stream,
     abort_inflight_streams,
     is_rate_limit_error,
@@ -301,8 +288,12 @@ def get_tools_schema():
 
 
 def completion(**kwargs):
-    """litellm.completion 的模块级导出的包装函数（可被测试 mocker.patch 拦截）。"""
-    return _litellm_completion(**kwargs)
+    """模型请求入口（自研 HTTPX 引擎唯一路径，可被测试 mocker.patch 拦截）。
+
+    实际传输由 core.llm_transport._dispatch_completion 分派到
+    core.llm_native_transport.native_completion。
+    """
+    return _dispatch_completion(**kwargs)
 
 
 # --- Re-exported from core.harness.responses_adapter ---
@@ -342,7 +333,7 @@ def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_e
                 holder.attach(stream)
             return stream, holder
         # 可关闭对象是底层原始流，不是外层映射生成器（生成器在执行中无法 close）
-        raw_stream = _litellm_responses(**prepared.kwargs)
+        raw_stream = _dispatch_responses(**prepared.kwargs)
         if holder is not None:
             holder.attach(raw_stream)
         return _responses_stream_as_chat_chunks(raw_stream), holder
@@ -356,8 +347,6 @@ def __getattr__(name):
     # 兼容别名：惰性计算，避免 import 时触发 MCP 连接
     if name == "TOOLS_SCHEMA":
         return get_tools_schema()
-    if name == "litellm":
-        return _get_litellm()
     if name == "mcp_manager":
         # 惰性加载 mcp_manager 单例：避免 import core.llm 时就拉起 mcp 包全家桶
         # （~1.1s 启动开销）。不缓存到 globals，保证外部属性访问始终反映
@@ -365,7 +354,7 @@ def __getattr__(name):
         return _get_mcp_manager()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
-# estimate_tokens 结果缓存：tiktoken 全量编码整个历史相当慢（长会话可达秒级），
+# estimate_tokens 结果缓存：token 估算整个历史开销可观（长会话消息多），
 # 而 UI 状态栏、压缩判断等会在内容未变时反复调用。用 (模型, 消息数, 总字符数)
 # 作为签名，未变化时直接复用上次结果。
 _token_estimate_cache = {"sig": None, "value": 0}
@@ -378,7 +367,7 @@ _token_cache_lock = threading.RLock()
 def _sanitize_error_text(text):
     """异常文本入 UI / 落库前脱敏。
 
-    litellm / 网关异常文本常携带完整请求 URL 与请求上下文（query 里的 api_key、
+    网关 / Provider 异常文本常携带完整请求 URL 与请求上下文（query 里的 api_key、
     Authorization: Bearer 头、URL userinfo 等），直接发 error/turn_error 事件会把
     凭据泄露到界面与会话记录。这里对 URL 凭据段与常见密钥模式做不可逆脱敏。
     """
@@ -418,8 +407,8 @@ def _fold_old_media_for_estimate(messages):
     """估算前把历史图片折叠为占位符（与请求时 _strip_media_and_merge 的规则一致）。
 
     base64 原图动辄几十万字符，按字符数估算会虚高几个数量级，导致携带大图片的
-    会话反复误触发记忆压缩。仅最近一条带图用户消息保留原样（交给 litellm 按
-    图片实际规格估算），更早的一律折叠为短占位符。
+    会话反复误触发记忆压缩。仅最近一条带图用户消息保留原样（贴近真实请求形状），
+    更早的一律折叠为短占位符。
     """
     last_media_idx = -1
     for idx in range(len(messages) - 1, -1, -1):
@@ -481,7 +470,7 @@ def _estimate_tokens_locked(model_name, messages):
     def _count(msgs):
         try:
             # 历史图片先折叠再计数：base64 字符量与图片真实 token 消耗无关
-            return _litellm_token_counter(model_name, _fold_old_media_for_estimate(msgs))
+            return _token_counter(model_name, _fold_old_media_for_estimate(msgs))
         except Exception:
             # 如果模型不支持或报错，采用约 2 字符 / Token 的经验值进行兜底估算
             return len(str(_fold_old_media_for_estimate(msgs))) // 2
@@ -873,7 +862,6 @@ from core.llm_dialects import (
     _is_official_kimi_route,
     _is_official_zhipu_route,
     _is_qwen_family,
-    _litellm_rejects_tool_choice,
     _merge_system_messages_into_leading,
     _model_system_prompt_extra,
     _new_tail_after_ledger_prefix,
@@ -923,7 +911,7 @@ def _stream_chunks_with_idle_notice(response_stream, event_callback, raise_if_ca
     “慢”与“卡死”。改为后台线程 pump + 主线程带 0.5s 超时的队列读取：
     空闲超阈值后按间隔上报等待状态，同时保持对取消事件的响应能力。
     注意：调用方提前放弃（取消/异常）时 pump 线程会继续读到流结束，线程为
-    daemon；litellm 流有 per-chunk 读超时自愈，native 流 read 超时为 None
+    daemon；native 流 read 超时为 None
     （读超时由本看门狗全权管控），因此 give-up 路径必须先经 inflight_holder
     显式关流再抛出，否则 pump 会永久阻塞在 socket 读且 abort 再也够不到它。
     inflight_holder：本流在在飞注册表中的句柄，消费结束（无论正常/异常/取消）
@@ -1515,14 +1503,6 @@ def _chat_with_model_generator(
     )
     if not deepseek_thinking_request:
         kwargs["tool_choice"] = "auto"
-        # 中转站的未知 gpt-5* 模型会被 litellm 客户端直接拒绝 tool_choice
-        #（见 _litellm_rejects_tool_choice），按参数追加放行；不能用全局
-        # drop_params——那会把 reasoning_effort 等推理强度静默吞掉。
-        if _litellm_rejects_tool_choice(model_name):
-            kwargs["allowed_openai_params"] = list(dict.fromkeys([
-                *(kwargs.get("allowed_openai_params") or []),
-                "tool_choice",
-            ]))
 
     # 默认输出长度上限：防止免费/轻量模型（如 glm-4-flash）默认 max_tokens 过小
     # 导致长回复被静默截断。若 provider 已显式配置则尊重其值；内置默认表未覆盖的
@@ -1661,8 +1641,8 @@ def _chat_with_model_generator(
                     if _is_kimi_family(model_name, api_base):
                         # Moonshot 推理模型要求所有带 tool_calls 的 assistant 消息
                         # 携带 reasoning_content；从数据库重建的历史消息可能已被剥掉，
-                        # 这里补空格占位符（litellm 的 moonshot/ 路由会自动做，
-                        # 但经销商常用的 openai/ 路由不会）。
+                        # 这里补空格占位符，保证从数据库重建的历史消息也满足
+                        # Moonshot 官方与经销商网关的该校验。
                         for _m in cleaned_messages:
                             if (
                                 _m.get("role") == "assistant"
@@ -1764,7 +1744,7 @@ def _chat_with_model_generator(
                             # 长时间无反馈被误判为“卡死”（重试提示只在异常后才有）
                             waited = time.monotonic() - wait_started_at
                             if waited >= REQUEST_WAIT_GIVE_UP_SECONDS:
-                                # 等待硬上限：litellm num_retries 会把单次超时在
+                                # 等待硬上限：上层重试会把单次超时在
                                 # 同一 Step 内放大数倍，这里按客户端真实等待时长兜底，
                                 # 到点结束本轮而非无限等
                                 raise RequestWaitGiveUpError(
@@ -1815,7 +1795,7 @@ def _chat_with_model_generator(
                     # 上下文窗口超限自动压缩历史记录并重试：
                     # 优先按异常类型判断，字符串匹配作为兜底且要求上下文相关关键词组合，
                     # 避免把 rate limit 等错误误判为超限
-                    is_context_overflow = isinstance(api_err, _litellm_context_overflow_error())
+                    is_context_overflow = isinstance(api_err, _context_overflow_error())
                     if not is_context_overflow:
                         is_context_overflow = (
                             "prompt is too long" in err_str
@@ -1964,8 +1944,8 @@ def _chat_with_model_generator(
                 if update.public_text:
                     yield update.public_text
 
-            # litellm 流式包装器在 finish 之后收到的最终 usage chunk 会被吞进
-            # wrapper.chunks 而不再 yield（StopIteration 分支）。迭代中拿到的
+            # 流式包装器在 finish 之后收到的最终 usage chunk 可能只落入
+            # wrapper.chunks 而不再对外 yield（StopIteration 分支）。迭代中拿到的
             # 最后一个 usage 可能是不含缓存明细的中间态（prompt_tokens_details=None），
             # 导致 DeepSeek 等通道命中记账恒为 0。流结束后从 chunks 尾部补取最终 usage。
             _tail_chunks = getattr(response_stream, "chunks", None)
@@ -2015,7 +1995,7 @@ def _chat_with_model_generator(
 
             # 输出耗时与流速判定：
             # 1) 真实逐 chunk 流式：首 token 到末 chunk 之间的实际流式输出时长；
-            # 2) 假流式/批式投递（如 LiteLLM MockResponsesAPIStreamingIterator 或网关整包缓冲）：
+            # 2) 假流式/批式投递（如网关整包缓冲的 MockResponses 流）：
             #    首 token 与末 chunk 在 Python 内存中迭代仅耗费毫秒级（如 0.01s~0.03s），
             #    此时若直接除以 raw_output_duration 会算出几万 t/s 的荒谬除零毛刺。
             #    当流式输出时长极短（< 0.15s 且 token 较多）或速度算出来超出物理极限（> 1000 t/s）时，
@@ -2896,8 +2876,8 @@ def __getattr__(name):
     - _token_usage_listener：set_token_usage_listener 运行期重绑的是
       core.llm_diagnostics 的模块全局，静态 re-export 会把导入时的 None 快照
       永久留在 core.llm 上误导内省；动态读取保证始终反映当前监听器。
-    - litellm / mcp_manager / TOOLS_SCHEMA：兼容别名，惰性求值，避免 import
-      core.llm 时就拉起 litellm（~1.4s）或 mcp 包全家桶（~1.1s）；不缓存到
+    - mcp_manager / TOOLS_SCHEMA：兼容别名，惰性求值，避免 import
+      core.llm 时就拉起 mcp 包全家桶（~1.1s）；不缓存到
       globals，保证外部属性访问始终反映当前值（测试 monkeypatch 友好）。
     """
     if name == "_token_usage_listener":
@@ -2905,8 +2885,6 @@ def __getattr__(name):
         return getattr(llm_diagnostics, "_token_usage_listener")
     if name == "TOOLS_SCHEMA":
         return get_tools_schema()
-    if name == "litellm":
-        return _get_litellm()
     if name == "mcp_manager":
         return _get_mcp_manager()
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

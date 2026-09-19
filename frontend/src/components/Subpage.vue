@@ -158,15 +158,29 @@
 
         <div class="model-section-title">添加模型</div>
         <div class="model-form">
-          <select v-model="newModel.provider_id" title="选择供应商" style="min-width:140px">
+          <select v-model="newModel.provider_id" title="选择供应商" style="min-width:140px" @change="subpageRemoteModels = null">
             <option value="" disabled>选择供应商</option>
             <option v-for="p in store.providerOptions" :key="p.id" :value="p.id">{{ p.name }}</option>
           </select>
           <input v-model="newModel.model_name" placeholder="模型名称" />
           <input v-model.number="newModel.context_window" type="number" min="0" placeholder="上下文窗口" style="width:120px" />
+          <button class="btn" :disabled="subpageFetchingModels" title="从厂商拉取可用模型列表" @click="fetchSubpageModels">
+            <span v-if="subpageFetchingModels" class="mini-spin"></span>获取模型列表
+          </button>
           <button class="btn primary" :disabled="addingModel" title="添加模型" @click="submitAddModel">
             <span v-if="addingModel" class="mini-spin"></span>添加模型
           </button>
+        </div>
+        <div v-if="subpageRemoteModels && subpageRemoteModels.length" class="model-form">
+          <select style="flex:1" data-test="subpage-remote-model-select" @change="pickSubpageModel">
+            <option value="">共 {{ subpageRemoteModels.length }} 个模型，点选自动填充（上下文/最大输出/多模态）</option>
+            <option v-for="entry in subpageRemoteModels" :key="entry.id" :value="entry.id">
+              {{ entry.id }}{{ entry.model_type ? `（${entry.model_type}）` : '' }}
+            </option>
+          </select>
+        </div>
+        <div class="model-form">
+          <input v-model.number="newModel.max_tokens" type="number" min="0" placeholder="最大输出（留空默认）" style="width:150px" />
         </div>
 
         <div class="model-section-title">已配置模型</div>
@@ -398,8 +412,47 @@ async function submitAddProvider() {
 }
 
 // ---- 模型管理：添加模型 ----
-const newModel = reactive({ provider_id: '', model_name: '', context_window: 32000 });
+const newModel = reactive({ provider_id: '', model_name: '', context_window: 32000, max_tokens: '' as number | '' });
 const addingModel = ref(false);
+
+// ---- 模型管理：获取模型列表一键填充 ----
+const subpageRemoteModels = ref<{ id: string; model_type?: string; context_window?: number | null; supports_vision?: boolean | null; max_tokens?: number | null }[] | null>(null);
+const subpageFetchingModels = ref(false);
+
+async function fetchSubpageModels() {
+  if (!newModel.provider_id) {
+    store.notifyModal('获取模型列表', '请先选择供应商');
+    return;
+  }
+  if (subpageFetchingModels.value) return;
+  subpageFetchingModels.value = true;
+  try {
+    const res = await store.fetchProviderModels(newModel.provider_id);
+    if (res?.ok) {
+      subpageRemoteModels.value = res.models || [];
+      if (!subpageRemoteModels.value.length) {
+        store.notifyModal('获取模型列表', '服务端返回了空列表');
+      }
+    } else {
+      store.notifyModal('获取模型列表', res?.msg || '未知错误');
+    }
+  } finally {
+    subpageFetchingModels.value = false;
+  }
+}
+
+function pickSubpageModel(event: Event) {
+  const value = (event.target as HTMLSelectElement).value;
+  if (!value) return;
+  newModel.model_name = value;
+  // 厂商元数据 + 本地规格表：能填的都填（未提供的字段保持表单原值）
+  const entry = (subpageRemoteModels.value || []).find((m) => m.id === value);
+  if (!entry) return;
+  if (entry.context_window && entry.context_window > 0) {
+    newModel.context_window = entry.context_window;
+  }
+  newModel.max_tokens = entry.max_tokens && entry.max_tokens > 0 ? entry.max_tokens : '';
+}
 
 async function submitAddModel() {
   if (!newModel.provider_id || !newModel.model_name.trim()) {
@@ -408,10 +461,12 @@ async function submitAddModel() {
   }
   addingModel.value = true;
   try {
-    // M34 修复：同上，addModel 成功才清空表单
-    const res = await store.addModel(newModel.provider_id, newModel.model_name.trim(), Number(newModel.context_window) || 0);
+    // M34 修复：同上，addModel 成功才清空表单；最大输出留空 = null（走内置默认）
+    const maxTokens = newModel.max_tokens === '' ? null : Number(newModel.max_tokens);
+    const res = await store.addModel(newModel.provider_id, newModel.model_name.trim(), Number(newModel.context_window) || 0, false, true, '', maxTokens);
     if (res && res.ok) {
       newModel.model_name = '';
+      newModel.max_tokens = '';
     }
   } finally {
     addingModel.value = false;

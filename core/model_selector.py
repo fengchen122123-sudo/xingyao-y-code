@@ -47,7 +47,7 @@ STYLE = Style.from_dict({
     "focused  cursor-column": "bg:#2a3a4a",
 })
 
-from core.model_catalog import get_preset_providers, litellm_model_name, protocol_choices
+from core.model_catalog import get_preset_providers, provider_route_name, protocol_choices
 
 PROTOCOLS = protocol_choices()
 PRESET_PROVIDERS = get_preset_providers()
@@ -58,7 +58,7 @@ def _test_model_connection(protocol: str, model: str, base_url: str, api_key: st
     from core.llm import _request_stream
 
     kwargs = {
-        "model": litellm_model_name(protocol, model),
+        "model": provider_route_name(protocol, model),
         "messages": [{"role": "user", "content": "ping"}],
         "max_tokens": 5,
         "stream": True,

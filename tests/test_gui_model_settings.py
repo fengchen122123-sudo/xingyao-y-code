@@ -112,51 +112,8 @@ def test_add_preset_provider_returns_refreshed_snapshot(tmp_path, monkeypatch):
     )
     assert kimi["protocol"] == "openai"
     assert kimi["has_api_key"] is True
-    # kimi-for-coding 已在预置目录登记为多模态模型，断言按名字定位以免受顺序影响
-    model = next(m for m in kimi["models"] if m["name"] == "kimi-for-coding")
-    assert model["supports_vision"] is True
-
-
-def test_sync_preset_models_for_removed_preset_returns_readable_message(tmp_path, monkeypatch):
-    """预置厂商已从目录移除时，GUI 必须给出可读提示，而不是裸 KeyError 文本。"""
-    _use_tmp_config(
-        tmp_path,
-        monkeypatch,
-        {
-            "active_model_id": None,
-            "providers": [
-                {
-                    "id": "p1",
-                    "name": "火山CodingPlan",
-                    "base_url": "https://ark.cn-beijing.volces.com/api/coding",
-                    "api_key": "sk-old",
-                    "protocol": "anthropic",
-                    "preset_id": "volcengine-coding-plan",
-                    "models": [],
-                }
-            ],
-        },
-    )
-
-    result = _bare_bridge().sync_preset_models("volcengine-coding-plan")
-
-    assert result["ok"] is False
-    assert "预置目录" in result["msg"]
-    assert "KeyError" not in result["msg"]
-    assert result["msg"] != "'volcengine-coding-plan'"
-
-
-def test_sync_preset_models_for_known_preset_still_reports_success(tmp_path, monkeypatch):
-    """兜底不得误伤正常同步：仍在预置目录中的厂商照常返回成功。"""
-    _use_tmp_config(tmp_path, monkeypatch, {"active_model_id": None, "providers": []})
-    bridge = _bare_bridge()
-    bridge.add_preset_provider("kimi-coding-openai", "sk-new")
-
-    result = bridge.sync_preset_models("kimi-coding-openai")
-
-    assert result["ok"] is True
-    assert result["added"] == 0
-    assert result["msg"] == "预置模型已是最新"
+    # 预置厂商只预填厂商信息，模型列表为空（用户经「获取模型列表」添加）
+    assert kimi["models"] == []
 
 
 def test_add_and_update_model_persist_multimodal_flag(tmp_path, monkeypatch):
@@ -192,22 +149,12 @@ def test_responses_model_test_uses_responses_protocol(tmp_path, monkeypatch):
         )
         return [SimpleNamespace(type="response.completed", response=response)]
 
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
     monkeypatch.setattr(
         llm,
         "completion",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("不得调用 completion")),
     )
-    monkeypatch.setattr(
-        llm,
-        "_get_litellm",
-        lambda: SimpleNamespace(
-            completion=lambda **kwargs: (_ for _ in ()).throw(
-                AssertionError("不得调用 completion")
-            )
-        ),
-    )
-
     result = _bare_bridge().test_model("m1")
 
     assert result == {"ok": True, "msg": "连接成功"}
@@ -457,3 +404,231 @@ def test_all_models_reports_unset_protocol_as_empty_string(tmp_path, monkeypatch
     models = bridge.get_model_settings()["models"]
     model_one = next(model for model in models if model["name"] == "model-one")
     assert model_one["computer_protocol"] == ""
+
+
+def test_fetch_provider_models_returns_sorted_list(tmp_path, monkeypatch):
+    """「获取模型列表」：正常路径返回模型 ID 列表，语音/图像类排到末尾。"""
+    import httpx
+
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "data": [
+                    {"id": "zeta-tts", "model_type": "语音合成"},
+                    {"id": "Beta", "model_type": "大语言模型"},
+                    {"id": "alpha", "model_type": "大语言模型"},
+                ]
+            }
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        captured["headers"] = headers
+        captured["timeout"] = timeout
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    assert [m["id"] for m in result["models"]] == ["alpha", "Beta", "zeta-tts"]
+    assert result["models"][0]["model_type"] == "大语言模型"
+    assert result["count"] == 3
+    # 双鉴权头兼容 OpenAI 网关（Bearer）与 Anthropic 端点（x-api-key）
+    assert captured["url"] == "https://api.example.com/v1/models"
+    assert captured["headers"]["Authorization"] == "Bearer sk-secret-value"
+    assert captured["headers"]["x-api-key"] == "sk-secret-value"
+
+
+def test_fetch_provider_models_reports_http_error(tmp_path, monkeypatch):
+    import httpx
+
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+
+    class _FakeResponse:
+        status_code = 401
+        text = '{"error":"invalid key"}'
+
+    monkeypatch.setattr(httpx, "get", lambda url, headers=None, timeout=None: _FakeResponse())
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is False
+    assert "401" in result["msg"]
+    assert "invalid key" in result["msg"]
+
+
+def test_fetch_provider_models_unknown_provider(tmp_path, monkeypatch):
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+
+    result = _bare_bridge().fetch_provider_models("no-such-provider")
+
+    assert result["ok"] is False
+    assert "未找到供应商" in result["msg"]
+
+
+def test_fetch_provider_models_handles_v1_base_url(tmp_path, monkeypatch):
+    """base_url 已含版本段（…/v1）时不得重复拼接（/v1/v1/models 404 教训）。"""
+    import httpx
+
+    data = _configured_data()
+    data["providers"][0]["base_url"] = "https://api.example.com/v1"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "m-a"}]}
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["url"] = url
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    assert captured["url"] == "https://api.example.com/v1/models"
+
+
+def test_fetch_provider_models_extracts_context_and_vision(tmp_path, monkeypatch):
+    """元数据提取：阶跃 max_input_tokens/enable_vision_input 形状与
+    OpenRouter context_length/architecture.input_modalities 形状都要能填表；
+    缺元数据的条目返回 None（前端保持表单原值）。"""
+    import httpx
+
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "data": [
+                    {
+                        "id": "step-x",
+                        "model_type": "大语言模型",
+                        "max_input_tokens": 1024000,
+                        "enable_vision_input": True,
+                    },
+                    {
+                        "id": "or-y",
+                        "context_length": 131072,
+                        "architecture": {"input_modalities": ["text", "image"]},
+                    },
+                    {"id": "plain-z"},
+                ]
+            }
+
+    monkeypatch.setattr(httpx, "get", lambda url, headers=None, timeout=None: _FakeResponse())
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    by_id = {m["id"]: m for m in result["models"]}
+    assert by_id["step-x"]["context_window"] == 1024000
+    assert by_id["step-x"]["supports_vision"] is True
+    assert by_id["or-y"]["context_window"] == 131072
+    assert by_id["or-y"]["supports_vision"] is True
+    assert by_id["plain-z"]["context_window"] is None
+    assert by_id["plain-z"]["supports_vision"] is None
+
+
+def test_model_max_tokens_roundtrip(tmp_path, monkeypatch):
+    """最大输出：快照回显、新增写入、更新改值、0 清除回内置默认。"""
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    bridge = _bare_bridge()
+    cfg = tmp_path / "config.json"
+
+    added = bridge.add_model(
+        "p1", "model-cap", 200000, True, True, "", 65536
+    )
+    assert added["ok"] is True
+    stored = next(
+        model
+        for provider in json.loads(cfg.read_text(encoding="utf-8"))["providers"]
+        for model in provider["models"]
+        if model["id"] == added["model_id"]
+    )
+    assert stored["max_tokens"] == 65536
+    assert added["settings"]["models"][0]["max_tokens"] is None  # 旧模型未设置
+
+    # 改值
+    updated = bridge.update_model(
+        "p1", added["model_id"], "model-cap", 200000, True, True, "", 131072
+    )
+    assert updated["ok"] is True
+    stored = next(
+        model
+        for provider in json.loads(cfg.read_text(encoding="utf-8"))["providers"]
+        for model in provider["models"]
+        if model["id"] == added["model_id"]
+    )
+    assert stored["max_tokens"] == 131072
+
+    # 0 = 清除键，回到内置默认
+    cleared = bridge.update_model(
+        "p1", added["model_id"], "model-cap", 200000, True, True, "", 0
+    )
+    assert cleared["ok"] is True
+    stored = next(
+        model
+        for provider in json.loads(cfg.read_text(encoding="utf-8"))["providers"]
+        for model in provider["models"]
+        if model["id"] == added["model_id"]
+    )
+    assert "max_tokens" not in stored
+    snapshot_item = next(
+        m for m in cleared["settings"]["models"] if m["id"] == added["model_id"]
+    )
+    assert snapshot_item["max_tokens"] is None
+
+    # 非法负值拒绝
+    rejected = bridge.update_model(
+        "p1", added["model_id"], "model-cap", 200000, True, True, "", -5
+    )
+    assert rejected["ok"] is False
+    assert "正整数" in rejected["msg"]
+
+
+def test_fetch_provider_models_enriches_from_spec_table(tmp_path, monkeypatch):
+    """厂商未提供元数据的字段由本地规格表回填（官方文档核实值）；
+    厂商自带元数据永远优先。"""
+    import httpx
+
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {
+                "data": [
+                    {"id": "deepseek-flash"},
+                    {"id": "step-x", "max_input_tokens": 1000},
+                    {"id": "unknown-model-xyz"},
+                ]
+            }
+
+    monkeypatch.setattr(httpx, "get", lambda url, headers=None, timeout=None: _FakeResponse())
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    by_id = {m["id"]: m for m in result["models"]}
+    # 规格表回填（deepseek-flash = 1M / 384K，官方定价页核实值）
+    assert by_id["deepseek-flash"]["context_window"] == 1048576
+    assert by_id["deepseek-flash"]["max_tokens"] == 384000
+    # 厂商自带上下文优先于规格表；step-x 不在规格表 → 输出 None
+    assert by_id["step-x"]["context_window"] == 1000
+    assert by_id["step-x"]["max_tokens"] is None
+    # 两边都没有 → 保持 None，由前端留空走内置默认
+    assert by_id["unknown-model-xyz"]["context_window"] is None
+    assert by_id["unknown-model-xyz"]["max_tokens"] is None

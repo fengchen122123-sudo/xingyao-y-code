@@ -5,7 +5,6 @@
 多段，逐段与累积摘要合并，每次请求都必须落在窗口内。
 """
 
-import types
 
 import pytest
 
@@ -72,7 +71,7 @@ def test_long_history_is_compressed_in_window_sized_chunks(manager, monkeypatch)
         prompts.append(kwargs["messages"][0]["content"])
         return _Resp(f"第 {len(prompts)} 段摘要")
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
 
     assert compress_session_memory(
         manager, "chunk-session", "fake/compress-model", "k", "", output_callback=lambda m: None
@@ -104,7 +103,7 @@ def test_chunked_merge_carries_summary_forward(manager, monkeypatch):
         prompts.append(kwargs["messages"][0]["content"])
         return _Resp(f"摘要v{len(prompts)}")
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
     compress_session_memory(
         manager, "chunk-session", "fake/compress-model", "k", "", output_callback=lambda m: None
     )
@@ -126,7 +125,7 @@ def test_single_chunk_keeps_first_summary_length(manager, monkeypatch):
         prompts.append(kwargs["messages"][0]["content"])
         return _Resp("单一摘要")
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
     assert compress_session_memory(
         manager, "chunk-session", "fake/compress-model", "k", "", output_callback=lambda m: None
     ) is True
@@ -144,7 +143,7 @@ def test_compression_request_uses_token_adaptive_timeout(manager, monkeypatch):
         return _Resp("单一摘要")
 
     monkeypatch.setattr(mc, "_compression_request_timeout", lambda _tokens: 321)
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
 
     assert compress_session_memory(
         manager,
@@ -172,7 +171,7 @@ def test_empty_chunk_result_aborts_without_touching_db(manager, monkeypatch):
     def fake_completion(**kwargs):
         return _Resp(next(replies))
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
     outcome = compress_session_memory(
         manager, "chunk-session", "fake/compress-model", "k", "",
         output_callback=lambda m: None, return_outcome=True,
@@ -218,7 +217,7 @@ def test_chinese_long_message_truncated_by_token_not_chars(manager, monkeypatch)
         prompts.append(kwargs["messages"][0]["content"])
         return _Resp("摘要")
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
     compress_session_memory(
         manager, "chunk-session", "fake/compress-model", "k", "", output_callback=lambda m: None
     )
@@ -241,22 +240,7 @@ def test_compression_budget_capped_at_max_chunk_budget():
     assert mc._compression_chunk_budget(4096) == 1024
 
 
-@pytest.fixture
-def fast_litellm(monkeypatch):
-    """给 is_rate_limit_error 的 isinstance 分支提供轻量替身，避免真实
-    import litellm（约 1.4s）。真实 litellm 异常链路由
-    test_rate_limit_detection_covers_real_litellm_exception_chain 专门覆盖。"""
-    class _RateLimitError(Exception):
-        pass
-
-    fake = types.SimpleNamespace(
-        exceptions=types.SimpleNamespace(RateLimitError=_RateLimitError)
-    )
-    monkeypatch.setattr("core.llm._get_litellm", lambda: fake)
-    return fake
-
-
-def test_chunk_rate_limit_backoff_retry(manager, monkeypatch, fast_litellm):
+def test_chunk_rate_limit_backoff_retry(manager, monkeypatch):
     """测试当单段遭遇 429 RateLimit 时能够指数退避重试并成功。"""
     _seed_history(manager, 12, filler=3)
     attempts = 0
@@ -275,7 +259,7 @@ def test_chunk_rate_limit_backoff_retry(manager, monkeypatch, fast_litellm):
             raise Exception("RateLimitError: 429 Too Many Requests - 请求过于频繁")
         return _Resp("重试成功摘要")
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
 
     notices = []
     assert compress_session_memory(
@@ -286,19 +270,6 @@ def test_chunk_rate_limit_backoff_retry(manager, monkeypatch, fast_litellm):
     assert attempts == 2
     assert len(sleeps) >= 1
     assert any("429" in n or "速率限制" in n for n in notices)
-
-
-def test_rate_limit_detection_covers_real_litellm_exception_chain():
-    """不 patch 的用例：is_rate_limit_error 对真实 litellm RateLimitError 实例
-    的 isinstance 判定必须有效（保留真实异常链路覆盖）。"""
-    from core.llm import is_rate_limit_error, _get_litellm
-
-    litellm = _get_litellm()
-    err = litellm.exceptions.RateLimitError(
-        message="Rate limited", llm_provider="openai", model="fake-model"
-    )
-    is_rl, _retry_after = is_rate_limit_error(err)
-    assert is_rl is True
 
 
 def test_chunk_rate_limit_respects_retry_after(manager, monkeypatch):
@@ -328,7 +299,7 @@ def test_chunk_rate_limit_respects_retry_after(manager, monkeypatch):
             raise RateLimitWithHeader()
         return _Resp("重试成功摘要")
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
 
     assert compress_session_memory(
         manager, "chunk-session", "fake/compress-model", "k", "",
@@ -370,7 +341,7 @@ def test_partial_progress_is_committed_when_budget_exceeded(manager, monkeypatch
         calls["n"] += 1
         clock["t"] += 90.0                          # 每段假装耗时 90s
         return _Resp("第 %d 段摘要内容" % calls["n"])
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
     monkeypatch.setattr(mc, "_cancellable_sleep", lambda *a, **kw: True)
 
     def read():

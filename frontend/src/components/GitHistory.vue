@@ -93,11 +93,11 @@ async function apiSafe(name: string, ...args: unknown[]) {
   cursor: pointer; font-size: 12px;
 }
 .git-commit-row:hover, .git-commit-row.selected { background: rgba(127,127,127,.14); }
-.git-graph { width: 14px; text-align: center; color: #64b5f6; font-family: monospace; }
-.git-graph.merge { color: #e5a037; }
+.git-graph { width: 14px; text-align: center; color: var(--accent); font-family: monospace; }
+.git-graph.merge { color: var(--yellow); }
 .git-commit-short { font-family: monospace; color: var(--text-dim, #888); }
 .git-commit-summary { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.git-commit-refs { color: #7ec97e; font-size: 11px; }
+.git-commit-refs { color: var(--green); font-size: 11px; }
 .git-file-row { display: flex; align-items: center; gap: 6px; padding: 2px 4px; border-radius: 4px; }
 .git-group-title { font-size: 12px; color: var(--text-dim, #888); margin: 6px 0 2px; }
 .git-mini {

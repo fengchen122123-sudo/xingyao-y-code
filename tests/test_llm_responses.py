@@ -1,3 +1,4 @@
+import enum
 from types import SimpleNamespace
 
 import pytest
@@ -126,12 +127,12 @@ def test_responses_stream_normalizes_text_reasoning_tools_and_usage():
 
 
 def test_responses_bridge_enum_typed_events_are_normalized():
-    """litellm chat→responses 桥接（DeepSeek 等 chat-only provider）合成事件的
-    type 是 ResponsesAPIStreamEvents 枚举成员而非字符串，必须按 .value 归一化。"""
-    try:
-        from litellm.types.llms.openai import ResponsesAPIStreamEvents
-    except ImportError:  # pragma: no cover - litellm 缺失时跳过
-        pytest.skip("litellm types 不可用")
+    """网关/桥接实现合成事件的 type 若是枚举成员而非字符串（str() 得到成员名），
+    必须按 .value 归一化，否则映射器全部失配。"""
+    class ResponsesAPIStreamEvents(enum.Enum):
+        RESPONSE_CREATED = "response.created"
+        OUTPUT_TEXT_DELTA = "response.output_text.delta"
+        RESPONSE_COMPLETED = "response.completed"
 
     completed = SimpleNamespace(
         usage=SimpleNamespace(
@@ -156,7 +157,7 @@ def test_responses_bridge_enum_typed_events_are_normalized():
 
 
 def test_responses_completed_output_function_call_is_emitted():
-    """litellm chat→responses 桥接（DeepSeek 等 chat-only provider）是非流式合成：
+    """Responses 桥接（DeepSeek 等 chat-only provider）是非流式合成：
     整个流只有 1 个 response.completed，function_call 完整放在 response.output[] 里，
     没有 output_item.added / arguments.delta 事件。completed 分支必须从 output[]
     提取 function_call，否则工具调用被静默吞掉、回合以 finish_reason=stop 结束。"""
@@ -281,10 +282,10 @@ def test_responses_protocol_calls_native_responses_api(monkeypatch):
         captured.update(kwargs)
         return []
 
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
     monkeypatch.setattr(
         llm,
-        "_litellm_completion",
+        "_dispatch_completion",
         lambda **kwargs: (_ for _ in ()).throw(AssertionError("不得降级到 completion")),
     )
 
@@ -326,7 +327,7 @@ def test_chat_event_gateway_uses_configured_responses_protocol(monkeypatch):
         ]
 
     monkeypatch.setattr(model_manager, "get_model_protocol", lambda *_: "responses")
-    monkeypatch.setattr(llm, "_litellm_responses", fake_responses)
+    monkeypatch.setattr(llm, "_dispatch_responses", fake_responses)
 
     events = list(
         llm.chat_with_model_events(

@@ -155,7 +155,7 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   （`_inflight_streams` 注册表），停止路径（GUI stop / CLI Ctrl+C / 子代理 `_terminate`）
   先 set cancel_event 再调 `abort_inflight_streams()` 直接关闭底层流，阻塞读立即抛错退出，
   不再静默接收数据直到请求超时。铁律：只关单个 response 流（逐层探测 close/completion_stream/
-  response），绝不触碰 litellm 共享连接池；关闭动作吞掉一切异常；先 set 事件再 abort，
+  response），绝不触碰共享 HTTP 连接池；关闭动作吞掉一切异常；先 set 事件再 abort，
   让被关闭一侧归一为用户取消（KeyboardInterrupt 打捞路径）而非网络错误重试。
 
 - 铁律：请求路径绝不改写历史中间字节；任何历史改写必须一次性、幂等、DB 层完成。

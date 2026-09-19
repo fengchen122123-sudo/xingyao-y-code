@@ -403,7 +403,7 @@ def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
                          api_base="", cache_scope="legacy"):
     """把本轮真实 token 用量追加到本地 token_usage 表，供 /usage 按模型/日期统计。
 
-    失败仅记日志，绝不影响对话主流程。model_name 为 litellm 模型串
+    失败仅记日志，绝不影响对话主流程。model_name 为 provider 路由模型串
     （如 "openai/deepseek-v4-pro"），按第一个 "/" 拆出 provider 与 model。
     """
     try:

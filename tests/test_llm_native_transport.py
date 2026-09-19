@@ -248,12 +248,13 @@ class _FakeClient:
         self.last_payload = None
         self.last_url = None
 
-    def build_request(self, method, url, headers=None, json=None):
+    def build_request(self, method, url, headers=None, json=None, timeout=None):
         self.last_payload = json
         self.last_url = url
+        self.last_timeout = timeout
         return object()
 
-    def send(self, req, stream=False, timeout=None):
+    def send(self, req, stream=False):
         return self._response
 
 
@@ -270,7 +271,7 @@ _SYNC_PAYLOAD = {
 
 
 def test_native_completion_defaults_to_non_stream(monkeypatch):
-    """不传 stream 时必须按非流式处理（litellm.completion 契约），
+    """不传 stream 时必须按非流式处理（completion 契约），
     返回可直接取 .choices 的完整响应。"""
     client = _FakeClient(_FakeHttpResponse(payload=_SYNC_PAYLOAD))
     monkeypatch.setattr(nt, "_client_instance", client)
@@ -320,36 +321,33 @@ def test_native_completion_passes_reasoning_effort_and_warns_unknown(monkeypatch
     assert "mystery_param" in caplog.text
 
 
-def test_litellm_completion_routes_unsupported_models(monkeypatch):
-    """o1/o3、litellm provider 前缀（azure/ 等）、anthropic/ 留在 litellm；
-    常规 OpenAI 兼容路由进 native。"""
+def test_dispatch_completion_routes_unsupported_models(monkeypatch):
+    """自研引擎路由契约：不支持的路由（o1/o3、azure/ 等厂商云路由）
+    显式抛 NativeLLMError（绝无静默兜底）；OpenAI 兼容与 anthropic/
+    前缀路由进 native。"""
+    import pytest
+
     from core import llm_transport
+    from core.llm_native_transport import NativeLLMError
 
-    class _FakeLitellm:
-        def __init__(self):
-            self.calls = []
-
-        def completion(self, **kwargs):
-            self.calls.append(kwargs)
-            return "LITELLM_RESULT"
-
-    fake_litellm = _FakeLitellm()
-    monkeypatch.setattr(llm_transport, "_litellm_module", fake_litellm)
     monkeypatch.setattr(
         nt, "native_completion", lambda **kw: (_ for _ in ()).throw(AssertionError("不应进 native"))
     )
 
-    for model in ("o1-preview", "openai/o3-mini", "anthropic/claude-x", "azure/gpt-4o"):
-        result = llm_transport._litellm_completion(model=model, messages=[])
-        assert result == "LITELLM_RESULT", model
+    for model in ("o1-preview", "openai/o3-mini", "azure/gpt-4o", "gemini/gemini-pro"):
+        with pytest.raises(NativeLLMError, match="不在自研引擎支持范围"):
+            llm_transport._dispatch_completion(model=model, messages=[])
 
-    # 常规模型进 native（native_completion 已被 mock 为哨兵）
+    # 常规与 anthropic 路由进 native（native_completion 已被 mock 为哨兵）
     monkeypatch.setattr(nt, "native_completion", lambda **kw: "NATIVE_RESULT")
-    assert llm_transport._litellm_completion(
+    assert llm_transport._dispatch_completion(
         model="deepseek-chat", messages=[]
     ) == "NATIVE_RESULT"
-    assert llm_transport._litellm_completion(
+    assert llm_transport._dispatch_completion(
         model="openai/gpt-4o", messages=[]
+    ) == "NATIVE_RESULT"
+    assert llm_transport._dispatch_completion(
+        model="anthropic/step-3.7-flash", messages=[]
     ) == "NATIVE_RESULT"
 
 

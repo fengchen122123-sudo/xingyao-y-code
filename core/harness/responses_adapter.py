@@ -43,7 +43,7 @@ def _merge_stream_response_id(current, seen):
 
 
 def _plain_value(value):
-    """把 litellm 事件对象树规范化为纯 dict/list/标量（computer_call 载荷用）。"""
+    """把上游事件对象树规范化为纯 dict/list/标量（computer_call 载荷用）。"""
     if isinstance(value, dict):
         return {key: _plain_value(item) for key, item in value.items()}
     if isinstance(value, (list, tuple)):
@@ -84,9 +84,9 @@ def _responses_stream_as_chat_chunks(events):
 def _normalize_responses_event_type(event_type) -> str:
     """Responses 事件 type 统一归一化为 'response.*' 字符串。
 
-    上游原生流事件的 type 是裸字符串；而 litellm 在需要自己合成事件流的路径上
-    （如 fake_stream：模型未登记原生流式能力时，改发非流式请求再由
-    MockResponsesAPIStreamingIterator 合成），合成事件的 type 直接填
+    上游原生流事件的 type 是裸字符串；而某些网关/桥接实现自己合成事件流的
+    路径上（如 fake_stream：模型未登记原生流式能力时，改发非流式请求再
+    合成事件流），合成事件的 type 直接填
     ResponsesAPIStreamEvents 枚举成员，str() 得到的是成员名
     （如 'ResponsesAPIStreamEvents.RESPONSE_COMPLETED'）而非事件值，必须用
     .value 还原，否则映射器全部失配。
@@ -179,7 +179,7 @@ def _responses_events_as_chat_chunks(events):
             response_id = _merge_stream_response_id(
                 response_id, _obj_value(response, "id", "")
             )
-            # fake_stream 合成路径（litellm 认为模型无原生流式能力时改发非流式
+            # fake_stream 合成路径（网关认为模型无原生流式能力时改发非流式
             # 请求再合成事件，如 openai/deepseek-flash）只在 completed 的 output[]
             # 里给出完整工具调用，没有 added/delta 事件，必须在此兜底提取；
             # 真流式路径 output[] 与 added 事件重复，按 call_id 去重。
