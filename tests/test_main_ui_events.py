@@ -943,7 +943,6 @@ def test_background_worker_survives_malformed_task(monkeypatch):
 
 def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
     """防回归：trigger_session_auto_rename 不得残留已删除函数的 return 语句（NameError）。"""
-    import litellm
 
     class ImmediateThread:
         def __init__(self, target, daemon):
@@ -963,7 +962,9 @@ def test_trigger_session_auto_rename_has_no_stale_return(monkeypatch):
 
     scheduled = []
     monkeypatch.setattr(main.threading, "Thread", ImmediateThread)
-    monkeypatch.setattr(litellm, "completion", lambda **kwargs: FakeResponse())
+    monkeypatch.setattr(
+        "core.llm_native_transport.native_completion", lambda **kwargs: FakeResponse()
+    )
     monkeypatch.setattr(main.manager, "rename_session", lambda session, title: (True, title))
     monkeypatch.setattr(main, "schedule_ui", scheduled.append)
     monkeypatch.setattr(main, "print_formatted_text", lambda *args, **kwargs: None)

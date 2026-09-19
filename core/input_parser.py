@@ -195,7 +195,7 @@ def parse_user_input(text, explicit_paths=None, session_id=None):
     """
     解析用户输入中的文件路径（包括 @文件 和绝对路径）。
     返回 (处理后的最终 content, 附加的系统提示字符串列表)
-    content 如果包含图片，将返回 LiteLLM/OpenAI 兼容的 list 结构。
+    content 如果包含图片，将返回 OpenAI 兼容的 list 结构。
     explicit_paths: 来自 UI 显式选择或拖拽的附件列表（用户明确授权，不受沙盒越界限制）。
     """
     if explicit_paths:

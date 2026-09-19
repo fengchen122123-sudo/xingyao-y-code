@@ -38,6 +38,7 @@ from core.media_store import archive_media_file
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
+from gui_git_mixin import GitBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -54,7 +55,6 @@ from core.model_manager import (
     set_secondary_roles,
     update_model as mm_update_model,
     update_provider as mm_update_provider,
-    sync_preset_provider_models as mm_sync_preset_provider_models,
 )
 from core.model_catalog import API_PROTOCOLS, get_preset_providers
 from core.reasoning_capabilities import build_reasoning_snapshot
@@ -480,7 +480,7 @@ def _media_save_filename(suggested_name: str, ext: str) -> str:
     return (name or "ycode-image") + ext
 
 
-class ApiBridge:
+class ApiBridge(GitBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
@@ -490,6 +490,12 @@ class ApiBridge:
         # 内部状态变量使用下划线开头，防止 PyWebView 在 Windows .NET 检查中产生属性递归问题
         self._window = None
         self._dropped_paths: list = []
+        # Git 工作台桥接状态（gui_git_mixin.GitBridgeMixin，惰性初始化）
+        self._git_svc = None
+        self._git_monitor = None
+        self._git_subs = {}
+        self._git_versions = {}
+        self._git_serialized = {}
         # GUI 专用会话库：与 CLI 的 ycode.db 分离，两边对话互不同步
         self._memory = MemoryManager(db_path=GUI_DB_FILE)
         # 修复：形参曾经遮蔽模块级单例，导致 self._mcp 永远是 None
@@ -7282,6 +7288,10 @@ class ApiBridge:
                         model.get("supports_function_calling", False)
                     ),
                     "computer_protocol": str(model.get("computer_protocol") or ""),
+                    # 最大输出：缺省 None（前端输入框留空 = 使用内置默认）
+                    "max_tokens": (
+                        int(model["max_tokens"]) if model.get("max_tokens") else None
+                    ),
                 }
                 provider_models.append(item)
                 models.append(dict(item))
@@ -7336,38 +7346,6 @@ class ApiBridge:
             }
         except Exception as e:
             logger.exception("add_preset_provider 失败")
-            return {"ok": False, "msg": str(e)}
-
-    def sync_preset_models(self, preset_id: str) -> Dict[str, Any]:
-        """把预置目录中该厂商的模型合并进用户配置（追加缺失+刷新目录元数据）。"""
-        try:
-            counts = mm_sync_preset_provider_models(str(preset_id))
-            added = int(counts.get("added", 0))
-            updated = int(counts.get("updated", 0))
-            self._sync_active_model_context()
-            parts = []
-            if added:
-                parts.append(f"新增 {added} 个模型")
-            if updated:
-                parts.append(f"更新 {updated} 个模型参数")
-            msg = "，".join(parts) if parts else "预置模型已是最新"
-            return {
-                "ok": True,
-                "added": added,
-                "updated": updated,
-                "settings": self.get_model_settings(),
-                "msg": msg,
-            }
-        except KeyError:
-            # 预置目录随版本更新会下架厂商，旧 config 中的 preset_id 于是成为未知厂商。
-            # 这是可预期状态：给前端可读提示，不按异常记录堆栈。
-            logger.info("预置厂商 %s 不在当前预置目录中，跳过同步", preset_id)
-            return {
-                "ok": False,
-                "msg": "该厂商已不在预置目录中，无法自动同步；可在该厂商下手动添加模型",
-            }
-        except Exception as e:
-            logger.exception("sync_preset_models 失败")
             return {"ok": False, "msg": str(e)}
 
     def add_provider(self, name: str, base_url: str, api_key: str, protocol: str) -> Dict[str, Any]:
@@ -7441,8 +7419,9 @@ class ApiBridge:
         model_name: str,
         context_window: int = 128000,
         supports_vision: bool = False,
-        supports_function_calling: bool = False,
+        supports_function_calling: bool = True,
         computer_protocol: str = "",
+        max_tokens: int | None = None,
     ) -> Dict[str, Any]:
         try:
             if not str(model_name or "").strip():
@@ -7454,7 +7433,12 @@ class ApiBridge:
                 window = int(context_window or 128000)
             except (TypeError, ValueError):
                 window = 128000
-            # LiteLLM 传输前缀与厂商作用域模型 ID 的拼接规则由 model_manager 统一处理。
+            try:
+                # 最大输出：空/0 = 不落键（请求时走内置默认表）
+                normalized_max_tokens = max(int(max_tokens), 0) or None if max_tokens is not None else None
+            except (TypeError, ValueError):
+                normalized_max_tokens = None
+            # 传输前缀与厂商作用域模型 ID 的拼接规则由 model_manager 统一处理。
             # computer_protocol 缺省/"" = 自动（不落键，视觉+工具调用即启用），
             # 不得强转 "none"（旧实现导致新视觉模型永不自动激活）。
             model_id = add_model_to_provider(
@@ -7464,6 +7448,7 @@ class ApiBridge:
                 supports_vision=bool(supports_vision),
                 supports_function_calling=bool(supports_function_calling),
                 computer_protocol=str(computer_protocol or ""),
+                max_tokens=normalized_max_tokens,
             )
             self._sync_active_model_context()
             return {
@@ -7486,6 +7471,7 @@ class ApiBridge:
         supports_vision: bool,
         supports_function_calling: bool | None = None,
         computer_protocol: str | None = None,
+        max_tokens: int | None = None,
     ) -> Dict[str, Any]:
         try:
             mm_update_model(
@@ -7497,6 +7483,7 @@ class ApiBridge:
                 # None 表示保留既有值（model_manager 语义），旧前端调用不受影响
                 supports_function_calling=supports_function_calling,
                 computer_protocol=computer_protocol,
+                max_tokens=max_tokens,
             )
             self._sync_active_model_context()
             return {"ok": True, "settings": self.get_model_settings(), "msg": "模型已更新"}
@@ -7518,6 +7505,142 @@ class ApiBridge:
             }
         except Exception as e:
             logger.exception("delete_model 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def fetch_provider_models(self, provider_id: str) -> Dict[str, Any]:
+        """拉取厂商端点的可用模型列表（GET {base_url}/v1/models），供添加模型时一键填充。
+
+        与对话请求链路完全独立：短超时、一次性 httpx 请求，不触碰共享连接池。
+        鉴权头同时携带 Bearer 与 x-api-key——OpenAI 网关认 Bearer，Anthropic
+        兼容端点认 x-api-key（实测阶跃 /v1/models 单发 x-api-key 会 401）。
+        """
+        try:
+            real_provider_id = self._resolve_provider_id(provider_id)
+            if real_provider_id is None:
+                return {"ok": False, "msg": f"未找到供应商: {provider_id}"}
+            provider = None
+            for p in load_config().get("providers", []):
+                if str(p.get("id")) == str(real_provider_id):
+                    provider = p
+                    break
+            if provider is None:
+                return {"ok": False, "msg": "厂商不存在"}
+            base_url = str(provider.get("base_url") or "").strip()
+            if not base_url:
+                return {"ok": False, "msg": "该厂商未配置 Base URL"}
+            api_key = str(provider.get("api_key") or "")
+            # base_url 可能已含版本段（OpenAI 惯例 …/v1，阶跃 step_plan/v1），
+            # 也可能是裸端点（如 …/step_plan）：前者直接拼 /models，后者补 /v1/models，
+            # 绝不能重复拼出版本段（曾出现 /v1/v1/models 404）。
+            base = base_url.rstrip("/")
+            url = (base + "/models") if base.endswith("/v1") else (base + "/v1/models")
+            headers = {"accept": "application/json"}
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+                headers["x-api-key"] = api_key
+            import httpx as _httpx
+
+            try:
+                resp = _httpx.get(url, headers=headers, timeout=15.0)
+            except Exception as exc:
+                return {"ok": False, "msg": f"无法连接 {base_url}: {exc}"}
+            if resp.status_code != 200:
+                body = (resp.text or "").strip()[:200]
+                return {"ok": False, "msg": f"获取失败 (HTTP {resp.status_code}): {body}"}
+            try:
+                data = resp.json()
+            except ValueError:
+                return {"ok": False, "msg": "响应不是有效 JSON（该端点可能不支持 /v1/models）"}
+            items = data.get("data") if isinstance(data, dict) else data
+            if not isinstance(items, list):
+                return {"ok": False, "msg": "响应格式无法解析（非 OpenAI /v1/models 形状）"}
+
+            # 上下文/多模态元数据字段名因厂商而异，逐个候选键提取：
+            # - 上下文：阶跃 max_input_tokens、OpenRouter/Together context_length、
+            #   Groq context_window、vLLM max_model_len
+            # - 最大输出：OpenRouter max_completion_tokens、通用 max_output_tokens
+            # - 多模态：阶跃 enable_vision_input、通用 supports_vision、
+            #   OpenRouter architecture.input_modalities 含 "image"
+            _context_keys = (
+                "max_input_tokens", "context_length", "context_window",
+                "max_model_len", "max_context_length",
+            )
+            _output_keys = ("max_completion_tokens", "max_output_tokens")
+            _vision_bool_keys = ("enable_vision_input", "supports_vision", "supports_image_input")
+
+            def _extract_meta(entry_item: dict):
+                context_window = None
+                for key in _context_keys:
+                    try:
+                        val = int(entry_item.get(key))
+                    except (TypeError, ValueError):
+                        continue
+                    if val > 0:
+                        context_window = val
+                        break
+                max_output = None
+                for key in _output_keys:
+                    try:
+                        val = int(entry_item.get(key))
+                    except (TypeError, ValueError):
+                        continue
+                    if val > 0:
+                        max_output = val
+                        break
+                supports_vision = None
+                for key in _vision_bool_keys:
+                    if isinstance(entry_item.get(key), bool):
+                        supports_vision = entry_item[key]
+                        break
+                if supports_vision is None:
+                    arch = entry_item.get("architecture")
+                    if isinstance(arch, dict):
+                        modalities = arch.get("input_modalities")
+                        if isinstance(modalities, list) and modalities:
+                            supports_vision = "image" in [str(m).lower() for m in modalities]
+                return context_window, max_output, supports_vision
+
+            from core.model_spec_table import lookup_model_spec
+
+            models: List[Dict[str, Any]] = []
+            for item in items:
+                if isinstance(item, dict):
+                    mid = str(item.get("id") or "").strip()
+                    model_type = str(item.get("model_type") or "")
+                    context_window, max_output, supports_vision = _extract_meta(item)
+                elif isinstance(item, str):
+                    mid, model_type = item.strip(), ""
+                    context_window, max_output, supports_vision = None, None, None
+                else:
+                    continue
+                if mid:
+                    # 厂商未提供元数据的字段回填本地规格表（官方文档核实值）
+                    spec_context, spec_output = lookup_model_spec(mid)
+                    if context_window is None:
+                        context_window = spec_context
+                    if max_output is None:
+                        max_output = spec_output
+                    models.append({
+                        "id": mid,
+                        "model_type": model_type,
+                        "context_window": context_window,
+                        "supports_vision": supports_vision,
+                        "max_tokens": max_output,
+                    })
+
+            def _sort_key(entry: Dict[str, str]):
+                # 明确标注为语音/图像/embedding 的条目排到末尾，对话模型靠前
+                model_type = entry.get("model_type") or ""
+                is_non_chat = any(
+                    keyword in model_type.lower()
+                    for keyword in ("语音", "图像", "音频", "文生图", "embedding", "rerank", "tts", "asr")
+                )
+                return (1 if is_non_chat else 0, entry["id"].lower())
+
+            models.sort(key=_sort_key)
+            return {"ok": True, "models": models, "count": len(models), "base_url": base_url}
+        except Exception as e:
+            logger.exception("fetch_provider_models 失败")
             return {"ok": False, "msg": str(e)}
 
     def test_model(self, model_id: str) -> Dict[str, Any]:

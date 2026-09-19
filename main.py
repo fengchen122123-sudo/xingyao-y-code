@@ -193,7 +193,7 @@ active_cancel_event = None
 active_turn_id = None
 app_instance = None
 is_thinking = False
-# LLM 引擎（litellm/tiktoken/模型能力探测）是否已在后台预热完成。
+# LLM 引擎（token 估算/模型能力探测）是否已在后台预热完成。
 # 首轮对话若赶在预热完成前发出，状态行会显示“正在启动模型引擎”而不是
 # 让用户误以为卡死。
 _llm_engine_ready = False
@@ -854,6 +854,21 @@ def _computer_status_bar_segment() -> str:
         return ""
 
 
+def _git_status_bar_segment() -> str:
+    """CLI 底部状态栏的 Git 段（规格 §12.1）：``⎇ dev* ↑2 ↓1  3 changes``。
+
+    非仓库/异常时为空串（状态栏布局不变）；内部带 1.5 秒 TTL 缓存，
+    保证高频渲染不反复拉起 git 进程。
+    """
+    try:
+        from core.workspace_context import get_workdir
+        from core.git_cli import render_git_status_bar
+
+        return render_git_status_bar(get_workdir() or "")
+    except Exception:
+        return ""
+
+
 def _startup_computer_runtime_for_cli() -> None:
     """启动轻量电脑操控运行时（Task 16）：开关开启时注册全局紧急停止热键。
 
@@ -991,6 +1006,7 @@ COMMAND_COMPLETIONS = [
     ("/dream", "后台触发梦境总结，提炼归纳记忆日志"),
     ("/memory", "查阅长期记忆索引 (MEMORY.md) 内容"),
     ("/worktree", "Git worktree 管理 (list/create/remove)"),
+    ("/git", "Git 工作台 (status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log)"),
     ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
     ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
     ("/skills", "技能管理 (list/refresh/enable/disable 或开选择器)"),
@@ -1752,8 +1768,8 @@ def trigger_session_auto_rename(session_name, user_query, api_model, api_key, ap
                 f"用户提问：\"{query_text}\"\n"
                 "会话标题："
             )
-            from litellm import completion
-            response = completion(
+            from core.llm_native_transport import native_completion
+            response = native_completion(
                 model=api_model,
                 api_key=api_key,
                 api_base=api_url,
@@ -2596,6 +2612,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/share</ansicyan>                                  : 导出当前会话为 Markdown/HTML/JSON（默认 md，可加参数）"))
         print_formatted_text(HTML(f"  <ansicyan>/diagram [open 序号|list]</ansicyan>               : 打开/列出已生成的 Mermaid 流程图网页（{_agent_name()}输出 mermaid 代码块时自动生成）"))
         print_formatted_text(HTML("  <ansicyan>/worktree</ansicyan>                              : Git worktree 管理 (list/create/remove/prune)"))
+        print_formatted_text(HTML("  <ansicyan>/git &lt;子命令&gt;</ansicyan>                          : Git 工作台 (status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log，高风险操作需 --confirm)"))
         print_formatted_text(HTML("  <ansicyan>/clear</ansicyan>                                  : 清理终端当前屏幕"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【2. 模型与样式配置】</ansiyellow></b>"))
@@ -3571,6 +3588,12 @@ def handle_slash_command(command_text):
         else:
             print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /worktree [list|create|remove|prune]</ansired>"))
 
+    elif cmd == "/git" or cmd.startswith("/git "):
+        # Git 工作台（规格 §12）：严格子命令解析 → GitApplicationService，
+        # 高风险操作两步确认（--confirm），绝不透传任意参数
+        from core.git_cli import handle_git_command
+        handle_git_command(command_text)
+
     elif cmd == "/mcp" or cmd.startswith("/mcp "):
         # MCP 服务管理：默认打开全屏 CLI 配置器，也支持子命令
         # 用法: /mcp                  -> 打开全屏 CLI 配置器（推荐）
@@ -4377,6 +4400,10 @@ def _make_input_app():
         if computer_segment:
             segments.append(("class:status.sep", "  |  "))
             segments.append(("class:status.token", f" {computer_segment} "))
+        git_segment = _git_status_bar_segment()
+        if git_segment:
+            segments.append(("class:status.sep", "  |  "))
+            segments.append(("class:status.token", f" {git_segment} "))
         return segments
 
     def get_activity_text():
@@ -4387,8 +4414,8 @@ def _make_input_app():
             # elapsed），避免两个动画刷新率不一致导致的观感卡顿。
             frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
             frame = frames[int(time.time() * 5) % len(frames)]
-            # 首轮对话赶在后台预热完成前发出时，litellm/tiktoken 的首次
-            # import 需要数秒——如实显示“启动模型引擎”，避免看似卡死。
+            # 首轮对话赶在后台预热完成前发出时，模型引擎首次初始化
+            # 需要时间——如实显示“启动模型引擎”，避免看似卡死。
             if not _llm_engine_ready and _active_tool_status is None:
                 return f"  {frame} {_agent_name()}正在启动模型引擎 · {max(0.0, elapsed):.1f}s · Ctrl+C 中断"
             return _format_activity_text(task_status, _active_tool_status, elapsed, frame)
@@ -5355,19 +5382,18 @@ def run_cli():
 
     # ── 启动预热（同步阶段，CLI 出现前完成）──────────────────────────────
     # 设计取向：启动慢一点没关系，但进入界面后必须立即可用、输入不卡。
-    # 若改为后台预热，litellm/mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
+    # 若改为后台预热，mcp/tiktoken 的 CPU 密集 import 会与 UI 渲染线程
     # 抢 GIL，实测会把首帧绘制卡 8 秒、键盘输入无回显。因此三个预热任务在
     # 此处并发执行、主线程显示进度动画并等全部完成后再进入 CLI。
 
-    def _preload_litellm():
-        """预热 LLM 引擎：litellm import、tiktoken 编码加载（token_counter
-        首次调用）、模型视觉能力探测（首个 generator 会调用）。"""
+    def _preload_llm_engine():
+        """预热 LLM 引擎：token 估算器首次调用与模型视觉能力探测
+        （首个 generator 会调用）。"""
         global _llm_engine_ready
         try:
-            from core.llm import _get_litellm, _litellm_token_counter, _supports_vision
-            _get_litellm()
+            from core.llm import _token_counter, _supports_vision
             try:
-                _litellm_token_counter(
+                _token_counter(
                     current_model or "openai/gpt-4o-mini",
                     [{"role": "user", "content": "预热"}],
                 )
@@ -5379,7 +5405,7 @@ def run_cli():
             except Exception:
                 pass
         except Exception as e:
-            logging.getLogger("py.warnings").warning("预加载 litellm 失败: %s", e)
+            logging.getLogger("py.warnings").warning("预加载 LLM 引擎失败: %s", e)
         finally:
             _llm_engine_ready = True
 
@@ -5421,7 +5447,7 @@ def run_cli():
             logging.getLogger("py.warnings").warning("MCP 后台连接失败: %s", e)
 
     def _warm_token_usage():
-        """预热当前 session 的 Token 统计（会连带 tiktoken 首次加载），
+        """预热当前 session 的 Token 统计，
         同步完成后状态栏 token 数在首绘时就是准确值。"""
         try:
             recalc_token_usage()
@@ -5429,7 +5455,7 @@ def run_cli():
             logging.getLogger("py.warnings").warning("启动预热 recalc_token_usage 失败: %s", e)
 
     _preload_threads = [
-        threading.Thread(target=_preload_litellm, daemon=True),
+        threading.Thread(target=_preload_llm_engine, daemon=True),
         threading.Thread(target=_preload_mcp, daemon=True),
         threading.Thread(target=_warm_token_usage, daemon=True),
     ]

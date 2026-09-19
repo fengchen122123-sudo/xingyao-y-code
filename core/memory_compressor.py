@@ -4,8 +4,8 @@ import re
 import threading
 
 from core.memory import message_content_to_text
-# litellm 改为懒导入：避免在 import core.memory_compressor 时强制加载 litellm（~1.4s）
-# 实际首次压缩时才加载，与 core.llm 的懒加载策略一致
+# 压缩模型请求入口为懒导入：实际首次压缩时才加载 core.llm，
+# 避免 import core.memory_compressor 就拉起 LLM 引擎全家桶
 from prompt_toolkit import print_formatted_text  # noqa: F401 保留导入以兼容测试桩
 from prompt_toolkit.formatted_text import HTML  # noqa: F401
 
@@ -576,8 +576,8 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
             chunks.append(current_chunk)
         total_chunks = len(chunks)
 
-        # 懒加载 litellm.completion（首次调用触发 import，约 1.4s）
-        from core.llm import _litellm_completion, _provider_cache_affinity_options, is_rate_limit_error
+        # 懒加载压缩模型请求入口（首次调用触发 core.llm 加载）
+        from core.llm import _dispatch_completion, _provider_cache_affinity_options, is_rate_limit_error
 
         new_summary = old_summary
         committed = False
@@ -660,7 +660,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 if cancel_event is not None and cancel_event.is_set():
                     return _finish_with_progress(committed, "cancelled")
                 try:
-                    response = _litellm_completion(**request_kwargs)
+                    response = _dispatch_completion(**request_kwargs)
                     raw_text = (response.choices[0].message.content or "").strip()
                     raw_text = re.sub(r"^记忆摘要[：:]\s*", "", raw_text)
                     raw_text = raw_text.replace("```", "").strip()

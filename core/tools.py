@@ -924,6 +924,8 @@ def execute_command(
             sink.seek(0)
             return sink.read(min(size, EXECUTE_COMMAND_MAX_OUTPUT_BYTES)), size
 
+        # Workspace Process Registry 句柄先于内层 try 初始化，保证 finally 可安全引用
+        _git_registry_handle = ""
         try:
             try:
                 invocation = build_command_invocation(command, shell_id=shell_id)
@@ -942,6 +944,19 @@ def execute_command(
             }
             if invocation.executable:
                 popen_kwargs["executable"] = invocation.executable
+            # Workspace Process Registry 登记（规格 §9.2）：登记失败绝不影响命令执行
+            try:
+                from core.git import process_registry as _proc_registry
+
+                _git_registry_handle = _proc_registry.register_process(
+                    popen_kwargs.get("cwd") or os.getcwd(),
+                    kind="execute_command",
+                    foreground=True,
+                    long_running=False,
+                    risk_class=_proc_registry.risk_class_for_command(command),
+                ).handle
+            except Exception:
+                _git_registry_handle = ""
             process = subprocess.Popen(
                 invocation.argv,
                 **popen_kwargs,
@@ -972,6 +987,13 @@ def execute_command(
             stdout_raw, stdout_size = _read_sink_capped(stdout_sink)
             stderr_raw, stderr_size = _read_sink_capped(stderr_sink)
         finally:
+            if _git_registry_handle:
+                try:
+                    from core.git import process_registry as _proc_registry
+
+                    _proc_registry.unregister_process(_git_registry_handle)
+                except Exception:
+                    pass
             try:
                 stdout_sink.close()
                 stderr_sink.close()

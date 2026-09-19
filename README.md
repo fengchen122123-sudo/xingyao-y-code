@@ -1,7 +1,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.2.30](https://img.shields.io/badge/Version-1.2.30-green.svg)](core/version.py)
+[![Version 1.3.0](https://img.shields.io/badge/Version-1.3.0-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
@@ -24,7 +24,7 @@
 
 ### 模型与工具
 
-- **多模型管理**：通过 `/models` 打开全屏模型选择器，支持 OpenAI / Anthropic / DeepSeek / Agnes 等多种协议，由 `LiteLLM` 统一调用
+- **多模型管理**：通过 `/models` 打开全屏模型选择器，支持 OpenAI / Anthropic / DeepSeek / Agnes 等多种协议，由自研 HTTPX 引擎（`core/llm_native_transport.py`）统一调用
 - **副模型机制**：可配置副模型承担视觉识别、记忆压缩、子代理调用等任务，主副分工
 - **29 个内置工具**：文件读写、代码搜索、命令执行、网页抓取、图片下载与生图、天气查询、LSP 符号查找、计划编排、智能路由等
 - **工具结果缓存**：相同搜索/读取自动走本地缓存，节省 token 与时间
@@ -58,6 +58,7 @@
 - **插件系统（Plugins）**：进程内插件扩展工具能力，零核心侵入，单插件异常不影响启动；内置混元文生图插件，支持用户级插件热加载
 - **MCP 客户端**：全屏 CLI 配置器 + 10+ 预设模板（飞书 / 高德 / B 站 / SQLite / Postgres 等），AI 可自配置 MCP
 - **Git Worktree**：`/worktree` 管理多分支并行工作区
+- **Git 工作台**：GUI「源代码管理」页签 + CLI `/git` 命令（状态/Diff/暂存/提交/分支/同步/Stash/历史/冲突），支持外部变化自动刷新、仓库信任确认与高风险操作二次确认；AI 在对话中的 Git 操作仍走原有权限流程
 
 ## 🚀 快速开始
 
@@ -81,7 +82,7 @@ source venv/bin/activate
 pip install -e .
 ```
 
-> 会自动安装全部运行依赖：`rich`、`litellm`、`prompt_toolkit`、`pyfiglet`、`ddgs`、`mcp`、`psutil`、`pillow`。
+> 会自动安装全部运行依赖：`rich`、`prompt_toolkit`、`pyfiglet`、`ddgs`、`mcp`、`psutil`、`pillow`。
 
 ### 3. 配置 API 密钥
 
@@ -529,7 +530,7 @@ xingyao-y-code/
 │   ├── version.py           # 版本号（单一来源）
 │   ├── agent_service.py     # 对话服务（CLI/GUI 共源）
 │   ├── harness/             # 固定主代理内核（严格状态机 / SQLite Journal / 工具管线）
-│   ├── llm.py               # LiteLLM 调用与工具编排
+│   ├── llm.py               # 模型请求入口与工具编排（自研 HTTPX 引擎）
 │   ├── tools.py             # 本地工具实现
 │   ├── tool_registry.py     # 工具注册表
 │   ├── tool_protocol.py     # 工具协议（ToolSpec 元数据）

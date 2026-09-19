@@ -302,7 +302,7 @@ def test_keepalive_retries_transient_failure_instead_of_stopping(monkeypatch):
             raise _Timeout("keepalive timed out")
         return "ok-response"
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
     accounted = []
     monkeypatch.setattr(
         ka, "account_keepalive_response",
@@ -341,7 +341,7 @@ def test_keepalive_stops_after_retries_exhausted(monkeypatch):
         calls.append(1)
         raise _Timeout("keepalive timed out")
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
     monkeypatch.setattr(
         ka, "account_keepalive_response", lambda response, telemetry: {"valid": True}
     )
@@ -378,7 +378,7 @@ def test_keepalive_retry_backoff_yields_to_new_registration(monkeypatch):
         calls.append(1)
         raise _Timeout("keepalive timed out")
 
-    monkeypatch.setattr("core.llm._litellm_completion", fake_completion)
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
     monkeypatch.setattr(
         ka, "account_keepalive_response", lambda response, telemetry: {"valid": True}
     )

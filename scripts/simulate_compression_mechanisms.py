@@ -1,7 +1,7 @@
 """零成本模拟二：压缩机制专项——429 自适应冷却 / DeepSeek 账本基线与主动轮换代 / 取消与增量恢复。
 
 全部走生产路径（compress_session_memory / prepare_turn_messages / _prepare_deepseek_ledger_request /
-真实 SQLite / 真实 tiktoken），唯一替换点仍是 core.llm._litellm_completion 桩，零 API 成本。
+真实 SQLite / 真实 tiktoken），唯一替换点仍是 core.llm._dispatch_completion 桩，零 API 成本。
 
 三个专项：
   C  429 自适应段间冷却
@@ -147,9 +147,9 @@ def part_c(tmp):
         fill_to(mgr, sess, 0.58)  # ≈3 段
         stub = StubLLM()
         stub.fail_first_n = fail_first
-        orig = llm._litellm_completion
+        orig = llm._dispatch_completion
         orig_cfg = mc._load_compression_config
-        llm._litellm_completion = stub
+        llm._dispatch_completion = stub
         cfg = dict(BASE_CFG); cfg.update(cfg_over)
         mc._load_compression_config = lambda: cfg
         t0 = time.monotonic()
@@ -158,7 +158,7 @@ def part_c(tmp):
             outcome = compress(mgr, sess, notices)
             dt = time.monotonic() - t0
         finally:
-            llm._litellm_completion = orig
+            llm._dispatch_completion = orig
             mc._load_compression_config = orig_cfg
         n429 = sum(1 for c in stub.calls if c[2] == "429")
         seg = re.search(r"分 (\d+) 段", "".join(m for _, m in notices))
@@ -217,8 +217,8 @@ def part_d(tmp):
     fill_to(mgr, sess, 0.96)  # 96%+ 水位，Tier3 同步压缩
     hist_fat = mgr.get_history_for_llm(sess)
     stub = StubLLM()
-    orig = llm._litellm_completion
-    llm._litellm_completion = stub
+    orig = llm._dispatch_completion
+    llm._dispatch_completion = stub
     try:
         gen1 = llm._prepare_deepseek_ledger_request(
             mgr, sess, DEEPSEEK_MODEL, DEEPSEEK_BASE, "main", hist_fat, [])
@@ -255,7 +255,7 @@ def part_d(tmp):
         fill_to(mgr, sess, 0.96)
         stub_fail = StubLLM()
         stub_fail.fail_all = True
-        llm._litellm_completion = stub_fail
+        llm._dispatch_completion = stub_fail
         notices = []
         agent_service.prepare_turn_messages(
             mgr, sess, DEEPSEEK_MODEL, WINDOW,
@@ -269,7 +269,7 @@ def part_d(tmp):
         assert not leaked and rot_left is False
         print("     D3 ✔ 失败/熔断绝不登记轮换代\n")
     finally:
-        llm._litellm_completion = orig
+        llm._dispatch_completion = orig
 
 
 def part_e(tmp):
@@ -281,8 +281,8 @@ def part_e(tmp):
     mgr.add_messages(sess, [("user", "开始")])
     fill_to(mgr, sess, 0.75)  # ≈4 段
     stub = StubLLM()  # 快桩：每段约 4.4s，取消点可控地落在第 2 段调用中
-    orig = llm._litellm_completion
-    llm._litellm_completion = stub
+    orig = llm._dispatch_completion
+    llm._dispatch_completion = stub
     try:
         cancel = threading.Event()
         notices = []
@@ -320,7 +320,7 @@ def part_e(tmp):
 
         # ---- E2 从已提交水位续推 ----
         stub2 = StubLLM()
-        llm._litellm_completion = stub2
+        llm._dispatch_completion = stub2
         notices2 = []
         out2 = compress(mgr, sess, notices2)
         seg = re.search(r"分 (\d+) 段", "".join(m for _, m in notices2))
@@ -333,7 +333,7 @@ def part_e(tmp):
         assert out2.status == "compressed"
         print("     E ✔ 取消不白烧（已完成段落保留）、恢复不重复付费（只压剩余段）\n")
     finally:
-        llm._litellm_completion = orig
+        llm._dispatch_completion = orig
 
 
 def main():

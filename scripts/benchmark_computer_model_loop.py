@@ -70,7 +70,7 @@ def candidate_providers():
             name = model.get("litellm_model") or model.get("id") or ""
             if not name:
                 continue
-            # litellm 的 anthropic provider 自行追加 /v1/messages：去掉末尾 /v1。
+            # Anthropic 协议路由的 base 以 /v1 结尾时 native 会自行拼接 /v1/messages：去掉末尾 /v1。
             if name.startswith("anthropic/") and base.rstrip("/").endswith("/v1"):
                 base = base.rstrip("/").removesuffix("/v1")
             out.append({"model": name, "api_base": base, "api_key": key})
@@ -78,7 +78,7 @@ def candidate_providers():
 
 
 def run_benchmark(model_filter: str, max_steps: int, output: Path):
-    import litellm
+    from core.llm_native_transport import native_completion
     from core.computer.models import ComputerAction, ComputerOwner
     from core.computer.browser_backend import BrowserComputerBackend
     import tempfile
@@ -130,7 +130,7 @@ def run_benchmark(model_filter: str, max_steps: int, output: Path):
             for candidate in candidates:
                 try:
                     steps, provider_total_ms, local_total_ms, final_text = _loop(
-                        litellm, candidate, messages, COMPUTER_ACTION_TOOL_SCHEMA,
+                        native_completion, candidate, messages, COMPUTER_ACTION_TOOL_SCHEMA,
                         service, run, owner, segments, max_steps,
                     )
                     break
@@ -215,7 +215,7 @@ def _observation_image_message(png_path: str) -> dict:
     }
 
 
-def _loop(litellm, candidate, messages, tool_schema, service, run, owner, segments, max_steps):
+def _loop(completion_fn, candidate, messages, tool_schema, service, run, owner, segments, max_steps):
     steps = []
     provider_total = 0.0
     local_total = 0.0
@@ -224,7 +224,7 @@ def _loop(litellm, candidate, messages, tool_schema, service, run, owner, segmen
     for _step in range(max_steps):
         seg_base = len(segments)
         request_started = time.perf_counter()
-        response = litellm.completion(
+        response = completion_fn(
             model=candidate["model"],
             messages=messages,
             tools=[tool_schema],

@@ -634,7 +634,7 @@ def _patch_native_responses(mocker, controller, responses):
     mocker.patch("core.llm._describe_images_with_secondary", lambda *_a, **_k: None)
     mocker.patch("core.llm.estimate_tokens", lambda *_a, **_k: 0)
     mocker.patch("core.llm.get_computer_control_service", lambda: controller)
-    mocker.patch("core.llm._litellm_responses", fake_responses)
+    mocker.patch("core.llm._dispatch_responses", fake_responses)
     return captured
 
 

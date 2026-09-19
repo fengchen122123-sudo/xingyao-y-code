@@ -2,7 +2,7 @@
 
 生产路径全部真实：prepare_turn_messages 四级水位阶梯、compress_session_memory
 分段 / CAS 增量落库、真实 SQLite、真实 tiktoken 估算。唯一替换点：
-core.llm._litellm_completion 打成"按 prompt 大小注入延迟"的桩（长输入短输出
+core.llm._dispatch_completion 打成"按 prompt 大小注入延迟"的桩（长输入短输出
 负载，20k token 段 ≈ 8s），零 API 成本。
 
 场景 A（旧行为，precompress_ratio=0）：水位 ~96% 发消息 → Tier3 同步压缩
@@ -135,12 +135,12 @@ def main():
     tmp_root = tempfile.mkdtemp(prefix="sim_precompress_")
 
     # ---- 桩注入与受控配置（finally 全量还原） ----
-    orig_completion = llm._litellm_completion
+    orig_completion = llm._dispatch_completion
     orig_loader = mc._load_compression_config
     orig_cooldown = agent_service._PRECOMPRESS_COOLDOWN_SECONDS
     orig_trigger = agent_service._trigger_background_precompress
 
-    llm._litellm_completion = FakeLLM()  # 压缩器运行时 from core.llm import，直接生效
+    llm._dispatch_completion = FakeLLM()  # 压缩器运行时 from core.llm import，直接生效
 
     def stub_loader():
         cfg = dict(BASE_CFG)
@@ -256,7 +256,7 @@ def main():
         print("机制覆盖：预压缩后台化 ✔ / already_running+内存裁剪兜底 ✔ / CAS 增量落库 ✔")
         print("SIMULATE PASSED")
     finally:
-        llm._litellm_completion = orig_completion
+        llm._dispatch_completion = orig_completion
         mc._load_compression_config = orig_loader
         agent_service._PRECOMPRESS_COOLDOWN_SECONDS = orig_cooldown
         agent_service._trigger_background_precompress = orig_trigger

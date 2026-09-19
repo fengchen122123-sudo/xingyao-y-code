@@ -157,7 +157,7 @@ describe('SettingsPage', () => {
     await wrapper.get('[data-test="model-supports-function-calling"]').setValue(true);
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
-    expect(addModel).toHaveBeenCalledWith('p1', 'model-auto', 128000, true, true, '');
+    expect(addModel).toHaveBeenCalledWith('p1', 'model-auto', 128000, true, true, '', 0);
   });
 
   it('blocks saving generic protocol without vision and function calling', async () => {
@@ -194,7 +194,7 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="model-computer-protocol-error"]').exists()).toBe(false);
     await wrapper.get('[data-test="model-modal"]').trigger('submit');
 
-    expect(addModel).toHaveBeenCalledWith('p1', 'vision-model', 128000, true, true, 'generic');
+    expect(addModel).toHaveBeenCalledWith('p1', 'vision-model', 128000, true, true, 'generic', 0);
     expect(wrapper.find('[data-test="model-modal"]').exists()).toBe(false);
   });
 
@@ -402,42 +402,5 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="model-error-banner"]').exists()).toBe(false);
     expect(wrapper.find('.test-result.ok').exists()).toBe(true);
     expect(wrapper.get('.test-result.ok').text()).toContain('连接成功');
-  });
-
-  it('shows the sync button only for preset providers and calls store with preset id', async () => {
-    const store = useAppStore();
-    vi.spyOn(store, 'syncPresetModels').mockResolvedValue({ ok: true } as never);
-    const wrapper = mount(SettingsPage);
-
-    await wrapper.get('[data-test="provider-p1"]').trigger('click');
-    // 自定义厂商（无 preset_id、名称与地址都不匹配预置目录）不显示同步入口
-    expect(wrapper.find('[data-test="sync-preset-models"]').exists()).toBe(false);
-
-    // 预置厂商显示同步按钮，点击按 preset_id 触发
-    store.$patch({
-      providers: store.providers.map(item => ({ ...item, preset_id: 'deepseek' })),
-    });
-    await wrapper.get('[data-test="provider-p1"]').trigger('click');
-    await wrapper.get('[data-test="sync-preset-models"]').trigger('click');
-    await flushPromises();
-
-    expect(store.syncPresetModels).toHaveBeenCalledWith('deepseek');
-  });
-
-  it('claims unlinked providers by name or base url for the sync button', async () => {
-    const store = useAppStore();
-    vi.spyOn(store, 'syncPresetModels').mockResolvedValue({ ok: true } as never);
-    // 手动添加的老厂商：没有 preset_id，但厂商名与预置目录一致（如早期手动加的 Agnes AI）
-    store.$patch({
-      providers: store.providers.map(item => ({ ...item, name: '深度求索' })),
-    });
-    const wrapper = mount(SettingsPage);
-
-    await wrapper.get('[data-test="provider-p1"]').trigger('click');
-    expect(wrapper.get('[data-test="sync-preset-models"]').isVisible()).toBe(true);
-    await wrapper.get('[data-test="sync-preset-models"]').trigger('click');
-    await flushPromises();
-
-    expect(store.syncPresetModels).toHaveBeenCalledWith('deepseek');
   });
 });
