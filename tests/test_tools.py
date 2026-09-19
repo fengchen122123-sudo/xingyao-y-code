@@ -4395,3 +4395,191 @@ def test_foreground_waits_for_failed_terminal_callback_before_returning():
     assert thread.is_alive() is False
     assert task.done_event.is_set() is True
     assert len(results) == 1
+
+
+# ---------------------------------------------------------------------------
+# 子代理部分工具失败不应一票否决整任务
+# ---------------------------------------------------------------------------
+# 历史问题：_run_default_subagent 把 ok=False 的 tool_finished 记进 tool_errors，
+# _run_task 里 `elif task.tool_errors:` 直接把整任务判 failed 并丢弃 result。
+# 于是子代理只要有一个工具报错（如 edit_file 打在不存在的文件上返回 🚨），
+# 整任务失败、成果全丢。修复：有成功工具调用时降级为结果尾部告警。
+
+def test_subagent_partial_tool_failure_still_completes():
+    conclusion = "已完成 core/tools.py 的改动，共修改 3 处，验证命令通过。" * 6
+
+    def runner(record):
+        record.tool_success_count = 3
+        record.tool_errors["edit_file"] = "文件不存在：core/foo.py"
+        return conclusion
+
+    manager = SubagentManager(runner=runner)
+    result = manager.run("改代码", "s1", "t1", timeout_seconds=30)
+
+    assert manager.snapshot()[0].status == "completed"
+    assert "已完成 core/tools.py 的改动" in result
+    assert "子代理执行期有工具报错" in result
+    assert "edit_file" in result
+
+
+def test_edit_file_missing_file_suggests_write_file():
+    import core.tools as tools_mod
+
+    result = tools_mod.edit_file(
+        "不存在的文件_xyz_不要创建.py",
+        target_content="a",
+        replacement_content="b",
+    )
+
+    assert result.startswith("🚨")
+    assert "write_file" in result
+
+
+def test_subagent_edit_file_missing_file_suggests_write_file():
+    """别名入口：让 `pytest -k subagent` 也能覆盖 edit_file 缺文件的提示。"""
+    test_edit_file_missing_file_suggests_write_file()
+
+
+# ---------------------------------------------------------------------------
+# 子代理超时/取消不再丢弃已产出正文
+# ---------------------------------------------------------------------------
+# 历史问题：正文只写 task.result，_terminate 只写 error。子代理线程返回正文
+# 时若 cancel_event 已置位（超时/取消），result 被整块丢弃，主 Agent 只看到
+# "foreground timeout"，无法判断成果是否已落地（文件可能已经改完）。
+
+def test_subagent_timeout_salvages_partial_result():
+    body = "已完成的现场：" + "改动 core/tools.py 并跑通验证。" * 12
+
+    def runner(record):
+        record.cancel_event.set()
+        return body
+
+    manager = SubagentManager(runner=runner)
+    result = manager.run("长任务", "s1", "t1", timeout_seconds=30)
+
+    snapshot = manager.snapshot()[0]
+    assert snapshot.status == "cancelled"
+    assert body in snapshot.partial_result
+    assert "已完成的部分" in result
+
+
+# ---------------------------------------------------------------------------
+# 回合级中止原因（无进展熔断/轮次上限）不再被静默吞掉
+# ---------------------------------------------------------------------------
+# 历史问题：熔断只走 _notify_event(..., "turn_error", ...) 后 return，不 yield
+# 正文；_run_default_subagent 的事件循环收到 turn_error 却不处理，最终只留下
+# "subagent returned no public answer"，真实原因丢失。
+
+def test_subagent_captures_turn_error_event(monkeypatch):
+    import core.llm as llm_mod
+    from core.turn_events import TurnEvent
+
+    def fake_events(*args, **kwargs):
+        yield TurnEvent("t1", 1, "assistant_delta", {"text": "先读一下文件"})
+        yield TurnEvent(
+            "t1", 2, "turn_error",
+            {"message": "连续 12 轮没有检测到状态变化，回合已终止"},
+        )
+
+    monkeypatch.setattr(llm_mod, "chat_with_model_events", fake_events)
+
+    manager = SubagentManager()
+    result = manager.run("测试", "s1", "t1", timeout_seconds=30)
+
+    assert manager.snapshot()[0].status == "failed"
+    assert "连续 12 轮" in result
+
+
+# ---------------------------------------------------------------------------
+# 熔断/轮次上限中止后不再白打一次总结续写请求
+# ---------------------------------------------------------------------------
+# 历史问题：summary_continuation 只查 cancel_event，而熔断不置位 cancel_event；
+# 修复前续写产出还有机会救回任务，修复后 turn_error 一律判 failed，
+# 这次续写请求的产出只能以截断 partial 出现在失败文本里，纯浪费。
+
+def test_subagent_turn_error_skips_summary_continuation(monkeypatch):
+    import core.llm as llm_mod
+    from core.turn_events import TurnEvent
+
+    calls = []
+
+    def fake_events(*args, **kwargs):
+        calls.append(1)
+        yield TurnEvent(
+            "t1", 1, "turn_error",
+            {"message": "连续 12 轮没有检测到状态变化，回合已终止"},
+        )
+
+    monkeypatch.setattr(llm_mod, "chat_with_model_events", fake_events)
+
+    manager = SubagentManager()
+    result = manager.run("测试", "s1", "t1", timeout_seconds=30)
+
+    assert manager.snapshot()[0].status == "failed"
+    assert "连续 12 轮" in result
+    # 正文为空必然满足续写长度条件：只允许主循环这一次请求
+    assert len(calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# 事件循环中途抛异常时尾部正文也要打捞
+# ---------------------------------------------------------------------------
+# 历史问题：runner 抛异常（如网络中断）会跳过事件循环后的最终打捞，
+# 周期 flush 只保到最后一个 2000 字符边界，尾部不足 2000 的正文丢失。
+
+def test_subagent_partial_salvaged_when_event_loop_raises(monkeypatch):
+    import core.llm as llm_mod
+    from core.turn_events import TurnEvent
+
+    def fake_events(*args, **kwargs):
+        yield TurnEvent(
+            "t1", 1, "assistant_delta",
+            {"text": "已定位问题：core/foo.py 第 10 行循环边界写反，"},
+        )
+        raise RuntimeError("网络连接中断")
+
+    monkeypatch.setattr(llm_mod, "chat_with_model_events", fake_events)
+
+    manager = SubagentManager()
+    result = manager.run("测试", "s1", "t1", timeout_seconds=30)
+
+    snapshot = manager.snapshot()[0]
+    assert snapshot.status == "failed"
+    assert "core/foo.py" in snapshot.partial_result
+    assert "已完成的部分" in result
+    assert "core/foo.py" in result
+
+
+# ---------------------------------------------------------------------------
+# 头截断保尾规则统一：_foreground_result 与 task_tool status 共用 helper
+# ---------------------------------------------------------------------------
+
+def test_truncate_subagent_result_keeps_warning_footer():
+    from core.tools import SUBAGENT_WARNING_MARKER, _truncate_subagent_result
+
+    footer = (
+        SUBAGENT_WARNING_MARKER
+        + "（1 个，可能影响结论可靠性，供主 Agent 判断是否复核）：\n"
+        + "  - edit_file: 文件不存在：core/foo.py"
+    )
+    out = _truncate_subagent_result(
+        "x" * 20000 + footer,
+        16000,
+        "\n\n... [子代理结果已截断，省略 {omitted} 字符]",
+    )
+
+    assert "edit_file: 文件不存在：core/foo.py" in out
+    assert "省略" in out and "字符]" in out
+    # 截断说明插在正文与告警块之间，不重复、不重叠
+    assert out.index("... [子代理结果已截断") < out.index(SUBAGENT_WARNING_MARKER)
+
+    # 无告警尾时退化为普通头截断，省略数正确
+    plain = _truncate_subagent_result(
+        "y" * 20000, 16000, "\n\n... [省略 {omitted} 字符]"
+    )
+    assert plain.startswith("y")
+    assert "省略 4000 字符" in plain
+    assert SUBAGENT_WARNING_MARKER not in plain
+
+    # 未超长原样返回
+    assert _truncate_subagent_result("short", 16000, "省略 {omitted}") == "short"
