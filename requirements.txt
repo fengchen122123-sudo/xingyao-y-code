@@ -1,6 +1,5 @@
 # Y-code CLI runtime dependencies
 rich>=13.0.0
-litellm>=1.0.0
 prompt_toolkit>=3.0.0
 pyfiglet>=0.8.0
 ddgs>=9.0.0

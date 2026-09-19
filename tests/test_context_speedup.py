@@ -6,7 +6,7 @@
 3. 0.85 预压缩后台触发（防抖 / 防重入 / 不阻塞回合）
 4. DeepSeek 账本主动轮换代登记（幂等登记、一次消费、账本请求前消费）
 
-沙盒约束与 test_agent_service.py 相同：模块顶层不 import litellm，
+沙盒约束与 test_agent_service.py 相同：模块顶层不加载 LLM 引擎，
 对 core.llm 一律打桩。
 """
 

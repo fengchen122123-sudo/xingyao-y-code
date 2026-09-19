@@ -1,6 +1,7 @@
 """大模型上游报错中文映射与排查建议引擎。
 
-将 LiteLLM、各模型云厂商 (OpenAI/Anthropic/DeepSeek/Kimi/GLM/通义千问等) 返回的
+将各模型云厂商与聚合网关 (OpenAI/Anthropic/DeepSeek/Kimi/GLM/通义千问等，
+包括网关侧基于 litellm 搭建的中转站) 返回的
 HTTP 状态码、英文异常及 JSON 报错结构，智能解析为对用户友好的中文诊断与操作建议，
 同时对敏感 API Key 等进行不可逆脱敏，保留必要技术简讯以供开发者排查。
 """

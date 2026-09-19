@@ -1,4 +1,4 @@
-from core.model_catalog import API_PROTOCOLS, get_preset_providers, litellm_model_name
+from core.model_catalog import API_PROTOCOLS, get_preset_providers, provider_route_name
 from core.reasoning_capabilities import get_reasoning_capability
 
 
@@ -17,111 +17,33 @@ def test_catalog_preserves_cli_model_metadata():
     assert kimi["name"] == "月之暗面kimi-for-coding（OpenAI格式）"
     assert kimi["protocol"] == "openai"
     assert kimi["base_url"] == "https://api.kimi.com/coding/v1"
-    assert kimi["models"] == [
-        {"name": "kimi-for-coding", "context_window": 1000000, "supports_vision": True,
-         "supports_function_calling": True, "max_tokens": 131072},
-        {"name": "k3", "context_window": 1000000, "supports_vision": True,
-         "supports_function_calling": True, "computer_protocol": "generic"},
-        {"name": "k3-256k", "context_window": 256000, "supports_vision": True,
-         "supports_function_calling": True, "computer_protocol": "generic"},
-    ]
 
 
 def test_catalog_queries_return_isolated_copies():
     first = get_preset_providers()
-    first[0]["models"][0]["name"] = "mutated"
+    first[0]["name"] = "mutated"
 
     second = get_preset_providers()
-    assert second[0]["models"][0]["name"] != "mutated"
+    assert second[0]["name"] != "mutated"
     assert len({provider["id"] for provider in second}) == len(second)
 
 
-def test_responses_uses_openai_litellm_route():
-    assert litellm_model_name("responses", "deepseek-v4-flash") == "openai/deepseek-v4-flash"
+def test_responses_uses_openai_route():
+    assert provider_route_name("responses", "deepseek-v4-flash") == "openai/deepseek-v4-flash"
 
 
 def test_vendor_scoped_model_id_still_gets_transport_prefix():
-    assert litellm_model_name("openai", "zai-org/GLM-5.2") == "openai/zai-org/GLM-5.2"
+    assert provider_route_name("openai", "zai-org/GLM-5.2") == "openai/zai-org/GLM-5.2"
 
 
 def test_explicit_transport_prefix_is_not_duplicated():
-    assert litellm_model_name("openai", "openai/gpt-4o") == "openai/gpt-4o"
+    assert provider_route_name("openai", "openai/gpt-4o") == "openai/gpt-4o"
 
 
-def test_confirmed_preset_models_carry_literal_computer_metadata():
-    """只给 brief/设计 9.2 明确点名的条目写字面量元数据，不得按名字批量推断。"""
-    providers = get_preset_providers()
-    generic = {
-        (provider["id"], model["name"])
-        for provider in providers
-        for model in provider["models"]
-        if model.get("computer_protocol") == "generic"
-    }
-    assert generic == {
-        ("kimi-coding-openai", "k3"),
-        ("kimi-coding-openai", "k3-256k"),
-        ("moonshot", "kimi-k3"),
-        ("sensenova", "kimi-k3"),
-        ("token-rhythm", "glm-5.3-flash"),
-        ("zhipu", "glm-5.3-flash"),
-        ("zhipu-coding-openai", "glm-5.3-flash"),
-    }
-
-
-def test_token_rhythm_preset_contains_qwen38_flash():
-    providers = get_preset_providers()
-    token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
-    model = next(m for m in token_rhythm["models"] if m["name"] == "qwen3.8-flash")
-
-    assert model["context_window"] == 1000000
-    assert model["supports_vision"] is True
-    assert model["supports_function_calling"] is True
-
-
-def test_token_rhythm_preset_contains_deepseek_flash():
-    providers = get_preset_providers()
-    token_rhythm = next(item for item in providers if item["id"] == "token-rhythm")
-    model = next(
-        m
-        for m in token_rhythm["models"]
-        if m["name"] == "deepseek-flash"
-    )
-
-    assert model["context_window"] == 1000000
-    assert model["max_tokens"] == 384000
-    assert model["supports_vision"] is True
-    assert model["supports_function_calling"] is True
-
-
-def test_preset_computer_metadata_never_forms_half_valid_combination():
-    """generic 条目必须同时声明视觉与工具能力；未知协议值不得出现在目录中。"""
+def test_preset_providers_carry_no_models():
+    """预置厂商只预填厂商信息，不携带模型（模型由用户经「获取模型列表」添加）。"""
     for provider in get_preset_providers():
-        for model in provider["models"]:
-            protocol = model.get("computer_protocol", "none")
-            assert protocol in {"none", "generic", "native_openai"}
-            if protocol == "generic":
-                assert model.get("supports_vision") is True
-                assert model.get("supports_function_calling") is True
-
-
-def test_preset_models_all_have_confirmed_reasoning_capability():
-    """预置模型必须登记思考能力（刻意隐藏档位的实验模型除外）。
-
-    目录新增模型漏配思考能力时，请求侧已按默认档静默回落、不报错；
-    该断言用于在添加模型时主动提醒补登记，而不是放任遗漏。
-    """
-    confirmed_hidden = {
-        "ark-code-latest",
-        "doubao-seed-evolving",
-        "step-explore",
-    }
-    unregistered = sorted(
-        {
-            model["name"]
-            for provider in get_preset_providers()
-            for model in provider["models"]
-            if get_reasoning_capability(model["name"]).kind == "hidden"
-        }
-        - confirmed_hidden
-    )
-    assert unregistered == []
+        assert "models" not in provider
+        assert provider["name"]
+        assert provider["base_url"].startswith("https://")
+        assert provider["protocol"] == "openai"
