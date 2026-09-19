@@ -2331,7 +2331,6 @@ navItems: [] as Array<{ id: number; preview: string }>,
           this.historyOldestId = res.history_oldest_id ?? null;
           runtime.historyHasMore = this.historyHasMore;
           runtime.historyOldestId = this.historyOldestId;
-          void this.refreshNavIndex();
           // 按回合撤销：切换会话后批量拉取该会话的检查点状态（卡片随会话重建）
           void this.refreshTurnUndoStates();
           this._bindSessionRuntime(sessionName);
@@ -2344,6 +2343,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
             lastLocal.execution_state = 'error';
           }
         }
+
+        // 红点索引无条件重拉：只在「首次加载该会话」时刷新会漏掉离开期间
+        // 新增的用户消息（后台回合、手机端发送），表现为切回后红点少最后一条
+        void this.refreshNavIndex(sessionName);
 
         // 目标会话运行态恢复：优先用后端下发的实时流式快照完整还原（正文/思考/工具卡片），
         // 若后端无快照但处于 runningSessions，则回退构造空 running 占位防止事件挂载报错。
@@ -2445,11 +2448,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    // 红点导航全量索引：切会话/回合结束/启动后刷新，供 MessageNavRail 全量渲染
-    async refreshNavIndex() {
+    // 红点导航全量索引：切会话/回合结束/启动后刷新，供 MessageNavRail 全量渲染。
+    // sessionName 缺省为当前显示会话；回合终态事件必须显式传入事件所属会话——
+    // 只按当前显示会话刷新时，后台会话跑完的回合不会更新它自己的索引，
+    // 切回该会话又命中「有内存缓存不重拉」分支，红点会永远少最后一条
+    // （2026-09-18 用户反馈：最后一句「修改更新记录」在红点导航里没有红点）。
+    async refreshNavIndex(sessionName?: string) {
       const api = this._api();
       if (!api || typeof (api as any).get_session_nav_index !== 'function') return;
-      const sessionAtCall = this.currentSessionName;
+      const sessionAtCall = sessionName || this.currentSessionName;
       try {
         const res = await (api as any).get_session_nav_index(sessionAtCall);
         if (this.currentSessionName !== sessionAtCall) {
@@ -3641,7 +3648,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.refreshTokenUsage();
         // 对话结束后消息数已变化，刷新侧栏会话列表（否则计数停留在启动快照）
         this.refreshSessions();
-        void this.refreshNavIndex();
+        // 按事件会话刷新红点索引：用户可能已切走，此时只刷当前显示会话
+        // 会让这个会话的红点永久缺最后一条
+        void this.refreshNavIndex(eventSession || undefined);
         // 非当前窗口执行完成 → 绿点
         this._setSessionStatusDot(eventSession, 'green');
       } else if (type === 'turn_cancelled') {
@@ -3658,6 +3667,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.subagentTasks = [];
         this.refreshTokenUsage();
         this.refreshSessions();
+        // 取消的回合里用户消息同样已落库：不刷新则红点缺这一条
+        void this.refreshNavIndex(eventSession || undefined);
       } else if (type === 'turn_error') {
         const errorMsg = String(data.message || data.error || '');
         this.running = false;
@@ -3692,6 +3703,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // Low 修复：turn_error 也补一次会话列表刷新（此前仅在公共终态块中
         // 按 runningSessions 为空兜底，与 turn_finish 重复且 turn_error 无覆盖）
         this.refreshSessions();
+        // 报错的回合里用户消息同样已落库：不刷新则红点缺这一条
+        void this.refreshNavIndex(eventSession || undefined);
         // 非当前窗口报错中断 → 红点
         this._setSessionStatusDot(eventSession, 'red');
       } else if (type === 'token_usage') {
