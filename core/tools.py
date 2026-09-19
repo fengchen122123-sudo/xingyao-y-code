@@ -1902,12 +1902,13 @@ def manage_task(action, task_id=None, after_revision=None, timeout_seconds=30, e
         if include_result:
             result = str(snap.result or "")
             if result:
-                if len(result) > _SUBAGENT_STATUS_RESULT_MAX_CHARS:
-                    omitted = len(result) - _SUBAGENT_STATUS_RESULT_MAX_CHARS
-                    result = (
-                        result[:_SUBAGENT_STATUS_RESULT_MAX_CHARS]
-                        + f"… [结果已截断，省略 {omitted} 字符；完整结果将在回合结束后的自动汇总中注入]"
-                    )
+                # 与 _foreground_result 同一套头截断保尾规则：status 视图也要
+                # 保住尾部工具报错告警块，只吃正文会让主 Agent 看不到结果存疑。
+                result = _truncate_subagent_result(
+                    result,
+                    _SUBAGENT_STATUS_RESULT_MAX_CHARS,
+                    "… [结果已截断，省略 {omitted} 字符；完整结果将在回合结束后的自动汇总中注入]",
+                )
                 payload["result"] = result
             if snap.error:
                 payload["error"] = str(snap.error)
@@ -2550,6 +2551,11 @@ def edit_file(
         expected_mtime_ns = _stat_mtime_ns(resolved)
         try:
             raw = resolved.read_bytes()
+        except FileNotFoundError:
+            return (
+                f"🚨 精准修改失败！文件不存在：{file_path}。"
+                "edit_file 只能修改已存在的文件；新建文件请改用 write_file。"
+            )
         except OSError as e:
             return f"🚨 精准修改失败！无法读取文件 {file_path}: {e}"
         try:
@@ -2690,6 +2696,57 @@ def _has_meaningful_subagent_result(text: str) -> bool:
     return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
 
 
+_SUBAGENT_WARNING_MAX_ITEMS = 5
+_SUBAGENT_WARNING_ITEM_MAX_CHARS = 200
+# 结果尾部告警的起始标记：结果截断时据此保住告警
+SUBAGENT_WARNING_MARKER = "\n\n⚠️ 子代理执行期有工具报错"
+
+
+def _with_tool_error_footer(result: str, tool_errors: dict, turn_error: str = "") -> str:
+    """把工具报错降级为结果尾部的告警清单，不再一票否决整任务。"""
+    if not tool_errors and not turn_error:
+        return result
+    items = list(tool_errors.items())
+    shown = items[:_SUBAGENT_WARNING_MAX_ITEMS]
+    lines = [
+        SUBAGENT_WARNING_MARKER
+        + f"（{len(items)} 个，可能影响结论可靠性，供主 Agent 判断是否复核）："
+    ]
+    if turn_error:
+        lines.append(f"  - 回合级中止原因: {turn_error}")
+    for name, detail in shown:
+        text = str(detail)
+        if len(text) > _SUBAGENT_WARNING_ITEM_MAX_CHARS:
+            text = text[:_SUBAGENT_WARNING_ITEM_MAX_CHARS] + "..."
+        lines.append(f"  - {name}: {text}")
+    if len(items) > len(shown):
+        lines.append(f"  ... 另有 {len(items) - len(shown)} 个未展开")
+    return result + "\n".join(lines)
+
+
+def _truncate_subagent_result(result: str, max_len: int, trailer: str) -> str:
+    """超长子代理结果头截断，但尾部告警块（SUBAGENT_WARNING_MARKER 起）原样保留。
+
+    截断只吃正文，不能连工具报错告警一起吃掉。告警块自身超过一半预算
+    （budget < max_len // 2）或与正文截断点重叠时放弃保留，退化为普通头截断。
+    trailer 中的 {omitted} 会替换为实际省略字符数；_foreground_result 与
+    task_tool status 视图共用此规则，避免两处截断行为漂移。
+    """
+    if len(result) <= max_len:
+        return result
+    tail = ""
+    marker_at = result.rfind(SUBAGENT_WARNING_MARKER)
+    if marker_at != -1:
+        candidate = result[marker_at:]
+        budget = max_len - len(candidate)
+        if budget >= max_len // 2 and budget <= marker_at:
+            tail = candidate
+    keep = max_len - len(tail)
+    head = result[:keep]
+    omitted = len(result) - len(head) - len(tail)
+    return head + trailer.replace("{omitted}", str(omitted)) + tail
+
+
 _ADVISOR_TAG_RE = re.compile(
     r"\[(?:Advisor consultation[^\]]*|Advisor review|End of advisor consultation[^\]]*)\]"
     r"|\(\s*advisor[^\)]*\)",
@@ -2743,6 +2800,7 @@ class SubagentTaskSnapshot:
     stages: tuple[SubagentStage, ...]
     execution_elapsed: float
     approval_wait_elapsed: float
+    partial_result: str = ""
 
 
 @dataclass
@@ -2759,8 +2817,15 @@ class SubagentTask:
     started_at: float | None = None
     finished_at: float | None = None
     result: str = ""
+    # 现场打捞：超时/取消/失败时已产出的正文（不改变任务终态）。
+    # 终态判定可能早于线程返回，正文若只写 result 会被整块丢弃。
+    partial_result: str = ""
     error: str = ""
     tool_errors: dict[str, str] = field(default_factory=dict, repr=False)
+    # 回合级中止原因（无进展熔断/轮次上限只走 turn_error 事件通道，
+    # 不 yield 正文；不单独记录就会退化成"子代理无公开结论"）
+    turn_error: str = ""
+    tool_success_count: int = 0
     stage: str = "queued"
     stages: list[SubagentStage] = field(default_factory=list)
     execution_elapsed: float = 0.0
@@ -3233,18 +3298,40 @@ class SubagentManager:
                         pass
                 return
 
+            # 现场打捞：终态判定前先把已产出的正文落进 partial_result
+            self._record_partial(task.task_id, result)
+
             try:
                 if task.cancel_event.is_set():
                     self._terminate(task.task_id, "cancelled", "task cancelled")
-                elif task.tool_errors:
+                elif task.turn_error or not _has_meaningful_subagent_result(result):
+                    # 无有效正文、或回合被熔断/轮次上限中止（正文只是中止前的
+                    # 过程叙述，不是结论）才判失败；此时工具错误与回合级原因
+                    # 是最有价值的诊断信息
+                    reason = (
+                        f"子代理回合被中止：{task.turn_error}"
+                        if task.turn_error
+                        else "subagent returned no public answer"
+                    )
+                    if not task.turn_error and task.tool_errors:
+                        reason += "；工具错误: " + "; ".join(
+                            f"{name}: {detail}"
+                            for name, detail in task.tool_errors.items()
+                        )
+                    self._terminate(task.task_id, "failed", reason)
+                elif task.tool_errors and task.tool_success_count == 0:
+                    # 所有工具调用都失败：结论只是错误复述，不能当成功
                     details = "; ".join(
                         f"{name}: {detail}" for name, detail in task.tool_errors.items()
                     )
                     self._terminate(task.task_id, "failed", details)
-                elif not _has_meaningful_subagent_result(result):
-                    self._terminate(task.task_id, "failed", "subagent returned no public answer")
                 else:
-                    self._complete(task.task_id, result)
+                    self._complete(
+                        task.task_id,
+                        _with_tool_error_footer(
+                            result, task.tool_errors, task.turn_error
+                        ),
+                    )
             finally:
                 _tool_cache.set_current_session(None)
         finally:
@@ -3381,15 +3468,13 @@ class SubagentManager:
             task = self._tasks[task_id]
             if task.status == "completed":
                 result = str(task.result or "")
-                # 子代理结果过长时截断，避免完整大段内容进入主代理上下文浪费 token。
-                max_len = SUBAGENT_RESULT_MAX_CHARS
-                if len(result) > max_len:
-                    omitted = len(result) - max_len
-                    result = (
-                        result[:max_len]
-                        + f"\n\n... [子代理结果已截断，省略 {omitted} 字符]"
-                    )
-                return result
+                # 子代理结果过长时截断，避免完整大段内容进入主代理上下文浪费 token；
+                # 尾部告警块（工具报错/回合级中止原因）由 helper 原样保留。
+                return _truncate_subagent_result(
+                    result,
+                    SUBAGENT_RESULT_MAX_CHARS,
+                    "\n\n... [子代理结果已截断，省略 {omitted} 字符]",
+                )
             if task.status == "timed_out" and task.handoff:
                 # 计划项子代理超时移交：返回结构化 JSON，让主 Agent 直接进入
                 # 接管核查流程（检查现场 → 继续执行 → plan_finish），
@@ -3402,6 +3487,7 @@ class SubagentManager:
                     "inspection_required": True,
                     "stage": task.stage,
                     "execution_elapsed": round(task.execution_elapsed, 1),
+                    "partial_result": str(task.partial_result or "")[:1500],
                     "error": task.error,
                 }, ensure_ascii=False)
             # 失败/超时/取消：返回结构化文本，让主 agent 能快速理解决策下一步
@@ -3463,6 +3549,12 @@ class SubagentManager:
         if tool_lines:
             parts.append("失败工具清单:")
             parts.extend(tool_lines)
+        partial = str(task.partial_result or "").strip()
+        if partial:
+            if len(partial) > 1500:
+                partial = partial[:1500] + "..."
+            parts.append("已完成的部分（超时/失败前已产出的正文，据此判断成果是否已落地）:")
+            parts.append(partial)
         parts.append(f"耗时: 执行 {round(task.execution_elapsed, 1)}s / 等待审批 {round(task.approval_wait_elapsed, 1)}s")
         parts.append("下一步建议:")
         for h in hints:
@@ -3736,7 +3828,20 @@ class SubagentManager:
             stages=tuple(task.stages),
             execution_elapsed=task.execution_elapsed,
             approval_wait_elapsed=task.approval_wait_elapsed,
+            partial_result=task.partial_result,
         )
+
+    def _record_partial(self, task_id: str, text: str) -> None:
+        """现场打捞：记录已产出的正文，不改变任务终态（终态判定可能早于线程返回）。"""
+        cleaned = str(text or "").strip()
+        if not cleaned:
+            return
+        with self._lock:
+            task = self._tasks.get(task_id)
+            if task is None:
+                return
+            if len(cleaned) > len(task.partial_result):
+                task.partial_result = cleaned
 
     def _record_stage(self, task_id: str, name: str, detail: str = "") -> None:
         with self._lock:
@@ -3944,59 +4049,91 @@ class SubagentManager:
         )
         answer = []
         tool_errors: dict[str, str] = {}
+        success_count = 0
+        partial_parts: list[str] = []
+        partial_len = 0
+        partial_flushed = 0
+        turn_error_message = ""
         # 进入子代理深度作用域：在此作用域内 _get_current_subagent_depth() 返回新深度。
         # 必须把事件消费循环包在作用域内，因为生成器创建时并不执行子代理逻辑；
         # 若只包生成器创建语句，深度会在真正执行前复位，嵌套深度限制将永久失效。
-        with _subagent_depth_scope():
-            for event in events:
-                if event.kind == "thinking_started":
-                    self._record_stage(task.task_id, "thinking")
-                elif event.kind == "tool_started":
-                    self._record_stage(
-                        task.task_id,
-                        "tool",
-                        str(event.payload.get("name", "")),
-                    )
-                    # 结果只保留最后一次工具调用之后的文本。工具调用前的过程叙述
-                    # （"我先给你一版初步结论，继续补读…"）不是最终结论，拼进结果
-                    # 会让主 Agent 把中间思路当成事实汇总（软件识别会话的真实事故）。
-                    answer.clear()
-                elif event.kind == "permission_requested":
-                    self._record_stage(task.task_id, "waiting_approval")
-                elif event.kind == "permission_resolved":
-                    self._record_stage(task.task_id, "running", "approval resolved")
-                elif event.kind == "assistant_delta":
-                    self._record_stage(task.task_id, "composing")
-                    answer.append(str(event.payload.get("text", "")))
-                elif event.kind == "tool_finished":
-                    name = str(event.payload.get("name", "tool"))
-                    if event.payload.get("ok") is False:
-                        tool_errors[name] = str(
-                            event.payload.get("summary")
-                            or event.payload.get("error")
-                            or "工具执行失败"
+        try:
+            with _subagent_depth_scope():
+                for event in events:
+                    if event.kind == "thinking_started":
+                        self._record_stage(task.task_id, "thinking")
+                    elif event.kind == "tool_started":
+                        self._record_stage(
+                            task.task_id,
+                            "tool",
+                            str(event.payload.get("name", "")),
                         )
-                    else:
-                        tool_errors.pop(name, None)
-                elif event.kind == "diff_ready":
-                    # 子代理修改文件产生的 diff 必须转发回父回合，否则父回合的
-                    # "文件更改"面板会丢失子代理的改动。tool_call_id 是子代理
-                    # 内部的调用 id，父端匹配不到会归入 legacy_diffs 兜底，
-                    # 仍能汇总展示。后台子代理在父回合结束后才转发时，父端
-                    # 事件流已收尾，转发为 best-effort（失败不影响主流程）。
-                    if task.event_callback is not None:
-                        try:
-                            task.event_callback("diff_ready", dict(event.payload))
-                        except Exception:
-                            logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
+                        # 结果只保留最后一次工具调用之后的文本。工具调用前的过程叙述
+                        # （"我先给你一版初步结论，继续补读…"）不是最终结论，拼进结果
+                        # 会让主 Agent 把中间思路当成事实汇总（软件识别会话的真实事故）。
+                        answer.clear()
+                    elif event.kind == "permission_requested":
+                        self._record_stage(task.task_id, "waiting_approval")
+                    elif event.kind == "permission_resolved":
+                        self._record_stage(task.task_id, "running", "approval resolved")
+                    elif event.kind == "assistant_delta":
+                        self._record_stage(task.task_id, "composing")
+                        text = str(event.payload.get("text", ""))
+                        answer.append(text)
+                        # 现场打捞用：partial_parts 不随 tool_started 清空
+                        partial_parts.append(text)
+                        partial_len += len(text)
+                        if partial_len - partial_flushed >= 2000:
+                            self._record_partial(task.task_id, "".join(partial_parts))
+                            partial_flushed = partial_len
+                    elif event.kind == "tool_finished":
+                        name = str(event.payload.get("name", "tool"))
+                        if event.payload.get("ok") is False:
+                            tool_errors[name] = str(
+                                event.payload.get("summary")
+                                or event.payload.get("error")
+                                or "工具执行失败"
+                            )
+                        else:
+                            tool_errors.pop(name, None)
+                            success_count += 1
+                    elif event.kind == "turn_error":
+                        # 无进展熔断/轮次上限只走事件通道，不 yield 正文
+                        turn_error_message = str(
+                            event.payload.get("message") or turn_error_message
+                        )
+                    elif event.kind == "diff_ready":
+                        # 子代理修改文件产生的 diff 必须转发回父回合，否则父回合的
+                        # "文件更改"面板会丢失子代理的改动。tool_call_id 是子代理
+                        # 内部的调用 id，父端匹配不到会归入 legacy_diffs 兜底，
+                        # 仍能汇总展示。后台子代理在父回合结束后才转发时，父端
+                        # 事件流已收尾，转发为 best-effort（失败不影响主流程）。
+                        if task.event_callback is not None:
+                            try:
+                                task.event_callback("diff_ready", dict(event.payload))
+                            except Exception:
+                                logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
+        finally:
+            # 现场打捞兜底：与循环内的周期 flush 幂等（_record_partial 只在更长时覆盖）。
+            # 事件循环中途抛异常（如网络错误）时，周期 flush 只保到最后一个
+            # 2000 字符边界，靠这里把尾部不足 2000 的正文也捞住，不改变异常传播。
+            self._record_partial(task.task_id, "".join(partial_parts))
         task.tool_errors.update(tool_errors)
+        task.tool_success_count = success_count
+        task.turn_error = turn_error_message
         result_text = "".join(answer)
 
         # summary_continuation：结果过短或为空时追加要求展开，避免子代理敷衍
         # 参考 Kimi Code 的 SUMMARY_MIN_LENGTH 机制。
         # 为空也要触发：最后一次工具调用之后模型可能没再输出文本（结果提取
         # 只保留末次工具调用后的内容），此时必须补一轮总结才有可交付结论。
-        if len(result_text.strip()) < 200 and not task.cancel_event.is_set():
+        # 无进展熔断/轮次上限中止（turn_error）后不再续写：终态已注定 failed，
+        # 续写产出只会以截断 partial 出现在失败文本里，白烧一次 LLM 请求。
+        if (
+            len(result_text.strip()) < 200
+            and not task.cancel_event.is_set()
+            and not turn_error_message
+        ):
             continuation_prompt = (
                 "你之前的回答过于简短。请提供更完整的总结，包含：\n"
                 "1. 具体的技术细节和实现要点\n"
