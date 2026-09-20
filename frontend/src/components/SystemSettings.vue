@@ -98,6 +98,15 @@
             :disabled="saving"
           />
           <button
+            data-test="pick-ai-output-dir"
+            class="setting-save"
+            type="button"
+            :disabled="saving"
+            @click="pickAiOutputDir"
+          >
+            选择目录
+          </button>
+          <button
             data-test="save-ai-output-dir"
             class="setting-save"
             type="button"
@@ -319,6 +328,17 @@ async function saveAiOutputDir() {
   }
 }
 
+// 选目录：桌面走原生文件夹对话框，触屏/原生不可用时回退内置目录浏览器
+// （store.pickFolderPlain 统一入口）；选到路径后回填草稿并直接保存，
+// 用户取消时回调不触发，草稿与已保存值都保持原样
+async function pickAiOutputDir() {
+  if (saving.value) return;
+  await store.pickFolderPlain((path: string) => {
+    aiOutputDirDraft.value = path;
+    void saveAiOutputDir();
+  });
+}
+
 async function selectShell(shellId: string) {
   if (shellId === store.systemSettings.command_shell || saving.value) return;
   saving.value = true;
@@ -426,8 +446,9 @@ async function selectComputerBrowser(browser: string) {
 .setting-number { width: 120px; height: 38px; padding: 0 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
 .setting-number:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
 .setting-number:disabled { cursor: wait; opacity: .7; }
-/* AI 生成内容目录是长路径：仅加宽该输入框，其余数值型设置项维持原宽度 */
-.setting-number[data-test="ai-output-dir-input"] { width: 320px; }
+/* AI 生成内容目录是长路径：仅加宽该输入框，其余数值型设置项维持原宽度；
+   右侧多了「选择目录」按钮，宽度略收避免挤压左侧说明文案 */
+.setting-number[data-test="ai-output-dir-input"] { width: 260px; }
 .setting-save { height: 38px; padding: 0 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
 .setting-save:hover:not(:disabled) { background: var(--bg3); }
 .setting-save:disabled { cursor: not-allowed; opacity: .6; }
@@ -468,5 +489,8 @@ async function selectComputerBrowser(browser: string) {
 @media (max-width: 620px) {
   .setting-row { align-items: stretch; flex-direction: column; gap: 12px; padding: 16px 0; }
   .setting-select { flex-basis: auto; max-width: none; width: 100%; }
+  /* 窄屏下目录输入框与两个按钮换行铺满，不横向溢出 */
+  .setting-number-group { flex-wrap: wrap; width: 100%; }
+  .setting-number[data-test="ai-output-dir-input"] { flex: 1 1 160px; width: auto; min-width: 0; }
 }
 </style>
