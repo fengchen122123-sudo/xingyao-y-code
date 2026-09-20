@@ -316,6 +316,9 @@ def build_runtime_context(model_name: str, permission_mode: str, api_base: str =
     from core.turn_undo.prompt_context import build_workspace_correction_section
 
     workspace_corrections = build_workspace_correction_section(get_workdir())
+    # AI 生成内容目录（Task 6）：配置级稳定值，注入动态块告知模型统一落点。
+    from core.ai_output_paths import resolve_ai_output_dir
+
     return RuntimeContext(
         model_name=model_name,
         permission_mode=permission_mode,
@@ -325,6 +328,7 @@ def build_runtime_context(model_name: str, permission_mode: str, api_base: str =
         command_shell=describe_selected_command_shell(),
         computer_capability=computer_capability,
         workspace_corrections=workspace_corrections,
+        ai_output_dir=str(resolve_ai_output_dir()),
     )
 
 

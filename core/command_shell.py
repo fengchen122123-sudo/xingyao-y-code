@@ -216,6 +216,14 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
 
     hotkey = get_emergency_hotkey_snapshot()
     computer_run = get_computer_control_service().snapshot()
+    # AI 生成内容目录（设置项 ai_output_dir）：同样走函数内惰性导入，
+    # 避免模块级 import 造成 command_shell ↔ ai_output_paths 循环依赖。
+    from core.ai_output_paths import (
+        default_ai_output_dir as _default_ai_output_dir,
+        get_ai_output_dir_setting as _get_ai_output_dir_setting,
+        resolve_ai_output_dir as _resolve_ai_output_dir,
+    )
+
     return {
         "command_shell": selected,
         "command_shell_options": options,
@@ -235,6 +243,10 @@ def get_system_settings(*, platform: str | None = None) -> dict[str, Any]:
         "computer_hotkey": "Ctrl+Alt+Esc",
         "computer_run": computer_run.to_public_dict(),
         "computer_active_model_capability": _computer_active_model_capability(computer),
+        # AI 生成内容目录：生效绝对路径 / 原始配置值（设置页回显）/ 默认目录
+        "ai_output_dir": str(_resolve_ai_output_dir()),
+        "ai_output_dir_setting": _get_ai_output_dir_setting(),
+        "ai_output_dir_default": str(_default_ai_output_dir()),
     }
 
 

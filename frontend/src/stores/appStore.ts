@@ -462,6 +462,10 @@ export const useAppStore = defineStore('app', {
       agent_turn_step_limit: 200,
       agent_turn_step_limit_min: 10,
       agent_turn_step_limit_max: 1000,
+      // AI 生成内容目录：默认目录与生效路径一律以后端快照覆盖，前端不猜路径
+      ai_output_dir: '',
+      ai_output_dir_setting: '',
+      ai_output_dir_default: '',
       // 电脑操控默认关闭（设计 8.1）：真实值一律以后端快照覆盖
       browser_control_enabled: false,
       computer_control_enabled: false,
@@ -1950,6 +1954,30 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.systemSettings = previous;
         this.connected = false;
         this.notifyModal('系统设置', '命令解释器设置失败: ' + err);
+        return false;
+      }
+    },
+
+    // AI 生成内容目录（Task 5）：成功/失败都以返回快照校准本地 systemSettings，
+    // 失败时后端快照本身即回滚值；桥接异常兜底回滚到调用前的快照
+    async setAiOutputDir(path: string): Promise<boolean> {
+      const previous = this.systemSettings;
+      const api = this._api();
+      if (!api) return false;
+      try {
+        const result = await api.set_ai_output_dir(path);
+        if (result && result.ok) {
+          this.systemSettings = result.settings || previous;
+          this.notifyModal('系统设置', result.msg || 'AI 生成内容目录已更新');
+          return true;
+        }
+        this.systemSettings = result?.settings || previous;
+        this.notifyModal('系统设置', 'AI 生成内容目录设置失败: ' + (result?.msg || '未知错误'));
+        return false;
+      } catch (err) {
+        this.systemSettings = previous;
+        this.connected = false;
+        this.notifyModal('系统设置', 'AI 生成内容目录设置失败: ' + err);
         return false;
       }
     },

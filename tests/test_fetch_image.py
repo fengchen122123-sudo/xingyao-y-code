@@ -47,7 +47,10 @@ def _patch_http(monkeypatch, body=b"", content_type="image/png"):
 def test_fetch_image_downloads_png_and_returns_local_path(monkeypatch, tmp_path):
     payload = b"\x89PNG\r\n\x1a\n" + b"\x00" * 128
     _patch_http(monkeypatch, payload, "image/png")
-    monkeypatch.chdir(tmp_path)
+    # 落点由 AI 生成内容目录决定（不再跟进程 cwd 走）：把配置指向 tmp_path
+    monkeypatch.setattr(
+        "core.ai_output_paths._read_setting", lambda: str(tmp_path)
+    )
 
     result = fetch_image("https://example.com/pic.png")
 

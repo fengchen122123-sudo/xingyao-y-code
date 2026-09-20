@@ -39,6 +39,9 @@ class RuntimeContext:
     computer_capability: "ComputerCapability | None" = None
     # 按回合撤销纠正动态块（规格 15.3）：无纠正时为空串，动态块字节不变。
     workspace_corrections: str = ""
+    # AI 生成内容目录（Task 6）：配置级稳定值（默认 ~/.ycode/tmp），
+    # 跨轮不变，符合动态块"不放每轮必变字段"的约束。
+    ai_output_dir: str = ""
 
 
 def build_stable_prompt(base_prompt: str) -> str:
@@ -86,6 +89,9 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
         f"默认命令解释器：{runtime.command_shell}\n"
         "生成命令时必须优先使用该解释器的语法；命令失败后根据错误调整语法，"
         "必要时可通过 execute_command 的 shell_id 显式选择其他已安装解释器。\n"
+        f"AI 生成内容目录：{runtime.ai_output_dir}\n"
+        "AI 产出的图片、下载文件与临时脚本一律写到该目录；"
+        "用户显式指定了保存位置时以用户指定为准。\n"
         f"当前计划：{runtime.active_plan}\n"
         f"{plan_instruction}"
         "（若上下文中存在多份本块，以最新一份为准）"

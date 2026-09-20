@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { mount } from '@vue/test-utils';
+import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 
 import SystemSettings from './SystemSettings.vue';
@@ -10,6 +10,14 @@ const turnStepLimitFields = {
   agent_turn_step_limit: 200,
   agent_turn_step_limit_min: 10,
   agent_turn_step_limit_max: 1000,
+};
+
+// AI 生成内容目录设置（Task 5）：setting 为原始配置值（未配置为空串），
+// default 为默认目录（占位符与说明文案展示用）
+const aiOutputDirFields = {
+  ai_output_dir: 'C:\\ycode-data\\tmp',
+  ai_output_dir_setting: '',
+  ai_output_dir_default: 'C:\\ycode-data\\tmp',
 };
 
 // 电脑操控设置快照（Task 12）：两个开关默认关闭，浏览器选项独立探测
@@ -56,6 +64,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [
         {
@@ -87,6 +96,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [
         {
@@ -115,6 +125,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
     };
@@ -137,6 +148,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
     };
@@ -157,6 +169,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       command_shell_options: [],
     };
@@ -170,6 +183,56 @@ describe('SystemSettings', () => {
     expect(save).not.toHaveBeenCalled();
   });
 
+  // ── AI 生成内容目录（Task 5）──
+
+  it('saves the AI output directory through the store', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
+    const wrapper = mount(SystemSettings);
+
+    // 占位符显示后端给出的默认目录，用户不填即恢复默认
+    const input = wrapper.get('[data-test="ai-output-dir-input"]');
+    expect(input.attributes('placeholder')).toBe('C:\\ycode-data\\tmp');
+
+    await input.setValue('D:/ai_out');
+    await wrapper.get('[data-test="save-ai-output-dir"]').trigger('click');
+
+    expect(save).toHaveBeenCalledWith('D:/ai_out');
+  });
+
+  it('shows the error and keeps the draft when saving the AI output directory fails', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(false);
+    const wrapper = mount(SystemSettings);
+
+    await wrapper.get('[data-test="ai-output-dir-input"]').setValue('D:/ai_out');
+    await wrapper.get('[data-test="save-ai-output-dir"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="ai-output-dir-error"]').text()).toContain('保存失败');
+    expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('D:/ai_out');
+  });
+
   // ── 电脑操控区（Task 12）──
 
   function mountWithComputerSettings(overrides: Record<string, unknown> = {}) {
@@ -180,6 +243,7 @@ describe('SystemSettings', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       ...overrides,
     } as typeof store.systemSettings;
@@ -299,6 +363,7 @@ describe('computer active model capability hint', () => {
       command_shell_error: '',
       remote_token_ttl: 86400,
       ...turnStepLimitFields,
+      ...aiOutputDirFields,
       ...computerSettings,
       ...overrides,
     } as typeof store.systemSettings;

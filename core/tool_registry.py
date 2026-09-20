@@ -438,7 +438,7 @@ def build_default_registry() -> ToolRegistry:
         ),
         ToolSpec(
             name="fetch_image",
-            description="下载网页中的图片到本地并返回本地路径。仅当 fetch_url / search_news 结果中含与主题直接相关的图片、需要图文并茂展示时使用；广告/图标/头像等无关图片不要下载。成功后按界面形态展示：GUI 会话用 Markdown 图片语法 ![](本地路径) 内嵌（远程 URL 前端不渲染，必须下载成本地路径）；CLI 终端直接给出本地路径。仅支持 http/https，仅 png/jpg/jpeg/gif/webp，上限 10MB。",
+            description="下载网页中的图片到本地并返回本地路径。仅当 fetch_url / search_news 结果中含与主题直接相关的图片、需要图文并茂展示时使用；广告/图标/头像等无关图片不要下载。成功后按界面形态展示：GUI 会话用 Markdown 图片语法 ![](本地路径) 内嵌（远程 URL 前端不渲染，必须下载成本地路径）；CLI 终端直接给出本地路径。图片落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）。仅支持 http/https，仅 png/jpg/jpeg/gif/webp，上限 10MB。",
             input_schema=_schema({
                 "url": {"type": "string", "description": "完整的 http 或 https 图片地址"},
                 "timeout_seconds": {
