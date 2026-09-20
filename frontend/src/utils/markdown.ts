@@ -19,7 +19,9 @@ function escapeHtml(text: string): string {
 
 // 代码块模式：renderMarkdown 提取与 findCodeBlockRanges 共用同一 pattern，
 // 保证切分器与渲染器对「代码块范围」的判定完全一致。
-const CODE_BLOCK_PATTERN = '```(\\w*)\\n([\\s\\S]*?)```';
+// 围栏后的换行允许 \r：Windows 剪贴板/工具输出常带 CRLF，只匹配 \n 会导致
+// 整块围栏（含 mermaid 图）识别不到，被当作纯文本显示。
+const CODE_BLOCK_PATTERN = '```(\\w*)\\r?\\n([\\s\\S]*?)```';
 
 /** 返回所有已闭合代码块的 [start, end) 字符范围。 */
 export function findCodeBlockRanges(source: string): Array<[number, number]> {
@@ -139,7 +141,9 @@ export function renderMarkdownDetailed(
   const codeBlocks: string[] = [];
   const fileLinks: string[] = [];
   const links: string[] = [];
-  text = text.replace(new RegExp(CODE_BLOCK_PATTERN, 'g'), (_, lang, code) => {
+  text = text.replace(new RegExp(CODE_BLOCK_PATTERN, 'g'), (_, lang, rawCode) => {
+    // CRLF 归一化：行尾残留的 \r 会被当成源码内容送进 mermaid 解析器
+    const code = String(rawCode ?? '').replace(/\r\n?/g, '\n');
     const idx = codeBlocks.length;
     // mermaid 块：renderMarkdown 保持纯同步——这里只产出带缓存 key 的占位
     // 容器 + 隐藏源码（均已转义），SVG 渲染由 mermaidRenderer 在 DOM 挂载后
