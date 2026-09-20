@@ -21,6 +21,12 @@ type MermaidApi = {
 let mermaidModulePromise: Promise<MermaidApi | null> | null = null;
 let initialized = false;
 let renderSeq = 0;
+// 加载失败后的冷却期：流式期间每个 delta 都会重建 DOM 并触发渲染，
+// 没有冷却会让每次触发都重发一次动态 import
+const LOAD_RETRY_COOLDOWN_MS = 5000;
+let loadFailedAt = 0;
+// 抽成变量便于测试注入（生产默认就是动态 import）
+let mermaidImporter: () => Promise<unknown> = () => import('mermaid');
 
 const svgCache = new Map<string, string>();
 const MAX_CACHE_ENTRIES = 50;
@@ -34,9 +40,12 @@ function isDarkTheme(): boolean {
 
 function loadMermaid(): Promise<MermaidApi | null> {
   if (!mermaidModulePromise) {
+    if (loadFailedAt && Date.now() - loadFailedAt < LOAD_RETRY_COOLDOWN_MS) {
+      return Promise.resolve(null);
+    }
     // 动态 import：mermaid 体积大（约 1.4MB min），拆成独立 chunk 按需加载，
     // 首个 mermaid 块出现才拉取；加载/初始化失败返回 null，块降级显示源码
-    mermaidModulePromise = import('mermaid')
+    mermaidModulePromise = mermaidImporter()
       .then((mod) => {
         const mermaid = ((mod as Record<string, unknown>).default ?? mod) as MermaidApi;
         if (!initialized) {
@@ -49,7 +58,12 @@ function loadMermaid(): Promise<MermaidApi | null> {
         }
         return mermaid;
       })
-      .catch(() => null);
+      .catch(() => {
+        // 失败不缓存：清空 promise 并进入冷却，冷却后允许重试
+        mermaidModulePromise = null;
+        loadFailedAt = Date.now();
+        return null;
+      });
   }
   return mermaidModulePromise;
 }
@@ -100,9 +114,12 @@ function injectSvg(block: HTMLElement, svg: string): void {
   if (source) source.setAttribute('hidden', '');
 }
 
-function markError(block: HTMLElement): void {
+function markError(block: HTMLElement, reason = ''): void {
   block.setAttribute('data-state', 'error');
-  // 错误态展示源码供用户复制自救（CSS 按状态控制显隐）
+  // 透出 mermaid 原始报错（如 "Parse error on line 2"），让用户一眼区分
+  // 「源码语法写错」和「渲染器故障」；多行信息截成一行、限长 120
+  const detail = String(reason || '').split('\n').filter(Boolean)[0]?.slice(0, 120) ?? '';
+  block.setAttribute('data-error-reason', detail ? `原因：${detail} ` : '');
   const source = block.querySelector('pre.mermaid-src');
   if (source) source.removeAttribute('hidden');
 }
@@ -128,7 +145,7 @@ export async function renderMermaidBlocks(root: HTMLElement | null): Promise<voi
     const key = block.dataset.mermaidKey || '';
     const source = block.querySelector('pre.mermaid-src')?.textContent ?? '';
     if (!key || !source.trim()) {
-      markError(block);
+      markError(block, '源码为空');
       continue;
     }
     const cached = svgCache.get(key);
@@ -142,7 +159,7 @@ export async function renderMermaidBlocks(root: HTMLElement | null): Promise<voi
       continue;
     }
     if (!mermaid) {
-      markError(block);
+      markError(block, '渲染器加载失败');
       continue;
     }
     block.setAttribute('data-state', 'rendering');
@@ -156,8 +173,8 @@ export async function renderMermaidBlocks(root: HTMLElement | null): Promise<voi
       if (block.isConnected && block.dataset.state === 'rendering') {
         injectSvg(block, clean);
       }
-    } catch {
-      if (block.isConnected) markError(block);
+    } catch (err) {
+      if (block.isConnected) markError(block, err instanceof Error ? err.message : String(err));
     }
   }
 }
@@ -167,5 +184,14 @@ export function __resetMermaidRendererForTest(): void {
   mermaidModulePromise = null;
   initialized = false;
   renderSeq = 0;
+  loadFailedAt = 0;
+  mermaidImporter = () => import('mermaid');
   svgCache.clear();
+}
+
+// 测试专用：替换 mermaid 动态加载器（模拟加载失败与重试），生产路径不变
+export function __setMermaidImporterForTest(
+  importer: (() => Promise<unknown>) | null,
+): void {
+  mermaidImporter = importer ?? (() => import('mermaid'));
 }

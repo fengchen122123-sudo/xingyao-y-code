@@ -31,6 +31,12 @@ describe('findCodeBlockRanges', () => {
     const src = '```a\n1\n```\n\n```b\n2\n```';
     expect(findCodeBlockRanges(src)).toHaveLength(2);
   });
+
+  it('CRLF 换行的代码块同样能被识别（Windows 来源文本）', () => {
+    const src = 'a\r\n```ts\r\nconst x = 1;\r\n```\r\nb';
+    const ranges = findCodeBlockRanges(src);
+    expect(ranges).toHaveLength(1);
+  });
 });
 
 describe('renderMarkdownDetailed', () => {
@@ -56,5 +62,12 @@ describe('renderMarkdownDetailed', () => {
 
   it('空输入返回空 html 与 0 计数', () => {
     expect(renderMarkdownDetailed('')).toEqual({ html: '', mediaCount: 0 });
+  });
+
+  it('CRLF 的 mermaid 围栏渲染为占位容器而非纯文本', () => {
+    const md = '```mermaid\r\nflowchart LR\r\nA-->B\r\n```\r\n';
+    const html = renderMarkdown(md);
+    expect(html).toContain('class="mermaid-block"');
+    expect(html).not.toContain('```mermaid');
   });
 });

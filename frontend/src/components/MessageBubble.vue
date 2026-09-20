@@ -983,7 +983,7 @@ async function copyUserMessage() {
   color: var(--text);
 }
 .md-body :deep(.mermaid-block[data-state='error'])::after {
-  content: '⚠️ 图表渲染失败，已显示 Mermaid 源码。可点击「复制源码」到其他渲染工具查看。';
+  content: '⚠️ 图表渲染失败，已显示 Mermaid 源码。' attr(data-error-reason) '可点击「复制源码」到其他渲染工具查看。';
   display: block;
   font-size: 12px;
   color: var(--orange);
