@@ -434,6 +434,16 @@ def _resolve_workspace_path(file_path, *, allow_trusted_read=False):
                 return candidate
         except Exception:
             pass
+    # AI 生成内容目录写入豁免：AI 产出的临时脚本 / 中间产物按设置统一落该目录，
+    # 不属于越界访问（规格 6.1）。目录由用户在设置页指定，视为已授权；
+    # 豁免只针对该目录，其余路径的沙盒判定不受影响。
+    try:
+        from core.ai_output_paths import is_ai_output_path
+
+        if is_ai_output_path(candidate):
+            return candidate
+    except Exception:
+        pass
     # 沙盒外路径必须经过 _sandbox_outside_guard 询问用户，
     # 用户批准后通过 sandbox_bypass() 设置线程级放行，_outside_workspace_allowed() 即返回 True。
     from core.workspace_context import get_workdir
@@ -1433,14 +1443,19 @@ def fetch_image(url, timeout_seconds=HTTP_TIMEOUT_SECONDS, cancel_event=None):
                         f"图片体积超过 {IMAGE_MAX_BYTES // (1024 * 1024)}MB 限制，已中止下载"
                     )
             _raise_if_cancelled(cancel_event)
+        # 落点：AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp），
+        # 不再用进程 cwd——打包版会把图片写进安装目录（规格 5）。
+        from core.ai_output_paths import resolve_ai_output_dir
+
+        target_dir = resolve_ai_output_dir()
         timestamp = time.strftime("%Y%m%d_%H%M%S")
         filename = f"download_{timestamp}.{extension}"
-        target = Path.cwd() / filename
+        target = target_dir / filename
         # 同秒重复/并发下载时避免互相覆盖
         counter = 2
         while target.exists():
             filename = f"download_{timestamp}_{counter}.{extension}"
-            target = Path.cwd() / filename
+            target = target_dir / filename
             counter += 1
         payload = bytes(data)
         # 按回合撤销：下载图片也是受控文件修改（fetch_image 注册 mutates_files）。

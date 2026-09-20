@@ -53,7 +53,7 @@ def _detect_ext(head: bytes) -> str:
     return ".img"
 
 
-def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", footnote: str = " ", image: str = "") -> ToolResult:
+def generate_image(prompt: str, size: str = "1024x1024", save_dir: str | None = None, footnote: str = " ", image: str = "") -> ToolResult:
     """调用混元生图接口生成图片并下载保存，返回本地路径等信息。
 
     作为插件工具 hunyuan_generate_image 的执行体被注册。
@@ -127,7 +127,13 @@ def generate_image(prompt: str, size: str = "1024x1024", save_dir: str = ".", fo
             is_error=True,
         )
 
-    # imageUrl 仅 24 小时有效，立即下载保存
+    # imageUrl 仅 24 小时有效，立即下载保存。
+    # 未传 save_dir → AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）；
+    # 显式传值（含 "."）→ 尊重原参数，不做隐式改道。
+    if save_dir is None:
+        from core.ai_output_paths import resolve_ai_output_dir
+
+        save_dir = str(resolve_ai_output_dir())
     save_dir = os.path.abspath(save_dir or ".")
     os.makedirs(save_dir, exist_ok=True)
     base = os.path.join(save_dir, "hunyuan_%s" % time.strftime("%Y%m%d_%H%M%S"))

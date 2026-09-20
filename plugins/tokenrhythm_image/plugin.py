@@ -90,15 +90,28 @@ def _response_format_for(model: str) -> str:
     return "b64_json" if model == "wan2.7-image" else "url"
 
 
+def _resolve_save_dir(save_dir: str | None) -> str:
+    """解析图片保存目录：未传 → AI 生成内容目录；显式传值 → 原样尊重。
+
+    未传（None）时统一落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp），
+    不再跟进程 cwd 走；显式传值（含 "."）保持旧行为，不做隐式改道。
+    """
+    if save_dir is None:
+        from core.ai_output_paths import resolve_ai_output_dir
+
+        return str(resolve_ai_output_dir())
+    return os.path.abspath(save_dir or ".")
+
+
 def _save_image_bytes(
-    payload: bytes, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+    payload: bytes, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
 ) -> str:
     """把图片字节写入本地，扩展名按文件头判断。
 
     按回合撤销：落盘前先持久化计划 after 快照（插件声明的受控文件修改
     同样接入 FileMutationRecorder，规格 9.5）。
     """
-    save_dir = os.path.abspath(save_dir or ".")
+    save_dir = _resolve_save_dir(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     path = os.path.join(
         save_dir,
@@ -134,9 +147,9 @@ def _save_image_bytes(
     return path
 
 
-def _download_image(url: str, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image") -> str:
+def _download_image(url: str, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image") -> str:
     """下载 URL 内容后落盘：先写 .part，读完即删，再按文件头确定扩展名。"""
-    save_dir = os.path.abspath(save_dir or ".")
+    save_dir = _resolve_save_dir(save_dir)
     os.makedirs(save_dir, exist_ok=True)
     tmp = os.path.join(save_dir, ".tokenrhythm_%s.part" % uuid.uuid4().hex)
     try:
@@ -153,7 +166,7 @@ def _download_image(url: str, save_dir: str, prefix: str, tool_name: str = "toke
 
 
 def _save_b64_image(
-    b64: str, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+    b64: str, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
 ) -> str:
     """服务端直接回 base64 时解码落盘（wan2.7-image 走这条路径）。"""
     import base64
@@ -168,7 +181,7 @@ def _save_b64_image(
 
 
 def _save_image_from_result(
-    result: dict, save_dir: str, prefix: str, tool_name: str = "tokenrhythm_generate_image"
+    result: dict, save_dir: str | None, prefix: str, tool_name: str = "tokenrhythm_generate_image"
 ) -> tuple:
     """从接口响应取图并落盘：优先 data[0].b64_json，其次 data[0].url。
 
@@ -216,7 +229,7 @@ def generate_image(
     size: str = "1024x1024",
     model: str = "qwen-image-2.0",
     n: int = 1,
-    save_dir: str = ".",
+    save_dir: str | None = None,
 ) -> ToolResult:
     """文生图：POST /v1/images/generations，落盘 data[0].b64_json 或 data[0].url。
 
@@ -293,7 +306,7 @@ def edit_image(
     image: str,
     size: str = "",
     model: str = "qwen-image-2.0",
-    save_dir: str = ".",
+    save_dir: str | None = None,
 ) -> ToolResult:
     """图生图（垫图改图）：multipart 上传 1 张原图 + 文字指令，POST /v1/images/edits。"""
     prompt = (prompt or "").strip()
@@ -448,7 +461,7 @@ def register(registry):
                 },
                 "save_dir": {
                     "type": "string",
-                    "description": "图片保存目录，默认当前工作目录",
+                    "description": "图片保存目录；不传则落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）",
                 },
             },
             "required": ["prompt"],
@@ -492,7 +505,7 @@ def register(registry):
                 },
                 "save_dir": {
                     "type": "string",
-                    "description": "图片保存目录，默认当前工作目录",
+                    "description": "图片保存目录；不传则落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）",
                 },
             },
             "required": ["prompt", "image"],

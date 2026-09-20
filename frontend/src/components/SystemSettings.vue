@@ -83,6 +83,34 @@
       <p v-if="turnStepLimitError" data-test="turn-step-limit-error" class="setting-error">
         {{ turnStepLimitError }}
       </p>
+      <div class="setting-row">
+        <div class="setting-copy">
+          <h2>AI 生成内容目录</h2>
+          <p>AI 生成的图片、下载的网页图片与临时脚本统一落到此目录；留空恢复默认（{{ store.systemSettings.ai_output_dir_default }}）。</p>
+        </div>
+        <div class="setting-number-group">
+          <input
+            data-test="ai-output-dir-input"
+            v-model="aiOutputDirDraft"
+            class="setting-number"
+            type="text"
+            :placeholder="store.systemSettings.ai_output_dir_default"
+            :disabled="saving"
+          />
+          <button
+            data-test="save-ai-output-dir"
+            class="setting-save"
+            type="button"
+            :disabled="saving || !aiOutputDirChanged"
+            @click="saveAiOutputDir"
+          >
+            保存
+          </button>
+        </div>
+      </div>
+      <p v-if="aiOutputDirError" data-test="ai-output-dir-error" class="setting-error">
+        {{ aiOutputDirError }}
+      </p>
       <p v-if="store.systemSettings.command_shell_error" class="setting-error">
         {{ store.systemSettings.command_shell_error }}
       </p>
@@ -263,6 +291,34 @@ async function saveTurnStepLimit() {
   }
 }
 
+// AI 生成内容目录（Task 5）：草稿保存的是原始配置值（未配置为空串），
+// 生效路径与默认目录都由后端快照给出，前端不自行拼路径
+const aiOutputDirDraft = ref(store.systemSettings.ai_output_dir_setting || '');
+const aiOutputDirError = ref('');
+
+watch(
+  () => store.systemSettings.ai_output_dir_setting,
+  value => { aiOutputDirDraft.value = value || ''; },
+);
+
+const aiOutputDirChanged = computed(
+  () => aiOutputDirDraft.value.trim() !== (store.systemSettings.ai_output_dir_setting || ''),
+);
+
+async function saveAiOutputDir() {
+  if (saving.value || !aiOutputDirChanged.value) return;
+  aiOutputDirError.value = '';
+  saving.value = true;
+  try {
+    const saved = await store.setAiOutputDir(aiOutputDirDraft.value.trim());
+    if (!saved) {
+      aiOutputDirError.value = '保存失败，请检查路径是否可写';
+    }
+  } finally {
+    saving.value = false;
+  }
+}
+
 async function selectShell(shellId: string) {
   if (shellId === store.systemSettings.command_shell || saving.value) return;
   saving.value = true;
@@ -370,6 +426,8 @@ async function selectComputerBrowser(browser: string) {
 .setting-number { width: 120px; height: 38px; padding: 0 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
 .setting-number:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 15%, transparent); }
 .setting-number:disabled { cursor: wait; opacity: .7; }
+/* AI 生成内容目录是长路径：仅加宽该输入框，其余数值型设置项维持原宽度 */
+.setting-number[data-test="ai-output-dir-input"] { width: 320px; }
 .setting-save { height: 38px; padding: 0 16px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); color: var(--text); font: inherit; }
 .setting-save:hover:not(:disabled) { background: var(--bg3); }
 .setting-save:disabled { cursor: not-allowed; opacity: .6; }

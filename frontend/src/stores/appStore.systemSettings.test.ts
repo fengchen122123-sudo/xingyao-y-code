@@ -12,6 +12,9 @@ const settings = {
   agent_turn_step_limit: 200,
   agent_turn_step_limit_min: 10,
   agent_turn_step_limit_max: 1000,
+  ai_output_dir: 'C:\\ycode-data\\tmp',
+  ai_output_dir_setting: '',
+  ai_output_dir_default: 'C:\\ycode-data\\tmp',
   browser_control_enabled: false,
   computer_control_enabled: false,
   computer_browser: 'edge',
@@ -209,5 +212,47 @@ describe('system settings store', () => {
     expect(ok).toBe(true);
     expect(enable).toHaveBeenCalledWith(true);
     expect(store.systemSettings.computer_control_enabled).toBe(true);
+  });
+
+  // ── AI 生成内容目录（Task 5）：只以后端返回快照覆盖，失败即回滚 ──
+
+  it('persists the AI output directory and applies the returned snapshot', async () => {
+    const next = structuredClone(settings);
+    next.ai_output_dir = 'D:\\ai_out';
+    next.ai_output_dir_setting = 'D:\\ai_out';
+    const setDir = vi.fn().mockResolvedValue({
+      ok: true,
+      settings: next,
+      msg: 'AI 生成内容目录已更新：D:\\ai_out',
+    });
+    (window as any).pywebview = { api: { set_ai_output_dir: setDir } };
+    const store = useAppStore();
+    store.systemSettings = structuredClone(settings);
+
+    const ok = await store.setAiOutputDir('D:\\ai_out');
+
+    expect(ok).toBe(true);
+    expect(setDir).toHaveBeenCalledWith('D:\\ai_out');
+    expect(store.systemSettings.ai_output_dir).toBe('D:\\ai_out');
+    expect(store.confirmModal.message).toContain('AI 生成内容目录已更新');
+  });
+
+  it('rolls back to the backend snapshot when the AI output directory is rejected', async () => {
+    const unchanged = structuredClone(settings);
+    const setDir = vi.fn().mockResolvedValue({
+      ok: false,
+      msg: '目录不可写或无法创建：D:\\blocked',
+      settings: unchanged,
+    });
+    (window as any).pywebview = { api: { set_ai_output_dir: setDir } };
+    const store = useAppStore();
+    store.systemSettings = structuredClone(settings);
+
+    const ok = await store.setAiOutputDir('D:\\blocked');
+
+    expect(ok).toBe(false);
+    expect(setDir).toHaveBeenCalledWith('D:\\blocked');
+    expect(store.systemSettings.ai_output_dir_setting).toBe('');
+    expect(store.confirmModal.message).toContain('目录不可写或无法创建');
   });
 });

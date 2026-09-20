@@ -226,6 +226,18 @@ def classify_path_access(
             return "credential_write"
         return "trusted_read"
 
+    # AI 生成内容目录（规格 6.1）：AI 产物（生图 / 下载图 / 临时脚本）按设置统一落到
+    # 该目录，目录由用户在设置页显式指定，视为已授权落点——读写都不算越界访问。
+    # 判定必须与 _sandbox_outside_guard 保持一致，否则权限层免问、执行层又弹确认。
+    try:
+        from core.ai_output_paths import is_ai_output_path
+
+        if is_ai_output_path(str(path_value)):
+            return "trusted_read"
+    except Exception:
+        # 豁免判定属于安全边界：无法确认时不得放行，按普通越界路径处理
+        pass
+
     if function_name in _TRUSTED_READONLY_TOOLS:
         try:
             from core.skills import is_trusted_read_path
@@ -336,6 +348,20 @@ def _sandbox_outside_guard(
             if is_trusted_paste_path(str(path_value)) or is_session_user_attached_path(str(path_value)):
                 return sandbox_bypass(), None
         except Exception:
+            pass
+    # AI 生成内容目录豁免（规格 6.1）：AI 产出的临时脚本 / 中间产物按设置统一落到该
+    # 目录，目录由用户在设置页显式指定，视为已授权。这里对**写工具同样放行**——
+    # 旧实现只豁免 _TRUSTED_READONLY_TOOLS，导致 AI 往该目录写文件仍多弹一次越界确认。
+    # 边界：① 只豁免该目录自身及其子路径，其他任何路径的写保护不受影响；
+    # ② 凭据写入（credential_write）优先，绝不被本豁免绕过。
+    if not credential_write:
+        try:
+            from core.ai_output_paths import is_ai_output_path
+
+            if is_ai_output_path(path_value):
+                return sandbox_bypass(), None
+        except Exception:
+            # 安全边界：判定失败时不放行，继续走下方询问流程（fail-closed）
             pass
     if getattr(tools_module._sandbox_tls, "depth", 0) > 0:
         return None, None
