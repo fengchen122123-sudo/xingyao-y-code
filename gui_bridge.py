@@ -3724,6 +3724,20 @@ class ApiBridge(GitBridgeMixin):
         except (CommandShellError, ValueError) as error:
             return {"ok": False, "msg": str(error), "settings": self.get_system_settings()}
 
+    def set_ai_output_dir(self, path: str) -> Dict[str, Any]:
+        """设置 AI 生成内容目录；不可用路径显式拒绝，不做静默降级。"""
+        from core.ai_output_paths import AiOutputDirError, set_ai_output_dir_setting
+
+        try:
+            effective = set_ai_output_dir_setting(path)
+            return {
+                "ok": True,
+                "settings": self.get_system_settings(),
+                "msg": f"AI 生成内容目录已更新：{effective}",
+            }
+        except (AiOutputDirError, ValueError) as error:
+            return {"ok": False, "msg": str(error), "settings": self.get_system_settings()}
+
     def set_agent_turn_step_limit(self, value: int) -> Dict[str, Any]:
         """设置单任务最大模型轮次；显式非法值必须拒绝且不写盘。"""
         from core.harness.turn_limits import TurnStepLimitError, save_turn_step_limit

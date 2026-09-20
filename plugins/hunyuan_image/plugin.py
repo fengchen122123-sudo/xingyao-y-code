@@ -40,7 +40,7 @@ def register(registry):
                 },
                 "save_dir": {
                     "type": "string",
-                    "description": "图片保存目录，默认当前工作目录",
+                    "description": "图片保存目录；不传则落到 AI 生成内容目录（设置页可配置，默认 ~/.ycode/tmp）",
                 },
                 "footnote": {
                     "type": "string",

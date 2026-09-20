@@ -135,6 +135,12 @@ export interface SystemSettingsSnapshot {
   agent_turn_step_limit: number;
   agent_turn_step_limit_min: number;
   agent_turn_step_limit_max: number;
+  // AI 生成内容目录（Task 5）：ai_output_dir 为当前生效的绝对路径；
+  // ai_output_dir_setting 为原始配置值（未配置为空串，供设置页回显草稿）；
+  // ai_output_dir_default 为默认目录（占位符展示用）
+  ai_output_dir: string;
+  ai_output_dir_setting: string;
+  ai_output_dir_default: string;
   // 电脑操控设置（设计 8.1/8.2）：两个开关默认关闭，浏览器选项独立探测
   browser_control_enabled: boolean;
   computer_control_enabled: boolean;
@@ -803,6 +809,8 @@ export interface PyWebViewAPI {
   set_sandbox_enabled(enabled: boolean): Promise<any>;
   get_system_settings(): Promise<SystemSettingsSnapshot>;
   set_command_shell(shellId: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // AI 生成内容目录：不可用路径显式拒绝（ok=false + msg），不做静默降级
+  set_ai_output_dir(path: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   // 电脑操控三个严格 setter（Task 12）：失败返回 error_code + 后端真实快照
