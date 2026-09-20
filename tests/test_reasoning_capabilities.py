@@ -33,6 +33,30 @@ def test_deepseek_prefixed_names_resolve_to_official_thinking_capability():
         assert capability.request_strategy == "thinking_object_effort", name
 
 
+def test_glm53_variant_names_inherit_family_capability():
+    """glm-5.3 家族未登记变体（如网关挂载名 flashx）自动继承强制思考能力。
+
+    能力表精确登记了 glm-5.3 / glm-5.3-flash / glm-5.3-free；其余以
+    glm-5.3 开头的变体按家族能力适配：low/high/max 三档，不可关闭。
+    """
+    for name in (
+        "glm-5.3-flashx",
+        "openai/glm-5.3-flashx",
+        "GLM-5.3-Turbo",
+        "https://gateway.example/v1/glm-5.3-custom",
+    ):
+        capability = get_reasoning_capability(name)
+        assert capability.kind == "effort", name
+        assert capability.options == ("default", "low", "high", "max"), name
+        assert capability.request_strategy == "thinking_object_effort", name
+
+
+def test_glm53_prefix_rule_does_not_spill_to_other_glm_generations():
+    """前缀规则只作用于 glm-5.3 家族，其他代际未知变体仍按未适配处理。"""
+    for name in ("glm-5.4", "glm-5.2-plus", "my-glm-5.3-clone"):
+        assert get_reasoning_capability(name).kind == "hidden", name
+
+
 def test_non_deepseek_unknown_models_stay_hidden():
     """deepseek 前缀规则不得外溢：其他未登记模型仍按未适配处理。"""
     for name in (
