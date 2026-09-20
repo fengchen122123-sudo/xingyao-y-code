@@ -233,6 +233,13 @@ _AGNES_PREFIX_CAPABILITY = ReasoningCapability(
     "toggle", ("default", "off", "on"), "agnes_enable_thinking"
 )
 
+# GLM-5.3 家族：强制思考（thinking.type 传 disabled 会报错），reasoning_effort
+# 仅支持 low/high/max。精确登记之外的变体名（网关挂载名、后缀变体如 flashx）
+# 按"glm-5.3 前缀"统一继承该能力，无需逐个登记；其他 GLM 代际不受影响。
+_GLM53_PREFIX_CAPABILITY = ReasoningCapability(
+    "effort", ("default", "low", "high", "max"), "thinking_object_effort"
+)
+
 
 def _model_leaf_name(normalized: str) -> str:
     """取传输前缀或网关 URL 之后的裸模型名。"""
@@ -265,6 +272,8 @@ def get_reasoning_capability(model_name: str) -> ReasoningCapability:
         return _DEEPSEEK_PREFIX_CAPABILITY
     if _model_leaf_name(normalized).startswith("agnes"):
         return _AGNES_PREFIX_CAPABILITY
+    if _model_leaf_name(normalized).startswith("glm-5.3"):
+        return _GLM53_PREFIX_CAPABILITY
     return HIDDEN_REASONING_CAPABILITY
 
 
