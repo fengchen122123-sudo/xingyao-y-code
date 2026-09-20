@@ -233,6 +233,57 @@ describe('SystemSettings', () => {
     expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('D:/ai_out');
   });
 
+  it('picks the AI output directory from the folder dialog, fills the draft and saves it', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
+    // 选择目录走 store.pickFolderPlain（桌面原生对话框 / 触屏内置浏览器统一入口）
+    const pick = vi.spyOn(store, 'pickFolderPlain').mockImplementation(async (cb: (path: string) => void) => {
+      cb('D:\\ai_out');
+    });
+    const wrapper = mount(SystemSettings);
+
+    await wrapper.get('[data-test="pick-ai-output-dir"]').trigger('click');
+    await flushPromises();
+
+    expect(pick).toHaveBeenCalled();
+    expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('D:\\ai_out');
+    expect(save).toHaveBeenCalledWith('D:\\ai_out');
+  });
+
+  it('keeps the draft and saves nothing when the folder dialog is cancelled', async () => {
+    const store = useAppStore();
+    store.systemSettings = {
+      command_shell: 'auto',
+      command_shell_available: true,
+      command_shell_error: '',
+      remote_token_ttl: 86400,
+      ...turnStepLimitFields,
+      ...aiOutputDirFields,
+      ...computerSettings,
+      command_shell_options: [],
+    };
+    const save = vi.spyOn(store, 'setAiOutputDir').mockResolvedValue(true);
+    // 用户取消：pickFolderPlain 的回调不触发
+    vi.spyOn(store, 'pickFolderPlain').mockImplementation(async () => {});
+    const wrapper = mount(SystemSettings);
+
+    await wrapper.get('[data-test="pick-ai-output-dir"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get<HTMLInputElement>('[data-test="ai-output-dir-input"]').element.value).toBe('');
+    expect(save).not.toHaveBeenCalled();
+  });
+
   // ── 电脑操控区（Task 12）──
 
   function mountWithComputerSettings(overrides: Record<string, unknown> = {}) {
