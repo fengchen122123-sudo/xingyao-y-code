@@ -27,6 +27,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import winreg
 
 
@@ -488,6 +489,32 @@ def _is_within_path(path, root):
         return False
 
 
+def _is_under_program_files(path):
+    """判断 path 是否位于 Program Files（含 x86）的子目录中（不含根目录本身）。
+
+    这是 machine 范围安装位置的唯一判定真值，供向导选项页即时校验与
+    _validate_install_target 引擎侧最后防线共用。此前两处各写一份判定，
+    一旦漂移就会出现"界面说合法、安装却报错"的错位（用户看到莫名的"安装失败"）。
+    判定与旧实现完全一致：realpath + normcase 归一化（消解 8.3 短名、大小写、
+    尾随反斜杠、目录联接差异），并排除 Program Files 根目录本身。
+    """
+    install_dir = os.path.abspath(str(path or ""))
+    roots = [
+        value for value in (
+            os.environ.get("ProgramFiles"),
+            os.environ.get("ProgramFiles(x86)"),
+        ) if value
+    ]
+    if not roots:
+        return False
+    return any(
+        _is_within_path(install_dir, root)
+        and os.path.normcase(os.path.realpath(install_dir))
+        != os.path.normcase(os.path.realpath(root))
+        for root in roots
+    )
+
+
 def _validate_install_target(path, scope):
     install_dir = os.path.abspath(str(path or ""))
     _validate_path_entry(install_dir)
@@ -497,18 +524,10 @@ def _validate_install_target(path, scope):
     if not tail.strip("\\/"):
         raise InstallError("不能安装到磁盘根目录。")
     if scope == "machine":
-        roots = [
-            value for value in (
-                os.environ.get("ProgramFiles"),
-                os.environ.get("ProgramFiles(x86)"),
-            ) if value
-        ]
-        if not roots or not any(
-            _is_within_path(install_dir, root)
-            and os.path.normcase(os.path.realpath(install_dir))
-            != os.path.normcase(os.path.realpath(root))
-            for root in roots
-        ):
+        # 复用 _is_under_program_files，避免与向导选项页的即时校验判定漂移。
+        # 这条引擎侧校验保留为最后防线，绝不因界面已校验而放宽——防止绕过向导
+        # 的路径（提权参数、手改注册表）装到所有人可写目录后又加全局 PATH。
+        if not _is_under_program_files(install_dir):
             raise InstallError("所有用户安装必须位于 Program Files 的子目录中。")
     return install_dir
 
@@ -684,6 +703,16 @@ def _write_install_manifest(install_dir, names):
 _MOVEFILE_REPLACE_EXISTING = 0x1
 _MOVEFILE_DELAY_UNTIL_REBOOT = 0x4
 
+# 被占用文件的"改名让位"备份后缀。改名让位不需要管理员权限，对正在运行的 exe
+# 也能成功，因此优先于需要管理员权限的 MoveFileEx 重启替换。
+_BAK_SUFFIX = ".ycode-bak"
+
+# "重启后替换"用的临时文件后缀。该 tmp 会被登记进 HKLM 的
+# PendingFileRenameOperations，下次开机时用它覆盖目标文件——因此它一旦残留到下一次
+# 安装，就会在下次重启时把新版本覆盖回旧内容（前端 index.html 与 assets 哈希不配套
+# 即白屏），必须在本次成功写入目标后清理掉。
+_REBOOT_TMP_SUFFIX = ".ycode-new"
+
 
 def _schedule_reboot_replace(tmp_src, dest):
     """用 MoveFileEx 标记临时文件在重启后替换到 dest（目标被占用时）。"""
@@ -694,48 +723,270 @@ def _schedule_reboot_replace(tmp_src, dest):
         raise ctypes.WinError()
 
 
-def _write_bytes_with_reboot_fallback(dest, data, log):
-    """写字节到 dest；目标被占用时回退到重启后替换。返回是否需要重启。"""
+def _is_registered_bak(bak, renamed_aside):
+    """该备份路径是否已登记进回滚集合。
+
+    已登记的备份绝不能被删除：删掉它，回滚时再也恢复不出旧字节，还会把一个其实
+    从未被修改的文件误报成"未能恢复为旧版本"，把用户引向错误的排查方向。
+    """
+    if not renamed_aside:
+        return False
+    return any(registered == bak for registered, _dest in renamed_aside)
+
+
+def _rename_aside(dest, log, renamed_aside=None):
+    """把被占用的 dest 改名让位为 dest + _BAK_SUFFIX，返回备份路径；不可行时返回 None。
+
+    改名让位（os.replace）不需要管理员权限，对正在运行的 exe 也能成功，因此优先
+    于 MoveFileEx 重启替换。任何 OSError 都返回 None（不抛异常），交由上层走重启
+    替换兜底；上一次安装遗留的备份删不掉时同样放弃让位，避免覆盖那份备份。
+    """
+    if not os.path.isfile(dest):
+        # 只有普通文件才适合让位：目标是目录（损坏的安装）时让位会把目录换成文件，
+        # 属于破坏性变更，直接交给重启替换/报错兜底。
+        return None
+    bak = dest + _BAK_SUFFIX
+    if os.path.lexists(bak):
+        if _is_registered_bak(bak, renamed_aside):
+            # 这份备份已经承担着回滚职责，保留它并放弃让位（放弃让位只影响本文件的
+            # 兜底路径选择，回滚能力不受损）。
+            log(f"ℹ 备份已在回滚集合中，保留不删: {os.path.basename(bak)}")
+            return None
+        try:
+            os.remove(bak)
+        except OSError as exc:
+            log(f"⚠️ 上次的备份仍被占用，跳过让位: {os.path.basename(bak)} ({exc})")
+            return None
+    try:
+        os.replace(dest, bak)
+        return bak
+    except OSError as exc:
+        log(f"⚠️ 改名让位失败: {os.path.basename(dest)} ({exc})")
+        return None
+
+
+def _restore_renamed(bak, dest, log):
+    """把让位/备份出去的旧文件恢复回原名。失败只记日志，不掩盖原始异常。
+
+    优先用 os.replace（同卷原子改名）。改名失败时退回复制回写：让位失败的常见
+    原因正是目标被以无 FILE_SHARE_DELETE 方式打开，此时 os.replace(bak, dest)
+    同样会失败，但只要还能写就仍能把备份字节复制回去——否则 _make_way_for_existing
+    的复制备份就白做了，失败后目录仍会半新半旧。
+    """
+    try:
+        os.replace(bak, dest)
+        return True
+    except OSError as exc:
+        try:
+            shutil.copy2(bak, dest)
+        except OSError:
+            log(f"⚠️ 恢复原文件失败: {os.path.basename(dest)} ({exc})")
+            return False
+        try:
+            os.remove(bak)
+        except OSError:
+            pass
+        return True
+
+
+def _cleanup_leftover_baks(install_dir, log):
+    """处理安装目录里遗留的 *.ycode-bak：先恢复、再清理。
+
+    上一次安装"改名到一半被强杀/断电"时，bak 是目标文件当时唯一的一份副本：
+      * 对应目标**不存在** → 把 bak 改回原名（自愈，绝不丢掉唯一副本）；
+      * 对应目标**存在** → 说明目标已就位，bak 只是冗余备份，尽力删除。
+    仍用 os.walk(followlinks=False) 且剪掉 reparse point 目录，绝不越出
+    install_dir；恢复/删除失败只记日志，绝不中断安装。
+    """
+    try:
+        for root, dirs, files in os.walk(install_dir, followlinks=False):
+            dirs[:] = [d for d in dirs if not _is_reparse_path(os.path.join(root, d))]
+            for name in files:
+                if not name.endswith(_BAK_SUFFIX):
+                    continue
+                bak = os.path.join(root, name)
+                dest = bak[:-len(_BAK_SUFFIX)]
+                if not os.path.lexists(dest):
+                    # 目标缺失：bak 是上次中断留下的唯一副本，必须恢复
+                    try:
+                        os.replace(bak, dest)
+                        log(f"ℹ 已恢复上次中断遗留的旧文件: {os.path.relpath(dest, install_dir)}")
+                    except OSError as exc:
+                        log(f"⚠️ 恢复上次中断遗留的旧文件失败: {name} ({exc})")
+                    continue
+                # 目标已就位：bak 是冗余备份，尽力删除
+                try:
+                    os.remove(bak)
+                    log(f"ℹ 已清理上次遗留的备份文件: {os.path.relpath(bak, install_dir)}")
+                except OSError as exc:
+                    log(f"⚠️ 清理遗留备份文件失败: {name} ({exc})")
+    except OSError as exc:
+        log(f"⚠️ 扫描遗留备份文件失败: {exc}")
+
+
+def _collect_stale_reboot_tmps(install_dir, log):
+    """收集上次安装遗留的"待重启替换"临时文件（*.ycode-new）路径集合。
+
+    上次安装对某个文件登记过 MoveFileEx(..., MOVEFILE_DELAY_UNTIL_REBOOT) 时，会在
+    下次开机用它覆盖目标。若用户没重启就再次安装：本次把新版本直接写进了目标，而
+    残留的 tmp（旧内容）与注册表条目还在 → 下次重启反而把新版本覆盖回旧内容；若该
+    文件属于前端（index.html / assets），表现就是"更新后打开白屏"。
+    这里只记下这批陈旧 tmp，等本次**成功写入对应目标之后**再删除它们：pending rename
+    的源文件不存在时该操作在重启时是空操作，所以删除陈旧 tmp 既不需要管理员权限，
+    也不会破坏仍需生效的重启替换。仍不跟随 reparse point、绝不越出 install_dir。
+    """
+    stale = set()
+    try:
+        for root, dirs, files in os.walk(install_dir, followlinks=False):
+            dirs[:] = [d for d in dirs if not _is_reparse_path(os.path.join(root, d))]
+            for name in files:
+                if name.endswith(_REBOOT_TMP_SUFFIX):
+                    stale.add(os.path.join(root, name))
+    except OSError as exc:
+        log(f"⚠️ 扫描遗留的待重启替换文件失败: {exc}")
+    if stale:
+        log(f"ℹ 检测到 {len(stale)} 个上次安装遗留的待重启替换文件，"
+            "将在本次成功写入对应文件后清理（避免重启后把新版本覆盖回旧内容）。")
+    return stale
+
+
+def _drop_stale_reboot_tmp(dest, stale_news, log):
+    """本次已成功写入 dest：清掉它遗留的陈旧 .ycode-new，避免重启时被覆盖回旧内容。
+
+    只处理"本次安装开始前就存在"的那批（stale_news），绝不动本次自己产生的
+    .ycode-new——那个文件正被登记着等重启替换，删了就白等一场。
+    """
+    if not stale_news:
+        return
+    tmp = dest + _REBOOT_TMP_SUFFIX
+    if tmp not in stale_news:
+        return
+    stale_news.discard(tmp)
+    try:
+        os.remove(tmp)
+        log(f"ℹ 已清理上次遗留的待重启替换文件: {os.path.basename(tmp)}")
+    except OSError as exc:
+        log(f"⚠️ 清理遗留的待重启替换文件失败: {os.path.basename(tmp)} ({exc})")
+
+
+def _make_way_for_existing(dest, log, renamed_aside):
+    """先让位、后写入：目标已存在时先把它纯改名让位为 dest + _BAK_SUFFIX。
+
+    改名让位不复制数据（几千个文件也很快），把 (bak, dest) 记入 renamed_aside
+    供失败回滚——否则第 N 个文件失败时，前 N-1 个已被新版原地覆盖且无从恢复，
+    目录会半新半旧（前端 index.html 与 assets 哈希不配套即白屏）。
+    目标不存在、目标是目录、或让位失败（如文件被以无 FILE_SHARE_DELETE 方式
+    打开）时什么都不做，交回上层三级兜底（直接写 / 让位后写 / 重启替换），
+    绝不因单个文件让位失败而中止安装。
+    """
+    if not os.path.isfile(dest):
+        # 只有普通文件才适合让位：目标不存在无需让位，目标是目录让位会破坏结构。
+        return
+    renamed = _rename_aside(dest, log, renamed_aside)
+    if renamed is not None:
+        renamed_aside.append((renamed, dest))
+        return
+    # 让位失败时"改名"这条路走不通，但"读"通常仍被允许：改为复制一份备份，
+    # 并把 (bak, dest) 同样记入 renamed_aside 复用回滚逻辑。否则该文件会被就地
+    # 覆盖且无备份，后续任一文件失败就会留下"该文件是新版、其余是旧版"的半新半旧
+    # 目录。备份也失败时才退回现状（直接写、无备份），绝不因备份失败中止安装。
+    bak = dest + _BAK_SUFFIX
+    try:
+        if os.path.lexists(bak) and not _is_registered_bak(bak, renamed_aside):
+            os.remove(bak)
+        shutil.copy2(dest, bak)
+    except OSError as exc:
+        log(f"⚠️ 复制备份失败: {os.path.basename(dest)} ({exc})")
+        return
+    renamed_aside.append((bak, dest))
+
+
+def _payload_file_error(dest, exc):
+    """构造带失败文件路径的 InstallError；兜底异常已含路径时不重复出现。"""
+    detail = str(exc)
+    if dest not in detail:
+        detail = f"{detail}\n文件: {dest}"
+    return InstallError(
+        f"释放文件失败: {detail}\n当前安装目录可能不完整，请重跑安装包修复。"
+    )
+
+
+def _write_bytes_with_reboot_fallback(dest, data, log, renamed_aside=None):
+    """写字节到 dest，返回 (status, bak)。
+
+    三级顺序：直接写 → 改名让位后写 → 写临时文件并登记重启后替换。
+      ("written", None)       直接写入成功；
+      ("written_aside", bak)  原文件被占用，已改名让位并写入新文件（bak 供回滚）；
+      ("reboot", None)        已登记重启后替换（需管理员权限，仅在让位失败时尝试）。
+    两条兜底路径都失败时抛错，异常信息带上 dest 便于定位失败文件。
+    """
     try:
         with open(dest, "wb") as f:
             f.write(data)
-        return False
+        return "written", None
     except PermissionError:
-        tmp = dest + ".ycode-new"
+        bak = _rename_aside(dest, log, renamed_aside)
+        if bak is not None:
+            try:
+                with open(dest, "wb") as f:
+                    f.write(data)
+                log(f"⚠️ 文件被占用，已改名让位并写入新文件: {os.path.basename(dest)}")
+                return "written_aside", bak
+            except Exception as exc:
+                # 让位后仍写不进去：把旧文件改回原名，绝不留下"有备份却没新文件"的状态
+                _restore_renamed(bak, dest, log)
+                raise OSError(f"文件被占用且让位后仍无法写入: {dest}") from exc
+        if os.path.isdir(dest):
+            # 目标是目录而非文件：MoveFileEx 无法用文件替换目录，直接报错让上层回滚
+            raise OSError(f"目标位置被目录占用，无法替换: {dest}")
+        tmp = dest + _REBOOT_TMP_SUFFIX
         try:
             with open(tmp, "wb") as f:
                 f.write(data)
             _schedule_reboot_replace(tmp, dest)
             log(f"⚠️ 文件被占用，已安排重启后替换: {os.path.basename(dest)}")
-            return True
-        except Exception:
+            return "reboot", None
+        except Exception as exc:
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except OSError:
                 pass
-            raise
+            raise OSError(f"文件被占用且无法安排重启替换: {dest}") from exc
 
 
-def _copy_file_with_reboot_fallback(src, dest, log):
-    """复制文件到 dest；目标被占用时回退到重启后替换。返回是否需要重启。"""
+def _copy_file_with_reboot_fallback(src, dest, log, renamed_aside=None):
+    """复制文件到 dest，返回 (status, bak)；语义同 _write_bytes_with_reboot_fallback。"""
     try:
         shutil.copy2(src, dest)
-        return False
+        return "written", None
     except PermissionError:
-        tmp = dest + ".ycode-new"
+        bak = _rename_aside(dest, log, renamed_aside)
+        if bak is not None:
+            try:
+                shutil.copy2(src, dest)
+                log(f"⚠️ 文件被占用，已改名让位并写入新文件: {os.path.basename(dest)}")
+                return "written_aside", bak
+            except Exception as exc:
+                # 让位后仍写不进去：把旧文件改回原名，绝不留下"有备份却没新文件"的状态
+                _restore_renamed(bak, dest, log)
+                raise OSError(f"文件被占用且让位后仍无法写入: {dest}") from exc
+        if os.path.isdir(dest):
+            # 目标是目录而非文件：MoveFileEx 无法用文件替换目录，直接报错让上层回滚
+            raise OSError(f"目标位置被目录占用，无法替换: {dest}")
+        tmp = dest + _REBOOT_TMP_SUFFIX
         try:
             shutil.copy2(src, tmp)
             _schedule_reboot_replace(tmp, dest)
             log(f"⚠️ 文件被占用，已安排重启后替换: {os.path.basename(dest)}")
-            return True
-        except Exception:
+            return "reboot", None
+        except Exception as exc:
             try:
                 if os.path.exists(tmp):
                     os.remove(tmp)
             except OSError:
                 pass
-            raise
+            raise OSError(f"文件被占用且无法安排重启替换: {dest}") from exc
 
 
 def _copy_payload(kind, src, install_dir, cli_only, log, progress, manage_manifest=True):
@@ -752,11 +1003,18 @@ def _copy_payload(kind, src, install_dir, cli_only, log, progress, manage_manife
     # Existing reparse points are rejected before the first payload byte is written.
     for dest in destinations:
         _ensure_no_reparse_components(install_dir, dest)
-    if manage_manifest:
-        _prune_removed_payload(install_dir, names, log)
-    # 修复 M46：记录本次新创建的文件，中途失败时回滚删除，避免半成品残留
-    # （已存在被覆盖的旧文件无法无损恢复，不在回滚范围内）。
+    # 复制开始前清理上次安装遗留的让位备份（*.ycode-bak）：上次因文件被占用删不掉
+    # 的备份在此重试；删不掉只记日志，绝不影响本次安装。
+    _cleanup_leftover_baks(install_dir, log)
+    # 上次遗留的"待重启替换"临时文件先记下来：本次成功写入对应目标后要删掉它们，
+    # 否则下次重启会把新版本覆盖回旧内容（前端资源哈希不配套即白屏）。
+    stale_news = _collect_stale_reboot_tmps(install_dir, log)
+    # 记录本次新创建的文件、让位备份与重启替换临时文件，中途失败时据此回滚，
+    # 避免留下半新半旧、能启动但白屏的坏目录。
     created = []
+    renamed_aside = []  # [(bak, dest)]
+    reboot_tmps = []
+    reboot_dests = []  # 命中重启替换的 dest：成功路径不能删它们的备份
     needs_reboot = False
     try:
         if kind == "zip":
@@ -767,8 +1025,23 @@ def _copy_payload(kind, src, install_dir, cli_only, log, progress, manage_manife
                     _ensure_no_reparse_components(install_dir, dest)
                     if not os.path.lexists(dest):
                         created.append(dest)
-                    if _write_bytes_with_reboot_fallback(dest, zf.read(rel), log):
+                    # 先让位、后写入：已存在的旧文件先纯改名让位（快），记入回滚集合，
+                    # 避免第 N 个文件失败时前 N-1 个已被覆盖却无从恢复。
+                    _make_way_for_existing(dest, log, renamed_aside)
+                    try:
+                        status, bak = _write_bytes_with_reboot_fallback(
+                            dest, zf.read(rel), log, renamed_aside)
+                    except Exception as exc:
+                        raise _payload_file_error(dest, exc) from exc
+                    if status == "written_aside":
+                        renamed_aside.append((bak, dest))
+                    elif status == "reboot":
                         needs_reboot = True
+                        reboot_tmps.append(dest + _REBOOT_TMP_SUFFIX)
+                        reboot_dests.append(dest)
+                    else:
+                        # 本次已把新版本写进 dest：清掉它的陈旧 .ycode-new，避免重启回滚
+                        _drop_stale_reboot_tmp(dest, stale_news, log)
                     progress(idx / total * 85.0)
         else:
             for idx, (rel, dest) in enumerate(zip(names, destinations), 1):
@@ -776,26 +1049,362 @@ def _copy_payload(kind, src, install_dir, cli_only, log, progress, manage_manife
                 _ensure_no_reparse_components(install_dir, dest)
                 if not os.path.lexists(dest):
                     created.append(dest)
-                if _copy_file_with_reboot_fallback(os.path.join(src, rel), dest, log):
+                # 先让位、后写入：已存在的旧文件先纯改名让位（快），记入回滚集合，
+                # 避免第 N 个文件失败时前 N-1 个已被覆盖却无从恢复。
+                _make_way_for_existing(dest, log, renamed_aside)
+                try:
+                    status, bak = _copy_file_with_reboot_fallback(
+                        os.path.join(src, rel), dest, log, renamed_aside)
+                except Exception as exc:
+                    raise _payload_file_error(dest, exc) from exc
+                if status == "written_aside":
+                    renamed_aside.append((bak, dest))
+                elif status == "reboot":
                     needs_reboot = True
+                    reboot_tmps.append(dest + _REBOOT_TMP_SUFFIX)
+                    reboot_dests.append(dest)
+                else:
+                    # 本次已把新版本写进 dest：清掉它的陈旧 .ycode-new，避免重启回滚
+                    _drop_stale_reboot_tmp(dest, stale_news, log)
                 progress(idx / total * 85.0)
-    except Exception:
+    except Exception as exc:
+        # 回滚必须"尽力全量执行"：删除本次新建的文件 → 把让位的旧文件全部改回原名
+        # → 清掉本次产生的 .ycode-new；单步失败只记日志，绝不中断后续恢复，否则会
+        # 留下半新半旧的坏目录（前端 index.html 与 assets 哈希不配套即白屏）。
         for path in created:
             try:
                 os.remove(path)
             except OSError:
                 pass
+        unrestored = []
+        for bak, dest in renamed_aside:
+            if not _restore_renamed(bak, dest, log):
+                unrestored.append(dest)
+        for tmp in reboot_tmps:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
+        if unrestored:
+            # 把"哪些文件没能恢复"汇总进最终异常文案（保留原始异常对象与堆栈）
+            note = ("\n⚠️ 以下文件未能恢复为旧版本，安装目录可能不一致，"
+                    "请重跑安装包修复:\n" + "\n".join(unrestored))
+            try:
+                exc.args = (str(exc) + note,) + tuple(exc.args[1:])
+            except Exception:
+                pass
         raise
     if manage_manifest:
+        # 顺序很重要：先按旧清单清理旧版已移除的文件（prune 依赖旧清单），再写新清单。
+        _prune_removed_payload(install_dir, names, log)
         _write_install_manifest(install_dir, names)
+    # 全部成功后才处理本次让位产生的备份。命中重启替换的 dest 是例外：它的新内容
+    # 要等重启才生效，此时若把备份删掉，目标文件在重启前会整段缺失（Y-code.exe 会
+    # 直接消失）。这类 dest 把备份改回原名，让旧版本继续可用，重启时由
+    # MOVEFILE_REPLACE_EXISTING 换成新版。
+    reboot_set = set(reboot_dests)
+    for bak, dest in renamed_aside:
+        if dest in reboot_set:
+            if _restore_renamed(bak, dest, log):
+                log(f"ℹ {os.path.basename(dest)} 将在系统重启后更新，当前保留旧版本。")
+            continue
+        try:
+            os.remove(bak)
+        except OSError:
+            log(f"⚠️ 备份文件仍被占用，将在下次安装时清理: {os.path.basename(bak)}")
     log(f"✔ 核心程序包及依赖成功释放到: {install_dir}")
     if needs_reboot:
         log("⚠️ 部分文件因正在运行而延迟到系统重启后替换，重启后更新才会完全生效。")
 
 
-def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lambda p: None):
+# 安装前占用预检：只关心安装目录里的自有可执行组件（正在运行的进程会锁住它们）。
+_OCCUPANCY_EXTS = (".exe", ".dll", ".pyd")
+# 可能占用安装目录的自有进程名（安装目录里就这两个可执行文件）。
+_OCCUPANCY_PROCESS_NAMES = ("Y-code.exe", "ycode.exe")
+# 结束进程后重新检测的最长等待时间（秒）与轮询间隔。
+_OCCUPANCY_RETRY_SECONDS = 10
+_OCCUPANCY_POLL_INTERVAL = 0.5
+# taskkill 子进程超时（秒），避免异常环境下卡死整个安装。
+_TASKKILL_TIMEOUT_SECONDS = 10
+# 共享冲突类 WinError：只有这两个才代表"文件被别的进程占着"。
+# ERROR_ACCESS_DENIED(5) 多半只是没写权限（只读属性、未提权时看 Program Files），
+# 不能和真正的占用混为一谈，否则会白弹一次询问、白结束一次进程。
+_SHARING_VIOLATION_WINERRORS = (32, 33)
+# 占用询问等待用户回答的超时（秒）。主线程若因弹窗异常或窗口被销毁而不再消费队列，
+# 没有超时的等待会让安装线程永久假死（进度日志冻结，用户只能杀进程）。
+_OCCUPANCY_ANSWER_TIMEOUT_SECONDS = 30
+
+
+def _probe_locked_payload_files(install_dir):
+    """返回安装目录中已存在、且当前被占用（不可读写打开）的 exe/dll/pyd 列表。
+
+    以 os.open(O_RDWR) 尝试打开，句柄立即关闭。只读/读写方式打开不写入任何字节，
+    不改变文件内容与 mtime，检测本身无副作用；占用判定细节见 _is_file_occupied。
+    失败只返回已收集结果，绝不抛异常，检测不得导致安装失败。
+    """
+    locked = []
+    try:
+        for root, dirs, files in os.walk(install_dir, followlinks=False):
+            # 剪掉 reparse point 目录，绝不越出 install_dir
+            dirs[:] = [d for d in dirs if not _is_reparse_path(os.path.join(root, d))]
+            for name in files:
+                if not name.lower().endswith(_OCCUPANCY_EXTS):
+                    continue
+                path = os.path.join(root, name)
+                if _is_file_occupied(path):
+                    locked.append(path)
+    except OSError:
+        pass
+    return locked
+
+
+def _is_file_occupied(path):
+    """判断 path 是否被其他进程占用（而不是当前用户没有写权限）。
+
+    Windows 上 os.open(path, O_RDWR) 失败时抛的都是 PermissionError，但原因不同：
+      * ERROR_SHARING_VIOLATION(32) / ERROR_LOCK_VIOLATION(33)：确实被占用；
+      * ERROR_ACCESS_DENIED(5)：多半只是文件带只读属性、或当前用户无写权限（例如
+        未提权时看到 Program Files 里的 dll）——把它当成"被占用"会白弹一次询问、
+        白结束一次进程，还在重试窗口里空转十秒。
+    所以共享冲突直接判占用；ACCESS_DENIED 再用只读方式复探一次，能读出来就说明只是
+    没写权限。判定过程中的任何异常都按"未被占用"处理，预检不得影响安装。
+    """
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except PermissionError as exc:
+        if getattr(exc, "winerror", None) in _SHARING_VIOLATION_WINERRORS:
+            return True
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            # 连只读都打不开：保守地当作被占用，把选择权交给用户
+            return True
+        else:
+            os.close(fd)
+            return False
+    except OSError:
+        return False
+    else:
+        os.close(fd)
+        return False
+
+
+def _run_taskkill(args, startupinfo=None):
+    """以列表参数调用 taskkill（不做 shell 字符串插值），带超时；失败返回 False。"""
+    try:
+        proc = subprocess.run(
+            ["taskkill", *args],
+            startupinfo=startupinfo,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=_TASKKILL_TIMEOUT_SECONDS,
+        )
+        return getattr(proc, "returncode", 1) == 0
+    except Exception:  # 子进程异常/超时都只记日志，绝不影响安装
+        return False
+
+
+def _taskkill(process_name, log, startupinfo=None, install_dir=None):
+    """结束**属于本安装目录**的同名进程；返回是否真的结束了进程。
+
+    为什么不用 `taskkill /F /IM`：它只按镜像名匹配，会把安装目录之外的另一个
+    Y-code 实例（便携版、别处的旧版残留）一起结束。这里先用进程镜像全路径筛出
+    属于本安装目录的 PID，再按 PID 结束；一个都筛不出来就不动手（宁可少杀，绝不
+    误杀）。install_dir 为空时退化为按镜像名结束，保持对旧调用方的兼容。
+    """
+    if install_dir:
+        pids = _iter_own_process_pids(process_name, install_dir)
+        if not pids:
+            log(f"ℹ 未发现属于本安装目录的 {process_name} 进程")
+            return False
+        ended = False
+        for pid in pids:
+            ended = _run_taskkill(["/F", "/PID", str(pid)], startupinfo) or ended
+        if ended:
+            log(f"✔ 已结束进程: {process_name} "
+                f"(PID {', '.join(str(pid) for pid in pids)})")
+            return True
+        log(f"⚠️ 结束进程失败: {process_name} "
+            f"(PID {', '.join(str(pid) for pid in pids)})")
+        return False
+    if _run_taskkill(["/F", "/IM", process_name], startupinfo):
+        log(f"✔ 已结束进程: {process_name}")
+        return True
+    log(f"ℹ 未发现运行中的进程: {process_name}")
+    return False
+
+
+def _iter_own_process_pids(process_name, install_dir):
+    """列出"镜像名匹配、且可执行文件位于 install_dir 内"的进程 PID。
+
+    取不到镜像路径的进程一律不列入（宁可少杀，绝不误杀）。任何异常都只导致少杀，
+    绝不影响安装流程。
+    """
+    try:
+        root = os.path.normcase(os.path.realpath(install_dir)) + os.sep
+    except OSError:
+        return []
+    pids = []
+    for pid, image in _iter_process_images(process_name):
+        if not image:
+            continue
+        try:
+            if os.path.normcase(os.path.realpath(image)).startswith(root):
+                pids.append(pid)
+        except OSError:
+            continue
+    return pids
+
+
+def _iter_process_images(process_name):
+    """产出 (pid, 可执行文件全路径)——镜像名等于 process_name 的进程（仅 Windows）。
+
+    用 Toolhelp 快照枚举 PID，再用 QueryFullProcessImageNameW 取全路径：这是为了把
+    "结束进程"限定在本安装目录内。非 Windows 或任何异常都返回已收集结果。
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return []
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+    INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class _PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    results = []
+    try:
+        kernel32 = ctypes.windll.kernel32
+    except Exception:
+        return results
+    try:
+        snapshot = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    except Exception:
+        return results
+    if not snapshot or snapshot == INVALID_HANDLE_VALUE:
+        return results
+    try:
+        entry = _PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32W)
+        if not kernel32.Process32FirstW(snapshot, ctypes.byref(entry)):
+            return results
+        while True:
+            if str(entry.szExeFile).lower() == process_name.lower():
+                pid = int(entry.th32ProcessID)
+                results.append(
+                    (pid, _process_image_path(pid, PROCESS_QUERY_LIMITED_INFORMATION)))
+            if not kernel32.Process32NextW(snapshot, ctypes.byref(entry)):
+                break
+    except Exception:
+        pass
+    finally:
+        try:
+            kernel32.CloseHandle(snapshot)
+        except Exception:
+            pass
+    return results
+
+
+def _process_image_path(pid, access):
+    """取进程可执行文件全路径；取不到返回 ""（调用方据此保守跳过该进程）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+    except Exception:
+        return ""
+    try:
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(access, False, pid)
+    except Exception:
+        return ""
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if not kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return ""
+        return buffer.value
+    except Exception:
+        return ""
+    finally:
+        try:
+            kernel32.CloseHandle(handle)
+        except Exception:
+            pass
+
+
+def _resolve_occupied_files(install_dir, log, ask=None, startupinfo=None):
+    """安装前占用预检：返回仍被占用的文件列表（尽力而为，绝不让预检导致安装失败）。
+
+    ask 为询问回调，接收被占用文件列表，返回：
+      'kill'     自动结束自有进程并继续（默认）
+      'retry'    用户已手动关闭，重新检测
+      'continue' 仍要继续（复制阶段的让位+回滚会保证不破坏目录）
+    ask 为 None（无 UI / 非交互场景）时绝不阻塞：只记日志并直接返回，保持无人值守
+    安装可用。检测无副作用（见 _probe_locked_payload_files）。
+    """
+    locked = _probe_locked_payload_files(install_dir)
+    if not locked:
+        return []
+    log("⚠️ 检测到以下文件正被占用（可能正在运行旧版本）:\n" + "\n".join(locked))
+    if ask is None:
+        log("ℹ 非交互模式：跳过占用处理，直接继续安装（复制阶段会自动让位）。")
+        return locked
+    deadline = time.monotonic() + _OCCUPANCY_RETRY_SECONDS
+    while locked:
+        try:
+            choice = ask(list(locked))
+        except Exception as exc:  # 询问回调异常不得阻塞安装
+            log(f"⚠️ 占用询问失败，直接继续安装: {exc}")
+            return locked
+        if choice == "continue":
+            log("ℹ 已选择继续安装（不结束进程）。")
+            return locked
+        if choice == "retry":
+            locked = _probe_locked_payload_files(install_dir)
+            if not locked:
+                log("✔ 占用已解除，继续安装。")
+                return []
+            log("⚠️ 仍有文件被占用，请关闭相关程序后重试:\n" + "\n".join(locked))
+            continue
+        # 默认 'kill'：结束自有进程后重新检测，最多重试到 _OCCUPANCY_RETRY_SECONDS
+        killed = [name for name in _OCCUPANCY_PROCESS_NAMES
+                  if _taskkill(name, log, startupinfo=startupinfo,
+                               install_dir=install_dir)]
+        while True:
+            locked = _probe_locked_payload_files(install_dir)
+            if not locked or time.monotonic() >= deadline:
+                break
+            time.sleep(_OCCUPANCY_POLL_INTERVAL)
+        if not locked:
+            log(f"✔ 占用已解除，继续安装。（已结束进程: {', '.join(killed) or '无'}）")
+            return []
+        log(f"⚠️ 结束进程后仍有文件被占用（已结束进程: {', '.join(killed) or '无'}）:\n"
+            + "\n".join(locked))
+    return locked
+
+
+def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lambda p: None,
+                ask_occupancy=None, interactive=None):
     """执行完整安装流程。任何致命错误抛 InstallError；非致命问题只记日志。
 
+    ask_occupancy：占用询问回调（见 _resolve_occupied_files）；向导传入，无 UI 时为 None。
+    interactive：显式指定是否交互；None 时默认 CLI 模式为非交互（绝不弹窗/阻塞）。
     返回汇总 dict：{"install_dir", "installed_cli", "desktop_shortcut", "merging_into_full"}。
     """
     scope = getattr(options, "scope", "user")
@@ -815,6 +1424,14 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
         log("🚀 正在安装命令行版核心依赖与组件...")
     else:
         log("🚀 正在安装程序核心依赖与组件...")
+    # 安装前占用预检：对安装目录中已存在的 exe/dll/pyd 逐个探测是否被占用（无副作用）。
+    # 交互式向导可询问用户自动结束自有进程；非交互（CLI 模式 / 无 UI 回调 / 显式
+    # interactive=False）只记日志并继续，绝不弹窗阻塞，保持无人值守安装可用。
+    if interactive is None:
+        interactive = mode != "cli"
+    _resolve_occupied_files(install_dir, log,
+                            ask=ask_occupancy if interactive else None,
+                            startupinfo=startupinfo)
     try:
         _copy_payload(payload_kind, payload_src, install_dir,
                       cli_only=(mode == "cli"), log=log, progress=progress,
@@ -996,6 +1613,8 @@ COLOR_CONTENT = "#FFFFFF"
 COLOR_TEXT = "#1F2937"
 COLOR_TEXT_DIM = "#6B7280"
 COLOR_SEP = "#E5E7EB"
+# 校验失败提示用的红色（与 _show_error 里的失败色一致，统一"危险/错误"语义）
+COLOR_DANGER = "#c0392b"
 WINDOW_W, WINDOW_H = 820, 520
 SIDEBAR_W = 200
 
@@ -1121,6 +1740,11 @@ class SetupWizard(tk.Tk):
         # _maybe_schedule_installer_cleanup）；幂等标志避免用户连点"完成"
         # 或"完成"与窗口关闭协议叠加时启动多个删除进程
         self._installer_cleanup_scheduled = False
+        # 选项页安装路径即时校验状态：_dir_invalid 为真时禁用"下一步/安装"，
+        # _dir_note 用于展示范围切换自动纠正路径的说明（见 _refresh_dir_validation）
+        self._dir_hint = None
+        self._dir_invalid = False
+        self._dir_note = ""
 
         # 页面导航流程：cli 模式没有“安装用户”页（CLI 始终按当前用户安装）
         # 许可协议页紧跟欢迎页：每次安装都展示，须主动勾选才能继续
@@ -1359,6 +1983,10 @@ class SetupWizard(tk.Tk):
             # 许可协议页：未勾选同意不得继续（默认不勾选，须用户主动确认）
             if name == "license" and not self.var_license_agree.get():
                 nxt.configure(state="disabled")
+            # 选项页：machine 范围下路径不在 Program Files 下时不得继续，
+            # 避免用户点"安装"后在安装阶段才收到 _validate_install_target 的报错
+            if name == "options" and self._dir_invalid:
+                nxt.configure(state="disabled")
 
     def _go_next(self):
         name = self._current_page
@@ -1465,14 +2093,52 @@ class SetupWizard(tk.Tk):
                         FONT_TEXT, "#8a6d1a", justify="left").place(x=50, y=200)
 
     def _on_scope_change(self):
-        # 未锁定时，安装路径在用户/机器两个默认值之间跟随切换；
-        # 用户手动改过的路径（不在两个默认值里）保持不变
+        # 重装锁定路径：行为保持现状不变（沿用原安装位置，不由范围切换改写）
         if self.previous_install:
             return
+        scope = self.var_scope.get()
         cur = self.var_dir.get().strip()
-        defaults = {default_install_dir("user"), default_install_dir("machine")}
-        if not cur or cur in defaults:
-            self.var_dir.set(default_install_dir(self.var_scope.get()))
+        user_default = default_install_dir("user")
+        machine_default = default_install_dir("machine")
+        defaults = {user_default, machine_default}
+        self._dir_note = ""
+        if scope == "machine":
+            # 切到"所有用户"：路径必须位于 Program Files 子目录下。旧逻辑只在路径为空
+            # 或正好等于两个默认值之一时才跟随切换，用户此前浏览/手填过路径时不会纠正，
+            # 直到安装阶段 _validate_install_target 才抛错——用户看到的是莫名其妙的
+            # "安装失败"。这里当场纠正为 machine 默认路径并提示"已自动改为 …"。
+            if not cur or cur in defaults or not _is_under_program_files(cur):
+                if cur and cur != machine_default:
+                    self._dir_note = (
+                        f"已自动改为 {machine_default}（为所有用户安装需位于 Program Files 下）。")
+                self.var_dir.set(machine_default)
+        elif not cur or cur in defaults:
+            # 切回"仅为我安装"：路径若为空或仍停留在 machine 默认值则改回 user 默认
+            self.var_dir.set(user_default)
+        # var_dir 值未变化时 trace 不会触发，这里显式刷新一次以保证提示/按钮同步
+        self._refresh_dir_validation()
+
+    def _refresh_dir_validation(self):
+        """按当前范围即时校验安装路径，刷新提示文字与"下一步/安装"按钮状态。
+
+        machine 范围下路径不在 Program Files 子目录时显示红字并置 _dir_invalid，
+        由 _update_nav_buttons 禁用继续；路径合法时恢复，并展示 _dir_note（范围
+        切换自动纠正路径的说明）。校验判定与引擎共用 _is_under_program_files，
+        保证界面结论与安装阶段一致。
+        """
+        if self._dir_hint is None:
+            return
+        scope = "user" if self.mode == "cli" else self.var_scope.get()
+        cur = self.var_dir.get().strip()
+        self._dir_invalid = bool(
+            scope == "machine" and cur and not _is_under_program_files(cur))
+        if self._dir_invalid:
+            self._dir_hint.configure(
+                text="⚠️ 为所有用户安装时，路径必须位于 Program Files 的子目录中。",
+                fg=COLOR_DANGER)
+        else:
+            self._dir_hint.configure(text=self._dir_note, fg="#8a6d1a")
+        self._update_nav_buttons()
 
     def _build_options_page(self):
         page = self._page("options")
@@ -1490,6 +2156,14 @@ class SetupWizard(tk.Tk):
         if locked:
             self._label(page, "检测到已安装的 星瑶Code，将覆盖安装到原位置。",
                         FONT_PAGE_SUB, "#8a6d1a").place(x=40, y=108)
+
+        # 路径输入框即时校验：machine 范围下路径不在 Program Files 子目录时红字提示
+        # 并禁用"下一步/安装"（见 _refresh_dir_validation），避免用户填了非法路径、
+        # 点安装后才在安装阶段收到引擎的"安装失败"。锁定路径时无需校验。
+        if not locked:
+            self._dir_hint = self._label(page, "", FONT_DIM, COLOR_TEXT_DIM)
+            self._dir_hint.place(x=40, y=110)
+            self.var_dir.trace_add("write", lambda *_: self._refresh_dir_validation())
 
         if self.mode == "full":
             tk.Checkbutton(page, text="创建桌面快捷方式",
@@ -1607,6 +2281,7 @@ class SetupWizard(tk.Tk):
                 self.mode, self.bundle_dir, options, self.startupinfo,
                 log=lambda msg: self._ui_queue.put(("log", msg)),
                 progress=lambda p: self._ui_queue.put(("progress", p)),
+                ask_occupancy=self._ask_occupancy,
             )
             self._ui_queue.put(("done", result))
         except InstallError as e:
@@ -1614,21 +2289,117 @@ class SetupWizard(tk.Tk):
         except Exception as e:  # 兜底：引擎外的意外异常也不能让向导卡死
             self._ui_queue.put(("error", f"安装过程出现意外错误: {e}"))
 
+    def _ask_occupancy(self, locked_files):
+        """安装线程调用：把占用询问投递到主线程弹窗，阻塞等待用户选择后返回。
+
+        Tk 非线程安全，弹窗必须在主线程执行；这里用 Event 同步等待，返回
+        'kill' / 'retry' / 'continue'。回调异常时返回"继续"，绝不阻塞安装。
+        """
+        done = threading.Event()
+        answer = {}
+
+        def _respond(choice):
+            answer["choice"] = choice
+            done.set()
+
+        self._ui_queue.put(("ask_occupancy", (list(locked_files), _respond)))
+        # 等待必须带超时：主线程若因弹窗异常、或窗口被销毁而不再消费队列，无超时的
+        # wait 会让安装线程永久假死（进度与日志冻结，用户只能杀进程）。
+        if not done.wait(_OCCUPANCY_ANSWER_TIMEOUT_SECONDS):
+            print("[setup] 占用询问超时未获答复，按“继续安装”处理")
+            return "continue"
+        return answer.get("choice", "continue")
+
+    def _prompt_occupancy(self, locked_files):
+        """主线程弹出"文件被占用"三选对话框，返回 'kill' / 'retry' / 'continue'。
+
+        默认（关闭窗口 / 回车）为「自动结束进程并继续」，与向导"少打断用户"的取向
+        一致；「仍要继续（不推荐）」排在最后。选①后由引擎重新检测并最多重试到 10 秒。
+        """
+        dialog = tk.Toplevel(self)
+        dialog.title("星瑶Code 安装")
+        dialog.configure(bg=COLOR_CONTENT)
+        dialog.resizable(False, False)
+        dialog.transient(self)
+        try:
+            dialog.grab_set()
+        except tk.TclError:
+            # 窗口尚未映射时 grab_set 会抛 TclError（提权路径下向导刚起来就开装）。
+            # 拿不到模态抓取不影响三选逻辑，但异常冒泡出去会让消息泵停摆、安装线程
+            # 只能空等超时，所以必须在这里就地吞掉。
+            pass
+        result = {"choice": "kill"}
+        shown = "\n".join(locked_files[:8]) + ("\n…" if len(locked_files) > 8 else "")
+        self._label(
+            dialog,
+            "检测到以下文件正被占用（可能正在运行旧版本）:\n\n"
+            f"{shown}\n\n"
+            "可以自动结束 星瑶Code 的进程后继续安装。",
+            FONT_TEXT, COLOR_TEXT, justify="left", anchor="w", wraplength=420,
+        ).pack(padx=20, pady=(18, 10), anchor="w")
+
+        def _choose(choice):
+            result["choice"] = choice
+            dialog.destroy()
+
+        btns = tk.Frame(dialog, bg=COLOR_CONTENT)
+        btns.pack(fill="x", padx=20, pady=(0, 18))
+        ttk.Button(btns, text="自动结束进程并继续", style="Brand.TButton",
+                   command=lambda: _choose("kill")).pack(side="left")
+        ttk.Button(btns, text="我已手动关闭，重新检测", style="Ghost.TButton",
+                   command=lambda: _choose("retry")).pack(side="left", padx=8)
+        ttk.Button(btns, text="仍要继续（不推荐）", style="Ghost.TButton",
+                   command=lambda: _choose("continue")).pack(side="left")
+        dialog.protocol("WM_DELETE_WINDOW", lambda: _choose("kill"))
+        # 居中到向导窗口
+        dialog.update_idletasks()
+        x = self.winfo_rootx() + (self.winfo_width() - dialog.winfo_width()) // 2
+        y = self.winfo_rooty() + (self.winfo_height() - dialog.winfo_height()) // 2
+        dialog.geometry(f"+{max(x, 0)}+{max(y, 0)}")
+        try:
+            self.wait_window(dialog)
+        except tk.TclError:
+            # 弹窗被外部销毁（例如用户关掉向导）：按已记录的选择返回，绝不冒泡异常
+            pass
+        return result["choice"]
+
     def _drain_ui_queue(self):
+        """主线程消息泵：逐条消费安装线程的消息。
+
+        单条消息处理失败绝不能停掉整个泵：after 一旦不再重挂，日志/进度会永久冻结，
+        占用询问的等待也会一直空等（向导假死）。所以每条消息独立兜底、after 放 finally。
+        """
         try:
             while True:
                 kind, payload = self._ui_queue.get_nowait()
-                if kind == "log":
-                    self._append_log(payload)
-                elif kind == "progress":
-                    self._set_progress(payload)
-                elif kind == "done":
-                    self._show_finish(payload)
-                elif kind == "error":
-                    self._show_error(payload)
+                try:
+                    if kind == "log":
+                        self._append_log(payload)
+                    elif kind == "progress":
+                        self._set_progress(payload)
+                    elif kind == "ask_occupancy":
+                        # 安装线程投递的占用询问：在主线程弹窗后把选择回传给安装线程
+                        locked_files, respond = payload
+                        respond(self._prompt_occupancy(locked_files))
+                    elif kind == "done":
+                        self._show_finish(payload)
+                    elif kind == "error":
+                        self._show_error(payload)
+                except Exception:
+                    print(f"[setup] 处理安装向导消息失败: {kind}")
+                    if kind == "ask_occupancy":
+                        # 弹窗失败也必须给安装线程一个答复，否则它只能空等超时
+                        try:
+                            payload[1]("continue")
+                        except Exception:
+                            pass
         except queue.Empty:
             pass
-        self.after(50, self._drain_ui_queue)
+        finally:
+            try:
+                self.after(50, self._drain_ui_queue)
+            except Exception:
+                pass  # 窗口已销毁：消息泵自然结束
 
     def _append_log(self, msg):
         self._log_text.configure(state="normal")
@@ -1693,7 +2464,19 @@ class SetupWizard(tk.Tk):
         schedule_installer_self_cleanup(sys.executable, self.startupinfo)
 
     def _on_window_close(self):
-        """右上角 X 关闭：与底部按钮走同一套「安装成功才清理安装包」逻辑。"""
+        """右上角 X 关闭：与底部按钮走同一套「安装成功才清理安装包」逻辑。
+
+        安装进行中拒绝关闭：安装线程是 daemon，窗口销毁后主循环退出会把它硬杀，
+        _copy_payload 的失败回滚根本来不及执行——那正是"半新半旧、能启动但白屏"
+        坏目录的成因。等安装进入成功/失败页再关，语义与安装页禁用取消按钮一致。
+        """
+        if self._current_page == "installing":
+            messagebox.showinfo(
+                "星瑶Code 安装",
+                "安装正在进行，请等待完成后再关闭窗口。",
+                parent=self,
+            )
+            return
         self._maybe_schedule_installer_cleanup()
         self.destroy()
 
