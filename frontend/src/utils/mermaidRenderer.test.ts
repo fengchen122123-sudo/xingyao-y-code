@@ -3,6 +3,7 @@ import {
   renderMermaidBlocks,
   sanitizeSvg,
   __resetMermaidRendererForTest,
+  __setMermaidImporterForTest,
 } from './mermaidRenderer';
 
 // mock mermaid 模块：jsdom 无法真实渲染 SVG（需要真实布局测量），
@@ -131,6 +132,54 @@ describe('renderMermaidBlocks', () => {
     expect(noKey.getAttribute('data-state')).toBe('error');
     expect(emptySrc.getAttribute('data-state')).toBe('error');
     expect(render).not.toHaveBeenCalled();
+  });
+
+  it('渲染失败：error 态带 mermaid 原始报错，便于定位语法问题', async () => {
+    render.mockRejectedValue(new Error('Parse error on line 2: A[foo(bar)]'));
+    const root = document.createElement('div');
+    const block = makeBlock('k-reason', 'graph TD\nA[foo(bar)]');
+    root.appendChild(block);
+    document.body.appendChild(root);
+    await renderMermaidBlocks(root);
+    expect(block.getAttribute('data-state')).toBe('error');
+    expect(block.getAttribute('data-error-reason')).toContain('Parse error on line 2');
+  });
+
+  it('加载失败不永久降级：冷却期过后重新加载，成功后正常渲染', async () => {
+    vi.useFakeTimers();
+    try {
+      let calls = 0;
+      __setMermaidImporterForTest(() => {
+        calls++;
+        if (calls === 1) return Promise.reject(new Error('chunk load failed'));
+        return Promise.resolve({ default: { initialize, render } });
+      });
+      render.mockResolvedValue({ svg: SVG_OK });
+
+      const root = document.createElement('div');
+      document.body.appendChild(root);
+
+      const first = makeBlock('k-load-1', 'graph TD\nA-->B');
+      root.appendChild(first);
+      await renderMermaidBlocks(root);
+      expect(first.getAttribute('data-state')).toBe('error');
+      expect(first.getAttribute('data-error-reason')).toContain('渲染器加载失败');
+      expect(calls).toBe(1);
+
+      const second = makeBlock('k-load-2', 'graph TD\nA-->B');
+      root.appendChild(second);
+      await renderMermaidBlocks(root);
+      expect(calls).toBe(1);
+
+      vi.advanceTimersByTime(5000);
+      const third = makeBlock('k-load-3', 'graph TD\nA-->B');
+      root.appendChild(third);
+      await renderMermaidBlocks(root);
+      expect(calls).toBe(2);
+      expect(third.getAttribute('data-state')).toBe('done');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 
