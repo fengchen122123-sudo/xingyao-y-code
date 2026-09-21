@@ -8,6 +8,11 @@ from dataclasses import dataclass, field
 from typing import Optional, Dict, Any
 
 
+# 全局默认 User-Agent：所有方言的请求头统一带上，便于服务端在调用日志/用量
+# 统计中按客户端归类（不设时 httpx 会填 python-httpx/x.x，导致被识别为 python）。
+DEFAULT_USER_AGENT = "XingYaoCode/1.3.1"
+
+
 @dataclass(frozen=True)
 class ModelPolicy:
     """定义单一模型或厂商方言的行为边界与能力约束。"""
@@ -39,7 +44,7 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
         reasoning_field="reasoning_content",
         supports_temperature=True,
         supports_stream_options=True,
-        default_headers={},
+        default_headers={"User-Agent": DEFAULT_USER_AGENT},
         default_extra_body={},
     ),
     # 月之暗面 Kimi
@@ -48,7 +53,7 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
         reasoning_field="reasoning_content",
         supports_temperature=True,
         supports_stream_options=True,
-        default_headers={},
+        default_headers={"User-Agent": DEFAULT_USER_AGENT},
         default_extra_body={},
     ),
     # 智谱 GLM
@@ -57,7 +62,7 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
         reasoning_field="reasoning_content",
         supports_temperature=True,
         supports_stream_options=True,
-        default_headers={},
+        default_headers={"User-Agent": DEFAULT_USER_AGENT},
         default_extra_body={},
     ),
     # OpenAI 思考模型 (o1, o3-mini)：native 引擎不接手（需 max_completion_tokens /
@@ -68,7 +73,7 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
         reasoning_field="reasoning_content",
         supports_temperature=False,  # 不允许自定义 temperature
         supports_stream_options=True,
-        default_headers={},
+        default_headers={"User-Agent": DEFAULT_USER_AGENT},
         default_extra_body={},
     ),
     # 通义千问 (DashScope)
@@ -77,7 +82,7 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
         reasoning_field="reasoning_content",
         supports_temperature=True,
         supports_stream_options=True,
-        default_headers={},
+        default_headers={"User-Agent": DEFAULT_USER_AGENT},
         default_extra_body={},
     ),
     # MiniMax
@@ -86,7 +91,7 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
         reasoning_field="reasoning_content",
         supports_temperature=True,
         supports_stream_options=True,
-        default_headers={},
+        default_headers={"User-Agent": DEFAULT_USER_AGENT},
         default_extra_body={},
     ),
     # 标准 OpenAI 兼容兜底 (兼容 OneAPI, NewAPI, vLLM, Ollama 等)
@@ -95,7 +100,7 @@ POLICY_REGISTRY: Dict[str, ModelPolicy] = {
         reasoning_field="reasoning_content",
         supports_temperature=True,
         supports_stream_options=True,
-        default_headers={},
+        default_headers={"User-Agent": DEFAULT_USER_AGENT},
         default_extra_body={},
     ),
 }
