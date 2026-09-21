@@ -1,6 +1,7 @@
 <script setup lang="ts">
-import { computed, onMounted } from 'vue';
+import { computed, onMounted, watch } from 'vue';
 import { useRoute } from 'vue-router';
+import { showToast } from 'vant';
 import { useAppStore } from './stores/app';
 
 const store = useAppStore();
@@ -8,12 +9,26 @@ const route = useRoute();
 const activeTab = computed(() => String(route.meta.tab || 'convo'));
 const showTabbar = computed(() => !!route.meta.tab);
 
+// tabbar 永远可见：有 tabbar 的页面弹层底部让出 tabbar 高度（详见 style.css）
+watch(showTabbar, (v) => document.documentElement.classList.toggle('has-tabbar', v), { immediate: true });
+
+// 新审批到达时全局轻提示（首次快照不算，避免每次进入都弹）
+let permSeen = -1;
+watch(() => store.permRequests.length, (n) => {
+  if (permSeen >= 0 && n > permSeen) showToast('有新的审批请求');
+  permSeen = n;
+});
+
 onMounted(() => {
   store.init().catch(() => {
     // init 失败时保持骨架页可交互：离线横幅提示重试
     store.ready = true;
   });
 });
+
+function reloadPage() {
+  window.location.reload();
+}
 
 async function retry() {
   try {
@@ -39,6 +54,11 @@ async function retry() {
     <symbol id="i-up2" viewBox="0 0 24 24"><path d="m17 11-5-5-5 5"/><path d="m17 18-5-5-5 5"/></symbol>
     <symbol id="i-clip" viewBox="0 0 24 24"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
     <symbol id="i-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="m21 15-4.5-4.5L7 20"/></symbol>
+    <symbol id="i-camera" viewBox="0 0 24 24"><path d="M4 8a2 2 0 0 1 2-2h1.6l1.2-1.8h6.4L16.4 6H18a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V8z"/><circle cx="12" cy="12.5" r="3.4"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3v5h5"/><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/></symbol>
+    <symbol id="i-brain" viewBox="0 0 24 24"><path d="M9.5 4.5A2.5 2.5 0 0 0 7 7a2.5 2.5 0 0 0-1.5 4.5A2.5 2.5 0 0 0 7 16a2.5 2.5 0 0 0 2.5 2.5c.8 0 1.5-.4 2-1V5.5c-.5-.6-1.2-1-2-1z"/><path d="M14.5 4.5A2.5 2.5 0 0 1 17 7a2.5 2.5 0 0 1 1.5 4.5A2.5 2.5 0 0 1 17 16a2.5 2.5 0 0 1-2.5 2.5c-.8 0-1.5-.4-2-1V5.5c.5-.6 1.2-1 2-1z"/></symbol>
+    <symbol id="i-zap" viewBox="0 0 24 24"><path d="M13 2 4.5 13.5H11l-1 8.5L19.5 10H13z"/></symbol>
+    <symbol id="i-plug" viewBox="0 0 24 24"><path d="M9 3v6"/><path d="M15 3v6"/><path d="M6 9h12v3a6 6 0 0 1-12 0V9z"/><path d="M12 18v3"/></symbol>
     <symbol id="i-chip" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="2"/><rect x="10" y="10" width="4" height="4"/><path d="M9 2v3M15 2v3M9 19v3M15 19v3M2 9h3M2 15h3M19 9h3M19 15h3"/></symbol>
     <symbol id="i-shield" viewBox="0 0 24 24"><path d="M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z"/></symbol>
     <symbol id="i-pencil" viewBox="0 0 24 24"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></symbol>
@@ -65,6 +85,18 @@ async function retry() {
         <component :is="Component" />
       </keep-alive>
     </router-view>
+
+    <!-- 配对失效：全屏遮罩，必须重新扫码（token 过期/被轮换） -->
+    <div v-if="store.pairInvalid" class="pair-mask">
+      <div class="pair-box">
+        <svg class="i xxl pair-ic"><use href="#i-shield" /></svg>
+        <div class="pair-title">配对已失效</div>
+        <div class="pair-desc">
+          该链接的配对 token 已过期或被重新签发。请在电脑端「手机访问」里重新打开绑定二维码，用手机扫码进入。
+        </div>
+        <button class="pair-btn" @click="reloadPage">重新加载页面</button>
+      </div>
+    </div>
 
     <van-tabbar v-if="showTabbar" :model-value="activeTab" placeholder safe-area-inset-bottom route>
       <van-tabbar-item to="/convo" name="convo">
@@ -109,4 +141,38 @@ async function retry() {
   animation: wx-pulse 1.4s ease-in-out infinite;
   flex: none;
 }
+
+/* 配对失效全屏遮罩：盖住 tabbar 与所有弹层，硬停止 */
+.pair-mask {
+  position: fixed;
+  inset: 0;
+  z-index: 4000;
+  background: color-mix(in srgb, var(--bg) 92%, #000);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 28px;
+}
+.pair-box {
+  max-width: 340px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.pair-ic { color: var(--warn); width: 30px; height: 30px; }
+.pair-title { font-size: 17px; font-weight: 700; color: var(--text-bright); }
+.pair-desc { font-size: 13px; line-height: 1.75; color: var(--text-2); }
+.pair-btn {
+  margin-top: 8px;
+  padding: 10px 20px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--bg-raised);
+  color: var(--text-1);
+  font-size: 13.5px;
+  font-family: inherit;
+}
+.pair-btn:active { background: var(--bg-overlay); }
 </style>

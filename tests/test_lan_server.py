@@ -852,3 +852,92 @@ def test_bridge_qr_mobile_flag_uses_m_path(monkeypatch):
     monkeypatch.setattr(bridge, "_ensure_lan_server", lambda: _Srv())
     assert bridge.get_remote_bind_qr()["path"] == "/"
     assert bridge.get_remote_bind_qr(mobile=True)["path"] == "/m/"
+
+
+# ---------------------------------------------------------------------------
+# token 唯一性：轮换与「校验+注册」原子互斥（缺口 1 回归保护）
+# ---------------------------------------------------------------------------
+
+
+def test_mobile_shim_snapshot_matches_disk():
+    """内嵌 shim 快照必须与磁盘 frontend/mobile-shim.js 完全一致。
+
+    手机端 shim 有两份来源（磁盘文件 + 打包缺失时的内嵌回退）。两份漂移会让
+    打包版手机拿到旧协议（例如丢失 token 持久化/4401 处理），必须锁死一致。
+    """
+    import os
+
+    import core.lan_server as lan_mod
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(
+        os.path.join(root, "frontend", "mobile-shim.js"), encoding="utf-8"
+    ) as f:
+        disk = f.read()
+    assert lan_mod._MOBILE_SHIM_FALLBACK_JS == disk
+
+
+def test_only_latest_token_verifies_after_rotation():
+    """轮换后只有最新 token 能通过校验，旧 token 立即失效。"""
+    srv = LanServer(bridge=None)
+    t1 = srv._issue_token()
+    t2 = srv._issue_token()
+
+    assert not srv._verify_token(t1)
+    assert srv._verify_token(t2)
+    assert not srv._verify_token(t2 + "x")
+    assert not srv._verify_token("")
+
+
+def test_client_registered_before_rotation_is_detached():
+    """轮换瞬间已注册的旧 token 客户端必须被摘除并以 4401 断开。"""
+    srv = LanServer(bridge=None)
+    tok = srv._issue_token()
+    client = _FakeClient()
+    assert srv._authenticate_and_register(client, tok) is True
+    assert srv._clients == [client]
+
+    srv._issue_token()
+
+    assert srv._clients == []
+    assert client.closed and client.closed[0][0] == 4401
+
+
+def test_rotation_rejects_stale_registration_concurrently():
+    """并发场景：旧 token 的注册绝不能在轮换后存活。
+
+    校验+注册持 _clients_lock，轮换的 token 切换也在同一把锁内完成，
+    因此任一时刻只有一个 token 能通过校验；用旧 token 抢注册的客户端
+    要么被拒绝、要么被随后摘除并 4401 断开。
+    """
+    srv = LanServer(bridge=None)
+    old = srv._issue_token()
+
+    registered_stale = []
+    stop = threading.Event()
+
+    def stale_worker():
+        while not stop.is_set():
+            c = _FakeClient()
+            if srv._authenticate_and_register(c, old):
+                registered_stale.append(c)
+            time.sleep(0.0003)
+
+    t = threading.Thread(target=stale_worker)
+    t.start()
+    try:
+        for _ in range(25):
+            srv._issue_token()
+            time.sleep(0.0015)
+    finally:
+        stop.set()
+        t.join()
+
+    # 旧 token 已彻底失效，当前 token 可用
+    assert not srv._verify_token(old)
+    assert srv._verify_token(srv._token.decode())
+    # 任何用旧 token 注册成功的客户端最终都不在客户端列表中，且被 4401 断开
+    assert srv._clients == []
+    for c in registered_stale:
+        assert c not in srv._clients
+        assert c.closed and c.closed[0][0] == 4401

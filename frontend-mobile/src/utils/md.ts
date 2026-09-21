@@ -40,6 +40,9 @@ hljs.registerLanguage('md', markdown);
 hljs.registerLanguage('java', java);
 hljs.registerLanguage('go', go);
 
+/** 代码/命令块折叠阈值：超过该行数默认收起（预览行数） */
+const COLLAPSE_LINES = 4;
+
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
@@ -58,7 +61,15 @@ marked.use({
         ? hljs.highlight(raw, { language: l, ignoreIllegals: true }).value
         : escapeHtml(raw);
       const label = l || 'text';
-      return `<div class="md-code"><div class="md-code-bar"><span class="md-code-lang mono">${label}</span><button type="button" class="md-copy" data-code="${encodeURIComponent(raw)}">复制</button></div><pre><code class="hljs">${body}</code></pre></div>`;
+      // 终端/命令类单独配色；代码/命令默认折叠，最多预览 COLLAPSE_LINES 行
+      const terminal = /^(bash|sh|shell|zsh|powershell|ps1|cmd|bat|sql)$/.test(l);
+      const lines = raw.replace(/\n+$/, '').split('\n').length;
+      const collapsible = lines > COLLAPSE_LINES;
+      const toggle = collapsible
+        ? `<button type="button" class="md-toggle" data-lines="${lines}">展开</button>`
+        : '';
+      const fade = collapsible ? '<div class="md-fade"></div>' : '';
+      return `<div class="md-code${terminal ? ' term' : ''}" data-kind="${terminal ? 'term' : 'code'}" data-lines="${lines}"><div class="md-code-bar"><span class="md-code-lang mono">${label}</span><span class="md-bar-r">${toggle}<button type="button" class="md-copy" data-code="${encodeURIComponent(raw)}">复制</button></span></div><pre><code class="hljs">${body}</code></pre>${fade}</div>`;
     },
     codespan({ text }: { text: string }): string {
       // 源文本整体预转义 + marked 又转义一层 → 还原一层后单次转义显示
