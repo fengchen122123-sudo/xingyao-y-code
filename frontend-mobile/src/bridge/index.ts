@@ -82,3 +82,9 @@ export function onEvent(listener: Listener): () => void {
   listeners.add(listener);
   return () => listeners.delete(listener);
 }
+
+// 配对失效：shim 在 WS 收到 4401（token 过期/被轮换）后派发。
+// 扇出为普通 bridge 事件，复用 onEvent 通道交给 store 处理。
+window.addEventListener('yc-pair-invalid', () => {
+  dispatch({ type: 'pair_invalid', data: {} });
+});

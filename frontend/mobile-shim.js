@@ -12,11 +12,25 @@
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
  * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
  *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
+ * - 配对 token：首次从 URL 参数取并写入 localStorage，之后刷新/重开（URL 无 token）
+ *   回退读 localStorage，直到服务端 TTL 过期或被轮换（4401）才失效。
  */
 (function () {
   if (window.pywebview) return; // 桌面环境不注入，防御性
 
-  var token = new URLSearchParams(window.location.search).get('token') || '';
+  var STORAGE_KEY = 'yc-pair-token';
+  var urlToken = new URLSearchParams(window.location.search).get('token') || '';
+  var token = urlToken;
+  try {
+    if (urlToken) {
+      window.localStorage.setItem(STORAGE_KEY, urlToken);
+    } else {
+      token = window.localStorage.getItem(STORAGE_KEY) || '';
+    }
+  } catch (_) {
+    // localStorage 不可用（隐私模式等）：仅本次 URL token 生效
+  }
+  var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
   var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';
 
   var ws = null;
@@ -88,7 +102,20 @@
         }
       }
     };
-    ws.onclose = function () {
+    ws.onclose = function (event) {
+      if (event && event.code === 4401) {
+        // 配对失效/被轮换：清掉本地 token（仅当与本次使用的相同，避免误清新 token），
+        // 通知前端显示「配对已失效」，并停止重连（空 token 重连只会一直失败）
+        try {
+          if (window.localStorage.getItem(STORAGE_KEY) === usedToken) {
+            window.localStorage.removeItem(STORAGE_KEY);
+          }
+        } catch (_) {}
+        try {
+          window.dispatchEvent(new CustomEvent('yc-pair-invalid'));
+        } catch (_) {}
+        return;
+      }
       setTimeout(connect, 2000); // 基础断线重连
     };
     ws.onerror = function () {};

@@ -55,7 +55,7 @@ _REPLAY_BUFFER_MAX = 128
 # 永远能拿到 shim，不再出现「pywebview API 不可用」。
 # 注意：修改磁盘版 mobile-shim.js 后请同步更新此快照，保持两边一致。
 _MOBILE_SHIM_FALLBACK_JS = """/**
- * mobile-shim.js —— 局域网手机远程控制的 transport shim（内嵌回退快照）
+ * mobile-shim.js —— 局域网手机远程控制的 transport shim
  *
  * 桌面上 pywebview 注入 window.pywebview.api（RPC）与 window.onBridgeEvent（事件）。
  * 手机上无 pywebview，本 shim 用 WebSocket 模拟这两者，使手机加载同一个 dist 前端、
@@ -68,11 +68,25 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
  * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
  *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
+ * - 配对 token：首次从 URL 参数取并写入 localStorage，之后刷新/重开（URL 无 token）
+ *   回退读 localStorage，直到服务端 TTL 过期或被轮换（4401）才失效。
  */
 (function () {
   if (window.pywebview) return; // 桌面环境不注入，防御性
 
-  var token = new URLSearchParams(window.location.search).get('token') || '';
+  var STORAGE_KEY = 'yc-pair-token';
+  var urlToken = new URLSearchParams(window.location.search).get('token') || '';
+  var token = urlToken;
+  try {
+    if (urlToken) {
+      window.localStorage.setItem(STORAGE_KEY, urlToken);
+    } else {
+      token = window.localStorage.getItem(STORAGE_KEY) || '';
+    }
+  } catch (_) {
+    // localStorage 不可用（隐私模式等）：仅本次 URL token 生效
+  }
+  var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
   var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';
 
   var ws = null;
@@ -84,7 +98,7 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
   function rpc(method, args) {
     return new Promise(function (resolve, reject) {
       if (!ws || ws.readyState !== 1) {
-        reject(new Error('\\u8fde\\u63a5\\u672a\\u5c31\\u7eea'));
+        reject(new Error('连接未就绪'));
         return;
       }
       var id = ++seq;
@@ -144,7 +158,20 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
         }
       }
     };
-    ws.onclose = function () {
+    ws.onclose = function (event) {
+      if (event && event.code === 4401) {
+        // 配对失效/被轮换：清掉本地 token（仅当与本次使用的相同，避免误清新 token），
+        // 通知前端显示「配对已失效」，并停止重连（空 token 重连只会一直失败）
+        try {
+          if (window.localStorage.getItem(STORAGE_KEY) === usedToken) {
+            window.localStorage.removeItem(STORAGE_KEY);
+          }
+        } catch (_) {}
+        try {
+          window.dispatchEvent(new CustomEvent('yc-pair-invalid'));
+        } catch (_) {}
+        return;
+      }
       setTimeout(connect, 2000); // 基础断线重连
     };
     ws.onerror = function () {};
@@ -273,42 +300,55 @@ class LanServer:
         except Exception:
             return False
 
-    def _kick_all_clients(self) -> None:
-        """断开所有已连接客户端并清空列表（token 轮换时防止旧链接继续可控）。
+    def _detach_clients_locked(self) -> list:
+        """摘除并清空客户端列表，返回被摘除的客户端。
 
-        必须在持锁状态下调用：先摘除列表再逐个 close，close 的网络 IO 放锁外，
-        避免阻塞注册路径。
+        必须在持 ``_clients_lock`` 时调用：与「校验+注册」共用同一临界区，
+        保证轮换时不会有客户端在摘除后又被注册进来。
         """
-        with self._clients_lock:
-            clients = self._clients
-            self._clients = []
-            self._client_locks.clear()
+        clients = self._clients
+        self._clients = []
+        self._client_locks.clear()
+        return clients
+
+    @staticmethod
+    def _close_rotated(clients: list) -> None:
+        """逐个关闭被轮换的连接；close 的网络 IO 放在锁外，避免阻塞注册路径。"""
         for client in clients:
             try:
                 client.close(code=4401, reason="token rotated")
             except Exception:
                 pass
 
+    def _kick_all_clients(self) -> None:
+        """断开所有已连接客户端并清空列表（token 轮换时防止旧链接继续可控）。"""
+        with self._clients_lock:
+            clients = self._detach_clients_locked()
+        self._close_rotated(clients)
+
     def _issue_token(self) -> str:
         """签发新配对 token（旧 token 立即失效，已连接客户端全部断开），持久化后返回明文。
 
         _ttl <= 0 表示永久有效：_token_expires 置为 None，永不过期、永不重签。
+
+        切换 token 与摘除旧连接在同一把 ``_clients_lock`` 内完成，与
+        ``_register_and_collect_replay`` 的「校验+注册」互斥：任一时刻只有一个
+        token 能通过校验，不会出现旧 token 校验通过、同时新 token 已生效的竞态。
         """
-        self._token = secrets.token_urlsafe(24).encode()
-        self._token_expires = (
-            None if self._ttl <= 0 else time.time() + self._ttl
-        )
-        # 踢掉旧 token 时代的连接：否则已扫码手机在刷新二维码后依然可控
-        self._kick_all_clients()
+        new_token = secrets.token_urlsafe(24).encode()
+        new_expires = None if self._ttl <= 0 else time.time() + self._ttl
+        with self._clients_lock:
+            self._token = new_token
+            self._token_expires = new_expires
+            clients = self._detach_clients_locked()
+        self._close_rotated(clients)
         try:
-            _save_config_value(config.REMOTE_PAIR_TOKEN_KEY, self._token.decode())
-            _save_config_value(
-                config.REMOTE_PAIR_TOKEN_EXPIRES_KEY, self._token_expires
-            )
+            _save_config_value(config.REMOTE_PAIR_TOKEN_KEY, new_token.decode())
+            _save_config_value(config.REMOTE_PAIR_TOKEN_EXPIRES_KEY, new_expires)
         except Exception:
             # 持久化失败不阻断签发：仅影响重启后的固定性，不影响本次可用性
             pass
-        return self._token.decode()
+        return new_token.decode()
 
     def _authenticate_and_register(self, ws, token) -> bool:
         """校验 token 并原子注册客户端：通过则加入列表，失败返回 False。
