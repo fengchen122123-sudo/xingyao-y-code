@@ -117,26 +117,6 @@ def contexts_to_messages(event_name: str, contexts) -> tuple[dict, ...]:
     return ({"role": "user", "content": header + "\n" + "\n\n".join(texts)},)
 
 
-def session_start_messages(
-    runner, *, session_id, turn_id
-) -> tuple[dict, ...]:
-    """回合准备处运行 SessionStart：返回要注入的 user 消息（无 hook → 空）。"""
-    if runner is None or not session_id:
-        return ()
-    result = run_hook_safely(
-        runner,
-        "SessionStart",
-        build_hook_input(
-            "SessionStart",
-            session_id=session_id,
-            turn_id=turn_id,
-        ),
-    )
-    if result is None:
-        return ()
-    return contexts_to_messages("SessionStart", result.additional_contexts)
-
-
 class StopContinueState:
     """进程内 Stop 续跑计数（规格 §5.2 / C9）。
 

@@ -71,6 +71,8 @@ def computer_action_tool_spec() -> ToolSpec:
         requires_permission=False,
         cancellable=True,
         parallel_safe=False,
+        # 规格 03 §3.2 点名 computer_action 归 system（A 阶段评审补修缺口）。
+        side_effect_scope="system",
         activity_description="电脑操控",
     )
 

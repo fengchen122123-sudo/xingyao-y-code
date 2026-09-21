@@ -7,15 +7,21 @@
 - H-T4：hook allow 不可提权（plan 档写操作在 hook 前已被权限链拒绝，
         hook 脚本无执行痕迹）。
 
-更多场景（H-T6 注入可见端到端 / H-T17 入参裁剪端到端）见待续清单，
+- H-T6：additional_context 注入可见——载荷层（批量链 follow-up 键）与真实
+        回合端到端（hook 注入进入下一轮 LLM 请求 messages）；
+- H-T17：项目级 hook 入参裁剪端到端（实收 [redacted] 写盘验证）；
+- C8：SessionStart 文本辅助（一次性 + 无 runner 零影响）。
+
 本文件聚焦"接入链已生效且无配置零影响"两个最高风险面。
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -86,6 +92,25 @@ def _script(tmp_path: Path, name: str, body: str) -> str:
     script = tmp_path / name
     script.write_text(body, encoding="utf-8")
     return f'"{sys.executable}" "{script}"'
+
+
+def _chunk(content="", tool_calls=None):
+    """构造流式 chunk（与 test_agent_turn_e2e 同形）。"""
+    delta = SimpleNamespace(
+        content=content,
+        reasoning_content="",
+        tool_calls=tool_calls,
+    )
+    return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None)
+
+
+def _tool_call(index, call_id, name, arguments):
+    """构造流式 tool_call delta（与 test_agent_turn_e2e 同形）。"""
+    return SimpleNamespace(
+        index=index,
+        id=call_id,
+        function=SimpleNamespace(name=name, arguments=json.dumps(arguments)),
+    )
 
 
 def _install_hook_runner(tmp_path, monkeypatch, hooks_payload, *, grant=True):
@@ -428,3 +453,109 @@ def test_session_start_context_text_runs_once_per_session():
     assert first == "welcome-ctx"
     assert second == ""
     assert len(calls) == 1
+
+
+# ── H-T6（端到端）：hook contexts 进入下一轮 LLM 请求 messages ──
+
+
+def test_hook_contexts_reach_next_llm_request_end_to_end(tmp_path, monkeypatch):
+    """H-T6 端到端：PreToolUse 注入的上下文真实进入下一轮 LLM 请求。
+
+    既有载荷层测试（test_hook_contexts_attached_as_followup_on_batch_path）
+    只证明 contexts 挂到了 message 私有键；本测试真实驱动
+    chat_with_model_events：第 1 轮 mock 模型返回工具调用（hook 注入上下文），
+    第 2 轮捕获 completion 收到的 messages，断言注入内容确实在请求里。
+    """
+    hook_cmd = _script(
+        tmp_path,
+        "ctx_e2e.py",
+        "import json\nprint(json.dumps({'additional_context': 'hook-ctx-e2e'}))\n",
+    )
+    _install_hook_runner(
+        tmp_path,
+        monkeypatch,
+        {"PreToolUse": [{"matcher": "*", "command": hook_cmd}]},
+    )
+
+    responses = [
+        iter([_chunk(tool_calls=[
+            _tool_call(0, "read-1", "read_file", {"file_path": str(Path(__file__))}),
+        ])]),
+        iter([_chunk("完成")]),
+    ]
+    captured: list = []
+
+    def fake_completion(**kwargs):
+        captured.append(copy.deepcopy(kwargs.get("messages") or []))
+        return responses.pop(0)
+
+    monkeypatch.setattr(llm, "completion", fake_completion)
+
+    events = list(llm.chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "读文件"}],
+        persist=False,
+        turn_id="turn-h-t6",
+        parent_session="sess-h-t6",
+        parent_turn_id="turn-h-t6",
+    ))
+
+    assert len(captured) == 2
+    second_request_text = json.dumps(captured[1], ensure_ascii=False)
+    assert "hook-ctx-e2e" in second_request_text
+    assert "【PreToolUse hook 追加上下文】" in second_request_text
+    assert [event.kind for event in events][-1] == "turn_finished"
+
+
+# ── 审查修复：Stop 续跑达回合步数上限时的显式通知 ──
+
+
+def test_stop_continue_notice_when_turn_limit_reached(monkeypatch):
+    """审查修复：Stop hook 请求续跑但已达回合步数上限 → 显式 notice，不静默丢弃。
+
+    原实现下该组合既不续跑也不告警（续跑请求被静默吞掉）；修复后应产生
+    「步数上限」notice，且不触发额外模型调用（未发生续跑）。
+    """
+    import core.hooks.lifecycle as lifecycle
+    from core.harness import turn_limits
+
+    class _StopResult:
+        continue_after_stop = True
+        additional_contexts = ["stop-ctx"]
+
+    class _StopRunner:
+        def run(self, event, hook_input, cancel_event=None):
+            return _StopResult()
+
+    state = StopContinueState()
+    completion_calls: list = []
+
+    def fake_completion(**kwargs):
+        completion_calls.append(kwargs.get("messages"))
+        return iter([_chunk("done")])
+
+    monkeypatch.setattr(lifecycle, "get_stop_continue_state", lambda: state)
+    monkeypatch.setattr(lifecycle, "get_default_hook_runner", lambda: _StopRunner())
+    monkeypatch.setattr(turn_limits, "load_turn_step_limit", lambda: 1)
+    monkeypatch.setattr(llm, "completion", fake_completion)
+
+    events = list(llm.chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "收尾"}],
+        persist=False,
+        turn_id="turn-stop-limit",
+        parent_session="sess-stop-limit",
+        parent_turn_id="turn-stop-limit",
+    ))
+
+    notices = [
+        str(event.payload.get("message") or "")
+        for event in events
+        if event.kind == "notice"
+    ]
+    assert any("步数上限" in message for message in notices)
+    # 未发生续跑：模型调用只发生一次
+    assert len(completion_calls) == 1
+    assert [event.kind for event in events][-1] == "turn_finished"

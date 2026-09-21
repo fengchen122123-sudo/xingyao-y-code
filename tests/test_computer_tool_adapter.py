@@ -338,6 +338,8 @@ def test_computer_action_tool_spec_semantics():
     assert spec.cancellable is True
     assert spec.parallel_safe is False
     assert spec.mutates_files is False
+    # 规格 03 §3.2：computer_action 归 system（A 阶段评审补修缺口）。
+    assert spec.side_effect_scope == "system"
 
 
 def test_reserved_computer_tool_names_are_frozen():
