@@ -136,6 +136,9 @@ def build_default_registry() -> ToolRegistry:
         plan_write,
     )
 
+    # side_effect_scope 归类依据《03-工具调度拓扑化设计规格》3.2 取值表
+    # （none / workspace / git / network / system）；表未覆盖的工具按语义归类，
+    # 行尾注释说明理由。该字段 v1 不参与调度决策，仅为契约元数据。
     read_specs = [
         ToolSpec(
             name="read_file",
@@ -152,6 +155,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="读取文件",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="list_directory",
@@ -165,6 +169,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="查看目录",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="search_code",
@@ -178,6 +183,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="搜索代码",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="find_definition",
@@ -200,6 +206,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="查找符号定义",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="search_news",
@@ -213,6 +220,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="联网搜索",
+            side_effect_scope="network",
         ),
         ToolSpec(
             name="fetch_url",
@@ -231,6 +239,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="访问网址",
+            side_effect_scope="network",
         ),
         ToolSpec(
             name="get_weather",
@@ -249,6 +258,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="查询天气",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="glob_files",
@@ -262,6 +272,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="匹配文件",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="automation_list",
@@ -282,6 +293,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="查看星轨自动化任务",
+            side_effect_scope="none",  # 表未覆盖：只读查询，无持久副作用
         ),
     ]
 
@@ -302,6 +314,7 @@ def build_default_registry() -> ToolRegistry:
             execute=ask_user,
             requires_permission=False,
             activity_description="等待用户回答",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="plan_write",
@@ -326,6 +339,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["items"]),
             execute=plan_write,
             activity_description="更新任务计划",
+            side_effect_scope="workspace",  # 表未覆盖：持久化修改任务计划状态（.ycode_tasks/plans）
         ),
         ToolSpec(
             name="plan_update",
@@ -344,6 +358,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_update,
             activity_description="更新计划项",
+            side_effect_scope="workspace",  # 表未覆盖：持久化修改计划项元数据
         ),
         ToolSpec(
             name="plan_read",
@@ -354,6 +369,7 @@ def build_default_registry() -> ToolRegistry:
             execute=plan_read,
             read_only=True,
             activity_description="查看计划状态",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="plan_retry",
@@ -364,6 +380,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_retry,
             activity_description="重试计划项",
+            side_effect_scope="workspace",  # 表未覆盖：修改计划项状态
         ),
         ToolSpec(
             name="plan_resume_takeover",
@@ -377,6 +394,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id"]),
             execute=plan_resume_takeover,
             activity_description="恢复主 Agent 接管",
+            side_effect_scope="workspace",  # 表未覆盖：修改计划项接管状态
         ),
         ToolSpec(
             name="plan_finish",
@@ -394,6 +412,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["item_id", "result"]),
             execute=plan_finish,
             activity_description="完成接管计划项",
+            side_effect_scope="system",  # 表未覆盖：会真实执行 verification shell 命令
         ),
         ToolSpec(
             name="write_file",
@@ -405,6 +424,7 @@ def build_default_registry() -> ToolRegistry:
             execute=tools.write_file,
             mutates_files=True,
             activity_description="写入文件",
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="edit_file",
@@ -435,6 +455,7 @@ def build_default_registry() -> ToolRegistry:
             execute=tools.edit_file,
             mutates_files=True,
             activity_description="修改文件",
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="fetch_image",
@@ -454,6 +475,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             cancellable=True,
             activity_description="下载图片",
+            side_effect_scope="network",
         ),
         ToolSpec(
             name="undo_turn",
@@ -474,6 +496,7 @@ def build_default_registry() -> ToolRegistry:
             }),
             execute=tools.undo_turn,
             activity_description="撤销回合文件修改",
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="execute_command",
@@ -505,6 +528,7 @@ def build_default_registry() -> ToolRegistry:
             }, ["command"]),
             execute=tools.execute_command,
             activity_description="执行命令",
+            side_effect_scope="system",
         ),
         ToolSpec(
             name="manage_task",
@@ -534,6 +558,7 @@ def build_default_registry() -> ToolRegistry:
             execute=tools.manage_task,
             requires_permission=False,
             activity_description="管理后台任务",
+            side_effect_scope="none",
         ),
         ToolSpec(
             name="run_subagent",
@@ -567,6 +592,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="启动子 Agent",
+            side_effect_scope="system",  # 表未覆盖：子代理可执行任意工具，副作用范围不可预知（保守归 system）
         ),
         # ── MCP 服务配置工具（让 AI 能自己配置/启用/禁用 MCP server）─────
         ToolSpec(
@@ -593,6 +619,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="新增 MCP server",
+            side_effect_scope="system",  # 表未覆盖：写 mcp.json 且以任意 command/args 启动外部进程
         ),
         ToolSpec(
             name="mcp_remove_server",
@@ -607,6 +634,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="删除 MCP server",
+            side_effect_scope="system",  # 表未覆盖：关闭外部进程并写 mcp.json
         ),
         ToolSpec(
             name="mcp_set_enabled",
@@ -622,6 +650,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="切换 MCP server 开关",
+            side_effect_scope="system",  # 表未覆盖：可能启动外部进程并写 mcp.json
         ),
         ToolSpec(
             name="mcp_list_servers",
@@ -636,6 +665,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=False,
             parallel_safe=True,
             activity_description="查看 MCP 服务列表",
+            side_effect_scope="none",  # 表未覆盖：只读查询
         ),
         # ── 星轨自动化工具（对话里创建/修改/删除/立即执行定时任务）───────
         ToolSpec(
@@ -711,6 +741,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="创建星轨自动化任务",
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="automation_update",
@@ -772,6 +803,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="修改星轨自动化任务",
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="automation_delete",
@@ -786,6 +818,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="删除星轨自动化任务",
+            side_effect_scope="workspace",
         ),
         ToolSpec(
             name="automation_run_now",
@@ -800,6 +833,7 @@ def build_default_registry() -> ToolRegistry:
             requires_permission=True,
             parallel_safe=False,
             activity_description="立即执行星轨自动化任务",
+            side_effect_scope="workspace",
         ),
     ]
     registry = ToolRegistry([*read_specs, *mutating_specs])
