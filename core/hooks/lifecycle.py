@@ -196,6 +196,73 @@ def get_stop_continue_state() -> StopContinueState:
     return _DEFAULT_STOP_STATE
 
 
+# ── 默认 HookRunner 单例与 SessionStart 记账（C6-C8 接入共用）────────────
+
+_DEFAULT_RUNNER = None
+_DEFAULT_RUNNER_LOCK = threading.Lock()
+_SESSION_START_CLAIMED: set[str] = set()
+_SESSION_START_CLAIM_LOCK = threading.Lock()
+
+
+def get_default_hook_runner():
+    """进程内默认 HookRunner 单例（用户级 + 项目级配置取默认路径）。
+
+    接入层（工具管线/回合流）每步都会取它：单例化避免重复构造；runner 内部
+    每次 run 都会重新加载配置与信任状态（规格 §5.4），因此这里缓存实例不会
+    引入"配置变更不生效"的窗口。测试隔离请直接构造 HookRunner 注入，
+    不要依赖本单例。
+    """
+    global _DEFAULT_RUNNER
+    if _DEFAULT_RUNNER is None:
+        with _DEFAULT_RUNNER_LOCK:
+            if _DEFAULT_RUNNER is None:
+                from core.hooks.runner import HookRunner
+
+                _DEFAULT_RUNNER = HookRunner()
+    return _DEFAULT_RUNNER
+
+
+def claim_session_start_once(session_id) -> bool:
+    """进程内每会话一次的 SessionStart 记账（新建或恢复后首次回合均触发）。
+
+    为什么不落盘：SessionStart 的语义是"会话进入活动状态"；跨进程恢复时
+    重新触发一次是期望行为（hook 可用于注入"欢迎回来/检查环境"上下文）。
+    """
+    key = str(session_id or "")
+    if not key:
+        return False
+    with _SESSION_START_CLAIM_LOCK:
+        if key in _SESSION_START_CLAIMED:
+            return False
+        _SESSION_START_CLAIMED.add(key)
+        return True
+
+
+def session_start_context_text(runner, *, session_id: str) -> str:
+    """首次回合准备时运行 SessionStart 并返回追加上下文文本（无 hook/重复调用 → 空串）。
+
+    返回文本而非消息：调用方（agent_service）把它与时间注记同通道内联到最后
+    一条 user 消息，不产生新的 system 消息（规格 §2.4 缓存亲和原则）。
+    """
+    if runner is None or not session_id:
+        return ""
+    if not claim_session_start_once(session_id):
+        return ""
+    result = run_hook_safely(
+        runner,
+        "SessionStart",
+        build_hook_input("SessionStart", session_id=str(session_id)),
+    )
+    if result is None:
+        return ""
+    texts = [
+        str(text).strip()
+        for text in (result.additional_contexts or ())
+        if str(text or "").strip()
+    ]
+    return "\n\n".join(texts)
+
+
 def evaluate_stop(
     controller: StopContinueState,
     runner,
