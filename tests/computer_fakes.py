@@ -22,6 +22,8 @@ listener 注册/事件发射 + start_run(run_id=)/pause/resume/stop 透传记录
 run_id 拒绝语义，供 Bridge 事件桥与控制 API 测试；绝不触碰真实键鼠/浏览器/截屏）。
 Task 16 给 FakeComputerBackend 增补 png_path（观察携带的虚拟截图路径，不读
 真实文件，供预览发布接线与隐私审计测试）。
+元素定位修复 E1 给 FakePage 增补元素收集脚本注入点（element_collect_result /
+element_collect_error，默认空列表，保证既有测试零影响）。
 其余请求捕获 helper 由后续 Task 按需在本文件扩展，禁止平行实现。
 """
 
@@ -35,6 +37,7 @@ from dataclasses import replace
 import pytest
 
 import config
+from core.computer.browser_backend import ELEMENT_COLLECT_SCRIPT
 from core.computer.models import (
     ComputerCapability,
     ComputerControlError,
@@ -255,18 +258,29 @@ class FakePage:
         self.screenshot_delay = 0.0
         self.concurrency_violations = 0
         self._inside_screenshot = False
+        # E1 元素收集脚本注入点：None 表示返回空列表（既有测试零影响）；
+        # error 非空时 evaluate 抛错，用于验证「收集失败不中断 observe」。
+        self.element_collect_result = None
+        self.element_collect_error = None
 
     def is_closed(self):
         self._runtime._record_call("page.is_closed")
         return self.closed
 
     def evaluate(self, expression, *args, **kwargs):
-        """仅支持 R5 可见性探针表达式；其他表达式一律拒绝（隐私边界）。"""
+        """仅支持 R5 可见性探针与 E1 元素收集脚本；其他表达式一律拒绝（隐私边界）。"""
         self._runtime._record_call("page.evaluate")
         self.evaluate_calls.append(expression)
+        if expression == ELEMENT_COLLECT_SCRIPT:
+            if self.element_collect_error is not None:
+                raise self.element_collect_error
+            result = self.element_collect_result
+            return [] if result is None else result
         if "visibilityState" in str(expression) and "hasFocus" in str(expression):
             return [self.visibility_state, self.focused]
-        raise AssertionError(f"fake page 只允许可见性探针，拒绝 evaluate: {expression!r}")
+        raise AssertionError(
+            f"fake page 只允许可见性探针与元素收集脚本，拒绝 evaluate: {expression!r}"
+        )
 
     def title(self):
         self._runtime._record_call("page.title")
