@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+from core.computer.actions import parse_computer_action
 from core.computer.browser_backend import (
     BrowserComputerBackend,
     ELEMENT_COLLECT_SCRIPT,
@@ -19,7 +20,7 @@ from core.computer.browser_worker_protocol import (
     normalize_observation_payload,
     observation_payload,
 )
-from core.computer.models import ComputerObservation
+from core.computer.models import ComputerControlError, ComputerObservation
 from tests.computer_fakes import FakePlaywrightRuntime, fake_png_bytes
 
 _ELEMENT = {
@@ -231,3 +232,142 @@ def test_refs_clear_when_collection_returns_empty(backend):
     page.element_collect_result = []
     backend.observe("run-a")
     assert backend._observed_element_refs == frozenset()
+
+
+# ---------------- ⑨ E2 元素引用动作（设计 3；验收清单阶段 3 · E2） ----------------
+
+
+def _prepare_element(backend, ref="el-1", *, kind="button", name="提交"):
+    """observe 注入一个元素，建立 E2 动作前置状态（ref 集合 + token + URL）。"""
+    backend.active_page.element_collect_result = [
+        {"ref": ref, "kind": kind, "name": name,
+         "bounds": [10, 20, 30, 40], "enabled": True},
+    ]
+    backend.observe("run-a")
+    return ref
+
+
+def _click_payload(ref="el-1"):
+    return {"kind": "click_element", "target": "browser", "element_ref": ref}
+
+
+def _set_value_payload(ref="el-1", text="中文测试"):
+    return {"kind": "set_value_element", "target": "browser",
+            "element_ref": ref, "text": text}
+
+
+def test_click_element_hits_locator_selector(backend):
+    """click_element 命中：observe 后按 ref 构造 locator 并点击（含 timeout）。
+
+    动作经 parse_computer_action 构造，确保「白名单 → 解析 → backend 分派」
+    全链路连通（E2 协议变更的回归保护）。
+    """
+    _prepare_element(backend)
+    backend.execute("run-a", parse_computer_action(_click_payload()))
+    page = backend.active_page
+    assert page.locator_calls == ['[data-ycode-ref="el-1"]']
+    assert len(page.last_locator.click_calls) == 1
+    # 元素动作超时取 _ELEMENT_ACTION_TIMEOUT_MS（明显小于默认 30s 命令预算）
+    assert page.last_locator.click_calls[0]["timeout"] == 10_000
+
+
+def test_set_value_element_fill_success(backend):
+    """set_value_element 主路径：fill 直接设值（中文不过输入法）。"""
+    _prepare_element(backend, kind="textbox", name="用户名")
+    backend.execute("run-a", parse_computer_action(_set_value_payload()))
+    page = backend.active_page
+    assert page.locator_calls == ['[data-ycode-ref="el-1"]']
+    assert page.last_locator.fill_calls[0][0] == "中文测试"
+    assert page.last_locator.fill_calls[0][1]["timeout"] == 10_000
+    # fill 主路径成功即返回：不触发键盘回落
+    assert page.last_locator.click_calls == []
+    assert page.keyboard.calls == []
+
+
+def test_set_value_element_falls_back_to_keyboard(backend):
+    """fill 不支持的控件（contenteditable/富文本）：点击聚焦 + 键盘输入。"""
+    _prepare_element(backend, kind="textbox", name="正文")
+    page = backend.active_page
+    page.locator_fill_error = RuntimeError("injected fill failure")
+    backend.execute("run-a", parse_computer_action(_set_value_payload()))
+    assert page.last_locator.fill_calls[0][0] == "中文测试"  # fill 先被尝试
+    assert len(page.last_locator.click_calls) == 1  # 回落：点击聚焦
+    assert page.last_locator.click_calls[0]["timeout"] == 10_000
+    assert ("type", "中文测试") in page.keyboard.calls  # 回落：键盘逐字符输入
+
+
+def test_click_element_failure_is_element_unsupported(backend):
+    """元素存在但不可点击（被遮挡/禁用/超时）：元素语义错误码，非命令超时。"""
+    _prepare_element(backend)
+    page = backend.active_page
+    page.locator_click_error = RuntimeError("injected click failure")
+    with pytest.raises(ComputerControlError) as exc:
+        backend.execute("run-a", parse_computer_action(_click_payload()))
+    assert exc.value.code == "computer_element_unsupported"
+    assert "点击失败" in exc.value.message
+
+
+def test_set_value_element_fallback_failure_is_unsupported(backend):
+    """回落（点击 + 键盘）仍失败：与 click 失败语义对齐的元素错误码。"""
+    _prepare_element(backend, kind="textbox", name="正文")
+    page = backend.active_page
+    page.locator_fill_error = RuntimeError("injected fill failure")
+    page.locator_click_error = RuntimeError("injected click failure")
+    with pytest.raises(ComputerControlError) as exc:
+        backend.execute("run-a", parse_computer_action(_set_value_payload()))
+    assert exc.value.code == "computer_element_unsupported"
+    assert "写入失败" in exc.value.message
+    # 回落序列完整尝试后才报错：click 被调用、键盘未到达
+    assert len(page.last_locator.click_calls) == 1
+    assert page.keyboard.calls == []
+
+
+def test_stale_ref_not_in_observed_set(backend):
+    """ref 不在最近一次 observe 集合内：computer_element_stale。"""
+    _prepare_element(backend)  # 集合 = {el-1}
+    with pytest.raises(ComputerControlError) as exc:
+        backend.execute("run-a", parse_computer_action(_click_payload("el-9")))
+    assert exc.value.code == "computer_element_stale"
+    assert "已失效" in exc.value.message
+
+
+def test_stale_ref_after_url_change(backend):
+    """URL 对比裁决：token 不随同页导航变化，URL 变化必须让旧 ref 失效。"""
+    _prepare_element(backend)
+    backend.active_page.url = "https://other.example/"
+    with pytest.raises(ComputerControlError) as exc:
+        backend.execute("run-a", parse_computer_action(_click_payload()))
+    assert exc.value.code == "computer_element_stale"
+    assert "地址" in exc.value.message
+
+
+def test_stale_ref_after_page_switch(backend):
+    """页面切换（popup/新前台页）→ 旧 ref 失效。
+
+    白盒注入 token 直接命中 token 检查分支：simulate_popup 会改变可见性解析
+    路径，而本用例只关心 _require_ref_valid 的裁决顺序（不必强求 popup）。
+    """
+    _prepare_element(backend)
+    backend._observed_page_token = -1  # 白盒：模拟受控页已切换
+    with pytest.raises(ComputerControlError) as exc:
+        backend.execute("run-a", parse_computer_action(_click_payload()))
+    assert exc.value.code == "computer_element_stale"
+    assert "页面已切换" in exc.value.message
+
+
+def test_element_action_without_observe_is_stale(backend):
+    """从未 observe：token 为 None，ref 校验第一项即拒绝（不静默执行）。"""
+    with pytest.raises(ComputerControlError) as exc:
+        backend.execute("run-a", parse_computer_action(_click_payload()))
+    assert exc.value.code == "computer_element_stale"
+
+
+def test_coordinate_click_still_uses_surface_check(backend):
+    """坐标动作与元素动作分流：URL 变化不影响坐标动作（仍走 surface 校验）。"""
+    _prepare_element(backend)
+    backend.active_page.url = "https://other.example/"
+    backend.execute(
+        "run-a",
+        parse_computer_action({"kind": "click", "target": "browser", "x": 5, "y": 6}),
+    )
+    assert backend.active_page.mouse.calls == [("click", 5, 6, "left")]

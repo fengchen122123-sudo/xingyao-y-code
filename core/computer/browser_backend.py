@@ -98,6 +98,11 @@ _VISIBILITY_PROBE = "() => [document.visibilityState, document.hasFocus()]"
 # 注入脚本内的 MAX_NAME 已做同样截断，这里兜底协议/求值结果的异常形态）。
 _ELEMENT_MAX_NAME_CHARS = 80
 
+# E2 元素动作超时（毫秒）：明显小于命令预算（默认 30s），元素等待/可点击性
+# 检查失败时由元素语义错误码（computer_element_unsupported）返回，而不是拖到
+# 命令超时变成笼统的 computer_action_timeout；实际取与命令剩余预算的较小值。
+_ELEMENT_ACTION_TIMEOUT_MS = 10_000
+
 # E1 浏览器元素收集脚本（设计 2.2~2.4）：一次 JS 求值收集视口内可交互元素。
 # - 隐私铁律：只读标签/ARIA/文本等结构信息，绝不读输入值、Cookie 或存储
 #   （脚本源码不得出现 .value / cookie / localStorage / sessionStorage 字样）；
@@ -715,6 +720,10 @@ class BrowserComputerBackend:
         # 生命周期——每次观察整体替换（空集即旧 ref 全部失效）；E2 的
         # click_element/set_value_element 依赖它做 computer_element_stale 校验。
         self._observed_element_refs: frozenset[str] = frozenset()
+        # E2：最近一次观察时的页面 URL。页面 token 不随同页导航变化（SPA 路由/
+        # 整页跳转仍落在同一 Page 对象上），URL 对比补全「页面变化 → 旧 ref 失效」
+        # 的产品决定（验收场景 4）；与 _observed_element_refs 同生命周期。
+        self._observed_url: str = ""
         self._surface_generation = 0
         self._pressed_buttons: set[str] = set()
         # 修饰键按下记录绑定按下时的 page（R3）：popup 切换 active page 后
@@ -1183,6 +1192,7 @@ class BrowserComputerBackend:
         self._page_tokens = {}
         self._observed_page_token = None
         self._observed_element_refs = frozenset()
+        self._observed_url = ""
         self._active_page = None
 
     # ---------------- worker 内：页面事件 ----------------
@@ -1369,6 +1379,33 @@ class BrowserComputerBackend:
                 "受控页面已切换，旧坐标已失效，必须重新观察（observe）后再操作",
             )
 
+    def _require_ref_valid(self, page, element_ref: str) -> None:
+        """元素动作前复核（E2）：ref 必须属于最近一次观察且页面未变化。
+
+        三项检查全部抛 computer_element_stale（与桌面 UIA 的 ref 失效语义
+        一致，不发明新码；元素动作的错误码统一 stale，不用 surface_changed）：
+        1. 页面 token——受控页切换（popup/新前台页）后旧 ref 全部失效；
+        2. URL 对比——裁决点：token 不随同页导航变化（SPA 路由、整页跳转仍
+           落在同一 Page 对象上），URL 对比补全「页面变化 → 旧 ref 失效」的
+           产品决定，对齐验收场景 4（导航到新 URL 后旧 ref 必须 stale）；
+        3. ref 集合——ref 不在最近一次 observe 收集的元素集合内。
+        """
+        if self._page_token(page) != self._observed_page_token:
+            raise ComputerControlError(
+                "computer_element_stale",
+                "页面已切换，元素引用失效，请重新 observe",
+            )
+        if page.url != self._observed_url:
+            raise ComputerControlError(
+                "computer_element_stale",
+                "页面地址已变化，元素引用失效，请重新 observe",
+            )
+        if element_ref not in self._observed_element_refs:
+            raise ComputerControlError(
+                "computer_element_stale",
+                f"元素引用 {element_ref} 已失效，请重新 observe",
+            )
+
     # ---------------- worker 内：命令实现 ----------------
 
     def _collect_interactive_elements(self, page) -> tuple:
@@ -1440,6 +1477,9 @@ class BrowserComputerBackend:
         if not isinstance(title, str):
             title = ""
         url = page.url if isinstance(page.url, str) else ""
+        # E2：同步观察时的 URL，供 _require_ref_valid 做「页面地址已变化」校验
+        # （token 不随同页导航变化，URL 对比是旧 ref 失效裁决的补全）。
+        self._observed_url = url
         parts = urlsplit(url)
         origin = f"{parts.scheme}://{parts.netloc}"
         # E1：截图与页面复核完成后收集可交互元素；收集失败/为空都回落截图路径。
@@ -1497,7 +1537,12 @@ class BrowserComputerBackend:
             self._wait_interruptible(duration)
             return
         page = self._resolve_active_page()
-        self._require_observed_surface(page)
+        if kind in ("click_element", "set_value_element"):
+            # E2：元素动作按 ref 校验（页面 token + URL + ref 集合），错误码
+            # 统一 computer_element_stale；坐标动作维持 surface_changed 语义。
+            self._require_ref_valid(page, action.element_ref)
+        else:
+            self._require_observed_surface(page)
         try:
             self._dispatch_action(page, action)
         except ComputerControlError:
@@ -1671,11 +1716,57 @@ class BrowserComputerBackend:
             page.reload(
                 wait_until="domcontentloaded", timeout=self._remaining_budget_ms()
             )
+        elif kind == "click_element":
+            self._exec_click_element(page, action.element_ref)
+        elif kind == "set_value_element":
+            self._exec_set_value_element(page, action.element_ref, action.text)
         else:
             raise ComputerControlError(
                 "computer_invalid_action",
                 f"浏览器 backend 不支持动作：{kind!r}",
             )
+
+    def _exec_click_element(self, page, element_ref: str) -> None:
+        """按元素引用点击（E2）：ref 有效性已在 _cmd_execute 校验。
+
+        Playwright locator 白送自动等待/滚动到视口/可点击性检查；元素存在但
+        不可点击（被遮挡/禁用/超时）时按元素语义报 computer_element_unsupported，
+        与桌面元素动作错误码对齐。
+        """
+        locator = page.locator(f'[data-ycode-ref="{element_ref}"]')
+        try:
+            locator.click(
+                timeout=min(_ELEMENT_ACTION_TIMEOUT_MS, self._remaining_budget_ms())
+            )
+        except Exception as error:
+            raise ComputerControlError(
+                "computer_element_unsupported",
+                f"元素 {element_ref} 点击失败：{type(error).__name__}",
+            ) from error
+
+    def _exec_set_value_element(self, page, element_ref: str, text: str) -> None:
+        """按元素引用写值（E2）：fill 优先，失败回落「点击聚焦 + 键盘输入」。
+
+        fill 直接设值不经输入法（中文免疫 IME 乱码）且触发 input/change 事件；
+        contenteditable/部分富文本编辑器不支持 fill，此时回落键盘输入。裁决：
+        回落仍失败按与 click 失败对齐的语义报 computer_element_unsupported
+        （不用坐标动作的 surface_changed / 命令超时错误码）。
+        """
+        locator = page.locator(f'[data-ycode-ref="{element_ref}"]')
+        timeout = min(_ELEMENT_ACTION_TIMEOUT_MS, self._remaining_budget_ms())
+        try:
+            locator.fill(text, timeout=timeout)
+            return
+        except Exception:
+            pass
+        try:
+            locator.click(timeout=timeout)
+            page.keyboard.type(text)
+        except Exception as error:
+            raise ComputerControlError(
+                "computer_element_unsupported",
+                f"元素 {element_ref} 写入失败：{type(error).__name__}",
+            ) from error
 
     def _exec_drag(self, page, action: ComputerAction) -> None:
         points = action.path
