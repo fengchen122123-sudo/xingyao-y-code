@@ -771,3 +771,111 @@ def test_effort_missing_model_reports_not_found(monkeypatch):
     main.handle_slash_command("/effort")
 
     assert any("未在配置中找到激活模型" in line for line in printed)
+
+
+# ---------------------------------------------------------------------------
+# /hooks（C13：Hook 生命周期钩子管理 - 只读清单 + 信任操作）
+# ---------------------------------------------------------------------------
+
+def _fake_hook_entries():
+    """两条 hook 视图条目（字段与 core.hooks.trust.list_hooks_with_status 一致）。"""
+    return [
+        {
+            "event": "PostToolUse",
+            "matcher": "*",
+            "command": "echo user-level",
+            "timeout_ms": 10000,
+            "status_message": None,
+            "source_path": "~/.ycode/hooks.json",
+            "scope": "user",
+            "digest": "digest-1",
+            "status": "trusted",
+        },
+        {
+            "event": "PreToolUse",
+            "matcher": "Bash",
+            "command": "echo project-level",
+            "timeout_ms": 10000,
+            "status_message": None,
+            "source_path": ".ycode/hooks.json",
+            "scope": "project",
+            "digest": "digest-2",
+            "status": "pending",
+        },
+    ]
+
+
+def _patch_hooks(monkeypatch, entries, calls=None):
+    """按 main.py 的函数内惰性导入打桩：patch 模块属性即可命中（与 /usage 等一致）。"""
+    import core.hooks.trust as hook_trust
+    import core.workspace_context as wsc
+
+    monkeypatch.setattr(wsc, "get_workdir", lambda: "E:/fixed-ws")
+    monkeypatch.setattr(hook_trust, "list_hooks_with_status", lambda **kwargs: list(entries))
+    if calls is not None:
+        def _apply(action, digest, **kwargs):
+            calls.append((action, digest, kwargs))
+            return True, "已信任"
+
+        monkeypatch.setattr(hook_trust, "apply_hook_trust_action", _apply)
+    return calls
+
+
+def test_hooks_list_shows_numbered_entries_with_status(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _patch_hooks(monkeypatch, _fake_hook_entries())
+
+    main.handle_slash_command("/hooks")
+
+    assert any("[1]" in line for line in printed)
+    assert any("[2]" in line for line in printed)
+    assert any("PostToolUse" in line for line in printed)
+    assert any("PreToolUse" in line for line in printed)
+    assert any("已信任" in line for line in printed)
+    assert any("待确认" in line for line in printed)
+
+
+def test_hooks_trust_passes_digest_and_workspace_root(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    calls = _patch_hooks(monkeypatch, _fake_hook_entries(), calls=[])
+
+    main.handle_slash_command("/hooks trust 2")
+
+    # CLI 子命令 trust 映射为信任层动作名 grant（deny/revoke/reset 同名直传）
+    assert calls == [("grant", "digest-2", {"workspace_root": "E:/fixed-ws"})]
+    assert any("已信任" in line for line in printed)
+    assert any("运行 /hooks 查看最新状态" in line for line in printed)
+
+
+def test_hooks_trust_rejects_out_of_range_and_non_numeric_index(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    calls = _patch_hooks(monkeypatch, _fake_hook_entries(), calls=[])
+
+    main.handle_slash_command("/hooks trust 9")   # 越界
+    main.handle_slash_command("/hooks trust abc")  # 非数字
+
+    assert calls == []
+    assert any("序号" in line and "查看编号" in line for line in printed)
+
+
+def test_hooks_list_empty_reports_not_configured(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _patch_hooks(monkeypatch, [])
+
+    main.handle_slash_command("/hooks")
+
+    assert any("未配置任何 Hook" in line for line in printed)
+
+
+def test_hooks_unknown_subcommand_shows_usage(monkeypatch):
+    printed = _capture_print(monkeypatch)
+    _quiet_ui(monkeypatch)
+    _patch_hooks(monkeypatch, _fake_hook_entries())
+
+    main.handle_slash_command("/hooks foo")
+
+    assert any("未知子命令" in line and "/hooks" in line for line in printed)
