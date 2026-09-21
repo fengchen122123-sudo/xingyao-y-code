@@ -1,21 +1,23 @@
-"""上下文注入描述符与注册表（面向 ZCode 能力借鉴 · 规格 02 · 阶段 B1-B3）。
+"""上下文注入描述符与注册表（面向 ZCode 能力借鉴 · 规格 02 · 阶段 B1-B6）。
 
 把星瑶现有的全部注入点统一登记为 ``InjectionSpec``（source × persistence ×
-channel 三个字段，规格 02 §2.1），为后续「渲染管线接管 / 压缩按类保留 /
-Hooks 统一落点」提供一张可查询的清单。
+channel 三个字段，规格 02 §2.1），并为「渲染管线接管 / 压缩按类保留 / Hooks
+统一落点」提供一张可查询的清单 + 组装入口。
 
-设计边界（规格 02 §3.2 步骤 1：登记，不参与渲染）：
+设计边界（规格 02 §3.1「包装而非重写」）：
 
-- 本模块只是"一张清单"：不改变任何现有注入的字节输出；
-  ``context_builder.py`` / ``agent_service.py`` / ``input_parser.py``
-  的实现与调用方零改动（本文件不 import 它们，只在 builder 内惰性引用）；
+- B1-B3：只登记不渲染，零字节变化；
+- B4（本文件当前状态）：渲染管线接管——``agent_service.build_stable_system_message``
+  遍历 ``build_prefix_sections()``、``context_builder.build_dynamic_prompt`` 遍历
+  ``build_persisted_sections()``、``agent_service`` 的时间注记取用
+  ``build_per_request_reminders()``；三处均在改造前字节输出上做等价拆分，
+  由 sha256 golden 与 tests/test_context_injection.py 的逐点对比守护；
 - ``section_builder`` 一律包装现有函数（无参闭包 / lambda），绝不复制其文本
   逻辑——避免未来出现"两份实现"的漂移；
 - 为什么需要 provider 参数：运行上下文块 / 时间注记 / 电脑操控说明 / 按回合
-  纠正都依赖每轮 ``RuntimeContext``，而注册表刻意不持有会话状态；调用方
-  （未来的渲染管线，步骤 2）通过 ``build_default_injection_registry`` 的
-  provider 参数注入状态来源，未绑定时这些 source 的 builder 返回空串
-  （规格 02 §2.1：空串表示不注入）。
+  纠正都依赖每轮 ``RuntimeContext``，而注册表刻意不持有会话状态；调用方通过
+  ``build_default_injection_registry`` 的 provider 参数注入状态来源，未绑定时
+  这些 source 的 builder 返回空串（规格 02 §2.1：空串表示不注入）。
 """
 
 from __future__ import annotations
@@ -62,8 +64,9 @@ class InjectionSpec:
 class ContextInjectionRegistry:
     """注入点注册表（规格 02 §2.5 接口）。
 
-    只做登记与查询。本阶段（B1-B3）查询方法实现完整但尚未被渲染管线调用，
-    因此对现有输出字节零影响。
+    只做登记与查询。B4 起三个组装入口（稳定前缀 / 动态块 / 每轮提醒）已由渲染
+    管线接管：查询方法的返回值就是各通道的最终拼接片段，因此保持"按登记顺序
+    返回全部非空片段"的语义不变。
     """
 
     def __init__(self) -> None:
@@ -130,8 +133,9 @@ class ContextInjectionRegistry:
 def _unbound_section_builder() -> str:
     """未绑定运行时状态的 builder：返回空串（= 不注入）。
 
-    为什么返回空串而不是抛错：本阶段（规格 02 §3.2 步骤 1）注册表只登记、
-    不参与渲染，任何查询时机都不应失败；步骤 2 渲染管线接管时，由调用方通过
+    为什么返回空串而不是抛错：注册表在"只登记不渲染"的 B1-B3 阶段就存在，
+    当初的任何查询时机都不应失败；渲染接管（B4）后，未绑定 provider 仍等价于
+    "该注入本轮不存在"（规格 02 §2.1：空串表示不注入），由调用方通过
     ``build_default_injection_registry(runtime_provider=...)`` 完成状态绑定。
     """
     return ""
@@ -150,36 +154,43 @@ def _build_context_prefix(is_gui: bool) -> str:
     return build_stable_prompt(load_system_prompt(is_gui))
 
 
-def _build_stable_system_sections(is_gui: bool) -> str:
-    """注入点 2：记忆目录 / 技能目录 / 子 Agent 清单段（PREFIX/SYSTEM）。
+def _build_stable_system_sections() -> str:
+    """注入点 2：通用编码规范 / 长期记忆 / 技能目录 / 子 Agent 清单段（PREFIX/SYSTEM）。
 
-    包装 ``agent_service.build_stable_system_message``，只取其 content 字段。
+    包装 ``agent_service.build_stable_system_extra_sections``（B4 从
+    ``build_stable_system_message`` 里拆出的「build_stable_prompt 之外」部分），
+    按原有条件与顺序以 "\\n\\n" 连接。
 
-    注意：该 content 现有实现里已包含注入点 1（build_stable_prompt 的输出）。
-    规格 02 §2.2 仍把两者分列两条 source；步骤 2 接管渲染时需按 source 拆分
-    组合、避免重复拼接。本阶段只登记不渲染，因此无任何字节影响。
+    为什么必须拆分（规格 02 §3.2 步骤 2）：注入点 1（base_prompt + 决策规则）与
+    注入点 2 是两条 PREFIX/SYSTEM source，渲染管线按 source 取值再拼；若本段仍返回
+    ``build_stable_system_message`` 的完整 content（内含注入点 1），前缀会重复拼接
+    一整份 base_prompt。拆分后两段各自完整，且分段点落在原有 "\\n\\n" 连接符上，
+    join 结合律保证 ``build_stable_system_message`` 的输出逐字节不变。
+    本段与 GUI/CLI 无关，故不再接收 is_gui（改造前该参数只用于读取 base_prompt）。
     """
-    from core.agent_service import build_stable_system_message
+    from core.agent_service import build_stable_system_extra_sections
 
-    return build_stable_system_message(is_gui)["content"]
+    return "\n\n".join(build_stable_system_extra_sections())
 
 
 def _runtime_block_builder(
     runtime_provider: Callable[[], "RuntimeContext"] | None,
 ) -> Callable[[], str]:
-    """注入点 3：运行上下文块（PERSISTED/SYSTEM）→ ``build_dynamic_prompt``。
+    """注入点 3：运行上下文基础块（PERSISTED/SYSTEM）。
 
-    注意：现有实现中电脑操控说明与按回合纠正由 build_dynamic_prompt 内部
-    追加（见注入点 6/7）；规格 02 §2.2 分列三条 source，步骤 2 接管渲染时
-    需按 source 拆分组合，避免重复拼接。
+    B4 起指向 ``context_builder._build_runtime_context_block``——build_dynamic_prompt
+    拆出的"基础块"（不含电脑操控说明与按回合纠正，二者是独立的注入点 6/7）。
+    为什么不能指向 build_dynamic_prompt：那会让 PERSISTED/SYSTEM 通道出现
+    "全量动态块 + 电脑操控 + 纠正"三项重复拼接，且注册表 builder → build_dynamic_prompt
+    → 注册表 形成无限递归。
     """
     if runtime_provider is None:
         return _unbound_section_builder
 
     def builder() -> str:
-        from core.context_builder import build_dynamic_prompt
+        from core.context_builder import _build_runtime_context_block
 
-        return build_dynamic_prompt(runtime_provider())
+        return _build_runtime_context_block(runtime_provider())
 
     return builder
 
@@ -227,9 +238,10 @@ def _workspace_corrections_builder(
 ) -> Callable[[], str]:
     """注入点 7：按回合撤销纠正（PERSISTED/SYSTEM）。
 
-    现有实现没有独立函数：该文本由 ``build_dynamic_prompt`` 内联追加，
-    来源是 ``RuntimeContext.workspace_corrections`` 字段。此处按字段直读包装，
-    步骤 2 接管渲染时由渲染管线决定拆分方式（本阶段只登记）。
+    现有实现没有独立函数：改造前该文本由 ``build_dynamic_prompt`` 内联追加，
+    来源是 ``RuntimeContext.workspace_corrections`` 字段。此处按字段直读包装
+    （与 build_dynamic_prompt 改造前的取值写法 `getattr(...) or ""` 完全一致），
+    B4 起由渲染管线把本段拼在动态块末尾。
     """
     if runtime_provider is None:
         return _unbound_section_builder
@@ -246,8 +258,9 @@ def _build_file_reference() -> str:
     现有实现中，@ 引用的注入文本由 ``input_parser.parse_user_input`` 直接拼进
     user 消息（text_content 的 "[附带上下文: ...]" / "[附带图片文件: ...]" 块），
     不存在可独立指向的无参函数；按规格 02 §2.2 的精神登记 source 与分类，
-    文本构建留待步骤 2/3 需要接管时再从 parse_user_input 提取。
-    返回空串 = 本阶段不注入（不改变任何现有行为）。
+    文本构建留待需要接管时再从 parse_user_input 提取（B4 只接管时间注记：
+    PER_REQUEST/USER_REMINDER 通道里本 source 返回空串被过滤，不参与拼接，
+    因此时间注记的拼接结果与改造前逐字节一致）。
     """
     return ""
 
@@ -287,10 +300,12 @@ def build_default_injection_registry(
     "重复 source 抛错"与测试隔离都会变得不可靠（规格 02 §5：注册表不得
     成为新的复杂度源）。
 
-    :param is_gui: 稳定前缀（注入点 1/2）读取哪份随包系统提示词（GUI/CLI 分离）。
+    :param is_gui: 稳定前缀（注入点 1）读取哪份随包系统提示词（GUI/CLI 分离）；
+        注入点 2 与端口径无关，不使用该参数。
     :param runtime_provider: 注入点 3/4/6/7 的每轮 RuntimeContext 来源；
-        未传时这些 source 的 builder 返回空串（不注入）——本阶段注册表
-        不参与渲染，状态绑定留给步骤 2 的渲染管线。
+        未传时这些 source 的 builder 返回空串（不注入），由调用方
+        （B4 起的渲染管线：build_stable_system_message / build_dynamic_prompt /
+        agent_service 的时间注记取用点）完成状态绑定。
     """
     registry = ContextInjectionRegistry()
 
@@ -302,12 +317,13 @@ def build_default_injection_registry(
         section_builder=lambda: _build_context_prefix(is_gui),
     ))
 
-    # 2) 记忆目录 / 技能目录 / 子 Agent 清单 → PREFIX/SYSTEM（跨轮基本不变）
+    # 2) 通用编码规范 / 长期记忆 / 技能目录 / 子 Agent 清单 → PREFIX/SYSTEM
+    #    （跨轮基本不变；B4 起与注入点 1 拆开各自独立取值，见 _build_stable_system_sections）
     registry.register(InjectionSpec(
         source=SOURCE_STABLE_SYSTEM_SECTIONS,
         persistence=Persistence.PREFIX,
         channel=Channel.SYSTEM,
-        section_builder=lambda: _build_stable_system_sections(is_gui),
+        section_builder=_build_stable_system_sections,
     ))
 
     # 3) 运行上下文块（模型/权限/目录/计划）→ PERSISTED/SYSTEM

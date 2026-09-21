@@ -73,6 +73,28 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
 
     电脑操控说明（Task 10，设计 10.1）：只在 Turn 冻结的 capability 开启时
     追加到块末尾；默认 None / disabled 时返回值与历史版本逐字节一致。
+
+    渲染方式（规格 02 §3.2 步骤 2 渲染接管）：本函数不再手工拼段，而是遍历
+    注入注册表的 PERSISTED/SYSTEM 通道——注入点 3（_build_runtime_context_block）
+    / 注入点 6（电脑操控说明）/ 注入点 7（按回合撤销纠正）——按登记顺序取非空段
+    并以 "\\n\\n" 连接。分段点正落在改造前手工追加 "\\n\\n" 的位置，故输出逐字节
+    一致。防递归：注册表的 runtime_context_block builder 指向基础块函数
+    _build_runtime_context_block，绝不回调本函数。
+    """
+    from core.context_injection import build_default_injection_registry
+
+    registry = build_default_injection_registry(runtime_provider=lambda: runtime)
+    sections = [section for section in registry.build_persisted_sections() if section]
+    return "\n\n".join(sections)
+
+
+def _build_runtime_context_block(runtime: RuntimeContext) -> str:
+    """运行上下文基础块（注入点 3）：不含电脑操控说明与按回合撤销纠正。
+
+    为什么从 build_dynamic_prompt 里拆出来：注册表把基础块 / 电脑操控说明 /
+    按回合纠正登记为三条独立 PERSISTED/SYSTEM source（规格 02 §2.2），每条
+    builder 必须能独立取值，否则会出现"基础块已含 6/7、注册表再拼一次"的双份
+    注入；同时这也避免注册表 builder 回调 build_dynamic_prompt 造成的无限递归。
     """
     plan_instruction = ""
     if runtime.permission_mode == "plan":
@@ -96,12 +118,6 @@ def build_dynamic_prompt(runtime: RuntimeContext) -> str:
         f"{plan_instruction}"
         "（若上下文中存在多份本块，以最新一份为准）"
     )
-    computer_section = _build_computer_prompt_section(runtime.computer_capability)
-    if computer_section:
-        prompt = prompt + "\n\n" + computer_section
-    corrections = getattr(runtime, "workspace_corrections", "") or ""
-    if corrections:
-        prompt = prompt + "\n\n" + corrections
     return prompt
 
 

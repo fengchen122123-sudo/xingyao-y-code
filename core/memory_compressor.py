@@ -136,6 +136,55 @@ def get_precompress_ratio() -> float:
         return DEFAULT_PRECOMPRESS_RATIO
 
 
+def persisted_injection_sources() -> frozenset:
+    """PERSISTED 类注入的 source 清单（规格 02 §2.6：压缩的"必须保留"依据）。
+
+    为什么压缩只需要这份清单而不需要 source 级白名单：星瑶的 PERSISTED 注入
+    （运行上下文块 / 电脑操控说明 / 按回合撤销纠正）都由 build_dynamic_prompt
+    合并进**同一条上下文块消息**，所以保留粒度就是"承载动态块的那条消息"
+    ——比 ZCode 的消息级/source 级双层机制更简单。
+
+    注册表不可用时返回空集：压缩主流程绝不因为"保留依据查不到"而失败或改变
+    行为（保留判定退化为改造前口径）。
+    """
+    try:
+        from core.context_injection import build_default_injection_registry
+
+        return build_default_injection_registry().persisted_sources()
+    except Exception:
+        logging.getLogger("py.warnings").debug(
+            "persisted_sources 不可用，压缩保留判定退化为默认口径", exc_info=True
+        )
+        return frozenset()
+
+
+def _persisted_context_anchor_index(messages: list) -> int | None:
+    """返回承载 PERSISTED 注入的最新上下文块消息下标（没有则 None）。
+
+    动态块由 agent_service 内联到 user 消息末尾，标记为 DYNAMIC_CONTEXT_PREFIX；
+    只有 PERSISTED 通道真的包含"运行上下文块"时才认为该标记代表需要保留的注入。
+    任何导入异常都退回 None（= 不做锚定），保证压缩行为与改造前一致。
+    """
+    try:
+        from core.context_builder import DYNAMIC_CONTEXT_PREFIX
+        from core.context_injection import SOURCE_RUNTIME_CONTEXT_BLOCK
+
+        if SOURCE_RUNTIME_CONTEXT_BLOCK not in persisted_injection_sources():
+            return None
+        if not DYNAMIC_CONTEXT_PREFIX:
+            return None
+    except Exception:
+        return None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if message.get("role") != "user":
+            continue
+        content = message.get("content") or ""
+        if isinstance(content, str) and DYNAMIC_CONTEXT_PREFIX in content:
+            return index
+    return None
+
+
 def _get_encoding(timeout=10.0):
     """惰性加载 tiktoken 编码器；网络不可达时绝不无限阻塞。
 
@@ -470,12 +519,21 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 emit(f"<ansiyellow>ℹ 当前会话活跃对话过少（少于 {retain_count + 2} 条），无需进行记忆压缩。</ansiyellow>")
                 return CompressionOutcome("skipped", "too_few_messages")
 
-            messages_to_summarize = all_active_messages[:-retain_count]
+            retain_floor = len(all_active_messages) - retain_count
+            # 【PERSISTED 注入保留锚点】规格 02 §2.6 / C-T7：PERSISTED 注入合并进
+            # 动态块这一条消息，压缩必须让它活下来。保留区本来纯按条数截取，长
+            # 工具链回合里"末条 user 消息"可能被挤出保留区，于是最新的运行上下文
+            # 快照会被摘要吞掉。命中该情形时把边界回退到那条消息；正常情形下它本
+            # 就在保留区内，retain_floor 不变——即对本行为零影响。
+            anchor = _persisted_context_anchor_index(all_active_messages)
+            if anchor is not None and anchor < retain_floor:
+                retain_floor = anchor
+            messages_to_summarize = all_active_messages[:retain_floor]
             # 截断点绝不能落在工具调用组中间：若保留区的第一条消息是 tool 结果，
             # 说明其对应的 assistant(tool_calls) 被归入了待压缩区，压缩后该 tool
             # 消息会变成孤儿，导致后续所有请求报 "tool_call_id is not found"，
             # 整个会话无法继续使用。此时把保留区开头的连续 tool 消息一并归入待压缩区。
-            retained = all_active_messages[-retain_count:]
+            retained = all_active_messages[retain_floor:]
             extra = 0
             while extra < len(retained) and retained[extra]["role"] == "tool":
                 extra += 1
@@ -486,7 +544,7 @@ def _do_compress(manager, session_name, api_model, api_key, api_url, force, emit
                 emit("<ansiyellow>ℹ 保留区均为工具结果且配对助手消息在待压缩区，本次压缩已跳过（等待更多对话后再压缩）。</ansiyellow>")
                 return CompressionOutcome("skipped", "pairing_protect")
             if extra:
-                messages_to_summarize = all_active_messages[:len(all_active_messages) - retain_count + extra]
+                messages_to_summarize = all_active_messages[:retain_floor + extra]
 
             # 4. 组装待总结对话文本日志（清洗思考标签 + 预截断工具结果）
             prepared_messages = []
