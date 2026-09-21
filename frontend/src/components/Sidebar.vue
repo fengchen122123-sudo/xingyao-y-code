@@ -172,11 +172,8 @@
       <button data-test="settings-button" title="打开设置" @click="store.openModelSettings()">
         <span>⚙</span><span class="footer-copy"><b>设置</b></span>
       </button>
-      <button class="phone-btn" data-test="remote-bind-button" title="手机远程控制" @click="openRemoteBind()">
+      <button class="phone-btn" data-test="remote-bind-button" title="手机访问（移动端 / web远端）" @click="openRemoteBind()">
         <AppIcon name="smartphone" :size="16" />
-      </button>
-      <button class="phone-btn" data-test="mobile-ui-button" title="新版移动端界面" @click="openMobileBind()">
-        <AppIcon name="gem" :size="16" />
       </button>
     </div>
   </div>
@@ -257,9 +254,26 @@
       <div class="modal-head">
         <div class="mh-ico"><AppIcon name="smartphone" :size="18" /></div>
         <div>
-          <h3>{{ remoteBindMode === 'mobile' ? '新版移动端界面' : '手机远程控制' }}</h3>
-          <p>{{ remoteBindMode === 'mobile' ? 'co-team 风格独立移动端，与经典界面互不影响' : '用手机扫码即可作为第二个前端控制本机' }}</p>
+          <h3>{{ remoteBindMode === 'mobile' ? '移动端' : 'web远端' }}</h3>
+          <p>{{ remoteBindMode === 'mobile'
+            ? '新版独立移动端界面，与经典界面互不影响'
+            : '经典响应式网页，扫码即可作为第二个前端控制本机' }}</p>
         </div>
+      </div>
+      <!-- 版本切换：两个前端共用同一配对 token，只切换 URL 路径 -->
+      <div class="bind-switch" role="tablist">
+        <button
+          role="tab"
+          data-test="bind-mode-mobile"
+          :class="{ active: remoteBindMode === 'mobile' }"
+          @click="switchRemoteBindMode('mobile')"
+        >移动端</button>
+        <button
+          role="tab"
+          data-test="bind-mode-desktop"
+          :class="{ active: remoteBindMode === 'desktop' }"
+          @click="switchRemoteBindMode('desktop')"
+        >web远端</button>
       </div>
       <div class="modal-body">
         <img class="qr-img" :src="remoteBind.qr" alt="绑定二维码" />
@@ -747,13 +761,24 @@ function onGroupDragEnd() {
 const confirmDeleteName = ref('');
 // 正在等待二次确认删除的项目分组路径
 const confirmDeleteGroupPath = ref('');
-// 手机远程控制绑定信息（点击手机图标后弹出二维码）
+// 手机访问绑定信息（点击手机图标后弹出二维码，弹窗内可切换移动端 / web远端）
 // permanent=true 表示永久有效（后端 expires_in=0），不做倒计时自动刷新
 const remoteBind = ref<null | { url: string; qr: string; expires_in: number; permanent?: boolean }>(null);
 // 配对链接刷新中标记：刷新期间禁用按钮避免重复点击
 const remoteBindRefreshing = ref(false);
-// 绑定目标：desktop=经典界面（桌面 dist 响应式版）/ mobile=独立移动端（/m/ 路径）
-const remoteBindMode = ref<'desktop' | 'mobile'>('desktop');
+// 绑定目标：mobile=新版独立移动端（/m/）/ desktop=经典响应式网页（/）。
+// 默认移动端；用 localStorage 记住上次选择（沿用 'ycode-*' 键前缀约定）。
+type RemoteBindMode = 'desktop' | 'mobile';
+const REMOTE_BIND_MODE_KEY = 'ycode-remote-bind-mode';
+function loadRemoteBindMode(): RemoteBindMode {
+  try {
+    return localStorage.getItem(REMOTE_BIND_MODE_KEY) === 'desktop' ? 'desktop' : 'mobile';
+  } catch {
+    // 隐私模式等 localStorage 不可用时退回默认值
+    return 'mobile';
+  }
+}
+const remoteBindMode = ref<RemoteBindMode>(loadRemoteBindMode());
 // 过期检查定时器：弹窗打开期间每秒检测，过期自动刷新 token
 let remoteBindExpiryTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -1124,17 +1149,17 @@ async function openFolder(path: string) {
   }
 }
 
-// 打开手机远程控制绑定弹窗：向后端请求二维码与配对链接。
+// 打开手机访问绑定弹窗：向后端请求二维码与配对链接。
 // 后端 token 固定：未过期直接复用，应用重启也不变；过期由后端自动重签。
 async function fetchRemoteBind(forceNew: boolean) {
   const api = window.pywebview && window.pywebview.api;
   if (!api) {
-    store.notifyModal('手机远程控制', '后端连接失败：pywebview API 不可用');
+    store.notifyModal('手机访问', '后端连接失败：pywebview API 不可用');
     return;
   }
   try {
     // get_remote_bind_qr 为后端桥接方法，前端类型契约尚未收录，故此处按返回结构取用；
-    // mobile 模式追加第二参数绑定独立移动端（/m/），桌面模式保持单参签名不变
+    // mobile 模式追加第二参数绑定独立移动端（/m/），web远端保持单参签名不变
     const result = remoteBindMode.value === 'mobile'
       ? await (api as any).get_remote_bind_qr(forceNew, true)
       : await (api as any).get_remote_bind_qr(forceNew);
@@ -1148,26 +1173,33 @@ async function fetchRemoteBind(forceNew: boolean) {
       };
       startExpiryWatch();
     } else if (!forceNew || !remoteBind.value) {
-      store.notifyModal('手机远程控制', (result && result.msg) || '获取绑定二维码失败');
+      store.notifyModal('手机访问', (result && result.msg) || '获取绑定二维码失败');
     } else {
       // 手动刷新失败时保留旧弹窗内容，仅提示
-      store.notifyModal('手机远程控制', (result && result.msg) || '刷新配对链接失败');
+      store.notifyModal('手机访问', (result && result.msg) || '刷新配对链接失败');
     }
   } catch (err) {
-    store.notifyModal('手机远程控制', String(err));
+    store.notifyModal('手机访问', String(err));
   } finally {
     remoteBindRefreshing.value = false;
   }
 }
 
+// 单一入口：按当前（或上次记住的）版本打开绑定弹窗
 async function openRemoteBind() {
-  remoteBindMode.value = 'desktop';
   await fetchRemoteBind(false);
 }
 
-// 新版移动端入口：与经典界面并列的第二个手机端，共用配对通道
-async function openMobileBind() {
-  remoteBindMode.value = 'mobile';
+// 弹窗内切换版本：只换 URL 路径，复用同一 token（后端未过期直接复用，
+// 不会重签 token，也不会踢掉已扫码连接的手机）
+async function switchRemoteBindMode(mode: RemoteBindMode) {
+  if (remoteBindMode.value === mode) return;
+  remoteBindMode.value = mode;
+  try {
+    localStorage.setItem(REMOTE_BIND_MODE_KEY, mode);
+  } catch {
+    // localStorage 不可用时仅本次生效
+  }
   await fetchRemoteBind(false);
 }
 
@@ -1678,7 +1710,7 @@ function getFolderTitle(g: SessionGroup) {
   color: var(--text);
   background: var(--bg2);
 }
-/* 手机远程控制入口：与设置按钮同行右侧的小方形图标按钮 */
+/* 手机访问入口：与设置按钮同行右侧的小方形图标按钮（弹窗内切换移动端 / web远端） */
 .side-footer .phone-btn {
   width: 32px;
   justify-content: center;
@@ -1688,7 +1720,7 @@ function getFolderTitle(g: SessionGroup) {
 .footer-copy { display: flex; flex-direction: column; min-width: 0; }
 .footer-copy b { font-size: 12.5px; color: inherit; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-/* 手机远程控制绑定弹窗（结构参照 ConfirmModal 的 modal-mask 风格） */
+/* 手机访问绑定弹窗（结构参照 ConfirmModal 的 modal-mask 风格） */
 .modal-mask {
   position: fixed;
   inset: 0;
@@ -1736,6 +1768,32 @@ function getFolderTitle(g: SessionGroup) {
 .modal-head p {
   font-size: 12px;
   color: var(--text-faint);
+}
+/* 版本切换分段控件（移动端 / web远端，共用同一配对 token） */
+.bind-switch {
+  display: flex;
+  gap: 4px;
+  margin: 12px 18px 0;
+  padding: 3px;
+  background: var(--bg3, rgba(255, 255, 255, 0.04));
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.bind-switch button {
+  flex: 1;
+  padding: 7px 0;
+  border: none;
+  background: none;
+  color: var(--text-dim);
+  font-size: 12.5px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.bind-switch button.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
 }
 .modal-body {
   padding: 18px;
