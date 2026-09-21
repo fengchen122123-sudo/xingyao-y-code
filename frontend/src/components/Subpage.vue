@@ -135,6 +135,71 @@
         </div>
       </div>
 
+      <!-- 钩子 Hooks 页：列出全部已配置 Hook，按状态提供信任/拒绝/撤销/重置操作 -->
+      <div v-else-if="subType === 'hooks'">
+        <div class="sub-toolbar">
+          <span class="toolbar-spacer"></span>
+          <button
+            class="chip-btn"
+            data-test="refresh-hooks-btn"
+            title="重新读取用户级与项目级 Hook"
+            :disabled="store.hooksLoading"
+            @click="store.refreshHooks()"
+          >
+            <AppIcon name="refresh" :size="12" :class="{ 'icon-spin': store.hooksLoading }" />
+            {{ store.hooksLoading ? '刷新中…' : '刷新' }}
+          </button>
+        </div>
+        <div class="sub-grid">
+          <div v-if="store.hooks.length === 0" class="sub-empty">
+            未配置任何 Hook（用户级 ~/.ycode/hooks.json、项目级 .zcode 或 .ycode/hooks.json）
+          </div>
+          <div v-for="h in store.hooks" :key="h.digest" class="sub-card" data-test="hook-row">
+            <div class="sc-top">
+              <div class="sc-ico"><AppIcon name="zap" :size="16" /></div>
+              <div class="sc-name">
+                {{ h.event }}
+                <span class="pl-src" :class="h.scope === 'user' ? 'user' : 'builtin'">{{ h.scope === 'user' ? '用户' : '项目' }}</span>
+              </div>
+              <span class="hook-status" :class="h.status">{{ hookStatusText(h.status) }}</span>
+            </div>
+            <div class="sc-desc hook-cmd">{{ h.command }}</div>
+            <div class="sc-id hook-meta">
+              matcher: {{ h.matcher }} · 来源: {{ h.source_path }}
+              <!-- 待确认/配置已变更：需先信任才会执行，拒绝则显式屏蔽 -->
+              <button
+                v-if="h.status === 'pending' || h.status === 'stale'"
+                class="btn primary sc-trust-btn"
+                data-test="hook-action-grant"
+                title="确认内容后允许该 Hook 命令执行"
+                @click.stop="store.grantHookTrust(h.digest)"
+              >信任</button>
+              <button
+                v-if="h.status === 'pending' || h.status === 'stale'"
+                class="btn sc-trust-btn"
+                data-test="hook-action-deny"
+                title="拒绝后该 Hook 命令不再执行"
+                @click.stop="store.denyHookTrust(h.digest)"
+              >拒绝</button>
+              <button
+                v-if="h.status === 'trusted'"
+                class="btn sc-trust-btn"
+                data-test="hook-action-revoke"
+                title="撤销信任，该 Hook 回到待确认"
+                @click.stop="store.revokeHookTrust(h.digest)"
+              >撤销信任</button>
+              <button
+                v-if="h.status === 'blocked' || h.status === 'revoked'"
+                class="btn sc-trust-btn"
+                data-test="hook-action-reset"
+                title="重置为待确认，可重新决定是否信任"
+                @click.stop="store.resetHookTrust(h.digest)"
+              >重置为待确认</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <!-- 星轨自动化任务页 -->
       <div v-else-if="subType === 'automations'" class="automations-page">
         <AutomationPane />
@@ -238,7 +303,7 @@ import { computed, reactive, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import AutomationPane from './AutomationPane.vue';
 import { useAppStore, type SubpageType } from '../stores/appStore';
-import type { SkillInfo, McpInfo, ModelInfo, PluginInfo } from '../types/pywebview';
+import type { SkillInfo, McpInfo, ModelInfo, PluginInfo, HookInfo } from '../types/pywebview';
 import { parseModelTestError } from '../utils/errorParser';
 
 const props = defineProps<{
@@ -254,6 +319,7 @@ const title = computed(() => {
   if (props.subType === 'mcp') return 'MCP 服务';
   if (props.subType === 'plugins') return '插件 Plugins';
   if (props.subType === 'automations') return '星轨自动化任务';
+  if (props.subType === 'hooks') return '钩子 Hooks';
   return '模型管理';
 });
 const desc = computed(() => {
@@ -261,6 +327,7 @@ const desc = computed(() => {
   if (props.subType === 'mcp') return '来自 mcp.json 的服务接口';
   if (props.subType === 'plugins') return '与 CLI 共用同一份 plugin.json 配置，开关状态两端同步';
   if (props.subType === 'automations') return '定时触发的星轨自动化回合，仅星瑶运行期间生效';
+  if (props.subType === 'hooks') return '用户级与项目级生命周期钩子（信任确认后生效）';
   return '管理模型供应商与可用模型列表';
 });
 
@@ -372,7 +439,19 @@ function pluginStatusText(p: PluginInfo) {
   }
 }
 
-// 打开 MCP / 插件 / 自动化页时刷新一次最新状态
+// C12：Hook 信任状态文案（未知状态回退原文，避免新增状态时静默丢信息）
+function hookStatusText(status: HookInfo['status']) {
+  switch (status) {
+    case 'pending': return '待确认';
+    case 'trusted': return '已信任';
+    case 'stale': return '配置已变更';
+    case 'blocked': return '已拒绝';
+    case 'revoked': return '已撤销';
+    default: return status;
+  }
+}
+
+// 打开 MCP / 插件 / 钩子 / 自动化页时刷新一次最新状态
 watch(
   () => [props.visible, props.subType] as const,
   ([visible, type]) => {
@@ -380,6 +459,8 @@ watch(
       store.refreshMcpServers();
     } else if (visible && type === 'plugins') {
       store.refreshPlugins();
+    } else if (visible && type === 'hooks') {
+      store.refreshHooks();
     } else if (visible && type === 'automations') {
       store.refreshAutomations();
     }
@@ -655,6 +736,39 @@ async function testModelRow(m: ModelInfo) {
   font-size: 10px;
   line-height: 1.6;
   vertical-align: middle;
+}
+
+/* 钩子 Hooks 卡片：命令行按 mono 展示且允许换行，状态徽标按 status 分色 */
+.sub-card .hook-cmd {
+  font-family: var(--mono);
+  white-space: pre-wrap;
+  word-break: break-all;
+  min-height: 0;
+}
+.hook-status {
+  margin-left: auto;
+  flex-shrink: 0;
+  font-size: 10.5px;
+  padding: 1px 8px;
+  border-radius: 6px;
+  background: var(--bg3);
+  color: var(--text-dim);
+}
+.hook-status.trusted {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.hook-status.pending,
+.hook-status.stale {
+  background: rgba(240, 136, 62, 0.15);
+  color: var(--orange);
+}
+.hook-status.blocked {
+  background: rgba(248, 81, 73, 0.12);
+  color: var(--red);
+}
+.hook-status.revoked {
+  color: var(--text-faint);
 }
 
 /* MCP 添加服务表单 */
