@@ -176,21 +176,22 @@ def load_system_prompt(is_gui: bool = False) -> str:
     return system_prompt
 
 
-def build_stable_system_message(is_gui: bool = False) -> dict:
-    """组装每轮请求首位的稳定系统提示词消息，供请求组装与 Token 估算复用。
+def build_stable_system_extra_sections() -> list[str]:
+    """稳定前缀中「build_stable_prompt 之外」的段落（注入点 2，规格 02 §2.2）。
 
-    稳定前缀 = 基础系统提示词 + 决策策略 + 通用编码规范 + 长期记忆
-               + 技能目录 + 自定义子 Agent 清单。
-    后四块内容跨轮基本不变（记忆仅在用户显式要求记录/归纳时变化，技能与子 Agent
-    在会话内稳定），并入稳定前缀可把前缀撑到 2048 token 的整数倍以上，
-    显著提升 DeepSeek 磁盘缓存（按 2048 token 块匹配）的命中覆盖范围。
+    内容 = 人设块? + 通用编码规范 + 长期记忆? + 技能目录? + 子 Agent 清单?，
+    保持改造前的条件与顺序；**不含** build_stable_prompt（base_prompt + 决策规则）
+    的输出——那部分由注入点 1 单独提供。
 
-    注意：任何跨轮不变的静态内容都应优先并入这里，而不是放进动态运行上下文块，
-    动态块每轮变化会打断 provider 侧缓存前缀。
+    为什么要拆出来（规格 02 §3.2 步骤 2 渲染接管）：注册表把注入点 1 与注入点 2
+    登记为两条 PREFIX/SYSTEM source，渲染管线按 source 分别取值、再以 "\\n\\n"
+    连接。只有把本段独立成函数，两条 source 才能各自产出完整文本且互不重复拼接；
+    因各段均非空且连接符统一，join 满足结合律——拆成两段后再拼与原一次性拼接
+    逐字节相同（由 sha256 golden ef286e51… 守护）。
+
+    本段与 GUI / CLI 口径无关，故不接受 is_gui 参数。
     """
-    from core.context_builder import build_stable_prompt
-
-    parts = [build_stable_prompt(load_system_prompt(is_gui))]
+    parts: list[str] = []
     # 人设设置块：仅当用户在设置页自定义了名称/称呼/人设时非空；
     # 默认配置返回空串，不影响 byte-stability。跨轮不变，归入稳定前缀。
     try:
@@ -223,7 +224,34 @@ def build_stable_system_message(is_gui: bool = False) -> dict:
             parts.append(subagents_catalog)
     except Exception:
         pass
+    return parts
+
+
+def build_stable_system_message(is_gui: bool = False) -> dict:
+    """组装每轮请求首位的稳定系统提示词消息，供请求组装与 Token 估算复用。
+
+    稳定前缀 = 基础系统提示词 + 决策策略 + 通用编码规范 + 长期记忆
+               + 技能目录 + 自定义子 Agent 清单。
+    后四块内容跨轮基本不变（记忆仅在用户显式要求记录/归纳时变化，技能与子 Agent
+    在会话内稳定），并入稳定前缀可把前缀撑到 2048 token 的整数倍以上，
+    显著提升 DeepSeek 磁盘缓存（按 2048 token 块匹配）的命中覆盖范围。
+
+    注意：任何跨轮不变的静态内容都应优先并入这里，而不是放进动态运行上下文块，
+    动态块每轮变化会打断 provider 侧缓存前缀。
+
+    渲染方式（规格 02 §3.2 步骤 2 渲染接管）：不再手工堆 parts，而是遍历注入
+    注册表的全部 PREFIX/SYSTEM source——注入点 1 = build_stable_prompt，
+    注入点 2 = build_stable_system_extra_sections——按登记顺序取非空段以
+    "\\n\\n" 连接。该组装与原实现逐字节等价（分段点正落在原有的 "\\n\\n"
+    连接符上，join 结合律成立），由 tests/test_prompt_byte_stability.py 的
+    sha256 golden（ef286e51…）与 test_context_injection.py 的逐点对比双重守护。
+    """
+    from core.context_injection import build_default_injection_registry
+
+    registry = build_default_injection_registry(is_gui=is_gui)
+    parts = [section for section in registry.build_prefix_sections() if section]
     return {"role": "system", "content": "\n\n".join(parts)}
+
 
 def estimate_history_tokens_with_system(model_name: str, history: list, is_gui: bool = False) -> int:
     """估算一轮请求的实际 Token 占用：历史消息 + 首部稳定系统提示词。
@@ -799,10 +827,11 @@ def prepare_turn_messages(
     history = manager.get_history_for_llm(session_name)
 
     # 只在这一层组装一个稳定提示词和一份当前运行上下文。
-    from core.context_builder import (
-        build_dynamic_prompt,
-        build_time_note,
-    )
+    # 动态块与时间注记自 B4 起统一经注入注册表取用（规格 02 §3.2 步骤 2）：
+    # 动态块由 build_dynamic_prompt 内部遍历 PERSISTED/SYSTEM 通道，
+    # 时间注记在下方按 PER_REQUEST/USER_REMINDER 通道取用。
+    from core.context_builder import build_dynamic_prompt
+    from core.context_injection import build_default_injection_registry
 
     # 提前组装首部稳定系统提示词：Token 估算必须把它计入，
     # 否则口径会低于实际请求（系统提示词不落库、每轮现组）
@@ -975,7 +1004,16 @@ def prepare_turn_messages(
     # 2) 动态运行上下文块 + 后台汇总 + 时间注记统一内联到最后一条 user 消息末尾。
     #    以前动态块/汇总块是独立 role=system 消息插到 user 之前，多轮对话里会落到
     #    历史中间（前面的 user 之后），违反 provider 的「system 必须在开头」约束。
-    time_note = build_time_note(runtime)
+    #    时间注记经注册表的 PER_REQUEST + USER_REMINDER 通道取用（规格 02 §3.2
+    #    步骤 2）：通道内当前只有时间注记一条（@ 文件引用在解析期内联、未接入
+    #    注册表 → builder 返回空串被过滤），故拼接结果与直接调用 build_time_note
+    #    逐字节一致；通道为空只会发生在时间注记本身为空时（现实现恒非空），
+    #    此时空串会被 _append_context_suffix_to_last_user 过滤，语义仍是"不注入"。
+    time_note = "\n\n".join(
+        build_default_injection_registry(
+            runtime_provider=lambda: runtime
+        ).build_per_request_reminders()
+    )
     try:
         summary_msg = build_background_task_summary(session_name)
     except Exception:
