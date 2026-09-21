@@ -301,9 +301,11 @@ class FakePage:
         self.concurrency_violations = 0
         self._inside_screenshot = False
         # E1 元素收集脚本注入点：None 表示返回空列表（既有测试零影响）；
-        # error 非空时 evaluate 抛错，用于验证「收集失败不中断 observe」。
+        # error 非空时 evaluate 抛错，用于验证「收集失败不中断 observe」；
+        # hook 非空时在收集脚本求值后调用（测试模拟收集期间页面变化）。
         self.element_collect_result = None
         self.element_collect_error = None
+        self.element_collect_hook = None
         # E2 元素动作注入点：locator 调用记录（selector 列表）与最近创建的
         # FakeLocator（供断言 click/fill 参数与异常注入路径）；预设字段
         # 在 locator 创建时应用到新对象（execute 前设置即可注入失败/命中数）。
@@ -325,6 +327,8 @@ class FakePage:
             if self.element_collect_error is not None:
                 raise self.element_collect_error
             result = self.element_collect_result
+            if self.element_collect_hook is not None:
+                self.element_collect_hook(self)
             return [] if result is None else result
         if "visibilityState" in str(expression) and "hasFocus" in str(expression):
             return [self.visibility_state, self.focused]
