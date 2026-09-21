@@ -170,6 +170,48 @@ def step0_build_frontend(project_dir, args):
 
     print(f"✅ 前端构建成功: {index_html}")
 
+    # ---- 独立移动端子应用（frontend-mobile/dist，/m/ 托管；缺失仅影响新界面）----
+    print("\n[步骤 0.5/5] 构建 / 复用移动端子应用产物 (frontend-mobile/dist)...")
+    mobile_dir = os.path.join(project_dir, "frontend-mobile")
+    mobile_dist = os.path.join(mobile_dir, "dist")
+    mobile_index = os.path.join(mobile_dist, "index.html")
+
+    if args.skip_frontend:
+        print("ℹ 已指定 --skip-frontend，同步跳过移动端构建。")
+        os.makedirs(mobile_dist, exist_ok=True)
+        if not os.path.exists(mobile_index):
+            print("⚠️ frontend-mobile/dist/index.html 不存在：打包后的 /m/ 新版移动端将 404（经典界面不受影响）。")
+        return
+
+    if os.path.exists(mobile_index) and not args.rebuild_frontend:
+        print(f"✅ 已检测到移动端产物: {mobile_index}（如需强制重新构建，请加上 --rebuild-frontend）。")
+        return
+
+    if not os.path.isdir(mobile_dir):
+        print(f"❌ 未找到移动端项目目录: {mobile_dir}")
+        sys.exit(1)
+
+    npm_bin = shutil.which("npm")
+    if npm_bin is None:
+        print("❌ PATH 环境变量中未找到 npm，无法构建移动端。")
+        sys.exit(1)
+    if not os.path.isdir(os.path.join(mobile_dir, "node_modules")):
+        print("🚀 移动端依赖缺失，正在执行 npm install ...")
+        install = subprocess.run([npm_bin, "install", "--no-audit", "--no-fund"], cwd=mobile_dir)
+        if install.returncode != 0:
+            print("❌ 移动端 npm install 失败。")
+            sys.exit(1)
+
+    print("🚀 正在执行移动端 npm run build ...")
+    result = subprocess.run([npm_bin, "run", "build"], cwd=mobile_dir)
+    if result.returncode != 0:
+        print(f"❌ 移动端构建失败（npm run build 退出码 {result.returncode}）。")
+        sys.exit(1)
+    if not os.path.exists(mobile_index):
+        print("❌ 移动端构建完成但未生成 frontend-mobile/dist/index.html，请检查 vite 配置。")
+        sys.exit(1)
+    print(f"✅ 移动端构建成功: {mobile_index}")
+
 
 # ============================================================================
 # 步骤 1：核心双主程序 (Y-code.exe + ycode.exe)
