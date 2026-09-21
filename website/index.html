@@ -250,6 +250,9 @@ section { position: relative; }
 .footer-links a:hover { color: var(--cyan); }
 .footer-links a.disabled { color: rgba(147, 167, 188, .45); cursor: not-allowed; pointer-events: none; }
 .footer-copy { width: 100%; color: rgba(147, 167, 188, .55); font-size: 13px; margin-top: 22px; }
+.footer-beian { width: 100%; font-size: 13px; margin-top: 6px; }
+.footer-beian a { color: rgba(147, 167, 188, .55); transition: color .2s; }
+.footer-beian a:hover { color: var(--cyan); }
 
 /* ============ 演示弹窗 ============ */
 dialog#demo-modal {
@@ -311,7 +314,7 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 <header class="hero" id="top">
   <div class="hero-content">
     <img class="hero-logo" src="assets/xingyaocode.png" alt="星瑶Code 像素机器人标志">
-    <div class="hero-tagline">星瑶Code 已上线 · v<span class="js-version">1.2.3</span></div>
+    <div class="hero-tagline">星瑶Code 已上线 · v<span class="js-version">1.3.1</span></div>
     <h1>让代码，回应你的想象。</h1>
     <p class="hero-desc">
       一位真正能执行任务、理解项目并长期记忆的本地 AI 编程伙伴。<br>
@@ -386,7 +389,7 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
     <div class="download-head">
       <div class="eyebrow">Download</div>
       <h2 class="section-title">准备好，与星瑶并肩了吗？</h2>
-      <span class="version-tag">当前版本 v<span class="js-version">1.2.3</span> · Windows</span>
+      <span class="version-tag">当前版本 v<span class="js-version">1.3.1</span> · Windows</span>
     </div>
     <div class="download-grid">
       <div class="platform-card available">
@@ -423,13 +426,14 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
       <a class="disabled" aria-disabled="true" title="GitHub 仓库即将上线">GitHub</a>
     </div>
     <div class="footer-copy">© 2026 星瑶Code · 让代码，回应你的想象。</div>
+    <div class="footer-beian"><a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener">京ICP备2026063481号</a></div>
   </div>
 </footer>
 
 <!-- ============ 演示下载弹窗 ============ -->
 <dialog id="demo-modal" aria-labelledby="demo-modal-title">
-  <h3 id="demo-modal-title">官网演示版</h3>
-  <p>当前为官网演示版，下载通道尚未接入服务器。<br>安装包（<span class="js-filename">ycode_setup_v1.2.3.exe</span>）上线后，此按钮将直接开始下载。</p>
+  <h3 id="demo-modal-title">在线演示版</h3>
+  <p>当前为在线演示版，下载通道尚未接入服务器。<br>安装包（<span class="js-filename">ycode_setup_v1.3.1.exe</span>）上线后，此按钮将直接开始下载。</p>
   <button class="btn btn-primary" type="button" id="demo-modal-close">我知道了</button>
 </dialog>
 
@@ -438,8 +442,8 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
 const DOWNLOAD_CONFIG = {
   mode: "demo",                 // "demo" 演示弹窗 | "live" 真实下载
   windowsUrl: "",               // live 模式必填，必须是非空 https:// 地址
-  version: "1.2.3",             // 页面显示版本
-  fileName: "ycode_setup_v1.2.3.exe"
+  version: "1.3.1",             // 页面显示版本
+  fileName: "ycode_setup_v1.3.1.exe"
 };
 
 /* 版本号与文件名统一由 CONFIG 渲染，改一处全站生效 */
@@ -455,7 +459,7 @@ function onDownloadClick() {
   if (DOWNLOAD_CONFIG.mode === "live") {
     var url = (DOWNLOAD_CONFIG.windowsUrl || "").trim();
     if (!/^https:\/\/\S+$/.test(url)) {
-      console.error("[星瑶Code 官网] live 模式下 windowsUrl 必须是非空 https:// 地址，当前值无效。");
+      console.error("[星瑶Code] live 模式下 windowsUrl 必须是非空 https:// 地址，当前值无效。");
       alert("下载配置无效，请稍后再试。");
       return;
     }
