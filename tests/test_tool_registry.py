@@ -407,3 +407,14 @@ def test_image_plugin_tools_declare_network_scope():
         "tokenrhythm_edit_image",
     ):
         assert registry.get(name).side_effect_scope == "network", name
+
+
+def test_fixed_computer_adapter_declares_system_scope():
+    """A 阶段评审补修：固定 computer 适配器必须声明 side_effect_scope=system。
+
+    规格 03 §3.2 取值表点名 computer_action 归 system；此前未声明导致取默认
+    none，本测试锁定该契约（与生图插件 network 同理，不经注册表加载）。
+    """
+    from core.computer.tool_adapter import computer_action_tool_spec
+
+    assert computer_action_tool_spec().side_effect_scope == "system"

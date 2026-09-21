@@ -91,6 +91,11 @@ sequenceDiagram
 
 **实现约束**：hook 返回的 `allow` 必须经过 `core/permission_policy.py` 的档位校验，**不直接生效**。
 
+> **实现裁决注记（2026-09-21 复核）**：v1 实测语义为——`confirm` 档位下 `ask→deny` 生效；`ask→allow` 不生效
+> （用户询问在权限链内、先于 hook 完成，hook 只能向更严格方向收敛）；`allow` 不参与提权（超出档位仍被拒，H-T4 锁定）。
+> 即 v1 的 hook 权限调整是「只收紧、不放松」；`ask→allow`（减少询问）留待二期（需把询问时机后移到 hook 之后）。
+> 档位校验复用既有权限链（`tool_pipeline` 的权限判定 + `_hook_permission_decision`），未改动 `permission_policy.py`。
+
 ---
 
 ## 3. 配置格式
@@ -414,6 +419,10 @@ STOP_CONTINUE_MAX = 5
 **为什么 PreToolUse 在权限判定之后**：
 - hook 需要知道权限决策才能做"ask→allow/deny"的调整；
 - 若放权限判定之前，hook 无法影响决策。
+
+> **实现裁决注记（2026-09-21 复核）**：v1 中"ask→allow"不生效——用户询问在权限链内先于 hook 完成，
+> hook 的 `allow` 分支保留既有结果（不重复询问、不放宽）；hook 的实际能力是「收紧」：deny 阻断、
+> `ask` 在档位自动放行时补一次真实询问。详见 §2.2 注记。
 
 **改动示例**（PreToolUse）：
 
