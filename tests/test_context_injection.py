@@ -212,28 +212,43 @@ def test_context_prefix_section_matches_golden_digest(monkeypatch):
     assert hashlib.sha256(_json_bytes(sections[0])).hexdigest() == _STABLE_PROMPT_GOLDEN_SHA256
 
 
-def test_stable_system_section_matches_existing_function(monkeypatch):
-    """注入点 2：记忆/技能/子 Agent 段与 build_stable_system_message 的 content 一致。"""
+def test_stable_system_sections_split_and_rejoin_match_message(monkeypatch):
+    """注入点 1+2（B4 拆分后）：两段各自完整、按序 join 与 build_stable_system_message 逐字节一致。"""
     import core.agent_service as agent_service
 
     _patch_stable_prefix_dependencies(monkeypatch)
     sections = build_default_injection_registry().build_prefix_sections()
 
-    assert sections[1] == agent_service.build_stable_system_message()["content"]
+    assert len(sections) == 2
+    # 注入点 2 的拆分语义：只含 build_stable_prompt 之外的段落（不含前缀）
+    assert sections[1] == "\n\n".join(
+        agent_service.build_stable_system_extra_sections()
+    )
+    # 组装等价：注册表两段按序 join 与原一次性组装逐字节一致
+    assert (
+        sections[0] + "\n\n" + sections[1]
+        == agent_service.build_stable_system_message()["content"]
+    )
 
 
 def test_runtime_bound_builders_delegate_to_existing_functions():
-    """注入点 3/4：绑定 RuntimeContext 后，输出与直接调用现有函数逐字节一致。"""
+    """注入点 3/4/7（B4 拆分后）：基础块/纠正/时间注记各自独立，join 与 build_dynamic_prompt 一致。"""
     import core.context_builder as context_builder
 
     runtime = _runtime_context(workspace_corrections="【按回合撤销纠正】示例纠正块")
     registry = build_default_injection_registry(runtime_provider=lambda: runtime)
 
-    # PERSISTED + SYSTEM：动态块（含内联的纠正块）在前，纠正块 source 随后
+    base_block = context_builder._build_runtime_context_block(runtime)
+    # PERSISTED + SYSTEM：基础块（不含 6/7）在前，纠正块 source 随后
     assert registry.build_persisted_sections() == [
-        context_builder.build_dynamic_prompt(runtime),
+        base_block,
         runtime.workspace_corrections,
     ]
+    # 组装等价：PERSISTED 通道 join 即 build_dynamic_prompt 的完整输出
+    assert (
+        "\n\n".join(registry.build_persisted_sections())
+        == context_builder.build_dynamic_prompt(runtime)
+    )
     # PER_REQUEST + USER_REMINDER：时间注记
     assert registry.build_per_request_reminders() == [
         context_builder.build_time_note(runtime)
@@ -241,7 +256,7 @@ def test_runtime_bound_builders_delegate_to_existing_functions():
 
 
 def test_computer_section_builder_follows_runtime_capability():
-    """注入点 6：电脑操控说明跟随 runtime 冻结的 capability（关闭时为空串）。"""
+    """注入点 6（B4 拆分后）：电脑操控说明独立成段；组装与 build_dynamic_prompt 一致。"""
     import core.context_builder as context_builder
     from core.computer.models import ComputerCapability, ComputerProtocol
 
@@ -254,18 +269,26 @@ def test_computer_section_builder_follows_runtime_capability():
     enabled_runtime = _runtime_context(computer_capability=capability)
     registry = build_default_injection_registry(runtime_provider=lambda: enabled_runtime)
     assert registry.build_persisted_sections() == [
-        context_builder.build_dynamic_prompt(enabled_runtime),
+        context_builder._build_runtime_context_block(enabled_runtime),
         expected,
     ]
+    assert (
+        "\n\n".join(registry.build_persisted_sections())
+        == context_builder.build_dynamic_prompt(enabled_runtime)
+    )
 
-    # 能力关闭：现有函数返回空串 → 该 source 不注入（与历史字节一致）
+    # 能力关闭：该 source 返回空串被过滤（不注入，与历史字节一致）
     disabled_runtime = _runtime_context()
     disabled_registry = build_default_injection_registry(
         runtime_provider=lambda: disabled_runtime
     )
     assert disabled_registry.build_persisted_sections() == [
-        context_builder.build_dynamic_prompt(disabled_runtime)
+        context_builder._build_runtime_context_block(disabled_runtime)
     ]
+    assert (
+        "\n\n".join(disabled_registry.build_persisted_sections())
+        == context_builder.build_dynamic_prompt(disabled_runtime)
+    )
 
 
 def test_registry_builders_do_not_mutate_context_builder_output(monkeypatch):
@@ -285,3 +308,78 @@ def test_registry_builders_do_not_mutate_context_builder_output(monkeypatch):
 
     assert context_builder.build_stable_prompt("base") == before_prompt
     assert context_builder.build_dynamic_prompt(runtime) == before_dynamic
+
+
+# ── B5：压缩协同（persisted_sources 引用 + 动态块锚点） ──
+
+
+def test_compression_uses_persisted_sources_and_locates_dynamic_block():
+    """B5：压缩侧引用注册表 persisted_sources()；承载 PERSISTED 注入的消息可被锚点定位。"""
+    from core.context_builder import DYNAMIC_CONTEXT_PREFIX
+    from core.memory_compressor import (
+        _persisted_context_anchor_index,
+        persisted_injection_sources,
+    )
+
+    # 压缩侧"必须保留"依据来自注册表（当前即三个 PERSISTED 注入）
+    sources = persisted_injection_sources()
+    assert SOURCE_RUNTIME_CONTEXT_BLOCK in sources
+    assert SOURCE_COMPUTER_CONTROL_SECTION in sources
+    assert SOURCE_WORKSPACE_CORRECTIONS in sources
+
+    # 锚点 = 最新一条内联了动态块的 user 消息
+    messages = [
+        {"role": "user", "content": "早先的任务"},
+        {"role": "assistant", "content": "回复"},
+        {"role": "user", "content": f"新任务\n\n{DYNAMIC_CONTEXT_PREFIX}\n当前模型：x"},
+        {"role": "assistant", "content": "回复2"},
+        {"role": "user", "content": "继续"},
+    ]
+    assert _persisted_context_anchor_index(messages) == 2
+
+    # 无动态块 / 空列表 → None（不锚定，压缩行为与改造前一致）
+    assert _persisted_context_anchor_index(messages[:2]) is None
+    assert _persisted_context_anchor_index([]) is None
+
+
+# ── B6：7 个注入点逐字节对比（改造后 vs 改造前参照） ──
+
+
+def test_seven_injection_points_byte_comparison(monkeypatch):
+    """B6：7 个注入点输出逐一与改造前参照逐字节一致，且组装等价。"""
+    import core.agent_service as agent_service
+    import core.context_builder as context_builder
+
+    _patch_stable_prefix_dependencies(monkeypatch)
+    runtime = _runtime_context(workspace_corrections="【纠正】块")
+    registry = build_default_injection_registry(runtime_provider=lambda: runtime)
+    by_source = {spec.source: spec for spec in registry.specs()}
+
+    # 1) context_prefix：build_stable_prompt（与 golden 同口径）
+    assert by_source[SOURCE_CONTEXT_PREFIX].section_builder() == (
+        context_builder.build_stable_prompt(agent_service.load_system_prompt())
+    )
+    # 2) stable_system_sections：拆出的 extra 段
+    assert by_source[SOURCE_STABLE_SYSTEM_SECTIONS].section_builder() == (
+        "\n\n".join(agent_service.build_stable_system_extra_sections())
+    )
+    # 3) runtime_context_block：基础块（不含 6/7）
+    assert by_source[SOURCE_RUNTIME_CONTEXT_BLOCK].section_builder() == (
+        context_builder._build_runtime_context_block(runtime)
+    )
+    # 4) time_note：与 build_time_note 逐字节一致
+    assert by_source[SOURCE_TIME_NOTE].section_builder() == (
+        context_builder.build_time_note(runtime)
+    )
+    # 5) file_reference：未接入（空串 = 不注入，不改变现有行为）
+    assert by_source[SOURCE_FILE_REFERENCE].section_builder() == ""
+    # 6) computer_control_section：能力关闭时为空串（不注入）
+    assert by_source[SOURCE_COMPUTER_CONTROL_SECTION].section_builder() == ""
+    # 7) workspace_corrections：字段直读
+    assert by_source[SOURCE_WORKSPACE_CORRECTIONS].section_builder() == "【纠正】块"
+
+    # 组装等价：改造前 build_dynamic_prompt 的完整输出（基础块 + 纠正块）
+    assert context_builder.build_dynamic_prompt(runtime) == (
+        context_builder._build_runtime_context_block(runtime)
+        + "\n\n" + "【纠正】块"
+    )
