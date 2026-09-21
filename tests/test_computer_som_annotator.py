@@ -7,11 +7,16 @@
 from __future__ import annotations
 
 import io
+import os
 
 import pytest
-from PIL import Image
+from PIL import Image, ImageFont
 
-from core.computer.som_annotator import annotate_screenshot
+from core.computer.som_annotator import (
+    _label_metrics,
+    _load_label_font,
+    annotate_screenshot,
+)
 
 
 def _white_png(width=1920, height=1080) -> bytes:
@@ -47,13 +52,16 @@ def test_rect_lands_on_expected_image_coordinates():
 
 def test_out_of_bounds_rect_is_clamped_and_outside_rect_skipped():
     png = _white_png()
-    clamped = _element("el-1", [3800, 2100, 4000, 2300])  # 右下角部分出图 → 钳制到图内
+    # 右下角部分出图 → 钳制到图内（图内 (1500,750)-(2000,1150) → 钳到 (1500,750)-(1920,1080)）。
+    # E3 字号升到 24px 后标签约 46×33，会盖住贴着右下角的小框，故取足够大的钳制框，
+    # 让右边缘远离左上角标签覆盖区，保留「钳制后仍可见」的断言强度。
+    clamped = _element("el-1", [3000, 1500, 4000, 2300])
     outside = _element("el-2", [-1000, -1000, -500, -500])  # 完全出图 → 跳过
     annotated = annotate_screenshot(png, (clamped, outside), 2.0, 2.0)
     image = Image.open(io.BytesIO(annotated)).convert("RGB")
-    # 钳制后的框仍可见（物理 (3800,2100) → 图内 (1900,1050)，右/下边钳到 1920/1080）；
-    # 取右边缘中部像素，避开左上角标签覆盖区
-    assert image.getpixel((1919, 1070)) == (255, 0, 0)
+    # 取右边缘中部像素（y=900），避开左上角标签覆盖区
+    assert image.getpixel((1919, 900)) == (255, 0, 0)
+    assert image.getpixel((1700, 900)) == (255, 255, 255)
     # 完全出图元素不产生任何绘制：与只含钳制元素的标注像素一致
     only_clamped = Image.open(
         io.BytesIO(annotate_screenshot(png, (clamped,), 2.0, 2.0))
@@ -109,3 +117,50 @@ def test_label_clamps_inside_image_border():
         if image.getpixel((x, y)) == (0, 0, 0)
     ]
     assert blacks
+
+
+# ---------------- E3：字号与框宽按观察图尺寸推导 ----------------
+
+@pytest.mark.parametrize(
+    ("width", "height", "expected"),
+    [
+        (1920, 1080, (24, 3)),
+        (3840, 2160, (28, 5)),
+        (512, 512, (14, 2)),
+    ],
+)
+def test_label_metrics_derives_font_size_and_rect_width(width, height, expected):
+    """验收数字：1920×1080 → (24, 3)；4K 触顶 (28, 5)；小图触底 (14, 2)。"""
+    assert _label_metrics(width, height) == expected
+
+
+def test_load_label_font_prefers_truetype():
+    """正常环境返回 TrueType 字体（候选列表首项可用）。"""
+    font = _load_label_font(24)
+    assert isinstance(font, ImageFont.FreeTypeFont)
+
+
+def test_load_label_font_falls_back_when_all_font_files_missing(monkeypatch):
+    """全部候选字体文件缺失（truetype 对文件名抛 OSError）时回落默认字体，不抛错。"""
+    original_truetype = ImageFont.truetype
+
+    def _missing_file_truetype(*args, **kwargs):
+        first = args[0] if args else kwargs.get("font")
+        if isinstance(first, (str, os.PathLike)):
+            # 模拟磁盘上找不到候选字体文件
+            raise OSError("模拟字体文件缺失")
+        # load_default() 内部用内置字节流调用 truetype，保持可用
+        return original_truetype(*args, **kwargs)
+
+    monkeypatch.setattr(ImageFont, "truetype", _missing_file_truetype)
+    font = _load_label_font(24)
+    assert font.getmetrics()  # 返回可用字体对象（未抛错）
+
+
+def test_annotation_deterministic_on_large_image():
+    """4K 图（字号/框宽触顶）同样满足同输入同字节。"""
+    png = _white_png(3840, 2160)
+    elements = (_element("el-7", [400, 200, 800, 600]),)
+    first = annotate_screenshot(png, elements, 2.0, 2.0)
+    second = annotate_screenshot(png, elements, 2.0, 2.0)
+    assert first == second
