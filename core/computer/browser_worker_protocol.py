@@ -45,6 +45,7 @@ OBSERVATION_FIELDS = (
     "page_title",
     "surface_id",
     "surface_generation",
+    "elements",
 )
 
 # ComputerAction 中经 JSON 往返后需要还原为 tuple 的字段。
@@ -52,6 +53,10 @@ _TUPLE_FIELDS = {
     "keys": (str,),
     "path": ((int, float), (int, float)),
 }
+
+# 元素列表 name 的防御性截断上限（与执行侧 ELEMENT_COLLECT_SCRIPT 的
+# MAX_NAME 对齐；正常载荷已截断，这里兜底异常形态）。
+_MAX_ELEMENT_NAME_CHARS = 80
 
 
 def encode_request(command_id: int, op: str, **payload: Any) -> str:
@@ -113,3 +118,48 @@ def normalize_action_payload(payload: dict) -> dict:
 def observation_payload(observation) -> dict:
     """ComputerObservation → 协议字段字典（只含 OBSERVATION_FIELDS）。"""
     return {field: getattr(observation, field) for field in OBSERVATION_FIELDS}
+
+
+def _safe_int(value) -> int:
+    """bounds 分量防御归一化：非法值取 0。"""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def normalize_observation_payload(payload: dict) -> dict:
+    """把 asdict(ComputerObservation) 的 JSON 形态还原为可构造 ComputerObservation 的形态。
+
+    JSON 往返会把 elements 外层 tuple 变成 list；这里还原为 tuple（元素内部
+    bounds 保持 list 形态，与桌面脱敏 dict 契约一致）。字段类型做防御：非
+    dict 项跳过、缺失归一为空 tuple——元素不可用时回落截图是产品决定，
+    绝不因载荷形态异常让 observe 失败。
+    """
+    normalized = dict(payload)
+    elements = normalized.get("elements")
+    listing: list[dict] = []
+    if isinstance(elements, (list, tuple)):
+        for item in elements:
+            if not isinstance(item, dict):
+                continue
+            ref = item.get("ref")
+            if not isinstance(ref, str) or not ref:
+                continue
+            kind = item.get("kind")
+            name = item.get("name")
+            bounds = item.get("bounds")
+            if isinstance(bounds, (list, tuple)) and len(bounds) == 4:
+                normalized_bounds = [_safe_int(component) for component in bounds]
+            else:
+                normalized_bounds = [0, 0, 0, 0]
+            enabled = item.get("enabled")
+            listing.append({
+                "ref": ref,
+                "kind": kind if isinstance(kind, str) else "",
+                "name": (name if isinstance(name, str) else "")[:_MAX_ELEMENT_NAME_CHARS],
+                "bounds": normalized_bounds,
+                "enabled": enabled if isinstance(enabled, bool) else True,
+            })
+    normalized["elements"] = tuple(listing)
+    return normalized
