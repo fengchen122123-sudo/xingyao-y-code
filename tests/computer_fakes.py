@@ -248,6 +248,8 @@ class FakeLocator:
     - ``fill_calls``：按序记录 (text, kwargs)；
     - ``click_error`` / ``fill_error``：注入异常，验证元素语义错误码与
       set_value_element 的键盘回落路径；
+    - ``count_result``：locator.count() 返回值，用于验证「元素不在 DOM →
+      stale」的失效判定（E2 评审修复）；
     - 绝不触碰真实页面 DOM 或 Playwright。
     """
 
@@ -257,6 +259,7 @@ class FakeLocator:
         self.fill_calls = []
         self.click_error = None
         self.fill_error = None
+        self.count_result = 1
 
     def click(self, **kwargs):
         self.click_calls.append(dict(kwargs))
@@ -267,6 +270,9 @@ class FakeLocator:
         self.fill_calls.append((text, dict(kwargs)))
         if self.fill_error is not None:
             raise self.fill_error
+
+    def count(self, **kwargs):
+        return self.count_result
 
 
 class FakePage:
@@ -299,12 +305,13 @@ class FakePage:
         self.element_collect_result = None
         self.element_collect_error = None
         # E2 元素动作注入点：locator 调用记录（selector 列表）与最近创建的
-        # FakeLocator（供断言 click/fill 参数与异常注入路径）；两个预设字段
-        # 在 locator 创建时应用到新对象（execute 前设置即可注入失败）。
+        # FakeLocator（供断言 click/fill 参数与异常注入路径）；预设字段
+        # 在 locator 创建时应用到新对象（execute 前设置即可注入失败/命中数）。
         self.locator_calls = []
         self.last_locator = None
         self.locator_click_error = None
         self.locator_fill_error = None
+        self.locator_count = 1
 
     def is_closed(self):
         self._runtime._record_call("page.is_closed")
@@ -336,6 +343,7 @@ class FakePage:
         locator = FakeLocator(selector)
         locator.click_error = self.locator_click_error
         locator.fill_error = self.locator_fill_error
+        locator.count_result = self.locator_count
         self.last_locator = locator
         return locator
 

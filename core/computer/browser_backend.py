@@ -1384,12 +1384,18 @@ class BrowserComputerBackend:
 
         三项检查全部抛 computer_element_stale（与桌面 UIA 的 ref 失效语义
         一致，不发明新码；元素动作的错误码统一 stale，不用 surface_changed）：
-        1. 页面 token——受控页切换（popup/新前台页）后旧 ref 全部失效；
+        1. 页面 token——从未观察（None）与受控页切换（popup/新前台页）都让
+           旧 ref 失效，但文案区分：前者引导先 observe，后者说明页面已切换；
         2. URL 对比——裁决点：token 不随同页导航变化（SPA 路由、整页跳转仍
            落在同一 Page 对象上），URL 对比补全「页面变化 → 旧 ref 失效」的
            产品决定，对齐验收场景 4（导航到新 URL 后旧 ref 必须 stale）；
         3. ref 集合——ref 不在最近一次 observe 收集的元素集合内。
         """
+        if self._observed_page_token is None:
+            raise ComputerControlError(
+                "computer_element_stale",
+                "尚未观察页面，请先 observe 再操作元素",
+            )
         if self._page_token(page) != self._observed_page_token:
             raise ComputerControlError(
                 "computer_element_stale",
@@ -1585,6 +1591,14 @@ class BrowserComputerBackend:
             return int(self._command_timeout * 1000)
         return max(1, int((deadline - time.monotonic()) * 1000))
 
+    def _element_action_timeout_ms(self) -> int:
+        """元素动作单段超时：10s 上限，并为命令收尾预留 1s 余量。
+
+        防止 fill/click/type 累计耗时越过命令 deadline——越过会触发调用侧
+        超时并封闭实例，而不是返回元素语义错误码（E2 评审修复）。
+        """
+        return max(1, min(_ELEMENT_ACTION_TIMEOUT_MS, self._remaining_budget_ms() - 1000))
+
     def _wait_interruptible(self, duration_ms: int) -> None:
         """显式 wait：服务取消/页面事件，stop 时立即中断（不用整段 sleep 伪装就绪）。"""
         end = time.monotonic() + duration_ms / 1000
@@ -1726,6 +1740,26 @@ class BrowserComputerBackend:
                 f"浏览器 backend 不支持动作：{kind!r}",
             )
 
+    def _raise_element_action_error(self, locator, element_ref: str, label: str, error: Exception) -> None:
+        """元素动作失败分类：元素不在 DOM → stale（引导重新 observe）；存在但不可操作 → unsupported。
+
+        同 URL 整页重载/DOM 重建时，token/URL/ref 集合三项校验都看不出来；
+        以 locator 命中数兜底（E2 评审修复）。
+        """
+        try:
+            missing = locator.count() == 0
+        except Exception:
+            missing = False
+        if missing:
+            raise ComputerControlError(
+                "computer_element_stale",
+                f"元素 {element_ref} 已不存在于页面，请重新 observe",
+            ) from error
+        raise ComputerControlError(
+            "computer_element_unsupported",
+            f"元素 {element_ref} {label}失败：{type(error).__name__}",
+        ) from error
+
     def _exec_click_element(self, page, element_ref: str) -> None:
         """按元素引用点击（E2）：ref 有效性已在 _cmd_execute 校验。
 
@@ -1735,14 +1769,9 @@ class BrowserComputerBackend:
         """
         locator = page.locator(f'[data-ycode-ref="{element_ref}"]')
         try:
-            locator.click(
-                timeout=min(_ELEMENT_ACTION_TIMEOUT_MS, self._remaining_budget_ms())
-            )
+            locator.click(timeout=self._element_action_timeout_ms())
         except Exception as error:
-            raise ComputerControlError(
-                "computer_element_unsupported",
-                f"元素 {element_ref} 点击失败：{type(error).__name__}",
-            ) from error
+            self._raise_element_action_error(locator, element_ref, "点击", error)
 
     def _exec_set_value_element(self, page, element_ref: str, text: str) -> None:
         """按元素引用写值（E2）：fill 优先，失败回落「点击聚焦 + 键盘输入」。
@@ -1753,20 +1782,20 @@ class BrowserComputerBackend:
         （不用坐标动作的 surface_changed / 命令超时错误码）。
         """
         locator = page.locator(f'[data-ycode-ref="{element_ref}"]')
-        timeout = min(_ELEMENT_ACTION_TIMEOUT_MS, self._remaining_budget_ms())
         try:
-            locator.fill(text, timeout=timeout)
+            locator.fill(text, timeout=self._element_action_timeout_ms())
             return
-        except Exception:
-            pass
+        except Exception as error:
+            _LOGGER.debug(
+                "元素 %s fill 失败，回落键盘输入：%s", element_ref, type(error).__name__
+            )
         try:
-            locator.click(timeout=timeout)
+            # 回落 click 单独重算剩余预算：fill 已消耗的时间不得让 click 越过
+            # 命令 deadline（越过触发调用侧超时并封闭实例，E2 评审修复）。
+            locator.click(timeout=self._element_action_timeout_ms())
             page.keyboard.type(text)
         except Exception as error:
-            raise ComputerControlError(
-                "computer_element_unsupported",
-                f"元素 {element_ref} 写入失败：{type(error).__name__}",
-            ) from error
+            self._raise_element_action_error(locator, element_ref, "写入", error)
 
     def _exec_drag(self, page, action: ComputerAction) -> None:
         points = action.path
