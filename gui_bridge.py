@@ -5094,6 +5094,9 @@ class ApiBridge(GitBridgeMixin):
         # 线程本地 workdir 作用域：绑定后必须在本回合 finally 中退出恢复，
         # 防止主线程直调（测试）或未来线程复用场景下 workdir 泄漏到下一回合
         _workdir_scope = None
+        # 线程本地权限档位作用域：与 workdir 同理，回合期间冻结会话生效档位，
+        # 供鉴权路径（app_context.get_permission_mode）读取，退出时恢复
+        _permission_scope = None
         error_state = {
             "toast_messages": set(),
             "terminal_message": None,
@@ -5309,6 +5312,15 @@ class ApiBridge(GitBridgeMixin):
             app_context.set_thread_session(session_name)
             from core.plan import set_current_plan_session
             set_current_plan_session(session_name)
+            # 权限档位进入鉴权路径：会话级档位此前只落在提示词文本与 DB 列，
+            # 鉴权路径（app_context.get_permission_mode）读的是全局值，导致
+            # 会话级完整访问（full）在工具调用时不被认可、反复弹确认。这里
+            # 把本回合生效档位绑定到线程，回合期间冻结，退出时恢复全局值。
+            _permission_scope = app_context.permission_mode_scope(
+                automation_permission_mode
+                or self._effective_permission_mode(session_name)
+            )
+            _permission_scope.__enter__()
 
             # 会话已在模型绑定阶段创建；此处直接解析用户输入并入库。
             try:
@@ -5505,6 +5517,8 @@ class ApiBridge(GitBridgeMixin):
             app_context.set_thread_session(None)
             if _workdir_scope is not None:
                 _workdir_scope.__exit__(None, None, None)
+            if _permission_scope is not None:
+                _permission_scope.__exit__(None, None, None)
             # 身份校验清理 cancel 事件：finally 竞态窗口内（本线程还没走完
             # finally，但 _active_turns 已 pop）新回合可能已建立同名事件，
             # 仅当字典里仍是本回合自己的事件对象时才删除，防误删新回合事件

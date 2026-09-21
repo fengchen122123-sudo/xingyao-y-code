@@ -382,8 +382,10 @@ const answersOf = (turn: TurnGroup) => turn.items.filter((m) => m.role === 'assi
 const errorsOf = (turn: TurnGroup) => turn.items.filter((m) => m.error_note);
 
 // ---- 内联审批（与「审批」Tab 同源，直接在对话内完成）----
+// 严格按当前会话过滤：绝不回退到别的会话的待办，否则权限卡会「跳串」到
+// 当前对话框（历史缺陷）。跨会话汇总只在「审批」Tab 展示。
 const activePerm = computed<PermRequest | null>(() =>
-  store.permRequests.find((p) => p.sessionName === store.currentSession) || store.permRequests[0] || null,
+  store.permRequests.find((p) => p.sessionName === store.currentSession) || null,
 );
 const isAskPerm = computed(() => activePerm.value?.functionName === 'ask_user');
 const permBusy = ref(false);
