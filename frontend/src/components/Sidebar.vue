@@ -175,6 +175,9 @@
       <button class="phone-btn" data-test="remote-bind-button" title="手机远程控制" @click="openRemoteBind()">
         <AppIcon name="smartphone" :size="16" />
       </button>
+      <button class="phone-btn" data-test="mobile-ui-button" title="新版移动端界面" @click="openMobileBind()">
+        <AppIcon name="gem" :size="16" />
+      </button>
     </div>
   </div>
 
@@ -254,8 +257,8 @@
       <div class="modal-head">
         <div class="mh-ico"><AppIcon name="smartphone" :size="18" /></div>
         <div>
-          <h3>手机远程控制</h3>
-          <p>用手机扫码即可作为第二个前端控制本机</p>
+          <h3>{{ remoteBindMode === 'mobile' ? '新版移动端界面' : '手机远程控制' }}</h3>
+          <p>{{ remoteBindMode === 'mobile' ? 'co-team 风格独立移动端，与经典界面互不影响' : '用手机扫码即可作为第二个前端控制本机' }}</p>
         </div>
       </div>
       <div class="modal-body">
@@ -749,6 +752,8 @@ const confirmDeleteGroupPath = ref('');
 const remoteBind = ref<null | { url: string; qr: string; expires_in: number; permanent?: boolean }>(null);
 // 配对链接刷新中标记：刷新期间禁用按钮避免重复点击
 const remoteBindRefreshing = ref(false);
+// 绑定目标：desktop=经典界面（桌面 dist 响应式版）/ mobile=独立移动端（/m/ 路径）
+const remoteBindMode = ref<'desktop' | 'mobile'>('desktop');
 // 过期检查定时器：弹窗打开期间每秒检测，过期自动刷新 token
 let remoteBindExpiryTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -1128,8 +1133,11 @@ async function fetchRemoteBind(forceNew: boolean) {
     return;
   }
   try {
-    // get_remote_bind_qr 为后端桥接方法，前端类型契约尚未收录，故此处按返回结构取用
-    const result = await (api as any).get_remote_bind_qr(forceNew);
+    // get_remote_bind_qr 为后端桥接方法，前端类型契约尚未收录，故此处按返回结构取用；
+    // mobile 模式追加第二参数绑定独立移动端（/m/），桌面模式保持单参签名不变
+    const result = remoteBindMode.value === 'mobile'
+      ? await (api as any).get_remote_bind_qr(forceNew, true)
+      : await (api as any).get_remote_bind_qr(forceNew);
     if (result && result.ok && result.qr && result.url) {
       remoteBind.value = {
         url: result.url,
@@ -1153,6 +1161,13 @@ async function fetchRemoteBind(forceNew: boolean) {
 }
 
 async function openRemoteBind() {
+  remoteBindMode.value = 'desktop';
+  await fetchRemoteBind(false);
+}
+
+// 新版移动端入口：与经典界面并列的第二个手机端，共用配对通道
+async function openMobileBind() {
+  remoteBindMode.value = 'mobile';
   await fetchRemoteBind(false);
 }
 

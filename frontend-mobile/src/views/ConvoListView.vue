@@ -1,0 +1,266 @@
+<template>
+  <div class="page">
+    <van-nav-bar title="会话" fixed placeholder safe-area-inset-top>
+      <template #left>
+        <img class="nvlogo" :src="logoUrl" alt="星瑶" />
+      </template>
+      <template #right>
+        <span class="newbtn" @click="openNew"><svg class="i"><use href="#i-plus" /></svg>新建</span>
+      </template>
+    </van-nav-bar>
+
+    <van-search v-model="search" placeholder="搜索会话" />
+
+    <van-pull-refresh :model-value="refreshing" @refresh="onRefresh">
+      <div class="groups">
+        <template v-for="g in filteredGroups" :key="g.folder_path">
+          <div class="group-label" @click="toggle(g.folder_path)">
+            <svg class="i sm chev" :class="{ open: !collapsed.has(g.folder_path) }"><use href="#i-chev-r" /></svg>
+            {{ g.is_global ? '自由对话' : g.folder_name }}
+            <span class="n mono">{{ g.sessions.length }}</span>
+            <span v-if="g.is_current" class="cur-mark">当前</span>
+          </div>
+          <template v-if="!collapsed.has(g.folder_path)">
+            <div
+              v-for="c in g.sessions"
+              :key="c.name"
+              class="conv-card"
+              :class="{ active: c.name === store.currentSession }"
+              @click="openSession(c)"
+              @touchstart="pressStart(c)"
+              @touchend="pressEnd"
+              @touchmove="pressEnd"
+              @contextmenu.prevent="openOps(c)"
+            >
+              <div class="t">
+                <span class="dot" :class="{ run: store.runningSessions.includes(c.name) }" />
+                <span class="title">{{ c.display_name }}</span>
+              </div>
+              <div class="m">
+                <span>{{ c.count }} 条</span>
+                <span class="sp" />
+                <span v-if="!g.is_global" class="mono wdir">{{ c.workdir }}</span>
+                <span>{{ relTime(c.updated_at) }}</span>
+              </div>
+            </div>
+          </template>
+        </template>
+        <van-empty v-if="!filteredGroups.length" description="还没有会话，点右上角新建" />
+      </div>
+    </van-pull-refresh>
+
+    <!-- 新建会话：绑定项目 -->
+    <van-popup v-model:show="newDlg" position="bottom" round :style="{ maxHeight: '70%' }">
+      <div class="sheet">
+        <div class="sh-h"><span>新建会话</span><span class="x" @click="newDlg = false">✕</span></div>
+        <div class="frow">
+          <label>标题（留空自动命名）</label>
+          <input v-model="newTitle" placeholder="例如：修复登录页遮挡" maxlength="120" />
+        </div>
+        <div class="frow">
+          <label>绑定项目（工作区）</label>
+          <select v-model="newWorkdir">
+            <option value="">自由对话（不绑定）</option>
+            <option v-for="g in projectGroups" :key="g.folder_path" :value="g.folder_path">{{ g.folder_path }}<template v-if="g.is_current">（当前）</template></option>
+            <option value="__browse__">浏览服务器目录…</option>
+          </select>
+        </div>
+        <div class="btnrow">
+          <button class="btn-g" @click="newDlg = false">取消</button>
+          <button class="btn-p" :disabled="creating" @click="create">创建并切换</button>
+        </div>
+      </div>
+    </van-popup>
+
+    <!-- 服务器目录浏览 -->
+    <van-popup v-model:show="dirDlg" position="bottom" round :style="{ maxHeight: '70%' }">
+      <div class="sheet">
+        <div class="sh-h"><span>选择工作目录</span><span class="x" @click="dirDlg = false">✕</span></div>
+        <div class="dirs">
+          <div v-if="!dirRoot" class="d" @click="browseUp">
+            <svg class="i sm" style="transform:rotate(180deg)"><use href="#i-chev-r" /></svg>上级目录
+          </div>
+          <div v-for="d in dirList" :key="d.path" class="d" @click="browseInto(d.path)">
+            <svg class="i sm"><use href="#i-folder" /></svg>{{ d.path }}
+          </div>
+          <van-empty v-if="!dirList.length" description="此目录没有子目录" />
+        </div>
+        <div class="btnrow">
+          <button class="btn-g" @click="dirDlg = false">取消</button>
+          <button class="btn-p" :disabled="!dirCurrent" @click="pickDir">选定此目录</button>
+        </div>
+      </div>
+    </van-popup>
+
+    <!-- 会话操作（长按，与详情 ⋯ 共用组件） -->
+    <SessionOps :show="opsDlg" :target="opsTarget" @close="opsDlg = false" @deleted="opsTarget = null" />
+  </div>
+</template>
+
+<script setup lang="ts">
+import { computed, onActivated, ref, watch } from 'vue';
+import { useRouter } from 'vue-router';
+import { showFailToast } from 'vant';
+import { useAppStore, type SessionGroup, type SessionItem } from '../stores/app';
+import SessionOps from '../components/SessionOps.vue';
+import { relTime } from '../utils/time';
+
+const store = useAppStore();
+const router = useRouter();
+
+// 星瑶品牌 logo（public 静态资源，运行时引用；/m/ 前缀与 lan_server 托管路径一致）
+const logoUrl = '/m/icon.png';
+
+const search = ref('');
+const refreshing = ref(false);
+const collapsed = ref(new Set<string>());
+const newDlg = ref(false);
+const creating = ref(false);
+const newTitle = ref('');
+const newWorkdir = ref('');
+const dirDlg = ref(false);
+const dirRoot = ref(true);
+const dirCurrent = ref('');
+const dirList = ref<{ name: string; path: string }[]>([]);
+const opsDlg = ref(false);
+const opsTarget = ref<SessionItem | null>(null);
+let pressTimer: ReturnType<typeof setTimeout> | null = null;
+
+const projectGroups = computed(() => store.sessionGroups.filter((g) => !g.is_global));
+
+const filteredGroups = computed<SessionGroup[]>(() => {
+  const q = search.value.trim().toLowerCase();
+  const out: SessionGroup[] = [];
+  for (const g of store.sessionGroups) {
+    const items = q
+      ? g.sessions.filter((s) => s.display_name.toLowerCase().includes(q))
+      : g.sessions;
+    if (items.length) out.push({ ...g, sessions: items });
+  }
+  return out;
+});
+
+function toggle(path: string) {
+  const next = new Set(collapsed.value);
+  if (next.has(path)) next.delete(path);
+  else next.add(path);
+  collapsed.value = next;
+}
+
+function pressStart(c: SessionItem) {
+  pressEnd();
+  pressTimer = setTimeout(() => { opsTarget.value = c; opsDlg.value = true; }, 550);
+}
+function pressEnd() {
+  if (pressTimer) { clearTimeout(pressTimer); pressTimer = null; }
+}
+function openOps(c: SessionItem) {
+  pressEnd();
+  opsTarget.value = c;
+  opsDlg.value = true;
+}
+
+async function openSession(c: SessionItem) {
+  if (opsDlg.value) { opsDlg.value = false; return; }
+  try {
+    await store.switchSession(c.name);
+    router.push(`/convo/${encodeURIComponent(c.name)}`);
+  } catch (e: any) {
+    showFailToast(e?.message || '切换会话失败');
+  }
+}
+
+async function onRefresh() {
+  refreshing.value = true;
+  await store.refreshSessions();
+  refreshing.value = false;
+}
+
+// ---- 新建（绑定项目）----
+
+function openNew() {
+  newTitle.value = '';
+  newWorkdir.value = '';
+  newDlg.value = true;
+}
+
+async function create() {
+  creating.value = true;
+  try {
+    const workdir = newWorkdir.value === '__browse__' ? '' : (newWorkdir.value || undefined);
+    const name = await store.createSession(newTitle.value.trim(), workdir);
+    newDlg.value = false;
+    if (name) router.push(`/convo/${encodeURIComponent(name)}`);
+  } catch (e: any) {
+    showFailToast(e?.message || '创建失败');
+  } finally {
+    creating.value = false;
+  }
+}
+
+async function browseInto(path: string) {
+  try {
+    const r = await store.browseDirs(path);
+    dirRoot.value = r.isRoot;
+    dirCurrent.value = r.current;
+    dirList.value = r.dirs;
+  } catch (e: any) {
+    showFailToast(e?.message || '目录读取失败');
+  }
+}
+async function browseUp() {
+  const parent = dirCurrent.value.replace(/[\\/][^\\/]+[\\/]?$/, '') || '';
+  await browseInto(parent);
+}
+function pickDir() {
+  newWorkdir.value = dirCurrent.value;
+  dirDlg.value = false;
+}
+
+// 选择"浏览服务器目录"时打开目录弹层
+watch(newWorkdir, (v) => {
+  if (v === '__browse__') {
+    dirDlg.value = true;
+    dirRoot.value = true;
+    dirCurrent.value = '';
+    void browseInto('');
+  }
+});
+
+onActivated(() => { void store.refreshSessions(); });
+</script>
+
+<style scoped>
+.page { min-height: 100vh; padding-bottom: 70px; }
+.nvlogo { width: 22px; height: 22px; border-radius: 6px; object-fit: cover; box-shadow: 0 0 8px var(--accent-soft); }
+.newbtn { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-family: var(--font-mono); color: var(--accent); }
+.groups { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.group-label { font-size: 12px; color: var(--text-2); padding: 7px 2px 5px; display: flex; align-items: center; gap: 7px; cursor: pointer; }
+.group-label .chev { transition: transform .15s; }
+.group-label .chev.open { transform: rotate(90deg); }
+.group-label .n { font-size: 10px; color: var(--text-3); }
+.cur-mark { font-size: 10px; color: var(--accent); border: 1px solid var(--accent-line); border-radius: 99px; padding: 0 7px; }
+.conv-card { background: var(--bg-panel); border: 1px solid var(--line); border-radius: 10px; padding: 11px 13px; display: flex; flex-direction: column; gap: 4px; }
+.conv-card:active { border-color: var(--accent); }
+.conv-card.active { border-color: var(--accent-line); }
+.conv-card .t { display: flex; align-items: center; gap: 7px; font-size: 13px; font-weight: 600; }
+.conv-card .title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.conv-card .m { display: flex; gap: 7px; align-items: center; font-size: 11px; color: var(--text-3); }
+.conv-card .sp { flex: 1; }
+.wdir { font-size: 10px; max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); flex: none; }
+.dot.run { background: var(--ok); animation: livepulse 1.3s infinite; }
+.sheet { padding: 14px 16px 20px; }
+.sh-h { display: flex; align-items: center; justify-content: space-between; padding: 0; margin-bottom: 10px; font-size: 13px; font-weight: 600; }
+.sh-h .x { font-size: 12px; color: var(--text-3); font-weight: 400; padding: 4px 8px; }
+.frow { display: flex; flex-direction: column; gap: 4px; margin: 8px 0 0; }
+.frow label { font-size: 11px; color: var(--text-3); }
+.frow input, .frow select { padding: 9px 11px; border-radius: 8px; border: 1px solid var(--line-strong); background: var(--bg-inset); color: var(--text-1); font-size: 13px; outline: none; font-family: inherit; }
+.btnrow { display: flex; gap: 8px; margin: 16px 0 0; }
+.btnrow button { flex: 1; padding: 10px; border-radius: 8px; font-size: 13px; }
+.btn-g { border: 1px solid var(--line-strong); background: none; color: var(--text-2); }
+.btn-p { border: none; background: var(--accent); color: var(--accent-text); font-weight: 600; }
+.dirs { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; max-height: 220px; overflow-y: auto; margin: 4px 0 0; }
+.dirs .d { padding: 9px 12px; font-size: 12.5px; font-family: var(--font-mono); cursor: pointer; display: flex; gap: 8px; align-items: center; }
+.dirs .d:active { background: var(--bg-raised); }
+</style>

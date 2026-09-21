@@ -1,0 +1,409 @@
+/* 星瑶移动端 — 暗色终端 IDE 主题（移植自 co-team mobile 拍板稿）。
+   双主题（dark 默认 / html.light 切换），移动端维持独立副本（刻意不依赖 frontend/src）。
+   设计纪律：发丝线替代卡片马赛克、mono 数字、强调色与主题绑定（暗=暖橙 / 亮=蓝）、阴影只给浮层。 */
+
+:root {
+  /* ---- 底色五层（暗，对齐星瑶 builtin.dark 暖灰系）---- */
+  --bg-page: #1a1a18;
+  --bg-panel: #20201e;
+  --bg-raised: #272724;
+  --bg-overlay: #302f2b;
+  --bg-inset: #141412;
+
+  /* ---- 发丝线 ---- */
+  --line: #34332f;
+  --line-strong: #46443c;
+
+  /* ---- 文字三级 ---- */
+  --text-1: #d9d9d4;
+  --text-bright: #edede9;
+  --text-2: #a8a7a0;
+  --text-3: #85847d;
+
+  /* ---- 强调色（暗 = 星瑶雾蓝）---- */
+  --accent: #6a92d8;
+  --accent-text: #ffffff;
+  --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent);
+  --accent-line: color-mix(in srgb, var(--accent) 38%, transparent);
+  --accent-press: #5578bb;
+
+  /* ---- 语义色（星瑶）---- */
+  --ok: #4ea96a;
+  --warn: #c9a24a;
+  --danger: #d9635b;
+
+  /* ---- 字号阶梯（正文 14 / 辅助 12 / meta 11；9-10px 绝迹）---- */
+  --fs-meta: 11px;
+  --fs-aux: 12px;
+  --fs-body: 14px;
+  --fs-sub: 15px;
+  --fs-title: 16px;
+  --fs-h2: 18px;
+
+  /* ---- 几何：控件 6 / cell 组 10 / 浮层 14（对齐星瑶 radius 阶）；阴影只给浮层 ---- */
+  --r-ctl: 6px;
+  --r-panel: 10px;
+  --r-float: 14px;
+  --shadow-float: 0 12px 32px rgba(0, 0, 0, 0.5);
+
+  /* ---- 字体（与星瑶桌面一致）---- */
+  --font-ui: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+
+  /* ---- 安全区 / 阴影档 ---- */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --shadow-1: 0 1px 3px rgba(0, 0, 0, 0.25);
+  --shadow-2: var(--shadow-float);
+
+  /* ---- 兼容别名（移植组件沿用 --ct-* / --bg 系旧名，减少改写面）---- */
+  --ct-bg: var(--bg-page);
+  --ct-panel: var(--bg-panel);
+  --ct-panel2: var(--bg-raised);
+  --ct-border: var(--line);
+  --ct-border2: var(--line-strong);
+  --ct-text: var(--text-1);
+  --ct-text2: var(--text-2);
+  --ct-text3: var(--text-3);
+  --ct-accent: var(--accent);
+  --ct-accent-soft: var(--accent-soft);
+  --ct-accent-ink: var(--accent-text);
+  --ct-green: var(--ok);
+  --ct-yellow: var(--warn);
+  --ct-red: var(--danger);
+  --ct-mono: var(--font-mono);
+
+  --bg: var(--bg-page);
+  --panel: var(--bg-panel);
+  --panel-2: var(--bg-raised);
+  --border: var(--line);
+  --border-strong: var(--line-strong);
+  --text: var(--text-1);
+  --green: var(--ok);
+  --yellow: var(--warn);
+  --red: var(--danger);
+  --me-bubble: var(--accent);
+  --bubble-me: var(--accent);
+  --me-text: var(--accent-text);
+  --nav-bg: var(--bg-panel);
+  --shadow-card: none; /* dark：发丝线即层级，不加投影 */
+
+  /* ---- 排版阶梯别名 ---- */
+  --fs-xs: var(--fs-meta);
+  --fs-sm: var(--fs-aux);
+  --fs-md: var(--fs-aux);
+  --fs-base: var(--fs-body);
+  --fs-lg: var(--fs-title);
+  --fs-xl: var(--fs-h2);
+
+  /* ---- 圆角别名 ---- */
+  --r-sm: 4px;
+  --r-md: var(--r-ctl);
+  --r-lg: var(--r-panel);
+
+  /* ============================================================
+     Vant 桥接（全量对接 token）
+     ============================================================ */
+  --van-primary-color: var(--accent);
+  --van-success-color: var(--ok);
+  --van-danger-color: var(--danger);
+  --van-warning-color: var(--warn);
+  --van-text-color: var(--text-1);
+  --van-text-color-2: var(--text-2);
+  --van-text-color-3: var(--text-3);
+  --van-border-color: var(--line);
+  --van-border-color-2: var(--line-strong);
+  --van-background: var(--bg-page);
+  --van-background-2: var(--bg-panel);
+  --van-cell-background: var(--bg-panel);
+  --van-cell-text-color: var(--text-1);
+  --van-cell-value-color: var(--text-2);
+  --van-cell-value-font-size: var(--fs-body);
+  --van-cell-font-size: var(--fs-body);
+  --van-cell-line-height: 22px;
+  --van-cell-vertical-padding: 12px;
+  --van-cell-horizontal-padding: 14px;
+  --van-nav-bar-background: var(--bg-panel);
+  --van-nav-bar-title-text-color: var(--text-1);
+  --van-nav-bar-title-font-size: var(--fs-title);
+  --van-nav-bar-title-font-weight: 700;
+  --van-nav-bar-arrow-size: 20px;
+  --van-nav-bar-icon-color: var(--text-2);
+  --van-nav-bar-height: 46px;
+  --van-nav-bar-text-color: var(--accent);
+  --van-cell-group-inset-radius: var(--r-panel);
+  --van-search-content-background: var(--bg-overlay);
+  --van-button-default-height: 40px;
+  --van-tabbar-background: var(--bg-panel);
+  --van-tabbar-item-active-color: var(--accent);
+  --van-tabbar-item-active-background: transparent;
+  --van-tabbar-item-text-color: var(--text-3);
+  /* 对齐 preview：图标 20 / 文字 11 / 图标下间距 2 */
+  --van-tabbar-item-font-size: 11px;
+  --van-tabbar-item-icon-size: 20px;
+  --van-tabbar-item-icon-margin-bottom: 2px;
+  --van-tabbar-item-line-height: 1.2;
+  --van-tabbar-height: 54px;
+  --van-button-primary-background: var(--accent);
+  --van-button-primary-border-color: var(--accent);
+  --van-button-plain-background: var(--bg-raised);
+  --van-button-plain-text-color: var(--text-1);
+  --van-button-plain-border-color: var(--line-strong);
+  --van-button-default-background: var(--bg-raised);
+  --van-button-default-border-color: var(--line-strong);
+  --van-button-default-text-color: var(--text-1);
+  --van-button-border-radius: var(--r-ctl);
+  --van-button-normal-font-size: var(--fs-body);
+  --van-search-background: var(--bg-page);
+  --van-search-input-background: var(--bg-overlay);
+  --van-field-label-color: var(--text-2);
+  --van-field-input-text-color: var(--text-1);
+  --van-field-placeholder-text-color: var(--text-3);
+  --van-tabs-bottom-bar-color: var(--accent);
+  --van-tabs-default-color: var(--text-2);
+  --van-tabs-active-color: var(--text-1);
+  --van-tabs-nav-background-color: var(--bg-panel);
+  --van-dialog-background: var(--bg-panel);
+  --van-dialog-header-font-size: var(--fs-title);
+  --van-dialog-header-font-weight: 700;
+  --van-dialog-confirm-button-text-color: var(--accent);
+  --van-dialog-border-radius: var(--r-panel);
+  --van-picker-background: var(--bg-panel);
+  --van-picker-option-text-color: var(--text-1);
+  --van-popup-background: var(--bg-panel);
+  --van-popover-background: var(--bg-panel);
+  --van-popover-text-color: var(--text-1);
+  --van-action-sheet-background: var(--bg-panel);
+  --van-action-sheet-item-text-color: var(--text-1);
+  --van-action-sheet-item-font-size: var(--fs-sub);
+  --van-action-sheet-cancel-text-color: var(--text-2);
+  --van-action-sheet-item-disabled-text-color: var(--text-3);
+  --van-action-sheet-description-color: var(--text-3);
+  --van-overlay-background: rgba(0, 0, 0, 0.6);
+  --van-empty-description-color: var(--text-3);
+  --van-empty-image-opacity: 0.55;
+  --van-tag-plain-background: transparent;
+  --van-tag-border-radius: 4px;
+  --van-tag-medium-border-radius: 4px;
+  --van-pull-refresh-head-text-color: var(--text-3);
+  --van-skeleton-paragraph-background: var(--bg-raised);
+  --van-checkbox-checked-icon-background: var(--accent);
+  --van-checkbox-checked-icon-border-color: var(--accent);
+  --van-radio-checked-icon-background: var(--accent);
+  --van-radio-checked-icon-border-color: var(--accent);
+  --van-switch-on-background: var(--accent);
+  --van-loading-text-color: var(--text-3);
+  --van-toast-background: color-mix(in srgb, var(--bg-raised) 92%, transparent);
+  --van-toast-text-color: var(--text-1);
+  --van-badge-background: var(--accent);
+  --van-badge-color: var(--accent-text);
+  --van-badge-font: var(--font-mono);
+  --van-badge-font-size: 9px;
+  --van-badge-font-weight: 500;
+  --van-notify-success-background: var(--ok);
+  --van-notify-warning-background: var(--warn);
+}
+
+/* ---- light 主题（对齐星瑶 builtin.light：蓝强调 / 白面板 / 语义色加深保对比）---- */
+html.light {
+  --bg-page: #f4f4f1;
+  --bg-panel: #ffffff;
+  --bg-raised: #efefec;
+  --bg-overlay: #ffffff;
+  --bg-inset: #e4e4e0;
+  --line: #e3e3de;
+  --line-strong: #cfcfca;
+  --text-1: #2c2c2a;
+  --text-bright: #171716;
+  --text-2: #5c5c56;
+  --text-3: #7a7a73;
+  --accent: #3a6dd8;
+  --accent-text: #ffffff;
+  --accent-soft: color-mix(in srgb, var(--accent) 10%, transparent);
+  --accent-press: #2f5cc0;
+  --ok: #2c8a4c;
+  --warn: #96700f;
+  --danger: #cf3d36;
+  --shadow-float: 0 12px 32px rgba(0, 0, 0, 0.18);
+  --shadow-1: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-2: var(--shadow-float);
+  --shadow-card: none;
+}
+
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+  height: 100%;
+  margin: 0;
+  padding: 0;
+  overflow: hidden;
+  background: var(--bg-page);
+  color: var(--text-1);
+  font-family: var(--font-ui);
+  font-size: var(--fs-body);
+  /* 对齐 preview：全局 normal 行高；正文类（.ans/.thinking 等）各自显式声明 */
+  line-height: normal;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+#app { height: 100dvh; display: flex; flex-direction: column; }
+
+input, textarea, select { font-size: 16px; font-family: inherit; }
+
+.mono { font-family: var(--font-mono); }
+
+/* ================= 线性图标工具类（与桌面 AppIcon 同风格） =================
+   全站唯一来源：所有 <svg class="i"><use href="#i-xxx"/></svg> 依赖此处的
+   尺寸与描边；缺失会导致 SVG 退化为 300×150 默认块并把布局挤坏。 */
+.i {
+  width: 14px;
+  height: 14px;
+  stroke: currentColor;
+  fill: none;
+  stroke-width: 1.6;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+  vertical-align: -2px;
+}
+.i.sm { width: 12px; height: 12px; }
+.i.lg { width: 16px; height: 16px; }
+.i.tab { width: 20px; height: 20px; }
+
+::-webkit-scrollbar { width: 0; height: 0; }
+
+/* ================= Vant 结构微调 ================= */
+
+.van-action-sheet,
+.van-popup--bottom {
+  border-radius: var(--r-float) var(--r-float) 0 0;
+}
+.van-action-sheet__gap,
+.van-action-sheet__cancel {
+  background: var(--bg-page) !important;
+}
+.van-dialog {
+  border: 1px solid var(--line-strong);
+  box-shadow: var(--shadow-float);
+}
+.van-cell::after { border-color: var(--line); }
+.van-hairline--top-bottom::after,
+.van-hairline-unfit--top-bottom::after { border-color: var(--line); }
+.van-nav-bar .van-icon { color: var(--text-2); }
+.van-tag { font-family: var(--font-mono); }
+
+/* 搜索框对齐 preview：外层 8/12/2，内容区 r8 + 发丝线边框 */
+.van-search {
+  padding: 8px 12px 2px;
+  background: transparent;
+}
+.van-search__content {
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  background: var(--bg-overlay);
+  padding-left: 12px;
+}
+.van-search .van-field__control { font-size: 16px; } /* 16px 防 iOS 聚焦自动放大 */
+.van-search .van-icon { color: var(--text-3); }
+
+/* nav-bar 标题左对齐（p-nav 版式） */
+.van-nav-bar__title {
+  position: absolute !important;
+  left: 46px !important;
+  right: auto !important;
+  transform: none !important;
+  text-align: left !important;
+  font-weight: 700 !important;
+  font-size: var(--fs-title) !important;
+}
+
+/* ================= 基础组件（cell 行 + 发丝线语言） ================= */
+
+.wx-group {
+  background: var(--bg-panel);
+  border: 1px solid var(--line);
+  border-radius: var(--r-panel);
+  margin: 8px 0;
+  overflow: hidden;
+  box-shadow: var(--shadow-card);
+}
+.wx-cell {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+  position: relative;
+  font-size: var(--fs-body);
+  min-height: 48px;
+}
+/* 值列对齐 preview：11px mono */
+.wx-cell .v { font-family: var(--font-mono); font-size: 11px; }
+.wx-cell + .wx-cell::before {
+  content: '';
+  position: absolute;
+  left: 14px; right: 0; top: 0;
+  height: 1px;
+  background: var(--line);
+  transform: scaleY(0.5);
+}
+.wx-cell.link { cursor: pointer; transition: background 0.15s ease; }
+.wx-cell.link:active { background: var(--bg-raised); }
+
+/* 主按钮：平面、无渐变、无发光 */
+.wx-btn {
+  display: block;
+  width: 100%;
+  height: 40px;
+  border: none;
+  border-radius: var(--r-ctl);
+  background: var(--accent);
+  color: var(--accent-text);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  transition: transform 0.12s ease, opacity 0.12s ease;
+}
+.wx-btn:active { transform: scale(0.97); opacity: 0.9; }
+.wx-btn:disabled { opacity: 0.35; }
+.wx-btn-plain { background: var(--bg-raised); color: var(--text-1); border: 1px solid var(--line-strong); }
+.wx-btn-danger { background: color-mix(in srgb, var(--danger) 12%, transparent); color: var(--danger); border: 1px solid color-mix(in srgb, var(--danger) 30%, transparent); }
+
+/* 大写间距标题（mono 点缀） */
+.wx-caption {
+  font-size: var(--fs-meta);
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  padding: 14px 4px 7px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.wx-caption::after {
+  content: '';
+  flex: 1;
+  height: 1px;
+  background: var(--line);
+}
+
+/* ================= motion ================= */
+
+@keyframes wx-pop-in {
+  from { opacity: 0; transform: translateY(6px) scale(0.97); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.wx-pop-in { animation: wx-pop-in 0.2s cubic-bezier(0.22, 0.8, 0.36, 1); }
+
+@keyframes wx-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+.wx-pulse { animation: wx-pulse 1.6s ease-in-out infinite; }
+
+@keyframes livepulse { 0%,100% { opacity: 1; } 50% { opacity: .25; } }
+
+/* 统一按压反馈 */
+.pressable:active { transform: scale(0.97); }
+.pressable { transition: transform 0.12s ease; }

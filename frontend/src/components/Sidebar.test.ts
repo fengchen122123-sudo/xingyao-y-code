@@ -171,6 +171,38 @@ it('永久有效（expires_in=0）时不做倒计时自动刷新', async () => {
   }
 });
 
+it('点击新版移动端按钮以 mobile=true 请求绑定二维码，并显示新界面标题', async () => {
+  const get_remote_bind_qr = vi.fn(async () => ({
+    ok: true,
+    url: 'http://192.168.1.5:8765/m/?token=mob1',
+    token: 'mob1',
+    qr: 'data:image/png;base64,MOB',
+    expires_in: 0,
+  }));
+  (window as any).pywebview = { api: { get_remote_bind_qr } };
+
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  const btn = wrapper.find('[data-test="mobile-ui-button"]');
+  expect(btn.exists()).toBe(true);
+  await btn.trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  // mobile 模式：第二参数为 true；随后打开经典界面弹窗不携带该参数
+  expect(get_remote_bind_qr).toHaveBeenCalledTimes(1);
+  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(1, false, true);
+  const modal = wrapper.find('[data-test="remote-bind-modal"]');
+  expect(modal.exists()).toBe(true);
+  expect(modal.find('img').attributes('src')).toBe('data:image/png;base64,MOB');
+  expect(modal.find('h3').text()).toContain('新版移动端界面');
+  await wrapper.find('[data-test="remote-bind-close"]').trigger('click');
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+  expect(get_remote_bind_qr).toHaveBeenLastCalledWith(false);
+});
+
 it('子页面打开时点击新会话会立即返回对话页面', async () => {
   delete (window as any).pywebview;
   const pinia = createPinia();

@@ -4385,17 +4385,19 @@ class ApiBridge(GitBridgeMixin):
                 logger.exception("局域网远程控制服务启动失败")
                 return None
 
-    def get_remote_bind_qr(self, force_new: bool = False) -> Dict[str, Any]:
+    def get_remote_bind_qr(self, force_new: bool = False, mobile: bool = False) -> Dict[str, Any]:
         """返回手机扫码绑定信息。
 
         token 固定：未过期直接复用；过期自动重签；force_new=True 由前端
         "刷新"按钮触发，强制重签并使旧 token 失效。
+        mobile=True 绑定到独立移动端子应用（/m/ 路径，co-team 风格界面）；
+        两种入口共享同一配对 token 与 WS 事件通道。
         """
         try:
             srv = self._ensure_lan_server()
             if srv is None:
                 return {"ok": False, "msg": "远程服务启动失败"}
-            return srv.get_bind_info(force_new=bool(force_new))
+            return srv.get_bind_info(force_new=bool(force_new), path="/m/" if mobile else "/")
         except Exception as e:
             logger.exception("get_remote_bind_qr 失败")
             return {"ok": False, "msg": str(e)}
