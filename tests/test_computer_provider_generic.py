@@ -51,11 +51,12 @@ def test_build_generic_dynamic_prompt_enabled_covers_all_seven_rules():
     text = build_generic_dynamic_prompt(GENERIC_CAPABILITY)
     # 通用化重构 Task E 元素优先学说：七条要点语义必须逐字可见
     assert "observe" in text
-    # 第 2 条：元素优先（list_elements → click_element/set_value_element）
-    assert "list_elements" in text
+    # 第 2 条（E4 更新）：元素优先——浏览器 observe 附带列表、坐标回落约束
     assert "click_element" in text
     assert "set_value_element" in text
     assert "el-N" in text
+    assert "禁止凭截图目测坐标" in text
+    assert "元素列表为空" in text
     assert "截图坐标点击" in text
     # 第 3 条：单动作 + sequence 打包
     assert "kind=sequence" in text
@@ -65,7 +66,8 @@ def test_build_generic_dynamic_prompt_enabled_covers_all_seven_rules():
     assert "不得猜测成功" in text
     assert "surface_generation" in text
     assert "旧坐标与旧元素引用立即作废" in text
-    # 第 5 条：焦点恢复指引
+    # 第 5 条：焦点恢复指引（桌面 list_elements 恢复路径）
+    assert "list_elements" in text
     assert "焦点被抢" in text
     assert "activate_surface" in text
     assert "严禁按记忆里的旧坐标连续重试" in text
