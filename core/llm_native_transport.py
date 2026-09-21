@@ -16,7 +16,7 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
-from core.llm_policy import ModelPolicy, get_model_policy
+from core.llm_policy import ModelPolicy, get_model_policy, DEFAULT_USER_AGENT
 
 logger = logging.getLogger(__name__)
 
@@ -869,6 +869,7 @@ def _anthropic_resolve_endpoint(
         "content-type": "application/json",
         "accept": "text/event-stream",
         "anthropic-version": _ANTHROPIC_VERSION,
+        "User-Agent": DEFAULT_USER_AGENT,
     }
     effective_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if effective_key:
