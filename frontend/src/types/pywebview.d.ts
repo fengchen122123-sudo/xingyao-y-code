@@ -290,6 +290,19 @@ export interface PluginInfo {
   error?: string;
 }
 
+// C11：Hook 条目（Hook 信任卡片数据源；status 由后端按配置内容摘要派生）
+export interface HookInfo {
+  event: string;
+  matcher: string;
+  command: string;
+  timeout_ms: number;
+  status_message: string;
+  source_path: string;
+  scope: 'user' | 'project';
+  digest: string;
+  status: 'pending' | 'trusted' | 'stale' | 'blocked' | 'revoked';
+}
+
 // 星轨自动化任务（待开发/星轨自动化任务/01-完整设计规格.md 11.3）
 export interface AutomationTaskInfo {
   id: string;
@@ -861,6 +874,12 @@ export interface PyWebViewAPI {
   get_plugins(): Promise<any>;
   toggle_plugin(name: string, enabled: boolean): Promise<any>;
   trust_plugin(name: string): Promise<any>;
+  // C11：项目级 Hook 信任（信任卡片数据源 + 信任/拒绝/撤销/重置动作）
+  get_hooks(): Promise<{ ok: boolean; hooks?: HookInfo[]; workdir?: string; msg?: string }>;
+  grant_hook_trust(digest: string): Promise<any>;
+  deny_hook_trust(digest: string): Promise<any>;
+  revoke_hook_trust(digest: string): Promise<any>;
+  reset_hook_trust(digest: string): Promise<any>;
   get_mcp_servers(): Promise<McpInfo[]>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
   add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;
