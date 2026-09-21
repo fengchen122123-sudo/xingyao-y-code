@@ -432,7 +432,7 @@
             <div class="contact-qr-wrap" @click="enlargedQr = { src: qrcodeWechat, alt: '微信群二维码' }">
               <img :src="qrcodeWechat" alt="微信群二维码" class="contact-qr" data-test="contact-wechat-qr" />
             </div>
-            <p class="contact-expiry">该二维码 7 天内（9月24日前）有效，过期后请重新获取</p>
+            <p class="contact-expiry">该二维码 7 天内（9月28日前）有效，过期后请重新获取</p>
           </section>
 
           <section class="contact-card">
@@ -1412,7 +1412,7 @@ onMounted(async () => {
 .contact-value { font-size: 14px; padding: 8px 14px; background: var(--bg2); border-radius: 6px; margin-bottom: 14px; word-break: break-all; }
 .contact-copy-btn { display: inline-flex; align-items: center; gap: 6px; padding: 7px 16px; font-size: 12px; }
 .contact-copy-btn.copied { opacity: 0.85; }
-.contact-qr-wrap { width: 160px; height: 160px; border-radius: 8px; overflow: hidden; background: #fff; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; padding: 6px; cursor: zoom-in; transition: transform 0.15s; }
+.contact-qr-wrap { width: 170px; aspect-ratio: 2 / 3; height: auto; border-radius: 8px; overflow: hidden; background: #fff; display: flex; align-items: center; justify-content: center; margin-bottom: 10px; padding: 6px; cursor: zoom-in; transition: transform 0.15s; }
 .contact-qr-wrap:hover { transform: scale(1.03); }
 .contact-qr { width: 100%; height: 100%; object-fit: contain; }
 .qr-enlarge-mask { position: fixed; inset: 0; z-index: 999; background: rgba(0, 0, 0, 0.7); display: flex; align-items: center; justify-content: center; cursor: zoom-out; }
