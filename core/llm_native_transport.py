@@ -635,6 +635,7 @@ _NATIVE_KNOWN_KWARGS = frozenset({
     "max_tokens", "max_output_tokens", "max_completion_tokens",
     "extra_body", "extra_headers", "timeout",
     "num_retries", "allowed_openai_params", "metadata",
+    "stream_options",
 })
 
 # OpenAI 兼容标准参数：存在即透传到请求体顶层
@@ -674,6 +675,10 @@ def native_completion(**kwargs) -> NativeStreamResponse:
     #   OpenAI 兼容路由的缓存亲和材料走 extra_body，已在下方合并。
     for litellm_meta_key in ("num_retries", "allowed_openai_params", "metadata"):
         kwargs.pop(litellm_meta_key, None)
+
+    # stream_options：流式 usage 统计由下方 policy.supports_stream_options
+    # 统一决定并自加（与调用方契约值等价），显式消费避免落进未知参数告警。
+    kwargs.pop("stream_options", None)
 
     # 与 litellm.completion 契约一致：调用方不传 stream 时为非流式请求，
     # 返回完整 NativeSyncResponse（stream=True 仅由主聊天路径显式传入）。

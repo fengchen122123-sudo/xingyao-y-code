@@ -321,6 +321,29 @@ def test_native_completion_passes_reasoning_effort_and_warns_unknown(monkeypatch
     assert "mystery_param" in caplog.text
 
 
+def test_native_completion_consumes_contract_stream_options_without_warning(monkeypatch, caplog):
+    """调用方契约带入的 stream_options（llm.py 固定形状）必须被显式识别：
+    不落入未识别参数告警，最终请求体由 policy 自加等价的 include_usage。"""
+    import logging
+
+    lines = [
+        'data: {"choices": [{"index": 0, "delta": {"content": "hi"}}]}',
+        "data: [DONE]",
+    ]
+    client = _FakeClient(_FakeHttpResponse(lines=lines))
+    monkeypatch.setattr(nt, "_client_instance", client)
+    with caplog.at_level(logging.WARNING):
+        nt.native_completion(
+            model="deepseek-chat",
+            api_key="k",
+            messages=[{"role": "user", "content": "hi"}],
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+    assert client.last_payload["stream_options"] == {"include_usage": True}
+    assert "未识别的请求参数" not in caplog.text
+
+
 def test_dispatch_completion_routes_unsupported_models(monkeypatch):
     """自研引擎路由契约：不支持的路由（o1/o3、azure/ 等厂商云路由）
     显式抛 NativeLLMError（绝无静默兜底）；OpenAI 兼容与 anthropic/
