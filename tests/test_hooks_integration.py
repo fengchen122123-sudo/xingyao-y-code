@@ -175,6 +175,81 @@ def test_evaluate_stop_uses_hook_result(monkeypatch):
     assert decision["messages"] and "stop-ctx" in decision["messages"][0]["content"]
 
 
+# ── P1-1：Stop 续跑上限的 turn 恒定性（llm 接入契约） ──
+
+
+def test_stop_continue_loop_keeps_same_turn_id(monkeypatch):
+    """续跑循环中 llm 传给 evaluate_stop 的 turn_id 恒定，上限才真正生效。
+
+    评审 P1-1 关注的失败模式：hook 请求续跑 → 注入 contexts → 下一轮模型
+    调用 → 再次 Stop 判定；若每轮重新生成 turn_id，StopContinueState 会按
+    “新回合”重置计数，5 次上限永不触发（潜在死循环）。这里真实驱动
+    chat_with_model_events（mock provider 每轮返回纯文本），断言：
+    1) 6 次 Stop 判定的 (session_id, turn_id) 完全一致——llm.py:2513 传的是
+       _chat_with_model_generator 的函数参数 parent_turn_id（llm.py:1044
+       定义，循环体内无重新赋值）；
+    2) 第 6 次判定 limit_hit，回合走正常收尾（turn_finished）；
+    3) 同一 state 换 turn_id 后计数重置（lifecycle 级用例已覆盖，此处顺带锁定）。
+    """
+    from types import SimpleNamespace
+
+    import core.hooks.lifecycle as lifecycle
+    from core.harness import turn_limits
+
+    def _chunk(content):
+        delta = SimpleNamespace(
+            content=content,
+            reasoning_content="",
+            tool_calls=None,
+            provider_specific_fields=None,
+        )
+        return SimpleNamespace(choices=[SimpleNamespace(delta=delta)], usage=None)
+
+    class _StopResult:
+        continue_after_stop = True
+        additional_contexts = ["stop-ctx"]
+
+    class _StopRunner:
+        def run(self, event, hook_input, cancel_event=None):
+            return _StopResult()
+
+    state = StopContinueState()
+    seen: list[tuple[str, str]] = []
+    real_evaluate_stop = lifecycle.evaluate_stop
+
+    def spy_evaluate_stop(controller, runner, *, session_id, turn_id, **kwargs):
+        seen.append((str(session_id), str(turn_id)))
+        return real_evaluate_stop(
+            controller, runner, session_id=session_id, turn_id=turn_id, **kwargs
+        )
+
+    monkeypatch.setattr(lifecycle, "evaluate_stop", spy_evaluate_stop)
+    monkeypatch.setattr(lifecycle, "get_stop_continue_state", lambda: state)
+    monkeypatch.setattr(lifecycle, "get_default_hook_runner", lambda: _StopRunner())
+    monkeypatch.setattr(turn_limits, "load_turn_step_limit", lambda: 20)
+    monkeypatch.setattr(llm, "completion", lambda **_kwargs: iter([_chunk("done")]))
+
+    events = list(llm.chat_with_model_events(
+        "fake-model",
+        "fake-key",
+        [{"role": "user", "content": "做一个多步任务"}],
+        persist=False,
+        turn_id="turn-stop-guard",
+        parent_session="sess-stop-guard",
+        parent_turn_id="turn-stop-guard",
+    ))
+
+    # 1) 恒定性：同一回合每一轮 Stop 判定都用同一个 turn_id
+    assert len(seen) == 6
+    assert set(seen) == {("sess-stop-guard", "turn-stop-guard")}
+    # 2) 上限生效：第 6 次判定到达上限 → 正常收尾而非继续循环
+    assert "turn_finished" in [event.kind for event in events]
+    assert state.decide("sess-stop-guard", "turn-stop-guard")["limit_hit"] is True
+    # 3) 换 turn_id（新回合）计数重置
+    reset = state.decide("sess-stop-guard", "turn-next")
+    assert reset["continue"] is True and reset["count"] == 1
+
+
 # ── H-T16：无 hooks 配置时零影响 ──
 
 
@@ -218,7 +293,7 @@ def test_hook_allow_cannot_escalate_plan_mode(tmp_path, monkeypatch):
     """plan 档下的写操作被权限链拒绝（hook 之前 return），hook 脚本无执行痕迹。
 
     证明"hook 的 allow 不可提权"：即便 hook 配置放行，写操作依然被拒，
-    且 PreToolUse 根本不运行（marker 文件不存在）。
+    且 PreToolUse 根本不运行（marker 文件不存在 + _run_tool_hook 调用计数为 0）。
     """
     marker = tmp_path / "hook-ran.marker"
     hook_cmd = _script(
@@ -250,11 +325,26 @@ def test_hook_allow_cannot_escalate_plan_mode(tmp_path, monkeypatch):
         ]),
     )
 
+    # P2-8：管线级计数——deny 先行路径下 _run_tool_hook 根本不应被调用
+    from core.harness import tool_pipeline as tool_pipeline_module
+
+    hook_calls = []
+    real_run_tool_hook = tool_pipeline_module.ToolPipeline._run_tool_hook
+
+    def counting_run_tool_hook(self, *args, **kwargs):
+        hook_calls.append(args)
+        return real_run_tool_hook(self, *args, **kwargs)
+
+    monkeypatch.setattr(
+        tool_pipeline_module.ToolPipeline, "_run_tool_hook", counting_run_tool_hook
+    )
+
     message = _call("write_file", {"file_path": "a.txt", "content": "x"})
     # 被权限链拒绝（plan 档不允许写操作）
     assert "计划模式" in message["content"] or "拒绝" in message["content"]
-    # hook 未运行：不可提权
+    # hook 未运行：不可提权（脚本无痕迹 + 管线未进入 hook 调用点）
     assert not marker.exists()
+    assert hook_calls == []
 
 
 # ── H-T6 + H-T17：contexts 经 follow-up 载荷注入；项目级入参 [redacted] ──
