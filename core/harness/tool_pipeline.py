@@ -115,6 +115,44 @@ def repeat_guard_exempt(name: str, arguments: dict) -> bool:
     return False
 
 
+def _hook_permission_decision(authorization) -> str:
+    """把权限判定结果折算成发给 hook 的 permission_decision（规格 01 §3.3）。
+
+    authorize_tool_call 的放行有两类 reason：档位自动决策（*_allow / *_hit）
+    与询问选项 key（allow_once / allow_task / ...——询问已在权限链内同步完成）。
+    对 hook 报 "ask" 表示"该调用经过用户确认"，让 hook 能区分两类放行；
+    未放行（含用户拒绝/取消）统一报 "deny"。
+    """
+    if isinstance(authorization, bool):
+        return "allow" if authorization else "deny"
+    if not bool(getattr(authorization, "allowed", False)):
+        return "deny"
+    reason = str(getattr(authorization, "reason", "") or "")
+    if reason.startswith("allow_"):
+        return "ask"
+    return "allow"
+
+
+def _tool_message_with_hook_contexts(decoded, content, hook_result, event_name):
+    """构造工具消息，并把 hook 的 additional_context 挂到 follow-up 私有载荷上。
+
+    为什么复用 _FOLLOWUP_MESSAGES_KEY：无 hook 时不产生任何附加消息（零影响）；
+    有 hook 时沿用设计 19.3 的既有通道——ToolBatchExecutor 构造 record 时剥离进
+    ToolExecutionRecord.followup_messages，再经 llm.py 既有 follow-up 注入点进入
+    随后的请求，不新增任何消息通道（H-T6）。
+    """
+    from core.hooks.lifecycle import contexts_to_messages
+
+    message = _tool_message(decoded, content)
+    contexts = ()
+    if hook_result is not None:
+        contexts = tuple(getattr(hook_result, "additional_contexts", ()) or ())
+    followups = contexts_to_messages(event_name, contexts)
+    if followups:
+        message[_FOLLOWUP_MESSAGES_KEY] = followups
+    return message
+
+
 @dataclass(frozen=True)
 class ToolExecutionContext:
     event_callback: Callable | None
@@ -134,6 +172,10 @@ class ToolExecutionContext:
     # 原生双 target 的 selector 状态（Task 11a，设计 11.2）：computer_select_target
     # 固定 adapter 凭它写入 target 租约；不进普通 ToolRegistry。默认 None。
     computer_native_selection: object | None = None
+    # Hook 接入（C6/C7，规格 01 §5.2）：由 llm_execution._build_tool_pipeline_and_context
+    # 注入的 HookRunner。默认 None 时 execute_decoded 不运行任何 hook、不产生任何
+    # 附加消息，工具链行为与字节保持改造前完全一致（H-T16 硬约束）。
+    hook_runner: object | None = None
 
 
 @dataclass(frozen=True)
@@ -880,6 +922,92 @@ class ToolPipeline:
             return STALE_EXECUTION_LEASE_TEXT
         return STALE_EXECUTION_LEASE_TEXT
 
+    def _run_tool_hook(
+        self,
+        decoded,
+        context,
+        event_name: str,
+        *,
+        permission_decision: str = "",
+        tool_result_preview: str = "",
+    ):
+        """运行工具事件的 hook（C6）：无 runner 或执行失败时返回 None（零影响）。"""
+        runner = getattr(context, "hook_runner", None)
+        if runner is None:
+            return None
+        from core.hooks.lifecycle import build_hook_input, run_hook_safely
+
+        return run_hook_safely(
+            runner,
+            event_name,
+            build_hook_input(
+                event_name,
+                session_id=getattr(context, "parent_session", ""),
+                turn_id=getattr(context, "parent_turn_id", ""),
+                tool_name=decoded.name,
+                tool_input=decoded.arguments,
+                permission_decision=permission_decision,
+                tool_result_preview=tool_result_preview,
+            ),
+            cancel_event=getattr(context, "cancel_event", None),
+        )
+
+    def _hook_ask_override(self, decoded, context) -> str:
+        """hook 请求 ask 覆盖：真实走现有询问链（GUI 权限弹窗 / 终端选项）。
+
+        为什么复用 permission_terminal 的询问函数：它是全进程唯一询问入口
+        （broker 串行、GUI 与终端共用）；自造询问会让 GUI 弹窗、任务级授权与
+        取消路径全部失效。询问链不可用或自身异常时返回 "approved"——hook 是
+        增强能力，不能因为询问组件缺失把原本允许的调用据为失败（fail-open）。
+        返回 "approved" / "denied" / "cancelled"。
+        """
+        try:
+            from core import permission_terminal as terminal
+
+            wait = getattr(terminal, "_wait_permission_option", None)
+            options_fn = getattr(terminal, "_permission_options", None)
+            if wait is None or options_fn is None:
+                return "approved"
+            # 与权限链相同的 llm-first 解析：测试/入口层 patch
+            # core.llm._wait_permission_option 时必须生效。
+            resolve = getattr(terminal, "_llm_first", None)
+            if resolve is not None:
+                wait = resolve("_wait_permission_option", wait)
+            task_grant = project_rule = None
+            facts_fn = getattr(terminal, "_permission_rule_facts", None)
+            if facts_fn is not None:
+                try:
+                    _task_hit, _project_hit, task_grant, project_rule = facts_fn(
+                        decoded.name, decoded.arguments
+                    )
+                except Exception:
+                    task_grant = project_rule = None
+            options = options_fn(
+                sandbox_request=False,
+                credential_write=False,
+                task_grant=task_grant,
+                project_rule=project_rule,
+            )
+            option_key = wait(
+                decoded.name,
+                decoded.arguments,
+                options,
+                event_callback=getattr(context, "event_callback", None),
+                permission_owner=getattr(context, "permission_owner", None),
+                parent_turn_id=getattr(context, "parent_turn_id", None),
+                permission_source=getattr(context, "permission_source", "主代理"),
+                cancel_event=getattr(context, "cancel_event", None),
+            )
+            if option_key == "cancelled":
+                return "cancelled"
+            if option_key == "deny":
+                return "denied"
+            return "approved"
+        except Exception:
+            # 询问链路异常（UI 事件丢失等）按 fail-open 保持原 allow：不把增强
+            # hook 的请求升级成工具失败。
+            return "approved"
+
     def execute_decoded(self, decoded: DecodedToolCall, context) -> dict:
         _raise_if_cancelled(context.cancel_event)
         fenced = self._stale_execution_lease(context)
@@ -908,6 +1036,7 @@ class ToolPipeline:
         # 的兜底边界一致：单工具系统级异常（如权限终端 input 的 OSError）转成
         # 工具错误结果返回，绝不击穿外层循环终结整个回合；KeyboardInterrupt
         # （取消路径）不属于 Exception，仍向上传递。
+        pre_hook = None
         try:
             self.adapters.announce(
                 decoded.name, decoded.arguments, context.event_callback
@@ -916,6 +1045,51 @@ class ToolPipeline:
             if denied is not None:
                 return _tool_message(decoded, denied)
             _raise_if_cancelled(context.cancel_event)
+
+            # C6（PreToolUse，规格 01 §5.2）：权限判定未拒绝后、执行前运行。
+            # hook 的阻断/权限覆盖在此生效；无 hook_runner 时整段零开销。
+            pre_hook = self._run_tool_hook(
+                decoded,
+                context,
+                "PreToolUse",
+                permission_decision=_hook_permission_decision(authorization),
+            )
+            if pre_hook is not None:
+                if pre_hook.block_requested:
+                    return _tool_message_with_hook_contexts(
+                        decoded,
+                        f"{TOOL_ERROR_PREFIX} 工具调用被 PreToolUse hook 阻断："
+                        f"{str(pre_hook.block_reason or '').strip() or 'hook 请求阻断本次调用'}",
+                        pre_hook,
+                        "PreToolUse",
+                    )
+                if pre_hook.permission_override == "deny":
+                    return _tool_message_with_hook_contexts(
+                        decoded,
+                        f"{TOOL_ERROR_PREFIX} 工具调用被 PreToolUse hook 拒绝："
+                        f"{str(pre_hook.block_reason or '').strip() or 'hook 请求拒绝本次调用'}",
+                        pre_hook,
+                        "PreToolUse",
+                    )
+                # C7 权限覆盖（规格 01 §5.3）：hook 只能向更严格方向收敛。
+                # deny 已在上面返回；"allow" 覆盖只在当前已走询问放行（ask）
+                # 时有意义——询问已在权限链内同步完成且用户已批准，这里保留
+                # 既有结果即可（对 deny 无效 —— deny 路径在 hook 之前已 return，
+                # H-T4 硬约束：hook 不能提权超过用户档位）。
+                # "ask" 覆盖：当前是档位自动放行时才需补一次真实询问。
+                if (
+                    pre_hook.permission_override == "ask"
+                    and _hook_permission_decision(authorization) == "allow"
+                ):
+                    verdict = self._hook_ask_override(decoded, context)
+                    if verdict == "denied":
+                        return _tool_message_with_hook_contexts(
+                            decoded, PERMISSION_DENIED_MESSAGE, pre_hook, "PreToolUse"
+                        )
+                    if verdict == "cancelled":
+                        return _tool_message_with_hook_contexts(
+                            decoded, PERMISSION_CANCELLED_MESSAGE, pre_hook, "PreToolUse"
+                        )
 
             legacy_boolean_authorization = isinstance(authorization, bool)
             bypass = bool(getattr(authorization, "sandbox_bypass", False))
@@ -939,7 +1113,29 @@ class ToolPipeline:
             content = (
                 f"{TOOL_ERROR_PREFIX} 调用工具 {decoded.name} 时发生系统内部错误：{tool_err}"
             )
-        return _tool_message(decoded, self.truncate_result(decoded.name, content))
+        message = _tool_message(decoded, self.truncate_result(decoded.name, content))
+        # C6（PostToolUse，规格 01 §5.2）：result 生成后、return 前运行；聚合层
+        # 已按事件屏蔽阻断/权限字段，hook 在这里只能追加上下文。pre/post 的
+        # contexts 都走 follow-up 私有载荷通道（无 hook 时不产生任何附加消息）。
+        post_hook = self._run_tool_hook(
+            decoded, context, "PostToolUse", tool_result_preview=content
+        )
+        hook_messages: tuple[dict, ...] = ()
+        if pre_hook is not None:
+            from core.hooks.lifecycle import contexts_to_messages
+
+            hook_messages = contexts_to_messages(
+                "PreToolUse", pre_hook.additional_contexts
+            )
+        if post_hook is not None:
+            from core.hooks.lifecycle import contexts_to_messages
+
+            hook_messages = hook_messages + contexts_to_messages(
+                "PostToolUse", post_hook.additional_contexts
+            )
+        if hook_messages:
+            message[_FOLLOWUP_MESSAGES_KEY] = hook_messages
+        return message
 
     def _execute_reserved_computer(self, decoded: DecodedToolCall, context) -> dict | None:
         """保留名固定适配（设计 19.2 + Task 11a）：非保留名返回 None。
