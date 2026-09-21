@@ -252,7 +252,19 @@ def _submit_daemon_call(function, *args, **kwargs):
     return future
 
 
-def group_tool_batches(tool_calls: list[dict], registry: ToolRegistry) -> tuple[ToolBatch, ...]:
+def _legacy_group_tool_batches(
+    tool_calls: list[dict], registry: ToolRegistry
+) -> tuple[ToolBatch, ...]:
+    """旧批次规划实现（原样保留，不参与生产执行）。
+
+    为什么保留：A5-A9 的对拍测试（tests/test_tool_scheduler.py）用它作为
+    "零回归"基线（无依赖声明的输入必须与 plan_tool_batches 逐批逐项一致）；
+    新调度器一旦出现线上问题，也可临时把 group_tool_batches 切回本函数
+    作为紧急回退，不需要回滚整个提交。
+
+    逻辑：相邻的 parallel_safe 调用合并成一批并行，遇到非 parallel_safe
+    断开；未注册的工具按非并行安全保守处理。
+    """
     batches: list[ToolBatch] = []
     for tool_call in tool_calls:
         name = tool_call["function"]["name"]
@@ -266,6 +278,31 @@ def group_tool_batches(tool_calls: list[dict], registry: ToolRegistry) -> tuple[
         else:
             batches.append(ToolBatch(parallel, (tool_call,)))
     return tuple(batches)
+
+
+def group_tool_batches(tool_calls: list[dict], registry: ToolRegistry) -> tuple[ToolBatch, ...]:
+    """兼容包装：委托给 plan_tool_batches（规格 2.5）。
+
+    保留本函数是为了：现有调用方（ToolBatchExecutor.prepare）与测试无需
+    改动；出问题时可以快速切回旧实现（见 _legacy_group_tool_batches）。
+
+    为什么这里传 max_concurrency=len(tool_calls)（即不做批次大小截断）：
+    1. 产品决定要求「无依赖声明」的输入与旧实现逐批逐项完全一致（工作包
+       README 第 2 条 + 03 规格回归红线），而旧实现没有批次大小上限——
+       截断会让 5 个以上连续的 parallel_safe 调用从"一批"变成多批，
+       开始事件与流水线形态都会变化；
+    2. 真实并发上限仍由 ToolBatchExecutor 的 BoundedSemaphore(max_parallel=4)
+       在执行期兜底（T-T12），批内 future 再多也不会超过 4 个同时运行；
+    3. plan_tool_batches 默认的 max_concurrency=4 供新调用方按需显式使用。
+    """
+    # 延迟导入：ToolBatch 定义在本模块，若在模块顶层互相导入会形成循环。
+    from core.harness.tool_scheduler import plan_tool_batches
+
+    return plan_tool_batches(
+        tool_calls,
+        registry,
+        max_concurrency=max(1, len(tool_calls)),
+    )
 
 
 def build_tool_result_event_draft(
