@@ -2531,6 +2531,19 @@ def _chat_with_model_generator(
                     if current_step is not None and turn + 1 < max_turns:
                         current_step.complete()
                     continue
+                if (
+                    _stop_decision is not None
+                    and _stop_decision.get("continue")
+                    and turn + 1 >= max_turns
+                ):
+                    # 审查修复：hook 请求续跑但已达回合步数上限——不再注入
+                    # 上下文，显式告警（原实现静默丢弃，用户无从感知）。
+                    _notify_event(event_callback, "notice", {
+                        "message": (
+                            "Stop hook 请求继续执行，但已达本回合步数上限，"
+                            "未能续跑（如需继续请开启新回合）。"
+                        ),
+                    })
                 if _stop_decision is not None and _stop_decision.get("limit_hit"):
                     _notify_event(event_callback, "notice", {
                         "message": str(_stop_decision.get("warning") or ""),
