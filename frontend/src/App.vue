@@ -110,6 +110,9 @@
             <!-- 权限询问内联卡片（codex 风格，跟随对话流末尾） -->
             <PermCard />
 
+            <!-- C11：项目级 Hook 信任卡片（跟随权限卡之后，信任前命令不执行） -->
+            <HookTrustCard />
+
             <!-- 回合活动指示：内容开始输出后才显示（等待首内容阶段由气泡内
                  等待线负责，两条不重叠）；结束后保留一行静态工作时间 -->
             <div v-if="showFlowWorking" class="working-indicator">
@@ -294,6 +297,7 @@ import SessionSearchModal from './components/SessionSearchModal.vue';
 // 免责条款首次使用确认（合规链路）：未同意或条款升级后强制弹出，不同意则退出
 import DisclaimerGate from './components/DisclaimerGate.vue';
 import PermCard from './components/PermCard.vue';
+import HookTrustCard from './components/HookTrustCard.vue';
 import ImageLightbox from './components/ImageLightbox.vue';
 import RemoteDirBrowser from './components/RemoteDirBrowser.vue';
 import Subpage from './components/Subpage.vue';

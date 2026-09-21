@@ -6455,6 +6455,64 @@ class ApiBridge(GitBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # Hooks（信任状态与操作走 core.hooks.trust，与 CLI / 执行侧同源；
+    #        状态判定每次读盘、不缓存，执行期间的撤销立即生效）
+    # ------------------------------------------------------------------
+    def _hook_workspace_root(self) -> str:
+        """当前会话对应的工作根路径（与回合运行时的 workspace_identity 口径一致）。"""
+        # _session_workdir 已含查不到时回退 _resolve_real_path(os.getcwd()) 的逻辑；
+        # GLOBAL 会话（自由对话）回合运行时用进程 cwd，这里同口径。
+        session_workdir = self._session_workdir(self._current_session)
+        if not session_workdir or session_workdir == "GLOBAL":
+            return _resolve_real_path(os.getcwd())
+        return _resolve_real_path(session_workdir)
+
+    def get_hooks(self) -> Dict[str, Any]:
+        """列出全部 hook（用户级+项目级）与信任状态（C11 卡片 / C12 管理页共用）。"""
+        # 成功: {"ok": True, "hooks": [...], "workdir": root}
+        # 异常: {"ok": False, "msg": str(e), "hooks": []}
+        try:
+            from core.hooks.trust import list_hooks_with_status
+            root = self._hook_workspace_root()
+            hooks = list_hooks_with_status(workspace_root=root)
+            return {"ok": True, "hooks": hooks, "workdir": root}
+        except Exception as e:
+            logger.exception("get_hooks 失败")
+            return {"ok": False, "msg": str(e), "hooks": []}
+
+    def grant_hook_trust(self, digest: str) -> Dict[str, Any]:
+        """信任指定 hook（pending/stale → trusted）。"""
+        return self._hook_trust_action("grant", digest)
+
+    def deny_hook_trust(self, digest: str) -> Dict[str, Any]:
+        """拒绝指定 hook（pending → blocked，不再询问）。"""
+        return self._hook_trust_action("deny", digest)
+
+    def revoke_hook_trust(self, digest: str) -> Dict[str, Any]:
+        """撤销对指定 hook 的信任（trusted → revoked）。"""
+        return self._hook_trust_action("revoke", digest)
+
+    def reset_hook_trust(self, digest: str) -> Dict[str, Any]:
+        """重置指定 hook 的信任状态（blocked/revoked → pending）。"""
+        return self._hook_trust_action("reset", digest)
+
+    def _hook_trust_action(self, action: str, digest: str) -> Dict[str, Any]:
+        """信任操作统一实现：执行后回传刷新列表（同 trust_plugin 回传 plugins 模式）。
+
+        成功: {"ok": ok, "msg": msg, "hooks": [...], "workdir": root}
+        异常: {"ok": False, "msg": str(e)}
+        """
+        try:
+            from core.hooks.trust import apply_hook_trust_action, list_hooks_with_status
+            root = self._hook_workspace_root()
+            ok, msg = apply_hook_trust_action(action, digest, workspace_root=root)
+            hooks = list_hooks_with_status(workspace_root=root)
+            return {"ok": ok, "msg": msg, "hooks": hooks, "workdir": root}
+        except Exception as e:
+            logger.exception("_hook_trust_action(%s) 失败", action)
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
     # MCP
     # ------------------------------------------------------------------
     def _mcp_tool_counts(self) -> Dict[str, int]:

@@ -1,7 +1,11 @@
-"""C3：Hooks 信任机制测试（H-T11 / H-T12 / H-T13）。"""
+"""C3：Hooks 信任机制测试（H-T11 / H-T12 / H-T13）；C11：信任视图与信任操作测试。"""
 
 from __future__ import annotations
 
+import json
+
+from core.hooks import apply_hook_trust_action, list_hooks_with_status
+from core.hooks.registry import HookRegistry
 from core.hooks.trust import (
     TRUST_BLOCKED,
     TRUST_PENDING,
@@ -115,3 +119,134 @@ def test_deny_blocks_and_reset_returns_to_pending(tmp_path):
     assert _status(store, digest) == TRUST_BLOCKED
     assert store.reset(workspace_identity=WS, digest=digest)
     assert _status(store, digest) == TRUST_PENDING
+
+
+# ── C11：信任视图与信任操作（GUI 桥接层 / CLI 共用）────────────────
+
+
+def _write_hooks(path, payload) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+
+def _two_level(tmp_path, project_command="python proj_hook.py"):
+    """两级配置（用户级 SessionStart + 项目级 Stop），路径全部注入 tmp。
+
+    返回 ``(registry, project_hooks_path, workspace_root)``；测试绝不触碰真实
+    ~/.ycode（store 也由 ``_store(tmp_path)`` 注入）。
+    """
+    user_path = tmp_path / "home" / "hooks.json"
+    project_path = tmp_path / "proj" / ".ycode" / "hooks.json"
+    _write_hooks(
+        user_path, {"hooks": {"SessionStart": [{"command": "python user_hook.py"}]}}
+    )
+    _write_hooks(project_path, {"hooks": {"Stop": [{"command": project_command}]}})
+    registry = HookRegistry(user_hooks_path=user_path, project_hooks_path=project_path)
+    return registry, project_path, tmp_path / "proj"
+
+
+def test_list_hooks_with_status_scope_defaults_and_grant(tmp_path):
+    """默认：用户级 trusted、项目级 pending；grant 后项目级转 trusted。"""
+    registry, _, workspace_root = _two_level(tmp_path)
+    store = _store(tmp_path)
+
+    def view():
+        return list_hooks_with_status(
+            workspace_root=workspace_root, registry=registry, store=store
+        )
+
+    hooks = view()
+    assert [h["scope"] for h in hooks] == ["user", "project"]
+    assert [h["status"] for h in hooks] == [TRUST_TRUSTED, TRUST_PENDING]
+    # GUI 信任卡片直接消费：字段齐全、纯 dict 可 JSON 序列化
+    assert set(hooks[1]) == {
+        "event",
+        "matcher",
+        "command",
+        "timeout_ms",
+        "status_message",
+        "source_path",
+        "scope",
+        "digest",
+        "status",
+    }
+    assert hooks[1]["event"] == "Stop"
+    json.dumps(hooks, ensure_ascii=False)
+
+    ok, message = apply_hook_trust_action(
+        "grant",
+        hooks[1]["digest"],
+        workspace_root=workspace_root,
+        registry=registry,
+        store=store,
+    )
+    assert (ok, message) == (True, "已信任")
+    assert view()[1]["status"] == TRUST_TRUSTED
+
+
+def test_list_hooks_with_status_stale_after_command_change(tmp_path):
+    """grant 后只改 command → digest 变且同 source_path 曾 trusted → stale。"""
+    registry, project_path, workspace_root = _two_level(tmp_path)
+    store = _store(tmp_path)
+    hooks = list_hooks_with_status(
+        workspace_root=workspace_root, registry=registry, store=store
+    )
+    assert apply_hook_trust_action(
+        "grant",
+        hooks[1]["digest"],
+        workspace_root=workspace_root,
+        registry=registry,
+        store=store,
+    ) == (True, "已信任")
+
+    _write_hooks(
+        project_path, {"hooks": {"Stop": [{"command": "python changed.py"}]}}
+    )
+    changed = list_hooks_with_status(
+        workspace_root=workspace_root, registry=registry, store=store
+    )[1]
+    assert changed["digest"] != hooks[1]["digest"]
+    assert changed["status"] == TRUST_STALE
+
+
+def test_apply_hook_trust_action_full_chain_and_unknown(tmp_path):
+    """grant→trusted、deny→blocked、revoke→revoked、reset→pending 全链路。"""
+    registry, _, workspace_root = _two_level(tmp_path)
+    store = _store(tmp_path)
+
+    def project():
+        return list_hooks_with_status(
+            workspace_root=workspace_root, registry=registry, store=store
+        )[1]
+
+    digest = project()["digest"]
+
+    def apply(action):
+        return apply_hook_trust_action(
+            action,
+            digest,
+            workspace_root=workspace_root,
+            registry=registry,
+            store=store,
+        )
+
+    assert project()["status"] == TRUST_PENDING
+    assert apply("grant") == (True, "已信任")
+    assert project()["status"] == TRUST_TRUSTED
+    assert apply("deny") == (True, "已拒绝，之后不再询问")
+    assert project()["status"] == TRUST_BLOCKED
+    assert apply("revoke") == (True, "已撤销信任")
+    assert project()["status"] == TRUST_REVOKED
+    assert apply("reset") == (True, "已重置为待确认")
+    assert project()["status"] == TRUST_PENDING
+
+    # 未知 digest：配置里不存在的条目不落信任记录
+    assert apply_hook_trust_action(
+        "grant",
+        "0" * 64,
+        workspace_root=workspace_root,
+        registry=registry,
+        store=store,
+    ) == (False, "未找到对应的 hook（配置可能已变更，请刷新后重试）")
+    # 未知 action：不触碰 registry/store 直接拒绝
+    assert apply("frobnicate") == (False, "未知操作: frobnicate")

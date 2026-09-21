@@ -312,3 +312,108 @@ class HookTrustStore:
         except OSError as exc:
             self._logger.warning("hook 信任存储写入失败: %s", exc)
             return False
+
+
+# ── 信任视图与信任操作（C11：GUI 管理页 / 信任卡片 / CLI 共用）──────
+
+
+def list_hooks_with_status(
+    *, workspace_root=None, registry=None, store=None
+) -> list[dict]:
+    """列出两级 hook 配置并逐条标注信任状态（GUI 管理页 / 信任卡片 / CLI 共用）。
+
+    为什么惰性导入 HookRegistry：``registry`` 模块级已导入本模块
+    （``compute_hook_digest``），若本函数在模块级导入 registry 会形成循环导入；
+    惰性导入让 trust 保持「被 registry 依赖」的单向依赖关系。
+
+    registry / store 允许注入：调用方（GUI / CLI）各自解析配置路径与存储路径
+    （如多实例隔离、测试注入 tmp 路径），视图函数不应再猜一次路径；默认值仅供
+    零配置的便捷调用。
+
+    为什么返回纯 dict 而不是 HookRegistration：本视图直接送给 GUI 前端，
+    dict 可 JSON 序列化，且把「状态」与「配置」摊平成同一层，前端不必再回查。
+    """
+    from core.hooks.registry import HookRegistry
+
+    reg = registry if registry is not None else HookRegistry()
+    st = store if store is not None else HookTrustStore()
+    identity = normalize_workspace_identity(workspace_root)
+    hooks: list[dict] = []
+    for item in reg.load(workspace_root=workspace_root):
+        hooks.append(
+            {
+                "event": item.event.value,
+                "matcher": item.matcher,
+                "command": item.command,
+                "timeout_ms": item.timeout_ms,
+                "status_message": item.status_message,
+                "source_path": item.source_path,
+                "scope": item.scope,
+                "digest": item.digest,
+                "status": st.status_for(
+                    workspace_identity=identity,
+                    digest=item.digest,
+                    source_path=item.source_path,
+                    scope=item.scope,
+                ),
+            }
+        )
+    return hooks
+
+
+def apply_hook_trust_action(
+    action, digest, *, workspace_root=None, registry=None, store=None
+) -> tuple[bool, str]:
+    """执行单条 hook 的信任操作（grant/deny/revoke/reset），返回 ``(ok, message)``。
+
+    为什么先查视图再落库：操作对象必须是「当前配置里真实存在的 hook」——
+    digest 是内容指纹，配置一变旧 digest 自然失配，此时应让用户刷新而不是把
+    信任写到一个已不存在的条目上（否则信任记录会指向幽灵条目，既不可见也不
+    可清理）。revoke/reset 也走同一查在流程，保证 GUI 与 CLI 无论 digest 从哪
+    来，都得到统一的存在性校验与同一套提示文案。
+
+    非法 action 先于查在返回：不必触碰 registry/store，也避免调用方把拼错的
+    动作名误判为「hook 不存在」去排查。
+
+    成功文案约定（GUI 直接展示）：grant→"已信任"；deny→"已拒绝，之后不再询问"；
+    revoke→"已撤销信任"；reset→"已重置为待确认"。
+    """
+    if action not in ("grant", "deny", "revoke", "reset"):
+        return False, f"未知操作: {action}"
+    st = store if store is not None else HookTrustStore()
+    identity = normalize_workspace_identity(workspace_root)
+    target = next(
+        (
+            item
+            for item in list_hooks_with_status(
+                workspace_root=workspace_root, registry=registry, store=st
+            )
+            if item["digest"] == digest
+        ),
+        None,
+    )
+    if target is None:
+        return False, "未找到对应的 hook（配置可能已变更，请刷新后重试）"
+    if action in ("grant", "deny"):
+        # grant/deny 需要 source_path 与 command 落库（供管理页展示「信任的是
+        # 哪条命令」），两者都从命中条目取，不信任调用方传来的副本。
+        write = st.grant if action == "grant" else st.deny
+        ok = write(
+            workspace_identity=identity,
+            digest=digest,
+            source_path=target["source_path"],
+            command=target["command"],
+        )
+        message = "已信任" if action == "grant" else "已拒绝，之后不再询问"
+    elif action == "revoke":
+        # revoke/reset 只按 identity+digest 操作存储，不需要来源信息。
+        ok = st.revoke(workspace_identity=identity, digest=digest)
+        message = "已撤销信任"
+    else:  # reset
+        ok = st.reset(workspace_identity=identity, digest=digest)
+        message = "已重置为待确认"
+    if not ok:
+        # 存储写入失败（磁盘满 / 权限问题）不能假装成功：GUI 卡片会显示旧状态，
+        # 用户必须知道这次操作没生效。
+        return False, "写入信任存储失败"
+    return True, message

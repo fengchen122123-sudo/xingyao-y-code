@@ -13,6 +13,7 @@ import type {
   SkillInfo,
   McpInfo,
   PluginInfo,
+  HookInfo,
   FileNode,
   BridgeEvent,
   PlanData,
@@ -548,6 +549,8 @@ export const useAppStore = defineStore('app', {
     tokenUsageReqSeq: 0,
     mcpReqSeq: 0,
     pluginsReqSeq: 0,
+    // C11：Hook 状态刷新请求序号，过期响应不覆盖新快照
+    hooksReqSeq: 0,
     // M27 修复：文件预览请求序号，旧响应不覆盖新打开文件的内容
     filePreviewReqSeq: 0,
 
@@ -559,6 +562,9 @@ export const useAppStore = defineStore('app', {
     skillsLoading: false,
     mcps: [] as McpInfo[],
     plugins: [] as PluginInfo[],
+    // C11：Hook 信任卡片数据源（项目级命令逐条信任，信任前不执行）
+    hooks: [] as HookInfo[],
+    hooksLoading: false,
 
     // 星轨自动化任务：任务列表 + 每任务运行历史（事件幂等替换）
     automationTasks: [] as AutomationTaskInfo[],
@@ -808,6 +814,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
 
     themeDirty(state): boolean {
       return JSON.stringify(state.guiThemeDraft) !== JSON.stringify(state.savedGuiTheme);
+    },
+
+    // C11：待信任的项目级 Hook（pending/stale 才需要用户决策；trusted 已生效）
+    pendingProjectHooks(state): HookInfo[] {
+      return state.hooks.filter(
+        h => h.scope === 'project' && (h.status === 'pending' || h.status === 'stale'),
+      );
     },
   },
 
@@ -1687,6 +1700,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.skillsLoading = this.skills.length === 0;
         this.mcps = init.mcps || [];
         this.plugins = (init as any).plugins || [];
+        // C11：启动时拉取 Hook 信任状态（信任卡片数据源）
+        void this.refreshHooks();
         this.workdir = init.workdir || '';
         this.currentSessionName = (init as any).current_session || '';
         // 工作区标签以“当前会话归属”为准：GLOBAL 会话显示“对话”，
@@ -2449,7 +2464,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } finally {
         // 加载态复位：仅在仍是当前会话时清除——快速连点不同会话时，
         // 过期响应返回不得清掉当前会话的加载态
-        if (this.currentSessionName === sessionName) this.sessionSwitching = false;
+        if (this.currentSessionName === sessionName) {
+          this.sessionSwitching = false;
+          // C11：切换流程末端刷新 Hook 信任状态（项目工作目录随会话变化）
+          void this.refreshHooks();
+        }
       }
     },
 
@@ -4142,6 +4161,62 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         this.connected = false;
         this.notifyModal('插件', '插件信任失败: ' + err);
+      }
+    },
+
+    // C11：Hook 信任状态刷新（启动/切会话/信任动作后重拉最新快照）
+    async refreshHooks() {
+      const api = this._api();
+      // 旧桥接没有 get_hooks：静默跳过，信任卡片不显示
+      if (!api || typeof api.get_hooks !== 'function') return;
+      // 序号防护：过期响应不覆盖新快照
+      const seq = ++this.hooksReqSeq;
+      this.hooksLoading = true;
+      try {
+        const res = await api.get_hooks();
+        if (seq !== this.hooksReqSeq) return;
+        if (res && res.ok) this.hooks = res.hooks || [];
+      } catch {
+        // 静默失败，保留现有列表
+      } finally {
+        if (seq === this.hooksReqSeq) this.hooksLoading = false;
+      }
+    },
+
+    // C11：Hook 信任动作统一入口（method: grant/deny/revoke/reset_hook_trust）
+    async _hookTrustAction(this: any, method: string, digest: string) {
+      const api = this._api();
+      if (!api || typeof (api as any)[method] !== 'function') return;
+      try {
+        const res = await (api as any)[method](digest);
+        if (res && res.ok) {
+          this.hooks = res.hooks || this.hooks;
+        } else if (res && res.msg) {
+          this.notifyModal('Hook 信任', res.msg);
+        }
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('Hook 信任', 'Hook 信任操作失败: ' + err);
+      }
+    },
+
+    grantHookTrust(digest: string) { return this._hookTrustAction('grant_hook_trust', digest); },
+    denyHookTrust(digest: string) { return this._hookTrustAction('deny_hook_trust', digest); },
+    revokeHookTrust(digest: string) { return this._hookTrustAction('revoke_hook_trust', digest); },
+    resetHookTrust(digest: string) { return this._hookTrustAction('reset_hook_trust', digest); },
+
+    // C11：一键信任/拒绝全部待决项目级 Hook（先快照数组，逐个串行避免遍历中变更）
+    async grantAllPendingHookTrusts() {
+      const pending = [...this.pendingProjectHooks];
+      for (const hook of pending) {
+        await this.grantHookTrust(hook.digest);
+      }
+    },
+
+    async denyAllPendingHookTrusts() {
+      const pending = [...this.pendingProjectHooks];
+      for (const hook of pending) {
+        await this.denyHookTrust(hook.digest);
       }
     },
 
