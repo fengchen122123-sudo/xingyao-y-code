@@ -53,6 +53,8 @@
   /* ---- 安全区 / 阴影档 ---- */
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
+  /* tabbar 实际占位（含安全区）；底部弹层以此为底 */
+  --tabbar-h: calc(var(--van-tabbar-height, 54px) + env(safe-area-inset-bottom, 0px));
   --shadow-1: 0 1px 3px rgba(0, 0, 0, 0.25);
   --shadow-2: var(--shadow-float);
 
@@ -144,6 +146,8 @@
   --van-tabbar-item-icon-margin-bottom: 2px;
   --van-tabbar-item-line-height: 1.2;
   --van-tabbar-height: 54px;
+  /* tabbar 高于弹层遮罩（Vant 弹层 z-index 从 2000 起），保证任何弹层下 tabbar 可见 */
+  --van-tabbar-z-index: 3000;
   --van-button-primary-background: var(--accent);
   --van-button-primary-border-color: var(--accent);
   --van-button-plain-background: var(--bg-raised);
@@ -269,6 +273,7 @@ input, textarea, select { font-size: 16px; font-family: inherit; }
 }
 .i.sm { width: 12px; height: 12px; }
 .i.lg { width: 16px; height: 16px; }
+.i.xxl { width: 20px; height: 20px; }
 .i.tab { width: 20px; height: 20px; }
 
 ::-webkit-scrollbar { width: 0; height: 0; }
@@ -292,6 +297,16 @@ input, textarea, select { font-size: 16px; font-family: inherit; }
 .van-hairline-unfit--top-bottom::after { border-color: var(--line); }
 .van-nav-bar .van-icon { color: var(--text-2); }
 .van-tag { font-family: var(--font-mono); }
+
+/* ================= 弹层与 tabbar =================
+   tabbar 固定且 z-index 高于遮罩：任何弹层打开时 tabbar 都可见、可点。
+   有 tabbar 的页面（html.has-tabbar）底部弹层上移一个 tabbar 高度，绝不覆盖 tabbar。 */
+html.has-tabbar .van-popup--bottom {
+  bottom: var(--tabbar-h) !important;
+}
+html.has-tabbar .van-popup--bottom.van-popup--round {
+  border-radius: var(--r-float) var(--r-float) 0 0;
+}
 
 /* 搜索框对齐 preview：外层 8/12/2，内容区 r8 + 发丝线边框 */
 .van-search {

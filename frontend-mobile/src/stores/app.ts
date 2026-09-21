@@ -6,16 +6,27 @@
 import { defineStore } from 'pinia';
 import { onEvent, rpc } from '../bridge';
 
+export interface ToolDisplay {
+  category?: string;
+  action?: string;
+  target?: string;
+  command?: string;
+  metrics?: Record<string, number>;
+  error_summary?: string;
+  is_skill?: boolean;
+}
 export interface ToolCallUi {
   id: string;
   name: string;
   label: string;
-  result?: { ok: boolean; summary: string; result: string; duration_ms?: number };
+  display?: ToolDisplay;
+  result?: { ok: boolean; summary: string; result: string; duration_ms?: number; display?: ToolDisplay };
 }
 
 export interface ChatMessage {
   role: 'user' | 'assistant' | 'tool' | 'error';
   _msg_id?: number;
+  tool_call_id?: string;
   content: string;
   reasoning_content?: string;
   tool_calls?: ToolCallUi[];
@@ -95,20 +106,90 @@ interface TokenUsage {
 
 const HEARTBEAT_MS = 20000;
 
-/** 历史消息归一化：turn_id → turnId（撤销定位键）、metrics 原样透传 */
+/**
+ * 历史会话里的旧形状 tool_call：{ id, function:{ name, arguments }, summary }。
+ * 归一成 UI 形状 { id, name, label, display, result }（对齐桌面 appStore.normalizeHistoryCall）。
+ */
+function normalizeHistoryCall(raw: any, toolMessages: Map<string, ChatMessage>): ToolCallUi {
+  const name = String(raw?.name || raw?.function?.name || raw?.tool_name || 'tool');
+  let label = String(raw?.label || raw?.summary || '');
+  if (!label) {
+    let args: any = raw?.function?.arguments;
+    if (typeof args === 'string') {
+      try { args = JSON.parse(args); } catch { args = null; }
+    }
+    if (args && typeof args === 'object') {
+      const p = args.file_path || args.path || args.dir_path || args.query || args.command || '';
+      label = p ? `${name} ${p}` : name;
+    } else {
+      label = name;
+    }
+  }
+  const call: ToolCallUi = { id: String(raw?.id || ''), name, label, display: raw?.display || undefined };
+  const toolMsg = call.id ? toolMessages.get(call.id) : undefined;
+  if (toolMsg) {
+    const content = String(toolMsg.content ?? '');
+    call.result = { ok: true, summary: content, result: content };
+  }
+  return call;
+}
+
+/**
+ * 把历史里独立的 role=tool 消息按 tool_call_id 配对进前一条助手消息的 tool_calls，
+ * 配对完成后从列表移除（对齐桌面 pairHistoryToolMessages）。
+ */
+export function pairHistoryToolMessages(messages: ChatMessage[]): ChatMessage[] {
+  const toolMessages = new Map<string, ChatMessage>();
+  for (const m of messages) {
+    if (m.role === 'tool' && m.tool_call_id) toolMessages.set(String(m.tool_call_id), m);
+  }
+  const paired: ChatMessage[] = [];
+  for (const m of messages) {
+    if (m.role === 'tool' && m.tool_call_id && toolMessages.has(String(m.tool_call_id))) continue;
+    if (m.role === 'assistant') {
+      paired.push({
+        ...m,
+        tool_calls: (m.tool_calls || []).map((raw: any) => normalizeHistoryCall(raw, toolMessages)),
+      });
+    } else {
+      paired.push(m);
+    }
+  }
+  return paired;
+}
+
+/** 历史消息归一化：turn_id → turnId、metrics 透传、tool 消息配对进 assistant */
 function normalizeMessages(list: any[]): ChatMessage[] {
-  return (list || []).map((m) => ({
+  const mapped = (list || []).map((m) => ({
     ...m,
     turnId: m.turnId || m.turn_id || '',
     metrics: m.metrics || undefined,
   }));
+  return pairHistoryToolMessages(mapped);
 }
+
+/** 思考能力快照（对齐桌面 reasoning_capabilities.build_reasoning_snapshot） */
+export interface ReasoningSnapshot {
+  kind: string;
+  visible: boolean;
+  disabled: boolean;
+  disabled_reason: string;
+  choice: string;
+  options: { value: string; label: string }[];
+}
+const REASONING_DEFAULT: ReasoningSnapshot = {
+  kind: 'hidden', visible: false, disabled: false, disabled_reason: '', choice: 'default', options: [],
+};
 
 export const useAppStore = defineStore('mobile-app', {
   state: () => ({
     ready: false,
     connected: false,
+    // 配对失效（token 过期/被轮换，shim 4401 后置位）：需重新扫码
+    pairInvalid: false,
     version: '',
+    // 人设：仅取智能体名称用于交互层展示（品牌文案不变；移动端不提供人设配置）
+    agentName: '星瑶',
     // 会话
     sessionGroups: [] as SessionGroup[],
     currentSession: '',
@@ -129,6 +210,9 @@ export const useAppStore = defineStore('mobile-app', {
     // @ 引用与斜杠命令数据源
     fileTree: [] as FileNode[],
     skills: [] as Record<string, any>[],
+    mcps: [] as Record<string, any>[],
+    // 思考强度（随当前模型变化）
+    reasoning: { ...REASONING_DEFAULT } as ReasoningSnapshot,
     // 流式
     currentStreamingText: '',
     currentThinkingText: '',
@@ -200,12 +284,17 @@ export const useAppStore = defineStore('mobile-app', {
         this.models = (st.models || []).map((m: any) => ({ id: String(m.id || ''), name: m.name ? String(m.name) : undefined, provider: m.provider ? String(m.provider) : undefined }));
         this.permissionMode = String(st.permission_mode || 'confirm');
         this.version = String(st.version || '');
+        // 人设名称（交互层展示用；后端仅在用户自定义时注入提示词）
+        const persona = (st.persona_settings || {}) as Record<string, any>;
+        this.agentName = String(persona.agent_name || '星瑶');
         this.messages = normalizeMessages(st.messages || []);
         this.historyHasMore = !!st.history_has_more;
         this.historyOldestId = st.history_oldest_id ?? null;
         this.tokenUsage = (st.token_usage || { used: 0, window: 0, cached_pct: 0, cumulative: 0 }) as TokenUsage;
         this.fileTree = (st.file_tree || []) as FileNode[];
         this.skills = (st.skills || []) as Record<string, any>[];
+        this.mcps = (st.mcps || []) as Record<string, any>[];
+        this.reasoning = (st.reasoning || { ...REASONING_DEFAULT }) as ReasoningSnapshot;
         this.runningSessions = Array.isArray(st.active_sessions) ? st.active_sessions.map(String) : [];
         this.queues = {};
         const qs = st.message_queues as Record<string, any[]> | undefined;
@@ -222,16 +311,52 @@ export const useAppStore = defineStore('mobile-app', {
           this.currentStreamingText = String(snap.streaming_text || '');
         }
         this.connected = true;
+        this.pairInvalid = false;
+        void this.fetchActivePermission(true);
       } catch (e: any) {
         this.connected = false;
         throw e;
       }
     },
 
+    /** 权限事件 / 快照统一入队（幂等） */
+    upsertPermRequest(data: Record<string, any>, sessionName = '') {
+      const req: PermRequest = {
+        requestId: String(data.request_id || ''),
+        sessionName: sessionName || String(data.session_name || ''),
+        summary: String(data.summary || data.function_name || ''),
+        functionName: String(data.function_name || ''),
+        allowAlways: !!data.allow_always,
+        options: Array.isArray(data.options) ? data.options.map(String) : [],
+        permissionOptions: Array.isArray(data.permission_options)
+          ? data.permission_options.map((o: any) => ({ key: String(o?.key || ''), label: String(o?.label || '') })).filter((o: PermOption) => o.key && o.label)
+          : [],
+        undoImpact: (data.undo_impact && typeof data.undo_impact === 'object') ? data.undo_impact : null,
+      };
+      if (req.requestId && !this.permRequests.some((p) => p.requestId === req.requestId)) {
+        this.permRequests.push(req);
+      }
+      return req;
+    },
+
+    /**
+     * 拉取当前未决权限快照（断线/重连后补齐错过的事件）。
+     * clearWhenEmpty：RPC 可用且确认无未决时清掉残留失效项；旧版桥无此方法时忽略。
+     */
+    async fetchActivePermission(clearWhenEmpty = false) {
+      try {
+        const r = await rpc<Record<string, any>>('get_active_permission');
+        const data = r?.permission;
+        if (data && data.request_id) { this.upsertPermRequest(data); return; }
+        if (clearWhenEmpty && this.permRequests.length) this.permRequests = [];
+      } catch { /* 旧版桥无 get_active_permission：忽略 */ }
+    },
+
     startHeartbeat() {
       if ((this as any)._hbTimer) return;
       (this as any)._hbTimer = setInterval(async () => {
         if (document.visibilityState !== 'visible') return;
+        if (this.pairInvalid) return; // 配对失效：不再无谓探测，等重新扫码
         try {
           const u = await rpc<Record<string, any>>('get_token_usage');
           this.applyUsage(u);
@@ -275,8 +400,10 @@ export const useAppStore = defineStore('mobile-app', {
       const st = await rpc<Record<string, any>>('switch_session', name);
       this.currentSession = String(st.session_name || name);
       this.currentWorkdir = String(st.workdir || '');
-      this.activeModelId = String((st.session_model || {}).id || this.activeModelId);
-      this.activeModelName = String((st.session_model || {}).name || this.activeModelName);
+      // switch_session 返回 active_model_id/name 与 reasoning（旧实现误读 session_model）
+      this.activeModelId = String(st.active_model_id || this.activeModelId);
+      this.activeModelName = String(st.active_model_name || this.activeModelName);
+      if (st.reasoning) this.reasoning = st.reasoning as ReasoningSnapshot;
       this.messages = normalizeMessages(st.messages || []);
       this.historyHasMore = !!st.history_has_more;
       this.historyOldestId = st.history_oldest_id ?? null;
@@ -288,6 +415,7 @@ export const useAppStore = defineStore('mobile-app', {
       await this.refreshSessions();
       await this.refreshUsage();
       void this.refreshUndoStates();
+      void this.fetchActivePermission(true);
     },
 
     async loadOlder() {
@@ -443,8 +571,31 @@ export const useAppStore = defineStore('mobile-app', {
     },
 
     async setModel(modelId: string) {
-      await rpc('set_model', modelId, this.currentSession);
-      this.activeModelId = modelId;
+      const r = await rpc<Record<string, any>>('set_model', modelId, this.currentSession);
+      this.activeModelId = String(r?.active_model_id || modelId);
+      if (r?.active_model_name) this.activeModelName = String(r.active_model_name);
+      if (r?.reasoning) this.reasoning = r.reasoning as ReasoningSnapshot;
+    },
+
+    /** 设置思考强度/开关（下一轮请求生效）；乐观更新 + 失败回滚 */
+    async setReasoning(choice: string) {
+      const prev = this.reasoning;
+      this.reasoning = { ...prev, choice };
+      try {
+        const r = await rpc<Record<string, any>>('set_reasoning_choice', this.activeModelId, choice);
+        if (!r || r.ok === false) throw new Error(r?.msg || '设置失败');
+        if (r.reasoning) this.reasoning = r.reasoning as ReasoningSnapshot;
+        return r?.msg as string | undefined;
+      } catch (e) {
+        this.reasoning = prev;
+        throw e;
+      }
+    },
+
+    /** 工作区文件检索（@ 引用文件，与客户端 search_workspace_files 一致） */
+    async searchWorkspaceFiles(query: string, limit = 20): Promise<string[]> {
+      const r = await rpc<Record<string, any>>('search_workspace_files', query, limit);
+      return ((r?.files || []) as string[]).map(String);
     },
 
     // ---- 事件语义（appStore.ts 子集） ----
@@ -461,6 +612,13 @@ export const useAppStore = defineStore('mobile-app', {
     applyEvent(type: string, data: Record<string, any>) {
       const session = String(data.session_name || '');
       const terminal = type === 'turn_finish' || type === 'turn_cancelled' || type === 'turn_error' || type === 'turn_idle';
+
+      // 配对失效（shim 收到 4401）：停止一切交互，等待用户重新扫码
+      if (type === 'pair_invalid') {
+        this.pairInvalid = true;
+        this.connected = false;
+        return;
+      }
 
       if (type === 'turn_start') {
         const s = session || this.runningSessions[0] || '';
@@ -607,7 +765,7 @@ export const useAppStore = defineStore('mobile-app', {
         const calls = last.tool_calls ?? (last.tool_calls = []);
         const id = String(data.id || '');
         if (!calls.some((c) => c.id === id)) {
-          calls.push({ id: id || `ui-${calls.length + 1}`, name: String(data.name || 'tool'), label: String(data.label || data.name || 'tool') });
+          calls.push({ id: id || `ui-${calls.length + 1}`, name: String(data.name || 'tool'), label: String(data.label || data.name || 'tool'), display: data.display || undefined });
         }
         return;
       }
@@ -619,9 +777,14 @@ export const useAppStore = defineStore('mobile-app', {
         const calls = last.tool_calls ?? (last.tool_calls = []);
         const id = String(data.id || '');
         const call = calls.find((c) => c.id === id);
-        const result = { ok: !!data.ok, summary: String(data.summary || ''), result: String(data.result || data.error || ''), duration_ms: data.duration_ms != null ? Number(data.duration_ms) : undefined };
-        if (call) call.result = result;
-        else calls.push({ id: id || `orphan-${calls.length + 1}`, name: String(data.name || 'tool'), label: String(data.label || data.name || 'tool'), result });
+        const display = data.display || undefined;
+        const result = { ok: !!data.ok, summary: String(data.summary || ''), result: String(data.result || data.error || ''), duration_ms: data.duration_ms != null ? Number(data.duration_ms) : undefined, display };
+        if (call) {
+          call.result = result;
+          if (display) call.display = display;
+        } else {
+          calls.push({ id: id || `orphan-${calls.length + 1}`, name: String(data.name || 'tool'), label: String(data.label || data.name || 'tool'), display, result });
+        }
         return;
       }
 
@@ -651,21 +814,7 @@ export const useAppStore = defineStore('mobile-app', {
       }
 
       if (type === 'permission_request') {
-        const req: PermRequest = {
-          requestId: String(data.request_id || ''),
-          sessionName: session,
-          summary: String(data.summary || data.function_name || ''),
-          functionName: String(data.function_name || ''),
-          allowAlways: !!data.allow_always,
-          options: Array.isArray(data.options) ? data.options.map(String) : [],
-          permissionOptions: Array.isArray(data.permission_options)
-            ? data.permission_options.map((o: any) => ({ key: String(o?.key || ''), label: String(o?.label || '') })).filter((o: PermOption) => o.key && o.label)
-            : [],
-          undoImpact: (data.undo_impact && typeof data.undo_impact === 'object') ? data.undo_impact : null,
-        };
-        if (req.requestId && !this.permRequests.some((p) => p.requestId === req.requestId)) {
-          this.permRequests.push(req);
-        }
+        this.upsertPermRequest(data, session);
         return;
       }
 
@@ -715,7 +864,13 @@ export const useAppStore = defineStore('mobile-app', {
         if (!session || session === this.currentSession) {
           this.activeModelId = String(data.model_id || this.activeModelId);
           this.activeModelName = String(data.model_name || data.model_id || this.activeModelName);
+          if (data.reasoning) this.reasoning = data.reasoning as ReasoningSnapshot;
         }
+        return;
+      }
+
+      if (type === 'mcp_status') {
+        if (Array.isArray(data.mcps)) this.mcps = data.mcps as Record<string, any>[];
         return;
       }
 

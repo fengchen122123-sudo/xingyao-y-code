@@ -4145,6 +4145,51 @@ class ApiBridge(GitBridgeMixin):
         except Exception:
             return {}
 
+    def _permission_event_payload(self, request) -> Dict[str, Any]:
+        """构造权限请求事件 payload（permission_request 事件与 get_active_permission 快照共用）。"""
+        from core.tool_presenter import describe_permission_request
+        options = list(request.options or ())
+        permission_options = [
+            {"key": key, "label": label}
+            for key, label in zip(request.option_keys, options)
+        ]
+        owner_map = getattr(self, "_turn_owner_sessions", {}) or {}
+        return {
+            "session_name": owner_map.get(request.parent_turn_id)
+            or _session_from_turn_id(request.parent_turn_id),
+            "request_id": request.request_id,
+            "function_name": request.function_name,
+            # 兼容字段：部分旧界面读 tool_name / details
+            "tool_name": request.function_name,
+            "arguments": dict(request.arguments or {}),
+            "details": dict(request.arguments or {}),
+            # 人类可读描述（执行什么命令 / 查看什么文件），前端直接展示
+            "summary": describe_permission_request(
+                request.function_name, dict(request.arguments or {})
+            ),
+            "source": request.source,
+            "options": options,
+            "permission_options": permission_options,
+            # 按回合撤销：undo_turn 权限卡附带服务预检的影响摘要（只读）
+            "undo_impact": self._undo_turn_impact_for_event(request),
+            # 沙盒外访问等场景只给 同意/拒绝 两项，不渲染"总是允许"
+            "allow_always": len(options) >= 3,
+        }
+
+    def get_active_permission(self) -> Dict[str, Any]:
+        """返回当前未决的权限请求快照（与 permission_request 事件同构）；无则 permission=None。
+
+        供移动端在初始化/切换会话/断线重连后补齐错过的事件，避免审批静默丢失。
+        """
+        try:
+            req = permission_broker.active_request()
+            if req is None:
+                return {"ok": True, "permission": None}
+            return {"ok": True, "permission": self._permission_event_payload(req)}
+        except Exception as e:
+            logger.exception("get_active_permission 失败")
+            return {"ok": False, "msg": str(e)}
+
     def _activate_permission_request(self, request):
         """broker 激活某个请求 → 推送到前端对话流内联卡片，并挂一个"超时即拒绝"的定时器。"""
         # 星轨自动化（规格 5.5）：无人值守回合的权限请求立即自动拒绝——
@@ -4160,33 +4205,7 @@ class ApiBridge(GitBridgeMixin):
             self._auto_deny_automation_permission(request, automation_label)
             return
         try:
-            from core.tool_presenter import describe_permission_request
-            options = list(request.options or ())
-            permission_options = [
-                {"key": key, "label": label}
-                for key, label in zip(request.option_keys, options)
-            ]
-            self.emit_event("permission_request", {
-                "session_name": self._turn_owner_sessions.get(request.parent_turn_id)
-                or _session_from_turn_id(request.parent_turn_id),
-                "request_id": request.request_id,
-                "function_name": request.function_name,
-                # 兼容字段：部分旧界面读 tool_name / details
-                "tool_name": request.function_name,
-                "arguments": dict(request.arguments or {}),
-                "details": dict(request.arguments or {}),
-                # 人类可读描述（执行什么命令 / 查看什么文件），前端直接展示
-                "summary": describe_permission_request(
-                    request.function_name, dict(request.arguments or {})
-                ),
-                "source": request.source,
-                "options": options,
-                "permission_options": permission_options,
-                # 按回合撤销：undo_turn 权限卡附带服务预检的影响摘要（只读）
-                "undo_impact": self._undo_turn_impact_for_event(request),
-                # 沙盒外访问等场景只给 同意/拒绝 两项，不渲染"总是允许"
-                "allow_always": len(options) >= 3,
-            })
+            self.emit_event("permission_request", self._permission_event_payload(request))
         except Exception:
             logger.exception("推送权限请求失败")
 

@@ -79,7 +79,7 @@ function isAsk(it: PermRequest): boolean {
   return it.functionName === 'ask_user';
 }
 function kindLabel(it: PermRequest): string {
-  if (isAsk(it)) return '星瑶 提问';
+  if (isAsk(it)) return `${store.agentName} 提问`;
   if (it.functionName === 'undo_turn') return '撤销此回合';
   if (it.permissionOptions.length) return '权限请求';
   return '命令待审批';
