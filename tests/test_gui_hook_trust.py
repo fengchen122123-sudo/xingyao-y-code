@@ -142,3 +142,19 @@ def test_hook_workspace_root_resolves_session_workdir(tmp_path):
     bridge = _bare_bridge(workdir=str(tmp_path))
 
     assert bridge._hook_workspace_root() == _resolved(tmp_path)
+
+
+def test_workspace_identity_parity_between_gui_and_runtime(tmp_path):
+    """P2-2 口径一致性：GUI 的 _resolve_real_path 与运行时 workspace_identity 同口径。
+
+    GUI 侧 _hook_workspace_root() 先过 _resolve_real_path 再交给 trust 层；
+    运行时（registry/runner）直接吃原始 workdir。两条路径经
+    normalize_workspace_identity 归一后必须是同一 workspace_identity，
+    否则 GUI 的授权/撤销会写进与运行时读取不同的信任条目（信任永远不生效）。
+    """
+    gui_identity = hook_trust.normalize_workspace_identity(
+        gui_bridge._resolve_real_path(str(tmp_path))
+    )
+    runtime_identity = hook_trust.normalize_workspace_identity(str(tmp_path.resolve()))
+
+    assert gui_identity == runtime_identity

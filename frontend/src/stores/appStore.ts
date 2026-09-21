@@ -4191,11 +4191,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
         const res = await (api as any)[method](digest);
         if (res && res.ok) {
           this.hooks = res.hooks || this.hooks;
+          // 递增刷新序号：本次动作已拿到最新快照，在途的旧 refreshHooks 响应作废
+          this.hooksReqSeq++;
         } else if (res && res.msg) {
           this.notifyModal('Hook 信任', res.msg);
         }
       } catch (err) {
-        this.connected = false;
+        // 连接状态由事件流维护：信任动作失败不等于桥接断线，不在此误置 connected
+        console.error('Hook 信任操作失败:', err);
         this.notifyModal('Hook 信任', 'Hook 信任操作失败: ' + err);
       }
     },
