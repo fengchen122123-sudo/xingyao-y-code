@@ -122,6 +122,28 @@ def test_collect_non_list_result_does_not_break_observe(backend, caplog):
     assert observation.elements == ()
 
 
+def test_observe_discards_elements_when_page_changes_during_collect(backend):
+    """收集期间页面变化（同页导航）：元素与页面身份快照不同源 → 清空回落截图。
+
+    对齐「截图后复核」语义（E1 评审修复）：收集完成后复核页面 token 与 URL，
+    不一致时元素整体作废，但截图与 URL 快照仍按既有语义返回。
+    """
+    page = backend.active_page
+    page.url = "https://example.com/step-1"
+    page.element_collect_result = [dict(_ELEMENT)]
+
+    def _navigate_during_collect(fake_page):
+        fake_page.url = "https://example.com/step-2"
+
+    page.element_collect_hook = _navigate_during_collect
+    observation = backend.observe("run-a")
+    assert observation.elements == ()
+    assert backend._observed_element_refs == frozenset()
+    # 元素不可用回落截图路径（产品决定）：截图与 URL 快照仍完整
+    assert observation.png_path
+    assert observation.page_origin == "https://example.com"
+
+
 # ---------------- ④ 确定性（T-E1-6） ----------------
 
 

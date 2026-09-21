@@ -159,6 +159,14 @@ def test_max_elements_and_name_truncation(edge_page):
     assert len(truncated[0]["name"]) == 80
 
 
+def test_name_truncation_counts_code_points_not_utf16_units(edge_page):
+    """E1 评审修复：非 BMP 字符（emoji）按码点截断，不被 UTF-16 代理对切半。"""
+    truncated = _collect(edge_page, f"<button>{'😀' * 100}</button>")
+    assert truncated[0]["name"] == "😀" * 80
+    mixed = _collect(edge_page, f"<button>{'a' + '😀' * 100}</button>")
+    assert mixed[0]["name"] == "a" + "😀" * 79
+
+
 # ---------------- 隐私 ----------------
 
 

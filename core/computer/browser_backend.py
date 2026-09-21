@@ -213,7 +213,9 @@ ELEMENT_COLLECT_SCRIPT = """() => {
     out.push({
       ref: ref,
       kind: deriveKind(el),
-      name: deriveName(el).slice(0, MAX_NAME),
+      // 按码点截断（Array.from），避免 UTF-16 代理对（emoji 等）被切半；
+      // 与 Python 侧 [:_ELEMENT_MAX_NAME_CHARS] 的码点语义对齐。
+      name: Array.from(deriveName(el)).slice(0, MAX_NAME).join(''),
       bounds: [
         Math.round(rect.left), Math.round(rect.top),
         Math.round(rect.right), Math.round(rect.bottom)
@@ -1490,6 +1492,14 @@ class BrowserComputerBackend:
         origin = f"{parts.scheme}://{parts.netloc}"
         # E1：截图与页面复核完成后收集可交互元素；收集失败/为空都回落截图路径。
         elements = self._collect_interactive_elements(page)
+        if elements and (
+            self._page_token(self._resolve_active_page()) != page_token
+            or (page.url if isinstance(page.url, str) else "") != url
+        ):
+            # 收集期间页面再次变化（活动页切换 / 同页导航）：元素与页面身份
+            # 快照不同源，整体清空回落截图路径（E2 的 ref 集合随之置空，
+            # 旧引用由 stale 校验拒绝）。
+            elements = ()
         path = self._store_screenshot(png_bytes)
         if self._observed_page_token != page_token:
             self._surface_generation += 1
