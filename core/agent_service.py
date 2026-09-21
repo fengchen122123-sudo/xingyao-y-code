@@ -1014,6 +1014,22 @@ def prepare_turn_messages(
             runtime_provider=lambda: runtime
         ).build_per_request_reminders()
     )
+    # C8（规格 01 §6.2）：会话创建或恢复后的首次回合准备时运行 SessionStart
+    # hook；其追加上下文与时间注记同通道内联到最后一条 user 消息，不产生新的
+    # system 消息。进程内记账保证每会话至多一次；无 hook 时恒为空串（零影响）。
+    try:
+        from core.hooks.lifecycle import (
+            get_default_hook_runner,
+            session_start_context_text,
+        )
+
+        session_start_note = session_start_context_text(
+            get_default_hook_runner(), session_id=session_name
+        )
+    except Exception:
+        session_start_note = ""
+    if session_start_note:
+        time_note = f"{time_note}\n\n{session_start_note}"
     try:
         summary_msg = build_background_task_summary(session_name)
     except Exception:

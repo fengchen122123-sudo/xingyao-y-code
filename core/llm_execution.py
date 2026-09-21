@@ -760,6 +760,7 @@ def _build_tool_pipeline_and_context(
 ):
     from core.harness.tool_adapters import ToolAdapterSet
     from core.harness.tool_pipeline import ToolExecutionContext, ToolPipeline
+    from core.hooks.lifecycle import get_default_hook_runner
     from core.tool_registry import ToolRegistry
 
     active_tool_registry = _get_active_tool_registry()
@@ -807,6 +808,9 @@ def _build_tool_pipeline_and_context(
         mcp_manager=_adapter("_get_mcp_manager", _get_mcp_manager)(),
         computer_lease=computer_lease,
         computer_native_selection=computer_native_selection,
+        # C6/C7 接线：注入默认 HookRunner（进程内单例）。无 hooks 配置时
+        # runner 各层快速短路，工具链行为与字节保持改造前完全一致（H-T16）。
+        hook_runner=get_default_hook_runner(),
     )
     pipeline = ToolPipeline(
         adapters,

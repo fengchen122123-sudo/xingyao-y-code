@@ -1110,6 +1110,8 @@ def _chat_with_model_generator(
     slow_step_nudge_count = 0
     # D 方案：验证声明护栏已触发的提醒次数（随本轮会话循环生命周期）。
     verify_claim_nudge_count = 0
+    # C8/C9：本回合工具调用总次数（Stop hook 输入字段；无 hooks 配置时零影响）。
+    turn_tool_call_count = 0
     # 本回合是否出现过写入类/命令执行类工具（按工具名累计，只读不写请求）。
     used_write_tools = False
     used_command_tools = False
@@ -2493,6 +2495,46 @@ def _chat_with_model_generator(
                         if current_step is not None and turn + 1 < max_turns:
                             current_step.complete()
                         continue
+                # C8/C9（规格 01 §5.2/§5.5）：Stop hook——模型准备结束回合时询问
+                # 用户配置的 Stop hook；请求续跑且未达上限（5 次）时注入上下文
+                # 继续下一轮，超限强制结束并告警。无 hooks 配置时 evaluate_stop
+                # 返回 None，整段零开销、行为与改造前完全一致。
+                try:
+                    from core.hooks.lifecycle import (
+                        evaluate_stop,
+                        get_default_hook_runner,
+                        get_stop_continue_state,
+                    )
+
+                    _stop_decision = evaluate_stop(
+                        get_stop_continue_state(),
+                        get_default_hook_runner(),
+                        session_id=parent_session,
+                        turn_id=parent_turn_id,
+                        response_preview=str(public_content or "")[:200],
+                        tool_call_count=turn_tool_call_count,
+                    )
+                except Exception:
+                    _stop_decision = None
+                if (
+                    _stop_decision is not None
+                    and _stop_decision.get("continue")
+                    and turn + 1 < max_turns
+                ):
+                    for _stop_msg in _stop_decision.get("messages") or ():
+                        messages.append(_stop_msg)
+                        pending_persistence.append(("user", _stop_msg))
+                    flush_persistence()
+                    progress_guard.observe(
+                        _step_progress_observation(None, session_id=parent_session)
+                    )
+                    if current_step is not None and turn + 1 < max_turns:
+                        current_step.complete()
+                    continue
+                if _stop_decision is not None and _stop_decision.get("limit_hit"):
+                    _notify_event(event_callback, "notice", {
+                        "message": str(_stop_decision.get("warning") or ""),
+                    })
                 # 模型未调用工具且未生成任何正文：给出明确提示，避免 UI 在
                 # "思考完成" 后陷入沉默（常见于某些模型只输出 reasoning 或空回复）。
                 # 判断用促升前的原始正文（raw_content_meaningful）：促升兜底本身
@@ -2557,6 +2599,8 @@ def _chat_with_model_generator(
                 continue
 
             tool_activity_seen = True
+            # C8/C9：累计本回合工具调用总次数（Stop hook 的 tool_call_count 输入）。
+            turn_tool_call_count += len(tool_calls_list)
             # D 方案：累计本回合的工具类别（写入类/命令执行类），供收尾时的验证
             # 声明护栏判定；只看本轮已发的 tool_calls，不改动请求或执行流程。
             step_used_write_tools, step_used_command_tools = _tool_call_activity_kinds(
