@@ -322,3 +322,42 @@ def test_mcp_reserved_schemas_are_filtered_from_tools_schema(monkeypatch):
     }
     assert "computer_action" not in names
     assert "remote" in names
+
+
+# ── A2：side_effect_scope 契约校验（03 规格 3.2） ──
+
+_VALID_SIDE_EFFECT_SCOPES = {"none", "workspace", "git", "network", "system"}
+
+# build_default_registry 的 31 个内置工具（不含插件与固定 computer 适配器）
+_BUILTIN_TOOL_NAMES = (
+    "read_file", "list_directory", "search_code", "find_definition", "search_news",
+    "fetch_url", "get_weather", "glob_files", "automation_list", "ask_user",
+    "plan_write", "plan_update", "plan_read", "plan_retry", "plan_resume_takeover",
+    "plan_finish", "write_file", "edit_file", "fetch_image", "undo_turn",
+    "execute_command", "manage_task", "run_subagent", "mcp_add_server",
+    "mcp_remove_server", "mcp_set_enabled", "mcp_list_servers", "automation_create",
+    "automation_update", "automation_delete", "automation_run_now",
+)
+
+
+def test_all_builtin_tools_have_valid_side_effect_scope():
+    """所有内置工具的 side_effect_scope 非空且属于合法集合（03 规格 T-T10）。"""
+    registry = build_default_registry()
+
+    for name in _BUILTIN_TOOL_NAMES:
+        scope = registry.get(name).side_effect_scope
+        assert scope, f"{name} 的 side_effect_scope 不得为空"
+        assert scope in _VALID_SIDE_EFFECT_SCOPES, f"{name} 的 scope 非法: {scope!r}"
+
+
+def test_side_effect_scope_matches_spec_categories():
+    """03 规格 3.2 取值表的代表性归类不得漂移。"""
+    registry = build_default_registry()
+
+    assert registry.get("read_file").side_effect_scope == "none"
+    assert registry.get("plan_read").side_effect_scope == "none"
+    assert registry.get("fetch_url").side_effect_scope == "network"
+    assert registry.get("fetch_image").side_effect_scope == "network"
+    assert registry.get("write_file").side_effect_scope == "workspace"
+    assert registry.get("undo_turn").side_effect_scope == "workspace"
+    assert registry.get("execute_command").side_effect_scope == "system"

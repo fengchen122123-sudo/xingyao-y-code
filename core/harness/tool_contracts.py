@@ -42,6 +42,9 @@ def resolve_tool(name, registry: ToolRegistry, mcp_manager) -> ResolvedTool:
             requires_permission=False,
             cancellable=True,
             parallel_safe=False,
+            # MCP 是外部工具，行为不可知：保守归 system（03 规格 3.3），
+            # v1 仅作契约元数据，不改变既有权限与调度判定。
+            side_effect_scope="system",
         )
         return ResolvedTool(spec=spec, source="mcp", execute=spec.execute)
     return ResolvedTool(
