@@ -430,7 +430,7 @@ export interface PermReqState {
   undoImpact?: Record<string, any> | null;
 }
 
-export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations';
+export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations' | 'hooks';
 
 const speedTracker = new StreamingSpeedTracker();
 
