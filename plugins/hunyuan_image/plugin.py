@@ -60,4 +60,8 @@ def register(registry):
         cancellable=True,            # 生图耗时长，允许用户中断
         parallel_safe=False,
         activity_description="混元生图中（约 10~60 秒）",
+        # 规格 03 §3.2 取值表：生图类工具（hunyuan_generate_image /
+        # tokenrhythm_*）归 network——会发起外部网络请求；此处补全声明，
+        # 避免取默认 none 与契约表漂移（A 阶段评审修复）。
+        side_effect_scope="network",
     ))

@@ -417,6 +417,9 @@ _PERMISSION_KWARGS = dict(
     requires_permission=True,    # 写操作走用户审批
     cancellable=True,            # 生图耗时长，允许用户中断
     parallel_safe=False,
+    # 规格 03 §3.2 取值表：tokenrhythm_* 生图类工具归 network（发起外部
+    # 网络请求）；两个工具共享本 kwargs，此处统一补全声明（A 阶段评审修复）。
+    side_effect_scope="network",
 )
 
 
