@@ -114,15 +114,37 @@ def test_parse_element_actions():
     )
 
 
-def test_element_actions_reject_browser_target():
+def test_element_actions_allow_browser_except_list_elements():
+    """E2 有意协议变更：click_element / set_value_element 支持 browser target。
+
+    变更前这两个动作是 desktop 专属；E2 后浏览器 observe 携带元素列表（el-N），
+    元素动作按 ref 走 Playwright locator 通路。list_elements 仍为桌面专属：
+    浏览器版职责由 observe 直接承担（设计 3.1），不提供独立动作。
+    """
     from core.computer.actions import parse_computer_action
 
-    with pytest.raises(ComputerControlError):
-        parse_computer_action(
-            {"kind": "click_element", "target": "browser", "element_ref": "el-1"}
-        )
-    with pytest.raises(ComputerControlError):
+    click = parse_computer_action(
+        {"kind": "click_element", "target": "browser", "element_ref": "el-1"}
+    )
+    assert click.element_ref == "el-1"
+    set_value = parse_computer_action(
+        {"kind": "set_value_element", "target": "browser",
+         "element_ref": "el-2", "text": "中文内容"}
+    )
+    assert set_value.element_ref == "el-2"
+    assert set_value.text == "中文内容"
+    with pytest.raises(ComputerControlError) as exc:
         parse_computer_action({"kind": "list_elements", "target": "browser"})
+    assert exc.value.code == "computer_invalid_action"
+
+
+def test_desktop_only_kinds_reflect_e2_protocol_change():
+    """白名单断言：click/set_value 已移除（双 target），list_elements 仍桌面专属。"""
+    from core.computer.actions import _DESKTOP_ONLY_KINDS
+
+    assert "click_element" not in _DESKTOP_ONLY_KINDS
+    assert "set_value_element" not in _DESKTOP_ONLY_KINDS
+    assert "list_elements" in _DESKTOP_ONLY_KINDS
 
 
 def test_summary_includes_element_ref():

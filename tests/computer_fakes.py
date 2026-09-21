@@ -24,6 +24,9 @@ Task 16 给 FakeComputerBackend 增补 png_path（观察携带的虚拟截图路
 真实文件，供预览发布接线与隐私审计测试）。
 元素定位修复 E1 给 FakePage 增补元素收集脚本注入点（element_collect_result /
 element_collect_error，默认空列表，保证既有测试零影响）。
+元素定位修复 E2 给 FakePage 增补 locator 记录点（locator_calls / last_locator，
+FakeLocator 记录 click/fill 参数并支持异常注入），FakeKeyboard 增补 type
+（set_value_element 的键盘回落路径）。
 其余请求捕获 helper 由后续 Task 按需在本文件扩展，禁止平行实现。
 """
 
@@ -219,6 +222,11 @@ class FakeKeyboard:
         self._runtime._record_call("keyboard.insert_text")
         self.calls.append(("insert_text", text))
 
+    def type(self, text, **kwargs):
+        # E2：set_value_element 的 fill 回落路径（点击聚焦 + 键盘逐字符输入）。
+        self._runtime._record_call("keyboard.type")
+        self.calls.append(("type", text))
+
     def down(self, key, **kwargs):
         self._runtime._record_call("keyboard.down")
         self._down_count += 1
@@ -231,6 +239,34 @@ class FakeKeyboard:
         self.calls.append(("up", key))
         if self.up_error is not None:
             raise self.up_error
+
+
+class FakeLocator:
+    """page.locator() fake（E2 元素动作）：记录 selector 与 click/fill 调用参数。
+
+    - ``click_calls``：按序记录 click 的 kwargs（含 timeout）；
+    - ``fill_calls``：按序记录 (text, kwargs)；
+    - ``click_error`` / ``fill_error``：注入异常，验证元素语义错误码与
+      set_value_element 的键盘回落路径；
+    - 绝不触碰真实页面 DOM 或 Playwright。
+    """
+
+    def __init__(self, selector):
+        self.selector = selector
+        self.click_calls = []
+        self.fill_calls = []
+        self.click_error = None
+        self.fill_error = None
+
+    def click(self, **kwargs):
+        self.click_calls.append(dict(kwargs))
+        if self.click_error is not None:
+            raise self.click_error
+
+    def fill(self, text, **kwargs):
+        self.fill_calls.append((text, dict(kwargs)))
+        if self.fill_error is not None:
+            raise self.fill_error
 
 
 class FakePage:
@@ -262,6 +298,13 @@ class FakePage:
         # error 非空时 evaluate 抛错，用于验证「收集失败不中断 observe」。
         self.element_collect_result = None
         self.element_collect_error = None
+        # E2 元素动作注入点：locator 调用记录（selector 列表）与最近创建的
+        # FakeLocator（供断言 click/fill 参数与异常注入路径）；两个预设字段
+        # 在 locator 创建时应用到新对象（execute 前设置即可注入失败）。
+        self.locator_calls = []
+        self.last_locator = None
+        self.locator_click_error = None
+        self.locator_fill_error = None
 
     def is_closed(self):
         self._runtime._record_call("page.is_closed")
@@ -285,6 +328,16 @@ class FakePage:
     def title(self):
         self._runtime._record_call("page.title")
         return self.page_title
+
+    def locator(self, selector):
+        """E2：返回记录型 FakeLocator；每次调用创建独立对象并记为最近对象。"""
+        self._runtime._record_call("page.locator")
+        self.locator_calls.append(selector)
+        locator = FakeLocator(selector)
+        locator.click_error = self.locator_click_error
+        locator.fill_error = self.locator_fill_error
+        self.last_locator = locator
+        return locator
 
     def goto(self, url, **kwargs):
         self._runtime._record_call("page.goto")

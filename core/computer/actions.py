@@ -48,9 +48,13 @@ _ALLOWED = {
 
 _TARGETS = ("browser", "desktop")
 _BROWSER_ONLY_KINDS = frozenset({"navigate", "back", "forward", "reload"})
+# E2（2026-09-21 元素定位修复）有意协议变更：click_element / set_value_element
+# 改为双 target 支持——浏览器 observe 自动携带元素列表（el-N），元素动作按 ref
+# 走同一套 Playwright locator 通路；list_elements 仍为桌面专属（浏览器版职责
+# 由 observe 直接承担，不提供独立动作，见设计规格 3.1）。
 _DESKTOP_ONLY_KINDS = frozenset(
     {"list_surfaces", "activate_surface", "invoke_surface", "observe_region",
-     "list_elements", "click_element", "set_value_element"}
+     "list_elements"}
 )
 _BUTTONS = frozenset({"left", "right", "middle"})
 _REASON_CODES = frozenset({"login_required", "captcha_required", "credential_required"})
