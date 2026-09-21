@@ -307,6 +307,22 @@ def test_click_element_failure_is_element_unsupported(backend):
     assert "点击失败" in exc.value.message
 
 
+def test_click_element_missing_after_reload_is_stale(backend):
+    """同 URL 整页重载/DOM 重建：三项校验看不出，locator 命中 0 → stale。
+
+    E2 评审修复：元素不在 DOM 时报 computer_element_stale 引导重新 observe，
+    而不是等 Playwright 超时误报 unsupported（白等且误导模型）。
+    """
+    _prepare_element(backend)
+    page = backend.active_page
+    page.locator_click_error = RuntimeError("element is not attached to the DOM")
+    page.locator_count = 0
+    with pytest.raises(ComputerControlError) as exc:
+        backend.execute("run-a", parse_computer_action(_click_payload()))
+    assert exc.value.code == "computer_element_stale"
+    assert "不存在" in exc.value.message
+
+
 def test_set_value_element_fallback_failure_is_unsupported(backend):
     """回落（点击 + 键盘）仍失败：与 click 失败语义对齐的元素错误码。"""
     _prepare_element(backend, kind="textbox", name="正文")
