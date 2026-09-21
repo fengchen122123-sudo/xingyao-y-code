@@ -9,6 +9,7 @@ core/llm.py 及其他核心模块通过此模块统一访问运行时状态，
 """
 
 from __future__ import annotations
+import contextlib
 import threading
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -143,8 +144,49 @@ def get_active_model_tuple() -> Optional[tuple]:
 # 权限相关
 # ---------------------------------------------------------------------------
 
+# 线程级权限档位：多会话并行时每个回合线程绑定自己的会话档位，鉴权路径
+# （get_permission_mode）据此判定，避免一个会话的档位污染其他会话。
+_permission_mode_tls = threading.local()
+
+
+def set_thread_permission_mode(mode: Any) -> None:
+    """绑定当前线程的权限档位（回合入口调用；传 None 解绑回退全局）。"""
+    if mode is None:
+        _permission_mode_tls.mode = None
+    else:
+        _permission_mode_tls.mode = normalize_permission_mode(mode)
+
+
+def get_thread_permission_mode() -> str | None:
+    """返回当前线程绑定的权限档位；未绑定返回 None。"""
+    return getattr(_permission_mode_tls, "mode", None)
+
+
+@contextlib.contextmanager
+def permission_mode_scope(mode: Any):
+    """线程内临时绑定权限档位，退出时恢复原值（支持嵌套）。
+
+    回合入口用会话生效档位包裹整段执行，回合期间档位冻结，下轮才可能变化。
+    与 workspace_scope 一样，裸设置在线程复用时可能残留，必须用 scope 恢复。
+    """
+    previous = getattr(_permission_mode_tls, "mode", None)
+    set_thread_permission_mode(mode)
+    try:
+        yield
+    finally:
+        _permission_mode_tls.mode = previous
+
+
 def get_permission_mode() -> str:
-    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。"""
+    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。
+
+    线程级绑定优先（多会话并行时每个回合线程持有自己的会话档位），未绑定时
+    回退到入口层注册的全局值。鉴权路径（core.permission_terminal）据此判定，
+    因此会话级完整访问档位必须经 set_thread_permission_mode 写入才能生效。
+    """
+    thread_mode = getattr(_permission_mode_tls, "mode", None)
+    if thread_mode is not None:
+        return normalize_permission_mode(thread_mode)
     ctx = _context
     if ctx is None:
         return normalize_permission_mode(_permission_mode_fallback)
