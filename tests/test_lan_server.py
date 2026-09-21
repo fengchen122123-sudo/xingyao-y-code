@@ -9,6 +9,19 @@ from core.lan_server import LanServer
 from gui_bridge import ApiBridge
 
 
+@pytest.fixture(autouse=True)
+def _no_config_writes(monkeypatch):
+    """屏蔽 lan_server 对真实 ~/.ycode/config.json 的写盘。
+
+    _issue_token/_persist_port 会把新 token/端口持久化到用户配置——单测
+    调用 get_bind_info()/start() 时会重签 token 并写盘，导致用户已扫码的
+    旧 token 全部失效（4401 invalid token）。测试实例一律不落盘。
+    """
+    import core.lan_server as lan_mod
+
+    monkeypatch.setattr(lan_mod, "_save_config_value", lambda *a, **k: None)
+
+
 def test_detect_lan_ip_non_loopback():
     ip = LanServer(bridge=None)._detect_lan_ip()
     assert ip and ip != "127.0.0.1"
@@ -737,3 +750,105 @@ def test_handle_ws_rejects_invalid_token_without_replay():
 
     assert ws.sent == []
     assert ws.closed is not None and ws.closed[0] == 4401
+
+
+# --------------------------------------------------------------------------- #
+# 独立移动端子应用（frontend-mobile/dist，/m/ 路径托管）
+# --------------------------------------------------------------------------- #
+
+def test_bind_url_supports_mobile_path():
+    srv = LanServer(bridge=None)
+    srv.port = 8765
+    srv.lan_ip = "192.168.1.5"
+    assert srv.bind_url("t1", path="/m/") == "http://192.168.1.5:8765/m/?token=t1"
+    # 缺尾斜杠自动补齐；缺前导斜杠自动补齐
+    assert srv.bind_url("t2", path="m") == "http://192.168.1.5:8765/m/?token=t2"
+
+
+def test_get_bind_info_mobile_path_embeds_m_prefix():
+    srv = LanServer(bridge=None)
+    srv.port = 8765
+    srv.lan_ip = "192.168.1.5"
+    info = srv.get_bind_info(path="/m/")
+    assert info["ok"]
+    assert "/m/?token=" in info["url"]
+
+
+@pytest.fixture()
+def mobile_dist(tmp_path, monkeypatch):
+    """构造一个最小 frontend-mobile/dist 并把 _mobile_dist_dir 指过去。"""
+    import core.lan_server as lan_mod
+
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(
+        "<html><head><title>x</title></head><body>m</body></html>", encoding="utf-8"
+    )
+    (dist / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
+    monkeypatch.setattr(
+        lan_mod.LanServer, "_mobile_dist_dir", staticmethod(lambda: str(dist))
+    )
+    return dist
+
+
+def _fake_request(path: str):
+    return type("R", (), {"path": path, "headers": {}})()
+
+
+def test_serve_mobile_index_injects_shim(mobile_dist):
+    srv = LanServer(bridge=None)
+    resp = srv._serve_mobile_index()
+    assert resp.status_code == 200
+    assert b"/m/mobile-shim.js" in resp.body
+    assert resp.headers["Cache-Control"] == "no-store"
+    # 桌面 index 注入路径不受影响（仍指向 /mobile-shim.js）
+    desktop = srv._serve_index()
+    assert b'src="/mobile-shim.js"' in desktop.body
+
+
+def test_serve_mobile_static_serves_assets_and_spa_fallback(mobile_dist):
+    srv = LanServer(bridge=None)
+    # 静态资源命中
+    resp = srv._serve_mobile_static("/m/assets/app.js")
+    assert resp.status_code == 200
+    assert resp.body == b"console.log(1)"
+    # SPA 深链（无扩展名）回退到移动端 index
+    deep = srv._serve_mobile_static("/m/convo/abc")
+    assert deep.status_code == 200
+    assert b"/m/mobile-shim.js" in deep.body
+    # 带扩展名的缺失资源 404
+    assert srv._serve_mobile_static("/m/assets/missing.js").status_code == 404
+
+
+def test_serve_mobile_static_blocks_traversal(mobile_dist, tmp_path):
+    srv = LanServer(bridge=None)
+    assert srv._serve_mobile_static("/m/../secret.txt").status_code == 404
+    assert srv._serve_mobile_static("/m/%2e%2e/secret.txt").status_code == 404
+
+
+def test_serve_http_routes_m_paths(mobile_dist):
+    srv = LanServer(bridge=None)
+    root = srv._serve_http(None, _fake_request("/m/"))
+    assert root.status_code == 200
+    assert b"/m/mobile-shim.js" in root.body
+    asset = srv._serve_http(None, _fake_request("/m/assets/app.js"))
+    assert asset.status_code == 200
+    assert asset.body == b"console.log(1)"
+    assert srv._serve_http(None, _fake_request("/m/mobile-shim.js")).status_code == 200
+    # 根路径仍路由到桌面 index（不注入 /m/ shim 引用）
+    desktop = srv._serve_http(None, _fake_request("/"))
+    assert desktop.status_code == 200
+    assert b'src="/mobile-shim.js"' in desktop.body
+
+
+def test_bridge_qr_mobile_flag_uses_m_path(monkeypatch):
+    """get_remote_bind_qr(mobile=True) 应绑定 /m/ 路径；默认仍是 /。"""
+    bridge = ApiBridge.__new__(ApiBridge)  # 跳过庞大 __init__
+
+    class _Srv:
+        def get_bind_info(self, force_new=False, path="/"):
+            return {"ok": True, "path": path}
+
+    monkeypatch.setattr(bridge, "_ensure_lan_server", lambda: _Srv())
+    assert bridge.get_remote_bind_qr()["path"] == "/"
+    assert bridge.get_remote_bind_qr(mobile=True)["path"] == "/m/"

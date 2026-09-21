@@ -250,9 +250,17 @@ class LanServer:
         # 3. 最后：hostname 解析
         return socket.gethostbyname(socket.gethostname())
 
-    def bind_url(self, token: str) -> str:
-        """生成手机扫码打开时携带配对 token 的绑定 URL。"""
-        return f"http://{self.lan_ip}:{self.port}/?token={token}"
+    def bind_url(self, token: str, path: str = "/") -> str:
+        """生成手机扫码打开时携带配对 token 的绑定 URL。
+
+        path 用于区分同一配对通道下的两个前端："/"（桌面 dist 响应式版）
+        与 "/m/"（frontend-mobile 独立移动端，co-team 风格界面）。
+        """
+        if not path.startswith("/"):
+            path = "/" + path
+        if not path.endswith("/"):
+            path += "/"
+        return f"http://{self.lan_ip}:{self.port}{path}?token={token}"
 
     def _verify_token(self, token) -> bool:
         """校验配对 token：非空、未过期、常量时间比较；_token_expires 为 None 表示永久有效。"""
@@ -378,19 +386,21 @@ class LanServer:
         except Exception:
             pass
 
-    def get_bind_info(self, force_new: bool = False) -> Dict:
+    def get_bind_info(self, force_new: bool = False, path: str = "/") -> Dict:
         """返回手机扫码绑定信息。
 
         token 固定策略：未过期直接复用（多次打开/应用重启 token 不变）；
         已过期自动重签；force_new=True（前端"刷新"按钮）强制重签并使旧
         token 立即失效。expires_in 返回剩余有效秒数（而非完整 TTL）。
+        path 指定绑定到哪个前端（"/" 桌面响应式版 / "/m/" 独立移动端），
+        两者共享同一配对 token 与 WS 通道。
         """
         if force_new or not self._token or (
             self._token_expires is not None and time.time() >= self._token_expires
         ):
             self._issue_token()
         token = self._token.decode()
-        url = self.bind_url(token)
+        url = self.bind_url(token, path=path)
         img = qrcode.make(url)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
@@ -630,6 +640,13 @@ class LanServer:
             return self._serve_index()
         if path == "/mobile-shim.js":
             return self._serve_shim()
+        if path in ("/m", "/m/") or path == "/m/index.html":
+            return self._serve_mobile_index()
+        if path == "/m/mobile-shim.js":
+            return self._serve_shim()
+        if path.startswith("/m/"):
+            # 独立移动端子应用：与桌面 dist 完全隔离的另一份静态资源
+            return self._serve_mobile_static(path)
         if path == "/theme":
             return self._serve_theme()
         if path == "/health":
@@ -717,6 +734,62 @@ class LanServer:
         if full != dist and not full.startswith(dist + os.sep):
             return self._http_404()
         if not os.path.isfile(full):
+            return self._http_404()
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._http_404()
+        return self._http_response(200, data, ctype)
+
+    # ------------------------------------------------------------------ #
+    # 独立移动端子应用（frontend-mobile/dist，/m/ 路径托管）
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _mobile_dist_dir() -> str:
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "frontend-mobile",
+            "dist",
+        )
+
+    def _serve_mobile_index(self) -> Response:
+        """读 frontend-mobile/dist/index.html，在 ``</head>`` 前注入 mobile-shim。
+
+        shim 引用走 /m/mobile-shim.js（与桌面端同一份 shim 文件与协议）；
+        index 禁缓存与 _serve_index 同理：保证手机端总能拿到最新 shim。
+        """
+        index_path = os.path.join(self._mobile_dist_dir(), "index.html")
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                html = f.read()
+        except OSError:
+            return self._http_404()
+        html = html.replace(
+            "</head>", '<script src="/m/mobile-shim.js"></script></head>', 1
+        )
+        return self._http_response(
+            200, html, "text/html; charset=utf-8", cache_control="no-store"
+        )
+
+    def _serve_mobile_static(self, path: str) -> Response:
+        """读 frontend-mobile/dist 下的静态文件，带路径穿越防护。
+
+        SPA history 回退：vue-router createWebHistory('/m/') 的深链
+        （如 /m/convo/xxx）刷新时按静态文件查找会落空——末段不含扩展名
+        的缺失路径一律回退到移动端 index.html；带扩展名的资源缺失照常 404。
+        """
+        dist = os.path.normpath(self._mobile_dist_dir())
+        rel = path[len("/m/"):] if path.startswith("/m/") else path.lstrip("/")
+        full = os.path.normpath(os.path.join(dist, rel))
+        if full != dist and not full.startswith(dist + os.sep):
+            return self._http_404()
+        if not os.path.isfile(full):
+            last_seg = rel.rstrip("/").split("/")[-1] if rel.rstrip("/") else ""
+            if "." not in last_seg:
+                return self._serve_mobile_index()
             return self._http_404()
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
         try:

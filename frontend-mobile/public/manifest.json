@@ -1,0 +1,11 @@
+{
+  "name": "星瑶移动端",
+  "short_name": "星瑶",
+  "start_url": "/m/",
+  "display": "standalone",
+  "background_color": "#1a1a18",
+  "theme_color": "#1a1a18",
+  "icons": [
+    { "src": "/m/favicon.svg", "sizes": "any", "type": "image/svg+xml" }
+  ]
+}
