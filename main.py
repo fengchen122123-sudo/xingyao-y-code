@@ -1009,6 +1009,7 @@ COMMAND_COMPLETIONS = [
     ("/git", "Git 工作台 (status/diff/stage/commit/branch/switch/fetch/pull/push/stash/log)"),
     ("/mcp", "MCP 服务管理 (status/tools/enable/disable/reconnect/edit)"),
     ("/plugins", "插件管理 (查看清单/enable|disable 禁启用/reload 刷新)"),
+    ("/hooks", "Hook 管理 (查看清单/信任确认/撤销)"),
     ("/skills", "技能管理 (list/refresh/enable/disable 或开选择器)"),
     ("/theme", "切换配色主题 (Nord, Cyberpunk, Matrix等)"),
     ("/permission", "切换安全权限级别 (confirm/accept_edits/plan/full)"),
@@ -2645,6 +2646,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/plugins</ansicyan>                             : 查看已安装的进程内插件 (名称/版本/来源/加载状态/提供的工具)"))
         print_formatted_text(HTML("  <ansicyan>/plugins enable|disable &lt;name&gt;</ansicyan>        : 启用/禁用指定插件 (写回 plugin.json，重启后生效)"))
         print_formatted_text(HTML("  <ansicyan>/plugins reload</ansicyan>                       : 重新扫描插件目录刷新清单 (不重启)"))
+        print_formatted_text(HTML("  <ansicyan>/hooks</ansicyan>                                : Hook 生命周期钩子管理 (查看清单/trust|deny|revoke|reset 序号 信任操作)"))
         print_formatted_text(HTML("  <ansicyan>/mcp</ansicyan>                                 : MCP 服务管理 (open/status/tools/enable/disable/reconnect/edit)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【4. 任务托管与后台进程】</ansiyellow></b>"))
@@ -3841,6 +3843,96 @@ def handle_slash_command(command_text):
             print_formatted_text(HTML(
                 "<ansired>⚠️ 未知子命令。用法: /plugins [enable &lt;name&gt;|disable &lt;name&gt;|reload]</ansired>"
             ))
+
+    elif cmd == "/hooks" or command_text.strip().startswith("/hooks "):
+        # Hook 生命周期钩子管理（规格 01 §8.4）：hook 执行不区分端；CLI 提供
+        # 只读清单与信任操作（写 ~/.ycode/hook_trust.json，与 GUI 共用同一存储）。
+        # 用法: /hooks                  -> 列出全部 hook（编号/事件/来源/状态/命令）
+        #       /hooks trust <序号>     -> 信任（pending/stale → trusted）
+        #       /hooks deny <序号>      -> 拒绝（pending → blocked，不再询问）
+        #       /hooks revoke <序号>    -> 撤销信任（trusted → revoked）
+        #       /hooks reset <序号>     -> 重置为待确认（blocked/revoked → pending）
+        from core.workspace_context import get_workdir
+        from core.hooks.trust import apply_hook_trust_action, list_hooks_with_status
+
+        sub_parts = command_text.strip().split()
+        sub = sub_parts[1].strip().lower() if len(sub_parts) > 1 else ""
+        workspace_root = str(get_workdir() or os.getcwd())
+
+        entries = []
+        try:
+            entries = list_hooks_with_status(workspace_root=workspace_root)
+        except Exception as e:
+            print_formatted_text(HTML(f"<ansired>⚠️ 读取 Hook 配置失败: {_esc(str(e))}</ansired>"))
+
+        if sub == "":
+            # 编号从 1 起，供 trust/deny/revoke/reset 引用（与 GUI 卡片同一数据源）
+            if not entries:
+                print_formatted_text(HTML("<ansiyellow>ℹ 未配置任何 Hook。</ansiyellow>"))
+                print_formatted_text(HTML(
+                    "<ansigray>  钩子文件: 用户级 ~/.ycode/hooks.json 、项目级 &lt;项目&gt;/.ycode/hooks.json</ansigray>"
+                ))
+            else:
+                print_formatted_text(HTML(f"<ansicyan>🪝 已发现 {len(entries)} 个 Hook:</ansicyan>"))
+                for idx, item in enumerate(entries, start=1):
+                    status = item.get("status")
+                    if status == "trusted":
+                        check = "<ansigreen>[✓]</ansigreen>"
+                        state = "<ansigreen>已信任</ansigreen>"
+                    elif status == "pending":
+                        check = "<ansiyellow>[~]</ansiyellow>"
+                        state = "<ansiyellow>待确认</ansiyellow>"
+                    elif status == "stale":
+                        check = "<ansiyellow>[~]</ansiyellow>"
+                        state = "<ansiyellow>配置已变更</ansiyellow>"
+                    elif status == "blocked":
+                        check = "<ansired>[x]</ansired>"
+                        state = "<ansired>已拒绝</ansired>"
+                    elif status == "revoked":
+                        check = "<ansigray>[ ]</ansigray>"
+                        state = "<ansigray>已撤销</ansigray>"
+                    else:
+                        check = "<ansigray>[?]</ansigray>"
+                        state = f"<ansigray>{_esc(str(status))}</ansigray>"
+                    scope_label = "用户级" if item.get("scope") == "user" else "项目级"
+                    command_preview = str(item.get("command") or "")
+                    if len(command_preview) > 70:
+                        command_preview = command_preview[:70] + "..."
+                    print_formatted_text(HTML(
+                        f"  [{idx}] {check} <b><ansicyan>{_esc(str(item.get('event') or '?'))}</ansicyan></b>"
+                        f"  <ansigray>{scope_label}</ansigray> · {state}  <ansigray>{_esc(command_preview)}</ansigray>"
+                    ))
+                print_formatted_text(HTML(
+                    "<ansigray>  使用 /hooks trust|deny|revoke|reset &lt;序号&gt; 管理信任（序号以最近一次 /hooks 输出为准）。</ansigray>"
+                ))
+
+        elif sub in ("trust", "deny", "revoke", "reset"):
+            # 序号解析：越界/非数字一律给用法提示，绝不带着无效下标去调信任操作
+            index_text = sub_parts[2].strip() if len(sub_parts) > 2 else ""
+            index = None
+            if index_text.isdigit():
+                try:
+                    index = int(index_text)
+                except ValueError:
+                    index = None  # 如 "²"：isdigit() 为真但 int() 不可解析
+            if index is None or not (1 <= index <= len(entries)):
+                print_formatted_text(HTML(
+                    f"<ansired>⚠️ 用法: /hooks {sub} &lt;序号&gt;（先运行 /hooks 查看编号）</ansired>"
+                ))
+            else:
+                # CLI 子命令用 trust，信任层动作名是 grant（与 GUI 卡片同一动作词汇）
+                action = "grant" if sub == "trust" else sub
+                ok, msg = apply_hook_trust_action(
+                    action, entries[index - 1]["digest"], workspace_root=workspace_root
+                )
+                if ok:
+                    print_formatted_text(HTML(f"<ansigreen>✔ {_esc(msg)}</ansigreen>"))
+                    print_formatted_text(HTML("<ansigray>  运行 /hooks 查看最新状态。</ansigray>"))
+                else:
+                    print_formatted_text(HTML(f"<ansired>⚠️ {_esc(msg)}</ansired>"))
+
+        else:
+            print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /hooks [trust|deny|revoke|reset &lt;序号&gt;]</ansired>"))
 
     elif cmd == "/usage" or cmd.startswith("/usage "):
         # Token 用量统计：按模型分桶，精确数值（不做缩写）
