@@ -94,6 +94,144 @@ _KEY_NAME_MAP = {
 # 表单值、凭据或其他 DOM 内容（隐私边界，设计 22）。
 _VISIBILITY_PROBE = "() => [document.visibilityState, document.hasFocus()]"
 
+# E1 元素列表的防御性截断上限（对齐桌面 windows_elements.py 的 MAX_NAME_CHARS；
+# 注入脚本内的 MAX_NAME 已做同样截断，这里兜底协议/求值结果的异常形态）。
+_ELEMENT_MAX_NAME_CHARS = 80
+
+# E1 浏览器元素收集脚本（设计 2.2~2.4）：一次 JS 求值收集视口内可交互元素。
+# - 隐私铁律：只读标签/ARIA/文本等结构信息，绝不读输入值、Cookie 或存储
+#   （脚本源码不得出现 .value / cookie / localStorage / sessionStorage 字样）；
+# - 确定性：querySelectorAll 的文档顺序 + 顺序编号，无随机数/时间戳，bounds
+#   取整方式固定（Math.round），同一页面状态产生逐字节相同的结果；
+# - 副作用：给选中元素打 data-ycode-ref 标记（E2 的 Playwright locator 依赖它；
+#   属性随页面生命周期结束自然消失，不主动清理、不监听不加事件）；
+# - 视口外元素不收集：模型看不到截图也无法点击，滚动后重新观察即可。
+ELEMENT_COLLECT_SCRIPT = """() => {
+  const SEL = [
+    'a[href]', 'button', 'input:not([type=hidden])', 'select', 'textarea',
+    '[role="button"]', '[role="link"]', '[role="textbox"]', '[role="checkbox"]',
+    '[role="radio"]', '[role="combobox"]', '[role="menuitem"]', '[role="tab"]',
+    '[role="switch"]', '[role="searchbox"]', '[role="option"]',
+    '[contenteditable="true"]', '[onclick]', '[tabindex]:not([tabindex="-1"])'
+  ].join(',');
+
+  const MAX_NAME = 80;
+  const MAX_ELEMENTS = 200;
+
+  // ---- 可见性判定 ----
+  // 优先用 checkVisibility()（现代 Chromium 支持，含祖先隐藏判定）；
+  // 不可用时回落到 getBoundingClientRect + computedStyle 组合判定。
+  function isVisible(el) {
+    if (typeof el.checkVisibility === 'function') {
+      return el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true });
+    }
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 || rect.height <= 0) return false;
+    const style = getComputedStyle(el);
+    return style.visibility !== 'hidden'
+        && style.display !== 'none'
+        && parseFloat(style.opacity) !== 0;
+  }
+
+  // ---- 视口内判定 ----
+  function inViewport(rect) {
+    return rect.bottom > 0
+        && rect.right > 0
+        && rect.top < window.innerHeight
+        && rect.left < window.innerWidth;
+  }
+
+  // ---- kind 推导：HTML/ARIA 原生语义（不映射 UIA 控件类型名） ----
+  function deriveKind(el) {
+    const role = el.getAttribute('role');
+    if (role) return role;
+    const tag = el.tagName.toLowerCase();
+    if (tag === 'input') {
+      const type = (el.getAttribute('type') || 'text').toLowerCase();
+      if (type === 'checkbox') return 'checkbox';
+      if (type === 'radio') return 'radio';
+      if (type === 'submit' || type === 'button' || type === 'reset') return 'button';
+      if (type === 'search') return 'searchbox';
+      return 'textbox';
+    }
+    if (tag === 'a') return 'link';
+    if (tag === 'button') return 'button';
+    if (tag === 'select') return 'combobox';
+    if (tag === 'textarea') return 'textbox';
+    return tag;
+  }
+
+  // ---- name 推导：对齐 W3C AccName 主流实现顺序，绝不读表单值 ----
+  function deriveName(el) {
+    const ariaLabel = el.getAttribute('aria-label');
+    if (ariaLabel && ariaLabel.trim()) return ariaLabel.trim();
+
+    const labelledBy = el.getAttribute('aria-labelledby');
+    if (labelledBy) {
+      const texts = labelledBy.split(/\\s+/)
+        .map(id => document.getElementById(id))
+        .filter(Boolean)
+        .map(node => (node.innerText || '').trim())
+        .filter(Boolean);
+      if (texts.length) return texts.join(' ');
+    }
+
+    if (el.id) {
+      const label = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+      if (label && label.innerText.trim()) return label.innerText.trim();
+    }
+    const wrappingLabel = el.closest('label');
+    if (wrappingLabel && wrappingLabel.innerText.trim()) return wrappingLabel.innerText.trim();
+
+    const placeholder = el.getAttribute('placeholder');
+    if (placeholder && placeholder.trim()) return placeholder.trim();
+    const title = el.getAttribute('title');
+    if (title && title.trim()) return title.trim();
+    const alt = el.getAttribute('alt');
+    if (alt && alt.trim()) return alt.trim();
+
+    const text = (el.innerText || '').trim();
+    if (text) return text;
+
+    return '';
+  }
+
+  const out = [];
+  let counter = 0;
+  for (const el of document.querySelectorAll(SEL)) {
+    if (counter >= MAX_ELEMENTS) break;
+    const rect = el.getBoundingClientRect();
+    if (!isVisible(el) || !inViewport(rect)) continue;
+    counter += 1;
+    const ref = 'el-' + counter;
+    el.setAttribute('data-ycode-ref', ref);
+    out.push({
+      ref: ref,
+      kind: deriveKind(el),
+      name: deriveName(el).slice(0, MAX_NAME),
+      bounds: [
+        Math.round(rect.left), Math.round(rect.top),
+        Math.round(rect.right), Math.round(rect.bottom)
+      ],
+      enabled: !el.disabled && el.getAttribute('aria-disabled') !== 'true',
+    });
+  }
+  return out;
+}"""
+
+
+def _normalize_element_bounds(value) -> list[int]:
+    """bounds 防御归一化：4 元 int list（对齐桌面脱敏 dict 形状），非法值取 0。"""
+    if not isinstance(value, (list, tuple)) or len(value) != 4:
+        return [0, 0, 0, 0]
+    normalized: list[int] = []
+    for component in value:
+        try:
+            normalized.append(int(component))
+        except (TypeError, ValueError):
+            normalized.append(0)
+    return normalized
+
 
 def _map_playwright_key(name: str) -> str:
     """统一动作键名 → Playwright key；字母在组合键中必须小写（Control+a）。"""
@@ -573,6 +711,10 @@ class BrowserComputerBackend:
         self._page_tokens: dict[int, int] = {}
         self._page_serial = 0
         self._observed_page_token: int | None = None
+        # E1：最近一次观察收集到的元素 ref 全集。与 _observed_page_token 同
+        # 生命周期——每次观察整体替换（空集即旧 ref 全部失效）；E2 的
+        # click_element/set_value_element 依赖它做 computer_element_stale 校验。
+        self._observed_element_refs: frozenset[str] = frozenset()
         self._surface_generation = 0
         self._pressed_buttons: set[str] = set()
         # 修饰键按下记录绑定按下时的 page（R3）：popup 切换 active page 后
@@ -723,7 +865,15 @@ class BrowserComputerBackend:
     def observe(self, run_id: str) -> ComputerObservation:
         if self._transport is not None:
             response = self._remote_call("observe", {"run_id": run_id}, "observe")
-            return ComputerObservation(**response["observation"])
+            from core.computer.browser_worker_protocol import (
+                normalize_observation_payload,
+            )
+
+            # JSON 往返会把 elements 外层 tuple 变成 list：归一化后再构造，
+            # 保证进程模式与线程模式的观察形状一致。
+            return ComputerObservation(
+                **normalize_observation_payload(response["observation"])
+            )
         return self._call("observe", lambda: self._cmd_observe(run_id))
 
     def execute(self, run_id: str, action: ComputerAction) -> None:
@@ -1032,6 +1182,7 @@ class BrowserComputerBackend:
         self._pressed_keys = []
         self._page_tokens = {}
         self._observed_page_token = None
+        self._observed_element_refs = frozenset()
         self._active_page = None
 
     # ---------------- worker 内：页面事件 ----------------
@@ -1220,6 +1371,44 @@ class BrowserComputerBackend:
 
     # ---------------- worker 内：命令实现 ----------------
 
+    def _collect_interactive_elements(self, page) -> tuple:
+        """收集视口内可交互元素（E1）；任何失败都归一为空 tuple，绝不中断观察。
+
+        为什么吞掉异常：元素不可用时回落截图路径是产品决定（设计 1.5/8.2），
+        observe 的截图与页面信息仍然有效；E2 侧凭空 ref 集合拒绝旧引用，
+        不会静默点错。返回 tuple of dict（ref/kind/name/bounds/enabled），
+        bounds 为 4 元 int list，与桌面 windows_elements_uia 的脱敏形状对齐。
+        """
+        try:
+            raw = page.evaluate(ELEMENT_COLLECT_SCRIPT)
+        except Exception:
+            _LOGGER.warning("浏览器元素收集失败，本次观察回落截图路径", exc_info=True)
+            return ()
+        if not isinstance(raw, (list, tuple)):
+            _LOGGER.warning(
+                "浏览器元素收集返回非列表（%s），本次观察回落截图路径",
+                type(raw).__name__,
+            )
+            return ()
+        listing: list[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue  # 非 dict 项无法被引用，直接丢弃
+            ref = item.get("ref")
+            if not isinstance(ref, str) or not ref:
+                continue  # 无 ref 的项无法被 E2 的 locator 引用
+            kind = item.get("kind")
+            name = item.get("name")
+            enabled = item.get("enabled")
+            listing.append({
+                "ref": ref,
+                "kind": kind if isinstance(kind, str) else "",
+                "name": (name if isinstance(name, str) else "")[:_ELEMENT_MAX_NAME_CHARS],
+                "bounds": _normalize_element_bounds(item.get("bounds")),
+                "enabled": enabled if isinstance(enabled, bool) else True,
+            })
+        return tuple(listing)
+
     def _cmd_observe(self, run_id: str) -> ComputerObservation:
         page = self._resolve_active_page()
         page_token = self._page_token(page)
@@ -1253,10 +1442,15 @@ class BrowserComputerBackend:
         url = page.url if isinstance(page.url, str) else ""
         parts = urlsplit(url)
         origin = f"{parts.scheme}://{parts.netloc}"
+        # E1：截图与页面复核完成后收集可交互元素；收集失败/为空都回落截图路径。
+        elements = self._collect_interactive_elements(page)
         path = self._store_screenshot(png_bytes)
         if self._observed_page_token != page_token:
             self._surface_generation += 1
             self._observed_page_token = page_token
+        # ref 集合与页面身份同生命周期：每次观察以本次结果整体替换，
+        # 空集即旧 ref 全部失效（E2 据此拒绝过期引用，不静默失败）。
+        self._observed_element_refs = frozenset(item["ref"] for item in elements)
         return ComputerObservation(
             run_id=run_id,
             target="browser",
@@ -1276,6 +1470,7 @@ class BrowserComputerBackend:
             page_title=title[:_MAX_TITLE_CHARS],
             surface_id=f"page-{page_token}",
             surface_generation=self._surface_generation,
+            elements=elements,
         )
 
     def _cmd_execute(self, run_id: str, action: ComputerAction) -> None:
