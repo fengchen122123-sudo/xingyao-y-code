@@ -361,3 +361,49 @@ def test_side_effect_scope_matches_spec_categories():
     assert registry.get("write_file").side_effect_scope == "workspace"
     assert registry.get("undo_turn").side_effect_scope == "workspace"
     assert registry.get("execute_command").side_effect_scope == "system"
+
+
+def _load_plugin_module_by_path(module_name, plugin_dir):
+    """按文件路径加载插件薄壳（与 plugin_loader 的加载方式一致）。
+
+    直接走 importlib 而不用插件加载器：本测试只验证插件源码里的 ToolSpec
+    声明，不应依赖插件启用状态 / 信任状态 / 全局注册表等外部环境。
+    """
+    import importlib.util
+    import os
+
+    entry = os.path.join(plugin_dir, "plugin.py")
+    spec = importlib.util.spec_from_file_location(module_name, entry)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_image_plugin_tools_declare_network_scope():
+    """A 阶段评审修复：生图插件工具必须声明 side_effect_scope=network。
+
+    规格 03 §3.2 取值表点名 hunyuan_generate_image / tokenrhythm_* 归
+    network；此前插件未声明导致取默认 none，本测试锁定该契约。
+    """
+    import os
+
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    plugins_root = os.path.join(project_root, "plugins")
+
+    hunyuan = _load_plugin_module_by_path(
+        "_test_hunyuan_image_plugin", os.path.join(plugins_root, "hunyuan_image")
+    )
+    tokenrhythm = _load_plugin_module_by_path(
+        "_test_tokenrhythm_image_plugin", os.path.join(plugins_root, "tokenrhythm_image")
+    )
+
+    registry = ToolRegistry()
+    hunyuan.register(registry)
+    tokenrhythm.register(registry)
+
+    for name in (
+        "hunyuan_generate_image",
+        "tokenrhythm_generate_image",
+        "tokenrhythm_edit_image",
+    ):
+        assert registry.get(name).side_effect_scope == "network", name
