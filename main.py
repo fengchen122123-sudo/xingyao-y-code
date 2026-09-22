@@ -995,6 +995,7 @@ COMMAND_COMPLETIONS = [
     ("/update", "更新检查与安装 (check/download/cancel/install)"),
     ("/changes", "查看最近 N 个回合的文件变更汇总 (默认 3)"),
     ("/usage", "查看 Token 用量统计 (按模型: 今日/近7天/近30天，可加日期/区间)"),
+    ("/doctor", "聚合自检 (配置/凭据/数据/数据库/MCP/网络/GUI 运行时；--json 机器可读)"),
     ("/tasks", "查看或托管后台长周期进程"),
     ("/plan", "查看或控制当前任务计划"),
     ("/undo", "按回合撤销文件修改 (list/preview/status/recover)"),
@@ -2657,6 +2658,7 @@ def handle_slash_command(command_text):
         print_formatted_text(HTML("  <ansicyan>/plan &lt;pause|resume|retry ID|cancel&gt;</ansicyan>       : 暂停、恢复、重试或取消计划"))
         print_formatted_text(HTML("  <ansicyan>/computer &lt;status|pause|resume|stop&gt;</ansicyan>   : 电脑操控运行控制"))
         print_formatted_text(HTML("  <ansicyan>/computer browser [edge|chrome]</ansicyan>    : 查看/切换操控默认浏览器 (活动任务内禁止切换；操控开关请在 GUI 系统设置页修改)"))
+        print_formatted_text(HTML("  <ansicyan>/doctor [--json]</ansicyan>                    : 聚合自检 (配置/凭据/数据/数据库/MCP/网络/GUI 运行时；--json 输出机器可读结果)"))
         print_formatted_text(HTML(""))
         print_formatted_text(HTML("<b><ansiyellow>【5. KAIROS 长期记忆系统】</ansiyellow></b>"))
         print_formatted_text(HTML("  <ansicyan>/remember &lt;内容&gt;</ansicyan>                     : 手动追加一条规则、偏好或事实到今日的记忆日志"))
@@ -3933,6 +3935,50 @@ def handle_slash_command(command_text):
 
         else:
             print_formatted_text(HTML("<ansired>⚠️ 未知子命令。用法: /hooks [trust|deny|revoke|reset &lt;序号&gt;]</ansired>"))
+
+    elif cmd == "/doctor" or cmd.startswith("/doctor "):
+        # 聚合自检（T3）：配置/凭据/数据/数据库/MCP/网络/GUI 运行时一站式体检；
+        # --json 输出机器可读结果（供脚本采集/报障），默认人类可读。
+        from core.doctor import run_checks
+
+        doctor_flags = [part.lower() for part in parts[1:]]
+        bad_flags = [part for part in doctor_flags if part != "--json"]
+        if bad_flags:
+            print_formatted_text(HTML(
+                f"<ansired>❌ 未知参数「{_esc(bad_flags[0])}」。用法: /doctor [--json]</ansired>"
+            ))
+        else:
+            import json as _doctor_json
+
+            results = run_checks()
+            if "--json" in doctor_flags:
+                print_formatted_text(_doctor_json.dumps(
+                    [result.to_dict() for result in results], ensure_ascii=False, indent=2
+                ))
+            else:
+                status_marks = {
+                    "ok": "<ansigreen>✔ 通过</ansigreen>",
+                    "warn": "<ansiyellow>⚠ 警告</ansiyellow>",
+                    "fail": "<ansired>✖ 失败</ansired>",
+                    "skip": "<ansigray>○ 跳过</ansigray>",
+                }
+                counts = {key: 0 for key in ("ok", "warn", "fail", "skip")}
+                print_formatted_text(HTML("<b><ansicyan>🩺 星瑶Code 聚合自检</ansicyan></b>"))
+                for result in results:
+                    if result.status in counts:
+                        counts[result.status] += 1
+                    mark = status_marks.get(result.status, _esc(result.status))
+                    print_formatted_text(HTML(
+                        f"  {mark}  <b>{_esc(result.name)}</b>：{_esc(result.detail)}"
+                    ))
+                    if result.hint:
+                        print_formatted_text(HTML(f"      <ansigray>建议：{_esc(result.hint)}</ansigray>"))
+                print_formatted_text(HTML(
+                    f"<b>总结</b>：{counts['ok']} 项通过 / {counts['warn']} 项警告 / "
+                    f"{counts['fail']} 项失败 / {counts['skip']} 项跳过"
+                ))
+                if counts["fail"] or counts["warn"]:
+                    print_formatted_text(HTML("<ansigray>  按上方建议逐项处理后重新运行 /doctor 复核。</ansigray>"))
 
     elif cmd == "/usage" or cmd.startswith("/usage "):
         # Token 用量统计：按模型分桶，精确数值（不做缩写）
