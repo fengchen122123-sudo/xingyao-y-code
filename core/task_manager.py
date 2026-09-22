@@ -293,6 +293,7 @@ def _load_tasks():
                     info.get("output_encoding")
                     or platform_console_encoding()
                 ),
+                "turn_id": info.get("turn_id") or "",
                 "status": TASK_STATUS_RUNNING,
                 "exit_code": None,
                 "revision": 0,
@@ -322,6 +323,8 @@ def _save_tasks():
                             info.get("output_encoding")
                             or platform_console_encoding()
                         ),
+                        # T4 回合关联：父回合随任务记录持久化（旧记录无此键，读取侧 .get 兼容）
+                        "turn_id": info.get("turn_id") or "",
                     }
             # 跨进程合并读：GUI/CLI 双进程并发写同一份 tasks.json 时，
             # 把磁盘上其他进程新启动的任务记录合并进来，避免内存全量覆盖写
@@ -353,10 +356,21 @@ def _save_tasks():
         _logger.warning("写入任务记录失败 %s: %s", TASK_DB_PATH, error)
 
 
-def start_background_task(command: str, session_id: str = "", shell_id: str = "") -> str:
+def turn_short_code(turn_id: str | None) -> str:
+    """回合短码：turn_id 前 8 位（与 turn_undo prompt_context 的展示惯例一致）。
+
+    用于 /tasks 展示与任务日志标注；无值返回空串。
+    """
+    return str(turn_id or "")[:8]
+
+
+def start_background_task(
+    command: str, session_id: str = "", shell_id: str = "", turn_id: str = ""
+) -> str:
     """在后台开启一个异步长周期任务（如 npm run dev），重定向日志输出。
 
     session_id 记录发起该任务所属的会话，完成回调据此触发 LLM 总结。
+    turn_id 记录发起该任务的父回合（T4 回合关联：/tasks 展示与日志标注）。
     """
     _ensure_paths()
     _ensure_loaded()
@@ -415,11 +429,24 @@ def start_background_task(command: str, session_id: str = "", shell_id: str = ""
             log_file = None
             raise
 
+        # T4 回合关联：任务日志首行标注父回合短码（副作用任务日志可追溯到回合）
+        if turn_id:
+            try:
+                log_file.write(
+                    f"[turn:{turn_short_code(turn_id)}] 后台任务启动\n".encode(
+                        output_encoding, errors="replace"
+                    )
+                )
+                log_file.flush()
+            except Exception:
+                pass
+
         with _TASKS_LOCK:
             ACTIVE_TASKS[task_id] = {
                 "id": task_id,
                 "command": command,
                 "session_id": session_id,
+                "turn_id": str(turn_id or ""),
                 "process": process,
                 "pid": process.pid,
                 "create_time": _process_create_time(process.pid),
@@ -719,7 +746,8 @@ def list_active_tasks():
                 "task_id": tid,
                 "command": info["command"],
                 "pid": pid or (proc.pid if proc else -1),
-                "duration": f"{running_time}秒"
+                "duration": f"{running_time}秒",
+                "turn_id": info.get("turn_id") or "",
             })
 
         if _evict_terminal_locked():
