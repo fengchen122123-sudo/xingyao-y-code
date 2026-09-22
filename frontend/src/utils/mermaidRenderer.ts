@@ -101,6 +101,75 @@ export function sanitizeSvg(svg: string): string {
   }
 }
 
+// 节点标签自动修复：模型输出常把 [DOC]、[VALUES] 这类方括号（以及裸圆括号）
+// 直接写进标签文本（如 E[说明 [DOC] 关键词]），mermaid 的 jison 解析器把
+// [ ] 当节点定界符直接 Parse error；官方解法是整段标签用双引号包裹
+// （E["说明 [DOC] 关键词"]）。本函数只在首次渲染失败后作为兜底重试调用——
+// 最坏结果 = 修复后仍失败、维持原降级显示，绝不影响本来合法的源码。
+// 用逐字符扫描而非正则：嵌套方括号（G[[VALUES]...]）的闭合边界正则识别不了。
+export function autofixMermaidSource(source: string): string {
+  // 标签内裸写这些字符都会让 jison 解析失败，是触发引号包裹的条件
+  const SPECIAL_CHARS = /[[\](){}]/;
+  const lines = source.split('\n');
+  let changed = false;
+  const fixed = lines.map((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('%%')) return line;
+    let out = '';
+    let i = 0;
+    let lineChanged = false;
+    while (i < line.length) {
+      const ch = line[i];
+      // 节点标签起点：'[' 且前驱是标识符字符（ID[...] 形态）。
+      // 边标签 |...|、markdown 链接等场景不满足该形态，天然跳过
+      if (ch === '[' && /[A-Za-z0-9_]/.test(out[out.length - 1] ?? '')) {
+        if (line[i + 1] === '"') {
+          // 已引号包裹的合法标签：原样复制到配对引号，闭合 ']' 走普通路径
+          let j = i + 2;
+          while (j < line.length && line[j] !== '"') j++;
+          const end = Math.min(j + 1, line.length);
+          out += line.slice(i, end);
+          i = end;
+          continue;
+        }
+        // 扫描标签内容找真实闭合位置：内层 '[' 加深、']' 回退，深度归零才是
+        // 该标签的边界（G[[VALUES]表.字段 查码值] 这类错乱写法靠它识别）
+        let depth = 1;
+        let j = i + 1;
+        let hasQuote = false;
+        while (j < line.length && depth > 0) {
+          const c = line[j];
+          if (c === '[') depth++;
+          else if (c === ']') depth--;
+          else if (c === '"') hasQuote = true;
+          j++;
+        }
+        if (depth !== 0) {
+          // 括号未闭合：无法定位标签边界，放弃修复，本行剩余原样保留
+          out += line.slice(i);
+          i = line.length;
+          continue;
+        }
+        const inner = line.slice(i + 1, j - 1);
+        // 内容已含双引号时放弃包裹（包裹反而会引入新的语法错误）
+        if (!hasQuote && SPECIAL_CHARS.test(inner)) {
+          out += `["${inner}"]`;
+          lineChanged = true;
+        } else {
+          out += line.slice(i, j);
+        }
+        i = j;
+        continue;
+      }
+      out += ch;
+      i++;
+    }
+    if (lineChanged) changed = true;
+    return lineChanged ? out : line;
+  });
+  return changed ? fixed.join('\n') : source;
+}
+
 function injectSvg(block: HTMLElement, svg: string): void {
   block.setAttribute('data-state', 'done');
   // 幂等兜底：气泡重挂载等场景下同一块可能被并发 watcher 重复注入，
@@ -174,7 +243,29 @@ export async function renderMermaidBlocks(root: HTMLElement | null): Promise<voi
         injectSvg(block, clean);
       }
     } catch (err) {
-      if (block.isConnected) markError(block, err instanceof Error ? err.message : String(err));
+      // 失败兜底：模型输出的常见语法瑕疵（标签内裸写 [ ] ( ) 等特殊字符）
+      // 做一次自动修复重试；成功则正常出图并写缓存，失败才走原降级。
+      // 只在失败路径触发，合法源码的渲染行为完全不变。
+      const fixed = autofixMermaidSource(source);
+      let recovered = false;
+      if (fixed !== source) {
+        try {
+          const { svg } = await mermaid.render(`mmd-${key}-${++renderSeq}`, fixed);
+          const clean = sanitizeSvg(svg);
+          if (clean) {
+            cachePut(key, clean);
+            if (block.isConnected && block.dataset.state === 'rendering') {
+              injectSvg(block, clean);
+            }
+            recovered = true;
+          }
+        } catch {
+          // 修复后仍失败：落入原降级，透出首次报错便于定位
+        }
+      }
+      if (!recovered && block.isConnected) {
+        markError(block, err instanceof Error ? err.message : String(err));
+      }
     }
   }
 }
