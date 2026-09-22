@@ -895,7 +895,15 @@ def execute_command(
                 )
             except Exception:
                 session_id = _tool_cache.get_current_session() or ""
-            background_kwargs = {"session_id": session_id}
+            # T4 回合关联：登记发起本任务的父回合（以 turn_undo 按工作区登记的
+            # 活动回合为准；任务记录与任务日志据此可追溯到回合）
+            try:
+                turn_id = _tu_coordinator.get_coordinator().active_turn_id(
+                    get_workdir() or os.getcwd()
+                ) or ""
+            except Exception:
+                turn_id = ""
+            background_kwargs = {"session_id": session_id, "turn_id": turn_id}
             if shell_id:
                 background_kwargs["shell_id"] = shell_id
             task_id = start_background_task(command, **background_kwargs)

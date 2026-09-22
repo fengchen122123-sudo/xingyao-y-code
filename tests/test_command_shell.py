@@ -292,8 +292,8 @@ def test_execute_command_passes_shell_override_to_background_tasks(monkeypatch):
 
     captured = {}
 
-    def fake_start(command, session_id="", shell_id=""):
-        captured.update(command=command, session_id=session_id, shell_id=shell_id)
+    def fake_start(command, session_id="", shell_id="", turn_id=""):
+        captured.update(command=command, session_id=session_id, shell_id=shell_id, turn_id=turn_id)
         return "task-1"
 
     monkeypatch.setattr("core.task_manager.start_background_task", fake_start)

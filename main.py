@@ -3381,7 +3381,9 @@ def handle_slash_command(command_text):
                 app_instance.exit()
 
     elif cmd in ("/tasks", "/task"):
-        from core.task_manager import list_active_tasks, get_task_output, kill_background_task
+        from core.task_manager import (
+            list_active_tasks, get_task_output, kill_background_task, turn_short_code,
+        )
         from core.tools import subagent_manager
 
         if len(parts) > 1:
@@ -3430,6 +3432,9 @@ def handle_slash_command(command_text):
                                        "cancelled": "ansigray", "timed_out": "ansired"}.get(t.status, "ansiyellow")
                         print_formatted_text(HTML(f"  状态: <{status_color}>{t.status}</{status_color}> | 类型: {t.subagent_type} | 阶段: {t.stage}"))
                         print_formatted_text(HTML(f"  执行: {round(t.execution_elapsed, 1)}s | 等待审批: {round(t.approval_wait_elapsed, 1)}s"))
+                        detail_turn_code = turn_short_code(t.parent_turn_id)
+                        if detail_turn_code:
+                            print_formatted_text(HTML(f"  回合: <ansigray>[turn:{detail_turn_code}]</ansigray>"))
                         desc_safe = (t.description or "")[:80].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                         print_formatted_text(HTML(f"  描述: {desc_safe}"))
                         if t.result:
@@ -3463,7 +3468,11 @@ def handle_slash_command(command_text):
                     print_formatted_text(HTML("<ansicyan><b>当前运行的后台进程（shell）：</b></ansicyan>"))
                     for t in shell_tasks:
                         safe_cmd = t['command'].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
-                        print_formatted_text(HTML(f"  <ansigreen>• ID: {t['task_id']}</ansigreen> | PID: <ansicyan>{t['pid']}</ansicyan> | 运行: {t['duration']} | 命令: {safe_cmd}"))
+                        turn_code = turn_short_code(t.get('turn_id'))
+                        turn_suffix = (
+                            f" | 回合: <ansigray>[turn:{turn_code}]</ansigray>" if turn_code else ""
+                        )
+                        print_formatted_text(HTML(f"  <ansigreen>• ID: {t['task_id']}</ansigreen> | PID: <ansicyan>{t['pid']}</ansicyan> | 运行: {t['duration']}{turn_suffix} | 命令: {safe_cmd}"))
                 if bg_sub_snapshots:
                     if shell_tasks:
                         print_formatted_text(HTML(""))
@@ -3473,10 +3482,14 @@ def handle_slash_command(command_text):
                                        "cancelled": "ansigray", "timed_out": "ansired",
                                        "in_progress": "ansiyellow", "running": "ansiyellow"}.get(t.status, "ansigray")
                         desc_safe = (t.description or "")[:50].replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+                        sub_turn_code = turn_short_code(t.parent_turn_id)
+                        sub_turn_suffix = (
+                            f" | 回合: <ansigray>[turn:{sub_turn_code}]</ansigray>" if sub_turn_code else ""
+                        )
                         print_formatted_text(HTML(
                             f"  <ansigreen>• ID: {t.task_id}</ansigreen> | 状态: <{status_color}>{t.status}</{status_color}> "
                             f"| 类型: <ansicyan>{t.subagent_type}</ansicyan> | 阶段: {t.stage} "
-                            f"| 执行: {round(t.execution_elapsed, 1)}s | 描述: {desc_safe}"
+                            f"| 执行: {round(t.execution_elapsed, 1)}s{sub_turn_suffix} | 描述: {desc_safe}"
                         ))
                 print_formatted_text(HTML("<ansigray>提示：你可以输入 `/tasks tail &lt;ID&gt;` 查看日志/状态，或 `/tasks kill &lt;ID&gt;` 终结任务。</ansigray>"))
 
