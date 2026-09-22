@@ -167,6 +167,16 @@ _QWEN_CACHE_CONFIG_KEYS = (
     "cache_control",
 )
 
+# 顶层 cache_keepalive_routes：显式声明可安全保活的第三方路由（域名/子串列表）。
+# 官方路由之外的网关默认不保活（未验证自动缓存时保活只是白烧配额），但实测
+# 验证过缓存的网关可在 config.json 顶层显式放行——与 Qwen 的「官方默认 +
+# 第三方显式配置」通道同构；官方路由判定逻辑不受此配置影响。
+_KEEPALIVE_ROUTES_CONFIG_KEY = "cache_keepalive_routes"
+
+# 顶层键解析结果缓存，指纹口径与 _resolve_model_config 一致（见 _qwen_cache_config_stamp）：
+# stamp = (loader 身份, 配置文件 mtime)；条目格式 (过期时间, stamp, routes)。
+_keepalive_routes_cfg_cache = {"entry": None}
+
 # 缓存开关判定在一轮对话里会被反复触发（_qwen_cache_enabled / _supports_cache_control /
 # _supports_cache_keepalive / tools 规范化），而 load_config 每次都要读盘并解析整个
 # config.json。这里按 (模型, 路由) 记忆解析结果，并用「配置指纹」做失效：
@@ -213,6 +223,9 @@ def _resolve_model_config(model_name, api_base="", model_cfg=None):
         from core.model_manager import load_config
 
         data = load_config()
+        # 同一份配置顺手缓存顶层 cache_keepalive_routes：同一轮里随后的
+        # _supports_cache_keepalive 显式配置通道即可命中缓存，不再重复读盘
+        _remember_keepalive_routes(data, stamp)
         m_str = str(model_name or "").strip()
         base_url = str(api_base or "").rstrip("/").lower()
         for provider in data.get("providers", []):
@@ -267,6 +280,80 @@ def _qwen_cache_control_configured(model_name, api_base="", model_cfg=None):
         return True
     cfg = _resolve_model_config(model_name, api_base, model_cfg)
     return bool(cfg.get("enable_cache_control") or cfg.get("cache_control"))
+
+
+def _normalize_route_match_key(api_base):
+    """路由匹配键：去 scheme/用户信息/端口/路径/查询后的小写主机名（含子域）。
+
+    配置条目与 api_base 走同一归一化：用户写完整 URL（https://example.com:8443/v1）
+    或裸域名（example.com）都按域名匹配；归一化拿不到主机名时退化为小写原文，
+    仍支持纯子串条目。
+    """
+    raw = str(api_base or "").strip()
+    if not raw:
+        return ""
+    candidate = raw if "://" in raw else "//" + raw
+    try:
+        host = str(urlsplit(candidate).hostname or "")
+    except Exception:
+        host = ""
+    return (host or raw).lower()
+
+
+def _parse_keepalive_routes(data):
+    """从一份已加载的 config 中提取 cache_keepalive_routes 并逐条归一化。"""
+    raw = data.get(_KEEPALIVE_ROUTES_CONFIG_KEY) if isinstance(data, dict) else None
+    if not isinstance(raw, (list, tuple)):
+        return ()
+    routes = []
+    for item in raw:
+        key = _normalize_route_match_key(item)
+        if key:
+            routes.append(key)
+    return tuple(routes)
+
+
+def _remember_keepalive_routes(data, stamp):
+    """把顶层 cache_keepalive_routes 的解析结果按配置指纹写入缓存（重复读盘去重）。"""
+    if stamp is None:
+        return
+    routes = _parse_keepalive_routes(data)
+    with _qwen_cache_cfg_lock:
+        _keepalive_routes_cfg_cache["entry"] = (
+            time.monotonic() + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
+        )
+
+
+def _configured_keepalive_routes():
+    """读取顶层 cache_keepalive_routes（域名/子串列表），带配置指纹缓存。"""
+    stamp = _qwen_cache_config_stamp()
+    now = time.monotonic()
+    if stamp is not None:
+        with _qwen_cache_cfg_lock:
+            cached = _keepalive_routes_cfg_cache.get("entry")
+            if cached and cached[0] > now and cached[1] == stamp:
+                return cached[2]
+    routes = ()
+    try:
+        from core.model_manager import load_config
+
+        routes = _parse_keepalive_routes(load_config())
+    except Exception:
+        pass
+    if stamp is not None:
+        with _qwen_cache_cfg_lock:
+            _keepalive_routes_cfg_cache["entry"] = (
+                now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
+            )
+    return routes
+
+
+def _keepalive_route_explicitly_enabled(api_base):
+    """api_base 归一化后包含显式配置中任一条目 → 该路由启用保活。"""
+    host = _normalize_route_match_key(api_base)
+    if not host:
+        return False
+    return any(entry in host for entry in _configured_keepalive_routes())
 
 
 def _glm_keepalive_thinking_locked(model_name):
@@ -475,7 +562,11 @@ def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
 
 
 def _supports_cache_keepalive(model_name, api_base="", model_cfg=None):
-    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi/智谱/百炼官方路由（或 Qwen 显式配置开启缓存）。"""
+    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi/智谱/百炼官方路由（或 Qwen 显式配置开启缓存）。
+
+    官方判定之外，config.json 顶层 cache_keepalive_routes 显式声明的网关路由
+    （按域名归一化匹配）同样放行——不改变任何官方路由判定，仅新增显式通道。
+    """
     return (
         _is_kimi_family(model_name, api_base)
         and _is_official_kimi_route(api_base)
@@ -485,7 +576,10 @@ def _supports_cache_keepalive(model_name, api_base="", model_cfg=None):
     ) or (
         _is_glm_family(model_name, api_base)
         and _is_official_zhipu_route(api_base)
-    ) or _qwen_cache_enabled(model_name, api_base, model_cfg)
+    ) or (
+        _qwen_cache_enabled(model_name, api_base, model_cfg)
+        or _keepalive_route_explicitly_enabled(api_base)
+    )
 
 
 def _supports_reasoning_fields(model_name, api_base=""):

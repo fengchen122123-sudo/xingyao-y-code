@@ -152,33 +152,42 @@ def _is_safe_memory_index_entry(content):
     path = PurePosixPath(target)
     return not path.is_absolute() and ".." not in path.parts
 
+# 进入稳定系统提示词的记忆索引提示语：必须是固定文案，不含任何计数/文件名/描述。
+# 为什么去掉计数（2026-09-22 实测）：旧实现把各类别的文件数拼进这段文本，而该文本
+# 由 build_memory_system_section() 注入稳定系统提示词并位于每轮请求首位、参与
+# system_sha256；于是一旦有记忆写入（如 15:21 写入 3 条），计数变化 → 稳定系统
+# 提示词变化 → 所有活跃会话在各自回合边界前缀全量 miss（实测 16.4 万 token
+# 前缀失效、缓存命中率跌到 2.5%）。因此这里只返回与记忆内容无关的恒定文案，
+# 具体条目改由 Agent 用文件工具按需读取。
+MEMORY_INDEX_HINT = "记忆索引位于 MEMORY.md；使用文件工具按需读取具体条目。"
+
+
 def load_memory_index():
+    """返回注入系统提示词的记忆索引提示语（固定文案，不随记忆写入变化）。
+
+    MEMORY.md 不存在时返回 ""（保持原有语义，用于区分"还没有记忆"）。
+    """
+    if not (MEMORY_DIR / "MEMORY.md").exists():
+        return ""
+    return MEMORY_INDEX_HINT
+
+
+def _read_memory_index_for_dream():
+    """读取 MEMORY.md 中通过安全校验的索引行，仅供 dream 整理 prompt 使用。
+
+    与 load_memory_index() 分离的原因：系统提示词只需要固定文案（缓存稳定性，
+    见上），而梦境整理必须看到已有索引的真实条目才能合并去重，因此这里按行读取
+    并复用 _is_safe_memory_index_entry 过滤（仍不把模型可控的非法行喂给 LLM）。
+    """
     path = MEMORY_DIR / "MEMORY.md"
     if not path.exists():
         return ""
     try:
-        category_counts = {
-            name: 0
-            for name in ("user", "feedback", "project", "reference", "uncategorized")
-        }
-        for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            stripped = line.strip()
-            if not _is_safe_memory_index_entry(stripped):
-                continue
-            match = _MEMORY_INDEX_ENTRY_RE.fullmatch(stripped)
-            parts = match.group(2).split("/", 1)
-            category = parts[0] if len(parts) == 2 else "uncategorized"
-            category_counts[category] += 1
-        # Never inject model/user-controlled titles, descriptions, or file names
-        # into a system message. Only fixed-vocabulary category counts are exposed;
-        # concrete files are discovered on demand with the normal file tools.
-        return "\n".join(
-            f"- memory-category: {category} ({count} files)"
-            for category, count in category_counts.items()
-            if count
-        )
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
         return ""
+    safe_lines = [line.strip() for line in lines if _is_safe_memory_index_entry(line.strip())]
+    return "\n".join(safe_lines)
 
 def build_memory_system_section():
     ensure_memory_dir()
@@ -265,7 +274,9 @@ def run_dream_consolidation_sync(api_model, api_key, api_base=None):
     2. 利用大模型生成整理策略，修改对应的 .md 记忆文件，并更新 MEMORY.md 索引。
     """
     ensure_memory_dir()
-    index = load_memory_index()
+    # 注意：这里不能用 load_memory_index()（它只返回固定提示文案，供系统提示词用），
+    # 梦境整理需要看到已有索引的真实条目，才能合并去重、避免重复写入。
+    index = _read_memory_index_for_dream()
     
     # 搜集所有日记账文件内容
     log_content = ""
