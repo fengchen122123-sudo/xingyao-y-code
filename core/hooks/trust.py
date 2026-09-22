@@ -332,6 +332,10 @@ def list_hooks_with_status(
 
     为什么返回纯 dict 而不是 HookRegistration：本视图直接送给 GUI 前端，
     dict 可 JSON 序列化，且把「状态」与「配置」摊平成同一层，前端不必再回查。
+
+    为什么按 ``include_disabled=True`` 加载：管理列表必须能看到被禁用的钩子
+    （带 ``disabled`` 标记）才能重新启用；执行侧（runner）仍走默认口径、
+    跳过 disabled 条目，因此本视图扩大可见范围不会影响执行行为。
     """
     from core.hooks.registry import HookRegistry
 
@@ -339,7 +343,7 @@ def list_hooks_with_status(
     st = store if store is not None else HookTrustStore()
     identity = normalize_workspace_identity(workspace_root)
     hooks: list[dict] = []
-    for item in reg.load(workspace_root=workspace_root):
+    for item in reg.load(workspace_root=workspace_root, include_disabled=True):
         hooks.append(
             {
                 "event": item.event.value,
@@ -350,6 +354,7 @@ def list_hooks_with_status(
                 "source_path": item.source_path,
                 "scope": item.scope,
                 "digest": item.digest,
+                "disabled": item.disabled,
                 "status": st.status_for(
                     workspace_identity=identity,
                     digest=item.digest,
