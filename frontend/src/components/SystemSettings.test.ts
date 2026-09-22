@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushPromises, mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
 
@@ -447,5 +447,115 @@ describe('computer active model capability hint', () => {
   it('hides the hint when both switches are off', () => {
     const wrapper = mountWith({});
     expect(wrapper.find('[data-test="computer-model-capability-hint"]').exists()).toBe(false);
+  });
+});
+
+// ── 运行自检（T3b）──
+
+describe('doctor self-check entry', () => {
+  const doctorApi = { run_doctor: vi.fn() };
+  const baseSettings = {
+    command_shell: 'auto',
+    command_shell_available: true,
+    command_shell_error: '',
+    remote_token_ttl: 86400,
+    ...turnStepLimitFields,
+    ...aiOutputDirFields,
+    ...computerSettings,
+    command_shell_options: [],
+  };
+
+  function mountWithDoctor() {
+    setActivePinia(createPinia());
+    const store = useAppStore();
+    store.systemSettings = { ...baseSettings } as typeof store.systemSettings;
+    return { store, wrapper: mount(SystemSettings) };
+  }
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    (window as any).pywebview = { api: doctorApi };
+  });
+
+  afterEach(() => {
+    delete (window as any).pywebview;
+  });
+
+  it('runs the aggregate self-check through the bridge and renders name/status/detail/hint', async () => {
+    doctorApi.run_doctor.mockResolvedValue({
+      ok: true,
+      summary: { ok: 1, warn: 1, fail: 1, skip: 1 },
+      checks: [
+        { name: '环境与版本', status: 'ok', detail: '星瑶Code v1.0.0 · Python 3.11.9 · win32', hint: '' },
+        { name: '配置', status: 'warn', detail: '存在未知配置键：memory_compression.retain_cout', hint: '未知键多为拼写错误，请删除或修正' },
+        { name: '凭据', status: 'fail', detail: '1/1 个 API Key 解密失败', hint: '请在模型设置中重新填写并保存' },
+        { name: '模型端点', status: 'skip', detail: '已跳过网络探测（skip_network=True）', hint: '' },
+      ],
+    });
+    const { wrapper } = mountWithDoctor();
+
+    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
+    await flushPromises();
+
+    expect(doctorApi.run_doctor).toHaveBeenCalledTimes(1);
+    expect(wrapper.get('[data-test="doctor-summary"]').text()).toBe('共 4 项：通过 1、警告 1、失败 1、跳过 1');
+
+    const failed = wrapper.get('[data-test="doctor-check-凭据"]');
+    expect(failed.text()).toContain('失败');
+    expect(failed.text()).toContain('1/1 个 API Key 解密失败');
+    expect(failed.text()).toContain('建议：请在模型设置中重新填写并保存');
+    expect(wrapper.get('[data-test="doctor-check-环境与版本"]').text()).toContain('通过');
+    expect(wrapper.get('[data-test="doctor-check-模型端点"]').text()).toContain('跳过');
+  });
+
+  it('disables the button while the self-check is running', async () => {
+    let resolveRun: ((report: unknown) => void) | null = null;
+    doctorApi.run_doctor.mockImplementation(
+      () => new Promise(resolve => { resolveRun = resolve; }),
+    );
+    const { wrapper } = mountWithDoctor();
+    const button = wrapper.get('[data-test="run-doctor-button"]');
+
+    await button.trigger('click');
+
+    expect(button.text()).toContain('检查中');
+    expect(button.attributes('disabled')).toBeDefined();
+
+    resolveRun!({ ok: true, checks: [], summary: { ok: 0, warn: 0, fail: 0, skip: 0 } });
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="run-doctor-button"]').attributes('disabled')).toBeUndefined();
+  });
+
+  it('shows the bridge error message when the report is not ok', async () => {
+    doctorApi.run_doctor.mockResolvedValue({ ok: false, msg: '检查器崩溃', checks: [] });
+    const { wrapper } = mountWithDoctor();
+
+    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('检查器崩溃');
+    expect(wrapper.find('[data-test="doctor-results"]').exists()).toBe(false);
+  });
+
+  it('shows an error when the bridge call rejects', async () => {
+    doctorApi.run_doctor.mockRejectedValue(new Error('bridge down'));
+    const { wrapper } = mountWithDoctor();
+
+    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('bridge down');
+  });
+
+  it('explains that pywebview is required when the bridge is unavailable', async () => {
+    delete (window as any).pywebview;
+    const { wrapper } = mountWithDoctor();
+
+    await wrapper.get('[data-test="run-doctor-button"]').trigger('click');
+    await flushPromises();
+
+    expect(wrapper.get('[data-test="doctor-error"]').text()).toContain('连接失败');
+    expect(doctorApi.run_doctor).not.toHaveBeenCalled();
   });
 });

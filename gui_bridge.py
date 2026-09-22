@@ -3457,10 +3457,13 @@ class ApiBridge(GitBridgeMixin):
             self._clear_session_last_error(target)
             deleted = self._memory.clear_session_messages(target)
             from core.llm import session_token_usage, token_usage_lock
+            from core.context_breakdown import clear_breakdown
             with token_usage_lock:
                 session_token_usage["latest_total"] = 0
                 session_token_usage["latest_prompt"] = 0
                 session_token_usage["latest_cached"] = 0
+            # 上下文占比快照与 token 记账同生命周期：清空历史即清空快照
+            clear_breakdown()
             self._emit_token_usage()
             return {"ok": True, "deleted": int(deleted), "msg": f"已清空 {deleted} 条历史记录"}
         except Exception as e:
@@ -3754,6 +3757,42 @@ class ApiBridge(GitBridgeMixin):
                 "ok": False,
                 "msg": str(error),
                 "settings": self.get_system_settings(),
+            }
+
+    # ------------------------------------------------------------------
+    # /doctor 聚合自检（T3b：设置页「运行自检」入口）
+    # ------------------------------------------------------------------
+    def run_doctor(self, skip_network: bool = False) -> Dict[str, Any]:
+        """GUI 设置页一键自检：复用 core.doctor.run_checks（与 CLI /doctor 同源）。
+
+        场景约定：GUI 由用户主动点击触发，默认做完整检查（含模型端点联网
+        探测，单项 3 秒超时，不冻结界面——pywebview 在工作线程执行桥接方法）；
+        skip_network=True 跳过网络项，供快速重跑/离线场景，与 CLI 同参对齐。
+
+        成功: {"ok": True, "checks": [{name,status,detail,hint}...], "summary": {...}}
+        异常: {"ok": False, "msg": str(e), "checks": [], "summary": 零值}
+              （防御性兜底；run_checks 内部已把单项异常隔离为 fail，正常不触发）
+        """
+        try:
+            from core.doctor import run_checks
+
+            checks = [
+                result.to_dict()
+                for result in run_checks(skip_network=bool(skip_network))
+            ]
+            summary: Dict[str, int] = {"ok": 0, "warn": 0, "fail": 0, "skip": 0}
+            for check in checks:
+                status = str(check.get("status") or "")
+                if status in summary:
+                    summary[status] += 1
+            return {"ok": True, "checks": checks, "summary": summary}
+        except Exception as e:
+            logger.exception("run_doctor 失败")
+            return {
+                "ok": False,
+                "msg": str(e),
+                "checks": [],
+                "summary": {"ok": 0, "warn": 0, "fail": 0, "skip": 0},
             }
 
     # ------------------------------------------------------------------
@@ -6069,8 +6108,8 @@ class ApiBridge(GitBridgeMixin):
     # ------------------------------------------------------------------
     def get_token_usage_statistics(self, days: int = 30) -> Dict[str, Any]:
         """按 CLI /usage 口径返回 GUI 的每日与模型 Token 统计。"""
-        if type(days) is not int or days not in (1, 7, 30):
-            return {"ok": False, "msg": "统计范围仅支持 1、7、30 天"}
+        if type(days) is not int or days not in (1, 7, 30, 365):
+            return {"ok": False, "msg": "统计范围仅支持 1、7、30、365 天"}
         range_days = days
 
         try:
@@ -6162,6 +6201,7 @@ class ApiBridge(GitBridgeMixin):
     def get_token_usage(self) -> Dict[str, Any]:
         try:
             from core.llm import get_token_usage_snapshot
+            from core.context_breakdown import get_breakdown
             # 按当前会话取模型：会话绑定模型与全局默认不同时，
             # 上下文圆圈的 window/used 必须按会话模型计算
             active = get_active_model(self._current_session) or {}
@@ -6211,6 +6251,8 @@ class ApiBridge(GitBridgeMixin):
                     process_usage.get("cumulative_completion", 0) or 0
                 ),
                 "total_cached": int(process_usage.get("cumulative_cached", 0) or 0),
+                # 输入框悬停面板：上下文来源字符占比快照（设计规格 §3.4）
+                "context_breakdown": get_breakdown(),
             }
         except Exception:
             logger.debug("get_token_usage 失败", exc_info=True)
@@ -6220,6 +6262,7 @@ class ApiBridge(GitBridgeMixin):
                 "cache_session_pct": None, "cache_available": False,
                 "cache_hot_turns": 0, "cache_invalidation_reason": "",
                 "prompt_tokens": 0, "cached_tokens": 0,
+                "context_breakdown": [],
             }
 
     def _emit_token_usage(self):
@@ -6232,6 +6275,7 @@ class ApiBridge(GitBridgeMixin):
         """切会话 / 清空历史后重算窗口占用（优先真实用量，无记录才估算兜底）。"""
         try:
             from core.agent_service import get_session_token_baseline
+            from core.context_breakdown import clear_breakdown
             from core.llm import session_token_usage, token_usage_lock
             # 按会话取模型：切模型后重算必须用该会话新绑定模型的窗口
             active = get_active_model(session_name) or {}
@@ -6242,6 +6286,9 @@ class ApiBridge(GitBridgeMixin):
             with token_usage_lock:
                 session_token_usage["latest_total"] = total
                 session_token_usage["latest_prompt"] = 0
+            # 上下文占比快照与 token 记账同生命周期：重算即清理旧快照，
+            # 避免切换会话后悬停面板残留上一会话的占比
+            clear_breakdown()
         except Exception:
             logger.debug("重算 token 用量失败", exc_info=True)
 
@@ -6510,6 +6557,60 @@ class ApiBridge(GitBridgeMixin):
             return {"ok": ok, "msg": msg, "hooks": hooks, "workdir": root}
         except Exception as e:
             logger.exception("_hook_trust_action(%s) 失败", action)
+            return {"ok": False, "msg": str(e)}
+
+    def save_hook(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """保存（新增/更新）一条 Hook 配置（手动配置入口；成功后回传刷新列表）。
+
+        成功: {"ok": ok, "msg": msg, "hooks": [...], "workdir": root}
+        异常: {"ok": False, "msg": str(e)}（绝不抛出到 pywebview 调用侧）
+        """
+        try:
+            from core.hooks.config_mutation import save_hook_config
+            from core.hooks.trust import list_hooks_with_status
+            root = self._hook_workspace_root()
+            ok, msg = save_hook_config(payload or {}, workspace_root=root)
+            hooks = list_hooks_with_status(workspace_root=root)
+            return {"ok": ok, "msg": msg, "hooks": hooks, "workdir": root}
+        except Exception as e:
+            logger.exception("save_hook 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def delete_hook(self, source_path: str, digest: str) -> Dict[str, Any]:
+        """删除一条 Hook 配置（手动配置入口；成功后回传刷新列表）。
+
+        成功: {"ok": ok, "msg": msg, "hooks": [...], "workdir": root}
+        异常: {"ok": False, "msg": str(e)}（绝不抛出到 pywebview 调用侧）
+        """
+        try:
+            from core.hooks.config_mutation import delete_hook_config
+            from core.hooks.trust import list_hooks_with_status
+            root = self._hook_workspace_root()
+            ok, msg = delete_hook_config(source_path, digest, workspace_root=root)
+            hooks = list_hooks_with_status(workspace_root=root)
+            return {"ok": ok, "msg": msg, "hooks": hooks, "workdir": root}
+        except Exception as e:
+            logger.exception("delete_hook 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_hook_disabled(
+        self, source_path: str, digest: str, disabled: bool
+    ) -> Dict[str, Any]:
+        """启用/停用一条 Hook 配置（手动配置入口；成功后回传刷新列表）。
+
+        成功: {"ok": ok, "msg": msg, "hooks": [...], "workdir": root}
+        异常: {"ok": False, "msg": str(e)}（绝不抛出到 pywebview 调用侧）
+        """
+        try:
+            # 别名导入：避免与桥接方法同名造成阅读歧义（导入的是一元布尔写入函数）
+            from core.hooks.config_mutation import set_hook_disabled as _set_hook_disabled
+            from core.hooks.trust import list_hooks_with_status
+            root = self._hook_workspace_root()
+            ok, msg = _set_hook_disabled(source_path, digest, disabled, workspace_root=root)
+            hooks = list_hooks_with_status(workspace_root=root)
+            return {"ok": ok, "msg": msg, "hooks": hooks, "workdir": root}
+        except Exception as e:
+            logger.exception("set_hook_disabled 失败")
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
