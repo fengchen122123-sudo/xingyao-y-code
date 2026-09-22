@@ -60,4 +60,35 @@ describe('token statistics store', () => {
     expect(store.tokenStatistics.summary.total).toBe(1100);
     expect(store.tokenStatisticsLoading).toBe(false);
   });
+
+  it('loads the lifetime (365 days) snapshot', async () => {
+    const lifetimeSnapshot = structuredClone(snapshot);
+    lifetimeSnapshot.range.days = 365;
+    const getStatistics = vi.fn().mockResolvedValue(lifetimeSnapshot);
+    (window as any).pywebview = { api: { get_token_usage_statistics: getStatistics } };
+    const store = useAppStore() as any;
+
+    const result = await store.loadTokenStatisticsLifetime(true);
+
+    expect(result?.ok).toBe(true);
+    expect(getStatistics).toHaveBeenCalledWith(365);
+    expect(store.tokenStatisticsLifetime.range.days).toBe(365);
+    expect(store.tokenStatisticsLifetimeLoading).toBe(false);
+  });
+
+  it('keeps the previous lifetime snapshot when refresh fails', async () => {
+    const getStatistics = vi.fn().mockResolvedValue({ ok: false, msg: 'database busy' });
+    (window as any).pywebview = { api: { get_token_usage_statistics: getStatistics } };
+    const store = useAppStore() as any;
+    const oldLifetime = structuredClone(snapshot);
+    oldLifetime.range.days = 365;
+    store.tokenStatisticsLifetime = oldLifetime;
+
+    const result = await store.loadTokenStatisticsLifetime(true);
+
+    expect(result?.ok).toBe(false);
+    expect(store.tokenStatisticsLifetime.range.days).toBe(365);
+    expect(store.tokenStatisticsLifetime.summary.total).toBe(1100);
+    expect(store.tokenStatisticsLifetimeLoading).toBe(false);
+  });
 });
