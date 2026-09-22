@@ -97,6 +97,46 @@ def test_worker_without_pending_mode_keeps_binding_untouched(manager, tmp_path):
     assert manager.get_session_permission_mode("自动化任务") == "accept_edits"
 
 
+def test_worker_binds_session_mode_into_auth_path(manager, tmp_path):
+    """回合执行期间鉴权路径必须读到会话生效档位，而非全局默认。
+
+    历史缺陷：会话级 full 只落在 DB 与提示词文本，鉴权路径读全局值，
+    导致会话级「完全访问」不被认可、变更类工具反复弹确认。
+    """
+    from core import app_context
+    from tests.test_gui_automation_dispatch import (
+        _WorkerHarness,
+        _make_bridge as _make_worker_bridge,
+    )
+
+    bridge = _make_worker_bridge(manager, tmp_path)[0]
+    manager.ensure_session("自动化任务", workdir="GLOBAL", source="GUI")
+    manager.set_session_permission_mode("自动化任务", "full")
+    # 全局默认刻意设为 confirm：只有会话绑定经线程作用域生效才能读到 full
+    bridge._current_permission_mode = "confirm"
+    app_context.set_permission_mode("confirm")
+
+    seen = []
+    harness = _WorkerHarness(bridge, manager, tmp_path, consume_return=False)
+    harness.__enter__()
+    # 捕获真实的 turn 消费入口（harness 已替换为桩），再包一层读取档位
+    real_consume = bridge._consume_turn_events
+
+    def _capture(*args, **kwargs):
+        seen.append(app_context.get_permission_mode())
+        return real_consume(*args, **kwargs)
+
+    bridge._consume_turn_events = _capture
+    try:
+        bridge._run_turn_worker("你好", "自动化任务")
+    finally:
+        harness.__exit__(None, None, None)
+
+    # 回合内读到会话级 full；回合结束后线程档位解绑、回退全局 confirm
+    assert seen == ["full"]
+    assert app_context.get_permission_mode() == "confirm"
+
+
 def test_send_user_message_validates_and_forwards_permission_mode(manager, tmp_path):
     """未知档位拒绝不发；合法档位透传给 worker（pending 补绑定）。"""
     bridge = _make_bridge(manager)

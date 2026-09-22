@@ -51,6 +51,10 @@ common_datas = [
     # 以 file:// 引用此文件，浏览器端离线渲染；缺失时页面降级只显示源码）
     ('vendor/mermaid/mermaid-11.17.2.min.js', 'vendor/mermaid'),
     ('frontend/dist', 'frontend/dist'),
+    # 独立移动端子应用（/m/ 路径托管，co-team 风格界面）：lan_server 的
+    # _serve_mobile_static() 在打包环境从 _MEIPASS/frontend-mobile/dist 读取；
+    # 缺失时手机扫码打开 /m/ 路径会 404（经典界面不受影响）
+    ('frontend-mobile/dist', 'frontend-mobile/dist'),
     # 手机远程控制传输 shim：LAN server 注入到手机端页面 <head>，
     # _serve_shim() 在打包环境从 _MEIPASS/frontend/ 读取；缺失时手机端
     # window.pywebview 永不注入，前端 30s 轮询超时后弹「pywebview API 不可用」
