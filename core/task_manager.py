@@ -76,7 +76,12 @@ _MAX_TASK_LOGS = 50
 # get_task_output 的 task_id 白名单，防止路径穿越读取任意日志文件
 _TASK_ID_PATTERN = re.compile(r"^[\w-]{1,64}$")
 
-from core.command_policy import is_dangerous_command, redact_sensitive_text
+from core.command_policy import (
+    build_child_env,
+    is_dangerous_command,
+    load_shell_env_policy,
+    redact_sensitive_text,
+)
 
 # 兼容已有内部调用和测试；策略实现集中在 command_policy。
 _is_dangerous_command = is_dangerous_command
@@ -374,7 +379,10 @@ def start_background_task(command: str, session_id: str = "", shell_id: str = ""
         log_file = open(log_file_path, "wb")
 
         # 注入环境变量，强制让 Python 的输出不进行缓冲，实时写入日志文件
-        env = os.environ.copy()
+        # T1 安全默认：后台子进程默认不继承敏感环境变量（*KEY*/*SECRET*/*TOKEN*/*PASSWORD*），
+        # 逃生门 config.json "shell_env_policy": {"exclude_sensitive": false}；
+        # 实时日志所需的注入在 build_child_env 结果之上显式叠加。
+        env = build_child_env(os.environ, policy=load_shell_env_policy())
         output_encoding = platform_console_encoding()
         env["PYTHONUNBUFFERED"] = "1"
         env["PYTHONIOENCODING"] = output_encoding
