@@ -13,11 +13,54 @@ def _wait_until(predicate, timeout=5.0, interval=0.02):
     return predicate()
 
 
-def _fire_immediately(service):
-    """把已注册快照的 deadline 回拨到过去并唤醒线程，立即触发一次保活。"""
+def _fire_immediately(service, session_key=None):
+    """把已注册会话条目的 deadline 回拨到过去并唤醒线程，立即触发一次保活。
+
+    session_key 为 None 时对所有会话条目生效（线程每轮挑最早到期的一个执行）。
+    """
     with service._condition:
-        service._last_activity -= service._interval + 1
+        if session_key is None:
+            targets = list(service._entries.items())
+        else:
+            targets = [(session_key, service._entries[session_key])]
+        assert targets, "没有已注册的保活条目"
+        for _key, entry in targets:
+            entry["last_activity"] -= entry["interval"] + 1
         service._condition.notify_all()
+
+
+def _keepalive_request(tag):
+    """最小可用保活请求；tag 落在 messages 里便于断言是哪个会话被保活。"""
+    return {
+        "model": "openai/qwen3.8-flash",
+        "messages": [{"role": "user", "content": tag}],
+    }
+
+
+@pytest.fixture(autouse=True)
+def _clear_route_config_caches():
+    """清空路由配置的指纹缓存，避免测试替身 load_config 的结论跨测试残留。
+
+    _configured_keepalive_routes / _qwen_cache 系列按 (load_config 身份, 配置
+    文件 mtime) 失效缓存；monkeypatch 换替身后指纹虽已变化，但缓存条目会持有
+    替身函数的引用，这里统一清空以保证测试间完全隔离。
+    """
+    import core.llm_dialects as dialects
+
+    def _clear():
+        with dialects._qwen_cache_cfg_lock:
+            dialects._keepalive_routes_cfg_cache["entry"] = None
+            dialects._qwen_cache_cfg_cache.clear()
+
+    _clear()
+    yield
+    _clear()
+
+
+def _drop_sessions(service, *session_keys):
+    """测试收尾：停掉指定会话的保活，避免线程残留在后续测试里继续发请求。"""
+    for session_key in session_keys:
+        service.register_request({}, interval=0, session_key=session_key)
 
 
 def test_keepalive_interval_defaults_120_and_rejects_too_short(monkeypatch):
@@ -46,6 +89,11 @@ def test_keepalive_interval_defaults_120_and_rejects_too_short(monkeypatch):
     )
     with pytest.raises(ValueError, match="至少为 60"):
         load_keepalive_interval()
+    # 显式传 interval 的调用点（register_request）同样拒绝过短间隔
+    from core.cache_keepalive import CacheKeepaliveService
+
+    with pytest.raises(ValueError, match="至少为 60"):
+        CacheKeepaliveService().register_request(_keepalive_request("t"), interval=30)
 
 
 def test_keepalive_request_reuses_prefix_but_limits_output():
@@ -88,8 +136,11 @@ def test_deepseek_keepalive_is_limited_to_official_routes():
     ) is False
 
 
-def test_kimi_keepalive_is_limited_to_official_routes():
+def test_kimi_keepalive_is_limited_to_official_routes(monkeypatch):
     from core.llm import _supports_cache_keepalive
+
+    # 无 cache_keepalive_routes 显式配置时，第三方中转站路由器不保活
+    monkeypatch.setattr("core.model_manager.load_config", lambda: {})
 
     assert _supports_cache_keepalive(
         "openai/k3-256k", "https://api.kimi.com/coding/v1"
@@ -97,6 +148,41 @@ def test_kimi_keepalive_is_limited_to_official_routes():
     assert _supports_cache_keepalive(
         "openai/kimi-k2.6", "https://tokenrhythm.studio/v1"
     ) is False
+
+
+def test_keepalive_routes_config_enables_explicit_gateway_routes(monkeypatch):
+    """顶层 cache_keepalive_routes 显式声明后，该域名的第三方路由启用保活。"""
+    from core.llm import _supports_cache_keepalive
+
+    monkeypatch.setattr(
+        "core.model_manager.load_config",
+        lambda: {"cache_keepalive_routes": ["tokenrhythm.studio"]},
+    )
+
+    # 裸域名条目命中带路径的 api_base（/v1 后缀不影响域名归一化）
+    assert _supports_cache_keepalive(
+        "openai/deepseek-flash", "https://tokenrhythm.studio/v1"
+    ) is True
+    # 无路径、大小写与端口变体同样命中
+    assert _supports_cache_keepalive(
+        "openai/deepseek-flash", "https://TokenRhythm.Studio"
+    ) is True
+    assert _supports_cache_keepalive(
+        "openai/deepseek-flash", "https://tokenrhythm.studio:8443/v1"
+    ) is True
+    # 未在配置中声明的其他网关路由不受影响
+    assert _supports_cache_keepalive(
+        "openai/deepseek-flash", "https://aggregator.example/v1"
+    ) is False
+
+    # 条目写成完整 URL（带路径）走同一归一化，同样命中
+    monkeypatch.setattr(
+        "core.model_manager.load_config",
+        lambda: {"cache_keepalive_routes": ["https://tokenrhythm.studio/v1"]},
+    )
+    assert _supports_cache_keepalive(
+        "openai/deepseek-flash", "https://tokenrhythm.studio/v1"
+    ) is True
 
 
 def test_deepseek_thinking_keepalive_omits_tool_choice_and_disables_thinking():
@@ -329,7 +415,7 @@ def test_keepalive_retries_transient_failure_instead_of_stopping(monkeypatch):
 
 
 def test_keepalive_stops_after_retries_exhausted(monkeypatch):
-    """重试耗尽（1 次首发 + 2 次退避重试）仍失败才允许自停。"""
+    """重试耗尽（1 次首发 + 2 次退避重试）仍失败才停用该会话的保活。"""
     import core.cache_keepalive as ka
 
     calls = []
@@ -357,9 +443,10 @@ def test_keepalive_stops_after_retries_exhausted(monkeypatch):
             interval=60,
         )
         _fire_immediately(service)
-        assert _wait_until(lambda: service.status()["enabled"] is False), "重试耗尽应自停"
+        assert _wait_until(lambda: service.status()["enabled"] is False), "重试耗尽应停用该会话"
         assert len(calls) == 3
         assert service.status()["error"] == "_Timeout"
+        assert service.status()["session_count"] == 0
     finally:
         service.register_request({}, interval=0)
 
@@ -412,3 +499,208 @@ def test_keepalive_retry_backoff_yields_to_new_registration(monkeypatch):
         assert service.status()["enabled"] is True
     finally:
         service.register_request({}, interval=0)
+
+
+def test_session_key_falls_back_to_telemetry_then_default(monkeypatch):
+    """会话键解析：显式 session_key > telemetry.session_id > 固定默认键。
+
+    默认键保证旧调用方（只传 request/interval/telemetry）行为不变：
+    不带 telemetry 的 register_request 只影响默认键条目，不误伤会话条目。"""
+    import core.cache_keepalive as ka
+
+    monkeypatch.setattr(ka, "load_keepalive_interval", lambda: 120)
+
+    service = ka.CacheKeepaliveService()
+    try:
+        service.register_request(
+            _keepalive_request("from-telemetry"),
+            interval=60,
+            telemetry={"session_id": "session-x"},
+        )
+        assert set(service._entries) == {"session-x"}
+        # 显式 session_key 优先于 telemetry.session_id
+        service.register_request(
+            _keepalive_request("explicit"),
+            interval=60,
+            telemetry={"session_id": "session-x"},
+            session_key="session-y",
+        )
+        assert set(service._entries) == {"session-x", "session-y"}
+        # 旧调用方（无 session_key / 无 telemetry）落到固定默认键，间隔走配置默认值
+        service.register_request(_keepalive_request("legacy"))
+        assert set(service._entries) == {
+            "session-x",
+            "session-y",
+            ka.DEFAULT_KEEPALIVE_SESSION_KEY,
+        }
+        assert service.status()["interval"] == 120
+        # 默认键的 interval=0 只停默认键条目，会话条目照旧
+        service.register_request({}, interval=0)
+        assert set(service._entries) == {"session-x", "session-y"}
+    finally:
+        _drop_sessions(
+            service, "session-x", "session-y", ka.DEFAULT_KEEPALIVE_SESSION_KEY
+        )
+
+
+def test_multi_session_keepalive_tracks_each_session(monkeypatch):
+    """多会话各自注册快照后，每个会话都应被保活（不再只覆盖最后一个会话）。
+
+    单快照实现的 bug：register_request 覆盖全局快照，只有最后注册的会话被续
+    TTL；实测 19 个会话、920 次切换/天下，间隔 > 5 分钟切回时 28% 的请求
+    命中率 < 50%，而带保活的官方路由切回命中率 96.2%。"""
+    import core.cache_keepalive as ka
+
+    dispatched = []
+
+    def fake_completion(**kwargs):
+        dispatched.append(kwargs["messages"][0]["content"])
+        return "ok-response"
+
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
+    monkeypatch.setattr(
+        ka, "account_keepalive_response", lambda response, telemetry: {"valid": True}
+    )
+
+    service = ka.CacheKeepaliveService()
+    try:
+        service.register_request(
+            _keepalive_request("sess-a"), interval=60, session_key="sess-a"
+        )
+        service.register_request(
+            _keepalive_request("sess-b"), interval=60, session_key="sess-b"
+        )
+        assert service.status()["session_count"] == 2
+        _fire_immediately(service)
+        assert _wait_until(
+            lambda: set(dispatched) == {"sess-a", "sess-b"}
+        ), "两个会话都应收到保活请求"
+        assert service.status()["enabled"] is True
+    finally:
+        _drop_sessions(service, "sess-a", "sess-b")
+
+
+def test_stopping_one_session_keeps_other_sessions_alive(monkeypatch):
+    """主请求开始时只停本会话快照：其他会话的保活继续（旧实现清空全局快照）。"""
+    import time as _time
+    import core.cache_keepalive as ka
+
+    dispatched = []
+
+    def fake_completion(**kwargs):
+        dispatched.append(kwargs["messages"][0]["content"])
+        return "ok-response"
+
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
+    monkeypatch.setattr(
+        ka, "account_keepalive_response", lambda response, telemetry: {"valid": True}
+    )
+
+    service = ka.CacheKeepaliveService()
+    try:
+        service.register_request(
+            _keepalive_request("sess-a"), interval=60, session_key="sess-a"
+        )
+        service.register_request(
+            _keepalive_request("sess-b"), interval=60, session_key="sess-b"
+        )
+        # 模拟主模型请求开始：只停 sess-a
+        service.register_request({}, interval=0, session_key="sess-a")
+        assert service.status()["session_count"] == 1
+        _fire_immediately(service)
+        assert _wait_until(lambda: dispatched == ["sess-b"]), "sess-b 仍应被保活"
+        _time.sleep(0.2)
+        assert dispatched == ["sess-b"], "sess-a 已停用，不应再发保活请求"
+        assert service.status()["enabled"] is True
+    finally:
+        _drop_sessions(service, "sess-a", "sess-b")
+
+
+def test_session_limit_evicts_oldest(monkeypatch):
+    """超过 MAX_KEEPALIVE_SESSIONS 时淘汰 last_activity 最旧的条目。"""
+    import core.cache_keepalive as ka
+
+    assert ka.MAX_KEEPALIVE_SESSIONS == 4
+    keys = [f"sess-{index}" for index in range(ka.MAX_KEEPALIVE_SESSIONS + 1)]
+
+    service = ka.CacheKeepaliveService()
+    try:
+        for key in keys:
+            service.register_request(
+                _keepalive_request(key), interval=60, session_key=key
+            )
+        assert set(service._entries) == set(keys[1:]), "最旧的会话应被淘汰"
+        assert service.status()["session_count"] == ka.MAX_KEEPALIVE_SESSIONS
+    finally:
+        _drop_sessions(service, *keys)
+
+
+def test_idle_session_is_pruned_from_loop(monkeypatch):
+    """last_activity 超过 KEEPALIVE_IDLE_EXPIRE_SECONDS 的条目在循环中被清理。"""
+    import core.cache_keepalive as ka
+
+    assert ka.KEEPALIVE_IDLE_EXPIRE_SECONDS == 30 * 60
+
+    service = ka.CacheKeepaliveService()
+    try:
+        service.register_request(
+            _keepalive_request("stale"), interval=60, session_key="stale"
+        )
+        service.register_request(
+            _keepalive_request("fresh"), interval=60, session_key="fresh"
+        )
+        # 把 stale 会话回拨到 1 小时前（超过 30 分钟空闲），唤醒线程触发清理
+        with service._condition:
+            service._entries["stale"]["last_activity"] -= 3600
+            service._condition.notify_all()
+        assert _wait_until(
+            lambda: "stale" not in service._entries
+        ), "空闲超时的会话条目应被清理"
+        assert "fresh" in service._entries
+        assert service.status()["session_count"] == 1
+    finally:
+        _drop_sessions(service, "stale", "fresh")
+
+
+def test_failing_session_does_not_stop_other_sessions(monkeypatch):
+    """某会话连续失败只停用该会话；其他会话的保活不受影响（旧实现全局自停）。"""
+    import core.cache_keepalive as ka
+
+    class _Timeout(Exception):
+        pass
+
+    dispatched = []
+
+    def fake_completion(**kwargs):
+        content = kwargs["messages"][0]["content"]
+        if content == "sess-bad":
+            raise _Timeout("keepalive timed out")
+        dispatched.append(content)
+        return "ok-response"
+
+    monkeypatch.setattr("core.llm._dispatch_completion", fake_completion)
+    monkeypatch.setattr(
+        ka, "account_keepalive_response", lambda response, telemetry: {"valid": True}
+    )
+    monkeypatch.setattr(ka, "KEEPALIVE_RETRY_BACKOFF_SECONDS", 0.01)
+
+    service = ka.CacheKeepaliveService()
+    try:
+        service.register_request(
+            _keepalive_request("sess-bad"), interval=60, session_key="sess-bad"
+        )
+        service.register_request(
+            _keepalive_request("sess-good"), interval=60, session_key="sess-good"
+        )
+        _fire_immediately(service)
+        assert _wait_until(
+            lambda: dispatched == ["sess-good"]
+        ), "健康会话的保活不能被失败会话拖垮"
+        assert _wait_until(
+            lambda: set(service._entries) == {"sess-good"}
+        ), "失败会话只停自己（连续 3 次尝试后移除该条目）"
+        assert service.status()["enabled"] is True
+        assert service.status()["session_count"] == 1
+        assert service.status()["error"] == ""
+    finally:
+        _drop_sessions(service, "sess-bad", "sess-good")
