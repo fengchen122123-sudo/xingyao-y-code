@@ -91,12 +91,16 @@
             @click.stop="store.setSandbox(!store.sandboxEnabled)"
           ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
 
-          <!-- 上下文统计圆环：弧线占比 = 已用上下文/窗口，悬停查看用量详情 -->
+          <!-- 上下文统计圆环：弧线占比 = 已用上下文/窗口；悬停弹出用量详情面板，
+               触摸设备点按切换（面板见 ContextUsagePanel） -->
           <span
+            ref="ctxRingRef"
             class="ctx-ring"
             :class="tokenClass"
-            :title="ctxTooltip"
             data-test="context-ring"
+            @mouseenter="openContextUsage"
+            @mouseleave="scheduleContextUsageClose"
+            @click.stop="toggleContextUsageOnTouch"
           >
             <svg viewBox="0 0 20 20" width="18" height="18" aria-hidden="true">
               <circle class="ctx-ring-bg" cx="10" cy="10" r="8" />
@@ -141,6 +145,13 @@
       :anchor-el="modelBtnRef"
       @close="showModelCascader = false"
     />
+    <!-- 上下文用量悬停面板：挂在圆环上方，鼠标在两元素间移动不关闭 -->
+    <ContextUsagePanel
+      :visible="showContextUsage"
+      :anchor-el="ctxRingRef"
+      @hover-enter="cancelContextUsageClose"
+      @hover-leave="scheduleContextUsageClose"
+    />
     <PermDropdown
       :visible="showPermDropdown"
       :anchor-el="permBtnRef"
@@ -162,12 +173,13 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import type { QueuedMessage } from '../types/pywebview';
 import { formatPermMode } from '../utils/markdown';
 import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
+import ContextUsagePanel from './ContextUsagePanel.vue';
 import PermDropdown from './PermDropdown.vue';
 import ReasoningSelector from './ReasoningSelector.vue';
 import AttachmentChips from './AttachmentChips.vue';
@@ -235,6 +247,64 @@ const ctxTooltip = computed(() => {
   const win = store.tokenUsage.window || 0;
   const remain = Math.max(win - used, 0);
   return `${ctxPctLabel.value}（${formatTokenCount(used)} / ${formatTokenCount(win)}）· 剩余约 ${formatTokenCount(remain)}`;
+});
+
+// —— 上下文用量面板：悬停圆环打开、移出延迟关闭（给鼠标移入面板的过渡时间）；
+//    面板自身悬停取消关闭；触摸设备点按切换；打开期间 Esc 关闭 ——
+const CTX_PANEL_CLOSE_DELAY = 160;
+const showContextUsage = ref(false);
+const ctxRingRef = ref<HTMLElement | null>(null);
+let ctxCloseTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearContextUsageClose() {
+  if (ctxCloseTimer !== null) {
+    clearTimeout(ctxCloseTimer);
+    ctxCloseTimer = null;
+  }
+}
+
+function openContextUsage() {
+  clearContextUsageClose();
+  showContextUsage.value = true;
+}
+
+function scheduleContextUsageClose() {
+  clearContextUsageClose();
+  ctxCloseTimer = setTimeout(() => {
+    ctxCloseTimer = null;
+    showContextUsage.value = false;
+  }, CTX_PANEL_CLOSE_DELAY);
+}
+
+function cancelContextUsageClose() {
+  clearContextUsageClose();
+}
+
+function toggleContextUsageOnTouch() {
+  if (!isTouch.value) return;
+  if (showContextUsage.value) {
+    clearContextUsageClose();
+    showContextUsage.value = false;
+  } else {
+    openContextUsage();
+  }
+}
+
+function onContextUsageKeydown(e: KeyboardEvent) {
+  if (e.key === 'Escape') {
+    clearContextUsageClose();
+    showContextUsage.value = false;
+  }
+}
+
+watch(showContextUsage, (visible) => {
+  if (visible) document.addEventListener('keydown', onContextUsageKeydown);
+  else document.removeEventListener('keydown', onContextUsageKeydown);
+});
+
+onUnmounted(() => {
+  clearContextUsageClose();
+  document.removeEventListener('keydown', onContextUsageKeydown);
 });
 
 const { attachments, pickAttachments, removeAttachment, clearAttachments, handlePaste, dragging, bindDrop, addPaths, uploadFiles, openAttachmentImage } = useAttachments();
@@ -508,14 +578,15 @@ textarea {
   display: inline-block;
 }
 
-/* 上下文统计圆环：margin-left:auto 把它与模型/发送按钮一起顶到右侧（红圈位置） */
+/* 上下文统计圆环：margin-left:auto 把它与模型/发送按钮一起顶到右侧（红圈位置）；
+   悬停弹出用量面板，指针样式提示可交互 */
 .ctx-ring {
   margin-left: auto;
   display: inline-flex;
   align-items: center;
   flex-shrink: 0;
   color: var(--accent);
-  cursor: default;
+  cursor: pointer;
 }
 .ctx-ring svg {
   display: block;

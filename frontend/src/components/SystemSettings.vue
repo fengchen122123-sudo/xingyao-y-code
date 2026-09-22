@@ -226,6 +226,56 @@
         </li>
       </ul>
     </section>
+
+    <section class="doctor-settings" data-test="doctor-settings-section">
+      <header class="doctor-header">
+        <h2 class="doctor-title"><AppIcon name="zap" :size="14" /> 运行自检</h2>
+        <p>一键检查配置、凭据、数据目录、数据库、MCP 服务、模型端点与运行环境，与 CLI 的 /doctor 使用同一套检查项；除数据目录做一次写入-删除自测外全部只读。</p>
+      </header>
+
+      <div class="setting-row">
+        <div class="setting-copy">
+          <h2>聚合自检</h2>
+          <p>模型端点检查需要联网探测（最长 3 秒），期间界面不会冻结；完成后逐项展示结果与建议。</p>
+        </div>
+        <button
+          data-test="run-doctor-button"
+          class="setting-save"
+          type="button"
+          :disabled="doctorRunning"
+          @click="runDoctor"
+        >
+          {{ doctorRunning ? '检查中…' : '运行自检' }}
+        </button>
+      </div>
+
+      <p v-if="doctorError" data-test="doctor-error" class="setting-error">{{ doctorError }}</p>
+
+      <div v-if="doctorChecks.length" data-test="doctor-results" class="doctor-results">
+        <p class="doctor-summary" data-test="doctor-summary">{{ doctorSummaryText }}</p>
+        <ul class="doctor-list">
+          <li
+            v-for="check in doctorChecks"
+            :key="check.name"
+            class="doctor-item"
+            :class="`doctor-item--${check.status}`"
+            :data-test="`doctor-check-${check.name}`"
+          >
+            <span class="doctor-status-icon">
+              <AppIcon :name="doctorStatusIcon(check.status)" :size="14" :stroke-width="2.25" />
+            </span>
+            <div class="doctor-item-body">
+              <div class="doctor-item-head">
+                <span class="doctor-name">{{ check.name }}</span>
+                <span class="doctor-status-text">{{ doctorStatusLabel(check.status) }}</span>
+              </div>
+              <p v-if="check.detail" class="doctor-detail">{{ check.detail }}</p>
+              <p v-if="check.hint" class="doctor-hint">建议：{{ check.hint }}</p>
+            </div>
+          </li>
+        </ul>
+      </div>
+    </section>
   </div>
 </template>
 
@@ -235,6 +285,7 @@ import { computed, ref, watch } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import { useIsMobile } from '../composables/useViewport';
 import AppIcon from './AppIcon.vue';
+import type { DoctorCheck, DoctorCheckStatus } from '../types/pywebview';
 
 const store = useAppStore();
 const saving = ref(false);
@@ -425,6 +476,65 @@ async function selectComputerBrowser(browser: string) {
     saving.value = false;
   }
 }
+
+// ── /doctor 聚合自检（T3b）：与 CLI /doctor 同源（core.doctor.run_checks）。
+// 结果为一次性快照（含 detail/hint 建议），只在本组件内维护，不进全局 Store ──
+
+const DOCTOR_STATUS_LABELS: Record<DoctorCheckStatus, string> = {
+  ok: '通过',
+  warn: '警告',
+  fail: '失败',
+  skip: '跳过',
+};
+const DOCTOR_STATUS_ICONS: Record<DoctorCheckStatus, string> = {
+  ok: 'check',
+  warn: 'triangle-alert',
+  fail: 'x',
+  skip: 'circle',
+};
+
+const doctorRunning = ref(false);
+const doctorError = ref('');
+const doctorChecks = ref<DoctorCheck[]>([]);
+
+const doctorSummaryText = computed(() => {
+  const count = (status: DoctorCheckStatus) =>
+    doctorChecks.value.filter(check => check.status === status).length;
+  return `共 ${doctorChecks.value.length} 项：通过 ${count('ok')}、警告 ${count('warn')}、失败 ${count('fail')}、跳过 ${count('skip')}`;
+});
+
+function doctorStatusLabel(status: string): string {
+  return DOCTOR_STATUS_LABELS[status as DoctorCheckStatus] || status;
+}
+
+function doctorStatusIcon(status: string): string {
+  return DOCTOR_STATUS_ICONS[status as DoctorCheckStatus] || 'info';
+}
+
+async function runDoctor() {
+  if (doctorRunning.value) return;
+  // 与 SettingsPage 的更新检查一致：直接读 window.pywebview，不弹全局"连接失败"模态框
+  const api = window.pywebview?.api;
+  if (!api) {
+    doctorError.value = '连接失败：请在桌面客户端中运行自检';
+    return;
+  }
+  doctorRunning.value = true;
+  doctorError.value = '';
+  try {
+    const report = await api.run_doctor();
+    if (report && report.ok && Array.isArray(report.checks)) {
+      doctorChecks.value = report.checks;
+    } else {
+      // 后端防御性兜底（ok=false）：保留上一次结果，仅提示错误
+      doctorError.value = `自检失败：${(report && report.msg) || '未知错误'}`;
+    }
+  } catch (err) {
+    doctorError.value = `自检失败：${err}`;
+  } finally {
+    doctorRunning.value = false;
+  }
+}
 </script>
 
 <style scoped>
@@ -485,6 +595,26 @@ async function selectComputerBrowser(browser: string) {
 .computer-preflight li.ok { color: var(--text-dim); }
 .computer-preflight li:not(.ok) svg { color: var(--danger); }
 .computer-preflight li.ok svg { color: var(--green); }
+
+/* ── 运行自检（T3b）── */
+.doctor-settings { margin-top: 34px; }
+.doctor-header { margin-bottom: 6px; }
+.doctor-title { display: flex; align-items: center; gap: 7px; margin: 0 0 7px; font-size: 16px; color: var(--text-bright); }
+.doctor-header p { margin: 0; color: var(--text-faint); font-size: 12.5px; line-height: 1.6; }
+.doctor-results { margin-top: 16px; }
+.doctor-summary { margin: 0 0 10px; color: var(--text-dim); font-size: 12.5px; }
+.doctor-list { margin: 0; padding: 0; list-style: none; }
+.doctor-item { display: flex; align-items: flex-start; gap: 10px; margin-bottom: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); }
+.doctor-status-icon { margin-top: 2px; color: var(--text-faint); }
+.doctor-item--ok .doctor-status-icon { color: var(--green); }
+.doctor-item--warn .doctor-status-icon { color: var(--warning); }
+.doctor-item--fail .doctor-status-icon { color: var(--danger); }
+.doctor-item-body { min-width: 0; }
+.doctor-item-head { display: flex; align-items: baseline; gap: 8px; }
+.doctor-name { font-size: 13px; color: var(--text-bright); }
+.doctor-status-text { font-size: 11.5px; color: var(--text-faint); }
+.doctor-detail { margin: 4px 0 0; color: var(--text-dim); font-size: 12.5px; line-height: 1.6; word-break: break-word; }
+.doctor-hint { margin: 3px 0 0; color: var(--warning); font-size: 12px; line-height: 1.6; word-break: break-word; }
 
 @media (max-width: 620px) {
   .setting-row { align-items: stretch; flex-direction: column; gap: 12px; padding: 16px 0; }

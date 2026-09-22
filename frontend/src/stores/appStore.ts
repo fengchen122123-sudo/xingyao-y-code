@@ -19,6 +19,7 @@ import type {
   PlanData,
   BackgroundTask,
   TokenUsage,
+  ContextBreakdownItem,
   TokenStatisticsSnapshot,
   PermissionMode,
   ReasoningChoice,
@@ -139,6 +140,30 @@ function enqueueGuiThemeOperation<T extends object>(
   return result;
 }
 
+// 上下文来源占比快照：旧后端缺失→[]；过滤非法 source 与非正 chars（容错不炸）
+const CONTEXT_BREAKDOWN_SOURCES = new Set<ContextBreakdownItem['source']>([
+  'messages',
+  'system_prompt',
+  'skills',
+  'runtime_context',
+  'tools',
+]);
+
+const normalizeContextBreakdown = (value: unknown): ContextBreakdownItem[] => {
+  if (!Array.isArray(value)) return [];
+  const items: ContextBreakdownItem[] = [];
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object') continue;
+    const source = (raw as { source?: unknown }).source;
+    if (typeof source !== 'string') continue;
+    if (!CONTEXT_BREAKDOWN_SOURCES.has(source as ContextBreakdownItem['source'])) continue;
+    const chars = Number((raw as { chars?: unknown }).chars);
+    if (!Number.isFinite(chars) || chars <= 0) continue;
+    items.push({ source: source as ContextBreakdownItem['source'], chars });
+  }
+  return items;
+};
+
 export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
   const nullableNumber = (value: unknown): number | null => {
     if (value === null || value === undefined) return null;
@@ -162,6 +187,7 @@ export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
     total_prompt: Number(data.total_prompt ?? 0),
     total_completion: Number(data.total_completion ?? 0),
     total_cached: Number(data.total_cached ?? 0),
+    context_breakdown: normalizeContextBreakdown(data.context_breakdown),
   };
 };
 
@@ -675,6 +701,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
     tokenStatistics: null as TokenStatisticsSnapshot | null,
     tokenStatisticsLoading: false,
     tokenStatisticsDays: 30 as 1 | 7 | 30,
+    tokenStatisticsLifetime: null as TokenStatisticsSnapshot | null,
+    tokenStatisticsLifetimeLoading: false,
 
     // 软件更新状态
     updateState: {
@@ -4208,6 +4236,56 @@ navItems: [] as Array<{ id: number; preview: string }>,
     revokeHookTrust(digest: string) { return this._hookTrustAction('revoke_hook_trust', digest); },
     resetHookTrust(digest: string) { return this._hookTrustAction('reset_hook_trust', digest); },
 
+    // C13：Hook 手动配置（新建/编辑/删除/启停；成功后回传刷新列表，失败返回 { ok:false, msg } 由调用方提示）
+    async saveHook(payload: Record<string, any>): Promise<{ ok: boolean; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.save_hook(payload);
+        if (res && res.ok) {
+          this.hooks = res.hooks || this.hooks;
+          // 递增刷新序号：本次动作已拿到最新快照，在途的旧 refreshHooks 响应作废
+          this.hooksReqSeq++;
+          return { ok: true };
+        }
+        return { ok: false, msg: (res && res.msg) || '保存 Hook 失败' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async deleteHook(sourcePath: string, digest: string): Promise<{ ok: boolean; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.delete_hook(sourcePath, digest);
+        if (res && res.ok) {
+          this.hooks = res.hooks || this.hooks;
+          this.hooksReqSeq++;
+          return { ok: true };
+        }
+        return { ok: false, msg: (res && res.msg) || '删除 Hook 失败' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async setHookDisabled(sourcePath: string, digest: string, disabled: boolean): Promise<{ ok: boolean; msg?: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥未就绪' };
+      try {
+        const res = await api.set_hook_disabled(sourcePath, digest, disabled);
+        if (res && res.ok) {
+          this.hooks = res.hooks || this.hooks;
+          this.hooksReqSeq++;
+          return { ok: true };
+        }
+        return { ok: false, msg: (res && res.msg) || (disabled ? '禁用 Hook 失败' : '启用 Hook 失败') };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
     // C11：一键信任/拒绝全部待决项目级 Hook（先快照数组，逐个串行避免遍历中变更）
     async grantAllPendingHookTrusts() {
       const pending = [...this.pendingProjectHooks];
@@ -4766,7 +4844,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
           return result;
         }
         this.tokenStatistics = result;
-        this.tokenStatisticsDays = result.range.days;
+        this.tokenStatisticsDays = days;
         return result;
       } catch (err) {
         this.connected = false;
@@ -4774,6 +4852,30 @@ navItems: [] as Array<{ id: number; preview: string }>,
         return null;
       } finally {
         this.tokenStatisticsLoading = false;
+      }
+    },
+
+    async loadTokenStatisticsLifetime(force = false) {
+      if (!force && this.tokenStatisticsLifetime) {
+        return this.tokenStatisticsLifetime;
+      }
+      const api = this._api();
+      if (!api) return null;
+      this.tokenStatisticsLifetimeLoading = true;
+      try {
+        const result = await api.get_token_usage_statistics(365);
+        if (!result || !result.ok) {
+          this.notifyModal('Token 统计', '加载 Token 统计失败: ' + (result?.msg || '未知错误'));
+          return result;
+        }
+        this.tokenStatisticsLifetime = result;
+        return result;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('Token 统计', '加载 Token 统计失败: ' + err);
+        return null;
+      } finally {
+        this.tokenStatisticsLifetimeLoading = false;
       }
     },
 
