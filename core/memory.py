@@ -784,6 +784,116 @@ class MemoryManager:
             row = cursor.fetchone()
             return None if row is None else dict(zip(columns, row))
 
+    def export_harness_journal(self, session_name: str = "", since_ms: int = 0) -> list[dict]:
+        """只读导出 harness 三表（turns/steps/events）为逐行 JSON 记录（T5）。
+
+        - 仅含 ID 与元数据（Harness 纪律：journal 不落消息正文，只有 sha256/
+          计数/时长/状态等），供诊断包与审计使用；
+        - session_name 为空时导出全部会话；since_ms > 0 时只导出
+          started_at_ms >= since_ms 的回合及其 steps/events；
+        - 不新增写路径、不改 schema：本方法只做 SELECT。
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            if session_name:
+                cursor.execute(
+                    "SELECT id, session_name FROM sessions WHERE session_name = ?",
+                    (session_name,),
+                )
+            else:
+                cursor.execute("SELECT id, session_name FROM sessions")
+            session_names = {int(row[0]): row[1] for row in cursor.fetchall()}
+            if not session_names:
+                return []
+
+            placeholders = ",".join("?" for _ in session_names)
+            turn_filter = f"WHERE session_id IN ({placeholders})"
+            turn_params = list(session_names)
+            if since_ms:
+                turn_filter += " AND started_at_ms >= ?"
+                turn_params.append(int(since_ms))
+            cursor.execute(
+                "SELECT turn_id, session_id, owner_id, status, started_at_ms, "
+                "finished_at_ms, last_sequence, error_code FROM harness_turns "
+                f"{turn_filter} ORDER BY started_at_ms ASC, turn_id ASC",
+                turn_params,
+            )
+            turn_columns = (
+                "turn_id", "session_id", "owner_id", "status", "started_at_ms",
+                "finished_at_ms", "last_sequence", "error_code",
+            )
+            rows: list[dict] = []
+            for raw in cursor.fetchall():
+                turn = dict(zip(turn_columns, raw))
+                rows.append({
+                    "type": "turn",
+                    "turn_id": turn["turn_id"],
+                    "session_name": session_names.get(int(turn["session_id"]), ""),
+                    "owner_id": turn["owner_id"],
+                    "status": turn["status"],
+                    "started_at_ms": turn["started_at_ms"],
+                    "finished_at_ms": turn["finished_at_ms"],
+                    "last_sequence": turn["last_sequence"],
+                    "error_code": turn["error_code"],
+                })
+
+            joined_filter = (
+                "JOIN harness_turns t ON t.turn_id = st.turn_id "
+                f"WHERE t.session_id IN ({placeholders})"
+            )
+            step_params = list(session_names)
+            if since_ms:
+                joined_filter += " AND t.started_at_ms >= ?"
+                step_params.append(int(since_ms))
+            cursor.execute(
+                "SELECT st.step_id, st.turn_id, st.ordinal, st.status, st.protocol, "
+                "st.model, st.api_base, st.cache_scope, st.messages_sha256, "
+                "st.system_sha256, st.tools_sha256, st.options_sha256, "
+                "st.cache_lane_sha256, st.message_count, st.system_message_count, "
+                "st.request_bytes, st.system_bytes, st.tools_bytes, st.options_bytes, "
+                "st.request_reason, st.attempt_count, st.deepseek_generation_id, "
+                "st.started_at_ms, st.finished_at_ms, st.duration_ms, "
+                "st.finish_reason, st.error_code FROM harness_steps st "
+                f"{joined_filter} ORDER BY st.turn_id ASC, st.ordinal ASC",
+                step_params,
+            )
+            step_columns = (
+                "step_id", "turn_id", "ordinal", "status", "protocol", "model",
+                "api_base", "cache_scope", "messages_sha256", "system_sha256",
+                "tools_sha256", "options_sha256", "cache_lane_sha256",
+                "message_count", "system_message_count", "request_bytes",
+                "system_bytes", "tools_bytes", "options_bytes", "request_reason",
+                "attempt_count", "deepseek_generation_id", "started_at_ms",
+                "finished_at_ms", "duration_ms", "finish_reason", "error_code",
+            )
+            for raw in cursor.fetchall():
+                rows.append({"type": "step", **dict(zip(step_columns, raw))})
+
+            event_filter = (
+                "JOIN harness_turns t ON t.turn_id = ev.turn_id "
+                f"WHERE t.session_id IN ({placeholders})"
+            )
+            event_params = list(session_names)
+            if since_ms:
+                event_filter += " AND t.started_at_ms >= ?"
+                event_params.append(int(since_ms))
+            cursor.execute(
+                "SELECT ev.id, ev.turn_id, ev.step_id, ev.sequence, ev.kind, "
+                "ev.created_at_ms, ev.message_id, ev.tool_name, ev.call_ordinal, "
+                "ev.arguments_sha256, ev.result_sha256, ev.duration_ms, "
+                "ev.result_status, ev.error_code FROM harness_events ev "
+                f"{event_filter} ORDER BY ev.turn_id ASC, ev.sequence ASC",
+                event_params,
+            )
+            event_columns = (
+                "id", "turn_id", "step_id", "sequence", "kind", "created_at_ms",
+                "message_id", "tool_name", "call_ordinal", "arguments_sha256",
+                "result_sha256", "duration_ms", "result_status", "error_code",
+            )
+            for raw in cursor.fetchall():
+                rows.append({"type": "event", **dict(zip(event_columns, raw))})
+            return rows
+
     def checkpoint_wal(self):
         """主动执行 WAL checkpoint，整理被写的预写日志，防止 ycode.db-wal 文件体积无限膨胀。"""
         with self._lock:
