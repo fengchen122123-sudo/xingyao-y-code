@@ -48,8 +48,9 @@ const props = defineProps<{
 const emit = defineEmits<{
   /** 点击未加载区域红点：父组件负责跨页翻页后回调 jumpToLoaded */
   (e: 'jump', payload: { index: number; id: number }): void;
-  /** 发起定位（任意红点点击）：父组件据此抑制自动吸底，避免视口被拽回底部 */
-  (e: 'locating'): void;
+  /** 跳转发起（任意红点点击）：父组件据此显式退出「跟随底部」——
+     跳转后内容变化不再自动吸底，直到用户主动滚回底部或点回底按钮 */
+  (e: 'jumpStart'): void;
 }>();
 
 const hasNavIndex = computed(() => Array.isArray(props.navItems) && props.navItems.length > 0);
@@ -58,7 +59,6 @@ const hasNavIndex = computed(() => Array.isArray(props.navItems) && props.navIte
 // 回合会撑破上限，此时已加载区首条消息是 assistant/tool，它的 id 不在 user 索引里。
 // 这种情况必须退回到「其后第一条 user 消息」，否则分界会退化成 0：轨道的
 // 已加载/未加载判断、点击定位、（滚动时）高亮反查会整体错位。
-// 用户反馈的「点第 3 个红点显示第 4 条内容」正是这种偏移。
 const loadedFirstIndex = computed(() => {
   if (!hasNavIndex.value) return 0;
   const first = props.loadedFirstId;
@@ -163,10 +163,9 @@ function refresh() {
 }
 
 // 当前"正在显示"的用户消息索引：滚动时按视口中线实时判定；
-// 点击红点立即置为目标索引并"钉住"，直到用户手动滚动才交还给几何判定
-//（否则点击后 updateActive 的几何计算会立即把高亮算回去）。
+// 点击红点立即置为目标索引并"钉住"，直到用户手动滚动才交还给几何判定。
 const activeIndex = ref(-1);
-// 点击跳转的目标索引；用户手动滚动时清除
+// 点击跳转的目标索引；用户手动滚动/显式回底时清除
 let pinnedIndex = -1;
 
 function updateActive() {
@@ -200,8 +199,10 @@ function updateActive() {
 }
 
 function jumpTo(i: number) {
-  // 先通知父组件抑制自动吸底：定位期间任何吸底都会把视口拽回底部，破坏跳转
-  emit('locating');
+  // 新跳转接管：静默取消上一次跳转的定位检查（高亮/定位由本次负责）
+  cancelJumpChecks();
+  // 先通知父组件显式退出「跟随底部」：跳转后内容变化不再自动吸底
+  emit('jumpStart');
   pinnedIndex = i;
   activeIndex.value = i;
   if (hasNavIndex.value) {
@@ -220,23 +221,120 @@ function jumpTo(i: number) {
 
 /** 已加载（含刚翻页加载到）的红点定位：全局索引换算局部 DOM 索引后 scrollTo */
 function scrollToLoadedIndex(globalIdx: number) {
-  scrollToLocalIndex(globalIdx - (hasNavIndex.value ? loadedFirstIndex.value : 0));
+  const base = hasNavIndex.value ? loadedFirstIndex.value : 0;
+  // clamp 到 0：翻页护栏中断导致目标仍超出已加载范围时，退到已加载区最上面，
+  // 避免负索引取不到元素、点了没反应
+  scrollToLocalIndex(Math.max(0, globalIdx - base));
+}
+
+/** 目标滚动位置：目标消息顶对齐视口顶部（留 16px 呼吸空间），并双端 clamp。
+    clamp 上界（maxScroll）是关键：内容收缩后目标可能超过可滚动范围，不 clamp
+    的话每次校正都写不进去、形成"稳定但偏差永远存在"的死循环。 */
+function computeJumpTarget(scrollEl: HTMLElement, el: HTMLElement): number {
+  const rect = el.getBoundingClientRect();
+  const scrollRect = scrollEl.getBoundingClientRect();
+  const raw = rect.top - scrollRect.top + scrollEl.scrollTop - 16;
+  const max = Math.max(0, scrollEl.scrollHeight - scrollEl.clientHeight);
+  return Math.min(Math.max(0, raw), max);
+}
+
+// —— 跳转定位的「有界校正」——
+// 一次性 scrollTo 的终点可能过时：目标上方/附近内容（图片解码、代码高亮、折叠体）
+// 会在动画期间继续撑开。这里在发起平滑定位后按固定检查点做有限校正：
+//   检查点 [800ms, 1500ms] + 兜底 2500ms 无条件收尾；
+//   校正只在「滚动已停止（距最后 scroll 事件 ≥200ms）」且「偏移 >10px」时执行；
+//   校正次数上限 2 次，绝无每帧校正/无限循环；用户输入或显式回底立即取消。
+// 与旧实现（每帧检查 + 即时校正）的区别：旧实现会在平滑动画启动初期误判
+// "位置稳定"而打断动画，且目标不可达时反复校正形成死循环（视口高频闪动）。
+const JUMP_ALIGN_TOLERANCE = 10;     // px：偏移在此内视为已对齐
+const JUMP_CHECK_DELAYS_MS = [800, 1500];
+const JUMP_FINALIZE_MS = 2500;       // 兜底：无论结果，彻底结束检查
+const JUMP_CHECK_MAX_CORRECTIONS = 2;
+const JUMP_SCROLL_IDLE_MS = 200;     // 距最后一次 scroll 事件多久算「滚动停止」
+let jumpTimers: number[] = [];
+let jumpChecking = false;
+let jumpCorrections = 0;
+let jumpLastScrollAt = 0;
+
+function cancelJumpTimers() {
+  for (const t of jumpTimers) window.clearTimeout(t);
+  jumpTimers = [];
+}
+
+/** 静默取消跳转检查（新跳转接管/组件卸载用；不触碰高亮钉住） */
+function cancelJumpChecks() {
+  cancelJumpTimers();
+  jumpChecking = false;
+}
+
+/** 公开取消（用户滚动接管/显式回底/发送消息）：结束检查并解除高亮钉住 */
+function cancelJump() {
+  cancelJumpChecks();
+  pinnedIndex = -1;
+}
+
+function prefersReducedMotion(): boolean {
+  return typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
 }
 
 function scrollToLocalIndex(localIdx: number) {
   const scrollEl = props.getScrollEl();
   const el = props.getUserMsgElements()[localIdx];
-  if (!scrollEl || !el) return;
-  const rect = el.getBoundingClientRect();
-  const scrollRect = scrollEl.getBoundingClientRect();
-  // 让目标消息滚动到距离滚动容器顶部 16px 的位置（留一点呼吸空间）
-  const target = rect.top - scrollRect.top + scrollEl.scrollTop - 16;
-  scrollEl.scrollTo({ top: Math.max(0, target), behavior: 'smooth' });
+  if (!scrollEl || !el) {
+    // 目标缺失（索引与 DOM 短暂不同步）：结束检查，避免定时器泄漏
+    cancelJumpChecks();
+    return;
+  }
+  const target = computeJumpTarget(scrollEl, el);
+  scrollEl.scrollTo({ top: target, behavior: prefersReducedMotion() ? 'auto' : 'smooth' });
+  startJumpChecks(scrollEl, el);
+}
+
+function startJumpChecks(scrollEl: HTMLElement, el: HTMLElement) {
+  cancelJumpTimers();
+  jumpChecking = true;
+  jumpCorrections = 0;
+  jumpLastScrollAt = Date.now();
+  for (const delay of JUMP_CHECK_DELAYS_MS) {
+    jumpTimers.push(window.setTimeout(() => runJumpCheck(scrollEl, el), delay));
+  }
+  // 兜底：检查点全部被跳过（滚动迟迟不停）时做最后一次校正机会，然后无条件收尾
+  jumpTimers.push(window.setTimeout(() => runJumpCheck(scrollEl, el, true), JUMP_FINALIZE_MS));
+}
+
+function runJumpCheck(scrollEl: HTMLElement, el: HTMLElement, final = false) {
+  if (!jumpChecking) return;
+  // 元素被卸载（切会话/消息流重排）或滚动容器已更换：直接收尾
+  if (!el.isConnected || props.getScrollEl() !== scrollEl) {
+    cancelJumpChecks();
+    return;
+  }
+  // 滚动仍在进行（平滑动画/惯性中）：本次不校正，交给后续检查点。
+  // 最终检查（final）不再等待——长动画必已结束；若此时仍有滚动活动，
+  // 也必来自内容/惯性而非用户输入（用户输入会先取消整个检查）。
+  if (!final && Date.now() - jumpLastScrollAt < JUMP_SCROLL_IDLE_MS) return;
+  if (jumpCorrections >= JUMP_CHECK_MAX_CORRECTIONS) {
+    cancelJumpChecks();
+    return;
+  }
+  const target = computeJumpTarget(scrollEl, el);
+  const delta = target - scrollEl.scrollTop;
+  if (Math.abs(delta) <= JUMP_ALIGN_TOLERANCE) {
+    // 已对齐：提前收尾
+    cancelJumpChecks();
+    return;
+  }
+  scrollEl.scrollTo({ top: target, behavior: 'auto' });
+  jumpCorrections += 1;
+  if (final || jumpCorrections >= JUMP_CHECK_MAX_CORRECTIONS) {
+    cancelJumpChecks();
+  }
 }
 
 /** 父组件跨页加载完成后回调：目标已进入已加载范围，执行定位 */
 function jumpToLoaded(globalIdx: number) {
-  emit('locating');
+  cancelJumpChecks();
   pinnedIndex = globalIdx;
   activeIndex.value = globalIdx;
   scrollToLoadedIndex(globalIdx);
@@ -244,9 +342,15 @@ function jumpToLoaded(globalIdx: number) {
 
 let resizeObserver: ResizeObserver | undefined;
 let boundScrollEl: HTMLElement | null = null;
-const onScroll = () => updateActive();
-// 用户主动滚动（滚轮/触摸/键盘）时解除点击高亮的钉住，交还给几何判定
-const unpin = () => { pinnedIndex = -1; };
+const onScroll = () => {
+  // 记录滚动活动：跳转检查点据此判定「滚动是否已停止」
+  if (jumpChecking) jumpLastScrollAt = Date.now();
+  updateActive();
+};
+// 用户主动滚动（滚轮/触摸/键盘）时解除高亮钉住并取消跳转检查，不再抢滚动控制权
+const unpin = () => {
+  cancelJump();
+};
 
 onMounted(() => {
   refresh();
@@ -266,6 +370,7 @@ onMounted(() => {
 });
 
 onUnmounted(() => {
+  cancelJumpTimers();
   resizeObserver?.disconnect();
   boundScrollEl?.removeEventListener('scroll', onScroll);
   boundScrollEl?.removeEventListener('wheel', unpin);
@@ -275,7 +380,7 @@ onUnmounted(() => {
 // 索引刷新（切会话/回合结束）时重算红点与槽位
 watch(() => props.navItems, () => refresh());
 
-defineExpose({ refresh, jumpToLoaded });
+defineExpose({ refresh, jumpToLoaded, cancelJump });
 </script>
 
 <style scoped>
@@ -333,9 +438,17 @@ defineExpose({ refresh, jumpToLoaded });
   transform: scale(1.4);
   opacity: 1;
 }
-/* 未加载（历史分页未翻到的区域）：更淡，点击会触发跨页加载 */
-.rail-dot.dim::before {
-  opacity: 0.22;
+/* 未加载（历史分页未翻到的区域）：空心环样式——清晰可见（能看到有多少条、可点击），
+   又与已加载的实心点明确区分（点击会触发跨页加载）。旧样式（实心、透明度 0.22）
+   在浅色主题下几乎不可见，用户会误以为"红点没有渲染出来"。
+   :not(.active)：跳转目标被钉住高亮时让 active 的实心样式优先。 */
+.rail-dot.dim:not(.active)::before {
+  background: transparent;
+  box-shadow: inset 0 0 0 1.5px var(--text-faint);
+  opacity: 0.6;
+}
+.rail-dot.dim:not(.active):hover::before {
+  opacity: 0.9;
 }
 
 /* 悬停预览浮层：fixed 定位在红点左侧，约 20 字（20em）一行自动换行，
