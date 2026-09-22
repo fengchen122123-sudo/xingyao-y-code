@@ -839,7 +839,11 @@ def execute_command(
     _execution_result: _CommandExecutionResult | None = None,
 ):
     """引擎工具：在本地终端默默执行命令，并把终端里的输出抓取回来"""
-    from core.command_policy import is_dangerous_command
+    from core.command_policy import (
+        build_child_env,
+        is_dangerous_command,
+        load_shell_env_policy,
+    )
     from core.workspace_context import get_workdir
 
     # 撤销中断期间冻结该工作区的一切星瑶侧写入（命令可绕过文件工具冻结，规格 21）
@@ -913,7 +917,10 @@ def execute_command(
         from core.task_scheduler import _stop_process_tree
 
         output_encoding = platform_console_encoding()
-        env = os.environ.copy()
+        # T1 安全默认：子进程默认不继承敏感环境变量（*KEY*/*SECRET*/*TOKEN*/*PASSWORD*），
+        # 逃生门 config.json "shell_env_policy": {"exclude_sensitive": false}；
+        # 编码注入在 build_child_env 结果之上显式叠加，不受策略裁剪影响。
+        env = build_child_env(os.environ, policy=load_shell_env_policy())
         env["PYTHONIOENCODING"] = output_encoding
         env["PYTHONUTF8"] = "0"
 
