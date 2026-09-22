@@ -5776,6 +5776,21 @@ def run_cli():
 
 
 if __name__ == "__main__":
+    # T2 配置未知键自检：默认仅写 runtime-warnings 诊断日志（现有警告通道，
+    # 见 core.runtime_warnings）；strict_config=true 时拒绝启动（退出码 2，
+    # 与 headless「2=配置错误」语义一致）。
+    try:
+        from config import UnknownConfigKeysError, audit_config_keys
+
+        audit_config_keys()
+    except UnknownConfigKeysError as config_key_error:
+        print(f"\n🚨 配置校验失败：{config_key_error}", file=sys.stderr)
+        print("请修正 config.json 中的未知键（或删除拼错的键）后重试。", file=sys.stderr)
+        sys.exit(2)
+    except Exception:
+        # 自检属于 best-effort 诊断，自身故障绝不能反过来阻断启动
+        pass
+
     # Headless 模式：ycode -p "task" 一次性执行任务后退出，不进入交互式 CLI
     # 用途：CI/脚本/管道集成（参考 Grok Build/OpenCode 的 headless 模式）
     # 用法：

@@ -548,6 +548,35 @@ def _finalize_gui_exit(lifecycle) -> None:
     _shutdown_computer_runtime()
 
 
+def _audit_config_keys() -> None:
+    """T2 配置未知键自检：默认仅写 GUI 运行日志（现有警告通道）；
+    strict_config=true 时原生弹窗报错并拒绝启动（严格模式的配置错误必须用户可见）。"""
+    try:
+        from config import UnknownConfigKeysError, audit_config_keys
+
+        audit_config_keys()
+    except UnknownConfigKeysError as error:
+        logger.error("配置校验失败（strict_config=true）：%s", error)
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "config.json 存在未知配置键，且已开启严格校验（strict_config=true），"
+                "启动已中止。\n\n"
+                f"{error}\n\n"
+                "请修正或删除这些键后重新启动。",
+                "星瑶Code · 配置错误",
+                0x10 | 0x00040000,  # MB_ICONERROR | MB_TOPMOST
+            )
+        except Exception:
+            logger.exception("配置错误告警弹窗失败")
+        sys.exit(1)
+    except Exception:
+        # 自检属于 best-effort 诊断，自身故障绝不能反过来阻断启动
+        logger.debug("配置未知键自检失败（忽略）", exc_info=True)
+
+
 def main():
     _configure_runtime_logging()
     # 无条件记录本进程身份：诊断"venv 与系统 Python / 安装版双进程共存"
@@ -562,6 +591,8 @@ def main():
     # 单实例保护：已有实例运行时直接激活其窗口并退出本进程，避免双开
     if _acquire_single_instance():
         sys.exit(0)
+    # T2 配置未知键自检：放在单例判定之后，双开场景不打扰既有实例
+    _audit_config_keys()
     # 显式传入真正的 MCP 单例，避免桥接层拿到空的 MCP 管理器
     try:
         from core.mcp_client import mcp_manager
