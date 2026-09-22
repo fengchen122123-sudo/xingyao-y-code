@@ -1075,8 +1075,13 @@ def _chat_with_model_generator(
     if cache_scope == "main":
         from core.cache_keepalive import cache_keepalive_service, load_keepalive_interval
         configured_keepalive = load_keepalive_interval()
-        # 每次主模型请求先停掉旧快照，防止切换 provider 后仍保活旧模型。
-        cache_keepalive_service.register_request({}, interval=0)
+        # 主模型请求开始只停掉"本会话"的旧快照，防止切换 provider 后仍保活旧模型；
+        # 其他会话（后台/多窗口切换）的快照继续保活，切回时不再全量 miss。
+        cache_keepalive_service.register_request(
+            {},
+            interval=0,
+            session_key=_resolve_cache_session_identity(cache_session_id),
+        )
         if request_protocol != "responses" and _supports_cache_keepalive(model_name, api_base):
             keepalive_interval = configured_keepalive
     # 1. 自动注入 KAIROS 长期记忆指示与 MEMORY.md 索引。
@@ -1397,6 +1402,15 @@ def _chat_with_model_generator(
     request_tools = _select_request_tools_for_route(
         model_name, api_base, request_tools
     )
+    # 【纯旁路】工具定义字符量快照（设计规格 §3.3）：每步请求都会走到，
+    # 重复更新无害；失败仅记 debug，绝不改变 request_tools 与发送字节。
+    try:
+        from core.context_breakdown import update_source as _update_ctx_source
+        _update_ctx_source(
+            "tools", len(json.dumps(request_tools, ensure_ascii=False))
+        )
+    except Exception:
+        logger.debug("工具定义字符量统计失败（旁路，已忽略）", exc_info=True)
     # 原生 OpenAI 协议（Task 11a，设计 11.1/11.2）：native tools 不进
     # request_tools（chat 格式），而是经 prepare_stream_request 的
     # native_computer_tools 参数追加在 flattened function tools 之后；
@@ -2046,6 +2060,7 @@ def _chat_with_model_generator(
                 _notify_event(event_callback, "notice", {"message": truncated_notice.strip()})
 
             if cache_scope == "main" and keepalive_interval:
+                # session_key 与会话身份对齐：多会话各自保活，互不顶替
                 cache_keepalive_service.register_request(
                     kwargs,
                     interval=keepalive_interval,
@@ -2054,6 +2069,7 @@ def _chat_with_model_generator(
                         "api_base": api_base,
                         "session_id": telemetry_session_id,
                     },
+                    session_key=telemetry_session_id,
                 )
 
             # 流结束：按最终 usage chunk 严格校验并统一记账一次。

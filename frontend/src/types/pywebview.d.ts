@@ -178,6 +178,26 @@ export interface ComputerControlResult extends ComputerRunSnapshot {
   msg?: string;
 }
 
+// /doctor 聚合自检（T3b）：单项结果来自 core.doctor.CheckResult，字段名与
+// CLI `/doctor --json` schema 完全一致（name/status/detail/hint）；status 四态固定
+export type DoctorCheckStatus = 'ok' | 'warn' | 'fail' | 'skip';
+
+export interface DoctorCheck {
+  name: string;
+  status: DoctorCheckStatus;
+  detail: string;
+  hint: string;
+}
+
+// run_doctor 桥接返回：ok=false 时 checks 为 []（防御性兜底），
+// summary 为各状态计数（键固定四态），供设置页顶部汇总展示
+export interface DoctorReport {
+  ok: boolean;
+  msg?: string;
+  checks: DoctorCheck[];
+  summary: Record<DoctorCheckStatus, number>;
+}
+
 // 电脑操控四类事件（Task 13a）：平铺信封——run_id 与严格递增的 event_seq 都在
 // 顶层，与既有 {"type","data"} 信封不同；事件体只含脱敏小 JSON，绝不携带截图
 // base64 或输入正文。载荷字段按防御性解析声明为可选并容忍未知扩展字段
@@ -301,6 +321,8 @@ export interface HookInfo {
   scope: 'user' | 'project';
   digest: string;
   status: 'pending' | 'trusted' | 'stale' | 'blocked' | 'revoked';
+  // 是否已禁用；后端总返回，可选以兼容旧桥接
+  disabled?: boolean;
 }
 
 // 星轨自动化任务（待开发/星轨自动化任务/01-完整设计规格.md 11.3）
@@ -408,6 +430,19 @@ export interface BackgroundTask {
   running_time?: string;
 }
 
+// 上下文来源（字符数估算，仅用于悬停面板展示占比，不进 token 账本）
+export type ContextBreakdownSource =
+  | 'messages'
+  | 'system_prompt'
+  | 'skills'
+  | 'runtime_context'
+  | 'tools';
+
+export interface ContextBreakdownItem {
+  source: ContextBreakdownSource;
+  chars: number;
+}
+
 export interface TokenUsage {
   used: number;
   window: number;
@@ -425,6 +460,8 @@ export interface TokenUsage {
   total_prompt: number;
   total_completion: number;
   total_cached: number;
+  /** 上下文来源字符占比快照（输入框悬停面板用）；无数据为 [] */
+  context_breakdown: ContextBreakdownItem[];
 }
 
 export interface TokenStatisticsMetrics {
@@ -451,7 +488,7 @@ export interface TokenStatisticsDay extends TokenStatisticsMetrics {
 export interface TokenStatisticsSnapshot {
   ok: true;
   range: {
-    days: 1 | 7 | 30;
+    days: 1 | 7 | 30 | 365;
     start_date: string;
     end_date: string;
   };
@@ -826,6 +863,9 @@ export interface PyWebViewAPI {
   set_ai_output_dir(path: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // /doctor 聚合自检（T3b）：设置页「运行自检」入口，复用 CLI 同一套检查
+  // （core.doctor.run_checks）；skipNetwork 默认 false（含模型端点联网探测）
+  run_doctor(skipNetwork?: boolean): Promise<DoctorReport>;
   // 电脑操控三个严格 setter（Task 12）：失败返回 error_code + 后端真实快照
   set_browser_control_enabled(value: boolean): Promise<SystemSettingsMutationResult>;
   set_computer_control_enabled(value: boolean): Promise<SystemSettingsMutationResult>;
@@ -856,7 +896,7 @@ export interface PyWebViewAPI {
   jump_queue(sessionName: string, messageId: string): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;
-  get_token_usage_statistics(days: 1 | 7 | 30): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
+  get_token_usage_statistics(days: 1 | 7 | 30 | 365): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
 
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
   refresh_skills(): Promise<{ ok: boolean; skills?: SkillInfo[]; msg?: string }>;
@@ -880,6 +920,10 @@ export interface PyWebViewAPI {
   deny_hook_trust(digest: string): Promise<any>;
   revoke_hook_trust(digest: string): Promise<any>;
   reset_hook_trust(digest: string): Promise<any>;
+  // C13：Hook 手动配置（新建/编辑/删除/启停；成功后回传刷新列表）
+  save_hook(payload: Record<string, any>): Promise<{ ok: boolean; msg?: string; hooks?: HookInfo[]; workdir?: string }>;
+  delete_hook(sourcePath: string, digest: string): Promise<{ ok: boolean; msg?: string; hooks?: HookInfo[]; workdir?: string }>;
+  set_hook_disabled(sourcePath: string, digest: string, disabled: boolean): Promise<{ ok: boolean; msg?: string; hooks?: HookInfo[]; workdir?: string }>;
   get_mcp_servers(): Promise<McpInfo[]>;
   toggle_mcp_server(name: string, enabled: boolean): Promise<any>;
   add_mcp_server(name: string, command: string, args: string[], env?: Record<string, string>, enabled?: boolean): Promise<any>;

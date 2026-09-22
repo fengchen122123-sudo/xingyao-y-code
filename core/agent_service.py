@@ -1054,6 +1054,38 @@ def prepare_turn_messages(
         ref_block=ref_block,
     )
 
+    # 【纯旁路】上下文来源字符占比快照（设计规格 §3.3）：仅供 GUI 悬停
+    # 面板展示比例，不进 token 账本；与请求内容零耦合、不改任何发送字节，
+    # 任何异常仅记 debug，绝不影响本轮组装。
+    try:
+        from core.context_breakdown import set_breakdown
+        from core.skills import get_active_skills_catalog
+
+        skills_text = get_active_skills_catalog() or ""
+        # 与 build_stable_system_extra_sections 同源：空白目录段不会进系统提示词
+        skills_len = len(skills_text) if skills_text.strip() else 0
+        # 排除系统消息与已单列的后缀，避免占比重复计入
+        suffix_chars = (
+            len(dynamic_prompt) + len(time_note) + len(summary_msg) + len(ref_block)
+        )
+        messages_chars = max(
+            sum(len(str(m)) for m in history if m.get("role") != "system")
+            - suffix_chars,
+            0,
+        )
+        system_prompt_chars = max(
+            len(system_message["content"]) - skills_len, 0
+        )
+        runtime_context_chars = suffix_chars
+        set_breakdown([
+            {"source": "messages", "chars": messages_chars},
+            {"source": "system_prompt", "chars": system_prompt_chars},
+            {"source": "skills", "chars": skills_len},
+            {"source": "runtime_context", "chars": runtime_context_chars},
+        ])
+    except Exception:
+        logger.debug("上下文来源占比统计失败（旁路，已忽略）", exc_info=True)
+
     return history
 
 

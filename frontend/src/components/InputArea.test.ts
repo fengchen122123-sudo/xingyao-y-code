@@ -230,3 +230,83 @@ it('输入组件因设置页卸载后重新挂载仍恢复当前会话草稿', a
   expect(wrapper.get('textarea').element.value).toBe('设置往返后仍保留');
   wrapper.unmount();
 });
+
+// —— 上下文用量面板：悬停圆环打开 / 延迟关闭 / 面板内保持 ——
+
+function mountInput() {
+  return mount(InputArea, { global: { stubs: { teleport: true } } });
+}
+
+it('悬停上下文圆环打开用量面板，移出后延迟关闭', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const store = useAppStore();
+    store.tokenUsage = { ...store.tokenUsage, used: 12345, window: 128000 };
+    const wrapper = mountInput();
+    const ring = wrapper.get('[data-test="context-ring"]');
+
+    // 原生 title 已移除，改为悬停详情面板
+    expect(ring.attributes('title')).toBeUndefined();
+
+    await ring.trigger('mouseenter');
+    expect(wrapper.get('.ctx-usage-panel').classes()).toContain('show');
+    expect(wrapper.get('[data-test="ctx-usage-summary"]').text())
+      .toBe('12,345 / 128,000（9.6%）');
+
+    // 移出圆环：延迟期内仍显示（留给鼠标移入面板的过渡时间）
+    await ring.trigger('mouseleave');
+    expect(wrapper.get('.ctx-usage-panel').classes()).toContain('show');
+
+    vi.advanceTimersByTime(300);
+    await nextTick();
+    expect(wrapper.get('.ctx-usage-panel').classes()).not.toContain('show');
+    wrapper.unmount();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('鼠标移入面板取消关闭，移出面板后延迟关闭', async () => {
+  vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+  try {
+    const wrapper = mountInput();
+    const ring = wrapper.get('[data-test="context-ring"]');
+    await ring.trigger('mouseenter');
+    await ring.trigger('mouseleave');
+
+    const panel = wrapper.get('.ctx-usage-panel');
+    await panel.trigger('mouseenter');
+    vi.advanceTimersByTime(300);
+    await nextTick();
+    expect(panel.classes()).toContain('show');
+
+    await panel.trigger('mouseleave');
+    vi.advanceTimersByTime(300);
+    await nextTick();
+    expect(wrapper.get('.ctx-usage-panel').classes()).not.toContain('show');
+    wrapper.unmount();
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it('触摸设备点按上下文圆环切换面板', async () => {
+  const originalMatchMedia = window.matchMedia;
+  Object.defineProperty(window, 'matchMedia', {
+    configurable: true,
+    value: (query: string) => ({ matches: query.includes('pointer'), media: query }),
+  });
+  try {
+    const wrapper = mountInput();
+    const ring = wrapper.get('[data-test="context-ring"]');
+
+    await ring.trigger('click');
+    expect(wrapper.get('.ctx-usage-panel').classes()).toContain('show');
+
+    await ring.trigger('click');
+    expect(wrapper.get('.ctx-usage-panel').classes()).not.toContain('show');
+    wrapper.unmount();
+  } finally {
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia });
+  }
+});
