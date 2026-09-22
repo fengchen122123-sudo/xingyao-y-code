@@ -1,3 +1,4 @@
+import difflib
 import json
 import logging
 import os
@@ -393,3 +394,165 @@ def save_config_value(key, value):
         # 调用方普遍不检查返回值，失败必须留下诊断痕迹而不是静默丢配置
         _log_warning("save_config_value(%r) 写入 config.json 失败: %s", key, e)
         return False
+
+
+# ---------------------------------------------------------------------------
+# T2 配置未知键校验：手改 config.json 拼错字段名时给出可见告警（此前静默无效）。
+# 只校验「键名」，不做类型/取值校验，也不触碰任何写路径。
+# 已知键来源 = config.example.json + config.py 默认结构 + 各模块运行时读写键的并集。
+# ---------------------------------------------------------------------------
+
+KNOWN_CONFIG_KEYS = frozenset({
+    # 模型与厂商
+    "active_model_id", "secondary_model_id", "secondary_model_roles", "providers",
+    # 旧版单模型格式（_resolve_constant 兼容读取 model/api_key/base_url）
+    "model", "api_key", "base_url",
+    # 权限与工作区
+    "permission_mode", "allow_outside_workspace",
+    # 运行与界面
+    "theme", "gui_theme_light", "gui_theme_id",
+    "command_shell", "shell_env_policy",
+    "agent_turn_step_limit", "prompt_cache_keepalive_seconds",
+    "mermaid_auto_open", "read_file_result_max_chars",
+    # 记忆/图片压缩
+    "memory_compression", "image_compression",
+    # 工具、安全与数据目录
+    "search_exclude_dirs", "skill_search_paths",
+    "fetch_url_allow_hosts", "fetch_url_strict_ssrf",
+    "expose_mcp_admin_tools", "project_hook_full_input",
+    "ai_output_dir",
+    # 电脑操控
+    "browser_control_enabled", "computer_control_enabled", "computer_browser",
+    # 局域网远程控制
+    "remote_token_ttl", "remote_pair_token", "remote_pair_token_expires_at",
+    "remote_pair_port",
+    # 数据迁移
+    "media_v1_migration_done",
+    # 本任务新增：严格模式开关
+    "strict_config",
+})
+
+# 已知嵌套对象（两层）允许的子键：顶层键 -> 子键集合
+KNOWN_NESTED_CONFIG_KEYS = {
+    "secondary_model_roles": frozenset({"vision", "compression", "subagent"}),
+    "image_compression": frozenset({"max_edge", "quality", "max_output_bytes"}),
+    "memory_compression": frozenset({
+        "retain_count", "retain_count_force",
+        "tool_result_truncate_threshold_chars", "tool_result_preview_limit_chars",
+        "tool_result_token_limit", "summary_length_first", "summary_length_merge",
+        "max_chunk_token_budget", "inter_chunk_delay_seconds", "max_total_seconds",
+        "precompress_ratio",
+    }),
+    "shell_env_policy": frozenset({
+        "inherit", "exclude_sensitive", "exclude", "include_only", "set",
+    }),
+}
+
+# providers[] 与 providers[].models[] 条目的已知键（含可选扩展键）
+_KNOWN_PROVIDER_KEYS = frozenset({
+    "id", "name", "base_url", "api_key", "protocol", "preset_id", "models",
+    # Qwen 缓存策略可挂在 provider 级（core.llm_dialects._QWEN_CACHE_CONFIG_KEYS）
+    "enable_prompt_cache", "prompt_cache", "enable_cache_control", "cache_control",
+    # 历史功能键：dd839a0（2026-09-19）前的「预设模型删除痕迹」功能已移除，
+    # 老配置可能残留此键，按兼容保留（不报未知，避免 strict 模式误阻断启动）。
+    "removed_preset_models",
+})
+_KNOWN_MODEL_KEYS = frozenset({
+    "id", "name", "litellm_model", "context_window", "supports_vision",
+    "supports_function_calling", "max_tokens", "thinking_budget", "enable_thinking",
+    "reasoning_effort", "reasoning_choice", "computer_protocol", "system_prompt_extra",
+    "enable_prompt_cache", "prompt_cache", "enable_cache_control", "cache_control",
+})
+
+
+class UnknownConfigKeysError(Exception):
+    """strict_config=true 且存在未知配置键：拒绝启动。"""
+
+
+def _collect_unknown_key_entries(mapping, allowed, prefix, found):
+    for key in mapping:
+        if key not in allowed:
+            path = f"{prefix}.{key}" if prefix else str(key)
+            found.append((path, allowed))
+
+
+def _unknown_config_key_entries(data):
+    """收集 (点分路径, 同层已知键集合) 二元组；校验是防御性诊断，绝不抛错。"""
+    found = []
+    if not isinstance(data, dict):
+        return found
+    for key, value in data.items():
+        if key not in KNOWN_CONFIG_KEYS:
+            # 顶层未知键只报根因：不再递归其子键，避免一个拼写错误刷出一串噪音
+            found.append((str(key), KNOWN_CONFIG_KEYS))
+            continue
+        if key == "providers":
+            if isinstance(value, list):
+                for index, provider in enumerate(value):
+                    if not isinstance(provider, dict):
+                        continue
+                    prefix = f"providers[{index}]"
+                    _collect_unknown_key_entries(provider, _KNOWN_PROVIDER_KEYS, prefix, found)
+                    models = provider.get("models")
+                    if isinstance(models, list):
+                        for model_index, model in enumerate(models):
+                            if isinstance(model, dict):
+                                _collect_unknown_key_entries(
+                                    model,
+                                    _KNOWN_MODEL_KEYS,
+                                    f"{prefix}.models[{model_index}]",
+                                    found,
+                                )
+            continue
+        allowed_children = KNOWN_NESTED_CONFIG_KEYS.get(key)
+        if allowed_children is not None and isinstance(value, dict):
+            _collect_unknown_key_entries(value, allowed_children, str(key), found)
+    return found
+
+
+def find_unknown_config_keys(data):
+    """返回配置 dict 中未知键的点分路径列表（如 "memory_compression.retain_cout"）。
+
+    覆盖顶层、已知嵌套对象两层、providers[]/providers[].models[] 条目；
+    非 dict 输入返回空列表。
+    """
+    return [path for path, _ in _unknown_config_key_entries(data)]
+
+
+def _format_unknown_config_key_detail(found):
+    """把未知键格式化为「路径（是否想写 xxx？）」提示串（difflib 近似匹配）。"""
+    parts = []
+    for path, allowed in found:
+        leaf = path.rsplit(".", 1)[-1]
+        matches = difflib.get_close_matches(leaf, sorted(allowed), n=1, cutoff=0.6)
+        if matches:
+            parts.append(f"{path}（是否想写 {matches[0]}？）")
+        else:
+            parts.append(path)
+    return "、".join(parts)
+
+
+def audit_config_keys(data=None):
+    """启动自检：未知配置键默认写运行告警；strict_config=true 时抛错阻断启动。
+
+    返回未知键路径列表；strict 命中时抛 UnknownConfigKeysError（不返回）。
+    只读诊断：绝不改写 config.json（写路径行为保持不变）。
+    """
+    if data is None:
+        data = _load()
+    found = _unknown_config_key_entries(data)
+    if not found:
+        return []
+    detail = _format_unknown_config_key_detail(found)
+    if isinstance(data, dict) and data.get("strict_config") is True:
+        raise UnknownConfigKeysError(
+            f"config.json 存在 {len(found)} 个未知配置键：{detail}。"
+            "已开启 strict_config=true，为防止拼写错误的配置静默无效，启动已中止。"
+        )
+    _log_warning(
+        "config.json 存在 %d 个未知配置键（不会生效）：%s。请检查拼写；"
+        "如需忽略请删除这些键，或设置 strict_config=true 让程序在存在未知键时拒绝启动",
+        len(found),
+        detail,
+    )
+    return [path for path, _ in found]
