@@ -4184,6 +4184,51 @@ class ApiBridge(GitBridgeMixin):
         except Exception:
             return {}
 
+    def _permission_event_payload(self, request) -> Dict[str, Any]:
+        """构造权限请求事件 payload（permission_request 事件与 get_active_permission 快照共用）。"""
+        from core.tool_presenter import describe_permission_request
+        options = list(request.options or ())
+        permission_options = [
+            {"key": key, "label": label}
+            for key, label in zip(request.option_keys, options)
+        ]
+        owner_map = getattr(self, "_turn_owner_sessions", {}) or {}
+        return {
+            "session_name": owner_map.get(request.parent_turn_id)
+            or _session_from_turn_id(request.parent_turn_id),
+            "request_id": request.request_id,
+            "function_name": request.function_name,
+            # 兼容字段：部分旧界面读 tool_name / details
+            "tool_name": request.function_name,
+            "arguments": dict(request.arguments or {}),
+            "details": dict(request.arguments or {}),
+            # 人类可读描述（执行什么命令 / 查看什么文件），前端直接展示
+            "summary": describe_permission_request(
+                request.function_name, dict(request.arguments or {})
+            ),
+            "source": request.source,
+            "options": options,
+            "permission_options": permission_options,
+            # 按回合撤销：undo_turn 权限卡附带服务预检的影响摘要（只读）
+            "undo_impact": self._undo_turn_impact_for_event(request),
+            # 沙盒外访问等场景只给 同意/拒绝 两项，不渲染"总是允许"
+            "allow_always": len(options) >= 3,
+        }
+
+    def get_active_permission(self) -> Dict[str, Any]:
+        """返回当前未决的权限请求快照（与 permission_request 事件同构）；无则 permission=None。
+
+        供移动端在初始化/切换会话/断线重连后补齐错过的事件，避免审批静默丢失。
+        """
+        try:
+            req = permission_broker.active_request()
+            if req is None:
+                return {"ok": True, "permission": None}
+            return {"ok": True, "permission": self._permission_event_payload(req)}
+        except Exception as e:
+            logger.exception("get_active_permission 失败")
+            return {"ok": False, "msg": str(e)}
+
     def _activate_permission_request(self, request):
         """broker 激活某个请求 → 推送到前端对话流内联卡片，并挂一个"超时即拒绝"的定时器。"""
         # 星轨自动化（规格 5.5）：无人值守回合的权限请求立即自动拒绝——
@@ -4199,33 +4244,7 @@ class ApiBridge(GitBridgeMixin):
             self._auto_deny_automation_permission(request, automation_label)
             return
         try:
-            from core.tool_presenter import describe_permission_request
-            options = list(request.options or ())
-            permission_options = [
-                {"key": key, "label": label}
-                for key, label in zip(request.option_keys, options)
-            ]
-            self.emit_event("permission_request", {
-                "session_name": self._turn_owner_sessions.get(request.parent_turn_id)
-                or _session_from_turn_id(request.parent_turn_id),
-                "request_id": request.request_id,
-                "function_name": request.function_name,
-                # 兼容字段：部分旧界面读 tool_name / details
-                "tool_name": request.function_name,
-                "arguments": dict(request.arguments or {}),
-                "details": dict(request.arguments or {}),
-                # 人类可读描述（执行什么命令 / 查看什么文件），前端直接展示
-                "summary": describe_permission_request(
-                    request.function_name, dict(request.arguments or {})
-                ),
-                "source": request.source,
-                "options": options,
-                "permission_options": permission_options,
-                # 按回合撤销：undo_turn 权限卡附带服务预检的影响摘要（只读）
-                "undo_impact": self._undo_turn_impact_for_event(request),
-                # 沙盒外访问等场景只给 同意/拒绝 两项，不渲染"总是允许"
-                "allow_always": len(options) >= 3,
-            })
+            self.emit_event("permission_request", self._permission_event_payload(request))
         except Exception:
             logger.exception("推送权限请求失败")
 
@@ -4424,17 +4443,19 @@ class ApiBridge(GitBridgeMixin):
                 logger.exception("局域网远程控制服务启动失败")
                 return None
 
-    def get_remote_bind_qr(self, force_new: bool = False) -> Dict[str, Any]:
+    def get_remote_bind_qr(self, force_new: bool = False, mobile: bool = False) -> Dict[str, Any]:
         """返回手机扫码绑定信息。
 
         token 固定：未过期直接复用；过期自动重签；force_new=True 由前端
         "刷新"按钮触发，强制重签并使旧 token 失效。
+        mobile=True 绑定到独立移动端子应用（/m/ 路径，co-team 风格界面）；
+        两种入口共享同一配对 token 与 WS 事件通道。
         """
         try:
             srv = self._ensure_lan_server()
             if srv is None:
                 return {"ok": False, "msg": "远程服务启动失败"}
-            return srv.get_bind_info(force_new=bool(force_new))
+            return srv.get_bind_info(force_new=bool(force_new), path="/m/" if mobile else "/")
         except Exception as e:
             logger.exception("get_remote_bind_qr 失败")
             return {"ok": False, "msg": str(e)}
@@ -5112,6 +5133,9 @@ class ApiBridge(GitBridgeMixin):
         # 线程本地 workdir 作用域：绑定后必须在本回合 finally 中退出恢复，
         # 防止主线程直调（测试）或未来线程复用场景下 workdir 泄漏到下一回合
         _workdir_scope = None
+        # 线程本地权限档位作用域：与 workdir 同理，回合期间冻结会话生效档位，
+        # 供鉴权路径（app_context.get_permission_mode）读取，退出时恢复
+        _permission_scope = None
         error_state = {
             "toast_messages": set(),
             "terminal_message": None,
@@ -5327,6 +5351,15 @@ class ApiBridge(GitBridgeMixin):
             app_context.set_thread_session(session_name)
             from core.plan import set_current_plan_session
             set_current_plan_session(session_name)
+            # 权限档位进入鉴权路径：会话级档位此前只落在提示词文本与 DB 列，
+            # 鉴权路径（app_context.get_permission_mode）读的是全局值，导致
+            # 会话级完整访问（full）在工具调用时不被认可、反复弹确认。这里
+            # 把本回合生效档位绑定到线程，回合期间冻结，退出时恢复全局值。
+            _permission_scope = app_context.permission_mode_scope(
+                automation_permission_mode
+                or self._effective_permission_mode(session_name)
+            )
+            _permission_scope.__enter__()
 
             # 会话已在模型绑定阶段创建；此处直接解析用户输入并入库。
             try:
@@ -5523,6 +5556,8 @@ class ApiBridge(GitBridgeMixin):
             app_context.set_thread_session(None)
             if _workdir_scope is not None:
                 _workdir_scope.__exit__(None, None, None)
+            if _permission_scope is not None:
+                _permission_scope.__exit__(None, None, None)
             # 身份校验清理 cancel 事件：finally 竞态窗口内（本线程还没走完
             # finally，但 _active_turns 已 pop）新回合可能已建立同名事件，
             # 仅当字典里仍是本回合自己的事件对象时才删除，防误删新回合事件

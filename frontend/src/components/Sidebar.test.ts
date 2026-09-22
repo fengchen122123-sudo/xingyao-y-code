@@ -1,14 +1,19 @@
 import { mount } from '@vue/test-utils';
 import { createPinia, setActivePinia } from 'pinia';
-import { expect, it, vi } from 'vitest';
+import { beforeEach, expect, it, vi } from 'vitest';
 import { nextTick } from 'vue';
 import Sidebar from './Sidebar.vue';
 import { useAppStore } from '../stores/appStore';
 
+// 版本选择会写入 localStorage（记住上次选择），逐用例清空避免相互影响
+beforeEach(() => {
+  localStorage.clear();
+});
+
 it('点击手机图标后调用 get_remote_bind_qr 并渲染二维码 img', async () => {
   const get_remote_bind_qr = vi.fn(async () => ({
     ok: true,
-    url: 'http://192.168.1.5:8765/?token=abc123',
+    url: 'http://192.168.1.5:8765/m/?token=abc123',
     token: 'abc123',
     qr: 'data:image/png;base64,QUJD',
     expires_in: 86400,
@@ -26,6 +31,8 @@ it('点击手机图标后调用 get_remote_bind_qr 并渲染二维码 img', asyn
   await new Promise((r) => setTimeout(r, 0));
 
   expect(get_remote_bind_qr).toHaveBeenCalledTimes(1);
+  // 默认版本为移动端：第二参数为 true
+  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(1, false, true);
   const modal = wrapper.find('[data-test="remote-bind-modal"]');
   expect(modal.exists()).toBe(true);
   const img = modal.find('img');
@@ -48,7 +55,7 @@ it('获取二维码失败时不显示弹窗，并弹出错误提示', async () =
   expect(wrapper.find('[data-test="remote-bind-modal"]').exists()).toBe(false);
   expect(store.confirmModal.show).toBe(true);
   expect(store.confirmModal.notice).toBe(true);
-  expect(store.confirmModal.title).toBe('手机远程控制');
+  expect(store.confirmModal.title).toBe('手机访问');
 });
 
 it('点击弹窗遮罩不关闭，仅点击关闭按钮才关闭', async () => {
@@ -100,8 +107,8 @@ it('重复打开弹窗直接复用同一 token（不强制重签）', async () =
   await new Promise((r) => setTimeout(r, 0));
 
   expect(get_remote_bind_qr).toHaveBeenCalledTimes(2);
-  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(1, false);
-  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(2, false);
+  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(1, false, true);
+  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(2, false, true);
 });
 
 it('点击刷新按钮以 force_new 重新获取 token', async () => {
@@ -136,7 +143,7 @@ it('点击刷新按钮以 force_new 重新获取 token', async () => {
   await refreshBtn.trigger('click');
   await new Promise((r) => setTimeout(r, 0));
 
-  expect(get_remote_bind_qr).toHaveBeenLastCalledWith(true);
+  expect(get_remote_bind_qr).toHaveBeenLastCalledWith(true, true);
   const modal = wrapper.find('[data-test="remote-bind-modal"]');
   expect(modal.find('img').attributes('src')).toBe('data:image/png;base64,NEW');
 });
@@ -169,6 +176,53 @@ it('永久有效（expires_in=0）时不做倒计时自动刷新', async () => {
   } finally {
     vi.useRealTimers();
   }
+});
+
+it('单入口默认移动端，切换 web远端后以单参签名请求并记住选择', async () => {
+  const get_remote_bind_qr = vi.fn(async (_forceNew: boolean, mobile?: boolean) => ({
+    ok: true,
+    url: mobile
+      ? 'http://192.168.1.5:8765/m/?token=abc123'
+      : 'http://192.168.1.5:8765/?token=abc123',
+    token: 'abc123',
+    qr: mobile ? 'data:image/png;base64,MOB' : 'data:image/png;base64,WEB',
+    expires_in: 0,
+  }));
+  (window as any).pywebview = { api: { get_remote_bind_qr } };
+
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const wrapper = mount(Sidebar, { global: { plugins: [pinia] } });
+
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+
+  // 默认移动端：带 mobile 参数，标题直接显示版本名
+  expect(get_remote_bind_qr).toHaveBeenNthCalledWith(1, false, true);
+  let modal = wrapper.find('[data-test="remote-bind-modal"]');
+  expect(modal.find('h3').text()).toBe('移动端');
+  expect(modal.find('img').attributes('src')).toBe('data:image/png;base64,MOB');
+
+  // 切到 web远端：单参签名（保持旧路径契约），二维码与标题随之切换
+  await wrapper.find('[data-test="bind-mode-desktop"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+  expect(get_remote_bind_qr).toHaveBeenLastCalledWith(false);
+  modal = wrapper.find('[data-test="remote-bind-modal"]');
+  expect(modal.find('h3').text()).toBe('web远端');
+  expect(modal.find('img').attributes('src')).toBe('data:image/png;base64,WEB');
+  expect(localStorage.getItem('ycode-remote-bind-mode')).toBe('desktop');
+
+  // 再切回移动端：恢复带参签名
+  await wrapper.find('[data-test="bind-mode-mobile"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+  expect(get_remote_bind_qr).toHaveBeenLastCalledWith(false, true);
+
+  // 关闭后重新打开：沿用上次记住的版本（移动端）
+  await wrapper.find('[data-test="remote-bind-close"]').trigger('click');
+  await wrapper.find('[data-test="remote-bind-button"]').trigger('click');
+  await new Promise((r) => setTimeout(r, 0));
+  expect(get_remote_bind_qr).toHaveBeenLastCalledWith(false, true);
+  expect(wrapper.find('[data-test="remote-bind-modal"] h3').text()).toBe('移动端');
 });
 
 it('子页面打开时点击新会话会立即返回对话页面', async () => {

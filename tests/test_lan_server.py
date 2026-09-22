@@ -9,6 +9,31 @@ from core.lan_server import LanServer
 from gui_bridge import ApiBridge
 
 
+@pytest.fixture(autouse=True)
+def _no_config_writes(monkeypatch):
+    """屏蔽 lan_server 对真实 ~/.ycode/config.json 的写盘。
+
+    _issue_token/_persist_port 会把新 token/端口持久化到用户配置——单测
+    调用 get_bind_info()/start() 时会重签 token 并写盘，导致用户已扫码的
+    旧 token 全部失效（4401 invalid token）。测试实例一律不落盘。
+    """
+    import core.lan_server as lan_mod
+
+    monkeypatch.setattr(lan_mod, "_save_config_value", lambda *a, **k: None)
+
+
+def _register_client(srv, ws):
+    """把 fake ws 登记为「已连接客户端」（客户端列表 + 每客户端发送锁）。
+
+    _safe_send 对未注册连接 fail-closed（不发送、返回 False）：直连桩的 ws
+    必须像真实注册路径（_register_and_collect_replay）一样同时登记发送锁，
+    否则服务器的回包会被 fail-closed 丢弃。
+    """
+    srv._clients.append(ws)
+    srv._client_locks[ws] = threading.Lock()
+    return ws
+
+
 def test_detect_lan_ip_non_loopback():
     ip = LanServer(bridge=None)._detect_lan_ip()
     assert ip and ip != "127.0.0.1"
@@ -33,7 +58,7 @@ def test_issue_and_verify_token():
 def test_broadcast_sends_to_clients():
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
-    srv._clients = [fake]
+    _register_client(srv, fake)
     srv.broadcast('{"type":"token_delta"}')
     assert fake.sent == ['{"type":"token_delta"}']
 
@@ -42,6 +67,7 @@ def test_route_rejects_window_close():
     """桌面专属窗口方法应被拒绝（无论黑名单/白名单）。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(fake, json.dumps({"method": "window_close", "args": {}, "id": 1}))
     assert "method not allowed" in fake.sent[0]
 
@@ -50,6 +76,7 @@ def test_route_allows_non_forbidden_method():
     """黑名单语义：不在 FORBIDDEN_METHODS 内的普通 bridge 方法（如 get_background_tasks）应被放行。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(fake, json.dumps({"method": "get_background_tasks", "args": {}, "id": 1}))
     assert "method not allowed" not in fake.sent[0]
     resp = json.loads(fake.sent[0])
@@ -59,6 +86,7 @@ def test_route_allows_non_forbidden_method():
 def test_route_allows_get_initial_state():
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     # bridge 无 get_initial_state 时 _call_bridge 返回 {"ok": False, "msg": "未知方法"}，但不应被白名单拒绝
     srv._route_message(fake, json.dumps({"method": "get_initial_state", "args": [], "id": 1}))
     resp = json.loads(fake.sent[0])
@@ -78,6 +106,7 @@ def test_route_allows_whitelisted_send():
 
     srv.bridge = B()
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(fake, json.dumps({"method": "send_user_message", "args": {"text": "hi"}, "id": 1}))
     assert "method not allowed" not in fake.sent[0]
     resp = json.loads(fake.sent[0])
@@ -278,7 +307,8 @@ def test_issue_token_kicks_connected_clients():
     """
     srv = LanServer(bridge=None)
     c1, c2 = _FakeClient(), _FakeClient()
-    srv._clients = [c1, c2]
+    _register_client(srv, c1)
+    _register_client(srv, c2)
 
     srv._issue_token()
 
@@ -295,7 +325,7 @@ def test_refresh_bind_info_disconnects_old_clients():
     srv.lan_ip = "192.168.1.5"
     old = srv.get_bind_info()
     client = _FakeClient()
-    srv._clients = [client]
+    _register_client(srv, client)
 
     new = srv.get_bind_info(force_new=True)
 
@@ -328,20 +358,25 @@ def test_register_rejects_old_token_after_rotation():
 # ---------------------------------------------------------------------------
 
 class _RecordingBridge:
-    """LAN 边界测试用的 bridge 替身：记录消息入口实际收到的 turn_source。
+    """LAN 边界测试用的 bridge 替身：记录消息入口实际收到的受控参数。
 
-    与真实 ApiBridge.send_user_message 签名同形（turn_source 是第 6 个位置
-    参数，gui_bridge.py:send_user_message）：*args 桩会从首参 dict 里"读出"
-    注入的 turn_source，掩盖位置参数绑定绕过（Task 15 审查 Critical-1 根因）。
+    与真实 ApiBridge.send_user_message 签名同形（permission_mode 是第 6、
+    turn_source 是第 7 个位置参数，gui_bridge.py:send_user_message）：*args
+    桩会从首参 dict 里"读出"注入的 turn_source，掩盖位置参数绑定绕过
+    （Task 15 审查 Critical-1 根因）。不接 **kwargs，未知键会以 TypeError
+    暴露（kwargs 白名单回归的观测面）。
     """
 
     def __init__(self):
         self.last_turn_source = "unset"
+        self.last_permission_mode = "unset"
         self.message_calls = []
 
     def send_user_message(self, text, session_name=None, attachments=None,
-                          workdir=None, model_id=None, turn_source="local"):
+                          workdir=None, model_id=None, permission_mode=None,
+                          turn_source="local"):
         self.last_turn_source = turn_source
+        self.last_permission_mode = permission_mode
         self.message_calls.append((text, turn_source))
         return {"ok": True}
 
@@ -450,6 +485,62 @@ def test_lan_positional_turn_source_cannot_reach_bridge():
     assert calls == ["lan"]
 
 
+# ---------------------------------------------------------------------------
+# 安全审查回归：kwargs 白名单化 / 首参 payload 档位剥离 / 发送 fail-closed
+# 客户端不得经 dict 通道注入 permission_mode（会话级权限档位）或未知键；
+# 未注册（已被摘除/轮换）连接的发送必须放弃，而非无锁直发。
+# ---------------------------------------------------------------------------
+
+def test_lan_kwargs_permission_mode_stripped(server, bridge):
+    """对抗回归：kwargs 形态注入 permission_mode 被白名单剥离。
+
+    修复前 dict 形态只删 turn_source，permission_mode 经 fn(**merged) 直接
+    生效——手机可把会话权限档位抬到 full。白名单化后档位必须回到签名默认 None。"""
+    result = server.dispatch_rpc(
+        "send_user_message",
+        {"text": "hi", "session_name": "s1", "permission_mode": "full"},
+    )
+    assert result["ok"] is True
+    assert bridge.last_permission_mode is None
+    assert bridge.last_turn_source == "lan"
+
+
+def test_lan_kwargs_unknown_keys_stripped(server, bridge):
+    """kwargs 形态的未知键同样被白名单剥离，不会落进 fn(**merged)。
+
+    桥桩不接未知关键字：修复前未知键透传会 TypeError，回包 {"ok": False}。"""
+    result = server.dispatch_rpc("send_user_message", {"text": "hi", "evil": 1})
+    assert result["ok"] is True
+    assert bridge.message_calls[-1][0] == "hi"
+
+
+def test_lan_payload_dict_permission_mode_stripped(server, bridge):
+    """对抗回归：首参 payload dict 内 permission_mode 被剥离（防夹带）。
+
+    修复前只删 payload 里的 turn_source，夹带的 permission_mode 随首参 dict
+    原样到达 bridge；剥离后桥桩收到的 text 不含该键、档位为默认 None。"""
+    result = server.dispatch_rpc(
+        "send_user_message", [{"text": "x", "permission_mode": "full"}]
+    )
+    assert result["ok"] is True
+    text = bridge.message_calls[-1][0]
+    assert isinstance(text, dict)
+    assert "permission_mode" not in text
+    assert bridge.last_permission_mode is None
+    assert bridge.last_turn_source == "lan"
+
+
+def test_safe_send_fail_closed_for_unregistered_ws():
+    """未注册（无发送锁）的 ws 直接放弃发送（fail-closed），不再无锁直发。
+
+    修复前 _safe_send 对已注销/被轮换摘除的连接走无锁直发并返回 True，
+    与摘除/关闭并发时存在竞态窗口。"""
+    srv = LanServer(bridge=None)
+    fake = _FakeClient()
+    assert srv._safe_send(fake, "x") is False
+    assert fake.sent == []
+
+
 def test_lan_forbids_private_underscore_methods():
     """对抗回归（Task 15 审查 Important-1）：下划线私有方法一律拒绝。
 
@@ -481,6 +572,7 @@ def test_route_rejects_private_underscore_method():
     """WebSocket 路径与 dispatch_rpc 共用同一边界：私有方法走 wire 也被拒。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(
         fake,
         json.dumps({"method": "_queue_js_payload", "args": ["evil js"], "id": 11}),
@@ -492,6 +584,7 @@ def test_route_rejects_computer_permission_mutation():
     """WebSocket 路径与 dispatch_rpc 共用同一边界：电脑操控 mutation 走 wire 也被拒。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(
         fake, json.dumps({"method": "set_computer_control_enabled", "args": [True], "id": 7})
     )
@@ -509,6 +602,7 @@ def test_route_injects_lan_turn_source_on_user_message():
 
     srv = LanServer(bridge=B())
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(
         fake,
         json.dumps({"method": "send_user_message", "args": {"text": "hi", "turn_source": "local"}, "id": 1}),
@@ -631,7 +725,7 @@ def test_replay_buffer_only_stores_whitelisted_events():
     """白名单事件打 seq 进补发缓冲；高频事件原样发送不入缓冲。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
-    srv._clients = [fake]
+    _register_client(srv, fake)
 
     srv.broadcast('{"type": "token_delta", "data": {"text": "x"}}', event_type="token_delta")
     srv.broadcast('{"type": "turn_error", "data": {"message": "boom"}}', event_type="turn_error")
@@ -660,7 +754,7 @@ def test_register_with_last_seq_replays_missed_events_in_order():
     srv = LanServer(bridge=None)
     srv._issue_token()
     live = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
-    srv._clients = [live]
+    _register_client(srv, live)
     srv.broadcast('{"type": "notice", "data": {"message": "n1"}}', event_type="notice")
     srv.broadcast('{"type": "token_delta", "data": {}}', event_type="token_delta")
     srv.broadcast('{"type": "turn_error", "data": {"message": "boom"}}', event_type="turn_error")
@@ -737,3 +831,194 @@ def test_handle_ws_rejects_invalid_token_without_replay():
 
     assert ws.sent == []
     assert ws.closed is not None and ws.closed[0] == 4401
+
+
+# --------------------------------------------------------------------------- #
+# 独立移动端子应用（frontend-mobile/dist，/m/ 路径托管）
+# --------------------------------------------------------------------------- #
+
+def test_bind_url_supports_mobile_path():
+    srv = LanServer(bridge=None)
+    srv.port = 8765
+    srv.lan_ip = "192.168.1.5"
+    assert srv.bind_url("t1", path="/m/") == "http://192.168.1.5:8765/m/?token=t1"
+    # 缺尾斜杠自动补齐；缺前导斜杠自动补齐
+    assert srv.bind_url("t2", path="m") == "http://192.168.1.5:8765/m/?token=t2"
+
+
+def test_get_bind_info_mobile_path_embeds_m_prefix():
+    srv = LanServer(bridge=None)
+    srv.port = 8765
+    srv.lan_ip = "192.168.1.5"
+    info = srv.get_bind_info(path="/m/")
+    assert info["ok"]
+    assert "/m/?token=" in info["url"]
+
+
+@pytest.fixture()
+def mobile_dist(tmp_path, monkeypatch):
+    """构造一个最小 frontend-mobile/dist 并把 _mobile_dist_dir 指过去。"""
+    import core.lan_server as lan_mod
+
+    dist = tmp_path / "dist"
+    (dist / "assets").mkdir(parents=True)
+    (dist / "index.html").write_text(
+        "<html><head><title>x</title></head><body>m</body></html>", encoding="utf-8"
+    )
+    (dist / "assets" / "app.js").write_text("console.log(1)", encoding="utf-8")
+    monkeypatch.setattr(
+        lan_mod.LanServer, "_mobile_dist_dir", staticmethod(lambda: str(dist))
+    )
+    return dist
+
+
+def _fake_request(path: str):
+    return type("R", (), {"path": path, "headers": {}})()
+
+
+def test_serve_mobile_index_injects_shim(mobile_dist):
+    srv = LanServer(bridge=None)
+    resp = srv._serve_mobile_index()
+    assert resp.status_code == 200
+    assert b"/m/mobile-shim.js" in resp.body
+    assert resp.headers["Cache-Control"] == "no-store"
+    # 桌面 index 注入路径不受影响（仍指向 /mobile-shim.js）
+    desktop = srv._serve_index()
+    assert b'src="/mobile-shim.js"' in desktop.body
+
+
+def test_serve_mobile_static_serves_assets_and_spa_fallback(mobile_dist):
+    srv = LanServer(bridge=None)
+    # 静态资源命中
+    resp = srv._serve_mobile_static("/m/assets/app.js")
+    assert resp.status_code == 200
+    assert resp.body == b"console.log(1)"
+    # SPA 深链（无扩展名）回退到移动端 index
+    deep = srv._serve_mobile_static("/m/convo/abc")
+    assert deep.status_code == 200
+    assert b"/m/mobile-shim.js" in deep.body
+    # 带扩展名的缺失资源 404
+    assert srv._serve_mobile_static("/m/assets/missing.js").status_code == 404
+
+
+def test_serve_mobile_static_blocks_traversal(mobile_dist, tmp_path):
+    srv = LanServer(bridge=None)
+    assert srv._serve_mobile_static("/m/../secret.txt").status_code == 404
+    assert srv._serve_mobile_static("/m/%2e%2e/secret.txt").status_code == 404
+
+
+def test_serve_http_routes_m_paths(mobile_dist):
+    srv = LanServer(bridge=None)
+    root = srv._serve_http(None, _fake_request("/m/"))
+    assert root.status_code == 200
+    assert b"/m/mobile-shim.js" in root.body
+    asset = srv._serve_http(None, _fake_request("/m/assets/app.js"))
+    assert asset.status_code == 200
+    assert asset.body == b"console.log(1)"
+    assert srv._serve_http(None, _fake_request("/m/mobile-shim.js")).status_code == 200
+    # 根路径仍路由到桌面 index（不注入 /m/ shim 引用）
+    desktop = srv._serve_http(None, _fake_request("/"))
+    assert desktop.status_code == 200
+    assert b'src="/mobile-shim.js"' in desktop.body
+
+
+def test_bridge_qr_mobile_flag_uses_m_path(monkeypatch):
+    """get_remote_bind_qr(mobile=True) 应绑定 /m/ 路径；默认仍是 /。"""
+    bridge = ApiBridge.__new__(ApiBridge)  # 跳过庞大 __init__
+
+    class _Srv:
+        def get_bind_info(self, force_new=False, path="/"):
+            return {"ok": True, "path": path}
+
+    monkeypatch.setattr(bridge, "_ensure_lan_server", lambda: _Srv())
+    assert bridge.get_remote_bind_qr()["path"] == "/"
+    assert bridge.get_remote_bind_qr(mobile=True)["path"] == "/m/"
+
+
+# ---------------------------------------------------------------------------
+# token 唯一性：轮换与「校验+注册」原子互斥（缺口 1 回归保护）
+# ---------------------------------------------------------------------------
+
+
+def test_mobile_shim_snapshot_matches_disk():
+    """内嵌 shim 快照必须与磁盘 frontend/mobile-shim.js 完全一致。
+
+    手机端 shim 有两份来源（磁盘文件 + 打包缺失时的内嵌回退）。两份漂移会让
+    打包版手机拿到旧协议（例如丢失 token 持久化/4401 处理），必须锁死一致。
+    """
+    import os
+
+    import core.lan_server as lan_mod
+
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(
+        os.path.join(root, "frontend", "mobile-shim.js"), encoding="utf-8"
+    ) as f:
+        disk = f.read()
+    assert lan_mod._MOBILE_SHIM_FALLBACK_JS == disk
+
+
+def test_only_latest_token_verifies_after_rotation():
+    """轮换后只有最新 token 能通过校验，旧 token 立即失效。"""
+    srv = LanServer(bridge=None)
+    t1 = srv._issue_token()
+    t2 = srv._issue_token()
+
+    assert not srv._verify_token(t1)
+    assert srv._verify_token(t2)
+    assert not srv._verify_token(t2 + "x")
+    assert not srv._verify_token("")
+
+
+def test_client_registered_before_rotation_is_detached():
+    """轮换瞬间已注册的旧 token 客户端必须被摘除并以 4401 断开。"""
+    srv = LanServer(bridge=None)
+    tok = srv._issue_token()
+    client = _FakeClient()
+    assert srv._authenticate_and_register(client, tok) is True
+    assert srv._clients == [client]
+
+    srv._issue_token()
+
+    assert srv._clients == []
+    assert client.closed and client.closed[0][0] == 4401
+
+
+def test_rotation_rejects_stale_registration_concurrently():
+    """并发场景：旧 token 的注册绝不能在轮换后存活。
+
+    校验+注册持 _clients_lock，轮换的 token 切换也在同一把锁内完成，
+    因此任一时刻只有一个 token 能通过校验；用旧 token 抢注册的客户端
+    要么被拒绝、要么被随后摘除并 4401 断开。
+    """
+    srv = LanServer(bridge=None)
+    old = srv._issue_token()
+
+    registered_stale = []
+    stop = threading.Event()
+
+    def stale_worker():
+        while not stop.is_set():
+            c = _FakeClient()
+            if srv._authenticate_and_register(c, old):
+                registered_stale.append(c)
+            time.sleep(0.0003)
+
+    t = threading.Thread(target=stale_worker)
+    t.start()
+    try:
+        for _ in range(25):
+            srv._issue_token()
+            time.sleep(0.0015)
+    finally:
+        stop.set()
+        t.join()
+
+    # 旧 token 已彻底失效，当前 token 可用
+    assert not srv._verify_token(old)
+    assert srv._verify_token(srv._token.decode())
+    # 任何用旧 token 注册成功的客户端最终都不在客户端列表中，且被 4401 断开
+    assert srv._clients == []
+    for c in registered_stale:
+        assert c not in srv._clients
+        assert c.closed and c.closed[0][0] == 4401

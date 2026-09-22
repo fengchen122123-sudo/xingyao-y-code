@@ -10,6 +10,7 @@
 import base64
 import io
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -27,6 +28,8 @@ from websockets.sync.server import serve
 
 import config
 from config import save_config_value as _save_config_value
+
+logger = logging.getLogger(__name__)
 
 # 手机端断线补发事件白名单：低频、状态关键、前端幂等（或自带去重）的事件。
 # 手机锁屏/切后台时 WebSocket 静默断开，断线窗口内的广播会永久丢失（表现为
@@ -55,7 +58,7 @@ _REPLAY_BUFFER_MAX = 128
 # 永远能拿到 shim，不再出现「pywebview API 不可用」。
 # 注意：修改磁盘版 mobile-shim.js 后请同步更新此快照，保持两边一致。
 _MOBILE_SHIM_FALLBACK_JS = """/**
- * mobile-shim.js —— 局域网手机远程控制的 transport shim（内嵌回退快照）
+ * mobile-shim.js —— 局域网手机远程控制的 transport shim
  *
  * 桌面上 pywebview 注入 window.pywebview.api（RPC）与 window.onBridgeEvent（事件）。
  * 手机上无 pywebview，本 shim 用 WebSocket 模拟这两者，使手机加载同一个 dist 前端、
@@ -68,11 +71,37 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
  * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
  *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
+ * - 配对 token：首次从 URL 参数取并写入 localStorage，随后立即用 history.replaceState
+ *   清理地址栏 query（保留 path/hash），token 不残留于浏览器历史/截图/分享链接；
+ *   之后刷新/重开（URL 无 token）回退读 localStorage，直到服务端 TTL 过期或被
+ *   轮换（4401）才失效。
  */
 (function () {
   if (window.pywebview) return; // 桌面环境不注入，防御性
 
-  var token = new URLSearchParams(window.location.search).get('token') || '';
+  var STORAGE_KEY = 'yc-pair-token';
+  var urlToken = new URLSearchParams(window.location.search).get('token') || '';
+  var token = urlToken;
+  try {
+    if (urlToken) {
+      window.localStorage.setItem(STORAGE_KEY, urlToken);
+    } else {
+      token = window.localStorage.getItem(STORAGE_KEY) || '';
+    }
+  } catch (_) {
+    // localStorage 不可用（隐私模式等）：仅本次 URL token 生效
+  }
+  // 地址栏清理：token 已写入 localStorage（或仅本次内存）后立即去掉 URL 上的
+  // ?token=，避免残留在浏览器历史、截图与分享链接中；保留 path 与 hash。
+  // 独立于上面的 try：隐私模式下 localStorage 抛错时 URL 同样要清理。
+  if (urlToken) {
+    try {
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+      }
+    } catch (_) {}
+  }
+  var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
   var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';
 
   var ws = null;
@@ -84,7 +113,7 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
   function rpc(method, args) {
     return new Promise(function (resolve, reject) {
       if (!ws || ws.readyState !== 1) {
-        reject(new Error('\\u8fde\\u63a5\\u672a\\u5c31\\u7eea'));
+        reject(new Error('连接未就绪'));
         return;
       }
       var id = ++seq;
@@ -144,7 +173,20 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
         }
       }
     };
-    ws.onclose = function () {
+    ws.onclose = function (event) {
+      if (event && event.code === 4401) {
+        // 配对失效/被轮换：清掉本地 token（仅当与本次使用的相同，避免误清新 token），
+        // 通知前端显示「配对已失效」，并停止重连（空 token 重连只会一直失败）
+        try {
+          if (window.localStorage.getItem(STORAGE_KEY) === usedToken) {
+            window.localStorage.removeItem(STORAGE_KEY);
+          }
+        } catch (_) {}
+        try {
+          window.dispatchEvent(new CustomEvent('yc-pair-invalid'));
+        } catch (_) {}
+        return;
+      }
       setTimeout(connect, 2000); // 基础断线重连
     };
     ws.onerror = function () {};
@@ -188,15 +230,16 @@ class LanServer:
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
-    # 内部注入 turn_source="lan" 并覆盖客户端 payload 同名字段，模型/用户
+    # 内部注入 turn_source="lan" 并剥离客户端一切同名绑定通道，模型/用户
     # 正文无法伪造回合来源；本地 GUI/CLI 调用不经本层，固定 local。
     MESSAGE_ENTRY_METHODS = frozenset({"send_user_message"})
 
     # send_user_message(text, session_name, attachments, workdir, model_id,
-    # permission_mode, turn_source)——turn_source 前共 6 个位置参数
+    # permission_mode, turn_source)——第 6 个位置参数起为受控参数
     # （gui_bridge.py 真实签名；第 6 位是会话级权限档位，同样不允许客户端
     # 经位置通道注入）。LAN 分发把客户端位置参数裁剪至前 5 个：第 6 位起
-    # 的绑定通道全部剥离，turn_source 只能由服务器以 keyword 唯一注入。
+    # 的绑定通道全部剥离；kwargs dict 形态按同一语义白名单化（只放行前 5
+    # 个键），turn_source 只能由服务器以 keyword 唯一注入。
     MESSAGE_ENTRY_POSITIONAL_LIMIT = 5
 
     def __init__(self, bridge=None, port=0):
@@ -205,6 +248,10 @@ class LanServer:
         self.lan_ip = self._detect_lan_ip()
         self._clients = []
         self._clients_lock = threading.Lock()
+        # 串行化「判断 + 签发 + 读取」路径（get_bind_info / set_ttl），避免并发
+        # force_new 双签交错与 token/expires 不一致组合；锁顺序单向：
+        # _token_issue_lock → _clients_lock（_issue_token 内部取后者），无死锁。
+        self._token_issue_lock = threading.Lock()
         self._client_locks: Dict[Any, threading.Lock] = {}
         self._token = None
         self._token_expires = 0.0
@@ -250,57 +297,79 @@ class LanServer:
         # 3. 最后：hostname 解析
         return socket.gethostbyname(socket.gethostname())
 
-    def bind_url(self, token: str) -> str:
-        """生成手机扫码打开时携带配对 token 的绑定 URL。"""
-        return f"http://{self.lan_ip}:{self.port}/?token={token}"
+    def bind_url(self, token: str, path: str = "/") -> str:
+        """生成手机扫码打开时携带配对 token 的绑定 URL。
+
+        path 用于区分同一配对通道下的两个前端："/"（桌面 dist 响应式版）
+        与 "/m/"（frontend-mobile 独立移动端，co-team 风格界面）。
+        """
+        if not path.startswith("/"):
+            path = "/" + path
+        if not path.endswith("/"):
+            path += "/"
+        return f"http://{self.lan_ip}:{self.port}{path}?token={token}"
 
     def _verify_token(self, token) -> bool:
         """校验配对 token：非空、未过期、常量时间比较；_token_expires 为 None 表示永久有效。"""
         if not token or not self._token:
             return False
-        if self._token_expires is not None and time.time() > self._token_expires:
+        # 过期边界取 >=（与 get_bind_info 的重签判定一致，保守方向）
+        if self._token_expires is not None and time.time() >= self._token_expires:
             return False
         try:
             return secrets.compare_digest(token.encode(), self._token)
         except Exception:
             return False
 
-    def _kick_all_clients(self) -> None:
-        """断开所有已连接客户端并清空列表（token 轮换时防止旧链接继续可控）。
+    def _detach_clients_locked(self) -> list:
+        """摘除并清空客户端列表，返回被摘除的客户端。
 
-        必须在持锁状态下调用：先摘除列表再逐个 close，close 的网络 IO 放锁外，
-        避免阻塞注册路径。
+        必须在持 ``_clients_lock`` 时调用：与「校验+注册」共用同一临界区，
+        保证轮换时不会有客户端在摘除后又被注册进来。
         """
-        with self._clients_lock:
-            clients = self._clients
-            self._clients = []
-            self._client_locks.clear()
+        clients = self._clients
+        self._clients = []
+        self._client_locks.clear()
+        return clients
+
+    @staticmethod
+    def _close_rotated(clients: list) -> None:
+        """逐个关闭被轮换的连接；close 的网络 IO 放在锁外，避免阻塞注册路径。"""
         for client in clients:
             try:
                 client.close(code=4401, reason="token rotated")
             except Exception:
                 pass
 
+    def _kick_all_clients(self) -> None:
+        """断开所有已连接客户端并清空列表（token 轮换时防止旧链接继续可控）。"""
+        with self._clients_lock:
+            clients = self._detach_clients_locked()
+        self._close_rotated(clients)
+
     def _issue_token(self) -> str:
         """签发新配对 token（旧 token 立即失效，已连接客户端全部断开），持久化后返回明文。
 
         _ttl <= 0 表示永久有效：_token_expires 置为 None，永不过期、永不重签。
+
+        切换 token 与摘除旧连接在同一把 ``_clients_lock`` 内完成，与
+        ``_register_and_collect_replay`` 的「校验+注册」互斥：任一时刻只有一个
+        token 能通过校验，不会出现旧 token 校验通过、同时新 token 已生效的竞态。
         """
-        self._token = secrets.token_urlsafe(24).encode()
-        self._token_expires = (
-            None if self._ttl <= 0 else time.time() + self._ttl
-        )
-        # 踢掉旧 token 时代的连接：否则已扫码手机在刷新二维码后依然可控
-        self._kick_all_clients()
+        new_token = secrets.token_urlsafe(24).encode()
+        new_expires = None if self._ttl <= 0 else time.time() + self._ttl
+        with self._clients_lock:
+            self._token = new_token
+            self._token_expires = new_expires
+            clients = self._detach_clients_locked()
+        self._close_rotated(clients)
         try:
-            _save_config_value(config.REMOTE_PAIR_TOKEN_KEY, self._token.decode())
-            _save_config_value(
-                config.REMOTE_PAIR_TOKEN_EXPIRES_KEY, self._token_expires
-            )
+            _save_config_value(config.REMOTE_PAIR_TOKEN_KEY, new_token.decode())
+            _save_config_value(config.REMOTE_PAIR_TOKEN_EXPIRES_KEY, new_expires)
         except Exception:
             # 持久化失败不阻断签发：仅影响重启后的固定性，不影响本次可用性
             pass
-        return self._token.decode()
+        return new_token.decode()
 
     def _authenticate_and_register(self, ws, token) -> bool:
         """校验 token 并原子注册客户端：通过则加入列表，失败返回 False。
@@ -378,27 +447,28 @@ class LanServer:
         except Exception:
             pass
 
-    def get_bind_info(self, force_new: bool = False) -> Dict:
+    def get_bind_info(self, force_new: bool = False, path: str = "/") -> Dict:
         """返回手机扫码绑定信息。
 
         token 固定策略：未过期直接复用（多次打开/应用重启 token 不变）；
         已过期自动重签；force_new=True（前端"刷新"按钮）强制重签并使旧
         token 立即失效。expires_in 返回剩余有效秒数（而非完整 TTL）。
+        path 指定绑定到哪个前端（"/" 桌面响应式版 / "/m/" 独立移动端），
+        两者共享同一配对 token 与 WS 通道。
         """
-        if force_new or not self._token or (
-            self._token_expires is not None and time.time() >= self._token_expires
-        ):
-            self._issue_token()
-        token = self._token.decode()
-        url = self.bind_url(token)
+        with self._token_issue_lock:
+            if force_new or not self._token or (
+                self._token_expires is not None and time.time() >= self._token_expires
+            ):
+                self._issue_token()
+            token = self._token.decode()
+            expires = self._token_expires
+        url = self.bind_url(token, path=path)
         img = qrcode.make(url)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         qr_b64 = base64.b64encode(buf.getvalue()).decode()
-        remaining = (
-            0 if self._token_expires is None
-            else max(0, int(self._token_expires - time.time()))
-        )
+        remaining = 0 if expires is None else max(0, int(expires - time.time()))
         return {
             "ok": True,
             "url": url,
@@ -410,18 +480,19 @@ class LanServer:
 
     def set_ttl(self, seconds: int) -> None:
         """更新配对 token 的有效期（秒）；<= 0 表示永久有效。"""
-        self._ttl = int(seconds)
+        with self._token_issue_lock:
+            self._ttl = int(seconds)
 
     def _safe_send(self, ws, payload: str) -> bool:
-        """线程安全地向单个客户端发送 payload。"""
+        """线程安全地向单个客户端发送 payload。
+
+        未注册（无发送锁）意味着已注销/被轮换摘除：直接放弃（fail-closed），
+        不再无锁直发，避免对已摘除连接并发 send 的竞态窗口。
+        """
         with self._clients_lock:
             lock = self._client_locks.get(ws)
         if lock is None:
-            try:
-                ws.send(payload)
-                return True
-            except Exception:
-                return False
+            return False
         with lock:
             try:
                 ws.send(payload)
@@ -568,7 +639,7 @@ class LanServer:
         return self._call_bridge(method, args, extra_kwargs)
 
     def _force_lan_turn_source(self, args):
-        """消息入口参数规范化：剥离客户端一切 turn_source 绑定通道。
+        """消息入口参数规范化：剥离客户端一切 turn_source 绑定与权限档位注入通道。
 
         真实 bridge 签名 send_user_message(text, session_name, attachments,
         workdir, model_id, permission_mode, turn_source)——turn_source 在
@@ -578,14 +649,30 @@ class LanServer:
         （返回 ``(args, extra_kwargs)``；无法规范化返回 ``None`` 由调用方
         fail-closed 拒绝）：
         - list：裁剪位置参数至前 5 个（text..model_id），第 6 位起丢弃；
-        - 首参为 dict（payload 形态）：删除其 turn_source 键（防夹带）；
-        - dict（kwargs 形态）：删除 turn_source 键后以 lan 覆盖。
+        - 首参为 dict（payload 形态）：删除其 turn_source / permission_mode
+          键（防夹带）；
+        - dict（kwargs 形态）：白名单化——只放行位置通道允许的前 5 个键
+          （与 MESSAGE_ENTRY_POSITIONAL_LIMIT 对齐），permission_mode /
+          turn_source 及一切未知键均被剥离，随后以 lan 覆盖 turn_source。
         最终 turn_source 只能由服务器经 _call_bridge 的 keyword 通道
         注入 "lan"，客户端不存在任何可达的绑定通道。
         """
         if isinstance(args, dict):
-            merged = dict(args)
-            merged.pop("turn_source", None)
+            # kwargs 形态：白名单化——只放行位置通道允许的前 5 个键（与
+            # MESSAGE_ENTRY_POSITIONAL_LIMIT 对齐），permission_mode /
+            # turn_source 及一切未知键均被剥离，客户端不存在任何档位注入通道。
+            merged = {
+                key: args[key]
+                for key in ("text", "session_name", "attachments", "workdir", "model_id")
+                if key in args
+            }
+            extra_keys = [
+                k
+                for k in args
+                if k not in ("text", "session_name", "attachments", "workdir", "model_id")
+            ]
+            if extra_keys:
+                logger.debug("LAN 消息入口剥离非法键: %s", extra_keys)
             merged["turn_source"] = "lan"
             return merged, None
         if isinstance(args, list):
@@ -593,6 +680,7 @@ class LanServer:
             if items and isinstance(items[0], dict):
                 payload = dict(items[0])
                 payload.pop("turn_source", None)
+                payload.pop("permission_mode", None)
                 items[0] = payload
             return items, {"turn_source": "lan"}
         return None
@@ -630,6 +718,13 @@ class LanServer:
             return self._serve_index()
         if path == "/mobile-shim.js":
             return self._serve_shim()
+        if path in ("/m", "/m/") or path == "/m/index.html":
+            return self._serve_mobile_index()
+        if path == "/m/mobile-shim.js":
+            return self._serve_shim()
+        if path.startswith("/m/"):
+            # 独立移动端子应用：与桌面 dist 完全隔离的另一份静态资源
+            return self._serve_mobile_static(path)
         if path == "/theme":
             return self._serve_theme()
         if path == "/health":
@@ -717,6 +812,62 @@ class LanServer:
         if full != dist and not full.startswith(dist + os.sep):
             return self._http_404()
         if not os.path.isfile(full):
+            return self._http_404()
+        ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError:
+            return self._http_404()
+        return self._http_response(200, data, ctype)
+
+    # ------------------------------------------------------------------ #
+    # 独立移动端子应用（frontend-mobile/dist，/m/ 路径托管）
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _mobile_dist_dir() -> str:
+        return os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+            "frontend-mobile",
+            "dist",
+        )
+
+    def _serve_mobile_index(self) -> Response:
+        """读 frontend-mobile/dist/index.html，在 ``</head>`` 前注入 mobile-shim。
+
+        shim 引用走 /m/mobile-shim.js（与桌面端同一份 shim 文件与协议）；
+        index 禁缓存与 _serve_index 同理：保证手机端总能拿到最新 shim。
+        """
+        index_path = os.path.join(self._mobile_dist_dir(), "index.html")
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                html = f.read()
+        except OSError:
+            return self._http_404()
+        html = html.replace(
+            "</head>", '<script src="/m/mobile-shim.js"></script></head>', 1
+        )
+        return self._http_response(
+            200, html, "text/html; charset=utf-8", cache_control="no-store"
+        )
+
+    def _serve_mobile_static(self, path: str) -> Response:
+        """读 frontend-mobile/dist 下的静态文件，带路径穿越防护。
+
+        SPA history 回退：vue-router createWebHistory('/m/') 的深链
+        （如 /m/convo/xxx）刷新时按静态文件查找会落空——末段不含扩展名
+        的缺失路径一律回退到移动端 index.html；带扩展名的资源缺失照常 404。
+        """
+        dist = os.path.normpath(self._mobile_dist_dir())
+        rel = path[len("/m/"):] if path.startswith("/m/") else path.lstrip("/")
+        full = os.path.normpath(os.path.join(dist, rel))
+        if full != dist and not full.startswith(dist + os.sep):
+            return self._http_404()
+        if not os.path.isfile(full):
+            last_seg = rel.rstrip("/").split("/")[-1] if rel.rstrip("/") else ""
+            if "." not in last_seg:
+                return self._serve_mobile_index()
             return self._http_404()
         ctype = mimetypes.guess_type(full)[0] or "application/octet-stream"
         try:

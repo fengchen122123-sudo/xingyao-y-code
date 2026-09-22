@@ -2907,6 +2907,10 @@ class SubagentTask:
     # ""=未移交；"main_takeover"/"takeover_queued"=移交成功；
     # "failed"=移交失败（保留 timed_out 事实，不得改写为普通 failed 重新委派）
     handoff: str = field(default="", repr=False)
+    # 父回合创建子代理时快照的权限档位（线程本地，子代理线程不继承）。
+    # 子代理线程执行工具时用它包裹，鉴权路径据此读到会话档位而非全局默认，
+    # 否则父会话 full + 全局 confirm/accept_edits 时子代理仍会反复弹审批。
+    permission_mode: str | None = field(default=None, repr=False)
 
 
 SubagentRunner = Callable[[SubagentTask], str]
@@ -3116,6 +3120,10 @@ class SubagentManager:
                 custom_config = None
 
         from core.workspace_context import get_workdir
+        # 权限档位随任务快照：子代理线程不继承调用线程的线程本地档位，
+        # 必须在创建时（仍处于父回合线程）取值，_run_task 内再用 scope 恢复。
+        from core import app_context as _app_context
+        _parent_permission_mode = _app_context.get_permission_mode()
         task = SubagentTask(
             task_id=str(task_id or _new_subagent_task_id()),
             parent_session=str(parent_session or ""),
@@ -3130,6 +3138,7 @@ class SubagentManager:
             model_config=model_config,
             custom_config=custom_config,
             event_callback=event_callback,
+            permission_mode=_parent_permission_mode,
         )
         with self._lock:
             if task.task_id in self._tasks:
@@ -3295,6 +3304,19 @@ class SubagentManager:
                 return
         task.slot_acquired = True
         _own_undo_turn = None  # 按回合撤销：后台任务拥有的独立检查点 (checkpoint, ctx)
+        # 线程本地权限档位作用域：子代理线程不继承父回合的线程绑定，必须用
+        # 创建时快照的档位重新绑定，否则鉴权路径回退到全局默认（父会话 full、
+        # 全局 confirm/accept_edits 时子代理工具仍反复弹审批）。
+        from contextlib import nullcontext as _nullcontext
+
+        from core import app_context as _subagent_app_context
+
+        _permission_scope = (
+            _subagent_app_context.permission_mode_scope(task.permission_mode)
+            if task.permission_mode
+            else _nullcontext()
+        )
+        _permission_scope.__enter__()
         try:
             with self._lock:
                 if task.status != "pending":
@@ -3312,8 +3334,6 @@ class SubagentManager:
             # 计划/授权/沙盒放行等“每会话”状态同样路由到父会话：
             # 子代理执行计划项、触发权限询问时操作的是父会话的桶，
             # 不会串到其他并行会话
-            import core.app_context as _subagent_app_context
-
             _subagent_app_context.set_thread_session(task.parent_session)
             from core.plan import set_current_plan_session as _bind_plan_route
 
@@ -3400,6 +3420,12 @@ class SubagentManager:
                 from core.turn_undo import recorder as _tu_recorder
 
                 _tu_recorder.unbind_thread()
+            except Exception:
+                pass
+            # 线程本地权限档位必须随任务结束解绑，避免复用线程（如测试主线程
+            # 直调）时档位残留到下一个任务
+            try:
+                _permission_scope.__exit__(None, None, None)
             except Exception:
                 pass
             self._release_slot(task)
