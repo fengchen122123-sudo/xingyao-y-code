@@ -194,9 +194,16 @@ def get_permission_mode() -> str:
 
 
 def set_permission_mode(value: Any) -> str:
-    """写入权限模式（自动规范化），返回最终生效的规范值。"""
+    """写入权限模式（自动规范化），返回最终生效的规范值。
+
+    若当前线程已绑定线程级档位（回合/子代理/并行工具线程内），同步更新该
+    绑定，避免"改了全局值但本线程仍按旧档位鉴权"的语义割裂；未绑定时只写
+    全局值（入口层切换会话默认档位的旧语义）。
+    """
     global _permission_mode_fallback
     canonical = normalize_permission_mode(value)
+    if getattr(_permission_mode_tls, "mode", None) is not None:
+        _permission_mode_tls.mode = canonical
     _permission_mode_fallback = canonical
     ctx = _context
     if ctx is not None:

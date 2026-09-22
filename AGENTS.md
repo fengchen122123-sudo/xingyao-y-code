@@ -140,6 +140,15 @@ plugins/<plugin_name>/          # 内置插件（随仓库发布）
   但 `_release_slot` 幂等立即归还名额，排队超过任务自身超时预算直接判 timed_out，
   避免泄漏线程占满 5 个名额导致前台回合无限阻塞。
 
+- 权限档位传播铁律：会话级档位由 `core/app_context.py` 的线程级绑定承载
+  （`set_thread_permission_mode` / `permission_mode_scope`），鉴权路径
+  `get_permission_mode()` 线程级优先、回退全局。任何新建执行线程都必须显式
+  传播该档位，否则回退全局默认，出现"会话开了 full 仍弹审批"：
+  GUI 回合在 `gui_bridge._run_turn_worker` 绑定；子代理在 `core/tools.py`
+  的 `SubagentTask.permission_mode` 创建时快照、`_run_task` 内 scope 恢复；
+  并行工具线程在 `core/harness/tool_pipeline._submit_daemon_call` 传播。
+  `set_permission_mode()` 对已绑定线程同步更新绑定，避免语义割裂。
+
 - `core/cache_keepalive.py`：前缀缓存保活默认 120 秒（0 关闭，最小 60），仅 DeepSeek/Kimi 路由生效。
 
 - 智谱 GLM 缓存路线：官方隐式自动缓存（无亲和参数、无显式标记、命中五折、TTL 不透明），
