@@ -10,7 +10,7 @@ from typing import Optional, Dict, Any
 
 # 全局默认 User-Agent：所有方言的请求头统一带上，便于服务端在调用日志/用量
 # 统计中按客户端归类（不设时 httpx 会填 python-httpx/x.x，导致被识别为 python）。
-DEFAULT_USER_AGENT = "XingYaoCode/1.3.1"
+DEFAULT_USER_AGENT = "XingYaoCode/1.3.2"
 
 
 @dataclass(frozen=True)
