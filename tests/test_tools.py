@@ -3545,7 +3545,7 @@ def test_execute_command_background_echo_redacts_inline_credentials(monkeypatch)
     """M8：后台任务启动回显中的内联凭据被脱敏。"""
     monkeypatch.setattr(
         "core.task_manager.start_background_task",
-        lambda command, session_id="": "abc12345",
+        lambda command, session_id="", turn_id="": "abc12345",
     )
 
     result = execute_command(
