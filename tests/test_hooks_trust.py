@@ -169,6 +169,7 @@ def test_list_hooks_with_status_scope_defaults_and_grant(tmp_path):
         "scope",
         "digest",
         "status",
+        "disabled",
     }
     assert hooks[1]["event"] == "Stop"
     json.dumps(hooks, ensure_ascii=False)
@@ -182,6 +183,34 @@ def test_list_hooks_with_status_scope_defaults_and_grant(tmp_path):
     )
     assert (ok, message) == (True, "已信任")
     assert view()[1]["status"] == TRUST_TRUSTED
+
+
+def test_list_hooks_with_status_includes_disabled_entries(tmp_path):
+    """管理列表口径：disabled 条目仍出现在列表中（带 disabled 标记），可重新启用。
+
+    执行侧（registry.load 默认口径）仍然跳过它——本视图只扩大可见范围，
+    不影响 runner 的执行行为。
+    """
+    registry, project_path, workspace_root = _two_level(tmp_path)
+    _write_hooks(
+        project_path,
+        {"hooks": {"Stop": [{"command": "python proj_hook.py", "disabled": True}]}},
+    )
+    store = _store(tmp_path)
+
+    hooks = list_hooks_with_status(
+        workspace_root=workspace_root, registry=registry, store=store
+    )
+
+    assert [h["disabled"] for h in hooks] == [False, True]
+    assert hooks[1]["command"] == "python proj_hook.py"
+    assert hooks[1]["scope"] == "project"
+    # 禁用条目同样有 digest（disabled 不参与指纹），配合 set_hook_disabled 可恢复
+    assert hooks[1]["digest"]
+    # 对照：执行侧默认口径下禁用条目不可见（行为不变）
+    assert [r.command for r in registry.load(workspace_root=workspace_root)] == [
+        "python user_hook.py"
+    ]
 
 
 def test_list_hooks_with_status_stale_after_command_change(tmp_path):

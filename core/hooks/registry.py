@@ -118,21 +118,36 @@ class HookRegistry:
             return None
         return default_project_hooks_path(workspace_root)
 
-    def load(self, *, workspace_root=None) -> list[HookRegistration]:
+    def load(
+        self, *, workspace_root=None, include_disabled: bool = False
+    ) -> list[HookRegistration]:
         """加载全部有效注册项。
 
         顺序约定：用户级在前、项目级在后。理由：用户自己的配置更可信，
         其注入上下文应更早出现；阻断/权限合并不受顺序影响（向最严格收敛）。
+
+        ``include_disabled`` 默认 False = 执行侧口径（disabled 条目被跳过，
+        行为与改造前完全一致）。管理列表（``trust.list_hooks_with_status``）
+        传 True 让被禁用的钩子仍可见、可重新启用——否则「停用」在管理页上
+        等同于条目消失，成为不可逆操作。
         """
-        registrations = self._load_file(self._user_hooks_path, scope="user")
+        registrations = self._load_file(
+            self._user_hooks_path, scope="user", include_disabled=include_disabled
+        )
         project_path = self.project_hooks_path(workspace_root)
         if project_path is not None:
-            registrations.extend(self._load_file(project_path, scope="project"))
+            registrations.extend(
+                self._load_file(
+                    project_path, scope="project", include_disabled=include_disabled
+                )
+            )
         return registrations
 
     # ── 内部实现 ────────────────────────────────────────────────
 
-    def _load_file(self, path: Path, *, scope: str) -> list[HookRegistration]:
+    def _load_file(
+        self, path: Path, *, scope: str, include_disabled: bool = False
+    ) -> list[HookRegistration]:
         if not path.exists():
             return []  # 文件不存在是正常情况（规格 §7），静默跳过
         try:
@@ -177,6 +192,7 @@ class HookRegistry:
                     source_path=source_path,
                     index=index,
                     path=path,
+                    include_disabled=include_disabled,
                 )
                 if registration is not None:
                     registrations.append(registration)
@@ -191,6 +207,7 @@ class HookRegistry:
         source_path: str,
         index: int,
         path: Path,
+        include_disabled: bool = False,
     ) -> HookRegistration | None:
         """解析单条 hook；任何字段非法都 warning 并返回 None（跳过该条）。"""
         where = f"{path} · {event.value}[{index}]"
@@ -239,11 +256,17 @@ class HookRegistry:
 
         disabled = entry.get("disabled", False)
         if not isinstance(disabled, bool):
+            # 非法 disabled 值两种模式都跳过：无法判断用户启停意图时既不执行、
+            # 也不让管理页把它当成可启停的条目（用户需先修好文件里的坏值）。
             self._logger.warning("hook 配置项 disabled 非法，已跳过（%s）", where)
             return None
-        if disabled:
+        if disabled and not include_disabled:
+            # 执行侧（默认口径）：disabled 条目直接跳过，与改造前行为一致；
+            # 管理列表（include_disabled=True）：保留并带 disabled 标记。
             return None
 
+        # digest 计算逻辑不变：disabled 不参与指纹（启停不改变执行内容，
+        # digest 只绑定 event/command/matcher/timeout_ms/source_path）。
         digest = compute_hook_digest(
             {
                 "event": event.value,
@@ -262,4 +285,5 @@ class HookRegistry:
             source_path=source_path,
             scope=scope,
             digest=digest,
+            disabled=disabled,
         )
