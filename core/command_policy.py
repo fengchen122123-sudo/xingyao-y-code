@@ -1,8 +1,11 @@
 """Pure policy helpers for session-scoped command authorization."""
 
+import fnmatch
 import os
 import re
 import shlex
+
+from collections.abc import Mapping
 
 from core.permission_policy import PermissionRisk
 
@@ -419,3 +422,90 @@ def _session_rule_is_exact(rule: tuple[str, ...]) -> bool:
         or (len(rule) > 1 and rule[1].startswith("-"))
         or any(token.lower() in _QUERY_FLAGS for token in rule[1:])
     )
+
+
+# ---------------------------------------------------------------------------
+# T1 子进程环境变量策略：默认不把主进程的敏感环境变量（API Key / Token 等）
+# 透传给 execute_command 与后台任务拉起的子进程，堵住「模型执行命令时把
+# 凭据带给子进程」的泄漏面。这是唯一默认偏离旧行为的配置项（安全默认）；
+# 逃生门：config.json 设 "shell_env_policy": {"exclude_sensitive": false}。
+# ---------------------------------------------------------------------------
+SHELL_ENV_POLICY_CONFIG_KEY = "shell_env_policy"
+DEFAULT_SHELL_ENV_POLICY = {"inherit": "all", "exclude_sensitive": True}
+DEFAULT_SENSITIVE_ENV_PATTERNS = ("*KEY*", "*SECRET*", "*TOKEN*", "*PASSWORD*")
+
+
+def _env_pattern_list(value) -> list[str]:
+    """归一化模式列表：字符串视为单模式，非法项静默忽略。"""
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return [item for item in value if isinstance(item, str) and item]
+    return []
+
+
+def _env_name_matches(name: str, patterns: list[str]) -> bool:
+    """环境变量名按 fnmatch 匹配，大小写不敏感（Windows 语义跨平台统一）。"""
+    upper = str(name).upper()
+    return any(fnmatch.fnmatchcase(upper, pattern.upper()) for pattern in patterns)
+
+
+def build_child_env(
+    base_env: Mapping[str, str], *, policy: dict | None = None
+) -> dict[str, str]:
+    """构造子进程环境变量表（默认安全：排除敏感变量）。
+
+    策略字段（均为可选，非法值回退默认）：
+    - ``inherit``: ``all``（默认）继承 base_env；``none`` 从空表开始
+    - ``exclude_sensitive``: 默认 True，按 ``DEFAULT_SENSITIVE_ENV_PATTERNS``
+      排除敏感变量；显式 False 为逃生门（恢复旧行为）
+    - ``exclude``: 追加自定义排除模式（fnmatch，大小写不敏感）
+    - ``include_only``: 非空白名单，仅保留匹配变量
+    - ``set``: 固定注入，最终生效（显式覆盖同名的继承值）
+    """
+    options = policy if isinstance(policy, dict) else {}
+    base = dict(base_env) if isinstance(base_env, Mapping) else {}
+
+    inherit = str(options.get("inherit", "all") or "all").strip().lower()
+    if inherit == "none":
+        env: dict[str, str] = {}
+    else:
+        env = {str(key): str(value) for key, value in base.items()}
+
+    exclude_patterns: list[str] = []
+    if options.get("exclude_sensitive", True):
+        exclude_patterns.extend(DEFAULT_SENSITIVE_ENV_PATTERNS)
+    exclude_patterns.extend(_env_pattern_list(options.get("exclude")))
+    for name in list(env):
+        if _env_name_matches(name, exclude_patterns):
+            del env[name]
+
+    include_only = _env_pattern_list(options.get("include_only"))
+    if include_only:
+        env = {
+            name: value
+            for name, value in env.items()
+            if _env_name_matches(name, include_only)
+        }
+
+    fixed = options.get("set")
+    if isinstance(fixed, Mapping):
+        env.update({str(key): str(value) for key, value in fixed.items()})
+    return env
+
+
+def load_shell_env_policy() -> dict:
+    """读取 config.json 的 shell_env_policy；缺省/非法值回退安全默认。"""
+    resolved = dict(DEFAULT_SHELL_ENV_POLICY)
+    try:
+        import config
+
+        data = config._load()
+    except Exception:
+        data = None
+    user_policy = (
+        data.get(SHELL_ENV_POLICY_CONFIG_KEY) if isinstance(data, dict) else None
+    )
+    if isinstance(user_policy, dict):
+        resolved.update(user_policy)
+    return resolved
