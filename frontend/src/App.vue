@@ -84,7 +84,17 @@
              若放进 overflow 滚动的 #chat-scroll 内，position:absolute 会相对
              整个内容区定位，会话一长红点就被推到内容中部、随内容滚出视口 -->
         <div class="chat-viewport">
-          <div ref="chatScrollRef" id="chat-scroll" data-theme-region="workspace" @scroll="onChatScroll">
+          <div
+            ref="chatScrollRef"
+            id="chat-scroll"
+            data-theme-region="workspace"
+            @scroll="onChatScroll"
+            @wheel="onChatWheel"
+            @touchstart="onChatTouchStart"
+            @touchmove="onChatTouchMove"
+            @touchend="onChatTouchEnd"
+            @pointerdown="onChatPointerDown"
+          >
           <div id="chat-body">
             <!-- 历史分页加载指示：滚动到顶翻页时显示 -->
             <div v-if="store.historyLoading" class="history-loading" data-test="history-loading">正在加载更早的消息…</div>
@@ -136,7 +146,7 @@
             :nav-items="store.navItems"
             :loaded-first-id="store.firstLoadedMsgId"
             @jump="onNavJump"
-            @locating="onRailLocating"
+            @jump-start="onRailJumpStart"
           />
 
           <!-- 回到底部悬浮按钮：用户上滑浏览历史时出现 -->
@@ -145,7 +155,7 @@
             class="jump-bottom"
             data-test="jump-bottom"
             title="回到底部"
-            @click="scrollToBottom(true)"
+            @click="forceScrollToBottom"
           >
             <AppIcon name="chevron-down" :size="16" :stroke-width="2.25" />
           </button>
@@ -433,18 +443,65 @@ const statusSkillTitle = computed(() =>
     : '本回合未使用任何技能',
 );
 
+// 红点跳转的「退出跟随」处理（滚动权状态机）。
+// 点击红点=用户显式离开底部：跳转发起时退出跟随（following=false），
+// 跳转期间与结束后内容变化都不再吸底；直到用户滚回底部（或点回底按钮）才恢复。
+// 不再需要「抑制窗口/恢复延迟」——following=false 本身就是全部保证。
+function onRailJumpStart() {
+  commitFollowing(false);
+}
+
+/** 显式回底（按钮/发送/切会话/设置页返回）：强制吸底恢复跟随，并取消进行中的跳转校正 */
+function forceScrollToBottom() {
+  scrollToBottom(true);
+  railRef.value?.cancelJump?.();
+}
+
 // 智能滚动：跟随模式（贴底自动吸底 / 上滑冻结）+ force 场景强制回底
 const {
   scrollToBottom,
   handleScroll,
   syncStick,
   showJumpButton,
+  noteUserScrollIntent,
+  commitFollowing,
 } = useChatScroll(() => chatScrollRef.value);
 
-// 历史滚动翻页：滚动近顶部时向前翻一页，加载后按内容增量补偿 scrollTop（视口不跳动）
+// 历史滚动翻页：滚动近顶部时向前翻一页，加载后按内容增量补偿 scrollTop（视口不跳动）。
+// 自动翻页只由「用户滚动」触发：程序化滚动（跳转定位/翻页补偿）不抢翻页控制权。
 function onChatScroll() {
-  handleScroll();
-  void maybeLoadOlder();
+  if (handleScroll()) void maybeLoadOlder();
+}
+
+// 用户滚动输入登记（滚轮/触摸/滚动条拖动）：useChatScroll 据此区分
+// 「用户滚动」与「程序化滚动」——跳转/补偿的滚动不再被误读为用户意图
+function onChatWheel(e: WheelEvent) {
+  noteUserScrollIntent(e.deltaY < 0 ? 'awayFromBottom' : e.deltaY > 0 ? 'towardBottom' : 'none');
+}
+let lastTouchY: number | null = null;
+function onChatTouchStart(e: TouchEvent) {
+  lastTouchY = e.touches[0]?.clientY ?? null;
+}
+function onChatTouchMove(e: TouchEvent) {
+  const y = e.touches[0]?.clientY;
+  if (y == null || lastTouchY == null) {
+    noteUserScrollIntent('unknown');
+    return;
+  }
+  noteUserScrollIntent(y > lastTouchY ? 'awayFromBottom' : y < lastTouchY ? 'towardBottom' : 'none');
+  lastTouchY = y;
+}
+function onChatTouchEnd() {
+  lastTouchY = null;
+}
+function onChatPointerDown(e: PointerEvent) {
+  // 命中滚动容器自身（滚动条/空白）：方向未知，随后由真实 scroll 落点裁决。
+  // 滚动条拖动/中键自动滚动不产生 wheel/touchmove——这里直接按「用户接管」
+  // 处理：取消进行中的跳转校正，防止校正把视口从用户拖到的位置拉回目标
+  if (e.target === chatScrollRef.value) {
+    noteUserScrollIntent('unknown');
+    railRef.value?.cancelJump?.();
+  }
 }
 // 翻页补偿的最长持续帧数（≈0.5s）：既覆盖图片解码、代码高亮等异步静默撑高，
 // 又不会长时间霸占滚动控制权
@@ -453,6 +510,7 @@ const LOAD_OLDER_MAX_FRAMES = 30;
 async function maybeLoadOlder() {
   const el = chatScrollRef.value;
   if (!el || el.scrollTop >= 120) return;
+  // 调用方已保证本次是「用户滚动」来源；跳转/补偿等程序化滚动不会走到这里
   if (!store.historyHasMore || store.historyLoading) return;
   const oldHeight = el.scrollHeight;
   const oldTop = el.scrollTop;
@@ -463,9 +521,14 @@ async function maybeLoadOlder() {
   const markUserTookOver = () => {
     if (performance.now() - startedAt > 80) userTookOver = true;
   };
+  // 滚动条拖动不产生 wheel/touchmove：命中容器自身的 pointerdown 同样视为用户接管
+  const markPointerTookOver = (ev: PointerEvent) => {
+    if (ev.target === el) markUserTookOver();
+  };
   el.addEventListener('wheel', markUserTookOver, { passive: true });
   el.addEventListener('touchmove', markUserTookOver, { passive: true });
   el.addEventListener('keydown', markUserTookOver);
+  el.addEventListener('pointerdown', markPointerTookOver);
   try {
     await store.loadOlderMessages();
     // 绝对定位补偿（幂等）：anchoring 生效时此赋值与浏览器结果一致，不会叠加；
@@ -493,57 +556,46 @@ async function maybeLoadOlder() {
     el.removeEventListener('wheel', markUserTookOver);
     el.removeEventListener('touchmove', markUserTookOver);
     el.removeEventListener('keydown', markUserTookOver);
+    el.removeEventListener('pointerdown', markPointerTookOver);
   }
-}
-
-// 红点跳转期间的「自动吸底抑制窗口」。
-// 点击红点后 rail 要把视口定位到目标消息，而跳转过程中任何「内容变化 → 自动吸底」
-// 都会把视口拽回底部，与定位相互打断——表现为「点第一个红点定不到、视口闪动乱跳」。
-// 因此在跳转起 600ms 内关闭自动吸底，之后自动恢复跟随。
-// 发送新消息、点「回到底部」等显式 force 吸底不走这里，不受影响。
-const AUTO_STICK_RELEASE_MS = 600;
-const navJumping = ref(false);
-let navJumpReleaseTimer: number | undefined;
-
-/** 关闭自动吸底（跳转开始 / 每次定位动作时调用） */
-function suppressAutoStick() {
-  if (navJumpReleaseTimer !== undefined) {
-    window.clearTimeout(navJumpReleaseTimer);
-    navJumpReleaseTimer = undefined;
-  }
-  navJumping.value = true;
-}
-
-/** 顺延抑制窗口：smooth 定位动画期间保持抑制，到期后恢复跟随 */
-function releaseAutoStickLater() {
-  if (navJumpReleaseTimer !== undefined) window.clearTimeout(navJumpReleaseTimer);
-  navJumpReleaseTimer = window.setTimeout(() => {
-    navJumpReleaseTimer = undefined;
-    navJumping.value = false;
-  }, AUTO_STICK_RELEASE_MS);
-}
-
-/** rail 每次发起定位（点击红点）时同步抑制自动吸底 */
-function onRailLocating() {
-  suppressAutoStick();
-  releaseAutoStickLater();
 }
 
 // 红点导航点击未加载区域：连续向前翻页直到目标消息进入列表，再交回 rail 定位。
 // 本地 SQLite 翻页极快，体感为直接跳转；60 页护栏防异常死循环。
+// 每页 prepend 后按高度增量补偿 scrollTop（幂等）：anchoring 生效时与浏览器结果
+// 一致，失效时兜底保持视口——连续翻页 + 异步内容撑高时 anchoring 会波动，
+// 不补偿就会「一直跳动」；补偿后再让出一帧渲染，避免批量变化把锚点冲垮。
+// 跳转已由 rail 的 jumpStart 退出跟随（following=false），翻页期间内容变化
+// 不再吸底，无需任何抑制窗口；seq 令牌保证连续点击时旧循环立即让位。
+let navJumpSeq = 0;
 async function onNavJump(payload: { index: number; id: number }) {
-  suppressAutoStick();
+  const seq = ++navJumpSeq;
+  commitFollowing(false); // 双保险：跨页跳转同样显式退出跟随
+  const el = chatScrollRef.value;
+  const sessionAtJump = store.currentSessionName;
   let guard = 0;
   while (guard++ < 60) {
+    if (seq !== navJumpSeq) return; // 新跳转接管：旧循环退出
+    if (store.currentSessionName !== sessionAtJump) return; // 切会话：放弃跳转
     const first = store.firstLoadedMsgId;
     if (first !== null && payload.id >= first) break;
     if (!store.historyHasMore) break;
+    const oldHeight = el?.scrollHeight ?? 0;
+    const oldTop = el?.scrollTop ?? 0;
     await store.loadOlderMessages();
+    await nextTick();
+    if (!el || chatScrollRef.value !== el || store.currentSessionName !== sessionAtJump) return;
+    if (seq !== navJumpSeq) return;
+    // 绝对定位补偿（幂等）：anchoring 生效时此赋值与浏览器结果一致，不会叠加
+    el.scrollTop = el.scrollHeight - oldHeight + oldTop;
+    // 让出一帧：给布局/anchoring 落地时间，下一轮 prepend 不在同一帧内叠加
+    await new Promise<void>((resolve) => {
+      window.requestAnimationFrame(() => resolve());
+    });
   }
+  if (seq !== navJumpSeq) return;
   await nextTick();
   railRef.value?.jumpToLoaded?.(payload.index);
-  // 定位动画（smooth）还需数百毫秒，此处顺延抑制窗口覆盖整段
-  releaseAutoStickLater();
 }
 
 // 红点导航轨道：每条「我发的消息」对应一个红点，DOM 变化后重算红点数量
@@ -555,19 +607,25 @@ function getUserMsgElements(): HTMLElement[] {
   return Array.from(chatScrollRef.value?.querySelectorAll('.msg-user') ?? []);
 }
 
-// 新用户消息（发送）→ 强制回底并恢复跟随；其余消息变化仅在跟随模式下跟随
+// 新用户消息（发送）→ 强制回底并恢复跟随；其余消息变化仅在跟随模式下跟随。
+// 仅当消息流「尾部」出现新 user 消息（= 用户刚发送）才强制吸底：历史翻页
+// prepend 只动头部，尾部消息对象不变（即使尾部恰好就是 user 消息、user 消息
+// 总数增加），因此这里按「尾部对象身份」判定，绝不误触发——也就不再需要依赖
+// historyLoading 的时序（不再需要 flush:'sync' 的同步守卫）。
+// 约束：该判定依赖 appStore.loadOlderMessages 的 prepend 保持既有消息对象身份
+//（数组前插、不重建对象）。若未来 store 改为重建消息对象，此判定与
+// App.historyPaged.test.ts 的「prepend 不得吸底」用例需同步调整。
 const userMsgCount = computed(() => store.messages.filter((m) => m.role === 'user').length);
-// flush: 'sync' 是关键：默认异步 flush 下，回调执行时 loadOlderMessages 的
-// finally 已把 historyLoading 复位，守卫形同虚设（真实翻页会吸底，实测复现）。
-// 同步 flush 保证回调看到 prepend 发生那一刻的 loading=true。
-// 双保险：仅当消息流「尾部」出现新 user 消息（= 用户刚发送）才强制吸底；
-// 历史翻页 prepend 只动头部、尾部角色不变，绝不触发。
+// setup 时先记下当前尾部（若已有消息）：它属于「已知的旧尾部」，不算刚发送
+let lastTailMsg: unknown = store.messages.length ? store.messages[store.messages.length - 1] : null;
 watch(userMsgCount, (n, o) => {
-  if (n <= o || store.historyLoading) return;
-  const last = store.messages[store.messages.length - 1] as { role?: string } | undefined;
-  if (last?.role !== 'user') return;
-  scrollToBottom(true);
-}, { flush: 'sync' });
+  const tail = store.messages[store.messages.length - 1] as { role?: string } | undefined;
+  const tailIsNew = tail !== undefined && tail !== lastTailMsg;
+  lastTailMsg = tail;
+  if (n <= o || !tailIsNew) return;
+  if (tail?.role !== 'user') return;
+  forceScrollToBottom();
+});
 
 // M32 修复：消息列表 key 不用数组索引（插入/删除时组件局部状态会错挂）。
 // 消息对象没有后端 id，按对象身份分配稳定渲染 key（实现移至 utils/turnGroups，
@@ -595,9 +653,9 @@ function ensureBodyObserver() {
     bodyObserver?.disconnect();
     observedBody = body;
     bodyObserver = new MutationObserver(() => {
-      // 内容变化（思考流/工具时间线/Diff 展开/工时计时等）：跟随模式下自动吸底。
-      // 红点跳转期间抑制，避免把正在定位的视口拽回底部。
-      if (!navJumping.value) scrollToBottom();
+      // 内容变化（思考流/工具时间线/Diff 展开/工时计时等）：仅在仍持有跟随权
+      // （following=true 且无新鲜向上意图）时吸底；跳转/上滚浏览期间不打扰。
+      scrollToBottom();
       refreshRail();
     });
     bodyObserver.observe(body, { childList: true, subtree: true, characterData: true, attributes: true });
@@ -605,9 +663,8 @@ function ensureBodyObserver() {
 }
 
 watch(() => store.messages.length, () => {
-  // 红点跳转（含跨页翻页 prepend）期间不得吸底：那会把视口反复拽回底部，
-  // 与 rail 的定位相互打断
-  if (!navJumping.value) scrollToBottom();
+  // 跳转/上滚浏览期间由 following=false 天然拦截吸底，无需额外判断
+  scrollToBottom();
   ensureBodyObserver();
   refreshRail();
 });
@@ -618,7 +675,7 @@ watch(() => store.currentStreamingText, () => {
 // 这里在 DOM 重建完成后强制滚回底部并重算轨道位置，恢复"停留在最新消息"体验
 watch(() => store.settingsOpen, (open) => {
   if (!open) {
-    scrollToBottom(true);
+    forceScrollToBottom();
     ensureBodyObserver();
     nextTick(() => {
       syncStick();
@@ -683,8 +740,9 @@ watch(() => store.running, (running) => {
 // 切会话 / 清空会话后，上一轮的工时残留无意义，一并重置
 watch(() => store.currentSessionName, () => {
   finalWorkTime.value = null;
-  // 切会话回到底部并恢复跟随，红点轨道按新会话消息重算
-  scrollToBottom(true);
+  // 切会话回到底部并恢复跟随（force 顺带取消进行中的跳转校正），
+  // 红点轨道按新会话消息重算
+  forceScrollToBottom();
   nextTick(refreshRail);
   // 关键：A/B 都在运行时切换会话，store.running 值不变（true→true），
   // watch(store.running) 不会触发，计时器会继续用旧会话的时间戳串号。
@@ -708,10 +766,12 @@ watch(() => store.messages.length, (len) => {
   if (len === 0) finalWorkTime.value = null;
 });
 
-onUnmounted(() => window.clearInterval(workTimer));
+onUnmounted(() => {
+  window.clearInterval(workTimer);
+});
 // 权限卡片出现/收起时同步滚动，保证用户能立即看到询问（强制回底）
 watch(() => store.permRequest.show, () => {
-  scrollToBottom(true);
+  forceScrollToBottom();
 });
 // M25 修复：pywebviewready 事件与 100ms 兜底轮询是双通道，原先无互斥，
 // initFromBackend 可能执行两次互相覆盖；且事件监听器注册后从不移除。
@@ -750,6 +810,24 @@ function onGlobalKeydown(e: KeyboardEvent) {
     } else {
       store.openSessionSearchModal();
     }
+    return;
+  }
+  // 键盘滚动键：登记用户滚动意图（useChatScroll 据此区分用户/程序化滚动）。
+  // 输入控件内的光标按键不属于对话区滚动，忽略。
+  const t = e.target as HTMLElement | null;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+  const isScrollKey = e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home'
+    || e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === 'End' || e.key === ' ';
+  if (!isScrollKey) return;
+  // 键盘滚动同样是「用户接管」：取消进行中的跳转校正（与 wheel/touchmove 口径一致），
+  // 防止跳转检查点把视口从用户刚滚到的位置拉回目标
+  railRef.value?.cancelJump?.();
+  if (e.key === 'ArrowUp' || e.key === 'PageUp' || e.key === 'Home') {
+    noteUserScrollIntent('awayFromBottom');
+  } else if (e.key === 'ArrowDown' || e.key === 'PageDown' || e.key === 'End') {
+    noteUserScrollIntent('towardBottom');
+  } else if (e.key === ' ') {
+    noteUserScrollIntent(e.shiftKey ? 'awayFromBottom' : 'towardBottom');
   }
 }
 

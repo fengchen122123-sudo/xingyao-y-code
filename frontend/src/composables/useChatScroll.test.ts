@@ -55,7 +55,7 @@ describe('isNearBottom / distanceFromBottom', () => {
   });
 });
 
-describe('useChatScroll 跟随模式', () => {
+describe('useChatScroll 跟随模式（滚动权状态机）', () => {
   it('跟随模式下自动吸底', async () => {
     const el = makeEl();
     const api = useChatScroll(() => el);
@@ -68,13 +68,15 @@ describe('useChatScroll 跟随模式', () => {
     expect(api.stickToBottom.value).toBe(true);
   });
 
-  it('用户上滑后冻结，不再被自动拉回', async () => {
+  it('用户上滑后冻结，不再被自动拉回；滚回底部恢复跟随', async () => {
     const el = makeEl();
     const api = useChatScroll(() => el);
 
     // 用户向上滚动 200px，离开底部
+    api.noteUserScrollIntent('awayFromBottom');
     el.scrollTop = 200;
-    api.handleScroll();
+    const fromUser = api.handleScroll();
+    expect(fromUser).toBe(true); // 用户来源：按落点更新跟随态
     expect(api.stickToBottom.value).toBe(false);
     expect(api.showJumpButton.value).toBe(true);
 
@@ -84,16 +86,49 @@ describe('useChatScroll 跟随模式', () => {
     expect(el.scrollTop).toBe(200);
 
     // 手动滑回底部：恢复跟随
+    api.noteUserScrollIntent('towardBottom');
     el.scrollTop = 500;
-    api.handleScroll();
+    expect(api.handleScroll()).toBe(true);
     expect(api.stickToBottom.value).toBe(true);
     expect(api.showJumpButton.value).toBe(false);
+  });
+
+  it('程序化滚动（无用户意图）不改变跟随态', () => {
+    const el = makeEl();
+    const api = useChatScroll(() => el);
+
+    // 贴底跟随中；跳转/补偿等程序化滚动把 scrollTop 挪到中间
+    el.scrollTop = 200;
+    const fromUser = api.handleScroll();
+    expect(fromUser).toBe(false); // 非用户来源
+    expect(api.stickToBottom.value).toBe(true); // 跟随权不被程序化滚动骗走
+  });
+
+  it('用户上滚意图立即退出跟随（不等 scroll 事件）', () => {
+    const el = makeEl();
+    const api = useChatScroll(() => el);
+
+    api.noteUserScrollIntent('awayFromBottom');
+    expect(api.stickToBottom.value).toBe(false);
+  });
+
+  it('上滚后紧跟内容变化：不吸底（对账）', async () => {
+    const el = makeEl();
+    const api = useChatScroll(() => el);
+
+    // 用户上滚的 wheel 已到达、scroll 事件尚未派发时，内容变化 commit 先到
+    api.noteUserScrollIntent('awayFromBottom');
+    api.scrollToBottom();
+    await flushRaf();
+
+    expect(el.scrollTop).toBe(0); // 未被吸底拽回
   });
 
   it('force 滚动忽略跟随模式并恢复跟随', async () => {
     const el = makeEl();
     const api = useChatScroll(() => el);
 
+    api.noteUserScrollIntent('awayFromBottom');
     el.scrollTop = 200;
     api.handleScroll();
     expect(api.stickToBottom.value).toBe(false);
@@ -104,11 +139,31 @@ describe('useChatScroll 跟随模式', () => {
     expect(api.stickToBottom.value).toBe(true);
   });
 
+  it('force 覆盖新鲜的上滚意图（显式动作优先）', async () => {
+    const el = makeEl();
+    const api = useChatScroll(() => el);
+
+    api.noteUserScrollIntent('awayFromBottom');
+    api.scrollToBottom(true); // 显式回底：意图作废，必须吸底
+    await flushRaf();
+    expect(el.scrollTop).toBe(el.scrollHeight);
+  });
+
+  it('已排队的吸底帧在退出跟随后不再执行', async () => {
+    const el = makeEl();
+    const api = useChatScroll(() => el);
+
+    api.scrollToBottom(); // 排队到下一帧
+    api.commitFollowing(false); // 帧执行前退出跟随（如跳转发起）
+    await flushRaf();
+    expect(el.scrollTop).toBe(0);
+  });
+
   it('滚动容器为空时不抛错且维持跟随', async () => {
     const api = useChatScroll(() => null);
     api.scrollToBottom();
     await flushRaf();
-    api.handleScroll();
+    expect(api.handleScroll()).toBe(false);
     expect(api.stickToBottom.value).toBe(true);
   });
 
