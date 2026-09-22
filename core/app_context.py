@@ -144,11 +144,30 @@ def get_active_model_tuple() -> Optional[tuple]:
 # ---------------------------------------------------------------------------
 
 def get_permission_mode() -> str:
-    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。"""
+    """返回当前权限模式的规范值（confirm / accept_edits / plan / full）。
+
+    受管策略存在时在此做上限兜底：任何来源（配置文件 / 会话切换 / 运行时命令）
+    的超限请求都在消费点降档，保证所有消费方拿到的都是合规模式。
+    """
     ctx = _context
     if ctx is None:
-        return normalize_permission_mode(_permission_mode_fallback)
-    return normalize_permission_mode(getattr(ctx, "permission_mode", _permission_mode_fallback))
+        mode = normalize_permission_mode(_permission_mode_fallback)
+    else:
+        mode = normalize_permission_mode(
+            getattr(ctx, "permission_mode", _permission_mode_fallback)
+        )
+    return _apply_managed_ceiling(mode)
+
+
+def _apply_managed_ceiling(mode: str) -> str:
+    """套用受管策略的权限模式上限（无策略/异常时原样返回）。"""
+    try:
+        # 延迟导入：本模块被大量模块导入，受管策略模块反向依赖本模块的规范化函数
+        from core.managed_policy import clamp_permission_mode
+
+        return clamp_permission_mode(mode)
+    except Exception:
+        return mode
 
 
 def set_permission_mode(value: Any) -> str:

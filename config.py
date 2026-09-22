@@ -7,6 +7,11 @@ import threading
 from copy import deepcopy
 
 from core.credentials import DPAPI_PREFIX, KEYRING_PREFIX, protect_secret, unprotect_secret
+from core.managed_policy import (
+    apply_managed_policy,
+    enforce_managed_writes,
+    load_managed_policy,
+)
 
 try:
     import tomllib
@@ -292,12 +297,23 @@ def _warn_toml_overridden_keys(keys):
         pass
 
 
-def _load():
+def _load(managed=True):
+    """读取有效配置（JSON + TOML overlay 合并）；``managed=False`` 供写路径读用户原值。
+
+    受管策略（企业/团队管理员基线）在返回前套用：``permission_mode`` 超出上限时
+    降档并留警告。受管文件缺失时结果与改动前逐字节一致。
+    """
     data = _read_json_with_backup(_CONFIG_FILE, default=None)
     result = data if isinstance(data, dict) else {}
     overlay = _read_toml_overlay(_TOML_CONFIG_FILE)
     if overlay:
         result = _deep_merge(result, overlay)
+    if managed:
+        try:
+            result = apply_managed_policy(result, load_managed_policy())
+        except Exception as error:
+            # 受管策略是管理员基线，读取/套用异常不能反过来影响主流程（按无策略继续）
+            _log_warning("受管策略读取/套用失败（%s），本次按无策略继续", error)
     return result
 
 
@@ -360,13 +376,15 @@ def update_config(mutator):
     mutator 接收当前配置 dict：原地修改后返回 None，或返回一个全新的 dict 作为写入内容。
     返回值为实际写入的配置 dict。mutator 改动了同时被 config.toml 覆盖的键时，
     写入运行时告警（TOML 读取时后合并，实际生效值仍以 TOML 为准）。
+    受管策略锁定的键（permission_mode 超上限）变更被拒绝（回退写入前值）并提示。
     """
     with _CONFIG_LOCK:
-        data = _load()
+        data = _load(managed=False)
         before = deepcopy(data)
         result = mutator(data)
         if result is not None:
             data = result
+        data, _rejected = enforce_managed_writes(data, before)
         _atomic_write_json(_CONFIG_FILE, data)
     changed_keys = {
         key
@@ -382,14 +400,17 @@ def save_config_value(key, value):
 
     该键同时被 config.toml 覆盖时写入运行时告警：TOML 读取时后合并，
     保存"成功"但实际生效值仍以 TOML 为准。
+    受管策略锁定的键（permission_mode 超出管理员上限）拒绝写入并提示"由管理员锁定"。
     """
     try:
         with _CONFIG_LOCK:
-            data = _load()
+            data = _load(managed=False)
+            before = dict(data) if isinstance(data, dict) else {}
             data[key] = value
+            data, rejected = enforce_managed_writes(data, before)
             _atomic_write_json(_CONFIG_FILE, data)
         _warn_toml_overridden_keys([key])
-        return True
+        return key not in rejected
     except Exception as e:
         # 调用方普遍不检查返回值，失败必须留下诊断痕迹而不是静默丢配置
         _log_warning("save_config_value(%r) 写入 config.json 失败: %s", key, e)

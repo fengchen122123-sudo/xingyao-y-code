@@ -844,7 +844,33 @@ def build_default_registry() -> ToolRegistry:
         plugin_loader.load_and_register(registry)
     except Exception:
         pass
+    _apply_managed_tool_filter(registry)
     return registry
+
+
+def _apply_managed_tool_filter(registry: ToolRegistry) -> None:
+    """受管策略 ``disabled_tools``：注册（含插件加载）完成后过滤禁用工具。
+
+    无策略/无禁用项时不做任何事（零行为变化）；管理端未列出的工具照常可用。
+    禁用了本发行版未安装的工具名时静默忽略（管理文件可能面向多版本分发）。
+    """
+    try:
+        from core.managed_policy import disabled_tool_names, load_managed_policy
+
+        disabled = disabled_tool_names(load_managed_policy())
+    except Exception:
+        return
+    if not disabled:
+        return
+    removed: list[str] = []
+    for name in disabled:
+        try:
+            registry.unregister(name)
+        except KeyError:
+            continue
+        removed.append(name)
+    if removed:
+        _LOGGER.warning("受管策略已禁用工具: %s", ", ".join(sorted(removed)))
 
 
 # ── MCP 配置工具的执行包装函数 ──────────────────────────────────────
