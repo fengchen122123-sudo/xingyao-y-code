@@ -65,6 +65,17 @@ describe('mobile-shim：token 持久化 + 4401 配对失效', () => {
     expect(JSON.parse(ws.sent[0]).token).toBe('ABC');
   });
 
+  it('URL 带 token：写入 localStorage 并从地址栏清理', () => {
+    const ws = loadShim('?token=ABC');
+    // token 已落 localStorage
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBe('ABC');
+    // 地址栏 query 已清理、path 保留
+    expect(window.location.search).toBe('');
+    expect(window.location.pathname).toBe('/m/');
+    ws.onopen?.();
+    expect(JSON.parse(ws.sent[0]).token).toBe('ABC');
+  });
+
   it('URL 无 token：回退用 localStorage 里的 token', () => {
     const ws = loadShim('', { [STORAGE_KEY]: 'XYZ' });
     ws.onopen?.();

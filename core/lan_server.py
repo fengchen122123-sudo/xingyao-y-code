@@ -10,6 +10,7 @@
 import base64
 import io
 import json
+import logging
 import mimetypes
 import os
 import secrets
@@ -27,6 +28,8 @@ from websockets.sync.server import serve
 
 import config
 from config import save_config_value as _save_config_value
+
+logger = logging.getLogger(__name__)
 
 # 手机端断线补发事件白名单：低频、状态关键、前端幂等（或自带去重）的事件。
 # 手机锁屏/切后台时 WebSocket 静默断开，断线窗口内的广播会永久丢失（表现为
@@ -68,8 +71,10 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
  * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
  *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
- * - 配对 token：首次从 URL 参数取并写入 localStorage，之后刷新/重开（URL 无 token）
- *   回退读 localStorage，直到服务端 TTL 过期或被轮换（4401）才失效。
+ * - 配对 token：首次从 URL 参数取并写入 localStorage，随后立即用 history.replaceState
+ *   清理地址栏 query（保留 path/hash），token 不残留于浏览器历史/截图/分享链接；
+ *   之后刷新/重开（URL 无 token）回退读 localStorage，直到服务端 TTL 过期或被
+ *   轮换（4401）才失效。
  */
 (function () {
   if (window.pywebview) return; // 桌面环境不注入，防御性
@@ -85,6 +90,16 @@ _MOBILE_SHIM_FALLBACK_JS = """/**
     }
   } catch (_) {
     // localStorage 不可用（隐私模式等）：仅本次 URL token 生效
+  }
+  // 地址栏清理：token 已写入 localStorage（或仅本次内存）后立即去掉 URL 上的
+  // ?token=，避免残留在浏览器历史、截图与分享链接中；保留 path 与 hash。
+  // 独立于上面的 try：隐私模式下 localStorage 抛错时 URL 同样要清理。
+  if (urlToken) {
+    try {
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+      }
+    } catch (_) {}
   }
   var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
   var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';
@@ -215,15 +230,16 @@ class LanServer:
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
-    # 内部注入 turn_source="lan" 并覆盖客户端 payload 同名字段，模型/用户
+    # 内部注入 turn_source="lan" 并剥离客户端一切同名绑定通道，模型/用户
     # 正文无法伪造回合来源；本地 GUI/CLI 调用不经本层，固定 local。
     MESSAGE_ENTRY_METHODS = frozenset({"send_user_message"})
 
     # send_user_message(text, session_name, attachments, workdir, model_id,
-    # permission_mode, turn_source)——turn_source 前共 6 个位置参数
+    # permission_mode, turn_source)——第 6 个位置参数起为受控参数
     # （gui_bridge.py 真实签名；第 6 位是会话级权限档位，同样不允许客户端
     # 经位置通道注入）。LAN 分发把客户端位置参数裁剪至前 5 个：第 6 位起
-    # 的绑定通道全部剥离，turn_source 只能由服务器以 keyword 唯一注入。
+    # 的绑定通道全部剥离；kwargs dict 形态按同一语义白名单化（只放行前 5
+    # 个键），turn_source 只能由服务器以 keyword 唯一注入。
     MESSAGE_ENTRY_POSITIONAL_LIMIT = 5
 
     def __init__(self, bridge=None, port=0):
@@ -232,6 +248,10 @@ class LanServer:
         self.lan_ip = self._detect_lan_ip()
         self._clients = []
         self._clients_lock = threading.Lock()
+        # 串行化「判断 + 签发 + 读取」路径（get_bind_info / set_ttl），避免并发
+        # force_new 双签交错与 token/expires 不一致组合；锁顺序单向：
+        # _token_issue_lock → _clients_lock（_issue_token 内部取后者），无死锁。
+        self._token_issue_lock = threading.Lock()
         self._client_locks: Dict[Any, threading.Lock] = {}
         self._token = None
         self._token_expires = 0.0
@@ -293,7 +313,8 @@ class LanServer:
         """校验配对 token：非空、未过期、常量时间比较；_token_expires 为 None 表示永久有效。"""
         if not token or not self._token:
             return False
-        if self._token_expires is not None and time.time() > self._token_expires:
+        # 过期边界取 >=（与 get_bind_info 的重签判定一致，保守方向）
+        if self._token_expires is not None and time.time() >= self._token_expires:
             return False
         try:
             return secrets.compare_digest(token.encode(), self._token)
@@ -435,20 +456,19 @@ class LanServer:
         path 指定绑定到哪个前端（"/" 桌面响应式版 / "/m/" 独立移动端），
         两者共享同一配对 token 与 WS 通道。
         """
-        if force_new or not self._token or (
-            self._token_expires is not None and time.time() >= self._token_expires
-        ):
-            self._issue_token()
-        token = self._token.decode()
+        with self._token_issue_lock:
+            if force_new or not self._token or (
+                self._token_expires is not None and time.time() >= self._token_expires
+            ):
+                self._issue_token()
+            token = self._token.decode()
+            expires = self._token_expires
         url = self.bind_url(token, path=path)
         img = qrcode.make(url)
         buf = io.BytesIO()
         img.save(buf, format="PNG")
         qr_b64 = base64.b64encode(buf.getvalue()).decode()
-        remaining = (
-            0 if self._token_expires is None
-            else max(0, int(self._token_expires - time.time()))
-        )
+        remaining = 0 if expires is None else max(0, int(expires - time.time()))
         return {
             "ok": True,
             "url": url,
@@ -460,18 +480,19 @@ class LanServer:
 
     def set_ttl(self, seconds: int) -> None:
         """更新配对 token 的有效期（秒）；<= 0 表示永久有效。"""
-        self._ttl = int(seconds)
+        with self._token_issue_lock:
+            self._ttl = int(seconds)
 
     def _safe_send(self, ws, payload: str) -> bool:
-        """线程安全地向单个客户端发送 payload。"""
+        """线程安全地向单个客户端发送 payload。
+
+        未注册（无发送锁）意味着已注销/被轮换摘除：直接放弃（fail-closed），
+        不再无锁直发，避免对已摘除连接并发 send 的竞态窗口。
+        """
         with self._clients_lock:
             lock = self._client_locks.get(ws)
         if lock is None:
-            try:
-                ws.send(payload)
-                return True
-            except Exception:
-                return False
+            return False
         with lock:
             try:
                 ws.send(payload)
@@ -618,7 +639,7 @@ class LanServer:
         return self._call_bridge(method, args, extra_kwargs)
 
     def _force_lan_turn_source(self, args):
-        """消息入口参数规范化：剥离客户端一切 turn_source 绑定通道。
+        """消息入口参数规范化：剥离客户端一切 turn_source 绑定与权限档位注入通道。
 
         真实 bridge 签名 send_user_message(text, session_name, attachments,
         workdir, model_id, permission_mode, turn_source)——turn_source 在
@@ -628,14 +649,30 @@ class LanServer:
         （返回 ``(args, extra_kwargs)``；无法规范化返回 ``None`` 由调用方
         fail-closed 拒绝）：
         - list：裁剪位置参数至前 5 个（text..model_id），第 6 位起丢弃；
-        - 首参为 dict（payload 形态）：删除其 turn_source 键（防夹带）；
-        - dict（kwargs 形态）：删除 turn_source 键后以 lan 覆盖。
+        - 首参为 dict（payload 形态）：删除其 turn_source / permission_mode
+          键（防夹带）；
+        - dict（kwargs 形态）：白名单化——只放行位置通道允许的前 5 个键
+          （与 MESSAGE_ENTRY_POSITIONAL_LIMIT 对齐），permission_mode /
+          turn_source 及一切未知键均被剥离，随后以 lan 覆盖 turn_source。
         最终 turn_source 只能由服务器经 _call_bridge 的 keyword 通道
         注入 "lan"，客户端不存在任何可达的绑定通道。
         """
         if isinstance(args, dict):
-            merged = dict(args)
-            merged.pop("turn_source", None)
+            # kwargs 形态：白名单化——只放行位置通道允许的前 5 个键（与
+            # MESSAGE_ENTRY_POSITIONAL_LIMIT 对齐），permission_mode /
+            # turn_source 及一切未知键均被剥离，客户端不存在任何档位注入通道。
+            merged = {
+                key: args[key]
+                for key in ("text", "session_name", "attachments", "workdir", "model_id")
+                if key in args
+            }
+            extra_keys = [
+                k
+                for k in args
+                if k not in ("text", "session_name", "attachments", "workdir", "model_id")
+            ]
+            if extra_keys:
+                logger.debug("LAN 消息入口剥离非法键: %s", extra_keys)
             merged["turn_source"] = "lan"
             return merged, None
         if isinstance(args, list):
@@ -643,6 +680,7 @@ class LanServer:
             if items and isinstance(items[0], dict):
                 payload = dict(items[0])
                 payload.pop("turn_source", None)
+                payload.pop("permission_mode", None)
                 items[0] = payload
             return items, {"turn_source": "lan"}
         return None

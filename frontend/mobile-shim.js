@@ -12,8 +12,10 @@
  * - 手机 → 电脑 RPC：{"method", "args", "id"}，args 为位置参数数组，回包 {"id", "result"}。
  * - 电脑 → 手机事件：{"type", "data"} 广播（后端 broadcast 发的是 JSON 字符串），
  *   白名单事件额外携带单调递增 seq，shim 记录最后收到的 seq 作为补发水位。
- * - 配对 token：首次从 URL 参数取并写入 localStorage，之后刷新/重开（URL 无 token）
- *   回退读 localStorage，直到服务端 TTL 过期或被轮换（4401）才失效。
+ * - 配对 token：首次从 URL 参数取并写入 localStorage，随后立即用 history.replaceState
+ *   清理地址栏 query（保留 path/hash），token 不残留于浏览器历史/截图/分享链接；
+ *   之后刷新/重开（URL 无 token）回退读 localStorage，直到服务端 TTL 过期或被
+ *   轮换（4401）才失效。
  */
 (function () {
   if (window.pywebview) return; // 桌面环境不注入，防御性
@@ -29,6 +31,16 @@
     }
   } catch (_) {
     // localStorage 不可用（隐私模式等）：仅本次 URL token 生效
+  }
+  // 地址栏清理：token 已写入 localStorage（或仅本次内存）后立即去掉 URL 上的
+  // ?token=，避免残留在浏览器历史、截图与分享链接中；保留 path 与 hash。
+  // 独立于上面的 try：隐私模式下 localStorage 抛错时 URL 同样要清理。
+  if (urlToken) {
+    try {
+      if (window.history && window.history.replaceState) {
+        window.history.replaceState(null, '', window.location.pathname + window.location.hash);
+      }
+    } catch (_) {}
   }
   var usedToken = token; // 本次连接使用的 token，4401 时据此决定是否清除
   var wsUrl = (window.location.protocol === 'https:' ? 'wss' : 'ws') + '://' + window.location.host + '/';

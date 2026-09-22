@@ -22,6 +22,18 @@ def _no_config_writes(monkeypatch):
     monkeypatch.setattr(lan_mod, "_save_config_value", lambda *a, **k: None)
 
 
+def _register_client(srv, ws):
+    """把 fake ws 登记为「已连接客户端」（客户端列表 + 每客户端发送锁）。
+
+    _safe_send 对未注册连接 fail-closed（不发送、返回 False）：直连桩的 ws
+    必须像真实注册路径（_register_and_collect_replay）一样同时登记发送锁，
+    否则服务器的回包会被 fail-closed 丢弃。
+    """
+    srv._clients.append(ws)
+    srv._client_locks[ws] = threading.Lock()
+    return ws
+
+
 def test_detect_lan_ip_non_loopback():
     ip = LanServer(bridge=None)._detect_lan_ip()
     assert ip and ip != "127.0.0.1"
@@ -46,7 +58,7 @@ def test_issue_and_verify_token():
 def test_broadcast_sends_to_clients():
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
-    srv._clients = [fake]
+    _register_client(srv, fake)
     srv.broadcast('{"type":"token_delta"}')
     assert fake.sent == ['{"type":"token_delta"}']
 
@@ -55,6 +67,7 @@ def test_route_rejects_window_close():
     """桌面专属窗口方法应被拒绝（无论黑名单/白名单）。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(fake, json.dumps({"method": "window_close", "args": {}, "id": 1}))
     assert "method not allowed" in fake.sent[0]
 
@@ -63,6 +76,7 @@ def test_route_allows_non_forbidden_method():
     """黑名单语义：不在 FORBIDDEN_METHODS 内的普通 bridge 方法（如 get_background_tasks）应被放行。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(fake, json.dumps({"method": "get_background_tasks", "args": {}, "id": 1}))
     assert "method not allowed" not in fake.sent[0]
     resp = json.loads(fake.sent[0])
@@ -72,6 +86,7 @@ def test_route_allows_non_forbidden_method():
 def test_route_allows_get_initial_state():
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     # bridge 无 get_initial_state 时 _call_bridge 返回 {"ok": False, "msg": "未知方法"}，但不应被白名单拒绝
     srv._route_message(fake, json.dumps({"method": "get_initial_state", "args": [], "id": 1}))
     resp = json.loads(fake.sent[0])
@@ -91,6 +106,7 @@ def test_route_allows_whitelisted_send():
 
     srv.bridge = B()
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(fake, json.dumps({"method": "send_user_message", "args": {"text": "hi"}, "id": 1}))
     assert "method not allowed" not in fake.sent[0]
     resp = json.loads(fake.sent[0])
@@ -291,7 +307,8 @@ def test_issue_token_kicks_connected_clients():
     """
     srv = LanServer(bridge=None)
     c1, c2 = _FakeClient(), _FakeClient()
-    srv._clients = [c1, c2]
+    _register_client(srv, c1)
+    _register_client(srv, c2)
 
     srv._issue_token()
 
@@ -308,7 +325,7 @@ def test_refresh_bind_info_disconnects_old_clients():
     srv.lan_ip = "192.168.1.5"
     old = srv.get_bind_info()
     client = _FakeClient()
-    srv._clients = [client]
+    _register_client(srv, client)
 
     new = srv.get_bind_info(force_new=True)
 
@@ -341,20 +358,25 @@ def test_register_rejects_old_token_after_rotation():
 # ---------------------------------------------------------------------------
 
 class _RecordingBridge:
-    """LAN 边界测试用的 bridge 替身：记录消息入口实际收到的 turn_source。
+    """LAN 边界测试用的 bridge 替身：记录消息入口实际收到的受控参数。
 
-    与真实 ApiBridge.send_user_message 签名同形（turn_source 是第 6 个位置
-    参数，gui_bridge.py:send_user_message）：*args 桩会从首参 dict 里"读出"
-    注入的 turn_source，掩盖位置参数绑定绕过（Task 15 审查 Critical-1 根因）。
+    与真实 ApiBridge.send_user_message 签名同形（permission_mode 是第 6、
+    turn_source 是第 7 个位置参数，gui_bridge.py:send_user_message）：*args
+    桩会从首参 dict 里"读出"注入的 turn_source，掩盖位置参数绑定绕过
+    （Task 15 审查 Critical-1 根因）。不接 **kwargs，未知键会以 TypeError
+    暴露（kwargs 白名单回归的观测面）。
     """
 
     def __init__(self):
         self.last_turn_source = "unset"
+        self.last_permission_mode = "unset"
         self.message_calls = []
 
     def send_user_message(self, text, session_name=None, attachments=None,
-                          workdir=None, model_id=None, turn_source="local"):
+                          workdir=None, model_id=None, permission_mode=None,
+                          turn_source="local"):
         self.last_turn_source = turn_source
+        self.last_permission_mode = permission_mode
         self.message_calls.append((text, turn_source))
         return {"ok": True}
 
@@ -463,6 +485,62 @@ def test_lan_positional_turn_source_cannot_reach_bridge():
     assert calls == ["lan"]
 
 
+# ---------------------------------------------------------------------------
+# 安全审查回归：kwargs 白名单化 / 首参 payload 档位剥离 / 发送 fail-closed
+# 客户端不得经 dict 通道注入 permission_mode（会话级权限档位）或未知键；
+# 未注册（已被摘除/轮换）连接的发送必须放弃，而非无锁直发。
+# ---------------------------------------------------------------------------
+
+def test_lan_kwargs_permission_mode_stripped(server, bridge):
+    """对抗回归：kwargs 形态注入 permission_mode 被白名单剥离。
+
+    修复前 dict 形态只删 turn_source，permission_mode 经 fn(**merged) 直接
+    生效——手机可把会话权限档位抬到 full。白名单化后档位必须回到签名默认 None。"""
+    result = server.dispatch_rpc(
+        "send_user_message",
+        {"text": "hi", "session_name": "s1", "permission_mode": "full"},
+    )
+    assert result["ok"] is True
+    assert bridge.last_permission_mode is None
+    assert bridge.last_turn_source == "lan"
+
+
+def test_lan_kwargs_unknown_keys_stripped(server, bridge):
+    """kwargs 形态的未知键同样被白名单剥离，不会落进 fn(**merged)。
+
+    桥桩不接未知关键字：修复前未知键透传会 TypeError，回包 {"ok": False}。"""
+    result = server.dispatch_rpc("send_user_message", {"text": "hi", "evil": 1})
+    assert result["ok"] is True
+    assert bridge.message_calls[-1][0] == "hi"
+
+
+def test_lan_payload_dict_permission_mode_stripped(server, bridge):
+    """对抗回归：首参 payload dict 内 permission_mode 被剥离（防夹带）。
+
+    修复前只删 payload 里的 turn_source，夹带的 permission_mode 随首参 dict
+    原样到达 bridge；剥离后桥桩收到的 text 不含该键、档位为默认 None。"""
+    result = server.dispatch_rpc(
+        "send_user_message", [{"text": "x", "permission_mode": "full"}]
+    )
+    assert result["ok"] is True
+    text = bridge.message_calls[-1][0]
+    assert isinstance(text, dict)
+    assert "permission_mode" not in text
+    assert bridge.last_permission_mode is None
+    assert bridge.last_turn_source == "lan"
+
+
+def test_safe_send_fail_closed_for_unregistered_ws():
+    """未注册（无发送锁）的 ws 直接放弃发送（fail-closed），不再无锁直发。
+
+    修复前 _safe_send 对已注销/被轮换摘除的连接走无锁直发并返回 True，
+    与摘除/关闭并发时存在竞态窗口。"""
+    srv = LanServer(bridge=None)
+    fake = _FakeClient()
+    assert srv._safe_send(fake, "x") is False
+    assert fake.sent == []
+
+
 def test_lan_forbids_private_underscore_methods():
     """对抗回归（Task 15 审查 Important-1）：下划线私有方法一律拒绝。
 
@@ -494,6 +572,7 @@ def test_route_rejects_private_underscore_method():
     """WebSocket 路径与 dispatch_rpc 共用同一边界：私有方法走 wire 也被拒。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(
         fake,
         json.dumps({"method": "_queue_js_payload", "args": ["evil js"], "id": 11}),
@@ -505,6 +584,7 @@ def test_route_rejects_computer_permission_mutation():
     """WebSocket 路径与 dispatch_rpc 共用同一边界：电脑操控 mutation 走 wire 也被拒。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(
         fake, json.dumps({"method": "set_computer_control_enabled", "args": [True], "id": 7})
     )
@@ -522,6 +602,7 @@ def test_route_injects_lan_turn_source_on_user_message():
 
     srv = LanServer(bridge=B())
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
+    _register_client(srv, fake)
     srv._route_message(
         fake,
         json.dumps({"method": "send_user_message", "args": {"text": "hi", "turn_source": "local"}, "id": 1}),
@@ -644,7 +725,7 @@ def test_replay_buffer_only_stores_whitelisted_events():
     """白名单事件打 seq 进补发缓冲；高频事件原样发送不入缓冲。"""
     srv = LanServer(bridge=None)
     fake = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
-    srv._clients = [fake]
+    _register_client(srv, fake)
 
     srv.broadcast('{"type": "token_delta", "data": {"text": "x"}}', event_type="token_delta")
     srv.broadcast('{"type": "turn_error", "data": {"message": "boom"}}', event_type="turn_error")
@@ -673,7 +754,7 @@ def test_register_with_last_seq_replays_missed_events_in_order():
     srv = LanServer(bridge=None)
     srv._issue_token()
     live = type("W", (), {"sent": [], "send": lambda self, p: self.sent.append(p)})()
-    srv._clients = [live]
+    _register_client(srv, live)
     srv.broadcast('{"type": "notice", "data": {"message": "n1"}}', event_type="notice")
     srv.broadcast('{"type": "token_delta", "data": {}}', event_type="token_delta")
     srv.broadcast('{"type": "turn_error", "data": {"message": "boom"}}', event_type="turn_error")
