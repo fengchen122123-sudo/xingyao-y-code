@@ -59,6 +59,10 @@ class HookRegistration:
     source_path: str
     scope: Literal["user", "project"]
     digest: str
+    # 启停标记：默认 False（带默认值保持向后兼容）；不参与 digest——启停不改变
+    # 执行内容，指纹只需绑定「配置内容」。执行侧默认加载仍然跳过 disabled 条目，
+    # 仅管理列表（include_disabled=True）保留它们以便在管理页重新启用。
+    disabled: bool = False
 
 
 @dataclass(frozen=True)
