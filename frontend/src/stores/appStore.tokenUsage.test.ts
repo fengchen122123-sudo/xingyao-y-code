@@ -126,3 +126,39 @@ it('captures and restores tokenUsage per session runtime (无闪烁切换)', () 
   expect(store.tokenUsage.used).toBe(36800);
   expect(store.tokenUsage.total_prompt).toBe(36800);
 });
+
+it('token_usage 事件透传 context_breakdown，非法来源与非正 chars 被过滤', () => {
+  const store = useAppStore();
+
+  store.handleBridgeEvent({
+    type: 'token_usage',
+    data: {
+      used: 920,
+      window: 128_000,
+      context_breakdown: [
+        { source: 'messages', chars: 620 },
+        { source: 'unknown_source', chars: 99 },
+        { source: 'skills', chars: 0 },
+        { source: 'tools', chars: -3 },
+      ],
+    },
+  });
+
+  expect(store.tokenUsage.context_breakdown).toEqual([{ source: 'messages', chars: 620 }]);
+});
+
+it('normalizeTokenUsage 对 context_breakdown 缺失/异常输入回落 []', () => {
+  const usage = normalizeTokenUsage({
+    context_breakdown: [
+      { source: 'system_prompt', chars: 200 },
+      null,
+      'junk',
+      { chars: 3 },
+    ],
+  });
+  expect(usage.context_breakdown).toEqual([{ source: 'system_prompt', chars: 200 }]);
+
+  // 旧后端无该字段 / 字段为 null → []
+  expect(normalizeTokenUsage({ used: 1, window: 128000 }).context_breakdown).toEqual([]);
+  expect(normalizeTokenUsage({ context_breakdown: null }).context_breakdown).toEqual([]);
+});

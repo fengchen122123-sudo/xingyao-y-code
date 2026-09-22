@@ -119,4 +119,24 @@ def test_gui_token_statistics_rejects_unsupported_range_without_querying(days):
 
     result = bridge.get_token_usage_statistics(days)
 
-    assert result == {"ok": False, "msg": "统计范围仅支持 1、7、30 天"}
+    assert result == {"ok": False, "msg": "统计范围仅支持 1、7、30、365 天"}
+
+
+def test_gui_token_statistics_supports_full_year_range():
+    bridge = object.__new__(gui_bridge.ApiBridge)
+    bridge._memory = MemoryManager(":memory:")
+    bridge._memory.add_token_usage(
+        "openai", "m1", 400, 40, 340, 440,
+        session_id="today", ts=_local_noon(date.today()),
+    )
+
+    result = bridge.get_token_usage_statistics(365)
+
+    assert result["ok"] is True
+    assert result["range"]["days"] == 365
+    assert result["range"]["start_date"] == (
+        date.today() - timedelta(days=364)
+    ).isoformat()
+    assert len(result["days"]) == 365
+    assert result["days"][-1]["total"] == 440
+    assert result["days"][0]["total"] == 0

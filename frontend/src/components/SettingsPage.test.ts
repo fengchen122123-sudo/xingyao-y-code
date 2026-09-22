@@ -87,6 +87,17 @@ describe('SettingsPage', () => {
     expect(wrapper.find('[data-test="token-statistics-page"]').exists()).toBe(true);
   });
 
+  it('switches to the legacy token statistics view', async () => {
+    const store = useAppStore();
+    vi.spyOn(store, 'loadTokenStatistics').mockResolvedValue(null);
+    const wrapper = mount(SettingsPage);
+
+    await wrapper.get('[data-test="token-statistics-legacy-nav"]').trigger('click');
+
+    expect(wrapper.find('[data-test="token-statistics-page-legacy"]').exists()).toBe(true);
+    expect(wrapper.find('[data-test="token-statistics-page"]').exists()).toBe(false);
+  });
+
   it('opens the GUI appearance page from settings navigation', async () => {
     const wrapper = mount(SettingsPage);
 
