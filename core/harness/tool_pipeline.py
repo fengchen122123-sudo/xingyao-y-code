@@ -230,6 +230,10 @@ def _submit_daemon_call(function, *args, **kwargs):
 
     workdir = get_workdir()
     thread_session = app_context.get_thread_session()
+    # 并行工具线程同样必须继承提交线程的权限档位：线程本地档位不会自动
+    # 进入新线程，丢失后鉴权路径回退全局默认，会话级 full 会被掩盖成
+    # 全局 confirm/accept_edits，触发不该出现的权限询问。
+    thread_permission_mode = app_context.get_thread_permission_mode()
 
     future = Future()
 
@@ -239,10 +243,20 @@ def _submit_daemon_call(function, *args, **kwargs):
         with workspace_scope(workdir):
             if thread_session:
                 app_context.set_thread_session(thread_session)
+            permission_scope = (
+                app_context.permission_mode_scope(thread_permission_mode)
+                if thread_permission_mode
+                else None
+            )
+            if permission_scope is not None:
+                permission_scope.__enter__()
             try:
                 future.set_result(function(*args, **kwargs))
             except BaseException as error:
                 future.set_exception(error)
+            finally:
+                if permission_scope is not None:
+                    permission_scope.__exit__(None, None, None)
 
     threading.Thread(
         target=runner,
