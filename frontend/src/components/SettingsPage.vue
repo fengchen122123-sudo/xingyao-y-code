@@ -5,6 +5,7 @@
       <div class="nav-section">基础设置</div>
       <button class="nav-item" :class="{ active: activeSection === 'models' }" @click="activeSection = 'models'"><span class="nav-ico"><AppIcon name="file" :size="14" /></span>模型配置</button>
       <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
+      <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
       <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
       <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
@@ -532,6 +533,7 @@
         </section>
       </template>
       <TokenUsageSettings v-else-if="activeSection === 'tokens'" />
+      <TokenUsageSettingsLegacy v-else-if="activeSection === 'tokens-legacy'" />
       <SystemSettings v-else-if="activeSection === 'system'" />
       <PersonaSettings v-else-if="activeSection === 'persona'" />
 
@@ -637,6 +639,7 @@ import { useAppStore } from '../stores/appStore';
 import { formatPermMode } from '../utils/markdown';
 import type { ChangelogEntry, ComputerProtocolChoice, ModelInfo } from '../types/pywebview';
 import TokenUsageSettings from './TokenUsageSettings.vue';
+import TokenUsageSettingsLegacy from './TokenUsageSettingsLegacy.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
 import SystemSettings from './SystemSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
@@ -655,7 +658,7 @@ import { parseModelTestError, type ParsedModelError } from '../utils/errorParser
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 // ── 手机端钻取式布局（≤768px）────────────────────────────────
 // 桌面：分区侧栏 + 厂商列表 + 详情三栏并排（isMobile=false，模板不变）。
