@@ -467,17 +467,13 @@ def _uses_deepseek_prompt_ledger(
 def _select_request_tools_for_route(model_name, api_base, tools, model_cfg=None):
     """Canonicalize tools for cache-optimized routes; preserve every other provider payload.
 
-    覆盖 DeepSeek 缓存优化路由（官方端点或 `deepseek_cache_routes` 显式声明的
-    网关）、Qwen session-cache 路由（官方百炼或 enable_prompt_cache 配置）以及
-    仅配置 enable_cache_control 的 Qwen 第三方网关——tools 字母序是缓存前缀字节
-    稳定的前提，任何开启缓存优化的路由都必须排序，否则 MCP 工具顺序一抖动前缀
-    整体失效。
+    覆盖 DeepSeek 家族（账本 + 工具字母序）与 Qwen 家族（断点 + 会话缓存头 +
+    工具字母序）的全部渠道——tools 字母序是缓存前缀字节稳定的前提，任何开启
+    缓存优化的路由都必须排序，否则 MCP 工具顺序一抖动前缀整体失效。
     """
     canonicalize = (
         _is_deepseek_family(model_name, api_base)
-        and _is_cache_optimized_deepseek_route(api_base)
-    ) or _qwen_cache_enabled(model_name, api_base, model_cfg) or (
-        _qwen_cache_control_configured(model_name, api_base, model_cfg)
+        or _is_qwen_family(model_name, api_base)
     )
     if not canonicalize:
         return tools

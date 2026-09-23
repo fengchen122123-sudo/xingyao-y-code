@@ -90,3 +90,35 @@ def test_deepseek_ledger_route_not_released_for_other_families():
     assert is_deepseek_ledger_route("openai/kimi-for-coding", "https://tokenrhythm.studio/v1") is False
     assert is_deepseek_ledger_route("openai/qwen3.8-flash", "https://relay.example/v1") is False
     assert is_deepseek_ledger_route("openai/glm-5.3", "https://relay.example/v1") is False
+
+
+# ---------------------------------------------------------------------------
+# 工具排序：deepseek / qwen 任意渠道字母序；kimi / glm / 其它原样
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model,api_base", [
+    ("openai/deepseek-v4.1-flash", "https://relay.example/v1"),
+    ("openai/qwen3.8-flash", "https://relay.example/v1"),
+])
+def test_tools_sorted_for_deepseek_and_qwen_across_channels(model, api_base):
+    from core.llm import _select_request_tools_for_route
+
+    tools = [
+        {"type": "function", "function": {"name": "zeta", "parameters": {}}},
+        {"type": "function", "function": {"name": "alpha", "parameters": {}}},
+    ]
+    sorted_tools = _select_request_tools_for_route(model, api_base, tools)
+    assert [t["function"]["name"] for t in sorted_tools] == ["alpha", "zeta"]
+    assert sorted_tools is not tools
+
+
+def test_tools_order_untouched_for_other_models():
+    from core.llm import _select_request_tools_for_route
+
+    tools = [
+        {"type": "function", "function": {"name": "zeta", "parameters": {}}},
+        {"type": "function", "function": {"name": "alpha", "parameters": {}}},
+    ]
+    for model in ("openai/kimi-k2.6", "openai/glm-5.3", "openai/gpt-4o"):
+        assert _select_request_tools_for_route(model, "https://relay.example/v1", tools) is tools
