@@ -121,6 +121,69 @@ def test_send_user_message_binds_known_model(tmp_path, monkeypatch):
     assert len(spawned) == 1
 
 
+def test_pending_draft_first_message_switches_current_session(tmp_path):
+    """pending 草稿会话首发落库后，_current_session 必须从旧会话切到新会话。
+
+    回归场景：用户在旧会话「我这个自然语言交互如果给」里点"新会话"
+    （前端 pending 草稿，不落库），发出首条消息。草稿期 _current_session
+    刻意停留在旧会话（防 set_model 污染），但落库后必须切换——否则
+    search_sessions 会把旧会话误当当前会话排除（@ 候选里目标消失）、
+    同时不排除真正在用的会话（@ 候选混入当前会话），@ 文件候选也会
+    继续扫描旧会话的工作区。
+    """
+    from core.memory import MemoryManager
+
+    mem = MemoryManager(db_path=str(tmp_path / "t.db"))
+    mem.ensure_session("我这个自然语言交互如果给", workdir="D:/iMOM/SHMK/publish", source="GUI")
+    mem.add_message("我这个自然语言交互如果给", "user", "旧会话的历史消息")
+
+    bridge, spawned, _, _ = _make_bridge(lambda s: False)
+    bridge._memory = mem
+    bridge._current_session = "我这个自然语言交互如果给"  # 草稿期停留的旧会话
+    bridge.get_sessions = lambda: {}  # _rename_session_to_title 事件负载用
+
+    res = bridge.send_user_message(
+        "为什么我输入@无法找到红", "session_abc123", None, "D:/proj"
+    )
+
+    assert res["ok"] is True
+    # 落库即命名：首条消息前 12 字成为会话名
+    assert bridge._current_session == "为什么我输入@无法找到红"
+    # 启动的回合也必须使用新会话名
+    assert spawned[0][0][1] == "为什么我输入@无法找到红"
+    # search_sessions 视角：旧会话恢复可见，新会话（当前）被正确排除
+    names = [s["name"] for s in bridge.search_sessions("")["sessions"]]
+    assert "我这个自然语言交互如果给" in names
+    assert "为什么我输入@无法找到红" not in names
+    mem.conn.close()
+
+
+def test_pending_draft_first_message_lan_does_not_steal_current_session(tmp_path):
+    """LAN 分发的消息即使带 workdir，也不得抢占本地 _current_session。
+
+    LAN dispatch 的前 5 个位置参数含 workdir，若不加 turn_source 防线，
+    远端往某会话发消息会把本地正在用的会话切走。
+    """
+    from core.memory import MemoryManager
+
+    mem = MemoryManager(db_path=str(tmp_path / "t.db"))
+    mem.ensure_session("本地会话", workdir="D:/proj", source="GUI")
+    mem.add_message("本地会话", "user", "本地消息")
+
+    bridge, spawned, _, _ = _make_bridge(lambda s: False)
+    bridge._memory = mem
+    bridge._current_session = "本地会话"
+    bridge.get_sessions = lambda: {}
+
+    res = bridge.send_user_message(
+        "远程消息", "session_def456", None, "D:/proj", None, None, "lan"
+    )
+
+    assert res["ok"] is True
+    assert bridge._current_session == "本地会话"
+    mem.conn.close()
+
+
 def test_send_user_message_ignores_unknown_model_binding(tmp_path, monkeypatch):
     """前端携带的模型 id 不在配置中（陈旧/已删除）时不得写入会话绑定。
 
