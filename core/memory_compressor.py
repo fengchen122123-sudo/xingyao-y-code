@@ -80,6 +80,34 @@ def is_session_compressing(manager, session_name: str) -> bool:
         return guard_key in _compressing_sessions
 
 
+def _positive_int_or_none(value):
+    """正整数校验：仅 int 且 >0 有效（bool 不算数），非法/缺失返回 None。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        return None
+    return value
+
+
+def _normalize_model_watermark_bases(raw):
+    """归一化「按模型的水位线计算基准」配置：仅 dict[str, 正整数] 有效。
+
+    键统一 str 化 + strip + 小写（与模型名叶子名的匹配口径一致），
+    值为合法正整数才保留；非法条目静默过滤，整体非 dict 时返回 {}。
+    用户写错的新配置绝不能弄崩整个配置读取。
+    """
+    if not isinstance(raw, dict):
+        return {}
+    normalized = {}
+    for key, value in raw.items():
+        name = str(key).strip().lower()
+        if not name:
+            continue
+        positive = _positive_int_or_none(value)
+        if positive is None:
+            continue
+        normalized[name] = positive
+    return normalized
+
+
 def _load_compression_config():
     """读取 config.json 中的记忆压缩配置，失败时返回默认值。"""
     try:
@@ -111,6 +139,15 @@ def _load_compression_config():
             "precompress_ratio": float(
                 comp_cfg.get("precompress_ratio", DEFAULT_PRECOMPRESS_RATIO)
             ),
+            # 水位线计算基准上限（tokens）：仅正整数有效，非法/缺失 → None
+            # （None = 不启用，保持纯窗口比例现行为）
+            "watermark_base_tokens": _positive_int_or_none(
+                comp_cfg.get("watermark_base_tokens")
+            ),
+            # 按模型覆盖的基准上限：非 dict 视为空表，非法条目静默过滤
+            "model_watermark_bases": _normalize_model_watermark_bases(
+                comp_cfg.get("model_watermark_bases")
+            ),
         }
     except Exception:
         return {
@@ -125,6 +162,8 @@ def _load_compression_config():
             "inter_chunk_delay_seconds": COMPRESSION_INTER_CHUNK_DELAY_SECONDS,
             "max_total_seconds": DEFAULT_MAX_TOTAL_SECONDS,
             "precompress_ratio": DEFAULT_PRECOMPRESS_RATIO,
+            "watermark_base_tokens": None,
+            "model_watermark_bases": {},
         }
 
 
@@ -134,6 +173,26 @@ def get_precompress_ratio() -> float:
         return float(_load_compression_config()["precompress_ratio"])
     except Exception:
         return DEFAULT_PRECOMPRESS_RATIO
+
+
+def get_watermark_base_tokens(model_name):
+    """该模型适用的「水位线计算基准」上限（tokens）；未配置/非法时返回 None。
+
+    None 表示不启用（保持纯窗口比例，现行为）。匹配顺序：
+    model_watermark_bases 精确命中（模型名取最后一个 "/" 之后的叶子名、小写）
+    → 全局 watermark_base_tokens → None。任何异常都返回 None，绝不抛出。
+    """
+    try:
+        config = _load_compression_config()
+        leaf = str(model_name or "").rsplit("/", 1)[-1].strip().lower()
+        per_model = config.get("model_watermark_bases")
+        if leaf and isinstance(per_model, dict):
+            hit = _positive_int_or_none(per_model.get(leaf))
+            if hit is not None:
+                return hit
+        return _positive_int_or_none(config.get("watermark_base_tokens"))
+    except Exception:
+        return None
 
 
 def persisted_injection_sources() -> frozenset:

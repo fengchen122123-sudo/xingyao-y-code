@@ -923,8 +923,21 @@ def prepare_turn_messages(
         manager, session_name, model_name, history=history, api_base=api_base
     )
 
+    # 【水位线基准】维护机制（snip/elide/预压缩/摘要/淘汰）一律按基准窗口
+    # watermark_window 计算触发线；物理安全边界（熔断 / I4 内存裁剪 / 单条
+    # 超窗警告）继续按真实 window 判定。大窗口模型（如 1M）的实际会话峰值
+    # 远低于窗口比例线，全按真实窗口算会让维护机制永不触发；基准未配置
+    # （None）时 watermark_window == window，行为与改造前完全一致。
+    _watermark_base = None
+    try:
+        from core.memory_compressor import get_watermark_base_tokens
+        _watermark_base = get_watermark_base_tokens(model_name)
+    except Exception:
+        logger.debug("水位线基准读取失败（已忽略）", exc_info=True)
+    watermark_window = min(window, _watermark_base) if _watermark_base else window
+
     # Tier 1 (≥60%)：本地 snip 旧工具结果（一次性改写并冻结，不重排、不重写前缀主体）
-    if estimated_tokens > window * SNIP_RATIO and not _cancelled():
+    if estimated_tokens > watermark_window * SNIP_RATIO and not _cancelled():
         snipped, _ = manager.maintain_tool_results(session_name, tier=1)
         if snipped:
             _notify("compress", f"<ansiyellow>ℹ 已折叠 {snipped} 条旧工具结果以节省上下文。</ansiyellow>")
@@ -932,7 +945,7 @@ def prepare_turn_messages(
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
     # Tier 2 (≥80%)：旧工具结果整体占位符化（snipped 升级一次）
-    if estimated_tokens > window * ELIDE_RATIO and not _cancelled():
+    if estimated_tokens > watermark_window * ELIDE_RATIO and not _cancelled():
         _, elided = manager.maintain_tool_results(session_name, tier=2)
         if elided:
             _notify("compress", f"<ansiyellow>ℹ 已归档 {elided} 条旧工具结果。</ansiyellow>")
@@ -946,7 +959,7 @@ def prepare_turn_messages(
     _precompress_ratio = _get_precompress_ratio()
     if (
         _precompress_ratio > 0
-        and window * _precompress_ratio <= estimated_tokens <= window * SUMMARIZE_RATIO
+        and watermark_window * _precompress_ratio <= estimated_tokens <= watermark_window * SUMMARIZE_RATIO
         and not _cancelled()
     ):
         _trigger_background_precompress(
@@ -955,7 +968,7 @@ def prepare_turn_messages(
         )
 
     # Tier 3 (≥95%)：压缩经济学——本地维护已把压力拉回线下则跳过付费摘要
-    if estimated_tokens > window * SUMMARIZE_RATIO and not _cancelled():
+    if estimated_tokens > watermark_window * SUMMARIZE_RATIO and not _cancelled():
         # 超过 0.95 水位才触发智能记忆压缩提炼。
         from core.memory_compressor import (
             compress_session_memory,
@@ -979,7 +992,7 @@ def prepare_turn_messages(
         estimated_tokens = estimate_tokens(model_name, [system_message] + history)
 
         # 兜底：如果总结归纳后依然超限，触发物理大文件折叠机制
-        if estimated_tokens > window * SUMMARIZE_RATIO:
+        if estimated_tokens > watermark_window * SUMMARIZE_RATIO:
             manager.prune_history_files(session_name, max_turns=1, retain_recent=4)
             history = manager.get_history_for_llm(session_name)
             estimated_tokens = estimate_tokens(model_name, [system_message] + history)
@@ -1015,7 +1028,7 @@ def prepare_turn_messages(
             while (
                 evict_count < MAX_EVICT_TURNS
                 and len(history) > 2
-                and estimated_tokens > window * SUMMARIZE_RATIO
+                and estimated_tokens > watermark_window * SUMMARIZE_RATIO
             ):
                 if not manager.evict_oldest_turn_persistent(session_name):
                     break
@@ -1033,7 +1046,7 @@ def prepare_turn_messages(
         # 把被动爆窗升级为计划内维护。只记会话名，不写任何正文。
         if (
             api_base
-            and estimated_tokens <= window * SUMMARIZE_RATIO
+            and estimated_tokens <= watermark_window * SUMMARIZE_RATIO
             and not compress_unprotected
             and not compress_running
             and not _cancelled()

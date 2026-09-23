@@ -766,6 +766,62 @@ def test_prepare_turn_summarizes_only_above_095(stub_llm, quiet_extras, monkeypa
     assert len(calls) == 1
 
 
+def test_watermark_base_triggers_snip_in_large_window(stub_llm, quiet_extras, monkeypatch):
+    """配置水位线计算基准后，1M 窗口模型也按基准窗口触发本地 snip。
+
+    基准 100000 → snip 水位 60000，低于测试内容初始估算（约 7.4 万字符）；
+    若按真实窗口 1M 计算（水位 60 万）则绝不触发。
+    用 5 条大结果的原因：maintain_tool_results 带 8000 估算 token 的尾部
+    保护区（ASCII 约 3.2 万字符），结果太少会全被保护区罩住而无法 snip。
+    """
+    import core.memory_compressor as memory_compressor
+    from core.agent_service import prepare_turn_messages
+    from core.tool_result_maintenance import SNIPPED_PREFIX
+
+    monkeypatch.setattr(
+        memory_compressor, "get_watermark_base_tokens", lambda model_name: 100000
+    )
+
+    manager = _make_manager()
+    session = "wm-base"
+    _fill_big_tool_results(manager, session, 5)
+    prepare_turn_messages(
+        manager, session, "deepseek-chat", 1000000, permission_mode="confirm"
+    )
+    history = manager.get_history_for_llm(session)
+    assert any(
+        m.get("role") == "tool" and str(m.get("content", "")).startswith(SNIPPED_PREFIX)
+        for m in history
+    )
+
+
+def test_watermark_base_absent_keeps_legacy_behavior(stub_llm, quiet_extras, monkeypatch):
+    """基准为 None 时保持现行为：1M 窗口按真实窗口算水位，同样内容不触发 snip。
+
+    显式打桩返回 None（而非依赖"默认无配置"），避免读取到真实用户
+    config.json 的配置造成环境污染。
+    """
+    import core.memory_compressor as memory_compressor
+    from core.agent_service import prepare_turn_messages
+    from core.tool_result_maintenance import SNIPPED_PREFIX
+
+    monkeypatch.setattr(
+        memory_compressor, "get_watermark_base_tokens", lambda model_name: None
+    )
+
+    manager = _make_manager()
+    session = "wm-base-none"
+    _fill_big_tool_results(manager, session, 5)
+    prepare_turn_messages(
+        manager, session, "deepseek-chat", 1000000, permission_mode="confirm"
+    )
+    history = manager.get_history_for_llm(session)
+    assert not any(
+        m.get("role") == "tool" and str(m.get("content", "")).startswith(SNIPPED_PREFIX)
+        for m in history
+    )
+
+
 # ---------------------------------------------------------------------------
 # 取消语义：用户取消的任务绝不注入"接手完成"指令
 # ---------------------------------------------------------------------------
