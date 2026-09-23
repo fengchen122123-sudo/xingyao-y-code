@@ -177,6 +177,17 @@ _KEEPALIVE_ROUTES_CONFIG_KEY = "cache_keepalive_routes"
 # stamp = (loader 身份, 配置文件 mtime)；条目格式 (过期时间, stamp, routes)。
 _keepalive_routes_cfg_cache = {"entry": None}
 
+# 顶层 deepseek_cache_routes：显式声明可安全启用 DeepSeek Prompt Ledger 与
+# tools 字母序的第三方网关（域名/子串列表）。官方路由之外默认不启用——
+# 账本语义（服务端按 2048 token 块匹配的磁盘前缀缓存）只在 DeepSeek 上游成立，
+# 挂载非 DeepSeek 模型的网关加进本配置只会白做规范化。判定逻辑与
+# cache_keepalive_routes 同构：只新增显式通道，不改任何官方路由判定。
+_DEEPSEEK_CACHE_ROUTES_CONFIG_KEY = "deepseek_cache_routes"
+
+# 条目格式同 _keepalive_routes_cfg_cache：`{"entry": (过期时间, stamp, routes) | None}`。
+# 测试可直接把 entry 置 None 强制重读配置。
+_deepseek_cache_routes_cfg_cache = {"entry": None}
+
 # 缓存开关判定在一轮对话里会被反复触发（_qwen_cache_enabled / _supports_cache_control /
 # _supports_cache_keepalive / tools 规范化），而 load_config 每次都要读盘并解析整个
 # config.json。这里按 (模型, 路由) 记忆解析结果，并用「配置指纹」做失效：
@@ -226,6 +237,9 @@ def _resolve_model_config(model_name, api_base="", model_cfg=None):
         # 同一份配置顺手缓存顶层 cache_keepalive_routes：同一轮里随后的
         # _supports_cache_keepalive 显式配置通道即可命中缓存，不再重复读盘
         _remember_keepalive_routes(data, stamp)
+        # 同一份配置也顺手缓存顶层 deepseek_cache_routes：随后 is_deepseek_ledger_route
+        # / _select_request_tools_for_route 的判定即可命中缓存，不再重复读盘
+        _remember_deepseek_cache_routes(data, stamp)
         m_str = str(model_name or "").strip()
         base_url = str(api_base or "").rstrip("/").lower()
         for provider in data.get("providers", []):
@@ -300,17 +314,27 @@ def _normalize_route_match_key(api_base):
     return (host or raw).lower()
 
 
-def _parse_keepalive_routes(data):
-    """从一份已加载的 config 中提取 cache_keepalive_routes 并逐条归一化。"""
-    raw = data.get(_KEEPALIVE_ROUTES_CONFIG_KEY) if isinstance(data, dict) else None
+def _parse_route_match_entries(data, key):
+    """从一份已加载的 config 中提取指定顶层键的路由条目并逐条归一化。"""
+    raw = data.get(key) if isinstance(data, dict) else None
     if not isinstance(raw, (list, tuple)):
         return ()
     routes = []
     for item in raw:
-        key = _normalize_route_match_key(item)
-        if key:
-            routes.append(key)
+        entry = _normalize_route_match_key(item)
+        if entry:
+            routes.append(entry)
     return tuple(routes)
+
+
+def _parse_keepalive_routes(data):
+    """从一份已加载的 config 中提取 cache_keepalive_routes 并逐条归一化。"""
+    return _parse_route_match_entries(data, _KEEPALIVE_ROUTES_CONFIG_KEY)
+
+
+def _parse_deepseek_cache_routes(data):
+    """从一份已加载的 config 中提取 deepseek_cache_routes 并逐条归一化。"""
+    return _parse_route_match_entries(data, _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY)
 
 
 def _remember_keepalive_routes(data, stamp):
@@ -356,6 +380,55 @@ def _keepalive_route_explicitly_enabled(api_base):
     return any(entry in host for entry in _configured_keepalive_routes())
 
 
+def _remember_deepseek_cache_routes(data, stamp):
+    """把顶层 deepseek_cache_routes 的解析结果按配置指纹写入缓存（重复读盘去重）。"""
+    if stamp is None:
+        return
+    routes = _parse_deepseek_cache_routes(data)
+    with _qwen_cache_cfg_lock:
+        _deepseek_cache_routes_cfg_cache["entry"] = (
+            time.monotonic() + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
+        )
+
+
+def _configured_deepseek_cache_routes():
+    """读取顶层 deepseek_cache_routes（域名/子串列表），带配置指纹缓存。"""
+    stamp = _qwen_cache_config_stamp()
+    now = time.monotonic()
+    if stamp is not None:
+        with _qwen_cache_cfg_lock:
+            cached = _deepseek_cache_routes_cfg_cache.get("entry")
+            if cached and cached[0] > now and cached[1] == stamp:
+                return cached[2]
+    routes = ()
+    try:
+        from core.model_manager import load_config
+
+        routes = _parse_deepseek_cache_routes(load_config())
+    except Exception:
+        pass
+    if stamp is not None:
+        with _qwen_cache_cfg_lock:
+            _deepseek_cache_routes_cfg_cache["entry"] = (
+                now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
+            )
+    return routes
+
+
+def _is_cache_optimized_deepseek_route(api_base=""):
+    """DeepSeek 缓存优化路由 = 官方端点 ∨ 显式配置声明的 DeepSeek 上游网关。
+
+    归一化走 _normalize_route_match_key（去 scheme/端口/路径后的小写主机名），
+    用户写完整 URL 或裸域名都能命中；官方判定分支保持不变。
+    """
+    if _is_official_deepseek_route(api_base):
+        return True
+    host = _normalize_route_match_key(api_base)
+    if not host:
+        return False
+    return any(entry in host for entry in _configured_deepseek_cache_routes())
+
+
 def _glm_keepalive_thinking_locked(model_name):
     """GLM 强制思考模型判定：思考没有关闭档，保活不得翻转成 disabled。
 
@@ -375,13 +448,15 @@ def _glm_keepalive_thinking_locked(model_name):
 
 
 def is_deepseek_ledger_route(model_name, api_base):
-    """官方 DeepSeek 家族路由判定：主会话不可变 Prompt Ledger 的核心条件。
+    """DeepSeek 家族缓存优化路由判定：主会话不可变 Prompt Ledger 的核心条件。
 
-    供 agent_service 的水位线基线与主动轮换判定复用（账本启用还需
-    persist / parent_session / cache_scope=main 等会话层条件，见
-    _uses_deepseek_prompt_ledger）。
+    官方端点（api.deepseek.com）之外，config.json 顶层 deepseek_cache_routes
+    显式声明的网关（按域名归一化匹配）同样放行——不改变任何官方路由判定，
+    仅新增显式通道。供 agent_service 的水位线基线与主动轮换判定复用
+    （账本启用还需 persist / parent_session / cache_scope=main 等会话层条件，
+    见 _uses_deepseek_prompt_ledger）。
     """
-    return _is_deepseek_family(model_name, api_base) and _is_official_deepseek_route(api_base)
+    return _is_deepseek_family(model_name, api_base) and _is_cache_optimized_deepseek_route(api_base)
 
 
 def _uses_deepseek_prompt_ledger(
@@ -399,14 +474,15 @@ def _uses_deepseek_prompt_ledger(
 def _select_request_tools_for_route(model_name, api_base, tools, model_cfg=None):
     """Canonicalize tools for cache-optimized routes; preserve every other provider payload.
 
-    覆盖官方 DeepSeek 路由、Qwen session-cache 路由（官方百炼或
-    enable_prompt_cache 配置）以及仅配置 enable_cache_control 的 Qwen
-    第三方网关——tools 字母序是缓存前缀字节稳定的前提，任何开启缓存
-    优化的路由都必须排序，否则 MCP 工具顺序一抖动前缀整体失效。
+    覆盖 DeepSeek 缓存优化路由（官方端点或 `deepseek_cache_routes` 显式声明的
+    网关）、Qwen session-cache 路由（官方百炼或 enable_prompt_cache 配置）以及
+    仅配置 enable_cache_control 的 Qwen 第三方网关——tools 字母序是缓存前缀字节
+    稳定的前提，任何开启缓存优化的路由都必须排序，否则 MCP 工具顺序一抖动前缀
+    整体失效。
     """
     canonicalize = (
         _is_deepseek_family(model_name, api_base)
-        and _is_official_deepseek_route(api_base)
+        and _is_cache_optimized_deepseek_route(api_base)
     ) or _qwen_cache_enabled(model_name, api_base, model_cfg) or (
         _qwen_cache_control_configured(model_name, api_base, model_cfg)
     )
@@ -431,6 +507,21 @@ def _deepseek_stable_header_matches(generation, current_messages, current_tools)
         current_messages[0] if current_messages[0].get("role") == "system" else None
     )
     return old_system == current_system
+
+
+# 账本换代原因取值域（写进 cache_request_diagnostics.request_reason）：
+#   ""                     未换代，本次为严格追加（热路径）
+#   first_generation       该会话冷启动，创建首个账本代
+#   pending_rotation       主动轮换登记被消费（水位线压缩成果落库后的计划内重建）
+#   caller_force_new       调用方显式 force_new（超窗压缩成功后的重试）
+#   header_tools_changed   工具契约变化导致稳定头失配
+#   header_system_changed  system 头变化导致稳定头失配
+#   boundary_ambiguous     账本前缀无法与当前历史建立唯一追加边界
+def _deepseek_header_rotation_reason(generation, current_messages, current_tools):
+    """稳定头失配的具体归因：工具契约先于 system 头判定，与比对顺序一致。"""
+    if generation["tools"] != current_tools:
+        return "header_tools_changed"
+    return "header_system_changed"
 
 
 def _new_tail_after_ledger_prefix(ledger_messages, current_messages):
@@ -487,9 +578,17 @@ def _prepare_deepseek_ledger_request(
     manager, session_name, model_name, api_base, cache_scope, messages, tools,
     *, force_new=False
 ):
-    """Build and persist the immutable request view for one DeepSeek call."""
+    """Build and persist the immutable request view for one DeepSeek call.
+
+    返回值额外带 `rotation_reason`：本次是否换代、为什么换代。空串表示
+    沿用了既有账本代（严格追加）。取值域见 `_deepseek_header_rotation_reason`
+    上方的注释；调用方（core/llm.py）把它覆写进 cache_request_diagnostics.request_reason，
+    让线上低命中能被直接归因，而不是只看到一个笼统的"上下文压缩或历史重写"。
+    """
+    rotation_reason = "caller_force_new" if force_new else ""
     if not force_new and consume_deepseek_generation_rotation(session_name):
         force_new = True
+        rotation_reason = "pending_rotation"
     generation = manager.get_or_create_deepseek_prompt_generation(
         session_name,
         model_name,
@@ -504,8 +603,12 @@ def _prepare_deepseek_ledger_request(
             "generation_id": generation["id"],
             "messages": generation["messages"],
             "tools": generation["tools"],
+            "rotation_reason": rotation_reason or "first_generation",
         }
     if not _deepseek_stable_header_matches(generation, messages, tools):
+        rotation_reason = _deepseek_header_rotation_reason(
+            generation, messages, tools
+        )
         generation = manager.get_or_create_deepseek_prompt_generation(
             session_name,
             model_name,
@@ -519,6 +622,7 @@ def _prepare_deepseek_ledger_request(
             "generation_id": generation["id"],
             "messages": generation["messages"],
             "tools": generation["tools"],
+            "rotation_reason": rotation_reason,
         }
     try:
         tail = _new_tail_after_ledger_prefix(generation["messages"], messages)
@@ -536,6 +640,7 @@ def _prepare_deepseek_ledger_request(
             "generation_id": generation["id"],
             "messages": generation["messages"],
             "tools": generation["tools"],
+            "rotation_reason": "boundary_ambiguous",
         }
     if tail:
         manager.append_deepseek_prompt_messages(
@@ -546,6 +651,7 @@ def _prepare_deepseek_ledger_request(
         "generation_id": generation["id"],
         "messages": generation["messages"],
         "tools": generation["tools"],
+        "rotation_reason": "",
     }
 
 
@@ -1380,7 +1486,7 @@ def _builtin_default_max_tokens(model_name, api_base=""):
         return 128000
     if "seed-2.1-pro" in model or "seed-2.1-turbo" in model:
         return 131000
-    if "mimo-v2.5-pro" in model:
+    if "mimo-v2.6" in model or model.startswith("mimo-v2.5"):
         return 256000
     if "minimax-m2.5" in model:
         return 200000

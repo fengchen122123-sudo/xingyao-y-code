@@ -9,6 +9,11 @@
     <div class="sub-body">
       <!-- 技能页 -->
       <div v-if="subType === 'skills'">
+        <!-- 会话级稳定段落快照：技能的启停会改变 system 头，而进行中的会话已在首请求
+             定型目录字节以保住前缀缓存；因此本页的改动只对新建会话生效。 -->
+        <p class="sub-note" data-test="session-snapshot-note">
+          已打开的会话将在新会话中生效：进行中的会话沿用其启动时的目录快照，以保证前缀缓存稳定。
+        </p>
         <div class="sub-toolbar">
           <div class="src-filter" data-test="source-filter">
             <button class="seg-btn" :class="{ active: sourceFilter === 'all' }" data-test="src-filter-all" @click="sourceFilter = 'all'">全部</button>
@@ -840,6 +845,13 @@ async function testModelRow(m: ModelInfo) {
 }
 .sub-head .sub-desc {
   font-size: 12px;
+  color: var(--text-faint);
+}
+.sub-note {
+  max-width: 960px;
+  margin: 0 auto 14px;
+  font-size: 12px;
+  line-height: 1.6;
   color: var(--text-faint);
 }
 .sub-body {

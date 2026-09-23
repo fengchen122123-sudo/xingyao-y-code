@@ -176,8 +176,10 @@ def load_system_prompt(is_gui: bool = False) -> str:
     return system_prompt
 
 
-def build_stable_system_extra_sections() -> list[str]:
+def _render_stable_system_extra_sections() -> list[str]:
     """稳定前缀中「build_stable_prompt 之外」的段落（注入点 2，规格 02 §2.2）。
+
+    本函数是无快照的原始渲染逻辑，会话级快照包装见 ``build_stable_system_extra_sections``。
 
     内容 = 人设块? + 通用编码规范 + 长期记忆? + 技能目录? + 子 Agent 清单?，
     保持改造前的条件与顺序；**不含** build_stable_prompt（base_prompt + 决策规则）
@@ -227,7 +229,57 @@ def build_stable_system_extra_sections() -> list[str]:
     return parts
 
 
-def build_stable_system_message(is_gui: bool = False) -> dict:
+# 会话级稳定段落快照：会话首请求定型「注入点 2」（编码规范 + 记忆索引 + 技能目录
+# + 子 Agent 清单）的渲染字节，会话中途改设置/切技能/改子 Agent 不再改动 system 头，
+# 因此不再触发 DeepSeek 账本换代（一次换代 = 一整条大 prompt 全价 miss）。
+#
+# 只进内存、不落库：进程重启后首请求重新渲染，文件无变化则渲染结果逐字节相同、
+# 天然不炸代；有变化则只换代一次，符合预期。无 session_name 时完全走原渲染路径，
+# 保证 tests/test_prompt_byte_stability.py 的 sha256 golden 不受影响。
+_SESSION_STABLE_SECTIONS = {}
+_SESSION_STABLE_SECTIONS_LOCK = threading.Lock()
+
+
+def build_stable_system_extra_sections(session_name=None) -> list[str]:
+    """注入点 2 的段落列表；给定会话名时按会话首请求的字节定型（会话级快照）。
+
+    返回 list 副本，调用方对返回值的任何改动都不会污染快照本身。
+    """
+    key = str(session_name or "").strip()
+    if key:
+        with _SESSION_STABLE_SECTIONS_LOCK:
+            cached = _SESSION_STABLE_SECTIONS.get(key)
+        if cached is not None:
+            return list(cached)
+    parts = _render_stable_system_extra_sections()
+    if key:
+        with _SESSION_STABLE_SECTIONS_LOCK:
+            _SESSION_STABLE_SECTIONS[key] = tuple(parts)
+    return parts
+
+
+def clear_session_stable_sections(session_name) -> None:
+    """会话删除/清空历史时丢弃快照，防止同名新会话继承旧段落字节。"""
+    key = str(session_name or "").strip()
+    if not key:
+        return
+    with _SESSION_STABLE_SECTIONS_LOCK:
+        _SESSION_STABLE_SECTIONS.pop(key, None)
+
+
+def rename_session_stable_sections(old_name, new_name) -> None:
+    """会话重命名时迁移快照，保持重命名前后请求前缀连续（账本也随会话名迁移）。"""
+    old_key = str(old_name or "").strip()
+    new_key = str(new_name or "").strip()
+    if not old_key or not new_key or old_key == new_key:
+        return
+    with _SESSION_STABLE_SECTIONS_LOCK:
+        value = _SESSION_STABLE_SECTIONS.pop(old_key, None)
+        if value is not None:
+            _SESSION_STABLE_SECTIONS[new_key] = value
+
+
+def build_stable_system_message(is_gui: bool = False, session_name=None) -> dict:
     """组装每轮请求首位的稳定系统提示词消息，供请求组装与 Token 估算复用。
 
     稳定前缀 = 基础系统提示词 + 决策策略 + 通用编码规范 + 长期记忆
@@ -245,10 +297,16 @@ def build_stable_system_message(is_gui: bool = False) -> dict:
     "\\n\\n" 连接。该组装与原实现逐字节等价（分段点正落在原有的 "\\n\\n"
     连接符上，join 结合律成立），由 tests/test_prompt_byte_stability.py 的
     sha256 golden（ef286e51…）与 test_context_injection.py 的逐点对比双重守护。
+
+    会话级快照（2026-09-23）：传入 session_name 时，注入点 2 的段落按会话首请求
+    的字节定型并缓存在进程内，会话中途的目录/设置变更不再改动 system 头、不再
+    触发 DeepSeek 账本换代；不传 session_name（Token 估算路径）与改造前逐字节相同。
     """
     from core.context_injection import build_default_injection_registry
 
-    registry = build_default_injection_registry(is_gui=is_gui)
+    registry = build_default_injection_registry(
+        is_gui=is_gui, session_name=session_name
+    )
     parts = [section for section in registry.build_prefix_sections() if section]
     return {"role": "system", "content": "\n\n".join(parts)}
 
@@ -835,7 +893,9 @@ def prepare_turn_messages(
 
     # 提前组装首部稳定系统提示词：Token 估算必须把它计入，
     # 否则口径会低于实际请求（系统提示词不落库、每轮现组）
-    system_message = build_stable_system_message(is_gui)
+    # 传 session_name 以启用「注入点 2」的会话级快照：本会话首请求定型目录字节，
+    # 中途改设置/切技能不再改动 system 头、不再触发账本换代。
+    system_message = build_stable_system_message(is_gui, session_name)
 
     # 【四级水位线阶梯】在向大模型请求前，按水位逐级升级维护强度。
     # 触发判断用本会话最近一次真实 API 用量与本地估算的较小值作基线：

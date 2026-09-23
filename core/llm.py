@@ -1623,6 +1623,7 @@ def _chat_with_model_generator(
             request_diagnostic = None
             active_deepseek_generation_id = None
             active_deepseek_message_count = None
+            active_deepseek_rotation_reason = ""
             cache_control_downgraded = False
             wait_started_at = None
 
@@ -1654,6 +1655,9 @@ def _chat_with_model_generator(
                         kwargs["tools"] = effective_request_tools
                         active_deepseek_generation_id = ledger_request["generation_id"]
                         active_deepseek_message_count = len(cleaned_messages)
+                        active_deepseek_rotation_reason = (
+                            ledger_request.get("rotation_reason") or ""
+                        )
                     if _is_kimi_family(model_name, api_base):
                         # Moonshot 推理模型要求所有带 tool_calls 的 assistant 消息
                         # 携带 reasoning_content；从数据库重建的历史消息可能已被剥掉，
@@ -1678,6 +1682,15 @@ def _chat_with_model_generator(
                             tools=effective_request_tools,
                         )
                         request_cache_reason = request_diagnostic["request_reason"]
+                        if active_deepseek_rotation_reason:
+                            # 账本换代原因比形状差分更精确（形状差分只能笼统看出
+                            # "上下文压缩或历史重写"）。非空即换代：request_cache_reason
+                            # 同步覆写，语义保持一致——两者都算"非热启动"，
+                            # 汇总侧 explicit_categories 也已把账本原因映射到既有分类。
+                            request_diagnostic["request_reason"] = (
+                                active_deepseek_rotation_reason
+                            )
+                            request_cache_reason = active_deepseek_rotation_reason
                         classified_message_shape = current_message_shape
                     kwargs["messages"] = _apply_cache_control(
                         cleaned_messages,

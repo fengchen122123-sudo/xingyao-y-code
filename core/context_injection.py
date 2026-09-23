@@ -154,7 +154,7 @@ def _build_context_prefix(is_gui: bool) -> str:
     return build_stable_prompt(load_system_prompt(is_gui))
 
 
-def _build_stable_system_sections() -> str:
+def _build_stable_system_sections(session_name=None) -> str:
     """注入点 2：通用编码规范 / 长期记忆 / 技能目录 / 子 Agent 清单段（PREFIX/SYSTEM）。
 
     包装 ``agent_service.build_stable_system_extra_sections``（B4 从
@@ -167,10 +167,13 @@ def _build_stable_system_sections() -> str:
     一整份 base_prompt。拆分后两段各自完整，且分段点落在原有 "\\n\\n" 连接符上，
     join 结合律保证 ``build_stable_system_message`` 的输出逐字节不变。
     本段与 GUI/CLI 无关，故不再接收 is_gui（改造前该参数只用于读取 base_prompt）。
+
+    ``session_name`` 透传给 ``build_stable_system_extra_sections``，用于会话级
+    快照（规格见 agent_service 同名字段）；为空时走无快照的原始渲染路径。
     """
     from core.agent_service import build_stable_system_extra_sections
 
-    return "\n\n".join(build_stable_system_extra_sections())
+    return "\n\n".join(build_stable_system_extra_sections(session_name))
 
 
 def _runtime_block_builder(
@@ -293,6 +296,7 @@ def build_default_injection_registry(
     *,
     is_gui: bool = False,
     runtime_provider: Callable[[], "RuntimeContext"] | None = None,
+    session_name: str | None = None,
 ) -> ContextInjectionRegistry:
     """登记规格 02 §2.2 的 7 个现有注入点，返回全新注册表。
 
@@ -306,6 +310,8 @@ def build_default_injection_registry(
         未传时这些 source 的 builder 返回空串（不注入），由调用方
         （B4 起的渲染管线：build_stable_system_message / build_dynamic_prompt /
         agent_service 的时间注记取用点）完成状态绑定。
+    :param session_name: 注入点 2 的会话级快照键；为 None 时不使用快照
+        （Token 估算、测试等无会话上下文场景），渲染字节与改造前一致。
     """
     registry = ContextInjectionRegistry()
 
@@ -323,7 +329,7 @@ def build_default_injection_registry(
         source=SOURCE_STABLE_SYSTEM_SECTIONS,
         persistence=Persistence.PREFIX,
         channel=Channel.SYSTEM,
-        section_builder=_build_stable_system_sections,
+        section_builder=lambda: _build_stable_system_sections(session_name),
     ))
 
     # 3) 运行上下文块（模型/权限/目录/计划）→ PERSISTED/SYSTEM
