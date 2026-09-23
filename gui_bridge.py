@@ -5478,7 +5478,9 @@ class ApiBridge(GitBridgeMixin):
 
             # 按回合撤销检查点已在用户消息落库前创建（undo_ctx）；
             # 历史压缩后重算窗口占用并推送，让上下文圆圈及时回落。
-            self._recalc_token_usage(session_name)
+            # 组装刚写入的来源占比快照必须保留（那是本轮最新数据，不是旧会话
+            # 残留）——否则下方推送的面板数据永远为空（2026-09-23 修复）。
+            self._recalc_token_usage(session_name, clear_breakdown_snapshot=False)
             self._emit_token_usage()
 
             # 子代理进度轮询：让前端"运行中"的子代理卡片能实时展开查看进度
@@ -6313,8 +6315,13 @@ class ApiBridge(GitBridgeMixin):
         except Exception:
             logger.debug("推送 token_usage 失败", exc_info=True)
 
-    def _recalc_token_usage(self, session_name: str):
-        """切会话 / 清空历史后重算窗口占用（优先真实用量，无记录才估算兜底）。"""
+    def _recalc_token_usage(self, session_name: str, *, clear_breakdown_snapshot: bool = True):
+        """切会话 / 清空历史后重算窗口占用（优先真实用量，无记录才估算兜底）。
+
+        clear_breakdown_snapshot=False 供「回合组装后重算」路径使用：该路径下
+        来源占比快照是组装刚写入的最新数据，绝不能被当作"旧会话残留"清掉
+        （否则组装后推给前端的面板数据永远为空，2026-09-23 修复）。
+        """
         try:
             from core.agent_service import get_session_token_baseline
             from core.context_breakdown import clear_breakdown
@@ -6330,7 +6337,8 @@ class ApiBridge(GitBridgeMixin):
                 session_token_usage["latest_prompt"] = 0
             # 上下文占比快照与 token 记账同生命周期：重算即清理旧快照，
             # 避免切换会话后悬停面板残留上一会话的占比
-            clear_breakdown()
+            if clear_breakdown_snapshot:
+                clear_breakdown()
         except Exception:
             logger.debug("重算 token 用量失败", exc_info=True)
 

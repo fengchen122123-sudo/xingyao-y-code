@@ -220,7 +220,7 @@ def test_worker_emits_message_final_for_current_turn_message(monkeypatch, tmp_pa
     monkeypatch.setattr("core.agent_service.prepare_turn_messages", lambda *_a, **_k: [])
     bridge._session_workdir = lambda _name: str(tmp_path)
     bridge._sync_active_model_context = lambda *_a: None
-    bridge._recalc_token_usage = lambda *_a: None
+    bridge._recalc_token_usage = lambda *_a, **_k: None
     bridge._subagent_progress_poller = lambda *_a, **_k: None
     bridge._maybe_auto_rename = lambda _name: None
 
