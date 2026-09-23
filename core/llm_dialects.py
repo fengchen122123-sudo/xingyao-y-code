@@ -1209,12 +1209,13 @@ def _attach_kimi_request_extras(
 ):
     """给 Kimi 系模型的请求参数附加缓存亲和配置（原地修改 result）。
 
-    - 缓存亲和：OpenAI 兼容路由传 prompt_cache_key，Anthropic 路由传 metadata.user_id。
+    - 缓存亲和：OpenAI 兼容路由传 prompt_cache_key，Anthropic 路由传 metadata.user_id；
+      判定只看模型家族，任意渠道都发送。
     """
     anthropic_route = str(model_name or "").split("/")[0].lower() == "anthropic"
 
     session_id = None
-    if _is_official_kimi_route(api_base):
+    if _is_kimi_family(model_name, api_base):
         session_id = _cache_affinity_session_id(
             cache_scope=cache_scope,
             model_name=model_name,

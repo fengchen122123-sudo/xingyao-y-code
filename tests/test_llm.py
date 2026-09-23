@@ -153,8 +153,8 @@ def test_kimi_openai_route_sends_prompt_cache_key(monkeypatch):
     assert opts["max_tokens"] == 131072
 
 
-def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
-    """第三方 OpenAI 网关未声明支持 Kimi 私有字段时不得发送 prompt_cache_key。"""
+def test_kimi_third_party_openai_route_sends_cache_key(monkeypatch):
+    """第三方 OpenAI 网关同样发送缓存亲和键：判定只看模型家族。"""
     from core.llm import _provider_request_options
 
     _patch_session(monkeypatch, "session_abc123")
@@ -165,7 +165,7 @@ def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
     )
 
     assert opts["max_tokens"] == 128000
-    assert "prompt_cache_key" not in opts.get("extra_body", {})
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
 
 
 @pytest.mark.parametrize("api_base", [
@@ -175,9 +175,8 @@ def test_kimi_third_party_openai_route_omits_official_cache_key(monkeypatch):
     "https://api.kimi.com:8443/coding/v1",
     "https://api.kimi.com/coding-evil/v1",
 ])
-def test_kimi_cache_affinity_rejects_noncanonical_official_urls(
-    monkeypatch, api_base
-):
+def test_kimi_cache_affinity_covers_noncanonical_api_bases(monkeypatch, api_base):
+    """任意 api_base（含非规范官方 URL）都发送缓存亲和键：判定只看模型家族。"""
     from core.llm import _provider_request_options, _supports_cache_keepalive
 
     _patch_session(monkeypatch, "session_abc123")
@@ -185,7 +184,7 @@ def test_kimi_cache_affinity_rejects_noncanonical_official_urls(
 
     opts = _provider_request_options("openai/kimi-k3", api_base)
 
-    assert "prompt_cache_key" not in opts.get("extra_body", {})
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
     assert _supports_cache_keepalive("openai/kimi-k3", api_base) is False
 
 
