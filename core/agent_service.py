@@ -182,7 +182,7 @@ def load_system_prompt(is_gui: bool = False) -> str:
     return system_prompt
 
 
-def _render_stable_system_extra_sections() -> list[str]:
+def _render_stable_system_extra_sections() -> tuple[list[str], int]:
     """稳定前缀中「build_stable_prompt 之外」的段落（注入点 2，规格 02 §2.2）。
 
     本函数是无快照的原始渲染逻辑，会话级快照包装见 ``build_stable_system_extra_sections``。
@@ -198,8 +198,13 @@ def _render_stable_system_extra_sections() -> list[str]:
     逐字节相同（由 sha256 golden ef286e51… 守护）。
 
     本段与 GUI / CLI 口径无关，故不接受 is_gui 参数。
+
+    返回值第二项为技能目录段的字符量（空白目录记 0），与段落同源定格：
+    供上下文来源统计与「系统提示词」做减项，避免会话中途技能变更后
+    统计值与快照实际字节不一致（2026-09-23 修复）。
     """
     parts: list[str] = []
+    skills_len = 0
     # 人设设置块：仅当用户在设置页自定义了名称/称呼/人设时非空；
     # 默认配置返回空串，不影响 byte-stability。跨轮不变，归入稳定前缀。
     try:
@@ -223,6 +228,7 @@ def _render_stable_system_extra_sections() -> list[str]:
         skills_catalog = get_active_skills_catalog()
         if skills_catalog.strip():
             parts.append(skills_catalog)
+            skills_len = len(skills_catalog)
     except Exception:
         pass
     try:
@@ -232,7 +238,7 @@ def _render_stable_system_extra_sections() -> list[str]:
             parts.append(subagents_catalog)
     except Exception:
         pass
-    return parts
+    return parts, skills_len
 
 
 # 会话级稳定段落快照：会话首请求定型「注入点 2」（编码规范 + 记忆索引 + 技能目录
@@ -242,6 +248,9 @@ def _render_stable_system_extra_sections() -> list[str]:
 # 只进内存、不落库：进程重启后首请求重新渲染，文件无变化则渲染结果逐字节相同、
 # 天然不炸代；有变化则只换代一次，符合预期。无 session_name 时完全走原渲染路径，
 # 保证 tests/test_prompt_byte_stability.py 的 sha256 golden 不受影响。
+#
+# 快照值 = (段落 tuple, 技能目录字符量)：技能长度与段落同源定格，
+# 供上下文来源统计使用（2026-09-23）。
 _SESSION_STABLE_SECTIONS = {}
 _SESSION_STABLE_SECTIONS_LOCK = threading.Lock()
 
@@ -256,12 +265,26 @@ def build_stable_system_extra_sections(session_name=None) -> list[str]:
         with _SESSION_STABLE_SECTIONS_LOCK:
             cached = _SESSION_STABLE_SECTIONS.get(key)
         if cached is not None:
-            return list(cached)
-    parts = _render_stable_system_extra_sections()
+            return list(cached[0])
+    parts, skills_len = _render_stable_system_extra_sections()
     if key:
         with _SESSION_STABLE_SECTIONS_LOCK:
-            _SESSION_STABLE_SECTIONS[key] = tuple(parts)
+            _SESSION_STABLE_SECTIONS[key] = (tuple(parts), skills_len)
     return parts
+
+
+def get_session_stable_skills_len(session_name):
+    """会话快照中技能目录段的字符量；无快照或无会话名时返回 None（调用方回落实时值）。
+
+    与 ``build_stable_system_extra_sections`` 的快照同源：技能长度随 system 头
+    一起按会话首请求定格，保证上下文来源统计与实际发送字节一致（2026-09-23）。
+    """
+    key = str(session_name or "").strip()
+    if not key:
+        return None
+    with _SESSION_STABLE_SECTIONS_LOCK:
+        cached = _SESSION_STABLE_SECTIONS.get(key)
+    return cached[1] if cached is not None else None
 
 
 def clear_session_stable_sections(session_name) -> None:
@@ -489,30 +512,33 @@ def strip_context_suffix(content):
 def _append_context_suffix_to_last_user(
     history, dynamic_prompt, summary_msg, time_note, manager, session_name,
     ref_block="",
-):
+) -> bool:
     """把动态运行上下文 + 引用对话块 + 后台汇总 + 时间注记内联到最后一条 user 消息末尾并 CAS 持久化。
 
     上下文块不再作为独立 role=system 消息持久化（那会把 system 消息留到
     user 之后，违反 provider 的「system 必须在开头」约束）。改为内联到
     user 消息 content 末尾，messages 数组里只保留首位的稳定 system 提示词。
+
+    返回是否实际注入：未注入（无 user / 非文本 content / 无有效片段）时
+    调用方不得把运行上下文计入统计口径（2026-09-23）。
     """
     if not history:
-        return
+        return False
     last_user_idx = None
     for i in range(len(history) - 1, -1, -1):
         if history[i].get("role") == "user":
             last_user_idx = i
             break
     if last_user_idx is None:
-        return
+        return False
     original_content = history[last_user_idx].get("content", "")
     if not isinstance(original_content, str):
         # 非文本 content（如媒体消息），跳过上下文内联
-        return
+        return False
     cleaned = strip_context_suffix(original_content)
     suffix_parts = [p for p in (dynamic_prompt, ref_block, summary_msg, time_note) if p]
     if not suffix_parts:
-        return
+        return False
     new_content = cleaned + "\n\n" + "\n\n".join(suffix_parts)
     history[last_user_idx]["content"] = new_content
     try:
@@ -521,6 +547,7 @@ def _append_context_suffix_to_last_user(
         )
     except Exception:
         logger.warning("上下文后缀 CAS 持久化失败，仅影响内存副本", exc_info=True)
+    return True
 
 
 def _extract_refs_from_last_user(history: list) -> list:
@@ -1139,7 +1166,7 @@ def prepare_turn_messages(
     except Exception:
         logger.warning("引用对话块构建失败，已跳过", exc_info=True)
         ref_block = ""
-    _append_context_suffix_to_last_user(
+    suffix_injected = _append_context_suffix_to_last_user(
         history, dynamic_prompt, summary_msg, time_note, manager, session_name,
         ref_block=ref_block,
     )
@@ -1149,15 +1176,20 @@ def prepare_turn_messages(
     # 任何异常仅记 debug，绝不影响本轮组装。
     try:
         from core.context_breakdown import set_breakdown
-        from core.skills import get_active_skills_catalog
 
-        skills_text = get_active_skills_catalog() or ""
-        # 与 build_stable_system_extra_sections 同源：空白目录段不会进系统提示词
-        skills_len = len(skills_text) if skills_text.strip() else 0
-        # 排除系统消息与已单列的后缀，避免占比重复计入
+        # 技能长度优先取会话快照口径（与 system 头实际字节一致）；无快照
+        # （无会话名/未定型）时回落实时目录长度；空白目录段不计（2026-09-23）。
+        skills_len = get_session_stable_skills_len(session_name)
+        if skills_len is None:
+            from core.skills import get_active_skills_catalog
+
+            skills_text = get_active_skills_catalog() or ""
+            skills_len = len(skills_text) if skills_text.strip() else 0
+        # 排除系统消息与已单列的后缀，避免占比重复计入；后缀未实际注入
+        # （如媒体消息跳过内联）时不计运行上下文。
         suffix_chars = (
             len(dynamic_prompt) + len(time_note) + len(summary_msg) + len(ref_block)
-        )
+        ) if suffix_injected else 0
         messages_chars = max(
             sum(len(str(m)) for m in history if m.get("role") != "system")
             - suffix_chars,

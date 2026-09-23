@@ -146,7 +146,8 @@ const CONTEXT_BREAKDOWN_SOURCES = new Set<ContextBreakdownItem['source']>([
   'system_prompt',
   'skills',
   'runtime_context',
-  'tools',
+  'system_tools',
+  'mcp_tools',
 ]);
 
 const normalizeContextBreakdown = (value: unknown): ContextBreakdownItem[] => {

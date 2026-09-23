@@ -262,6 +262,36 @@ def _get_mcp_manager():
     return mcp_manager
 
 
+def _snapshot_tool_breakdown(request_tools):
+    """【纯旁路】按 MCP 工具名集合拆分统计工具定义字符量（设计规格 §3.3；
+    2026-09-23 拆分系统/MCP）。失败仅记 debug，绝不改变 request_tools 与发送字节。"""
+    try:
+        from core.context_breakdown import update_source as _update_ctx_source
+        mcp_tool_names = {
+            s.get("function", {}).get("name")
+            for s in _get_mcp_manager().get_schemas()
+        }
+        system_tools = [
+            s for s in request_tools
+            if s.get("function", {}).get("name") not in mcp_tool_names
+        ]
+        mcp_tools = [
+            s for s in request_tools
+            if s.get("function", {}).get("name") in mcp_tool_names
+        ]
+        # 空组写 0（而非 '[]' 的 2），前端过滤 chars<=0 不会渲染 0 占比行
+        _update_ctx_source(
+            "system_tools",
+            len(json.dumps(system_tools, ensure_ascii=False)) if system_tools else 0,
+        )
+        _update_ctx_source(
+            "mcp_tools",
+            len(json.dumps(mcp_tools, ensure_ascii=False)) if mcp_tools else 0,
+        )
+    except Exception:
+        logger.debug("工具定义字符量统计失败（旁路，已忽略）", exc_info=True)
+
+
 def get_tools_schema():
     """每次构建请求时新鲜获取工具 schema（registry 静态 + MCP 动态）。
 
@@ -1408,15 +1438,9 @@ def _chat_with_model_generator(
     request_tools = _select_request_tools_for_route(
         model_name, api_base, request_tools
     )
-    # 【纯旁路】工具定义字符量快照（设计规格 §3.3）：每步请求都会走到，
-    # 重复更新无害；失败仅记 debug，绝不改变 request_tools 与发送字节。
-    try:
-        from core.context_breakdown import update_source as _update_ctx_source
-        _update_ctx_source(
-            "tools", len(json.dumps(request_tools, ensure_ascii=False))
-        )
-    except Exception:
-        logger.debug("工具定义字符量统计失败（旁路，已忽略）", exc_info=True)
+    # 【纯旁路】工具定义字符量快照（设计规格 §3.3；2026-09-23 拆分系统/MCP）：
+    # 每步请求都会走到，重复更新无害；失败仅记 debug，绝不改变发送字节。
+    _snapshot_tool_breakdown(request_tools)
     # 原生 OpenAI 协议（Task 11a，设计 11.1/11.2）：native tools 不进
     # request_tools（chat 格式），而是经 prepare_stream_request 的
     # native_computer_tools 参数追加在 flattened function tools 之后；

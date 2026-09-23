@@ -1286,3 +1286,70 @@ def test_build_referenced_sessions_block_skips_broken_session(
     assert "「坏会话」读取失败，已跳过" in block
     assert "好会话关键结论" in block
 
+
+def test_context_breakdown_skills_follow_snapshot_after_change(
+    stub_llm, quiet_extras, monkeypatch
+):
+    """会话中途技能变更后，breakdown 的技能/系统提示词仍按快照口径，不随实时目录漂移。"""
+    import core.agent_service as agent_service
+    import core.skills as skills_mod
+    from core.agent_service import prepare_turn_messages
+    from core.context_breakdown import get_breakdown, clear_breakdown
+
+    monkeypatch.setattr(skills_mod, "get_active_skills_catalog", lambda: "skills-v1")
+    mgr = _make_manager()
+    session = "snap-breakdown"
+    try:
+        mgr.ensure_session(session)
+        mgr.add_message(session, "user", "问题一")
+        prepare_turn_messages(
+            mgr, session, "openai/gpt-test", 128000, permission_mode="full"
+        )
+        snap1 = {i["source"]: i["chars"] for i in get_breakdown()}
+        assert snap1["skills"] == len("skills-v1")
+
+        # 会话中途技能目录变化：system 头走快照，统计必须与快照一致
+        monkeypatch.setattr(
+            skills_mod, "get_active_skills_catalog", lambda: "skills-v2-much-longer"
+        )
+        mgr.add_message(session, "assistant", "答")
+        mgr.add_message(session, "user", "问题二")
+        messages2 = prepare_turn_messages(
+            mgr, session, "openai/gpt-test", 128000, permission_mode="full"
+        )
+        snap2 = {i["source"]: i["chars"] for i in get_breakdown()}
+        assert snap2["skills"] == len("skills-v1")
+        assert snap2["skills"] + snap2["system_prompt"] == len(messages2[0]["content"])
+    finally:
+        clear_breakdown()
+        agent_service.clear_session_stable_sections(session)
+
+
+def test_append_context_suffix_reports_injection():
+    """后缀注入返回真实状态：正常文本注入 True；媒体消息/无 user/空片段 False。"""
+    from core.agent_service import _append_context_suffix_to_last_user
+
+    class _FakeMgr:
+        def replace_latest_user_message_content(self, *args, **kwargs):
+            pass
+
+    mgr = _FakeMgr()
+    history = [{"role": "user", "content": "你好"}]
+    assert _append_context_suffix_to_last_user(
+        history, "DYN", "", "TIME", mgr, "s"
+    ) is True
+    assert "DYN" in history[0]["content"]
+
+    media = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]
+    assert _append_context_suffix_to_last_user(
+        media, "DYN", "", "TIME", mgr, "s"
+    ) is False
+    assert isinstance(media[0]["content"], list)
+
+    assert _append_context_suffix_to_last_user(
+        [{"role": "assistant", "content": "hi"}], "DYN", "", "TIME", mgr, "s"
+    ) is False
+    assert _append_context_suffix_to_last_user(
+        [{"role": "user", "content": "你好"}], "", "", "", mgr, "s"
+    ) is False
+

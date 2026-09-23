@@ -139,7 +139,8 @@ it('token_usage 事件透传 context_breakdown，非法来源与非正 chars 被
         { source: 'messages', chars: 620 },
         { source: 'unknown_source', chars: 99 },
         { source: 'skills', chars: 0 },
-        { source: 'tools', chars: -3 },
+        { source: 'system_tools', chars: -3 },
+        { source: 'tools', chars: 42 },
       ],
     },
   });
