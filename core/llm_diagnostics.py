@@ -387,6 +387,12 @@ def rename_cache_usage_session(old_name, new_name):
             for source, target, value in moves:
                 mapping[target] = value
                 del mapping[source]
+    try:
+        from core.agent_service import rename_session_stable_sections
+
+        rename_session_stable_sections(old_key, new_key)
+    except Exception:
+        logger.debug("稳定段落快照迁移失败（已忽略）", exc_info=True)
 
 
 def clear_cache_usage_session(session_name):
@@ -396,6 +402,12 @@ def clear_cache_usage_session(session_name):
         for mapping in (_cache_request_states, _cache_usage_states):
             for key in [key for key in mapping if key and key[0] == session_key]:
                 del mapping[key]
+    try:
+        from core.agent_service import clear_session_stable_sections
+
+        clear_session_stable_sections(session_key)
+    except Exception:
+        logger.debug("稳定段落快照清理失败（已忽略）", exc_info=True)
 
 
 def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
