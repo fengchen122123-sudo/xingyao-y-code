@@ -73,3 +73,19 @@ def test_snapshot_follows_session_rename_and_clear(monkeypatch):
     _stub_prompt_sources(monkeypatch, "skills-v2")
     fresh = agent_service.build_stable_system_message(session_name="after")["content"]
     assert "skills-v2" in fresh
+
+
+def test_session_stable_skills_len_matches_snapshot(monkeypatch):
+    """技能长度随快照定格：中途技能变更不影响已定型值；无快照/无会话名返回 None。"""
+    import core.agent_service as agent_service
+
+    assert agent_service.get_session_stable_skills_len("nope") is None
+    assert agent_service.get_session_stable_skills_len("") is None
+
+    _stub_prompt_sources(monkeypatch, "skills-v1")
+    agent_service.build_stable_system_message(session_name="snap-len")
+    assert agent_service.get_session_stable_skills_len("snap-len") == len("skills-v1")
+
+    # 中途技能变更：已定型快照值不漂移
+    _stub_prompt_sources(monkeypatch, "skills-v2-longer")
+    assert agent_service.get_session_stable_skills_len("snap-len") == len("skills-v1")

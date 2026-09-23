@@ -82,7 +82,7 @@ describe('ContextUsagePanel', () => {
     const rows = wrapper.findAll('[data-test="ctx-usage-row"]');
     expect(rows).toHaveLength(3);
 
-    expect(rows[0].find('.cxp-row-name').text()).toBe('对话历史');
+    expect(rows[0].find('.cxp-row-name').text()).toBe('消息');
     expect(rows[0].find('.cxp-row-pct').text()).toBe('67.4%');
     expect(rows[1].find('.cxp-row-name').text()).toBe('系统提示词');
     expect(rows[1].find('.cxp-row-pct').text()).toBe('21.7%');
@@ -97,6 +97,23 @@ describe('ContextUsagePanel', () => {
     wrapper.unmount();
   });
 
+  it('渲染系统工具与 MCP 工具两类来源行', () => {
+    setUsage({
+      used: 1000,
+      window: 128000,
+      context_breakdown: [
+        { source: 'system_tools', chars: 800 },
+        { source: 'mcp_tools', chars: 100 },
+      ],
+    });
+    const wrapper = mountPanel();
+    const rows = wrapper.findAll('[data-test="ctx-usage-row"]');
+    expect(rows).toHaveLength(2);
+    expect(rows[0].find('.cxp-row-name').text()).toBe('系统工具');
+    expect(rows[1].find('.cxp-row-name').text()).toBe('MCP 工具');
+    wrapper.unmount();
+  });
+
   it('过滤非法来源与非正 chars；Σchars 为 0 时整段列表隐藏', () => {
     setUsage({
       used: 100,
@@ -104,7 +121,9 @@ describe('ContextUsagePanel', () => {
       context_breakdown: [
         { source: 'bogus' as ContextBreakdownItem['source'], chars: 50 },
         { source: 'messages', chars: 0 },
-        { source: 'tools', chars: -3 },
+        { source: 'system_tools', chars: -3 },
+        // 旧来源 tools 已从白名单移除，须被静默过滤
+        { source: 'tools' as ContextBreakdownItem['source'], chars: 42 },
       ],
     });
     const wrapper = mountPanel();

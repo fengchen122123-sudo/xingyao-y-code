@@ -68,12 +68,14 @@ const emit = defineEmits<{
 const store = useAppStore();
 
 // 中文名映射（后端来源白名单；键序即校验集合，不参与渲染顺序）
+// 2026-09-23 对齐 ZCode：工具拆分为系统工具 / MCP 工具，标签同步
 const SOURCE_LABELS: Record<ContextBreakdownSource, string> = {
-  messages: '对话历史',
+  messages: '消息',
   system_prompt: '系统提示词',
   skills: '技能',
-  runtime_context: '运行上下文',
-  tools: '工具定义',
+  runtime_context: '其他',
+  system_tools: '系统工具',
+  mcp_tools: 'MCP 工具',
 };
 
 // 同一色系五档深浅：色相固定为 accent，按列表顺序递减混合强度

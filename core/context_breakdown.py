@@ -6,9 +6,9 @@
 所有函数遵循旁路原则：内部 try/except 吞掉一切异常、非法输入静默过滤，
 统计绝不打扰对话主流程；快照写入与读取均持锁，GUI/后台线程并发安全。
 
-来源白名单与 `get_breakdown` 的稳定输出顺序一致：
-messages（对话历史）/ system_prompt（系统提示词）/ skills（技能目录）/
-runtime_context（运行上下文）/ tools（工具定义）。
+来源白名单与 `get_breakdown` 的稳定输出顺序一致（2026-09-23 对齐 ZCode：工具拆分）：
+messages（消息）/ system_prompt（系统提示词）/ skills（技能目录）/
+runtime_context（其他）/ system_tools（系统工具）/ mcp_tools（MCP 工具）。
 """
 
 from __future__ import annotations
@@ -24,7 +24,8 @@ VALID_SOURCES: tuple[str, ...] = (
     "system_prompt",
     "skills",
     "runtime_context",
-    "tools",
+    "system_tools",
+    "mcp_tools",
 )
 
 _lock = threading.Lock()
