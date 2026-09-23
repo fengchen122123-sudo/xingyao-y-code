@@ -407,6 +407,24 @@ def test_configured_deepseek_cache_route_sorts_tools(monkeypatch):
     assert sorted_tools is not tools
 
 
+def test_deepseek_family_route_sorts_tools_without_config(monkeypatch):
+    """家族判定下任意渠道排序 tools：配置不再必要（MCP 顺序抖动不得击穿缓存前缀）。"""
+    from core.llm import _select_request_tools_for_route
+
+    _use_deepseek_cache_routes(monkeypatch, [])
+    tools = [
+        {"type": "function", "function": {"name": "zeta", "parameters": {}}},
+        {"type": "function", "function": {"name": "alpha", "parameters": {}}},
+    ]
+
+    sorted_tools = _select_request_tools_for_route(
+        "openai/deepseek-v4-flash-0731", "https://relay.example/v1", tools
+    )
+
+    assert [tool["function"]["name"] for tool in sorted_tools] == ["alpha", "zeta"]
+    assert sorted_tools is not tools
+
+
 # ---------------------------------------------------------------------------
 # 改造项 ③：轮换与 miss 可观测（换代原因写进 cache_request_diagnostics）
 # ---------------------------------------------------------------------------

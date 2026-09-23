@@ -319,7 +319,7 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
                 "reasoning_effort": "high",
                 "allowed_openai_params": ["reasoning_effort"],
             },
-            [ZETA_TOOL, ALPHA_TOOL],
+            [ALPHA_TOOL, ZETA_TOOL],
             None,
         ),
         (
@@ -656,7 +656,7 @@ def test_exact_model_id_reaches_final_provider_payload(monkeypatch):
         "model": "openai/deepseek-v4-flash",
         "api_key": "<redacted>",
         "messages": [{"role": "user", "content": "inspect"}],
-        "tools": [ZETA_TOOL, ALPHA_TOOL],
+        "tools": [ALPHA_TOOL, ZETA_TOOL],
         "stream": True,
         "stream_options": {"include_usage": True},
         "num_retries": 2,
