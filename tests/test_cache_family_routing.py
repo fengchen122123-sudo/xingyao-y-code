@@ -122,3 +122,18 @@ def test_tools_order_untouched_for_other_models():
     ]
     for model in ("openai/kimi-k2.6", "openai/glm-5.3", "openai/gpt-4o"):
         assert _select_request_tools_for_route(model, "https://relay.example/v1", tools) is tools
+
+
+# ---------------------------------------------------------------------------
+# kimi：缓存亲和键，任意渠道发送
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("api_base", ["https://api.moonshot.cn/v1", *_OTHER_CHANNELS])
+def test_kimi_affinity_sent_across_channels(api_base):
+    from core.llm import _provider_request_options
+
+    opts = _provider_request_options(
+        "openai/kimi-k2.6", api_base, cache_session_id="family-matrix"
+    )
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
