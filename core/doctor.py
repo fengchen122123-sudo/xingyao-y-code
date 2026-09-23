@@ -85,8 +85,12 @@ def _probe_endpoint(url: str, timeout: float) -> tuple[bool, str]:
     import urllib.error
     import urllib.request
 
+    from core.llm_policy import tokenrhythm_agent_headers
+
+    headers = {"User-Agent": "ycode-doctor"}
+    headers.update(tokenrhythm_agent_headers(url))
     request = urllib.request.Request(
-        str(url).rstrip("/") + "/", headers={"User-Agent": "ycode-doctor"}
+        str(url).rstrip("/") + "/", headers=headers
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:

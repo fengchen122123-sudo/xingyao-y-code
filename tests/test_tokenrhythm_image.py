@@ -45,6 +45,18 @@ class _Response:
         return False
 
 
+def _request_header(request, name):
+    """大小写不敏感读取 urllib.request.Request 的请求头。
+
+    Python 3.14 起 Request.get_header() 不再做 capitalize 规范化，
+    与 add_header 的存储键不再对称、会取不到值；测试统一走本例遍历。
+    """
+    return next(
+        (value for key, value in request.headers.items() if key.lower() == name.lower()),
+        None,
+    )
+
+
 class _FakeRegistry:
     def __init__(self):
         self.specs = []
@@ -222,6 +234,29 @@ class GenerateImageTest(unittest.TestCase):
         self.assertTrue(result.is_error)
         self.assertIn("base64", result.content)
 
+    def test_generate_request_carries_tokenrhythm_agent_header(self):
+        """生图请求头必须携带 X-TokenRhythm-Agent 客户端标识（值同全局默认 User-Agent）。"""
+        from core.llm_policy import DEFAULT_USER_AGENT
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["agent"] = _request_header(request, "X-TokenRhythm-Agent")
+            return _Response({"data": [{"url": "https://example.invalid/x.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\xff\xd8\xff\xe0")
+
+        with tempfile.TemporaryDirectory() as save_dir:
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.generate_image("橘猫", save_dir=save_dir)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["agent"], DEFAULT_USER_AGENT)
+
 class EditImageTest(unittest.TestCase):
     def setUp(self):
         self.tr = _load_plugin()
@@ -337,6 +372,30 @@ class EditImageTest(unittest.TestCase):
             fake_retrieve.assert_not_called()
             with open(result.changed_files[0], "rb") as f:
                 self.assertEqual(f.read(), raw)
+
+    def test_edit_request_carries_tokenrhythm_agent_header(self):
+        """垫图改图请求头同样携带 X-TokenRhythm-Agent 客户端标识（值同全局默认 User-Agent）。"""
+        from core.llm_policy import DEFAULT_USER_AGENT
+
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["agent"] = _request_header(request, "X-TokenRhythm-Agent")
+            return _Response({"data": [{"url": "https://example.invalid/edited.png"}]})
+
+        def fake_urlretrieve(url, target):
+            with open(target, "wb") as f:
+                f.write(b"\x89PNG\r\n\x1a\n")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            png = self._make_png(tmp)
+            with mock.patch.object(self.tr, "_resolve_api_key", return_value="sk_tr_fake_test"), \
+                 mock.patch.object(self.tr.urllib.request, "urlopen", fake_urlopen), \
+                 mock.patch.object(self.tr.urllib.request, "urlretrieve", fake_urlretrieve):
+                result = self.tr.edit_image(prompt="把背景换成雪景", image=png, save_dir=tmp)
+
+        self.assertFalse(result.is_error)
+        self.assertEqual(captured["agent"], DEFAULT_USER_AGENT)
 
 
 class PluginMetadataTest(unittest.TestCase):

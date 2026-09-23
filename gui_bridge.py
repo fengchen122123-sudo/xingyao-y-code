@@ -7753,8 +7753,10 @@ class ApiBridge(GitBridgeMixin):
             if api_key:
                 headers["Authorization"] = f"Bearer {api_key}"
                 headers["x-api-key"] = api_key
+            from core.llm_policy import tokenrhythm_agent_headers
             import httpx as _httpx
 
+            headers.update(tokenrhythm_agent_headers(url))
             try:
                 resp = _httpx.get(url, headers=headers, timeout=15.0)
             except Exception as exc:
