@@ -35,9 +35,13 @@ def _isolate_route_state(monkeypatch):
         dialects._keepalive_routes_cfg_cache["entry"] = None
         dialects._deepseek_cache_routes_cfg_cache["entry"] = None
         dialects._qwen_cache_cfg_cache.clear()
+    with dialects._affinity_disabled_lock:
+        dialects._affinity_disabled_routes.clear()
     with dialects._cache_control_disabled_lock:
         dialects._cache_control_disabled_routes.clear()
     yield
+    with dialects._affinity_disabled_lock:
+        dialects._affinity_disabled_routes.clear()
     with dialects._cache_control_disabled_lock:
         dialects._cache_control_disabled_routes.clear()
 
@@ -165,3 +169,107 @@ def test_keepalive_explicit_routes_still_gate_non_family_models(monkeypatch):
     with dialects._qwen_cache_cfg_lock:
         dialects._keepalive_routes_cfg_cache["entry"] = None
     assert _supports_cache_keepalive("openai/some-model", "https://tokenrhythm.studio/v1") is True
+
+
+# ---------------------------------------------------------------------------
+# kimi 亲和键 400 拒绝兜底：判定从严、临时拉黑、TTL 自愈、重试剥离
+# ---------------------------------------------------------------------------
+
+
+class _FakeBadRequest(Exception):
+    status_code = 400
+
+
+class _FakeServerError(Exception):
+    status_code = 500
+
+
+def test_affinity_rejection_requires_bad_request_status_and_named_field():
+    """只有 400 且文案点名 prompt_cache_key / user_id 才拉黑；无关故障不误伤。"""
+    from core.llm import _is_kimi_affinity_rejection
+
+    assert _is_kimi_affinity_rejection(
+        _FakeBadRequest("Error code: 400 - unknown field 'prompt_cache_key'")
+    )
+    assert _is_kimi_affinity_rejection(
+        _FakeBadRequest("Error code: 400 - invalid metadata.user_id")
+    )
+    assert not _is_kimi_affinity_rejection(
+        RuntimeError("connection reset while uploading prompt_cache_key (4000 bytes)")
+    )
+    assert not _is_kimi_affinity_rejection(
+        _FakeServerError("500 internal server error mentioning user_id")
+    )
+    assert not _is_kimi_affinity_rejection(
+        _FakeBadRequest("Error code: 400 - context length exceeded, invalid prompt")
+    )
+
+
+def test_affinity_blacklist_skips_key_and_expires_after_ttl():
+    """拉黑期间请求不再携带亲和键；TTL 到期自动恢复，一次误判不永久关优化。"""
+    from core.llm import (
+        _disable_affinity_route,
+        _provider_request_options,
+    )
+
+    base = "https://relay.example/v1"
+    model = "openai/kimi-k2.6"
+
+    opts = _provider_request_options(model, base, cache_session_id="affinity-ttl")
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
+
+    _disable_affinity_route(model, base, ttl_seconds=0.05)
+    blocked = _provider_request_options(model, base, cache_session_id="affinity-ttl")
+    assert "prompt_cache_key" not in blocked.get("extra_body", {})
+
+    time.sleep(0.08)
+    recovered = _provider_request_options(model, base, cache_session_id="affinity-ttl")
+    assert recovered["extra_body"]["prompt_cache_key"].startswith("ycode-")
+
+
+def _chunk(text="完成"):
+    from types import SimpleNamespace
+
+    delta = SimpleNamespace(content=text, reasoning_content=None, tool_calls=None)
+    return SimpleNamespace(
+        choices=[SimpleNamespace(delta=delta, finish_reason="stop")], usage=None
+    )
+
+
+def test_affinity_rejection_downgrades_retry_without_key(mocker):
+    """模拟 400：拉黑该路由 → 本轮重试剥离亲和键 → 后续请求也不再携带。"""
+    from core.llm import (
+        _affinity_route_disabled,
+        _provider_request_options,
+        chat_with_model_events,
+    )
+
+    captured = []
+
+    def fake_completion(**kwargs):
+        captured.append(deepcopy(kwargs))
+        if len(captured) == 1:
+            raise _FakeBadRequest("Error code: 400 - unknown field 'prompt_cache_key'")
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+
+    list(chat_with_model_events(
+        "openai/kimi-k2.6",
+        "fake-key",
+        [{"role": "user", "content": "提问"}],
+        "https://relay.example/v1",
+        persist=False,
+        turn_id="turn-affinity-downgrade",
+        consume_background_notifications=False,
+        cache_session_id="affinity-downgrade",
+    ))
+
+    assert len(captured) >= 2
+    assert captured[0]["extra_body"]["prompt_cache_key"].startswith("ycode-")
+    assert "prompt_cache_key" not in captured[1].get("extra_body", {})
+    assert _affinity_route_disabled("openai/kimi-k2.6", "https://relay.example/v1") is True
+    follow_up = _provider_request_options(
+        "openai/kimi-k2.6", "https://relay.example/v1", cache_session_id="affinity-downgrade"
+    )
+    assert "prompt_cache_key" not in follow_up.get("extra_body", {})

@@ -760,6 +760,79 @@ def _is_cache_control_rejection(api_err):
     return "cache_control" in text or "cache control" in text or "ephemeral" in text
 
 
+# 被上游以 400 明确拒绝过 Kimi 缓存亲和键（prompt_cache_key / metadata.user_id）
+# 的路由 -> 恢复时间戳（monotonic）。与 cache_control 降级完全同构：一次误判
+# 不该把该路由的亲和优化永久关掉，TTL 到期后自动再给一次机会。
+_affinity_disabled_routes = {}
+_affinity_disabled_lock = threading.RLock()
+
+
+def _disable_affinity_route(model_name, api_base, ttl_seconds=None):
+    """临时禁用某路由的 Kimi 缓存亲和键，返回被拉黑的路由 key。"""
+    ttl = (
+        _CACHE_CONTROL_REJECTION_TTL_SECONDS
+        if ttl_seconds is None else float(ttl_seconds)
+    )
+    key = _cache_control_route_key(model_name, api_base)
+    with _affinity_disabled_lock:
+        _affinity_disabled_routes[key] = time.monotonic() + ttl
+    return key
+
+
+def _affinity_route_disabled(model_name, api_base):
+    """该路由是否仍在亲和键拉黑期内（过期条目顺手清理）。"""
+    key = _cache_control_route_key(model_name, api_base)
+    now = time.monotonic()
+    with _affinity_disabled_lock:
+        expire_at = _affinity_disabled_routes.get(key)
+        if expire_at is None:
+            return False
+        if expire_at <= now:
+            _affinity_disabled_routes.pop(key, None)
+            return False
+        return True
+
+
+def _is_kimi_affinity_rejection(api_err):
+    """判定上游是否以 400/bad request 明确拒绝了 Kimi 缓存亲和键字段。
+
+    必须同时满足两个条件，缺一不判：
+    1. 状态码确为 400（或异常类型名为 BadRequestError）；
+    2. 错误文本点名 prompt_cache_key / user_id 这类亲和字段。
+    只按文案关键词宽泛匹配的话，一次无关故障（网络抖动、上游 5xx）就会把
+    该路由的亲和优化整体关掉。
+    """
+    if api_err is None:
+        return False
+    is_bad_request = (
+        getattr(api_err, "status_code", None) == 400
+        or type(api_err).__name__ == "BadRequestError"
+    )
+    if not is_bad_request:
+        return False
+    text = str(api_err).lower()
+    return "prompt_cache_key" in text or "user_id" in text
+
+
+def _strip_cache_affinity_options(result):
+    """剥离请求参数中的 Kimi 缓存亲和字段（400 降级重试用）。
+
+    只动 prompt_cache_key 与 metadata.user_id 两个亲和字段本身；
+    extra_body / metadata 剥离后若为空容器则整体移除，保证重试请求
+    与「从未附加亲和」的请求形状一致。
+    """
+    extra_body = result.get("extra_body")
+    if isinstance(extra_body, dict):
+        extra_body.pop("prompt_cache_key", None)
+        if not extra_body:
+            result.pop("extra_body", None)
+    metadata = result.get("metadata")
+    if isinstance(metadata, dict):
+        metadata.pop("user_id", None)
+        if not metadata:
+            result.pop("metadata", None)
+
+
 def _supports_cache_control(model_name, api_base="", model_cfg=None):
     """判断 provider 是否支持 cache_control 字段。
 
@@ -1204,12 +1277,15 @@ def _attach_kimi_request_extras(
     """给 Kimi 系模型的请求参数附加缓存亲和配置（原地修改 result）。
 
     - 缓存亲和：OpenAI 兼容路由传 prompt_cache_key，Anthropic 路由传 metadata.user_id；
-      判定只看模型家族，任意渠道都发送。
+      判定只看模型家族，任意渠道都发送（被上游 400 拒绝的路由由
+      _disable_affinity_route 临时拉黑兜底）。
     """
     anthropic_route = str(model_name or "").split("/")[0].lower() == "anthropic"
 
     session_id = None
-    if _is_kimi_family(model_name, api_base):
+    if _is_kimi_family(model_name, api_base) and not _affinity_route_disabled(
+        model_name, api_base
+    ):
         session_id = _cache_affinity_session_id(
             cache_scope=cache_scope,
             model_name=model_name,
