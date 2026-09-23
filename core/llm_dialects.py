@@ -1487,7 +1487,8 @@ def _builtin_default_max_tokens(model_name, api_base=""):
     if "seed-2.1-pro" in model or "seed-2.1-turbo" in model:
         return 131000
     if "mimo-v2.6" in model or model.startswith("mimo-v2.5"):
-        return 256000
+        # 上游网关实测上限 131072（128K），超限直接 400；与 model_spec_table 官方规格一致。
+        return 131072
     if "minimax-m2.5" in model:
         return 200000
     if "minimax-m2.7" in model:
