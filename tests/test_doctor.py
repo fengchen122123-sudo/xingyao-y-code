@@ -347,6 +347,66 @@ def test_check_model_endpoint_warns_on_unreachable(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# ⑦-补 探测请求头（X-TokenRhythm-Agent）
+# ---------------------------------------------------------------------------
+
+def _request_header(request, name):
+    """大小写不敏感读取 urllib.request.Request 的请求头。
+
+    Python 3.14 起 Request.get_header() 不再做 capitalize 规范化，
+    与 add_header 的存储键不再对称、会取不到值；测试统一走本例遍历。
+    """
+    return next(
+        (value for key, value in request.headers.items() if key.lower() == name.lower()),
+        None,
+    )
+
+
+def _capture_probe_headers(monkeypatch, url):
+    """打桩 urlopen 执行一次 _probe_endpoint，返回 (可达结果, 实际请求对象)。"""
+    import urllib.request as urllib_request
+
+    captured = {}
+
+    class _FakeResp:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc_info):
+            return False
+
+    def _fake_urlopen(request, timeout):
+        captured["request"] = request
+        return _FakeResp()
+
+    monkeypatch.setattr(urllib_request, "urlopen", _fake_urlopen)
+    ok, _detail = doctor._probe_endpoint(url, timeout=1)
+    return ok, captured["request"]
+
+
+def test_probe_endpoint_carries_tokenrhythm_agent_header_for_tokenrhythm(monkeypatch):
+    """探测基元律动端点时携带 X-TokenRhythm-Agent 客户端标识头。"""
+    from core.llm_policy import DEFAULT_USER_AGENT
+
+    ok, request = _capture_probe_headers(monkeypatch, "https://tokenrhythm.studio/v1")
+
+    assert ok is True
+    assert _request_header(request, "X-TokenRhythm-Agent") == DEFAULT_USER_AGENT
+
+
+def test_probe_endpoint_omits_tokenrhythm_agent_header_for_other_hosts(monkeypatch):
+    """探测非基元律动主机时不得携带该标识头。"""
+    ok, request = _capture_probe_headers(monkeypatch, "https://api.example.com")
+
+    assert ok is True
+    assert _request_header(request, "X-TokenRhythm-Agent") is None
+
+
+# ---------------------------------------------------------------------------
+# ⑧ GUI 运行时
+# ---------------------------------------------------------------------------
 # ⑧ GUI 运行时
 # ---------------------------------------------------------------------------
 
