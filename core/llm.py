@@ -825,6 +825,9 @@ def chat_with_model_events(
 
 # --- Re-exported from core.llm_dialects ---
 from core.llm_dialects import (
+    _affinity_disabled_lock,
+    _affinity_disabled_routes,
+    _affinity_route_disabled,
     _ANTHROPIC_REASONING_BUDGETS,
     _BUILTIN_DEFAULT_MAX_TOKENS,
     _CACHE_CONTROL_PROVIDERS,
@@ -850,12 +853,14 @@ from core.llm_dialects import (
     _configured_reasoning_choice,
     _deepseek_stable_header_matches,
     _deepseek_thinking_enabled,
+    _disable_affinity_route,
     _disable_cache_control_route,
     _flatten_media_content,
     _glm_keepalive_thinking_locked,
     _is_cache_control_rejection,
     _is_deepseek_family,
     _is_glm_family,
+    _is_kimi_affinity_rejection,
     _is_kimi_family,
     _is_official_dashscope_route,
     _is_official_deepseek_route,
@@ -880,6 +885,7 @@ from core.llm_dialects import (
     _resolve_cache_session_identity,
     _resolve_model_config,
     _select_request_tools_for_route,
+    _strip_cache_affinity_options,
     _strip_media_and_merge,
     _supports_cache_control,
     _supports_cache_keepalive,
@@ -1625,6 +1631,7 @@ def _chat_with_model_generator(
             active_deepseek_message_count = None
             active_deepseek_rotation_reason = ""
             cache_control_downgraded = False
+            affinity_downgraded = False
             wait_started_at = None
 
             for attempt in range(max_api_retries):
@@ -1904,6 +1911,24 @@ def _chat_with_model_generator(
                         warn_msg = (
                             "上游拒绝 cache_control 参数 (400)，已剥离标记并降级重试；"
                             f"该路由的显式断点在 {int(_CACHE_CONTROL_REJECTION_TTL_SECONDS // 60)} 分钟内不再启用。"
+                        )
+                        if event_callback is None:
+                            print(f"\n[⚠️ {warn_msg}]")
+                        else:
+                            _notify_event(event_callback, "status", {"message": warn_msg})
+                        if attempt < max_api_retries - 1:
+                            continue
+
+                    # 上游以 400 明确拒绝 Kimi 缓存亲和键（prompt_cache_key /
+                    # metadata.user_id）：本轮剥离亲和字段立即重发，并按路由
+                    # 临时拉黑（TTL 到期自愈），与 cache_control 降级完全同构。
+                    if not affinity_downgraded and _is_kimi_affinity_rejection(api_err):
+                        affinity_downgraded = True
+                        _disable_affinity_route(model_name, api_base)
+                        _strip_cache_affinity_options(kwargs)
+                        warn_msg = (
+                            "上游拒绝缓存亲和参数 (400)，已剥离并降级重试；"
+                            f"该路由的缓存亲和键在 {int(_CACHE_CONTROL_REJECTION_TTL_SECONDS // 60)} 分钟内不再启用。"
                         )
                         if event_callback is None:
                             print(f"\n[⚠️ {warn_msg}]")
