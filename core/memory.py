@@ -1325,6 +1325,13 @@ class MemoryManager:
             "模型或接口变化": "identity_change",
             "工具契约变化": "tool_contract_change",
             "上下文压缩或历史重写": "client_history_rewrite",
+            # 账本换代原因（core/llm_dialects._deepseek_header_rotation_reason 取值域）
+            "first_generation": "cold_start",
+            "pending_rotation": "client_history_rewrite",
+            "caller_force_new": "client_history_rewrite",
+            "header_tools_changed": "tool_contract_change",
+            "header_system_changed": "client_history_rewrite",
+            "boundary_ambiguous": "client_history_rewrite",
         }
         for row in rows:
             identity = (

@@ -71,6 +71,9 @@
       <p v-if="errorMsg" data-test="persona-error" class="persona-error">{{ errorMsg }}</p>
       <p v-else-if="savedTip" data-test="persona-saved" class="persona-saved">{{ savedTip }}</p>
       <p class="persona-note">人设内容与称呼会随名称一起注入会话提示词：填写后取代内置默认人设中的身份与性格设定（安全红线与工具规范保留），清空后自动恢复内置默认人设，不会丢失。</p>
+      <!-- 会话级稳定段落快照：人设属于注入点 2，进行中的会话已在首请求定型目录字节
+           以保住前缀缓存；因此保存的改动只对新建会话生效。 -->
+      <p class="persona-note" data-test="session-snapshot-note">已打开的会话将在新会话中生效：进行中的会话沿用其启动时的目录快照，以保证前缀缓存稳定。</p>
     </section>
   </div>
 </template>
