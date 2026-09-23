@@ -208,7 +208,9 @@
       >{{ gitBranchText }}</span>
       <span class="si status-token" data-test="status-token" data-mobile-status="hidden" :class="statusTokenClass" title="上下文 Token 占用百分比">Token {{ statusTokenPct }}%</span>
       <span class="si status-permission" data-test="status-permission" data-mobile-status="hidden">权限: <span>{{ formatPermMode(store.permissionMode) }}</span></span>
-      <span class="si status-skill" data-test="status-skill" data-mobile-status="hidden" :title="statusSkillTitle">技能: {{ statusSkillText }}</span>
+      <span class="si status-skill" data-test="status-skill" data-mobile-status="hidden" :title="statusSkillTitle">
+        <span class="skill-text">技能: {{ statusSkillText }}</span>
+      </span>
       <span
         class="si status-sandbox"
         data-test="status-sandbox"
@@ -434,9 +436,20 @@ const statusTokenClass = computed(() => {
 
 // 状态栏"技能"项：显示本回合实际用到的技能名（来自 is_skill 工具调用收集），
 // 回合结束后固化；未使用任何技能时显示"无"，让"很少触发"从感觉变成可见数字
-const statusSkillText = computed(() =>
-  store.usedSkills.length ? store.usedSkills.join('、') : '无',
-);
+// 技能较多时只显示装得下的部分并以省略号结尾（完整列表见 title），
+// 避免长串技能名把状态栏挤压换行；CSS 侧另有单行省略号兜底
+const STATUS_SKILL_CHAR_BUDGET = 48;
+const statusSkillText = computed(() => {
+  const list = store.usedSkills;
+  if (!list.length) return '无';
+  let text = '';
+  for (const name of list) {
+    const next = text ? `${text}、${name}` : name;
+    if (text && next.length > STATUS_SKILL_CHAR_BUDGET) return text + '…';
+    text = next;
+  }
+  return text;
+});
 const statusSkillTitle = computed(() =>
   store.usedSkills.length
     ? '本回合使用的技能：' + store.usedSkills.join('、')
@@ -1349,6 +1362,19 @@ onUnmounted(() => {
   display: flex;
   align-items: center;
   gap: 5px;
+}
+/* 技能项：空间不足时优先收缩让位，不挤压其它状态项；强制单行，
+   超宽用省略号截断（完整技能列表在 title 中查看） */
+#statusbar .status-skill {
+  min-width: 0;
+  flex-shrink: 100;
+}
+#statusbar .status-skill .skill-text {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #statusbar .si-warn {
   color: var(--orange);
