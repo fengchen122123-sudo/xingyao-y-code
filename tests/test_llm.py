@@ -115,6 +115,24 @@ def _patch_model_cfg(monkeypatch, cfg):
     )
 
 
+def _without_cache_extras(result):
+    """剥离缓存附加项（Qwen 会话缓存头 / Kimi 亲和键）。
+
+    思考档位契约测试只校验推理参数编码；缓存附加项由家族判定测试
+    （test_cache_family_routing.py）与 qwen/kimi 专项用例覆盖。
+    """
+    cleaned = dict(result)
+    cleaned.pop("extra_headers", None)
+    extra_body = cleaned.get("extra_body")
+    if isinstance(extra_body, dict):
+        cleaned["extra_body"] = {
+            key: value
+            for key, value in extra_body.items()
+            if key != "prompt_cache_key"
+        }
+    return cleaned
+
+
 def test_kimi_openai_route_sends_prompt_cache_key(monkeypatch):
     """OpenAI 兼容路由携带会话级稳定且不暴露原会话名的缓存键。"""
     from core.llm import _provider_request_options
@@ -309,7 +327,7 @@ def test_model_reasoning_choice_uses_its_exact_request_contract(
 
     result = _provider_request_options(model_name, "https://gateway.example/v1")
 
-    assert result == expected
+    assert _without_cache_extras(result) == expected
 
 
 @pytest.mark.parametrize(
@@ -349,7 +367,7 @@ def test_new_reasoning_choice_owns_the_request_contract_over_legacy_fields(
 
     if result.get("max_tokens") is None:
         result.pop("max_tokens", None)
-    assert result == expected
+    assert _without_cache_extras(result) == expected
 
 
 @pytest.mark.parametrize(
@@ -380,7 +398,8 @@ def test_registered_models_migrate_legacy_reasoning_without_double_encoding(
 
     _patch_model_cfg(monkeypatch, model_cfg)
 
-    assert _provider_request_options(model_name, "https://gateway.example/v1") == expected
+    result = _provider_request_options(model_name, "https://gateway.example/v1")
+    assert _without_cache_extras(result) == expected
 
 
 def test_provider_options_use_exact_model_id_when_routes_are_duplicated(monkeypatch):
@@ -412,9 +431,10 @@ def test_default_reasoning_choice_adds_no_user_override(monkeypatch):
 
     _patch_model_cfg(monkeypatch, {"reasoning_choice": "default"})
 
-    assert _provider_request_options(
+    result = _provider_request_options(
         "openai/qwen3.8-max", "https://gateway.example/v1"
-    ) == {"max_tokens": 131000}
+    )
+    assert _without_cache_extras(result) == {"max_tokens": 131000}
 
 
 def test_effort_without_enabled_thinking_fails_before_transport():

@@ -273,27 +273,21 @@ def _resolve_model_config(model_name, api_base="", model_cfg=None):
 
 
 def _qwen_cache_enabled(model_name, api_base="", model_cfg=None):
-    """判断当前 Qwen 模型路由是否开启了缓存加速（官方百炼或配置显式开启）。"""
-    if not _is_qwen_family(model_name, api_base):
-        return False
-    if _is_official_dashscope_route(api_base):
-        return True
-    cfg = _resolve_model_config(model_name, api_base, model_cfg)
-    return bool(cfg.get("enable_prompt_cache") or cfg.get("prompt_cache"))
+    """判断当前 Qwen 模型路由是否开启缓存加速：只看模型家族，不看渠道。
+
+    （model_cfg 参数仅为调用方签名兼容保留；enable_prompt_cache /
+    prompt_cache 配置键仍被解析但不再是必要条件。）
+    """
+    return _is_qwen_family(model_name, api_base)
 
 
 def _qwen_cache_control_configured(model_name, api_base="", model_cfg=None):
-    """Qwen 路由是否启用了显式 cache_control 断点（官方百炼或配置显式开启）。
+    """Qwen 路由是否启用显式 cache_control 断点：只看模型家族，不看渠道。
 
     不含运行期 400 黑名单降级：黑名单只关掉标记本身，tools 规范化等请求
     形状稳定措施不随 TTL 黑名单来回翻转（形状抖动比标记更伤缓存前缀）。
     """
-    if not _is_qwen_family(model_name, api_base):
-        return False
-    if _is_official_dashscope_route(api_base):
-        return True
-    cfg = _resolve_model_config(model_name, api_base, model_cfg)
-    return bool(cfg.get("enable_cache_control") or cfg.get("cache_control"))
+    return _is_qwen_family(model_name, api_base)
 
 
 def _normalize_route_match_key(api_base):
@@ -713,8 +707,7 @@ def _requires_tool_call_reasoning(model_name, api_base=""):
 
 # 需要显式 cache_control 标记才启用 prompt caching 的 provider 白名单（按 provider 前缀）：
 #   - anthropic: 必须显式标记，命中后缓存 token 按 1/10 计费
-# Qwen 不在此白名单里，但走官方百炼路由或 config.json 显式声明
-# enable_cache_control / cache_control 时同样启用（见 _supports_cache_control）；
+# Qwen 不在此白名单里，但 Qwen 家族任意渠道默认启用（见 _supports_cache_control）；
 # 其余 OpenAI 兼容网关默认不标记——隐式缓存本就命中，而显式标记可能被严格校验的
 # 网关拒绝为 400（真被拒绝时由 _disable_cache_control_route 临时降级兜底）。
 _CACHE_CONTROL_PROVIDERS = ("anthropic",)
@@ -783,7 +776,7 @@ def _supports_cache_control(model_name, api_base="", model_cfg=None):
 
     保守策略：
     - Anthropic：始终支持
-    - Qwen 家族：官方百炼路由默认启用；第三方网关若配置了 enable_cache_control / cache_control 则启用
+    - Qwen 家族：任意渠道默认启用（家族判定，不再依赖渠道或配置）
     - 若先前已被上游 400 拒绝，降级一段时间（TTL 到期后自动恢复）
     """
     if _cache_control_route_disabled(model_name, api_base):
