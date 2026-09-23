@@ -247,10 +247,12 @@ class _FakeClient:
         self._response = response
         self.last_payload = None
         self.last_url = None
+        self.last_headers = None
 
     def build_request(self, method, url, headers=None, json=None, timeout=None):
         self.last_payload = json
         self.last_url = url
+        self.last_headers = headers or {}
         self.last_timeout = timeout
         return object()
 
@@ -391,3 +393,68 @@ def test_fast_token_counter_counts_tool_call_arguments():
     }])
     without = fast_token_counter("m", [{"role": "assistant", "content": ""}])
     assert with_args > without + 100
+
+
+# ---------------------------------------------------------------------------
+# 基元律动（tokenrhythm.studio）客户端标识头：X-TokenRhythm-Agent
+# ---------------------------------------------------------------------------
+
+def test_openai_route_adds_tokenrhythm_agent_header():
+    """OpenAI 兼容路由打到基元律动端点时，请求头必须补 X-TokenRhythm-Agent，
+    且值与 User-Agent 同源（服务端据此识别客户端来源）。"""
+    policy = get_model_policy("deepseek-chat", api_base="https://tokenrhythm.studio/v1")
+    url, headers, _ = nt._resolve_endpoint_and_headers(
+        model="deepseek-chat",
+        api_key="k",
+        api_base="https://tokenrhythm.studio/v1",
+        policy=policy,
+    )
+
+    assert url == "https://tokenrhythm.studio/v1/chat/completions"
+    assert headers["X-TokenRhythm-Agent"] == headers["User-Agent"]
+
+
+def test_anthropic_route_adds_tokenrhythm_agent_header():
+    """Anthropic Messages 路由打到基元律动端点时同样补该标识头。"""
+    _url, headers = nt._anthropic_resolve_endpoint(
+        api_base="https://tokenrhythm.studio",
+        api_key="k",
+        extra_headers=None,
+    )
+
+    assert headers["X-TokenRhythm-Agent"] == headers["User-Agent"]
+
+
+def test_non_tokenrhythm_bases_omit_tokenrhythm_agent_header():
+    """非基元律动端点（OpenAI 兼容与 Anthropic 两条路由）不得携带该头。"""
+    policy = get_model_policy("deepseek-chat")
+    _url, headers, _ = nt._resolve_endpoint_and_headers(
+        model="deepseek-chat",
+        api_key="k",
+        api_base="https://api.deepseek.com/v1",
+        policy=policy,
+    )
+    assert "X-TokenRhythm-Agent" not in headers
+
+    _a_url, anthropic_headers = nt._anthropic_resolve_endpoint(
+        api_base="https://api.anthropic.com",
+        api_key="k",
+        extra_headers=None,
+    )
+    assert "X-TokenRhythm-Agent" not in anthropic_headers
+
+
+def test_native_completion_sends_tokenrhythm_agent_header(monkeypatch):
+    """端到端：经基元律动 API 基址的完整请求，实际发出的请求头包含该标识。"""
+    client = _FakeClient(_FakeHttpResponse(payload=_SYNC_PAYLOAD))
+    monkeypatch.setattr(nt, "_client_instance", client)
+
+    nt.native_completion(
+        model="openai/deepseek-chat",
+        api_key="k",
+        api_base="https://tokenrhythm.studio/v1",
+        messages=[{"role": "user", "content": "hi"}],
+    )
+
+    assert client.last_url == "https://tokenrhythm.studio/v1/chat/completions"
+    assert client.last_headers["X-TokenRhythm-Agent"] == client.last_headers["User-Agent"]

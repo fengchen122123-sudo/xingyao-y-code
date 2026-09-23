@@ -16,7 +16,12 @@ from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 import httpx
 
-from core.llm_policy import ModelPolicy, get_model_policy, DEFAULT_USER_AGENT
+from core.llm_policy import (
+    ModelPolicy,
+    get_model_policy,
+    DEFAULT_USER_AGENT,
+    tokenrhythm_agent_headers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -571,8 +576,9 @@ def _resolve_endpoint_and_headers(
     if effective_key:
         headers["Authorization"] = f"Bearer {effective_key}"
 
-    # 合并方言默认头与外部追加头
+    # 合并方言默认头、基元律动标识头与外部追加头
     headers.update(policy.default_headers)
+    headers.update(tokenrhythm_agent_headers(url))
     if extra_headers:
         headers.update(extra_headers)
 
@@ -879,6 +885,7 @@ def _anthropic_resolve_endpoint(
     effective_key = api_key or os.environ.get("ANTHROPIC_API_KEY")
     if effective_key:
         headers["x-api-key"] = effective_key
+    headers.update(tokenrhythm_agent_headers(url))
     if extra_headers:
         headers.update(extra_headers)
     return url, headers

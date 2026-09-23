@@ -12,6 +12,21 @@ from typing import Optional, Dict, Any
 # 统计中按客户端归类（不设时 httpx 会填 python-httpx/x.x，导致被识别为 python）。
 DEFAULT_USER_AGENT = "XingYaoCode/1.3.2"
 
+# 基元律动（TokenRhythm）专用：向 tokenrhythm.studio 发起的请求统一补
+# X-TokenRhythm-Agent 头（值同默认 User-Agent），便于服务端识别客户端来源。
+TOKENRHYTHM_DOMAIN = "tokenrhythm.studio"
+TOKENRHYTHM_AGENT_HEADER = "X-TokenRhythm-Agent"
+
+
+def tokenrhythm_agent_headers(url: Optional[str] = None) -> Dict[str, str]:
+    """目标地址属于基元律动（tokenrhythm.studio）时返回 X-TokenRhythm-Agent 头。
+
+    非基元律动地址返回空 dict，调用方统一用 headers.update(...) 合并。
+    """
+    if TOKENRHYTHM_DOMAIN in str(url or "").lower():
+        return {TOKENRHYTHM_AGENT_HEADER: DEFAULT_USER_AGENT}
+    return {}
+
 
 @dataclass(frozen=True)
 class ModelPolicy:

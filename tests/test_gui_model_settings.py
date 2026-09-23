@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import config
 import core.model_manager as model_manager
 import core.llm as llm
+from core.llm_policy import DEFAULT_USER_AGENT
 from gui_bridge import ApiBridge
 
 
@@ -497,6 +498,60 @@ def test_fetch_provider_models_handles_v1_base_url(tmp_path, monkeypatch):
 
     assert result["ok"] is True
     assert captured["url"] == "https://api.example.com/v1/models"
+
+
+def test_fetch_provider_models_adds_tokenrhythm_agent_header(tmp_path, monkeypatch):
+    """基元律动厂商：拉取模型列表的请求必须携带 X-TokenRhythm-Agent 客户端标识。"""
+    import httpx
+
+    data = _configured_data()
+    data["providers"][0]["base_url"] = "https://tokenrhythm.studio/v1"
+    _use_tmp_config(tmp_path, monkeypatch, data)
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "alpha"}]}
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["headers"] = headers
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    assert captured["headers"]["X-TokenRhythm-Agent"] == DEFAULT_USER_AGENT
+
+
+def test_fetch_provider_models_omits_tokenrhythm_agent_header_for_other_providers(
+    tmp_path, monkeypatch
+):
+    """非基元律动厂商：拉取模型列表不得携带该标识头。"""
+    import httpx
+
+    _use_tmp_config(tmp_path, monkeypatch, _configured_data())
+    captured = {}
+
+    class _FakeResponse:
+        status_code = 200
+
+        def json(self):
+            return {"data": [{"id": "alpha"}]}
+
+    def _fake_get(url, headers=None, timeout=None):
+        captured["headers"] = headers
+        return _FakeResponse()
+
+    monkeypatch.setattr(httpx, "get", _fake_get)
+
+    result = _bare_bridge().fetch_provider_models("p1")
+
+    assert result["ok"] is True
+    assert "X-TokenRhythm-Agent" not in captured["headers"]
 
 
 def test_fetch_provider_models_extracts_context_and_vision(tmp_path, monkeypatch):

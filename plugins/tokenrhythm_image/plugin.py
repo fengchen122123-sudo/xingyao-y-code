@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 import uuid
 
+from core.llm_policy import tokenrhythm_agent_headers
 from core.tool_protocol import ToolResult, ToolSpec
 
 _API_BASE = "https://tokenrhythm.studio/v1"
@@ -271,6 +272,7 @@ def generate_image(
         headers={
             "Content-Type": "application/json",
             "Authorization": "Bearer " + api_key,
+            **tokenrhythm_agent_headers(_GENERATE_URL),
         },
         method="POST",
     )
@@ -379,6 +381,7 @@ def edit_image(
         headers={
             "Content-Type": "multipart/form-data; boundary=%s" % boundary,
             "Authorization": "Bearer " + api_key,
+            **tokenrhythm_agent_headers(_EDITS_URL),
         },
         method="POST",
     )
