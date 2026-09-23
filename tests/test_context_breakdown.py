@@ -11,6 +11,7 @@
 - 清空历史 / 重算 token 用量时快照同步清理（与 token 记账同生命周期）。
 """
 
+import json
 import threading
 
 import core.context_breakdown as cb
@@ -28,7 +29,8 @@ def test_set_and_get_roundtrip_in_stable_source_order():
     cb.clear_breakdown()
     try:
         cb.set_breakdown([
-            {"source": "tools", "chars": 40},
+            {"source": "mcp_tools", "chars": 45},
+            {"source": "system_tools", "chars": 40},
             {"source": "messages", "chars": 10},
             {"source": "skills", "chars": 30},
             {"source": "system_prompt", "chars": 20},
@@ -39,7 +41,8 @@ def test_set_and_get_roundtrip_in_stable_source_order():
             {"source": "system_prompt", "chars": 20},
             {"source": "skills", "chars": 30},
             {"source": "runtime_context", "chars": 50},
-            {"source": "tools", "chars": 40},
+            {"source": "system_tools", "chars": 40},
+            {"source": "mcp_tools", "chars": 45},
         ]
     finally:
         cb.clear_breakdown()
@@ -51,7 +54,7 @@ def test_get_breakdown_returns_independent_copy():
     try:
         cb.set_breakdown([{"source": "messages", "chars": 10}])
         first = cb.get_breakdown()
-        first.append({"source": "tools", "chars": 99})
+        first.append({"source": "system_tools", "chars": 99})
         first[0]["chars"] = 999
         assert cb.get_breakdown() == [{"source": "messages", "chars": 10}]
     finally:
@@ -64,15 +67,15 @@ def test_update_source_appends_then_overwrites():
     try:
         cb.update_source("messages", 100)
         assert cb.get_breakdown() == [{"source": "messages", "chars": 100}]
-        cb.update_source("tools", 7)
+        cb.update_source("system_tools", 7)
         assert cb.get_breakdown() == [
             {"source": "messages", "chars": 100},
-            {"source": "tools", "chars": 7},
+            {"source": "system_tools", "chars": 7},
         ]
         cb.update_source("messages", 250)
         assert cb.get_breakdown() == [
             {"source": "messages", "chars": 250},
-            {"source": "tools", "chars": 7},
+            {"source": "system_tools", "chars": 7},
         ]
     finally:
         cb.clear_breakdown()
@@ -97,6 +100,10 @@ def test_invalid_sources_are_filtered_without_raising():
         cb.update_source(None, 10)
         cb.update_source("messages", 5)
         assert cb.get_breakdown() == [{"source": "messages", "chars": 5}]
+
+        # 2026-09-23 对齐 ZCode：旧来源 "tools" 已移出白名单，更新被静默过滤
+        cb.update_source("tools", 10)
+        assert cb.get_breakdown() == [{"source": "messages", "chars": 5}]
     finally:
         cb.clear_breakdown()
 
@@ -108,7 +115,7 @@ def test_invalid_chars_are_filtered_without_raising():
         cb.set_breakdown([
             {"source": "messages", "chars": -1},           # 负数过滤
             {"source": "skills", "chars": "abc"},          # 非数字过滤
-            {"source": "tools", "chars": None},            # None 过滤
+            {"source": "system_tools", "chars": None},     # None 过滤
             {"source": "system_prompt"},                   # 缺 chars 过滤
             {"source": "runtime_context", "chars": 3.9},   # 浮点整数化（截断）
             {"source": "messages", "chars": "12"},         # 数字字符串整数化
@@ -118,8 +125,8 @@ def test_invalid_chars_are_filtered_without_raising():
             {"source": "runtime_context", "chars": 3},
         ]
 
-        cb.update_source("tools", -5)
-        cb.update_source("tools", "xyz")
+        cb.update_source("system_tools", -5)
+        cb.update_source("system_tools", "xyz")
         assert cb.get_breakdown() == [
             {"source": "messages", "chars": 12},
             {"source": "runtime_context", "chars": 3},
@@ -164,7 +171,7 @@ def test_concurrent_updates_smoke():
         try:
             for i in range(300):
                 cb.update_source("messages", i)
-                cb.update_source("tools", i * 2)
+                cb.update_source("system_tools", i * 2)
                 cb.get_breakdown()
         except Exception as exc:  # pragma: no cover - 仅在回归时触发
             errors.append(exc)
@@ -178,8 +185,63 @@ def test_concurrent_updates_smoke():
     try:
         assert errors == []
         snapshot = cb.get_breakdown()
-        assert [item["source"] for item in snapshot] == ["messages", "tools"]
+        assert [item["source"] for item in snapshot] == ["messages", "system_tools"]
         assert all(isinstance(item["chars"], int) for item in snapshot)
+    finally:
+        cb.clear_breakdown()
+
+
+# ---------------------------------------------------------------------------
+# llm._snapshot_tool_breakdown：工具来源拆分系统工具 / MCP 工具
+# ---------------------------------------------------------------------------
+
+def test_tool_breakdown_splits_system_and_mcp(monkeypatch):
+    """工具字符量按 MCP 名集拆为 system_tools / mcp_tools 两组。"""
+    class _FakeMCP:
+        def get_schemas(self):
+            return [{"function": {"name": "firecrawl__scrape_url"}}]
+    monkeypatch.setattr(llm, "_get_mcp_manager", lambda: _FakeMCP())
+    cb.clear_breakdown()
+    try:
+        llm._snapshot_tool_breakdown([
+            {"function": {"name": "read_file"}},
+            {"function": {"name": "firecrawl__scrape_url"}},
+        ])
+        snapshot = {item["source"]: item["chars"] for item in cb.get_breakdown()}
+        assert snapshot["system_tools"] == len(
+            json.dumps([{"function": {"name": "read_file"}}], ensure_ascii=False)
+        )
+        assert snapshot["mcp_tools"] == len(
+            json.dumps([{"function": {"name": "firecrawl__scrape_url"}}], ensure_ascii=False)
+        )
+    finally:
+        cb.clear_breakdown()
+
+
+def test_tool_breakdown_empty_group_writes_zero(monkeypatch):
+    """无 MCP 工具时空组写 0（而非 '[]' 的 2），前端不会渲染 0 行。"""
+    class _FakeMCP:
+        def get_schemas(self):
+            return []
+    monkeypatch.setattr(llm, "_get_mcp_manager", lambda: _FakeMCP())
+    cb.clear_breakdown()
+    try:
+        llm._snapshot_tool_breakdown([{"function": {"name": "read_file"}}])
+        snapshot = {item["source"]: item["chars"] for item in cb.get_breakdown()}
+        assert snapshot["mcp_tools"] == 0
+        assert snapshot["system_tools"] > 0
+    finally:
+        cb.clear_breakdown()
+
+
+def test_tool_breakdown_failure_is_silent(monkeypatch):
+    """统计异常被吞掉绝不抛出（旁路铁律）。"""
+    def _boom():
+        raise RuntimeError("mcp manager exploded")
+    monkeypatch.setattr(llm, "_get_mcp_manager", _boom)
+    cb.clear_breakdown()
+    try:
+        llm._snapshot_tool_breakdown([{"function": {"name": "read_file"}}])  # 不得抛异常
     finally:
         cb.clear_breakdown()
 

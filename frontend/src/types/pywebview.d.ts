@@ -436,7 +436,8 @@ export type ContextBreakdownSource =
   | 'system_prompt'
   | 'skills'
   | 'runtime_context'
-  | 'tools';
+  | 'system_tools'
+  | 'mcp_tools';
 
 export interface ContextBreakdownItem {
   source: ContextBreakdownSource;
