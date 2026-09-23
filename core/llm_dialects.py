@@ -444,13 +444,12 @@ def _glm_keepalive_thinking_locked(model_name):
 def is_deepseek_ledger_route(model_name, api_base):
     """DeepSeek 家族缓存优化路由判定：主会话不可变 Prompt Ledger 的核心条件。
 
-    官方端点（api.deepseek.com）之外，config.json 顶层 deepseek_cache_routes
-    显式声明的网关（按域名归一化匹配）同样放行——不改变任何官方路由判定，
-    仅新增显式通道。供 agent_service 的水位线基线与主动轮换判定复用
-    （账本启用还需 persist / parent_session / cache_scope=main 等会话层条件，
-    见 _uses_deepseek_prompt_ledger）。
+    只看模型家族，不看渠道：任意网关（tokenrhythm、阿里云 token-plan、
+    其它中转）上的 deepseek 模型一律放行。供 agent_service 的水位线基线与
+    主动轮换判定复用（账本启用还需 persist / parent_session / cache_scope=main
+    等会话层条件，见 _uses_deepseek_prompt_ledger）。
     """
-    return _is_deepseek_family(model_name, api_base) and _is_cache_optimized_deepseek_route(api_base)
+    return _is_deepseek_family(model_name, api_base)
 
 
 def _uses_deepseek_prompt_ledger(

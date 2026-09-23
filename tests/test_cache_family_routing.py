@@ -70,3 +70,23 @@ def test_qwen_cache_extras_enabled_across_channels():
         ), api_base
         sorted_tools = _select_request_tools_for_route(model, api_base, tools)
         assert [t["function"]["name"] for t in sorted_tools] == ["alpha", "zeta"]
+
+
+# ---------------------------------------------------------------------------
+# deepseek：账本判定，任意渠道自动放行；非本族不误放
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("api_base", ["https://api.deepseek.com", *_OTHER_CHANNELS])
+def test_deepseek_ledger_route_covers_all_channels(api_base):
+    from core.llm import is_deepseek_ledger_route
+
+    assert is_deepseek_ledger_route("openai/deepseek-v4.1-flash", api_base) is True
+
+
+def test_deepseek_ledger_route_not_released_for_other_families():
+    from core.llm import is_deepseek_ledger_route
+
+    assert is_deepseek_ledger_route("openai/kimi-for-coding", "https://tokenrhythm.studio/v1") is False
+    assert is_deepseek_ledger_route("openai/qwen3.8-flash", "https://relay.example/v1") is False
+    assert is_deepseek_ledger_route("openai/glm-5.3", "https://relay.example/v1") is False
