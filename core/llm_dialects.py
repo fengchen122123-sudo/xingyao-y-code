@@ -657,22 +657,16 @@ def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
 
 
 def _supports_cache_keepalive(model_name, api_base="", model_cfg=None):
-    """保活仅适用于已明确验证自动 prompt caching 的 DeepSeek/Kimi/智谱/百炼官方路由（或 Qwen 显式配置开启缓存）。
+    """保活适用于四族模型（DeepSeek/Kimi/智谱/Qwen）的任意渠道路由。
 
-    官方判定之外，config.json 顶层 cache_keepalive_routes 显式声明的网关路由
-    （按域名归一化匹配）同样放行——不改变任何官方路由判定，仅新增显式通道。
+    家族判定之外，config.json 顶层 cache_keepalive_routes 显式声明的网关路由
+    （按域名归一化匹配）继续为「非四族模型」提供显式保活通道。
     """
     return (
         _is_kimi_family(model_name, api_base)
-        and _is_official_kimi_route(api_base)
-    ) or (
-        _is_deepseek_family(model_name, api_base)
-        and _is_official_deepseek_route(api_base)
-    ) or (
-        _is_glm_family(model_name, api_base)
-        and _is_official_zhipu_route(api_base)
-    ) or (
-        _qwen_cache_enabled(model_name, api_base, model_cfg)
+        or _is_deepseek_family(model_name, api_base)
+        or _is_glm_family(model_name, api_base)
+        or _is_qwen_family(model_name, api_base)
         or _keepalive_route_explicitly_enabled(api_base)
     )
 

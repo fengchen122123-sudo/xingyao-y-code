@@ -125,7 +125,8 @@ def test_keepalive_request_reuses_prefix_but_limits_output():
     assert "stream_options" not in keepalive
 
 
-def test_deepseek_keepalive_is_limited_to_official_routes():
+def test_deepseek_keepalive_covers_third_party_routes():
+    """DeepSeek 家族任意渠道放行保活：官方与第三方中转一致。"""
     from core.llm import _supports_cache_keepalive
 
     assert _supports_cache_keepalive(
@@ -133,13 +134,13 @@ def test_deepseek_keepalive_is_limited_to_official_routes():
     ) is True
     assert _supports_cache_keepalive(
         "openai/deepseek-v4-pro", "https://aggregator.example/v1"
-    ) is False
+    ) is True
 
 
-def test_kimi_keepalive_is_limited_to_official_routes(monkeypatch):
+def test_kimi_keepalive_covers_third_party_routes(monkeypatch):
+    """Kimi 家族任意渠道放行保活：官方与第三方中转一致。"""
     from core.llm import _supports_cache_keepalive
 
-    # 无 cache_keepalive_routes 显式配置时，第三方中转站路由器不保活
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
 
     assert _supports_cache_keepalive(
@@ -147,11 +148,11 @@ def test_kimi_keepalive_is_limited_to_official_routes(monkeypatch):
     ) is True
     assert _supports_cache_keepalive(
         "openai/kimi-k2.6", "https://tokenrhythm.studio/v1"
-    ) is False
+    ) is True
 
 
 def test_keepalive_routes_config_enables_explicit_gateway_routes(monkeypatch):
-    """顶层 cache_keepalive_routes 显式声明后，该域名的第三方路由启用保活。"""
+    """顶层 cache_keepalive_routes 对非四族模型的显式通道：声明后该域名放行。"""
     from core.llm import _supports_cache_keepalive
 
     monkeypatch.setattr(
@@ -161,18 +162,18 @@ def test_keepalive_routes_config_enables_explicit_gateway_routes(monkeypatch):
 
     # 裸域名条目命中带路径的 api_base（/v1 后缀不影响域名归一化）
     assert _supports_cache_keepalive(
-        "openai/deepseek-flash", "https://tokenrhythm.studio/v1"
+        "openai/some-model", "https://tokenrhythm.studio/v1"
     ) is True
     # 无路径、大小写与端口变体同样命中
     assert _supports_cache_keepalive(
-        "openai/deepseek-flash", "https://TokenRhythm.Studio"
+        "openai/some-model", "https://TokenRhythm.Studio"
     ) is True
     assert _supports_cache_keepalive(
-        "openai/deepseek-flash", "https://tokenrhythm.studio:8443/v1"
+        "openai/some-model", "https://tokenrhythm.studio:8443/v1"
     ) is True
     # 未在配置中声明的其他网关路由不受影响
     assert _supports_cache_keepalive(
-        "openai/deepseek-flash", "https://aggregator.example/v1"
+        "openai/some-model", "https://aggregator.example/v1"
     ) is False
 
     # 条目写成完整 URL（带路径）走同一归一化，同样命中
@@ -181,7 +182,7 @@ def test_keepalive_routes_config_enables_explicit_gateway_routes(monkeypatch):
         lambda: {"cache_keepalive_routes": ["https://tokenrhythm.studio/v1"]},
     )
     assert _supports_cache_keepalive(
-        "openai/deepseek-flash", "https://tokenrhythm.studio/v1"
+        "openai/some-model", "https://tokenrhythm.studio/v1"
     ) is True
 
 
@@ -250,7 +251,8 @@ def test_keepalive_response_without_usage_fails_loudly():
         account_keepalive_response(SimpleNamespace(), {})
 
 
-def test_zhipu_keepalive_is_limited_to_official_routes():
+def test_zhipu_keepalive_covers_third_party_routes():
+    """GLM 家族任意渠道放行保活：官方端点、未知路径与第三方中转一视同仁。"""
     from core.llm import _supports_cache_keepalive
 
     assert _supports_cache_keepalive(
@@ -266,20 +268,19 @@ def test_zhipu_keepalive_is_limited_to_official_routes():
     assert _supports_cache_keepalive(
         "anthropic/glm-5.3-flash", "https://open.bigmodel.cn/api/anthropic"
     ) is True
-    # 官方域名下的未知路径不放行
+    # 家族判定不看 URL 形状：官方域名未知路径、第三方中转的 GLM 模型一律放行
     assert _supports_cache_keepalive(
         "openai/glm-5.3", "https://open.bigmodel.cn/api/unknown"
-    ) is False
-    # 第三方中转的 GLM 模型不放行
+    ) is True
     assert _supports_cache_keepalive(
         "openai/glm-5.3", "https://tokenrhythm.studio/v1"
-    ) is False
+    ) is True
     assert _supports_cache_keepalive(
         "openai/zai-org/GLM-5.2", "https://api.siliconflow.cn/v1"
-    ) is False
+    ) is True
     assert _supports_cache_keepalive(
         "anthropic/glm-5.2", "https://ark.cn-beijing.volces.com/api/coding"
-    ) is False
+    ) is True
 
 
 def test_glm_forced_thinking_keepalive_preserves_thinking_and_raises_output():
