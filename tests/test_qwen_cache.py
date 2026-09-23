@@ -94,13 +94,13 @@ def test_qwen_tools_canonicalization():
     )
     assert [t["function"]["name"] for t in sorted_tools] == ["alpha_tool", "zeta_tool"]
 
-    # 非官方路由（第三方中转）：工具保持原样，不干扰
-    preserved_tools = _select_request_tools_for_route(
+    # 第三方路由（任意中转）：同样排序（判定只看模型家族）
+    sorted_gateway_tools = _select_request_tools_for_route(
         "openai/qwen3.8-max",
         "https://gateway.example/v1",
         tools,
     )
-    assert [t["function"]["name"] for t in preserved_tools] == ["zeta_tool", "alpha_tool"]
+    assert [t["function"]["name"] for t in sorted_gateway_tools] == ["alpha_tool", "zeta_tool"]
 
 
 def test_qwen_session_cache_header_injection(monkeypatch):
@@ -126,13 +126,13 @@ def test_qwen_session_cache_header_injection(monkeypatch):
     )
     assert "x-dashscope-session-cache" not in opts_bg.get("extra_headers", {})
 
-    # 第三方网关不注入私有 header
+    # 第三方网关同样注入（判定只看模型家族）
     opts_gateway = _provider_request_options(
         "openai/qwen3.8-max",
         gateway_base,
         cache_scope="main",
     )
-    assert "extra_headers" not in opts_gateway
+    assert opts_gateway.get("extra_headers", {}).get("x-dashscope-session-cache") == "enable"
 
     # 亲和参数提取测试
     affinity_official = _provider_cache_affinity_options(
@@ -143,12 +143,12 @@ def test_qwen_session_cache_header_injection(monkeypatch):
     assert affinity_official.get("extra_headers", {}).get("x-dashscope-session-cache") == "enable"
 
 
-def test_qwen_dashscope_explicit_cache_control():
+def test_qwen_cache_control_enabled_across_channels():
     official_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     gateway_base = "https://gateway.example/v1"
 
     assert _supports_cache_control("openai/qwen3.8-max", official_base)
-    assert not _supports_cache_control("openai/qwen3.8-max", gateway_base)
+    assert _supports_cache_control("openai/qwen3.8-max", gateway_base)
 
     messages = [
         {"role": "system", "content": "stable system prompt"},
@@ -168,19 +168,19 @@ def test_qwen_dashscope_explicit_cache_control():
     assert marked[2]["content"][0]["cache_control"] == {"type": "ephemeral"}
     assert marked[2]["content"][0]["text"] == "round 1 answer"
 
-    # 第三方网关：保持原样不打 cache_control
-    unmarked = _apply_cache_control(deepcopy(messages), "openai/qwen3.8-max", gateway_base)
-    assert unmarked[0]["content"] == "stable system prompt"
-    assert "cache_control" not in unmarked[0]
+    # 第三方网关同样打 cache_control 断点
+    marked_gateway = _apply_cache_control(deepcopy(messages), "openai/qwen3.8-max", gateway_base)
+    assert isinstance(marked_gateway[0]["content"], list)
+    assert marked_gateway[0]["content"][0]["cache_control"] == {"type": "ephemeral"}
 
 
 def test_qwen_keepalive_support_and_request_building():
     official_base = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     gateway_base = "https://gateway.example/v1"
 
-    # 仅百炼官方路由放行保活
+    # 家族判定：官方与第三方路由都放行保活
     assert _supports_cache_keepalive("openai/qwen3.8-max", official_base)
-    assert not _supports_cache_keepalive("openai/qwen3.8-max", gateway_base)
+    assert _supports_cache_keepalive("openai/qwen3.8-max", gateway_base)
 
     original_req = {
         "model": "openai/qwen3.8-max",
@@ -304,12 +304,12 @@ def test_request_envelope_lane_sha_distinguishes_qwen_lanes():
     assert _cache_lane_sha256({"model": "openai/qwen3.8-max"}) == ""
 
 
-def test_qwen_config_driven_cache_enablement(monkeypatch):
-    """验证通过 config.json 或 model_cfg 显式配置开启 Qwen 第三方网关（如 TokenRhythm）缓存。"""
+def test_qwen_cache_enabled_regardless_of_config(monkeypatch):
+    """Qwen 家族任意渠道默认全开；配置键保留兼容，存在与否都不影响判定。"""
     gateway_base = "https://tokenrhythm.studio/v1"
     model = "openai/qwen3.8-flash"
 
-    # 1. 模拟未配置 prompt_cache 时：默认不启用缓存增强
+    # 1. 未配置任何缓存键：家族判定下默认全开
     monkeypatch.setattr("core.model_manager.load_config", lambda: {
         "providers": [{
             "name": "TokenRhythm",
@@ -318,9 +318,12 @@ def test_qwen_config_driven_cache_enablement(monkeypatch):
         }]
     })
     from core.llm import _qwen_cache_enabled, _supports_cache_keepalive, _supports_cache_control
-    assert not _qwen_cache_enabled(model, gateway_base)
-    assert not _supports_cache_keepalive(model, gateway_base)
-    assert not _supports_cache_control(model, gateway_base)
+    assert _qwen_cache_enabled(model, gateway_base)
+    assert _supports_cache_keepalive(model, gateway_base)
+    assert _supports_cache_control(model, gateway_base)
+    # session-cache header 同样注入
+    opts = _provider_request_options(model, gateway_base, cache_scope="main")
+    assert opts.get("extra_headers", {}).get("x-dashscope-session-cache") == "enable"
 
     # 2. 模拟在 provider 级别开启 enable_prompt_cache
     monkeypatch.setattr("core.model_manager.load_config", lambda: {
@@ -427,12 +430,11 @@ def test_qwen_tools_canonicalization_includes_computer_tool():
     assert [t["function"]["name"] for t in sorted_tools] == ["alpha_tool", "computer", "zeta_tool"]
 
 
-def test_qwen_tools_canonicalized_when_only_cache_control_configured(monkeypatch):
-    """仅配置 enable_cache_control 的第三方网关也必须排序 tools。
+def test_qwen_tools_canonicalized_for_third_party_route(monkeypatch):
+    """第三方网关的 tools 必须排序（家族判定），配置不再是必要条件。
 
-    tools 字母序是缓存前缀字节稳定的前提：只开断点标记而不排序，MCP
-    工具顺序一抖动，断点打得再对前缀也会整体失效。session-cache header
-    与 keepalive 仍由 enable_prompt_cache 单独控制，不随此开关放开。"""
+    tools 字母序是缓存前缀字节稳定的前提：不排序时 MCP 工具顺序一抖动，
+    缓存前缀整体失效。"""
     gateway_base = "https://tokenrhythm.studio/v1"
     model = "openai/qwen3.8-flash"
 
@@ -455,8 +457,8 @@ def test_qwen_tools_canonicalized_when_only_cache_control_configured(monkeypatch
     ]
     sorted_tools = _select_request_tools_for_route(model, gateway_base, tools)
     assert [t["function"]["name"] for t in sorted_tools] == ["alpha_tool", "zeta_tool"]
-    # session-cache header 语义不变：仅 enable_prompt_cache 开启时注入
-    assert not _qwen_cache_enabled(model, gateway_base)
+    # 缓存开关判定同样只看家族：配置不再是必要条件
+    assert _qwen_cache_enabled(model, gateway_base)
 
 
 def test_cache_benchmark_qwen_parameters():
@@ -606,46 +608,31 @@ _GATEWAY = "https://tokenrhythm.studio/v1"
 _GATEWAY_MODEL = "openai/qwen3.8-flash"
 
 
-def test_qwen_cache_config_lookup_is_cached(monkeypatch):
-    """同一路由在一轮里被多次判定时，config.json 只允许被读取一次。"""
+def test_keepalive_route_config_lookup_is_cached(monkeypatch):
+    """非四族模型的显式保活通道判定：同一路由一轮内多次判定只读一次 config.json。"""
     reads = []
 
     def fake_load_config():
         reads.append(1)
-        return {
-            "providers": [{
-                "base_url": _GATEWAY,
-                "enable_prompt_cache": True,
-                "enable_cache_control": True,
-                "models": [{"litellm_model": _GATEWAY_MODEL}],
-            }]
-        }
+        return {"cache_keepalive_routes": ["tokenrhythm.studio"]}
 
     monkeypatch.setattr("core.model_manager.load_config", fake_load_config)
     for _ in range(6):
-        assert _supports_cache_keepalive(_GATEWAY_MODEL, _GATEWAY)
-        assert _supports_cache_control(_GATEWAY_MODEL, _GATEWAY)
+        assert _supports_cache_keepalive("openai/some-model", _GATEWAY)
     assert len(reads) == 1
 
 
-def test_qwen_cache_config_lookup_refreshes_when_config_changes(monkeypatch):
-    """配置被改写后判定必须跟上，不能永远停留在旧结论。"""
+def test_keepalive_route_config_lookup_refreshes_when_config_changes(monkeypatch):
+    """配置被改写后显式保活通道判定必须跟上，不能永远停留在旧结论。"""
     monkeypatch.setattr("core.model_manager.load_config", lambda: {
-        "providers": [{
-            "base_url": _GATEWAY,
-            "models": [{"litellm_model": _GATEWAY_MODEL}],
-        }]
+        "cache_keepalive_routes": []
     })
-    assert not _supports_cache_control(_GATEWAY_MODEL, _GATEWAY)
+    assert not _supports_cache_keepalive("openai/some-model", _GATEWAY)
 
     monkeypatch.setattr("core.model_manager.load_config", lambda: {
-        "providers": [{
-            "base_url": _GATEWAY,
-            "enable_cache_control": True,
-            "models": [{"litellm_model": _GATEWAY_MODEL}],
-        }]
+        "cache_keepalive_routes": ["tokenrhythm.studio"]
     })
-    assert _supports_cache_control(_GATEWAY_MODEL, _GATEWAY)
+    assert _supports_cache_keepalive("openai/some-model", _GATEWAY)
 
 
 # ---------------------------------------------------------------------------

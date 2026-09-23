@@ -308,7 +308,7 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
 
 
 @pytest.mark.parametrize(
-    ("model", "model_cfg", "provider_tail", "tools"),
+    ("model", "model_cfg", "provider_tail", "tools", "expected_messages"),
     [
         (
             "openai/deepseek-v4-flash",
@@ -320,16 +320,40 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
                 "allowed_openai_params": ["reasoning_effort"],
             },
             [ZETA_TOOL, ALPHA_TOOL],
+            None,
         ),
         (
             "openai/qwen3.7-max",
             {"reasoning_choice": "off", "enable_thinking": False},
             {
                 "max_tokens": 131000,
+                "extra_headers": {"x-dashscope-session-cache": "enable"},
                 "extra_body": {"enable_thinking": False},
                 "tool_choice": "auto",
             },
-            [ZETA_TOOL, ALPHA_TOOL],
+            [ALPHA_TOOL, ZETA_TOOL],
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "stable",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "inspect",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
         ),
         (
             "openai/qwen3.8-max",
@@ -340,13 +364,36 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
             },
             {
                 "max_tokens": 131000,
+                "extra_headers": {"x-dashscope-session-cache": "enable"},
                 "extra_body": {
                     "enable_thinking": True,
                     "reasoning_effort": "medium",
                 },
                 "tool_choice": "auto",
             },
-            [ZETA_TOOL, ALPHA_TOOL],
+            [ALPHA_TOOL, ZETA_TOOL],
+            [
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "stable",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "inspect",
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                },
+            ],
         ),
         (
             "openai/LongCat-2.0",
@@ -357,6 +404,7 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
                 "tool_choice": "auto",
             },
             [ZETA_TOOL, ALPHA_TOOL],
+            None,
         ),
         (
             "openai/kimi-k3",
@@ -367,11 +415,12 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
                 "tool_choice": "auto",
             },
             [ZETA_TOOL, ALPHA_TOOL],
+            None,
         ),
     ],
 )
 def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
-    monkeypatch, model, model_cfg, provider_tail, tools
+    monkeypatch, model, model_cfg, provider_tail, tools, expected_messages
 ):
     """新思考策略的最终 provider 字节必须精确，不允许混入第二套开关。"""
     import core.llm as llm
@@ -380,7 +429,8 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
         {"role": "system", "content": "stable"},
         {"role": "user", "content": "inspect"},
     ]
-    expected_messages = deepcopy(messages)
+    if expected_messages is None:
+        expected_messages = deepcopy(messages)
     captured = _capture(
         monkeypatch,
         model=model,
