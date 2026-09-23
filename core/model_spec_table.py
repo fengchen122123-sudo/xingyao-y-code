@@ -6,7 +6,7 @@
 - GLM: docs.z.ai/guides/llm（glm-5/5.1 为 200K 上下文，5.2 起 1M；输出统一 128K）
 - Qwen: help.aliyun.com 百炼模型文档（3.7/3.8 系 1M/131072）
 - MiniMax: OpenRouter 与官方模型卡（204800/131072）
-- MiMo: mimo.xiaomi.com 官方示例 max_completion_tokens=131072，1M 上下文
+- MiMo: mimo.mi.com 官方模型页（V2.6/V2.5 全系 1M 上下文 / 128K 输出）
 - Seed: 火山方舟模型列表（256k 输入/输出对齐）
 - 阶跃: token plan /v1/models 端点 max_input_tokens（输出 230400 来自
   OpenRouter 供应商元数据，官方未公布）
@@ -50,6 +50,10 @@ MODEL_SPECS = {
     "minimax-m2.5": (204800, 131072),
     "minimax-m2.7": (204800, 131072),
     # 小米 MiMo / 字节 Seed
+    "mimo-v2.6-pro": (1048576, 131072),
+    "mimo-v2.6-flash": (1048576, 131072),
+    "mimo-v2.6-pro-ultraspeed": (1048576, 131072),
+    "mimo-v2.5": (1048576, 131072),
     "mimo-v2.5-pro": (1048576, 131072),
     "seed-2.1-turbo": (262144, 262144),
     "seed-2.1-pro": (262144, 262144),

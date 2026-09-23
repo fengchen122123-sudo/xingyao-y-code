@@ -114,14 +114,24 @@ _register(
         "thinking_object_effort",
     ),
 )
+# 小米 MiMo（mimo.mi.com 官方 Deep Thinking 文档，2026-09-22 V2.6 系列发布）：
+# 深度思考只有 thinking.type enabled/disabled 开关、默认开启，官方未提供强度档位；
+# OpenAI 兼容路由经 extra_body 透传 thinking 对象。v2.5 / v2.5-pro 将于
+# 2026-10-21 下线，下线前与 V2.6 系列同为开关式思考。
 _register(
-    ("mimo-v2.5-pro",),
+    (
+        "mimo-v2.6-pro",
+        "mimo-v2.6-flash",
+        "mimo-v2.6-pro-ultraspeed",
+        "mimo-v2.5",
+        "mimo-v2.5-pro",
+    ),
     ReasoningCapability(
-        "effort", ("default", "off", "high"), "effort_switch"
+        "toggle", ("default", "off", "on"), "thinking_object_toggle"
     ),
 )
 # 商汤 sensenova-6.8-flash-lite：官方文档 reasoning_effort 取值 low/medium/high/none
-#（none=关闭思考），缺省默认 medium，与 mimo 同为 effort_switch 策略。
+#（none=关闭思考），缺省默认 medium。
 _register(
     ("sensenova-6.8-flash-lite",),
     ReasoningCapability(

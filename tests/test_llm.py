@@ -275,14 +275,13 @@ def test_deepseek_thinking_is_explicit_for_aggregators(monkeypatch):
             {"max_tokens": 128000, "extra_body": {"thinking": {"type": "enabled"}}},
         ),
         (
-            "openai/mimo-v2.5-pro",
-            "off",
-            {
-                "max_tokens": 256000,
-                "reasoning_effort": "none",
-                "allowed_openai_params": ["reasoning_effort"],
-            },
-        ),
+                "openai/mimo-v2.5-pro",
+                "off",
+                {"max_tokens": 131072, "extra_body": {"thinking": {"type": "disabled"}}},        ),
+        (
+                "openai/mimo-v2.6-pro",
+                "on",
+                {"max_tokens": 131072, "extra_body": {"thinking": {"type": "enabled"}}},        ),
         (
             "openai/qwen3.7-max",
             "off",
@@ -776,7 +775,10 @@ def test_overflow_refill_preserves_extra_system_blocks_and_drops_legacy_db_syste
         ("openai/LongCat-2.0", "https://gateway.example/v1", 128000),
         ("openai/seed-2.1-pro", "https://gateway.example/v1", 131000),
         ("openai/seed-2.1-turbo", "https://gateway.example/v1", 131000),
-        ("openai/mimo-v2.5-pro", "https://gateway.example/v1", 256000),
+        ("openai/mimo-v2.5-pro", "https://gateway.example/v1", 131072),
+        ("openai/mimo-v2.6-pro", "https://gateway.example/v1", 131072),
+        ("openai/mimo-v2.6-flash", "https://gateway.example/v1", 131072),
+        ("openai/mimo-v2.6-pro-ultraspeed", "https://gateway.example/v1", 131072),
         ("openai/minimax-m2.5", "https://gateway.example/v1", 200000),
         ("openai/minimax-m2.7", "https://gateway.example/v1", 192000),
         ("openai/gpt-4o", "https://gateway.example/v1", 32000),
