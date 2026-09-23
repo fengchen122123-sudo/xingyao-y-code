@@ -369,3 +369,29 @@ def test_recalc_token_usage_clears_context_breakdown(monkeypatch):
         assert cb.get_breakdown() == []
     finally:
         cb.clear_breakdown()
+
+
+def test_recalc_token_usage_keeps_breakdown_when_snapshot_preserved(monkeypatch):
+    """回合组装后重算（clear_breakdown_snapshot=False）必须保留刚写入的快照。
+
+    回归（2026-09-23）：回合路径曾误用默认清理语义，组装刚写入的来源占比
+    快照被重算清掉，导致组装后推给前端的面板数据永远为空。
+    """
+    bridge = _bridge_without_init("ctx-keep")
+    bridge._memory = MemoryManager(":memory:")
+    bridge._memory.create_session_explicit("ctx-keep")
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/test",
+        "base_url": "",
+        "context_window": 128000,
+    })
+    monkeypatch.setattr(
+        "core.agent_service.get_session_token_baseline", lambda *args, **kwargs: 1234
+    )
+
+    cb.set_breakdown([{"source": "messages", "chars": 42}])
+    try:
+        bridge._recalc_token_usage("ctx-keep", clear_breakdown_snapshot=False)
+        assert cb.get_breakdown() == [{"source": "messages", "chars": 42}]
+    finally:
+        cb.clear_breakdown()
