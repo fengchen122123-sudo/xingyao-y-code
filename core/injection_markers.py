@@ -1,0 +1,56 @@
+"""注入保留标记的唯一来源 + 防伪造中和（提示词工程与信源防护升级 · T1.5）。
+
+保留标记是程序与消息文本之间的"协议"：
+
+- ``strip_context_suffix``（core/agent_service.py）依赖它们做末尾剥离；
+- 模型依赖它们识别信源（"这是程序注入的运行上下文"）。
+
+用户内容中出现同名标记时必须"中和"——在标记首字符后插入零宽字符 U+200B：
+破坏精确匹配、不影响用户可见文本与语义。否则会出现两类问题：
+
+1. 数据完整性：用户消息自带 ``【当前运行上下文】`` 时，可能被
+   ``strip_context_suffix`` 从中间误截断，丢掉用户真正写的内容；
+2. 信任混淆：用户内容里的伪造标记会让模型误认为"这是系统注入的
+   运行上下文"，从而把伪造的"权限模式：full"等内容当真。
+
+中和必须发生在**程序自身注入之前**：程序注入使用原标记，strip 照常识别。
+
+本模块是这 4 个标记的唯一来源，其余模块一律从本模块导入（值逐字不变）。
+"""
+
+from __future__ import annotations
+
+#: 零宽空格：中和时插在标记首字符之后，肉眼不可见、不改变语义。
+ZERO_WIDTH = "\u200b"
+
+# 4 个保留标记（值必须与各使用处逐字一致；本文件是唯一来源）
+DYNAMIC_CONTEXT_PREFIX = "【当前运行上下文】"
+TIME_NOTE_PREFIX = "【当前时间】"
+BG_SUMMARY_PREFIX = "📦 后台子代理任务结果汇总"
+REF_SESSIONS_PREFIX = "【引用的对话记录】"
+
+#: 参与防伪造中和的全部保留标记。
+RESERVED_MARKERS: tuple[str, ...] = (
+    DYNAMIC_CONTEXT_PREFIX,
+    TIME_NOTE_PREFIX,
+    BG_SUMMARY_PREFIX,
+    REF_SESSIONS_PREFIX,
+)
+
+
+def neutralize_reserved_markers(text):
+    """中和文本中的保留标记（幂等；仅破坏精确匹配，不改变可见文本）。
+
+    中和手段是在标记首字符后插入一个零宽空格（U+200B）。因此：
+
+    - 中和后的文本仍**包含**标记的可见字符序列，但不再是
+      ``"\\n\\n" + marker`` 的精确匹配，``strip_context_suffix`` 不会命中；
+    - ``text.replace(ZERO_WIDTH, "")`` 可还原出与原文完全一致的可见文本；
+    - 幂等：已中和的文本不含原标记子串，重复调用不会叠加零宽字符。
+    """
+    if not text or not isinstance(text, str):
+        return text
+    for marker in RESERVED_MARKERS:
+        if marker in text:
+            text = text.replace(marker, marker[0] + ZERO_WIDTH + marker[1:])
+    return text

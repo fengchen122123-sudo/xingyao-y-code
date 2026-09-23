@@ -2807,7 +2807,9 @@ class MemoryManager:
                     def prune_text(text):
                         if "[附带上下文:" in text:
                             return re.sub(
-                                r"(\[附带上下文: .*?\])\n```.*?\n```\n?", 
+                                # T1.2 起标记行与代码块之间多了一行信源声明（不含反引号），
+                                # 故容忍这样的一行；无声明行的既有消息仍照常匹配。
+                                r"(\[附带上下文: .*?\])(?:\n[^\n`]{1,80})?\n```.*?\n```\n?", 
                                 r"\1 (⚠️ 内容已折叠以节省 Token。若需再次查看请使用 read_file 工具)\n\n", 
                                 text, 
                                 flags=re.DOTALL

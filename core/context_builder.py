@@ -6,6 +6,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from core.injection_markers import DYNAMIC_CONTEXT_PREFIX, TIME_NOTE_PREFIX
+
 if TYPE_CHECKING:
     from core.computer.models import ComputerCapability
 
@@ -56,8 +58,9 @@ def build_stable_prompt(base_prompt: str) -> str:
     return "\n\n".join(parts)
 
 
-DYNAMIC_CONTEXT_PREFIX = "【当前运行上下文】"
-TIME_NOTE_PREFIX = "【当前时间】"
+# 保留标记的唯一来源已收敛到 core/injection_markers.py（T1.5 防伪造基础设施），
+# 由文件顶部 import 引入。常量值逐字未变，且
+# `from core.context_builder import DYNAMIC_CONTEXT_PREFIX` 等既有引用路径保持可用。
 
 
 def build_dynamic_prompt(runtime: RuntimeContext) -> str:
