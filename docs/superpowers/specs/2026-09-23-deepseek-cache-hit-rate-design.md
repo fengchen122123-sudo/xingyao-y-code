@@ -235,3 +235,65 @@
 2. 按 4.1 → 4.2 → 4.3 顺序实施，每项配单测；
 3. 写实施计划请使用 writing-plans 技能；TDD 请使用 test-driven-development 技能；
 4. 完成后用 `bench/adapt_bench.py` 实测并更新本文件的验证结论。
+
+---
+
+## 8. 实施结论（2026-09-23 回填）
+
+### 8.1 三项改造落地情况
+
+| 改造项 | 落点 | 状态 |
+|---|---|---|
+| ① 缓存优化路由可配置化 | `core/llm_dialects.py` `_is_cache_optimized_deepseek_route` + `_configured_deepseek_cache_routes` | 已实施 |
+| ② 会话级目录快照 | `core/agent_service.py` `build_stable_system_extra_sections(session_name)` / `_SESSION_STABLE_SECTIONS` | 已实施 |
+| ③ 轮换可观测 | `_prepare_deepseek_ledger_request` → `rotation_reason` → `core/llm.py` 覆写 `cache_request_diagnostics.request_reason` | 已实施 |
+
+提交：`5dd359d`（实施计划）、`c752110`（三项改造 + 测试），本文件与实测报告的回填随其后的
+文档提交入库。实施计划见 `docs/superpowers/plans/2026-09-23-deepseek-cache-hit-rate.md`。
+
+### 8.2 与设计稿的事实修正
+
+1. §3.1-8「`cache_request_diagnostics` 当前 deepseek 家族零记录」不成立：实测该表共
+   1087 行，其中 deepseek 家族 435 行、`api_base` 全部为 `https://tokenrhythm.studio/v1`。
+   该表的写入路径本就**没有路由门禁**，③ 无需新增「发射开关」；实际缺口只是换代原因
+   没有落到 `request_reason`。
+2. §4.3 的换代原因取值域需补第 6 个 `caller_force_new`（`core/llm.py` 超窗压缩成功后的
+   重试分支主动传 `force_new=True`），否则该分支会被误标为 `pending_rotation`。
+3. §4.2 未说明的一处语义细节：③ 的原因覆写对**所有**换代都生效（含首代
+   `first_generation`），因此账本路由的首个请求在 `request_reason` 上由「冷启动」变为
+   `first_generation`。二者在 `query_cache_diagnostic_summary` 的 `explicit_categories`
+   中同归 `cold_start`，且都属「非热启动」，统计口径不变。
+4. `bench/adapt_bench.py` 绕开 Prompt Ledger（第 41 行直接 `from core.llm import completion`
+   并以 `stream=False` 调用），**不能度量本次改造收益**，只能测上游网关自身上限；
+   实测其运行间抖动达 ±12 个百分点。详见
+   `docs/adapt-report-deepseek-tokenrhythm-cache.md` §3.3/§4。
+
+### 8.3 验证证据
+
+| 验收项 | 命令 | 结果 |
+|---|---|---|
+| 配置路由进账本 / tools 排序 | `pytest tests/test_deepseek_prompt_ledger.py -k configured_deepseek_cache_route -q` | `2 passed, 17 deselected in 1.78s`（第三个用例名不含该子串，见下行全文件） |
+| 账本测试全文件 | `pytest tests/test_deepseek_prompt_ledger.py -q` | `19 passed`（原 16 + 新增 3） |
+| 目录快照不换代 | `pytest tests/test_session_stable_snapshot.py -q` | `3 passed in 1.95s` |
+| 换代原因诊断 | `pytest tests/test_deepseek_prompt_ledger.py -k rotation_reason -q` | `3 passed, 16 deselected in 2.41s` |
+| 相关测试全量（7 文件） | `pytest tests/test_deepseek_prompt_ledger.py tests/test_session_stable_snapshot.py tests/test_prompt_byte_stability.py tests/test_context_injection.py tests/test_qwen_cache.py tests/test_cache_diagnostics_storage.py tests/test_agent_service.py -q` | `123 passed in 25.45s` |
+| 字节 golden 未破坏 | `pytest tests/test_prompt_byte_stability.py -q` | `5 passed in 1.77s`，golden `ef286e51…` 未变 |
+| 前端技能页 | `npx vitest run src/components/Subpage.skills.test.ts` | `Tests 9 passed (9)` |
+| 语法检查 | `py_compile.compile(..., doraise=True)` 覆盖 6 个 core 文件 + 2 个测试文件（进程内执行，见备注） | `compiled 8 / 8 OK`，零 SyntaxError |
+| 网关实测 | `bench/adapt_bench.py`（before=419f14e / after=c752110） | 总体命中率 before `76.66%` / after `64.91%`；差异为上游抖动，见 `docs/adapt-report-deepseek-tokenrhythm-cache.md` §3.3 |
+| 线上历史基线 | `~/.ycode/tmp/deepseek_hitrate.py` / `deepseek_routes.py` | 661 条 88.44%；按 api_base 拆 `tokenrhythm.studio/v1` 435 条 88.35%（2026-08-05~09-17） |
+
+> 备注（本机环境）：本沙箱会拦截子进程的批量删除并改写退出码（`3221226505` / `0xC0000409`），
+> 因此 `python -m py_compile` 与 `pytest` 的**进程退出码不可信**——验收一律以进程内编译结果
+> 或落盘日志中的汇总行为准（例如 `pytest --basetemp=<工作区内目录>` 才能拿到完整汇总行）。
+> 同一原因导致沙箱内 `ripgrep` 不可用，`tests/test_agent_turn_e2e.py` 中以 `search_code` /
+> `glob_files` 为前置的用例会因 `rg 错误 (rc=3221226505)` 而失败，属环境限制、与本改造无关。
+
+### 8.4 上线动作（运维）
+
+config.json 增加：`"deepseek_cache_routes": ["tokenrhythm.studio"]`（本次交付未写入用户配置，
+由使用方手工添加）。生效后 3~7 天用 `~/.ycode/tmp/deepseek_hitrate.py`（按模型/按日命中率）
+与 `~/.ycode/tmp/deepseek_routes.py`（按 api_base 拆分）对照 §1.2 目标验收；低命中事件按
+`cache_request_diagnostics.request_reason` 的换代原因分布归因（`first_generation` /
+`pending_rotation` / `caller_force_new` / `header_tools_changed` / `header_system_changed` /
+`boundary_ambiguous`）。
