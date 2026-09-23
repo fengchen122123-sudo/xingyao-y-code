@@ -1,0 +1,237 @@
+# DeepSeek 缓存命中率提升设计
+
+- 日期：2026-09-23
+- 状态：设计已评审（用户选定方案 B），待实施
+- 目标读者：接手实施的 agent（无需查阅前置对话）
+
+---
+
+## 1. 背景与目标
+
+### 1.1 问题
+
+用户反馈 DeepSeek 家族模型的 prompt 缓存命中率「最近到不了 99%」。对 `~/.ycode/ycode.db`
+的 `token_usage` 表统计（口径：model 以 `deepseek` 开头、不分大小写，命中率 =
+Σcached_tokens / Σprompt_tokens）：
+
+| 范围 | 命中率 | 样本 |
+|---|---|---|
+| 总体（2026-08-05 ~ 09-17） | **88.44%** | 661 条 |
+| 近 30 天 | 93.93% | 83 条 |
+| 按模型：deepseek-v4-flash-0731 | 88.12% | 578 条（主力） |
+| 按模型：deepseek-v4-pro-0813 | 94.28% | 67 条 |
+| 按模型：deepseek-flash | 91.73% | 16 条 |
+
+单条记录分布（prompt>0）：57.0% ≥99%，28.7% 在 90~99%，5.3% 在 50~90%，
+7.7% <50%，1.2% 冷启动（cached=0）。**低命中记录都是大 prompt**——它们把加权
+均值从 99% 拽到 88%。
+
+**按 api_base 拆分（决定性发现）：**
+
+| api_base | 记录 | prompt | 命中率 |
+|---|---|---|---|
+| `https://tokenrhythm.studio/v1` | 435 | 44.1M（71%） | 88.35% |
+| （空，旧记录未写 api_base） | 226 | 18.3M | 88.68% |
+
+用户的 DeepSeek 流量约 7 成走 **TokenRhythm（基元律动）网关**，而非官方
+`api.deepseek.com`。
+
+### 1.2 目标
+
+- 热路径（剔除冷启动/窗口轮换/工具契约变更轮）命中率：**≥97~99%**
+- 含一切的总体命中率：**≥93~96%**（物理上限，见 1.3）
+- 统计口径不变：`token_usage` 表 deepseek 开头模型（不分大小写）的
+  Σcached/Σprompt
+
+### 1.3 物理约束（诚实预期）
+
+以下场景必然全量 miss，任何实现都消不掉：
+
+1. 新会话/新账本代的首个请求（冷启动）；
+2. 1M 上下文窗口超限后的账本轮换（主动轮换已有，仍是一次全价重建）；
+3. 服务端缓存 TTL 驱逐（App 关闭过久后恢复，客户端只能保活无法杜绝）；
+4. 每轮真实新增内容（用户消息、工具结果）——这是 90~99% 区间带的主因，属正常。
+
+因此「总体恒 99%」不可达，本设计以 1.2 的分档口径验收。
+
+---
+
+## 2. 调研结论（ZCode / DeepSeek Harness 借鉴点）
+
+调研对象已浅克隆到本机：`~/.ycode/tmp/ZCode`、`~/.ycode/tmp/deepseek-harness`。
+结论提炼（细节见当回合对话，此处只留可执行要点）：
+
+| 手段 | ZCode | DeepSeek Harness | 我们的现状 |
+|---|---|---|---|
+| 稳定/动态内容分离 | ✅ stable/dynamic 分块 | ✅ 一切易变内容追加到历史尾部 | ✅ 已有（动态块尾部内联、append-only） |
+| 显式 cache_control 断点 | ✅ Anthropic 协议 4 断点 | ❌ 刻意不用（词汇表剪除） | ✅ 仅 anthropic/ 前缀模型 |
+| append-only 不可变请求账本 | 部分（消息侧滚动断点） | ✅ session log 即唯一事实源 | ✅ **已有 Prompt Ledger，但仅官方路由** |
+| 系统提示词变化处理 | 失效尾部小块 | in-history 追加（前缀不动） | system 头变化 → 账本强制轮换 |
+| 工具列表字节稳定 | 注册表生成 + hash | 确定性投影 | ✅ 官方/Qwen 路由字母序规范化 |
+| 缓存意识制度化 | — | 每个插件 README 必写 KV Cache effect | 无 |
+
+核心判断：**我们的架构已具备 DSH 同款骨架（Prompt Ledger），差距只在覆盖范围
+与少数前缀破坏点**，不需要引入 Anthropic 协议切换或显式断点扩展。
+
+---
+
+## 3. 现状盘点（代码事实，含位置）
+
+### 3.1 已有机制（不要重复造）
+
+1. **DeepSeek Prompt Ledger**（不可变账本）
+   - 表：`deepseek_prompt_generations` / `deepseek_prompt_messages`
+     （`core/memory.py:442-464`）；CRUD：`get_or_create_deepseek_prompt_generation`
+     （约 `core/memory.py:990-1030`）、`append_deepseek_prompt_messages`（约 1033 行）。
+   - 请求构建：`_prepare_deepseek_ledger_request`（`core/llm_dialects.py:477` 附近）：
+     稳定头（tools + 首条 system）比对失败或追加边界不唯一 → `force_new` 换代。
+   - 启用条件：`_uses_deepseek_prompt_ledger`（`core/llm_dialects.py:387`）=
+     persist ∧ parent_session ∧ cache_scope==main ∧ `is_deepseek_ledger_route`。
+   - 路由判定：`is_deepseek_ledger_route`（`core/llm_dialects.py:377`）=
+     `_is_deepseek_family` ∧ `_is_official_deepseek_route`；
+     **`_is_official_deepseek_route`（`core/llm_dialects.py:77`）只认
+     `https://api.deepseek.com` 三个拼法 → tokenrhythm.studio 被排除**。
+   - 压缩免疫：压缩只改写 DB 工作副本，账本字节不变；窗口仍超限则由
+     `mark_deepseek_generation_rotation`（`core/agent_service.py:969` 附近调用）
+     登记主动轮换。
+2. **tools 字母序规范化**：`_select_request_tools_for_route`
+   （`core/llm_dialects.py:397` 附近），仅覆盖官方 DeepSeek / Qwen 缓存路由。
+3. **稳定/动态提示词分离**：`core/context_builder.py`
+   （`build_stable_prompt` / `build_dynamic_prompt` / `build_time_note`）；
+   动态块与时间注记内联到最后一条 user 消息尾部，append-only。
+4. **记忆索引恒定化**：`core/memory_kairos.py:192` `build_memory_system_section`
+   的索引段为恒定占位文案，写记忆已不影响前缀。
+5. **MCP 首等**：`core/llm.py:265 get_tools_schema` 进程内首次调用同步等 MCP
+   就绪，避免 tools 第 N 轮突然出现。
+6. **plan 模式不裁剪 tools**：`core/llm.py:1367` 附近注释明确（约束由执行层
+   plan_enforced 保证）。
+7. **显式断点**：`_apply_cache_control`（`core/llm_dialects.py:704`），
+   `_CACHE_CONTROL_PROVIDERS = ("anthropic",)`（`core/llm_dialects.py:614`）。
+8. **诊断表（空转）**：`cache_request_diagnostics`（`core/memory.py:511` 附近建表，
+   含 request_reason / messages_sha256 / system_sha256 / tools_sha256 /
+   common_prefix_messages 等），**当前 deepseek 家族零记录**。
+
+### 3.2 剩余失分点（按预期影响排序）
+
+1. **tokenrhythm 网关流量无账本、无 tools 规范化**（3.1-1/2 的判定排除）：
+   压缩 → 历史重写 → 前缀全灭；MCP 重连/增减 → tools 顺序/集合抖动 → 全灭。
+   这是 88% 与 99% 之间的最大差额来源。
+2. **system 头中途变化 → 账本强制轮换**：稳定头由
+   `build_stable_system_message`（`core/agent_service.py:230`）每轮重建，内含
+   人设块 / 技能目录 / 子 Agent 清单（`build_stable_system_extra_sections`，
+   `core/agent_service.py:179`）。会话中途用户改设置/切技能/改子 Agent →
+   `_deepseek_stable_header_matches` 失败 → `force_new` → 全量 miss 一次。
+3. **轮换与 miss 原因不可观测**：换代分支不记录原因，无法归因验证。
+
+---
+
+## 4. 设计方案（用户已选定：方案 B 直接结构改造）
+
+### 4.1 改造项 ①：缓存优化路由可配置化（核心，约八成收益）
+
+**做法**：新增 config.json 顶层键 `deepseek_cache_routes`（字符串数组，域名/子串
+条目），把网关路由纳入 DeepSeek 缓存优化家族。
+
+- 在 `core/llm_dialects.py` 新增：
+  - `_DEEPSEEK_CACHE_ROUTES_CONFIG_KEY = "deepseek_cache_routes"`；
+  - `_configured_deepseek_cache_routes()`：**直接复用
+    `_configured_keepalive_routes` 的既有模式**（`_parse_keepalive_routes` 解析 +
+    `_qwen_cache_config_stamp` 指纹缓存，见 `core/llm_dialects.py:297-340` 附近），
+    解析逻辑抽到共用辅助函数或按同模式仿写；
+  - `_is_cache_optimized_deepseek_route(api_base)` =
+    `_is_official_deepseek_route(api_base)` ∨ 主机名命中任一配置条目
+    （归一化用现有 `_normalize_route_match_key`，`core/llm_dialects.py:283`）。
+- 切换两个调用点（其余判定不动）：
+  1. `is_deepseek_ledger_route`（`core/llm_dialects.py:377`）的官方路由条件 →
+     换 `_is_cache_optimized_deepseek_route`；
+  2. `_select_request_tools_for_route`（`core/llm_dialects.py:397` 附近）的
+     canonicalize 条件中 `_is_official_deepseek_route(api_base)` →
+     换 `_is_cache_optimized_deepseek_route(api_base)`。
+- 用户侧配置（运维动作，不写代码默认值）：config.json 增加
+  `"deepseek_cache_routes": ["tokenrhythm.studio"]`。
+
+**效果**：tokenrhythm 流量获得 append-only 账本（压缩不再炸缓存——方案 B 中
+「compaction 保前缀」由本项直接覆盖，无需另改压缩器）+ tools 字母序
+（MCP 抖动免疫）。
+
+**注意**：`_is_deepseek_family`（模型名含 deepseek）保持不变；非 DeepSeek 上游的
+网关不要加进配置（账本语义只对 DeepSeek 磁盘缓存上游有意义）。
+
+### 4.2 改造项 ②：目录变更不炸代（会话级目录快照）
+
+**问题**：`build_stable_system_extra_sections`（`core/agent_service.py:179`）每轮
+现取人设/技能目录/子 Agent 清单，会话中途变化 → 账本稳定头失配 → 强制换代。
+
+**做法**：对「注入点 2」的输出做**会话级快照**：
+
+- 会话首个请求时渲染一次人设块 + 技能目录 + 子 Agent 清单（记忆段已是恒定
+  索引，包含在内无妨），按 `session_name` 缓存到进程内字典；
+- 该会话后续请求一律复用快照字节；会话删除/重命名时清快照；
+- 进程重启后恢复快照不存在 → 首请求重新渲染（若文件无变化，渲染结果逐字节
+  相同，天然不炸代；有变化则只换代一次，符合预期）。
+- 设置页（技能/子 Agent/人设的保存入口）加提示文案：「已打开的会话将在
+  新会话中生效」。
+
+**实现锚点**：`build_stable_system_message`（`core/agent_service.py:230`）目前
+无 session 参数，需在请求组装链路上传入 session_name（chat_with_model_events
+方向），快照存取放在 agent_service 层；Token 估算路径
+（`estimate_history_tokens_with_system`）可继续用无快照的现值（估算口径允许偏差，
+不影响线上字节）。
+
+**风险**：会话内改技能/子 Agent 不立即生效，用户可能困惑 → 用提示文案缓解；
+快照只进内存，不落库。
+
+### 4.3 改造项 ③：轮换与 miss 可观测（验收的必要手段）
+
+- 在 `_prepare_deepseek_ledger_request` 的各 `force_new` 分支记录原因：
+  `first_generation` / `pending_rotation` / `header_tools_changed` /
+  `header_system_changed` / `boundary_ambiguous`；
+  向 `cache_request_diagnostics` 写一行（request_reason 用上述值，
+  tools_sha256 / system_sha256 能算则算，其余字段按现有 schema 可空）。
+- 排查 `cache_request_diagnostics` 现有的写入点（实现时先定位其发射开关），
+  把 deepseek 家族路由纳入——当前该表 deepseek 零记录，改完要能直接看到
+  miss 归因。
+- 复用统计脚本 `~/.ycode/tmp/deepseek_hitrate.py`（按模型/按日命中率）与
+  `~/.ycode/tmp/deepseek_routes.py`（按 api_base 拆分）做改造前后对比。
+
+### 4.4 非目标（明确不做）
+
+- 不切 Anthropic 协议、不给 OpenAI 协议路由加显式 cache_control
+  （DeepSeek 服务端自动前缀缓存已生效，DSH 同样刻意不用显式断点）；
+- 不改压缩算法（账本已对压缩免疫）；
+- 不改保活机制（per-session 保活隔离已修过）；
+- 不动 `token_usage` 统计口径与历史数据。
+
+---
+
+## 5. 风险与缓解
+
+| 风险 | 缓解 |
+|---|---|
+| tokenrhythm 上游未必是官方 DeepSeek 磁盘缓存，账本收益不确定 | 现状 88% 证明服务端确有前缀缓存行为；append-only 对任何前缀缓存上游只增不减；改造前后用 4.3 的脚本实测验证 |
+| 目录快照导致会话内设置变更不生效，用户困惑 | 设置页提示文案；快照仅内存，重启即新值 |
+| 配置条目误加非 DeepSeek 上游网关 | 文档（本文件 + config 注释）写明「仅 DeepSeek 磁盘缓存上游」 |
+| 空 api_base 的 legacy 记录（约 1/3）无法回溯归因 | 不管，只看改造后新数据 |
+
+---
+
+## 6. 验证方案
+
+1. **单元测试**（新增/更新）：
+   - 配置条目使 `is_deepseek_ledger_route` 对网关怀里通过（含大小写/端口/路径归一化）；
+   - `_select_request_tools_for_route` 对配置路由输出字母序 tools；
+   - 目录快照：会话中途变更技能目录 → system 头字节不变 → 不触发换代；
+   - 换代分支写出 rotation 原因诊断行。
+2. **实测基准**：`bench/adapt_bench.py` 以 tokenrhythm 的 deepseek 模型跑
+   缓存命中率场景，改造前后各一遍对比 hot_rate（参考既有报告
+   `docs/adapt-report-deepseek-v4-flash.md` 的格式留档）。
+3. **线上观测**：改造生效后 3~7 天，用 4.3 脚本盯 `token_usage` 按日命中率与
+   `cache_request_diagnostics` 的 miss 归因，对照 1.2 目标验收。
+
+## 7. 接手指引（给实施 agent）
+
+1. 先读 `core/llm_dialects.py` 的 ① 路由判定区（60-110 行）与账本地区
+   （370-560 行）、`core/agent_service.py` 的稳定头组装（179-260 行）；
+2. 按 4.1 → 4.2 → 4.3 顺序实施，每项配单测；
+3. 写实施计划请使用 writing-plans 技能；TDD 请使用 test-driven-development 技能；
+4. 完成后用 `bench/adapt_bench.py` 实测并更新本文件的验证结论。
