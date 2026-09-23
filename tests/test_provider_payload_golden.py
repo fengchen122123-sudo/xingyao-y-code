@@ -411,7 +411,10 @@ def test_responses_provider_kwargs_are_byte_golden(monkeypatch):
             {"reasoning_choice": "high", "enable_thinking": True, "reasoning_effort": "high"},
             {
                 "max_tokens": 131072,
-                "extra_body": {"reasoning_effort": "high"},
+                "extra_body": {
+                    "prompt_cache_key": "ycode-a47c32959586-50a50ebc13bc62a9",
+                    "reasoning_effort": "high",
+                },
                 "tool_choice": "auto",
             },
             [ZETA_TOOL, ALPHA_TOOL],
@@ -438,6 +441,7 @@ def test_model_reasoning_choice_provider_kwargs_are_byte_golden(
         protocol="openai",
         model_cfg=model_cfg,
         messages=messages,
+        cache_session_id="golden-reasoning-choice",
     )
     expected = {
         "model": model,
