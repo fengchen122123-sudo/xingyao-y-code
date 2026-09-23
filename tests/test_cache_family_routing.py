@@ -137,3 +137,31 @@ def test_kimi_affinity_sent_across_channels(api_base):
         "openai/kimi-k2.6", api_base, cache_session_id="family-matrix"
     )
     assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
+
+
+# ---------------------------------------------------------------------------
+# 保活：四族任意渠道自动放行；非四族仍走显式白名单
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("model,official_base", _FAMILIES)
+def test_keepalive_enabled_for_family_across_channels(model, official_base):
+    from core.llm import _supports_cache_keepalive
+
+    for api_base in [official_base, *_OTHER_CHANNELS]:
+        assert _supports_cache_keepalive(model, api_base) is True, (model, api_base)
+
+
+def test_keepalive_explicit_routes_still_gate_non_family_models(monkeypatch):
+    from core.llm import _supports_cache_keepalive
+    import core.llm_dialects as dialects
+
+    assert _supports_cache_keepalive("openai/some-model", "https://relay.example/v1") is False
+
+    monkeypatch.setattr(
+        "core.model_manager.load_config",
+        lambda: {"cache_keepalive_routes": ["tokenrhythm.studio"]},
+    )
+    with dialects._qwen_cache_cfg_lock:
+        dialects._keepalive_routes_cfg_cache["entry"] = None
+    assert _supports_cache_keepalive("openai/some-model", "https://tokenrhythm.studio/v1") is True
