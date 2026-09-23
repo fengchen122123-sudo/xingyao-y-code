@@ -24,6 +24,7 @@ from ddgs import DDGS
 from core.version import __version__ as YCODE_VERSION
 from core import tool_cache as _tool_cache
 from core.lsp import _get_rg_executable
+from core.subagent_common import build_subagent_common_block
 
 
 HTTP_TIMEOUT_SECONDS = 20
@@ -4081,6 +4082,11 @@ class SubagentManager:
         )
         # 自定义子 agent 的系统提示词优先；未配置时用内置 role_instructions
         instruction_text = custom_system_prompt if custom_system_prompt else role_instructions[role]
+        # T3 子代理公共约束块：安全 / 证据 / 工具面 / 防伪四条对内置与自定义子代理
+        # 一律生效。拼进 instruction_text 而非仅在首请求拼接——后续「续写总结」请求
+        # （cont_messages）同样复用 instruction_text，两处请求自动带上同一份约束。
+        # 顺序：身份正文在前、公共约束在后（约束是底线，不可被用户自定义 body 覆盖）。
+        instruction_text = instruction_text + "\n" + build_subagent_common_block(allowed_tools)
         messages = [
             {
                 "role": "system",
