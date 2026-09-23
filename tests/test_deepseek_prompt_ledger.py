@@ -77,8 +77,8 @@ def test_deepseek_generation_rejects_stale_append():
         raise AssertionError("stale append must fail")
 
 
-def test_deepseek_generation_identity_isolated_from_kimi_and_endpoints():
-    """防止不同 Provider 或 endpoint 误用同一缓存账本。"""
+def test_deepseek_generation_identity_isolated_from_kimi_and_scopes():
+    """防止不同 Provider 或非主会话 scope 误用同一缓存账本。"""
     from core.llm import _uses_deepseek_prompt_ledger
 
     assert _uses_deepseek_prompt_ledger(
@@ -87,7 +87,8 @@ def test_deepseek_generation_identity_isolated_from_kimi_and_endpoints():
     assert not _uses_deepseek_prompt_ledger(
         "anthropic/kimi-k2.5", "https://api.kimi.com/coding", "main", True, "s1"
     )
-    assert not _uses_deepseek_prompt_ledger(
+    # 家族判定：任意 endpoint 的 deepseek 主会话都进账本
+    assert _uses_deepseek_prompt_ledger(
         "openai/deepseek-v4-pro", "https://relay.example/v1", "main", True, "s1"
     )
     assert not _uses_deepseek_prompt_ledger(
@@ -341,7 +342,7 @@ def test_deleted_session_rejects_new_or_appended_ledger_messages():
 
 
 # ---------------------------------------------------------------------------
-# 改造项 ①：缓存优化路由可配置化（config.json 顶层 deepseek_cache_routes）
+# 缓存优化路由家族化（config.json 顶层 deepseek_cache_routes 保留兼容）
 # ---------------------------------------------------------------------------
 
 
@@ -369,13 +370,13 @@ def test_configured_deepseek_cache_route_enables_ledger(monkeypatch):
     )
 
 
-def test_unconfigured_gateway_stays_out_of_ledger(monkeypatch):
-    """未配置的网关不得进入账本：账本只对显式声明的 DeepSeek 上游成立。"""
+def test_any_gateway_enters_ledger_for_deepseek_family(monkeypatch):
+    """任意网关进账本（配置不再必要）：非本族不误放，官方不受配置影响。"""
     from core.llm import is_deepseek_ledger_route
 
     _use_deepseek_cache_routes(monkeypatch, ["tokenrhythm.studio"])
 
-    assert not is_deepseek_ledger_route(
+    assert is_deepseek_ledger_route(
         "openai/deepseek-v4-flash-0731", "https://relay.example/v1"
     )
     assert not is_deepseek_ledger_route(
