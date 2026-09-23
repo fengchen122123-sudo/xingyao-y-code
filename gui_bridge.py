@@ -4545,6 +4545,13 @@ class ApiBridge(GitBridgeMixin):
                         self._memory.ensure_session(target_session, workdir=str(workdir), source="GUI")
                     except Exception:
                         logger.debug("落库即命名失败", exc_info=True)
+                    # pending 草稿落库后必须把 _current_session 从旧会话切过来：
+                    # 草稿期刻意不切（防 set_model 污染旧会话），但落库后仍停留
+                    # 在旧会话会让 search_sessions 误把旧会话当当前会话排除、
+                    # 同时混入真正在用的会话，@ 文件候选也会扫错工作区。
+                    # 仅 local 入口切换——LAN 分发同样携带 workdir，不能抢本地会话。
+                    if turn_source == "local" and self._current_session != target_session:
+                        self._set_current_session(target_session)
                 # 已存在会话也随消息刷新模型绑定：前端始终携带当前激活模型 id，
                 # 让"选模型立即生效"，不再只在 pending 新会话时绑定
                 if clean_model_id:
