@@ -185,7 +185,7 @@ def test_kimi_cache_affinity_covers_noncanonical_api_bases(monkeypatch, api_base
     opts = _provider_request_options("openai/kimi-k3", api_base)
 
     assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
-    assert _supports_cache_keepalive("openai/kimi-k3", api_base) is False
+    assert _supports_cache_keepalive("openai/kimi-k3", api_base) is True
 
 
 def test_kimi_anthropic_route_sends_metadata_user_id(monkeypatch):
