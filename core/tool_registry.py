@@ -436,6 +436,9 @@ def build_default_registry() -> ToolRegistry:
                 "两条路径互斥：传了 start_line/end_line 就跳过 target_content 匹配。\n"
                 "路径A 适合小文件/唯一代码段，target_content 应包含唯一上下文（≤1500 字符），多次出现需补上下文或 replace_all=True。\n"
                 "路径B 适合大文件/重复代码段，建议先 read_file(with_line_numbers=True) 获取行号。\n"
+                "⚠ 编辑前必须先读取该文件：路径A 的 target_content 必须与文件实际内容一致，"
+                "路径B 的行号必须来自真实文件——不要凭记忆或旧快照改文件。\n"
+                "若文件在本次编辑的「读取→写入」窗口内被外部修改，写入会中止并提示重新读取（防并发覆盖）。\n"
                 "严禁用 write_file 覆盖已有大文件来替代 edit_file。"
             ),
             input_schema=_schema({
@@ -509,7 +512,9 @@ def build_default_registry() -> ToolRegistry:
                 "PowerShell 中 & 是调用运算符（用于执行字符串命令），非 Bash 风格的命令串联符。"
                 "错误示例：cd path & javac Foo.java（会抛 ParserError，退出码 2）"
                 "正确示例：cd path; javac Foo.java; java Foo\n"
-                "3) 条件串联用 if ($LASTEXITCODE -eq 0) { next }，PowerShell 7+ 才支持 && 运算符"
+                "3) 条件串联用 if ($LASTEXITCODE -eq 0) { next }，PowerShell 7+ 才支持 && 运算符\n"
+                "单次执行输出总量上限 1MB（stdout+stderr）：超限会终止进程树并返回截断结果；"
+                "可能长时间刷屏的命令请自行收敛输出（重定向到文件、加 head 或限制范围）。"
             ),
             input_schema=_schema({
                 "command": {"type": "string"},
@@ -568,6 +573,9 @@ def build_default_registry() -> ToolRegistry:
                 "回合结束后的下一回合自动注入「📦 后台子代理任务结果汇总」；"
                 "回合内可用 manage_task(status/wait, task_id=\"subagent-…\") 主动查询进度或等待终态，"
                 "不要拖延回合空等。"
+                "子代理状态非 completed（failed/timed_out/cancelled）一律视为失败："
+                "读完失败原因与失败工具列表后由主 Agent 用自己的工具兜底完成，"
+                "同一子任务最多重试 1 次且必须改变任务描述（换工具/换方法），禁止原样重试。"
             ),
             input_schema=_schema({
                 "task_description": {"type": "string"},
