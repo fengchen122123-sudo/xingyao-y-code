@@ -277,6 +277,8 @@
 | 目录快照不换代 | `pytest tests/test_session_stable_snapshot.py -q` | `3 passed in 1.95s` |
 | 换代原因诊断 | `pytest tests/test_deepseek_prompt_ledger.py -k rotation_reason -q` | `3 passed, 16 deselected in 2.41s` |
 | 相关测试全量（7 文件） | `pytest tests/test_deepseek_prompt_ledger.py tests/test_session_stable_snapshot.py tests/test_prompt_byte_stability.py tests/test_context_injection.py tests/test_qwen_cache.py tests/test_cache_diagnostics_storage.py tests/test_agent_service.py -q` | `123 passed in 25.45s` |
+| 受改动影响测试集 | 69 个测试文件（正则圈出所有引用 `agent_service` / `llm(_dialects)` / `context_injection` / `llm_diagnostics` / `memory` / `deepseek` / cache 诊断的测试），`pytest -q --junitxml=…` | `tests=1547 failures=1 errors=0`（耗时 617s）；唯一失败为既有性能型用例，见下条 |
+| 该唯一失败的归属 | `pytest tests/test_memory.py::test_delete_session_stays_fast_with_many_harness_events`，并用基线版 `core/memory.py`（`git show 419f14e:core/memory.py`）交叉复跑 | 改动后 356 ms / 基线版 553 ms，**两侧都超 350 ms 阈值** → 机器性能型既有失败，非本次回归（该用例断言的是会话删除耗时，与本次三处改动无交集） |
 | 字节 golden 未破坏 | `pytest tests/test_prompt_byte_stability.py -q` | `5 passed in 1.77s`，golden `ef286e51…` 未变 |
 | 前端技能页 | `npx vitest run src/components/Subpage.skills.test.ts` | `Tests 9 passed (9)` |
 | 语法检查 | `py_compile.compile(..., doraise=True)` 覆盖 6 个 core 文件 + 2 个测试文件（进程内执行，见备注） | `compiled 8 / 8 OK`，零 SyntaxError |
@@ -285,9 +287,19 @@
 
 > 备注（本机环境）：本沙箱会拦截子进程的批量删除并改写退出码（`3221226505` / `0xC0000409`），
 > 因此 `python -m py_compile` 与 `pytest` 的**进程退出码不可信**——验收一律以进程内编译结果
-> 或落盘日志中的汇总行为准（例如 `pytest --basetemp=<工作区内目录>` 才能拿到完整汇总行）。
+> 或 `--junitxml` 产物为准。两点实操经验：
+> 1. `--basetemp` **不要**指向工作区内的 `mytemp/`：部分用例会在 tmp 目录内写配置再改名，
+>    沙箱会以 `PermissionError: [WinError 5]` 拒绝，制造约 45 个**假失败**（换成默认临时目录后
+>    `test_config.py` + `test_gui_model_settings.py` 复跑 `56 passed` 即证）；
+> 2. pytest 收尾清理临时目录会撞「safe-delete 批量删除守卫」，终端汇总行可能丢失，故用
+>    `--junitxml` 落盘再解析，比读 stdout 可靠。
+>
 > 同一原因导致沙箱内 `ripgrep` 不可用，`tests/test_agent_turn_e2e.py` 中以 `search_code` /
 > `glob_files` 为前置的用例会因 `rg 错误 (rc=3221226505)` 而失败，属环境限制、与本改造无关。
+>
+> **全量回归（`pytest -q` 全仓）在本机未能完成**：受浏览器/电脑操控类用例拖累，实测 30 分钟
+> 仍未跑完且中途被沙箱删除守卫终止。上表的「受改动影响测试集」（69 文件 / 1547 用例）是本次
+> 可交付的最强回归证据；仓库全量回归的完整数字需在无沙箱干扰的环境补跑。
 
 ### 8.4 上线动作（运维）
 
