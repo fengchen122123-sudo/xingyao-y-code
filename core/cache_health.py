@@ -22,15 +22,18 @@ sum(cached_tokens) / sum(prompt_tokens)，不是逐轮命中率的算术平均�
 Task 3 的分母与 verdict 规则已验收，动分母须另立验收。缺失 / None / 零 / 负值 /
 非法值一律按未报告处理（不冒充 0）。
 
-★ 口径边界（与 docs/adapt-report-cross-channel-cache.md 的基线对照前必读）：
-`prev_prompt` 是在**传入的窗口内**滚动的——窗口首行没有上一行、紧跟在未报告行之后的
-那一行也拿不到上一行，这两类行**整体不进分母**（既少一个 samples，也不计入
-hot_prompt / hot_cached / write_turns）。而报告 §二 的基线是**全历史、按 session
-分链**算出来的：取样行数不同、prev 链边界也不同，**两侧数字不可直接对照**，差几个
-百分点不是回归。窗口越小偏差越大（实测 3 行窗口：samples 2/3，hot_hit_rate 50.9%
-而全量同轮次口径 67.1%）。要复测对标数字，二选一：
-① `MemoryManager.query_lane_cache_health(start_ts=修复切点, window=大于该车道切点后
-行数)`，把取样集钉在切点之后；② 直接用报告 §七 的脚本（与基线同一套算法）。
+★ prev_prompt 的两种来源（决定分母口径，读结果前必须先看是哪一种）：
+
+1. 行上带 `prev_prompt` 键（`MemoryManager.query_lane_cache_health` 走的就是这条）：
+   由查询层在**过滤前的全表**上按 (session_id, model, api_base, cache_scope) 分链算好，
+   上一行未报告缓存明细则为 NULL。此时时间范围与行数窗口只决定「取哪些行做样本」，
+   **不切断 prev 链**——区间首行不再白丢一个可判定样本，口径与报告 §二 的全历史基线
+   一致，可以直接对照（设计 §Task3 的原始口径）。
+2. 行上没有该键（直接喂 rows 的纯函数用法）：退回**窗口内滚动**兜底。此时窗口首行、
+   以及紧跟在未报告行之后的那一行拿不到 prev，两类行整体不进分母（既少一个 samples，
+   也不计入 hot_prompt / hot_cached / write_turns），窗口越小偏差越大（实测 3 行窗口
+   少 1 行：hot_hit_rate 50.9% vs 同轮次全量 67.1%）。**这种数字不要与基线直接对照**；
+   要复测对标数字请用查询层，或报告 §七 的脚本（与基线同一套算法）。
 """
 
 from dataclasses import dataclass
@@ -89,8 +92,10 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
     """把同一 lane 的窗口内诊断行归类为一条 LaneHealth。
 
     rows：同一 lane 内按 id 升序的 cache_request_diagnostics 行（dict，可含 None）。
-    window：只取最近 N 行（不足则全取）；prev_prompt 链在窗口内滚动，窗口首行
-        没有「上一行」→ 不可判定（不回溯窗口外，保证窗口外的行不影响结果）。
+    window：只取最近 N 行（不足则全取）。prev 的来源看行：带 `prev_prompt` 键时
+    以查询层算好的值为准（时间/行数窗口不切断 prev 链，区间首行照样可判定）；
+    不带该键才退回窗口内滚动（窗口首行与紧跟未报告行之后的行不可判定）。
+    两种口径的差别见模块 docstring。
     theta：upstream loss 阈值——cached < min(prev_prompt, prompt_tokens) * theta。
 
     判定顺序即语义：unreported → client_rewrite → insufficient → upstream_lossy
@@ -111,13 +116,23 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
     loss_count = 0
     client_rewrite_count = 0
     states = []
-    prev_prompt = None
+    rolling_prev = None
 
     for row in window_rows:
         reason = str(row.get("request_reason") or "")
         prompt_tokens = row.get("prompt_tokens")
         cached_tokens = row.get("cached_tokens")
         row_reported = _is_reported_row(row)
+
+        # prev 取值优先级：行上带 `prev_prompt` 键 → 以它为准（查询层按
+        # (session, model, api_base, cache_scope) 在全表上分链算好，时间/窗口过滤
+        # 不切断链；键值为 None 就是「本链首行或上一行未报告」= 不可判定，不猜）。
+        # 不带该键 → 退回窗口内滚动兜底，让直接喂行的纯函数用法行为保持不变。
+        if "prev_prompt" in row:
+            explicit_prev = row.get("prev_prompt")
+            prev_prompt = None if explicit_prev is None else int(explicit_prev)
+        else:
+            prev_prompt = rolling_prev
 
         if reason == COLD_START_REASON:
             # 冷启动：不入健康分母，也不计入换写观察（只排除）。
@@ -150,7 +165,7 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
                 states.append("ok")
 
         # 只有「已报告且有效、值非 NULL」的上一行才能把 prompt 传给下一行做 prev。
-        prev_prompt = (
+        rolling_prev = (
             int(prompt_tokens) if row_reported and prompt_tokens is not None else None
         )
 
