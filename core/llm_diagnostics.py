@@ -559,6 +559,107 @@ def lane_keepalive_evidence(model_name, api_base):
     return (turns, prompt_tokens, cached_tokens, hit_rate)
 
 
+# 保活止损证据的跨进程存活（启动播种）。证据桶是内存态、进程重启即清零，而判定
+# 门槛是「该车道保活 ≥10 轮且命中率 <0.5」——意味着每次重启都要重新白烧 10 轮全价
+# 前缀才够判一次（实测亏损车道保活单轮平均 10.6 万 token，10 轮 ≈ 106 万）。
+# token_usage 里本来就有 cache_scope='keepalive' 的落库行，启动时按车道播进内存
+# 即可零成本续上，重启后第一次保活尝试前就能止损。
+PERSISTED_KEEPALIVE_EVIDENCE_SESSION = "__persisted_keepalive__"
+_KEEPALIVE_EVIDENCE_SEED_WINDOW_DAYS = 7
+# 进程启动时刻：播种窗口的右边界，用来把「本进程自己已计入内存的轮次」排除掉。
+_KEEPALIVE_EVIDENCE_PROCESS_STARTED_AT = int(time.time())
+_keepalive_lane_evidence_seeded = False
+_keepalive_lane_evidence_seed_lock = threading.RLock()
+
+
+def seed_keepalive_lane_evidence_from_store(
+    before_ts=None,
+    window_days=_KEEPALIVE_EVIDENCE_SEED_WINDOW_DAYS,
+    force=False,
+    manager=None,
+):
+    """把上一个进程留下的保活轮次播进内存证据桶，返回本次播种的车道数。
+
+    - `before_ts` 默认取进程启动时刻：本进程记的轮次已经在内存桶里，再播一遍会
+      双计（轮次翻倍 → 样本门槛被提前跨过，等于把「≥10 轮才动」的铁律削弱成 5 轮）。
+    - 窗口只取最近 `window_days` 天：保活亏损是稳态特征，但陈旧数据不该永久压制
+      一条已经好转的车道复活。
+    - 播进独立的合成会话键，不冒充任何真实会话：`get_token_usage_snapshot` 的
+      `cache_scopes` 按 (会话, 模型, 接口) 过滤，因此 GUI 的单会话保活展示不受影响，
+      而 `_scan_keepalive_lane_evidence` 的跨会话聚合能看到它。
+    - 只播一次（幂等）：`force=True` 才允许重复播种；manager 尚未就绪时不置
+      「已播种」标记，留给启动路径重试。失败只记日志，绝不影响启动。
+    """
+    global _keepalive_lane_evidence_seeded
+    with _keepalive_lane_evidence_seed_lock:
+        if _keepalive_lane_evidence_seeded and not force:
+            return 0
+        resolved = manager
+        if resolved is None:
+            try:
+                from core import app_context
+
+                resolved = app_context.get_manager()
+            except Exception:
+                resolved = None
+        if resolved is None:
+            return 0
+        cutoff = int(
+            before_ts
+            if before_ts is not None
+            else _KEEPALIVE_EVIDENCE_PROCESS_STARTED_AT
+        )
+        try:
+            lanes = resolved.query_keepalive_lane_evidence(
+                before_ts=cutoff,
+                since_ts=cutoff - int(window_days) * 86400,
+            )
+        except Exception:
+            logger.debug("保活车道证据播种查询失败（已忽略）", exc_info=True)
+            return 0
+        seeded = 0
+        with token_usage_lock:
+            for (model_key, base_key), totals in sorted((lanes or {}).items()):
+                turns, prompt_total, cached_total = totals
+                if int(turns) <= 0 or int(prompt_total) <= 0:
+                    continue
+                state_key = (
+                    PERSISTED_KEEPALIVE_EVIDENCE_SESSION,
+                    model_key,
+                    base_key,
+                    "keepalive",
+                )
+                if state_key in _cache_usage_states:
+                    continue
+                _cache_usage_states[state_key] = {
+                    "cumulative_prompt": int(prompt_total),
+                    "cumulative_cached": int(cached_total),
+                    "hot_prompt": int(prompt_total),
+                    "hot_cached": int(cached_total),
+                    "hot_turns": int(turns),
+                    # 播种是历史合计，不冒充「最新一轮」：latest 一律留 0，
+                    # 展示层按 prompt=0 → rate=None 处理（未报告 ≠ 0）。
+                    "latest_prompt": 0,
+                    "latest_cached": 0,
+                    "usage_valid": True,
+                    "usage_error": "",
+                    "invalidation_reason": "持久化保活证据播种",
+                    "turns": int(turns),
+                }
+                seeded += 1
+        with _keepalive_lane_evidence_lock:
+            _keepalive_lane_evidence_cache["expire_at"] = 0.0
+            _keepalive_lane_evidence_cache["lanes"] = {}
+        _keepalive_lane_evidence_seeded = True
+        if seeded:
+            logger.info(
+                "保活车道证据已从持久化用量播种：%d 条车道（本进程启动前、最近 %d 天）",
+                seeded,
+                int(window_days),
+            )
+        return seeded
+
+
 def rename_cache_usage_session(old_name, new_name):
     """会话重命名时原子迁移缓存请求形状与 usage 遥测。"""
     old_key = str(old_name)

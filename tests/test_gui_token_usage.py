@@ -381,8 +381,7 @@ def _snapshot_with_scopes():
 
 
 def test_gui_token_payload_exposes_lane_dimension_keeping_legacy_keys(monkeypatch):
-    """GUI 补 lane 维度字段（模型/接口/scope + hot 与 session_all 命中率），
-    且现有键一个都不少、语义不变（前端已在读）。"""
+    """GUI 下发车道身份 + 保活单列命中率，且现有键一个都不少、语义不变（前端已在读）。"""
     bridge = _bridge_without_init()
     monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
         "litellm_model": "openai/deepseek-v4",
@@ -397,15 +396,36 @@ def test_gui_token_payload_exposes_lane_dimension_keeping_legacy_keys(monkeypatc
 
     # 金样式：改动前的键必须仍是子集
     assert _LEGACY_GUI_TOKEN_KEYS <= set(payload)
-    # lane 维度
+    # 车道身份：前端面板用它标注「这个数字属于哪条车道」
     assert payload["cache_lane_model"] == "openai/deepseek-v4"
     assert payload["cache_lane_api_base"] == "https://gui.example/v1"
-    assert payload["cache_lane_scope"] == "main"
-    assert payload["cache_lane_hot_pct"] == 98.8
-    assert payload["cache_lane_session_pct"] == 91.0
-    # 保活单列，不混入 lane/main 命中率
+    # 保活单列（与主口径同分母的是 session_all，hot 另给一格与 CLI 状态栏同源）
+    assert payload["cache_keepalive_session_pct"] == 10.0
     assert payload["cache_keepalive_hot_pct"] == 10.0
     assert payload["cache_hot_pct"] == 98.8
+
+
+def test_gui_token_payload_does_not_duplicate_existing_rate_keys(monkeypatch):
+    """车道命中率不重复下发：与既有 cache_hot_pct / cache_session_pct 同值的键必须不存在。
+
+    车道身份是新增信息，命中率本身早已按 (会话, 模型, 接口) 算好并下发；
+    再复制一份只涨载荷、并给前端留下「两个数字该信谁」的歧义。
+    """
+    bridge = _bridge_without_init()
+    monkeypatch.setattr(gui_bridge, "get_active_model", lambda *_args: {
+        "litellm_model": "openai/deepseek-v4",
+        "base_url": "https://gui.example/v1",
+        "context_window": 1000000,
+    })
+    monkeypatch.setattr(
+        llm, "get_token_usage_snapshot", lambda *args, **kwargs: _snapshot_with_scopes()
+    )
+
+    payload = bridge.get_token_usage()
+
+    assert "cache_lane_hot_pct" not in payload
+    assert "cache_lane_session_pct" not in payload
+    assert "cache_lane_scope" not in payload
 
 
 def test_gui_keepalive_lane_rate_unreported_is_none_not_zero(monkeypatch):
@@ -434,4 +454,5 @@ def test_gui_keepalive_lane_rate_unreported_is_none_not_zero(monkeypatch):
 
     assert _LEGACY_GUI_TOKEN_KEYS <= set(payload)
     assert payload["cache_keepalive_hot_pct"] is None
+    assert payload["cache_keepalive_session_pct"] is None
 
