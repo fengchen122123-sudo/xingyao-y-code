@@ -341,3 +341,32 @@ def test_strict_config_true_with_keepalive_evidence_gate_passes(
 
     assert config.audit_config_keys() == []
     assert captured_warnings == []
+
+
+# ---------------------------------------------------------------------------
+# Task6：prompt_cache_key 白名单键登记
+# ---------------------------------------------------------------------------
+
+def test_cache_affinity_lanes_key_is_known():
+    """Task6：cache_affinity_lanes 登记为已知键，不出现在未知键列表。
+
+    该键被 core/llm_dialects.py 的 _affinity_lane_enabled 读取；不登记则
+    strict_config 用户会因未知键告警被阻断启动。
+    """
+    data = {"cache_affinity_lanes": []}
+
+    assert config.find_unknown_config_keys(data) == []
+
+
+def test_strict_config_true_with_cache_affinity_lanes_passes(
+    cfg_env, captured_warnings
+):
+    """Task6：strict_config=true 且含该键时 audit_config_keys() 返回 []、零告警。"""
+    cfg_path, _ = cfg_env
+    cfg_path.write_text(
+        json.dumps({"strict_config": True, "cache_affinity_lanes": ["relay.example"]}),
+        encoding="utf-8",
+    )
+
+    assert config.audit_config_keys() == []
+    assert captured_warnings == []

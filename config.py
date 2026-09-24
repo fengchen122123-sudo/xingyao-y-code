@@ -452,10 +452,11 @@ KNOWN_CONFIG_KEYS = frozenset({
     # 本任务新增：严格模式开关
     "strict_config",
     # 缓存路由显式配置（core/route_overrides.py CONFIG_KEY、core/llm_dialects.py
-    # _KEEPALIVE_ROUTES_CONFIG_KEY / _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY）与保活
-    # 证据门开关（core/llm_dialects.py _KEEPALIVE_EVIDENCE_GATE_CONFIG_KEY）
+    # _KEEPALIVE_ROUTES_CONFIG_KEY / _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY）、保活
+    # 证据门开关（_KEEPALIVE_EVIDENCE_GATE_CONFIG_KEY）与 prompt_cache_key
+    # 白名单（_AFFINITY_LANES_CONFIG_KEY）
     "route_request_overrides", "cache_keepalive_routes", "deepseek_cache_routes",
-    "cache_keepalive_evidence_gate",
+    "cache_keepalive_evidence_gate", "cache_affinity_lanes",
 })
 
 # 已知嵌套对象（两层）允许的子键：顶层键 -> 子键集合
