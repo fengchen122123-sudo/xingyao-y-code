@@ -1331,9 +1331,15 @@ class MemoryManager:
                 raise
 
     def query_cache_request_diagnostics(
-        self, start_ts=None, end_ts=None, session_id=None, cache_scope=None
+        self, start_ts=None, end_ts=None, session_id=None, cache_scope=None,
+        with_prev_prompt=False,
     ):
-        """按时间/会话读取诊断行；NULL 与真实 0 保持原样。"""
+        """按时间/会话读取诊断行；NULL 与真实 0 保持原样。
+
+        `with_prev_prompt=True` 时每行额外带 `prev_prompt`：同一
+        (session_id, model, api_base, cache_scope) 内按 id 排序的上一行 prompt_tokens
+        （设计 §Task3 口径）。上一行未报告缓存明细、或本行已是该链首行 → NULL。
+        """
         clauses = []
         params = []
         if start_ts is not None:
@@ -1358,12 +1364,31 @@ class MemoryManager:
             "cache_reported", "usage_valid",
             "usage_errors", "cache_control_markers", "request_bytes_final",
         )
-        with self._lock:
-            rows = self.conn.execute(
-                "SELECT " + ",".join(columns)
-                + " FROM cache_request_diagnostics" + where + " ORDER BY ts, id",
-                params,
-            ).fetchall()
+        if not with_prev_prompt:
+            with self._lock:
+                rows = self.conn.execute(
+                    "SELECT " + ",".join(columns)
+                    + " FROM cache_request_diagnostics" + where + " ORDER BY ts, id",
+                    params,
+                ).fetchall()
+        else:
+            # prev 在**过滤前的全表**上算，再套外层过滤：时间范围的首行照样拿得到
+            # 上一行，不会因为「切点正好落在行中间」白丢一个样本。分区含 session_id：
+            # 不同会话绝不互借 prev（跨会话的大 prompt 会把新会话首行误判成丢前缀）。
+            # CASE 未命中即 NULL：上一行未报告缓存明细时 prev 视为未知（不把未知当 0）。
+            selected = columns + ("prev_prompt",)
+            with self._lock:
+                rows = self.conn.execute(
+                    "SELECT * FROM (SELECT "
+                    + ",".join(columns)
+                    + ", LAG(CASE WHEN cache_reported = 1 AND usage_valid = 1 "
+                      "THEN prompt_tokens END) OVER ("
+                      "PARTITION BY session_id, model, api_base, cache_scope "
+                      "ORDER BY id) AS prev_prompt "
+                    + " FROM cache_request_diagnostics)" + where + " ORDER BY ts, id",
+                    params,
+                ).fetchall()
+            columns = selected
         result = []
         for row in rows:
             item = dict(zip(columns, row))
@@ -1420,8 +1445,14 @@ class MemoryManager:
         复用 query_cache_request_diagnostics（idx_cache_diag_ts 走时间过滤），按 lane
         分组、组内按 id 升序，再交给 core.cache_health.classify_lanes_health 派生。
         查询层不把 NULL 转成 0——「未报告 ≠ 真实 0」由派生层继续区分。
+
+        prev_prompt 由查询层按 (会话, lane) 分链算好后随行带上（设计 §Task3 口径）：
+        时间范围只决定「取哪些行做样本」，不切断 prev 链——否则切点正好落在某个会话
+        中间时，区间首行会白白丢掉一个可判定样本。
         """
-        rows = self.query_cache_request_diagnostics(start_ts, end_ts)
+        rows = self.query_cache_request_diagnostics(
+            start_ts, end_ts, with_prev_prompt=True
+        )
         grouped = {}
         for row in rows:
             key = (row["model"], row["api_base"], row["cache_scope"])
