@@ -6265,6 +6265,10 @@ class ApiBridge(GitBridgeMixin):
             latest_rate = cache_usage["latest"].get("rate")
             hot_rate = cache_usage["hot"].get("rate")
             session_rate = cache_usage["session_all"].get("rate")
+            # Task 4：补 lane 维度（当前会话的模型 / 接口 / scope）与保活单列
+            lane_model = str(active.get("litellm_model", "") or "")
+            lane_api_base = str(active.get("base_url", "") or "")
+            keepalive_usage = (snapshot.get("cache_scopes") or {}).get("keepalive") or {}
 
             def rounded(value):
                 return None if value is None else round(float(value), 1)
@@ -6295,6 +6299,17 @@ class ApiBridge(GitBridgeMixin):
                     process_usage.get("cumulative_completion", 0) or 0
                 ),
                 "total_cached": int(process_usage.get("cumulative_cached", 0) or 0),
+                # Task 4：lane 维度字段——前端按当前车道显示命中率，
+                # 不再把跨渠道/保活数据混成一个数字（现有键语义保持不变）
+                "cache_lane_model": lane_model,
+                "cache_lane_api_base": lane_api_base,
+                "cache_lane_scope": "main",
+                "cache_lane_hot_pct": rounded(hot_rate),
+                "cache_lane_session_pct": rounded(session_rate),
+                # 保活单列：keepalive scope 热命中率（未报告为 None，不冒充 0）
+                "cache_keepalive_hot_pct": rounded(
+                    (keepalive_usage.get("hot") or {}).get("rate")
+                ),
                 # 输入框悬停面板：上下文来源字符占比快照（设计规格 §3.4）
                 "context_breakdown": get_breakdown(),
             }
@@ -6306,6 +6321,9 @@ class ApiBridge(GitBridgeMixin):
                 "cache_session_pct": None, "cache_available": False,
                 "cache_hot_turns": 0, "cache_invalidation_reason": "",
                 "prompt_tokens": 0, "cached_tokens": 0,
+                "cache_lane_model": "", "cache_lane_api_base": "",
+                "cache_lane_scope": "main", "cache_lane_hot_pct": None,
+                "cache_lane_session_pct": None, "cache_keepalive_hot_pct": None,
                 "context_breakdown": [],
             }
 

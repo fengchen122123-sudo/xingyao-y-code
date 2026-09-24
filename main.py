@@ -382,7 +382,11 @@ def _render_usage_section(manager, label, start_s, end_s):
     if not rows:
         print_formatted_text(HTML("  <ansigray>暂无记录</ansigray>"))
         return False
-    display_rows = [(row, _usage_model_label(row)) for row in rows]
+    # 展开 api_base 与 scope：同名模型的不同渠道/保活分行显示，main 不再被合并
+    display_rows = [
+        (row, _usage_model_label(row, row.get("api_base"), row.get("cache_scope")))
+        for row in rows
+    ]
     name_w = max(
         12,
         min(60, max(_term_display_width(name) for _, name in display_rows) + 2),
@@ -469,12 +473,47 @@ def _format_cache_hit_rate(cached_tokens, cache_prompt_tokens):
     return f"{cached_tokens / cache_prompt_tokens * 100:.1f}%"
 
 
-def _usage_model_label(row):
-    """用量表只显示 provider/model；接口域名/path 哈希/缓存作用域标签
-    对日常使用是噪音（历史遗留的 @ host path#xx [scope] 已按用户要求移除）。"""
+def _status_cache_metrics(session_id, model_name, api_base, cache_scope="main"):
+    """状态栏口径：当前会话 × 当前车道的热命中率（主指标）。
+
+    车道键与 core/llm_diagnostics._cache_usage_key 完全一致
+    （lower + 去尾斜杠 + scope）。keepalive 从 cache_scopes 单列取，
+    不混进 main；进程级累计（所有会话/渠道/scope 混算）不在此函数内。
+    rate 为 None 表示该车道 usage 未报告，展示层按 "--" 处理（未报告 ≠ 0）。
+    """
+    snapshot = get_token_usage_snapshot(session_id, model_name, api_base, cache_scope)
+    cache = snapshot.get("cache") or {}
+    scopes = snapshot.get("cache_scopes") or {}
+    current_scope = str(cache_scope or "main")
+    keepalive = cache if current_scope == "keepalive" else (scopes.get("keepalive") or {})
+    hot = cache.get("hot") or {}
+    session_all = cache.get("session_all") or {}
+    keepalive_hot = keepalive.get("hot") or {}
+    return {
+        "hot_rate": hot.get("rate"),
+        "hot_prompt": int(hot.get("prompt_tokens", 0) or 0),
+        "hot_cached": int(hot.get("cached_tokens", 0) or 0),
+        "session_rate": session_all.get("rate"),
+        "keepalive_rate": keepalive_hot.get("rate"),
+        "keepalive_prompt": int(keepalive_hot.get("prompt_tokens", 0) or 0),
+        "keepalive_cached": int(keepalive_hot.get("cached_tokens", 0) or 0),
+    }
+
+
+def _usage_model_label(row, api_base=None, cache_scope=None):
+    """用量表标签：provider/model；显式传入 api_base / cache_scope 时展开身份，
+    让同一模型在不同渠道、不同作用域（如保活）的命中率分行显示，不再被合并。
+    默认不展开（保持历史精简输出：不带接口域名/path 哈希/scope 后缀）。"""
     provider = str(row.get("provider") or "")
     model = str(row.get("model") or "")
-    return f"{provider}/{model}" if provider else model
+    label = f"{provider}/{model}" if provider else model
+    base = str(api_base or "").strip()
+    if base:
+        label = f"{label} @ {base}"
+    scope = str(cache_scope or "").strip()
+    if scope and scope != "main":
+        label = f"{label} [{scope}]"
+    return label
 
 
 def set_terminal_title(title: str) -> None:
@@ -4505,7 +4544,8 @@ def _make_input_app():
         # 1. 提取短模型名（使用内存缓存，避免每次渲染都读盘解析 config.json）
         model_display = current_model_name or "未激活模型"
 
-        # 2. 读取统一快照：取计费累计与上下文窗口用量
+        # 2. 读取统一快照：主指标 = 当前会话 × 当前车道的热命中率；
+        #    进程级累计（所有会话/渠道/scope 混算）降为次要显示
         usage_snapshot = get_token_usage_snapshot(
             current_session, current_model, current_url, "main"
         )
@@ -4513,15 +4553,23 @@ def _make_input_app():
         latest_total = usage_snapshot["window"]["latest_total"]
         max_win = current_ctx_win
 
+        lane_metrics = _status_cache_metrics(
+            current_session, current_model, current_url, "main"
+        )
+        lane_rate = lane_metrics["hot_rate"]
+        lane_cached = lane_metrics["hot_cached"]
+        keepalive_rate = lane_metrics["keepalive_rate"]
+
         cum_prompt = process_usage["cumulative_prompt"]
         cum_completion = process_usage["cumulative_completion"]
         cum_cached = process_usage["cumulative_cached"]
 
         # 命中率分母用 prompt tokens（缓存只可能命中输入部分），
-        # 用 total（含输出）会把比率稀释失真
-        hit_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else 0
+        # 用 total（含输出）会把比率稀释失真。
+        # lane_rate 为 None 表示该车道 usage 未报告（≠ 0 命中），显示 "--"。
+        global_rate = (cum_cached / cum_prompt * 100) if cum_prompt > 0 else None
         pct = (latest_total / max_win * 100) if max_win > 0 else 0
-        
+
         def format_num(n):
             if n >= 1_000_000:
                 val = n / 1_000_000
@@ -4530,19 +4578,26 @@ def _make_input_app():
                 val = n / 1_000
                 return f"{int(val)}K" if val.is_integer() else f"{val:.1f}K"
             return str(n)
-            
+
         prompt_str = format_num(cum_prompt)
         completion_str = format_num(cum_completion)
         cached_str = format_num(cum_cached)
+        lane_cached_str = format_num(lane_cached)
+        lane_rate_str = f"{lane_rate:.0f}%" if lane_rate is not None else "--"
+        global_rate_str = f"{global_rate:.0f}%" if global_rate is not None else "--"
         latest_total_str = format_num(latest_total)
         max_win_str = format_num(max_win)
 
-        # 状态栏 Token 概览：输入/输出/命中/命中率/上下文
+        # 状态栏 Token 概览：主指标是当前车道热命中率；
+        # 进程级累计只作次要标注（跨会话/渠道/scope 混算，不代表当前车道）。
         token_info = (
             f"输入 {prompt_str} · 输出 {completion_str} · "
-            f"命中 {cached_str} ({hit_rate:.0f}%) · "
+            f"命中 {lane_cached_str} ({lane_rate_str}) · "
+            f"全局累计 {cached_str} ({global_rate_str}) · "
             f"上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
         )
+        if keepalive_rate is not None:
+            token_info += f" · 保活 {keepalive_rate:.0f}%"
 
         # 3. 统计星瑶的执行状态与播放动画，证明星瑶仍在操作/思考
         # 直接读模块全局变量，不再 import main 自引用

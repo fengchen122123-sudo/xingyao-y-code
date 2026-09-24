@@ -358,13 +358,74 @@ def _mark_cache_usage_unavailable(
             session_token_usage["cache_invalidation_reason"] = state["usage_error"]
 
 
+def _cache_usage_view(state):
+    """把某车道的 usage 状态转成 latest/hot/session_all 三口径视图。
+
+    usage_valid=False（usage 未报告/不一致）时三个 rate 一律为 None：
+    未报告 ≠ 0 命中（铁律 3），调用方按 None 展示为 "--" 而不是 0%。
+    """
+    if state is None:
+        return {
+            "available": False,
+            "usage_valid": False,
+            "latest": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+            "hot": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+            "session_all": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
+            "hot_turns": 0,
+            "invalidation_reason": "",
+        }
+    valid = bool(state.get("usage_valid", True))
+
+    def _rate(cached_value, prompt_value):
+        if not valid or not prompt_value:
+            return None
+        return cached_value / prompt_value * 100
+
+    latest_prompt = int(state.get("latest_prompt", 0) or 0)
+    latest_cached = int(state.get("latest_cached", 0) or 0)
+    hot_prompt = int(state.get("hot_prompt", 0) or 0)
+    hot_cached = int(state.get("hot_cached", 0) or 0)
+    cumulative_prompt = int(state.get("cumulative_prompt", 0) or 0)
+    cumulative_cached = int(state.get("cumulative_cached", 0) or 0)
+    return {
+        "available": valid,
+        "usage_valid": valid,
+        "latest": {
+            "prompt_tokens": latest_prompt,
+            "cached_tokens": latest_cached,
+            "rate": _rate(latest_cached, latest_prompt),
+        },
+        "hot": {
+            "prompt_tokens": hot_prompt,
+            "cached_tokens": hot_cached,
+            "rate": _rate(hot_cached, hot_prompt),
+        },
+        "session_all": {
+            "prompt_tokens": cumulative_prompt,
+            "cached_tokens": cumulative_cached,
+            "rate": _rate(cumulative_cached, cumulative_prompt),
+        },
+        "hot_turns": int(state.get("hot_turns", 0) or 0),
+        "invalidation_reason": str(
+            state.get("usage_error")
+            if not valid
+            else state.get("invalidation_reason", "")
+        ),
+    }
+
+
 def get_token_usage_snapshot(
     session_id,
     model_name,
     api_base,
     cache_scope="main",
 ):
-    """返回线程安全的 token 与当前缓存身份快照，不暴露内部可变状态。"""
+    """返回线程安全的 token 与当前缓存身份快照，不暴露内部可变状态。
+
+    cache 仍是「当前 scope」的视图（键与语义不变）；cache_scopes 是
+    同一 (会话, 模型, 接口) 下按 scope 分离的只读视图（如 keepalive 单列），
+    供展示层把保活与 main 分开，不改变任何记账语义。
+    """
     state_key = _cache_usage_key(
         session_id, model_name, api_base, cache_scope
     )
@@ -387,56 +448,20 @@ def get_token_usage_snapshot(
                 session_token_usage.get("cumulative_cache_prompt", 0) or 0
             ),
         }
-        if state is None:
-            cache = {
-                "available": False,
-                "usage_valid": False,
-                "latest": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
-                "hot": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
-                "session_all": {"prompt_tokens": 0, "cached_tokens": 0, "rate": None},
-                "hot_turns": 0,
-                "invalidation_reason": "",
-            }
-        else:
-            valid = bool(state.get("usage_valid", True))
-
-            def _rate(cached_value, prompt_value):
-                if not valid or not prompt_value:
-                    return None
-                return cached_value / prompt_value * 100
-
-            latest_prompt = int(state.get("latest_prompt", 0) or 0)
-            latest_cached = int(state.get("latest_cached", 0) or 0)
-            hot_prompt = int(state.get("hot_prompt", 0) or 0)
-            hot_cached = int(state.get("hot_cached", 0) or 0)
-            cumulative_prompt = int(state.get("cumulative_prompt", 0) or 0)
-            cumulative_cached = int(state.get("cumulative_cached", 0) or 0)
-            cache = {
-                "available": valid,
-                "usage_valid": valid,
-                "latest": {
-                    "prompt_tokens": latest_prompt,
-                    "cached_tokens": latest_cached,
-                    "rate": _rate(latest_cached, latest_prompt),
-                },
-                "hot": {
-                    "prompt_tokens": hot_prompt,
-                    "cached_tokens": hot_cached,
-                    "rate": _rate(hot_cached, hot_prompt),
-                },
-                "session_all": {
-                    "prompt_tokens": cumulative_prompt,
-                    "cached_tokens": cumulative_cached,
-                    "rate": _rate(cumulative_cached, cumulative_prompt),
-                },
-                "hot_turns": int(state.get("hot_turns", 0) or 0),
-                "invalidation_reason": str(
-                    state.get("usage_error")
-                    if not valid
-                    else state.get("invalidation_reason", "")
-                ),
-            }
-    return {"window": window, "process": process, "cache": cache}
+        cache = _cache_usage_view(state)
+        current_scope = str(cache_scope or "main")
+        cache_scopes = {current_scope: cache}
+        lane_identity = state_key[:3]
+        for key, scope_state in _cache_usage_states.items():
+            if key[:3] != lane_identity or key[3] == current_scope:
+                continue
+            cache_scopes[key[3]] = _cache_usage_view(scope_state)
+    return {
+        "window": window,
+        "process": process,
+        "cache": cache,
+        "cache_scopes": cache_scopes,
+    }
 
 
 def rename_cache_usage_session(old_name, new_name):

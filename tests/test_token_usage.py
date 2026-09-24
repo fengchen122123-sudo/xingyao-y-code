@@ -546,3 +546,122 @@ def test_format_cache_diagnostic_summary_omits_empty_summary():
     assert main._format_cache_diagnostic_summary({
         "count": 0, "lost_tokens": 0, "unreported": 0, "categories": {}
     }) == ""
+
+
+# —— 跨渠道缓存命中率修复 · Task 4：口径修复与展示 ——
+
+def test_status_cache_metrics_take_current_lane_hot_rate_not_process_mix():
+    """状态栏主指标 = 当前会话 × 当前车道的热命中率：跨渠道切换不串数。
+
+    阿里云车道 4 轮 950/1000 = 95%，基元律动车道 2 轮 100/1000 = 10%；
+    进程级累计混算会是 66.6%。这里断言两个具体数字，杜绝回到混算口径。
+    """
+    import core.llm as llm
+
+    session, model = "task4-lane-switch", "openai/deepseek-v4.1-flash"
+    aliyun = "https://aliyun-token-plan.example/v1"
+    tokenrhythm = "https://tokenrhythm.example/v1"
+    for _ in range(4):
+        llm._record_cache_usage(session, "main", 1000, 950, "", model, aliyun)
+    for _ in range(2):
+        llm._record_cache_usage(session, "main", 1000, 100, "", model, tokenrhythm)
+
+    aliyun_metrics = main._status_cache_metrics(session, model, aliyun)
+    tokenrhythm_metrics = main._status_cache_metrics(session, model, tokenrhythm)
+
+    assert aliyun_metrics["hot_rate"] == 95.0
+    assert tokenrhythm_metrics["hot_rate"] == 10.0
+    assert aliyun_metrics["hot_prompt"] == 4000
+    assert tokenrhythm_metrics["hot_prompt"] == 2000
+
+
+def test_status_cache_metrics_keep_keepalive_scope_out_of_main():
+    """保活不污染 main：keepalive 低命中轮次绝不动 main 指标，且自身单独可得。"""
+    import core.llm as llm
+
+    session, model = "task4-keepalive-isolation", "openai/deepseek-v4.1-flash"
+    base = "https://aliyun-token-plan.example/v1"
+    for _ in range(4):
+        llm._record_cache_usage(session, "main", 1000, 950, "", model, base)
+
+    before = main._status_cache_metrics(session, model, base)
+    for _ in range(6):
+        llm._record_cache_usage(session, "keepalive", 10000, 0, "", model, base)
+    after = main._status_cache_metrics(session, model, base)
+
+    assert before["hot_rate"] == 95.0
+    # §1.7 的 11.5pp 假跌：保活 0 命中不得把 main 从 95% 拖下来
+    assert after["hot_rate"] == 95.0
+    assert after["hot_prompt"] == 4000
+    assert after["hot_cached"] == 3800
+    # 保活自身指标单独可得
+    assert after["keepalive_rate"] == 0.0
+    assert after["keepalive_prompt"] == 60000
+    assert after["keepalive_cached"] == 0
+
+
+def test_status_cache_metrics_unreported_lane_is_none_not_zero():
+    """铁律「未报告 ≠ 0」：usage_valid=0 的车道指标为 None，不冒充 0% 命中。"""
+    import core.llm as llm
+
+    session, model = "task4-unreported", "openai/local-vllm"
+    base = "http://10.38.90.70:8000/v1"
+
+    llm._record_cache_usage(session, "main", 1000, 950, "", model, base)
+    llm._mark_cache_usage_unavailable(session, model, base, "main", "usage 不一致")
+
+    metrics = main._status_cache_metrics(session, model, base)
+
+    assert metrics["hot_rate"] is None
+    assert metrics["session_rate"] is None
+    # 已报告的累计分母不因「最新一轮未报告」而丢失
+    assert metrics["hot_prompt"] == 1000
+
+
+def test_usage_model_label_separates_routes_and_keepalive_scope():
+    """同一模型在不同渠道 / 不同 scope 必须产出不同标签，不再合并成一条。"""
+    row = {
+        "provider": "openai",
+        "model": "deepseek-v4-flash",
+        "api_base": "https://aliyun-token-plan.example/v1",
+        "cache_scope": "main",
+    }
+    other = {**row, "api_base": "https://tokenrhythm.example/v1"}
+    keepalive = {**row, "cache_scope": "keepalive"}
+
+    aliyun_label = main._usage_model_label(row, row["api_base"], row["cache_scope"])
+    tokenrhythm_label = main._usage_model_label(
+        other, other["api_base"], other["cache_scope"]
+    )
+    keepalive_label = main._usage_model_label(
+        keepalive, keepalive["api_base"], keepalive["cache_scope"]
+    )
+
+    assert aliyun_label == (
+        "openai/deepseek-v4-flash @ https://aliyun-token-plan.example/v1"
+    )
+    assert tokenrhythm_label != aliyun_label
+    assert keepalive_label != aliyun_label
+    assert "[keepalive]" in keepalive_label
+    # 同 model + 同 api_base + 同 scope 标签稳定
+    assert main._usage_model_label(
+        row, row["api_base"], row["cache_scope"]
+    ) == aliyun_label
+
+
+def test_token_usage_snapshot_exposes_per_scope_views_without_changing_cache_keys():
+    """快照新增按 scope 分离视图；现有 cache 键语义不变（仍是当前 scope 视图）。"""
+    import core.llm as llm
+
+    session, model = "task4-scope-views", "openai/deepseek-v4.1-flash"
+    base = "https://aliyun-token-plan.example/v1"
+    llm._record_cache_usage(session, "main", 1000, 950, "", model, base)
+    llm._record_cache_usage(session, "keepalive", 1000, 100, "", model, base)
+
+    snapshot = llm.get_token_usage_snapshot(session, model, base, "main")
+
+    assert snapshot["cache"]["hot"]["rate"] == 95.0
+    assert snapshot["cache"]["hot"]["prompt_tokens"] == 1000
+    assert snapshot["cache_scopes"]["main"]["hot"]["rate"] == 95.0
+    assert snapshot["cache_scopes"]["keepalive"]["hot"]["rate"] == 10.0
+    assert snapshot["cache_scopes"]["keepalive"]["hot"]["prompt_tokens"] == 1000
