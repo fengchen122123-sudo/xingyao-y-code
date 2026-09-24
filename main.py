@@ -134,6 +134,15 @@ import config
 
 manager = MemoryManager(db_path=config.DB_FILE)
 
+# 保活止损证据跨进程续用：CLI 启动时同样把上一个进程落库的 keepalive 轮次播进内存
+# 证据桶，否则每次重启都要重新白烧 10 轮全价前缀才够判一次止损。失败不阻断启动。
+try:
+    from core.llm_diagnostics import seed_keepalive_lane_evidence_from_store
+
+    seed_keepalive_lane_evidence_from_store(manager=manager)
+except Exception:  # 启动兜底：证据播种失败最多退回「重启后重新攒 10 轮」的旧行为
+    pass
+
 # 按回合撤销：注册进程级存储并执行启动恢复扫描（收敛中断事务、重建路径
 # 冻结、清理跨 boot 失效令牌；不自动重放任何文件写入）
 from core.turn_undo import service as _turn_undo_service
