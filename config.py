@@ -451,6 +451,9 @@ KNOWN_CONFIG_KEYS = frozenset({
     "media_v1_migration_done",
     # 本任务新增：严格模式开关
     "strict_config",
+    # 缓存路由显式配置（core/route_overrides.py CONFIG_KEY、core/llm_dialects.py
+    # _KEEPALIVE_ROUTES_CONFIG_KEY / _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY）
+    "route_request_overrides", "cache_keepalive_routes", "deepseek_cache_routes",
 })
 
 # 已知嵌套对象（两层）允许的子键：顶层键 -> 子键集合
