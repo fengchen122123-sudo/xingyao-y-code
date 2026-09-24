@@ -1172,3 +1172,168 @@ def test_keepalive_evidence_cache_ttl_is_short_window(monkeypatch):
     assert lane_keepalive_evidence(_TASK5_MODEL, base) == (
         2, 2_000, 1_000, pytest.approx(0.5),
     )
+
+
+# ---------------------------------------------------------------------------
+# 启动播种：止损证据必须跨进程存活
+#
+# 证据桶是内存态、重启即清零，而判定门槛是「该车道保活 ≥10 轮且命中率 <0.5」——
+# 意味着每次重启都要重新白烧 10 轮全价前缀才够判（实测亏损车道保活单轮平均
+# 10.6 万 token）。token_usage 里本来就有 cache_scope='keepalive' 的行，
+# 启动时按车道播进内存即可零成本续上。
+# ---------------------------------------------------------------------------
+
+_TASK5_SEED_MODEL_LEAF = "deepseek-v4.1-flash"
+
+
+def _clear_keepalive_lane(model, api_base):
+    """清掉某车道全部 keepalive 内存桶（含播种用的合成会话桶），避免测试间污染。"""
+    import core.llm_diagnostics as diagnostics
+
+    target = (str(model or "").lower(), str(api_base or "").rstrip("/").lower())
+    with diagnostics.token_usage_lock:
+        for key in [
+            k for k in diagnostics._cache_usage_states
+            if str(k[3]) == "keepalive" and (k[1], k[2]) == target
+        ]:
+            del diagnostics._cache_usage_states[key]
+    _expire_keepalive_evidence_cache()
+
+
+def _persist_keepalive_turns(manager, api_base, *, turns, prompt, cached, ts_list=None,
+                            session_prefix="persisted"):
+    """把「已落库的保活轮次」按真实记账路径写进 token_usage（含 cached=None 的未报告形状）。"""
+    import time as _time
+
+    now = int(_time.time())
+    for index in range(turns):
+        manager.add_token_usage(
+            "openai", _TASK5_SEED_MODEL_LEAF, prompt, 5,
+            None if cached is None else cached, prompt + 5,
+            session_id=f"{session_prefix}-{index}", api_base=api_base,
+            cache_scope="keepalive",
+            ts=(ts_list[index] if ts_list else now - 3600 + index),
+        )
+
+
+def test_seed_restores_loss_evidence_after_process_restart(tmp_path, monkeypatch):
+    """新进程内存为空：启动播种后必须立刻具备止损证据，不再白烧 10 轮保活。"""
+    import time as _time
+
+    import core.app_context as app_context
+    import core.llm_diagnostics as diagnostics
+    from core.memory import MemoryManager
+
+    base = "https://task5-restart.example/v1"
+    manager = MemoryManager(tmp_path / "seed.db")
+    now = int(_time.time())
+    _persist_keepalive_turns(manager, base, turns=12, prompt=100_000, cached=20_000)
+
+    monkeypatch.setattr(app_context, "get_manager", lambda: manager)
+    _clear_keepalive_lane(_TASK5_MODEL, base)
+    diagnostics._keepalive_lane_evidence_seeded = False
+
+    try:
+        assert diagnostics.lane_keepalive_evidence(_TASK5_MODEL, base)[0] == 0, "播种前内存应为空"
+        assert diagnostics.seed_keepalive_lane_evidence_from_store(before_ts=now + 10) == 1
+
+        turns, prompt, cached, hit_rate = diagnostics.lane_keepalive_evidence(
+            _TASK5_MODEL, base
+        )
+        assert turns == 12
+        assert prompt == 1_200_000 and cached == 240_000
+        assert hit_rate == pytest.approx(0.2)
+
+        import core.llm_dialects as dialects
+
+        _stub_config(monkeypatch, {})
+        dialects._keepalive_evidence_disabled_routes.clear()
+        from core.llm import _supports_cache_keepalive
+
+        assert _supports_cache_keepalive(_TASK5_MODEL, base) is False, "重启后应立即止损"
+    finally:
+        _clear_keepalive_lane(_TASK5_MODEL, base)
+        diagnostics._keepalive_lane_evidence_seeded = False
+
+
+def test_seed_skips_current_process_rows_and_unreported_turns(tmp_path, monkeypatch):
+    """播种只吃「本进程启动前」且「报告了缓存明细」的行。
+
+    本进程自己记的轮次已在内存桶里，再播一遍会双计（轮次翻倍 → 判定门槛被提前
+    跨过）；未报告缓存明细的轮次连入分母的资格都没有（未报告 ≠ 0）。
+    """
+    import time as _time
+
+    import core.app_context as app_context
+    import core.llm_diagnostics as diagnostics
+    from core.memory import MemoryManager
+
+    base = "https://task5-seed-window.example/v1"
+    manager = MemoryManager(tmp_path / "seed2.db")
+    now = int(_time.time())
+    process_start = now - 60
+    _persist_keepalive_turns(
+        manager, base, turns=12, prompt=100_000, cached=20_000,
+        ts_list=[process_start - 120 + i for i in range(12)],
+        session_prefix="prev-process",
+    )
+    # 本进程启动后落库的行：内存桶已计过一次，播种必须跳过
+    _persist_keepalive_turns(
+        manager, base, turns=8, prompt=100_000, cached=90_000,
+        ts_list=[process_start + 10 + i for i in range(8)],
+        session_prefix="this-process",
+    )
+    # 未报告缓存明细的行：绝不入分母
+    _persist_keepalive_turns(
+        manager, base, turns=3, prompt=100_000, cached=None,
+        ts_list=[process_start - 200 - i for i in range(3)],
+        session_prefix="unreported",
+    )
+
+    monkeypatch.setattr(app_context, "get_manager", lambda: manager)
+    _clear_keepalive_lane(_TASK5_MODEL, base)
+    diagnostics._keepalive_lane_evidence_seeded = False
+
+    try:
+        diagnostics.seed_keepalive_lane_evidence_from_store(before_ts=process_start)
+        turns, prompt, cached, hit_rate = diagnostics.lane_keepalive_evidence(
+            _TASK5_MODEL, base
+        )
+        assert turns == 12, "只播上一个进程的 12 轮，跳过本进程 8 轮与未报告 3 轮"
+        assert prompt == 1_200_000 and cached == 240_000
+        assert hit_rate == pytest.approx(0.2)
+    finally:
+        _clear_keepalive_lane(_TASK5_MODEL, base)
+        diagnostics._keepalive_lane_evidence_seeded = False
+
+
+def test_seed_is_idempotent_and_keeps_per_session_view_clean(tmp_path, monkeypatch):
+    """播种幂等，且不冒充任何真实会话（GUI 的单会话保活展示不受播种影响）。"""
+    import time as _time
+
+    import core.app_context as app_context
+    import core.llm_diagnostics as diagnostics
+    from core.memory import MemoryManager
+
+    base = "https://task5-seed-idempotent.example/v1"
+    manager = MemoryManager(tmp_path / "seed3.db")
+    now = int(_time.time())
+    _persist_keepalive_turns(manager, base, turns=11, prompt=50_000, cached=10_000)
+
+    monkeypatch.setattr(app_context, "get_manager", lambda: manager)
+    _clear_keepalive_lane(_TASK5_MODEL, base)
+    diagnostics._keepalive_lane_evidence_seeded = False
+
+    try:
+        assert diagnostics.seed_keepalive_lane_evidence_from_store(before_ts=now + 10) == 1
+        again = diagnostics.seed_keepalive_lane_evidence_from_store(before_ts=now + 10)
+        assert again == 0, "默认不重复播种"
+        assert diagnostics.lane_keepalive_evidence(_TASK5_MODEL, base)[0] == 11
+
+        snapshot = diagnostics.get_token_usage_snapshot(
+            "task5-real-session", _TASK5_MODEL, base, "main"
+        )
+        assert "keepalive" not in snapshot["cache_scopes"], "播种不得冒充真实会话"
+    finally:
+        _clear_keepalive_lane(_TASK5_MODEL, base)
+        diagnostics._keepalive_lane_evidence_seeded = False

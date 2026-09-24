@@ -613,6 +613,15 @@ class ApiBridge(GitBridgeMixin):
         app_context.set_ui_flavor("gui")
         app_context.set_manager(self._memory)
         app_context.set_current_session(self._current_session)
+        # 保活止损证据跨进程续用：把上一个进程落库的 keepalive 轮次播进内存证据桶。
+        # 不播种则每次重启都要重新白烧 10 轮全价前缀才够判一次止损（实测亏损车道
+        # 单轮保活平均 10.6 万 token）。失败只记日志，绝不阻断窗口启动。
+        try:
+            from core.llm_diagnostics import seed_keepalive_lane_evidence_from_store
+
+            seed_keepalive_lane_evidence_from_store()
+        except Exception:
+            logger.warning("保活车道证据播种失败（已忽略）", exc_info=True)
         self._sync_active_model_context()
         permission_broker.set_prompt_handlers(
             self._activate_permission_request,
@@ -6318,16 +6327,19 @@ class ApiBridge(GitBridgeMixin):
                     process_usage.get("cumulative_completion", 0) or 0
                 ),
                 "total_cached": int(process_usage.get("cumulative_cached", 0) or 0),
-                # Task 4：lane 维度字段——前端按当前车道显示命中率，
-                # 不再把跨渠道/保活数据混成一个数字（现有键语义保持不变）
+                # 车道身份与保活单列（前端上下文面板消费；口径与上面的 cache_*_pct 一致，
+                # 因此不再重复输出 cache_lane_hot_pct / cache_lane_session_pct 这类
+                # 与既有键同值的字段——白涨载荷）。现有键语义保持不变。
                 "cache_lane_model": lane_model,
                 "cache_lane_api_base": lane_api_base,
-                "cache_lane_scope": "main",
-                "cache_lane_hot_pct": rounded(hot_rate),
-                "cache_lane_session_pct": rounded(session_rate),
-                # 保活单列：keepalive scope 热命中率（未报告为 None，不冒充 0）
+                # 保活单列：keepalive scope 的命中率（未报告为 None，不冒充 0）。
+                # hot 是热窗口径（与 CLI 状态栏同源），session 与主口径
+                # cache_session_pct 同分母，面板用后者才不会两行不同口径。
                 "cache_keepalive_hot_pct": rounded(
                     (keepalive_usage.get("hot") or {}).get("rate")
+                ),
+                "cache_keepalive_session_pct": rounded(
+                    (keepalive_usage.get("session_all") or {}).get("rate")
                 ),
                 # 输入框悬停面板：上下文来源字符占比快照（设计规格 §3.4）
                 "context_breakdown": get_breakdown(),
@@ -6341,8 +6353,8 @@ class ApiBridge(GitBridgeMixin):
                 "cache_hot_turns": 0, "cache_invalidation_reason": "",
                 "prompt_tokens": 0, "cached_tokens": 0,
                 "cache_lane_model": "", "cache_lane_api_base": "",
-                "cache_lane_scope": "main", "cache_lane_hot_pct": None,
-                "cache_lane_session_pct": None, "cache_keepalive_hot_pct": None,
+                "cache_keepalive_hot_pct": None,
+                "cache_keepalive_session_pct": None,
                 "context_breakdown": [],
             }
 
