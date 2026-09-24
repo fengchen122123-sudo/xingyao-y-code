@@ -77,6 +77,96 @@ def test_qwen_cache_extras_enabled_across_channels():
 
 
 # ---------------------------------------------------------------------------
+# qwen（Task 1a）：名称优先的家族归属——聚合域不再把外族模型拽进 Qwen 家族
+# ---------------------------------------------------------------------------
+
+_MAAS_AGGREGATE_BASE = (
+    "https://workspace-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+)
+
+
+def test_qwen_family_not_pulled_in_by_aggregate_domain():
+    """deepseek 名 × maas 聚合域：不得被判成 Qwen 家族，请求字节保持原样。"""
+    from core.llm import (
+        _apply_cache_control,
+        _provider_request_options,
+        _qwen_cache_enabled,
+        _supports_cache_control,
+    )
+
+    model = "openai/deepseek-v4.1-flash"
+    api_base = _MAAS_AGGREGATE_BASE
+    assert _qwen_cache_enabled(model, api_base) is False
+    assert _supports_cache_control(model, api_base) is False
+    opts = _provider_request_options(model, api_base, cache_scope="main")
+    assert "x-dashscope-session-cache" not in opts.get("extra_headers", {})
+    messages = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "inspect"},
+    ]
+    assert _apply_cache_control(deepcopy(messages), model, api_base) == messages
+
+
+def test_qwen_family_still_enabled_for_qwen_names_on_aggregate_domain():
+    """对偶断言：本族名 × maas 域行为零变化；名称无归属时域名兜底照旧。"""
+    from core.llm import (
+        _apply_cache_control,
+        _is_qwen_family,
+        _provider_request_options,
+        _qwen_cache_enabled,
+        _supports_cache_control,
+    )
+
+    model = "openai/qwen3.8-flash"
+    api_base = _MAAS_AGGREGATE_BASE
+    assert _qwen_cache_enabled(model, api_base) is True
+    assert _supports_cache_control(model, api_base) is True
+    opts = _provider_request_options(model, api_base, cache_scope="main")
+    assert opts.get("extra_headers", {}).get("x-dashscope-session-cache") == "enable"
+
+    messages = [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "inspect"},
+    ]
+    marked = _apply_cache_control(deepcopy(messages), model, api_base)
+    assert marked == [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "stable",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "inspect",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        },
+    ]
+    # 源列表未被污染（deepcopy 传参）
+    assert messages == [
+        {"role": "system", "content": "stable"},
+        {"role": "user", "content": "inspect"},
+    ]
+
+    # 名称无任何归属时，官方域名兜底照旧（_is_official_dashscope_route 未动）
+    assert (
+        _is_qwen_family(
+            "custom-model", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        is True
+    )
+
+
+# ---------------------------------------------------------------------------
 # deepseek：账本判定，任意渠道自动放行；非本族不误放
 # ---------------------------------------------------------------------------
 
