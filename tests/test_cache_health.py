@@ -41,6 +41,9 @@ def _ts(date_text, clock="10:00:00"):
     return int(time.mktime(time.strptime(f"{date_text} {clock}", "%Y-%m-%d %H:%M:%S")))
 
 
+_UNSET = object()
+
+
 def _diag_row(
     row_id,
     *,
@@ -54,9 +57,14 @@ def _diag_row(
     cached_tokens=None,
     cache_reported=True,
     usage_valid=True,
+    cache_write_tokens=_UNSET,
 ):
-    """按 cache_request_diagnostics 全列真实形状构造一行（None 表示未报告）。"""
-    return {
+    """按 cache_request_diagnostics 全列真实形状构造一行（None 表示未报告）。
+
+    cache_write_tokens 不传时该键缺失（老诊断行形状）；显式传 None 表示
+    「列存在但未报告」，传数值表示该轮已报告写入量（Task 7 新增列）。
+    """
+    row = {
         "id": row_id,
         "ts": ts,
         "session_id": session_id,
@@ -86,6 +94,9 @@ def _diag_row(
         "cache_control_markers": 3,
         "request_bytes_final": 9000,
     }
+    if cache_write_tokens is not _UNSET:
+        row["cache_write_tokens"] = cache_write_tokens
+    return row
 
 
 def test_single_upstream_loss_row_detected_with_correct_rate():
@@ -277,6 +288,39 @@ def test_healthy_tokenrhythm_lane_hits_approximately_full_rate():
     assert health.upstream_loss_rate == 0.0
     assert health.consecutive_loss == 0
     assert health.verdict == "healthy"
+
+
+def test_lane_health_lists_write_turns_without_shrinking_denominator():
+    """写入轮单列（Task 7 派生层补全）：write_turns / hot_write_tokens 只单列，
+    不把写入轮从 samples 分母剔除（Task 3 的分母与 verdict 规则已验收）。"""
+    rows = [
+        _diag_row(1, prompt_tokens=10000, cached_tokens=9500, cache_write_tokens=None),
+        _diag_row(2, prompt_tokens=10000, cached_tokens=9500, cache_write_tokens=800),
+        _diag_row(3, prompt_tokens=10000, cached_tokens=0, cache_write_tokens=900),
+    ]
+
+    health = classify_lane_health(rows)
+
+    # 首行无 prev 不入分母（write=None 也不计写入轮）；第 2/3 行都留在分母里。
+    assert health.samples == 2
+    assert health.write_turns == 2
+    assert health.hot_write_tokens == 1700
+    assert health.upstream_loss_rate == pytest.approx(0.5)
+
+
+def test_lane_health_write_turns_zero_when_unreported():
+    """两行都不带 cache_write_tokens 键：缺失 ≠ 0，写入轮计数与写入量保持 0。"""
+    rows = [
+        _diag_row(1, prompt_tokens=10000, cached_tokens=9500),
+        _diag_row(2, prompt_tokens=10000, cached_tokens=9500),
+    ]
+    assert all("cache_write_tokens" not in row for row in rows)
+
+    health = classify_lane_health(rows)
+
+    assert health.samples == 1
+    assert health.write_turns == 0
+    assert health.hot_write_tokens == 0
 
 
 def test_hot_hit_rate_is_token_weighted_not_per_turn_average():
