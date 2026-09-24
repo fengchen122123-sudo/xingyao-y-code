@@ -1373,6 +1373,47 @@ class MemoryManager:
             result.append(item)
         return result
 
+    def query_keepalive_lane_evidence(self, before_ts=None, since_ts=None):
+        """按车道聚合「已落库且报告了缓存明细」的保活轮次，供止损证据跨进程续用。
+
+        只取 cache_scope='keepalive' 且 cached_tokens IS NOT NULL 的行：未报告的保活
+        轮次连入分母的资格都没有（未报告 ≠ 0），绝不把 NULL 当 0 参与加权。
+
+        before_ts 把窗口钉在「本进程启动之前」——本进程自己记的轮次已经在内存证据桶里，
+        再算一遍会双计（轮次翻倍 → 判定门槛被提前跨过）；since_ts 排除久远到不该再
+        压制复活的过去（亏损是稳态特征，但车道好转时不能被陈旧数据永久判死）。
+
+        返回 `{(模型小写全串, 归一化 api_base): (轮次, prompt 合计, cached 合计)}`，
+        键口径与 core.llm_diagnostics._cache_usage_key 一致（小写 + 去尾斜杠）。
+        """
+        clauses = ["cache_scope = 'keepalive'", "cached_tokens IS NOT NULL"]
+        params = []
+        if before_ts is not None:
+            clauses.append("ts < ?")
+            params.append(int(before_ts))
+        if since_ts is not None:
+            clauses.append("ts >= ?")
+            params.append(int(since_ts))
+        sql = (
+            "SELECT provider, model, api_base, COUNT(*), "
+            "SUM(prompt_tokens), SUM(cached_tokens) FROM token_usage WHERE "
+            + " AND ".join(clauses)
+            + " GROUP BY provider, model, api_base"
+        )
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        lanes = {}
+        for provider, model, api_base, turns, prompt_total, cached_total in rows:
+            provider = str(provider or "")
+            model_leaf = str(model or "")
+            full_model = f"{provider}/{model_leaf}" if provider else model_leaf
+            key = (full_model.lower(), str(api_base or "").rstrip("/").lower())
+            acc = lanes.setdefault(key, [0, 0, 0])
+            acc[0] += int(turns or 0)
+            acc[1] += int(prompt_total or 0)
+            acc[2] += int(cached_total or 0)
+        return {key: tuple(value) for key, value in lanes.items()}
+
     def query_lane_cache_health(self, start_ts=None, end_ts=None, lane=None, window=200):
         """按时间窗口汇总各 lane 的健康度；lane=(model, api_base, cache_scope) 可选过滤。
 
