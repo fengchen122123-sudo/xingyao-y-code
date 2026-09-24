@@ -188,6 +188,12 @@ export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
     total_prompt: Number(data.total_prompt ?? 0),
     total_completion: Number(data.total_completion ?? 0),
     total_cached: Number(data.total_cached ?? 0),
+    // 车道身份与保活单列：命中率按 (会话, 模型, 接口, scope) 独立，
+    // 界面必须标清楚数字属于哪条车道；旧后端无这些字段时回落 ""/null（不冒充 0%）
+    cache_lane_model: String(data.cache_lane_model ?? ''),
+    cache_lane_api_base: String(data.cache_lane_api_base ?? ''),
+    cache_keepalive_hot_pct: nullableNumber(data.cache_keepalive_hot_pct),
+    cache_keepalive_session_pct: nullableNumber(data.cache_keepalive_session_pct),
     context_breakdown: normalizeContextBreakdown(data.context_breakdown),
   };
 };

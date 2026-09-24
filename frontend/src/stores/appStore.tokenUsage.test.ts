@@ -163,3 +163,31 @@ it('normalizeTokenUsage 对 context_breakdown 缺失/异常输入回落 []', () 
   expect(normalizeTokenUsage({ used: 1, window: 128000 }).context_breakdown).toEqual([]);
   expect(normalizeTokenUsage({ context_breakdown: null }).context_breakdown).toEqual([]);
 });
+
+it('车道身份与保活单列字段：有值按类型归一化，旧后端缺失回落 ""/null（不当 0%）', () => {
+  const full = normalizeTokenUsage({
+    cache_available: true,
+    cache_session_pct: 90.81,
+    cache_lane_model: 'openai/deepseek-v4.1-flash',
+    cache_lane_api_base: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+    cache_keepalive_hot_pct: 24.04,
+    cache_keepalive_session_pct: 30.97,
+  });
+
+  expect(full.cache_lane_model).toBe('openai/deepseek-v4.1-flash');
+  expect(full.cache_lane_api_base).toBe(
+    'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+  );
+  expect(full.cache_keepalive_hot_pct).toBe(24.04);
+  expect(full.cache_keepalive_session_pct).toBe(30.97);
+
+  // 旧后端（或异常字符串）：身份回落空串、命中率回落 null，绝不变成 0%
+  const legacy = normalizeTokenUsage({ used: 1, window: 128000 });
+  expect(legacy.cache_lane_model).toBe('');
+  expect(legacy.cache_lane_api_base).toBe('');
+  expect(legacy.cache_keepalive_hot_pct).toBeNull();
+  expect(legacy.cache_keepalive_session_pct).toBeNull();
+
+  const junk = normalizeTokenUsage({ cache_keepalive_session_pct: 'n/a' });
+  expect(junk.cache_keepalive_session_pct).toBeNull();
+});

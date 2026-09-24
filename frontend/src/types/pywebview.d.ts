@@ -457,6 +457,12 @@ export interface TokenUsage {
   cache_invalidation_reason: string;
   prompt_tokens: number;
   cached_tokens: number;
+  /** 当前车道身份（模型 + 接口）：命中率按车道独立，跨渠道切换时用来确认没串数 */
+  cache_lane_model: string;
+  cache_lane_api_base: string;
+  /** 保活（cache_scope=keepalive）单独命中率；未报告为 null，界面按"隐藏"处理而非 0% */
+  cache_keepalive_hot_pct: number | null;
+  cache_keepalive_session_pct: number | null;
   /** CLI 状态栏口径：会话计费累计输入/输出/缓存命中 tokens */
   total_prompt: number;
   total_completion: number;

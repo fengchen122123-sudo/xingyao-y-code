@@ -169,4 +169,46 @@ describe('ContextUsagePanel', () => {
     expect(style).toContain('width: 320px');
     wrapper.unmount();
   });
+
+  it('缓存命中率下方标注当前车道，保活命中率单独一列', async () => {
+    setUsage({
+      cache_available: true,
+      cache_session_pct: 90.81,
+      cache_lane_model: 'openai/deepseek-v4.1-flash',
+      cache_lane_api_base: 'https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1',
+      cache_keepalive_session_pct: 30.97,
+    });
+    const wrapper = mountPanel();
+
+    // 车道身份：scheme 与结尾斜杠不进界面，只留可读的「模型 @ 主机」
+    const lane = wrapper.get('[data-test="ctx-usage-cache-lane"]');
+    expect(lane.text()).toContain('openai/deepseek-v4.1-flash');
+    expect(lane.text()).toContain('token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1');
+    expect(lane.text()).not.toContain('https://');
+
+    // 保活单列：与主口径同行的另一个数字，1 位小数
+    const keepalive = wrapper.get('[data-test="ctx-usage-cache-keepalive"]');
+    expect(keepalive.text()).toContain('保活命中率');
+    expect(keepalive.text()).toContain('31.0%');
+    wrapper.unmount();
+  });
+
+  it('保活未报告（null）时整列隐藏，绝不显示 0%', async () => {
+    setUsage({
+      cache_available: true,
+      cache_session_pct: 90.81,
+      cache_lane_model: 'openai/local-vllm',
+      cache_lane_api_base: 'http://127.0.0.1:8000/v1',
+      cache_keepalive_session_pct: null,
+    });
+    const wrapper = mountPanel();
+    expect(wrapper.find('[data-test="ctx-usage-cache-keepalive"]').exists()).toBe(false);
+    // 旧后端无车道字段时也不该冒出车道行
+    expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(true);
+
+    setUsage({ cache_lane_model: '', cache_lane_api_base: '' });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
+    wrapper.unmount();
+  });
 });
