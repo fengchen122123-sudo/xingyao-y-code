@@ -349,6 +349,41 @@ def _pad_left(text, width):
     return " " * max(0, width - _term_display_width(text)) + text
 
 
+def _truncate_visible(text, width, ellipsis="…"):
+    """把文本压到 width 显示宽度以内：保留首尾、中间省略。
+
+    列宽有上限（如 /usage 的模型列）时，超宽文本只补齐不压缩会把该行的
+    数字列整体右推，同一张表的表头/数据行/小计再也对不齐。只截尾又会把
+    渠道域名尾部与 `[scope]` 标记切掉——这两段正是用来区分车道的部分，
+    因此按显示宽度保留首尾、中间用省略号收尾。
+    """
+    text = str(text)
+    if width <= 0:
+        return ""
+    if _term_display_width(text) <= width:
+        return text
+    ellipsis_width = _term_display_width(ellipsis)
+    if ellipsis_width >= width:
+        return ellipsis[:width]
+    budget = width - ellipsis_width
+    head_budget = (budget + 1) // 2
+
+    def _take(chars, limit):
+        taken = []
+        used = 0
+        for char in chars:
+            char_width = _term_display_width(char)
+            if used + char_width > limit:
+                break
+            taken.append(char)
+            used += char_width
+        return "".join(taken), used
+
+    head, head_used = _take(text, head_budget)
+    tail, _ = _take(reversed(text), budget - head_used)
+    return head + ellipsis + "".join(reversed(tail))
+
+
 def _parse_usage_date_args(args):
     """解析 /usage 的日期参数。
 
@@ -404,8 +439,11 @@ def _render_usage_section(manager, label, start_s, end_s):
     for r, route_label in display_rows:
         _cache_prompt = int(r.get("cache_prompt", 0) or 0)
         _rate = _format_cache_hit_rate(r["cached"], _cache_prompt)
+        # 标签含 api_base / [scope] 时可能远超列宽上限：先按显示宽度压缩到列宽、
+        # 再补齐，最后才转义（转义会插入 &amp; 等实体，先转义会让宽度测量失真）。
+        _name_cell = _esc(_pad_right(_truncate_visible(route_label, name_w), name_w))
         print_formatted_text(HTML(
-            f"  {_pad_right(_esc(route_label), name_w)} {r['prompt']:>14} "
+            f"  {_name_cell} {r['prompt']:>14} "
             f"{r['completion']:>14} {_cache_prompt:>14} {r['cached']:>14} "
             f"{_rate:>10} {r['total']:>14}"
         ))
@@ -498,6 +536,36 @@ def _status_cache_metrics(session_id, model_name, api_base, cache_scope="main"):
         "keepalive_prompt": int(keepalive_hot.get("prompt_tokens", 0) or 0),
         "keepalive_cached": int(keepalive_hot.get("cached_tokens", 0) or 0),
     }
+
+
+def _compose_status_token_info(
+    *,
+    lane_cached,
+    lane_rate,
+    prompt,
+    completion,
+    cached,
+    global_rate,
+    ctx_pct,
+    ctx_used,
+    ctx_max,
+    keepalive_rate=None,
+):
+    """状态栏 Token 概览文字：车道热口径与进程累计口径分别标注。
+
+    车道命中率的分母是「当前会话 × 当前车道」的热窗口，而输入/输出/命中是
+    进程累计（跨会话、渠道、scope 混算）。两者分母不同，并排出现又不标口径时，
+    「命中 X (Y%)」会被读成「输入 X 的 Y%」，自相矛盾——故分别加「本车道」/
+    「全局」标签。所有传参均为已格式化文本；未报告的 rate 由调用方传 "--"。
+    """
+    text = (
+        f"本车道命中 {lane_cached} ({lane_rate}) · "
+        f"全局 输入 {prompt} · 输出 {completion} · 命中 {cached} ({global_rate}) · "
+        f"上下文 {ctx_pct} ({ctx_used}/{ctx_max})"
+    )
+    if keepalive_rate is not None:
+        text += f" · 保活 {keepalive_rate}"
+    return text
 
 
 def _usage_model_label(row, api_base=None, cache_scope=None):
@@ -4590,14 +4658,20 @@ def _make_input_app():
 
         # 状态栏 Token 概览：主指标是当前车道热命中率；
         # 进程级累计只作次要标注（跨会话/渠道/scope 混算，不代表当前车道）。
-        token_info = (
-            f"输入 {prompt_str} · 输出 {completion_str} · "
-            f"命中 {lane_cached_str} ({lane_rate_str}) · "
-            f"全局累计 {cached_str} ({global_rate_str}) · "
-            f"上下文 {pct:.0f}% ({latest_total_str}/{max_win_str})"
+        token_info = _compose_status_token_info(
+            lane_cached=lane_cached_str,
+            lane_rate=lane_rate_str,
+            prompt=prompt_str,
+            completion=completion_str,
+            cached=cached_str,
+            global_rate=global_rate_str,
+            ctx_pct=f"{pct:.0f}%",
+            ctx_used=latest_total_str,
+            ctx_max=max_win_str,
+            keepalive_rate=(
+                None if keepalive_rate is None else f"{keepalive_rate:.0f}%"
+            ),
         )
-        if keepalive_rate is not None:
-            token_info += f" · 保活 {keepalive_rate:.0f}%"
 
         # 3. 统计星瑶的执行状态与播放动画，证明星瑶仍在操作/思考
         # 直接读模块全局变量，不再 import main 自引用

@@ -927,3 +927,93 @@ def test_account_server_usage_forwards_cache_write_from_anthropic_shape(monkeypa
                 if str(k[0]).startswith("accounting-write")
             ]:
                 del llm._cache_usage_states[key]
+
+
+def test_usage_table_keeps_numeric_columns_aligned_for_long_route_labels(monkeypatch):
+    """长渠道标签（模型 @ api_base [scope]）不得撑破列宽上限导致数字列错行。
+
+    本次改动把 api_base / scope 放回标签后，标签宽度可达 80+ 格，而模型列宽
+    上限是 60 且只补齐不压缩——超出的部分会把该行的数字列整体右推，
+    同一张表的表头/数据行/小计再也对不齐。
+    """
+    import re
+
+    rows = [
+        {
+            "provider": "openai", "model": "deepseek-v4.1-flash",
+            "api_base": "https://cn-beijing.maas.aliyuncs.com/api/v1",
+            "cache_scope": "main",
+            "prompt": 100000, "completion": 500, "cached": 88000,
+            "cache_prompt": 100000, "total": 100500,
+        },
+        {
+            "provider": "openai", "model": "deepseek-v4.1-flash",
+            "api_base": "https://cn-beijing.maas.aliyuncs.com/api/v1",
+            "cache_scope": "keepalive",
+            "prompt": 50000, "completion": 20, "cached": 2000,
+            "cache_prompt": 50000, "total": 50020,
+        },
+    ]
+
+    class Manager:
+        def query_token_usage_by_model(self, start, end):
+            return rows
+
+        def query_cache_diagnostic_summary(self, *args, **kwargs):
+            return {"count": 0, "lost_tokens": 0, "unreported": 0, "categories": {}}
+
+    captured = []
+    monkeypatch.setattr(
+        main, "print_formatted_text",
+        lambda html, *args, **kwargs: captured.append(str(html)),
+    )
+
+    main._render_usage_section(Manager(), "今日", "2026-08-09", "2026-08-09")
+
+    lines = [re.sub(r"<[^>]+>", "", line) for line in captured]
+    table_lines = lines[1:]  # 跳过标题行
+    assert len(table_lines) >= 4, lines  # 表头 + 两条数据行 + 小计
+    # 列对齐的等价判据：所有表格行的显示宽度必须一致（列宽固定，
+    # 超宽标签若不压缩就会把该行撑开，于是行宽不再相等）。
+    widths = {main._term_display_width(line) for line in table_lines}
+    assert len(widths) == 1, (widths, table_lines)
+
+
+def test_status_token_info_labels_lane_and_process_scopes_separately():
+    """状态栏一行内必须分别标注「车道热口径」与「进程累计口径」。
+
+    车道命中率的分母是当前车道的热窗口，进程输入/输出/命中的分母是进程累计；
+    两者并排却不标口径时，「命中 X (Y%)」会被读成「输入 X 的 Y%」，自相矛盾。
+    """
+    text = main._compose_status_token_info(
+        lane_cached="15.2K", lane_rate="88%",
+        prompt="40.0M", completion="2.1M", cached="700.4K", global_rate="71%",
+        ctx_pct="3%", ctx_used="4K", ctx_max="128K", keepalive_rate=None,
+    )
+
+    assert "本车道命中 15.2K (88%)" in text
+    assert "全局 输入 40.0M · 输出 2.1M · 命中 700.4K (71%)" in text
+    assert "保活" not in text
+
+    with_keepalive = main._compose_status_token_info(
+        lane_cached="15.2K", lane_rate="88%",
+        prompt="40.0M", completion="2.1M", cached="700.4K", global_rate="71%",
+        ctx_pct="3%", ctx_used="4K", ctx_max="128K", keepalive_rate="2%",
+    )
+    assert with_keepalive.endswith("· 保活 2%")
+
+
+def test_usage_model_label_cell_is_bounded_but_keeps_channel_and_scope():
+    """列宽压缩保留首尾：渠道尾部与 [scope] 标记必须仍然可见。"""
+    label = (
+        "openai/deepseek-v4.1-flash @ "
+        "https://cn-beijing.maas.aliyuncs.com/api/v1 [keepalive]"
+    )
+    cell = main._truncate_visible(label, 60)
+
+    assert main._term_display_width(cell) <= 60
+    assert cell.startswith("openai/deepseek-v4.1-flash @ h")
+    assert cell.endswith("iyuncs.com/api/v1 [keepalive]")
+    assert "…" in cell
+    # 不超宽时原样返回，不做任何压缩
+    assert main._truncate_visible("a/b", 60) == "a/b"
