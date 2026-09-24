@@ -139,15 +139,15 @@
 3. **出数字**：用 `core.cache_health.classify_lane_health`（Task 3 交付的纯函数）或 `MemoryManager.query_lane_cache_health` 读出该车道的 `hot_hit_rate` 与 `upstream_loss_rate`。
 4. **三方对照**：同样脚本在基元律动 / 官方车道各跑一遍，保证同口径可比。
 
-> **⚠️ 口径警告（2026-09-24 晚补）**：本报告 §二 的基线是**全历史、按 session 分链**
-> 算出来的；而 `classify_lane_health` / `query_lane_cache_health` 的 `prev_prompt`
-> 是在**传入窗口内**滚动的——窗口首行与紧跟未报告行之后的那一行**整体不进分母**
-> （既少一个 `samples`，也不计入 `hot_prompt` / `hot_cached` / `write_turns`）。
-> 取样集与 prev 链边界都不同，**两侧数字不可直接对照**，差几个百分点不是回归；
-> 窗口越小偏差越大（实测 3 行窗口：`samples` 2/3，`hot_hit_rate` 50.9% vs 同轮次
-> 全量口径 67.1%）。复测要么把取样钉在切点之后并给足窗口
-> （`query_lane_cache_health(start_ts=切点, window=大于该车道切点后行数)`），
-> 要么直接用 §七 的脚本（与基线同一套算法）。
+> **✅ 口径已统一（2026-09-24 晚二次修订）**：`query_lane_cache_health` 的 `prev_prompt`
+> 现由查询层在**过滤前的全表**上按 `(session_id, model, api_base, cache_scope)` 分链算好
+> （上一行未报告缓存明细则为 NULL），时间范围只决定「取哪些行做样本」、不切断 prev 链
+> ——与本报告 §二 基线的算法一致，**可以直接对照**。
+> 历史版本曾把 prev 做成「窗口内滚动」，导致窗口/区间首行整体不进分母（实测 3 行窗口
+> samples 2/3、`hot_hit_rate` 50.9% vs 同轮次全量 67.1%），该偏差已修复。
+> 仍然要注意的一条：`classify_lane_health(rows)` 被**直接喂行**时（不经查询层、行上没有
+> `prev_prompt` 键）退回窗口内滚动兜底，那种数字不可与基线对照。复测推荐：
+> `query_lane_cache_health(start_ts=切点, window=大于该车道切点后行数)`，或用 §七 脚本。
 
 ### 5.4 判定准则（先定好，避免事后解释）
 
@@ -177,6 +177,8 @@
 - **对偶断言的线上证据**：同期 `qwen3.8-flash @ tokenrhythm` 6 行 `markers=13`、逻辑前缀 5,070,184 vs 线上 5,070,990 —— 真 qwen 模型仍照常拿显式标记，收紧**没有误伤**。
 - **Task 5 证据门线上触发过**：`gui-runtime.log` 16:13:30「保活按车道证据止损 model=openai/deepseek-v4.1-flash」；止损前该车道切点后仍烧了 11 轮保活、命中率 30.97%、未命中 756,270 token。
 - **三方对照仍缺两块**：基元律动 / 官方 deepseek 车道切点后 0 样本（当天未走该车道），需补跑才能同口径比较。
+- **两条测量路径已对齐（口径校正后复验）**：同一份切点后数据，用 `MemoryManager.query_lane_cache_health(window=10**6)`（库函数，prev 由 SQL 窗口函数按会话分链）复算阿里云 main 车道，得到 `samples=122 / hot=91.09% / loss=4.10%`，与上面 §七 脚本的结果**逐字一致**（SQLite 3.50.4）；库层 `verdict='healthy'`、`consecutive_loss=0`。也就是说：**客户端侧止血已由两条独立路径共同确认**，而 91.09% 仍低于 §5.4 的 95% 线 → 剩余差距按准则归**渠道责任**，转「网关缓存亲和专项」。
+- 同批切点后各车道（库函数口径，供横向参考）：`deepseek-flash @ 43.240.221.111:3978` 98.84% / loss 0%；`k3 @ api.kimi.com/coding` 99.62% / loss 0%；`qwen3.8-flash @ tokenrhythm` 97.49% / loss 1.52%；`deepseek-flash @ tokenrhythm [subagent:explore]` 因 45/57 轮为客户端换代 → `insufficient`（该 scope 的历史重写多属正常，不代表渠道差）。
 
 ---
 
