@@ -241,7 +241,9 @@ _AFFINITY_LANES_CONFIG_KEY = "cache_affinity_lanes"
 # cache_keepalive_routes 同构：只新增显式通道，不改任何官方路由判定。
 _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY = "deepseek_cache_routes"
 
-# 条目格式同 _keepalive_routes_cfg_cache：`{"entry": (过期时间, stamp, routes) | None}`。
+# 条目格式：`{"entry": (过期时间, stamp, routes) | None}`。注意本缓存独立于
+# _keepalive_routes_cfg_cache——后者因保活证据门开关与亲和键白名单共用同一次
+# 配置读取，条目已扩为 5 元组，两者不共用条目。
 # 测试可直接把 entry 置 None 强制重读配置。
 _deepseek_cache_routes_cfg_cache = {"entry": None}
 
