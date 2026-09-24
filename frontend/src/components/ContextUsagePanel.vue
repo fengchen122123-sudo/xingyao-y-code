@@ -44,11 +44,6 @@
           <span class="cxp-cache-label">缓存命中率</span>
           <span class="cxp-cache-value">{{ cachePctText }}</span>
         </div>
-        <!-- 保活单列：keepalive scope 不混进主口径；未报告整列隐藏，绝不显示 0% -->
-        <div v-if="showKeepaliveRow" class="cxp-cache" data-test="ctx-usage-cache-keepalive">
-          <span class="cxp-cache-label">保活命中率</span>
-          <span class="cxp-cache-value">{{ keepalivePctText }}</span>
-        </div>
       </template>
     </div>
   </Teleport>
@@ -151,14 +146,7 @@ const showCacheRow = computed(() => {
 
 const cachePctText = computed(() => `${Number(store.tokenUsage.cache_session_pct).toFixed(1)}%`);
 
-// 保活单列：只认与主口径同分母的 session 值；null / 非有限值一律整列隐藏，
-// 绝不退化成 0%（未报告 ≠ 0 命中）。
-const keepalivePct = computed(() => {
-  const value = store.tokenUsage.cache_keepalive_session_pct;
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-});
-const showKeepaliveRow = computed(() => keepalivePct.value !== null);
-const keepalivePctText = computed(() => `${Number(keepalivePct.value).toFixed(1)}%`);
+// 保活命中率已下线（与车道身份行同批）：store/后端字段保留，界面不再展示。
 
 // —— 定位：向上弹出（输入框在底部）、水平对齐锚点并在视口内夹取 ——
 const PANEL_WIDTH = 320;
