@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -63,15 +64,48 @@ def _cache_usage_key(session_id, model_name, api_base, cache_scope="main"):
     )
 
 
+def _strip_cache_control_markers(messages):
+    """返回消息列表的「客户端逻辑前缀」副本：脱离所有 cache_control 标记。
+
+    覆盖两种标记形态（跨渠道缓存命中率修复 · Task 2）：
+    - 消息顶层 ``cache_control``（Anthropic 协议）；
+    - ``content`` 列表内每个块的 ``cache_control``（Qwen / DashScope 兼容形态，
+      ``_apply_cache_control`` 会把字符串 content 改写为
+      ``[{"type": "text", "text": …, "cache_control": …}]``）。
+
+    除 ``cache_control`` 键外不改变任何字段值；打标引入的单文本块包装
+    （剥完后恰为 ``[{"type": "text", "text": X}]``）还原为客户端原字符串 X，
+    否则「同一批消息打标前后」的 sha256 会因 content 形态改写而漂移。
+    多块 content（如文本 + 图片）原样保留列表形态，只剥标记。
+    不修改传入对象（逐消息拷贝），调用方随后仍要拿原始消息打标、发送。
+    """
+    normalized = []
+    for message in messages or []:
+        if not isinstance(message, dict):
+            normalized.append(message)
+            continue
+        clean = copy.deepcopy(message)
+        clean.pop("cache_control", None)
+        content = clean.get("content")
+        if isinstance(content, list):
+            for block in content:
+                if isinstance(block, dict):
+                    block.pop("cache_control", None)
+            if (
+                len(content) == 1
+                and isinstance(content[0], dict)
+                and content[0].get("type") == "text"
+                and set(content[0]) == {"type", "text"}
+            ):
+                clean["content"] = content[0]["text"]
+        normalized.append(clean)
+    return normalized
+
+
 def _cache_message_fingerprints(messages):
     fingerprints = []
-    for message in messages or []:
-        normalized = {
-            key: value
-            for key, value in message.items()
-            if key != "cache_control"
-        }
-        payload = _canonical_diagnostic_json(normalized)
+    for message in _strip_cache_control_markers(messages):
+        payload = _canonical_diagnostic_json(message)
         fingerprints.append(hashlib.sha256(payload.encode("utf-8")).hexdigest())
     return tuple(fingerprints)
 
@@ -99,10 +133,7 @@ def _build_cache_request_diagnostic(
     route_override_fingerprint 为渠道请求形态覆盖的生效指纹（无覆盖为空串），
     只作记录，便于事后按 route_override_sha256 归因缓存换代是否由覆盖变更引起。
     """
-    normalized_messages = [
-        {key: value for key, value in message.items() if key != "cache_control"}
-        for message in (messages or [])
-    ]
+    normalized_messages = _strip_cache_control_markers(messages)
     system_messages = [
         message for message in normalized_messages
         if message.get("role") == "system"
@@ -127,6 +158,31 @@ def _build_cache_request_diagnostic(
         "route_override_sha256": str(route_override_fingerprint or ""),
         "_message_fingerprints": _cache_message_fingerprints(normalized_messages),
     }
+
+
+def _cache_control_request_metrics(messages):
+    """统计打标后线上消息的（显式 cache_control 标记数, 规范化字节数）。
+
+    与 `_build_cache_request_diagnostic` 的 request_bytes 使用同一规范化函数
+    （canonical JSON），保证「客户端逻辑前缀字节」(request_bytes) 与
+    「线上字节事实」(request_bytes_final) 可直接对照；标记计数覆盖消息顶层
+    与 content 块两种形态。该函数按线上原样测量，不做任何剥离。
+    """
+    marker_count = 0
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if "cache_control" in message:
+            marker_count += 1
+        content = message.get("content")
+        if isinstance(content, list):
+            marker_count += sum(
+                1
+                for block in content
+                if isinstance(block, dict) and "cache_control" in block
+            )
+    payload = _canonical_diagnostic_json(messages or [])
+    return marker_count, len(payload.encode("utf-8"))
 
 
 def _classify_cache_request_details(
