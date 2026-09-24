@@ -249,10 +249,16 @@ section { position: relative; }
 .footer-links a { color: var(--dim); transition: color .2s; }
 .footer-links a:hover { color: var(--cyan); }
 .footer-links a.disabled { color: rgba(147, 167, 188, .45); cursor: not-allowed; pointer-events: none; }
-.footer-copy { width: 100%; color: rgba(147, 167, 188, .55); font-size: 13px; margin-top: 22px; }
-.footer-beian { width: 100%; font-size: 13px; margin-top: 6px; }
+.footer-copy { width: 100%; color: rgba(147, 167, 188, .55); font-size: 13px; margin-top: 22px; text-align: center; }
+.footer-beian { width: 100%; font-size: 13px; margin-top: 6px; text-align: center; }
 .footer-beian a { color: rgba(147, 167, 188, .55); transition: color .2s; }
 .footer-beian a:hover { color: var(--cyan); }
+.footer-beian .beian-icon {
+  display: inline-block;
+  width: 14px; height: 14px;
+  vertical-align: -2px;
+  margin-right: 4px;
+}
 
 /* ============ 演示弹窗 ============ */
 dialog#demo-modal {
@@ -426,7 +432,11 @@ dialog#demo-modal .btn { width: 100%; justify-content: center; }
       <a class="disabled" aria-disabled="true" title="GitHub 仓库即将上线">GitHub</a>
     </div>
     <div class="footer-copy">© 2026 星瑶Code · 让代码，回应你的想象。</div>
-    <div class="footer-beian"><a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener">京ICP备2026063481号</a></div>
+    <div class="footer-beian">
+      <a href="https://beian.mps.gov.cn/#/query/webSearch?code=11011402057329" target="_blank" rel="noreferrer"><img class="beian-icon" src="assets/beian_gongan.png" alt="">京公网安备11011402057329号</a>
+      <span aria-hidden="true"> · </span>
+      <a href="https://beian.miit.gov.cn/" target="_blank" rel="noopener">京ICP备2026063481号-1</a>
+    </div>
   </div>
 </footer>
 
