@@ -531,7 +531,9 @@ class MemoryManager:
                         cache_reported INTEGER NOT NULL,
                         usage_valid INTEGER NOT NULL,
                         usage_errors TEXT NOT NULL,
-                        route_override_sha256 TEXT NOT NULL DEFAULT ''
+                        route_override_sha256 TEXT NOT NULL DEFAULT '',
+                        cache_control_markers INTEGER,
+                        request_bytes_final INTEGER
                     )
                 ''')
                 # 老库平滑升级：早期版本建的表没有 route_override_sha256 列，
@@ -544,6 +546,24 @@ class MemoryManager:
                         cursor.execute(
                             "ALTER TABLE cache_request_diagnostics "
                             "ADD COLUMN route_override_sha256 TEXT NOT NULL DEFAULT ''"
+                        )
+                    except Exception:
+                        pass
+                # 线上字节事实两列（Task 2）：为 NULL 表示未观测（老行与未回填行），
+                # 绝不把「未观测」写成 0。同样幂等补列。
+                if "cache_control_markers" not in cache_diag_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE cache_request_diagnostics "
+                            "ADD COLUMN cache_control_markers INTEGER"
+                        )
+                    except Exception:
+                        pass
+                if "request_bytes_final" not in cache_diag_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE cache_request_diagnostics "
+                            "ADD COLUMN request_bytes_final INTEGER"
                         )
                     except Exception:
                         pass
@@ -1228,6 +1248,7 @@ class MemoryManager:
             "system_bytes", "tools_bytes", "prompt_tokens", "cached_tokens",
             "cache_miss_tokens", "cache_reported", "usage_valid", "usage_errors",
             "route_override_sha256",
+            "cache_control_markers", "request_bytes_final",
         )
         values = [
             str(diagnostic.get("session_id") or ""),
@@ -1251,6 +1272,16 @@ class MemoryManager:
             1 if diagnostic.get("usage_valid") else 0,
             json.dumps(list(diagnostic.get("usage_errors") or ()), ensure_ascii=False),
             str(diagnostic.get("route_override_sha256", "") or ""),
+            (
+                None
+                if diagnostic.get("cache_control_markers") is None
+                else int(diagnostic["cache_control_markers"])
+            ),
+            (
+                None
+                if diagnostic.get("request_bytes_final") is None
+                else int(diagnostic["request_bytes_final"])
+            ),
         ]
         with self._lock:
             try:
@@ -1289,7 +1320,7 @@ class MemoryManager:
             "message_count", "system_message_count", "common_prefix_messages",
             "request_bytes", "system_bytes", "tools_bytes", "prompt_tokens",
             "cached_tokens", "cache_miss_tokens", "cache_reported", "usage_valid",
-            "usage_errors",
+            "usage_errors", "cache_control_markers", "request_bytes_final",
         )
         with self._lock:
             rows = self.conn.execute(

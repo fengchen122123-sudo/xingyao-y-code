@@ -223,6 +223,7 @@ from core.llm_diagnostics import (
     _USAGE_FIELD_MISSING,
     _account_server_usage,
     _build_cache_request_diagnostic,
+    _cache_control_request_metrics,
     _cache_message_fingerprints,
     _cache_request_states,
     _cache_usage_key,
@@ -237,6 +238,7 @@ from core.llm_diagnostics import (
     _persist_cache_request_diagnostic,
     _persist_token_usage,
     _record_cache_usage,
+    _strip_cache_control_markers,
     _usage_field,
     clear_cache_usage_session,
     get_token_usage_snapshot,
@@ -1739,6 +1741,15 @@ def _chat_with_model_generator(
                         api_base,
                         disabled=cache_control_downgraded,
                     )
+                    if request_diagnostic is not None:
+                        # Task 2：同一行同时回答「客户端逻辑前缀变了吗」（上方打标前
+                        # 构建的 sha256 / request_bytes）与「线上字节带几个显式标记」。
+                        # 此处按打标后的真实载荷补测；_apply_cache_control 是原地改写，
+                        # kwargs["messages"] 即最终上线字节。
+                        (
+                            request_diagnostic["cache_control_markers"],
+                            request_diagnostic["request_bytes_final"],
+                        ) = _cache_control_request_metrics(kwargs["messages"])
                     # 历史图片折叠属于正常节省行为，不再向用户弹提示打扰
                     # 超时随载荷放大：超大上下文 + 深度思考的首个 token 可能要几分钟，
                     # 90s 一刀切会让大载荷反复超时重发（每次重发输入都全额计费）
