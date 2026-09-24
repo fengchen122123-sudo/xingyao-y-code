@@ -530,9 +530,23 @@ class MemoryManager:
                         cache_miss_tokens INTEGER,
                         cache_reported INTEGER NOT NULL,
                         usage_valid INTEGER NOT NULL,
-                        usage_errors TEXT NOT NULL
+                        usage_errors TEXT NOT NULL,
+                        route_override_sha256 TEXT NOT NULL DEFAULT ''
                     )
                 ''')
+                # 老库平滑升级：早期版本建的表没有 route_override_sha256 列，
+                # 照 token_usage 加列写法补列；失败静默忽略，保证幂等（列已存在、
+                # 并发升级等场景都不该让启动失败）。
+                cursor.execute("PRAGMA table_info(cache_request_diagnostics)")
+                cache_diag_columns = {col[1] for col in cursor.fetchall()}
+                if "route_override_sha256" not in cache_diag_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE cache_request_diagnostics "
+                            "ADD COLUMN route_override_sha256 TEXT NOT NULL DEFAULT ''"
+                        )
+                    except Exception:
+                        pass
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_cache_diag_identity "
                     "ON cache_request_diagnostics"
@@ -1213,6 +1227,7 @@ class MemoryManager:
             "system_message_count", "common_prefix_messages", "request_bytes",
             "system_bytes", "tools_bytes", "prompt_tokens", "cached_tokens",
             "cache_miss_tokens", "cache_reported", "usage_valid", "usage_errors",
+            "route_override_sha256",
         )
         values = [
             str(diagnostic.get("session_id") or ""),
@@ -1235,6 +1250,7 @@ class MemoryManager:
             1 if diagnostic.get("cache_reported") else 0,
             1 if diagnostic.get("usage_valid") else 0,
             json.dumps(list(diagnostic.get("usage_errors") or ()), ensure_ascii=False),
+            str(diagnostic.get("route_override_sha256", "") or ""),
         ]
         with self._lock:
             try:
