@@ -1703,6 +1703,13 @@ def _chat_with_model_generator(
                                 _m["reasoning_content"] = " "
                     current_message_shape = _cache_message_fingerprints(cleaned_messages)
                     if current_message_shape != classified_message_shape:
+                        # 覆盖指纹只进诊断记录（route_override_sha256），不塞进
+                        # _provider_request_options 的返回值——后者直接交给
+                        # litellm/native，多一个自定义键会触发未识别参数告警。
+                        from core.route_overrides import (  # 局部导入，避免模块循环依赖
+                            resolve_route_override,
+                        )
+
                         request_diagnostic = _classify_cache_request_details(
                             telemetry_session_id,
                             cache_scope,
@@ -1711,6 +1718,9 @@ def _chat_with_model_generator(
                             _tool_contract_fingerprint(effective_request_tools),
                             cleaned_messages,
                             tools=effective_request_tools,
+                            route_override_fingerprint=(
+                                resolve_route_override(model_name, api_base)["fingerprint"]
+                            ),
                         )
                         request_cache_reason = request_diagnostic["request_reason"]
                         if active_deepseek_rotation_reason:

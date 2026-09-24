@@ -119,3 +119,119 @@ def test_persist_diagnostic_distinguishes_valid_invalid_and_missing_usage(monkey
     assert any("cache hit + miss" in err for err in captured[1]["usage_errors"])
     assert captured[2]["usage_valid"] is False
     assert captured[2]["usage_errors"] == ("usage missing",)
+
+
+def test_diagnostic_records_route_override_sha256():
+    from core.llm import _build_cache_request_diagnostic
+
+    diag = _build_cache_request_diagnostic(
+        "sess", "main", "openai/deepseek-flash", "https://tokenrhythm.studio/v1",
+        [], [{"role": "system", "content": "x"}],
+        route_override_fingerprint="deadbeef",
+    )
+    assert diag["route_override_sha256"] == "deadbeef"
+
+
+def test_diagnostic_defaults_to_empty_without_override():
+    from core.llm import _build_cache_request_diagnostic
+
+    diag = _build_cache_request_diagnostic(
+        "sess", "main", "openai/deepseek-flash", "https://api.deepseek.com",
+        [], [{"role": "system", "content": "x"}],
+    )
+    assert diag["route_override_sha256"] == ""
+
+
+def test_route_override_fingerprint_records_without_counting_as_rotation():
+    """覆盖指纹变化只更新记录值，不得被换代判定误判成一次缓存换代。"""
+    from core.llm import _classify_cache_request_details
+
+    session = "diag-override-rotation"
+    base = [{"role": "system", "content": "stable"}]
+    first = _classify_cache_request_details(
+        session, "main", "openai/deepseek-flash", "https://tokenrhythm.studio/v1",
+        "tools-v1", base, route_override_fingerprint="aa",
+    )
+    second = _classify_cache_request_details(
+        session, "main", "openai/deepseek-flash", "https://tokenrhythm.studio/v1",
+        "tools-v1", base, route_override_fingerprint="bb",
+    )
+
+    assert first["request_reason"] == "冷启动"
+    assert first["route_override_sha256"] == "aa"
+    assert second["request_reason"] == ""
+    assert second["route_override_sha256"] == "bb"
+
+
+def test_legacy_cache_diagnostic_table_migrates_route_override_column(tmp_path):
+    """老库升级：缺 route_override_sha256 列触发迁移；老调用不传该字段也能落库。"""
+    import sqlite3
+
+    from core.memory import MemoryManager
+
+    db_path = tmp_path / "legacy-cache-diagnostics.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE cache_request_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            api_base TEXT NOT NULL,
+            cache_scope TEXT NOT NULL,
+            request_reason TEXT NOT NULL,
+            messages_sha256 TEXT NOT NULL,
+            system_sha256 TEXT NOT NULL,
+            tools_sha256 TEXT NOT NULL,
+            message_count INTEGER NOT NULL,
+            system_message_count INTEGER NOT NULL,
+            common_prefix_messages INTEGER NOT NULL,
+            request_bytes INTEGER NOT NULL,
+            system_bytes INTEGER NOT NULL,
+            tools_bytes INTEGER NOT NULL,
+            prompt_tokens INTEGER,
+            cached_tokens INTEGER,
+            cache_miss_tokens INTEGER,
+            cache_reported INTEGER NOT NULL,
+            usage_valid INTEGER NOT NULL,
+            usage_errors TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    manager = MemoryManager(str(db_path))
+    columns = {
+        row[1]
+        for row in manager.conn.execute(
+            "PRAGMA table_info(cache_request_diagnostics)"
+        )
+    }
+    assert "route_override_sha256" in columns
+
+    manager.add_cache_request_diagnostic({
+        "session_id": "legacy-path",
+        "model": "openai/deepseek-v4",
+        "api_base": "https://api.example/v1",
+        "cache_scope": "main",
+        "request_reason": "",
+        "messages_sha256": "a" * 64,
+        "system_sha256": "b" * 64,
+        "tools_sha256": "c" * 64,
+        "message_count": 1,
+        "system_message_count": 1,
+        "common_prefix_messages": 0,
+        "request_bytes": 10,
+        "system_bytes": 5,
+        "tools_bytes": 0,
+        "cache_reported": False,
+        "usage_valid": False,
+        "usage_errors": ("usage missing",),
+    })
+    row = manager.conn.execute(
+        "SELECT route_override_sha256 FROM cache_request_diagnostics "
+        "WHERE session_id = 'legacy-path'"
+    ).fetchone()
+    assert row == ("",)

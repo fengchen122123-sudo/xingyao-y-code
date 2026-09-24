@@ -92,8 +92,13 @@ def _build_cache_request_diagnostic(
     api_base,
     tools,
     messages,
+    route_override_fingerprint="",
 ):
-    """构建不含正文的确定性请求形状诊断。"""
+    """构建不含正文的确定性请求形状诊断。
+
+    route_override_fingerprint 为渠道请求形态覆盖的生效指纹（无覆盖为空串），
+    只作记录，便于事后按 route_override_sha256 归因缓存换代是否由覆盖变更引起。
+    """
     normalized_messages = [
         {key: value for key, value in message.items() if key != "cache_control"}
         for message in (messages or [])
@@ -119,6 +124,7 @@ def _build_cache_request_diagnostic(
         "request_bytes": len(messages_json.encode("utf-8")),
         "system_bytes": len(system_json.encode("utf-8")),
         "tools_bytes": len(tools_json.encode("utf-8")),
+        "route_override_sha256": str(route_override_fingerprint or ""),
         "_message_fingerprints": _cache_message_fingerprints(normalized_messages),
     }
 
@@ -131,11 +137,17 @@ def _classify_cache_request_details(
     tool_contract,
     messages,
     tools=None,
+    route_override_fingerprint="",
 ):
-    """记录请求形状并返回可持久化的原因、哈希与公共前缀长度。"""
+    """记录请求形状并返回可持久化的原因、哈希与公共前缀长度。
+
+    route_override_fingerprint 只透传进诊断记录（route_override_sha256），
+    不参与下方 current 的换代比较：覆盖变化不该被误判成一次缓存换代。
+    """
     state_key = (str(session_id), str(cache_scope or "main"))
     details = _build_cache_request_diagnostic(
-        session_id, cache_scope, model_name, api_base, tools, messages
+        session_id, cache_scope, model_name, api_base, tools, messages,
+        route_override_fingerprint=route_override_fingerprint,
     )
     current = {
         "model": details["model"],
