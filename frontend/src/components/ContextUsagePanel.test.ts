@@ -170,7 +170,7 @@ describe('ContextUsagePanel', () => {
     wrapper.unmount();
   });
 
-  it('缓存命中率下方标注当前车道，保活命中率单独一列', async () => {
+  it('缓存与保活命中率各占一行，车道身份不再上界面', async () => {
     setUsage({
       cache_available: true,
       cache_session_pct: 90.81,
@@ -180,11 +180,9 @@ describe('ContextUsagePanel', () => {
     });
     const wrapper = mountPanel();
 
-    // 车道身份：scheme 与结尾斜杠不进界面，只留可读的「模型 @ 主机」
-    const lane = wrapper.get('[data-test="ctx-usage-cache-lane"]');
-    expect(lane.text()).toContain('openai/deepseek-v4.1-flash');
-    expect(lane.text()).toContain('token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1');
-    expect(lane.text()).not.toContain('https://');
+    // 车道身份行（模型 @ 接口）已下线：数据字段仍在，界面不再渲染
+    expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
+    expect(wrapper.get('[data-test="ctx-usage-cache"]').text()).toContain('缓存命中率');
 
     // 保活单列：与主口径同行的另一个数字，1 位小数
     const keepalive = wrapper.get('[data-test="ctx-usage-cache-keepalive"]');
@@ -203,8 +201,8 @@ describe('ContextUsagePanel', () => {
     });
     const wrapper = mountPanel();
     expect(wrapper.find('[data-test="ctx-usage-cache-keepalive"]').exists()).toBe(false);
-    // 旧后端无车道字段时也不该冒出车道行
-    expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(true);
+    // 车道行已下线：无论后端有没有车道字段，界面都不渲染它
+    expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
 
     setUsage({ cache_lane_model: '', cache_lane_api_base: '' });
     await wrapper.vm.$nextTick();

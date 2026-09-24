@@ -44,10 +44,6 @@
           <span class="cxp-cache-label">缓存命中率</span>
           <span class="cxp-cache-value">{{ cachePctText }}</span>
         </div>
-        <!-- 车道身份：同一模型在不同渠道的缓存命中彼此独立，标出来才不会看着像「串数」 -->
-        <div v-if="cacheLaneText" class="cxp-cache-lane" data-test="ctx-usage-cache-lane">
-          {{ cacheLaneText }}
-        </div>
         <!-- 保活单列：keepalive scope 不混进主口径；未报告整列隐藏，绝不显示 0% -->
         <div v-if="showKeepaliveRow" class="cxp-cache" data-test="ctx-usage-cache-keepalive">
           <span class="cxp-cache-label">保活命中率</span>
@@ -154,18 +150,6 @@ const showCacheRow = computed(() => {
 });
 
 const cachePctText = computed(() => `${Number(store.tokenUsage.cache_session_pct).toFixed(1)}%`);
-
-// 车道身份：同一模型在不同渠道的缓存命中彼此独立，标出来才不会看着像「串数」。
-// 接口只留「主机+路径」，scheme 与结尾斜杠不进界面（面板宽 320px，少一串噪音）。
-const cacheLaneText = computed(() => {
-  const usage = store.tokenUsage;
-  const model = String(usage.cache_lane_model || '');
-  const host = String(usage.cache_lane_api_base || '')
-    .replace(/^[a-z][a-z0-9+.-]*:\/\//i, '')
-    .replace(/\/+$/, '');
-  if (model && host) return `${model} @ ${host}`;
-  return model || host;
-});
 
 // 保活单列：只认与主口径同分母的 session 值；null / 非有限值一律整列隐藏，
 // 绝不退化成 0%（未报告 ≠ 0 命中）。
@@ -324,14 +308,5 @@ onUnmounted(() => window.removeEventListener('resize', onViewportResize));
   font-family: var(--mono);
   font-variant-numeric: tabular-nums;
   color: var(--text);
-}
-/* 车道身份小字注脚：长接口地址允许折行，不撑破面板宽度 */
-.cxp-cache-lane {
-  margin-top: 2px;
-  font-size: 11px;
-  line-height: 1.4;
-  color: var(--text-dim);
-  font-family: var(--mono);
-  word-break: break-all;
 }
 </style>
