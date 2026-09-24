@@ -271,7 +271,7 @@ describe('useSuggest', () => {
     detectToken();
     expect(suggest.value?.mode).toBe('file');
     await vi.advanceTimersByTimeAsync(200);
-    expect(searchSessions).toHaveBeenCalledWith('登录', 12);
+    expect(searchSessions).toHaveBeenCalledWith('登录', 12, '');
     expect(searchFiles).toHaveBeenCalledWith('登录', 8);
     // 会话候选在前、文件候选在后
     expect(suggestItems.value.length).toBe(2);
@@ -281,6 +281,35 @@ describe('useSuggest', () => {
     expect(suggestItems.value[0].desc).toBe('3 条消息');
     expect(suggestItems.value[1].group).toBe('file');
     expect(suggestItems.value[1].label).toBe('core/login.py');
+
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  it('@ 会话候选携带当前会话名：草稿态传空串，后端据此不排除任何会话', async () => {
+    vi.useFakeTimers();
+    const store = useAppStore();
+    const searchSessions = vi.fn().mockResolvedValue({ ok: true, sessions: [] });
+    const searchFiles = vi.fn().mockResolvedValue({ files: [] });
+    vi.stubGlobal('pywebview', {
+      api: { search_sessions: searchSessions, search_workspace_files: searchFiles },
+    });
+
+    const inputVal = ref('@');
+    const taRef = ref<HTMLTextAreaElement | null>(null);
+    const { detectToken } = useSuggest(inputVal, taRef);
+    taRef.value = mockTextarea('@', 1);
+
+    // 新会话草稿：currentSessionName 为空，必须显式传空串——否则后端会用自己
+    // 仍停留在上一个会话的 _current_session 把目标会话排除掉
+    store.currentSessionName = '';
+    detectToken();
+    expect(searchSessions).toHaveBeenLastCalledWith('', 12, '');
+
+    // 已在某个已落库会话里：把会话名交给后端，由它排除自身
+    store.currentSessionName = '缓存改造';
+    detectToken();
+    expect(searchSessions).toHaveBeenLastCalledWith('', 12, '缓存改造');
 
     vi.unstubAllGlobals();
     vi.useRealTimers();
@@ -384,7 +413,7 @@ describe('useSuggest', () => {
     taRef.value = mockTextarea('@login', 6);
     detectToken();
     await vi.advanceTimersByTimeAsync(200);
-    expect(searchSessions).toHaveBeenCalledWith('login', 12);
+    expect(searchSessions).toHaveBeenCalledWith('login', 12, '');
     // 会话接口异常不应拖垮文件补全：文件候选仍正常出现
     expect(suggestItems.value.map(it => it.apply)).toEqual(['@core/login.py', '@README.md']);
     expect(suggestItems.value.every(it => it.group === 'file')).toBe(true);
@@ -417,7 +446,7 @@ describe('useSuggest', () => {
     // 会话请求不防抖、立即发起：冲刷微任务后「对话」候选已经可见，
     // 而不是等慢文件扫描（旧实现会卡在 Promise.all 上）
     await vi.advanceTimersByTimeAsync(1);
-    expect(searchSessions).toHaveBeenCalledWith('登录', 12);
+    expect(searchSessions).toHaveBeenCalledWith('登录', 12, '');
     expect(suggestItems.value.length).toBe(1);
     expect(suggestItems.value[0].group).toBe('session');
     expect(suggestItems.value[0].label).toBe('登录bug排查');

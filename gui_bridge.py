@@ -2796,8 +2796,21 @@ class ApiBridge(GitBridgeMixin):
             logger.exception("search_workspace_files 失败")
             return {"ok": False, "msg": str(e), "files": []}
 
-    def search_sessions(self, query: str = "", limit: int = 12) -> Dict[str, Any]:
+    def search_sessions(
+        self,
+        query: str = "",
+        limit: int = 12,
+        current_session: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """@ 提及对话自动补全：会话名大小写不敏感子串匹配（排除当前会话）。
+
+        current_session 是前端显式传入的「用户实际所在的会话名」：
+        - 未传（None）时回退到后端自己维护的 _current_session，兼容旧前端；
+        - 传空串表示用户正处于「新会话草稿」：该会话尚未落库，用户此刻并不在
+          任何已落库会话的上下文里，此时必须不排除任何会话。草稿态下后端
+          _current_session 仍停留在上一个真实会话（落库才切换，见
+          _spawn_turn_worker 内的处理），若继续按它排除，用户在空白新会话里
+          @ 上一个对话会永远搜不到，且改名字也无效——排除依据是会话身份而非名字。
 
         取数策略与侧栏 get_sessions() 对齐：
         - include_empty=True：否则刚新建、还没有任何消息的会话永远进不了 @ 候选；
@@ -2812,11 +2825,17 @@ class ApiBridge(GitBridgeMixin):
             if self._memory is None:
                 return {"ok": False, "msg": "后端未就绪", "sessions": []}
             q = str(query or "").strip().lower()
+            # 排除目标：前端显式传入的 current_session 优先（空串 = 草稿新会话，
+            # 不排除任何会话）；未传入时回退到后端当前会话，保持旧调用方语义不变。
+            if current_session is None:
+                exclude_name = str(self._current_session or "")
+            else:
+                exclude_name = str(current_session)
             raw = self._memory.get_all_sessions(workdir=None, include_empty=True)
             items = []
             for s in raw:
                 name = str(s.get("name") or "")
-                if not name or name == self._current_session:
+                if not name or (exclude_name and name == exclude_name):
                     continue
                 count = int(s.get("count") or 0)
                 # 空会话仅在人工重命名后才补全：默认名空会话是自动创建的

@@ -961,7 +961,8 @@ export interface PyWebViewAPI {
   // @ 引用自动补全：工作区文件子串匹配
   search_workspace_files(query: string, limit?: number): Promise<any>;
   // @ 提及对话自动补全：历史会话子串匹配（排除当前会话）
-  search_sessions(query: string, limit?: number): Promise<{
+  // currentSession：用户实际所在的会话名；草稿新会话传空串，表示不排除任何会话
+  search_sessions(query: string, limit?: number, currentSession?: string): Promise<{
     ok: boolean;
     sessions?: { name: string; count: number; updated_at: string; workdir: string }[];
     msg?: string;

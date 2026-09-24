@@ -98,8 +98,12 @@ export function useSuggest(
     // —— 会话候选：不防抖，立即发起 ——
     // 接口缺失（旧版桥）时直接跳过，退化为纯文件补全。
     if (typeof api.search_sessions === 'function') {
+      // 第三个参数是「用户实际所在的会话名」，由前端权威给出：非空时后端据此
+      // 排除自身；新会话草稿态 currentSessionName 为 ''，显式传空串让后端不排除
+      // 任何会话——否则后端 _current_session 仍停留在上一个真实会话，用户在这个
+      // 空白新会话里 @ 上一个对话会永远搜不到（改名也无效）。
       api
-        .search_sessions(query, 12)
+        .search_sessions(query, 12, store.currentSessionName || '')
         .then(res => {
           if (!canWrite()) return;
           sessionItems = ((res && res.sessions) || []).map(s => ({
