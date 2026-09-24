@@ -140,6 +140,21 @@ def test_known_optional_keys_are_not_reported():
     assert config.find_unknown_config_keys(data) == []
 
 
+def test_cache_route_config_keys_are_known():
+    """Task0：三个缓存路由配置键必须登记为已知键，零误报。
+
+    三个键分别被 core/route_overrides.py（route_request_overrides）与
+    core/llm_dialects.py（cache_keepalive_routes / deepseek_cache_routes）读取。
+    """
+    data = {
+        "route_request_overrides": [],
+        "cache_keepalive_routes": [],
+        "deepseek_cache_routes": [],
+    }
+
+    assert config.find_unknown_config_keys(data) == []
+
+
 # ---------------------------------------------------------------------------
 # ② 未知键命中（含嵌套）
 # ---------------------------------------------------------------------------
@@ -236,6 +251,23 @@ def test_strict_config_true_raises_and_blocks_startup(cfg_env, captured_warnings
 def test_strict_config_true_with_clean_config_passes(cfg_env, captured_warnings):
     cfg_path, _ = cfg_env
     cfg_path.write_text(json.dumps({"strict_config": True}), encoding="utf-8")
+
+    assert config.audit_config_keys() == []
+    assert captured_warnings == []
+
+
+def test_strict_config_true_with_cache_route_keys_passes(cfg_env, captured_warnings):
+    """Task0：strict_config=true 且含三个缓存路由配置键时可正常启动（零告警、不抛错）。"""
+    cfg_path, _ = cfg_env
+    cfg_path.write_text(
+        json.dumps({
+            "strict_config": True,
+            "route_request_overrides": [],
+            "cache_keepalive_routes": [],
+            "deepseek_cache_routes": [],
+        }),
+        encoding="utf-8",
+    )
 
     assert config.audit_config_keys() == []
     assert captured_warnings == []
