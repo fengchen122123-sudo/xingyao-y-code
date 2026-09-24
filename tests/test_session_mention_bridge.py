@@ -123,6 +123,45 @@ class SessionMentionBridgeTest(unittest.TestCase):
         self.assertNotIn("X(2)", names)
         self.assertIn("X", names)
 
+    def test_draft_new_session_excludes_nothing(self):
+        """草稿新会话（current_session 传空串）不得排除任何会话。
+
+        回归：启动后点「新会话」进入空白草稿时，后端 _current_session 仍停留在
+        上一个真实会话（会话懒落库，落库才切换）；若继续按它排除，用户在这张
+        空白草稿里 @ 上一个对话会永远搜不到，改名字也无效——排除依据是会话
+        身份而不是名字。
+        """
+        bridge = self._make_bridge_with_tmp_memory(current_session="缓存改造")
+        for name in ("缓存改造", "其他会话"):
+            bridge._memory.ensure_session(name)
+            bridge._memory.add_message(name, "user", "hi")
+
+        # 旧调用（不传第三参）语义不变：仍按后端当前会话排除
+        legacy = [s["name"] for s in bridge.search_sessions("")["sessions"]]
+        self.assertNotIn("缓存改造", legacy)
+
+        # 草稿态：显式传空串，任何会话都不排除，目标会话必须可见
+        draft = [
+            s["name"]
+            for s in bridge.search_sessions("", current_session="")["sessions"]
+        ]
+        self.assertIn("缓存改造", draft)
+        self.assertIn("其他会话", draft)
+
+    def test_explicit_current_session_overrides_backend_state(self):
+        """显式传入的 current_session 覆盖后端 _current_session（前端才是权威）。"""
+        bridge = self._make_bridge_with_tmp_memory(current_session="后端以为的当前会话")
+        for name in ("后端以为的当前会话", "前端所在的会话"):
+            bridge._memory.ensure_session(name)
+            bridge._memory.add_message(name, "user", "hi")
+
+        names = [
+            s["name"]
+            for s in bridge.search_sessions("", current_session="前端所在的会话")["sessions"]
+        ]
+        self.assertNotIn("前端所在的会话", names)
+        self.assertIn("后端以为的当前会话", names)
+
 
 if __name__ == "__main__":
     unittest.main()
