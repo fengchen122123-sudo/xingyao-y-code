@@ -15,6 +15,12 @@ sum(cached_tokens) / sum(prompt_tokens)，不是逐轮命中率的算术平均�
 未报告 ≠ 0：cache_reported=0 / usage_valid=0 的行绝不入健康分母、绝不按
 命中率 0 记账（窗口内全为此类 → reported=False、verdict='unreported'）。
 无法确定 prev_prompt 的行宁可少一个样本，也不把未知当 0。
+
+写入轮单列（Task 7 遗留的派生层补全）：可判定轮次中 cache_write_tokens 有值
+（非 None 且 > 0）的单独计入 write_turns / hot_write_tokens。**本期只单列，
+不把写入轮从 samples 分母剔除**——「写入轮 ≠ 未命中」与「分母口径」是两件事，
+Task 3 的分母与 verdict 规则已验收，动分母须另立验收。缺失 / None / 零 / 负值 /
+非法值一律按未报告处理（不冒充 0）。
 """
 
 from dataclasses import dataclass
@@ -40,6 +46,8 @@ class LaneHealth:
     upstream_loss_rate: float
     consecutive_loss: int
     client_rewrite_count: int
+    write_turns: int  # 可判定行中 cache_write_tokens 非 None 且 >0 的轮次数
+    hot_write_tokens: int  # 上述写入轮的写入量之和（未报告/非正数一律不计）
     verdict: str  # healthy | unreported | upstream_lossy | client_rewrite | insufficient
 
 
@@ -49,6 +57,22 @@ def _is_reported_row(row):
     未报告/无效的轮次连入分母的资格都没有，也绝不记 0（铁律 3）。
     """
     return bool(row.get("cache_reported")) and bool(row.get("usage_valid"))
+
+
+def _row_write_tokens(row):
+    """行上已报告的写入量（cache_write_tokens 非 None 且 > 0）；否则返回 None。
+
+    与 cached_tokens 一样坚持 NULL 语义：缺失 / None / 零 / 负值 / 非法值
+    一律视为「未报告」，绝不冒充 0，也不把非正数计成写入轮（Task 7 铁律 4）。
+    """
+    value = row.get("cache_write_tokens")
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneHealth:
@@ -72,6 +96,8 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
     samples = 0
     hot_prompt = 0
     hot_cached = 0
+    write_turns = 0
+    hot_write_tokens = 0
     loss_count = 0
     client_rewrite_count = 0
     states = []
@@ -103,6 +129,10 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
             samples += 1
             hot_prompt += prompt_value
             hot_cached += cached_value
+            write_value = _row_write_tokens(row)
+            if write_value is not None:
+                write_turns += 1
+                hot_write_tokens += write_value
             if cached_value < min(prev_prompt, prompt_value) * theta:
                 loss_count += 1
                 states.append("loss")
@@ -149,6 +179,8 @@ def classify_lane_health(rows, *, window=200, theta=DEFAULT_LOSS_THETA) -> LaneH
         upstream_loss_rate=upstream_loss_rate,
         consecutive_loss=consecutive_loss,
         client_rewrite_count=client_rewrite_count,
+        write_turns=write_turns,
+        hot_write_tokens=hot_write_tokens,
         verdict=verdict,
     )
 
