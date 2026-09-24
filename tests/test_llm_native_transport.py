@@ -458,3 +458,20 @@ def test_native_completion_sends_tokenrhythm_agent_header(monkeypatch):
 
     assert client.last_url == "https://tokenrhythm.studio/v1/chat/completions"
     assert client.last_headers["X-TokenRhythm-Agent"] == client.last_headers["User-Agent"]
+
+
+# tests/test_llm_native_transport.py（守护现有合并顺序，不改代码）
+def test_extra_headers_win_over_hardcoded_tokenrhythm_header():
+    """配置的 X-TokenRhythm-Agent 必须压过硬编码值——由现有合并顺序保证。"""
+    from core.llm_native_transport import _resolve_endpoint_and_headers
+    from core.llm_policy import get_model_policy
+
+    _url, headers, _clean = _resolve_endpoint_and_headers(
+        model="openai/deepseek-flash",
+        api_key="k",
+        api_base="https://tokenrhythm.studio/v1",
+        policy=get_model_policy(model_name="openai/deepseek-flash",
+                                api_base="https://tokenrhythm.studio/v1"),
+        extra_headers={"X-TokenRhythm-Agent": "CustomAgent/1.0"},
+    )
+    assert headers["X-TokenRhythm-Agent"] == "CustomAgent/1.0"
