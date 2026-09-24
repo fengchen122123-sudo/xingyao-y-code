@@ -1472,6 +1472,28 @@ def _assert_reasoning_request_consistent(result, capability):
         raise ValueError("请求包含思考强度，但未开启思考")
 
 
+def _apply_route_request_overrides(result, model_name, api_base):
+    """合并渠道请求形态覆盖；无配置时原样返回（零影响）。
+
+    必须在 _assert_reasoning_request_consistent 之后调用：覆盖值不参与一致性
+    校验，配置错误才不会抛错阻断对话（§4.4 / §4.7 的硬约束）。
+    """
+    from core.route_overrides import resolve_route_override  # 局部导入，避免模块循环依赖
+
+    override = resolve_route_override(model_name, api_base)
+    headers = override.get("headers") or {}
+    body = override.get("body") or {}
+    if headers:
+        merged = dict(result.get("extra_headers") or {})
+        merged.update(headers)
+        result["extra_headers"] = merged
+    if body:
+        merged = dict(result.get("extra_body") or {})
+        merged.update(body)
+        result["extra_body"] = merged
+    return result
+
+
 def _provider_cache_affinity_options(
     model_name,
     api_base,
@@ -1737,5 +1759,5 @@ def _provider_request_options(
         anthropic_route=anthropic_route,
     )
     _assert_reasoning_request_consistent(result, capability)
-    return result
+    return _apply_route_request_overrides(result, model_name, api_base)
 
