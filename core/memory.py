@@ -483,6 +483,7 @@ class MemoryManager:
                         prompt_tokens INTEGER,
                         completion_tokens INTEGER,
                         cached_tokens INTEGER,
+                        cache_write_tokens INTEGER,
                         total_tokens INTEGER,
                         session_id TEXT,
                         api_base TEXT NOT NULL DEFAULT '',
@@ -501,6 +502,15 @@ class MemoryManager:
                         "ALTER TABLE token_usage "
                         "ADD COLUMN cache_scope TEXT NOT NULL DEFAULT 'legacy'"
                     )
+                # 读写分列（Task 7）：为 NULL 表示未报告（未报告 ≠ 0），不加默认值。
+                if "cache_write_tokens" not in token_usage_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE token_usage "
+                            "ADD COLUMN cache_write_tokens INTEGER"
+                        )
+                    except Exception:
+                        pass
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_token_usage_date ON token_usage(date)"
                 )
@@ -534,7 +544,8 @@ class MemoryManager:
                         usage_errors TEXT NOT NULL,
                         route_override_sha256 TEXT NOT NULL DEFAULT '',
                         cache_control_markers INTEGER,
-                        request_bytes_final INTEGER
+                        request_bytes_final INTEGER,
+                        cache_write_tokens INTEGER
                     )
                 ''')
                 # 老库平滑升级：早期版本建的表没有 route_override_sha256 列，
@@ -565,6 +576,15 @@ class MemoryManager:
                         cursor.execute(
                             "ALTER TABLE cache_request_diagnostics "
                             "ADD COLUMN request_bytes_final INTEGER"
+                        )
+                    except Exception:
+                        pass
+                # 读写分列（Task 7）：写入量单列，NULL 语义与 cached 一致。
+                if "cache_write_tokens" not in cache_diag_columns:
+                    try:
+                        cursor.execute(
+                            "ALTER TABLE cache_request_diagnostics "
+                            "ADD COLUMN cache_write_tokens INTEGER"
                         )
                     except Exception:
                         pass
@@ -942,7 +962,8 @@ class MemoryManager:
 
     def add_token_usage(self, provider, model, prompt_tokens, completion_tokens,
                         cached_tokens, total_tokens, session_id=None, ts=None,
-                        api_base="", cache_scope="legacy"):
+                        api_base="", cache_scope="legacy",
+                        cache_write_tokens=None):
         """追加一条真实 token 用量记录（由 core/llm.py 流结束记账点调用）。"""
         import time
         if ts is None:
@@ -953,12 +974,18 @@ class MemoryManager:
                 self.conn.execute(
                     "INSERT INTO token_usage "
                     "(ts, date, provider, model, prompt_tokens, completion_tokens, "
-                    "cached_tokens, total_tokens, session_id, api_base, cache_scope) "
-                    "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                    "cached_tokens, cache_write_tokens, total_tokens, session_id, "
+                    "api_base, cache_scope) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         int(ts), day, str(provider or ""), str(model or ""),
                         int(prompt_tokens or 0), int(completion_tokens or 0),
                         None if cached_tokens is None else int(cached_tokens),
+                        (
+                            None
+                            if cache_write_tokens is None
+                            else int(cache_write_tokens)
+                        ),
                         int(total_tokens or 0),
                         str(session_id) if session_id is not None else None,
                         _canonicalize_api_base(api_base),
@@ -1148,7 +1175,7 @@ class MemoryManager:
         with self._lock:
             cursor = self.conn.execute(
                 "SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens, "
-                "provider, model "
+                "provider, model, cache_write_tokens "
                 "FROM token_usage WHERE session_id = ? "
                 "AND cache_scope IN ('main', 'legacy') "
                 "ORDER BY id DESC LIMIT 1",
@@ -1164,6 +1191,7 @@ class MemoryManager:
             "completion_tokens": int(row[1] or 0),
             "total_tokens": int(row[2] or 0),
             "cached_tokens": None if row[3] is None else int(row[3]),
+            "cache_write_tokens": None if row[6] is None else int(row[6]),
             "model_name": f"{provider}/{model}" if provider else model,
         }
 
@@ -1247,7 +1275,8 @@ class MemoryManager:
             "messages_sha256", "system_sha256", "tools_sha256", "message_count",
             "system_message_count", "common_prefix_messages", "request_bytes",
             "system_bytes", "tools_bytes", "prompt_tokens", "cached_tokens",
-            "cache_miss_tokens", "cache_reported", "usage_valid", "usage_errors",
+            "cache_miss_tokens", "cache_write_tokens",
+            "cache_reported", "usage_valid", "usage_errors",
             "route_override_sha256",
             "cache_control_markers", "request_bytes_final",
         )
@@ -1269,6 +1298,11 @@ class MemoryManager:
             None if diagnostic.get("prompt_tokens") is None else int(diagnostic["prompt_tokens"]),
             None if diagnostic.get("cached_tokens") is None else int(diagnostic["cached_tokens"]),
             None if diagnostic.get("cache_miss_tokens") is None else int(diagnostic["cache_miss_tokens"]),
+            (
+                None
+                if diagnostic.get("cache_write_tokens") is None
+                else int(diagnostic["cache_write_tokens"])
+            ),
             1 if diagnostic.get("cache_reported") else 0,
             1 if diagnostic.get("usage_valid") else 0,
             json.dumps(list(diagnostic.get("usage_errors") or ()), ensure_ascii=False),
@@ -1320,7 +1354,8 @@ class MemoryManager:
             "request_reason", "messages_sha256", "system_sha256", "tools_sha256",
             "message_count", "system_message_count", "common_prefix_messages",
             "request_bytes", "system_bytes", "tools_bytes", "prompt_tokens",
-            "cached_tokens", "cache_miss_tokens", "cache_reported", "usage_valid",
+            "cached_tokens", "cache_miss_tokens", "cache_write_tokens",
+            "cache_reported", "usage_valid",
             "usage_errors", "cache_control_markers", "request_bytes_final",
         )
         with self._lock:
