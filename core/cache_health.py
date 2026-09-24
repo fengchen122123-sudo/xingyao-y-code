@@ -21,6 +21,16 @@ sum(cached_tokens) / sum(prompt_tokens)，不是逐轮命中率的算术平均�
 不把写入轮从 samples 分母剔除**——「写入轮 ≠ 未命中」与「分母口径」是两件事，
 Task 3 的分母与 verdict 规则已验收，动分母须另立验收。缺失 / None / 零 / 负值 /
 非法值一律按未报告处理（不冒充 0）。
+
+★ 口径边界（与 docs/adapt-report-cross-channel-cache.md 的基线对照前必读）：
+`prev_prompt` 是在**传入的窗口内**滚动的——窗口首行没有上一行、紧跟在未报告行之后的
+那一行也拿不到上一行，这两类行**整体不进分母**（既少一个 samples，也不计入
+hot_prompt / hot_cached / write_turns）。而报告 §二 的基线是**全历史、按 session
+分链**算出来的：取样行数不同、prev 链边界也不同，**两侧数字不可直接对照**，差几个
+百分点不是回归。窗口越小偏差越大（实测 3 行窗口：samples 2/3，hot_hit_rate 50.9%
+而全量同轮次口径 67.1%）。要复测对标数字，二选一：
+① `MemoryManager.query_lane_cache_health(start_ts=修复切点, window=大于该车道切点后
+行数)`，把取样集钉在切点之后；② 直接用报告 §七 的脚本（与基线同一套算法）。
 """
 
 from dataclasses import dataclass
