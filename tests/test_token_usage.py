@@ -665,3 +665,265 @@ def test_token_usage_snapshot_exposes_per_scope_views_without_changing_cache_key
     assert snapshot["cache_scopes"]["main"]["hot"]["rate"] == 95.0
     assert snapshot["cache_scopes"]["keepalive"]["hot"]["rate"] == 10.0
     assert snapshot["cache_scopes"]["keepalive"]["hot"]["prompt_tokens"] == 1000
+
+
+# ---------------------------------------------------------------------------
+# Task 7（跨渠道缓存命中率修复）：缓存读 / 写分列记账——写入轮 ≠ 未命中
+# ---------------------------------------------------------------------------
+
+
+def test_persist_token_usage_forwards_cache_write_tokens(monkeypatch):
+    """写入量必须透传到落库层；未报告时传 None（绝不冒充 0）。"""
+    recorded = {}
+
+    class _FakeManager:
+        def add_token_usage(self, **kwargs):
+            recorded.update(kwargs)
+
+    monkeypatch.setattr(app_context, "get_manager", lambda: _FakeManager())
+    _persist_token_usage(
+        "anthropic/kimi-k3",
+        prompt_tokens=1000,
+        completion_tokens=20,
+        cached_tokens=None,
+        total_tokens=1020,
+        session_id="sess-write",
+        api_base="https://api.kimi.com/coding/v1",
+        cache_scope="main",
+        cache_write_tokens=800,
+    )
+    assert recorded["cache_write_tokens"] == 800
+
+    recorded.clear()
+    _persist_token_usage(
+        "openai/m1",
+        prompt_tokens=1000,
+        completion_tokens=20,
+        cached_tokens=100,
+        total_tokens=1020,
+        session_id="sess-write",
+        api_base="https://relay.example/v1",
+        cache_scope="main",
+    )
+    # 未报告时不带该键（既有调用方对 kwargs 做精确断言），落库层默认 None。
+    assert recorded.get("cache_write_tokens") is None
+
+
+def test_token_usage_cache_write_tokens_column_keeps_null_vs_zero(tmp_path):
+    """落库语义：未报告 → NULL，已报告 → 真实值（含 0），查询原样返回。"""
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(str(tmp_path / "token-write.db"))
+    try:
+        manager.add_token_usage(
+            "anthropic", "kimi-k3", 1000, 20, None, 1020,
+            session_id="write-null", cache_write_tokens=None,
+        )
+        manager.add_token_usage(
+            "anthropic", "kimi-k3", 1000, 20, 0, 1020,
+            session_id="write-zero", cache_write_tokens=0,
+        )
+        manager.add_token_usage(
+            "anthropic", "kimi-k3", 1000, 20, None, 1020,
+            session_id="write-real", cache_write_tokens=800,
+        )
+
+        assert manager.get_last_token_usage("write-null")["cache_write_tokens"] is None
+        assert manager.get_last_token_usage("write-zero")["cache_write_tokens"] == 0
+        assert manager.get_last_token_usage("write-real")["cache_write_tokens"] == 800
+    finally:
+        manager.close()
+
+
+def test_extract_cache_write_tokens_candidates_and_unreported():
+    """写入量候选名三形态；未报告 → None（写入轮 ≠ 未命中，绝不冒充 0）。"""
+    from core.llm_diagnostics import _extract_cache_write_tokens
+
+    assert _extract_cache_write_tokens(None) is None
+    assert _extract_cache_write_tokens({"prompt_tokens": 1000}) is None
+    assert _extract_cache_write_tokens({"cache_creation_input_tokens": 700}) == 700
+    assert _extract_cache_write_tokens({"cache_write_tokens": 300}) == 300
+    assert _extract_cache_write_tokens(
+        {"prompt_tokens_details": {"cache_creation_tokens": 400}}
+    ) == 400
+    # details 内嵌优先于直读与 Anthropic 形态
+    assert _extract_cache_write_tokens({
+        "prompt_tokens_details": {"cache_creation_tokens": 400},
+        "cache_write_tokens": 300,
+        "cache_creation_input_tokens": 700,
+    }) == 400
+    # 报告了 0 是真实 0，与「未报告」严格区分
+    assert _extract_cache_write_tokens({"cache_write_tokens": 0}) == 0
+    # 非法值按未报告处理，不猜、不夹断（拒绝口径与 cached_tokens 一致）
+    assert _extract_cache_write_tokens({"cache_write_tokens": -1}) is None
+
+
+def test_cache_diagnostic_table_keeps_null_vs_zero_for_cache_write(tmp_path):
+    """诊断表写入量列：未报告 → NULL，已报告 → 真实值（含 0）。"""
+    from core.memory import MemoryManager
+
+    manager = MemoryManager(str(tmp_path / "diag-write.db"))
+    try:
+        base = {
+            "model": "anthropic/kimi-k3",
+            "api_base": "https://api.kimi.com/coding/v1",
+            "cache_scope": "main",
+            "request_reason": "",
+            "messages_sha256": "a" * 64,
+            "system_sha256": "b" * 64,
+            "tools_sha256": "c" * 64,
+            "message_count": 2,
+            "system_message_count": 1,
+            "common_prefix_messages": 0,
+            "request_bytes": 100,
+            "system_bytes": 40,
+            "tools_bytes": 0,
+            "cache_reported": True,
+            "usage_valid": True,
+            "usage_errors": (),
+        }
+        manager.add_cache_request_diagnostic(dict(base, session_id="dw-null"))
+        manager.add_cache_request_diagnostic(
+            dict(base, session_id="dw-zero", cache_write_tokens=0)
+        )
+        manager.add_cache_request_diagnostic(
+            dict(base, session_id="dw-real", cache_write_tokens=800)
+        )
+
+        rows = {
+            row["session_id"]: row
+            for row in manager.query_cache_request_diagnostics()
+        }
+        assert rows["dw-null"]["cache_write_tokens"] is None
+        assert rows["dw-zero"]["cache_write_tokens"] == 0
+        assert rows["dw-real"]["cache_write_tokens"] == 800
+    finally:
+        manager.close()
+
+
+def test_legacy_diagnostic_table_migrates_cache_write_column(tmp_path):
+    """老诊断库缺 cache_write_tokens 时自动补列；老行 NULL；重开幂等。"""
+    import sqlite3
+
+    from core.memory import MemoryManager
+
+    db_path = tmp_path / "legacy-write.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE cache_request_diagnostics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts INTEGER NOT NULL,
+            session_id TEXT NOT NULL,
+            model TEXT NOT NULL,
+            api_base TEXT NOT NULL,
+            cache_scope TEXT NOT NULL,
+            request_reason TEXT NOT NULL,
+            messages_sha256 TEXT NOT NULL,
+            system_sha256 TEXT NOT NULL,
+            tools_sha256 TEXT NOT NULL,
+            message_count INTEGER NOT NULL,
+            system_message_count INTEGER NOT NULL,
+            common_prefix_messages INTEGER NOT NULL,
+            request_bytes INTEGER NOT NULL,
+            system_bytes INTEGER NOT NULL,
+            tools_bytes INTEGER NOT NULL,
+            prompt_tokens INTEGER,
+            cached_tokens INTEGER,
+            cache_miss_tokens INTEGER,
+            cache_reported INTEGER NOT NULL,
+            usage_valid INTEGER NOT NULL,
+            usage_errors TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO cache_request_diagnostics ("
+        "ts, session_id, model, api_base, cache_scope, request_reason, "
+        "messages_sha256, system_sha256, tools_sha256, message_count, "
+        "system_message_count, common_prefix_messages, request_bytes, "
+        "system_bytes, tools_bytes, cache_reported, usage_valid, usage_errors"
+        ") VALUES (1, 'legacy-write-row', 'openai/qwen3.8-max', "
+        "'https://dashscope.aliyuncs.com/compatible-mode/v1', 'main', '', "
+        "'a', 'b', 'c', 1, 1, 0, 188, 90, 0, 0, 0, '[]')"
+    )
+    conn.commit()
+    conn.close()
+
+    manager = MemoryManager(str(db_path))
+    try:
+        columns = {
+            row[1]
+            for row in manager.conn.execute(
+                "PRAGMA table_info(cache_request_diagnostics)"
+            )
+        }
+        assert "cache_write_tokens" in columns
+        legacy = manager.conn.execute(
+            "SELECT cache_write_tokens FROM cache_request_diagnostics "
+            "WHERE session_id = 'legacy-write-row'"
+        ).fetchone()
+        assert legacy == (None,)
+    finally:
+        manager.close()
+
+    reopened = MemoryManager(str(db_path))
+    try:
+        assert "cache_write_tokens" in {
+            row[1]
+            for row in reopened.conn.execute(
+                "PRAGMA table_info(cache_request_diagnostics)"
+            )
+        }
+    finally:
+        reopened.close()
+
+
+def test_account_server_usage_forwards_cache_write_from_anthropic_shape(monkeypatch):
+    """Anthropic 形态的写入量经记账链落到 persist kwargs；未报告则不带该键。"""
+    import core.llm as llm
+
+    persisted = []
+    monkeypatch.setattr(
+        llm, "_persist_token_usage",
+        lambda *args, **kwargs: persisted.append(kwargs),
+    )
+    try:
+        llm._account_server_usage(
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 20,
+                "total_tokens": 1020,
+                "cache_read_input_tokens": 200,
+                "cache_creation_input_tokens": 700,
+            },
+            model_name="anthropic/kimi-k3",
+            api_base="https://api.kimi.com/coding/v1",
+            session_id="accounting-write",
+            cache_scope="main",
+            invalidation_reason="",
+        )
+        assert persisted and persisted[0]["cache_write_tokens"] == 700
+
+        persisted.clear()
+        llm._account_server_usage(
+            {
+                "prompt_tokens": 1000,
+                "completion_tokens": 20,
+                "total_tokens": 1020,
+                "prompt_cache_hit_tokens": 200,
+            },
+            model_name="openai/deepseek-v4",
+            api_base="https://relay.example/v1",
+            session_id="accounting-write-none",
+            cache_scope="main",
+            invalidation_reason="",
+        )
+        assert persisted and "cache_write_tokens" not in persisted[0]
+    finally:
+        with llm.token_usage_lock:
+            for key in [
+                k for k in llm._cache_usage_states
+                if str(k[0]).startswith("accounting-write")
+            ]:
+                del llm._cache_usage_states[key]

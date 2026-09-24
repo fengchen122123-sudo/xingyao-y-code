@@ -600,7 +600,8 @@ def clear_cache_usage_session(session_name):
 
 def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
                          cached_tokens, total_tokens, session_id=None,
-                         api_base="", cache_scope="legacy"):
+                         api_base="", cache_scope="legacy",
+                         cache_write_tokens=None):
     """把本轮真实 token 用量追加到本地 token_usage 表，供 /usage 按模型/日期统计。
 
     失败仅记日志，绝不影响对话主流程。model_name 为 provider 路由模型串
@@ -626,6 +627,7 @@ def _persist_token_usage(model_name, prompt_tokens, completion_tokens,
             session_id=session_id,
             api_base=api_base,
             cache_scope=cache_scope,
+            cache_write_tokens=cache_write_tokens,
         )
     except Exception as _persist_err:
         try:
@@ -789,6 +791,35 @@ def _extract_cached_tokens(usage):
     return int(record["cached_tokens"] or 0)
 
 
+def _extract_cache_write_tokens(usage):
+    """读取本轮缓存**写入** token；未报告 → None（Task 7 · 缓存读写分列）。
+
+    候选名与 cached 同构的三个来源：details 内嵌、OpenAI 兼容直读、
+    Anthropic 形态（`_anthropic_usage_to_openai` 会把 cache_creation 单独透出）。
+    刻意**不**进 `_normalize_server_usage` 的返回结构：那是既有调用方与测试的
+    精确契约，而写入量只影响「写入轮不算未命中」这一列展示，不该改变记账结构。
+
+    铁律：未报告 ≠ 0。非法值一律按未报告处理（返回 None），不猜、不夹断。
+    """
+    if usage is None:
+        return None
+    details = _usage_field(usage, "prompt_tokens_details")
+    for raw in (
+        _usage_field(details, "cache_creation_tokens"),
+        _usage_field(usage, "cache_write_tokens"),
+        _usage_field(usage, "cache_creation_input_tokens"),
+    ):
+        if raw is _USAGE_FIELD_MISSING or raw is None:
+            continue
+        errors = []
+        value = _optional_nonnegative_int(raw, "cache_write_tokens", errors)
+        if errors or value is None:
+            logger.debug("忽略非法的缓存写入量字段（按未报告处理）")
+            return None
+        return value
+    return None
+
+
 def _persist_cache_request_diagnostic(request_details, usage):
     """补齐 usage 并持久化请求诊断；失败不影响回复或正式 token 记账。"""
     if not request_details:
@@ -814,6 +845,8 @@ def _persist_cache_request_diagnostic(request_details, usage):
         "usage_valid": usage_record["valid"],
         "usage_errors": tuple(usage_record["errors"]),
     })
+    # Task 7（缓存读写分列）：写入量从原始 usage 单独提取，未报告 → None。
+    diagnostic["cache_write_tokens"] = _extract_cache_write_tokens(usage)
     try:
         from core import app_context
         manager = app_context.get_manager()
@@ -900,16 +933,21 @@ def _account_server_usage(
         persist = None
     if persist is None:
         persist = _persist_token_usage
-    persist(
-        model_name,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        cached_tokens=cached_tokens,
-        total_tokens=total_tokens,
-        session_id=session_id,
-        api_base=api_base,
-        cache_scope=cache_scope,
-    )
+    persist_kwargs = {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "total_tokens": total_tokens,
+        "session_id": session_id,
+        "api_base": api_base,
+        "cache_scope": cache_scope,
+    }
+    # 未报告写入量时不带该键：调用方（含测试替身）对 kwargs 做精确断言，
+    # 恒定多一个 None 键同样会改变既有契约。未报告 → 落库 NULL，语义不变。
+    cache_write_tokens = _extract_cache_write_tokens(usage)
+    if cache_write_tokens is not None:
+        persist_kwargs["cache_write_tokens"] = cache_write_tokens
+    persist(model_name, **persist_kwargs)
 
     listener = _token_usage_listener
     if listener is not None:
