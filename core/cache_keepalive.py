@@ -225,6 +225,22 @@ def account_keepalive_response(response, telemetry):
     )
     if record is None:
         raise RuntimeError("provider 保活 usage 校验失败")
+    # 保活车道证据（Task 5）：已报告缓存明细的轮次计入 keepalive 桶的轮次与
+    # 累计 token，供 _supports_cache_keepalive 的车道证据门读取；未报告轮次
+    # 不进桶（未报告 ≠ 0，绝不进分母）。补记失败只记日志，绝不影响保活主流程。
+    if record.get("cache_reported"):
+        try:
+            from core.llm_diagnostics import record_keepalive_lane_usage
+
+            record_keepalive_lane_usage(
+                str(telemetry.get("session_id") or ""),
+                str(telemetry.get("model_name") or ""),
+                str(telemetry.get("api_base") or ""),
+                record.get("prompt_tokens") or 0,
+                record.get("cached_tokens") or 0,
+            )
+        except Exception:
+            logger.debug("保活车道证据记账失败（已忽略）", exc_info=True)
     return record
 
 

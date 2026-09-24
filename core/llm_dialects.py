@@ -222,7 +222,9 @@ _QWEN_CACHE_CONFIG_KEYS = (
 _KEEPALIVE_ROUTES_CONFIG_KEY = "cache_keepalive_routes"
 
 # 顶层键解析结果缓存，指纹口径与 _resolve_model_config 一致（见 _qwen_cache_config_stamp）：
-# stamp = (loader 身份, 配置文件 mtime)；条目格式 (过期时间, stamp, routes)。
+# stamp = (loader 身份, 配置文件 mtime)；条目格式
+# (过期时间, stamp, routes, evidence_gate_enabled)——最后一项是
+# cache_keepalive_evidence_gate（Task 5 保活证据门开关），与 routes 共用同一次读盘。
 _keepalive_routes_cfg_cache = {"entry": None}
 
 # 顶层 deepseek_cache_routes：显式声明可安全启用 DeepSeek Prompt Ledger 与
@@ -380,13 +382,19 @@ def _parse_deepseek_cache_routes(data):
 
 
 def _remember_keepalive_routes(data, stamp):
-    """把顶层 cache_keepalive_routes 的解析结果按配置指纹写入缓存（重复读盘去重）。"""
+    """把顶层 cache_keepalive_routes 的解析结果按配置指纹写入缓存（重复读盘去重）。
+
+    同一份 entry 顺带记住 cache_keepalive_evidence_gate（Task 5 保活证据门
+    开关）：两者都出自同一次 load_config，各存一份会让同一个键多付一次读盘。
+    条目格式：(过期时间, stamp, routes, evidence_gate_enabled)。
+    """
     if stamp is None:
         return
     routes = _parse_keepalive_routes(data)
     with _qwen_cache_cfg_lock:
         _keepalive_routes_cfg_cache["entry"] = (
             time.monotonic() + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
+            _parse_keepalive_evidence_gate(data),
         )
 
 
@@ -400,16 +408,19 @@ def _configured_keepalive_routes():
             if cached and cached[0] > now and cached[1] == stamp:
                 return cached[2]
     routes = ()
+    gate_enabled = True
     try:
         from core.model_manager import load_config
 
-        routes = _parse_keepalive_routes(load_config())
+        data = load_config()
+        routes = _parse_keepalive_routes(data)
+        gate_enabled = _parse_keepalive_evidence_gate(data)
     except Exception:
         pass
     if stamp is not None:
         with _qwen_cache_cfg_lock:
             _keepalive_routes_cfg_cache["entry"] = (
-                now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
+                now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes, gate_enabled,
             )
     return routes
 
@@ -704,19 +715,157 @@ def _deepseek_thinking_enabled(model_name, api_base="", model_cfg=None):
     return "v4" in model or "reasoner" in model
 
 
+# ---------------------------------------------------------------------------
+# 保活按车道证据止损（跨渠道缓存命中率修复 · Task 5）
+#
+# 保活是每 120 秒一次的全价前缀请求；在亏损车道上（如阿里云
+# deepseek-v4.1-flash keepalive 118 轮仅 24.04% 命中）纯属烧 token。
+# 规则（写死）：
+# - 双条件同时满足才停：该车道 keepalive 的 token 加权命中率 < 0.5 且轮次 >= 10；
+# - 样本不足绝不动作（R3 保险丝）：轮次 < 10 一律不停，哪怕命中率 0%；
+# - 止损 TTL 小时级（3600s）：保活亏损是稳态特征而非偶发 400，短 TTL 会导致
+#   反复复活（900s 那套是给「上游明确拒绝」用的，语义不同）；
+# - 顶层开关 cache_keepalive_evidence_gate（默认开）；关掉时判定行为与改动前
+#   逐字等价——本门只可能停「已判定亏损」的车道，健康车道零变化。
+# ---------------------------------------------------------------------------
+
+_KEEPALIVE_EVIDENCE_GATE_CONFIG_KEY = "cache_keepalive_evidence_gate"
+_KEEPALIVE_EVIDENCE_LOSS_THRESHOLD = 0.5
+_KEEPALIVE_EVIDENCE_MIN_TURNS = 10
+_KEEPALIVE_EVIDENCE_DISABLED_TTL_SECONDS = 3600.0
+
+# (model, api_base) 归一化键 -> 止损到期时间戳（monotonic）。与 400 拉黑表
+# （_affinity_disabled_routes / _cache_control_disabled_routes）分开：触发
+# 条件（车道证据亏损 vs 上游拒绝）、TTL（小时级 vs 900s）与语义都不同。
+_keepalive_evidence_disabled_routes = {}
+_keepalive_evidence_disabled_lock = threading.RLock()
+
+
+def _keepalive_evidence_route_key(model_name, api_base):
+    """止损表键：(模型, 归一化 api_base)，与 _cache_usage_key 的键口径一致。"""
+    return (
+        str(model_name or "").strip().lower(),
+        str(api_base or "").rstrip("/").lower(),
+    )
+
+
+def _parse_keepalive_evidence_gate(data):
+    """从一份已加载的 config 提取开关；缺省/非布尔 → 默认开（True）。"""
+    raw = (
+        data.get(_KEEPALIVE_EVIDENCE_GATE_CONFIG_KEY)
+        if isinstance(data, dict)
+        else None
+    )
+    return raw if isinstance(raw, bool) else True
+
+
+def _keepalive_evidence_gate_enabled():
+    """读取顶层 cache_keepalive_evidence_gate（默认开），带配置指纹缓存。
+
+    与 _configured_keepalive_routes 共用同一份缓存条目：开关与保活白名单出自
+    同一次 load_config，天真的做法是各存一份、各读一次盘——那会让保活判定在
+    每轮多付一次配置读取。这里只在共用 entry 缺失时委托 routes 侧填充。
+    """
+    stamp = _qwen_cache_config_stamp()
+    now = time.monotonic()
+    if stamp is not None:
+        with _qwen_cache_cfg_lock:
+            cached = _keepalive_routes_cfg_cache.get("entry")
+            if cached and cached[0] > now and cached[1] == stamp and len(cached) >= 4:
+                return bool(cached[3])
+    # 未命中（或拿不到指纹）：委托 routes 读取，由它填同一份 entry。
+    _configured_keepalive_routes()
+    with _qwen_cache_cfg_lock:
+        cached = _keepalive_routes_cfg_cache.get("entry")
+        if cached and len(cached) >= 4:
+            return bool(cached[3])
+    return True
+
+
+def _disable_keepalive_lane(model_name, api_base, turns, hit_rate, ttl_seconds=None):
+    """止损某车道的保活（小时级 TTL），并记录判定依据。
+
+    日志只记键名与数字（model / api_base / turns / hit_rate / at /
+    ttl_seconds），绝不记录任何 prompt 或消息正文。
+    """
+    ttl = (
+        _KEEPALIVE_EVIDENCE_DISABLED_TTL_SECONDS
+        if ttl_seconds is None else float(ttl_seconds)
+    )
+    key = _keepalive_evidence_route_key(model_name, api_base)
+    with _keepalive_evidence_disabled_lock:
+        _keepalive_evidence_disabled_routes[key] = time.monotonic() + ttl
+    logger.warning(
+        "保活按车道证据止损 model=%s api_base=%s turns=%d hit_rate=%.4f "
+        "at=%s ttl_seconds=%.0f",
+        model_name,
+        api_base,
+        int(turns),
+        float(hit_rate),
+        time.strftime("%Y-%m-%dT%H:%M:%S"),
+        ttl,
+    )
+    return key
+
+
+def _keepalive_evidence_route_disabled(model_name, api_base):
+    """该车道是否仍在止损期内（过期条目顺手清理）。"""
+    key = _keepalive_evidence_route_key(model_name, api_base)
+    now = time.monotonic()
+    with _keepalive_evidence_disabled_lock:
+        expire_at = _keepalive_evidence_disabled_routes.get(key)
+        if expire_at is None:
+            return False
+        if expire_at <= now:
+            _keepalive_evidence_disabled_routes.pop(key, None)
+            return False
+        return True
+
+
+def _keepalive_lane_disabled_by_evidence(model_name, api_base):
+    """车道证据门：低命中且样本足够 → 停该车道保活；否则不动作。
+
+    顺序即语义：开关关闭 → 不动作（与改动前逐字等价）；止损期内 → 直接停；
+    样本不足 → 不动作（R3 保险丝）；命中率 >= 阈值 → 不动作（健康车道零变化）。
+    """
+    if not _keepalive_evidence_gate_enabled():
+        return False
+    if _keepalive_evidence_route_disabled(model_name, api_base):
+        return True
+    from core.llm_diagnostics import lane_keepalive_evidence
+
+    turns, _prompt_tokens, _cached_tokens, hit_rate = lane_keepalive_evidence(
+        model_name, api_base
+    )
+    if turns < _KEEPALIVE_EVIDENCE_MIN_TURNS:
+        return False  # 样本不足：绝不动作（R3 保险丝）
+    if hit_rate is None or hit_rate >= _KEEPALIVE_EVIDENCE_LOSS_THRESHOLD:
+        return False  # 命中率未低于阈值：健康车道行为零变化
+    _disable_keepalive_lane(model_name, api_base, turns, hit_rate)
+    return True
+
+
 def _supports_cache_keepalive(model_name, api_base="", model_cfg=None):
     """保活适用于四族模型（DeepSeek/Kimi/智谱/Qwen）的任意渠道路由。
 
     家族判定之外，config.json 顶层 cache_keepalive_routes 显式声明的网关路由
     （按域名归一化匹配）继续为「非四族模型」提供显式保活通道。
+
+    在此之上叠加「车道证据门」（Task 5）：该车道 keepalive 实测命中率 < 0.5
+    且样本轮次 >= 10 → 停该车道保活（小时级自愈）；样本不足绝不动作。
+    顶层开关 cache_keepalive_evidence_gate=false 时本门整体关闭，行为与
+    改动前逐字等价。
     """
-    return (
+    supported = (
         _is_kimi_family(model_name, api_base)
         or _is_deepseek_family(model_name, api_base)
         or _is_glm_family(model_name, api_base)
         or _is_qwen_family(model_name, api_base)
         or _keepalive_route_explicitly_enabled(api_base)
     )
+    if not supported:
+        return False
+    return not _keepalive_lane_disabled_by_evidence(model_name, api_base)
 
 
 def _supports_reasoning_fields(model_name, api_base=""):
