@@ -28,6 +28,26 @@ _REASONING_FIELD_PROVIDERS = ("anthropic", "deepseek", "moonshot")
 _KIMI_NAME_RE = re.compile(r"(?:^|[-_/])k(?:2|3)(?:[._-]\d+)?(?:$|[-_])")
 
 
+def _family_names(model_name):
+    """按模型名判定归属的已知家族名集合（纯字符串，刻意不接收 api_base）。
+
+    刻意不调用 _is_kimi_family / _is_deepseek_family / _is_glm_family /
+    _is_qwen_family 本体：四个家族函数内部要调用本函数做「其他族名称探测」，
+    互相调用会形成 qwen → kimi → qwen 的无限递归。
+    """
+    model = str(model_name or "").split("/")[-1].lower()
+    names = set()
+    if "kimi" in model or "moonshot" in model or _KIMI_NAME_RE.search(model):
+        names.add("kimi")
+    if "deepseek" in model:
+        names.add("deepseek")
+    if "glm" in model:
+        names.add("glm")
+    if "qwen" in model or "dashscope" in model:
+        names.add("qwen")
+    return frozenset(names)
+
+
 def _is_kimi_family(model_name, api_base=""):
     """判断是否 Kimi/Moonshot 系模型（模型名优先，api_base 兜底）。
 
@@ -147,7 +167,12 @@ def _is_official_dashscope_route(api_base=""):
 
 
 def _is_qwen_family(model_name, api_base=""):
-    """判断是否 Qwen/通义千问系模型（模型名优先，api_base 兜底）。
+    """判断是否 Qwen/通义千问系模型（名称优先，api_base 兜底）。
+
+    名称优先：模型名命中本族（qwen/dashscope 子串）直接 True——`openai/qwen3.8-flash`
+    这类本族名行为零变化。名称已属其他已知族（kimi/deepseek/glm）时域名兜底不生效，
+    避免把多模型聚合域（如 .maas.aliyuncs.com 同时托管 deepseek/qwen/glm/kimi）
+    上的外族模型误判进 Qwen 家族。仅当名称无任何家族归属时才看域名兜底。
 
     api_base 只认官方百炼/灵积端点（_is_official_dashscope_route 严格校验
     https + 域名），不做 "dashscope" 子串宽匹配——否则 base_url 恰含该
@@ -157,6 +182,8 @@ def _is_qwen_family(model_name, api_base=""):
     model = str(model_name or "").split("/")[-1].lower()
     if "qwen" in model or "dashscope" in model:
         return True
+    if _family_names(model_name):
+        return False  # 名称已属其他已知族 → 域名兜底不生效
     return _is_official_dashscope_route(api_base)
 
 

@@ -93,6 +93,41 @@ def test_deepseek_non_thinking_provider_kwargs_are_byte_golden(monkeypatch):
     assert_exact_provider_kwargs(captured, expected)
 
 
+def test_deepseek_on_maas_aggregate_domain_provider_kwargs_are_byte_golden(monkeypatch):
+    """deepseek 名 × maas 聚合域：聚合域不得改写请求字节（Task 1a 的回归防线）。
+
+    该 (model, api_base) 组合此前落在 Qwen 域名兜底里，会被追加
+    x-dashscope-session-cache 头并把 content 改写成 cache_control 块；
+    名称优先后应与官方 api.deepseek.com 的 deepseek 金样只差 api_base。
+    """
+    import core.llm as llm
+
+    captured = _capture(
+        monkeypatch, model="openai/deepseek-v4.1-flash",
+        api_base="https://workspace-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        protocol="openai", model_cfg={"enable_thinking": False},
+        messages=[{"role": "system", "content": "stable"}, {"role": "user", "content": "inspect"}],
+    )
+    expected = {
+        "model": "openai/deepseek-v4.1-flash",
+        "api_key": "<redacted>",
+        "messages": [
+            {"role": "system", "content": "stable"},
+            {"role": "user", "content": "inspect"},
+        ],
+        "tools": [ALPHA_TOOL, ZETA_TOOL],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+        "num_retries": 2,
+        "max_tokens": 384000,
+        "extra_body": {"thinking": {"type": "disabled"}},
+        "tool_choice": "auto",
+        "api_base": "https://workspace-123.cn-beijing.maas.aliyuncs.com/compatible-mode/v1",
+        "timeout": llm.API_REQUEST_TIMEOUT_SECONDS,
+    }
+    assert_exact_provider_kwargs(captured, expected)
+
+
 def test_deepseek_thinking_tool_round_provider_kwargs_are_byte_golden(monkeypatch):
     import core.llm as llm
 
