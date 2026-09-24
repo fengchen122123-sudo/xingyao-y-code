@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import threading
+import time
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +359,43 @@ def _mark_cache_usage_unavailable(
             session_token_usage["cache_invalidation_reason"] = state["usage_error"]
 
 
+def record_keepalive_lane_usage(
+    session_id,
+    model_name,
+    api_base,
+    prompt_tokens,
+    cached_tokens,
+):
+    """把一轮保活 usage 计入 keepalive 车道桶：token 走既有记账，轮次单独 +1。
+
+    跨渠道缓存命中率修复 · Task 5 的证据数据源补记：保活亏损是稳态特征，
+    判定需要「该车道 keepalive 的轮次 + token 加权命中率」，而现有
+    _record_cache_usage 的 hot_turns 语义是「无失效原因的轮次」——保活请求
+    在 _account_server_usage 侧的 invalidation_reason 是「保活请求」（非空），
+    hot_turns 对 keepalive 桶恒为 0，不能当样本数用，因此轮次用独立的
+    ``turns`` 计数（桶结构是 dict，零迁移成本；旧桶无该键 → 0 → 样本不足 →
+    不动作，方向保守）。
+
+    本函数只做「保活 scope 补记」这一件事，不改 _record_cache_usage /
+    _normalize_server_usage / _cache_usage_key 的任何语义；main 记账路径
+    （_account_server_usage 的 main_scope 门）完全不动。
+    """
+    _record_cache_usage(
+        session_id,
+        "keepalive",
+        prompt_tokens,
+        cached_tokens,
+        "",
+        model_name,
+        api_base,
+    )
+    state_key = _cache_usage_key(session_id, model_name, api_base, "keepalive")
+    with token_usage_lock:
+        state = _cache_usage_states.get(state_key)
+        if state is not None:
+            state["turns"] = int(state.get("turns", 0) or 0) + 1
+
+
 def _cache_usage_view(state):
     """把某车道的 usage 状态转成 latest/hot/session_all 三口径视图。
 
@@ -462,6 +500,63 @@ def get_token_usage_snapshot(
         "cache": cache,
         "cache_scopes": cache_scopes,
     }
+
+
+# 保活车道证据的短 TTL 缓存：_supports_cache_keepalive 在热路径上每轮被多次
+# 调用，跨会话聚合是 O(桶数) 扫描，不能每轮都做。30~60 秒窗口对「分钟级保活 +
+# 小时级止损」完全够用。测试可清空/置零 expire_at 强制重读（与
+# _keepalive_routes_cfg_cache 同款手法）。
+_KEEPALIVE_LANE_EVIDENCE_TTL_SECONDS = 45.0
+_keepalive_lane_evidence_cache = {"expire_at": 0.0, "lanes": {}}
+_keepalive_lane_evidence_lock = threading.RLock()
+
+
+def _scan_keepalive_lane_evidence():
+    """扫描一次 _cache_usage_states：按 (model, api_base) 聚合 keepalive 桶。
+
+    只读聚合，不写任何状态：轮次取桶的 turns 计数，token 取累计口径。
+    未报告缓存明细的轮次从不写桶，天然不进分母（未报告 ≠ 0，铁律 3）。
+    键口径与 _cache_usage_key 一致（小写 + 去尾斜杠）。
+    """
+    lanes = {}
+    with token_usage_lock:
+        for key, state in _cache_usage_states.items():
+            if str(key[3]) != "keepalive":
+                continue
+            lane = (key[1], key[2])
+            turns, prompt_tokens, cached_tokens = lanes.get(lane, (0, 0, 0))
+            lanes[lane] = (
+                turns + int(state.get("turns", 0) or 0),
+                prompt_tokens + int(state.get("cumulative_prompt", 0) or 0),
+                cached_tokens + int(state.get("cumulative_cached", 0) or 0),
+            )
+    return lanes
+
+
+def lane_keepalive_evidence(model_name, api_base):
+    """返回该车道 keepalive 的 (turns, prompt_tokens, cached_tokens, hit_rate)。
+
+    跨会话聚合同一 (model, api_base) 下所有 cache_scope='keepalive' 桶：
+    hit_rate = sum(cached)/sum(prompt)（token 加权）；无样本（prompt=0）时为
+    None——调用方必须先看 turns，无样本绝不当作 0 命中处理。
+    """
+    lane = (
+        str(model_name or "").lower(),
+        str(api_base or "").rstrip("/").lower(),
+    )
+    now = time.monotonic()
+    with _keepalive_lane_evidence_lock:
+        if _keepalive_lane_evidence_cache["expire_at"] > now:
+            lanes = _keepalive_lane_evidence_cache["lanes"]
+        else:
+            lanes = _scan_keepalive_lane_evidence()
+            _keepalive_lane_evidence_cache["lanes"] = lanes
+            _keepalive_lane_evidence_cache["expire_at"] = (
+                now + _KEEPALIVE_LANE_EVIDENCE_TTL_SECONDS
+            )
+    turns, prompt_tokens, cached_tokens = lanes.get(lane, (0, 0, 0))
+    hit_rate = (cached_tokens / prompt_tokens) if prompt_tokens else None
+    return (turns, prompt_tokens, cached_tokens, hit_rate)
 
 
 def rename_cache_usage_session(old_name, new_name):

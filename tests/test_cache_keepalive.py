@@ -705,3 +705,470 @@ def test_failing_session_does_not_stop_other_sessions(monkeypatch):
         assert service.status()["error"] == ""
     finally:
         _drop_sessions(service, "sess-bad", "sess-good")
+
+
+# ---------------------------------------------------------------------------
+# 跨渠道缓存命中率修复 · Task 5：保活按车道证据止损
+#
+# 规则（写死）：
+# - 双条件同时满足才停：该车道 cache_scope='keepalive' 的独立 token 加权命中率
+#   < 0.5 且轮次 >= 10；
+# - 样本不足绝不动作（R3 保险丝）：轮次 < 10 时一律不停，哪怕命中率 0%；
+# - 健康车道行为零变化；开关 cache_keepalive_evidence_gate=false 时行为与
+#   改动前逐字等价；
+# - 止损 TTL 小时级（>= 3600s，不用 900s 的 400 拒绝档）；
+# - 止损日志只记车道标识与数字（turns / hit_rate / 判定时间），绝不记正文。
+# ---------------------------------------------------------------------------
+
+_TASK5_MODEL = "openai/deepseek-v4.1-flash"
+
+
+def _expire_keepalive_evidence_cache():
+    """强制下次聚合重读（短 TTL 缓存是生产优化，测试需可控失效）。"""
+    import core.llm_diagnostics as diagnostics
+
+    with diagnostics._keepalive_lane_evidence_lock:
+        diagnostics._keepalive_lane_evidence_cache["expire_at"] = 0.0
+        diagnostics._keepalive_lane_evidence_cache["lanes"] = {}
+
+
+def _reset_keepalive_evidence_state():
+    """清空 Task 5 新增的全部进程内状态：止损表、开关缓存、聚合缓存。"""
+    import core.llm_dialects as dialects
+
+    with dialects._keepalive_evidence_disabled_lock:
+        dialects._keepalive_evidence_disabled_routes.clear()
+    with dialects._qwen_cache_cfg_lock:
+        # 开关与保活白名单共用同一份配置解析条目，清它即同时失效两者。
+        dialects._keepalive_routes_cfg_cache["entry"] = None
+    _expire_keepalive_evidence_cache()
+
+
+@pytest.fixture(autouse=True)
+def _isolate_keepalive_evidence():
+    """Task 5 状态隔离：测试前后清空止损表/开关缓存/聚合缓存，并回收测试桶。"""
+    import core.llm_diagnostics as diagnostics
+
+    with diagnostics.token_usage_lock:
+        before = set(diagnostics._cache_usage_states)
+    _reset_keepalive_evidence_state()
+    yield
+    _reset_keepalive_evidence_state()
+    with diagnostics.token_usage_lock:
+        leaked = [
+            key for key in diagnostics._cache_usage_states if key not in before
+        ]
+        for key in leaked:
+            del diagnostics._cache_usage_states[key]
+
+
+def _stub_config(monkeypatch, data):
+    """替换 load_config 并清掉开关指纹缓存，保证读到替身配置。"""
+    import core.llm_dialects as dialects
+
+    monkeypatch.setattr("core.model_manager.load_config", lambda: data)
+    with dialects._qwen_cache_cfg_lock:
+        # 开关与保活白名单共用同一份配置解析条目，清它即同时失效两者。
+        dialects._keepalive_routes_cfg_cache["entry"] = None
+
+
+def _seed_keepalive_lane(session, model, api_base, *, turns, prompt_total, cached_total):
+    """按桶形状注入 keepalive 车道证据（轮次 + 累计 prompt/cached），并失效聚合缓存。"""
+    import core.llm_diagnostics as diagnostics
+
+    key = diagnostics._cache_usage_key(session, model, api_base, "keepalive")
+    with diagnostics.token_usage_lock:
+        diagnostics._cache_usage_states[key] = {
+            "cumulative_prompt": prompt_total,
+            "cumulative_cached": cached_total,
+            "hot_prompt": prompt_total,
+            "hot_cached": cached_total,
+            "hot_turns": turns,
+            "latest_prompt": prompt_total,
+            "latest_cached": cached_total,
+            "usage_valid": True,
+            "usage_error": "",
+            "invalidation_reason": "",
+            "turns": turns,
+        }
+    _expire_keepalive_evidence_cache()
+
+
+def test_keepalive_lane_evidence_aggregates_across_sessions():
+    """跨会话聚合：同 (model, api_base) 的 keepalive 桶合计轮次与 token（他车道隔离）。
+
+    阿里云形状的两个会话切片：60 轮 + 58 轮 = 118 轮，
+    prompt 9,792,934 / cached 2,353,920（24.04%）。
+    """
+    from core.llm_diagnostics import lane_keepalive_evidence
+
+    base = "https://task5-aggregate.example/v1"
+    other_base = "https://task5-aggregate-other.example/v1"
+    _seed_keepalive_lane(
+        "task5-aggregate-a", _TASK5_MODEL, base,
+        turns=60, prompt_total=4_979_460, cached_total=1_196_936,
+    )
+    _seed_keepalive_lane(
+        "task5-aggregate-b", _TASK5_MODEL, base,
+        turns=58, prompt_total=4_813_474, cached_total=1_156_984,
+    )
+    _seed_keepalive_lane(
+        "task5-aggregate-other", _TASK5_MODEL, other_base,
+        turns=5, prompt_total=5_000, cached_total=5_000,
+    )
+
+    turns, prompt_tokens, cached_tokens, hit_rate = lane_keepalive_evidence(
+        _TASK5_MODEL, base
+    )
+
+    assert turns == 118
+    assert prompt_tokens == 9_792_934
+    assert cached_tokens == 2_353_920
+    assert hit_rate == pytest.approx(2_353_920 / 9_792_934)
+    assert 0.2403 < hit_rate < 0.2405
+    # 另一车道（同模型、不同 api_base）不得混入
+    assert lane_keepalive_evidence(_TASK5_MODEL, other_base)[:3] == (5, 5_000, 5_000)
+
+
+def test_aliyun_keepalive_lane_118_turns_2404_stops(monkeypatch):
+    """阿里云形状应停：118 轮、24.04% → 该车道保活停（False）。"""
+    from core.llm import _supports_cache_keepalive
+
+    base = "https://task5-aliyun.example/v1"
+    _stub_config(monkeypatch, {})
+    _seed_keepalive_lane(
+        "task5-aliyun", _TASK5_MODEL, base,
+        turns=118, prompt_total=9_792_934, cached_total=2_353_920,
+    )
+
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is False
+
+
+def test_tokenrhythm_keepalive_lane_61_turns_9015_stays(monkeypatch):
+    """基元律动形状应留：61 轮、90.15% → 保活保留（True）。"""
+    from core.llm import _supports_cache_keepalive
+
+    base = "https://task5-tokenrhythm.example/v1"
+    _stub_config(monkeypatch, {})
+    _seed_keepalive_lane(
+        "task5-tokenrhythm", _TASK5_MODEL, base,
+        turns=61, prompt_total=3_368_268, cached_total=3_036_416,
+    )
+
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is True
+
+
+def test_kimi_keepalive_lane_746_turns_9207_stays(monkeypatch):
+    """api.kimi.com 形状应留：746 轮、92.07% → 保活保留（True）。"""
+    from core.llm import _supports_cache_keepalive
+
+    base = "https://api.kimi.com/coding/v1"
+    _stub_config(monkeypatch, {})
+    _seed_keepalive_lane(
+        "task5-kimi", "openai/k3", base,
+        turns=746, prompt_total=135_118_794, cached_total=124_404_334,
+    )
+
+    assert _supports_cache_keepalive("openai/k3", base) is True
+
+
+def test_keepalive_sample_fuse_9_turns_zero_hit_never_stops(monkeypatch):
+    """保险丝（R3）：9 轮、0% 命中 → 样本不足，绝不停（True）。"""
+    from core.llm import _supports_cache_keepalive
+
+    base = "https://task5-fuse.example/v1"
+    _stub_config(monkeypatch, {})
+    _seed_keepalive_lane(
+        "task5-fuse", _TASK5_MODEL, base,
+        turns=9, prompt_total=9_000, cached_total=0,
+    )
+
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is True
+
+
+def test_keepalive_boundary_exactly_10_turns_below_half_stops(monkeypatch):
+    """双条件边界：恰好 10 轮、49.9% → 停（False）。"""
+    from core.llm import _supports_cache_keepalive
+    from core.llm_diagnostics import lane_keepalive_evidence
+
+    base = "https://task5-boundary.example/v1"
+    _stub_config(monkeypatch, {})
+    _seed_keepalive_lane(
+        "task5-boundary", _TASK5_MODEL, base,
+        turns=10, prompt_total=10_000, cached_total=4_990,
+    )
+
+    assert lane_keepalive_evidence(_TASK5_MODEL, base)[3] == pytest.approx(0.499)
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is False
+
+
+def test_keepalive_mature_lane_at_half_hit_rate_stays(monkeypatch):
+    """双条件：>=10 轮但命中率 >= 0.5 → 不停（True）。"""
+    from core.llm import _supports_cache_keepalive
+
+    base = "https://task5-half.example/v1"
+    _stub_config(monkeypatch, {})
+    _seed_keepalive_lane(
+        "task5-half", _TASK5_MODEL, base,
+        turns=10, prompt_total=10_000, cached_total=5_000,
+    )
+
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is True
+
+
+def _legacy_supports_cache_keepalive(model_name, api_base):
+    """改动前的判据（四族 ∨ 显式白名单）——用于逐字等价对照。"""
+    from core.llm_dialects import (
+        _is_deepseek_family,
+        _is_glm_family,
+        _is_kimi_family,
+        _is_qwen_family,
+        _keepalive_route_explicitly_enabled,
+    )
+
+    return (
+        _is_kimi_family(model_name, api_base)
+        or _is_deepseek_family(model_name, api_base)
+        or _is_glm_family(model_name, api_base)
+        or _is_qwen_family(model_name, api_base)
+        or _keepalive_route_explicitly_enabled(api_base)
+    )
+
+
+@pytest.mark.parametrize(
+    "model,api_base",
+    [
+        ("openai/deepseek-v4.1-flash", "https://api.deepseek.com"),
+        ("openai/deepseek-v4.1-flash", "https://tokenrhythm.studio/v1"),
+        (
+            "openai/deepseek-v4.1-flash",
+            "https://task5-matrix.maas.aliyuncs.com/compatible-mode/v1",
+        ),
+        ("openai/kimi-k2.6", "https://api.moonshot.cn/v1"),
+        ("openai/k3", "https://api.kimi.com/coding/v1"),
+        ("openai/glm-5.3", "https://open.bigmodel.cn/api/paas/v4"),
+        (
+            "openai/qwen3.8-flash",
+            "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        ),
+        ("openai/qwen3.8-flash", "https://task5-relay.example/v1"),
+        ("openai/some-model", "https://task5-relay.example/v1"),
+    ],
+)
+def test_evidence_gate_healthy_lanes_match_legacy_verdict(model, api_base, monkeypatch):
+    """健康车道零变化：门开着且无亏损证据时，返回值与改动前判据逐字等价。"""
+    from core.llm import _supports_cache_keepalive
+
+    _stub_config(monkeypatch, {})
+
+    assert _supports_cache_keepalive(model, api_base) is _legacy_supports_cache_keepalive(
+        model, api_base
+    )
+
+
+def test_evidence_gate_disabled_ignores_loss_lane(monkeypatch):
+    """开关 false：同样的亏损车道 → 门被关掉（True，行为与改动前等价）。"""
+    from core.llm import _supports_cache_keepalive
+
+    base = "https://task5-gate-off.example/v1"
+    _stub_config(monkeypatch, {"cache_keepalive_evidence_gate": False})
+    _seed_keepalive_lane(
+        "task5-gate-off", _TASK5_MODEL, base,
+        turns=118, prompt_total=9_792_934, cached_total=2_353_920,
+    )
+
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is True
+
+
+def test_evidence_gate_defaults_enabled_when_config_key_absent(monkeypatch):
+    """开关缺省 → 默认开（只可能停"已判定亏损"的车道）。"""
+    import core.llm_dialects as dialects
+
+    _stub_config(monkeypatch, {})
+
+    assert dialects._keepalive_evidence_gate_enabled() is True
+
+
+def test_keepalive_stop_ttl_is_hour_scale_and_reescalates(monkeypatch):
+    """止损 TTL 小时级（>=3600，明确不用 900），到期后重判并重新计满。"""
+    import time as _time
+    import core.llm_dialects as dialects
+    from core.llm import _supports_cache_keepalive
+
+    assert dialects._KEEPALIVE_EVIDENCE_DISABLED_TTL_SECONDS >= 3600
+
+    base = "https://task5-ttl.example/v1"
+    _stub_config(monkeypatch, {})
+    _seed_keepalive_lane(
+        "task5-ttl", _TASK5_MODEL, base,
+        turns=12, prompt_total=12_000, cached_total=1_200,
+    )
+
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is False
+    key = dialects._keepalive_evidence_route_key(_TASK5_MODEL, base)
+    with dialects._keepalive_evidence_disabled_lock:
+        remaining = dialects._keepalive_evidence_disabled_routes[key] - _time.monotonic()
+    assert 3599 <= remaining <= 3601
+
+    # 把条目拨到过期：重判（证据仍亏损）→ 再次止损，TTL 重新计满
+    with dialects._keepalive_evidence_disabled_lock:
+        dialects._keepalive_evidence_disabled_routes[key] = _time.monotonic() - 1
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is False
+    with dialects._keepalive_evidence_disabled_lock:
+        refreshed = dialects._keepalive_evidence_disabled_routes[key] - _time.monotonic()
+    assert 3599 <= refreshed <= 3601
+
+
+def test_keepalive_stop_log_records_lane_digits_only(monkeypatch, caplog):
+    """止损依据可观测：日志含车道标识、样本轮次、命中率与判定时间，且不含正文。"""
+    import logging
+    from core.llm import _supports_cache_keepalive
+
+    base = "https://task5-log.example/v1"
+    _stub_config(monkeypatch, {})
+    _seed_keepalive_lane(
+        "task5-log", _TASK5_MODEL, base,
+        turns=12, prompt_total=12_000, cached_total=1_200,
+    )
+
+    with caplog.at_level(logging.WARNING, logger="core.llm_dialects"):
+        assert _supports_cache_keepalive(_TASK5_MODEL, base) is False
+
+    stops = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "core.llm_dialects"
+        and "保活" in record.getMessage()
+        and base in record.getMessage()
+    ]
+    assert len(stops) == 1, "止损只记一条"
+    log_line = stops[0]
+    assert _TASK5_MODEL in log_line
+    assert "turns=12" in log_line
+    assert "hit_rate=0.1000" in log_line
+    assert "at=" in log_line
+    assert "ttl_seconds=3600" in log_line
+    # 只记数字与键名：绝不记录任何消息正文/提示词内容
+    assert "messages" not in log_line
+    assert "content" not in log_line
+    assert "prompt" not in log_line
+
+
+def test_keepalive_evidence_isolates_main_scope_low_hit(monkeypatch):
+    """cache_scope 隔离：同车道 main scope 命中率再低也不得影响 keepalive 判定。"""
+    import core.llm as llm
+    import core.llm_diagnostics as diagnostics
+
+    base = "https://task5-scope.example/v1"
+    _stub_config(monkeypatch, {})
+    for _ in range(30):
+        llm._record_cache_usage("task5-scope", "main", 1_000, 100, "", _TASK5_MODEL, base)
+
+    lane_buckets = [
+        key
+        for key in diagnostics._cache_usage_states
+        if key[1] == _TASK5_MODEL and key[2] == base and key[3] == "keepalive"
+    ]
+    assert lane_buckets == []
+    assert llm._supports_cache_keepalive(_TASK5_MODEL, base) is True
+
+
+def test_record_keepalive_lane_usage_accumulates_turns_and_tokens():
+    """保活记账通道：每轮 +1 轮次并累计 token；12 轮 70% → 判定可复算。"""
+    from core.llm_diagnostics import (
+        lane_keepalive_evidence,
+        record_keepalive_lane_usage,
+    )
+
+    base = "https://task5-record.example/v1"
+    for index in range(12):
+        record_keepalive_lane_usage(
+            "task5-record", _TASK5_MODEL, base, 1_000, 100 if index < 3 else 900
+        )
+
+    turns, prompt_tokens, cached_tokens, hit_rate = lane_keepalive_evidence(
+        _TASK5_MODEL, base
+    )
+    assert turns == 12
+    assert prompt_tokens == 12_000
+    assert cached_tokens == 3 * 100 + 9 * 900
+    assert hit_rate == pytest.approx(8_400 / 12_000)
+
+
+def test_account_keepalive_response_feeds_lane_evidence(monkeypatch):
+    """保活响应记账成功后 → 车道证据累计；10 轮 10% 触发止损（False）。"""
+    from types import SimpleNamespace
+    from core.cache_keepalive import account_keepalive_response
+    from core.llm import _supports_cache_keepalive
+    from core.llm_diagnostics import lane_keepalive_evidence
+
+    base = "https://task5-link.example/v1"
+    _stub_config(monkeypatch, {})
+    monkeypatch.setattr(
+        "core.llm._account_server_usage",
+        lambda usage, **kwargs: {
+            "valid": True,
+            "cache_reported": True,
+            "prompt_tokens": 1_000,
+            "cached_tokens": 100,
+        },
+    )
+
+    for _ in range(10):
+        account_keepalive_response(
+            SimpleNamespace(usage=SimpleNamespace()),
+            {"model_name": _TASK5_MODEL, "api_base": base, "session_id": "task5-link"},
+        )
+
+    assert lane_keepalive_evidence(_TASK5_MODEL, base) == (
+        10, 10_000, 1_000, pytest.approx(0.1),
+    )
+    assert _supports_cache_keepalive(_TASK5_MODEL, base) is False
+
+
+def test_account_keepalive_response_without_cache_report_skips_evidence(monkeypatch):
+    """未报告缓存明细的保活轮次不进车道证据（未报告 ≠ 0，R3 保险丝不受影响）。"""
+    from types import SimpleNamespace
+    from core.cache_keepalive import account_keepalive_response
+    from core.llm_diagnostics import lane_keepalive_evidence
+
+    base = "https://task5-unreported.example/v1"
+    _stub_config(monkeypatch, {})
+    monkeypatch.setattr(
+        "core.llm._account_server_usage",
+        lambda usage, **kwargs: {"valid": True},
+    )
+
+    account_keepalive_response(
+        SimpleNamespace(usage=SimpleNamespace()),
+        {"model_name": _TASK5_MODEL, "api_base": base, "session_id": "task5-unreported"},
+    )
+
+    assert lane_keepalive_evidence(_TASK5_MODEL, base) == (0, 0, 0, None)
+
+
+def test_keepalive_evidence_cache_ttl_is_short_window(monkeypatch):
+    """聚合短 TTL 缓存（30~60s）：窗口内返回旧快照，过期后重扫。"""
+    from core.llm_diagnostics import (
+        _KEEPALIVE_LANE_EVIDENCE_TTL_SECONDS,
+        lane_keepalive_evidence,
+        record_keepalive_lane_usage,
+    )
+
+    assert 30 <= _KEEPALIVE_LANE_EVIDENCE_TTL_SECONDS <= 60
+
+    base = "https://task5-cache.example/v1"
+    _stub_config(monkeypatch, {})
+    record_keepalive_lane_usage("task5-cache", _TASK5_MODEL, base, 1_000, 1_000)
+    first = lane_keepalive_evidence(_TASK5_MODEL, base)
+    assert first == (1, 1_000, 1_000, pytest.approx(1.0))
+
+    # TTL 窗口内再写一轮：缓存未过期，聚合仍返回旧快照
+    record_keepalive_lane_usage("task5-cache", _TASK5_MODEL, base, 1_000, 0)
+    assert lane_keepalive_evidence(_TASK5_MODEL, base) == first
+
+    # 过期后重扫：两轮合计 2000/1000 = 50%
+    _expire_keepalive_evidence_cache()
+    assert lane_keepalive_evidence(_TASK5_MODEL, base) == (
+        2, 2_000, 1_000, pytest.approx(0.5),
+    )

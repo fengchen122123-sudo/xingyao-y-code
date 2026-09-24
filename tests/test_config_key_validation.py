@@ -312,3 +312,32 @@ def test_toml_overlay_unknown_key_is_reported(cfg_env, captured_warnings):
 
     assert config.audit_config_keys() == ["unknown_toml_key"]
     assert any("unknown_toml_key" in warning for warning in captured_warnings)
+
+
+# ---------------------------------------------------------------------------
+# Task5：保活证据门开关登记
+# ---------------------------------------------------------------------------
+
+def test_cache_keepalive_evidence_gate_key_is_known():
+    """Task5：cache_keepalive_evidence_gate 登记为已知键，不出现在未知键列表。
+
+    该键被 core/llm_dialects.py 的保活证据门读取；不登记则 strict_config
+    用户会因未知键告警被阻断启动。
+    """
+    data = {"cache_keepalive_evidence_gate": True}
+
+    assert config.find_unknown_config_keys(data) == []
+
+
+def test_strict_config_true_with_keepalive_evidence_gate_passes(
+    cfg_env, captured_warnings
+):
+    """Task5：strict_config=true 且含该键时 audit_config_keys() 返回 []、零告警。"""
+    cfg_path, _ = cfg_env
+    cfg_path.write_text(
+        json.dumps({"strict_config": True, "cache_keepalive_evidence_gate": False}),
+        encoding="utf-8",
+    )
+
+    assert config.audit_config_keys() == []
+    assert captured_warnings == []
