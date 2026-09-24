@@ -223,9 +223,16 @@ _KEEPALIVE_ROUTES_CONFIG_KEY = "cache_keepalive_routes"
 
 # 顶层键解析结果缓存，指纹口径与 _resolve_model_config 一致（见 _qwen_cache_config_stamp）：
 # stamp = (loader 身份, 配置文件 mtime)；条目格式
-# (过期时间, stamp, routes, evidence_gate_enabled)——最后一项是
-# cache_keepalive_evidence_gate（Task 5 保活证据门开关），与 routes 共用同一次读盘。
+# (过期时间, stamp, routes, evidence_gate_enabled, affinity_lanes)——后两项分别是
+# cache_keepalive_evidence_gate（Task 5 保活证据门开关）与 cache_affinity_lanes
+# （Task 6 prompt_cache_key 白名单），三个顶层键共用同一次读盘。
 _keepalive_routes_cfg_cache = {"entry": None}
+
+# 顶层 cache_affinity_lanes：显式声明允许发送 prompt_cache_key 的非 kimi 车道
+# （域名/子串列表）。默认关闭：缺省/非列表 → 空元组 → 任何非 kimi 模型都不发
+# 亲和键；kimi 家族（_is_kimi_family）的既有行为不受此配置影响。与
+# cache_keepalive_routes 同构：只新增显式通道，不改任何既有家族判定。
+_AFFINITY_LANES_CONFIG_KEY = "cache_affinity_lanes"
 
 # 顶层 deepseek_cache_routes：显式声明可安全启用 DeepSeek Prompt Ledger 与
 # tools 字母序的第三方网关（域名/子串列表）。官方路由之外默认不启用——
@@ -381,12 +388,18 @@ def _parse_deepseek_cache_routes(data):
     return _parse_route_match_entries(data, _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY)
 
 
+def _parse_affinity_lanes(data):
+    """从一份已加载的 config 中提取 cache_affinity_lanes 并逐条归一化。"""
+    return _parse_route_match_entries(data, _AFFINITY_LANES_CONFIG_KEY)
+
+
 def _remember_keepalive_routes(data, stamp):
     """把顶层 cache_keepalive_routes 的解析结果按配置指纹写入缓存（重复读盘去重）。
 
     同一份 entry 顺带记住 cache_keepalive_evidence_gate（Task 5 保活证据门
-    开关）：两者都出自同一次 load_config，各存一份会让同一个键多付一次读盘。
-    条目格式：(过期时间, stamp, routes, evidence_gate_enabled)。
+    开关）与 cache_affinity_lanes（Task 6 prompt_cache_key 白名单）：三者都
+    出自同一次 load_config，各存一份会让同一个键多付一次读盘。
+    条目格式：(过期时间, stamp, routes, evidence_gate_enabled, affinity_lanes)。
     """
     if stamp is None:
         return
@@ -395,6 +408,7 @@ def _remember_keepalive_routes(data, stamp):
         _keepalive_routes_cfg_cache["entry"] = (
             time.monotonic() + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
             _parse_keepalive_evidence_gate(data),
+            _parse_affinity_lanes(data),
         )
 
 
@@ -409,18 +423,21 @@ def _configured_keepalive_routes():
                 return cached[2]
     routes = ()
     gate_enabled = True
+    affinity_lanes = ()
     try:
         from core.model_manager import load_config
 
         data = load_config()
         routes = _parse_keepalive_routes(data)
         gate_enabled = _parse_keepalive_evidence_gate(data)
+        affinity_lanes = _parse_affinity_lanes(data)
     except Exception:
         pass
     if stamp is not None:
         with _qwen_cache_cfg_lock:
             _keepalive_routes_cfg_cache["entry"] = (
                 now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes, gate_enabled,
+                affinity_lanes,
             )
     return routes
 
@@ -466,6 +483,43 @@ def _configured_deepseek_cache_routes():
                 now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
             )
     return routes
+
+
+def _configured_affinity_lanes():
+    """读取顶层 cache_affinity_lanes（域名/子串白名单），带配置指纹缓存。
+
+    与 _configured_keepalive_routes / _keepalive_evidence_gate_enabled 共用
+    同一份缓存条目的第 5 位：三者都出自同一次 load_config，分开存会让每个键
+    各付一次读盘。缺省/非列表 → 空元组（默认关闭）。
+    """
+    stamp = _qwen_cache_config_stamp()
+    now = time.monotonic()
+    if stamp is not None:
+        with _qwen_cache_cfg_lock:
+            cached = _keepalive_routes_cfg_cache.get("entry")
+            if cached and cached[0] > now and cached[1] == stamp and len(cached) >= 5:
+                return cached[4]
+    # 未命中（或条目是旧格式）：委托 routes 读取，由它填同一份 entry。
+    _configured_keepalive_routes()
+    with _qwen_cache_cfg_lock:
+        cached = _keepalive_routes_cfg_cache.get("entry")
+        if cached and len(cached) >= 5:
+            return cached[4]
+    return ()
+
+
+def _affinity_lane_enabled(model_name, api_base):
+    """该路由是否被顶层 cache_affinity_lanes 显式放行（默认关闭）。
+
+    与 _keepalive_route_explicitly_enabled 同构：api_base 归一化后包含显式
+    配置中任一条目（域名/子串匹配）即放行；缺省/非列表配置下恒为 False，
+    未白名单车道的请求字节零变化。model_name 参与签名只为与家族判定调用点
+    对称，判定本身与模型无关（kimi 家族通道不受本函数影响）。
+    """
+    host = _normalize_route_match_key(api_base)
+    if not host:
+        return False
+    return any(entry in host for entry in _configured_affinity_lanes())
 
 
 def _is_cache_optimized_deepseek_route(api_base=""):
@@ -1474,15 +1528,17 @@ def _attach_kimi_request_extras(
     """给 Kimi 系模型的请求参数附加缓存亲和配置（原地修改 result）。
 
     - 缓存亲和：OpenAI 兼容路由传 prompt_cache_key，Anthropic 路由传 metadata.user_id；
-      判定只看模型家族，任意渠道都发送（被上游 400 拒绝的路由由
-      _disable_affinity_route 临时拉黑兜底）。
+      判定看模型家族或顶层 cache_affinity_lanes 白名单（默认关闭，Task 6）：
+      kimi 家族任意渠道都发送；非 kimi 模型仅白名单命中的车道发送。
+      被上游 400 拒绝的路由由 _disable_affinity_route 临时拉黑兜底。
     """
     anthropic_route = str(model_name or "").split("/")[0].lower() == "anthropic"
 
     session_id = None
-    if _is_kimi_family(model_name, api_base) and not _affinity_route_disabled(
-        model_name, api_base
-    ):
+    if (
+        _is_kimi_family(model_name, api_base)
+        or _affinity_lane_enabled(model_name, api_base)
+    ) and not _affinity_route_disabled(model_name, api_base):
         session_id = _cache_affinity_session_id(
             cache_scope=cache_scope,
             model_name=model_name,
@@ -1701,7 +1757,9 @@ def _provider_cache_affinity_options(
 ):
     """仅返回 provider 缓存亲和参数，不改变输出长度或推理配置。"""
     result = {}
-    if _is_kimi_family(model_name, api_base):
+    kimi_family = _is_kimi_family(model_name, api_base)
+    lane_enabled = _affinity_lane_enabled(model_name, api_base)
+    if kimi_family or lane_enabled:
         _attach_kimi_request_extras(
             result,
             model_name,
@@ -1711,7 +1769,9 @@ def _provider_cache_affinity_options(
             cache_session_id=cache_session_id,
             tool_contract=tool_contract,
         )
-    elif _is_qwen_family(model_name, api_base):
+    # 白名单只新增 prompt_cache_key 通道：qwen 分支保持既有「kimi 名优先、
+    # 命中即不再走 qwen 分支」语义，与改动前的 if/elif 逐字等价。
+    if _is_qwen_family(model_name, api_base) and not kimi_family:
         _attach_qwen_request_extras(
             result,
             model_name,
@@ -1929,7 +1989,9 @@ def _provider_request_options(
         # 发了会直接 400。Kimi 推理模型（k2.5/k2.6/k2.7/k3 等）在该路由上会原生
         # 输出 reasoning_content，无需显式开启；输出上限由内置默认表统一给出。
 
-    if kimi_family:
+    # Task 6：顶层 cache_affinity_lanes 白名单为非 kimi 模型新增 prompt_cache_key
+    # 通道（默认关闭）；kimi 家族的判定与既有分支行为不变。
+    if kimi_family or _affinity_lane_enabled(model_name, api_base):
         _attach_kimi_request_extras(
             result,
             model_name,

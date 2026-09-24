@@ -497,3 +497,235 @@ def test_affinity_rejection_downgrades_retry_without_key(mocker):
         "openai/kimi-k2.6", "https://relay.example/v1", cache_session_id="affinity-downgrade"
     )
     assert "prompt_cache_key" not in follow_up.get("extra_body", {})
+
+
+# ---------------------------------------------------------------------------
+# Task 6：prompt_cache_key 白名单化——默认关闭，仅白名单车道发送
+#
+# 铁律：绝不发 prompt_cache_breakpoint（§1.8：OpenAI 认它是有效字段，
+# Kimi 收到直接 400）。白名单留空时，非 kimi 模型的请求字节零变化。
+# ---------------------------------------------------------------------------
+
+_AFFINITY_LANE_BASE = "https://relay.example/v1"
+_AFFINITY_LANE_OTHER_BASE = "https://relay-other.example/v1"
+
+
+def _set_affinity_lanes(monkeypatch, entries):
+    """配置替身 + 强制重读共用配置条目（同 cache_keepalive_routes 测试手法）。"""
+    import core.llm_dialects as dialects
+
+    monkeypatch.setattr(
+        "core.model_manager.load_config",
+        lambda: {"cache_affinity_lanes": entries},
+    )
+    with dialects._qwen_cache_cfg_lock:
+        dialects._keepalive_routes_cfg_cache["entry"] = None
+
+
+def test_affinity_key_default_off_for_non_kimi_models():
+    """默认关闭：无 cache_affinity_lanes 配置时，非 kimi 模型一律不带亲和键。"""
+    from core.llm import _provider_request_options
+
+    for model, api_base in (
+        ("openai/deepseek-v4.1-flash", "https://relay.example/v1"),
+        ("openai/qwen3.8-flash", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    ):
+        opts = _provider_request_options(
+            model, api_base, cache_session_id="lane-default-off"
+        )
+        assert "prompt_cache_key" not in opts.get("extra_body", {}), (model, api_base)
+
+
+@pytest.mark.parametrize("api_base", ["https://api.moonshot.cn/v1", *_OTHER_CHANNELS])
+def test_kimi_affinity_unchanged_with_empty_lanes(monkeypatch, api_base):
+    """白名单为空/缺省：kimi 家族在任意渠道仍带亲和键，行为零变化。"""
+    from core.llm import _provider_request_options
+
+    _set_affinity_lanes(monkeypatch, [])
+    opts = _provider_request_options(
+        "openai/kimi-k2.6", api_base, cache_session_id="family-matrix"
+    )
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
+
+
+def test_affinity_lane_whitelist_enables_only_listed_domain(monkeypatch):
+    """白名单开启后才生效：命中域名发亲和键，其他域名与家族仍不带。"""
+    from core.llm import _provider_cache_affinity_options, _provider_request_options
+
+    _set_affinity_lanes(monkeypatch, ["relay.example"])
+
+    enabled = _provider_request_options(
+        "openai/deepseek-v4.1-flash", _AFFINITY_LANE_BASE, cache_session_id="lane-on"
+    )
+    assert enabled["extra_body"]["prompt_cache_key"].startswith("ycode-")
+
+    blocked = _provider_request_options(
+        "openai/deepseek-v4.1-flash",
+        _AFFINITY_LANE_OTHER_BASE,
+        cache_session_id="lane-off",
+    )
+    assert "prompt_cache_key" not in blocked.get("extra_body", {})
+
+    blocked_dashscope = _provider_request_options(
+        "openai/qwen3.8-flash",
+        "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        cache_session_id="lane-off",
+    )
+    assert "prompt_cache_key" not in blocked_dashscope.get("extra_body", {})
+
+    # 副模型/压缩通道（_provider_cache_affinity_options）同样只放行白名单车道
+    affinity = _provider_cache_affinity_options(
+        "openai/deepseek-v4.1-flash",
+        _AFFINITY_LANE_BASE,
+        cache_scope="secondary:compression",
+        tool_contract="no-tools",
+    )
+    assert affinity["extra_body"]["prompt_cache_key"].startswith("ycode-")
+    other_affinity = _provider_cache_affinity_options(
+        "openai/deepseek-v4.1-flash",
+        _AFFINITY_LANE_OTHER_BASE,
+        cache_scope="secondary:compression",
+        tool_contract="no-tools",
+    )
+    assert other_affinity == {}
+
+
+def test_empty_affinity_lanes_byte_equivalent_to_missing_key(monkeypatch):
+    """白名单为空列表：未白名单行为与无配置时逐字等价（序列化级比对）。"""
+    import json
+
+    from core.llm import _provider_request_options
+
+    model, api_base = "openai/deepseek-v4.1-flash", _AFFINITY_LANE_BASE
+    without = _provider_request_options(model, api_base, cache_session_id="lane-empty")
+    _set_affinity_lanes(monkeypatch, [])
+    with_empty = _provider_request_options(
+        model, api_base, cache_session_id="lane-empty"
+    )
+    assert json.dumps(with_empty, sort_keys=True) == json.dumps(
+        without, sort_keys=True
+    )
+
+
+def test_affinity_lane_entry_normalization_accepts_bare_domain_and_url(monkeypatch):
+    """归一化：白名单写裸域名与写完整 URL 都匹配同一 api_base。"""
+    from core.llm import _provider_request_options
+
+    for entry in ("relay.example", "https://relay.example/v1"):
+        _set_affinity_lanes(monkeypatch, [entry])
+        opts = _provider_request_options(
+            "openai/deepseek-v4.1-flash",
+            _AFFINITY_LANE_BASE,
+            cache_session_id="lane-normalize",
+        )
+        assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-"), entry
+
+
+def test_affinity_lane_rejection_downgrades_retry_without_key(monkeypatch, mocker):
+    """白名单车道被上游 400 拒绝：本轮重试剥离亲和键，该路由进拉黑表。"""
+    from core.llm import (
+        _affinity_route_disabled,
+        _provider_request_options,
+        chat_with_model_events,
+    )
+
+    _set_affinity_lanes(monkeypatch, ["relay.example"])
+    model, base = "openai/deepseek-v4.1-flash", _AFFINITY_LANE_BASE
+
+    captured = []
+
+    def fake_completion(**kwargs):
+        captured.append(deepcopy(kwargs))
+        if len(captured) == 1:
+            raise _FakeBadRequest("Error code: 400 - unknown field 'prompt_cache_key'")
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+
+    list(chat_with_model_events(
+        model,
+        "fake-key",
+        [{"role": "user", "content": "提问"}],
+        base,
+        persist=False,
+        turn_id="turn-affinity-lane-downgrade",
+        consume_background_notifications=False,
+        cache_session_id="affinity-lane-downgrade",
+    ))
+
+    assert len(captured) >= 2
+    assert captured[0]["extra_body"]["prompt_cache_key"].startswith("ycode-")
+    assert "prompt_cache_key" not in captured[1].get("extra_body", {})
+    assert _affinity_route_disabled(model, base) is True
+    follow_up = _provider_request_options(
+        model, base, cache_session_id="affinity-lane-downgrade"
+    )
+    assert "prompt_cache_key" not in follow_up.get("extra_body", {})
+
+
+def test_guard_no_prompt_cache_breakpoint_in_provider_kwargs(monkeypatch, mocker):
+    """铁律守卫：最终 provider kwargs（含 extra_body/extra_headers/metadata）
+    的序列化结果里不得出现 prompt_cache_breakpoint。"""
+    import json
+
+    from core.llm import _provider_request_options, chat_with_model_events
+
+    _set_affinity_lanes(monkeypatch, ["relay.example"])
+
+    for model, api_base in (
+        ("openai/kimi-k2.6", "https://api.moonshot.cn/v1"),
+        ("anthropic/kimi-k2.6", "https://api.moonshot.cn/v1"),
+        ("openai/deepseek-v4.1-flash", _AFFINITY_LANE_BASE),
+        ("openai/qwen3.8-flash", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
+    ):
+        opts = _provider_request_options(
+            model, api_base, cache_session_id="breakpoint-guard"
+        )
+        assert "prompt_cache_breakpoint" not in json.dumps(
+            opts, ensure_ascii=False, default=str
+        ), (model, api_base)
+
+    captured = []
+
+    def fake_completion(**kwargs):
+        captured.append(deepcopy(kwargs))
+        return iter([_chunk("完成")])
+
+    mocker.patch("core.llm.completion", side_effect=fake_completion)
+    list(chat_with_model_events(
+        "openai/kimi-k2.6",
+        "fake-key",
+        [{"role": "user", "content": "守卫"}],
+        "https://api.moonshot.cn/v1",
+        persist=False,
+        turn_id="turn-breakpoint-guard",
+        consume_background_notifications=False,
+        cache_session_id="breakpoint-guard",
+    ))
+    assert captured
+    assert "prompt_cache_breakpoint" not in json.dumps(
+        captured[0], ensure_ascii=False, default=str
+    )
+
+
+def test_mixed_kimi_qwen_name_on_affinity_lane_keeps_kimi_branch_only(monkeypatch):
+    """白名单不得把 qwen 分支拽进亲和选项：kimi+qwen 混合名仍只走 kimi 分支。
+
+    混合名同时命中两族；原语义是 if/elif（kimi 命中即不再走 qwen），
+    白名单只应新增 prompt_cache_key 通道，不得顺带塞入 qwen 的会话缓存头。
+    注意：qwen 会话缓存头在主链路 `_provider_request_options` 里走的是另一条
+    独立路径，不受本函数分支影响——所以这条守卫断言只针对本函数的返回值。
+    """
+    from core.llm import _provider_cache_affinity_options
+
+    _set_affinity_lanes(monkeypatch, ["relay.example"])
+
+    opts = _provider_cache_affinity_options(
+        "openai/kimi-k2.6-qwen",
+        _AFFINITY_LANE_BASE,
+        cache_scope="main",
+        cache_session_id="mixed-name-guard",
+    )
+
+    assert opts["extra_body"]["prompt_cache_key"].startswith("ycode-")
+    assert "extra_headers" not in opts
