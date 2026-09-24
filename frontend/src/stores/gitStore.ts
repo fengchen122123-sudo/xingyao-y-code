@@ -21,6 +21,19 @@ interface GitConfirmState {
   typedInput: string;
 }
 
+// 工作区路径归一化比较：后端 git_state_changed 事件里的 workspace 经
+// normalize_repo_path 处理（Windows 下 normcase → 小写 + 反斜杠），而前端
+// workdir 来自后端下发的真实路径（保留磁盘大小写）。直接字符串比较会把
+// 同一工作区误判成"其他 Worktree"而丢弃通知，外部 Git 操作（终端提交/切换
+// 分支等）就永远刷不到界面（§10 外部变化重读失效）。
+function normalizeWorkspaceKey(path: string): string {
+  return path.replace(/\//g, '\\').replace(/\\+$/, '').toLowerCase();
+}
+
+function isSameWorkspace(a: string, b: string): boolean {
+  return normalizeWorkspaceKey(a) === normalizeWorkspaceKey(b);
+}
+
 function callApi<T>(name: string, ...args: unknown[]): Promise<T> {
   const api = window.pywebview && window.pywebview.api;
   if (!api) {
@@ -278,7 +291,7 @@ export const useGitStore = defineStore('git', {
 
     onExternalChange(data: { workspace?: string }) {
       const ws = data && data.workspace;
-      if (!ws || ws === this.workdir) {
+      if (!ws || isSameWorkspace(ws, this.workdir)) {
         void this.refresh();
       }
     },
