@@ -475,3 +475,83 @@ def test_extra_headers_win_over_hardcoded_tokenrhythm_header():
         extra_headers={"X-TokenRhythm-Agent": "CustomAgent/1.0"},
     )
     assert headers["X-TokenRhythm-Agent"] == "CustomAgent/1.0"
+
+
+# ---------------------------------------------------------------------------
+# 渠道请求形态覆盖零影响（V2）：未配置 route_request_overrides 时请求头逐字节不变
+# ---------------------------------------------------------------------------
+
+def _mark_route_overrides_unconfigured(monkeypatch):
+    """把渠道请求形态覆盖置为「未配置」状态。
+
+    monkeypatch + _cache 置 None 的手法同 tests/test_route_overrides.py 的 _fake_config：
+    配置指纹只反映 loader 身份 + 配置文件 mtime，替换 loader 后必须手动失效缓存，
+    否则 10 秒 TTL 内可能读到上一组配置。
+    """
+    import core.route_overrides as overrides
+
+    monkeypatch.setattr(overrides, "_load_config_for_overrides", lambda: {})
+    overrides._cache["entry"] = None
+
+
+def test_openai_route_headers_are_byte_golden_without_route_overrides(monkeypatch):
+    """未配置 route_request_overrides 时，OpenAI 兼容路由 headers 与改动前逐键全等。
+
+    渠道覆盖只经 _provider_request_options 的 extra_headers/extra_body 注入，
+    传输层零改动；本用例断言两条基线请求头快照（基元律动 / 普通网关）逐字节一致，
+    任何键的增删或取值变化都会挂。
+    """
+    _mark_route_overrides_unconfigured(monkeypatch)
+
+    url, tokenrhythm_headers, _clean = nt._resolve_endpoint_and_headers(
+        model="openai/deepseek-flash",
+        api_key="k",
+        api_base="https://tokenrhythm.studio/v1",
+        policy=get_model_policy("openai/deepseek-flash",
+                                api_base="https://tokenrhythm.studio/v1"),
+        extra_headers=None,
+    )
+    assert url == "https://tokenrhythm.studio/v1/chat/completions"
+    assert tokenrhythm_headers == {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "Authorization": "Bearer k",
+        "User-Agent": "XingYaoCode/1.3.2",
+        "X-TokenRhythm-Agent": "XingYaoCode/1.3.2",
+    }
+
+    url, plain_headers, _clean = nt._resolve_endpoint_and_headers(
+        model="openai/deepseek-flash",
+        api_key="k",
+        api_base="https://api.deepseek.com/v1",
+        policy=get_model_policy("openai/deepseek-flash",
+                                api_base="https://api.deepseek.com/v1"),
+        extra_headers=None,
+    )
+    assert url == "https://api.deepseek.com/v1/chat/completions"
+    assert plain_headers == {
+        "Content-Type": "application/json",
+        "Accept": "text/event-stream",
+        "Authorization": "Bearer k",
+        "User-Agent": "XingYaoCode/1.3.2",
+    }
+
+
+def test_anthropic_route_headers_are_byte_golden_without_route_overrides(monkeypatch):
+    """未配置 route_request_overrides 时，Anthropic Messages 路由 headers 逐键全等。"""
+    _mark_route_overrides_unconfigured(monkeypatch)
+
+    url, headers = nt._anthropic_resolve_endpoint(
+        api_base="https://tokenrhythm.studio",
+        api_key="k",
+        extra_headers=None,
+    )
+    assert url == "https://tokenrhythm.studio/v1/messages"
+    assert headers == {
+        "content-type": "application/json",
+        "accept": "text/event-stream",
+        "anthropic-version": "2023-06-01",
+        "User-Agent": "XingYaoCode/1.3.2",
+        "x-api-key": "k",
+        "X-TokenRhythm-Agent": "XingYaoCode/1.3.2",
+    }
