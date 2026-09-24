@@ -53,12 +53,16 @@ def _is_kimi_family(model_name, api_base=""):
 
     经销商/聚合网关（api.scnet.cn、OpenRouter 等）的 base_url 不含
     moonshot 字样，必须靠模型名识别，否则所有 Kimi 深度适配全部失效。
+    名称已属其他已知族（deepseek/glm/qwen）时域名兜底不生效；仅当名称
+    无任何家族归属时才看 api_base 兜底（与 _is_qwen_family 同一道门）。
     """
     m = str(model_name or "").split("/")[-1].lower()
     if "kimi" in m or "moonshot" in m:
         return True
     if _KIMI_NAME_RE.search(m):
         return True
+    if _family_names(model_name):
+        return False  # 名称已属其他已知族 → 域名兜底不生效
     b = str(api_base or "").lower()
     return "moonshot" in b or "kimi" in b
 
@@ -90,8 +94,17 @@ def _is_official_kimi_route(api_base=""):
 
 
 def _is_deepseek_family(model_name, api_base=""):
+    """判断是否 DeepSeek 系模型（模型名优先，api_base 兜底）。
+
+    名称已属其他已知族（kimi/glm/qwen）时域名兜底不生效；仅当名称无任何
+    家族归属时才看 api_base 兜底（与 _is_qwen_family 同一道门）。
+    """
     model = str(model_name or "").split("/")[-1].lower()
-    return "deepseek" in model or _is_official_deepseek_route(api_base)
+    if "deepseek" in model:
+        return True
+    if _family_names(model_name):
+        return False  # 名称已属其他已知族 → 域名兜底不生效
+    return _is_official_deepseek_route(api_base)
 
 
 def _is_official_deepseek_route(api_base=""):
@@ -135,9 +148,17 @@ def _is_official_zhipu_route(api_base=""):
 
 
 def _is_glm_family(model_name, api_base=""):
-    """判断是否智谱 GLM 系模型（模型名优先，api_base 兜底）。"""
+    """判断是否智谱 GLM 系模型（模型名优先，api_base 兜底）。
+
+    名称已属其他已知族（kimi/deepseek/qwen）时域名兜底不生效；仅当名称
+    无任何家族归属时才看 api_base 兜底（与 _is_qwen_family 同一道门）。
+    """
     model = str(model_name or "").split("/")[-1].lower()
-    return "glm" in model or _is_official_zhipu_route(api_base)
+    if "glm" in model:
+        return True
+    if _family_names(model_name):
+        return False  # 名称已属其他已知族 → 域名兜底不生效
+    return _is_official_zhipu_route(api_base)
 
 
 def _is_official_dashscope_route(api_base=""):

@@ -167,6 +167,140 @@ def test_qwen_family_still_enabled_for_qwen_names_on_aggregate_domain():
 
 
 # ---------------------------------------------------------------------------
+# Task 1b：kimi / deepseek / glm 对称收紧——名称优先于域名兜底
+#
+# 与 Task 1a 的 qwen 同一道门：名称命中本族 → True；名称已属其他已知族 →
+# 域名兜底不生效；名称无任何归属 → 官方域兜底照旧。
+# ---------------------------------------------------------------------------
+
+_FAMILY_ORDER = ("kimi", "deepseek", "glm", "qwen")
+
+# 四族 × {各自官方域, maas 聚合域, tokenrhythm, relay} 的完整笛卡尔积基底：
+# _FAMILIES 的四个官方域 + _OTHER_CHANNELS（含 maas 聚合域、tokenrhythm、relay）。
+_MATRIX_BASES = [official_base for _model, official_base in _FAMILIES] + list(
+    _OTHER_CHANNELS
+)
+
+# 名称已属已知族的代表模型及其（唯一的）归属族。
+_OWNED_MODELS = [
+    ("openai/deepseek-v4.1-flash", "deepseek"),
+    ("openai/kimi-k2.6", "kimi"),
+    ("openai/glm-5.3", "glm"),
+    ("openai/qwen3.8-flash", "qwen"),
+]
+
+
+def _family_bools(model, api_base):
+    """四族判定的完整布尔四元组，顺序同 _FAMILY_ORDER。"""
+    from core.llm import (
+        _is_deepseek_family,
+        _is_glm_family,
+        _is_kimi_family,
+        _is_qwen_family,
+    )
+
+    return (
+        _is_kimi_family(model, api_base),
+        _is_deepseek_family(model, api_base),
+        _is_glm_family(model, api_base),
+        _is_qwen_family(model, api_base),
+    )
+
+
+def test_foreign_family_names_not_pulled_in_by_official_domains():
+    """外族模型 × 他族官方域：只剩本族单 True，不再被域名兜底拽进他族。"""
+    from core.llm import (
+        _is_deepseek_family,
+        _is_glm_family,
+        _is_kimi_family,
+        is_deepseek_ledger_route,
+    )
+
+    # kimi 名挂 deepseek 官方域：deepseek 家族不得抢认，kimi 名称命中照旧
+    assert _is_deepseek_family("openai/kimi-k2.6", "https://api.deepseek.com") is False
+    assert _is_kimi_family("openai/kimi-k2.6", "https://api.deepseek.com") is True
+    # glm 名挂 deepseek 官方域
+    assert _is_deepseek_family("openai/glm-5.3", "https://api.deepseek.com") is False
+    # deepseek 名挂智谱官方域
+    assert (
+        _is_glm_family(
+            "openai/deepseek-v4.1-flash", "https://open.bigmodel.cn/api/paas/v4"
+        )
+        is False
+    )
+    # deepseek 名挂 moonshot 官方域（kimi 兜底是裸子串，比另外三族松）
+    assert (
+        _is_kimi_family("openai/deepseek-v4.1-flash", "https://api.moonshot.cn/v1")
+        is False
+    )
+    # kimi 名挂智谱官方域
+    assert (
+        _is_glm_family("openai/kimi-k2.6", "https://open.bigmodel.cn/api/paas/v4")
+        is False
+    )
+    # qwen 名挂 deepseek 官方域：不得启用 DeepSeek 账本（Task 1b 真实收益点）
+    assert (
+        is_deepseek_ledger_route("openai/qwen3.8-flash", "https://api.deepseek.com")
+        is False
+    )
+
+
+def test_unowned_names_still_fall_back_to_official_domains():
+    """名称无任何归属时，四族官方域兜底照旧（对偶语义，门不得误伤）。"""
+    from core.llm import (
+        _is_deepseek_family,
+        _is_glm_family,
+        _is_kimi_family,
+        _is_qwen_family,
+    )
+
+    assert _is_deepseek_family("custom-model", "https://api.deepseek.com") is True
+    assert _is_kimi_family("custom-model", "https://api.moonshot.cn/v1") is True
+    assert _is_glm_family("custom-model", "https://open.bigmodel.cn/api/paas/v4") is True
+    assert (
+        _is_qwen_family(
+            "custom-model", "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        )
+        is True
+    )
+
+
+@pytest.mark.parametrize("model,owner", _OWNED_MODELS)
+@pytest.mark.parametrize("api_base", _MATRIX_BASES)
+def test_family_matrix_known_names_single_owner(model, owner, api_base):
+    """四族名 × 七个渠道基底：完整四元组只有名称归属族为 True（含 maas 聚合域）。"""
+    expected = tuple(family == owner for family in _FAMILY_ORDER)
+    assert _family_bools(model, api_base) == expected, (model, api_base)
+
+
+@pytest.mark.parametrize(
+    "api_base,owner",
+    [
+        ("https://api.deepseek.com", "deepseek"),
+        ("https://api.moonshot.cn/v1", "kimi"),
+        ("https://open.bigmodel.cn/api/paas/v4", "glm"),
+        ("https://dashscope.aliyuncs.com/compatible-mode/v1", "qwen"),
+        (_MAAS_AGGREGATE_BASE, "qwen"),
+        ("https://tokenrhythm.studio/v1", None),
+        ("https://relay.example/v1", None),
+    ],
+)
+def test_family_matrix_unowned_name_domain_fallback(api_base, owner):
+    """名称无归属 × 七个渠道基底：域名兜底仅本族官方/聚合域生效，其余全 False。"""
+    expected = tuple(family == owner for family in _FAMILY_ORDER)
+    assert _family_bools("custom-model", api_base) == expected, api_base
+
+
+def test_mixed_family_names_keep_multi_membership():
+    """混合名维持现状：deepseek-qwen 双名仍双 True，不引入单值家族概念。"""
+    from core.llm import _is_deepseek_family, _is_qwen_family
+
+    model = "openai/deepseek-r1-qwen-distill"
+    assert _is_deepseek_family(model, "https://relay.example/v1") is True
+    assert _is_qwen_family(model, "https://relay.example/v1") is True
+
+
+# ---------------------------------------------------------------------------
 # deepseek：账本判定，任意渠道自动放行；非本族不误放
 # ---------------------------------------------------------------------------
 
