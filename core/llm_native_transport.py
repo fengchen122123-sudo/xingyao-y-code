@@ -1094,6 +1094,9 @@ def _anthropic_usage_to_openai(usage_raw: Dict[str, Any]) -> Dict[str, Any]:
         "prompt_tokens_details": {"cached_tokens": cache_read} if cache_read else None,
         "prompt_cache_hit_tokens": cache_read or None,
         "prompt_cache_miss_tokens": input_tokens or None,
+        # Task 7（跨渠道缓存命中率修复）：写入量单独暴露给记账层，供读写分列；
+        # 未报告 → None。上面 prompt_tokens 的汇总口径保持不变。
+        "cache_creation_input_tokens": cache_creation or None,
     }
 
 
