@@ -170,7 +170,7 @@ describe('ContextUsagePanel', () => {
     wrapper.unmount();
   });
 
-  it('缓存与保活命中率各占一行，车道身份不再上界面', async () => {
+  it('仅缓存命中率单列展示，车道身份与保活命中率都不再上界面', async () => {
     setUsage({
       cache_available: true,
       cache_session_pct: 90.81,
@@ -180,18 +180,16 @@ describe('ContextUsagePanel', () => {
     });
     const wrapper = mountPanel();
 
-    // 车道身份行（模型 @ 接口）已下线：数据字段仍在，界面不再渲染
-    expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
     expect(wrapper.get('[data-test="ctx-usage-cache"]').text()).toContain('缓存命中率');
-
-    // 保活单列：与主口径同行的另一个数字，1 位小数
-    const keepalive = wrapper.get('[data-test="ctx-usage-cache-keepalive"]');
-    expect(keepalive.text()).toContain('保活命中率');
-    expect(keepalive.text()).toContain('31.0%');
+    expect(wrapper.get('[data-test="ctx-usage-cache"]').text()).toContain('90.8%');
+    // 车道身份行（模型 @ 接口）与保活命中率行均已下线：数据字段仍在，界面不再渲染
+    expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="ctx-usage-cache-keepalive"]').exists()).toBe(false);
+    expect(wrapper.text()).not.toContain('保活');
     wrapper.unmount();
   });
 
-  it('保活未报告（null）时整列隐藏，绝不显示 0%', async () => {
+  it('保活字段无论缺省还是已报告都不渲染（整列永久下线）', async () => {
     setUsage({
       cache_available: true,
       cache_session_pct: 90.81,
@@ -204,9 +202,10 @@ describe('ContextUsagePanel', () => {
     // 车道行已下线：无论后端有没有车道字段，界面都不渲染它
     expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
 
-    setUsage({ cache_lane_model: '', cache_lane_api_base: '' });
+    setUsage({ cache_lane_model: '', cache_lane_api_base: '', cache_keepalive_session_pct: 31 });
     await wrapper.vm.$nextTick();
     expect(wrapper.find('[data-test="ctx-usage-cache-lane"]').exists()).toBe(false);
+    expect(wrapper.find('[data-test="ctx-usage-cache-keepalive"]').exists()).toBe(false);
     wrapper.unmount();
   });
 });
