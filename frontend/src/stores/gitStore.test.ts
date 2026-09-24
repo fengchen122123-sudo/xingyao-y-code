@@ -111,6 +111,11 @@ describe('gitStore', () => {
     store.onExternalChange({ workspace: 'E:/other' });
     await new Promise((r) => setTimeout(r, 0));
     expect(get_status).toHaveBeenCalledTimes(2);
+    // 后端事件里的 workspace 经 normcase 归一（Windows：小写 + 反斜杠），
+    // 前端 workdir 保留磁盘真实大小写；两者必须视为同一工作区，否则外部变化永不刷新
+    store.onExternalChange({ workspace: 'e:\\proj' });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(get_status).toHaveBeenCalledTimes(3);
   });
 
   it('stage 调用后以后端新快照刷新界面（仓库为唯一事实源）', async () => {
