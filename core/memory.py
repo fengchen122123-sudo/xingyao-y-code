@@ -10,6 +10,7 @@ import time
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
+from core.cache_health import classify_lanes_health
 from core.harness.models import JournalEventDraft
 
 
@@ -1336,6 +1337,30 @@ class MemoryManager:
             item["usage_errors"] = json.loads(item["usage_errors"] or "[]")
             result.append(item)
         return result
+
+    def query_lane_cache_health(self, start_ts=None, end_ts=None, lane=None, window=200):
+        """按时间窗口汇总各 lane 的健康度；lane=(model, api_base, cache_scope) 可选过滤。
+
+        复用 query_cache_request_diagnostics（idx_cache_diag_ts 走时间过滤），按 lane
+        分组、组内按 id 升序，再交给 core.cache_health.classify_lanes_health 派生。
+        查询层不把 NULL 转成 0——「未报告 ≠ 真实 0」由派生层继续区分。
+        """
+        rows = self.query_cache_request_diagnostics(start_ts, end_ts)
+        grouped = {}
+        for row in rows:
+            key = (row["model"], row["api_base"], row["cache_scope"])
+            grouped.setdefault(key, []).append(row)
+        if lane is not None:
+            model, api_base, cache_scope = lane
+            wanted = (
+                str(model or "").lower(),
+                str(api_base or "").rstrip("/").lower(),
+                str(cache_scope or "main"),
+            )
+            grouped = {key: value for key, value in grouped.items() if key == wanted}
+        for grouped_rows in grouped.values():
+            grouped_rows.sort(key=lambda row: row["id"])
+        return classify_lanes_health(grouped, window=window)
 
     def query_cache_diagnostic_summary(
         self,
