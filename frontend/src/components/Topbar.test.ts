@@ -208,3 +208,16 @@ describe('Topbar frameless window controls', () => {
     expect(wrapper.find('[data-test="win-min"]').exists()).toBe(true);
   });
 });
+
+describe('Topbar terminal toggle', () => {
+  it('toggles the bottom terminal panel through the store', async () => {
+    const store = useAppStore();
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+
+    await wrapper.get('[data-test="btn-terminal"]').trigger('click');
+    expect(store.terminalPanelOpen).toBe(true);
+
+    await wrapper.get('[data-test="btn-terminal"]').trigger('click');
+    expect(store.terminalPanelOpen).toBe(false);
+  });
+});

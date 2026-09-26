@@ -21,6 +21,8 @@ from core.harness.tool_pipeline import (
     REPEAT_CALL_BLOCKED_TEXT,
     ToolExecutionContext,
     ToolPipeline,
+    _escape_control_chars_in_json_strings,
+    _repair_truncated_json,
 )
 from core.llm_dialects import (
     _provider_cache_affinity_options,
@@ -552,108 +554,8 @@ def _step_progress_observation(records, tool_calls_by_id=None, session_id=None):
     )
 
 
-def _raise_if_tool_cancelled(cancel_event):
-    # 取消判断只认每 turn 传入的 cancel_event，不再读全局粘性布尔
-    if cancel_event is not None and cancel_event.is_set():
-        raise KeyboardInterrupt("用户终止了工具执行。")
-
-
-def _escape_control_chars_in_json_strings(text):
-    """只转义字符串值内部的裸控制字符（\\n/\\r/\\t），结构空白与合法转义保持不动。"""
-    escapes = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
-    out = []
-    in_string = False
-    escaped = False
-    for ch in text:
-        if in_string:
-            if escaped:
-                out.append(ch)
-                escaped = False
-            elif ch == "\\":
-                out.append(ch)
-                escaped = True
-            elif ch == '"':
-                out.append(ch)
-                in_string = False
-            elif ch in escapes:
-                out.append(escapes[ch])
-            else:
-                out.append(ch)
-        else:
-            out.append(ch)
-            if ch == '"':
-                in_string = True
-    return "".join(out)
-
-
-def _repair_truncated_json(raw):
-    """修复被截断的 JSON 字符串：补全未闭合的字符串、括号、花括号。
-
-    当 LLM 生成的 tool call arguments 超过 API 传输限制时被截断，
-    json.loads 会报 "Unterminated string" 错误。本函数只处理末尾截断：
-    1. 补全未闭合的字符串（在末尾加引号）
-    2. 移除对象/数组末尾多余的逗号
-    3. 按栈顺序闭合所有未闭合的 [ { 括号
-    4. 如果末尾是冒号（缺值），补空字符串
-
-    注意：如果截断处之后还混入了非 JSON 文本（如模型把对话历史写进参数），
-    本函数不再 aggressive 地回退截断，而是让 json.loads 继续失败，由调用方
-    返回明确的参数解析错误，避免用被篡改的参数继续执行工具。
-    """
-    if not raw or not raw.strip():
-        return raw
-
-    in_string = False
-    escaped = False
-    stack = []
-
-    for ch in raw:
-        if in_string:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                in_string = False
-        else:
-            if ch == '"':
-                in_string = True
-            elif ch in "[{":
-                stack.append(ch)
-            elif ch == "]":
-                if stack and stack[-1] == "[":
-                    stack.pop()
-            elif ch == "}":
-                if stack and stack[-1] == "{":
-                    stack.pop()
-
-    repaired = raw.rstrip()
-
-    # 如果末尾在字符串内（未闭合），先补上引号
-    if in_string:
-        # 移除末尾可能残留的反斜杠（避免转义刚补的引号）
-        if repaired.endswith("\\"):
-            repaired = repaired[:-1]
-        repaired += '"'
-
-    # 移除末尾多余的逗号（在闭合括号前）
-    repaired = repaired.rstrip()
-    while repaired.endswith(","):
-        repaired = repaired[:-1].rstrip()
-
-    # 如果末尾是冒号（缺值），补空字符串
-    if repaired.endswith(":"):
-        repaired += ' ""'
-
-    # 按栈的逆序闭合括号
-    closing_map = {"[": "]", "{": "}"}
-    while stack:
-        opener = stack.pop()
-        repaired += closing_map[opener]
-
-    return repaired
-
-
+# JSON 参数修复/控制字符转义与 harness 执行管线共用同一实现（单份定义在
+# core.harness.tool_pipeline，顶部统一导入复用，避免双份实现行为漂移）。
 def _show_file_diff(
     file_path,
     old_content,

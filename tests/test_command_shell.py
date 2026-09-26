@@ -385,53 +385,6 @@ def test_plan_verification_uses_the_selected_interpreter(tmp_path, monkeypatch):
     assert calls[0][1]["shell"] is False
 
 
-def test_embedded_terminal_uses_the_selected_interpreter(tmp_path, monkeypatch):
-    import threading
-    import subprocess
-
-    from gui_bridge import ApiBridge
-
-    _use_tmp_config(tmp_path, monkeypatch, {"command_shell": "cmd"})
-    executable = r"C:\Windows\System32\cmd.exe"
-    monkeypatch.setattr(
-        "core.command_shell.shutil.which",
-        lambda name: executable if name == "cmd.exe" else None,
-    )
-    calls = []
-
-    class FakeStdout:
-        def readline(self):
-            return b""
-
-    class FakeProcess:
-        stdout = FakeStdout()
-
-        def poll(self):
-            return 0
-
-        def wait(self, timeout=None):
-            return 0
-
-    bridge = ApiBridge.__new__(ApiBridge)
-    bridge._current_session = "session"
-    bridge._term_proc = None
-    bridge._term_lock = threading.Lock()
-    bridge._session_workdir = lambda _session: str(tmp_path)
-    bridge.emit_event = lambda _kind, _data: None
-    monkeypatch.setattr(
-        subprocess,
-        "Popen",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or FakeProcess(),
-    )
-
-    result = bridge.run_terminal_command("echo hi")
-
-    assert result["ok"] is True
-    assert calls[0][0][0] == "echo hi"
-    assert calls[0][1]["shell"] is True
-    assert calls[0][1]["executable"] == executable
-
-
 def test_system_settings_include_active_model_computer_capability(monkeypatch, tmp_path):
     """设置负载携带活动模型电脑操控资格（与 Turn 起点同一判定函数）。"""
     from tests.computer_fakes import use_temp_config

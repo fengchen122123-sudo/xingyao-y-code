@@ -310,3 +310,34 @@ it('触摸设备点按上下文圆环切换面板', async () => {
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia });
   }
 });
+
+it('renders the git branch chip and opens the git panel on click', async () => {
+  const { useGitStore } = await import('../stores/gitStore');
+  const store = useAppStore();
+  const gitStore = useGitStore();
+  gitStore.snapshot = {
+    branch_name: 'dev', head_state: 'clean', head_oid: 'abcd1234',
+    ahead: 0, behind: 0, staged: [], unstaged: [], untracked: [],
+    conflicts: [], operation_kind: 'idle',
+  } as any;
+
+  const wrapper = mount(InputArea);
+  const chip = wrapper.get('[data-test="composer-git-branch"]');
+  // 复用状态栏文案（去 ⎇ 前缀）：分支名 + 脏标记
+  expect(chip.text()).toContain('dev');
+
+  store.rightPanelCollapsed = true;
+  const nonceBefore = gitStore.panelOpenNonce;
+  await chip.trigger('click');
+  expect(gitStore.panelOpenNonce).toBe(nonceBefore + 1);
+  expect(store.rightPanelCollapsed).toBe(false);
+  wrapper.unmount();
+});
+
+it('hides the git branch chip outside a git workspace', async () => {
+  const { useGitStore } = await import('../stores/gitStore');
+  useGitStore().snapshot = null;
+  const wrapper = mount(InputArea);
+  expect(wrapper.find('[data-test="composer-git-branch"]').exists()).toBe(false);
+  wrapper.unmount();
+});

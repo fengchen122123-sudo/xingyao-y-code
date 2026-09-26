@@ -850,7 +850,6 @@ export interface PyWebViewAPI {
   get_workspace_state(workdir: string): Promise<any>;
   get_sessions(): Promise<SessionGroup[]>;
   create_session(title?: string, workdir?: string): Promise<any>;
-  create_global_session(title?: string): Promise<any>;
   switch_session(sessionName: string, targetWorkdir?: string): Promise<any>;
   load_older_messages(sessionName: string, beforeId: number): Promise<any>;
   get_session_nav_index(sessionName: string): Promise<any>;
@@ -1056,8 +1055,13 @@ export interface PyWebViewAPI {
   get_background_tasks(): Promise<BackgroundTask[]>;
   kill_task(taskId: string): Promise<any>;
 
-  run_terminal_command(command: string): Promise<any>;
-  kill_terminal_command(): Promise<any>;
+  // 旧版右侧面板单命令终端已下线；底部交互式终端见 pty_terminal_*
+  pty_terminal_ensure(cols: number, rows: number): Promise<{
+    ok: boolean; pid?: number; cwd?: string; reused?: boolean; msg?: string;
+  }>;
+  pty_terminal_write(data: string): Promise<{ ok: boolean; msg?: string }>;
+  pty_terminal_resize(cols: number, rows: number): Promise<{ ok: boolean; msg?: string }>;
+  pty_terminal_kill(): Promise<{ ok: boolean; msg?: string }>;
 
   add_provider(name: string, baseUrl: string, apiKey: string, protocol: string): Promise<any>;
   get_model_settings(): Promise<ModelSettingsSnapshot>;
@@ -1086,42 +1090,27 @@ export interface PyWebViewAPI {
   // Git 工作台（规格 §11/§13；桥接层 gui_git_mixin.GitBridgeMixin）
   // ---------------------------------------------------------------------------
   git_get_status(workdir: string): Promise<GitBridgeResult>;
-  git_refresh(workdir: string): Promise<GitBridgeResult>;
   git_stage(workdir: string, paths: string[]): Promise<GitBridgeResult>;
   git_stage_all(workdir: string): Promise<GitBridgeResult>;
   git_unstage(workdir: string, paths: string[]): Promise<GitBridgeResult>;
   git_commit(workdir: string, title: string, body?: string, amend?: boolean): Promise<GitBridgeResult>;
-  git_undo_last_commit(workdir: string, keepStaged: boolean): Promise<GitBridgeResult>;
-  git_discard_changes(workdir: string, paths: string[]): Promise<GitBridgeResult>;
   git_list_branches(workdir: string): Promise<GitBridgeResult>;
   git_switch_branch(workdir: string, target: string): Promise<GitBridgeResult>;
   git_create_branch(workdir: string, name: string, startPoint?: string, switchAfter?: boolean): Promise<GitBridgeResult>;
-  git_list_remotes(workdir: string): Promise<GitBridgeResult>;
   git_fetch(workdir: string, remote?: string, prune?: boolean): Promise<GitBridgeResult>;
   git_pull(workdir: string): Promise<GitBridgeResult>;
   git_push(workdir: string, remote?: string, refspec?: string, forceWithLease?: boolean, token?: string): Promise<GitBridgeResult>;
   git_load_history(workdir: string, skip?: number, limit?: number): Promise<GitBridgeResult>;
   git_load_diff(workdir: string, path?: string, staged?: boolean, left?: string, right?: string): Promise<GitBridgeResult>;
-  git_blame(workdir: string, path: string): Promise<GitBridgeResult>;
   git_load_reflog(workdir: string, skip?: number, limit?: number): Promise<GitBridgeResult>;
-  git_list_tags(workdir: string): Promise<GitBridgeResult>;
-  git_list_stashes(workdir: string): Promise<GitBridgeResult>;
   git_stash_create(workdir: string, message: string, includeUntracked: boolean): Promise<GitBridgeResult>;
-  git_stash_apply(workdir: string, index: number): Promise<GitBridgeResult>;
-  git_stash_drop(workdir: string, index: number): Promise<GitBridgeResult>;
   git_preview_risk(workdir: string, operation: string, params: Record<string, any>): Promise<GitBridgeResult>;
   git_confirm_operation(workdir: string, operation: string, params: Record<string, any>, token: string): Promise<GitBridgeResult>;
   git_get_trust(workdir: string): Promise<GitBridgeResult>;
   git_allow_once(workdir: string): Promise<GitBridgeResult>;
   git_trust_repository(workdir: string): Promise<GitBridgeResult>;
-  git_worktree_list(workdir: string): Promise<GitBridgeResult>;
-  git_worktree_add(workdir: string, path: string, branch: string, newBranch: boolean): Promise<GitBridgeResult>;
-  git_worktree_remove(workdir: string, path: string, force: boolean): Promise<GitBridgeResult>;
-  git_stop_monitoring(workdir: string): Promise<GitBridgeResult>;
   git_load_conflict(workdir: string, path: string): Promise<GitBridgeResult>;
   git_resolve_conflict(workdir: string, path: string, resultText?: string, side?: string): Promise<GitBridgeResult>;
-  git_read_rebase_plan(workdir: string): Promise<GitBridgeResult>;
-  git_write_rebase_plan(workdir: string, plan: { action: string; oid: string; summary: string }[]): Promise<GitBridgeResult>;
   git_recover_branch(workdir: string, oid: string, name: string): Promise<GitBridgeResult>;
   git_ai_assist(workdir: string, kind: string): Promise<GitBridgeResult>;
 }

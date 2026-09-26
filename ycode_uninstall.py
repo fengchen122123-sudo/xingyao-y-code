@@ -24,30 +24,16 @@ import time
 import ctypes
 import winreg
 
-# 复用安装向导一侧已实现并测试过的基础工具（桌面路径/环境变量广播/管理员检测）
-from ycode_setup import (
+# 复用安装/卸载向导共享的基础工具（桌面路径/环境变量广播/管理员检测/reparse 判定）。
+# 从 installer_common 导入而不是 ycode_setup：避免把安装向导的 tkinter/PIL
+# 依赖树拖进卸载器二进制（32MB → ~25MB）。
+from installer_common import (
+    _is_reparse_path,
     broadcast_environment_change,
-    get_desktop_dir,
     get_common_desktop_dir,
+    get_desktop_dir,
     is_user_an_admin,
 )
-
-try:
-    # 修复 #2：优先直接复用安装器里已单测过的挂载点（符号链接/目录联接）检测，
-    # 保证安装/卸载两侧对 reparse point 的判定完全一致。
-    from ycode_setup import _is_reparse_path
-except ImportError:  # 卸载器被单独拷出、安装器不在 sys.path 时的兜底等价实现
-    def _is_reparse_path(path):
-        """判断已存在路径是否会重定向文件系统遍历（符号链接/目录联接）。
-
-        os.path.islink 覆盖符号链接；os.path.isjunction（Python 3.12+，
-        基于 GetFileAttributesW 的 FILE_ATTRIBUTE_REPARSE_POINT 属性）
-        覆盖目录联接等挂载点。
-        """
-        if os.path.islink(path):
-            return True
-        isjunction = getattr(os.path, "isjunction", None)
-        return bool(isjunction and isjunction(path))
 
 
 def _resolve_ycode_data_dir():

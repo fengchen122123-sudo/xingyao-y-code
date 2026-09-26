@@ -5,13 +5,13 @@ Y-code 官方 Windows 安装向导（可视化 GUI 版，单一源码，靠内�
   full 模式（默认）：完整版安装包。默认安装图形界面版 (Y-code.exe)，
                      安装选项页可勾选是否附带安装命令行版 (ycode.exe / ycode 命令)、
                      是否创建桌面快捷方式。
-                     若用户当时选择不装命令行版，会把内嵌的 CLI 独立安装向导
-                     释放到安装目录的 cli\\ 子目录下，方便以后随时补装。
+                     若用户当时选择不装命令行版，以后想补装时重新运行本安装
+                     向导并勾选「命令行版」即可（载荷本身两种 exe 都带）。
 
   cli 模式：CLI 独立安装包。只安装命令行版，用于用户后续补装，或单独分发
             给只想用命令行的用户。
 
-界面：tkinter（标准库，零新增依赖）+ 内嵌虚化背景图 assets/setup_bg.png。
+界面：tkinter（标准库，零新增依赖）。
 安装引擎与界面解耦：run_install() 在后台线程执行，经队列回调刷新 UI，
 可直接被 pytest 无界面测试。
 
@@ -20,6 +20,8 @@ Y-code 官方 Windows 安装向导（可视化 GUI 版，单一源码，靠内�
 项目根目录下的 ycode_setup.spec 手动构建（不经过 build_release.py），因为
 没有内嵌 setup_mode.txt，会自动按 'full' 模式运行。
 """
+import lzma  # noqa: F401  载荷改用 ZIP_LZMA 压缩后，释放依赖 _lzma 解码器，
+             # 显式导入确保 PyInstaller 把 _lzma.pyd 打进安装向导/卸载向导
 import os
 import queue
 import re
@@ -33,6 +35,18 @@ import winreg
 
 # 桌面快捷方式显示名（品牌名）
 DESKTOP_SHORTCUT_NAME = "星瑶code.lnk"
+
+
+# 桌面路径/环境变量广播/管理员检测/reparse 判定等基础工具下沉到
+# installer_common.py：卸载向导也复用同一实现，且不再链接本模块的
+# tkinter/PIL 依赖树（卸载器体积从 32MB 降到 ~25MB）。
+from installer_common import (
+    _is_reparse_path,
+    broadcast_environment_change,
+    get_common_desktop_dir,
+    get_desktop_dir,
+    is_user_an_admin,
+)
 
 
 # ============================================================================
@@ -109,40 +123,6 @@ def normalize_browsed_install_dir(chosen):
     return os.path.join(chosen, "Y-code")
 
 
-def get_desktop_dir():
-    """获取用户真实桌面路径。
-
-    桌面文件夹可能被用户或 OneDrive 重定向（例如 D:\\Users\\xxx\\Desktop），
-    此时 ~/Desktop 并不是用户实际看到的桌面。优先读注册表
-    User Shell Folders 的 Desktop 值，读取失败再回退 ~/Desktop。
-    """
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
-        ) as key:
-            value, _ = winreg.QueryValueEx(key, "Desktop")
-            return os.path.normpath(os.path.expandvars(value))
-    except OSError:
-        return os.path.join(os.path.expanduser("~"), "Desktop")
-
-
-def get_common_desktop_dir():
-    """获取公共桌面路径（所有用户共享），machine 范围安装时放置快捷方式。
-
-    优先读注册表 Shell Folders 的 Common Desktop 值，失败回退默认路径。
-    """
-    try:
-        with winreg.OpenKey(
-            winreg.HKEY_LOCAL_MACHINE,
-            r"SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
-        ) as key:
-            value, _ = winreg.QueryValueEx(key, "Common Desktop")
-            return os.path.normpath(os.path.expandvars(value))
-    except OSError:
-        return r"C:\Users\Public\Desktop"
-
-
 def create_shortcut(shortcut_path, target_path, working_dir, startupinfo):
     """用 PowerShell 的 WScript.Shell COM 对象动态生成 .lnk 快捷方式。"""
     def _ps_single_quote(value):
@@ -164,18 +144,6 @@ def create_shortcut(shortcut_path, target_path, working_dir, startupinfo):
 # ============================================================================
 # 注册表操作（全部用 winreg，不再用 reg.exe + 文本解析）
 # ============================================================================
-
-def broadcast_environment_change():
-    """广播 WM_SETTINGCHANGE，使新写入的环境变量无需重启/重新登录即可对新开的进程生效。"""
-    import ctypes
-    HWND_BROADCAST = 0xFFFF
-    WM_SETTINGCHANGE = 0x001A
-    SMTO_ABORTIFHUNG = 0x0002
-    result_val = ctypes.c_long()
-    ctypes.windll.user32.SendMessageTimeoutW(
-        HWND_BROADCAST, WM_SETTINGCHANGE, 0, "Environment",
-        SMTO_ABORTIFHUNG, 1000, ctypes.byref(result_val),
-    )
 
 
 def add_to_system_path(install_dir, log=print):
@@ -274,15 +242,6 @@ def detect_previous_install():
     return None, None
 
 
-def is_user_an_admin():
-    """当前进程是否已拥有管理员权限。"""
-    try:
-        import ctypes
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
-    except Exception:
-        return False
-
-
 def _parse_elevated_args(argv):
     """解析提权重启时携带的命令行参数（纯函数，可单测）。无提权参数返回 None。
 
@@ -349,7 +308,7 @@ def launch_gui_app(install_dir, startupinfo):
 
 # 允许自清理的安装包文件名白名单：
 #   * Y-CODE-Setup-v{版本}.exe —— 「关于」页检查更新下载到缓存目录的更新包；
-#   * ycode_cli_setup*.exe     —— 内嵌/独立分发的 CLI 安装向导（补装用）。
+#   * ycode_cli_setup*.exe     —— 独立分发的 CLI 安装向导（补装用）。
 # 只有这两种文件才可能是"本向导自身"，其余一律不动，避免误删用户文件。
 _SELF_INSTALLER_NAME_RE = re.compile(
     r"^(?:Y-CODE-Setup-v[^\\/]+\.exe|ycode_cli_setup[^\\/]*\.exe)$",
@@ -549,14 +508,6 @@ def _safe_payload_path(install_dir, relative_path):
     if not inside or destination == root:
         raise InstallError(f"安装包包含非法路径: {relative_path}")
     return destination
-
-
-def _is_reparse_path(path):
-    """Return whether an existing path redirects filesystem traversal."""
-    if os.path.islink(path):
-        return True
-    isjunction = getattr(os.path, "isjunction", None)
-    return bool(isjunction and isjunction(path))
 
 
 def _ensure_no_reparse_components(install_dir, destination):
@@ -1472,18 +1423,9 @@ def run_install(mode, bundle_dir, options, startupinfo, log=print, progress=lamb
                     log("ℹ 已跳过命令行版 (ycode.exe)，仅保留图形界面版。")
             except Exception as e:
                 log(f"⚠️ 移除命令行版组件失败: {e}")
-            try:
-                bundled_cli_setup = os.path.join(bundle_dir, "cli", "ycode_cli_setup.exe")
-                if os.path.exists(bundled_cli_setup):
-                    cli_subdir = os.path.join(install_dir, "cli")
-                    os.makedirs(cli_subdir, exist_ok=True)
-                    dest = os.path.join(cli_subdir, "ycode_cli_setup.exe")
-                    shutil.copy2(bundled_cli_setup, dest)
-                    log(f"✔ 已附带命令行版补装程序: {dest}，以后可双击它补装命令行版")
-                else:
-                    log("⚠️ 安装包中未找到命令行版补装程序，跳过。")
-            except Exception as e:
-                log(f"⚠️ 复制命令行版补装程序失败: {e}")
+            # 不再内嵌独立 CLI 安装器（曾把 169MB 载荷重复打进主安装包）：
+            # 补装 = 重跑本向导勾选「命令行版」，载荷两种 exe 都带，等效且省一半体积。
+            log("ℹ 本次未安装命令行版；如需补装，重新运行本安装向导并勾选「命令行版」即可。")
         progress(90.0)
 
         # 3. 桌面快捷方式 "星瑶code" → Y-code.exe（按用户勾选；machine 范围放公共桌面）
@@ -2421,7 +2363,7 @@ class SetupWizard(tk.Tk):
             if result["installed_cli"]:
                 hints.append("打开新的命令行窗口 (CMD/PowerShell)，输入 ycode 使用命令行版。")
             else:
-                hints.append("本次未安装命令行版；如需要，可随时双击安装目录下 cli\\ycode_cli_setup.exe 补装。")
+                hints.append("本次未安装命令行版；如需要，重新运行本安装向导并勾选「命令行版」即可补装。")
         else:
             hints = ["打开任意全新的命令行窗口 (CMD/PowerShell)，输入 ycode 敲回车即可开始使用。"]
         self._finish_detail.configure(

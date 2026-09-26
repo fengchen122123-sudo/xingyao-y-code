@@ -17,9 +17,8 @@ from __future__ import annotations
 import datetime
 import logging
 import os
-import tempfile
 import threading
-from typing import Any, Callable, Optional
+from typing import Callable, Optional
 
 from core.injection_markers import (
     BG_SUMMARY_PREFIX as _BG_SUMMARY_PREFIX,
@@ -800,11 +799,15 @@ def _trigger_background_precompress(
     api_base: str,
     cancel_event: Optional[threading.Event],
     notify: Optional[Callable[[str, str], None]],
+    done_event: Optional[threading.Event] = None,
 ) -> bool:
     """在后台守护线程提前触发记忆压缩（与 0.95 同步路径同一入口）。
 
     返回是否真正启动了线程。防抖 + 防重入：后台已有压缩在跑或距上次
     尝试不足冷却时间时直接跳过，绝不影响当前回合的组装流程。
+    done_event（可选）：压缩线程真正结束时置位。闲时维护靠它把
+    cancel_event 的注册期延长到压缩结束，否则线程发射后立即返回，
+    事件会在压缩起飞前就被弹出注册表、无法被回合开始中断。
     """
     import time as _time
 
@@ -854,6 +857,9 @@ def _trigger_background_precompress(
         except Exception:
             # 预压缩是锦上添花：任何异常只记日志，绝不影响对话主流程
             logger.exception("会话 %s 后台预压缩异常", session_name)
+        finally:
+            if done_event is not None:
+                done_event.set()
 
     threading.Thread(
         target=_run,

@@ -170,6 +170,10 @@
 
         <!-- 底部固定输入框：跟随中间对话栏宽度（存在消息时呈现） -->
         <InputArea v-if="store.messages && store.messages.length > 0" />
+
+        <!-- 底部内嵌交互式终端（ZCode 式弹出）：v-show 保持挂载，
+             收起期间输出持续累积到 xterm 缓冲不丢失 -->
+        <TerminalPane v-show="store.terminalPanelOpen" />
       </div>
 
       <!-- 右面板宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
@@ -302,6 +306,7 @@ import KimiEmptyState from './components/KimiEmptyState.vue';
 import TurnGroup from './components/TurnGroup.vue';
 import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
+import TerminalPane from './components/TerminalPane.vue';
 import ComputerControlBar from './components/ComputerControlBar.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
@@ -1263,11 +1268,24 @@ onUnmounted(() => {
   flex-direction: column;
   min-height: 0;
   position: relative;
+  /* 会话区做成与下方输入框一致的浮层卡片：四周 6px 衬边。
+     用 padding 而非 margin：margin 区不绘制本元素背景。
+     衬边色跟随工作区分区的背景透明度混合（--theme-workspace-* 由主题运行时
+     写在 documentElement 上）：实色主题 opacity=100% 衬边为纯白面板色；
+     全局背景图皮肤下调低透明度时，衬边与会话区一起透出背景图，
+     否则不透明白垫在半透明会话区下面会把背景图整块挡死。 */
+  padding: 6px;
+  background: color-mix(in srgb, var(--bg1) var(--theme-workspace-bg-opacity-pct, 100%), transparent);
 }
 #chat-scroll {
   flex: 1;
   overflow-y: auto;
   padding: 20px 28px 10px;
+  /* 圆角对齐输入框 #input-box（10px），内容随圆角裁剪；
+     描边与输入框同款：主题里会话区底色常与四周留白的 app 底色几乎同色，
+     没有这条 1px 描边时圆角卡片边界不可见（"看不到留白"的根因） */
+  border: 1px solid var(--border);
+  border-radius: 10px;
   /* 保留浏览器 scroll anchoring（默认 auto）：翻页 prepend 与图片/异步内容
      分批撑高时由渲染引擎持续保持视口锚点，这是"不回退"的主力机制。
      JS 侧 maybeLoadOlder 的补偿是绝对定位赋值（oldTop + 内容增量），

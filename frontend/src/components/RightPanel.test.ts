@@ -15,6 +15,8 @@ it('桌面端根元素内联宽度跟随 store.rightPanelWidth，折叠时负 ma
   const pinia = createPinia();
   setActivePinia(pinia);
   const store = useAppStore();
+  // 面板默认收起（appStore.rightPanelDefault 测试锁定）；本用例验证展开态宽度
+  store.rightPanelCollapsed = false;
   store.rightPanelWidth = 400;
   const wrapper = mount(RightPanel, { global: { plugins: [pinia] } });
 
@@ -85,12 +87,12 @@ it('run 出现前不渲染操控页签，出现后动态追加并自动切过去
   const store = useAppStore();
   const wrapper = mount(RightPanel);
 
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件', 'Git']);
+  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '文件', 'Git']);
 
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'starting' });
   await nextTick();
 
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件', 'Git', '操控']);
+  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '文件', 'Git', '操控']);
   expect(computerTab(wrapper).classes()).toContain('active');
   expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
   expect(store.computerLastAutoOpenedRunId).toBe('run-1');
@@ -176,7 +178,7 @@ it('终态 60 秒且用户不在操控页签时自动关闭页签', async () => 
   vi.advanceTimersByTime(1);
   await nextTick();
   expect(computerTab(wrapper)).toBeUndefined();
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '终端', '文件', 'Git']);
+  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '文件', 'Git']);
 
   wrapper.unmount();
   vi.useRealTimers();
@@ -185,6 +187,8 @@ it('终态 60 秒且用户不在操控页签时自动关闭页签', async () => 
 it('用户停留在操控页签时到点顺延，不被自动关闭', async () => {
   vi.useFakeTimers();
   const store = useAppStore();
+  // 「在看就不关」要求面板处于展开态（默认收起时谈不上在看）
+  store.rightPanelCollapsed = false;
   const wrapper = mount(RightPanel);
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
   await nextTick();
