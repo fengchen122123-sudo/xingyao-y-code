@@ -3752,25 +3752,6 @@ class SubagentManager:
                     return True
             return False
 
-    def has_unconsumed_terminal_background_tasks(self, parent_session: str) -> bool:
-        """检查指定会话是否有未消费的终态后台子代理任务（成功+失败都算）。
-
-        用于决定是否在 turn 开始时注入汇总上下文。
-        """
-        if not parent_session:
-            return False
-        with self._lock:
-            for task in self._tasks.values():
-                if (
-                    task.run_in_background
-                    and task.parent_session == parent_session
-                    and task.status in _SUBAGENT_TERMINAL_STATUSES
-                    and task.done_event.is_set()
-                    and not task.notification_consumed
-                ):
-                    return True
-            return False
-
     def drain_terminal_background_tasks(self, parent_session: str) -> list[SubagentTaskSnapshot]:
         """提取本会话中所有终态（completed/failed/timed_out/cancelled）且尚未注入汇总上下文的后台子代理任务。
 
@@ -4196,7 +4177,7 @@ class SubagentManager:
                             try:
                                 task.event_callback("diff_ready", dict(event.payload))
                             except Exception:
-                                logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
+                                _logger.warning("转发子代理 diff_ready 事件失败", exc_info=True)
         finally:
             # 现场打捞兜底：与循环内的周期 flush 幂等（_record_partial 只在更长时覆盖）。
             # 事件循环中途抛异常（如网络错误）时，周期 flush 只保到最后一个
@@ -4639,6 +4620,52 @@ def dream_consolidation():
         return "🚨 整理失败：大模型密钥尚未配置，无法提炼记忆。"
         
     return run_dream_consolidation_sync(task_model, task_key, task_url)
+
+def recall_history(before_msg_id, limit=16, cancel_event=None):
+    """回溯当前会话更早被压缩归档的原始消息（recall_history 工具执行体）。
+
+    只服务摘要水位覆盖的范围：活跃区消息模型本就可见，重复注入只会浪费
+    上下文。会话身份取执行线程绑定，取不到时回退全局当前会话。
+    """
+    import core.app_context as _app_context
+
+    session_name = ""
+    try:
+        session_name = str(
+            _app_context.get_thread_session() or _app_context.get_current_session() or ""
+        ).strip()
+    except Exception:
+        session_name = ""
+    if not session_name:
+        return "无法确定当前会话，无法回溯历史。"
+    try:
+        manager = _app_context.get_manager()
+    except Exception:
+        manager = None
+    if manager is None:
+        return "会话存储未就绪，无法回溯历史。"
+
+    try:
+        rows = manager.get_compressed_messages(session_name, before_msg_id, limit)
+    except Exception as exc:
+        return f"回溯历史失败：{exc}"
+    if not rows:
+        return (
+            "该范围内没有已压缩的原始消息。before_msg_id 需指向摘要水位覆盖的"
+            "区间（取值见记忆摘要块尾部的[更早摘要回溯]索引中的 msg_id）。"
+        )
+
+    lines = []
+    for row in rows:
+        content = str(row.get("content") or "").strip()
+        if len(content) > 600:
+            content = content[:600] + "...[该条过长，已截断]"
+        lines.append(f"#msg_id={row.get('id')} [{row.get('role')}]\n{content}")
+    header = (
+        f"共回溯 {len(rows)} 条已压缩原始消息（按时间正序）。"
+        "需要更早的内容时，把 before_msg_id 设为本批最早一条的 msg_id 再调用。"
+    )
+    return header + "\n\n" + "\n\n".join(lines)
 
 def glob_files(pattern, dir_path=".", cancel_event=None):
     """快速文件模式匹配：使用 glob 表达式在项目目录中搜索匹配的文件路径列表。优先尝试 ripgrep。"""

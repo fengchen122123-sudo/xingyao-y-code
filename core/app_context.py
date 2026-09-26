@@ -274,14 +274,20 @@ def get_manager() -> Optional[Any]:
 
 
 def set_manager(manager: Any) -> None:
-    """显式注册 MemoryManager（没有 ctx 或 ctx 不暴露 manager 时的兜底通道）。"""
+    """显式注册 MemoryManager（没有 ctx 或 ctx 不暴露 manager 时的兜底通道）。
+
+    注意：ctx 已注册且其 manager 是只读视图（如 CLI 的 _CLIContext 代理到
+    模块全局）时，ctx 优先级高于本 fallback——调用方若需覆盖，必须先注销 ctx。
+    """
     global _manager_fallback
     _manager_fallback = manager
     ctx = _context
     if ctx is not None:
         try:
             ctx.manager = manager
-        except Exception:
+        except AttributeError:
+            # ctx 的 manager 是只读 property（CLI/GUI 代理到各自全局状态），
+            # 此时以 ctx 的实时值为准，fallback 仅作无 ctx 环境的兜底。
             pass
 
 

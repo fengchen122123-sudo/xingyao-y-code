@@ -8,13 +8,10 @@ import subprocess
 import threading
 import time
 import uuid
-from types import SimpleNamespace
-from urllib.parse import urlsplit
 # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
-from concurrent.futures import Future, TimeoutError as _FutureTimeoutError
+from concurrent.futures import TimeoutError
 from copy import deepcopy
-from dataclasses import dataclass
 from typing import Dict, List
 
 from core.harness.request_envelope import (
@@ -374,17 +371,6 @@ def _request_stream(prepared_or_protocol, kwargs=None, *, timeout=None, cancel_e
         _unregister_inflight_stream(cancel_event, holder)
         raise
 
-
-def __getattr__(name):
-    # 兼容别名：惰性计算，避免 import 时触发 MCP 连接
-    if name == "TOOLS_SCHEMA":
-        return get_tools_schema()
-    if name == "mcp_manager":
-        # 惰性加载 mcp_manager 单例：避免 import core.llm 时就拉起 mcp 包全家桶
-        # （~1.1s 启动开销）。不缓存到 globals，保证外部属性访问始终反映
-        # core.mcp_client.mcp_manager 的当前值（测试 monkeypatch 友好）。
-        return _get_mcp_manager()
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 # estimate_tokens 结果缓存：token 估算整个历史开销可观（长会话消息多），
 # 而 UI 状态栏、压缩判断等会在内容未变时反复调用。用 (模型, 消息数, 总字符数)
@@ -927,7 +913,6 @@ from core.llm_dialects import (
     _tool_contract_fingerprint,
     _uses_deepseek_prompt_ledger,
     _vision_support_cache,
-    _vision_support_cache_lock,
     consume_deepseek_generation_rotation,
     is_deepseek_ledger_route,
     mark_deepseek_generation_rotation,
@@ -1048,7 +1033,6 @@ from core.llm_execution import (
     _execute_single_tool_call,
     _get_imom_active_publish_root,
     _persisted_tool_calls,
-    _raise_if_tool_cancelled,
     _raw_tool_call_arguments,
     _read_file_result_limit,
     _read_text_with_encoding_fallback,
@@ -2583,6 +2567,12 @@ def _chat_with_model_generator(
                                 "不要在计划未完成时直接结束回答。"
                             ),
                         }
+                        # 注入催促消息后继续下一轮（与下方 Stop-hook 续跑同模式：
+                        # append + pending_persistence + flush_persistence）。
+                        # v1.1.51 重构时曾丢失这两行 append，导致模型从未真正
+                        # 收到催促、只有 UI 在空提醒——此处按 v1.1.25 原实现恢复。
+                        messages.append(nudge_request)
+                        pending_persistence.append(("user", nudge_request))
                         _notify_event(event_callback, "notice", {
                             "message": "计划仍有未执行项，已提醒模型继续执行。",
                         })

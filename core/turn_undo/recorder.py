@@ -32,7 +32,6 @@ from core.turn_undo.models import (
     OwnerKind,
     NodeKind,
     NodeState,
-    PlannedPathMutation,
     SnapshotAvailability,
     SourceKind,
     TurnUndoError,
@@ -923,40 +922,3 @@ def close_turn(
     )
     release_context(ctx.checkpoint_id)
     return final_status
-
-
-def abort_turn(ctx: RecorderContext, *, reason: str) -> None:
-    """回合异常/取消：已记录快照仍保留可用（与旧 end_turn_checkpoint 语义一致），
-    但未验证完整的记录会令检查点不可撤销。"""
-    close_turn(ctx, unavailable_reason=reason)
-
-
-def build_planned_mutation(
-    *,
-    path: str,
-    after_kind: NodeKind,
-    after_content: Optional[bytes],
-    tool_name: str,
-    tool_call_id: str,
-    source_kind: Optional[SourceKind] = None,
-    source_id: Optional[str] = None,
-    display_path: Optional[str] = None,
-) -> PlannedPathMutation:
-    """便捷构造：供工具层在拿到最终字节后声明完整计划修改。"""
-    canonical = canonicalize_path(path)
-    ctx = current_context()
-    root = ctx.workspace_root if ctx else os.path.dirname(canonical)
-    return PlannedPathMutation(
-        canonical_path=canonical,
-        display_path=display_path or display_path_for(root, canonical),
-        after=NodeState(
-            kind=after_kind,
-            exists=after_kind is not NodeKind.MISSING,
-            size=len(after_content) if after_content is not None else None,
-        ),
-        after_content=after_content,
-        source_kind=source_kind or SourceKind.MAIN_AGENT,
-        source_id=source_id or (ctx.turn_id if ctx else ""),
-        tool_name=tool_name,
-        tool_call_id=tool_call_id,
-    )

@@ -9,6 +9,8 @@ tenacity>=8.0.0
 
 # GUI dependencies
 pywebview>=6.0.0
+# 内嵌交互式终端（底部面板）的 Windows ConPTY 封装
+pywinpty>=2.0; sys_platform == "win32"
 pillow>=10.0.0
 pystray>=0.19.5
 keyring>=25.0.0; sys_platform != "win32"

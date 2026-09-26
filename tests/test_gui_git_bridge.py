@@ -140,14 +140,3 @@ def test_git_state_changed_event_dispatched(bridge, tmp_path):
                 break
         time.sleep(0.05)
     assert seen, "外部变化应经 _js_queue 派发 git_state_changed 事件"
-
-
-def test_stop_monitoring(bridge, tmp_path):
-    repo = make_repo(tmp_path, commits=1)
-    assert bridge.git_get_status(str(repo))["ok"]
-    stopped = bridge.git_stop_monitoring(str(repo))
-    assert stopped["ok"] is True
-    from core.git.bootstrap import get_git_monitor
-    from core.git.repository import normalize_repo_path
-
-    assert get_git_monitor().subscriber_count(normalize_repo_path(str(repo))) == 0

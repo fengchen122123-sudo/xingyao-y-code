@@ -37,6 +37,11 @@ tiktoken_ext_datas, tiktoken_ext_binaries, tiktoken_ext_hiddenimports = collect_
 # 浏览器缓存（Chromium/Firefox/WebKit 均不在 wheel 内，collect_all 不会带入）。
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all('playwright')
 
+# pywinpty（GUI 内嵌交互式终端，core/gui_terminal.py 惰性 import）：Rust 扩展
+# 与 conpty.dll / winpty.dll / OpenConsole.exe / winpty-agent.exe 是包内二进制，
+# PyInstaller 默认收集不全，必须 collect_all；否则打包后打开底部终端直接报错。
+pywinpty_datas, pywinpty_binaries, pywinpty_hiddenimports = collect_all('winpty')
+
 # CLI 与 GUI 都会用到的数据文件：默认配置模板、系统提示词模板、内置 ripgrep
 # （core.tools 的 search_code 工具依赖，两个入口共享同一套工具注册表）、前端
 # 编译产物（GUI 加载的静态资源；CLI 虽然用不到，但沿用原 spec 已生效的打包
@@ -67,11 +72,11 @@ common_datas = [
     ('assets/ycode.ico', 'assets'),
     # 更新日志（关于页展示当前版本更新内容 + 历史版本列表）
     ('assets/CHANGELOG.md', 'assets'),
-] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas + playwright_datas
+] + litellm_datas + pyfiglet_datas + tiktoken_ext_datas + playwright_datas + pywinpty_datas
 
-common_binaries = litellm_binaries + tiktoken_ext_binaries + playwright_binaries
+common_binaries = litellm_binaries + tiktoken_ext_binaries + playwright_binaries + pywinpty_binaries
 
-common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken_ext_hiddenimports + playwright_hiddenimports + [
+common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken_ext_hiddenimports + playwright_hiddenimports + pywinpty_hiddenimports + [
     # core.hunyuan_image 只被内置插件 plugins/hunyuan_image 在运行时动态 import，
     # PyInstaller 静态分析不可达，必须显式声明，否则打包后插件调用直接
     # ModuleNotFoundError。
@@ -87,8 +92,12 @@ common_hiddenimports = litellm_hiddenimports + pyfiglet_hiddenimports + tiktoken
 # tkinter/matplotlib/IPython/notebook 均未被本项目使用；PyQt5/PyQt6 是
 # pywebview 的可选 Qt 后端（本项目在 Windows 上固定走 edgechromium/winforms
 # 后端），一并排除可显著减小体积、加快启动时的模块扫描。
+# numpy/numpydoc 仅被 litellm 的冷门可选路径引用（nvidia riva 音频转写 /
+# function_to_dict 文档解析，本项目均不使用，且为函数内懒 import），排除后
+# 可省 ~27MB（openblas 单文件即 20MB）。
 common_excludes = [
     'tkinter', 'matplotlib', 'IPython', 'notebook', 'PyQt5', 'PyQt6',
+    'numpy', 'numpydoc',
 ]
 
 

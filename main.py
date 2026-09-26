@@ -1421,13 +1421,6 @@ def _echo_user_input(html_text: str) -> None:
     print_formatted_text(HTML(html_text))
 
 
-def _format_thinking_elapsed(elapsed: float) -> str:
-    # 短思考（< 1s）用毫秒显示，避免全部显示成 "0.0s" 让用户误以为没思考
-    if elapsed < 1.0:
-        return f"{int(elapsed * 1000)}ms"
-    return f"{elapsed:.1f}s"
-
-
 def _render_public_answer_block(turn_id: str, text: str) -> None:
     block = str(text or "").strip()
     if not block:
@@ -5235,19 +5228,37 @@ def _background_worker():
             def _turn_notify(kind, message):
                 schedule_ui(lambda text=message: print_formatted_text(HTML(text)))
 
-            history = _agent_service.prepare_turn_messages(
-                manager,
-                task_session,
-                task_model,
-                task_ctx_win,
-                permission_mode=current_permission_mode,
-                cancel_event=early_cancel,
-                notify=_turn_notify,
-                api_key=task_key,
-                api_base=task_url,
-                compress_threshold=MEMORY_COMPRESS_THRESHOLD,
-                referenced_sessions=session_refs,
-            )
+            # 闲时维护：回合开始即撤销本会话的空闲维护任务并协作中断在跑的
+            # 闲时压缩（见 core/idle_maintenance.py），结束在 finally 重新计时
+            try:
+                from core.idle_maintenance import idle_maintenance_service
+                idle_maintenance_service.on_turn_started(task_session)
+            except Exception:
+                pass
+
+            try:
+                history = _agent_service.prepare_turn_messages(
+                    manager,
+                    task_session,
+                    task_model,
+                    task_ctx_win,
+                    permission_mode=current_permission_mode,
+                    cancel_event=early_cancel,
+                    notify=_turn_notify,
+                    api_key=task_key,
+                    api_base=task_url,
+                    compress_threshold=MEMORY_COMPRESS_THRESHOLD,
+                    referenced_sessions=session_refs,
+                )
+            except Exception:
+                # 回合在进入下方 try/finally 之前早退：on_turn_started 已置位的
+                # 闲时维护忙位必须在这里收口，否则该会话的闲时任务在到期时
+                # 被忙闲复查跳过，直到下一个成功回合才自愈
+                try:
+                    idle_maintenance_service.on_turn_finished(task_session, notify=None)
+                except Exception:
+                    pass
+                raise
 
 
             # 后台线程只切换 UI 状态，不直接触碰 prompt_toolkit 布局。
@@ -5358,6 +5369,12 @@ def _background_worker():
                 is_thinking = False
                 task_status = "idle"
                 _clear_active_thinking()
+                # 闲时维护重新计时：空闲超过配置延时后跑水位线维护与压缩
+                # （默认开，config memory_compression.idle_maintenance_seconds = 0 关闭）
+                try:
+                    idle_maintenance_service.on_turn_finished(task_session, notify=_turn_notify)
+                except Exception:
+                    pass
                 from core import tool_cache as _tool_cache
                 _tool_cache.set_current_session(None)
                 # 清理卡在 in_progress 的计划项：子 agent 异常退出（超时/崩溃/未调用 terminal_callback）

@@ -342,39 +342,14 @@ def test_deleted_session_rejects_new_or_appended_ledger_messages():
 
 
 # ---------------------------------------------------------------------------
-# 缓存优化路由家族化（config.json 顶层 deepseek_cache_routes 保留兼容）
+# 缓存优化路由家族化：is_deepseek_ledger_route 纯模型家族判定（旧
+# deepseek_cache_routes 配置键已废弃不再读取，见 core/llm_dialects.py 顶部备注）
 # ---------------------------------------------------------------------------
 
 
-def _use_deepseek_cache_routes(monkeypatch, routes):
-    """把顶层 deepseek_cache_routes 指向给定条目，并清掉解析缓存。"""
-    import core.llm_dialects as llm_dialects
-
-    monkeypatch.setattr(
-        "core.model_manager.load_config", lambda: {"deepseek_cache_routes": list(routes)}
-    )
-    llm_dialects._deepseek_cache_routes_cfg_cache["entry"] = None
-
-
-def test_configured_deepseek_cache_route_enables_ledger(monkeypatch):
-    """配置条目让网关路由进入 Prompt Ledger：大小写/端口/路径归一化后仍命中。"""
+def test_any_gateway_enters_ledger_for_deepseek_family():
+    """任意网关进账本：非本族不误放，官方端点照样进账本。"""
     from core.llm import is_deepseek_ledger_route
-
-    _use_deepseek_cache_routes(monkeypatch, ["tokenrhythm.studio"])
-
-    assert is_deepseek_ledger_route(
-        "openai/deepseek-v4-flash-0731", "https://tokenrhythm.studio/v1"
-    )
-    assert is_deepseek_ledger_route(
-        "openai/deepseek-v4-flash-0731", "https://TokenRhythm.STUDIO:443/v1/"
-    )
-
-
-def test_any_gateway_enters_ledger_for_deepseek_family(monkeypatch):
-    """任意网关进账本（配置不再必要）：非本族不误放，官方不受配置影响。"""
-    from core.llm import is_deepseek_ledger_route
-
-    _use_deepseek_cache_routes(monkeypatch, ["tokenrhythm.studio"])
 
     assert is_deepseek_ledger_route(
         "openai/deepseek-v4-flash-0731", "https://relay.example/v1"
@@ -382,36 +357,15 @@ def test_any_gateway_enters_ledger_for_deepseek_family(monkeypatch):
     assert not is_deepseek_ledger_route(
         "openai/kimi-for-coding", "https://tokenrhythm.studio/v1"
     )
-    # 官方路由判定不受配置影响：配置为空时官方端点照样进账本
-    _use_deepseek_cache_routes(monkeypatch, [])
     assert is_deepseek_ledger_route(
         "openai/deepseek-v4-pro", "https://api.deepseek.com/v1"
     )
 
 
-def test_configured_deepseek_cache_route_sorts_tools(monkeypatch):
-    """配置网关路由的 tools 必须字母序：MCP 顺序抖动不得击穿缓存前缀。"""
+def test_deepseek_family_route_sorts_tools_without_config():
+    """家族判定下任意渠道排序 tools：MCP 顺序抖动不得击穿缓存前缀。"""
     from core.llm import _select_request_tools_for_route
 
-    _use_deepseek_cache_routes(monkeypatch, ["tokenrhythm.studio"])
-    tools = [
-        {"type": "function", "function": {"name": "zeta", "parameters": {}}},
-        {"type": "function", "function": {"name": "alpha", "parameters": {}}},
-    ]
-
-    sorted_tools = _select_request_tools_for_route(
-        "openai/deepseek-v4-flash-0731", "https://tokenrhythm.studio/v1", tools
-    )
-
-    assert [tool["function"]["name"] for tool in sorted_tools] == ["alpha", "zeta"]
-    assert sorted_tools is not tools
-
-
-def test_deepseek_family_route_sorts_tools_without_config(monkeypatch):
-    """家族判定下任意渠道排序 tools：配置不再必要（MCP 顺序抖动不得击穿缓存前缀）。"""
-    from core.llm import _select_request_tools_for_route
-
-    _use_deepseek_cache_routes(monkeypatch, [])
     tools = [
         {"type": "function", "function": {"name": "zeta", "parameters": {}}},
         {"type": "function", "function": {"name": "alpha", "parameters": {}}},

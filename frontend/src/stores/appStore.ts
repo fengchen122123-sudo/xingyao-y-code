@@ -41,6 +41,7 @@ import type {
   TurnUndoRecoveryPreviewPayload,
   TurnUndoRecoveryExecutePayload,
 } from '../types/pywebview';
+import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
 import type { MediaItem } from '../types/media';
 import { formatPermMode } from '../utils/markdown';
 import {
@@ -92,6 +93,13 @@ function storedPanelWidth(key: string, def: number, min: number, max: number): n
     return def;
   }
 }
+
+// 底部内嵌终端面板持久化键与尺寸边界（与 'ycode-*' 前缀约定一致）
+export const TERMINAL_PANEL_OPEN_KEY = 'ycode-terminal-open';
+export const TERMINAL_PANEL_HEIGHT_KEY = 'ycode-terminal-height';
+export const TERMINAL_PANEL_DEFAULT_HEIGHT = 300;
+export const TERMINAL_PANEL_MIN_HEIGHT = 140;
+export const TERMINAL_PANEL_MAX_HEIGHT = 720;
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
   // Pinia exposes state through Vue proxies, which structuredClone rejects.
@@ -463,7 +471,7 @@ export interface PermReqState {
   undoImpact?: Record<string, any> | null;
 }
 
-export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations' | 'hooks';
+export type SubpageType = 'skills' | 'mcp' | 'plugins' | 'models' | 'automations';
 
 const speedTracker = new StreamingSpeedTracker();
 
@@ -646,6 +654,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
     version: '',
     // 启动初始化是否完成（控制 星瑶Code 启动画面，完成后淡出进入对话）
     initialized: false,
+    // JS 桥完成首次验证（initFromBackend 拿到 api）：底部终端等惰性能力
+    // 以此为启动信号，避免在 pywebview 注入完成前触达 _api() 弹连接失败框
+    bridgeReady: false,
 
     // 侧栏与面板开合状态
     // 移动端（<=768px）默认收起侧栏：侧栏作为 fixed 覆盖层，展开时滑入，
@@ -654,7 +665,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       typeof window !== 'undefined' &&
       typeof window.matchMedia === 'function' &&
       window.matchMedia('(max-width: 768px)').matches,
-    rightPanelCollapsed: false,
+    // 右侧计划/任务/终端/文件/Git 栏默认收起：启动不摊开主对话区，
+    // 仅由顶栏“切换面板”按钮或底栏 Git 分支项手动展开；
+    // 展开状态不持久化，每次启动都从收起开始
+    rightPanelCollapsed: true,
     // 桌面端左右面板宽度（px）：拖拽手柄实时更新，启动时从 localStorage 恢复；
     // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
     sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
@@ -686,7 +700,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
     // 设置页打开后要落在哪个分区（模型配置/外观与主题等），由调用方指定；
     // 预览返回编辑器时用它跳回"外观与主题"而不是默认的模型配置
-    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer',
+    settingsSection: 'models' as 'models' | 'tokens' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer',
     // 智能体显示名：设置页「人设设置」自定义后全局生效（界面文案/执行过程/思考提示）
     agentName: '星瑶',
     // 智能体对用户的称呼；空串表示不使用特定称呼
@@ -767,9 +781,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // frameless 窗口最大化状态（后端 window_maximize_state 事件推送）
     windowMaximized: false,
 
-    // 内嵌终端（右侧面板）
-    terminalOutput: '',
-    terminalRunning: false,
+    // 底部内嵌交互式终端面板（ZCode 弹出式终端）：
+    // open 持久化到 localStorage，height 记忆拖拽结果；默认收起
+    terminalPanelOpen: (() => {
+      try { return localStorage.getItem(TERMINAL_PANEL_OPEN_KEY) === '1'; } catch { return false; }
+    })(),
+    terminalPanelHeight: (() => {
+      try {
+        const n = Number(localStorage.getItem(TERMINAL_PANEL_HEIGHT_KEY));
+        return Number.isFinite(n) && n >= TERMINAL_PANEL_MIN_HEIGHT
+          ? Math.min(n, TERMINAL_PANEL_MAX_HEIGHT)
+          : TERMINAL_PANEL_DEFAULT_HEIGHT;
+      } catch { return TERMINAL_PANEL_DEFAULT_HEIGHT; }
+    })(),
   }),
 
   getters: {
@@ -1000,6 +1024,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return api;
     },
 
+    // 底部终端专用的静默桥访问：不用 _api()（它缺桥时会弹窗），终端在
+    // bridgeReady 之前根本不发起调用，这里兜底返回 null 即可
+    _ptyApi(): PyWebViewAPI | null {
+      return (window.pywebview && window.pywebview.api) || null;
+    },
+
     // 回合级事件（tool_start / tool_finish / diff_ready）必须落在当前助手消息上；
     // 缺失时：若当前会话处于运行态（如中途扫码接入），自愈补齐 running 占位卡片避免崩溃；
     // 若非运行态到达则严格抛出契约错误。
@@ -1144,6 +1174,63 @@ navItems: [] as Array<{ id: number; preview: string }>,
 
     toggleRightPanel() {
       this.rightPanelCollapsed = !this.rightPanelCollapsed;
+    },
+
+    // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
+    toggleTerminalPanel() {
+      this.terminalPanelOpen = !this.terminalPanelOpen;
+      try {
+        if (this.terminalPanelOpen) {
+          localStorage.setItem(TERMINAL_PANEL_OPEN_KEY, '1');
+        } else {
+          localStorage.removeItem(TERMINAL_PANEL_OPEN_KEY);
+        }
+      } catch { /* 存储不可用时仅本次会话生效 */ }
+    },
+
+    setTerminalPanelHeight(height: number) {
+      this.terminalPanelHeight = Math.round(
+        Math.min(TERMINAL_PANEL_MAX_HEIGHT, Math.max(TERMINAL_PANEL_MIN_HEIGHT, height))
+      );
+      try {
+        localStorage.setItem(TERMINAL_PANEL_HEIGHT_KEY, String(this.terminalPanelHeight));
+      } catch { /* 忽略 */ }
+    },
+
+    /** 确保后端常驻 shell 存在（首次打开面板或上次进程退出后调用） */
+    async ensurePtyTerminal(cols: number, rows: number): Promise<{ ok: boolean; cwd?: string; reused?: boolean; msg?: string }> {
+      const api = this._ptyApi();
+      if (!api?.pty_terminal_ensure) return { ok: false, msg: '后端桥未就绪' };
+      try {
+        const res = await api.pty_terminal_ensure(cols, rows);
+        if (res && res.ok === false && res.msg) {
+          this.notifyChatLocal(`终端启动失败：${res.msg}`, 'notice');
+        }
+        return res || { ok: false, msg: '未知错误' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    async ptyTerminalWrite(text: string) {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_write) {
+        try { await api.pty_terminal_write(text); } catch { /* 输入丢弃即可 */ }
+      }
+    },
+
+    async ptyTerminalResize(cols: number, rows: number) {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_resize) {
+        try { await api.pty_terminal_resize(cols, rows); } catch { /* 下次 resize 再试 */ }
+      }
+    },
+
+    async ptyTerminalKill() {
+      const api = this._ptyApi();
+      if (api?.pty_terminal_kill) {
+        try { await api.pty_terminal_kill(); } catch { /* 忽略 */ }
+      }
     },
 
     async _resyncAuthoritativeGuiTheme(this: any, failure: GuiThemeFailure): Promise<GuiThemeFailure> {
@@ -1677,6 +1764,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         await finishSplash();
         return;
       }
+      this.bridgeReady = true;
       // 星轨自动化：启动时主动拉一次任务快照（引擎启动推送可能早于页面就绪被丢弃）
       void this.refreshAutomations();
       this.themeLight = document.body.classList.contains('light');
@@ -3914,16 +4002,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
         const tid = String(data.task_id || '');
         const statusText = code === 0 ? '已完成' : `已结束（退出码 ${code}）`;
         this.notifyChatLocal(`后台任务 ${tid} ${statusText}`, 'notice', String(data.session_name || '') || undefined);
-      } else if (type === 'terminal_output') {
-        this.terminalOutput += data.text || '';
-        // 输出上限 200K 字符：超出后从头部截断，避免长任务把内存拖爆
-        if (this.terminalOutput.length > 200_000) {
-          this.terminalOutput = '…[输出过长，头部已截断]\n' + this.terminalOutput.slice(-160_000);
-        }
-      } else if (type === 'terminal_finished') {
-        this.terminalRunning = false;
-        const code = data.code;
-        this.terminalOutput += `\n[进程已退出，代码 ${code}]\n\n`;
+      } else if (type === 'pty_data') {
+        // 底部内嵌交互式终端：原始输出直接走 ptyBus 给 xterm，不进响应式状态
+        emitPtyData(String(data.text ?? ''));
+      } else if (type === 'pty_exit') {
+        emitPtyExit(Number(data.code ?? 0));
       } else if (type === 'update_download_progress') {
         this.updateState.status = 'downloading';
         this.updateState.downloadProgress = Number(data.percent) || 0;
@@ -4442,42 +4525,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    // ---------------- 内嵌终端 ----------------
-    async runTerminalCommand(command: string) {
-      const cmd = (command || '').trim();
-      if (!cmd || this.terminalRunning) return;
-      const api = this._api();
-      if (!api) return;
-      this.terminalOutput += `$ ${cmd}\n`;
-      this.terminalRunning = true;
-      try {
-        const res = await api.run_terminal_command(cmd);
-        if (!res || !res.ok) {
-          this.terminalRunning = false;
-          this.terminalOutput += `[启动失败: ${(res && res.msg) || '未知错误'}]\n`;
-        }
-      } catch (err) {
-        this.terminalRunning = false;
-        this.terminalOutput += `[启动失败: ${err}]\n`;
-      }
-    },
-
-    async killTerminalCommand() {
-      const api = this._api();
-      if (!api) return;
-      try {
-        const res = await api.kill_terminal_command();
-        if (!res || !res.ok) {
-          this.notifyModal('后台任务', (res && res.msg) || '终止命令失败');
-        }
-      } catch (err) {
-        this.notifyModal('后台任务', '终止命令失败: ' + err);
-      }
-    },
-
-    clearTerminal() {
-      this.terminalOutput = '';
-    },
+    // ---------------- 内嵌终端（右侧面板版已下线，交互式终端见 ptyTerminal*） ----------------
 
     async exportSession(fmt: 'md' | 'html' | 'json') {
       const api = this._api();

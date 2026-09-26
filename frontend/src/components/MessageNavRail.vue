@@ -385,10 +385,11 @@ defineExpose({ refresh, jumpToLoaded, cancelJump });
 
 <style scoped>
 /* 固定钉在对话区右侧：相对 .chat-viewport（不滚动的外壳）定位，
-   垂直居中、不随内容滚动。点贴右侧边缘（gutter 内），不压消息文字。 */
+   垂直居中、不随内容滚动。点落在会话卡片内缘（外层 6px 白色衬边 + 1px 描边
+   之外），不压消息文字、不骑在衬边与卡片的分界线上。 */
 .nav-rail {
   position: absolute;
-  right: 4px;
+  right: 13px;
   top: 50%;
   transform: translateY(-50%);
   display: flex;

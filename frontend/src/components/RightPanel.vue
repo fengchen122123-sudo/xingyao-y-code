@@ -106,30 +106,7 @@
         </div>
       </div>
 
-      <!-- 内嵌终端 -->
-      <div v-show="activeTab === 'term'" class="rpane active term-pane">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;padding-bottom:6px;border-bottom:1px solid var(--border)">
-          <span style="font-size:12px;color:var(--text-dim);font-weight:600">终端 · {{ store.currentWorkdirLabel }}</span>
-          <div style="display:flex;gap:6px">
-            <button v-if="store.terminalRunning" class="chip-btn danger" style="font-size:11.5px;padding:3px 9px" title="终止正在运行的命令" @click="store.killTerminalCommand()"><AppIcon name="square" :size="11" :stroke-width="2" /> 终止</button>
-            <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="清空终端输出" @click="store.clearTerminal()"><AppIcon name="x" :size="11" :stroke-width="2" /> 清空</button>
-          </div>
-        </div>
-        <div class="term-body" @click="focusTermInput">
-          <div ref="termOutputEl" class="t-out"><template v-if="termLines.length === 0"><span class="t-cmd">$ # 终端已准备就绪，支持执行 Shell 命令</span></template><template v-for="(line, i) in termLines" :key="i">{{ i > 0 ? '\n' : '' }}<span :class="line.cls || undefined">{{ line.text }}</span></template></div>
-          <div class="term-input-row">
-            <span class="term-prompt">$</span>
-            <input
-              ref="termInputEl"
-              v-model="termInput"
-              class="term-input"
-              :disabled="store.terminalRunning"
-              :placeholder="store.terminalRunning ? '命令运行中…' : '输入命令，回车执行'"
-              @keydown.enter="runTermCommand"
-            />
-          </div>
-        </div>
-      </div>
+      <!-- 内嵌终端已下线：交互式终端改由顶栏按钮唤起的底部面板承载 -->
 
       <!-- 文件树面板 -->
       <div v-show="activeTab === 'files'" class="rpane active">
@@ -197,7 +174,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
@@ -207,7 +184,7 @@ import { useGitStore } from '../stores/gitStore';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
 
-type TabType = 'plan' | 'tasks' | 'term' | 'files' | 'git' | 'computer';
+type TabType = 'plan' | 'tasks' | 'files' | 'git' | 'computer';
 
 const store = useAppStore();
 
@@ -227,7 +204,6 @@ const activeTab = ref<TabType>('plan');
 const baseTabs: Array<{ id: TabType; label: string }> = [
   { id: 'plan', label: '计划' },
   { id: 'tasks', label: '任务' },
-  { id: 'term', label: '终端' },
   { id: 'files', label: '文件' },
   { id: 'git', label: 'Git' }
 ];
@@ -304,47 +280,6 @@ watch(
   () => scheduleComputerAutoDismiss(),
   { immediate: true },
 );
-
-// ---------------- 内嵌终端 ----------------
-const termInput = ref('');
-const termOutputEl = ref<HTMLElement | null>(null);
-const termInputEl = ref<HTMLInputElement | null>(null);
-
-// 点击终端区域任意处即聚焦输入框（正在选中文字时不抢焦点）
-function focusTermInput() {
-  const sel = window.getSelection();
-  if (sel && !sel.isCollapsed) return;
-  termInputEl.value?.focus();
-}
-
-// 按行着色（对齐 demo 的 t-cmd / t-ok / t-warn 样式）：
-// $ 开头的回显命令 => 白色；退出码 0 => 绿色；非零退出/启动失败 => 黄色
-const termLines = computed(() => {
-  const out = store.terminalOutput;
-  if (!out) return [] as Array<{ text: string; cls: string }>;
-  return out.split('\n').map((text) => {
-    let cls = '';
-    if (text.startsWith('$ ')) cls = 't-cmd';
-    else if (text.startsWith('[进程已退出，代码 0]')) cls = 't-ok';
-    else if (text.startsWith('[进程已退出') || text.startsWith('[启动失败') || text.startsWith('…[输出过长')) cls = 't-warn';
-    return { text, cls };
-  });
-});
-
-function runTermCommand() {
-  const cmd = termInput.value.trim();
-  if (!cmd || store.terminalRunning) return;
-  termInput.value = '';
-  store.runTerminalCommand(cmd);
-}
-
-// 有新输出时自动滚到底部
-watch(() => store.terminalOutput, async () => {
-  await nextTick();
-  if (termOutputEl.value) {
-    termOutputEl.value.scrollTop = termOutputEl.value.scrollHeight;
-  }
-});
 
 function fileBaseName(path: string) {
   if (!path) return '';
@@ -568,72 +503,6 @@ onUnmounted(() => {
 }
 .rpane.active {
   display: block;
-}
-
-/* 内嵌终端：输出区占满剩余高度，输入行固定在底部 */
-.rpane.active.term-pane {
-  display: flex;
-  flex-direction: column;
-  height: 100%;
-}
-/* 终端主体：输出区与输入行同处一个深色框内（对齐 demo 样式） */
-.term-body {
-  flex: 1;
-  min-height: 0;
-  display: flex;
-  flex-direction: column;
-  background: var(--code-bg);
-  border: 1px solid var(--border);
-  border-radius: 9px;
-  padding: 12px;
-  font-family: var(--mono);
-  font-size: 12px;
-  line-height: 1.65;
-  cursor: text;
-}
-.t-out {
-  flex: 0 1 auto;
-  min-height: 0;
-  overflow-y: auto;
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: var(--text-dim);
-}
-.t-out .t-cmd {
-  color: var(--text-bright);
-}
-.t-out .t-ok {
-  color: var(--green);
-}
-.t-out .t-warn {
-  color: var(--yellow);
-}
-.term-input-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-top: 4px;
-  color: var(--green);
-  flex-shrink: 0;
-}
-.term-prompt {
-  font-family: var(--mono);
-  font-size: 12px;
-  font-weight: 700;
-  flex-shrink: 0;
-}
-.term-input {
-  flex: 1;
-  min-width: 0;
-  background: none;
-  border: none;
-  outline: none;
-  color: var(--text-bright);
-  font-family: var(--mono);
-  font-size: 12px;
-}
-.term-input::placeholder {
-  color: var(--text-faint);
 }
 
 .progress-line {

@@ -8,9 +8,7 @@ import logging
 import os
 from copy import copy
 from contextlib import nullcontext
-from typing import Callable
 
-from core.harness.tool_contracts import ResolvedTool
 from core.tool_protocol import ToolResult
 from core.tools import (
     edit_file as _edit_file,

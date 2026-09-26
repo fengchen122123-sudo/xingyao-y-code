@@ -49,6 +49,22 @@
             <AppIcon class="perm-icon" name="shield" :size="13" :stroke-width="2" /><span class="perm-label">{{ formatPermMode(store.permissionMode) }}</span>
             <AppIcon class="permission-chevron" name="chevron-down" :size="11" :stroke-width="2" />
           </button>
+          <!-- 沙盒限制开关（绿框位）：与输入框沙盒 chip 同一后端配置 -->
+          <button
+            data-test="hero-sandbox-button"
+            class="kimi-pill-btn sandbox-pill"
+            :class="{ 'sandbox-open': store.sandboxEnabled }"
+            :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
+            @click.stop="store.setSandbox(!store.sandboxEnabled)"
+          >{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</button>
+          <!-- Git 分支入口（红框位）：非 Git 工作区不显示；点击弹出 Git 管理面板 -->
+          <button
+            v-if="gitBranchLabel"
+            data-test="hero-git-branch"
+            class="kimi-pill-btn"
+            title="Git 工作台：点击打开 Git 管理面板"
+            @click.stop="openGitPanel"
+          ><AppIcon name="git-branch" :size="13" :stroke-width="2" /><span class="git-branch-label">{{ gitBranchLabel }}</span></button>
         </div>
 
         <div style="display:flex;align-items:center;gap:10px">
@@ -134,6 +150,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
+import { useGitStore } from '../stores/gitStore';
 import { formatPermMode } from '../utils/markdown';
 import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
@@ -146,6 +163,16 @@ import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
 
 const store = useAppStore();
+const gitStore = useGitStore();
+// Git 分支 chip 文案：复用状态栏格式（去掉 ⎇ 前缀）；非 Git 工作区为空隐藏
+const gitBranchLabel = computed(() => {
+  const text = gitStore.statusbarText;
+  return text ? text.slice(2) : '';
+});
+function openGitPanel() {
+  gitStore.requestOpenPanel();
+  if (store.rightPanelCollapsed) store.toggleRightPanel();
+}
 const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',
   set: value => { store._getSessionRuntime().composerText = value; },
@@ -297,6 +324,18 @@ function handleKeydown(e: KeyboardEvent) {
   backdrop-filter: blur(14px);
   animation: fadein 0.15s cubic-bezier(0.16, 1, 0.3, 1);
 }
+/* 沙盒开关解除态：橙色提示（与输入框沙盒 chip 一致） */
+.sandbox-pill.sandbox-open {
+  border-color: var(--orange);
+  color: var(--orange);
+}
+/* Git 分支 chip：长分支名截断，完整名在 title 中 */
+.git-branch-label {
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .workdir-item {
   padding: 9px 12px;
   border-radius: 8px;
@@ -353,6 +392,14 @@ function handleKeydown(e: KeyboardEvent) {
   .perm-icon,
   .model-icon {
     display: inline-flex;
+  }
+  /* 手机端沙盒只留 开/限，分支信息看状态栏即可 */
+  .sandbox-pill {
+    font-size: 12px;
+    padding: 6px 9px;
+  }
+  [data-test="hero-git-branch"] {
+    display: none;
   }
 }
 </style>

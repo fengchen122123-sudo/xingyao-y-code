@@ -8,13 +8,12 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
       ycode.exe                  CLI 控制台版 (console=True)
       _internal/                 两者共享的运行时依赖与数据文件
   dist/ycode_uninstall.exe     独立卸载向导
-  dist/Y-code-cli-{版本}.exe   独立 CLI 安装向导（供主安装包内嵌，也可单独分发）
+  dist/Y-code-cli-{版本}.exe   独立 CLI 安装向导（单独分发，补装/纯 CLI 用户）
   dist/XingYaoCode-{版本}.exe  主安装向导（默认装 GUI，可选附带装 CLI）
   dist/release_parts/          Gitee Release 附件（超 100MB 的安装包按 ≤95MB
                                二进制分卷 .part1/.part2/...，附 RELEASE_NOTES.txt
                                上传指引，内含 SHA256 校验行）
-  （两个安装向导文件名带版本号，便于多渠道分发时区分新旧；内嵌进主安装包的
-    cli/ycode_cli_setup.exe 仍用固定名，安装引擎按固定名查找。）
+  （两个安装向导文件名带版本号，便于多渠道分发时区分新旧。）
 
 用法：
   venv\\Scripts\\python build_release.py                   完整构建
@@ -326,13 +325,20 @@ def make_payload_archive(project_dir, ycode_dir):
     超过一分钟毫无反应（用户以为安装包坏了）。压缩成单文件后，启动解压量从
     4000+ 个文件降到十几个，界面几秒内出现；真正的文件释放挪到安装步骤里做
     （有进度条，符合正常安装体验）。
+
+    为什么 ZIP_LZMA 而不是 DEFLATE-6：载荷体积再省 ~15-20%，且载荷在每个
+    安装器里各嵌一份、直接决定安装器体积。释放侧 ycode_setup._copy_payload
+    走 zf.read() 逐成员读，对压缩算法完全透明；安装向导通过模块级
+    `import lzma` 已随包 _lzma 解码器。代价：压缩耗时约 2-4 分钟、安装时
+    解压略慢 1-3 秒（进度条内无感）；且 Explorer 无法直接打开 LZMA zip——
+    本产物仅供安装器内嵌，不是用户可直接解压的分发物。
     """
     zip_path = os.path.join(project_dir, "build", "ycode_pkg.zip")
     if os.path.exists(zip_path):
         os.remove(zip_path)
-    print("📦 正在压缩核心程序包为单文件载荷 (ycode_pkg.zip)...")
+    print("📦 正在压缩核心程序包为单文件载荷 (ycode_pkg.zip, LZMA)...")
     count = 0
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6, allowZip64=True) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_LZMA, allowZip64=True) as zf:
         for root, _dirs, files in os.walk(ycode_dir):
             for name in files:
                 src = os.path.join(root, name)
@@ -363,14 +369,18 @@ def step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_e
     )
 
 
-def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, cli_setup_exe):
+def step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe):
     print("\n[步骤 4/5] 正在编译主安装向导 ycode_setup.exe...")
+    # 不再内嵌 cli/ycode_cli_setup.exe（-222MB）：主安装器的 full 模式本来就
+    # 用同一份载荷直接释放 ycode.exe（run_install → _copy_payload），内嵌的
+    # CLI 安装器只在"用户勾掉 CLI"的兜底场景被复制到安装目录，却让 169MB
+    # 载荷 + 32MB 卸载器在主安装包里各出现两次。补装路径改为：重跑主安装
+    # 向导勾选「命令行版」。
     return build_setup_variant(
         pyinstaller_bin, project_dir, mode="full", output_name="ycode_setup",
         add_data_pairs=[
             (payload_zip, "."),
             (uninstall_exe, "."),
-            (cli_setup_exe, "cli"),
             ("config.example.json", "."),
             ("system_prompt.md", "."),
             # GUI 向导资源：横幅/窗口图标（经典样式已弃用 setup_bg.png 背景图）
@@ -710,10 +720,10 @@ def build():
         payload_zip = make_payload_archive(project_dir, ycode_dir)
         uninstall_exe = step2_build_uninstaller(pyinstaller_bin, project_dir)
 
-    cli_setup_exe = step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
+    step3_build_cli_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
 
     if not args.cli_only:
-        step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe, cli_setup_exe)
+        step4_build_full_setup(pyinstaller_bin, project_dir, payload_zip, uninstall_exe)
 
     version = read_project_version(project_dir)
     step4b_rename_setups(project_dir, version, args.cli_only)

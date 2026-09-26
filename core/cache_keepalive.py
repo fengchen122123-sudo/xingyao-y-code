@@ -312,6 +312,20 @@ class CacheKeepaliveService:
                 "session_count": len(self._entries),
             }
 
+    def get_session_snapshot(self, session_key=None):
+        """只读返回会话最后一次主请求快照的深拷贝；无条目返回 None。
+
+        供插入式压缩复用主请求字节（ledger 消息 + tools + 亲和参数原样）。
+        绝不改动调度状态：不刷新 last_activity、不创建/唤醒保活线程。
+        """
+        key = _resolve_keepalive_session_key(session_key)
+        with self._condition:
+            entry = self._entries.get(key)
+            if not entry:
+                return None
+            snapshot = entry.get("snapshot")
+            return deepcopy(snapshot) if snapshot else None
+
     def _evict_oldest_locked(self, exclude=None):
         """条目超出 MAX_KEEPALIVE_SESSIONS 时淘汰 last_activity 最旧的会话。
 

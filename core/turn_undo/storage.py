@@ -330,29 +330,6 @@ class BlobStore:
             )
         return data
 
-    def read_stream_verified(self, sha256: str):
-        """以生成器流式读取并校验哈希；结尾不匹配抛 snapshot_corrupt。"""
-        path = self.blob_path(sha256)
-        digest = hashlib.sha256()
-        try:
-            with open(path, "rb") as handle:
-                while True:
-                    chunk = handle.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    digest.update(chunk)
-                    yield chunk
-        except FileNotFoundError:
-            raise TurnUndoError(
-                UndoErrorCode.SNAPSHOT_MISSING,
-                f"快照内容缺失: {sha256[:12]}…",
-            )
-        if digest.hexdigest() != sha256:
-            raise TurnUndoError(
-                UndoErrorCode.SNAPSHOT_CORRUPT,
-                f"快照内容哈希校验失败: {sha256[:12]}…",
-            )
-
 
 # ---------------------------------------------------------------------------
 # DAO 行对象（存储层内部表示）
