@@ -34,6 +34,9 @@
       <span v-if="store.updateState.status === 'downloading'" class="progress-tag">{{ store.updateState.downloadProgress }}%</span>
     </button>
 
+    <button class="icon-btn no-drag" id="btn-terminal" title="切换终端" data-test="btn-terminal" @click="store.toggleTerminalPanel()">
+      <AppIcon name="square-terminal" :size="16" />
+    </button>
     <button class="icon-btn no-drag" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
       <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" />
     </button>

@@ -38,6 +38,7 @@ from core.media_store import archive_media_file
 from core.frameless import _MONITORINFO
 from core.memory import MemoryManager
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
+from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_terminal
 from gui_git_mixin import GitBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
@@ -574,9 +575,10 @@ class ApiBridge(GitBridgeMixin):
         self._perm_timers: Dict[str, threading.Timer] = {}
         self._perm_lock = threading.Lock()
 
-        # 内嵌终端：右侧面板用户手动执行命令的子进程（同一时刻最多一个）
-        self._term_proc = None
-        self._term_lock = threading.Lock()
+        # 内嵌交互式终端（底部面板，pywinpty/ConPTY 常驻 shell）：单会话、
+        # 用户手动开启；模型/工具链路不经过这里
+        self._pty_session = None
+        self._pty_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
         # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
@@ -1083,9 +1085,13 @@ class ApiBridge(GitBridgeMixin):
         permission_broker.cancel_all()
 
         try:
-            self.kill_terminal_command()
+            with self._pty_lock:
+                pty_session = self._pty_session
+                self._pty_session = None
+            if pty_session is not None:
+                pty_session.kill()
         except Exception:
-            logger.exception("退出时终止内嵌终端失败")
+            logger.exception("退出时终止内嵌交互式终端失败")
 
         try:
             from core.tools import subagent_manager
@@ -3276,25 +3282,6 @@ class ApiBridge(GitBridgeMixin):
             logger.exception("create_session 失败")
             return {"ok": False, "msg": str(e)}
 
-    def create_global_session(self, title: str = "新对话") -> Dict[str, Any]:
-        """创建跳出文件夹限定的独立通用对话"""
-        try:
-            new_name = f"session_{uuid.uuid4().hex[:6]}"
-            self._memory.create_session_explicit(new_name, workdir="GLOBAL", source="GUI")
-            self._set_current_session(new_name)
-            # 同 create_session：清掉旧会话残留在全局 latest_total 的窗口占用
-            self._recalc_token_usage(new_name)
-            return {
-                "ok": True,
-                "session_name": new_name,
-                "title": title,
-                "display_name": title,
-                "workdir": "GLOBAL",
-            }
-        except Exception as e:
-            logger.exception("create_global_session 失败")
-            return {"ok": False, "msg": str(e)}
-
     def _set_current_session(self, session_name: str):
         """切换当前会话，并同步所有与会话绑定的运行时状态。"""
         self._current_session = session_name
@@ -5161,6 +5148,13 @@ class ApiBridge(GitBridgeMixin):
         automation_task_name = str((automation_context or {}).get("task_name") or "")
         automation_permission_mode = str((automation_context or {}).get("permission_mode") or "")
         automation_error: Optional[str] = None
+        # 闲时维护：回合开始即撤销本会话的空闲维护任务并协作中断在跑的
+        # 闲时压缩（见 core/idle_maintenance.py），结束在 finally 重新计时
+        try:
+            from core.idle_maintenance import idle_maintenance_service
+            idle_maintenance_service.on_turn_started(session_name)
+        except Exception:
+            pass
         # 本回合起点消息 id（turn_start 事件后记录）：异常/取消回滚后 history
         # 末尾会退化成上一轮的助手消息，补发全文必须按此边界过滤。必须在
         # finish_once 定义之前初始化，闭包才能读到；取值失败退回 None（旧行为）。
@@ -5684,6 +5678,22 @@ class ApiBridge(GitBridgeMixin):
                     daemon=True,
                     name="gui-bg-summary-recheck",
                 ).start()
+            # 闲时维护重新计时：空闲超过配置延时后跑水位线维护与压缩（默认开，
+            # config memory_compression.idle_maintenance_seconds = 0 关闭）
+            if not self._shutting_down:
+                try:
+                    idle_maintenance_service.on_turn_finished(
+                        session_name,
+                        notify=lambda kind, message: self.emit_event(
+                            "notice",
+                            {
+                                "message": _strip_ansi_markup(message),
+                                "session_name": session_name,
+                            },
+                        ),
+                    )
+                except Exception:
+                    pass
             # finally 末尾：补发排队中的用户消息（FIFO）。放在所有清理之后，
             # 保证补发回合的 turn_start 事件一定晚于本回合的终态事件到达前端
             self._drain_message_queue(session_name)
@@ -7418,108 +7428,87 @@ class ApiBridge(GitBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
-    # 内嵌终端（右侧面板）
-    # 仅执行用户在终端输入框里手动敲下的命令——模型/工具链路不经过这里，
+    # 内嵌交互式终端（底部面板，pywinpty/ConPTY 常驻 shell）
+    # 旧版右侧面板单命令终端（run/kill_terminal_command）已下线删除，
+    # 交互式终端能力由 pty_terminal_* 承载——模型/工具链路不经过这里，
     # 模型执行命令仍走 execute_command 工具的权限确认流程。
+    # 输出/退出经 emit_event（pty_data / pty_exit）进 _js_queue 派发。
     # ------------------------------------------------------------------
-    def run_terminal_command(self, command: str) -> Dict[str, Any]:
-        import subprocess
-        from core.command_shell import CommandShellError, build_command_invocation
+    def _emit_pty_exit(self, code) -> None:
+        if self._shutting_down:
+            return
+        try:
+            self.emit_event("pty_exit", {"code": int(code)})
+        except Exception:
+            logger.debug("推送终端退出事件失败", exc_info=True)
 
-        command = str(command or "").strip()
-        if not command:
-            return {"ok": False, "msg": "命令为空"}
+    def pty_terminal_ensure(self, cols=80, rows=24) -> Dict[str, Any]:
+        """确保存在一个存活的交互式终端会话；没有或已退出则新开一个。
 
-        with self._term_lock:
-            if self._term_proc is not None and self._term_proc.poll() is None:
-                return {"ok": False, "msg": "已有命令正在运行，请先等它结束或点击终止"}
+        以当前会话的 workdir 为起始目录；GLOBAL 自由对话按进程 cwd 兜底
+        （M19 同款处理，workdir 标记字符串不能直接当目录用）。
+        """
+        cols, rows = clamp_terminal_size(cols, rows)
+        with self._pty_lock:
+            session = self._pty_session
+            if session is not None and session.is_alive():
+                return {"ok": True, "pid": session.pid, "cwd": session.cwd, "reused": True}
             cwd = self._session_workdir(self._current_session)
             if cwd == "GLOBAL" or not os.path.isdir(cwd):
-                # M19：GLOBAL 自由对话的 workdir 只是归属标记字符串，直接当
-                # Popen cwd 必抛 FileNotFoundError；统一归一为进程 cwd
                 cwd = _resolve_real_path(os.getcwd())
             try:
-                invocation = build_command_invocation(command)
-                popen_kwargs = {
-                    "shell": invocation.use_system_shell,
-                    "cwd": cwd,
-                    "stdout": subprocess.PIPE,
-                    "stderr": subprocess.STDOUT,
-                    "stdin": subprocess.DEVNULL,
-                }
-                if invocation.executable:
-                    popen_kwargs["executable"] = invocation.executable
-                if os.name == "nt":
-                    popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-                else:
-                    # M20：独立进程组启动，终止时用 killpg 杀整棵子树，
-                    # 避免只 kill shell 父进程后子进程成孤儿
-                    popen_kwargs["start_new_session"] = True
-                proc = subprocess.Popen(invocation.argv, **popen_kwargs)
-            except CommandShellError as e:
-                return {"ok": False, "msg": f"命令解释器不可用: {e}"}
-            except Exception as e:
-                return {"ok": False, "msg": str(e)}
-            self._term_proc = proc
-
-        def _pump():
-            # 按行读取并小批量推送：逐行 evaluate_js 会在输出很密时拖垮 WebView
-            buf: List[str] = []
-            last_flush = time.monotonic()
-
-            def _flush():
-                nonlocal last_flush
-                if buf:
-                    self.emit_event("terminal_output", {"text": "".join(buf)})
-                    buf.clear()
-                last_flush = time.monotonic()
-
-            try:
-                for raw in iter(proc.stdout.readline, b""):
-                    try:
-                        line = raw.decode("utf-8")
-                    except UnicodeDecodeError:
-                        # Windows 下 cmd 内置命令常输出 GBK
-                        line = raw.decode("gbk", errors="replace")
-                    buf.append(line)
-                    if time.monotonic() - last_flush >= 0.08 or len(buf) >= 200:
-                        _flush()
-            except Exception:
-                logger.debug("终端输出读取中断", exc_info=True)
-            finally:
-                _flush()
-                try:
-                    rc = proc.wait(timeout=5)
-                except Exception:
-                    rc = -1
-                self.emit_event("terminal_finished", {"code": rc})
-
-        threading.Thread(target=_pump, daemon=True, name="gui-terminal-pump").start()
-        return {"ok": True, "cwd": cwd}
-
-    def kill_terminal_command(self) -> Dict[str, Any]:
-        import subprocess
-
-        with self._term_lock:
-            proc = self._term_proc
-        if proc is None or proc.poll() is not None:
-            return {"ok": False, "msg": "当前没有正在运行的命令"}
-        try:
-            if os.name == "nt":
-                # Windows 命令解释器会再派生子进程，必须 /T 杀掉整棵进程树
-                subprocess.run(
-                    ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                    capture_output=True,
-                    creationflags=subprocess.CREATE_NO_WINDOW,
+                session = create_pty_terminal(
+                    cwd=cwd,
+                    cols=cols,
+                    rows=rows,
+                    on_output=lambda text: self.emit_event("pty_data", {"text": text}),
+                    on_exit=self._emit_pty_exit,
                 )
-            else:
-                # M20：配合 Popen 的 start_new_session，杀整个进程组而不是
-                # 只 kill shell 父进程（子树否则成孤儿）
-                import signal
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+            except PtyTerminalError as e:
+                return {"ok": False, "msg": str(e)}
+            except Exception as e:
+                logger.exception("启动内嵌交互式终端失败")
+                return {"ok": False, "msg": str(e)}
+            self._pty_session = session
+            return {"ok": True, "pid": session.pid, "cwd": cwd, "reused": False}
+
+    def pty_terminal_write(self, data: str) -> Dict[str, Any]:
+        """把用户键入内容写进常驻 shell（xterm.js onData 原样字符串）。"""
+        data = str(data or "")
+        if not data:
+            return {"ok": False, "msg": "输入为空"}
+        with self._pty_lock:
+            session = self._pty_session
+        if session is None or not session.is_alive():
+            return {"ok": False, "msg": "终端未运行"}
+        try:
+            session.write(data)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def pty_terminal_resize(self, cols=80, rows=24) -> Dict[str, Any]:
+        """同步前端 xterm 视口尺寸到 ConPTY（面板拖拽/窗口缩放时调用）。"""
+        cols, rows = clamp_terminal_size(cols, rows)
+        with self._pty_lock:
+            session = self._pty_session
+        if session is None or not session.is_alive():
+            return {"ok": False, "msg": "终端未运行"}
+        try:
+            session.resize(cols, rows)
+            return {"ok": True}
+        except Exception as e:
+            return {"ok": False, "msg": str(e)}
+
+    def pty_terminal_kill(self) -> Dict[str, Any]:
+        """终止常驻 shell（下次 pty_terminal_ensure 会重新拉起）。"""
+        with self._pty_lock:
+            session = self._pty_session
+            self._pty_session = None
+        if session is None:
+            return {"ok": True, "msg": "终端未启动"}
+        try:
+            session.kill()
             return {"ok": True}
         except Exception as e:
             return {"ok": False, "msg": str(e)}

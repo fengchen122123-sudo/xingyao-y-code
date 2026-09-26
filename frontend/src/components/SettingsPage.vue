@@ -7,6 +7,7 @@
       <button data-test="token-statistics-nav" class="nav-item" :class="{ active: activeSection === 'tokens' }" @click="activeSection = 'tokens'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计</button>
       <button data-test="token-statistics-legacy-nav" class="nav-item" :class="{ active: activeSection === 'tokens-legacy' }" @click="activeSection = 'tokens-legacy'"><span class="nav-ico"><AppIcon name="chart" :size="14" /></span>Token 统计旧版</button>
       <button data-test="permission-nav" class="nav-item" :class="{ active: activeSection === 'permissions' }" @click="activeSection = 'permissions'"><span class="nav-ico"><AppIcon name="shield" :size="14" /></span>权限与沙盒</button>
+      <button data-test="hooks-nav" class="nav-item" :class="{ active: activeSection === 'hooks' }" @click="activeSection = 'hooks'"><span class="nav-ico"><AppIcon name="zap" :size="14" /></span>钩子 Hooks</button>
       <button data-test="appearance-nav" class="nav-item" :class="{ active: activeSection === 'appearance' }" @click="activeSection = 'appearance'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>外观与主题</button>
       <button data-test="system-settings-nav" class="nav-item" :class="{ active: activeSection === 'system' }" @click="activeSection = 'system'"><span class="nav-ico"><AppIcon name="settings" :size="14" /></span>系统设置</button>
       <button data-test="persona-nav" class="nav-item" :class="{ active: activeSection === 'persona' }" @click="activeSection = 'persona'"><span class="nav-ico"><AppIcon name="message-square-plus" :size="14" /></span>人设设置</button>
@@ -397,6 +398,16 @@
           </div>
         </section>
       </template>
+      <template v-else-if="activeSection === 'hooks'">
+        <header class="settings-header settings-header--narrow">
+          <div>
+            <h1>钩子 Hooks</h1>
+            <p>用户级与项目级生命周期钩子（支持手动配置，信任确认后生效）。</p>
+          </div>
+        </header>
+
+        <HooksSettings />
+      </template>
       <template v-else-if="activeSection === 'contact'">
         <header class="settings-header">
           <div>
@@ -643,6 +654,7 @@ import TokenUsageSettingsLegacy from './TokenUsageSettingsLegacy.vue';
 import GuiThemeSettings from './GuiThemeSettings.vue';
 import SystemSettings from './SystemSettings.vue';
 import PersonaSettings from './PersonaSettings.vue';
+import HooksSettings from './HooksSettings.vue';
 import { useIsMobile } from '../composables/useViewport';
 import qrcodeWechat from '../assets/qrcode-wechat.png';
 import qrcodeFeishu from '../assets/qrcode-feishu.png';
@@ -658,7 +670,7 @@ import { parseModelTestError, type ParsedModelError } from '../utils/errorParser
 const store = useAppStore();
 // 初始分区跟随 store.settingsSection（预览返回编辑器时跳到外观与主题）；
 // 组件常驻，返回编辑器时通过 watch 同步
-const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
+const activeSection = ref<'models' | 'tokens' | 'tokens-legacy' | 'permissions' | 'hooks' | 'appearance' | 'system' | 'persona' | 'about' | 'contact' | 'disclaimer'>(store.settingsSection);
 watch(() => store.settingsSection, (section) => { activeSection.value = section; });
 // ── 手机端钻取式布局（≤768px）────────────────────────────────
 // 桌面：分区侧栏 + 厂商列表 + 详情三栏并排（isMobile=false，模板不变）。

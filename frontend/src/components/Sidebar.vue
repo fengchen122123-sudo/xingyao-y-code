@@ -28,12 +28,6 @@
         <span class="mi-count">{{ enabledPluginCount }} / {{ store.plugins.length }}</span>
         <span class="mi-arrow">›</span>
       </div>
-      <div class="menu-item" @click="openHooks()">
-        <span class="mi-ico"><AppIcon name="zap" :size="15" /></span>
-        <span class="mi-label">钩子 Hooks</span>
-        <span class="mi-count">{{ store.hooks.length }}</span>
-        <span class="mi-arrow">›</span>
-      </div>
       <div class="menu-item" @click="openAutomations()">
         <span class="mi-ico"><AppIcon name="orbit" :size="15" /></span>
         <span class="mi-label">星轨</span>
@@ -1089,10 +1083,6 @@ function openMcp() {
 }
 function openPlugins() {
   store.openSubpage('plugins');
-  collapseSidebarIfMobile();
-}
-function openHooks() {
-  store.openSubpage('hooks');
   collapseSidebarIfMobile();
 }
 function openAutomations() {

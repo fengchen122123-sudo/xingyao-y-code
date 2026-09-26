@@ -177,10 +177,13 @@ def get_model_policy(
         return POLICY_REGISTRY["dashscope"]
 
     # 6. MiniMax
+    # 域名双认：api.minimaxi.com 为官方现行域名（与 model_catalog 预置一致），
+    # api.minimax.chat 为旧域名——老用户配置仍要能识别出 minimax 方言。
     if (
         "minimax" in m_lower
         or "abab" in m_lower
         or "api.minimax.chat" in base_lower
+        or "api.minimaxi.com" in base_lower
     ):
         return POLICY_REGISTRY["minimax"]
 

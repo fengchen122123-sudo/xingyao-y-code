@@ -308,39 +308,3 @@ def test_rename_session_snapshot_failure_returns_ok_without_sessions():
 
     assert res["ok"] is True and res["name"] == "新名"
     assert res["sessions"] is None
-
-
-def test_terminal_command_normalizes_global_workdir(monkeypatch, tmp_path):
-    """M19：GLOBAL 自由对话的内嵌终端不能把字符串 "GLOBAL" 当 Popen cwd。"""
-    import subprocess
-
-    bridge = _bare_gui_bridge()
-    bridge._current_session = "global-session"
-    bridge._term_proc = None
-    bridge._term_lock = __import__("threading").Lock()
-    bridge._session_workdir = lambda _session: "GLOBAL"
-    bridge.emit_event = lambda _kind, _data: None
-
-    monkeypatch.chdir(tmp_path)
-    captured = {}
-
-    class FakeProc:
-        def __init__(self):
-            self.stdout = type("Out", (), {"readline": lambda self: b""})()
-
-        def poll(self):
-            return None
-
-        def wait(self, timeout=None):
-            return 0
-
-    def fake_popen(command, **kwargs):
-        captured.update(kwargs)
-        return FakeProc()
-
-    monkeypatch.setattr(subprocess, "Popen", fake_popen)
-
-    res = bridge.run_terminal_command("echo hi")
-
-    assert res["ok"] is True
-    assert captured["cwd"] == gui_bridge._resolve_real_path(str(tmp_path))

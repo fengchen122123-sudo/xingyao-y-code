@@ -156,7 +156,6 @@ def _make_shutdown_bridge(manager):
     bridge._lan_server = None
     bridge._mcp = None
     bridge._js_queue = queue.Queue()
-    bridge.kill_terminal_command = lambda: None
     return bridge
 
 
