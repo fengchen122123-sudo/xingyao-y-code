@@ -33,7 +33,6 @@ def _isolate_route_state(monkeypatch):
     monkeypatch.setattr("core.model_manager.load_config", lambda: {})
     with dialects._qwen_cache_cfg_lock:
         dialects._keepalive_routes_cfg_cache["entry"] = None
-        dialects._deepseek_cache_routes_cfg_cache["entry"] = None
         dialects._qwen_cache_cfg_cache.clear()
     with dialects._affinity_disabled_lock:
         dialects._affinity_disabled_routes.clear()

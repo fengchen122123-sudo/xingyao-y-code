@@ -234,18 +234,9 @@ _keepalive_routes_cfg_cache = {"entry": None}
 # cache_keepalive_routes 同构：只新增显式通道，不改任何既有家族判定。
 _AFFINITY_LANES_CONFIG_KEY = "cache_affinity_lanes"
 
-# 顶层 deepseek_cache_routes：显式声明可安全启用 DeepSeek Prompt Ledger 与
-# tools 字母序的第三方网关（域名/子串列表）。官方路由之外默认不启用——
-# 账本语义（服务端按 2048 token 块匹配的磁盘前缀缓存）只在 DeepSeek 上游成立，
-# 挂载非 DeepSeek 模型的网关加进本配置只会白做规范化。判定逻辑与
-# cache_keepalive_routes 同构：只新增显式通道，不改任何官方路由判定。
-_DEEPSEEK_CACHE_ROUTES_CONFIG_KEY = "deepseek_cache_routes"
-
-# 条目格式：`{"entry": (过期时间, stamp, routes) | None}`。注意本缓存独立于
-# _keepalive_routes_cfg_cache——后者因保活证据门开关与亲和键白名单共用同一次
-# 配置读取，条目已扩为 5 元组，两者不共用条目。
-# 测试可直接把 entry 置 None 强制重读配置。
-_deepseek_cache_routes_cfg_cache = {"entry": None}
+# 历史备注：顶层 deepseek_cache_routes 配置键已废弃不再读取——is_deepseek_ledger_route
+# 改为纯模型家族判定（任意网关上的 deepseek 模型一律进账本），config.py 白名单
+# 保留该键仅为旧配置兼容（写入不再有任何效果）。
 
 # 缓存开关判定在一轮对话里会被反复触发（_qwen_cache_enabled / _supports_cache_control /
 # _supports_cache_keepalive / tools 规范化），而 load_config 每次都要读盘并解析整个
@@ -296,9 +287,6 @@ def _resolve_model_config(model_name, api_base="", model_cfg=None):
         # 同一份配置顺手缓存顶层 cache_keepalive_routes：同一轮里随后的
         # _supports_cache_keepalive 显式配置通道即可命中缓存，不再重复读盘
         _remember_keepalive_routes(data, stamp)
-        # 同一份配置也顺手缓存顶层 deepseek_cache_routes：随后 is_deepseek_ledger_route
-        # / _select_request_tools_for_route 的判定即可命中缓存，不再重复读盘
-        _remember_deepseek_cache_routes(data, stamp)
         m_str = str(model_name or "").strip()
         base_url = str(api_base or "").rstrip("/").lower()
         for provider in data.get("providers", []):
@@ -385,11 +373,6 @@ def _parse_keepalive_routes(data):
     return _parse_route_match_entries(data, _KEEPALIVE_ROUTES_CONFIG_KEY)
 
 
-def _parse_deepseek_cache_routes(data):
-    """从一份已加载的 config 中提取 deepseek_cache_routes 并逐条归一化。"""
-    return _parse_route_match_entries(data, _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY)
-
-
 def _parse_affinity_lanes(data):
     """从一份已加载的 config 中提取 cache_affinity_lanes 并逐条归一化。"""
     return _parse_route_match_entries(data, _AFFINITY_LANES_CONFIG_KEY)
@@ -452,41 +435,6 @@ def _keepalive_route_explicitly_enabled(api_base):
     return any(entry in host for entry in _configured_keepalive_routes())
 
 
-def _remember_deepseek_cache_routes(data, stamp):
-    """把顶层 deepseek_cache_routes 的解析结果按配置指纹写入缓存（重复读盘去重）。"""
-    if stamp is None:
-        return
-    routes = _parse_deepseek_cache_routes(data)
-    with _qwen_cache_cfg_lock:
-        _deepseek_cache_routes_cfg_cache["entry"] = (
-            time.monotonic() + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
-        )
-
-
-def _configured_deepseek_cache_routes():
-    """读取顶层 deepseek_cache_routes（域名/子串列表），带配置指纹缓存。"""
-    stamp = _qwen_cache_config_stamp()
-    now = time.monotonic()
-    if stamp is not None:
-        with _qwen_cache_cfg_lock:
-            cached = _deepseek_cache_routes_cfg_cache.get("entry")
-            if cached and cached[0] > now and cached[1] == stamp:
-                return cached[2]
-    routes = ()
-    try:
-        from core.model_manager import load_config
-
-        routes = _parse_deepseek_cache_routes(load_config())
-    except Exception:
-        pass
-    if stamp is not None:
-        with _qwen_cache_cfg_lock:
-            _deepseek_cache_routes_cfg_cache["entry"] = (
-                now + _QWEN_CACHE_CFG_TTL_SECONDS, stamp, routes,
-            )
-    return routes
-
-
 def _configured_affinity_lanes():
     """读取顶层 cache_affinity_lanes（域名/子串白名单），带配置指纹缓存。
 
@@ -522,20 +470,6 @@ def _affinity_lane_enabled(model_name, api_base):
     if not host:
         return False
     return any(entry in host for entry in _configured_affinity_lanes())
-
-
-def _is_cache_optimized_deepseek_route(api_base=""):
-    """DeepSeek 缓存优化路由 = 官方端点 ∨ 显式配置声明的 DeepSeek 上游网关。
-
-    归一化走 _normalize_route_match_key（去 scheme/端口/路径后的小写主机名），
-    用户写完整 URL 或裸域名都能命中；官方判定分支保持不变。
-    """
-    if _is_official_deepseek_route(api_base):
-        return True
-    host = _normalize_route_match_key(api_base)
-    if not host:
-        return False
-    return any(entry in host for entry in _configured_deepseek_cache_routes())
 
 
 def _glm_keepalive_thinking_locked(model_name):

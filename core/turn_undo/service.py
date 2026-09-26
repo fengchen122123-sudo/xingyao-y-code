@@ -204,22 +204,6 @@ def finish_background_task_turn(ctx, *, reason: str = "") -> Optional[TurnUndoSt
     return finish_turn(ctx, aborted=bool(reason), reason=reason)
 
 
-def assert_turn_recording(session_id: int, turn_id: str) -> None:
-    """工作区锁内判定活跃状态用：检查点必须存在且处于 recording。"""
-    storage = get_default_storage()
-    checkpoint = storage.get_checkpoint_by_turn(session_id, turn_id)
-    if checkpoint is None:
-        raise TurnUndoError(
-            UndoErrorCode.CHECKPOINT_NOT_FOUND,
-            f"回合检查点不存在: {turn_id}",
-        )
-    if checkpoint.status_enum is not TurnUndoStatus.RECORDING:
-        raise TurnUndoError(
-            UndoErrorCode.CHECKPOINT_CLOSED,
-            f"回合检查点已封闭: {turn_id}",
-        )
-
-
 # ---------------------------------------------------------------------------
 # 规格 19 公共 API（GUI / CLI / 模型工具共用）
 # ---------------------------------------------------------------------------

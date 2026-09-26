@@ -292,11 +292,6 @@ def _initial_gui_theme() -> dict:
     }
 
 
-def _initial_theme_light() -> bool:
-    """Compatibility helper retained for callers from the boolean-theme release."""
-    return _initial_gui_theme()["appearance"] == "light"
-
-
 def _build_gui_theme_fragment(gui_theme: dict) -> str:
     fragment = (
         f"theme={gui_theme['appearance']}"
@@ -498,7 +493,9 @@ def _create_main_window(api, url: str, gui_theme: dict):
         title="星瑶Code · 星瑶",
         url=url,
         js_api=api,
-        width=1320,
+        # 默认宽度演变：初版 1320 → 缩 15%（1122，缓解宽屏下对话行过长）→
+        # 回调 5%（1178）；用户可随时拖拽调节，高度与最小尺寸不变
+        width=1178,
         height=840,
         min_size=(960, 640),
         text_select=True,

@@ -76,8 +76,14 @@ def _journal_rows(zip_path):
 
 
 @pytest.fixture
-def manager(tmp_path):
-    """独立 MemoryManager，含一个会话与一条 turn/step/event 轨迹。"""
+def manager(tmp_path, monkeypatch):
+    """独立 MemoryManager，含一个会话与一条 turn/step/event 轨迹。
+
+    必须清掉 app_context._context：全量套件里其它测试模块在收集期 import main，
+    main 注册的 _CLIContext.manager 是只读 property（指向 main 的模块级空库），
+    且 ctx 优先级高于 set_manager 的 fallback——不清掉的话 get_manager() 会
+    返回 main 的 manager，导出的 journal 恒为空（全量跑 3 连失败的根因）。
+    """
     manager = MemoryManager(str(tmp_path / "trace.db"))
     manager.create_session_explicit("s1")
     journal = HarnessJournal(manager, "owner-trace", clock_ms=lambda: 10_000)
@@ -92,6 +98,7 @@ def manager(tmp_path):
             call_ordinal=0,
         ),
     )
+    monkeypatch.setattr(app_context, "_context", None)
     app_context.set_manager(manager)
     yield manager
     manager.close()

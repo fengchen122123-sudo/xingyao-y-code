@@ -114,6 +114,23 @@ describe('SettingsPage', () => {
     expect(wrapper.get('[data-test="system-settings-page"]').isVisible()).toBe(true);
   });
 
+  it('opens the hooks page from settings navigation and refreshes the list', async () => {
+    const store = useAppStore();
+    const refreshSpy = vi.spyOn(store, 'refreshHooks').mockResolvedValue(undefined);
+    const wrapper = mount(SettingsPage);
+
+    // 默认落在模型配置分区，钩子分区未挂载
+    expect(wrapper.find('[data-test="hook-new-btn"]').exists()).toBe(false);
+    expect(refreshSpy).not.toHaveBeenCalled();
+
+    await wrapper.get('[data-test="hooks-nav"]').trigger('click');
+
+    expect(wrapper.text()).toContain('钩子 Hooks');
+    expect(wrapper.get('[data-test="hook-new-btn"]').isVisible()).toBe(true);
+    // 进入钩子分区挂载组件时自动刷新一次列表
+    expect(refreshSpy).toHaveBeenCalledTimes(1);
+  });
+
   it('opens a model editor with the multimodal choice', async () => {
     const wrapper = mount(SettingsPage);
 

@@ -550,7 +550,9 @@ def _resolve_endpoint_and_headers(
         elif kind == "dashscope":
             url = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
         elif kind == "minimax":
-            url = "https://api.minimax.chat/v1/text/chatcompletion_v2"
+            # 兜底 URL 用官方现行域名（与 model_catalog 预置一致；旧域名
+            # api.minimax.chat 仍可被 llm_policy 识别，但不再作为默认）
+            url = "https://api.minimaxi.com/v1/text/chatcompletion_v2"
         else:
             url = "https://api.openai.com/v1/chat/completions"
 

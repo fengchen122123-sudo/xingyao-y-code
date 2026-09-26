@@ -452,9 +452,11 @@ KNOWN_CONFIG_KEYS = frozenset({
     # 本任务新增：严格模式开关
     "strict_config",
     # 缓存路由显式配置（core/route_overrides.py CONFIG_KEY、core/llm_dialects.py
-    # _KEEPALIVE_ROUTES_CONFIG_KEY / _DEEPSEEK_CACHE_ROUTES_CONFIG_KEY）、保活
+    # _KEEPALIVE_ROUTES_CONFIG_KEY）、保活
     # 证据门开关（_KEEPALIVE_EVIDENCE_GATE_CONFIG_KEY）与 prompt_cache_key
-    # 白名单（_AFFINITY_LANES_CONFIG_KEY）
+    # 白名单（_AFFINITY_LANES_CONFIG_KEY）。
+    # deepseek_cache_routes：已废弃不再读取（ledger 改纯模型家族判定），保留
+    # 键仅为旧 config.json 兼容（写入无任何效果，不会触发未知键告警）。
     "route_request_overrides", "cache_keepalive_routes", "deepseek_cache_routes",
     "cache_keepalive_evidence_gate", "cache_affinity_lanes",
 })
