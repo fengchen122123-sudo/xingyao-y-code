@@ -669,6 +669,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 仅由顶栏“切换面板”按钮或底栏 Git 分支项手动展开；
     // 展开状态不持久化，每次启动都从收起开始
     rightPanelCollapsed: true,
+    // “打开标签页”选择页可见性：顶栏按钮等中性入口展开面板时先选择要看的内容，
+    // 底栏 Git 分支项等定向入口经 expandRightPanelDirect 跳过（不持久化）
+    rightPanelPicker: false,
     // 桌面端左右面板宽度（px）：拖拽手柄实时更新，启动时从 localStorage 恢复；
     // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
     sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
@@ -717,6 +720,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 计划、后台任务、Token 用量
     planData: { title: '', items: [], progress: 0 } as PlanData,
     backgroundTasks: [] as BackgroundTask[],
+    // 右面板“后台任务”详情：当前查看的任务 id 与打开 nonce（执行条“详情”触发）
+    bgTaskDetailId: '',
+    bgTaskOpenNonce: 0,
     subagentTasks: [] as SubagentTaskSnapshot[],
     tokenUsage: emptyTokenUsage(),
     tokenStatistics: null as TokenStatisticsSnapshot | null,
@@ -1172,8 +1178,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.sidebarCollapsed = !this.sidebarCollapsed;
     },
 
+    // 顶栏“切换面板”按钮等中性入口：展开先显示“打开标签页”选择页，收起即离开
     toggleRightPanel() {
       this.rightPanelCollapsed = !this.rightPanelCollapsed;
+      this.rightPanelPicker = !this.rightPanelCollapsed;
+    },
+
+    // 定向入口（底栏 Git 分支项、输入框/空态 Git chip）：直达对应页签不经选择页；
+    // 面板已展开且停在选择页时也负责切走
+    expandRightPanelDirect() {
+      this.rightPanelCollapsed = false;
+      this.rightPanelPicker = false;
     },
 
     // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
@@ -5115,6 +5130,25 @@ navItems: [] as Array<{ id: number; preview: string }>,
       const busyTurns = this.running || this.runningSessions.length > 0;
       const busyTasks = Array.isArray(this.backgroundTasks) && this.backgroundTasks.some(t => t.status === 'running');
       return busyTurns || busyTasks;
+    },
+
+    // 后台任务快照（list_active_tasks 只返回 running 项）：任务对话框打开、
+    // 应用启动等时机调用；桥未就绪（浏览器开发态）时静默保留上次快照
+    async refreshBackgroundTasks() {
+      if (!(window.pywebview && window.pywebview.api)) return;
+      try {
+        const list = await window.pywebview.api.get_background_tasks();
+        // list_active_tasks 只返回 running 任务且字段为 duration/pid：统一归一为
+        // 前端展示字段（status 恒为 running，running_time 取 duration）
+        this.backgroundTasks = (Array.isArray(list) ? list : []).map((t: any) => ({
+          task_id: String(t?.task_id ?? ''),
+          command: String(t?.command ?? ''),
+          status: 'running',
+          running_time: String(t?.duration ?? '') || '活跃',
+        }));
+      } catch {
+        // 拉取失败保留上次快照，不打断界面
+      }
     },
 
     async checkUpdate(manual: boolean = false) {

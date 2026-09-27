@@ -7,107 +7,36 @@
     @mouseenter="computerPanelHovered = true"
     @mouseleave="computerPanelHovered = false"
   >
-    <div id="right-tabs">
-      <button
-        v-for="tab in tabs"
-        :key="tab.id"
-        class="rtab"
-        :class="{ active: activeTab === tab.id }"
-        @click="activeTab = tab.id"
-      >
-        {{ tab.label }}
-        <span v-if="tab.id === 'plan' && store.planData.items.length > 0" class="badge-dot"></span>
-        <span
-          v-if="tab.closable"
-          class="rtab-close"
-          data-test="computer-tab-close"
-          title="关闭操控面板"
-          aria-label="关闭操控面板"
-          @click.stop="dismissComputerPane()"
-        >
-          <AppIcon name="x" :size="11" :stroke-width="2.5" />
-        </span>
+    <!-- 工作台头部：替代原页签栏，承载当前工作台标题与返回选择页入口 -->
+    <div v-if="!store.rightPanelPicker" class="pane-head">
+      <span class="pane-title" data-test="pane-title">{{ activePaneLabel }}</span>
+      <button class="pane-close" data-test="pane-close" title="返回标签选择" aria-label="返回标签选择" @click="closePaneToPicker()">
+        <AppIcon name="x" :size="13" :stroke-width="2" />
       </button>
     </div>
 
     <div id="right-content">
-      <!-- 计划面板 -->
-      <div v-show="activeTab === 'plan'" class="rpane active">
-        <div class="progress-line">
-          <span>{{ store.planData.title || '任务计划' }}</span>
-          <span style="color:var(--accent);font-weight:600">{{ store.planData.progress }}%</span>
-        </div>
-        <div class="progress-bar"><i :style="{ width: store.planData.progress + '%' }"></i></div>
-
-        <div v-if="!store.planData.items || store.planData.items.length === 0" style="color:var(--text-faint);font-size:12px;padding:12px 0">
-          暂无活动计划。当{{ store.agentName }}编排复杂大任务时，计划全景会自动在此呈现。
-        </div>
-
-        <div v-else class="plan-list">
-          <div
-            v-for="item in store.planData.items"
-            :key="item.id"
-            class="plan-item-row"
-            :class="item.status"
+      <!-- 打开标签页选择页（ZCode 式侧板）：顶栏按钮等中性入口展开面板时
+           先选择要看的内容，页签栏保留随时可切；定向入口经
+           expandRightPanelDirect 跳过本页 -->
+      <div v-if="store.rightPanelPicker" class="tab-picker" data-test="tab-picker">
+        <h3 class="tp-title">打开标签页</h3>
+        <p class="tp-sub">选择要在侧边面板中打开的标签。</p>
+        <div class="tp-cards">
+          <button
+            v-for="card in pickerCards"
+            :key="card.id"
+            class="tp-card"
+            :data-test="'picker-card-' + card.id"
+            @click="openPicked(card.id)"
           >
-            <span class="p-status-ico">
-              <AppIcon
-                :name="item.status === 'done' ? 'check' : (item.status === 'in_progress' ? 'refresh' : 'circle')"
-                :size="12"
-                :stroke-width="2"
-                :class="{ 'icon-spin': item.status === 'in_progress' }"
-              />
-            </span>
-            <span class="p-text">{{ item.handoff_note || item.text }}</span>
-          </div>
+            <AppIcon :name="card.icon" :size="15" :stroke-width="2" />
+            <span>{{ card.label }}</span>
+          </button>
         </div>
       </div>
 
-      <!-- 后台任务 -->
-      <div v-show="activeTab === 'tasks'" class="rpane active">
-        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)">
-          <span style="font-size:12px;color:var(--text-dim);font-weight:600">后台运行任务</span>
-          <button class="chip-btn" style="font-size:11.5px;padding:3px 9px" title="刷新后台任务列表" @click="refreshTasks"><AppIcon name="refresh" :size="12" /> 刷新</button>
-        </div>
-
-        <div v-if="(!store.backgroundTasks || store.backgroundTasks.length === 0) && (!store.subagentTasks || store.subagentTasks.length === 0)" style="color:var(--text-faint);font-size:12px;padding:12px 0">
-          暂无后台活跃任务
-        </div>
-
-        <!-- 子代理任务（run_subagent 后台/前台任务） -->
-        <div v-if="store.subagentTasks && store.subagentTasks.length" class="task-section">
-          <div class="task-section-label">子代理任务</div>
-          <div v-for="t in store.subagentTasks" :key="t.id" class="task-card">
-            <div class="tc-top">
-              <span class="tc-cmd">{{ t.description || t.id }}</span>
-              <span class="tc-status">{{ t.status || '运行中' }}</span>
-            </div>
-            <div class="tc-foot">
-              <span>{{ t.stage || '' }}{{ t.stage_detail ? ' · ' + t.stage_detail : '' }}</span>
-              <span v-if="t.elapsed">{{ t.elapsed }}s</span>
-            </div>
-          </div>
-        </div>
-
-        <div v-if="store.backgroundTasks && store.backgroundTasks.length" class="task-section">
-          <div class="task-section-label">后台运行任务</div>
-          <div class="task-list">
-            <div v-for="t in store.backgroundTasks" :key="t.task_id" class="task-card">
-              <div class="tc-top">
-                <span class="tc-cmd">{{ t.command || t.task_id }}</span>
-                <span class="tc-status">{{ t.status || '运行中' }}</span>
-              </div>
-              <div class="tc-foot">
-                <span style="font-size:11px;color:var(--text-faint)">{{ t.running_time || '活跃' }}</span>
-                <button class="chip-btn danger" style="font-size:11px;padding:2px 7px" title="终止该后台任务" @click="killTask(t.task_id)">终止</button>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- 内嵌终端已下线：交互式终端改由顶栏按钮唤起的底部面板承载 -->
-
+      <template v-else>
       <!-- 文件树面板 -->
       <div v-show="activeTab === 'files'" class="rpane active">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border)">
@@ -138,10 +67,28 @@
         <GitPanel />
       </div>
 
-      <!-- 电脑操控面板（设计 16.2）：出现过 run 后动态追加的“操控”页签内容 -->
-      <div v-show="activeTab === 'computer'" class="rpane active" data-test="computer-pane">
+      <!-- 电脑操控面板（设计 16.2）：出现过 run 后自动切入的“操控”工作台 -->
+      <div v-show="activeTab === 'computer' && !!store.computerRun.run_id" class="rpane active" data-test="computer-pane">
         <ComputerControlPane />
       </div>
+
+      <!-- 浏览器工作台：承载电脑操控的浏览器实时画面与状态轨迹，
+           无操控会话时与操控页签共用同一引导态 -->
+      <div v-show="activeTab === 'browser'" class="rpane active" data-test="browser-pane">
+        <ComputerControlPane />
+      </div>
+
+      <!-- 后台任务执行过程：底部执行条“详情”触发，2 秒轮询日志尾部 -->
+      <div v-show="activeTab === 'tasks'" class="rpane active" data-test="bg-task-pane">
+        <div class="bgt-wrap">
+          <div class="bgt-head">
+            <span class="bgt-cmd" :title="detailCommand">{{ detailCommand }}</span>
+            <span class="bgt-state" :class="{ done: !detailRunning }">{{ detailRunning ? '运行中' : '已结束' }}</span>
+          </div>
+          <pre ref="bgtLogRef" class="bgt-log" data-test="bg-task-log">{{ detailOutput || (detailRunning ? '正在读取任务输出…' : '未找到任务输出。') }}</pre>
+        </div>
+      </div>
+      </template>
     </div>
 
     <!-- 文件预览弹窗：Teleport 到 body——右栏分区带 isolation 分层，
@@ -174,7 +121,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, watch, onMounted, onUnmounted } from 'vue';
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
@@ -184,7 +131,7 @@ import { useGitStore } from '../stores/gitStore';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
 
-type TabType = 'plan' | 'tasks' | 'files' | 'git' | 'computer';
+type TabType = 'files' | 'git' | 'browser' | 'tasks' | 'computer';
 
 const store = useAppStore();
 
@@ -197,35 +144,50 @@ const panelStyle = computed(() => {
   if (store.rightPanelCollapsed) style.marginRight = `-${store.rightPanelWidth}px`;
   return style;
 });
-const activeTab = ref<TabType>('plan');
+const activeTab = ref<TabType>('files');
 
-// 既有四个页签静态定义；“操控”页签只在出现过电脑操控 run 后动态追加
-// （设计 16.2），避免给从未使用操控的用户增加常驻页签
-const baseTabs: Array<{ id: TabType; label: string }> = [
-  { id: 'plan', label: '计划' },
-  { id: 'tasks', label: '任务' },
-  { id: 'files', label: '文件' },
-  { id: 'git', label: 'Git' }
+// 选择页三张卡（对齐 ZCode 官方侧板）：文件 / Git / 浏览器；
+// “操控”不进选择页，只在出现过电脑操控 run 后自动切入（设计 16.2）
+const pickerCards: Array<{ id: TabType; label: string; icon: string }> = [
+  { id: 'files', label: '文件', icon: 'folder' },
+  { id: 'git', label: 'Git', icon: 'git-branch' },
+  { id: 'browser', label: '浏览器', icon: 'globe' }
 ];
-const tabs = computed<Array<{ id: TabType; label: string; closable?: boolean }>>(() => (
-  store.computerRun.run_id
-    ? [...baseTabs, { id: 'computer', label: '操控', closable: store.computerRunTerminal }]
-    : baseTabs
-));
 
-// run 开始时首次自动切到操控页签（设计 16.2）：每个 run 只开一次（记录到
-// computerLastAutoOpenedRunId），用户随后手动切走不抢回，新 run 再开一次；
+const PANE_LABELS: Record<TabType, string> = {
+  files: '文件',
+  git: 'Git',
+  browser: '浏览器',
+  tasks: '后台任务',
+  computer: '操控'
+};
+const activePaneLabel = computed(() => PANE_LABELS[activeTab.value] || '');
+
+function openPicked(tab: TabType) {
+  activeTab.value = tab;
+  store.rightPanelPicker = false;
+  if (tab === 'files') maybeAutoRefreshFileTree();
+}
+
+// 工作台头部 ×：返回选择页（hub-and-spoke），不销毁工作台状态；
+// 操控 run 的停止走顶部安全条/自动收场
+function closePaneToPicker() {
+  store.rightPanelPicker = true;
+}
+// run 开始时首次自动切入操控工作台（设计 16.2）：每个 run 只开一次（记录到
+// computerLastAutoOpenedRunId），用户返回选择页不抢回，新 run 再开一次；
 // 挂载补跑覆盖“run 启动时右面板尚未挂载（如设置页打开中）”的场景
 function autoOpenComputerTabOnce() {
   const runId = store.computerRun.run_id;
   if (!runId || runId === store.computerLastAutoOpenedRunId) return;
   if (!store.computerControlBarVisible) return;
   store.computerLastAutoOpenedRunId = runId;
+  store.rightPanelPicker = false;
   activeTab.value = 'computer';
 }
 watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
 
-// 状态栏分支项点击 → 打开源代码管理页签（gitStore.panelOpenNonce 由 App.vue 触发）
+// 状态栏分支项点击 → 打开源代码管理工作台（gitStore.panelOpenNonce 由 App.vue 触发）
 const gitStore = useGitStore();
 watch(
   () => gitStore.panelOpenNonce,
@@ -234,6 +196,64 @@ watch(
       activeTab.value = 'git';
     }
   }
+);
+
+// 底部执行条“详情” → 打开后台任务执行过程工作台（nonce 每次点击自增，
+// 同一任务重复点击也能从选择页/其他工作台切回）
+watch(
+  () => store.bgTaskOpenNonce,
+  () => {
+    if (store.bgTaskOpenNonce > 0 && store.bgTaskDetailId) {
+      store.rightPanelPicker = false;
+      activeTab.value = 'tasks';
+    }
+  }
+);
+
+// ── 后台任务执行过程：2 秒轮询日志尾部，跟随滚动到底 ──
+const detailOutput = ref('');
+const bgtLogRef = ref<HTMLElement | null>(null);
+const detailCommand = computed(
+  () => store.backgroundTasks.find(t => t.task_id === store.bgTaskDetailId)?.command || store.bgTaskDetailId
+);
+const detailRunning = computed(() =>
+  store.backgroundTasks.some(t => t.task_id === store.bgTaskDetailId)
+);
+
+let bgtTimer: ReturnType<typeof setInterval> | undefined;
+let bgtInFlight = false;
+async function fetchTaskOutput() {
+  const id = store.bgTaskDetailId;
+  if (!id || !(window.pywebview && window.pywebview.api) || bgtInFlight) return;
+  bgtInFlight = true;
+  try {
+    const res = await window.pywebview.api.get_background_task_output(id, 200);
+    if (store.bgTaskDetailId === id && res?.ok) {
+      const el = bgtLogRef.value;
+      const follow = !el || (el.scrollHeight - el.scrollTop - el.clientHeight < 30);
+      detailOutput.value = String(res.output || '');
+      await nextTick();
+      if (follow && bgtLogRef.value) bgtLogRef.value.scrollTop = bgtLogRef.value.scrollHeight;
+    }
+  } catch { /* 桥未就绪/单次失败：保留下次轮询 */ }
+  finally { bgtInFlight = false; }
+}
+function stopTaskOutputPolling() {
+  if (bgtTimer !== undefined) {
+    clearInterval(bgtTimer);
+    bgtTimer = undefined;
+  }
+}
+watch(
+  () => [activeTab.value, store.bgTaskDetailId] as const,
+  ([tab, id]) => {
+    stopTaskOutputPolling();
+    detailOutput.value = '';
+    if (tab === 'tasks' && id) {
+      void fetchTaskOutput();
+      bgtTimer = setInterval(() => { void fetchTaskOutput(); }, 2000);
+    }
+  },
 );
 
 // ── 操控页签关闭（2026-09-10 设计）──
@@ -253,18 +273,18 @@ function dismissComputerPane() {
   clearComputerDismissTimer();
   if (!store.computerRun.run_id) return;
   store.clearComputerRun();
-  // 面板折叠时 activeTab 可能仍停在 computer，页签消失后必须回退
-  if (activeTab.value === 'computer') activeTab.value = 'plan';
+  // 停在操控工作台时 run 消失后无内容可看，回退到选择页
+  if (activeTab.value === 'computer') store.rightPanelPicker = true;
 }
 
-// 终态起算 60 秒：到点若用户仍在看（停在操控页签且未折叠，或鼠标悬停在面板内）
-// 则顺延一个周期，否则关闭。「在看就不关」是唯一规则
+// 终态起算 60 秒：到点若用户仍在看（停在操控工作台且未折叠、未返回选择页，
+// 或鼠标悬停在面板内）则顺延一个周期，否则关闭。「在看就不关」是唯一规则
 function scheduleComputerAutoDismiss() {
   clearComputerDismissTimer();
   if (!store.computerRun.run_id || !store.computerRunTerminal) return;
   computerDismissTimer = setTimeout(() => {
     computerDismissTimer = null;
-    const stillWatching = (activeTab.value === 'computer' && !store.rightPanelCollapsed)
+    const stillWatching = (activeTab.value === 'computer' && !store.rightPanelPicker && !store.rightPanelCollapsed)
       || computerPanelHovered.value;
     if (stillWatching) {
       scheduleComputerAutoDismiss();
@@ -358,34 +378,7 @@ const highlightedPreview = computed(() => {
   return escapeHtml(content);
 });
 
-async function refreshTasks() {
-  if (window.pywebview && window.pywebview.api) {
-    try {
-      const list = await window.pywebview.api.get_background_tasks();
-      store.backgroundTasks = list || [];
-    } catch (e) {
-      store.notifyModal('后台任务', '刷新后台任务失败: ' + e);
-    }
-  }
-}
-
-async function killTask(id: string) {
-  if (window.pywebview && window.pywebview.api) {
-    try {
-      const res = await window.pywebview.api.kill_task(id);
-      if (!res || !res.ok) {
-        store.notifyModal('后台任务', res?.msg ? `终止任务失败: ${res.msg}` : '终止任务失败');
-      } else {
-        store.notifyModal('后台任务', res.msg ? `${res.msg}: ${id}` : '已请求终止后台任务: ' + id);
-      }
-    } catch (e) {
-      store.notifyModal('后台任务', '终止任务失败: ' + e);
-    }
-    await refreshTasks();
-  }
-}
-
-// 文件树自动刷新：切到“文件”页签或窗口重新聚焦时触发（节流 2 秒），
+// 文件树自动刷新：进入“文件”工作台或窗口重新聚焦时触发（节流 2 秒），
 // 覆盖“用户在外部文件夹里新增/删除了文件再回来看”的场景；也可点 ↻ 手动刷新
 let lastFileTreeAutoRefresh = 0;
 function maybeAutoRefreshFileTree() {
@@ -394,8 +387,8 @@ function maybeAutoRefreshFileTree() {
   lastFileTreeAutoRefresh = now;
   if (store.workdir) void store.refreshFileTree();
 }
-// 切到操控页签时校准 run 快照（设计 16.4）：_js_queue 满时允许丢新事件，
-// 进入页签即用 get_computer_control_status() 复核终态
+// 进入操控工作台时校准 run 快照（设计 16.4）：_js_queue 满时允许丢新事件，
+// 进入工作台即用 get_computer_control_status() 复核终态
 watch(activeTab, (t) => {
   if (t === 'files') maybeAutoRefreshFileTree();
   if (t === 'computer' && store.computerRun.run_id) void store.refreshComputerRun();
@@ -403,8 +396,7 @@ watch(activeTab, (t) => {
 const onWindowFocus = () => { if (activeTab.value === 'files') maybeAutoRefreshFileTree(); };
 
 onMounted(() => {
-  refreshTasks();
-  // 挂载补跑一次自动开页签（run 启动时右面板可能尚未挂载，见函数注释）
+  // 挂载补跑一次自动开工作台（run 启动时右面板可能尚未挂载，见函数注释）
   autoOpenComputerTabOnce();
   window.addEventListener('focus', onWindowFocus);
 });
@@ -412,6 +404,7 @@ onMounted(() => {
 onUnmounted(() => {
   window.removeEventListener('focus', onWindowFocus);
   clearComputerDismissTimer();
+  stopTaskOutputPolling();
 });
 </script>
 
@@ -427,55 +420,34 @@ onUnmounted(() => {
 #rightbar.collapsed {
   margin-right: -330px;
 }
-#right-tabs {
+/* 工作台头部：标题 + 返回选择页 */
+.pane-head {
   display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
 }
-.rtab {
-  flex: 1;
-  padding: 9px 0;
-  text-align: center;
+.pane-title {
   font-size: 12.5px;
+  font-weight: 600;
   color: var(--text-dim);
-  cursor: pointer;
-  border-bottom: 2px solid transparent;
-  background: none;
-  border-top: none;
-  border-left: none;
-  border-right: none;
-  transition: 0.15s;
-  position: relative;
 }
-.rtab:hover {
-  color: var(--text);
-}
-.rtab.active {
-  color: var(--accent);
-  border-bottom-color: var(--accent);
-}
-.badge-dot {
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--accent);
-  position: absolute;
-  top: 5px;
-  right: 7px;
-}
-.rtab-close {
+.pane-close {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
-  margin-left: 5px;
-  border-radius: 4px;
+  width: 22px;
+  height: 22px;
+  border-radius: 5px;
+  border: none;
+  background: none;
   color: var(--text-faint);
   cursor: pointer;
   transition: 0.15s;
 }
-.rtab-close:hover {
+.pane-close:hover {
   background: var(--bg3);
   color: var(--text);
 }
@@ -485,6 +457,49 @@ onUnmounted(() => {
 @keyframes rp-icon-spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+
+/* 打开标签页选择页（ZCode 式侧板）：标题居中 + 三张竖排大卡 */
+.tab-picker {
+  padding: 40px 6px 20px;
+  text-align: center;
+}
+.tp-title {
+  margin: 0 0 6px;
+  font-size: 16.5px;
+  font-weight: 700;
+  color: var(--text);
+}
+.tp-sub {
+  margin: 0 0 24px;
+  font-size: 12.5px;
+  color: var(--text-faint);
+}
+.tp-cards {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.tp-card {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 13px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.tp-card:hover {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
 }
 
 #right-content {
@@ -505,109 +520,6 @@ onUnmounted(() => {
   display: block;
 }
 
-.progress-line {
-  display: flex;
-  justify-content: space-between;
-  font-size: 13px;
-  margin-bottom: 8px;
-  font-weight: 600;
-}
-.progress-bar {
-  height: 6px;
-  background: var(--bg3);
-  border-radius: 99px;
-  overflow: hidden;
-  margin-bottom: 14px;
-}
-.progress-bar i {
-  display: block;
-  height: 100%;
-  background: var(--accent);
-  transition: width 0.3s ease;
-}
-
-.plan-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.plan-item-row {
-  display: flex;
-  align-items: flex-start;
-  gap: 8px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  font-size: 12.5px;
-  line-height: 1.5;
-}
-.plan-item-row.done {
-  border-color: rgba(63, 185, 80, 0.3);
-  background: rgba(63, 185, 80, 0.05);
-}
-.p-status-ico {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-}
-.plan-item-row.done .p-status-ico {
-  color: var(--green);
-}
-.plan-item-row.done .p-text {
-  text-decoration: line-through;
-  color: var(--text-faint);
-}
-.plan-item-row.in_progress {
-  border-color: var(--accent);
-  background: rgba(88, 166, 255, 0.08);
-}
-.plan-item-row.in_progress .p-status-ico {
-  color: var(--accent);
-}
-.plan-item-row.in_progress .p-text {
-  color: var(--text);
-  font-weight: 600;
-}
-.plan-item-row.todo {
-  color: var(--text-dim);
-}
-
-.task-list {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
-.task-section { margin-bottom: 12px; }
-.task-section-label { padding: 4px 0 8px; color: var(--text-faint); font-size: 11px; font-weight: 600; }
-.task-card {
-  background: var(--bg2);
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 9px 12px;
-}
-.tc-top {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  margin-bottom: 6px;
-}
-.tc-cmd {
-  font-family: var(--mono);
-  font-size: 12px;
-  color: var(--text);
-  font-weight: 600;
-}
-.tc-status {
-  font-size: 11px;
-  color: var(--green);
-}
-.tc-foot {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-}
-
 .chip-btn {
   background: var(--bg3);
   border: 1px solid var(--border);
@@ -622,12 +534,51 @@ onUnmounted(() => {
   border-color: var(--text-faint);
   color: var(--text);
 }
-.chip-btn.danger {
-  color: var(--red);
+
+/* 后台任务执行过程 */
+.bgt-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
-.chip-btn.danger:hover {
-  background: rgba(248, 81, 73, 0.15);
-  border-color: var(--red);
+.bgt-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.bgt-cmd {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bgt-state {
+  flex-shrink: 0;
+  font-size: 11px;
+  color: var(--green);
+}
+.bgt-state.done {
+  color: var(--text-faint);
+}
+.bgt-log {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--text-dim);
+  max-height: calc(100vh - 220px);
+  overflow-y: auto;
 }
 
 /* 文件预览弹窗 */

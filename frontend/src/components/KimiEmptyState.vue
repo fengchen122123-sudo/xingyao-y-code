@@ -171,7 +171,7 @@ const gitBranchLabel = computed(() => {
 });
 function openGitPanel() {
   gitStore.requestOpenPanel();
-  if (store.rightPanelCollapsed) store.toggleRightPanel();
+  store.expandRightPanelDirect();
 }
 const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',
