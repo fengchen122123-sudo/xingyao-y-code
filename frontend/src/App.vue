@@ -64,6 +64,20 @@
           <span class="crumb">会话 / <b>{{ store.currentSessionDisplayName }}</b></span>
           <span class="top-spacer"></span>
 
+          <!-- 计划入口：星瑶创建了任务计划时显示；悬浮面板锚定在按钮下方，不遮全屏 -->
+          <div v-if="taskEntry.visible" class="plan-entry-wrap">
+            <button
+              class="chip-btn task-entry"
+              data-test="task-entry"
+              title="查看任务计划执行进度"
+              @click.stop="taskDialogOpen = !taskDialogOpen"
+            >
+              <AppIcon name="loader" :size="12" :stroke-width="2" :class="{ 'task-entry-spin': taskEntry.activeCount > 0 }" /> 计划
+              <span v-if="taskEntry.activeCount > 0" class="task-entry-badge" data-test="task-entry-badge">{{ taskEntry.activeCount }}</span>
+            </button>
+            <TaskProgressDialog v-if="taskDialogOpen" @close="taskDialogOpen = false" />
+          </div>
+
           <div class="export-wrap">
             <button class="chip-btn" title="导出会话" @click.stop="showExportMenu = !showExportMenu"><AppIcon name="download" :size="13" /> 导出</button>
             <div v-if="showExportMenu" class="export-menu" @click.stop>
@@ -167,6 +181,9 @@
           :sub-type="store.subpage.type"
           @close="store.closeSubpage()"
         />
+
+        <!-- 后台任务执行条：list_active_tasks 快照非空时出现，详情展开任务卡片 -->
+        <BackgroundTasksBar />
 
         <!-- 底部固定输入框：跟随中间对话栏宽度（存在消息时呈现） -->
         <InputArea v-if="store.messages && store.messages.length > 0" />
@@ -311,6 +328,9 @@ import ComputerControlBar from './components/ComputerControlBar.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
 import SessionSearchModal from './components/SessionSearchModal.vue';
+import TaskProgressDialog from './components/TaskProgressDialog.vue';
+import BackgroundTasksBar from './components/BackgroundTasksBar.vue';
+import { taskEntryState } from './utils/taskEntry';
 // 免责条款首次使用确认（合规链路）：未同意或条款升级后强制弹出，不同意则退出
 import DisclaimerGate from './components/DisclaimerGate.vue';
 import PermCard from './components/PermCard.vue';
@@ -397,13 +417,21 @@ function backToThemeEditor() {
 
 const showExportMenu = ref(false);
 
+// 会话头部“计划”入口 + 任务计划进度对话框：计划数据由 plan_updated 事件流
+// 实时驱动，入口只在存在计划时显示，角标统计进行中的计划条目
+const taskDialogOpen = ref(false);
+const taskEntry = computed(() => taskEntryState({ plan: store.planData }));
+
 async function doExport(fmt: 'md' | 'html' | 'json') {
   showExportMenu.value = false;
   await store.exportSession(fmt);
 }
 
-function closeExportMenu() {
+// 文档级点击统一收起头部悬浮层（导出菜单/计划面板）；按钮与面板内部
+// 用 @click.stop 挡泡，避免点开即关
+function closeHeaderPopovers() {
   showExportMenu.value = false;
+  taskDialogOpen.value = false;
 }
 
 const statusTokenPct = computed(() => {
@@ -423,7 +451,7 @@ const gitBranchText = computed(() => {
 function openGitPanel() {
   // 非 Git 项目点击不展开（面板内已有"非仓库"提示态），避免空操作困惑
   gitStore.requestOpenPanel();
-  if (store.rightPanelCollapsed) store.toggleRightPanel();
+  store.expandRightPanelDirect();
 }
 watch(
   () => store.workdir,
@@ -849,10 +877,18 @@ function onGlobalKeydown(e: KeyboardEvent) {
   }
 }
 
+let bgTaskPollTimer: number | undefined;
+
 onMounted(() => {
-  document.addEventListener('click', closeExportMenu);
+  document.addEventListener('click', closeHeaderPopovers);
   window.addEventListener('keydown', onGlobalKeydown);
   void syncInitialWindowMaximized();
+  // 启动拉一次后台任务快照，并每 5 秒轮询：底部执行条、关闭确认的
+  // hasActiveTasks 都依赖它保持新鲜（list_active_tasks 为进程内查询，开销极小）
+  void store.refreshBackgroundTasks();
+  bgTaskPollTimer = window.setInterval(() => {
+    void store.refreshBackgroundTasks();
+  }, 5000);
 
   // 窗口重新聚焦时校准电脑操控快照（设计 16.4）：_js_queue 满时允许丢新事件，
   // 终态不能只依赖事件推送，聚焦即用 get_computer_control_status() 复核
@@ -883,7 +919,8 @@ onMounted(() => {
   ensureBodyObserver();
 });
 onUnmounted(() => {
-  document.removeEventListener('click', closeExportMenu);
+  document.removeEventListener('click', closeHeaderPopovers);
+  clearInterval(bgTaskPollTimer);
   window.removeEventListener('keydown', onGlobalKeydown);
   window.removeEventListener('focus', onWindowFocusRecalibrateComputer);
   window.removeEventListener('pywebviewready', onPywebviewReady);
@@ -1260,6 +1297,35 @@ onUnmounted(() => {
 }
 .top-spacer {
   flex: 1;
+}
+
+/* 会话头部“计划”入口：进行中徽标 + 运行时旋转图标；悬浮面板锚定其下 */
+.plan-entry-wrap {
+  position: relative;
+}
+.task-entry {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.task-entry-badge {
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: 99px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 10.5px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+}
+@keyframes task-entry-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.task-entry .task-entry-spin {
+  animation: task-entry-spin 0.9s linear infinite;
 }
 
 .chat-viewport {

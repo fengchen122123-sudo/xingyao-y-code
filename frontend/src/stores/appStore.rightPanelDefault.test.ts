@@ -15,3 +15,22 @@ it('右侧面板默认收起，展开需手动触发', () => {
   store.toggleRightPanel();
   expect(store.rightPanelCollapsed).toBe(true);
 });
+
+it('中性展开先显示“打开标签页”选择页，定向展开跳过；收起即离开', () => {
+  const store = useAppStore();
+  store.toggleRightPanel();
+  expect(store.rightPanelPicker).toBe(true);
+
+  // 定向入口（Git 分支项等）：直达页签不经选择页
+  store.expandRightPanelDirect();
+  expect(store.rightPanelPicker).toBe(false);
+  expect(store.rightPanelCollapsed).toBe(false);
+
+  store.toggleRightPanel();
+  expect(store.rightPanelCollapsed).toBe(true);
+  expect(store.rightPanelPicker).toBe(false);
+
+  // 再次中性展开：重新先显示选择页
+  store.toggleRightPanel();
+  expect(store.rightPanelPicker).toBe(true);
+});

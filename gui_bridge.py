@@ -7406,6 +7406,18 @@ class ApiBridge(GitBridgeMixin):
             logger.debug("get_background_tasks 失败", exc_info=True)
             return []
 
+    def get_background_task_output(self, task_id: str, tail_lines: int = 200) -> Dict[str, Any]:
+        """后台任务执行过程：读取任务日志尾部（右面板详情用）。
+
+        get_task_output 自带末尾字节截断与异常兜底，失败返回 🚨 文本而非抛错。
+        """
+        try:
+            from core.task_manager import get_task_output
+            return {"ok": True, "output": get_task_output(str(task_id or ""), int(tail_lines))}
+        except Exception as exc:
+            logger.debug("get_background_task_output 失败", exc_info=True)
+            return {"ok": False, "output": "", "msg": str(exc)}
+
     def kill_task(self, task_id: str) -> Dict[str, Any]:
         try:
             from core.task_manager import (

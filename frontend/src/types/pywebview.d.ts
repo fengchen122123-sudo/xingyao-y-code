@@ -1053,6 +1053,7 @@ export interface PyWebViewAPI {
   }>>;
 
   get_background_tasks(): Promise<BackgroundTask[]>;
+  get_background_task_output(taskId: string, tailLines?: number): Promise<{ ok: boolean; output: string; msg?: string }>;
   kill_task(taskId: string): Promise<any>;
 
   // 旧版右侧面板单命令终端已下线；底部交互式终端见 pty_terminal_*
