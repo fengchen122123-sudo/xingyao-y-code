@@ -676,6 +676,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
     sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
     rightPanelWidth: storedPanelWidth(RIGHT_PANEL_WIDTH_KEY, RIGHT_PANEL_DEFAULT_WIDTH, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
+    // 内嵌浏览器（右侧面板浏览器页签）：真实网页由宿主叠加的原生 WebView2
+    // 渲染，前端只持有状态（地址栏/前进后退能力/加载态）并做乐观更新；
+    // supported=false 表示宿主平台不支持（非 Windows 桌面端 GUI 或缺桥）。
+    embeddedBrowser: {
+      url: '',
+      title: '',
+      can_go_back: false,
+      can_go_forward: false,
+      loading: false,
+      ready: false,
+      visible: false,
+      supported: true,
+    },
     themeLight: false,
     guiTheme: null as GuiTheme | null,
     savedGuiTheme: null as GuiTheme | null,
@@ -3278,6 +3291,19 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
+    /** 合并宿主回推的内嵌浏览器状态快照（字段强转，容忍缺省/多余字段） */
+    applyEmbeddedBrowserState(this: any, data: Record<string, unknown> | null | undefined) {
+      const src = (data || {}) as Record<string, unknown>;
+      const s = this.embeddedBrowser;
+      s.url = String(src.url ?? '');
+      s.title = String(src.title ?? '');
+      s.can_go_back = !!src.can_go_back;
+      s.can_go_forward = !!src.can_go_forward;
+      s.loading = !!src.loading;
+      s.ready = !!src.ready;
+      s.visible = !!src.visible;
+    },
+
     handleBridgeEvent(event: BridgeEvent) {
       const type = event.type;
       const data = event.data || {};
@@ -3315,6 +3341,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // frameless 最大化状态变更（原生双击/Snap/拖拽还原路径）：同步到 store
       if (type === 'window_maximize_state') {
         this.windowMaximized = !!data.maximized;
+        return;
+      }
+      // 内嵌浏览器状态推送（宿主 WebView2 控件的导航/标题/加载态回推）：
+      // 独立支路，不参与会话 runtime 归属，合并完直接返回
+      if (type === 'embedded_browser') {
+        this.applyEmbeddedBrowserState(data);
         return;
       }
       // 按回合撤销：撤销/恢复事务状态变更（数据库提交成功后后端才发）。

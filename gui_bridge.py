@@ -40,6 +40,7 @@ from core.memory import MemoryManager
 from core.gui_theme import ThemeError, get_repository as get_gui_theme_repository
 from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_terminal
 from gui_git_mixin import GitBridgeMixin
+from gui_browser_mixin import BrowserBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -481,7 +482,7 @@ def _media_save_filename(suggested_name: str, ext: str) -> str:
     return (name or "ycode-image") + ext
 
 
-class ApiBridge(GitBridgeMixin):
+class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
@@ -1092,6 +1093,15 @@ class ApiBridge(GitBridgeMixin):
                 pty_session.kill()
         except Exception:
             logger.exception("退出时终止内嵌交互式终端失败")
+
+        # 内嵌浏览器：best-effort 释放原生 WebView2 控件并取消节流定时器。
+        # 放在 JS 派发哨兵之前；shutdown 内部吞异常，失败不阻断退出链
+        try:
+            embedded = getattr(self, "_embedded_browser", None)
+            if embedded is not None:
+                embedded.shutdown()
+        except Exception:
+            logger.exception("退出时释放内嵌浏览器失败")
 
         try:
             from core.tools import subagent_manager

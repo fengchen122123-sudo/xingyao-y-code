@@ -97,9 +97,10 @@ it('中性入口展开面板时先显示选择页三卡，点卡片进入对应�
   wrapper.unmount();
 });
 
-it('浏览器卡片进入浏览器工作台，无操控会话时呈现引导态', async () => {
+it('浏览器卡片进入浏览器工作台并挂载 BrowserPane，标题仍为「浏览器」', async () => {
   const store = useAppStore();
-  const wrapper = mount(RightPanel);
+  // 浏览器工作台依赖宿主 WebView2 桥，测试中以 stub 替换其内部实现
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
 
   store.toggleRightPanel();
   await nextTick();
@@ -109,7 +110,7 @@ it('浏览器卡片进入浏览器工作台，无操控会话时呈现引导态'
   const pane = wrapper.find('[data-test="browser-pane"]');
   expect(pane.exists()).toBe(true);
   expect(pane.isVisible()).toBe(true);
-  expect(pane.find('[data-test="computer-empty-state"]').exists()).toBe(true);
+  expect(pane.find('browser-pane-stub').exists()).toBe(true);
   expect(paneTitle(wrapper)).toBe('浏览器');
   wrapper.unmount();
 });

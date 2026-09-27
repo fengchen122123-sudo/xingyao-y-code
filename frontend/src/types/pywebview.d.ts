@@ -178,6 +178,35 @@ export interface ComputerControlResult extends ComputerRunSnapshot {
   msg?: string;
 }
 
+// 内嵌浏览器（右侧面板浏览器页签）：DOM 占位区的 CSS px 矩形，上报给宿主，
+// 由宿主把叠加的原生 WebView2 控件摆到该矩形上
+export interface EmbeddedBrowserRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+}
+
+// core.embedded_browser.EmbeddedBrowserController._snapshot()：宿主回推的状态快照
+export interface EmbeddedBrowserState {
+  url: string;
+  title: string;
+  can_go_back: boolean;
+  can_go_forward: boolean;
+  loading: boolean;
+  ready: boolean;
+  visible: boolean;
+}
+
+// browser_pane_* 系列统一返回：成功 {ok:true,state?}；失败 {ok:false,error}
+// error ∈ 'unsupported_platform' | 'invalid_rect' | 'form_unavailable' | 'not_open'
+//       | 'invoke_failed' | 'not_ready' | 'invalid_url'（前端只特判 unsupported_platform）
+export interface EmbeddedBrowserPaneResult {
+  ok: boolean;
+  state?: EmbeddedBrowserState | null;
+  error?: string;
+}
+
 // /doctor 聚合自检（T3b）：单项结果来自 core.doctor.CheckResult，字段名与
 // CLI `/doctor --json` schema 完全一致（name/status/detail/hint）；status 四态固定
 export type DoctorCheckStatus = 'ok' | 'warn' | 'fail' | 'skip';
@@ -1055,6 +1084,21 @@ export interface PyWebViewAPI {
   get_background_tasks(): Promise<BackgroundTask[]>;
   get_background_task_output(taskId: string, tailLines?: number): Promise<{ ok: boolean; output: string; msg?: string }>;
   kill_task(taskId: string): Promise<any>;
+
+  // ---------------------------------------------------------------------------
+  // 内嵌浏览器（右侧面板浏览器页签；宿主 gui_browser_mixin.BrowserBridgeMixin）
+  // rect 为 DOM 占位区的 CSS px 矩形；url 为空串表示只创建/定位、不导航。
+  // 非 Windows 或缺桥时统一返回 {ok:false,error:'unsupported_platform'}。
+  // ---------------------------------------------------------------------------
+  browser_pane_open(rect: EmbeddedBrowserRect, url?: string): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_set_bounds(rect: EmbeddedBrowserRect): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_navigate(url: string): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_back(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_forward(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_reload(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_stop(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_hide(): Promise<EmbeddedBrowserPaneResult>;
+  browser_pane_get_state(): Promise<EmbeddedBrowserPaneResult>;
 
   // 旧版右侧面板单命令终端已下线；底部交互式终端见 pty_terminal_*
   pty_terminal_ensure(cols: number, rows: number): Promise<{
