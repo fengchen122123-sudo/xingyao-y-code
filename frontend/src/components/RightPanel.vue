@@ -15,7 +15,7 @@
       </button>
     </div>
 
-    <div id="right-content">
+    <div id="right-content" :class="{ flush: activeTab === 'browser' && !store.rightPanelPicker }">
       <!-- 打开标签页选择页（ZCode 式侧板）：顶栏按钮等中性入口展开面板时
            先选择要看的内容，页签栏保留随时可切；定向入口经
            expandRightPanelDirect 跳过本页 -->
@@ -72,10 +72,10 @@
         <ComputerControlPane />
       </div>
 
-      <!-- 浏览器工作台：承载电脑操控的浏览器实时画面与状态轨迹，
-           无操控会话时与操控页签共用同一引导态 -->
+      <!-- 浏览器工作台：DOM 工具栏 + 原生表面占位区；真实网页由宿主叠加的
+           WebView2 控件渲染，前端负责矩形上报与起始页/不支持态 -->
       <div v-show="activeTab === 'browser'" class="rpane active" data-test="browser-pane">
-        <ComputerControlPane />
+        <BrowserPane :active="activeTab === 'browser' && !store.rightPanelPicker && !store.rightPanelCollapsed" />
       </div>
 
       <!-- 后台任务执行过程：底部执行条“详情”触发，2 秒轮询日志尾部 -->
@@ -126,6 +126,7 @@ import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
 import ComputerControlPane from './ComputerControlPane.vue';
+import BrowserPane from './BrowserPane.vue';
 import GitPanel from './GitPanel.vue';
 import { useGitStore } from '../stores/gitStore';
 import { renderMarkdown } from '../utils/markdown';
@@ -518,6 +519,21 @@ onUnmounted(() => {
 }
 .rpane.active {
   display: block;
+}
+/* 浏览器工作台：表面占位区要撑满整个内容区（原生控件按此矩形叠加），
+   需要去掉内边距并让页签容器成为竖向 flex 容器。用 id+类提升优先级，
+   覆盖上面的 .rpane.active{display:block}，且只作用于 flush 时的激活页签 */
+#right-content.flush {
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+#right-content.flush .rpane.active {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
 }
 
 .chip-btn {
