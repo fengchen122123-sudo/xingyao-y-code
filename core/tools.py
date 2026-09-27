@@ -3012,6 +3012,17 @@ def _unpack_model_config(model_config: tuple | None):
     raise ValueError("model_config 必须是 (model, key, base_url[, model_id])")
 
 
+def _format_tool_stage_duration(duration_ms) -> str:
+    """tool_finished 阶段详情里的耗时片段：≥1s 显示秒，否则毫秒。"""
+    try:
+        ms = max(0, int(duration_ms or 0))
+    except (TypeError, ValueError):
+        return ""
+    if ms <= 0:
+        return ""
+    return f"{ms / 1000:.1f}s" if ms >= 1000 else f"{ms}ms"
+
+
 def _permission_owner_waiting(owner_id: str) -> bool:
     from core.permission_broker import permission_broker
 
@@ -4154,12 +4165,24 @@ class SubagentManager:
                     elif event.kind == "tool_finished":
                         name = str(event.payload.get("name", "tool"))
                         if event.payload.get("ok") is False:
-                            tool_errors[name] = str(
+                            err = str(
                                 event.payload.get("summary")
                                 or event.payload.get("error")
                                 or "工具执行失败"
                             )
+                            tool_errors[name] = err
+                            # 阶段历史带上失败摘要，右面板执行流程能看到卡在哪一步
+                            self._record_stage(
+                                task.task_id,
+                                "tool",
+                                f"{name} ✗ {' '.join(err.split())[:120]}",
+                            )
                         else:
+                            self._record_stage(
+                                task.task_id,
+                                "tool",
+                                f"{name} ✓ {_format_tool_stage_duration(event.payload.get('duration_ms'))}",
+                            )
                             tool_errors.pop(name, None)
                             success_count += 1
                     elif event.kind == "turn_error":

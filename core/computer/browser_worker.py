@@ -37,6 +37,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--browser", required=True, choices=("edge", "chrome"))
     parser.add_argument("--profile", required=True)
     parser.add_argument("--command-timeout", type=float, default=30.0)
+    parser.add_argument("--viewport-width", type=int, default=1440)
+    parser.add_argument("--viewport-height", type=int, default=900)
     args = parser.parse_args(argv)
 
     from core.computer.browser_backend import BrowserComputerBackend
@@ -58,6 +60,7 @@ def main(argv: list[str] | None = None) -> int:
         Path(args.profile),
         command_timeout=args.command_timeout,
         window_hint_provider=hint_provider,
+        viewport=(args.viewport_width, args.viewport_height),
     )
     try:
         backend.start()

@@ -1,7 +1,13 @@
+import { createPinia, setActivePinia } from 'pinia';
 import { mount } from '@vue/test-utils';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import ToolExecutionTrace from './ToolExecutionTrace.vue';
 import type { ToolDisplay, ToolExecutionCall } from '../utils/toolTrace';
+
+// 行组件内 openSubagentDetail 依赖 pinia store
+beforeEach(() => {
+  setActivePinia(createPinia());
+});
 
 
 const commandDisplay = (command: string): ToolDisplay => ({

@@ -38,3 +38,29 @@ it('embedded_browser 事件合并到 embeddedBrowser 状态并强制字段类型
   expect(store.embeddedBrowser.can_go_back).toBe(false);
   expect(store.embeddedBrowser.loading).toBe(false);
 });
+
+it('embedded_browser_automation 事件写入项目分辨率并展开面板到浏览器页签', () => {
+  const store = useAppStore();
+  store.rightPanelCollapsed = true;
+  store.rightPanelPicker = true;
+  expect(store.embeddedBrowser.automationViewport).toBeNull();
+
+  store.handleBridgeEvent({ type: 'embedded_browser_automation', data: { width: 1280, height: 800 } } as any);
+  expect(store.embeddedBrowser.automationViewport).toEqual([1280, 800]);
+  expect(store.rightPanelCollapsed).toBe(false);
+  expect(store.rightPanelPicker).toBe(false);
+
+  // 非法/缺省分辨率：状态不变（不写入 NaN 视口）
+  store.handleBridgeEvent({ type: 'embedded_browser_automation', data: {} } as any);
+  expect(store.embeddedBrowser.automationViewport).toEqual([1280, 800]);
+});
+
+it('embedded_browser_automation 相同分辨率重复下发仍换新引用（可重复触发组件 watch）', () => {
+  const store = useAppStore();
+  store.handleBridgeEvent({ type: 'embedded_browser_automation', data: { width: 375, height: 667 } } as any);
+  const first = store.embeddedBrowser.automationViewport;
+  store.handleBridgeEvent({ type: 'embedded_browser_automation', data: { width: 375, height: 667 } } as any);
+  const second = store.embeddedBrowser.automationViewport;
+  expect(second).toEqual([375, 667]);
+  expect(second).not.toBe(first);
+});

@@ -2507,12 +2507,16 @@ class MemoryManager:
             return self._parse_message_rows(page, with_ids=True), has_more
 
     def get_session_user_nav_items(self, session_name):
-        """红点导航全量索引：该会话全部 user 消息的 [{id, text}]（正序）。
+        """红点导航全量索引：该会话全部 user 消息的 [{id, text, is_observation}]（正序）。
 
         仅提取纯文本（多模态 blocks 只拼 text 块），不做后缀剥离/截断——
         预览清洗在 gui_bridge 层完成（strip_context_suffix 位于高层，
-        memory 不反向依赖）。
+        memory 不反向依赖）。is_observation 标记电脑操控观察跟进协议消息
+        （_computer_v1 结构标记），展示层据此过滤，模型上下文不受影响。
+        判定助手经惰性导入使用（memory 是底层模块，避免顶层依赖 computer 包）。
         """
+        from core.computer.provider_generic import is_observation_protocol_message
+
         with self._lock:
             cursor = self.conn.cursor()
             cursor.execute('SELECT id FROM sessions WHERE session_name = ?', (session_name,))
@@ -2525,6 +2529,7 @@ class MemoryManager:
                 "AND role = 'user' ORDER BY id ASC", (session_id,))
             items = []
             for msg_id, raw in cursor.fetchall():
+                observation = is_observation_protocol_message(raw)
                 parsed, ok = _try_parse_json(raw)
                 if ok and isinstance(parsed, list):
                     texts = [
@@ -2537,7 +2542,7 @@ class MemoryManager:
                     text = str(parsed.get("content") or "")
                 else:
                     text = str(raw or "")
-                items.append({"id": msg_id, "text": text})
+                items.append({"id": msg_id, "text": text, "is_observation": observation})
             return items
 
     def get_history_for_llm(self, session_name):

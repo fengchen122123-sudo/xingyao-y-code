@@ -121,3 +121,6 @@ tokenrhythm_*.png
 build_*.log
 dryrun_*.log
 publish_*.log
+
+# Y-code GUI 本地运行数据（后台任务日志/计划/任务设置），仅本地留存
+.ycode_tasks/

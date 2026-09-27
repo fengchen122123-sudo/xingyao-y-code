@@ -31,6 +31,29 @@ _LOGGER = logging.getLogger(__name__)
 # follow-up 观察 user message 的固定说明文本（Task 9 brief 样例逐字）。
 OBSERVATION_FOLLOWUP_TEXT = "【电脑观察】请只依据这张最新截图决定下一步。"
 
+# 观察跟进消息持久化时的结构标记（_observation_followup_message 写入的
+# _computer_v1 键）。展示层据此把这类系统协议消息从用户气泡/红点导航中
+# 过滤掉——它们是系统发给模型的观察提示，不是用户发送的内容。
+_OBSERVATION_MARKER_KEY = "_computer_v1"
+
+
+def is_observation_protocol_message(obj) -> bool:
+    """判定是否为电脑操控观察跟进协议消息（展示层过滤用）。
+
+    兼容三种输入形状：
+    - memory 解析后的消息行 dict：_parse_message_rows 会把 JSON content 的
+      顶层键提升到行上，_computer_v1 出现在行 dict；
+    - 持久化 content 原始串（整个 message dict 的 JSON）：串内含该标记；
+    - 解析后的 message dict 本身。
+    其余形状（真实用户文本、多模态块列表、非字符串/字典）一律 False——
+    真实用户消息绝无此标记，模型上下文（get_history）不受展示过滤影响。
+    """
+    if isinstance(obj, dict):
+        return _OBSERVATION_MARKER_KEY in obj
+    if isinstance(obj, str):
+        return f'"{_OBSERVATION_MARKER_KEY}"' in obj
+    return False
+
 # 动态运行上下文里的电脑操控说明（通用化重构 Task E 的元素优先学说；只在
 # capability 决策为 enabled 时加入，绝不进 build_stable_system_message）。
 _GENERIC_DYNAMIC_PROMPT = (
@@ -51,7 +74,10 @@ _GENERIC_DYNAMIC_PROMPT = (
     "5. 出现焦点被抢、会话失活、窗口挪位时：先 list_elements 或 activate_surface"
     "重建基线，严禁按记忆里的旧坐标连续重试。\n"
     "6. 遇到登录、验证码或需要凭据时，改用 request_user_takeover 请求用户接管。\n"
-    "7. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。"
+    "7. 完成任务后输出正常最终结论，停止调用电脑工具，不继续无意义观察。\n"
+    "8. 浏览器自动化在 GUI 右侧面板的内嵌浏览器里实时呈现（用户围观），页面按"
+    "项目分辨率渲染（桌面页默认 1440×900，移动页建议 375×667）；与目标页面"
+    "不匹配时先用 browser_set_viewport 调整再导航。"
 )
 
 # Provider tool result 的稳定 JSON 序列化参数（设计 10.2）。

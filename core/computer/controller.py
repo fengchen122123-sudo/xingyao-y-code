@@ -163,17 +163,41 @@ def _default_backend_factory(target: str, identity: BackendIdentity) -> Computer
         raise ComputerControlError("computer_unsupported_os", adapter.unavailable_reason)
     if target == "browser":
         from core.computer.browser_backend import BrowserComputerBackend
+        from core.computer.settings import (
+            DEFAULT_BROWSER_VIEWPORT_HEIGHT,
+            DEFAULT_BROWSER_VIEWPORT_WIDTH,
+        )
 
         # R5：系统侧受控页裁决信号（窗口标题提示）由平台层提供；
         # 平台未实现时 getattr 回落 None，backend 退化为 DOM 可见性裁决。
         hint_provider = getattr(adapter, "browser_window_hints", None)
         if hint_provider is not None and not callable(hint_provider):
             hint_provider = None
+        # 项目分辨率（逻辑视口）对两种浏览器通道一致生效：外部浏览器作为
+        # 启动视口，内置浏览器作为缩放呈现的目标视口。
+        viewport = (identity.viewport_width, identity.viewport_height)
+        if viewport[0] <= 0 or viewport[1] <= 0:
+            viewport = (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
+        if identity.browser == "embedded":
+            from core.computer.embedded_browser_backend import EmbeddedBrowserBackend
+
+            if not identity.cdp_endpoint:
+                raise ComputerControlError(
+                    "computer_embedded_unavailable", "内置浏览器 CDP endpoint 缺失"
+                )
+            # 不传窗口标题提示：浏览器归 GUI 所有，PID/窗口裁决不适用，
+            # backend 内部退化为 DOM 可见性裁决。
+            return EmbeddedBrowserBackend(
+                identity.cdp_endpoint,
+                Path(identity.profile_path),
+                viewport=viewport,
+            )
         return BrowserComputerBackend(
             identity.browser,
             Path(identity.profile_path),
             window_hint_provider=hint_provider,
             use_process_worker=True,
+            viewport=viewport,
         )
     return adapter.create_desktop_backend()
 
@@ -215,11 +239,16 @@ class ComputerControlService:
         settings_loader: Callable[[], object] | None = None,
         generation_provider: Callable[[], int] | None = None,
         abort_streams: Callable[[threading.Event], None] | None = None,
+        embedded_endpoint_provider: Callable[[str], str] | None = None,
     ) -> None:
         self._backend_factory = backend_factory or _default_backend_factory
         self._settings_loader = settings_loader or load_computer_settings
         self._generation_provider = generation_provider or get_settings_generation
         self._abort_streams = abort_streams or _default_abort_streams
+        # 内置浏览器（embedded）CDP endpoint 提供者：仅 GUI 进程注入——
+        # 负责确保内嵌 WebView2 控件带调试端口存在并返回回环 endpoint；
+        # CLI/无 GUI 不注入，embedded 目标一律明确失败（不静默回落外部浏览器）。
+        self._embedded_endpoint_provider = embedded_endpoint_provider
         self._lock = threading.RLock()
         self._action_lock = threading.Lock()
         self._run: _Run | None = None
@@ -254,6 +283,18 @@ class ComputerControlService:
         """
         with self._lock:
             self._preview_publisher = publisher
+
+    def set_embedded_endpoint_provider(
+        self, provider: Callable[[str], str] | None
+    ) -> None:
+        """注册/清除内置浏览器 CDP endpoint 提供者（仅 GUI 进程接线）。
+
+        provider(session_id) 负责确保内嵌 WebView2 控件带调试端口存在并返回
+        "http://127.0.0.1:<port>"；session_id 为发起操控的会话名（供前端把
+        浏览器页签开进正确会话），抛出的异常由调用方归一为启动失败。
+        """
+        with self._lock:
+            self._embedded_endpoint_provider = provider
 
     def _build_event_locked(self, run: _Run, event_type: str, **fields) -> dict:
         """状态锁内分配事件序号并构造事件（调用方必须持有状态锁）。"""
@@ -453,29 +494,71 @@ class ComputerControlService:
     # ---------------- backend 获取（含 retained 复用） ----------------
 
     def _resolve_backend_identity(
-        self, target: str, capability: ComputerCapability
+        self, target: str, capability: ComputerCapability, session_id: str = ""
     ) -> BackendIdentity:
-        """按 run 冻结能力构造 backend 请求身份；profile 在本次领取时解析为规范绝对路径。"""
+        """按 run 冻结能力构造 backend 请求身份；profile 在本次领取时解析为规范绝对路径。
+
+        embedded（内置 WebView2）在此处即调用 endpoint 提供者：确保控件带
+        调试端口存在（GUI 线程 marshal），端点冻结进身份——端口变化即视为
+        配置变更、retained 会话不复用。项目分辨率同点冻结（R4）。
+        session_id 为发起会话名，透传给提供者供前端按会话归属展示浏览器页签。
+        """
         from core.computer.platforms import get_platform_adapter
 
         if target == "browser":
-            from core.computer.settings import get_browser_profile_dir
+            from core.computer.settings import (
+                get_browser_profile_dir,
+                get_project_browser_viewport,
+            )
+            from core.workspace_context import get_workdir
 
             browser = capability.browser
-            if browser not in ("edge", "chrome"):
+            cdp_endpoint = ""
+            if browser == "embedded":
+                provider = self._embedded_endpoint_provider
+                if provider is None:
+                    raise ComputerControlError(
+                        "computer_embedded_unavailable",
+                        "当前进程没有内置浏览器（GUI 专属）；"
+                        "请在设置中把浏览器切换为 Edge 或 Chrome",
+                    )
+                try:
+                    cdp_endpoint = provider(session_id)
+                except ComputerControlError:
+                    raise
+                except Exception as error:
+                    raise ComputerControlError(
+                        "computer_embedded_unavailable",
+                        f"内置浏览器自动化准备失败：{error}",
+                    ) from error
+                if not cdp_endpoint:
+                    raise ComputerControlError(
+                        "computer_embedded_unavailable",
+                        "内置浏览器 CDP endpoint 无效",
+                    )
+            elif browser not in ("edge", "chrome"):
                 raise ComputerControlError(
                     "computer_invalid_config",
                     f"能力快照缺少有效浏览器选择：{browser!r}",
                 )
             profile_path = str(get_browser_profile_dir(browser))
+            viewport_width, viewport_height = get_project_browser_viewport(
+                get_workdir()
+            )
         else:
             browser = ""
             profile_path = ""
+            cdp_endpoint = ""
+            viewport_width = 0
+            viewport_height = 0
         return BackendIdentity(
             platform=get_platform_adapter().name,
             target=target,
             browser=browser,
             profile_path=profile_path,
+            cdp_endpoint=cdp_endpoint,
+            viewport_width=viewport_width,
+            viewport_height=viewport_height,
         )
 
     def _claim_backend(self, target: str, identity: BackendIdentity) -> ComputerBackend:
@@ -565,7 +648,9 @@ class ComputerControlService:
         self._emit_state(run, reason="start")
         if target is not None:
             try:
-                identity = self._resolve_backend_identity(target, capability)
+                identity = self._resolve_backend_identity(
+                    target, capability, run.owner.session_id
+                )
                 backend = self._claim_backend(target, identity)
             except Exception as error:
                 self._fail_run(run, error, "backend_start_failed")
@@ -650,7 +735,7 @@ class ComputerControlService:
             if establishing:
                 try:
                     identity = self._resolve_backend_identity(
-                        action.target, run.capability
+                        action.target, run.capability, run.owner.session_id
                     )
                     backend = self._claim_backend(action.target, identity)
                 except Exception as error:

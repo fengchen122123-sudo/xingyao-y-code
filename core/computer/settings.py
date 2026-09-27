@@ -7,6 +7,7 @@ profile 展示路径。不得导入 controller 或 hotkey，不得执行任何�
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from typing import Callable
 import config
 from core.computer import platforms
 from core.computer.models import ComputerControlError
+
+logger = logging.getLogger(__name__)
 
 BROWSER_CONTROL_CONFIG_KEY = "browser_control_enabled"
 COMPUTER_CONTROL_CONFIG_KEY = "computer_control_enabled"
@@ -29,10 +32,27 @@ _GENERATION_LOCK = threading.Lock()
 _settings_generation = 0
 
 # 公共设置只保存浏览器身份；可执行文件名与安装位置由平台层负责。
+# "embedded" 是 GUI 内置 WebView2（CDP 直连），不是独立安装的浏览器：
+# 无可执行文件探测，profile 即内嵌控件的 UserDataFolder。
 _BROWSER_DEFINITIONS = {
     "edge": "Microsoft Edge",
     "chrome": "Google Chrome",
+    "embedded": "星瑶内置浏览器",
 }
+
+# 进程级默认浏览器：GUI 入口在启动时注入 "embedded"（未显式配置过的用户
+# 默认走内置浏览器）；CLI 不注入，保持 "edge" 回落。只影响"配置缺省"，
+# 绝不覆盖用户显式写入的值。
+_process_default_browser: str | None = None
+
+
+def set_process_default_browser(browser: str) -> None:
+    global _process_default_browser
+    if browser not in _BROWSER_DEFINITIONS:
+        raise ComputerControlError(
+            "computer_invalid_config", f"不支持的默认浏览器：{browser!r}"
+        )
+    _process_default_browser = browser
 
 
 @dataclass(frozen=True)
@@ -90,12 +110,13 @@ def _read_bool(data: dict, key: str) -> bool:
 
 def _read_browser(data: dict) -> str:
     if COMPUTER_BROWSER_CONFIG_KEY not in data:
-        return DEFAULT_COMPUTER_BROWSER
+        # 配置缺省：GUI 进程注入的默认值优先（embedded），否则 edge
+        return _process_default_browser or DEFAULT_COMPUTER_BROWSER
     value = data[COMPUTER_BROWSER_CONFIG_KEY]
     if type(value) is not str or value not in _BROWSER_DEFINITIONS:
         raise ComputerControlError(
             "computer_invalid_config",
-            f"{COMPUTER_BROWSER_CONFIG_KEY} 只支持 edge 或 chrome",
+            f"{COMPUTER_BROWSER_CONFIG_KEY} 只支持 edge、chrome 或 embedded",
         )
     return value
 
@@ -106,6 +127,21 @@ def _is_platform_supported(platform: str) -> bool:
 
 def _detect_browser(browser: str, platform: str) -> BrowserOption:
     """平台内单独探测所选浏览器，不可用平台不检查其他系统的安装路径。"""
+    if browser == "embedded":
+        # 内置浏览器无可执行文件：可用性按「入参 platform + 内嵌模块可加载」
+        # 判定。必须用入参而不是 sys.platform——测试/调用方会以
+        # platform="darwin"/"linux" 模拟非 Windows 环境（此时 sys.platform
+        # 仍是 win32），与其它浏览器同一裁决口径。
+        from core.embedded_browser import is_supported
+
+        available = platform == "win32" and is_supported()
+        return BrowserOption(
+            browser="embedded",
+            label=_BROWSER_DEFINITIONS["embedded"],
+            available=available,
+            executable="",
+            unavailable_reason="" if available else "内置浏览器仅在 Windows 桌面端可用",
+        )
     adapter = platforms.get_platform_adapter(platform)
     label = _BROWSER_DEFINITIONS[browser]
     executable = adapter.find_browser_executable(browser)
@@ -125,16 +161,22 @@ def list_browser_options(*, platform: str | None = None) -> tuple[BrowserOption,
 
 
 def get_browser_profile_dir(browser: str) -> Path:
-    """专用 profile 目录：Path(config.YCODE_DIR) / "browser-profiles" / browser。
+    """浏览器 profile 目录。
 
-    config.YCODE_DIR 是字符串，必须先包 Path；resolve 后确认仍在
-    browser-profiles 根之下，拒绝任何路径逃逸。
+    edge/chrome：Path(config.YCODE_DIR) / "browser-profiles" / browser，
+    resolve 后确认仍在专用根之下，拒绝任何路径逃逸；
+    embedded：内嵌 WebView2 控件自己的 UserDataFolder（单一事实来源在
+    core.embedded_browser.profile_dir，两处路径必须恒等）。
     """
     if type(browser) is not str or browser not in _BROWSER_DEFINITIONS:
         raise ComputerControlError(
             "computer_invalid_config",
-            f"不支持的浏览器：{browser!r}，只支持 edge 或 chrome",
+            f"不支持的浏览器：{browser!r}，只支持 edge、chrome 或 embedded",
         )
+    if browser == "embedded":
+        from core.embedded_browser import profile_dir
+
+        return profile_dir().resolve()
     root = Path(config.YCODE_DIR) / "browser-profiles"
     resolved_root = root.resolve()
     candidate = (root / browser).resolve()
@@ -209,7 +251,7 @@ def set_computer_browser(value: object, active_run: bool) -> ComputerSettingsSna
     if type(value) is not str or value not in _BROWSER_DEFINITIONS:
         raise ComputerControlError(
             "computer_invalid_config",
-            f"{COMPUTER_BROWSER_CONFIG_KEY} 只支持 edge 或 chrome",
+            f"{COMPUTER_BROWSER_CONFIG_KEY} 只支持 edge、chrome 或 embedded",
         )
     if not config.save_config_value(COMPUTER_BROWSER_CONFIG_KEY, value):
         raise ComputerControlError(
@@ -218,3 +260,93 @@ def set_computer_browser(value: object, active_run: bool) -> ComputerSettingsSna
         )
     _bump_settings_generation()
     return load_computer_settings()
+
+
+# ---------------- 项目级浏览器视口（每项目分辨率） ----------------
+
+BROWSER_VIEWPORT_CONFIG_KEY = "browser_viewport"
+BROWSER_VIEWPORT_MIN = 120
+BROWSER_VIEWPORT_MAX = 8192
+DEFAULT_BROWSER_VIEWPORT_WIDTH = 1440
+DEFAULT_BROWSER_VIEWPORT_HEIGHT = 900
+
+
+def normalize_browser_viewport(width: object, height: object) -> tuple[int, int]:
+    """校验/夹取逻辑视口尺寸；非法输入抛稳定错误码。"""
+    def _clamp(value: object, minimum: int, label: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ComputerControlError(
+                "computer_invalid_config", f"浏览器视口{label}必须是整数"
+            )
+        ivalue = int(value)
+        if ivalue != value:
+            raise ComputerControlError(
+                "computer_invalid_config", f"浏览器视口{label}必须是整数"
+            )
+        return max(minimum, min(BROWSER_VIEWPORT_MAX, ivalue))
+
+    return (
+        _clamp(width, BROWSER_VIEWPORT_MIN, "宽度"),
+        _clamp(height, BROWSER_VIEWPORT_MIN, "高度"),
+    )
+
+
+def get_project_browser_viewport(workdir: str | None) -> tuple[int, int]:
+    """读取项目级浏览器逻辑视口；未设置/非法一律回落默认（1440×900）。
+
+    workdir 为 None（GLOBAL 自由会话）时同样回落默认——分辨率是"每项目"
+    概念，无项目即无个性化。
+    """
+    if not workdir:
+        return (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
+    from core import workspace_settings
+
+    raw = workspace_settings.get_workspace_setting(workdir, BROWSER_VIEWPORT_CONFIG_KEY)
+    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+        return (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
+    try:
+        return normalize_browser_viewport(raw[0], raw[1])
+    except ComputerControlError:
+        return (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
+
+
+def set_project_browser_viewport(workdir: str | None, width: object, height: object) -> tuple[int, int]:
+    """写入项目级浏览器逻辑视口（星瑶经 browser_set_viewport 工具调用）。"""
+    if not workdir:
+        raise ComputerControlError(
+            "computer_invalid_config",
+            "当前会话未关联项目，无法设置项目分辨率；请先进入项目工作区",
+        )
+    from core import workspace_settings
+
+    viewport = normalize_browser_viewport(width, height)
+    workspace_settings.set_workspace_setting(
+        workdir, BROWSER_VIEWPORT_CONFIG_KEY, list(viewport)
+    )
+    _notify_browser_viewport_changed(workdir, viewport)
+    return viewport
+
+
+# 项目分辨率变更通知：GUI 入口注册（把事件推给前端面板即时应用）；
+# 工具层触发，listener 异常只留痕不传播。
+_VIEWPORT_LISTENERS: list[Callable[[str | None, tuple[int, int]], None]] = []
+
+
+def register_browser_viewport_listener(
+    listener: Callable[[str | None, tuple[int, int]], None],
+) -> None:
+    with _GENERATION_LOCK:
+        if listener not in _VIEWPORT_LISTENERS:
+            _VIEWPORT_LISTENERS.append(listener)
+
+
+def _notify_browser_viewport_changed(
+    workdir: str | None, viewport: tuple[int, int]
+) -> None:
+    with _GENERATION_LOCK:
+        listeners = list(_VIEWPORT_LISTENERS)
+    for listener in listeners:
+        try:
+            listener(workdir, viewport)
+        except Exception:
+            logger.debug("浏览器视口变更通知失败", exc_info=True)

@@ -47,7 +47,7 @@ def test_build_generic_computer_tool_off_or_native_returns_none(capability):
     assert build_generic_computer_tool(capability) is None
 
 
-def test_build_generic_dynamic_prompt_enabled_covers_all_seven_rules():
+def test_build_generic_dynamic_prompt_enabled_covers_all_eight_rules():
     text = build_generic_dynamic_prompt(GENERIC_CAPABILITY)
     # 通用化重构 Task E 元素优先学说：七条要点语义必须逐字可见
     assert "observe" in text
@@ -75,6 +75,10 @@ def test_build_generic_dynamic_prompt_enabled_covers_all_seven_rules():
     assert "request_user_takeover" in text
     assert "验证码" in text
     assert "完成" in text and "不继续无意义观察" in text
+    # 第 8 条：内嵌浏览器围观呈现 + 项目分辨率/browser_set_viewport 指引
+    assert "右侧面板" in text
+    assert "browser_set_viewport" in text
+    assert "1440×900" in text
 
 
 @pytest.mark.parametrize("capability", [
@@ -104,3 +108,33 @@ def test_validate_batch_rejects_computer_action_without_target():
         ])
     assert raised.value.code == "computer_invalid_action"
     assert "一次只能调用一个" in raised.value.message
+
+
+def test_is_persisted_observation_message_shape_variants():
+    """判定助手：观察跟进 JSON 串为真；真实用户文本/列表内容/非字符串为假。"""
+    import json
+
+    from core.computer.provider_generic import (
+        _observation_followup_message,
+        is_observation_protocol_message,
+    )
+
+    class _Obs:
+        target = "browser"
+        elements = [{"ref": "el-1", "kind": "link", "name": "x",
+                     "bounds": (1, 2, 3, 4), "enabled": True}]
+        png_path = ""
+
+    followup = _observation_followup_message(_Obs(), run_id="run-1", ordinal=1)
+    assert is_observation_protocol_message(json.dumps(followup, ensure_ascii=False))
+    # memory 解析后的消息行：_computer_v1 键提升到行顶层
+    row = dict(followup, role="user")
+    assert is_observation_protocol_message(row)
+    assert not is_observation_protocol_message("帮我打开浏览器看看")
+    assert not is_observation_protocol_message({"role": "user", "content": "文本"})
+    # 真实多模态用户消息：content 是 JSON 数组，绝无 _computer_v1 键
+    assert not is_observation_protocol_message(
+        json.dumps([{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}])
+    )
+    assert not is_observation_protocol_message(None)
+    assert not is_observation_protocol_message(123)
