@@ -71,13 +71,9 @@ it('文本预览：kind=text 时仍渲染代码块，不出现 <img>', async () 
   wrapper.unmount();
 });
 
-// ── 打开标签页选择页（ZCode 式侧板，页签栏已移除） ──
+// ── 多页签容器：页签条 + 单独关闭 + 选择页追加 ──
 
-function paneTitle(wrapper: ReturnType<typeof mount>) {
-  return wrapper.find('[data-test="pane-title"]').text().trim();
-}
-
-it('中性入口展开面板时先显示选择页三卡，点卡片进入对应工作台', async () => {
+it('中性入口展开面板：无页签先显示选择页五卡，点卡片开出对应页签', async () => {
   const store = useAppStore();
   const wrapper = mount(RightPanel);
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
@@ -85,19 +81,22 @@ it('中性入口展开面板时先显示选择页三卡，点卡片进入对应�
   store.toggleRightPanel();
   await nextTick();
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
-  // 页签栏已移除：选择页期间不渲染工台头
-  expect(wrapper.find('.pane-head').exists()).toBe(false);
-  expect(wrapper.findAll('.tp-card').map(c => c.text().trim())).toEqual(['文件', 'Git', '浏览器']);
+  expect(wrapper.findAll('.tp-card').map(c => c.text().trim()))
+    .toEqual(['文件', 'Git', '浏览器', '后台任务', '子代理']);
 
   await wrapper.find('[data-test="picker-card-files"]').trigger('click');
   await nextTick();
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
-  expect(paneTitle(wrapper)).toBe('文件');
-  expect(wrapper.find('[data-test="pane-close"]').exists()).toBe(true);
+  // 页签条出现 files 页签且处于激活态
+  const tab = wrapper.find('[data-test="tab-files"]');
+  expect(tab.exists()).toBe(true);
+  expect(tab.classes()).toContain('active');
+  expect(wrapper.find('[data-test="tabbar-add"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="tabbar-collapse"]').exists()).toBe(true);
   wrapper.unmount();
 });
 
-it('浏览器卡片进入浏览器工作台并挂载 BrowserPane，标题仍为「浏览器」', async () => {
+it('浏览器卡片开出浏览器页签并挂载 BrowserPane', async () => {
   const store = useAppStore();
   // 浏览器工作台依赖宿主 WebView2 桥，测试中以 stub 替换其内部实现
   const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
@@ -111,104 +110,204 @@ it('浏览器卡片进入浏览器工作台并挂载 BrowserPane，标题仍为�
   expect(pane.exists()).toBe(true);
   expect(pane.isVisible()).toBe(true);
   expect(pane.find('browser-pane-stub').exists()).toBe(true);
-  expect(paneTitle(wrapper)).toBe('浏览器');
+  expect(wrapper.find('[data-test="tab-browser"]').classes()).toContain('active');
   wrapper.unmount();
 });
 
-it('工台头 × 返回选择页，可再次选卡切换工作台', async () => {
+it('多页签并存：开浏览器再开 Git 互不覆盖，点页签切回', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  store.openRightPanelTab('browser');
+  await nextTick();
+  expect(wrapper.find('[data-test="browser-pane"]').isVisible()).toBe(true);
+
+  // Git 定向入口：追加页签，不覆盖浏览器页签
+  store.openRightPanelTab('git');
+  await nextTick();
+  expect(store.rightPanelTabs).toEqual(['browser', 'git']);
+  expect(store.rightPanelActiveTab).toBe('git');
+  expect(wrapper.find('[data-test="git-pane"]').isVisible()).toBe(true);
+  expect(wrapper.find('[data-test="browser-pane"]').exists()).toBe(true);
+  // jsdom 的 getComputedStyle 不读内联 style，v-show 隐藏只能查内联样式断言
+  expect(wrapper.find('[data-test="browser-pane"]').attributes('style')).toContain('display: none');
+
+  // 点浏览器页签切回，Git 页签保留
+  await wrapper.find('[data-test="tab-browser"]').trigger('click');
+  await nextTick();
+  expect(wrapper.find('[data-test="browser-pane"]').isVisible()).toBe(true);
+  expect(wrapper.find('[data-test="git-pane"]').attributes('style')).toContain('display: none');
+  expect(store.rightPanelTabs).toEqual(['browser', 'git']);
+  wrapper.unmount();
+});
+
+it('页签可单独关闭：关闭激活页签切到邻居，全部关完回选择页', async () => {
   const store = useAppStore();
   const wrapper = mount(RightPanel);
 
-  store.toggleRightPanel();
+  store.openRightPanelTab('browser');
+  store.openRightPanelTab('git');
   await nextTick();
-  await wrapper.find('[data-test="picker-card-files"]').trigger('click');
-  await nextTick();
-  expect(paneTitle(wrapper)).toBe('文件');
+  expect(store.rightPanelActiveTab).toBe('git');
 
-  await wrapper.find('[data-test="pane-close"]').trigger('click');
+  // 关闭激活页签 git → 切到左邻 browser
+  await wrapper.find('[data-test="tab-close-git"]').trigger('click');
+  await nextTick();
+  expect(store.rightPanelTabs).toEqual(['browser']);
+  expect(store.rightPanelActiveTab).toBe('browser');
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
+
+  // 关闭最后一个页签 → 回选择页（面板保持展开）
+  await wrapper.find('[data-test="tab-close-browser"]').trigger('click');
+  await nextTick();
+  expect(store.rightPanelTabs).toEqual([]);
+  expect(store.rightPanelActiveTab).toBe('');
+  expect(store.rightPanelCollapsed).toBe(false);
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+it('“+”回选择页追加页签，已开页签保留在页签条上', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+
+  store.openRightPanelTab('files');
+  await nextTick();
+  await wrapper.find('[data-test="tabbar-add"]').trigger('click');
   await nextTick();
   expect(store.rightPanelPicker).toBe(true);
-  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
+  expect(store.rightPanelTabs).toEqual(['files']);
 
   await wrapper.find('[data-test="picker-card-git"]').trigger('click');
   await nextTick();
-  expect(paneTitle(wrapper)).toBe('Git');
-  expect(wrapper.find('[data-test="git-pane"]').isVisible()).toBe(true);
+  expect(store.rightPanelTabs).toEqual(['files', 'git']);
+  expect(store.rightPanelActiveTab).toBe('git');
+  expect(wrapper.find('[data-test="tab-files"]').exists()).toBe(true);
   wrapper.unmount();
 });
 
-it('定向入口 expandRightPanelDirect 跳过选择页，Git 分支项直达 Git 工作台', async () => {
+it('页签条 × 收起整个面板，再次中性展开回到激活页签', async () => {
   const store = useAppStore();
-  const gitStore = useGitStore();
   const wrapper = mount(RightPanel);
 
-  gitStore.requestOpenPanel();
-  store.expandRightPanelDirect();
+  store.openRightPanelTab('git');
   await nextTick();
+  await wrapper.find('[data-test="tabbar-collapse"]').trigger('click');
+  await nextTick();
+  expect(store.rightPanelCollapsed).toBe(true);
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
 
+  store.toggleRightPanel();
+  await nextTick();
+  expect(store.rightPanelCollapsed).toBe(false);
   expect(store.rightPanelPicker).toBe(false);
-  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
   expect(wrapper.find('[data-test="git-pane"]').isVisible()).toBe(true);
   wrapper.unmount();
 });
 
-it('收起面板即离开选择页，再次中性展开重新显示', async () => {
-  const store = useAppStore();
-  const wrapper = mount(RightPanel);
+// ── 后台任务执行过程页签 ──
 
-  store.toggleRightPanel();
-  await nextTick();
-  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
-
-  store.toggleRightPanel();
-  await nextTick();
-  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
-
-  store.toggleRightPanel();
-  await nextTick();
-  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
-  wrapper.unmount();
-});
-
-// ── 后台任务执行过程工作台 ──
-
-it('执行条详情 nonce 打开后台任务工作台并显示命令', async () => {
+it('执行条详情打开后台任务页签并显示命令', async () => {
   const store = useAppStore();
   const wrapper = mount(RightPanel);
 
   store.backgroundTasks = [{ task_id: 't9', command: 'pytest -q', status: 'running' }];
-  store.bgTaskDetailId = 't9';
-  store.bgTaskOpenNonce += 1;
+  store.openBackgroundTaskDetail('t9');
   await nextTick();
 
-  expect(store.rightPanelPicker).toBe(false);
+  expect(store.bgTaskOpenNonce).toBe(1);
+  expect(store.bgTaskDetailId).toBe('t9');
   expect(wrapper.find('[data-test="bg-task-pane"]').isVisible()).toBe(true);
-  expect(wrapper.find('[data-test="pane-title"]').text()).toBe('后台任务');
   expect(wrapper.find('[data-test="bg-task-log"]').text()).toContain('正在读取任务输出');
   wrapper.unmount();
 });
 
-// ── 操控工作台（设计 16.2：run 出现自动切入，不进选择页） ──
+// ── 子代理执行过程页签 ──
 
-it('run 出现后自动切入操控工作台并校准快照，返回选择页后事件不抢回，新 run 再切一次', async () => {
+function subagentDetailPayload() {
+  return {
+    ok: true,
+    task: {
+      id: 'sub-1', description: '调研代码结构', type: 'explore', status: 'running',
+      stage: 'completed', elapsed: 12, background: false,
+      stages: [
+        { name: 'tool', at: 1758000000, detail: 'read_file ✓ 1.2s' },
+      ],
+    },
+    tasks: [
+      { id: 'sub-1', description: '调研代码结构', type: 'explore', status: 'running', stage: 'tool', elapsed: 12, background: false },
+      { id: 'sub-2', description: '整理测试报告', type: 'general', status: 'completed', stage: 'completed', elapsed: 30, background: true },
+    ],
+  };
+}
+
+it('子代理查看打开子代理页签：头部信息 + 阶段时间线 + 任务切换条', async () => {
+  const getDetail = vi.fn().mockResolvedValue(subagentDetailPayload());
+  (window as any).pywebview = { api: { get_subagent_task_detail: getDetail } };
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel);
+
+  store.openSubagentDetail('sub-1');
+  await nextTick();
+
+  expect(store.subagentOpenNonce).toBe(1);
+  expect(wrapper.find('[data-test="subagent-pane"]').isVisible()).toBe(true);
+
+  await vi.waitFor(() => {
+    expect(wrapper.findAll('[data-test="subagent-flow"] .suba-step').length).toBeGreaterThan(0);
+  });
+  expect(getDetail).toHaveBeenCalledWith('sub-1', store.currentSessionName);
+  expect(wrapper.text()).toContain('调研代码结构');
+  expect(wrapper.text()).toContain('read_file ✓ 1.2s');
+  // 任务切换条：会话内两个子代理 → 两个 chip，点击第二个切换查看对象
+  const chips = wrapper.findAll('.suba-chip');
+  expect(chips).toHaveLength(2);
+  await chips[1].trigger('click');
+  expect(store.subagentDetailId).toBe('sub-2');
+  wrapper.unmount();
+});
+
+it('目标任务已被清理（ok=false）时显示未找到提示而非空白', async () => {
+  const getDetail = vi.fn().mockResolvedValue({
+    ok: false, task: null, tasks: [], msg: '未找到该子代理任务（可能已被清理）',
+  });
+  (window as any).pywebview = { api: { get_subagent_task_detail: getDetail } };
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel);
+
+  store.openSubagentDetail('gone-1');
+  await nextTick();
+
+  await vi.waitFor(() => {
+    expect(wrapper.find('[data-test="subagent-missing"]').text()).toContain('未找到');
+  });
+  wrapper.unmount();
+});
+
+// ── 操控页签（设计 16.2：run 出现自动切入，不进选择页） ──
+
+it('run 出现后自动切入操控页签并校准快照，关闭页签后事件不抢回，新 run 再开一次', async () => {
   const getStatus = vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'paused', pause_reason: 'user_pause' });
   (window as any).pywebview = { api: { get_computer_control_status: getStatus } };
   const store = useAppStore();
+  store.rightPanelCollapsed = false;
   const wrapper = mount(RightPanel);
 
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'starting' });
   await nextTick();
 
   expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
-  expect(paneTitle(wrapper)).toBe('操控');
   expect(store.rightPanelPicker).toBe(false);
+  expect(store.rightPanelActiveTab).toBe('computer');
   expect(store.computerLastAutoOpenedRunId).toBe('run-1');
-  // 进入操控工作台触发快照校准
+  // 进入操控页签触发快照校准
   await vi.waitFor(() => expect(store.computerRun.status).toBe('paused'));
   expect(store.computerRun.pause_reason).toBe('user_pause');
 
-  // 用户点工台头 × 返回选择页：run 不终止，同一 run 后续事件不把人拽回去
-  await wrapper.find('[data-test="pane-close"]').trigger('click');
+  // 用户关掉操控页签：run 不终止，同一 run 后续事件不把人拽回去
+  await wrapper.find('[data-test="tab-close-computer"]').trigger('click');
   await nextTick();
   expect(store.rightPanelPicker).toBe(true);
   expect(store.computerRun.run_id).toBe('run-1');
@@ -218,7 +317,7 @@ it('run 出现后自动切入操控工作台并校准快照，返回选择页后
   await nextTick();
   expect(store.rightPanelPicker).toBe(true);
 
-  // 新 run 开始：再自动切入一次
+  // 新 run 开始：再自动开一次
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'starting' });
   await nextTick();
   expect(store.rightPanelPicker).toBe(false);
@@ -227,7 +326,7 @@ it('run 出现后自动切入操控工作台并校准快照，返回选择页后
   wrapper.unmount();
 });
 
-it('操控终态 60 秒且用户已返回选择页时自动收场', async () => {
+it('操控终态 60 秒且用户已关闭页签时自动收场（页签随收场关闭）', async () => {
   vi.useFakeTimers();
   const store = useAppStore();
   store.rightPanelCollapsed = false;
@@ -235,8 +334,8 @@ it('操控终态 60 秒且用户已返回选择页时自动收场', async () => 
 
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
   await nextTick();
-  // 用户 × 返回选择页（不终止 run），run 随后进入终态
-  await wrapper.find('[data-test="pane-close"]').trigger('click');
+  // 用户关掉操控页签（不终止 run），run 随后进入终态
+  await wrapper.find('[data-test="tab-close-computer"]').trigger('click');
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'completed' });
   await nextTick();
   expect(store.computerRun.run_id).toBe('run-1');
@@ -248,14 +347,14 @@ it('操控终态 60 秒且用户已返回选择页时自动收场', async () => 
   vi.advanceTimersByTime(1);
   await nextTick();
   expect(store.computerRun.run_id).toBe('');
-  // 收场后留在选择页
+  // 收场后无操控页签，停在选择页
   expect(store.rightPanelPicker).toBe(true);
 
   wrapper.unmount();
   vi.useRealTimers();
 });
 
-it('用户停留在操控工作台时到点顺延，不被自动关闭', async () => {
+it('用户停留在操控页签时到点顺延，不被自动关闭', async () => {
   vi.useFakeTimers();
   const store = useAppStore();
   // 「在看就不关」要求面板处于展开态（默认收起时谈不上在看）
@@ -299,4 +398,25 @@ it('鼠标悬停在右面板内时到点顺延，移开后下一个周期关闭'
 
   wrapper.unmount();
   vi.useRealTimers();
+});
+
+// ── Git 定向入口（状态栏分支项 / 输入框 chip） ──
+
+it('Git 分支项直达 Git 页签，浏览器页签并存不覆盖', async () => {
+  const store = useAppStore();
+  const gitStore = useGitStore();
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  store.openRightPanelTab('browser');
+  await nextTick();
+
+  gitStore.requestOpenPanel();
+  store.openRightPanelTab('git');
+  await nextTick();
+
+  expect(store.rightPanelPicker).toBe(false);
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
+  expect(wrapper.find('[data-test="git-pane"]').isVisible()).toBe(true);
+  expect(store.rightPanelTabs).toEqual(['browser', 'git']);
+  wrapper.unmount();
 });

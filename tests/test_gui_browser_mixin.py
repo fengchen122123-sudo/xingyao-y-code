@@ -24,12 +24,12 @@ class StubController:
         self.calls = []
         self.result = result or {"ok": True, "state": {"url": "https://example.com"}}
 
-    def open(self, rect, url=""):
-        self.calls.append(("open", rect, url))
+    def open(self, rect, url="", zoom=1.0):
+        self.calls.append(("open", rect, url, zoom))
         return self.result
 
-    def set_bounds(self, rect):
-        self.calls.append(("set_bounds", rect))
+    def set_bounds(self, rect, zoom=1.0):
+        self.calls.append(("set_bounds", rect, zoom))
         return self.result
 
     def navigate(self, url):
@@ -104,7 +104,23 @@ def test_open_passes_rect_and_url_to_controller(monkeypatch):
     result = d.browser_pane_open(VALID_RECT, "https://example.com")
 
     assert result["ok"] is True
-    assert stub.calls == [("open", VALID_RECT, "https://example.com")]
+    assert stub.calls == [("open", VALID_RECT, "https://example.com", 1.0)]
+
+
+def test_open_and_set_bounds_pass_zoom_through(monkeypatch):
+    """自由尺寸「适应窗口」：前端计算好的缩放随 open/set_bounds 一并透传。"""
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    d = Dummy()
+    stub = StubController()
+    d._embedded_browser = stub
+
+    d.browser_pane_open(VALID_RECT, "", 0.35)
+    d.browser_pane_set_bounds(VALID_RECT, 0.35)
+
+    assert stub.calls == [
+        ("open", VALID_RECT, "", 0.35),
+        ("set_bounds", VALID_RECT, 0.35),
+    ]
 
 
 def test_navigate_returns_controller_state(monkeypatch):
@@ -167,3 +183,49 @@ def test_hide_and_get_state_without_controller_are_safe():
     d = Dummy()
     assert d.browser_pane_hide() == {"ok": True}
     assert d.browser_pane_get_state() == {"ok": True, "state": None}
+
+
+def test_automation_endpoint_emits_session_name(monkeypatch):
+    """自动化事件携带发起会话名：前端据此把浏览器页签开进发起会话的右面板，
+    A 会话的浏览器自动化不再出现在当前查看的 B 会话里。"""
+    from core.computer.models import ComputerControlError
+
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+
+    class AutoController:
+        def __init__(self):
+            self.prepared = 0
+
+        def prepare_automation(self):
+            self.prepared += 1
+            return {"ok": True, "endpoint": "http://127.0.0.1:9222"}
+
+    d = Dummy()
+    stub = AutoController()
+    d._embedded_browser = stub
+    monkeypatch.setattr(
+        "core.computer.settings.get_project_browser_viewport",
+        lambda _workdir: (1280, 800),
+    )
+    monkeypatch.setattr("core.workspace_context.get_workdir", lambda: "D:/proj")
+
+    endpoint = d.embedded_browser_automation_endpoint("sess-A")
+
+    assert endpoint == "http://127.0.0.1:9222"
+    assert stub.prepared == 1
+    assert d.events == [
+        (
+            "embedded_browser_automation",
+            {"width": 1280, "height": 800, "session_name": "sess-A"},
+        )
+    ]
+
+    # 控制器缺失：明确抛错（无降级），不发面板事件
+    d2 = Dummy()
+    try:
+        d2.embedded_browser_automation_endpoint("sess-B")
+    except ComputerControlError as exc:
+        assert exc.code == "computer_embedded_unavailable"
+    else:
+        raise AssertionError("expected ComputerControlError")
+    assert d2.events == []

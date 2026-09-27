@@ -19,6 +19,7 @@ import ctypes
 import logging
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -39,10 +40,30 @@ _REJECTED_SCHEMES_RE = re.compile(
     r"^(javascript|data|file|vbscript|blob|mailto|about|tel|chrome|edge|view-source):"
 )
 
+# WebView2 ZoomFactor 允许范围：自由尺寸「适应窗口」用缩放把请求的逻辑视口
+# （如 1280×800）渲染进面板矩形；超出范围的请求直接夹到边界。
+_ZOOM_MIN = 0.25
+_ZOOM_MAX = 8.0
+
 
 def is_supported() -> bool:
     """内嵌浏览器仅 Windows（WebView2/WinForms）可用。"""
     return sys.platform == "win32"
+
+
+def profile_dir() -> Path:
+    """内嵌 WebView2 的 UserDataFolder（单一事实来源；computer.settings 的
+    embedded 分支必须与此恒等）。支持 YCODE_DATA_DIR 覆盖。"""
+    return _data_dir() / "browser_profile"
+
+
+def pick_free_loopback_port() -> int:
+    """随机空闲回环端口：CDP 调试端口只绑 127.0.0.1，端口随机化降低
+    本机其它进程探测/连接的面。存在理论竞态（端口被抢），由 CDP 连接
+    重试与明确报错兜底。"""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _data_dir() -> Path:
@@ -152,6 +173,10 @@ class EmbeddedBrowserController:
         self._url = ""
         self._title = ""
         self._bounds: Optional[Tuple[int, int, int, int]] = None
+        self._zoom = 1.0
+        # CDP 调试端口：仅自动化准备路径（prepare_automation）创建的控件携带；
+        # None = 当前控件未开调试端口（普通面板浏览），是重建判定依据。
+        self._cdp_port: Optional[int] = None
         self._lock = threading.RLock()
         self._last_emit = 0.0
         self._emit_timer: Optional[threading.Timer] = None
@@ -223,19 +248,25 @@ class EmbeddedBrowserController:
 
         return WebView2, CoreWebView2CreationProperties
 
-    def _create_control(self, form) -> None:
-        """在 GUI 线程内创建并挂载 WebView2 控件（幂等）。"""
+    def _create_control(self, form, additional_browser_args: str = "", cdp_port: Optional[int] = None) -> None:
+        """在 GUI 线程内创建并挂载 WebView2 控件（幂等）。
+
+        additional_browser_args 仅自动化准备路径使用（CDP 调试端口），
+        必须在 EnsureCoreWebView2Async 之前写入 CreationProperties。
+        """
         if self._webview is not None:
             return
         WebView2, CreationProperties = self._load_webview2()
         wv = WebView2()
         props = CreationProperties()
-        profile_dir = _data_dir() / "browser_profile"
+        profile = profile_dir()
         try:
-            profile_dir.mkdir(parents=True, exist_ok=True)
+            profile.mkdir(parents=True, exist_ok=True)
         except Exception:
             logger.debug("创建浏览器 profile 目录失败", exc_info=True)
-        props.UserDataFolder = str(profile_dir)
+        props.UserDataFolder = str(profile)
+        if additional_browser_args:
+            props.AdditionalBrowserArguments = additional_browser_args
         wv.CreationProperties = props
         wv.Visible = False
         wv.CoreWebView2InitializationCompleted += self._on_init_completed
@@ -243,6 +274,8 @@ class EmbeddedBrowserController:
         wv.EnsureCoreWebView2Async(None)
         self._webview = wv
         self._form = form
+        self._cdp_port = cdp_port
+        self._zoom = 1.0  # 新控件从默认缩放起步，旧缓存不得带入
 
     # ------------------------------------------------------------ 事件回调
 
@@ -400,8 +433,8 @@ class EmbeddedBrowserController:
 
     # ------------------------------------------------------------ 公开接口
 
-    def open(self, rect: Dict[str, Any], url: str = "") -> Dict[str, Any]:
-        """惰性创建控件，定位并显示；url 合法则立即导航。"""
+    def open(self, rect: Dict[str, Any], url: str = "", zoom: float = 1.0) -> Dict[str, Any]:
+        """惰性创建控件，定位并显示；url 合法则立即导航。zoom 为渲染缩放。"""
         try:
             if not is_supported():
                 return {"ok": False, "error": "unsupported_platform"}
@@ -413,7 +446,7 @@ class EmbeddedBrowserController:
             def _do_open():
                 try:
                     self._create_control(form)
-                    self._apply_bounds(form, rect)
+                    self._apply_bounds(form, rect, zoom)
                     self._visible = True
                     if self._webview is not None:
                         self._webview.Visible = True
@@ -437,8 +470,8 @@ class EmbeddedBrowserController:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def set_bounds(self, rect: Dict[str, Any]) -> Dict[str, Any]:
-        """更新控件矩形的物理像素 Bounds，并 BringToFront 压住主 webview。"""
+    def set_bounds(self, rect: Dict[str, Any], zoom: float = 1.0) -> Dict[str, Any]:
+        """更新控件矩形的物理像素 Bounds 与渲染缩放，并 BringToFront 压住主 webview。"""
         try:
             form = self._form or self._get_form()
             if form is None or self._webview is None:
@@ -447,7 +480,7 @@ class EmbeddedBrowserController:
 
             def _apply():
                 try:
-                    self._apply_bounds(form, rect)
+                    self._apply_bounds(form, rect, zoom)
                     box["ok"] = True
                 except Exception as exc:
                     box["ok"] = False
@@ -459,13 +492,32 @@ class EmbeddedBrowserController:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def _apply_bounds(self, form, rect: Dict[str, Any]) -> None:
+    def _apply_bounds(self, form, rect: Dict[str, Any], zoom: float = 1.0) -> None:
         """GUI 线程内计算 DPI 并把 CSS 矩形换算为控件 Bounds。"""
         scale = self._compute_scale(form)
         x, y, w, h = css_rect_to_physical(rect, scale)
         self._webview.Bounds = self._make_rectangle(x, y, w, h)
+        self._apply_zoom(zoom)
         self._webview.BringToFront()
         self._bounds = (x, y, w, h)
+
+    def _apply_zoom(self, zoom: float) -> None:
+        """设置渲染缩放（自由尺寸「适应窗口」）：网页按 bounds/zoom 的 CSS
+        视口布局，整体缩放贴合控件矩形。幂等：值未变化不触碰控件。"""
+        try:
+            z = float(zoom)
+        except (TypeError, ValueError):
+            return
+        if z != z:  # NaN
+            return
+        z = max(_ZOOM_MIN, min(_ZOOM_MAX, z))
+        if self._zoom == z:
+            return
+        try:
+            self._webview.ZoomFactor = z
+            self._zoom = z
+        except Exception:
+            logger.debug("设置 WebView2 ZoomFactor 失败", exc_info=True)
 
     def navigate(self, url: str) -> Dict[str, Any]:
         target = normalize_url(url)
@@ -558,6 +610,66 @@ class EmbeddedBrowserController:
     def get_state(self) -> Dict[str, Any]:
         try:
             return {"ok": True, "state": self._snapshot()}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def prepare_automation(self) -> Dict[str, Any]:
+        """星瑶自动化准备：确保控件带 CDP 调试端口存在（幂等）。
+
+        - 控件已带端口：直接返回现有 endpoint（面板浏览不受影响）；
+        - 控件存在但未带端口：Dispose 后带端口重建（页面会重载）；
+        - 控件不存在：隐藏创建（不强制打开面板，可见性/定位仍由前端
+          面板的 open/set_bounds 正常路径负责——WebView2 隐藏时渲染可能
+          被节流，自动化开始后面板会自动切到浏览器页签使其可见）。
+
+        返回 {'ok', 'endpoint', 'recreated'}；失败 {'ok': False, 'error'}。
+        """
+        try:
+            if not is_supported():
+                return {"ok": False, "error": "unsupported_platform"}
+            form = self._get_form()
+            if form is None:
+                return {"ok": False, "error": "form_unavailable"}
+            box: Dict[str, Any] = {}
+
+            def _do_prepare():
+                try:
+                    if self._webview is not None and self._cdp_port is not None:
+                        box["ok"] = True
+                        box["endpoint"] = f"http://127.0.0.1:{self._cdp_port}"
+                        box["recreated"] = False
+                        return
+                    if self._webview is not None:
+                        # 已有控件但未带调试端口：带端口重建（页面重载）。
+                        old = self._webview
+                        self._webview = None
+                        self._ready = False
+                        self._visible = False
+                        with self._lock:
+                            self._pending_url = ""
+                        self._zoom = 1.0
+                        try:
+                            old.Dispose()
+                        except Exception:
+                            logger.debug("释放旧内嵌 WebView2 失败", exc_info=True)
+                        box["recreated"] = True
+                    port = pick_free_loopback_port()
+                    self._create_control(
+                        form,
+                        additional_browser_args=f"--remote-debugging-port={port}",
+                        cdp_port=port,
+                    )
+                    box["ok"] = True
+                    box["endpoint"] = f"http://127.0.0.1:{port}"
+                    if not box.get("recreated"):
+                        box["recreated"] = False
+                except Exception as exc:
+                    box["ok"] = False
+                    box["error"] = str(exc)
+
+            if not self._invoke(form, _do_prepare):
+                return {"ok": False, "error": "invoke_failed"}
+            return box or {"ok": False, "error": "invoke_failed"}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 

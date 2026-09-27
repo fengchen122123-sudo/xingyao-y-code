@@ -53,6 +53,12 @@
           <span class="subagent-desc" :title="task.description">{{ task.description }}</span>
           <span v-if="task.stage_detail" class="subagent-detail">{{ task.stage_detail }}</span>
           <span class="subagent-time">{{ task.elapsed }}s</span>
+          <button
+            class="subagent-view"
+            :data-test="'subagent-view-' + task.id"
+            title="在右侧面板查看该子代理的执行流程"
+            @click="store.openSubagentDetail(task.id)"
+          >查看</button>
         </div>
       </div>
 
@@ -67,6 +73,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
 import AppIcon from './AppIcon.vue';
+import { useAppStore } from '../stores/appStore';
 import {
   diffCounts,
   type LegacyDiff,
@@ -78,6 +85,8 @@ const props = defineProps<{
   row: ToolTraceRow;
   elapsedMs?: number;
 }>();
+
+const store = useAppStore();
 
 // 本地展开状态：只影响本行 UI，不写入任何 store
 const resultOpen = ref(false);
@@ -442,6 +451,15 @@ function diffLineClass(line: string) {
   margin-left: auto;
   flex-shrink: 0;
   color: var(--text-faint);
+}
+.subagent-view {
+  flex-shrink: 0;
+  color: var(--accent);
+  opacity: 0.85;
+}
+.subagent-view:hover {
+  opacity: 1;
+  text-decoration: underline;
 }
 .trace-result {
   display: block;

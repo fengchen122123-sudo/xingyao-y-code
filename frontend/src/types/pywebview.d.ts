@@ -459,6 +459,46 @@ export interface BackgroundTask {
   running_time?: string;
 }
 
+// ---------------------------------------------------------------------------
+// 子代理执行过程（右面板"子代理"工作台 + 聊天卡片"查看"入口）
+// ---------------------------------------------------------------------------
+
+export interface SubagentStagePayload {
+  name: string;
+  at: number;
+  detail: string;
+}
+
+/** get_subagent_task_detail 返回的完整任务详情（含阶段历史与结论） */
+export interface SubagentTaskDetail {
+  id: string;
+  description: string;
+  type: string;
+  status: string;
+  stage: string;
+  stage_detail?: string;
+  elapsed: number;
+  background: boolean;
+  plan_item_id?: string;
+  started_at?: number | null;
+  finished_at?: number | null;
+  stages: SubagentStagePayload[];
+  result: string;
+  error: string;
+  partial: string;
+}
+
+/** 任务切换条用的轻量清单项 */
+export interface SubagentTaskListItem {
+  id: string;
+  description: string;
+  type: string;
+  status: string;
+  stage: string;
+  elapsed: number;
+  background: boolean;
+}
+
 // 上下文来源（字符数估算，仅用于悬停面板展示占比，不进 token 账本）
 export type ContextBreakdownSource =
   | 'messages'
@@ -674,6 +714,7 @@ export interface SubagentProgressEventData {
     stage_detail?: string;
     elapsed: number;
     background?: boolean;
+    stages?: SubagentStagePayload[];
   }>;
 }
 
@@ -1084,6 +1125,15 @@ export interface PyWebViewAPI {
   get_background_tasks(): Promise<BackgroundTask[]>;
   get_background_task_output(taskId: string, tailLines?: number): Promise<{ ok: boolean; output: string; msg?: string }>;
   kill_task(taskId: string): Promise<any>;
+
+  // 子代理执行过程详情（右面板"子代理"工作台轮询）：task 为目标任务完整详情，
+  // tasks 为会话内全部子代理轻量清单；任务被容量清理时 ok=false 保留 msg
+  get_subagent_task_detail(taskId: string, sessionName?: string): Promise<{
+    ok: boolean;
+    task?: SubagentTaskDetail | null;
+    tasks: SubagentTaskListItem[];
+    msg?: string;
+  }>;
 
   // ---------------------------------------------------------------------------
   // 内嵌浏览器（右侧面板浏览器页签；宿主 gui_browser_mixin.BrowserBridgeMixin）

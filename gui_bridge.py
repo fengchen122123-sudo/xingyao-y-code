@@ -2405,6 +2405,9 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
         msgs: List[Dict[str, Any]] = []
         has_more = False
         oldest_id: Optional[int] = None
+        # 电脑操控观察跟进消息识别（展示层过滤，见循环内说明）
+        from core.computer.provider_generic import is_observation_protocol_message
+
         try:
             # 按回合撤销：消息 → 回合关联（纯界面元数据，Provider 请求不读取）
             try:
@@ -2421,6 +2424,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
                 if role in ("user", "assistant", "tool"):
                     content = msg.get("content") or ""
                     if role == "user":
+                        # 电脑操控观察跟进消息（设计 19.3）：系统发给模型的观察提示
+                        # 协议消息，不是用户发送的。展示层一律跳过——气泡与红点
+                        # 导航都按 user 消息渲染，不过滤就会冒充用户发言；
+                        # 模型上下文（get_history）不受影响。_parse_message_rows
+                        # 会把持久化 JSON 的 _computer_v1 键提升到行顶层。
+                        if is_observation_protocol_message(msg):
+                            continue
                         # 历史回放：剥离当轮注入的「当前运行上下文 / 当前时间」后缀，
                         # 那部分是给模型看的运行快照，不该显示在历史气泡里
                         content = strip_context_suffix(content)
@@ -2518,6 +2528,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
             raw_items = self._memory.get_session_user_nav_items(session_name)
             items = []
             for it in raw_items:
+                # 电脑操控观察跟进消息不是用户发送的：红点导航一并跳过
+                # （与 _load_session_messages 的气泡过滤同一裁决）
+                if it.get("is_observation"):
+                    continue
                 text = strip_context_suffix(str(it.get("text") or ""))
                 text = re.sub(r"\s+", " ", text).strip()
                 if not text:
@@ -5894,6 +5908,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
                         "stage_detail": last_detail,
                         "elapsed": elapsed,
                         "background": bool(snap.run_in_background),
+                        # 完整阶段历史：右面板"子代理"工作台渲染执行流程时间线
+                        "stages": [
+                            {"name": s.name, "at": s.at, "detail": s.detail}
+                            for s in snap.stages
+                        ],
                     })
                 # 没有任务且上一轮也没有任务时不推事件，避免空轮询刷屏
                 if tasks or had_tasks:
@@ -7427,6 +7446,62 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
         except Exception as exc:
             logger.debug("get_background_task_output 失败", exc_info=True)
             return {"ok": False, "output": "", "msg": str(exc)}
+
+    def get_subagent_task_detail(self, task_id: str, session_name: str = "") -> Dict[str, Any]:
+        """子代理执行过程详情（右面板"子代理"工作台轮询用）。
+
+        返回目标任务的完整阶段历史 + 该会话全部子代理的轻量清单（供任务切换条）。
+        目标任务按 task_id 全局查找（会话切换后仍可回看）；清单按 session 过滤，
+        session_name 为空时返回全部任务。任务可能因容量清理被回收，此时 ok=False，
+        前端保留最后已知状态继续展示。
+        """
+        try:
+            from core.tools import subagent_manager
+            wanted = str(task_id or "")
+            session = str(session_name or "")
+            now = time.time()
+            tasks: List[Dict[str, Any]] = []
+            target = None
+            target_item: Dict[str, Any] | None = None
+            for snap in subagent_manager.snapshot():
+                elapsed = 0
+                if snap.started_at:
+                    elapsed = int((snap.finished_at or now) - snap.started_at)
+                item = {
+                    "id": snap.task_id,
+                    "description": snap.description,
+                    "type": snap.subagent_type,
+                    "status": snap.status,
+                    "stage": snap.stage,
+                    "elapsed": elapsed,
+                    "background": bool(snap.run_in_background),
+                }
+                if not session or snap.parent_session == session:
+                    tasks.append(item)
+                if snap.task_id == wanted:
+                    target = snap
+                    target_item = item
+            if target is None or target_item is None:
+                return {"ok": False, "task": None, "tasks": tasks,
+                        "msg": "未找到该子代理任务（可能已被清理）"}
+            detail = {
+                **target_item,
+                "stage_detail": target.stages[-1].detail if target.stages else "",
+                "plan_item_id": target.plan_item_id,
+                "started_at": target.started_at,
+                "finished_at": target.finished_at,
+                "stages": [
+                    {"name": s.name, "at": s.at, "detail": s.detail}
+                    for s in target.stages
+                ],
+                "result": str(target.result or "")[:4000],
+                "error": str(target.error or ""),
+                "partial": str(target.partial_result or "")[:2000],
+            }
+            return {"ok": True, "task": detail, "tasks": tasks}
+        except Exception as exc:
+            logger.debug("get_subagent_task_detail 失败", exc_info=True)
+            return {"ok": False, "task": None, "tasks": [], "msg": str(exc)}
 
     def kill_task(self, task_id: str) -> Dict[str, Any]:
         try:

@@ -53,12 +53,10 @@ function onDocClick() {
 onMounted(() => document.addEventListener('click', onDocClick));
 onUnmounted(() => document.removeEventListener('click', onDocClick));
 
-// 详情：打开右侧面板并切入该任务的执行过程工作台，任务卡保持展开
-// （bgTaskOpenNonce 每次自增，同一任务重复点击也能从选择页切回）
+// 详情：打开右侧面板后台任务页签查看该任务执行过程，任务卡保持展开
+// （bgTaskOpenNonce 每次自增，同一任务重复点击也能从其他页签切回）
 function openDetail(id: string) {
-  store.bgTaskDetailId = id;
-  store.bgTaskOpenNonce += 1;
-  store.expandRightPanelDirect();
+  store.openBackgroundTaskDetail(id);
 }
 
 async function killTask(id: string) {

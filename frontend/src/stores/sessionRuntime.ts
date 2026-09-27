@@ -39,6 +39,12 @@ export interface SessionRuntimeState {
   historyOldestId?: number | null;
   // 红点导航全量索引：随会话保存/恢复，切会话时绝不残留上一个会话的红点
   navItems?: Array<{ id: number; preview: string }>;
+  // 右面板多页签（会话级隔离）：该会话打开的页签、激活页签与面板展开态，
+  // 随会话保存/恢复——A 会话打开的浏览器页签不串到 B 会话。
+  // undefined = 该会话从未展开过右面板（切回时默认收起、无页签）
+  rightPanelTabs?: string[];
+  rightPanelActiveTab?: string;
+  rightPanelExpanded?: boolean;
 }
 
 export function createSessionRuntime(): SessionRuntimeState {

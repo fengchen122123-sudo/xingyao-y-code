@@ -209,7 +209,7 @@ const gitBranchLabel = computed(() => {
 });
 function openGitPanel() {
   gitStore.requestOpenPanel();
-  store.expandRightPanelDirect();
+  store.openRightPanelTab('git');
 }
 const inputVal = computed<string>({
   get: () => store._getSessionRuntime().composerText || '',

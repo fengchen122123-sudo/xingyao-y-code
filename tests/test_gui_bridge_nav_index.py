@@ -97,3 +97,29 @@ def test_load_session_messages_carries_msg_id_anchor():
     assert all(isinstance(i, int) for i in ids)
     assert ids == sorted(ids)
     assert msgs[0]["_msg_id"] == oldest_id
+
+
+def test_nav_index_skips_observation_followup_messages():
+    """电脑操控观察跟进消息不是用户发送的：红点导航一并跳过。"""
+    import json
+
+    from core.computer.provider_generic import _observation_followup_message
+
+    class _Obs:
+        target = "browser"
+        elements = [
+            {"ref": "el-1", "kind": "link", "name": "主页",
+             "bounds": (10, 20, 30, 40), "enabled": True},
+        ]
+        png_path = ""
+
+    bridge = _bare_bridge()
+    bridge._memory.add_message("s", "user", "帮我打开浏览器看看")
+    followup = _observation_followup_message(_Obs(), run_id="run-1", ordinal=1)
+    bridge._memory.add_message("s", "user", json.dumps(followup, ensure_ascii=False))
+
+    res = bridge.get_session_nav_index("s")
+
+    assert res["ok"] is True
+    assert res["total"] == 1
+    assert res["items"][0]["preview"] == "帮我打开浏览器看看"
