@@ -33,6 +33,15 @@ export interface UseEmbeddedBrowserSurfaceOptions {
   shouldShowSurface: () => boolean;
   /** 表面占位元素 getter（用于测量矩形与遮挡检测中心点） */
   getSurfaceEl: () => HTMLElement | null;
+  /**
+   * 包含区元素 getter（可选）：所有上报矩形都会被夹紧（交集）到该元素
+   * 矩形内。原生控件绘制在 DOM 之上、不受 overflow:hidden 裁剪，测量源
+   * 一旦给出越出包含区的矩形，控件就会盖住界面其它区域——这个夹紧是
+   * 「原生表面绝不逃出面板」的最后防线。
+   */
+  getClampEl?: () => HTMLElement | null;
+  /** 原生渲染缩放（自由尺寸「适应窗口」）：随每次 open/set_bounds 一并上报 */
+  getZoom?: () => number;
   /** 平台不支持时返回 true：完全不发桥调用，避免无谓报错 */
   isUnsupported: () => boolean;
   /** 任一次桥调用返回 unsupported_platform 时回调（界面切不支持态） */
@@ -61,6 +70,16 @@ function readApi(): any {
     return (window as any).pywebview?.api ?? null;
   } catch {
     return null;
+  }
+}
+
+/** 当前渲染缩放：自由尺寸态由宿主组件提供，异常/缺省一律回落 1（不缩放） */
+function currentZoom(opts: UseEmbeddedBrowserSurfaceOptions): number {
+  try {
+    const z = opts.getZoom?.();
+    return typeof z === 'number' && Number.isFinite(z) && z > 0 ? z : 1;
+  } catch {
+    return 1;
   }
 }
 
@@ -103,12 +122,36 @@ export function useEmbeddedBrowserSurface(
 
   function measure(el: HTMLElement): BrowserRect {
     const r = el.getBoundingClientRect();
-    return {
+    return clampRect(el, {
       x: Math.round(r.left),
       y: Math.round(r.top),
       width: Math.round(r.width),
       height: Math.round(r.height),
-    };
+    });
+  }
+
+  /** 把矩形夹紧（交集）到包含区内：测量源越出包含区的部分直接裁掉。
+   *  量包含区自身时不夹紧（恒等交集）；包含区不可用（缺元素/零尺寸/
+   *  异常）时不夹紧，维持原行为。 */
+  function clampRect(measured: HTMLElement, rect: BrowserRect): BrowserRect {
+    const clampEl = opts.getClampEl?.();
+    if (!clampEl || clampEl === measured) return rect;
+    try {
+      const b = clampEl.getBoundingClientRect();
+      if (b.width <= 0 || b.height <= 0) return rect;
+      const left = Math.max(rect.x, Math.round(b.left));
+      const top = Math.max(rect.y, Math.round(b.top));
+      const right = Math.min(rect.x + rect.width, Math.round(b.right));
+      const bottom = Math.min(rect.y + rect.height, Math.round(b.bottom));
+      return {
+        x: left,
+        y: top,
+        width: Math.max(0, right - left),
+        height: Math.max(0, bottom - top),
+      };
+    } catch {
+      return rect;
+    }
   }
 
   function rectKey(rect: BrowserRect): string {
@@ -147,7 +190,7 @@ export function useEmbeddedBrowserSurface(
     surfaceVisible.value = true;
     lastRectKey = rectKey(rect);
     // open 幂等（后端保活，重复调用只重定位）；首次带 url 可一步「创建 + 导航」
-    return callApi('browser_pane_open', rect, url).then((res) => {
+    return callApi('browser_pane_open', rect, url, currentZoom(opts)).then((res) => {
       if (res && res.ok === false && res.error === 'unsupported_platform') markUnsupported();
       return res;
     });
@@ -168,7 +211,7 @@ export function useEmbeddedBrowserSurface(
       const key = rectKey(rect);
       if (key !== lastRectKey) {
         lastRectKey = key;
-        dispatch('browser_pane_set_bounds', rect);
+        dispatch('browser_pane_set_bounds', rect, currentZoom(opts));
       }
       return null;
     } catch {
@@ -219,7 +262,7 @@ export function useEmbeddedBrowserSurface(
       // 心跳：可见时强制重报矩形，兜底丢失的尺寸/位置事件
       if (!opts.isActive() || !lastVisible) return;
       const target = opts.getSurfaceEl();
-      if (target) dispatch('browser_pane_set_bounds', measure(target));
+      if (target) dispatch('browser_pane_set_bounds', measure(target), currentZoom(opts));
     }, BOUNDS_HEARTBEAT_MS);
     // 首帧后校准一次（此时 DOM 布局与 props 都已就位）
     void nextTick(() => syncNow());

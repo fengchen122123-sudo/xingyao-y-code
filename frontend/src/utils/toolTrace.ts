@@ -33,6 +33,12 @@ export interface ToolExecutionResult {
   display?: ToolDisplay;
 }
 
+export interface SubagentStage {
+  name: string;
+  at: number;
+  detail: string;
+}
+
 export interface SubagentTaskSnapshot {
   id: string;
   description: string;
@@ -40,6 +46,9 @@ export interface SubagentTaskSnapshot {
   stage: string;
   stage_detail?: string;
   elapsed: number;
+  type?: string;
+  background?: boolean;
+  stages?: SubagentStage[];
 }
 
 export interface LegacyDiff {

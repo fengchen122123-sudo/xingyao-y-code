@@ -451,7 +451,7 @@ const gitBranchText = computed(() => {
 function openGitPanel() {
   // 非 Git 项目点击不展开（面板内已有"非仓库"提示态），避免空操作困惑
   gitStore.requestOpenPanel();
-  store.expandRightPanelDirect();
+  store.openRightPanelTab('git');
 }
 watch(
   () => store.workdir,

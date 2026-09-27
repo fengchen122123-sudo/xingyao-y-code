@@ -225,3 +225,124 @@ def test_navigate_queues_when_core_not_ready_then_flushes():
     assert core.navigated == []
     ctrl._on_init_completed(ctrl._webview, SimpleNamespace(IsSuccess=True))
     assert core.navigated == ["https://example.com"]
+
+
+class _ZoomProbe:
+    """记录 ZoomFactor 赋值次数的桩：验证同值幂等（不重复触碰控件）。"""
+
+    def __init__(self):
+        self.zoom_sets = 0
+        self._zoom = None
+
+    @property
+    def ZoomFactor(self):
+        return self._zoom
+
+    @ZoomFactor.setter
+    def ZoomFactor(self, value):
+        self.zoom_sets += 1
+        self._zoom = value
+
+
+def test_apply_zoom_clamps_to_webview_range():
+    ctrl, _core = _fake_ready_controller()
+    probe = _ZoomProbe()
+    ctrl._webview = probe
+
+    ctrl._apply_zoom(0.01)
+    assert probe.ZoomFactor == 0.25
+    ctrl._apply_zoom(99)
+    assert probe.ZoomFactor == 8.0
+
+
+def test_apply_zoom_skips_unchanged_value():
+    ctrl, _core = _fake_ready_controller()
+    probe = _ZoomProbe()
+    ctrl._webview = probe
+
+    ctrl._apply_zoom(0.5)
+    assert probe.zoom_sets == 1
+    ctrl._apply_zoom(0.5)  # 幂等：心跳重复上报同值不得反复触碰控件
+    ctrl._apply_zoom(0.7)
+    ctrl._apply_zoom(0.7)
+    assert probe.ZoomFactor == 0.7
+    assert probe.zoom_sets == 2
+
+
+def test_apply_zoom_tolerates_bad_input():
+    ctrl, _core = _fake_ready_controller()
+    probe = _ZoomProbe()
+    ctrl._webview = probe
+
+    for bad in (None, "abc", float("nan")):
+        ctrl._apply_zoom(bad)
+    assert probe.zoom_sets == 0
+    assert probe.ZoomFactor is None
+
+
+# ---------------- 星瑶自动化准备（prepare_automation） ----------------
+
+
+def test_prepare_automation_creates_hidden_control_with_cdp_args():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    ctrl._webview = None
+    calls: dict = {}
+
+    def _fake_create(form, additional_browser_args="", cdp_port=None):
+        calls["args"] = additional_browser_args
+        calls["port"] = cdp_port
+        ctrl._webview = SimpleNamespace()
+        ctrl._cdp_port = cdp_port
+
+    ctrl._create_control = _fake_create
+    result = ctrl.prepare_automation()
+    assert result["ok"] is True
+    assert result["recreated"] is False
+    assert result["endpoint"] == f"http://127.0.0.1:{calls['port']}"
+    assert calls["args"].startswith("--remote-debugging-port=")
+    assert calls["args"] == f"--remote-debugging-port={calls['port']}"
+
+
+def test_prepare_automation_is_idempotent_when_port_present():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    ctrl._webview = SimpleNamespace()
+    ctrl._cdp_port = 9321
+    created: list = []
+    ctrl._create_control = lambda *args, **kwargs: created.append(args)
+    result = ctrl.prepare_automation()
+    assert result == {"ok": True, "endpoint": "http://127.0.0.1:9321", "recreated": False}
+    assert created == []  # 幂等：不重复创建/重建控件
+
+
+def test_prepare_automation_recreates_control_without_port():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    disposed: list = []
+    ctrl._webview = SimpleNamespace(Dispose=lambda: disposed.append(1))
+    ctrl._cdp_port = None
+    ctrl._ready = True
+    created: dict = {}
+
+    def _fake_create(form, additional_browser_args="", cdp_port=None):
+        created["port"] = cdp_port
+        ctrl._webview = SimpleNamespace()
+        ctrl._cdp_port = cdp_port
+
+    ctrl._create_control = _fake_create
+    result = ctrl.prepare_automation()
+    assert result["ok"] is True
+    assert result["recreated"] is True
+    assert disposed == [1]
+    assert ctrl._ready is False  # 重建后内核重新初始化
+    assert created["port"] is not None
+    assert result["endpoint"] == f"http://127.0.0.1:{created['port']}"
+
+
+def test_prepare_automation_requires_form():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._webview = None
+    ctrl._get_form = lambda: None
+    result = ctrl.prepare_automation()
+    assert result == {"ok": False, "error": "form_unavailable"}

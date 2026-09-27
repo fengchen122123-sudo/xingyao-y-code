@@ -597,6 +597,30 @@ def main():
         mcp_manager = None
     api = ApiBridge(mcp_manager=mcp_manager)
     _start_preload_thread()
+    # 星瑶浏览器自动化默认走 GUI 内置浏览器：注入进程级默认值（仅影响
+    # 配置缺省，不覆盖用户显式设置）与 CDP endpoint 提供者（embedded 专属，
+    # 确保内嵌控件带调试端口并通知前端面板呈现项目分辨率）。失败只留痕。
+    try:
+        from core.computer.controller import get_computer_control_service
+        from core.computer.settings import (
+            register_browser_viewport_listener,
+            set_process_default_browser,
+        )
+
+        set_process_default_browser("embedded")
+        get_computer_control_service().set_embedded_endpoint_provider(
+            api.embedded_browser_automation_endpoint
+        )
+
+        def _on_browser_viewport_changed(_workdir, viewport):
+            api.emit_event(
+                "embedded_browser_automation",
+                {"width": viewport[0], "height": viewport[1]},
+            )
+
+        register_browser_viewport_listener(_on_browser_viewport_changed)
+    except Exception:
+        logger.exception("接线内置浏览器自动化通道失败（保持外部浏览器可用）")
 
     # 启动前环境体检：Windows GUI 走 pywebview 的 edgechromium 后端，强依赖系统
     # WebView2 Runtime。该运行时缺失/损坏时 pywebview 的 on_webview_ready 只记一条

@@ -694,6 +694,25 @@ def build_default_registry() -> ToolRegistry:
             activity_description="查看 MCP 服务列表",
             side_effect_scope="none",  # 表未覆盖：只读查询
         ),
+        # ── 项目浏览器分辨率（星瑶按项目自设视口）─────────────────────────
+        ToolSpec(
+            name="browser_set_viewport",
+            description=(
+                "设置当前项目的浏览器分辨率（逻辑视口宽×高，单位像素），按项目持久化。"
+                "星瑶做浏览器操作时页面按该分辨率渲染：GUI 内置浏览器以适应窗口缩放呈现，"
+                "外部浏览器作为窗口视口。适配移动端页面用 375×667，桌面页面用 1440×900。"
+                "当前会话未关联项目时无法设置。"
+            ),
+            input_schema=_schema({
+                "width": {"type": "integer", "description": "视口宽度（像素），120-8192"},
+                "height": {"type": "integer", "description": "视口高度（像素），120-8192"},
+            }, ["width", "height"]),
+            execute=lambda width, height: _browser_set_viewport_wrapper(width, height),
+            requires_permission=True,
+            parallel_safe=False,
+            activity_description="设置项目浏览器分辨率",
+            side_effect_scope="workspace",
+        ),
         # ── 星轨自动化工具（对话里创建/修改/删除/立即执行定时任务）───────
         ToolSpec(
             name="automation_create",
@@ -922,6 +941,29 @@ def _mcp_set_enabled_wrapper(name, enabled):
 def _mcp_list_servers_wrapper():
     from core.mcp_client import mcp_manager
     return ToolResult(content=mcp_manager.list_servers(), is_error=False)
+
+
+# ── 项目浏览器分辨率工具的执行包装函数 ──────────────────────────────
+def _browser_set_viewport_wrapper(width, height):
+    from core.computer.models import ComputerControlError
+    from core.computer.settings import set_project_browser_viewport
+    from core.workspace_context import get_workdir
+
+    workdir = get_workdir()
+    try:
+        viewport = set_project_browser_viewport(workdir, width, height)
+    except ComputerControlError as error:
+        return ToolResult(content=f"{error.code}: {error.message}", is_error=True)
+    except Exception as error:
+        return ToolResult(content=f"browser_set_viewport 执行失败：{error}", is_error=True)
+    return ToolResult(
+        content=(
+            f"已设置当前项目的浏览器分辨率：{viewport[0]}×{viewport[1]}"
+            "（逻辑像素，按项目持久化）。GUI 内置浏览器已即时按适应窗口缩放"
+            "呈现该分辨率；之后的浏览器自动化也会使用该视口。"
+        ),
+        is_error=False,
+    )
 
 
 # ── 星轨自动化（automation_*）工具的执行包装函数 ──────────────────────
