@@ -1,0 +1,151 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.env
+.venv
+env/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# PyInstaller (auto-generated, never commit)
+# 注意：ycode.spec / ycode_setup.spec / ycode_uninstall.spec 是项目自定义配置，
+# 已纳入版本控制；其他自动生成的 .spec（例如 build_release.py 用 --onefile
+# 动态构建 ycode_setup.exe / ycode_cli_setup.exe 时，PyInstaller 在临时目录
+# 里自动生成的那些）仍然忽略。
+*.spec
+!ycode.spec
+!ycode_setup.spec
+!ycode_uninstall.spec
+
+# pytest
+.pytest_cache/
+mytemp/
+
+# SQLite databases (contain user data / dev state)
+*.db
+
+# Per-session persisted task plans (runtime state)
+.ycode_tasks/plans/*.json
+.ycode_tasks/plans/*.tmp
+# 任务日志与本地运行状态（含个人路径，不入库）
+.ycode_tasks/*.log
+.ycode_tasks/tasks.json
+# 会话计划快照（运行时状态，不入库）
+.zcode/
+
+# Scraped / downloaded HTML files（仅忽略仓库根目录下的抓取/临时网页；
+# /* 限定层级，避免误伤 frontend/index.html 这类项目源码里的 HTML 模板）
+/*.html
+!frontend/index.html
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project secrets & local state (NEVER commit real API keys)
+config.json
+active_skills.json
+mcp.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Scratch and temporary files
+scratch_*
+scratch/
+generate_interview_pdf*.py
+zip/
+*.pdf
+.pytest_tmp/
+
+# Build logs
+build_log.txt
+
+# DB debug exports (temporary debug dumps)
+db_*.txt
+
+# Temporary test directories
+test20*/
+.test-profile-*/
+.workbuddy/
+.worktrees/
+
+# Local superpowers brainstorm state
+.superpowers/
+
+# Runtime diagnostic output (playwright screenshots, contact sheets, etc.)
+output/
+
+# pytest ��ʱ����Ŀ¼
+tmp/
+
+# 临时产物：图片生成脚本（内含密钥，严禁入库）与本地测试生成的图片/图表
+gen_images.py
+img1_*.png
+img2_*.png
+img3_*.png
+img4_*.png
+flowchart.mmd
+flowchart.png
+docs/harness_execution_flow.html
+docs/harness_execution_flow.md
+
+# Node dependencies
+node_modules/
+
+# SQLite WAL sidecar files - runtime state
+*.db-shm
+*.db-wal
+
+# 内部合规材料：含系统弱点与风险分析，仅本地留存，禁止入库/推送
+# 覆盖合规审查报告、整改方案、PII 处置报告（含后续新增版本）
+docs/合规审查报告*
+docs/合规整改方案*
+docs/PII*
+
+hunyuan_*.jpg
+tokenrhythm_*.png
+.tmp_skill_src/
+build_*.log
+dryrun_*.log
+publish_*.log
+
+# ===== ↑ 以上同步自 .gitignore（「从 .gitignore 同步」只重写以上部分）=====
+.git/
+.hg/
+.svn/
+bower_components/
+jspm_packages/
+site-packages/
+coverage/
+htmlcov/
+lcov-report/
+cmakefiles/
+cmake-build-*/
+bazel-*/
+pods/
+deriveddata/
+storybook-static/
+playwright-report/
+test-results/
+allure-results/
+allure-report/
+cdk.out/
+*.dist-info/
+eggs/
+pip-wheel-metadata/
+wheels/
+# ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
+# 自定义规则写在下方（本行提示可删除）

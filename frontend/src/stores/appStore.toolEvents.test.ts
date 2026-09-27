@@ -172,6 +172,34 @@ it('moves subagent snapshots into the running run_subagent call and freezes on c
   expect(message.tool_calls![0].subagent_tasks).toHaveLength(1);
 });
 
+it('carries stage history into subagent snapshots for the right-panel flow view', () => {
+  const store = useAppStore();
+  store.handleBridgeEvent(event('turn_start', { user_text: '并行调研' }));
+  store.handleBridgeEvent(event('tool_start', { id: 'sub-1', name: 'run_subagent', label: '运行子代理', display: {} }));
+  store.handleBridgeEvent(event('subagent_progress', {
+    tasks: [
+      {
+        id: 't1', description: '调研代码结构', status: 'running', stage: 'tool',
+        stage_detail: 'read_file ✓ 1.2s', elapsed: 5, type: 'explore', background: true,
+        stages: [
+          { name: 'model', at: 1758900000.5, detail: '' },
+          { name: 'tool', at: 1758900001.5, detail: 'read_file ✓ 1.2s' },
+        ],
+      },
+    ],
+  }));
+
+  const snapshot = store.messages.at(-1)!.tool_calls![0].subagent_tasks![0];
+  expect(snapshot.type).toBe('explore');
+  expect(snapshot.background).toBe(true);
+  expect(snapshot.stages).toEqual([
+    { name: 'model', at: 1758900000.5, detail: '' },
+    { name: 'tool', at: 1758900001.5, detail: 'read_file ✓ 1.2s' },
+  ]);
+  // 事件里的快照同时进入面板级列表，供查看入口复用
+  expect(store.subagentTasks[0].stages).toHaveLength(2);
+});
+
 it('creates an orphan completion call when tool_finish has no matching start', () => {
   const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
   const store = useAppStore();

@@ -16,21 +16,24 @@ it('右侧面板默认收起，展开需手动触发', () => {
   expect(store.rightPanelCollapsed).toBe(true);
 });
 
-it('中性展开先显示“打开标签页”选择页，定向展开跳过；收起即离开', () => {
+it('中性展开先显示“打开标签页”选择页，定向开页签跳过；收起即离开', () => {
   const store = useAppStore();
   store.toggleRightPanel();
   expect(store.rightPanelPicker).toBe(true);
 
   // 定向入口（Git 分支项等）：直达页签不经选择页
-  store.expandRightPanelDirect();
+  store.openRightPanelTab('git');
   expect(store.rightPanelPicker).toBe(false);
   expect(store.rightPanelCollapsed).toBe(false);
+  expect(store.rightPanelTabs).toEqual(['git']);
+  expect(store.rightPanelActiveTab).toBe('git');
 
   store.toggleRightPanel();
   expect(store.rightPanelCollapsed).toBe(true);
-  expect(store.rightPanelPicker).toBe(false);
 
-  // 再次中性展开：重新先显示选择页
+  // 再次中性展开：该会话已有页签 → 直接回到激活页签，不再进选择页
   store.toggleRightPanel();
-  expect(store.rightPanelPicker).toBe(true);
+  expect(store.rightPanelCollapsed).toBe(false);
+  expect(store.rightPanelPicker).toBe(false);
+  expect(store.rightPanelActiveTab).toBe('git');
 });

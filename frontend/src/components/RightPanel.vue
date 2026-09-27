@@ -7,19 +7,45 @@
     @mouseenter="computerPanelHovered = true"
     @mouseleave="computerPanelHovered = false"
   >
-    <!-- 工作台头部：替代原页签栏，承载当前工作台标题与返回选择页入口 -->
-    <div v-if="!store.rightPanelPicker" class="pane-head">
-      <span class="pane-title" data-test="pane-title">{{ activePaneLabel }}</span>
-      <button class="pane-close" data-test="pane-close" title="返回标签选择" aria-label="返回标签选择" @click="closePaneToPicker()">
+    <!-- 页签条：多页签并存（浏览器/Git/文件/后台任务/子代理…互不覆盖），
+         每个页签可单独关闭；"+"打开选择页追加页签，最右 × 收起整个面板 -->
+    <div class="tabbar" data-test="tabbar">
+      <div class="tabbar-tabs">
+        <button
+          v-for="tab in store.rightPanelTabs"
+          :key="tab"
+          class="tabbar-tab"
+          :class="{ active: isActiveTab(tab) }"
+          :data-test="'tab-' + tab"
+          :title="PANE_LABELS[tab]"
+          @click="store.activateRightPanelTab(tab)"
+        >
+          <AppIcon :name="TAB_ICONS[tab] || 'circle'" :size="12" :stroke-width="2" />
+          <span class="tabbar-label">{{ PANE_LABELS[tab] }}</span>
+          <span
+            class="tabbar-close"
+            :data-test="'tab-close-' + tab"
+            title="关闭页签"
+            @click.stop="store.closeRightPanelTab(tab)"
+          >
+            <AppIcon name="x" :size="11" :stroke-width="2" />
+          </span>
+        </button>
+      </div>
+      <span class="tabbar-spacer"></span>
+      <button class="tabbar-btn" data-test="tabbar-add" title="打开标签页" @click="store.showRightPanelPicker()">
+        <AppIcon name="plus" :size="13" :stroke-width="2" />
+      </button>
+      <button class="tabbar-btn" data-test="tabbar-collapse" title="收起面板" @click="store.toggleRightPanel()">
         <AppIcon name="x" :size="13" :stroke-width="2" />
       </button>
     </div>
 
-    <div id="right-content" :class="{ flush: activeTab === 'browser' && !store.rightPanelPicker }">
-      <!-- 打开标签页选择页（ZCode 式侧板）：顶栏按钮等中性入口展开面板时
-           先选择要看的内容，页签栏保留随时可切；定向入口经
-           expandRightPanelDirect 跳过本页 -->
-      <div v-if="store.rightPanelPicker" class="tab-picker" data-test="tab-picker">
+    <div id="right-content" :class="{ flush: activeTab === 'browser' }">
+      <!-- 打开标签页选择页（ZCode 式侧板）：无页签/点"+"时出现，从卡片
+           追加页签；已打开的页签保留在页签条上随时可切回。定向入口经
+           openRightPanelTab 直接开页签跳过本页 -->
+      <div v-if="showPicker" class="tab-picker" data-test="tab-picker">
         <h3 class="tp-title">打开标签页</h3>
         <p class="tp-sub">选择要在侧边面板中打开的标签。</p>
         <div class="tp-cards">
@@ -28,7 +54,7 @@
             :key="card.id"
             class="tp-card"
             :data-test="'picker-card-' + card.id"
-            @click="openPicked(card.id)"
+            @click="store.openRightPanelTab(card.id)"
           >
             <AppIcon :name="card.icon" :size="15" :stroke-width="2" />
             <span>{{ card.label }}</span>
@@ -75,7 +101,7 @@
       <!-- 浏览器工作台：DOM 工具栏 + 原生表面占位区；真实网页由宿主叠加的
            WebView2 控件渲染，前端负责矩形上报与起始页/不支持态 -->
       <div v-show="activeTab === 'browser'" class="rpane active" data-test="browser-pane">
-        <BrowserPane :active="activeTab === 'browser' && !store.rightPanelPicker && !store.rightPanelCollapsed" />
+        <BrowserPane :active="activeTab === 'browser'" />
       </div>
 
       <!-- 后台任务执行过程：底部执行条“详情”触发，2 秒轮询日志尾部 -->
@@ -87,6 +113,11 @@
           </div>
           <pre ref="bgtLogRef" class="bgt-log" data-test="bg-task-log">{{ detailOutput || (detailRunning ? '正在读取任务输出…' : '未找到任务输出。') }}</pre>
         </div>
+      </div>
+
+      <!-- 子代理执行过程：聊天卡片“查看”触发，1 秒轮询任务阶段历史 -->
+      <div v-show="activeTab === 'subagent'" class="rpane active" data-test="subagent-pane">
+        <SubagentPane :active="activeTab === 'subagent'" />
       </div>
       </template>
     </div>
@@ -122,17 +153,15 @@
 
 <script setup lang="ts">
 import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue';
-import { useAppStore } from '../stores/appStore';
+import { useAppStore, type RightPanelTabId } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 import FileTreeNode from './FileTreeNode.vue';
 import ComputerControlPane from './ComputerControlPane.vue';
 import BrowserPane from './BrowserPane.vue';
 import GitPanel from './GitPanel.vue';
-import { useGitStore } from '../stores/gitStore';
+import SubagentPane from './SubagentPane.vue';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
-
-type TabType = 'files' | 'git' | 'browser' | 'tasks' | 'computer';
 
 const store = useAppStore();
 
@@ -145,71 +174,60 @@ const panelStyle = computed(() => {
   if (store.rightPanelCollapsed) style.marginRight = `-${store.rightPanelWidth}px`;
   return style;
 });
-const activeTab = ref<TabType>('files');
 
-// 选择页三张卡（对齐 ZCode 官方侧板）：文件 / Git / 浏览器；
+// 激活页签（store 驱动）：面板收起或停在选择页时为 ''——所有工作台隐藏，
+// BrowserPane/SubagentPane 的 active prop 同时转 false（原生浏览器表面
+// 隐藏、详情轮询停止），切会话时的浏览器隔离也经由这条路生效
+const activeTab = computed<RightPanelTabId | ''>(() => {
+  if (store.rightPanelCollapsed) return '';
+  if (store.rightPanelPicker || store.rightPanelTabs.length === 0) return '';
+  return store.rightPanelActiveTab;
+});
+const showPicker = computed(() => !store.rightPanelCollapsed && activeTab.value === '');
+function isActiveTab(tab: RightPanelTabId) {
+  return activeTab.value === tab;
+}
+
+// 选择页五张卡（对齐 ZCode 官方侧板）：文件 / Git / 浏览器 / 后台任务 / 子代理；
 // “操控”不进选择页，只在出现过电脑操控 run 后自动切入（设计 16.2）
-const pickerCards: Array<{ id: TabType; label: string; icon: string }> = [
+const pickerCards: Array<{ id: RightPanelTabId; label: string; icon: string }> = [
   { id: 'files', label: '文件', icon: 'folder' },
   { id: 'git', label: 'Git', icon: 'git-branch' },
-  { id: 'browser', label: '浏览器', icon: 'globe' }
+  { id: 'browser', label: '浏览器', icon: 'globe' },
+  { id: 'tasks', label: '后台任务', icon: 'square-terminal' },
+  { id: 'subagent', label: '子代理', icon: 'blocks' }
 ];
 
-const PANE_LABELS: Record<TabType, string> = {
+const PANE_LABELS: Record<RightPanelTabId, string> = {
   files: '文件',
   git: 'Git',
   browser: '浏览器',
   tasks: '后台任务',
-  computer: '操控'
+  computer: '操控',
+  subagent: '子代理'
 };
-const activePaneLabel = computed(() => PANE_LABELS[activeTab.value] || '');
+const TAB_ICONS: Partial<Record<RightPanelTabId, string>> = {
+  files: 'folder',
+  git: 'git-branch',
+  browser: 'globe',
+  tasks: 'square-terminal',
+  computer: 'scan',
+  subagent: 'blocks'
+};
 
-function openPicked(tab: TabType) {
-  activeTab.value = tab;
-  store.rightPanelPicker = false;
-  if (tab === 'files') maybeAutoRefreshFileTree();
-}
-
-// 工作台头部 ×：返回选择页（hub-and-spoke），不销毁工作台状态；
-// 操控 run 的停止走顶部安全条/自动收场
-function closePaneToPicker() {
-  store.rightPanelPicker = true;
-}
 // run 开始时首次自动切入操控工作台（设计 16.2）：每个 run 只开一次（记录到
-// computerLastAutoOpenedRunId），用户返回选择页不抢回，新 run 再开一次；
+// computerLastAutoOpenedRunId），用户关闭页签不抢回，新 run 再开一次；
 // 挂载补跑覆盖“run 启动时右面板尚未挂载（如设置页打开中）”的场景
 function autoOpenComputerTabOnce() {
   const runId = store.computerRun.run_id;
   if (!runId || runId === store.computerLastAutoOpenedRunId) return;
   if (!store.computerControlBarVisible) return;
   store.computerLastAutoOpenedRunId = runId;
-  store.rightPanelPicker = false;
-  activeTab.value = 'computer';
+  // 只登记页签不摊开面板（设计 16.2 旧语义）：面板已展开的直接落在操控页签，
+  // 收起中的等用户手动展开时再看到
+  store.openRightPanelTab('computer', { expand: false });
 }
 watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
-
-// 状态栏分支项点击 → 打开源代码管理工作台（gitStore.panelOpenNonce 由 App.vue 触发）
-const gitStore = useGitStore();
-watch(
-  () => gitStore.panelOpenNonce,
-  () => {
-    if (gitStore.panelOpenNonce > 0) {
-      activeTab.value = 'git';
-    }
-  }
-);
-
-// 底部执行条“详情” → 打开后台任务执行过程工作台（nonce 每次点击自增，
-// 同一任务重复点击也能从选择页/其他工作台切回）
-watch(
-  () => store.bgTaskOpenNonce,
-  () => {
-    if (store.bgTaskOpenNonce > 0 && store.bgTaskDetailId) {
-      store.rightPanelPicker = false;
-      activeTab.value = 'tasks';
-    }
-  }
-);
 
 // ── 后台任务执行过程：2 秒轮询日志尾部，跟随滚动到底 ──
 const detailOutput = ref('');
@@ -274,8 +292,9 @@ function dismissComputerPane() {
   clearComputerDismissTimer();
   if (!store.computerRun.run_id) return;
   store.clearComputerRun();
-  // 停在操控工作台时 run 消失后无内容可看，回退到选择页
-  if (activeTab.value === 'computer') store.rightPanelPicker = true;
+  // 操控页签随收场一并关闭：run 消失后页签已无内容可看（关闭后自动切到
+  // 邻居页签，全部关完回选择页）
+  store.closeRightPanelTab('computer');
 }
 
 // 终态起算 60 秒：到点若用户仍在看（停在操控工作台且未折叠、未返回选择页，
@@ -285,8 +304,8 @@ function scheduleComputerAutoDismiss() {
   if (!store.computerRun.run_id || !store.computerRunTerminal) return;
   computerDismissTimer = setTimeout(() => {
     computerDismissTimer = null;
-    const stillWatching = (activeTab.value === 'computer' && !store.rightPanelPicker && !store.rightPanelCollapsed)
-      || computerPanelHovered.value;
+    // activeTab 已包含“页签激活、面板展开、非选择页”全部条件
+    const stillWatching = activeTab.value === 'computer' || computerPanelHovered.value;
     if (stillWatching) {
       scheduleComputerAutoDismiss();
       return;
@@ -421,21 +440,80 @@ onUnmounted(() => {
 #rightbar.collapsed {
   margin-right: -330px;
 }
-/* 工作台头部：标题 + 返回选择页 */
-.pane-head {
+/* 页签条：多页签并存 + “+”选择页 + 收起按钮；页签过多时横向滚动 */
+.tabbar {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  padding: 8px 12px;
+  gap: 2px;
+  padding: 5px 8px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
+  min-width: 0;
 }
-.pane-title {
-  font-size: 12.5px;
+.tabbar-tabs {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.tabbar-tabs::-webkit-scrollbar {
+  display: none;
+}
+.tabbar-spacer {
+  flex: 1;
+}
+.tabbar-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 118px;
+  padding: 4px 6px 4px 9px;
+  border-radius: 6px;
+  border: 1px solid transparent;
+  background: none;
+  color: var(--text-faint);
+  font-size: 12px;
   font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: 0.15s;
+  flex-shrink: 0;
+}
+.tabbar-tab:hover {
+  background: var(--bg2);
   color: var(--text-dim);
 }
-.pane-close {
+.tabbar-tab.active {
+  border-color: var(--border);
+  background: var(--bg2);
+  color: var(--text);
+}
+.tabbar-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tabbar-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 15px;
+  height: 15px;
+  border-radius: 4px;
+  color: var(--text-faint);
+  opacity: 0.55;
+  transition: 0.15s;
+  flex-shrink: 0;
+}
+.tabbar-close:hover {
+  background: var(--bg3);
+  color: var(--text);
+  opacity: 1;
+}
+.tabbar-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -447,8 +525,9 @@ onUnmounted(() => {
   color: var(--text-faint);
   cursor: pointer;
   transition: 0.15s;
+  flex-shrink: 0;
 }
-.pane-close:hover {
+.tabbar-btn:hover {
   background: var(--bg3);
   color: var(--text);
 }

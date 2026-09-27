@@ -78,18 +78,18 @@ class BrowserBridgeMixin:
 
     # ---------------------------------------------------------------- 桥方法
 
-    def browser_pane_open(self, rect: Dict[str, Any], url: str = "") -> Dict[str, Any]:
+    def browser_pane_open(self, rect: Dict[str, Any], url: str = "", zoom: float = 1.0) -> Dict[str, Any]:
         try:
             if not self._valid_rect(rect):
                 return {"ok": False, "error": "invalid_rect"}
             ctrl, error = self._use_controller()
             if error is not None:
                 return error
-            return ctrl.open(rect, url)
+            return ctrl.open(rect, url, zoom)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def browser_pane_set_bounds(self, rect: Dict[str, Any]) -> Dict[str, Any]:
+    def browser_pane_set_bounds(self, rect: Dict[str, Any], zoom: float = 1.0) -> Dict[str, Any]:
         try:
             if not self._valid_rect(rect):
                 return {"ok": False, "error": "invalid_rect"}
@@ -101,7 +101,7 @@ class BrowserBridgeMixin:
             ctrl = getattr(self, "_embedded_browser", None)
             if ctrl is None:
                 return {"ok": False, "error": "not_open"}
-            return ctrl.set_bounds(rect)
+            return ctrl.set_bounds(rect, zoom)
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -167,3 +167,48 @@ class BrowserBridgeMixin:
             return ctrl.get_state()
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    # ------------------------------------------------ 内置浏览器自动化通道
+
+    def embedded_browser_automation_endpoint(self, session_name: str = "") -> str:
+        """内置浏览器自动化入口（computer controller 的 embedded 分支调用）。
+
+        确保内嵌 WebView2 控件带 CDP 调试端口存在（幂等，必要时带端口重建），
+        并通知前端把面板切到浏览器页签、按当前项目分辨率做适应窗口呈现——
+        用户实时围观星瑶操作。session_name 为发起操控的会话名，随事件透传，
+        前端据此把浏览器页签开进发起会话的右面板（其他会话不受打扰）。
+        返回回环 endpoint；任何失败都抛 ComputerControlError（无降级：
+        绝不静默改走外部浏览器）。
+        """
+        from core.computer.models import ComputerControlError
+        from core.computer.settings import get_project_browser_viewport
+        from core.workspace_context import get_workdir
+
+        ctrl = self._browser_controller()
+        if ctrl is None:
+            raise ComputerControlError(
+                "computer_embedded_unavailable",
+                "内置浏览器仅在 Windows 桌面端 GUI 中可用；"
+                "请在设置中把浏览器切换为 Edge 或 Chrome",
+            )
+        result = ctrl.prepare_automation()
+        if not result.get("ok"):
+            raise ComputerControlError(
+                "computer_embedded_unavailable",
+                f"内置浏览器自动化准备失败：{result.get('error')}",
+            )
+        try:
+            width, height = get_project_browser_viewport(get_workdir())
+            self.emit_event(
+                "embedded_browser_automation",
+                {
+                    "width": width,
+                    "height": height,
+                    "session_name": str(session_name or ""),
+                },
+            )
+        except Exception:
+            # 面板呈现失败不阻断自动化链路：CDP 连接与截图不依赖前端状态，
+            # 仅影响"围观"体验。
+            logger.debug("推送内置浏览器自动化面板事件失败", exc_info=True)
+        return str(result["endpoint"])

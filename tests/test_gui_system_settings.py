@@ -111,7 +111,8 @@ def test_system_settings_snapshot_exposes_computer_control_settings(tmp_path, mo
     assert result["computer_control_enabled"] is False
     assert result["computer_browser"] == "edge"
     options = {item["browser"]: item for item in result["computer_browser_options"]}
-    assert set(options) == {"edge", "chrome"}
+    # embedded = GUI 内置 WebView2（CDP 直连），与外部浏览器并列可选项
+    assert set(options) == {"edge", "chrome", "embedded"}
     for item in options.values():
         assert set(item) == {"browser", "label", "available", "executable", "unavailable_reason"}
     assert "browser-profiles" in result["computer_profile_path"].replace("/", "\\")

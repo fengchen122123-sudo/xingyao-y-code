@@ -101,6 +101,9 @@ export const TERMINAL_PANEL_DEFAULT_HEIGHT = 300;
 export const TERMINAL_PANEL_MIN_HEIGHT = 140;
 export const TERMINAL_PANEL_MAX_HEIGHT = 720;
 
+// 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页
+export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent';
+
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
   // Pinia exposes state through Vue proxies, which structuredClone rejects.
   // The bridge contract is JSON-only, so a JSON round trip is the exact clone boundary.
@@ -670,8 +673,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 展开状态不持久化，每次启动都从收起开始
     rightPanelCollapsed: true,
     // “打开标签页”选择页可见性：顶栏按钮等中性入口展开面板时先选择要看的内容，
-    // 底栏 Git 分支项等定向入口经 expandRightPanelDirect 跳过（不持久化）
+    // 底栏 Git 分支项等定向入口经 openRightPanelTab 直接开页签（不持久化）。
+    // 页签全部关闭时也回到选择页
     rightPanelPicker: false,
+    // 右面板多页签：当前会话打开的页签与激活页签（'' = 停在选择页）。
+    // 页签集/激活页签/展开态都会话隔离：随 _captureRuntime/_bindSessionRuntime
+    // 按会话保存恢复，A 会话打开的浏览器页签不会出现在 B 会话
+    rightPanelTabs: [] as RightPanelTabId[],
+    rightPanelActiveTab: '' as RightPanelTabId | '',
     // 桌面端左右面板宽度（px）：拖拽手柄实时更新，启动时从 localStorage 恢复；
     // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
     sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
@@ -688,6 +697,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       ready: false,
       visible: false,
       supported: true,
+      // 星瑶浏览器自动化的项目分辨率（适应窗口呈现）；null = 无自动化视口
+      automationViewport: null as [number, number] | null,
     },
     themeLight: false,
     guiTheme: null as GuiTheme | null,
@@ -736,6 +747,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 右面板“后台任务”详情：当前查看的任务 id 与打开 nonce（执行条“详情”触发）
     bgTaskDetailId: '',
     bgTaskOpenNonce: 0,
+    // 右面板“子代理”详情：当前查看的任务 id 与打开 nonce（卡片“查看”触发）
+    subagentDetailId: '',
+    subagentOpenNonce: 0,
     subagentTasks: [] as SubagentTaskSnapshot[],
     tokenUsage: emptyTokenUsage(),
     tokenStatistics: null as TokenStatisticsSnapshot | null,
@@ -960,6 +974,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       runtime.historyOldestId = this.historyOldestId;
       // 导航索引随会话保存：切回时展示该会话自己的红点
       runtime.navItems = this.navItems;
+      // 右面板多页签随会话保存：页签集、激活页签与面板展开态都按会话隔离，
+      // 切回时恢复该会话自己的浏览器/Git 等页签
+      runtime.rightPanelTabs = [...this.rightPanelTabs];
+      runtime.rightPanelActiveTab = this.rightPanelActiveTab;
+      runtime.rightPanelExpanded = !this.rightPanelCollapsed;
     },
 
     _captureCurrentRuntime(this: any) {
@@ -1014,6 +1033,29 @@ navItems: [] as Array<{ id: number; preview: string }>,
       if (runtime.permMode) {
         this.permissionMode = runtime.permMode as PermissionMode;
       }
+      // 右面板多页签随会话恢复：目标会话从未展开过面板（undefined）→ 收起、
+      // 无页签；展开过的会话恢复自己的页签集与激活页签。浏览器原生表面随
+      // BrowserPane 的 active prop 翻转自动隐藏/重显，不需要额外桥调用
+      const savedTabs = runtime.rightPanelTabs;
+      let tabs = savedTabs ? ([...savedTabs] as RightPanelTabId[]) : [];
+      // 操控页签依附于全局唯一的 run：终态自动收场可能发生在别的会话上
+      // （closeRightPanelTab 只作用于当前页签集），run 已清场后残留的操控
+      // 页签恢复出来只会是一片空白，恢复时一并丢弃
+      if (!this.computerRun.run_id) {
+        tabs = tabs.filter(t => t !== 'computer');
+      }
+      this.rightPanelTabs = tabs;
+      const savedActive = runtime.rightPanelActiveTab;
+      this.rightPanelActiveTab = savedActive && this.rightPanelTabs.includes(savedActive as RightPanelTabId)
+        ? savedActive
+        : this.rightPanelTabs[this.rightPanelTabs.length - 1] || '';
+      // 该会话从未展开过面板（undefined）→ 收起，让它显示正常会话页面；
+      // 展开过的会话恢复自己的开合态
+      this.rightPanelCollapsed = runtime.rightPanelExpanded === undefined
+        ? true
+        : !runtime.rightPanelExpanded;
+      // 无页签 → 选择页；有页签 → 显示激活页签
+      this.rightPanelPicker = this.rightPanelTabs.length === 0;
     },
 
     _setSessionRunning(this: any, sessionName: string, running: boolean) {
@@ -1191,17 +1233,98 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.sidebarCollapsed = !this.sidebarCollapsed;
     },
 
-    // 顶栏“切换面板”按钮等中性入口：展开先显示“打开标签页”选择页，收起即离开
+    // 顶栏“切换面板”按钮等中性入口：收起/展开面板。展开时该会话已有页签 →
+    // 直接显示激活页签；一个页签都没开过 → 先进选择页
     toggleRightPanel() {
       this.rightPanelCollapsed = !this.rightPanelCollapsed;
-      this.rightPanelPicker = !this.rightPanelCollapsed;
+      if (!this.rightPanelCollapsed) {
+        this.rightPanelPicker = this.rightPanelTabs.length === 0;
+      }
     },
 
-    // 定向入口（底栏 Git 分支项、输入框/空态 Git chip）：直达对应页签不经选择页；
-    // 面板已展开且停在选择页时也负责切走
-    expandRightPanelDirect() {
-      this.rightPanelCollapsed = false;
+    // ── 右面板多页签（会话级隔离）─────────────────────────────────
+    // 打开（或切换到）指定页签：不存在则追加，激活并停在该页签。定向入口
+    // （Git 分支项、执行条详情、子代理卡片、浏览器自动化）统一走这里：
+    // 面板上已有其他页签时是“加页签”，不再互相覆盖。
+    // opts.expand=false：只登记页签不摊开面板（操控 run 自动切入沿用旧设计，
+    // 用户手动展开面板时直接落在操控页签）
+    openRightPanelTab(this: any, tab: RightPanelTabId, opts?: { expand?: boolean }) {
+      if (!this.rightPanelTabs.includes(tab)) this.rightPanelTabs.push(tab);
+      this.rightPanelActiveTab = tab;
       this.rightPanelPicker = false;
+      if (opts?.expand !== false) this.rightPanelCollapsed = false;
+      // 详情页签缺省查看对象：有任务时自动选第一个，避免开页签只见“未找到”
+      if (tab === 'tasks' && !this.bgTaskDetailId && this.backgroundTasks.length) {
+        this.bgTaskDetailId = this.backgroundTasks[0].task_id;
+      }
+      if (tab === 'subagent' && !this.subagentDetailId && this.subagentTasks.length) {
+        this.subagentDetailId = this.subagentTasks[0].id;
+      }
+    },
+
+    // 关闭单个页签：激活页签被关时优先切换到右侧邻居（保持视线位置），
+    // 没有右侧则取最后一个；全部关完回选择页（面板保持展开，可再开新页签）
+    closeRightPanelTab(this: any, tab: RightPanelTabId) {
+      const idx = this.rightPanelTabs.indexOf(tab);
+      if (idx < 0) return;
+      this.rightPanelTabs.splice(idx, 1);
+      if (this.rightPanelActiveTab === tab) {
+        this.rightPanelActiveTab =
+          this.rightPanelTabs[Math.min(idx, this.rightPanelTabs.length - 1)] || '';
+      }
+      if (this.rightPanelTabs.length === 0) {
+        this.rightPanelActiveTab = '';
+        this.rightPanelPicker = true;
+      }
+    },
+
+    // 页签条点击：切到已打开的页签
+    activateRightPanelTab(this: any, tab: RightPanelTabId) {
+      if (!this.rightPanelTabs.includes(tab)) return;
+      this.rightPanelActiveTab = tab;
+      this.rightPanelPicker = false;
+    },
+
+    // 页签条“+”：展开面板并显示选择页（保留已开页签，选卡后追加/激活）
+    showRightPanelPicker(this: any) {
+      this.rightPanelCollapsed = false;
+      this.rightPanelPicker = true;
+    },
+
+    // 把浏览器页签开进指定会话的右面板（会话归属）：当前会话直接开；
+    // 其他会话只写入其 runtime（含展开态），不抢当前界面——切回该会话时
+    // 浏览器页签随之出现。浏览器原生表面随页签失活自动隐藏，不跨界显示
+    openBrowserTabForSession(this: any, sessionName: string) {
+      if (!sessionName || sessionName === this.currentSessionName) {
+        this.openRightPanelTab('browser');
+        return;
+      }
+      const runtime = this._getSessionRuntime(sessionName);
+      const tabs: RightPanelTabId[] = runtime.rightPanelTabs
+        ? ([...runtime.rightPanelTabs] as RightPanelTabId[])
+        : [];
+      if (!tabs.includes('browser')) tabs.push('browser');
+      runtime.rightPanelTabs = tabs;
+      runtime.rightPanelActiveTab = 'browser';
+      runtime.rightPanelExpanded = true;
+    },
+
+    // 执行条“详情”：记录目标任务并打开后台任务页签（nonce 每次自增，
+    // 同一任务重复点击也能从其他页签切回）
+    openBackgroundTaskDetail(this: any, taskId: string) {
+      if (!taskId) return;
+      this.bgTaskDetailId = taskId;
+      this.bgTaskOpenNonce += 1;
+      this.openRightPanelTab('tasks');
+    },
+
+    // 子代理卡片"查看"按钮：记录目标任务 id 并打开子代理页签
+    // （nonce 每次自增，同一任务重复点击也能从其他页签切回）
+    openSubagentDetail(taskId: string) {
+      if (!taskId) return;
+      this.subagentDetailId = taskId;
+      this.subagentOpenNonce += 1;
+      this.openRightPanelTab('subagent');
     },
 
     // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
@@ -3349,6 +3472,20 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.applyEmbeddedBrowserState(data);
         return;
       }
+      // 内置浏览器自动化（星瑶经 CDP 驱动右侧面板浏览器）：携带项目分辨率，
+      // 面板切到浏览器页签并按该分辨率做适应窗口呈现（用户实时围观）。
+      // 独立支路，不参与会话 runtime 归属；页签按会话归属打开——
+      // A 会话发起的自动化不在当前查看的 B 会话抢屏
+      if (type === 'embedded_browser_automation') {
+        const width = Number(data.width);
+        const height = Number(data.height);
+        if (Number.isFinite(width) && Number.isFinite(height) && width > 0 && height > 0) {
+          // 每次换新数组引用：相同分辨率再次下发时组件侧 watch 也能触发
+          this.embeddedBrowser.automationViewport = [width, height];
+          this.openBrowserTabForSession(String(data.session_name || this.currentSessionName || ''));
+        }
+        return;
+      }
       // 按回合撤销：撤销/恢复事务状态变更（数据库提交成功后后端才发）。
       // 只更新对应会话和回合，不串到当前正在查看的其他会话（规格 16/25.5）
       if (type === 'turn_undo_updated') {
@@ -4019,6 +4156,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
           stage: String(t.stage || ''),
           ...(t.stage_detail ? { stage_detail: String(t.stage_detail) } : {}),
           elapsed: Number(t.elapsed || 0),
+          ...(t.type ? { type: String(t.type) } : {}),
+          ...(t.background ? { background: true } : {}),
+          ...(Array.isArray(t.stages) ? {
+            stages: t.stages.map((s: any) => ({
+              name: String(s.name || ''),
+              at: Number(s.at) || 0,
+              detail: String(s.detail || ''),
+            })),
+          } : {}),
         }));
         target.subagent_tasks = snapshots;
         this.subagentTasks = snapshots;
