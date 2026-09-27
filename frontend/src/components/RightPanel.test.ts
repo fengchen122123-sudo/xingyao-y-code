@@ -5,6 +5,7 @@ import { mount } from '@vue/test-utils';
 
 import RightPanel from './RightPanel.vue';
 import { useAppStore } from '../stores/appStore';
+import { useGitStore } from '../stores/gitStore';
 
 beforeEach(() => {
   setActivePinia(createPinia());
@@ -70,121 +71,190 @@ it('文本预览：kind=text 时仍渲染代码块，不出现 <img>', async () 
   wrapper.unmount();
 });
 
-// ── 电脑操控“操控”页签（Task 13b，设计 16.2） ──
+// ── 打开标签页选择页（ZCode 式侧板，页签栏已移除） ──
 
-function tabLabels(wrapper: ReturnType<typeof mount>) {
-  return wrapper.findAll('.rtab').map(t => t.text().trim());
+function paneTitle(wrapper: ReturnType<typeof mount>) {
+  return wrapper.find('[data-test="pane-title"]').text().trim();
 }
 
-function computerTab(wrapper: ReturnType<typeof mount>) {
-  return wrapper.findAll('.rtab').find(t => t.text().trim() === '操控')!;
-}
-
-it('run 出现前不渲染操控页签，出现后动态追加并自动切过去一次', async () => {
-  (window as any).pywebview = {
-    api: { get_computer_control_status: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'starting' }) },
-  };
+it('中性入口展开面板时先显示选择页三卡，点卡片进入对应工作台', async () => {
   const store = useAppStore();
   const wrapper = mount(RightPanel);
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
 
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '文件', 'Git']);
-
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'starting' });
+  store.toggleRightPanel();
   await nextTick();
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
+  // 页签栏已移除：选择页期间不渲染工台头
+  expect(wrapper.find('.pane-head').exists()).toBe(false);
+  expect(wrapper.findAll('.tp-card').map(c => c.text().trim())).toEqual(['文件', 'Git', '浏览器']);
 
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '文件', 'Git', '操控']);
-  expect(computerTab(wrapper).classes()).toContain('active');
-  expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
-  expect(store.computerLastAutoOpenedRunId).toBe('run-1');
+  await wrapper.find('[data-test="picker-card-files"]').trigger('click');
+  await nextTick();
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
+  expect(paneTitle(wrapper)).toBe('文件');
+  expect(wrapper.find('[data-test="pane-close"]').exists()).toBe(true);
   wrapper.unmount();
 });
 
-it('用户切走后同一 run 的后续事件不抢回页签，新 run 再自动开一次', async () => {
-  (window as any).pywebview = {
-    api: { get_computer_control_status: vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'running' }) },
-  };
+it('浏览器卡片进入浏览器工作台，无操控会话时呈现引导态', async () => {
   const store = useAppStore();
   const wrapper = mount(RightPanel);
 
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'starting' });
+  store.toggleRightPanel();
   await nextTick();
-  expect(computerTab(wrapper).classes()).toContain('active');
+  await wrapper.find('[data-test="picker-card-browser"]').trigger('click');
+  await nextTick();
 
-  // 用户手动切到“文件”页签
-  const filesTab = wrapper.findAll('.rtab').find(t => t.text().trim() === '文件')!;
-  await filesTab.trigger('click');
-  expect(computerTab(wrapper).classes()).not.toContain('active');
-
-  // 同一 run 的后续事件（observation/finished）不把页签抢回来
-  store.reduceComputerEvent({ type: 'computer_observation', run_id: 'run-1', event_seq: 2, action_ordinal: 1, preview_url: '/computer-preview/t/1.png', origin_or_window: 'example.com' });
-  store.reduceComputerEvent({ type: 'computer_action_finished', run_id: 'run-1', event_seq: 3, action_ordinal: 1, action_kind: 'click', ok: true, error_code: '' });
-  await nextTick();
-  expect(computerTab(wrapper).classes()).not.toContain('active');
-  // run 结束也保留在当前页签
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 4, status: 'stopped' });
-  await nextTick();
-  expect(computerTab(wrapper).classes()).not.toContain('active');
-
-  // 新 run 开始：再自动切到操控页签一次
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'starting' });
-  await nextTick();
-  expect(computerTab(wrapper).classes()).toContain('active');
-  expect(store.computerLastAutoOpenedRunId).toBe('run-2');
+  const pane = wrapper.find('[data-test="browser-pane"]');
+  expect(pane.exists()).toBe(true);
+  expect(pane.isVisible()).toBe(true);
+  expect(pane.find('[data-test="computer-empty-state"]').exists()).toBe(true);
+  expect(paneTitle(wrapper)).toBe('浏览器');
   wrapper.unmount();
 });
 
-it('手动切到操控页签时拉取快照校准 run 状态', async () => {
+it('工台头 × 返回选择页，可再次选卡切换工作台', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+
+  store.toggleRightPanel();
+  await nextTick();
+  await wrapper.find('[data-test="picker-card-files"]').trigger('click');
+  await nextTick();
+  expect(paneTitle(wrapper)).toBe('文件');
+
+  await wrapper.find('[data-test="pane-close"]').trigger('click');
+  await nextTick();
+  expect(store.rightPanelPicker).toBe(true);
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
+
+  await wrapper.find('[data-test="picker-card-git"]').trigger('click');
+  await nextTick();
+  expect(paneTitle(wrapper)).toBe('Git');
+  expect(wrapper.find('[data-test="git-pane"]').isVisible()).toBe(true);
+  wrapper.unmount();
+});
+
+it('定向入口 expandRightPanelDirect 跳过选择页，Git 分支项直达 Git 工作台', async () => {
+  const store = useAppStore();
+  const gitStore = useGitStore();
+  const wrapper = mount(RightPanel);
+
+  gitStore.requestOpenPanel();
+  store.expandRightPanelDirect();
+  await nextTick();
+
+  expect(store.rightPanelPicker).toBe(false);
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
+  expect(wrapper.find('[data-test="git-pane"]').isVisible()).toBe(true);
+  wrapper.unmount();
+});
+
+it('收起面板即离开选择页，再次中性展开重新显示', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+
+  store.toggleRightPanel();
+  await nextTick();
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
+
+  store.toggleRightPanel();
+  await nextTick();
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
+
+  store.toggleRightPanel();
+  await nextTick();
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+// ── 后台任务执行过程工作台 ──
+
+it('执行条详情 nonce 打开后台任务工作台并显示命令', async () => {
+  const store = useAppStore();
+  const wrapper = mount(RightPanel);
+
+  store.backgroundTasks = [{ task_id: 't9', command: 'pytest -q', status: 'running' }];
+  store.bgTaskDetailId = 't9';
+  store.bgTaskOpenNonce += 1;
+  await nextTick();
+
+  expect(store.rightPanelPicker).toBe(false);
+  expect(wrapper.find('[data-test="bg-task-pane"]').isVisible()).toBe(true);
+  expect(wrapper.find('[data-test="pane-title"]').text()).toBe('后台任务');
+  expect(wrapper.find('[data-test="bg-task-log"]').text()).toContain('正在读取任务输出');
+  wrapper.unmount();
+});
+
+// ── 操控工作台（设计 16.2：run 出现自动切入，不进选择页） ──
+
+it('run 出现后自动切入操控工作台并校准快照，返回选择页后事件不抢回，新 run 再切一次', async () => {
   const getStatus = vi.fn().mockResolvedValue({ run_id: 'run-1', status: 'paused', pause_reason: 'user_pause' });
   (window as any).pywebview = { api: { get_computer_control_status: getStatus } };
   const store = useAppStore();
   const wrapper = mount(RightPanel);
 
-  // run 结束态（无自动开页签），用户手动点开操控页签
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'stopped', stop_reason: 'user_stop' });
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'starting' });
   await nextTick();
-  expect(computerTab(wrapper).classes()).not.toContain('active');
-  await computerTab(wrapper).trigger('click');
 
-  expect(getStatus).toHaveBeenCalledWith();
+  expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
+  expect(paneTitle(wrapper)).toBe('操控');
+  expect(store.rightPanelPicker).toBe(false);
+  expect(store.computerLastAutoOpenedRunId).toBe('run-1');
+  // 进入操控工作台触发快照校准
   await vi.waitFor(() => expect(store.computerRun.status).toBe('paused'));
   expect(store.computerRun.pause_reason).toBe('user_pause');
+
+  // 用户点工台头 × 返回选择页：run 不终止，同一 run 后续事件不把人拽回去
+  await wrapper.find('[data-test="pane-close"]').trigger('click');
+  await nextTick();
+  expect(store.rightPanelPicker).toBe(true);
+  expect(store.computerRun.run_id).toBe('run-1');
+
+  store.reduceComputerEvent({ type: 'computer_observation', run_id: 'run-1', event_seq: 2, action_ordinal: 1, preview_url: '/computer-preview/t/1.png', origin_or_window: 'example.com' });
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 3, status: 'stopped' });
+  await nextTick();
+  expect(store.rightPanelPicker).toBe(true);
+
+  // 新 run 开始：再自动切入一次
+  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'starting' });
+  await nextTick();
+  expect(store.rightPanelPicker).toBe(false);
+  expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
+  expect(store.computerLastAutoOpenedRunId).toBe('run-2');
   wrapper.unmount();
 });
 
-// ── 操控页签关闭（2026-09-10 设计） ──
-
-function goFilesTab(wrapper: ReturnType<typeof mount>) {
-  return wrapper.findAll('.rtab').find(t => t.text().trim() === '文件')!;
-}
-
-it('终态 60 秒且用户不在操控页签时自动关闭页签', async () => {
+it('操控终态 60 秒且用户已返回选择页时自动收场', async () => {
   vi.useFakeTimers();
   const store = useAppStore();
+  store.rightPanelCollapsed = false;
   const wrapper = mount(RightPanel);
-  // run 开始：自动切到操控页签
+
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
   await nextTick();
-  // 用户切到「文件」页签
-  await goFilesTab(wrapper).trigger('click');
-  // run 进入终态
+  // 用户 × 返回选择页（不终止 run），run 随后进入终态
+  await wrapper.find('[data-test="pane-close"]').trigger('click');
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'completed' });
   await nextTick();
-  expect(computerTab(wrapper)).toBeTruthy();
+  expect(store.computerRun.run_id).toBe('run-1');
 
   vi.advanceTimersByTime(59999);
   await nextTick();
-  expect(computerTab(wrapper)).toBeTruthy();
+  expect(store.computerRun.run_id).toBe('run-1');
 
   vi.advanceTimersByTime(1);
   await nextTick();
-  expect(computerTab(wrapper)).toBeUndefined();
-  expect(tabLabels(wrapper)).toEqual(['计划', '任务', '文件', 'Git']);
+  expect(store.computerRun.run_id).toBe('');
+  // 收场后留在选择页
+  expect(store.rightPanelPicker).toBe(true);
 
   wrapper.unmount();
   vi.useRealTimers();
 });
 
-it('用户停留在操控页签时到点顺延，不被自动关闭', async () => {
+it('用户停留在操控工作台时到点顺延，不被自动关闭', async () => {
   vi.useFakeTimers();
   const store = useAppStore();
   // 「在看就不关」要求面板处于展开态（默认收起时谈不上在看）
@@ -192,16 +262,16 @@ it('用户停留在操控页签时到点顺延，不被自动关闭', async () =
   const wrapper = mount(RightPanel);
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
   await nextTick();
-  expect(computerTab(wrapper).classes()).toContain('active');
+  expect(wrapper.find('[data-test="computer-pane"]').isVisible()).toBe(true);
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'stopped' });
   await nextTick();
 
   vi.advanceTimersByTime(60000);
   await nextTick();
-  expect(computerTab(wrapper)).toBeTruthy();
+  expect(store.computerRun.run_id).toBe('run-1');
   vi.advanceTimersByTime(60000);
   await nextTick();
-  expect(computerTab(wrapper)).toBeTruthy();
+  expect(store.computerRun.run_id).toBe('run-1');
 
   wrapper.unmount();
   vi.useRealTimers();
@@ -213,59 +283,19 @@ it('鼠标悬停在右面板内时到点顺延，移开后下一个周期关闭'
   const wrapper = mount(RightPanel);
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
   await nextTick();
-  await goFilesTab(wrapper).trigger('click');
   await wrapper.find('#rightbar').trigger('mouseenter');
   store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'failed' });
   await nextTick();
 
   vi.advanceTimersByTime(60000);
   await nextTick();
-  expect(computerTab(wrapper)).toBeTruthy();
+  expect(store.computerRun.run_id).toBe('run-1');
 
   await wrapper.find('#rightbar').trigger('mouseleave');
   vi.advanceTimersByTime(60000);
   await nextTick();
-  expect(computerTab(wrapper)).toBeUndefined();
+  expect(store.computerRun.run_id).toBe('');
 
   wrapper.unmount();
   vi.useRealTimers();
-});
-
-it('点击页签 × 立即关闭操控面板并切回计划页签', async () => {
-  const store = useAppStore();
-  const wrapper = mount(RightPanel);
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
-  await nextTick();
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'completed' });
-  await nextTick();
-
-  const closeEl = wrapper.find('[data-test="computer-tab-close"]');
-  expect(closeEl.exists()).toBe(true);
-  await closeEl.trigger('click');
-  await nextTick();
-
-  expect(computerTab(wrapper)).toBeUndefined();
-  expect(wrapper.findAll('.rtab')[0].classes()).toContain('active');
-  expect(store.computerRun.run_id).toBe('');
-  wrapper.unmount();
-});
-
-it('运行中不渲染关闭入口，关闭后新 run 重新开页签', async () => {
-  const store = useAppStore();
-  const wrapper = mount(RightPanel);
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 1, status: 'running' });
-  await nextTick();
-  expect(wrapper.find('[data-test="computer-tab-close"]').exists()).toBe(false);
-
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-1', event_seq: 2, status: 'stopped' });
-  await nextTick();
-  await wrapper.find('[data-test="computer-tab-close"]').trigger('click');
-  await nextTick();
-  expect(computerTab(wrapper)).toBeUndefined();
-
-  store.reduceComputerEvent({ type: 'computer_state', run_id: 'run-2', event_seq: 1, status: 'starting' });
-  await nextTick();
-  expect(computerTab(wrapper)).toBeTruthy();
-  expect(computerTab(wrapper).classes()).toContain('active');
-  wrapper.unmount();
 });
