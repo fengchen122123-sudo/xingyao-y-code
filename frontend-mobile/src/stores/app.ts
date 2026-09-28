@@ -462,6 +462,40 @@ export const useAppStore = defineStore('mobile-app', {
       await rpc('jump_queue', this.currentSession, messageId);
     },
 
+    /** 批量取附件展示名（附件 chip 的 name 仅用于展示，取不到时用路径兜底） */
+    async filesInfo(paths: string[]): Promise<{ name: string; path: string }[]> {
+      const list = paths.filter((p) => p && p.trim());
+      if (!list.length) return [];
+      const infos = await rpc<any[]>('get_files_info', list);
+      return (infos || [])
+        .map((i: any) => ({
+          path: String(i?.path || ''),
+          name: String(i?.name || ''),
+        }))
+        .filter((a) => a.path)
+        .map((a) => ({ ...a, name: a.name || a.path.split(/[\\/]/).pop() || a.path }));
+    },
+
+    /**
+     * 撤回排队消息：从队列移除并把内容交回调用方回填输入框，供重新编辑。
+     * 先取消后回填——取消失败就原样抛错，草稿不动，避免消息既留在队列又在输入框里。
+     */
+    async takeQueued(messageId: string): Promise<{ text: string; attachments: { name: string; path: string }[] } | null> {
+      const item = (this.queues[this.currentSession] || []).find((m) => m.id === messageId);
+      if (!item) return null;
+      await this.cancelQueued(messageId);
+      let attachments: { name: string; path: string }[] = [];
+      if (item.attachments?.length) {
+        try {
+          attachments = await this.filesInfo(item.attachments);
+        } catch {
+          // 附件名读不到不影响回填文本：至少把路径还原成 chip
+          attachments = item.attachments.map((p) => ({ path: p, name: p.split(/[\\/]/).pop() || p }));
+        }
+      }
+      return { text: item.text, attachments };
+    },
+
     // ---- 附件（手机端经 WS 上传 base64，落盘后路径作为附件发送）----
 
     async uploadAttachment(name: string, dataB64: string): Promise<string> {
