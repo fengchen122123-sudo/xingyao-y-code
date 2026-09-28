@@ -123,3 +123,36 @@ def test_nav_index_skips_observation_followup_messages():
     assert res["ok"] is True
     assert res["total"] == 1
     assert res["items"][0]["preview"] == "帮我打开浏览器看看"
+
+
+def test_nav_index_and_bubbles_skip_system_injected_messages():
+    """后台任务回报/护栏催促/hook 上下文等系统注入 user 消息：
+    红点导航与对话气泡都不出现，只留用户真实发送的内容。"""
+    bridge = _bare_bridge()
+    bridge._memory.add_message("s", "user", "真正的问题")
+    bridge._memory.add_message("s", "user", (
+        "<task-notification>\n"
+        "  <task-id>subagent-d66d7cca</task-id>\n"
+        "  <status>timed_out</status>\n"
+        "  <summary>子任务「超 小范」timed_out</summary>\n"
+        "</task-notification>"
+    ))
+    bridge._memory.add_message(
+        "s", "user",
+        "计划尚未执行完毕，仍有可执行的计划项: ['P1'](登录修复)。"
+        "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项。",
+    )
+    bridge._memory.add_message(
+        "s", "user",
+        "【Stop hook 追加上下文】\n继续执行剩余工作",
+    )
+
+    res = bridge.get_session_nav_index("s")
+
+    assert res["ok"] is True
+    assert res["total"] == 1
+    assert res["items"][0]["preview"] == "真正的问题"
+
+    msgs, _, _ = bridge._load_session_messages("s")
+    user_msgs = [m for m in msgs if m["role"] == "user"]
+    assert [m["content"] for m in user_msgs] == ["真正的问题"]

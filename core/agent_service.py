@@ -17,6 +17,7 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import re
 import threading
 from typing import Callable, Optional
 
@@ -681,21 +682,51 @@ def _digest_one_session(manager, name, info):
     return body
 
 
+def _normalize_ref_lookup_key(name) -> str:
+    """@{...} 引用名的宽松匹配键：去掉花括号与空白、统一小写。
+
+    历史上前端插入引用时会剥掉名字里的花括号（useSuggest 的
+    replace(/[{}]/g, '')），而会话名里可能残留 @{...} 标记残渣
+    （「@{缓存改造} 阅读一下」「@{我这个自然语言交互如」）。两边同键
+    归一后这类名字才能被引用命中，而不是被误判为「不存在或已删除」。
+    """
+    return re.sub(r"[{}\s]+", "", str(name or "")).lower()
+
+
 def build_referenced_sessions_block(manager, ref_names, current_session=None):
     """把 @{会话名} 引用的对话内容组装为上下文后缀块文本。
 
     注入发生在 token 估算之后，必须自行限额（_REF_TOTAL_MAX_CHARS）。
     自引用与不存在的会话如实标注「已跳过」，绝不抛错影响主流程。
+    会话名先按精确匹配查找，落空再按规范化键兜底（见 _normalize_ref_lookup_key）。
     """
     if not ref_names:
         return ""
     try:
-        existing = {
-            str(s.get("name") or ""): s
-            for s in manager.get_all_sessions(workdir=None, include_empty=True)
-        }
+        session_rows = manager.get_all_sessions(workdir=None, include_empty=True)
     except Exception:
-        existing = {}
+        session_rows = []
+    existing = {}
+    normalized = {}
+    for s in session_rows:
+        real_name = str(s.get("name") or "")
+        if not real_name:
+            continue
+        # setdefault：同名会话取列表中靠前者（get_all_sessions 按 id DESC，
+        # 即较新创建的会话），保留既有「后即最新」的直觉语义
+        existing.setdefault(real_name, s)
+        normalized.setdefault(_normalize_ref_lookup_key(real_name), s)
+
+    def _resolve(raw_name):
+        """把引用名解析为 (真实会话名, 会话信息)；解析不到返回 (None, None)。"""
+        info = existing.get(raw_name)
+        if info is not None:
+            return raw_name, info
+        info = normalized.get(_normalize_ref_lookup_key(raw_name))
+        if info is not None:
+            return str(info.get("name") or ""), info
+        return None, None
+
     # T1.3 信源声明：引用块直接拼接被引用会话的历史文本，属"数据"而非指令；
     # 标题标记（REF_SESSIONS_PREFIX）是 strip_context_suffix 的剥离锚点，逐字保持。
     intro = (
@@ -711,15 +742,20 @@ def build_referenced_sessions_block(manager, ref_names, current_session=None):
         if current_session and name == current_session:
             skipped.append(f"「{name}」是当前会话，已跳过")
             continue
-        info = existing.get(name)
+        resolved_name, info = _resolve(name)
         if info is None:
             skipped.append(f"「{name}」不存在或已删除，已跳过")
             continue
+        # 自引用判定用解析后的真实名：名字被花括号污染时，宽松命中后
+        # 仍需拦住「引用当前会话自己」，而不是当成一个不存在的会话
+        if current_session and resolved_name == current_session:
+            skipped.append(f"「{name}」是当前会话，已跳过")
+            continue
         try:
-            digest = _digest_one_session(manager, name, info)
+            digest = _digest_one_session(manager, resolved_name, info)
         except Exception:
             # 单个脏会话（畸形消息/存储异常）不能拖垮全部引用：如实标注后跳过
-            logger.warning("引用会话「%s」摘要组装失败，已跳过", name, exc_info=True)
+            logger.warning("引用会话「%s」摘要组装失败，已跳过", resolved_name, exc_info=True)
             skipped.append(f"「{name}」读取失败，已跳过")
             continue
         if total + len(digest) > _REF_TOTAL_MAX_CHARS:
