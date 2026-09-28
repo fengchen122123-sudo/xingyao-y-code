@@ -53,13 +53,13 @@ def _close_task_handle(task_id):
         handle.close()
 
 
-def _seed_running_task(tmp_path, task_id, *, turn_id):
+def _seed_running_task(tmp_path, task_id, *, turn_id, session_id="s1"):
     """直接构造一条 running 任务记录（避开监控线程对打桩进程的轮询）。"""
     with task_manager._TASKS_LOCK:
         task_manager.ACTIVE_TASKS[task_id] = {
             "id": task_id,
             "command": "demo",
-            "session_id": "s1",
+            "session_id": session_id,
             "turn_id": turn_id,
             "process": None,
             "pid": 424242,
@@ -104,6 +104,40 @@ def test_list_active_tasks_includes_turn_id(tmp_path, monkeypatch):
     matched = [t for t in tasks if t["task_id"] == "t4list"]
     assert matched, tasks
     assert matched[0]["turn_id"] == "a1b2c3d4"
+
+
+# ---------------------------------------------------------------------------
+# 后台任务会话归属（GUI 执行条跨会话过滤的数据基础）
+# ---------------------------------------------------------------------------
+
+def test_tasks_json_persists_session_id(tmp_path, monkeypatch):
+    """session_id 随任务记录持久化：GUI 重启接管后任务仍归属发起会话。"""
+    _isolate_task_env(tmp_path, monkeypatch)
+    _seed_running_task(tmp_path, "t4sess", turn_id="", session_id="sess-a")
+    task_manager._save_tasks()
+    data = json.loads((tmp_path / "tasks.json").read_text(encoding="utf-8"))
+    assert data["t4sess"]["session_id"] == "sess-a"
+
+
+def test_load_tasks_restores_session_id(tmp_path, monkeypatch):
+    """磁盘接管读取路径还原 session_id（旧记录无此键时归一为空串）。"""
+    _isolate_task_env(tmp_path, monkeypatch)
+    _seed_running_task(tmp_path, "t4sess", turn_id="", session_id="sess-a")
+    task_manager._save_tasks()
+    with task_manager._TASKS_LOCK:
+        task_manager.ACTIVE_TASKS.clear()
+    task_manager._load_tasks()
+    assert task_manager.ACTIVE_TASKS["t4sess"]["session_id"] == "sess-a"
+
+
+def test_list_active_tasks_includes_session_id(tmp_path, monkeypatch):
+    _isolate_task_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(task_manager, "_sync_task_locked", lambda tid, info: None)
+    _seed_running_task(tmp_path, "t4sesslist", turn_id="", session_id="sess-a")
+    tasks = task_manager.list_active_tasks()
+    matched = [t for t in tasks if t["task_id"] == "t4sesslist"]
+    assert matched, tasks
+    assert matched[0]["session_id"] == "sess-a"
 
 
 # ---------------------------------------------------------------------------

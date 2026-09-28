@@ -412,3 +412,18 @@ def extract_session_refs(text):
 
     cleaned = SESSION_REF_PATTERN.sub(_sub, text)
     return cleaned.strip(), refs
+
+
+def sanitize_session_title(text):
+    """从用户输入派生会话标题前的净化：@{会话名} 标记还原为内部名，并剥掉残留花括号。
+
+    标题之后会被再次作为 @{...} 引用的目标，因此标题里不能残留标记语法字符：
+    名字含 } 会让引用解析提前终止；前端插入引用时还会剥掉名字里的花括号
+    （useSuggest 的 replace(/[{}]/g, '')），两种情况都让「按名精确匹配」永远
+    落空，用户侧表现为「引用的对话不存在」。历史上自动标题截断 @{...} 标记
+    产生过「@{缓存改造} 阅读一下」「@{我这个自然语言交互如」这类不可引用的名字。
+    """
+    if not text:
+        return text or ""
+    text = SESSION_REF_PATTERN.sub(lambda m: m.group(1), str(text))
+    return text.replace("{", "").replace("}", "")
