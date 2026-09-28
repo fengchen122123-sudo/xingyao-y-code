@@ -56,7 +56,7 @@
             :class="{ 'sandbox-open': store.sandboxEnabled }"
             :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件（点击恢复限制）' : '沙盒已开启：仅允许访问工作目录内文件（点击解除限制）'"
             @click.stop="store.setSandbox(!store.sandboxEnabled)"
-          >{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</button>
+          ><span class="sandbox-label-full">{{ store.sandboxEnabled ? '沙盒: 开' : '沙盒: 限' }}</span><span class="sandbox-label-short">{{ store.sandboxEnabled ? '开' : '限' }}</span></button>
           <!-- Git 分支入口（红框位）：非 Git 工作区不显示；点击弹出 Git 管理面板 -->
           <button
             v-if="gitBranchLabel"
@@ -377,8 +377,46 @@ function handleKeydown(e: KeyboardEvent) {
 }
 /* 紧凑形态元素（图标）仅手机端显示，桌面端隐藏 */
 .perm-icon,
-.model-icon {
+.model-icon,
+.sandbox-label-short {
   display: none;
+}
+
+/* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
+   侧栏展开挤窄首页卡片时禁止按钮换行，按 .kimi-card 容器宽度分档，
+   档位与对话中输入栏一致：≤640 隐分支文字 / ≤540 权限·模型转图标 /
+   ≤430 沙盒收成 开/限 并隐藏分支入口 */
+.kimi-card {
+  container-type: inline-size;
+  container-name: composer;
+}
+@container composer (max-width: 640px) {
+  [data-test="hero-git-branch"] .git-branch-label {
+    display: none;
+  }
+}
+@container composer (max-width: 540px) {
+  .permission-mode-btn .perm-label,
+  .permission-mode-btn .permission-chevron,
+  .model-chip .model-label,
+  .model-chip .model-chevron {
+    display: none;
+  }
+  .perm-icon,
+  .model-icon {
+    display: inline-flex;
+  }
+}
+@container composer (max-width: 430px) {
+  [data-test="hero-git-branch"] {
+    display: none;
+  }
+  .sandbox-label-full {
+    display: none;
+  }
+  .sandbox-label-short {
+    display: inline;
+  }
 }
 
 @media (max-width: 768px) {

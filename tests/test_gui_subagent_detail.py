@@ -114,10 +114,16 @@ def test_subagent_progress_poller_emits_stage_history(monkeypatch):
     assert len(data["tasks"]) == 2
     task = data["tasks"][0]
     assert task["description"] == "前台任务"
-    # 阶段历史只断言注入的工具阶段（queued/running 等阶段 detail 为空）
-    assert [s for s in task["stages"] if s["detail"]] == [
-        {"name": "tool", "at": task["stages"][0]["at"], "detail": "read_file ✓ 1.2s"},
-        {"name": "tool", "at": task["stages"][1]["at"], "detail": "edit_file ✗ 文件不存在"},
+    # 阶段历史只断言注入的工具阶段（queued/running 等阶段 detail 为空，
+    # 完整历史按 queued→running→tool→completed 追加）；at 只验证存在，
+    # 不与全量列表索引绑定（此前取 stages[0]/[1] 的 at，恒为 queued/running
+    # 的时刻，与过滤后的 tool 阶段永不匹配）
+    tool_stages = [s for s in task["stages"] if s["detail"]]
+    assert [s["detail"] for s in tool_stages] == [
+        "read_file ✓ 1.2s",
+        "edit_file ✗ 文件不存在",
     ]
+    assert all(s["name"] == "tool" for s in tool_stages)
+    assert all(s["at"] > 0 for s in tool_stages)
     # s2 的任务不进本次推送
     assert all(t["description"] != "其他会话任务" for t in data["tasks"])

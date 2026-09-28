@@ -388,6 +388,47 @@ it('自由尺寸菜单打开时让宿主 hide 原生表面；点菜单外区域�
   wrapper.unmount();
 });
 
+it('画笔截图模式让宿主 hide 原生表面；模式关闭后自动恢复', async () => {
+  const api = mockApi();
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+  useAppStore().embeddedBrowser.url = 'https://example.com';
+
+  const wrapper = await mountPane(true, true);
+  await vi.waitFor(() => expect(api.browser_pane_open).toHaveBeenCalled());
+  expect(api.browser_pane_hide).not.toHaveBeenCalled();
+
+  // 冻结帧覆盖层接管面板：原生表面必须让位（其像素已在快照里）
+  store.rightPanelSnipActive = true;
+  await nextTick();
+  await vi.waitFor(() => expect(api.browser_pane_hide).toHaveBeenCalled());
+
+  // snip 关闭：shouldShowSurface 翻回 true，既有 watch 自动 re-show
+  store.rightPanelSnipActive = false;
+  await nextTick();
+  await vi.waitFor(() => {
+    const calls = api.browser_pane_open.mock.calls;
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+    expect(calls[calls.length - 1][0]).toEqual({ x: 0, y: 0, width: 300, height: 400 });
+  });
+  wrapper.unmount();
+});
+
+it('画笔截图模式优先于自动化视口：起始页保显例外也不生效', async () => {
+  const api = mockApi();
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+  store.embeddedBrowser.automationViewport = [1280, 800];
+
+  const wrapper = await mountPane(true, true);
+  await vi.waitFor(() => expect(api.browser_pane_open).toHaveBeenCalled());
+
+  store.rightPanelSnipActive = true;
+  await nextTick();
+  await vi.waitFor(() => expect(api.browser_pane_hide).toHaveBeenCalled());
+  wrapper.unmount();
+});
+
 // ── 星瑶自动化呈现回归（会话区被浏览器铺满 / 首次 observe 挂死事故）──
 
 it('自动化视口下发时即使还在起始页也打开原生表面（隐藏 WebView2 截图会挂起的回归）', async () => {

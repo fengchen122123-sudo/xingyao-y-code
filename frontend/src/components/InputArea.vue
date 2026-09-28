@@ -455,6 +455,10 @@ async function undoQueue(item: QueuedMessage) {
 #input-wrap {
   max-width: var(--chat-col-width);
   margin: 0 auto;
+  /* 图标化收纳档位的容器：挤压来自两侧面板展开而非窗口变窄，
+     媒体查询感知不到，按此容器宽度分档（见文件末尾 @container） */
+  container-type: inline-size;
+  container-name: composer;
 }
 
 /* 排队消息条：输入框上方逐条展示回合运行期间发送的排队消息 */
@@ -573,12 +577,25 @@ textarea {
   gap: 5px;
   cursor: pointer;
   transition: 0.15s;
+  /* 侧栏展开挤压输入栏时按钮被压缩，CJK 文本会逐字换行把按钮撑成
+     多行“竖条”、与其他按钮高低不一——文字一律单行，收缩交给可截断的
+     模型/分支按钮（见下），固定文案按钮禁止压缩 */
+  white-space: nowrap;
 }
 .plus-btn {
   font-size: 14px;
   font-weight: 600;
   padding: 3px 10px;
   line-height: 1.2;
+  flex-shrink: 0;
+}
+.permission-mode-btn,
+.sandbox-btn {
+  flex-shrink: 0;
+}
+/* 输入栏内按钮统一高度：回形针等图标按钮与文字胶囊不出现高低差 */
+#input-bar .chip-btn {
+  min-height: 28px;
 }
 .chip-btn:hover {
   border-color: var(--text-faint);
@@ -596,6 +613,9 @@ textarea {
   overflow: hidden;
   text-overflow: ellipsis;
   display: inline-block;
+  /* 唯一允许被挤压的按钮：min-width:0 解除 flex 最小内容宽度限制，
+     空间不足时以省略号收缩而不是换行撑高 */
+  min-width: 0;
 }
 
 /* 上下文统计圆环：margin-left:auto 把它与模型/发送按钮一起顶到右侧（红圈位置）；
@@ -631,11 +651,14 @@ textarea {
   color: var(--orange);
 }
 
-/* Git 分支入口：长分支名截断显示，完整名在 title 中 */
+/* Git 分支入口：长分支名截断显示，完整名在 title 中；空间不足时与模型按钮
+   一起收缩（label 需 min-width:0 才能在 flex 内真正截断出省略号） */
 .git-branch-btn {
   max-width: 200px;
+  min-width: 0;
 }
 .git-branch-btn .git-branch-label {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -710,6 +733,41 @@ textarea {
 .model-icon,
 .sandbox-label-short {
   display: none;
+}
+
+/* ── 宽度不足时的图标化收纳（容器查询，对齐手机版形态）──
+   两侧面板展开挤窄输入栏时禁止按钮换行/压成竖条，按 #input-wrap 容器
+   宽度分档收纳，任何档位都保持单行：
+   ≤640 只隐 Git 分支文字（模型名继续省略号收缩）；
+   ≤540 权限/模型转手机版纯图标；
+   ≤430 沙盒收成 开/限 并隐藏分支入口 */
+@container composer (max-width: 640px) {
+  .git-branch-btn .git-branch-label {
+    display: none;
+  }
+}
+@container composer (max-width: 540px) {
+  .permission-mode-btn .perm-label,
+  .permission-mode-btn .permission-chevron,
+  .model-chip .model-label,
+  .model-chip .model-chevron {
+    display: none;
+  }
+  .perm-icon,
+  .model-icon {
+    display: inline-flex;
+  }
+}
+@container composer (max-width: 430px) {
+  .git-branch-btn {
+    display: none;
+  }
+  .sandbox-label-full {
+    display: none;
+  }
+  .sandbox-label-short {
+    display: inline;
+  }
 }
 
 @media (max-width: 768px) {
