@@ -26,6 +26,7 @@ Y-code Windows 发布打包流水线：一条命令生成完整的 Windows 安�
 import argparse
 import glob
 import hashlib
+import importlib.util
 import os
 import re
 import shutil
@@ -83,6 +84,70 @@ def resolve_pyinstaller(project_dir):
     print("   venv\\Scripts\\activate")
     print("   venv\\Scripts\\pip install pyinstaller")
     sys.exit(1)
+
+
+def _strip_python_comment(line):
+    """剥掉一行 Python 代码里的注释（整行与行尾）：引号外的首个 # 起截断。
+
+    spec 里的 collect_all('x') 写进注释只是文档不是配置，混进解析结果会让
+    硬校验对不存在的包误报缺依赖、白白卡死构建，因此解析前必须剥离。
+    """
+    in_str = None
+    for i, ch in enumerate(line):
+        if in_str:
+            if ch == in_str:
+                in_str = None
+        elif ch in "'\"":
+            in_str = ch
+        elif ch == "#":
+            return line[:i]
+    return line
+
+
+def collect_all_targets_from_spec(spec_path):
+    """从 PyInstaller spec 提取全部 collect_all('包名') 目标（去重保序）。
+
+    以 spec 文件为唯一事实源解析，而不是在本脚本里另抄一份包名清单——
+    以后往 spec 加 collect_all 时校验自动跟上，不会出现两处清单漂移。
+    解析前剥离注释（见 _strip_python_comment），防止注释里的 collect_all
+    字样解析出假目标。
+    """
+    pattern = re.compile(r"collect_all\(\s*['\"]([A-Za-z0-9_.]+)['\"]\s*\)")
+    targets = []
+    with open(spec_path, "r", encoding="utf-8") as f:
+        for line in f:
+            code = _strip_python_comment(line)
+            for match in pattern.finditer(code):
+                if match.group(1) not in targets:
+                    targets.append(match.group(1))
+    return targets
+
+
+def find_missing_collect_all_targets(targets):
+    """返回 targets 中构建环境 import 不到的包名（find_spec 只定位不执行模块）。"""
+    missing = []
+    for name in targets:
+        try:
+            spec = importlib.util.find_spec(name)
+        except (ImportError, ValueError):
+            spec = None
+        if spec is None:
+            missing.append(name)
+    return missing
+
+
+def verify_spec_collect_all_targets(project_dir):
+    """主程序构建前的环境硬校验：ycode.spec 每个 collect_all 目标必须可 import。
+
+    背景：PyInstaller 的 collect_all 对构建环境里缺失的包静默返回空三元组
+    （6.21.0 实测只打 WARNING 不报错），Analysis 照常通过，产物直接丢依赖。
+    pywinpty（GUI 内嵌终端）是重灾区——core/gui_terminal.py 在函数内惰性
+    import，静态分析本就不可达，collect_all 是唯一收集通道；缺包时打包版
+    终端启动即报 ModuleNotFoundError，且整个构建流程没有任何失败信号。
+    """
+    return find_missing_collect_all_targets(
+        collect_all_targets_from_spec(os.path.join(project_dir, "ycode.spec"))
+    )
 
 
 def read_project_version(project_dir):
@@ -715,6 +780,17 @@ def build():
         print("ℹ 已指定 --setup-only，跳过前端 / 核心载荷 / 卸载程序构建，直接复用现有产物。")
         payload_zip = make_payload_archive(project_dir, ycode_dir)
     else:
+        # 硬校验放在最前（含前端构建之前）：环境缺包时尽快失败，不浪费时间。
+        # --setup-only 分支复用既有载荷、不重新 Analysis，无需此检查。
+        missing_collect_all = verify_spec_collect_all_targets(project_dir)
+        if missing_collect_all:
+            print("❌ 构建环境缺少 ycode.spec collect_all 依赖的包: "
+                  + ", ".join(missing_collect_all))
+            print("   collect_all 对构建环境缺失的包会静默返回空而不报错，继续构建")
+            print("   会产出丢失该依赖的安装包（典型症状：打包后 GUI 内嵌终端启动")
+            print("   即报 No module named 'winpty'）。")
+            print("   请先补齐依赖：venv\\Scripts\\python -m pip install -r requirements.txt")
+            sys.exit(1)
         step0_build_frontend(project_dir, args)
         ycode_dir = step1_build_core(pyinstaller_bin, project_dir)
         payload_zip = make_payload_archive(project_dir, ycode_dir)
