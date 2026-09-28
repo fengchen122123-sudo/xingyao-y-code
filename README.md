@@ -40,7 +40,7 @@
 ### 高级编排
 
 - **子代理系统**：5 种内置类型（explore / implement / test / review / general）+ 自定义子代理，支持依赖感知并行调度与嵌套（最深 3 层）
-- **计划执行模式**：复杂任务先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
+- **计划执行模式**：多步任务（拆解后子任务超过 3 条）先用 `plan_write` 建立可执行计划，按依赖图逐项派发子代理，支持暂停 / 恢复 / 重试 / 取消
 - **后台任务管理**：长周期命令后台执行，`/tasks` 查看状态、`/tasks tail` 看日志、`/tasks kill` 终结
 - **权限系统**：四种模式（confirm 变更前确认 / accept_edits 自动编辑 / plan 计划模式 / full 完全访问），沙盒控制工作目录访问边界
 
@@ -370,7 +370,7 @@ Y-code 内置 29 个工具（不含 iMOM 项目定位插件栈的 5 个定位工
 
 ### 计划模式（Plan Mode）
 
-复杂任务（3+ 文件、50+ 行改动）先用 `plan_write` 建立可执行计划：
+多步任务（拆解后子任务超过 3 条）先用 `plan_write` 建立可执行计划：
 
 1. `plan_write` 建立计划（含依赖图、阶段、验证方式）
 2. 主 Agent 通用工具被限制，只能用 `run_subagent` / `ask_user` / `plan_read` / `plan_retry` / `plan_update`
