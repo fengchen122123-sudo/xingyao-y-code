@@ -3,6 +3,8 @@ import { createPinia } from 'pinia';
 import './style.css';
 import App from './App.vue';
 import { applyBootTheme } from './themes/runtime';
+import { useAppStore } from './stores/appStore';
+import { registerFrontendUpdateHandlers } from './utils/frontendUpdate';
 
 // 启动画面在 get_initial_state 返回前就会渲染：先同步恢复主题，避免浅色主题
 // 用户看到黑色 splash（后端真值返回后会再校正一次）。
@@ -15,3 +17,10 @@ try {
 const app = createApp(App);
 app.use(createPinia());
 app.mount('#app');
+
+// 界面资源版本失配自愈（详见 utils/frontendUpdate.ts）：dist 运行期更新、
+// 或旧构建哈希 chunk 动态 import 失败（vite:preloadError）时，等界面空闲
+// 自动刷新到最新版本。注入闸门：任一会话有进行中回合就不刷新，避免打断
+// 正在进行的对话；回合结束后由内部定时器复检补刷。
+const store = useAppStore();
+registerFrontendUpdateHandlers({ canReload: () => store.runningSessions.length === 0 });
