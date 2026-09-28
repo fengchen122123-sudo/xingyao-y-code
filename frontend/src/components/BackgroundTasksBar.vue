@@ -1,9 +1,9 @@
 <template>
-  <div v-if="store.backgroundTasks.length > 0" class="bg-bar" data-test="bg-bar">
+  <div v-if="store.currentSessionBackgroundTasks.length > 0" class="bg-bar" data-test="bg-bar">
     <div class="bg-bar-row" @click.stop>
       <AppIcon name="loader" :size="13" :stroke-width="2" class="bg-spin" />
       <span class="bg-text" data-test="bg-bar-count">
-        <b class="bg-num">{{ store.backgroundTasks.length }}</b> 个后台任务在执行
+        <b class="bg-num">{{ store.currentSessionBackgroundTasks.length }}</b> 个后台任务在执行
       </span>
       <span class="bg-spacer"></span>
       <button class="chip-btn" data-test="bg-bar-details" @click.stop="open = !open">
@@ -18,13 +18,13 @@
         <span class="bg-pop-note">每 5 秒自动刷新</span>
       </div>
       <div class="bg-pop-list">
-        <div v-for="t in store.backgroundTasks" :key="t.task_id" class="bg-task">
+        <div v-for="t in store.currentSessionBackgroundTasks" :key="t.task_id" class="bg-task">
           <div class="bg-task-top">
             <span class="bg-task-cmd" :title="t.command || t.task_id">{{ t.command || t.task_id }}</span>
             <span class="bg-task-status">{{ t.status || 'running' }}</span>
           </div>
           <div class="bg-task-foot">
-            <span class="bg-task-time">{{ t.running_time || '活跃' }}</span>
+            <span class="bg-task-time">{{ taskFootLabel(t) }}</span>
             <span class="bg-task-actions">
               <button class="chip-btn" :data-test="'bg-detail-' + t.task_id" title="在右侧面板查看执行过程" @click.stop="openDetail(t.task_id)">详情</button>
               <button class="chip-btn danger" :data-test="'bg-kill-' + t.task_id" title="终止该后台任务" @click="killTask(t.task_id)">终止</button>
@@ -41,11 +41,25 @@ import { onMounted, onUnmounted, ref } from 'vue';
 import { useAppStore } from '../stores/appStore';
 import AppIcon from './AppIcon.vue';
 
-// 会话底部“后台任务执行条”：list_active_tasks 快照非空时出现（快照由
-// App.vue 每 5 秒轮询刷新）；详情展开任务卡片悬浮于对话区底部，无全屏遮罩，
-// 点外部/再点详情收起。
+// 会话底部“后台任务执行条”：只显示当前会话发起的任务（渲染源
+// currentSessionBackgroundTasks 按 session_id 过滤全局快照，其他会话/CLI
+// 启动的任务不串显）；快照由 App.vue 每 5 秒轮询刷新；详情展开任务卡片
+// 悬浮于对话区底部，无全屏遮罩，点外部/再点详情收起。
 const store = useAppStore();
 const open = ref(false);
+
+// 任务卡脚注：时长 + 输出心跳。尚无实际输出（仅启动标记）时明确提示
+// "等待首行输出"，避免把缓冲管道命令的正常静默误读为卡死
+function taskFootLabel(t: { running_time?: string; output_size?: number; no_output_yet?: boolean }) {
+  const parts = [t.running_time || '活跃'];
+  if (t.no_output_yet) {
+    parts.push('等待首行输出');
+  } else if ((t.output_size ?? 0) > 0) {
+    const s = t.output_size as number;
+    parts.push(s < 1024 ? `输出 ${s} B` : `输出 ${(s / 1024).toFixed(1)} KB`);
+  }
+  return parts.join(' · ');
+}
 
 function onDocClick() {
   open.value = false;

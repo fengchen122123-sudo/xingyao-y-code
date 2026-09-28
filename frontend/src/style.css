@@ -499,6 +499,12 @@ button {
   margin-top: 12px;
 }
 
+/* 左右按钮组不参与压缩：宽度不足由容器查询（见 KimiEmptyState）整体
+   切换手机版图标形态，而不是组内按钮被压换行 */
+.kimi-card-bar > div {
+  flex-shrink: 0;
+}
+
 .kimi-pill-btn {
   background: var(--bg2);
   border: 1px solid var(--border);
@@ -511,6 +517,25 @@ button {
   gap: 6px;
   cursor: pointer;
   transition: 0.15s;
+  /* CJK 文本逐字换行会把按钮撑成多行竖条，文字一律单行 */
+  white-space: nowrap;
+  flex-shrink: 0;
+  /* 图标按钮(回形针)与文字按钮统一高度，一行内不出现高低差 */
+  min-height: 30px;
+}
+
+/* 首页模型按钮：档位间隙里唯一可收缩的按钮，空间不足省略号截断 */
+.kimi-card-bar .model-chip {
+  max-width: 200px;
+  min-width: 0;
+  overflow: hidden;
+  flex-shrink: 1;
+}
+.kimi-card-bar .model-chip .model-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .kimi-pill-btn:hover {

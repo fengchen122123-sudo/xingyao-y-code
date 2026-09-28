@@ -3,7 +3,7 @@
     <div class="pop-head">
       <div class="ph-ico"><AppIcon name="chart" :size="14" :stroke-width="2" /></div>
       <div class="ph-title">
-        <h3>任务计划</h3>
+        <h3>星链</h3>
         <p class="ph-sub">星瑶编排复杂任务时的计划执行进度</p>
       </div>
       <button class="chip-btn" title="关闭" @click="$emit('close')"><AppIcon name="x" :size="12" :stroke-width="2" /> 关闭</button>

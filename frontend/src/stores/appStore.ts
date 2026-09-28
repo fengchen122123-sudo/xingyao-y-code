@@ -42,6 +42,8 @@ import type {
   TurnUndoRecoveryExecutePayload,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
+// 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
+import { requestFrontendReload } from '../utils/frontendUpdate';
 import type { MediaItem } from '../types/media';
 import { formatPermMode } from '../utils/markdown';
 import {
@@ -681,6 +683,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 按会话保存恢复，A 会话打开的浏览器页签不会出现在 B 会话
     rightPanelTabs: [] as RightPanelTabId[],
     rightPanelActiveTab: '' as RightPanelTabId | '',
+    // 右面板画笔截图模式：冻结帧覆盖层挂出中。置位后浏览器页签的
+    // shouldShowSurface 门控会让原生 WebView2 表面 hide（冻结帧已含其像素，
+    // 原生控件必须让位给画笔覆盖层）；关闭后既有 watch 自动 re-show。
+    // 模态瞬态，不持久化也不会话隔离
+    rightPanelSnipActive: false,
     // 桌面端左右面板宽度（px）：拖拽手柄实时更新，启动时从 localStorage 恢复；
     // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
     sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
@@ -863,6 +870,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return (state.currentSessionName && state.messageQueues[state.currentSessionName]) || [];
     },
 
+    // 当前会话发起的后台任务（底部执行条渲染源）：快照带 session_id 归属，
+    // 只显示本会话启动的任务，其他会话（或 CLI）启动的任务不跨会话串显；
+    // 无归属的旧记录不属于任何会话，任何会话的执行条都不显示
+    currentSessionBackgroundTasks(state): BackgroundTask[] {
+      const sess = state.currentSessionName;
+      if (!sess) return [];
+      return state.backgroundTasks.filter(t => t.session_id === sess);
+    },
+
     // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示
     computerControlBarVisible(state): boolean {
       return COMPUTER_BAR_STATUSES.includes(state.computerRun.status);
@@ -951,7 +967,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return this.sessionRuntimeByName[key];
     },
 
-    _captureRuntime(this: any, sessionName = this.currentSessionName) {
+    // opts.skipLayout：跳过右面板页签/开合/任务详情等布局态捕获。事件管线
+    // （handleBridgeEvent）跨会话临时绑到目标会话时必须传 true——此时顶层
+    // 布局仍是当前查看会话的实时状态，捕获进目标会话会用 A 的布局污染 B 的
+    // 快照，用户真实切回 B 时恢复出错误页签/开合。
+    _captureRuntime(this: any, sessionName = this.currentSessionName, opts?: { skipLayout?: boolean }) {
       const runtime = this._getSessionRuntime(sessionName);
       runtime.messages = this.messages;
       runtime.streamingText = this.currentStreamingText;
@@ -975,10 +995,15 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 导航索引随会话保存：切回时展示该会话自己的红点
       runtime.navItems = this.navItems;
       // 右面板多页签随会话保存：页签集、激活页签与面板展开态都按会话隔离，
-      // 切回时恢复该会话自己的浏览器/Git 等页签
+      // 切回时恢复该会话自己的浏览器/Git 等页签。事件管线的临时捕获
+      // （skipLayout）不保存这段：顶层布局此时仍属于当前查看的会话
+      if (!opts?.skipLayout) {
       runtime.rightPanelTabs = [...this.rightPanelTabs];
       runtime.rightPanelActiveTab = this.rightPanelActiveTab;
       runtime.rightPanelExpanded = !this.rightPanelCollapsed;
+      // 后台任务详情查看对象随会话保存：切回时恢复该会话自己的查看对象
+      runtime.bgTaskDetailId = this.bgTaskDetailId;
+      }
     },
 
     _captureCurrentRuntime(this: any) {
@@ -996,7 +1021,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    _bindSessionRuntime(this: any, sessionName = this.currentSessionName) {
+    // opts.skipLayout：跳过右面板页签/开合/任务详情等布局态恢复。事件管线
+    // （handleBridgeEvent）跨会话临时绑回当前会话时必须传 true——布局只随
+    // 用户真实切换会话恢复，否则该会话旧快照会把用户刚点的面板开合覆盖掉
+    // （表现为"关了又自动打开 / 打开又自动关闭"）。
+    _bindSessionRuntime(this: any, sessionName = this.currentSessionName, opts?: { skipLayout?: boolean }) {
       const runtime = this._getSessionRuntime(sessionName);
       this.messages = runtime.messages;
       // 历史分页游标随会话恢复；loading 为瞬态，切会话强制复位防卡死翻页
@@ -1035,7 +1064,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
       // 右面板多页签随会话恢复：目标会话从未展开过面板（undefined）→ 收起、
       // 无页签；展开过的会话恢复自己的页签集与激活页签。浏览器原生表面随
-      // BrowserPane 的 active prop 翻转自动隐藏/重显，不需要额外桥调用
+      // BrowserPane 的 active prop 翻转自动隐藏/重显，不需要额外桥调用。
+      // 事件管线的临时回绑（skipLayout）不恢复这段：布局属用户实时操作面，
+      // 回滚到旧快照会吃掉用户刚做的开合/页签变更
+      if (!opts?.skipLayout) {
       const savedTabs = runtime.rightPanelTabs;
       let tabs = savedTabs ? ([...savedTabs] as RightPanelTabId[]) : [];
       // 操控页签依附于全局唯一的 run：终态自动收场可能发生在别的会话上
@@ -1056,6 +1088,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         : !runtime.rightPanelExpanded;
       // 无页签 → 选择页；有页签 → 显示激活页签
       this.rightPanelPicker = this.rightPanelTabs.length === 0;
+      // 后台任务详情查看对象随会话恢复：切会话不残留上一个会话的任务详情
+      this.bgTaskDetailId = runtime.bgTaskDetailId || '';
+      }
     },
 
     _setSessionRunning(this: any, sessionName: string, running: boolean) {
@@ -1253,9 +1288,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.rightPanelActiveTab = tab;
       this.rightPanelPicker = false;
       if (opts?.expand !== false) this.rightPanelCollapsed = false;
-      // 详情页签缺省查看对象：有任务时自动选第一个，避免开页签只见“未找到”
-      if (tab === 'tasks' && !this.bgTaskDetailId && this.backgroundTasks.length) {
-        this.bgTaskDetailId = this.backgroundTasks[0].task_id;
+      // 详情页签缺省查看对象：只在本会话有后台任务时自动选第一个，
+      // 其他会话的任务不跨会话代选（与执行条的会话过滤口径一致）
+      if (tab === 'tasks' && !this.bgTaskDetailId && this.currentSessionBackgroundTasks.length) {
+        this.bgTaskDetailId = this.currentSessionBackgroundTasks[0].task_id;
       }
       if (tab === 'subagent' && !this.subagentDetailId && this.subagentTasks.length) {
         this.subagentDetailId = this.subagentTasks[0].id;
@@ -3455,6 +3491,14 @@ navItems: [] as Array<{ id: number; preview: string }>,
         if (push) push(data);
         return;
       }
+      // 前端构建产物运行期更新（gui_main 的 dist watchdog 推送 fingerprint）：
+      // 触发「资源版本失配自愈」——等界面空闲时自动刷新到最新版本，
+      // 避免旧构建哈希 chunk 404（mermaid 等懒加载失败）；
+      // 不参与会话 runtime 归属，处理完直接返回
+      if (type === 'frontend_dist_updated') {
+        requestFrontendReload('dist-updated');
+        return;
+      }
       // frameless 自绘标题栏关闭请求：弹现代确认框（替代 win32 原生 MessageBox），
       // 不参与会话 runtime 归属逻辑，处理完直接返回
       if (type === 'close_requested') {
@@ -3519,7 +3563,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
       const targetRuntimeKey = eventSession || currentRuntimeKey;
       const switchedRuntime = targetRuntimeKey !== currentRuntimeKey;
-      if (switchedRuntime) this._bindSessionRuntime(targetRuntimeKey);
+      if (switchedRuntime) {
+        // 跨会话临时绑定只切换会话数据，不恢复目标会话布局：顶层布局保持
+        // 当前查看会话的实时状态，事件处理完在 finally 原样带回（否则目标
+        // 会话的布局快照会覆盖用户刚对面板做的开合/页签操作）
+        this._bindSessionRuntime(targetRuntimeKey, { skipLayout: true });
+      }
 
       try {
 
@@ -3826,7 +3875,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
             items,
             progress,
           };
-          this._captureRuntime(targetRuntimeKey);
+          // 事件中转捕获：跨会话事件跳过布局段（顶层布局仍属当前查看会话）
+          this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         }
       } else if (type === 'plan_item_handoff') {
         // 子 Agent 超时接管可见性：只更新本会话计划项的执行模式/owner，
@@ -3863,7 +3913,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
               ...patched,
             } as any);
           }
-          this._captureRuntime(targetRuntimeKey);
+          // 事件中转捕获：跨会话事件跳过布局段（顶层布局仍属当前查看会话）
+          this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         }
       } else if (type === 'user_message_images') {
         // 后端解析附件后补发的图片：挂到当前会话最后一条用户气泡上
@@ -4228,7 +4279,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }
       }
       } finally {
-        this._captureRuntime(targetRuntimeKey);
+        // 同会话事件全量捕获（用户的面板开合由此落入快照）；跨会话事件
+        // 跳过布局段，避免把当前会话的实时布局写进目标会话的快照
+        this._captureRuntime(targetRuntimeKey, { skipLayout: switchedRuntime });
         if (type === 'session_renamed' && data.old && data.new) {
           const oldKey = String(data.old);
           const newKey = String(data.new);
@@ -4238,7 +4291,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
           }
           if (this.currentSessionName === newKey) this._bindSessionRuntime(newKey);
         } else if (switchedRuntime) {
-          this._bindSessionRuntime(currentRuntimeKey);
+          // 回绑只恢复会话数据（消息/流式/运行态等），不恢复面板布局：
+          // 用户在事件间隙对右面板做的开合是实时操作面，被旧快照回滚即
+          // "切换面板点了没反应/自动弹回"的根因
+          this._bindSessionRuntime(currentRuntimeKey, { skipLayout: true });
         }
       }
     },
@@ -5317,12 +5373,21 @@ navItems: [] as Array<{ id: number; preview: string }>,
       try {
         const list = await window.pywebview.api.get_background_tasks();
         // list_active_tasks 只返回 running 任务且字段为 duration/pid：统一归一为
-        // 前端展示字段（status 恒为 running，running_time 取 duration）
+        // 前端展示字段（status 恒为 running，running_time 取 duration）；
+        // session_id 为发起会话名，执行条经 currentSessionBackgroundTasks 按会话过滤；
+        // output_size/last_output_age/no_output_yet 为输出心跳，右面板任务页签
+        // 运行期提示用（旧后端缺省 undefined/null）
         this.backgroundTasks = (Array.isArray(list) ? list : []).map((t: any) => ({
           task_id: String(t?.task_id ?? ''),
           command: String(t?.command ?? ''),
           status: 'running',
           running_time: String(t?.duration ?? '') || '活跃',
+          session_id: String(t?.session_id ?? ''),
+          pid: Number(t?.pid ?? 0) || undefined,
+          turn_id: String(t?.turn_id ?? ''),
+          output_size: Number(t?.output_size ?? 0),
+          last_output_age: (t?.last_output_age ?? null) === null ? null : Number(t.last_output_age),
+          no_output_yet: t?.no_output_yet === true,
         }));
       } catch {
         // 拉取失败保留上次快照，不打断界面
