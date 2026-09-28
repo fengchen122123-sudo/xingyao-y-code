@@ -228,7 +228,9 @@ export async function renderMermaidBlocks(root: HTMLElement | null): Promise<voi
       continue;
     }
     if (!mermaid) {
-      markError(block, '渲染器加载失败');
+      // 动态 import 失败最常见的根因是旧构建哈希 chunk 404（dist 运行期更新），
+      // 文案补上「可刷新界面恢复」指路；frontendUpdate 自愈会另行触发整页刷新
+      markError(block, '渲染器加载失败（可刷新界面恢复）');
       continue;
     }
     block.setAttribute('data-state', 'rendering');
