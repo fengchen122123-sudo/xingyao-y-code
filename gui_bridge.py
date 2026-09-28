@@ -31,6 +31,7 @@ import config
 from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.agent_service import strip_context_suffix
+from core.injection_markers import is_system_injected_user_text
 from core.turn_renderer import sanitize_protocol_text, sanitize_stream_text
 from core.media_refs import MEDIA_DISPLAY_ERROR_LABELS
 from core.media_server import media_server
@@ -41,6 +42,7 @@ from core.gui_theme import ThemeError, get_repository as get_gui_theme_repositor
 from core.gui_terminal import PtyTerminalError, clamp_terminal_size, create_pty_terminal
 from gui_git_mixin import GitBridgeMixin
 from gui_browser_mixin import BrowserBridgeMixin
+from gui_snip_mixin import SnipBridgeMixin
 from core.model_manager import (
     add_preset_provider as mm_add_preset_provider,
     add_model_to_provider,
@@ -482,7 +484,7 @@ def _media_save_filename(suggested_name: str, ext: str) -> str:
     return (name or "ycode-image") + ext
 
 
-class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
+class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     _active_turn_lock = threading.Lock()
     _active_turn_snapshots: dict[str, dict] = {}
     _session_last_errors: dict[str, dict] = {}
@@ -2431,6 +2433,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
                         # 会把持久化 JSON 的 _computer_v1 键提升到行顶层。
                         if is_observation_protocol_message(msg):
                             continue
+                        # 后台任务回报 / 护栏催促 / hook 追加上下文等系统注入的
+                        # user 消息：不是用户发送的内容，气泡一律不渲染（与红点
+                        # 导航同一裁决）；模型上下文（get_history）不受影响。
+                        if is_system_injected_user_text(content):
+                            continue
                         # 历史回放：剥离当轮注入的「当前运行上下文 / 当前时间」后缀，
                         # 那部分是给模型看的运行快照，不该显示在历史气泡里
                         content = strip_context_suffix(content)
@@ -2521,6 +2528,8 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
     def get_session_nav_index(self, session_name: str) -> Dict[str, Any]:
         """红点导航全量索引：该会话全部 user 消息的 {id, preview}（正序、不分页）。
 
+        只收录用户真实发送的内容：电脑操控观察跟进消息与系统注入的提示词
+        （后台任务回报 / 护栏催促 / hook 追加上下文）不产生红点。
         preview 剥离运行上下文后缀、折叠空白、截断 100 字；纯图片消息给占位。
         会话不存在/无消息返回空列表（ok=True），前端无差别渲染零红点。
         """
@@ -2531,6 +2540,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
                 # 电脑操控观察跟进消息不是用户发送的：红点导航一并跳过
                 # （与 _load_session_messages 的气泡过滤同一裁决）
                 if it.get("is_observation"):
+                    continue
+                # 后台任务回报 / 护栏催促 / hook 追加上下文等系统注入的 user
+                # 消息同样不是用户发送的：不产生红点（与气泡过滤同一裁决）
+                if is_system_injected_user_text(str(it.get("text") or "")):
                     continue
                 text = strip_context_suffix(str(it.get("text") or ""))
                 text = re.sub(r"\s+", " ", text).strip()
@@ -4567,7 +4580,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
                 # 避免等整个回合跑完才由 _maybe_auto_rename 改名。
                 # 注意：rename_session 要求会话已落库，故先 ensure_session 创建。
                 if workdir and re.match(r"^session_[a-f0-9]{6}$", target_session or ""):
-                    base_title = clean_text[:12].replace("\n", " ").strip()
+                    # 标题派生前先净化 @{会话名} 标记：直接把标记原文截进名字会
+                    # 产生「@{xxx」这类残缺标题，令该会话永远无法被 @ 引用命中
+                    from core.input_parser import sanitize_session_title
+                    base_title = sanitize_session_title(clean_text)[:12].replace("\n", " ").strip()
                     if base_title:
                         try:
                             self._memory.ensure_session(target_session, workdir=str(workdir), source="GUI")
@@ -6176,6 +6192,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin):
         # 首条用户消息也带着当轮注入的上下文后缀，提炼标题前剥掉，
         # 否则标题会混入「【当前运行上下文】当前模型：…」这类运行时文字
         first_text = str(strip_context_suffix(raw)).strip().replace("\n", " ")
+        # @{会话名} 标记按内部名还原并剥掉花括号：与首条消息即时命名
+        # （_send_message 内的 base_title 派生）保持同一净化口径
+        from core.input_parser import sanitize_session_title
+        first_text = sanitize_session_title(first_text)
         return first_text[:12] if first_text else None
 
     def _rename_session_to_title(self, session_name: str, base_title: str) -> str:

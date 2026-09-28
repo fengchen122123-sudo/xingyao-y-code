@@ -457,6 +457,17 @@ export interface BackgroundTask {
   command: string;
   status: string;
   running_time?: string;
+  // 发起该任务的会话名（后端任务记录持久化）：执行条按当前会话过滤，
+  // 其他会话启动的任务不在本会话串显；旧记录无归属时不属于任何会话
+  session_id?: string;
+  // 输出心跳（list_active_tasks 提供）：日志字节数 / 距最后写入秒数 /
+  // 是否尚无实际命令输出（仅启动标记）。面板据此在运行期区分
+  // "仍在运行只是暂无输出"与"面板失联"，旧后端缺省 undefined
+  pid?: number;
+  turn_id?: string;
+  output_size?: number;
+  last_output_age?: number | null;
+  no_output_yet?: boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -1149,6 +1160,25 @@ export interface PyWebViewAPI {
   browser_pane_stop(): Promise<EmbeddedBrowserPaneResult>;
   browser_pane_hide(): Promise<EmbeddedBrowserPaneResult>;
   browser_pane_get_state(): Promise<EmbeddedBrowserPaneResult>;
+
+  // ---------------------------------------------------------------------------
+  // 右面板画笔截图（宿主 gui_snip_mixin.SnipBridgeMixin）。rect 为右面板的
+  // CSS px 矩形（与 browser_pane_open 同一坐标系），冻结帧必须在其原生表面
+  // 仍可见时捕获（快照要包含浏览器内容）。所有失败归一 {ok:false,msg}。
+  // ---------------------------------------------------------------------------
+  capture_right_panel_region(rect: EmbeddedBrowserRect): Promise<{
+    ok: boolean;
+    data_url?: string;
+    width?: number;
+    height?: number;
+    msg?: string;
+  }>;
+  snip_copy_clipboard(dataUrl: string): Promise<{ ok: boolean; msg?: string }>;
+  snip_save_image(dataUrl: string, suggestedName?: string): Promise<{
+    ok: boolean;
+    path?: string;
+    msg?: string;
+  }>;
 
   // 旧版右侧面板单命令终端已下线；底部交互式终端见 pty_terminal_*
   pty_terminal_ensure(cols: number, rows: number): Promise<{

@@ -31,8 +31,10 @@ describe('panelMaxWidth', () => {
     expect(panelMaxWidth(480, 2400)).toBe(480);
   });
 
-  it('小窗口下单侧面板不超过窗口宽度的 45%', () => {
-    expect(panelMaxWidth(480, 800)).toBe(360);
+  it('小窗口下单侧面板不超过窗口宽度的 50%', () => {
+    expect(panelMaxWidth(480, 800)).toBe(400);
+    // 用户可把右面板拖到窗口一半：比例守卫不得低于 50%
+    expect(panelMaxWidth(1280, 1000)).toBe(500);
   });
 });
 

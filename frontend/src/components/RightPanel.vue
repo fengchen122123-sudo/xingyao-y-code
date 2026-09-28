@@ -1,6 +1,7 @@
 <template>
   <div
     id="rightbar"
+    ref="rightbarRef"
     data-theme-region="right_panel"
     :class="{ collapsed: store.rightPanelCollapsed }"
     :style="panelStyle"
@@ -33,6 +34,15 @@
         </button>
       </div>
       <span class="tabbar-spacer"></span>
+      <button
+        class="tabbar-btn"
+        data-test="tabbar-snip"
+        title="画笔截图：圈选面板任意内容生成图片"
+        :disabled="snipBusy"
+        @click="enterSnipMode"
+      >
+        <AppIcon name="pencil" :size="13" :stroke-width="2" />
+      </button>
       <button class="tabbar-btn" data-test="tabbar-add" title="打开标签页" @click="store.showRightPanelPicker()">
         <AppIcon name="plus" :size="13" :stroke-width="2" />
       </button>
@@ -104,12 +114,34 @@
         <BrowserPane :active="activeTab === 'browser'" />
       </div>
 
-      <!-- 后台任务执行过程：底部执行条“详情”触发，2 秒轮询日志尾部 -->
+      <!-- 后台任务执行过程：底部执行条“详情”触发，2 秒轮询日志尾部与任务快照。
+           多任务时顶部列表切换；元信息行带输出字节心跳，运行中日志只有启动
+           标记时给出缓冲管道解释（Select-Object -Last 会攒到进程结束才输出） -->
       <div v-show="activeTab === 'tasks'" class="rpane active" data-test="bg-task-pane">
         <div class="bgt-wrap">
+          <div v-if="store.currentSessionBackgroundTasks.length > 1" class="bgt-list" data-test="bg-task-list">
+            <button
+              v-for="t in store.currentSessionBackgroundTasks"
+              :key="t.task_id"
+              class="bgt-item"
+              :class="{ active: t.task_id === store.bgTaskDetailId }"
+              :data-test="'bg-task-item-' + t.task_id"
+              :title="t.command"
+              @click="store.bgTaskDetailId = t.task_id"
+            >
+              <span class="bgt-dot" :class="{ idle: t.no_output_yet }"></span>
+              <span class="bgt-item-cmd">{{ t.command || t.task_id }}</span>
+              <span class="bgt-item-time">{{ t.running_time }}</span>
+            </button>
+          </div>
           <div class="bgt-head">
             <span class="bgt-cmd" :title="detailCommand">{{ detailCommand }}</span>
             <span class="bgt-state" :class="{ done: !detailRunning }">{{ detailRunning ? '运行中' : '已结束' }}</span>
+          </div>
+          <div v-if="detailMeta" class="bgt-meta" data-test="bg-task-meta">{{ detailMeta }}</div>
+          <div v-if="detailRunning && detailNoOutput" class="bgt-hint" data-test="bg-task-hint">
+            进程运行中，日志暂无命令输出（只有启动标记）。任务仍在正常执行——若命令末尾接了
+            <code>| Select-Object -Last</code>、<code>| tail</code> 等缓冲管道，输出会到进程结束才一次性写入日志。
           </div>
           <pre ref="bgtLogRef" class="bgt-log" data-test="bg-task-log">{{ detailOutput || (detailRunning ? '正在读取任务输出…' : '未找到任务输出。') }}</pre>
         </div>
@@ -121,6 +153,14 @@
       </div>
       </template>
     </div>
+
+    <!-- 画笔截图覆盖层：进入模式前已捕获整块面板冻结帧（含原生浏览器表面），
+         挂出时 rightPanelSnipActive 会让原生表面 hide，覆盖层完整接管右面板 -->
+    <RightPanelSnip
+      v-if="store.rightPanelSnipActive && snipSnapshot"
+      :snapshot="snipSnapshot"
+      @close="exitSnipMode"
+    />
 
     <!-- 文件预览弹窗：Teleport 到 body——右栏分区带 isolation 分层，
          fixed 模态留在分区内会被后绘制的兄弟分区盖住 -->
@@ -160,10 +200,54 @@ import ComputerControlPane from './ComputerControlPane.vue';
 import BrowserPane from './BrowserPane.vue';
 import GitPanel from './GitPanel.vue';
 import SubagentPane from './SubagentPane.vue';
+import RightPanelSnip from './RightPanelSnip.vue';
 import { renderMarkdown } from '../utils/markdown';
 import { useIsMobile } from '../composables/useViewport';
 
 const store = useAppStore();
+
+// ── 画笔截图：入口按钮 → 捕获冻结帧 → 挂覆盖层 ──
+// 捕获必须在置位 rightPanelSnipActive 之前完成：原生浏览器表面此刻仍可见，
+// 冻结帧才包含其像素；置位后 BrowserPane 的表面门控自动 hide 表面，关闭时
+// 既有状态机自动 re-show。快照 dataURL 只走本地 ref（模态瞬态，不进 store）
+const rightbarRef = ref<HTMLElement | null>(null);
+const snipSnapshot = ref('');
+const snipBusy = ref(false);
+
+async function enterSnipMode() {
+  if (store.rightPanelSnipActive || snipBusy.value) return;
+  const el = rightbarRef.value;
+  const api = typeof window !== 'undefined' ? window.pywebview?.api : undefined;
+  if (!el || !api?.capture_right_panel_region) {
+    store.notifyChat('桌面桥未就绪，无法使用画笔截图');
+    return;
+  }
+  const r = el.getBoundingClientRect();
+  snipBusy.value = true;
+  try {
+    const res = await api.capture_right_panel_region({
+      x: Math.round(r.left),
+      y: Math.round(r.top),
+      width: Math.round(r.width),
+      height: Math.round(r.height),
+    });
+    if (res?.ok && res.data_url) {
+      snipSnapshot.value = res.data_url;
+      store.rightPanelSnipActive = true;
+    } else {
+      store.notifyChat(res?.msg || '面板截图失败，请重试');
+    }
+  } catch {
+    store.notifyChat('面板截图失败：桥接调用异常');
+  } finally {
+    snipBusy.value = false;
+  }
+}
+
+function exitSnipMode() {
+  store.rightPanelSnipActive = false;
+  snipSnapshot.value = '';
+}
 
 // 桌面端宽度由拖拽手柄写入 store，此处内联生效；折叠负 margin 跟随实际
 // 宽度。移动端（<=768px）整体隐藏右面板，不输出内联样式。
@@ -232,12 +316,39 @@ watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
 // ── 后台任务执行过程：2 秒轮询日志尾部，跟随滚动到底 ──
 const detailOutput = ref('');
 const bgtLogRef = ref<HTMLElement | null>(null);
+const detailTask = computed(
+  () => store.backgroundTasks.find(t => t.task_id === store.bgTaskDetailId)
+);
 const detailCommand = computed(
-  () => store.backgroundTasks.find(t => t.task_id === store.bgTaskDetailId)?.command || store.bgTaskDetailId
+  () => detailTask.value?.command || store.bgTaskDetailId
 );
-const detailRunning = computed(() =>
-  store.backgroundTasks.some(t => t.task_id === store.bgTaskDetailId)
-);
+const detailRunning = computed(() => !!detailTask.value);
+
+// 元信息行：PID / 回合短码 / 输出字节心跳 / 距最后输出秒数（旧后端无字段时整体隐藏）
+const detailMeta = computed(() => {
+  const t = detailTask.value;
+  if (!t) return '';
+  const parts: string[] = [];
+  if (t.pid) parts.push(`PID ${t.pid}`);
+  if (t.turn_id) parts.push(`回合 ${t.turn_id.slice(0, 8)}`);
+  const size = t.output_size;
+  if (size !== undefined) {
+    parts.push(size < 1024 ? `输出 ${size} B` : `输出 ${(size / 1024).toFixed(1)} KB`);
+  }
+  if (t.last_output_age !== null && t.last_output_age !== undefined) {
+    parts.push(`最后输出 ${t.last_output_age}s 前`);
+  }
+  return parts.join(' · ');
+});
+
+// 运行中但日志还没有实际命令输出：优先用后端心跳字段判定（旧后端退化为
+// 检查输出文本是否只有启动标记行）
+const detailNoOutput = computed(() => {
+  const t = detailTask.value;
+  if (t && t.no_output_yet !== undefined) return t.no_output_yet;
+  const txt = detailOutput.value.trim();
+  return txt === '' || /^\[turn:[0-9a-f]{8}\] 后台任务启动$/.test(txt);
+});
 
 let bgtTimer: ReturnType<typeof setInterval> | undefined;
 let bgtInFlight = false;
@@ -246,6 +357,9 @@ async function fetchTaskOutput() {
   if (!id || !(window.pywebview && window.pywebview.api) || bgtInFlight) return;
   bgtInFlight = true;
   try {
+    // 页签激活期间同步刷新任务快照：时长/输出心跳按 2 秒节拍跳动
+    // （App.vue 全局轮询为 5 秒，只够底部执行条保鲜）
+    void store.refreshBackgroundTasks();
     const res = await window.pywebview.api.get_background_task_output(id, 200);
     if (store.bgTaskDetailId === id && res?.ok) {
       const el = bgtLogRef.value;
@@ -436,16 +550,21 @@ onUnmounted(() => {
   flex-direction: column;
   flex-shrink: 0;
   transition: margin-right 0.25s;
+  /* 画笔截图覆盖层的定位基准（absolute inset:0 盖住页签条+内容区） */
+  position: relative;
 }
 #rightbar.collapsed {
   margin-right: -330px;
 }
-/* 页签条：多页签并存 + “+”选择页 + 收起按钮；页签过多时横向滚动 */
+/* 页签条：多页签并存 + “+”选择页 + 收起按钮；页签过多时横向滚动。
+   高度钉死为 38px（+1px 下边框与 #chat-header 的 38px+1px 完全一致），
+   两侧分隔线才在同一条水平线上——内容自适应高度会随页签/按钮字号浮动 */
 .tabbar {
   display: flex;
   align-items: center;
   gap: 2px;
-  padding: 5px 8px;
+  height: 38px;
+  padding: 0 8px;
   border-bottom: 1px solid var(--border);
   flex-shrink: 0;
   min-width: 0;
@@ -674,6 +793,81 @@ onUnmounted(() => {
   color: var(--text-dim);
   max-height: calc(100vh - 220px);
   overflow-y: auto;
+}
+/* 多任务切换列表：状态点（橙=暂无输出）+ 命令 + 时长 */
+.bgt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.bgt-item {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  width: 100%;
+  padding: 6px 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: var(--bg2);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-family: inherit;
+  text-align: left;
+  cursor: pointer;
+  transition: 0.15s;
+}
+.bgt-item:hover {
+  border-color: var(--text-faint);
+}
+.bgt-item.active {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--text);
+}
+.bgt-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--green);
+  flex-shrink: 0;
+}
+.bgt-dot.idle {
+  background: var(--orange);
+}
+.bgt-item-cmd {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--mono);
+}
+.bgt-item-time {
+  flex-shrink: 0;
+  font-size: 10.5px;
+  color: var(--text-faint);
+}
+/* 元信息心跳行与无输出解释提示 */
+.bgt-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
+  font-size: 11px;
+  color: var(--text-faint);
+}
+.bgt-hint {
+  padding: 8px 11px;
+  border: 1px solid rgba(240, 136, 62, 0.35);
+  background: rgba(240, 136, 62, 0.08);
+  border-radius: 8px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  color: var(--text-dim);
+}
+.bgt-hint code {
+  font-family: var(--mono);
+  font-size: 10.5px;
+  color: var(--orange);
 }
 
 /* 文件预览弹窗 */

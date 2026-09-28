@@ -45,6 +45,9 @@ export interface SessionRuntimeState {
   rightPanelTabs?: string[];
   rightPanelActiveTab?: string;
   rightPanelExpanded?: boolean;
+  // 该会话最近查看的后台任务详情 id：随会话保存/恢复，切会话时任务详情
+  // 不残留上一个会话的查看对象（与 rightPanelTabs 的会话隔离同口径）
+  bgTaskDetailId?: string;
 }
 
 export function createSessionRuntime(): SessionRuntimeState {

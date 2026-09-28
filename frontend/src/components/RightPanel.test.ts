@@ -229,9 +229,11 @@ function subagentDetailPayload() {
     ok: true,
     task: {
       id: 'sub-1', description: '调研代码结构', type: 'explore', status: 'running',
-      stage: 'completed', elapsed: 12, background: false,
+      stage: 'tool', elapsed: 12, background: false, started_at: 1758000000,
       stages: [
-        { name: 'tool', at: 1758000000, detail: 'read_file ✓ 1.2s' },
+        { name: 'model', at: 1758000000, detail: '' },
+        { name: 'tool', at: 1758000005, detail: 'read_file' },
+        { name: 'tool', at: 1758000006, detail: 'read_file ✓ 1.2s' },
       ],
     },
     tasks: [
@@ -241,7 +243,7 @@ function subagentDetailPayload() {
   };
 }
 
-it('子代理查看打开子代理页签：头部信息 + 阶段时间线 + 任务切换条', async () => {
+it('子代理查看打开子代理页签：头部信息 + 执行行 + 任务切换条', async () => {
   const getDetail = vi.fn().mockResolvedValue(subagentDetailPayload());
   (window as any).pywebview = { api: { get_subagent_task_detail: getDetail } };
   const store = useAppStore();
@@ -255,11 +257,18 @@ it('子代理查看打开子代理页签：头部信息 + 阶段时间线 + 任�
   expect(wrapper.find('[data-test="subagent-pane"]').isVisible()).toBe(true);
 
   await vi.waitFor(() => {
-    expect(wrapper.findAll('[data-test="subagent-flow"] .suba-step').length).toBeGreaterThan(0);
+    expect(wrapper.findAll('[data-test="subagent-flow"] .suba-row').length).toBeGreaterThan(0);
   });
   expect(getDetail).toHaveBeenCalledWith('sub-1', store.currentSessionName);
   expect(wrapper.text()).toContain('调研代码结构');
-  expect(wrapper.text()).toContain('read_file ✓ 1.2s');
+  // 方案 B：工具开始/结束配对成一行（开始时刻锚定），模板行（调用模型）弱化保留
+  const rows = wrapper.findAll('[data-test="subagent-flow"] .suba-row');
+  expect(rows).toHaveLength(2);
+  expect(rows[1].text()).toContain('read_file');
+  expect(rows[1].text()).toContain('✓ 1.2s');
+  // 头部统计：轮次与工具成败计数
+  expect(wrapper.text()).toContain('轮次 1');
+  expect(wrapper.text()).toContain('工具 1 成功');
   // 任务切换条：会话内两个子代理 → 两个 chip，点击第二个切换查看对象
   const chips = wrapper.findAll('.suba-chip');
   expect(chips).toHaveLength(2);
@@ -418,5 +427,64 @@ it('Git 分支项直达 Git 页签，浏览器页签并存不覆盖', async () =
   expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
   expect(wrapper.find('[data-test="git-pane"]').isVisible()).toBe(true);
   expect(store.rightPanelTabs).toEqual(['browser', 'git']);
+  wrapper.unmount();
+});
+
+// ── 画笔截图入口（gui_snip_mixin.SnipBridgeMixin）──
+
+it('画笔截图：无桥时不进入截图模式并提示；桥正常时先捕获再挂覆盖层', async () => {
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  expect(wrapper.find('[data-test="tabbar-snip"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="snip-overlay"]').exists()).toBe(false);
+
+  // 无桥（jsdom 调试环境）：不置位、不挂覆盖层
+  await wrapper.find('[data-test="tabbar-snip"]').trigger('click');
+  await nextTick();
+  expect(store.rightPanelSnipActive).toBe(false);
+  expect(wrapper.find('[data-test="snip-overlay"]').exists()).toBe(false);
+
+  // 桥就绪：捕获成功（含 data_url）→ 置位并挂覆盖层；快照经 prop 传入冻结帧
+  let captureCalled = false;
+  (window as any).pywebview = {
+    api: {
+      capture_right_panel_region: vi.fn(async () => {
+        captureCalled = true;
+        return { ok: true, data_url: 'data:image/png;base64,AAAA', width: 10, height: 10 };
+      }),
+    },
+  };
+  await wrapper.find('[data-test="tabbar-snip"]').trigger('click');
+  await nextTick();
+  await nextTick();
+  expect(captureCalled).toBe(true);
+  expect(store.rightPanelSnipActive).toBe(true);
+  expect(wrapper.find('[data-test="snip-overlay"]').exists()).toBe(true);
+
+  // 覆盖层 Esc → 退出截图模式（原生表面由既有状态机恢复，无需桥调用；
+  // 工具条仅在圈出选区后渲染，jsdom 无笔画，走键盘退出路径）
+  window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' }));
+  await nextTick();
+  expect(store.rightPanelSnipActive).toBe(false);
+  wrapper.unmount();
+});
+
+it('画笔截图：捕获失败不进入截图模式', async () => {
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  (window as any).pywebview = {
+    api: {
+      capture_right_panel_region: vi.fn(async () => ({ ok: false, msg: '屏幕捕获失败' })),
+    },
+  };
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  await wrapper.find('[data-test="tabbar-snip"]').trigger('click');
+  await nextTick();
+  await nextTick();
+  expect(store.rightPanelSnipActive).toBe(false);
+  expect(wrapper.find('[data-test="snip-overlay"]').exists()).toBe(false);
   wrapper.unmount();
 });

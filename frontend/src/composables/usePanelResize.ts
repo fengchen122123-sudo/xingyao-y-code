@@ -9,13 +9,14 @@ export const RIGHT_PANEL_WIDTH_KEY = 'ycode-rightpanel-width';
 export const SIDEBAR_DEFAULT_WIDTH = 240;
 export const SIDEBAR_MIN_WIDTH = 240;
 export const SIDEBAR_MAX_WIDTH = 480;
-// 右面板默认 330px，可在 260~640 之间拖拽
+// 右面板默认 330px，可在 260~1280 之间拖拽（实际上限随视口收窄，见 MAX_VIEWPORT_RATIO）
 export const RIGHT_PANEL_DEFAULT_WIDTH = 330;
 export const RIGHT_PANEL_MIN_WIDTH = 260;
-export const RIGHT_PANEL_MAX_WIDTH = 640;
+export const RIGHT_PANEL_MAX_WIDTH = 1280;
 
-// 单侧面板最宽不超过窗口宽度的 45%，避免小窗口下两侧把中间对话区挤没
-export const MAX_VIEWPORT_RATIO = 0.45;
+// 单侧面板最宽不超过窗口宽度的 50%，保证中间对话区至少剩一半；
+// 固定上限只兜底超宽窗口，比例守卫才是真正的挤压保护
+export const MAX_VIEWPORT_RATIO = 0.5;
 
 /** 限制在 [min, max] 区间内并取整（min > max 时按交换后的区间夹取） */
 export function clampPanelWidth(width: number, min: number, max: number): number {
@@ -24,7 +25,7 @@ export function clampPanelWidth(width: number, min: number, max: number): number
   return Math.min(Math.max(Math.round(width), lo), hi);
 }
 
-/** 视口感知上限：min(配置上限, 视口宽度 * 45%) */
+/** 视口感知上限：min(配置上限, 视口宽度 * 50%) */
 export function panelMaxWidth(max: number, viewportWidth = window.innerWidth): number {
   return Math.min(max, Math.round(viewportWidth * MAX_VIEWPORT_RATIO));
 }
@@ -85,7 +86,7 @@ export interface PanelResizeApi {
 /**
  * 面板宽度拖拽调节（桌面端左右分栏手柄）：
  * - 拖拽中实时跟随，松手后写入 localStorage，下次启动自动恢复
- * - 上限随视口动态夹取（不超过窗口 45%）
+ * - 上限随视口动态夹取（不超过窗口 50%）
  * - 拖回默认宽度视为未自定义，清除记忆；双击手柄直接复位
  */
 export function usePanelResize(opts: PanelResizeOptions): PanelResizeApi {
