@@ -138,6 +138,21 @@ def normalize_url(raw: Any) -> str:
     return ""
 
 
+def is_navigation_allowed(uri: Any) -> bool:
+    """页面自身发起导航的 scheme 兜底判定（与 normalize_url 同口径）。
+
+    仅 http/https（normalize_url 的规整结果）与既有的 about:blank 白名单放行；
+    javascript:/file:/data:/about:config 等一律拒绝。uri 取不到（None / 空 /
+    旧版内核无该属性）时返回 True——不误杀，交由 WebView2 自身策略决定。
+    """
+    if uri is None:
+        return True
+    text = str(uri).strip()
+    if not text:
+        return True
+    return normalize_url(text) != ""
+
+
 def _make_delegate(callback: Callable[[], None]):
     """把 Python 可调用包装成 WinForms 委托（Form.Invoke 需要 Delegate）。
 
@@ -332,6 +347,20 @@ class EmbeddedBrowserController:
     def _on_navigation_starting(self, sender, args) -> None:
         self._loading = True
         self._schedule_emit()
+        # 页面自身发起的顶层导航（点击链接 / location.href / meta refresh）不经过
+        # 后端 normalize_url，必须在这里用同一口径兜底，否则 javascript:/file:
+        # 等 scheme 可绕过白名单。uri 取不到时不误杀。
+        try:
+            uri = getattr(args, "Uri", None)
+        except Exception:
+            uri = None
+        if is_navigation_allowed(uri):
+            return
+        try:
+            args.Cancel = True
+            logger.info("已拦截非白名单内嵌浏览器导航: %s", uri)
+        except Exception:
+            logger.debug("取消内嵌浏览器导航失败", exc_info=True)
 
     def _on_navigation_completed(self, sender, args) -> None:
         self._loading = False
@@ -683,6 +712,10 @@ class EmbeddedBrowserController:
                     self._emit_timer = None
                 self._pending_emit = False
                 self._pending_url = ""
+                # 一并清 _cdp_port：控件即将 Dispose，端口不再可用；不清的话
+                # 下一次 prepare_automation 会误认"控件仍带调试端口"而返回
+                # 已失效的 endpoint（面板浏览与自动化并存时的静默错误）。
+                self._cdp_port = None
             webview = self._webview
             form = self._form
             if webview is None:

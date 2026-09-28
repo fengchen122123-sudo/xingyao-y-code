@@ -211,7 +211,10 @@ it('执行条详情打开后台任务页签并显示命令', async () => {
   const store = useAppStore();
   const wrapper = mount(RightPanel);
 
-  store.backgroundTasks = [{ task_id: 't9', command: 'pytest -q', status: 'running' }];
+  // 后台任务带会话归属：详情头部与列表统一走 currentSessionBackgroundTasks，
+  // 无归属的旧记录不显示（本用例给任务一个与当前会话一致的 session_id）
+  store.currentSessionName = 's1';
+  store.backgroundTasks = [{ task_id: 't9', command: 'pytest -q', status: 'running', session_id: 's1' }];
   store.openBackgroundTaskDetail('t9');
   await nextTick();
 
@@ -486,5 +489,47 @@ it('画笔截图：捕获失败不进入截图模式', async () => {
   await nextTick();
   expect(store.rightPanelSnipActive).toBe(false);
   expect(wrapper.find('[data-test="snip-overlay"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+// ── 后台任务详情口径一致性 ──
+
+it('后台任务详情头部与列表同口径：只认当前会话任务，不显示其他会话的命令', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 's2';
+  store.backgroundTasks = [
+    { task_id: 't1', command: '别的会话命令', status: 'running', session_id: 's1' },
+  ];
+  store.bgTaskDetailId = 't1';
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  store.openRightPanelTab('tasks');
+  await nextTick();
+
+  // 列表源是 currentSessionBackgroundTasks（本会话无任务 → 不渲染多任务列表）
+  expect(wrapper.find('[data-test="bg-task-list"]').exists()).toBe(false);
+  // 头部详情同样只认当前会话：查不到则回落到任务 id，不显示他会话命令
+  expect(wrapper.find('.bgt-cmd').text()).toBe('t1');
+  wrapper.unmount();
+});
+
+// ── 操控页签的会话归属 ──
+
+it('run 归属其他会话时操控页签写入归属会话，不污染当前查看的会话', async () => {
+  const store = useAppStore();
+  store.currentSessionName = 'B';
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel, { global: { stubs: { BrowserPane: true } } });
+
+  // run 由 A 会话启动（owner_session_id=A），用户此刻正看 B 会话
+  store._applyComputerSnapshot({ run_id: 'run-1', status: 'running', owner_session_id: 'A' });
+  await nextTick();
+
+  // B 的页签集不被写脏
+  expect(store.rightPanelTabs).not.toContain('computer');
+  // 归属会话 A 的 runtime 已登记操控页签（切回 A 时看到）
+  const runtimeA = (store as any).sessionRuntimeByName['A'];
+  expect(runtimeA.rightPanelTabs).toContain('computer');
+  expect(runtimeA.rightPanelActiveTab).toBe('computer');
   wrapper.unmount();
 });

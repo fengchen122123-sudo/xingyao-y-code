@@ -7,6 +7,7 @@
 
 import base64
 import io
+import logging
 import struct
 import sys
 from types import SimpleNamespace
@@ -37,8 +38,47 @@ def make_png_data_url(image: Image.Image) -> str:
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def fake_form(device_dpi=96, hwnd=12345):
-    return SimpleNamespace(Handle=SimpleNamespace(ToInt32=lambda: hwnd), DeviceDpi=device_dpi)
+class FakeForm:
+    """主窗体桩：Invoke 同步执行委托，并记录是否在"GUI 线程"内。
+
+    strict=True 模拟 WinForms 的跨线程约束：Handle / DeviceDpi 只允许在
+    Invoke（GUI 线程）内读取，否则抛 —— 桥方法若直接在当前 js_api 线程读
+    窗体，会像真机一样抛 InvalidOperationException。
+    """
+
+    def __init__(self, device_dpi=96, hwnd=12345, strict=False, invoke_error=None):
+        self._hwnd = hwnd
+        self._device_dpi = device_dpi
+        self._strict = strict
+        self._invoke_error = invoke_error
+        self.in_gui_thread = False
+        self.invocations = 0
+
+    @property
+    def Handle(self):
+        if self._strict and not self.in_gui_thread:
+            raise RuntimeError("WinForms 跨线程访问：Handle 只能在 GUI 线程读取")
+        return SimpleNamespace(ToInt32=lambda: self._hwnd)
+
+    @property
+    def DeviceDpi(self):
+        if self._strict and not self.in_gui_thread:
+            raise RuntimeError("WinForms 跨线程访问：DeviceDpi 只能在 GUI 线程读取")
+        return self._device_dpi
+
+    def Invoke(self, delegate):
+        if self._invoke_error is not None:
+            raise self._invoke_error
+        self.invocations += 1
+        self.in_gui_thread = True
+        try:
+            delegate()
+        finally:
+            self.in_gui_thread = False
+
+
+def fake_form(device_dpi=96, hwnd=12345, **kwargs):
+    return FakeForm(device_dpi=device_dpi, hwnd=hwnd, **kwargs)
 
 
 # ------------------------------------------------------- physical_bbox_for_css
@@ -125,6 +165,83 @@ def test_dib_header_and_pixel_layout():
     assert body[8:16] == b"\x00\x00\xff" + b"\x00\xff\x00" + b"\x00\x00"
 
 
+def test_dib_3x2_bytes_match_reference_layout():
+    """3×2（行 9 字节 → 4 字节对齐到 12）逐字节比对参考实现：
+
+    头字段 + 底向上行序 + 列序 BGR + 行尾 3 字节补齐，全部按已知色值手算，
+    换用 PIL 批量转换后输出必须一字不差。
+    """
+    img = Image.new("RGB", (3, 2))
+    img.putdata([
+        (255, 0, 0), (0, 255, 0), (0, 0, 255),
+        (10, 20, 30), (40, 50, 60), (70, 80, 90),
+    ])
+
+    dib = dib_bytes_from_image(img)
+
+    stride = 12
+    assert len(dib) == 40 + stride * 2
+    assert dib[:40] == struct.pack("<IiiHHIIiiII", 40, 3, 2, 1, 24, 0, stride * 2, 0, 0, 0, 0)
+    assert dib[40:] == (
+        # 底向上：先图最后一行 (10,20,30)(40,50,60)(70,80,90) 的 BGR + 补齐
+        b"\x1e\x14\x0a" + b"\x3c\x32\x28" + b"\x5a\x50\x46" + b"\x00" * 3
+        # 再图第一行 红/绿/蓝 的 BGR + 补齐
+        + b"\x00\x00\xff" + b"\x00\xff\x00" + b"\xff\x00\x00" + b"\x00" * 3
+    )
+
+
+@pytest.mark.parametrize("size", [(1, 1), (2, 3), (7, 5), (16, 9)])
+def test_dib_matches_reference_per_pixel_conversion(size):
+    """随机像素的多种尺寸下，输出与逐像素参考实现逐字节一致（含奇数宽补齐）。"""
+    import random
+
+    random.seed(sum(size))
+    img = Image.new("RGB", size)
+    img.putdata([
+        (random.randrange(256), random.randrange(256), random.randrange(256))
+        for _ in range(size[0] * size[1])
+    ])
+
+    def reference(image: Image.Image) -> bytes:
+        rgb = image.convert("RGB")
+        width, height = rgb.size
+        row_stride = ((width * 3 + 3) // 4) * 4
+        header = struct.pack(
+            "<IiiHHIIiiII", 40, width, height, 1, 24, 0, row_stride * height, 0, 0, 0, 0
+        )
+        pixels = bytearray(row_stride * height)
+        raw = rgb.tobytes()
+        for row in range(height):
+            src = row * width * 3
+            dst = (height - 1 - row) * row_stride  # 底向上
+            for col in range(width):
+                r, g, b = raw[src + col * 3: src + col * 3 + 3]
+                pixels[dst + col * 3] = b
+                pixels[dst + col * 3 + 1] = g
+                pixels[dst + col * 3 + 2] = r
+        return header + bytes(pixels)
+
+    assert dib_bytes_from_image(img) == reference(img)
+
+
+def test_dib_uses_pil_batch_bgr_conversion(monkeypatch):
+    """性能防线：必须走 PIL 原生批量路径（raw BGR + 行对齐 stride + 底向上），
+    不能退回逐像素 Python 循环——1920×1080 约 622 万次解释器循环会在 js_api
+    线程同步阻塞。"""
+    calls = []
+    original = Image.Image.tobytes
+
+    def spy(self, *args, **kwargs):
+        calls.append(args)
+        return original(self, *args, **kwargs)
+
+    monkeypatch.setattr(Image.Image, "tobytes", spy)
+
+    dib_bytes_from_image(Image.new("RGB", (3, 2)))
+
+    assert calls == [("raw", "BGR", 12, -1)]
+
+
 # ------------------------------------------------------------ capture 编排
 
 def test_capture_requires_windows(monkeypatch):
@@ -156,13 +273,47 @@ def test_capture_uses_scale_and_client_frame(monkeypatch):
         "_window_client_frame",
         lambda hwnd: ((100, 50), (1600, 900)),
     )
-    d = Dummy(form=fake_form(device_dpi=120))  # scale = 1.25
-    res = d.capture_right_panel_region({"x": 8, "y": 4, "width": 32, "height": 16})
+    form = fake_form(device_dpi=120)  # scale = 1.25
+    res = Dummy(form=form).capture_right_panel_region({"x": 8, "y": 4, "width": 32, "height": 16})
     assert res["ok"] is True
     assert res["width"] == 40 and res["height"] == 20
     assert res["data_url"].startswith("data:image/png;base64,")
     # 物理区域 = 客户区原点 + css×1.25
     assert grabbed == [(110, 55, 110 + 40, 55 + 20)]
+    # 几何读取（Handle / DPI / 客户区）只 marshal 一次到 GUI 线程
+    assert form.invocations == 1
+
+
+def test_capture_reads_handle_and_dpi_on_gui_thread(monkeypatch):
+    """form.Handle / _compute_scale / 客户区测量必须在 GUI 线程（form.Invoke）内
+    完成：WinForms 控件跨线程访问会抛 InvalidOperationException，与
+    core/embedded_browser.py 头部既有约定一致。"""
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "win32")
+    monkeypatch.setattr(
+        gui_snip_mixin, "default_panel_grab", lambda bbox: Image.new("RGB", (40, 20))
+    )
+    monkeypatch.setattr(
+        gui_snip_mixin, "_window_client_frame", lambda hwnd: ((100, 50), (1600, 900))
+    )
+    form = fake_form(device_dpi=120, strict=True)  # 只允许在 Invoke 内读窗体
+
+    res = Dummy(form=form).capture_right_panel_region({"x": 8, "y": 4, "width": 32, "height": 16})
+
+    assert res["ok"] is True, res
+    assert form.invocations == 1
+
+
+def test_capture_degrades_when_form_invoke_fails(monkeypatch):
+    """窗口已销毁（Invoke 抛异常）时安全降级为既有 error dict，绝不抛穿桥层。"""
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "win32")
+    monkeypatch.setattr(
+        gui_snip_mixin, "_window_client_frame", lambda hwnd: ((0, 0), (800, 600))
+    )
+    form = fake_form(invoke_error=RuntimeError("control disposed"))
+
+    res = Dummy(form=form).capture_right_panel_region({"x": 0, "y": 0, "width": 10, "height": 10})
+
+    assert res["ok"] is False and res["msg"] == "窗口尚未就绪"
 
 
 def test_capture_reports_failure_when_grab_returns_none(monkeypatch):
@@ -200,6 +351,32 @@ def test_snip_copy_validates_then_writes(monkeypatch):
     assert bad["ok"] is False and "msg" in bad
 
 
+def test_snip_copy_logs_handle_access_failure(monkeypatch, caplog):
+    """静默降级必须留痕：读取窗口句柄失败时保持 hwnd=0 的降级语义，
+    并写 debug 日志（含 exc_info），不再无声吞掉。"""
+
+    class _BadHandle:
+        def ToInt32(self):
+            raise OSError("handle gone")
+
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "win32")
+    seen = []
+    monkeypatch.setattr(
+        gui_snip_mixin,
+        "_set_clipboard_dib",
+        lambda dib, hwnd: seen.append(hwnd) or True,
+    )
+    # 无 Invoke 的窗体：句柄读取必然失败
+    form = SimpleNamespace(Handle=_BadHandle(), DeviceDpi=96)
+
+    with caplog.at_level(logging.DEBUG, logger="gui_snip_mixin"):
+        res = Dummy(form=form).snip_copy_clipboard(make_png_data_url(Image.new("RGB", (2, 2))))
+
+    assert res == {"ok": True}
+    assert seen == [0]  # 降级语义不变：拿不到句柄仍以 0 写入剪贴板
+    assert any(record.exc_info for record in caplog.records), "句柄读取失败必须留 debug 日志"
+
+
 def test_set_clipboard_dib_non_windows_is_false(monkeypatch):
     monkeypatch.setattr(gui_snip_mixin.sys, "platform", "linux")
     assert gui_snip_mixin._set_clipboard_dib(b"\x00" * 8, 0) is False
@@ -213,7 +390,7 @@ def test_snip_save_writes_file(tmp_path, monkeypatch):
         picked.append((dialog, kwargs))
         return str(tmp_path / "out.png")
 
-    d = Dummy()
+    d = Dummy(form=fake_form())
     d._window = SimpleNamespace(create_file_dialog=fake_dialog)
     data_url = make_png_data_url(Image.new("RGB", (5, 5)))
 
@@ -224,8 +401,42 @@ def test_snip_save_writes_file(tmp_path, monkeypatch):
     assert kwargs["save_filename"] == "shot.png"
 
 
+def test_snip_save_dialog_runs_on_gui_thread(tmp_path, monkeypatch):
+    """文件对话框是 WinForms 控件操作：必须在 GUI 线程（form.Invoke）内弹出
+    （js_api 方法在 pywebview 的独立线程执行，见 webview/util.js_bridge_call）。"""
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "win32")
+    form = fake_form(strict=True)
+    target = tmp_path / "out.png"
+
+    def fake_dialog(dialog, **kwargs):
+        assert form.in_gui_thread, "文件对话框必须在 GUI 线程调用"
+        return str(target)
+
+    d = Dummy(form=form)
+    d._window = SimpleNamespace(create_file_dialog=fake_dialog)
+
+    res = d.snip_save_image(make_png_data_url(Image.new("RGB", (5, 5))), "shot.png")
+
+    assert res["ok"] is True and res["path"] == str(target)
+    assert form.invocations == 1
+
+
+def test_snip_save_without_form_degrades_without_opening_dialog(monkeypatch):
+    """窗体不可用（未创建/已销毁）时返回既有 error dict，且不触碰文件对话框。"""
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "win32")
+    called = []
+    d = Dummy(form=None)
+    d._window = SimpleNamespace(create_file_dialog=lambda *a, **k: called.append(1))
+
+    res = d.snip_save_image(make_png_data_url(Image.new("RGB", (5, 5))))
+
+    assert res == {"ok": False, "msg": "窗口尚未就绪"}
+    assert called == []
+
+
 def test_snip_save_cancelled_and_invalid(monkeypatch, tmp_path):
-    d = Dummy()
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "win32")
+    d = Dummy(form=fake_form())
     d._window = SimpleNamespace(create_file_dialog=lambda *a, **k: None)
     data_url = make_png_data_url(Image.new("RGB", (5, 5)))
 
@@ -237,9 +448,71 @@ def test_snip_save_cancelled_and_invalid(monkeypatch, tmp_path):
 
 
 def test_snip_save_appends_png_suffix(tmp_path, monkeypatch):
-    d = Dummy()
+    monkeypatch.setattr(gui_snip_mixin.sys, "platform", "win32")
+    d = Dummy(form=fake_form())
     d._window = SimpleNamespace(
         create_file_dialog=lambda *a, **k: str(tmp_path / "noext")
     )
     res = d.snip_save_image(make_png_data_url(Image.new("RGB", (5, 5))))
     assert res["ok"] is True and res["path"].endswith("noext.png")
+
+
+# ------------------------------------------------------- ctypes 句柄签名声明
+
+class _RecordingWin32Func:
+    """假 user32 函数：记录 argtypes/restype 声明，并在调用时写入输出结构体。"""
+
+    def __init__(self, kind):
+        self.kind = kind
+        self.argtypes = None
+        self.restype = None
+        self.calls = []
+
+    def __call__(self, hwnd, ptr):
+        self.calls.append(hwnd)
+        out = ptr._obj
+        if self.kind == "origin":
+            out.x, out.y = 100, 50
+        else:
+            out.right, out.bottom = 1600, 900
+        return 1
+
+
+def test_window_client_frame_declares_ctypes_signatures(monkeypatch):
+    """64 位句柄截断教训：HWND 参数与返回值必须显式声明 argtypes/restype，
+    否则 windll 默认按 32 位 int 处理，句柄 > 2**31 时报 OverflowError /
+    截断成错误句柄。"""
+    client_to_screen = _RecordingWin32Func("origin")
+    get_client_rect = _RecordingWin32Func("rect")
+    user32 = SimpleNamespace(
+        ClientToScreen=client_to_screen, GetClientRect=get_client_rect
+    )
+    monkeypatch.setattr(
+        gui_snip_mixin.ctypes, "windll", SimpleNamespace(user32=user32), raising=False
+    )
+
+    big_hwnd = 0x1_2345_6789  # > 2**31
+    origin, size = gui_snip_mixin._window_client_frame(big_hwnd)
+
+    assert (origin, size) == ((100, 50), (1600, 900))
+    assert client_to_screen.calls == [big_hwnd]
+    for func in (client_to_screen, get_client_rect):
+        assert func.argtypes[0] is gui_snip_mixin.ctypes.c_void_p, "HWND 声明为 c_void_p"
+        assert func.restype is gui_snip_mixin.ctypes.c_bool
+
+
+def test_window_client_frame_raises_on_win32_failure(monkeypatch):
+    """Win32 调用失败仍按既有语义抛 OSError（调用方降级语义不变）。"""
+    monkeypatch.setattr(
+        gui_snip_mixin.ctypes,
+        "windll",
+        SimpleNamespace(
+            user32=SimpleNamespace(
+                ClientToScreen=lambda *a: 0, GetClientRect=lambda *a: 1
+            )
+        ),
+        raising=False,
+    )
+
+    with pytest.raises(OSError):
+        gui_snip_mixin._window_client_frame(12345)

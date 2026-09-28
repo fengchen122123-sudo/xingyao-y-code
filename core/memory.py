@@ -153,7 +153,7 @@ def _tool_call_is_replayable(tc) -> bool:
 def _sanitize_tool_call_pairing(history):
     """修复 tool_call 配对，避免坏历史导致 API 报错后整个会话无法继续使用。
 
-    三种损坏形态：
+    四种损坏形态：
     1. 孤儿 tool 消息：tool_call_id 未在前面任何 assistant.tool_calls 中声明，
        API 会报 "tool_call_id is not found" → 直接丢弃该 tool 消息。
     2. assistant 声明了 tool_calls 但历史中缺少对应 tool 结果，
@@ -162,6 +162,10 @@ def _sanitize_tool_call_pairing(history):
     3. tool call 本身不可回放（函数名为空 / arguments 非法 JSON，
        典型成因：上游网关流式吐出残缺调用被原样落库）→ 从回放历史
        中剔除该调用，其 tool 结果按形态 1 连带丢弃。
+    4. tool 结果与应答它的 assistant 之间被注入了别的消息（典型成因：
+       编排提醒等 notice 消息在旧版落库顺序里插到了工具结果之前），严格
+       网关同样报 "must be followed by tool messages" → 按 tool_call_id 把
+       结果搬回对应 assistant 之后；正文一字不动，只调整位置。
     """
     announced = set()
     for msg in history:
@@ -208,6 +212,31 @@ def _sanitize_tool_call_pairing(history):
                 msg.pop("tool_calls", None)
                 if not msg.get("content"):
                     msg["content"] = "[工具调用记录缺失]"
+
+    # 形态 4：把被注入消息隔开的 tool 结果搬回所属 assistant 之后，
+    # 让回放顺序满足 provider 的「tool_calls 必须被 tool 消息应答」约束。
+    # 已合法相邻的调用组顺序保持不变（幂等，不扰动 provider 侧前缀缓存）。
+    tool_message_by_id = {}
+    for msg in sanitized:
+        if msg.get("role") != "tool":
+            continue
+        tcid = msg.get("tool_call_id")
+        if tcid and tcid not in tool_message_by_id:
+            tool_message_by_id[tcid] = msg
+
+    if tool_message_by_id:
+        reordered = []
+        for msg in sanitized:
+            if msg.get("role") == "tool":
+                # 结果统一由所属 assistant 就地安置，此处不再原样输出
+                continue
+            reordered.append(msg)
+            for tool_call in msg.get("tool_calls") or []:
+                tcid = tool_call.get("id") if isinstance(tool_call, dict) else None
+                tool_message = tool_message_by_id.pop(tcid, None) if tcid else None
+                if tool_message is not None:
+                    reordered.append(tool_message)
+        sanitized = reordered
 
     return sanitized
 

@@ -63,17 +63,48 @@ def neutralize_reserved_markers(text):
 #
 # core/llm.py 会以 role="user" 持久化一批"系统替任务/护栏生成的提示词"：
 # 后台子代理回报（task-notification）、慢步催促、总结催促、验证催促、
-# 计划续推催促，以及 hook 追加上下文（core/hooks/lifecycle.py 的
+# 计划续推催促、编排提醒，以及 hook 追加上下文（core/hooks/lifecycle.py 的
 # contexts_to_messages 头部）。它们不是用户发送的内容，展示层必须过滤
 # （否则冒充用户发言、污染红点导航）；模型上下文（get_history）不受影响。
 #
-# 同步铁律：前缀与各生成点文案逐字一致，改文案必须同步本表（对账测试在
-# tests/test_injection_markers.py::test_system_injected_prefixes_frozen）：
+# 编排提醒文案 ORCHESTRATION_NUDGE_TEXT 的选择：刻意把"文案常量"定义在本模块，
+# 由 core/llm.py 导入复用，过滤前缀 ORCHESTRATION_NUDGE_PREFIX 直接由该文案
+# 派生——二者同源，从结构上杜绝"生成点文案"与"过滤前缀"漂移（比登记字面
+# 前缀更利于后续防漂移）。
+#
+# 同步铁律：前缀与各生成点文案逐字一致（对账测试见
+# tests/test_injection_markers.py::test_all_generation_points_are_registered，
+# 直接 import 各生成点常量断言；test_system_injected_prefixes_frozen 另做字面冻结）：
 #   - llm.py 后台通知注入（文案生成于 core/tools.py:_notification）
-#   - llm.py slow_step_nudge
-#   - llm.py summary_request（"工具已经执行完毕…" / "你刚才只输出了思考过程…"）
+#   - llm.py SLOW_STEP_NUDGE_TEXT
+#   - llm.py SUMMARY_NUDGE_TOOL_DONE_TEXT / SUMMARY_NUDGE_THINKING_ONLY_TEXT
 #   - llm_execution.py VERIFY_CLAIM_NUDGE_TEXT
-#   - llm.py 计划续推 nudge_request
+#   - llm.py PLAN_CONTINUE_NUDGE_TEXT
+#   - 本模块 ORCHESTRATION_NUDGE_TEXT（由 llm.py 导入，前缀与文案同源）
+#   - gui_bridge.py _BG_SUMMARY_PROMPT（后台子代理汇总回合注入指令）
+#   - gui_bridge.py _BG_COMMAND_SUMMARY_PROMPT（后台命令总结回合注入指令）
+# ---------------------------------------------------------------------------
+
+#: 编排提醒文案（多步未建计划的软提醒）。定义于此并由 core/llm.py 导入，
+#: 保证"生成点文案"与"展示层过滤前缀"同源，从结构上杜绝二者漂移。
+ORCHESTRATION_NUDGE_TEXT = (
+    "本回合已连续执行多步操作，仍未建立任务计划。"
+    "若任务拆解后超过 3 条子任务，请立即用 plan_write 建立计划并逐条执行；"
+    "不超过 3 条可忽略本提醒，直接完成。"
+)
+
+#: 编排提醒在展示层过滤用的稳定前缀（取文案首句，与 ORCHESTRATION_NUDGE_TEXT 同源）。
+ORCHESTRATION_NUDGE_PREFIX = "本回合已连续执行多步操作，仍未建立任务计划。"
+
+#: 后台子代理全部终态后自动发起汇总回合的注入指令前缀。生成点两处：GUI 的
+#: gui_bridge._BG_SUMMARY_PROMPT，以及 CLI main.py 的
+#: __ycode_internal__:summarize_background_tasks 文案变体（共同前缀一致）。
+BG_SUMMARY_INJECTION_PREFIX = "请汇总所有后台子代理任务的结果并告诉我"
+
+#: 后台命令任务完成后自动发起总结回合的注入指令前缀。生成点：
+#: gui_bridge._BG_COMMAND_SUMMARY_PROMPT。
+BG_COMMAND_SUMMARY_INJECTION_PREFIX = "有一个后台命令任务执行完毕"
+
 SYSTEM_INJECTED_USER_PREFIXES: tuple[str, ...] = (
     "<task-notification>",
     "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何",
@@ -81,6 +112,12 @@ SYSTEM_INJECTED_USER_PREFIXES: tuple[str, ...] = (
     "你刚才只输出了思考过程，既没有调用工具执行任何操作",
     "你声称已完成验证，但本回合没有执行任何命令。",
     "计划尚未执行完毕，仍有可执行的计划项",
+    ORCHESTRATION_NUDGE_PREFIX,
+    # 内部回合自行发起的注入指令：与用户输入同形（role=user，位置也按"回合发起
+    # 消息"记为 user），无法靠 position_kind 区分，只能靠文案识别。这两类曾被
+    # 渲染成用户气泡并污染红点导航（用户报告）。
+    BG_SUMMARY_INJECTION_PREFIX,
+    BG_COMMAND_SUMMARY_INJECTION_PREFIX,
 )
 
 # hook 追加上下文头部：【{事件名} hook 追加上下文】（事件名为无空白 ASCII 标识）

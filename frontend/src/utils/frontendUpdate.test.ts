@@ -5,7 +5,9 @@ import {
   requestFrontendReload,
   __resetFrontendUpdateForTest,
   __setFrontendUpdateDepsForTest,
+  __getFrontendUpdateSchedulerForTest,
   FRONTEND_AUTO_RELOAD_TS_KEY,
+  FRONTEND_AUTO_RELOAD_COUNT_KEY,
 } from './frontendUpdate';
 
 // 界面资源版本失配自愈：验证「dist 更新事件 / vite:preloadError → 界面空闲时
@@ -182,5 +184,50 @@ describe('frontendUpdate 自愈调度', () => {
 
     scheduler.reset();
     expect(scheduler.isPending()).toBe(false);
+  });
+
+  it('连续自愈刷新达到上限后停止自动刷新并告警（dist 持续损坏不再无限重载）', () => {
+    const reload = vi.fn();
+    const onExhausted = vi.fn();
+    __setFrontendUpdateDepsForTest({ reload, onExhausted, maxReloadsPerSession: 3 });
+    registerFrontendUpdateHandlers({ canReload: () => true });
+
+    // 前三次（每次间隔满 10 秒）各自成功刷新，累计次数达到上限
+    for (let i = 0; i < 3; i++) {
+      vi.setSystemTime(T0 + 6000 + i * 11000);
+      requestFrontendReload('dist-updated', `fp-${i}`);
+    }
+    expect(reload).toHaveBeenCalledTimes(3);
+    expect(sessionStorage.getItem(FRONTEND_AUTO_RELOAD_COUNT_KEY)).toBe('3');
+
+    // 第四次：触顶后不再刷新，改为告警，且不进入 pending（不再注册复检定时器）
+    vi.setSystemTime(T0 + 60000);
+    requestFrontendReload('dist-updated', 'fp-3');
+    expect(reload).toHaveBeenCalledTimes(3);
+    expect(onExhausted).toHaveBeenCalledTimes(1);
+    expect(__getFrontendUpdateSchedulerForTest().isPending()).toBe(false);
+
+    // 复检节奏推进也不再触发刷新（定时器已停）
+    vi.advanceTimersByTime(5000);
+    expect(reload).toHaveBeenCalledTimes(3);
+  });
+
+  it('fingerprint 未变化不重复刷新，指纹更替后才刷新', () => {
+    const reload = vi.fn();
+    __setFrontendUpdateDepsForTest({ reload });
+    registerFrontendUpdateHandlers({ canReload: () => true });
+    vi.setSystemTime(T0 + 6000);
+    requestFrontendReload('dist-updated', 'mtime:100:2048');
+    expect(reload).toHaveBeenCalledTimes(1);
+
+    // 同一指纹：即便早已超过 10 秒防风暴窗口，也不重复刷新
+    vi.setSystemTime(T0 + 40000);
+    requestFrontendReload('dist-updated', 'mtime:100:2048');
+    expect(reload).toHaveBeenCalledTimes(1);
+
+    // 指纹更替（dist 真正更新）：正常刷新
+    vi.setSystemTime(T0 + 50000);
+    requestFrontendReload('dist-updated', 'mtime:200:4096');
+    expect(reload).toHaveBeenCalledTimes(2);
   });
 });
