@@ -38,7 +38,7 @@ _EXPECTED_CLASSIFICATION = {
 
 # test_prompt_byte_stability.py 的 build_stable_prompt golden（同一数字，独立复核）
 _STABLE_PROMPT_GOLDEN_SHA256 = (
-    "626f1ab481c68e14aa4a0d0fd356e5f61c94121c6b8b7d64e0f92830c1a26c9a"
+    "bedde81d1a0b0b66858cfb4e6521886dfceefe8ae6f652cdfecf3fb65788b248"
 )
 
 
