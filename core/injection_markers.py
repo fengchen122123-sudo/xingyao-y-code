@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+import re
+
 #: 零宽空格：中和时插在标记首字符之后，肉眼不可见、不改变语义。
 ZERO_WIDTH = "\u200b"
 
@@ -54,3 +56,50 @@ def neutralize_reserved_markers(text):
         if marker in text:
             text = text.replace(marker, marker[0] + ZERO_WIDTH + marker[1:])
     return text
+
+
+# ---------------------------------------------------------------------------
+# 系统注入 user 消息识别（展示层过滤：红点导航 / GUI 气泡 / CLI 历史回放）
+#
+# core/llm.py 会以 role="user" 持久化一批"系统替任务/护栏生成的提示词"：
+# 后台子代理回报（task-notification）、慢步催促、总结催促、验证催促、
+# 计划续推催促，以及 hook 追加上下文（core/hooks/lifecycle.py 的
+# contexts_to_messages 头部）。它们不是用户发送的内容，展示层必须过滤
+# （否则冒充用户发言、污染红点导航）；模型上下文（get_history）不受影响。
+#
+# 同步铁律：前缀与各生成点文案逐字一致，改文案必须同步本表（对账测试在
+# tests/test_injection_markers.py::test_system_injected_prefixes_frozen）：
+#   - llm.py 后台通知注入（文案生成于 core/tools.py:_notification）
+#   - llm.py slow_step_nudge
+#   - llm.py summary_request（"工具已经执行完毕…" / "你刚才只输出了思考过程…"）
+#   - llm_execution.py VERIFY_CLAIM_NUDGE_TEXT
+#   - llm.py 计划续推 nudge_request
+SYSTEM_INJECTED_USER_PREFIXES: tuple[str, ...] = (
+    "<task-notification>",
+    "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何",
+    "工具已经执行完毕。现在必须只输出最终中文检查结论",
+    "你刚才只输出了思考过程，既没有调用工具执行任何操作",
+    "你声称已完成验证，但本回合没有执行任何命令。",
+    "计划尚未执行完毕，仍有可执行的计划项",
+)
+
+# hook 追加上下文头部：【{事件名} hook 追加上下文】（事件名为无空白 ASCII 标识）
+_HOOK_CONTEXT_HEADER_RE = re.compile(r"^【\S+ hook 追加上下文】")
+
+
+def is_system_injected_user_text(text) -> bool:
+    """判定 user 消息文本是否为系统注入的提示词（展示层过滤用）。
+
+    前缀精确匹配（容忍行首空白）；hook 头部按事件名正则。真实用户消息
+    不会以这些系统文案开头；本判定只用于红点导航 / 气泡 / CLI 历史回放
+    等展示路径，模型上下文（get_history）不调用它。
+    """
+    if not isinstance(text, str) or not text:
+        return False
+    stripped = text.lstrip()
+    if not stripped:
+        return False
+    for prefix in SYSTEM_INJECTED_USER_PREFIXES:
+        if stripped.startswith(prefix):
+            return True
+    return bool(_HOOK_CONTEXT_HEADER_RE.match(stripped))

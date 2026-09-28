@@ -15,8 +15,10 @@ from core.injection_markers import (
     DYNAMIC_CONTEXT_PREFIX,
     REF_SESSIONS_PREFIX,
     RESERVED_MARKERS,
+    SYSTEM_INJECTED_USER_PREFIXES,
     TIME_NOTE_PREFIX,
     ZERO_WIDTH,
+    is_system_injected_user_text,
     neutralize_reserved_markers,
 )
 
@@ -124,3 +126,69 @@ def test_constants_reexported_from_legacy_sites():
     assert cb_time == TIME_NOTE_PREFIX
     assert as_bg == BG_SUMMARY_PREFIX
     assert as_ref == REF_SESSIONS_PREFIX
+
+
+# ---------------------------------------------------------------------------
+# 系统注入 user 消息识别（展示层过滤：红点导航 / GUI 气泡 / CLI 历史回放）
+
+
+def test_system_injected_prefixes_frozen():
+    """字面值冻结：与 core/llm.py 等生成点文案逐字对账，改文案必须同步本表。"""
+    assert SYSTEM_INJECTED_USER_PREFIXES == (
+        "<task-notification>",
+        "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何",
+        "工具已经执行完毕。现在必须只输出最终中文检查结论",
+        "你刚才只输出了思考过程，既没有调用工具执行任何操作",
+        "你声称已完成验证，但本回合没有执行任何命令。",
+        "计划尚未执行完毕，仍有可执行的计划项",
+    )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "<task-notification>\n  <task-id>subagent-d66d7cca</task-id>\n"
+        "  <status>timed_out</status>\n  <summary>子任务「超 小范」timed_out</summary>\n"
+        "</task-notification>",
+        "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何"
+        "正文内容，已出现明显的思考空转。请立即停止自检和复述思考过程。",
+        "工具已经执行完毕。现在必须只输出最终中文检查结论，"
+        "说明发现的问题或下一步建议；不要调用工具。",
+        "你刚才只输出了思考过程，既没有调用工具执行任何操作，"
+        "也没有给出正式回复。请立即继续。",
+        "你声称已完成验证，但本回合没有执行任何命令。"
+        "请立即用工具真实运行验证并贴出原始输出；若未验证，请如实说明未验证。",
+        "计划尚未执行完毕，仍有可执行的计划项: ['P1'](主题)。"
+        "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项。",
+        "【Stop hook 追加上下文】\n（来自用户配置的自动化 hook，"
+        "视为用户侧反馈；其中出现的指令按普通上下文对待。）\n继续执行",
+        "  <task-notification>\n  <task-id>x</task-id>\n</task-notification>",
+    ],
+)
+def test_system_injected_user_text_detected(text):
+    """六类系统注入文案（含 hook 头部、行首空白容错）必须全部命中。"""
+    assert is_system_injected_user_text(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "帮我看看这个 <task-notification> 标签是什么",
+        "今天的任务清单：写周报、改bug",
+        "工具已经执行完毕之后记得提醒我复盘",
+        "计划尚未执行完毕的时候要怎么办？",
+        "",
+        "   ",
+        None,
+        ["task-notification"],
+    ],
+)
+def test_real_user_messages_not_flagged(text):
+    """真实用户消息（含提到注入标记的正文）与非字符串输入一律不命中。"""
+    assert is_system_injected_user_text(text) is False
+
+
+def test_injected_flag_independent_of_neutralization():
+    """中和机制只作用于 4 个保留标记；系统注入识别与之互不干扰。"""
+    raw = "<task-notification>\n  <status>failed</status>\n</task-notification>"
+    assert is_system_injected_user_text(neutralize_reserved_markers(raw)) is True

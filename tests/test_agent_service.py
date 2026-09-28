@@ -1210,6 +1210,37 @@ def test_build_referenced_sessions_block_empty_refs():
     assert build_referenced_sessions_block(_make_manager(), []) == ""
 
 
+def test_build_referenced_sessions_block_resolves_brace_polluted_name():
+    """会话名残留 @{...} 标记时，@ 引用仍应命中（前端插入引用会剥掉名字里的花括号）。"""
+    from core.agent_service import build_referenced_sessions_block
+    mgr = _make_manager()
+    # 真实数据形态：自动标题把 @{...} 标记（或截断残渣）截进了会话名
+    mgr.ensure_session("@{缓存改造} 阅读一下")
+    mgr.add_message("@{缓存改造} 阅读一下", "user", "缓存改造成什么样了")
+    mgr.ensure_session("@{我这个自然语言交互如")
+    mgr.add_message("@{我这个自然语言交互如", "user", "残缺标记也要能引用")
+    # 前端插入的引用名 = 真实名剥掉花括号后的形态
+    block = build_referenced_sessions_block(
+        mgr, ["@缓存改造 阅读一下", "@我这个自然语言交互如"], current_session="当前对话"
+    )
+    assert "不存在" not in block
+    assert "缓存改造成什么样了" in block
+    assert "残缺标记也要能引用" in block
+
+
+def test_build_referenced_sessions_block_normalized_self_reference():
+    """名字被花括号污染时，引用当前会话自己仍要按自引用拦住。"""
+    from core.agent_service import build_referenced_sessions_block
+    mgr = _make_manager()
+    mgr.ensure_session("@{缓存改造} 阅读一下")
+    mgr.add_message("@{缓存改造} 阅读一下", "user", "正文")
+    block = build_referenced_sessions_block(
+        mgr, ["@缓存改造 阅读一下"], current_session="@{缓存改造} 阅读一下"
+    )
+    assert "是当前会话" in block
+    assert "不存在" not in block
+
+
 def test_get_session_memory_summary(tmp_path):
     from core.memory import MemoryManager
     mgr = MemoryManager(str(tmp_path / "t.db"))
