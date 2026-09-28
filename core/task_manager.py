@@ -70,6 +70,10 @@ _LOADED = False
 
 # get_task_output 只从日志尾部读取的字节数上限，避免 GB 级日志撑爆内存
 _TAIL_READ_BYTES = 256 * 1024
+# 日志"仅有启动标记、尚无实际命令输出"的判定阈值：turn 标记行约 30 字节，
+# 低于该值说明命令还没有任何输出落盘（list_active_tasks 据此给 GUI 面板
+# 提供 no_output_yet 字段，运行中提示由前端渲染）
+_STARTUP_MARKER_MAX_BYTES = 64
 # 最多保留的历史任务日志数量（超出后按修改时间滚动清理）
 _MAX_TASK_LOGS = 50
 
@@ -294,6 +298,7 @@ def _load_tasks():
                     or platform_console_encoding()
                 ),
                 "turn_id": info.get("turn_id") or "",
+                "session_id": str(info.get("session_id") or ""),
                 "status": TASK_STATUS_RUNNING,
                 "exit_code": None,
                 "revision": 0,
@@ -325,6 +330,9 @@ def _save_tasks():
                         ),
                         # T4 回合关联：父回合随任务记录持久化（旧记录无此键，读取侧 .get 兼容）
                         "turn_id": info.get("turn_id") or "",
+                        # 会话归属随任务记录持久化：GUI 重启接管后任务仍归属发起会话，
+                        # 执行条据此做会话过滤（旧记录无此键，读取侧 .get 兼容）
+                        "session_id": str(info.get("session_id") or ""),
                     }
             # 跨进程合并读：GUI/CLI 双进程并发写同一份 tasks.json 时，
             # 把磁盘上其他进程新启动的任务记录合并进来，避免内存全量覆盖写
@@ -718,6 +726,7 @@ def _evict_terminal_locked():
 def list_active_tasks():
     """返回当前所有仍在运行的任务列表（返回值结构与历史一致，只含 running 任务）。
 
+    每行附带 session_id（发起会话名）：GUI 执行条据此只显示当前会话的任务。
     死亡任务不再直接删除，而是标记终态保留在 ACTIVE_TASKS 供快照/wait 查询；
     终态记录超过 _TERMINAL_KEEP_CAP 时淘汰最旧；磁盘库只保存 running 任务。
     """
@@ -742,12 +751,26 @@ def list_active_tasks():
             proc = info.get("process")
             pid = info.get("pid")
             running_time = int(time.time() - info["start_time"])
+            # 输出心跳：日志字节数 + 距最后一次写入的秒数。GUI 任务面板据此在
+            # 运行期区分"仍在运行只是暂无输出"与"面板失联"（缓冲管道命令的
+            # 运行期日志天然只有启动标记一行，size 长期停在几十字节）
+            log_file_path = info.get("log_file_path")
+            try:
+                output_size = os.path.getsize(log_file_path) if log_file_path else 0
+                last_output_age = max(0, int(time.time() - os.path.getmtime(log_file_path))) \
+                    if log_file_path and output_size > 0 else None
+            except OSError:
+                output_size, last_output_age = 0, None
             results.append({
                 "task_id": tid,
                 "command": info["command"],
                 "pid": pid or (proc.pid if proc else -1),
                 "duration": f"{running_time}秒",
                 "turn_id": info.get("turn_id") or "",
+                "session_id": info.get("session_id") or "",
+                "output_size": output_size,
+                "last_output_age": last_output_age,
+                "no_output_yet": output_size <= _STARTUP_MARKER_MAX_BYTES,
             })
 
         if _evict_terminal_locked():

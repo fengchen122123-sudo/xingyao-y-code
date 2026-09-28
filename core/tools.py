@@ -3337,34 +3337,48 @@ class SubagentManager:
                 task.started_at = time.time()
                 self._record_stage_locked(task, "running")
 
-            # 子代理线程标记父会话，使工具级共享缓存可被复用
-            _tool_cache.set_current_session(task.parent_session)
-            # 子代理线程继承父回合的工作目录上下文（多会话并行隔离）
-            from core.workspace_context import set_workdir
-            if task.workdir:
-                set_workdir(task.workdir)
-            # 计划/授权/沙盒放行等“每会话”状态同样路由到父会话：
-            # 子代理执行计划项、触发权限询问时操作的是父会话的桶，
-            # 不会串到其他并行会话
-            _subagent_app_context.set_thread_session(task.parent_session)
-            from core.plan import set_current_plan_session as _bind_plan_route
+            # 启动段（会话/工作目录/undo 检查点绑定）异常兜底：这里抛错会让
+            # 线程带着 running 状态裸崩（永无终态回调与 done_event），必须
+            # 落成终态让等待方可见（取消中 → cancelled，其余 → failed）
+            try:
+                # 子代理线程标记父会话，使工具级共享缓存可被复用
+                _tool_cache.set_current_session(task.parent_session)
+                # 子代理线程继承父回合的工作目录上下文（多会话并行隔离）
+                from core.workspace_context import set_workdir
+                if task.workdir:
+                    set_workdir(task.workdir)
+                # 计划/授权/沙盒放行等“每会话”状态同样路由到父会话：
+                # 子代理执行计划项、触发权限询问时操作的是父会话的桶，
+                # 不会串到其他并行会话
+                _subagent_app_context.set_thread_session(task.parent_session)
+                from core.plan import set_current_plan_session as _bind_plan_route
 
-            _bind_plan_route(task.parent_session)
-            # 按回合撤销归属（规格 9.2）：
-            # - 前台同步子代理共享父回合检查点（只借记录权）；
-            # - 可能迟于父回合结束的后台任务从启动时拥有独立检查点，
-            #   并以 parent_checkpoint_id 关联来源回合。
-            from core.turn_undo import recorder as _tu_recorder
-            from core.turn_undo import service as _tu_service
+                _bind_plan_route(task.parent_session)
+                # 按回合撤销归属（规格 9.2）：
+                # - 前台同步子代理共享父回合检查点（只借记录权）；
+                # - 可能迟于父回合结束的后台任务从启动时拥有独立检查点，
+                #   并以 parent_checkpoint_id 关联来源回合。
+                from core.turn_undo import recorder as _tu_recorder
+                from core.turn_undo import service as _tu_service
 
-            _own_undo_turn = None
-            if task.run_in_background:
-                _own_undo_turn = _tu_service.begin_background_task_turn(
-                    parent_turn_id=task.parent_turn_id,
-                    description=f"后台子代理 {task.task_id}: {task.description[:60]}",
-                )
-            else:
-                _tu_recorder.bind_thread_for_turn(task.parent_turn_id, owner=False)
+                _own_undo_turn = None
+                if task.run_in_background:
+                    _own_undo_turn = _tu_service.begin_background_task_turn(
+                        parent_turn_id=task.parent_turn_id,
+                        description=f"后台子代理 {task.task_id}: {task.description[:60]}",
+                    )
+                else:
+                    _tu_recorder.bind_thread_for_turn(task.parent_turn_id, owner=False)
+            except BaseException as error:
+                _logger.warning("子代理启动段失败 %s: %s", task.task_id, error)
+                _tool_cache.set_current_session(None)
+                if task.cancel_event.is_set():
+                    self._terminate(task.task_id, "cancelled", "task cancelled")
+                else:
+                    self._terminate(
+                        task.task_id, "failed", f"子代理启动失败: {error}"
+                    )
+                return
             try:
                 result = _strip_advisor_tags(str(self._runner(task) or "").strip())
             except BaseException as error:

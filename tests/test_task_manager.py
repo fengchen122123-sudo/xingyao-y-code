@@ -1,4 +1,5 @@
 import io
+import time
 from types import SimpleNamespace
 
 import core.task_manager as task_manager
@@ -437,3 +438,93 @@ def test_kill_detailed_reports_not_found_for_unknown_task(tmp_path, monkeypatch)
         task_manager.kill_background_task_detailed("missing")
         == task_manager.KILL_RESULT_NOT_FOUND
     )
+
+
+def test_list_active_tasks_reports_output_heartbeat(tmp_path, monkeypatch):
+    """list_active_tasks 携带输出心跳：字节数/距最后输出秒数/尚无实际输出标记。
+
+    GUI 任务面板据此在运行期区分"仍在运行只是暂无输出"（缓冲管道命令的
+    运行期日志天然只有启动标记一行）与"任务已失联"。
+    """
+    task_id = "heartbeat"
+    log_path = tmp_path / f"task_{task_id}.log"
+    log_path.write_bytes("[turn:004b1e8b] 后台任务启动\n".encode("utf-8"))
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(
+        task_manager,
+        "ACTIVE_TASKS",
+        {
+            task_id: {
+                "id": task_id,
+                "command": "demo",
+                "process": None,
+                "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
+                "create_time": 1000.0,
+                "log_file_path": str(log_path),
+                "log_handle": None,
+                "start_time": time.time(),
+                "output_encoding": "utf-8",
+                "turn_id": "004b1e8b-rest-of-uuid",
+                "session_id": "sess",
+            }
+        },
+    )
+    monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: 1000.0)
+    monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: True)
+
+    rows = task_manager.list_active_tasks()
+
+    assert len(rows) == 1
+    row = rows[0]
+    # 日志只有启动标记（约 30 字节）：no_output_yet=True 且心跳字段齐备
+    assert row["no_output_yet"] is True
+    assert 0 < row["output_size"] <= task_manager._STARTUP_MARKER_MAX_BYTES
+    assert isinstance(row["last_output_age"], int)
+    assert row["last_output_age"] >= 0
+    assert row["turn_id"] == "004b1e8b-rest-of-uuid"
+    assert row["session_id"] == "sess"
+
+    # 日志出现实际输出后 no_output_yet 翻转，字节数跟随增长
+    log_path.write_bytes("[turn:004b1e8b] 后台任务启动\n".encode("utf-8") + b"x" * 200)
+    row = task_manager.list_active_tasks()[0]
+    assert row["no_output_yet"] is False
+    assert row["output_size"] > 200
+
+
+def test_list_active_tasks_missing_log_reports_zero_output(tmp_path, monkeypatch):
+    """日志文件缺失（被清理/尚未创建）时心跳字段安全回退，不抛异常。"""
+    task_id = "no-log"
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(
+        task_manager,
+        "ACTIVE_TASKS",
+        {
+            task_id: {
+                "id": task_id,
+                "command": "demo",
+                "process": None,
+                "pid": 4321,
+                "status": task_manager.TASK_STATUS_RUNNING,
+                "revision": 0,
+                "exit_code": None,
+                "create_time": 1000.0,
+                "log_file_path": str(tmp_path / "task_no_log.log"),
+                "log_handle": None,
+                "start_time": time.time(),
+                "output_encoding": "utf-8",
+            }
+        },
+    )
+    monkeypatch.setattr(task_manager, "_process_create_time", lambda pid: 1000.0)
+    monkeypatch.setattr(task_manager, "is_pid_running", lambda pid: True)
+
+    row = task_manager.list_active_tasks()[0]
+
+    assert row["output_size"] == 0
+    assert row["last_output_age"] is None
+    assert row["no_output_yet"] is True

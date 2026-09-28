@@ -533,7 +533,13 @@ def build_default_registry() -> ToolRegistry:
                 "正确示例：cd path; javac Foo.java; java Foo\n"
                 "3) 条件串联用 if ($LASTEXITCODE -eq 0) { next }，PowerShell 7+ 才支持 && 运算符\n"
                 "单次执行输出总量上限 1MB（stdout+stderr）：超限会终止进程树并返回截断结果；"
-                "可能长时间刷屏的命令请自行收敛输出（重定向到文件、加 head 或限制范围）。"
+                "可能长时间刷屏的命令请自行收敛输出（重定向到文件、加 head 或限制范围）。\n"
+                "后台模式（run_in_background=true）禁止在命令末尾接 "
+                "| Select-Object -Last、| tail、| head 等缓冲/截断管道："
+                "输出会实时写入任务日志，用户在界面「后台任务」面板实时查看执行过程，"
+                "完成后系统自动取日志尾部汇总，无需自行截尾；"
+                "这类管道（尤其 Select-Object -Last）必须收齐全部输入才开始输出，"
+                "接上去整个运行期日志都只有启动标记一行，用户全程看不到执行进度。"
             ),
             input_schema=_schema({
                 "command": {"type": "string"},
