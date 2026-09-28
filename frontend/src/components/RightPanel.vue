@@ -249,6 +249,10 @@ function exitSnipMode() {
   snipSnapshot.value = '';
 }
 
+// 切会话时退出画笔截图：store 侧经 _bindSessionRuntime 复位 rightPanelSnipActive，
+// 这里一并清掉本地冻结帧快照——否则会话切换后本地仍残留上一会话的帧
+watch(() => store.currentSessionName, () => { exitSnipMode(); });
+
 // 桌面端宽度由拖拽手柄写入 store，此处内联生效；折叠负 margin 跟随实际
 // 宽度。移动端（<=768px）整体隐藏右面板，不输出内联样式。
 const isMobile = useIsMobile();
@@ -308,8 +312,14 @@ function autoOpenComputerTabOnce() {
   if (!store.computerControlBarVisible) return;
   store.computerLastAutoOpenedRunId = runId;
   // 只登记页签不摊开面板（设计 16.2 旧语义）：面板已展开的直接落在操控页签，
-  // 收起中的等用户手动展开时再看到
-  store.openRightPanelTab('computer', { expand: false });
+  // 收起中的等用户手动展开时再看到。
+  // 按 run 归属会话写入：run 在 A 会话启动、用户正看 B 会话时写进 A 的 runtime，
+  // 不把 B 的页签集写脏（归属会话未知时回落当前会话）
+  store.openRightPanelTabForSession(
+    store.computerRun.owner_session_id || store.currentSessionName,
+    'computer',
+    { expand: false },
+  );
 }
 watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
 
@@ -317,7 +327,7 @@ watch(() => store.computerRun.run_id, autoOpenComputerTabOnce);
 const detailOutput = ref('');
 const bgtLogRef = ref<HTMLElement | null>(null);
 const detailTask = computed(
-  () => store.backgroundTasks.find(t => t.task_id === store.bgTaskDetailId)
+  () => store.currentSessionBackgroundTasks.find(t => t.task_id === store.bgTaskDetailId)
 );
 const detailCommand = computed(
   () => detailTask.value?.command || store.bgTaskDetailId

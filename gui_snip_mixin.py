@@ -12,8 +12,11 @@ EmbeddedBrowserController._compute_scale（GetDpiForWindow → DeviceDpi → 1.0
 避免两处 DPI 逻辑漂移。
 
 所有桥方法返回 dict 且吞异常（{'ok': False, 'msg': ...}），绝不抛穿 js_api；
-剪贴板 GlobalAlloc/SetClipboardData 显式设 restype=c_void_p（64 位句柄
-截断教训，同 core/computer/win32_adapter.py 注释）。
+剪贴板 GlobalAlloc/SetClipboardData、客户区测量的 ClientToScreen/GetClientRect
+全部显式设 argtypes/restype=c_void_p（64 位句柄截断教训，同
+core/computer/win32_adapter.py 注释）。窗体句柄 / DPI / 文件对话框都必须经
+form.Invoke 同步 marshal 回 GUI 线程（js_api 方法在 pywebview 独立线程执行），
+与 core/embedded_browser.py 头部约定的同一套规则。
 """
 
 from __future__ import annotations
@@ -70,6 +73,14 @@ def _window_client_frame(
             ("right", ctypes.c_long),
             ("bottom", ctypes.c_long),
         ]
+
+    # 64 位句柄截断教训（同文件头注释 / win32_adapter）：windll 默认按 32 位
+    # int 传递与返回，句柄 > 2**31 时会 OverflowError 或被截断成错误句柄，
+    # HWND 与返回值必须显式声明（c_void_p / BOOL）。
+    user32.ClientToScreen.argtypes = (ctypes.c_void_p, ctypes.POINTER(_POINT))
+    user32.ClientToScreen.restype = ctypes.c_bool
+    user32.GetClientRect.argtypes = (ctypes.c_void_p, ctypes.POINTER(_RECT))
+    user32.GetClientRect.restype = ctypes.c_bool
 
     origin = _POINT(0, 0)
     if not user32.ClientToScreen(hwnd, ctypes.byref(origin)):
@@ -147,7 +158,12 @@ def decode_png_data_url(data_url: Any) -> bytes:
 
 
 def dib_bytes_from_image(img: Any) -> bytes:
-    """PIL Image → 24 位底向上 CF_DIB 字节（BITMAPINFOHEADER + 像素）。"""
+    """PIL Image → 24 位底向上 CF_DIB 字节（BITMAPINFOHEADER + 像素）。
+
+    走 PIL 原生批量转换（raw BGR + 行对齐 stride + orientation=-1 即底向上），
+    与旧的全 Python 三重循环逐字节等价，但不再有 ~622 万次（1920×1080）
+    解释器循环——该路径在 js_api 线程同步执行，逐像素循环会直接卡住桥调用。
+    """
     rgb = img.convert("RGB")
     width, height = rgb.size
     stride = ((width * 3 + 3) // 4) * 4
@@ -162,17 +178,9 @@ def dib_bytes_from_image(img: Any) -> bytes:
         stride * height, # biSizeImage
         0, 0, 0, 0,      # 分辨率/调色板字段
     )
-    pixels = bytearray(stride * height)
-    raw = rgb.tobytes()  # 顶起、逐行、RGB
-    for row in range(height):
-        src = row * width * 3
-        dst = (height - 1 - row) * stride  # 底向上
-        for col in range(width):
-            r, g, b = raw[src + col * 3: src + col * 3 + 3]
-            pixels[dst + col * 3] = b
-            pixels[dst + col * 3 + 1] = g
-            pixels[dst + col * 3 + 2] = r
-    return header + bytes(pixels)
+    # raw BGR：逐行 BGR（列序与 CF_DIB 一致）；stride：行尾补齐到 4 字节对齐；
+    # orientation=-1：行序自底向上（与 BI_RGB 正 biHeight 约定一致）
+    return header + rgb.tobytes("raw", "BGR", stride, -1)
 
 
 def _set_clipboard_dib(dib: bytes, hwnd: int) -> bool:
@@ -247,6 +255,39 @@ class SnipBridgeMixin:
             logger.debug("获取主窗体失败", exc_info=True)
             return None
 
+    def _invoke_gui(self, form, callback):
+        """把回调同步 marshal 到 GUI 线程执行，返回 (ok, 返回值)。
+
+        与 core/embedded_browser.EmbeddedBrowserController._invoke 同一套约定
+        （桥方法从 js_api 线程进入，WinForms/DPI 必须回到 GUI 线程）。窗体的
+        Handle 也只能在 GUI 线程内读——WinForms 跨线程访问会抛
+        InvalidOperationException，所以连"句柄是否就绪"的探测都放在委托里。
+        句柄未创建（ToInt32()==0）、窗体已销毁（Invoke 抛异常）时返回
+        (False, None)，由调用方按既有 error dict 降级，绝不抛穿桥层。
+        """
+        if form is None:
+            return False, None
+        box: Dict[str, Any] = {}
+
+        def _run() -> None:
+            handle = getattr(form, "Handle", None)
+            if handle is not None and hasattr(handle, "ToInt32") and handle.ToInt32() == 0:
+                box["ready"] = False  # 句柄还没建起来
+                return
+            box["ready"] = True
+            box["value"] = callback()
+
+        try:
+            from core.embedded_browser import _make_delegate
+
+            form.Invoke(_make_delegate(_run))
+        except Exception:
+            logger.debug("GUI 线程 Invoke 失败（窗体可能已销毁）", exc_info=True)
+            return False, None
+        if not box.get("ready", False):
+            return False, None
+        return True, box.get("value")
+
     # ---------------------------------------------------------------- 桥方法
 
     def capture_right_panel_region(self, rect: Dict[str, Any]) -> Dict[str, Any]:
@@ -260,14 +301,23 @@ class SnipBridgeMixin:
             form = self._main_form()
             if form is None:
                 return {"ok": False, "msg": "窗口尚未就绪"}
-            hwnd = form.Handle.ToInt32()
-            if not hwnd:
-                return {"ok": False, "msg": "窗口尚未就绪"}
-            # 复用内嵌浏览器的 DPI 换算：GetDpiForWindow → DeviceDpi → 1.0
-            from core.embedded_browser import EmbeddedBrowserController
 
-            scale = EmbeddedBrowserController._compute_scale(form)
-            origin, client_size = _window_client_frame(hwnd)
+            def _read_geometry():
+                # 句柄 / DPI 换算 / 客户区测量全部在 GUI 线程内完成（form.Invoke）
+                hwnd = int(form.Handle.ToInt32())
+                if not hwnd:
+                    return None
+                # 复用内嵌浏览器的 DPI 换算：GetDpiForWindow → DeviceDpi → 1.0
+                from core.embedded_browser import EmbeddedBrowserController
+
+                scale = EmbeddedBrowserController._compute_scale(form)
+                origin, client_size = _window_client_frame(hwnd)
+                return scale, origin, client_size
+
+            ok, geometry = self._invoke_gui(form, _read_geometry)
+            if not ok or geometry is None:
+                return {"ok": False, "msg": "窗口尚未就绪"}
+            scale, origin, client_size = geometry
             bbox = physical_bbox_for_css(rect, scale, origin, client_size)
             if bbox is None:
                 return {"ok": False, "msg": "截图区域无效"}
@@ -322,8 +372,12 @@ class SnipBridgeMixin:
             form = self._main_form()
             if form is not None:
                 try:
-                    hwnd = form.Handle.ToInt32()
+                    # 句柄只能在 GUI 线程读（WinForms 跨线程访问约束）
+                    ok, value = self._invoke_gui(form, lambda: int(form.Handle.ToInt32()))
+                    hwnd = int(value) if (ok and value) else 0
                 except Exception:
+                    # 降级语义不变（hwnd=0），但必须留痕，不再无声吞掉
+                    logger.debug("读取窗口句柄失败（剪贴板以 hwnd=0 写入）", exc_info=True)
                     hwnd = 0
             if not _set_clipboard_dib(dib, hwnd):
                 return {"ok": False, "msg": "写入剪贴板失败"}
@@ -346,6 +400,9 @@ class SnipBridgeMixin:
 
             if not getattr(self, "_window", None):
                 return {"ok": False, "msg": "窗口尚未就绪"}
+            form = self._main_form()
+            if form is None:
+                return {"ok": False, "msg": "窗口尚未就绪"}
             home = Path.home()
             directory = home / "Pictures"
             if not directory.is_dir():
@@ -354,11 +411,18 @@ class SnipBridgeMixin:
             if not name:
                 name = f"ycode截图_{time.strftime('%Y%m%d_%H%M%S')}.png"
             name = os.path.basename(name).replace("/", "_").replace("\\", "_") or "ycode截图.png"
-            result = self._window.create_file_dialog(
-                webview.SAVE_DIALOG,
-                directory=str(directory),
-                save_filename=name,
-            )
+
+            def _ask_save_path():
+                # 文件对话框是 WinForms 控件操作，必须在 GUI 线程弹出
+                return self._window.create_file_dialog(
+                    webview.SAVE_DIALOG,
+                    directory=str(directory),
+                    save_filename=name,
+                )
+
+            ok, result = self._invoke_gui(form, _ask_save_path)
+            if not ok:
+                return {"ok": False, "msg": "窗口尚未就绪"}
             path = ""
             if isinstance(result, (list, tuple)):
                 path = str(result[0]) if result else ""

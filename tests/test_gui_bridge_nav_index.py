@@ -156,3 +156,30 @@ def test_nav_index_and_bubbles_skip_system_injected_messages():
     msgs, _, _ = bridge._load_session_messages("s")
     user_msgs = [m for m in msgs if m["role"] == "user"]
     assert [m["content"] for m in user_msgs] == ["真正的问题"]
+
+
+def test_nav_index_and_bubbles_skip_internal_turn_injection_messages():
+    """内部回合的注入指令（后台子代理汇总 / 后台命令总结）与用户输入同形
+    （都是 role=user）：红点导航与对话气泡都必须跳过，否则红点会被污染。"""
+    bridge = _bare_bridge()
+    bridge._memory.add_message("s", "user", "帮我做两个后台任务测试")
+    bridge._memory.add_message("s", "user", (
+        "请汇总所有后台子代理任务的结果并告诉我。如果某些任务失败了，"
+        "可以用你自身的工具（如 search_news / fetch_url 等）接手完成；"
+        "但已被用户取消的任务不要接手或重试，如实说明即可。"
+    ))
+    bridge._memory.add_message("s", "user", (
+        "有一个后台命令任务执行完毕，请用一句话简短总结它的结果"
+        "（成功/失败 + 关键信息，不要复述命令本身）。\n"
+        "命令: python a.py\n退出码: 0（0=成功，非0=失败）\n日志尾部:\nok"
+    ))
+
+    res = bridge.get_session_nav_index("s")
+
+    assert res["ok"] is True
+    assert res["total"] == 1
+    assert res["items"][0]["preview"] == "帮我做两个后台任务测试"
+
+    msgs, _, _ = bridge._load_session_messages("s")
+    user_msgs = [m for m in msgs if m["role"] == "user"]
+    assert [m["content"] for m in user_msgs] == ["帮我做两个后台任务测试"]

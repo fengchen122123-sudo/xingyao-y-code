@@ -346,3 +346,117 @@ def test_prepare_automation_requires_form():
     ctrl._get_form = lambda: None
     result = ctrl.prepare_automation()
     assert result == {"ok": False, "error": "form_unavailable"}
+
+
+# ---------------- 页面自身发起的顶层导航 scheme 兜底 ----------------
+
+
+class _NavArgs:
+    """NavigationStartingEventArgs 桩：只有 Uri 与可写的 Cancel。"""
+
+    def __init__(self, uri):
+        self.Uri = uri
+        self.Cancel = False
+
+
+@pytest.mark.parametrize(
+    ("uri", "cancelled"),
+    [
+        # 点击链接 / location.href / meta refresh 绕过后端 normalize_url 的入口
+        ("javascript:alert(1)", True),
+        ("file:///C:/Windows/win.ini", True),
+        ("data:text/html,<h1>x</h1>", True),
+        ("about:config", True),
+        # 白名单：http/https 与既有的 about:blank
+        ("https://example.com/page", False),
+        ("http://example.com/page", False),
+        ("about:blank", False),
+    ],
+)
+def test_navigation_starting_enforces_scheme_whitelist(uri, cancelled):
+    ctrl = _controller()
+    args = _NavArgs(uri)
+
+    ctrl._on_navigation_starting(None, args)
+
+    assert args.Cancel is cancelled
+
+
+def test_navigation_starting_without_uri_does_not_miskill():
+    """Uri 取不到（旧版内核 / args 为 None）时不得误杀导航。"""
+    ctrl = _controller()
+
+    args = SimpleNamespace(Cancel=False)
+    ctrl._on_navigation_starting(None, args)
+    assert args.Cancel is False
+
+    ctrl._on_navigation_starting(None, None)  # 不抛
+
+
+def test_is_navigation_allowed_matches_normalize_url():
+    assert eb.is_navigation_allowed("https://example.com") is True
+    assert eb.is_navigation_allowed("about:blank") is True
+    assert eb.is_navigation_allowed(None) is True  # 取不到 -> 不误杀
+    assert eb.is_navigation_allowed("") is True
+    assert eb.is_navigation_allowed("javascript:alert(1)") is False
+    assert eb.is_navigation_allowed("file:///C:/x.txt") is False
+
+
+# ---------------- shutdown 释放契约 ----------------
+
+
+def test_shutdown_disposes_control_and_clears_cdp_port():
+    """shutdown 必须一并清 _cdp_port：否则下一次 prepare_automation 会
+    误认"控件仍带调试端口"而返回已失效的 endpoint。"""
+    ctrl, core = _fake_ready_controller()
+    disposed = []
+    ctrl._webview = SimpleNamespace(
+        CoreWebView2=core, Dispose=lambda: disposed.append(1)
+    )
+    ctrl._cdp_port = 9321
+
+    assert ctrl.shutdown() == {"ok": True}
+
+    assert disposed == [1]
+    assert ctrl._cdp_port is None
+    assert ctrl._webview is None
+
+
+def test_shutdown_clears_cdp_port_without_control():
+    ctrl = _controller()
+    ctrl._cdp_port = 9321
+
+    assert ctrl.shutdown() == {"ok": True}
+
+    assert ctrl._cdp_port is None
+
+
+def test_browser_mixin_releases_cached_controller_on_shutdown(monkeypatch):
+    """gui_browser_mixin：控制器释放后必须清掉桥层缓存引用，后续脑跳调用与
+    "从未打开"语义一致（set_bounds -> not_open），不再打到已 Dispose 的控件。
+
+    注：gui_browser_mixin 共用 core.embedded_browser 的释放契约，测试放这里
+    与控制器释放契约同处一文件。
+    """
+    import gui_browser_mixin
+
+    class _Bridge(gui_browser_mixin.BrowserBridgeMixin):
+        def __init__(self):
+            self._window = SimpleNamespace(uid="master")
+
+        def emit_event(self, *_args):
+            pass
+
+    monkeypatch.setattr(gui_browser_mixin.sys, "platform", "win32")
+    bridge = _Bridge()
+    ctrl = bridge._browser_controller()
+    assert ctrl is not None
+    assert bridge._embedded_browser is ctrl
+
+    ctrl.shutdown()  # ApiBridge.shutdown 的调用形态
+
+    assert getattr(bridge, "_embedded_browser", None) is None
+    rect = {"x": 0, "y": 0, "width": 100, "height": 100}
+    assert bridge.browser_pane_set_bounds(rect) == {"ok": False, "error": "not_open"}
+    assert bridge.browser_pane_get_state() == {"ok": True, "state": None}
+    assert bridge.browser_pane_hide() == {"ok": True}

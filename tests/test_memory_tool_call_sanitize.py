@@ -121,3 +121,71 @@ def test_null_arguments_call_is_dropped():
 
     assert "tool_calls" not in sanitized[0]
     assert all(m["role"] != "tool" for m in sanitized)
+
+
+def test_notice_between_tool_calls_and_results_is_repaired():
+    """编排提醒等注入的 user 消息落在 assistant.tool_calls 与 tool 结果之间时，
+    上游报 "An assistant message with 'tool_calls' must be followed by tool
+    messages"；加载层把 tool 结果搬回 assistant 之后，正文一律保留不丢。"""
+    nudge = "本回合已连续执行多步操作，仍未建立任务计划。"
+    history = [
+        {"role": "user", "content": "跑一下"},
+        _assistant([
+            {"id": "call-1", "type": "function",
+             "function": {"name": "execute_command", "arguments": '{"command": "git log"}'}},
+        ]),
+        {"role": "user", "content": nudge},
+        _tool("call-1", "execute_command", "9c91d32 chore: ..."),
+    ]
+
+    sanitized = _sanitize_tool_call_pairing(history)
+
+    assert [m["role"] for m in sanitized] == ["user", "assistant", "tool", "user"]
+    assert [tc["id"] for tc in sanitized[1]["tool_calls"]] == ["call-1"]
+    assert sanitized[2]["tool_call_id"] == "call-1"
+    assert sanitized[2]["content"] == "9c91d32 chore: ..."
+    assert sanitized[3]["content"] == nudge
+
+
+def test_calls_split_by_notice_are_reordered_by_call_order():
+    """同一 step 的多个调用被注入消息拆散、且结果乱序时，按 tool_calls 顺序重排。"""
+    nudge = "本回合已连续执行多步操作，仍未建立任务计划。"
+    calls = [
+        {"id": "call-1", "type": "function",
+         "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}},
+        {"id": "call-2", "type": "function",
+         "function": {"name": "glob_files", "arguments": '{"pattern": "*.py"}'}},
+    ]
+    history = [
+        _assistant(calls),
+        {"role": "user", "content": nudge},
+        _tool("call-2", "glob_files"),
+        _tool("call-1", "read_file"),
+    ]
+
+    sanitized = _sanitize_tool_call_pairing(history)
+
+    assert [m["role"] for m in sanitized] == ["assistant", "tool", "tool", "user"]
+    assert [m["tool_call_id"] for m in sanitized if m["role"] == "tool"] == ["call-1", "call-2"]
+    assert sanitized[0]["tool_calls"] == calls
+
+
+def test_already_adjacent_pairs_keep_original_order():
+    """已经合法相邻的调用组不得被重排（幂等，避免每轮请求扰动前缀缓存）。"""
+    nudge = "本回合已连续执行多步操作，仍未建立任务计划。"
+    history = [
+        {"role": "user", "content": "hi"},
+        _assistant([
+            {"id": "call-1", "type": "function",
+             "function": {"name": "read_file", "arguments": '{"path": "a.txt"}'}},
+        ], content="先读文件"),
+        _tool("call-1", "read_file"),
+        {"role": "user", "content": nudge},
+    ]
+
+    sanitized = _sanitize_tool_call_pairing(history)
+
+    assert [m["role"] for m in sanitized] == ["user", "assistant", "tool", "user"]
+    assert sanitized[1]["content"] == "先读文件"
+    assert sanitized[2]["tool_call_id"] == "call-1"
+    assert sanitized[3]["content"] == nudge

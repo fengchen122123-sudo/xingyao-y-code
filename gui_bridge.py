@@ -31,7 +31,11 @@ import config
 from config import GUI_DB_FILE, MY_PERMISSION_MODE
 import core.app_context as app_context
 from core.agent_service import strip_context_suffix
-from core.injection_markers import is_system_injected_user_text
+from core.injection_markers import (
+    BG_COMMAND_SUMMARY_INJECTION_PREFIX,
+    BG_SUMMARY_INJECTION_PREFIX,
+    is_system_injected_user_text,
+)
 from core.turn_renderer import sanitize_protocol_text, sanitize_stream_text
 from core.media_refs import MEDIA_DISPLAY_ERROR_LABELS
 from core.media_server import media_server
@@ -333,11 +337,19 @@ FILE_TREE_SKIP_DIRS = {
 # 测试模型连通性的超时（秒）
 TEST_MODEL_TIMEOUT = 15
 
-# 后台子代理全部终态后自动发起的汇总回合（与 CLI 的内部汇总指令同文案）
+# 后台子代理全部终态后自动发起的汇总回合（与 CLI 的内部汇总指令同文案）。
+# 前缀复用 core.injection_markers 的常量：注入文案与展示层过滤前缀同源，
+# 从结构上杜绝"改了注入文案、忘改过滤表"导致的泄漏（这两类曾渲染成用户
+# 气泡并污染红点导航，用户报告过）。
 _BG_SUMMARY_PROMPT = (
-    "请汇总所有后台子代理任务的结果并告诉我。如果某些任务失败了，"
+    BG_SUMMARY_INJECTION_PREFIX + "。如果某些任务失败了，"
     "可以用你自身的工具（如 search_news / fetch_url 等）接手完成；"
     "但已被用户取消的任务不要接手或重试，如实说明即可。"
+)
+# 后台命令任务完成后自动发起总结回合的注入指令（同样以 role=user 落库，展示层过滤）
+_BG_COMMAND_SUMMARY_PROMPT = (
+    BG_COMMAND_SUMMARY_INJECTION_PREFIX
+    + "，请用一句话简短总结它的结果（成功/失败 + 关键信息，不要复述命令本身）。"
 )
 # 内部汇总回合在前端展示的系统提示文案（代替把上面的指令原文渲染成用户气泡）
 _BG_SUMMARY_DISPLAY_TEXT = "📦 所有后台子代理任务已结束，正在自动汇总结果…"
@@ -5786,8 +5798,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             cmd = redact_sensitive_text(command or "")
             tail = (log_tail or "").strip()[-1500:]
             prompt = (
-                "有一个后台命令任务执行完毕，请用一句话简短总结它的结果"
-                "（成功/失败 + 关键信息，不要复述命令本身）。\n"
+                f"{_BG_COMMAND_SUMMARY_PROMPT}\n"
                 f"命令: {cmd}\n"
                 f"退出码: {int(returncode or 0)}（0=成功，非0=失败）\n"
                 f"日志尾部:\n{tail or '(无输出)'}\n"

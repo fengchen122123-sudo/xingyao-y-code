@@ -69,6 +69,7 @@ from core.tools import (
     write_file,
 )
 from core.turn_events import TurnEventFactory
+from core.injection_markers import ORCHESTRATION_NUDGE_TEXT as _ORCHESTRATION_NUDGE_TEXT
 
 # 电脑操控（Task 10，设计 9.3/19）：包级轻量依赖，绝不触碰键鼠/浏览器；
 # controller 顶层也不 import core.llm，无循环导入。测试通过 monkeypatch
@@ -1058,14 +1059,68 @@ from core.llm_execution import (
 
 # ── 编排提醒：多步未建计划时的软提醒（每回合最多 1 次）────────────────
 
+# 阈值口径：实质操作数"超过"该阈值（即 ≥ 4）才提醒，恰好 3 步及以内不提醒——
+# 与提醒文案及 system_prompt*.md 的"3 条及以内直接执行"保持一致。
 _ORCHESTRATION_NUDGE_THRESHOLD = 3
 _ORCHESTRATION_COUNTED_TOOLS = frozenset({"write_file", "edit_file"})
 _ORCHESTRATION_COMMAND_TOOL = "execute_command"
-_ORCHESTRATION_NUDGE_TEXT = (
-    "本回合已连续执行多步操作，仍未建立任务计划。"
-    "若任务拆解后超过 3 条子任务，请立即用 plan_write 建立计划并逐条执行；"
-    "不超过 3 条可忽略本提醒，直接完成。"
+# 文案常量迁至 core.injection_markers（展示层过滤前缀与文案同源，防漂移）；
+# 顶部以别名导入并保留 _ORCHESTRATION_NUDGE_TEXT 名称供既有引用使用。
+
+# 慢步催促文案（core/tools.py 无该生成点；此处抽为模块级常量便于展示层过滤
+# 前缀与生成点对账，防止文案漂移）。
+SLOW_STEP_NUDGE_TEXT = (
+    "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何"
+    "正文内容，已出现明显的思考空转。请立即停止自检和复述思考过程，"
+    "直接输出最终结论：任务已完成就给出中文结论，仍需操作就立即"
+    "调用相应工具。禁止继续只输出思考内容。"
 )
+# 总结催促文案（工具已跑完却无结论）。
+SUMMARY_NUDGE_TOOL_DONE_TEXT = (
+    "工具已经执行完毕。现在必须只输出最终中文检查结论，"
+    "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
+)
+# 总结催促文案（只输出思考、既无工具也无正文）。
+SUMMARY_NUDGE_THINKING_ONLY_TEXT = (
+    "你刚才只输出了思考过程，既没有调用工具执行任何操作，"
+    "也没有给出正式回复。请立即继续：需要执行操作就调用相应工具，"
+    "任务已完成就直接输出中文结论；不要只输出思考内容。"
+)
+# 计划续推催促文案（{hints} 由调用处填充）。
+PLAN_CONTINUE_NUDGE_TEXT = (
+    "计划尚未执行完毕，仍有可执行的计划项: [{hints}]。"
+    "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项；"
+    "若某项确实无法完成，请先用 plan_read 查看状态并明确说明原因，"
+    "不要在计划未完成时直接结束回答。"
+)
+
+# 按 turn_id 的进程内去重：同一 turn_id 异常重入（生成器被重复驱动）时，
+# 编排提醒只注入一次。写法参考 core/permission_terminal.py 的
+# _plan_turn_started_at（带 TTL + 过期清理，避免无限增长）。
+_orchestration_nudged_turns: dict[str, float] = {}
+_orchestration_nudged_lock = threading.Lock()
+_ORCHESTRATION_NUDGE_TURN_TTL_SECONDS = 3600
+
+
+def _orchestration_turn_already_nudged(turn_id) -> bool:
+    """该 turn_id 是否已注入过编排提醒（只读，不登记）。"""
+    if turn_id is None:
+        return False
+    with _orchestration_nudged_lock:
+        return str(turn_id) in _orchestration_nudged_turns
+
+
+def _register_orchestration_nudge(turn_id, *, now=None) -> None:
+    """登记某 turn_id 已注入编排提醒，并顺带清理过期条目（TTL 防无限增长）。"""
+    if turn_id is None:
+        return
+    now = time.monotonic() if now is None else now
+    with _orchestration_nudged_lock:
+        _orchestration_nudged_turns[str(turn_id)] = now
+        cutoff = now - _ORCHESTRATION_NUDGE_TURN_TTL_SECONDS
+        for stale_id, started_at in list(_orchestration_nudged_turns.items()):
+            if started_at < cutoff:
+                _orchestration_nudged_turns.pop(stale_id, None)
 
 
 def _count_substantive_ops(tool_calls):
@@ -1098,10 +1153,16 @@ def _count_substantive_ops(tool_calls):
 
 
 def _should_nudge_orchestration(*, allow_subagents, count, session_id, turn_id, already_sent):
-    """是否注入编排提醒：主代理回合 + 达阈值 + 无计划在途 + 未提醒过。"""
+    """是否注入编排提醒：主代理回合 + 实质操作超过阈值 + 无计划在途 + 未提醒过。
+
+    阈值口径：count 必须"超过" _ORCHESTRATION_NUDGE_THRESHOLD（即 ≥ 4）才提醒，
+    恰好 3 步及以内不提醒（与提醒文案及 system_prompt*.md 一致）。
+    """
     if not allow_subagents or already_sent:
         return False
-    if count < _ORCHESTRATION_NUDGE_THRESHOLD:
+    if count <= _ORCHESTRATION_NUDGE_THRESHOLD:
+        return False
+    if _orchestration_turn_already_nudged(turn_id):
         return False
     return not (_has_pending_plan(session_id) or _is_plan_turn(turn_id))
 
@@ -1305,7 +1366,9 @@ def _chat_with_model_generator(
                         disp["model_name"] = model.get("name") or model_name
                         break
         except Exception:
-            pass
+            # 读配置失败不影响落库：保留回退为 model_name 原值的行为，仅记录
+            # 调试日志留下痕迹，便于排查显示名缺失。
+            logger.debug("读取模型显示名配置失败，回退为 model_name", exc_info=True)
         if metrics:
             disp["metrics"] = metrics
         return {"_display": disp}
@@ -2385,12 +2448,7 @@ def _chat_with_model_generator(
                     })
                     slow_step_nudge = {
                         "role": "user",
-                        "content": (
-                            "你在最近一步耗时过长，且既没有调用任何工具、也没有输出任何"
-                            "正文内容，已出现明显的思考空转。请立即停止自检和复述思考过程，"
-                            "直接输出最终结论：任务已完成就给出中文结论，仍需操作就立即"
-                            "调用相应工具。禁止继续只输出思考内容。"
-                        ),
+                        "content": SLOW_STEP_NUDGE_TEXT,
                     }
                     # 空的 assistant 消息（content 为 None）不入库也不留内存，只追加
                     # 强催促；催促使消息同样需要持久化，避免下一轮重建历史时上下文缺失。
@@ -2519,20 +2577,11 @@ def _chat_with_model_generator(
                     # 留在历史里会让下一轮 API 报 400（Anthropic 拒绝空 content）
                     messages.pop()
                     if tool_activity_seen:
-                        nudge_text = (
-                            "工具已经执行完毕。现在必须只输出最终中文检查结论，"
-                            "说明发现的问题或下一步建议；不要调用工具，也不要只输出标点或 Markdown 标记。"
-                            + length_hint
-                        )
+                        nudge_text = SUMMARY_NUDGE_TOOL_DONE_TEXT + length_hint
                     else:
                         # 模型只输出思考、未调用任何工具也未给出正文：催促它真正行动，
                         # 而不是把内心独白当成交付结果。
-                        nudge_text = (
-                            "你刚才只输出了思考过程，既没有调用工具执行任何操作，"
-                            "也没有给出正式回复。请立即继续：需要执行操作就调用相应工具，"
-                            "任务已完成就直接输出中文结论；不要只输出思考内容。"
-                            + length_hint
-                        )
+                        nudge_text = SUMMARY_NUDGE_THINKING_ONLY_TEXT + length_hint
                     summary_request = {
                         "role": "user",
                         "content": nudge_text,
@@ -2613,12 +2662,7 @@ def _chat_with_model_generator(
                         )
                         nudge_request = {
                             "role": "user",
-                            "content": (
-                                f"计划尚未执行完毕，仍有可执行的计划项: [{hints}]。"
-                                "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项；"
-                                "若某项确实无法完成，请先用 plan_read 查看状态并明确说明原因，"
-                                "不要在计划未完成时直接结束回答。"
-                            ),
+                            "content": PLAN_CONTINUE_NUDGE_TEXT.format(hints=hints),
                         }
                         # 注入催促消息后继续下一轮（与下方 Stop-hook 续跑同模式：
                         # append + pending_persistence + flush_persistence）。
@@ -2908,29 +2952,10 @@ def _chat_with_model_generator(
                 key=lambda record: record.call_ordinal,
             ))
 
-            # 编排提醒（软）：多步实质操作仍未建计划时拉一把，每回合最多一次
+            # 编排提醒（软）：多步实质操作仍未建计划时拉一把，每回合最多一次。
+            # 实质操作数在此累计；提醒本体的 append 推迟到全部 tool 结果（含
+            # follow-up 观察消息）之后，见下方"工具结果全部入列后再追加"处。
             substantive_op_count += _count_substantive_ops(tool_calls_list)
-            if _should_nudge_orchestration(
-                allow_subagents=allow_subagents,
-                count=substantive_op_count,
-                session_id=parent_session,
-                turn_id=parent_turn_id,
-                already_sent=orchestration_nudge_sent,
-            ):
-                orchestration_nudge_sent = True
-                orchestration_request = {
-                    "role": "user",
-                    "content": _ORCHESTRATION_NUDGE_TEXT,
-                }
-                messages.append(orchestration_request)
-                pending_persistence.append(("user", orchestration_request))
-                _notify_event(event_callback, "notice", {
-                    "message": "已提醒模型评估是否需要建立任务计划。",
-                })
-                flush_persistence()
-                progress_guard.observe(
-                    _step_progress_observation(None, session_id=parent_session)
-                )
 
             results = [record.message for record in records]
             # follow-up 观察 user 消息按 call ordinal 追加在全部 tool results
@@ -2953,6 +2978,35 @@ def _chat_with_model_generator(
                     pending_persistence.extend(
                         ("user", followup) for followup in followup_messages
                     )
+
+            # 工具结果全部入列后，再追加编排提醒：保证 messages 顺序为
+            # assistant(tool_calls) → tool(...)（含 follow-up 观察消息）→ user(提醒)，
+            # 满足 Anthropic「tool_use 后必须紧跟 tool_result」与 OpenAI「tool_calls
+            # 必须被 tool 消息应答」的约束；pending_persistence 入队顺序与之一致。
+            # 同一 turn 只注入一次：除生成器局部 orchestration_nudge_sent 外，还按
+            # turn_id 做进程内去重（异常重入时不再重复注入）。
+            if _should_nudge_orchestration(
+                allow_subagents=allow_subagents,
+                count=substantive_op_count,
+                session_id=parent_session,
+                turn_id=parent_turn_id,
+                already_sent=orchestration_nudge_sent,
+            ):
+                orchestration_nudge_sent = True
+                _register_orchestration_nudge(parent_turn_id)
+                orchestration_request = {
+                    "role": "user",
+                    "content": _ORCHESTRATION_NUDGE_TEXT,
+                }
+                messages.append(orchestration_request)
+                pending_persistence.append(("user", orchestration_request))
+                _notify_event(event_callback, "notice", {
+                    "message": "已提醒模型评估是否需要建立任务计划。",
+                })
+                flush_persistence()
+                progress_guard.observe(
+                    _step_progress_observation(None, session_id=parent_session)
+                )
 
             if event_callback is None:
                 app_context.set_task_status('executing')
