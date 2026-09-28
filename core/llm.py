@@ -1056,6 +1056,56 @@ from core.llm_execution import (
     _vision_fallback_text,
 )
 
+# ── 编排提醒：多步未建计划时的软提醒（每回合最多 1 次）────────────────
+
+_ORCHESTRATION_NUDGE_THRESHOLD = 3
+_ORCHESTRATION_COUNTED_TOOLS = frozenset({"write_file", "edit_file"})
+_ORCHESTRATION_COMMAND_TOOL = "execute_command"
+_ORCHESTRATION_NUDGE_TEXT = (
+    "本回合已连续执行多步操作，仍未建立任务计划。"
+    "若任务拆解后超过 3 条子任务，请立即用 plan_write 建立计划并逐条执行；"
+    "不超过 3 条可忽略本提醒，直接完成。"
+)
+
+
+def _count_substantive_ops(tool_calls):
+    """一批工具调用中的实质操作数：write_file / edit_file / 非只读 execute_command。
+
+    execute_command 的只读判定与计划门禁同口径（classify_command_risk）；
+    参数解析失败的调用按保守原则计入，空命令不计。
+    """
+    from core.permission_policy import PermissionRisk
+
+    count = 0
+    for tool_call in tool_calls or ():
+        function = tool_call.get("function") or {}
+        name = str(function.get("name") or "")
+        if name in _ORCHESTRATION_COUNTED_TOOLS:
+            count += 1
+            continue
+        if name != _ORCHESTRATION_COMMAND_TOOL:
+            continue
+        raw = str(function.get("arguments") or "")
+        try:
+            arguments = json.loads(raw) if raw.strip() else {}
+        except (TypeError, ValueError):
+            count += 1
+            continue
+        command = str((arguments or {}).get("command") or "")
+        if command and classify_command_risk(command) is not PermissionRisk.QUERY:
+            count += 1
+    return count
+
+
+def _should_nudge_orchestration(*, allow_subagents, count, session_id, turn_id, already_sent):
+    """是否注入编排提醒：主代理回合 + 达阈值 + 无计划在途 + 未提醒过。"""
+    if not allow_subagents or already_sent:
+        return False
+    if count < _ORCHESTRATION_NUDGE_THRESHOLD:
+        return False
+    return not (_has_pending_plan(session_id) or _is_plan_turn(turn_id))
+
+
 _ORIGINAL_EXECUTE_SINGLE_TOOL_CALL = _execute_single_tool_call
 
 
@@ -1229,6 +1279,9 @@ def _chat_with_model_generator(
             logger.warning("折叠电脑操控观察截图失败（已忽略）", exc_info=True)
     # 计划未执行完时的续推次数上限：防止模型反复提前收尾与续推消息互相打转
     plan_continue_nudges = 0
+    # 编排提醒：本回合是否已注入、实质操作累计（每回合重置）
+    orchestration_nudge_sent = False
+    substantive_op_count = 0
     pending_persistence = []
     persistence_failure = None
     current_step = None
@@ -2854,6 +2907,30 @@ def _chat_with_model_generator(
                 records,
                 key=lambda record: record.call_ordinal,
             ))
+
+            # 编排提醒（软）：多步实质操作仍未建计划时拉一把，每回合最多一次
+            substantive_op_count += _count_substantive_ops(tool_calls_list)
+            if _should_nudge_orchestration(
+                allow_subagents=allow_subagents,
+                count=substantive_op_count,
+                session_id=parent_session,
+                turn_id=parent_turn_id,
+                already_sent=orchestration_nudge_sent,
+            ):
+                orchestration_nudge_sent = True
+                orchestration_request = {
+                    "role": "user",
+                    "content": _ORCHESTRATION_NUDGE_TEXT,
+                }
+                messages.append(orchestration_request)
+                pending_persistence.append(("user", orchestration_request))
+                _notify_event(event_callback, "notice", {
+                    "message": "已提醒模型评估是否需要建立任务计划。",
+                })
+                flush_persistence()
+                progress_guard.observe(
+                    _step_progress_observation(None, session_id=parent_session)
+                )
 
             results = [record.message for record in records]
             # follow-up 观察 user 消息按 call ordinal 追加在全部 tool results
