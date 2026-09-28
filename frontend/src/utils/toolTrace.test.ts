@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import {
+  buildSubagentFlatView,
   buildToolTraceRows,
   countDiffChanges,
   reduceExecutionState,
@@ -312,5 +313,99 @@ describe('reduceExecutionState', () => {
     expect(reduceExecutionState('running', 'turn_error')).toBe('error');
     expect(reduceExecutionState('running', 'turn_cancelled')).toBe('cancelled');
     expect(reduceExecutionState('running', 'turn_finish')).toBe('completed');
+  });
+});
+
+describe('buildSubagentFlatView', () => {
+  const stage = (name: string, at: number, detail = '') => ({ name, at, detail });
+
+  it('pairs tool start/finish into a single row anchored at the start time', () => {
+    const view = buildSubagentFlatView([
+      stage('model', 100),
+      stage('tool', 110, 'read_file'),
+      stage('tool', 111, 'read_file ✓ 0.4s'),
+      stage('composing', 112),
+    ]);
+    expect(view.rows).toEqual([
+      { kind: 'stage', name: 'model', at: 100 },
+      { kind: 'tool', name: 'read_file', at: 110, status: 'ok', durationText: '0.4s' },
+      { kind: 'stage', name: 'composing', at: 112 },
+    ]);
+    expect(view).toMatchObject({ rounds: 1, toolOk: 1, toolErr: 0 });
+  });
+
+  it('keeps an unfinished tool as running', () => {
+    const view = buildSubagentFlatView([
+      stage('tool', 100, 'bash'),
+    ]);
+    expect(view.rows[0]).toEqual({ kind: 'tool', name: 'bash', at: 100, status: 'running' });
+    expect(view.toolOk).toBe(0);
+  });
+
+  it('captures the failure summary from a ✗ finish', () => {
+    const view = buildSubagentFlatView([
+      stage('tool', 100, 'bash'),
+      stage('tool', 103, 'bash ✗ 2 errors no-unused-vars'),
+    ]);
+    expect(view.rows[0]).toMatchObject({
+      kind: 'tool',
+      name: 'bash',
+      at: 100,
+      status: 'err',
+      errorText: '2 errors no-unused-vars',
+    });
+    expect(view.rows[0].durationText).toBeUndefined();
+    expect(view.toolErr).toBe(1);
+  });
+
+  it('pairs sequential runs of the same tool LIFO', () => {
+    const view = buildSubagentFlatView([
+      stage('tool', 100, 'bash'),
+      stage('tool', 101, 'bash ✓ 1.0s'),
+      stage('tool', 102, 'bash'),
+      stage('tool', 110, 'bash ✗ failed'),
+    ]);
+    expect(view.rows.map((r) => r.status)).toEqual(['ok', 'err']);
+    expect(view.rows.map((r) => r.at)).toEqual([100, 102]);
+    expect(view).toMatchObject({ toolOk: 1, toolErr: 1 });
+  });
+
+  it('emits a standalone row when the start entry was evicted by the 64-entry cap', () => {
+    const view = buildSubagentFlatView([
+      stage('model', 100),
+      stage('tool', 200, 'grep ✓ 0.9s'),
+    ]);
+    expect(view.rows[1]).toEqual({
+      kind: 'tool',
+      name: 'grep',
+      at: 200,
+      status: 'ok',
+      durationText: '0.9s',
+    });
+    expect(view.toolOk).toBe(1);
+  });
+
+  it('counts model stages as rounds and leaves other template stages intact', () => {
+    const view = buildSubagentFlatView([
+      stage('model', 100),
+      stage('thinking', 101),
+      stage('tool', 102, 'read_file'),
+      stage('tool', 103, 'read_file ✓ 0.2s'),
+      stage('model', 104),
+      stage('waiting_approval', 105),
+      stage('running', 106, 'approval resolved'),
+    ]);
+    expect(view.rounds).toBe(2);
+    expect(view.rows.filter((r) => r.kind === 'stage').map((r) => r.name)).toEqual([
+      'model',
+      'thinking',
+      'model',
+      'waiting_approval',
+      'running',
+    ]);
+  });
+
+  it('returns an empty view for no stages', () => {
+    expect(buildSubagentFlatView([])).toEqual({ rows: [], rounds: 0, toolOk: 0, toolErr: 0 });
   });
 });

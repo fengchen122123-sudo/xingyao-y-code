@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>子代理面板改版 · 三方案对比</title>
+<style>
+  :root {
+    --bg0: #1a1a18;
+    --bg1: #20201e;
+    --bg2: #272724;
+    --bg3: #302f2b;
+    --border: #34332f;
+    --text: #d9d9d4;
+    --text-bright: #edede9;
+    --text-dim: #a8a7a0;
+    --text-faint: #85847d;
+    --accent: #6a92d8;
+    --accent-soft: rgba(106, 146, 216, 0.16);
+    --green: #4ea96a;
+    --red: #d9635b;
+    --orange: #d08a4e;
+    --code-bg: #141412;
+    --mono: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg0);
+    color: var(--text);
+    font-family: 'Segoe UI', 'Microsoft YaHei', system-ui, sans-serif;
+    font-size: 13px;
+    padding: 28px 20px 60px;
+  }
+
+  /* ── 页面框架 ─────────────────────────────── */
+  .page-head { max-width: 1160px; margin: 0 auto 20px; }
+  .page-head h1 { font-size: 18px; color: var(--text-bright); font-weight: 600; }
+  .page-head .sub { color: var(--text-faint); margin-top: 6px; line-height: 1.7; }
+  .scene-switch {
+    display: inline-flex; gap: 4px; margin-top: 14px;
+    padding: 4px; border: 1px solid var(--border); border-radius: 10px; background: var(--bg1);
+  }
+  .scene-switch button {
+    border: 0; background: transparent; color: var(--text-dim);
+    font-family: inherit; font-size: 12.5px; padding: 5px 16px; border-radius: 7px; cursor: pointer;
+  }
+  .scene-switch button.active { background: var(--accent-soft); color: var(--accent); }
+  .pick-banner {
+    max-width: 1160px; margin: 0 auto 20px; display: none;
+    padding: 12px 16px; border-radius: 10px;
+    border: 1px solid var(--accent); background: var(--accent-soft); color: var(--text-bright);
+  }
+  .pick-banner b { color: var(--accent); }
+
+  .stage { max-width: 1160px; margin: 0 auto; display: flex; flex-wrap: wrap; gap: 28px; align-items: flex-start; }
+  .stage[data-scene="done"] .scene-running { display: none !important; }
+  .stage[data-scene="running"] .scene-done { display: none !important; }
+
+  .col { width: 330px; flex-shrink: 0; }
+  .col-head { margin-bottom: 10px; }
+  .col-head .t { font-size: 14.5px; font-weight: 600; color: var(--text-bright); }
+  .col-head .t .rec {
+    font-size: 10.5px; font-weight: 600; color: var(--green);
+    border: 1px solid var(--green); border-radius: 99px; padding: 1px 8px; margin-left: 8px; vertical-align: 2px;
+  }
+  .col-head .d { color: var(--text-faint); font-size: 12px; margin-top: 4px; line-height: 1.6; }
+  .col-foot { margin-top: 10px; color: var(--text-faint); font-size: 11.5px; line-height: 1.8; padding: 0 2px; }
+
+  /* ── 面板机身 ─────────────────────────────── */
+  .phone {
+    width: 330px; border: 1px solid var(--border); border-radius: 14px;
+    background: var(--bg1); overflow: hidden; cursor: pointer;
+    box-shadow: 0 8px 28px rgba(0,0,0,.45); transition: outline .15s;
+    outline: 2px solid transparent;
+  }
+  .phone.selected { outline-color: var(--accent); }
+  .ptabs {
+    display: flex; gap: 2px; padding: 6px 8px 0; border-bottom: 1px solid var(--border); background: var(--bg0);
+  }
+  .ptabs span {
+    font-size: 11px; color: var(--text-faint); padding: 5px 9px 7px; border-radius: 7px 7px 0 0;
+  }
+  .ptabs span.on { color: var(--accent); background: var(--bg1); box-shadow: inset 0 -2px 0 var(--accent); }
+  .pane { padding: 12px; display: flex; flex-direction: column; gap: 10px; min-height: 480px; }
+
+  /* ── 任务头卡（三方案共用） ─────────────────── */
+  .head-card { border-bottom: 1px solid var(--border); padding-bottom: 10px; }
+  .hc-row1 { display: flex; align-items: center; gap: 7px; }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .dot.run { background: var(--orange); animation: pulse 1.6s ease-in-out infinite; }
+  .dot.ok  { background: var(--green); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .st-chip {
+    font-size: 10.5px; border-radius: 99px; padding: 1.5px 9px;
+    background: rgba(208,138,78,.15); color: var(--orange);
+  }
+  .st-chip.ok { background: rgba(78,169,106,.15); color: var(--green); }
+  .badge {
+    font-size: 10.5px; padding: 1.5px 8px; border-radius: 99px;
+    border: 1px solid var(--border); color: var(--text-faint);
+  }
+  .hc-title { font-size: 13.5px; font-weight: 600; color: var(--text-bright); margin-top: 7px; line-height: 1.5; }
+  .hc-stats { display: flex; gap: 6px 12px; flex-wrap: wrap; margin-top: 8px; font-size: 11px; color: var(--text-faint); }
+  .hc-stats .num { color: var(--text-dim); font-family: var(--mono); }
+  .hc-stats .bad { color: var(--red); }
+
+  /* ── 区块标题 ─────────────────────────────── */
+  .sec-t { font-size: 11px; font-weight: 600; color: var(--text-faint); letter-spacing: .5px; display: flex; align-items: center; gap: 8px; }
+  .sec-t::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+  /* ── 方案 A：轮次分组时间线 ─────────────────── */
+  .rounds { display: flex; flex-direction: column; gap: 5px; }
+  .round { border: 1px solid transparent; border-radius: 9px; }
+  .round.current { border-color: var(--accent); background: var(--accent-soft); }
+  .round-head {
+    display: flex; align-items: center; gap: 7px; padding: 6px 9px;
+    font-size: 11.5px; color: var(--text-dim); cursor: pointer; user-select: none;
+  }
+  .round-head:hover { background: rgba(255,255,255,.03); border-radius: 9px; }
+  .round.current .round-head { color: var(--text-bright); }
+  .caret { color: var(--text-faint); font-size: 9px; transition: transform .15s; width: 10px; flex-shrink: 0; }
+  .round.collapsed .caret { transform: rotate(-90deg); }
+  .round.collapsed .round-body { display: none; }
+  .round-head .rt { font-weight: 600; color: var(--text); flex-shrink: 0; }
+  .round.current .rt { color: var(--accent); }
+  .round-head .rmeta { color: var(--text-faint); font-family: var(--mono); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .round-head .live { margin-left: auto; flex-shrink: 0; color: var(--orange); font-size: 10.5px; }
+  .round-body { padding: 1px 9px 7px 26px; display: flex; flex-direction: column; gap: 2px; }
+  .tool-row { display: flex; align-items: center; gap: 7px; font-size: 11.5px; padding: 2.5px 0; min-height: 20px; }
+  .t-ico { flex-shrink: 0; width: 14px; height: 14px; color: var(--text-faint); display: inline-flex; }
+  .t-ico svg { width: 12.5px; height: 12.5px; }
+  .tool-row.ok .t-ico { color: var(--text-faint); }
+  .t-name { color: var(--text-dim); font-family: var(--mono); font-size: 11px; flex-shrink: 0; }
+  .t-arg { color: var(--text-faint); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .t-dur { margin-left: auto; flex-shrink: 0; font-family: var(--mono); font-size: 10.5px; color: var(--text-faint); display: inline-flex; align-items: center; gap: 4px; }
+  .tool-row.ok .t-dur { color: var(--green); }
+  .tool-row.running .t-dur { color: var(--orange); }
+  .tool-row.err { cursor: pointer; }
+  .tool-row.err .t-name, .tool-row.err .t-dur { color: var(--red); }
+  .spin { animation: rot 1.1s linear infinite; }
+  @keyframes rot { to { transform: rotate(360deg); } }
+  .err-body {
+    display: none; margin: 3px 0 5px 21px; padding: 7px 9px;
+    background: rgba(217,99,91,.08); border-left: 2px solid var(--red); border-radius: 0 6px 6px 0;
+    font-size: 11px; color: var(--red); line-height: 1.6; font-family: var(--mono);
+  }
+  .tool-row.err.open + .err-body { display: block; }
+  .wait-row { display: flex; align-items: center; gap: 7px; padding: 4px 9px; margin: 2px 0; border-radius: 7px; background: rgba(201,162,74,.12); color: var(--yellow, #c9a24a); font-size: 11.5px; }
+
+  /* ── 方案 B：扁平整理 ─────────────────────── */
+  .flat { display: flex; flex-direction: column; }
+  .f-row { display: flex; align-items: baseline; gap: 8px; padding: 3px 0 3px 10px; font-size: 11.5px; position: relative; }
+  .f-row::before {
+    content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; border-radius: 2px;
+    background: transparent;
+  }
+  .f-row.dim { color: var(--text-faint); font-size: 10.5px; }
+  .f-row.dim .f-t { color: var(--text-faint); font-weight: 400; }
+  .f-time { flex-shrink: 0; font-family: var(--mono); font-size: 10px; color: var(--text-faint); }
+  .f-t { color: var(--text-dim); font-weight: 600; flex-shrink: 0; }
+  .f-d { color: var(--text-faint); font-family: var(--mono); font-size: 10.5px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .f-d.ok { color: var(--green); }
+  .f-d.err { color: var(--red); white-space: normal; }
+  .f-row.current::before { background: var(--accent); }
+  .f-row.current .f-t { color: var(--accent); }
+  .f-more { color: var(--text-faint); font-size: 10.5px; padding: 5px 0 0 10px; }
+
+  /* ── 方案 C：仪表盘 ───────────────────────── */
+  .big-card {
+    border: 1px solid var(--accent); background: var(--accent-soft); border-radius: 12px;
+    padding: 14px; display: flex; flex-direction: column; gap: 7px;
+  }
+  .big-card.done { border-color: var(--green); background: rgba(78,169,106,.1); }
+  .bc-main { display: flex; align-items: center; gap: 9px; font-size: 15px; font-weight: 600; color: var(--text-bright); }
+  .bc-main .t-ico svg { width: 15px; height: 15px; }
+  .bc-sub { font-size: 11.5px; color: var(--text-dim); }
+  .bc-sub .mono { font-family: var(--mono); }
+  .hist { display: flex; flex-direction: column; gap: 4px; }
+  .h-item {
+    display: flex; align-items: center; gap: 7px; padding: 6px 9px; font-size: 11.5px;
+    border: 1px solid var(--border); border-radius: 8px; color: var(--text-dim); cursor: pointer;
+  }
+  .h-item:hover { border-color: var(--text-faint); }
+  .h-item .rt { font-weight: 600; color: var(--text); }
+  .h-item .rmeta { color: var(--text-faint); font-family: var(--mono); font-size: 10.5px; margin-left: auto; }
+  .h-item .failchip { font-size: 10px; color: var(--red); border: 1px solid var(--red); border-radius: 99px; padding: 0 6px; }
+  .h-item .caret { transition: transform .15s; }
+  .h-item.open .caret { transform: rotate(90deg); }
+  .h-body { display: none; flex-direction: column; gap: 2px; padding: 3px 9px 8px 26px; margin-top: -2px; }
+  .h-item.open + .h-body { display: flex; }
+
+  /* ── 结论卡（三方案共用） ───────────────────── */
+  .result-card { border: 1px solid var(--border); border-radius: 10px; background: var(--bg2); overflow: hidden; }
+  .rc-head { display: flex; align-items: center; padding: 7px 10px; font-size: 11.5px; font-weight: 600; color: var(--text-dim); border-bottom: 1px solid var(--border); }
+  .rc-head.err-head { color: var(--red); }
+  .rc-copy {
+    margin-left: auto; border: 1px solid var(--border); background: var(--bg1); color: var(--text-faint);
+    font-size: 10.5px; font-family: inherit; border-radius: 6px; padding: 2px 9px; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 4px;
+  }
+  .rc-copy:hover { color: var(--text); border-color: var(--text-faint); }
+  .rc-body {
+    padding: 9px 11px; font-size: 11.5px; line-height: 1.75; color: var(--text-dim);
+    max-height: 110px; overflow-y: auto; white-space: pre-wrap; word-break: break-word;
+  }
+  .rc-body.err { color: var(--red); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute">
+  <defs>
+    <symbol id="i-file" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/>
+    </symbol>
+    <symbol id="i-search" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round">
+      <circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>
+    </symbol>
+    <symbol id="i-edit" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/>
+    </symbol>
+    <symbol id="i-term" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="2" y="4" width="20" height="16" rx="2"/><path d="m6 9 3.5 3L6 15"/><path d="M12 15h5"/>
+    </symbol>
+    <symbol id="i-spin" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round">
+      <path d="M12 3a9 9 0 1 0 9 9"/>
+    </symbol>
+    <symbol id="i-copy" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/>
+    </symbol>
+    <symbol id="i-check" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
+      <path d="m4.5 12.5 5 5 10-11"/>
+    </symbol>
+  </defs>
+</svg>
+
+<div class="page-head">
+  <h1>子代理面板改版 · 三个方案对比</h1>
+  <div class="sub">
+    按 GUI 右面板真实宽度（330px）与应用主题绘制。三个方案共用水印 improved 的任务头卡与结论卡，差异在中间「执行过程」的组织方式。<br>
+    可以直接点面板选中；方案 A / C 里的轮次可点击折叠，失败的工具行可点击展开错误。也可以在右上角切换「运行中 / 已完成」两种场景。
+  </div>
+  <div class="scene-switch" id="sceneSwitch">
+    <button data-scene="running" class="active">运行中</button>
+    <button data-scene="done">已完成</button>
+  </div>
+</div>
+
+<div class="pick-banner" id="pickBanner"></div>
+
+<div class="stage" id="stage" data-scene="running">
+
+  <!-- ═══════════ 方案 A ═══════════ -->
+  <section class="col">
+    <div class="col-head">
+      <div class="t">方案 A · 回合分组时间线<span class="rec">推荐</span></div>
+      <div class="d">流水账解析成「轮次组」：工具开始/结束配对成一行，模板行（调用模型/思考中）折进组头。</div>
+    </div>
+    <div class="phone" data-plan="A">
+      <div class="ptabs"><span>文件</span><span>Git</span><span class="on">子代理</span><span>任务</span></div>
+
+      <!-- 场景：运行中 -->
+      <div class="pane scene-running">
+        <div class="head-card">
+          <div class="hc-row1">
+            <span class="dot run"></span><span class="st-chip">运行中</span>
+            <span class="badge">general-purpose</span><span class="badge">后台</span>
+          </div>
+          <div class="hc-title">重构右面板子代理详情的显示布局</div>
+          <div class="hc-stats">
+            <span>已用 <span class="num">2m18s</span></span>
+            <span><span class="num">14:03:21</span> 开始</span>
+            <span>轮次 <span class="num">3</span></span>
+            <span>工具 <span class="num">4</span> 成功 · <span class="num bad">1</span> 失败</span>
+          </div>
+        </div>
+
+        <div class="sec-t">执行过程</div>
+        <div class="rounds">
+          <div class="round collapsed">
+            <div class="round-head" data-toggle>
+              <span class="caret">▼</span><span class="rt">第 1 轮</span>
+              <span class="rmeta">14:03:21 · 3 个工具 · 8.2s</span>
+            </div>
+            <div class="round-body">
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">RightPanel.vue</span><span class="t-dur">0.4s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-search"/></svg></span><span class="t-name">grep</span><span class="t-arg">"rpane"</span><span class="t-dur">1.2s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">style.css</span><span class="t-dur">0.8s</span></div>
+            </div>
+          </div>
+
+          <div class="round">
+            <div class="round-head" data-toggle>
+              <span class="caret">▼</span><span class="rt">第 2 轮</span>
+              <span class="rmeta">14:03:35 · 3 个工具</span>
+              <span class="live">进行中</span>
+            </div>
+            <div class="round-body">
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-edit"/></svg></span><span class="t-name">edit_file</span><span class="t-arg">SubagentPane.vue</span><span class="t-dur">0.2s</span></div>
+              <div class="tool-row err" data-toggle><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm run lint</span><span class="t-dur">✗ 3.1s</span></div>
+              <div class="err-body">✗ 2 errors —  src/SubagentPane.vue:  87:7  error  'stages' is defined but never used  no-unused-vars</div>
+              <div class="tool-row running"><span class="t-ico"><svg class="spin"><use href="#i-spin"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm test</span><span class="t-dur"><svg class="spin" width="10" height="10"><use href="#i-spin"/></svg> 运行 12s</span></div>
+            </div>
+          </div>
+
+          <div class="round current">
+            <div class="round-head">
+              <span class="caret">▼</span><span class="rt">第 3 轮</span>
+              <span class="rmeta">14:04:10</span>
+              <span class="live">思考中…</span>
+            </div>
+            <div class="round-body"></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 场景：已完成 -->
+      <div class="pane scene-done">
+        <div class="head-card">
+          <div class="hc-row1">
+            <span class="dot ok"></span><span class="st-chip ok">已完成</span>
+            <span class="badge">general-purpose</span><span class="badge">后台</span>
+          </div>
+          <div class="hc-title">重构右面板子代理详情的显示布局</div>
+          <div class="hc-stats">
+            <span>已用 <span class="num">3m42s</span></span>
+            <span><span class="num">14:03:21</span> → <span class="num">14:07:03</span></span>
+            <span>轮次 <span class="num">4</span></span>
+            <span>工具 <span class="num">11</span> 成功 · <span class="num">0</span> 失败</span>
+          </div>
+        </div>
+
+        <div class="sec-t">执行过程</div>
+        <div class="rounds">
+          <div class="round collapsed">
+            <div class="round-head" data-toggle><span class="caret">▼</span><span class="rt">第 1 轮</span><span class="rmeta">14:03:21 · 3 个工具 · 8.2s</span></div>
+            <div class="round-body">
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">RightPanel.vue</span><span class="t-dur">0.4s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-search"/></svg></span><span class="t-name">grep</span><span class="t-arg">"rpane"</span><span class="t-dur">1.2s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">style.css</span><span class="t-dur">0.8s</span></div>
+            </div>
+          </div>
+          <div class="round collapsed">
+            <div class="round-head" data-toggle><span class="caret">▼</span><span class="rt">第 2 轮</span><span class="rmeta">14:03:35 · 3 个工具 · 15.5s</span></div>
+            <div class="round-body">
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-edit"/></svg></span><span class="t-name">edit_file</span><span class="t-arg">SubagentPane.vue</span><span class="t-dur">0.2s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm run lint</span><span class="t-dur">3.1s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm test</span><span class="t-dur">12.2s</span></div>
+            </div>
+          </div>
+          <div class="round collapsed">
+            <div class="round-head" data-toggle><span class="caret">▼</span><span class="rt">第 3 轮</span><span class="rmeta">14:04:10 · 4 个工具 · 41s</span></div>
+            <div class="round-body">
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">SubagentPane.vue</span><span class="t-dur">0.3s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-search"/></svg></span><span class="t-name">grep</span><span class="t-arg">"suba-step"</span><span class="t-dur">0.9s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-edit"/></svg></span><span class="t-name">edit_file</span><span class="t-arg">toolTrace.ts</span><span class="t-dur">0.4s</span></div>
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm run lint</span><span class="t-dur">2.8s</span></div>
+            </div>
+          </div>
+          <div class="round">
+            <div class="round-head" data-toggle><span class="caret">▼</span><span class="rt">第 4 轮</span><span class="rmeta">14:05:02 · 1 个工具 · 22s</span></div>
+            <div class="round-body">
+              <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm run test -- subagent</span><span class="t-dur">21.4s</span></div>
+            </div>
+          </div>
+        </div>
+
+        <div class="sec-t">结论</div>
+        <div class="result-card">
+          <div class="rc-head">执行结论
+            <button class="rc-copy"><svg width="11" height="11"><use href="#i-copy"/></svg>复制</button>
+          </div>
+          <div class="rc-body">重构完成。SubagentPane 已改为按轮次分组的时间线：工具开始/结束配对合并、模板阶段折叠进组头，新增工具成败统计、失败行展开与自动吸底滚动。共改动 2 个文件，新增 6 个测试用例全部通过。</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-foot">
+      · 一眼看清「干到哪一步、卡在哪一步」，历史折叠后一屏容纳全部轮次<br>
+      · 失败行展开看错误详情，不用挤在一行里<br>
+      · 执行中自动吸底跟随最新轮次，上翻即停
+    </div>
+  </section>
+
+  <!-- ═══════════ 方案 B ═══════════ -->
+  <section class="col">
+    <div class="col-head">
+      <div class="t">方案 B · 扁平轻整理</div>
+      <div class="d">保持时间顺序原貌：模板行弱化成小字灰行、当前行左侧色条标记，不引入分组结构。</div>
+    </div>
+    <div class="phone" data-plan="B">
+      <div class="ptabs"><span>文件</span><span>Git</span><span class="on">子代理</span><span>任务</span></div>
+
+      <div class="pane scene-running">
+        <div class="head-card">
+          <div class="hc-row1">
+            <span class="dot run"></span><span class="st-chip">运行中</span>
+            <span class="badge">general-purpose</span><span class="badge">后台</span>
+          </div>
+          <div class="hc-title">重构右面板子代理详情的显示布局</div>
+          <div class="hc-stats">
+            <span>已用 <span class="num">2m18s</span></span>
+            <span><span class="num">14:03:21</span> 开始</span>
+            <span>轮次 <span class="num">3</span></span>
+            <span>工具 <span class="num">4</span> 成功 · <span class="num bad">1</span> 失败</span>
+          </div>
+        </div>
+
+        <div class="sec-t">执行过程</div>
+        <div class="flat">
+          <div class="f-row"><span class="f-time">14:03:21</span><span class="f-t">开始执行</span></div>
+          <div class="f-row dim"><span class="f-time">14:03:24</span><span class="f-t">思考中</span></div>
+          <div class="f-row"><span class="f-time">14:03:31</span><span class="f-t">read_file</span><span class="f-d ok">✓ 0.4s</span></div>
+          <div class="f-row"><span class="f-time">14:03:33</span><span class="f-t">grep</span><span class="f-d ok">✓ 1.2s</span></div>
+          <div class="f-row"><span class="f-time">14:03:35</span><span class="f-t">read_file</span><span class="f-d ok">✓ 0.8s</span></div>
+          <div class="f-row dim"><span class="f-time">14:03:36</span><span class="f-t">生成回复</span></div>
+          <div class="f-row dim"><span class="f-time">14:03:38</span><span class="f-t">思考中</span></div>
+          <div class="f-row"><span class="f-time">14:03:44</span><span class="f-t">edit_file</span><span class="f-d ok">✓ 0.2s</span></div>
+          <div class="f-row"><span class="f-time">14:03:51</span><span class="f-t">bash</span><span class="f-d err">✗ npm run lint · 2 errors（摘要直接断行）</span></div>
+          <div class="f-row"><span class="f-time">14:03:58</span><span class="f-t">bash</span><span class="f-d">npm test ⏳ 运行 12s</span></div>
+          <div class="f-row dim current"><span class="f-time">14:04:10</span><span class="f-t">思考中</span></div>
+        </div>
+      </div>
+
+      <div class="pane scene-done">
+        <div class="head-card">
+          <div class="hc-row1">
+            <span class="dot ok"></span><span class="st-chip ok">已完成</span>
+            <span class="badge">general-purpose</span><span class="badge">后台</span>
+          </div>
+          <div class="hc-title">重构右面板子代理详情的显示布局</div>
+          <div class="hc-stats">
+            <span>已用 <span class="num">3m42s</span></span>
+            <span><span class="num">14:03:21</span> → <span class="num">14:07:03</span></span>
+            <span>轮次 <span class="num">4</span></span>
+            <span>工具 <span class="num">11</span> 成功 · <span class="num">0</span> 失败</span>
+          </div>
+        </div>
+
+        <div class="sec-t">执行过程</div>
+        <div class="flat">
+          <div class="f-row"><span class="f-time">14:03:21</span><span class="f-t">开始执行</span></div>
+          <div class="f-row"><span class="f-time">14:03:31</span><span class="f-t">read_file</span><span class="f-d ok">✓ 0.4s</span></div>
+          <div class="f-row"><span class="f-time">14:03:33</span><span class="f-t">grep</span><span class="f-d ok">✓ 1.2s</span></div>
+          <div class="f-row"><span class="f-time">14:03:44</span><span class="f-t">edit_file</span><span class="f-d ok">✓ 0.2s</span></div>
+          <div class="f-row"><span class="f-time">14:03:51</span><span class="f-t">bash</span><span class="f-d ok">✓ 3.1s</span></div>
+          <div class="f-row"><span class="f-time">14:03:58</span><span class="f-t">bash</span><span class="f-d ok">✓ 12.2s</span></div>
+          <div class="f-row"><span class="f-time">14:04:30</span><span class="f-t">read_file</span><span class="f-d ok">✓ 0.5s</span></div>
+          <div class="f-row"><span class="f-time">14:05:02</span><span class="f-t">bash</span><span class="f-d ok">✓ 21.4s</span></div>
+          <div class="f-more">… 中间已省略 5 行</div>
+        </div>
+
+        <div class="sec-t">结论</div>
+        <div class="result-card">
+          <div class="rc-head">执行结论
+            <button class="rc-copy"><svg width="11" height="11"><use href="#i-copy"/></svg>复制</button>
+          </div>
+          <div class="rc-body">重构完成。SubagentPane 已改为按轮次分组的时间线：工具开始/结束配对合并、模板阶段折叠进组头，新增工具成败统计、失败行展开与自动吸底滚动。共改动 2 个文件，新增 6 个测试用例全部通过。</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-foot">
+      · 改动最小，保留完整时间顺序，适合逐行回看<br>
+      · 任务一长仍是长列表，轮次边界要靠时间戳自己辨认<br>
+      · 失败摘要只能截断塞在行内或断行
+    </div>
+  </section>
+
+  <!-- ═══════════ 方案 C ═══════════ -->
+  <section class="col">
+    <div class="col-head">
+      <div class="t">方案 C · 仪表盘式</div>
+      <div class="d">顶部大卡聚焦「此刻在干嘛」，历史全部折叠成摘要行，看细节需点开。</div>
+    </div>
+    <div class="phone" data-plan="C">
+      <div class="ptabs"><span>文件</span><span>Git</span><span class="on">子代理</span><span>任务</span></div>
+
+      <div class="pane scene-running">
+        <div class="head-card">
+          <div class="hc-row1">
+            <span class="dot run"></span><span class="st-chip">运行中</span>
+            <span class="badge">general-purpose</span><span class="badge">后台</span>
+          </div>
+          <div class="hc-title">重构右面板子代理详情的显示布局</div>
+          <div class="hc-stats">
+            <span>已用 <span class="num">2m18s</span></span>
+            <span><span class="num">14:03:21</span> 开始</span>
+            <span>工具 <span class="num">4</span> 成功 · <span class="num bad">1</span> 失败</span>
+          </div>
+        </div>
+
+        <div class="big-card">
+          <div class="bc-main"><span class="t-ico" style="color:var(--orange)"><svg class="spin"><use href="#i-spin"/></svg></span>bash npm test · 运行 12s</div>
+          <div class="bc-sub">第 2 轮 · 已用 <span class="mono">2m18s</span></div>
+          <div class="bc-sub">上一步：<span class="mono" style="color:var(--red)">bash npm run lint ✗ 3.1s</span></div>
+        </div>
+
+        <div class="sec-t">历史轮次</div>
+        <div class="hist">
+          <div class="h-item" data-toggle><span class="caret">▸</span><span class="rt">第 1 轮</span><span class="rmeta">3 个工具 · 8.2s</span></div>
+          <div class="h-body">
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">RightPanel.vue</span><span class="t-dur">0.4s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-search"/></svg></span><span class="t-name">grep</span><span class="t-arg">"rpane"</span><span class="t-dur">1.2s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">style.css</span><span class="t-dur">0.8s</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="pane scene-done">
+        <div class="head-card">
+          <div class="hc-row1">
+            <span class="dot ok"></span><span class="st-chip ok">已完成</span>
+            <span class="badge">general-purpose</span><span class="badge">后台</span>
+          </div>
+          <div class="hc-title">重构右面板子代理详情的显示布局</div>
+          <div class="hc-stats">
+            <span>已用 <span class="num">3m42s</span></span>
+            <span><span class="num">14:03:21</span> → <span class="num">14:07:03</span></span>
+            <span>工具 <span class="num">11</span> 成功 · <span class="num">0</span> 失败</span>
+          </div>
+        </div>
+
+        <div class="big-card done">
+          <div class="bc-main"><span class="t-ico" style="color:var(--green)"><svg><use href="#i-check"/></svg></span>已完成 · 3m42s</div>
+          <div class="bc-sub">4 轮 · 11 个工具全部成功</div>
+        </div>
+
+        <div class="sec-t">历史轮次</div>
+        <div class="hist">
+          <div class="h-item" data-toggle><span class="caret">▸</span><span class="rt">第 4 轮</span><span class="rmeta">1 个工具 · 22s</span></div>
+          <div class="h-body">
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm run test -- subagent</span><span class="t-dur">21.4s</span></div>
+          </div>
+          <div class="h-item" data-toggle><span class="caret">▸</span><span class="rt">第 3 轮</span><span class="rmeta">4 个工具 · 41s</span></div>
+          <div class="h-body">
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">SubagentPane.vue</span><span class="t-dur">0.3s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-search"/></svg></span><span class="t-name">grep</span><span class="t-arg">"suba-step"</span><span class="t-dur">0.9s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-edit"/></svg></span><span class="t-name">edit_file</span><span class="t-arg">toolTrace.ts</span><span class="t-dur">0.4s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm run lint</span><span class="t-dur">2.8s</span></div>
+          </div>
+          <div class="h-item" data-toggle><span class="caret">▸</span><span class="rt">第 2 轮</span><span class="rmeta">3 个工具 · 15.5s</span></div>
+          <div class="h-body">
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-edit"/></svg></span><span class="t-name">edit_file</span><span class="t-arg">SubagentPane.vue</span><span class="t-dur">0.2s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm run lint</span><span class="t-dur">3.1s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-term"/></svg></span><span class="t-name">bash</span><span class="t-arg">npm test</span><span class="t-dur">12.2s</span></div>
+          </div>
+          <div class="h-item" data-toggle><span class="caret">▸</span><span class="rt">第 1 轮</span><span class="rmeta">3 个工具 · 8.2s</span></div>
+          <div class="h-body">
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">RightPanel.vue</span><span class="t-dur">0.4s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-search"/></svg></span><span class="t-name">grep</span><span class="t-arg">"rpane"</span><span class="t-dur">1.2s</span></div>
+            <div class="tool-row ok"><span class="t-ico"><svg><use href="#i-file"/></svg></span><span class="t-name">read_file</span><span class="t-arg">style.css</span><span class="t-dur">0.8s</span></div>
+          </div>
+        </div>
+
+        <div class="sec-t">结论</div>
+        <div class="result-card">
+          <div class="rc-head">执行结论
+            <button class="rc-copy"><svg width="11" height="11"><use href="#i-copy"/></svg>复制</button>
+          </div>
+          <div class="rc-body">重构完成。SubagentPane 已改为按轮次分组的时间线：工具开始/结束配对合并、模板阶段折叠进组头，新增工具成败统计、失败行展开与自动吸底滚动。共改动 2 个文件，新增 6 个测试用例全部通过。</div>
+        </div>
+      </div>
+    </div>
+    <div class="col-foot">
+      · 当前状态最醒目，瞥一眼就知道在干嘛<br>
+      · 看历史要多点一次，回看排查效率低<br>
+      · 大卡 + 头卡占掉约一半纵向空间，330px 下偏挤
+    </div>
+  </section>
+</div>
+
+<script>
+  // 场景切换
+  const stage = document.getElementById('stage');
+  document.getElementById('sceneSwitch').addEventListener('click', (e) => {
+    const btn = e.target.closest('button'); if (!btn) return;
+    stage.dataset.scene = btn.dataset.scene;
+    document.querySelectorAll('#sceneSwitch button').forEach(b => b.classList.toggle('active', b === btn));
+  });
+
+  // 轮次折叠 / 失败行展开 / 历史行展开
+  document.querySelectorAll('[data-toggle]').forEach(el => {
+    el.addEventListener('click', (e) => {
+      e.stopPropagation();
+      if (el.classList.contains('round-head')) {
+        el.closest('.round').classList.toggle('collapsed');
+      } else if (el.classList.contains('tool-row')) {
+        el.classList.toggle('open');
+      } else if (el.classList.contains('h-item')) {
+        el.classList.toggle('open');
+      }
+    });
+  });
+
+  // 选中方案
+  const banner = document.getElementById('pickBanner');
+  const names = { A: 'A · 回合分组时间线（推荐）', B: 'B · 扁平轻整理', C: 'C · 仪表盘式' };
+  document.querySelectorAll('.phone').forEach(p => {
+    p.addEventListener('click', () => {
+      document.querySelectorAll('.phone').forEach(x => x.classList.toggle('selected', x === p));
+      const plan = p.dataset.plan;
+      banner.style.display = 'block';
+      banner.innerHTML = '✓ 已选择 <b>方案 ' + names[plan] + '</b> —— 回到对话里告诉我「选 A/B/C」即可，我会按它落地实现。';
+    });
+  });
+</script>
+</body>
+</html>

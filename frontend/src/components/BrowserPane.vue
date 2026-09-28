@@ -315,7 +315,12 @@ const surface = useEmbeddedBrowserSurface({
   // 例外：星瑶自动化已下发视口时，起始页也要显示原生表面——自动化马上要经
   // CDP 导航，隐藏的 WebView2 截图会被节流/挂起（曾致首次 observe 超时、
   // backend 被判封闭报「无法打开浏览器」）；短暂可见的空白页是预期围观体验。
+  // 画笔截图冻结帧接管整块面板时最先让位：冻结帧在进入模式前已捕获表面
+  // 像素，原生控件若继续显示会盖住画笔覆盖层；门控放在 automationViewport
+  // 之前——星瑶自动化的「起始页保显」也不能越过这个模态，snip 关闭后
+  // 既有 watch 会自动 re-show 表面。
   shouldShowSurface: () =>
+    !store.rightPanelSnipActive &&
     !unsupported.value &&
     !sizeMenuOpen.value &&
     (!isStartPage.value || !!store.embeddedBrowser.automationViewport),

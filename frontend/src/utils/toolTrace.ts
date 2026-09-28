@@ -261,3 +261,100 @@ export function reduceExecutionState(
   if (event === 'turn_cancelled') return 'cancelled';
   return 'completed';
 }
+
+// ── 子代理执行过程扁平视图 ──────────────────────────────────────────────
+// 右面板"子代理"工作台用：后端 stages 是事件流水账（tool_started/tool_finished
+// 各记一条、模板阶段穿插），这里解析成保持时间顺序的展示行——工具开始/结束
+// 配对合并为一行，模板阶段原位保留由组件弱化渲染。
+
+export type SubagentToolStatus = 'running' | 'ok' | 'err';
+
+export interface SubagentFlatRow {
+  kind: 'stage' | 'tool';
+  /** stage 阶段名，或工具名 */
+  name: string;
+  /** 行起始时刻（epoch 秒）；工具行取开始时刻 */
+  at: number;
+  status?: SubagentToolStatus;
+  /** ✓ 后的耗时片段，如 "0.8s" / "420ms" */
+  durationText?: string;
+  /** ✗ 后的失败摘要 */
+  errorText?: string;
+}
+
+export interface SubagentFlatView {
+  rows: SubagentFlatRow[];
+  /** model 阶段出现次数 ≈ 模型轮次 */
+  rounds: number;
+  toolOk: number;
+  toolErr: number;
+}
+
+const SUBAGENT_TOOL_FINISH_RE = /^(.*?)\s*([✓✗])\s*([\s\S]*)$/;
+
+export function buildSubagentFlatView(stages: SubagentStage[]): SubagentFlatView {
+  const rows: SubagentFlatRow[] = [];
+  // 同名工具的未完成开始行（并行同名调用时后写覆盖，配对按 LIFO）
+  const pending = new Map<string, SubagentFlatRow>();
+  let rounds = 0;
+  let toolOk = 0;
+  let toolErr = 0;
+
+  const finishRow = (row: SubagentFlatRow, ok: boolean, tail: string) => {
+    row.status = ok ? 'ok' : 'err';
+    if (ok) row.durationText = tail || undefined;
+    else row.errorText = tail || undefined;
+    if (ok) toolOk += 1;
+    else toolErr += 1;
+  };
+
+  for (const stage of stages) {
+    if (stage.name !== 'tool') {
+      if (stage.name === 'model') rounds += 1;
+      rows.push({ kind: 'stage', name: stage.name, at: stage.at });
+      continue;
+    }
+    const detail = stage.detail ?? '';
+    const finish = detail.match(SUBAGENT_TOOL_FINISH_RE);
+    if (!finish || (!finish[1].trim() && !finish[3].trim())) {
+      // tool_started：detail 就是工具名
+      const row: SubagentFlatRow = {
+        kind: 'tool',
+        name: detail || 'tool',
+        at: stage.at,
+        status: 'running',
+      };
+      rows.push(row);
+      if (detail) pending.set(detail, row);
+      continue;
+    }
+    // tool_finished：detail 形如 "name ✓ 0.8s" / "name ✗ 失败摘要"
+    const toolName = finish[1].trim();
+    const ok = finish[2] === '✓';
+    const tail = finish[3].trim();
+    let row = toolName ? pending.get(toolName) : undefined;
+    if (!row) {
+      // 开始行可能已被后端 64 条上限淘汰：就近配对最后一个同名 running 行
+      for (let i = rows.length - 1; i >= 0; i -= 1) {
+        const candidate = rows[i]!;
+        if (
+          candidate.kind === 'tool' &&
+          candidate.status === 'running' &&
+          (!toolName || candidate.name === toolName)
+        ) {
+          row = candidate;
+          break;
+        }
+      }
+    }
+    if (row) {
+      pending.delete(row.name);
+      finishRow(row, ok, tail);
+    } else {
+      const orphan: SubagentFlatRow = { kind: 'tool', name: toolName || 'tool', at: stage.at };
+      finishRow(orphan, ok, tail);
+      rows.push(orphan);
+    }
+  }
+  return { rows, rounds, toolOk, toolErr };
+}

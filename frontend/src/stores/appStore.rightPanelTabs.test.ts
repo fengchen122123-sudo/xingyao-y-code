@@ -120,14 +120,26 @@ it('浏览器自动化事件缺 session_name 时归属当前会话（兼容旧�
   expect(store.rightPanelPicker).toBe(false);
 });
 
-it('openRightPanelTab 打开详情页签时缺省选中第一个任务', () => {
+it('openRightPanelTab 打开详情页签时缺省选中本会话第一个任务，不跨会话代选', () => {
   const store = useAppStore();
+  store.currentSessionName = 's1';
   store.backgroundTasks = [
-    { task_id: 't1', command: 'sleep 30', status: 'running' },
-    { task_id: 't2', command: 'sleep 60', status: 'running' },
+    { task_id: 't1', command: 'sleep 30', status: 'running', session_id: 's1' },
+    { task_id: 't2', command: 'sleep 60', status: 'running', session_id: 's1' },
+    { task_id: 't9', command: 'other session', status: 'running', session_id: 's2' },
   ];
   store.openRightPanelTab('tasks');
   expect(store.bgTaskDetailId).toBe('t1');
+
+  // 本会话没有后台任务时不代选其他会话的任务（与执行条的会话过滤口径一致）
+  const other = useAppStore();
+  other.currentSessionName = 's2';
+  other.backgroundTasks = [
+    { task_id: 't1', command: 'sleep 30', status: 'running', session_id: 's1' },
+  ];
+  other.bgTaskDetailId = '';
+  other.openRightPanelTab('tasks');
+  expect(other.bgTaskDetailId).toBe('');
 });
 
 it('切会话时丢弃失去 run 的残留操控页签（终态收场发生在其他会话上的场景）', async () => {
