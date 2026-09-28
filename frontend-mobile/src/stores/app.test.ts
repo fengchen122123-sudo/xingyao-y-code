@@ -1,5 +1,5 @@
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { useAppStore } from './app';
 
 function fresh() {
@@ -119,5 +119,67 @@ describe('mobile app store 事件语义', () => {
     store.applyEvent('skills_loaded', { skills: [{ name: 'tdd' }] });
     expect(store.fileTree[0].name).toBe('src');
     expect(store.skills[0].name).toBe('tdd');
+  });
+});
+
+describe('mobile app store 排队消息撤回', () => {
+  function mockApi(overrides: Record<string, any> = {}) {
+    const api = {
+      cancel_queued_message: vi.fn(async () => ({ ok: true, removed: 1 })),
+      get_files_info: vi.fn(async (paths: string[]) => paths.map((p) => ({ path: p, name: p.split('/').pop(), ok: true }))),
+      ...overrides,
+    };
+    (window as any).pywebview = { api };
+    return api;
+  }
+
+  function queuedStore() {
+    const store = fresh();
+    store.currentSession = 's1';
+    store.queues = {
+      s1: [
+        { id: 'q1', text: '第一条', attachments: [] },
+        { id: 'q2', text: '第二条', attachments: ['/tmp/a.png'] },
+      ],
+    };
+    return store;
+  }
+
+  it('takeQueued 移出队列并回填文本与附件名', async () => {
+    const api = mockApi();
+    const store = queuedStore();
+
+    const r = await store.takeQueued('q2');
+
+    expect(r).toEqual({ text: '第二条', attachments: [{ path: '/tmp/a.png', name: 'a.png' }] });
+    expect(store.currentQueue.map((m) => m.id)).toEqual(['q1']);
+    expect(api.cancel_queued_message).toHaveBeenCalledWith('s1', 'q2');
+  });
+
+  it('id 不在队列时返回 null 且不调用取消接口', async () => {
+    const api = mockApi();
+    const store = queuedStore();
+
+    expect(await store.takeQueued('missing')).toBeNull();
+    expect(api.cancel_queued_message).not.toHaveBeenCalled();
+    expect(store.currentQueue).toHaveLength(2);
+  });
+
+  it('取消失败时抛错且队列与草稿都不动（避免消息既在队列又在输入框）', async () => {
+    mockApi({ cancel_queued_message: vi.fn(async () => { throw new Error('连接中断'); }) });
+    const store = queuedStore();
+
+    await expect(store.takeQueued('q2')).rejects.toThrow('连接中断');
+    expect(store.currentQueue.map((m) => m.id)).toEqual(['q1', 'q2']);
+  });
+
+  it('附件名读取失败仍按路径兜底回填', async () => {
+    mockApi({ get_files_info: vi.fn(async () => { throw new Error('读不到'); }) });
+    const store = queuedStore();
+
+    const r = await store.takeQueued('q2');
+
+    expect(r?.attachments).toEqual([{ path: '/tmp/a.png', name: 'a.png' }]);
+    expect(store.currentQueue.map((m) => m.id)).toEqual(['q1']);
   });
 });
