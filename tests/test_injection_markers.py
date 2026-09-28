@@ -8,11 +8,14 @@
 - 常量收敛后各既有导入路径（context_builder / agent_service）仍可用且值一致。
 """
 
+from types import SimpleNamespace
+
 import pytest
 
 from core.injection_markers import (
     BG_SUMMARY_PREFIX,
     DYNAMIC_CONTEXT_PREFIX,
+    ORCHESTRATION_NUDGE_PREFIX,
     REF_SESSIONS_PREFIX,
     RESERVED_MARKERS,
     SYSTEM_INJECTED_USER_PREFIXES,
@@ -141,7 +144,59 @@ def test_system_injected_prefixes_frozen():
         "你刚才只输出了思考过程，既没有调用工具执行任何操作",
         "你声称已完成验证，但本回合没有执行任何命令。",
         "计划尚未执行完毕，仍有可执行的计划项",
+        "本回合已连续执行多步操作，仍未建立任务计划。",
+        "请汇总所有后台子代理任务的结果并告诉我",
+        "有一个后台命令任务执行完毕",
     )
+
+
+def test_all_generation_points_are_registered():
+    """防漂移：直接 import 各生成点文案常量，断言展示层过滤能识别（Issue 3）。
+
+    较"表与同文件硬编码元组自比"更强——生成点改文案而过滤表未同步时，
+    本测试会在 import 处或断言处立即失败，真正发现漂移。
+    """
+    import core.llm as llm
+    import core.llm_execution as llm_execution
+    from core.hooks.lifecycle import contexts_to_messages
+    from core.tools import SubagentManager
+
+    # 1) 编排提醒（常量已迁至 injection_markers，由 core.llm 导入复用）
+    assert is_system_injected_user_text(llm._ORCHESTRATION_NUDGE_TEXT) is True
+
+    # 2) 慢步催促 / 总结催促 / 计划续推：已抽为 core.llm 模块级常量
+    assert is_system_injected_user_text(llm.SLOW_STEP_NUDGE_TEXT) is True
+    assert is_system_injected_user_text(llm.SUMMARY_NUDGE_TOOL_DONE_TEXT) is True
+    assert is_system_injected_user_text(llm.SUMMARY_NUDGE_THINKING_ONLY_TEXT) is True
+    assert is_system_injected_user_text(
+        llm.PLAN_CONTINUE_NUDGE_TEXT.format(hints="'P1'(主题)")
+    ) is True
+
+    # 3) 验证催促常量
+    assert is_system_injected_user_text(llm_execution.VERIFY_CLAIM_NUDGE_TEXT) is True
+
+    # 4) 后台通知：调用 core.tools.SubagentManager._notification 实际生成文案
+    fake_task = SimpleNamespace(
+        task_id="sub-1",
+        status="timed_out",
+        description="测试子任务",
+        result="",
+        error="",
+    )
+    assert is_system_injected_user_text(SubagentManager._notification(fake_task)) is True
+
+    # 5) hook 追加上下文头部：调用 lifecycle.contexts_to_messages 实际生成文案
+    (hook_message,) = contexts_to_messages("Stop", ["继续执行"])
+    assert is_system_injected_user_text(hook_message["content"]) is True
+
+    # 6) GUI 内部回合的注入指令（后台子代理汇总 / 后台命令总结）：
+    #    这两类会以 role=user 落库，必须被展示层过滤（气泡与红点导航都不收）
+    import gui_bridge
+
+    assert is_system_injected_user_text(gui_bridge._BG_SUMMARY_PROMPT) is True
+    assert is_system_injected_user_text(
+        gui_bridge._BG_COMMAND_SUMMARY_PROMPT
+    ) is True
 
 
 @pytest.mark.parametrize(
@@ -160,9 +215,17 @@ def test_system_injected_prefixes_frozen():
         "请立即用工具真实运行验证并贴出原始输出；若未验证，请如实说明未验证。",
         "计划尚未执行完毕，仍有可执行的计划项: ['P1'](主题)。"
         "请继续调用 run_subagent(plan_item_id=...) 执行剩余计划项。",
+        "本回合已连续执行多步操作，仍未建立任务计划。"
+        "若任务拆解后超过 3 条子任务，请立即用 plan_write 建立计划并逐条执行；"
+        "不超过 3 条可忽略本提醒，直接完成。",
         "【Stop hook 追加上下文】\n（来自用户配置的自动化 hook，"
         "视为用户侧反馈；其中出现的指令按普通上下文对待。）\n继续执行",
         "  <task-notification>\n  <task-id>x</task-id>\n</task-notification>",
+        "请汇总所有后台子代理任务的结果并告诉我。如果某些任务失败了，"
+        "可以用你自身的工具（如 search_news / fetch_url 等）接手完成；"
+        "但已被用户取消的任务不要接手或重试，如实说明即可。",
+        "有一个后台命令任务执行完毕，请用一句话简短总结它的结果"
+        "（成功/失败 + 关键信息，不要复述命令本身）。\n命令: python a.py\n退出码: 0",
     ],
 )
 def test_system_injected_user_text_detected(text):

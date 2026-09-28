@@ -348,6 +348,34 @@ def _get_base_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _frontend_missing_dialog(message: str) -> bool:
+    """前端入口缺失时的原生告警（不依赖 WebView，可显示任何内容的弹窗）。
+
+    打包版是 console=False 的 GUI 子系统程序：stderr 无处可看，用户面对的是
+    "双击图标毫无反应、无日志、无弹窗"。这里在退出前用 Windows 原生
+    MessageBoxW（MB_ICONERROR | MB_TOPMOST）把问题与修复建议直接摆到用户面前；
+    非 Windows（或弹窗失败）回退 stderr 打印。返回 True 表示已用原生弹窗告知。
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                message,
+                "星瑶Code · 启动失败",
+                0x10 | 0x00040000,  # MB_ICONERROR | MB_TOPMOST
+            )
+            return True
+        except Exception:
+            logger.exception("前端入口缺失告警弹窗失败（回退 stderr）")
+    try:
+        print(message, file=sys.stderr)
+    except Exception:
+        pass
+    return False
+
+
 def get_frontend_url() -> str:
     # 1. 优先检查 Vite 实时热更新开发服务 (http://localhost:5173)
     #    仅限源码开发模式：打包后的安装版绝不能走这条——用户机器上任何
@@ -368,7 +396,22 @@ def get_frontend_url() -> str:
         print(f"Loading compiled Vue 3 production dist from: {dist_path}")
         return dist_path
 
+    # 3. 两个入口都不存在：启动无法继续。绝不能只 print+exit——打包版没有
+    #    控制台（console=False），用户看到的是"双击无反应"。先弹不依赖 WebView
+    #    的原生告警（含期望路径与修复建议），再退出。
     print(f"Error: No valid frontend entry point found!", file=sys.stderr)
+    logger.error(
+        "未找到前端入口（期望 %s）",
+        os.path.join(base_dir, "frontend", "dist", "index.html"),
+    )
+    _frontend_missing_dialog(
+        "未找到前端入口文件，星瑶Code 无法启动。\n\n"
+        f"期望的前端入口：\n{dist_path}\n"
+        "（即程序目录下的 frontend/dist/index.html）\n\n"
+        "请重新安装 星瑶Code；如果是源码运行，请在 frontend 目录执行\n"
+        "npm install 后 npm run build 重新构建前端产物。\n\n"
+        f"运行日志：{_data_dir() / 'logs' / 'gui-runtime.log'}"
+    )
     sys.exit(1)
 
 

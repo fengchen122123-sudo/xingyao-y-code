@@ -105,6 +105,10 @@ export const TERMINAL_PANEL_MAX_HEIGHT = 720;
 
 // 右面板页签 id：每种工作台同时最多一个实例；tasks/subagent 是详情查看页
 export type RightPanelTabId = 'files' | 'git' | 'browser' | 'tasks' | 'computer' | 'subagent';
+// 合法页签 id 白名单：恢复会话快照时据此过滤过期 id，避免 PANE_LABELS 取到 undefined
+const RIGHT_PANEL_TAB_IDS = new Set<RightPanelTabId>([
+  'files', 'git', 'browser', 'tasks', 'computer', 'subagent',
+]);
 
 function cloneGuiTheme(theme: GuiTheme): GuiTheme {
   // Pinia exposes state through Vue proxies, which structuredClone rejects.
@@ -1003,6 +1007,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
       runtime.rightPanelExpanded = !this.rightPanelCollapsed;
       // 后台任务详情查看对象随会话保存：切回时恢复该会话自己的查看对象
       runtime.bgTaskDetailId = this.bgTaskDetailId;
+      // 子代理详情查看对象同口径随会话保存：切会话不残留上一个会话的查看 id
+      runtime.subagentDetailId = this.subagentDetailId;
       }
     },
 
@@ -1069,7 +1075,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 回滚到旧快照会吃掉用户刚做的开合/页签变更
       if (!opts?.skipLayout) {
       const savedTabs = runtime.rightPanelTabs;
-      let tabs = savedTabs ? ([...savedTabs] as RightPanelTabId[]) : [];
+      // 按合法页签白名单过滤：旧快照里可能残留已删除的 id，直接 as 强转会让
+      // RightPanel 的 PANE_LABELS[tab] 取到 undefined（页签标题/图标变空白）
+      let tabs: RightPanelTabId[] = savedTabs
+        ? (savedTabs as string[]).filter(
+            (t: string): t is RightPanelTabId => RIGHT_PANEL_TAB_IDS.has(t as RightPanelTabId),
+          )
+        : [];
       // 操控页签依附于全局唯一的 run：终态自动收场可能发生在别的会话上
       // （closeRightPanelTab 只作用于当前页签集），run 已清场后残留的操控
       // 页签恢复出来只会是一片空白，恢复时一并丢弃
@@ -1090,6 +1102,13 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.rightPanelPicker = this.rightPanelTabs.length === 0;
       // 后台任务详情查看对象随会话恢复：切会话不残留上一个会话的任务详情
       this.bgTaskDetailId = runtime.bgTaskDetailId || '';
+      // 子代理详情查看对象同口径恢复：切会话不残留上一个会话的查看 id，
+      // 否则 SubagentPane 会用新会话名去查上一会话的任务 id，详情串场
+      this.subagentDetailId = runtime.subagentDetailId || '';
+      // 画笔截图模态（冻结帧覆盖层）是会话瞬态：切会话后置位残留会让新会话的
+      // 浏览器原生表面被持续压住、覆盖层显示上一会话的冻结帧，这里随会话强制退出
+      // （覆盖层的本地快照 ref 由 RightPanel 监听 currentSessionName 一并清除）
+      this.rightPanelSnipActive = false;
       }
     },
 
@@ -1312,6 +1331,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.rightPanelActiveTab = '';
         this.rightPanelPicker = true;
       }
+      // 关闭页签同步清理该页签的瞬态查看对象：否则重开瞬间会先渲染旧详情
+      // （tasks 残留 bgTaskDetailId、subagent 残留查看 id 与 SubagentPane 内部 detail）
+      if (tab === 'tasks') this.bgTaskDetailId = '';
+      if (tab === 'subagent') this.subagentDetailId = '';
     },
 
     // 页签条点击：切到已打开的页签
@@ -1343,6 +1366,27 @@ navItems: [] as Array<{ id: number; preview: string }>,
       runtime.rightPanelTabs = tabs;
       runtime.rightPanelActiveTab = 'browser';
       runtime.rightPanelExpanded = true;
+    },
+
+    // 把任意页签开进指定会话的右面板（会话归属）：当前会话直接开；其他会话只
+    // 写入其 runtime（含展开态），不抢当前界面——切回该会话时页签随之出现。
+    // 供「run 归属会话」的电脑操控页签等使用：run 在 A 会话启动、用户正看 B
+    // 会话时，操控页签应写进 A 的 runtime，不能把 B 的页签集写脏。
+    openRightPanelTabForSession(this: any, sessionName: string, tab: RightPanelTabId, opts?: { expand?: boolean }) {
+      if (!sessionName || sessionName === this.currentSessionName) {
+        this.openRightPanelTab(tab, opts);
+        return;
+      }
+      const runtime = this._getSessionRuntime(sessionName);
+      const tabs: RightPanelTabId[] = runtime.rightPanelTabs
+        ? (runtime.rightPanelTabs as string[]).filter(
+            (t: string): t is RightPanelTabId => RIGHT_PANEL_TAB_IDS.has(t as RightPanelTabId),
+          )
+        : [];
+      if (!tabs.includes(tab)) tabs.push(tab);
+      runtime.rightPanelTabs = tabs;
+      runtime.rightPanelActiveTab = tab;
+      if (opts?.expand !== false) runtime.rightPanelExpanded = true;
     },
 
     // 执行条“详情”：记录目标任务并打开后台任务页签（nonce 每次自增，
@@ -3496,7 +3540,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 避免旧构建哈希 chunk 404（mermaid 等懒加载失败）；
       // 不参与会话 runtime 归属，处理完直接返回
       if (type === 'frontend_dist_updated') {
-        requestFrontendReload('dist-updated');
+        // 把后端 fingerprint（mtime:size）纳入判断：与上次触发刷新的指纹相同
+        // 说明构建并未真正更替，自愈模块会拦下重复刷新（防同一指纹反复整页重载）
+        const fingerprint = typeof data.fingerprint === 'string' ? data.fingerprint : undefined;
+        requestFrontendReload('dist-updated', fingerprint);
         return;
       }
       // frameless 自绘标题栏关闭请求：弹现代确认框（替代 win32 原生 MessageBox），

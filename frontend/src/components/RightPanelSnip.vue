@@ -74,7 +74,7 @@
 </template>
 
 <script setup lang="ts">
-import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue';
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue';
 import AppIcon from './AppIcon.vue';
 import { useAppStore } from '../stores/appStore';
 import { useAttachments } from '../composables/useAttachments';
@@ -322,6 +322,14 @@ function onKeydown(e: KeyboardEvent): void {
 function onWindowResize(): void {
   emit('close');
 }
+
+// 拖拽右面板宽度手柄只改 store.rightPanelWidth，不会派发 window.resize：
+// 面板尺寸一变，冻结帧与覆盖层按 naturalWidth/rootW 的反算就错位、导出区域
+// 与所见不符——与窗口 resize 同策略，尺寸变化即退出（下次进入重拍冻结帧）
+watch(
+  () => [store.rightPanelWidth, store.rightPanelCollapsed],
+  () => { emit('close'); },
+);
 
 function setupCanvas(): void {
   const canvas = canvasRef.value;

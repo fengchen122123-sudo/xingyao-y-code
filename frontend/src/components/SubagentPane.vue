@@ -214,7 +214,8 @@ watch(
   () => [props.active, store.subagentDetailId] as const,
   ([active, id]) => {
     stopPolling();
-    if (id && detail.value && detail.value.id !== id) {
+    // 查看对象变化或被清空（关闭页签）时丢弃上次详情，避免重开瞬间显示旧详情
+    if (detail.value && (!id || detail.value.id !== id)) {
       detail.value = null;
       missingText.value = '正在读取子代理执行过程…';
     }
