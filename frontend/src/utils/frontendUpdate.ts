@@ -28,6 +28,10 @@
 
 /** 距上次自动刷新时间戳的 sessionStorage key（毫秒时间戳字符串） */
 export const FRONTEND_AUTO_RELOAD_TS_KEY = 'ycode:frontend-auto-reload-ts';
+/** 本次会话「连续自动刷新次数」的 sessionStorage key（整页刷新后仍在） */
+export const FRONTEND_AUTO_RELOAD_COUNT_KEY = 'ycode:frontend-auto-reload-count';
+/** 上次触发刷新的 dist 指纹的 sessionStorage key（与后端 frontend_dist_updated 对齐） */
+export const FRONTEND_AUTO_RELOAD_FP_KEY = 'ycode:frontend-auto-reload-fp';
 
 /** 距上次自动刷新至少 10 秒，防「刷新风暴」 */
 const MIN_AUTO_RELOAD_INTERVAL_MS = 10_000;
@@ -35,6 +39,8 @@ const MIN_AUTO_RELOAD_INTERVAL_MS = 10_000;
 const USER_ACTIVITY_GRACE_MS = 5_000;
 /** pending 期间复检定时器的间隔 */
 const PENDING_RETRY_INTERVAL_MS = 1_000;
+/** 本次会话连续自动刷新次数上限：触顶即停止自动刷新并告警（dist 持续损坏兜底） */
+const MAX_AUTO_RELOADS_PER_SESSION = 3;
 
 /** 存储抽象（生产注入 sessionStorage 的安全包装；测试可注入内存实现） */
 export interface FrontendUpdateStorage {
@@ -55,11 +61,16 @@ export interface ReloadSchedulerOptions {
   minIntervalMs?: number;
   activityGraceMs?: number;
   retryIntervalMs?: number;
+  /** 本次会话连续自动刷新次数上限（默认 3）：触顶停止自动刷新，避免无限重载 */
+  maxReloadsPerSession?: number;
+  /** 触顶回调（main.ts 注入：给出可关闭的告警提示）；默认 no-op */
+  onExhausted?: (count: number) => void;
 }
 
 export interface ReloadScheduler {
-  /** 标记 pending 并立即尝试刷新（条件不满足则留给定时器复检） */
-  request(reason: string): void;
+  /** 标记 pending 并立即尝试刷新（条件不满足则留给定时器复检）。
+   *  fingerprint 为触发源携带的 dist 指纹（preload-error 无指纹时省略）。 */
+  request(reason: string, fingerprint?: string): void;
   /** 单次复检：条件全部满足才执行刷新（测试可手动推进） */
   tick(): void;
   /** 记录一次用户活动（每次活动都顺延刷新宽限） */
@@ -81,16 +92,22 @@ export function createReloadScheduler(options: ReloadSchedulerOptions): ReloadSc
   const minIntervalMs = options.minIntervalMs ?? MIN_AUTO_RELOAD_INTERVAL_MS;
   const activityGraceMs = options.activityGraceMs ?? USER_ACTIVITY_GRACE_MS;
   const retryIntervalMs = options.retryIntervalMs ?? PENDING_RETRY_INTERVAL_MS;
+  const maxReloads = options.maxReloadsPerSession ?? MAX_AUTO_RELOADS_PER_SESSION;
+  const onExhausted = options.onExhausted ?? (() => { /* 默认无告警出口 */ });
 
   let pending = false;
   let pendingReason = '';
+  // 本次 pending 对应的 dist 指纹（preload-error 无指纹时为空）
+  let pendingFingerprint: string | undefined;
   let timer: ReturnType<typeof setInterval> | null = null;
+  // 触顶告警只发一次（同一次触顶反复触发 event 不刷屏）
+  let exhaustedNotified = false;
   // 创建即视为「刚有活动」（页面加载瞬间不抢刷）；此后随用户事件顺延
   let lastActivityAt = now();
 
-  const readLastReloadAt = (): number => {
+  const readStoredNumber = (key: string): number => {
     try {
-      const raw = storage.getItem(FRONTEND_AUTO_RELOAD_TS_KEY);
+      const raw = storage.getItem(key);
       if (raw === null) return 0;
       const value = Number(raw);
       return Number.isFinite(value) && value > 0 ? value : 0;
@@ -100,11 +117,34 @@ export function createReloadScheduler(options: ReloadSchedulerOptions): ReloadSc
     }
   };
 
-  const writeLastReloadAt = (value: number): void => {
+  const readStoredString = (key: string): string => {
     try {
-      storage.setItem(FRONTEND_AUTO_RELOAD_TS_KEY, String(value));
+      return storage.getItem(key) ?? '';
     } catch {
-      // 写不进去只意味着本次会话失去防风暴记忆，不影响本次刷新
+      return '';
+    }
+  };
+
+  const writeStored = (key: string, value: string): void => {
+    try {
+      storage.setItem(key, value);
+    } catch {
+      // 写不进去只意味着本次会话失去防风暴/指纹记忆，不影响本次刷新
+    }
+  };
+
+  const readLastReloadAt = (): number => readStoredNumber(FRONTEND_AUTO_RELOAD_TS_KEY);
+  const readReloadCount = (): number => readStoredNumber(FRONTEND_AUTO_RELOAD_COUNT_KEY);
+  // 本次会话连续自愈次数是否已触顶：触顶后不再刷新（避免 dist 持续损坏时无限重载）
+  const isExhausted = (): boolean => readReloadCount() >= maxReloads;
+
+  const notifyExhausted = (): void => {
+    if (exhaustedNotified) return;
+    exhaustedNotified = true;
+    try {
+      onExhausted(readReloadCount());
+    } catch {
+      // 告警出口异常不应影响调度器收尾
     }
   };
 
@@ -132,13 +172,37 @@ export function createReloadScheduler(options: ReloadSchedulerOptions): ReloadSc
     if (lastReloadAt > 0 && current - lastReloadAt < minIntervalMs) return;
     // 条件 c：距最后用户活动 >= 5 秒（界面空闲才刷新，避免打断输入/拖拽）
     if (current - lastActivityAt < activityGraceMs) return;
-    // 全部满足：先清 pending、停表、写时间戳，再执行刷新——
-    // 即使刷新过程中又触发一次 request，新页面也会被时间戳拦住
+    // 条件 d：指纹未变化——与上次触发刷新的 dist 指纹相同，说明构建并未真正
+    // 更替（同一事件被重复推送 / 页面刚刷新后又收到旧事件），不必再刷；
+    // 清 pending 收工，避免同一指纹反复整页重载
+    if (pendingFingerprint && pendingFingerprint === readStoredString(FRONTEND_AUTO_RELOAD_FP_KEY)) {
+      pending = false;
+      pendingReason = '';
+      pendingFingerprint = undefined;
+      stopTimer();
+      return;
+    }
+    // 条件 e：连续自愈次数触顶——dist 持续损坏（chunk 永久 404）时再刷也是
+    // 同样的坏页面，停止自动刷新并告警，杜绝「每 ≥10 秒整页重载一次」的死循环
+    if (isExhausted()) {
+      pending = false;
+      pendingReason = '';
+      pendingFingerprint = undefined;
+      stopTimer();
+      notifyExhausted();
+      return;
+    }
+    // 全部满足：先清 pending、停表、写时间戳/计数/指纹，再执行刷新——
+    // 即使刷新过程中又触发一次 request，新页面也会被这些记录拦住
     pending = false;
     const reason = pendingReason;
     pendingReason = '';
+    const fingerprint = pendingFingerprint;
+    pendingFingerprint = undefined;
     stopTimer();
-    writeLastReloadAt(current);
+    writeStored(FRONTEND_AUTO_RELOAD_TS_KEY, String(current));
+    writeStored(FRONTEND_AUTO_RELOAD_COUNT_KEY, String(readReloadCount() + 1));
+    if (fingerprint) writeStored(FRONTEND_AUTO_RELOAD_FP_KEY, fingerprint);
     console.info(`[前端自愈] 构建资源已更新（${reason || 'unknown'}），空闲窗口内自动刷新到最新版本`);
     reload();
   }
@@ -148,9 +212,18 @@ export function createReloadScheduler(options: ReloadSchedulerOptions): ReloadSc
     timer = setInterval(tick, retryIntervalMs);
   }
 
-  function request(reason: string): void {
+  function request(reason: string, fingerprint?: string): void {
+    // 已触顶：不再注册复检定时器、不再进入 pending——继续重载也只会是坏页面，
+    // 只补发一次告警（新 dist 事件到达也拦在这里，需用户手动刷新恢复）
+    if (isExhausted()) {
+      pendingFingerprint = fingerprint;
+      notifyExhausted();
+      return;
+    }
     pending = true;
     pendingReason = reason;
+    // 最新一次触发源的指纹生效（preload-error 无指纹会清空，避免误用旧指纹拦截）
+    pendingFingerprint = fingerprint;
     ensureTimer();
     // 立即尝试：多数场景触发时界面已空闲，无需等下一次复检
     tick();
@@ -163,8 +236,13 @@ export function createReloadScheduler(options: ReloadSchedulerOptions): ReloadSc
   function reset(): void {
     pending = false;
     pendingReason = '';
+    pendingFingerprint = undefined;
     stopTimer();
     lastActivityAt = now();
+    exhaustedNotified = false;
+    for (const key of [FRONTEND_AUTO_RELOAD_COUNT_KEY, FRONTEND_AUTO_RELOAD_FP_KEY]) {
+      try { storage.removeItem?.(key); } catch { /* 忽略 */ }
+    }
   }
 
   return { request, tick, notifyActivity, reset, isPending: () => pending };
@@ -175,6 +253,8 @@ export function createReloadScheduler(options: ReloadSchedulerOptions): ReloadSc
 // canReload 注入（main.ts 调用 registerFrontendUpdateHandlers 时传入）；
 // 默认 true——未注入时不拦截刷新。
 let canReloadImpl: () => boolean = () => true;
+// 触顶告警出口注入（main.ts 传入 store.notifyModal 等）；默认 no-op。
+let onExhaustedImpl: (count: number) => void = () => { /* 未注入时静默 */ };
 // window 监听只注册一次（幂等防重复注册）
 let handlersRegistered = false;
 
@@ -198,6 +278,7 @@ function defaultOptions(): ReloadSchedulerOptions {
     reload: () => location.reload(),
     now: () => Date.now(),
     canReload: () => canReloadImpl(),
+    onExhausted: (count) => onExhaustedImpl(count),
     storage: safeSessionStorage(),
     minIntervalMs: MIN_AUTO_RELOAD_INTERVAL_MS,
     activityGraceMs: USER_ACTIVITY_GRACE_MS,
@@ -225,8 +306,9 @@ function onUserActivity(): void {
  * 幂等：window 监听只注册一次，重复调用不会叠加监听器；canReload 注入以
  * 最后一次传入为准（生产只调用一次；测试需要反复注入不同闸门）。
  */
-export function registerFrontendUpdateHandlers(options: { canReload?: () => boolean } = {}): void {
+export function registerFrontendUpdateHandlers(options: { canReload?: () => boolean; onExhausted?: (count: number) => void } = {}): void {
   if (options.canReload) canReloadImpl = options.canReload;
+  if (options.onExhausted) onExhaustedImpl = options.onExhausted;
   if (handlersRegistered) return;
   handlersRegistered = true;
   // capture: true 保证子元素在冒泡阶段 stopPropagation 前也能观测到；
@@ -241,8 +323,15 @@ export function registerFrontendUpdateHandlers(options: { canReload?: () => bool
  * 由内部 1 秒定时器周期性复检，条件满足即刷新。可被重复调用（合并为同一
  * pending，最新 reason 生效）。
  */
-export function requestFrontendReload(reason: string): void {
-  scheduler.request(reason);
+export function requestFrontendReload(reason: string, fingerprint?: string): void {
+  scheduler.request(reason, fingerprint);
+}
+
+/**
+ * 测试专用：取当前单例调度器（常用于断言 isPending()，验证触顶后不再 pending）。
+ */
+export function __getFrontendUpdateSchedulerForTest(): ReloadScheduler {
+  return scheduler;
 }
 
 /**
@@ -254,9 +343,12 @@ export function __resetFrontendUpdateForTest(): void {
   scheduler.reset();
   singletonOptions = defaultOptions();
   scheduler = createReloadScheduler(singletonOptions);
-  // 时间戳可能落在默认真实 sessionStorage，也可能落在上一条用例注入的存储里
+  // 时间戳/连续刷新计数/指纹可能落在默认真实 sessionStorage，也可能落在
+  // 上一条用例注入的存储里
   for (const store of [previousStorage, singletonOptions.storage]) {
-    try { store.removeItem?.(FRONTEND_AUTO_RELOAD_TS_KEY); } catch { /* 忽略 */ }
+    for (const key of [FRONTEND_AUTO_RELOAD_TS_KEY, FRONTEND_AUTO_RELOAD_COUNT_KEY, FRONTEND_AUTO_RELOAD_FP_KEY]) {
+      try { store.removeItem?.(key); } catch { /* 忽略 */ }
+    }
   }
 }
 

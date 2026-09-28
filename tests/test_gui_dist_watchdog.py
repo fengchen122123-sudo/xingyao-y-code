@@ -11,6 +11,9 @@ dist 目录；真实采样路径与算法单独用 tmp_path 验证。
 """
 
 import threading
+from types import SimpleNamespace
+
+import pytest
 
 import gui_main
 
@@ -133,6 +136,67 @@ def test_fingerprint_none_when_dist_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(gui_main, "_get_base_dir", lambda: str(tmp_path))
 
     assert gui_main._frontend_dist_fingerprint() is None
+
+
+# ------------------------------------------- 前端入口缺失的原生告警（Critical）
+
+def test_missing_frontend_alerts_natively_before_exit(tmp_path, monkeypatch):
+    """找不到前端入口时：先弹不依赖 WebView 的原生提示，再 sys.exit(1)。
+
+    打包版是 console=False 的 GUI 子系统程序（无控制台、stderr 无处可看），
+    只 print+exit 会让用户看到"双击无反应"。
+    """
+    monkeypatch.setattr(gui_main, "_get_base_dir", lambda: str(tmp_path))
+    monkeypatch.setattr(gui_main, "is_port_open", lambda *args, **kwargs: False)
+    alerts = []
+    monkeypatch.setattr(
+        gui_main, "_frontend_missing_dialog", lambda message: alerts.append(message) or True
+    )
+
+    with pytest.raises(SystemExit) as excinfo:
+        gui_main.get_frontend_url()
+
+    assert excinfo.value.code == 1
+    assert len(alerts) == 1, "必须先弹出原生提示再退出"
+    message = alerts[0]
+    # 问题描述 + 期望的入口路径 + 重新安装/重构建议
+    assert "frontend" in message and "dist" in message and "index.html" in message
+    assert str(tmp_path) in message
+    assert "重新安装" in message and "重新构建" in message
+
+
+def test_frontend_missing_dialog_falls_back_to_stderr_on_non_windows(monkeypatch, capsys):
+    """非 Windows 无 MessageBoxW：回退 stderr 打印，返回值标记未用原生弹窗。"""
+    monkeypatch.setattr(gui_main.sys, "platform", "linux")
+
+    assert gui_main._frontend_missing_dialog("前端产物缺失：请重新构建") is False
+    assert "前端产物缺失：请重新构建" in capsys.readouterr().err
+
+
+def test_frontend_missing_dialog_uses_native_messagebox_on_windows(monkeypatch):
+    """Windows：走 user32.MessageBoxW（MB_ICONERROR | MB_TOPMOST），
+    不依赖 WebView，因此黑屏/白屏时依然可见。"""
+    import ctypes
+
+    calls = []
+    monkeypatch.setattr(gui_main.sys, "platform", "win32")
+    monkeypatch.setattr(
+        ctypes,
+        "windll",
+        SimpleNamespace(
+            user32=SimpleNamespace(MessageBoxW=lambda *args: calls.append(args) or 1)
+        ),
+        raising=False,
+    )
+
+    assert gui_main._frontend_missing_dialog("前端产物缺失") is True
+
+    assert len(calls) == 1
+    _hwnd, text, title, flags = calls[0]
+    assert text == "前端产物缺失"
+    assert "启动失败" in title
+    assert flags & 0x10  # MB_ICONERROR
+    assert flags & 0x00040000  # MB_TOPMOST：主窗口白屏时也不被遮挡
 
 
 def test_start_watchdog_wires_daemon_thread_event_and_stop_handle(monkeypatch):

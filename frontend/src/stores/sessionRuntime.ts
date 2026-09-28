@@ -48,6 +48,10 @@ export interface SessionRuntimeState {
   // 该会话最近查看的后台任务详情 id：随会话保存/恢复，切会话时任务详情
   // 不残留上一个会话的查看对象（与 rightPanelTabs 的会话隔离同口径）
   bgTaskDetailId?: string;
+  // 该会话最近查看的子代理详情任务 id：与 bgTaskDetailId 完全同口径随会话
+  // 保存/恢复——切会话不残留上一个会话的查看对象，否则 SubagentPane 会用
+  // 新会话名去查上一会话的任务 id，详情串场
+  subagentDetailId?: string;
 }
 
 export function createSessionRuntime(): SessionRuntimeState {

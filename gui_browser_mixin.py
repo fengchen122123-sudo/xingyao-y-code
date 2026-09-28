@@ -59,7 +59,32 @@ class BrowserBridgeMixin:
             self._embedded_browser = ctrl
         except Exception:
             pass
+        try:
+            # 释放路径挂接：ApiBridge.shutdown 只持有控制器引用直接调
+            # ctrl.shutdown()，控件 Dispose 后引用若留在实例上，后续
+            # set_bounds/get_state 会打到已销毁控件。把"清引用"绑到释放动作上，
+            # 释放后各桥方法与"从未打开"语义一致（实例级包装，不改 API 表面）。
+            release = ctrl.shutdown  # 先取原始绑定方法，避免包装后自递归
+            ctrl.shutdown = lambda: self._release_browser_controller(ctrl, release)
+        except Exception:
+            logger.debug("挂接内嵌浏览器释放钩子失败", exc_info=True)
         return ctrl
+
+    def _release_browser_controller(self, ctrl, shutdown) -> Dict[str, Any]:
+        """执行控制器释放并清掉桥层缓存引用（ctrl.shutdown 的包装实现）。
+
+        释放与异常语义保持不变（返回控制器原始的 {'ok': ...} 结构）；清引用后
+        browser_pane_set_bounds 返回 not_open、get_state 返回 state=None、
+        hide 返回 ok——与"未打开过"完全一致，不再触碰已 Dispose 的控件。
+        """
+        try:
+            return shutdown()
+        except Exception as exc:
+            logger.exception("释放内嵌浏览器控制器失败")
+            return {"ok": False, "error": str(exc)}
+        finally:
+            if getattr(self, "_embedded_browser", None) is ctrl:
+                self._embedded_browser = None
 
     @staticmethod
     def _valid_rect(rect: Any) -> bool:
