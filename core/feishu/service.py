@@ -177,15 +177,26 @@ class FeishuService:
 
         返回值会被传输层序列化后作为 ACK 回给飞书——卡片回调需要它，
         消息事件返回 None 即可。
+
+        入站路径必须有 INFO 日志：长连接"连上了但收不到消息"是最常见的现场问题，
+        没有日志就无法区分「飞书没推」与「我们丢掉了」。
         """
         try:
             event = json.loads(payload.decode("utf-8"))
         except Exception:
-            logger.warning("飞书事件解析失败（非 JSON）", exc_info=True)
+            logger.warning("飞书事件解析失败（非 JSON）: %s", payload[:200], exc_info=True)
             return None
 
-        event_id = str(((event or {}).get("header") or {}).get("event_id") or "")
-        event_type = str(((event or {}).get("header") or {}).get("event_type") or "")
+        header = (event or {}).get("header") or {}
+        event_id = str(header.get("event_id") or "")
+        event_type = str(header.get("event_type") or "")
+        if not event_type:
+            # 载荷形状与预期不符时把顶层键打出来，便于定位协议差异
+            logger.warning("飞书事件缺少 header.event_type，顶层键=%s",
+                           sorted((event or {}).keys()) if isinstance(event, dict) else type(event).__name__)
+            return None
+        logger.info("飞书事件到达: type=%s id=%s", event_type, event_id or "<空>")
+
         if not event_id:
             # 无 event_id 无法去重：宁可不处理，也不冒重复执行用户消息的风险
             logger.warning("飞书事件缺少 event_id，已忽略（event_type=%s）", event_type)
@@ -194,12 +205,13 @@ class FeishuService:
         dedup_key = f"{event_id}:{event_type}"
         if self._is_duplicate(dedup_key):
             self._duplicates += 1
-            logger.debug("飞书事件重复投递，已忽略: %s", dedup_key)
+            logger.info("飞书事件重复投递，已忽略: %s", dedup_key)
             return None
 
         self._received_events += 1
         bridge = self._bridge
         if bridge is None:
+            logger.warning("飞书事件到达但未注入 bridge，已忽略（event_type=%s）", event_type)
             return None
         try:
             return bridge.on_feishu_event(event)
