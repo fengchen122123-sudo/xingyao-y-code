@@ -3733,6 +3733,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 logger.debug("读取会话权限档位失败", exc_info=True)
         return getattr(self, "_current_permission_mode", "confirm") or "confirm"
 
+    def get_permission_mode(self, session_name: str = "") -> Dict[str, Any]:
+        """返回指定会话的**生效**权限档位（会话级优先，未绑定回退全局默认）。
+
+        只读接口：供飞书/手机端在切换档位前展示当前状态，不修改任何状态。
+        """
+        try:
+            target = str(session_name or "").strip() or self._current_session
+            return {"ok": True, "session_name": target,
+                    "permission_mode": self._effective_permission_mode(target)}
+        except Exception as e:
+            logger.exception("get_permission_mode 失败")
+            return {"ok": False, "msg": str(e)}
+
     def set_permission_mode(self, mode: str, session_name: str = "") -> Dict[str, Any]:
         try:
             # 规范化会把无法识别的值兜底成 confirm；这里要明确告诉前端"没识别出来"，
