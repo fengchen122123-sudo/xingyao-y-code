@@ -212,12 +212,13 @@ def build_default_registry() -> ToolRegistry:
             name="recall_history",
             description=(
                 "回溯当前会话更早被压缩归档的原始对话消息。before_msg_id 取自记忆摘要块"
-                "尾部[更早摘要回溯]索引中的 msg_id（或上一批回溯结果里最早一条的 msg_id），"
-                "返回该边界及其之前、摘要水位覆盖范围内的原始消息（时间正序，含角色）。"
+                "尾部[更早摘要回溯]索引中的 msg_id（或上一批回溯结果里最早一条的 msg_id 减 1，"
+                "避免重复返回该条），返回该边界及其之前（含边界自身）、摘要水位覆盖范围内的"
+                "原始消息（时间正序，含角色）。"
                 "仅用于恢复更早对话的细节；当前活跃上下文里已有的内容无需回溯。"
             ),
             input_schema=_schema({
-                "before_msg_id": {"type": "integer", "description": "读取此 msg_id 之前的已压缩消息", "minimum": 1},
+                "before_msg_id": {"type": "integer", "description": "读取该 msg_id 及其之前（含边界自身）的已压缩消息", "minimum": 1},
                 "limit": {"type": "integer", "default": 16, "minimum": 1, "maximum": 50, "description": "最多返回的消息条数"},
             }, ["before_msg_id"]),
             execute=tools.recall_history,

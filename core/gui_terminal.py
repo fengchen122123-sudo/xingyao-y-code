@@ -96,6 +96,9 @@ class PtyTerminalSession:
         # 全部实例属性先于线程启动初始化完毕（读线程/监视线程都依赖）
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._out_lock = threading.Lock()
+        # on_output 派发顺序锁：reader 与 ticker 可能并发冲刷，锁内取残留并回调，
+        # 保证两次 on_output 的调用次序与取出次序一致（前端拼接不会倒序）
+        self._emit_lock = threading.Lock()
         self._pending: list[str] = []
         self._pending_bytes = 0
         self._pending_ts: Optional[float] = None
@@ -103,6 +106,9 @@ class PtyTerminalSession:
         self._closed = False
         self._exit_code: Optional[int] = None
         self._exit_event = threading.Event()
+        # 读线程收尾完成标记：读线程不再产出新数据时 set()；
+        # _finish 与它汇合并把残留冲刷完，之后才派发退出事件
+        self._reader_done = threading.Event()
 
         self._proc = None  # pywinpty.PtyProcess（Windows）
         self._popen: Optional[subprocess.Popen] = None  # POSIX 路径使用
@@ -170,10 +176,25 @@ class PtyTerminalSession:
         os.close(slave)
         self._master_fd = master
         self._proc_pid = self._popen.pid
-        fcntl.ioctl(
-            master, termios.TIOCSWINSZ,
-            struct.pack("HHHH", self._rows, self._cols, 0, 0),
-        )
+        try:
+            fcntl.ioctl(
+                master, termios.TIOCSWINSZ,
+                struct.pack("HHHH", self._rows, self._cols, 0, 0),
+            )
+        except Exception as e:
+            # 初始尺寸设置失败：清理已建好的 master fd 与子进程，避免泄漏
+            # （此时三线程尚未启动，不会与收尾逻辑并发）
+            self._master_fd = None
+            try:
+                os.close(master)
+            except OSError:
+                pass
+            try:
+                if self._popen.poll() is None:
+                    self._popen.kill()
+            except Exception:
+                logger.debug("清理 POSIX 终端子进程失败（忽略）", exc_info=True)
+            raise PtyTerminalError(f"启动 shell 失败: {e}")
 
     # ------------------------------------------------------------------
     # 对外操作
@@ -183,25 +204,48 @@ class PtyTerminalSession:
         return self._proc_pid
 
     def is_alive(self) -> bool:
-        return not self._exit_event.is_set()
+        """会话是否仍可用：退出事件未置位，且子进程确实还活着。"""
+        if self._exit_event.is_set():
+            return False
+        # 兜底：monitor 卡在 _proc.wait() 时退出事件迟迟不置位，
+        # 这里直接探测进程存活状态，避免无限复用"假活"会话
+        try:
+            if os.name == "nt":
+                if self._proc is not None and not self._proc.isalive():
+                    return False
+            else:
+                if self._popen is not None and self._popen.poll() is not None:
+                    return False
+        except Exception:
+            logger.debug("终端存活探测失败，回退退出事件判定", exc_info=True)
+        return True
 
-    def write(self, data: str) -> None:
-        """写入用户输入（xterm.js 的 onData 原样字符串，UTF-8 语义）。"""
-        if self._closed or not data:
-            return
+    def write(self, data: str) -> bool:
+        """写入用户输入（xterm.js 的 onData 原样字符串，UTF-8 语义）。
+
+        返回 bool：成功 True；会话已关闭或写入异常 False——调用方据此
+        上报失败，避免 shell 已死时用户键入被静默丢弃。
+        """
+        if self._closed:
+            return False
+        if not data:
+            return True  # 空输入无需写入，不算失败
         try:
             if os.name == "nt":
                 self._proc.write(data)
             else:
                 os.write(self._master_fd, data.encode("utf-8"))
+            return True
         except Exception:
             logger.debug("终端输入写入失败（会话可能已退出）", exc_info=True)
+            return False
 
-    def resize(self, cols: int, rows: int) -> None:
+    def resize(self, cols: int, rows: int) -> bool:
+        """同步终端尺寸；返回 bool（成功 True，会话已关闭/设置失败 False）。"""
         cols, rows = clamp_terminal_size(cols, rows)
         self._cols, self._rows = cols, rows
         if self._closed:
-            return
+            return False
         try:
             if os.name == "nt":
                 self._proc.setwinsize(rows, cols)
@@ -215,8 +259,10 @@ class PtyTerminalSession:
                     termios.TIOCSWINSZ,
                     struct.pack("HHHH", rows, cols, 0, 0),
                 )
+            return True
         except Exception:
             logger.debug("终端 resize 失败（会话可能已退出）", exc_info=True)
+            return False
 
     def kill(self) -> None:
         """终止 shell 并释放资源（幂等，可从任意线程调用）。"""
@@ -272,12 +318,17 @@ class PtyTerminalSession:
         except Exception:
             logger.debug("终端读线程结束", exc_info=True)
         finally:
-            self._flush()
             try:
-                self._feed_text(self._decoder.decode(b"", final=True))
                 self._flush()
-            except Exception:
-                pass
+                try:
+                    self._feed_text(self._decoder.decode(b"", final=True))
+                    self._flush()
+                except Exception:
+                    pass
+            finally:
+                # 读线程到此不再产出新数据：先置位再等退出事件，
+                # _finish 汇合该标记并把残留冲刷完，才发 pty_exit
+                self._reader_done.set()
             # monitor 负责发退出事件；这里兜底等待，防止极端时序下先于退出码返回
             self._exit_event.wait(2.0)
 
@@ -320,23 +371,35 @@ class PtyTerminalSession:
             self._flush()
 
     def _flush(self) -> None:
-        with self._out_lock:
-            if not self._pending:
-                self._pending_ts = None
-                return
-            text = "".join(self._pending)
-            self._pending.clear()
-            self._pending_bytes = 0
-            self._pending_ts = None
         callback = self._on_output
-        if callback:
+        if callback is None:
+            with self._out_lock:
+                self._pending.clear()
+                self._pending_bytes = 0
+                self._pending_ts = None
+            return
+        # 顺序锁覆盖「取残留 + 派发」整段：reader 与 ticker 并发冲刷时，
+        # 两次 on_output 的调用次序与取出次序一致，前端不会倒序拼接
+        # （回调只做 emit_event，不会重入本会话，无死锁风险）
+        with self._emit_lock:
+            with self._out_lock:
+                if not self._pending:
+                    self._pending_ts = None
+                    return
+                text = "".join(self._pending)
+                self._pending.clear()
+                self._pending_bytes = 0
+                self._pending_ts = None
             try:
                 callback(text)
             except Exception:
                 logger.debug("终端输出回调异常", exc_info=True)
 
     def _finish(self) -> None:
-        """monitor 专属收尾：冲刷残留输出 → 发退出事件 → 标记死亡。"""
+        """monitor 专属收尾：等读线程汇合 → 冲刷残留输出 → 发退出事件。"""
+        # 有界等待读线程收尾：读线程可能仍阻塞在 PTY 读取上，
+        # 超时兜底继续收尾，避免退出事件被无限期拖延
+        self._reader_done.wait(1.0)
         self._flush()
         code = self._exit_code if self._exit_code is not None else 0
         self._exit_event.set()
