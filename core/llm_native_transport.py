@@ -1032,7 +1032,20 @@ def _anthropic_translate_messages(messages: Any) -> Tuple[Optional[Any], List[Di
             blocks = [{"type": "text", "text": ""}]
         if cache_ctrl:
             blocks[-1]["cache_control"] = cache_ctrl
-        out.append({"role": "user", "content": blocks})
+        # 相邻 user 消息并入前一条：OpenAI 序列 assistant(tool_calls) → tool(...)
+        # → user(编排提醒/follow-up 注入) 翻译后会出现 user(tool_result) 与
+        # user(text) 相邻，Anthropic 严格角色交替校验直接 400
+        # "roles must alternate"，故文本块追加进前一条 user 的块列表
+        # （tool_result 在前、文本在后）。
+        prev = out[-1] if out else None
+        if (
+            isinstance(prev, dict)
+            and prev.get("role") == "user"
+            and isinstance(prev.get("content"), list)
+        ):
+            prev["content"].extend(blocks)
+        else:
+            out.append({"role": "user", "content": blocks})
 
     system: Optional[Any] = None
     if system_blocks:
