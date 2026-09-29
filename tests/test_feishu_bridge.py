@@ -226,7 +226,7 @@ def test_completion_card_carries_reply_form(tmp_path):
     elements = api.cards[0]["card"]["body"]["elements"]
     form = next(e for e in elements if e.get("tag") == "form")
     assert form["elements"][0]["tag"] == "input"
-    assert form["elements"][0]["name"] == "reply"
+    assert form["elements"][0]["name"] == "reply_text"
     submit = form["elements"][1]
     assert submit["form_action_type"] == "submit"
     assert submit["name"] == "reply"
@@ -245,7 +245,7 @@ def test_card_reply_sends_turn_and_returns_raw_card(tmp_path):
     session = star.sent[0]["session_name"]
 
     response = br.on_feishu_event(
-        _card_action_event("reply", form_value={"reply": "继续深挖"}, via_form_submit=True)
+        _card_action_event("reply", form_value={"reply_text": "继续深挖"}, via_form_submit=True)
     )
 
     assert star.sent[-1]["text"] == "继续深挖"
@@ -261,7 +261,7 @@ def test_card_reply_via_value_payload_also_works(tmp_path):
     br, star, _ = _bridge(tmp_path)
     br.on_feishu_event(_message_event("第一轮"))
 
-    br.on_feishu_event(_card_action_event("reply", form_value={"reply": "按钮路径"}))
+    br.on_feishu_event(_card_action_event("reply", form_value={"reply_text": "按钮路径"}))
 
     assert star.sent[-1]["text"] == "按钮路径"
 

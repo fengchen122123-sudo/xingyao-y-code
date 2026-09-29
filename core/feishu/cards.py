@@ -152,9 +152,12 @@ def completion_card(session_label: str, content: str, workdir: str = "",
     if content:
         elements += [hr(), md(clip(content))]
     if with_reply:
-        # 卡上直接追问：表单提交后回调 action.form_value = {"reply": 文本}
+        # 卡上直接追问：表单提交后回调 action.form_value = {"reply_text": 文本}，
+        # 路由名（提交按钮的 name）是 "reply"。
+        # 红线：同一个 form 内各元素的 name 必须唯一——输入框与提交按钮若同名，
+        # 飞书整卡拒收（实测 230099 / 11310: name(reply) duplicate）。
         elements.append(form("reply_form", [
-            input_field("reply", "继续这个话题…"),
+            input_field("reply_text", "继续这个话题…"),
             submit_btn("发送", "reply"),
         ]))
     elements.append(note("星瑶 · 引用回复本卡亦可 · 直接在会话里发消息同样有效"))
