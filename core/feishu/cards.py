@@ -153,9 +153,13 @@ def build_result_card(title: str, lines: List[str]) -> Dict[str, Any]:
 # ---------------------------------------------------------------- 业务卡片
 
 def context_markdown(session_label: str, workdir: str = "") -> str:
+    """卡片上的「会话 / 工作目录」两行。
+
+    工作目录一律给出行：`GLOBAL`（自由对话）没有真实目录，显示成
+    「自由对话（未绑定目录）」而不是留空——留空会让人以为"没取到"。
+    """
     lines = [f"**会话**　{session_label}"]
-    if workdir:
-        lines.append(f"**工作目录**　{workdir}")
+    lines.append(f"**工作目录**　{workdir or '自由对话（未绑定目录）'}")
     return "\n".join(lines)
 
 
