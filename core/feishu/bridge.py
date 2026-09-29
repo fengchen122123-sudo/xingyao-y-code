@@ -199,25 +199,31 @@ class FeishuBridge:
         message = body.get("message") or {}
         chat_id = str(message.get("chat_id") or "")
         if not chat_id:
+            logger.warning("飞书消息事件缺少 chat_id，已忽略（event 顶层键=%s）", sorted(body.keys()))
             return
         open_id = str(((body.get("sender") or {}).get("sender_id") or {}).get("open_id") or "")
         self._store.set_last_chat(chat_id)
 
         text = extract_text(message)
         if text is None:
+            logger.info("飞书非文本消息（type=%s），已回复提示", message.get("message_type"))
             self._safe_send_text(chat_id, "目前只支持文本消息，图片/文件请先在星瑶桌面端发送。")
             return
         text = strip_mention(text)
         if not text:
+            logger.info("飞书消息去 @ 后为空，已忽略（chat=%s）", chat_id)
             return
+        logger.info("飞书消息: chat=%s open_id=%s 内容=%r", chat_id, open_id, text[:60])
         if text.startswith("/"):
             self._handle_command(text, chat_id, open_id)
             return
 
         session = self._ensure_session(chat_id, open_id)
         if not session:
+            logger.warning("飞书消息未能绑定星瑶会话（chat=%s），已回复失败提示", chat_id)
             self._safe_send_text(chat_id, "创建星瑶会话失败，请稍后重试。")
             return
+        logger.info("飞书消息转回合: session=%s", session)
 
         self._buffer_turn(session, chat_id, text)
         try:
@@ -559,6 +565,7 @@ class FeishuBridge:
         cmd, arg = parse_command(text)
         if not cmd:
             return
+        logger.info("飞书指令: %s %s（chat=%s）", cmd, arg, chat_id)
         try:
             card = self._build_command_card(cmd, arg, chat_id, open_id)
         except Exception:
@@ -766,6 +773,8 @@ class FeishuBridge:
     def _safe_send_card(self, chat_id: str, card: Dict[str, Any]) -> None:
         try:
             self._api_client().send_card(chat_id, card)
+            title = ((card or {}).get("header") or {}).get("title") or {}
+            logger.info("飞书卡片已发送: chat=%s 标题=%s", chat_id, title.get("content"))
         except Exception:
             logger.exception("发送飞书卡片失败（chat=%s）", chat_id)
 
@@ -832,5 +841,6 @@ class FeishuBridge:
     def _safe_send_text(self, chat_id: str, text: str) -> None:
         try:
             self._api_client().send_text(chat_id, text)
+            logger.info("飞书文本已发送: chat=%s 内容=%r", chat_id, (text or "")[:40])
         except Exception:
             logger.exception("发送飞书提示文本失败（chat=%s）", chat_id)
