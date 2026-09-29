@@ -31,9 +31,11 @@ from core.feishu.cards import (
 from core.feishu.commands import (
     HELP_TEXT,
     agent_card,
+    dir_picker_card,
     inbox_card,
     mode_card,
     model_list_card,
+    new_session_card,
     panel_card,
     parse_command,
     permission_mode_label,
@@ -680,14 +682,10 @@ class FeishuBridge:
             return agent_card(agent_name=self._agent_name(), model_name=self._active_model_name())
 
         if cmd == "/new":
-            title = arg or self._label_for(open_id)
-            result = self._bridge.create_session(title, None)
-            if not result or not result.get("ok"):
-                self._safe_send_text(chat_id, "新建会话失败，请稍后重试。")
-                return None
-            name = str(result.get("session_name") or "")
-            self._store.bind(chat_id, name, title)
-            return text_card("✅ 已新建并绑定", f"会话 **{title}**\n`{name}`", "green")
+            return self._command_new(chat_id, open_id, arg)
+
+        if cmd == "/newdir":
+            return self._command_newdir(chat_id, arg)
 
         if cmd == "/list":
             page = self._page_of(arg)
@@ -769,7 +767,59 @@ class FeishuBridge:
         return text_card("✅ 已切换模型",
                          f"**{target.get('name') or target.get('id')}**\n`{target.get('id')}`", "green")
 
-    # ---- 执行权限档位（会话级）----
+    # ---- 新建会话与工作目录 ----
+
+    def _command_new(self, chat_id: str, open_id: str, arg: str, workdir: str = "GLOBAL"):
+        """新建会话并绑定到本飞书会话。
+
+        默认 `workdir="GLOBAL"`（自由对话，不绑定目录）——与桌面端「新建对话」一致。
+        **不能传 None**：后端 `create_session(workdir=None)` 的默认是**进程当前目录**
+        （`os.getcwd()`），会把飞书新会话悄悄绑到星瑶进程所在目录（真机踩过）。
+        """
+        title = (arg or "").strip() or self._label_for(open_id) or "飞书 · 会话"
+        try:
+            result = self._bridge.create_session(title, workdir)
+        except Exception:
+            logger.exception("飞书新建会话失败")
+            self._safe_send_text(chat_id, "新建会话失败，请稍后重试。")
+            return None
+        if not result or not result.get("ok"):
+            self._safe_send_text(chat_id, f"新建会话失败：{(result or {}).get('msg') or '未知错误'}")
+            return None
+        name = str(result.get("session_name") or "")
+        self._store.bind(chat_id, name, title)
+        where = "" if str(workdir or "") in ("", "GLOBAL") else str(workdir)
+        logger.info("飞书新建会话: session=%s workdir=%s", name, where or "GLOBAL")
+        return new_session_card(title=title, name=name, workdir=where)
+
+    def _project_dirs(self) -> List[Dict[str, Any]]:
+        """已知项目目录（来自会话分组，自由对话组除外）。"""
+        try:
+            groups = self._bridge.get_sessions() or []
+        except Exception:
+            return []
+        out: List[Dict[str, Any]] = []
+        for group in groups:
+            if (group or {}).get("is_global"):
+                continue
+            path = str((group or {}).get("folder_path") or "")
+            if not path:
+                continue
+            out.append({
+                "path": path,
+                "name": str((group or {}).get("folder_name") or path),
+                "count": len((group or {}).get("sessions") or []),
+            })
+        return out
+
+    def _command_newdir(self, chat_id: str, arg: str):
+        """选项目目录建会话：不带参数给目录选择卡，带路径直接绑定创建。"""
+        path = str(arg or "").strip()
+        if not path or path.startswith("page:"):
+            return dir_picker_card(dirs=self._project_dirs(), page=self._page_of(path))
+        title = os.path.basename(path.rstrip("\\/")) or path
+        return self._command_new(chat_id, "", title, workdir=path)
+
 
     def _current_permission_mode(self, session: str) -> str:
         try:

@@ -11,6 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.feishu.cards import (
     TEMPLATE_BLUE,
+    TEMPLATE_GREEN,
+    TEMPLATE_ORANGE,
     btn,
     btn_flow,
     card2,
@@ -27,7 +29,8 @@ HELP_TEXT = """**星瑶 · 飞书指令**
 - `/whoami`　显示你的 open_id（填「审批白名单」要用它）
 - `/panel`　功能面板（按钮即指令）
 - `/status`　绑定与连接状态
-- `/new [标题]`　新建星瑶会话并绑定到本会话
+- `/new [标题]`　新建**自由对话**（不绑定目录）并绑定到本会话
+- `/newdir [标题]`　新建会话并**绑定一个项目目录**（列出已知目录供选）
 - `/list`　会话列表（可切换绑定）
 - `/switch <序号>`　按列表序号切换绑定
 - `/model [序号或名称]`　模型列表 / 直接切换
@@ -195,7 +198,11 @@ def status_card(*, session_label: str, session_name: str, workdir: str, model_na
 
 
 def session_list_card(*, sessions: List[Dict[str, Any]], current_session: str, page: int) -> Dict[str, Any]:
-    """会话列表卡：当前项打标 + 点按钮切换 + 无状态翻页。"""
+    """会话列表卡：当前项打标 + 点按钮切换 + 无状态翻页。
+
+    每项显示工作目录（与桌面侧栏一致）：自由对话显示「自由对话」，项目会话显示其目录。
+    排序沿用后端顺序——**分组内按创建时间倒序**（最新建的在前），不是按最近活跃时间。
+    """
     elements: List[Dict[str, Any]] = [
         btn_flow([btn("🆕 新建会话", "primary", {"kind": "cmd", "cmd": "/new"})]),
     ]
@@ -207,9 +214,11 @@ def session_list_card(*, sessions: List[Dict[str, Any]], current_session: str, p
         index = start + offset + 1
         name = str(item.get("name") or "")
         title = str(item.get("display_name") or name)
+        workdir = str(item.get("workdir") or "")
         is_current = name == current_session
         marker = "（当前）" if is_current else ""
-        elements.append(md(f"**{index}. {title}**{marker}\n`{name}`"))
+        where = "自由对话" if (not workdir or workdir == "GLOBAL") else workdir
+        elements.append(md(f"**{index}. {title}**{marker}\n{clip(where, 60)}　·　{clip(str(item.get('count') or 0), 12)} 条\n`{name}`"))
         if is_current:
             elements.append(btn_flow([btn("📍 当前会话", "default", {"kind": "cmd", "cmd": "/status"})]))
         else:
@@ -219,6 +228,39 @@ def session_list_card(*, sessions: List[Dict[str, Any]], current_session: str, p
     if pager:
         elements.append(pager)
     return card2("🖥 星瑶 会话", TEMPLATE_BLUE, elements)
+
+
+def new_session_card(*, title: str, name: str, workdir: str) -> Dict[str, Any]:
+    """新建会话回执：说明落在哪个目录，并给出「绑定项目目录」入口。"""
+    where = workdir or "自由对话（未绑定目录）"
+    elements = [
+        md(f"**会话**　{title}\n**工作目录**　{where}\n`{name}`"),
+        btn_flow([btn("📁 改为绑定项目目录", "default", {"kind": "cmd", "cmd": "/newdir"})]),
+        note("绑定目录后，星瑶在该会话里的文件操作以那个目录为工作区；自由对话不绑定任何目录。"),
+    ]
+    return card2("✅ 已新建并绑定", TEMPLATE_GREEN, elements)
+
+
+def dir_picker_card(*, dirs: List[Dict[str, Any]], page: int = 1) -> Dict[str, Any]:
+    """项目目录选择卡：列出已知项目目录，点按钮把新会话绑定到该目录。"""
+    if not dirs:
+        return card2("📁 选择项目目录", TEMPLATE_BLUE, [
+            md("还没有任何项目目录。先在桌面端用「新建会话 → 绑定项目」引入一个目录，或直接使用自由对话。"),
+            btn_flow([btn("🆕 新建自由对话", "primary", {"kind": "cmd", "cmd": "/new"})]),
+        ])
+    elements: List[Dict[str, Any]] = [
+        btn_flow([btn("🆕 自由对话（不绑定）", "primary", {"kind": "cmd", "cmd": "/new"})]),
+    ]
+    start = (page - 1) * PAGE_SIZE
+    for offset, item in enumerate(dirs[start:start + PAGE_SIZE]):
+        path = str(item.get("path") or "")
+        elements.append(md(f"**{start + offset + 1}. {item.get('name') or path}**\n{clip(path, 80)}"))
+        elements.append(btn_flow([btn("📁 绑定到此目录", "default",
+                                      {"kind": "cmd", "cmd": "/newdir", "arg": path})]))
+    pager = _pager("/newdir", page, len(dirs))
+    if pager:
+        elements.append(pager)
+    return card2("📁 选择项目目录", TEMPLATE_BLUE, elements)
 
 
 def model_list_card(*, models: List[Dict[str, Any]], active_model_id: str, page: int) -> Dict[str, Any]:
