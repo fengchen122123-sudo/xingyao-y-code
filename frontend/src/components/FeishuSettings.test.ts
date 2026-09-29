@@ -140,7 +140,7 @@ describe('FeishuSettings', () => {
       .toContain('输入 App Secret');
   });
 
-  it('界面内置完整配置说明（含发布应用与 /whoami 拿 open_id）', async () => {
+  it('界面内置完整配置说明（含发布应用、回调与 /whoami）', async () => {
     mockApi();
     const wrapper = mountPage();
     await flushPromises();
@@ -148,11 +148,14 @@ describe('FeishuSettings', () => {
     const guide = wrapper.find('[data-test="feishu-guide"]');
     expect(guide.exists()).toBe(true);
     const text = guide.text();
-    // 六步里的关键点必须都在，尤其"发布应用"这个最容易漏的步骤
+    // 六步里的关键点必须都在，尤其"发布应用"与"卡片回调"这两个最容易漏的步骤
     expect(text).toContain('创建企业自建应用');
     expect(text).toContain('im:message:send_as_bot');
     expect(text).toContain('使用长连接接收事件');
+    expect(text).toContain('im.message.receive_v1');
     expect(text).toContain('card.action.trigger');
+    expect(text).toContain('回调 / 卡片回调');
+    expect(text).toContain('卡片按钮点了没反应');
     expect(text).toContain('发布版本');
     expect(text).toContain('/whoami');
     // 排错指引
