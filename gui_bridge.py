@@ -4592,6 +4592,130 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 飞书通道设置
+    # ------------------------------------------------------------------
+
+    def get_feishu_settings(self) -> Dict[str, Any]:
+        """飞书集成设置快照。**不含 app_secret 明文**，只回 has_secret 布尔。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            cfg = load_feishu_config()
+            svc = getattr(self, "_feishu_service", None)
+            if svc is not None:
+                status = svc.status()
+            else:
+                from core.feishu.service import FeishuService
+
+                status = FeishuService().status()
+            return {
+                "ok": True,
+                "settings": {
+                    "enabled": cfg.enabled,
+                    "app_id": cfg.app_id,
+                    "has_secret": cfg.has_secret,
+                    "approvers": list(cfg.approvers),
+                    "notify_chat_id": cfg.notify_chat_id,
+                    "status": status,
+                },
+            }
+        except Exception as e:
+            logger.exception("get_feishu_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_feishu_secret(self) -> Dict[str, Any]:
+        """按需返回 app_secret 明文（仅设置页用户主动点「显示」时调用）。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            return {"ok": True, "app_secret": load_feishu_config().app_secret}
+        except Exception as e:
+            logger.exception("get_feishu_secret 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_feishu_settings(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """保存飞书设置；app_secret 写盘前加密（dpapi:/keyring:）。
+
+        payload.app_secret 省略或为空字符串表示「不修改已有密钥」——避免设置页
+        因掩码回显把密钥写坏。
+        """
+        payload = dict(payload or {})
+        try:
+            from core.credentials import protect_secret
+
+            app_id = str(payload.get("app_id") or "").strip()
+            approvers = [str(x).strip() for x in (payload.get("approvers") or []) if str(x).strip()]
+            notify_chat_id = str(payload.get("notify_chat_id") or "").strip()
+            enabled = bool(payload.get("enabled"))
+            secret = str(payload.get("app_secret") or "")
+            secret_provided = bool(secret.strip())
+
+            def mutate(data: Dict[str, Any]) -> None:
+                data[config.FEISHU_ENABLED_KEY] = enabled
+                data[config.FEISHU_APP_ID_KEY] = app_id
+                if secret_provided:
+                    data[config.FEISHU_APP_SECRET_KEY] = protect_secret(secret.strip())
+                data[config.FEISHU_APPROVERS_KEY] = approvers
+                data[config.FEISHU_NOTIFY_CHAT_ID_KEY] = notify_chat_id
+
+            config.update_config(mutate)
+            self._refresh_feishu_service()
+            snapshot = self.get_feishu_settings()
+            return {"ok": True, "settings": snapshot.get("settings") or {}, "msg": ""}
+        except Exception as e:
+            logger.exception("set_feishu_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def test_feishu_connection(self, app_id: str = "", app_secret: str = "") -> Dict[str, Any]:
+        """校验凭据：请求飞书长连接接入点，返回是否拿到连接地址。
+
+        传入空值时用已保存的配置（密钥未填则用已存密钥），便于设置页「测试连接」。
+        """
+        try:
+            from core.feishu._lark_ws import Client
+            from core.feishu.config import load_feishu_config
+
+            cfg = load_feishu_config()
+            use_id = str(app_id or "").strip() or cfg.app_id
+            use_secret = str(app_secret or "").strip() or cfg.app_secret
+            if not use_id or not use_secret:
+                return {"ok": False, "msg": "请先填写 App ID 与 App Secret"}
+            client = Client(app_id=use_id, app_secret=use_secret, source="xingyao")
+            url = client._get_conn_url()
+            return {
+                "ok": True,
+                "msg": "凭据有效，飞书已返回长连接地址（保存后即开始连接）",
+                "endpoint_ready": bool(url),
+            }
+        except Exception as e:
+            logger.info("test_feishu_connection 失败: %s", e)
+            return {"ok": False, "msg": f"连接失败：{e}"}
+
+    def _refresh_feishu_service(self) -> None:
+        """配置变更后让飞书服务按新配置生效（启动 / 停止 / 重连）。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            configured = load_feishu_config().configured
+        except Exception:
+            configured = False
+        svc = getattr(self, "_feishu_service", None)
+        if svc is None:
+            if configured:
+                self._ensure_feishu_service()
+            return
+        if not configured:
+            try:
+                svc.stop()
+            finally:
+                self._feishu_service = None
+            return
+        try:
+            svc.restart()
+        except Exception:
+            logger.exception("重启飞书通道服务失败")
+
+    # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
     def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, permission_mode: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
