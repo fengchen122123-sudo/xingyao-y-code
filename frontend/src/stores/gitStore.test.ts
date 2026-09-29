@@ -167,6 +167,30 @@ describe('gitStore', () => {
     expect(store.branchLabel).toBe('');
   });
 
+  it('在途刷新期间的新刷新请求被合并，收尾后只补发一次', async () => {
+    // 慢环境下一次快照要数秒，监控失效事件会在数秒内堆起多个并发请求，
+    // 后端 worktree_lock 串行执行会让最新状态排队饿死——必须合并补发
+    let resolveFirst!: (v: unknown) => void;
+    const firstGate = new Promise<unknown>((resolve) => { resolveFirst = resolve; });
+    const get_status = vi.fn()
+      .mockImplementationOnce(() => firstGate)
+      .mockImplementationOnce(() => Promise.resolve({ ok: true, snapshot: fakeSnapshot({ branch_name: 'v2' }) }));
+    mockApi({
+      git_get_status: get_status,
+      git_get_trust: vi.fn().mockResolvedValue({ ok: true, level: 'trusted' }),
+    });
+    const store = useGitStore();
+    const first = store.ensureLoaded('E:/proj');
+    store.onExternalChange({ workspace: 'E:/proj' });
+    store.onExternalChange({ workspace: 'E:/proj' });
+    expect(get_status).toHaveBeenCalledTimes(1);
+    resolveFirst({ ok: true, snapshot: fakeSnapshot({ branch_name: 'dev' }) });
+    await first;
+    await new Promise((r) => setTimeout(r, 0));
+    expect(get_status).toHaveBeenCalledTimes(2);
+    expect(store.branchLabel).toBe('v2');
+  });
+
   it('stage 调用后以后端新快照刷新界面（仓库为唯一事实源）', async () => {
     const before = fakeSnapshot();
     const after = fakeSnapshot();

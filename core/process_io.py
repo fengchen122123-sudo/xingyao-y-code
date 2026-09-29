@@ -5,6 +5,29 @@ from __future__ import annotations
 import codecs
 import locale
 import os
+import re
+
+# ANSI/VT 转义序列整体匹配：CSI（颜色/光标控制）、OSC（窗口标题等）、两字节转义。
+# 子进程写管道/日志时可能携带这些序列（vitest 在 CI/FORCE_COLOR 下非 TTY 也上色），
+# 而日志文本既要给 GUI/CLI 面板显示，也会经任务快照进入模型上下文，只认纯文本。
+_ANSI_ESCAPE_RE = re.compile(
+    r"\x1b\[[0-9;:?]*[ -/]*[@-~]"           # CSI：\x1b[0;39m / \x1b[2K 等
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?"  # OSC：\x1b]0;title\x07 等
+    r"|\x1b[@-Z\\-_]"                        # 两字节转义：\x1b7 / \x1bM 等
+)
+
+
+def strip_ansi_escapes(text: str) -> str:
+    """剥离 ANSI/VT 终端转义序列，返回可安全显示与入模的纯文本。
+
+    只删 ESC 字符会留下 ``[33m`` 之类的碎码，必须整段匹配后再兜底删除
+    残余 ESC 字节——不完整序列删掉 ESC 即失效，防止劫持终端渲染
+    （与 history_renderer._strip_escapes 的防注入立场一致）。
+    """
+    if not text:
+        return text
+    cleaned = _ANSI_ESCAPE_RE.sub("", text)
+    return cleaned.replace("\x1b", "")
 
 
 def platform_console_encoding() -> str:

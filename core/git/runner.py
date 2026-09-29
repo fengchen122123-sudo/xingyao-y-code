@@ -129,6 +129,7 @@ class GitRunner:
 
     def __init__(self, git_executable: str = "git"):
         self.git_executable = git_executable
+        self._version_cache: Optional[Tuple[int, int, int]] = None
 
     # ------------------------------------------------------------------ 公开入口
 
@@ -184,7 +185,14 @@ class GitRunner:
         return self._execute([str(a) for a in args], cwd=cwd, scope=None, timeout=timeout, stdin=False, env_extra=None)
 
     def check_available(self) -> Tuple[int, int, int]:
-        """探测 git 可执行与版本；缺失/不可解析显式失败。"""
+        """探测 git 可执行与版本；缺失/不可解析显式失败。
+
+        结果按实例缓存：git 版本在进程生命周期内不会变化，而 resolve 每个
+        请求都会经过这里（快照/preview/写操作全走 resolve），慢环境下每次
+        探测都是一个真实的进程启动开销。
+        """
+        if self._version_cache is not None:
+            return self._version_cache
         try:
             result = self.execute_raw([self.git_executable, "--version"], timeout=10.0)
         except GitError as error:
@@ -195,12 +203,14 @@ class GitRunner:
                 f"git 可执行探测失败: {error.message}",
             ) from error
         try:
-            return parse_git_version(result.stdout_text)
+            detected = parse_git_version(result.stdout_text)
         except ValueError as exc:
             raise GitError(
                 GitErrorCode.GIT_NOT_FOUND,
                 f"无法识别 git 版本输出: {redact_text(result.stdout_text.strip()[:120])}",
             ) from exc
+        self._version_cache = detected
+        return detected
 
     def ensure_version(
         self,
