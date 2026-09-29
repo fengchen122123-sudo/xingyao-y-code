@@ -600,6 +600,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._lan_server = None
         # 保护 _lan_server 惰性创建的双检锁：并发（启动后台线程 + 用户点二维码）时不得创建两个实例
         self._lan_lock = threading.Lock()
+        # 飞书通道服务（惰性创建，见 _ensure_feishu_service）：未配置时完全不启动，
+        # 对现有功能零影响
+        self._feishu_service = None
+        self._feishu_lock = threading.Lock()
         # 电脑操控事件桥：controller listener 注册标记（进程内建立一次、幂等，
         # 见 _ensure_computer_event_bridge；set_window 与各控制方法都会触发）
         self._computer_event_listener = None
@@ -1150,6 +1154,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 self._lan_server.stop()
         except Exception:
             logger.exception("退出时停止局域网远程控制服务失败")
+
+        try:
+            if getattr(self, "_feishu_service", None) is not None:
+                self._feishu_service.stop()
+        except Exception:
+            logger.exception("退出时停止飞书通道服务失败")
 
         if self._mcp is not None:
             try:
@@ -2042,6 +2052,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         lan = getattr(self, "_lan_server", None)
         if lan is not None:
             lan.broadcast(payload, event_type=event_type)
+        # 转发给飞书通道（未配置/未启动时为 None，零开销；on_event 内部已吞异常，
+        # 绝不影响桌面 JS 派发）
+        feishu = getattr(self, "_feishu_service", None)
+        if feishu is not None:
+            feishu.on_event(event_type, data)
 
     def _queue_js_payload(self, payload: str) -> None:
         """唯一入队点：保证派发线程存在后 put_nowait；队列满丢弃新事件并计数。"""
@@ -2583,6 +2598,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             ).start()
         except Exception:
             logger.debug("局域网远程控制服务启动线程创建失败", exc_info=True)
+        # 飞书通道：未配置时 _ensure_feishu_service 直接返回 None，不做任何事
+        try:
+            threading.Thread(
+                target=self._ensure_feishu_service,
+                daemon=True,
+                name="feishu-startup",
+            ).start()
+        except Exception:
+            logger.debug("飞书通道服务启动线程创建失败", exc_info=True)
         # 历史消息媒体清单迁移：一次性、幂等，后台执行不阻塞初始化
         try:
             threading.Thread(
@@ -4507,6 +4531,39 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 logger.exception("局域网远程控制服务启动失败")
                 return None
 
+    def _ensure_feishu_service(self):
+        """惰性创建并启动飞书通道服务，失败/未配置返回 None（不抛给调用方）。
+
+        与 _ensure_lan_server 同范式：双检锁保证并发（启动后台线程 + 设置页保存）
+        只创建一个实例。未配置（开关关闭或缺凭据）时不创建任何线程，对现有功能
+        零影响——这也是"飞书功能不影响其它功能"的兜底开关。
+        """
+        if getattr(self, "_feishu_service", None) is not None:
+            return self._feishu_service
+        lock = getattr(self, "_feishu_lock", None)
+        if lock is None:
+            # getattr 兜底：测试里的裸实例（__new__ 构造）不经过 __init__，
+            # 缺状态时就地补齐，避免后台启动线程里抛 AttributeError
+            lock = threading.Lock()
+            self._feishu_lock = lock
+        with lock:
+            if getattr(self, "_feishu_service", None) is not None:
+                return self._feishu_service
+            try:
+                from core.feishu.service import FeishuService
+
+                # bridge（业务语义：会话绑定、卡片、审批）在 T4 注入；
+                # 本步只负责服务生命周期与事件转发通道。
+                svc = FeishuService()
+                if not svc.start():
+                    # 未配置：不发布实例，避免事件热路径上做无谓转发
+                    return None
+                self._feishu_service = svc
+                return svc
+            except Exception:
+                logger.exception("飞书通道服务启动失败")
+                return None
+
     def get_remote_bind_qr(self, force_new: bool = False, mobile: bool = False) -> Dict[str, Any]:
         """返回手机扫码绑定信息。
 
@@ -4540,13 +4597,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
     # ------------------------------------------------------------------
     def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, permission_mode: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
         # turn_source 是入口层受控回合来源（设计 18）：LAN dispatch 由服务器注入
-        # "lan"，本地 GUI/CLI 固定 "local"；只接受这两个受控值，模型/用户正文
-        # 无法设置，非法值直接拒绝（不启动回合）。
+        # "lan"，本地 GUI/CLI 固定 "local"，飞书通道由 core/feishu 注入 "feishu"；
+        # 只接受这几个受控值，模型/用户正文无法设置，非法值直接拒绝（不启动回合）。
         # 注意参数顺序：permission_mode 在 turn_source 之前——桌面 GUI 经
         # pywebview 按位置传参，第 6 位必须是会话级权限档位；LAN 分发只放行
         # 前 5 个位置参数（MESSAGE_ENTRY_POSITIONAL_LIMIT），客户端同样无法
         # 经位置通道注入档位。
-        if turn_source not in ("local", "lan"):
+        if turn_source not in ("local", "lan", "feishu"):
             return {"ok": False, "msg": "无效的回合来源"}
         try:
             if self._shutting_down:
