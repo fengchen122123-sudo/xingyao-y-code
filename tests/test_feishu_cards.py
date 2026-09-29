@@ -28,8 +28,10 @@ from core.feishu.cards import (
 from core.feishu.commands import (
     agent_card,
     inbox_card,
+    mode_card,
     model_list_card,
     panel_card,
+    sandbox_card,
     session_list_card,
     stall_card,
     status_card,
@@ -94,6 +96,12 @@ def _all_cards():
             {"request_id": "req-2", "is_question": True, "title": "选择数据库", "session_label": "s"},
         ], page=1),
         "stall": stall_card(session_label="s", last_text="重构鉴权逻辑", minutes=12),
+        "mode": mode_card(current_mode="confirm", session_label="飞书 · ou_abcdefgh", buttons_enabled=True),
+        "mode_readonly": mode_card(current_mode="full", session_label="s", buttons_enabled=False,
+                                   hint="未配置审批白名单，飞书侧不可切换执行权限"),
+        "sandbox_off": sandbox_card(enabled=False, buttons_enabled=True),
+        "sandbox_on": sandbox_card(enabled=True, buttons_enabled=True),
+        "sandbox_readonly": sandbox_card(enabled=False, buttons_enabled=False, hint="未配置审批白名单"),
         "text": text_card("星瑶 · 帮助", "正文"),
         "agent": agent_card(agent_name="星瑶", model_name="gpt-4o"),
     }

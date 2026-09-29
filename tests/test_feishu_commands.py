@@ -24,6 +24,9 @@ class _FakeStarBridge:
             {"id": "claude", "name": "Claude", "provider": "anthropic"},
         ]
         self.active_model_id = "gpt-4o"
+        self.permission_mode = "confirm"
+        self.mode_set = []
+        self.sandbox_set = []
 
     def get_sessions(self):
         return [{"folder_path": "GLOBAL", "folder_name": "对话", "is_global": True,
@@ -51,6 +54,21 @@ class _FakeStarBridge:
         self.stopped.append(session_name)
         return {"ok": True}
 
+    def get_permission_mode(self, session_name=""):
+        return {"ok": True, "session_name": session_name, "permission_mode": self.permission_mode}
+
+    def set_permission_mode(self, mode, session_name=""):
+        self.mode_set.append({"mode": mode, "session": session_name})
+        if mode not in ("confirm", "accept_edits", "plan", "full"):
+            # 星瑶会显式拒绝未知档位，不静默兜底
+            return {"ok": False, "msg": f"未知权限模式: {mode}"}
+        self.permission_mode = mode
+        return {"ok": True, "permission_mode": mode, "bound": True}
+
+    def set_sandbox_enabled(self, enabled):
+        self.sandbox_set.append(bool(enabled))
+        return {"ok": True, "allow_outside_workspace": bool(enabled)}
+
     def respond_permission(self, request_id, allow, always=False):
         return {"ok": True}
 
@@ -73,7 +91,8 @@ class _FakeApi:
         return {"code": 0, "data": {"message_id": f"om_t{len(self.texts)}"}}
 
 
-def _setup(tmp_path, approvers=("ou_allowed",), bound_session="session_a", state="connected"):
+# 白名单按 open_id 校验；默认值与 _message 的发件人一致，避免"自己都不在白名单里"
+def _setup(tmp_path, approvers=("ou_abcdefgh",), bound_session="session_a", state="connected"):
     star = _FakeStarBridge()
     api = _FakeApi()
     store = FeishuBindingStore(path=str(tmp_path / "state.json"))
@@ -285,9 +304,9 @@ def test_whoami_returns_open_id_for_whitelist(tmp_path):
 
 
 def test_whoami_reports_when_already_in_whitelist(tmp_path):
-    br, _, api = _setup(tmp_path, approvers=["ou_allowed"])
+    br, _, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
 
-    br.on_feishu_event(_message("/whoami", open_id="ou_allowed"))
+    br.on_feishu_event(_message("/whoami"))
 
     assert "已在名单内" in api.texts[0]["text"]
 
@@ -307,6 +326,164 @@ def test_plain_text_still_goes_to_model(tmp_path):
     br.on_feishu_event(_message("帮我看下 README"))
 
     assert star.sent == [{"text": "帮我看下 README", "session_name": "session_a", "turn_source": "feishu"}]
+
+
+# ---------------------------------------------------------------- 执行权限档位
+
+def _patch_sandbox(monkeypatch, enabled: bool):
+    """沙盒状态来自全局配置（core.model_manager.load_config）。"""
+    import core.model_manager as mm
+
+    monkeypatch.setattr(mm, "load_config", lambda: {"allow_outside_workspace": enabled})
+
+
+def test_mode_card_shows_current_and_offers_switching(tmp_path):
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/mode"))
+
+    card = api.cards[0]["card"]
+    assert card["header"]["title"]["content"] == "🔐 执行权限"
+    body = _card_text(card)
+    assert "变更前确认" in body and "← 当前" in body
+    # 当前档位不给切换按钮，其余三个都给
+    values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
+              for c in e["columns"] for b in c["elements"]]
+    args = {v.get("arg") for v in values}
+    assert args == {"accept_edits", "plan", "full"}
+    assert all(v["cmd"] == "/mode" for v in values)
+
+
+def test_mode_switch_binds_to_bound_session(tmp_path):
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/mode accept_edits"))
+
+    assert star.mode_set == [{"mode": "accept_edits", "session": "session_a"}]
+    text = _card_text(api.cards[0]["card"])
+    assert "已切换执行权限" in text
+    assert "accept_edits" in text
+
+
+def test_mode_card_hides_buttons_without_approvers(tmp_path):
+    """fail-closed：未配置白名单时只读展示，不给切换入口。"""
+    br, star, api = _setup(tmp_path, approvers=())
+
+    br.on_feishu_event(_message("/mode"))
+
+    card = api.cards[0]["card"]
+    assert [e for e in card["body"]["elements"] if e.get("tag") == "column_set"] == []
+    assert "未配置审批白名单" in _card_text(card)
+
+
+def test_mode_switch_refused_without_whitelist(tmp_path):
+    br, star, api = _setup(tmp_path, approvers=())
+
+    br.on_feishu_event(_message("/mode full"))
+
+    assert star.mode_set == []                       # 不回调后端
+    assert "无权操作" in api.cards[0]["card"]["header"]["title"]["content"]
+
+
+def test_mode_switch_surfaces_unknown_mode_error(tmp_path):
+    """星瑶会显式拒绝未知档位（不静默兜底成 confirm），错误必须原样回显。"""
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/mode 乱写的档位"))
+
+    assert "切换失败" in api.cards[0]["card"]["header"]["title"]["content"]
+    assert "未知权限模式" in _card_text(api.cards[0]["card"])
+
+
+def test_mode_switch_without_bound_session_reports(tmp_path):
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"], bound_session="")
+
+    br.on_feishu_event(_message("/mode plan"))
+
+    assert star.mode_set == []
+    assert "未绑定会话" in api.cards[0]["card"]["header"]["title"]["content"]
+
+
+# ---------------------------------------------------------------- 沙盒开关
+
+def test_sandbox_card_shows_state_and_warns(tmp_path, monkeypatch):
+    _patch_sandbox(monkeypatch, False)
+    br, _, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/sandbox"))
+
+    card = api.cards[0]["card"]
+    assert card["header"]["title"]["content"] == "🧰 沙盒开关"
+    body = _card_text(card)
+    assert "已关闭" in body
+    assert "全局" in body                             # 必须写明是全局放宽项
+    values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
+              for c in e["columns"] for b in c["elements"]]
+    assert values == [{"kind": "cmd", "cmd": "/sandbox", "arg": "on"}]
+
+
+def test_sandbox_card_reflects_enabled_state(tmp_path, monkeypatch):
+    _patch_sandbox(monkeypatch, True)
+    br, _, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/sandbox"))
+
+    body = _card_text(api.cards[0]["card"])
+    assert "已开启" in body
+    assert "off" in body                              # 给出关闭按钮
+
+
+def test_sandbox_turn_on_calls_backend(tmp_path, monkeypatch):
+    _patch_sandbox(monkeypatch, False)
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/sandbox on"))
+
+    assert star.sandbox_set == [True]
+    assert "已切换沙盒放行" in _card_text(api.cards[0]["card"])
+
+
+def test_sandbox_turn_off_calls_backend(tmp_path, monkeypatch):
+    _patch_sandbox(monkeypatch, True)
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/sandbox off"))
+
+    assert star.sandbox_set == [False]
+    assert "已关闭沙盒放行" in _card_text(api.cards[0]["card"])
+
+
+def test_sandbox_refused_without_whitelist(tmp_path, monkeypatch):
+    _patch_sandbox(monkeypatch, False)
+    br, star, api = _setup(tmp_path, approvers=[])
+
+    br.on_feishu_event(_message("/sandbox on"))
+
+    assert star.sandbox_set == []                     # 全局放宽项：非白名单一律不动
+    assert "无权操作" in api.cards[0]["card"]["header"]["title"]["content"]
+
+
+def test_sandbox_bad_argument_reports_usage(tmp_path, monkeypatch):
+    _patch_sandbox(monkeypatch, False)
+    br, star, api = _setup(tmp_path, approvers=["ou_abcdefgh"])
+
+    br.on_feishu_event(_message("/sandbox 随便写"))
+
+    assert star.sandbox_set == []
+    card = api.cards[0]["card"]
+    assert "参数不对" in card["header"]["title"]["content"]
+    assert "用法" in _card_text(card)
+
+
+def test_panel_has_mode_and_sandbox_buttons(tmp_path):
+    br, _, api = _setup(tmp_path)
+
+    br.on_feishu_event(_message("/panel"))
+
+    cmds = {v.get("cmd") for e in api.cards[0]["card"]["body"]["elements"]
+            if e.get("tag") == "column_set" for c in e["columns"] for b in c["elements"]
+            for v in [b["behaviors"][0]["value"]]}
+    assert {"/mode", "/sandbox"} <= cmds
 
 
 # ---------------------------------------------------------------- 面板按钮 → 指令
