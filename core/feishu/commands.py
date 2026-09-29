@@ -31,11 +31,30 @@ HELP_TEXT = """**星瑶 · 飞书指令**
 - `/list`　会话列表（可切换绑定）
 - `/switch <序号>`　按列表序号切换绑定
 - `/model [序号或名称]`　模型列表 / 直接切换
+- `/mode [档位]`　执行权限档位（仅作用于本会话，需在审批白名单内）
+- `/sandbox [on|off]`　沙盒放行开关（**全局**，需在审批白名单内）
 - `/agent`　查看当前人设（人设切换在桌面端设置里改）
 - `/inbox`　待拍板收件箱（权限待批 + 提问待答）
 - `/stop`　中止当前会话正在跑的任务
 
 其余任何消息都会直接发给当前绑定的星瑶会话。"""
+
+# 执行权限档位（规范值 → 短标签 / 说明），规范值取自 core.app_context.CANONICAL_PERMISSION_MODES
+PERMISSION_MODES = (
+    ("confirm", "变更前确认", "改动前询问；只读查询放行"),
+    ("accept_edits", "自动编辑", "普通改动放行，敏感改动仍询问"),
+    ("plan", "计划模式", "只读，先出方案再实施"),
+    ("full", "完全访问", "不再询问，全部放行"),
+)
+_MODE_SHORT = {key: short for key, short, _ in PERMISSION_MODES}
+_MODE_DESC = {key: desc for key, _, desc in PERMISSION_MODES}
+
+
+def permission_mode_label(mode: str) -> str:
+    key = str(mode or "").strip()
+    if key in _MODE_SHORT:
+        return f"{_MODE_SHORT[key]}（{key}）"
+    return key or "未知"
 
 
 def whoami_text(*, open_id: str, chat_id: str, allowed: bool) -> str:
@@ -101,7 +120,59 @@ def panel_card() -> Dict[str, Any]:
             btn("🧠 模型", "default", {"kind": "cmd", "cmd": "/model"}),
             btn("🤖 人设", "default", {"kind": "cmd", "cmd": "/agent"}),
         ]),
+        btn_flow([
+            btn("🔐 权限", "default", {"kind": "cmd", "cmd": "/mode"}),
+            btn("🧰 沙盒", "default", {"kind": "cmd", "cmd": "/sandbox"}),
+        ]),
     ])
+
+
+def mode_card(*, current_mode: str, session_label: str,
+              buttons_enabled: bool = True, hint: str = "") -> Dict[str, Any]:
+    """执行权限档位卡：显示当前档位 + 一键切换（只作用于本会话）。"""
+    lines = [f"**当前档位**　{permission_mode_label(current_mode)}"]
+    if session_label:
+        lines.append(f"**会话**　{session_label}")
+    lines.append("")
+    lines.append("**可选档位**")
+    for key, short, desc in PERMISSION_MODES:
+        mark = "　← 当前" if key == current_mode else ""
+        lines.append(f"- {short}（`{key}`）：{desc}{mark}")
+    elements: List[Dict[str, Any]] = [md("\n".join(lines))]
+
+    if buttons_enabled:
+        buttons = [
+            btn(f"切换到{short}", "primary" if key == "confirm" else "default",
+                {"kind": "cmd", "cmd": "/mode", "arg": key})
+            for key, short, _ in PERMISSION_MODES if key != current_mode
+        ]
+        if buttons:
+            elements.append(btn_flow(buttons))
+        elements.append(note("档位只作用于飞书绑定的这个会话，桌面端的全局默认不受影响。"))
+    else:
+        elements.append(note(hint or "未配置审批白名单，飞书侧不可切换执行权限（设置 → 飞书集成）"))
+    return card2("🔐 执行权限", TEMPLATE_BLUE, elements)
+
+
+def sandbox_card(*, enabled: bool, buttons_enabled: bool = True, hint: str = "") -> Dict[str, Any]:
+    """沙盒开关卡：这是**全局**放宽项，必须白名单内的人才能操作。"""
+    state = "已开启（允许访问工作目录之外的文件）" if enabled else "已关闭（仅限工作目录内）"
+    elements: List[Dict[str, Any]] = [md(f"**当前状态**　{state}")]
+    if buttons_enabled:
+        if enabled:
+            elements.append(btn_flow([
+                btn("🔒 关闭沙盒放行", "primary", {"kind": "cmd", "cmd": "/sandbox", "arg": "off"}),
+            ]))
+        else:
+            elements.append(btn_flow([
+                btn("🔓 开启沙盒放行", "danger", {"kind": "cmd", "cmd": "/sandbox", "arg": "on"}),
+            ]))
+        elements.append(note(
+            "⚠️ 这是**全局**开关（`allow_outside_workspace`）：一旦开启，**所有会话**都可读写工作目录之外的文件。"
+        ))
+    else:
+        elements.append(note(hint or "未配置审批白名单，飞书侧不可切换沙盒开关（设置 → 飞书集成）"))
+    return card2("🧰 沙盒开关", "orange" if enabled else TEMPLATE_BLUE, elements)
 
 
 def status_card(*, session_label: str, session_name: str, workdir: str, model_name: str,
