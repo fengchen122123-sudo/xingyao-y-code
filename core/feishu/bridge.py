@@ -115,6 +115,26 @@ class FeishuBindingStore:
             self._data["bindings"].pop(str(chat_id), None)
             self._save_locked()
 
+    def rename_session(self, old: str, new: str) -> None:
+        """会话改名后迁移绑定（含展示名）。
+
+        星瑶会在回合中把会话自动重命名（首条消息当标题），不改绑定的话下一条
+        消息 `_session_exists(旧名)` 为假 → 会另建新会话，用户侧表现为「换了话题」。
+        """
+        old_name, new_name = str(old or ""), str(new or "")
+        if not old_name or not new_name or old_name == new_name:
+            return
+        with self._lock:
+            changed = False
+            for entry in self._data["bindings"].values():
+                if str(entry.get("session") or "") == old_name:
+                    entry["session"] = new_name
+                    entry["label"] = new_name      # 新名字即新标题，展示跟着走
+                    entry["updated_at"] = int(time.time())
+                    changed = True
+            if changed:
+                self._save_locked()
+
     def all_bindings(self) -> Dict[str, Dict[str, Any]]:
         with self._lock:
             return {k: dict(v) for k, v in self._data["bindings"].items()}
@@ -151,6 +171,10 @@ class FeishuBridge:
         self._card_requests_limit = 500
         # 未决的权限/提问（供 /inbox 聚合）：request_id → 摘要
         self._pending_requests: Dict[str, Dict[str, Any]] = {}
+        # 会话改名别名：改名后的事件名 → 本轮 pending 的键（回合开始时的会话名）。
+        # 星瑶会在回合中把会话自动重命名（首条消息当标题），此时 message_final 仍用
+        # 旧名、turn_finish 用新名——没有这张表，turn_finish 就找不到本轮，卡片静默不发。
+        self._session_aliases: Dict[str, str] = {}
         # 卡住提醒的冷却时间戳（session → 上次提醒时刻）
         self._stall_notified: Dict[str, float] = {}
         self._watchdog: Optional[threading.Thread] = None
@@ -443,19 +467,27 @@ class FeishuBridge:
                 self._pending_requests.clear()
             return
 
+        if event_type == "session_renamed":
+            # 星瑶会在回合中把会话自动重命名（首条消息当标题）；改名后 turn_finish
+            # 带新名、message_final 仍带旧名，必须建立别名并迁移绑定
+            self._on_session_renamed(data)
+            return
+
         session = str(data.get("session_name") or "")
         if not session:
             return
+        # 改名后的事件名经别名回溯到本轮 pending 的键
+        key = self._pending_key(session)
         # 任何事件都算「有输出」，刷新卡住判定
-        self._touch_activity(session)
+        self._touch_activity(key)
         with self._lock:
-            buffered = session in self._pending
+            buffered = key in self._pending
         if not buffered:
             return
 
         if event_type == "message_final":
             with self._lock:
-                entry = self._pending.get(session)
+                entry = self._pending.get(key)
                 if entry is not None:
                     content = data.get("content")
                     if isinstance(content, str) and content:
@@ -464,22 +496,56 @@ class FeishuBridge:
 
         if event_type == "turn_error":
             with self._lock:
-                entry = self._pending.get(session)
+                entry = self._pending.get(key)
                 if entry is not None:
                     entry["error"] = str(data.get("message") or "未知错误")
             return
 
         if event_type in ("turn_finish", "turn_cancelled"):
-            with self._lock:
-                entry = self._pending.pop(session, None)
+            entry = self._pop_pending(key)
             if entry:
                 self._flush(session, entry, cancelled=(event_type == "turn_cancelled"))
+
+    def _on_session_renamed(self, data: Dict[str, Any]) -> None:
+        """会话改名：迁移绑定 + 建立事件名别名（否则回合结果静默发不出去）。"""
+        old = str(data.get("old") or data.get("old_name") or "")
+        new = str(data.get("new") or data.get("new_name") or "")
+        if not old or not new or old == new:
+            return
+        logger.info("飞书：星瑶会话改名 %s → %s", old, new)
+        try:
+            self._store.rename_session(old, new)
+        except Exception:
+            logger.debug("飞书绑定随改名迁移失败", exc_info=True)
+        with self._lock:
+            key = self._session_aliases.get(old, old)
+            entry = self._pending.get(key)
+            if entry is not None:
+                # 改名后的事件名（turn_finish 用新名）也能回溯到本轮
+                self._session_aliases[new] = key
+                entry["name"] = new
+
+    def _pending_key(self, session: str) -> str:
+        """把事件里的会话名解析成本轮 pending 的键（沿改名别名回溯）。"""
+        with self._lock:
+            return self._session_aliases.get(session, session)
+
+    def _pop_pending(self, key: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            entry = self._pending.pop(key, None)
+            if entry is not None:
+                for alias, target in list(self._session_aliases.items()):
+                    if target == key:
+                        self._session_aliases.pop(alias, None)
+            return entry
 
     def _flush(self, session: str, entry: Dict[str, Any], cancelled: bool) -> None:
         chat_id = str(entry.get("chat_id") or self._store.last_chat_id())
         if not chat_id:
             return
-        label = self._store.label_of(chat_id) or session
+        # 会话可能已在回合中被重命名：用最新名字查工作目录与兜底展示
+        current_name = str(entry.get("name") or session)
+        label = self._store.label_of(chat_id) or current_name
         try:
             if entry.get("error"):
                 card = failure_card(label, str(entry["error"]))
@@ -487,7 +553,7 @@ class FeishuBridge:
                 card = completion_card(
                     label,
                     str(entry.get("content") or ""),
-                    workdir=self._session_workdir(session),
+                    workdir=self._session_workdir(current_name),
                     cancelled=cancelled,
                 )
             self._api_client().send_card(chat_id, card)
@@ -501,6 +567,7 @@ class FeishuBridge:
         with self._lock:
             self._pending[session] = {
                 "chat_id": chat_id,
+                "name": session,
                 "content": "",
                 "error": "",
                 "last_text": text,
@@ -510,8 +577,7 @@ class FeishuBridge:
         self._ensure_watchdog()
 
     def _drop_turn(self, session: str) -> None:
-        with self._lock:
-            self._pending.pop(session, None)
+        self._pop_pending(self._pending_key(session))
 
     def _touch_activity(self, session: str) -> None:
         """回合有输出就刷新活跃时间（卡住判定的依据）。"""
