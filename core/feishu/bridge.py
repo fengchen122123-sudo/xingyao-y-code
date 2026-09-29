@@ -13,7 +13,7 @@ import logging
 import os
 import threading
 import time
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import config as app_config
 from core.feishu.cards import (
@@ -27,6 +27,18 @@ from core.feishu.cards import (
     strip_mention,
     target_lines,
 )
+from core.feishu.commands import (
+    HELP_TEXT,
+    agent_card,
+    inbox_card,
+    model_list_card,
+    panel_card,
+    parse_command,
+    session_list_card,
+    stall_card,
+    status_card,
+    text_card,
+)
 from core.feishu.client import FeishuApiClient, FeishuApiError
 from core.feishu.config import FeishuConfig, load_feishu_config
 
@@ -36,6 +48,11 @@ TURN_SOURCE = "feishu"
 EVENT_MESSAGE = "im.message.receive_v1"
 EVENT_CARD_ACTION = "card.action.trigger"
 STATE_FILENAME = "feishu_state.json"
+
+# 卡住提醒：某会话持续执行但 N 分钟无任何输出时推一次，同会话 2 小时内最多一次
+STALL_MINUTES = 10
+STALL_COOLDOWN_SECONDS = 7200
+WATCHDOG_INTERVAL_SECONDS = 60
 
 
 def default_state_path() -> str:
@@ -131,6 +148,17 @@ class FeishuBridge:
         # context.open_message_id 反查（与 opencode-mobile 的 messageId 方案一致）
         self._card_requests: Dict[str, str] = {}
         self._card_requests_limit = 500
+        # 未决的权限/提问（供 /inbox 聚合）：request_id → 摘要
+        self._pending_requests: Dict[str, Dict[str, Any]] = {}
+        # 卡住提醒的冷却时间戳（session → 上次提醒时刻）
+        self._stall_notified: Dict[str, float] = {}
+        self._watchdog: Optional[threading.Thread] = None
+        self._watchdog_lock = threading.Lock()
+        # 连接状态提供者（由 FeishuService 注入，供 /status 展示）
+        self._status_provider = None
+
+    def set_status_provider(self, provider) -> None:
+        self._status_provider = provider
 
     # ---- 依赖 ----
 
@@ -181,13 +209,16 @@ class FeishuBridge:
         text = strip_mention(text)
         if not text:
             return
+        if text.startswith("/"):
+            self._handle_command(text, chat_id, open_id)
+            return
 
         session = self._ensure_session(chat_id, open_id)
         if not session:
             self._safe_send_text(chat_id, "创建星瑶会话失败，请稍后重试。")
             return
 
-        self._buffer_turn(session, chat_id)
+        self._buffer_turn(session, chat_id, text)
         try:
             result = self._bridge.send_user_message(text, session_name=session, turn_source=TURN_SOURCE)
         except Exception as e:
@@ -221,7 +252,7 @@ class FeishuBridge:
             session = self._ensure_session(chat_id, open_id)
             if not session:
                 return card_response(build_result_card("❌ 发送失败", ["创建星瑶会话失败"]))
-            self._buffer_turn(session, chat_id)
+            self._buffer_turn(session, chat_id, text)
             try:
                 result = self._bridge.send_user_message(text, session_name=session, turn_source=TURN_SOURCE)
             except Exception as e:
@@ -239,6 +270,14 @@ class FeishuBridge:
 
         if kind == "ask":
             return self._handle_ask_action(value, form_value, request_id, open_id)
+
+        if kind == "cmd":
+            # 面板/列表/翻页按钮：按钮即指令（无状态，页码与参数都在 value 里）
+            cmd = str(value.get("cmd") or "")
+            arg = str(value.get("arg") or "")
+            if cmd:
+                self._handle_command(f"{cmd} {arg}".strip(), chat_id, open_id)
+            return None
 
         # 其余卡片动作由后续任务接管
         logger.debug("暂不处理的卡片动作: %s", kind or action.get("name") or "?")
@@ -259,8 +298,25 @@ class FeishuBridge:
         allowed = bool(cfg.approvers)
         hint = "" if allowed else "未配置审批白名单（设置 → 飞书集成），请在桌面端处理本次授权。"
         function_name = str(data.get("function_name") or "")
+        is_question = function_name == "ask_user"
+        targets = target_lines(dict(data.get("arguments") or {}))
+        workdir = self._session_workdir(session)
+        # 记入未决清单，供 /inbox 聚合与「▶ 处理」重推卡
+        with self._lock:
+            self._pending_requests[request_id] = {
+                "request_id": request_id,
+                "is_question": is_question,
+                "title": str(data.get("summary") or ("星瑶提问" if is_question else function_name)),
+                "session_label": label,
+                "options": [str(o) for o in (data.get("options") or [])],
+                "action_name": function_name,
+                "summary": str(data.get("summary") or ""),
+                "targets": targets,
+                "workdir": workdir,
+                "allow_always": bool(data.get("allow_always")),
+            }
         try:
-            if function_name == "ask_user":
+            if is_question:
                 card = question_card(
                     question=str(data.get("summary") or data.get("details") or "星瑶有问题需要你确认"),
                     options=[str(o) for o in (data.get("options") or [])],
@@ -273,9 +329,9 @@ class FeishuBridge:
                 card = permission_card(
                     action_name=function_name,
                     summary=str(data.get("summary") or ""),
-                    targets=target_lines(dict(data.get("arguments") or {})),
+                    targets=targets,
                     session_label=label,
-                    workdir=self._session_workdir(session),
+                    workdir=workdir,
                     request_id=request_id,
                     allow_always=bool(data.get("allow_always")),
                     buttons_enabled=allowed,
@@ -321,6 +377,8 @@ class FeishuBridge:
         if not result or not result.get("ok"):
             return card_response(build_result_card(
                 "⚠️ 已处理或已失效", [str((result or {}).get("msg") or "该权限请求已失效")]))
+        with self._lock:
+            self._pending_requests.pop(request_id, None)
         title = "✅ 已批准" if allow else "✖ 已拒绝"
         if allow and always:
             title = "✅ 已总是批准"
@@ -350,6 +408,8 @@ class FeishuBridge:
         if not result or not result.get("ok"):
             return card_response(build_result_card(
                 "⚠️ 已处理或已失效", [str((result or {}).get("msg") or "该请求已失效")]))
+        with self._lock:
+            self._pending_requests.pop(request_id, None)
         return card_response(build_result_card("✅ 已回答", [f"回答：{answer}"]))
 
     # ---- 星瑶 → 飞书 ----
@@ -369,9 +429,17 @@ class FeishuBridge:
             self._push_permission_card(data)
             return
 
+        if event_type == "permission_dismiss":
+            # 审批被别处处理（桌面端/超时/取消）：清掉收件箱里的未决项
+            with self._lock:
+                self._pending_requests.clear()
+            return
+
         session = str(data.get("session_name") or "")
         if not session:
             return
+        # 任何事件都算「有输出」，刷新卡住判定
+        self._touch_activity(session)
         with self._lock:
             buffered = session in self._pending
         if not buffered:
@@ -420,13 +488,279 @@ class FeishuBridge:
 
     # ---- 内部工具 ----
 
-    def _buffer_turn(self, session: str, chat_id: str) -> None:
+    def _buffer_turn(self, session: str, chat_id: str, text: str = "") -> None:
+        now = time.time()
         with self._lock:
-            self._pending[session] = {"chat_id": chat_id, "content": "", "error": ""}
+            self._pending[session] = {
+                "chat_id": chat_id,
+                "content": "",
+                "error": "",
+                "last_text": text,
+                "started_at": now,
+                "last_activity": now,
+            }
+        self._ensure_watchdog()
 
     def _drop_turn(self, session: str) -> None:
         with self._lock:
             self._pending.pop(session, None)
+
+    def _touch_activity(self, session: str) -> None:
+        """回合有输出就刷新活跃时间（卡住判定的依据）。"""
+        with self._lock:
+            entry = self._pending.get(session)
+            if entry is not None:
+                entry["last_activity"] = time.time()
+
+    # ---- 卡住提醒 ----
+
+    def _ensure_watchdog(self) -> None:
+        with self._watchdog_lock:
+            if self._watchdog is not None and self._watchdog.is_alive():
+                return
+            self._watchdog = threading.Thread(
+                target=self._watchdog_loop, daemon=True, name="feishu-stall-watchdog")
+            self._watchdog.start()
+
+    def _watchdog_loop(self) -> None:
+        while True:
+            time.sleep(WATCHDOG_INTERVAL_SECONDS)
+            try:
+                self._check_stalls()
+            except Exception:
+                logger.debug("卡住检测异常", exc_info=True)
+
+    def _check_stalls(self) -> None:
+        now = time.time()
+        with self._lock:
+            candidates = [(name, dict(entry)) for name, entry in self._pending.items()]
+        for session, entry in candidates:
+            last = float(entry.get("last_activity") or entry.get("started_at") or 0)
+            if not last or now - last < STALL_MINUTES * 60:
+                continue
+            with self._lock:
+                if now - float(self._stall_notified.get(session) or 0) < STALL_COOLDOWN_SECONDS:
+                    continue
+                self._stall_notified[session] = now
+            chat_id = str(entry.get("chat_id") or self._store.last_chat_id())
+            if not chat_id:
+                continue
+            label = self._store.label_of(chat_id) or session
+            self._safe_send_card(chat_id, stall_card(
+                session_label=label,
+                last_text=str(entry.get("last_text") or ""),
+                minutes=int((now - last) / 60),
+            ))
+
+    # ---- 指令 ----
+
+    def _handle_command(self, text: str, chat_id: str, open_id: str) -> None:
+        cmd, arg = parse_command(text)
+        if not cmd:
+            return
+        try:
+            card = self._build_command_card(cmd, arg, chat_id, open_id)
+        except Exception:
+            logger.exception("处理飞书指令失败: %s", cmd)
+            self._safe_send_text(chat_id, f"指令处理失败：{cmd}")
+            return
+        if card is not None:
+            self._safe_send_card(chat_id, card)
+
+    def _build_command_card(self, cmd: str, arg: str, chat_id: str, open_id: str):
+        if cmd in ("/help", "/?", "/start"):
+            return text_card("星瑶 · 帮助", HELP_TEXT)
+
+        if cmd == "/panel":
+            return panel_card()
+
+        if cmd == "/status":
+            return self._status_snapshot_card(chat_id)
+
+        if cmd == "/agent":
+            return agent_card(agent_name=self._agent_name(), model_name=self._active_model_name())
+
+        if cmd == "/new":
+            title = arg or self._label_for(open_id)
+            result = self._bridge.create_session(title, None)
+            if not result or not result.get("ok"):
+                self._safe_send_text(chat_id, "新建会话失败，请稍后重试。")
+                return None
+            name = str(result.get("session_name") or "")
+            self._store.bind(chat_id, name, title)
+            return text_card("✅ 已新建并绑定", f"会话 **{title}**\n`{name}`", "green")
+
+        if cmd == "/list":
+            page = self._page_of(arg)
+            return session_list_card(sessions=self._all_sessions(),
+                                     current_session=self._store.session_of(chat_id), page=page)
+
+        if cmd == "/switch":
+            return self._command_switch(chat_id, arg)
+
+        if cmd == "/model":
+            return self._command_model(chat_id, arg)
+
+        if cmd == "/inbox":
+            if arg.startswith("open:"):
+                return self._open_inbox_item(arg.split(":", 1)[1])
+            return inbox_card(items=self._inbox_items(), page=self._page_of(arg))
+
+        if cmd == "/stop":
+            session = self._store.session_of(chat_id)
+            if not session:
+                self._safe_send_text(chat_id, "当前没有绑定会话。")
+                return None
+            result = self._bridge.stop_current_turn(session)
+            if result and result.get("ok") is False:
+                self._safe_send_text(chat_id, f"中止失败：{result.get('msg') or '未知错误'}")
+            else:
+                self._safe_send_text(chat_id, "⏹ 已发送中止请求。")
+            return None
+
+        self._safe_send_text(chat_id, f"未知指令：{cmd}（发 /help 看指令表）")
+        return None
+
+    def _command_switch(self, chat_id: str, arg: str):
+        sessions = self._all_sessions()
+        try:
+            index = int(arg)
+        except (TypeError, ValueError):
+            self._safe_send_text(chat_id, "用法：/switch <序号>（序号见 /list）")
+            return None
+        if index < 1 or index > len(sessions):
+            self._safe_send_text(chat_id, f"序号超出范围（1-{len(sessions)}）")
+            return None
+        target = sessions[index - 1]
+        name = str(target.get("name") or "")
+        title = str(target.get("display_name") or name)
+        self._store.bind(chat_id, name, title)
+        return text_card("✅ 已切换绑定", f"会话 **{title}**\n`{name}`", "green")
+
+    def _command_model(self, chat_id: str, arg: str):
+        settings = self._bridge.get_model_settings() or {}
+        models = list(settings.get("models") or [])
+        active = str(settings.get("active_model_id") or "")
+        if not arg or arg.startswith("page:"):
+            return model_list_card(models=models, active_model_id=active, page=self._page_of(arg))
+        target = None
+        if arg.isdigit():
+            index = int(arg)
+            if 1 <= index <= len(models):
+                target = models[index - 1]
+        else:
+            for item in models:
+                if arg in (str(item.get("id") or ""), str(item.get("name") or "")):
+                    target = item
+                    break
+        if target is None:
+            self._safe_send_text(chat_id, f"没找到模型：{arg}（发 /model 看列表）")
+            return None
+        session = self._store.session_of(chat_id) or None
+        result = self._bridge.set_model(str(target.get("id") or ""), session)
+        if result and result.get("ok") is False:
+            self._safe_send_text(chat_id, f"切换模型失败：{result.get('msg') or '未知错误'}")
+            return None
+        return text_card("✅ 已切换模型",
+                         f"**{target.get('name') or target.get('id')}**\n`{target.get('id')}`", "green")
+
+    def _status_snapshot_card(self, chat_id: str):
+        cfg = self._config()
+        session = self._store.session_of(chat_id)
+        settings = {}
+        try:
+            settings = self._bridge.get_model_settings() or {}
+        except Exception:
+            settings = {}
+        active_id = str(settings.get("active_model_id") or "")
+        name = self._active_model_name()
+        state = "未知"
+        if callable(self._status_provider):
+            try:
+                state = str((self._status_provider() or {}).get("state") or "未知")
+            except Exception:
+                state = "未知"
+        return status_card(
+            session_label=self._store.label_of(chat_id) or "",
+            session_name=session,
+            workdir=self._session_workdir(session),
+            model_name=name or active_id,
+            connection_state=state,
+            approvers_count=len(cfg.approvers or []),
+            pending_count=len(self._inbox_items()),
+            agent_name=self._agent_name(),
+        )
+
+    def _inbox_items(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            items = [dict(v) for v in self._pending_requests.values()]
+        return items
+
+    def _open_inbox_item(self, request_id: str):
+        with self._lock:
+            item = self._pending_requests.get(request_id)
+        if not item:
+            return text_card("⚠️ 该待办已处理", "它可能已经被桌面端或其他人处理了。", "red")
+        # 重新推一张对应的卡（按钮直接可用），不再另建状态
+        cfg = self._config()
+        allowed = bool(cfg.approvers)
+        hint = "" if allowed else "未配置审批白名单（设置 → 飞书集成），请在桌面端处理本次授权。"
+        if item.get("is_question"):
+            return question_card(question=str(item.get("title") or ""), options=list(item.get("options") or []),
+                                 session_label=str(item.get("session_label") or ""),
+                                 request_id=request_id, buttons_enabled=allowed, hint=hint)
+        return permission_card(action_name=str(item.get("action_name") or ""),
+                               summary=str(item.get("summary") or ""),
+                               targets=list(item.get("targets") or []),
+                               session_label=str(item.get("session_label") or ""),
+                               workdir=str(item.get("workdir") or ""),
+                               request_id=request_id,
+                               allow_always=bool(item.get("allow_always")),
+                               buttons_enabled=allowed, hint=hint)
+
+    @staticmethod
+    def _page_of(arg: str) -> int:
+        if arg.startswith("page:"):
+            try:
+                return max(1, int(arg.split(":", 1)[1]))
+            except ValueError:
+                return 1
+        return 1
+
+    def _all_sessions(self) -> List[Dict[str, Any]]:
+        try:
+            groups = self._bridge.get_sessions() or []
+        except Exception:
+            return []
+        out: List[Dict[str, Any]] = []
+        for group in groups:
+            out.extend((group or {}).get("sessions") or [])
+        return out
+
+    def _agent_name(self) -> str:
+        try:
+            from core.persona_settings import get_agent_display_name
+
+            return str(get_agent_display_name() or "星瑶")
+        except Exception:
+            return "星瑶"
+
+    def _active_model_name(self) -> str:
+        try:
+            settings = self._bridge.get_model_settings() or {}
+            active_id = str(settings.get("active_model_id") or "")
+            for item in settings.get("models") or []:
+                if str(item.get("id") or "") == active_id:
+                    return str(item.get("name") or active_id)
+            return active_id
+        except Exception:
+            return ""
+
+    def _safe_send_card(self, chat_id: str, card: Dict[str, Any]) -> None:
+        try:
+            self._api_client().send_card(chat_id, card)
+        except Exception:
+            logger.exception("发送飞书卡片失败（chat=%s）", chat_id)
 
     def _ensure_session(self, chat_id: str, open_id: str) -> str:
         session = self._store.session_of(chat_id)
