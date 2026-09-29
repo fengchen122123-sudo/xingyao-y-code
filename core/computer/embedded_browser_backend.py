@@ -25,6 +25,21 @@ from core.computer.browser_backend import BrowserComputerBackend
 from core.computer.models import ComputerControlError
 
 _CDP_READY_POLL_INTERVAL = 0.25
+# CDP endpoint 必须是回环地址 + 1-65535 的合法端口
+_CDP_ENDPOINT_PREFIX = "http://127.0.0.1:"
+# 连接失败报错中 last_error 摘要的截断长度：CDP/Playwright 错误文本可能很长
+_ERROR_SUMMARY_MAX_CHARS = 300
+
+
+def _parse_cdp_port(endpoint: object) -> int | None:
+    """解析 "http://127.0.0.1:<port>[/...]" 中的端口；非回环或端口非法返回 None。"""
+    if type(endpoint) is not str or not endpoint.startswith(_CDP_ENDPOINT_PREFIX):
+        return None
+    port_text = endpoint[len(_CDP_ENDPOINT_PREFIX):].split("/", 1)[0]
+    if not (port_text.isascii() and port_text.isdigit()):
+        return None
+    port = int(port_text)
+    return port if 1 <= port <= 65535 else None
 
 
 class EmbeddedBrowserBackend(BrowserComputerBackend):
@@ -40,10 +55,10 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
         on_page_change=None,
         playwright_factory=None,
     ) -> None:
-        if type(cdp_endpoint) is not str or not cdp_endpoint.startswith("http://127.0.0.1:"):
+        if _parse_cdp_port(cdp_endpoint) is None:
             raise ComputerControlError(
                 "computer_invalid_config",
-                "内置浏览器 CDP endpoint 必须是 127.0.0.1 回环地址",
+                "内置浏览器 CDP endpoint 必须是 127.0.0.1 回环地址且端口为 1-65535 的整数",
             )
         super().__init__(
             "embedded",
@@ -114,10 +129,20 @@ class EmbeddedBrowserBackend(BrowserComputerBackend):
             except Exception as error:
                 last_error = error
                 time.sleep(_CDP_READY_POLL_INTERVAL)
+        if last_error is None:
+            detail = "未知错误"
+        else:
+            summary = " ".join(str(last_error).split())
+            if len(summary) > _ERROR_SUMMARY_MAX_CHARS:
+                summary = summary[: _ERROR_SUMMARY_MAX_CHARS] + "…"
+            detail = (
+                f"{type(last_error).__name__}: {summary}"
+                if summary
+                else type(last_error).__name__
+            )
         raise ComputerControlError(
             "computer_embedded_unavailable",
-            f"无法通过 CDP 连接内置浏览器（{self._cdp_endpoint}）："
-            f"{type(last_error).__name__ if last_error else '未知错误'}",
+            f"无法通过 CDP 连接内置浏览器（{self._cdp_endpoint}）：{detail}",
         )
 
     def _observation_viewport(self, page) -> dict:

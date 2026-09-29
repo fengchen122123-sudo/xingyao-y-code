@@ -98,7 +98,7 @@ def css_rect_to_physical(rect: Dict[str, Any], scale: float) -> Tuple[int, int, 
 
 def _looks_like_host(u: str) -> bool:
     """判断无 scheme 的输入是否像域名 / localhost / IP（可带端口）。"""
-    authority = re.split(r"[/?#]", u, 1)[0]
+    authority = re.split(r"[/?#]", u, maxsplit=1)[0]
     if not authority or "@" in authority:
         return False
     hostname = authority.split(":", 1)[0]
