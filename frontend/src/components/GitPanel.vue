@@ -275,7 +275,11 @@ async function onConfirmOk() {
 
 onMounted(() => {
   const workdir = appStore.workdir || '';
-  if (workdir) void store.ensureLoaded(workdir);
+  if (workdir) {
+    void store.ensureLoaded(workdir);
+    // 信任态只在面板打开时拉取：角标/状态栏刷新路径不再每次多付信任探测的 git 进程
+    void store.loadTrust();
+  }
 });
 
 // 弹窗打开期间监听 Esc 关闭；关闭与卸载时摘除监听
@@ -289,7 +293,10 @@ onBeforeUnmount(() => window.removeEventListener('keydown', onDiffModalKeydown))
 watch(
   () => appStore.workdir,
   (wd) => {
-    if (wd) void store.ensureLoaded(wd);
+    if (wd) {
+      void store.ensureLoaded(wd);
+      void store.loadTrust();
+    }
   }
 );
 </script>

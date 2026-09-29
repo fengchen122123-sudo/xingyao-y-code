@@ -567,6 +567,11 @@ class MemoryManager:
                     "CREATE INDEX IF NOT EXISTS idx_token_usage_route "
                     "ON token_usage(model, api_base, cache_scope, date)"
                 )
+                # 按会话聚合（GUI 状态栏本会话口径 / 会话弹层）的查询走此索引
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_token_usage_session "
+                    "ON token_usage(session_id, cache_scope)"
+                )
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS cache_request_diagnostics (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1312,6 +1317,115 @@ class MemoryManager:
                 }
                 for row in cursor.fetchall()
             ]
+
+    def get_token_usage_by_session(self, session_name):
+        """按会话聚合真实 token 用量：对话口径（main/legacy）为主，保活单列。
+
+        命中率分母 cache_prompt 只统计已报告缓存明细的行（未报告 ≠ 0）。
+        返回 {"prompt", "completion", "cached", "cache_prompt", "total",
+        "requests", "last_ts", "keepalive_prompt", "keepalive_cached",
+        "keepalive_requests"}；无记录时数值项为 0、last_ts 为 None。
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT SUM(prompt_tokens), SUM(completion_tokens),
+                       SUM(cached_tokens),
+                       SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
+                       SUM(total_tokens), COUNT(*), MAX(ts)
+                FROM token_usage
+                WHERE session_id = ? AND cache_scope IN ('main', 'legacy')
+                """,
+                (str(session_name),),
+            )
+            row = cursor.fetchone()
+            cursor = self.conn.execute(
+                """
+                SELECT SUM(prompt_tokens), SUM(cached_tokens), COUNT(*)
+                FROM token_usage
+                WHERE session_id = ? AND cache_scope = 'keepalive'
+                """,
+                (str(session_name),),
+            )
+            keepalive_row = cursor.fetchone()
+        return {
+            "prompt": int(row[0] or 0),
+            "completion": int(row[1] or 0),
+            "cached": int(row[2] or 0),
+            "cache_prompt": int(row[3] or 0),
+            "total": int(row[4] or 0),
+            "requests": int(row[5] or 0),
+            "last_ts": int(row[6]) if row[6] is not None else None,
+            "keepalive_prompt": int(keepalive_row[0] or 0),
+            "keepalive_cached": int(keepalive_row[1] or 0),
+            "keepalive_requests": int(keepalive_row[2] or 0),
+        }
+
+    def list_token_usage_by_sessions(self, limit=20):
+        """按会话聚合 token 用量并按合计降序排列，供会话弹层选择查看。
+
+        只列 sessions 表中仍存在的会话；已删会话的残留行不进列表，
+        但仍计入 get_token_usage_totals() 的全部会话合计。
+        返回 [{"session_id", "prompt", "completion", "cached", "cache_prompt",
+        "total", "requests", "last_ts"}, ...]
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT t.session_id,
+                       SUM(t.prompt_tokens), SUM(t.completion_tokens),
+                       SUM(t.cached_tokens),
+                       SUM(CASE WHEN t.cached_tokens IS NOT NULL THEN t.prompt_tokens ELSE 0 END),
+                       SUM(t.total_tokens), COUNT(*), MAX(t.ts)
+                FROM token_usage t
+                JOIN sessions s ON s.session_name = t.session_id
+                WHERE t.cache_scope IN ('main', 'legacy')
+                GROUP BY t.session_id
+                ORDER BY SUM(t.total_tokens) DESC, MAX(t.ts) DESC
+                LIMIT ?
+                """,
+                (int(limit),),
+            )
+            return [
+                {
+                    "session_id": row[0] or "",
+                    "prompt": int(row[1] or 0),
+                    "completion": int(row[2] or 0),
+                    "cached": int(row[3] or 0),
+                    "cache_prompt": int(row[4] or 0),
+                    "total": int(row[5] or 0),
+                    "requests": int(row[6] or 0),
+                    "last_ts": int(row[7]) if row[7] is not None else None,
+                }
+                for row in cursor.fetchall()
+            ]
+
+    def get_token_usage_totals(self):
+        """全部会话的总计（不分 scope，与状态行旧口径同源的落库版）。
+
+        保活/压缩轮次也是真实计费，全部合计必须包含；命中率分母同样
+        只取已报告缓存明细的行。返回 {"prompt", "completion", "cached",
+        "cache_prompt", "total", "requests"}。
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT SUM(prompt_tokens), SUM(completion_tokens),
+                       SUM(cached_tokens),
+                       SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
+                       SUM(total_tokens), COUNT(*)
+                FROM token_usage
+                """
+            )
+            row = cursor.fetchone()
+        return {
+            "prompt": int(row[0] or 0),
+            "completion": int(row[1] or 0),
+            "cached": int(row[2] or 0),
+            "cache_prompt": int(row[3] or 0),
+            "total": int(row[4] or 0),
+            "requests": int(row[5] or 0),
+        }
 
     def add_cache_request_diagnostic(self, diagnostic):
         """追加一条无正文的请求级缓存诊断记录。"""
@@ -2974,7 +3088,10 @@ class MemoryManager:
         返回按时间正序的 [{"id", "role", "content"}]，content 为文本化内容。
         """
         try:
-            limit = max(1, min(int(limit or 16), 50))
+            # 显式判 None：仅缺省用 16；0/负数按下限夹到 1，不再被 `or` 误当缺省
+            if limit is None:
+                limit = 16
+            limit = max(1, min(int(limit), 50))
             before_msg_id = int(before_msg_id)
         except (TypeError, ValueError):
             return []
@@ -3143,6 +3260,12 @@ class MemoryManager:
                 # 回溯索引静默消失且旧名行永远清不掉（与上方更新同事务）
                 cursor.execute(
                     'UPDATE session_summary_generations SET session_name = ? WHERE session_name = ?',
+                    (final_name, old_name),
+                )
+                # token 用量流水按 session_name 记账：不随迁则按会话统计
+                # 在改名后静默丢历史（与上方更新同事务）
+                cursor.execute(
+                    'UPDATE token_usage SET session_id = ? WHERE session_id = ?',
                     (final_name, old_name),
                 )
                 self.conn.commit()
