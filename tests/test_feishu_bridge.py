@@ -79,12 +79,23 @@ def _message_event(text="你好", chat_id="oc_1", open_id="ou_abcdefgh", msg_typ
     }
 
 
-def _card_action_event(kind="reply", form_value=None, chat_id="oc_1", open_id="ou_abcdefgh"):
+def _card_action_event(kind="reply", form_value=None, chat_id="oc_1", open_id="ou_abcdefgh",
+                       via_form_submit=False):
+    """构造卡片回调事件。
+
+    via_form_submit=True 模拟**表单提交按钮**的真实载荷：只有 `action.name`，
+    没有 `action.value`（提交按钮不带 behaviors）。
+    """
+    action: dict = {"form_value": form_value or {}}
+    if via_form_submit:
+        action["name"] = kind
+    else:
+        action["value"] = {"kind": kind}
     return {
         "header": {"event_id": "ev-2", "event_type": "card.action.trigger"},
         "event": {
             "operator": {"open_id": open_id},
-            "action": {"value": {"kind": kind}, "form_value": form_value or {}},
+            "action": action,
             "context": {"open_chat_id": chat_id},
         },
     }
@@ -228,11 +239,14 @@ def test_completion_card_carries_reply_form(tmp_path):
 # ---------------------------------------------------------------- 卡片追问
 
 def test_card_reply_sends_turn_and_returns_raw_card(tmp_path):
+    """真实形态：完成卡的表单提交按钮（只有 action.name，没有 action.value）。"""
     br, star, _ = _bridge(tmp_path)
     br.on_feishu_event(_message_event("第一轮"))
     session = star.sent[0]["session_name"]
 
-    response = br.on_feishu_event(_card_action_event(form_value={"reply": "继续深挖"}))
+    response = br.on_feishu_event(
+        _card_action_event("reply", form_value={"reply": "继续深挖"}, via_form_submit=True)
+    )
 
     assert star.sent[-1]["text"] == "继续深挖"
     assert star.sent[-1]["session_name"] == session
@@ -240,6 +254,16 @@ def test_card_reply_sends_turn_and_returns_raw_card(tmp_path):
     # 回调结果卡必须包 raw（红线 3）
     assert response["card"]["type"] == "raw"
     assert response["card"]["data"]["header"]["template"] == "green"
+
+
+def test_card_reply_via_value_payload_also_works(tmp_path):
+    """带 value 的按钮形态（非表单提交）同样要能路由。"""
+    br, star, _ = _bridge(tmp_path)
+    br.on_feishu_event(_message_event("第一轮"))
+
+    br.on_feishu_event(_card_action_event("reply", form_value={"reply": "按钮路径"}))
+
+    assert star.sent[-1]["text"] == "按钮路径"
 
 
 def test_card_reply_with_empty_form_returns_warning(tmp_path):

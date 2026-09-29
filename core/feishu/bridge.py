@@ -22,7 +22,10 @@ from core.feishu.cards import (
     completion_card,
     extract_text,
     failure_card,
+    permission_card,
+    question_card,
     strip_mention,
+    target_lines,
 )
 from core.feishu.client import FeishuApiClient, FeishuApiError
 from core.feishu.config import FeishuConfig, load_feishu_config
@@ -124,6 +127,10 @@ class FeishuBridge:
         self._api_lock = threading.Lock()
         # session_name → 本轮飞书回合的上下文（chat_id / 已收到的结果文本）
         self._pending: Dict[str, Dict[str, Any]] = {}
+        # 卡片消息 id → 权限请求 id：表单提交按钮带不了 value，只能靠
+        # context.open_message_id 反查（与 opencode-mobile 的 messageId 方案一致）
+        self._card_requests: Dict[str, str] = {}
+        self._card_requests_limit = 500
 
     # ---- 依赖 ----
 
@@ -200,7 +207,12 @@ class FeishuBridge:
         context = body.get("context") or {}
         chat_id = str(context.get("open_chat_id") or context.get("chat_id") or self._store.last_chat_id())
         open_id = str((body.get("operator") or {}).get("open_id") or "")
-        kind = str(value.get("kind") or "")
+        # 表单提交按钮只带 action.name（没有 behaviors/value），因此 kind 要两处取
+        kind = str(value.get("kind") or action.get("name") or "")
+        # request_id 优先取按钮 value；表单提交（无 value）用卡片消息 id 反查
+        request_id = str(value.get("request_id") or "")
+        if not request_id:
+            request_id = self._request_id_for_message(str(context.get("open_message_id") or ""))
 
         if kind == "reply":
             text = str(form_value.get("reply") or "").strip()
@@ -222,20 +234,141 @@ class FeishuBridge:
             label = self._store.label_of(chat_id) or session
             return card_response(build_result_card("✅ 已发送", [f"会话 {label}，完成后推送结果"]))
 
-        # 其余卡片动作（审批等）由后续任务接管
+        if kind == "perm":
+            return self._handle_permission_action(value, request_id, open_id)
+
+        if kind == "ask":
+            return self._handle_ask_action(value, form_value, request_id, open_id)
+
+        # 其余卡片动作由后续任务接管
         logger.debug("暂不处理的卡片动作: %s", kind or action.get("name") or "?")
         return None
+
+    # ---- 审批 / 提问 ----
+
+    def _push_permission_card(self, data: Dict[str, Any]) -> None:
+        request_id = str(data.get("request_id") or "")
+        if not request_id:
+            return
+        chat_id = self._notify_chat()
+        if not chat_id:
+            return
+        session = str(data.get("session_name") or "")
+        label = self._store.label_of(chat_id) or session
+        cfg = self._config()
+        allowed = bool(cfg.approvers)
+        hint = "" if allowed else "未配置审批白名单（设置 → 飞书集成），请在桌面端处理本次授权。"
+        function_name = str(data.get("function_name") or "")
+        try:
+            if function_name == "ask_user":
+                card = question_card(
+                    question=str(data.get("summary") or data.get("details") or "星瑶有问题需要你确认"),
+                    options=[str(o) for o in (data.get("options") or [])],
+                    session_label=label,
+                    request_id=request_id,
+                    buttons_enabled=allowed,
+                    hint=hint,
+                )
+            else:
+                card = permission_card(
+                    action_name=function_name,
+                    summary=str(data.get("summary") or ""),
+                    targets=target_lines(dict(data.get("arguments") or {})),
+                    session_label=label,
+                    workdir=self._session_workdir(session),
+                    request_id=request_id,
+                    allow_always=bool(data.get("allow_always")),
+                    buttons_enabled=allowed,
+                    hint=hint,
+                )
+            resp = self._api_client().send_card(chat_id, card)
+            # 记下卡片消息 id → 请求 id：表单提交按钮没有 value，回调只能靠
+            # context.open_message_id 反查（与 opencode-mobile 的 messageId 方案一致）
+            message_id = str(((resp or {}).get("data") or {}).get("message_id") or "")
+            if message_id:
+                self._remember_card_request(message_id, request_id)
+        except Exception:
+            logger.exception("推送飞书审批卡失败（request_id=%s）", request_id)
+
+    def _remember_card_request(self, message_id: str, request_id: str) -> None:
+        with self._lock:
+            self._card_requests[message_id] = request_id
+            while len(self._card_requests) > self._card_requests_limit:
+                oldest = next(iter(self._card_requests), None)
+                if oldest is None:
+                    break
+                self._card_requests.pop(oldest, None)
+
+    def _request_id_for_message(self, message_id: str) -> str:
+        if not message_id:
+            return ""
+        with self._lock:
+            return self._card_requests.get(message_id, "")
+
+    def _handle_permission_action(self, value: Dict[str, Any], request_id: str, open_id: str) -> Any:
+        if not request_id:
+            return card_response(build_result_card("⚠️ 无法识别请求", ["卡片与请求的对应关系已失效，请在桌面端处理"]))
+        allowed, reason = self._approver_allowed(open_id)
+        if not allowed:
+            return card_response(build_result_card("❌ 无权操作", [reason]))
+        allow = bool(value.get("allow"))
+        always = bool(value.get("always"))
+        try:
+            result = self._bridge.respond_permission(request_id, allow, always)
+        except Exception as e:
+            logger.exception("飞书审批回传失败")
+            return card_response(build_result_card("❌ 审批失败", [str(e)]))
+        if not result or not result.get("ok"):
+            return card_response(build_result_card(
+                "⚠️ 已处理或已失效", [str((result or {}).get("msg") or "该权限请求已失效")]))
+        title = "✅ 已批准" if allow else "✖ 已拒绝"
+        if allow and always:
+            title = "✅ 已总是批准"
+        return card_response(build_result_card(title, [str(value.get("action_label") or "")]))
+
+    def _handle_ask_action(self, value: Dict[str, Any], form_value: Dict[str, Any],
+                           request_id: str, open_id: str) -> Any:
+        if not request_id:
+            return card_response(build_result_card("⚠️ 无法识别请求", ["卡片与请求的对应关系已失效，请在桌面端处理"]))
+        allowed, reason = self._approver_allowed(open_id)
+        if not allowed:
+            return card_response(build_result_card("❌ 无权操作", [reason]))
+        try:
+            if "index" in value:
+                index = int(value.get("index"))
+                result = self._bridge.respond_permission_choice(request_id, index, "")
+                answer = str((value.get("options") or [None])[index] if value.get("options") else index)
+            else:
+                # 自由文本：桌面/移动端统一用 -1 表示自定义回答
+                answer = str(form_value.get("answer") or "").strip()
+                if not answer:
+                    return card_response(build_result_card("⚠️ 没有内容", ["请输入回答后再提交"]))
+                result = self._bridge.respond_permission_choice(request_id, -1, answer)
+        except Exception as e:
+            logger.exception("飞书提问回传失败")
+            return card_response(build_result_card("❌ 回答失败", [str(e)]))
+        if not result or not result.get("ok"):
+            return card_response(build_result_card(
+                "⚠️ 已处理或已失效", [str((result or {}).get("msg") or "该请求已失效")]))
+        return card_response(build_result_card("✅ 已回答", [f"回答：{answer}"]))
 
     # ---- 星瑶 → 飞书 ----
 
     def on_agent_event(self, event_type: str, data: Any) -> None:
         """星瑶事件转发入口（由 FeishuService 调用，跑在事件源线程里）。
 
-        只处理「由飞书发起的回合」：`_pending` 里没有该会话就直接返回，
-        桌面端自己的回合不会产生任何飞书消息。
+        - 审批/提问不分来源：桌面端发起的回合同样可能等人拍板，人在外面时
+          正是靠这条链路把审批推到飞书（与 opencode-mobile 一致）。
+        - 回合结果只处理「由飞书发起的回合」：`_pending` 里没有该会话就直接返回，
+          桌面端自己的回合不会产生多余的飞书消息。
         """
         if not isinstance(data, dict):
             return
+
+        if event_type == "permission_request":
+            self._push_permission_card(data)
+            return
+
         session = str(data.get("session_name") or "")
         if not session:
             return
@@ -317,6 +450,20 @@ class FeishuBridge:
     def _label_for(open_id: str) -> str:
         suffix = (open_id or "").strip()[:8]
         return f"飞书 · {suffix}" if suffix else "飞书 · 会话"
+
+    def _notify_chat(self) -> str:
+        """审批卡推送落点：优先配置的固定 chat，其次最后一次说话的会话。"""
+        cfg = self._config()
+        return cfg.notify_chat_id or self._store.last_chat_id()
+
+    def _approver_allowed(self, open_id: str):
+        """审批白名单校验（fail-closed）：未配置白名单时任何人都不放行。"""
+        approvers = list(self._config().approvers or [])
+        if not approvers:
+            return False, "未配置审批白名单（设置 → 飞书集成），暂不可在飞书审批"
+        if open_id and open_id in approvers:
+            return True, ""
+        return False, f"你不在审批白名单内（{open_id or '未知用户'}）"
 
     def _session_exists(self, session: str) -> bool:
         try:
