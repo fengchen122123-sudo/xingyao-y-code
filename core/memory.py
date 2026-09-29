@@ -18,6 +18,17 @@ from core.tool_result_maintenance import PROTECTION_ZONE_TOKENS
 import pathlib
 
 
+# token 流水按 session_name 记账，而会话名可被新会话复用（旧会话被删除后
+# sessions 行消失、名字随之释放）。因此按名字聚合必须叠加「会话创建时间
+# 下界」，否则新会话会把同名旧会话的历史流水算进自己的累计（2026-09-29
+# 状态行显示 3200 万输入即此因）。created_at 是本地时间文本，'utc' 修饰符
+# 按系统本地时区把它换算成 epoch，与写入侧 int(time.time()) 口径一致。
+_SESSION_TOKEN_TIME_BOUND_SQL = (
+    "(s.created_at IS NULL OR s.created_at = '' "
+    "OR t.ts >= CAST(strftime('%s', s.created_at, 'utc') AS INTEGER))"
+)
+
+
 def _canonicalize_api_base(value):
     """规范 endpoint 身份并移除 userinfo/query/fragment，避免分桶漂移或泄密。"""
     text = str(value or "").strip()
@@ -1228,11 +1239,14 @@ class MemoryManager:
         """
         with self._lock:
             cursor = self.conn.execute(
-                "SELECT prompt_tokens, completion_tokens, total_tokens, cached_tokens, "
-                "provider, model, cache_write_tokens "
-                "FROM token_usage WHERE session_id = ? "
-                "AND cache_scope IN ('main', 'legacy') "
-                "ORDER BY id DESC LIMIT 1",
+                "SELECT t.prompt_tokens, t.completion_tokens, t.total_tokens, "
+                "t.cached_tokens, t.provider, t.model, t.cache_write_tokens "
+                "FROM token_usage t "
+                "LEFT JOIN sessions s ON s.session_name = t.session_id "
+                "WHERE t.session_id = ? "
+                "AND t.cache_scope IN ('main', 'legacy') "
+                f"AND {_SESSION_TOKEN_TIME_BOUND_SQL} "
+                "ORDER BY t.id DESC LIMIT 1",
                 (str(session_id),),
             )
             row = cursor.fetchone()
@@ -1328,22 +1342,27 @@ class MemoryManager:
         """
         with self._lock:
             cursor = self.conn.execute(
-                """
-                SELECT SUM(prompt_tokens), SUM(completion_tokens),
-                       SUM(cached_tokens),
-                       SUM(CASE WHEN cached_tokens IS NOT NULL THEN prompt_tokens ELSE 0 END),
-                       SUM(total_tokens), COUNT(*), MAX(ts)
-                FROM token_usage
-                WHERE session_id = ? AND cache_scope IN ('main', 'legacy')
+                f"""
+                SELECT SUM(t.prompt_tokens), SUM(t.completion_tokens),
+                       SUM(t.cached_tokens),
+                       SUM(CASE WHEN t.cached_tokens IS NOT NULL
+                                THEN t.prompt_tokens ELSE 0 END),
+                       SUM(t.total_tokens), COUNT(*), MAX(t.ts)
+                FROM token_usage t
+                LEFT JOIN sessions s ON s.session_name = t.session_id
+                WHERE t.session_id = ? AND t.cache_scope IN ('main', 'legacy')
+                  AND {_SESSION_TOKEN_TIME_BOUND_SQL}
                 """,
                 (str(session_name),),
             )
             row = cursor.fetchone()
             cursor = self.conn.execute(
-                """
-                SELECT SUM(prompt_tokens), SUM(cached_tokens), COUNT(*)
-                FROM token_usage
-                WHERE session_id = ? AND cache_scope = 'keepalive'
+                f"""
+                SELECT SUM(t.prompt_tokens), SUM(t.cached_tokens), COUNT(*)
+                FROM token_usage t
+                LEFT JOIN sessions s ON s.session_name = t.session_id
+                WHERE t.session_id = ? AND t.cache_scope = 'keepalive'
+                  AND {_SESSION_TOKEN_TIME_BOUND_SQL}
                 """,
                 (str(session_name),),
             )
@@ -1371,7 +1390,7 @@ class MemoryManager:
         """
         with self._lock:
             cursor = self.conn.execute(
-                """
+                f"""
                 SELECT t.session_id,
                        SUM(t.prompt_tokens), SUM(t.completion_tokens),
                        SUM(t.cached_tokens),
@@ -1380,6 +1399,7 @@ class MemoryManager:
                 FROM token_usage t
                 JOIN sessions s ON s.session_name = t.session_id
                 WHERE t.cache_scope IN ('main', 'legacy')
+                  AND {_SESSION_TOKEN_TIME_BOUND_SQL}
                 GROUP BY t.session_id
                 ORDER BY SUM(t.total_tokens) DESC, MAX(t.ts) DESC
                 LIMIT ?
@@ -3140,6 +3160,12 @@ class MemoryManager:
                         'DELETE FROM session_summary_generations WHERE session_name = ?',
                         (session_name,),
                     )
+                    # token 流水按 session_name 记账，会话行删除后流水若留下，
+                    # 同名新会话会把它当作自己的历史累计（2026-09-29 状态行
+                    # 显示 3200 万输入即此因），故与消息同事务一并清理。
+                    cursor.execute(
+                        'DELETE FROM token_usage WHERE session_id = ?', (session_name,)
+                    )
                     cursor.execute('DELETE FROM sessions WHERE id = ?', (session_id,))
                     self.conn.commit()
                     deleted = True
@@ -3172,6 +3198,12 @@ class MemoryManager:
                     cursor.execute(
                         f'DELETE FROM session_summary_generations '
                         f'WHERE session_name IN ({placeholders})',
+                        deleted_names,
+                    )
+                    # 同 delete_session：会话行删除必须连带清理按名字记账的
+                    # token 流水，否则同名新会话会继承这批历史累计。
+                    cursor.execute(
+                        f'DELETE FROM token_usage WHERE session_id IN ({placeholders})',
                         deleted_names,
                     )
                 cursor.execute('DELETE FROM sessions WHERE workdir = ?', (workdir_norm,))
