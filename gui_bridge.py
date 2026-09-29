@@ -112,6 +112,12 @@ _MONITOR_DEFAULTTONEAREST = 2
 # 回合对齐扩展上限为 limit + 30（见 core.memory.get_history_paged）。
 HISTORY_PAGE_SIZE = 50
 
+# 入口层受控回合来源：GUI/CLI 本地 = local，LAN 手机端 = lan，飞书通道 = feishu。
+# 由入口层注入，模型/用户正文无法设置（send_user_message 校验后拒绝非法值）。
+# 与 core.llm.COMPUTER_TURN_SOURCES 必须保持一致——低层还会再校验一次来源，
+# 两处不一致会让新来源的回合在模型请求处直接抛错（有测试断言两者相等）。
+TURN_SOURCES = ("local", "lan", "feishu")
+
 
 # _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
 # 在同一个 ctypes.windll.user32 上互相覆盖 GetMonitorInfoW.argtypes，导致
@@ -4726,7 +4732,7 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # pywebview 按位置传参，第 6 位必须是会话级权限档位；LAN 分发只放行
         # 前 5 个位置参数（MESSAGE_ENTRY_POSITIONAL_LIMIT），客户端同样无法
         # 经位置通道注入档位。
-        if turn_source not in ("local", "lan", "feishu"):
+        if turn_source not in TURN_SOURCES:
             return {"ok": False, "msg": "无效的回合来源"}
         try:
             if self._shutting_down:

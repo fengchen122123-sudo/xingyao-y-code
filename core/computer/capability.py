@@ -73,7 +73,7 @@ def resolve_computer_capability(
 
     if turn_source != "local":
         return _rejected(
-            settings, "computer_remote_forbidden", "局域网或移动端发起的回合不允许电脑操控"
+            settings, "computer_remote_forbidden", "局域网、手机或飞书等远程发起的回合不允许电脑操控"
         )
     if not settings.platform_supported:
         return _rejected(
