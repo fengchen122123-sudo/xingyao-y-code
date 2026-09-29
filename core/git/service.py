@@ -144,8 +144,13 @@ class GitApplicationService:
             return self._build_snapshot(identity)
 
     def _build_snapshot(self, identity: RepositoryIdentity) -> GitSnapshot:
+        # --ignored=matching 并入唯一一次 status 扫描（ignored 计数由解析产出）；
+        # 曾为计数单独再全量扫一遍工作区，node_modules 仓库单次就要秒级
         raw_status = self.runner.run_checked(
-            ["status", "--porcelain=v2", "-z", "--branch", "--show-stash"],
+            [
+                "status", "--porcelain=v2", "-z", "--branch", "--show-stash",
+                "--ignored=matching",
+            ],
             cwd=identity.worktree_root,
             scope=ExecScope.READ_ONLY,
             timeout=60.0,
@@ -154,12 +159,13 @@ class GitApplicationService:
         kind, phase = query.detect_operation_state(
             self.runner, identity, status.has_conflicts
         )
-        ignored = query.count_ignored(self.runner, identity.worktree_root)
         wv = compute_worktree_version(
             identity=identity,
             head_oid=status.head_oid or "",
             index_material="",  # index 材料已包含于 status 原始字节
-            status_bytes=raw_status.stdout,
+            # 版本材料剥掉 `!` 记录，与不带 --ignored 的扫描字节保持一致：
+            # ignored 文件变化不得触发版本变化（乐观并发会误报冲突）
+            status_bytes=query.strip_ignored_records(raw_status.stdout),
             operation_markers=f"{kind.value}:{phase.value}",
             conflict_material=";".join(
                 f"{c.path}:{c.kind}" for c in status.conflicts
@@ -180,7 +186,7 @@ class GitApplicationService:
             staged=status.staged,
             unstaged=status.unstaged,
             untracked=status.untracked,
-            ignored_count=ignored,
+            ignored_count=status.ignored_count,
             conflicts=status.conflicts,
             stash_count=status.stash_count,
             operation_kind=kind,

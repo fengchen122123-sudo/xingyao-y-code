@@ -1,6 +1,7 @@
 """只读查询层（规格 §5.2/§5.9）：porcelain v2 解析、操作状态检测与各只读查询。
 
-状态解析只吃 `git status --porcelain=v2 -z --branch --show-stash` 的原始字节，
+状态解析只吃 `git status --porcelain=v2 -z --branch --show-stash` 的原始字节
+（快照路径追加 `--ignored=matching`，单次扫描同时产出 ignored 计数），
 绝不解析本地化的人类可读输出（规格 §5.2/§8）。
 """
 
@@ -50,6 +51,7 @@ class StatusV2:
     entries: Tuple[FileChange, ...]
     untracked: Tuple[str, ...]
     conflicts: Tuple[ConflictEntry, ...]
+    ignored_count: int = 0
 
     # porcelain v2 的"未修改"标记是 "."（区别于 v1 的空格）
     @property
@@ -72,6 +74,9 @@ def _decode(raw: bytes) -> str:
 def parse_status_v2(raw: bytes) -> StatusV2:
     """解析 `git status --porcelain=v2 -z --branch --show-stash` 输出。
 
+    快照路径会追加 `--ignored=matching`，此时输出含 `!`（ignored）记录，
+    一并在此计数（单次扫描产出，避免为 ignored 计数再全量扫描一遍工作区）。
+
     -z 格式：所有记录 NUL 结尾；`2` 重命名条目的 <path> 与 <origPath> 各自
     NUL 结尾（已用真实仓库字节实验核对）；路径不做任何引号/转义猜测。
     """
@@ -81,6 +86,7 @@ def parse_status_v2(raw: bytes) -> StatusV2:
     ahead = 0
     behind = 0
     stash_count = 0
+    ignored_count = 0
     entries: List[FileChange] = []
     untracked: List[str] = []
     conflicts: List[ConflictEntry] = []
@@ -150,7 +156,9 @@ def parse_status_v2(raw: bytes) -> StatusV2:
                 )
         elif line.startswith("? "):
             untracked.append(line[2:])
-        # "! "（ignored）在 --ignored 下才出现；忽略条目只计数量时另行查询
+        elif line.startswith("! "):
+            # `!`（ignored）记录仅在使用 --ignored 时出现；路径内联在同一段
+            ignored_count += 1
     return StatusV2(
         head_oid=head_oid,
         branch_name=branch_name,
@@ -161,7 +169,35 @@ def parse_status_v2(raw: bytes) -> StatusV2:
         entries=tuple(entries),
         untracked=tuple(untracked),
         conflicts=tuple(conflicts),
+        ignored_count=ignored_count,
     )
+
+
+def strip_ignored_records(raw: bytes) -> bytes:
+    """去掉 `!`（ignored）记录，还原成不带 --ignored 扫描的原始字节流。
+
+    快照把 `--ignored=matching` 合并进唯一一次 status 扫描后，worktree_version
+    的 status 字节材料仍必须与旧两段式扫描字节一致——ignored 文件变化
+    （如 node_modules 抖动）不得触发版本变化，否则乐观并发会误报冲突。
+    与 parse_status_v2 同款结构化游走：`2` 记录的 <origPath> 是独立 NUL 段，
+    须随记录一并保留，避免恰好以 "! " 开头的重命名原名被误剥。
+    """
+    segments = raw.split(b"\x00")
+    kept: List[bytes] = []
+    index = 0
+    while index < len(segments):
+        segment = segments[index]
+        index += 1
+        if segment.startswith(b"2 "):
+            kept.append(segment)
+            if index < len(segments):
+                kept.append(segments[index])
+                index += 1
+            continue
+        if segment.startswith(b"! "):
+            continue
+        kept.append(segment)
+    return b"\x00".join(kept)
 
 
 def _safe_int(text: str) -> int:
@@ -169,23 +205,6 @@ def _safe_int(text: str) -> int:
         return int(text)
     except (TypeError, ValueError):
         return 0
-
-
-def count_ignored(runner: GitRunner, worktree_root: str) -> int:
-    """忽略文件数量（--porcelain=v2 -z --ignored=matching 的 `!` 条目数）。"""
-    result = runner.run(
-        ["status", "--porcelain=v2", "-z", "--ignored=matching"],
-        cwd=worktree_root,
-        scope=ExecScope.READ_ONLY,
-        timeout=60.0,
-    )
-    if result.returncode != 0:
-        return 0
-    return sum(
-        1
-        for segment in result.stdout.split(b"\x00")
-        if segment.startswith(b"! ")
-    )
 
 
 def detect_operation_state(

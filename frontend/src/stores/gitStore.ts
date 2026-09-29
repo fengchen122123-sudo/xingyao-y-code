@@ -46,6 +46,12 @@ function callApi<T>(name: string, ...args: unknown[]): Promise<T> {
   return fn.apply(api, args);
 }
 
+// 快照请求串号：git_get_status 在大仓库要数秒，期间用户切会话/换工作区时
+// workdir 已被 $reset 或覆盖，若旧工作区的在途响应照常落地，会把上一仓库的
+// 快照串台到当前会话（表现为公共对话显示上一个项目的分支角标）。
+// 串号放模块级而非 state：$reset 会把 state 计数归零，与在途旧请求撞号。
+let refreshSerial = 0;
+
 export const useGitStore = defineStore('git', {
   state: () => ({
     workdir: '' as string,
@@ -128,14 +134,19 @@ export const useGitStore = defineStore('git', {
     },
 
     async refresh() {
-      if (!this.workdir) return;
+      const workdir = this.workdir;
+      if (!workdir) return;
+      const serial = ++refreshSerial;
       this.loading = true;
       try {
-        const res = await callApi<any>('git_get_status', this.workdir);
+        const res = await callApi<any>('git_get_status', workdir);
+        // 过期响应丢弃：已发起更新的快照请求，或 workdir 在途期间被切换/重置
+        if (serial !== refreshSerial || this.workdir !== workdir) return;
         this._applyResult(res);
         if (res.ok) await this.loadTrust();
       } finally {
-        this.loading = false;
+        // 仅最新请求有权收 loading，避免旧请求提前关掉新请求的加载态
+        if (serial === refreshSerial) this.loading = false;
       }
     },
 
@@ -149,8 +160,9 @@ export const useGitStore = defineStore('git', {
     },
 
     async loadTrust() {
-      const res = await callApi<any>('git_get_trust', this.workdir);
-      if (res.ok) this.trustLevel = res.level;
+      const workdir = this.workdir;
+      const res = await callApi<any>('git_get_trust', workdir);
+      if (res.ok && this.workdir === workdir) this.trustLevel = res.level;
     },
 
     async trustRepository() {
