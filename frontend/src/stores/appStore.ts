@@ -20,6 +20,8 @@ import type {
   BackgroundTask,
   TokenUsage,
   ContextBreakdownItem,
+  SessionTokenTotals,
+  TokenUsageOverview,
   TokenStatisticsSnapshot,
   PermissionMode,
   ReasoningChoice,
@@ -182,6 +184,20 @@ const normalizeContextBreakdown = (value: unknown): ContextBreakdownItem[] => {
   return items;
 };
 
+export const normalizeSessionTokenTotals = (data: any = {}): SessionTokenTotals => ({
+  session_id: String(data.session_id ?? ''),
+  prompt: Number(data.prompt ?? 0),
+  completion: Number(data.completion ?? 0),
+  cached: Number(data.cached ?? 0),
+  cache_prompt: Number(data.cache_prompt ?? 0),
+  total: Number(data.total ?? 0),
+  requests: Number(data.requests ?? 0),
+  last_ts: data.last_ts === null || data.last_ts === undefined ? null : Number(data.last_ts),
+  keepalive_prompt: Number(data.keepalive_prompt ?? 0),
+  keepalive_cached: Number(data.keepalive_cached ?? 0),
+  keepalive_requests: Number(data.keepalive_requests ?? 0),
+});
+
 export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
   const nullableNumber = (value: unknown): number | null => {
     if (value === null || value === undefined) return null;
@@ -211,6 +227,8 @@ export const normalizeTokenUsage = (data: any = {}): TokenUsage => {
     cache_lane_api_base: String(data.cache_lane_api_base ?? ''),
     cache_keepalive_hot_pct: nullableNumber(data.cache_keepalive_hot_pct),
     cache_keepalive_session_pct: nullableNumber(data.cache_keepalive_session_pct),
+    // 本会话口径（落库聚合，重启不清零）；旧后端无此字段时回落全零 + 空 session_id
+    session_totals: normalizeSessionTokenTotals(data.session_totals),
     context_breakdown: normalizeContextBreakdown(data.context_breakdown),
   };
 };
@@ -763,6 +781,9 @@ navItems: [] as Array<{ id: number; preview: string }>,
     subagentOpenNonce: 0,
     subagentTasks: [] as SubagentTaskSnapshot[],
     tokenUsage: emptyTokenUsage(),
+    // 会话 token 弹层（点击状态行时按需拉取；打开即刷新，不做后台轮询）
+    tokenUsageOverview: null as TokenUsageOverview | null,
+    tokenUsageOverviewLoading: false,
     tokenStatistics: null as TokenStatisticsSnapshot | null,
     tokenStatisticsLoading: false,
     tokenStatisticsDays: 30 as 1 | 7 | 30,
@@ -3465,6 +3486,23 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } catch (err) {
         // 静默失败：token_usage 推送事件通常会补上，不打断用户
         console.error('刷新 Token 用量失败:', err);
+      }
+    },
+
+    // 会话 token 弹层数据：每次打开都重拉（面板是瞬时视图，不做增量维护）
+    async loadTokenUsageOverview(limit = 20) {
+      const api = this._api();
+      if (!api) return null;
+      this.tokenUsageOverviewLoading = true;
+      try {
+        const result = await api.get_token_usage_overview(limit);
+        if (result && result.ok) this.tokenUsageOverview = result;
+        return result;
+      } catch (err) {
+        console.error('加载会话 Token 概览失败:', err);
+        return null;
+      } finally {
+        this.tokenUsageOverviewLoading = false;
       }
     },
 

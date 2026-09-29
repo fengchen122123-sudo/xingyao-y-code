@@ -1,5 +1,9 @@
 <template>
-  <div id="input-area" data-theme-region="composer" :class="{ 'is-resizing': isResizing }">
+  <div
+    id="input-area"
+    data-theme-region="composer"
+    :class="{ 'is-resizing': isResizing, 'right-panel-open': !store.rightPanelCollapsed }"
+  >
     <!-- 顶边拖拽手柄：向上拖抬高输入框（多显示几行），向下拖以默认高度为下限；
          双击恢复默认高度 -->
     <div
@@ -165,12 +169,24 @@
       :anchor-el="permBtnRef"
       @close="showPermDropdown = false"
     />
+    <!-- 会话 token 弹层：点击状态行摘要向上弹出（本会话/全部/会话列表） -->
+    <TokenUsagePopover
+      :visible="showTokenPopover"
+      :anchor-el="tokenSummaryRef"
+      @close="showTokenPopover = false"
+    />
 
     <!-- 触摸设备不再使用应用内附件菜单：点回形针直接唤起系统文件选择器 -->
 
     <div id="input-meta">
       <div class="l">
-        <span class="token-summary" :title="summaryTitle">{{ tokenSummary }}</span>
+        <span
+          ref="tokenSummaryRef"
+          class="token-summary token-summary-clickable"
+          data-test="token-summary"
+          :title="summaryTitle"
+          @click.stop="toggleTokenPopover"
+        >{{ tokenSummary }}</span>
       </div>
       <div class="r keyboard-hints" data-test="keyboard-hints">
         <span class="ctx-percent" :class="tokenClass" :title="ctxTooltip">{{ ctxPctLabel }}</span>
@@ -190,6 +206,7 @@ import AppIcon from './AppIcon.vue';
 import ModelCascader from './ModelCascader.vue';
 import ContextUsagePanel from './ContextUsagePanel.vue';
 import PermDropdown from './PermDropdown.vue';
+import TokenUsagePopover from './TokenUsagePopover.vue';
 import ReasoningSelector from './ReasoningSelector.vue';
 import AttachmentChips from './AttachmentChips.vue';
 import InputSuggest from './InputSuggest.vue';
@@ -197,7 +214,7 @@ import { useAttachments } from '../composables/useAttachments';
 import { useIsTouch } from '../composables/useIsTouch';
 import { useSuggest } from '../composables/useSuggest';
 import { useComposerResize } from '../composables/useComposerResize';
-import { buildTokenSummary, formatTokenCount } from '../utils/tokenFormat';
+import { buildSessionTokenSummary, formatTokenCount } from '../utils/tokenFormat';
 
 const store = useAppStore();
 const gitStore = useGitStore();
@@ -222,6 +239,8 @@ const showPermDropdown = ref(false);
 const modelBtnRef = ref<HTMLElement | null>(null);
 const permBtnRef = ref<HTMLElement | null>(null);
 const reasoningSelectorRef = ref<{ close: () => void } | null>(null);
+const showTokenPopover = ref(false);
+const tokenSummaryRef = ref<HTMLElement | null>(null);
 
 function closeComposerMenus() {
   showModelCascader.value = false;
@@ -231,13 +250,20 @@ function closeComposerMenus() {
 function toggleModelCascader() {
   reasoningSelectorRef.value?.close();
   showPermDropdown.value = false;
+  showTokenPopover.value = false;
   showModelCascader.value = !showModelCascader.value;
 }
 
 function togglePermDropdown() {
   reasoningSelectorRef.value?.close();
   showModelCascader.value = false;
+  showTokenPopover.value = false;
   showPermDropdown.value = !showPermDropdown.value;
+}
+
+function toggleTokenPopover() {
+  closeComposerMenus();
+  showTokenPopover.value = !showTokenPopover.value;
 }
 
 const tokenPct = computed(() => {
@@ -251,11 +277,13 @@ const tokenClass = computed(() => {
   return '';
 });
 
-// 状态栏摘要：与 CLI（main.py get_status）同口径——输入/输出/命中，命中率分母为输入
-const tokenSummary = computed(() => buildTokenSummary(store.tokenUsage));
+// 状态栏摘要：本会话口径（token_usage 落库聚合，重启不清零）；
+// 点击弹出会话明细（全部会话合计 + 会话列表）。命中率分母只含已报告
+// 缓存明细的轮次（未报告 ≠ 0），比旧全局口径的 cached/prompt 更真实
+const tokenSummary = computed(() => buildSessionTokenSummary(store.tokenUsage.session_totals));
 const summaryTitle = computed(() => (
   store.tokenUsage.cache_invalidation_reason
-  || '会话累计 Token（输入 / 输出 / 缓存命中），口径与 CLI 状态栏一致'
+  || '本会话 Token 统计（输入 / 输出 / 缓存命中，重启不清零）· 点击查看全部会话'
 ));
 
 // 上下文圆环：周长固定，弧长按占用百分比推进，悬停显示用量详情
@@ -701,13 +729,30 @@ textarea {
   justify-content: space-between;
   font-size: 11.5px;
   color: var(--text-faint);
+  /* 元信息条收纳档位的容器：右侧栏展开挤窄中列时媒体查询感知不到，
+     按自身实际宽度分档隐藏（见文件末尾 @container input-meta） */
+  container-type: inline-size;
+  container-name: input-meta;
 }
 #input-meta .l {
   display: flex;
   gap: 12px;
+  /* 允许收缩配合省略号：token 摘要不换行，缺 min-width 会溢出压到右侧提示上 */
+  min-width: 0;
 }
 .token-summary {
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* 状态行摘要可点击（弹出会话 token 面板）：加悬停反馈但不抢视觉 */
+.token-summary-clickable {
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.15s;
+}
+.token-summary-clickable:hover {
+  color: var(--text);
 }
 .kbd {
   background: var(--bg3);
@@ -716,7 +761,12 @@ textarea {
   padding: 1px 5px;
   font-size: 10px;
 }
-/* 上下文百分比：仅手机端元信息条右侧显示（桌面该位置是快捷键提示） */
+/* 快捷键提示不参与收缩：窄时按档位整块隐藏，绝不折行叠到摘要上 */
+.keyboard-hints {
+  flex-shrink: 0;
+  white-space: nowrap;
+}
+/* 上下文百分比：桌面默认隐藏，手机端或空间不足档位时顶替快捷键提示的位置 */
 .ctx-percent {
   display: none;
   white-space: nowrap;
@@ -767,6 +817,31 @@ textarea {
   }
   .sandbox-label-short {
     display: inline;
+  }
+}
+
+/* ── 元信息条收纳（右侧栏展开 / 窄窗口 / 手机端）──
+   token 摘要与快捷键提示加起来约 600px，中间列被右侧栏挤窄后互相重叠。
+   右侧栏展开时按用户要求整行不显示快捷键提示；再按 #input-meta 实际宽度
+   兜底分档：≤640 提示换位为上下文百分比，≤540（手机竖屏宽度）连 token
+   摘要一起隐藏，完整数据仍在底栏与点击弹层中可查 */
+#input-area.right-panel-open .keyboard-hints .hint-full {
+  display: none;
+}
+#input-area.right-panel-open .ctx-percent {
+  display: inline;
+}
+@container input-meta (max-width: 640px) {
+  .keyboard-hints .hint-full {
+    display: none;
+  }
+  .ctx-percent {
+    display: inline;
+  }
+}
+@container input-meta (max-width: 540px) {
+  .token-summary {
+    display: none;
   }
 }
 

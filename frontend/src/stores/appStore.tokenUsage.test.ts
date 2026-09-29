@@ -191,3 +191,35 @@ it('车道身份与保活单列字段：有值按类型归一化，旧后端缺�
   const junk = normalizeTokenUsage({ cache_keepalive_session_pct: 'n/a' });
   expect(junk.cache_keepalive_session_pct).toBeNull();
 });
+
+it('normalizes session_totals（本会话落库口径）with legacy fallback', () => {
+  const usage = normalizeTokenUsage({
+    used: 1,
+    window: 128000,
+    session_totals: {
+      session_id: '你来对我1.3.3版本新',
+      prompt: 12480,
+      completion: 3206,
+      cached: 9876,
+      cache_prompt: 12000,
+      total: 15686,
+      requests: 23,
+      last_ts: 1759000000,
+      keepalive_prompt: 8120,
+      keepalive_cached: 7900,
+      keepalive_requests: 5,
+    },
+  });
+
+  expect(usage.session_totals.session_id).toBe('你来对我1.3.3版本新');
+  expect(usage.session_totals.prompt).toBe(12480);
+  expect(usage.session_totals.cache_prompt).toBe(12000);
+  expect(usage.session_totals.last_ts).toBe(1759000000);
+  expect(usage.session_totals.keepalive_requests).toBe(5);
+
+  // 旧后端无 session_totals 字段：回落全零 + 空 session_id + last_ts null
+  const legacy = normalizeTokenUsage({ used: 1, window: 128000 });
+  expect(legacy.session_totals.session_id).toBe('');
+  expect(legacy.session_totals.prompt).toBe(0);
+  expect(legacy.session_totals.last_ts).toBeNull();
+});

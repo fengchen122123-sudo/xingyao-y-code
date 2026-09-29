@@ -47,6 +47,18 @@ it('为键盘快捷键提示提供独立的手机端隐藏标记', () => {
   wrapper.unmount();
 });
 
+it('右侧栏展开时根节点带 right-panel-open 标记（CSS 据此隐藏快捷键提示）', async () => {
+  const store = useAppStore();
+  store.rightPanelCollapsed = true;
+  const wrapper = mount(InputArea);
+
+  expect(wrapper.get('#input-area').classes()).not.toContain('right-panel-open');
+  store.rightPanelCollapsed = false;
+  await wrapper.vm.$nextTick();
+  expect(wrapper.get('#input-area').classes()).toContain('right-panel-open');
+  wrapper.unmount();
+});
+
 it('排队消息显示在输入框上方，提供取消与插队按钮', async () => {
   const store = useAppStore();
   store.currentSessionName = 'session-b';
