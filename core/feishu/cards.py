@@ -128,6 +128,22 @@ def card_response(card: Dict[str, Any]) -> Dict[str, Any]:
     return {"card": {"type": "raw", "data": card}}
 
 
+def with_status(card: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """在卡片副本末尾追加一行状态（原地回执用，保留原内容）。
+
+    飞书会用回调返回的卡片**原地替换**被点的那张卡：直接返回一张小回执卡会把
+    原内容（比如星瑶的回复）冲掉。这里基于**原始卡片的副本**追加状态行——
+    原内容保留，且每次都从原始卡片重建，反复提交不会累积多行状态。
+    """
+    import copy
+
+    new_card = copy.deepcopy(card or {})
+    body = new_card.setdefault("body", {})
+    elements = body.setdefault("elements", [])
+    elements.append(md(text))
+    return new_card
+
+
 def build_result_card(title: str, lines: List[str]) -> Dict[str, Any]:
     """操作结果卡（随回调响应帧返回，原地替换被点的卡）。"""
     negative = any(word in title for word in ("拒绝", "取消", "失败", "超时", "已处理", "无权"))
