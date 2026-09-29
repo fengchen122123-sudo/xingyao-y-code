@@ -155,6 +155,16 @@ gui_hiddenimports = common_hiddenimports + [
     'pythonnet',
     'pystray',
     'pystray._win32',
+    # 飞书通道（core/feishu/*）：由 gui_bridge 在函数内惰性 import，静态分析
+    # 本可见；但打包版无控制台，漏收只会在运行期才炸，这里显式声明兜底。
+    # 该通道不引入第三方依赖（传输层为自维护代码），故无需新增 collect_all。
+    'core.feishu.service',
+    'core.feishu.bridge',
+    'core.feishu.client',
+    'core.feishu.cards',
+    'core.feishu.commands',
+    'core.feishu.config',
+    'core.feishu._lark_ws',
 ]
 
 a_gui = Analysis(
