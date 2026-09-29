@@ -505,7 +505,7 @@ def _should_nudge_orchestration(*, allow_subagents, count, session_id, turn_id, 
     """是否注入编排提醒：主代理回合 + 达阈值 + 无计划在途 + 未提醒过。"""
     if not allow_subagents or already_sent:
         return False
-    if count < _ORCHESTRATION_NUDGE_THRESHOLD:
+    if count <= _ORCHESTRATION_NUDGE_THRESHOLD:  # 超过阈值 3（即 ≥4 步）才提醒
         return False
     return not (_has_pending_plan(session_id) or _is_plan_turn(turn_id))
 ```

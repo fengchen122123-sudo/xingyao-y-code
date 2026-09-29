@@ -141,9 +141,11 @@ def verify_spec_collect_all_targets(project_dir):
 
     背景：PyInstaller 的 collect_all 对构建环境里缺失的包静默返回空三元组
     （6.21.0 实测只打 WARNING 不报错），Analysis 照常通过，产物直接丢依赖。
-    pywinpty（GUI 内嵌终端）是重灾区——core/gui_terminal.py 在函数内惰性
-    import，静态分析本就不可达，collect_all 是唯一收集通道；缺包时打包版
-    终端启动即报 ModuleNotFoundError，且整个构建流程没有任何失败信号。
+    pywinpty（GUI 内嵌终端）是重灾区——core/gui_terminal.py 被 gui_bridge.py 顶层
+    导入，其 `from winpty import PtyProcess` 虽是函数内 import，但仍是字面 import、
+    字节码扫描可识别，Python 模块本身不漏收；真正需要 collect_all 的是 pywinpty 的
+    原生二进制与 datas（默认收集不全，collect_all 是收全它们的唯一通道）；缺包时
+    打包版终端启动即报 ModuleNotFoundError，且整个构建流程没有任何失败信号。
     """
     return find_missing_collect_all_targets(
         collect_all_targets_from_spec(os.path.join(project_dir, "ycode.spec"))

@@ -278,7 +278,14 @@ def normalize_browser_viewport(width: object, height: object) -> tuple[int, int]
             raise ComputerControlError(
                 "computer_invalid_config", f"浏览器视口{label}必须是整数"
             )
-        ivalue = int(value)
+        try:
+            ivalue = int(value)
+        except (ValueError, OverflowError, TypeError):
+            # float('nan')/float('inf') 等非有限值不能穿透读路径：
+            # 折算成模块内稳定错误码，而不是裸 ValueError/OverflowError
+            raise ComputerControlError(
+                "computer_invalid_config", f"浏览器视口{label}必须是整数"
+            ) from None
         if ivalue != value:
             raise ComputerControlError(
                 "computer_invalid_config", f"浏览器视口{label}必须是整数"
@@ -301,12 +308,17 @@ def get_project_browser_viewport(workdir: str | None) -> tuple[int, int]:
         return (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
     from core import workspace_settings
 
-    raw = workspace_settings.get_workspace_setting(workdir, BROWSER_VIEWPORT_CONFIG_KEY)
-    if not isinstance(raw, (list, tuple)) or len(raw) != 2:
-        return (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
     try:
+        raw = workspace_settings.get_workspace_setting(
+            workdir, BROWSER_VIEWPORT_CONFIG_KEY
+        )
+        if not isinstance(raw, (list, tuple)) or len(raw) != 2:
+            return (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
         return normalize_browser_viewport(raw[0], raw[1])
-    except ComputerControlError:
+    except Exception:
+        # 读路径铁律：任何损坏（NaN/Inf、相对 workdir、文件不可读等）
+        # 都静默回落默认视口，绝不外抛打断回合
+        logger.debug("项目浏览器视口读取失败，回落默认", exc_info=True)
         return (DEFAULT_BROWSER_VIEWPORT_WIDTH, DEFAULT_BROWSER_VIEWPORT_HEIGHT)
 
 
@@ -320,9 +332,16 @@ def set_project_browser_viewport(workdir: str | None, width: object, height: obj
     from core import workspace_settings
 
     viewport = normalize_browser_viewport(width, height)
-    workspace_settings.set_workspace_setting(
-        workdir, BROWSER_VIEWPORT_CONFIG_KEY, list(viewport)
-    )
+    try:
+        workspace_settings.set_workspace_setting(
+            workdir, BROWSER_VIEWPORT_CONFIG_KEY, list(viewport)
+        )
+    except ValueError as error:
+        # 相对路径 / 目录不存在：折算为稳定错误码，上层工具可据此自纠
+        raise ComputerControlError(
+            "computer_invalid_config",
+            f"项目分辨率保存失败：{error}",
+        ) from error
     _notify_browser_viewport_changed(workdir, viewport)
     return viewport
 
