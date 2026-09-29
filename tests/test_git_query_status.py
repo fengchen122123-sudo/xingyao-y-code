@@ -3,11 +3,11 @@
 from pathlib import Path
 
 from core.git.query import (
-    count_ignored,
     detect_operation_state,
     fetch_status,
     head_state_from,
     parse_status_v2,
+    strip_ignored_records,
 )
 from core.git.models import HeadState, OperationKind, OperationPhase
 from core.git.repository import resolve_repository
@@ -194,11 +194,72 @@ def test_detect_bisect_marked_unsupported(tmp_path):
     assert phase is OperationPhase.RUNNING
 
 
-def test_count_ignored(tmp_path):
+def test_parse_ignored_records_counted():
+    # --ignored=matching 合并进单次扫描后，`!` 记录在解析时计数，其余条目不受影响
+    raw = (
+        b"# branch.oid a\x00# branch.head main\x00"
+        b"1 .M N... 100644 100644 100644 h1 h2 tracked.txt\x00"
+        b"! node_modules/pkg/index.js\x00"
+        b"? u.txt\x00"
+        b"! build/out.log\x00"
+    )
+    status = parse_status_v2(raw)
+    assert status.ignored_count == 2
+    assert [e.path for e in status.unstaged] == ["tracked.txt"]
+    assert status.untracked == ("u.txt",)
+
+
+def test_parse_ignored_without_flag_is_zero():
+    status = parse_status_v2(b"# branch.oid a\x00# branch.head main\x00? u.txt\x00")
+    assert status.ignored_count == 0
+
+
+def test_strip_ignored_records_byte_fidelity():
+    # 剥离 `!` 记录后须与不带 --ignored 的扫描字节完全一致（worktree_version 材料不变）
+    plain = (
+        b"# branch.oid a\x00# branch.head main\x00"
+        b"1 .M N... 100644 100644 100644 h1 h2 tracked.txt\x00"
+        b"? u.txt\x00"
+    )
+    merged = (
+        b"# branch.oid a\x00# branch.head main\x00"
+        b"! build/out.log\x00"
+        b"1 .M N... 100644 100644 100644 h1 h2 tracked.txt\x00"
+        b"? u.txt\x00"
+        b"! node_modules/pkg/index.js\x00"
+    )
+    assert strip_ignored_records(merged) == plain
+
+
+def test_strip_ignored_records_keeps_rename_orig_path():
+    # `2` 记录的 <origPath> 是独立 NUL 段，恰好以 "! " 开头也不能被误剥
+    raw = (
+        b"2 R. N... 100644 100644 100644 h1 h2 R60 new.txt\x00! tricky-orig.txt\x00"
+        b"! real-ignored.log\x00"
+    )
+    stripped = strip_ignored_records(raw)
+    assert stripped == (
+        b"2 R. N... 100644 100644 100644 h1 h2 R60 new.txt\x00! tricky-orig.txt\x00"
+    )
+    status = parse_status_v2(stripped)
+    assert status.entries[0].orig_path == "! tricky-orig.txt"
+    assert status.ignored_count == 0
+
+
+def test_ignored_count_from_merged_scan_real_repo(tmp_path):
     repo = make_repo(tmp_path, commits=1)
     (repo / "ignore-me.log").write_text("x\n", encoding="utf-8")
     (repo / ".gitignore").write_text("*.log\n", encoding="utf-8")
     run_git(repo, "add", ".gitignore")
     run_git(repo, "commit", "-q", "-m", "gitignore")
     identity = resolve_repository(str(repo), GitRunner())
-    assert count_ignored(GitRunner(), identity.worktree_root) >= 1
+    result = GitRunner().run(
+        [
+            "status", "--porcelain=v2", "-z", "--branch", "--show-stash",
+            "--ignored=matching",
+        ],
+        cwd=identity.worktree_root,
+        timeout=60.0,
+    )
+    status = parse_status_v2(result.stdout)
+    assert status.ignored_count >= 1

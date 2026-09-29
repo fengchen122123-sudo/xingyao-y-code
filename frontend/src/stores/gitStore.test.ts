@@ -118,6 +118,55 @@ describe('gitStore', () => {
     expect(get_status).toHaveBeenCalledTimes(3);
   });
 
+  it('切会话后在途的旧工作区快照响应被丢弃，不串台分支角标', async () => {
+    // 复现路径：项目会话（大仓库）快照请求在途 → 切到公共对话（workdir 清空
+    // 并 $reset）→ 旧响应迟到落地。无串号防护时旧仓库快照会重新填入 snapshot，
+    // 公共对话持续显示上一个项目的分支（git_get_status 实测秒级，窗口很大）
+    let resolveStale!: () => void;
+    const staleGate = new Promise<void>((resolve) => { resolveStale = resolve; });
+    const get_status = vi.fn()
+      .mockImplementationOnce(() => staleGate)
+      .mockImplementationOnce(() => Promise.resolve({
+        ok: true,
+        snapshot: fakeSnapshot({
+          branch_name: 'newproj',
+          repository: { worktree_root: 'D:/new', common_git_dir: 'D:/new/.git', git_version: '2.51.2', is_linked_worktree: false },
+        }),
+      }));
+    mockApi({
+      git_get_status: get_status,
+      git_get_trust: vi.fn().mockResolvedValue({ ok: true, level: 'trusted' }),
+    });
+    const store = useGitStore();
+    const stale = store.ensureLoaded('E:/proj');
+    await store.ensureLoaded('D:/new');
+    expect(store.branchLabel).toBe('newproj');
+    // 旧工作区响应此刻才返回：必须被丢弃，快照保持新工作区数据
+    resolveStale();
+    await stale;
+    expect(store.workdir).toBe('D:/new');
+    expect(store.branchLabel).toBe('newproj');
+  });
+
+  it('切到公共对话（workdir 清空）后迟到的快照响应不落地', async () => {
+    let resolveStale!: () => void;
+    const staleGate = new Promise<void>((resolve) => { resolveStale = resolve; });
+    const get_status = vi.fn().mockImplementationOnce(() => staleGate);
+    mockApi({
+      git_get_status: get_status,
+      git_get_trust: vi.fn().mockResolvedValue({ ok: true, level: 'trusted' }),
+    });
+    const store = useGitStore();
+    const stale = store.ensureLoaded('E:/proj');
+    // 模拟 App.vue 切到 GLOBAL 会话：workdir 置空 + $reset
+    store.workdir = '';
+    store.$reset();
+    resolveStale();
+    await stale;
+    expect(store.snapshot).toBeNull();
+    expect(store.branchLabel).toBe('');
+  });
+
   it('stage 调用后以后端新快照刷新界面（仓库为唯一事实源）', async () => {
     const before = fakeSnapshot();
     const after = fakeSnapshot();
