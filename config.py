@@ -182,6 +182,21 @@ REMOTE_PAIR_TOKEN_EXPIRES_KEY = "remote_pair_token_expires_at"
 # 配对端口持久化键：重启后复用同一端口，二维码 URL 不变、无需重新扫码
 REMOTE_PAIR_PORT_KEY = "remote_pair_port"
 
+# 飞书通道（在飞书里与星瑶对话）：默认关闭，未配置时不影响任何现有功能。
+# app_secret 写盘前经 core.credentials 加密（dpapi:/keyring: 前缀），读取时解密。
+FEISHU_ENABLED_KEY = "feishu_enabled"
+FEISHU_ENABLED_DEFAULT = False
+FEISHU_APP_ID_KEY = "feishu_app_id"
+FEISHU_APP_ID_DEFAULT = ""
+FEISHU_APP_SECRET_KEY = "feishu_app_secret"
+FEISHU_APP_SECRET_DEFAULT = ""
+# 审批白名单（open_id 列表）；为空时审批卡不渲染按钮
+FEISHU_APPROVERS_KEY = "feishu_approvers"
+FEISHU_APPROVERS_DEFAULT: tuple = ()
+# 固定推送落点（群/单聊 chat_id，oc_ 开头）；为空时推给最后说话的会话
+FEISHU_NOTIFY_CHAT_ID_KEY = "feishu_notify_chat_id"
+FEISHU_NOTIFY_CHAT_ID_DEFAULT = ""
+
 # 自动从当前源码目录初始化默认配置文件
 if not os.path.exists(_CONFIG_FILE):
     default_config_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
@@ -447,6 +462,9 @@ KNOWN_CONFIG_KEYS = frozenset({
     # 局域网远程控制
     "remote_token_ttl", "remote_pair_token", "remote_pair_token_expires_at",
     "remote_pair_port",
+    # 飞书通道（在飞书里与星瑶对话）
+    "feishu_enabled", "feishu_app_id", "feishu_app_secret", "feishu_approvers",
+    "feishu_notify_chat_id",
     # 数据迁移
     "media_v1_migration_done",
     # 本任务新增：严格模式开关
