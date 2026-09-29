@@ -24,6 +24,7 @@ PAGE_SIZE = 8
 HELP_TEXT = """**星瑶 · 飞书指令**
 
 - `/help`　本帮助
+- `/whoami`　显示你的 open_id（填「审批白名单」要用它）
 - `/panel`　功能面板（按钮即指令）
 - `/status`　绑定与连接状态
 - `/new [标题]`　新建星瑶会话并绑定到本会话
@@ -35,6 +36,22 @@ HELP_TEXT = """**星瑶 · 飞书指令**
 - `/stop`　中止当前会话正在跑的任务
 
 其余任何消息都会直接发给当前绑定的星瑶会话。"""
+
+
+def whoami_text(*, open_id: str, chat_id: str, allowed: bool) -> str:
+    """`/whoami` 回执：给出填白名单要用的 open_id。
+
+    注意 open_id 是「本应用视角」的用户标识——同一个人的 open_id 在不同应用里不同，
+    所以必须用星瑶自己看到的这个值去填白名单。
+    """
+    lines = [
+        "你的 open_id（复制到「设置 → 飞书集成 → 审批白名单」即可）：",
+        open_id or "（拿不到 open_id：请确认应用已开通 im:message 权限）",
+        "",
+        f"当前会话 chat_id：{chat_id or '—'}",
+    ]
+    lines.append("白名单状态：已在名单内 ✅" if allowed else "白名单状态：不在名单内（或白名单为空）")
+    return "\n".join(lines)
 
 
 def parse_command(text: str) -> Tuple[str, str]:

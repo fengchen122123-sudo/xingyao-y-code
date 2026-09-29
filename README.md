@@ -151,6 +151,10 @@ cp config.example.json config.json
 
 - **审批白名单**决定谁能在飞书点「批准 / 拒绝」。留空时飞书侧**不可审批**（卡片只做提醒，
   仍需回桌面端处理）——这是有意的 fail-closed 设计。
+  **不知道自己的 open_id？** 在飞书里给机器人发 `/whoami`，它会回你的 open_id，复制进白名单即可
+  （open_id 按应用区分，必须用星瑶看到的这个值）。
+- 设置页内置飞书侧**六步配置说明**与**配置检查清单**；连不上时先看说明里的排查顺序
+  （事件订阅是否选了长连接、应用是否已发布、权限是否已开通）。
 - 也可以手改 `config.json`：`feishu_enabled` / `feishu_app_id` / `feishu_app_secret` /
   `feishu_approvers` / `feishu_notify_chat_id`；密钥建议在界面里填（会自动加密存储）。
 - 默认关闭；关闭或未配置时星瑶行为与未接入前完全一致。

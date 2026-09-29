@@ -271,6 +271,35 @@ def test_unknown_command_reports(tmp_path):
     assert "未知指令" in api.texts[0]["text"]
 
 
+def test_whoami_returns_open_id_for_whitelist(tmp_path):
+    """白名单自助配置：发 /whoami 拿到「本应用视角」的 open_id。"""
+    br, _, api = _setup(tmp_path, approvers=())
+
+    br.on_feishu_event(_message("/whoami", open_id="ou_self1234"))
+
+    text = api.texts[0]["text"]
+    assert "ou_self1234" in text
+    assert "oc_1" in text                     # 同时给出 chat_id，便于填固定推送落点
+    assert "不在名单内" in text
+    assert api.cards == []
+
+
+def test_whoami_reports_when_already_in_whitelist(tmp_path):
+    br, _, api = _setup(tmp_path, approvers=["ou_allowed"])
+
+    br.on_feishu_event(_message("/whoami", open_id="ou_allowed"))
+
+    assert "已在名单内" in api.texts[0]["text"]
+
+
+def test_help_mentions_whoami(tmp_path):
+    br, _, api = _setup(tmp_path)
+
+    br.on_feishu_event(_message("/help"))
+
+    assert "/whoami" in _card_text(api.cards[0]["card"])
+
+
 def test_plain_text_still_goes_to_model(tmp_path):
     """回归：非指令消息不受指令集影响，仍直接发给绑定会话。"""
     br, star, _ = _setup(tmp_path)

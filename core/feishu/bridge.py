@@ -38,6 +38,7 @@ from core.feishu.commands import (
     stall_card,
     status_card,
     text_card,
+    whoami_text,
 )
 from core.feishu.client import FeishuApiClient, FeishuApiError
 from core.feishu.config import FeishuConfig, load_feishu_config
@@ -576,6 +577,12 @@ class FeishuBridge:
 
         if cmd == "/status":
             return self._status_snapshot_card(chat_id)
+
+        if cmd == "/whoami":
+            # 回执用纯文本：open_id 要能长按复制，卡片里不好选
+            allowed, _ = self._approver_allowed(open_id)
+            self._safe_send_text(chat_id, whoami_text(open_id=open_id, chat_id=chat_id, allowed=allowed))
+            return None
 
         if cmd == "/agent":
             return agent_card(agent_name=self._agent_name(), model_name=self._active_model_name())
