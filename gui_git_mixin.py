@@ -443,7 +443,9 @@ class GitBridgeMixin:
                 return self._git_err(
                     GitError(GitErrorCode.INVALID_STATE, f"未知 AI 辅助类型: {kind}")
                 )
-            return dict(self.send_user_message(template, workdir=workdir, turn_source="git_panel"))
+            # 回合来源必须落在受控值域（local|lan，见 send_user_message 入口校验）：
+            # Git 面板属于本地入口，固定 local；曾误传 "git_panel" 导致按钮被入口拒绝
+            return dict(self.send_user_message(template, workdir=workdir, turn_source="local"))
         except Exception as error:
             return self._git_err(error)
 
