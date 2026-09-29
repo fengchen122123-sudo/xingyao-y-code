@@ -23,6 +23,7 @@ from core.feishu.cards import (
     failure_card,
     permission_card,
     question_card,
+    with_status,
 )
 from core.feishu.commands import (
     agent_card,
@@ -167,3 +168,16 @@ def test_card_is_json_serializable():
     """卡片最终要 json.dumps 后发给飞书，含中文不能炸。"""
     for name, card in _all_cards().items():
         assert json.dumps(card, ensure_ascii=False)
+
+
+def test_with_status_appends_without_mutating_original():
+    """原地回执：追加状态行不得改动原卡片（原件要能反复复用）。"""
+    original = completion_card("飞书 · ou_x", "星瑶的回复正文")
+    before = json.dumps(original, ensure_ascii=False)
+
+    updated = with_status(original, "✅ 已发送")
+
+    assert json.dumps(original, ensure_ascii=False) == before          # 原件未被改动
+    assert "星瑶的回复正文" in json.dumps(updated, ensure_ascii=False)   # 内容保留
+    assert "✅ 已发送" in json.dumps(updated, ensure_ascii=False)
+    assert len(updated["body"]["elements"]) == len(original["body"]["elements"]) + 1

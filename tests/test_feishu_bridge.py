@@ -52,11 +52,12 @@ class _FakeApi:
 
     def send_text(self, chat_id, text, reply_to=None):
         self.texts.append({"chat_id": chat_id, "text": text})
-        return {"code": 0}
+        return {"code": 0, "data": {"message_id": f"om_t{len(self.texts)}"}}
 
     def send_card(self, chat_id, card, reply_to=None):
-        self.cards.append({"chat_id": chat_id, "card": card})
-        return {"code": 0}
+        message_id = f"om_{len(self.cards) + 1}"
+        self.cards.append({"chat_id": chat_id, "card": card, "message_id": message_id})
+        return {"code": 0, "data": {"message_id": message_id}}
 
 
 def _bridge(tmp_path, star=None):
@@ -88,11 +89,12 @@ def _message_event(text="你好", chat_id="oc_1", open_id="ou_abcdefgh", msg_typ
 
 
 def _card_action_event(kind="reply", form_value=None, chat_id="oc_1", open_id="ou_abcdefgh",
-                       via_form_submit=False):
+                       via_form_submit=False, message_id=""):
     """构造卡片回调事件。
 
     via_form_submit=True 模拟**表单提交按钮**的真实载荷：只有 `action.name`，
     没有 `action.value`（提交按钮不带 behaviors）。
+    message_id 对应飞书回调里的 context.open_message_id（被点卡片的消息 id）。
     """
     action: dict = {"form_value": form_value or {}}
     if via_form_submit:
@@ -104,7 +106,7 @@ def _card_action_event(kind="reply", form_value=None, chat_id="oc_1", open_id="o
         "event": {
             "operator": {"open_id": open_id},
             "action": action,
-            "context": {"open_chat_id": chat_id},
+            "context": {"open_chat_id": chat_id, "open_message_id": message_id},
         },
     }
 
@@ -282,6 +284,59 @@ def test_card_reply_with_empty_form_returns_warning(tmp_path):
     assert star.sent == []
     assert response["card"]["type"] == "raw"
     assert "没有内容" in response["card"]["data"]["header"]["title"]["content"]
+
+
+# ---------------------------------------------------------------- 原地回执不冲掉原内容
+
+def test_reply_keeps_original_card_content(tmp_path):
+    """在完成卡上追问后，卡片必须**保留星瑶的回复**，只追加一行状态。
+
+    真机反馈：直接返回小回执卡会把原内容冲掉（飞书是原地替换语义）。
+    """
+    br, star, api = _bridge(tmp_path)
+    br.on_feishu_event(_message_event("第一轮"))
+    session = star.sent[0]["session_name"]
+    br.on_agent_event("message_final", {"session_name": session, "content": "我是星瑶，可以帮你写代码"})
+    br.on_agent_event("turn_finish", {"session_name": session})
+    completion_id = api.cards[0]["message_id"]
+
+    response = br.on_feishu_event(_card_action_event(
+        "reply", form_value={"reply_text": "再详细点"}, via_form_submit=True, message_id=completion_id))
+
+    card = response["card"]["data"]
+    body = json.dumps(card, ensure_ascii=False)
+    assert "我是星瑶，可以帮你写代码" in body      # 原内容保留
+    assert "✅ 已发送" in body                      # 追加了状态行
+    assert card["header"]["title"]["content"] == "✅ 星瑶已完成"   # 卡片本体没被换成小回执卡
+
+
+def test_repeated_replies_do_not_accumulate_status_lines(tmp_path):
+    br, star, api = _bridge(tmp_path)
+    br.on_feishu_event(_message_event("第一轮"))
+    session = star.sent[0]["session_name"]
+    br.on_agent_event("message_final", {"session_name": session, "content": "结果正文"})
+    br.on_agent_event("turn_finish", {"session_name": session})
+    completion_id = api.cards[0]["message_id"]
+
+    first = br.on_feishu_event(_card_action_event(
+        "reply", form_value={"reply_text": "追问一"}, via_form_submit=True, message_id=completion_id))
+    second = br.on_feishu_event(_card_action_event(
+        "reply", form_value={"reply_text": "追问二"}, via_form_submit=True, message_id=completion_id))
+
+    assert json.dumps(first["card"]["data"], ensure_ascii=False).count("✅ 已发送") == 1
+    assert json.dumps(second["card"]["data"], ensure_ascii=False).count("✅ 已发送") == 1
+
+
+def test_reply_without_known_card_falls_back_to_result_card(tmp_path):
+    """取不到原件（超出保留上限/非本进程发的卡）时退回独立小回执卡。"""
+    br, star, _ = _bridge(tmp_path)
+
+    response = br.on_feishu_event(_card_action_event(
+        "reply", form_value={"reply_text": "追问"}, via_form_submit=True, message_id="om_unknown"))
+
+    card = response["card"]["data"]
+    assert card["header"]["title"]["content"] == "✅ 已发送"
+    assert star.sent[-1]["text"] == "追问"
 
 
 def test_unknown_event_type_is_ignored(tmp_path):
