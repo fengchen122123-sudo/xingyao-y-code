@@ -32,6 +32,7 @@ from core.feishu.cards import (  # noqa: E402
     failure_card,
     permission_card,
     question_card,
+    with_status,
 )
 from core.feishu.client import FeishuApiClient, FeishuApiError  # noqa: E402
 from core.feishu.commands import (  # noqa: E402
@@ -157,9 +158,11 @@ def main() -> int:
     client = FeishuApiClient(cfg.app_id, cfg.app_secret)
     print(f"发送到会话 {chat_id}（共 {len(cards)} 张）\n")
     failed = []
+    sent_ids = {}
     for name, card in cards.items():
         try:
-            client.send_card(chat_id, card)
+            resp = client.send_card(chat_id, card)
+            sent_ids[name] = str(((resp or {}).get("data") or {}).get("message_id") or "")
             print(f"✅ {name}")
         except FeishuApiError as e:
             failed.append(name)
@@ -168,7 +171,19 @@ def main() -> int:
             failed.append(name)
             print(f"❌ {name}: {type(e).__name__}: {e}")
 
-    print(f"\n结果：{len(cards) - len(failed)}/{len(cards)} 张被飞书接受")
+    # 原地回执卡（点按钮后返回的卡片，走 update_card 同一个校验器）：
+    # 完成卡 + 一行状态是卡片表单追问后的实际返回形态，必须一并验
+    completion_id = sent_ids.get("completion")
+    if completion_id and "completion" in cards:
+        try:
+            client.update_card(completion_id, with_status(cards["completion"], "✅ 已发送 · 自检"))
+            print("✅ completion+status（原地回执卡形态）")
+        except FeishuApiError as e:
+            failed.append("completion+status")
+            print(f"❌ completion+status: {e}")
+
+    print(f"\n结果：{len(cards) + (1 if completion_id else 0) - len(failed)}"
+          f"/{len(cards) + (1 if completion_id else 0)} 张被飞书接受")
     if failed:
         print("被拒卡片：" + ", ".join(failed))
         return 1

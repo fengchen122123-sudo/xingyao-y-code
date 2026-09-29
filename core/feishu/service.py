@@ -31,6 +31,12 @@ STATE_RECONNECTING = "reconnecting"
 STATE_ERROR = "error"
 STATE_STOPPED = "stopped"
 
+# 需要留痕的回合事件（每个回合固定 2~4 条，不构成噪音；其余高频事件不记）
+_TRACE_EVENTS = frozenset({
+    "message_final", "turn_finish", "turn_cancelled", "turn_error",
+    "session_renamed", "permission_request", "permission_dismiss",
+})
+
 
 class FeishuService:
     """飞书长连接服务。未配置时 `start()` 直接返回 False，不做任何事。"""
@@ -165,10 +171,16 @@ class FeishuService:
         bridge = self._bridge
         if bridge is None:
             return
+        # 回合结束类事件必须留痕：这条链路此前完全静默，导致"卡片没发出去"
+        # 无法区分「事件没到桥接层」与「到了但没匹配上本轮」
+        if event_type in _TRACE_EVENTS:
+            logger.info("飞书事件转发: %s session=%s",
+                        event_type, (data or {}).get("session_name") if isinstance(data, dict) else "?")
         try:
             bridge.on_agent_event(event_type, data)
         except Exception:
-            logger.debug("飞书事件转发失败: %s", event_type, exc_info=True)
+            # 吞掉异常但不能静默：热路径上的错误必须可见，否则排查无从下手
+            logger.warning("飞书事件转发失败: %s", event_type, exc_info=True)
 
     # ---- 事件：飞书 → 星瑶 ----
 

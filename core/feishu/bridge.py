@@ -26,6 +26,7 @@ from core.feishu.cards import (
     question_card,
     strip_mention,
     target_lines,
+    with_status,
 )
 from core.feishu.commands import (
     HELP_TEXT,
@@ -175,6 +176,10 @@ class FeishuBridge:
         # 星瑶会在回合中把会话自动重命名（首条消息当标题），此时 message_final 仍用
         # 旧名、turn_finish 用新名——没有这张表，turn_finish 就找不到本轮，卡片静默不发。
         self._session_aliases: Dict[str, str] = {}
+        # 已发送卡片（message_id → 原始卡片）：卡片按钮回调是「原地替换」语义，
+        # 保留原件才能在回执时重建「原内容 + 状态行」，而不是把原内容冲掉
+        self._sent_cards: Dict[str, Dict[str, Any]] = {}
+        self._sent_cards_limit = 200
         # 卡住提醒的冷却时间戳（session → 上次提醒时刻）
         self._stall_notified: Dict[str, float] = {}
         self._watchdog: Optional[threading.Thread] = None
@@ -268,6 +273,8 @@ class FeishuBridge:
         form_value = action.get("form_value") or {}
         context = body.get("context") or {}
         chat_id = str(context.get("open_chat_id") or context.get("chat_id") or self._store.last_chat_id())
+        # 被点卡片的消息 id：表单提交没有 value，靠它反查请求 id，也靠它取回原始卡片做原地回执
+        message_id = str(context.get("open_message_id") or "")
         open_id = str((body.get("operator") or {}).get("open_id") or "")
         # 表单提交按钮只带 action.name（没有 behaviors/value），因此 kind 要两处取
         kind = str(value.get("kind") or action.get("name") or "")
@@ -279,23 +286,28 @@ class FeishuBridge:
         if kind == "reply":
             # 输入框 name 是 reply_text（与提交按钮路由名 reply 区分，否则飞书判重名拒卡）
             text = str(form_value.get("reply_text") or "").strip()
+            logger.info("飞书卡片追问: chat=%s 内容=%r form_keys=%s",
+                        chat_id, text[:60], sorted(form_value.keys()))
             if not text:
-                return card_response(build_result_card("⚠️ 没有内容", ["请先输入内容再点发送"]))
+                return card_response(self._status_response(message_id, "⚠️ 没有内容", "请先输入内容再点发送"))
             session = self._ensure_session(chat_id, open_id)
             if not session:
-                return card_response(build_result_card("❌ 发送失败", ["创建星瑶会话失败"]))
+                return card_response(self._status_response(message_id, "❌ 发送失败", "创建星瑶会话失败"))
             self._buffer_turn(session, chat_id, text)
             try:
                 result = self._bridge.send_user_message(text, session_name=session, turn_source=TURN_SOURCE)
             except Exception as e:
                 self._drop_turn(session)
                 logger.exception("飞书卡片追问转回合失败")
-                return card_response(build_result_card("❌ 发送失败", [str(e)]))
+                return card_response(self._status_response(message_id, "❌ 发送失败", str(e)))
             if not result or not result.get("ok"):
                 self._drop_turn(session)
-                return card_response(build_result_card("❌ 发送失败", [(result or {}).get("msg") or "未知错误"]))
+                return card_response(self._status_response(
+                    message_id, "❌ 发送失败", str((result or {}).get("msg") or "未知错误")))
             label = self._store.label_of(chat_id) or session
-            return card_response(build_result_card("✅ 已发送", [f"会话 {label}，完成后推送结果"]))
+            logger.info("飞书卡片追问已转回合: session=%s", session)
+            return card_response(self._status_response(
+                message_id, "✅ 已发送", f"会话 {label}，完成后会推送新的结果卡"))
 
         if kind == "perm":
             return self._handle_permission_action(value, request_id, open_id)
@@ -312,7 +324,7 @@ class FeishuBridge:
             return None
 
         # 其余卡片动作由后续任务接管
-        logger.debug("暂不处理的卡片动作: %s", kind or action.get("name") or "?")
+        logger.info("暂不处理的卡片动作: %s（value=%s）", kind or action.get("name") or "?", sorted(value.keys()))
         return None
 
     # ---- 审批 / 提问 ----
@@ -369,10 +381,9 @@ class FeishuBridge:
                     buttons_enabled=allowed,
                     hint=hint,
                 )
-            resp = self._api_client().send_card(chat_id, card)
             # 记下卡片消息 id → 请求 id：表单提交按钮没有 value，回调只能靠
             # context.open_message_id 反查（与 opencode-mobile 的 messageId 方案一致）
-            message_id = str(((resp or {}).get("data") or {}).get("message_id") or "")
+            message_id = self._send_card(chat_id, card)
             if message_id:
                 self._remember_card_request(message_id, request_id)
         except Exception:
@@ -475,6 +486,7 @@ class FeishuBridge:
 
         session = str(data.get("session_name") or "")
         if not session:
+            logger.info("飞书事件 %s 无 session_name，已忽略", event_type)
             return
         # 改名后的事件名经别名回溯到本轮 pending 的键
         key = self._pending_key(session)
@@ -482,7 +494,10 @@ class FeishuBridge:
         self._touch_activity(key)
         with self._lock:
             buffered = key in self._pending
+        if event_type in ("message_final", "turn_error", "turn_finish", "turn_cancelled"):
+            logger.info("飞书回合事件: %s session=%s 命中本轮=%s", event_type, session, buffered)
         if not buffered:
+            # 桌面端自己的回合不产生飞书消息（设计如此）；仅当看起来该有本轮时才提示
             return
 
         if event_type == "message_final":
@@ -556,7 +571,7 @@ class FeishuBridge:
                     workdir=self._session_workdir(current_name),
                     cancelled=cancelled,
                 )
-            self._api_client().send_card(chat_id, card)
+            self._send_card(chat_id, card)
         except Exception:
             logger.exception("发送飞书回合结果失败（chat=%s）", chat_id)
 
@@ -837,11 +852,52 @@ class FeishuBridge:
         except Exception:
             return ""
 
+    def _send_card(self, chat_id: str, card: Dict[str, Any]) -> str:
+        """发送卡片、记日志、记住原件（供原地回执重建），返回 message_id。
+
+        成功必须留痕：此前 `_flush` 直接调 api 且只在失败时记日志，"卡片到底发没发出去"
+        只能靠猜（真机排查时踩过）。
+        """
+        resp = self._api_client().send_card(chat_id, card)
+        message_id = str(((resp or {}).get("data") or {}).get("message_id") or "")
+        title = ((card or {}).get("header") or {}).get("title") or {}
+        logger.info("飞书卡片已发送: chat=%s 标题=%s id=%s",
+                    chat_id, title.get("content"), message_id or "-")
+        if message_id:
+            self._remember_card(message_id, card)
+        return message_id
+
+    def _remember_card(self, message_id: str, card: Dict[str, Any]) -> None:
+        with self._lock:
+            self._sent_cards[message_id] = card
+            while len(self._sent_cards) > self._sent_cards_limit:
+                oldest = next(iter(self._sent_cards), None)
+                if oldest is None:
+                    break
+                self._sent_cards.pop(oldest, None)
+
+    def _original_card(self, message_id: str) -> Optional[Dict[str, Any]]:
+        if not message_id:
+            return None
+        with self._lock:
+            return self._sent_cards.get(message_id)
+
+    def _status_response(self, message_id: str, title: str, detail: str = "") -> Dict[str, Any]:
+        """原地回执：**保留**被点卡片的原内容，只在末尾追加状态行。
+
+        飞书会用回调返回的卡片原地替换被点的那张卡——完成卡上直接返回小回执卡会把
+        星瑶的回复内容冲掉（真机反馈过）。取不到原件（超出保留上限/非本进程发的卡）
+        时退回独立小卡。
+        """
+        original = self._original_card(message_id)
+        if original is not None:
+            body = f"**{title}**" + (f"\n{detail}" if detail else "")
+            return with_status(original, body)
+        return build_result_card(title, [detail] if detail else [])
+
     def _safe_send_card(self, chat_id: str, card: Dict[str, Any]) -> None:
         try:
-            self._api_client().send_card(chat_id, card)
-            title = ((card or {}).get("header") or {}).get("title") or {}
-            logger.info("飞书卡片已发送: chat=%s 标题=%s", chat_id, title.get("content"))
+            self._send_card(chat_id, card)
         except Exception:
             logger.exception("发送飞书卡片失败（chat=%s）", chat_id)
 
