@@ -253,7 +253,8 @@ class FeishuBridge:
             request_id = self._request_id_for_message(str(context.get("open_message_id") or ""))
 
         if kind == "reply":
-            text = str(form_value.get("reply") or "").strip()
+            # 输入框 name 是 reply_text（与提交按钮路由名 reply 区分，否则飞书判重名拒卡）
+            text = str(form_value.get("reply_text") or "").strip()
             if not text:
                 return card_response(build_result_card("⚠️ 没有内容", ["请先输入内容再点发送"]))
             session = self._ensure_session(chat_id, open_id)
