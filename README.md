@@ -141,8 +141,12 @@ cp config.example.json config.json
 1. 在[飞书开放平台](https://open.feishu.cn/)建一个**企业自建应用**，拿到 App ID 与 App Secret。
 2. 给应用开通权限：`im:message`（读消息）、`im:message:send_as_bot`（发消息）；
    需要在群里 @ 机器人时再加 `im:message.group_at_msg`。
-3. 在「事件与回调」里把订阅方式切到**使用长连接接收事件**，并订阅
-   `im.message.receive_v1`（收消息）与 `card.action.trigger`（卡片按钮回传）。
+3. 在「事件与回调」里把订阅方式切到**使用长连接接收事件**，然后**两块都要加**：
+   - **事件订阅**：`im.message.receive_v1`（收消息）
+   - **回调 / 卡片回调**：`card.action.trigger`（卡片按钮回传）
+
+   > 第二块最容易漏。只配事件不配回调时，消息能收到、机器人也能回话，但卡片上的
+   > 按钮（批准 / 拒绝 / 面板 / 翻页）点了没有任何反应。改完订阅记得**重新发布版本**。
 
 > 长连接由星瑶主动连飞书，**不需要公网 IP、也不需要内网穿透**，更不用配回调地址与校验密钥。
 

@@ -146,10 +146,22 @@
             需要在群里 @ 机器人时再加 <code>im:message.group_at_msg</code>。
           </li>
           <li>
-            <b>事件订阅切长连接</b>：应用详情 → <b>事件与回调</b> → 订阅方式选
-            <b>使用长连接接收事件</b>；然后添加两个事件：
-            <code>im.message.receive_v1</code>（收到消息）、
-            <code>card.action.trigger</code>（卡片按钮回传）。
+            <b>事件与回调都要配</b>：应用详情 → <b>事件与回调</b>，先把订阅方式选
+            <b>使用长连接接收事件</b>，然后分两块加：
+            <ul>
+              <li>
+                <b>事件订阅</b>（收消息）：
+                <code>im.message.receive_v1</code>。
+              </li>
+              <li>
+                <b>回调 / 卡片回调</b>（卡片按钮回传）：
+                <code>card.action.trigger</code>。
+                <span class="tip">
+                  这块<b>最容易漏</b>：只配事件不配回调时，消息能收到、机器人也能回话，
+                  但卡片上的按钮（批准 / 拒绝 / 面板 / 翻页）点了<b>没有任何反应</b>。
+                </span>
+              </li>
+            </ul>
             <span class="tip">选长连接就<b>不用填回调地址、不用公网 IP、不用内网穿透</b>。</span>
           </li>
           <li>
@@ -182,6 +194,15 @@
           <li>事件订阅是不是选了<b>长连接</b>（选了「回调地址」而没填地址，事件不会推过来）。</li>
           <li>应用是否<b>已发布</b>且管理员已通过；权限是否已开通。</li>
           <li>星瑶这边「启用飞书通道」开关是否打开（关闭时完全不建连接）。</li>
+        </ul>
+
+        <h3>消息能收到，但卡片按钮点了没反应</h3>
+        <ul>
+          <li>
+            多半是<b>回调没配</b>：回「事件与回调」里确认 <code>card.action.trigger</code>
+            加在了<b>回调 / 卡片回调</b>那一块（不是只加在事件订阅里），且该处的订阅方式同样是长连接。
+          </li>
+          <li>再确认应用版本已重新发布——改完订阅要<b>重新发版</b>才会生效。</li>
         </ul>
       </div>
     </section>
@@ -380,6 +401,8 @@ onMounted(load);
 .help-toggle .chev.open { transform: rotate(90deg); }
 .help-body ol, .help-body ul { margin: 0; padding-left: 18px; }
 .help-body li { margin-bottom: 8px; font-size: 12.5px; color: var(--text-2); line-height: 1.75; }
+.help-body li > ul { margin: 4px 0 4px; }
+.help-body li > ul > li { margin-bottom: 4px; list-style: circle; }
 .help-body h3 { margin: 14px 0 6px; font-size: 12.5px; color: var(--text-1); }
 .help-body a { color: var(--accent); }
 .help-body code { padding: 1px 5px; border-radius: 4px; background: var(--bg1); font-family: var(--font-mono); font-size: 11.5px; }
