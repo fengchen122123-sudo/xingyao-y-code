@@ -52,6 +52,16 @@ class FeishuService:
 
     def set_bridge(self, bridge) -> None:
         self._bridge = bridge
+        self._wire_status_provider(bridge)
+
+    def _wire_status_provider(self, bridge) -> None:
+        """把本服务的状态快照注入桥接层，供 /status 指令展示连接态。"""
+        setter = getattr(bridge, "set_status_provider", None)
+        if callable(setter):
+            try:
+                setter(self.status)
+            except Exception:
+                logger.debug("注入飞书状态提供者失败", exc_info=True)
 
     # ---- 生命周期 ----
 
@@ -72,6 +82,7 @@ class FeishuService:
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
                 return False
+            self._wire_status_provider(self._bridge)
             try:
                 client = Client(
                     app_id=cfg.app_id,
