@@ -87,6 +87,14 @@ def test_lan_turn_is_always_disabled(enabled_settings):
     assert resolve_computer_capability(model, {}, enabled_settings, "lan").error_code == "computer_remote_forbidden"
 
 
+def test_feishu_turn_is_also_remote(enabled_settings):
+    """飞书通道发起的回合与 LAN 同属「远程」：即使两个开关全开也禁用电脑操控。"""
+    model = {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "generic"}
+    capability = resolve_computer_capability(model, {}, enabled_settings, "feishu")
+    assert capability.error_code == "computer_remote_forbidden"
+    assert capability.enabled is False
+
+
 def test_native_requires_official_openai_responses(enabled_settings):
     model = {"supports_vision": True, "supports_function_calling": True, "computer_protocol": "native_openai"}
     provider = {"protocol": "openai", "base_url": "https://proxy.example/v1"}
