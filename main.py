@@ -3529,8 +3529,9 @@ def handle_slash_command(command_text):
                 if shell_log_available:
                     print_formatted_text(HTML(f"<ansicyan><b>--- 任务 {safe_tid} 最新 30 行日志 ---</b></ansicyan>"))
                     # Low 修复：任务日志可能携带 ANSI 控制序列，直接 print 会注入终端样式；
-                    # 与 history_renderer 一致，剥离 ESC 字符后再输出。
-                    print(output.replace("\x1b", ""))
+                    # get_task_output 已整段剥离，这里兜底再过一次共享清洗函数
+                    from core.process_io import strip_ansi_escapes
+                    print(strip_ansi_escapes(output))
                 else:
                     # 再查子代理任务状态
                     sub_tasks = subagent_manager.snapshot()

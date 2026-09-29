@@ -1059,8 +1059,12 @@ from core.llm_execution import (
 
 # ── 编排提醒：多步未建计划时的软提醒（每回合最多 1 次）────────────────
 
-# 阈值口径：实质操作数"超过"该阈值（即 ≥ 4）才提醒，恰好 3 步及以内不提醒——
-# 与提醒文案及 system_prompt*.md 的"3 条及以内直接执行"保持一致。
+# 阈值口径：计数对象是“实质操作数”而非模型拆解出的子任务条数——前者由
+# _count_substantive_ops 统计（write_file / edit_file / 非只读 execute_command
+# 的调用数），与后者是近似映射（一步实质操作 ≈ 推进一条子任务），仅作运行时兜底
+# 估计。阈值语义是“超过 3”（即 ≥ 4）才提醒，恰好 3 步及以内不提醒，与提醒文案及
+# system_prompt.md / system_prompt_gui.md 的“子任务超过 3 条（即 ≥ 4 条）必须先用
+# plan_write、3 条及以内直接执行”保持一致。
 _ORCHESTRATION_NUDGE_THRESHOLD = 3
 _ORCHESTRATION_COUNTED_TOOLS = frozenset({"write_file", "edit_file"})
 _ORCHESTRATION_COMMAND_TOOL = "execute_command"
@@ -2999,10 +3003,15 @@ def _chat_with_model_generator(
                     "content": _ORCHESTRATION_NUDGE_TEXT,
                 }
                 messages.append(orchestration_request)
+                # 此处不重复加 if stream 守卫：flush_persistence() 内部已以
+                # `if stream and pending_persistence` 整体兜底，非持久化会话
+                # （stream=False，即 persist=False 的内部调用）下该 append 与随后的
+                # flush 均为 no-op，行为等价；与 slow_step_nudge / summary_request /
+                # claim_nudge 等既有 nudge 注入保持同一种写法（统一由 flush_persistence
+                # 兜底，不逐点加守卫）。
                 pending_persistence.append(("user", orchestration_request))
-                _notify_event(event_callback, "notice", {
-                    "message": "已提醒模型评估是否需要建立任务计划。",
-                })
+                # 静默注入：不发 notice 事件（UI 不弹提示卡片），只留 debug 日志
+                logger.debug("已静默注入编排提醒（session=%s turn=%s）", parent_session, parent_turn_id)
                 flush_persistence()
                 progress_guard.observe(
                     _step_progress_observation(None, session_id=parent_session)

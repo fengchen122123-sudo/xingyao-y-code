@@ -32,6 +32,33 @@ def test_background_task_log_is_opened_as_binary(tmp_path, monkeypatch):
         handle.close()
 
 
+def test_background_task_env_disables_color_output(tmp_path, monkeypatch):
+    captured = {}
+
+    def fake_popen(*args, **kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(pid=12346)
+
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "TASK_DB_PATH", str(tmp_path / "tasks.json"))
+    monkeypatch.setattr(task_manager, "ACTIVE_TASKS", {})
+    monkeypatch.setattr(task_manager.subprocess, "Popen", fake_popen)
+    # 继承环境里的 FORCE_COLOR 优先级高于 NO_COLOR，必须被移除
+    monkeypatch.setenv("FORCE_COLOR", "1")
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+    task_id = task_manager.start_background_task("demo")
+
+    handle = captured["stdout"]
+    try:
+        env = captured["env"]
+        assert env["NO_COLOR"] == "1"
+        assert "FORCE_COLOR" not in env
+        assert task_id in task_manager.ACTIVE_TASKS
+    finally:
+        handle.close()
+
+
 def test_background_task_output_decodes_raw_log_bytes(tmp_path, monkeypatch):
     task_id = "raw-log"
     raw = "星期六\n".encode("gbk")
@@ -59,6 +86,41 @@ def test_background_task_output_decodes_raw_log_bytes(tmp_path, monkeypatch):
 
     assert decoded == [(raw, "gbk")]
     assert output == "星期六\n"
+
+
+def test_get_task_output_strips_ansi_escape_sequences(tmp_path, monkeypatch):
+    task_id = "ansi-log"
+    # 模拟 vitest 在管道下的彩色输出：颜色码与正文混在日志原文里
+    raw = (
+        "\x1b[0;39m\x1b[33mHTMLCanvasElement's getContext()\x1b[39m not implemented\n"
+        "\x1b[32mPASS\x1b[0m src/app.test.ts (14ms)\n"
+    ).encode("ascii")
+    (tmp_path / f"task_{task_id}.log").write_bytes(raw)
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+    monkeypatch.setattr(task_manager, "ACTIVE_TASKS", {})
+
+    output = task_manager.get_task_output(task_id)
+
+    assert output == (
+        "HTMLCanvasElement's getContext() not implemented\n"
+        "PASS src/app.test.ts (14ms)\n"
+    )
+    assert "\x1b" not in output
+    assert "[0;39m" not in output
+
+
+def test_read_log_tail_strips_ansi_escape_sequences(tmp_path, monkeypatch):
+    # 纯 ASCII 内容：log_tail 的解码编码随平台控制台变化，中文在这里有
+    # "合法 GBK 误读" 的歧义，不适合做跨机器断言
+    task_id = "ansi-tail"
+    (tmp_path / f"task_{task_id}.log").write_bytes(
+        "\x1b[31mBUILD FAILED\x1b[0m: missing dependency\n".encode("ascii")
+    )
+    monkeypatch.setattr(task_manager, "LOG_DIR", str(tmp_path))
+
+    tail = task_manager._read_log_tail(task_id)
+
+    assert tail == "BUILD FAILED: missing dependency\n"
 
 
 def test_start_failure_closes_log_file_handle(tmp_path, monkeypatch):

@@ -547,8 +547,54 @@ export interface TokenUsage {
   total_prompt: number;
   total_completion: number;
   total_cached: number;
+  /** 本会话口径（token_usage 落库聚合，重启不清零）；状态行默认显示这组数字 */
+  session_totals: SessionTokenTotals;
   /** 上下文来源字符占比快照（输入框悬停面板用）；无数据为 [] */
   context_breakdown: ContextBreakdownItem[];
+}
+
+/** 本会话 token 用量聚合：对话口径（main/legacy），保活单列不混入 */
+export interface SessionTokenTotals {
+  session_id: string;
+  prompt: number;
+  completion: number;
+  cached: number;
+  /** 命中率分母：只含已报告缓存明细的轮次 prompt（未报告 ≠ 0） */
+  cache_prompt: number;
+  total: number;
+  requests: number;
+  last_ts: number | null;
+  keepalive_prompt: number;
+  keepalive_cached: number;
+  keepalive_requests: number;
+}
+
+/** 会话弹层的单会话行（按合计 token 降序） */
+export interface TokenUsageOverviewSession {
+  session_id: string;
+  prompt: number;
+  completion: number;
+  cached: number;
+  cache_prompt: number;
+  total: number;
+  requests: number;
+  last_ts: number | null;
+}
+
+/** 会话 token 弹层数据：全部会话合计（不分 scope，含保活/压缩）+ 会话列表 */
+export interface TokenUsageOverview {
+  ok: boolean;
+  msg?: string;
+  current: string;
+  totals: {
+    prompt: number;
+    completion: number;
+    cached: number;
+    cache_prompt: number;
+    total: number;
+    requests: number;
+  };
+  sessions: TokenUsageOverviewSession[];
 }
 
 export interface TokenStatisticsMetrics {
@@ -983,6 +1029,7 @@ export interface PyWebViewAPI {
   jump_queue(sessionName: string, messageId: string): Promise<any>;
 
   get_token_usage(): Promise<TokenUsage>;
+  get_token_usage_overview(limit?: number): Promise<TokenUsageOverview>;
   get_token_usage_statistics(days: 1 | 7 | 30 | 365): Promise<TokenStatisticsSnapshot | { ok: false; msg: string }>;
 
   toggle_skill(skillId: string, enabled: boolean): Promise<any>;
