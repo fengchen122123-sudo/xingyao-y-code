@@ -38,8 +38,10 @@ from core.feishu.client import FeishuApiClient, FeishuApiError  # noqa: E402
 from core.feishu.commands import (  # noqa: E402
     agent_card,
     inbox_card,
+    mode_card,
     model_list_card,
     panel_card,
+    sandbox_card,
     session_list_card,
     stall_card,
     status_card,
@@ -102,6 +104,8 @@ def build_cards():
             {"request_id": "req-2", "is_question": True, "title": "Database Selection", "session_label": SESSION_LABEL},
         ], page=1),
         "stall": stall_card(session_label=SESSION_LABEL, last_text="重构 server/src 下的鉴权逻辑", minutes=12),
+        "mode": mode_card(current_mode="confirm", session_label=SESSION_LABEL, buttons_enabled=True),
+        "sandbox": sandbox_card(enabled=False, buttons_enabled=True),
         "help": text_card("星瑶 · 帮助", "**星瑶 · 飞书指令**\n\n- `/help` 本帮助\n- `/whoami` 显示你的 open_id"),
         "agent": agent_card(agent_name="星瑶", model_name="agnes-3.0-flash"),
     }

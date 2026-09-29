@@ -32,9 +32,12 @@ from core.feishu.commands import (
     HELP_TEXT,
     agent_card,
     inbox_card,
+    mode_card,
     model_list_card,
     panel_card,
     parse_command,
+    permission_mode_label,
+    sandbox_card,
     session_list_card,
     stall_card,
     status_card,
@@ -697,6 +700,12 @@ class FeishuBridge:
         if cmd == "/model":
             return self._command_model(chat_id, arg)
 
+        if cmd == "/mode":
+            return self._command_mode(chat_id, open_id, arg)
+
+        if cmd == "/sandbox":
+            return self._command_sandbox(chat_id, open_id, arg)
+
         if cmd == "/inbox":
             if arg.startswith("open:"):
                 return self._open_inbox_item(arg.split(":", 1)[1])
@@ -759,6 +768,91 @@ class FeishuBridge:
             return None
         return text_card("✅ 已切换模型",
                          f"**{target.get('name') or target.get('id')}**\n`{target.get('id')}`", "green")
+
+    # ---- 执行权限档位（会话级）----
+
+    def _current_permission_mode(self, session: str) -> str:
+        try:
+            result = self._bridge.get_permission_mode(session or "")
+            if result and result.get("ok"):
+                return str(result.get("permission_mode") or "")
+        except Exception:
+            logger.debug("读取权限档位失败", exc_info=True)
+        return ""
+
+    def _command_mode(self, chat_id: str, open_id: str, arg: str):
+        session = self._store.session_of(chat_id)
+        label = self._store.label_of(chat_id) or session
+        current = self._current_permission_mode(session)
+        # 只读展示不需要白名单；**切换**属于远程改执行策略，必须白名单把关
+        allowed, reason = self._approver_allowed(open_id)
+
+        if not arg:
+            return mode_card(current_mode=current, session_label=label,
+                             buttons_enabled=allowed, hint=reason)
+
+        if not allowed:
+            logger.info("飞书权限档位切换被拒（不在白名单）: chat=%s", chat_id)
+            return text_card("❌ 无权操作", reason, "red")
+
+        target = str(arg).strip()
+        if not session:
+            return text_card("⚠️ 未绑定会话", "先用 /list 或 /new 绑定一个会话，再切换档位。", "orange")
+        try:
+            result = self._bridge.set_permission_mode(target, session)
+        except Exception as e:
+            logger.exception("飞书切换权限档位失败")
+            return text_card("❌ 切换失败", str(e), "red")
+        if not result or not result.get("ok"):
+            # 星瑶会显式拒绝未知档位（不静默兜底成 confirm），原样回显
+            return text_card("❌ 切换失败", str((result or {}).get("msg") or "未知错误"), "red")
+        applied = str(result.get("permission_mode") or target)
+        logger.info("飞书权限档位已切换: session=%s -> %s", session, applied)
+        return text_card("✅ 已切换执行权限",
+                         f"会话 **{label}** → {permission_mode_label(applied)}\n"
+                         f"（只影响本会话，桌面端全局默认不变）", "green")
+
+    # ---- 沙盒开关（全局，放宽项）----
+
+    @staticmethod
+    def _sandbox_enabled() -> bool:
+        """沙盒放行状态（全局配置 allow_outside_workspace，/sandbox on 的落点）。"""
+        try:
+            from core.model_manager import load_config
+
+            return bool((load_config() or {}).get("allow_outside_workspace", False))
+        except Exception:
+            # 读不到按"未放行"处理（fail-closed），并留痕——此前这类异常会被静默吞掉
+            logger.warning("读取沙盒开关失败（按未放行处理）", exc_info=True)
+            return False
+
+    def _command_sandbox(self, chat_id: str, open_id: str, arg: str):
+        enabled = self._sandbox_enabled()
+        allowed, reason = self._approver_allowed(open_id)
+
+        if not arg:
+            return sandbox_card(enabled=enabled, buttons_enabled=allowed, hint=reason)
+
+        if not allowed:
+            logger.info("飞书沙盒切换被拒（不在白名单）: chat=%s", chat_id)
+            return text_card("❌ 无权操作", reason, "red")
+
+        want = str(arg).strip().lower()
+        if want not in ("on", "off", "true", "false", "1", "0"):
+            return text_card("⚠️ 参数不对", "用法：`/sandbox on` 或 `/sandbox off`", "orange")
+        target = want in ("on", "true", "1")
+        try:
+            result = self._bridge.set_sandbox_enabled(target)
+        except Exception as e:
+            logger.exception("飞书切换沙盒开关失败")
+            return text_card("❌ 切换失败", str(e), "red")
+        if not result or not result.get("ok"):
+            return text_card("❌ 切换失败", str((result or {}).get("msg") or "未知错误"), "red")
+        logger.info("飞书沙盒开关已切换: allow_outside_workspace=%s", target)
+        return text_card("✅ 已切换沙盒放行" if target else "✅ 已关闭沙盒放行",
+                         "现在**允许**读写工作目录之外的文件（全局生效）" if target
+                         else "现在**仅限**工作目录内的文件（全局生效）",
+                         "orange" if target else "green")
 
     def _status_snapshot_card(self, chat_id: str):
         cfg = self._config()
