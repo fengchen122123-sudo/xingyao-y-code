@@ -166,6 +166,115 @@ def failure_card(session_label: str, message: str) -> Dict[str, Any]:
     return card2("⚠️ 星瑶执行出错", TEMPLATE_RED, body)
 
 
+# ---------------------------------------------------------------- 审批 / 提问
+
+# 动作名归一成中文（对齐 opencode-mobile「动作名被归一成中文，不是原始英文标识」）
+ACTION_LABELS = {
+    "run_command": "执行命令",
+    "execute_command": "执行命令",
+    "shell_command": "执行命令",
+    "write_file": "写入文件",
+    "create_file": "新建文件",
+    "edit_file": "修改文件",
+    "delete_file": "删除文件",
+    "move_file": "移动文件",
+    "read_file": "读取文件",
+    "list_directory": "列出目录",
+    "search_files": "搜索文件",
+    "fetch_url": "访问网络",
+    "external_directory": "访问项目外目录",
+    "undo_turn": "撤销回合",
+    "ask_user": "提问",
+    "subagent": "子任务",
+    "browser": "浏览器操作",
+    "computer_use": "电脑操控",
+}
+
+
+def action_label(function_name: str) -> str:
+    name = str(function_name or "")
+    if name in ACTION_LABELS:
+        return ACTION_LABELS[name]
+    if name.startswith("browser_"):
+        return "浏览器操作"
+    if name.startswith("computer_"):
+        return "电脑操控"
+    return name or "未知操作"
+
+
+def target_lines(arguments: Dict[str, Any], limit: int = 20, max_len: int = 300) -> List[str]:
+    """把参数渲染成「目标」行（列表参数按条目展开，便于按条数折叠）。"""
+    if not isinstance(arguments, dict):
+        return []
+    preferred = ("path", "paths", "file", "files", "command", "cmd", "pattern", "query", "url", "target")
+    lines: List[str] = []
+    for key in preferred:
+        if key not in arguments:
+            continue
+        value = arguments[key]
+        if isinstance(value, (list, tuple)):
+            items = [str(v).strip() for v in value]
+            items = [v for v in items if v]
+            for item in items[:limit]:
+                lines.append(f"**{key}**　{clip(item, max_len)}")
+            if len(items) > limit:
+                lines.append(f"**{key}**　…（还有 {len(items) - limit} 项）")
+            continue
+        text = str(value).strip()
+        if text:
+            lines.append(f"**{key}**　{clip(text, max_len)}")
+    return lines
+
+
+def permission_card(*, action_name: str, summary: str, targets: List[str], session_label: str,
+                    workdir: str = "", request_id: str, allow_always: bool,
+                    buttons_enabled: bool = True, hint: str = "") -> Dict[str, Any]:
+    """权限审批卡。未配置审批白名单时 buttons_enabled=False（fail-closed，不渲染按钮）。"""
+    title = f"⛔ 需要授权 · {action_label(action_name)}"
+    elements: List[CardElement] = [
+        md(f"**动作**　{action_label(action_name)}（{action_name}）"),
+    ]
+    if summary:
+        elements.append(md(clip(summary)))
+    if targets:
+        if len(targets) > 5 or any(len(t) > 300 for t in targets):
+            elements.append(collapse(f"全部目标（{len(targets)} 项）", [md(t) for t in targets]))
+        else:
+            elements.append(md("**目标**\n" + "\n".join(targets)))
+    elements.append(md(context_markdown(session_label, workdir)))
+    if hint:
+        elements.append(note(hint))
+
+    if buttons_enabled:
+        buttons = [
+            btn("✅ 批准一次", "primary", {"kind": "perm", "request_id": request_id, "allow": True, "always": False}),
+        ]
+        if allow_always:
+            buttons.append(btn("✅ 总是批准", "primary",
+                               {"kind": "perm", "request_id": request_id, "allow": True, "always": True}))
+        buttons.append(btn("✖ 拒绝", "danger", {"kind": "perm", "request_id": request_id, "allow": False}))
+        elements.append(btn_flow(buttons))
+    return card2(title, TEMPLATE_RED, elements)
+
+
+def question_card(*, question: str, options: List[str], session_label: str,
+                  request_id: str, buttons_enabled: bool = True, hint: str = "") -> Dict[str, Any]:
+    """提问卡：选项按钮 + 自由输入框（提交后回调 form_value={"answer": 文本}）。"""
+    elements: List[CardElement] = [md(clip(question or "星瑶有问题需要你确认"))]
+    if buttons_enabled:
+        for index, option in enumerate(options):
+            elements.append(btn(str(option), "default",
+                                {"kind": "ask", "request_id": request_id, "index": index}))
+        elements.append(form("answer_form", [
+            input_field("answer", "其他（自己输入）"),
+            submit_btn("✅ 提交回答", "ask"),
+        ]))
+    elements.append(md(context_markdown(session_label)))
+    if hint:
+        elements.append(note(hint))
+    return card2("❓ 星瑶提问", TEMPLATE_BLUE, elements)
+
+
 # ---------------------------------------------------------------- 解析
 
 def extract_text(message: Dict[str, Any]) -> Optional[str]:
