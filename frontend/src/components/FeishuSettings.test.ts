@@ -139,4 +139,59 @@ describe('FeishuSettings', () => {
     expect((wrapper.find('[data-test="feishu-app-secret"]').element as HTMLInputElement).placeholder)
       .toContain('输入 App Secret');
   });
+
+  it('界面内置完整配置说明（含发布应用与 /whoami 拿 open_id）', async () => {
+    mockApi();
+    const wrapper = mountPage();
+    await flushPromises();
+
+    const guide = wrapper.find('[data-test="feishu-guide"]');
+    expect(guide.exists()).toBe(true);
+    const text = guide.text();
+    // 六步里的关键点必须都在，尤其"发布应用"这个最容易漏的步骤
+    expect(text).toContain('创建企业自建应用');
+    expect(text).toContain('im:message:send_as_bot');
+    expect(text).toContain('使用长连接接收事件');
+    expect(text).toContain('card.action.trigger');
+    expect(text).toContain('发布版本');
+    expect(text).toContain('/whoami');
+    // 排错指引
+    expect(text).toContain('收不到消息时依次查');
+  });
+
+  it('配置说明可折叠', async () => {
+    mockApi();
+    const wrapper = mountPage();
+    await flushPromises();
+
+    const guide = () => wrapper.find('[data-test="feishu-guide"]');
+    // 默认展开（用户要求说明直接可见）；点标题折叠
+    expect(guide().attributes('style') || '').not.toContain('display: none');
+    await wrapper.find('[data-test="feishu-guide-toggle"]').trigger('click');
+    expect(guide().attributes('style')).toContain('display: none');
+    await wrapper.find('[data-test="feishu-guide-toggle"]').trigger('click');
+    expect(guide().attributes('style') || '').not.toContain('display: none');
+  });
+
+  it('配置检查清单反映当前完成度', async () => {
+    mockApi({
+      get_feishu_settings: vi.fn(async () => ({
+        ok: true,
+        settings: { ...snapshot, approvers: [], status: { ...snapshot.status, state: 'error' } },
+      })),
+    });
+    const wrapper = mountPage();
+    await flushPromises();
+
+    const items = wrapper.findAll('[data-test="feishu-checklist"] li');
+    expect(items).toHaveLength(5);
+    // 前三项已满足（App ID / 密钥 / 已启用），连接异常与白名单未配置
+    expect(items[0].classes()).toContain('ok');
+    expect(items[1].classes()).toContain('ok');
+    expect(items[2].classes()).toContain('ok');
+    expect(items[3].classes()).not.toContain('ok');
+    expect(items[3].text()).toContain('连接异常');
+    expect(items[4].classes()).not.toContain('ok');
+    expect(items[4].text()).toContain('/whoami');
+  });
 });
