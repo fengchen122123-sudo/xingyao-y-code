@@ -29,13 +29,29 @@ class _FakeStarBridge:
         self.sandbox_set = []
 
     def get_sessions(self):
-        return [{"folder_path": "GLOBAL", "folder_name": "对话", "is_global": True,
-                 "is_current": True, "sessions": list(self.sessions)}]
+        """按工作目录分组（与后端一致）：自由对话一组，其余每个目录一组。"""
+        global_group = {
+            "folder_path": "GLOBAL", "folder_name": "对话", "is_global": True, "is_current": True,
+            "sessions": [s for s in self.sessions if (s.get("workdir") or "GLOBAL") == "GLOBAL"],
+        }
+        by_dir: dict = {}
+        for item in self.sessions:
+            wd = str(item.get("workdir") or "")
+            if not wd or wd == "GLOBAL":
+                continue
+            by_dir.setdefault(wd, []).append(item)
+        groups = [global_group]
+        for path in sorted(by_dir):
+            folder = path.replace("\\", "/").rstrip("/").split("/")[-1] or path
+            groups.append({"folder_path": path, "folder_name": folder, "is_global": False,
+                           "is_current": False, "sessions": by_dir[path]})
+        return groups
 
     def create_session(self, title, workdir=None):
         name = f"session_new{len(self.created)}"
-        self.created.append({"title": title, "name": name})
-        self.sessions.append({"name": name, "display_name": title, "workdir": "GLOBAL"})
+        self.created.append({"title": title, "workdir": workdir, "name": name})
+        self.sessions.append({"name": name, "display_name": title,
+                              "workdir": workdir or "GLOBAL"})
         return {"ok": True, "session_name": name, "title": title}
 
     def send_user_message(self, text, session_name=None, turn_source="local"):
@@ -127,6 +143,12 @@ def _cmd_action(cmd, arg="", open_id="ou_allowed"):
     }
 
 
+def _card_markdown(card):
+    """卡片里的 markdown 正文（避开 JSON 转义，路径断言用这个）。"""
+    return "\n".join(str(e.get("content") or "") for e in card["body"]["elements"]
+                     if e.get("tag") == "markdown")
+
+
 def _card_text(card):
     return json.dumps(card, ensure_ascii=False)
 
@@ -180,9 +202,65 @@ def test_new_creates_and_binds_session(tmp_path):
 
     br.on_feishu_event(_message("/new 我的新会话"))
 
-    assert star.created == [{"title": "我的新会话", "name": "session_new0"}]
+    assert star.created == [{"title": "我的新会话", "workdir": "GLOBAL", "name": "session_new0"}]
     assert br._store.session_of("oc_1") == "session_new0"
     assert "已新建并绑定" in api.cards[0]["card"]["header"]["title"]["content"]
+
+
+def test_new_defaults_to_global_workdir_never_none(tmp_path):
+    """回归：新建会话必须显式传 GLOBAL。
+
+    后端 `create_session(workdir=None)` 的默认是**进程当前目录**（os.getcwd()），
+    传 None 会把飞书新会话悄悄绑到星瑶进程所在目录（真机表现为"工作目录莫名其妙"）。
+    """
+    br, star, api = _setup(tmp_path)
+
+    br.on_feishu_event(_message("/new"))
+
+    assert star.created[0]["workdir"] == "GLOBAL"
+    assert star.created[0]["workdir"] is not None
+    body = _card_text(api.cards[0]["card"])
+    assert "自由对话" in body
+    assert "改为绑定项目目录" in body          # 回执卡给出绑定目录的入口
+
+
+def test_newdir_picker_lists_project_dirs(tmp_path):
+    br, star, api = _setup(tmp_path)
+    star.sessions.append({"name": "session_p", "display_name": "项目会话", "workdir": r"D:\proj\demo"})
+
+    br.on_feishu_event(_message("/newdir"))
+
+    card = api.cards[0]["card"]
+    assert card["header"]["title"]["content"] == "📁 选择项目目录"
+    body = _card_text(card)
+    assert "demo" in body and r"D:\proj\demo" in _card_markdown(card)
+    values = [b["behaviors"][0]["value"] for e in card["body"]["elements"] if e.get("tag") == "column_set"
+              for c in e["columns"] for b in c["elements"]]
+    assert {"kind": "cmd", "cmd": "/newdir", "arg": r"D:\proj\demo"} in values
+    assert {"kind": "cmd", "cmd": "/new"} in values      # 也给自由对话入口
+
+
+def test_newdir_binds_session_to_directory(tmp_path):
+    br, star, api = _setup(tmp_path)
+
+    br.on_feishu_event(_message(r"/newdir D:\proj\demo"))
+
+    assert star.created == [{"title": "demo", "workdir": r"D:\proj\demo", "name": "session_new0"}]
+    assert br._store.session_of("oc_1") == "session_new0"
+    body = _card_text(api.cards[0]["card"])
+    assert r"D:\proj\demo" in _card_markdown(api.cards[0]["card"])
+
+
+def test_list_shows_workdir_and_global_marker(tmp_path):
+    """列表每项显示工作目录（与桌面侧栏一致）：GLOBAL 显示"自由对话"，项目会话显示目录。"""
+    br, star, api = _setup(tmp_path)
+    star.sessions.append({"name": "session_g", "display_name": "自由聊", "workdir": "GLOBAL"})
+
+    br.on_feishu_event(_message("/list"))
+
+    body = _card_text(api.cards[0]["card"])
+    assert "自由对话" in body                        # GLOBAL 会话显示"自由对话"
+    assert "D:/proj" in body or "D:\\proj" in body   # 项目会话显示其目录
 
 
 def test_list_card_marks_current_and_offers_switch(tmp_path):
