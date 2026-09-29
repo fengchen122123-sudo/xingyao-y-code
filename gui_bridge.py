@@ -4550,11 +4550,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             if getattr(self, "_feishu_service", None) is not None:
                 return self._feishu_service
             try:
+                from core.feishu.bridge import FeishuBridge
                 from core.feishu.service import FeishuService
 
-                # bridge（业务语义：会话绑定、卡片、审批）在 T4 注入；
-                # 本步只负责服务生命周期与事件转发通道。
-                svc = FeishuService()
+                svc = FeishuService(bridge=FeishuBridge(bridge=self))
                 if not svc.start():
                     # 未配置：不发布实例，避免事件热路径上做无谓转发
                     return None
