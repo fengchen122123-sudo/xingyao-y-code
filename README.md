@@ -1,7 +1,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://www.python.org/)
-[![Version 1.3.3](https://img.shields.io/badge/Version-1.3.3-green.svg)](core/version.py)
+[![Version 1.4.0](https://img.shields.io/badge/Version-1.4.0-green.svg)](core/version.py)
 
 # 星瑶 (Y-code)
 
@@ -131,7 +131,32 @@ cp config.example.json config.json
 }
 ```
 
-### 4. 启动星瑶
+### 4.（可选）接入飞书：在飞书里和星瑶对话
+
+配好后在飞书里给机器人发一句话即可驱动一轮任务；执行完成卡、权限审批卡、提问卡、
+待拍板收件箱、卡住提醒与指令集都在飞书闭环。
+
+**飞书侧（一次性，三步）**
+
+1. 在[飞书开放平台](https://open.feishu.cn/)建一个**企业自建应用**，拿到 App ID 与 App Secret。
+2. 给应用开通权限：`im:message`（读消息）、`im:message:send_as_bot`（发消息）；
+   需要在群里 @ 机器人时再加 `im:message.group_at_msg`。
+3. 在「事件与回调」里把订阅方式切到**使用长连接接收事件**，并订阅
+   `im.message.receive_v1`（收消息）与 `card.action.trigger`（卡片按钮回传）。
+
+> 长连接由星瑶主动连飞书，**不需要公网 IP、也不需要内网穿透**，更不用配回调地址与校验密钥。
+
+**星瑶侧**：打开 GUI → **设置 → 飞书集成**，填入 App ID / App Secret，
+可选填「审批白名单」（open_id 列表）与「固定推送会话 ID」，点「测试连接」校验后保存即生效。
+
+- **审批白名单**决定谁能在飞书点「批准 / 拒绝」。留空时飞书侧**不可审批**（卡片只做提醒，
+  仍需回桌面端处理）——这是有意的 fail-closed 设计。
+- 也可以手改 `config.json`：`feishu_enabled` / `feishu_app_id` / `feishu_app_secret` /
+  `feishu_approvers` / `feishu_notify_chat_id`；密钥建议在界面里填（会自动加密存储）。
+- 默认关闭；关闭或未配置时星瑶行为与未接入前完全一致。
+- 在飞书里发 `/help` 看全部指令（`/panel` `/status` `/new` `/list` `/switch` `/model` `/inbox` `/stop`）。
+
+### 5. 启动星瑶
 
 ```bash
 # CLI 控制台版（推荐）
@@ -141,7 +166,7 @@ python main.py
 ycode
 ```
 
-### 5.（可选）启动 GUI 窗口版
+### 6.（可选）启动 GUI 窗口版
 
 GUI 模式基于 `pywebview` + Vue 3 前端。前端构建产物 `frontend/dist/` 不随仓库提交，首次使用需先构建：
 
@@ -158,7 +183,7 @@ python gui_main.py
 
 > 前端开发调试时也可改为在 `frontend/` 下运行 `npm run dev`（Vite 开发服务器，端口 5173），`gui_main.py` 会优先加载它。两者都不可用时 GUI 无法启动，CLI 模式不受影响。
 
-### 6.（可选）构建 Windows 安装包
+### 7.（可选）构建 Windows 安装包
 
 ```bash
 # 完整构建（GUI 主安装包 + 可选 CLI 组件）
