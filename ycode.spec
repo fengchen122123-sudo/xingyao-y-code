@@ -37,9 +37,11 @@ tiktoken_ext_datas, tiktoken_ext_binaries, tiktoken_ext_hiddenimports = collect_
 # 浏览器缓存（Chromium/Firefox/WebKit 均不在 wheel 内，collect_all 不会带入）。
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all('playwright')
 
-# pywinpty（GUI 内嵌交互式终端，core/gui_terminal.py 惰性 import）：Rust 扩展
-# 与 conpty.dll / winpty.dll / OpenConsole.exe / winpty-agent.exe 是包内二进制，
-# PyInstaller 默认收集不全，必须 collect_all；否则打包后打开底部终端直接报错。
+# pywinpty（GUI 内嵌交互式终端）：core/gui_terminal.py 被 gui_bridge.py 顶层导入，
+# 其内部的 `from winpty import PtyProcess` 虽是函数内 import，但仍是字面 import，能被
+# PyInstaller 字节码扫描识别，Python 模块本身不会漏收；必须 collect_all 是因为其原生
+# 二进制与 datas（Rust 扩展、conpty.dll / winpty.dll / OpenConsole.exe / winpty-agent.exe
+# 等）默认收集不全，否则打包后打开底部终端直接报错。
 pywinpty_datas, pywinpty_binaries, pywinpty_hiddenimports = collect_all('winpty')
 
 # CLI 与 GUI 都会用到的数据文件：默认配置模板、系统提示词模板、内置 ripgrep

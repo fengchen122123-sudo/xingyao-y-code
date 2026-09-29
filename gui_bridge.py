@@ -6397,6 +6397,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     process_usage.get("cumulative_completion", 0) or 0
                 ),
                 "total_cached": int(process_usage.get("cumulative_cached", 0) or 0),
+                # 本会话口径（token_usage 落库聚合，重启不清零）：状态行默认
+                # 显示当前会话的输入/输出/命中；命中率分母用 cache_prompt
+                # （只含已报告缓存明细的轮次，未报告 ≠ 0）
+                "session_totals": self._session_token_totals(self._current_session),
                 # 车道身份与保活单列（前端上下文面板消费；口径与上面的 cache_*_pct 一致，
                 # 因此不再重复输出 cache_lane_hot_pct / cache_lane_session_pct 这类
                 # 与既有键同值的字段——白涨载荷）。现有键语义保持不变。
@@ -6425,8 +6429,48 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 "cache_lane_model": "", "cache_lane_api_base": "",
                 "cache_keepalive_hot_pct": None,
                 "cache_keepalive_session_pct": None,
+                "session_totals": self._empty_session_totals(),
                 "context_breakdown": [],
             }
+
+    @staticmethod
+    def _empty_session_totals():
+        return {
+            "session_id": "", "prompt": 0, "completion": 0, "cached": 0,
+            "cache_prompt": 0, "total": 0, "requests": 0, "last_ts": None,
+            "keepalive_prompt": 0, "keepalive_cached": 0, "keepalive_requests": 0,
+        }
+
+    def _session_token_totals(self, session_name):
+        """本会话 token 用量落库聚合；失败返回零值，绝不影响主推送。"""
+        try:
+            totals = self._memory.get_token_usage_by_session(session_name)
+        except Exception:
+            logger.debug("本会话 token 聚合失败", exc_info=True)
+            totals = self._empty_session_totals()
+        totals = dict(totals)
+        totals["session_id"] = str(session_name or "")
+        return totals
+
+    def get_token_usage_overview(self, limit: int = 20) -> Dict[str, Any]:
+        """会话 token 弹层数据：全部会话合计 + 按用量排序的会话列表。
+
+        合计不分 scope（保活/压缩也是真实计费），会话列表只含对话口径
+        （main/legacy）且只列现存会话。供前端点击状态行时按需拉取。
+        """
+        try:
+            if type(limit) is not int or not (1 <= limit <= 100):
+                limit = 20
+            sessions = self._memory.list_token_usage_by_sessions(limit=limit)
+            return {
+                "ok": True,
+                "current": str(self._current_session or ""),
+                "totals": self._memory.get_token_usage_totals(),
+                "sessions": sessions,
+            }
+        except Exception as exc:
+            logger.debug("get_token_usage_overview 失败", exc_info=True)
+            return {"ok": False, "msg": str(exc), "current": "", "totals": {}, "sessions": []}
 
     def _emit_token_usage(self):
         try:
@@ -7601,7 +7645,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": True, "pid": session.pid, "cwd": cwd, "reused": False}
 
     def pty_terminal_write(self, data: str) -> Dict[str, Any]:
-        """把用户键入内容写进常驻 shell（xterm.js onData 原样字符串）。"""
+        """把用户键入内容写进常驻 shell（xterm.js onData 原样字符串）。
+
+        session.write 返回 bool：显式 False 表示输入未送达（shell 已退出、
+        写入异常等），桥层如实回 {"ok": False}，前端据此提示而不是静默丢键。
+        """
         data = str(data or "")
         if not data:
             return {"ok": False, "msg": "输入为空"}
@@ -7610,23 +7658,30 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         if session is None or not session.is_alive():
             return {"ok": False, "msg": "终端未运行"}
         try:
-            session.write(data)
-            return {"ok": True}
+            ok = session.write(data)
         except Exception as e:
             return {"ok": False, "msg": str(e)}
+        if ok is False:
+            return {"ok": False, "msg": "终端已退出，输入未送达"}
+        return {"ok": True}
 
     def pty_terminal_resize(self, cols=80, rows=24) -> Dict[str, Any]:
-        """同步前端 xterm 视口尺寸到 ConPTY（面板拖拽/窗口缩放时调用）。"""
+        """同步前端 xterm 视口尺寸到 ConPTY（面板拖拽/窗口缩放时调用）。
+
+        session.resize 返回 bool：显式 False 表示尺寸未生效（会话已退出等）。
+        """
         cols, rows = clamp_terminal_size(cols, rows)
         with self._pty_lock:
             session = self._pty_session
         if session is None or not session.is_alive():
             return {"ok": False, "msg": "终端未运行"}
         try:
-            session.resize(cols, rows)
-            return {"ok": True}
+            ok = session.resize(cols, rows)
         except Exception as e:
             return {"ok": False, "msg": str(e)}
+        if ok is False:
+            return {"ok": False, "msg": "终端已退出，尺寸同步失败"}
+        return {"ok": True}
 
     def pty_terminal_kill(self) -> Dict[str, Any]:
         """终止常驻 shell（下次 pty_terminal_ensure 会重新拉起）。"""

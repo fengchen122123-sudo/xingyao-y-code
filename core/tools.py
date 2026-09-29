@@ -4682,6 +4682,9 @@ def recall_history(before_msg_id, limit=16, cancel_event=None):
     if manager is None:
         return "会话存储未就绪，无法回溯历史。"
 
+    if cancel_event is not None and cancel_event.is_set():
+        return "🛑 操作已被用户取消。"
+
     try:
         rows = manager.get_compressed_messages(session_name, before_msg_id, limit)
     except Exception as exc:
@@ -4699,8 +4702,8 @@ def recall_history(before_msg_id, limit=16, cancel_event=None):
             content = content[:600] + "...[该条过长，已截断]"
         lines.append(f"#msg_id={row.get('id')} [{row.get('role')}]\n{content}")
     header = (
-        f"共回溯 {len(rows)} 条已压缩原始消息（按时间正序）。"
-        "需要更早的内容时，把 before_msg_id 设为本批最早一条的 msg_id 再调用。"
+        f"共回溯 {len(rows)} 条已压缩原始消息（按时间正序；before_msg_id 含边界自身）。"
+        "需要更早的内容时，把 before_msg_id 设为本批最早一条的 msg_id 减 1 再调用。"
     )
     return header + "\n\n" + "\n\n".join(lines)
 
