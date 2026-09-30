@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { isLocalFileLink, toAbsoluteLocalPath } from './localPath';
+import {
+  canOpenInRightPanel,
+  isHtmlFilePath,
+  isLocalFileLink,
+  isMarkdownFilePath,
+  toAbsoluteLocalPath,
+  toFileUrl,
+} from './localPath';
 
 describe('isLocalFileLink', () => {
   it('识别相对路径（含分隔符 + 已知扩展名）', () => {
@@ -53,5 +60,64 @@ describe('toAbsoluteLocalPath', () => {
   });
   it('相对路径且 workdir 为空返回 null', () => {
     expect(toAbsoluteLocalPath('docs/foo.md', '')).toBeNull();
+  });
+});
+
+describe('isHtmlFilePath', () => {
+  it('只认 .html / .htm（不分大小写）', () => {
+    expect(isHtmlFilePath('D:\\proj\\index.html')).toBe(true);
+    expect(isHtmlFilePath('index.HTM')).toBe(true);
+    expect(isHtmlFilePath('a.html?x=1')).toBe(true);
+  });
+  it('其它文件与目录不算', () => {
+    expect(isHtmlFilePath('a.md')).toBe(false);
+    expect(isHtmlFilePath('a.html.bak')).toBe(false);
+    expect(isHtmlFilePath('')).toBe(false);
+  });
+});
+
+describe('isMarkdownFilePath', () => {
+  it('只认 .md / .markdown（不分大小写）', () => {
+    expect(isMarkdownFilePath('docs/notes.md')).toBe(true);
+    expect(isMarkdownFilePath('a.MARKDOWN')).toBe(true);
+    expect(isMarkdownFilePath('a.mdx')).toBe(false);
+    expect(isMarkdownFilePath('a.html')).toBe(false);
+  });
+});
+
+describe('canOpenInRightPanel', () => {
+  it('html / pdf / md 三类交给右栏', () => {
+    expect(canOpenInRightPanel('D:\\proj\\index.html')).toBe(true);
+    expect(canOpenInRightPanel('D:\\proj\\doc.pdf')).toBe(true);
+    expect(canOpenInRightPanel('docs/notes.md')).toBe(true);
+    expect(canOpenInRightPanel('a.MARKDOWN')).toBe(true);
+    expect(canOpenInRightPanel('report.pdf?x=1')).toBe(true);
+  });
+  it('其它类型仍走源码预览弹窗', () => {
+    expect(canOpenInRightPanel('a.py')).toBe(false);
+    expect(canOpenInRightPanel('pic.png')).toBe(false);
+    expect(canOpenInRightPanel('a.txt')).toBe(false);
+    expect(canOpenInRightPanel('')).toBe(false);
+  });
+});
+
+describe('toFileUrl', () => {
+  it('盘符路径转 file:// URL（统一正斜杠）', () => {
+    expect(toFileUrl('D:\\proj\\a.html')).toBe('file:///D:/proj/a.html');
+    expect(toFileUrl('C:/x/index.htm')).toBe('file:///C:/x/index.htm');
+  });
+  it('空格与中文按段百分号编码（与后端 quote(safe="") 同口径）', () => {
+    expect(toFileUrl('D:\\My Docs\\a b.html')).toBe('file:///D:/My%20Docs/a%20b.html');
+    expect(toFileUrl('D:\\文档\\a(1).html')).toBe(
+      'file:///D:/%E6%96%87%E6%A1%A3/a%281%29.html',
+    );
+  });
+  it('UNC 路径转 file:// 主机形式', () => {
+    expect(toFileUrl('\\\\srv\\share\\a.html')).toBe('file://srv/share/a.html');
+  });
+  it('相对路径 / 空路径 / 含 .. 的路径返回空串', () => {
+    expect(toFileUrl('docs/a.html')).toBe('');
+    expect(toFileUrl('')).toBe('');
+    expect(toFileUrl('D:\\a\\..\\b.html')).toBe('');
   });
 });

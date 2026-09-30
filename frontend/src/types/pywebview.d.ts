@@ -1235,6 +1235,13 @@ export interface PyWebViewAPI {
   browser_pane_stop(): Promise<EmbeddedBrowserPaneResult>;
   browser_pane_hide(): Promise<EmbeddedBrowserPaneResult>;
   browser_pane_get_state(): Promise<EmbeddedBrowserPaneResult>;
+  // 把前端渲染好的预览 HTML 落盘（宿主 gui_browser_mixin.BrowserBridgeMixin，
+  // 实现 core.web_preview）：返回本地路径后由 browser_pane_navigate 打开。
+  // 与平台无关；内容为空/过大时返回 {ok:false,error}。
+  write_preview_page(
+    htmlText: string,
+    sourcePath?: string,
+  ): Promise<{ ok: boolean; path?: string; error?: string }>;
 
   // ---------------------------------------------------------------------------
   // 右面板画笔截图（宿主 gui_snip_mixin.SnipBridgeMixin）。rect 为右面板的
