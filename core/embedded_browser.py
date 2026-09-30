@@ -405,8 +405,8 @@ class EmbeddedBrowserController:
         self._loading = True
         self._schedule_emit()
         # 页面自身发起的顶层导航（点击链接 / location.href / meta refresh）不经过
-        # 后端 normalize_url，必须在这里用同一口径兜底，否则 javascript:/file:
-        # 等 scheme 可绕过白名单。uri 取不到时不误杀。
+        # 后端 normalize_url，必须在这里用同一口径兜底，否则 javascript:/data:
+        # 等 scheme 可绕过白名单（本地文件 URI 与主入口同口径放行）。uri 取不到时不误杀。
         try:
             uri = getattr(args, "Uri", None)
         except Exception:
