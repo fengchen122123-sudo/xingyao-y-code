@@ -521,6 +521,23 @@ export const useAppStore = defineStore('app', {
     // 沙盒开关（true=允许访问工作目录外文件），与 CLI /sandbox 共享后端配置
     sandboxEnabled: false,
 
+    // 飞书集成快照（密钥只回 has_secret，明文按需单独取）
+    feishuSettings: {
+      enabled: false,
+      app_id: '',
+      has_secret: false,
+      approvers: [] as string[],
+      notify_chat_id: '',
+      status: {
+        state: 'disabled',
+        running: false,
+        last_error: '',
+        received_events: 0,
+        duplicate_events: 0,
+        uptime_seconds: 0,
+      },
+    },
+
     // 系统设置使用独立快照，后续新增系统级选项时继续扩展该对象。
     systemSettings: {
       command_shell: 'auto',
@@ -2296,6 +2313,71 @@ navItems: [] as Array<{ id: number; preview: string }>,
         this.sandboxEnabled = prev;
         this.connected = false;
         this.notifyChat('沙盒开关调整失败: ' + err);
+      }
+    },
+
+    // ---- 飞书集成（设置 → 飞书集成）----
+
+    async refreshFeishuSettings() {
+      const api = this._api();
+      if (!api) return null;
+      try {
+        const result = await api.get_feishu_settings();
+        if (result && result.ok && result.settings) {
+          this.feishuSettings = result.settings;
+          return result.settings;
+        }
+        return null;
+      } catch (err) {
+        this.connected = false;
+        this.notifyModal('飞书集成', '加载飞书设置失败: ' + err);
+        return null;
+      }
+    },
+
+    /** 保存飞书设置；app_secret 留空表示不修改已有密钥 */
+    async saveFeishuSettings(payload: {
+      enabled: boolean;
+      app_id: string;
+      app_secret?: string;
+      approvers: string[];
+      notify_chat_id: string;
+    }): Promise<{ ok: boolean; msg: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥接不可用' };
+      try {
+        const result = await api.set_feishu_settings(payload);
+        if (result && result.ok) {
+          if (result.settings) this.feishuSettings = result.settings;
+          return { ok: true, msg: '' };
+        }
+        return { ok: false, msg: (result && result.msg) || '保存失败' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
+      }
+    },
+
+    /** 按需取 app_secret 明文（仅用户点「显示」时调用） */
+    async revealFeishuSecret(): Promise<string> {
+      const api = this._api();
+      if (!api) return '';
+      try {
+        const result = await api.get_feishu_secret();
+        return result && result.ok ? String(result.app_secret || '') : '';
+      } catch {
+        return '';
+      }
+    },
+
+    /** 测试连接：用传入凭据或已保存凭据请求飞书长连接接入点 */
+    async testFeishuConnection(appId: string, appSecret: string): Promise<{ ok: boolean; msg: string }> {
+      const api = this._api();
+      if (!api) return { ok: false, msg: '桥接不可用' };
+      try {
+        const result = await api.test_feishu_connection(appId, appSecret);
+        return { ok: !!(result && result.ok), msg: (result && result.msg) || '' };
+      } catch (err) {
+        return { ok: false, msg: String(err) };
       }
     },
 

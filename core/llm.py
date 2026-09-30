@@ -584,6 +584,14 @@ def _claim_takeover_at_turn_start(
     return scheduler, claimed
 
 
+# 入口层受控回合来源白名单：只有入口层（GUI/CLI 本地、LAN 手机端、飞书通道）能设置，
+# 绝不来自用户消息或模型参数。非 local 的回合一律按「远程」处理（禁用电脑操控、
+# 不解析 @{会话名}、不抢桌面当前会话），见 core/computer/capability.py 与
+# core/agent_service.py 的 turn_source != "local" 分支。
+# 新增来源时必须同时更新 gui_bridge.TURN_SOURCES（有测试断言两者一致）。
+COMPUTER_TURN_SOURCES = ("local", "lan", "feishu")
+
+
 def resolve_turn_computer_capability(
     model_name,
     api_base=None,
@@ -595,7 +603,7 @@ def resolve_turn_computer_capability(
     按请求路由在 config 中查找模型条目，与请求实际使用的 base_url/protocol
     一起交给纯函数 resolve_computer_capability 冻结为不可变快照；同一 Turn
     的每个 Step 复用该快照，不做二次决策。turn_source 只接受入口层受控值
-    local|lan（不得来自用户消息或模型参数）。设置快照读取失败按
+    local|lan|feishu（不得来自用户消息或模型参数）。设置快照读取失败按
     computer_invalid_config 拒绝（fail-closed），绝不中断普通对话。
     """
     from core.model_manager import get_model_config_by_litellm_model, get_model_protocol
@@ -643,8 +651,8 @@ def chat_with_model_events(
     the event-oriented entry point used by the CLI and is deliberately kept
     separate while the existing tool loop is migrated incrementally.
 
-    computer_turn_source 是入口层给出的受控回合来源（local|lan）：LAN/mobile
-    发起的 Turn 在 resolve_computer_capability 内固定禁用电脑操控。
+    computer_turn_source 是入口层给出的受控回合来源（local|lan|feishu）：LAN/mobile
+    与飞书通道发起的 Turn 在 resolve_computer_capability 内固定禁用电脑操控。
 
     computer_capability（Task 11a F1 收敛）是调用方显式传入的 Turn 能力快照；
     未传时优先取同线程 prepare 阶段（agent_service.build_runtime_context）存入
@@ -652,8 +660,10 @@ def chat_with_model_events(
     Turn 的 capability 只解析一次；子代理回合（allow_subagents=False）始终为
     None，不解析也不注入电脑操控。
     """
-    if computer_turn_source not in ("local", "lan"):
-        raise ValueError("computer_turn_source 只允许受控值 local 或 lan")
+    if computer_turn_source not in COMPUTER_TURN_SOURCES:
+        raise ValueError(
+            f"computer_turn_source 只允许受控值 {'|'.join(COMPUTER_TURN_SOURCES)}"
+        )
     resolved_turn_id = turn_id or f"turn-{uuid.uuid4().hex[:8]}"
     resolved_parent_turn_id = parent_turn_id or resolved_turn_id
     # Turn 起点解析一次电脑操控能力（Task 10 接线点①，设计 9.3）：局部不可变
