@@ -112,6 +112,12 @@ _MONITOR_DEFAULTTONEAREST = 2
 # 回合对齐扩展上限为 limit + 30（见 core.memory.get_history_paged）。
 HISTORY_PAGE_SIZE = 50
 
+# 入口层受控回合来源：GUI/CLI 本地 = local，LAN 手机端 = lan，飞书通道 = feishu。
+# 由入口层注入，模型/用户正文无法设置（send_user_message 校验后拒绝非法值）。
+# 与 core.llm.COMPUTER_TURN_SOURCES 必须保持一致——低层还会再校验一次来源，
+# 两处不一致会让新来源的回合在模型请求处直接抛错（有测试断言两者相等）。
+TURN_SOURCES = ("local", "lan", "feishu")
+
 
 # _MONITORINFO 结构体统一从 core.frameless 导入：两个模块各自定义同名结构体会
 # 在同一个 ctypes.windll.user32 上互相覆盖 GetMonitorInfoW.argtypes，导致
@@ -600,6 +606,10 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self._lan_server = None
         # 保护 _lan_server 惰性创建的双检锁：并发（启动后台线程 + 用户点二维码）时不得创建两个实例
         self._lan_lock = threading.Lock()
+        # 飞书通道服务（惰性创建，见 _ensure_feishu_service）：未配置时完全不启动，
+        # 对现有功能零影响
+        self._feishu_service = None
+        self._feishu_lock = threading.Lock()
         # 电脑操控事件桥：controller listener 注册标记（进程内建立一次、幂等，
         # 见 _ensure_computer_event_bridge；set_window 与各控制方法都会触发）
         self._computer_event_listener = None
@@ -1150,6 +1160,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 self._lan_server.stop()
         except Exception:
             logger.exception("退出时停止局域网远程控制服务失败")
+
+        try:
+            if getattr(self, "_feishu_service", None) is not None:
+                self._feishu_service.stop()
+        except Exception:
+            logger.exception("退出时停止飞书通道服务失败")
 
         if self._mcp is not None:
             try:
@@ -2042,6 +2058,11 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         lan = getattr(self, "_lan_server", None)
         if lan is not None:
             lan.broadcast(payload, event_type=event_type)
+        # 转发给飞书通道（未配置/未启动时为 None，零开销；on_event 内部已吞异常，
+        # 绝不影响桌面 JS 派发）
+        feishu = getattr(self, "_feishu_service", None)
+        if feishu is not None:
+            feishu.on_event(event_type, data)
 
     def _queue_js_payload(self, payload: str) -> None:
         """唯一入队点：保证派发线程存在后 put_nowait；队列满丢弃新事件并计数。"""
@@ -2583,6 +2604,15 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             ).start()
         except Exception:
             logger.debug("局域网远程控制服务启动线程创建失败", exc_info=True)
+        # 飞书通道：未配置时 _ensure_feishu_service 直接返回 None，不做任何事
+        try:
+            threading.Thread(
+                target=self._ensure_feishu_service,
+                daemon=True,
+                name="feishu-startup",
+            ).start()
+        except Exception:
+            logger.debug("飞书通道服务启动线程创建失败", exc_info=True)
         # 历史消息媒体清单迁移：一次性、幂等，后台执行不阻塞初始化
         try:
             threading.Thread(
@@ -3703,6 +3733,19 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 logger.debug("读取会话权限档位失败", exc_info=True)
         return getattr(self, "_current_permission_mode", "confirm") or "confirm"
 
+    def get_permission_mode(self, session_name: str = "") -> Dict[str, Any]:
+        """返回指定会话的**生效**权限档位（会话级优先，未绑定回退全局默认）。
+
+        只读接口：供飞书/手机端在切换档位前展示当前状态，不修改任何状态。
+        """
+        try:
+            target = str(session_name or "").strip() or self._current_session
+            return {"ok": True, "session_name": target,
+                    "permission_mode": self._effective_permission_mode(target)}
+        except Exception as e:
+            logger.exception("get_permission_mode 失败")
+            return {"ok": False, "msg": str(e)}
+
     def set_permission_mode(self, mode: str, session_name: str = "") -> Dict[str, Any]:
         try:
             # 规范化会把无法识别的值兜底成 confirm；这里要明确告诉前端"没识别出来"，
@@ -4507,6 +4550,38 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 logger.exception("局域网远程控制服务启动失败")
                 return None
 
+    def _ensure_feishu_service(self):
+        """惰性创建并启动飞书通道服务，失败/未配置返回 None（不抛给调用方）。
+
+        与 _ensure_lan_server 同范式：双检锁保证并发（启动后台线程 + 设置页保存）
+        只创建一个实例。未配置（开关关闭或缺凭据）时不创建任何线程，对现有功能
+        零影响——这也是"飞书功能不影响其它功能"的兜底开关。
+        """
+        if getattr(self, "_feishu_service", None) is not None:
+            return self._feishu_service
+        lock = getattr(self, "_feishu_lock", None)
+        if lock is None:
+            # getattr 兜底：测试里的裸实例（__new__ 构造）不经过 __init__，
+            # 缺状态时就地补齐，避免后台启动线程里抛 AttributeError
+            lock = threading.Lock()
+            self._feishu_lock = lock
+        with lock:
+            if getattr(self, "_feishu_service", None) is not None:
+                return self._feishu_service
+            try:
+                from core.feishu.bridge import FeishuBridge
+                from core.feishu.service import FeishuService
+
+                svc = FeishuService(bridge=FeishuBridge(bridge=self))
+                if not svc.start():
+                    # 未配置：不发布实例，避免事件热路径上做无谓转发
+                    return None
+                self._feishu_service = svc
+                return svc
+            except Exception:
+                logger.exception("飞书通道服务启动失败")
+                return None
+
     def get_remote_bind_qr(self, force_new: bool = False, mobile: bool = False) -> Dict[str, Any]:
         """返回手机扫码绑定信息。
 
@@ -4536,17 +4611,141 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # 飞书通道设置
+    # ------------------------------------------------------------------
+
+    def get_feishu_settings(self) -> Dict[str, Any]:
+        """飞书集成设置快照。**不含 app_secret 明文**，只回 has_secret 布尔。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            cfg = load_feishu_config()
+            svc = getattr(self, "_feishu_service", None)
+            if svc is not None:
+                status = svc.status()
+            else:
+                from core.feishu.service import FeishuService
+
+                status = FeishuService().status()
+            return {
+                "ok": True,
+                "settings": {
+                    "enabled": cfg.enabled,
+                    "app_id": cfg.app_id,
+                    "has_secret": cfg.has_secret,
+                    "approvers": list(cfg.approvers),
+                    "notify_chat_id": cfg.notify_chat_id,
+                    "status": status,
+                },
+            }
+        except Exception as e:
+            logger.exception("get_feishu_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def get_feishu_secret(self) -> Dict[str, Any]:
+        """按需返回 app_secret 明文（仅设置页用户主动点「显示」时调用）。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            return {"ok": True, "app_secret": load_feishu_config().app_secret}
+        except Exception as e:
+            logger.exception("get_feishu_secret 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def set_feishu_settings(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """保存飞书设置；app_secret 写盘前加密（dpapi:/keyring:）。
+
+        payload.app_secret 省略或为空字符串表示「不修改已有密钥」——避免设置页
+        因掩码回显把密钥写坏。
+        """
+        payload = dict(payload or {})
+        try:
+            from core.credentials import protect_secret
+
+            app_id = str(payload.get("app_id") or "").strip()
+            approvers = [str(x).strip() for x in (payload.get("approvers") or []) if str(x).strip()]
+            notify_chat_id = str(payload.get("notify_chat_id") or "").strip()
+            enabled = bool(payload.get("enabled"))
+            secret = str(payload.get("app_secret") or "")
+            secret_provided = bool(secret.strip())
+
+            def mutate(data: Dict[str, Any]) -> None:
+                data[config.FEISHU_ENABLED_KEY] = enabled
+                data[config.FEISHU_APP_ID_KEY] = app_id
+                if secret_provided:
+                    data[config.FEISHU_APP_SECRET_KEY] = protect_secret(secret.strip())
+                data[config.FEISHU_APPROVERS_KEY] = approvers
+                data[config.FEISHU_NOTIFY_CHAT_ID_KEY] = notify_chat_id
+
+            config.update_config(mutate)
+            self._refresh_feishu_service()
+            snapshot = self.get_feishu_settings()
+            return {"ok": True, "settings": snapshot.get("settings") or {}, "msg": ""}
+        except Exception as e:
+            logger.exception("set_feishu_settings 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def test_feishu_connection(self, app_id: str = "", app_secret: str = "") -> Dict[str, Any]:
+        """校验凭据：请求飞书长连接接入点，返回是否拿到连接地址。
+
+        传入空值时用已保存的配置（密钥未填则用已存密钥），便于设置页「测试连接」。
+        """
+        try:
+            from core.feishu._lark_ws import Client
+            from core.feishu.config import load_feishu_config
+
+            cfg = load_feishu_config()
+            use_id = str(app_id or "").strip() or cfg.app_id
+            use_secret = str(app_secret or "").strip() or cfg.app_secret
+            if not use_id or not use_secret:
+                return {"ok": False, "msg": "请先填写 App ID 与 App Secret"}
+            client = Client(app_id=use_id, app_secret=use_secret, source="xingyao")
+            url = client._get_conn_url()
+            return {
+                "ok": True,
+                "msg": "凭据有效，飞书已返回长连接地址（保存后即开始连接）",
+                "endpoint_ready": bool(url),
+            }
+        except Exception as e:
+            logger.info("test_feishu_connection 失败: %s", e)
+            return {"ok": False, "msg": f"连接失败：{e}"}
+
+    def _refresh_feishu_service(self) -> None:
+        """配置变更后让飞书服务按新配置生效（启动 / 停止 / 重连）。"""
+        try:
+            from core.feishu.config import load_feishu_config
+
+            configured = load_feishu_config().configured
+        except Exception:
+            configured = False
+        svc = getattr(self, "_feishu_service", None)
+        if svc is None:
+            if configured:
+                self._ensure_feishu_service()
+            return
+        if not configured:
+            try:
+                svc.stop()
+            finally:
+                self._feishu_service = None
+            return
+        try:
+            svc.restart()
+        except Exception:
+            logger.exception("重启飞书通道服务失败")
+
+    # ------------------------------------------------------------------
     # 对话流
     # ------------------------------------------------------------------
     def send_user_message(self, text: str, session_name: Optional[str] = None, attachments: Optional[List[str]] = None, workdir: Optional[str] = None, model_id: Optional[str] = None, permission_mode: Optional[str] = None, turn_source: str = "local") -> Dict[str, Any]:
         # turn_source 是入口层受控回合来源（设计 18）：LAN dispatch 由服务器注入
-        # "lan"，本地 GUI/CLI 固定 "local"；只接受这两个受控值，模型/用户正文
-        # 无法设置，非法值直接拒绝（不启动回合）。
+        # "lan"，本地 GUI/CLI 固定 "local"，飞书通道由 core/feishu 注入 "feishu"；
+        # 只接受这几个受控值，模型/用户正文无法设置，非法值直接拒绝（不启动回合）。
         # 注意参数顺序：permission_mode 在 turn_source 之前——桌面 GUI 经
         # pywebview 按位置传参，第 6 位必须是会话级权限档位；LAN 分发只放行
         # 前 5 个位置参数（MESSAGE_ENTRY_POSITIONAL_LIMIT），客户端同样无法
         # 经位置通道注入档位。
-        if turn_source not in ("local", "lan"):
+        if turn_source not in TURN_SOURCES:
             return {"ok": False, "msg": "无效的回合来源"}
         try:
             if self._shutting_down:
