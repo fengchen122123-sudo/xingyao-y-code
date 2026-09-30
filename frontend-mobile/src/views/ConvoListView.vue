@@ -9,9 +9,9 @@
       </template>
     </van-nav-bar>
 
-    <van-search v-model="search" placeholder="搜索会话" />
+    <van-search v-model="search" placeholder="搜索会话" clear-trigger="always" />
 
-    <van-pull-refresh :model-value="refreshing" @refresh="onRefresh">
+    <van-pull-refresh class="list" :model-value="refreshing" @refresh="onRefresh">
       <div class="groups">
         <template v-for="g in filteredGroups" :key="g.folder_path">
           <div class="group-label" @click="toggle(g.folder_path)">
@@ -45,7 +45,10 @@
             </div>
           </template>
         </template>
-        <van-empty v-if="!filteredGroups.length" description="还没有会话，点右上角新建" />
+        <div v-if="!filteredGroups.length" class="empty">
+          <van-empty :description="search.trim() ? `没有匹配「${search.trim()}」的会话` : '还没有会话，点右上角新建'" />
+          <button v-if="search.trim()" class="empty-clear" @click="search = ''">清除搜索</button>
+        </div>
       </div>
     </van-pull-refresh>
 
@@ -256,20 +259,37 @@ function pickDir() {
 }
 
 onActivated(() => { void store.refreshSessions(); });
-// tabbar 可点在弹层之上，离开本页（keep-alive 不卸载）时主动收起所有弹层
+// tabbar 可点在弹层之上，离开本页（keep-alive 不卸载）时主动收起所有弹层。
+// 搜索词同样必须清掉：keep-alive 复用同一实例，若留着搜索词，从详情返回时列表
+// 仍停在过滤结果上（关键词不命中时还会显示空态），看起来就是「卡在搜索界面」，
+// 而 Vant 的清除按钮只在输入框聚焦时才出现，用户找不到退出口只能整页刷新。
 onDeactivated(() => {
   newDlg.value = false;
   projDlg.value = false;
   dirDlg.value = false;
   opsDlg.value = false;
+  search.value = '';
 });
 </script>
 
 <style scoped>
-.page { min-height: 100vh; padding-bottom: 70px; }
+/* 页面高度由 flex 分配（app-root 已扣掉 tabbar/banner），滚动容器见 .list。
+   全局 html/body 是 overflow:hidden，本页必须自己提供滚动容器，否则内容超屏
+   只能被裁掉（曾经 .page 只有 min-height:100vh，整页无法滑动）。 */
+.page { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+/* 滚动容器必须是 pull-refresh 自身或其祖先：Vant 用 useScrollParent(root) 沿 DOM
+   向上找 overflow-y 为 auto/scroll 的元素来判定「是否在顶部」，找不到就退化成
+   window（永不滚动）→ reachTop 恒真 → 任何向下拖动都会被 preventDefault 抢去触发
+   下拉刷新，列表反而滚不动。这里覆盖 Vant 的 overflow:hidden 让它命中自身。 */
+.list { flex: 1; min-height: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; }
+/* Vant 默认把 track 固定成 100% 高（内容靠溢出传播撑开滚动区）。改成随内容长高、
+   但至少一屏，滚动区尺寸不再依赖溢出传播规则。 */
+.list :deep(.van-pull-refresh__track) { height: auto; min-height: 100%; }
 .nvlogo { width: 22px; height: 22px; border-radius: 6px; object-fit: cover; box-shadow: 0 0 8px var(--accent-soft); }
 .newbtn { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; font-family: var(--font-mono); color: var(--accent); }
-.groups { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+.groups { padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px)); display: flex; flex-direction: column; gap: 10px; }
+.empty { padding-top: 40px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.empty-clear { padding: 9px 22px; border-radius: 8px; font-size: 13px; border: 1px solid var(--line-strong); background: none; color: var(--text-2); }
 .group-label { font-size: 12px; color: var(--text-2); padding: 9px 2px 7px; display: flex; align-items: center; gap: 7px; cursor: pointer; }
 .group-label .chev { transition: transform .15s; }
 .group-label .chev.open { transform: rotate(90deg); }
