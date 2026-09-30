@@ -160,11 +160,19 @@
 
     <!-- 输入栏 -->
     <div ref="composerEl" class="composer">
-      <!-- 排队条 -->
+      <!-- 排队条：逐条列出（旧实现只渲染队首，第 2 条起没有任何操作入口） -->
       <div v-if="store.currentQueue.length" class="qbar">
-        <span class="q"><svg class="i sm"><use href="#i-clock" /></svg>排队 {{ store.currentQueue.length }} 条：{{ store.currentQueue[0].text }}</span>
-        <span class="x" @click="cancelQueued(store.currentQueue[0].id)"><svg class="i sm"><use href="#i-x" /></svg>取消</span>
-        <span class="x" style="color:var(--accent)" @click="jumpQueued(store.currentQueue[0].id)"><svg class="i sm"><use href="#i-up2" /></svg>插队</span>
+        <div class="q-head"><svg class="i sm"><use href="#i-clock" /></svg>排队 {{ store.currentQueue.length }} 条</div>
+        <div class="q-list">
+          <div v-for="(m, qi) in store.currentQueue" :key="m.id" class="q-row">
+            <span class="q-idx mono">{{ qi + 1 }}</span>
+            <span class="q-txt">{{ m.text }}</span>
+            <span v-if="m.attachments.length" class="q-att mono">{{ m.attachments.length }} 附件</span>
+            <span class="q-act" @click="undoQueued(m)"><svg class="i sm"><use href="#i-undo" /></svg>编辑</span>
+            <span class="q-act jump" @click="jumpQueued(m.id)"><svg class="i sm"><use href="#i-up2" /></svg>插队</span>
+            <span class="q-act del" @click="cancelQueued(m.id)"><svg class="i sm"><use href="#i-x" /></svg>取消</span>
+          </div>
+        </div>
       </div>
 
       <!-- 附件 chips -->
@@ -222,7 +230,7 @@
 import { computed, nextTick, onActivated, onBeforeUnmount, onMounted, ref, type Ref } from 'vue';
 import { useRouter } from 'vue-router';
 import { showConfirmDialog, showFailToast, showImagePreview, showToast } from 'vant';
-import { useAppStore, type ChatMessage, type PermRequest, type ToolCallUi } from '../stores/app';
+import { useAppStore, type ChatMessage, type PermRequest, type QueuedMsg, type ToolCallUi } from '../stores/app';
 import MdView from '../components/MdView.vue';
 import SessionOps from '../components/SessionOps.vue';
 import { copyText } from '../utils/clipboard';
@@ -583,6 +591,34 @@ async function jumpQueued(id: string) {
     showFailToast(e?.message || '插队失败');
   }
 }
+/** 撤回排队消息：移出队列并把文本/附件回填输入框，供重新编辑后再发 */
+async function undoQueued(m: QueuedMsg) {
+  if (draft.value.trim()) {
+    try {
+      await showConfirmDialog({ title: '撤回排队消息', message: '输入框已有内容，撤回会覆盖当前草稿。' });
+    } catch {
+      return; // 用户放弃
+    }
+  }
+  try {
+    const r = await store.takeQueued(m.id);
+    if (!r) { showFailToast('该消息已不在队列中'); return; }
+    draft.value = r.text;
+    for (const a of r.attachments) {
+      if (!attachChips.value.some((c) => c.path === a.path)) attachChips.value.push(a);
+    }
+    nextTick(() => {
+      const el = document.querySelector('.input-box textarea') as HTMLTextAreaElement | null;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(el.value.length, el.value.length);
+      el.style.height = BASE_TA_H + 'px';
+      el.style.height = Math.min(124, el.scrollHeight) + 'px';
+    });
+  } catch (e: any) {
+    showFailToast(e?.message || '撤回失败');
+  }
+}
 
 // ---- 撤销回合 ----
 const undoDlg = ref(false);
@@ -819,9 +855,18 @@ html.light .u-bub { background: var(--accent); }
 /* ===== 输入栏 ===== */
 .composer { flex: none; position: sticky; bottom: 0; z-index: 5; background: var(--bg); border-top: 1px solid var(--line); padding: 9px 16px calc(14px + env(safe-area-inset-bottom)); }
 
-.qbar { display: flex; align-items: center; gap: 8px; font-size: 11px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--bg-panel)); border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); border-radius: 10px; padding: 7px 12px; margin-bottom: 7px; }
-.qbar .q { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: inline-flex; gap: 6px; align-items: center; }
-.qbar .x { cursor: pointer; flex: none; display: inline-flex; gap: 4px; align-items: center; }
+.qbar { font-size: 11px; color: var(--warn); background: color-mix(in srgb, var(--warn) 10%, var(--bg-panel)); border: 1px solid color-mix(in srgb, var(--warn) 30%, transparent); border-radius: 10px; padding: 7px 12px 8px; margin-bottom: 7px; }
+.q-head { display: flex; align-items: center; gap: 6px; }
+/* 多条排队时限制高度、行内滚动，不把输入区顶出屏幕 */
+.q-list { max-height: 30vh; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; margin-top: 4px; }
+.q-row { display: flex; align-items: center; gap: 7px; color: var(--text-1); }
+.q-idx { flex: none; font-size: 10px; color: var(--text-3); }
+.q-txt { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.q-att { flex: none; font-size: 10px; color: var(--text-3); }
+.q-act { flex: none; display: inline-flex; align-items: center; gap: 3px; padding: 2px 5px; border-radius: 6px; color: var(--text-2); cursor: pointer; }
+.q-act:active { background: var(--bg-raised); }
+.q-act.jump { color: var(--accent); }
+.q-act.del { color: var(--text-3); }
 .chips { display: flex; gap: 6px; margin-bottom: 6px; flex-wrap: wrap; }
 .chip { font-size: 11px; font-family: var(--font-mono); color: var(--text-2); background: var(--bg-raised); border: 1px solid var(--line); border-radius: 99px; padding: 3px 10px; display: flex; gap: 6px; align-items: center; }
 .chip .x { color: var(--text-3); cursor: pointer; display: flex; }
