@@ -55,9 +55,22 @@ def test_css_rect_to_physical_handles_bad_scale_and_values():
         # 显式危险 scheme 一律拒绝
         ("javascript:alert(1)", ""),
         ("data:text/html,<h1>x</h1>", ""),
-        ("file:///C:/x.txt", ""),
         ("mailto:a@b.com", ""),
         ("about:config", ""),
+        # 本地文件放行：file:// URL 与盘符 / UNC 绝对路径都规范成 file:// URI
+        ("file:///C:/x.txt", "file:///C:/x.txt"),
+        ("file:///D:/proj/a.html", "file:///D:/proj/a.html"),
+        ("C:\\proj\\a.html", "file:///C:/proj/a.html"),
+        ("D:/proj/index.html", "file:///D:/proj/index.html"),
+        ("\\\\srv\\share\\a.html", "file://srv/share/a.html"),
+        # 空格 / 中文按百分号编码（本地路径带空格与中文是常态）
+        ("file:///D:/My Docs/a b.html", "file:///D:/My%20Docs/a%20b.html"),
+        ("file:///D:/文档/a.html", "file:///D:/%E6%96%87%E6%A1%A3/a.html"),
+        # file: 的非标准写法 / 相对路径 / 含 ".." 的路径一律拒绝
+        ("file:relative.txt", ""),
+        ("file://relative.txt", ""),
+        ("file:///D:/a/../b.html", ""),
+        ("../a.html", ""),
         # 搜索词 / 含空格
         ("hello world", ""),
         ("just-a-word", ""),
@@ -364,13 +377,16 @@ class _NavArgs:
     [
         # 点击链接 / location.href / meta refresh 绕过后端 normalize_url 的入口
         ("javascript:alert(1)", True),
-        ("file:///C:/Windows/win.ini", True),
         ("data:text/html,<h1>x</h1>", True),
         ("about:config", True),
-        # 白名单：http/https 与既有的 about:blank
+        ("file:relative.txt", True),
+        # 白名单：http/https、about:blank，以及本地文件（本地 html 页内互链、
+        # meta refresh 到另一个本地页都按系统浏览器行为放行）
         ("https://example.com/page", False),
         ("http://example.com/page", False),
         ("about:blank", False),
+        ("file:///C:/Windows/win.ini", False),
+        ("file:///D:/proj/a.html", False),
     ],
 )
 def test_navigation_starting_enforces_scheme_whitelist(uri, cancelled):
@@ -399,7 +415,43 @@ def test_is_navigation_allowed_matches_normalize_url():
     assert eb.is_navigation_allowed(None) is True  # 取不到 -> 不误杀
     assert eb.is_navigation_allowed("") is True
     assert eb.is_navigation_allowed("javascript:alert(1)") is False
-    assert eb.is_navigation_allowed("file:///C:/x.txt") is False
+    # 本地文件已放行（右栏内嵌浏览器渲染本地 html）；非绝对路径写法仍拒绝
+    assert eb.is_navigation_allowed("file:///C:/x.txt") is True
+    assert eb.is_navigation_allowed("file:relative.txt") is False
+
+
+# ---------------- 本地文件 URI 规整 ----------------
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("file:///C:/x.txt", "file:///C:/x.txt"),
+        ("file://C:/x.txt", "file:///C:/x.txt"),
+        ("C:\\proj\\a.html", "file:///C:/proj/a.html"),
+        ("C:/proj/a.html", "file:///C:/proj/a.html"),
+        ("\\\\srv\\share\\a.html", "file://srv/share/a.html"),
+        ("  file:///C:/x.txt  ", "file:///C:/x.txt"),
+    ],
+)
+def test_normalize_file_url_forms(raw, expected):
+    assert eb.normalize_file_url(raw) == expected
+
+
+def test_normalize_file_url_rejects_unsafe_inputs():
+    assert eb.normalize_file_url(None) == ""
+    assert eb.normalize_file_url(123) == ""
+    assert eb.normalize_file_url("") == ""
+    assert eb.normalize_file_url("file:") == ""
+    assert eb.normalize_file_url("file:C:/x.txt") == ""  # 非 file:// 标准写法
+    assert eb.normalize_file_url("relative/a.html") == ""  # 相对路径无基准目录
+    assert eb.normalize_file_url("file:///C:/a/../b.html") == ""  # 含 .. 视为异常输入
+
+
+def test_path_to_file_uri_rejects_relative_and_root_only():
+    assert eb.path_to_file_uri("./a.html") == ""
+    assert eb.path_to_file_uri("") == ""
+    assert eb.path_to_file_uri("C:") == ""  # 只有盘符、无文件名
 
 
 # ---------------- shutdown 释放契约 ----------------

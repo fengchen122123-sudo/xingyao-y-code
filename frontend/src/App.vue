@@ -239,6 +239,13 @@
         :class="{ 'si-warn': store.sandboxEnabled }"
         :title="store.sandboxEnabled ? '沙盒已解除：允许访问工作目录外文件' : '沙盒已开启：仅允许访问工作目录内文件'"
       >沙盒: {{ store.sandboxEnabled ? '解除' : '限制' }}</span>
+      <!-- AI 生成内容声明：居中落在状态栏中段剩余区域，空间不足时收缩省略 -->
+      <span
+        class="si status-ai-notice"
+        data-test="status-ai-notice"
+        data-mobile-status="hidden"
+        title="本界面展示的内容由 AI 生成，仅供参考，请仔细甄别"
+      ><span class="notice-text">内容由 AI 生成，仅供参考，请仔细甄别</span></span>
       <div class="right status-runtime" data-test="status-runtime">
         <span class="si" data-test="status-running" data-mobile-status="primary">{{ store.running ? '生成中…' : '空闲' }}</span>
         <span class="si" data-test="status-charset" data-mobile-status="hidden">UTF-8</span>
@@ -402,6 +409,8 @@ const {
   defaultWidth: RIGHT_PANEL_DEFAULT_WIDTH,
   getWidth: () => store.rightPanelWidth,
   setWidth: (w) => { store.rightPanelWidth = w; },
+  // 右面板按视口比例记忆：窗口放大/缩小等比跟随，拖到 50% 就一直保持 50%
+  viewportRatio: true,
 });
 // 拖拽期间给 #main 加 class：全局禁文本选择并强制 col-resize 光标
 const anyPanelResizing = computed(() => sidebarResizing.value || rightPanelResizing.value);
@@ -1462,6 +1471,20 @@ onUnmounted(() => {
 }
 #statusbar .si-warn {
   color: var(--orange);
+}
+/* AI 生成内容声明：占据状态栏中段剩余空间并居中，窄窗口时优先收缩省略 */
+#statusbar .status-ai-notice {
+  flex: 1 1 auto;
+  min-width: 0;
+  justify-content: center;
+  color: var(--text-dim);
+  opacity: 0.75;
+}
+#statusbar .status-ai-notice .notice-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 #statusbar .right {
   margin-left: auto;
