@@ -221,3 +221,29 @@ describe('Topbar terminal toggle', () => {
     expect(store.terminalPanelOpen).toBe(false);
   });
 });
+
+describe('Topbar sidebar toggle', () => {
+  it('collapses and expands the sidebar when the logo mark is clicked', async () => {
+    const store = useAppStore();
+    store.sidebarCollapsed = false;
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+
+    await wrapper.get('.logo .mark').trigger('click');
+    expect(store.sidebarCollapsed).toBe(true);
+
+    await wrapper.get('.logo .mark').trigger('click');
+    expect(store.sidebarCollapsed).toBe(false);
+  });
+
+  it('keeps the toggle hit area on the icon rather than the wordmark', async () => {
+    const store = useAppStore();
+    store.sidebarCollapsed = false;
+    const wrapper = mount(Topbar, { global: { stubs: { AppIcon: true } } });
+
+    await wrapper.get('.logo .name').trigger('click');
+    expect(store.sidebarCollapsed).toBe(false);
+
+    expect(wrapper.find('button#btn-toggle-side').exists()).toBe(false);
+    expect(wrapper.get('#btn-toggle-side').classes()).toContain('mark');
+  });
+});

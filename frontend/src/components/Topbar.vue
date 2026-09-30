@@ -1,10 +1,20 @@
 <template>
   <div id="topbar" data-theme-region="app_header">
-    <button class="icon-btn no-drag" id="btn-toggle-side" title="切换侧栏" @click="store.toggleSidebar()">
-      <AppIcon name="menu" :size="17" />
-    </button>
-    <div class="logo no-drag" :title="store.version ? ('星瑶Code ' + store.agentName + ' v' + store.version) : ('星瑶Code ' + store.agentName)">
-      <img class="mark" :src="'/icon.png'" alt="星瑶Code">
+    <!-- 侧栏开合入口：点击左上角星瑶图标收起/展开左侧栏
+         （热区只覆盖图标本身，右侧文字标题不参与；原独立汉堡按钮已移除） -->
+    <div class="logo no-drag" :title="logoTitle">
+      <img
+        class="mark"
+        id="btn-toggle-side"
+        role="button"
+        tabindex="0"
+        :src="'/icon.png'"
+        alt="星瑶Code"
+        :title="store.sidebarCollapsed ? '展开侧栏' : '收起侧栏'"
+        @click="store.toggleSidebar()"
+        @keydown.enter.prevent="store.toggleSidebar()"
+        @keydown.space.prevent="store.toggleSidebar()"
+      >
       <div><span class="name">星瑶Code</span></div>
     </div>
 
@@ -159,6 +169,11 @@ onBeforeUnmount(() => {
   cancelPendingDrag();
 });
 
+// logo 文字区域的悬停提示：显示版本信息（侧栏开合提示挂在星瑶图标上）
+const logoTitle = computed(() =>
+  store.version ? `星瑶Code ${store.agentName} v${store.version}` : `星瑶Code ${store.agentName}`
+);
+
 const topbarUpdateLabel = computed(() => {
   if (store.updateState.status === 'downloaded') return '立即安装更新';
   if (store.updateState.status === 'downloading') return '下载中';
@@ -202,6 +217,16 @@ function handleUpdateClick() {
   border-radius: 7px;
   object-fit: cover;
   display: block;
+  /* 兼作侧栏开合入口：热区只在图标本身 */
+  cursor: pointer;
+  transition: filter 0.12s;
+}
+#topbar .logo .mark:hover {
+  filter: brightness(1.12);
+}
+#topbar .logo .mark:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
 }
 #topbar .logo .name {
   font-weight: 600;

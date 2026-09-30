@@ -44,6 +44,7 @@ it('手机状态栏只保留连接、模型、工作区、沙盒、运行状态�
     'status-token',
     'status-permission',
     'status-skill',
+    'status-ai-notice',
     'status-charset',
   ]);
 

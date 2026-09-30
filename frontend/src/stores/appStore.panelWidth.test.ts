@@ -7,6 +7,11 @@ import {
 } from '../composables/usePanelResize';
 import { useAppStore } from './appStore';
 
+// 视口宽度控制（jsdom 默认 1024）：右面板宽度按视口比例恢复，需可模拟
+function setViewportWidth(width: number) {
+  Object.defineProperty(window, 'innerWidth', { value: width, writable: true, configurable: true });
+}
+
 beforeEach(() => {
   localStorage.removeItem(SIDEBAR_WIDTH_KEY);
   localStorage.removeItem(RIGHT_PANEL_WIDTH_KEY);
@@ -41,5 +46,22 @@ describe('面板宽度状态', () => {
     localStorage.setItem(SIDEBAR_WIDTH_KEY, '180');
     const store = useAppStore();
     expect(store.sidebarWidth).toBe(240);
+  });
+
+  it('右面板比例存储按当前视口换算（拖到 50% 恢复成视口一半）', () => {
+    setViewportWidth(1000);
+    localStorage.setItem(RIGHT_PANEL_WIDTH_KEY, '0.5');
+    const store = useAppStore();
+    expect(store.rightPanelWidth).toBe(500);
+  });
+
+  it('右面板旧版像素存储仍可恢复，越界值收敛到视口 50% 上限', () => {
+    setViewportWidth(1000);
+    localStorage.setItem(RIGHT_PANEL_WIDTH_KEY, '400');
+    expect(useAppStore().rightPanelWidth).toBe(400);
+
+    setActivePinia(createPinia());
+    localStorage.setItem(RIGHT_PANEL_WIDTH_KEY, '9999');
+    expect(useAppStore().rightPanelWidth).toBe(500);
   });
 });
