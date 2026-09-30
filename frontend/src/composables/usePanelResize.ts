@@ -59,6 +59,38 @@ export function computeRestoredWidth(stored: string | null, min: number, max: nu
   return clampPanelWidth(value, min, max);
 }
 
+// ── 视口比例记忆（右面板专用）────────────────────────────────
+// 宽度按“占视口宽度的比例”记忆：窗口放大/缩小时等比跟随，拖到 50% 就一直保持 50%。
+// 存储值 <= 1 视为比例；> 1 视为旧版像素值（按当前视口换算成比例，兼容老记忆）。
+
+/**
+ * 解析持久化的视口比例：非法/非正数返回 null（视为未自定义）；
+ * 超过 50% 的比例收敛到 MAX_VIEWPORT_RATIO（与 panelMaxWidth 同口径）。
+ */
+export function parseStoredRatio(stored: string | null, viewportWidth = window.innerWidth): number | null {
+  if (stored == null) return null;
+  const value = Number(stored);
+  if (!Number.isFinite(value) || value <= 0) return null;
+  const ratio = value > 1 ? value / viewportWidth : value;
+  return Math.min(ratio, MAX_VIEWPORT_RATIO);
+}
+
+/** 视口比例 → 像素宽度：夹取到 [min, min(配置上限, 视口 50%)] */
+export function ratioToWidth(ratio: number, min: number, max: number, viewportWidth = window.innerWidth): number {
+  return clampPanelWidth(ratio * viewportWidth, min, panelMaxWidth(max, viewportWidth));
+}
+
+/** 恢复比例记忆的宽度：未自定义返回 null，其余按当前视口换算像素宽度 */
+export function computeRestoredRatioWidth(
+  stored: string | null,
+  min: number,
+  max: number,
+  viewportWidth = window.innerWidth,
+): number | null {
+  const ratio = parseStoredRatio(stored, viewportWidth);
+  return ratio == null ? null : ratioToWidth(ratio, min, max, viewportWidth);
+}
+
 export interface PanelResizeOptions {
   /** 手柄在面板的哪一侧：'left' 手柄于左栏右缘，'right' 手柄于右栏左缘 */
   direction: 'left' | 'right';
@@ -72,6 +104,12 @@ export interface PanelResizeOptions {
   getWidth: () => number;
   /** 拖拽中实时回写宽度（通常写入 appStore） */
   setWidth: (w: number) => void;
+  /**
+   * 宽度按视口比例记忆并在窗口缩放时等比跟随（右面板专用）。
+   * 开启后持久化的是比例而非像素，且 window resize 时按比例重算像素宽度；
+   * 侧栏上限固定 480px、语义是固定像素宽度，故不开启。
+   */
+  viewportRatio?: boolean;
 }
 
 export interface PanelResizeApi {
@@ -91,11 +129,22 @@ export interface PanelResizeApi {
  */
 export function usePanelResize(opts: PanelResizeOptions): PanelResizeApi {
   const isResizing = ref(false);
+  // 当前自定义比例（null = 未自定义，窗口缩放不联动）。内存持有而非每次读存储：
+  // 拖拽中尚未持久化也要能联动；被小视口夹窄时也不丢用户意图，窗口回弹即按原比例恢复
+  let ratio: number | null = null;
+  if (opts.viewportRatio) {
+    try { ratio = parseStoredRatio(localStorage.getItem(opts.storageKey)); } catch { ratio = null; }
+  }
 
   function persist(width: number) {
+    const customized = width !== opts.defaultWidth;
+    if (opts.viewportRatio) ratio = customized ? width / window.innerWidth : null;
     try {
-      if (width === opts.defaultWidth) {
+      if (!customized) {
         localStorage.removeItem(opts.storageKey);
+      } else if (opts.viewportRatio) {
+        // 存比例而非像素：窗口缩放后按同一比例还原
+        localStorage.setItem(opts.storageKey, String(Number((width / window.innerWidth).toFixed(4))));
       } else {
         localStorage.setItem(opts.storageKey, String(width));
       }
@@ -104,7 +153,17 @@ export function usePanelResize(opts: PanelResizeOptions): PanelResizeApi {
 
   function resetWidth() {
     opts.setWidth(opts.defaultWidth);
+    if (opts.viewportRatio) ratio = null;
     try { localStorage.removeItem(opts.storageKey); } catch { /* 忽略 */ }
+  }
+
+  // 视口比例联动：窗口缩放时按记忆比例重算像素宽度（拖到 50% 就一直是 50%）；
+  // 拖拽进行中不介入，避免和指针位移抢同一份宽度
+  if (opts.viewportRatio) {
+    window.addEventListener('resize', () => {
+      if (ratio == null || isResizing.value) return;
+      opts.setWidth(ratioToWidth(ratio, opts.minWidth, opts.maxWidth));
+    });
   }
 
   function onHandlePointerdown(e: PointerEvent) {
