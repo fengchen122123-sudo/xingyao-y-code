@@ -126,6 +126,23 @@ export interface ComputerRunSnapshot {
   hotkey_available: boolean;
 }
 
+export interface FeishuSettingsSnapshot {
+  enabled: boolean;
+  app_id: string;
+  /** 仅表示是否已配置密钥；明文不经快照下发 */
+  has_secret: boolean;
+  approvers: string[];
+  notify_chat_id: string;
+  status: {
+    state: string;
+    running: boolean;
+    last_error: string;
+    received_events: number;
+    duplicate_events: number;
+    uptime_seconds: number;
+  };
+}
+
 export interface SystemSettingsSnapshot {
   command_shell: string;
   command_shell_options: CommandShellOption[];
@@ -995,6 +1012,17 @@ export interface PyWebViewAPI {
   // AI 生成内容目录：不可用路径显式拒绝（ok=false + msg），不做静默降级
   set_ai_output_dir(path: string): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   set_remote_token_ttl(seconds: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
+  // 飞书集成：快照不含 app_secret 明文（只回 has_secret），明文按需 get_feishu_secret
+  get_feishu_settings(): Promise<{ ok: boolean; settings?: FeishuSettingsSnapshot; msg?: string }>;
+  set_feishu_settings(payload: {
+    enabled: boolean;
+    app_id: string;
+    app_secret?: string;
+    approvers: string[];
+    notify_chat_id: string;
+  }): Promise<{ ok: boolean; settings?: FeishuSettingsSnapshot; msg?: string }>;
+  get_feishu_secret(): Promise<{ ok: boolean; app_secret?: string; msg?: string }>;
+  test_feishu_connection(appId?: string, appSecret?: string): Promise<{ ok: boolean; msg?: string; endpoint_ready?: boolean }>;
   set_agent_turn_step_limit(value: number): Promise<{ ok: boolean; settings: SystemSettingsSnapshot; msg?: string }>;
   // /doctor 聚合自检（T3b）：设置页「运行自检」入口，复用 CLI 同一套检查
   // （core.doctor.run_checks）；skipNetwork 默认 false（含模型端点联网探测）
