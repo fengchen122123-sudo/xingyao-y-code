@@ -78,6 +78,7 @@ import {
   SIDEBAR_MAX_WIDTH,
   SIDEBAR_MIN_WIDTH,
   SIDEBAR_WIDTH_KEY,
+  computeRestoredRatioWidth,
   computeRestoredWidth,
 } from '../composables/usePanelResize';
 import {
@@ -95,6 +96,24 @@ function storedPanelWidth(key: string, def: number, min: number, max: number): n
     return computeRestoredWidth(localStorage.getItem(key), min, max) ?? def;
   } catch {
     return def;
+  }
+}
+
+/**
+ * 右面板宽度启动恢复（视口比例语义）：记忆的是“占视口宽度的比例”，
+ * 按当前视口换算成像素（兼容旧版像素记忆），并夹取到
+ * [min, min(配置上限, 视口 50%)]；未自定义或存储不可用回默认宽度。
+ * 窗口缩放时的等比跟随由 usePanelResize(viewportRatio) 的 resize 监听负责。
+ */
+function restoredRightPanelWidth(): number {
+  try {
+    return computeRestoredRatioWidth(
+      localStorage.getItem(RIGHT_PANEL_WIDTH_KEY),
+      RIGHT_PANEL_MIN_WIDTH,
+      RIGHT_PANEL_MAX_WIDTH,
+    ) ?? RIGHT_PANEL_DEFAULT_WIDTH;
+  } catch {
+    return RIGHT_PANEL_DEFAULT_WIDTH;
   }
 }
 
@@ -728,9 +747,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 模态瞬态，不持久化也不会话隔离
     rightPanelSnipActive: false,
     // 桌面端左右面板宽度（px）：拖拽手柄实时更新，启动时从 localStorage 恢复；
+    // 右面板按视口比例记忆（窗口缩放等比跟随），侧栏按固定像素记忆；
     // 移动端（<=768px）忽略这两个值，布局由 style.css 媒体查询接管
     sidebarWidth: storedPanelWidth(SIDEBAR_WIDTH_KEY, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MIN_WIDTH, SIDEBAR_MAX_WIDTH),
-    rightPanelWidth: storedPanelWidth(RIGHT_PANEL_WIDTH_KEY, RIGHT_PANEL_DEFAULT_WIDTH, RIGHT_PANEL_MIN_WIDTH, RIGHT_PANEL_MAX_WIDTH),
+    rightPanelWidth: restoredRightPanelWidth(),
     // 内嵌浏览器（右侧面板浏览器页签）：真实网页由宿主叠加的原生 WebView2
     // 渲染，前端只持有状态（地址栏/前进后退能力/加载态）并做乐观更新；
     // supported=false 表示宿主平台不支持（非 Windows 桌面端 GUI 或缺桥）。

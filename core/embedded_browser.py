@@ -25,6 +25,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
+from urllib.parse import quote, unquote
 
 logger = logging.getLogger(__name__)
 
@@ -35,10 +36,14 @@ _EMIT_INTERVAL = 0.15
 _IPV4_RE = re.compile(r"^\d{1,3}(\.\d{1,3}){3}$")
 _HOST_CHARS_RE = re.compile(r"^[A-Za-z0-9.\-]+$")
 # 命中这些显式 scheme 一律拒绝加载（前端 <a>/搜索框可能混入），
-# 避免内嵌控件被 javascript:/data:/file: 利用做越权或注入。
+# 避免内嵌控件被 javascript:/data: 利用做越权或注入。
+# file: 不在此列：本地 html 要在右栏内嵌浏览器里按网页渲染，改由
+# normalize_file_url 单独规整（只放行盘符 / UNC 形式的绝对路径，见下）。
 _REJECTED_SCHEMES_RE = re.compile(
-    r"^(javascript|data|file|vbscript|blob|mailto|about|tel|chrome|edge|view-source):"
+    r"^(javascript|data|vbscript|blob|mailto|about|tel|chrome|edge|view-source):"
 )
+# 本地文件绝对路径形态（相对路径没有可靠基准目录，一律不放行）
+_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 
 # WebView2 ZoomFactor 允许范围：自由尺寸「适应窗口」用缩放把请求的逻辑视口
 # （如 1280×800）渲染进面板矩形；超出范围的请求直接夹到边界。
@@ -114,6 +119,52 @@ def _looks_like_host(u: str) -> bool:
     return False
 
 
+def path_to_file_uri(path: str) -> str:
+    r"""本地绝对路径 → file:// URI（正斜杠 + 百分号编码）；非绝对路径返回 ''。
+
+    只接受盘符路径（C:\x / C:/x）与 UNC 路径（\\server\share\x）：相对路径没有
+    可靠基准目录，放行等于把任意文本当本地文件打开，故一律拒绝。含 ".." 的
+    路径同样不放行（调用方已归一化，出现即视为异常输入）。
+    """
+    p = str(path).strip().strip('"')
+    if not p:
+        return ""
+    p = p.replace("\\", "/")
+    if _WINDOWS_DRIVE_RE.match(p):
+        drive = p[:2]
+        segs = [s for s in p[2:].split("/") if s not in ("", ".")]
+        if not segs or ".." in segs:
+            return ""
+        return "file:///" + drive + "/" + "/".join(quote(s, safe="") for s in segs)
+    if p.startswith("//"):
+        parts = [s for s in p[2:].split("/") if s not in ("", ".")]
+        if len(parts) < 2 or ".." in parts:
+            return ""
+        return "file://" + quote(parts[0], safe="") + "/" + "/".join(
+            quote(s, safe="") for s in parts[1:]
+        )
+    return ""
+
+
+def normalize_file_url(raw: Any) -> str:
+    """file:// URL 或本地绝对路径 → 规范 file:// URI；非法输入返回 ''。"""
+    if not isinstance(raw, str):
+        return ""
+    u = raw.strip().strip('"')
+    if not u:
+        return ""
+    if u[:5].lower() == "file:":
+        body = u[5:]
+        if not body.startswith("//"):
+            return ""  # file:C:/x 这类非标准写法一律拒绝
+        # file:///C:/x → /C:/x；file://C:/x → C:/x
+        decoded = unquote(body[2:])
+        if decoded.startswith("/"):
+            decoded = decoded[1:]
+        return path_to_file_uri(decoded)
+    return path_to_file_uri(u)
+
+
 def normalize_url(raw: Any) -> str:
     """把前端上报的 URL 规整成可导航地址；非法输入返回 ''（拒绝加载）。"""
     if not isinstance(raw, str):
@@ -124,6 +175,11 @@ def normalize_url(raw: Any) -> str:
     low = u.lower()
     if low == "about:blank":
         return u
+    # 本地文件（file:// URL / 盘符 / UNC 绝对路径）：规范成 file:// URI 后放行，
+    # 供右栏内嵌浏览器按网页渲染本地 html。本分支必须先于下面的「含空格即拒绝」
+    # ——本地路径带空格是常态（如 C:\My Docs\a.html）。
+    if low.startswith("file:") or _WINDOWS_DRIVE_RE.match(u) or u.startswith("\\\\"):
+        return normalize_file_url(u)
     # 含空格/制表符 → 视为搜索词或残缺输入，拒绝（避免把任意文本当 URL）
     if any(ch.isspace() for ch in u):
         return ""
@@ -141,9 +197,10 @@ def normalize_url(raw: Any) -> str:
 def is_navigation_allowed(uri: Any) -> bool:
     """页面自身发起导航的 scheme 兜底判定（与 normalize_url 同口径）。
 
-    仅 http/https（normalize_url 的规整结果）与既有的 about:blank 白名单放行；
-    javascript:/file:/data:/about:config 等一律拒绝。uri 取不到（None / 空 /
-    旧版内核无该属性）时返回 True——不误杀，交由 WebView2 自身策略决定。
+    放行 http/https（normalize_url 的规整结果）、about:blank 与本地文件 URI
+    （file:/// 盘符路径 / UNC，供本地 html 页内互链）；javascript:/data:/
+    about:config 等一律拒绝。uri 取不到（None / 空 / 旧版内核无该属性）时
+    返回 True——不误杀，交由 WebView2 自身策略决定。
     """
     if uri is None:
         return True
