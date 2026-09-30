@@ -489,3 +489,65 @@ it('自动化视口框矩形越出占位区时被夹紧回占位区内（铺满�
   expect(rectSpy).toHaveBeenCalled();
   wrapper.unmount();
 });
+
+// ---------------- 外部导航请求（对话正文 / 文件树点击 html）----------------
+
+it('外部导航请求驱动内嵌浏览器导航，并乐观写入地址栏', async () => {
+  const api = mockApi();
+  (window as any).pywebview = { api };
+  const store = useAppStore();
+
+  const wrapper = await mountPane(true);
+
+  store.browserNavRequest = { url: 'file:///D:/proj/index.html', path: 'D:\\proj\\index.html' };
+  store.browserNavNonce += 1;
+  await nextTick();
+
+  await vi.waitFor(() =>
+    expect(api.browser_pane_navigate).toHaveBeenCalledWith('file:///D:/proj/index.html'),
+  );
+  expect(store.embeddedBrowser.url).toBe('file:///D:/proj/index.html');
+  wrapper.unmount();
+});
+
+it('请求到达时桥还没就绪：先挂起，pywebviewready 后补导航', async () => {
+  const store = useAppStore();
+  // 请求先于挂载/桥就绪到达（点击 html 时桥仍在两步注入的间隙）
+  store.browserNavRequest = { url: 'file:///D:/proj/index.html', path: 'D:\\proj\\index.html' };
+  store.browserNavNonce += 1;
+
+  const wrapper = await mountPane(true);
+  expect(store.embeddedBrowser.url).toBe(''); // 挂起期间不乐观改地址栏
+
+  const api = mockApi();
+  (window as any).pywebview = { api };
+  window.dispatchEvent(new Event('pywebviewready'));
+  await nextTick();
+
+  await vi.waitFor(() =>
+    expect(api.browser_pane_navigate).toHaveBeenCalledWith('file:///D:/proj/index.html'),
+  );
+  wrapper.unmount();
+});
+
+it('宿主不支持内嵌浏览器时回退源码预览并提示', async () => {
+  vi.useFakeTimers();
+  const store = useAppStore();
+  const previewCalls: string[] = [];
+  const notices: string[] = [];
+  store.openFilePreview = (async (p: string) => { previewCalls.push(p); }) as any;
+  store.notifyChat = ((m: string) => { notices.push(m); }) as any;
+
+  const wrapper = await mountPane(true);
+  // 宽限期耗尽仍无桥 → 判缺失（unsupported）
+  vi.advanceTimersByTime(BRIDGE_GRACE_MS + 1);
+  await nextTick();
+
+  store.browserNavRequest = { url: 'file:///D:/proj/index.html', path: 'D:\\proj\\index.html' };
+  store.browserNavNonce += 1;
+  await nextTick();
+
+  expect(previewCalls).toEqual(['D:\\proj\\index.html']);
+  expect(notices.join('')).toContain('内嵌浏览器不可用');
+  wrapper.unmount();
+});

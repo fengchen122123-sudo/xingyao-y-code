@@ -146,7 +146,8 @@ import { useAppStore, type ChatMessage } from '../stores/appStore';
 import { renderMarkdownDetailed, COPY_ICON_SVG, CHECK_ICON_SVG } from '../utils/markdown';
 import { splitStableBlocks } from '../utils/markdownBlocks';
 import { renderMermaidBlocks } from '../utils/mermaidRenderer';
-import { toAbsoluteLocalPath } from '../utils/localPath';
+import { canOpenInRightPanel, toAbsoluteLocalPath } from '../utils/localPath';
+import { useIsMobile } from '../composables/useViewport';
 import { formatTokenSpeed, formatDuration } from '../utils/tokenSpeed';
 import AppIcon from './AppIcon.vue';
 import FoldCard from './FoldCard.vue';
@@ -159,6 +160,8 @@ const props = defineProps<{
 // 当前气泡是“本轮正在等待响应”的空助手气泡时，显示动态干活反馈。
 // 任何实际内容（思考流 / 工具调用 / 正文 token）到达后自动隐藏。
 const store = useAppStore();
+// 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
+const isMobile = useIsMobile();
 // 用户消息复制按钮的「已复制」反馈状态与定时器
 const userCopied = ref(false);
 let userCopiedTimer: number | undefined;
@@ -364,6 +367,12 @@ function onMdBodyClick(e: MouseEvent) {
     const target = toAbsoluteLocalPath(raw, store.workdir);
     if (!target) {
       store.notifyModal('文件预览', '当前会话未绑定工作目录，无法解析相对路径');
+      return;
+    }
+    // html / pdf / md 交给右栏（网页直接渲染，md 先渲染成预览页）；
+    // 移动端没有右面板，一律回退源码预览弹窗
+    if (canOpenInRightPanel(target) && !isMobile.value) {
+      void store.openInRightPanel(target);
       return;
     }
     store.openFilePreview(target);

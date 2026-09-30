@@ -227,6 +227,22 @@ class BrowserBridgeMixin:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def write_preview_page(self, html_text: str, source_path: str = "") -> Dict[str, Any]:
+        """把前端渲染好的预览 HTML 落盘，返回可交给内嵌浏览器打开的本地路径。
+
+        用途：右栏浏览器要按阅读样式展示 .md（浏览器直接打开 md 只显示源码
+        文本）。前端用与消息气泡同一套渲染器生成完整 HTML 后交这里落盘，
+        再走 browser_pane_navigate 打开该文件。与平台无关（不碰 WebView2），
+        非 Windows 也能用。
+        """
+        try:
+            from core.web_preview import write_preview_page as _write_preview_page
+
+            path = _write_preview_page(html_text, source_path)
+            return {"ok": True, "path": str(path)}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
     def browser_pane_get_state(self) -> Dict[str, Any]:
         try:
             ctrl = getattr(self, "_embedded_browser", None)

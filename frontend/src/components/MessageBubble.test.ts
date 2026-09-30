@@ -375,4 +375,52 @@ describe('MessageBubble', () => {
   });
 });
 
+describe('MessageBubble 文件链接点击分流', () => {
+  function mountWithContent(content: string) {
+    const store = useAppStore();
+    const panelCalls: string[] = [];
+    const previewCalls: string[] = [];
+    store.openInRightPanel = (async (p: string) => { panelCalls.push(p); }) as any;
+    store.openFilePreview = (async (p: string) => { previewCalls.push(p); }) as any;
+    const msg = assistantMessage({ content });
+    return { wrapper: mount(MessageBubble, { props: { msg } }), panelCalls, previewCalls };
+  }
+
+  it('正文里的 html 路径点击走右栏内嵌浏览器（不再是源码预览弹窗）', async () => {
+    const { wrapper, panelCalls, previewCalls } = mountWithContent('看这个 D:\\proj\\index.html');
+    await flushPromises();
+
+    await wrapper.get('a[data-file-link]').trigger('click');
+
+    expect(panelCalls).toEqual(['D:\\proj\\index.html']);
+    expect(previewCalls).toEqual([]);
+    wrapper.unmount();
+  });
+
+  it('正文里的 pdf / md 路径同样走右栏', async () => {
+    const pdf = mountWithContent('看这个 D:\\proj\\doc.pdf');
+    await flushPromises();
+    await pdf.wrapper.get('a[data-file-link]').trigger('click');
+    expect(pdf.panelCalls).toEqual(['D:\\proj\\doc.pdf']);
+    pdf.wrapper.unmount();
+
+    const md = mountWithContent('看这个 D:\\proj\\readme.md');
+    await flushPromises();
+    await md.wrapper.get('a[data-file-link]').trigger('click');
+    expect(md.panelCalls).toEqual(['D:\\proj\\readme.md']);
+    md.wrapper.unmount();
+  });
+
+  it('正文里的其它文件路径点击仍走源码预览弹窗', async () => {
+    const { wrapper, panelCalls, previewCalls } = mountWithContent('看这个 D:\\proj\\app.py');
+    await flushPromises();
+
+    await wrapper.get('a[data-file-link]').trigger('click');
+
+    expect(previewCalls).toEqual(['D:\\proj\\app.py']);
+    expect(panelCalls).toEqual([]);
+    wrapper.unmount();
+  });
+});
+
 
