@@ -5,6 +5,7 @@
 """
 
 from types import SimpleNamespace
+import time
 
 import pytest
 
@@ -296,15 +297,25 @@ def test_apply_zoom_tolerates_bad_input():
 # ---------------- 星瑶自动化准备（prepare_automation） ----------------
 
 
+def test_automation_profile_dir_is_separate_from_browsing_profile():
+    """自动化控件必须用独立 UserDataFolder：同目录二次带参建环境会撞
+    WebView2 0x8007139F（本次故障根因），分离后从结构上不可能冲突。"""
+    assert eb.automation_profile_dir() != eb.profile_dir()
+    assert eb.automation_profile_dir().name == "browser_profile_cdp"
+    assert eb.profile_dir().name == "browser_profile"
+
+
 def test_prepare_automation_creates_hidden_control_with_cdp_args():
     ctrl, _core = _fake_ready_controller()
     ctrl._get_form = lambda: _FakeForm()
     ctrl._webview = None
+    ctrl._cdp_probe = lambda port, timeout: (True, "ready")
     calls: dict = {}
 
-    def _fake_create(form, additional_browser_args="", cdp_port=None):
+    def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
         calls["args"] = additional_browser_args
         calls["port"] = cdp_port
+        calls["folder"] = user_data_folder
         ctrl._webview = SimpleNamespace()
         ctrl._cdp_port = cdp_port
 
@@ -315,6 +326,7 @@ def test_prepare_automation_creates_hidden_control_with_cdp_args():
     assert result["endpoint"] == f"http://127.0.0.1:{calls['port']}"
     assert calls["args"].startswith("--remote-debugging-port=")
     assert calls["args"] == f"--remote-debugging-port={calls['port']}"
+    assert calls["folder"] == eb.automation_profile_dir()
 
 
 def test_prepare_automation_is_idempotent_when_port_present():
@@ -332,13 +344,14 @@ def test_prepare_automation_is_idempotent_when_port_present():
 def test_prepare_automation_recreates_control_without_port():
     ctrl, _core = _fake_ready_controller()
     ctrl._get_form = lambda: _FakeForm()
+    ctrl._cdp_probe = lambda port, timeout: (True, "ready")
     disposed: list = []
     ctrl._webview = SimpleNamespace(Dispose=lambda: disposed.append(1))
     ctrl._cdp_port = None
     ctrl._ready = True
     created: dict = {}
 
-    def _fake_create(form, additional_browser_args="", cdp_port=None):
+    def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
         created["port"] = cdp_port
         ctrl._webview = SimpleNamespace()
         ctrl._cdp_port = cdp_port
@@ -351,6 +364,52 @@ def test_prepare_automation_recreates_control_without_port():
     assert ctrl._ready is False  # 重建后内核重新初始化
     assert created["port"] is not None
     assert result["endpoint"] == f"http://127.0.0.1:{created['port']}"
+
+
+def test_prepare_automation_reports_real_error_when_cdp_never_ready():
+    """控件建了但 CDP 端口起不来（如 WebView2 初始化失败 0x8007139F）：
+    必须丢弃控件并返回真实错误，绝不返回连不上的死端点——否则上层会拿着
+    它去建 backend，最终只表现为"启动超时"，真因被掩盖。"""
+    ctrl, _core = _fake_ready_controller()
+    ctrl._get_form = lambda: _FakeForm()
+    ctrl._webview = None
+    ctrl._cdp_probe = lambda port, timeout: (False, "URLError: connection refused")
+    disposed: list = []
+
+    def _fake_create(form, additional_browser_args="", cdp_port=None, user_data_folder=None):
+        ctrl._webview = SimpleNamespace(Dispose=lambda: disposed.append(1))
+        ctrl._cdp_port = cdp_port
+
+    ctrl._create_control = _fake_create
+    ctrl._init_error = "(0x8007139F): 组或资源的状态不是执行请求操作的正确状态。"
+    result = ctrl.prepare_automation()
+    assert result["ok"] is False
+    assert "CDP 端点不可用" in result["error"]
+    assert "0x8007139F" in result["error"]
+    assert disposed == [1]  # 死控件不留在主窗体上
+    assert ctrl._webview is None
+    assert ctrl._cdp_port is None  # 清端口：下次准备必须重新创建
+
+
+def test_init_failure_is_recorded_for_error_reporting():
+    ctrl, _core = _fake_ready_controller()
+    ctrl._on_init_completed(
+        ctrl._webview,
+        SimpleNamespace(IsSuccess=False, InitializationException="boom (0x8007139F)"),
+    )
+    assert "0x8007139F" in ctrl._init_error
+    assert ctrl._ready is False
+    ctrl._on_init_completed(ctrl._webview, SimpleNamespace(IsSuccess=True))
+    assert ctrl._init_error == ""
+
+
+def test_probe_cdp_endpoint_gives_up_within_timeout():
+    """探测必须有界：连不上的端口要在超时后返回失败，绝不无限等。"""
+    started = time.monotonic()
+    ok, detail = eb.probe_cdp_endpoint(1, timeout=0.3)
+    assert ok is False
+    assert detail
+    assert time.monotonic() - started < 5.0
 
 
 def test_prepare_automation_requires_form():

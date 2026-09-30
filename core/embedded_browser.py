@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 import logging
 import os
 import re
@@ -23,6 +24,7 @@ import socket
 import sys
 import threading
 import time
+import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 from urllib.parse import quote, unquote
@@ -50,6 +52,13 @@ _WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
 _ZOOM_MIN = 0.25
 _ZOOM_MAX = 8.0
 
+# CDP 端点就绪等待：控件创建是异步的（EnsureCoreWebView2Async），端口要等
+# 浏览器进程起来才可连。有界轮询，超时即视为本次自动化准备失败——绝不把
+# 一个连不上的端口当成功返回。
+_CDP_READY_TIMEOUT = 20.0
+_CDP_PROBE_INTERVAL = 0.25
+_CDP_PROBE_HTTP_TIMEOUT = 1.0
+
 
 def is_supported() -> bool:
     """内嵌浏览器仅 Windows（WebView2/WinForms）可用。"""
@@ -57,9 +66,60 @@ def is_supported() -> bool:
 
 
 def profile_dir() -> Path:
-    """内嵌 WebView2 的 UserDataFolder（单一事实来源；computer.settings 的
-    embedded 分支必须与此恒等）。支持 YCODE_DATA_DIR 覆盖。"""
+    """内嵌 WebView2 面板浏览控件的 UserDataFolder。支持 YCODE_DATA_DIR 覆盖。
+
+    注意：自动化控件另用 automation_profile_dir()（刻意分离，原因见该函数）。
+    """
     return _data_dir() / "browser_profile"
+
+
+def automation_profile_dir() -> Path:
+    """星瑶自动化控件的专用 UserDataFolder（与面板浏览目录刻意分离）。
+
+    为什么必须分离（实测复现的 WebView2 硬约束）：同一个 UserDataFolder 上
+    只要还存在一个活着的 WebView2 环境，再创建带 AdditionalBrowserArguments
+    的环境就会失败——HRESULT 0x8007139F（ERROR_INVALID_STATE，"组或资源的
+    状态不是执行请求操作的正确状态"）。面板浏览控件是无参创建的，而自动化
+    准备要带 --remote-debugging-port 重建，Dispose 之后底层环境与浏览器进程
+    未必立刻收尾（初始化尚在飞行时 Dispose 尤其如此），于是带参重建必炸：
+    2026-09-28 20:48、2026-09-30 18:22 各发生一次，面板 profile 里再无浏览器
+    进程，星瑶的每一次电脑操控都表现为"embedded 浏览器启动超时"。
+
+    给自动化控件独立目录后，它与浏览控件不在同一目录，冲突从结构上不可能
+    发生，也不再依赖 Dispose 的收尾时序。computer.settings 的 embedded 分支
+    以此为准（identity 冻结的是自动化实际使用的 profile）。
+    """
+    return _data_dir() / "browser_profile_cdp"
+
+
+def probe_cdp_endpoint(
+    port: int, timeout: float = _CDP_READY_TIMEOUT
+) -> Tuple[bool, str]:
+    """有界轮询 CDP 端点是否真的可用（GET /json/version）。
+
+    返回 (ok, detail)：ok=True 时 detail 是内核版本串；失败给最后一条错误摘要。
+    只有真的探到端点可用，自动化准备才把 endpoint 交给上层——控件创建失败
+    （如上述 0x8007139F）时端口永远不会起来，此时必须返回真实错误，而不是
+    一个连不上的死端点。
+    """
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    last = "端口未就绪"
+    while True:
+        try:
+            with urllib.request.urlopen(
+                f"http://127.0.0.1:{int(port)}/json/version",
+                timeout=_CDP_PROBE_HTTP_TIMEOUT,
+            ) as response:
+                status = int(getattr(response, "status", 200))
+                if status == 200:
+                    payload = json.loads(response.read().decode("utf-8", "replace"))
+                    return True, str(payload.get("Browser") or "ready")
+                last = f"HTTP {status}"
+        except Exception as error:  # noqa: BLE001 —— 探测失败一律按未就绪处理
+            last = f"{type(error).__name__}: {error}"
+        if time.monotonic() >= deadline:
+            return False, " ".join(str(last).split())[:200]
+        time.sleep(_CDP_PROBE_INTERVAL)
 
 
 def pick_free_loopback_port() -> int:
@@ -249,6 +309,11 @@ class EmbeddedBrowserController:
         # CDP 调试端口：仅自动化准备路径（prepare_automation）创建的控件携带；
         # None = 当前控件未开调试端口（普通面板浏览），是重建判定依据。
         self._cdp_port: Optional[int] = None
+        # 自动化准备的就绪探测（可注入假探针，测试用）与超时；_init_error 记录
+        # WebView2 初始化失败原因，供 prepare_automation 报出真实错误。
+        self._cdp_probe = probe_cdp_endpoint
+        self._cdp_ready_timeout = _CDP_READY_TIMEOUT
+        self._init_error = ""
         self._lock = threading.RLock()
         self._last_emit = 0.0
         self._emit_timer: Optional[threading.Timer] = None
@@ -320,18 +385,26 @@ class EmbeddedBrowserController:
 
         return WebView2, CoreWebView2CreationProperties
 
-    def _create_control(self, form, additional_browser_args: str = "", cdp_port: Optional[int] = None) -> None:
+    def _create_control(
+        self,
+        form,
+        additional_browser_args: str = "",
+        cdp_port: Optional[int] = None,
+        user_data_folder: Optional[Path] = None,
+    ) -> None:
         """在 GUI 线程内创建并挂载 WebView2 控件（幂等）。
 
         additional_browser_args 仅自动化准备路径使用（CDP 调试端口），
         必须在 EnsureCoreWebView2Async 之前写入 CreationProperties。
+        user_data_folder 缺省为面板浏览目录；自动化路径传
+        automation_profile_dir()——两者必须分离，理由见该函数说明。
         """
         if self._webview is not None:
             return
         WebView2, CreationProperties = self._load_webview2()
         wv = WebView2()
         props = CreationProperties()
-        profile = profile_dir()
+        profile = Path(user_data_folder) if user_data_folder is not None else profile_dir()
         try:
             profile.mkdir(parents=True, exist_ok=True)
         except Exception:
@@ -343,6 +416,7 @@ class EmbeddedBrowserController:
         wv.Visible = False
         wv.CoreWebView2InitializationCompleted += self._on_init_completed
         form.Controls.Add(wv)
+        self._init_error = ""  # 新控件的初始化结果从零开始记
         wv.EnsureCoreWebView2Async(None)
         self._webview = wv
         self._form = form
@@ -355,11 +429,15 @@ class EmbeddedBrowserController:
         """WebView2 内核就绪：配置 Settings 并挂接导航/新窗口事件。"""
         try:
             if not args.IsSuccess:
+                self._init_error = " ".join(
+                    str(getattr(args, "InitializationException", "unknown")).split()
+                )[:300]
                 logger.warning(
                     "内嵌 WebView2 初始化失败: %s",
                     getattr(args, "InitializationException", "unknown"),
                 )
                 return
+            self._init_error = ""
             core = self._webview.CoreWebView2
             try:
                 core.Settings.IsStatusBarEnabled = False
@@ -699,14 +777,46 @@ class EmbeddedBrowserController:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def prepare_automation(self) -> Dict[str, Any]:
-        """星瑶自动化准备：确保控件带 CDP 调试端口存在（幂等）。
+    def _discard_control(self, form) -> None:
+        """丢弃当前控件并清空端口状态（自动化准备失败路径）。
 
-        - 控件已带端口：直接返回现有 endpoint（面板浏览不受影响）；
+        必须一并清 _cdp_port：否则下一次 prepare_automation 会误认"控件仍带
+        调试端口"而返回已失效的 endpoint（与 shutdown 同一理由）。
+        """
+
+        def _drop():
+            webview = self._webview
+            self._webview = None
+            self._ready = False
+            self._visible = False
+            self._cdp_port = None
+            self._zoom = 1.0
+            with self._lock:
+                self._pending_url = ""
+            if webview is not None:
+                try:
+                    webview.Dispose()
+                except Exception:
+                    logger.debug("释放内嵌 WebView2 失败", exc_info=True)
+
+        if form is None:
+            _drop()
+        elif not self._invoke(form, _drop):
+            _drop()
+
+    def prepare_automation(self) -> Dict[str, Any]:
+        """星瑶自动化准备：确保控件带 CDP 调试端口存在且端点真的可用（幂等）。
+
+        - 控件已带端口：直接返回现有 endpoint（该端口在创建时已验证过）；
         - 控件存在但未带端口：Dispose 后带端口重建（页面会重载）；
         - 控件不存在：隐藏创建（不强制打开面板，可见性/定位仍由前端
           面板的 open/set_bounds 正常路径负责——WebView2 隐藏时渲染可能
           被节流，自动化开始后面板会自动切到浏览器页签使其可见）。
+
+        自动化控件使用 automation_profile_dir()（与面板浏览目录分离，见该函数
+        说明）。创建后同步探测 CDP 端点：探不到就丢弃控件并返回真实错误——
+        绝不把死端点当成功交给上层，否则上层会拿着连不上的端口去建 backend，
+        最终只表现为"启动超时"，真因被完全掩盖（2026-09-30 故障）。
 
         返回 {'ok', 'endpoint', 'recreated'}；失败 {'ok': False, 'error'}。
         """
@@ -724,6 +834,8 @@ class EmbeddedBrowserController:
                         box["ok"] = True
                         box["endpoint"] = f"http://127.0.0.1:{self._cdp_port}"
                         box["recreated"] = False
+                        box["port"] = self._cdp_port
+                        box["verify"] = False
                         return
                     if self._webview is not None:
                         # 已有控件但未带调试端口：带端口重建（页面重载）。
@@ -744,9 +856,12 @@ class EmbeddedBrowserController:
                         form,
                         additional_browser_args=f"--remote-debugging-port={port}",
                         cdp_port=port,
+                        user_data_folder=automation_profile_dir(),
                     )
                     box["ok"] = True
                     box["endpoint"] = f"http://127.0.0.1:{port}"
+                    box["port"] = port
+                    box["verify"] = True
                     if not box.get("recreated"):
                         box["recreated"] = False
                 except Exception as exc:
@@ -755,7 +870,24 @@ class EmbeddedBrowserController:
 
             if not self._invoke(form, _do_prepare):
                 return {"ok": False, "error": "invoke_failed"}
-            return box or {"ok": False, "error": "invoke_failed"}
+            if not box.get("ok"):
+                return box or {"ok": False, "error": "invoke_failed"}
+            result = {
+                "ok": True,
+                "endpoint": box["endpoint"],
+                "recreated": box.get("recreated", False),
+            }
+            if not box.get("verify"):
+                return result
+            ready, detail = self._cdp_probe(box["port"], self._cdp_ready_timeout)
+            if ready:
+                return result
+            init_error = self._init_error
+            self._discard_control(form)
+            reason = f"内置浏览器 CDP 端点不可用（{detail}）"
+            if init_error:
+                reason += f"；WebView2 初始化失败：{init_error}"
+            return {"ok": False, "error": reason}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
