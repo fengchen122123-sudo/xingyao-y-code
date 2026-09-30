@@ -44,6 +44,8 @@ import type {
   TurnUndoRecoveryExecutePayload,
 } from '../types/pywebview';
 import { emitPtyData, emitPtyExit } from '../utils/ptyBus';
+import { isMarkdownFilePath, toFileUrl } from '../utils/localPath';
+import { buildMarkdownPreviewHtml } from '../utils/previewHtml';
 // 前端构建产物运行期更新 → 资源版本失配自愈（详见 utils/frontendUpdate.ts）
 import { requestFrontendReload } from '../utils/frontendUpdate';
 import type { MediaItem } from '../types/media';
@@ -766,6 +768,11 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 星瑶浏览器自动化的项目分辨率（适应窗口呈现）；null = 无自动化视口
       automationViewport: null as [number, number] | null,
     },
+    // 右栏浏览器「外部请求导航」（对话正文 / 文件树点击 html 文件触发）：
+    // BrowserPane 消费这条请求去导航；nonce 自增保证同一文件重复点击也能被
+    // 观察到（内容相同的对象引用不变时 watch 不触发）。null = 无待处理请求。
+    browserNavRequest: null as null | { url: string; path: string },
+    browserNavNonce: 0,
     themeLight: false,
     guiTheme: null as GuiTheme | null,
     savedGuiTheme: null as GuiTheme | null,
@@ -1424,6 +1431,64 @@ navItems: [] as Array<{ id: number; preview: string }>,
       runtime.rightPanelTabs = tabs;
       runtime.rightPanelActiveTab = 'browser';
       runtime.rightPanelExpanded = true;
+    },
+
+    // 本地 html 在右栏内嵌浏览器里按网页渲染（对话正文 / 文件树点击 html 的入口）。
+    // 路径转成 file:// URL 后写一条导航请求并摊开浏览器页签；转换失败（相对路径
+    // 等非绝对路径）直接回退源码预览弹窗，不静默失败。宿主不支持内嵌浏览器
+    // （非 Windows 桌面端 GUI）时，由 BrowserPane 消费请求时再回退预览。
+    openLocalFileInBrowser(this: any, path: string) {
+      const url = toFileUrl(path);
+      if (!url) {
+        void this.openFilePreview(path);
+        return;
+      }
+      this.browserNavRequest = { url, path };
+      this.browserNavNonce += 1;
+      this.openRightPanelTab('browser');
+    },
+
+    // markdown 在右栏浏览器里按阅读样式打开：浏览器直接打开 .md 只显示源码文本，
+    // 所以先用与消息气泡同一套渲染器生成预览 HTML，经桥落盘（core.web_preview）
+    // 后再交浏览器打开。任一环节不可用（缺桥 / 读文件失败 / 落盘失败）都回退
+    // 源码预览弹窗，不静默失败。
+    async openMarkdownInRightPanel(this: any, path: string) {
+      const api = this._api();
+      if (!api || typeof api.read_file_preview !== 'function'
+        || typeof api.write_preview_page !== 'function') {
+        await this.openFilePreview(path);
+        return;
+      }
+      try {
+        const res = await api.read_file_preview(path);
+        if (!res || !res.ok || typeof res.content !== 'string') {
+          await this.openFilePreview(path);
+          return;
+        }
+        const name = path.split(/[\\/]/).pop() || path;
+        const page = buildMarkdownPreviewHtml(res.content, path, name);
+        const written = await api.write_preview_page(page, path);
+        if (!written || !written.ok || !written.path) {
+          await this.openFilePreview(path);
+          return;
+        }
+        this.openLocalFileInBrowser(String(written.path));
+      } catch {
+        await this.openFilePreview(path);
+      }
+    },
+
+    // 本地文件在右栏显示的统一入口（对话正文 / 文件树的点击分流）：
+    // html / pdf 直接交给内嵌浏览器（pdf 走 WebView2 内置查看器）；md 先渲染成
+    // 预览页；其它类型回退源码预览弹窗。
+    async openInRightPanel(this: any, path: string) {
+      const target = String(path || '').trim();
+      if (!target) return;
+      if (isMarkdownFilePath(target)) {
+        await this.openMarkdownInRightPanel(target);
+        return;
+      }
+      this.openLocalFileInBrowser(target);
     },
 
     // 把任意页签开进指定会话的右面板（会话归属）：当前会话直接开；其他会话只

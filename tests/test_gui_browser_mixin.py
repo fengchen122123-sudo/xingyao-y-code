@@ -4,6 +4,7 @@
 navigate 透传、控制器抛异常兜底、on_state→emit_event 接线。
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import gui_browser_mixin
@@ -229,3 +230,28 @@ def test_automation_endpoint_emits_session_name(monkeypatch):
     else:
         raise AssertionError("expected ComputerControlError")
     assert d2.events == []
+
+
+# ---------------- 预览页落盘（md 在右栏浏览器渲染用）----------------
+
+
+def test_write_preview_page_writes_file(tmp_path, monkeypatch):
+    import core.web_preview as wp
+
+    monkeypatch.setattr(wp, "get_preview_dir", lambda: tmp_path)
+    d = Dummy()
+
+    result = d.write_preview_page("<html>rendered</html>", r"D:\proj\a.md")
+
+    assert result["ok"] is True
+    assert Path(result["path"]).read_text(encoding="utf-8") == "<html>rendered</html>"
+
+
+def test_write_preview_page_error_is_structured():
+    d = Dummy()
+
+    # 空内容：不抛穿 js_api，返回结构化错误
+    result = d.write_preview_page("   ")
+
+    assert result["ok"] is False
+    assert result["error"]

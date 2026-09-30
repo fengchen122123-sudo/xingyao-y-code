@@ -225,6 +225,12 @@ function onBridgeReady(): void {
   window.removeEventListener('pywebviewready', onBridgeReady);
   // 桥就绪晚于挂载是桌面端常态：此刻才能校准地址栏/前进后退等真实状态
   void calibrate();
+  // 挂起的外部导航请求（点击 html 时桥还没就绪）：就绪后补上导航
+  if (pendingExternalUrl.value) {
+    const url = pendingExternalUrl.value;
+    pendingExternalUrl.value = '';
+    goTo(url);
+  }
 }
 
 function watchBridge(): void {
@@ -415,6 +421,30 @@ function goTo(url: string) {
   surface.navigate(url);
 }
 
+// ── 外部入口请求导航（对话正文 / 文件树点击 html）──
+// store 里放一条导航请求 + nonce，这里消费它：桥未就绪先缓存（就绪后补，
+// 见 onBridgeReady）；宿主不支持内嵌浏览器则回退源码预览弹窗——这条回退保证
+// 点击 html 在任何宿主上都落得了地，不会「点了没反应」。
+const pendingExternalUrl = ref('');
+
+function consumeBrowserNavRequest() {
+  const req = store.browserNavRequest;
+  if (!req || !req.url) return;
+  if (unsupported.value) {
+    store.notifyChat('内嵌浏览器不可用，已改为源码预览');
+    void store.openFilePreview(req.path);
+    return;
+  }
+  if (bridgeWaiting.value) {
+    pendingExternalUrl.value = req.url;
+    return;
+  }
+  goTo(req.url);
+}
+
+// nonce 变化 = 新的导航请求（同一文件重复点击也会自增，watch 必触发）
+watch(() => store.browserNavNonce, consumeBrowserNavRequest);
+
 // ── 工具栏按钮 ──
 function onBack() { surface.request('browser_pane_back'); }
 function onForward() { surface.request('browser_pane_forward'); }
@@ -569,6 +599,9 @@ async function calibrate() {
 let surfaceRo: ResizeObserver | null = null;
 
 onMounted(() => {
+  // 挂载前到达的外部导航请求（点击 html 时本组件可能还没挂载）统一在此消费：
+  // 桥未就绪先挂起（就绪后补导航），宿主不支持则回退源码预览
+  consumeBrowserNavRequest();
   // 桥已在 setup 前就绪（热重载/重挂载）：直接校准；waiting 则挂双通道等待
   if (bridgePhase.value === 'ready') { void calibrate(); return; }
   if (bridgePhase.value === 'waiting') watchBridge();

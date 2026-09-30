@@ -28,6 +28,8 @@ import AppIcon from './AppIcon.vue';
 import type { FileNode } from '../types/pywebview';
 import { useAppStore } from '../stores/appStore';
 import { extIcon } from '../utils/fileIcon';
+import { canOpenInRightPanel } from '../utils/localPath';
+import { useIsMobile } from '../composables/useViewport';
 
 const props = defineProps<{
   node: FileNode;
@@ -35,6 +37,8 @@ const props = defineProps<{
 }>();
 
 const store = useAppStore();
+// 移动端（<=768px）右面板整体隐藏：HTML 文件点击只能回退源码预览弹窗
+const isMobile = useIsMobile();
 // FileNode 本身只带文件名(n)，需要沿递归路径拼接出完整路径供预览接口使用
 const fullPath = computed(() => {
   return props.parentPath ? props.parentPath + '\\' + props.node.n : props.node.n;
@@ -49,6 +53,12 @@ const icon = computed(() => (props.node.d ? '' : extIcon(props.node.n)));
 
 async function toggle() {
   if (!props.node.d) {
+    // html / pdf / md 交给右栏（网页直接渲染，md 先渲染成预览页）；
+    // 移动端没有右面板，一律回退源码预览弹窗
+    if (canOpenInRightPanel(fullPath.value) && !isMobile.value) {
+      void store.openInRightPanel(fullPath.value);
+      return;
+    }
     store.openFilePreview(fullPath.value);
     return;
   }
