@@ -423,4 +423,46 @@ describe('MessageBubble 文件链接点击分流', () => {
   });
 });
 
+describe('MessageBubble QQ2009 用户昵称行', () => {
+  it('默认主题（未设置 guiTheme）下用户消息不渲染 QQ2009 昵称行', () => {
+    const store = useAppStore();
+    expect(store.guiTheme).toBeNull();
 
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'user', content: '帮你查一下库存' } },
+    });
+
+    expect(wrapper.find('.qq09-msg-sender').exists()).toBe(false);
+    wrapper.unmount();
+  });
+
+  it('QQ2009 主题激活时用户消息渲染「木偶」昵称行', () => {
+    const store = useAppStore();
+    // 门控只读主题 id，其余字段与本用例无关，故用最小对象占位（不构造完整 GuiTheme）
+    store.guiTheme = { id: 'builtin.qq2009' } as any;
+
+    const wrapper = mount(MessageBubble, {
+      props: { msg: { role: 'user', content: '帮你查一下库存' } },
+    });
+
+    const sender = wrapper.get('.qq09-msg-sender');
+    expect(sender.get('.qq09-sender-name').text()).toBe('木偶');
+    // 昵称行在用户气泡之前（气泡仍是文案承载者）
+    expect(wrapper.get('.msg-user').html()).toContain('qq09-msg-sender');
+    wrapper.unmount();
+  });
+
+  it('助手消息在任何主题下都不渲染 QQ2009 昵称行', () => {
+    const store = useAppStore();
+    const msg = assistantMessage({ content: '回复内容' });
+
+    const defaultTheme = mount(MessageBubble, { props: { msg } });
+    expect(defaultTheme.find('.qq09-msg-sender').exists()).toBe(false);
+    defaultTheme.unmount();
+
+    store.guiTheme = { id: 'builtin.qq2009' } as any;
+    const qq09Theme = mount(MessageBubble, { props: { msg } });
+    expect(qq09Theme.find('.qq09-msg-sender').exists()).toBe(false);
+    qq09Theme.unmount();
+  });
+});

@@ -47,6 +47,38 @@
     </div>
 
     <div id="input-wrap">
+      <!-- QQ2009 皮肤专属：经典工具栏行（仅内置 QQ2009 主题激活时渲染；
+           只接入真实存在的功能，样式在 themes/qq2009.css，本组件不加样式） -->
+      <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-toolbar" data-test="qq09-toolbar">
+        <!-- 图片：星瑶的图片发送与文件共用同一个附件入口（pick_files 系统对话框，
+             图片扩展名会被识别出缩略图），无独立图片菜单，故与「文件」同调 onAttachClick -->
+        <button
+          type="button"
+          class="qq09-tb-btn"
+          data-test="qq09-tb-image"
+          title="发送图片：打开附件选择（png / jpg / gif / webp 等，选中后显示缩略图）"
+          @click="onAttachClick"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <rect x="3" y="4.5" width="18" height="15" rx="2.5" />
+            <circle cx="8.5" cy="9.5" r="1.6" />
+            <path d="M4 17.8l4.8-4.8 3.4 3.4 3-2.8 4.8 4.8" />
+          </svg>
+        </button>
+        <!-- 文件：同一附件入口，任意格式文件都可选 -->
+        <button
+          type="button"
+          class="qq09-tb-btn"
+          data-test="qq09-tb-file"
+          title="发送文件：打开附件选择（任意格式，可多选）"
+          @click="onAttachClick"
+        >
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+            <path d="M3.5 7.2a2 2 0 0 1 2-2h3.4l1.8 2h8.2a2 2 0 0 1 2 2v7.6a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2z" />
+            <path d="M7.5 11.5h9" />
+          </svg>
+        </button>
+      </div>
       <div id="input-box" ref="inputBoxRef" :class="{ 'drop-hover': dragging }">
         <AttachmentChips :items="attachments" @remove="removeAttachment" @open="openAttachmentImage" />
         <!-- / 斜杠命令 与 @ 文件引用的自动补全面板 -->

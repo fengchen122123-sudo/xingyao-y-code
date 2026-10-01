@@ -131,7 +131,13 @@ const surface = computed(() => String(store.computerRun.current_surface || ''));
 const reasonText = computed(() => {
   const run = store.computerRun;
   if (run.status === 'paused') return run.pause_reason ? `暂停原因：${run.pause_reason}` : '已暂停，等待恢复';
-  if (run.status === 'waiting_for_user' && run.pause_reason) return `等待用户接管：${run.pause_reason}`;
+  // 接管态（waiting_for_user）是 2026-10-01 修复的一部分：回合正常收尾后已自动交还租约与浏览器连接，
+  // 下一回合星瑶会重新接管同一页面继续操作，用户不必点“立即停止”，只需在对话里说一声即可。
+  // 因此即使 pause_reason 为空也要给出这段交还指引，避免用户误以为必须手动停止。
+  if (run.status === 'waiting_for_user') {
+    const reasonPart = run.pause_reason ? `：${run.pause_reason}` : '';
+    return `等待你接管${reasonPart} · 在右侧面板操作完成后，直接在对话里说一声，星瑶会重新接管继续。`;
+  }
   if (run.status === 'stopped') return run.stop_reason ? `停止原因：${run.stop_reason}` : '本 run 已停止';
   if (run.status === 'provider_safety_required') {
     return run.error_code

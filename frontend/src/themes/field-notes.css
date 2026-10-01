@@ -1,0 +1,60 @@
+/* ============================================================
+   田野笔记 Field Notes（builtin.field-notes）主题专属样式层
+   作用域：html[data-gui-theme-id="builtin.field-notes"]，
+   仅该主题激活时生效，其他主题（内置深浅 / QQ2009 / 自定义）不受影响。
+   内容：
+   1. 绿区可读性修复——style.css 的分区别名只重定向了 --text /
+      --text-bright / --border / --accent，--text-dim 与 --text-faint
+      仍指向全局深色变量，在墨绿侧栏/顶栏/状态栏上形成"绿底黑字"；
+      此处按手册色板把这两个别名重定向为灰绿浅色。
+   2. 设计稿结构还原——侧栏 3px 朱橙右缘、状态栏 3px 朱橙顶边、
+      核心组件直角化、状态栏等宽小字。
+   ============================================================ */
+
+/* ---- 1. 绿区文字可读性（sidebar / app_header / statusbar） ---- */
+html[data-gui-theme-id="builtin.field-notes"] #sidebar,
+html[data-gui-theme-id="builtin.field-notes"] #topbar,
+html[data-gui-theme-id="builtin.field-notes"] #statusbar {
+  /* 次级文字：手册灰绿（墨绿 #1D3A2F 底上对比度约 4.6:1） */
+  --text-dim: #9DB3A4;
+  /* 弱化文字：保底可读下限（仅用于计数、相对时间等辅助信息） */
+  --text-faint: #7FA08C;
+  /* 绿区内小徽章 / hover 背景：墨绿浅档，替代全局米色值 */
+  --bg2: #28493C;
+  --bg3: #1A332A;
+}
+
+/* "[当前]"标签：全局绿 #2F9E5F 在墨绿底上对比不足，提亮为手册浅绿。
+   模板内联 style 只能 !important 压。 */
+html[data-gui-theme-id="builtin.field-notes"] #sidebar .group-header .g-title > span {
+  color: #7FD4A4 !important;
+}
+
+/* ---- 2. 设计稿结构还原 ---- */
+
+/* 侧栏右缘 3px 朱橙细缝（设计稿标志性细节） */
+html[data-gui-theme-id="builtin.field-notes"] #sidebar {
+  border-right: 3px solid #E04E10;
+}
+
+/* 状态栏 3px 朱橙顶边 + 等宽小字（手册页脚感） */
+html[data-gui-theme-id="builtin.field-notes"] #statusbar {
+  border-top: 3px solid #E04E10;
+  font-family: var(--mono);
+  letter-spacing: 0.4px;
+}
+
+/* 直角化核心组件（设计稿为硬直角，默认 6~8px 圆角收到 0） */
+html[data-gui-theme-id="builtin.field-notes"] #sidebar .menu-item,
+html[data-gui-theme-id="builtin.field-notes"] #sidebar .session-item,
+html[data-gui-theme-id="builtin.field-notes"] #sidebar .side-footer button,
+html[data-gui-theme-id="builtin.field-notes"] #topbar .win-btn,
+html[data-gui-theme-id="builtin.field-notes"] .icon-btn {
+  border-radius: 0;
+}
+
+/* 消息气泡与空态卡片：保留一丝柔和，收至 3px */
+html[data-gui-theme-id="builtin.field-notes"] .msg-user .bubble,
+html[data-gui-theme-id="builtin.field-notes"] .kimi-card {
+  border-radius: 3px;
+}

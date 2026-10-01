@@ -353,3 +353,49 @@ it('hides the git branch chip outside a git workspace', async () => {
   expect(wrapper.find('[data-test="composer-git-branch"]').exists()).toBe(false);
   wrapper.unmount();
 });
+
+// —— QQ2009 皮肤专属工具栏行：默认主题不渲染，仅真实功能按钮 ——
+
+it('默认主题下不渲染 QQ2009 工具栏行', () => {
+  const wrapper = mount(InputArea);
+  expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('QQ2009 主题下渲染工具栏行，两个附件按钮都调用真实的附件入口', async () => {
+  const store = useAppStore();
+  store.guiTheme = { id: 'builtin.qq2009' } as any;
+  // 附件入口最终落点是 store.pickFiles（系统文件对话框），断言真实函数被调用
+  const pickSpy = vi.spyOn(store, 'pickFiles').mockResolvedValue([]);
+
+  const wrapper = mount(InputArea);
+  const toolbar = wrapper.get('[data-test="qq09-toolbar"]');
+  // 动作清单：图片 + 文件（星瑶无独立图片菜单，两者共用同一附件入口）
+  const buttons = toolbar.findAll('.qq09-tb-btn');
+  expect(buttons).toHaveLength(2);
+  expect(buttons[0].attributes('title')).toContain('图片');
+  expect(buttons[1].attributes('title')).toContain('文件');
+  // 图标为 inline SVG（stroke 风格），非 emoji
+  expect(buttons[0].find('svg').exists()).toBe(true);
+
+  await buttons[0].trigger('click');
+  await buttons[1].trigger('click');
+  await flushPromises();
+  expect(pickSpy).toHaveBeenCalledTimes(2);
+  wrapper.unmount();
+});
+
+it('切换到 QQ2009 主题时工具栏行实时出现，切回默认主题后消失', async () => {
+  const store = useAppStore();
+  const wrapper = mount(InputArea);
+  expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(false);
+
+  store.guiTheme = { id: 'builtin.qq2009' } as any;
+  await nextTick();
+  expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(true);
+
+  store.guiTheme = { id: 'builtin.dark' } as any;
+  await nextTick();
+  expect(wrapper.find('[data-test="qq09-toolbar"]').exists()).toBe(false);
+  wrapper.unmount();
+});

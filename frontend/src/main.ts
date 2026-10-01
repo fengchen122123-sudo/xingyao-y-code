@@ -1,6 +1,9 @@
 import { createApp } from 'vue';
 import { createPinia } from 'pinia';
 import './style.css';
+import './themes/field-notes.css';
+// 内置 QQ2009 皮肤的专属质感层（渐变标题栏/橙色悬停等平色 token 表达不了的效果）
+import './themes/qq2009.css';
 import App from './App.vue';
 import { applyBootTheme } from './themes/runtime';
 import { useAppStore } from './stores/appStore';
