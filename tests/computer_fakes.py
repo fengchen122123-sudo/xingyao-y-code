@@ -868,7 +868,8 @@ class FakeBridgeController:
     - ``start_run(run_id=...)`` 建立活动 run；pause/resume/stop 记录透传调用
       并发出 computer_state 事件；run_id 与当前活动 run 不匹配抛
       computer_invalid_state（旧 UI 事件的 run id 拒绝语义，镜像
-      _require_active_run_locked）；
+      _require_active_run_locked）；``stop`` 接受 ``cancel_owner`` 关键字
+      （默认 True）并记录到 ``stop_cancel_owner``，行为不变；
     - ``snapshot()`` 返回真实 ComputerRunSnapshot（终态保留 run_id，
       镜像 _last_snapshot 语义）；
     - 绝不触碰真实键鼠、浏览器或截屏。
@@ -882,6 +883,9 @@ class FakeBridgeController:
         self.pause_calls = []
         self.resume_calls = []
         self.stop_calls = []
+        # 接管交还修复 L2：记录 stop 的 cancel_owner 关键字（默认 True），
+        # 使该桩能接受调用方传入的新关键字而不 TypeError。
+        self.stop_cancel_owner = []
 
     @property
     def listener_count(self):
@@ -980,9 +984,12 @@ class FakeBridgeController:
         self.emit_state(run_id=run_id, event_seq=3, status="running", reason="resume")
         return self.snapshot()
 
-    def stop(self, run_id, reason):
+    def stop(self, run_id, reason, *, cancel_owner=True):
+        # 接受 stop 的 cancel_owner 关键字（镜像真实 controller 签名）：该桩
+        # 只记录、行为不变，避免调用方传新关键字时 TypeError。
         self._require_active_run(run_id)
         self.stop_calls.append((run_id, reason))
+        self.stop_cancel_owner.append(cancel_owner)
         self.status = "stopped"
         self.emit_state(run_id=run_id, event_seq=4, status="stopped", reason=reason)
         return self.snapshot()
@@ -1014,6 +1021,11 @@ class FakeController:
       ``complete_calls``/``completed_run_ids``/``complete_error``、
       ``stop_calls``/``stop_reasons``/``stop_error``；生命周期方法只记录调用，
       ``run_status`` 随 complete/stop 变化供 Turn 收尾判定；
+    - 接管交还修复 L1/L2 补充：``complete_run`` 记录 ``retain_browser_session``
+      到 ``complete_retain_flags``，``stop`` 记录 ``cancel_owner`` 到
+      ``stop_cancel_owner``（签名带默认值 True）；``execute`` 遇
+      ``request_user_takeover`` 时把 ``run_status`` 置为 ``waiting_for_user``
+      （镜像真实 controller 的接管交接），供「接管回合收尾」测试建模；
     - 绝不触碰真实键鼠、浏览器或截屏。
     """
 
@@ -1038,6 +1050,11 @@ class FakeController:
         self.stop_reasons = []
         self.stop_error = None
         self.run_status = "running"
+        # 接管交还修复 L1/L2：记录每次 stop/complete_run 的关键关键字参数，
+        # 供 Turn 收尾测试断言「兜底 stop 传 cancel_owner=False」「接管态收尾
+        # 传 retain_browser_session=False」。
+        self.stop_cancel_owner = []
+        self.complete_retain_flags = []
 
     def start_run(self, owner, capability, target=None):
         self.start_calls += 1
@@ -1054,12 +1071,14 @@ class FakeController:
         if self.complete_error is not None:
             raise self.complete_error
         self.completed_run_ids.append(run_id)
+        self.complete_retain_flags.append(retain_browser_session)
         self.run_status = "completed"
         return self.snapshot()
 
-    def stop(self, run_id, reason):
+    def stop(self, run_id, reason, *, cancel_owner=True):
         self.stop_calls += 1
         self.stop_reasons.append((run_id, reason))
+        self.stop_cancel_owner.append(cancel_owner)
         if self.stop_error is not None:
             raise self.stop_error
         self.run_status = "stopped"
@@ -1092,6 +1111,10 @@ class FakeController:
         base = self._observations.pop(0) if self._observations else (
             self._default_observation(run_id, action)
         )
+        if action.kind == "request_user_takeover":
+            # 镜像真实 controller 的接管交接行为：request_user_takeover 成功
+            # 执行后 run 转入 waiting_for_user，供「接管回合收尾」测试建模。
+            self.run_status = "waiting_for_user"
         return replace(
             base,
             run_id=run_id,

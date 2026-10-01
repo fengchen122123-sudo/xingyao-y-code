@@ -51,12 +51,16 @@ from core.computer.settings import get_settings_generation, load_computer_settin
 _LOGGER = logging.getLogger(__name__)
 
 # 显式状态转移表（计划 Task 8 Step 3 逐字给定，非法转换抛领域不变量错误）。
+# 唯一有意放宽项（2026-10-01 实机复现后新增）：waiting_for_user → completing。
+# 用户接管态在回合正常收尾时按"完成"终结——本回合的操控工作正常收尾并交还
+# 排他租约；不放行该转移会让 run 既无终态也无清理，租约永久留活，下一回合被
+# computer_session_busy 永久挡死（日志：非法状态转换：waiting_for_user → completing）。
 _TRANSITIONS = {
     "idle": {"starting"},
     "starting": {"running", "failed", "stopping"},
     "running": {"paused", "waiting_for_user", "provider_safety_required", "completing", "stopping", "failed"},
     "paused": {"running", "stopping", "failed"},
-    "waiting_for_user": {"running", "stopping", "failed"},
+    "waiting_for_user": {"running", "stopping", "failed", "completing"},
     "provider_safety_required": {"running", "stopping", "failed"},
     "completing": {"completed", "stopping", "failed"},
     "completed": {"starting"},
@@ -638,10 +642,16 @@ class ComputerControlService:
         run = _Run(owner, capability, target)
         with self._lock:
             if self._run is not None:
+                # L3 可诊断性：占用错误带上被占 run 的当前状态，让"下一回合
+                # 拿不到租约"一眼可诊断（该等它结束还是该手动停止），不必翻日志。
                 raise ComputerControlError(
                     "computer_session_busy",
-                    f"电脑操控正被会话「{self._run.owner.session_label}」占用",
-                    details={"owner_session_label": self._run.owner.session_label},
+                    f"电脑操控正被会话「{self._run.owner.session_label}」占用"
+                    f"（当前状态：{self._run.status}）",
+                    details={
+                        "owner_session_label": self._run.owner.session_label,
+                        "owner_run_status": self._run.status,
+                    },
                 )
             self._run = run
             self._transition(run, ComputerRunStatus.STARTING.value)
@@ -1117,6 +1127,8 @@ class ComputerControlService:
         self,
         run_id: str | None = None,
         reason: str = "application_exit",
+        *,
+        cancel_owner: bool = True,
     ) -> ComputerRunSnapshot:
         """取消/故障/紧急停止终态：固定顺序清理并关闭 backend；幂等。
 
@@ -1124,6 +1136,16 @@ class ComputerControlService:
         → backend release_inputs → backend close → 状态终结 → 租约释放 →
         final event。每步独立 try/except 保证后续释放；首个清理错误记为 failed，
         绝不伪装成 stopped success。
+
+        cancel_owner（默认 True）：为 False 时跳过 `owner.cancel_event.set()`
+        与 `_abort_streams` 两步，其余清理顺序完全不变。回合正常收尾的兜底
+        释放必须传 False——`gui_bridge.py:6220` 与 `:6377` 用该 cancel_event
+        判定"回合是否被用户取消"，若兜底释放设置它，会把正常结束的回合误标
+        成"已取消"。
+
+        幂等：已处终态返回终态快照；已处 stopping（停止在途）直接返回当前
+        快照，不重复释放/关闭 backend、不重复终结——否则 stopping → stopping
+        非法会中断正在进行的清理链（日志 2026-09-10 有两条实例）。
 
         run_id 为 None（Task 16 进程退出统一入口）：先按上表停止当前活动
         run（若有），再关闭全部 retained browser session；无活动 run 时幂等
@@ -1163,21 +1185,29 @@ class ComputerControlService:
                 )
             if run.status in _TERMINAL_STATUSES:
                 return self._snapshot_locked(run)
+            if run.status == ComputerRunStatus.STOPPING.value:
+                # 停止在途：另一次 stop 已进入清理链，本次幂等返回当前快照，
+                # 不重复释放/关闭 backend、不重复终结。放行会让 _transition
+                # 抛"stopping → stopping"并中断那条清理链。
+                return self._snapshot_locked(run)
             self._transition(run, ComputerRunStatus.STOPPING.value)
             run.stop_reason = reason
         self._emit_state(run, reason=reason)
 
         first_error = None
-        try:
-            run.owner.cancel_event.set()
-        except Exception as error:  # 防御性：threading.Event.set 正常不会失败
-            first_error = first_error or error
-            _LOGGER.exception("设置电脑操控 owner cancel event 失败")
-        try:
-            self._abort_streams(run.owner.cancel_event)
-        except Exception as error:
-            first_error = first_error or error
-            _LOGGER.exception("中断在飞 Provider 流失败")
+        if cancel_owner:
+            # 回合正常收尾的兜底释放传 cancel_owner=False：不得把 cancel_event
+            # 置位（gui_bridge.py:6220/:6377 用它判定回合是否被用户取消）。
+            try:
+                run.owner.cancel_event.set()
+            except Exception as error:  # 防御性：threading.Event.set 正常不会失败
+                first_error = first_error or error
+                _LOGGER.exception("设置电脑操控 owner cancel event 失败")
+            try:
+                self._abort_streams(run.owner.cancel_event)
+            except Exception as error:
+                first_error = first_error or error
+                _LOGGER.exception("中断在飞 Provider 流失败")
         backend = run.backend
         if backend is not None:
             try:

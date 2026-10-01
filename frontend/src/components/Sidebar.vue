@@ -1,5 +1,143 @@
 <template>
   <div id="sidebar" data-theme-region="sidebar" :class="{ collapsed: store.sidebarCollapsed }" :style="panelStyle">
+      <!-- QQ2009 皮肤专属：主面板用户卡（装饰性，仅内置 QQ2009 主题激活时渲染；
+           样式在 themes/qq2009.css 的 §2 小节，本组件不加样式） -->
+      <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-user-card">
+        <!-- 头像：点击换自定义头像（隐藏 input 转交原生文件框，见 qq09PickAvatar）。
+             img 盖住默认企鹅底图（z-index 1，状态点 2）；GIF 的 DataURL 放进
+             img.src 即按帧自动播放，无需额外处理。状态点保持原样叠在右下角。 -->
+        <div class="qq09-avatar" title="点击更换头像" @click="qq09PickAvatar">
+          <img v-if="qq09AvatarData" class="qq09-avatar-img" :src="qq09AvatarData" alt="用户头像">
+          <button
+            v-if="qq09AvatarData"
+            type="button"
+            class="qq09-avatar-reset"
+            data-test="qq09-avatar-reset"
+            title="恢复默认头像"
+            @click.stop="qq09ResetAvatar"
+          >×</button>
+          <!-- 状态点颜色由 :data-status 驱动（六色见 qq2009.css，与下方状态行同源） -->
+          <span class="qq09-status-dot" :data-status="qq09Status" />
+        </div>
+        <!-- 隐藏文件框：仅由头像点击触发（hidden 不占布局，也不参与用户卡 flex 排布） -->
+        <input
+          ref="qq09AvatarInputRef"
+          type="file"
+          hidden
+          accept="image/*"
+          data-test="qq09-avatar-input"
+          @change="qq09OnAvatarFile"
+        >
+        <div class="qq09-user-meta">
+          <div class="qq09-user-name">
+            <template v-if="!qq09EditingName">
+              <!-- 不再用 :title（浏览器默认 tooltip），超长时改用自定义气泡 qq09Tip -->
+              <span
+                class="qq09-user-name-text"
+                @mouseenter="qq09ShowTip($event, qq09UserName)"
+                @mouseleave="qq09HideTip"
+              >{{ qq09UserName }}</span>
+              <span class="qq09-user-no">(260711)</span>
+              <button type="button" class="qq09-name-edit" data-test="qq09-name-edit" title="修改昵称" @click="qq09StartEdit">
+                <AppIcon name="pencil" :size="11" :stroke-width="2" />
+              </button>
+            </template>
+            <input
+              v-else
+              ref="qq09NameInputRef"
+              v-model="qq09NameDraft"
+              class="qq09-name-input"
+              data-test="qq09-name-input"
+              maxlength="24"
+              @keyup.enter="qq09SaveName"
+              @keyup.esc="qq09CancelEdit"
+              @blur="qq09SaveName"
+            >
+          </div>
+          <!-- 个性签名：与昵称同款就地编辑（铅笔 → 输入框 → 保存） -->
+          <div class="qq09-user-sign">
+            <template v-if="!qq09EditingSign">
+              <span
+                class="qq09-user-sign-text"
+                @mouseenter="qq09ShowTip($event, qq09UserSign)"
+                @mouseleave="qq09HideTip"
+              >{{ qq09UserSign }}</span>
+              <button type="button" class="qq09-sign-edit" data-test="qq09-sign-edit" title="修改签名" @click="qq09StartSignEdit">
+                <AppIcon name="pencil" :size="10" :stroke-width="2" />
+              </button>
+            </template>
+            <input
+              v-else
+              ref="qq09SignInputRef"
+              v-model="qq09SignDraft"
+              class="qq09-sign-input"
+              data-test="qq09-sign-input"
+              maxlength="40"
+              @keyup.enter="qq09SaveSign"
+              @keyup.esc="qq09CancelSign"
+              @blur="qq09SaveSign"
+            >
+          </div>
+          <!-- 在线状态：触发器 + 就地下拉（非原生 select）；图标为纯 CSS 圆点，无 emoji/图片 -->
+          <div ref="qq09StatusRef" class="qq09-user-status">
+            <button
+              type="button"
+              class="qq09-status-trigger"
+              data-test="qq09-status-trigger"
+              :aria-expanded="qq09StatusMenuOpen"
+              title="切换在线状态"
+              @click="qq09ToggleStatusMenu"
+            >
+              <span class="qq09-st-icon" :data-st="qq09Status" aria-hidden="true" />
+              <span class="qq09-status-label">{{ qq09StatusLabel }}</span>
+              <span class="qq09-status-caret">▾</span>
+            </button>
+            <div v-if="qq09StatusMenuOpen" class="qq09-status-menu" data-test="qq09-status-menu" role="menu" aria-label="在线状态">
+              <button
+                v-for="st in QQ09_STATUSES"
+                :key="st.id"
+                type="button"
+                role="menuitemradio"
+                class="qq09-status-item"
+                :class="{ active: st.id === qq09Status }"
+                :aria-checked="st.id === qq09Status"
+                :data-test="`qq09-status-item-${st.id}`"
+                @click="qq09SelectStatus(st.id)"
+              >
+                <span class="qq09-st-icon" :data-st="st.id" aria-hidden="true" />
+                <span class="qq09-status-item-name">{{ st.label }}</span>
+              </button>
+            </div>
+          </div>
+          <!-- QQ 等级：图标为纯 CSS 绘制（太阳/月亮/星星，无 emoji/图片），
+               数量与种类由 QQ09_LEVEL_ICONS 按 16/4/1 换算；与状态胶囊同一行排布 -->
+          <div class="qq09-user-level" data-test="qq09-user-level" :title="`QQ等级 ${QQ09_LEVEL} 级`">
+            <span
+              v-for="(icon, i) in QQ09_LEVEL_ICONS"
+              :key="i"
+              class="qq09-lv-icon"
+              :data-lv="icon"
+              aria-hidden="true"
+            />
+            <span class="qq09-lv-num">{{ QQ09_LEVEL }}</span>
+          </div>
+        </div>
+        <!-- 自定义气泡提示（网名 / 签名超长时显示完整文本）：fixed 定位，不参与用户卡
+             弹性布局；作为 hover 元素的兄弟节点渲染，状态不落在元素内部，编辑态切换不残留 -->
+        <span
+          v-if="qq09Tip.show"
+          class="qq09-tip"
+          :class="{ flipped: qq09Tip.flipped }"
+          data-test="qq09-user-tip"
+          :style="{ left: `${qq09Tip.left}px`, top: `${qq09Tip.top}px` }"
+        >{{ qq09Tip.text }}</span>
+      </div>
+
+      <!-- QQ2009 皮肤专属：搜索框，点击打开既有的会话搜索弹窗 -->
+      <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-search" data-test="qq09-search" @click="store.openSessionSearchModal()">
+        🔍 搜索会话、联系人…
+      </div>
+
     <div class="side-menu">
       <div class="menu-item" @click="newSession()">
         <span class="mi-ico">✎</span>
@@ -89,17 +227,11 @@
               @click.stop="store.createSessionInGroup(group.folder_path)"
             >＋</button>
             <button
-              v-if="!group.is_global && group.folder_path !== 'GLOBAL' && confirmDeleteGroupPath !== group.folder_path"
+              v-if="!group.is_global && group.folder_path !== 'GLOBAL'"
               class="g-del"
-              title="删除此项目分组及组内对话"
-              @click.stop="askDeleteGroup(group.folder_path)"
+              title="删除此项目分组及组内对话（会二次确认）"
+              @click.stop="askDeleteGroup(group)"
             >✕</button>
-            <button
-              v-if="!group.is_global && group.folder_path !== 'GLOBAL' && confirmDeleteGroupPath === group.folder_path"
-              class="g-confirm"
-              title="点击确认删除分组及组内对话"
-              @click.stop="confirmDeleteGroup(group.folder_path, getFolderTitle(group))"
-            >确认</button>
           </div>
 
           <div v-show="!collapsedGroups[group.folder_path]" class="group-sessions">
@@ -759,8 +891,6 @@ function onGroupDragEnd() {
 }
 // 正在等待二次确认删除的会话名（在时间位置显示红色小确认按钮）
 const confirmDeleteName = ref('');
-// 正在等待二次确认删除的项目分组路径
-const confirmDeleteGroupPath = ref('');
 // 手机访问绑定信息（点击手机图标后弹出二维码，弹窗内可切换移动端 / web远端）
 // permanent=true 表示永久有效（后端 expires_in=0），不做倒计时自动刷新
 const remoteBind = ref<null | { url: string; qr: string; expires_in: number; permanent?: boolean }>(null);
@@ -792,6 +922,193 @@ const editingValue = ref('');
 // 进入编辑态时的原始显示名，用于判断"未改动"
 let editingOriginal = '';
 const renameInputEl = ref<HTMLInputElement | null>(null);
+
+// QQ2009 皮肤：用户卡昵称可就地编辑（localStorage 持久化，默认「木偶」）
+const QQ09_NAME_KEY = 'qq09.sidebarUserName';
+const qq09UserName = ref(localStorage.getItem(QQ09_NAME_KEY)?.trim() || '木偶');
+const qq09EditingName = ref(false);
+const qq09NameDraft = ref('');
+const qq09NameInputRef = ref<HTMLInputElement | null>(null);
+function qq09StartEdit() {
+  qq09HideTip();
+  qq09NameDraft.value = qq09UserName.value;
+  qq09EditingName.value = true;
+  nextTick(() => qq09NameInputRef.value?.focus());
+}
+function qq09SaveName() {
+  const v = qq09NameDraft.value.trim();
+  if (v) {
+    qq09UserName.value = v;
+    localStorage.setItem(QQ09_NAME_KEY, v);
+  }
+  qq09EditingName.value = false;
+}
+function qq09CancelEdit() { qq09EditingName.value = false; }
+
+// QQ2009 皮肤：用户卡个性签名可就地编辑（与昵称同款，localStorage 持久化）。
+// 签名允许改短但不允许空：trim 后为空即回退默认签名，同时也写回存储。
+const QQ09_SIGN_KEY = 'qq09.sidebarSign';
+const QQ09_SIGN_DEFAULT = '代码写完了吗，就刷 QQ？';
+const qq09UserSign = ref(localStorage.getItem(QQ09_SIGN_KEY)?.trim() || QQ09_SIGN_DEFAULT);
+const qq09EditingSign = ref(false);
+const qq09SignDraft = ref('');
+const qq09SignInputRef = ref<HTMLInputElement | null>(null);
+function qq09StartSignEdit() {
+  qq09HideTip();
+  qq09SignDraft.value = qq09UserSign.value;
+  qq09EditingSign.value = true;
+  nextTick(() => qq09SignInputRef.value?.focus());
+}
+function qq09SaveSign() {
+  const next = qq09SignDraft.value.trim() || QQ09_SIGN_DEFAULT;
+  qq09UserSign.value = next;
+  localStorage.setItem(QQ09_SIGN_KEY, next);
+  qq09EditingSign.value = false;
+}
+function qq09CancelSign() { qq09EditingSign.value = false; }
+
+// QQ2009 皮肤：用户卡自定义气泡提示（网名 / 签名），替代浏览器默认 title。
+// 悬停约 350ms 后、且文本确实被省略号截断（scrollWidth > clientWidth）才显示；
+// 未截断时弹气泡纯属冗余。移出 / 点击 / 滚动 / 进入编辑态立即隐藏。
+const QQ09_TIP_DELAY = 350;
+// 元素离视口顶部小于此值时气泡改落到下方（并用 .flipped 翻转小三角）
+const QQ09_TIP_FLIP_TOP = 60;
+const qq09Tip = reactive({ show: false, text: '', top: 0, left: 0, flipped: false });
+let qq09TipTimer: ReturnType<typeof setTimeout> | null = null;
+function qq09HideTip() {
+  if (qq09TipTimer !== null) {
+    clearTimeout(qq09TipTimer);
+    qq09TipTimer = null;
+  }
+  if (qq09Tip.show) qq09Tip.show = false;
+}
+/** 悬停延迟后在元素上方（空间不足则下方）弹出完整文本气泡 */
+function qq09ShowTip(e: MouseEvent, text: string) {
+  const el = e.currentTarget as HTMLElement | null;
+  if (!el) return;
+  qq09HideTip();
+  qq09TipTimer = setTimeout(() => {
+    qq09TipTimer = null;
+    // 文本完整可见时不弹（scrollWidth 等于 clientWidth 即未截断）
+    if (el.scrollWidth <= el.clientWidth) return;
+    const rect = el.getBoundingClientRect();
+    qq09Tip.text = text;
+    // 水平居中于元素；left/top 用视口坐标，配合 .qq09-tip 的 fixed 定位
+    qq09Tip.left = rect.left + rect.width / 2;
+    qq09Tip.flipped = rect.top < QQ09_TIP_FLIP_TOP;
+    qq09Tip.top = qq09Tip.flipped ? rect.bottom + 5 : rect.top - 5;
+    qq09Tip.show = true;
+  }, QQ09_TIP_DELAY);
+}
+
+// QQ2009 皮肤：用户卡在线状态可切换（localStorage 持久化，缺省 online）
+// 六个状态与 qq2009.css 一一对应：.qq09-st-icon[data-st=*] 是菜单/状态行图标，
+// .qq09-status-dot[data-status=*] 是头像右下角的状态点。
+const QQ09_STATUS_KEY = 'qq09.sidebarStatus';
+const QQ09_STATUSES = [
+  { id: 'online', label: '我在线上' },
+  { id: 'busy', label: '忙碌中' },
+  { id: 'away', label: '离开' },
+  { id: 'dnd', label: '请勿打扰' },
+  { id: 'qme', label: 'Q我吧' },
+  { id: 'offline', label: '隐身' },
+] as const;
+type Qq09StatusId = (typeof QQ09_STATUSES)[number]['id'];
+/** 读 localStorage；非法/缺失值一律退回 online（与昵称同款就地持久化做法） */
+function loadQq09Status(): Qq09StatusId {
+  const saved = localStorage.getItem(QQ09_STATUS_KEY);
+  return QQ09_STATUSES.some((s) => s.id === saved) ? (saved as Qq09StatusId) : 'online';
+}
+const qq09Status = ref<Qq09StatusId>(loadQq09Status());
+const qq09StatusMenuOpen = ref(false);
+// 触发器 + 下拉菜单的共同包裹层：外点判定用它，避免误伤菜单内部点击
+const qq09StatusRef = ref<HTMLElement | null>(null);
+const qq09StatusLabel = computed(
+  () => QQ09_STATUSES.find((s) => s.id === qq09Status.value)?.label ?? '我在线上',
+);
+function qq09ToggleStatusMenu() { qq09StatusMenuOpen.value = !qq09StatusMenuOpen.value; }
+function qq09CloseStatusMenu() { qq09StatusMenuOpen.value = false; }
+function qq09SelectStatus(id: Qq09StatusId) {
+  qq09Status.value = id;
+  localStorage.setItem(QQ09_STATUS_KEY, id);
+  qq09CloseStatusMenu();
+}
+
+// QQ2009 皮肤：用户卡 QQ 等级展示（装饰性，图标纯 CSS 绘制见 qq2009.css）。
+// QQ 等级换算：1 太阳 = 16 级，1 月亮 = 4 级，1 星星 = 1 级（皇冠 64 级暂用不到，
+// 真到那天再说）。图标顺序与 QQ 客户端一致：太阳在前，月亮居中，星星收尾。
+const QQ09_LEVEL = 21;
+const QQ09_LEVEL_ICONS: ReadonlyArray<'sun' | 'moon' | 'star'> = [
+  ...Array.from({ length: Math.floor(QQ09_LEVEL / 16) }, () => 'sun' as const),
+  ...Array.from({ length: Math.floor((QQ09_LEVEL % 16) / 4) }, () => 'moon' as const),
+  ...Array.from({ length: QQ09_LEVEL % 4 }, () => 'star' as const),
+];
+
+// QQ2009 皮肤：用户卡头像可点击更换（DataURL 持久化，默认企鹅底图）。
+// 2MB 上限的理由：localStorage 配额通常只有 5MB，DataURL 还要 base64 膨胀约 1/3，
+// 超过这个体积既会撑爆配额、也让同步读写明显变慢；2MB 以内的 GIF 动图能完整落盘。
+// 动图支持：GIF 的 DataURL 仍是标准 image/gif 资源，塞进 <img src> 后浏览器按帧
+// 自动播放，无需 CSS 精灵图或 JS 逐帧控制。
+const QQ09_AVATAR_KEY = 'qq09.sidebarAvatar';
+const QQ09_AVATAR_MAX_BYTES = 2 * 1024 * 1024;
+/** 读已存头像 DataURL；存储不可用 / 内容损坏（非 data:image/* 前缀）一律按无自定义头像处理 */
+function loadQq09Avatar(): string {
+  try {
+    const raw = localStorage.getItem(QQ09_AVATAR_KEY);
+    return raw && raw.startsWith('data:image/') ? raw : '';
+  } catch {
+    // localStorage 不可用（隐私模式/配额满）时退回默认企鹅头像
+    return '';
+  }
+}
+const qq09AvatarData = ref(loadQq09Avatar());
+const qq09AvatarInputRef = ref<HTMLInputElement | null>(null);
+
+/** 点头像：转交隐藏文件框；先清空 value 以便连续两次选同一个文件也能触发 change */
+function qq09PickAvatar() {
+  qq09HideTip();
+  const input = qq09AvatarInputRef.value;
+  if (!input) return;
+  input.value = '';
+  input.click();
+}
+
+/** 选文件后：校验类型/体积 → FileReader 读 DataURL → 写内存态 + localStorage */
+function qq09OnAvatarFile(e: Event) {
+  const input = e.target as HTMLInputElement | null;
+  const file = input?.files?.[0];
+  if (!file) return;
+  // 非图片直接忽略（accept 只是过滤器，用户仍可切到「所有文件」）
+  if (!file.type.startsWith('image/')) return;
+  if (file.size > QQ09_AVATAR_MAX_BYTES) {
+    alert('图片不能超过 2MB（localStorage 容量有限，建议压缩后再传）');
+    return;
+  }
+  const reader = new FileReader();
+  reader.onload = () => {
+    const data = typeof reader.result === 'string' ? reader.result : '';
+    if (!data.startsWith('data:image/')) return;
+    qq09AvatarData.value = data;
+    try {
+      localStorage.setItem(QQ09_AVATAR_KEY, data);
+    } catch {
+      /* 配额满时仅本次会话生效：头像已显示，只是不持久化，不打扰用户 */
+    }
+  };
+  // 读取失败（文件被移走/无权限）静默忽略，头像保持原样
+  reader.onerror = () => {};
+  reader.readAsDataURL(file);
+}
+
+/** 恢复默认头像：清内存态并删键，回到 CSS 画的企鹅底图 */
+function qq09ResetAvatar() {
+  qq09AvatarData.value = '';
+  try {
+    localStorage.removeItem(QQ09_AVATAR_KEY);
+  } catch {
+    /* 存储不可用时仅清掉本次会话的状态 */
+  }
+}
 
 function openCtxMenu(e: MouseEvent, s: SessionInfo, group: SessionGroup) {
   cancelRename();
@@ -955,14 +1272,23 @@ function commitRename() {
   store.renameSession(oldName, next);
 }
 
-// 会话菜单与分组菜单互斥，统一收口关闭
+// 会话菜单与分组菜单互斥，统一收口关闭（滚动 / 缩放时顺带收掉 QQ2009 气泡）
 function closeSidebarMenus() {
   closeCtxMenu();
   closeGroupMenu();
+  qq09HideTip();
 }
 
 // 菜单关闭时机：点击菜单外任意位置（点在菜单内不关，避免抢在 click 之前移除节点）
 function onDocMouseDown(e: MouseEvent) {
+  // 气泡是纯悬停提示：任何点击都立即隐藏，避免残留
+  qq09HideTip();
+  // QQ2009 状态菜单同款外点关闭：点在「触发器 + 下拉」包裹层外才关
+  // （层内的 mousedown 一律放行，交给触发器的 click 做开合、菜单项的 click 做选中）
+  if (qq09StatusMenuOpen.value) {
+    const wrap = qq09StatusRef.value;
+    if (!(wrap && e.target instanceof Node && wrap.contains(e.target))) qq09CloseStatusMenu();
+  }
   if (!ctxMenu.show && !groupMenu.show) return;
   const el = ctxMenu.show ? ctxMenuEl.value : groupMenuEl.value;
   if (el && e.target instanceof Node && el.contains(e.target)) return;
@@ -974,6 +1300,7 @@ function onDocKeyDown(e: KeyboardEvent) {
   if (isImeComposing(e)) return;
   if (e.key === 'Escape') {
     closeSidebarMenus();
+    qq09CloseStatusMenu();
     cancelRename();
   }
 }
@@ -1019,13 +1346,19 @@ onUnmounted(() => {
   }
 });
 
-function askDeleteGroup(path: string) {
-  confirmDeleteGroupPath.value = path;
-}
-
-function confirmDeleteGroup(path: string, title: string) {
-  confirmDeleteGroupPath.value = '';
-  store.deleteFolderGroup(path, title);
+// 删除项目分组：先弹确认框（带分组名与组内对话数），确认后才真正移出分组。
+// 后端 delete_folder_group 只删分组内的对话记录，不动磁盘上的项目文件。
+async function askDeleteGroup(group: SessionGroup) {
+  const title = getFolderTitle(group);
+  const count = group.sessions ? group.sessions.length : 0;
+  const detail = count > 0 ? `组内 ${count} 个对话记录会一并删除，` : '该分组内暂无对话记录，';
+  const ok = await store.askConfirm(
+    '删除项目分组',
+    '仅移出侧栏分组，磁盘文件不受影响',
+    `确定要删除项目分组「${title}」吗？${detail}磁盘上的项目文件不会被删除。`,
+  );
+  if (!ok) return;
+  await store.deleteFolderGroup(group.folder_path, title);
 }
 
 function askDelete(name: string) {
@@ -1125,12 +1458,6 @@ const enabledPluginCount = computed(() => store.plugins.filter(p => p.enabled).l
 const enabledAutomationCount = computed(() => store.automationTasks.filter(t => t.enabled).length);
 
 function toggleGroupCollapsed(path: string) {
-  // 处于确认删除状态时，点击分组头其它区域视为取消，不折叠
-  if (confirmDeleteGroupPath.value === path) {
-    confirmDeleteGroupPath.value = '';
-    return;
-  }
-  confirmDeleteGroupPath.value = '';
   collapsedGroups.value[path] = !collapsedGroups.value[path];
   saveFlagPaths(COLLAPSED_GROUPS_KEY, collapsedGroups.value);
 }
@@ -1431,21 +1758,6 @@ function getFolderTitle(g: SessionGroup) {
 .group-header .g-del:hover {
   color: var(--red);
   background: rgba(248, 81, 73, 0.15);
-}
-/* 分组删除的二次确认：红色小确认按钮 */
-.group-header .g-confirm {
-  background: var(--red);
-  border: none;
-  color: #fff;
-  font-size: 11px;
-  padding: 2px 8px;
-  border-radius: 5px;
-  cursor: pointer;
-  transition: 0.15s;
-  animation: s-confirm-pop 0.15s;
-}
-.group-header .g-confirm:hover {
-  filter: brightness(1.15);
 }
 
 .group-sessions {

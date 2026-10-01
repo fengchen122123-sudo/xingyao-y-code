@@ -703,4 +703,18 @@ describe('GUI theme library management', () => {
     expect(saved.regions.workspace.background).toBe('#654321');
     expect(setActive).toHaveBeenCalledWith('rose');
   });
+
+  it('候选主题的原生标题栏预览失败时，data-gui-theme-id 随 DOM 快照一起回滚', async () => {
+    const store = useAppStore();
+    // 先成功预览旧主题，html 上留下旧主题的身份钩子
+    const first = await store.previewGuiTheme(makeTheme('builtin.dark'));
+    expect(first.ok).toBe(true);
+    expect(document.documentElement.dataset.guiThemeId).toBe('builtin.dark');
+    // 候选主题的标题栏预览失败 → 回滚后 html 上应恢复旧主题 id，而不是停在候选主题
+    previewTitlebar.mockResolvedValueOnce({ ok: false, error: activeThemeError });
+    const result = await store.previewGuiTheme(makeTheme('builtin.qq2009', 'light'));
+    expect(result.ok).toBe(false);
+    expect(store.guiTheme?.id).toBe('builtin.dark');
+    expect(document.documentElement.dataset.guiThemeId).toBe('builtin.dark');
+  });
 });

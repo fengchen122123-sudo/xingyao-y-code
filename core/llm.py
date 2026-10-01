@@ -1,3 +1,4 @@
+import difflib
 import json
 import hashlib
 import logging
@@ -8,6 +9,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 # Python 3.10 及以下 concurrent.futures.TimeoutError 不是内建 TimeoutError 的别名，
 # 权限等待轮询必须同时捕获两者，否则等待期直接崩溃
 from concurrent.futures import TimeoutError
@@ -142,6 +144,29 @@ from core.llm_transport import (
     abort_inflight_streams,
     is_rate_limit_error,
 )
+
+# --- 上游错误分类（修复③：额度/鉴权类确定性失败 fail-fast 复用）---
+from core.llm_error_mapper import map_llm_error
+
+# 确定性失败类别：重试无意义（额度耗尽 / 鉴权失败 / 权限受限 / 模型不存在），
+# 命中即 fail-fast 直接抛出，走既有失败收尾；瞬时类（rate_limit 等）保持重试。
+_DETERMINISTIC_API_FAILURE_CATEGORIES = frozenset({
+    "insufficient_quota",
+    "auth_invalid",
+    "permission_denied",
+    "model_not_found",
+})
+
+
+def _is_deterministic_api_failure(exc):
+    """判断异常是否属于"重试无意义"的确定性上游失败（纯函数，便于单测）。
+
+    整体用 try/except 兜底：分类失败时返回 False（保守），不改变既有重试行为。
+    """
+    try:
+        return map_llm_error(exc).category in _DETERMINISTIC_API_FAILURE_CATEGORIES
+    except Exception:
+        return False
 
 # --- Re-exported from core.permission_terminal ---
 from core.permission_terminal import (
@@ -525,8 +550,116 @@ def _yield_content(text):
         yield char
 
 
+# 填充词词表（修复①「填充词判据收紧」）。取舍是“宁可漏判、不可误判”：
+# 漏掉一个填充词只会少熔断一次，误判正常短回复则会触发下游护栏误熔断。
+# 首版照方案给定元素，唯一例外是不收录“完成”——它是常见的合法最终短回复
+# （仓库内多处用例即以 "完成" 作为模型收尾正文，属方案自身边界所言的
+# “正常短回复不得被误判”），收录它会让正常收尾被判为空正文并误触发催促。
+_FILLER_TOKENS = frozenset(
+    {
+        "好", "好的", "嗯", "哦", "噢", "ok", "okay", "行", "可以",
+        "收到", "明白", "了解", "继续", "输出", "完毕",
+        "yes", "no",
+    }
+)
+
+# 与 _is_meaningful_assistant_content 同款的“空白/标点/Markdown 符号”噪声字符类，
+# 剥离与切分共用同一口径，避免两处正则漂移。
+# 相较原判据补入省略号“…”（U+2026），否则“收到……”这类“填充词+省略号”无法被剥离，
+# 纯标点语义不变（仅标点仍由原判据判空）。
+_ASSISTANT_NOISE_PATTERN = r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\…]+"
+
+
+def _is_filler_only(text):
+    """判断文本是否只由填充词构成（修复①判据收紧的辅助函数）。
+
+    来历：原判定只剥离噪声字符，对 ``"好。"`` 剥完仍剩 ``"好"`` 而被判为有效正文，
+    使得慢步熔断 / 总结催促 / 收尾报错三道护栏同时短路。此处要求：剥完噪声后，
+    按标点切出的每个片段都命中 ``_FILLER_TOKENS``（比对前小写化），且残余长度 ≤6，
+    才算“纯填充词”。宁可漏判（放过个别填充词），也不误判（把正常短回复当空正文）。
+    """
+    raw = text or ""
+    stripped = re.sub(_ASSISTANT_NOISE_PATTERN, "", raw)
+    # 残余为空属于“空正文”语义，交回原判据处理，本函数不判假（不改变空串行为）。
+    if not stripped:
+        return False
+    # 残余过长，不可能只是短应答式填充词。
+    if len(stripped) > 6:
+        return False
+    fragments = [seg for seg in re.split(_ASSISTANT_NOISE_PATTERN, raw) if seg]
+    if not fragments:
+        return False
+    return all(seg.lower() in _FILLER_TOKENS for seg in fragments)
+
+
 def _is_meaningful_assistant_content(text):
-    return bool(re.sub(r"[\s`*_#>~\-\[\](){}|.,!?，。！？:：;；/\\]+", "", text or ""))
+    """是否含有效正文：原判据为真，且不是“剥完只剩填充词”。
+
+    函数名与签名保持不变（下游调用与回归用例依赖）。
+    """
+    if not bool(re.sub(_ASSISTANT_NOISE_PATTERN, "", text or "")):
+        return False
+    return not _is_filler_only(text)
+
+
+# --- 退化（复读）检测（修复②）：流式装配层的"连续复读"护栏 -------------------
+# 与修复①的分工：修复①管"单步只有填充词"，这里管"多步反复同一段短内容"。
+# 两者都是为了解决同一类卡死——模型既不调工具也不给结论，只反复刷同样的话，
+# 而 progress_guard 只看确定性状态、不读自然语言（有意设计），追不上这种模式。
+_DEGENERATE_WINDOW = 3
+# "连续相同"判据只对短内容生效：长正文逐位相同更像模型复述上下文，交给相似度判据。
+_DEGENERATE_MAX_FINGERPRINT_CHARS = 20
+_DEGENERATE_SIMILARITY_THRESHOLD = 0.9
+# 退化收敛催促的次数上限：首次命中催促一次，再次命中直接熔断收尾。
+_DEGENERATE_MAX_NUDGES = 1
+
+
+def _degenerate_fingerprint(text):
+    """退化指纹：剥离噪声字符（与修复①同一口径）后的字符串。
+
+    复用 ``_ASSISTANT_NOISE_PATTERN``，避免两处正则各写一份造成口径漂移。
+    """
+    return re.sub(_ASSISTANT_NOISE_PATTERN, "", text or "")
+
+
+def _fingerprint_similarity(left, right):
+    """两个指纹的相似度（0~1）：取“编辑距离比例”与“字符集包含度”的较大者。
+
+    只用标准库（difflib）实现，不引入第三方依赖。包含度是必要补充：中文短复读的
+    指纹常只差一两个字（如 "好" vs "好的"），编辑距离比例只有 0.67，会漏判；包含度
+    按 ``|A∩B| / min(|A|, |B|)`` 计算，能把“一方基本被另一方覆盖”的近似复读判出来。
+    """
+    if not left or not right:
+        return 0.0
+    edit_ratio = difflib.SequenceMatcher(None, left, right).ratio()
+    left_set, right_set = set(left), set(right)
+    containment = len(left_set & right_set) / min(len(left_set), len(right_set))
+    return max(edit_ratio, containment)
+
+
+def _is_degenerate_repeat(fingerprints):
+    """最近若干步指纹是否构成“退化复读”（纯函数，便于单测）。
+
+    判定口径（实施方案 §T2）：滑窗内连续 3 步指纹逐位相同且单步长度 ≤20 字符；
+    或滑窗内指纹两两相似度 ≥0.9。空指纹（工具调用步无正文、无思考）不参与判定，
+    避免把“连续只调工具”的正常步骤误判为复读。
+    """
+    window = list(fingerprints)[-_DEGENERATE_WINDOW:]
+    if len(window) < _DEGENERATE_WINDOW:
+        return False
+    if not all(window):
+        return False
+    if (
+        len(set(window)) == 1
+        and len(window[0]) <= _DEGENERATE_MAX_FINGERPRINT_CHARS
+    ):
+        return True
+    return all(
+        _fingerprint_similarity(earlier, later)
+        >= _DEGENERATE_SIMILARITY_THRESHOLD
+        for index, earlier in enumerate(window)
+        for later in window[index + 1:]
+    )
 
 
 # _read_text_with_encoding_fallback 的唯一实现位于 core/llm_execution.py，
@@ -1260,6 +1393,11 @@ def _chat_with_model_generator(
     FINAL_SUMMARY_MAX_RETRIES = 2
     # 慢步熔断已触发的强催促次数（随本轮会话循环生命周期）。
     slow_step_nudge_count = 0
+    # 退化（复读）检测：最近 3 步的正文指纹滑窗 + 已触发的收敛催促次数。
+    # 与 slow_step_nudge_count 同生命周期（随回合重置），且只存本回合内存：
+    # 不写 Journal、不入库、不落盘（与 read_signatures 同策略，避免污染缓存与历史）。
+    recent_content_fingerprints = deque(maxlen=_DEGENERATE_WINDOW)
+    degenerate_nudge_count = 0
     # D 方案：验证声明护栏已触发的提醒次数（随本轮会话循环生命周期）。
     verify_claim_nudge_count = 0
     # C8/C9：本回合工具调用总次数（Stop hook 输入字段；无 hooks 配置时零影响）。
@@ -1324,6 +1462,17 @@ def _chat_with_model_generator(
                 # complete 也不 stop。
                 return
             if computer_exit_kind == "completed":
+                # L1（2026-10-01 "接管—交还"修复）：用户接管态
+                # （waiting_for_user）同样走"完成"路径终结并交还排他租约。
+                # 转移表放行 waiting_for_user → completing 之前，这一步会抛
+                # 非法状态转换并被吞成 warning，run 既无终态也无租约释放，
+                # 下一回合被 computer_session_busy 挡死（2026-10-01 实机故障，
+                # 日志 gui-runtime.log:11174/11519）。
+                # retain 必须为 True、与普通收尾完全一致：外部 Edge/Chrome 上
+                # 关闭 backend 会连用户此刻正在手动操作的浏览器窗口一起关掉，
+                # 而接管场景恰恰正在用那个窗口；内置浏览器上保留会话也让下一
+                # 回合免去 CDP 重连。面板页面属于 GUI 的 WebView2 控件，与 run
+                # 是否保留无关。
                 computer_controller.complete_run(
                     computer_run_id, computer_owner, retain_browser_session=True
                 )
@@ -1332,11 +1481,42 @@ def _chat_with_model_generator(
                     computer_run_id,
                     "turn_cancelled" if computer_exit_kind == "cancelled" else "turn_stopped",
                 )
-        except ComputerControlError as error:
+        except Exception as error:
+            # 捕获范围必须宽于 ComputerControlError（2026-10-01 审查补修）：
+            # snapshot()/complete_run()/stop() 可能抛出非领域异常，若任其逃逸，
+            # 既没有兜底释放租约，还会把异常抛进回合 finally、打断整个收尾流程。
             logger.warning(
-                "电脑操控 run 收尾失败（run=%s kind=%s）：%s",
-                computer_run_id, computer_exit_kind, error,
+                "电脑操控 run 收尾失败（run=%s kind=%s，%s）：%s",
+                computer_run_id, computer_exit_kind, type(error).__name__, error,
             )
+            # L2（2026-10-01 "接管—交还"修复）：收尾失败兜底，保证"回合结束绝不
+            # 留活租约"。complete_run 不可达的一切情形（paused 与
+            # starting/completing/stopping 等非终态——paused → completing 属于
+            # 既有契约明令拒绝的转移）以及其他导致收尾动作失败的异常，都在此
+            # 强制 stop 释放租约，否则 run 会既无终态也无租约释放，下一回合被
+            # computer_session_busy 挡死。整段兜底只 warning，绝不向上抛，也不
+            # 掩盖回合原本结局（provider_safety_required 的提前 return 语义不受
+            # 影响：该分支在上面已 return，不会进入这里）。
+            try:
+                fallback_snapshot = computer_controller.snapshot()
+                if (
+                    fallback_snapshot is not None
+                    and fallback_snapshot.run_id == computer_run_id
+                    and fallback_snapshot.status not in _COMPUTER_RUN_TERMINAL_STATUSES
+                ):
+                    # cancel_owner=False：gui_bridge.py:6220 与 :6377 用该 owner 的
+                    # cancel_event 判定"回合是否被用户取消"，收尾兜底不得把正常
+                    # 结束的回合误标成"已取消"。
+                    computer_controller.stop(
+                        computer_run_id,
+                        "turn_end_finalize_fallback",
+                        cancel_owner=False,
+                    )
+            except Exception:
+                logger.warning(
+                    "电脑操控 run 收尾兜底释放失败（run=%s kind=%s，已忽略）",
+                    computer_run_id, computer_exit_kind, exc_info=True,
+                )
         # 截图清除（2026-09-06 提速计划 Task 6）：回合终结后该会话所有电脑操控
         # 观察图立即折叠为占位符。provider_safety_required 的提前 return 不会
         # 走到这里（run 仍存活，模型恢复后还需要最后一张图）。
@@ -2096,6 +2276,13 @@ def _chat_with_model_generator(
                         if attempt < max_api_retries - 1:
                             continue
 
+                    # 修复③：额度耗尽 / 鉴权失败 / 权限受限 / 模型不存在等确定性失败
+                    # 重试无意义，只会反复空烧额度、拖长用户等待；命中即直接抛出，
+                    # 走既有失败收尾（与五次重试耗尽后的路径一致）。分类失败保守回退
+                    # 既有重试行为，不改变瞬时错误（429 等）的退避口径。
+                    if _is_deterministic_api_failure(api_err):
+                        raise api_err
+
                     if attempt < max_api_retries - 1:
                         # 速率限制（429 / TooManyRequests / RateLimitError）需要更长退避，
                         # 普通网络抖动用短退避即可。优先遵守上游 retry-after 头。
@@ -2411,6 +2598,10 @@ def _chat_with_model_generator(
             # 思考原文可能极长（数万字），直接全量促升会把大段内心独白倾倒给用户，
             # 因此只保留开头一段预览，其余截断。
             raw_content_meaningful = _is_meaningful_assistant_content(public_content)
+            # 促升前的原始正文快照：退化（复读）检测的指纹必须取这里的值。
+            # 一旦走到下面的促升分支，public_content 会被改写成思考预览，
+            # 此时再取指纹等于拿思考内容当正文指纹（口径错误，见下方退化检测块）。
+            pre_promotion_content = public_content
             promoted_reasoning = False
             if (
                 not assembled_response.tool_calls
@@ -2443,6 +2634,74 @@ def _chat_with_model_generator(
             current_tool_calls = tool_calls_list
             replay_reasoning_content = assembled_response.reasoning_content
             provider_thinking_blocks = assembled_response.thinking_blocks
+
+            # 退化（复读）检测（修复②）：模型连续多步只重复同一段短正文
+            # （"好。""嗯。"这类填充词或其近似变体）时，既不产出结论也不推进任务，
+            # 前端气泡持续刷屏、状态栏长期停在"生成中"，用户视角等同卡死。
+            # progress_guard 只比确定性状态、不读正文（有意设计），对这类失效不敏感，
+            # 因此在这里按正文指纹滑窗补一道护栏：首次命中发 notice 并要求收敛，
+            # 二次命中发 error 后走慢步熔断同一收尾路径结束回合。
+            # 注意：正文指纹取 pre_promotion_content（促升前的原始正文快照）——
+            # 上面的 reasoning 促升分支会把 public_content 改写成思考预览，若在促升后
+            # 取指纹（曾经就是如此），退化检测会拿思考预览当正文指纹（口径错误），
+            # 于是"连续几步只输出思考"被误判成正文复读，抢走促升兜底与总结催促的职责。
+            # 口径修正：退化判定只保留正文指纹，思考指纹不再参与熔断。理由是思考内容
+            # 在多步推理中天然高度相似（模型自检 / 复述思考），拿它做复读判据会误伤正常
+            # 推理；而"只输出思考、无正文"的场景本就由既有的 reasoning 促升兜底与总结
+            # 催促（FINAL_SUMMARY_MAX_RETRIES）护栏负责，并有专门测试守着。退化熔断因此
+            # 只针对正文复读这一种故障模式——故障现场正是"每步只输出'好。''嗯。''OK。'
+            # 这类填充词正文"。
+            # 收紧（修复②）：判定只针对"空转步"——有工具调用说明模型正在推进任务，
+            # 不属于"既不调工具也不给结论"的故障模式。若对有工具调用的步也判定，
+            # 首次命中会 continue 直接丢弃该步真实 tool_calls（工具不执行、assistant
+            # 消息不入历史），把"连续几步回相似短句但各自调用不同工具"的正常多步任务
+            # 误杀。这里与慢步熔断的 `not tool_calls_list` 前置条件保持同一口径：
+            # 只有无工具调用的步才累计指纹并参与判定。
+            if not tool_calls_list:
+                recent_content_fingerprints.append(
+                    _degenerate_fingerprint(pre_promotion_content)
+                )
+                if _is_degenerate_repeat(recent_content_fingerprints):
+                    if degenerate_nudge_count < _DEGENERATE_MAX_NUDGES:
+                        degenerate_nudge_count += 1
+                        _notify_event(event_callback, "notice", {
+                            "message": "检测到模型连续多步复读相同内容，已要求其立即收敛并给出结论。",
+                        })
+                        # 与慢步熔断同一通道：同时写内存与持久化，并立即 flush，
+                        # 否则下一轮重建历史时这条催促会丢失。
+                        degenerate_nudge = {
+                            "role": "user",
+                            "content": SLOW_STEP_NUDGE_TEXT,
+                        }
+                        messages.append(degenerate_nudge)
+                        pending_persistence.append(("user", degenerate_nudge))
+                        flush_persistence()
+                        # 复读本身无确定性状态变化：计入进展观察（停滞计数 +1）
+                        progress_guard.observe(
+                            _step_progress_observation(None, session_id=parent_session)
+                        )
+                        # Step 状态机要求 STREAMING → ASSISTANT_READY → COMPLETED，
+                        # 此处尚未走常规 mark_assistant_ready 路径，先补迁移再进入下一轮。
+                        if current_step is not None:
+                            current_step.mark_assistant_ready()
+                            if turn + 1 < max_turns:
+                                current_step.complete()
+                        continue
+                    # 催促过仍未收敛：发 error 让用户可见（禁止静默收尾），并走慢步
+                    # 熔断同一收尾路径结束循环、返回已产出的内容。
+                    _notify_event(event_callback, "error", {
+                        "message": "模型连续多步复读相同内容且未收敛，已触发退化熔断结束本回合。",
+                    })
+                    if promoted_reasoning and public_content:
+                        yield from _yield_content(public_content)
+                    flush_persistence()
+                    if current_step is not None:
+                        current_step.mark_assistant_ready()
+                        current_step.complete()
+                    if harness_runtime is not None:
+                        harness_runtime.complete()
+                    computer_exit_kind = "completed"
+                    return
 
             # 慢步熔断（防止推理型小模型思考失控、静默空转、零产出）：
             # 单步耗时超过 SLOW_STEP_ABORT_SECONDS 且既未产出正文、也未发起工具

@@ -8,6 +8,22 @@
     @mouseenter="computerPanelHovered = true"
     @mouseleave="computerPanelHovered = false"
   >
+    <!-- QQ2009 皮肤专属：动态 QQ秀（非主流动图），置顶于右侧面板（页签条之上）——
+         仅内置 QQ2009 主题且面板处于「打开标签页」状态时渲染；
+         样式在 themes/qq2009.css，本组件不加样式 -->
+    <div v-if="showPicker && store.guiTheme?.id === 'builtin.qq2009'" class="qq09-show" data-test="qq09-show">
+      <div class="qq09-show-head">
+        <span class="qq09-show-title">QQ秀</span>
+      </div>
+      <!-- src 走绑定写法（同 Topbar 的 :src="'/icon.png'"）：public 资源经
+           绝对路径引用，静态 url() 会被构建期当作文件资产去解析 -->
+      <div class="qq09-show-stage">
+        <img class="qq09-show-bg" :src="'/qqshow-fzl.gif'" alt="">
+        <img class="qq09-show-gif" :src="'/qqshow-fzl.gif'" alt="星瑶的非主流 QQ秀">
+        <div class="qq09-show-nameplate">☆星瑶 · 非主流动图秀☆</div>
+      </div>
+    </div>
+
     <!-- 页签条：多页签并存（浏览器/Git/文件/后台任务/子代理…互不覆盖），
          每个页签可单独关闭；"+"打开选择页追加页签，最右 × 收起整个面板 -->
     <div class="tabbar" data-test="tabbar">
