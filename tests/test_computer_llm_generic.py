@@ -517,6 +517,80 @@ def test_computer_run_completed_at_normal_turn_end(monkeypatch, tmp_path):
     assert controller.completed_run_ids == ["run-a"]
 
 
+def test_takeover_run_completed_at_turn_end(monkeypatch, tmp_path):
+    """用户接管态回合正常收尾时必须按"完成"终结并交还租约。
+
+    接管态（waiting_for_user）若收尾不终结、不清理，run 就会卡在
+    waiting_for_user（既无终态也无租约释放），下一回合被
+    computer_session_busy 挡死、该 Turn 的电脑操控能力持续失效
+    （对应 2026-10-01 实机故障）。收尾必须按普通"完成"路径保留浏览器
+    会话（retain_browser_session=True）：外部 Edge/Chrome 上关闭 backend
+    会连用户正在手动操作的浏览器窗口一起关掉，接管场景恰恰正在用那个窗口。
+    """
+    controller = _fake_controller(tmp_path)
+    run_two_step_tool_turn(
+        monkeypatch, tmp_path,
+        controller=controller,
+        responses=[
+            [_chunk(tool_calls=[_computer_call(
+                "call-computer-1",
+                {
+                    "kind": "request_user_takeover",
+                    "target": "browser",
+                    "reason_code": "login_required",
+                },
+            )])],
+            [_chunk("已请求你接管登录，等你操作完再继续。")],
+        ],
+    )
+    # 接管态回合正常收尾：走 complete_run 成功，而不是 stop
+    assert controller.complete_calls == 1
+    assert controller.stop_calls == 0
+    # 保留浏览器会话（不得关闭用户正在操作的浏览器）
+    assert controller.complete_retain_flags == [True]
+    # run 进入终态，租约已交还（下一回合可重新 start_run）
+    assert controller.run_status == "completed"
+
+
+def test_turn_end_finalize_fallback_stops_leaked_run(monkeypatch, tmp_path):
+    """收尾动作因状态不合法而失败时，必须兜底强制释放租约。
+
+    L2 兜底契约：回合结束绝不留活租约。complete_run 抛出
+    computer_invalid_state 后，收尾路径必须再调一次
+    stop(reason="turn_end_finalize_fallback")，且 cancel_owner=False——
+    不得把正常结束的回合误标成"已取消"（该 cancel_event 供 GUI 判定
+    回合是否被用户取消）。
+    """
+    controller = _fake_controller(tmp_path)
+    controller.complete_error = ComputerControlError(
+        "computer_invalid_state", "非法状态转换：waiting_for_user → completing"
+    )
+    run_two_step_tool_turn(monkeypatch, tmp_path, controller=controller)
+    # 先尝试过正常收尾，失败后才走兜底
+    assert controller.complete_calls == 1
+    assert controller.stop_calls == 1
+    assert controller.stop_reasons == [("run-a", "turn_end_finalize_fallback")]
+    assert controller.stop_cancel_owner == [False]
+
+
+def test_turn_end_finalize_fallback_survives_non_domain_error(monkeypatch, tmp_path):
+    """非领域异常同样必须触发兜底，且绝不能逃逸出回合收尾。
+
+    只捕获 ComputerControlError 不足以守住"回合结束绝不留活租约"：
+    snapshot()/complete_run() 可能因实现缺陷或环境异常抛出 RuntimeError
+    之类的非领域异常。若任其逃逸，既没有兜底释放租约，还会把异常抛进
+    回合 finally、打断整个收尾流程。
+    """
+    controller = _fake_controller(tmp_path)
+    controller.complete_error = RuntimeError("收尾时炸了")
+    run_two_step_tool_turn(monkeypatch, tmp_path, controller=controller)
+    # 先尝试过正常收尾，失败后必须兜底释放
+    assert controller.complete_calls == 1
+    assert controller.stop_calls == 1
+    assert controller.stop_reasons == [("run-a", "turn_end_finalize_fallback")]
+    assert controller.stop_cancel_owner == [False]
+
+
 def test_turn_without_computer_calls_never_starts_run(monkeypatch, tmp_path):
     controller = _fake_controller(tmp_path)
     run_two_step_tool_turn(

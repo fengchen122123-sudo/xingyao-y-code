@@ -180,6 +180,9 @@ export async function applyGuiTheme(theme: GuiTheme, api: PyWebViewAPI): Promise
   // body 上的 light 继续服务既有 body.light 后代选择器（代码高亮等）。
   document.documentElement.classList.toggle('light', theme.appearance === 'light');
   document.body.classList.toggle('light', theme.appearance === 'light');
+  // 主题身份钩子：主题专属 CSS（如 qq2009.css）用 html[data-gui-theme-id="..."]
+  // 作为作用域选择器，仅当该主题激活时生效；切换主题时本函数重新执行会覆盖该属性。
+  document.documentElement.dataset.guiThemeId = theme.id;
 
   let disposed = false;
   return {

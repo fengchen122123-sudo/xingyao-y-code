@@ -147,7 +147,11 @@ def test_second_owner_cannot_take_active_lease(service, owner_a, owner_b, capabi
     with pytest.raises(ComputerControlError) as raised:
         service.start_run(owner_b, capability, target="desktop")
     assert raised.value.code == "computer_session_busy"
-    assert raised.value.details == {"owner_session_label": owner_a.session_label}
+    assert raised.value.details["owner_session_label"] == owner_a.session_label
+    # L3 可诊断性：占用错误必须说明被占 run 当前处于什么状态，
+    # 否则用户只看到"被占用"，无法判断该等它结束还是该手动停止。
+    assert raised.value.details["owner_run_status"] == "running"
+    assert "当前状态：running" in raised.value.message
     assert service.snapshot().run_id == run.run_id
 
 
@@ -188,12 +192,52 @@ def test_complete_run_releases_lease_but_retains_browser_session(service, runnin
     assert new_run.run_id != running_run.run_id
 
 
+def test_complete_run_from_waiting_for_user_releases_lease(
+    service, running_run, owner_a, owner_b, capability
+):
+    """L1：用户接管态（waiting_for_user）的 run 也能按“完成”收尾并释放租约。
+
+    回合以 completed 收尾时必须允许 waiting_for_user → completing；否则 run
+    既不终结也不清理，租约留活，下一回合被 computer_session_busy 永久挡死。
+    """
+    service.execute(
+        running_run.run_id, owner_a,
+        ComputerAction(kind="request_user_takeover", target="browser", reason_code="login_required"),
+    )
+    assert service.snapshot().status == "waiting_for_user"
+    snapshot = service.complete_run(running_run.run_id, owner_a, retain_browser_session=True)
+    assert snapshot.status == "completed"
+    # 接管态收尾与普通收尾同为 retain=True：绝不能关闭 backend —— 外部
+    # Edge/Chrome 上 close() 会直接关掉用户此刻正在手动操作的浏览器窗口
+    # （接管场景恰恰正在用那个窗口）；内置浏览器上 close() 虽只断 CDP
+    # 连接，但保留会话还能让下一回合免去重连。
+    assert service.backend.close_count == 0
+    assert service.backend.release_count == 1
+    # 租约已释放：另一 owner 立即可以开新 run，不抛 computer_session_busy。
+    new_run_id = service.start_run(owner_b, capability, target="browser").run_id
+    assert new_run_id != running_run.run_id
+
+
 def test_stop_is_idempotent_and_releases_inputs_once(service, running_run):
     first = service.stop(running_run.run_id, "hotkey")
     second = service.stop(running_run.run_id, "hotkey")
     assert first.status == second.status == "stopped"
     assert service.backend.release_count == 1
     assert service.backend.close_count == 1
+
+
+def test_stop_from_stopping_is_idempotent(service, running_run):
+    """L2：停止在途（stopping）时再次 stop 必须幂等返回，而不是抛非法状态转换。
+
+    现状 stopping → stopping 非法，会把正在进行的清理链打断；且幂等路径
+    不得重复释放/关闭 backend，也不得终结 run。
+    """
+    service._transition(service._run, "stopping")
+    snapshot = service.stop(running_run.run_id, "again")
+    assert snapshot.status == "stopping"
+    assert service.backend.release_count == 0
+    assert service.backend.close_count == 0
+    assert service.snapshot().run_id == running_run.run_id
 
 
 # ---------------- 状态机与租约 ----------------

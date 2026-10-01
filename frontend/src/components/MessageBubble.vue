@@ -2,6 +2,11 @@
   <div class="msg" :class="msg.role === 'user' ? 'msg-user' : msg.role === 'error' ? 'msg-error' : msg.role === 'notice' ? 'msg-notice' : 'msg-assistant'">
     <!-- 用户消息（文本 + 可选多张图片缩略图，点击放大）；气泡下方悬停浮现操作栏 -->
     <template v-if="msg.role === 'user'">
+      <!-- QQ2009 皮肤专属：用户消息昵称行（仅内置 QQ2009 主题激活时渲染；
+           样式在 themes/qq2009.css，本组件不加样式） -->
+      <div v-if="store.guiTheme?.id === 'builtin.qq2009'" class="qq09-msg-sender">
+        <b class="qq09-sender-name">木偶</b>
+      </div>
       <div class="bubble user-bubble">
         <div v-if="msg.content" class="user-text">{{ msg.content }}</div>
         <div

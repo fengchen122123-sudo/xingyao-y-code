@@ -100,6 +100,19 @@ it('shows run status target model and failure reasons', () => {
   wrapper.unmount();
 });
 
+it('tells the user to hand back via chat instead of stopping when waiting for user', () => {
+  // 2026-10-01：接管态回合收尾已自动交还租约与浏览器连接，用户不必手动点“立即停止”，
+  // 只需在对话里说一声，星瑶会重新接管继续。原因行必须给出这段交还指引。
+  const store = useAppStore();
+  seedRun(store, { status: 'waiting_for_user', pause_reason: 'credential_required' });
+  const wrapper = mountPane();
+  const text = wrapper.text();
+  expect(text).toContain('等待你接管');
+  expect(text).toContain('credential_required');
+  expect(text).toContain('星瑶会重新接管继续');
+  wrapper.unmount();
+});
+
 it('shows stop only without any resume button for provider safety runs', () => {
   const store = useAppStore();
   seedRun(store, { status: 'provider_safety_required' });
