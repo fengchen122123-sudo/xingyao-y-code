@@ -624,12 +624,12 @@ html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-st-icon[
   background: radial-gradient(circle at 35% 30%, #E8EDF2, #9AA7B4 60%, #7A8896);
 }
 /* ---- QQ 等级行：与状态胶囊同一行（状态胶囊 inline-block，等级块紧随其后），
-   图标 11px 纯 CSS 绘制（零 emoji / 零图片），末尾跟等级数字 ---- */
+   图标 12px 纯 CSS 绘制（零 emoji / 零图片），末尾跟等级数字 ---- */
 html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-user-level {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
-  margin: 4px 0 0 8px;
+  gap: 3px;
+  margin: 4px 0 0 9px;
   vertical-align: top;
   line-height: 1;
   white-space: nowrap;
@@ -638,8 +638,8 @@ html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon 
   position: relative;
   flex: none;
   display: inline-block;
-  width: 11px;
-  height: 11px;
+  width: 12px;
+  height: 12px;
 }
 /* 太阳：金橙圆盘（径向渐变模拟球面高光） */
 html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[data-lv="sun"] {
@@ -647,24 +647,28 @@ html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[
   background: radial-gradient(circle at 35% 30%, #FFE9A8, #F5A623 60%, #E08600);
   box-shadow: 0 0 2px rgba(245, 166, 35, 0.6);
 }
-/* 月亮：金黄圆盘 + 右上内阴影挖出月牙（与状态图标「离开」同款挖月手法） */
+/* 月亮：经典双圆叠加出月牙——底圆金黄，右上叠一个与用户卡背景同色的圆，
+   把右大半遮掉，只露出左边一弯月牙（比 inset 阴影在小尺寸下边缘更干净） */
 html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[data-lv="moon"] {
   border-radius: 50%;
   background: radial-gradient(circle at 35% 30%, #FFF3C4, #F2C94C 60%, #D9A51F);
-  box-shadow: inset -3.5px 1.5px 0 0 #F0F7FD;
+  overflow: hidden;
 }
-/* 星星：五角星用 clip-path 裁（10 顶点标准五星），金黄渐变 + 细描边 */
+html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[data-lv="moon"]::before {
+  content: '';
+  position: absolute;
+  right: -2px;
+  top: -1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #EAF3FB;
+}
+/* 星星：五角星用 clip-path 裁（10 顶点标准五星），金黄渐变 + 柔和外发光 */
 html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-icon[data-lv="star"] {
   background: linear-gradient(180deg, #FFE27A, #F5A623);
   clip-path: polygon(50% 0%, 61% 35%, 98% 35%, 68% 57%, 79% 91%, 50% 70%, 21% 91%, 32% 57%, 2% 35%, 39% 35%);
-}
-/* 等级数字：QQ 蓝小字，与图标基线对齐 */
-html[data-gui-theme-id="builtin.qq2009"] #sidebar .qq09-user-card .qq09-lv-num {
-  margin-left: 2px;
-  color: #2B5A7A;
-  font-size: 10px;
-  font-weight: 700;
-  line-height: 1;
+  filter: drop-shadow(0 0 1px rgba(245, 166, 35, 0.55));
 }
 /* ---- QQ2009 门控元素：搜索框（对照 mockup .search-row / .search-box）
    注：mockup 里 .search-row 的浅蓝底行由侧栏自身渐变底色承接（真实 DOM 只有

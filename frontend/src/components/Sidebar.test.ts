@@ -462,17 +462,18 @@ it('localStorage 预置状态 qme 时初始渲染「Q我吧」且状态点为蓝
   wrapper.unmount();
 });
 
-// ---- QQ2009 用户卡 QQ 等级展示（装饰性，21 级 = 1 太阳 + 1 月亮 + 1 星星） ----
-it('QQ2009 用户卡渲染 QQ 等级：1 太阳 1 月亮 1 星星，末尾数字 21', () => {
+// ---- QQ2009 用户卡 QQ 等级展示（装饰性，5 级 = 1 月亮 + 1 星星，无数字后缀） ----
+it('QQ2009 用户卡渲染 QQ 等级：1 月亮 1 星星，不渲染等级数字', () => {
   const { wrapper } = mountQq09();
 
   const level = wrapper.find('[data-test="qq09-user-level"]');
   expect(level.exists()).toBe(true);
   const icons = level.findAll('.qq09-lv-icon');
-  expect(icons.length).toBe(3);
-  expect(icons.map((i) => i.attributes('data-lv'))).toEqual(['sun', 'moon', 'star']);
-  expect(level.find('.qq09-lv-num').text()).toBe('21');
-  expect(level.attributes('title')).toContain('21');
+  expect(icons.length).toBe(2);
+  expect(icons.map((i) => i.attributes('data-lv'))).toEqual(['moon', 'star']);
+  // 只显示图标，不带等级数字；悬停提示给出完整等级
+  expect(level.find('.qq09-lv-num').exists()).toBe(false);
+  expect(level.attributes('title')).toBe('QQ等级 5 级');
   wrapper.unmount();
 });
 
