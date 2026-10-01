@@ -119,7 +119,6 @@
               :data-lv="icon"
               aria-hidden="true"
             />
-            <span class="qq09-lv-num">{{ QQ09_LEVEL }}</span>
           </div>
         </div>
         <!-- 自定义气泡提示（网名 / 签名超长时显示完整文本）：fixed 定位，不参与用户卡
@@ -1037,7 +1036,7 @@ function qq09SelectStatus(id: Qq09StatusId) {
 // QQ2009 皮肤：用户卡 QQ 等级展示（装饰性，图标纯 CSS 绘制见 qq2009.css）。
 // QQ 等级换算：1 太阳 = 16 级，1 月亮 = 4 级，1 星星 = 1 级（皇冠 64 级暂用不到，
 // 真到那天再说）。图标顺序与 QQ 客户端一致：太阳在前，月亮居中，星星收尾。
-const QQ09_LEVEL = 21;
+const QQ09_LEVEL = 5;
 const QQ09_LEVEL_ICONS: ReadonlyArray<'sun' | 'moon' | 'star'> = [
   ...Array.from({ length: Math.floor(QQ09_LEVEL / 16) }, () => 'sun' as const),
   ...Array.from({ length: Math.floor((QQ09_LEVEL % 16) / 4) }, () => 'moon' as const),
