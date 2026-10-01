@@ -533,3 +533,52 @@ it('run 归属其他会话时操控页签写入归属会话，不污染当前查
   expect(runtimeA.rightPanelActiveTab).toBe('computer');
   wrapper.unmount();
 });
+
+// ── QQ2009 皮肤专属：动态 QQ秀（非主流动图） ──
+
+it('QQ秀：默认主题（guiTheme 为 null）停在选择页时不渲染 QQ秀块', async () => {
+  const store = useAppStore();
+  // 展开面板且无页签 → 停在选择页（showPicker）
+  store.rightPanelCollapsed = false;
+  const wrapper = mount(RightPanel);
+
+  expect(store.guiTheme).toBeNull();
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
+  expect(wrapper.find('[data-test="qq09-show"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('QQ秀：内置 QQ2009 主题下选择页渲染动图舞台与名牌', async () => {
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  // 主题构造器只用到 id 字段：测试用最小对象（GuiTheme 全量字段由主题仓库负责）
+  store.guiTheme = { id: 'builtin.qq2009' } as any;
+  const wrapper = mount(RightPanel);
+
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(true);
+  const show = wrapper.find('[data-test="qq09-show"]');
+  expect(show.exists()).toBe(true);
+  // 舞台双图（背景垫图 + 动图）同源引用 public 资源
+  const imgs = show.findAll('img');
+  expect(imgs).toHaveLength(2);
+  expect(imgs.map(i => i.attributes('src'))).toEqual(['/qqshow-fzl.gif', '/qqshow-fzl.gif']);
+  expect(show.find('.qq09-show-nameplate').text()).toContain('非主流动图秀');
+  wrapper.unmount();
+});
+
+it('QQ秀：QQ2009 主题下打开具体标签页（选择页隐藏）时不渲染 QQ秀块', async () => {
+  const store = useAppStore();
+  store.rightPanelCollapsed = false;
+  store.guiTheme = { id: 'builtin.qq2009' } as any;
+  const wrapper = mount(RightPanel);
+
+  expect(wrapper.find('[data-test="qq09-show"]').exists()).toBe(true);
+
+  // 打开 files 页签：picker 让位，QQ秀随选择页一并隐藏
+  store.openRightPanelTab('files');
+  await nextTick();
+  expect(store.rightPanelPicker).toBe(false);
+  expect(wrapper.find('[data-test="tab-picker"]').exists()).toBe(false);
+  expect(wrapper.find('[data-test="qq09-show"]').exists()).toBe(false);
+  wrapper.unmount();
+});

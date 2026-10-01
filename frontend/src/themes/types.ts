@@ -41,7 +41,7 @@ export interface GuiTheme {
   id: string;
   name: string;
   appearance: ThemeAppearance;
-  extends: 'builtin.light' | 'builtin.dark';
+  extends: 'builtin.light' | 'builtin.dark' | 'builtin.qq2009' | 'builtin.field-notes';
   builtin: boolean;
   tokens: Record<string, string | number>;
   native_titlebar: NativeTitlebarTheme;
@@ -53,7 +53,7 @@ export interface GuiThemeSummary {
   id: string;
   name: string;
   appearance: ThemeAppearance;
-  extends: 'builtin.light' | 'builtin.dark';
+  extends: 'builtin.light' | 'builtin.dark' | 'builtin.qq2009' | 'builtin.field-notes';
   builtin: boolean;
 }
 

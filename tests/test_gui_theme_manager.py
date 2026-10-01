@@ -8,7 +8,7 @@ from zipfile import ZIP_STORED, ZipFile
 import pytest
 from PIL import Image
 
-from core.gui_theme import ThemeError, ThemeRepository
+from core.gui_theme import REGION_IDS, ThemeError, ThemeRepository
 
 
 def make_repo(tmp_path, config_data=None):
@@ -161,8 +161,53 @@ def test_list_themes_includes_builtin_and_user_summaries(tmp_path):
     assert repo.list_themes() == [
         {"id": "builtin.dark", "name": "内置深色", "appearance": "dark", "extends": "builtin.dark", "builtin": True},
         {"id": "builtin.light", "name": "内置浅色", "appearance": "light", "extends": "builtin.light", "builtin": True},
+        {"id": "builtin.qq2009", "name": "内置 QQ2009", "appearance": "light", "extends": "builtin.qq2009", "builtin": True},
+        {"id": "builtin.field-notes", "name": "内置 田野笔记", "appearance": "light", "extends": "builtin.field-notes", "builtin": True},
         {"id": "rose", "name": "rose", "appearance": "light", "extends": "builtin.light", "builtin": False},
     ]
+
+
+def test_builtin_qq2009_theme_is_available_and_valid(tmp_path):
+    repo = make_repo(tmp_path)
+    theme = repo.get_theme("builtin.qq2009")
+    assert theme["builtin"] is True
+    assert theme["name"] == "内置 QQ2009"
+    assert theme["appearance"] == "light"
+    assert set(theme["regions"]) == set(REGION_IDS)
+    assert theme["tokens"]["accent"] == "#3A8FD0"
+    assert theme["tokens"]["orange"] == "#F39C00"
+    assert theme["native_titlebar"]["mode"] == "light"
+    # 复制路径会对清单走完整 Schema 校验：借此证明内置 QQ2009 的取值合法、可派生用户主题
+    copy = repo.copy_theme("builtin.qq2009", "qq2009-copy", "QQ2009 副本")
+    assert copy["builtin"] is False
+    assert copy["extends"] == "builtin.qq2009"
+    assert copy["regions"]["app_header"]["background"] == "#6FB3E5"
+    assert copy["regions"]["workspace"]["background"] == "#FFFFFF"
+    assert copy["regions"]["statusbar"]["background"] == "#D5E5F4"
+    assert copy["tokens"]["radius_medium"] == 5
+    assert [item["id"] for item in repo.list_themes()] == [
+        "builtin.dark", "builtin.light", "builtin.qq2009", "builtin.field-notes", "qq2009-copy",
+    ]
+
+
+def test_builtin_field_notes_theme_is_available_and_valid(tmp_path):
+    repo = make_repo(tmp_path)
+    theme = repo.get_theme("builtin.field-notes")
+    assert theme["builtin"] is True
+    assert theme["name"] == "内置 田野笔记"
+    assert theme["appearance"] == "light"
+    assert set(theme["regions"]) == set(REGION_IDS)
+    assert theme["tokens"]["accent"] == "#E04E10"
+    assert theme["tokens"]["background_app"] == "#EFEADB"
+    assert theme["native_titlebar"]["mode"] == "dark"
+    # 复制路径会对清单走完整 Schema 校验：借此证明内置田野笔记的取值合法、可派生用户主题
+    copy = repo.copy_theme("builtin.field-notes", "field-notes-copy", "田野笔记副本")
+    assert copy["builtin"] is False
+    assert copy["extends"] == "builtin.field-notes"
+    assert copy["regions"]["sidebar"]["background"] == "#1D3A2F"
+    assert copy["regions"]["workspace"]["background"] == "#EFEADB"
+    assert copy["regions"]["statusbar"]["background"] == "#1D3A2F"
+    assert copy["tokens"]["radius_medium"] == 2
 
 
 def test_old_light_flag_migrates_once(tmp_path):

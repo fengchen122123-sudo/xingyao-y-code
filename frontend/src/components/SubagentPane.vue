@@ -23,7 +23,12 @@
           <span v-if="detail.type" class="suba-badge">{{ detail.type }}</span>
           <span v-if="detail.background" class="suba-badge">后台</span>
         </div>
-        <div class="suba-title" :title="detail.description">{{ detail.description }}</div>
+        <div
+          class="suba-title"
+          data-test="subagent-title"
+          @mouseenter="onTitleEnter"
+          @mouseleave="onTitleLeave"
+        >{{ detail.description }}</div>
         <div class="suba-stats">
           <span>已用 <b class="suba-num">{{ formatElapsed(detail.elapsed) }}</b></span>
           <span v-if="timeRangeText">{{ timeRangeText }}</span>
@@ -34,6 +39,19 @@
           </span>
         </div>
       </div>
+
+      <!-- 任务描述气泡：标题默认收 5 行，hover 时在浮层里展示全文。
+           原生 title 会把长段落拉成不换行的超长提示，故自绘 -->
+      <Teleport to="body">
+        <div
+          v-if="tipVisible"
+          class="suba-title-tip"
+          data-test="subagent-title-tip"
+          :style="tipStyle"
+          @mouseenter="cancelHideTip"
+          @mouseleave="hideTip"
+        >{{ detail.description }}</div>
+      </Teleport>
 
       <!-- 执行过程：保持时间顺序的扁平行，工具开始/结束已配对合并 -->
       <div class="suba-flow" data-test="subagent-flow">
@@ -168,6 +186,53 @@ const timeRangeText = computed(() => {
   return `${start} 开始`;
 });
 
+// ── 任务描述气泡：标题默认收 5 行，hover 时浮层展示全文 ──
+const tipVisible = ref(false);
+const tipStyle = ref<Record<string, string>>({});
+let tipTimer: ReturnType<typeof setTimeout> | undefined;
+
+function cancelHideTip() {
+  if (tipTimer !== undefined) {
+    clearTimeout(tipTimer);
+    tipTimer = undefined;
+  }
+}
+// 延时收起：鼠标从标题移向浮层的过程中不闪烁
+function hideTip() {
+  cancelHideTip();
+  tipTimer = setTimeout(() => { tipVisible.value = false; }, 120);
+}
+function showTip(el: HTMLElement) {
+  const rect = el.getBoundingClientRect();
+  const viewportW = window.innerWidth || 1024;
+  const viewportH = window.innerHeight || 768;
+  const width = Math.max(200, Math.min(rect.width || 260, 420, viewportW - 24));
+  const left = Math.max(12, Math.min(rect.left, viewportW - width - 12));
+  const style: Record<string, string> = {
+    left: `${left}px`,
+    width: `${width}px`,
+    maxHeight: `${Math.max(160, Math.round(viewportH * 0.6))}px`,
+  };
+  // 标题偏下（下方放不下）时气泡翻到上方，否则贴标题下沿
+  if (rect.bottom > viewportH * 0.55) {
+    style.bottom = `${Math.max(12, viewportH - rect.top + 6)}px`;
+  } else {
+    style.top = `${rect.bottom + 6}px`;
+  }
+  tipStyle.value = style;
+  cancelHideTip();
+  tipVisible.value = true;
+}
+function onTitleEnter(e: MouseEvent) {
+  const el = e.currentTarget as HTMLElement | null;
+  // 未被截断（内容不足 5 行）不弹气泡
+  if (!el || el.scrollHeight <= el.clientHeight + 1) return;
+  showTip(el);
+}
+function onTitleLeave() {
+  hideTip();
+}
+
 async function copyResult() {
   const text = detail.value?.result;
   if (!text) return;
@@ -227,7 +292,10 @@ watch(
   { immediate: true },
 );
 
-onUnmounted(stopPolling);
+onUnmounted(() => {
+  stopPolling();
+  cancelHideTip();
+});
 </script>
 
 <style scoped>
@@ -311,12 +379,35 @@ onUnmounted(stopPolling);
   0%, 100% { opacity: 1; }
   50% { opacity: 0.35; }
 }
+/* 任务描述默认只露 5 行，超出以省略号收尾；全文由 hover 气泡展示 */
 .suba-title {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 5;
+  line-clamp: 5;
+  overflow: hidden;
   font-size: 13px;
   font-weight: 600;
   color: var(--text);
   line-height: 1.5;
   word-break: break-word;
+}
+
+/* 任务描述气泡：Teleport 到 body + fixed，不被右栏滚动容器裁切 */
+.suba-title-tip {
+  position: fixed;
+  z-index: 1500;
+  padding: 8px 11px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--bg1);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow-y: auto;
+  box-shadow: 0 10px 28px rgba(0, 0, 0, 0.35);
 }
 .suba-stage {
   flex-shrink: 0;

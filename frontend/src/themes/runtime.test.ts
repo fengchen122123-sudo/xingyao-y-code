@@ -80,6 +80,33 @@ describe('applyGuiTheme', () => {
     applied.dispose();
   });
 
+  it('把主题 ID 写到 documentElement 的 data-gui-theme-id，供主题专属 CSS 作用域激活', async () => {
+    // 主题专属样式表（如 qq2009.css）用 html[data-gui-theme-id="builtin.qq2009"]
+    // 限定作用域，只有该主题激活时才生效。
+    const value = theme();
+    value.id = 'builtin.qq2009';
+
+    const applied = await applyGuiTheme(value, fakeApi());
+
+    expect(document.documentElement.dataset.guiThemeId).toBe('builtin.qq2009');
+    applied.dispose();
+  });
+
+  it('切换主题时覆盖 data-gui-theme-id，不残留上一个主题的身份', async () => {
+    const first = theme();
+    first.id = 'builtin.qq2009';
+    const firstApplied = await applyGuiTheme(first, fakeApi());
+    expect(document.documentElement.dataset.guiThemeId).toBe('builtin.qq2009');
+    firstApplied.dispose();
+
+    const second = theme();
+    second.id = 'builtin.rose';
+    const secondApplied = await applyGuiTheme(second, fakeApi());
+
+    expect(document.documentElement.dataset.guiThemeId).toBe('builtin.rose');
+    secondApplied.dispose();
+  });
+
   it('maps semantic and region tokens without injecting a style element', async () => {
     const applied = await applyGuiTheme(theme(), fakeApi());
 

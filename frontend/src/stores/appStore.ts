@@ -1638,12 +1638,17 @@ navItems: [] as Array<{ id: number; preview: string }>,
       }
     },
 
-    _restoreGuiThemeDomSnapshot(rootStyle: string | null, light: boolean) {
+    _restoreGuiThemeDomSnapshot(rootStyle: string | null, light: boolean, guiThemeId: string | undefined) {
       if (rootStyle === null) document.documentElement.removeAttribute('style');
       else document.documentElement.setAttribute('style', rootStyle);
       // light 类在 html 与 body 上成对维护（见 runtime.applyGuiTheme）
       document.documentElement.classList.toggle('light', light);
       document.body.classList.toggle('light', light);
+      // 主题身份钩子（data-gui-theme-id，主题专属 CSS 的作用域）随快照一起回滚：
+      // 候选主题的原生标题栏桥失败时若不回滚该属性，html 上停留的是候选主题的 id，
+      // 与 store.guiTheme（旧主题）不一致，旧主题会被候选主题的皮肤 CSS 染色。
+      if (guiThemeId === undefined) delete document.documentElement.dataset.guiThemeId;
+      else document.documentElement.dataset.guiThemeId = guiThemeId;
     },
 
     async _applyGuiThemeCandidate(
@@ -1657,6 +1662,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
       const previousHandle = this._appliedGuiTheme as AppliedTheme | null;
       const previousRootStyle = document.documentElement.getAttribute('style');
       const previousLight = document.body.classList.contains('light');
+      const previousGuiThemeId = document.documentElement.dataset.guiThemeId;
       let candidateHandle: AppliedTheme;
       try {
         candidateHandle = await applyGuiTheme(theme, api);
@@ -1669,7 +1675,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const result = await api.preview_native_titlebar(theme.native_titlebar);
           if (!result.ok) {
             candidateHandle.dispose();
-            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
             const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
             if (!rollback.ok) return rollback;
             return result;
@@ -1679,7 +1685,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
           const result = await api.restore_native_titlebar();
           if (!result.ok) {
             candidateHandle.dispose();
-            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+            this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
             const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
             if (!rollback.ok) return rollback;
             return result;
@@ -1688,7 +1694,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
         }
       } catch (error) {
         candidateHandle.dispose();
-        this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight);
+        this._restoreGuiThemeDomSnapshot(previousRootStyle, previousLight, previousGuiThemeId);
         const rollback = await this._restorePreviousNativeTitlebar(previousTheme);
         if (!rollback.ok) return rollback;
         return guiThemeFailure(error, 'native_titlebar');
@@ -3233,7 +3239,7 @@ navItems: [] as Array<{ id: number; preview: string }>,
     },
 
     async deleteFolderGroup(workdir: string, folderTitle: string) {
-      // 确认动作已内联在分组头的红色小按钮上，不再弹大确认窗；
+      // 调用方（侧栏分组头 ✕）已用 askConfirm 弹窗完成二次确认；
       // 后端 delete_folder_group 会连同组内对话记录一起删除（不动磁盘文件）
       const api = this._api();
       if (!api) return;
