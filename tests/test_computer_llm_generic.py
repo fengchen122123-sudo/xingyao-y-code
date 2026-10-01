@@ -606,6 +606,104 @@ def test_turn_without_computer_calls_never_starts_run(monkeypatch, tmp_path):
     assert controller.stop_calls == 0
 
 
+# ---------------------------------------------------------------------------
+# 失败收尾：Provider 异常的回合不得置位会话 cancel_event
+# ---------------------------------------------------------------------------
+
+
+class _CancelAwareController(FakeController):
+    """复刻真实 controller.stop 的 cancel_owner 语义（含事件副作用）。
+
+    真实 ``ComputerController.stop`` 在 cancel_owner=True 时会执行
+    ``run.owner.cancel_event.set()``，而该 event 正是 GUI 判定"回合是否被
+    用户取消"的依据（gui_bridge 收尾读它决定发 turn_cancelled 还是正常结束）。
+    FakeController 只记录参数、不产生副作用，无法暴露"失败被误标成取消"，
+    因此这里补上这一条副作用，让断言落在真实行为上。
+    """
+
+    def stop(self, run_id, reason, *, cancel_owner=True):
+        snapshot = super().stop(run_id, reason, cancel_owner=cancel_owner)
+        if cancel_owner:
+            self.owner.cancel_event.set()
+        return snapshot
+
+
+def _cancel_aware_controller(tmp_path, cancel_event):
+    """与会话 cancel_event 共用同一 Event 对象的收尾感知 controller。"""
+    png_path = tmp_path / "observation-run-a.png"
+    png_path.write_bytes(b"\x89PNG\r\n\x1a\nfake-observation")
+    owner = ComputerOwner(
+        session_id=SESSION,
+        turn_id=TURN,
+        session_label=SESSION,
+        cancel_event=cancel_event,
+    )
+    return _CancelAwareController(owner=owner, run_id="run-a", png_path=str(png_path))
+
+
+def run_turn_ending_with_provider_error(monkeypatch, *, controller, cancel_event):
+    """首步 computer_action 建立 run，次步 Provider 抛 402 类错误结束回合。
+
+    402 属于确定性上游失败（额度耗尽），不会被重试；回合最终以
+    computer_exit_kind="failed" 收尾。
+    """
+    _patch_request_env(monkeypatch)
+    monkeypatch.setattr(
+        llm_mod, "resolve_computer_capability", lambda *args, **kwargs: GENERIC_CAPABILITY
+    )
+    monkeypatch.setattr(llm_mod, "get_computer_control_service", lambda: controller)
+    requests = []
+
+    def fake_completion(**kwargs):
+        requests.append(deepcopy(kwargs))
+        if len(requests) == 1:
+            return iter([_chunk(tool_calls=[_computer_call(
+                "call-computer-1", {"kind": "observe", "target": "browser"},
+            )])])
+        raise RuntimeError("Error code: 402 - Payment Required")
+
+    monkeypatch.setattr(llm_mod, "completion", fake_completion)
+    list(chat_with_model_events(
+        "openai/generic-vision",
+        "fake-key",
+        [{"role": "user", "content": "打开浏览器看看页面"}],
+        None,
+        persist=False,
+        turn_id=TURN,
+        cancel_event=cancel_event,
+        parent_session=SESSION,
+        parent_turn_id=TURN,
+        permission_owner=TURN,
+        consume_background_notifications=False,
+    ))
+    return requests
+
+
+def test_failed_turn_finalize_keeps_session_cancel_event_clear(monkeypatch, tmp_path):
+    """Provider 失败收尾不得置位会话 cancel_event（否则界面显示"已取消"）。
+
+    实机故障（2026-10-01，gui-runtime.log 20:14-20:28）：会话在电脑操控中反复
+    撞上上游 402，每次回合都显示"已取消"，真实失败原因被完全吞掉——
+    ``harness_turns`` 里这些回合的事实是 status=failed / error_code=APIError。
+    根因是失败收尾沿用 ``controller.stop`` 的 ``cancel_owner=True`` 默认值：
+    设了 event，gui_bridge 收尾就把它判成"用户取消"。
+
+    失败只应 stop(run, "turn_stopped") 且 cancel_owner=False；用户真取消时
+    event 早已由停止按钮置位，该参数不承担取消语义。
+    """
+    cancel_event = threading.Event()
+    controller = _cancel_aware_controller(tmp_path, cancel_event)
+    run_turn_ending_with_provider_error(
+        monkeypatch, controller=controller, cancel_event=cancel_event
+    )
+    # run 确实建立过（首步 computer_action），且按"失败"收尾而非"完成"
+    assert controller.start_calls == 1
+    assert controller.complete_calls == 0
+    assert controller.stop_reasons == [("run-a", "turn_stopped")]
+    assert controller.stop_cancel_owner == [False]
+    assert not cancel_event.is_set()
+
+
 def test_busy_controller_reports_error_without_breaking_turn(monkeypatch, tmp_path):
     controller = _fake_controller(tmp_path)
     controller.start_error = ComputerControlError(

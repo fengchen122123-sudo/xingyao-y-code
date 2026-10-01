@@ -1477,9 +1477,18 @@ def _chat_with_model_generator(
                     computer_run_id, computer_owner, retain_browser_session=True
                 )
             else:
+                # cancel_owner=False：owner 的 cancel_event 就是 gui_bridge
+                # 判定"回合是否被用户取消"的事件（gui_bridge.py:6220 与 :6377）。
+                # cancelled/failed/stopped 三类非正常收尾里只有真取消才该保留该
+                # 语义，而真取消时 event 早已由停止按钮/Ctrl+C 路径置位，收尾不
+                # 需要也不应再设它：否则一次普通失败（如上游 402 额度不足）会被
+                # 误标成"已取消"，界面上错误原因全部丢失（2026-10-01 实机故障，
+                # 日志 gui-runtime.log 20:14-20:28 连续 8 次）。与下方
+                # turn_end_finalize_fallback 兜底口径保持一致。
                 computer_controller.stop(
                     computer_run_id,
                     "turn_cancelled" if computer_exit_kind == "cancelled" else "turn_stopped",
+                    cancel_owner=False,
                 )
         except Exception as error:
             # 捕获范围必须宽于 ComputerControlError（2026-10-01 审查补修）：
