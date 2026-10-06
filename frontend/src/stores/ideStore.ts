@@ -1,6 +1,6 @@
 import { defineStore } from 'pinia';
 
-import { closeDocument } from '../editor/lsp';
+import { closeDocument, resetClientState } from '../editor/lsp';
 import { languageIdForPath } from '../editor/setup';
 import type { IdeReadFileResult } from '../types/pywebview';
 
@@ -141,6 +141,22 @@ export const useIdeStore = defineStore('ide', {
       this.session = next;
       if (!this.tabsBySession[this.session]) this.tabsBySession[this.session] = [];
       this._syncActiveTab();
+    },
+
+    /**
+     * 会话 / 工作区切换后调用：后端回收全部语言服务器，前端丢弃 LSP 缓存。
+     *
+     * 本地状态先清、再调后端：`resetClientState()` 必须无条件执行，否则桥调用失败
+     * （窗口重载期 / 后端不可用）会把上一个工作区的文档登记与诊断留在内存里，之后
+     * 语言服务器的重启重发就可能落到已经切走的文档上（Task 12 评审 B）。
+     * 后端那条腿是 `lsp_sync_workspace` → `LspManager.recycle_all()`；即使前端漏调
+     * 本动作，`_lsp_workspace_guard` 也会在下一次 LSP 请求前兜底回收。
+     */
+    async syncWorkspace() {
+      resetClientState();
+      const api = ideApi();
+      if (!api || typeof api.lsp_sync_workspace !== 'function') return;
+      await api.lsp_sync_workspace();
     },
 
     /** 打开目标文件并把光标定位到指定行列（S2 的跳转定义 / 诊断跳转复用） */

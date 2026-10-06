@@ -428,3 +428,85 @@ it('running → stopped 后再次 running 也会重发 didOpen（进程被回收
   await vi.advanceTimersByTimeAsync(0);
   expect(api.lsp_notify).toHaveBeenCalledTimes(2);
 });
+
+// ---------------------------------------------------------------------------
+// Task 12 评审 B：重启重发不得跨工作区误发
+// ---------------------------------------------------------------------------
+
+it('切工作区清状态后，旧工作区迟到的 running 不会对新工作区文档重发 didOpen', async () => {
+  const api = installBridge();
+  await openDocument('E:\\wsA\\a.py', 'python', 'x = 1\n');
+  // 旧工作区（wsA）服务器崩溃：留下「待重发」标记
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'running'));
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'restarting'));
+
+  // 用户切到另一个工作区：本地 LSP 状态整体清空（生产入口是 ideStore.syncWorkspace）
+  resetClientState();
+  await openDocument('E:\\wsB\\b.py', 'python', 'y = 1\n');
+  const before = api.lsp_notify.mock.calls.length;
+
+  // wsA 那个键上迟到的 running：如果只清了 openDocs 而留下旧的重启记账，
+  // 这里会把 wsB 的文档当成「刚重启的服务器仍打开的文档」重发 didOpen —— 跨区误发
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  // 唯一允许的 didOpen 是本用例自己 openDocument 发出的那条（mock.calls[1]）
+  expect(api.lsp_notify.mock.calls.length).toBe(before);
+  expect((api.lsp_notify.mock.calls[1] as unknown[])[0]).toBe('E:\\wsB\\b.py');
+});
+
+it('resetClientState 清掉按 (workspace, server) 的重启记账', async () => {
+  const api = installBridge();
+  await openDocument('E:\\wsA\\a.py', 'python', 'x = 1\n');
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'restarting'));
+  resetClientState();
+  // 重启记账清空后，旧键上的 running 既不是「回收后再次 running」也不是「重启完成」：
+  // 不对任何人重发（此时也没有登记在册的文档）
+  await openDocument('E:\\wsA\\b.py', 'python', 'z = 1\n');
+  const before = api.lsp_notify.mock.calls.length;
+  dispatchLspEvent('lsp_status', statusOf('jedi-a', 'E:\\wsA', 'python', 'running'));
+  await vi.advanceTimersByTimeAsync(0);
+  expect(api.lsp_notify.mock.calls.length).toBe(before);
+});
+
+it('切换工作区时回收语言服务器并清空本地 LSP 状态', async () => {
+  const { createPinia, setActivePinia } = await import('pinia');
+  const { useIdeStore } = await import('../stores/ideStore');
+  setActivePinia(createPinia());
+  const api = installBridge({
+    ide_read_file: vi.fn(async (path: string) => ({
+      ok: true,
+      path,
+      content: 'x = 1\n',
+      encoding: 'utf-8',
+      bom: false,
+      eol: 'lf',
+      hash: 'h1',
+    })),
+    ide_set_open_files: vi.fn(async () => ({ ok: true, count: 1 })),
+  });
+  const store = useIdeStore();
+  store.setSession('s1');
+  await store.openFile('E:\\ws\\a.py');
+  await openDocument('E:\\ws\\a.py', 'python', 'x = 1\n');
+  dispatchLspEvent('lsp_diagnostics', { path: 'E:\\ws\\a.py', diagnostics: [DIAG] });
+  expect(diagnosticsFor('E:\\ws\\a.py')).toHaveLength(1);
+
+  await store.syncWorkspace();
+
+  expect(api.lsp_sync_workspace).toHaveBeenCalledTimes(1);
+  expect(diagnosticsFor('E:\\ws\\a.py')).toEqual([]);
+});
+
+it('桥不支持 lsp_sync_workspace 时 syncWorkspace 仍然清本地状态（不抛异常）', async () => {
+  const { createPinia, setActivePinia } = await import('pinia');
+  const { useIdeStore } = await import('../stores/ideStore');
+  setActivePinia(createPinia());
+  const api = installBridge();
+  delete (api as any).lsp_sync_workspace;
+  const store = useIdeStore();
+  store.setSession('s1');
+  await openDocument('E:\\ws\\a.py', 'python', 'x = 1\n');
+  dispatchLspEvent('lsp_diagnostics', { path: 'E:\\ws\\a.py', diagnostics: [DIAG] });
+  await expect(store.syncWorkspace()).resolves.toBeUndefined();
+  expect(diagnosticsFor('E:\\ws\\a.py')).toEqual([]);
+});

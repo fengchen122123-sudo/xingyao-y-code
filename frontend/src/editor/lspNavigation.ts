@@ -75,24 +75,54 @@ export function toLocations(result: unknown): LspLocation[] {
   return locations.filter((location) => location.path !== '');
 }
 
+/**
+ * LSP 的一个位置点是否可用：必须是带整数 line / character 的对象。
+ *
+ * 只接受整数，是为了让 `{ line: '0' }`、`NaN` 这类「结构不合法」的畸形位置
+ * 走丢弃分支，而不是被 `?? 0` 兜成 (0,0)。
+ */
+function isPosition(value: any): value is { line: number; character: number } {
+  return (
+    !!value &&
+    typeof value === 'object' &&
+    Number.isInteger(value.line) &&
+    Number.isInteger(value.character) &&
+    value.line >= 0 &&
+    value.character >= 0
+  );
+}
+
+/** TextEdit.range 在 LSP 里是必填字段；缺失或结构不合法一律返回 null（丢弃该条编辑）。 */
+function validRange(range: any): { start: { line: number; character: number }; end: { line: number; character: number } } | null {
+  return isPosition(range?.start) && isPosition(range?.end) ? range : null;
+}
+
 export function toTextEdits(
   edits: unknown[],
   offsets: number[],
   docLength: number,
 ): { from: number; to: number; insert: string }[] {
   if (!Array.isArray(edits)) return [];
-  return edits
-    .map((raw) => {
-      const edit = (raw ?? {}) as Record<string, any>;
-      return {
-        from: positionToOffset(offsets, edit.range?.start?.line ?? 0, edit.range?.start?.character ?? 0, docLength),
-        to: positionToOffset(offsets, edit.range?.end?.line ?? 0, edit.range?.end?.character ?? 0, docLength),
-        insert: String(edit.newText ?? ''),
-      };
-    })
-    // 安全过滤：CodeMirror 对「起点在终点之后」的变更范围会直接抛错。
+  const changes: { from: number; to: number; insert: string }[] = [];
+  for (const raw of edits) {
+    const edit = (raw ?? {}) as Record<string, any>;
+    // 安全过滤一：缺 range / range 结构不合法 ⇒ 整体放弃这一条。
+    // 绝不能用 `edit.range?.start?.line ?? 0` 兜底——那会把「没有范围」退化成
+    // 位于 (0,0) 的零宽范围，它能通过下面的 `from <= to` 检查，于是变成
+    // 「在文档开头插入 newText」，真的改坏用户文档。
+    const range = validRange(edit.range);
+    if (!range) continue;
+    const change = {
+      from: positionToOffset(offsets, range.start.line, range.start.character, docLength),
+      to: positionToOffset(offsets, range.end.line, range.end.character, docLength),
+      insert: String(edit.newText ?? ''),
+    };
+    // 安全过滤二：CodeMirror 对「起点在终点之后」的变更范围会直接抛错。
     // 语言服务器返回畸形 range 时宁可整体放弃这次编辑，也不能让文档半途改坏。
-    .filter((change) => change.from <= change.to);
+    if (change.from > change.to) continue;
+    changes.push(change);
+  }
+  return changes;
 }
 
 export function lspHover(path: string): Extension {
