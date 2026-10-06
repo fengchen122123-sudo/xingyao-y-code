@@ -4,7 +4,7 @@
       v-for="tab in store.tabs()"
       :key="tab.path"
       class="tab"
-      :class="{ active: tab.path === store.activePath() }"
+      :class="{ active: samePath(tab.path, store.activePath()) }"
       :title="tab.path"
       @click="store.activate(tab.path)"
     >
@@ -16,7 +16,9 @@
 </template>
 
 <script setup lang="ts">
-import { useIdeStore } from '../stores/ideStore';
+// 活动标签比对与 EditorPane 同口径（samePath：只统一分隔符，不折叠大小写与 `..`）——
+// 裸 `===` 遇到分隔符写法差异（`E:\p\a.py` vs `E:/p/a.py`）会把已活动的标签判成非活动
+import { samePath, useIdeStore } from '../stores/ideStore';
 
 const store = useIdeStore();
 
