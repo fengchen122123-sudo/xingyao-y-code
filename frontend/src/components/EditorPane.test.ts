@@ -122,6 +122,23 @@ function api() {
   return (window as any).pywebview.api;
 }
 
+/** 与 mock 里 makeDoc 同形状的假文档：供「视图延迟就绪」的竞态用例手工喂 state。 */
+function makeFakeDoc(text: string) {
+  const lines = text.split('\n');
+  const starts: number[] = [];
+  let offset = 0;
+  for (const line of lines) {
+    starts.push(offset);
+    offset += line.length + 1;
+  }
+  return {
+    toString: () => text,
+    length: text.length,
+    lines: lines.length,
+    line: (n: number) => ({ from: starts[n - 1] ?? 0, to: (starts[n - 1] ?? 0) + (lines[n - 1] ?? '').length }),
+  };
+}
+
 beforeEach(() => {
   (EditorView as unknown as { __instances: FakeView[] }).__instances = [];
   navCalls.length = 0;
@@ -327,6 +344,79 @@ it('F2 重命名的取名回调接到 window.prompt，并把旧名字带进提�
   // 用户取消（prompt 返回 null）时重命名不生效
   promptSpy.mockReturnValue(null);
   expect(navCalls[0].requestNewName('old_name')).toBeNull();
+  wrapper.unmount();
+});
+
+it('挂载竞态：视图未就绪时到达的 pendingJump 在视图就绪后仍被消费（不丢失、不残留）', async () => {
+  // 复现 Task 10 评审 I-1：IdeLayout 的 `:key="ide.activePath()"` 会在 openFile 后
+  // 重建 EditorPane —— 旧实例卸载、新实例 view 尚为 null，而 onJump 的
+  // `openFile().then(() => jumpTo())` 正是在这个窗口里写入 pendingJump。
+  const store = useIdeStore();
+  await store.openFile('a.py');
+
+  // 让新实例的 createEditorState 挂起，制造「view 未就绪」的窗口
+  let release!: (state: unknown) => void;
+  const gate = new Promise((resolve) => {
+    release = resolve;
+  });
+  (createEditorState as unknown as { mockImplementationOnce: (fn: () => unknown) => void })
+    .mockImplementationOnce(() => gate);
+
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await nextTick();
+  // view 还没建出来
+  expect((EditorView as unknown as { __instances: FakeView[] }).__instances).toHaveLength(0);
+
+  // 跳转请求在视图就绪前到达
+  store.pendingJump = { path: 'a.py', line: 2, character: 3 };
+  await nextTick();
+  expect(store.pendingJump).not.toBeNull(); // 此刻尚不能消费，只能保留
+
+  // 视图就绪
+  release({ doc: makeFakeDoc('x = 1\n') });
+  await flushPromises();
+
+  // 必须最终被消费：定位生效且请求清空（残留会被后续跳转错误消费）
+  expect(store.pendingJump).toBeNull();
+  expect(lastView().lastSelection).not.toBeNull();
+  expect(lastView().focused).toBe(true);
+  wrapper.unmount();
+});
+
+it('pendingJump 在视图挂载前就已写入时也会被消费（非 immediate watcher 会漏掉）', async () => {
+  const store = useIdeStore();
+  await store.openFile('a.py');
+  // 挂载前就写好了跳转请求：watch 非 immediate 时不会评估初始值，直接漏掉
+  store.pendingJump = { path: 'a.py', line: 2, character: 3 };
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  expect(store.pendingJump).toBeNull();
+  expect(lastView().lastSelection).not.toBeNull();
+  wrapper.unmount();
+});
+
+it('openFile 失败时 F12 跳转静默回落，不产生 unhandled rejection', async () => {
+  const store = useIdeStore();
+  await store.openFile('a.py');
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  // 目标文件读取失败（越权 / 磁盘错误）：openFile 在 !res.ok 时会 throw
+  api().ide_read_file.mockResolvedValue({ ok: false, msg: '越权' });
+  const rejections: unknown[] = [];
+  const handler = (reason: unknown) => rejections.push(reason);
+  process.on('unhandledRejection', handler);
+  try {
+    navCalls[0].onJump([{ path: 'b.py', line: 1, character: 1 }]);
+    await flushPromises();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  } finally {
+    process.off('unhandledRejection', handler);
+  }
+
+  expect(rejections).toEqual([]);
+  expect(store.pendingJump).toBeNull();
   wrapper.unmount();
 });
 
