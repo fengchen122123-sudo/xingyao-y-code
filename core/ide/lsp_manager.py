@@ -18,6 +18,7 @@ import subprocess
 import threading
 import time
 
+from core.ide import language_registry, server_provision
 from core.ide.lsp_codec import FrameDecoder, LspFrameError, encode_frame
 
 logger = logging.getLogger(__name__)
@@ -388,7 +389,12 @@ class LspProcess:
         if not isinstance(method, str):
             return
         if msg_id is not None:
-            self._handle_server_request(msg_id, method, msg.get("params") or {})
+            try:
+                self._handle_server_request(msg_id, method, msg.get("params") or {})
+            except LspNotRunning as exc:
+                # 进程已退出/写管道已断：回不了包是预期情况，不允许它冒泡出读线程
+                # （读线程带 traceback 终止会留下「进程活着但没人读」的连接）。
+                logger.debug("语言服务器 %s 无法响应 %s：%s", self.name, method, exc)
             return
         if self._on_notification is not None:
             try:
@@ -475,3 +481,318 @@ class LspProcess:
         for thread in (self._reader, self._stderr_reader):
             if thread is not None and thread.is_alive() and thread is not threading.current_thread():
                 thread.join(timeout=2)
+
+
+
+
+class LspManager:
+    """按「工作区 + 语言」缓冲语言服务器进程。
+
+    一个工作区的一种语言只跑一个进程；同一种语言在不同工作区各跑一个，
+    因为 initialize 的 rootUri 不同，跨区复用会让跳转与诊断指向别的工作区。
+
+    状态机：stopped -> starting -> running ->（崩溃）restarting -> running
+    -> ... 连续崩溃超过 max_restarts 次后进入 failed 并停止自动重启。
+
+    回收契约（评审发现 A）：管理器登记自己启动过的每一个进程，`close()`
+    （也支持 `with LspManager(...) as m` 与 `__del__` 兜底）负责把它们全部收掉。
+    只按槽位收不够——崩溃重启会替换槽位，异常路径上槽位还可能先被丢掉，
+    那时子进程就成了没人认领的孤儿（daemon 读线程只保证不阻塞解释器退出，
+    Popen 不会替你杀子进程）。`close()` 是终态：关闭后不允许再启动新进程，
+    否则「关闭」之后起来的进程没人回收。
+    """
+
+    MAX_RESTARTS = 3
+    RESTART_BACKOFF = 0.5
+    # 存活超过这个时长就认为服务器已经稳定，崩溃计数清零，
+    # 避免「偶发崩溃 + 长间隔」把额度用光
+    RESTART_RESET_SECONDS = 60.0
+
+    def __init__(
+        self,
+        *,
+        provision=None,
+        on_notification=None,
+        on_status=None,
+        max_restarts=None,
+        restart_backoff=None,
+        process_factory=None,
+    ):
+        self._provision = provision or server_provision.resolve_executable
+        self._on_notification = on_notification
+        self._on_status = on_status
+        self.max_restarts = self.MAX_RESTARTS if max_restarts is None else max_restarts
+        self.restart_backoff = self.RESTART_BACKOFF if restart_backoff is None else restart_backoff
+        self._process_factory = process_factory or LspProcess
+        self._lock = threading.RLock()
+        self._slots: dict[tuple[str, str], dict] = {}
+        # 兜底登记表：启动过的每一个进程。close() 靠它回收「槽位已经没了」的进程；
+        # 进程退出即摘掉，避免重启路径让它无限增长。
+        self._started: list[LspProcess] = []
+        self._closed = False
+
+    # ---------------- 内部工具 ----------------
+
+    @staticmethod
+    def _norm(workspace) -> str:
+        return os.path.normcase(os.path.abspath(workspace or ""))
+
+    def _forget(self, proc) -> None:
+        """把已经退出的进程从兜底登记表里摘掉；活着的进程留着等 close() 收。"""
+        if proc is None or proc.is_alive():
+            return
+        with self._lock:
+            try:
+                self._started.remove(proc)
+            except ValueError:
+                pass
+
+    def _emit_status(self, workspace, language_id, server_id, state, msg="") -> None:
+        if self._on_status is None:
+            return
+        self._on_status({
+            "server": server_id,
+            "language": language_id,
+            "workspace": workspace,
+            "state": state,
+            "msg": msg,
+        })
+
+    def _make_notification_handler(self, workspace, language_id):
+        def _handler(proc, method, params):
+            if self._on_notification is not None:
+                self._on_notification(workspace, language_id, method, params)
+        return _handler
+
+    def _make_exit_handler(self, key, workspace, language_id):
+        def _handler(proc, exit_code, intentional):
+            self._handle_exit(key, workspace, language_id, proc, exit_code, intentional)
+        return _handler
+
+    # ---------------- 启动 ----------------
+
+    def ensure_server(self, workspace: str, language_id: str) -> LspProcess:
+        key = (self._norm(workspace), language_id)
+        with self._lock:
+            if self._closed:
+                raise LspStartError("语言服务器管理器已关闭，不能再启动语言服务器")
+            slot = self._slots.get(key)
+            if slot is not None and slot["proc"] is not None and slot["proc"].is_alive():
+                return slot["proc"]
+            server_id = language_registry.server_id_for_language(language_id)
+            if not server_id:
+                raise LspStartError(f"没有为语言 {language_id} 配置语言服务器")
+            provision = self._provision(server_id)
+            if not provision.get("executable"):
+                raise LspStartError(
+                    provision.get("msg") or f"未找到语言服务器 {server_id} 的可执行文件"
+                )
+            spec = language_registry.get_spec(server_id)
+            if slot is None:
+                slot = {
+                    "proc": None,
+                    "restarts": 0,
+                    "state": "stopped",
+                    "server_id": server_id,
+                    "msg": "",
+                    "started_at": 0.0,
+                }
+                self._slots[key] = slot
+            slot["state"] = "starting"
+            slot["msg"] = ""
+            slot["started_at"] = time.time()
+            self._emit_status(workspace, language_id, server_id, "starting")
+
+            command = [provision["executable"]]
+            command.extend(provision.get("extra_args") or [])
+            command.extend(spec.args)
+            proc = self._process_factory(
+                command,
+                cwd=workspace or None,
+                name=server_id,
+                initialization_options=dict(spec.initialization_options),
+                on_notification=self._make_notification_handler(workspace, language_id),
+                on_exit=self._make_exit_handler(key, workspace, language_id),
+            )
+            try:
+                proc.start()
+                proc.initialize(workspace or os.getcwd())
+            except LspError as exc:
+                slot["state"] = "failed"
+                slot["msg"] = str(exc)
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                self._emit_status(workspace, language_id, server_id, "failed", str(exc))
+                raise
+            # 登记必须和 start/initialize 同在管理器锁内：退出回调（读线程）第一步就要拿
+            # 这把锁，只要回调晚于锁释放，`slot["proc"] is proc` 就一定认得出来；
+            # 登记被挪到锁外才会丢掉「initialize 一结束就退出」的崩溃。
+            slot["proc"] = proc
+            self._started.append(proc)
+            slot["state"] = "running"
+            self._emit_status(workspace, language_id, server_id, "running")
+            return proc
+
+    # ---------------- 请求 / 通知 ----------------
+
+    def request(self, workspace, language_id, method, params=None, *, timeout=None):
+        return self.ensure_server(workspace, language_id).request(method, params, timeout=timeout)
+
+    def notify(self, workspace, language_id, method, params=None) -> None:
+        self.ensure_server(workspace, language_id).notify(method, params)
+
+    # ---------------- 状态 ----------------
+
+    def status(self, workspace=None) -> list:
+        wanted = self._norm(workspace) if workspace is not None else None
+        with self._lock:
+            items = list(self._slots.items())
+        rows = []
+        for (ws, language_id), slot in items:
+            if wanted is not None and ws != wanted:
+                continue
+            proc = slot["proc"]
+            alive = bool(proc is not None and proc.is_alive())
+            state = slot["state"]
+            if state == "running" and not alive:
+                state = "stopped"
+            rows.append({
+                "workspace": ws,
+                "language": language_id,
+                "server": slot["server_id"],
+                "state": state,
+                "pid": proc.pid if proc is not None else None,
+                "restarts": slot["restarts"],
+                "msg": slot["msg"],
+            })
+        return rows
+
+    # ---------------- 崩溃处理 ----------------
+
+    def _handle_exit(self, key, workspace, language_id, proc, exit_code, intentional) -> None:
+        with self._lock:
+            slot = self._slots.get(key)
+            if slot is None or slot["proc"] is not proc:
+                # 关闭/回收之后的迟到回调：槽位已经不属于它了，顺手摘掉登记表
+                self._forget(proc)
+                return
+            slot["proc"] = None
+            self._forget(proc)
+            if intentional or self._closed:
+                slot["state"] = "stopped"
+                self._emit_status(workspace, language_id, slot["server_id"], "stopped")
+                return
+            uptime = time.time() - (slot["started_at"] or 0.0)
+            if uptime > self.RESTART_RESET_SECONDS:
+                slot["restarts"] = 0
+            if slot["restarts"] >= self.max_restarts:
+                slot["state"] = "failed"
+                slot["msg"] = (
+                    f"语言服务器连续异常退出 {slot['restarts']} 次，已停止自动重启；"
+                    f"退出码 {exit_code}，请检查设置页的语言服务器路径"
+                )
+                self._emit_status(
+                    workspace, language_id, slot["server_id"], "failed", slot["msg"]
+                )
+                return
+            slot["restarts"] += 1
+            restarts = slot["restarts"]
+            server_id = slot["server_id"]
+            slot["state"] = "restarting"
+        self._emit_status(workspace, language_id, server_id, "restarting", f"第 {restarts} 次重启")
+        if self.restart_backoff:
+            time.sleep(self.restart_backoff)
+        try:
+            self.ensure_server(workspace, language_id)
+        except LspError as exc:
+            logger.warning("语言服务器 %s 自动重启失败：%s", server_id, exc)
+
+    # ---------------- 回收 ----------------
+
+    def recycle_workspace(self, workspace) -> list:
+        """回收某工作区的全部语言服务器进程，返回被回收的 (workspace, language) 列表。"""
+        norm = self._norm(workspace)
+        with self._lock:
+            keys = [k for k in self._slots if k[0] == norm]
+            slots = [(k, self._slots.pop(k)) for k in keys]
+        recycled = []
+        for (ws, language_id), slot in slots:
+            proc = slot["proc"]
+            if proc is not None:
+                try:
+                    proc.shutdown()
+                except Exception:
+                    logger.exception("关闭语言服务器失败")
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                self._forget(proc)
+            recycled.append((ws, language_id))
+            self._emit_status(ws, language_id, slot["server_id"], "stopped")
+        return recycled
+
+    def recycle_all(self) -> list:
+        with self._lock:
+            workspaces = sorted({k[0] for k in self._slots})
+        recycled = []
+        for ws in workspaces:
+            recycled.extend(self.recycle_workspace(ws))
+        return recycled
+
+    def close(self) -> list:
+        """关闭管理器：回收全部工作区，再兜底收掉任何仍在运行的子进程。
+
+        幂等：第二次调用返回空列表。兜底对象是 `_started` 里登记过的进程——
+        即使槽位在异常路径上丢了（调用方漏调 shutdown/kill、重启过程中旧槽位
+        被替换），只要进程还活着就在这里被收掉。
+
+        `close()` 是终态：之后 `ensure_server` 直接报错，避免「关闭」之后又起来
+        一个没人回收的进程。
+        """
+        with self._lock:
+            self._closed = True
+            pending = list(self._started)
+        recycled = self.recycle_all()
+        for proc in pending:
+            if proc.is_alive():
+                try:
+                    proc.shutdown()
+                except Exception:
+                    logger.exception("关闭语言服务器失败")
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            self._forget(proc)
+        # shutdown 期间可能又有进程被拉起（崩溃回调），再扫一遍并强杀
+        with self._lock:
+            leftovers = [p for p in self._started if p.is_alive()]
+        for proc in leftovers:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            self._forget(proc)
+        return recycled
+
+    def shutdown(self) -> list:
+        """`close()` 的别名：与 `LspProcess.shutdown` 同名，便于统一收尾。"""
+        return self.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __del__(self):
+        # 兜底中的兜底：调用方忘了 close 时，GC 也要把子进程收掉。
+        # 解释器退出阶段模块全局可能已经拆了，所以整个身体吞掉异常。
+        try:
+            self.close()
+        except Exception:
+            pass
