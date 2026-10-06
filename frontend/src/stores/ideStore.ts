@@ -88,7 +88,25 @@ export const useIdeStore = defineStore('ide', {
 
   actions: {
     setSession(session: string) {
-      this.session = session || '';
+      const next = session || '';
+      const prev = this.session;
+      // `''` 桶是「界面挂载前还没拿到会话名」时打开文件的临时归属地。离开它去绑定
+      // 真实会话时把桶里已有的标签迁移过去，否则先打开的文件会随 `''` 桶变成孤儿、
+      // 在新会话下静默消失（Task 8 评审 Important）。
+      // 只在目标会话桶为空时迁移：目标桶已有标签说明那是它自己的状态，不搬运覆盖。
+      if (prev === '' && next) {
+        const orphans = this.tabsBySession[''];
+        if (orphans?.length && !(this.tabsBySession[next]?.length)) {
+          this.tabsBySession[next] = orphans;
+          this.tabsBySession[''] = [];
+          const active = this.activeBySession[''];
+          if (active) {
+            this.activeBySession[next] = active;
+            this.activeBySession[''] = '';
+          }
+        }
+      }
+      this.session = next;
       if (!this.tabsBySession[this.session]) this.tabsBySession[this.session] = [];
       this._syncActiveTab();
     },
