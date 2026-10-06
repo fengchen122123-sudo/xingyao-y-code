@@ -105,3 +105,61 @@ def test_oversized_length_does_not_allocate_buffer():
     with pytest.raises(LspFrameError):
         decoder.feed(b"Content-Length: %d\r\n\r\n" % (200 * 1024 * 1024))
     assert decoder.pending_bytes < 64
+
+
+# --- 跨帧切片：一个 chunk 同时含上一帧尾部与下一帧头部 ----------------------
+
+
+def test_chunk_with_previous_frame_tail_and_next_frame_head():
+    """缓冲区切片顺序错误（先取正文再切头、或按错偏移删字节）只在这条路径暴露。
+
+    逐字节喂与「整块喂多帧」都覆盖不到：前者每帧都在自己的 chunk 里成帧，
+    后者每次切分都落在帧边界上。这里切在 A 的正文中间，让同一个 chunk 同时携带
+    A 的尾部与 B 的头部。
+    """
+    a = {"jsonrpc": "2.0", "id": 1, "result": {"v": "a"}}
+    b = {"jsonrpc": "2.0", "method": "test/pushed", "params": {"n": 2}}
+    frame_a = encode_frame(a)
+    frame_b = encode_frame(b)
+    cut = len(frame_a) - 7
+    decoder = FrameDecoder()
+    assert decoder.feed(frame_a[:cut]) == []
+    assert decoder.pending_bytes == cut
+    assert decoder.feed(frame_a[cut:] + frame_b[:6]) == [a]
+    assert decoder.pending_bytes == 6
+    assert decoder.feed(frame_b[6:]) == [b]
+    assert decoder.pending_bytes == 0
+
+
+# --- 坏帧不能连带丢掉同一次 feed 里已解码的合法消息 ------------------------
+
+
+def test_messages_decoded_before_bad_frame_are_kept():
+    """[合法帧 A][坏帧 B] 同一个 chunk：A 必须能从异常里取回来。
+
+    A 很可能正是 initialize 响应，丢掉它管理器就会一直等一个永远不会被
+    投递的响应（挂起），而不是报错。
+    """
+    good = {"jsonrpc": "2.0", "id": 1, "result": {"capabilities": {"hoverProvider": True}}}
+    bad_body = b"{ not json"
+    bad = b"Content-Length: %d\r\n\r\n" % len(bad_body) + bad_body
+    decoder = FrameDecoder()
+    with pytest.raises(LspFrameError) as exc:
+        decoder.feed(encode_frame(good) + bad)
+    assert exc.value.messages == [good]
+
+
+def test_messages_kept_when_bad_frame_has_no_content_length():
+    good = {"id": 7}
+    decoder = FrameDecoder()
+    with pytest.raises(LspFrameError) as exc:
+        decoder.feed(encode_frame(good) + b"X-Test: 1\r\n\r\n{}")
+    assert exc.value.messages == [good]
+
+
+def test_frame_error_without_prior_messages_has_empty_list():
+    err = LspFrameError("坏帧")
+    assert err.messages == []
+    with pytest.raises(LspFrameError) as exc:
+        FrameDecoder().feed(b"Content-Length: -1\r\n\r\n")
+    assert exc.value.messages == []
