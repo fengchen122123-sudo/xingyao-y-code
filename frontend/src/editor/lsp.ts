@@ -312,8 +312,16 @@ function serverKeyOf(status: LspServerStatus): string {
 
 /**
  * 服务器重启后对「仍登记为已打开」的文档重发 didOpen（带最新文本）。
- * 只遍历 openDocs：前端认为已关闭的文档绝不复活；workspace 切换时
- * resetClientState 已清空 openDocs，因此这里不会对已回收工作区的文档补发。
+ *
+ * 前提（Task 12 评审 B 收口）：切换工作区时 `resetClientState()` 会同时清空
+ * `openDocs` 与按 (workspace, server) 记账的 `serverStateByKey` / `reopenPending`，
+ * 生产入口是 `ideStore.syncWorkspace()`（切换点调用）。三条状态必须一起清：
+ * 只清文档、留下旧工作区的 `reopenPending` 键时，旧键上一次迟到的 `running`
+ * 会把新工作区的文档当成「自己刚重启的服务器仍打开的文档」重发 didOpen
+ * —— 那正是跨工作区误发（LSP 规范下重复 didOpen 是协议错误）。
+ *
+ * 只按 `languageId` 过滤本身不足以判定归属：同一语言在多个工作区各有一个进程，
+ * 真正区分它们的是 `serverKeyOf` 的 (workspace, server) 口径。
  */
 async function reopenOpenDocuments(languageId: string): Promise<void> {
   const api = bridgeApi();
@@ -428,6 +436,11 @@ export function resetClientState(): void {
   openDocs.clear();
   docPaths.clear();
   diagnosticsByPath.clear();
+  // 按 (workspace, server) 的重启记账同样属于「上一个工作区的状态」：`openDocs`
+  // 清了、这两个表还留着旧工作区的键时，旧键上一次迟到的 `running` 会在新工作区的
+  // 文档上触发一次重启重发（跨工作区误发 didOpen，评审 B）。三条状态必须一起清。
+  serverStateByKey.clear();
+  reopenPending.clear();
 }
 
 // ---------------------------------------------------------------------------

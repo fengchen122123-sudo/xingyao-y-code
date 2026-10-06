@@ -93,7 +93,19 @@ onMounted(async () => {
 
 // IDE 布局常驻不重建：会话切换时也把标签桶重新绑定到新会话，
 // 否则切换会话后新打开的文件会写进上一个会话的桶（跨会话串标签）。
-watch(() => store.currentSessionName, (name) => ide.setSession(name));
+watch(() => store.currentSessionName, (name) => {
+  ide.setSession(name);
+  // 切会话 = 切工作区（工作区跟随会话），必须回收语言服务器：进程与工作区绑定
+  // （LSP initialize 的 rootUri 写死），留着上一个工作区不仅白占内存，还会让
+  // 迟到的诊断/跳转指向错误目录。回收幂等，与下面的 workdir 监听重复调用无副作用。
+  void ide.syncWorkspace();
+});
+
+// 工作区变了但会话没变（例如给「对话」会话引入项目文件夹，或手机上按路径选目录）：
+// 同样要回收，否则旧工作区的语言服务器会一直跑着（验收 S2-3：切工作区无残留进程）。
+watch(() => store.workdir, () => {
+  void ide.syncWorkspace();
+});
 </script>
 
 <style scoped>
