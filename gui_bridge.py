@@ -3431,10 +3431,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         if batcher is None:
             from core.ide import diagnostics_batcher
 
-            batcher = diagnostics_batcher.DiagnosticsBatcher(
-                on_flush=self._lsp_flush_diagnostics
-            )
+            batcher = diagnostics_batcher.DiagnosticsBatcher()
             self._lsp_batcher = batcher
+        # 与 _lsp_manager_instance 同源的问题：只在「新建分支」挂 on_flush，测试或
+        # 其它入口直接把 batcher 塞进 `self._lsp_batcher`（绕过本工厂）时，那种
+        # batcher 永远没有 on_flush——诊断攒在内存里，一次都不会送到前端。
+        # 末尾幂等赋值，代价可忽略。
+        batcher._on_flush = self._lsp_flush_diagnostics
         return batcher
 
     def _lsp_on_status(self, status) -> None:
@@ -3549,6 +3552,27 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception as e:
             logger.exception("lsp_notify 失败")
             return {"ok": False, "error": {"code": -32603, "message": str(e)}, "msg": str(e)}
+
+    def lsp_sync_workspace(self) -> Dict[str, Any]:
+        """前端在会话 / 工作区切换后主动调用：旧工作区的语言服务器立刻退出。
+
+        配套的兜底是 _lsp_workspace_guard：即使前端漏调，下一次 LSP 请求也会
+        先回收旧工作区的进程，因此不存在「切了工作区还在跑旧服务器」的窗口。
+        """
+        try:
+            workspace = self._session_workdir(self._current_session) or ""
+            recycled = []
+            manager = getattr(self, "_lsp_manager", None)
+            if manager is not None:
+                recycled = [language_id for _, language_id in manager.recycle_all()]
+            batcher = getattr(self, "_lsp_batcher", None)
+            if batcher is not None:
+                batcher.flush()
+            self._lsp_workspace = workspace
+            return {"ok": True, "workspace": workspace, "recycled": recycled}
+        except Exception as e:
+            logger.exception("lsp_sync_workspace 失败")
+            return {"ok": False, "workspace": "", "recycled": [], "msg": str(e)}
 
     def lsp_server_status(self, workspace: str = "") -> Dict[str, Any]:
         """枚举全部已配置语言服务器的状态；不启动任何进程（不会因为看状态而拉起服务器）。"""

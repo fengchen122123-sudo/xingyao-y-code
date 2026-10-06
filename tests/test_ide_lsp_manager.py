@@ -303,6 +303,65 @@ def test_exit_after_close_does_not_restart(tmp_path, monkeypatch):
     assert manager.status(str(tmp_path))[0]["state"] == "stopped"
 
 
+class _RecordingProcess(LspProcess):
+    """把每次真正 spawn 出来的 pid 记到测试提供的列表里。
+
+    断言必须落在 pid + 操作系统存活探测上：只看 `_slots` 这类对象字段，
+    漏掉的正是「槽位没了但进程还在跑」这一种残留。
+    """
+
+    def __init__(self, *args, spawned=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._spawned = spawned
+
+    def start(self):
+        super().start()
+        if self._spawned is not None:
+            self._spawned.append(self.pid)
+
+
+def test_exit_race_with_recycle_workspace_does_not_resurrect(tmp_path, monkeypatch):
+    """评审发现 A：崩溃退避期间工作区被回收，退避结束后不得重建进程。
+
+    交错时序：`_handle_exit` 持锁判定为崩溃并释放锁 → 退避中
+    → `recycle_workspace` pop 掉槽位（此时 `slot["proc"]` 已是 None，不会 shutdown）
+    → 退避结束。没有世代护栏时，最后那步 `ensure_server` 会给一个已经切走的
+    工作区重新拉起语言服务器，留下跨工作区残留。
+    """
+    monkeypatch.setenv("FAKE_LSP_MODE", "normal")
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    spawned = []
+    manager = LspManager(
+        provision=_provision_for(make_fake_command(tmp_path)),
+        restart_backoff=1.0,
+        process_factory=lambda *a, **kw: _RecordingProcess(*a, spawned=spawned, **kw),
+    )
+    try:
+        proc = manager.ensure_server(str(ws), "python")
+        pid = proc.pid
+        assert _pid_alive(pid)
+        # 让服务器自己崩溃（test/crash → sys.exit(9)），进入崩溃重启流程
+        manager.notify(str(ws), "python", "test/crash", {})
+        state = _wait_for(
+            lambda: (manager.status(str(ws)) or [{}])[0].get("state"),
+            lambda s: s == "restarting",
+        )
+        assert state == "restarting", "崩溃回调没有进入退避等待，用例前提不成立"
+
+        # 退避期间用户切走工作区：槽位被 pop，进程已死
+        recycled = manager.recycle_workspace(str(ws))
+        assert recycled == [(os.path.normcase(os.path.abspath(str(ws))), "python")]
+
+        # 等退避窗口过去（+ 余量），观察是否有人把进程重新拉起来
+        _wait_for(lambda: manager.status(None), lambda rows: bool(rows), timeout=1.5)
+        assert manager.status(None) == [], "已回收的工作区被重建了槽位"
+        assert len(spawned) == 1, "已回收的工作区被重建了进程：spawned=%s" % spawned
+        assert all(not _pid_alive(p) for p in spawned), "回收后仍有语言服务器进程存活"
+    finally:
+        manager.close()
+
+
 # --- 评审发现 D：读线程的兜底 -------------------------------------------------
 
 
