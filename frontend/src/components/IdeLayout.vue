@@ -47,7 +47,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref } from 'vue';
+import { onMounted, ref, watch } from 'vue';
 
 import ActivityBar from './ActivityBar.vue';
 import BottomPanel from './BottomPanel.vue';
@@ -64,6 +64,30 @@ const ide = useIdeStore();
 // 标签、断点、底部面板状态都来自 ideStore
 const activity = ref('files');
 const bottomHeight = ref(200);
+
+// 先登记会话、再恢复标签：顺序不能反（Task 8 评审 Important）——
+// ideStore 的标签桶按会话隔离，若反过来，先 openFile 的标签会落进 '' 桶，
+// 会话绑定后成为孤儿、用户已打开的文件凭空消失。
+onMounted(async () => {
+  ide.setSession(store.currentSessionName);
+  const api = (window as any).pywebview?.api;
+  if (!api?.ide_get_layout) return;
+  const res = await api.ide_get_layout(store.currentSessionName);
+  if (res?.ok && res.layout) {
+    for (const item of res.layout.tabs) {
+      try {
+        await ide.openFile(item.path);
+      } catch {
+        // 上次打开的文件可能已被删除或移出工作区，静默跳过
+      }
+    }
+    if (res.layout.active) ide.activate(res.layout.active);
+  }
+});
+
+// IDE 布局常驻不重建：会话切换时也把标签桶重新绑定到新会话，
+// 否则切换会话后新打开的文件会写进上一个会话的桶（跨会话串标签）。
+watch(() => store.currentSessionName, (name) => ide.setSession(name));
 </script>
 
 <style scoped>

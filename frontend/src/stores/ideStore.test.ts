@@ -339,3 +339,34 @@ it('persistLayout 无会话或无桥时安全返回，不抛异常', async () =>
   (window as any).pywebview = undefined;
   await expect(store.persistLayout()).resolves.toBeUndefined();
 });
+
+// ---- C：'' 桶时序（Task 8 评审 Important）----
+
+it("未设会话时打开的文件在 setSession 后迁移进新会话，不凭空消失且仍可保存", async () => {
+  const api = installBridge();
+  const store = useIdeStore();
+
+  // 界面挂载前就打开文件：此时还没有会话名，标签只能落进 '' 桶
+  await store.openFile('a.py');
+  expect(store.tabs().map((t) => t.path)).toEqual(['a.py']);
+
+  // 随后才拿到会话名
+  store.setSession('s1');
+
+  // 标签随迁移仍在（活动标签一并迁移），不会随 '' 桶变成孤儿
+  expect(store.tabs().map((t) => t.path)).toEqual(['a.py']);
+  expect(store.activePath()).toBe('a.py');
+
+  // 迁移后的标签仍可正常保存（写盘用 realpath + 打开时的 hash）
+  store.updateContent('a.py', 'x = 2\n');
+  expect(store.tab('a.py')?.dirty).toBe(true);
+  await store.saveTab('a.py');
+  expect(api.ide_write_file).toHaveBeenCalledWith('a.py', 'x = 2\n', 'h1', 'utf-8', false, 'lf');
+  expect(store.tab('a.py')?.dirty).toBe(false);
+
+  // '' 桶已清空：同一份标签不会同时挂在两个桶里
+  store.setSession('');
+  expect(store.tabs()).toEqual([]);
+  store.setSession('s1');
+  expect(store.tabs().map((t) => t.path)).toEqual(['a.py']);
+});
