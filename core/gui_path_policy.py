@@ -89,7 +89,7 @@ def gui_path_access_allowed(real_path: str, workspace: str, *, action: str = "pr
     参数:
         real_path: 已解析的绝对路径（调用方先过 _resolve_real_path）
         workspace: 当前会话工作目录；GLOBAL 自由对话会话传 "GLOBAL"
-        action: "preview" 或 "open"，仅影响拒绝文案
+        action: "preview" / "open" / "edit"，仅影响拒绝文案（三值规则完全一致）
         session_id: 可选当前会话名，用于校验会话主动挂载附件
     返回:
         (是否放行, 拒绝原因)；放行时第二项为空字符串。
