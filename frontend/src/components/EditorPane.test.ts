@@ -200,6 +200,24 @@ it('pendingJump 落到选区后清空，其他路径的跳转请求不消费', a
   wrapper.unmount();
 });
 
+it('pendingJump 写的是调用方原路径（与 props.path 形态不同）时同样被消费', async () => {
+  // 后端把 E:\p\sub\..\a.py 规范化成 realpath E:\p\a.py
+  api().ide_read_file = vi.fn(async () => ({
+    ok: true, path: 'E:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
+  }));
+  const store = useIdeStore();
+  await store.openFile('E:\\p\\sub\\..\\a.py');
+  const wrapper = mount(EditorPane, { props: { path: 'E:\\p\\a.py' } });
+  await flushPromises();
+
+  // S2 用原始路径写下的跳转请求：严格 !== 比对会让它永远不被消费
+  store.pendingJump = { path: 'E:\\p\\sub\\..\\a.py', line: 1, character: 1 };
+  await nextTick();
+  expect(store.pendingJump).toBeNull();
+  expect(lastView().lastSelection).not.toBeNull();
+  wrapper.unmount();
+});
+
 it('卸载时 destroy 视图并移除 keydown 监听', async () => {
   const store = useIdeStore();
   await store.openFile('a.py');

@@ -1,7 +1,7 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
 
-import { normKey, useIdeStore } from './ideStore';
+import { pathKey, samePath, useIdeStore } from './ideStore';
 
 function installBridge(overrides: Record<string, unknown> = {}) {
   const api = {
@@ -116,26 +116,89 @@ it('closeTab 关闭最后一个标签后活动路径为空', async () => {
   expect(store.activePath()).toBe('');
 });
 
-// ---- A：后端 realpath 与调用方原始路径不一致时的查表口径 ----
+// ---- A：以后端 realpath 为唯一判重权威（只统一分隔符，不折叠大小写与 `..`）----
 
-it('后端返回 realpath 与调用方路径大小写/分隔符不同时，第二次 openFile 不新开标签', async () => {
+it('调用方路径含 .. 而后端回规范化绝对路径：第二次 openFile 只产生一个标签，saveTab 仍命中', async () => {
+  // 真实存在的形态差异：传入 E:\p\sub\..\a.py，后端回 realpath E:\p\a.py
   const api = installBridge({
     ide_read_file: vi.fn(async () => ({
-      ok: true, path: 'e:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
+      ok: true, path: 'E:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
     })),
   });
   const store = useIdeStore();
-  await store.openFile('E:\\P\\a.py');
-  await store.openFile('E:\\P\\a.py');
+  await store.openFile('E:\\p\\sub\\..\\a.py');
+  await store.openFile('E:\\p\\sub\\..\\a.py');
 
-  expect(api.ide_read_file).toHaveBeenCalledTimes(1);
-  expect(store.tabs().length).toBe(1);
-  // 标签路径仍是后端 realpath（权威路径，不得被规范化结果覆盖）
-  expect(store.tabs()[0].path).toBe('e:\\p\\a.py');
-  expect(store.activePath()).toBe('e:\\p\\a.py');
+  // (1) 判重只依据后端 realpath：绝不新建第二个标签
+  expect(store.tabs().map((t) => t.path)).toEqual(['E:\\p\\a.py']);
+  expect(store.activePath()).toBe('E:\\p\\a.py');
+
+  // (2) 调用方拿原路径保存仍能命中标签，写盘用 realpath（不能静默 return）
+  store.updateContent('E:\\p\\sub\\..\\a.py', 'x = 2\n');
+  expect(store.tab('E:\\p\\a.py')?.dirty).toBe(true);
+  await store.saveTab('E:\\p\\sub\\..\\a.py');
+  expect(api.ide_write_file).toHaveBeenCalledTimes(1);
+  expect(api.ide_write_file).toHaveBeenCalledWith('E:\\p\\a.py', 'x = 2\n', 'h1', 'utf-8', false, 'lf');
+  expect(store.tab('E:\\p\\a.py')?.dirty).toBe(false);
 });
 
-it('用原始路径 updateContent/saveTab 仍能命中 realpath 标签并真正写盘（不静默 return）', async () => {
+it('同一文件换一种写法打开：多读一次后按 realpath 精确命中，丢弃读取结果不新建标签', async () => {
+  const api = installBridge({
+    ide_read_file: vi.fn(async () => ({
+      ok: true, path: 'E:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
+    })),
+  });
+  const store = useIdeStore();
+  await store.openFile('E:\\p\\a.py');
+  // 第二次换含 `..` 的写法：精确比对未命中 → 真读一次（可接受的重复读取）
+  api.ide_read_file.mockResolvedValueOnce({
+    ok: true, path: 'E:\\p\\a.py', content: 'x = 99\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h9',
+  } as any);
+  await store.openFile('E:\\p\\sub\\..\\a.py');
+
+  expect(api.ide_read_file).toHaveBeenCalledTimes(2);
+  expect(store.tabs().length).toBe(1);
+  // 判定为同一标签后本次读取结果被丢弃：内容与 hash 都没被换掉
+  expect(store.tabs()[0].path).toBe('E:\\p\\a.py');
+  expect(store.tabs()[0].content).toBe('x = 1\n');
+  expect(store.tabs()[0].hash).toBe('h1');
+  // 这次调用方写法被记为查表别名，后续保存仍能命中并写 realpath
+  store.updateContent('E:\\p\\sub\\..\\a.py', 'x = 2\n');
+  await store.saveTab('E:\\p\\sub\\..\\a.py');
+  expect(api.ide_write_file).toHaveBeenCalledWith('E:\\p\\a.py', 'x = 2\n', 'h1', 'utf-8', false, 'lf');
+});
+
+it('标签路径始终保存后端 realpath，不被调用方路径覆盖', async () => {
+  installBridge({
+    ide_read_file: vi.fn(async () => ({
+      ok: true, path: 'e:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
+    })),
+  });
+  const store = useIdeStore();
+  await store.openFile('E:\\P\\a.py');
+
+  expect(store.tabs()[0].path).toBe('e:\\p\\a.py');
+  expect(store.activePath()).toBe('e:\\p\\a.py');
+  expect(store.tab('E:\\P\\a.py')?.path).toBe('e:\\p\\a.py');
+});
+
+it('大小写不同不做词法折叠：后端认同一文件时也只有（且必须只有）一个标签', async () => {
+  const api = installBridge({
+    ide_read_file: vi.fn(async () => ({
+      ok: true, path: 'e:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
+    })),
+  });
+  const store = useIdeStore();
+  await store.openFile('E:\\p\\a.py');
+  await store.openFile('E:\\p\\A.py');
+
+  // 不折叠大小写 → 第二次仍走一次真读，靠后端 realpath 相等收敛到一个标签
+  expect(api.ide_read_file).toHaveBeenCalledTimes(2);
+  expect(store.tabs().length).toBe(1);
+  expect(store.tabs()[0].path).toBe('e:\\p\\a.py');
+});
+
+it('写类动作用调用方原路径命中标签：靠 openFile 记下的后端对答，而不是大小写折叠', async () => {
   const api = installBridge({
     ide_read_file: vi.fn(async () => ({
       ok: true, path: 'e:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
@@ -143,6 +206,10 @@ it('用原始路径 updateContent/saveTab 仍能命中 realpath 标签并真正�
   });
   const store = useIdeStore();
   await store.openFile('E:\\P\\a.py');
+  // 权威路径是后端 realpath，调用方原路径被记为查表别名（不折叠大小写）
+  expect(store.tabs()[0].path).toBe('e:\\p\\a.py');
+  expect(store.tabs()[0].requestedPaths).toEqual(['E:\\P\\a.py']);
+
   store.updateContent('E:\\P\\a.py', 'x = 2\n');
   expect(store.tab('E:\\P\\a.py')?.dirty).toBe(true);
 
@@ -153,7 +220,7 @@ it('用原始路径 updateContent/saveTab 仍能命中 realpath 标签并真正�
   expect(store.tab('E:\\P\\a.py')?.hash).toBe('h2');
 });
 
-it('含 .. 相对段的路径与后端 realpath 归到同一标签，保存也命中', async () => {
+it('closeTab / handleExternalChange 用调用方原路径同样命中标签', async () => {
   const api = installBridge({
     ide_read_file: vi.fn(async () => ({
       ok: true, path: 'E:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
@@ -161,40 +228,24 @@ it('含 .. 相对段的路径与后端 realpath 归到同一标签，保存也�
   });
   const store = useIdeStore();
   await store.openFile('E:\\p\\sub\\..\\a.py');
-  await store.openFile('E:\\p\\a.py');
-  expect(api.ide_read_file).toHaveBeenCalledTimes(1);
-  expect(store.tabs().length).toBe(1);
-
-  store.updateContent('E:\\p\\sub\\..\\a.py', 'x = 3\n');
-  await store.saveTab('E:\\p\\sub\\..\\a.py');
-  expect(api.ide_write_file).toHaveBeenCalledTimes(1);
-  expect(api.ide_write_file).toHaveBeenCalledWith('E:\\p\\a.py', 'x = 3\n', 'h1', 'utf-8', false, 'lf');
-});
-
-it('closeTab / handleExternalChange 同样经规范化键命中标签', async () => {
-  const api = installBridge({
-    ide_read_file: vi.fn(async () => ({
-      ok: true, path: 'e:\\p\\a.py', content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
-    })),
-  });
-  const store = useIdeStore();
-  await store.openFile('E:\\P\\a.py');
   // 脏：外部改动只标记不覆盖
-  store.updateContent('E:\\P\\a.py', 'x = 5\n');
-  await store.handleExternalChange('E:\\P\\a.py');
-  expect(store.tab('E:\\P\\a.py')?.externalChange).toBe(true);
+  store.updateContent('E:\\p\\sub\\..\\a.py', 'x = 5\n');
+  await store.handleExternalChange('E:\\p\\sub\\..\\a.py');
+  expect(store.tab('E:\\p\\a.py')?.externalChange).toBe(true);
 
-  store.closeTab('E:\\P\\a.py');
+  store.closeTab('E:\\p\\sub\\..\\a.py');
   expect(store.tabs()).toEqual([]);
   expect(api.ide_read_file).toHaveBeenCalledTimes(1);
 });
 
-it('normKey 折叠分隔符 / 盘符大小写 / 相对段，且保留相对路径语义', () => {
-  expect(normKey('E:\\P\\a.py')).toBe(normKey('e:/p/a.py'));
-  expect(normKey('E:\\p\\sub\\..\\a.py')).toBe(normKey('E:\\p\\a.py'));
-  expect(normKey('E:\\p\\a.py')).not.toBe(normKey('E:\\p\\b.py'));
-  // 大小写折叠只发生在 Windows 形态的路径上
-  expect(normKey('src/A.py')).toBe('src/A.py');
+it('pathKey/samePath 只统一分隔符：不折叠大小写、不折叠 ..（不猜路径）', () => {
+  expect(pathKey('E:\\p\\a.py')).toBe('E:/p/a.py');
+  expect(samePath('E:\\p\\a.py', 'E:/p/a.py')).toBe(true);
+  expect(samePath('E:\\p\\a.py', 'E:\\p\\b.py')).toBe(false);
+  // 大小写敏感目录里 A.py 与 a.py 是两个文件：不得无差别 toLowerCase
+  expect(samePath('E:/p/A.py', 'E:/p/a.py')).toBe(false);
+  // 中间段是 junction / 符号链接时，`..` 的 realpath 语义与词法折叠不同：不得折叠
+  expect(samePath('E:/p/sub/../a.py', 'E:/p/a.py')).toBe(false);
 });
 
 // ---- B：toggleBreakpoint / persistLayout 的行为覆盖 ----
