@@ -278,3 +278,52 @@ def test_lsp_notify_didClose_discards_batcher_state(tmp_path, monkeypatch):
         manager.recycle_all()
     assert key not in batcher._pending
     assert key not in batcher._last_flushed
+
+
+# ---------------------------------------------------------------------------
+# Task 7 评审 Minor-1：工厂末尾必须幂等挂 on_flush（注入的 batcher 也要挂上）
+# ---------------------------------------------------------------------------
+def test_injected_batcher_gets_flush_callback(tmp_path, monkeypatch):
+    """测试或其它入口直接塞进 `_lsp_batcher` 的实例，也必须被挂上 on_flush。
+
+    旧实现在「新建分支」里挂回调，注入进来的 batcher 没有回调：诊断在合批器里
+    攒着，一次都不会 emit_event 到前端（表现为「改完代码诊断不刷新」，且无日志）。
+    """
+    from core.ide.diagnostics_batcher import DiagnosticsBatcher
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    f = ws / "a.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    manager = _manager(tmp_path)
+    bridge = _make_bridge(str(ws), tmp_path, monkeypatch, manager)
+    events = []
+    bridge.emit_event = lambda name, payload=None: events.append((name, payload))
+    injected = DiagnosticsBatcher()
+    bridge._lsp_batcher = injected
+    try:
+        assert bridge._lsp_batcher_instance() is injected
+        injected.push(str(f), [{"message": "boom"}])
+        injected.flush()
+        diag_events = [e for e in events if e[0] == "lsp_diagnostics"]
+        assert len(diag_events) == 1, "注入的 batcher 没有 on_flush，诊断被静默吞掉"
+        assert os.path.normcase(diag_events[0][1]["path"]) == os.path.normcase(str(f))
+    finally:
+        manager.recycle_all()
+
+
+# ---------------------------------------------------------------------------
+# Task 7 评审 Minor-2：迟到的响应必须留痕，排障能区分「没回」与「回了但超时」
+# ---------------------------------------------------------------------------
+def test_late_response_is_logged_and_dropped(tmp_path, monkeypatch, caplog):
+    """请求超时后迟到的响应：不改变行为（丢弃），但必须有 debug 日志。"""
+    import logging as _logging
+
+    from core.ide.lsp_manager import LspProcess
+
+    proc = LspProcess([sys.executable, "-c", "pass"], cwd=None, name="fake-jsonrpc")
+    with caplog.at_level(_logging.DEBUG, logger="core.ide.lsp_manager"):
+        # 表里没有这个 id：等价于「请求已超时、待答项已被摘掉」
+        proc._dispatch({"jsonrpc": "2.0", "id": 4242, "result": {"ok": True}})
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("4242" in m and "迟到" in m for m in messages), messages
