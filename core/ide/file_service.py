@@ -4,6 +4,8 @@
 与只读预览（gui_bridge.read_file_preview）的关键区别：
 - 预览允许截断、允许图片；编辑器不允许——内容不完整会写坏文件；
 - 编辑器必须原样保留编码、BOM 与换行风格，写回时一个字节都不能变。
+  已知例外：mixed 换行（同文件内混用 CRLF/LF/CR）在编辑器内部已被归一为
+  LF，保存后统一成 LF，见 _normalize_eol。
 
 编码口径与预览保持一致（UTF-8 -> GBK），避免同一个文件在两处显示不同。
 """
@@ -31,7 +33,11 @@ def _hash_bytes(data: bytes) -> str:
 
 
 def _detect_eol(text: str) -> str:
-    """判断换行风格；两种以上混用时返回 mixed，写回时不做转换。"""
+    """判断换行风格；两种以上混用时返回 mixed。
+
+    mixed 无法逐行还原（编辑器内部已归一为 LF），写回时按 LF 统一落盘，
+    见 _normalize_eol。
+    """
     crlf = text.count("\r\n")
     lf = text.count("\n") - crlf
     cr = text.count("\r") - crlf
@@ -86,3 +92,87 @@ def read_text_file(path: str) -> dict:
         "hash": _hash_bytes(raw),
         "size": size,
     }
+
+
+def _normalize_eol(text: str, eol: str) -> str:
+    """把编辑器内部的 LF 还原成原文件的换行风格。
+
+    注意 mixed 的处理：编辑器内部（CodeMirror 6 的 Text）在构造时就把
+    ``\\r\\n`` 与 ``\\r`` 归一为 ``\\n``，传下来的内容已是纯 LF，原始的行级
+    换行分布已经丢失，架构上无法逐行还原。因此 mixed 文件保存后其换行符会
+    被统一为 LF，而不是「保持不变」。
+    """
+    unified = text.replace("\r\n", "\n").replace("\r", "\n")
+    if eol == "crlf":
+        return unified.replace("\n", "\r\n")
+    if eol == "cr":
+        return unified.replace("\n", "\r")
+    return unified
+
+
+def _atomic_write_bytes(path: str, data: bytes) -> None:
+    """临时文件 + 原子替换；失败时清理临时文件。"""
+    directory = os.path.dirname(path) or "."
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        mode = None
+    fd, tmp = tempfile.mkstemp(prefix=".ycode-ide-", dir=directory)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    if mode is not None:
+        try:
+            os.chmod(path, mode)
+        except OSError:
+            pass
+
+
+def write_text_file(
+    path: str,
+    content: str,
+    expected_hash: str,
+    *,
+    encoding: str,
+    bom: bool,
+    eol: str,
+) -> dict:
+    """保存编辑器内容。
+
+    expected_hash 为打开文件时 read_text_file 返回的 hash：磁盘内容与它不
+    一致说明文件在编辑期间被外部（星瑶或其他程序）改过，返回 conflict 且
+    不落盘，由前端让用户选择。传空字符串表示调用方明确要求覆盖。
+    """
+    real = os.path.realpath(os.path.abspath(path))
+    if expected_hash:
+        try:
+            with open(real, "rb") as fh:
+                disk_hash = _hash_bytes(fh.read())
+        except FileNotFoundError:
+            disk_hash = ""
+        if disk_hash != expected_hash:
+            return {
+                "ok": False,
+                "conflict": {"disk_hash": disk_hash},
+                "msg": "文件已被外部修改，请选择以磁盘为准重载或用当前内容覆盖",
+            }
+    text = _normalize_eol(content, eol)
+    try:
+        data = text.encode(encoding)
+    except UnicodeEncodeError as exc:
+        raise FileServiceError(
+            f"内容包含 {encoding} 无法表示的字符（{exc.start} 处），请先改用 UTF-8 保存"
+        ) from exc
+    if bom:
+        data = _BOM_UTF8 + data
+    _atomic_write_bytes(real, data)
+    return {"ok": True, "hash": _hash_bytes(data)}
