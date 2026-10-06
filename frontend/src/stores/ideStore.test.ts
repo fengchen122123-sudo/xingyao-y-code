@@ -340,6 +340,29 @@ it('persistLayout 无会话或无桥时安全返回，不抛异常', async () =>
   await expect(store.persistLayout()).resolves.toBeUndefined();
 });
 
+it('打开与关闭标签都会写回布局快照（active 与真实断点，不是空数组）', async () => {
+  const api = installBridge({
+    ide_save_layout: vi.fn(async (_s: string, l: any) => ({ ok: true, layout: l })),
+  });
+  const store = useIdeStore();
+  store.setSession('s1');
+  // 断点与标签同属一份布局快照：写回必须带真实断点列表，不能写死空数组
+  store.toggleBreakpoint('a.py', 3);
+
+  await store.openFile('a.py');
+  expect(api.ide_save_layout).toHaveBeenCalledWith(
+    's1',
+    expect.objectContaining({ active: 'a.py', breakpoints: [{ path: 'a.py', line: 3 }] }),
+  );
+
+  store.closeTab('a.py');
+  await Promise.resolve();
+  expect(api.ide_save_layout).toHaveBeenLastCalledWith(
+    's1',
+    expect.objectContaining({ active: '', breakpoints: [{ path: 'a.py', line: 3 }] }),
+  );
+});
+
 // ---- C：'' 桶时序（Task 8 评审 Important）----
 
 it("未设会话时打开的文件在 setSession 后迁移进新会话，不凭空消失且仍可保存", async () => {
