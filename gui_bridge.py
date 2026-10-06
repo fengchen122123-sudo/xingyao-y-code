@@ -3229,6 +3229,156 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                     logger.debug("释放技能扫描锁失败", exc_info=True)
 
     # ------------------------------------------------------------------
+    # IDE 模式：编辑器文件读写 / 布局 / 已打开文件变更
+    # ------------------------------------------------------------------
+    _IDE_WATCH_INTERVAL = 1.0
+
+    def _ide_watcher_instance(self):
+        """惰性创建轮询器与线程；线程只负责轮询，派发交给 emit_event。"""
+        from core.ide import file_service
+
+        watcher = getattr(self, "_ide_watcher", None)
+        if watcher is None:
+            watcher = file_service.OpenFileWatcher(interval=self._IDE_WATCH_INTERVAL)
+            self._ide_watcher = watcher
+        return watcher
+
+    def _ide_ensure_watch_thread(self) -> None:
+        if getattr(self, "_ide_watch_thread", None) is not None:
+            return
+        import threading
+
+        stop_event = threading.Event()
+        self._ide_watch_stop = stop_event
+
+        def _loop():
+            while not stop_event.wait(self._IDE_WATCH_INTERVAL):
+                try:
+                    self._ide_poll_once()
+                except Exception:
+                    logger.exception("IDE 已打开文件轮询失败")
+
+        thread = threading.Thread(target=_loop, name="ide-open-file-watcher", daemon=True)
+        self._ide_watch_thread = thread
+        thread.start()
+
+    def _ide_poll_once(self) -> int:
+        """轮询一次并派发变更事件，返回变更文件数（线程循环与测试共用）。"""
+        watcher = self._ide_watcher_instance()
+        changed = watcher.poll()
+        for path in changed:
+            self.emit_event("ide_file_changed", {"path": path})
+        return len(changed)
+
+    def ide_set_open_files(self, paths) -> Dict[str, Any]:
+        """登记当前编辑器打开的文件（轮询集合由前端驱动）。"""
+        try:
+            watcher = self._ide_watcher_instance()
+            watcher.set_open_files(paths or [])
+            self._ide_ensure_watch_thread()
+            return {"ok": True, "count": len(watcher._files)}
+        except Exception as e:
+            logger.exception("ide_set_open_files 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def _ide_guard(self, path: str, action: str) -> "tuple[str, str]":
+        """统一路径策略校验，返回 (real_path, 拒绝原因)。"""
+        from core.gui_path_policy import gui_path_access_allowed
+
+        real_path = _resolve_real_path(path)
+        workspace = self._session_workdir(self._current_session)
+        allowed, deny_msg = gui_path_access_allowed(
+            real_path, workspace, action=action, session_id=self._current_session
+        )
+        if not allowed:
+            return real_path, deny_msg
+        return real_path, ""
+
+    def ide_read_file(self, path: str) -> Dict[str, Any]:
+        from core.ide import file_service
+
+        try:
+            real_path, deny = self._ide_guard(path, "edit")
+            if deny:
+                return {"ok": False, "msg": deny}
+            return {"ok": True, **file_service.read_text_file(real_path)}
+        except file_service.FileServiceError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("ide_read_file 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def ide_write_file(
+        self,
+        path: str,
+        content: str,
+        expected_hash: str = "",
+        encoding: str = "utf-8",
+        bom: bool = False,
+        eol: str = "lf",
+    ) -> Dict[str, Any]:
+        from core.ide import file_service
+
+        try:
+            real_path, deny = self._ide_guard(path, "edit")
+            if deny:
+                return {"ok": False, "msg": deny}
+            return file_service.write_text_file(
+                real_path, content, expected_hash,
+                encoding=encoding, bom=bom, eol=eol,
+            )
+        except file_service.FileServiceError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("ide_write_file 失败")
+            return {"ok": False, "msg": str(e)}
+
+    def ide_stat_files(self, paths) -> Dict[str, Any]:
+        try:
+            from core.ide import file_service
+
+            stats = []
+            for raw in paths or []:
+                real_path, deny = self._ide_guard(raw, "preview")
+                if deny:
+                    stats.append({"path": raw, "denied": True, "msg": deny})
+                    continue
+                try:
+                    st = os.stat(real_path)
+                    with open(real_path, "rb") as fh:
+                        digest = file_service._hash_bytes(fh.read())
+                    stats.append({
+                        "path": real_path,
+                        "mtime": st.st_mtime,
+                        "size": st.st_size,
+                        "hash": digest,
+                    })
+                except OSError:
+                    stats.append({"path": real_path, "missing": True})
+            return {"ok": True, "stats": stats}
+        except Exception as e:
+            logger.exception("ide_stat_files 失败")
+            return {"ok": False, "stats": [], "msg": str(e)}
+
+    def ide_get_layout(self, session: str) -> Dict[str, Any]:
+        try:
+            from core.ide import layout_store
+
+            return {"ok": True, "layout": layout_store.get_ide_layout(session)}
+        except Exception as e:
+            logger.exception("ide_get_layout 失败")
+            return {"ok": False, "layout": None, "msg": str(e)}
+
+    def ide_save_layout(self, session: str, layout) -> Dict[str, Any]:
+        try:
+            from core.ide import layout_store
+
+            return {"ok": True, "layout": layout_store.save_ide_layout(session, layout)}
+        except Exception as e:
+            logger.exception("ide_save_layout 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
     # 会话持久化：历史会话列表
     # ------------------------------------------------------------------
     def get_sessions(self) -> List[Dict[str, Any]]:
