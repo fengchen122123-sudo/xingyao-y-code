@@ -387,6 +387,15 @@ class LspProcess:
             if entry is not None:
                 entry["result"] = msg
                 entry["event"].set()
+            else:
+                # 迟到响应：请求已经超时返回（或连接收尾时清了待答表），这条响应无处可去，
+                # 只能丢弃。排障时必须能区分「服务器没回」与「回了但已超时」——前者是
+                # 服务器卡死/方法不支持，后者是超时设得太紧，两者的处置完全不同。
+                logger.debug(
+                    "语言服务器 %s 的响应 id=%s 迟到（请求已超时或已失效），已丢弃",
+                    self.name,
+                    msg_id,
+                )
             return
         method = msg.get("method")
         if not isinstance(method, str):
@@ -503,6 +512,12 @@ class LspManager:
     那时子进程就成了没人认领的孤儿（daemon 读线程只保证不阻塞解释器退出，
     Popen 不会替你杀子进程）。`close()` 是终态：关闭后不允许再启动新进程，
     否则「关闭」之后起来的进程没人回收。
+
+    槽位世代（评审发现 A）：`recycle_workspace` / `close()` 除了收进程，还给被
+    pop 掉的槽位立墓碑（`_recycled_generations`）。崩溃回调 `_handle_exit` 在
+    退避结束后必须复核「我这一世代的槽位还在不在」，不在就放弃重启——否则
+    退避期间发生的工作区切换会让 `ensure_server` 给一个已经切走的工作区重新
+    拉起进程，留下跨工作区残留。`_closed` 只挡得住 `close()` 那条路径。
     """
 
     MAX_RESTARTS = 3
@@ -532,6 +547,12 @@ class LspManager:
         # 兜底登记表：启动过的每一个进程。close() 靠它回收「槽位已经没了」的进程；
         # 进程退出即摘掉，避免重启路径让它无限增长。
         self._started: list[LspProcess] = []
+        # 槽位世代计数器：每建一个槽位（含崩溃后重建）取一个新号，全局单调递增。
+        # 用途是让「迟到的崩溃回调」能辨认自己那一世代还在不在（评审发现 A）。
+        self._slot_seq = 0
+        # 墓碑：被 recycle_workspace 收掉的槽位世代。保证键的旧世代不被误复活，
+        # 新世代开张时（ensure_server 建槽）覆盖掉同名墓碑。
+        self._recycled_generations: dict[tuple[str, str], int] = {}
         self._closed = False
 
     # ---------------- 内部工具 ----------------
@@ -549,6 +570,15 @@ class LspManager:
                 self._started.remove(proc)
             except ValueError:
                 pass
+
+    def _next_generation(self, key) -> int:
+        """给新槽位分配世代号，并清掉该键的墓碑（旧世代已经不会再回来）。
+
+        调用方必须已持有 `self._lock`（世代号与槽位登记必须在同一临界区里）。
+        """
+        self._slot_seq += 1
+        self._recycled_generations.pop(key, None)
+        return self._slot_seq
 
     def _emit_status(self, workspace, language_id, server_id, state, msg="") -> None:
         if self._on_status is None:
@@ -599,6 +629,9 @@ class LspManager:
                     "server_id": server_id,
                     "msg": "",
                     "started_at": 0.0,
+                    # 世代号：本槽位这一轮生命的标识。`_handle_exit` 退避结束后凭它
+                    # 判断「我负责的那个槽位还在不在」，被回收的槽位绝不复活。
+                    "generation": self._next_generation(key),
                 }
                 self._slots[key] = slot
             slot["state"] = "starting"
@@ -704,13 +737,28 @@ class LspManager:
             restarts = slot["restarts"]
             server_id = slot["server_id"]
             slot["state"] = "restarting"
+            generation = slot["generation"]
         self._emit_status(workspace, language_id, server_id, "restarting", f"第 {restarts} 次重启")
         if self.restart_backoff:
             time.sleep(self.restart_backoff)
-        try:
-            self.ensure_server(workspace, language_id)
-        except LspError as exc:
-            logger.warning("语言服务器 %s 自动重启失败：%s", server_id, exc)
+        # 退避期间槽位可能已经被 recycle_workspace 收掉（用户切了工作区）、被换成
+        # 新世代（新请求重新拉起），或管理器已关闭。这三种情况下都不允许再重启：
+        # 否则会给一个已经切走的工作区重新拉起进程，正是「切工作区残留语言服务器」
+        # （评审发现 A）。校验与 ensure_server 必须在同一临界区里完成——检查通过后
+        # 才去拿锁的话，回收动作可以插在中间，护栏形同虚设。
+        with self._lock:
+            current = self._slots.get(key)
+            if self._closed or current is None or current.get("generation") != generation:
+                logger.debug(
+                    "语言服务器 %s 跳过自动重启：工作区 %s 的槽位已回收或已换代",
+                    server_id,
+                    workspace,
+                )
+                return
+            try:
+                self.ensure_server(workspace, language_id)
+            except LspError as exc:
+                logger.warning("语言服务器 %s 自动重启失败：%s", server_id, exc)
 
     # ---------------- 回收 ----------------
 
@@ -720,6 +768,10 @@ class LspManager:
         with self._lock:
             keys = [k for k in self._slots if k[0] == norm]
             slots = [(k, self._slots.pop(k)) for k in keys]
+            # 立墓碑：被回收的世代号记下来。槽位已 pop，任何还在退避中的 `_handle_exit`
+            # 无论按「槽位是否还在」还是按「世代是否相同」复核，都会判定为已回收而放弃重启。
+            for key, slot in slots:
+                self._recycled_generations[key] = slot.get("generation") or 0
         recycled = []
         for (ws, language_id), slot in slots:
             proc = slot["proc"]
