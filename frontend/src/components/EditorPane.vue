@@ -19,6 +19,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import { buildEditorTheme } from '../editor/theme';
 import { createEditorState, EditorView } from '../editor/setup';
+import { changeDocument, lspExtensions, openDocument } from '../editor/lsp';
 import { samePath, useIdeStore } from '../stores/ideStore';
 
 const props = defineProps<{ path: string }>();
@@ -37,7 +38,13 @@ async function mountView() {
   if (!hostRef.value || !props.path) return;
   const current = store.tab(props.path);
   if (!current) return;
-  const state = await createEditorState(current.content, store.languageId(props.path));
+  const languageId = store.languageId(current.path);
+  // LSP 扩展按文件实例化：补全源、诊断 lint 源、视图注册（诊断到达时 forceLinting 要用）
+  const state = await createEditorState(
+    current.content,
+    languageId,
+    lspExtensions({ path: current.path, languageId }),
+  );
   view?.destroy();
   view = new EditorView({
     state,
@@ -46,10 +53,16 @@ async function mountView() {
       buildEditorTheme(isLightTheme()),
       EditorView.updateListener.of((update) => {
         if (!update.docChanged || applyingExternal) return;
-        store.updateContent(props.path, update.state.doc.toString());
+        const text = update.state.doc.toString();
+        store.updateContent(props.path, text);
+        // 文档同步走防抖（CHANGE_DEBOUNCE_MS），不会因为一次击键打一次桥调用
+        changeDocument(current.path, text);
       }),
     ],
   });
+  // 打开/切换标签后把文档登记到语言服务器：拿不到服务器（未配置 / 越权）时
+  // openDocument 内部静默降级为纯文本，不会打断编辑器
+  void openDocument(current.path, languageId, current.content);
 }
 
 onMounted(() => {
@@ -77,6 +90,10 @@ watch(
     applyingExternal = true;
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: next } });
     applyingExternal = false;
+    // 外部改动（磁盘重载 / 「以磁盘为准」）不经过 docChanged 监听，必须单独同步给
+    // 语言服务器：否则服务端文档比编辑器旧，诊断会一直停在旧内容上。
+    const current = store.tab(props.path);
+    if (current) changeDocument(current.path, next);
   },
 );
 

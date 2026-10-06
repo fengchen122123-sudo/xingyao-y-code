@@ -67,10 +67,15 @@ export async function languageExtension(languageId: string): Promise<Extension[]
   }
 }
 
-export async function createEditorState(doc: string, languageId: string): Promise<EditorState> {
+/** extraExtensions 用于注入 LSP 等按文件实例化的扩展（补全、lint、悬停）。 */
+export async function createEditorState(
+  doc: string,
+  languageId: string,
+  extraExtensions: Extension[] = [],
+): Promise<EditorState> {
   return EditorState.create({
     doc,
-    extensions: [...baseExtensions(), ...(await languageExtension(languageId))],
+    extensions: [...baseExtensions(), ...(await languageExtension(languageId)), ...extraExtensions],
   });
 }
 
