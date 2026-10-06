@@ -54,6 +54,33 @@ export function samePath(a: string, b: string): boolean {
   return pathKey(a) === pathKey(b);
 }
 
+// ── 布局快照写回的防抖 ─────────────────────────────────────────────
+// 计划 Task 12 要求「带防抖的持久化动作」：打开 / 切换 / 关闭标签与增删断点都会
+// 触发写回，恢复 N 个标签时逐次落盘约 2N+1 次（activate 与 openFile 各写一次，
+// 每次 toggleBreakpoint 也写一次），频繁切标签同样逐次落盘。这里把写回合并到
+// 静默窗口末尾，末次写出的是**当时**的完整标签列表与真实断点（payload 在 flush
+// 时才从 state 计算），不会落盘半截状态。
+export const LAYOUT_PERSIST_DEBOUNCE_MS = 300;
+
+let layoutPersistTimer: ReturnType<typeof setTimeout> | undefined;
+
+function scheduleLayoutPersist(store: { persistLayout: () => Promise<unknown> }) {
+  if (layoutPersistTimer !== undefined) clearTimeout(layoutPersistTimer);
+  layoutPersistTimer = setTimeout(() => {
+    layoutPersistTimer = undefined;
+    // 快照是尽力而为的恢复数据：落盘失败不阻断编辑，下一次变更会重新调度
+    void store.persistLayout().catch(() => {});
+  }, LAYOUT_PERSIST_DEBOUNCE_MS);
+}
+
+/** 结束防抖窗口并立刻落盘（会话切换前调用，见 setSession 的注释） */
+function flushLayoutPersist(store: { persistLayout: () => Promise<unknown> }) {
+  if (layoutPersistTimer === undefined) return;
+  clearTimeout(layoutPersistTimer);
+  layoutPersistTimer = undefined;
+  void store.persistLayout().catch(() => {});
+}
+
 export const useIdeStore = defineStore('ide', {
   state: () => ({
     session: '',
@@ -90,6 +117,10 @@ export const useIdeStore = defineStore('ide', {
     setSession(session: string) {
       const next = session || '';
       const prev = this.session;
+      // 切会话前先把上一个会话挂起的防抖写回落盘：persistLayout 的 payload 在 flush
+      // 时才从 state 计算，若留到定时器到点，写回的会是新会话（甚至空会话）的列表，
+      // 上一个会话的最新标签就丢了。
+      flushLayoutPersist(this);
       // `''` 桶是「界面挂载前还没拿到会话名」时打开文件的临时归属地。离开它去绑定
       // 真实会话时把桶里已有的标签迁移过去，否则先打开的文件会随 `''` 桶变成孤儿、
       // 在新会话下静默消失（Task 8 评审 Important）。
@@ -149,12 +180,15 @@ export const useIdeStore = defineStore('ide', {
       // 落库统一用 realpath（标签已打开时取标签路径），这样 S3 的断点 gutter
       // 用 `${tab.path}:${line}` 查 `breakpoints` 集合才能命中
       else list.push({ path: this._resolvePath(path), line });
-      void this.persistLayout();
+      scheduleLayoutPersist(this);
     },
 
     /** 写回布局快照（标签 / 活动标签 / 断点），供重开软件后恢复。
      *  实现取自计划 Task 12 的权威片段；此处提前落地以满足 Task 8 冻结契约
-     *  （toggleBreakpoint 已调用本动作，未定义会在运行期抛 TypeError）。 */
+     *  （toggleBreakpoint 已调用本动作，未定义会在运行期抛 TypeError）。
+     *
+     *  本动作是**立即写**语义（显式调用即落盘）；标签 / 断点变更路径走
+     *  `scheduleLayoutPersist`，合并到防抖窗口末尾再调用它。 */
     async persistLayout() {
       const api = ideApi();
       if (!api?.ide_save_layout || !this.session) return;
@@ -207,7 +241,8 @@ export const useIdeStore = defineStore('ide', {
       this.activeBySession[this.session] = this._resolvePath(path);
       this._syncActiveTab();
       // 活动标签变化也要写回快照，否则重开软件后恢复的 active 是陈旧值
-      void this.persistLayout();
+      // （防抖：openFile → activate 后紧跟的补写会合并成一次落盘）
+      scheduleLayoutPersist(this);
     },
 
     languageId(path: string): string {
@@ -266,8 +301,8 @@ export const useIdeStore = defineStore('ide', {
       this.tabs().push(tab);
       this.activate(tab.path);
       await this._syncOpenFiles();
-      // 标签集合有变化：写回布局快照（activate 已写一次，这里补写以覆盖新标签列表）
-      void this.persistLayout();
+      // 标签集合有变化：写回布局快照（activate 已调度一次，防抖会与这次合并）
+      scheduleLayoutPersist(this);
     },
 
     closeTab(path: string) {
@@ -284,7 +319,7 @@ export const useIdeStore = defineStore('ide', {
       this._syncActiveTab();
       void this._syncOpenFiles();
       // 关标签后活动标签可能换人：写回快照，重开软件时不会恢复已关闭的标签
-      void this.persistLayout();
+      scheduleLayoutPersist(this);
     },
 
     updateContent(path: string, content: string) {
