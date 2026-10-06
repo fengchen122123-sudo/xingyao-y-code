@@ -3,7 +3,8 @@
 
 定位优先级（从高到低）：
 1. 用户在设置页手动指定的绝对路径（存 <数据目录>/ide_lsp_servers.json）；
-2. 随安装包分发的内置件（<安装根>/lsp_bin/<名字>[.exe]，打包时登记）；
+2. 随安装包分发的内置件（冻结时优先 <_MEIPASS>/lsp_bin，再回落 exe 同级 lsp_bin；
+   源码运行时为仓库根 lsp_bin，打包时登记）；
 3. 系统 PATH 探测（shutil.which）。
 
 本模块只回答「能不能找到、在哪」，不校验协议版本、不启动进程。
@@ -52,18 +53,39 @@ def _config_path() -> str:
     return os.path.join(_config_dir(), _OVERRIDE_FILE)
 
 
-def _builtin_dir() -> str:
-    """随包分发的语言服务器目录：<安装根>/lsp_bin。
+def _builtin_dirs() -> list[str]:
+    """随包分发的语言服务器候选目录（按优先级从高到低）。
 
-    冻结运行时以可执行文件所在目录为根，源码运行时以 core/ide 的上两级为根，
-    两者都落在「安装根目录/lsp_bin」，与项目其它内置资源的相对位置约定一致。
+    本仓库的随包资源一律走 PyInstaller 的 `_MEIPASS`（onedir 打包下即
+    `_internal/`，见 core/lsp.py 的 ripgrep、core/diagram_export.py 的 mermaid、
+    core/plugin_loader.py、core/skills.py）。`ycode.spec` 是 onedir 且 datas 收在
+    `_internal/`，所以冻结运行时必须优先查 `<_MEIPASS>/lsp_bin`；exe 同级目录
+    只作为历史约定兜底（按 exe 同级查找会让内置服务器永远发现不了、静默回落 PATH）。
+    源码运行时以仓库根（core/ide 的上两级）为根。去重后返回。
     """
+    candidates: list[str] = []
     if getattr(sys, "frozen", False):
-        return os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "lsp_bin")
-    here = os.path.abspath(__file__)
-    return os.path.join(
-        os.path.dirname(os.path.dirname(os.path.dirname(here))), "lsp_bin"
-    )
+        meipass = getattr(sys, "_MEIPASS", None)
+        if meipass:
+            candidates.append(os.path.join(str(meipass), "lsp_bin"))
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        candidates.append(os.path.join(exe_dir, "lsp_bin"))
+    else:
+        here = os.path.abspath(__file__)
+        root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+        candidates.append(os.path.join(root, "lsp_bin"))
+    unique: list[str] = []
+    seen: set[str] = set()
+    for path in candidates:
+        if path not in seen:
+            seen.add(path)
+            unique.append(path)
+    return unique
+
+
+def _builtin_dir() -> str:
+    """首选内置件目录，仅供日志与排查使用（真正查找请用 _builtin_dirs）。"""
+    return _builtin_dirs()[0]
 
 
 def _candidate_names(name: str) -> list[str]:
@@ -140,11 +162,12 @@ def invalidate_cache() -> None:
 
 
 def _find_in_builtin(name: str) -> str | None:
-    directory = _builtin_dir()
-    for candidate in _candidate_names(name):
-        full = os.path.join(directory, candidate)
-        if os.path.isfile(full):
-            return os.path.realpath(full)
+    """按优先级遍历内置件候选目录，先命中先返回。"""
+    for directory in _builtin_dirs():
+        for candidate in _candidate_names(name):
+            full = os.path.join(directory, candidate)
+            if os.path.isfile(full):
+                return os.path.realpath(full)
     return None
 
 

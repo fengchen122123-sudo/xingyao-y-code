@@ -13,7 +13,7 @@ from core.ide import language_registry, server_provision as sp
 def _prepare(tmp_path, monkeypatch):
     """把数据目录与内置件目录都指到临时目录，测试之间互不污染。"""
     monkeypatch.setenv("YCODE_DATA_DIR", str(tmp_path / "data"))
-    monkeypatch.setattr(sp, "_builtin_dir", lambda: str(tmp_path / "bin"))
+    monkeypatch.setattr(sp, "_builtin_dirs", lambda: [str(tmp_path / "bin")])
     sp.invalidate_cache()
 
 
@@ -123,3 +123,47 @@ def test_all_server_status_covers_every_spec(tmp_path, monkeypatch):
     python_row = [r for r in rows if r["server"] == "jedi"][0]
     assert python_row["languages"] == ["python"]
     assert python_row["command"] == "jedi-language-server"
+
+
+def test_frozen_prefers_meipass_then_falls_back_to_exe_dir(tmp_path, monkeypatch):
+    """冻结运行时内置件优先查 _MEIPASS/lsp_bin，其次才是 exe 同级目录。
+
+    ycode.spec 是 onedir 且 datas 收在 _internal/（即 _MEIPASS），若只查 exe 同级
+    会永远找不到内置服务器、静默回落 PATH，所以顺序必须钉死。
+    """
+    monkeypatch.setenv("YCODE_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(sp.shutil, "which", lambda name: None)
+    meipass = tmp_path / "internal"
+    exe_dir = tmp_path / "app"
+    monkeypatch.setattr(sp.sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sp.sys, "_MEIPASS", str(meipass), raising=False)
+    monkeypatch.setattr(sp.sys, "executable", str(exe_dir / "ycode.exe"), raising=False)
+    sp.invalidate_cache()
+
+    # 1) MEIPASS 那份还不存在：只能回落到 exe 同级
+    _touch(exe_dir / "lsp_bin" / "jedi-language-server")
+    res = sp.resolve_executable("jedi")
+    assert res["source"] == "bundled"
+    assert res["executable"] == os.path.realpath(
+        str(exe_dir / "lsp_bin" / "jedi-language-server")
+    )
+
+    # 2) MEIPASS 那份出现后，即使 exe 同级也有，必须优先命中 MEIPASS
+    _touch(meipass / "lsp_bin" / "jedi-language-server")
+    sp.invalidate_cache()
+    res = sp.resolve_executable("jedi")
+    assert res["source"] == "bundled"
+    assert res["executable"] == os.path.realpath(
+        str(meipass / "lsp_bin" / "jedi-language-server")
+    )
+
+
+def test_cached_result_extra_args_are_not_shared_with_caller(tmp_path, monkeypatch):
+    """缓存命中的返回值与缓存本身不共享 extra_args（原地改不能污染缓存）。"""
+    _prepare(tmp_path, monkeypatch)
+    monkeypatch.setattr(sp.shutil, "which", lambda name: "/usr/bin/" + name)
+    first = sp.resolve_executable("typescript")
+    first["extra_args"].append("--polluted")
+    second = sp.resolve_executable("typescript")
+    assert second["extra_args"] == []
+    assert second["executable"].endswith("typescript-language-server")
