@@ -3,7 +3,8 @@ import { expect, it, vi } from 'vitest';
 
 // EditorState.languageData 是静态 Facet：实例上只能用 facet()/languageDataAt() 读，
 // 计划原文的 `state.languageData.length` 在实例上恒为 undefined（已用最小探针证实）
-import { EditorState } from '@codemirror/state';
+import { EditorState, EditorSelection, type Extension } from '@codemirror/state';
+import { keymap } from '@codemirror/view';
 
 import { createEditorState, LANGUAGE_LOADERS } from './setup';
 import {
@@ -22,9 +23,12 @@ import {
   uriToPath,
 } from './lsp';
 import {
+  lspFormatKeymap,
   lspNavigationExtensions,
+  lspRenameKeymap,
   toHoverText,
   toLocations,
+  toRenameEdits,
   toTextEdits,
 } from './lspNavigation';
 
@@ -313,5 +317,147 @@ it('lspNavigationExtensions 返回悬停、跳转、格式化、重命名四个�
 
 it('uriToPath 对非 file URI 返回空串，避免把远端路径当本地文件打开', () => {
   expect(uriToPath('https://example.com/a.py')).toBe('');
+});
+
+// ---------------------------------------------------------------------------
+// 评审欠账：I-2 documentChanges / M-2 URI 归一 / M-3 未处理拒绝
+// ---------------------------------------------------------------------------
+
+/** 从状态的 keymap facet 取出指定按键的绑定：在 jsdom 下直接驱动真实 keymap。
+ *  keymap facet 的值是「每个 provider 一个数组」的嵌套结构，需要先 flat()。 */
+function keyBindingFor(state: EditorState, key: string) {
+  const binding = state.facet(keymap).flat().find((b) => b.key === key);
+  if (!binding) throw new Error(`没有找到 ${key} 绑定`);
+  return binding;
+}
+
+/** 用真实 EditorState + 记录型假视图触发一次按键，返回被 dispatch 的 spec。 */
+function runKeymapKey(doc: string, ext: Extension, key: string, cursor = 0): unknown[] {
+  const state = EditorState.create({
+    doc,
+    extensions: [ext],
+    selection: EditorSelection.cursor(cursor),
+  });
+  const dispatched: unknown[] = [];
+  const view = {
+    state,
+    dispatch: (spec: unknown) => {
+      dispatched.push(spec);
+    },
+  };
+  keyBindingFor(state, key).run?.(view as never);
+  return dispatched;
+}
+
+function mockLspRequest(result: unknown) {
+  (window as any).pywebview = {
+    api: { lsp_request: vi.fn(async () => ({ ok: true, result })) },
+  };
+}
+
+function flushMicrotasks() {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** 收集本进程内未处理的 promise 拒绝，用于断言「不产生 unhandled rejection」。 */
+function watchUnhandledRejections() {
+  const got: unknown[] = [];
+  const handler = (reason: unknown) => got.push(reason);
+  process.on('unhandledRejection', handler);
+  return { got, stop: () => process.off('unhandledRejection', handler) };
+}
+
+it('toRenameEdits 支持 documentChanges，同时保留 changes 形态（I-2）', () => {
+  const path = 'E:\\p\\a.py';
+  const edits = toRenameEdits(
+    {
+      documentChanges: [
+        {
+          textDocument: { uri: fileUri(path), version: null },
+          edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: 'bar' }],
+        },
+      ],
+    },
+    path,
+  );
+  expect(edits).toHaveLength(1);
+
+  expect(
+    toRenameEdits({ changes: { [fileUri(path)]: [{ range: {}, newText: 'x' }] } }, path),
+  ).toHaveLength(1);
+  expect(toRenameEdits(null, path)).toEqual([]);
+  // documentChanges 里没有当前文件时返回空数组（不误取别人的编辑）
+  expect(
+    toRenameEdits(
+      {
+        documentChanges: [
+          { textDocument: { uri: fileUri('E:\\p\\other.py') }, edits: [{ newText: 'x' }] },
+        ],
+      },
+      path,
+    ),
+  ).toEqual([]);
+});
+
+it('toRenameEdits 按 uriToPath 归一后匹配，盘符大小写不一致也命中（M-2）', () => {
+  const path = 'E:\\p\\a.py';
+  const edits = toRenameEdits({ changes: { 'file:///e:/p/a.py': [{ newText: 'bar' }] } }, path);
+  expect(edits).toHaveLength(1);
+});
+
+it('F2 重命名走 documentChanges：真实 keymap 会 dispatch 出编辑（I-2 回归）', async () => {
+  const path = 'E:\\p\\a.py';
+  mockLspRequest({
+    documentChanges: [
+      {
+        textDocument: { uri: fileUri(path), version: null },
+        edits: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: 'bar' }],
+      },
+    ],
+  });
+  const dispatched = runKeymapKey('foo = 1\n', lspRenameKeymap(path, () => 'bar'), 'F2', 1);
+  await flushMicrotasks();
+  expect(dispatched).toHaveLength(1);
+  expect((dispatched[0] as { changes: unknown[] }).changes).toEqual([{ from: 0, to: 3, insert: 'bar' }]);
+});
+
+it('F2 重命名按归一后的 URI 取当前文件编辑（M-2 回归）', async () => {
+  const path = 'E:\\p\\a.py';
+  mockLspRequest({
+    changes: {
+      'file:///e:/p/a.py': [
+        { range: { start: { line: 0, character: 0 }, end: { line: 0, character: 3 } }, newText: 'bar' },
+      ],
+    },
+  });
+  const dispatched = runKeymapKey('foo = 1\n', lspRenameKeymap(path, () => 'bar'), 'F2', 1);
+  await flushMicrotasks();
+  expect(dispatched).toHaveLength(1);
+});
+
+it('格式化 dispatch 抛错时不留 unhandled rejection（M-3 回归）', async () => {
+  const path = 'E:\\p\\a.py';
+  mockLspRequest([
+    { range: { start: { line: 1, character: 0 }, end: { line: 1, character: 2 } }, newText: 'BB' },
+  ]);
+  const state = EditorState.create({
+    doc: 'a\nbb\n',
+    extensions: [lspFormatKeymap(path)],
+    selection: EditorSelection.cursor(0),
+  });
+  const view = {
+    state,
+    dispatch: () => {
+      throw new Error('畸形编辑：重叠变更');
+    },
+  };
+  const watcher = watchUnhandledRejections();
+  try {
+    keyBindingFor(state, 'Shift-Alt-f').run?.(view as never);
+    await flushMicrotasks();
+  } finally {
+    watcher.stop();
+  }
+  expect(watcher.got).toEqual([]);
 });
 
