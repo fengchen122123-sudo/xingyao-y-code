@@ -743,6 +743,8 @@ navItems: [] as Array<{ id: number; preview: string }>,
     // 按会话保存恢复，A 会话打开的浏览器页签不会出现在 B 会话
     rightPanelTabs: [] as RightPanelTabId[],
     rightPanelActiveTab: '' as RightPanelTabId | '',
+    // IDE 模式：与 rightPanelTabs 同样按会话隔离
+    ideModeBySession: {} as Record<string, boolean>,
     // 右面板画笔截图模式：冻结帧覆盖层挂出中。置位后浏览器页签的
     // shouldShowSurface 门控会让原生 WebView2 表面 hide（冻结帧已含其像素，
     // 原生控件必须让位给画笔覆盖层）；关闭后既有 watch 自动 re-show。
@@ -1528,6 +1530,16 @@ navItems: [] as Array<{ id: number; preview: string }>,
       this.subagentDetailId = taskId;
       this.subagentOpenNonce += 1;
       this.openRightPanelTab('subagent');
+    },
+
+    // ── IDE 模式（对话 / IDE 双模式切换）───────────────────────────
+    // 按会话隔离：A 会话切到 IDE 模式，B 会话仍保持对话模式
+    ideMode(): boolean {
+      return !!this.ideModeBySession[this.currentSessionName];
+    },
+
+    toggleIdeMode() {
+      this.ideModeBySession[this.currentSessionName] = !this.ideMode();
     },
 
     // ── 底部内嵌交互式终端面板 ──────────────────────────────────────
