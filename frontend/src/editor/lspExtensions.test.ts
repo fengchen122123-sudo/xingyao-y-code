@@ -9,6 +9,7 @@ import { createEditorState, LANGUAGE_LOADERS } from './setup';
 import {
   diagnosticsFor,
   dispatchLspEvent,
+  fileUri,
   lineOffsets,
   lspCompletionSource,
   lspExtensions,
@@ -18,7 +19,14 @@ import {
   severityOf,
   toCompletions,
   toDiagnostics,
+  uriToPath,
 } from './lsp';
+import {
+  lspNavigationExtensions,
+  toHoverText,
+  toLocations,
+  toTextEdits,
+} from './lspNavigation';
 
 it('行号与文档偏移互转', () => {
   const text = 'a\nbb\nccc';
@@ -190,5 +198,82 @@ it('补全源在桥调用 reject 时静默返回 null（不产生 unhandled reje
   await expect(source(context)).resolves.toBeNull();
   warn.mockRestore();
   (window as any).pywebview = undefined;
+});
+
+// ---------------------------------------------------------------------------
+// Task 10：悬停 / 跳转定义 / 格式化 / 重命名
+// ---------------------------------------------------------------------------
+
+it('toHoverText 支持字符串、MarkupContent 与数组三种形态', () => {
+  expect(toHoverText({ contents: 'plain' })).toBe('plain');
+  expect(toHoverText({ contents: { kind: 'markdown', value: '**bold**' } })).toBe('**bold**');
+  expect(toHoverText({ contents: ['line1', { value: 'line2' }] })).toBe('line1\n\nline2');
+  expect(toHoverText(null)).toBe('');
+});
+
+it('toLocations 同时支持 Location 与 LocationLink', () => {
+  const plain = toLocations([
+    { uri: fileUri('E:\\p\\a.py'), range: { start: { line: 3, character: 4 } } },
+  ]);
+  expect(plain).toEqual([{ path: 'E:\\p\\a.py', line: 3, character: 4 }]);
+
+  const links = toLocations([
+    {
+      targetUri: fileUri('E:\\p\\b.py'),
+      targetRange: { start: { line: 7, character: 0 } },
+    },
+  ]);
+  expect(links).toEqual([{ path: 'E:\\p\\b.py', line: 7, character: 0 }]);
+
+  expect(toLocations(null)).toEqual([]);
+  expect(toLocations([{ uri: 'http://example.com', range: { start: { line: 0, character: 0 } } }])).toEqual([]);
+});
+
+it('toTextEdits 把 LSP 编辑范围换算成文档偏移', () => {
+  const text = 'a\nbb\n';
+  const offsets = lineOffsets(text);
+  const edits = toTextEdits(
+    [
+      {
+        range: { start: { line: 1, character: 0 }, end: { line: 1, character: 2 } },
+        newText: 'BB',
+      },
+    ],
+    offsets,
+    text.length,
+  );
+  expect(edits).toEqual([{ from: 2, to: 4, insert: 'BB' }]);
+  expect(toTextEdits(undefined as unknown as unknown[], offsets, text.length)).toEqual([]);
+});
+
+it('toTextEdits 丢弃起点在终点之后的畸形 range，避免 CodeMirror 抛错改坏文档', () => {
+  const text = 'a\nbb\n';
+  const offsets = lineOffsets(text);
+  // 语言服务器返回倒置 range（end 在 start 之前）时必须整体丢弃这一条编辑
+  const edits = toTextEdits(
+    [
+      {
+        range: { start: { line: 1, character: 2 }, end: { line: 0, character: 0 } },
+        newText: 'BOOM',
+      },
+    ],
+    offsets,
+    text.length,
+  );
+  expect(edits).toEqual([]);
+});
+
+it('lspNavigationExtensions 返回悬停、跳转、格式化、重命名四个扩展', () => {
+  resetClientState();
+  const exts = lspNavigationExtensions({
+    path: 'E:\\p\\a.py',
+    onJump: () => undefined,
+    requestNewName: () => null,
+  });
+  expect(exts.length).toBe(4);
+});
+
+it('uriToPath 对非 file URI 返回空串，避免把远端路径当本地文件打开', () => {
+  expect(uriToPath('https://example.com/a.py')).toBe('');
 });
 
