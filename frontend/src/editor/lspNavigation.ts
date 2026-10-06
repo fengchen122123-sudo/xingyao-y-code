@@ -10,6 +10,7 @@ import {
   fileUri,
   lineOffsets,
   lspRequest,
+  normKey,
   offsetToPosition,
   positionToOffset,
   uriToPath,
@@ -125,6 +126,48 @@ export function toTextEdits(
   return changes;
 }
 
+/**
+ * URI 是否指向本地 `path`：一律先经 `uriToPath` 归一到本地路径再比（与 `toLocations`
+ * 同一口径）。服务器回传的 URI 在盘符大小写、百分号编码、斜杠方向上可能与本地
+ * `fileUri(path)` 不完全一致，精确串匹配会静默漏掉（评审 M-2）。
+ */
+function sameLocalPath(uri: unknown, path: string): boolean {
+  const cleaned = uriToPath(String(uri ?? ''));
+  return cleaned !== '' && normKey(cleaned) === normKey(path);
+}
+
+/**
+ * 从 `textDocument/rename` 的返回里取出「当前文件」的编辑。
+ *
+ * 两条路都要走（评审 I-2）：
+ * - `documentChanges`：LSP 3.x 的推荐形态（`TextDocumentEdit`）。部分服务器
+ *   （jdtls / rust-analyzer 等）优先回它，此时 `changes` 为空 —— 只读 `changes`
+ *   会让 F2 静默无效果。
+ * - `changes`：按 URI 分组的旧形态。
+ *
+ * 跨文件重命名只取当前文件的那一份；其余文件的编辑不在这里落地（避免静默改写
+ * 未打开的磁盘文件）。
+ */
+export function toRenameEdits(result: unknown, path: string): unknown[] {
+  if (!result || typeof result !== 'object') return [];
+  const row = result as Record<string, any>;
+  if (Array.isArray(row.documentChanges)) {
+    for (const change of row.documentChanges) {
+      if (!change || typeof change !== 'object') continue;
+      const docUri = (change as Record<string, any>).textDocument?.uri;
+      if (!sameLocalPath(docUri, path)) continue;
+      const edits = (change as Record<string, any>).edits;
+      if (Array.isArray(edits)) return edits;
+    }
+  }
+  if (row.changes && typeof row.changes === 'object') {
+    for (const [uri, edits] of Object.entries(row.changes as Record<string, unknown>)) {
+      if (Array.isArray(edits) && sameLocalPath(uri, path)) return edits;
+    }
+  }
+  return [];
+}
+
 export function lspHover(path: string): Extension {
   return hoverTooltip(async (view, pos) => {
     const text = view.state.doc.toString();
@@ -159,7 +202,10 @@ export function lspDefinitionKeymap(
           });
           const locations = toLocations(result);
           if (locations.length) onJump(locations);
-        })();
+        })().catch(() => {
+          /* 导航请求是尽力而为的：异步体内的任何异常（畸形输入 / onJump 回调）
+             都不允许变成 unhandled rejection（评审 M-3）。 */
+        });
         return true;
       },
     },
@@ -179,7 +225,10 @@ export function lspFormatKeymap(path: string): Extension {
           });
           const changes = toTextEdits(result ?? [], lineOffsets(text), text.length);
           if (changes.length) view.dispatch({ changes });
-        })();
+        })().catch(() => {
+          /* CodeMirror 对畸形编辑范围（如重叠变更）会抛错：文档因 dispatch 的原子性
+             保持不变，但绝不留未处理拒绝（评审 M-3）。 */
+        });
         return true;
       },
     },
@@ -202,23 +251,21 @@ export function lspRenameKeymap(
         const newName = requestNewName(oldName);
         if (!newName) return true;
         void (async () => {
-          const edit = await lspRequest<{ changes?: Record<string, unknown[]> }>(
-            path,
-            'textDocument/rename',
-            {
-              textDocument: { uri: fileUri(path) },
-              position: offsetToPosition(offsets, word.from),
-              newName,
-            },
-          );
-          const changes = edit?.changes ?? {};
-          const currentUri = fileUri(path);
-          const rawEdits = (changes[currentUri] ?? []) as unknown[];
+          const edit = await lspRequest<unknown>(path, 'textDocument/rename', {
+            textDocument: { uri: fileUri(path) },
+            position: offsetToPosition(offsets, word.from),
+            newName,
+          });
+          // 同时支持 documentChanges（LSP 3.x）与 changes（旧形态），URI 经归一后比对
+          const rawEdits = toRenameEdits(edit, path);
           const mapped = toTextEdits(rawEdits, offsets, text.length);
           if (mapped.length) view.dispatch({ changes: mapped });
           // 跨文件重命名只改当前文件；其余文件的编辑由用户手动保存后重新触发，
           // 避免在前端静默改写未打开的磁盘文件
-        })();
+        })().catch(() => {
+          /* 畸形的重命名编辑让 dispatch 抛错时，文档因原子性保持不变，
+             但绝不留未处理拒绝（评审 M-3）。 */
+        });
         return true;
       },
     },
