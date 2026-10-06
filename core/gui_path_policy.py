@@ -13,6 +13,8 @@ core.harness.tool_adapters）"沙盒开启即放行工作区外"的语义不一�
 3. 路径在会话工作区内：放行。
 4. 工作区外：跟随沙盒开关 allow_outside_workspace（/sandbox on 或 GUI
    "沙盒: 解除"时放行，与 Agent read_file 行为一致）。
+5. action="edit"（IDE 编辑器保存）：规则与 preview 完全一致，仅拒绝文案
+   的动词不同；工作区外保存是否放行同样跟随沙盒开关。
 
 本模块只依赖标准库与 config，不引入 PIL / webview / gui_bridge 等重组件，
 便于独立测试（gui_bridge 模块顶层 import PIL，缺依赖环境下无法导入）。
@@ -25,6 +27,9 @@ from config import YCODE_DIR as CONFIG_YCODE_DIR
 # 与 core.harness.tool_adapters 的凭据口径一致：数据目录顶层的配置文件
 # （含 .bak 备份）含 API Key / MCP server 配置，GUI 预览/打开一律拒绝
 _CREDENTIAL_BASENAMES = {"config.json", "config.json.bak", "mcp.json", "mcp.json.bak"}
+
+# 动作到文案动词的映射：edit 与 preview 共用同一套放行规则，只有措辞不同
+_ACTION_NOUN = {"preview": "预览", "open": "打开", "edit": "编辑"}
 
 # 数据目录注入口：测试可通过设置该变量指向临时目录，避免触碰用户真实 ~/.ycode
 _ycode_dir_override: str = ""
@@ -89,7 +94,7 @@ def gui_path_access_allowed(real_path: str, workspace: str, *, action: str = "pr
     返回:
         (是否放行, 拒绝原因)；放行时第二项为空字符串。
     """
-    noun = "打开" if action == "open" else "预览"
+    noun = _ACTION_NOUN.get(action, _ACTION_NOUN["preview"])
     # 1) 凭据文件永远拒绝（安全边界，不受沙盒开关影响）
     if is_credential_config_path(real_path):
         return False, f"安全策略禁止{noun}应用配置文件（含 API Key 等凭据）"
