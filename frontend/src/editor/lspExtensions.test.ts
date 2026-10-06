@@ -263,6 +263,44 @@ it('toTextEdits 丢弃起点在终点之后的畸形 range，避免 CodeMirror �
   expect(edits).toEqual([]);
 });
 
+it('toTextEdits 丢弃缺 range 的编辑，绝不在文档开头插入 newText', () => {
+  const text = 'a\nbb\n';
+  const offsets = lineOffsets(text);
+  // 畸形编辑：没有 range（LSP 规范里 TextEdit.range 必填）。
+  // 用 `?? 0` 兜底会退化成 (0,0) 的零宽插入，能过 from <= to 检查，
+  // 于是变成「在文档开头插入 BOOM」——真的改坏文档，必须整体丢弃。
+  expect(
+    toTextEdits([{ newText: 'BOOM' }] as unknown[], offsets, text.length),
+  ).toEqual([]);
+  // range 结构不合法（起止点不是位置对象 / 不是整数）同样丢弃
+  expect(
+    toTextEdits(
+      [
+        { range: { start: { line: '0', character: 0 }, end: { line: 1, character: 0 } }, newText: 'BOOM' },
+        { range: { end: { line: 1, character: 0 } }, newText: 'BOOM' },
+        { range: { start: { line: 0, character: 0 } }, newText: 'BOOM' },
+        { range: { start: { line: 0, character: -1 }, end: { line: 1, character: 0 } }, newText: 'BOOM' },
+      ] as unknown[],
+      offsets,
+      text.length,
+    ),
+  ).toEqual([]);
+  // 混在一起时只丢畸形的那几条，合法编辑照常生效
+  expect(
+    toTextEdits(
+      [
+        { newText: 'BOOM' },
+        {
+          range: { start: { line: 1, character: 0 }, end: { line: 1, character: 2 } },
+          newText: 'BB',
+        },
+      ] as unknown[],
+      offsets,
+      text.length,
+    ),
+  ).toEqual([{ from: 2, to: 4, insert: 'BB' }]);
+});
+
 it('lspNavigationExtensions 返回悬停、跳转、格式化、重命名四个扩展', () => {
   resetClientState();
   const exts = lspNavigationExtensions({
