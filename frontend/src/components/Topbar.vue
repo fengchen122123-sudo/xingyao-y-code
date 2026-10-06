@@ -47,6 +47,17 @@
     <button class="icon-btn no-drag" id="btn-terminal" title="切换终端" data-test="btn-terminal" @click="store.toggleTerminalPanel()">
       <AppIcon name="square-terminal" :size="16" />
     </button>
+    <!-- 对话 / IDE 双模式切换：按会话隔离，不重建会话、不打断进行中的回合 -->
+    <button
+      type="button"
+      class="icon-btn no-drag"
+      id="btn-ide-mode"
+      data-test="btn-ide-mode"
+      :title="store.ideMode() ? '切换到对话模式' : '切换到 IDE 模式'"
+      @click="store.toggleIdeMode()"
+    >
+      {{ store.ideMode() ? '对话' : 'IDE' }}
+    </button>
     <button class="icon-btn no-drag" id="btn-theme" title="切换主题" @click="store.toggleTheme()">
       <AppIcon :name="store.themeLight ? 'sun' : 'moon'" :size="16" />
     </button>

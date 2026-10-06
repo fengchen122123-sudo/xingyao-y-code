@@ -58,7 +58,12 @@
         @dblclick="resetSidebarWidth"
       ></div>
 
-      <!-- 中间主对话与聊天区域 -->
+      <!-- IDE 模式：中部整块换成 IDE 布局（活动栏 / 文件树 / 编辑器 / 底部面板 / 对话区宿主） -->
+      <IdeLayout v-if="store.ideMode()" />
+
+      <!-- 中间主对话与聊天区域：对话模式就地渲染；IDE 模式经 Teleport 搬进 IdeLayout 的
+           #ide-chat-host —— 对话区只有一份 DOM，不复制标记、切换模式也不重建实例 -->
+      <Teleport to="#ide-chat-host" :disabled="!store.ideMode()">
       <div id="center">
         <div id="chat-header" data-theme-region="conversation_toolbar">
           <span class="crumb">会话 / <b>{{ store.currentSessionDisplayName }}</b></span>
@@ -189,9 +194,12 @@
         <InputArea v-if="store.messages && store.messages.length > 0" />
 
         <!-- 底部内嵌交互式终端（ZCode 式弹出）：v-show 保持挂载，
-             收起期间输出持续累积到 xterm 缓冲不丢失 -->
-        <TerminalPane v-show="store.terminalPanelOpen" />
+             收起期间输出持续累积到 xterm 缓冲不丢失。
+             IDE 模式下终端由 IdeLayout 的 BottomPanel 独占——这里必须 v-if 退场，
+             否则会同时存在两个 xterm 实例、两个 PTY 会话 -->
+        <TerminalPane v-if="!store.ideMode()" v-show="store.terminalPanelOpen" />
       </div>
+      </Teleport>
 
       <!-- 右面板宽度拖拽手柄：压分界线的隐形热区，双击恢复默认宽度 -->
       <div
@@ -331,6 +339,7 @@ import TurnGroup from './components/TurnGroup.vue';
 import InputArea from './components/InputArea.vue';
 import RightPanel from './components/RightPanel.vue';
 import TerminalPane from './components/TerminalPane.vue';
+import IdeLayout from './components/IdeLayout.vue';
 import ComputerControlBar from './components/ComputerControlBar.vue';
 import ConfirmModal from './components/ConfirmModal.vue';
 import UpdateModal from './components/UpdateModal.vue';
@@ -857,6 +866,17 @@ function onPywebviewReady() {
 }
 
 function onGlobalKeydown(e: KeyboardEvent) {
+  // 对话 / IDE 双模式切换：Ctrl+Alt+I。
+  // 快捷键盘点（frontend/src 下 *.vue / *.ts）：应用内全局只绑了 Ctrl+F（会话检索）、
+  // 编辑器内绑了 Ctrl+S；Ctrl+Shift+I 应用内未占用，但它是 Chromium / WebView2 的
+  // DevTools 加速键、会被宿主抢先消费，故改用 Ctrl+Alt+I。
+  // 绑定放在这里而不是 IdeLayout：IdeLayout 只在 IDE 模式下存在，挂在它上面只能退出、
+  // 无法从对话模式进入 IDE；窗口级监听本就在 App 统一注册。
+  if (!e.repeat && (e.ctrlKey || e.metaKey) && e.altKey && !e.shiftKey && e.key.toLowerCase() === 'i') {
+    e.preventDefault();
+    store.toggleIdeMode();
+    return;
+  }
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'f') {
     // 拦截全局 Ctrl+F / Cmd+F 呼出会话多维检索面板
     e.preventDefault();
