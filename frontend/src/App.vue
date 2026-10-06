@@ -90,7 +90,7 @@
 
         <!-- 电脑操控安全条（设计 16.1）：聊天标题栏下方、滚动区外——对话滚动时保持可见；
              仅 run 活动期（starting/running/paused/waiting_for_user/
-             provider_safety_required/stopping/failed）渲染 -->
+             provider_safety_required/stopping/failed）且 run 归属当前会话时渲染 -->
         <ComputerControlBar />
 
         <!-- 对话主体滚动区：.chat-viewport 是不滚动的定位外壳，

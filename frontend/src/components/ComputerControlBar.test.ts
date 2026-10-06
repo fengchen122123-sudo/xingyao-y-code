@@ -1,5 +1,6 @@
 import { createPinia, setActivePinia } from 'pinia';
 import { beforeEach, expect, it, vi } from 'vitest';
+import { nextTick } from 'vue';
 import { mount } from '@vue/test-utils';
 
 import ComputerControlBar from './ComputerControlBar.vue';
@@ -229,4 +230,63 @@ it('pause and stop buttons drive the bridge with the current run id', async () =
   expect(api.stop_computer_control).toHaveBeenCalledWith('run-1');
   expect(store.computerRun.status).toBe('stopped');
   wrapper.unmount();
+});
+
+// ── 安全条的会话归属：其他会话发起的操控不串显到当前会话 ──
+
+// 挂载辅助：指定 run 的归属会话与当前查看的会话
+function mountBarForSession(ownerSession: string, viewingSession: string) {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.currentSessionName = viewingSession;
+  store.computerRun = {
+    ...store.computerRun,
+    run_id: 'run-1',
+    status: 'running',
+    target: 'desktop',
+    owner_session_id: ownerSession,
+  };
+  const wrapper = mount(ComputerControlBar, { global: { plugins: [pinia] } });
+  return { store, wrapper };
+}
+
+it('hides the bar while another session owns the running computer', () => {
+  const { wrapper } = mountBarForSession('A', 'B');
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('shows the bar when the running computer belongs to the current session', () => {
+  const { wrapper } = mountBarForSession('A', 'A');
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+it('keeps the bar when the run owner is unknown (legacy snapshot)', () => {
+  const { wrapper } = mountBarForSession('', 'B');
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(true);
+  wrapper.unmount();
+});
+
+it('hides the bar as soon as the user switches away from the owner session', async () => {
+  const { store, wrapper } = mountBarForSession('A', 'A');
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(true);
+  store.currentSessionName = 'B';
+  await nextTick();
+  expect(wrapper.find('[data-test="computer-control-bar"]').exists()).toBe(false);
+  wrapper.unmount();
+});
+
+it('keeps the global bar getter session-agnostic for the right panel', () => {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const store = useAppStore();
+  store.currentSessionName = 'B';
+  store.computerRun = {
+    ...store.computerRun, run_id: 'run-1', status: 'running', owner_session_id: 'A',
+  };
+  // 全局判据（RightPanel 自动登记操控页签依赖）仍为 true，会话归属只在条自身生效
+  expect(store.computerControlBarVisible).toBe(true);
+  expect(store.computerBarVisibleInCurrentSession).toBe(false);
 });

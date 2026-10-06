@@ -948,9 +948,21 @@ navItems: [] as Array<{ id: number; preview: string }>,
       return state.backgroundTasks.filter(t => t.session_id === sess);
     },
 
-    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示
+    // 顶部安全条可见性（设计 16.1 / brief 逐字状态表）：run 活动期才显示。
+    // 注意：这是全局判据（RightPanel 自动登记操控页签也用它），不区分会话
     computerControlBarVisible(state): boolean {
       return COMPUTER_BAR_STATUSES.includes(state.computerRun.status);
+    },
+
+    // 顶部安全条的会话归属（对齐 currentSessionBackgroundTasks 的既有约定）：
+    // 只在本会话发起的 run 里渲染，run 在 A 会话启动、用户正看 B 会话时不串显；
+    // 归属未知（owner_session_id 为空，如旧后端快照）时回落显示，
+    // 避免用户失去条上的暂停/停止入口
+    computerBarVisibleInCurrentSession(state): boolean {
+      if (!COMPUTER_BAR_STATUSES.includes(state.computerRun.status)) return false;
+      const owner = state.computerRun.owner_session_id;
+      if (!owner) return true;
+      return owner === state.currentSessionName;
     },
 
     // run 是否处于终态：驱动页签关闭入口与终态自动关闭计时
