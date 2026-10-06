@@ -81,9 +81,29 @@ vi.mock('../editor/setup', async () => {
   };
 });
 
+// Task 10 导航扩展的接线探针：记录 EditorPane 实际传进去的选项，既能断言「导航扩展
+// 真的挂进了编辑器状态」，也能直接驱动 onJump / requestNewName 验证回调接线（
+// jsdom 下无法真的按 F12/F2 键去戳 CodeMirror 的 keymap）。
+const navCalls = vi.hoisted(() => [] as Array<{
+  path: string;
+  onJump: (locations: { path: string; line: number; character: number }[]) => void;
+  requestNewName: (oldName: string) => string | null;
+}>);
+
+vi.mock('../editor/lspNavigation', async () => {
+  const actual = await vi.importActual<typeof import('../editor/lspNavigation')>('../editor/lspNavigation');
+  return {
+    ...actual,
+    lspNavigationExtensions: (options: (typeof navCalls)[number]) => {
+      navCalls.push(options);
+      return actual.lspNavigationExtensions(options);
+    },
+  };
+});
+
 import EditorPane from './EditorPane.vue';
 import { buildEditorTheme } from '../editor/theme';
-import { EditorView } from '../editor/setup';
+import { createEditorState, EditorView } from '../editor/setup';
 import { useIdeStore } from '../stores/ideStore';
 
 interface FakeView {
@@ -104,6 +124,7 @@ function api() {
 
 beforeEach(() => {
   (EditorView as unknown as { __instances: FakeView[] }).__instances = [];
+  navCalls.length = 0;
   setActivePinia(createPinia());
   (window as any).pywebview = {
     api: {
@@ -256,6 +277,56 @@ it('提示条按钮：以磁盘为准重载、保留我的内容只清标记、�
   await nextTick();
   await wrapper.findAll('button')[3].trigger('click');
   expect(api().ide_write_file).toHaveBeenCalledWith('a.py', 'x = 2\n', '', 'utf-8', false, 'lf');
+  wrapper.unmount();
+});
+
+it('编辑器状态里并列挂上补全/诊断扩展与 4 个导航扩展（悬停/F12/格式化/F2）', async () => {
+  const store = useIdeStore();
+  await store.openFile('a.py');
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  // 导航扩展按当前文件实例化，参数口径与 lspExtensions 一致
+  expect(navCalls).toHaveLength(1);
+  expect(navCalls[0].path).toBe('a.py');
+
+  // createEditorState 的第 3 个参数 = 3 个补全/诊断/视图扩展 + 4 个导航扩展
+  const calls = (createEditorState as unknown as { mock: { calls: unknown[][] } }).mock.calls;
+  expect(calls[calls.length - 1][2]).toHaveLength(7);
+  wrapper.unmount();
+});
+
+it('F12 跳转回调只经 store.jumpTo 写跳转请求，不自己动编辑器选区', async () => {
+  const store = useIdeStore();
+  await store.openFile('a.py');
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  const selectionBefore = lastView().lastSelection;
+  navCalls[0].onJump([{ path: 'b.py', line: 4, character: 2 }]);
+  await flushPromises();
+
+  // 目标文件被打开，跳转请求落到 store（定位由待跳转 watcher 独占负责）
+  expect(store.tab('b.py')).toBeTruthy();
+  expect(store.pendingJump).toEqual({ path: 'b.py', line: 4, character: 2 });
+  expect(lastView().lastSelection).toBe(selectionBefore);
+  wrapper.unmount();
+});
+
+it('F2 重命名的取名回调接到 window.prompt，并把旧名字带进提示', async () => {
+  const store = useIdeStore();
+  await store.openFile('a.py');
+  const wrapper = mount(EditorPane, { props: { path: 'a.py' } });
+  await flushPromises();
+
+  const promptSpy = vi.fn<() => string | null>(() => 'new_name');
+  (window as any).prompt = promptSpy;
+  expect(navCalls[0].requestNewName('old_name')).toBe('new_name');
+  expect(promptSpy).toHaveBeenCalledWith('重命名为', 'old_name');
+
+  // 用户取消（prompt 返回 null）时重命名不生效
+  promptSpy.mockReturnValue(null);
+  expect(navCalls[0].requestNewName('old_name')).toBeNull();
   wrapper.unmount();
 });
 
