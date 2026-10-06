@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import os
 import tempfile
+import threading
 
 # 编辑器单文件上限：超过此体积 CodeMirror 的渲染与语法分析会明显卡顿
 IDE_EDIT_MAX_BYTES = 2 * 1024 * 1024
@@ -181,3 +182,47 @@ def write_text_file(
         data = _BOM_UTF8 + data
     _atomic_write_bytes(real, data)
     return {"ok": True, "hash": _hash_bytes(data)}
+
+
+class OpenFileWatcher:
+    """只轮询当前已打开文件的 (mtime, size)。
+
+    刻意不做全仓扫描：IDE 打开的文件通常个位数，按 1 秒轮询的代价可以忽略，
+    而目录监听（watchdog）需要额外依赖，与项目的依赖红线冲突。
+    """
+
+    def __init__(self, interval: float = 1.0):
+        self._interval = interval
+        self._files: dict[str, tuple[float, int]] = {}
+        self._lock = threading.Lock()
+
+    @property
+    def interval(self) -> float:
+        return self._interval
+
+    def _stamp(self, real: str) -> tuple[float, int]:
+        try:
+            st = os.stat(real)
+            return (st.st_mtime, st.st_size)
+        except OSError:
+            return (0.0, -1)
+
+    def set_open_files(self, paths) -> None:
+        """重设监视集合，并以当前磁盘状态建立基线。"""
+        snapshot: dict[str, tuple[float, int]] = {}
+        for p in paths or []:
+            real = os.path.realpath(os.path.abspath(str(p)))
+            snapshot[real] = self._stamp(real)
+        with self._lock:
+            self._files = snapshot
+
+    def poll(self) -> list[str]:
+        """返回自上次 poll 后发生变化的文件（含被删除的文件，标记为 size=-1）。"""
+        changed: list[str] = []
+        with self._lock:
+            for real in list(self._files.keys()):
+                current = self._stamp(real)
+                if current != self._files[real]:
+                    self._files[real] = current
+                    changed.append(real)
+        return changed

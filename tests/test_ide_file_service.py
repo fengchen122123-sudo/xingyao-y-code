@@ -309,3 +309,56 @@ def test_write_failure_cleans_temp_and_keeps_original(tmp_path, monkeypatch):
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".ycode-ide-")]
     assert leftovers == []
     assert f.read_bytes() == b"x = 1\n"
+
+
+# ---------------------------------------------------------------------------
+# 外部改动轮询：只盯已打开文件，用显式 utime 保证结果确定
+# ---------------------------------------------------------------------------
+from core.ide.file_service import OpenFileWatcher
+
+
+def test_watcher_reports_modified_file_once(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    base = os.stat(str(f)).st_mtime
+    watcher = OpenFileWatcher()
+    watcher.set_open_files([str(f)])
+
+    os.utime(str(f), (base + 10, base + 10))
+    assert watcher.poll() == [str(f)]
+    # 第二次轮询不应重复上报同一个变更
+    assert watcher.poll() == []
+
+
+def test_watcher_reports_deleted_file_once(tmp_path):
+    f = tmp_path / "gone.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    watcher = OpenFileWatcher()
+    watcher.set_open_files([str(f)])
+    os.unlink(str(f))
+    assert watcher.poll() == [str(f)]
+    assert watcher.poll() == []
+
+
+def test_watcher_ignores_unopened_files(tmp_path):
+    opened = tmp_path / "open.py"
+    opened.write_text("x = 1\n", encoding="utf-8")
+    other = tmp_path / "other.py"
+    other.write_text("y = 1\n", encoding="utf-8")
+    base = os.stat(str(other)).st_mtime
+    watcher = OpenFileWatcher()
+    watcher.set_open_files([str(opened)])
+
+    os.utime(str(other), (base + 10, base + 10))
+    assert watcher.poll() == []
+
+
+def test_watcher_set_open_files_resets_baseline(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_text("x = 1\n", encoding="utf-8")
+    watcher = OpenFileWatcher()
+    base = os.stat(str(f)).st_mtime
+    os.utime(str(f), (base + 10, base + 10))
+    # 重新登记时才建立基线，不会把登记前的改动当作变更上报
+    watcher.set_open_files([str(f)])
+    assert watcher.poll() == []
