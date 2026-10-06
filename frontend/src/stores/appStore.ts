@@ -1,6 +1,9 @@
 import { defineStore } from 'pinia';
 // Git 工作台事件转发（git_state_changed）；gitStore 不反向依赖 appStore，无环
 import { useGitStore } from './gitStore';
+// IDE 已打开文件的外部改动事件转发（ide_file_changed）；
+// ideStore 只依赖 editor/setup 与类型声明，不反向依赖 appStore，无环
+import { useIdeStore } from './ideStore';
 import type {
   AutomationRunInfo,
   AutomationTaskInfo,
@@ -4519,6 +4522,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       } else if (type === 'pty_data') {
         // 底部内嵌交互式终端：原始输出直接走 ptyBus 给 xterm，不进响应式状态
         emitPtyData(String(data.text ?? ''));
+      } else if (type === 'ide_file_changed') {
+        // IDE 已打开文件被外部改动（后端 Task 7 轮询发现）：交给 ideStore 决定
+        // 是自动重载（本地干净）还是只打脏标记（本地有未保存内容）
+        void useIdeStore().handleExternalChange(String(data.path ?? ''));
       } else if (type === 'pty_exit') {
         emitPtyExit(Number(data.code ?? 0));
       } else if (type === 'update_download_progress') {

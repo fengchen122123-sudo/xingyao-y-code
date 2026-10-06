@@ -27,9 +27,23 @@ import { ref, computed } from 'vue';
 import AppIcon from './AppIcon.vue';
 import type { FileNode } from '../types/pywebview';
 import { useAppStore } from '../stores/appStore';
+import { useIdeStore } from '../stores/ideStore';
 import { extIcon } from '../utils/fileIcon';
 import { canOpenInRightPanel } from '../utils/localPath';
 import { useIsMobile } from '../composables/useViewport';
+
+// 可在编辑器里打开的文本/代码扩展名（与 frontend/src/editor/setup.ts 的扩展名表同一口径）
+const EDITABLE_EXT = new Set([
+  'py', 'js', 'mjs', 'cjs', 'jsx', 'ts', 'tsx', 'json', 'md', 'html', 'htm',
+  'css', 'txt', 'log', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'sql', 'sh',
+  'bat', 'ps1', 'go', 'rs', 'java', 'c', 'h', 'cpp', 'hpp', 'cs', 'php', 'rb',
+]);
+
+function isEditableText(name: string): boolean {
+  const dot = name.lastIndexOf('.');
+  if (dot < 0) return false;
+  return EDITABLE_EXT.has(name.slice(dot + 1).toLowerCase());
+}
 
 const props = defineProps<{
   node: FileNode;
@@ -53,6 +67,12 @@ const icon = computed(() => (props.node.d ? '' : extIcon(props.node.n)));
 
 async function toggle() {
   if (!props.node.d) {
+    // IDE 模式下，代码与文本文件直接在编辑器打开；图片等非文本仍走既有预览分流。
+    // 必须插在下方既有分流之前，且只接管可编辑文本类型，保证对话模式零回归。
+    if (store.ideMode() && isEditableText(props.node.n)) {
+      void useIdeStore().openFile(fullPath.value);
+      return;
+    }
     // html / pdf / md 交给右栏（网页直接渲染，md 先渲染成预览页）；
     // 移动端没有右面板，一律回退源码预览弹窗
     if (canOpenInRightPanel(fullPath.value) && !isMobile.value) {
