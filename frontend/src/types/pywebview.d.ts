@@ -1335,6 +1335,39 @@ export interface PyWebViewAPI {
   ide_set_open_files(paths: string[]): Promise<{ ok: boolean; count: number }>;
   ide_get_layout(session: string): Promise<{ ok: boolean; layout: IdeLayoutSnapshot | null }>;
   ide_save_layout(session: string, layout: IdeLayoutSnapshot): Promise<{ ok: boolean; layout: IdeLayoutSnapshot }>;
+
+  // ---- IDE 模式 S2：语言服务 ----
+  lsp_request(
+    path: string,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<{ ok: boolean; result?: unknown; error?: { code: number; message: string }; msg?: string }>;
+  lsp_notify(
+    path: string,
+    method: string,
+    params: Record<string, unknown>,
+  ): Promise<{ ok: boolean; error?: { code: number; message: string }; msg?: string }>;
+  lsp_server_status(workspace?: string): Promise<{
+    ok: boolean;
+    workspace: string;
+    servers: {
+      server: string;
+      language: string;
+      state: 'missing' | 'stopped' | 'starting' | 'running' | 'restarting' | 'failed';
+      executable: string;
+      source: 'override' | 'bundled' | 'path' | 'missing';
+      pid?: number | null;
+      msg?: string;
+    }[];
+    msg?: string;
+  }>;
+  lsp_set_server_path(serverId: string, path: string): Promise<{ ok: boolean; msg?: string }>;
+  lsp_sync_workspace(): Promise<{
+    ok: boolean;
+    workspace: string;
+    recycled: string[];
+    msg?: string;
+  }>;
 }
 
 // ---------------------------------------------------------------------------
