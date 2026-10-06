@@ -206,6 +206,8 @@ export const useIdeStore = defineStore('ide', {
       // 活动路径统一记标签的 realpath：activeBySession 与标签路径两处状态不漂移
       this.activeBySession[this.session] = this._resolvePath(path);
       this._syncActiveTab();
+      // 活动标签变化也要写回快照，否则重开软件后恢复的 active 是陈旧值
+      void this.persistLayout();
     },
 
     languageId(path: string): string {
@@ -264,6 +266,8 @@ export const useIdeStore = defineStore('ide', {
       this.tabs().push(tab);
       this.activate(tab.path);
       await this._syncOpenFiles();
+      // 标签集合有变化：写回布局快照（activate 已写一次，这里补写以覆盖新标签列表）
+      void this.persistLayout();
     },
 
     closeTab(path: string) {
@@ -279,6 +283,8 @@ export const useIdeStore = defineStore('ide', {
       }
       this._syncActiveTab();
       void this._syncOpenFiles();
+      // 关标签后活动标签可能换人：写回快照，重开软件时不会恢复已关闭的标签
+      void this.persistLayout();
     },
 
     updateContent(path: string, content: string) {
