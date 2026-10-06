@@ -201,3 +201,111 @@ def test_write_is_atomic_no_temp_left(tmp_path):
     )
     leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".ycode-ide-")]
     assert leftovers == []
+
+
+# ---------------------------------------------------------------------------
+# 保存返回的 hash 必须自洽：能直接作为下一次保存的 expected_hash
+#
+# 前端的用法是「保存成功后用返回的 hash 更新标签状态」，若返回的 hash 与磁盘
+# 现状不一致，第二次保存会立刻误报「文件已被外部修改」。这里覆盖纯 LF、CRLF、
+# 带 BOM 三种落盘形态；夹具一律用 write_bytes 以避免 Windows 换行翻译。
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "raw,eol,bom",
+    [
+        (b"x = 1\n", "lf", False),
+        (b"a = 1\r\nb = 2\r\n", "crlf", False),
+        (b"\xef\xbb\xbfx = 1\n", "lf", True),
+    ],
+    ids=["lf", "crlf", "bom"],
+)
+def test_write_returned_hash_round_trips(tmp_path, raw, eol, bom):
+    f = tmp_path / "rt.py"
+    f.write_bytes(raw)
+    info = read_text_file(str(f))
+    assert info["eol"] == eol
+    assert info["bom"] is bom
+
+    first = write_text_file(
+        str(f), "x = 1\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    assert first["ok"] is True
+    # 返回值必须等于磁盘现状的 hash（含 BOM 的原始字节口径）
+    assert read_text_file(str(f))["hash"] == first["hash"]
+
+    # 闭环：用返回的 hash 再保存一次，必须成功且不报冲突
+    second = write_text_file(
+        str(f), "x = 2\n", first["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    assert second["ok"] is True
+    assert "conflict" not in second
+    assert second["hash"] == read_text_file(str(f))["hash"]
+
+
+# ---------------------------------------------------------------------------
+# 编码失败与写入失败：必须「磁盘内容一字不变且不留临时文件」
+# ---------------------------------------------------------------------------
+def test_write_gbk_unrepresentable_raises_and_keeps_disk(tmp_path):
+    f = tmp_path / "gbk.txt"
+    original = "中文\n".encode("gbk")
+    f.write_bytes(original)
+    info = read_text_file(str(f))
+
+    # 「🚀」（U+1F680）在 GBK 里没有对应码位
+    with pytest.raises(FileServiceError) as exc:
+        write_text_file(
+            str(f), "中文🚀\n", info["hash"],
+            encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+        )
+    assert "gbk" in str(exc.value).lower()
+
+    # 编码失败发生在落盘之前：磁盘一字不变，也不留下临时文件
+    assert f.read_bytes() == original
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".ycode-ide-")]
+    assert leftovers == []
+
+
+def test_write_expected_hash_on_deleted_file_is_conflict(tmp_path):
+    """目标文件已不存在时，带 expected_hash 的保存必须走冲突分支。
+
+    若把「读不到文件」当成「无冲突」直接覆盖，用户会静默地重新创建一个已被
+    删除（或被改名）的文件，这是数据事故。
+    """
+    f = tmp_path / "gone.py"
+    f.write_bytes(b"x = 1\n")
+    info = read_text_file(str(f))
+    os.unlink(str(f))
+
+    res = write_text_file(
+        str(f), "x = 2\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    assert res["ok"] is False
+    # 哨兵语义：disk_hash 为空串表示目标文件已不存在
+    assert res["conflict"]["disk_hash"] == ""
+    assert "磁盘" in res["msg"]
+    # 绝不能把文件重新创建出来
+    assert not f.exists()
+
+
+def test_write_failure_cleans_temp_and_keeps_original(tmp_path, monkeypatch):
+    """os.replace 失败时不得残留 .ycode-ide-* 临时文件，也不得破坏原文件。"""
+    f = tmp_path / "a.py"
+    f.write_bytes(b"x = 1\n")
+    info = read_text_file(str(f))
+
+    def boom(src, dst):
+        raise OSError("simulated replace failure")
+
+    monkeypatch.setattr(os, "replace", boom)
+    with pytest.raises(OSError):
+        write_text_file(
+            str(f), "x = 2\n", info["hash"],
+            encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+        )
+
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".ycode-ide-")]
+    assert leftovers == []
+    assert f.read_bytes() == b"x = 1\n"
