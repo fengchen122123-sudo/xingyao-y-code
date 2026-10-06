@@ -28,7 +28,13 @@ const DIAG = {
 function installBridge(overrides: Record<string, unknown> = {}) {
   const api = {
     lsp_request: vi.fn(async () => ({ ok: true, result: { items: [{ label: 'x' }] } })),
-    lsp_notify: vi.fn(async () => ({ ok: true })),
+    // 显式标注返回类型：失败分支的用例会传 error 字段（与 pywebview.d.ts 的 lsp_notify
+    // 声明一致），否则 vi.fn 推断出的 { ok: boolean } 会让 mockResolvedValue 报 TS2353
+    lsp_notify: vi.fn(
+      async (): Promise<{ ok: boolean; error?: { code: number; message: string }; msg?: string }> => ({
+        ok: true,
+      }),
+    ),
     lsp_server_status: vi.fn(async () => ({ ok: true, workspace: 'E:\\ws', servers: [] })),
     lsp_set_server_path: vi.fn(async () => ({ ok: true })),
     lsp_sync_workspace: vi.fn(async () => ({ ok: true, workspace: 'E:\\ws', recycled: [] })),

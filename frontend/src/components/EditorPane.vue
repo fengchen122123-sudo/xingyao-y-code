@@ -20,6 +20,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { buildEditorTheme } from '../editor/theme';
 import { createEditorState, EditorView } from '../editor/setup';
 import { changeDocument, lspExtensions, openDocument } from '../editor/lsp';
+import { lspNavigationExtensions } from '../editor/lspNavigation';
 import { samePath, useIdeStore } from '../stores/ideStore';
 
 const props = defineProps<{ path: string }>();
@@ -40,10 +41,26 @@ async function mountView() {
   if (!current) return;
   const languageId = store.languageId(current.path);
   // LSP 扩展按文件实例化：补全源、诊断 lint 源、视图注册（诊断到达时 forceLinting 要用）
+  // + 导航类（悬停 / F12 跳转定义 / Shift-Alt-f 格式化 / F2 重命名）。
+  // 跳转只写 store.jumpTo：编辑器视图的定位由下方 pendingJump watcher 独占负责，
+  // 这里绝不自己 dispatch selection（S1 冻结契约：定位菜谱只有跳转请求的消费者那份）。
   const state = await createEditorState(
     current.content,
     languageId,
-    lspExtensions({ path: current.path, languageId }),
+    [
+      ...lspExtensions({ path: current.path, languageId }),
+      ...lspNavigationExtensions({
+        path: current.path,
+        onJump: (locations) => {
+          const first = locations[0];
+          if (!first) return;
+          void store.openFile(first.path).then(() => {
+            store.jumpTo(first.path, first.line, first.character);
+          });
+        },
+        requestNewName: (oldName) => window.prompt('重命名为', oldName),
+      }),
+    ],
   );
   view?.destroy();
   view = new EditorView({
