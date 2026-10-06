@@ -1,7 +1,20 @@
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
-import { pathKey, samePath, useIdeStore } from './ideStore';
+import { LAYOUT_PERSIST_DEBOUNCE_MS, pathKey, samePath, useIdeStore } from './ideStore';
+
+/** 走完布局写回的防抖窗口：调度中的快照落盘（末次内容由当时的 state 计算） */
+async function flushLayoutDebounce() {
+  vi.advanceTimersByTime(LAYOUT_PERSIST_DEBOUNCE_MS);
+  await Promise.resolve();
+  await Promise.resolve();
+}
+
+// 防抖用例自带假定时器（见 getPersistLayout 用例组）；万一用例中途失败也要还原，
+// 否则后续用例会被挂起的假时钟拖住
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 function installBridge(overrides: Record<string, unknown> = {}) {
   const api = {
@@ -251,6 +264,7 @@ it('pathKey/samePath 只统一分隔符：不折叠大小写、不折叠 ..（�
 // ---- B：toggleBreakpoint / persistLayout 的行为覆盖 ----
 
 it('toggleBreakpoint 同一 path+line 再调一次删除断点，breakpoints 用 `${path}:${line}` 键', async () => {
+  vi.useFakeTimers();
   const api = installBridge();
   const store = useIdeStore();
   store.setSession('s1');
@@ -266,8 +280,8 @@ it('toggleBreakpoint 同一 path+line 再调一次删除断点，breakpoints 用
   store.toggleBreakpoint('a.py', 3);
   expect(store.breakpointsFor('a.py')).toEqual([7]);
   expect(store.breakpoints.has('a.py:3')).toBe(false);
-  // 每次增删都会把布局（含断点）写回后端
-  await Promise.resolve();
+  // 增删断点都会把布局（含断点）写回后端：防抖窗口结束后落盘，末次是删除后的真实断点
+  await flushLayoutDebounce();
   expect(api.ide_save_layout).toHaveBeenCalled();
   const lastCall = api.ide_save_layout.mock.calls.at(-1) as unknown[] | undefined;
   const layout = lastCall?.[1] as { breakpoints: unknown } | undefined;
@@ -341,6 +355,7 @@ it('persistLayout 无会话或无桥时安全返回，不抛异常', async () =>
 });
 
 it('打开与关闭标签都会写回布局快照（active 与真实断点，不是空数组）', async () => {
+  vi.useFakeTimers();
   const api = installBridge({
     ide_save_layout: vi.fn(async (_s: string, l: any) => ({ ok: true, layout: l })),
   });
@@ -350,13 +365,14 @@ it('打开与关闭标签都会写回布局快照（active 与真实断点，不
   store.toggleBreakpoint('a.py', 3);
 
   await store.openFile('a.py');
+  await flushLayoutDebounce(); // 防抖窗口结束才落盘（内容仍是完整快照）
   expect(api.ide_save_layout).toHaveBeenCalledWith(
     's1',
     expect.objectContaining({ active: 'a.py', breakpoints: [{ path: 'a.py', line: 3 }] }),
   );
 
   store.closeTab('a.py');
-  await Promise.resolve();
+  await flushLayoutDebounce();
   expect(api.ide_save_layout).toHaveBeenLastCalledWith(
     's1',
     expect.objectContaining({ active: '', breakpoints: [{ path: 'a.py', line: 3 }] }),
@@ -392,4 +408,134 @@ it("未设会话时打开的文件在 setSession 后迁移进新会话，不凭�
   expect(store.tabs()).toEqual([]);
   store.setSession('s1');
   expect(store.tabs().map((t) => t.path)).toEqual(['a.py']);
+});
+
+// ---- D：误合并方向的负例（判重的反方向：两个 realpath 就必须是两个标签）----
+
+it('两种拼写被后端回成两个不同 realpath：必须保留两个标签，不得词法折叠误合并', async () => {
+  // 上面的用例锁的是「同一文件两种写法 → 1 个标签」；这里锁反方向：
+  // E:\p1\sub\..\a.py 的中间段若是 junction / 符号链接，它与 E:\p1\a.py 不是同一个文件。
+  // 若判重时偷懒做 `..` 词法折叠，就会把两个不同文件误合并成一个标签 → 打开第二个文件
+  // 不进标签、保存又写回第一个文件的路径（静默改错文件）。全程 mock 桥，不触碰文件系统。
+  const api = installBridge({
+    ide_read_file: vi.fn(async (path: string) => ({
+      ok: true,
+      // 后端 realpath 权威作答：第一个写法落在 E:\p2\a.py，第二个就是 E:\p1\a.py
+      path: path.includes('..') ? 'E:\\p2\\a.py' : 'E:\\p1\\a.py',
+      content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
+    })),
+  });
+  const store = useIdeStore();
+  await store.openFile('E:\\p1\\sub\\..\\a.py');
+  await store.openFile('E:\\p1\\a.py');
+
+  expect(store.tabs().map((t) => t.path)).toEqual(['E:\\p2\\a.py', 'E:\\p1\\a.py']);
+  expect(store.activePath()).toBe('E:\\p1\\a.py');
+
+  // 两个标签各自独立：按原路径查表 / 置脏 / 保存都不串到另一个标签
+  store.updateContent('E:\\p1\\sub\\..\\a.py', 'z = 3\n');
+  expect(store.tab('E:\\p2\\a.py')?.dirty).toBe(true);
+  expect(store.tab('E:\\p1\\a.py')?.dirty).toBe(false);
+
+  await store.saveTab('E:\\p1\\sub\\..\\a.py');
+  expect(api.ide_write_file).toHaveBeenCalledTimes(1);
+  expect(api.ide_write_file).toHaveBeenCalledWith('E:\\p2\\a.py', 'z = 3\n', 'h1', 'utf-8', false, 'lf');
+  expect(store.tab('E:\\p1\\a.py')?.dirty).toBe(false);
+});
+
+it('closeTab 只关掉调用方路径命中的那一个标签，不误关同名的另一个 realpath', async () => {
+  installBridge({
+    ide_read_file: vi.fn(async (path: string) => ({
+      ok: true,
+      path: path.includes('..') ? 'E:\\p2\\a.py' : 'E:\\p1\\a.py',
+      content: 'x = 1\n', encoding: 'utf-8', bom: false, eol: 'lf', hash: 'h1',
+    })),
+  });
+  const store = useIdeStore();
+  await store.openFile('E:\\p1\\sub\\..\\a.py');
+  await store.openFile('E:\\p1\\a.py');
+
+  store.closeTab('E:\\p1\\sub\\..\\a.py');
+  expect(store.tabs().map((t) => t.path)).toEqual(['E:\\p1\\a.py']);
+});
+
+// ---- C：布局快照写回的防抖（调用被放大 → 合并到停手后一次）----
+
+it('连续打开多个标签（含 activate 重复触发）只落盘一次，末次是完整标签列表与真实断点', async () => {
+  vi.useFakeTimers();
+  const api = installBridge();
+  const store = useIdeStore();
+  store.setSession('s1');
+  // 恢复布局场景：N 个文件逐个 openFile，每次都会 activate + 补写，未防抖是 ~2N+1 次
+  await store.openFile('a.py');
+  await store.openFile('b.py');
+  store.toggleBreakpoint('b.py', 5);
+  await store.openFile('c.py');
+  store.activate('a.py'); // 用户又点回第一个标签
+
+  // 防抖窗口内一次都不落盘
+  expect(api.ide_save_layout).not.toHaveBeenCalled();
+
+  await flushLayoutDebounce();
+  expect(api.ide_save_layout).toHaveBeenCalledTimes(1);
+  expect(api.ide_save_layout).toHaveBeenCalledWith('s1', {
+    version: 1,
+    tabs: [
+      { path: 'a.py', line: 1 },
+      { path: 'b.py', line: 2 },
+      { path: 'c.py', line: 3 },
+    ],
+    active: 'a.py',
+    breakpoints: [{ path: 'b.py', line: 5 }],
+  });
+});
+
+it('标签频繁切换只在停手后写一次，末次活动标签是停手时的那个', async () => {
+  vi.useFakeTimers();
+  const api = installBridge();
+  const store = useIdeStore();
+  store.setSession('s1');
+  await store.openFile('a.py');
+  await store.openFile('b.py');
+  await flushLayoutDebounce();
+  api.ide_save_layout.mockClear();
+
+  store.activate('a.py');
+  store.activate('b.py');
+  store.activate('a.py');
+
+  expect(api.ide_save_layout).not.toHaveBeenCalled();
+  await flushLayoutDebounce();
+  expect(api.ide_save_layout).toHaveBeenCalledTimes(1);
+  expect(api.ide_save_layout).toHaveBeenLastCalledWith(
+    's1',
+    expect.objectContaining({
+      active: 'a.py',
+      tabs: [
+        { path: 'a.py', line: 1 },
+        { path: 'b.py', line: 2 },
+      ],
+    }),
+  );
+});
+
+it('切会话前先把挂起的写回落盘到原会话，不把上个会话的标签错挂到新会话', async () => {
+  vi.useFakeTimers();
+  const api = installBridge();
+  const store = useIdeStore();
+  store.setSession('s1');
+  await store.openFile('a.py');
+
+  // 防抖窗口还没到点就切会话：此时若任由定时器到点再落盘，写回的会是 s2（空列表）
+  store.setSession('s2');
+  await Promise.resolve();
+  expect(api.ide_save_layout).toHaveBeenCalledTimes(1);
+  expect(api.ide_save_layout).toHaveBeenCalledWith(
+    's1',
+    expect.objectContaining({ tabs: [{ path: 'a.py', line: 1 }], active: 'a.py' }),
+  );
+
+  // 挂起的写回已被消费：再等满一个窗口不会补写第二次
+  await flushLayoutDebounce();
+  expect(api.ide_save_layout).toHaveBeenCalledTimes(1);
 });

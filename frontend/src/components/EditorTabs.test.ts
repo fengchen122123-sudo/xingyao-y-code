@@ -83,6 +83,25 @@ it('关闭活动标签只走关闭逻辑，不因冒泡误触发切换', async (
   wrapper.unmount();
 });
 
+it('活动标签用 samePath 口径判定：分隔符写法不同也认作同一个标签（不再是裸 === 比较）', async () => {
+  const store = useIdeStore();
+  await store.openFile('E:\\p\\a.py');
+  await store.openFile('E:\\p\\b.py');
+  // 活动路径以另一种分隔符写法落进 state（跳转定义 / 布局恢复都可能带进这种写法）：
+  // 裸 `tab.path === store.activePath()` 会把活动标签判成非活动，标签条就不高亮了
+  store.activeBySession[store.session] = 'E:/p/b.py';
+
+  const wrapper = mount(EditorTabs);
+  const active = wrapper.find('.tab.active');
+  expect(active.exists()).toBe(true);
+  expect(active.text()).toContain('b.py');
+  wrapper.unmount();
+
+  // 口径锁死：模板里不得再出现裸路径比较
+  expect(editorTabsSource).not.toContain('tab.path === store.activePath()');
+  expect(editorTabsSource).toContain('samePath(tab.path, store.activePath())');
+});
+
 it('活动标签用既有主题变量着色，不引入新变量', async () => {
   const store = useIdeStore();
   await store.openFile('a.py');
