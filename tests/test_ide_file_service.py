@@ -362,3 +362,39 @@ def test_watcher_set_open_files_resets_baseline(tmp_path):
     # 重新登记时才建立基线，不会把登记前的改动当作变更上报
     watcher.set_open_files([str(f)])
     assert watcher.poll() == []
+
+
+# ---------------------------------------------------------------------------
+# acknowledge：星瑶自己写盘后回填基线
+#
+# 没有这个入口时，保存动作会改变 (mtime, size)，下一次 poll() 必然把「自己刚写
+# 的文件」当成外部改动上报：干净标签多一次冗余重载，脏标签被打上「已被星瑶修改」
+# 横幅——用户若点「以磁盘为准」就会丢掉自己的编辑。
+# ---------------------------------------------------------------------------
+def test_watcher_acknowledge_suppresses_self_write(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_bytes(b"x = 1\n")
+    watcher = OpenFileWatcher()
+    watcher.set_open_files([str(f)])
+
+    # 模拟保存：写盘后 mtime/size 变化，随后回填基线
+    f.write_bytes(b"x = 2\n")
+    base = os.stat(str(f)).st_mtime
+    os.utime(str(f), (base + 10, base + 10))
+    watcher.acknowledge(str(f))
+
+    assert watcher.poll() == []
+
+
+def test_watcher_without_acknowledge_reports_self_write(tmp_path):
+    """反证：不回填基线时自己写盘必被上报——防止这个保护被静默移除。"""
+    f = tmp_path / "a.py"
+    f.write_bytes(b"x = 1\n")
+    watcher = OpenFileWatcher()
+    watcher.set_open_files([str(f)])
+
+    f.write_bytes(b"x = 2\n")
+    base = os.stat(str(f)).st_mtime
+    os.utime(str(f), (base + 10, base + 10))
+
+    assert watcher.poll() == [str(f)]

@@ -13,6 +13,8 @@
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import core.gui_path_policy as gpp
@@ -147,3 +149,46 @@ def test_ide_layout_roundtrip(tmp_path, monkeypatch):
     got = bridge.ide_get_layout("s1")
     assert got["ok"] is True
     assert got["layout"]["active"] == "a.py"
+
+
+# ---------------------------------------------------------------------------
+# expected_hash 必填（来自 Task 4 评审的 Important 发现）
+# ---------------------------------------------------------------------------
+def test_ide_write_file_requires_expected_hash(tmp_path, monkeypatch):
+    """漏传 expected_hash 必须报 TypeError，绝不静默退化成无条件覆盖。
+
+    空串在 write_text_file 里的语义是「调用方明确要求覆盖」，若桥方法给出
+    expected_hash: str = "" 这样的宽松默认值，调用方漏传就悄悄关掉了全部冲突
+    保护，用户会在不知情的情况下覆盖掉星瑶刚写的内容。
+    """
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    f = ws / "a.py"
+    f.write_bytes(b"x = 1\n")
+    bridge = _make_bridge(str(ws), monkeypatch, tmp_path)
+
+    with pytest.raises(TypeError):
+        bridge.ide_write_file(str(f), "x = 2\n")
+    # 未落盘，磁盘一字不动
+    assert f.read_bytes() == b"x = 1\n"
+
+
+# ---------------------------------------------------------------------------
+# 保存后回填轮询基线（来自 Task 5 评审的 Important 发现）
+# ---------------------------------------------------------------------------
+def test_ide_write_file_refreshes_watch_baseline(tmp_path, monkeypatch):
+    """星瑶保存自己写盘的文件，轮询不得当成外部改动上报。"""
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    f = ws / "a.py"
+    f.write_bytes(b"x = 1\n")
+    bridge = _make_bridge(str(ws), monkeypatch, tmp_path)
+    bridge.ide_set_open_files([str(f)])
+
+    read = bridge.ide_read_file(str(f))
+    res = bridge.ide_write_file(
+        str(f), "x = 2\n", read["hash"], read["encoding"], read["bom"], read["eol"]
+    )
+    assert res["ok"] is True
+    # 保存动作必须回填基线：紧接着 poll 一次不得上报为外部改动
+    assert bridge._ide_poll_once() == 0

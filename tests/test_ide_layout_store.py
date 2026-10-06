@@ -77,3 +77,38 @@ def test_saved_file_is_valid_json(data_dir):
     store.save_ide_layout("s1", {"tabs": [{"path": "a.py", "line": 1}], "active": "a.py", "breakpoints": []})
     raw = (data_dir / "ide_layout.json").read_text(encoding="utf-8")
     assert json.loads(raw)["sessions"]["s1"]["active"] == "a.py"
+
+
+# ---------------------------------------------------------------------------
+# 保存拒绝「存在但读不出」的布局文件（来自 Task 6 评审的 Important 发现）
+#
+# save_ide_layout 是全量覆盖语义：先读全量快照、改当前会话、再整体回写。若读取
+# 失败被回落成空快照，回写内容只含当前会话，磁盘上其它会话的布局会被**静默抹掉**。
+# 因此必须区分「文件不存在」（合法，空快照）与「存在但读不出来」（异常，拒绝写入）。
+# ---------------------------------------------------------------------------
+def test_save_refuses_when_store_unreadable_and_keeps_disk(data_dir):
+    path = data_dir / "ide_layout.json"
+    original = b"{ not json at all"
+    path.write_bytes(original)
+
+    with pytest.raises(store.IdeLayoutError):
+        store.save_ide_layout("s1", {
+            "tabs": [{"path": "a.py", "line": 1}], "active": "a.py", "breakpoints": [],
+        })
+
+    # 拒绝写入：磁盘内容一字不变
+    assert path.read_bytes() == original
+
+
+def test_save_works_when_file_absent(data_dir):
+    """文件不存在是合法状态（等价空快照），保存必须正常写入。"""
+    path = data_dir / "ide_layout.json"
+    assert not path.exists()
+
+    saved = store.save_ide_layout("s1", {
+        "tabs": [{"path": "a.py", "line": 1}], "active": "a.py", "breakpoints": [],
+    })
+
+    assert saved["active"] == "a.py"
+    on_disk = json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["sessions"]["s1"]["active"] == "a.py"

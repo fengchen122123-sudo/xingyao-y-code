@@ -3312,21 +3312,39 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         self,
         path: str,
         content: str,
-        expected_hash: str = "",
+        expected_hash: str,
         encoding: str = "utf-8",
         bom: bool = False,
         eol: str = "lf",
     ) -> Dict[str, Any]:
+        """保存编辑器内容并刷新轮询基线。
+
+        expected_hash 必填、无默认值：它是打开文件时 read_text_file 返回的 hash，
+        作为冲突检测基准。**空串表示调用方明确要求覆盖**（用户在冲突提示里选择了
+        「用我的覆盖」），非空时作冲突检测基准。这里刻意不给默认值——调用方漏传
+        会被 Python 直接报 TypeError，而不是静默退化成「无条件覆盖」、关掉全部
+        冲突保护。
+        """
         from core.ide import file_service
 
         try:
             real_path, deny = self._ide_guard(path, "edit")
             if deny:
                 return {"ok": False, "msg": deny}
-            return file_service.write_text_file(
+            result = file_service.write_text_file(
                 real_path, content, expected_hash,
                 encoding=encoding, bom=bom, eol=eol,
             )
+            # 只有真正落盘成功才回填基线：冲突 / 编码失败 / 权限失败都没改动磁盘，
+            # 回填反而会掩盖紧接着的外部改动。
+            if result.get("ok"):
+                watcher = getattr(self, "_ide_watcher", None)
+                if watcher is not None:
+                    try:
+                        watcher.acknowledge(real_path)
+                    except Exception:
+                        logger.debug("刷新 IDE 轮询基线失败", exc_info=True)
+            return result
         except file_service.FileServiceError as e:
             return {"ok": False, "msg": str(e)}
         except Exception as e:
