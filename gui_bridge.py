@@ -3397,6 +3397,212 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
             return {"ok": False, "msg": str(e)}
 
     # ------------------------------------------------------------------
+    # IDE 模式 S2：语言服务（LSP）
+    # ------------------------------------------------------------------
+    # 单次 LSP 请求的等待上限：补全 / 悬停这类交互请求超过这个时间对用户
+    # 已经没有意义，宁可让前端拿到失败去回落纯文本编辑。
+    # 桥方法本身跑在 pywebview 为每次 JS 调用新建的临时线程上（不是 UI 线程，
+    # 也不是 gui-js-dispatcher），所以这里同步等待不会冻结界面；上限只是防止
+    # 语言服务器失联时前端 Promise 永远悬着。
+    _LSP_REQUEST_TIMEOUT = 15.0
+
+    def _lsp_manager_instance(self):
+        """惰性创建 LSP 管理器；两个回调都只做「进事件队列」这件事。
+
+        回调在每次取实例时统一挂一次，而不是只在新建时挂：测试或其它入口可能
+        把管理器直接塞进 `self._lsp_manager`（绕过本工厂），那种管理器没有回调，
+        语言服务器的推送与状态变化会被静默丢掉。挂回调是幂等的纯赋值，代价可忽略。
+        """
+        manager = getattr(self, "_lsp_manager", None)
+        if manager is None:
+            from core.ide import lsp_manager
+
+            manager = lsp_manager.LspManager()
+            self._lsp_manager = manager
+        # 回调只做「投递」：读线程 / 崩溃重启回调 / 合批定时器线程都可能在任意
+        # 线程调到它们；emit_event 内部只往 _js_queue put_nowait，绝不直接
+        # evaluate_js——那是 gui-js-dispatcher 单消费者线程的专属职责。
+        manager._on_notification = self._lsp_on_notification
+        manager._on_status = self._lsp_on_status
+        return manager
+
+    def _lsp_batcher_instance(self):
+        batcher = getattr(self, "_lsp_batcher", None)
+        if batcher is None:
+            from core.ide import diagnostics_batcher
+
+            batcher = diagnostics_batcher.DiagnosticsBatcher(
+                on_flush=self._lsp_flush_diagnostics
+            )
+            self._lsp_batcher = batcher
+        return batcher
+
+    def _lsp_on_status(self, status) -> None:
+        """可能在 LSP 读线程 / 重启回调里被调用，只允许 emit_event。"""
+        self.emit_event("lsp_status", status)
+
+    def _lsp_on_notification(self, workspace: str, language_id: str, method: str, params) -> None:
+        """语言服务器主动推送的入口，运行在该服务器的读线程上。
+
+        读线程只允许把消息交给合批器（纯内存操作），绝不触碰 WebView：真正送到
+        前端的 lsp_diagnostics 由合批定时器触发 _lsp_flush_diagnostics → emit_event。
+        """
+        if method != "textDocument/publishDiagnostics":
+            return
+        from core.ide.lsp_manager import uri_to_path
+
+        params = params or {}
+        uri = params.get("uri") or ""
+        path = uri_to_path(uri) or uri
+        self._lsp_batcher_instance().push(path, params.get("diagnostics") or [])
+
+    def _lsp_flush_diagnostics(self, path: str, diagnostics) -> None:
+        """由合批定时器线程调用，仍然只做 emit_event。"""
+        self.emit_event("lsp_diagnostics", {"path": path, "diagnostics": diagnostics})
+
+    def _lsp_discard_diagnostics(self, path: str, params=None) -> None:
+        """文档关闭：丢弃该路径的待派发诊断与去重指纹（Task 6 评审项 A）。
+
+        去重表 `_last_flushed` 唯一的清理点就是 `discard`；漏掉这一步它会随
+        打开过的文件数无界累积。键必须与 `_lsp_on_notification` 推入时一致
+        （uri 反解出来的路径）：前端传来的 path 与 didClose 的 uri 指向同一文件，
+        两边都清一遍，免得符号链接 / 大小写归一化差异造成漏清。
+        """
+        batcher = getattr(self, "_lsp_batcher", None)
+        if batcher is None:
+            return
+        from core.ide.lsp_manager import uri_to_path
+
+        keys = {str(path)}
+        doc = (params or {}).get("textDocument") if isinstance(params, dict) else None
+        uri = (doc or {}).get("uri") if isinstance(doc, dict) else None
+        if uri:
+            derived = uri_to_path(uri)
+            if derived:
+                keys.add(derived)
+        for key in keys:
+            batcher.discard(key)
+
+    def _lsp_workspace_guard(self) -> str:
+        """工作区变化时回收全部语言服务器：进程与工作区绑定，不跨区复用。"""
+        workspace = self._session_workdir(self._current_session) or ""
+        if getattr(self, "_lsp_workspace", None) != workspace:
+            if getattr(self, "_lsp_manager", None) is not None:
+                try:
+                    self._lsp_manager.recycle_all()
+                except Exception:
+                    logger.exception("切换工作区时回收语言服务器失败")
+            self._lsp_workspace = workspace
+        return workspace
+
+    def lsp_request(self, path: str, method: str, params=None) -> Dict[str, Any]:
+        from core.ide.lsp_manager import LspError, LspRequestError
+
+        try:
+            workspace = self._lsp_workspace_guard()
+            real_path, deny = self._ide_guard(path, "preview")
+            if deny:
+                return {"ok": False, "error": {"code": -32003, "message": deny}, "msg": deny}
+            from core.ide import language_registry
+
+            language_id = language_registry.language_id_for_path(real_path)
+            if not language_id:
+                msg = "该文件类型未配置语言服务器，已降级为纯文本编辑"
+                return {"ok": False, "error": {"code": -32000, "message": msg}, "msg": msg}
+            manager = self._lsp_manager_instance()
+            result = manager.request(
+                workspace, language_id, method, params or {}, timeout=self._LSP_REQUEST_TIMEOUT
+            )
+            return {"ok": True, "result": result}
+        except LspRequestError as e:
+            return {"ok": False, "error": {"code": e.code, "message": e.message}, "msg": str(e)}
+        except LspError as e:
+            return {"ok": False, "error": {"code": -32001, "message": str(e)}, "msg": str(e)}
+        except Exception as e:
+            logger.exception("lsp_request 失败")
+            return {"ok": False, "error": {"code": -32603, "message": str(e)}, "msg": str(e)}
+
+    def lsp_notify(self, path: str, method: str, params=None) -> Dict[str, Any]:
+        from core.ide.lsp_manager import LspError
+
+        try:
+            workspace = self._lsp_workspace_guard()
+            real_path, deny = self._ide_guard(path, "preview")
+            if deny:
+                return {"ok": False, "error": {"code": -32003, "message": deny}, "msg": deny}
+            # 文档关闭是合批器状态的收口点：先清掉该文件的待派发诊断与去重指纹，
+            # 再发 didClose。放在 notify 之前——即使服务器不可用、通知发不出去，
+            # 前端已经关掉的文档也不该在去重表里留痕（评审项 A）。
+            if method == "textDocument/didClose":
+                self._lsp_discard_diagnostics(real_path, params)
+            from core.ide import language_registry
+
+            language_id = language_registry.language_id_for_path(real_path)
+            if not language_id:
+                msg = "该文件类型未配置语言服务器，已降级为纯文本编辑"
+                return {"ok": False, "error": {"code": -32000, "message": msg}, "msg": msg}
+            manager = self._lsp_manager_instance()
+            manager.notify(workspace, language_id, method, params or {})
+            return {"ok": True}
+        except LspError as e:
+            return {"ok": False, "error": {"code": -32001, "message": str(e)}, "msg": str(e)}
+        except Exception as e:
+            logger.exception("lsp_notify 失败")
+            return {"ok": False, "error": {"code": -32603, "message": str(e)}, "msg": str(e)}
+
+    def lsp_server_status(self, workspace: str = "") -> Dict[str, Any]:
+        """枚举全部已配置语言服务器的状态；不启动任何进程（不会因为看状态而拉起服务器）。"""
+        try:
+            from core.ide import language_registry, server_provision
+
+            current = workspace or self._lsp_workspace_guard()
+            manager = getattr(self, "_lsp_manager", None)
+            live = {}
+            if manager is not None:
+                for row in manager.status(current):
+                    live[row["language"]] = row
+            servers = []
+            for language_id, server_id in language_registry.all_language_servers():
+                provision = server_provision.resolve_executable(server_id)
+                row = live.get(language_id) or {}
+                if provision["source"] == "missing":
+                    state = "missing"
+                else:
+                    state = row.get("state", "stopped")
+                servers.append({
+                    "server": server_id,
+                    "language": language_id,
+                    "state": state,
+                    "executable": provision["executable"],
+                    "source": provision["source"],
+                    "pid": row.get("pid"),
+                    "msg": row.get("msg") or provision["msg"],
+                })
+            return {"ok": True, "workspace": current, "servers": servers}
+        except Exception as e:
+            logger.exception("lsp_server_status 失败")
+            return {"ok": False, "servers": [], "msg": str(e)}
+
+    def lsp_set_server_path(self, server_id: str, path: str) -> Dict[str, Any]:
+        """设置页手动指定可执行文件路径；path 为空串表示恢复自动探测。"""
+        from core.ide import server_provision
+
+        try:
+            if path:
+                result = server_provision.save_override(server_id, path)
+            else:
+                result = server_provision.clear_override(server_id)
+            # 可执行文件变了，旧进程必须换掉，否则用户改了路径却毫无效果
+            if getattr(self, "_lsp_manager", None) is not None:
+                self._lsp_manager.recycle_all()
+            return {"ok": True, **result}
+        except server_provision.ProvisionError as e:
+            return {"ok": False, "msg": str(e)}
+        except Exception as e:
+            logger.exception("lsp_set_server_path 失败")
+            return {"ok": False, "msg": str(e)}
+
+    # ------------------------------------------------------------------
     # 会话持久化：历史会话列表
     # ------------------------------------------------------------------
     def get_sessions(self) -> List[Dict[str, Any]]:
