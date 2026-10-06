@@ -85,3 +85,119 @@ def test_read_rejects_unknown_encoding(tmp_path):
 def test_read_rejects_missing_file(tmp_path):
     with pytest.raises(FileServiceError):
         read_text_file(str(tmp_path / "nope.py"))
+
+
+# ---------------------------------------------------------------------------
+# 写入：编码与换行原样保持、原子写、冲突检测
+#
+# 注意：夹具一律用 write_bytes。Windows 上 Path.write_text 会把 "\n" 翻译成
+# os.linesep（实测 3.12：write_text("x = 1\n") 落盘为 b"x = 1\r\n"），会让
+# 「纯 LF 文件」的用例悄悄变成 CRLF 用例，断言随之失真。
+# ---------------------------------------------------------------------------
+from core.ide.file_service import write_text_file
+
+
+def test_write_keeps_utf8_and_lf(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_bytes(b"x = 1\n")
+    info = read_text_file(str(f))
+    res = write_text_file(
+        str(f), "x = 2\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    assert res["ok"] is True
+    assert f.read_bytes() == b"x = 2\n"
+
+
+def test_write_keeps_gbk_encoding(tmp_path):
+    """GBK 文件写回必须还是 GBK，否则中文变乱码。"""
+    f = tmp_path / "gbk.txt"
+    f.write_bytes("中文\n".encode("gbk"))
+    info = read_text_file(str(f))
+    res = write_text_file(
+        str(f), "中文改\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    assert res["ok"] is True
+    assert f.read_bytes() == "中文改\n".encode("gbk")
+
+
+def test_write_keeps_bom(tmp_path):
+    f = tmp_path / "bom.py"
+    f.write_bytes(b"\xef\xbb\xbfx = 1\n")
+    info = read_text_file(str(f))
+    write_text_file(
+        str(f), "x = 2\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    assert f.read_bytes() == b"\xef\xbb\xbfx = 2\n"
+
+
+def test_write_keeps_crlf(tmp_path):
+    """编辑器内部统一用 LF，写回时必须还原成原文件的 CRLF。"""
+    f = tmp_path / "win.py"
+    f.write_bytes(b"a = 1\r\nb = 2\r\n")
+    info = read_text_file(str(f))
+    write_text_file(
+        str(f), "a = 1\nb = 3\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    assert f.read_bytes() == b"a = 1\r\nb = 3\r\n"
+
+
+def test_write_mixed_eol_unified_to_lf(tmp_path):
+    """mixed 换行无法逐行还原：编辑器内部已归一为 LF，保存后统一成 LF。
+
+    这是架构取舍而非「不转换」——CodeMirror 6 的 Text 构造时就把 \r\n / \r
+    归一为 \n，原始的行级换行分布传到后端时已丢失。
+    """
+    f = tmp_path / "mixed.py"
+    f.write_bytes(b"a = 1\r\nb = 2\n")
+    info = read_text_file(str(f))
+    assert info["eol"] == "mixed"
+    write_text_file(
+        str(f), "a = 9\nb = 2\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    # mixed 不做逐行还原，正文按 LF 统一落盘
+    assert f.read_bytes() == b"a = 9\nb = 2\n"
+
+
+def test_write_detects_conflict(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_bytes(b"x = 1\n")
+    info = read_text_file(str(f))
+    # 模拟星瑶在用户编辑期间改了同一个文件
+    f.write_bytes(b"x = 1  # changed by agent\n")
+    res = write_text_file(
+        str(f), "x = 2\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    assert res["ok"] is False
+    assert res["conflict"]["disk_hash"] != info["hash"]
+    # 冲突时绝不落盘，磁盘内容保持星瑶写的版本
+    assert f.read_bytes() == b"x = 1  # changed by agent\n"
+
+
+def test_write_skips_conflict_check_when_hash_empty(tmp_path):
+    """expected_hash 为空表示调用方明确要求覆盖（用户选择了「用我的覆盖」）。"""
+    f = tmp_path / "a.py"
+    f.write_bytes(b"old\n")
+    res = write_text_file(
+        str(f), "new\n", "",
+        encoding="utf-8", bom=False, eol="lf",
+    )
+    assert res["ok"] is True
+    assert f.read_bytes() == b"new\n"
+
+
+def test_write_is_atomic_no_temp_left(tmp_path):
+    f = tmp_path / "a.py"
+    f.write_bytes(b"x = 1\n")
+    info = read_text_file(str(f))
+    write_text_file(
+        str(f), "x = 2\n", info["hash"],
+        encoding=info["encoding"], bom=info["bom"], eol=info["eol"],
+    )
+    leftovers = [p.name for p in tmp_path.iterdir() if p.name.startswith(".ycode-ide-")]
+    assert leftovers == []
