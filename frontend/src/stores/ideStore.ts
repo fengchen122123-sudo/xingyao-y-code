@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia';
 
+import { closeDocument } from '../editor/lsp';
 import { languageIdForPath } from '../editor/setup';
 import type { IdeReadFileResult } from '../types/pywebview';
 
@@ -318,6 +319,9 @@ export const useIdeStore = defineStore('ide', {
       }
       this._syncActiveTab();
       void this._syncOpenFiles();
+      // 关标签 = 该文档退出编辑：通知语言服务器 didClose（EditorPane 只按活动标签挂载，
+      // 切标签不会卸载文档，所以关闭点只能在这里）。传输失败由 lsp 层静默吞掉。
+      void closeDocument(target.path);
       // 关标签后活动标签可能换人：写回快照，重开软件时不会恢复已关闭的标签
       scheduleLayoutPersist(this);
     },

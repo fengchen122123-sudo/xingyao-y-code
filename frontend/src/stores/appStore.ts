@@ -4,6 +4,9 @@ import { useGitStore } from './gitStore';
 // IDE 已打开文件的外部改动事件转发（ide_file_changed）；
 // ideStore 只依赖 editor/setup 与类型声明，不反向依赖 appStore，无环
 import { useIdeStore } from './ideStore';
+// LSP 事件（lsp_status / lsp_diagnostics）转发：桥事件的唯一赋值点在本 store 的
+// handleBridgeEvent，LSP 事件同样接进那条链（editor/lsp 不反向依赖 stores，无环）
+import { dispatchLspEvent } from '../editor/lsp';
 import type {
   AutomationRunInfo,
   AutomationTaskInfo,
@@ -4526,6 +4529,12 @@ navItems: [] as Array<{ id: number; preview: string }>,
         // IDE 已打开文件被外部改动（后端 Task 7 轮询发现）：交给 ideStore 决定
         // 是自动重载（本地干净）还是只打脏标记（本地有未保存内容）
         void useIdeStore().handleExternalChange(String(data.path ?? ''));
+      } else if (type === 'lsp_diagnostics' || type === 'lsp_status') {
+        // 语言服务事件（Task 9）：必须接进本函数这条既有 type-if 链——它是
+        // window.onBridgeEvent 的唯一赋值点。计划里「由 App.vue 的桥事件分发处转发」
+        // 的说法不成立：App.vue 再挂一处分发等于新开一条通道，违反单消费者约定。
+        // lsp_status 里还携带崩溃重启信号，由 lsp 客户端据此重发 didOpen。
+        dispatchLspEvent(type, data);
       } else if (type === 'pty_exit') {
         emitPtyExit(Number(data.code ?? 0));
       } else if (type === 'update_download_progress') {
