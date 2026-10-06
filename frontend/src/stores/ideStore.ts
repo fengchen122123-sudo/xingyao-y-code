@@ -15,6 +15,15 @@ export interface IdeTab {
   externalChange: boolean;
   /** 保存时检测到冲突 */
   conflict: boolean;
+  /**
+   * 曾经用哪些「调用方原始路径」openFile 到本标签。
+   *
+   * 记的不是猜出来的路径，而是 openFile 时后端 realpath 的对答记录：调用方给 P、
+   * 后端答 realpath R，则 P 记在这里。写类动作（updateContent / saveTab / closeTab…）
+   * 用调用方原路径查表时靠它命中标签，避免 Task 8 评审发现的「saveTab 静默 return」。
+   * 标签的权威路径永远是 `path`（realpath），本字段只作查表别名，不参与持久化。
+   */
+  requestedPaths?: string[];
 }
 
 function ideApi() {
@@ -23,43 +32,26 @@ function ideApi() {
   return api;
 }
 
-function isWindowsRuntime(): boolean {
-  return typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent || '');
+/**
+ * 路径比对键：全仓「按路径查表」的统一口径，**只统一分隔符**（`\` → `/`）。
+ *
+ * 刻意不做两件事，因为那是在猜路径而不是读路径：
+ * - 不做 `..` 词法折叠：中间段是 junction / 符号链接时，`C:\p\sub\..\a.py` 的
+ *   realpath 可能与 `C:\p\a.py` 指向不同文件；词法折叠会把两者误判为同一文件，
+ *   于是 openFile 不再读第二个文件、saveTab 又写回第一个文件的路径 → 静默数据不一致。
+ * - 不做大小写折叠：工作区若位于 Windows 上挂载的大小写敏感目录，`A.py` 与 `a.py`
+ *   是两个文件，无差别 `toLowerCase()` 会把它们误合并。
+ *
+ * realpath 的权威判定只来自后端 `ide_read_file` 的返回（见 `openFile`），
+ * 本函数只产出比对键，**绝不写回标签**——标签路径始终保存 realpath。
+ */
+export function pathKey(path: string): string {
+  return (path || '').replace(/\\/g, '/');
 }
 
-/**
- * 路径规范化键：所有「按路径查表」的统一比对口径。
- *
- * 后端 `ide_read_file` 返回的是 realpath，而界面（文件树、跳转请求）传进来的是
- * 原始路径；Windows 上两者常因分隔符、盘符大小写、`..` 相对段而不等（后端还有
- * abspath 兜底）。若直接用字符串比对，会出现：同一文件打开两次开出两个标签、
- * `saveTab(原始路径)` 查不到标签而静默 return，Ctrl+S 失效。
- *
- * 注意：本函数只产出比对键，**绝不写回标签**——标签路径始终保存 realpath，
- * 它是后端与 S2/S3 的权威路径。
- */
-export function normKey(path: string): string {
-  if (!path) return '';
-  const key = path.replace(/\\/g, '/');
-  const unc = key.startsWith('//');
-  const drive = /^[a-zA-Z]:\//.test(key);
-  const absolute = unc || drive || key.startsWith('/');
-  const segments: string[] = [];
-  for (const seg of key.split('/')) {
-    if (seg === '' || seg === '.') continue;
-    if (seg === '..') {
-      if (segments.length && segments[segments.length - 1] !== '..') segments.pop();
-      else if (!absolute) segments.push('..');
-      continue;
-    }
-    segments.push(seg);
-  }
-  let normalized = segments.join('/');
-  if (unc) normalized = `//${normalized}`;
-  else if (absolute) normalized = `/${normalized}`;
-  // Windows 路径大小写不敏感：盘符/UNC 前缀自带证据，其余靠运行时判断
-  if (drive || unc || isWindowsRuntime()) normalized = normalized.toLowerCase();
-  return normalized;
+/** 两个路径是否指同一处：与查表同口径（精确 + 分隔符统一，不折叠大小写与 `..`） */
+export function samePath(a: string, b: string): boolean {
+  return pathKey(a) === pathKey(b);
 }
 
 export const useIdeStore = defineStore('ide', {
@@ -104,7 +96,8 @@ export const useIdeStore = defineStore('ide', {
     /** 打开目标文件并把光标定位到指定行列（S2 的跳转定义 / 诊断跳转复用） */
     async jumpTo(path: string, line: number, character = 1) {
       await this.openFile(path);
-      this.pendingJump = { path: this.tab(path)?.path ?? path, line, character };
+      // 跳转请求里的路径统一记 realpath，EditorPane 用同一查表口径比对即可消费
+      this.pendingJump = { path: this._resolvePath(path), line, character };
     },
 
     /** EditorPane 消费完跳转请求后调用，避免重复定位 */
@@ -121,9 +114,10 @@ export const useIdeStore = defineStore('ide', {
     },
 
     breakpointsFor(path: string): number[] {
-      const key = normKey(path);
+      // 断点按标签 realpath 落库，查询前先经查表把调用方路径解析成 realpath
+      const key = pathKey(this._resolvePath(path));
       return (this.breakpointsBySession[this.session] ?? [])
-        .filter((b) => normKey(b.path) === key)
+        .filter((b) => pathKey(b.path) === key)
         .map((b) => b.line)
         .sort((a, b) => a - b);
     },
@@ -131,12 +125,12 @@ export const useIdeStore = defineStore('ide', {
     toggleBreakpoint(path: string, line: number) {
       if (!this.breakpointsBySession[this.session]) this.breakpointsBySession[this.session] = [];
       const list = this.breakpointsBySession[this.session];
-      const key = normKey(path);
-      const idx = list.findIndex((b) => normKey(b.path) === key && b.line === line);
+      const key = pathKey(this._resolvePath(path));
+      const idx = list.findIndex((b) => pathKey(b.path) === key && b.line === line);
       if (idx >= 0) list.splice(idx, 1);
       // 落库统一用 realpath（标签已打开时取标签路径），这样 S3 的断点 gutter
       // 用 `${tab.path}:${line}` 查 `breakpoints` 集合才能命中
-      else list.push({ path: this.tab(path)?.path ?? path, line });
+      else list.push({ path: this._resolvePath(path), line });
       void this.persistLayout();
     },
 
@@ -165,9 +159,25 @@ export const useIdeStore = defineStore('ide', {
       return this.tabsBySession[this.session] ?? [];
     },
 
+    /**
+     * 按路径查标签：**全仓唯一口径**（openFile 判重、EditorPane 跳转比对、写类动作都用它）。
+     *
+     * 两步，都不猜路径：
+     * 1. 精确比对标签路径——只统一分隔符，不折叠大小写、不折叠 `..`；
+     * 2. 再比对标签「曾经用哪些调用方路径打开」（`requestedPaths`，来自 openFile 时
+     *    后端 realpath 的真实对答），保证调用方拿原路径查表也不会静默落空。
+     */
     tab(path: string): IdeTab | undefined {
-      const key = normKey(path);
-      return this.tabs().find((t) => normKey(t.path) === key);
+      const key = pathKey(path);
+      if (!key) return undefined;
+      const exact = this.tabs().find((t) => pathKey(t.path) === key);
+      if (exact) return exact;
+      return this.tabs().find((t) => (t.requestedPaths ?? []).some((p) => pathKey(p) === key));
+    },
+
+    /** 把调用方路径解析成标签的权威路径（realpath）；查不到就原样返回 */
+    _resolvePath(path: string): string {
+      return this.tab(path)?.path ?? path;
     },
 
     activePath(): string {
@@ -176,7 +186,7 @@ export const useIdeStore = defineStore('ide', {
 
     activate(path: string) {
       // 活动路径统一记标签的 realpath：activeBySession 与标签路径两处状态不漂移
-      this.activeBySession[this.session] = this.tab(path)?.path ?? path;
+      this.activeBySession[this.session] = this._resolvePath(path);
       this._syncActiveTab();
     },
 
@@ -197,18 +207,32 @@ export const useIdeStore = defineStore('ide', {
       // 必须先确保它存在，否则 tabs() 的 `?? []` 会返回一个被丢弃的临时数组，
       // push 进去的标签立即丢失。
       if (!this.tabsBySession[this.session]) this.tabsBySession[this.session] = [];
-      // 判重经 normKey：后端回的是 realpath，调用方给的是原始路径
-      const existing = this.tab(path);
-      if (existing) {
-        this.activate(existing.path);
+      // 第一次精确比对：调用方路径与已有标签（含其记录过的调用方路径）逐字相同则直接用
+      const opened = this.tab(path);
+      if (opened) {
+        this.activate(opened.path);
         return;
       }
       const res: IdeReadFileResult = await api.ide_read_file(path);
       if (!res.ok) {
         throw new Error(res.msg || '打开文件失败');
       }
+      // 后端 realpath 是唯一判重权威：拿它再精确比对一次已有标签，命中就丢弃本次读取结果。
+      // 判重只依据 realpath 的精确相等（最多统一分隔符）——不折叠大小写、不折叠 `..`:
+      // 那两种折叠在 junction/符号链接或大小写敏感目录上会把不同文件误判成同一个。
+      // 代价是形态不同的路径会多读一次，可以接受（文件早已打开时才付）。
+      const realPath = res.path || path;
+      const existing = this.tab(realPath);
+      if (existing) {
+        // 记下这次的对答，后续用同一调用方路径查表（saveTab/closeTab…）才能命中
+        if (!(existing.requestedPaths ?? []).some((p) => pathKey(p) === pathKey(path))) {
+          existing.requestedPaths = [...(existing.requestedPaths ?? []), path];
+        }
+        this.activate(existing.path);
+        return;
+      }
       const tab: IdeTab = {
-        path: res.path || path,
+        path: realPath,
         content: res.content ?? '',
         encoding: (res.encoding as 'utf-8' | 'gbk') ?? 'utf-8',
         bom: !!res.bom,
@@ -217,6 +241,7 @@ export const useIdeStore = defineStore('ide', {
         dirty: false,
         externalChange: false,
         conflict: false,
+        requestedPaths: samePath(path, realPath) ? [] : [path],
       };
       this.tabs().push(tab);
       this.activate(tab.path);
@@ -225,11 +250,13 @@ export const useIdeStore = defineStore('ide', {
 
     closeTab(path: string) {
       const list = this.tabs();
-      const key = normKey(path);
-      const idx = list.findIndex((t) => normKey(t.path) === key);
+      const target = this.tab(path);
+      if (!target) return;
+      const key = pathKey(target.path);
+      const idx = list.indexOf(target);
       if (idx < 0) return;
       list.splice(idx, 1);
-      if (normKey(this.activePath()) === key) {
+      if (pathKey(this.activePath()) === key) {
         this.activeBySession[this.session] = list[Math.min(idx, list.length - 1)]?.path ?? '';
       }
       this._syncActiveTab();
