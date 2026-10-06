@@ -20,6 +20,7 @@
 - 所有前端可见事件必须经 `gui_bridge.py` 的 `_js_queue` 与 `gui-js-dispatcher` 单消费者线程派发，事件源线程只允许 `put_nowait`，禁止直接 `evaluate_js`。
 - 用户手动编辑与保存**不接入**「按回合撤销」体系，也不写 Journal 正文。
 - 前端 CSP 保持 `default-src 'self'`（`frontend/index.html:7-11`），不引入 eval、不引入外部 CDN。
+- 「不引入第三方依赖」红线的适用范围是 **Python 侧**（`core/`、`gui_bridge.py` 等），不约束前端 npm 依赖。前端引入 CodeMirror 6 已由设计规格 §7.1 授权，仓库既有 `vue` / `@xterm/xterm` / `highlight.js` / `mermaid` 同样是前端依赖，评审时不得据此判定为违规。
 - 文本编码不得混淆：读进来是 GBK 就写回 GBK，BOM 与换行风格原样保持。
 - 工作区外文件可只读，保存必须拒绝；`~/.ycode` 顶层凭据配置文件读写一律拒绝。
 - `frontend/dist` 与 `dist/` 永不提交。
@@ -3308,24 +3309,29 @@ def test_ide_package_does_not_import_lsp_tool():
 
 def test_ide_modules_do_not_touch_prompt_builder():
     """IDE 模块不得引用提示词构造，防止把编辑器状态注入请求。"""
+    import core.ide.file_service as fs
     import core.ide.layout_store as ls
 
-    for module in (fs := __import__("core.ide.file_service", fromlist=["x"]), ls):
+    for module in (fs, ls):
         source = open(module.__file__, encoding="utf-8").read()
         for forbidden in ("build_stable_prompt", "context_builder", "system_prompt"):
             assert forbidden not in source, f"{module.__name__} 引用了 {forbidden}"
 
 
-def test_prompt_byte_stability_still_passes():
-    """委托给既有黄金测试：IDE 不得改变请求字节。"""
-    import subprocess
+def test_ide_modules_do_not_touch_request_path():
+    """静态断言：IDE 模块不得出现在模型请求构造链路上。
 
-    result = subprocess.run(
-        [sys.executable, "-m", "pytest", "tests/test_prompt_byte_stability.py", "-q"],
-        cwd=os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        capture_output=True, text=True, encoding="utf-8", errors="replace",
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    字节稳定黄金测试（tests/test_prompt_byte_stability.py）由本任务 Step 4 的统一
+    测试一并跑，这里刻意不用 subprocess 嵌套调用 pytest——嵌套执行会重复跑一遍
+    测试、拉长耗时，且失败信息二段套娃，定位成本远高于收益。
+    """
+    import core.ide.file_service as fs
+    import core.ide.layout_store as ls
+
+    for module in (fs, ls):
+        source = open(module.__file__, encoding="utf-8").read()
+        for forbidden in ("llm_transport", "llm_native_transport", "llm_dialects", "turn_controller"):
+            assert forbidden not in source, f"{module.__name__} 引用了 {forbidden}"
 ```
 
 - [ ] **Step 2: 运行回归测试**
