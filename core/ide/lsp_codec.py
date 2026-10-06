@@ -29,7 +29,18 @@ MAX_PAYLOAD_BYTES = 8 * 1024 * 1024
 
 
 class LspFrameError(Exception):
-    """帧结构非法（缺 Content-Length、长度非整数、头部超长、正文非 JSON）。"""
+    """帧结构非法（缺 Content-Length、长度非整数、头部超长、正文非 JSON）。
+
+    异常上还挂着 `messages`：**抛出本次异常之前，同一次 feed 里已经成功解码的
+    消息**。一个 chunk 完全可能是 `[合法帧 A][坏帧 B]`，而 A 很可能正是
+    `initialize` 响应；读循环若因为 B 把 A 一起丢掉，上层就会一直等一个永远
+    不会被投递的响应（挂起），而不是看到错误。调用方捕获异常后必须先把
+    `messages` 派发出去，再决定是否放弃这条连接。
+    """
+
+    def __init__(self, message, messages=None):
+        super().__init__(message)
+        self.messages = list(messages or ())
 
 
 def encode_frame(payload: dict, *, encoding: str = "utf-8") -> bytes:
@@ -74,24 +85,30 @@ class FrameDecoder:
         if chunk:
             self._buffer.extend(chunk)
         messages: list[dict] = []
-        while True:
-            sep = self._buffer.find(_HEADER_SEP)
-            if sep < 0:
-                if len(self._buffer) > _MAX_HEADER_BYTES:
-                    raise LspFrameError("头部超过 16 KB 仍未见空行，帧结构异常")
-                break
-            if sep > _MAX_HEADER_BYTES:
-                raise LspFrameError("头部超过 16 KB，帧结构异常")
-            length = _parse_content_length(bytes(self._buffer[:sep]))
-            body_start = sep + len(_HEADER_SEP)
-            total = body_start + length
-            if len(self._buffer) < total:
-                # 正文还没到齐，保持原样等待下一次 feed
-                break
-            body = bytes(self._buffer[body_start:total])
-            del self._buffer[:total]
-            try:
-                messages.append(json.loads(body.decode(self._encoding)))
-            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-                raise LspFrameError(f"正文不是合法 JSON：{exc}") from exc
+        try:
+            while True:
+                sep = self._buffer.find(_HEADER_SEP)
+                if sep < 0:
+                    if len(self._buffer) > _MAX_HEADER_BYTES:
+                        raise LspFrameError("头部超过 16 KB 仍未见空行，帧结构异常")
+                    break
+                if sep > _MAX_HEADER_BYTES:
+                    raise LspFrameError("头部超过 16 KB，帧结构异常")
+                length = _parse_content_length(bytes(self._buffer[:sep]))
+                body_start = sep + len(_HEADER_SEP)
+                total = body_start + length
+                if len(self._buffer) < total:
+                    # 正文还没到齐，保持原样等待下一次 feed
+                    break
+                body = bytes(self._buffer[body_start:total])
+                del self._buffer[:total]
+                try:
+                    messages.append(json.loads(body.decode(self._encoding)))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise LspFrameError(f"正文不是合法 JSON：{exc}") from exc
+        except LspFrameError as exc:
+            # 坏帧之前已经解出来的消息不能随异常一起消失（见 LspFrameError 说明）
+            if not exc.messages:
+                exc.messages = list(messages)
+            raise
         return messages
