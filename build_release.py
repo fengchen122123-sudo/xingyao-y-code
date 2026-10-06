@@ -230,6 +230,26 @@ def step0_build_frontend(project_dir, args):
         print("   3) frontend/src 下的 TypeScript / Vue 代码存在编译错误")
         sys.exit(1)
 
+    # IDE 模式引入 CodeMirror 6 后，首屏包体积必须受控：
+    # 语言包与重扩展一律动态 import，一旦被静态引入这里会失败。
+    # 注：计划原文用 `base_dir`，本函数的对应变量名是 `project_dir`（函数内无 base_dir），
+    # 故这里逐字保留校验逻辑、只把根目录变量名对齐到本函数的作用域。
+    dist_assets = os.path.join(project_dir, "frontend", "dist", "assets")
+    MAX_ENTRY_BYTES = 1_800_000  # 首屏 JS 上限 1.8 MB
+    if os.path.isdir(dist_assets):
+        entry_files = [
+            f for f in os.listdir(dist_assets)
+            if f.startswith("index-") and f.endswith(".js")
+        ]
+        for name in entry_files:
+            size = os.path.getsize(os.path.join(dist_assets, name))
+            if size > MAX_ENTRY_BYTES:
+                raise SystemExit(
+                    f"前端首屏包过大：{name} {size / 1024 / 1024:.2f} MB，"
+                    f"上限 {MAX_ENTRY_BYTES / 1024 / 1024:.2f} MB。"
+                    "请检查是否有语言包被静态引入。"
+                )
+
     if not os.path.exists(index_html):
         print("❌ npm run build 已执行完成，但未生成 frontend/dist/index.html，请检查 vite 构建配置。")
         sys.exit(1)
