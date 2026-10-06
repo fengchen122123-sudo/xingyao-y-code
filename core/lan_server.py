@@ -227,6 +227,15 @@ class LanServer:
         "resume_computer_control", "acknowledge_computer_safety",
         # GUI 事件桥内部测试 seam（等价于窃听/阻断桌面事件流）
         "drain_js_queue",
+        # IDE 桥的状态变更类方法（fail-closed：dispatch_rpc 默认放行，若不入
+        # 黑名单，手机端等于凭空多出一条远程写文件 / 改布局的通道）。写入类
+        # 「ide_write_file」可直接改写桌面工作区文件，「ide_set_open_files」
+        # 会污染桌面轮询集合，「ide_save_layout」会覆盖桌面持久化布局——都不是
+        # 手机远程控制该有的能力，与既有 open_path / save_clipboard_image 同一
+        # 边界（设计 18：LAN 必须实施 fail-closed 的同一边界）。只读类
+        # ide_read_file / ide_stat_files / ide_get_layout 保持放行，与既有
+        # read_file_preview 可被 LAN 调用的先例一致。
+        "ide_write_file", "ide_set_open_files", "ide_save_layout",
     })
 
     # 会创建用户 Turn 的消息入口（Task 15，设计 18）：dispatch 层由服务器
