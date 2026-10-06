@@ -216,6 +216,21 @@ class OpenFileWatcher:
         with self._lock:
             self._files = snapshot
 
+    def acknowledge(self, path: str) -> None:
+        """把已登记文件（星瑶自己写盘成功后）的基线刷新为当前值。
+
+        没有这个入口时，保存动作会让 (mtime, size) 变化，下一次 poll() 必然把
+        自己写的文件当成「外部改动」上报：干净标签多一次冗余重载，脏标签被打上
+        「已被星瑶修改」横幅，用户点「以磁盘为准」还会丢掉自己的编辑。
+
+        只刷新**已在监视集合内**的路径——未登记的文件不因此被纳入监视（轮询
+        集合由前端驱动，见 ide_set_open_files）。
+        """
+        real = os.path.realpath(os.path.abspath(str(path)))
+        with self._lock:
+            if real in self._files:
+                self._files[real] = self._stamp(real)
+
     def poll(self) -> list[str]:
         """返回自上次 poll 后发生变化的文件（含被删除的文件，标记为 size=-1）。"""
         changed: list[str] = []
