@@ -31,9 +31,16 @@ export interface LspResponse<T = unknown> {
   msg?: string;
 }
 
+/**
+ * `lsp_status` **事件**的 payload。后端 `LspManager._emit_status` 输出
+ * `server/language/workspace/state/msg`，因此事件一定带 `workspace`。
+ * 注意与 `lsp_server_status` **响应**里的 `servers[]` 条目区分：那里不含
+ * `workspace`（它在响应顶层），两者是不同形状，不要合并。
+ */
 export interface LspServerStatus {
   server: string;
   language: string;
+  workspace?: string;
   state: 'missing' | 'stopped' | 'starting' | 'running' | 'restarting' | 'failed';
   executable?: string;
   source?: 'override' | 'bundled' | 'path' | 'missing';
