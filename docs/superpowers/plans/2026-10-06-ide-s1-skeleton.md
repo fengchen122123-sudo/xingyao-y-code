@@ -1644,10 +1644,12 @@ git commit -m "feat(ide): 桥接层新增 IDE 文件读写/布局方法并派发
 
 **Interfaces:**
 - Consumes: Task 7 的桥方法
-- Produces（`useIdeStore()`）：
-  - state：`tabsBySession: Record<string, IdeTab[]>`、`activeBySession: Record<string, string>`
-  - actions：`openFile(path)`、`closeTab(path)`、`activate(path)`、`updateContent(path, content)`、`saveTab(path)`、`handleExternalChange(path)`、`tabs()`、`activePath()`、`tab(path)`
-  - 类型 `IdeTab { path, content, encoding, bom, eol, hash, dirty, externalChange }`
+- Produces（`useIdeStore()`，这是 S2 / S3 共同消费的**冻结契约**，后续任务不得改名）：
+  - state：`tabsBySession`、`activeBySession`、`activeTab: IdeTab | null`、`breakpointsBySession: Record<string, {path, line}[]>`、`bottomTabBySession`、`bottomPanelOpenBySession`、`pendingJump: {path, line, character} | null`
+  - getters：`breakpoints: Set<string>`（键为 `${path}:${line}`）、`bottomTab: string`、`bottomPanelOpen: boolean`
+  - actions：`setSession(session)`、`openFile(path)`、`closeTab(path)`、`activate(path)`、`updateContent(path, content)`、`saveTab(path)`、`reloadFromDisk(path)`、`handleExternalChange(path)`、`persistLayout()`、`breakpointsFor(path): number[]`、`toggleBreakpoint(path, line)`、`jumpTo(path, line, character)`、`clearPendingJump()`、`setBottomTab(tab)`、`toggleBottomPanel()`、`tabs()`、`activePath()`、`tab(path)`
+  - 类型 `IdeTab { path, content, encoding, bom, eol, hash, dirty, externalChange, conflict }`
+  - 说明：`activeTab` 是对象形态（S3 的调试界面与断点 gutter 读 `activeTab.path`），`activePath()` 是字符串形态，两者由 `_syncActiveTab()` 保持同步
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -1877,12 +1879,78 @@ export const useIdeStore = defineStore('ide', {
     session: '',
     tabsBySession: {} as Record<string, IdeTab[]>,
     activeBySession: {} as Record<string, string>,
+    /** 当前活动标签对象：S3 的调试界面与断点 gutter 直接读 activeTab.path */
+    activeTab: null as IdeTab | null,
+    /** 断点按会话隔离，元素形状与 core/ide/layout_store.py 的校验结构一致 */
+    breakpointsBySession: {} as Record<string, { path: string; line: number }[]>,
+    bottomTabBySession: {} as Record<string, string>,
+    bottomPanelOpenBySession: {} as Record<string, boolean>,
+    /** 待执行的跳转请求：S2 的「跳转定义」把目标行列写在这里，EditorPane 消费后清空 */
+    pendingJump: null as { path: string; line: number; character: number } | null,
   }),
+
+  getters: {
+    /** `${path}:${line}` 集合，供断点 gutter 做 O(1) 判定 */
+    breakpoints(state): Set<string> {
+      return new Set(
+        (state.breakpointsBySession[state.session] ?? []).map((b) => `${b.path}:${b.line}`),
+      );
+    },
+
+    bottomTab(state): string {
+      return state.bottomTabBySession[state.session] ?? 'terminal';
+    },
+
+    bottomPanelOpen(state): boolean {
+      return state.bottomPanelOpenBySession[state.session] ?? true;
+    },
+  },
 
   actions: {
     setSession(session: string) {
       this.session = session || '';
       if (!this.tabsBySession[this.session]) this.tabsBySession[this.session] = [];
+      this._syncActiveTab();
+    },
+
+    /** 打开目标文件并把光标定位到指定行列（S2 的跳转定义 / 诊断跳转复用） */
+    async jumpTo(path: string, line: number, character = 1) {
+      await this.openFile(path);
+      this.pendingJump = { path: this.tab(path)?.path ?? path, line, character };
+    },
+
+    /** EditorPane 消费完跳转请求后调用，避免重复定位 */
+    clearPendingJump() {
+      this.pendingJump = null;
+    },
+
+    setBottomTab(tab: string) {
+      this.bottomTabBySession[this.session] = tab;
+    },
+
+    toggleBottomPanel() {
+      this.bottomPanelOpenBySession[this.session] = !this.bottomPanelOpen;
+    },
+
+    breakpointsFor(path: string): number[] {
+      return (this.breakpointsBySession[this.session] ?? [])
+        .filter((b) => b.path === path)
+        .map((b) => b.line)
+        .sort((a, b) => a - b);
+    },
+
+    toggleBreakpoint(path: string, line: number) {
+      if (!this.breakpointsBySession[this.session]) this.breakpointsBySession[this.session] = [];
+      const list = this.breakpointsBySession[this.session];
+      const idx = list.findIndex((b) => b.path === path && b.line === line);
+      if (idx >= 0) list.splice(idx, 1);
+      else list.push({ path, line });
+      void this.persistLayout();
+    },
+
+    /** 活动标签对象与 activeBySession 保持同步，避免两处状态漂移 */
+    _syncActiveTab() {
+      this.activeTab = this.tab(this.activePath()) ?? null;
     },
 
     tabs(): IdeTab[] {
@@ -1899,6 +1967,7 @@ export const useIdeStore = defineStore('ide', {
 
     activate(path: string) {
       this.activeBySession[this.session] = path;
+      this._syncActiveTab();
     },
 
     languageId(path: string): string {
@@ -1947,6 +2016,7 @@ export const useIdeStore = defineStore('ide', {
       if (this.activePath() === path) {
         this.activeBySession[this.session] = list[Math.min(idx, list.length - 1)]?.path ?? '';
       }
+      this._syncActiveTab();
       void this._syncOpenFiles();
     },
 
@@ -2247,6 +2317,20 @@ watch(
     applyingExternal = true;
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: next } });
     applyingExternal = false;
+  },
+);
+
+// 跳转定义 / 诊断定位：把 store 里的 pendingJump 落到编辑器选区
+watch(
+  () => store.pendingJump,
+  (jump) => {
+    if (!view || !jump || jump.path !== props.path) return;
+    const total = view.state.doc.lines;
+    const lineInfo = view.state.doc.line(Math.min(Math.max(jump.line, 1), total));
+    const anchor = Math.min(lineInfo.from + Math.max(jump.character - 1, 0), lineInfo.to);
+    view.dispatch({ selection: { anchor }, scrollIntoView: true });
+    view.focus();
+    store.clearPendingJump();
   },
 );
 
@@ -2675,28 +2759,37 @@ const items = [
         :key="item.id"
         type="button"
         class="bottom-tab"
-        :class="[item.id, { active: active === item.id }]"
-        @click="active = item.id"
+        :class="[item.id, { active: store.bottomTab === item.id }]"
+        @click="store.setBottomTab(item.id)"
       >
         {{ item.title }}
       </button>
       <button type="button" class="bottom-close" @click="$emit('close')">×</button>
     </div>
     <div class="bottom-body">
-      <TerminalPane v-if="active === 'terminal'" />
+      <TerminalPane v-if="store.bottomTab === 'terminal'" />
       <div v-else class="bottom-placeholder">{{ placeholder }}</div>
     </div>
   </div>
 </template>
 
 <script setup lang="ts">
-import { computed, ref } from 'vue';
+import { computed, onMounted } from 'vue';
 
 import TerminalPane from './TerminalPane.vue';
+import { useAppStore } from '../stores/appStore';
+import { useIdeStore } from '../stores/ideStore';
 
 defineEmits<{ (e: 'close'): void }>();
 
-const active = ref('terminal');
+const store = useIdeStore();
+const appStore = useAppStore();
+
+onMounted(() => {
+  // TerminalPane 的启动条件是 bridgeReady && terminalPanelOpen，IDE 模式下必须显式打开
+  if (!appStore.terminalPanelOpen) appStore.terminalPanelOpen = true;
+});
+
 const tabs = [
   { id: 'terminal', title: '终端' },
   { id: 'problems', title: '问题' },
@@ -2705,8 +2798,8 @@ const tabs = [
 ];
 
 const placeholder = computed(() => {
-  if (active.value === 'problems') return '语言诊断将在 S2 接入后显示';
-  if (active.value === 'output') return '输出通道将在 S2 接入后显示';
+  if (store.bottomTab === 'problems') return '语言诊断将在 S2 接入后显示';
+  if (store.bottomTab === 'output') return '输出通道将在 S2 接入后显示';
   return '调试控制台将在 S3 接入后显示';
 });
 </script>
@@ -2805,10 +2898,10 @@ const placeholder = computed(() => {
       <EditorPane v-else :key="store.activePath()" :path="store.activePath()" />
 
       <div class="ide-bottom" :style="{ height: bottomHeight + 'px' }">
-        <BottomPanel v-if="bottomOpen" @close="bottomOpen = false" />
+        <BottomPanel v-if="ide.bottomPanelOpen" @close="ide.toggleBottomPanel()" />
       </div>
-      <div v-if="!bottomOpen" class="ide-bottom-open">
-        <button type="button" class="icon-btn" @click="bottomOpen = true">显示面板</button>
+      <div v-if="!ide.bottomPanelOpen" class="ide-bottom-open">
+        <button type="button" class="icon-btn" @click="ide.toggleBottomPanel()">显示面板</button>
       </div>
     </div>
 
@@ -2832,9 +2925,9 @@ import { useIdeStore } from '../stores/ideStore';
 
 const store = useAppStore();
 const ide = useIdeStore();
-// 用 ide 别名避免与 appStore 混用；文件树与工作区状态都来自 appStore
+// 用 ide 别名避免与 appStore 混用；文件树与工作区状态都来自 appStore，
+// 标签、断点、底部面板状态都来自 ideStore
 const activity = ref('files');
-const bottomOpen = ref(true);
 const bottomHeight = ref(200);
 </script>
 
@@ -2942,19 +3035,7 @@ const bottomHeight = ref(200);
 
 **终端只能有一个实例**（这一步最容易出错，务必按下面做）：`App.vue` 目前用 `v-show` 常挂载 `TerminalPane`（`App.vue:191-193`）。IDE 模式下 `BottomPanel` 也会挂载一个，若两处同时存在就会出现两个 xterm 实例、两个 PTY 会话。因此把 `App.vue` 里的 `TerminalPane` 改为 `v-if="!store.ideMode()"`，IDE 模式下终端完全由 `BottomPanel` 拥有。
 
-同时注意 `TerminalPane` 的启动条件是 `bridgeReady && terminalPanelOpen`（`TerminalPane.vue:198-218`），所以 `BottomPanel` 挂载时需要确保该开关为真，否则终端不会启动。在 `BottomPanel.vue` 的 `onMounted` 中加入：
-
-```ts
-import { onMounted } from 'vue';
-import { useAppStore } from '../stores/appStore';
-
-const appStore = useAppStore();
-
-onMounted(() => {
-  // TerminalPane 的启动条件包含 terminalPanelOpen，IDE 模式下必须显式打开
-  if (!appStore.terminalPanelOpen) appStore.terminalPanelOpen = true;
-});
-```
+同时注意 `TerminalPane` 的启动条件是 `bridgeReady && terminalPanelOpen`（`TerminalPane.vue:198-218`），所以 `BottomPanel` 挂载时必须确保该开关为真，否则终端不会启动——这一点已经写进上面 `BottomPanel.vue` 的 `onMounted` 里，不要漏掉。
 
 **已知取舍（写进提交信息，不要当成 bug）**：切换模式会卸载并重建 `TerminalPane`，PTY 会话本身由 `pty_terminal_ensure` 复用不会重启（`gui_bridge.py:7816` 的语义是「没有或已退出才新开」），但 xterm 的滚动缓冲会在切换时重置。本期接受这个取舍；若后续要求保留缓冲，改法是让 `App.vue` 用 `<Teleport>` 把同一个实例搬进底部面板，而不是两处各挂一个。
 
@@ -3144,7 +3225,8 @@ onMounted(async () => {
         version: 1,
         tabs: tabs.map((t, index) => ({ path: t.path, line: index + 1 })),
         active: this.activePath(),
-        breakpoints: [],
+        // 断点由 S3 写入 ideStore，这里必须持久化真实值，不能写死空数组
+        breakpoints: this.breakpointsBySession[this.session] ?? [],
       });
     },
 ```

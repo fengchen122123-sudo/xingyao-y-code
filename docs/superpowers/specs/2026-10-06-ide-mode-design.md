@@ -220,6 +220,34 @@ CodeMirror 6 扩展映射：
 | `lsp_status` | `{server, state, msg?}` | 语言服务器启停与异常（S2） |
 | `dap_stopped` / `dap_output` | 见 S3 规格 | 调试事件（S3） |
 
+### 5.6 实施期接口补充（由三份实施计划回写）
+
+本节记录实施计划在细化过程中新增并已冻结的接口与模块，属于对 §4 与 §5.5 的补充，评审时以本节为准。
+
+**桥方法（在 §5.5 之外新增）**
+
+| 方法 | 来源 | 用途 |
+|---|---|---|
+| `ide_set_open_files(paths)` | S1 | 登记编辑器当前打开的文件，驱动后端外部改动轮询（轮询集合只能由前端提供，后端无法自行推断） |
+| `lsp_set_server_path(language_id, path)` | S2 | 设置页手动指定语言服务器可执行文件路径，对应 §6.1 要求的写入入口 |
+| `lsp_sync_workspace(workdir)` | S2 | 切换工作区时显式回收 LSP 进程；后端另有 `_lsp_workspace_guard` 兜底 |
+
+**新增模块（在 §4 的目录清单之外）**
+
+| 模块 | 来源 | 职责 |
+|---|---|---|
+| `core/ide/lsp_codec.py` | S2 | LSP 帧编解码（Content-Length、分片到达、粘包），独立成文件便于单测 |
+| `core/ide/diagnostics_batcher.py` | S2 | 诊断 200 ms 节流合批与内容指纹去重 |
+| `core/ide/debug_adapters.py` | S3 | 调试适配器探测与供给（debugpy / dlv / lldb-dap） |
+| `core/ide/debug_session.py` | S3 | DAP 流程编排（initialize → launch → setBreakpoints → configurationDone） |
+| `core/ide/run_command.py` | S3 | 运行命令解析（按语言或项目配置推断命令） |
+
+**其他约定**
+
+- 内置语言服务器目录固定为 `<安装根>/lsp_bin`；随安装包分发还是首次启动解压到用户目录，留给打包阶段按体积决策（对应 §7.1）。
+- `dlv dap` 只提供 TCP 监听、没有 stdio 模式，因此 DAP 进程层必须同时支持 stdio 与 TCP 两种传输，监听端口从 stderr 解析。
+- 前端 `ideStore` 的冻结契约见 S1 计划 Task 8：`activeTab`（对象形态）、`activePath()`（字符串形态）、`breakpoints`（getter，`${path}:${line}` 集合）、`breakpointsFor(path)`、`toggleBreakpoint(path, line)`、`jumpTo(path, line, character)` / `clearPendingJump()`（跳转定位，由 `EditorPane` 的 watcher 消费）、`bottomTab` / `setBottomTab` / `bottomPanelOpen` / `toggleBottomPanel`。S2 与 S3 均消费这些名字，实现时不得改名。
+
 ---
 
 ## 6. S2 / S3 设计要点（详细规格另行出具）
