@@ -3,7 +3,8 @@
 
 与只读预览（gui_bridge.read_file_preview）的关键区别：
 - 预览允许截断、允许图片；编辑器不允许——内容不完整会写坏文件；
-- 编辑器必须原样保留编码、BOM 与换行风格，写回时一个字节都不能变。
+- 编辑器必须原样保留编码与 BOM（含 BOM 的原始字节口径，读写两侧一致），
+  并按原文件的换行风格还原。
   已知例外：mixed 换行（同文件内混用 CRLF/LF/CR）在编辑器内部已被归一为
   LF，保存后统一成 LF，见 _normalize_eol。
 
@@ -151,6 +152,10 @@ def write_text_file(
     expected_hash 为打开文件时 read_text_file 返回的 hash：磁盘内容与它不
     一致说明文件在编辑期间被外部（星瑶或其他程序）改过，返回 conflict 且
     不落盘，由前端让用户选择。传空字符串表示调用方明确要求覆盖。
+
+    冲突分支返回的 ``conflict["disk_hash"]`` 是磁盘当前内容的 SHA-256；空
+    字符串是**哨兵值，表示目标文件已不存在**（被删除或改名）。调用方应据此
+    提示「文件已删除」而不是「内容冲突」。绝不把这种情况当作无冲突覆盖。
     """
     real = os.path.realpath(os.path.abspath(path))
     if expected_hash:
