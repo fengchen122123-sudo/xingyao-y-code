@@ -352,7 +352,10 @@ class LspProcess:
                     break
                 for msg in messages:
                     self._dispatch(msg)
-        except (ValueError, OSError):
+        except (ValueError, OSError, LspNotRunning):
+            # _dispatch 内部已捕获 LspNotRunning；这里是防御性收口，保证读线程
+            # 绝不以 traceback 逃逸（读线程带 traceback 终止会留下「进程活着但
+            # 没人读」的连接）。
             pass
         finally:
             if broken_frame:
