@@ -416,6 +416,56 @@ def test_lan_forbids_drain_js_queue(server):
     assert response["error"]["code"] == "method_not_allowed"
 
 
+@pytest.mark.parametrize("method", [
+    "ide_write_file",
+    "ide_set_open_files",
+    "ide_save_layout",
+])
+def test_lan_forbids_ide_state_mutating_methods(server, method):
+    """IDE 桥的写类方法必须 fail-closed 拒绝（Task 8 评审 Critical）。
+
+    dispatch_rpc 是 fail-open 分发（只拦黑名单 + 下划线前缀）：这些方法若不入
+    FORBIDDEN_METHODS，手机端等于凭空多出一条远程写文件 / 改打开集合 / 覆盖
+    持久化布局的通道。写类方法会改变桌面状态，必须与 open_path /
+    save_clipboard_image 同一边界（设计 18：LAN 实施 fail-closed 的同一边界）。
+    """
+    response = server.dispatch_rpc(method, [])
+    assert response["error"]["code"] == "method_not_allowed"
+
+
+def test_lan_allows_ide_read_only_methods():
+    """只读类 IDE 方法保持放行（与 read_file_preview 可被 LAN 调用同一先例）。
+
+    只读不改变桌面状态，误拦会破坏手机端浏览/查看文件的既有能力。
+    """
+    calls = []
+
+    class ReadBridge:
+        def ide_read_file(self, path):
+            calls.append(("read", path))
+            return {"ok": True, "path": path, "content": "x = 1\n"}
+
+        def ide_stat_files(self, paths):
+            calls.append(("stat", paths))
+            return {"ok": True, "stats": []}
+
+        def ide_get_layout(self, session):
+            calls.append(("layout", session))
+            return {"ok": True, "layout": None}
+
+    srv = LanServer(bridge=ReadBridge())
+    for method, args in (
+        ("ide_read_file", ["a.py"]),
+        ("ide_stat_files", [["a.py"]]),
+        ("ide_get_layout", ["s1"]),
+    ):
+        result = srv.dispatch_rpc(method, args)
+        # 绝不能返回 method_not_allowed：只读方法必须真正到达 bridge
+        assert "error" not in result
+        assert result["ok"] is True
+    assert [c[0] for c in calls] == ["read", "stat", "layout"]
+
+
 @pytest.mark.parametrize("method", ["get_computer_control_status", "stop_computer_control"])
 def test_lan_allows_status_and_emergency_stop(server, method):
     assert server.dispatch_rpc(method, ["run-a"] if method.startswith("stop") else [])["ok"] is True
