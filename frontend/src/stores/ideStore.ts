@@ -23,6 +23,45 @@ function ideApi() {
   return api;
 }
 
+function isWindowsRuntime(): boolean {
+  return typeof navigator !== 'undefined' && /Windows/i.test(navigator.userAgent || '');
+}
+
+/**
+ * 路径规范化键：所有「按路径查表」的统一比对口径。
+ *
+ * 后端 `ide_read_file` 返回的是 realpath，而界面（文件树、跳转请求）传进来的是
+ * 原始路径；Windows 上两者常因分隔符、盘符大小写、`..` 相对段而不等（后端还有
+ * abspath 兜底）。若直接用字符串比对，会出现：同一文件打开两次开出两个标签、
+ * `saveTab(原始路径)` 查不到标签而静默 return，Ctrl+S 失效。
+ *
+ * 注意：本函数只产出比对键，**绝不写回标签**——标签路径始终保存 realpath，
+ * 它是后端与 S2/S3 的权威路径。
+ */
+export function normKey(path: string): string {
+  if (!path) return '';
+  const key = path.replace(/\\/g, '/');
+  const unc = key.startsWith('//');
+  const drive = /^[a-zA-Z]:\//.test(key);
+  const absolute = unc || drive || key.startsWith('/');
+  const segments: string[] = [];
+  for (const seg of key.split('/')) {
+    if (seg === '' || seg === '.') continue;
+    if (seg === '..') {
+      if (segments.length && segments[segments.length - 1] !== '..') segments.pop();
+      else if (!absolute) segments.push('..');
+      continue;
+    }
+    segments.push(seg);
+  }
+  let normalized = segments.join('/');
+  if (unc) normalized = `//${normalized}`;
+  else if (absolute) normalized = `/${normalized}`;
+  // Windows 路径大小写不敏感：盘符/UNC 前缀自带证据，其余靠运行时判断
+  if (drive || unc || isWindowsRuntime()) normalized = normalized.toLowerCase();
+  return normalized;
+}
+
 export const useIdeStore = defineStore('ide', {
   state: () => ({
     session: '',
@@ -82,8 +121,9 @@ export const useIdeStore = defineStore('ide', {
     },
 
     breakpointsFor(path: string): number[] {
+      const key = normKey(path);
       return (this.breakpointsBySession[this.session] ?? [])
-        .filter((b) => b.path === path)
+        .filter((b) => normKey(b.path) === key)
         .map((b) => b.line)
         .sort((a, b) => a - b);
     },
@@ -91,9 +131,12 @@ export const useIdeStore = defineStore('ide', {
     toggleBreakpoint(path: string, line: number) {
       if (!this.breakpointsBySession[this.session]) this.breakpointsBySession[this.session] = [];
       const list = this.breakpointsBySession[this.session];
-      const idx = list.findIndex((b) => b.path === path && b.line === line);
+      const key = normKey(path);
+      const idx = list.findIndex((b) => normKey(b.path) === key && b.line === line);
       if (idx >= 0) list.splice(idx, 1);
-      else list.push({ path, line });
+      // 落库统一用 realpath（标签已打开时取标签路径），这样 S3 的断点 gutter
+      // 用 `${tab.path}:${line}` 查 `breakpoints` 集合才能命中
+      else list.push({ path: this.tab(path)?.path ?? path, line });
       void this.persistLayout();
     },
 
@@ -123,7 +166,8 @@ export const useIdeStore = defineStore('ide', {
     },
 
     tab(path: string): IdeTab | undefined {
-      return this.tabs().find((t) => t.path === path);
+      const key = normKey(path);
+      return this.tabs().find((t) => normKey(t.path) === key);
     },
 
     activePath(): string {
@@ -131,7 +175,8 @@ export const useIdeStore = defineStore('ide', {
     },
 
     activate(path: string) {
-      this.activeBySession[this.session] = path;
+      // 活动路径统一记标签的 realpath：activeBySession 与标签路径两处状态不漂移
+      this.activeBySession[this.session] = this.tab(path)?.path ?? path;
       this._syncActiveTab();
     },
 
@@ -152,9 +197,10 @@ export const useIdeStore = defineStore('ide', {
       // 必须先确保它存在，否则 tabs() 的 `?? []` 会返回一个被丢弃的临时数组，
       // push 进去的标签立即丢失。
       if (!this.tabsBySession[this.session]) this.tabsBySession[this.session] = [];
+      // 判重经 normKey：后端回的是 realpath，调用方给的是原始路径
       const existing = this.tab(path);
       if (existing) {
-        this.activate(path);
+        this.activate(existing.path);
         return;
       }
       const res: IdeReadFileResult = await api.ide_read_file(path);
@@ -179,10 +225,11 @@ export const useIdeStore = defineStore('ide', {
 
     closeTab(path: string) {
       const list = this.tabs();
-      const idx = list.findIndex((t) => t.path === path);
+      const key = normKey(path);
+      const idx = list.findIndex((t) => normKey(t.path) === key);
       if (idx < 0) return;
       list.splice(idx, 1);
-      if (this.activePath() === path) {
+      if (normKey(this.activePath()) === key) {
         this.activeBySession[this.session] = list[Math.min(idx, list.length - 1)]?.path ?? '';
       }
       this._syncActiveTab();
