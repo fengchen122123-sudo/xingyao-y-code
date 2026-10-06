@@ -19,7 +19,7 @@ import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 
 import { buildEditorTheme } from '../editor/theme';
 import { createEditorState, EditorView } from '../editor/setup';
-import { useIdeStore } from '../stores/ideStore';
+import { samePath, useIdeStore } from '../stores/ideStore';
 
 const props = defineProps<{ path: string }>();
 const store = useIdeStore();
@@ -80,11 +80,18 @@ watch(
   },
 );
 
-// 跳转定义 / 诊断定位：把 store 里的 pendingJump 落到编辑器选区
+// 跳转定义 / 诊断定位：把 store 里的 pendingJump 落到编辑器选区。
+// 路径比较走 store 的同一查表口径（`tab()` = 精确 + 分隔符统一，且认 openFile 记录过的
+// 调用方原路径）——原先的严格 `!==` 会让 S2 用原始路径写下的跳转永远不被消费
+// （标签一直挂着待跳转），也会与本组件的 `store.tab(props.path)` 口径打架。
 watch(
   () => store.pendingJump,
   (jump) => {
-    if (!view || !jump || jump.path !== props.path) return;
+    if (!view || !jump) return;
+    // 两侧都先按 store 的查表解析成权威路径（realpath），再比同一口径的键
+    const target = store.tab(jump.path)?.path ?? jump.path;
+    const current = store.tab(props.path)?.path ?? props.path;
+    if (!samePath(target, current)) return;
     const total = view.state.doc.lines;
     const lineInfo = view.state.doc.line(Math.min(Math.max(jump.line, 1), total));
     const anchor = Math.min(lineInfo.from + Math.max(jump.character - 1, 0), lineInfo.to);
