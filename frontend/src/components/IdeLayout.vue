@@ -81,7 +81,13 @@ onMounted(async () => {
         // 上次打开的文件可能已被删除或移出工作区，静默跳过
       }
     }
-    if (res.layout.active) ide.activate(res.layout.active);
+    // 恢复 active 前必须确认该标签真的恢复了：快照里的 active 可能指向已被删除或
+    // 移出工作区的文件——上面的 openFile 读取失败会被 try/catch 静默吞掉，标签根本没建。
+    // 若无条件 activate，活动标签会指向一个不存在的标签，并随后经 persistLayout 把这条
+    // 陈旧 active 写回快照（重开一次脏一次）。这里用 tab() 与 openFile 相同的查表口径
+    // （realpath 精确比对 + 调用方路径别名）判存在性；不存在就保持恢复过程中最后成功
+    // 打开的那个标签，空快照则保持空。
+    if (res.layout.active && ide.tab(res.layout.active)) ide.activate(res.layout.active);
   }
 });
 
