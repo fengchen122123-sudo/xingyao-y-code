@@ -1080,6 +1080,10 @@ navItems: [] as Array<{ id: number; preview: string }>,
       // 切回时恢复该会话自己的浏览器/Git 等页签。事件管线的临时捕获
       // （skipLayout）不保存这段：顶层布局此时仍属于当前查看的会话
       if (!opts?.skipLayout) {
+      // 注意：本行**每次都换一个新数组引用**。S3-T8 报告里「回写当前 store 的同一批
+      // 引用、值相等时 Vue hasChanged 不触发更新」那条论断只适用于上面按引用直赋的
+      // 字段（messages / tokenUsage / modelId / navItems 等），**不适用于 rightPanelTabs**。
+      // 这里没有性能后果：该字段只在切会话时被读写，不在高频事件路径上。
       runtime.rightPanelTabs = [...this.rightPanelTabs];
       runtime.rightPanelActiveTab = this.rightPanelActiveTab;
       runtime.rightPanelExpanded = !this.rightPanelCollapsed;
