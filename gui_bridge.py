@@ -600,6 +600,12 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         # 用户手动开启；模型/工具链路不经过这里
         self._pty_session = None
         self._pty_lock = threading.Lock()
+        # IDE 调试（DAP 适配器进程）：单会话、用户显式启动；读线程只 put_nowait 事件
+        self._debug_session = None
+        self._debug_lock = threading.Lock()
+        # 当前暂停线程/帧：单步与求值都作用在它上面（由 dap_stopped 事件刷新）
+        self._debug_last_thread_id = 0
+        self._debug_last_frame_id = 0
         self._shutdown_lock = threading.Lock()
         self._shutting_down = False
         # 局域网手机远程控制服务（惰性创建，见 Task 3 的 _ensure_lan_server）
@@ -1117,6 +1123,13 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
                 pty_session.kill()
         except Exception:
             logger.exception("退出时终止内嵌交互式终端失败")
+
+        # 调试适配器进程：与内嵌终端同口径，退出必须回收（否则用户机器上留下
+        # 一个活着的调试器进程）
+        try:
+            self._shutdown_debug_session()
+        except Exception:
+            logger.exception("退出时终止调试适配器失败")
 
         # 内嵌浏览器：best-effort 释放原生 WebView2 控件并取消节流定时器。
         # 放在 JS 派发哨兵之前；shutdown 内部吞异常，失败不阻断退出链
@@ -8372,6 +8385,247 @@ class ApiBridge(GitBridgeMixin, BrowserBridgeMixin, SnipBridgeMixin):
         except Exception as e:
             logger.exception("ide_run_file 失败")
             return {"ok": False, "msg": f"一键运行失败：{e}"}
+
+    # ------------------------------------------------------------------
+    # IDE 调试：适配器进程由后端托管，事件一律经 emit_event（put_nowait 入队）
+    # core.ide 的导入同样放在方法内（同 ide_run_file：core/ide 依赖链不该
+    # 拖慢 GUI 启动）。路径口径与 ide_run_file 完全一致：先 _resolve_real_path，
+    # 再 gui_path_access_allowed——调试会起进程，这里少一步就是越权通道。
+    # ------------------------------------------------------------------
+    def _emit_dap_event(self, event_type: str, data: Dict[str, Any]) -> None:
+        """调试事件唯一出口：绝不在这里 evaluate_js（读线程不是派发线程）。
+
+        emit_event 内部只做 put_nowait（队列满丢弃新事件、绝不阻塞），所以
+        DAP 适配器读线程调用它是安全的：不触碰 WebView，也不会卡住读循环。
+        """
+        if event_type == "dap_stopped":
+            self._debug_last_thread_id = int(data.get("thread_id") or 0)
+            self._debug_last_frame_id = int(data.get("frame_id") or 0)
+        if self._shutting_down:
+            return
+        try:
+            self.emit_event(event_type, data)
+        except Exception:
+            logger.debug("推送调试事件失败", exc_info=True)
+
+    def _shutdown_debug_session(self) -> None:
+        """结束会话并回收适配器进程（幂等；shutdown 与 ide_debug_stop 共用）。"""
+        with self._debug_lock:
+            session = self._debug_session
+            self._debug_session = None
+        if session is None:
+            return
+        session.stop()
+
+    def _debug_path_denied(self, real_path: str, workspace: str, label: str) -> str:
+        """路径策略出口：入参必须已过 _resolve_real_path（口径同 ide_run_file）。
+
+        返回空串表示放行；否则是可诊断的中文原因（前缀说明是哪个路径被拒，
+        用户能直接看出该去改工作区还是关沙盒）。
+        """
+        from core.gui_path_policy import gui_path_access_allowed
+
+        allowed, reason = gui_path_access_allowed(
+            real_path, workspace, action="open", session_id=self._current_session
+        )
+        if allowed:
+            return ""
+        return f"{label}不可访问：{reason}"
+
+    def ide_debug_availability(self) -> Dict[str, Any]:
+        """探测各语言调试适配器（给调试面板与设置页展示安装状态）。"""
+        from core.ide.debug_adapters import adapter_availability
+
+        return {"ok": True, "adapters": adapter_availability()}
+
+    def ide_debug_start(
+        self,
+        path: str = "",
+        breakpoints: Optional[List[Dict[str, Any]]] = None,
+        program: str = "",
+        args: Optional[List[str]] = None,
+        stop_on_entry: bool = False,
+    ) -> Dict[str, Any]:
+        """启动调试：路径策略 → 探测适配器 → 起会话 → 下发断点 → configurationDone。
+
+        program / cwd 也要过策略（S3-T4 评审）：两者都会原样进 DAP launch 参数，
+        不过策略就等于"用调试器起任意程序"。
+        """
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_adapters import probe_adapter
+        from core.ide.debug_session import DebugSession, DebugSessionError
+        from core.ide.language_registry import language_id_for_path
+
+        with self._debug_lock:
+            if self._debug_session is not None:
+                return {"ok": False, "msg": "已有调试会话在运行，请先停止"}
+        real = _resolve_real_path(path)
+        if not os.path.isfile(real):
+            return {"ok": False, "msg": "文件不存在或不是普通文件，无法调试"}
+        workspace = self._session_workdir(self._current_session)
+        if workspace and workspace != "GLOBAL":
+            # 与 ide_run_file 同口径：工作区先归一化再交给策略做包含判断
+            workspace = _resolve_real_path(workspace)
+        denied = self._debug_path_denied(real, workspace, "调试目标文件")
+        if denied:
+            return {"ok": False, "msg": denied}
+        program_real = ""
+        if str(program or "").strip():
+            # program 是 launch 参数里的「被调试程序」：同样先 realpath 再校验
+            program_real = _resolve_real_path(str(program))
+            denied = self._debug_path_denied(program_real, workspace, "调试程序")
+            if denied:
+                return {"ok": False, "msg": denied}
+        # cwd 由目标文件推导（适配器的工作目录），送进适配器前照样过策略
+        cwd_real = os.path.dirname(real)
+        denied = self._debug_path_denied(cwd_real, workspace, "调试工作目录")
+        if denied:
+            return {"ok": False, "msg": denied}
+        language_id = language_id_for_path(real)
+        probe = probe_adapter(language_id)
+        if not probe.ok or probe.spec is None:
+            return {"ok": False, "msg": probe.hint or f"星瑶暂不支持调试该语言：{language_id or '未知'}"}
+        session = DebugSession(
+            probe.spec,
+            program=program_real or real,
+            cwd=cwd_real,
+            args=list(args or []),
+            stop_on_entry=bool(stop_on_entry),
+            emit=self._emit_dap_event,
+            # debugpy 的适配器必须用启动它自己的解释器，否则 -m debugpy.adapter 找不到模块
+            python=probe.spec.command[0] if language_id == "python" else "",
+        )
+        try:
+            info = session.start()
+        except DebugSessionError as e:
+            session.stop()
+            return {"ok": False, "msg": str(e)}
+        except (DapProtocolError, DapRequestError) as e:
+            session.stop()
+            return {"ok": False, "msg": f"启动调试适配器失败：{e}"}
+        try:
+            for item in breakpoints or []:
+                if not isinstance(item, dict):
+                    continue
+                entry_path = str(item.get("path") or real)
+                lines = [int(line) for line in (item.get("lines") or [])]
+                session.set_breakpoints(entry_path, lines)
+            session.configuration_done()
+        except (DapProtocolError, DapRequestError, DebugSessionError) as e:
+            session.stop()
+            return {"ok": False, "msg": f"调试初始化失败：{e}"}
+        with self._debug_lock:
+            self._debug_session = session
+        self._emit_dap_event("dap_status", {"session_id": session.session_id, "state": "running", "msg": ""})
+        return {
+            "ok": True,
+            "session_id": session.session_id,
+            "adapter": probe.spec.adapter_id,
+            "pid": info.get("pid"),
+        }
+
+    def ide_debug_set_breakpoints(self, path: str, lines: Optional[List[int]] = None) -> Dict[str, Any]:
+        """会话未启动时断点只存在前端，这里返回 pending 由启动时统一下发。"""
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_session import DebugSessionError
+
+        with self._debug_lock:
+            session = self._debug_session
+        if session is None:
+            return {"ok": True, "pending": True, "verified": []}
+        try:
+            verified = session.set_breakpoints(_resolve_real_path(path), [int(line) for line in (lines or [])])
+        except (DebugSessionError, DapProtocolError, DapRequestError) as e:
+            return {"ok": False, "msg": f"设置断点失败：{e}"}
+        return {"ok": True, "pending": False, "verified": verified}
+
+    def ide_debug_command(self, command: str) -> Dict[str, Any]:
+        """调试控制：continue / pause / next / stepIn / stepOut / restart。"""
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_session import DebugSessionError
+
+        handlers = {
+            "continue": lambda session, thread_id: session.continue_(thread_id),
+            "pause": lambda session, thread_id: session.pause(thread_id),
+            "next": lambda session, thread_id: session.next_(thread_id),
+            "stepIn": lambda session, thread_id: session.step_in(thread_id),
+            "stepOut": lambda session, thread_id: session.step_out(thread_id),
+            "restart": lambda session, thread_id: session.restart(),
+        }
+        handler = handlers.get(str(command))
+        if handler is None:
+            return {"ok": False, "msg": f"不支持的调试命令：{command}"}
+        with self._debug_lock:
+            session = self._debug_session
+        if session is None:
+            return {"ok": False, "msg": "调试未启动"}
+        # 当前暂停线程来自 dap_stopped（桥层记录）；DebugSession 自己不带这个状态，
+        # 用 0 发 continue/next 会被适配器拒绝（"thread not found"）
+        thread_id = self._debug_thread_id() or int(getattr(session, "_active_thread_id", 0) or 0)
+        try:
+            handler(session, int(thread_id or 0))
+        except (DebugSessionError, DapProtocolError, DapRequestError) as e:
+            return {"ok": False, "msg": f"{command} 失败：{e}"}
+        return {"ok": True}
+
+    def ide_debug_threads(self) -> Dict[str, Any]:
+        return self._debug_query("threads", lambda session: session.threads(), field="threads")
+
+    def ide_debug_stack_trace(self, thread_id: int = 0, levels: int = 20) -> Dict[str, Any]:
+        return self._debug_query(
+            "stackTrace",
+            lambda session: session.stack_trace(int(thread_id) or self._debug_thread_id(), int(levels)),
+            field="frames",
+        )
+
+    def ide_debug_scopes(self, frame_id: int = 0) -> Dict[str, Any]:
+        return self._debug_query("scopes", lambda session: session.scopes(int(frame_id)), field="scopes")
+
+    def ide_debug_variables(self, variables_reference: int = 0) -> Dict[str, Any]:
+        return self._debug_query(
+            "variables", lambda session: session.variables(int(variables_reference)), field="variables"
+        )
+
+    def ide_debug_evaluate(self, expression: str, frame_id: int = 0) -> Dict[str, Any]:
+        """求值：结果平铺返回（result / type / variablesReference），前端直接渲染。"""
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_session import DebugSessionError
+
+        with self._debug_lock:
+            session = self._debug_session
+        if session is None:
+            return {"ok": False, "msg": "调试未启动", "result": "", "type": "", "variablesReference": 0}
+        try:
+            payload = session.evaluate(str(expression), int(frame_id) or self._debug_frame_id())
+        except (DebugSessionError, DapProtocolError, DapRequestError) as e:
+            return {"ok": False, "msg": f"求值失败：{e}", "result": "", "type": "", "variablesReference": 0}
+        return {"ok": True, **payload}
+
+    def ide_debug_stop(self) -> Dict[str, Any]:
+        """停止调试并回收适配器进程（幂等）。"""
+        self._shutdown_debug_session()
+        self._emit_dap_event("dap_status", {"session_id": "", "state": "stopped", "msg": ""})
+        return {"ok": True}
+
+    def _debug_query(self, label: str, action, field: str) -> Dict[str, Any]:
+        """调试查询的统一出口：无会话 / 适配器报错的返回结构在这里收敛。"""
+        from core.ide.dap_manager import DapProtocolError, DapRequestError
+        from core.ide.debug_session import DebugSessionError
+
+        with self._debug_lock:
+            session = self._debug_session
+        if session is None:
+            return {"ok": False, "msg": "调试未启动", field: None}
+        try:
+            return {"ok": True, field: action(session)}
+        except (DebugSessionError, DapProtocolError, DapRequestError) as e:
+            return {"ok": False, "msg": f"{label} 失败：{e}", field: None}
+
+    def _debug_thread_id(self) -> int:
+        return int(getattr(self, "_debug_last_thread_id", 0) or 0)
+
+    def _debug_frame_id(self) -> int:
+        return int(getattr(self, "_debug_last_frame_id", 0) or 0)
 
     # ------------------------------------------------------------------
     # 模型管理
